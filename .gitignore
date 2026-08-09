@@ -1,0 +1,45 @@
+# Local snapshots of competition rules, harnesses, and public tests.
+/references/
+
+# Kernel and userspace build outputs.
+/build/
+/out/
+/dist/
+/target/
+/kernel-rv
+*.o
+*.a
+*.so
+*.elf
+*.bin
+*.img
+*.iso
+*.d
+
+# Emulator, debugger, coverage, and benchmark artifacts.
+*.log
+*.trace
+*.profraw
+*.profdata
+*.gcda
+*.gcno
+core
+core.*
+
+# Local editor and operating-system metadata.
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local secrets and machine-specific configuration.
+.env
+.env.*
+!.env.example
+local.mk
+
+# Raw local Agent/Harness session data is not a project artifact.
+/.agent-sessions/
+/.codex/sessions/
