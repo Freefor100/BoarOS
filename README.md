@@ -4,19 +4,36 @@
 
 BoarOS 是一个从零学习并面向 OS Comp 能力建设的 C + 汇编类 Linux 内核，也是一次长期的人—Agent 协作开发实践。
 
-## 当前状态
+## 当前实现
 
-项目目标、工程规则和已验证的本地工具链事实已经建立；目前还没有可启动的内核。
+- `make all` 构建 RISC-V64 ELF `kernel-rv`。
+- QEMU `virt` 加载默认 OpenSBI，随后以 S-mode 进入 BoarOS。
+- 启动代码建立 `gp`、清零 BSS、创建单 hart 启动栈，并把 OpenSBI 的 hart ID 与 DTB 指针交给 C 入口。
+- 内核检查 DTB 魔数，通过轮询 UART 输出启动信息，再以 SBI SRST 关闭虚拟机。
+- 自动测试在 512 MiB 和 1 GiB 两种 guest RAM 配置下验证完整启动链与 DTB 交接。
 
-## 技术方向
+当前只支持 RISC-V64 单 hart 启动；分页、异常、中断、内存管理、设备树解析、用户态和 LoongArch64 均未实现。完整比赛 Harness 仍会因缺少 `kernel-la` 失败。
 
-- RISC-V64 + OpenSBI 优先；LoongArch64 随后接入。
-- 内核使用 GNU C11 和必要的架构汇编。
-- 先形成可观察、可验证的端到端能力，再依据真实需求扩展。
-- 测例用于发现通用语义问题，不作为硬编码实现清单。
+## 构建与运行
+
+需要 `riscv64-unknown-elf-gcc`、对应 binutils、GNU Make 和 `qemu-system-riscv64`。
+
+```sh
+make all
+make run-riscv
+make test-riscv
+```
+
+`make debug-riscv` 使用 `-S -s` 启动 QEMU：虚拟 CPU 会暂停并在宿主 TCP 端口 1234 等待 GDB，因此命令不会自行返回。
+
+## 近期方向
+
+先审阅并掌握当前启动链与调试入口，再围绕下一项内核机制比较候选方案。RISC-V64 + OpenSBI 优先，LoongArch64 随后接入。
 
 ## 文档
 
+- [RISC-V 启动模块](docs/modules/riscv-boot.md)
+- [RISC-V 启动学习记录](docs/learning/riscv-boot.md)
 - [目标与边界](docs/goals.md)
 - [设计与工程原则](docs/design.md)
 - [工具链事实](docs/toolchain.md)
