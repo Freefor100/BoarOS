@@ -28,6 +28,11 @@ _start:
 2:
     la sp, __boot_stack_top
     andi sp, sp, -16
+
+    /* All early traps are fatal and share the initialized kernel stack. */
+    la t0, riscv_trap_entry
+    csrw stvec, t0
+
     mv a0, s0
     mv a1, s1
     call kernel_main

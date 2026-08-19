@@ -13,6 +13,7 @@ QEMU_MEMORY ?= 1G
 
 BUILD_DIR := build/riscv
 KERNEL_RV := kernel-rv
+TRAP_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-trap-rv
 
 ARCH_FLAGS := -march=rv64imac_zicsr_zifencei -mabi=lp64 -mcmodel=medany
 CPPFLAGS := -Iinclude
@@ -21,25 +22,38 @@ CFLAGS := $(ARCH_FLAGS) -std=gnu11 -O2 -g3 \
 	-ffunction-sections -fdata-sections -Wall -Wextra -Werror
 ASFLAGS := $(ARCH_FLAGS) -g3
 LDFLAGS := $(ARCH_FLAGS) -nostdlib -nostartfiles -static -no-pie \
-	-T arch/riscv/linker.ld -Wl,--build-id=none -Wl,--gc-sections \
-	-Wl,-Map,$(BUILD_DIR)/kernel-rv.map
+	-T arch/riscv/linker.ld -Wl,--build-id=none -Wl,--gc-sections
 
 C_SOURCES := \
 	arch/riscv/sbi.c \
+	arch/riscv/trap.c \
 	arch/riscv/virt_uart.c \
 	kernel/main.c
-ASM_SOURCES := arch/riscv/boot.S
+ASM_SOURCES := \
+	arch/riscv/boot.S \
+	arch/riscv/trap_entry.S
 OBJECTS := \
 	$(patsubst %.c,$(BUILD_DIR)/%.o,$(C_SOURCES)) \
 	$(patsubst %.S,$(BUILD_DIR)/%.o,$(ASM_SOURCES))
-DEPS := $(OBJECTS:.o=.d)
+TRAP_TEST_C_SOURCES := tests/riscv/trap_main.c
+TRAP_TEST_ASM_SOURCES := tests/riscv/trap_trigger.S
+TRAP_TEST_OBJECTS := \
+	$(filter-out $(BUILD_DIR)/kernel/main.o,$(OBJECTS)) \
+	$(patsubst %.c,$(BUILD_DIR)/%.o,$(TRAP_TEST_C_SOURCES)) \
+	$(patsubst %.S,$(BUILD_DIR)/%.o,$(TRAP_TEST_ASM_SOURCES))
+DEPS := $(OBJECTS:.o=.d) $(TRAP_TEST_OBJECTS:.o=.d)
 
-.PHONY: all clean debug-riscv run-riscv test-riscv
+.PHONY: all clean debug-riscv run-riscv test-riscv test-trap-riscv
 
 all: $(KERNEL_RV)
 
 $(KERNEL_RV): $(OBJECTS) arch/riscv/linker.ld
-	$(CC) $(LDFLAGS) -o $@ $(OBJECTS)
+	$(CC) $(LDFLAGS) -Wl,-Map,$(BUILD_DIR)/kernel-rv.map \
+		-o $@ $(OBJECTS)
+
+$(TRAP_TEST_KERNEL_RV): $(TRAP_TEST_OBJECTS) arch/riscv/linker.ld
+	$(CC) $(LDFLAGS) -Wl,-Map,$(BUILD_DIR)/tests/kernel-trap-rv.map \
+		-o $@ $(TRAP_TEST_OBJECTS)
 
 $(BUILD_DIR)/%.o: %.c
 	@mkdir -p $(dir $@)
@@ -59,6 +73,9 @@ debug-riscv: $(KERNEL_RV)
 
 test-riscv: $(KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) ./tests/boot-riscv.sh
+
+test-trap-riscv: $(TRAP_TEST_KERNEL_RV)
+	QEMU_RISCV64=$(QEMU_RISCV64) KERNEL_RV=$< ./tests/trap-riscv.sh
 
 clean:
 	$(RM) -r -- $(BUILD_DIR) $(KERNEL_RV)

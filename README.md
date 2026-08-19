@@ -9,10 +9,11 @@ BoarOS 是一个从零学习并面向 OS Comp 能力建设的 C + 汇编类 Linu
 - `make all` 构建 RISC-V64 ELF `kernel-rv`。
 - QEMU `virt` 加载默认 OpenSBI，随后以 S-mode 进入 BoarOS。
 - 启动代码建立 `gp`、清零 BSS、创建单 hart 启动栈，并把 OpenSBI 的 hart ID 与 DTB 指针交给 C 入口。
+- 启动代码安装 Direct-mode `stvec`；同步 trap 会输出 `scause`、`sepc`、`stval`、`sstatus` 后关机。
 - 内核检查 DTB 魔数，通过轮询 UART 输出启动信息，再以 SBI SRST 关闭虚拟机。
-- 自动测试在 512 MiB 和 1 GiB 两种 guest RAM 配置下验证完整启动链与 DTB 交接。
+- 自动测试验证致命 trap 路径，并在 512 MiB 和 1 GiB 两种 guest RAM 配置下验证完整启动链与 DTB 交接。
 
-当前只支持 RISC-V64 单 hart 启动；分页、异常、中断、内存管理、设备树解析、用户态和 LoongArch64 均未实现。完整比赛 Harness 仍会因缺少 `kernel-la` 失败。
+当前只支持 RISC-V64 单 hart 启动和致命 trap 诊断；trap 恢复、分页、中断、内存管理、设备树解析、用户态和 LoongArch64 均未实现。完整比赛 Harness 仍会因缺少 `kernel-la` 失败。
 
 ## 构建与运行
 
@@ -24,17 +25,19 @@ BoarOS 是一个从零学习并面向 OS Comp 能力建设的 C + 汇编类 Linu
 make all
 make run-riscv
 make test-riscv
+make test-trap-riscv
 ```
 
 `make debug-riscv` 使用 `-S -s` 启动 QEMU：虚拟 CPU 会暂停并在宿主 TCP 端口 1234 等待 GDB，因此命令不会自行返回。
 
 ## 近期方向
 
-先审阅并掌握当前启动链与调试入口，再围绕下一项内核机制比较候选方案。RISC-V64 + OpenSBI 优先，LoongArch64 随后接入。
+先审阅并掌握当前启动链与致命 trap 路径，再围绕设备树内存信息和物理页管理比较候选方案。RISC-V64 + OpenSBI 优先，LoongArch64 随后接入。
 
 ## 文档
 
 - [RISC-V 启动模块](docs/modules/riscv-boot.md)
+- [RISC-V 致命 Trap 模块](docs/modules/riscv-trap.md)
 - [RISC-V 启动学习记录](docs/learning/riscv-boot.md)
 - [目标与边界](docs/goals.md)
 - [设计与工程原则](docs/design.md)
