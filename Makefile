@@ -14,6 +14,7 @@ QEMU_MEMORY ?= 1G
 BUILD_DIR := build/riscv
 KERNEL_RV := kernel-rv
 TRAP_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-trap-rv
+DTB_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-dtb-rv
 
 ARCH_FLAGS := -march=rv64imac_zicsr_zifencei -mabi=lp64 -mcmodel=medany
 CPPFLAGS := -Iinclude
@@ -28,6 +29,7 @@ C_SOURCES := \
 	arch/riscv/sbi.c \
 	arch/riscv/trap.c \
 	arch/riscv/virt_uart.c \
+	kernel/dtb.c \
 	kernel/main.c
 ASM_SOURCES := \
 	arch/riscv/boot.S \
@@ -41,9 +43,17 @@ TRAP_TEST_OBJECTS := \
 	$(filter-out $(BUILD_DIR)/kernel/main.o,$(OBJECTS)) \
 	$(patsubst %.c,$(BUILD_DIR)/%.o,$(TRAP_TEST_C_SOURCES)) \
 	$(patsubst %.S,$(BUILD_DIR)/%.o,$(TRAP_TEST_ASM_SOURCES))
-DEPS := $(OBJECTS:.o=.d) $(TRAP_TEST_OBJECTS:.o=.d)
+DTB_TEST_C_SOURCES := tests/riscv/dtb_main.c
+DTB_TEST_OBJECTS := \
+	$(filter-out $(BUILD_DIR)/kernel/main.o,$(OBJECTS)) \
+	$(patsubst %.c,$(BUILD_DIR)/%.o,$(DTB_TEST_C_SOURCES))
+DEPS := \
+	$(OBJECTS:.o=.d) \
+	$(TRAP_TEST_OBJECTS:.o=.d) \
+	$(DTB_TEST_OBJECTS:.o=.d)
 
-.PHONY: all clean debug-riscv run-riscv test-riscv test-trap-riscv
+.PHONY: all clean debug-riscv run-riscv test-dtb-riscv test-riscv \
+	test-trap-riscv
 
 all: $(KERNEL_RV)
 
@@ -54,6 +64,10 @@ $(KERNEL_RV): $(OBJECTS) arch/riscv/linker.ld
 $(TRAP_TEST_KERNEL_RV): $(TRAP_TEST_OBJECTS) arch/riscv/linker.ld
 	$(CC) $(LDFLAGS) -Wl,-Map,$(BUILD_DIR)/tests/kernel-trap-rv.map \
 		-o $@ $(TRAP_TEST_OBJECTS)
+
+$(DTB_TEST_KERNEL_RV): $(DTB_TEST_OBJECTS) arch/riscv/linker.ld
+	$(CC) $(LDFLAGS) -Wl,-Map,$(BUILD_DIR)/tests/kernel-dtb-rv.map \
+		-o $@ $(DTB_TEST_OBJECTS)
 
 $(BUILD_DIR)/%.o: %.c
 	@mkdir -p $(dir $@)
@@ -71,8 +85,12 @@ debug-riscv: $(KERNEL_RV)
 	$(QEMU_RISCV64) -machine virt -bios default -kernel $< \
 		-m $(QEMU_MEMORY) -smp 1 -nographic -no-reboot -S -s
 
-test-riscv: $(KERNEL_RV)
+test-riscv: test-dtb-riscv $(KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) ./tests/boot-riscv.sh
+
+test-dtb-riscv: $(DTB_TEST_KERNEL_RV)
+	QEMU_RISCV64=$(QEMU_RISCV64) DTB_TEST_KERNEL_RV=$< \
+		./tests/dtb-riscv.sh
 
 test-trap-riscv: $(TRAP_TEST_KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) KERNEL_RV=$< ./tests/trap-riscv.sh

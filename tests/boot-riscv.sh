@@ -19,6 +19,7 @@ fi
 run_case()
 {
     memory=$1
+    expected_size=$2
     output="$output_dir/boot-$memory.log"
 
     echo "RISC-V boot test: memory=$memory"
@@ -52,10 +53,17 @@ run_case()
         echo "boot line did not expose the OpenSBI handoff registers" >&2
         exit 1
     fi
+
+    expected_memory="BoarOS: memory base=0x80000000 size=$expected_size"
+    if [ "$(grep -cxF "$expected_memory" "$output" || true)" -ne 1 ]; then
+        cat "$output" >&2
+        echo "expected one DTB memory line: $expected_memory" >&2
+        exit 1
+    fi
 }
 
-run_case 512M
-run_case 1G
+run_case 512M 0x20000000
+run_case 1G 0x40000000
 
 dtb_512=$(sed -n 's/^BoarOS: booted .* dtb=\(0x[0-9a-f]*\)$/\1/p' "$output_dir/boot-512M.log")
 dtb_1g=$(sed -n 's/^BoarOS: booted .* dtb=\(0x[0-9a-f]*\)$/\1/p' "$output_dir/boot-1G.log")

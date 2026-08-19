@@ -1,33 +1,44 @@
 #include <arch/riscv/sbi.h>
 #include <arch/riscv/virt_uart.h>
+#include <kernel/dtb.h>
 
-#define DTB_MAGIC_0 0xd0U
-#define DTB_MAGIC_1 0x0dU
-#define DTB_MAGIC_2 0xfeU
-#define DTB_MAGIC_3 0xedU
+static void shutdown_for_dtb_error(enum dtb_status status)
+    __attribute__((noreturn));
 
-static int dtb_has_valid_magic(const void *dtb)
+static void shutdown_for_dtb_error(enum dtb_status status)
 {
-    const unsigned char *bytes = dtb;
+    if (status == DTB_STATUS_INVALID) {
+        virt_uart_puts("BoarOS: invalid DTB\n");
+    } else if (status == DTB_STATUS_NOT_FOUND) {
+        virt_uart_puts("BoarOS: DTB memory not found\n");
+    } else if (status == DTB_STATUS_UNSUPPORTED) {
+        virt_uart_puts("BoarOS: unsupported DTB memory format\n");
+    } else {
+        virt_uart_puts("BoarOS: unknown DTB error\n");
+    }
 
-    return bytes != 0 &&
-           bytes[0] == DTB_MAGIC_0 &&
-           bytes[1] == DTB_MAGIC_1 &&
-           bytes[2] == DTB_MAGIC_2 &&
-           bytes[3] == DTB_MAGIC_3;
+    sbi_shutdown();
 }
 
 void kernel_main(unsigned long hart_id, const void *dtb)
 {
-    if (!dtb_has_valid_magic(dtb)) {
-        virt_uart_puts("BoarOS: invalid DTB handoff\n");
-        sbi_shutdown();
+    struct dtb_memory_range memory;
+    enum dtb_status status = dtb_read_first_memory_range(dtb, &memory);
+
+    if (status != DTB_STATUS_OK) {
+        shutdown_for_dtb_error(status);
     }
 
     virt_uart_puts("BoarOS: booted hart=");
     virt_uart_put_hex(hart_id);
     virt_uart_puts(" dtb=");
     virt_uart_put_hex((unsigned long)dtb);
+    virt_uart_putc('\n');
+
+    virt_uart_puts("BoarOS: memory base=");
+    virt_uart_put_hex((unsigned long)memory.base);
+    virt_uart_puts(" size=");
+    virt_uart_put_hex((unsigned long)memory.size);
     virt_uart_putc('\n');
 
     sbi_shutdown();
