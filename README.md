@@ -16,7 +16,9 @@ BoarOS 是一个从零学习并面向 OS Comp 能力建设的 C + 汇编类 Linu
 
 ## 构建与运行
 
-需要 `riscv64-unknown-elf-gcc`、对应 binutils、GNU Make 和 `qemu-system-riscv64`。
+需要 RISC-V64 bare-metal GCC 与对应 binutils、GNU Make 和
+`qemu-system-riscv64`。构建系统兼容 `riscv64-unknown-elf-` 与 Arch Linux
+提供的 `riscv64-elf-` 工具前缀。
 
 ```sh
 make all

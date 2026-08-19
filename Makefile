@@ -1,4 +1,11 @@
-CROSS_COMPILE ?= riscv64-unknown-elf-
+CROSS_COMPILE ?= $(shell \
+	if command -v riscv64-unknown-elf-gcc >/dev/null 2>&1; then \
+		printf '%s' riscv64-unknown-elf-; \
+	elif command -v riscv64-elf-gcc >/dev/null 2>&1; then \
+		printf '%s' riscv64-elf-; \
+	else \
+		printf '%s' riscv64-unknown-elf-; \
+	fi)
 
 CC := $(CROSS_COMPILE)gcc
 QEMU_RISCV64 ?= qemu-system-riscv64
