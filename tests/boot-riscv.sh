@@ -60,6 +60,24 @@ run_case()
         echo "expected one DTB memory line: $expected_memory" >&2
         exit 1
     fi
+
+    if ! grep -Eq '^BoarOS: memory layout reserved=0x[1-9a-f][0-9a-f]* usable=0x[1-9a-f][0-9a-f]*$' "$output"; then
+        cat "$output" >&2
+        echo "expected a non-empty boot memory layout" >&2
+        exit 1
+    fi
+
+    if ! grep -Eq '^BoarOS: first reserved base=0x80000000 size=0x[1-9a-f][0-9a-f]*$' "$output"; then
+        cat "$output" >&2
+        echo "expected the OpenSBI reservation at RAM base" >&2
+        exit 1
+    fi
+
+    if ! grep -Eq '^BoarOS: first usable base=0x[1-9a-f][0-9a-f]* size=0x[1-9a-f][0-9a-f]*$' "$output"; then
+        cat "$output" >&2
+        echo "expected a concrete first usable range" >&2
+        exit 1
+    fi
 }
 
 run_case 512M 0x20000000

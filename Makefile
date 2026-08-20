@@ -29,6 +29,7 @@ C_SOURCES := \
 	arch/riscv/sbi.c \
 	arch/riscv/trap.c \
 	arch/riscv/virt_uart.c \
+	kernel/boot_memory.c \
 	kernel/dtb.c \
 	kernel/main.c
 ASM_SOURCES := \
@@ -43,7 +44,9 @@ TRAP_TEST_OBJECTS := \
 	$(filter-out $(BUILD_DIR)/kernel/main.o,$(OBJECTS)) \
 	$(patsubst %.c,$(BUILD_DIR)/%.o,$(TRAP_TEST_C_SOURCES)) \
 	$(patsubst %.S,$(BUILD_DIR)/%.o,$(TRAP_TEST_ASM_SOURCES))
-DTB_TEST_C_SOURCES := tests/riscv/dtb_main.c
+DTB_TEST_C_SOURCES := \
+	tests/riscv/boot_memory_cases.c \
+	tests/riscv/dtb_main.c
 DTB_TEST_OBJECTS := \
 	$(filter-out $(BUILD_DIR)/kernel/main.o,$(OBJECTS)) \
 	$(patsubst %.c,$(BUILD_DIR)/%.o,$(DTB_TEST_C_SOURCES))

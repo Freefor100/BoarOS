@@ -31,6 +31,12 @@ static uint32_t read_be32(const unsigned char *bytes)
            (uint32_t)bytes[3];
 }
 
+static uint64_t read_be64(const unsigned char *bytes)
+{
+    return ((uint64_t)read_be32(bytes) << 32) |
+           read_be32(bytes + 4U);
+}
+
 static int reserve_entry_is_terminator(const unsigned char *entry)
 {
     return read_be32(entry) == 0U &&
@@ -181,15 +187,51 @@ static enum dtb_status read_memory_reg(const unsigned char *value,
     return DTB_STATUS_OK;
 }
 
-enum dtb_status dtb_read_first_memory_range(
-    const void *dtb,
-    struct dtb_memory_range *range)
+static enum dtb_status append_reserved_reg(
+    const unsigned char *value,
+    uint32_t length,
+    uint32_t address_cells,
+    uint32_t size_cells,
+    struct dtb_boot_info *info)
+{
+    uint32_t tuple_cells = address_cells + size_cells;
+    uint32_t tuple_size = tuple_cells * 4U;
+    uint32_t offset;
+
+    if (tuple_size == 0U || length == 0U || length % tuple_size != 0U) {
+        return DTB_STATUS_INVALID;
+    }
+
+    for (offset = 0U; offset < length; offset += tuple_size) {
+        uint64_t size = read_cells(value + offset + address_cells * 4U,
+                                   size_cells);
+
+        if (size == 0U) {
+            continue;
+        }
+        if (info->reserved_count == DTB_MAX_RESERVED_RANGES) {
+            return DTB_STATUS_UNSUPPORTED;
+        }
+
+        info->reserved[info->reserved_count].base =
+            read_cells(value + offset, address_cells);
+        info->reserved[info->reserved_count].size = size;
+        info->reserved_count++;
+    }
+
+    return DTB_STATUS_OK;
+}
+
+enum dtb_status dtb_read_boot_info(const void *dtb,
+                                   struct dtb_boot_info *info)
 {
     const unsigned char *blob = dtb;
     const unsigned char *structure;
     const unsigned char *strings;
     const unsigned char *memory_reg = NULL;
+    const unsigned char *reserved_reg = NULL;
     uint32_t memory_reg_length = 0U;
+    uint32_t reserved_reg_length = 0U;
     uint32_t total_size;
     uint32_t structure_offset;
     uint32_t structure_size;
@@ -204,7 +246,9 @@ enum dtb_status dtb_read_first_memory_range(
     uint32_t property_depth = 0U;
     uint32_t address_cells = 2U;
     uint32_t size_cells = 1U;
-    struct dtb_memory_range result;
+    uint32_t reserved_address_cells = 0U;
+    uint32_t reserved_size_cells = 0U;
+    struct dtb_boot_info result;
     int saw_root = 0;
     int address_cells_seen = 0;
     int size_cells_seen = 0;
@@ -213,8 +257,16 @@ enum dtb_status dtb_read_first_memory_range(
     int memory_type_seen = 0;
     int found = 0;
     int memory_reg_seen = 0;
+    int reserved_node = 0;
+    int reserved_node_seen = 0;
+    int reserved_address_cells_seen = 0;
+    int reserved_size_cells_seen = 0;
+    int reserved_ranges_seen = 0;
+    int reserved_child = 0;
+    int reserved_reg_seen = 0;
+    int reserved_size_seen = 0;
 
-    if (blob == NULL || range == NULL) {
+    if (blob == NULL || info == NULL) {
         return DTB_STATUS_INVALID;
     }
 
@@ -253,6 +305,8 @@ enum dtb_status dtb_read_first_memory_range(
         return DTB_STATUS_INVALID;
     }
 
+    result.dtb_size = total_size;
+    result.reserved_count = 0U;
     reserve_position = reserve_offset;
     for (;;) {
         if (reserve_position > structure_offset ||
@@ -262,6 +316,17 @@ enum dtb_status dtb_read_first_memory_range(
 
         if (reserve_entry_is_terminator(blob + reserve_position)) {
             break;
+        }
+
+        if (read_be64(blob + reserve_position + 8U) != 0U) {
+            if (result.reserved_count == DTB_MAX_RESERVED_RANGES) {
+                return DTB_STATUS_UNSUPPORTED;
+            }
+            result.reserved[result.reserved_count].base =
+                read_be64(blob + reserve_position);
+            result.reserved[result.reserved_count].size =
+                read_be64(blob + reserve_position + 8U);
+            result.reserved_count++;
         }
         reserve_position += 16U;
     }
@@ -314,6 +379,29 @@ enum dtb_status dtb_read_first_memory_range(
                 memory_reg = NULL;
                 memory_reg_length = 0U;
                 memory_reg_seen = 0;
+
+                reserved_node = bytes_equal_string(name,
+                                                   name_length,
+                                                   "reserved-memory");
+                if (reserved_node) {
+                    if (reserved_node_seen) {
+                        return DTB_STATUS_INVALID;
+                    }
+                    reserved_node_seen = 1;
+                    reserved_address_cells_seen = 0;
+                    reserved_size_cells_seen = 0;
+                    reserved_ranges_seen = 0;
+                }
+            } else if (depth == 3U && reserved_node) {
+                if (!reserved_address_cells_seen ||
+                    !reserved_size_cells_seen || !reserved_ranges_seen) {
+                    return DTB_STATUS_INVALID;
+                }
+                reserved_child = 1;
+                reserved_reg = NULL;
+                reserved_reg_length = 0U;
+                reserved_reg_seen = 0;
+                reserved_size_seen = 0;
             }
         } else if (token == FDT_END_NODE) {
             enum dtb_status status;
@@ -331,11 +419,38 @@ enum dtb_status dtb_read_first_memory_range(
                                          memory_reg_length,
                                          address_cells,
                                          size_cells,
-                                         &result,
+                                         &result.memory,
                                          &found);
                 if (status != DTB_STATUS_OK) {
                     return status;
                 }
+            }
+
+            if (depth == 3U && reserved_child) {
+                if (reserved_reg_seen && reserved_size_seen) {
+                    return DTB_STATUS_INVALID;
+                }
+                if (!reserved_reg_seen) {
+                    return reserved_size_seen ? DTB_STATUS_UNSUPPORTED
+                                              : DTB_STATUS_INVALID;
+                }
+                status = append_reserved_reg(reserved_reg,
+                                             reserved_reg_length,
+                                             reserved_address_cells,
+                                             reserved_size_cells,
+                                             &result);
+                if (status != DTB_STATUS_OK) {
+                    return status;
+                }
+                reserved_child = 0;
+            } else if (depth == 2U && reserved_node) {
+                if (!reserved_address_cells_seen ||
+                    !reserved_size_cells_seen || !reserved_ranges_seen ||
+                    reserved_address_cells != address_cells ||
+                    reserved_size_cells != size_cells) {
+                    return DTB_STATUS_INVALID;
+                }
+                reserved_node = 0;
             }
 
             if (property_depth == depth) {
@@ -376,7 +491,11 @@ enum dtb_status dtb_read_first_memory_range(
                 return status;
             }
 
-            if (depth == 1U &&
+            if (((depth == 2U && (memory_name || reserved_node)) ||
+                 (depth == 3U && reserved_child)) &&
+                bytes_equal_string(name, name_length, "status")) {
+                return DTB_STATUS_UNSUPPORTED;
+            } else if (depth == 1U &&
                 bytes_equal_string(name, name_length, "#address-cells")) {
                 if (address_cells_seen || length != 4U) {
                     return DTB_STATUS_INVALID;
@@ -398,6 +517,52 @@ enum dtb_status dtb_read_first_memory_range(
                 if (size_cells == 0U || size_cells > 2U) {
                     return DTB_STATUS_UNSUPPORTED;
                 }
+            } else if (depth == 2U && reserved_node &&
+                       bytes_equal_string(name,
+                                          name_length,
+                                          "#address-cells")) {
+                if (reserved_address_cells_seen || length != 4U) {
+                    return DTB_STATUS_INVALID;
+                }
+                reserved_address_cells_seen = 1;
+                reserved_address_cells = read_be32(value);
+                if (reserved_address_cells == 0U ||
+                    reserved_address_cells > 2U) {
+                    return DTB_STATUS_UNSUPPORTED;
+                }
+            } else if (depth == 2U && reserved_node &&
+                       bytes_equal_string(name,
+                                          name_length,
+                                          "#size-cells")) {
+                if (reserved_size_cells_seen || length != 4U) {
+                    return DTB_STATUS_INVALID;
+                }
+                reserved_size_cells_seen = 1;
+                reserved_size_cells = read_be32(value);
+                if (reserved_size_cells == 0U ||
+                    reserved_size_cells > 2U) {
+                    return DTB_STATUS_UNSUPPORTED;
+                }
+            } else if (depth == 2U && reserved_node &&
+                       bytes_equal_string(name, name_length, "ranges")) {
+                if (reserved_ranges_seen || length != 0U) {
+                    return DTB_STATUS_INVALID;
+                }
+                reserved_ranges_seen = 1;
+            } else if (depth == 3U && reserved_child &&
+                       bytes_equal_string(name, name_length, "reg")) {
+                if (reserved_reg_seen) {
+                    return DTB_STATUS_INVALID;
+                }
+                reserved_reg_seen = 1;
+                reserved_reg = value;
+                reserved_reg_length = length;
+            } else if (depth == 3U && reserved_child &&
+                       bytes_equal_string(name, name_length, "size")) {
+                if (reserved_size_seen) {
+                    return DTB_STATUS_INVALID;
+                }
+                reserved_size_seen = 1;
             } else if (depth == 2U && memory_name &&
                        bytes_equal_string(name,
                                           name_length,
@@ -431,7 +596,7 @@ enum dtb_status dtb_read_first_memory_range(
                 return DTB_STATUS_NOT_FOUND;
             }
 
-            *range = result;
+            *info = result;
             return DTB_STATUS_OK;
         } else {
             return DTB_STATUS_INVALID;
