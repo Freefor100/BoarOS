@@ -1,6 +1,6 @@
 # 内存管理学习总结
 
-本文整理开发启动期内存管理和分页时需要掌握的知识、BoarOS 已经确定的选择及理由、平台能力依据和可复用的验证经验。当前接口、限制和测试契约以 [DTB 与启动内存布局模块](../modules/dtb-memory.md) 和 [物理页分配模块](../modules/physical-pages.md) 为准。
+本文整理开发启动期内存管理和分页时需要掌握的知识、BoarOS 已经确定的选择及理由、平台能力依据和可复用的验证经验。当前接口、限制和测试契约以 [DTB 与启动内存布局模块](../modules/dtb-memory.md)、[物理页分配模块](../modules/physical-pages.md) 和 [RISC-V Sv39 分页模块](../modules/riscv-sv39.md) 为准。
 
 ## 从物理内存到虚拟地址
 
@@ -130,6 +130,24 @@ Sv39 页表项的常用低位标志为：
 
 `R/W/X` 全为零时，有效表项指向下一级页表；其中任一为一时，表项是叶子映射。`W=1` 且 `R=0` 是保留组合。若在最高级或第二级提前遇到叶子项，就形成 1 GiB 或 2 MiB 大页；大页的虚拟地址和物理地址都必须按大页大小对齐。第三级叶子项形成普通 4 KiB 映射。
 
+Sv39 所说的“三级”是三次索引，不是只允许一种叶子大小：
+
+| 硬件层级 | 常用软件名称 | 使用的索引 | 叶子覆盖范围 |
+|---|---|---|---:|
+| Level 2 | 根页表 / PGD | `VPN[2]` | 1 GiB |
+| Level 1 | PMD | `VPN[1]` | 2 MiB |
+| Level 0 | PTE 页 | `VPN[0]` | 4 KiB |
+
+走到 Level 0 才得到 4 KiB 叶子；在 Level 1 提前结束就是 2 MiB 叶子，在 Level 2 提前结束就是 1 GiB 叶子。中间级表项只保存下一级页表的物理页号，不能带叶子的 R/W/X 组合。
+
+### BoarOS 当前为什么组合 2 MiB 和 4 KiB？
+
+BoarOS 的 Sv39 建表器在虚拟地址、物理地址和剩余长度都按 2 MiB 对齐时优先建立 2 MiB 叶子，其余边缘和权限边界使用 4 KiB 叶子。这样既能给 text、rodata、data 设置不同权限，又不会为大片连续 RAM 逐页建立数百万个 PTE。
+
+以完全对齐的 16 GiB 映射为例：全部使用 2 MiB 叶子需要 8192 个叶子项、16 张 Level 1 表和 1 张根表，共 17 个 4 KiB 页表页。若全部使用 4 KiB 叶子，则需要 4,194,304 个叶子项、8192 张 Level 0 表、16 张 Level 1 表和 1 张根表，共 8209 个页表页，约 32.06 MiB。大页还会减少相同范围所需的 TLB 项数。
+
+当前不建立 1 GiB 叶子。它可以在以后作为 Level 2 叶子加入，并不要求改变三级结构；但 1 GiB 同时要求 VA/PA 对齐，而且无法在叶子内部表达内核段权限差异。当前 2 MiB 已把 16 GiB 建表开销降到 17 页，先保留更简单的冲突和权限模型。
+
 ## `satp`、TLB 和 `SFENCE.VMA`
 
 TLB 缓存虚拟页到物理页框的翻译和权限。内存中的页表项改变后，TLB 里的旧结果不会因为普通 store 自动失效。
@@ -150,6 +168,12 @@ RISC-V 使用 `SFENCE.VMA` 同步页表更新与后续地址翻译。它可以�
 
 这里复用的是 RISC-V 页表机制，不是整套平台代码。QEMU 与 VisionFive 2 的固件流程、RAM/MMIO 布局、UART、中断控制器和设备仍然需要各自的平台适配。
 
+### Linux 的做法提供了什么参照？
+
+当前本地 Linux RISC-V 源码默认从 Sv57 尝试，根据命令行、DTB 的 `mmu-type` 和 `satp` 写入读回结果逐级退到 Sv48 或 Sv39。它把内核映像映射与物理内存线性映射分开，并在严格内核权限配置下区分可执行代码、只读数据和普通可写内存。
+
+Linux 建立线性映射时同样按对齐和剩余长度选择较大叶子；在 Sv39 的三级配置中，其通用建表层折叠了 PUD，因而线性映射最大选择 2 MiB PMD 叶子，而不是直接使用 1 GiB 根叶子。BoarOS 固定 Sv39 且先实现 2 MiB/4 KiB，是对当前两块 RISC-V 目标硬件交集和早期实现范围的主动收窄，不是 RISC-V 硬件只能这样设置。
+
 ## LoongArch 为什么是另一套分页实现？
 
 LoongArch 不使用 RISC-V 的 `satp` 和 PTE 格式。它通过 `PRCFG2.PSAVL` 表示 CPU 支持的页大小，通过 `STLBPS.PS` 选择 STLB 页大小，并用 `PWCL`、`PWCH` 配置多级页表的索引位置和宽度。16 KiB 页对应 `PS=14`。
@@ -163,18 +187,22 @@ LoongArch64 Linux 默认选择 16 KiB/三级页表，该布局支持最多 47 �
 - 区间算法要覆盖相邻、重叠、完全包含、越界裁剪、整数溢出和相减后为空等情况。
 - 页分配测试要检查非对齐边缘、耗尽、释放后复用、重复释放、非法地址和失败时状态不变。
 - 分页切换应分阶段验证：先检查页表内存内容和 PTE 编码，再启用 MMU；切换后立即输出一个最小标记，可以区分“建表错误”和“后续子系统错误”。
+- 只验证 store page fault 不足以证明权限正确：应先从目标页成功读取，再用明确的汇编 store 触发故障，并核对 `scause` 和 `stval`。
+- 范围映射必须说明失败是否回滚。BoarOS 启动建表采用部分提交：中途 OOM 或冲突时保留已经写入的页表，但整个失败页表不得激活；测试同时检查计数和已写 PTE。
 - QEMU 能验证架构机制和 `virt` 平台路径，但不能替代开发板上的固件交接、DTB、MMIO 和真实 TLB 行为验证。
-- 当前分页关闭时可直接按物理地址访问回收链节点；开启分页后，分配器托管的 RAM 必须存在可访问的内核映射，否则释放链表会在读写节点时出错。
+- 分页开启后，分配器托管的 RAM 必须存在可访问的内核映射，否则释放链表会在读写节点时出错；BoarOS 当前用 RAM 恒等映射满足这一条件。
 
 当前聚焦验证入口为：
 
 ```sh
 make test-dtb-riscv
 make test-page-riscv
+make test-sv39-riscv
+make test-sv39-fault-riscv
 make test-riscv
 ```
 
-前两个目标分别验证 DTB/启动布局和物理页状态机，但不覆盖页表编码、映射权限或 `satp` 切换。分页能力必须有这些语义的独立验证，不能把“内核仍能启动”当作全部分页语义的证据。
+Sv39 建表测试覆盖精确 PTE、2 MiB/4 KiB 选择、16 GiB 规模、边界拒绝和部分提交；权限故障测试覆盖 MMU 生效后的只读保护；完整启动测试再验证 512 MiB/1 GiB RAM 下的 `satp` 和页表页计数。开发板到手后还必须补充同类硬件验证，不能把 QEMU 结果直接等同于板级兼容。
 
 ## 资料依据
 
@@ -182,6 +210,7 @@ make test-riscv
 
 - `references/riscv/riscv-privileged-20260120.pdf`：`satp` MODE、Sv39/Sv48/Sv57、PTE 与 `SFENCE.VMA`。
 - `references/qemu/hw/riscv/virt.c`、`references/qemu/target/riscv/cpu.c`：`virt` 默认 CPU 与支持的最大分页模式。
+- `references/linux/arch/riscv/mm/init.c`、`references/linux/arch/riscv/include/asm/pgtable-64.h`：Linux 的模式探测、地址空间和线性映射叶子选择。
 - `references/visionfive2/jh7110-datasheet-v1.67.pdf`、`references/visionfive2/sifive-u74-core-complex-21G3.pdf`：U74 与 Sv39 能力。
 - `references/loongarch-documentation/docs/LoongArch-Vol1-EN/`：`PSAVL`、`STLBPS`、`PWCL/PWCH` 和多级页表结构。
 - `git -C references/linux show HEAD:arch/loongarch/Kconfig`：LoongArch Linux 的页大小与页表层级组合。

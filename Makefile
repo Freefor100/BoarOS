@@ -16,6 +16,8 @@ KERNEL_RV := kernel-rv
 TRAP_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-trap-rv
 DTB_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-dtb-rv
 PAGE_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-page-rv
+SV39_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-sv39-rv
+SV39_FAULT_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-sv39-fault-rv
 
 ARCH_FLAGS := -march=rv64imac_zicsr_zifencei -mabi=lp64 -mcmodel=medany
 CPPFLAGS := -Iinclude -DBOAROS_PAGE_SHIFT=12
@@ -28,6 +30,7 @@ LDFLAGS := $(ARCH_FLAGS) -nostdlib -nostartfiles -static -no-pie \
 
 C_SOURCES := \
 	arch/riscv/sbi.c \
+	arch/riscv/sv39.c \
 	arch/riscv/trap.c \
 	arch/riscv/virt_uart.c \
 	kernel/boot_memory.c \
@@ -71,14 +74,34 @@ PAGE_TEST_C_SOURCES := \
 PAGE_TEST_OBJECTS := \
 	$(TEST_RUNTIME_OBJECTS) \
 	$(patsubst %.c,$(BUILD_DIR)/%.o,$(PAGE_TEST_C_SOURCES))
+SV39_TEST_C_SOURCES := \
+	arch/riscv/sv39.c \
+	kernel/physical_page.c \
+	tests/riscv/sv39_cases.c \
+	tests/riscv/sv39_main.c
+SV39_TEST_OBJECTS := \
+	$(TEST_RUNTIME_OBJECTS) \
+	$(patsubst %.c,$(BUILD_DIR)/%.o,$(SV39_TEST_C_SOURCES))
+SV39_FAULT_TEST_C_SOURCES := \
+	arch/riscv/sv39.c \
+	kernel/boot_memory.c \
+	kernel/dtb.c \
+	kernel/physical_page.c \
+	tests/riscv/sv39_fault_main.c
+SV39_FAULT_TEST_OBJECTS := \
+	$(TEST_RUNTIME_OBJECTS) \
+	$(patsubst %.c,$(BUILD_DIR)/%.o,$(SV39_FAULT_TEST_C_SOURCES))
 DEPS := \
 	$(OBJECTS:.o=.d) \
 	$(TRAP_TEST_OBJECTS:.o=.d) \
 	$(DTB_TEST_OBJECTS:.o=.d) \
-	$(PAGE_TEST_OBJECTS:.o=.d)
+	$(PAGE_TEST_OBJECTS:.o=.d) \
+	$(SV39_TEST_OBJECTS:.o=.d) \
+	$(SV39_FAULT_TEST_OBJECTS:.o=.d)
 
 .PHONY: all clean debug-riscv references run-riscv test-dtb-riscv \
-	test-page-riscv test-references test-riscv test-trap-riscv
+	test-page-riscv test-references test-riscv test-sv39-fault-riscv \
+	test-sv39-riscv test-trap-riscv
 
 all: $(KERNEL_RV)
 
@@ -104,6 +127,16 @@ $(PAGE_TEST_KERNEL_RV): $(PAGE_TEST_OBJECTS) arch/riscv/linker.ld
 	$(CC) $(LDFLAGS) -Wl,-Map,$(BUILD_DIR)/tests/kernel-page-rv.map \
 		-o $@ $(PAGE_TEST_OBJECTS)
 
+$(SV39_TEST_KERNEL_RV): $(SV39_TEST_OBJECTS) arch/riscv/linker.ld
+	$(CC) $(LDFLAGS) -Wl,-Map,$(BUILD_DIR)/tests/kernel-sv39-rv.map \
+		-o $@ $(SV39_TEST_OBJECTS)
+
+$(SV39_FAULT_TEST_KERNEL_RV): $(SV39_FAULT_TEST_OBJECTS) \
+		arch/riscv/linker.ld
+	$(CC) $(LDFLAGS) \
+		-Wl,-Map,$(BUILD_DIR)/tests/kernel-sv39-fault-rv.map \
+		-o $@ $(SV39_FAULT_TEST_OBJECTS)
+
 $(BUILD_DIR)/%.o: %.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c $< -o $@
@@ -120,11 +153,17 @@ debug-riscv: $(KERNEL_RV)
 	$(QEMU_RISCV64) -machine virt -bios default -kernel $< \
 		-m $(QEMU_MEMORY) -smp 1 -nographic -no-reboot -S -s
 
-test-riscv: $(DTB_TEST_KERNEL_RV) $(PAGE_TEST_KERNEL_RV) $(KERNEL_RV)
+test-riscv: $(DTB_TEST_KERNEL_RV) $(PAGE_TEST_KERNEL_RV) \
+	$(SV39_TEST_KERNEL_RV) $(SV39_FAULT_TEST_KERNEL_RV) $(KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) \
 		DTB_TEST_KERNEL_RV=$(DTB_TEST_KERNEL_RV) ./tests/dtb-riscv.sh
 	QEMU_RISCV64=$(QEMU_RISCV64) \
 		PAGE_TEST_KERNEL_RV=$(PAGE_TEST_KERNEL_RV) ./tests/page-riscv.sh
+	QEMU_RISCV64=$(QEMU_RISCV64) \
+		SV39_TEST_KERNEL_RV=$(SV39_TEST_KERNEL_RV) ./tests/sv39-riscv.sh
+	QEMU_RISCV64=$(QEMU_RISCV64) \
+		SV39_FAULT_TEST_KERNEL_RV=$(SV39_FAULT_TEST_KERNEL_RV) \
+		./tests/sv39-fault-riscv.sh
 	QEMU_RISCV64=$(QEMU_RISCV64) ./tests/boot-riscv.sh
 
 test-dtb-riscv: $(DTB_TEST_KERNEL_RV)
@@ -134,6 +173,14 @@ test-dtb-riscv: $(DTB_TEST_KERNEL_RV)
 test-page-riscv: $(PAGE_TEST_KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) PAGE_TEST_KERNEL_RV=$< \
 		./tests/page-riscv.sh
+
+test-sv39-riscv: $(SV39_TEST_KERNEL_RV)
+	QEMU_RISCV64=$(QEMU_RISCV64) SV39_TEST_KERNEL_RV=$< \
+		./tests/sv39-riscv.sh
+
+test-sv39-fault-riscv: $(SV39_FAULT_TEST_KERNEL_RV)
+	QEMU_RISCV64=$(QEMU_RISCV64) SV39_FAULT_TEST_KERNEL_RV=$< \
+		./tests/sv39-fault-riscv.sh
 
 test-trap-riscv: $(TRAP_TEST_KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) KERNEL_RV=$< ./tests/trap-riscv.sh

@@ -15,20 +15,25 @@ SECTIONS
 
     .text :
     {
+        __text_start = .;
         KEEP(*(.text.boot))
         *(.text .text.*)
+        . = ALIGN(0x1000);
+        __text_end = .;
     } :text
 
-    . = ALIGN(0x1000);
     .rodata :
     {
+        __rodata_start = .;
         *(.srodata .srodata.*)
         *(.rodata .rodata.*)
+        . = ALIGN(0x1000);
+        __rodata_end = .;
     } :rodata
 
-    . = ALIGN(0x1000);
     .data :
     {
+        __data_start = .;
         PROVIDE(__global_pointer$ = . + 0x800);
         *(.sdata .sdata.*)
         *(.data .data.*)
@@ -49,6 +54,8 @@ SECTIONS
         __bss_end = .;
     } :data
 
+    . = ALIGN(0x1000);
+    __data_end = .;
     __kernel_end = .;
 
     /DISCARD/ :

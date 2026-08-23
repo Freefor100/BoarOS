@@ -1,13 +1,12 @@
 #include <arch/riscv/virt_uart.h>
 
-#define VIRT_UART_BASE 0x10000000UL
 #define UART_THR 0UL
 #define UART_LSR 5UL
 #define UART_LSR_THR_EMPTY (1U << 5)
 
 static volatile unsigned char *uart_register(unsigned long offset)
 {
-    return (volatile unsigned char *)(VIRT_UART_BASE + offset);
+    return (volatile unsigned char *)(VIRT_UART_MMIO_BASE + offset);
 }
 
 void virt_uart_putc(char character)

@@ -12,9 +12,10 @@ BoarOS 是一个从零学习并面向 OS Comp 能力建设的 C + 汇编类 Linu
 - 启动代码安装 Direct-mode `stvec`；同步 trap 会输出 `scause`、`sepc`、`stval`、`sstatus` 后关机。
 - 内核校验并扫描 DTB，读取第一段 RAM 和静态保留区，排除固件、内核镜像与 DTB 自身占用后形成启动内存布局。
 - 物理页分配器按 4 KiB 向内对齐可用区间，支持单页分配、释放、耗尽和重复释放诊断。
-- 自动测试分别验证 DTB 与启动布局、物理页状态机和致命 trap，并在 512 MiB 和 1 GiB 两种 guest RAM 配置下验证完整启动链。
+- RISC-V 启动期建立 Sv39 页表：RAM 当前采用恒等映射，按条件组合 2 MiB 与 4 KiB 叶子；内核代码、只读数据、可写数据分别使用 RX、R、RW 权限，QEMU `virt` UART 使用 RW。
+- 自动测试分别验证 DTB 与启动布局、物理页状态机、Sv39 编码/规模/失败语义、只读页写故障和致命 trap，并在 512 MiB 和 1 GiB 两种 guest RAM 配置下验证完整分页启动链。
 
-当前只支持 RISC-V64 单 hart 启动、致命 trap 诊断、DTB 中第一段物理内存和静态保留区的启动布局，以及最小物理页分配；trap 恢复、分页、中断、用户态和 LoongArch64 均未实现。完整比赛 Harness 仍会因缺少 `kernel-la` 失败。
+当前只支持 RISC-V64 单 hart、QEMU `virt` 平台、启动期恒等映射、致命 trap 诊断、DTB 中第一段物理内存和静态保留区，以及最小物理页分配。运行期映射修改、内核高半区、trap 恢复、中断、用户态和 LoongArch64 均未实现。完整比赛 Harness 仍会因缺少 `kernel-la` 失败。
 
 ## 构建与运行
 
@@ -28,6 +29,8 @@ make run-riscv
 make test-riscv
 make test-dtb-riscv
 make test-page-riscv
+make test-sv39-riscv
+make test-sv39-fault-riscv
 make test-trap-riscv
 make test-references
 ```
@@ -36,7 +39,7 @@ make test-references
 
 ## 近期方向
 
-下一步使用物理页分配器建立 RISC-V64 Sv39/4 KiB 的最小内核映射。RISC-V64 + OpenSBI 优先，LoongArch64 16 KiB/三级页表随后接入。
+下一步在现有 Sv39 恒等映射上确定 RISC-V64 内核高半区与映射生命周期；RISC-V64 + OpenSBI 主路径稳定后，再接入 LoongArch64 16 KiB/三级页表。
 
 ## 文档
 
@@ -44,6 +47,7 @@ make test-references
 - [RISC-V 致命 Trap 模块](docs/modules/riscv-trap.md)
 - [DTB 与启动内存布局模块](docs/modules/dtb-memory.md)
 - [物理页分配模块](docs/modules/physical-pages.md)
+- [RISC-V Sv39 分页模块](docs/modules/riscv-sv39.md)
 - [RISC-V 启动学习总结](docs/learning/riscv-boot.md)
 - [内存管理学习总结](docs/learning/memory-management.md)
 - [目标与边界](docs/goals.md)

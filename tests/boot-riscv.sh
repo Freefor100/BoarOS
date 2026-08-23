@@ -86,9 +86,25 @@ run_case()
     page_available=${page_counts#* }
     if [ -z "$page_counts" ] || [ "$page_total" = "$page_counts" ] ||
         [ "$page_available" != "${page_available#* }" ] ||
-        [ "$page_total" != "$page_available" ]; then
+        [ "$((page_total))" -le "$((page_available))" ]; then
         cat "$output" >&2
-        echo "expected one initialized physical page allocator" >&2
+        echo "expected page tables to consume physical pages" >&2
+        exit 1
+    fi
+
+    sv39_counts=$(sed -n \
+        's/^BoarOS: Sv39 root=0x[1-9a-f][0-9a-f]* tables=\(0x[1-9a-f][0-9a-f]*\) leaf4k=\(0x[1-9a-f][0-9a-f]*\) leaf2m=\(0x[1-9a-f][0-9a-f]*\) satp=0x8[0-9a-f]*$/\1 \2 \3/p' \
+        "$output")
+    sv39_tables=${sv39_counts%% *}
+    sv39_rest=${sv39_counts#* }
+    sv39_leaf4k=${sv39_rest%% *}
+    sv39_leaf2m=${sv39_rest#* }
+    if [ -z "$sv39_counts" ] || [ "$sv39_tables" = "$sv39_counts" ] ||
+        [ "$sv39_leaf4k" = "$sv39_rest" ] ||
+        [ "$sv39_leaf2m" != "${sv39_leaf2m#* }" ] ||
+        [ "$((page_total - page_available))" -ne "$((sv39_tables))" ]; then
+        cat "$output" >&2
+        echo "expected active Sv39 with accounted 4 KiB and 2 MiB leaves" >&2
         exit 1
     fi
 }
