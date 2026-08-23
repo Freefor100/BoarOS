@@ -9,6 +9,7 @@ CROSS_COMPILE ?= $(shell \
 
 CC := $(CROSS_COMPILE)gcc
 NM := $(CROSS_COMPILE)nm
+OBJDUMP := $(CROSS_COMPILE)objdump
 READELF := $(CROSS_COMPILE)readelf
 QEMU_RISCV64 ?= qemu-system-riscv64
 QEMU_MEMORY ?= 1G
@@ -16,6 +17,9 @@ QEMU_MEMORY ?= 1G
 BUILD_DIR := build/riscv
 KERNEL_RV := kernel-rv
 TRAP_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-trap-rv
+TRAP_RETURN_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-trap-return-rv
+TRAP_RETURN_SIE_TEST_KERNEL_RV := \
+	$(BUILD_DIR)/tests/kernel-trap-return-sie-rv
 HIGH_HALF_TRAP_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-high-half-trap-rv
 NO_IDENTITY_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-no-identity-rv
 DTB_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-dtb-rv
@@ -64,8 +68,21 @@ TRAP_TEST_OBJECTS := \
 	$(TEST_RUNTIME_OBJECTS) \
 	$(patsubst %.c,$(BUILD_DIR)/%.o,$(TRAP_TEST_C_SOURCES)) \
 	$(patsubst %.S,$(BUILD_DIR)/%.o,$(TRAP_TEST_ASM_SOURCES))
+TRAP_RETURN_TEST_C_SOURCES := tests/riscv/trap_return_main.c
+TRAP_RETURN_TEST_ASM_SOURCES := tests/riscv/trap_return_trigger.S
+TRAP_RETURN_TEST_OBJECTS := \
+	$(TEST_RUNTIME_OBJECTS) \
+	$(patsubst %.c,$(BUILD_DIR)/%.o,$(TRAP_RETURN_TEST_C_SOURCES)) \
+	$(patsubst %.S,$(BUILD_DIR)/%.o,$(TRAP_RETURN_TEST_ASM_SOURCES))
+TRAP_RETURN_SIE_TEST_C_SOURCES := tests/riscv/trap_return_sie_main.c
+TRAP_RETURN_SIE_TEST_OBJECTS := \
+	$(TEST_RUNTIME_OBJECTS) \
+	$(patsubst %.c,$(BUILD_DIR)/%.o,$(TRAP_RETURN_SIE_TEST_C_SOURCES)) \
+	$(patsubst %.S,$(BUILD_DIR)/%.o,$(TRAP_RETURN_TEST_ASM_SOURCES))
 HIGH_HALF_TRAP_TEST_C_SOURCES := tests/riscv/high_half_trap.c
-HIGH_HALF_TRAP_TEST_ASM_SOURCES := tests/riscv/trap_trigger.S
+HIGH_HALF_TRAP_TEST_ASM_SOURCES := \
+	tests/riscv/trap_trigger.S \
+	tests/riscv/trap_return_trigger.S
 HIGH_HALF_TRAP_TEST_OBJECTS := \
 	$(OBJECTS) \
 	$(patsubst %.c,$(BUILD_DIR)/%.o,$(HIGH_HALF_TRAP_TEST_C_SOURCES)) \
@@ -111,6 +128,8 @@ SV39_FAULT_TEST_OBJECTS := \
 DEPS := \
 	$(OBJECTS:.o=.d) \
 	$(TRAP_TEST_OBJECTS:.o=.d) \
+	$(TRAP_RETURN_TEST_OBJECTS:.o=.d) \
+	$(TRAP_RETURN_SIE_TEST_OBJECTS:.o=.d) \
 	$(HIGH_HALF_TRAP_TEST_OBJECTS:.o=.d) \
 	$(NO_IDENTITY_TEST_OBJECTS:.o=.d) \
 	$(DTB_TEST_OBJECTS:.o=.d) \
@@ -121,7 +140,7 @@ DEPS := \
 .PHONY: all clean debug-riscv references run-riscv test-dtb-riscv \
 	test-high-half-trap-riscv test-no-identity-riscv test-page-riscv \
 	test-references test-riscv test-sv39-fault-riscv test-sv39-riscv \
-	test-trap-riscv
+	test-trap-riscv test-trap-return-riscv
 
 all: $(KERNEL_RV)
 
@@ -139,9 +158,22 @@ $(TRAP_TEST_KERNEL_RV): $(TRAP_TEST_OBJECTS) arch/riscv/linker.ld
 	$(CC) $(LDFLAGS) -Wl,-Map,$(BUILD_DIR)/tests/kernel-trap-rv.map \
 		-o $@ $(TRAP_TEST_OBJECTS)
 
+$(TRAP_RETURN_TEST_KERNEL_RV): $(TRAP_RETURN_TEST_OBJECTS) \
+		arch/riscv/linker.ld
+	$(CC) $(LDFLAGS) -Wl,--wrap=riscv_trap_dispatch \
+		-Wl,-Map,$(BUILD_DIR)/tests/kernel-trap-return-rv.map \
+		-o $@ $(TRAP_RETURN_TEST_OBJECTS)
+
+$(TRAP_RETURN_SIE_TEST_KERNEL_RV): $(TRAP_RETURN_SIE_TEST_OBJECTS) \
+		arch/riscv/linker.ld
+	$(CC) $(LDFLAGS) -Wl,--wrap=riscv_trap_dispatch \
+		-Wl,-Map,$(BUILD_DIR)/tests/kernel-trap-return-sie-rv.map \
+		-o $@ $(TRAP_RETURN_SIE_TEST_OBJECTS)
+
 $(HIGH_HALF_TRAP_TEST_KERNEL_RV): $(HIGH_HALF_TRAP_TEST_OBJECTS) \
 		arch/riscv/linker.ld
 	$(CC) $(LDFLAGS) -Wl,--wrap=sbi_shutdown \
+		-Wl,--wrap=riscv_trap_dispatch \
 		-Wl,-Map,$(BUILD_DIR)/tests/kernel-high-half-trap-rv.map \
 		-o $@ $(HIGH_HALF_TRAP_TEST_OBJECTS)
 
@@ -187,6 +219,7 @@ debug-riscv: $(KERNEL_RV)
 
 test-riscv: $(DTB_TEST_KERNEL_RV) $(PAGE_TEST_KERNEL_RV) \
 	$(SV39_TEST_KERNEL_RV) $(SV39_FAULT_TEST_KERNEL_RV) \
+	$(TRAP_RETURN_TEST_KERNEL_RV) $(TRAP_RETURN_SIE_TEST_KERNEL_RV) \
 	$(HIGH_HALF_TRAP_TEST_KERNEL_RV) $(NO_IDENTITY_TEST_KERNEL_RV) \
 	$(KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) \
@@ -198,6 +231,11 @@ test-riscv: $(DTB_TEST_KERNEL_RV) $(PAGE_TEST_KERNEL_RV) \
 	QEMU_RISCV64=$(QEMU_RISCV64) \
 		SV39_FAULT_TEST_KERNEL_RV=$(SV39_FAULT_TEST_KERNEL_RV) \
 		./tests/sv39-fault-riscv.sh
+	QEMU_RISCV64=$(QEMU_RISCV64) \
+		TRAP_RETURN_TEST_KERNEL_RV=$(TRAP_RETURN_TEST_KERNEL_RV) \
+		TRAP_RETURN_SIE_TEST_KERNEL_RV=$(TRAP_RETURN_SIE_TEST_KERNEL_RV) \
+		OBJDUMP_RV=$(OBJDUMP) \
+		./tests/trap-return-riscv.sh
 	QEMU_RISCV64=$(QEMU_RISCV64) NM_RV=$(NM) READELF_RV=$(READELF) \
 		./tests/boot-riscv.sh
 	QEMU_RISCV64=$(QEMU_RISCV64) NM_RV=$(NM) \
@@ -225,6 +263,13 @@ test-sv39-fault-riscv: $(SV39_FAULT_TEST_KERNEL_RV)
 
 test-trap-riscv: $(TRAP_TEST_KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) KERNEL_RV=$< ./tests/trap-riscv.sh
+
+test-trap-return-riscv: $(TRAP_RETURN_TEST_KERNEL_RV) \
+		$(TRAP_RETURN_SIE_TEST_KERNEL_RV)
+	QEMU_RISCV64=$(QEMU_RISCV64) TRAP_RETURN_TEST_KERNEL_RV=$< \
+		TRAP_RETURN_SIE_TEST_KERNEL_RV=$(TRAP_RETURN_SIE_TEST_KERNEL_RV) \
+		OBJDUMP_RV=$(OBJDUMP) \
+		./tests/trap-return-riscv.sh
 
 test-high-half-trap-riscv: $(HIGH_HALF_TRAP_TEST_KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) NM_RV=$(NM) \

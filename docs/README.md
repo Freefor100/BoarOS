@@ -8,11 +8,12 @@
 | [设计与工程原则](design.md) | 人—Agent 协作边界与默认技术原则 |
 | [工具链事实](toolchain.md) | 已验证的本地工具、Harness 和构建输入 |
 | [RISC-V 启动模块](modules/riscv-boot.md) | 当前启动代码的入口、契约、不变量和限制 |
-| [RISC-V 致命 Trap 模块](modules/riscv-trap.md) | S-mode trap 入口、诊断契约、测试和限制 |
+| [RISC-V Trap 模块](modules/riscv-trap.md) | S-mode Trap Frame、返回、诊断契约、测试和限制 |
 | [DTB 与启动内存布局模块](modules/dtb-memory.md) | RAM、静态保留区与可用物理区间的接口和限制 |
 | [物理页分配模块](modules/physical-pages.md) | 构建期页粒度、单页分配/释放契约和限制 |
 | [RISC-V Sv39 分页模块](modules/riscv-sv39.md) | 2 MiB/4 KiB 建表、激活、失败语义和当前地址空间 |
 | [RISC-V 启动学习总结](learning/riscv-boot.md) | 启动知识、BoarOS 的应用方式、平台差异和调试经验 |
+| [RISC-V Trap 学习总结](learning/riscv-traps.md) | Trap CSR、上下文保存、异常返回、中断确认和项目选择 |
 | [内存管理学习总结](learning/memory-management.md) | 内存与分页知识、架构能力、项目选择和验证依据 |
 | [第三方代码](third-party.md) | 实际引入的外部源码、版本与许可 |
 

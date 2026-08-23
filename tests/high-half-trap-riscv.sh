@@ -40,6 +40,7 @@ fi
 
 expected_breakpoint=$(symbol_value trap_test_breakpoint)
 expected_stvec=$(symbol_value riscv_trap_entry)
+expected_return_sepc=$(symbol_value trap_test_software_interrupt_resume)
 
 if ! timeout -k 2s 10s "$qemu" \
     -machine virt \
@@ -64,15 +65,31 @@ stvec=$(sed -n \
 actual_sepc=$(sed -n \
     's/^BoarOS: fatal trap scause=0x3 sepc=\(0x[0-9a-f]*\) stval=.*/\1/p' \
     "$output")
+return_sepc=$(sed -n \
+    's/^BoarOS: high-half trap return scause=0x8000000000000001 sepc=\(0x[0-9a-f]*\) frame=.*/\1/p' \
+    "$output")
+return_frame=$(sed -n \
+    's/^BoarOS: high-half trap return .* frame=\(0x[0-9a-f]*\) handler=0x0 registers=0x0$/\1/p' \
+    "$output")
 
 if [ "${breakpoint#0x}" != "$expected_breakpoint" ] ||
     [ "${stvec#0x}" != "$expected_stvec" ] ||
-    [ "$actual_sepc" != "$breakpoint" ]; then
+    [ "$actual_sepc" != "$breakpoint" ] ||
+    [ "${return_sepc#0x}" != "$expected_return_sepc" ]; then
     show_output
     echo "high-half trap context does not match ELF symbols" >&2
     echo "breakpoint=$expected_breakpoint stvec=$expected_stvec" >&2
     exit 1
 fi
+
+case $return_frame:$return_sepc:$actual_sepc in
+    0xffffffff[89a-f][0-9a-f]*:0xffffffff[89a-f][0-9a-f]*:0xffffffff[89a-f][0-9a-f]*) ;;
+    *)
+        show_output
+        echo "trap return or breakpoint did not use the Sv39 high half" >&2
+        exit 1
+        ;;
+esac
 
 case $actual_sepc in
     0xffffffff[89a-f][0-9a-f]*) ;;

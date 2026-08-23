@@ -1,24 +1,36 @@
 #include <arch/riscv/sbi.h>
+#include <arch/riscv/trap.h>
 #include <arch/riscv/virt_uart.h>
 
-void riscv_trap_fatal(unsigned long scause,
-                      unsigned long sepc,
-                      unsigned long stval,
-                      unsigned long sstatus) __attribute__((noreturn));
+static void riscv_trap_fatal(const struct riscv_trap_frame *frame)
+    __attribute__((noreturn));
 
-void riscv_trap_fatal(unsigned long scause,
-                      unsigned long sepc,
-                      unsigned long stval,
-                      unsigned long sstatus)
+static void riscv_trap_fatal(const struct riscv_trap_frame *frame)
 {
     virt_uart_puts("BoarOS: fatal trap scause=");
-    virt_uart_put_hex(scause);
+    virt_uart_put_hex(frame->scause);
     virt_uart_puts(" sepc=");
-    virt_uart_put_hex(sepc);
+    virt_uart_put_hex(frame->sepc);
     virt_uart_puts(" stval=");
-    virt_uart_put_hex(stval);
+    virt_uart_put_hex(frame->stval);
     virt_uart_puts(" sstatus=");
-    virt_uart_put_hex(sstatus);
+    virt_uart_put_hex(frame->sstatus);
+    virt_uart_putc('\n');
+
+    sbi_shutdown();
+}
+
+void riscv_trap_dispatch(struct riscv_trap_frame *frame)
+{
+    riscv_trap_fatal(frame);
+}
+
+void riscv_trap_bad_return(struct riscv_trap_frame *frame)
+{
+    virt_uart_puts("BoarOS: invalid trap return sstatus=");
+    virt_uart_put_hex(frame->sstatus);
+    virt_uart_puts(" sepc=");
+    virt_uart_put_hex(frame->sepc);
     virt_uart_putc('\n');
 
     sbi_shutdown();

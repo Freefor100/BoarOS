@@ -29,7 +29,8 @@ _start:
     la sp, __boot_stack_top
     andi sp, sp, -16
 
-    /* All early traps are fatal and share the initialized kernel stack. */
+    /* Kernel traps use the current stack; sscratch is reserved for U-mode. */
+    csrw sscratch, zero
     la t0, riscv_trap_entry
     csrw stvec, t0
 
