@@ -81,6 +81,8 @@ static void shutdown_for_sv39_error(enum riscv_sv39_status status)
         virt_uart_puts("BoarOS: no memory for Sv39 page tables\n");
     } else if (status == RISCV_SV39_STATUS_CONFLICT) {
         virt_uart_puts("BoarOS: conflicting Sv39 mapping\n");
+    } else if (status == RISCV_SV39_STATUS_STATE) {
+        virt_uart_puts("BoarOS: invalid Sv39 page-table state\n");
     } else {
         virt_uart_puts("BoarOS: unknown Sv39 error\n");
     }

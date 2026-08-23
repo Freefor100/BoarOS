@@ -17,6 +17,14 @@ enum riscv_sv39_status {
     RISCV_SV39_STATUS_INVALID,
     RISCV_SV39_STATUS_NO_MEMORY,
     RISCV_SV39_STATUS_CONFLICT,
+    RISCV_SV39_STATUS_STATE,
+};
+
+enum riscv_sv39_page_table_state {
+    RISCV_SV39_STATE_UNINITIALIZED = 0,
+    RISCV_SV39_STATE_BUILDING,
+    RISCV_SV39_STATE_FAILED,
+    RISCV_SV39_STATE_ACTIVE,
 };
 
 struct riscv_sv39_page_table {
@@ -25,19 +33,19 @@ struct riscv_sv39_page_table {
     uint64_t table_pages;
     uint64_t leaf_4k;
     uint64_t leaf_2m;
-    uint32_t initialized;
+    enum riscv_sv39_page_table_state state;
 };
 
-/* Every allocator range must end at or below the Sv39 56-bit PA limit. */
+/* The table object must be zero-initialized before its first initialization. */
 enum riscv_sv39_status riscv_sv39_page_table_init(
     struct riscv_sv39_page_table *table,
     struct physical_page_allocator *allocator);
 
 /*
  * Build mappings before activation, while every page-table physical address is
- * directly accessible.  A failure may leave earlier leaves and intermediate
- * tables installed; the caller must then abandon this page table and must not
- * activate it.
+ * directly accessible.  Invalid inputs leave a BUILDING table reusable.  An
+ * allocation or mapping conflict changes it to FAILED and may leave earlier
+ * leaves and intermediate tables installed.
  */
 enum riscv_sv39_status riscv_sv39_map_range(
     struct riscv_sv39_page_table *table,
@@ -46,8 +54,9 @@ enum riscv_sv39_status riscv_sv39_map_range(
     uint64_t size,
     uint32_t permissions);
 
+/* Both address spaces must keep the current execution context and table writable. */
 enum riscv_sv39_status riscv_sv39_activate(
-    const struct riscv_sv39_page_table *table);
+    struct riscv_sv39_page_table *table);
 
 uint64_t riscv_sv39_current_satp(void);
 

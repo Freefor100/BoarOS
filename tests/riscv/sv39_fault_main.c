@@ -124,6 +124,7 @@ void kernel_main(unsigned long hart_id, const void *dtb)
 {
     struct dtb_boot_info info;
     struct boot_memory_layout layout;
+    uint64_t available;
     uint64_t value;
 
     (void)hart_id;
@@ -136,8 +137,28 @@ void kernel_main(unsigned long hart_id, const void *dtb)
                           &layout) != BOOT_MEMORY_STATUS_OK ||
         physical_page_allocator_init(&allocator, &layout) !=
             PHYSICAL_PAGE_STATUS_OK ||
-        !build_page_table(&info) ||
-        riscv_sv39_activate(&page_table) != RISCV_SV39_STATUS_OK) {
+        !build_page_table(&info)) {
+        fail_setup();
+    }
+
+    if (riscv_sv39_activate(&page_table) != RISCV_SV39_STATUS_OK ||
+        page_table.state != RISCV_SV39_STATE_ACTIVE) {
+        fail_setup();
+    }
+    available = physical_page_available(&allocator);
+    if (riscv_sv39_map_range(&page_table,
+                             VIRT_UART_MMIO_BASE,
+                             VIRT_UART_MMIO_BASE,
+                             VIRT_UART_MMIO_SIZE,
+                             RISCV_SV39_READ | RISCV_SV39_WRITE) !=
+            RISCV_SV39_STATUS_STATE ||
+        riscv_sv39_activate(&page_table) != RISCV_SV39_STATUS_STATE ||
+        riscv_sv39_page_table_init(&page_table, &allocator) !=
+            RISCV_SV39_STATUS_STATE ||
+        riscv_sv39_page_table_init(&page_table, 0) !=
+            RISCV_SV39_STATUS_STATE ||
+        page_table.state != RISCV_SV39_STATE_ACTIVE ||
+        physical_page_available(&allocator) != available) {
         fail_setup();
     }
 

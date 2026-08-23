@@ -3,7 +3,6 @@
 
 #include <stdint.h>
 
-#define RISCV_SV39_INITIALIZED UINT32_C(0x53563339)
 #define RISCV_SV39_PTE_VALID UINT64_C(0x001)
 #define RISCV_SV39_PTE_READ UINT64_C(0x002)
 #define RISCV_SV39_PTE_WRITE UINT64_C(0x004)
@@ -147,7 +146,13 @@ enum riscv_sv39_status riscv_sv39_page_table_init(
     enum physical_page_status status;
     uint64_t root_address;
 
-    if (table == 0 || allocator == 0) {
+    if (table == 0) {
+        return RISCV_SV39_STATUS_INVALID;
+    }
+    if (table->state != RISCV_SV39_STATE_UNINITIALIZED) {
+        return RISCV_SV39_STATUS_STATE;
+    }
+    if (allocator == 0) {
         return RISCV_SV39_STATUS_INVALID;
     }
 
@@ -169,7 +174,7 @@ enum riscv_sv39_status riscv_sv39_page_table_init(
     result.table_pages = 1U;
     result.leaf_4k = 0U;
     result.leaf_2m = 0U;
-    result.initialized = RISCV_SV39_INITIALIZED;
+    result.state = RISCV_SV39_STATE_BUILDING;
     *table = result;
     return RISCV_SV39_STATUS_OK;
 }
@@ -246,9 +251,13 @@ enum riscv_sv39_status riscv_sv39_map_range(
 {
     uint64_t remaining = size;
 
-    if (table == 0 ||
-        table->initialized != RISCV_SV39_INITIALIZED ||
-        (virtual_address & (RISCV_SV39_PAGE_SIZE_4K - 1U)) != 0U ||
+    if (table == 0) {
+        return RISCV_SV39_STATUS_INVALID;
+    }
+    if (table->state != RISCV_SV39_STATE_BUILDING) {
+        return RISCV_SV39_STATUS_STATE;
+    }
+    if ((virtual_address & (RISCV_SV39_PAGE_SIZE_4K - 1U)) != 0U ||
         (physical_address & (RISCV_SV39_PAGE_SIZE_4K - 1U)) != 0U ||
         (size & (RISCV_SV39_PAGE_SIZE_4K - 1U)) != 0U ||
         !canonical_virtual_address(virtual_address) ||
@@ -276,6 +285,7 @@ enum riscv_sv39_status riscv_sv39_map_range(
                           leaf_size,
                           permissions);
         if (status != RISCV_SV39_STATUS_OK) {
+            table->state = RISCV_SV39_STATE_FAILED;
             return status;
         }
 
@@ -295,29 +305,44 @@ uint64_t riscv_sv39_current_satp(void)
     return value;
 }
 
-enum riscv_sv39_status riscv_sv39_activate(
-    const struct riscv_sv39_page_table *table)
+static void switch_satp(uint64_t value)
 {
+    __asm__ volatile("sfence.vma zero, zero" ::: "memory");
+    __asm__ volatile("csrw satp, %0" : : "r"(value) : "memory");
+    __asm__ volatile("sfence.vma zero, zero" ::: "memory");
+}
+
+enum riscv_sv39_status riscv_sv39_activate(
+    struct riscv_sv39_page_table *table)
+{
+    uint64_t previous_satp;
     uint64_t root_ppn;
     uint64_t satp;
 
-    if (table == 0 ||
-        table->initialized != RISCV_SV39_INITIALIZED ||
-        (table->root_address & BOAROS_PAGE_MASK) != 0U) {
+    if (table == 0) {
+        return RISCV_SV39_STATUS_INVALID;
+    }
+    if (table->state != RISCV_SV39_STATE_BUILDING) {
+        return RISCV_SV39_STATUS_STATE;
+    }
+    if ((table->root_address & BOAROS_PAGE_MASK) != 0U) {
+        table->state = RISCV_SV39_STATE_FAILED;
         return RISCV_SV39_STATUS_INVALID;
     }
 
     root_ppn = table->root_address >> BOAROS_PAGE_SHIFT;
     if ((root_ppn & ~RISCV_SV39_SATP_PPN_MASK) != 0U) {
+        table->state = RISCV_SV39_STATE_FAILED;
         return RISCV_SV39_STATUS_INVALID;
     }
     satp = RISCV_SV39_SATP_MODE | root_ppn;
 
-    __asm__ volatile("sfence.vma zero, zero" ::: "memory");
-    __asm__ volatile("csrw satp, %0" : : "r"(satp) : "memory");
-    __asm__ volatile("sfence.vma zero, zero" ::: "memory");
-
+    previous_satp = riscv_sv39_current_satp();
+    table->state = RISCV_SV39_STATE_ACTIVE;
+    switch_satp(satp);
     if (riscv_sv39_current_satp() != satp) {
+        switch_satp(previous_satp);
+        table->state = RISCV_SV39_STATE_FAILED;
         return RISCV_SV39_STATUS_INVALID;
     }
 
