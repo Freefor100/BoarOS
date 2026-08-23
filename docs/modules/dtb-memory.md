@@ -33,7 +33,7 @@
 - [OpenSBI v1.8.1 `fdt_fixup.c`](https://github.com/riscv-software-src/opensbi/blob/v1.8.1/lib/utils/fdt/fdt_fixup.c)：OpenSBI 将固件/PMP 保护范围加入 `/reserved-memory`
 - Linux `f4cdf7ca9a1f` 的 [`drivers/of/fdt.c`](https://github.com/torvalds/linux/blob/f4cdf7ca9a1fdcca413157df19753f388a5a224e/drivers/of/fdt.c) 与 [`arch/riscv/mm/init.c`](https://github.com/torvalds/linux/blob/f4cdf7ca9a1fdcca413157df19753f388a5a224e/arch/riscv/mm/init.c)：确认 RAM 发现、静态保留区、内核和 DTB 自保留的启动顺序
 
-本地 Linux 浅克隆保存在被忽略的 `references/linux/`；项目没有复制上述来源的代码，因此不构成第三方源码引入。
+本地 Linux 固定提交快照保存在被忽略的 `references/linux/`；项目没有复制上述来源的代码，因此不构成第三方源码引入。
 
 ## 验证与限制
 
@@ -44,4 +44,4 @@ make test-riscv
 
 聚焦测试覆盖一或两个 cell、多 tuple、两类静态保留区、容量上限、动态和 `status` unsupported、畸形输入、失败输出不变，以及布局的裁剪、合并、耗尽和溢出。完整启动测试在 QEMU `virt` 的 512 MiB 与 1 GiB 配置下验证真实 OpenSBI DTB、原始 RAM 大小和非空启动布局。
 
-当前没有多 RAM bank、动态 reserved-memory、页对齐、物理页分配、NUMA、热插拔或 CMA 语义。
+本模块仍不处理多 RAM bank、动态 reserved-memory、NUMA、热插拔或 CMA；页边界收缩和单页分配由[物理页分配模块](physical-pages.md)承担。

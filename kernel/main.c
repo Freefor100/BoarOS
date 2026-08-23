@@ -2,11 +2,14 @@
 #include <arch/riscv/virt_uart.h>
 #include <kernel/boot_memory.h>
 #include <kernel/dtb.h>
+#include <kernel/physical_page.h>
 
 #include <stdint.h>
 
 extern unsigned char __kernel_start[];
 extern unsigned char __kernel_end[];
+
+static struct physical_page_allocator page_allocator;
 
 static void shutdown_for_dtb_error(enum dtb_status status)
     __attribute__((noreturn));
@@ -42,12 +45,29 @@ static void shutdown_for_boot_memory_error(enum boot_memory_status status)
     sbi_shutdown();
 }
 
+static void shutdown_for_physical_page_error(enum physical_page_status status)
+    __attribute__((noreturn));
+
+static void shutdown_for_physical_page_error(enum physical_page_status status)
+{
+    if (status == PHYSICAL_PAGE_STATUS_INVALID) {
+        virt_uart_puts("BoarOS: invalid physical page layout\n");
+    } else if (status == PHYSICAL_PAGE_STATUS_EMPTY) {
+        virt_uart_puts("BoarOS: no complete physical pages\n");
+    } else {
+        virt_uart_puts("BoarOS: unknown physical page error\n");
+    }
+
+    sbi_shutdown();
+}
+
 void kernel_main(unsigned long hart_id, const void *dtb)
 {
     struct dtb_boot_info info;
     struct boot_memory_layout layout;
     enum dtb_status dtb_status = dtb_read_boot_info(dtb, &info);
     enum boot_memory_status memory_status;
+    enum physical_page_status page_status;
 
     if (dtb_status != DTB_STATUS_OK) {
         shutdown_for_dtb_error(dtb_status);
@@ -61,6 +81,11 @@ void kernel_main(unsigned long hart_id, const void *dtb)
         &layout);
     if (memory_status != BOOT_MEMORY_STATUS_OK) {
         shutdown_for_boot_memory_error(memory_status);
+    }
+
+    page_status = physical_page_allocator_init(&page_allocator, &layout);
+    if (page_status != PHYSICAL_PAGE_STATUS_OK) {
+        shutdown_for_physical_page_error(page_status);
     }
 
     virt_uart_puts("BoarOS: booted hart=");
@@ -91,6 +116,13 @@ void kernel_main(unsigned long hart_id, const void *dtb)
     virt_uart_put_hex((unsigned long)layout.usable[0].base);
     virt_uart_puts(" size=");
     virt_uart_put_hex((unsigned long)layout.usable[0].size);
+    virt_uart_putc('\n');
+
+    virt_uart_puts("BoarOS: physical pages total=");
+    virt_uart_put_hex((unsigned long)physical_page_total(&page_allocator));
+    virt_uart_puts(" available=");
+    virt_uart_put_hex(
+        (unsigned long)physical_page_available(&page_allocator));
     virt_uart_putc('\n');
 
     sbi_shutdown();

@@ -51,6 +51,7 @@ struct blob_builder {
 static struct blob_builder test_blob;
 
 void run_boot_memory_tests(void);
+void run_physical_page_tests(void);
 
 static void write_be32(unsigned char *bytes, uint32_t value)
 {
@@ -717,6 +718,7 @@ void kernel_main(unsigned long hart_id, const void *dtb)
     test_reports_memory_status_property();
     test_reports_reserved_memory_status_property();
     run_boot_memory_tests();
+    run_physical_page_tests();
 
     virt_uart_puts("BoarOS: DTB parser tests passed\n");
     sbi_shutdown();

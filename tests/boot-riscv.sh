@@ -2,7 +2,7 @@
 
 set -eu
 
-project_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+project_root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 kernel="$project_root/kernel-rv"
 qemu=${QEMU_RISCV64:-qemu-system-riscv64}
 output_dir=$(mktemp -d)
@@ -76,6 +76,19 @@ run_case()
     if ! grep -Eq '^BoarOS: first usable base=0x[1-9a-f][0-9a-f]* size=0x[1-9a-f][0-9a-f]*$' "$output"; then
         cat "$output" >&2
         echo "expected a concrete first usable range" >&2
+        exit 1
+    fi
+
+    page_counts=$(sed -n \
+        's/^BoarOS: physical pages total=\(0x[1-9a-f][0-9a-f]*\) available=\(0x[1-9a-f][0-9a-f]*\)$/\1 \2/p' \
+        "$output")
+    page_total=${page_counts%% *}
+    page_available=${page_counts#* }
+    if [ -z "$page_counts" ] || [ "$page_total" = "$page_counts" ] ||
+        [ "$page_available" != "${page_available#* }" ] ||
+        [ "$page_total" != "$page_available" ]; then
+        cat "$output" >&2
+        echo "expected one initialized physical page allocator" >&2
         exit 1
     fi
 }

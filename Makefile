@@ -17,7 +17,7 @@ TRAP_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-trap-rv
 DTB_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-dtb-rv
 
 ARCH_FLAGS := -march=rv64imac_zicsr_zifencei -mabi=lp64 -mcmodel=medany
-CPPFLAGS := -Iinclude
+CPPFLAGS := -Iinclude -DBOAROS_PAGE_SHIFT=12
 CFLAGS := $(ARCH_FLAGS) -std=gnu11 -O2 -g3 \
 	-ffreestanding -fno-builtin -fno-stack-protector -fno-pic -fno-pie \
 	-ffunction-sections -fdata-sections -Wall -Wextra -Werror
@@ -31,7 +31,8 @@ C_SOURCES := \
 	arch/riscv/virt_uart.c \
 	kernel/boot_memory.c \
 	kernel/dtb.c \
-	kernel/main.c
+	kernel/main.c \
+	kernel/physical_page.c
 ASM_SOURCES := \
 	arch/riscv/boot.S \
 	arch/riscv/trap_entry.S
@@ -46,7 +47,8 @@ TRAP_TEST_OBJECTS := \
 	$(patsubst %.S,$(BUILD_DIR)/%.o,$(TRAP_TEST_ASM_SOURCES))
 DTB_TEST_C_SOURCES := \
 	tests/riscv/boot_memory_cases.c \
-	tests/riscv/dtb_main.c
+	tests/riscv/dtb_main.c \
+	tests/riscv/physical_page_cases.c
 DTB_TEST_OBJECTS := \
 	$(filter-out $(BUILD_DIR)/kernel/main.o,$(OBJECTS)) \
 	$(patsubst %.c,$(BUILD_DIR)/%.o,$(DTB_TEST_C_SOURCES))
