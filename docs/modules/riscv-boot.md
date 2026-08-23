@@ -41,4 +41,4 @@ make test-riscv
 make debug-riscv
 ```
 
-`make test-riscv` 先运行 DTB 与布局聚焦测试，再在 512 MiB 与 1 GiB 下各启动一次正常内核，要求 hart ID 为 0、DTB 地址随 RAM 大小变化、解析出的基址恒为 `0x80000000`、大小分别为 `0x20000000` 与 `0x40000000`、启动布局非空，且 QEMU 经 SBI 正常退出。`make debug-riscv` 会在第一条 guest 指令前暂停，并在宿主 TCP 端口 1234 等待 GDB。
+`make test-riscv` 先分别运行 DTB/布局与物理页分配聚焦测试，再在 512 MiB 与 1 GiB 下各启动一次正常内核，要求 hart ID 为 0、DTB 地址随 RAM 大小变化、解析出的基址恒为 `0x80000000`、大小分别为 `0x20000000` 与 `0x40000000`、启动布局非空，且 QEMU 经 SBI 正常退出。`make debug-riscv` 会在第一条 guest 指令前暂停，并在宿主 TCP 端口 1234 等待 GDB。

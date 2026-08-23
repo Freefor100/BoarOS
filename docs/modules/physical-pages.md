@@ -10,6 +10,7 @@
 | `include/kernel/page.h` | 从构建目标导出页大小和掩码 |
 | `include/kernel/physical_page.h`、`kernel/physical_page.c` | 初始化显式分配器对象并提供单页分配、释放和计数查询 |
 | `tests/riscv/physical_page_cases.c` | 验证区间对齐、状态变化和错误契约 |
+| `tests/riscv/physical_page_main.c`、`tests/page-riscv.sh` | 构建并运行独立的 QEMU 聚焦测试内核 |
 
 RISC-V64 构建固定 `BOAROS_PAGE_SHIFT=12`。初始化把每个字节粒度可用区间
 向内收缩到完整页，拒绝溢出、乱序或重叠输入；不足一页的碎片被忽略。失败不会
@@ -34,7 +35,7 @@ RAM。释放页组成侵入式回收链表；重复释放检测扫描该链表�
 ## 验证
 
 ```sh
-make test-dtb-riscv
+make test-page-riscv
 make test-riscv
 ```
 

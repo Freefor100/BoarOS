@@ -12,7 +12,7 @@ BoarOS 是一个从零学习并面向 OS Comp 能力建设的 C + 汇编类 Linu
 - 启动代码安装 Direct-mode `stvec`；同步 trap 会输出 `scause`、`sepc`、`stval`、`sstatus` 后关机。
 - 内核校验并扫描 DTB，读取第一段 RAM 和静态保留区，排除固件、内核镜像与 DTB 自身占用后形成启动内存布局。
 - 物理页分配器按 4 KiB 向内对齐可用区间，支持单页分配、释放、耗尽和重复释放诊断。
-- 自动测试验证致命 trap 路径，并在 512 MiB 和 1 GiB 两种 guest RAM 配置下验证完整启动链、DTB 交接、物理内存范围与非空启动布局。
+- 自动测试分别验证 DTB 与启动布局、物理页状态机和致命 trap，并在 512 MiB 和 1 GiB 两种 guest RAM 配置下验证完整启动链。
 
 当前只支持 RISC-V64 单 hart 启动、致命 trap 诊断、DTB 中第一段物理内存和静态保留区的启动布局，以及最小物理页分配；trap 恢复、分页、中断、用户态和 LoongArch64 均未实现。完整比赛 Harness 仍会因缺少 `kernel-la` 失败。
 
@@ -27,6 +27,7 @@ make all
 make run-riscv
 make test-riscv
 make test-dtb-riscv
+make test-page-riscv
 make test-trap-riscv
 make test-references
 ```
@@ -44,6 +45,7 @@ make test-references
 - [DTB 与启动内存布局模块](docs/modules/dtb-memory.md)
 - [物理页分配模块](docs/modules/physical-pages.md)
 - [RISC-V 启动学习记录](docs/learning/riscv-boot.md)
+- [内存管理学习记录](docs/learning/memory-management.md)
 - [目标与边界](docs/goals.md)
 - [设计与工程原则](docs/design.md)
 - [工具链事实](docs/toolchain.md)

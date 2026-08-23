@@ -15,6 +15,7 @@ BUILD_DIR := build/riscv
 KERNEL_RV := kernel-rv
 TRAP_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-trap-rv
 DTB_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-dtb-rv
+PAGE_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-page-rv
 
 ARCH_FLAGS := -march=rv64imac_zicsr_zifencei -mabi=lp64 -mcmodel=medany
 CPPFLAGS := -Iinclude -DBOAROS_PAGE_SHIFT=12
@@ -39,26 +40,45 @@ ASM_SOURCES := \
 OBJECTS := \
 	$(patsubst %.c,$(BUILD_DIR)/%.o,$(C_SOURCES)) \
 	$(patsubst %.S,$(BUILD_DIR)/%.o,$(ASM_SOURCES))
+TEST_RUNTIME_C_SOURCES := \
+	arch/riscv/sbi.c \
+	arch/riscv/trap.c \
+	arch/riscv/virt_uart.c
+TEST_RUNTIME_ASM_SOURCES := \
+	arch/riscv/boot.S \
+	arch/riscv/trap_entry.S
+TEST_RUNTIME_OBJECTS := \
+	$(patsubst %.c,$(BUILD_DIR)/%.o,$(TEST_RUNTIME_C_SOURCES)) \
+	$(patsubst %.S,$(BUILD_DIR)/%.o,$(TEST_RUNTIME_ASM_SOURCES))
 TRAP_TEST_C_SOURCES := tests/riscv/trap_main.c
 TRAP_TEST_ASM_SOURCES := tests/riscv/trap_trigger.S
 TRAP_TEST_OBJECTS := \
-	$(filter-out $(BUILD_DIR)/kernel/main.o,$(OBJECTS)) \
+	$(TEST_RUNTIME_OBJECTS) \
 	$(patsubst %.c,$(BUILD_DIR)/%.o,$(TRAP_TEST_C_SOURCES)) \
 	$(patsubst %.S,$(BUILD_DIR)/%.o,$(TRAP_TEST_ASM_SOURCES))
 DTB_TEST_C_SOURCES := \
+	kernel/boot_memory.c \
+	kernel/dtb.c \
 	tests/riscv/boot_memory_cases.c \
-	tests/riscv/dtb_main.c \
-	tests/riscv/physical_page_cases.c
+	tests/riscv/dtb_main.c
 DTB_TEST_OBJECTS := \
-	$(filter-out $(BUILD_DIR)/kernel/main.o,$(OBJECTS)) \
+	$(TEST_RUNTIME_OBJECTS) \
 	$(patsubst %.c,$(BUILD_DIR)/%.o,$(DTB_TEST_C_SOURCES))
+PAGE_TEST_C_SOURCES := \
+	kernel/physical_page.c \
+	tests/riscv/physical_page_cases.c \
+	tests/riscv/physical_page_main.c
+PAGE_TEST_OBJECTS := \
+	$(TEST_RUNTIME_OBJECTS) \
+	$(patsubst %.c,$(BUILD_DIR)/%.o,$(PAGE_TEST_C_SOURCES))
 DEPS := \
 	$(OBJECTS:.o=.d) \
 	$(TRAP_TEST_OBJECTS:.o=.d) \
-	$(DTB_TEST_OBJECTS:.o=.d)
+	$(DTB_TEST_OBJECTS:.o=.d) \
+	$(PAGE_TEST_OBJECTS:.o=.d)
 
 .PHONY: all clean debug-riscv references run-riscv test-dtb-riscv \
-	test-references test-riscv test-trap-riscv
+	test-page-riscv test-references test-riscv test-trap-riscv
 
 all: $(KERNEL_RV)
 
@@ -80,6 +100,10 @@ $(DTB_TEST_KERNEL_RV): $(DTB_TEST_OBJECTS) arch/riscv/linker.ld
 	$(CC) $(LDFLAGS) -Wl,-Map,$(BUILD_DIR)/tests/kernel-dtb-rv.map \
 		-o $@ $(DTB_TEST_OBJECTS)
 
+$(PAGE_TEST_KERNEL_RV): $(PAGE_TEST_OBJECTS) arch/riscv/linker.ld
+	$(CC) $(LDFLAGS) -Wl,-Map,$(BUILD_DIR)/tests/kernel-page-rv.map \
+		-o $@ $(PAGE_TEST_OBJECTS)
+
 $(BUILD_DIR)/%.o: %.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c $< -o $@
@@ -96,12 +120,20 @@ debug-riscv: $(KERNEL_RV)
 	$(QEMU_RISCV64) -machine virt -bios default -kernel $< \
 		-m $(QEMU_MEMORY) -smp 1 -nographic -no-reboot -S -s
 
-test-riscv: test-dtb-riscv $(KERNEL_RV)
+test-riscv: $(DTB_TEST_KERNEL_RV) $(PAGE_TEST_KERNEL_RV) $(KERNEL_RV)
+	QEMU_RISCV64=$(QEMU_RISCV64) \
+		DTB_TEST_KERNEL_RV=$(DTB_TEST_KERNEL_RV) ./tests/dtb-riscv.sh
+	QEMU_RISCV64=$(QEMU_RISCV64) \
+		PAGE_TEST_KERNEL_RV=$(PAGE_TEST_KERNEL_RV) ./tests/page-riscv.sh
 	QEMU_RISCV64=$(QEMU_RISCV64) ./tests/boot-riscv.sh
 
 test-dtb-riscv: $(DTB_TEST_KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) DTB_TEST_KERNEL_RV=$< \
 		./tests/dtb-riscv.sh
+
+test-page-riscv: $(PAGE_TEST_KERNEL_RV)
+	QEMU_RISCV64=$(QEMU_RISCV64) PAGE_TEST_KERNEL_RV=$< \
+		./tests/page-riscv.sh
 
 test-trap-riscv: $(TRAP_TEST_KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) KERNEL_RV=$< ./tests/trap-riscv.sh
