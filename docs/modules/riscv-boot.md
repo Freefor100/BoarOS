@@ -1,6 +1,6 @@
 # RISC-V 启动模块
 
-本文描述当前代码的稳定事实。构建、地址与固件交接的个人理解见 [RISC-V 启动学习记录](../learning/riscv-boot.md)，异常诊断契约见 [RISC-V 致命 Trap 模块](riscv-trap.md)，启动内存边界见 [DTB 与启动内存布局模块](dtb-memory.md)。
+本文描述当前代码的稳定事实。构建、地址空间与固件交接的背景知识见 [RISC-V 启动知识](../learning/riscv-boot.md)，异常诊断契约见 [RISC-V 致命 Trap 模块](riscv-trap.md)，启动内存边界见 [DTB 与启动内存布局模块](dtb-memory.md)。
 
 ## 范围与入口
 

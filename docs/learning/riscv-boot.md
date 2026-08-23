@@ -1,92 +1,95 @@
-# RISC-V 启动学习记录
+# RISC-V 启动知识
 
-这份记录来自启动阶段的实际提问和调试。当前代码契约以 [RISC-V 启动模块](../modules/riscv-boot.md) 为准。
+本文整理从零理解 RISC-V 内核启动所需的基础知识。BoarOS 当前实现的入口、地址和限制以 [RISC-V 启动模块](../modules/riscv-boot.md) 为准。
 
-## 源码怎样变成 QEMU 中运行的内核？
+## 源码怎样变成可启动内核？
 
-**理解**
-
-CPU 不执行 C、汇编文本或 Makefile。Make 根据依赖调用 `riscv64-unknown-elf-gcc`：C 和 `.S` 先变成 RISC-V 对象文件，链接器再按 `arch/riscv/linker.ld` 合成 `kernel-rv`。这个 ELF 同时保存机器码、`PT_LOAD` 段的 guest 装载地址、入口 `0x80200000` 和调试符号。
-
-`qemu-system-riscv64` 模拟整台 `virt` 机器，而不是在宿主 Linux 中运行普通进程。`-kernel kernel-rv` 让 QEMU 解析 ELF 并把加载段放进 guest RAM；虚拟 CPU 仍从 reset ROM 开始，经过默认 OpenSBI 后才以 S-mode 进入 ELF 的 `_start`。
+CPU 只能执行目标架构的机器指令。C 源码先由交叉编译器生成 RISC-V 对象文件，汇编源码由汇编器生成对象文件，链接器再把这些对象文件和链接脚本合成 ELF：
 
 ```text
-C / .S -> RISC-V 对象 -> linker script -> kernel-rv ELF
-                                                |
-QEMU reset ROM -> OpenSBI --------------------> _start -> kernel_main
+C / 汇编源码 -> 目标文件 -> 链接器 + 链接脚本 -> ELF 内核
 ```
 
-**证据**
+对象文件已经包含机器码和数据，但其中的符号地址可能尚未确定。链接器负责解析跨文件符号、安排代码和数据的位置，并生成最终入口地址。
+
+ELF 中与内核启动最相关的内容有：
+
+- ELF header：记录目标架构、入口地址和其他表的位置。
+- program header：描述加载器应把哪些 `PT_LOAD` 段放到什么地址，并区分文件大小与内存大小。
+- section：按链接用途组织 `.text`、`.rodata`、`.data`、`.bss` 等内容。
+- symbol table：保存函数和对象符号，便于链接、反汇编和调试；运行时加载通常不依赖它。
+
+`.bss` 表示初值为零的静态存储区。ELF 不必为整段零数据保存文件内容，因此启动代码必须根据链接器符号把对应内存清零。
+
+裸机或内核构建使用 freestanding 环境：编译器不能假设宿主操作系统、C 运行库、进程入口、系统调用或标准输出存在。即使源码是 C，栈、静态数据初始化和硬件输出仍要由内核自己建立。
+
+常用检查工具：
 
 ```sh
-make all
-file kernel-rv
 riscv64-unknown-elf-readelf -h -l -s kernel-rv
+riscv64-unknown-elf-objdump -d kernel-rv
+riscv64-unknown-elf-nm -u kernel-rv
 ```
 
-`file` 应识别 ELF64 RISC-V；`readelf` 应显示入口 `0x80200000` 和对应的加载段。`riscv64-unknown-elf-nm -u kernel-rv` 不应列出未解析符号。
+工具链前缀可能因发行版而不同。`readelf` 查看入口和加载段，`objdump` 查看机器指令，`nm -u` 查看是否仍有未解析符号。
 
-## 固定地址、内存、端口分别是谁的？
+## CPU、固件与内核怎样交接？
 
-**理解**
+RISC-V 定义了多个特权级：M-mode 管理机器级资源，S-mode 通常运行操作系统内核，U-mode 运行用户程序。CPU 复位后不会直接调用 C 函数，而是从平台规定的复位入口执行固件代码。
 
-QEMU `virt` 为虚拟 CPU 建立 guest 物理地址空间。分页尚未开启，因此当前内核直接使用 guest 物理地址，但同一地址空间既包含 RAM，也包含 ROM 和 MMIO：
+OpenSBI 是常见的 RISC-V M-mode 固件。它完成机器级初始化，再把控制权交给 S-mode 内核。常见交接约定是：
 
-| 地址或位置 | 含义 | 决定者 |
-|---|---|---|
-| `0x1000` | reset ROM 中的复位入口 | QEMU `virt` |
-| `0x80000000` 起 | guest RAM；当前 OpenSBI 位于开头 | QEMU 机型、`-m` 与固件布局 |
-| `0x80200000` 起 | BoarOS ELF 加载段和 `_start` | 链接脚本选择，QEMU 按 ELF 装载，OpenSBI 按交接信息跳转 |
-| `0x10000000` | NS16550A UART 的 MMIO 寄存器 | QEMU `virt` 地址图 |
-| `a1` 指向的位置 | QEMU 生成的 DTB，位于 guest RAM 且会随内存布局改变 | QEMU 生成，OpenSBI 传递 |
-| TCP `1234` | `-s` 创建的宿主 GDB 监听端口 | QEMU 宿主进程 |
+- `a0` 保存启动 hart 的 ID。
+- `a1` 保存设备树 DTB 的物理地址。
+- 跳转目标是内核 ELF 的入口。
 
-RAM 地址指向可存放字节的虚拟内存条；ROM 是 guest 只读启动代码；MMIO 地址由 QEMU 译码后送到设备模型。宿主 TCP 端口不在 guest 地址空间，也不是 UART 的“端口”。真机上相同角色由 SoC 地址图、固件和设备树承担。
+这些值是启动 ABI 的一部分。内核应在复用参数寄存器之前保存它们，不能假设固件留下的栈、全局指针或中断状态适合内核继续使用。
 
-**证据**
+S-mode 不能直接执行所有机器级操作。SBI 定义了 S-mode 通过 `ecall` 请求 M-mode 固件提供服务的调用约定，例如系统复位、关机、时钟和处理器间中断。扩展号、函数号和参数放在规定的 `a` 寄存器中，返回值也通过寄存器传回。
 
-`make debug-riscv` 后连接 GDB，可以依次观察 reset `0x1000`、OpenSBI `0x80000000` 和 `_start 0x80200000`。分别使用 512 MiB 与 1 GiB 运行时，入口保持不变，启动行中的 DTB 地址改变。
+## 为什么进入 C 之前需要汇编？
 
-## 为什么必须先执行汇编入口？
+C 编译器生成的代码遵守 RISC-V ABI，并默认若干运行条件已经成立：
 
-**理解**
+- `sp` 指向有效栈，且满足 ABI 对齐要求。
+- `gp` 在需要时能访问小数据区。
+- `.bss` 已经清零，因此无显式初值的静态对象初值为零。
+- 当前中断和异常状态与可用处理程序一致。
+- 调用参数位于 ABI 规定的寄存器中。
 
-C 调用约定已经假设栈、`gp` 和零初始化静态数据可用，固件却只承诺 `a0/a1` 等入口信息，留下的 `sp` 不属于内核。`boot.S` 因而在不能依赖 C 环境时保存参数、初始化 `gp`、关闭尚无处理函数的中断、清零 BSS、建立 16 字节对齐的 4 KiB 栈，再调用 `kernel_main`。如果 C 入口意外返回，汇编停在 `wfi` 循环，避免执行未知地址。
+固件通常只保证启动 ABI，不会替内核建立这些 C 运行条件。因此最早的入口使用少量汇编完成：保存固件参数、选择内核栈、初始化 `gp`、清零 `.bss`、设置必要的控制寄存器，再按 ABI 调用 C 入口。
 
-**证据**
+栈通常向低地址增长。RISC-V 的标准调用约定要求调用边界上的栈指针保持 16 字节对齐。启动栈还必须避开内核镜像、固件、设备树和其他保留区域。
 
-在 `_start` 与 `kernel_main` 设置断点，前者可看到 OpenSBI 传来的 `a0/a1` 和尚未建立的内核栈，后者可看到 `sp` 已落入链接脚本预留的启动栈。
+## 物理地址、虚拟地址和 MMIO 有什么区别？
 
-## UART 字符怎样到终端，SBI 怎样关闭 QEMU？
+CPU 发出的地址最终要在平台地址空间中解释。分页关闭时，S-mode 使用的地址直接作为物理地址；分页开启后，虚拟地址先经过页表翻译，再得到物理地址。
 
-**理解**
+物理地址空间不只包含 RAM：
 
-内核向 guest 地址 `0x10000000` 写字节时，QEMU 把 store 交给 NS16550A 模型；`-nographic` 再把该设备的字符后端连接到宿主终端或重定向日志。这条路径没有调用宿主 `printf`。
+- RAM 保存普通代码和数据。
+- ROM 常用于复位和固件入口。
+- MMIO 区间由设备控制器响应，读写会访问设备寄存器而不是内存条。
 
-S-mode 无权直接完成所有机器级操作。内核按 SBI ABI 把扩展、函数和参数放入 `a7/a6/a0/a1` 后执行 `ecall`，CPU 陷入 M-mode 的 OpenSBI；OpenSBI 处理 SRST shutdown 请求，最终让 QEMU 进程退出。
+QEMU `virt` 模拟的是一台完整 RISC-V 机器。它的 RAM、UART、PLIC、CLINT 等都有 guest 物理地址；这些地址与宿主进程的虚拟地址、文件描述符和 TCP 端口不是同一地址空间。QEMU 的 `-m` 可以改变 guest RAM 大小，设备树和固件负责把实际布局传给内核，因此内核不能根据一次运行观察到的地址推导所有平台。
 
-**证据**
+分页切换时，当前执行的代码、栈、页表、异常入口和用于输出的 MMIO 都必须在新地址空间中仍然可访问，否则 CPU 会在切换后的第一批取指或访存中产生异常。
 
-`make run-riscv` 会显示 OpenSBI 信息和一行 `BoarOS: booted ...`，随后返回 shell。若 SBI 调用返回，代码会打印 `BoarOS: SBI shutdown failed` 并停住，测试以超时报错。
+## UART 输出怎样到达宿主终端？
 
-## 为什么 `make test-riscv` 曾只打印 512M 后停住？
+UART 是串行控制器。轮询发送通常先读取线路状态寄存器，确认发送保持寄存器可写，再把一个字节写入发送寄存器。由于 MMIO 读写具有设备副作用，编译器和 CPU 不能像普通内存一样随意删除或重排这些访问；具体代码要遵守架构的设备内存和顺序规则。
 
-**现象**
+QEMU 收到 guest 对 UART MMIO 的访问后，把字符交给配置的字符后端。`-nographic` 常把该后端接到宿主终端，所以屏幕上的字符来自“内核写 MMIO → QEMU 设备模型 → 宿主字符后端”，不是内核调用了宿主 `printf`。
 
-在真实 Linux 终端中执行测试，只出现 `RISC-V boot test: memory=512M`，进程没有按 10 秒超时返回。
+## 怎样观察启动过程？
 
-**根因**
+启动错误经常发生在 C 环境和完整日志尚不可用时，常用手段包括：
 
-GNU `timeout` 默认把受控命令放进独立进程组。QEMU 的 `-nographic` 使用 stdio；当这个进程组相对终端处于后台并尝试读取或调整终端时，Linux job control 会发送 `SIGTTIN` 或 `SIGTTOU`。`timeout` 与 QEMU 同组并一起停止，计时器也无法继续，所以表面上像超时失效。
+- 用 `readelf` 确认入口、加载地址和段大小。
+- 用 `objdump` 对照入口附近的汇编和机器指令。
+- 用链接 map 或 `nm` 确认栈、`.bss` 和边界符号的位置。
+- 用 QEMU `-S -s` 在第一条 guest 指令前暂停，并通过 GDB 观察寄存器、内存和控制流。
+- 在汇编早期路径中逐步增加最小 UART 标记，定位执行停在哪个阶段。
+- 自动化 QEMU 时把非交互 stdin 接到 `/dev/null`，把输出写入日志，并由宿主超时机制处理无法退出的 guest。
 
-**修复与证据**
-
-自动测试不需要键盘输入，因此 QEMU 的 stdin 改接 `/dev/null`，stdout/stderr 写入单次运行日志：
-
-```sh
-... qemu-system-riscv64 ... </dev/null >"$output" 2>&1
-```
-
-修复后真实 PTY 中的 512 MiB 和 1 GiB 两个实例都会结束。`run-riscv` 与 `debug-riscv` 仍保留交互终端；前者可用 `Ctrl-a x` 手工退出，后者因 `-S -s` 等待 GDB 而保持运行。
-
-这次调试留下的通用经验是：终端中的“卡住”不一定是 guest 死循环；先检查宿主进程状态、进程组和信号，再判断 QEMU 或内核是否仍在执行。
+“终端没有新输出”不能单独证明 guest 死循环。还应检查 QEMU 进程状态、宿主信号、GDB 中的程序计数器，以及 UART 和 SBI 调用是否真的发生。
