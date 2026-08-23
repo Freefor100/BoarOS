@@ -1,7 +1,6 @@
 # 物理页分配模块
 
-本文描述启动期物理页分配器的稳定接口。它消费
-`boot_memory_layout.usable[]`，不重新发现 RAM，也不解释 DTB。
+本文描述启动期物理页分配器的稳定接口。相关概念、算法选择理由和分页关系见 [内存管理学习总结](../learning/memory-management.md)。它消费 `boot_memory_layout.usable[]`，不重新发现 RAM，也不解释 DTB。
 
 ## 入口与契约
 

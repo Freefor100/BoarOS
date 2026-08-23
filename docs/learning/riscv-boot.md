@@ -1,6 +1,6 @@
-# RISC-V 启动知识
+# RISC-V 启动学习总结
 
-本文整理从零理解 RISC-V 内核启动所需的基础知识。BoarOS 当前实现的入口、地址和限制以 [RISC-V 启动模块](../modules/riscv-boot.md) 为准。
+本文整理 RISC-V 启动阶段需要掌握的知识、BoarOS 已经确定的应用方式及理由、平台差异和可复用调试经验。当前入口、地址和限制以 [RISC-V 启动模块](../modules/riscv-boot.md) 为准。
 
 ## 源码怎样变成可启动内核？
 
@@ -33,6 +33,12 @@ riscv64-unknown-elf-nm -u kernel-rv
 
 工具链前缀可能因发行版而不同。`readelf` 查看入口和加载段，`objdump` 查看机器指令，`nm -u` 查看是否仍有未解析符号。
 
+### BoarOS 的应用方式
+
+BoarOS 使用 GNU C11、少量 RISC-V 汇编和自有链接脚本生成 freestanding ELF。C 用于承载大部分内核逻辑，汇编只处理 C 环境尚未成立的入口和 trap 现场。这样既保留对寄存器和 CSR 的直接控制，也避免把普通内核逻辑全部写成难以维护的汇编。
+
+链接地址必须同时满足加载器和运行时地址解释。当前 RISC-V 内核链接到 `0x80200000`，因为 QEMU `virt` 的 RAM 从 `0x80000000` 开始，默认 OpenSBI 占据低端区域并从 `0x80200000` 交接内核。这个地址是当前 QEMU/OpenSBI 平台契约，不应被当作所有 RISC-V 开发板都相同的架构常量。
+
 ## CPU、固件与内核怎样交接？
 
 RISC-V 定义了多个特权级：M-mode 管理机器级资源，S-mode 通常运行操作系统内核，U-mode 运行用户程序。CPU 复位后不会直接调用 C 函数，而是从平台规定的复位入口执行固件代码。
@@ -46,6 +52,12 @@ OpenSBI 是常见的 RISC-V M-mode 固件。它完成机器级初始化，再把
 这些值是启动 ABI 的一部分。内核应在复用参数寄存器之前保存它们，不能假设固件留下的栈、全局指针或中断状态适合内核继续使用。
 
 S-mode 不能直接执行所有机器级操作。SBI 定义了 S-mode 通过 `ecall` 请求 M-mode 固件提供服务的调用约定，例如系统复位、关机、时钟和处理器间中断。扩展号、函数号和参数放在规定的 `a` 寄存器中，返回值也通过寄存器传回。
+
+### 为什么 BoarOS 使用 OpenSBI？
+
+BoarOS 以 S-mode 内核作为 RISC-V 主路径，把机器级初始化和 SBI 服务交给 OpenSBI。这样内核可以专注于操作系统机制，不需要同时实现一套 M-mode 固件；QEMU 和采用 OpenSBI 启动链的开发板也能共享相同的 S-mode 入口约定。
+
+共享的是 SBI 和 RISC-V 启动 ABI，不是整个板级启动流程。不同平台可能由不同 ROM、SPL、U-Boot 或 OpenSBI 组合进入内核，ELF 装载地址、DTB 内容和可用 SBI 扩展仍需按实际固件验证。
 
 ## 为什么进入 C 之前需要汇编？
 
@@ -75,6 +87,10 @@ QEMU `virt` 模拟的是一台完整 RISC-V 机器。它的 RAM、UART、PLIC、
 
 分页切换时，当前执行的代码、栈、页表、异常入口和用于输出的 MMIO 都必须在新地址空间中仍然可访问，否则 CPU 会在切换后的第一批取指或访存中产生异常。
 
+### 架构事实和平台事实要分开
+
+寄存器、特权级、`satp`、trap 和 SBI 调用约定属于 RISC-V 架构或固件接口；RAM 起始地址、UART 基址、中断控制器、设备树内容和装载地址属于平台。QEMU `virt` 与 VisionFive 2 可以复用 RISC-V 启动和分页机制，但不能因为 CPU 架构相同就复用硬编码的 MMIO 地址。
+
 ## UART 输出怎样到达宿主终端？
 
 UART 是串行控制器。轮询发送通常先读取线路状态寄存器，确认发送保持寄存器可写，再把一个字节写入发送寄存器。由于 MMIO 读写具有设备副作用，编译器和 CPU 不能像普通内存一样随意删除或重排这些访问；具体代码要遵守架构的设备内存和顺序规则。
@@ -93,3 +109,16 @@ QEMU 收到 guest 对 UART MMIO 的访问后，把字符交给配置的字符后
 - 自动化 QEMU 时把非交互 stdin 接到 `/dev/null`，把输出写入日志，并由宿主超时机制处理无法退出的 guest。
 
 “终端没有新输出”不能单独证明 guest 死循环。还应检查 QEMU 进程状态、宿主信号、GDB 中的程序计数器，以及 UART 和 SBI 调用是否真的发生。
+
+BoarOS 的启动测试曾暴露过一个可复用经验：`timeout` 与使用 `-nographic` stdio 的 QEMU 可能一起受到终端 job control 信号影响，表现为超时计时也停止。非交互测试把 stdin 接到 `/dev/null`，可以把宿主终端问题与 guest 内核问题分离；交互运行和 GDB 调试则继续保留终端输入。
+
+## 资料依据
+
+执行 `make references` 后可在本地核对：
+
+- `references/riscv/riscv-privileged-20260120.pdf`：RISC-V 特权级、CSR、trap 和分页机制。
+- `references/opensbi/`：SBI 固件实现和 RISC-V 下一阶段交接。
+- `references/qemu/hw/riscv/virt.c`：QEMU `virt` 机型、默认 CPU 和设备布局实现。
+- `references/visionfive2/jh7110-boot-user-guide.pdf`、`references/visionfive2/visionfive2-software-trm.pdf`：VisionFive 2 的实际启动链和平台软件信息。
+
+资料的固定版本、上游地址和恢复方式见 [本地参考资料](../../references/README.md)。
