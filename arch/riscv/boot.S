@@ -42,3 +42,28 @@ _start:
     j 3b
 
     .size _start, . - _start
+
+    .globl riscv_relocate_to_high
+    .type riscv_relocate_to_high, @function
+
+riscv_relocate_to_high:
+    /* The active table maps the whole image at both its old and new VA. */
+    add ra, ra, a0
+    add sp, sp, a0
+
+    csrr t0, stvec
+    add t0, t0, a0
+    csrw stvec, t0
+
+    la t0, 1f
+    add t0, t0, a0
+    jr t0
+
+1:
+    .option push
+    .option norelax
+    la gp, __global_pointer$
+    .option pop
+    ret
+
+    .size riscv_relocate_to_high, . - riscv_relocate_to_high

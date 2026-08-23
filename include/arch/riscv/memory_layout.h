@@ -1,0 +1,9 @@
+#ifndef BOAROS_ARCH_RISCV_MEMORY_LAYOUT_H
+#define BOAROS_ARCH_RISCV_MEMORY_LAYOUT_H
+
+#include <stdint.h>
+
+/* Keep this synchronized with KERNEL_VIRTUAL_BASE in linker.ld. */
+#define RISCV_KERNEL_VIRTUAL_BASE UINT64_C(0xffffffff80000000)
+
+#endif

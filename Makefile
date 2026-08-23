@@ -8,12 +8,15 @@ CROSS_COMPILE ?= $(shell \
 	fi)
 
 CC := $(CROSS_COMPILE)gcc
+NM := $(CROSS_COMPILE)nm
+READELF := $(CROSS_COMPILE)readelf
 QEMU_RISCV64 ?= qemu-system-riscv64
 QEMU_MEMORY ?= 1G
 
 BUILD_DIR := build/riscv
 KERNEL_RV := kernel-rv
 TRAP_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-trap-rv
+HIGH_HALF_TRAP_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-high-half-trap-rv
 DTB_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-dtb-rv
 PAGE_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-page-rv
 SV39_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-sv39-rv
@@ -59,6 +62,12 @@ TRAP_TEST_OBJECTS := \
 	$(TEST_RUNTIME_OBJECTS) \
 	$(patsubst %.c,$(BUILD_DIR)/%.o,$(TRAP_TEST_C_SOURCES)) \
 	$(patsubst %.S,$(BUILD_DIR)/%.o,$(TRAP_TEST_ASM_SOURCES))
+HIGH_HALF_TRAP_TEST_C_SOURCES := tests/riscv/high_half_trap.c
+HIGH_HALF_TRAP_TEST_ASM_SOURCES := tests/riscv/trap_trigger.S
+HIGH_HALF_TRAP_TEST_OBJECTS := \
+	$(OBJECTS) \
+	$(patsubst %.c,$(BUILD_DIR)/%.o,$(HIGH_HALF_TRAP_TEST_C_SOURCES)) \
+	$(patsubst %.S,$(BUILD_DIR)/%.o,$(HIGH_HALF_TRAP_TEST_ASM_SOURCES))
 DTB_TEST_C_SOURCES := \
 	kernel/boot_memory.c \
 	kernel/dtb.c \
@@ -94,14 +103,15 @@ SV39_FAULT_TEST_OBJECTS := \
 DEPS := \
 	$(OBJECTS:.o=.d) \
 	$(TRAP_TEST_OBJECTS:.o=.d) \
+	$(HIGH_HALF_TRAP_TEST_OBJECTS:.o=.d) \
 	$(DTB_TEST_OBJECTS:.o=.d) \
 	$(PAGE_TEST_OBJECTS:.o=.d) \
 	$(SV39_TEST_OBJECTS:.o=.d) \
 	$(SV39_FAULT_TEST_OBJECTS:.o=.d)
 
 .PHONY: all clean debug-riscv references run-riscv test-dtb-riscv \
-	test-page-riscv test-references test-riscv test-sv39-fault-riscv \
-	test-sv39-riscv test-trap-riscv
+	test-high-half-trap-riscv test-page-riscv test-references test-riscv \
+	test-sv39-fault-riscv test-sv39-riscv test-trap-riscv
 
 all: $(KERNEL_RV)
 
@@ -118,6 +128,12 @@ $(KERNEL_RV): $(OBJECTS) arch/riscv/linker.ld
 $(TRAP_TEST_KERNEL_RV): $(TRAP_TEST_OBJECTS) arch/riscv/linker.ld
 	$(CC) $(LDFLAGS) -Wl,-Map,$(BUILD_DIR)/tests/kernel-trap-rv.map \
 		-o $@ $(TRAP_TEST_OBJECTS)
+
+$(HIGH_HALF_TRAP_TEST_KERNEL_RV): $(HIGH_HALF_TRAP_TEST_OBJECTS) \
+		arch/riscv/linker.ld
+	$(CC) $(LDFLAGS) -Wl,--wrap=sbi_shutdown \
+		-Wl,-Map,$(BUILD_DIR)/tests/kernel-high-half-trap-rv.map \
+		-o $@ $(HIGH_HALF_TRAP_TEST_OBJECTS)
 
 $(DTB_TEST_KERNEL_RV): $(DTB_TEST_OBJECTS) arch/riscv/linker.ld
 	$(CC) $(LDFLAGS) -Wl,-Map,$(BUILD_DIR)/tests/kernel-dtb-rv.map \
@@ -154,7 +170,8 @@ debug-riscv: $(KERNEL_RV)
 		-m $(QEMU_MEMORY) -smp 1 -nographic -no-reboot -S -s
 
 test-riscv: $(DTB_TEST_KERNEL_RV) $(PAGE_TEST_KERNEL_RV) \
-	$(SV39_TEST_KERNEL_RV) $(SV39_FAULT_TEST_KERNEL_RV) $(KERNEL_RV)
+	$(SV39_TEST_KERNEL_RV) $(SV39_FAULT_TEST_KERNEL_RV) \
+	$(HIGH_HALF_TRAP_TEST_KERNEL_RV) $(KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) \
 		DTB_TEST_KERNEL_RV=$(DTB_TEST_KERNEL_RV) ./tests/dtb-riscv.sh
 	QEMU_RISCV64=$(QEMU_RISCV64) \
@@ -164,7 +181,11 @@ test-riscv: $(DTB_TEST_KERNEL_RV) $(PAGE_TEST_KERNEL_RV) \
 	QEMU_RISCV64=$(QEMU_RISCV64) \
 		SV39_FAULT_TEST_KERNEL_RV=$(SV39_FAULT_TEST_KERNEL_RV) \
 		./tests/sv39-fault-riscv.sh
-	QEMU_RISCV64=$(QEMU_RISCV64) ./tests/boot-riscv.sh
+	QEMU_RISCV64=$(QEMU_RISCV64) NM_RV=$(NM) READELF_RV=$(READELF) \
+		./tests/boot-riscv.sh
+	QEMU_RISCV64=$(QEMU_RISCV64) NM_RV=$(NM) \
+		HIGH_HALF_TRAP_TEST_KERNEL_RV=$(HIGH_HALF_TRAP_TEST_KERNEL_RV) \
+		./tests/high-half-trap-riscv.sh
 
 test-dtb-riscv: $(DTB_TEST_KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) DTB_TEST_KERNEL_RV=$< \
@@ -184,6 +205,10 @@ test-sv39-fault-riscv: $(SV39_FAULT_TEST_KERNEL_RV)
 
 test-trap-riscv: $(TRAP_TEST_KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) KERNEL_RV=$< ./tests/trap-riscv.sh
+
+test-high-half-trap-riscv: $(HIGH_HALF_TRAP_TEST_KERNEL_RV)
+	QEMU_RISCV64=$(QEMU_RISCV64) NM_RV=$(NM) \
+		HIGH_HALF_TRAP_TEST_KERNEL_RV=$< ./tests/high-half-trap-riscv.sh
 
 clean:
 	$(RM) -r -- $(BUILD_DIR) $(KERNEL_RV)

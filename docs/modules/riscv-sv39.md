@@ -7,8 +7,8 @@
 | 文件 | 当前职责 |
 |---|---|
 | `include/arch/riscv/sv39.h`、`arch/riscv/sv39.c` | 初始化根页表、建立 2 MiB/4 KiB 映射并切换 `satp` |
-| `arch/riscv/linker.ld` | 导出页对齐的 text、rodata、data 边界 |
-| `kernel/main.c` | 根据 DTB RAM、ELF 边界和 QEMU UART 建立启动地址空间 |
+| `arch/riscv/linker.ld`、`include/arch/riscv/memory_layout.h` | 固定高半区 VMA 并导出页对齐的 text、rodata、data 边界 |
+| `kernel/main.c` | 根据 DTB RAM、ELF 边界和 QEMU UART 建立启动地址空间与高半区别名 |
 | `tests/riscv/sv39_cases.c` | 验证 PTE、页表数量、边界和失败语义 |
 | `tests/riscv/sv39_fault_main.c` | 启用分页后验证只读页可读但不可写 |
 
@@ -35,25 +35,27 @@ UNINITIALIZED --init成功--> BUILDING --activate成功--> ACTIVE
 
 ## 启动地址空间
 
-`kernel_main` 当前建立以下恒等映射：
+`kernel_main` 当前建立以下映射：
 
 - DTB 报告的整段 RAM；text 为 RX，rodata 为 R，其余 RAM 为 RW。
+- 内核镜像在 `0xffffffff80000000` 开始的高半区别名；它指向同一组物理页，并保持 text RX、rodata R、data/BSS/启动栈 RW。
 - QEMU `virt` 的 `0x10000000..0x10001000` UART MMIO 为 RW。
 
 页表页来自启动内存布局的可用 RAM，所以会减少物理页分配器的可用页计数；这些页也落在 RAM 恒等映射内。QEMU UART 地址属于平台事实，不在通用 `sv39.c` 中；接入 VisionFive 2 时应由新的平台入口提供自己的 MMIO 映射。
 
 `riscv_sv39_activate` 使用 ASID 0，把根页物理页号与 MODE=8 写入 `satp`，在写入前后各执行一次全局 `SFENCE.VMA`，并读回 `satp` 验证硬件接受该模式。切换前保存旧 `satp`；若读回不一致，则经过同样的 fence 恢复旧值，再把页表标为 `FAILED`。
 
-激活期间，旧地址空间和候选地址空间都必须保持当前代码、栈、trap 入口以及页表对象本身可访问，页表对象还必须可写。当前启动路径从 Bare 切换到覆盖全部 RAM 的恒等映射，满足这个条件。当前只支持单 hart 的首次切换；若错误页表让当前执行地址在写入 `satp` 后立即不可达，CPU 会先产生同步异常，软件无法依赖后续读回路径恢复。
+激活期间，旧地址空间和候选地址空间都必须保持当前代码、栈、trap 入口以及页表对象本身可访问，页表对象还必须可写。当前启动路径从 Bare 切换到“RAM 恒等映射 + 高半区内核映射”；激活函数先从低地址返回，随后汇编路径把 `ra`、`sp`、`gp`、`stvec` 和控制流切换到高半区。当前只支持单 hart 的首次切换；若错误页表让当前执行地址在写入 `satp` 后立即不可达，CPU 会先产生同步异常，软件无法依赖后续读回路径恢复。
 
 ## 验证
 
 ```sh
 make test-sv39-riscv
 make test-sv39-fault-riscv
+make test-high-half-trap-riscv
 make test-riscv
 ```
 
-聚焦建表测试检查完整生命周期转换、2 MiB/4 KiB PTE 的精确编码、16 GiB 对齐映射的页表规模、混合叶子、canonical/物理上界/权限/对齐校验、两种叶子结构冲突以及中途失败后的部分提交状态。独立测试 walker 会从实际页表反向解析 PA、叶子大小和权限；页池预先填充非零字节，以同时验证页表清零。权限测试先用显式 `ld` 证明 rodata 页可读，再用显式 `sd` 要求产生 store page fault（`scause=15`，`stval` 等于目标地址），并在激活后验证所有建表操作均被拒绝。完整启动测试在 512 MiB 和 1 GiB RAM 下验证 `satp.MODE=8`，并要求物理页计数差等于页表页数。
+聚焦建表测试检查完整生命周期转换、2 MiB/4 KiB PTE 的精确编码、16 GiB 对齐映射的页表规模、混合叶子、canonical/物理上界/权限/对齐校验、两种叶子结构冲突以及中途失败后的部分提交状态。独立测试 walker 会从实际页表反向解析 PA、叶子大小和权限；页池预先填充非零字节，以同时验证页表清零。权限测试先用显式 `ld` 证明 rodata 页可读，再用显式 `sd` 要求产生 store page fault（`scause=15`，`stval` 等于目标地址），并在激活后验证所有建表操作均被拒绝。完整启动测试在 512 MiB 和 1 GiB RAM 下验证 `satp.MODE=8`，要求物理页计数差等于页表页数，并依据 ELF 符号精确检查高半区 PC、SP、GP 和 `stvec`。独立高半区 trap 测试还会执行真实 breakpoint，核对 `scause=3` 与高地址 `sepc`。
 
-当前未实现 1 GiB 叶子、高半区、用户映射、页表回收和运行期映射修改。
+当前未实现 1 GiB 叶子、物理内存 direct map、移除恒等映射、用户映射、页表回收和运行期映射修改。

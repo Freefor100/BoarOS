@@ -1,5 +1,10 @@
 OUTPUT_ARCH(riscv)
-ENTRY(_start)
+
+KERNEL_VIRTUAL_BASE = 0xffffffff80000000;
+KERNEL_PHYSICAL_BASE = 0x80200000;
+KERNEL_LOAD_OFFSET = KERNEL_VIRTUAL_BASE - KERNEL_PHYSICAL_BASE;
+
+ENTRY(__kernel_physical_start)
 
 PHDRS
 {
@@ -10,10 +15,11 @@ PHDRS
 
 SECTIONS
 {
-    . = 0x80200000;
+    . = KERNEL_VIRTUAL_BASE;
     __kernel_start = .;
+    __kernel_physical_start = KERNEL_PHYSICAL_BASE;
 
-    .text :
+    .text : AT(ADDR(.text) - KERNEL_LOAD_OFFSET)
     {
         __text_start = .;
         KEEP(*(.text.boot))
@@ -22,7 +28,7 @@ SECTIONS
         __text_end = .;
     } :text
 
-    .rodata :
+    .rodata : AT(ADDR(.rodata) - KERNEL_LOAD_OFFSET)
     {
         __rodata_start = .;
         *(.srodata .srodata.*)
@@ -31,7 +37,7 @@ SECTIONS
         __rodata_end = .;
     } :rodata
 
-    .data :
+    .data : AT(ADDR(.data) - KERNEL_LOAD_OFFSET)
     {
         __data_start = .;
         PROVIDE(__global_pointer$ = . + 0x800);
@@ -40,7 +46,7 @@ SECTIONS
     } :data
 
     . = ALIGN(0x1000);
-    .bss (NOLOAD) :
+    .bss (NOLOAD) : AT(ADDR(.bss) - KERNEL_LOAD_OFFSET)
     {
         __bss_start = .;
         *(.sbss .sbss.*)
@@ -57,6 +63,7 @@ SECTIONS
     . = ALIGN(0x1000);
     __data_end = .;
     __kernel_end = .;
+    __kernel_physical_end = __kernel_end - KERNEL_LOAD_OFFSET;
 
     /DISCARD/ :
     {

@@ -1,3 +1,4 @@
+#include <arch/riscv/memory_layout.h>
 #include <arch/riscv/sbi.h>
 #include <arch/riscv/sv39.h>
 #include <arch/riscv/virt_uart.h>
@@ -16,6 +17,8 @@ extern unsigned char __rodata_start[];
 extern unsigned char __rodata_end[];
 extern unsigned char __data_start[];
 extern unsigned char __data_end[];
+
+void riscv_relocate_to_high(uint64_t offset);
 
 static struct physical_page_allocator page_allocator;
 static struct riscv_sv39_page_table kernel_page_table;
@@ -109,11 +112,39 @@ static enum riscv_sv39_status map_identity(
                                 permissions);
 }
 
+static enum riscv_sv39_status map_kernel_alias(
+    uint64_t kernel_start,
+    uint64_t start,
+    uint64_t end,
+    uint32_t permissions)
+{
+    uint64_t offset;
+
+    if (kernel_start > start || start > end) {
+        return RISCV_SV39_STATUS_INVALID;
+    }
+    if (start == end) {
+        return RISCV_SV39_STATUS_OK;
+    }
+    offset = start - kernel_start;
+    if (offset > UINT64_MAX - RISCV_KERNEL_VIRTUAL_BASE ||
+        end - start > UINT64_MAX - (RISCV_KERNEL_VIRTUAL_BASE + offset)) {
+        return RISCV_SV39_STATUS_INVALID;
+    }
+
+    return riscv_sv39_map_range(&kernel_page_table,
+                                RISCV_KERNEL_VIRTUAL_BASE + offset,
+                                start,
+                                end - start,
+                                permissions);
+}
+
 static enum riscv_sv39_status build_kernel_page_table(
     const struct dtb_boot_info *info)
 {
     uint64_t memory_start;
     uint64_t memory_end;
+    uint64_t kernel_start = (uint64_t)(uintptr_t)__kernel_start;
     uint64_t text_start = (uint64_t)(uintptr_t)__text_start;
     uint64_t text_end = (uint64_t)(uintptr_t)__text_end;
     uint64_t rodata_start = (uint64_t)(uintptr_t)__rodata_start;
@@ -171,11 +202,65 @@ static enum riscv_sv39_status build_kernel_page_table(
         return status;
     }
 
+    status = map_kernel_alias(kernel_start,
+                              text_start,
+                              text_end,
+                              RISCV_SV39_READ | RISCV_SV39_EXECUTE);
+    if (status != RISCV_SV39_STATUS_OK) {
+        return status;
+    }
+    status = map_kernel_alias(kernel_start,
+                              rodata_start,
+                              rodata_end,
+                              RISCV_SV39_READ);
+    if (status != RISCV_SV39_STATUS_OK) {
+        return status;
+    }
+    status = map_kernel_alias(kernel_start,
+                              data_start,
+                              data_end,
+                              RISCV_SV39_READ | RISCV_SV39_WRITE);
+    if (status != RISCV_SV39_STATUS_OK) {
+        return status;
+    }
+
     return riscv_sv39_map_range(&kernel_page_table,
                                 VIRT_UART_MMIO_BASE,
                                 VIRT_UART_MMIO_BASE,
                                 VIRT_UART_MMIO_SIZE,
                                 RISCV_SV39_READ | RISCV_SV39_WRITE);
+}
+
+static uint64_t current_pc(void)
+{
+    uint64_t value;
+
+    __asm__ volatile("auipc %0, 0" : "=r"(value));
+    return value;
+}
+
+static uint64_t current_sp(void)
+{
+    uint64_t value;
+
+    __asm__ volatile("mv %0, sp" : "=r"(value));
+    return value;
+}
+
+static uint64_t current_gp(void)
+{
+    uint64_t value;
+
+    __asm__ volatile("mv %0, gp" : "=r"(value));
+    return value;
+}
+
+static uint64_t current_stvec(void)
+{
+    uint64_t value;
+
+    __asm__ volatile("csrr %0, stvec" : "=r"(value));
+    return value;
 }
 
 void kernel_main(unsigned long hart_id, const void *dtb)
@@ -214,6 +299,18 @@ void kernel_main(unsigned long hart_id, const void *dtb)
     if (sv39_status != RISCV_SV39_STATUS_OK) {
         shutdown_for_sv39_error(sv39_status);
     }
+    riscv_relocate_to_high(RISCV_KERNEL_VIRTUAL_BASE -
+                           (uint64_t)(uintptr_t)__kernel_start);
+
+    virt_uart_puts("BoarOS: high-half pc=");
+    virt_uart_put_hex((unsigned long)current_pc());
+    virt_uart_puts(" sp=");
+    virt_uart_put_hex((unsigned long)current_sp());
+    virt_uart_puts(" gp=");
+    virt_uart_put_hex((unsigned long)current_gp());
+    virt_uart_puts(" stvec=");
+    virt_uart_put_hex((unsigned long)current_stvec());
+    virt_uart_putc('\n');
 
     virt_uart_puts("BoarOS: booted hart=");
     virt_uart_put_hex(hart_id);
