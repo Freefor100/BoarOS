@@ -1,5 +1,9 @@
-# Local snapshots of competition rules, harnesses, and public tests.
-/references/
+# Local snapshots of specifications, source trees, board documents, rules,
+# harnesses, and public tests. Keep only the restoration metadata in Git.
+/references/*
+!/references/README.md
+!/references/fetch.sh
+!/references/sources.tsv
 
 # Kernel and userspace build outputs.
 /build/

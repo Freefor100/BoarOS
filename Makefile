@@ -55,10 +55,16 @@ DEPS := \
 	$(TRAP_TEST_OBJECTS:.o=.d) \
 	$(DTB_TEST_OBJECTS:.o=.d)
 
-.PHONY: all clean debug-riscv run-riscv test-dtb-riscv test-riscv \
-	test-trap-riscv
+.PHONY: all clean debug-riscv references run-riscv test-dtb-riscv \
+	test-references test-riscv test-trap-riscv
 
 all: $(KERNEL_RV)
+
+references:
+	./references/fetch.sh
+
+test-references:
+	./tests/references.sh
 
 $(KERNEL_RV): $(OBJECTS) arch/riscv/linker.ld
 	$(CC) $(LDFLAGS) -Wl,-Map,$(BUILD_DIR)/kernel-rv.map \

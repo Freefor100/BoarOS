@@ -27,6 +27,7 @@ make run-riscv
 make test-riscv
 make test-dtb-riscv
 make test-trap-riscv
+make test-references
 ```
 
 `make debug-riscv` 使用 `-S -s` 启动 QEMU：虚拟 CPU 会暂停并在宿主 TCP 端口 1234 等待 GDB，因此命令不会自行返回。
@@ -47,7 +48,9 @@ make test-trap-riscv
 - [文档导航](docs/README.md)
 - [参与开发](CONTRIBUTING.md)
 
-`references/` 保存本地规则、Harness 和公开测例快照，不纳入版本控制。
+`make references` 按固定版本恢复架构规范、QEMU/Linux/OpenSBI 源码、开发板
+资料、比赛规则、Harness 和公开测例；实际快照不纳入版本控制，来源与校验值见
+[本地参考资料](references/README.md)。恢复过程不会执行任何外部脚本。
 
 ## 公开参考
 

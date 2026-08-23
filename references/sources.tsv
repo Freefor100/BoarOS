@@ -1,0 +1,20 @@
+# kind	path	url	remote-ref	commit-or-sha256
+full	os2026	https://gitlab.eduxiji.net/csc1/csc-os/os2026	-	d9a3cf1fbe597f13584988e0597ae9b4e9163ea7
+full	oscomp-testsuits	https://github.com/oscomp/testsuits-for-oskernel.git	-	b5ec6ef8497e1818cbdec3b54bb722f036e57972
+full	oscomp-autotest	https://github.com/oscomp/autotest-for-oskernel.git	-	d1bb3a3c4b27274e196a2648518525c1a304e339
+snapshot	linux	https://github.com/torvalds/linux.git	f4cdf7ca9a1fdcca413157df19753f388a5a224e	f4cdf7ca9a1fdcca413157df19753f388a5a224e
+snapshot	qemu	https://gitlab.com/qemu-project/qemu.git	refs/tags/v11.1.0	84f07211cc5b4fc6a371559bf8a5de4fb068e648
+snapshot	opensbi	https://github.com/riscv-software-src/opensbi.git	refs/tags/v1.8.1	74434f255873d74e56cc50aa762d1caf24c099f8
+snapshot	loongarch-documentation	https://github.com/loongson/LoongArch-Documentation.git	e0d6592229d9e00e512bd28b688a7f20b171714f	e0d6592229d9e00e512bd28b688a7f20b171714f
+snapshot	visionfive2-sdk	https://github.com/starfive-tech/VisionFive2.git	refs/tags/JH7110_VF2_6.12_v6.0.0	7f1bacc7c3969ea7ae7da4b9f3ca3fbd6e39c142
+file	riscv/riscv-privileged-20260120.pdf	https://docs.riscv.org/reference/isa/v20260120/_attachments/riscv-privileged.pdf	-	d0f818af6fa519d39e68f822aa795bff9f38032a2f352afdf43e91c0d480e408
+file	visionfive2/jh7110-datasheet-v1.67.pdf	https://doc-en.rvspace.org/JH7110/PDF/JH7110_Datasheet.pdf	-	5d3eb13e93a97e819464d61343a81fbc286509f77cfcf64688d11d4c3217e80f
+file	visionfive2/visionfive2-software-trm.pdf	https://doc-en.rvspace.org/VisionFive2/PDF/VisionFive2_SW_TRM.pdf	-	182ddb77088accf9497ec9c80a1ed8b581cafd4c4a4dc1de01899fc28f8f8898
+file	visionfive2/jh7110-boot-user-guide.pdf	https://doc-en.rvspace.org/VisionFive2/PDF/JH7110_Boot_UG.pdf	-	a7a55cff1d586334623375cfa884aea61931053a666d7cad88d7368e5c3d9fca
+file	visionfive2/sifive-u74-core-complex-21G3.pdf	https://sifive.cdn.prismic.io/sifive/ad5577a0-9a00-45c9-a5d0-424a3d586060_u74_core_complex_manual_21G3.pdf	-	496c73e51ae203bd7d00866d3809b21772aa5b8f3dfa4f719d8530f494b3ddbd
+file	loongarch/loongarch-vol1-v1.11.pdf	https://raw.githubusercontent.com/loongson-community/docs/f5b8447db3aa957fb1d81d4969f379f93dcdb8a5/loongarch/2025032109191292796.%E9%BE%99%E6%9E%B6%E6%9E%84%E5%8F%82%E8%80%83%E6%89%8B%E5%86%8C%E5%8D%B7%E4%B8%80_r1p11.pdf	-	5a1a2b3117a1beb82155ed4f93f7be0b6ba6eb596ca6f3ba3bbd5245021707f8
+file	loongarch/loongson-2k1000la-user-manual-v1.0.pdf	https://raw.githubusercontent.com/loongson-community/docs/f5b8447db3aa957fb1d81d4969f379f93dcdb8a5/2K1000/%E9%BE%99%E8%8A%AF2K1000LA%E5%A4%84%E7%90%86%E5%99%A8%E7%94%A8%E6%88%B7%E6%89%8B%E5%86%8C_V1.0.pdf	-	3b859cc3b3d9af25ea2ec8abb644e2179f9e8526a71c1e22ee9be92ce4dda4a6
+file	loongarch/loongson-2k1000la-datasheet-v1.1.pdf	https://raw.githubusercontent.com/loongson-community/docs/f5b8447db3aa957fb1d81d4969f379f93dcdb8a5/2K1000/2023053015362144181.%E9%BE%99%E8%8A%AF2K1000LA%E5%A4%84%E7%90%86%E5%99%A8%E6%95%B0%E6%8D%AE%E6%89%8B%E5%86%8C_V1.1.pdf	-	ae38df4a3f061de79b922e4ac4914f53e1f5928789c44c5ed1f44929c9cbac06
+file	loongarch/loongson-embedded-system-architecture-v1.1.pdf	https://raw.githubusercontent.com/loongson-community/docs/f5b8447db3aa957fb1d81d4969f379f93dcdb8a5/firmware/2025011014243453502.%E9%BE%99%E8%8A%AFCPU%E7%BB%9F%E4%B8%80%E7%B3%BB%E7%BB%9F%E6%9E%B6%E6%9E%84%E8%A7%84%E8%8C%83(LA%E6%9E%B6%E6%9E%84%E5%B5%8C%E5%85%A5%E5%BC%8F%E7%B3%BB%E5%88%97)V1.1.pdf	-	b04f63fb4e070f6b8be0ffa1b070449fe9d79149a0652abdaf5ea3592c4cd2e8
+file	loongarch/nebula-board-README.md	https://gitee.com/loongarch_community/2k1000la-doc/raw/5f4921e408e5f935d0c047816f3050111856dcbc/README.md	-	5b9bf159aea98e2655cb21f7a31744ba691c310d46b0f535ceeeeb0674e5077f
+file	loongarch/nebula-board-README.en.md	https://gitee.com/loongarch_community/2k1000la-doc/raw/5f4921e408e5f935d0c047816f3050111856dcbc/README.en.md	-	509fd32f4ee9cd92157ec481b3aa2dbaa06d49de2c74c32cb5c49ed6a7543ee6
