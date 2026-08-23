@@ -21,8 +21,16 @@ extern unsigned char __data_end[];
 
 void riscv_relocate_to_high(uint64_t offset);
 
+#define RISCV_TRANSITION_TABLE_PAGE_COUNT 5U
+
 static struct physical_page_allocator page_allocator;
 static struct riscv_sv39_page_table kernel_page_table;
+static struct physical_page_allocator transition_page_allocator;
+static struct riscv_sv39_page_table transition_page_table;
+static unsigned char
+    transition_table_pages[RISCV_TRANSITION_TABLE_PAGE_COUNT *
+                           BOAROS_PAGE_SIZE]
+    __attribute__((aligned(BOAROS_PAGE_SIZE)));
 
 static void *direct_map_page_access(uint64_t physical_address)
 {
@@ -119,6 +127,7 @@ static void shutdown_for_direct_map_error(void)
 }
 
 static enum riscv_sv39_status map_identity(
+    struct riscv_sv39_page_table *table,
     uint64_t start,
     uint64_t end,
     uint32_t permissions)
@@ -130,7 +139,7 @@ static enum riscv_sv39_status map_identity(
         return RISCV_SV39_STATUS_OK;
     }
 
-    return riscv_sv39_map_range(&kernel_page_table,
+    return riscv_sv39_map_range(table,
                                 start,
                                 start,
                                 end - start,
@@ -138,6 +147,7 @@ static enum riscv_sv39_status map_identity(
 }
 
 static enum riscv_sv39_status map_kernel_alias(
+    struct riscv_sv39_page_table *table,
     uint64_t kernel_start,
     uint64_t start,
     uint64_t end,
@@ -157,7 +167,7 @@ static enum riscv_sv39_status map_kernel_alias(
         return RISCV_SV39_STATUS_INVALID;
     }
 
-    return riscv_sv39_map_range(&kernel_page_table,
+    return riscv_sv39_map_range(table,
                                 RISCV_KERNEL_VIRTUAL_BASE + offset,
                                 start,
                                 end - start,
@@ -165,6 +175,7 @@ static enum riscv_sv39_status map_kernel_alias(
 }
 
 static enum riscv_sv39_status map_direct_alias(
+    struct riscv_sv39_page_table *table,
     uint64_t start,
     uint64_t end,
     uint32_t permissions)
@@ -184,11 +195,89 @@ static enum riscv_sv39_status map_direct_alias(
         return RISCV_SV39_STATUS_INVALID;
     }
 
-    return riscv_sv39_map_range(&kernel_page_table,
+    return riscv_sv39_map_range(table,
                                 virtual_address,
                                 start,
                                 end - start,
                                 permissions);
+}
+
+static enum riscv_sv39_status build_transition_page_table(void)
+{
+    struct boot_memory_layout layout;
+    uint64_t kernel_start = (uint64_t)(uintptr_t)__kernel_start;
+    uint64_t kernel_end = (uint64_t)(uintptr_t)__kernel_end;
+    uint64_t mapping_start;
+    uint64_t mapping_end;
+    uint64_t mapping_size;
+    uint64_t virtual_start;
+    enum physical_page_status page_status;
+    enum riscv_sv39_status status;
+
+    if (kernel_start > kernel_end ||
+        kernel_end > UINT64_MAX - (RISCV_SV39_PAGE_SIZE_2M - 1U)) {
+        return RISCV_SV39_STATUS_INVALID;
+    }
+    mapping_start = kernel_start & ~(RISCV_SV39_PAGE_SIZE_2M - 1U);
+    mapping_end = (kernel_end + RISCV_SV39_PAGE_SIZE_2M - 1U) &
+                  ~(RISCV_SV39_PAGE_SIZE_2M - 1U);
+    mapping_size = mapping_end - mapping_start;
+    if (kernel_start - mapping_start > RISCV_KERNEL_VIRTUAL_BASE) {
+        return RISCV_SV39_STATUS_INVALID;
+    }
+    virtual_start = RISCV_KERNEL_VIRTUAL_BASE -
+                    (kernel_start - mapping_start);
+
+    layout.reserved_count = 0U;
+    layout.usable_count = 1U;
+    layout.usable[0].base =
+        (uint64_t)(uintptr_t)transition_table_pages;
+    layout.usable[0].size = sizeof(transition_table_pages);
+    page_status = physical_page_allocator_init(&transition_page_allocator,
+                                               &layout);
+    if (page_status != PHYSICAL_PAGE_STATUS_OK) {
+        return RISCV_SV39_STATUS_INVALID;
+    }
+    status = riscv_sv39_page_table_init(&transition_page_table,
+                                        &transition_page_allocator);
+    if (status != RISCV_SV39_STATUS_OK) {
+        return status;
+    }
+
+    status = map_identity(&transition_page_table,
+                          mapping_start,
+                          mapping_end,
+                          RISCV_SV39_READ |
+                              RISCV_SV39_WRITE |
+                              RISCV_SV39_EXECUTE);
+    if (status != RISCV_SV39_STATUS_OK) {
+        return status;
+    }
+    status = riscv_sv39_map_range(&transition_page_table,
+                                  virtual_start,
+                                  mapping_start,
+                                  mapping_size,
+                                  RISCV_SV39_READ |
+                                      RISCV_SV39_WRITE |
+                                      RISCV_SV39_EXECUTE);
+    if (status != RISCV_SV39_STATUS_OK) {
+        return status;
+    }
+    status = riscv_sv39_map_range(&transition_page_table,
+                                  VIRT_UART_MMIO_BASE,
+                                  VIRT_UART_MMIO_BASE,
+                                  VIRT_UART_MMIO_SIZE,
+                                  RISCV_SV39_READ | RISCV_SV39_WRITE);
+    if (status != RISCV_SV39_STATUS_OK) {
+        return status;
+    }
+    if (physical_page_available(&transition_page_allocator) != 0U ||
+        transition_page_table.table_pages !=
+            RISCV_TRANSITION_TABLE_PAGE_COUNT) {
+        return RISCV_SV39_STATUS_INVALID;
+    }
+
+    return RISCV_SV39_STATUS_OK;
 }
 
 static enum riscv_sv39_status build_kernel_page_table(
@@ -229,46 +318,24 @@ static enum riscv_sv39_status build_kernel_page_table(
         return status;
     }
 
-    status = map_identity(memory_start,
-                          text_start,
-                          RISCV_SV39_READ | RISCV_SV39_WRITE);
-    if (status != RISCV_SV39_STATUS_OK) {
-        return status;
-    }
-    status = map_identity(text_start,
-                          text_end,
-                          RISCV_SV39_READ | RISCV_SV39_EXECUTE);
-    if (status != RISCV_SV39_STATUS_OK) {
-        return status;
-    }
-    status = map_identity(rodata_start,
-                          rodata_end,
-                          RISCV_SV39_READ);
-    if (status != RISCV_SV39_STATUS_OK) {
-        return status;
-    }
-    status = map_identity(data_start,
-                          memory_end,
-                          RISCV_SV39_READ | RISCV_SV39_WRITE);
-    if (status != RISCV_SV39_STATUS_OK) {
-        return status;
-    }
-
-    status = map_kernel_alias(kernel_start,
+    status = map_kernel_alias(&kernel_page_table,
+                              kernel_start,
                               text_start,
                               text_end,
                               RISCV_SV39_READ | RISCV_SV39_EXECUTE);
     if (status != RISCV_SV39_STATUS_OK) {
         return status;
     }
-    status = map_kernel_alias(kernel_start,
+    status = map_kernel_alias(&kernel_page_table,
+                              kernel_start,
                               rodata_start,
                               rodata_end,
                               RISCV_SV39_READ);
     if (status != RISCV_SV39_STATUS_OK) {
         return status;
     }
-    status = map_kernel_alias(kernel_start,
+    status = map_kernel_alias(&kernel_page_table,
+                              kernel_start,
                               data_start,
                               data_end,
                               RISCV_SV39_READ | RISCV_SV39_WRITE);
@@ -276,25 +343,29 @@ static enum riscv_sv39_status build_kernel_page_table(
         return status;
     }
 
-    status = map_direct_alias(memory_start,
+    status = map_direct_alias(&kernel_page_table,
+                              memory_start,
                               text_start,
                               RISCV_SV39_READ | RISCV_SV39_WRITE);
     if (status != RISCV_SV39_STATUS_OK) {
         return status;
     }
-    status = map_direct_alias(text_start,
+    status = map_direct_alias(&kernel_page_table,
+                              text_start,
                               text_end,
                               RISCV_SV39_READ);
     if (status != RISCV_SV39_STATUS_OK) {
         return status;
     }
-    status = map_direct_alias(rodata_start,
+    status = map_direct_alias(&kernel_page_table,
+                              rodata_start,
                               rodata_end,
                               RISCV_SV39_READ);
     if (status != RISCV_SV39_STATUS_OK) {
         return status;
     }
-    status = map_direct_alias(data_start,
+    status = map_direct_alias(&kernel_page_table,
+                              data_start,
                               memory_end,
                               RISCV_SV39_READ | RISCV_SV39_WRITE);
     if (status != RISCV_SV39_STATUS_OK) {
@@ -430,16 +501,25 @@ void kernel_main(unsigned long hart_id, const void *dtb)
         shutdown_for_physical_page_error(page_status);
     }
 
+    sv39_status = build_transition_page_table();
+    if (sv39_status != RISCV_SV39_STATUS_OK) {
+        shutdown_for_sv39_error(sv39_status);
+    }
     sv39_status = build_kernel_page_table(&info);
     if (sv39_status != RISCV_SV39_STATUS_OK) {
         shutdown_for_sv39_error(sv39_status);
     }
-    sv39_status = riscv_sv39_activate(&kernel_page_table);
+    sv39_status = riscv_sv39_activate(&transition_page_table);
     if (sv39_status != RISCV_SV39_STATUS_OK) {
         shutdown_for_sv39_error(sv39_status);
     }
     riscv_relocate_to_high(RISCV_KERNEL_VIRTUAL_BASE -
                            (uint64_t)(uintptr_t)__kernel_start);
+
+    sv39_status = riscv_sv39_activate(&kernel_page_table);
+    if (sv39_status != RISCV_SV39_STATUS_OK) {
+        shutdown_for_sv39_error(sv39_status);
+    }
 
     page_status = physical_page_allocator_bind_access(
         &page_allocator,

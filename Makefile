@@ -17,6 +17,7 @@ BUILD_DIR := build/riscv
 KERNEL_RV := kernel-rv
 TRAP_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-trap-rv
 HIGH_HALF_TRAP_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-high-half-trap-rv
+NO_IDENTITY_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-no-identity-rv
 DTB_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-dtb-rv
 PAGE_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-page-rv
 SV39_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-sv39-rv
@@ -69,6 +70,10 @@ HIGH_HALF_TRAP_TEST_OBJECTS := \
 	$(OBJECTS) \
 	$(patsubst %.c,$(BUILD_DIR)/%.o,$(HIGH_HALF_TRAP_TEST_C_SOURCES)) \
 	$(patsubst %.S,$(BUILD_DIR)/%.o,$(HIGH_HALF_TRAP_TEST_ASM_SOURCES))
+NO_IDENTITY_TEST_C_SOURCES := tests/riscv/no_identity.c
+NO_IDENTITY_TEST_OBJECTS := \
+	$(OBJECTS) \
+	$(patsubst %.c,$(BUILD_DIR)/%.o,$(NO_IDENTITY_TEST_C_SOURCES))
 DTB_TEST_C_SOURCES := \
 	kernel/boot_memory.c \
 	kernel/dtb.c \
@@ -107,14 +112,16 @@ DEPS := \
 	$(OBJECTS:.o=.d) \
 	$(TRAP_TEST_OBJECTS:.o=.d) \
 	$(HIGH_HALF_TRAP_TEST_OBJECTS:.o=.d) \
+	$(NO_IDENTITY_TEST_OBJECTS:.o=.d) \
 	$(DTB_TEST_OBJECTS:.o=.d) \
 	$(PAGE_TEST_OBJECTS:.o=.d) \
 	$(SV39_TEST_OBJECTS:.o=.d) \
 	$(SV39_FAULT_TEST_OBJECTS:.o=.d)
 
 .PHONY: all clean debug-riscv references run-riscv test-dtb-riscv \
-	test-high-half-trap-riscv test-page-riscv test-references test-riscv \
-	test-sv39-fault-riscv test-sv39-riscv test-trap-riscv
+	test-high-half-trap-riscv test-no-identity-riscv test-page-riscv \
+	test-references test-riscv test-sv39-fault-riscv test-sv39-riscv \
+	test-trap-riscv
 
 all: $(KERNEL_RV)
 
@@ -137,6 +144,12 @@ $(HIGH_HALF_TRAP_TEST_KERNEL_RV): $(HIGH_HALF_TRAP_TEST_OBJECTS) \
 	$(CC) $(LDFLAGS) -Wl,--wrap=sbi_shutdown \
 		-Wl,-Map,$(BUILD_DIR)/tests/kernel-high-half-trap-rv.map \
 		-o $@ $(HIGH_HALF_TRAP_TEST_OBJECTS)
+
+$(NO_IDENTITY_TEST_KERNEL_RV): $(NO_IDENTITY_TEST_OBJECTS) \
+		arch/riscv/linker.ld
+	$(CC) $(LDFLAGS) -Wl,--wrap=sbi_shutdown \
+		-Wl,-Map,$(BUILD_DIR)/tests/kernel-no-identity-rv.map \
+		-o $@ $(NO_IDENTITY_TEST_OBJECTS)
 
 $(DTB_TEST_KERNEL_RV): $(DTB_TEST_OBJECTS) arch/riscv/linker.ld
 	$(CC) $(LDFLAGS) -Wl,-Map,$(BUILD_DIR)/tests/kernel-dtb-rv.map \
@@ -174,7 +187,8 @@ debug-riscv: $(KERNEL_RV)
 
 test-riscv: $(DTB_TEST_KERNEL_RV) $(PAGE_TEST_KERNEL_RV) \
 	$(SV39_TEST_KERNEL_RV) $(SV39_FAULT_TEST_KERNEL_RV) \
-	$(HIGH_HALF_TRAP_TEST_KERNEL_RV) $(KERNEL_RV)
+	$(HIGH_HALF_TRAP_TEST_KERNEL_RV) $(NO_IDENTITY_TEST_KERNEL_RV) \
+	$(KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) \
 		DTB_TEST_KERNEL_RV=$(DTB_TEST_KERNEL_RV) ./tests/dtb-riscv.sh
 	QEMU_RISCV64=$(QEMU_RISCV64) \
@@ -189,6 +203,9 @@ test-riscv: $(DTB_TEST_KERNEL_RV) $(PAGE_TEST_KERNEL_RV) \
 	QEMU_RISCV64=$(QEMU_RISCV64) NM_RV=$(NM) \
 		HIGH_HALF_TRAP_TEST_KERNEL_RV=$(HIGH_HALF_TRAP_TEST_KERNEL_RV) \
 		./tests/high-half-trap-riscv.sh
+	QEMU_RISCV64=$(QEMU_RISCV64) \
+		NO_IDENTITY_TEST_KERNEL_RV=$(NO_IDENTITY_TEST_KERNEL_RV) \
+		./tests/no-identity-riscv.sh
 
 test-dtb-riscv: $(DTB_TEST_KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) DTB_TEST_KERNEL_RV=$< \
@@ -212,6 +229,10 @@ test-trap-riscv: $(TRAP_TEST_KERNEL_RV)
 test-high-half-trap-riscv: $(HIGH_HALF_TRAP_TEST_KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) NM_RV=$(NM) \
 		HIGH_HALF_TRAP_TEST_KERNEL_RV=$< ./tests/high-half-trap-riscv.sh
+
+test-no-identity-riscv: $(NO_IDENTITY_TEST_KERNEL_RV)
+	QEMU_RISCV64=$(QEMU_RISCV64) NO_IDENTITY_TEST_KERNEL_RV=$< \
+		./tests/no-identity-riscv.sh
 
 clean:
 	$(RM) -r -- $(BUILD_DIR) $(KERNEL_RV)

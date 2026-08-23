@@ -47,7 +47,7 @@ _start:
     .type riscv_relocate_to_high, @function
 
 riscv_relocate_to_high:
-    /* The active table maps the whole image at both its old and new VA. */
+    /* The transition table maps the image at both its old and new VA. */
     add ra, ra, a0
     add sp, sp, a0
 
