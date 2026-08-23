@@ -20,6 +20,7 @@ struct dtb_memory_range {
 struct dtb_boot_info {
     struct dtb_memory_range memory;
     uint32_t dtb_size;
+    uint32_t timebase_frequency;
     uint32_t reserved_count;
     struct dtb_memory_range reserved[DTB_MAX_RESERVED_RANGES];
 };

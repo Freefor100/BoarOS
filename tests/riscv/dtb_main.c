@@ -37,10 +37,16 @@ enum property_name_offset {
     NAME_STATUS = sizeof("#address-cells") + sizeof("#size-cells") +
                   sizeof("device_type") + sizeof("reg") + sizeof("ranges") +
                   sizeof("size"),
+    NAME_TIMEBASE_FREQUENCY = sizeof("#address-cells") +
+                              sizeof("#size-cells") +
+                              sizeof("device_type") + sizeof("reg") +
+                              sizeof("ranges") + sizeof("size") +
+                              sizeof("status"),
 };
 
 static const unsigned char property_names[] =
-    "#address-cells\0#size-cells\0device_type\0reg\0ranges\0size\0status";
+    "#address-cells\0#size-cells\0device_type\0reg\0ranges\0size\0status\0"
+    "timebase-frequency";
 
 struct blob_builder {
     unsigned char bytes[TEST_BLOB_CAPACITY];
@@ -277,6 +283,7 @@ static void poison_boot_info(struct dtb_boot_info *info)
     info->memory.base = 0x1122334455667788ULL;
     info->memory.size = 0x8877665544332211ULL;
     info->dtb_size = 0xa5a5a5a5U;
+    info->timebase_frequency = 0x3c3c3c3cU;
     info->reserved_count = 0x5a5a5a5aU;
     for (index = 0U; index < DTB_MAX_RESERVED_RANGES; index++) {
         info->reserved[index].base = 0x1100000000000000ULL + index;
@@ -291,6 +298,7 @@ static int boot_info_is_poisoned(const struct dtb_boot_info *info)
     if (info->memory.base != 0x1122334455667788ULL ||
         info->memory.size != 0x8877665544332211ULL ||
         info->dtb_size != 0xa5a5a5a5U ||
+        info->timebase_frequency != 0x3c3c3c3cU ||
         info->reserved_count != 0x5a5a5a5aU) {
         return 0;
     }
@@ -329,6 +337,20 @@ static void expect_memory(unsigned long case_id,
     if (actual != DTB_STATUS_OK ||
         info.memory.base != expected_base ||
         info.memory.size != expected_size) {
+        fail_status(case_id, DTB_STATUS_OK, actual);
+    }
+}
+
+static void expect_timebase(unsigned long case_id,
+                            uint32_t expected_frequency)
+{
+    struct dtb_boot_info info;
+    enum dtb_status actual = dtb_read_boot_info(test_blob.bytes, &info);
+
+    if (actual != DTB_STATUS_OK ||
+        info.memory.base != 0x80000000ULL ||
+        info.memory.size != 0x20000000ULL ||
+        info.timebase_frequency != expected_frequency) {
         fail_status(case_id, DTB_STATUS_OK, actual);
     }
 }
@@ -688,6 +710,108 @@ static void test_reports_reserved_memory_status_property(void)
     expect_error(23U, DTB_STATUS_UNSUPPORTED);
 }
 
+static void test_reads_timebase_frequency(void)
+{
+    static const uint32_t reg[] = {0U, 0x80000000U, 0x20000000U};
+
+    builder_start(&test_blob);
+    builder_begin_node(&test_blob, "cpus");
+    builder_property_u32(&test_blob, NAME_TIMEBASE_FREQUENCY, 10000000U);
+    builder_end_node(&test_blob);
+    builder_add_memory(&test_blob, "memory@80000000", reg, 3U);
+    builder_finish(&test_blob);
+    expect_timebase(24U, 10000000U);
+}
+
+static void test_reports_missing_timebase_frequency(void)
+{
+    static const uint32_t reg[] = {0U, 0x80000000U, 0x20000000U};
+
+    builder_start(&test_blob);
+    builder_add_memory(&test_blob, "memory@80000000", reg, 3U);
+    builder_finish(&test_blob);
+    expect_timebase(25U, 0U);
+}
+
+static void test_rejects_short_timebase_frequency(void)
+{
+    static const uint32_t reg[] = {0U, 0x80000000U, 0x20000000U};
+    static const unsigned char frequency[] = {0U, 0U, 1U};
+
+    builder_start(&test_blob);
+    builder_begin_node(&test_blob, "cpus");
+    builder_property(&test_blob,
+                     NAME_TIMEBASE_FREQUENCY,
+                     frequency,
+                     sizeof(frequency));
+    builder_end_node(&test_blob);
+    builder_add_memory(&test_blob, "memory@80000000", reg, 3U);
+    builder_finish(&test_blob);
+    expect_error(26U, DTB_STATUS_INVALID);
+}
+
+static void test_rejects_long_timebase_frequency(void)
+{
+    static const uint32_t reg[] = {0U, 0x80000000U, 0x20000000U};
+    static const unsigned char frequency[8] = {0U, 0U, 0U, 1U};
+
+    builder_start(&test_blob);
+    builder_begin_node(&test_blob, "cpus");
+    builder_property(&test_blob,
+                     NAME_TIMEBASE_FREQUENCY,
+                     frequency,
+                     sizeof(frequency));
+    builder_end_node(&test_blob);
+    builder_add_memory(&test_blob, "memory@80000000", reg, 3U);
+    builder_finish(&test_blob);
+    expect_error(27U, DTB_STATUS_INVALID);
+}
+
+static void test_rejects_zero_timebase_frequency(void)
+{
+    static const uint32_t reg[] = {0U, 0x80000000U, 0x20000000U};
+
+    builder_start(&test_blob);
+    builder_begin_node(&test_blob, "cpus");
+    builder_property_u32(&test_blob, NAME_TIMEBASE_FREQUENCY, 0U);
+    builder_end_node(&test_blob);
+    builder_add_memory(&test_blob, "memory@80000000", reg, 3U);
+    builder_finish(&test_blob);
+    expect_error(28U, DTB_STATUS_INVALID);
+}
+
+static void test_rejects_duplicate_timebase_frequency(void)
+{
+    static const uint32_t reg[] = {0U, 0x80000000U, 0x20000000U};
+
+    builder_start(&test_blob);
+    builder_begin_node(&test_blob, "cpus");
+    builder_property_u32(&test_blob, NAME_TIMEBASE_FREQUENCY, 10000000U);
+    builder_property_u32(&test_blob, NAME_TIMEBASE_FREQUENCY, 10000000U);
+    builder_end_node(&test_blob);
+    builder_add_memory(&test_blob, "memory@80000000", reg, 3U);
+    builder_finish(&test_blob);
+    expect_error(29U, DTB_STATUS_INVALID);
+}
+
+static void test_ignores_timebase_outside_cpus(void)
+{
+    static const uint32_t reg[] = {0U, 0x80000000U, 0x20000000U};
+
+    builder_start(&test_blob);
+    builder_begin_node(&test_blob, "chosen");
+    builder_property_u32(&test_blob, NAME_TIMEBASE_FREQUENCY, 10000000U);
+    builder_end_node(&test_blob);
+    builder_begin_node(&test_blob, "cpus");
+    builder_begin_node(&test_blob, "cpu@0");
+    builder_property_u32(&test_blob, NAME_TIMEBASE_FREQUENCY, 4000000U);
+    builder_end_node(&test_blob);
+    builder_end_node(&test_blob);
+    builder_add_memory(&test_blob, "memory@80000000", reg, 3U);
+    builder_finish(&test_blob);
+    expect_timebase(30U, 0U);
+}
+
 void kernel_main(unsigned long hart_id, const void *dtb)
 {
     (void)hart_id;
@@ -716,6 +840,13 @@ void kernel_main(unsigned long hart_id, const void *dtb)
     test_reports_too_many_reservations();
     test_reports_memory_status_property();
     test_reports_reserved_memory_status_property();
+    test_reads_timebase_frequency();
+    test_reports_missing_timebase_frequency();
+    test_rejects_short_timebase_frequency();
+    test_rejects_long_timebase_frequency();
+    test_rejects_zero_timebase_frequency();
+    test_rejects_duplicate_timebase_frequency();
+    test_ignores_timebase_outside_cpus();
     run_boot_memory_tests();
 
     virt_uart_puts("BoarOS: DTB parser tests passed\n");

@@ -2,11 +2,13 @@
 #include <arch/riscv/memory_layout.h>
 #include <arch/riscv/sbi.h>
 #include <arch/riscv/sv39.h>
+#include <arch/riscv/timer.h>
 #include <arch/riscv/virt_uart.h>
 #include <kernel/boot_memory.h>
 #include <kernel/dtb.h>
 #include <kernel/page.h>
 #include <kernel/physical_page.h>
+#include <kernel/tick.h>
 
 #include <stdint.h>
 
@@ -123,6 +125,30 @@ static void shutdown_for_direct_map_error(void) __attribute__((noreturn));
 static void shutdown_for_direct_map_error(void)
 {
     virt_uart_puts("BoarOS: direct map verification failed\n");
+    sbi_shutdown();
+}
+
+static void shutdown_for_timer_error(enum riscv_timer_status status)
+    __attribute__((noreturn));
+
+static void shutdown_for_timer_error(enum riscv_timer_status status)
+{
+    if (status == RISCV_TIMER_STATUS_INVALID_ARGUMENT) {
+        virt_uart_puts("BoarOS: invalid timer argument\n");
+    } else if (status == RISCV_TIMER_STATUS_INVALID_FREQUENCY) {
+        virt_uart_puts("BoarOS: invalid timer frequency\n");
+    } else if (status == RISCV_TIMER_STATUS_ALREADY_STARTED) {
+        virt_uart_puts("BoarOS: timer already started\n");
+    } else if (status == RISCV_TIMER_STATUS_SBI_PROBE_FAILED) {
+        virt_uart_puts("BoarOS: SBI TIME probe failed\n");
+    } else if (status == RISCV_TIMER_STATUS_SBI_TIME_UNAVAILABLE) {
+        virt_uart_puts("BoarOS: SBI TIME unavailable\n");
+    } else if (status == RISCV_TIMER_STATUS_SBI_SET_FAILED) {
+        virt_uart_puts("BoarOS: SBI timer setup failed\n");
+    } else {
+        virt_uart_puts("BoarOS: unknown timer startup error\n");
+    }
+
     sbi_shutdown();
 }
 
@@ -481,6 +507,7 @@ void kernel_main(unsigned long hart_id, const void *dtb)
     enum boot_memory_status memory_status;
     enum physical_page_status page_status;
     enum riscv_sv39_status sv39_status;
+    enum riscv_timer_status timer_status;
 
     if (dtb_status != DTB_STATUS_OK) {
         shutdown_for_dtb_error(dtb_status);
@@ -589,5 +616,22 @@ void kernel_main(unsigned long hart_id, const void *dtb)
     virt_uart_put_hex((unsigned long)riscv_sv39_current_satp());
     virt_uart_putc('\n');
 
-    sbi_shutdown();
+    timer_status = riscv_timer_start(info.timebase_frequency,
+                                     KERNEL_TICKS_PER_SECOND);
+    if (timer_status != RISCV_TIMER_STATUS_OK) {
+        shutdown_for_timer_error(timer_status);
+    }
+
+    virt_uart_puts("BoarOS: timer frequency=");
+    virt_uart_put_hex((unsigned long)info.timebase_frequency);
+    virt_uart_puts(" tick-hz=");
+    virt_uart_put_hex(KERNEL_TICKS_PER_SECOND);
+    virt_uart_puts(" period=");
+    virt_uart_put_hex((unsigned long)(info.timebase_frequency /
+                                      KERNEL_TICKS_PER_SECOND));
+    virt_uart_putc('\n');
+
+    for (;;) {
+        asm volatile("wfi");
+    }
 }

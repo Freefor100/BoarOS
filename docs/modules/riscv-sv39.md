@@ -64,6 +64,6 @@ make test-no-identity-riscv
 make test-riscv
 ```
 
-聚焦建表测试检查完整生命周期转换、2 MiB/4 KiB PTE 的精确编码、16 GiB 对齐映射的页表规模、混合叶子、canonical/物理上界/权限/对齐校验、两种叶子结构冲突以及中途失败后的部分提交状态。direct-map 聚焦用例检查正反转换、窗口首尾、跨界和失败时输出不变。独立测试 walker 会从实际页表反向解析 PA、叶子大小和权限；页池预先填充非零字节，以同时验证页表清零。权限测试先用显式 `ld` 证明 rodata 页可读，再用显式 `sd` 要求产生 store page fault（`scause=15`，`stval` 等于目标地址），并在激活后验证所有建表操作均被拒绝。完整启动测试在 512 MiB 和 1 GiB RAM 下验证 `satp.MODE=8`，通过 direct map 实际写读、释放和复用物理页，要求物理页计数差等于最终页表页数，并依据 ELF 符号精确检查高半区 PC、SP、GP 和 `stvec`。独立高半区 trap 测试执行真实 breakpoint，核对 `scause=3` 与高地址 `sepc`；no-identity 测试在最终切换后读取低内核物理地址，要求产生 `scause=13` 的 load page fault。
+聚焦建表测试检查完整生命周期转换、2 MiB/4 KiB PTE 的精确编码、16 GiB 对齐映射的页表规模、混合叶子、canonical/物理上界/权限/对齐校验、两种叶子结构冲突以及中途失败后的部分提交状态。direct-map 聚焦用例检查正反转换、窗口首尾、跨界和失败时输出不变。独立测试 walker 会从实际页表反向解析 PA、叶子大小和权限；页池预先填充非零字节，以同时验证页表清零。权限测试先用显式 `ld` 证明 rodata 页可读，再用显式 `sd` 要求产生 store page fault（`scause=15`，`stval` 等于目标地址），并在激活后验证所有建表操作均被拒绝。完整启动测试在 512 MiB、1 GiB 和 16 GiB RAM 下验证 `satp.MODE=8`，通过 direct map 实际写读、释放和复用物理页，要求物理页计数差等于最终页表页数，并依据 ELF 符号精确检查高半区 PC、SP、GP 和 `stvec`。独立高半区 trap 测试执行真实 breakpoint，核对 `scause=3` 与高地址 `sepc`；no-identity 测试在最终切换后读取低内核物理地址，要求产生 `scause=13` 的 load page fault。
 
 当前未实现 1 GiB 叶子、用户映射、页表回收和运行期映射修改。direct map 只映射 DTB 报告的第一段 RAM，不包含 MMIO，也不放宽内核 text/rodata 的别名权限。

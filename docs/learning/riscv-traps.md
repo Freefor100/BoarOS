@@ -75,9 +75,9 @@ BoarOS 当前固定以下 RISC-V trap 基线：
 - 汇编只负责架构现场和关键返回验证，具体 cause 交给 C dispatcher。
 - handler 返回表示事件已经处理；未知或当前不能处理的事件必须 fatal，不伪造成功。
 - dispatcher 期间保持 SIE 关闭，不支持嵌套异步中断。
-- 生产内核暂不启用中断，也没有 handler 注册框架；第一项正式可恢复事件将在 timer/tick 阶段接入。
+- 最终地址空间稳定后只开启 supervisor timer interrupt；它是当前唯一正式可恢复生产事件，dispatcher 不提供运行期 handler 注册框架。
 
-这些选择属于 RISC-V 架构层，可在 QEMU `virt` 和 VisionFive 2 上复用。定时器来源、外部中断控制器和设备 IRQ 编号仍属于 SBI 或平台层，不能从 QEMU 的行为推断开发板布局。
+这些选择属于 RISC-V 架构层，可在 QEMU `virt` 和 VisionFive 2 上复用。当前 timer 通过两边共有的 SBI TIME 抽象复用，实际 timebase 仍从 DTB 获取；外部中断控制器和设备 IRQ 编号属于平台层，不能从 QEMU 的行为推断开发板布局。时间机制的完整解释见 [RISC-V 时间与周期 Tick 学习总结](riscv-time.md)。
 
 ## 怎样验证入口确实可恢复？
 
@@ -86,6 +86,7 @@ BoarOS 当前固定以下 RISC-V trap 基线：
 - 在汇编中给寄存器设置独立的完整 64 位哨兵，trap 返回后先把完整现场快照到栈，再逐项比较 x1..x31；SP 和 GP 与进入探针前的实际值比较。高 32 位也必须变化，才能发现错误的 32 位 load/store 导致的截断或符号扩展。
 - 用显式 32 位 `EBREAK` 验证同步异常修改 `sepc` 后不会重复执行。
 - 用真实 SSIP 验证 interrupt cause、SPP/SPIE/SIE、pending 清除以及 `sret` 恢复 SIE。
+- 用真实 SBI timer 验证生产 cause 5 handler 重设 deadline、保持 `sepc` 并至少两次返回高半区 `wfi`。
 - 在两个独立启动测试中分别构造 SPP 无效和保存 SIE 开启的 Frame，证明任一返回检查缺失都会失败，而不是让另一项错误掩盖分支覆盖不足。
 - 检查最终测试 ELF 的入口反汇编，确认 Frame 槽地址准备、dummy `sc.d`、`sepc` 写回和 `sret` 的顺序；这验证的是实际链接产物，不依赖源码中是否还保留同名文本。
 - 在 Bare 低地址和最终 Sv39 高半区各执行真实返回；高半区测试随后再触发未处理 breakpoint，证明 fatal fallback 仍在。

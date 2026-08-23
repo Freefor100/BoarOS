@@ -1,14 +1,19 @@
 #include <arch/riscv/sbi.h>
+#include <arch/riscv/timer.h>
 #include <arch/riscv/virt_uart.h>
 
 #include <stdint.h>
 
 #define KERNEL_PHYSICAL_START UINT64_C(0x80200000)
 
-void __real_sbi_shutdown(void) __attribute__((noreturn));
-void __wrap_sbi_shutdown(void) __attribute__((noreturn));
+enum riscv_timer_status __real_riscv_timer_start(
+    uint32_t timebase_frequency,
+    uint32_t ticks_per_second);
+enum riscv_timer_status __wrap_riscv_timer_start(
+    uint32_t timebase_frequency,
+    uint32_t ticks_per_second);
 
-static unsigned int shutdown_calls;
+static unsigned int timer_start_calls;
 
 static uint64_t load_low_kernel_alias(uint64_t address)
 {
@@ -21,12 +26,14 @@ static uint64_t load_low_kernel_alias(uint64_t address)
     return value;
 }
 
-void __wrap_sbi_shutdown(void)
+enum riscv_timer_status __wrap_riscv_timer_start(
+    uint32_t timebase_frequency,
+    uint32_t ticks_per_second)
 {
-    if (shutdown_calls == 0U) {
+    if (timer_start_calls == 0U) {
         uint64_t value;
 
-        shutdown_calls = 1U;
+        timer_start_calls = 1U;
         virt_uart_puts("BoarOS: no-identity target=");
         virt_uart_put_hex((unsigned long)KERNEL_PHYSICAL_START);
         virt_uart_putc('\n');
@@ -35,7 +42,8 @@ void __wrap_sbi_shutdown(void)
         virt_uart_puts("BoarOS: no-identity load returned value=");
         virt_uart_put_hex((unsigned long)value);
         virt_uart_putc('\n');
+        sbi_shutdown();
     }
 
-    __real_sbi_shutdown();
+    return __real_riscv_timer_start(timebase_frequency, ticks_per_second);
 }

@@ -3,7 +3,7 @@
 set -eu
 
 project_root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
-kernel="$project_root/kernel-rv"
+kernel=${BOOT_TEST_KERNEL_RV:-"$project_root/build/riscv/tests/kernel-timer-boot-rv"}
 qemu=${QEMU_RISCV64:-qemu-system-riscv64}
 nm_rv=${NM_RV:-nm}
 readelf_rv=${READELF_RV:-readelf}
@@ -107,6 +107,23 @@ run_case()
         exit 1
     fi
 
+    interrupt_values=$(sed -n \
+        's/^BoarOS: timer interrupt ticks=\(0x[0-9a-f][0-9a-f]*\) entries=\(0x[0-9a-f][0-9a-f]*\) failures=0x0$/\1 \2/p' \
+        "$output")
+    interrupt_ticks=${interrupt_values%% *}
+    interrupt_entries=${interrupt_values#* }
+    if [ "$(grep -cxF 'BoarOS: timer frequency=0x989680 tick-hz=0x64 period=0x186a0' "$output" || true)" -ne 1 ] ||
+        [ -z "$interrupt_values" ] ||
+        [ "$interrupt_ticks" = "$interrupt_values" ] ||
+        [ "$interrupt_entries" != "${interrupt_entries#* }" ] ||
+        [ "$((interrupt_ticks))" -lt 3 ] ||
+        [ "$((interrupt_entries))" -lt 3 ] ||
+        [ "$((interrupt_entries))" -gt 8 ]; then
+        cat "$output" >&2
+        echo "expected successful timer initialization and interrupts" >&2
+        exit 1
+    fi
+
     if [ "$(grep -cE '^BoarOS: high-half pc=0x[0-9a-f]+ sp=0x[0-9a-f]+ gp=0x[0-9a-f]+ stvec=0x[0-9a-f]+$' "$output" || true)" -ne 1 ]; then
         cat "$output" >&2
         echo "expected one high-half execution context line" >&2
@@ -207,13 +224,15 @@ run_case()
 
 run_case 512M 0x20000000
 run_case 1G 0x40000000
+run_case 16G 0x400000000
 
 dtb_512=$(sed -n 's/^BoarOS: booted .* dtb=\(0x[0-9a-f]*\)$/\1/p' "$output_dir/boot-512M.log")
 dtb_1g=$(sed -n 's/^BoarOS: booted .* dtb=\(0x[0-9a-f]*\)$/\1/p' "$output_dir/boot-1G.log")
+dtb_16g=$(sed -n 's/^BoarOS: booted .* dtb=\(0x[0-9a-f]*\)$/\1/p' "$output_dir/boot-16G.log")
 
-if [ "$dtb_512" = "$dtb_1g" ]; then
-    echo "DTB address did not change with guest memory size: $dtb_512" >&2
+if [ "$dtb_512" = "$dtb_1g" ] || [ "$dtb_1g" = "$dtb_16g" ]; then
+    echo "DTB address did not change across guest memory sizes" >&2
     exit 1
 fi
 
-echo "RISC-V boot passed: DTB moved from $dtb_512 to $dtb_1g"
+echo "RISC-V boot passed: DTB moved from $dtb_512 through $dtb_1g to $dtb_16g"

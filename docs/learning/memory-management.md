@@ -242,7 +242,7 @@ make test-no-identity-riscv
 make test-riscv
 ```
 
-Sv39 建表测试覆盖精确 PTE、2 MiB/4 KiB 选择、16 GiB 规模、边界拒绝和部分提交；权限故障测试覆盖 MMU 生效后的只读保护；完整启动测试再验证 512 MiB/1 GiB RAM 下的 `satp`、页表页计数和高半区执行上下文；高半区 trap 测试验证硬件实际使用迁移后的 `stvec`，no-identity 测试验证最终页表真实拒绝低 RAM load。开发板到手后还必须补充同类硬件验证，不能把 QEMU 结果直接等同于板级兼容。
+Sv39 建表测试覆盖精确 PTE、2 MiB/4 KiB 选择、16 GiB 规模、边界拒绝和部分提交；权限故障测试覆盖 MMU 生效后的只读保护；完整启动测试再验证 512 MiB、1 GiB 和 16 GiB RAM 下的 `satp`、页表页计数和高半区执行上下文；高半区 trap 测试验证硬件实际使用迁移后的 `stvec`，no-identity 测试验证最终页表真实拒绝低 RAM load。开发板到手后还必须补充同类硬件验证，不能把 QEMU 结果直接等同于板级兼容。
 
 ## 资料依据
 

@@ -1,18 +1,23 @@
 #include <arch/riscv/sbi.h>
+#include <arch/riscv/timer.h>
 #include <arch/riscv/trap.h>
 #include <arch/riscv/virt_uart.h>
 
 #include <stdint.h>
 
-void __real_sbi_shutdown(void) __attribute__((noreturn));
-void __wrap_sbi_shutdown(void) __attribute__((noreturn));
+enum riscv_timer_status __real_riscv_timer_start(
+    uint32_t timebase_frequency,
+    uint32_t ticks_per_second);
+enum riscv_timer_status __wrap_riscv_timer_start(
+    uint32_t timebase_frequency,
+    uint32_t ticks_per_second);
 void __real_riscv_trap_dispatch(struct riscv_trap_frame *frame);
 void __wrap_riscv_trap_dispatch(struct riscv_trap_frame *frame);
 void trap_test_breakpoint(void);
 unsigned long trap_test_software_interrupt_return(void);
 extern unsigned char trap_test_software_interrupt_resume[];
 
-static unsigned int shutdown_calls;
+static unsigned int timer_start_calls;
 static unsigned int expecting_software_interrupt;
 static unsigned long return_handler_failures;
 static unsigned long return_scause;
@@ -49,12 +54,14 @@ void __wrap_riscv_trap_dispatch(struct riscv_trap_frame *frame)
     __real_riscv_trap_dispatch(frame);
 }
 
-void __wrap_sbi_shutdown(void)
+enum riscv_timer_status __wrap_riscv_timer_start(
+    uint32_t timebase_frequency,
+    uint32_t ticks_per_second)
 {
-    if (shutdown_calls == 0U) {
+    if (timer_start_calls == 0U) {
         unsigned long register_failures;
 
-        shutdown_calls = 1U;
+        timer_start_calls = 1U;
         expecting_software_interrupt = 1U;
         register_failures = trap_test_software_interrupt_return();
         if (expecting_software_interrupt != 0U) {
@@ -80,7 +87,8 @@ void __wrap_sbi_shutdown(void)
         trap_test_breakpoint();
 
         virt_uart_puts("BoarOS: high-half trap returned\n");
+        sbi_shutdown();
     }
 
-    __real_sbi_shutdown();
+    return __real_riscv_timer_start(timebase_frequency, ticks_per_second);
 }

@@ -265,6 +265,8 @@ enum dtb_status dtb_read_boot_info(const void *dtb,
     int reserved_child = 0;
     int reserved_reg_seen = 0;
     int reserved_size_seen = 0;
+    int cpus_node = 0;
+    int timebase_frequency_seen = 0;
 
     if (blob == NULL || info == NULL) {
         return DTB_STATUS_INVALID;
@@ -306,6 +308,7 @@ enum dtb_status dtb_read_boot_info(const void *dtb,
     }
 
     result.dtb_size = total_size;
+    result.timebase_frequency = 0U;
     result.reserved_count = 0U;
     reserve_position = reserve_offset;
     for (;;) {
@@ -370,6 +373,7 @@ enum dtb_status dtb_read_boot_info(const void *dtb,
             position = next_position;
 
             if (depth == 2U) {
+                cpus_node = bytes_equal_string(name, name_length, "cpus");
                 memory_name = classify_memory_node_name(name, name_length);
                 if (memory_name < 0) {
                     return DTB_STATUS_INVALID;
@@ -453,6 +457,10 @@ enum dtb_status dtb_read_boot_info(const void *dtb,
                 reserved_node = 0;
             }
 
+            if (depth == 2U) {
+                cpus_node = 0;
+            }
+
             if (property_depth == depth) {
                 property_depth = 0U;
             }
@@ -495,6 +503,18 @@ enum dtb_status dtb_read_boot_info(const void *dtb,
                  (depth == 3U && reserved_child)) &&
                 bytes_equal_string(name, name_length, "status")) {
                 return DTB_STATUS_UNSUPPORTED;
+            } else if (depth == 2U && cpus_node &&
+                       bytes_equal_string(name,
+                                          name_length,
+                                          "timebase-frequency")) {
+                if (timebase_frequency_seen || length != 4U) {
+                    return DTB_STATUS_INVALID;
+                }
+                result.timebase_frequency = read_be32(value);
+                if (result.timebase_frequency == 0U) {
+                    return DTB_STATUS_INVALID;
+                }
+                timebase_frequency_seen = 1;
             } else if (depth == 1U &&
                 bytes_equal_string(name, name_length, "#address-cells")) {
                 if (address_cells_seen || length != 4U) {

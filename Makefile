@@ -26,6 +26,9 @@ DTB_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-dtb-rv
 PAGE_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-page-rv
 SV39_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-sv39-rv
 SV39_FAULT_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-sv39-fault-rv
+TIMER_CASES_TEST_KERNEL_RV := \
+	$(BUILD_DIR)/tests/kernel-timer-cases-rv
+TIMER_BOOT_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-timer-boot-rv
 
 ARCH_FLAGS := -march=rv64imac_zicsr_zifencei -mabi=lp64 -mcmodel=medany
 CPPFLAGS := -Iinclude -DBOAROS_PAGE_SHIFT=12
@@ -40,12 +43,14 @@ C_SOURCES := \
 	arch/riscv/direct_map.c \
 	arch/riscv/sbi.c \
 	arch/riscv/sv39.c \
+	arch/riscv/timer.c \
 	arch/riscv/trap.c \
 	arch/riscv/virt_uart.c \
 	kernel/boot_memory.c \
 	kernel/dtb.c \
 	kernel/main.c \
-	kernel/physical_page.c
+	kernel/physical_page.c \
+	kernel/tick.c
 ASM_SOURCES := \
 	arch/riscv/boot.S \
 	arch/riscv/trap_entry.S
@@ -54,8 +59,10 @@ OBJECTS := \
 	$(patsubst %.S,$(BUILD_DIR)/%.o,$(ASM_SOURCES))
 TEST_RUNTIME_C_SOURCES := \
 	arch/riscv/sbi.c \
+	arch/riscv/timer.c \
 	arch/riscv/trap.c \
-	arch/riscv/virt_uart.c
+	arch/riscv/virt_uart.c \
+	kernel/tick.c
 TEST_RUNTIME_ASM_SOURCES := \
 	arch/riscv/boot.S \
 	arch/riscv/trap_entry.S
@@ -125,6 +132,16 @@ SV39_FAULT_TEST_C_SOURCES := \
 SV39_FAULT_TEST_OBJECTS := \
 	$(TEST_RUNTIME_OBJECTS) \
 	$(patsubst %.c,$(BUILD_DIR)/%.o,$(SV39_FAULT_TEST_C_SOURCES))
+TIMER_CASES_TEST_C_SOURCES := \
+	tests/riscv/timer_cases.c
+TIMER_CASES_TEST_OBJECTS := \
+	$(TEST_RUNTIME_OBJECTS) \
+	$(patsubst %.c,$(BUILD_DIR)/%.o,$(TIMER_CASES_TEST_C_SOURCES))
+TIMER_BOOT_TEST_C_SOURCES := \
+	tests/riscv/timer_boot.c
+TIMER_BOOT_TEST_OBJECTS := \
+	$(OBJECTS) \
+	$(patsubst %.c,$(BUILD_DIR)/%.o,$(TIMER_BOOT_TEST_C_SOURCES))
 DEPS := \
 	$(OBJECTS:.o=.d) \
 	$(TRAP_TEST_OBJECTS:.o=.d) \
@@ -135,12 +152,15 @@ DEPS := \
 	$(DTB_TEST_OBJECTS:.o=.d) \
 	$(PAGE_TEST_OBJECTS:.o=.d) \
 	$(SV39_TEST_OBJECTS:.o=.d) \
-	$(SV39_FAULT_TEST_OBJECTS:.o=.d)
+	$(SV39_FAULT_TEST_OBJECTS:.o=.d) \
+	$(TIMER_CASES_TEST_OBJECTS:.o=.d) \
+	$(TIMER_BOOT_TEST_OBJECTS:.o=.d)
 
 .PHONY: all clean debug-riscv references run-riscv test-dtb-riscv \
-	test-high-half-trap-riscv test-no-identity-riscv test-page-riscv \
+	test-high-half-trap-riscv test-idle-riscv test-no-identity-riscv \
+	test-page-riscv \
 	test-references test-riscv test-sv39-fault-riscv test-sv39-riscv \
-	test-trap-riscv test-trap-return-riscv
+	test-timer-riscv test-trap-riscv test-trap-return-riscv
 
 all: $(KERNEL_RV)
 
@@ -172,14 +192,14 @@ $(TRAP_RETURN_SIE_TEST_KERNEL_RV): $(TRAP_RETURN_SIE_TEST_OBJECTS) \
 
 $(HIGH_HALF_TRAP_TEST_KERNEL_RV): $(HIGH_HALF_TRAP_TEST_OBJECTS) \
 		arch/riscv/linker.ld
-	$(CC) $(LDFLAGS) -Wl,--wrap=sbi_shutdown \
+	$(CC) $(LDFLAGS) -Wl,--wrap=riscv_timer_start \
 		-Wl,--wrap=riscv_trap_dispatch \
 		-Wl,-Map,$(BUILD_DIR)/tests/kernel-high-half-trap-rv.map \
 		-o $@ $(HIGH_HALF_TRAP_TEST_OBJECTS)
 
 $(NO_IDENTITY_TEST_KERNEL_RV): $(NO_IDENTITY_TEST_OBJECTS) \
 		arch/riscv/linker.ld
-	$(CC) $(LDFLAGS) -Wl,--wrap=sbi_shutdown \
+	$(CC) $(LDFLAGS) -Wl,--wrap=riscv_timer_start \
 		-Wl,-Map,$(BUILD_DIR)/tests/kernel-no-identity-rv.map \
 		-o $@ $(NO_IDENTITY_TEST_OBJECTS)
 
@@ -201,6 +221,19 @@ $(SV39_FAULT_TEST_KERNEL_RV): $(SV39_FAULT_TEST_OBJECTS) \
 		-Wl,-Map,$(BUILD_DIR)/tests/kernel-sv39-fault-rv.map \
 		-o $@ $(SV39_FAULT_TEST_OBJECTS)
 
+$(TIMER_CASES_TEST_KERNEL_RV): $(TIMER_CASES_TEST_OBJECTS) \
+		arch/riscv/linker.ld
+	$(CC) $(LDFLAGS) -Wl,--wrap=sbi_probe_extension \
+		-Wl,--wrap=sbi_set_timer \
+		-Wl,-Map,$(BUILD_DIR)/tests/kernel-timer-cases-rv.map \
+		-o $@ $(TIMER_CASES_TEST_OBJECTS)
+
+$(TIMER_BOOT_TEST_KERNEL_RV): $(TIMER_BOOT_TEST_OBJECTS) \
+		arch/riscv/linker.ld
+	$(CC) $(LDFLAGS) -Wl,--wrap=kernel_tick_advance \
+		-Wl,-Map,$(BUILD_DIR)/tests/kernel-timer-boot-rv.map \
+		-o $@ $(TIMER_BOOT_TEST_OBJECTS)
+
 $(BUILD_DIR)/%.o: %.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c $< -o $@
@@ -221,6 +254,7 @@ test-riscv: $(DTB_TEST_KERNEL_RV) $(PAGE_TEST_KERNEL_RV) \
 	$(SV39_TEST_KERNEL_RV) $(SV39_FAULT_TEST_KERNEL_RV) \
 	$(TRAP_RETURN_TEST_KERNEL_RV) $(TRAP_RETURN_SIE_TEST_KERNEL_RV) \
 	$(HIGH_HALF_TRAP_TEST_KERNEL_RV) $(NO_IDENTITY_TEST_KERNEL_RV) \
+	$(TIMER_CASES_TEST_KERNEL_RV) $(TIMER_BOOT_TEST_KERNEL_RV) \
 	$(KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) \
 		DTB_TEST_KERNEL_RV=$(DTB_TEST_KERNEL_RV) ./tests/dtb-riscv.sh
@@ -236,7 +270,12 @@ test-riscv: $(DTB_TEST_KERNEL_RV) $(PAGE_TEST_KERNEL_RV) \
 		TRAP_RETURN_SIE_TEST_KERNEL_RV=$(TRAP_RETURN_SIE_TEST_KERNEL_RV) \
 		OBJDUMP_RV=$(OBJDUMP) \
 		./tests/trap-return-riscv.sh
+	QEMU_RISCV64=$(QEMU_RISCV64) \
+		TIMER_CASES_TEST_KERNEL_RV=$(TIMER_CASES_TEST_KERNEL_RV) \
+		TIMER_BOOT_TEST_KERNEL_RV=$(TIMER_BOOT_TEST_KERNEL_RV) \
+		./tests/timer-riscv.sh
 	QEMU_RISCV64=$(QEMU_RISCV64) NM_RV=$(NM) READELF_RV=$(READELF) \
+		BOOT_TEST_KERNEL_RV=$(TIMER_BOOT_TEST_KERNEL_RV) \
 		./tests/boot-riscv.sh
 	QEMU_RISCV64=$(QEMU_RISCV64) NM_RV=$(NM) \
 		HIGH_HALF_TRAP_TEST_KERNEL_RV=$(HIGH_HALF_TRAP_TEST_KERNEL_RV) \
@@ -244,6 +283,8 @@ test-riscv: $(DTB_TEST_KERNEL_RV) $(PAGE_TEST_KERNEL_RV) \
 	QEMU_RISCV64=$(QEMU_RISCV64) \
 		NO_IDENTITY_TEST_KERNEL_RV=$(NO_IDENTITY_TEST_KERNEL_RV) \
 		./tests/no-identity-riscv.sh
+	QEMU_RISCV64=$(QEMU_RISCV64) KERNEL_RV=$(KERNEL_RV) \
+		./tests/idle-riscv.sh
 
 test-dtb-riscv: $(DTB_TEST_KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) DTB_TEST_KERNEL_RV=$< \
@@ -260,6 +301,15 @@ test-sv39-riscv: $(SV39_TEST_KERNEL_RV)
 test-sv39-fault-riscv: $(SV39_FAULT_TEST_KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) SV39_FAULT_TEST_KERNEL_RV=$< \
 		./tests/sv39-fault-riscv.sh
+
+test-timer-riscv: $(TIMER_CASES_TEST_KERNEL_RV) \
+		$(TIMER_BOOT_TEST_KERNEL_RV)
+	QEMU_RISCV64=$(QEMU_RISCV64) TIMER_CASES_TEST_KERNEL_RV=$< \
+		TIMER_BOOT_TEST_KERNEL_RV=$(TIMER_BOOT_TEST_KERNEL_RV) \
+		./tests/timer-riscv.sh
+
+test-idle-riscv: $(KERNEL_RV)
+	QEMU_RISCV64=$(QEMU_RISCV64) KERNEL_RV=$< ./tests/idle-riscv.sh
 
 test-trap-riscv: $(TRAP_TEST_KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) KERNEL_RV=$< ./tests/trap-riscv.sh

@@ -6,14 +6,16 @@
 
 | 文件 | 当前职责 |
 |---|---|
-| `include/kernel/dtb.h`、`kernel/dtb.c` | 校验 DTB，读取第一段 RAM、DTB 大小和静态保留区 |
+| `include/kernel/dtb.h`、`kernel/dtb.c` | 校验 DTB，读取第一段 RAM、DTB 大小、RISC-V timebase 和静态保留区 |
 | `include/kernel/boot_memory.h`、`kernel/boot_memory.c` | 规范化保留区并生成字节粒度的可用区间 |
 | `kernel/main.c` | 加入内核与 DTB 占用，输出启动布局诊断 |
 | `tests/riscv/dtb_main.c` | 用合成 DTB 验证格式、状态和输出契约 |
 | `tests/riscv/boot_memory_cases.c` | 验证区间裁剪、排序、合并与相减 |
 | `tests/dtb-riscv.sh`、`tests/boot-riscv.sh` | 运行聚焦测试和真实 QEMU 启动测试 |
 
-`dtb_read_boot_info` 成功时写出第一段非空 RAM、header 的 `total_size`，以及 memory reservation block 和静态 `/reserved-memory/*/reg` 中的非空区间。两种来源合计最多 16 项；超限返回 `DTB_STATUS_UNSUPPORTED`。任何失败都不修改输出。
+`dtb_read_boot_info` 成功时写出第一段非空 RAM、header 的 `total_size`、根节点直属 `/cpus/timebase-frequency`，以及 memory reservation block 和静态 `/reserved-memory/*/reg` 中的非空区间。两种保留区来源合计最多 16 项；超限返回 `DTB_STATUS_UNSUPPORTED`。任何失败都不修改输出。
+
+`timebase-frequency` 缺失时字段为零，通用 DTB 读取仍成功；RISC-V timer 启动负责把零频率作为平台缺失错误。属性存在时必须恰为一个非零 32 位 cell，错误长度或重复属性返回 `DTB_STATUS_INVALID`。其他节点中的同名属性不冒充 `/cpus` 值。
 
 `boot_memory_build` 接收上述快照、链接器给出的半开内核区间和 DTB 地址。成功时返回按地址排序的 `reserved[]` 与 `usable[]`；失败区分非法输入和没有剩余物理内存，输出同样保持不变。
 
@@ -22,6 +24,7 @@
 - 读取器按大端格式逐字段解码，不把可能未对齐的 DTB 数据转换成 C 结构。
 - header 总长度、块顺序与范围、对齐、版本、reservation terminator、结构 token、字符串终止和属性填充都受边界检查。
 - 根节点缺省使用两个 address cell 和一个 size cell；显式值只能是一或二。memory 节点必须位于根节点下，并提供合法的 `device_type = "memory"` 与 `reg`。
+- `timebase-frequency` 是平台提供的原始计数频率；本模块不计算 tick period，也不假设 QEMU 或开发板频率。
 - `/reserved-memory` 必须使用与根节点相同的 cell 数并带空 `ranges`；静态子节点的每个 `reg` tuple 都会保存。动态 `size` 形式和相关节点的 `status` 语义尚未实现，读取器明确返回 unsupported。
 - 布局构建器检查所有 `base + size` 运算，要求内核区间完整位于所选 RAM 中；DTB 或设备树保留区位于 RAM 外的部分会被裁掉。
 - 保留区排序后合并重叠或相邻项，再从 RAM 中相减。结果保持字节粒度，页边界对齐由后续物理页分配器负责。
@@ -42,6 +45,6 @@ make test-dtb-riscv
 make test-riscv
 ```
 
-聚焦测试覆盖一或两个 cell、多 tuple、两类静态保留区、容量上限、动态和 `status` unsupported、畸形输入、失败输出不变，以及布局的裁剪、合并、耗尽和溢出。完整启动测试在 QEMU `virt` 的 512 MiB 与 1 GiB 配置下验证真实 OpenSBI DTB、原始 RAM 大小和非空启动布局。
+聚焦测试覆盖一或两个 cell、多 tuple、两类静态保留区、timebase 正常/缺失/错误位置/错误长度/零值/重复、容量上限、动态和 `status` unsupported、畸形输入、失败输出不变，以及布局的裁剪、合并、耗尽和溢出。完整启动测试在 QEMU `virt` 的 512 MiB、1 GiB 与 16 GiB 配置下验证真实 OpenSBI DTB、10 MHz timebase、原始 RAM 大小和非空启动布局。
 
 本模块仍不处理多 RAM bank、动态 reserved-memory、NUMA、热插拔或 CMA；页边界收缩和单页分配由[物理页分配模块](physical-pages.md)承担。
