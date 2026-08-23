@@ -1,3 +1,4 @@
+#include <arch/riscv/context.h>
 #include <arch/riscv/direct_map.h>
 #include <arch/riscv/memory_layout.h>
 #include <arch/riscv/sbi.h>
@@ -8,6 +9,7 @@
 #include <kernel/dtb.h>
 #include <kernel/page.h>
 #include <kernel/physical_page.h>
+#include <kernel/scheduler.h>
 #include <kernel/tick.h>
 
 #include <stdint.h>
@@ -20,6 +22,8 @@ extern unsigned char __rodata_start[];
 extern unsigned char __rodata_end[];
 extern unsigned char __data_start[];
 extern unsigned char __data_end[];
+extern unsigned char __boot_stack_bottom[];
+extern unsigned char __boot_stack_top[];
 
 void riscv_relocate_to_high(uint64_t offset);
 
@@ -149,6 +153,18 @@ static void shutdown_for_timer_error(enum riscv_timer_status status)
         virt_uart_puts("BoarOS: unknown timer startup error\n");
     }
 
+    sbi_shutdown();
+}
+
+static void shutdown_for_scheduler_error(
+    enum kernel_scheduler_status status) __attribute__((noreturn));
+
+static void shutdown_for_scheduler_error(
+    enum kernel_scheduler_status status)
+{
+    virt_uart_puts("BoarOS: scheduler startup/idle error status=");
+    virt_uart_put_hex((unsigned long)status);
+    virt_uart_putc('\n');
     sbi_shutdown();
 }
 
@@ -411,11 +427,11 @@ static void verify_direct_map_runtime(void)
     uint64_t physical_address;
     uint64_t virtual_address;
     uint64_t recycled_address;
+    void *page_pointer;
     volatile uint64_t *words;
     enum physical_page_status status;
 
-    if (page_allocator.access != direct_map_page_access ||
-        kernel_page_table.allocator != &page_allocator) {
+    if (kernel_page_table.allocator != &page_allocator) {
         shutdown_for_direct_map_error();
     }
 
@@ -429,8 +445,15 @@ static void verify_direct_map_runtime(void)
         RISCV_DIRECT_MAP_STATUS_OK) {
         shutdown_for_direct_map_error();
     }
+    status = physical_page_resolve(&page_allocator,
+                                   physical_address,
+                                   &page_pointer);
+    if (status != PHYSICAL_PAGE_STATUS_OK ||
+        (uint64_t)(uintptr_t)page_pointer != virtual_address) {
+        shutdown_for_direct_map_error();
+    }
 
-    words = (volatile uint64_t *)(uintptr_t)virtual_address;
+    words = page_pointer;
     words[1] = pattern;
     if (words[1] != pattern) {
         shutdown_for_direct_map_error();
@@ -459,7 +482,7 @@ static void verify_direct_map_runtime(void)
     virt_uart_puts(" offset=");
     virt_uart_put_hex((unsigned long)(virtual_address - physical_address));
     virt_uart_puts(" access=");
-    virt_uart_put_hex((unsigned long)(uintptr_t)page_allocator.access);
+    virt_uart_put_hex((unsigned long)(uintptr_t)direct_map_page_access);
     virt_uart_puts(" value=");
     virt_uart_put_hex((unsigned long)pattern);
     virt_uart_puts(" reused=");
@@ -508,6 +531,7 @@ void kernel_main(unsigned long hart_id, const void *dtb)
     enum physical_page_status page_status;
     enum riscv_sv39_status sv39_status;
     enum riscv_timer_status timer_status;
+    enum kernel_scheduler_status scheduler_status;
 
     if (dtb_status != DTB_STATUS_OK) {
         shutdown_for_dtb_error(dtb_status);
@@ -556,6 +580,14 @@ void kernel_main(unsigned long hart_id, const void *dtb)
     }
     kernel_page_table.allocator = &page_allocator;
     verify_direct_map_runtime();
+
+    scheduler_status = kernel_scheduler_init(
+        &page_allocator,
+        (uintptr_t)__boot_stack_bottom,
+        (uintptr_t)__boot_stack_top);
+    if (scheduler_status != KERNEL_SCHEDULER_STATUS_OK) {
+        shutdown_for_scheduler_error(scheduler_status);
+    }
 
     virt_uart_puts("BoarOS: high-half pc=");
     virt_uart_put_hex((unsigned long)current_pc());
@@ -632,6 +664,14 @@ void kernel_main(unsigned long hart_id, const void *dtb)
     virt_uart_putc('\n');
 
     for (;;) {
+        uintptr_t interrupt_status = riscv_interrupt_save();
+        uint64_t reaped_count;
+
+        scheduler_status = kernel_scheduler_reap_exited(&reaped_count);
+        riscv_interrupt_restore(interrupt_status);
+        if (scheduler_status != KERNEL_SCHEDULER_STATUS_OK) {
+            shutdown_for_scheduler_error(scheduler_status);
+        }
         asm volatile("wfi");
     }
 }

@@ -258,6 +258,31 @@ enum physical_page_status physical_page_release(
     return PHYSICAL_PAGE_STATUS_OK;
 }
 
+enum physical_page_status physical_page_resolve(
+    const struct physical_page_allocator *allocator,
+    uint64_t physical_address,
+    void **pointer)
+{
+    void *result;
+
+    if (allocator == 0 || pointer == 0 ||
+        allocator->initialized != PHYSICAL_PAGE_ALLOCATOR_INITIALIZED ||
+        !address_was_allocated(allocator, physical_address)) {
+        return PHYSICAL_PAGE_STATUS_INVALID;
+    }
+    if (allocator->access == 0) {
+        return PHYSICAL_PAGE_STATUS_STATE;
+    }
+
+    result = allocator->access(physical_address);
+    if (result == 0) {
+        return PHYSICAL_PAGE_STATUS_INVALID;
+    }
+
+    *pointer = result;
+    return PHYSICAL_PAGE_STATUS_OK;
+}
+
 uint64_t physical_page_total(
     const struct physical_page_allocator *allocator)
 {

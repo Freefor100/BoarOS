@@ -2,6 +2,7 @@
 #include <arch/riscv/timer.h>
 #include <arch/riscv/trap.h>
 #include <arch/riscv/virt_uart.h>
+#include <kernel/scheduler.h>
 #include <kernel/tick.h>
 
 static void riscv_trap_fatal(const struct riscv_trap_frame *frame)
@@ -39,6 +40,24 @@ static void riscv_timer_fatal(const struct riscv_trap_frame *frame,
     sbi_shutdown();
 }
 
+static void riscv_scheduler_fatal(
+    const struct riscv_trap_frame *frame,
+    enum kernel_scheduler_status status) __attribute__((noreturn));
+
+static void riscv_scheduler_fatal(
+    const struct riscv_trap_frame *frame,
+    enum kernel_scheduler_status status)
+{
+    virt_uart_puts("BoarOS: scheduler error status=");
+    virt_uart_put_hex((unsigned long)status);
+    virt_uart_puts(" scause=");
+    virt_uart_put_hex(frame->scause);
+    virt_uart_puts(" sepc=");
+    virt_uart_put_hex(frame->sepc);
+    virt_uart_putc('\n');
+    sbi_shutdown();
+}
+
 void riscv_trap_dispatch(struct riscv_trap_frame *frame)
 {
     if (frame->scause ==
@@ -51,6 +70,14 @@ void riscv_trap_dispatch(struct riscv_trap_frame *frame)
             riscv_timer_fatal(frame, status);
         }
         kernel_tick_advance(elapsed_ticks);
+        {
+            enum kernel_scheduler_status scheduler_status =
+                kernel_scheduler_on_tick(elapsed_ticks);
+
+            if (scheduler_status != KERNEL_SCHEDULER_STATUS_OK) {
+                riscv_scheduler_fatal(frame, scheduler_status);
+            }
+        }
         return;
     }
 

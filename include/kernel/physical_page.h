@@ -48,6 +48,12 @@ enum physical_page_status physical_page_release(
     struct physical_page_allocator *allocator,
     uint64_t address);
 
+/* The caller must own an allocated page; this validates only address history. */
+enum physical_page_status physical_page_resolve(
+    const struct physical_page_allocator *allocator,
+    uint64_t physical_address,
+    void **pointer);
+
 uint64_t physical_page_total(
     const struct physical_page_allocator *allocator);
 

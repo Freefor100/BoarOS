@@ -5,6 +5,7 @@ set -eu
 project_root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 kernel=${KERNEL_RV:-"$project_root/kernel-rv"}
 qemu=${QEMU_RISCV64:-qemu-system-riscv64}
+memory=${QEMU_MEMORY:-512M}
 output_dir=$(mktemp -d)
 output="$output_dir/idle.log"
 
@@ -20,7 +21,7 @@ timeout -k 2s 2s "$qemu" \
     -machine virt \
     -bios default \
     -kernel "$kernel" \
-    -m 512M \
+    -m "$memory" \
     -smp 1 \
     -nographic \
     -no-reboot </dev/null >"$output" 2>&1

@@ -404,6 +404,90 @@ static void test_rejects_inaccessible_recycled_nodes(void)
     }
 }
 
+static void test_resolves_owned_pages_through_bound_access(void)
+{
+    struct boot_memory_layout layout;
+    struct physical_page_allocator allocator;
+    void *const sentinel = (void *)(uintptr_t)UINT64_C(0x1122334455667788);
+    void *pointer = sentinel;
+    uint64_t address;
+    enum physical_page_status actual;
+
+    layout.usable_count = 1U;
+    layout.usable[0].base = TEST_PHYSICAL_BASE;
+    layout.usable[0].size = BOAROS_PAGE_SIZE * 2U;
+    actual = physical_page_allocator_init(&allocator, &layout);
+    if (actual != PHYSICAL_PAGE_STATUS_OK ||
+        physical_page_allocate(&allocator, &address) !=
+            PHYSICAL_PAGE_STATUS_OK) {
+        fail_page(44U, PHYSICAL_PAGE_STATUS_OK, actual);
+    }
+
+    actual = physical_page_resolve(&allocator, address, &pointer);
+    if (actual != PHYSICAL_PAGE_STATUS_STATE || pointer != sentinel) {
+        fail_page(45U, PHYSICAL_PAGE_STATUS_STATE, actual);
+    }
+    if (physical_page_allocator_bind_access(&allocator,
+                                            mapped_page_access) !=
+        PHYSICAL_PAGE_STATUS_OK) {
+        fail_page(46U,
+                  PHYSICAL_PAGE_STATUS_OK,
+                  PHYSICAL_PAGE_STATUS_STATE);
+    }
+
+    actual = physical_page_resolve(0, address, &pointer);
+    if (actual != PHYSICAL_PAGE_STATUS_INVALID || pointer != sentinel) {
+        fail_page(47U, PHYSICAL_PAGE_STATUS_INVALID, actual);
+    }
+    actual = physical_page_resolve(&allocator, address, 0);
+    if (actual != PHYSICAL_PAGE_STATUS_INVALID) {
+        fail_page(48U, PHYSICAL_PAGE_STATUS_INVALID, actual);
+    }
+    actual = physical_page_resolve(&allocator, address + 1U, &pointer);
+    if (actual != PHYSICAL_PAGE_STATUS_INVALID || pointer != sentinel) {
+        fail_page(49U, PHYSICAL_PAGE_STATUS_INVALID, actual);
+    }
+    actual = physical_page_resolve(&allocator,
+                                   address + BOAROS_PAGE_SIZE,
+                                   &pointer);
+    if (actual != PHYSICAL_PAGE_STATUS_INVALID || pointer != sentinel) {
+        fail_page(50U, PHYSICAL_PAGE_STATUS_INVALID, actual);
+    }
+
+    actual = physical_page_resolve(&allocator, address, &pointer);
+    if (actual != PHYSICAL_PAGE_STATUS_OK || pointer != &page_pool[0]) {
+        fail_page(51U, PHYSICAL_PAGE_STATUS_OK, actual);
+    }
+}
+
+static void test_resolve_rejects_inaccessible_page(void)
+{
+    struct boot_memory_layout layout;
+    struct physical_page_allocator allocator;
+    void *const sentinel = (void *)(uintptr_t)UINT64_C(0x8877665544332211);
+    void *pointer = sentinel;
+    uint64_t address;
+    enum physical_page_status actual;
+
+    layout.usable_count = 1U;
+    layout.usable[0].base = TEST_PHYSICAL_BASE;
+    layout.usable[0].size = BOAROS_PAGE_SIZE;
+    actual = physical_page_allocator_init(&allocator, &layout);
+    if (actual != PHYSICAL_PAGE_STATUS_OK ||
+        physical_page_allocate(&allocator, &address) !=
+            PHYSICAL_PAGE_STATUS_OK ||
+        physical_page_allocator_bind_access(
+            &allocator,
+            inaccessible_page_access) != PHYSICAL_PAGE_STATUS_OK) {
+        fail_page(52U, PHYSICAL_PAGE_STATUS_OK, actual);
+    }
+
+    actual = physical_page_resolve(&allocator, address, &pointer);
+    if (actual != PHYSICAL_PAGE_STATUS_INVALID || pointer != sentinel) {
+        fail_page(53U, PHYSICAL_PAGE_STATUS_INVALID, actual);
+    }
+}
+
 void run_physical_page_tests(void)
 {
     test_aligns_allocates_and_reports_exhaustion();
@@ -413,4 +497,6 @@ void run_physical_page_tests(void)
     test_rejects_invalid_api_inputs();
     test_accesses_recycled_nodes_through_mapping();
     test_rejects_inaccessible_recycled_nodes();
+    test_resolves_owned_pages_through_bound_access();
+    test_resolve_rejects_inaccessible_page();
 }

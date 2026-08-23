@@ -29,17 +29,24 @@ SV39_FAULT_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-sv39-fault-rv
 TIMER_CASES_TEST_KERNEL_RV := \
 	$(BUILD_DIR)/tests/kernel-timer-cases-rv
 TIMER_BOOT_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-timer-boot-rv
+CONTEXT_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-context-rv
+SCHEDULER_CASES_TEST_KERNEL_RV := \
+	$(BUILD_DIR)/tests/kernel-scheduler-cases-rv
+SCHEDULER_BOOT_TEST_KERNEL_RV := \
+	$(BUILD_DIR)/tests/kernel-scheduler-boot-rv
 
 ARCH_FLAGS := -march=rv64imac_zicsr_zifencei -mabi=lp64 -mcmodel=medany
 CPPFLAGS := -Iinclude -DBOAROS_PAGE_SHIFT=12
 CFLAGS := $(ARCH_FLAGS) -std=gnu11 -O2 -g3 \
 	-ffreestanding -fno-builtin -fno-stack-protector -fno-pic -fno-pie \
 	-ffunction-sections -fdata-sections -Wall -Wextra -Werror
+CFLAGS += $(CFLAGS_EXTRA)
 ASFLAGS := $(ARCH_FLAGS) -g3
 LDFLAGS := $(ARCH_FLAGS) -nostdlib -nostartfiles -static -no-pie \
 	-T arch/riscv/linker.ld -Wl,--build-id=none -Wl,--gc-sections
 
 C_SOURCES := \
+	arch/riscv/context.c \
 	arch/riscv/direct_map.c \
 	arch/riscv/sbi.c \
 	arch/riscv/sv39.c \
@@ -50,21 +57,27 @@ C_SOURCES := \
 	kernel/dtb.c \
 	kernel/main.c \
 	kernel/physical_page.c \
+	kernel/scheduler.c \
 	kernel/tick.c
 ASM_SOURCES := \
 	arch/riscv/boot.S \
+	arch/riscv/context_switch.S \
 	arch/riscv/trap_entry.S
 OBJECTS := \
 	$(patsubst %.c,$(BUILD_DIR)/%.o,$(C_SOURCES)) \
 	$(patsubst %.S,$(BUILD_DIR)/%.o,$(ASM_SOURCES))
 TEST_RUNTIME_C_SOURCES := \
+	arch/riscv/context.c \
 	arch/riscv/sbi.c \
 	arch/riscv/timer.c \
 	arch/riscv/trap.c \
 	arch/riscv/virt_uart.c \
+	kernel/physical_page.c \
+	kernel/scheduler.c \
 	kernel/tick.c
 TEST_RUNTIME_ASM_SOURCES := \
 	arch/riscv/boot.S \
+	arch/riscv/context_switch.S \
 	arch/riscv/trap_entry.S
 TEST_RUNTIME_OBJECTS := \
 	$(patsubst %.c,$(BUILD_DIR)/%.o,$(TEST_RUNTIME_C_SOURCES)) \
@@ -107,7 +120,6 @@ DTB_TEST_OBJECTS := \
 	$(TEST_RUNTIME_OBJECTS) \
 	$(patsubst %.c,$(BUILD_DIR)/%.o,$(DTB_TEST_C_SOURCES))
 PAGE_TEST_C_SOURCES := \
-	kernel/physical_page.c \
 	tests/riscv/physical_page_cases.c \
 	tests/riscv/physical_page_main.c
 PAGE_TEST_OBJECTS := \
@@ -116,7 +128,6 @@ PAGE_TEST_OBJECTS := \
 SV39_TEST_C_SOURCES := \
 	arch/riscv/direct_map.c \
 	arch/riscv/sv39.c \
-	kernel/physical_page.c \
 	tests/riscv/direct_map_cases.c \
 	tests/riscv/sv39_cases.c \
 	tests/riscv/sv39_main.c
@@ -127,7 +138,6 @@ SV39_FAULT_TEST_C_SOURCES := \
 	arch/riscv/sv39.c \
 	kernel/boot_memory.c \
 	kernel/dtb.c \
-	kernel/physical_page.c \
 	tests/riscv/sv39_fault_main.c
 SV39_FAULT_TEST_OBJECTS := \
 	$(TEST_RUNTIME_OBJECTS) \
@@ -142,6 +152,24 @@ TIMER_BOOT_TEST_C_SOURCES := \
 TIMER_BOOT_TEST_OBJECTS := \
 	$(OBJECTS) \
 	$(patsubst %.c,$(BUILD_DIR)/%.o,$(TIMER_BOOT_TEST_C_SOURCES))
+CONTEXT_TEST_C_SOURCES := \
+	tests/riscv/context_cases.c
+CONTEXT_TEST_OBJECTS := \
+	$(TEST_RUNTIME_OBJECTS) \
+	$(patsubst %.c,$(BUILD_DIR)/%.o,$(CONTEXT_TEST_C_SOURCES))
+SCHEDULER_CASES_TEST_C_SOURCES := \
+	tests/riscv/scheduler_cases.c
+SCHEDULER_CASES_TEST_OBJECTS := \
+	$(TEST_RUNTIME_OBJECTS) \
+	$(patsubst %.c,$(BUILD_DIR)/%.o,$(SCHEDULER_CASES_TEST_C_SOURCES))
+SCHEDULER_BOOT_TEST_C_SOURCES := \
+	tests/riscv/scheduler_boot.c
+SCHEDULER_BOOT_TEST_ASM_SOURCES := \
+	tests/riscv/scheduler_workers.S
+SCHEDULER_BOOT_TEST_OBJECTS := \
+	$(OBJECTS) \
+	$(patsubst %.c,$(BUILD_DIR)/%.o,$(SCHEDULER_BOOT_TEST_C_SOURCES)) \
+	$(patsubst %.S,$(BUILD_DIR)/%.o,$(SCHEDULER_BOOT_TEST_ASM_SOURCES))
 DEPS := \
 	$(OBJECTS:.o=.d) \
 	$(TRAP_TEST_OBJECTS:.o=.d) \
@@ -154,11 +182,15 @@ DEPS := \
 	$(SV39_TEST_OBJECTS:.o=.d) \
 	$(SV39_FAULT_TEST_OBJECTS:.o=.d) \
 	$(TIMER_CASES_TEST_OBJECTS:.o=.d) \
-	$(TIMER_BOOT_TEST_OBJECTS:.o=.d)
+	$(TIMER_BOOT_TEST_OBJECTS:.o=.d) \
+	$(CONTEXT_TEST_OBJECTS:.o=.d) \
+	$(SCHEDULER_CASES_TEST_OBJECTS:.o=.d) \
+	$(SCHEDULER_BOOT_TEST_OBJECTS:.o=.d)
 
 .PHONY: all clean debug-riscv references run-riscv test-dtb-riscv \
+	test-context-riscv \
 	test-high-half-trap-riscv test-idle-riscv test-no-identity-riscv \
-	test-page-riscv \
+	test-page-riscv test-scheduler-cases-riscv test-scheduler-riscv \
 	test-references test-riscv test-sv39-fault-riscv test-sv39-riscv \
 	test-timer-riscv test-trap-riscv test-trap-return-riscv
 
@@ -234,6 +266,24 @@ $(TIMER_BOOT_TEST_KERNEL_RV): $(TIMER_BOOT_TEST_OBJECTS) \
 		-Wl,-Map,$(BUILD_DIR)/tests/kernel-timer-boot-rv.map \
 		-o $@ $(TIMER_BOOT_TEST_OBJECTS)
 
+$(CONTEXT_TEST_KERNEL_RV): $(CONTEXT_TEST_OBJECTS) arch/riscv/linker.ld
+	$(CC) $(LDFLAGS) \
+		-Wl,-Map,$(BUILD_DIR)/tests/kernel-context-rv.map \
+		-o $@ $(CONTEXT_TEST_OBJECTS)
+
+$(SCHEDULER_CASES_TEST_KERNEL_RV): $(SCHEDULER_CASES_TEST_OBJECTS) \
+		arch/riscv/linker.ld
+	$(CC) $(LDFLAGS) \
+		-Wl,-Map,$(BUILD_DIR)/tests/kernel-scheduler-cases-rv.map \
+		-o $@ $(SCHEDULER_CASES_TEST_OBJECTS)
+
+$(SCHEDULER_BOOT_TEST_KERNEL_RV): $(SCHEDULER_BOOT_TEST_OBJECTS) \
+		arch/riscv/linker.ld
+	$(CC) $(LDFLAGS) -Wl,--wrap=kernel_scheduler_init \
+		-Wl,--wrap=kernel_tick_advance \
+		-Wl,-Map,$(BUILD_DIR)/tests/kernel-scheduler-boot-rv.map \
+		-o $@ $(SCHEDULER_BOOT_TEST_OBJECTS)
+
 $(BUILD_DIR)/%.o: %.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c $< -o $@
@@ -251,6 +301,8 @@ debug-riscv: $(KERNEL_RV)
 		-m $(QEMU_MEMORY) -smp 1 -nographic -no-reboot -S -s
 
 test-riscv: $(DTB_TEST_KERNEL_RV) $(PAGE_TEST_KERNEL_RV) \
+	$(CONTEXT_TEST_KERNEL_RV) $(SCHEDULER_CASES_TEST_KERNEL_RV) \
+	$(SCHEDULER_BOOT_TEST_KERNEL_RV) \
 	$(SV39_TEST_KERNEL_RV) $(SV39_FAULT_TEST_KERNEL_RV) \
 	$(TRAP_RETURN_TEST_KERNEL_RV) $(TRAP_RETURN_SIE_TEST_KERNEL_RV) \
 	$(HIGH_HALF_TRAP_TEST_KERNEL_RV) $(NO_IDENTITY_TEST_KERNEL_RV) \
@@ -260,6 +312,16 @@ test-riscv: $(DTB_TEST_KERNEL_RV) $(PAGE_TEST_KERNEL_RV) \
 		DTB_TEST_KERNEL_RV=$(DTB_TEST_KERNEL_RV) ./tests/dtb-riscv.sh
 	QEMU_RISCV64=$(QEMU_RISCV64) \
 		PAGE_TEST_KERNEL_RV=$(PAGE_TEST_KERNEL_RV) ./tests/page-riscv.sh
+	QEMU_RISCV64=$(QEMU_RISCV64) OBJDUMP_RV=$(OBJDUMP) \
+		CONTEXT_TEST_KERNEL_RV=$(CONTEXT_TEST_KERNEL_RV) \
+		CONTEXT_OBJECT_RV=$(BUILD_DIR)/arch/riscv/context_switch.o \
+		./tests/context-riscv.sh
+	QEMU_RISCV64=$(QEMU_RISCV64) \
+		SCHEDULER_CASES_TEST_KERNEL_RV=$(SCHEDULER_CASES_TEST_KERNEL_RV) \
+		./tests/scheduler-cases-riscv.sh
+	QEMU_RISCV64=$(QEMU_RISCV64) \
+		SCHEDULER_BOOT_TEST_KERNEL_RV=$(SCHEDULER_BOOT_TEST_KERNEL_RV) \
+		./tests/scheduler-riscv.sh
 	QEMU_RISCV64=$(QEMU_RISCV64) \
 		SV39_TEST_KERNEL_RV=$(SV39_TEST_KERNEL_RV) ./tests/sv39-riscv.sh
 	QEMU_RISCV64=$(QEMU_RISCV64) \
@@ -293,6 +355,20 @@ test-dtb-riscv: $(DTB_TEST_KERNEL_RV)
 test-page-riscv: $(PAGE_TEST_KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) PAGE_TEST_KERNEL_RV=$< \
 		./tests/page-riscv.sh
+
+test-context-riscv: $(CONTEXT_TEST_KERNEL_RV)
+	QEMU_RISCV64=$(QEMU_RISCV64) OBJDUMP_RV=$(OBJDUMP) \
+		CONTEXT_TEST_KERNEL_RV=$< \
+		CONTEXT_OBJECT_RV=$(BUILD_DIR)/arch/riscv/context_switch.o \
+		./tests/context-riscv.sh
+
+test-scheduler-cases-riscv: $(SCHEDULER_CASES_TEST_KERNEL_RV)
+	QEMU_RISCV64=$(QEMU_RISCV64) SCHEDULER_CASES_TEST_KERNEL_RV=$< \
+		./tests/scheduler-cases-riscv.sh
+
+test-scheduler-riscv: $(SCHEDULER_BOOT_TEST_KERNEL_RV)
+	QEMU_RISCV64=$(QEMU_RISCV64) SCHEDULER_BOOT_TEST_KERNEL_RV=$< \
+		./tests/scheduler-riscv.sh
 
 test-sv39-riscv: $(SV39_TEST_KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) SV39_TEST_KERNEL_RV=$< \

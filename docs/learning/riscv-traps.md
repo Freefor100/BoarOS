@@ -50,7 +50,7 @@ SIE 是 S-mode 全局中断开关，`sie` 则分别控制 supervisor software、
 
 当前内核使用 RV64IMAC，不生成浮点或向量指令，因此整数入口不保存 F/V 状态。以后允许用户程序或内核使用这些扩展时，应把 F/V 作为带所有权和启用状态的扩展上下文管理，通常采用按需保存，而不是无条件把大型向量状态塞进每次基础 trap。
 
-Frame 建在当前内核栈上，避免了额外换栈和冷缓存访问。代价是 trap 会继续消耗被中断栈的剩余空间；当前 4 KiB 启动栈没有 guard page 或溢出恢复。引入任务和多 hart 后，每个可调度上下文需要自己的内核栈，是否再设置 per-hart IRQ 栈应根据嵌套、中断负载和栈高水位决定。
+Frame 建在当前内核栈上，避免了额外换栈和冷缓存访问。代价是 trap 会继续消耗被中断栈的剩余空间；当前 boot idle 和普通内核线程都使用 4 KiB 栈，没有 guard page 或溢出恢复。每个可调度上下文已有自己的内核栈，是否再设置 per-hart IRQ 栈应根据嵌套、中断负载和栈高水位决定。Trap Frame 与 scheduler switch context 的分工见[内核线程与抢占调度学习总结](kernel-scheduling.md)。
 
 ## `sscratch` 与未来 U-mode 换栈
 
@@ -75,7 +75,7 @@ BoarOS 当前固定以下 RISC-V trap 基线：
 - 汇编只负责架构现场和关键返回验证，具体 cause 交给 C dispatcher。
 - handler 返回表示事件已经处理；未知或当前不能处理的事件必须 fatal，不伪造成功。
 - dispatcher 期间保持 SIE 关闭，不支持嵌套异步中断。
-- 最终地址空间稳定后只开启 supervisor timer interrupt；它是当前唯一正式可恢复生产事件，dispatcher 不提供运行期 handler 注册框架。
+- 最终地址空间稳定后只开启 supervisor timer interrupt；它是当前唯一正式可恢复生产事件，并在 tick 计数后触发内核线程调度。dispatcher 不提供运行期 handler 注册框架。
 
 这些选择属于 RISC-V 架构层，可在 QEMU `virt` 和 VisionFive 2 上复用。当前 timer 通过两边共有的 SBI TIME 抽象复用，实际 timebase 仍从 DTB 获取；外部中断控制器和设备 IRQ 编号属于平台层，不能从 QEMU 的行为推断开发板布局。时间机制的完整解释见 [RISC-V 时间与周期 Tick 学习总结](riscv-time.md)。
 

@@ -78,7 +78,7 @@ next    = previous_deadline + elapsed * period
 
 它还会打断 `wfi`，增加缓存活动和功耗；多 hart 时总事件数量会近似随 hart 数增加。UART 输出远比 handler 本身昂贵，因此正常 tick 绝不能逐次打印。
 
-当前 100 Hz 是实现调度时常见且保守的 10 ms 粒度，在单 hart 启动阶段开销很小。若以后测量发现空闲唤醒或高 hart 数成本明显，可以把周期策略换成 tickless；一次性 SBI deadline 后端正适合这一变化。不要仅凭“Linux 支持高 HZ”提高频率，也不要仅凭“中断有开销”在没有延迟指标时过早引入复杂 nohz 状态。
+当前 100 Hz 为单 hart FIFO 内核线程提供 10 ms 时间片检查。无 READY 竞争者时 scheduler 不切换；有竞争者时一次 trap 最多切换一次。若以后测量发现空闲唤醒或高 hart 数成本明显，可以把周期策略换成 tickless；一次性 SBI deadline 后端正适合这一变化。不要仅凭“Linux 支持高 HZ”提高频率，也不要仅凭“中断有开销”在没有延迟指标时过早引入复杂 nohz 状态。
 
 ## xv6、rCore 与 Linux 的相关做法
 

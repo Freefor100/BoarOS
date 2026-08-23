@@ -1,6 +1,6 @@
 # RISC-V Trap 模块
 
-本文描述当前 RISC-V S-mode trap 入口、整数上下文 ABI、返回与致命失败契约。架构机制和设计理由见 [RISC-V Trap 学习总结](../learning/riscv-traps.md)，正式 timer handler 见 [RISC-V Timer 与内核 Tick 模块](riscv-timer.md)。
+本文描述当前 RISC-V S-mode trap 入口、整数上下文 ABI、返回与致命失败契约。架构机制和设计理由见 [RISC-V Trap 学习总结](../learning/riscv-traps.md)，正式 timer handler 见 [RISC-V Timer 与内核 Tick 模块](riscv-timer.md)，trap 内的线程切换见[内核线程调度模块](kernel-scheduler.md)。
 
 ## 范围与入口
 
@@ -9,7 +9,7 @@
 | `include/arch/riscv/trap.h` | 定义汇编/C 共享的 Trap Frame 布局、CSR 位和 cause 编码 |
 | `arch/riscv/boot.S` | 在启动栈可用后清零 `sscratch` 并安装 Direct-mode `stvec` |
 | `arch/riscv/trap_entry.S` | 保存完整整数现场、调用 C dispatcher、验证并恢复或拒绝返回 |
-| `arch/riscv/trap.c` | 提供生产 dispatcher、fatal 和非法返回诊断 |
+| `arch/riscv/trap.c` | 提供生产 dispatcher、timer/scheduler fatal 和非法返回诊断 |
 | `tests/riscv/trap_return_main.c`、`trap_return_sie_main.c`、`trap_return_trigger.S` | 提供只在测试 ELF 中生效的同步与异步返回 handler、独立非法状态探针和寄存器探针 |
 | `tests/trap-return-riscv.sh` | 在 QEMU 中验证低地址恢复、返回状态和拒绝路径 |
 | `tests/riscv/high_half_trap.c`、`tests/high-half-trap-riscv.sh` | 在最终 Sv39 地址空间验证高半区恢复及 fatal 回归 |
@@ -30,7 +30,7 @@
 void riscv_trap_dispatch(struct riscv_trap_frame *frame);
 ```
 
-dispatcher 返回表示 Frame 已经可以恢复；不认识或不能处理的事件必须进入不返回的 fatal 路径。当前生产 dispatcher 精确匹配 supervisor timer interrupt（interrupt 位加 cause 5），要求 timer backend 先设置新的未来 deadline，再累计 elapsed tick 并返回；它不修改 `sepc`。其他生产 trap 仍准确输出原始四个 CSR 并通过 SBI 关机。专用测试 ELF 可以链接包装 dispatcher 注入同步/软件中断探针，但未识别 cause 仍转交真实生产 fatal。
+dispatcher 返回表示当前恢复到的线程 Frame 已经可以恢复；不认识或不能处理的事件必须进入不返回的 fatal 路径。当前生产 dispatcher 精确匹配 supervisor timer interrupt（interrupt 位加 cause 5），要求 timer backend 先设置新的未来 deadline，再累计 elapsed tick，随后让 scheduler 至多切换一次；它不修改 `sepc`。切换发生后，dispatcher 可能从另一线程先前保存的调用链返回，并恢复该线程栈上的 Frame。其他生产 trap 仍准确输出原始四个 CSR 并通过 SBI 关机。专用测试 ELF 可以链接包装 dispatcher 注入同步/软件中断探针，但未识别 cause 仍转交真实生产 fatal。
 
 ## 返回契约
 
@@ -49,8 +49,8 @@ dispatcher 返回表示 Frame 已经可以恢复；不认识或不能处理的�
 - `stvec` 使用 Direct 模式，所有 S-mode trap 进入同一入口；启动和页表切换阶段保持 `sie=0` 与全局 SIE 关闭，最终地址空间稳定后只开启 STIE 和全局 SIE。
 - `sscratch` 在内核执行期间固定为零。当前入口假定 trap 来自具有有效、16 字节对齐内核栈的 S-mode，不执行 U-mode 换栈。
 - 保存现场和 C dispatcher 期间不重新打开 SIE，不支持嵌套异步中断。同步异常可以再次进入当前栈，但 handler、栈或诊断路径自身故障后的递归失败仍没有独立恢复保证。
-- 当前使用 4 KiB 单 hart 启动栈，没有独立 Trap 栈、guard page、per-hart 栈或溢出恢复。
-- 当前只有静态 timer handler，没有运行期 handler 注册、IPI、外部中断控制器、用户态 trap、调度切换或 F/V 上下文管理。未来 U-mode 入口需要先通过 `sscratch` 找到任务内核栈，再复用相同 Frame 和 dispatcher ABI。
+- boot idle 使用 4 KiB 静态启动栈，普通内核线程各使用私有 4 KiB 单页栈；没有独立 Trap 栈、guard page、per-hart IRQ 栈或溢出恢复。
+- 当前只有静态 timer handler 和由它触发的内核线程切换，没有运行期 handler 注册、IPI、外部中断控制器、用户态 trap 或 F/V 上下文管理。未来 U-mode 入口需要先通过 `sscratch` 找到任务内核栈，再复用相同 Frame 和 dispatcher ABI。
 
 ## 验证入口
 
@@ -59,9 +59,10 @@ make test-trap-return-riscv
 make test-trap-riscv
 make test-high-half-trap-riscv
 make test-timer-riscv
+make test-scheduler-riscv
 make test-riscv
 ```
 
 `test-trap-return-riscv` 使用显式 32 位 `EBREAK` 验证同步 handler 将 `sepc` 前移 4 字节后返回，再设置 `sip.SSIP`、`sie.SSIE` 和全局 SIE，验证真实 supervisor software interrupt 的保存、清 pending 与返回。汇编探针为除 `sp`、`gp` 外的寄存器设置独立 64 位哨兵，并对全部 x1..x31 的返回值、原始 SP/GP、Frame 对齐、cause 以及 SPP/SPIE/SIE 进行检查；两个测试 ELF 分别构造 SPP 无效和保存 SIE 开启的返回状态，要求各自进入 bad-return 路径。脚本还检查最终 ELF 的入口反汇编，要求 dummy `sc.d` 位于 Frame 槽地址准备之后、`sepc` 写回和 `sret` 之前。
 
-`test-timer-riscv` 使用实际 QEMU DTB、OpenSBI TIME 和 cause 5，让生产 dispatcher 至少两次经完整 Trap Frame 路径返回 `wfi`，再由测试专用 tick 包装有限关机。`test-trap-riscv` 保留低地址未处理 breakpoint 的 fatal 契约。`test-high-half-trap-riscv` 在最终 Sv39 页表启用后先完成一次 SSIP 恢复，核对 `sepc` 和 Frame 都位于高半区，再触发原有 breakpoint 并要求生产 fatal 路径不返回。Sv39 权限故障和 no-identity 测试继续验证页故障诊断格式与行为。
+`test-timer-riscv` 使用实际 QEMU DTB、OpenSBI TIME 和 cause 5，让生产 dispatcher 至少两次经完整 Trap Frame 路径返回 `wfi`，再由测试专用 tick 包装有限关机。`test-scheduler-riscv` 进一步让两个不主动让出的线程只靠 timer 在各自 Frame/栈之间切换，验证 A -> B -> A、完整恢复、退出和 boot idle 回收。`test-trap-riscv` 保留低地址未处理 breakpoint 的 fatal 契约。`test-high-half-trap-riscv` 在最终 Sv39 页表启用后先完成一次 SSIP 恢复，核对 `sepc` 和 Frame 都位于高半区，再触发原有 breakpoint 并要求生产 fatal 路径不返回。Sv39 权限故障和 no-identity 测试继续验证页故障诊断格式与行为。
