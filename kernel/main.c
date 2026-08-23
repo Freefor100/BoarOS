@@ -1,3 +1,4 @@
+#include <arch/riscv/direct_map.h>
 #include <arch/riscv/memory_layout.h>
 #include <arch/riscv/sbi.h>
 #include <arch/riscv/sv39.h>
@@ -22,6 +23,20 @@ void riscv_relocate_to_high(uint64_t offset);
 
 static struct physical_page_allocator page_allocator;
 static struct riscv_sv39_page_table kernel_page_table;
+
+static void *direct_map_page_access(uint64_t physical_address)
+{
+    uint64_t virtual_address;
+
+    if (riscv_direct_map_pa_to_va(physical_address,
+                                  BOAROS_PAGE_SIZE,
+                                  &virtual_address) !=
+        RISCV_DIRECT_MAP_STATUS_OK) {
+        return 0;
+    }
+
+    return (void *)(uintptr_t)virtual_address;
+}
 
 static void shutdown_for_dtb_error(enum dtb_status status)
     __attribute__((noreturn));
@@ -66,6 +81,8 @@ static void shutdown_for_physical_page_error(enum physical_page_status status)
         virt_uart_puts("BoarOS: invalid physical page layout\n");
     } else if (status == PHYSICAL_PAGE_STATUS_EMPTY) {
         virt_uart_puts("BoarOS: no complete physical pages\n");
+    } else if (status == PHYSICAL_PAGE_STATUS_STATE) {
+        virt_uart_puts("BoarOS: physical page access is not bound\n");
     } else {
         virt_uart_puts("BoarOS: unknown physical page error\n");
     }
@@ -90,6 +107,14 @@ static void shutdown_for_sv39_error(enum riscv_sv39_status status)
         virt_uart_puts("BoarOS: unknown Sv39 error\n");
     }
 
+    sbi_shutdown();
+}
+
+static void shutdown_for_direct_map_error(void) __attribute__((noreturn));
+
+static void shutdown_for_direct_map_error(void)
+{
+    virt_uart_puts("BoarOS: direct map verification failed\n");
     sbi_shutdown();
 }
 
@@ -134,6 +159,33 @@ static enum riscv_sv39_status map_kernel_alias(
 
     return riscv_sv39_map_range(&kernel_page_table,
                                 RISCV_KERNEL_VIRTUAL_BASE + offset,
+                                start,
+                                end - start,
+                                permissions);
+}
+
+static enum riscv_sv39_status map_direct_alias(
+    uint64_t start,
+    uint64_t end,
+    uint32_t permissions)
+{
+    uint64_t virtual_address;
+
+    if (start > end) {
+        return RISCV_SV39_STATUS_INVALID;
+    }
+    if (start == end) {
+        return RISCV_SV39_STATUS_OK;
+    }
+    if (riscv_direct_map_pa_to_va(start,
+                                  end - start,
+                                  &virtual_address) !=
+        RISCV_DIRECT_MAP_STATUS_OK) {
+        return RISCV_SV39_STATUS_INVALID;
+    }
+
+    return riscv_sv39_map_range(&kernel_page_table,
+                                virtual_address,
                                 start,
                                 end - start,
                                 permissions);
@@ -224,11 +276,98 @@ static enum riscv_sv39_status build_kernel_page_table(
         return status;
     }
 
+    status = map_direct_alias(memory_start,
+                              text_start,
+                              RISCV_SV39_READ | RISCV_SV39_WRITE);
+    if (status != RISCV_SV39_STATUS_OK) {
+        return status;
+    }
+    status = map_direct_alias(text_start,
+                              text_end,
+                              RISCV_SV39_READ);
+    if (status != RISCV_SV39_STATUS_OK) {
+        return status;
+    }
+    status = map_direct_alias(rodata_start,
+                              rodata_end,
+                              RISCV_SV39_READ);
+    if (status != RISCV_SV39_STATUS_OK) {
+        return status;
+    }
+    status = map_direct_alias(data_start,
+                              memory_end,
+                              RISCV_SV39_READ | RISCV_SV39_WRITE);
+    if (status != RISCV_SV39_STATUS_OK) {
+        return status;
+    }
+
     return riscv_sv39_map_range(&kernel_page_table,
                                 VIRT_UART_MMIO_BASE,
                                 VIRT_UART_MMIO_BASE,
                                 VIRT_UART_MMIO_SIZE,
                                 RISCV_SV39_READ | RISCV_SV39_WRITE);
+}
+
+static void verify_direct_map_runtime(void)
+{
+    const uint64_t pattern = UINT64_C(0x1122334455667788);
+    uint64_t physical_address;
+    uint64_t virtual_address;
+    uint64_t recycled_address;
+    volatile uint64_t *words;
+    enum physical_page_status status;
+
+    if (page_allocator.access != direct_map_page_access ||
+        kernel_page_table.allocator != &page_allocator) {
+        shutdown_for_direct_map_error();
+    }
+
+    status = physical_page_allocate(&page_allocator, &physical_address);
+    if (status != PHYSICAL_PAGE_STATUS_OK) {
+        shutdown_for_physical_page_error(status);
+    }
+    if (riscv_direct_map_pa_to_va(physical_address,
+                                  BOAROS_PAGE_SIZE,
+                                  &virtual_address) !=
+        RISCV_DIRECT_MAP_STATUS_OK) {
+        shutdown_for_direct_map_error();
+    }
+
+    words = (volatile uint64_t *)(uintptr_t)virtual_address;
+    words[1] = pattern;
+    if (words[1] != pattern) {
+        shutdown_for_direct_map_error();
+    }
+
+    status = physical_page_release(&page_allocator, physical_address);
+    if (status != PHYSICAL_PAGE_STATUS_OK) {
+        shutdown_for_physical_page_error(status);
+    }
+    status = physical_page_allocate(&page_allocator, &recycled_address);
+    if (status != PHYSICAL_PAGE_STATUS_OK) {
+        shutdown_for_physical_page_error(status);
+    }
+    if (recycled_address != physical_address || words[1] != pattern) {
+        shutdown_for_direct_map_error();
+    }
+    status = physical_page_release(&page_allocator, recycled_address);
+    if (status != PHYSICAL_PAGE_STATUS_OK) {
+        shutdown_for_physical_page_error(status);
+    }
+
+    virt_uart_puts("BoarOS: direct map pa=");
+    virt_uart_put_hex((unsigned long)physical_address);
+    virt_uart_puts(" va=");
+    virt_uart_put_hex((unsigned long)virtual_address);
+    virt_uart_puts(" offset=");
+    virt_uart_put_hex((unsigned long)(virtual_address - physical_address));
+    virt_uart_puts(" access=");
+    virt_uart_put_hex((unsigned long)(uintptr_t)page_allocator.access);
+    virt_uart_puts(" value=");
+    virt_uart_put_hex((unsigned long)pattern);
+    virt_uart_puts(" reused=");
+    virt_uart_put_hex((unsigned long)recycled_address);
+    virt_uart_putc('\n');
 }
 
 static uint64_t current_pc(void)
@@ -301,6 +440,15 @@ void kernel_main(unsigned long hart_id, const void *dtb)
     }
     riscv_relocate_to_high(RISCV_KERNEL_VIRTUAL_BASE -
                            (uint64_t)(uintptr_t)__kernel_start);
+
+    page_status = physical_page_allocator_bind_access(
+        &page_allocator,
+        direct_map_page_access);
+    if (page_status != PHYSICAL_PAGE_STATUS_OK) {
+        shutdown_for_physical_page_error(page_status);
+    }
+    kernel_page_table.allocator = &page_allocator;
+    verify_direct_map_runtime();
 
     virt_uart_puts("BoarOS: high-half pc=");
     virt_uart_put_hex((unsigned long)current_pc());

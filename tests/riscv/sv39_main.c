@@ -2,6 +2,7 @@
 #include <arch/riscv/virt_uart.h>
 
 int run_sv39_tests(void);
+int run_direct_map_tests(void);
 
 void kernel_main(unsigned long hart_id, const void *dtb)
 {
@@ -9,6 +10,15 @@ void kernel_main(unsigned long hart_id, const void *dtb)
 
     (void)hart_id;
     (void)dtb;
+
+    result = run_direct_map_tests();
+    if (result != 0) {
+        virt_uart_puts("BoarOS: direct map test failed case=");
+        virt_uart_put_hex((unsigned long)result);
+        virt_uart_putc('\n');
+        sbi_shutdown();
+    }
+    virt_uart_puts("BoarOS: direct map tests passed\n");
 
     result = run_sv39_tests();
     if (result != 0) {

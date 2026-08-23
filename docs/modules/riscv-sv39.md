@@ -6,6 +6,7 @@
 
 | 文件 | 当前职责 |
 |---|---|
+| `include/arch/riscv/direct_map.h`、`arch/riscv/direct_map.c` | 校验并转换 direct-map 中的 PA/VA 范围 |
 | `include/arch/riscv/sv39.h`、`arch/riscv/sv39.c` | 初始化根页表、建立 2 MiB/4 KiB 映射并切换 `satp` |
 | `arch/riscv/linker.ld`、`include/arch/riscv/memory_layout.h` | 固定高半区 VMA 并导出页对齐的 text、rodata、data 边界 |
 | `kernel/main.c` | 根据 DTB RAM、ELF 边界和 QEMU UART 建立启动地址空间与高半区别名 |
@@ -27,6 +28,11 @@ UNINITIALIZED --init成功--> BUILDING --activate成功--> ACTIVE
 
 `riscv_sv39_map_range` 分别接收虚拟地址和物理地址，不假定二者相等。起始地址、物理地址和长度必须按 4 KiB 对齐，长度必须非零；整个虚拟范围必须位于同一个 Sv39 canonical 半区，整个物理范围必须能由 56 位 PPN 表示。权限至少包含 R、W、X 之一，并拒绝规范保留的 W=1、R=0 组合。
 
+RISC-V direct map 使用固定公式 `VA = 0xffffffc000000000 + PA`，窗口大小为
+128 GiB，因此只接受端点不超过 `0x2000000000` 的非空物理范围。反向转换只接受
+`0xffffffc000000000..0xffffffe000000000` 内的非空范围。两种转换都会检查范围越界
+和输出指针，失败时不修改输出。
+
 建表器按地址递增处理范围：当当前虚拟地址、物理地址和剩余长度都满足 2 MiB 条件时建立 Level 1 叶子，否则建立 Level 0 的 4 KiB 叶子。非叶表项只设置 V；叶子预置 V、A 和请求的 R/W/X，可写叶子同时预置 D。当前不设置 U 或 G。
 
 现有表项不会被覆盖。若范围中途遇到冲突、页耗尽或其他建表错误，已经建立的叶子和中间表会保留，页表进入 `FAILED`；这是启动期建表器的部分提交语义。状态机会阻止调用者激活这张不完整页表。当前接口不提供回滚、拆分大页、覆盖映射或取消映射。
@@ -37,11 +43,12 @@ UNINITIALIZED --init成功--> BUILDING --activate成功--> ACTIVE
 
 `kernel_main` 当前建立以下映射：
 
-- DTB 报告的整段 RAM；text 为 RX，rodata 为 R，其余 RAM 为 RW。
+- DTB 报告整段 RAM 的恒等映射；text 为 RX，rodata 为 R，其余 RAM 为 RW。它是首次切换 `satp` 时保留当前执行上下文的启动桥梁。
+- 同一段 RAM 的固定偏移 direct alias；text 和 rodata 为 R，其余 RAM 为 RW，所有 direct alias 均不可执行。
 - 内核镜像在 `0xffffffff80000000` 开始的高半区别名；它指向同一组物理页，并保持 text RX、rodata R、data/BSS/启动栈 RW。
 - QEMU `virt` 的 `0x10000000..0x10001000` UART MMIO 为 RW。
 
-页表页来自启动内存布局的可用 RAM，所以会减少物理页分配器的可用页计数；这些页也落在 RAM 恒等映射内。QEMU UART 地址属于平台事实，不在通用 `sv39.c` 中；接入 VisionFive 2 时应由新的平台入口提供自己的 MMIO 映射。
+页表页来自启动内存布局的可用 RAM，所以会减少物理页分配器的可用页计数；这些页同时落在 RAM 恒等映射和 direct map 内。物理页分配器在高半区 continuation 一次性绑定高地址访问函数，分页激活后的页内访问由此使用 direct map，不会通过低 text 回调暗中依赖 identity。QEMU UART 地址属于平台事实，不在通用 `sv39.c` 中；接入 VisionFive 2 时应由新的平台入口提供自己的 MMIO 映射。
 
 `riscv_sv39_activate` 使用 ASID 0，把根页物理页号与 MODE=8 写入 `satp`，在写入前后各执行一次全局 `SFENCE.VMA`，并读回 `satp` 验证硬件接受该模式。切换前保存旧 `satp`；若读回不一致，则经过同样的 fence 恢复旧值，再把页表标为 `FAILED`。
 
@@ -56,6 +63,6 @@ make test-high-half-trap-riscv
 make test-riscv
 ```
 
-聚焦建表测试检查完整生命周期转换、2 MiB/4 KiB PTE 的精确编码、16 GiB 对齐映射的页表规模、混合叶子、canonical/物理上界/权限/对齐校验、两种叶子结构冲突以及中途失败后的部分提交状态。独立测试 walker 会从实际页表反向解析 PA、叶子大小和权限；页池预先填充非零字节，以同时验证页表清零。权限测试先用显式 `ld` 证明 rodata 页可读，再用显式 `sd` 要求产生 store page fault（`scause=15`，`stval` 等于目标地址），并在激活后验证所有建表操作均被拒绝。完整启动测试在 512 MiB 和 1 GiB RAM 下验证 `satp.MODE=8`，要求物理页计数差等于页表页数，并依据 ELF 符号精确检查高半区 PC、SP、GP 和 `stvec`。独立高半区 trap 测试还会执行真实 breakpoint，核对 `scause=3` 与高地址 `sepc`。
+聚焦建表测试检查完整生命周期转换、2 MiB/4 KiB PTE 的精确编码、16 GiB 对齐映射的页表规模、混合叶子、canonical/物理上界/权限/对齐校验、两种叶子结构冲突以及中途失败后的部分提交状态。direct-map 聚焦用例检查正反转换、窗口首尾、跨界和失败时输出不变。独立测试 walker 会从实际页表反向解析 PA、叶子大小和权限；页池预先填充非零字节，以同时验证页表清零。权限测试先用显式 `ld` 证明 rodata 页可读，再用显式 `sd` 要求产生 store page fault（`scause=15`，`stval` 等于目标地址），并在激活后验证所有建表操作均被拒绝。完整启动测试在 512 MiB 和 1 GiB RAM 下验证 `satp.MODE=8`，通过 direct map 实际写读、释放和复用物理页，要求物理页计数差等于页表页数，并依据 ELF 符号精确检查高半区 PC、SP、GP 和 `stvec`。独立高半区 trap 测试还会执行真实 breakpoint，核对 `scause=3` 与高地址 `sepc`。
 
-当前未实现 1 GiB 叶子、物理内存 direct map、移除恒等映射、用户映射、页表回收和运行期映射修改。
+当前未实现 1 GiB 叶子、移除恒等映射、用户映射、页表回收和运行期映射修改。direct map 只映射 DTB 报告的第一段 RAM，不包含 MMIO，也不放宽内核 text/rodata 的别名权限。

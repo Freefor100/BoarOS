@@ -22,6 +22,25 @@ static uint64_t model_page_pool[TEST_POOL_WORDS(16U)]
 static uint64_t single_page_pool[TEST_POOL_WORDS(1U)]
     __attribute__((aligned(BOAROS_PAGE_SIZE)));
 
+static void *identity_page_access(uint64_t address)
+{
+    return (void *)(uintptr_t)address;
+}
+
+static enum physical_page_status init_test_page_allocator(
+    struct physical_page_allocator *allocator,
+    const struct boot_memory_layout *layout)
+{
+    enum physical_page_status status =
+        physical_page_allocator_init(allocator, layout);
+
+    if (status != PHYSICAL_PAGE_STATUS_OK) {
+        return status;
+    }
+    return physical_page_allocator_bind_access(allocator,
+                                               identity_page_access);
+}
+
 #define TEST_PTE_VALID UINT64_C(0x001)
 #define TEST_PTE_READ UINT64_C(0x002)
 #define TEST_PTE_WRITE UINT64_C(0x004)
@@ -144,7 +163,7 @@ static int init_allocator(struct physical_page_allocator *allocator)
     layout.usable_count = 1U;
     layout.usable[0].base = (uint64_t)(uintptr_t)page_pool;
     layout.usable[0].size = sizeof(page_pool);
-    return physical_page_allocator_init(allocator, &layout) ==
+    return init_test_page_allocator(allocator, &layout) ==
            PHYSICAL_PAGE_STATUS_OK;
 }
 
@@ -160,7 +179,7 @@ static int test_lifecycle_states(void)
     layout.usable[0].base = (uint64_t)(uintptr_t)lifecycle_page_pool;
     layout.usable[0].size = sizeof(lifecycle_page_pool);
     reset_page_table(&table);
-    if (physical_page_allocator_init(&allocator, &layout) !=
+    if (init_test_page_allocator(&allocator, &layout) !=
             PHYSICAL_PAGE_STATUS_OK) {
         return 23;
     }
@@ -248,7 +267,7 @@ static int test_lifecycle_states(void)
     layout.usable[0].base = (uint64_t)(uintptr_t)single_page_pool;
     layout.usable[0].size = sizeof(single_page_pool);
     reset_page_table(&table);
-    if (physical_page_allocator_init(&allocator, &layout) !=
+    if (init_test_page_allocator(&allocator, &layout) !=
             PHYSICAL_PAGE_STATUS_OK ||
         physical_page_allocate(&allocator, &address) !=
             PHYSICAL_PAGE_STATUS_OK ||
@@ -261,7 +280,7 @@ static int test_lifecycle_states(void)
     layout.usable[0].base = (uint64_t)(uintptr_t)lifecycle_page_pool;
     layout.usable[0].size = sizeof(lifecycle_page_pool);
     reset_page_table(&table);
-    if (physical_page_allocator_init(&allocator, &layout) !=
+    if (init_test_page_allocator(&allocator, &layout) !=
             PHYSICAL_PAGE_STATUS_OK ||
         riscv_sv39_page_table_init(&table, &allocator) !=
             RISCV_SV39_STATUS_OK) {
@@ -300,7 +319,7 @@ static int test_model_and_boundaries(void)
     layout.usable[0].base = (uint64_t)(uintptr_t)model_page_pool;
     layout.usable[0].size = sizeof(model_page_pool);
     reset_page_table(&table);
-    if (physical_page_allocator_init(&allocator, &layout) !=
+    if (init_test_page_allocator(&allocator, &layout) !=
             PHYSICAL_PAGE_STATUS_OK ||
         riscv_sv39_page_table_init(&table, &allocator) !=
             RISCV_SV39_STATUS_OK) {
@@ -399,7 +418,7 @@ static int test_model_and_boundaries(void)
     }
 
     reset_page_table(&table);
-    if (physical_page_allocator_init(&allocator, &layout) !=
+    if (init_test_page_allocator(&allocator, &layout) !=
             PHYSICAL_PAGE_STATUS_OK ||
         riscv_sv39_page_table_init(&table, &allocator) !=
             RISCV_SV39_STATUS_OK ||
@@ -424,7 +443,7 @@ static int test_model_and_boundaries(void)
     }
 
     reset_page_table(&table);
-    if (physical_page_allocator_init(&allocator, &layout) !=
+    if (init_test_page_allocator(&allocator, &layout) !=
             PHYSICAL_PAGE_STATUS_OK ||
         riscv_sv39_page_table_init(&table, &allocator) !=
             RISCV_SV39_STATUS_OK ||
@@ -526,7 +545,7 @@ int run_sv39_tests(void)
     scale_layout.usable[0].base =
         (uint64_t)(uintptr_t)scale_page_pool;
     scale_layout.usable[0].size = sizeof(scale_page_pool);
-    if (physical_page_allocator_init(&allocator, &scale_layout) !=
+    if (init_test_page_allocator(&allocator, &scale_layout) !=
             PHYSICAL_PAGE_STATUS_OK ||
         riscv_sv39_page_table_init(&table, &allocator) !=
             RISCV_SV39_STATUS_OK ||
@@ -581,7 +600,7 @@ int run_sv39_tests(void)
     scale_layout.usable[0].base =
         (uint64_t)(uintptr_t)mixed_page_pool;
     scale_layout.usable[0].size = sizeof(mixed_page_pool);
-    if (physical_page_allocator_init(&allocator, &scale_layout) !=
+    if (init_test_page_allocator(&allocator, &scale_layout) !=
             PHYSICAL_PAGE_STATUS_OK ||
         riscv_sv39_page_table_init(&table, &allocator) !=
             RISCV_SV39_STATUS_OK ||
@@ -601,7 +620,7 @@ int run_sv39_tests(void)
     scale_layout.usable[0].base =
         (uint64_t)(uintptr_t)exhausted_page_pool;
     scale_layout.usable[0].size = sizeof(exhausted_page_pool);
-    if (physical_page_allocator_init(&allocator, &scale_layout) !=
+    if (init_test_page_allocator(&allocator, &scale_layout) !=
             PHYSICAL_PAGE_STATUS_OK ||
         riscv_sv39_page_table_init(&table, &allocator) !=
             RISCV_SV39_STATUS_OK) {
@@ -624,7 +643,7 @@ int run_sv39_tests(void)
     scale_layout.usable[0].size = BOAROS_PAGE_SIZE;
     scale_layout.usable[1].base = UINT64_C(1) << 56U;
     scale_layout.usable[1].size = BOAROS_PAGE_SIZE;
-    if (physical_page_allocator_init(&allocator, &scale_layout) !=
+    if (init_test_page_allocator(&allocator, &scale_layout) !=
             PHYSICAL_PAGE_STATUS_OK ||
         riscv_sv39_page_table_init(&table, &allocator) !=
             RISCV_SV39_STATUS_INVALID ||
@@ -638,7 +657,7 @@ int run_sv39_tests(void)
     scale_layout.usable[0].base =
         (uint64_t)(uintptr_t)exhausted_page_pool;
     scale_layout.usable[0].size = sizeof(exhausted_page_pool);
-    if (physical_page_allocator_init(&allocator, &scale_layout) !=
+    if (init_test_page_allocator(&allocator, &scale_layout) !=
             PHYSICAL_PAGE_STATUS_OK ||
         riscv_sv39_page_table_init(&table, &allocator) !=
             RISCV_SV39_STATUS_OK ||

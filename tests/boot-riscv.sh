@@ -146,6 +146,23 @@ run_case()
         exit 1
     fi
 
+    direct_map_values=$(sed -n \
+        's/^BoarOS: direct map pa=\(0x[1-9a-f][0-9a-f]*\) va=\(0xffffffc[0-9a-f]*\) offset=0xffffffc000000000 access=0xffffffff[89a-f][0-9a-f]* value=0x1122334455667788 reused=\(0x[1-9a-f][0-9a-f]*\)$/\1 \2 \3/p' \
+        "$output")
+    direct_map_pa=${direct_map_values%% *}
+    direct_map_rest=${direct_map_values#* }
+    direct_map_va=${direct_map_rest%% *}
+    direct_map_reused=${direct_map_rest#* }
+    if [ -z "$direct_map_values" ] ||
+        [ "$direct_map_pa" = "$direct_map_values" ] ||
+        [ "$direct_map_va" = "$direct_map_rest" ] ||
+        [ "$direct_map_reused" != "${direct_map_reused#* }" ] ||
+        [ "$direct_map_pa" != "$direct_map_reused" ]; then
+        cat "$output" >&2
+        echo "expected one successful direct-map allocation and reuse" >&2
+        exit 1
+    fi
+
     if ! grep -Eq '^BoarOS: first reserved base=0x80000000 size=0x[1-9a-f][0-9a-f]*$' "$output"; then
         cat "$output" >&2
         echo "expected the OpenSBI reservation at RAM base" >&2

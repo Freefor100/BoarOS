@@ -32,6 +32,7 @@ LDFLAGS := $(ARCH_FLAGS) -nostdlib -nostartfiles -static -no-pie \
 	-T arch/riscv/linker.ld -Wl,--build-id=none -Wl,--gc-sections
 
 C_SOURCES := \
+	arch/riscv/direct_map.c \
 	arch/riscv/sbi.c \
 	arch/riscv/sv39.c \
 	arch/riscv/trap.c \
@@ -84,8 +85,10 @@ PAGE_TEST_OBJECTS := \
 	$(TEST_RUNTIME_OBJECTS) \
 	$(patsubst %.c,$(BUILD_DIR)/%.o,$(PAGE_TEST_C_SOURCES))
 SV39_TEST_C_SOURCES := \
+	arch/riscv/direct_map.c \
 	arch/riscv/sv39.c \
 	kernel/physical_page.c \
+	tests/riscv/direct_map_cases.c \
 	tests/riscv/sv39_cases.c \
 	tests/riscv/sv39_main.c
 SV39_TEST_OBJECTS := \

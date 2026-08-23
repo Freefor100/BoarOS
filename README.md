@@ -11,12 +11,12 @@ BoarOS 是一个从零学习并面向 OS Comp 能力建设的 C + 汇编类 Linu
 - 启动代码建立 `gp`、清零 BSS、创建单 hart 启动栈，并把 OpenSBI 的 hart ID 与 DTB 指针交给 C 入口。
 - 启动代码安装 Direct-mode `stvec`；同步 trap 会输出 `scause`、`sepc`、`stval`、`sstatus` 后关机。
 - 内核校验并扫描 DTB，读取第一段 RAM 和静态保留区，排除固件、内核镜像与 DTB 自身占用后形成启动内存布局。
-- 物理页分配器按 4 KiB 向内对齐可用区间，支持单页分配、释放、耗尽和重复释放诊断。
-- RISC-V 内核 ELF 链接到 Sv39 高半区 `0xffffffff80000000`，QEMU 当前仍从物理地址 `0x80200000` 装载和进入；启动页表同时保留 RAM 恒等映射并按 RX、R、RW 权限映射高半区内核，随后把 PC、栈、`gp` 和 `stvec` 切换到高地址。
+- 物理页分配器按 4 KiB 向内对齐可用区间，支持单页分配、释放、耗尽和重复释放诊断；进入高半区后一次性绑定物理地址访问函数，回收链节点通过该函数读写。
+- RISC-V 内核 ELF 链接到 Sv39 高半区 `0xffffffff80000000`，QEMU 当前仍从物理地址 `0x80200000` 装载和进入；启动页表保留临时 RAM 恒等映射，同时建立高半区内核映射和从 `0xffffffc000000000` 开始的 128 GiB 物理内存 direct-map 窗口，随后把 PC、栈、`gp` 和 `stvec` 切换到高地址。
 - Sv39 建表器按条件组合 2 MiB 与 4 KiB 叶子；QEMU `virt` UART 当前使用低地址 RW 恒等映射。
-- 自动测试分别验证 DTB 与启动布局、物理页状态机、Sv39 编码/规模/失败语义、只读页写故障、低地址致命 trap 和真实高半区 breakpoint trap，并在 512 MiB 和 1 GiB 两种 guest RAM 配置下验证 ELF 地址契约与完整分页启动链。
+- 自动测试分别验证 DTB 与启动布局、物理页状态机、direct-map 地址边界、Sv39 编码/规模/失败语义、只读页写故障、低地址致命 trap 和真实高半区 breakpoint trap，并在 512 MiB 和 1 GiB 两种 guest RAM 配置下通过 direct map 实际写读、释放和复用物理页。
 
-当前只支持 RISC-V64 单 hart、QEMU `virt` 平台、启动期高半区内核与 RAM 恒等映射并存、致命 trap 诊断、DTB 中第一段物理内存和静态保留区，以及最小物理页分配。物理内存 direct map、移除恒等映射、运行期映射修改、trap 恢复、中断、用户态和 LoongArch64 均未实现。完整比赛 Harness 仍会因缺少 `kernel-la` 失败。
+当前只支持 RISC-V64 单 hart、QEMU `virt` 平台、启动期高半区内核/direct map 与 RAM 恒等映射并存、致命 trap 诊断、DTB 中第一段物理内存和静态保留区，以及最小物理页分配。移除恒等映射、运行期映射修改、trap 恢复、中断、用户态和 LoongArch64 均未实现。完整比赛 Harness 仍会因缺少 `kernel-la` 失败。
 
 ## 构建与运行
 
@@ -41,7 +41,7 @@ make test-references
 
 ## 近期方向
 
-下一步为 RISC-V64 建立明确的物理地址到内核可访问地址转换，逐步减少对 RAM 恒等映射的依赖并补充映射生命周期；RISC-V64 + OpenSBI 主路径稳定后，再接入 LoongArch64 16 KiB/三级页表。
+下一步收窄首次 `satp` 切换对低地址代码和栈的依赖，并删除整段 RISC-V RAM 恒等映射；RISC-V64 + OpenSBI 主路径稳定后，再接入 LoongArch64 16 KiB/三级页表。
 
 ## 文档
 

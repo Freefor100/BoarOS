@@ -35,7 +35,13 @@ if [ "$(grep -cxF 'BoarOS: Sv39 tests passed' "$output" || true)" -ne 1 ]; then
     exit 1
 fi
 
-if grep -qF 'BoarOS: Sv39 test failed' "$output"; then
+if [ "$(grep -cxF 'BoarOS: direct map tests passed' "$output" || true)" -ne 1 ]; then
+    tail -n 80 "$output" >&2
+    echo "direct map conversion tests did not report success" >&2
+    exit 1
+fi
+
+if grep -Eq 'BoarOS: (Sv39|direct map) test failed' "$output"; then
     tail -n 80 "$output" >&2
     echo "Sv39 test kernel reported a failed case" >&2
     exit 1

@@ -6,4 +6,7 @@
 /* Keep this synchronized with KERNEL_VIRTUAL_BASE in linker.ld. */
 #define RISCV_KERNEL_VIRTUAL_BASE UINT64_C(0xffffffff80000000)
 
+#define RISCV_DIRECT_MAP_BASE UINT64_C(0xffffffc000000000)
+#define RISCV_DIRECT_MAP_SIZE UINT64_C(0x2000000000)
+
 #endif

@@ -37,27 +37,42 @@ static int address_was_allocated(
     return 0;
 }
 
-static uint64_t read_recycled_node(uint64_t address)
+static int read_recycled_node(
+    const struct physical_page_allocator *allocator,
+    uint64_t address,
+    uint64_t *value)
 {
-    const unsigned char *bytes = (const unsigned char *)(uintptr_t)address;
-    uint64_t value = 0U;
+    const unsigned char *bytes = allocator->access(address);
+    uint64_t result = 0U;
     uint32_t index;
 
-    for (index = 0U; index < sizeof(value); index++) {
-        value |= (uint64_t)bytes[index] << (index * 8U);
+    if (bytes == 0) {
+        return 0;
+    }
+    for (index = 0U; index < sizeof(result); index++) {
+        result |= (uint64_t)bytes[index] << (index * 8U);
     }
 
-    return value;
+    *value = result;
+    return 1;
 }
 
-static void write_recycled_node(uint64_t address, uint64_t value)
+static int write_recycled_node(
+    const struct physical_page_allocator *allocator,
+    uint64_t address,
+    uint64_t value)
 {
-    unsigned char *bytes = (unsigned char *)(uintptr_t)address;
+    unsigned char *bytes = allocator->access(address);
     uint32_t index;
 
+    if (bytes == 0) {
+        return 0;
+    }
     for (index = 0U; index < sizeof(value); index++) {
         bytes[index] = (unsigned char)(value >> (index * 8U));
     }
+
+    return 1;
 }
 
 enum physical_page_status physical_page_allocator_init(
@@ -78,6 +93,7 @@ enum physical_page_status physical_page_allocator_init(
     result.recycled_head = PHYSICAL_PAGE_NONE;
     result.range_count = 0U;
     result.initialized = 0U;
+    result.access = 0;
     for (index = 0U; index < BOOT_MEMORY_MAX_USABLE_RANGES; index++) {
         result.ranges[index].base = 0U;
         result.ranges[index].next = 0U;
@@ -129,6 +145,22 @@ enum physical_page_status physical_page_allocator_init(
     return PHYSICAL_PAGE_STATUS_OK;
 }
 
+enum physical_page_status physical_page_allocator_bind_access(
+    struct physical_page_allocator *allocator,
+    physical_page_access_fn access)
+{
+    if (allocator == 0 || access == 0 ||
+        allocator->initialized != PHYSICAL_PAGE_ALLOCATOR_INITIALIZED) {
+        return PHYSICAL_PAGE_STATUS_INVALID;
+    }
+    if (allocator->access != 0) {
+        return PHYSICAL_PAGE_STATUS_STATE;
+    }
+
+    allocator->access = access;
+    return PHYSICAL_PAGE_STATUS_OK;
+}
+
 enum physical_page_status physical_page_allocate(
     struct physical_page_allocator *allocator,
     uint64_t *address)
@@ -147,10 +179,15 @@ enum physical_page_status physical_page_allocate(
         uint64_t result = allocator->recycled_head;
         uint64_t next;
 
+        if (allocator->access == 0) {
+            return PHYSICAL_PAGE_STATUS_STATE;
+        }
         if (!address_was_allocated(allocator, result)) {
             return PHYSICAL_PAGE_STATUS_INVALID;
         }
-        next = read_recycled_node(result);
+        if (!read_recycled_node(allocator, result, &next)) {
+            return PHYSICAL_PAGE_STATUS_INVALID;
+        }
         if (next != PHYSICAL_PAGE_NONE &&
             !address_was_allocated(allocator, next)) {
             return PHYSICAL_PAGE_STATUS_INVALID;
@@ -190,6 +227,9 @@ enum physical_page_status physical_page_release(
         !address_was_allocated(allocator, address)) {
         return PHYSICAL_PAGE_STATUS_INVALID;
     }
+    if (allocator->access == 0) {
+        return PHYSICAL_PAGE_STATUS_STATE;
+    }
 
     current = allocator->recycled_head;
     while (current != PHYSICAL_PAGE_NONE &&
@@ -200,7 +240,9 @@ enum physical_page_status physical_page_release(
         if (!address_was_allocated(allocator, current)) {
             return PHYSICAL_PAGE_STATUS_INVALID;
         }
-        current = read_recycled_node(current);
+        if (!read_recycled_node(allocator, current, &current)) {
+            return PHYSICAL_PAGE_STATUS_INVALID;
+        }
         scanned++;
     }
     if (current != PHYSICAL_PAGE_NONE ||
@@ -208,7 +250,9 @@ enum physical_page_status physical_page_release(
         return PHYSICAL_PAGE_STATUS_INVALID;
     }
 
-    write_recycled_node(address, allocator->recycled_head);
+    if (!write_recycled_node(allocator, address, allocator->recycled_head)) {
+        return PHYSICAL_PAGE_STATUS_INVALID;
+    }
     allocator->recycled_head = address;
     allocator->available_pages++;
     return PHYSICAL_PAGE_STATUS_OK;

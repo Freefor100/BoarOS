@@ -21,6 +21,11 @@ static const uint64_t readonly_target = UINT64_C(0x1122334455667788);
 static struct physical_page_allocator allocator;
 static struct riscv_sv39_page_table page_table;
 
+static void *identity_page_access(uint64_t address)
+{
+    return (void *)(uintptr_t)address;
+}
+
 static void fail_setup(void) __attribute__((noreturn));
 
 static uint64_t load_readonly_target(const uint64_t *address)
@@ -136,6 +141,9 @@ void kernel_main(unsigned long hart_id, const void *dtb)
                           (uint64_t)(uintptr_t)dtb,
                           &layout) != BOOT_MEMORY_STATUS_OK ||
         physical_page_allocator_init(&allocator, &layout) !=
+            PHYSICAL_PAGE_STATUS_OK ||
+        physical_page_allocator_bind_access(&allocator,
+                                            identity_page_access) !=
             PHYSICAL_PAGE_STATUS_OK ||
         !build_page_table(&info)) {
         fail_setup();
