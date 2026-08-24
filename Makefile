@@ -35,6 +35,7 @@ SCHEDULER_CASES_TEST_KERNEL_RV := \
 SCHEDULER_BOOT_TEST_KERNEL_RV := \
 	$(BUILD_DIR)/tests/kernel-scheduler-boot-rv
 SYSCALL_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-syscall-rv
+ELF64_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-elf64-rv
 USER_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-user-rv
 USER_FATAL_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-user-fatal-rv
 
@@ -58,6 +59,7 @@ C_SOURCES := \
 	arch/riscv/virt_uart.c \
 	kernel/boot_memory.c \
 	kernel/dtb.c \
+	kernel/elf64.c \
 	kernel/main.c \
 	kernel/physical_page.c \
 	kernel/scheduler.c \
@@ -77,6 +79,7 @@ TEST_RUNTIME_C_SOURCES := \
 	arch/riscv/timer.c \
 	arch/riscv/trap.c \
 	arch/riscv/virt_uart.c \
+	kernel/elf64.c \
 	kernel/physical_page.c \
 	kernel/scheduler.c \
 	kernel/syscall.c \
@@ -180,6 +183,12 @@ SYSCALL_TEST_C_SOURCES := \
 SYSCALL_TEST_OBJECTS := \
 	$(TEST_RUNTIME_OBJECTS) \
 	$(patsubst %.c,$(BUILD_DIR)/%.o,$(SYSCALL_TEST_C_SOURCES))
+ELF64_TEST_C_SOURCES := \
+	tests/riscv/elf64_cases.c \
+	tests/riscv/elf64_main.c
+ELF64_TEST_OBJECTS := \
+	$(TEST_RUNTIME_OBJECTS) \
+	$(patsubst %.c,$(BUILD_DIR)/%.o,$(ELF64_TEST_C_SOURCES))
 USER_TEST_C_SOURCES := tests/riscv/user_boot.c
 USER_TEST_ASM_SOURCES := tests/riscv/user_payload.S
 USER_TEST_OBJECTS := \
@@ -207,11 +216,13 @@ DEPS := \
 	$(SCHEDULER_CASES_TEST_OBJECTS:.o=.d) \
 	$(SCHEDULER_BOOT_TEST_OBJECTS:.o=.d) \
 	$(SYSCALL_TEST_OBJECTS:.o=.d) \
+	$(ELF64_TEST_OBJECTS:.o=.d) \
 	$(USER_TEST_OBJECTS:.o=.d) \
 	$(USER_FATAL_TEST_OBJECTS:.o=.d)
 
 .PHONY: all clean debug-riscv references run-riscv test-dtb-riscv \
 	test-context-riscv \
+	test-elf64-riscv \
 	test-high-half-trap-riscv test-idle-riscv test-no-identity-riscv \
 	test-page-riscv test-scheduler-cases-riscv test-scheduler-riscv \
 	test-references test-riscv test-sv39-fault-riscv test-sv39-riscv \
@@ -312,6 +323,11 @@ $(SYSCALL_TEST_KERNEL_RV): $(SYSCALL_TEST_OBJECTS) arch/riscv/linker.ld
 	$(CC) $(LDFLAGS) \
 		-Wl,-Map,$(BUILD_DIR)/tests/kernel-syscall-rv.map \
 		-o $@ $(SYSCALL_TEST_OBJECTS)
+
+$(ELF64_TEST_KERNEL_RV): $(ELF64_TEST_OBJECTS) arch/riscv/linker.ld
+	$(CC) $(LDFLAGS) \
+		-Wl,-Map,$(BUILD_DIR)/tests/kernel-elf64-rv.map \
+		-o $@ $(ELF64_TEST_OBJECTS)
 
 $(USER_TEST_KERNEL_RV): $(USER_TEST_OBJECTS) arch/riscv/linker.ld
 	$(CC) $(LDFLAGS) -Wl,--wrap=riscv_sv39_activate \
@@ -430,6 +446,10 @@ test-scheduler-riscv: $(SCHEDULER_BOOT_TEST_KERNEL_RV)
 test-syscall-riscv: $(SYSCALL_TEST_KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) SYSCALL_TEST_KERNEL_RV=$< \
 		./tests/syscall-riscv.sh
+
+test-elf64-riscv: $(ELF64_TEST_KERNEL_RV)
+	QEMU_RISCV64=$(QEMU_RISCV64) ELF64_TEST_KERNEL_RV=$< \
+		./tests/elf64-riscv.sh
 
 test-user-riscv: $(USER_TEST_KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) USER_TEST_KERNEL_RV=$< \
