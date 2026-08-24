@@ -1,6 +1,7 @@
 #include <arch/riscv/sbi.h>
 #include <arch/riscv/sv39.h>
 #include <arch/riscv/user_elf.h>
+#include <arch/riscv/user_process.h>
 #include <arch/riscv/virt_uart.h>
 #include <kernel/physical_page.h>
 #include <kernel/scheduler.h>
@@ -60,8 +61,10 @@ static enum kernel_scheduler_status create_elf_task(
     struct riscv_user_elf_string environment[1];
     struct riscv_user_elf_request request;
     struct riscv_sv39_user_space space = {0};
+    struct riscv_user_process process = {0};
     struct riscv_user_elf_entry entry;
     enum riscv_user_elf_status elf_status;
+    enum riscv_user_process_status process_status;
     enum kernel_scheduler_status scheduler_status;
 
     arguments[0].bytes = argument_zero;
@@ -90,14 +93,33 @@ static enum kernel_scheduler_status create_elf_task(
     } else if (fault_kind == 2) {
         guard_fault_address = RISCV_USER_ELF_STACK_GUARD_BASE;
     }
-    scheduler_status = kernel_user_thread_create(&space,
+    process_status = riscv_user_process_create(&process, &space);
+    if (process_status != RISCV_USER_PROCESS_STATUS_OK) {
+        if ((process.state == RISCV_USER_PROCESS_LIVE ||
+             process.state == RISCV_USER_PROCESS_CLEANUP) &&
+            riscv_user_process_destroy(&process) !=
+                RISCV_USER_PROCESS_STATUS_OK) {
+            return KERNEL_SCHEDULER_STATUS_ADDRESS_SPACE;
+        }
+        if ((space.state == RISCV_SV39_USER_SPACE_LIVE ||
+             space.state == RISCV_SV39_USER_SPACE_CLEANUP) &&
+            riscv_sv39_user_space_destroy(&space) !=
+                RISCV_SV39_STATUS_OK) {
+            return KERNEL_SCHEDULER_STATUS_ADDRESS_SPACE;
+        }
+        return process_status == RISCV_USER_PROCESS_STATUS_NO_MEMORY
+                   ? KERNEL_SCHEDULER_STATUS_NO_MEMORY
+                   : KERNEL_SCHEDULER_STATUS_ADDRESS_SPACE;
+    }
+    scheduler_status = kernel_user_thread_create(&process,
                                                  entry.entry,
                                                  entry.stack_pointer,
                                                  0U);
     if (scheduler_status != KERNEL_SCHEDULER_STATUS_OK &&
-        space.state == RISCV_SV39_USER_SPACE_LIVE &&
-        riscv_sv39_user_space_destroy(&space) !=
-            RISCV_SV39_STATUS_OK) {
+        (process.state == RISCV_USER_PROCESS_LIVE ||
+         process.state == RISCV_USER_PROCESS_CLEANUP) &&
+        riscv_user_process_destroy(&process) !=
+            RISCV_USER_PROCESS_STATUS_OK) {
         return KERNEL_SCHEDULER_STATUS_ADDRESS_SPACE;
     }
     return scheduler_status;

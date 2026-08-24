@@ -15,12 +15,12 @@ BoarOS 是一个从零搭建，面向 OS Comp 能力建设的 C 语言（少量 
 - RISC-V 内核 ELF 链接到 Sv39 高半区 `0xffffffff80000000`，QEMU 当前仍从物理地址 `0x80200000` 装载和进入；内核先用只覆盖切换所需低/高别名的过渡页表迁移 PC、栈、`gp` 和 `stvec`，再切换到只含高半区内核、从 `0xffffffc000000000` 开始的 128 GiB RAM direct map 和平台 MMIO 的最终页表。
 - Sv39 建表器按条件组合 2 MiB 与 4 KiB 叶子；最终页表不保留低地址映射，QEMU `virt` UART 的物理 MMIO 通过 `0xffffffe000000000` 的 supervisor-only 高半区别名访问。运行期用户地址空间拥有低半区 4 KiB U 页和页表页、借用包含 UART 在内的最终内核高半区根项，并以 ASID 0 全局刷新方式切换 `satp`。
 - 最终地址空间建立后，内核先把 boot context 初始化为 idle，再通过 SBI TIME 设置绝对 deadline，以 100 Hz 策略处理 supervisor timer interrupt；迟到时按原 deadline 相位一次补记 elapsed tick，并把同一 elapsed 交给 scheduler。
-- RISC-V switch context 按 psABI 保存 `ra/sp/tp/s0..s11`，其中内核 `tp` 固定指向 current thread。普通内核/用户任务各使用一个私有 4 KiB 页承载控制块、canary 和内核栈；用户任务额外独占一个 Sv39 用户地址空间。单 hart FIFO scheduler 每 tick 最多抢占切换一次，退出后由 boot idle 返回逐条完成记录并回收线程页、用户叶子页和页表页。正常内核不创建演示任务，仍永久执行 `wfi`。
+- RISC-V switch context 按 psABI 保存 `ra/sp/tp/s0..s11`，其中内核 `tp` 固定指向 current thread。普通内核/用户任务各使用一个私有 4 KiB 页承载控制块、canary 和内核栈；用户任务再用一个 4 KiB 进程记录页独立拥有 Sv39 地址空间。单 hart FIFO scheduler 每 tick 最多抢占切换一次，退出后由 boot idle 返回逐条完成记录，并按地址空间、进程记录页、线程页的顺序回收；复合失败保留可移动、可重试的 owner。正常内核不创建演示任务，仍永久执行 `wfi`。
 - 最小 Linux 风格系统调用边界支持 `exit(93)`，未知调用返回 `-ENOSYS`；用户同步故障只终止当前任务并保留 `scause/stval` 完成记录，S-mode 未处理故障仍为内核 fatal。
 - 有界 ELF64 解析器从只读内核内存缓冲区解码并校验 ELF header 与 program header；RISC-V 装载器支持静态、小端 ELF64 `ET_EXEC`，把 `PT_LOAD` 复制到独立 Sv39 用户地址空间，按页合并权限并执行 W^X 检查、补零 BSS，再根据带长度的参数请求建立 Linux 形态的 `argc/argv/envp/auxv` 初始栈。用户栈预留低半区顶端 8 MiB 虚拟区间，初次只提交容纳至多 128 KiB 栈镜像并额外向下留出 64 KiB 的页，预留区下方保持一页永久 guard；动态链接、TLS、随机数和按需扩栈尚未支持。
-- 自动测试除启动、物理页、分页、Trap、timer 和内核线程状态外，还让两个独立 Sv39 用户地址空间真实进入 U-mode：主任务经 timer 抢占到内核 worker 后恢复，核对 `gp/sp/tp/s0..s11`、未知 syscall 和 `exit(93)`；故障任务触发 load page fault。另一组测试独立链接完整静态 ELF，验证 `.data`、BSS、参数/环境字符串、auxv、栈对齐、初始提交边界、RX 文本写故障和永久栈 guard 故障。测试最终要求完成记录正确且全部用户/线程页回收，另在用户根下破坏返回凭据验证 fatal 诊断。
+- 自动测试除启动、物理页、分页、Trap、timer 和内核线程状态外，还注入进程记录页访问/释放与页表回收的复合失败，要求状态可重试且页所有权不丢失；两个独立 Sv39 用户进程会真实进入 U-mode，主任务经 timer 抢占到内核 worker 后恢复，核对 `gp/sp/tp/s0..s11`、未知 syscall 和 `exit(93)`，故障任务触发 load page fault。另一组测试独立链接完整静态 ELF，验证 `.data`、BSS、参数/环境字符串、auxv、栈对齐、初始提交边界、RX 文本写故障和永久栈 guard 故障。测试最终要求完成记录正确且全部进程/用户/线程页回收，另在用户根下破坏返回凭据验证 fatal 诊断。
 
-当前只支持 RISC-V64 单 hart、QEMU `virt` 平台、Sv39/4 KiB 用户页、S/U 整数 Trap Frame、SBI timer/100 Hz tick、单页内核栈与 FIFO 抢占，以及从完整内存缓冲区装载静态 `ET_EXEC` 用户程序。尚无进程/PID、通用用户内存复制、文件来源与 `exec` 生命周期、动态链接、`fork/wait`、阻塞与唤醒、文件系统、外部中断、SMP 或 LoongArch64；生产启动仍不创建用户任务。完整比赛 Harness 仍会因缺少 `kernel-la` 失败。
+当前只支持 RISC-V64 单 hart、QEMU `virt` 平台、Sv39/4 KiB 用户页、S/U 整数 Trap Frame、SBI timer/100 Hz tick、单页内核栈与 FIFO 抢占、一个线程对应一个最小地址空间 owner，以及从完整内存缓冲区装载静态 `ET_EXEC` 用户程序。最小进程容器尚无 PID、父子关系、文件表或 Linux 进程生命周期；也没有通用用户内存复制、文件来源与 `exec`、动态链接、`fork/wait`、阻塞与唤醒、文件系统、外部中断、SMP 或 LoongArch64。生产启动仍不创建用户任务，完整比赛 Harness 仍会因缺少 `kernel-la` 失败。
 
 ## 构建与运行
 
@@ -41,6 +41,7 @@ make test-syscall-riscv
 make test-elf64-riscv
 make test-user-elf-cases-riscv
 make test-user-elf-riscv
+make test-user-process-riscv
 make test-user-riscv
 make test-user-fatal-riscv
 make test-sv39-riscv
@@ -58,7 +59,7 @@ make test-references
 
 ## 近期方向
 
-下一步把已验证的内存型 ELF 装载器接入进程级资源容器，定义最小用户内存访问边界，再从文件系统提供可执行文件来源并逐步接入比赛所需系统调用；RISC-V64 + OpenSBI 主路径稳定后，再实现 LoongArch64 16 KiB/三级页表和对应 context/trap。
+下一步定义最小用户内存访问边界，再从文件系统提供可执行文件来源、形成 `exec` 生命周期并逐步接入比赛所需系统调用；RISC-V64 + OpenSBI 主路径稳定后，再实现 LoongArch64 16 KiB/三级页表和对应 context/trap。
 
 ## 文档
 
@@ -70,6 +71,7 @@ make test-references
 - [DTB 与启动内存布局模块](docs/modules/dtb-memory.md)
 - [物理页分配模块](docs/modules/physical-pages.md)
 - [RISC-V Sv39 分页模块](docs/modules/riscv-sv39.md)
+- [RISC-V 用户进程资源模块](docs/modules/riscv-user-process.md)
 - [用户 ELF64 装载模块](docs/modules/user-elf.md)
 - [RISC-V 启动学习总结](docs/learning/riscv-boot.md)
 - [RISC-V Trap 学习总结](docs/learning/riscv-traps.md)

@@ -9,6 +9,7 @@
 | `include/arch/riscv/context.h`、`arch/riscv/context.c` | 定义并初始化 RISC-V switch context，提供当前 `tp` 和 SIE 临界区操作 |
 | `include/arch/riscv/thread.h` | 定义位于 scheduler thread 对象首部、供 Trap 汇编访问的固定 RISC-V 线程状态前缀 |
 | `arch/riscv/context_switch.S` | 保存/恢复 `ra`、`sp`、`tp`、`s0..s11`，首次进入线程 trampoline |
+| `include/arch/riscv/user_process.h`、`arch/riscv/user_process.c` | 用独立物理页记录并拥有用户进程的 Sv39 地址空间 |
 | `include/kernel/scheduler.h`、`kernel/scheduler.c` | 管理静态 idle、内核/用户任务、FIFO 队列、地址空间和页所有权 |
 | `arch/riscv/trap.c` | 在 timer backend 和 tick 计数成功后调用 scheduler |
 | `kernel/main.c` | 在 timer 启动前初始化 scheduler，并在 boot idle 栈上回收退出线程 |
@@ -53,7 +54,7 @@ enum kernel_scheduler_status kernel_thread_create(
     void *argument);
 
 enum kernel_scheduler_status kernel_user_thread_create(
-    struct riscv_sv39_user_space *space,
+    struct riscv_user_process *process,
     uintptr_t entry,
     uintptr_t stack_pointer,
     uintptr_t thread_pointer);
@@ -67,9 +68,11 @@ enum kernel_scheduler_status kernel_scheduler_reap_one(
 
 `kernel_scheduler_reap_one()` 每次只回收 exited FIFO 的一个线程，并返回其完成记录。记录区分内核/用户线程以及入口返回、退出系统调用和用户态故障，`status`、`detail` 保存具体完成信息；当前内核线程入口返回产生 `{kernel, returned, 0, 0}`。队列为空返回 `KERNEL_SCHEDULER_STATUS_EMPTY`，不把空队列伪装成成功。
 
-用户任务创建要求入口至少按压缩指令的 2 字节 IALIGN 对齐并落在 U+X 页，用户 SP 按 psABI 的 16 字节边界对齐且 `stack_pointer-1` 落在 U+R+W 页，地址空间还必须与 scheduler 使用同一分配器。成功把地址空间从调用者 move 到任务；失败不转移所有权。错误状态还区分页表/`satp` 状态，失败或队列为空时输出参数保持不变。
+用户任务创建要求入口至少按压缩指令的 2 字节 IALIGN 对齐并落在 U+X 页，用户 SP 按 psABI 的 16 字节边界对齐且 `stack_pointer-1` 落在 U+R+W 页，进程还必须与 scheduler 使用同一分配器。成功把 LIVE 进程句柄从调用者 move 到任务；失败不转移所有权。错误状态还区分未映射地址、记录页访问与页表/`satp` 状态，失败或队列为空时输出参数保持不变。
 
-`riscv_user_elf_load()` 返回的 LIVE 地址空间、入口和栈指针可以直接传给 `kernel_user_thread_create()`。装载器与 scheduler 仍是两个所有权阶段：装载成功后调用者持有地址空间，线程创建成功后才由 scheduler 持有；创建失败时调用者必须销毁仍由自己持有的空间。生产启动当前没有可执行文件来源，因此只在测试 kernel 中连接这两层。
+线程页分配成功后的创建回滚由 scheduler 自己负责。若该页无法访问且立即释放也失败，scheduler 在全局状态中保留一个待清理页 owner，返回 `KERNEL_SCHEDULER_STATUS_PAGE_RELEASE`，并在 owner 清除前拒绝创建更多线程，避免覆盖唯一地址。`kernel_scheduler_reap_one()` 会先重试这张页，再处理 exited FIFO；仅完成待清理页且队列为空时仍返回 `EMPTY`，不伪造完成记录。
+
+`riscv_user_elf_load()` 返回 LIVE 地址空间、入口和栈指针；调用者先用 `riscv_user_process_create()` 把地址空间移入独立进程记录页，再把 LIVE 进程交给 `kernel_user_thread_create()`。三个所有权阶段都采用成功才 move：装载成功后调用者持有地址空间，进程创建成功后持有进程，线程创建成功后才由 scheduler 持有；任一步失败都由调用者销毁仍在自己手中的 owner。生产启动当前没有可执行文件来源，因此只在测试 kernel 中连接这三层。
 
 ## 初始化、当前线程和临界区
 
@@ -104,9 +107,9 @@ Trap Frame 已保存被中断点的全部整数现场，switch context 只保存
 
 ## 栈与退出所有权
 
-每个普通任务占用一个 4 KiB 线程页，页内保存元数据、switch context、canary 和向下增长的内核栈。用户任务另外独占一个 `riscv_sv39_user_space`，它拥有低半区叶子页和页表页；当前代码页、数据/用户栈页均由该对象统一回收。
+每个普通任务占用一个 4 KiB 线程页，页内保存元数据、switch context、canary 和向下增长的内核栈。用户任务另外拥有一个 4 KiB 进程记录页，其中的 `riscv_sv39_user_space` 统一拥有代码、数据/用户栈叶子页和低半区页表页。线程固定前缀缓存任务 `satp`，切换本身直接使用缓存；现有调度前不变量检查仍解析进程记录并核对缓存，因此增加的是一次 direct-map 记录访问，不是 TLB 切换或额外页表遍历。
 
-入口返回或用户退出/故障时，线程页仍承载当前 SP，不能立即释放。退出路径先切到下一地址空间，把完成记录随任务移到 exited 队列，再通过 discard context 切离当前栈。idle 回收用户任务时先销毁其非活动地址空间，再释放线程页；若线程页释放失败，已销毁状态保留在队首，重试不会二次销毁。只有全部释放成功才移除节点并写出完成记录。
+入口返回或用户退出/故障时，线程页仍承载当前 SP，不能立即释放。退出路径先切到下一地址空间，把完成记录随任务移到 exited 队列，再通过 discard context 切离当前栈。idle 回收用户任务时先销毁非活动地址空间，再释放进程记录页，最后释放线程页；任一步失败都让 exited 节点留在队首。进程进入 CLEANUP 时只重试记录页，进入 DESTROYED 后也不会因线程页释放失败而二次销毁。只有全部释放成功才移除节点并写出完成记录。
 
 每个 scheduler thread 以固定 32 字节 `struct riscv_thread_state` 开头，依次保存 `kernel_sp`、U 入口暂存的 `user_sp`、用户任务标记和任务 `satp`。C 静态断言与测试共同约束汇编偏移；其余 scheduler 元数据不属于汇编 ABI。
 
@@ -118,11 +121,12 @@ Trap Frame 已保存被中断点的全部整数现场，switch context 只保存
 make test-context-riscv
 make test-scheduler-cases-riscv
 make test-scheduler-riscv
+make test-user-process-riscv
 make test-user-riscv
 make test-user-elf-riscv
 make test-riscv
 ```
 
-context/state 测试覆盖内核与用户首次 context、固定线程前缀、创建失败原子性、FIFO、完成记录和内核线程页回收。用户测试覆盖入口/栈权限校验、U -> 内核 worker -> U 的真实 timer 调度、内核执行期间 `sscratch=0`、未知 syscall、正常退出、用户页故障、完成记录顺序和全部页计数复原；ELF 集成测试再验证装载器输出能直接成为真实用户任务并完整回收。生产 ELF 不含这些测试任务。
+context/state 测试覆盖内核与用户首次 context、固定线程前缀、创建失败原子性、线程页访问与立即释放双失败、FIFO、完成记录和内核线程页回收。进程聚焦测试覆盖记录页创建/移动/访问/复合失败和可重试销毁；用户测试覆盖入口/栈权限校验、U -> 内核 worker -> U 的真实 timer 调度、内核执行期间 `sscratch=0`、未知 syscall、正常退出和用户页故障，并依次注入地址空间部分回收、记录页释放、DESTROYED 进程的线程页释放失败，验证 exited 节点与完成输出保持、重试不二次销毁以及最终页计数复原。ELF 集成测试再验证装载器输出能经过进程容器成为真实用户任务并完整回收。生产 ELF 不含这些测试任务。
 
-当前限制为 RISC-V64 单 hart、ASID 0 全局 TLB 刷新、一个 tick 时间片、FIFO、4 KiB 单页内核栈和 canary。一个用户任务直接拥有一个地址空间，尚无进程/PID、共享地址空间的多线程、BLOCKED/sleep/wait/join、主动 yield、优先级、SMP、guard page、多页栈、F/V 上下文或 LoongArch context。
+当前限制为 RISC-V64 单 hart、ASID 0 全局 TLB 刷新、一个 tick 时间片、FIFO、4 KiB 单页内核栈和 canary。当前最小进程容器只拥有地址空间，并固定一个进程对应一个线程；尚无 PID、父子关系、文件表、共享地址空间的多线程、BLOCKED/sleep/wait/join、主动 yield、优先级、SMP、内核栈 guard、多页内核栈、F/V 上下文或 LoongArch context。

@@ -20,7 +20,7 @@ enum kernel_scheduler_status {
     KERNEL_SCHEDULER_STATUS_ADDRESS_SPACE,
 };
 
-struct riscv_sv39_user_space;
+struct riscv_user_process;
 
 enum kernel_thread_kind {
     KERNEL_THREAD_KIND_KERNEL = 0,
@@ -49,9 +49,9 @@ enum kernel_scheduler_status kernel_thread_create(
     void (*entry)(void *),
     void *argument);
 
-/* Success consumes space; failure leaves it owned by the caller. */
+/* Success consumes process; failure leaves it owned by the caller. */
 enum kernel_scheduler_status kernel_user_thread_create(
-    struct riscv_sv39_user_space *space,
+    struct riscv_user_process *process,
     uintptr_t entry,
     uintptr_t stack_pointer,
     uintptr_t thread_pointer);

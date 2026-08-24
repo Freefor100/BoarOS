@@ -16,7 +16,8 @@ extern unsigned char __boot_stack_top[];
 
 static unsigned char page_pool[BOAROS_PAGE_SIZE * TEST_PAGE_COUNT]
     __attribute__((aligned(BOAROS_PAGE_SIZE)));
-static unsigned long fail_next_access;
+static unsigned long access_calls_before_failure;
+static unsigned long fail_access_count;
 static uintptr_t entry_sp[TEST_PAGE_COUNT];
 static void *entry_tp[TEST_PAGE_COUNT];
 static uintptr_t entry_order[TEST_PAGE_COUNT];
@@ -40,9 +41,12 @@ _Static_assert(RISCV_THREAD_STATE_SIZE ==
 
 static void *scheduler_page_access(uint64_t physical_address)
 {
-    if (fail_next_access != 0U) {
-        fail_next_access = 0U;
-        return 0;
+    if (fail_access_count != 0U) {
+        if (access_calls_before_failure == 0U) {
+            fail_access_count--;
+            return 0;
+        }
+        access_calls_before_failure--;
     }
     if (physical_address < TEST_PHYSICAL_BASE ||
         physical_address - TEST_PHYSICAL_BASE >= sizeof(page_pool)) {
@@ -197,10 +201,50 @@ static unsigned long run_create_cases(
     struct physical_page_allocator *allocator)
 {
     uint64_t initial_available = physical_page_available(allocator);
-    struct kernel_thread_completion completion;
+    struct kernel_thread_completion completion = {
+        .kind = (enum kernel_thread_kind)0x21,
+        .reason = (enum kernel_thread_exit_reason)0x43,
+        .status = UINT64_C(0x65768798a9bacbdc),
+        .detail = UINT64_C(0xedfe0f1021324354),
+    };
     unsigned long failures = 0U;
 
-    fail_next_access = 1U;
+    access_calls_before_failure = 0U;
+    fail_access_count = 2U;
+    failures += expect_status(KERNEL_SCHEDULER_STATUS_PAGE_RELEASE,
+                              kernel_thread_create(thread_entry, 0));
+    if (physical_page_available(allocator) + 1U != initial_available) {
+        failures++;
+    }
+    fail_access_count = 0U;
+    failures += expect_status(KERNEL_SCHEDULER_STATUS_PAGE_RELEASE,
+                              kernel_thread_create(thread_entry, 0));
+    if (physical_page_available(allocator) + 1U != initial_available) {
+        failures++;
+    }
+    access_calls_before_failure = 0U;
+    fail_access_count = 1U;
+    failures += expect_status(KERNEL_SCHEDULER_STATUS_PAGE_RELEASE,
+                              kernel_scheduler_reap_one(&completion));
+    if (completion.kind != (enum kernel_thread_kind)0x21 ||
+        completion.reason != (enum kernel_thread_exit_reason)0x43 ||
+        completion.status != UINT64_C(0x65768798a9bacbdc) ||
+        completion.detail != UINT64_C(0xedfe0f1021324354) ||
+        physical_page_available(allocator) + 1U != initial_available) {
+        failures++;
+    }
+    failures += expect_status(KERNEL_SCHEDULER_STATUS_EMPTY,
+                              kernel_scheduler_reap_one(&completion));
+    if (completion.kind != (enum kernel_thread_kind)0x21 ||
+        completion.reason != (enum kernel_thread_exit_reason)0x43 ||
+        completion.status != UINT64_C(0x65768798a9bacbdc) ||
+        completion.detail != UINT64_C(0xedfe0f1021324354) ||
+        physical_page_available(allocator) != initial_available) {
+        failures++;
+    }
+
+    access_calls_before_failure = 1U;
+    fail_access_count = 1U;
     failures += expect_status(KERNEL_SCHEDULER_STATUS_PAGE_ACCESS,
                               kernel_thread_create(thread_entry, 0));
     if (physical_page_available(allocator) != initial_available) {

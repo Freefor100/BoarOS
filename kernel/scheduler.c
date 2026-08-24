@@ -2,6 +2,7 @@
 #include <arch/riscv/sv39.h>
 #include <arch/riscv/thread.h>
 #include <arch/riscv/trap.h>
+#include <arch/riscv/user_process.h>
 #include <kernel/page.h>
 #include <kernel/physical_page.h>
 #include <kernel/scheduler.h>
@@ -32,7 +33,7 @@ struct kernel_thread {
     uint32_t state;
     uint32_t idle;
     struct kernel_thread_completion completion;
-    struct riscv_sv39_user_space user_space;
+    struct riscv_user_process process;
     struct riscv_switch_context context;
 } __attribute__((aligned(16)));
 
@@ -47,6 +48,8 @@ struct kernel_scheduler {
     struct kernel_thread *ready_tail;
     struct kernel_thread *exited_head;
     struct kernel_thread *exited_tail;
+    uint64_t cleanup_page_address;
+    uint32_t cleanup_page_owned;
     enum kernel_scheduler_status fatal_status;
     struct riscv_switch_context discard_context;
 };
@@ -109,7 +112,7 @@ static enum kernel_scheduler_status validate_thread(
             thread->arch.user_mode != 0U ||
             thread->arch.satp != scheduler.kernel_satp ||
             thread->completion.kind != KERNEL_THREAD_KIND_KERNEL ||
-            thread->user_space.state != RISCV_SV39_USER_SPACE_EMPTY) {
+            thread->process.state != RISCV_USER_PROCESS_EMPTY) {
             return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
         }
         return KERNEL_SCHEDULER_STATUS_OK;
@@ -136,26 +139,39 @@ static enum kernel_scheduler_status validate_thread(
         if (thread->arch.user_sp != 0U ||
             thread->arch.satp != scheduler.kernel_satp ||
             thread->completion.kind != KERNEL_THREAD_KIND_KERNEL ||
-            thread->user_space.state != RISCV_SV39_USER_SPACE_EMPTY) {
+            thread->process.state != RISCV_USER_PROCESS_EMPTY) {
             return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
         }
     } else {
         if (thread->arch.user_mode != 1U ||
             thread->completion.kind != KERNEL_THREAD_KIND_USER ||
-            (thread->user_space.state != RISCV_SV39_USER_SPACE_LIVE &&
+            (thread->process.state != RISCV_USER_PROCESS_LIVE &&
              (expected_state != KERNEL_THREAD_STATE_EXITED ||
-              thread->user_space.state !=
-                  RISCV_SV39_USER_SPACE_DESTROYED))) {
+              (thread->process.state !=
+                   RISCV_USER_PROCESS_CLEANUP &&
+               thread->process.state !=
+                   RISCV_USER_PROCESS_DESTROYED)))) {
             return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
         }
-        if (thread->user_space.state == RISCV_SV39_USER_SPACE_LIVE) {
-            if (thread->user_space.allocator != scheduler.allocator ||
-                riscv_sv39_user_space_satp(&thread->user_space,
-                                           &expected_satp) !=
-                    RISCV_SV39_STATUS_OK ||
-                expected_satp != thread->arch.satp) {
+        if (thread->process.state == RISCV_USER_PROCESS_LIVE) {
+            if (thread->process.allocator != scheduler.allocator ||
+                (expected_state != KERNEL_THREAD_STATE_EXITED &&
+                 (riscv_user_process_satp(&thread->process,
+                                          &expected_satp) !=
+                      RISCV_USER_PROCESS_STATUS_OK ||
+                  expected_satp != thread->arch.satp))) {
                 return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
             }
+        } else if (thread->process.state ==
+                   RISCV_USER_PROCESS_CLEANUP) {
+            if (thread->process.allocator != scheduler.allocator ||
+                (thread->process.record_page_address &
+                 BOAROS_PAGE_MASK) != 0U) {
+                return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
+            }
+        } else if (thread->process.allocator != 0 ||
+                   thread->process.record_page_address != 0U) {
+            return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
         }
     }
 
@@ -214,6 +230,14 @@ static enum kernel_scheduler_status activate_thread_address_space(
 static enum kernel_scheduler_status validate_queues(void)
 {
     enum kernel_scheduler_status status;
+
+    if (scheduler.cleanup_page_owned > 1U ||
+        (scheduler.cleanup_page_owned == 0U &&
+         scheduler.cleanup_page_address != 0U) ||
+        (scheduler.cleanup_page_owned != 0U &&
+         (scheduler.cleanup_page_address & BOAROS_PAGE_MASK) != 0U)) {
+        return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
+    }
 
     status = validate_queue_shape(scheduler.ready_head,
                                   scheduler.ready_tail);
@@ -300,8 +324,13 @@ static enum kernel_scheduler_status release_after_create_failure(
     uint64_t physical_address,
     enum kernel_scheduler_status original_status)
 {
+    if (scheduler.cleanup_page_owned != 0U) {
+        return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
+    }
     if (physical_page_release(scheduler.allocator, physical_address) !=
         PHYSICAL_PAGE_STATUS_OK) {
+        scheduler.cleanup_page_address = physical_address;
+        scheduler.cleanup_page_owned = 1U;
         return KERNEL_SCHEDULER_STATUS_PAGE_RELEASE;
     }
     return original_status;
@@ -356,6 +385,8 @@ enum kernel_scheduler_status kernel_scheduler_init(
     scheduler.ready_tail = 0;
     scheduler.exited_head = 0;
     scheduler.exited_tail = 0;
+    scheduler.cleanup_page_address = 0U;
+    scheduler.cleanup_page_owned = 0U;
     scheduler.fatal_status = KERNEL_SCHEDULER_STATUS_OK;
     scheduler.idle_context_saved = 0U;
     scheduler.initialized = KERNEL_SCHEDULER_INITIALIZED;
@@ -394,6 +425,10 @@ enum kernel_scheduler_status kernel_thread_create(
     }
     status = validate_queues();
     if (status != KERNEL_SCHEDULER_STATUS_OK) {
+        goto restore_interrupts;
+    }
+    if (scheduler.cleanup_page_owned != 0U) {
+        status = KERNEL_SCHEDULER_STATUS_PAGE_RELEASE;
         goto restore_interrupts;
     }
 
@@ -458,7 +493,7 @@ restore_interrupts:
 }
 
 enum kernel_scheduler_status kernel_user_thread_create(
-    struct riscv_sv39_user_space *space,
+    struct riscv_user_process *process,
     uintptr_t entry,
     uintptr_t stack_pointer,
     uintptr_t thread_pointer)
@@ -474,13 +509,13 @@ enum kernel_scheduler_status kernel_user_thread_create(
     uintptr_t stack_low;
     enum physical_page_status page_status;
     enum riscv_context_status context_status;
-    enum riscv_sv39_status sv39_status;
+    enum riscv_user_process_status process_status;
     enum kernel_scheduler_status status;
 
     if (scheduler.initialized != KERNEL_SCHEDULER_INITIALIZED) {
         return KERNEL_SCHEDULER_STATUS_NOT_INITIALIZED;
     }
-    if (space == 0 || entry == 0U ||
+    if (process == 0 || entry == 0U ||
         (entry & (uintptr_t)1U) != 0U || stack_pointer == 0U ||
         (stack_pointer & (uintptr_t)15U) != 0U) {
         return KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
@@ -499,20 +534,29 @@ enum kernel_scheduler_status kernel_user_thread_create(
     if (status != KERNEL_SCHEDULER_STATUS_OK) {
         goto restore_interrupts;
     }
-    if (space->allocator != scheduler.allocator) {
+    if (scheduler.cleanup_page_owned != 0U) {
+        status = KERNEL_SCHEDULER_STATUS_PAGE_RELEASE;
+        goto restore_interrupts;
+    }
+    if (process->allocator != scheduler.allocator) {
         status = KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
         goto restore_interrupts;
     }
-    sv39_status = riscv_sv39_user_space_satp(space, &user_satp);
-    if (sv39_status != RISCV_SV39_STATUS_OK) {
-        status = sv39_status == RISCV_SV39_STATUS_STATE
-                     ? KERNEL_SCHEDULER_STATUS_ADDRESS_SPACE
-                     : KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
+    process_status = riscv_user_process_satp(process, &user_satp);
+    if (process_status != RISCV_USER_PROCESS_STATUS_OK) {
+        status = process_status ==
+                         RISCV_USER_PROCESS_STATUS_INVALID_ARGUMENT
+                     ? KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT
+                     : KERNEL_SCHEDULER_STATUS_ADDRESS_SPACE;
         goto restore_interrupts;
     }
-    sv39_status = riscv_sv39_user_lookup(space, entry, &entry_mapping);
-    if (sv39_status != RISCV_SV39_STATUS_OK) {
-        status = sv39_status == RISCV_SV39_STATUS_NOT_MAPPED
+    process_status = riscv_user_process_lookup(process,
+                                               entry,
+                                               &entry_mapping);
+    if (process_status != RISCV_USER_PROCESS_STATUS_OK) {
+        status = process_status == RISCV_USER_PROCESS_STATUS_NOT_MAPPED ||
+                         process_status ==
+                             RISCV_USER_PROCESS_STATUS_INVALID_ARGUMENT
                      ? KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT
                      : KERNEL_SCHEDULER_STATUS_ADDRESS_SPACE;
         goto restore_interrupts;
@@ -523,11 +567,13 @@ enum kernel_scheduler_status kernel_user_thread_create(
         status = KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
         goto restore_interrupts;
     }
-    sv39_status = riscv_sv39_user_lookup(space,
-                                         stack_pointer - 1U,
-                                         &stack_mapping);
-    if (sv39_status != RISCV_SV39_STATUS_OK) {
-        status = sv39_status == RISCV_SV39_STATUS_NOT_MAPPED
+    process_status = riscv_user_process_lookup(process,
+                                               stack_pointer - 1U,
+                                               &stack_mapping);
+    if (process_status != RISCV_USER_PROCESS_STATUS_OK) {
+        status = process_status == RISCV_USER_PROCESS_STATUS_NOT_MAPPED ||
+                         process_status ==
+                             RISCV_USER_PROCESS_STATUS_INVALID_ARGUMENT
                      ? KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT
                      : KERNEL_SCHEDULER_STATUS_ADDRESS_SPACE;
         goto restore_interrupts;
@@ -602,8 +648,8 @@ enum kernel_scheduler_status kernel_user_thread_create(
             KERNEL_SCHEDULER_STATUS_INVALID_STATE);
         goto restore_interrupts;
     }
-    if (riscv_sv39_user_space_move(&thread->user_space, space) !=
-        RISCV_SV39_STATUS_OK) {
+    if (riscv_user_process_move(&thread->process, process) !=
+        RISCV_USER_PROCESS_STATUS_OK) {
         status = release_after_create_failure(
             physical_address,
             KERNEL_SCHEDULER_STATUS_ADDRESS_SPACE);
@@ -675,6 +721,7 @@ enum kernel_scheduler_status kernel_scheduler_reap_one(
     struct kernel_thread_completion result;
     struct kernel_thread *thread;
     struct kernel_thread *next;
+    enum riscv_user_process_status process_status;
     enum kernel_scheduler_status status;
 
     if (scheduler.initialized != KERNEL_SCHEDULER_INITIALIZED) {
@@ -701,6 +748,16 @@ enum kernel_scheduler_status kernel_scheduler_reap_one(
         return status;
     }
 
+    if (scheduler.cleanup_page_owned != 0U) {
+        if (physical_page_release(scheduler.allocator,
+                                  scheduler.cleanup_page_address) !=
+            PHYSICAL_PAGE_STATUS_OK) {
+            return KERNEL_SCHEDULER_STATUS_PAGE_RELEASE;
+        }
+        scheduler.cleanup_page_address = 0U;
+        scheduler.cleanup_page_owned = 0U;
+    }
+
     if (scheduler.exited_head == 0) {
         return KERNEL_SCHEDULER_STATUS_EMPTY;
     }
@@ -722,10 +779,29 @@ enum kernel_scheduler_status kernel_scheduler_reap_one(
             result.reason != KERNEL_THREAD_EXIT_USER_FAULT) {
             return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
         }
-        if (thread->user_space.state == RISCV_SV39_USER_SPACE_LIVE &&
-            riscv_sv39_user_space_destroy(&thread->user_space) !=
-                RISCV_SV39_STATUS_OK) {
-            return KERNEL_SCHEDULER_STATUS_ADDRESS_SPACE;
+        if (thread->process.state == RISCV_USER_PROCESS_LIVE ||
+            thread->process.state == RISCV_USER_PROCESS_CLEANUP) {
+            process_status = riscv_user_process_destroy(
+                &thread->process);
+            if (process_status != RISCV_USER_PROCESS_STATUS_OK) {
+                if (process_status ==
+                    RISCV_USER_PROCESS_STATUS_PAGE_ACCESS) {
+                    return KERNEL_SCHEDULER_STATUS_PAGE_ACCESS;
+                }
+                if (process_status ==
+                        RISCV_USER_PROCESS_STATUS_PAGE_RELEASE ||
+                    process_status ==
+                        RISCV_USER_PROCESS_STATUS_CLEANUP_REQUIRED) {
+                    return KERNEL_SCHEDULER_STATUS_PAGE_RELEASE;
+                }
+                return process_status ==
+                               RISCV_USER_PROCESS_STATUS_ADDRESS_SPACE
+                           ? KERNEL_SCHEDULER_STATUS_ADDRESS_SPACE
+                           : KERNEL_SCHEDULER_STATUS_INVALID_STATE;
+            }
+        }
+        if (thread->process.state != RISCV_USER_PROCESS_DESTROYED) {
+            return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
         }
     } else {
         return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
