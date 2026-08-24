@@ -313,29 +313,11 @@ static enum riscv_user_elf_status map_load_pages(
     return RISCV_USER_ELF_STATUS_OK;
 }
 
-static void copy_bytes(unsigned char *destination,
-                       const unsigned char *source,
-                       size_t size)
-{
-    size_t index;
-
-    for (index = 0U; index < size; index++) {
-        destination[index] = source[index];
-    }
-}
-
 static enum riscv_user_elf_status copy_load_segments(
     const struct kernel_elf64_image *image,
-    struct riscv_sv39_user_space *space,
-    struct physical_page_allocator *allocator)
+    struct riscv_sv39_user_space *space)
 {
     struct kernel_elf64_program_header segment;
-    struct riscv_sv39_mapping mapping;
-    uint64_t copied;
-    uint64_t current;
-    uint64_t chunk;
-    uint64_t offset_in_page;
-    void *page;
     uint16_t index;
     enum riscv_user_elf_status status;
 
@@ -350,26 +332,12 @@ static enum riscv_user_elf_status copy_load_segments(
             segment.file_size == 0U) {
             continue;
         }
-        copied = 0U;
-        while (copied < segment.file_size) {
-            current = segment.virtual_address + copied;
-            if (riscv_sv39_user_lookup(space, current, &mapping) !=
-                    RISCV_SV39_STATUS_OK ||
-                physical_page_resolve(
-                    allocator,
-                    mapping.physical_address & ~BOAROS_PAGE_MASK,
-                    &page) != PHYSICAL_PAGE_STATUS_OK) {
-                return RISCV_USER_ELF_STATUS_ADDRESS_SPACE;
-            }
-            offset_in_page = current & BOAROS_PAGE_MASK;
-            chunk = BOAROS_PAGE_SIZE - offset_in_page;
-            if (chunk > segment.file_size - copied) {
-                chunk = segment.file_size - copied;
-            }
-            copy_bytes((unsigned char *)page + offset_in_page,
-                       image->bytes + segment.offset + copied,
-                       (size_t)chunk);
-            copied += chunk;
+        if (riscv_sv39_user_space_populate(
+                space,
+                segment.virtual_address,
+                image->bytes + segment.offset,
+                (size_t)segment.file_size) != RISCV_SV39_STATUS_OK) {
+            return RISCV_USER_ELF_STATUS_ADDRESS_SPACE;
         }
     }
     return RISCV_USER_ELF_STATUS_OK;
@@ -454,7 +422,7 @@ enum riscv_user_elf_status riscv_user_elf_load(
     if (status != RISCV_USER_ELF_STATUS_OK) {
         return finish_failure(status, &working, space);
     }
-    status = copy_load_segments(&image, &working, allocator);
+    status = copy_load_segments(&image, &working);
     if (status != RISCV_USER_ELF_STATUS_OK) {
         return finish_failure(status, &working, space);
     }

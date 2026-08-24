@@ -27,6 +27,8 @@ static uint64_t user_space_oom_pool[TEST_POOL_WORDS(4U)]
     __attribute__((aligned(BOAROS_PAGE_SIZE)));
 static uint64_t zero_address_page_pool[TEST_POOL_WORDS(4U)]
     __attribute__((aligned(BOAROS_PAGE_SIZE)));
+static uint64_t populate_page_pool[TEST_POOL_WORDS(16U)]
+    __attribute__((aligned(BOAROS_PAGE_SIZE)));
 
 static void *identity_page_access(uint64_t address)
 {
@@ -772,6 +774,92 @@ static int test_user_space_root_at_zero(void)
     return 0;
 }
 
+static int test_user_space_populate(void)
+{
+    static const unsigned char payload[16] = {
+        0x10U, 0x11U, 0x12U, 0x13U,
+        0x14U, 0x15U, 0x16U, 0x17U,
+        0x18U, 0x19U, 0x1aU, 0x1bU,
+        0x1cU, 0x1dU, 0x1eU, 0x1fU,
+    };
+    const uint64_t first_va = UINT64_C(0x20000);
+    const uint64_t second_va = first_va + BOAROS_PAGE_SIZE;
+    struct boot_memory_layout layout;
+    struct physical_page_allocator allocator;
+    struct riscv_sv39_page_table kernel_table;
+    struct riscv_sv39_user_space space = {0};
+    struct riscv_sv39_mapping first_mapping;
+    struct riscv_sv39_mapping second_mapping;
+    unsigned char *first_page;
+    unsigned char *second_page;
+    void *pointer;
+    uint32_t index;
+    uint64_t available;
+
+    layout.usable_count = 1U;
+    layout.usable[0].base =
+        (uint64_t)(uintptr_t)populate_page_pool;
+    layout.usable[0].size = sizeof(populate_page_pool);
+    reset_page_table(&kernel_table);
+    if (init_test_page_allocator(&allocator, &layout) !=
+            PHYSICAL_PAGE_STATUS_OK ||
+        riscv_sv39_page_table_init(&kernel_table, &allocator) !=
+            RISCV_SV39_STATUS_OK) {
+        return 60;
+    }
+    kernel_table.state = RISCV_SV39_STATE_ACTIVE;
+    available = physical_page_available(&allocator);
+    if (riscv_sv39_user_space_init(&space,
+                                   &allocator,
+                                   &kernel_table) !=
+            RISCV_SV39_STATUS_OK ||
+        riscv_sv39_user_map_zeroed_page(&space,
+                                        first_va,
+                                        RISCV_SV39_READ |
+                                            RISCV_SV39_EXECUTE) !=
+            RISCV_SV39_STATUS_OK ||
+        riscv_sv39_user_map_zeroed_page(&space,
+                                        second_va,
+                                        RISCV_SV39_READ |
+                                            RISCV_SV39_WRITE) !=
+            RISCV_SV39_STATUS_OK ||
+        riscv_sv39_user_space_populate(
+            &space,
+            first_va + BOAROS_PAGE_SIZE - 8U,
+            payload,
+            sizeof(payload)) != RISCV_SV39_STATUS_OK ||
+        riscv_sv39_user_lookup(&space,
+                               first_va,
+                               &first_mapping) != RISCV_SV39_STATUS_OK ||
+        riscv_sv39_user_lookup(&space,
+                               second_va,
+                               &second_mapping) != RISCV_SV39_STATUS_OK ||
+        physical_page_resolve(&allocator,
+                              first_mapping.physical_address,
+                              &pointer) != PHYSICAL_PAGE_STATUS_OK) {
+        return 61;
+    }
+    first_page = pointer;
+    if (physical_page_resolve(&allocator,
+                              second_mapping.physical_address,
+                              &pointer) != PHYSICAL_PAGE_STATUS_OK) {
+        return 62;
+    }
+    second_page = pointer;
+    for (index = 0U; index < 8U; index++) {
+        if (first_page[BOAROS_PAGE_SIZE - 8U + index] != payload[index] ||
+            second_page[index] != payload[8U + index]) {
+            return 63;
+        }
+    }
+    if (riscv_sv39_user_space_destroy(&space) !=
+            RISCV_SV39_STATUS_OK ||
+        physical_page_available(&allocator) != available) {
+        return 64;
+    }
+    return 0;
+}
+
 int run_sv39_tests(void)
 {
     struct physical_page_allocator allocator;
@@ -1028,6 +1116,11 @@ int run_sv39_tests(void)
     }
 
     result = test_user_space_root_at_zero();
+    if (result != 0) {
+        return result;
+    }
+
+    result = test_user_space_populate();
     if (result != 0) {
         return result;
     }

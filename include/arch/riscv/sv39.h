@@ -3,6 +3,7 @@
 
 #include <kernel/physical_page.h>
 
+#include <stddef.h>
 #include <stdint.h>
 
 #define RISCV_SV39_PAGE_SIZE_4K UINT64_C(0x1000)
@@ -115,6 +116,13 @@ enum riscv_sv39_status riscv_sv39_user_lookup(
     const struct riscv_sv39_user_space *space,
     uint64_t virtual_address,
     struct riscv_sv39_mapping *mapping);
+
+/* Populate mapped owned pages before this address space becomes active. */
+enum riscv_sv39_status riscv_sv39_user_space_populate(
+    struct riscv_sv39_user_space *space,
+    uint64_t virtual_address,
+    const void *bytes,
+    size_t size);
 
 enum riscv_sv39_status riscv_sv39_user_space_satp(
     const struct riscv_sv39_user_space *space,

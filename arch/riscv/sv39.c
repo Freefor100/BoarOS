@@ -852,6 +852,60 @@ enum riscv_sv39_status riscv_sv39_user_lookup(
     return RISCV_SV39_STATUS_STATE;
 }
 
+enum riscv_sv39_status riscv_sv39_user_space_populate(
+    struct riscv_sv39_user_space *space,
+    uint64_t virtual_address,
+    const void *bytes,
+    size_t size)
+{
+    const unsigned char *source = bytes;
+    struct riscv_sv39_mapping mapping;
+    unsigned char *page;
+    uint64_t current;
+    uint64_t chunk;
+    uint64_t copied = 0U;
+    uint64_t user_satp;
+    void *pointer;
+    size_t index;
+
+    if (space == 0 || space->state != RISCV_SV39_USER_SPACE_LIVE ||
+        (size != 0U && bytes == 0) ||
+        virtual_address < RISCV_SV39_PAGE_SIZE_4K ||
+        (uint64_t)size > RISCV_SV39_USER_LIMIT - virtual_address ||
+        riscv_sv39_user_space_satp(space, &user_satp) !=
+            RISCV_SV39_STATUS_OK) {
+        return RISCV_SV39_STATUS_INVALID;
+    }
+    if (riscv_sv39_current_satp() == user_satp) {
+        return RISCV_SV39_STATUS_STATE;
+    }
+
+    while (copied < (uint64_t)size) {
+        current = virtual_address + copied;
+        if (riscv_sv39_user_lookup(space, current, &mapping) !=
+            RISCV_SV39_STATUS_OK) {
+            return RISCV_SV39_STATUS_NOT_MAPPED;
+        }
+        if (physical_page_resolve(
+                space->allocator,
+                mapping.physical_address & ~BOAROS_PAGE_MASK,
+                &pointer) != PHYSICAL_PAGE_STATUS_OK) {
+            return RISCV_SV39_STATUS_STATE;
+        }
+        page = pointer;
+        chunk = BOAROS_PAGE_SIZE - (current & BOAROS_PAGE_MASK);
+        if (chunk > (uint64_t)size - copied) {
+            chunk = (uint64_t)size - copied;
+        }
+        for (index = 0U; index < (size_t)chunk; index++) {
+            page[(current & BOAROS_PAGE_MASK) + index] =
+                source[(size_t)copied + index];
+        }
+        copied += chunk;
+    }
+    return RISCV_SV39_STATUS_OK;
+}
+
 enum riscv_sv39_status riscv_sv39_user_space_satp(
     const struct riscv_sv39_user_space *space,
     uint64_t *satp)
