@@ -38,6 +38,9 @@ SYSCALL_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-syscall-rv
 ELF64_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-elf64-rv
 USER_ELF_CASES_TEST_KERNEL_RV := \
 	$(BUILD_DIR)/tests/kernel-user-elf-cases-rv
+USER_ELF_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-user-elf-rv
+USER_ELF_PROGRAM_RV := $(BUILD_DIR)/tests/user/elf-probe-rv
+USER_ELF_FAULT_PROGRAM_RV := $(BUILD_DIR)/tests/user/elf-text-fault-rv
 USER_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-user-rv
 USER_FATAL_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-user-fatal-rv
 
@@ -199,6 +202,16 @@ USER_ELF_CASES_TEST_C_SOURCES := \
 USER_ELF_CASES_TEST_OBJECTS := \
 	$(TEST_RUNTIME_OBJECTS) \
 	$(patsubst %.c,$(BUILD_DIR)/%.o,$(USER_ELF_CASES_TEST_C_SOURCES))
+USER_ELF_TEST_C_SOURCES := tests/riscv/user_elf_boot.c
+USER_ELF_TEST_ASM_SOURCES := tests/riscv/user_elf_images.S
+USER_ELF_TEST_OBJECTS := \
+	$(OBJECTS) \
+	$(patsubst %.c,$(BUILD_DIR)/%.o,$(USER_ELF_TEST_C_SOURCES)) \
+	$(patsubst %.S,$(BUILD_DIR)/%.o,$(USER_ELF_TEST_ASM_SOURCES))
+USER_ELF_PROGRAM_OBJECT_RV := \
+	$(BUILD_DIR)/tests/user/user_elf_program.o
+USER_ELF_FAULT_PROGRAM_OBJECT_RV := \
+	$(BUILD_DIR)/tests/user/user_elf_fault_program.o
 USER_TEST_C_SOURCES := tests/riscv/user_boot.c
 USER_TEST_ASM_SOURCES := tests/riscv/user_payload.S
 USER_TEST_OBJECTS := \
@@ -228,12 +241,15 @@ DEPS := \
 	$(SYSCALL_TEST_OBJECTS:.o=.d) \
 	$(ELF64_TEST_OBJECTS:.o=.d) \
 	$(USER_ELF_CASES_TEST_OBJECTS:.o=.d) \
+	$(USER_ELF_TEST_OBJECTS:.o=.d) \
+	$(USER_ELF_PROGRAM_OBJECT_RV:.o=.d) \
+	$(USER_ELF_FAULT_PROGRAM_OBJECT_RV:.o=.d) \
 	$(USER_TEST_OBJECTS:.o=.d) \
 	$(USER_FATAL_TEST_OBJECTS:.o=.d)
 
 .PHONY: all clean debug-riscv references run-riscv test-dtb-riscv \
 	test-context-riscv \
-	test-elf64-riscv test-user-elf-cases-riscv \
+	test-elf64-riscv test-user-elf-cases-riscv test-user-elf-riscv \
 	test-high-half-trap-riscv test-idle-riscv test-no-identity-riscv \
 	test-page-riscv test-scheduler-cases-riscv test-scheduler-riscv \
 	test-references test-riscv test-sv39-fault-riscv test-sv39-riscv \
@@ -345,6 +361,41 @@ $(USER_ELF_CASES_TEST_KERNEL_RV): $(USER_ELF_CASES_TEST_OBJECTS) \
 	$(CC) $(LDFLAGS) -Wl,--wrap=riscv_sv39_user_space_destroy \
 		-Wl,-Map,$(BUILD_DIR)/tests/kernel-user-elf-cases-rv.map \
 		-o $@ $(USER_ELF_CASES_TEST_OBJECTS)
+
+$(USER_ELF_PROGRAM_OBJECT_RV): tests/riscv/user_elf_program.S
+	@mkdir -p $(dir $@)
+	$(CC) $(CPPFLAGS) $(ASFLAGS) -MMD -MP -c $< -o $@
+
+$(USER_ELF_FAULT_PROGRAM_OBJECT_RV): tests/riscv/user_elf_program.S
+	@mkdir -p $(dir $@)
+	$(CC) $(CPPFLAGS) $(ASFLAGS) -DUSER_ELF_TEXT_FAULT \
+		-MMD -MP -c $< -o $@
+
+$(USER_ELF_PROGRAM_RV): $(USER_ELF_PROGRAM_OBJECT_RV) \
+		tests/riscv/user_elf.ld
+	$(CC) $(ARCH_FLAGS) -nostdlib -nostartfiles -static -no-pie \
+		-T tests/riscv/user_elf.ld -Wl,--build-id=none \
+		-Wl,--gc-sections -o $@ $(USER_ELF_PROGRAM_OBJECT_RV)
+
+$(USER_ELF_FAULT_PROGRAM_RV): $(USER_ELF_FAULT_PROGRAM_OBJECT_RV) \
+		tests/riscv/user_elf.ld
+	$(CC) $(ARCH_FLAGS) -nostdlib -nostartfiles -static -no-pie \
+		-T tests/riscv/user_elf.ld -Wl,--build-id=none \
+		-Wl,--gc-sections -o $@ $(USER_ELF_FAULT_PROGRAM_OBJECT_RV)
+
+$(BUILD_DIR)/tests/riscv/user_elf_images.o: \
+		tests/riscv/user_elf_images.S \
+		$(USER_ELF_PROGRAM_RV) $(USER_ELF_FAULT_PROGRAM_RV)
+	@mkdir -p $(dir $@)
+	$(CC) $(CPPFLAGS) $(ASFLAGS) -MMD -MP -c $< -o $@
+
+$(USER_ELF_TEST_KERNEL_RV): $(USER_ELF_TEST_OBJECTS) arch/riscv/linker.ld
+	$(CC) $(LDFLAGS) -Wl,--wrap=riscv_sv39_activate \
+		-Wl,--wrap=kernel_scheduler_init \
+		-Wl,--wrap=kernel_scheduler_reap_one \
+		-Wl,--wrap=kernel_tick_advance \
+		-Wl,-Map,$(BUILD_DIR)/tests/kernel-user-elf-rv.map \
+		-o $@ $(USER_ELF_TEST_OBJECTS)
 
 $(USER_TEST_KERNEL_RV): $(USER_TEST_OBJECTS) arch/riscv/linker.ld
 	$(CC) $(LDFLAGS) -Wl,--wrap=riscv_sv39_activate \
@@ -471,6 +522,14 @@ test-elf64-riscv: $(ELF64_TEST_KERNEL_RV)
 test-user-elf-cases-riscv: $(USER_ELF_CASES_TEST_KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) USER_ELF_CASES_TEST_KERNEL_RV=$< \
 		./tests/user-elf-cases-riscv.sh
+
+test-user-elf-riscv: $(USER_ELF_TEST_KERNEL_RV) \
+		$(USER_ELF_PROGRAM_RV) $(USER_ELF_FAULT_PROGRAM_RV)
+	QEMU_RISCV64=$(QEMU_RISCV64) READELF_RV=$(READELF) \
+		USER_ELF_TEST_KERNEL_RV=$(USER_ELF_TEST_KERNEL_RV) \
+		USER_ELF_PROGRAM_RV=$(USER_ELF_PROGRAM_RV) \
+		USER_ELF_FAULT_PROGRAM_RV=$(USER_ELF_FAULT_PROGRAM_RV) \
+		./tests/user-elf-riscv.sh
 
 test-user-riscv: $(USER_TEST_KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) USER_TEST_KERNEL_RV=$< \
