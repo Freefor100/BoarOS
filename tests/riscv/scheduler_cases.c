@@ -1,5 +1,6 @@
 #include <arch/riscv/context.h>
 #include <arch/riscv/sbi.h>
+#include <arch/riscv/thread.h>
 #include <arch/riscv/virt_uart.h>
 #include <kernel/page.h>
 #include <kernel/physical_page.h>
@@ -20,6 +21,10 @@ static uintptr_t entry_sp[TEST_PAGE_COUNT];
 static void *entry_tp[TEST_PAGE_COUNT];
 static uintptr_t entry_order[TEST_PAGE_COUNT];
 static unsigned long entry_count;
+
+_Static_assert(RISCV_THREAD_STATE_KERNEL_SP ==
+                   offsetof(struct riscv_thread_state, kernel_sp),
+               "RISC-V thread kernel-sp offset mismatch");
 
 static void *scheduler_page_access(uint64_t physical_address)
 {
@@ -58,7 +63,12 @@ static unsigned long expect_status(
 
 static unsigned long run_preinit_cases(void)
 {
-    uint64_t reaped = UINT64_C(0x1122334455667788);
+    struct kernel_thread_completion completion = {
+        .kind = (enum kernel_thread_kind)0x11,
+        .reason = (enum kernel_thread_exit_reason)0x22,
+        .status = UINT64_C(0x33445566778899aa),
+        .detail = UINT64_C(0xbbccddeeff001122),
+    };
     unsigned long failures = 0U;
 
     failures += expect_status(KERNEL_SCHEDULER_STATUS_NOT_INITIALIZED,
@@ -66,8 +76,11 @@ static unsigned long run_preinit_cases(void)
     failures += expect_status(KERNEL_SCHEDULER_STATUS_NOT_INITIALIZED,
                               kernel_scheduler_on_tick(1U));
     failures += expect_status(KERNEL_SCHEDULER_STATUS_NOT_INITIALIZED,
-                              kernel_scheduler_reap_exited(&reaped));
-    if (reaped != UINT64_C(0x1122334455667788)) {
+                              kernel_scheduler_reap_one(&completion));
+    if (completion.kind != (enum kernel_thread_kind)0x11 ||
+        completion.reason != (enum kernel_thread_exit_reason)0x22 ||
+        completion.status != UINT64_C(0x33445566778899aa) ||
+        completion.detail != UINT64_C(0xbbccddeeff001122)) {
         failures++;
     }
 
@@ -131,7 +144,12 @@ static unsigned long run_init_cases(
 
 static unsigned long run_idle_cases(void)
 {
-    uint64_t reaped = UINT64_C(0xa5a5a5a5a5a5a5a5);
+    struct kernel_thread_completion completion = {
+        .kind = (enum kernel_thread_kind)0x33,
+        .reason = (enum kernel_thread_exit_reason)0x44,
+        .status = UINT64_C(0x5566778899aabbcc),
+        .detail = UINT64_C(0xddeeff0011223344),
+    };
     unsigned long failures = 0U;
 
     failures += expect_status(KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT,
@@ -140,20 +158,23 @@ static unsigned long run_idle_cases(void)
                               kernel_scheduler_on_tick(0U));
     failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
                               kernel_scheduler_on_tick(1U));
-    failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
-                              kernel_scheduler_reap_exited(&reaped));
-    if (reaped != 0U) {
+    failures += expect_status(KERNEL_SCHEDULER_STATUS_EMPTY,
+                              kernel_scheduler_reap_one(&completion));
+    if (completion.kind != (enum kernel_thread_kind)0x33 ||
+        completion.reason != (enum kernel_thread_exit_reason)0x44 ||
+        completion.status != UINT64_C(0x5566778899aabbcc) ||
+        completion.detail != UINT64_C(0xddeeff0011223344)) {
         failures++;
     }
 
     __asm__ volatile("csrsi sstatus, 2" ::: "memory");
     failures += expect_status(KERNEL_SCHEDULER_STATUS_INVALID_STATE,
                               kernel_scheduler_on_tick(1U));
-    reaped = UINT64_C(0x8877665544332211);
+    completion.status = UINT64_C(0x8877665544332211);
     failures += expect_status(KERNEL_SCHEDULER_STATUS_INVALID_STATE,
-                              kernel_scheduler_reap_exited(&reaped));
+                              kernel_scheduler_reap_one(&completion));
     __asm__ volatile("csrci sstatus, 2" ::: "memory");
-    if (reaped != UINT64_C(0x8877665544332211)) {
+    if (completion.status != UINT64_C(0x8877665544332211)) {
         failures++;
     }
 
@@ -164,7 +185,7 @@ static unsigned long run_create_cases(
     struct physical_page_allocator *allocator)
 {
     uint64_t initial_available = physical_page_available(allocator);
-    uint64_t reaped = UINT64_C(0x1122334455667788);
+    struct kernel_thread_completion completion;
     unsigned long failures = 0U;
 
     fail_next_access = 1U;
@@ -199,9 +220,42 @@ static unsigned long run_create_cases(
             (entry_sp[1] & ~(uintptr_t)BOAROS_PAGE_MASK)) {
         failures++;
     }
+    completion.kind = (enum kernel_thread_kind)0x55;
+    completion.reason = (enum kernel_thread_exit_reason)0x66;
+    completion.status = UINT64_MAX;
+    completion.detail = UINT64_MAX;
     failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
-                              kernel_scheduler_reap_exited(&reaped));
-    if (reaped != TEST_PAGE_COUNT ||
+                              kernel_scheduler_reap_one(&completion));
+    if (completion.kind != KERNEL_THREAD_KIND_KERNEL ||
+        completion.reason != KERNEL_THREAD_EXIT_RETURNED ||
+        completion.status != 0U || completion.detail != 0U ||
+        physical_page_available(allocator) != initial_available - 1U) {
+        failures++;
+    }
+
+    completion.kind = (enum kernel_thread_kind)0x77;
+    completion.reason = (enum kernel_thread_exit_reason)0x88;
+    completion.status = UINT64_MAX;
+    completion.detail = UINT64_MAX;
+    failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
+                              kernel_scheduler_reap_one(&completion));
+    if (completion.kind != KERNEL_THREAD_KIND_KERNEL ||
+        completion.reason != KERNEL_THREAD_EXIT_RETURNED ||
+        completion.status != 0U || completion.detail != 0U ||
+        physical_page_available(allocator) != initial_available) {
+        failures++;
+    }
+
+    completion.kind = (enum kernel_thread_kind)0x99;
+    completion.reason = (enum kernel_thread_exit_reason)0xaa;
+    completion.status = UINT64_C(0xbbccddeeff001122);
+    completion.detail = UINT64_C(0x33445566778899aa);
+    failures += expect_status(KERNEL_SCHEDULER_STATUS_EMPTY,
+                              kernel_scheduler_reap_one(&completion));
+    if (completion.kind != (enum kernel_thread_kind)0x99 ||
+        completion.reason != (enum kernel_thread_exit_reason)0xaa ||
+        completion.status != UINT64_C(0xbbccddeeff001122) ||
+        completion.detail != UINT64_C(0x33445566778899aa) ||
         physical_page_available(allocator) != initial_available) {
         failures++;
     }

@@ -7,6 +7,7 @@
 
 enum kernel_scheduler_status {
     KERNEL_SCHEDULER_STATUS_OK = 0,
+    KERNEL_SCHEDULER_STATUS_EMPTY,
     KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT,
     KERNEL_SCHEDULER_STATUS_NOT_INITIALIZED,
     KERNEL_SCHEDULER_STATUS_ALREADY_INITIALIZED,
@@ -16,6 +17,24 @@ enum kernel_scheduler_status {
     KERNEL_SCHEDULER_STATUS_QUEUE_CORRUPT,
     KERNEL_SCHEDULER_STATUS_STACK_CORRUPT,
     KERNEL_SCHEDULER_STATUS_PAGE_RELEASE,
+};
+
+enum kernel_thread_kind {
+    KERNEL_THREAD_KIND_KERNEL = 0,
+    KERNEL_THREAD_KIND_USER,
+};
+
+enum kernel_thread_exit_reason {
+    KERNEL_THREAD_EXIT_RETURNED = 0,
+    KERNEL_THREAD_EXIT_SYSCALL,
+    KERNEL_THREAD_EXIT_USER_FAULT,
+};
+
+struct kernel_thread_completion {
+    enum kernel_thread_kind kind;
+    enum kernel_thread_exit_reason reason;
+    uint64_t status;
+    uint64_t detail;
 };
 
 enum kernel_scheduler_status kernel_scheduler_init(
@@ -30,8 +49,8 @@ enum kernel_scheduler_status kernel_thread_create(
 enum kernel_scheduler_status kernel_scheduler_on_tick(
     uint64_t elapsed_ticks);
 
-enum kernel_scheduler_status kernel_scheduler_reap_exited(
-    uint64_t *reaped_count);
+enum kernel_scheduler_status kernel_scheduler_reap_one(
+    struct kernel_thread_completion *completion);
 
 void kernel_thread_exit(void) __attribute__((noreturn));
 

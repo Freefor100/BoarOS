@@ -7,6 +7,7 @@
 | 文件 | 当前职责 |
 |---|---|
 | `include/arch/riscv/context.h`、`arch/riscv/context.c` | 定义并初始化 RISC-V switch context，提供当前 `tp` 和 SIE 临界区操作 |
+| `include/arch/riscv/thread.h` | 定义位于 scheduler thread 对象首部、供 Trap 汇编访问的固定 RISC-V 线程状态前缀 |
 | `arch/riscv/context_switch.S` | 保存/恢复 `ra`、`sp`、`tp`、`s0..s11`，首次进入线程 trampoline |
 | `include/kernel/scheduler.h`、`kernel/scheduler.c` | 管理静态 idle、普通内核线程、FIFO ready/exited 队列和页所有权 |
 | `arch/riscv/trap.c` | 在 timer backend 和 tick 计数成功后调用 scheduler |
@@ -47,11 +48,13 @@ enum kernel_scheduler_status kernel_thread_create(
 enum kernel_scheduler_status kernel_scheduler_on_tick(
     uint64_t elapsed_ticks);
 
-enum kernel_scheduler_status kernel_scheduler_reap_exited(
-    uint64_t *reaped_count);
+enum kernel_scheduler_status kernel_scheduler_reap_one(
+    struct kernel_thread_completion *completion);
 ```
 
-错误状态区分非法参数、未初始化、重复初始化、内存耗尽、页访问失败、非法状态、队列损坏、栈损坏和页释放失败。失败输出参数保持不变；创建在提交 ready queue 前失败时释放已经取得的页，回滚释放本身失败则保留精确的页释放错误。
+`kernel_scheduler_reap_one()` 每次只回收 exited FIFO 的一个线程，并返回其完成记录。记录区分内核/用户线程以及入口返回、退出系统调用和用户态故障，`status`、`detail` 保存具体完成信息；当前内核线程入口返回产生 `{kernel, returned, 0, 0}`。队列为空返回 `KERNEL_SCHEDULER_STATUS_EMPTY`，不把空队列伪装成成功。
+
+错误状态还区分非法参数、未初始化、重复初始化、内存耗尽、页访问失败、非法状态、队列损坏、栈损坏和页释放失败。失败或队列为空时输出参数保持不变；创建在提交 ready queue 前失败时释放已经取得的页，回滚释放本身失败则保留精确的页释放错误。
 
 ## 初始化、当前线程和临界区
 
@@ -62,12 +65,12 @@ final Sv39/direct map
 -> 绑定物理页访问
 -> scheduler_init(boot stack bounds)
 -> timer_start
--> boot idle: reap exited -> wfi
+-> boot idle: reap one until EMPTY -> wfi
 ```
 
 初始化只允许一次，要求当前 SP 位于传入的 boot stack、SIE 已关闭且物理页分配器有效。成功后静态 idle 成为 current，并把 `tp` 设置为 idle 对象。BoarOS 内核 ABI 固定 `tp=current kernel thread`；当前不使用 C TLS，也不允许外部通过 `sp` 页对齐推导线程对象。
 
-`kernel_thread_create()` 自己保存并关闭 SIE，完成验证、分配和入队后恢复调用者原来的 SIE 状态。`kernel_scheduler_on_tick()` 和 `kernel_scheduler_reap_exited()` 只在 SIE 已关闭时调用；timer trap 天然满足这一点，boot idle 则显式保存/关闭/恢复 SIE。该排他方式只对单 hart 成立，不代表已经具备 SMP 并发安全。
+`kernel_thread_create()` 自己保存并关闭 SIE，完成验证、分配和入队后恢复调用者原来的 SIE 状态。`kernel_scheduler_on_tick()` 和 `kernel_scheduler_reap_one()` 只在 SIE 已关闭时调用；timer trap 天然满足这一点，boot idle 则显式保存/关闭/恢复 SIE。该排他方式只对单 hart 成立，不代表已经具备 SMP 并发安全。
 
 ## 状态、时间片与切换
 
@@ -76,7 +79,7 @@ final Sv39/direct map
 ```text
 allocate -> READY -> RUNNING -> READY
                          |
-                         +-> EXITED -> idle reap -> physical release
+                         +-> EXITED -> idle reap one -> physical release
 IDLE <------- ready empty / last running thread exits
 ```
 
@@ -88,7 +91,9 @@ Trap Frame 已保存被中断点的全部整数现场，switch context 只保存
 
 每个普通线程当前占用一个由物理页分配器提供的 4 KiB 页。页内私有保存线程元数据、switch context、栈 canary 和向下增长的内核栈；栈顶保持 16 字节对齐。该布局不公开，不是通用 scheduler ABI，因此以后可以在模块内部换成独立控制块、多页栈或 guard page。
 
-入口返回时页仍承载当前 SP，不能立即释放。退出路径关闭 SIE，把线程移到 exited 队列，再把无需恢复的现场写入 scheduler 私有 discard context，切到下一个 READY 或此前保存过的 boot idle。idle 在自己的静态栈上逐页释放 exited；释放失败时不丢失尚未释放节点的所有权。
+入口返回时页仍承载当前 SP，不能立即释放。退出路径关闭 SIE，把完成记录随线程移到 exited 队列，再把无需恢复的现场写入 scheduler 私有 discard context，切到下一个 READY 或此前保存过的 boot idle。idle 在自己的静态栈上按 FIFO 每次复制一条完成记录并释放一页；只有释放成功才移除队首，因而释放失败不会丢失线程所有权，连续退出也不会合并或覆盖完成原因。
+
+每个 scheduler thread 以 `struct riscv_thread_state` 开头，当前固定字段只有 Trap 入口需要的 `kernel_sp`。该前缀的偏移和大小同时由 C 静态断言与测试约束；内核线程的 `kernel_sp` 等于其栈顶。其余 scheduler 私有元数据不属于汇编 ABI。
 
 调度前检查 current/`tp`、状态、栈边界、canary 和队列首尾。timer 路径发现错误时把精确 scheduler 状态交给 trap fatal 诊断。线程退出无法返回错误；若它发现不可恢复的不变量损坏，则锁存首个 fatal 状态并通过 discard context 切回已保存的 idle，由原 timer 调用链报告错误，不在可疑线程栈上继续运行或释放所有权不明的页。
 
@@ -101,6 +106,6 @@ make test-scheduler-riscv
 make test-riscv
 ```
 
-context runner 检查最终对象的保存/恢复偏移，拒绝把 caller-saved、`gp` 或其他共享状态塞入 switch context。状态测试覆盖初始化前调用、失败初始化、SIE 前置条件、空队列、创建失败回滚、耗尽、FIFO 入口返回、exit-to-idle 和两页回收。真实抢占测试创建两个从不 yield 的汇编线程，验证 timer-only 的 A -> B -> A、独立 `sp/tp`、`s0..s11` 哨兵、返回退出、boot idle 恢复和空闲页计数复原；生产 ELF 不含这些 worker。
+context runner 检查最终对象的保存/恢复偏移，拒绝把 caller-saved、`gp` 或其他共享状态塞入 switch context。状态测试覆盖初始化前调用、失败初始化、SIE 前置条件、空队列输出不变、创建失败回滚、耗尽、FIFO 入口返回、两条独立完成记录和逐页回收。真实抢占测试创建两个从不 yield 的汇编线程，验证 timer-only 的 A -> B -> A、独立 `sp/tp`、`s0..s11` 哨兵、返回退出、boot idle 恢复和空闲页计数复原；生产 ELF 不含这些 worker。
 
 当前限制为 RISC-V64 单 hart、一个 tick 时间片、FIFO、4 KiB 单页栈和 canary 检测。尚无用户任务/地址空间切换、BLOCKED/sleep/wait/join、主动 yield、优先级、SMP 锁与 per-hart runqueue、guard page、多页栈、F/V 上下文或 LoongArch switch context。

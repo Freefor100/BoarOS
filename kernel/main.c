@@ -665,11 +665,13 @@ void kernel_main(unsigned long hart_id, const void *dtb)
 
     for (;;) {
         uintptr_t interrupt_status = riscv_interrupt_save();
-        uint64_t reaped_count;
+        struct kernel_thread_completion completion;
 
-        scheduler_status = kernel_scheduler_reap_exited(&reaped_count);
+        do {
+            scheduler_status = kernel_scheduler_reap_one(&completion);
+        } while (scheduler_status == KERNEL_SCHEDULER_STATUS_OK);
         riscv_interrupt_restore(interrupt_status);
-        if (scheduler_status != KERNEL_SCHEDULER_STATUS_OK) {
+        if (scheduler_status != KERNEL_SCHEDULER_STATUS_EMPTY) {
             shutdown_for_scheduler_error(scheduler_status);
         }
         asm volatile("wfi");

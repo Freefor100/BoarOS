@@ -1,4 +1,5 @@
 #include <arch/riscv/context.h>
+#include <arch/riscv/thread.h>
 #include <kernel/page.h>
 #include <kernel/physical_page.h>
 #include <kernel/scheduler.h>
@@ -20,6 +21,7 @@ enum kernel_thread_state {
 };
 
 struct kernel_thread {
+    struct riscv_thread_state arch;
     uint64_t magic;
     uint64_t physical_address;
     uintptr_t stack_low;
@@ -27,6 +29,7 @@ struct kernel_thread {
     struct kernel_thread *next;
     uint32_t state;
     uint32_t idle;
+    struct kernel_thread_completion completion;
     struct riscv_switch_context context;
 } __attribute__((aligned(16)));
 
@@ -50,6 +53,8 @@ _Static_assert(sizeof(struct kernel_thread) + sizeof(uint64_t) +
                        KERNEL_THREAD_MINIMUM_STACK <=
                    BOAROS_PAGE_SIZE,
                "kernel thread metadata leaves too little stack");
+_Static_assert(offsetof(struct kernel_thread, arch) == 0U,
+               "RISC-V thread state must prefix the scheduler thread");
 
 static uintptr_t current_sp(void)
 {
@@ -93,7 +98,8 @@ static enum kernel_scheduler_status validate_thread(
         if (thread != &scheduler.idle ||
             expected_state != KERNEL_THREAD_STATE_IDLE ||
             thread->physical_address != KERNEL_THREAD_NO_PAGE ||
-            thread->stack_low >= thread->stack_high) {
+            thread->stack_low >= thread->stack_high ||
+            thread->arch.kernel_sp != thread->stack_high) {
             return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
         }
         return KERNEL_SCHEDULER_STATUS_OK;
@@ -109,6 +115,7 @@ static enum kernel_scheduler_status validate_thread(
     if (thread->stack_low != expected_low ||
         thread->stack_high != base + BOAROS_PAGE_SIZE ||
         thread->context.tp != base ||
+        thread->arch.kernel_sp != thread->stack_high ||
         thread->context.sp < thread->stack_low ||
         thread->context.sp > thread->stack_high ||
         (thread->context.sp & (uintptr_t)15U) != 0U) {
@@ -268,6 +275,7 @@ enum kernel_scheduler_status kernel_scheduler_init(
     }
 
     scheduler.allocator = allocator;
+    scheduler.idle.arch.kernel_sp = idle_stack_high;
     scheduler.idle.magic = KERNEL_THREAD_MAGIC;
     scheduler.idle.physical_address = KERNEL_THREAD_NO_PAGE;
     scheduler.idle.stack_low = idle_stack_low;
@@ -275,6 +283,10 @@ enum kernel_scheduler_status kernel_scheduler_init(
     scheduler.idle.next = 0;
     scheduler.idle.state = KERNEL_THREAD_STATE_IDLE;
     scheduler.idle.idle = 1U;
+    scheduler.idle.completion.kind = KERNEL_THREAD_KIND_KERNEL;
+    scheduler.idle.completion.reason = KERNEL_THREAD_EXIT_RETURNED;
+    scheduler.idle.completion.status = 0U;
+    scheduler.idle.completion.detail = 0U;
     scheduler.current = &scheduler.idle;
     scheduler.ready_head = 0;
     scheduler.ready_tail = 0;
@@ -345,6 +357,7 @@ enum kernel_scheduler_status kernel_thread_create(
     thread = page;
     stack_low = align_up_16((uintptr_t)thread + sizeof(*thread) +
                             sizeof(uint64_t));
+    thread->arch.kernel_sp = (uintptr_t)thread + BOAROS_PAGE_SIZE;
     thread->magic = KERNEL_THREAD_MAGIC;
     thread->physical_address = physical_address;
     thread->stack_low = stack_low;
@@ -352,6 +365,10 @@ enum kernel_scheduler_status kernel_thread_create(
     thread->next = 0;
     thread->state = KERNEL_THREAD_STATE_READY;
     thread->idle = 0U;
+    thread->completion.kind = KERNEL_THREAD_KIND_KERNEL;
+    thread->completion.reason = KERNEL_THREAD_EXIT_RETURNED;
+    thread->completion.status = 0U;
+    thread->completion.detail = 0U;
     *(uint64_t *)(stack_low - sizeof(uint64_t)) = KERNEL_STACK_CANARY;
     context_status = riscv_context_init(&thread->context,
                                         thread->stack_high,
@@ -419,16 +436,18 @@ enum kernel_scheduler_status kernel_scheduler_on_tick(
     return validate_current();
 }
 
-enum kernel_scheduler_status kernel_scheduler_reap_exited(
-    uint64_t *reaped_count)
+enum kernel_scheduler_status kernel_scheduler_reap_one(
+    struct kernel_thread_completion *completion)
 {
-    uint64_t count = 0U;
+    struct kernel_thread_completion result;
+    struct kernel_thread *thread;
+    struct kernel_thread *next;
     enum kernel_scheduler_status status;
 
     if (scheduler.initialized != KERNEL_SCHEDULER_INITIALIZED) {
         return KERNEL_SCHEDULER_STATUS_NOT_INITIALIZED;
     }
-    if (reaped_count == 0) {
+    if (completion == 0) {
         return KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
     }
     if (riscv_interrupt_is_enabled()) {
@@ -449,27 +468,32 @@ enum kernel_scheduler_status kernel_scheduler_reap_exited(
         return status;
     }
 
-    while (scheduler.exited_head != 0) {
-        struct kernel_thread *thread = scheduler.exited_head;
-        struct kernel_thread *next = thread->next;
-
-        status = validate_thread(thread, KERNEL_THREAD_STATE_EXITED);
-        if (status != KERNEL_SCHEDULER_STATUS_OK) {
-            return status;
-        }
-        if (physical_page_release(scheduler.allocator,
-                                  thread->physical_address) !=
-            PHYSICAL_PAGE_STATUS_OK) {
-            return KERNEL_SCHEDULER_STATUS_PAGE_RELEASE;
-        }
-        scheduler.exited_head = next;
-        if (next == 0) {
-            scheduler.exited_tail = 0;
-        }
-        count++;
+    if (scheduler.exited_head == 0) {
+        return KERNEL_SCHEDULER_STATUS_EMPTY;
     }
 
-    *reaped_count = count;
+    thread = scheduler.exited_head;
+    next = thread->next;
+    status = validate_thread(thread, KERNEL_THREAD_STATE_EXITED);
+    if (status != KERNEL_SCHEDULER_STATUS_OK) {
+        return status;
+    }
+    result = thread->completion;
+    if (result.kind != KERNEL_THREAD_KIND_KERNEL ||
+        result.reason != KERNEL_THREAD_EXIT_RETURNED ||
+        result.status != 0U || result.detail != 0U) {
+        return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
+    }
+    if (physical_page_release(scheduler.allocator,
+                              thread->physical_address) !=
+        PHYSICAL_PAGE_STATUS_OK) {
+        return KERNEL_SCHEDULER_STATUS_PAGE_RELEASE;
+    }
+    scheduler.exited_head = next;
+    if (next == 0) {
+        scheduler.exited_tail = 0;
+    }
+    *completion = result;
     return KERNEL_SCHEDULER_STATUS_OK;
 }
 
