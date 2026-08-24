@@ -21,6 +21,10 @@ static uint64_t model_page_pool[TEST_POOL_WORDS(16U)]
     __attribute__((aligned(BOAROS_PAGE_SIZE)));
 static uint64_t single_page_pool[TEST_POOL_WORDS(1U)]
     __attribute__((aligned(BOAROS_PAGE_SIZE)));
+static uint64_t user_space_page_pool[TEST_POOL_WORDS(16U)]
+    __attribute__((aligned(BOAROS_PAGE_SIZE)));
+static uint64_t user_space_oom_pool[TEST_POOL_WORDS(4U)]
+    __attribute__((aligned(BOAROS_PAGE_SIZE)));
 
 static void *identity_page_access(uint64_t address)
 {
@@ -45,6 +49,7 @@ static enum physical_page_status init_test_page_allocator(
 #define TEST_PTE_READ UINT64_C(0x002)
 #define TEST_PTE_WRITE UINT64_C(0x004)
 #define TEST_PTE_EXECUTE UINT64_C(0x008)
+#define TEST_PTE_USER UINT64_C(0x010)
 #define TEST_PTE_RWX \
     (TEST_PTE_READ | TEST_PTE_WRITE | TEST_PTE_EXECUTE)
 #define TEST_PTE_FLAGS UINT64_C(0x3ff)
@@ -85,6 +90,9 @@ static uint32_t test_permissions(uint64_t entry)
     }
     if ((entry & TEST_PTE_EXECUTE) != 0U) {
         permissions |= RISCV_SV39_EXECUTE;
+    }
+    if ((entry & TEST_PTE_USER) != 0U) {
+        permissions |= RISCV_SV39_USER;
     }
 
     return permissions;
@@ -472,6 +480,213 @@ static int test_model_and_boundaries(void)
     return 0;
 }
 
+static int test_user_space_lifecycle(void)
+{
+    const uint64_t code_va = UINT64_C(0x10000);
+    const uint64_t stack_va = UINT64_C(0x3ffffff000);
+    const uint64_t kernel_va = UINT64_C(0xffffffc000000000);
+    struct boot_memory_layout layout;
+    struct physical_page_allocator allocator;
+    struct riscv_sv39_page_table kernel_table;
+    struct riscv_sv39_user_space source = {0};
+    struct riscv_sv39_user_space destination = {0};
+    struct riscv_sv39_mapping mapping;
+    uint64_t *kernel_root;
+    uint64_t *user_root;
+    uint64_t kernel_high_entry;
+    uint64_t code_page;
+    uint64_t stack_page;
+    uint64_t rejected_page;
+    uint64_t conflict_page;
+    uint64_t available_before_invalid;
+
+    layout.usable_count = 1U;
+    layout.usable[0].base = (uint64_t)(uintptr_t)user_space_page_pool;
+    layout.usable[0].size = sizeof(user_space_page_pool);
+    reset_page_table(&kernel_table);
+    if (init_test_page_allocator(&allocator, &layout) !=
+            PHYSICAL_PAGE_STATUS_OK ||
+        riscv_sv39_page_table_init(&kernel_table, &allocator) !=
+            RISCV_SV39_STATUS_OK ||
+        riscv_sv39_map_range(&kernel_table,
+                             kernel_va,
+                             UINT64_C(0x200000),
+                             RISCV_SV39_PAGE_SIZE_4K,
+                             RISCV_SV39_READ | RISCV_SV39_EXECUTE) !=
+            RISCV_SV39_STATUS_OK) {
+        return 44;
+    }
+    kernel_table.state = RISCV_SV39_STATE_ACTIVE;
+    kernel_root = (uint64_t *)(uintptr_t)kernel_table.root_address;
+    kernel_high_entry = kernel_root[256];
+    if (kernel_high_entry == 0U ||
+        riscv_sv39_user_space_init(&source,
+                                   &allocator,
+                                   &kernel_table) !=
+            RISCV_SV39_STATUS_OK) {
+        return 45;
+    }
+
+    user_root = (uint64_t *)(uintptr_t)source.root_address;
+    if (source.table_pages != 1U || source.leaf_pages != 0U ||
+        user_root[0] != 0U || user_root[255] != 0U ||
+        user_root[256] != kernel_high_entry ||
+        user_root[511] != kernel_root[511]) {
+        return 46;
+    }
+
+    if (physical_page_allocate(&allocator, &rejected_page) !=
+            PHYSICAL_PAGE_STATUS_OK) {
+        return 47;
+    }
+    available_before_invalid = physical_page_available(&allocator);
+    if (riscv_sv39_user_map_owned_page(&source,
+                                       0U,
+                                       rejected_page,
+                                       RISCV_SV39_READ) !=
+            RISCV_SV39_STATUS_INVALID ||
+        riscv_sv39_user_map_owned_page(&source,
+                                       code_va,
+                                       rejected_page,
+                                       RISCV_SV39_WRITE) !=
+            RISCV_SV39_STATUS_INVALID ||
+        source.table_pages != 1U || source.leaf_pages != 0U ||
+        physical_page_available(&allocator) != available_before_invalid ||
+        physical_page_release(&allocator, rejected_page) !=
+            PHYSICAL_PAGE_STATUS_OK) {
+        return 48;
+    }
+
+    if (physical_page_allocate(&allocator, &code_page) !=
+            PHYSICAL_PAGE_STATUS_OK ||
+        riscv_sv39_user_map_owned_page(&source,
+                                       code_va,
+                                       code_page,
+                                       RISCV_SV39_READ |
+                                           RISCV_SV39_EXECUTE) !=
+            RISCV_SV39_STATUS_OK ||
+        riscv_sv39_user_lookup(&source, code_va + UINT64_C(0x321),
+                               &mapping) != RISCV_SV39_STATUS_OK ||
+        mapping.physical_address != code_page + UINT64_C(0x321) ||
+        mapping.permissions != (RISCV_SV39_READ |
+                                RISCV_SV39_EXECUTE |
+                                RISCV_SV39_USER) ||
+        source.table_pages != 3U || source.leaf_pages != 1U) {
+        return 49;
+    }
+
+    if (physical_page_allocate(&allocator, &conflict_page) !=
+            PHYSICAL_PAGE_STATUS_OK) {
+        return 50;
+    }
+    available_before_invalid = physical_page_available(&allocator);
+    if (riscv_sv39_user_map_owned_page(&source,
+                                       code_va,
+                                       conflict_page,
+                                       RISCV_SV39_READ) !=
+            RISCV_SV39_STATUS_CONFLICT ||
+        source.table_pages != 3U || source.leaf_pages != 1U ||
+        physical_page_available(&allocator) != available_before_invalid ||
+        physical_page_release(&allocator, conflict_page) !=
+            PHYSICAL_PAGE_STATUS_OK) {
+        return 51;
+    }
+
+    if (physical_page_allocate(&allocator, &stack_page) !=
+            PHYSICAL_PAGE_STATUS_OK ||
+        riscv_sv39_user_map_owned_page(&source,
+                                       stack_va,
+                                       stack_page,
+                                       RISCV_SV39_READ |
+                                           RISCV_SV39_WRITE) !=
+            RISCV_SV39_STATUS_OK ||
+        riscv_sv39_user_lookup(&source,
+                               stack_va + RISCV_SV39_PAGE_SIZE_4K - 1U,
+                               &mapping) != RISCV_SV39_STATUS_OK ||
+        mapping.physical_address !=
+            stack_page + RISCV_SV39_PAGE_SIZE_4K - 1U ||
+        mapping.permissions != (RISCV_SV39_READ |
+                                RISCV_SV39_WRITE |
+                                RISCV_SV39_USER) ||
+        source.table_pages != 5U || source.leaf_pages != 2U ||
+        riscv_sv39_user_lookup(&source,
+                               stack_va - RISCV_SV39_PAGE_SIZE_4K,
+                               &mapping) != RISCV_SV39_STATUS_NOT_MAPPED) {
+        return 52;
+    }
+
+    if (riscv_sv39_user_space_move(&destination, &source) !=
+            RISCV_SV39_STATUS_OK ||
+        source.state != RISCV_SV39_USER_SPACE_MOVED ||
+        destination.state != RISCV_SV39_USER_SPACE_LIVE ||
+        riscv_sv39_user_lookup(&source, code_va, &mapping) !=
+            RISCV_SV39_STATUS_STATE ||
+        riscv_sv39_user_space_destroy(&source) !=
+            RISCV_SV39_STATUS_STATE ||
+        riscv_sv39_user_space_destroy(&destination) !=
+            RISCV_SV39_STATUS_OK ||
+        destination.state != RISCV_SV39_USER_SPACE_DESTROYED ||
+        physical_page_available(&allocator) !=
+            16U - kernel_table.table_pages ||
+        kernel_root[256] != kernel_high_entry ||
+        !expect_walk(&kernel_table,
+                     kernel_va,
+                     UINT64_C(0x200000),
+                     RISCV_SV39_PAGE_SIZE_4K,
+                     RISCV_SV39_READ | RISCV_SV39_EXECUTE)) {
+        return 53;
+    }
+
+    return 0;
+}
+
+static int test_user_space_oom_rollback(void)
+{
+    struct boot_memory_layout layout;
+    struct physical_page_allocator allocator;
+    struct riscv_sv39_page_table kernel_table;
+    struct riscv_sv39_user_space space = {0};
+    uint64_t leaf_page;
+
+    layout.usable_count = 1U;
+    layout.usable[0].base = (uint64_t)(uintptr_t)user_space_oom_pool;
+    layout.usable[0].size = sizeof(user_space_oom_pool);
+    reset_page_table(&kernel_table);
+    if (init_test_page_allocator(&allocator, &layout) !=
+            PHYSICAL_PAGE_STATUS_OK ||
+        riscv_sv39_page_table_init(&kernel_table, &allocator) !=
+            RISCV_SV39_STATUS_OK) {
+        return 54;
+    }
+    kernel_table.state = RISCV_SV39_STATE_ACTIVE;
+    if (riscv_sv39_user_space_init(&space,
+                                   &allocator,
+                                   &kernel_table) !=
+            RISCV_SV39_STATUS_OK ||
+        physical_page_allocate(&allocator, &leaf_page) !=
+            PHYSICAL_PAGE_STATUS_OK ||
+        physical_page_available(&allocator) != 1U) {
+        return 55;
+    }
+
+    if (riscv_sv39_user_map_owned_page(&space,
+                                       UINT64_C(0x10000),
+                                       leaf_page,
+                                       RISCV_SV39_READ) !=
+            RISCV_SV39_STATUS_NO_MEMORY ||
+        space.table_pages != 1U || space.leaf_pages != 0U ||
+        physical_page_available(&allocator) != 1U ||
+        physical_page_release(&allocator, leaf_page) !=
+            PHYSICAL_PAGE_STATUS_OK ||
+        riscv_sv39_user_space_destroy(&space) !=
+            RISCV_SV39_STATUS_OK ||
+        physical_page_available(&allocator) != 3U) {
+        return 56;
+    }
+
+    return 0;
+}
+
 int run_sv39_tests(void)
 {
     struct physical_page_allocator allocator;
@@ -702,6 +917,16 @@ int run_sv39_tests(void)
     }
 
     result = test_lifecycle_states();
+    if (result != 0) {
+        return result;
+    }
+
+    result = test_user_space_lifecycle();
+    if (result != 0) {
+        return result;
+    }
+
+    result = test_user_space_oom_rollback();
     if (result != 0) {
         return result;
     }

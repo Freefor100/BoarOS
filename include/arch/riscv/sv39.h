@@ -11,6 +11,7 @@
 #define RISCV_SV39_READ (UINT32_C(1) << 0U)
 #define RISCV_SV39_WRITE (UINT32_C(1) << 1U)
 #define RISCV_SV39_EXECUTE (UINT32_C(1) << 2U)
+#define RISCV_SV39_USER (UINT32_C(1) << 3U)
 
 enum riscv_sv39_status {
     RISCV_SV39_STATUS_OK = 0,
@@ -18,6 +19,7 @@ enum riscv_sv39_status {
     RISCV_SV39_STATUS_NO_MEMORY,
     RISCV_SV39_STATUS_CONFLICT,
     RISCV_SV39_STATUS_STATE,
+    RISCV_SV39_STATUS_NOT_MAPPED,
 };
 
 enum riscv_sv39_page_table_state {
@@ -34,6 +36,26 @@ struct riscv_sv39_page_table {
     uint64_t leaf_4k;
     uint64_t leaf_2m;
     enum riscv_sv39_page_table_state state;
+};
+
+enum riscv_sv39_user_space_state {
+    RISCV_SV39_USER_SPACE_EMPTY = 0,
+    RISCV_SV39_USER_SPACE_LIVE,
+    RISCV_SV39_USER_SPACE_MOVED,
+    RISCV_SV39_USER_SPACE_DESTROYED,
+};
+
+struct riscv_sv39_user_space {
+    struct physical_page_allocator *allocator;
+    uint64_t root_address;
+    uint64_t table_pages;
+    uint64_t leaf_pages;
+    enum riscv_sv39_user_space_state state;
+};
+
+struct riscv_sv39_mapping {
+    uint64_t physical_address;
+    uint32_t permissions;
 };
 
 /* The table object must be zero-initialized before its first initialization. */
@@ -59,5 +81,32 @@ enum riscv_sv39_status riscv_sv39_activate(
     struct riscv_sv39_page_table *table);
 
 uint64_t riscv_sv39_current_satp(void);
+
+/* The user-space object and kernel table must use the same allocator. */
+enum riscv_sv39_status riscv_sv39_user_space_init(
+    struct riscv_sv39_user_space *space,
+    struct physical_page_allocator *allocator,
+    const struct riscv_sv39_page_table *kernel_table);
+
+/* Success transfers ownership of physical_address to space. */
+enum riscv_sv39_status riscv_sv39_user_map_owned_page(
+    struct riscv_sv39_user_space *space,
+    uint64_t virtual_address,
+    uint64_t physical_address,
+    uint32_t permissions);
+
+enum riscv_sv39_status riscv_sv39_user_lookup(
+    const struct riscv_sv39_user_space *space,
+    uint64_t virtual_address,
+    struct riscv_sv39_mapping *mapping);
+
+/* Success consumes source; failure leaves both objects unchanged. */
+enum riscv_sv39_status riscv_sv39_user_space_move(
+    struct riscv_sv39_user_space *destination,
+    struct riscv_sv39_user_space *source);
+
+/* The active satp root cannot be destroyed. */
+enum riscv_sv39_status riscv_sv39_user_space_destroy(
+    struct riscv_sv39_user_space *space);
 
 #endif
