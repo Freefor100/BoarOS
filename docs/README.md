@@ -15,12 +15,14 @@
 | [DTB 与启动内存布局模块](modules/dtb-memory.md) | RAM、静态保留区与可用物理区间的接口和限制 |
 | [物理页分配模块](modules/physical-pages.md) | 构建期页粒度、单页分配/释放契约和限制 |
 | [RISC-V Sv39 分页模块](modules/riscv-sv39.md) | 启动建表、运行期用户根、SATP 切换、所有权和失败语义 |
+| [用户 ELF64 装载模块](modules/user-elf.md) | 有界 ELF64 解析、RISC-V 静态映像物化、权限和失败所有权契约 |
 | [RISC-V 启动学习总结](learning/riscv-boot.md) | 启动知识、BoarOS 的应用方式、平台差异和调试经验 |
 | [RISC-V Trap 学习总结](learning/riscv-traps.md) | Trap CSR、上下文保存、异常返回、中断确认和项目选择 |
 | [RISC-V 时间与周期 Tick 学习总结](learning/riscv-time.md) | timebase、clockevent、SBI/Sstc、周期 tick、性能和平台事实 |
 | [内核线程与抢占调度学习总结](learning/kernel-scheduling.md) | Trap/switch context、psABI、线程状态、栈所有权和 timer 抢占 |
 | [内存管理学习总结](learning/memory-management.md) | 内存与分页知识、架构能力、项目选择和验证依据 |
 | [RISC-V 用户态与系统调用学习总结](learning/riscv-user-mode.md) | 特权边界、首次进入、地址空间、系统调用 ABI 和故障隔离 |
+| [ELF 用户程序装载学习总结](learning/elf-loading.md) | ELF 形态、装载段、BSS、页权限、用户初始栈和比赛输入依据 |
 | [第三方代码](third-party.md) | 实际引入的外部源码、版本与许可 |
 
 `modules/` 保存当前实现的稳定事实，接口或不变量变化时同步更新。`learning/` 保存开发过程中值得集中复习的知识、已经确定的项目选择及理由、架构或板级资料依据，以及可复用的验证和调试经验；它不保存未确认方案、TODO、临时 plan 或流水账。根目录 `README.md` 记录当前能力、运行入口和近期方向。每个可独立验证的子系统阶段结束时都要主动检查这三类文档，而不是等到人再次提问，也不是每个提交都追加流水账。

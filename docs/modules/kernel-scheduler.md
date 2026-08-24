@@ -16,6 +16,7 @@
 | `tests/riscv/scheduler_cases.c`、`tests/scheduler-cases-riscv.sh` | 验证状态、失败原子性、FIFO、退出和页回收 |
 | `tests/riscv/scheduler_boot.c`、`scheduler_workers.S`、`tests/scheduler-riscv.sh` | 用真实 timer 验证不主动让出的两个线程被抢占和恢复 |
 | `tests/riscv/user_boot.c`、`user_payload.S`、`tests/user-riscv.sh` | 验证 U-mode 任务、跨 `satp` 调度、退出/故障记录和完整回收 |
+| `tests/riscv/user_elf_boot.c`、`user_elf_program.S`、`tests/user-elf-riscv.sh` | 把装载器产出的地址空间交给 scheduler，运行完整静态 ELF |
 
 架构 context 接口为：
 
@@ -68,6 +69,8 @@ enum kernel_scheduler_status kernel_scheduler_reap_one(
 
 用户任务创建要求入口至少按压缩指令的 2 字节 IALIGN 对齐并落在 U+X 页，用户 SP 按 psABI 的 16 字节边界对齐且 `stack_pointer-1` 落在 U+R+W 页，地址空间还必须与 scheduler 使用同一分配器。成功把地址空间从调用者 move 到任务；失败不转移所有权。错误状态还区分页表/`satp` 状态，失败或队列为空时输出参数保持不变。
 
+`riscv_user_elf_load()` 返回的 LIVE 地址空间、入口和栈指针可以直接传给 `kernel_user_thread_create()`。装载器与 scheduler 仍是两个所有权阶段：装载成功后调用者持有地址空间，线程创建成功后才由 scheduler 持有；创建失败时调用者必须销毁仍由自己持有的空间。生产启动当前没有可执行文件来源，因此只在测试 kernel 中连接这两层。
+
 ## 初始化、当前线程和临界区
 
 稳定启动顺序为：
@@ -116,9 +119,10 @@ make test-context-riscv
 make test-scheduler-cases-riscv
 make test-scheduler-riscv
 make test-user-riscv
+make test-user-elf-riscv
 make test-riscv
 ```
 
-context/state 测试覆盖内核与用户首次 context、固定线程前缀、创建失败原子性、FIFO、完成记录和内核线程页回收。用户测试覆盖入口/栈权限校验、U -> 内核 worker -> U 的真实 timer 调度、内核执行期间 `sscratch=0`、未知 syscall、正常退出、用户页故障、完成记录顺序和全部页计数复原；生产 ELF 不含这些测试任务。
+context/state 测试覆盖内核与用户首次 context、固定线程前缀、创建失败原子性、FIFO、完成记录和内核线程页回收。用户测试覆盖入口/栈权限校验、U -> 内核 worker -> U 的真实 timer 调度、内核执行期间 `sscratch=0`、未知 syscall、正常退出、用户页故障、完成记录顺序和全部页计数复原；ELF 集成测试再验证装载器输出能直接成为真实用户任务并完整回收。生产 ELF 不含这些测试任务。
 
 当前限制为 RISC-V64 单 hart、ASID 0 全局 TLB 刷新、一个 tick 时间片、FIFO、4 KiB 单页内核栈和 canary。一个用户任务直接拥有一个地址空间，尚无进程/PID、共享地址空间的多线程、BLOCKED/sleep/wait/join、主动 yield、优先级、SMP、guard page、多页栈、F/V 上下文或 LoongArch context。

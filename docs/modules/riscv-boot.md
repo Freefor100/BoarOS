@@ -37,7 +37,7 @@
 
 ## 当前限制
 
-当前代码只处理单 hart、固定 QEMU `virt` UART、固定高半区内核 VMA、最终 high/direct RAM 映射、S/U-mode 整数 Trap Frame、第一段 DTB 物理内存和静态保留区、SBI timer/100 Hz tick、FIFO 内核/用户任务，以及最小单页分配。QEMU ELF 的物理装载地址仍固定为 `0x80200000`；VisionFive 2 的装载地址和固件入口必须在板级适配时单独提供，不能直接沿用该平台常量。外部中断、ELF 用户程序装载、完整进程、SMP 或 LoongArch64 尚未实现；额外挂载的 VirtIO 块设备和网卡尚未访问。
+当前代码只处理单 hart、固定 QEMU `virt` UART、固定高半区内核 VMA、最终 high/direct RAM 映射、S/U-mode 整数 Trap Frame、第一段 DTB 物理内存和静态保留区、SBI timer/100 Hz tick、FIFO 内核/用户任务、静态 RISC-V `ET_EXEC` 内存映像，以及最小单页分配。QEMU ELF 的物理装载地址仍固定为 `0x80200000`；VisionFive 2 的装载地址和固件入口必须在板级适配时单独提供，不能直接沿用该平台常量。外部中断、用户 ELF 的文件来源和动态链接、完整进程、SMP 或 LoongArch64 尚未实现；额外挂载的 VirtIO 块设备和网卡尚未访问。
 
 ## 验证入口
 
