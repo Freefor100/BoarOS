@@ -6,6 +6,16 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#define RISCV_USER_ELF_AUXILIARY_PAIRS 8U
+
+struct riscv_user_elf_stack_layout {
+    const struct riscv_user_elf_string *arguments;
+    size_t argument_count;
+    uint64_t string_address;
+    uint64_t stack_pointer;
+    uint64_t committed_base;
+};
+
 static enum riscv_user_elf_status parser_status(
     enum kernel_elf64_status status)
 {
@@ -343,6 +353,320 @@ static enum riscv_user_elf_status copy_load_segments(
     return RISCV_USER_ELF_STATUS_OK;
 }
 
+static enum riscv_user_elf_status populate_u64(
+    struct riscv_sv39_user_space *space,
+    uint64_t virtual_address,
+    uint64_t value)
+{
+    return riscv_sv39_user_space_populate(space,
+                                          virtual_address,
+                                          &value,
+                                          sizeof(value)) ==
+                   RISCV_SV39_STATUS_OK
+               ? RISCV_USER_ELF_STATUS_OK
+               : RISCV_USER_ELF_STATUS_ADDRESS_SPACE;
+}
+
+static enum riscv_user_elf_status populate_string(
+    struct riscv_sv39_user_space *space,
+    uint64_t virtual_address,
+    const struct riscv_user_elf_string *string)
+{
+    static const char terminator = '\0';
+
+    if (string->length != 0U &&
+        riscv_sv39_user_space_populate(space,
+                                       virtual_address,
+                                       string->bytes,
+                                       string->length) !=
+            RISCV_SV39_STATUS_OK) {
+        return RISCV_USER_ELF_STATUS_ADDRESS_SPACE;
+    }
+    return riscv_sv39_user_space_populate(
+               space,
+               virtual_address + string->length,
+               &terminator,
+               sizeof(terminator)) == RISCV_SV39_STATUS_OK
+               ? RISCV_USER_ELF_STATUS_OK
+               : RISCV_USER_ELF_STATUS_ADDRESS_SPACE;
+}
+
+static enum riscv_user_elf_status populate_auxiliary(
+    struct riscv_sv39_user_space *space,
+    uint64_t *word_address,
+    uint64_t type,
+    uint64_t value)
+{
+    enum riscv_user_elf_status status =
+        populate_u64(space, *word_address, type);
+
+    if (status != RISCV_USER_ELF_STATUS_OK) {
+        return status;
+    }
+    status = populate_u64(space,
+                          *word_address + sizeof(uint64_t),
+                          value);
+    if (status == RISCV_USER_ELF_STATUS_OK) {
+        *word_address += 2U * sizeof(uint64_t);
+    }
+    return status;
+}
+
+static enum riscv_user_elf_status program_header_address(
+    const struct kernel_elf64_image *image,
+    uint64_t *address)
+{
+    struct kernel_elf64_program_header segment;
+    uint64_t table_bytes =
+        (uint64_t)image->header.program_header_count * UINT64_C(56);
+    uint64_t relative;
+    uint16_t index;
+    enum riscv_user_elf_status status;
+
+    *address = 0U;
+    for (index = 0U;
+         index < image->header.program_header_count;
+         index++) {
+        status = read_program_header(image, index, &segment);
+        if (status != RISCV_USER_ELF_STATUS_OK) {
+            return status;
+        }
+        if (segment.type != KERNEL_ELF64_PROGRAM_LOAD ||
+            image->header.program_header_offset < segment.offset) {
+            continue;
+        }
+        relative = image->header.program_header_offset - segment.offset;
+        if (relative <= segment.file_size &&
+            table_bytes <= segment.file_size - relative) {
+            *address = segment.virtual_address + relative;
+            return RISCV_USER_ELF_STATUS_OK;
+        }
+    }
+    return RISCV_USER_ELF_STATUS_OK;
+}
+
+static enum riscv_user_elf_status validate_strings(
+    const struct riscv_user_elf_string *strings,
+    size_t count,
+    uint64_t *total_bytes)
+{
+    size_t index;
+    size_t byte_index;
+
+    for (index = 0U; index < count; index++) {
+        if (strings[index].bytes == 0) {
+            return RISCV_USER_ELF_STATUS_INVALID_ARGUMENT;
+        }
+        if ((uint64_t)strings[index].length >=
+                RISCV_USER_ELF_STACK_IMAGE_LIMIT ||
+            (uint64_t)strings[index].length + 1U >
+                RISCV_USER_ELF_STACK_IMAGE_LIMIT - *total_bytes) {
+            return RISCV_USER_ELF_STATUS_ARGUMENT_TOO_LARGE;
+        }
+        for (byte_index = 0U;
+             byte_index < strings[index].length;
+             byte_index++) {
+            if (strings[index].bytes[byte_index] == '\0') {
+                return RISCV_USER_ELF_STATUS_INVALID_ARGUMENT;
+            }
+        }
+        *total_bytes += (uint64_t)strings[index].length + 1U;
+    }
+    return RISCV_USER_ELF_STATUS_OK;
+}
+
+static enum riscv_user_elf_status calculate_stack_layout(
+    const struct riscv_user_elf_request *request,
+    struct riscv_user_elf_stack_layout *layout)
+{
+    static const struct riscv_user_elf_string empty = {0, 0U};
+    const struct riscv_user_elf_string *arguments = request->arguments;
+    size_t argument_count = request->argument_count;
+    uint64_t string_bytes = 0U;
+    uint64_t table_bytes;
+    uint64_t table_words;
+    enum riscv_user_elf_status status;
+
+    if (argument_count == 0U) {
+        arguments = &empty;
+        argument_count = 1U;
+        string_bytes = 1U;
+    }
+    if (argument_count >
+            RISCV_USER_ELF_STACK_IMAGE_LIMIT / sizeof(uint64_t) ||
+        request->environment_count >
+            RISCV_USER_ELF_STACK_IMAGE_LIMIT / sizeof(uint64_t)) {
+        return RISCV_USER_ELF_STATUS_ARGUMENT_TOO_LARGE;
+    }
+    table_words = 1U + (uint64_t)argument_count + 1U +
+                  (uint64_t)request->environment_count + 1U +
+                  2U * RISCV_USER_ELF_AUXILIARY_PAIRS;
+    if (table_words >
+        RISCV_USER_ELF_STACK_IMAGE_LIMIT / sizeof(uint64_t)) {
+        return RISCV_USER_ELF_STATUS_ARGUMENT_TOO_LARGE;
+    }
+    table_bytes = table_words * sizeof(uint64_t);
+    if (request->argument_count != 0U) {
+        status = validate_strings(arguments,
+                                  argument_count,
+                                  &string_bytes);
+        if (status != RISCV_USER_ELF_STATUS_OK) {
+            return status;
+        }
+    }
+    status = validate_strings(request->environment,
+                              request->environment_count,
+                              &string_bytes);
+    if (status != RISCV_USER_ELF_STATUS_OK) {
+        return status;
+    }
+    if (table_bytes >
+        RISCV_USER_ELF_STACK_IMAGE_LIMIT - string_bytes) {
+        return RISCV_USER_ELF_STATUS_ARGUMENT_TOO_LARGE;
+    }
+
+    layout->arguments = arguments;
+    layout->argument_count = argument_count;
+    layout->string_address = RISCV_USER_ELF_STACK_TOP - string_bytes;
+    layout->stack_pointer =
+        (layout->string_address - table_bytes) & ~UINT64_C(15);
+    if (RISCV_USER_ELF_STACK_TOP - layout->stack_pointer >
+        RISCV_USER_ELF_STACK_IMAGE_LIMIT) {
+        return RISCV_USER_ELF_STATUS_ARGUMENT_TOO_LARGE;
+    }
+    layout->committed_base =
+        page_start(layout->stack_pointer -
+                   RISCV_USER_ELF_STACK_INITIAL_HEADROOM);
+    return RISCV_USER_ELF_STATUS_OK;
+}
+
+static enum riscv_user_elf_status map_stack_pages(
+    const struct riscv_user_elf_stack_layout *layout,
+    struct riscv_sv39_user_space *space)
+{
+    uint64_t current;
+    enum riscv_user_elf_status status;
+
+    for (current = layout->committed_base;
+         current < RISCV_USER_ELF_STACK_TOP;
+         current += BOAROS_PAGE_SIZE) {
+        status = map_zeroed_page(space,
+                                 current,
+                                 RISCV_SV39_READ |
+                                     RISCV_SV39_WRITE);
+        if (status != RISCV_USER_ELF_STATUS_OK) {
+            return status;
+        }
+    }
+    return RISCV_USER_ELF_STATUS_OK;
+}
+
+static enum riscv_user_elf_status build_argument_stack(
+    const struct riscv_user_elf_request *request,
+    const struct kernel_elf64_image *image,
+    const struct riscv_user_elf_stack_layout *layout,
+    struct riscv_sv39_user_space *space,
+    uint64_t *stack_pointer)
+{
+    const struct riscv_user_elf_string *arguments = layout->arguments;
+    size_t argument_count = layout->argument_count;
+    uint64_t string_address = layout->string_address;
+    uint64_t word_address;
+    uint64_t phdr_address;
+    size_t index;
+    enum riscv_user_elf_status status;
+
+    word_address = layout->stack_pointer;
+
+    status = populate_u64(space,
+                          word_address,
+                          (uint64_t)argument_count);
+    if (status != RISCV_USER_ELF_STATUS_OK) {
+        return status;
+    }
+    word_address += sizeof(uint64_t);
+    for (index = 0U; index < argument_count; index++) {
+        status = populate_u64(space, word_address, string_address);
+        if (status != RISCV_USER_ELF_STATUS_OK) {
+            return status;
+        }
+        status = populate_string(space,
+                                 string_address,
+                                 &arguments[index]);
+        if (status != RISCV_USER_ELF_STATUS_OK) {
+            return status;
+        }
+        word_address += sizeof(uint64_t);
+        string_address += (uint64_t)arguments[index].length + 1U;
+    }
+    status = populate_u64(space, word_address, 0U);
+    if (status != RISCV_USER_ELF_STATUS_OK) {
+        return status;
+    }
+    word_address += sizeof(uint64_t);
+    for (index = 0U; index < request->environment_count; index++) {
+        status = populate_u64(space, word_address, string_address);
+        if (status != RISCV_USER_ELF_STATUS_OK) {
+            return status;
+        }
+        status = populate_string(space,
+                                 string_address,
+                                 &request->environment[index]);
+        if (status != RISCV_USER_ELF_STATUS_OK) {
+            return status;
+        }
+        word_address += sizeof(uint64_t);
+        string_address +=
+            (uint64_t)request->environment[index].length + 1U;
+    }
+    status = populate_u64(space, word_address, 0U);
+    if (status != RISCV_USER_ELF_STATUS_OK) {
+        return status;
+    }
+    word_address += sizeof(uint64_t);
+
+    status = program_header_address(image, &phdr_address);
+    if (status != RISCV_USER_ELF_STATUS_OK) {
+        return status;
+    }
+    status = populate_auxiliary(space, &word_address, 6U,
+                                BOAROS_PAGE_SIZE);
+    if (status == RISCV_USER_ELF_STATUS_OK) {
+        status = populate_auxiliary(space, &word_address, 3U,
+                                    phdr_address);
+    }
+    if (status == RISCV_USER_ELF_STATUS_OK) {
+        status = populate_auxiliary(space, &word_address, 4U, 56U);
+    }
+    if (status == RISCV_USER_ELF_STATUS_OK) {
+        status = populate_auxiliary(
+            space,
+            &word_address,
+            5U,
+            image->header.program_header_count);
+    }
+    if (status == RISCV_USER_ELF_STATUS_OK) {
+        status = populate_auxiliary(space, &word_address, 7U, 0U);
+    }
+    if (status == RISCV_USER_ELF_STATUS_OK) {
+        status = populate_auxiliary(space, &word_address, 8U, 0U);
+    }
+    if (status == RISCV_USER_ELF_STATUS_OK) {
+        status = populate_auxiliary(space,
+                                    &word_address,
+                                    9U,
+                                    image->header.entry);
+    }
+    if (status == RISCV_USER_ELF_STATUS_OK) {
+        status = populate_auxiliary(space, &word_address, 0U, 0U);
+    }
+    if (status != RISCV_USER_ELF_STATUS_OK) {
+        return status;
+    }
+    *stack_pointer = layout->stack_pointer;
+    return RISCV_USER_ELF_STATUS_OK;
+}
+
 static enum riscv_user_elf_status finish_failure(
     enum riscv_user_elf_status failure,
     struct riscv_sv39_user_space *working,
@@ -364,8 +688,7 @@ static enum riscv_user_elf_status finish_failure(
 }
 
 enum riscv_user_elf_status riscv_user_elf_load(
-    const void *image_bytes,
-    size_t image_size,
+    const struct riscv_user_elf_request *request,
     struct physical_page_allocator *allocator,
     const struct riscv_sv39_page_table *kernel_table,
     struct riscv_sv39_user_space *space,
@@ -374,18 +697,25 @@ enum riscv_user_elf_status riscv_user_elf_load(
     struct kernel_elf64_image image;
     struct riscv_sv39_user_space working = {0};
     struct riscv_user_elf_entry loaded;
+    struct riscv_user_elf_stack_layout stack_layout;
     enum kernel_elf64_status elf_status;
     enum riscv_sv39_status sv39_status;
     enum riscv_user_elf_status status;
 
-    if (image_bytes == 0 || allocator == 0 || kernel_table == 0 ||
+    if (request == 0 || request->image == 0 ||
+        (request->argument_count != 0U && request->arguments == 0) ||
+        (request->environment_count != 0U &&
+         request->environment == 0) ||
+        allocator == 0 || kernel_table == 0 ||
         space == 0 || entry == 0 ||
         space->state != RISCV_SV39_USER_SPACE_EMPTY ||
         kernel_table->state != RISCV_SV39_STATE_ACTIVE ||
         kernel_table->allocator != allocator) {
         return RISCV_USER_ELF_STATUS_INVALID_ARGUMENT;
     }
-    elf_status = kernel_elf64_open(image_bytes, image_size, &image);
+    elf_status = kernel_elf64_open(request->image,
+                                   request->image_size,
+                                   &image);
     if (elf_status != KERNEL_ELF64_STATUS_OK) {
         return parser_status(elf_status);
     }
@@ -394,6 +724,10 @@ enum riscv_user_elf_status riscv_user_elf_load(
     }
     if (image.header.type != KERNEL_ELF64_TYPE_EXECUTABLE) {
         return RISCV_USER_ELF_STATUS_UNSUPPORTED;
+    }
+    status = calculate_stack_layout(request, &stack_layout);
+    if (status != RISCV_USER_ELF_STATUS_OK) {
+        return status;
     }
     status = validate_image_layout(&image,
                                    physical_page_available(allocator));
@@ -416,9 +750,7 @@ enum riscv_user_elf_status riscv_user_elf_load(
     if (status != RISCV_USER_ELF_STATUS_OK) {
         return finish_failure(status, &working, space);
     }
-    status = map_zeroed_page(&working,
-                             RISCV_USER_ELF_STACK_BASE,
-                             RISCV_SV39_READ | RISCV_SV39_WRITE);
+    status = map_stack_pages(&stack_layout, &working);
     if (status != RISCV_USER_ELF_STATUS_OK) {
         return finish_failure(status, &working, space);
     }
@@ -428,7 +760,14 @@ enum riscv_user_elf_status riscv_user_elf_load(
     }
 
     loaded.entry = image.header.entry;
-    loaded.stack_pointer = RISCV_USER_ELF_STACK_TOP;
+    status = build_argument_stack(request,
+                                  &image,
+                                  &stack_layout,
+                                  &working,
+                                  &loaded.stack_pointer);
+    if (status != RISCV_USER_ELF_STATUS_OK) {
+        return finish_failure(status, &working, space);
+    }
     if (riscv_sv39_user_space_move(space, &working) !=
         RISCV_SV39_STATUS_OK) {
         return finish_failure(RISCV_USER_ELF_STATUS_ADDRESS_SPACE,

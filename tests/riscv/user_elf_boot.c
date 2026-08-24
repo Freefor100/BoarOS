@@ -53,13 +53,30 @@ static enum kernel_scheduler_status create_elf_task(
     const unsigned char *end,
     int fault_kind)
 {
+    static const char argument_zero[] = "elf-probe";
+    static const char argument_one[] = "hello";
+    static const char environment_zero[] = "MODE=test";
+    struct riscv_user_elf_string arguments[2];
+    struct riscv_user_elf_string environment[1];
+    struct riscv_user_elf_request request;
     struct riscv_sv39_user_space space = {0};
     struct riscv_user_elf_entry entry;
     enum riscv_user_elf_status elf_status;
     enum kernel_scheduler_status scheduler_status;
 
-    elf_status = riscv_user_elf_load(start,
-                                     image_size(start, end),
+    arguments[0].bytes = argument_zero;
+    arguments[0].length = sizeof(argument_zero) - 1U;
+    arguments[1].bytes = argument_one;
+    arguments[1].length = sizeof(argument_one) - 1U;
+    environment[0].bytes = environment_zero;
+    environment[0].length = sizeof(environment_zero) - 1U;
+    request.image = start;
+    request.image_size = image_size(start, end);
+    request.arguments = arguments;
+    request.argument_count = sizeof(arguments) / sizeof(arguments[0]);
+    request.environment = environment;
+    request.environment_count = sizeof(environment) / sizeof(environment[0]);
+    elf_status = riscv_user_elf_load(&request,
                                      allocator,
                                      active_kernel_table,
                                      &space,
@@ -71,9 +88,7 @@ static enum kernel_scheduler_status create_elf_task(
     if (fault_kind == 1) {
         fault_entry = entry.entry;
     } else if (fault_kind == 2) {
-        guard_fault_address = entry.stack_pointer -
-                              BOAROS_PAGE_SIZE -
-                              sizeof(uint64_t);
+        guard_fault_address = RISCV_USER_ELF_STACK_GUARD_BASE;
     }
     scheduler_status = kernel_user_thread_create(&space,
                                                  entry.entry,

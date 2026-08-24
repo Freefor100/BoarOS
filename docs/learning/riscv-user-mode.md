@@ -48,7 +48,7 @@ BoarOS 当前实现 `exit`，编号为 93。退出状态取参数的低 8 位并
 
 ## 当前项目选择与平台边界
 
-BoarOS 当前先用手工映射探针验证首次 `SRET`、真实 timer 抢占、U-mode syscall、同步页故障、调度恢复和完整资源回收，再用独立链接的静态 ELF 验证装载器产出的代码、数据、BSS 和栈能沿同一架构路径运行。已有 ELF 仍来自完整的只读内核内存缓冲区，不等于已经具备进程/PID、文件系统 `exec` 或通用 `copy_from_user`。
+BoarOS 当前先用手工映射探针验证首次 `SRET`、真实 timer 抢占、U-mode syscall、同步页故障、调度恢复和完整资源回收，再用独立链接的静态 ELF 验证装载器产出的代码、数据、BSS 和 Linux 形态的 `argc/argv/envp/auxv` 初始栈能沿同一架构路径运行。已有 ELF 和参数仍来自完整的只读内核缓冲区，不等于已经具备进程/PID、文件系统 `exec` 或通用 `copy_from_user`。
 
 Sv39、`satp`、`sscratch`、Trap Frame 和 RISC-V syscall 寄存器约定属于架构层，可在 QEMU `virt` 与 VisionFive 2 复用。SBI/固件交接、RAM 与 MMIO 布局、timebase、UART 和中断控制器仍属于平台层；QEMU 上通过 U-mode 测试不等于开发板适配已经完成。
 

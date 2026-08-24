@@ -852,10 +852,22 @@ static int test_user_space_populate(void)
             return 63;
         }
     }
+    if (riscv_sv39_user_space_populate(
+            &space,
+            UINT64_C(1) << 38U,
+            0,
+            0U) != RISCV_SV39_STATUS_INVALID ||
+        riscv_sv39_user_space_populate(
+            &space,
+            second_va + BOAROS_PAGE_SIZE,
+            payload,
+            1U) != RISCV_SV39_STATUS_NOT_MAPPED) {
+        return 64;
+    }
     if (riscv_sv39_user_space_destroy(&space) !=
             RISCV_SV39_STATUS_OK ||
         physical_page_available(&allocator) != available) {
-        return 64;
+        return 65;
     }
     return 0;
 }

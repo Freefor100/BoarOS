@@ -17,8 +17,8 @@ BoarOS 是一个从零搭建，面向 OS Comp 能力建设的 C 语言（少量 
 - 最终地址空间建立后，内核先把 boot context 初始化为 idle，再通过 SBI TIME 设置绝对 deadline，以 100 Hz 策略处理 supervisor timer interrupt；迟到时按原 deadline 相位一次补记 elapsed tick，并把同一 elapsed 交给 scheduler。
 - RISC-V switch context 按 psABI 保存 `ra/sp/tp/s0..s11`，其中内核 `tp` 固定指向 current thread。普通内核/用户任务各使用一个私有 4 KiB 页承载控制块、canary 和内核栈；用户任务额外独占一个 Sv39 用户地址空间。单 hart FIFO scheduler 每 tick 最多抢占切换一次，退出后由 boot idle 返回逐条完成记录并回收线程页、用户叶子页和页表页。正常内核不创建演示任务，仍永久执行 `wfi`。
 - 最小 Linux 风格系统调用边界支持 `exit(93)`，未知调用返回 `-ENOSYS`；用户同步故障只终止当前任务并保留 `scause/stval` 完成记录，S-mode 未处理故障仍为内核 fatal。
-- 有界 ELF64 解析器从只读内核内存缓冲区解码并校验 ELF header 与 program header；RISC-V 装载器支持静态、小端 ELF64 `ET_EXEC`，把 `PT_LOAD` 复制到独立 Sv39 用户地址空间，按页合并权限并执行 W^X 检查，补零 BSS，再在低半区顶端建立一页 RW/NX 栈及其下方的一页未映射 guard。动态链接、TLS 和 Linux 初始参数栈尚未支持。
-- 自动测试除启动、物理页、分页、Trap、timer 和内核线程状态外，还让两个独立 Sv39 用户地址空间真实进入 U-mode：主任务经 timer 抢占到内核 worker 后恢复，核对 `gp/sp/tp/s0..s11`、未知 syscall 和 `exit(93)`；故障任务触发 load page fault。另一组测试独立链接完整静态 ELF，验证 `.data`、BSS、用户栈、RX 文本写故障和向下越过栈底的 guard 故障。测试最终要求完成记录正确且全部用户/线程页回收，另在用户根下破坏返回凭据验证 fatal 诊断。
+- 有界 ELF64 解析器从只读内核内存缓冲区解码并校验 ELF header 与 program header；RISC-V 装载器支持静态、小端 ELF64 `ET_EXEC`，把 `PT_LOAD` 复制到独立 Sv39 用户地址空间，按页合并权限并执行 W^X 检查、补零 BSS，再根据带长度的参数请求建立 Linux 形态的 `argc/argv/envp/auxv` 初始栈。用户栈预留低半区顶端 8 MiB 虚拟区间，初次只提交容纳至多 128 KiB 栈镜像并额外向下留出 64 KiB 的页，预留区下方保持一页永久 guard；动态链接、TLS、随机数和按需扩栈尚未支持。
+- 自动测试除启动、物理页、分页、Trap、timer 和内核线程状态外，还让两个独立 Sv39 用户地址空间真实进入 U-mode：主任务经 timer 抢占到内核 worker 后恢复，核对 `gp/sp/tp/s0..s11`、未知 syscall 和 `exit(93)`；故障任务触发 load page fault。另一组测试独立链接完整静态 ELF，验证 `.data`、BSS、参数/环境字符串、auxv、栈对齐、初始提交边界、RX 文本写故障和永久栈 guard 故障。测试最终要求完成记录正确且全部用户/线程页回收，另在用户根下破坏返回凭据验证 fatal 诊断。
 
 当前只支持 RISC-V64 单 hart、QEMU `virt` 平台、Sv39/4 KiB 用户页、S/U 整数 Trap Frame、SBI timer/100 Hz tick、单页内核栈与 FIFO 抢占，以及从完整内存缓冲区装载静态 `ET_EXEC` 用户程序。尚无进程/PID、通用用户内存复制、文件来源与 `exec` 生命周期、动态链接、`fork/wait`、阻塞与唤醒、文件系统、外部中断、SMP 或 LoongArch64；生产启动仍不创建用户任务。完整比赛 Harness 仍会因缺少 `kernel-la` 失败。
 
@@ -58,7 +58,7 @@ make test-references
 
 ## 近期方向
 
-下一步把已验证的内存型 ELF 装载器接入进程级资源容器，定义最小用户内存访问边界和 Linux 用户初始栈，再从文件系统提供可执行文件来源并逐步接入比赛所需系统调用；RISC-V64 + OpenSBI 主路径稳定后，再实现 LoongArch64 16 KiB/三级页表和对应 context/trap。
+下一步把已验证的内存型 ELF 装载器接入进程级资源容器，定义最小用户内存访问边界，再从文件系统提供可执行文件来源并逐步接入比赛所需系统调用；RISC-V64 + OpenSBI 主路径稳定后，再实现 LoongArch64 16 KiB/三级页表和对应 context/trap。
 
 ## 文档
 

@@ -59,7 +59,9 @@ RISC-V direct map 使用固定公式 `VA = 0xffffffc000000000 + PA`，窗口大�
 
 `riscv_sv39_user_space_init()` 分配一张新根表，清空低半区根项，并复制已经 ACTIVE 的最终内核页表根项 256..511。用户对象只拥有低半区树；借用的高半区表和叶子始终由内核页表拥有，销毁时不会遍历或释放。
 
-`riscv_sv39_user_map_owned_page()` 只接受 `0x1000..2^38` 内按 4 KiB 对齐的低地址、已分配物理页和合法 R/W/X 权限。成功建立带 U/A（可写时还带 D）的 Level 0 叶子并接管物理页；失败仍由调用者持有该页。`riscv_sv39_user_map_zeroed_page()` 则在地址空间内部完成叶表路径准备、叶子分配、清零、映射和所有权登记，调用者不会接触处于“已经分配但尚无所有者”状态的叶子。中间表分配采用局部事务：若创建第二张中间表失败，会撤销本次新建且仍为空的上级表，不破坏更早的映射。
+`riscv_sv39_user_map_owned_page()` 只接受 `[0x1000, 2^38)` 内按 4 KiB 对齐的低地址、已分配物理页和合法 R/W/X 权限。成功建立带 U/A（可写时还带 D）的 Level 0 叶子并接管物理页；失败仍由调用者持有该页。`riscv_sv39_user_map_zeroed_page()` 则在地址空间内部完成叶表路径准备、叶子分配、清零、映射和所有权登记，调用者不会接触处于“已经分配但尚无所有者”状态的叶子。中间表分配采用局部事务：若创建第二张中间表失败，会撤销本次新建且仍为空的上级表，不破坏更早的映射。
+
+`riscv_sv39_user_space_populate()` 用物理页访问函数跨页写入已经映射、当前未激活的 LIVE 用户空间。输入范围必须完整位于 `[0x1000, 2^38)`，零长度也不能以一过尾地址冒充有效起点；当前 `satp` 指向目标根时拒绝操作。它检查映射存在但不要求 PTE 带 W，因此 ELF 装载器可以直接初始化最终权限为 RX 的 text，而不建立临时 RWX 映射或切换到用户根执行复制。
 
 用户空间生命周期为：
 
@@ -80,7 +82,7 @@ CLEANUP --move--> MOVED
 
 `riscv_sv39_user_space_satp()` 只为 LIVE 对象生成 `MODE=8, ASID=0, PPN=root`；`riscv_sv39_switch_satp()` 只接受 Bare 或 Sv39 ASID 0，并在根切换前后执行全局 `SFENCE.VMA`。scheduler 在修改 ready/current 状态之前完成切根；当前没有 ASID 分配或按地址 TLB 失效。
 
-RISC-V ELF 装载器是当前用户映射接口的真实调用方。它先完成格式、范围、段重叠和页级 W^X 预检，再逐页分配、清零和映射；两个不重叠的 `PT_LOAD` 落在同一 4 KiB 页时只建立一个叶子，权限取覆盖该页各段的并集。文件内容复制后，`p_memsz - p_filesz` 与页内空隙保持为零。RW/NX 用户栈占用 Sv39 低半区最高一页，紧邻其下的一页不映射，作为向下增长栈越界时的 guard。
+RISC-V ELF 装载器是当前用户映射接口的真实调用方。它先完成格式、范围、段重叠和页级 W^X 预检，再逐页分配、清零和映射；两个不重叠的 `PT_LOAD` 落在同一 4 KiB 页时只建立一个叶子，权限取覆盖该页各段的并集。文件内容通过离线填充接口复制后，`p_memsz - p_filesz` 与页内空隙保持为零。RW/NX 用户栈预留 Sv39 低半区顶端 8 MiB，初次只映射覆盖初始参数栈并额外向下留出 64 KiB 的后缀；预留区下方一页永久不映射，作为向下扩展边界的 guard。
 
 ## 验证
 
@@ -96,6 +98,6 @@ make test-user-elf-riscv
 make test-riscv
 ```
 
-聚焦建表测试除启动 PTE、规模和失败语义外，还检查用户根高半区借用、U 页权限、零页映射、数值为 0 的合法用户根地址、lookup、move、活动根销毁拒绝、后序回收、OOM 回滚、`satp` 编码和失败输出不变。`test-user-elf-cases-riscv` 覆盖装载权限、共享边界页、BSS、guard、错误树、OOM 回滚，以及根页、中间表和叶子页发生“访问与立即释放同时失败”时的 `CLEANUP` 所有权；其中还直接构造第二张中间表失败且上级表回滚释放也失败的组合，要求保留 `CLEANUP_REQUIRED` 状态。`test-user-elf-riscv` 让独立链接的完整 ELF 实际运行，并以 RX 文本写和向下越过栈底两种 store page fault 验证最终硬件 PTE。`test-user-riscv` 进一步在两个真实用户根与内核根之间切换，验证可执行/可写用户页、timer 抢占、页故障隔离及最终页计数复原；`test-user-fatal-riscv` 在用户根仍活动时强制拒绝返回，验证高半区 UART 能完成 fatal 诊断和关机。其余权限、高半区和 no-identity 测试继续验证启动页表的硬件行为。
+聚焦建表测试除启动 PTE、规模和失败语义外，还检查用户根高半区借用、U 页权限、零页映射、跨页离线填充、用户地址半开区间、数值为 0 的合法用户根地址、lookup、move、活动根销毁拒绝、后序回收、OOM 回滚、`satp` 编码和失败输出不变。`test-user-elf-cases-riscv` 覆盖装载权限、参数栈、初始提交边界、共享边界页、BSS、永久 guard、错误树、OOM 回滚，以及根页、中间表和叶子页发生“访问与立即释放同时失败”时的 `CLEANUP` 所有权；其中还直接构造第二张中间表失败且上级表回滚释放也失败的组合，要求保留 `CLEANUP_REQUIRED` 状态。`test-user-elf-riscv` 让独立链接的完整 ELF 实际运行，并以 RX 文本写和永久 guard 两种 store page fault 验证最终硬件 PTE。`test-user-riscv` 进一步在两个真实用户根与内核根之间切换，验证可执行/可写用户页、timer 抢占、页故障隔离及最终页计数复原；`test-user-fatal-riscv` 在用户根仍活动时强制拒绝返回，验证高半区 UART 能完成 fatal 诊断和关机。其余权限、高半区和 no-identity 测试继续验证启动页表的硬件行为。
 
 当前未实现 1 GiB 叶子、用户 unmap/mprotect、共享叶子、copy-on-write、按需分页、ASID 分配和 SMP TLB shootdown。用户映射固定为 4 KiB；direct map 只映射 DTB 报告的第一段 RAM，不包含 MMIO，也不放宽内核 text/rodata 的别名权限。

@@ -871,6 +871,7 @@ enum riscv_sv39_status riscv_sv39_user_space_populate(
     if (space == 0 || space->state != RISCV_SV39_USER_SPACE_LIVE ||
         (size != 0U && bytes == 0) ||
         virtual_address < RISCV_SV39_PAGE_SIZE_4K ||
+        virtual_address >= RISCV_SV39_USER_LIMIT ||
         (uint64_t)size > RISCV_SV39_USER_LIMIT - virtual_address ||
         riscv_sv39_user_space_satp(space, &user_satp) !=
             RISCV_SV39_STATUS_OK) {
