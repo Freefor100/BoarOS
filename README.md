@@ -9,16 +9,17 @@ BoarOS 是一个从零搭建，面向 OS Comp 能力建设的 C 语言（少量 
 - `make all` 构建 RISC-V64 ELF `kernel-rv`。
 - QEMU `virt` 加载默认 OpenSBI，随后以 S-mode 进入 BoarOS。
 - 启动代码建立 `gp`、清零 BSS、创建单 hart 启动栈，并把 OpenSBI 的 hart ID 与 DTB 指针交给 C 入口。
-- 启动代码安装 Direct-mode `stvec`；S-mode 入口在当前内核栈保存完整整数 Trap Frame，经过 C dispatcher 后可以验证并执行 `sret`。生产 dispatcher 已处理 supervisor timer interrupt；其他未处理事件仍输出 `scause`、`sepc`、`stval`、`sstatus` 后关机。
+- 启动代码安装 Direct-mode `stvec`；统一 Trap 入口让 S-mode 直接使用当前栈，并通过 `sscratch <-> tp` 为 U-mode 切到任务内核栈，保存完整整数 Trap Frame 后经过 C dispatcher 验证并执行 `sret`。生产 dispatcher 已处理 supervisor timer、U-mode ecall 和用户同步故障；其他未处理事件仍输出 CSR 现场后关机。
 - 内核校验并扫描 DTB，读取第一段 RAM、静态保留区和 RISC-V `timebase-frequency`，排除固件、内核镜像与 DTB 自身占用后形成启动内存布局。
 - 物理页分配器按 4 KiB 向内对齐可用区间，支持单页分配、释放、耗尽和重复释放诊断；进入高半区后一次性绑定物理地址访问函数，回收链节点通过该函数读写。
 - RISC-V 内核 ELF 链接到 Sv39 高半区 `0xffffffff80000000`，QEMU 当前仍从物理地址 `0x80200000` 装载和进入；内核先用只覆盖切换所需低/高别名的过渡页表迁移 PC、栈、`gp` 和 `stvec`，再切换到只含高半区内核、从 `0xffffffc000000000` 开始的 128 GiB RAM direct map 和平台 MMIO 的最终页表。
-- Sv39 建表器按条件组合 2 MiB 与 4 KiB 叶子；最终页表不映射低地址 RAM，QEMU `virt` UART 仍使用独立的低地址 RW MMIO 映射。
+- Sv39 建表器按条件组合 2 MiB 与 4 KiB 叶子；最终页表不保留低地址映射，QEMU `virt` UART 的物理 MMIO 通过 `0xffffffe000000000` 的 supervisor-only 高半区别名访问。运行期用户地址空间拥有低半区 4 KiB U 页和页表页、借用包含 UART 在内的最终内核高半区根项，并以 ASID 0 全局刷新方式切换 `satp`。
 - 最终地址空间建立后，内核先把 boot context 初始化为 idle，再通过 SBI TIME 设置绝对 deadline，以 100 Hz 策略处理 supervisor timer interrupt；迟到时按原 deadline 相位一次补记 elapsed tick，并把同一 elapsed 交给 scheduler。
-- RISC-V switch context 按 psABI 保存 `ra/sp/tp/s0..s11`，其中 `tp` 固定指向 current kernel thread。普通线程各使用一个私有 4 KiB 页承载控制块、canary 和向下增长的栈；单 hart FIFO scheduler 每 tick 最多抢占切换一次，线程入口返回后由 boot idle 在另一张栈上回收页。正常内核不创建演示线程，仍永久执行 `wfi`。
-- 自动测试分别验证 DTB 与启动布局、物理页状态机、direct-map 地址边界、Sv39 编码/规模/失败语义、只读页写故障、最终地址空间拒绝低 RAM 访问、低地址/高半区 Trap Frame 返回、timer 状态/deadline/真实中断、context 保存集合、scheduler 状态/回滚、timer-only A -> B -> A 抢占、退出回收、非法返回拒绝和致命 trap，并在 512 MiB、1 GiB 和 16 GiB guest RAM 配置下通过 direct map 实际写读、释放和复用物理页。
+- RISC-V switch context 按 psABI 保存 `ra/sp/tp/s0..s11`，其中内核 `tp` 固定指向 current thread。普通内核/用户任务各使用一个私有 4 KiB 页承载控制块、canary 和内核栈；用户任务额外独占一个 Sv39 用户地址空间。单 hart FIFO scheduler 每 tick 最多抢占切换一次，退出后由 boot idle 返回逐条完成记录并回收线程页、用户叶子页和页表页。正常内核不创建演示任务，仍永久执行 `wfi`。
+- 最小 Linux 风格系统调用边界支持 `exit(93)`，未知调用返回 `-ENOSYS`；用户同步故障只终止当前任务并保留 `scause/stval` 完成记录，S-mode 未处理故障仍为内核 fatal。
+- 自动测试除启动、物理页、分页、Trap、timer 和内核线程状态外，还让两个独立 Sv39 用户地址空间真实进入 U-mode：主任务经 timer 抢占到内核 worker 后恢复，核对 `gp/sp/tp/s0..s11`、未知 syscall 和 `exit(93)`；故障任务触发 load page fault。测试最终要求三条完成记录和全部用户/线程页回收，另在用户根下破坏返回凭据验证 fatal 诊断。
 
-当前只支持 RISC-V64 单 hart、QEMU `virt` 平台、无低 RAM 恒等别名的启动期高半区内核/direct map、S-mode 整数 Trap Frame/返回、SBI timer/100 Hz tick、单页内核线程与 FIFO 抢占调度、DTB 中第一段物理内存和静态保留区，以及最小物理页分配。除 timer 外的生产中断、用户态 trap/进程、阻塞与唤醒、运行期映射修改、SMP 和 LoongArch64 均未实现。完整比赛 Harness 仍会因缺少 `kernel-la` 失败。
+当前只支持 RISC-V64 单 hart、QEMU `virt` 平台、Sv39/4 KiB 用户页、S/U 整数 Trap Frame、SBI timer/100 Hz tick、单页内核栈与 FIFO 抢占，以及可执行的最小用户任务。尚无 ELF 装载、进程/PID、通用用户内存复制、`fork/exec/wait`、阻塞与唤醒、文件系统、外部中断、SMP 或 LoongArch64；生产启动仍不创建用户任务。完整比赛 Harness 仍会因缺少 `kernel-la` 失败。
 
 ## 构建与运行
 
@@ -35,6 +36,9 @@ make test-page-riscv
 make test-context-riscv
 make test-scheduler-cases-riscv
 make test-scheduler-riscv
+make test-syscall-riscv
+make test-user-riscv
+make test-user-fatal-riscv
 make test-sv39-riscv
 make test-sv39-fault-riscv
 make test-timer-riscv
@@ -50,7 +54,7 @@ make test-references
 
 ## 近期方向
 
-下一步围绕第一个用户地址空间、U-mode trap 往返和最小系统调用边界设计可执行用户任务；RISC-V64 + OpenSBI 主路径稳定后，再接入 LoongArch64 16 KiB/三级页表和对应 context/trap 实现。
+下一步围绕可加载用户程序补齐 ELF 装载、进程级资源容器和最小用户内存访问边界，再逐步接入比赛所需系统调用；RISC-V64 + OpenSBI 主路径稳定后，再实现 LoongArch64 16 KiB/三级页表和对应 context/trap。
 
 ## 文档
 
@@ -58,6 +62,7 @@ make test-references
 - [RISC-V Trap 模块](docs/modules/riscv-trap.md)
 - [RISC-V Timer 与内核 Tick 模块](docs/modules/riscv-timer.md)
 - [内核线程调度模块](docs/modules/kernel-scheduler.md)
+- [系统调用解码模块](docs/modules/kernel-syscall.md)
 - [DTB 与启动内存布局模块](docs/modules/dtb-memory.md)
 - [物理页分配模块](docs/modules/physical-pages.md)
 - [RISC-V Sv39 分页模块](docs/modules/riscv-sv39.md)
@@ -66,6 +71,7 @@ make test-references
 - [RISC-V 时间与周期 Tick 学习总结](docs/learning/riscv-time.md)
 - [内核线程与抢占调度学习总结](docs/learning/kernel-scheduling.md)
 - [内存管理学习总结](docs/learning/memory-management.md)
+- [RISC-V 用户态与系统调用学习总结](docs/learning/riscv-user-mode.md)
 - [目标与边界](docs/goals.md)
 - [设计与工程原则](docs/design.md)
 - [工具链事实](docs/toolchain.md)

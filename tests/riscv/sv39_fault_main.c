@@ -116,8 +116,8 @@ static int build_page_table(const struct dtb_boot_info *info)
     }
     if (status == RISCV_SV39_STATUS_OK) {
         status = riscv_sv39_map_range(&page_table,
-                                      VIRT_UART_MMIO_BASE,
-                                      VIRT_UART_MMIO_BASE,
+                                      VIRT_UART_MMIO_PHYSICAL_BASE,
+                                      VIRT_UART_MMIO_PHYSICAL_BASE,
                                       VIRT_UART_MMIO_SIZE,
                                       RISCV_SV39_READ | RISCV_SV39_WRITE);
     }
@@ -155,8 +155,8 @@ void kernel_main(unsigned long hart_id, const void *dtb)
     }
     available = physical_page_available(&allocator);
     if (riscv_sv39_map_range(&page_table,
-                             VIRT_UART_MMIO_BASE,
-                             VIRT_UART_MMIO_BASE,
+                             VIRT_UART_MMIO_PHYSICAL_BASE,
+                             VIRT_UART_MMIO_PHYSICAL_BASE,
                              VIRT_UART_MMIO_SIZE,
                              RISCV_SV39_READ | RISCV_SV39_WRITE) !=
             RISCV_SV39_STATUS_STATE ||

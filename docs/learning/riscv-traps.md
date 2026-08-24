@@ -1,6 +1,6 @@
 # RISC-V Trap 学习总结
 
-本文整理实现 RISC-V S-mode trap、异常返回和后续中断/用户态入口需要掌握的知识，以及 BoarOS 当前已经确定的选择。当前代码接口和限制以 [RISC-V Trap 模块](../modules/riscv-trap.md) 为准。
+本文整理实现 RISC-V S/U-mode trap、异常返回和中断入口需要掌握的知识，以及 BoarOS 当前已经确定的选择。当前代码接口和限制以 [RISC-V Trap 模块](../modules/riscv-trap.md) 为准。
 
 ## Trap 不是普通函数调用
 
@@ -36,7 +36,7 @@ SIE 是 S-mode 全局中断开关，`sie` 则分别控制 supervisor software、
 
 进入 trap 时，硬件把旧 SIE 压入 SPIE 并清 SIE，使入口能够原子地保存关键现场。BoarOS 当前在整个 dispatcher 期间保持 SIE 为零，不允许异步中断嵌套。这样延迟取决于 handler 最长执行时间，因此以后的中断代码应保持硬中断部分很短，把耗时工作推迟到普通内核上下文，而不是轻率地在 Frame 尚未稳定时重新开中断。
 
-`sret` 完成相反转换：PC 取自 `sepc`，返回特权级取自 SPP，SIE 取自 SPIE，随后 SPIE 置一、SPP 清零。当前 BoarOS 只实现 S-mode 来源，所以返回前明确拒绝 SPP 为零的 Frame；它还拒绝保存 SIE 为一，防止写回 `sstatus` 后、通用寄存器恢复前出现新的中断。
+`sret` 完成相反转换：PC 取自 `sepc`，返回特权级取自 SPP，SIE 取自 SPIE，随后 SPIE 置一、SPP 清零。BoarOS 接受 S-mode Frame，也接受通过可信内核任务指针验证的 U-mode Frame；两者都拒绝保存 SIE 为一，防止写回 `sstatus` 后、通用寄存器恢复前出现新的中断。首次进入 U-mode 时还显式设置 `UXL=64`、`SPIE=1`，并保持 `SPP=0`、`SIE=0`。
 
 ## 同步异常和异步中断怎样继续执行？
 
@@ -46,19 +46,21 @@ SIE 是 S-mode 全局中断开关，`sie` 则分别控制 supervisor software、
 
 ## 为什么保存完整整数现场？
 
-中断发生时，x1..x31 都可能承载被打断代码仍需使用的值。只考虑 C 函数的 caller-saved/callee-saved 分类可以构造较小的即时返回入口，但无法直接作为抢占、调度、信号和用户态异常的完整执行上下文。BoarOS 保存全部可写整数寄存器和四个 trap CSR，得到固定 288 字节、16 字节对齐的 Frame。
+中断发生时，x1..x31 都可能承载被打断代码仍需使用的值。只考虑 C 函数的 caller-saved/callee-saved 分类可以构造较小的即时返回入口，但无法直接作为抢占、调度、信号和用户态异常的完整执行上下文。BoarOS 保存全部可写整数寄存器和四个 trap CSR，并在原有尾槽保存入口取得的可信内核 `tp`，得到固定 288 字节、16 字节对齐的 Frame。
 
 当前内核使用 RV64IMAC，不生成浮点或向量指令，因此整数入口不保存 F/V 状态。以后允许用户程序或内核使用这些扩展时，应把 F/V 作为带所有权和启用状态的扩展上下文管理，通常采用按需保存，而不是无条件把大型向量状态塞进每次基础 trap。
 
-Frame 建在当前内核栈上，避免了额外换栈和冷缓存访问。代价是 trap 会继续消耗被中断栈的剩余空间；当前 boot idle 和普通内核线程都使用 4 KiB 栈，没有 guard page 或溢出恢复。每个可调度上下文已有自己的内核栈，是否再设置 per-hart IRQ 栈应根据嵌套、中断负载和栈高水位决定。Trap Frame 与 scheduler switch context 的分工见[内核线程与抢占调度学习总结](kernel-scheduling.md)。
+S-mode trap 直接在当前内核栈建立 Frame；U-mode trap 先从 current 取得可信内核栈，再建立相同布局的 Frame。两种路径都继续消耗所属任务内核栈的剩余空间；当前 boot idle 和普通内核/用户任务都使用 4 KiB 内核栈，没有 guard page 或溢出恢复。是否再设置 per-hart IRQ 栈应根据嵌套、中断负载和栈高水位决定。Trap Frame 与 scheduler switch context 的分工见[内核线程与抢占调度学习总结](kernel-scheduling.md)。
 
-## `sscratch` 与未来 U-mode 换栈
+## `sscratch` 与 U-mode 换栈
 
 `sscratch` 是留给 S-mode 软件使用的 XLEN 位 CSR。规范建议在运行用户代码时保存 hart-local supervisor context 指针，并在入口最前面通过 `CSRRW` 与某个整数寄存器交换，从而在还没有可信内核栈时取得内核上下文。
 
 Linux RISC-V 在用户态运行时让 `sscratch` 指向内核的当前任务/线程上下文；trap 入口交换 `tp`，再从该上下文取得 kernel SP。内核态执行期间则把 `sscratch` 置零，使递归 trap 能识别它已经来自内核。
 
-BoarOS 当前尚无任务和 per-hart 上下文，不提前创建只为换栈服务的占位结构。内核执行期间明确保持 `sscratch=0`，S-mode trap 直接使用当前栈。建立最小用户上下文时，入口会在公共保存路径之前加入经过真实 U-mode 往返测试的换栈步骤，继续复用现有 Frame 和 C dispatcher ABI。
+BoarOS 采用同一约定。运行 U-mode 时，`sscratch` 保存 current，`tp` 是用户寄存器；入口第一步用 `csrrw tp, sscratch, tp` 取得 current 并暂存用户 `tp`，把不可信用户 `sp` 写入任务控制块，再从控制块加载 kernel SP。完整 Frame 建好后把用户 `sp/tp` 放回对应槽、把可信 current 写入 `kernel_tp` 槽，并在调用 C 前清零 `sscratch`。用户 `gp` 同样不可信；保存它以后必须以禁止 linker relaxation 的 PC 相对序列重载内核 `__global_pointer$`，避免 C 的全局访问使用用户选择的基址。
+
+从 S-mode 进入时 `sscratch=0`，第一次交换得到零，入口据此留在当前栈，再交换一次恢复原内核 `tp`。返回 U-mode 前必须验证 Frame 中的 `kernel_tp` 与当前内核 `tp` 一致，然后把 current 放回 `sscratch` 并恢复用户 `tp/sp`。可信 `kernel_tp` 由入口而不是用户寄存器产生，因此返回代码不必把任意用户值当作内核指针解引用。
 
 ## 为什么返回前清除 LR/SC reservation？
 
@@ -71,11 +73,11 @@ BoarOS 当前尚无任务和 per-hart 上下文，不提前创建只为换栈服
 BoarOS 当前固定以下 RISC-V trap 基线：
 
 - Direct `stvec` 和一条公共保存/恢复路径。
-- 在当前内核栈建立完整 RV64 整数 Trap Frame。
+- S-mode 使用当前内核栈；U-mode 通过 `sscratch <-> tp` 切到任务内核栈，并复用同一完整 RV64 整数 Trap Frame。
 - 汇编只负责架构现场和关键返回验证，具体 cause 交给 C dispatcher。
 - handler 返回表示事件已经处理；未知或当前不能处理的事件必须 fatal，不伪造成功。
 - dispatcher 期间保持 SIE 关闭，不支持嵌套异步中断。
-- 最终地址空间稳定后只开启 supervisor timer interrupt；它是当前唯一正式可恢复生产事件，并在 tick 计数后触发内核线程调度。dispatcher 不提供运行期 handler 注册框架。
+- 最终地址空间稳定后开启 supervisor timer interrupt；生产 dispatcher 处理 timer、U-mode ecall 和 U-mode 同步故障。timer 在 tick 计数后触发线程调度，用户故障只终止所属任务，其他未知事件仍为 fatal。dispatcher 不提供运行期 handler 注册框架。
 
 这些选择属于 RISC-V 架构层，可在 QEMU `virt` 和 VisionFive 2 上复用。当前 timer 通过两边共有的 SBI TIME 抽象复用，实际 timebase 仍从 DTB 获取；外部中断控制器和设备 IRQ 编号属于平台层，不能从 QEMU 的行为推断开发板布局。时间机制的完整解释见 [RISC-V 时间与周期 Tick 学习总结](riscv-time.md)。
 
@@ -91,6 +93,8 @@ BoarOS 当前固定以下 RISC-V trap 基线：
 - 检查最终测试 ELF 的入口反汇编，确认 Frame 槽地址准备、dummy `sc.d`、`sepc` 写回和 `sret` 的顺序；这验证的是实际链接产物，不依赖源码中是否还保留同名文本。
 - 在 Bare 低地址和最终 Sv39 高半区各执行真实返回；高半区测试随后再触发未处理 breakpoint，证明 fatal fallback 仍在。
 - 保留 store/load page fault 测试，防止 Frame 重构破坏原始 `scause`、`sepc`、`stval`、`sstatus` 诊断。
+- 让真实 U-mode 任务在独立 Sv39 根页表中运行，由 timer 抢占到内核线程后再恢复，逐项核对用户 `gp/sp/tp/s0..s11`，同时证明内核执行期间 `sscratch=0`；最终 ELF 反汇编还要证明入口确实重载了内核 `gp`。
+- 让第二个用户地址空间触发 load page fault，验证故障只形成任务完成记录，而不会破坏另一用户任务或把 S-mode 故障错误降级。
 
 ## 资料依据
 

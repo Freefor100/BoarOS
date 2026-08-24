@@ -8,17 +8,19 @@
 | [设计与工程原则](design.md) | 人—Agent 协作边界与默认技术原则 |
 | [工具链事实](toolchain.md) | 已验证的本地工具、Harness 和构建输入 |
 | [RISC-V 启动模块](modules/riscv-boot.md) | 当前启动代码的入口、契约、不变量和限制 |
-| [RISC-V Trap 模块](modules/riscv-trap.md) | S-mode Trap Frame、返回、诊断契约、测试和限制 |
+| [RISC-V Trap 模块](modules/riscv-trap.md) | S/U-mode Trap Frame、换栈、返回、诊断契约和测试 |
 | [RISC-V Timer 与内核 Tick 模块](modules/riscv-timer.md) | DTB timebase、SBI TIME、deadline、生产 timer trap 和 tick 契约 |
-| [内核线程调度模块](modules/kernel-scheduler.md) | RISC-V switch context、单 hart FIFO 抢占、线程栈和退出回收契约 |
+| [内核线程调度模块](modules/kernel-scheduler.md) | RISC-V switch context、单 hart FIFO 抢占、用户地址空间所有权和退出回收契约 |
+| [系统调用解码模块](modules/kernel-syscall.md) | Linux 风格寄存器 ABI、exit 与未知系统调用契约 |
 | [DTB 与启动内存布局模块](modules/dtb-memory.md) | RAM、静态保留区与可用物理区间的接口和限制 |
 | [物理页分配模块](modules/physical-pages.md) | 构建期页粒度、单页分配/释放契约和限制 |
-| [RISC-V Sv39 分页模块](modules/riscv-sv39.md) | 2 MiB/4 KiB 建表、激活、失败语义和当前地址空间 |
+| [RISC-V Sv39 分页模块](modules/riscv-sv39.md) | 启动建表、运行期用户根、SATP 切换、所有权和失败语义 |
 | [RISC-V 启动学习总结](learning/riscv-boot.md) | 启动知识、BoarOS 的应用方式、平台差异和调试经验 |
 | [RISC-V Trap 学习总结](learning/riscv-traps.md) | Trap CSR、上下文保存、异常返回、中断确认和项目选择 |
 | [RISC-V 时间与周期 Tick 学习总结](learning/riscv-time.md) | timebase、clockevent、SBI/Sstc、周期 tick、性能和平台事实 |
 | [内核线程与抢占调度学习总结](learning/kernel-scheduling.md) | Trap/switch context、psABI、线程状态、栈所有权和 timer 抢占 |
 | [内存管理学习总结](learning/memory-management.md) | 内存与分页知识、架构能力、项目选择和验证依据 |
+| [RISC-V 用户态与系统调用学习总结](learning/riscv-user-mode.md) | 特权边界、首次进入、地址空间、系统调用 ABI 和故障隔离 |
 | [第三方代码](third-party.md) | 实际引入的外部源码、版本与许可 |
 
 `modules/` 保存当前实现的稳定事实，接口或不变量变化时同步更新。`learning/` 保存开发过程中值得集中复习的知识、已经确定的项目选择及理由、架构或板级资料依据，以及可复用的验证和调试经验；它不保存未确认方案、TODO、临时 plan 或流水账。根目录 `README.md` 记录当前能力、运行入口和近期方向。每个可独立验证的子系统阶段结束时都要主动检查这三类文档，而不是等到人再次提问，也不是每个提交都追加流水账。

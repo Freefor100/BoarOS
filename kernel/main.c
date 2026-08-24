@@ -306,8 +306,8 @@ static enum riscv_sv39_status build_transition_page_table(void)
         return status;
     }
     status = riscv_sv39_map_range(&transition_page_table,
-                                  VIRT_UART_MMIO_BASE,
-                                  VIRT_UART_MMIO_BASE,
+                                  VIRT_UART_MMIO_PHYSICAL_BASE,
+                                  VIRT_UART_MMIO_PHYSICAL_BASE,
                                   VIRT_UART_MMIO_SIZE,
                                   RISCV_SV39_READ | RISCV_SV39_WRITE);
     if (status != RISCV_SV39_STATUS_OK) {
@@ -415,8 +415,8 @@ static enum riscv_sv39_status build_kernel_page_table(
     }
 
     return riscv_sv39_map_range(&kernel_page_table,
-                                VIRT_UART_MMIO_BASE,
-                                VIRT_UART_MMIO_BASE,
+                                VIRT_UART_MMIO_KERNEL_BASE,
+                                VIRT_UART_MMIO_PHYSICAL_BASE,
                                 VIRT_UART_MMIO_SIZE,
                                 RISCV_SV39_READ | RISCV_SV39_WRITE);
 }
@@ -571,6 +571,7 @@ void kernel_main(unsigned long hart_id, const void *dtb)
     if (sv39_status != RISCV_SV39_STATUS_OK) {
         shutdown_for_sv39_error(sv39_status);
     }
+    virt_uart_use_kernel_mapping();
 
     page_status = physical_page_allocator_bind_access(
         &page_allocator,

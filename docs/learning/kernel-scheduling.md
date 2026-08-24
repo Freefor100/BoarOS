@@ -1,6 +1,6 @@
 # 内核线程与抢占调度学习总结
 
-本文整理实现最小可抢占内核线程需要掌握的执行上下文、ABI、状态转换、栈所有权和 timer 调度知识，并记录 BoarOS 当前已经确定的选择。当前接口和限制以[内核线程调度模块](../modules/kernel-scheduler.md)为准。
+本文整理实现最小可抢占内核/用户任务需要掌握的执行上下文、ABI、状态转换、栈与地址空间所有权和 timer 调度知识，并记录 BoarOS 当前已经确定的选择。当前接口和限制以[内核线程调度模块](../modules/kernel-scheduler.md)为准。
 
 ## 内核线程需要保存什么
 
@@ -16,7 +16,7 @@ Switch context 面向 `riscv_context_switch(previous, next)` 这一普通函数�
 
 RISC-V psABI 把 `tp` 作为固定用途寄存器，普通函数不能把它当临时寄存器。内核可以约定它始终指向当前线程，从而无需全局查找或用 `sp & page_mask` 推导对象。
 
-`sp` 掩码方案把线程对象布局、栈大小和对齐永久耦合起来；一旦改成多页栈、guard page 或独立控制块，所有调用点都要变化。`tp=current` 让单页布局保持 scheduler 私有。代价是当前内核不能同时把 `tp` 用作 C TLS 基址；以后进入用户态时，还要在用户 TLS、内核 current 和 trap 换栈之间明确保存/恢复规则。
+`sp` 掩码方案把线程对象布局、栈大小和对齐永久耦合起来；一旦改成多页栈、guard page 或独立控制块，所有调用点都要变化。`tp=current` 让单页布局保持 scheduler 私有。代价是内核不能同时把 `tp` 用作 C TLS 基址。用户态可以拥有自己的 `tp`；trap 入口通过 `sscratch <-> tp` 暂存它并恢复内核 current，返回用户态时再反向交换。
 
 ## 从 Timer Trap 到抢占再返回
 
@@ -36,6 +36,8 @@ A 普通代码
 
 若 B 从未运行过，它的初始 `ra` 指向 trampoline，初始 `sp` 是自己的栈顶，`s0/s1` 临时携带入口和参数。trampoline 开启 SIE 后调用入口；入口返回则关闭 SIE 并进入线程退出路径。
 
+首次运行用户任务不是调用一个 U-mode C 函数。Scheduler 预先在任务内核栈上构造 Trap Frame，令 switch context 的 `ra` 指向公共 trap return、`sp` 指向该 Frame。第一次被选中时，context switch 直接进入返回汇编，验证 U-mode 来源后由 `sret` 恢复用户 PC、SP、TP 和整数寄存器。这样首次进入和以后从 trap 恢复共用一条架构路径。
+
 这个流程说明“timer handler 返回”不一定立刻回到触发本次中断的线程。context switch 先换了 C 调用链和栈，dispatcher 最终返回的是被恢复线程先前留下的 trap 调用。每个线程始终使用自己的 Trap Frame 和内核栈。
 
 ## FIFO、时间片与 elapsed
@@ -48,7 +50,7 @@ BoarOS 的 timer backend 保留 deadline 相位，并可能一次报告多个迟
 
 ## 状态与所有权必须一起变化
 
-当前普通线程生命周期为：
+当前任务生命周期为：
 
 ```text
 allocated page -> READY -> RUNNING -> READY
@@ -57,6 +59,8 @@ allocated page -> READY -> RUNNING -> READY
 ```
 
 队列操作不只是移动指针，还转移“谁拥有这张页、谁可能仍在使用这张栈”的事实。创建只有在页访问、元数据、canary 和初始 context 全部成功后才能提交 READY；此前失败必须回滚页。RUNNING 线程返回时，当前 SP 仍在自己的页中，因此不能边退出边释放。它先进入 EXITED 并永不恢复，等 idle 已运行在静态 boot stack 上再释放。
+
+用户任务还独占一个运行期 Sv39 地址空间。创建接口采用移动所有权：全部入口、用户栈权限和初始 Frame 检查成功后，地址空间才从调用者转交任务；失败时调用者仍然拥有它。调度切换在修改队列/current 前先切换到目标 `satp`，使用 ASID 0 时每次全局刷新 TLB。回收则先销毁用户叶子页和私有页表，再释放任务页；中途失败的对象留在完成队首，后续重试不会双重销毁。
 
 退出切换把旧寄存器写入一份永不入队的 discard context。这样退出线程没有可再次选择的 switch context，idle 回收页也不会留下悬空恢复点。若退出路径发现 `tp`、状态、边界或 canary 损坏，它不能像普通函数那样返回错误；安全做法是记录错误、切到可信 idle 栈，再由仍能返回状态的 timer 调用链执行 fatal 诊断。
 
@@ -77,11 +81,11 @@ ready/exited 队列会同时被普通线程创建路径、timer handler 和 idle
 ## BoarOS 当前选择
 
 - RISC-V 异步现场继续使用完整 Trap Frame，普通调度使用独立的 psABI switch context。
-- `tp` 固定为 current kernel thread；普通线程不使用 C TLS。
+- 内核 `tp` 固定为 current；用户 `tp` 独立保存，`sscratch` 只在 U-mode 保存 current，内核态保持为零。
 - 单 hart FIFO round-robin，一个 tick 时间片，一次 trap 最多切换一次。
-- 普通线程使用私有 4 KiB 单页栈布局；boot context 成为永久 idle，继续使用静态 boot stack。
-- 线程入口返回即退出；idle 在另一张栈上回收页。
-- 队列临界区保存并关闭 SIE；不为尚未实现的 SMP、阻塞、优先级、用户地址空间或 F/V 状态建立占位层。
+- 普通内核/用户任务使用私有 4 KiB 单页内核栈布局；用户任务额外独占一个 Sv39 用户地址空间；boot context 成为永久 idle，继续使用静态 boot stack。
+- 内核线程入口返回即退出；用户任务通过 syscall 或同步故障退出。idle 在另一张栈上先回收用户地址空间、再回收任务页。
+- 队列临界区保存并关闭 SIE；不为尚未实现的 SMP、阻塞、优先级、进程/PID 或 F/V 状态建立占位层。
 
 这些选择形成完整、可测的内核线程闭环，同时把以后可能变化的策略、栈布局和 per-hart 组织留在模块内部。RISC-V context 机制可在 QEMU `virt` 与 VisionFive 2 复用；平台 timebase 仍由 DTB 决定。LoongArch 需要自己的 switch context、CSR/中断和 16 KiB 栈页实现，不能复用 RISC-V 汇编。
 
@@ -92,6 +96,7 @@ ready/exited 队列会同时被普通线程创建路径、timer handler 和 idle
 - 只让线程打印一次不能证明抢占；worker 必须不调用 yield 并持续忙等，由真实 timer 形成 A -> B -> A。
 - 给 `s0..s11` 设置独立哨兵并跨多次抢占比较，可发现错误偏移、漏保存和 32/64 位宽度错误；同时检查最终对象反汇编，验证实际链接指令而非源码文本。
 - 记录每个 worker 的 `sp/tp`、最终 idle `sp/tp` 和分配器空闲计数，能同时验证独立栈、current ABI、退出切换和页回收。
+- 用户任务测试还应跨真实 timer 抢占检查用户 `gp/sp/tp/s0..s11`，用两个独立根页表隔离正常任务与故障任务，并在完成后核对全部叶子页、页表页和任务页归还。
 - 正常生产内核会永久 idle，有限关机逻辑应放在测试 ELF 的链接包装中；生产映像需用符号表确认不含测试 worker。
 - 静态分析适合发现 C 状态路径中的空指针、未初始化、双重释放和释放后使用；汇编寄存器集合、Trap Frame/context 配合及真实抢占顺序仍需要反汇编和 QEMU 端到端测试。
 

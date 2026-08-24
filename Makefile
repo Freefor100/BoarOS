@@ -35,6 +35,8 @@ SCHEDULER_CASES_TEST_KERNEL_RV := \
 SCHEDULER_BOOT_TEST_KERNEL_RV := \
 	$(BUILD_DIR)/tests/kernel-scheduler-boot-rv
 SYSCALL_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-syscall-rv
+USER_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-user-rv
+USER_FATAL_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-user-fatal-rv
 
 ARCH_FLAGS := -march=rv64imac_zicsr_zifencei -mabi=lp64 -mcmodel=medany
 CPPFLAGS := -Iinclude -DBOAROS_PAGE_SHIFT=12
@@ -71,11 +73,13 @@ OBJECTS := \
 TEST_RUNTIME_C_SOURCES := \
 	arch/riscv/context.c \
 	arch/riscv/sbi.c \
+	arch/riscv/sv39.c \
 	arch/riscv/timer.c \
 	arch/riscv/trap.c \
 	arch/riscv/virt_uart.c \
 	kernel/physical_page.c \
 	kernel/scheduler.c \
+	kernel/syscall.c \
 	kernel/tick.c
 TEST_RUNTIME_ASM_SOURCES := \
 	arch/riscv/boot.S \
@@ -129,7 +133,6 @@ PAGE_TEST_OBJECTS := \
 	$(patsubst %.c,$(BUILD_DIR)/%.o,$(PAGE_TEST_C_SOURCES))
 SV39_TEST_C_SOURCES := \
 	arch/riscv/direct_map.c \
-	arch/riscv/sv39.c \
 	tests/riscv/direct_map_cases.c \
 	tests/riscv/sv39_cases.c \
 	tests/riscv/sv39_main.c
@@ -137,7 +140,6 @@ SV39_TEST_OBJECTS := \
 	$(TEST_RUNTIME_OBJECTS) \
 	$(patsubst %.c,$(BUILD_DIR)/%.o,$(SV39_TEST_C_SOURCES))
 SV39_FAULT_TEST_C_SOURCES := \
-	arch/riscv/sv39.c \
 	kernel/boot_memory.c \
 	kernel/dtb.c \
 	tests/riscv/sv39_fault_main.c
@@ -173,12 +175,21 @@ SCHEDULER_BOOT_TEST_OBJECTS := \
 	$(patsubst %.c,$(BUILD_DIR)/%.o,$(SCHEDULER_BOOT_TEST_C_SOURCES)) \
 	$(patsubst %.S,$(BUILD_DIR)/%.o,$(SCHEDULER_BOOT_TEST_ASM_SOURCES))
 SYSCALL_TEST_C_SOURCES := \
-	kernel/syscall.c \
 	tests/riscv/syscall_cases.c \
 	tests/riscv/syscall_main.c
 SYSCALL_TEST_OBJECTS := \
 	$(TEST_RUNTIME_OBJECTS) \
 	$(patsubst %.c,$(BUILD_DIR)/%.o,$(SYSCALL_TEST_C_SOURCES))
+USER_TEST_C_SOURCES := tests/riscv/user_boot.c
+USER_TEST_ASM_SOURCES := tests/riscv/user_payload.S
+USER_TEST_OBJECTS := \
+	$(OBJECTS) \
+	$(patsubst %.c,$(BUILD_DIR)/%.o,$(USER_TEST_C_SOURCES)) \
+	$(patsubst %.S,$(BUILD_DIR)/%.o,$(USER_TEST_ASM_SOURCES))
+USER_FATAL_TEST_C_SOURCES := tests/riscv/user_bad_return.c
+USER_FATAL_TEST_OBJECTS := \
+	$(USER_TEST_OBJECTS) \
+	$(patsubst %.c,$(BUILD_DIR)/%.o,$(USER_FATAL_TEST_C_SOURCES))
 DEPS := \
 	$(OBJECTS:.o=.d) \
 	$(TRAP_TEST_OBJECTS:.o=.d) \
@@ -195,7 +206,9 @@ DEPS := \
 	$(CONTEXT_TEST_OBJECTS:.o=.d) \
 	$(SCHEDULER_CASES_TEST_OBJECTS:.o=.d) \
 	$(SCHEDULER_BOOT_TEST_OBJECTS:.o=.d) \
-	$(SYSCALL_TEST_OBJECTS:.o=.d)
+	$(SYSCALL_TEST_OBJECTS:.o=.d) \
+	$(USER_TEST_OBJECTS:.o=.d) \
+	$(USER_FATAL_TEST_OBJECTS:.o=.d)
 
 .PHONY: all clean debug-riscv references run-riscv test-dtb-riscv \
 	test-context-riscv \
@@ -203,7 +216,7 @@ DEPS := \
 	test-page-riscv test-scheduler-cases-riscv test-scheduler-riscv \
 	test-references test-riscv test-sv39-fault-riscv test-sv39-riscv \
 	test-syscall-riscv test-timer-riscv test-trap-riscv \
-	test-trap-return-riscv
+	test-trap-return-riscv test-user-fatal-riscv test-user-riscv
 
 all: $(KERNEL_RV)
 
@@ -300,6 +313,24 @@ $(SYSCALL_TEST_KERNEL_RV): $(SYSCALL_TEST_OBJECTS) arch/riscv/linker.ld
 		-Wl,-Map,$(BUILD_DIR)/tests/kernel-syscall-rv.map \
 		-o $@ $(SYSCALL_TEST_OBJECTS)
 
+$(USER_TEST_KERNEL_RV): $(USER_TEST_OBJECTS) arch/riscv/linker.ld
+	$(CC) $(LDFLAGS) -Wl,--wrap=riscv_sv39_activate \
+		-Wl,--wrap=kernel_scheduler_init \
+		-Wl,--wrap=kernel_scheduler_reap_one \
+		-Wl,--wrap=kernel_tick_advance \
+		-Wl,-Map,$(BUILD_DIR)/tests/kernel-user-rv.map \
+		-o $@ $(USER_TEST_OBJECTS)
+
+$(USER_FATAL_TEST_KERNEL_RV): $(USER_FATAL_TEST_OBJECTS) \
+		arch/riscv/linker.ld
+	$(CC) $(LDFLAGS) -Wl,--wrap=riscv_sv39_activate \
+		-Wl,--wrap=kernel_scheduler_init \
+		-Wl,--wrap=kernel_scheduler_reap_one \
+		-Wl,--wrap=kernel_tick_advance \
+		-Wl,--wrap=riscv_trap_dispatch \
+		-Wl,-Map,$(BUILD_DIR)/tests/kernel-user-fatal-rv.map \
+		-o $@ $(USER_FATAL_TEST_OBJECTS)
+
 $(BUILD_DIR)/%.o: %.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c $< -o $@
@@ -320,6 +351,7 @@ test-riscv: $(DTB_TEST_KERNEL_RV) $(PAGE_TEST_KERNEL_RV) \
 	$(CONTEXT_TEST_KERNEL_RV) $(SCHEDULER_CASES_TEST_KERNEL_RV) \
 	$(SCHEDULER_BOOT_TEST_KERNEL_RV) \
 	$(SYSCALL_TEST_KERNEL_RV) \
+	$(USER_TEST_KERNEL_RV) $(USER_FATAL_TEST_KERNEL_RV) \
 	$(SV39_TEST_KERNEL_RV) $(SV39_FAULT_TEST_KERNEL_RV) \
 	$(TRAP_RETURN_TEST_KERNEL_RV) $(TRAP_RETURN_SIE_TEST_KERNEL_RV) \
 	$(HIGH_HALF_TRAP_TEST_KERNEL_RV) $(NO_IDENTITY_TEST_KERNEL_RV) \
@@ -342,6 +374,11 @@ test-riscv: $(DTB_TEST_KERNEL_RV) $(PAGE_TEST_KERNEL_RV) \
 	QEMU_RISCV64=$(QEMU_RISCV64) \
 		SYSCALL_TEST_KERNEL_RV=$(SYSCALL_TEST_KERNEL_RV) \
 		./tests/syscall-riscv.sh
+	QEMU_RISCV64=$(QEMU_RISCV64) USER_TEST_KERNEL_RV=$(USER_TEST_KERNEL_RV) \
+		./tests/user-riscv.sh
+	QEMU_RISCV64=$(QEMU_RISCV64) \
+		USER_FATAL_TEST_KERNEL_RV=$(USER_FATAL_TEST_KERNEL_RV) \
+		./tests/user-fatal-riscv.sh
 	QEMU_RISCV64=$(QEMU_RISCV64) \
 		SV39_TEST_KERNEL_RV=$(SV39_TEST_KERNEL_RV) ./tests/sv39-riscv.sh
 	QEMU_RISCV64=$(QEMU_RISCV64) \
@@ -393,6 +430,14 @@ test-scheduler-riscv: $(SCHEDULER_BOOT_TEST_KERNEL_RV)
 test-syscall-riscv: $(SYSCALL_TEST_KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) SYSCALL_TEST_KERNEL_RV=$< \
 		./tests/syscall-riscv.sh
+
+test-user-riscv: $(USER_TEST_KERNEL_RV)
+	QEMU_RISCV64=$(QEMU_RISCV64) USER_TEST_KERNEL_RV=$< \
+		./tests/user-riscv.sh
+
+test-user-fatal-riscv: $(USER_FATAL_TEST_KERNEL_RV)
+	QEMU_RISCV64=$(QEMU_RISCV64) USER_FATAL_TEST_KERNEL_RV=$< \
+		./tests/user-fatal-riscv.sh
 
 test-sv39-riscv: $(SV39_TEST_KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) SV39_TEST_KERNEL_RV=$< \

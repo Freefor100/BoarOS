@@ -54,6 +54,8 @@ verify_trap_return_sequence()
 
     sed -n '/<riscv_trap_entry>:/,/^$/p' \
         "$full_disassembly" >"$entry_disassembly"
+    sed -n '/<riscv_trap_return>:/,/^$/p' \
+        "$full_disassembly" >>"$entry_disassembly"
 
     address_count=$(grep -cE \
         '[[:space:]]addi[[:space:]]+t1,sp,256$' \
@@ -66,9 +68,16 @@ verify_trap_return_sequence()
         "$entry_disassembly" || true)
     sret_count=$(grep -cE \
         '[[:space:]]sret$' "$entry_disassembly" || true)
+    gp_auipc_count=$(grep -cE \
+        '[[:space:]]auipc[[:space:]]+gp,' \
+        "$entry_disassembly" || true)
+    gp_addi_count=$(grep -cE \
+        '[[:space:]]addi[[:space:]]+gp,gp,' \
+        "$entry_disassembly" || true)
 
     if [ "$address_count" -ne 1 ] || [ "$sc_count" -ne 1 ] || \
-        [ "$sepc_count" -ne 1 ] || [ "$sret_count" -ne 1 ]; then
+        [ "$sepc_count" -ne 1 ] || [ "$sret_count" -ne 1 ] || \
+        [ "$gp_auipc_count" -ne 1 ] || [ "$gp_addi_count" -ne 1 ]; then
         cat "$entry_disassembly" >&2
         echo "trap return reservation-clearing sequence is missing or ambiguous" >&2
         exit 1

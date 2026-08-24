@@ -82,6 +82,9 @@ enum riscv_sv39_status riscv_sv39_activate(
 
 uint64_t riscv_sv39_current_satp(void);
 
+/* Only Bare or Sv39 with ASID 0 is accepted. */
+enum riscv_sv39_status riscv_sv39_switch_satp(uint64_t satp);
+
 /* The user-space object and kernel table must use the same allocator. */
 enum riscv_sv39_status riscv_sv39_user_space_init(
     struct riscv_sv39_user_space *space,
@@ -99,6 +102,10 @@ enum riscv_sv39_status riscv_sv39_user_lookup(
     const struct riscv_sv39_user_space *space,
     uint64_t virtual_address,
     struct riscv_sv39_mapping *mapping);
+
+enum riscv_sv39_status riscv_sv39_user_space_satp(
+    const struct riscv_sv39_user_space *space,
+    uint64_t *satp);
 
 /* Success consumes source; failure leaves both objects unchanged. */
 enum riscv_sv39_status riscv_sv39_user_space_move(

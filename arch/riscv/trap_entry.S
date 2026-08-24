@@ -1,4 +1,5 @@
 #include <arch/riscv/trap.h>
+#include <arch/riscv/thread.h>
 
     .section .text, "ax", @progbits
     .align 2
@@ -6,12 +7,44 @@
     .type riscv_trap_entry, @function
 
 riscv_trap_entry:
+    /* U-mode keeps current in sscratch and its own tp in tp. */
+    csrrw tp, sscratch, tp
+    bnez tp, .Luser_entry
+
+    /* S-mode keeps sscratch zero; restore its kernel tp immediately. */
+    csrrw tp, sscratch, tp
     addi sp, sp, -RISCV_TRAP_FRAME_SIZE
 
+    sd t0, RISCV_TRAP_FRAME_T0(sp)
+    sd tp, RISCV_TRAP_FRAME_TP(sp)
+    sd zero, RISCV_TRAP_FRAME_KERNEL_TP(sp)
+    addi t0, sp, RISCV_TRAP_FRAME_SIZE
+    sd t0, RISCV_TRAP_FRAME_SP(sp)
+    j .Lsave_common
+
+.Luser_entry:
+    sd sp, RISCV_THREAD_STATE_USER_SP(tp)
+    ld sp, RISCV_THREAD_STATE_KERNEL_SP(tp)
+    addi sp, sp, -RISCV_TRAP_FRAME_SIZE
+
+    sd t0, RISCV_TRAP_FRAME_T0(sp)
+    ld t0, RISCV_THREAD_STATE_USER_SP(tp)
+    sd t0, RISCV_TRAP_FRAME_SP(sp)
+    csrr t0, sscratch
+    sd t0, RISCV_TRAP_FRAME_TP(sp)
+    sd tp, RISCV_TRAP_FRAME_KERNEL_TP(sp)
+    csrw sscratch, zero
+
+.Lsave_common:
     sd ra, RISCV_TRAP_FRAME_RA(sp)
     sd gp, RISCV_TRAP_FRAME_GP(sp)
-    sd tp, RISCV_TRAP_FRAME_TP(sp)
-    sd t0, RISCV_TRAP_FRAME_T0(sp)
+
+    /* The saved gp may be user-controlled; C must see the kernel value. */
+    .option push
+    .option norelax
+    la gp, __global_pointer$
+    .option pop
+
     sd t1, RISCV_TRAP_FRAME_T1(sp)
     sd t2, RISCV_TRAP_FRAME_T2(sp)
     sd s0, RISCV_TRAP_FRAME_S0(sp)
@@ -39,8 +72,6 @@ riscv_trap_entry:
     sd t5, RISCV_TRAP_FRAME_T5(sp)
     sd t6, RISCV_TRAP_FRAME_T6(sp)
 
-    addi t0, sp, RISCV_TRAP_FRAME_SIZE
-    sd t0, RISCV_TRAP_FRAME_SP(sp)
     csrr t0, sstatus
     sd t0, RISCV_TRAP_FRAME_SSTATUS(sp)
     csrr t0, sepc
@@ -53,12 +84,29 @@ riscv_trap_entry:
     mv a0, sp
     call riscv_trap_dispatch
 
+    .size riscv_trap_entry, . - riscv_trap_entry
+
+    .globl riscv_trap_return
+    .type riscv_trap_return, @function
+riscv_trap_return:
     ld t0, RISCV_TRAP_FRAME_SSTATUS(sp)
-    andi t1, t0, RISCV_SSTATUS_SPP
-    beqz t1, .Lbad_return
     andi t1, t0, RISCV_SSTATUS_SIE
     bnez t1, .Lbad_return
+    andi t1, t0, RISCV_SSTATUS_SPP
+    bnez t1, .Lsupervisor_return
 
+    ld t1, RISCV_TRAP_FRAME_KERNEL_TP(sp)
+    beqz t1, .Lbad_return
+    bne tp, t1, .Lbad_return
+    ld t1, RISCV_THREAD_STATE_USER_MODE(tp)
+    beqz t1, .Lbad_return
+    csrw sscratch, tp
+    j .Lprepare_return
+
+.Lsupervisor_return:
+    csrw sscratch, zero
+
+.Lprepare_return:
     ld t0, RISCV_TRAP_FRAME_SEPC(sp)
     addi t1, sp, RISCV_TRAP_FRAME_SEPC
     sc.d zero, t0, (t1)
@@ -103,4 +151,4 @@ riscv_trap_entry:
     mv a0, sp
     tail riscv_trap_bad_return
 
-    .size riscv_trap_entry, . - riscv_trap_entry
+    .size riscv_trap_return, . - riscv_trap_return

@@ -22,6 +22,8 @@
     (UINT64_C(1) << RISCV_SV39_PHYSICAL_BITS)
 #define RISCV_SV39_PHYSICAL_MAX (RISCV_SV39_PHYSICAL_LIMIT - UINT64_C(1))
 #define RISCV_SV39_SATP_MODE (UINT64_C(8) << 60U)
+#define RISCV_SV39_SATP_MODE_MASK (UINT64_C(0xf) << 60U)
+#define RISCV_SV39_SATP_ASID_MASK (UINT64_C(0xffff) << 44U)
 #define RISCV_SV39_SATP_PPN_MASK ((UINT64_C(1) << 44U) - UINT64_C(1))
 
 static int canonical_virtual_address(uint64_t address)
@@ -309,11 +311,34 @@ uint64_t riscv_sv39_current_satp(void)
     return value;
 }
 
-static void switch_satp(uint64_t value)
+static void write_satp(uint64_t value)
 {
     __asm__ volatile("sfence.vma zero, zero" ::: "memory");
     __asm__ volatile("csrw satp, %0" : : "r"(value) : "memory");
     __asm__ volatile("sfence.vma zero, zero" ::: "memory");
+}
+
+enum riscv_sv39_status riscv_sv39_switch_satp(uint64_t satp)
+{
+    uint64_t mode = satp & RISCV_SV39_SATP_MODE_MASK;
+    uint64_t previous;
+
+    if ((mode == 0U && satp != 0U) ||
+        (mode != 0U && mode != RISCV_SV39_SATP_MODE) ||
+        (satp & RISCV_SV39_SATP_ASID_MASK) != 0U) {
+        return RISCV_SV39_STATUS_INVALID;
+    }
+
+    previous = riscv_sv39_current_satp();
+    if (previous == satp) {
+        return RISCV_SV39_STATUS_OK;
+    }
+    write_satp(satp);
+    if (riscv_sv39_current_satp() != satp) {
+        write_satp(previous);
+        return RISCV_SV39_STATUS_INVALID;
+    }
+    return RISCV_SV39_STATUS_OK;
 }
 
 enum riscv_sv39_status riscv_sv39_activate(
@@ -343,9 +368,8 @@ enum riscv_sv39_status riscv_sv39_activate(
 
     previous_satp = riscv_sv39_current_satp();
     table->state = RISCV_SV39_STATE_ACTIVE;
-    switch_satp(satp);
-    if (riscv_sv39_current_satp() != satp) {
-        switch_satp(previous_satp);
+    if (riscv_sv39_switch_satp(satp) != RISCV_SV39_STATUS_OK) {
+        (void)riscv_sv39_switch_satp(previous_satp);
         table->state = RISCV_SV39_STATE_FAILED;
         return RISCV_SV39_STATUS_INVALID;
     }
@@ -726,6 +750,32 @@ enum riscv_sv39_status riscv_sv39_user_lookup(
     }
 
     return RISCV_SV39_STATUS_STATE;
+}
+
+enum riscv_sv39_status riscv_sv39_user_space_satp(
+    const struct riscv_sv39_user_space *space,
+    uint64_t *satp)
+{
+    uint64_t root_ppn;
+    uint64_t result;
+
+    if (space == 0 || satp == 0) {
+        return RISCV_SV39_STATUS_INVALID;
+    }
+    if (space->state != RISCV_SV39_USER_SPACE_LIVE) {
+        return RISCV_SV39_STATUS_STATE;
+    }
+    if ((space->root_address & BOAROS_PAGE_MASK) != 0U) {
+        return RISCV_SV39_STATUS_INVALID;
+    }
+    root_ppn = space->root_address >> BOAROS_PAGE_SHIFT;
+    if ((root_ppn & ~RISCV_SV39_SATP_PPN_MASK) != 0U) {
+        return RISCV_SV39_STATUS_INVALID;
+    }
+
+    result = RISCV_SV39_SATP_MODE | root_ppn;
+    *satp = result;
+    return RISCV_SV39_STATUS_OK;
 }
 
 enum riscv_sv39_status riscv_sv39_user_space_move(

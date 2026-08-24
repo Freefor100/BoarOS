@@ -4,9 +4,16 @@
 #define UART_LSR 5UL
 #define UART_LSR_THR_EMPTY (1U << 5)
 
+static unsigned long uart_mmio_base = VIRT_UART_MMIO_PHYSICAL_BASE;
+
 static volatile unsigned char *uart_register(unsigned long offset)
 {
-    return (volatile unsigned char *)(VIRT_UART_MMIO_BASE + offset);
+    return (volatile unsigned char *)(uart_mmio_base + offset);
+}
+
+void virt_uart_use_kernel_mapping(void)
+{
+    uart_mmio_base = VIRT_UART_MMIO_KERNEL_BASE;
 }
 
 void virt_uart_putc(char character)

@@ -25,6 +25,18 @@ static unsigned long entry_count;
 _Static_assert(RISCV_THREAD_STATE_KERNEL_SP ==
                    offsetof(struct riscv_thread_state, kernel_sp),
                "RISC-V thread kernel-sp offset mismatch");
+_Static_assert(RISCV_THREAD_STATE_USER_SP ==
+                   offsetof(struct riscv_thread_state, user_sp),
+               "RISC-V thread user-sp offset mismatch");
+_Static_assert(RISCV_THREAD_STATE_USER_MODE ==
+                   offsetof(struct riscv_thread_state, user_mode),
+               "RISC-V thread user-mode offset mismatch");
+_Static_assert(RISCV_THREAD_STATE_SATP ==
+                   offsetof(struct riscv_thread_state, satp),
+               "RISC-V thread satp offset mismatch");
+_Static_assert(RISCV_THREAD_STATE_SIZE ==
+                   sizeof(struct riscv_thread_state),
+               "RISC-V thread state size mismatch");
 
 static void *scheduler_page_access(uint64_t physical_address)
 {

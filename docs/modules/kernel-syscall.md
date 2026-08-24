@@ -1,6 +1,6 @@
 # 系统调用解码模块
 
-本文描述与架构 Trap Frame 解耦的系统调用语义接口。当前模块只解码已经从用户寄存器复制出的请求，不负责权限判断、`sepc` 推进、寄存器回写、线程退出或资源回收。
+本文描述与架构 Trap Frame 解耦的系统调用语义接口。模块只解码已经从用户寄存器复制出的请求；RISC-V Trap 层负责 `a7/a0..a5` 转换、`sepc` 推进和 `a0` 回写，scheduler 负责退出与资源回收。
 
 ## 接口
 
@@ -26,4 +26,4 @@ enum kernel_syscall_status kernel_syscall_dispatch(
 - `exit` 编号为 93，产生 `EXIT`；状态保留参数 0 的低 8 位。
 - 其他编号产生 `RETURN`，返回 `-ENOSYS`（-38）。
 
-`make test-syscall-riscv` 在 QEMU 上验证空指针失败原子性、`exit(93)` 的状态截断，以及多个未知编号的统一返回。当前尚未接入 RISC-V 用户态 ecall Trap；该连接属于架构 Trap 和 scheduler 的职责。
+`make test-syscall-riscv` 验证空指针失败原子性、`exit(93)` 的状态截断，以及多个未知编号的统一返回。`make test-user-riscv` 从真实 U-mode 执行未知 ecall 和 `exit(93)`：未知调用返回后继续执行，exit 形成用户完成记录且不再返回该 Frame。

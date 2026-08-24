@@ -3,7 +3,10 @@
 #include <arch/riscv/trap.h>
 #include <arch/riscv/virt_uart.h>
 #include <kernel/scheduler.h>
+#include <kernel/syscall.h>
 #include <kernel/tick.h>
+
+#include <stdint.h>
 
 static void riscv_trap_fatal(const struct riscv_trap_frame *frame)
     __attribute__((noreturn));
@@ -60,6 +63,8 @@ static void riscv_scheduler_fatal(
 
 void riscv_trap_dispatch(struct riscv_trap_frame *frame)
 {
+    int from_user = (frame->sstatus & RISCV_SSTATUS_SPP) == 0U;
+
     if (frame->scause ==
         (RISCV_SCAUSE_INTERRUPT | RISCV_SCAUSE_SUPERVISOR_TIMER)) {
         uint64_t elapsed_ticks;
@@ -79,6 +84,49 @@ void riscv_trap_dispatch(struct riscv_trap_frame *frame)
             }
         }
         return;
+    }
+
+    if (from_user && frame->scause == RISCV_SCAUSE_USER_ECALL) {
+        struct kernel_syscall_request request = {
+            .number = frame->a7,
+            .arguments = {
+                frame->a0,
+                frame->a1,
+                frame->a2,
+                frame->a3,
+                frame->a4,
+                frame->a5,
+            },
+        };
+        struct kernel_syscall_result result;
+
+        if (kernel_syscall_dispatch(&request, &result) !=
+            KERNEL_SYSCALL_STATUS_OK) {
+            riscv_trap_fatal(frame);
+        }
+        if (result.action == KERNEL_SYSCALL_ACTION_EXIT) {
+            kernel_user_thread_exit(KERNEL_THREAD_EXIT_SYSCALL,
+                                    (uint64_t)result.value,
+                                    0U);
+        }
+        if (result.action != KERNEL_SYSCALL_ACTION_RETURN) {
+            riscv_trap_fatal(frame);
+        }
+        if (frame->sepc > UINT64_MAX - 4U) {
+            kernel_user_thread_exit(KERNEL_THREAD_EXIT_USER_FAULT,
+                                    frame->scause,
+                                    frame->stval);
+        }
+        frame->a0 = (unsigned long)result.value;
+        frame->sepc += 4U;
+        return;
+    }
+
+    if (from_user &&
+        (frame->scause & RISCV_SCAUSE_INTERRUPT) == 0U) {
+        kernel_user_thread_exit(KERNEL_THREAD_EXIT_USER_FAULT,
+                                frame->scause,
+                                frame->stval);
     }
 
     riscv_trap_fatal(frame);

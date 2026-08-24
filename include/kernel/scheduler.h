@@ -17,7 +17,10 @@ enum kernel_scheduler_status {
     KERNEL_SCHEDULER_STATUS_QUEUE_CORRUPT,
     KERNEL_SCHEDULER_STATUS_STACK_CORRUPT,
     KERNEL_SCHEDULER_STATUS_PAGE_RELEASE,
+    KERNEL_SCHEDULER_STATUS_ADDRESS_SPACE,
 };
+
+struct riscv_sv39_user_space;
 
 enum kernel_thread_kind {
     KERNEL_THREAD_KIND_KERNEL = 0,
@@ -46,6 +49,13 @@ enum kernel_scheduler_status kernel_thread_create(
     void (*entry)(void *),
     void *argument);
 
+/* Success consumes space; failure leaves it owned by the caller. */
+enum kernel_scheduler_status kernel_user_thread_create(
+    struct riscv_sv39_user_space *space,
+    uintptr_t entry,
+    uintptr_t stack_pointer,
+    uintptr_t thread_pointer);
+
 enum kernel_scheduler_status kernel_scheduler_on_tick(
     uint64_t elapsed_ticks);
 
@@ -53,5 +63,10 @@ enum kernel_scheduler_status kernel_scheduler_reap_one(
     struct kernel_thread_completion *completion);
 
 void kernel_thread_exit(void) __attribute__((noreturn));
+
+void kernel_user_thread_exit(
+    enum kernel_thread_exit_reason reason,
+    uint64_t status,
+    uint64_t detail) __attribute__((noreturn));
 
 #endif

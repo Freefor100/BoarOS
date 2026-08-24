@@ -73,6 +73,11 @@ enum riscv_context_status riscv_context_init(
     void *argument,
     void *thread_pointer);
 
+enum riscv_context_status riscv_context_init_user(
+    struct riscv_switch_context *context,
+    uintptr_t trap_frame_pointer,
+    void *thread_pointer);
+
 void riscv_context_switch(
     struct riscv_switch_context *previous,
     const struct riscv_switch_context *next);

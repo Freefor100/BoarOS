@@ -36,16 +36,19 @@
 #define RISCV_TRAP_FRAME_SEPC 256
 #define RISCV_TRAP_FRAME_SCAUSE 264
 #define RISCV_TRAP_FRAME_STVAL 272
+#define RISCV_TRAP_FRAME_KERNEL_TP 280
 #define RISCV_TRAP_FRAME_SIZE 288
 
 #define RISCV_SSTATUS_SIE 0x2
 #define RISCV_SSTATUS_SPIE 0x20
 #define RISCV_SSTATUS_SPP 0x100
+#define RISCV_SSTATUS_UXL_64 0x200000000UL
 
 #define RISCV_SCAUSE_INTERRUPT 0x8000000000000000
 #define RISCV_SCAUSE_SUPERVISOR_SOFTWARE 1
 #define RISCV_SCAUSE_BREAKPOINT 3
 #define RISCV_SCAUSE_SUPERVISOR_TIMER 5
+#define RISCV_SCAUSE_USER_ECALL 8
 
 #ifndef __ASSEMBLER__
 
@@ -87,6 +90,7 @@ struct riscv_trap_frame {
     unsigned long sepc;
     unsigned long scause;
     unsigned long stval;
+    unsigned long kernel_tp;
 } __attribute__((aligned(16)));
 
 #define RISCV_TRAP_ASSERT_OFFSET(member, offset) \
@@ -130,6 +134,7 @@ RISCV_TRAP_ASSERT_OFFSET(sstatus, RISCV_TRAP_FRAME_SSTATUS);
 RISCV_TRAP_ASSERT_OFFSET(sepc, RISCV_TRAP_FRAME_SEPC);
 RISCV_TRAP_ASSERT_OFFSET(scause, RISCV_TRAP_FRAME_SCAUSE);
 RISCV_TRAP_ASSERT_OFFSET(stval, RISCV_TRAP_FRAME_STVAL);
+RISCV_TRAP_ASSERT_OFFSET(kernel_tp, RISCV_TRAP_FRAME_KERNEL_TP);
 _Static_assert(sizeof(struct riscv_trap_frame) == RISCV_TRAP_FRAME_SIZE,
                "riscv trap frame size mismatch");
 

@@ -59,7 +59,7 @@ Direct-mode dispatcher 精确匹配：
 scause = interrupt bit | 5
 ```
 
-timer trap 进入时硬件已把旧 SIE 保存到 SPIE 并清 SIE，当前 handler 不重新开启嵌套中断。它不修改 `sepc`；在 SBI 安排新的未来 deadline 后累计 tick，再调用 scheduler。没有 READY 竞争者时 Trap Frame 通过 `sret` 回到原被中断位置；发生切换时则恢复被选线程先前的 trap 调用链。所有其他未知 cause 仍进入原有 fatal 诊断。
+timer trap 进入时硬件已把旧 SIE 保存到 SPIE 并清 SIE，当前 handler 不重新开启嵌套中断。它不修改 `sepc`；在 SBI 安排新的未来 deadline 后累计 tick，再调用 scheduler。没有 READY 竞争者时 Trap Frame 通过 `sret` 回到原被中断位置；发生切换时则先切目标 `satp`，再恢复被选任务先前的调用链。U-mode ecall 和同步故障由同一 dispatcher 的独立分支处理，其他未知 cause 进入 fatal 诊断。
 
 ## Deadline 与失败原子性
 
@@ -81,6 +81,7 @@ next    = previous_deadline + elapsed * period
 make test-dtb-riscv
 make test-timer-riscv
 make test-scheduler-riscv
+make test-user-riscv
 make test-idle-riscv
 make test-trap-return-riscv
 make test-riscv

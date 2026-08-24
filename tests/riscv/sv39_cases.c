@@ -499,6 +499,7 @@ static int test_user_space_lifecycle(void)
     uint64_t rejected_page;
     uint64_t conflict_page;
     uint64_t available_before_invalid;
+    uint64_t user_satp = UINT64_C(0x1122334455667788);
 
     layout.usable_count = 1U;
     layout.usable[0].base = (uint64_t)(uintptr_t)user_space_page_pool;
@@ -517,6 +518,11 @@ static int test_user_space_lifecycle(void)
         return 44;
     }
     kernel_table.state = RISCV_SV39_STATE_ACTIVE;
+    if (riscv_sv39_user_space_satp(&source, &user_satp) !=
+            RISCV_SV39_STATUS_STATE ||
+        user_satp != UINT64_C(0x1122334455667788)) {
+        return 45;
+    }
     kernel_root = (uint64_t *)(uintptr_t)kernel_table.root_address;
     kernel_high_entry = kernel_root[256];
     if (kernel_high_entry == 0U ||
@@ -528,7 +534,13 @@ static int test_user_space_lifecycle(void)
     }
 
     user_root = (uint64_t *)(uintptr_t)source.root_address;
-    if (source.table_pages != 1U || source.leaf_pages != 0U ||
+    if (riscv_sv39_user_space_satp(&source, &user_satp) !=
+            RISCV_SV39_STATUS_OK ||
+        user_satp != ((UINT64_C(8) << 60U) |
+                      (source.root_address >> BOAROS_PAGE_SHIFT)) ||
+        riscv_sv39_user_space_satp(&source, 0) !=
+            RISCV_SV39_STATUS_INVALID ||
+        source.table_pages != 1U || source.leaf_pages != 0U ||
         user_root[0] != 0U || user_root[255] != 0U ||
         user_root[256] != kernel_high_entry ||
         user_root[511] != kernel_root[511]) {
@@ -701,6 +713,17 @@ int run_sv39_tests(void)
     uint64_t *level0;
     uint64_t root_entry;
     uint64_t level1_entry;
+    uint64_t initial_satp = riscv_sv39_current_satp();
+
+    if (riscv_sv39_switch_satp(initial_satp) != RISCV_SV39_STATUS_OK ||
+        riscv_sv39_switch_satp(UINT64_C(1) << 60U) !=
+            RISCV_SV39_STATUS_INVALID ||
+        riscv_sv39_switch_satp((UINT64_C(8) << 60U) |
+                               (UINT64_C(1) << 44U)) !=
+            RISCV_SV39_STATUS_INVALID ||
+        riscv_sv39_current_satp() != initial_satp) {
+        return 57;
+    }
 
     reset_page_table(&table);
     if (!init_allocator(&allocator) ||
