@@ -91,7 +91,7 @@ static enum riscv_user_elf_status validate_segment(
     }
     end = segment->virtual_address + segment->memory_size;
     if (segment->virtual_address < BOAROS_PAGE_SIZE ||
-        end > RISCV_USER_ELF_STACK_BASE) {
+        end > RISCV_USER_ELF_STACK_GUARD_BASE) {
         return RISCV_USER_ELF_STATUS_INVALID_LAYOUT;
     }
     permissions = segment_permissions(segment->flags);
@@ -241,26 +241,12 @@ static enum riscv_user_elf_status permissions_for_page(
     return RISCV_USER_ELF_STATUS_OK;
 }
 
-static void clear_page(void *pointer)
-{
-    unsigned char *bytes = pointer;
-    size_t index;
-
-    for (index = 0U; index < BOAROS_PAGE_SIZE; index++) {
-        bytes[index] = 0U;
-    }
-}
-
 static enum riscv_user_elf_status map_zeroed_page(
     struct riscv_sv39_user_space *space,
-    struct physical_page_allocator *allocator,
     uint64_t virtual_address,
     uint32_t permissions)
 {
     struct riscv_sv39_mapping existing;
-    uint64_t physical_address;
-    void *pointer;
-    enum physical_page_status page_status;
     enum riscv_sv39_status sv39_status;
 
     sv39_status = riscv_sv39_user_lookup(space,
@@ -276,46 +262,19 @@ static enum riscv_user_elf_status map_zeroed_page(
         return RISCV_USER_ELF_STATUS_ADDRESS_SPACE;
     }
 
-    page_status = physical_page_allocate(allocator, &physical_address);
-    if (page_status == PHYSICAL_PAGE_STATUS_EMPTY) {
-        return RISCV_USER_ELF_STATUS_NO_MEMORY;
-    }
-    if (page_status != PHYSICAL_PAGE_STATUS_OK) {
-        return RISCV_USER_ELF_STATUS_ADDRESS_SPACE;
-    }
-    page_status = physical_page_resolve(allocator,
-                                        physical_address,
-                                        &pointer);
-    if (page_status != PHYSICAL_PAGE_STATUS_OK) {
-        if (physical_page_release(allocator, physical_address) !=
-            PHYSICAL_PAGE_STATUS_OK) {
-            return RISCV_USER_ELF_STATUS_ADDRESS_SPACE;
-        }
-        return RISCV_USER_ELF_STATUS_ADDRESS_SPACE;
-    }
-    clear_page(pointer);
-    sv39_status = riscv_sv39_user_map_owned_page(space,
-                                                 virtual_address,
-                                                 physical_address,
-                                                 permissions);
-    if (sv39_status != RISCV_SV39_STATUS_OK) {
-        enum physical_page_status release_status =
-            physical_page_release(allocator, physical_address);
-
-        if (release_status != PHYSICAL_PAGE_STATUS_OK) {
-            return RISCV_USER_ELF_STATUS_ADDRESS_SPACE;
-        }
-        return sv39_status == RISCV_SV39_STATUS_NO_MEMORY
-                   ? RISCV_USER_ELF_STATUS_NO_MEMORY
-                   : RISCV_USER_ELF_STATUS_ADDRESS_SPACE;
-    }
-    return RISCV_USER_ELF_STATUS_OK;
+    sv39_status = riscv_sv39_user_map_zeroed_page(space,
+                                                  virtual_address,
+                                                  permissions);
+    return sv39_status == RISCV_SV39_STATUS_OK
+               ? RISCV_USER_ELF_STATUS_OK
+               : sv39_status == RISCV_SV39_STATUS_NO_MEMORY
+                     ? RISCV_USER_ELF_STATUS_NO_MEMORY
+                     : RISCV_USER_ELF_STATUS_ADDRESS_SPACE;
 }
 
 static enum riscv_user_elf_status map_load_pages(
     const struct kernel_elf64_image *image,
-    struct riscv_sv39_user_space *space,
-    struct physical_page_allocator *allocator)
+    struct riscv_sv39_user_space *space)
 {
     struct kernel_elf64_program_header segment;
     uint64_t current;
@@ -343,7 +302,6 @@ static enum riscv_user_elf_status map_load_pages(
                 return status;
             }
             status = map_zeroed_page(space,
-                                     allocator,
                                      current,
                                      permissions);
             if (status != RISCV_USER_ELF_STATUS_OK) {
@@ -422,7 +380,8 @@ static enum riscv_user_elf_status finish_failure(
     struct riscv_sv39_user_space *working,
     struct riscv_sv39_user_space *output)
 {
-    if (working->state != RISCV_SV39_USER_SPACE_LIVE) {
+    if (working->state != RISCV_SV39_USER_SPACE_LIVE &&
+        working->state != RISCV_SV39_USER_SPACE_CLEANUP) {
         return failure;
     }
     if (riscv_sv39_user_space_destroy(working) ==
@@ -478,16 +437,18 @@ enum riscv_user_elf_status riscv_user_elf_load(
                                              allocator,
                                              kernel_table);
     if (sv39_status != RISCV_SV39_STATUS_OK) {
-        return sv39_status == RISCV_SV39_STATUS_NO_MEMORY
-                   ? RISCV_USER_ELF_STATUS_NO_MEMORY
-                   : RISCV_USER_ELF_STATUS_ADDRESS_SPACE;
+        return finish_failure(
+            sv39_status == RISCV_SV39_STATUS_NO_MEMORY
+                ? RISCV_USER_ELF_STATUS_NO_MEMORY
+                : RISCV_USER_ELF_STATUS_ADDRESS_SPACE,
+            &working,
+            space);
     }
-    status = map_load_pages(&image, &working, allocator);
+    status = map_load_pages(&image, &working);
     if (status != RISCV_USER_ELF_STATUS_OK) {
         return finish_failure(status, &working, space);
     }
     status = map_zeroed_page(&working,
-                             allocator,
                              RISCV_USER_ELF_STACK_BASE,
                              RISCV_SV39_READ | RISCV_SV39_WRITE);
     if (status != RISCV_USER_ELF_STATUS_OK) {

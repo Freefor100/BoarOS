@@ -6,6 +6,7 @@ project_root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 kernel=${USER_ELF_TEST_KERNEL_RV:-"$project_root/build/riscv/tests/kernel-user-elf-rv"}
 program=${USER_ELF_PROGRAM_RV:-"$project_root/build/riscv/tests/user/elf-probe-rv"}
 fault_program=${USER_ELF_FAULT_PROGRAM_RV:-"$project_root/build/riscv/tests/user/elf-text-fault-rv"}
+guard_program=${USER_ELF_GUARD_PROGRAM_RV:-"$project_root/build/riscv/tests/user/elf-guard-fault-rv"}
 readelf_rv=${READELF_RV:-riscv64-unknown-elf-readelf}
 qemu=${QEMU_RISCV64:-qemu-system-riscv64}
 output_dir=$(mktemp -d)
@@ -13,14 +14,14 @@ output="$output_dir/user-elf.log"
 
 trap 'rm -rf "$output_dir"' EXIT HUP INT TERM
 
-for file in "$kernel" "$program" "$fault_program"; do
+for file in "$kernel" "$program" "$fault_program" "$guard_program"; do
     if [ ! -f "$file" ]; then
         echo "missing user ELF test artifact: $file" >&2
         exit 1
     fi
 done
 
-for file in "$program" "$fault_program"; do
+for file in "$program" "$fault_program" "$guard_program"; do
     header=$($readelf_rv -hW "$file")
     segments=$($readelf_rv -lW "$file")
     sections=$($readelf_rv -SW "$file")
@@ -50,7 +51,7 @@ if ! timeout -k 2s 10s "$qemu" \
     exit 1
 fi
 
-if [ "$(grep -cxE 'BoarOS: user ELF completions=0x2 ticks=0x[1-9a-f][0-9a-f]* failures=0x0' "$output" || true)" -ne 1 ]; then
+if [ "$(grep -cxE 'BoarOS: user ELF completions=0x3 ticks=0x[1-9a-f][0-9a-f]* failures=0x0' "$output" || true)" -ne 1 ]; then
     tail -n 100 "$output" >&2
     echo "standalone user ELF programs did not complete correctly" >&2
     exit 1

@@ -29,8 +29,13 @@ static uint64_t test_page_pool[TEST_POOL_WORDS]
     __attribute__((aligned(BOAROS_PAGE_SIZE)));
 static uint64_t test_oom_page_pool[TEST_OOM_POOL_WORDS]
     __attribute__((aligned(BOAROS_PAGE_SIZE)));
+static uint64_t test_cleanup_page_pool[TEST_POOL_WORDS]
+    __attribute__((aligned(BOAROS_PAGE_SIZE)));
 static unsigned char test_image[TEST_IMAGE_SIZE];
 static int force_destroy_failure;
+static uint64_t inaccessible_page;
+static uint64_t fail_after_first_access_page;
+static uint32_t fail_after_first_access_count;
 
 enum riscv_sv39_status __real_riscv_sv39_user_space_destroy(
     struct riscv_sv39_user_space *space);
@@ -47,6 +52,20 @@ enum riscv_sv39_status __wrap_riscv_sv39_user_space_destroy(
 static void *identity_page_access(uint64_t address)
 {
     return (void *)(uintptr_t)address;
+}
+
+static void *faulting_page_access(uint64_t address)
+{
+    if (address == inaccessible_page) {
+        return 0;
+    }
+    if (address == fail_after_first_access_page) {
+        if (fail_after_first_access_count != 0U) {
+            return 0;
+        }
+        fail_after_first_access_count++;
+    }
+    return identity_page_access(address);
 }
 
 static void put_u16(size_t offset, uint16_t value)
@@ -152,11 +171,12 @@ static void make_valid_image(void)
     }
 }
 
-static int init_allocator_and_kernel_table(
+static int init_allocator_and_kernel_table_with_access(
     struct physical_page_allocator *allocator,
     struct riscv_sv39_page_table *kernel_table,
     void *pool,
-    size_t pool_size)
+    size_t pool_size,
+    physical_page_access_fn access)
 {
     struct boot_memory_layout layout;
 
@@ -166,7 +186,7 @@ static int init_allocator_and_kernel_table(
     if (physical_page_allocator_init(allocator, &layout) !=
             PHYSICAL_PAGE_STATUS_OK ||
         physical_page_allocator_bind_access(allocator,
-                                            identity_page_access) !=
+                                            access) !=
             PHYSICAL_PAGE_STATUS_OK ||
         riscv_sv39_page_table_init(kernel_table, allocator) !=
             RISCV_SV39_STATUS_OK) {
@@ -174,6 +194,20 @@ static int init_allocator_and_kernel_table(
     }
     kernel_table->state = RISCV_SV39_STATE_ACTIVE;
     return 1;
+}
+
+static int init_allocator_and_kernel_table(
+    struct physical_page_allocator *allocator,
+    struct riscv_sv39_page_table *kernel_table,
+    void *pool,
+    size_t pool_size)
+{
+    return init_allocator_and_kernel_table_with_access(
+        allocator,
+        kernel_table,
+        pool,
+        pool_size,
+        identity_page_access);
 }
 
 static int expect_pattern(const unsigned char *page,
@@ -260,7 +294,10 @@ unsigned long run_user_elf_cases(void)
         return 2U;
     }
     if (entry.entry != TEST_TEXT_VA ||
-        entry.stack_pointer != RISCV_USER_ELF_STACK_TOP ||
+        entry.stack_pointer != RISCV_USER_ELF_LIMIT ||
+        RISCV_USER_ELF_STACK_TOP != RISCV_USER_ELF_LIMIT ||
+        RISCV_USER_ELF_STACK_BASE !=
+            RISCV_USER_ELF_LIMIT - BOAROS_PAGE_SIZE ||
         space.state != RISCV_SV39_USER_SPACE_LIVE ||
         space.leaf_pages != 3U || space.table_pages != 5U) {
         return 3U;
@@ -301,7 +338,7 @@ unsigned long run_user_elf_cases(void)
             (RISCV_SV39_USER | RISCV_SV39_READ | RISCV_SV39_WRITE) ||
         !expect_zero(stack_page, 0U, BOAROS_PAGE_SIZE) ||
         riscv_sv39_user_lookup(&space,
-                               RISCV_USER_ELF_STACK_TOP,
+                               RISCV_USER_ELF_STACK_GUARD_BASE,
                                &stack_mapping) !=
             RISCV_SV39_STATUS_NOT_MAPPED) {
         return 6U;
@@ -548,13 +585,19 @@ static unsigned long run_layout_failures(void)
 static unsigned long run_oom_and_cleanup_cases(void)
 {
     struct physical_page_allocator allocator;
+    struct physical_page_allocator cleanup_allocator;
     struct riscv_sv39_page_table kernel_table = {0};
+    struct riscv_sv39_page_table cleanup_kernel_table = {0};
     struct riscv_sv39_user_space space = {0};
+    struct riscv_sv39_user_space cleanup_space = {0};
+    struct riscv_sv39_user_space rollback_cleanup_space = {0};
+    struct riscv_sv39_user_space root_cleanup_space = {0};
     struct riscv_user_elf_entry entry = {
         .entry = UINT64_C(0x1111111111111111),
         .stack_pointer = UINT64_C(0x2222222222222222),
     };
     uint64_t available;
+    enum riscv_sv39_status sv39_status;
 
     make_valid_image();
     if (!init_allocator_and_kernel_table(&allocator,
@@ -594,6 +637,110 @@ static unsigned long run_oom_and_cleanup_cases(void)
             RISCV_SV39_STATUS_OK ||
         physical_page_available(&allocator) != available) {
         return 4U;
+    }
+
+    inaccessible_page = 0U;
+    if (!init_allocator_and_kernel_table_with_access(
+            &cleanup_allocator,
+            &cleanup_kernel_table,
+            test_cleanup_page_pool,
+            sizeof(test_cleanup_page_pool),
+            faulting_page_access)) {
+        return 5U;
+    }
+    available = physical_page_available(&cleanup_allocator);
+    /* The kernel root is page zero; user-space init allocates page one. */
+    inaccessible_page =
+        (uint64_t)(uintptr_t)test_cleanup_page_pool +
+        BOAROS_PAGE_SIZE;
+    make_valid_image();
+    if (riscv_user_elf_load(test_image,
+                            sizeof(test_image),
+                            &cleanup_allocator,
+                            &cleanup_kernel_table,
+                            &root_cleanup_space,
+                            &entry) !=
+            RISCV_USER_ELF_STATUS_CLEANUP_REQUIRED ||
+        root_cleanup_space.state != RISCV_SV39_USER_SPACE_CLEANUP ||
+        root_cleanup_space.table_pages != 0U ||
+        root_cleanup_space.leaf_pages != 0U ||
+        root_cleanup_space.cleanup_page_owned == 0U ||
+        root_cleanup_space.cleanup_page_address != inaccessible_page ||
+        entry_changed(&entry) ||
+        physical_page_available(&cleanup_allocator) >= available) {
+        inaccessible_page = 0U;
+        return 6U;
+    }
+    inaccessible_page = 0U;
+    if (riscv_sv39_user_space_destroy(&root_cleanup_space) !=
+            RISCV_SV39_STATUS_OK ||
+        physical_page_available(&cleanup_allocator) != available) {
+        return 7U;
+    }
+
+    if (riscv_sv39_user_space_init(&rollback_cleanup_space,
+                                   &cleanup_allocator,
+                                   &cleanup_kernel_table) !=
+            RISCV_SV39_STATUS_OK) {
+        return 8U;
+    }
+    inaccessible_page =
+        (uint64_t)(uintptr_t)test_cleanup_page_pool +
+        3U * BOAROS_PAGE_SIZE;
+    fail_after_first_access_page =
+        (uint64_t)(uintptr_t)test_cleanup_page_pool +
+        2U * BOAROS_PAGE_SIZE;
+    fail_after_first_access_count = 0U;
+    sv39_status = riscv_sv39_user_map_zeroed_page(
+        &rollback_cleanup_space,
+        TEST_TEXT_VA & ~BOAROS_PAGE_MASK,
+        RISCV_SV39_READ);
+    if (sv39_status != RISCV_SV39_STATUS_CLEANUP_REQUIRED ||
+        rollback_cleanup_space.state !=
+            RISCV_SV39_USER_SPACE_CLEANUP ||
+        rollback_cleanup_space.table_pages != 2U ||
+        rollback_cleanup_space.leaf_pages != 0U ||
+        rollback_cleanup_space.cleanup_page_owned == 0U ||
+        rollback_cleanup_space.cleanup_page_address != inaccessible_page) {
+        inaccessible_page = 0U;
+        fail_after_first_access_page = 0U;
+        return 9U;
+    }
+    inaccessible_page = 0U;
+    fail_after_first_access_page = 0U;
+    if (riscv_sv39_user_space_destroy(&rollback_cleanup_space) !=
+            RISCV_SV39_STATUS_OK ||
+        physical_page_available(&cleanup_allocator) != available) {
+        return 10U;
+    }
+
+    /* kernel root, user root, L1 and L0 precede the first ELF leaf. */
+    inaccessible_page =
+        (uint64_t)(uintptr_t)test_cleanup_page_pool +
+        4U * BOAROS_PAGE_SIZE;
+    make_valid_image();
+    if (riscv_user_elf_load(test_image,
+                            sizeof(test_image),
+                            &cleanup_allocator,
+                            &cleanup_kernel_table,
+                            &cleanup_space,
+                            &entry) !=
+            RISCV_USER_ELF_STATUS_CLEANUP_REQUIRED ||
+        cleanup_space.state != RISCV_SV39_USER_SPACE_CLEANUP ||
+        cleanup_space.table_pages != 3U ||
+        cleanup_space.leaf_pages != 0U ||
+        cleanup_space.cleanup_page_owned == 0U ||
+        cleanup_space.cleanup_page_address != inaccessible_page ||
+        entry_changed(&entry) ||
+        physical_page_available(&cleanup_allocator) >= available) {
+        inaccessible_page = 0U;
+        return 11U;
+    }
+    inaccessible_page = 0U;
+    if (riscv_sv39_user_space_destroy(&cleanup_space) !=
+            RISCV_SV39_STATUS_OK ||
+        physical_page_available(&cleanup_allocator) != available) {
+        return 12U;
     }
     return 0U;
 }

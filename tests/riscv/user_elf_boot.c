@@ -16,6 +16,8 @@ extern unsigned char user_elf_program_start[];
 extern unsigned char user_elf_program_end[];
 extern unsigned char user_elf_fault_program_start[];
 extern unsigned char user_elf_fault_program_end[];
+extern unsigned char user_elf_guard_program_start[];
+extern unsigned char user_elf_guard_program_end[];
 
 enum riscv_sv39_status __real_riscv_sv39_activate(
     struct riscv_sv39_page_table *table);
@@ -31,6 +33,7 @@ static struct riscv_sv39_page_table *active_kernel_table;
 static struct physical_page_allocator *test_allocator;
 static uint64_t initial_available;
 static uint64_t fault_entry;
+static uint64_t guard_fault_address;
 static uint64_t completion_count;
 static uint64_t tick_count;
 static uint64_t test_failures;
@@ -48,7 +51,7 @@ static enum kernel_scheduler_status create_elf_task(
     struct physical_page_allocator *allocator,
     const unsigned char *start,
     const unsigned char *end,
-    int record_fault_entry)
+    int fault_kind)
 {
     struct riscv_sv39_user_space space = {0};
     struct riscv_user_elf_entry entry;
@@ -65,8 +68,12 @@ static enum kernel_scheduler_status create_elf_task(
         test_failures += (uint64_t)elf_status + 1U;
         return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
     }
-    if (record_fault_entry != 0) {
+    if (fault_kind == 1) {
         fault_entry = entry.entry;
+    } else if (fault_kind == 2) {
+        guard_fault_address = entry.stack_pointer -
+                              BOAROS_PAGE_SIZE -
+                              sizeof(uint64_t);
     }
     scheduler_status = kernel_user_thread_create(&space,
                                                  entry.entry,
@@ -117,10 +124,17 @@ enum kernel_scheduler_status __wrap_kernel_scheduler_init(
     if (status != KERNEL_SCHEDULER_STATUS_OK) {
         return status;
     }
+    status = create_elf_task(allocator,
+                             user_elf_fault_program_start,
+                             user_elf_fault_program_end,
+                             1);
+    if (status != KERNEL_SCHEDULER_STATUS_OK) {
+        return status;
+    }
     return create_elf_task(allocator,
-                           user_elf_fault_program_start,
-                           user_elf_fault_program_end,
-                           1);
+                           user_elf_guard_program_start,
+                           user_elf_guard_program_end,
+                           2);
 }
 
 static void check_completion(
@@ -136,11 +150,20 @@ static void check_completion(
         }
         return;
     }
-    if (completion_count != 2U ||
+    if (completion_count == 2U) {
+        if (completion->kind != KERNEL_THREAD_KIND_USER ||
+            completion->reason != KERNEL_THREAD_EXIT_USER_FAULT ||
+            completion->status != RISCV_STORE_PAGE_FAULT ||
+            completion->detail != fault_entry) {
+            test_failures++;
+        }
+        return;
+    }
+    if (completion_count != 3U ||
         completion->kind != KERNEL_THREAD_KIND_USER ||
         completion->reason != KERNEL_THREAD_EXIT_USER_FAULT ||
         completion->status != RISCV_STORE_PAGE_FAULT ||
-        completion->detail != fault_entry) {
+        completion->detail != guard_fault_address) {
         test_failures++;
     }
 }
@@ -155,7 +178,7 @@ enum kernel_scheduler_status __wrap_kernel_scheduler_reap_one(
         return status;
     }
     check_completion(completion);
-    if (completion_count == 2U) {
+    if (completion_count == 3U) {
         if (physical_page_available(test_allocator) != initial_available) {
             test_failures++;
         }
@@ -175,7 +198,7 @@ void __wrap_kernel_tick_advance(uint64_t elapsed_ticks)
 {
     tick_count++;
     __real_kernel_tick_advance(elapsed_ticks);
-    if (tick_count > 16U) {
+    if (tick_count > 24U) {
         virt_uart_puts("BoarOS: user ELF timeout failures=");
         virt_uart_put_hex((unsigned long)(test_failures + 1U));
         virt_uart_putc('\n');

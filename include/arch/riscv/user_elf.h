@@ -9,10 +9,11 @@
 #include <stdint.h>
 
 #define RISCV_USER_ELF_LIMIT (UINT64_C(1) << 38U)
-#define RISCV_USER_ELF_STACK_TOP \
-    (RISCV_USER_ELF_LIMIT - BOAROS_PAGE_SIZE)
+#define RISCV_USER_ELF_STACK_TOP RISCV_USER_ELF_LIMIT
 #define RISCV_USER_ELF_STACK_BASE \
     (RISCV_USER_ELF_STACK_TOP - BOAROS_PAGE_SIZE)
+#define RISCV_USER_ELF_STACK_GUARD_BASE \
+    (RISCV_USER_ELF_STACK_BASE - BOAROS_PAGE_SIZE)
 
 enum riscv_user_elf_status {
     RISCV_USER_ELF_STATUS_OK = 0,
@@ -34,8 +35,8 @@ struct riscv_user_elf_entry {
 
 /*
  * Success moves a complete LIVE address space into space.  Ordinary failure
- * leaves both outputs unchanged.  CLEANUP_REQUIRED instead moves the partial
- * LIVE space to the caller so ownership is never lost.
+ * leaves both outputs unchanged.  CLEANUP_REQUIRED instead moves a retryable
+ * LIVE or CLEANUP space to the caller so ownership is never lost.
  */
 enum riscv_user_elf_status riscv_user_elf_load(
     const void *image,

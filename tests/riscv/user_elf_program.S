@@ -3,10 +3,17 @@
     .globl _start
     .type _start, @function
 _start:
-#ifdef USER_ELF_TEXT_FAULT
+#if defined(USER_ELF_TEXT_FAULT)
     la t0, _start
     sd zero, 0(t0)
     li a0, 0xef
+    li a7, 93
+    ecall
+#elif defined(USER_ELF_GUARD_FAULT)
+    li t0, 0x1008
+    sub t0, sp, t0
+    sd zero, 0(t0)
+    li a0, 0xee
     li a7, 93
     ecall
 #else

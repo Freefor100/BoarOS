@@ -409,6 +409,19 @@ static void clear_runtime_table(uint64_t *entries)
     }
 }
 
+static enum riscv_sv39_status remember_cleanup_page(
+    struct riscv_sv39_user_space *space,
+    uint64_t address)
+{
+    if (space->cleanup_page_owned != 0U) {
+        return RISCV_SV39_STATUS_STATE;
+    }
+    space->cleanup_page_address = address;
+    space->cleanup_page_owned = 1U;
+    space->state = RISCV_SV39_USER_SPACE_CLEANUP;
+    return RISCV_SV39_STATUS_CLEANUP_REQUIRED;
+}
+
 static enum riscv_sv39_status allocate_runtime_table(
     struct riscv_sv39_user_space *space,
     uint64_t *address,
@@ -431,7 +444,7 @@ static enum riscv_sv39_status allocate_runtime_table(
     if (status != RISCV_SV39_STATUS_OK) {
         if (physical_page_release(space->allocator, *address) !=
             PHYSICAL_PAGE_STATUS_OK) {
-            return RISCV_SV39_STATUS_STATE;
+            return remember_cleanup_page(space, *address);
         }
         return status;
     }
@@ -526,7 +539,15 @@ enum riscv_sv39_status riscv_sv39_user_space_init(
     if (status != RISCV_SV39_STATUS_OK) {
         if (physical_page_release(allocator, root_address) !=
             PHYSICAL_PAGE_STATUS_OK) {
-            return RISCV_SV39_STATUS_STATE;
+            result.allocator = allocator;
+            result.root_address = 0U;
+            result.table_pages = 0U;
+            result.leaf_pages = 0U;
+            result.cleanup_page_address = root_address;
+            result.cleanup_page_owned = 1U;
+            result.state = RISCV_SV39_USER_SPACE_CLEANUP;
+            *space = result;
+            return RISCV_SV39_STATUS_CLEANUP_REQUIRED;
         }
         return status;
     }
@@ -542,6 +563,8 @@ enum riscv_sv39_status riscv_sv39_user_space_init(
     result.root_address = root_address;
     result.table_pages = 1U;
     result.leaf_pages = 0U;
+    result.cleanup_page_address = 0U;
+    result.cleanup_page_owned = 0U;
     result.state = RISCV_SV39_USER_SPACE_LIVE;
     *space = result;
     return RISCV_SV39_STATUS_OK;
@@ -567,45 +590,21 @@ static enum riscv_sv39_status rollback_runtime_table(
     return RISCV_SV39_STATUS_OK;
 }
 
-enum riscv_sv39_status riscv_sv39_user_map_owned_page(
+static enum riscv_sv39_status resolve_user_leaf_slot(
     struct riscv_sv39_user_space *space,
     uint64_t virtual_address,
-    uint64_t physical_address,
-    uint32_t permissions)
+    uint64_t **leaf)
 {
     uint64_t *root;
     uint64_t *level1;
     uint64_t *level0;
     uint64_t *root_entry;
     uint64_t *level1_entry;
-    uint64_t *leaf;
+    uint64_t *result;
     uint64_t level1_address;
     uint64_t level0_address;
-    void *owned_page;
     int allocated_level1 = 0;
     enum riscv_sv39_status status;
-
-    if (space == 0) {
-        return RISCV_SV39_STATUS_INVALID;
-    }
-    if (space->state != RISCV_SV39_USER_SPACE_LIVE) {
-        return RISCV_SV39_STATUS_STATE;
-    }
-    if (virtual_address < RISCV_SV39_PAGE_SIZE_4K ||
-        virtual_address >= RISCV_SV39_USER_LIMIT ||
-        (virtual_address & (RISCV_SV39_PAGE_SIZE_4K - 1U)) != 0U ||
-        (physical_address & (RISCV_SV39_PAGE_SIZE_4K - 1U)) != 0U ||
-        physical_address > RISCV_SV39_PHYSICAL_MAX -
-                               (RISCV_SV39_PAGE_SIZE_4K - 1U) ||
-        !valid_user_permissions(permissions)) {
-        return RISCV_SV39_STATUS_INVALID;
-    }
-    if (physical_page_resolve(space->allocator,
-                              physical_address,
-                              &owned_page) != PHYSICAL_PAGE_STATUS_OK) {
-        return RISCV_SV39_STATUS_INVALID;
-    }
-    (void)owned_page;
 
     status = resolve_runtime_table(space->allocator,
                                    space->root_address,
@@ -648,7 +647,9 @@ enum riscv_sv39_status riscv_sv39_user_map_owned_page(
                                        root_entry,
                                        level1_address) !=
                     RISCV_SV39_STATUS_OK) {
-                return RISCV_SV39_STATUS_STATE;
+                return status == RISCV_SV39_STATUS_CLEANUP_REQUIRED
+                           ? status
+                           : RISCV_SV39_STATUS_STATE;
             }
             return status;
         }
@@ -666,10 +667,109 @@ enum riscv_sv39_status riscv_sv39_user_map_owned_page(
         }
     }
 
-    leaf = &level0[(virtual_address >> BOAROS_PAGE_SHIFT) &
-                   RISCV_SV39_INDEX_MASK];
-    if (*leaf != 0U) {
+    result = &level0[(virtual_address >> BOAROS_PAGE_SHIFT) &
+                     RISCV_SV39_INDEX_MASK];
+    if (*result != 0U) {
         return RISCV_SV39_STATUS_CONFLICT;
+    }
+    *leaf = result;
+    return RISCV_SV39_STATUS_OK;
+}
+
+enum riscv_sv39_status riscv_sv39_user_map_owned_page(
+    struct riscv_sv39_user_space *space,
+    uint64_t virtual_address,
+    uint64_t physical_address,
+    uint32_t permissions)
+{
+    uint64_t *leaf;
+    void *owned_page;
+    enum riscv_sv39_status status;
+
+    if (space == 0) {
+        return RISCV_SV39_STATUS_INVALID;
+    }
+    if (space->state != RISCV_SV39_USER_SPACE_LIVE) {
+        return RISCV_SV39_STATUS_STATE;
+    }
+    if (virtual_address < RISCV_SV39_PAGE_SIZE_4K ||
+        virtual_address >= RISCV_SV39_USER_LIMIT ||
+        (virtual_address & (RISCV_SV39_PAGE_SIZE_4K - 1U)) != 0U ||
+        (physical_address & (RISCV_SV39_PAGE_SIZE_4K - 1U)) != 0U ||
+        physical_address > RISCV_SV39_PHYSICAL_MAX -
+                               (RISCV_SV39_PAGE_SIZE_4K - 1U) ||
+        !valid_user_permissions(permissions)) {
+        return RISCV_SV39_STATUS_INVALID;
+    }
+    if (physical_page_resolve(space->allocator,
+                              physical_address,
+                              &owned_page) != PHYSICAL_PAGE_STATUS_OK) {
+        return RISCV_SV39_STATUS_INVALID;
+    }
+    (void)owned_page;
+
+    status = resolve_user_leaf_slot(space, virtual_address, &leaf);
+    if (status != RISCV_SV39_STATUS_OK) {
+        return status;
+    }
+    *leaf = user_leaf_entry(physical_address, permissions);
+    space->leaf_pages++;
+    return RISCV_SV39_STATUS_OK;
+}
+
+enum riscv_sv39_status riscv_sv39_user_map_zeroed_page(
+    struct riscv_sv39_user_space *space,
+    uint64_t virtual_address,
+    uint32_t permissions)
+{
+    uint64_t physical_address;
+    uint64_t *leaf;
+    uint64_t *words;
+    uint32_t index;
+    enum physical_page_status page_status;
+    enum riscv_sv39_status status;
+
+    if (space == 0) {
+        return RISCV_SV39_STATUS_INVALID;
+    }
+    if (space->state != RISCV_SV39_USER_SPACE_LIVE) {
+        return RISCV_SV39_STATUS_STATE;
+    }
+    if (virtual_address < RISCV_SV39_PAGE_SIZE_4K ||
+        virtual_address >= RISCV_SV39_USER_LIMIT ||
+        (virtual_address & (RISCV_SV39_PAGE_SIZE_4K - 1U)) != 0U ||
+        !valid_user_permissions(permissions)) {
+        return RISCV_SV39_STATUS_INVALID;
+    }
+    status = resolve_user_leaf_slot(space, virtual_address, &leaf);
+    if (status != RISCV_SV39_STATUS_OK) {
+        return status;
+    }
+    page_status = physical_page_allocate(space->allocator,
+                                         &physical_address);
+    if (page_status == PHYSICAL_PAGE_STATUS_EMPTY) {
+        return RISCV_SV39_STATUS_NO_MEMORY;
+    }
+    if (page_status != PHYSICAL_PAGE_STATUS_OK) {
+        return page_status == PHYSICAL_PAGE_STATUS_STATE
+                   ? RISCV_SV39_STATUS_STATE
+                   : RISCV_SV39_STATUS_INVALID;
+    }
+    status = resolve_runtime_table(space->allocator,
+                                   physical_address,
+                                   &words);
+    if (status != RISCV_SV39_STATUS_OK) {
+        if (physical_page_release(space->allocator,
+                                  physical_address) !=
+            PHYSICAL_PAGE_STATUS_OK) {
+            return remember_cleanup_page(space, physical_address);
+        }
+        return status;
+    }
+    for (index = 0U;
+         index < BOAROS_PAGE_SIZE / sizeof(*words);
+         index++) {
+        words[index] = 0U;
     }
     *leaf = user_leaf_entry(physical_address, permissions);
     space->leaf_pages++;
@@ -786,7 +886,8 @@ enum riscv_sv39_status riscv_sv39_user_space_move(
         return RISCV_SV39_STATUS_INVALID;
     }
     if (destination->state != RISCV_SV39_USER_SPACE_EMPTY ||
-        source->state != RISCV_SV39_USER_SPACE_LIVE) {
+        (source->state != RISCV_SV39_USER_SPACE_LIVE &&
+         source->state != RISCV_SV39_USER_SPACE_CLEANUP)) {
         return RISCV_SV39_STATUS_STATE;
     }
 
@@ -795,6 +896,8 @@ enum riscv_sv39_status riscv_sv39_user_space_move(
     source->root_address = 0U;
     source->table_pages = 0U;
     source->leaf_pages = 0U;
+    source->cleanup_page_address = 0U;
+    source->cleanup_page_owned = 0U;
     source->state = RISCV_SV39_USER_SPACE_MOVED;
     return RISCV_SV39_STATUS_OK;
 }
@@ -910,14 +1013,34 @@ enum riscv_sv39_status riscv_sv39_user_space_destroy(
     if (space == 0) {
         return RISCV_SV39_STATUS_INVALID;
     }
-    if (space->state != RISCV_SV39_USER_SPACE_LIVE) {
+    if (space->state != RISCV_SV39_USER_SPACE_LIVE &&
+        space->state != RISCV_SV39_USER_SPACE_CLEANUP) {
         return RISCV_SV39_STATUS_STATE;
     }
-    satp = riscv_sv39_current_satp();
-    root_ppn = space->root_address >> BOAROS_PAGE_SHIFT;
-    if ((satp >> 60U) == 8U &&
-        (satp & RISCV_SV39_SATP_PPN_MASK) == root_ppn) {
-        return RISCV_SV39_STATUS_STATE;
+    if (space->table_pages != 0U) {
+        satp = riscv_sv39_current_satp();
+        root_ppn = space->root_address >> BOAROS_PAGE_SHIFT;
+        if ((satp >> 60U) == 8U &&
+            (satp & RISCV_SV39_SATP_PPN_MASK) == root_ppn) {
+            return RISCV_SV39_STATUS_STATE;
+        }
+    }
+    if (space->cleanup_page_owned != 0U) {
+        if (physical_page_release(space->allocator,
+                                  space->cleanup_page_address) !=
+            PHYSICAL_PAGE_STATUS_OK) {
+            return RISCV_SV39_STATUS_CLEANUP_REQUIRED;
+        }
+        space->cleanup_page_address = 0U;
+        space->cleanup_page_owned = 0U;
+    }
+    if (space->table_pages == 0U) {
+        if (space->root_address != 0U || space->leaf_pages != 0U) {
+            return RISCV_SV39_STATUS_STATE;
+        }
+        space->allocator = 0;
+        space->state = RISCV_SV39_USER_SPACE_DESTROYED;
+        return RISCV_SV39_STATUS_OK;
     }
     status = resolve_runtime_table(space->allocator,
                                    space->root_address,
@@ -948,6 +1071,8 @@ enum riscv_sv39_status riscv_sv39_user_space_destroy(
     space->root_address = 0U;
     space->table_pages = 0U;
     space->leaf_pages = 0U;
+    space->cleanup_page_address = 0U;
+    space->cleanup_page_owned = 0U;
     space->state = RISCV_SV39_USER_SPACE_DESTROYED;
     return RISCV_SV39_STATUS_OK;
 }

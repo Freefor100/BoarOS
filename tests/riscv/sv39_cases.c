@@ -25,10 +25,20 @@ static uint64_t user_space_page_pool[TEST_POOL_WORDS(16U)]
     __attribute__((aligned(BOAROS_PAGE_SIZE)));
 static uint64_t user_space_oom_pool[TEST_POOL_WORDS(4U)]
     __attribute__((aligned(BOAROS_PAGE_SIZE)));
+static uint64_t zero_address_page_pool[TEST_POOL_WORDS(4U)]
+    __attribute__((aligned(BOAROS_PAGE_SIZE)));
 
 static void *identity_page_access(uint64_t address)
 {
     return (void *)(uintptr_t)address;
+}
+
+static void *zero_address_page_access(uint64_t address)
+{
+    if (address >= sizeof(zero_address_page_pool)) {
+        return 0;
+    }
+    return (unsigned char *)zero_address_page_pool + address;
 }
 
 static enum physical_page_status init_test_page_allocator(
@@ -76,6 +86,20 @@ static void reset_page_table(struct riscv_sv39_page_table *table)
     table->leaf_4k = 0U;
     table->leaf_2m = 0U;
     table->state = RISCV_SV39_STATE_UNINITIALIZED;
+}
+
+static int page_is_zero(const uint64_t *words)
+{
+    uint32_t index;
+
+    for (index = 0U;
+         index < BOAROS_PAGE_SIZE / sizeof(*words);
+         index++) {
+        if (words[index] != 0U) {
+            return 0;
+        }
+    }
+    return 1;
 }
 
 static uint32_t test_permissions(uint64_t entry)
@@ -495,15 +519,20 @@ static int test_user_space_lifecycle(void)
     uint64_t *user_root;
     uint64_t kernel_high_entry;
     uint64_t code_page;
-    uint64_t stack_page;
     uint64_t rejected_page;
     uint64_t conflict_page;
+    void *stack_page;
     uint64_t available_before_invalid;
     uint64_t user_satp = UINT64_C(0x1122334455667788);
 
     layout.usable_count = 1U;
     layout.usable[0].base = (uint64_t)(uintptr_t)user_space_page_pool;
     layout.usable[0].size = sizeof(user_space_page_pool);
+    for (available_before_invalid = 0U;
+         available_before_invalid < TEST_POOL_WORDS(16U);
+         available_before_invalid++) {
+        user_space_page_pool[available_before_invalid] = UINT64_MAX;
+    }
     reset_page_table(&kernel_table);
     if (init_test_page_allocator(&allocator, &layout) !=
             PHYSICAL_PAGE_STATUS_OK ||
@@ -604,22 +633,22 @@ static int test_user_space_lifecycle(void)
         return 51;
     }
 
-    if (physical_page_allocate(&allocator, &stack_page) !=
-            PHYSICAL_PAGE_STATUS_OK ||
-        riscv_sv39_user_map_owned_page(&source,
-                                       stack_va,
-                                       stack_page,
-                                       RISCV_SV39_READ |
-                                           RISCV_SV39_WRITE) !=
+    if (riscv_sv39_user_map_zeroed_page(&source,
+                                        stack_va,
+                                        RISCV_SV39_READ |
+                                            RISCV_SV39_WRITE) !=
             RISCV_SV39_STATUS_OK ||
         riscv_sv39_user_lookup(&source,
-                               stack_va + RISCV_SV39_PAGE_SIZE_4K - 1U,
+                               stack_va,
                                &mapping) != RISCV_SV39_STATUS_OK ||
-        mapping.physical_address !=
-            stack_page + RISCV_SV39_PAGE_SIZE_4K - 1U ||
         mapping.permissions != (RISCV_SV39_READ |
                                 RISCV_SV39_WRITE |
                                 RISCV_SV39_USER) ||
+        physical_page_resolve(&allocator,
+                              mapping.physical_address,
+                              &stack_page) !=
+            PHYSICAL_PAGE_STATUS_OK ||
+        !page_is_zero(stack_page) ||
         source.table_pages != 5U || source.leaf_pages != 2U ||
         riscv_sv39_user_lookup(&source,
                                stack_va - RISCV_SV39_PAGE_SIZE_4K,
@@ -696,6 +725,50 @@ static int test_user_space_oom_rollback(void)
         return 56;
     }
 
+    return 0;
+}
+
+static int test_user_space_root_at_zero(void)
+{
+    struct boot_memory_layout layout;
+    struct physical_page_allocator allocator;
+    struct riscv_sv39_page_table kernel_table;
+    struct riscv_sv39_user_space space = {0};
+    uint64_t reserved_zero;
+    uint64_t user_satp = 0U;
+
+    layout.usable_count = 1U;
+    layout.usable[0].base = 0U;
+    layout.usable[0].size = sizeof(zero_address_page_pool);
+    reset_page_table(&kernel_table);
+    if (physical_page_allocator_init(&allocator, &layout) !=
+            PHYSICAL_PAGE_STATUS_OK ||
+        physical_page_allocator_bind_access(&allocator,
+                                            zero_address_page_access) !=
+            PHYSICAL_PAGE_STATUS_OK ||
+        physical_page_allocate(&allocator, &reserved_zero) !=
+            PHYSICAL_PAGE_STATUS_OK ||
+        reserved_zero != 0U ||
+        riscv_sv39_page_table_init(&kernel_table, &allocator) !=
+            RISCV_SV39_STATUS_OK) {
+        return 58;
+    }
+    kernel_table.state = RISCV_SV39_STATE_ACTIVE;
+    if (physical_page_release(&allocator, reserved_zero) !=
+            PHYSICAL_PAGE_STATUS_OK ||
+        riscv_sv39_user_space_init(&space,
+                                   &allocator,
+                                   &kernel_table) !=
+            RISCV_SV39_STATUS_OK ||
+        space.root_address != 0U || space.table_pages != 1U ||
+        riscv_sv39_user_space_satp(&space, &user_satp) !=
+            RISCV_SV39_STATUS_OK ||
+        user_satp != (UINT64_C(8) << 60U) ||
+        riscv_sv39_user_space_destroy(&space) !=
+            RISCV_SV39_STATUS_OK ||
+        physical_page_available(&allocator) != 3U) {
+        return 59;
+    }
     return 0;
 }
 
@@ -950,6 +1023,11 @@ int run_sv39_tests(void)
     }
 
     result = test_user_space_oom_rollback();
+    if (result != 0) {
+        return result;
+    }
+
+    result = test_user_space_root_at_zero();
     if (result != 0) {
         return result;
     }

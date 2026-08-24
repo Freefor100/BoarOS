@@ -20,6 +20,7 @@ enum riscv_sv39_status {
     RISCV_SV39_STATUS_CONFLICT,
     RISCV_SV39_STATUS_STATE,
     RISCV_SV39_STATUS_NOT_MAPPED,
+    RISCV_SV39_STATUS_CLEANUP_REQUIRED,
 };
 
 enum riscv_sv39_page_table_state {
@@ -43,13 +44,16 @@ enum riscv_sv39_user_space_state {
     RISCV_SV39_USER_SPACE_LIVE,
     RISCV_SV39_USER_SPACE_MOVED,
     RISCV_SV39_USER_SPACE_DESTROYED,
+    RISCV_SV39_USER_SPACE_CLEANUP,
 };
 
 struct riscv_sv39_user_space {
     struct physical_page_allocator *allocator;
     uint64_t root_address;
-    uint64_t table_pages;
-    uint64_t leaf_pages;
+    uint32_t table_pages;
+    uint32_t leaf_pages;
+    uint64_t cleanup_page_address;
+    uint32_t cleanup_page_owned;
     enum riscv_sv39_user_space_state state;
 };
 
@@ -98,6 +102,15 @@ enum riscv_sv39_status riscv_sv39_user_map_owned_page(
     uint64_t physical_address,
     uint32_t permissions);
 
+/*
+ * Success allocates, zeroes, maps, and transfers one page to space.
+ * CLEANUP_REQUIRED leaves a retryable CLEANUP owner; only move/destroy it.
+ */
+enum riscv_sv39_status riscv_sv39_user_map_zeroed_page(
+    struct riscv_sv39_user_space *space,
+    uint64_t virtual_address,
+    uint32_t permissions);
+
 enum riscv_sv39_status riscv_sv39_user_lookup(
     const struct riscv_sv39_user_space *space,
     uint64_t virtual_address,
@@ -107,12 +120,12 @@ enum riscv_sv39_status riscv_sv39_user_space_satp(
     const struct riscv_sv39_user_space *space,
     uint64_t *satp);
 
-/* Success consumes source; failure leaves both objects unchanged. */
+/* Success consumes a LIVE or CLEANUP source; failure changes neither object. */
 enum riscv_sv39_status riscv_sv39_user_space_move(
     struct riscv_sv39_user_space *destination,
     struct riscv_sv39_user_space *source);
 
-/* The active satp root cannot be destroyed. */
+/* The active satp root cannot be destroyed; CLEANUP is retryable. */
 enum riscv_sv39_status riscv_sv39_user_space_destroy(
     struct riscv_sv39_user_space *space);
 
