@@ -4,6 +4,7 @@
 #include <arch/riscv/virt_uart.h>
 #include <kernel/scheduler.h>
 #include <kernel/syscall.h>
+#include <kernel/task.h>
 #include <kernel/tick.h>
 
 #include <stdint.h>
@@ -100,7 +101,9 @@ void riscv_trap_dispatch(struct riscv_trap_frame *frame)
         };
         struct kernel_syscall_result result;
 
-        if (kernel_syscall_dispatch(&request, &result) !=
+        if (kernel_syscall_dispatch(kernel_task_current(),
+                                    &request,
+                                    &result) !=
             KERNEL_SYSCALL_STATUS_OK) {
             riscv_trap_fatal(frame);
         }

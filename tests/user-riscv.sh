@@ -28,7 +28,7 @@ if ! timeout -k 2s 10s "$qemu" \
     exit 1
 fi
 
-if [ "$(grep -cxE 'BoarOS: user mode completions=0x3 ticks=0x[1-9a-f][0-9a-f]* failures=0x0' "$output" || true)" -ne 1 ]; then
+if [ "$(grep -cxE 'BoarOS: user mode completions=0x4 ticks=0x[1-9a-f][0-9a-f]* failures=0x0' "$output" || true)" -ne 1 ]; then
     tail -n 100 "$output" >&2
     echo "user-mode test did not complete the preempt/resume/exit path" >&2
     exit 1

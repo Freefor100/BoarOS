@@ -12,6 +12,7 @@ static unsigned long result_changed(
 
 static unsigned long run_invalid_argument_cases(void)
 {
+    struct kernel_task *caller = (struct kernel_task *)(uintptr_t)1U;
     struct kernel_syscall_request request = {0};
     struct kernel_syscall_result result = {
         .action = (enum kernel_syscall_action)0x55,
@@ -19,14 +20,16 @@ static unsigned long run_invalid_argument_cases(void)
     };
     unsigned long failures = 0U;
 
-    if (kernel_syscall_dispatch(0, &result) !=
+    if (kernel_syscall_dispatch(caller, 0, &result) !=
             KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT ||
         result_changed(&result,
                        (enum kernel_syscall_action)0x55,
                        INT64_C(0x1122334455667788))) {
         failures++;
     }
-    if (kernel_syscall_dispatch(&request, 0) !=
+    if (kernel_syscall_dispatch(caller, &request, 0) !=
+            KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT ||
+        kernel_syscall_dispatch(0, &request, &result) !=
         KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT) {
         failures++;
     }
@@ -36,6 +39,7 @@ static unsigned long run_invalid_argument_cases(void)
 
 static unsigned long run_exit_cases(void)
 {
+    struct kernel_task *caller = (struct kernel_task *)(uintptr_t)1U;
     struct kernel_syscall_request request = {
         .number = 93U,
         .arguments = {
@@ -52,7 +56,7 @@ static unsigned long run_exit_cases(void)
         .value = -1,
     };
 
-    if (kernel_syscall_dispatch(&request, &result) !=
+    if (kernel_syscall_dispatch(caller, &request, &result) !=
             KERNEL_SYSCALL_STATUS_OK ||
         result_changed(&result, KERNEL_SYSCALL_ACTION_EXIT, 0xab)) {
         return 1U;
@@ -62,17 +66,18 @@ static unsigned long run_exit_cases(void)
 
 static unsigned long run_unknown_cases(void)
 {
-    static const uint64_t numbers[] = {0U, 94U, UINT64_MAX};
+    static const uint64_t numbers[] = {0U, 94U, 173U, UINT64_MAX};
     struct kernel_syscall_request request = {0};
     struct kernel_syscall_result result;
     unsigned long failures = 0U;
     unsigned long index;
+    struct kernel_task *caller = (struct kernel_task *)(uintptr_t)1U;
 
     for (index = 0U; index < sizeof(numbers) / sizeof(numbers[0]); index++) {
         request.number = numbers[index];
         result.action = KERNEL_SYSCALL_ACTION_EXIT;
         result.value = 1;
-        if (kernel_syscall_dispatch(&request, &result) !=
+        if (kernel_syscall_dispatch(caller, &request, &result) !=
                 KERNEL_SYSCALL_STATUS_OK ||
             result_changed(&result, KERNEL_SYSCALL_ACTION_RETURN, -38)) {
             failures++;

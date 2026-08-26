@@ -5,6 +5,8 @@
 
 #define KERNEL_SYSCALL_ARGUMENT_COUNT 6U
 
+struct kernel_task;
+
 enum kernel_syscall_status {
     KERNEL_SYSCALL_STATUS_OK = 0,
     KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT,
@@ -26,6 +28,7 @@ struct kernel_syscall_result {
 };
 
 enum kernel_syscall_status kernel_syscall_dispatch(
+    struct kernel_task *caller,
     const struct kernel_syscall_request *request,
     struct kernel_syscall_result *result);
 

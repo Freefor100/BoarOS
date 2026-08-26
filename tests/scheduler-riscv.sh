@@ -5,13 +5,43 @@ set -eu
 project_root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 kernel=${SCHEDULER_BOOT_TEST_KERNEL_RV:-"$project_root/build/riscv/tests/kernel-scheduler-boot-rv"}
 qemu=${QEMU_RISCV64:-qemu-system-riscv64}
+objdump=${OBJDUMP_RV:-riscv64-unknown-elf-objdump}
+scheduler_object=${SCHEDULER_OBJECT_RV:-"$project_root/build/riscv/kernel/scheduler.o"}
 output_dir=$(mktemp -d)
 output="$output_dir/scheduler.log"
+hot_disassembly="$output_dir/scheduler-hot.dis"
 
 trap 'rm -rf "$output_dir"' EXIT HUP INT TERM
 
 if [ ! -f "$kernel" ]; then
     echo "missing scheduler boot kernel: $kernel" >&2
+    exit 1
+fi
+if [ ! -f "$scheduler_object" ]; then
+    echo "missing scheduler object: $scheduler_object" >&2
+    exit 1
+fi
+
+for symbol in \
+    kernel_scheduler_on_tick \
+    activate_thread_address_space \
+    validate_current \
+    validate_queues \
+    validate_thread.part.0
+do
+    "$objdump" -dr --disassemble="$symbol" "$scheduler_object" \
+        >>"$hot_disassembly"
+    if ! grep -q "<$symbol>:" "$hot_disassembly"; then
+        cat "$hot_disassembly" >&2
+        echo "missing scheduler hot-path symbol: $symbol" >&2
+        exit 1
+    fi
+done
+
+if grep -Eq 'R_RISCV_CALL(_PLT)?[[:space:]]+(kernel_mm_|riscv_kernel_mm_|kernel_pid_|physical_page_)' \
+    "$hot_disassembly"; then
+    cat "$hot_disassembly" >&2
+    echo "scheduler tick path performs MM, PID, or physical-page lifecycle work" >&2
     exit 1
 fi
 

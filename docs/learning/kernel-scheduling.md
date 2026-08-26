@@ -8,13 +8,13 @@
 
 Trap Frame 面向任意指令边界。中断发生前没有调用者按 ABI 准备现场，所以入口必须保存全部可写整数寄存器以及 `sstatus/sepc/scause/stval`。它位于被中断线程自己的内核栈上，最终由 `sret` 恢复。
 
-Switch context 面向 `riscv_context_switch(previous, next)` 这一普通函数调用。编译器已经按 psABI 允许 caller-saved 寄存器被调用破坏；调用链只要求 callee-saved 寄存器恢复。RV64 整数 psABI 中，`s0..s11` 和 `sp` 是 callee-saved，`ra` 决定 `ret` 的恢复点。BoarOS 还保存 `tp`，因为它被确定为当前线程指针。于是基础 switch context 是 `ra/sp/tp/s0..s11`，不重复保存 `a*`、`t*`、Trap CSR 或完整 Trap Frame。
+Switch context 面向 `riscv_context_switch(previous, next)` 这一普通函数调用。编译器已经按 psABI 允许 caller-saved 寄存器被调用破坏；调用链只要求 callee-saved 寄存器恢复。RV64 整数 psABI 中，`s0..s11` 和 `sp` 是 callee-saved，`ra` 决定 `ret` 的恢复点。BoarOS 还保存 `tp`，因为它被确定为当前任务指针。于是基础 switch context 是 `ra/sp/tp/s0..s11`，不重复保存 `a*`、`t*`、Trap CSR 或完整 Trap Frame。
 
 这种分工也适用于以后会阻塞的系统调用：线程可以在任意内核调用深度通过 switch context 暂停，恢复后继续原 C 调用链；用户或中断现场仍由该线程栈上的 Trap Frame 管理。若只交换最外层 Trap Frame，普通内核调用链的阻塞点就无法自然保存。
 
 ## `tp` 为什么适合表示 current
 
-RISC-V psABI 把 `tp` 作为固定用途寄存器，普通函数不能把它当临时寄存器。内核可以约定它始终指向当前线程，从而无需全局查找或用 `sp & page_mask` 推导对象。
+RISC-V psABI 把 `tp` 作为固定用途寄存器，普通函数不能把它当临时寄存器。内核可以约定它始终指向当前可调度任务，从而无需全局查找或用 `sp & page_mask` 推导对象。
 
 `sp` 掩码方案把线程对象布局、栈大小和对齐永久耦合起来；一旦改成多页栈、guard page 或独立控制块，所有调用点都要变化。`tp=current` 让单页布局保持 scheduler 私有。代价是内核不能同时把 `tp` 用作 C TLS 基址。用户态可以拥有自己的 `tp`；trap 入口通过 `sscratch <-> tp` 暂存它并恢复内核 current，返回用户态时再反向交换。
 
@@ -60,9 +60,19 @@ allocated page -> READY -> RUNNING -> READY
 
 队列操作不只是移动指针，还转移“谁拥有这张页、谁可能仍在使用这张栈”的事实。创建只有在页访问、元数据、canary 和初始 context 全部成功后才能提交 READY；此前失败必须回滚页。RUNNING 线程返回时，当前 SP 仍在自己的页中，因此不能边退出边释放。它先进入 EXITED 并永不恢复，等 idle 已运行在静态 boot stack 上再释放。
 
-用户任务还独占一个运行期 Sv39 地址空间。创建接口采用移动所有权：全部入口、用户栈权限和初始 Frame 检查成功后，地址空间才从调用者转交任务；失败时调用者仍然拥有它。调度切换在修改队列/current 前先切换到目标 `satp`，使用 ASID 0 时每次全局刷新 TLB。回收则先销毁用户叶子页和私有页表，再释放任务页；中途失败的对象留在完成队首，后续重试不会双重销毁。
+用户任务持有一个 MM 引用，而不是直接拥有页表树。创建接口采用移动所有权：全部入口、用户栈权限、初始 Frame 和 TID 建立成功后，MM 才从调用者转交任务；失败时调用者仍然拥有它。MM 可以通过 acquire 被多个任务共享，末引用才销毁地址空间，因此 `CLONE_VM` 不需要复制或伪造页表 owner。当前测试已让两个独立线程组共享同一 MM，但创建入口仍只产生单成员线程组，尚无 `clone` flags。调度切换在修改队列/current 前使用任务创建时缓存的 `satp`，不会在 tick 热路径解析 MM；ASID 0 的根切换仍会全局刷新 TLB。
 
 退出切换把旧寄存器写入一份永不入队的 discard context。这样退出线程没有可再次选择的 switch context，idle 回收页也不会留下悬空恢复点。若退出路径发现 `tp`、状态、边界或 canary 损坏，它不能像普通函数那样返回错误；安全做法是记录错误、切到可信 idle 栈，再由仍能返回状态的 timer 调用链执行 fatal 诊断。
+
+## Task、线程组和 Linux 身份
+
+Linux 的 task 表示一条可独立调度的执行流。每个 task 有自己的 TID；同一线程组共享一个 TGID，组首 task 满足 `TID == TGID`。用户通常把 TGID 称为进程 PID，因此 `getpid()` 返回 TGID，`gettid()` 返回当前 task 的 TID。线程组身份与 MM 是否共享是相关但不同的选择：clone flags 可以分别控制加入线程组和共享地址空间，内核不应把“同一 MM”硬编码为“同一 PID”。
+
+BoarOS 用不透明 `kernel_task` 保存调度状态、TID、组首关系和 MM 引用，syscall dispatcher 显式接收 caller task。当前每个用户任务都是自己的组首，所以 `getpid/gettid` 数值相等；字段和 ABI 已经按最终语义分离。内核任务与 idle 没有用户可见身份，ID 0 留作内部“无 PID/TID”，用户 ID 从 1 开始。
+
+有界 ID 可用位图管理：一位表示一个数值是否占用，分配搜索和释放不会额外分配内存，32768 个 ID 只需 4 KiB。线性扫描最坏为 O(limit)，但循环游标使连续创建通常很快；只有进程创建/退出触碰它，不进入 timer/context switch。未来若真实并发创建使扫描或全局锁成为瓶颈，可换成分层位图或 per-CPU 缓存，而不改变 TID/TGID ABI。
+
+回收顺序必须与可观察生命周期一致：先释放 task 的 MM 引用，再归还 TID，最后释放仍承载内核栈和元数据的任务页。任何阶段失败都保留 exited 节点并从准确阶段重试；只有全部完成后才发布 completion。以后实现 `wait` 时，退出后的 zombie 元数据和父进程观察点会延长“退出”和“最终释放 PID”之间的生命周期，不能直接沿用当前立即完成记录作为完整 Linux wait 语义。
 
 ## 内核栈大小、对齐和保护
 
@@ -83,9 +93,9 @@ ready/exited 队列会同时被普通线程创建路径、timer handler 和 idle
 - RISC-V 异步现场继续使用完整 Trap Frame，普通调度使用独立的 psABI switch context。
 - 内核 `tp` 固定为 current；用户 `tp` 独立保存，`sscratch` 只在 U-mode 保存 current，内核态保持为零。
 - 单 hart FIFO round-robin，一个 tick 时间片，一次 trap 最多切换一次。
-- 普通内核/用户任务使用私有 4 KiB 单页内核栈布局；用户任务额外独占一个 Sv39 用户地址空间；boot context 成为永久 idle，继续使用静态 boot stack。
-- 内核线程入口返回即退出；用户任务通过 syscall 或同步故障退出。idle 在另一张栈上先回收用户地址空间、再回收任务页。
-- 队列临界区保存并关闭 SIE；不为尚未实现的 SMP、阻塞、优先级、进程/PID 或 F/V 状态建立占位层。
+- 普通内核/用户任务使用私有 4 KiB 单页内核栈布局；用户任务持有可共享 MM 引用和独立 TID/线程组身份；boot context 成为永久 idle，继续使用静态 boot stack。
+- 内核线程入口返回即退出；用户任务通过 syscall 或同步故障退出。idle 在另一张栈上依次释放 MM 引用、TID 和任务页。
+- 队列临界区保存并关闭 SIE；当前不为尚未实现的 SMP、阻塞、优先级或 F/V 状态建立占位层，MM/身份字段则是 `clone/fork/exec/wait` 已确定路径的必要永久机制。
 
 这些选择形成完整、可测的内核线程闭环，同时把以后可能变化的策略、栈布局和 per-hart 组织留在模块内部。RISC-V context 机制可在 QEMU `virt` 与 VisionFive 2 复用；平台 timebase 仍由 DTB 决定。LoongArch 需要自己的 switch context、CSR/中断和 16 KiB 栈页实现，不能复用 RISC-V 汇编。
 
@@ -96,7 +106,7 @@ ready/exited 队列会同时被普通线程创建路径、timer handler 和 idle
 - 只让线程打印一次不能证明抢占；worker 必须不调用 yield 并持续忙等，由真实 timer 形成 A -> B -> A。
 - 给 `s0..s11` 设置独立哨兵并跨多次抢占比较，可发现错误偏移、漏保存和 32/64 位宽度错误；同时检查最终对象反汇编，验证实际链接指令而非源码文本。
 - 记录每个 worker 的 `sp/tp`、最终 idle `sp/tp` 和分配器空闲计数，能同时验证独立栈、current ABI、退出切换和页回收。
-- 用户任务测试还应跨真实 timer 抢占检查用户 `gp/sp/tp/s0..s11`，用两个独立根页表隔离正常任务与故障任务，并在完成后核对全部叶子页、页表页和任务页归还。
+- 用户任务测试还应跨真实 timer 抢占检查用户 `gp/sp/tp/s0..s11`；让两个任务以不同栈和身份共享正常 MM，并用另一独立根隔离故障任务，可以同时验证共享末引用、`satp` 切换和故障隔离。完成后还要核对全部 MM、叶子页、页表页、TID 和任务页归还。
 - 正常生产内核会永久 idle，有限关机逻辑应放在测试 ELF 的链接包装中；生产映像需用符号表确认不含测试 worker。
 - 静态分析适合发现 C 状态路径中的空指针、未初始化、双重释放和释放后使用；汇编寄存器集合、Trap Frame/context 配合及真实抢占顺序仍需要反汇编和 QEMU 端到端测试。
 

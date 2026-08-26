@@ -1,6 +1,7 @@
 #ifndef BOAROS_KERNEL_SCHEDULER_H
 #define BOAROS_KERNEL_SCHEDULER_H
 
+#include <kernel/mm.h>
 #include <kernel/physical_page.h>
 
 #include <stdint.h>
@@ -19,8 +20,6 @@ enum kernel_scheduler_status {
     KERNEL_SCHEDULER_STATUS_PAGE_RELEASE,
     KERNEL_SCHEDULER_STATUS_ADDRESS_SPACE,
 };
-
-struct riscv_user_process;
 
 enum kernel_thread_kind {
     KERNEL_THREAD_KIND_KERNEL = 0,
@@ -49,9 +48,9 @@ enum kernel_scheduler_status kernel_thread_create(
     void (*entry)(void *),
     void *argument);
 
-/* Success consumes process; failure leaves it owned by the caller. */
+/* Success consumes mm; failure leaves it owned by the caller. */
 enum kernel_scheduler_status kernel_user_thread_create(
-    struct riscv_user_process *process,
+    struct kernel_mm *mm,
     uintptr_t entry,
     uintptr_t stack_pointer,
     uintptr_t thread_pointer);

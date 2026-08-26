@@ -5,7 +5,6 @@
     .globl user_test_payload_start
 user_test_payload_start:
     li gp, USER_TEST_GP_VALUE
-    li tp, USER_TEST_TP_VALUE
     li s0, 0x101
     li s1, 0x102
     li s2, 0x103
@@ -26,7 +25,15 @@ user_test_payload_start:
     beqz t0, 1b
 
     li t0, USER_TEST_TP_VALUE
+    beq tp, t0, 4f
+    li t0, USER_TEST_SECOND_TP_VALUE
     bne tp, t0, 2f
+    li t0, USER_TEST_SECOND_STACK_TOP
+    j 5f
+4:
+    li t0, USER_TEST_STACK_TOP
+5:
+    bne sp, t0, 2f
     li t0, USER_TEST_GP_VALUE
     bne gp, t0, 2f
     li t0, 0x101
@@ -53,15 +60,33 @@ user_test_payload_start:
     bne s10, t0, 2f
     li t0, 0x10c
     bne s11, t0, 2f
-    li t0, USER_TEST_STACK_TOP
-    bne sp, t0, 2f
-
     li a7, 0x7fff
     ecall
     li t0, -38
     bne a0, t0, 2f
     li t0, USER_TEST_GP_VALUE
     bne gp, t0, 2f
+
+    li a7, 172
+    ecall
+    blez a0, 2f
+    mv s0, a0
+
+    li a7, 178
+    ecall
+    blez a0, 2f
+    bne a0, s0, 2f
+
+    li t0, 1
+    addi t1, s10, USER_TEST_ID_COUNT_OFFSET
+    amoadd.d t2, t0, (t1)
+    li t0, 2
+    bgeu t2, t0, 2f
+    slli t2, t2, 4
+    addi t2, t2, USER_TEST_ID_RECORDS_OFFSET
+    add t2, s10, t2
+    sd s0, 0(t2)
+    sd a0, 8(t2)
 
     li t0, USER_TEST_RESUMED_VALUE
     sd t0, USER_TEST_RESUMED_OFFSET(s10)

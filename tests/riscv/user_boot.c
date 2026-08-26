@@ -2,7 +2,8 @@
 
 #include <arch/riscv/sbi.h>
 #include <arch/riscv/sv39.h>
-#include <arch/riscv/user_process.h>
+#include <arch/riscv/mm.h>
+#include <kernel/mm.h>
 #include <arch/riscv/virt_uart.h>
 #include <kernel/page.h>
 #include <kernel/physical_page.h>
@@ -100,7 +101,8 @@ static enum kernel_scheduler_status create_user_test(
     struct physical_page_allocator *allocator)
 {
     struct riscv_sv39_user_space space = {0};
-    struct riscv_user_process process = {0};
+    struct kernel_mm mm = {0};
+    struct kernel_mm shared = {0};
     uint64_t code_address;
     uint64_t data_address;
     uint64_t available_before_invalid;
@@ -142,38 +144,51 @@ static enum kernel_scheduler_status create_user_test(
             data_address,
             RISCV_SV39_READ | RISCV_SV39_WRITE) !=
             RISCV_SV39_STATUS_OK ||
-        riscv_user_process_create(&process, &space) !=
-            RISCV_USER_PROCESS_STATUS_OK) {
+        riscv_sv39_user_map_zeroed_page(
+            &space,
+            USER_TEST_SECOND_STACK_VA,
+            RISCV_SV39_READ | RISCV_SV39_WRITE) !=
+            RISCV_SV39_STATUS_OK ||
+        riscv_kernel_mm_create(&mm, &space) !=
+            KERNEL_MM_STATUS_OK) {
         return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
     }
-    normal_record_address = process.record_page_address;
+    normal_record_address = mm.record_page_address;
     normal_leaf_address = code_address;
     available_before_invalid = physical_page_available(allocator);
-    if (kernel_user_thread_create(&process,
+    if (kernel_user_thread_create(&mm,
                                   USER_TEST_CODE_VA + 1U,
                                   USER_TEST_STACK_TOP,
                                   USER_TEST_TP_VALUE) !=
             KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT ||
-        kernel_user_thread_create(&process,
+        kernel_user_thread_create(&mm,
                                   USER_TEST_CODE_VA,
                                   USER_TEST_STACK_TOP - 8U,
                                   USER_TEST_TP_VALUE) !=
             KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT ||
-        process.state != RISCV_USER_PROCESS_LIVE ||
+        mm.state != KERNEL_MM_LIVE ||
         physical_page_available(allocator) != available_before_invalid) {
         return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
     }
-    return kernel_user_thread_create(&process,
+    if (kernel_mm_acquire(&shared, &mm) != KERNEL_MM_STATUS_OK ||
+        kernel_user_thread_create(&mm,
+                                  USER_TEST_CODE_VA,
+                                  USER_TEST_STACK_TOP,
+                                  USER_TEST_TP_VALUE) !=
+            KERNEL_SCHEDULER_STATUS_OK) {
+        return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
+    }
+    return kernel_user_thread_create(&shared,
                                      USER_TEST_CODE_VA,
-                                     USER_TEST_STACK_TOP,
-                                     USER_TEST_TP_VALUE);
+                                     USER_TEST_SECOND_STACK_TOP,
+                                     USER_TEST_SECOND_TP_VALUE);
 }
 
 static enum kernel_scheduler_status create_fault_test(
     struct physical_page_allocator *allocator)
 {
     struct riscv_sv39_user_space space = {0};
-    struct riscv_user_process process = {0};
+    struct kernel_mm mm = {0};
     uint64_t code_address;
     uint64_t stack_address;
     void *code_page;
@@ -212,12 +227,12 @@ static enum kernel_scheduler_status create_fault_test(
             stack_address,
             RISCV_SV39_READ | RISCV_SV39_WRITE) !=
             RISCV_SV39_STATUS_OK ||
-        riscv_user_process_create(&process, &space) !=
-            RISCV_USER_PROCESS_STATUS_OK) {
+        riscv_kernel_mm_create(&mm, &space) !=
+            KERNEL_MM_STATUS_OK) {
         return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
     }
-    fault_record_address = process.record_page_address;
-    return kernel_user_thread_create(&process,
+    fault_record_address = mm.record_page_address;
+    return kernel_user_thread_create(&mm,
                                      USER_TEST_CODE_VA,
                                      USER_TEST_STACK_TOP,
                                      0U);
@@ -280,7 +295,7 @@ static void check_completion(
         }
         return;
     }
-    if (completion_count != 3U ||
+    if ((completion_count != 3U && completion_count != 4U) ||
         completion->kind != KERNEL_THREAD_KIND_USER ||
         completion->reason != KERNEL_THREAD_EXIT_SYSCALL ||
         completion->status != USER_TEST_EXIT_STATUS ||
@@ -327,7 +342,6 @@ enum physical_page_status __wrap_physical_page_release(
     }
     status = __real_physical_page_release(allocator, address);
     if (status == PHYSICAL_PAGE_STATUS_OK &&
-        fail_thread_after_record != 0U &&
         address == normal_record_address) {
         normal_record_released = 1U;
     }
@@ -346,7 +360,27 @@ enum kernel_scheduler_status __wrap_kernel_scheduler_reap_one(
                 UINT64_C(USER_TEST_STARTED_VALUE) ||
             user_data[USER_TEST_RESUMED_OFFSET / sizeof(uint64_t)] !=
                 UINT64_C(USER_TEST_RESUMED_VALUE) ||
-            user_data[USER_TEST_FAILURES_OFFSET / sizeof(uint64_t)] != 0U) {
+            user_data[USER_TEST_FAILURES_OFFSET / sizeof(uint64_t)] != 0U ||
+            user_data[USER_TEST_ID_COUNT_OFFSET / sizeof(uint64_t)] != 2U ||
+            user_data[USER_TEST_ID_RECORDS_OFFSET / sizeof(uint64_t)] == 0U ||
+            user_data[(USER_TEST_ID_RECORDS_OFFSET + 8U) /
+                      sizeof(uint64_t)] !=
+                user_data[USER_TEST_ID_RECORDS_OFFSET /
+                          sizeof(uint64_t)] ||
+            user_data[(USER_TEST_ID_RECORDS_OFFSET +
+                       USER_TEST_ID_RECORD_STRIDE) /
+                      sizeof(uint64_t)] == 0U ||
+            user_data[(USER_TEST_ID_RECORDS_OFFSET +
+                       USER_TEST_ID_RECORD_STRIDE + 8U) /
+                      sizeof(uint64_t)] !=
+                user_data[(USER_TEST_ID_RECORDS_OFFSET +
+                           USER_TEST_ID_RECORD_STRIDE) /
+                          sizeof(uint64_t)] ||
+            user_data[USER_TEST_ID_RECORDS_OFFSET /
+                      sizeof(uint64_t)] ==
+                user_data[(USER_TEST_ID_RECORDS_OFFSET +
+                           USER_TEST_ID_RECORD_STRIDE) /
+                          sizeof(uint64_t)]) {
             test_failures++;
         }
     }
@@ -362,7 +396,10 @@ enum kernel_scheduler_status __wrap_kernel_scheduler_reap_one(
         }
         fault_reap_failure_checked = 1U;
     }
-    if (completion_count == 2U && normal_reap_failures_checked == 0U) {
+    if (completion_count == 3U && normal_reap_failures_checked == 0U) {
+        if (normal_record_released != 0U) {
+            test_failures++;
+        }
         set_completion_sentinel(completion);
         fail_release_address = normal_leaf_address;
         fail_release_once = 1U;
@@ -389,7 +426,7 @@ enum kernel_scheduler_status __wrap_kernel_scheduler_reap_one(
         return status;
     }
     check_completion(completion);
-    if (completion_count == 3U) {
+    if (completion_count == 4U) {
         if (worker_ran == 0U || user_results_checked == 0U ||
             fault_reap_failure_checked == 0U ||
             normal_reap_failures_checked == 0U ||

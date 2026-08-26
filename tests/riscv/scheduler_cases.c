@@ -4,6 +4,7 @@
 #include <arch/riscv/virt_uart.h>
 #include <kernel/page.h>
 #include <kernel/physical_page.h>
+#include <kernel/pid.h>
 #include <kernel/scheduler.h>
 
 #include <stdint.h>
@@ -75,6 +76,45 @@ static unsigned long expect_status(
     enum kernel_scheduler_status actual)
 {
     return expected != actual;
+}
+
+static unsigned long run_pid_cases(void)
+{
+    uint64_t bitmap[KERNEL_PID_BITMAP_WORDS(3U)] = {UINT64_MAX};
+    struct kernel_pid_allocator allocator = {0};
+    kernel_pid_t first = -1;
+    kernel_pid_t second = -1;
+    kernel_pid_t third = -1;
+    kernel_pid_t unchanged = 77;
+
+    if (kernel_pid_allocator_init(&allocator, bitmap, 3U) !=
+            KERNEL_PID_STATUS_OK ||
+        kernel_pid_allocate(&allocator, &first) != KERNEL_PID_STATUS_OK ||
+        kernel_pid_allocate(&allocator, &second) != KERNEL_PID_STATUS_OK ||
+        kernel_pid_allocate(&allocator, &third) != KERNEL_PID_STATUS_OK ||
+        first != 1 || second != 2 || third != 3) {
+        return 1U;
+    }
+    if (kernel_pid_allocate(&allocator, &unchanged) !=
+            KERNEL_PID_STATUS_EXHAUSTED ||
+        unchanged != 77) {
+        return 2U;
+    }
+    if (kernel_pid_release(&allocator, second) != KERNEL_PID_STATUS_OK ||
+        kernel_pid_allocate(&allocator, &second) != KERNEL_PID_STATUS_OK ||
+        second != 2) {
+        return 3U;
+    }
+    if (kernel_pid_release(&allocator, first) != KERNEL_PID_STATUS_OK ||
+        kernel_pid_release(&allocator, second) != KERNEL_PID_STATUS_OK ||
+        kernel_pid_release(&allocator, third) != KERNEL_PID_STATUS_OK ||
+        kernel_pid_release(&allocator, second) !=
+            KERNEL_PID_STATUS_NOT_ALLOCATED ||
+        kernel_pid_release(&allocator, 0) != KERNEL_PID_STATUS_INVALID ||
+        kernel_pid_release(&allocator, 4) != KERNEL_PID_STATUS_INVALID) {
+        return 4U;
+    }
+    return 0U;
 }
 
 static unsigned long run_preinit_cases(void)
@@ -340,6 +380,7 @@ void kernel_main(unsigned long hart_id, const void *dtb)
     }
 
     failures = page_status != PHYSICAL_PAGE_STATUS_OK;
+    failures += run_pid_cases();
     failures += run_preinit_cases();
     failures += run_init_cases(&allocator);
     failures += run_idle_cases();

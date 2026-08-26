@@ -68,7 +68,7 @@ make test-riscv
 
 `test-trap-return-riscv` 使用显式 32 位 `EBREAK` 验证同步 handler 将 `sepc` 前移 4 字节后返回，再设置 `sip.SSIP`、`sie.SSIE` 和全局 SIE，验证真实 supervisor software interrupt 的保存、清 pending 与返回。汇编探针为除 `sp`、`gp` 外的寄存器设置独立 64 位哨兵，并对全部 x1..x31 的返回值、原始 SP/GP、Frame 对齐、cause 以及 SPP/SPIE/SIE 进行检查；两个测试 ELF 分别构造 SPP 无效和保存 SIE 开启的返回状态，要求各自进入 bad-return 路径。脚本还检查最终 ELF 的入口反汇编，要求 dummy `sc.d` 位于 Frame 槽地址准备之后、`sepc` 写回和 `sret` 之前。
 
-`test-user-riscv` 用两个独立用户地址空间验证 U-mode：主任务在用户循环中被真实 timer 抢占，内核 worker 运行时观察 `sscratch=0` 并设置共享页标志，主任务恢复后核对用户 `gp/sp/tp/s0..s11`、未知 syscall 返回和 `exit(93)`；另一任务访问未映射地址，要求生成用户故障完成记录且不影响主任务。runner 最终要求内核线程、两个用户任务及其地址空间全部回收。
+`test-user-riscv` 用两个用户根验证 U-mode：两个具有不同栈和 TID/TGID 的任务共享正常 MM，在用户循环中被真实 timer 抢占；内核 worker 运行时观察 `sscratch=0` 并设置共享页标志，两个任务恢复后核对用户 `gp/sp/tp/s0..s11`、身份 syscall、未知 syscall 返回和 `exit(93)`。另一独立 MM 任务访问未映射地址，要求生成用户故障完成记录且不影响正常任务。runner 最终要求内核线程、三个用户任务、两个 MM 及全部 TID 回收。
 
 `test-user-fatal-riscv` 在同一真实用户路径中让测试 wrapper 破坏已返回 ecall Frame 的可信 `kernel_tp`，要求汇编拒绝返回，并在用户根仍活动时经 supervisor-only 高半区 UART 输出唯一 fatal 行后关机。它防止诊断路径暗中依赖只存在于内核根的低地址设备映射。
 
