@@ -34,6 +34,8 @@ void __real_kernel_tick_advance(uint64_t elapsed_ticks);
 static struct riscv_sv39_page_table *active_kernel_table;
 static struct physical_page_allocator *test_allocator;
 static volatile uint64_t *user_data;
+static unsigned char *user_uname_first;
+static unsigned char *user_uname_second;
 static uint64_t initial_available;
 static uint64_t completion_count;
 static uint64_t tick_count;
@@ -49,6 +51,27 @@ static uint64_t fail_thread_after_record;
 static uint64_t normal_record_released;
 static uint64_t fault_reap_failure_checked;
 static uint64_t normal_reap_failures_checked;
+
+struct test_utsname {
+    char sysname[65];
+    char nodename[65];
+    char release[65];
+    char version[65];
+    char machine[65];
+    char domainname[65];
+};
+
+static const struct test_utsname expected_utsname = {
+    .sysname = "Linux",
+    .nodename = "boaros",
+    .release = "6.1.0-boaros",
+    .version = "#1 BoarOS",
+    .machine = "riscv64",
+    .domainname = "(none)",
+};
+
+_Static_assert(sizeof(struct test_utsname) == USER_TEST_UNAME_SIZE,
+               "test utsname must match the Linux ABI");
 
 static void clear_page(void *page)
 {
@@ -78,6 +101,67 @@ static int copy_payload(void *page,
     for (index = 0U; index < size; index++) {
         destination[index] = *(const unsigned char *)(start_address + index);
     }
+    return 1;
+}
+
+static unsigned char user_uname_byte(size_t index)
+{
+    size_t first_bytes =
+        USER_TEST_UNAME_SECOND_VA - USER_TEST_UNAME_ADDRESS;
+
+    if (index < first_bytes) {
+        return user_uname_first[
+            (USER_TEST_UNAME_ADDRESS - USER_TEST_UNAME_FIRST_VA) +
+            index];
+    }
+    return user_uname_second[index - first_bytes];
+}
+
+static int user_uname_matches(void)
+{
+    const unsigned char *expected =
+        (const unsigned char *)&expected_utsname;
+    size_t index;
+
+    if (user_uname_first == 0 || user_uname_second == 0 ||
+        user_uname_first[USER_TEST_UNAME_ADDRESS -
+                         USER_TEST_UNAME_FIRST_VA - 1U] != 0U ||
+        user_uname_second[USER_TEST_UNAME_SIZE -
+                          (USER_TEST_UNAME_SECOND_VA -
+                           USER_TEST_UNAME_ADDRESS)] != 0U) {
+        return 0;
+    }
+    for (index = 0U; index < sizeof(expected_utsname); index++) {
+        if (user_uname_byte(index) != expected[index]) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int remember_user_uname_pages(const struct kernel_mm *mm)
+{
+    struct kernel_mm_mapping mapping;
+    void *pointer;
+
+    if (kernel_mm_lookup(mm, USER_TEST_UNAME_FIRST_VA, &mapping) !=
+            KERNEL_MM_STATUS_OK ||
+        physical_page_resolve(mm->allocator,
+                              mapping.physical_address &
+                                  ~BOAROS_PAGE_MASK,
+                              &pointer) != PHYSICAL_PAGE_STATUS_OK) {
+        return 0;
+    }
+    user_uname_first = pointer;
+    if (kernel_mm_lookup(mm, USER_TEST_UNAME_SECOND_VA, &mapping) !=
+            KERNEL_MM_STATUS_OK ||
+        physical_page_resolve(mm->allocator,
+                              mapping.physical_address &
+                                  ~BOAROS_PAGE_MASK,
+                              &pointer) != PHYSICAL_PAGE_STATUS_OK) {
+        return 0;
+    }
+    user_uname_second = pointer;
     return 1;
 }
 
@@ -149,8 +233,19 @@ static enum kernel_scheduler_status create_user_test(
             USER_TEST_SECOND_STACK_VA,
             RISCV_SV39_READ | RISCV_SV39_WRITE) !=
             RISCV_SV39_STATUS_OK ||
+        riscv_sv39_user_map_zeroed_page(
+            &space,
+            USER_TEST_UNAME_FIRST_VA,
+            RISCV_SV39_READ | RISCV_SV39_WRITE) !=
+            RISCV_SV39_STATUS_OK ||
+        riscv_sv39_user_map_zeroed_page(
+            &space,
+            USER_TEST_UNAME_SECOND_VA,
+            RISCV_SV39_READ | RISCV_SV39_WRITE) !=
+            RISCV_SV39_STATUS_OK ||
         riscv_kernel_mm_create(&mm, &space) !=
-            KERNEL_MM_STATUS_OK) {
+            KERNEL_MM_STATUS_OK ||
+        !remember_user_uname_pages(&mm)) {
         return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
     }
     normal_record_address = mm.record_page_address;
@@ -380,7 +475,8 @@ enum kernel_scheduler_status __wrap_kernel_scheduler_reap_one(
                       sizeof(uint64_t)] ==
                 user_data[(USER_TEST_ID_RECORDS_OFFSET +
                            USER_TEST_ID_RECORD_STRIDE) /
-                          sizeof(uint64_t)]) {
+                          sizeof(uint64_t)] ||
+            !user_uname_matches()) {
             test_failures++;
         }
     }

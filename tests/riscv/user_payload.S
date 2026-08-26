@@ -88,6 +88,29 @@ user_test_payload_start:
     sd s0, 0(t2)
     sd a0, 8(t2)
 
+    li a0, USER_TEST_UNAME_ADDRESS
+    li a7, 160
+    ecall
+    bnez a0, 2f
+
+    li a0, 0
+    li a7, 160
+    ecall
+    li t0, -14
+    bne a0, t0, 2f
+
+    li a0, USER_TEST_CODE_VA
+    li a7, 160
+    ecall
+    li t0, -14
+    bne a0, t0, 2f
+
+    li a0, USER_TEST_USER_LIMIT - 1
+    li a7, 160
+    ecall
+    li t0, -14
+    bne a0, t0, 2f
+
     li t0, USER_TEST_RESUMED_VALUE
     sd t0, USER_TEST_RESUMED_OFFSET(s10)
     li a0, USER_TEST_EXIT_STATUS

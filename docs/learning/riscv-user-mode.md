@@ -1,6 +1,6 @@
 # RISC-V 用户态与系统调用学习总结
 
-本文整理从内核线程走到可执行 U-mode 任务所需的特权级、地址空间、现场切换、系统调用和资源所有权知识，并记录 BoarOS 当前已经验证的选择。稳定接口和限制以 [RISC-V Trap 模块](../modules/riscv-trap.md)、[RISC-V Sv39 分页模块](../modules/riscv-sv39.md)、[内核 MM 模块](../modules/kernel-mm.md)、[内核任务调度模块](../modules/kernel-scheduler.md)和 [系统调用解码模块](../modules/kernel-syscall.md)为准。
+本文整理从内核线程走到可执行 U-mode 任务所需的特权级、地址空间、现场切换、系统调用和资源所有权知识，并记录 BoarOS 当前已经验证的选择。稳定接口和限制以 [RISC-V Trap 模块](../modules/riscv-trap.md)、[RISC-V Sv39 分页模块](../modules/riscv-sv39.md)、[内核 MM 模块](../modules/kernel-mm.md)、[用户内存访问模块](../modules/kernel-uaccess.md)、[内核任务调度模块](../modules/kernel-scheduler.md)和 [系统调用解码模块](../modules/kernel-syscall.md)为准。
 
 ## U-mode 解决的边界
 
@@ -44,9 +44,21 @@ BoarOS 的通用 `kernel_mm` 是可 acquire/move/release 的引用，RISC-V 用�
 
 RISC-V Linux 用户 ABI 用 `a7` 传系统调用号，`a0..a5` 传最多六个参数，返回值放在 `a0`。用户执行 `ECALL` 后，`sepc` 指向 `ECALL` 本身；若系统调用要返回用户代码，内核必须把 `sepc` 前移 4 字节，否则会再次执行同一条指令。
 
-BoarOS 当前实现 `exit(93)`、`getpid(172)` 和 `gettid(178)`。退出状态取参数的低 8 位并形成完成记录，任务不再恢复；`getpid` 返回线程组 ID，`gettid` 返回当前任务 ID。当前用户任务都是单成员组，所以两个身份值相同，但内核字段和 syscall 语义已经分开。未知调用返回 `-ENOSYS`（错误号 38），同时前移 `sepc` 后继续执行。
+BoarOS 当前实现 `exit(93)`、`uname(160)`、`getpid(172)` 和 `gettid(178)`。退出状态取参数的低 8 位并形成完成记录，任务不再恢复；`uname` 使用 Linux 六个 65 字节字段、总计 390 字节的 `new_utsname`，用户目标无效时返回 `-EFAULT`；`getpid` 返回线程组 ID，`gettid` 返回当前任务 ID。当前用户任务都是单成员组，所以两个身份值相同，但内核字段和 syscall 语义已经分开。未知调用返回 `-ENOSYS`（错误号 38），同时前移 `sepc` 后继续执行。
 
-系统调用解码与架构 Trap 分开：Trap 层负责寄存器、`sepc` 和显式 current task，通用解码层负责编号、参数和结果语义。`exit` 目前只结束当前 task；尚未实现 `exit_group`、父子关系、zombie/wait、文件表、信号、用户内存复制、可执行文件来源与 `exec` 生命周期或 `fork/clone`，现有 MM/TID 机制不伪装这些能力。
+系统调用解码与架构 Trap 分开：Trap 层负责寄存器、`sepc` 和显式 current task，通用解码层负责编号、参数和结果语义。`exit` 目前只结束当前 task；尚未实现 `exit_group`、父子关系、zombie/wait、文件表、信号、用户输入复制、可执行文件来源与 `exec` 生命周期或 `fork/clone`，现有 MM/TID 机制不伪装这些能力。
+
+## 内核为什么不能直接解引用用户指针
+
+系统调用参数只是用户虚拟地址。即使当前用户页表正在 `satp` 中，S-mode 对带 `PTE_U` 页的访问仍受架构特权控制；RISC-V 通常需要临时设置 `sstatus.SUM`。地址还可能未映射、权限错误或在复制中途跨页，若内核普通 load/store 直接触发 page fault，而 Trap 只会把 S-mode fault 当作 fatal，就会把一个应返回 `-EFAULT` 的用户错误升级成内核崩溃。
+
+Linux RISC-V 的高性能 usercopy 会先验证用户范围，设置 SUM 后直接访问用户虚拟地址，并给可能故障的汇编指令登记 exception table。S-mode page fault 到来时，Trap 根据故障 PC 查表，把 `sepc` 修正到 fixup 路径，最终返回尚未复制的字节数。硬件 TLB 负责地址翻译，适合大缓冲区；代价是 SUM 开关纪律、异常表链接布局、汇编复制循环和 fault fixup 都必须完整正确。
+
+BoarOS 当前的首个消费者是固定 390 字节的 `uname`，而内核尚无 exception table、并发 unmap 或按需缺页。因此 RISC-V 后端先逐基页调用 `kernel_mm_lookup()`，检查 `USER|WRITE` 后通过高半区 direct map 写物理页。每个片段不跨页，范围越界在复制前失败，后续页故障则保留已经复制的连续前缀。该路径不会产生可恢复的 S-mode fault，也不需要修改 SUM；代价是每个涉及页执行一次三级软件遍历，所以不能从 `uname` 测试推断未来大块 `read/write` 的性能。
+
+软件遍历是当前正确性路径，不是 syscall ABI 的组成部分。公共 uaccess 接口只表达 MM、用户地址、内核缓冲区、长度和已复制前缀；将来可以在 RISC-V 内部为当前活动 MM 增加 SUM+异常表快路径，在 LoongArch 使用其架构机制，而 `uname`、VFS 和错误码语义保持不变。SMP、COW 或运行期 unmap 出现后，还必须用 MM 读锁或页固定保证“查到映射”和“完成复制”之间的物理页生命周期。
+
+`uname.sysname` 必须是 `Linux`，公开 LTP 会据此判断 Linux ABI。`release` 也常被 BusyBox 和 LTP 解析成版本号来选择兼容路径；RISC-V/LoongArch 不应报告不可能支持这些架构的远古版本。BoarOS 当前固定报告 `6.1.0-boaros`，机器字段由架构构建选择为 `riscv64`，以后 LoongArch 使用 `loongarch64`。这些字符串与 390 字节结构布局属于用户可观察 ABI；主机名和 UTS namespace 可在以后改成受锁保护的动态快照。
 
 ## 用户故障与内核故障必须分开
 
@@ -77,3 +89,5 @@ Sv39、`satp`、`sscratch`、Trap Frame 和 RISC-V syscall 寄存器约定属于
 - `references/riscv/riscv-privileged-20260120.pdf`：U/S 特权转换、`sstatus`、`sscratch`、`SRET` 和 Trap CSR。
 - `references/linux/arch/riscv/kernel/entry.S`：Linux RISC-V 的 `sscratch`/`tp` 换栈、用户/内核来源判断和返回路径。
 - `references/linux/arch/riscv/include/asm/syscall.h`、`references/linux/arch/riscv/include/uapi/asm/unistd.h` 与通用 UAPI syscall 定义：RISC-V Linux 的参数寄存器、返回值和系统调用编号来源。
+- `references/linux/arch/riscv/include/asm/uaccess.h`、`references/linux/arch/riscv/lib/uaccess.S` 和 `references/linux/arch/riscv/mm/extable.c`：SUM、复制循环、异常表与 fault fixup 的 Linux 实现依据。
+- `references/linux/include/uapi/linux/utsname.h` 与 `references/linux/kernel/sys.c`：`new_utsname` 的六字段布局、`uname(160)` 复制和 `-EFAULT` 语义。

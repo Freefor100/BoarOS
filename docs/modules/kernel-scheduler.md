@@ -9,7 +9,7 @@
 | `include/arch/riscv/context.h`、`arch/riscv/context.c` | 初始化 RISC-V switch context，提供 current `tp` 和 SIE 临界区操作 |
 | `include/arch/riscv/thread.h`、`arch/riscv/context_switch.S` | 定义 Trap 汇编可见的任务前缀，保存/恢复 `ra/sp/tp/s0..s11` |
 | `include/kernel/pid.h`、`kernel/pid.c` | 提供调用者给定位图的有界整数 ID 分配器 |
-| `include/kernel/task.h` | 暴露不透明 current task 以及 TID/TGID 查询 |
+| `include/kernel/task.h` | 暴露不透明 current task、TID/TGID 查询和当前用户任务的只读 MM 借用 |
 | `include/kernel/scheduler.h`、`kernel/scheduler.c` | 管理 idle、任务页、FIFO 队列、MM/身份所有权和完成回收 |
 | `arch/riscv/trap.c` | 在 timer tick 后调用 scheduler，并把 current task 传给 syscall 层 |
 | `kernel/main.c` | 在 timer 启动前初始化 scheduler，在 boot idle 栈上回收退出任务 |
@@ -36,9 +36,13 @@ enum kernel_task_status kernel_task_tid(
     const struct kernel_task *task, kernel_pid_t *tid);
 enum kernel_task_status kernel_task_tgid(
     const struct kernel_task *task, kernel_pid_t *tgid);
+enum kernel_task_status kernel_task_mm_borrow(
+    const struct kernel_task *task, const struct kernel_mm **mm);
 ```
 
 `struct kernel_task` 对公共调用者不透明。历史接口名中的 `thread` 仍表示创建或结束一条执行流；内部对象使用 task，因为它同时承载调度状态、Linux 身份关系和资源引用。
+
+`kernel_task_mm_borrow()` 只接受 scheduler 当前正在运行的用户任务及其 LIVE MM，成功返回不增加引用计数的只读借用。它用于一次同步 syscall 操作，调用者不得保存或释放该指针；任务在内核调用链和 timer 抢占期间仍拥有 MM，退出回收则要等任务离开该调用链。这样 `uname` 不在每次用户复制时修改 MM 引用计数，未来 SMP 必须把这项借用纳入 task/MM 的读侧生命周期保护。
 
 ## 创建和所有权
 

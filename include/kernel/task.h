@@ -4,6 +4,7 @@
 #include <kernel/pid.h>
 
 struct kernel_task;
+struct kernel_mm;
 
 enum kernel_task_status {
     KERNEL_TASK_STATUS_OK = 0,
@@ -21,5 +22,10 @@ enum kernel_task_status kernel_task_tid(
 enum kernel_task_status kernel_task_tgid(
     const struct kernel_task *task,
     kernel_pid_t *tgid);
+
+/* The returned MM is borrowed for the duration of the current task call. */
+enum kernel_task_status kernel_task_mm_borrow(
+    const struct kernel_task *task,
+    const struct kernel_mm **mm);
 
 #endif

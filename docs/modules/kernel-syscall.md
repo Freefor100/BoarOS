@@ -18,17 +18,18 @@ enum kernel_syscall_status kernel_syscall_dispatch(
 - `KERNEL_SYSCALL_ACTION_RETURN`：把 `value` 写回用户返回值寄存器后继续执行。
 - `KERNEL_SYSCALL_ACTION_EXIT`：以 `value` 作为退出状态终止当前用户任务。
 
-空调用者、空请求或空输出返回 `KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT`；身份查询无法从调用者取得有效 TID/TGID 时也返回该状态。失败时不修改输出。有效请求均返回 `KERNEL_SYSCALL_STATUS_OK`，具体语义由结果动作表达。
+空调用者、空请求或空输出返回 `KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT`；依赖任务资源的调用无法取得有效身份或 LIVE MM，以及 uaccess 报告内核状态损坏时，也返回该状态并由 Trap 边界视为 fatal。失败时不修改输出。有效请求均返回 `KERNEL_SYSCALL_STATUS_OK`，具体语义由结果动作表达。
 
 ## 当前 ABI 与验证
 
 当前采用 Linux RISC-V 系统调用编号和错误值：
 
 - `exit` 编号为 93，产生 `EXIT`；状态保留参数 0 的低 8 位。
+- `uname` 编号为 160，把六个 65 字节字段组成的 Linux `new_utsname` 写到参数 0 指向的用户缓冲区；成功返回 0，用户范围、映射或写权限错误返回 `-EFAULT`（-14）。当前固定报告 `Linux/boaros/6.1.0-boaros/#1 BoarOS/riscv64/(none)`，其中机器名由架构构建配置提供。
 - `getpid` 编号为 172，返回调用任务所属线程组的 TGID。
 - `gettid` 编号为 178，返回调用任务自己的 TID。
 - 其他编号产生 `RETURN`，返回 `-ENOSYS`（-38）。
 
 当前用户任务都是单成员线程组，所以 `getpid()` 与 `gettid()` 数值相等；接口语义和内部字段已经分离，增加线程组成员后无需改变 syscall ABI。内核任务与 idle 没有 Linux 身份，Trap 层只会从用户任务进入该接口。
 
-`make test-syscall-riscv` 验证空指针失败原子性、`exit(93)` 的状态截断和未知编号的统一返回。`make test-user-riscv` 从真实 U-mode 执行 `getpid/gettid`、未知 ecall 和 `exit(93)`：身份值必须为正且首线程二者相等，未知调用返回后继续执行，exit 形成用户完成记录且不再返回该 Frame。
+`make test-syscall-riscv` 验证空指针失败原子性、`exit(93)` 的状态截断和未知编号的统一返回。`make test-uaccess-riscv` 验证 `uname` 所依赖的复制错误语义。`make test-user-riscv` 从真实 U-mode 执行跨 4 KiB 边界的 `uname`，逐字节核对完整 390 字节结构和前后哨兵，并要求 NULL、RX text 与越过用户地址上限的目标都返回 `-EFAULT`；同一程序还验证 `getpid/gettid`、未知 ecall 和 `exit(93)`。

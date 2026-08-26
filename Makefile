@@ -27,6 +27,7 @@ PAGE_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-page-rv
 SV39_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-sv39-rv
 SV39_FAULT_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-sv39-fault-rv
 MM_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-mm-rv
+UACCESS_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-uaccess-rv
 TIMER_CASES_TEST_KERNEL_RV := \
 	$(BUILD_DIR)/tests/kernel-timer-cases-rv
 TIMER_BOOT_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-timer-boot-rv
@@ -47,7 +48,8 @@ USER_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-user-rv
 USER_FATAL_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-user-fatal-rv
 
 ARCH_FLAGS := -march=rv64imac_zicsr_zifencei -mabi=lp64 -mcmodel=medany
-CPPFLAGS := -Iinclude -DBOAROS_PAGE_SHIFT=12
+CPPFLAGS := -Iinclude -DBOAROS_PAGE_SHIFT=12 \
+	-DBOAROS_UTS_MACHINE=\"riscv64\"
 CFLAGS := $(ARCH_FLAGS) -std=gnu11 -O2 -g3 \
 	-ffreestanding -fno-builtin -fno-stack-protector -fno-pic -fno-pie \
 	-ffunction-sections -fdata-sections -Wall -Wextra -Werror
@@ -64,6 +66,7 @@ C_SOURCES := \
 	arch/riscv/sv39.c \
 	arch/riscv/timer.c \
 	arch/riscv/trap.c \
+	arch/riscv/uaccess.c \
 	arch/riscv/user_elf.c \
 	arch/riscv/virt_uart.c \
 	kernel/boot_memory.c \
@@ -89,6 +92,7 @@ TEST_RUNTIME_C_SOURCES := \
 	arch/riscv/sv39.c \
 	arch/riscv/timer.c \
 	arch/riscv/trap.c \
+	arch/riscv/uaccess.c \
 	arch/riscv/user_elf.c \
 	arch/riscv/virt_uart.c \
 	kernel/elf64.c \
@@ -168,6 +172,12 @@ MM_TEST_C_SOURCES := \
 MM_TEST_OBJECTS := \
 	$(TEST_RUNTIME_OBJECTS) \
 	$(patsubst %.c,$(BUILD_DIR)/%.o,$(MM_TEST_C_SOURCES))
+UACCESS_TEST_C_SOURCES := \
+	tests/riscv/uaccess_cases.c \
+	tests/riscv/uaccess_main.c
+UACCESS_TEST_OBJECTS := \
+	$(TEST_RUNTIME_OBJECTS) \
+	$(patsubst %.c,$(BUILD_DIR)/%.o,$(UACCESS_TEST_C_SOURCES))
 TIMER_CASES_TEST_C_SOURCES := \
 	tests/riscv/timer_cases.c
 TIMER_CASES_TEST_OBJECTS := \
@@ -248,6 +258,7 @@ DEPS := \
 	$(SV39_TEST_OBJECTS:.o=.d) \
 	$(SV39_FAULT_TEST_OBJECTS:.o=.d) \
 	$(MM_TEST_OBJECTS:.o=.d) \
+	$(UACCESS_TEST_OBJECTS:.o=.d) \
 	$(TIMER_CASES_TEST_OBJECTS:.o=.d) \
 	$(TIMER_BOOT_TEST_OBJECTS:.o=.d) \
 	$(CONTEXT_TEST_OBJECTS:.o=.d) \
@@ -271,7 +282,7 @@ DEPS := \
 	test-references test-riscv test-sv39-fault-riscv test-sv39-riscv \
 	test-syscall-riscv test-timer-riscv test-trap-riscv \
 	test-trap-return-riscv test-user-fatal-riscv test-mm-riscv \
-	test-user-riscv
+	test-uaccess-riscv test-user-riscv
 
 all: $(KERNEL_RV)
 
@@ -337,6 +348,12 @@ $(MM_TEST_KERNEL_RV): $(MM_TEST_OBJECTS) \
 	$(CC) $(LDFLAGS) \
 		-Wl,-Map,$(BUILD_DIR)/tests/kernel-mm-rv.map \
 		-o $@ $(MM_TEST_OBJECTS)
+
+$(UACCESS_TEST_KERNEL_RV): $(UACCESS_TEST_OBJECTS) \
+		arch/riscv/linker.ld
+	$(CC) $(LDFLAGS) \
+		-Wl,-Map,$(BUILD_DIR)/tests/kernel-uaccess-rv.map \
+		-o $@ $(UACCESS_TEST_OBJECTS)
 
 $(TIMER_CASES_TEST_KERNEL_RV): $(TIMER_CASES_TEST_OBJECTS) \
 		arch/riscv/linker.ld
@@ -473,7 +490,7 @@ test-riscv: $(DTB_TEST_KERNEL_RV) $(PAGE_TEST_KERNEL_RV) \
 	$(SYSCALL_TEST_KERNEL_RV) $(ELF64_TEST_KERNEL_RV) \
 	$(USER_ELF_CASES_TEST_KERNEL_RV) $(USER_ELF_TEST_KERNEL_RV) \
 	$(USER_TEST_KERNEL_RV) $(USER_FATAL_TEST_KERNEL_RV) \
-	$(MM_TEST_KERNEL_RV) \
+	$(MM_TEST_KERNEL_RV) $(UACCESS_TEST_KERNEL_RV) \
 	$(SV39_TEST_KERNEL_RV) $(SV39_FAULT_TEST_KERNEL_RV) \
 	$(TRAP_RETURN_TEST_KERNEL_RV) $(TRAP_RETURN_SIE_TEST_KERNEL_RV) \
 	$(HIGH_HALF_TRAP_TEST_KERNEL_RV) $(NO_IDENTITY_TEST_KERNEL_RV) \
@@ -517,6 +534,9 @@ test-riscv: $(DTB_TEST_KERNEL_RV) $(PAGE_TEST_KERNEL_RV) \
 	QEMU_RISCV64=$(QEMU_RISCV64) \
 		MM_TEST_KERNEL_RV=$(MM_TEST_KERNEL_RV) \
 		./tests/mm-riscv.sh
+	QEMU_RISCV64=$(QEMU_RISCV64) \
+		UACCESS_TEST_KERNEL_RV=$(UACCESS_TEST_KERNEL_RV) \
+		./tests/uaccess-riscv.sh
 	QEMU_RISCV64=$(QEMU_RISCV64) \
 		SV39_TEST_KERNEL_RV=$(SV39_TEST_KERNEL_RV) ./tests/sv39-riscv.sh
 	QEMU_RISCV64=$(QEMU_RISCV64) \
@@ -600,6 +620,10 @@ test-user-fatal-riscv: $(USER_FATAL_TEST_KERNEL_RV)
 test-mm-riscv: $(MM_TEST_KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) MM_TEST_KERNEL_RV=$< \
 		./tests/mm-riscv.sh
+
+test-uaccess-riscv: $(UACCESS_TEST_KERNEL_RV)
+	QEMU_RISCV64=$(QEMU_RISCV64) UACCESS_TEST_KERNEL_RV=$< \
+		./tests/uaccess-riscv.sh
 
 test-sv39-riscv: $(SV39_TEST_KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) SV39_TEST_KERNEL_RV=$< \
