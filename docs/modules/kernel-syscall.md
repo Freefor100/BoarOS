@@ -25,7 +25,7 @@ enum kernel_syscall_status kernel_syscall_dispatch(
 当前采用 Linux RISC-V 系统调用编号和错误值：
 
 - `exit` 编号为 93，产生 `EXIT`；状态保留参数 0 的低 8 位。
-- `uname` 编号为 160，把六个 65 字节字段组成的 Linux `new_utsname` 写到参数 0 指向的用户缓冲区；成功返回 0，用户范围、映射或写权限错误返回 `-EFAULT`（-14）。当前固定报告 `Linux/boaros/6.1.0-boaros/#1 BoarOS/riscv64/(none)`，其中机器名由架构构建配置提供。
+- `uname` 编号为 160，把六个 65 字节字段组成的 Linux `new_utsname` 写到参数 0 指向的用户缓冲区；成功返回 0，用户范围、映射或写权限错误返回 `-EFAULT`（-14）。当前固定报告 `Linux/boaros/0.1.0-boaros-dev/#1 BoarOS/riscv64/(none)`，其中 release 是 BoarOS 自身开发版本而非 Linux 能力等级，机器名由架构构建配置提供。
 - `getpid` 编号为 172，返回调用任务所属线程组的 TGID。
 - `gettid` 编号为 178，返回调用任务自己的 TID。
 - 其他编号产生 `RETURN`，返回 `-ENOSYS`（-38）。

@@ -58,7 +58,7 @@ BoarOS 当前的首个消费者是固定 390 字节的 `uname`，而内核尚无
 
 软件遍历是当前正确性路径，不是 syscall ABI 的组成部分。公共 uaccess 接口只表达 MM、用户地址、内核缓冲区、长度和已复制前缀；将来可以在 RISC-V 内部为当前活动 MM 增加 SUM+异常表快路径，在 LoongArch 使用其架构机制，而 `uname`、VFS 和错误码语义保持不变。SMP、COW 或运行期 unmap 出现后，还必须用 MM 读锁或页固定保证“查到映射”和“完成复制”之间的物理页生命周期。
 
-`uname.sysname` 必须是 `Linux`，公开 LTP 会据此判断 Linux ABI。`release` 也常被 BusyBox 和 LTP 解析成版本号来选择兼容路径；RISC-V/LoongArch 不应报告不可能支持这些架构的远古版本。BoarOS 当前固定报告 `6.1.0-boaros`，机器字段由架构构建选择为 `riscv64`，以后 LoongArch 使用 `loongarch64`。这些字符串与 390 字节结构布局属于用户可观察 ABI；主机名和 UTS namespace 可在以后改成受锁保护的动态快照。
+`uname.sysname` 报告 `Linux`，表示内核选择 Linux 用户 ABI personality，不表示内部实现来自 Linux 源码。`release` 是操作系统自身的发行标识，不是 syscall、文件系统或并发能力的位图；但现实程序可能把它当成内核能力的近似信号，所以借用一个尚未达到的 Linux 版本会误导用户态兼容路径。BoarOS 当前报告自身开发版本 `0.1.0-boaros-dev`，以后随项目发布状态升级；Linux ABI 兼容程度由明确的行为测试和兼容性矩阵表达，不由 release 字符串代替。机器字段由架构构建选择为 `riscv64`，以后 LoongArch 使用 `loongarch64`。这些字符串与 390 字节结构布局都属于用户可观察 ABI；主机名和 UTS namespace 可在以后改成受锁保护的动态快照。
 
 ## 用户故障与内核故障必须分开
 
