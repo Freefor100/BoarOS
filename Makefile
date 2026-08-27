@@ -25,6 +25,7 @@ NO_IDENTITY_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-no-identity-rv
 DTB_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-dtb-rv
 PAGE_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-page-rv
 HEAP_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-heap-rv
+BLOCK_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-block-rv
 SV39_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-sv39-rv
 SV39_FAULT_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-sv39-fault-rv
 MM_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-mm-rv
@@ -70,7 +71,9 @@ C_SOURCES := \
 	arch/riscv/uaccess.c \
 	arch/riscv/user_elf.c \
 	arch/riscv/virt_uart.c \
+	arch/riscv/virtio_mmio_block.c \
 	kernel/boot_memory.c \
+	kernel/block.c \
 	kernel/dtb.c \
 	kernel/elf64.c \
 	kernel/main.c \
@@ -79,6 +82,7 @@ C_SOURCES := \
 	kernel/scheduler.c \
 	kernel/syscall.c \
 	kernel/tick.c \
+	lib/string.c \
 	mm/heap.c
 ASM_SOURCES := \
 	arch/riscv/boot.S \
@@ -97,12 +101,15 @@ TEST_RUNTIME_C_SOURCES := \
 	arch/riscv/uaccess.c \
 	arch/riscv/user_elf.c \
 	arch/riscv/virt_uart.c \
+	arch/riscv/virtio_mmio_block.c \
+	kernel/block.c \
 	kernel/elf64.c \
 	kernel/pid.c \
 	kernel/physical_page.c \
 	kernel/scheduler.c \
 	kernel/syscall.c \
 	kernel/tick.c \
+	lib/string.c \
 	mm/heap.c
 TEST_RUNTIME_ASM_SOURCES := \
 	arch/riscv/boot.S \
@@ -160,6 +167,12 @@ HEAP_TEST_C_SOURCES := \
 HEAP_TEST_OBJECTS := \
 	$(TEST_RUNTIME_OBJECTS) \
 	$(patsubst %.c,$(BUILD_DIR)/%.o,$(HEAP_TEST_C_SOURCES))
+BLOCK_TEST_C_SOURCES := \
+	kernel/dtb.c \
+	tests/riscv/block_main.c
+BLOCK_TEST_OBJECTS := \
+	$(TEST_RUNTIME_OBJECTS) \
+	$(patsubst %.c,$(BUILD_DIR)/%.o,$(BLOCK_TEST_C_SOURCES))
 SV39_TEST_C_SOURCES := \
 	arch/riscv/direct_map.c \
 	tests/riscv/direct_map_cases.c \
@@ -265,6 +278,7 @@ DEPS := \
 	$(DTB_TEST_OBJECTS:.o=.d) \
 	$(PAGE_TEST_OBJECTS:.o=.d) \
 	$(HEAP_TEST_OBJECTS:.o=.d) \
+	$(BLOCK_TEST_OBJECTS:.o=.d) \
 	$(SV39_TEST_OBJECTS:.o=.d) \
 	$(SV39_FAULT_TEST_OBJECTS:.o=.d) \
 	$(MM_TEST_OBJECTS:.o=.d) \
@@ -289,7 +303,7 @@ DEPS := \
 	test-elf64-riscv test-user-elf-cases-riscv test-user-elf-riscv \
 	test-high-half-trap-riscv test-idle-riscv test-no-identity-riscv \
 	test-lwext4-host \
-	test-heap-riscv test-page-riscv \
+	test-block-riscv test-heap-riscv test-page-riscv \
 	test-scheduler-cases-riscv test-scheduler-riscv \
 	test-references test-riscv test-sv39-fault-riscv test-sv39-riscv \
 	test-syscall-riscv test-timer-riscv test-trap-riscv \
@@ -351,6 +365,10 @@ $(PAGE_TEST_KERNEL_RV): $(PAGE_TEST_OBJECTS) arch/riscv/linker.ld
 $(HEAP_TEST_KERNEL_RV): $(HEAP_TEST_OBJECTS) arch/riscv/linker.ld
 	$(CC) $(LDFLAGS) -Wl,-Map,$(BUILD_DIR)/tests/kernel-heap-rv.map \
 		-o $@ $(HEAP_TEST_OBJECTS)
+
+$(BLOCK_TEST_KERNEL_RV): $(BLOCK_TEST_OBJECTS) arch/riscv/linker.ld
+	$(CC) $(LDFLAGS) -Wl,-Map,$(BUILD_DIR)/tests/kernel-block-rv.map \
+		-o $@ $(BLOCK_TEST_OBJECTS)
 
 $(SV39_TEST_KERNEL_RV): $(SV39_TEST_OBJECTS) arch/riscv/linker.ld
 	$(CC) $(LDFLAGS) -Wl,-Map,$(BUILD_DIR)/tests/kernel-sv39-rv.map \
@@ -505,6 +523,7 @@ debug-riscv: $(KERNEL_RV)
 
 test-riscv: $(DTB_TEST_KERNEL_RV) $(PAGE_TEST_KERNEL_RV) \
 	$(HEAP_TEST_KERNEL_RV) \
+	$(BLOCK_TEST_KERNEL_RV) \
 	$(CONTEXT_TEST_KERNEL_RV) $(SCHEDULER_CASES_TEST_KERNEL_RV) \
 	$(SCHEDULER_BOOT_TEST_KERNEL_RV) \
 	$(SYSCALL_TEST_KERNEL_RV) $(ELF64_TEST_KERNEL_RV) \
@@ -522,6 +541,8 @@ test-riscv: $(DTB_TEST_KERNEL_RV) $(PAGE_TEST_KERNEL_RV) \
 		PAGE_TEST_KERNEL_RV=$(PAGE_TEST_KERNEL_RV) ./tests/page-riscv.sh
 	QEMU_RISCV64=$(QEMU_RISCV64) \
 		HEAP_TEST_KERNEL_RV=$(HEAP_TEST_KERNEL_RV) ./tests/heap-riscv.sh
+	QEMU_RISCV64=$(QEMU_RISCV64) \
+		BLOCK_TEST_KERNEL_RV=$(BLOCK_TEST_KERNEL_RV) ./tests/block-riscv.sh
 	QEMU_RISCV64=$(QEMU_RISCV64) OBJDUMP_RV=$(OBJDUMP) \
 		CONTEXT_TEST_KERNEL_RV=$(CONTEXT_TEST_KERNEL_RV) \
 		CONTEXT_OBJECT_RV=$(BUILD_DIR)/arch/riscv/context_switch.o \
@@ -596,6 +617,10 @@ test-page-riscv: $(PAGE_TEST_KERNEL_RV)
 test-heap-riscv: $(HEAP_TEST_KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) HEAP_TEST_KERNEL_RV=$< \
 		./tests/heap-riscv.sh
+
+test-block-riscv: $(BLOCK_TEST_KERNEL_RV)
+	QEMU_RISCV64=$(QEMU_RISCV64) BLOCK_TEST_KERNEL_RV=$< \
+		./tests/block-riscv.sh
 
 test-context-riscv: $(CONTEXT_TEST_KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) OBJDUMP_RV=$(OBJDUMP) \
