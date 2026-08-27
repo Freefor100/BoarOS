@@ -27,6 +27,51 @@ push、发布、比赛提交、许可证和阶段转换由人决定，除非人�
 - 错误码、对象所有权、清理顺序、锁和内存序属于接口语义。
 - 从设计开始考虑多核，但单核行为尚不可验证时不预建复杂 SMP 框架。
 
+## 根文件系统与可执行文件来源
+
+文件系统阶段沿真实启动路径建立以下纵向闭环，而不是分别提交未被生产路径消费的接口或空框架：
+
+```text
+DTB 设备发现
+  -> 平台 MMIO 与 VirtIO transport
+  -> virtio-blk
+  -> BoarOS block_device
+  -> 私有 lwext4 adapter
+  -> 根 VFS file/pread
+  -> ELF 随机访问源
+  -> 用户地址空间与 /init
+```
+
+阶段收口的可观察结果是：QEMU 从真实 raw ext4 磁盘发现块设备，只读挂载根文件系统，通过 VFS 打开 `/init`，按偏移装载静态 ELF 并进入 U-mode，最后沿已有 syscall 与任务回收路径退出。实现可以按物理内存、块设备、文件和进程映像各自的资源生命周期形成审查边界，但独立边界必须具有真实消费者、失败语义和验证证据；只新增未使用 API 不构成阶段能力。
+
+### 内存与块设备边界
+
+当前单页 bump/recycle 分配器只承担分页启动期：最终 direct map 可用后单向切换到 buddy 物理页分配器。切换时从可用 RAM 分配紧凑的逐页元数据，把启动期已经领出的页导入为 allocated，把其余页按最大可合并阶加入空闲链。现有单页接口在切换后委托给 order-0，另提供按二次幂连续页分配，供页表、大对象与 DMA 使用；不得要求调用者知道分配器当前处于启动还是最终状态。
+
+内核动态分配采用小对象 size class 与 buddy 后备的大对象路径，提供具有整数溢出检查的 `calloc`/`realloc` 语义，并通过 lwext4 的用户分配钩子服务文件系统。固定大小的连续 heap arena 会把可用容量固化成启动参数，vmalloc heap 又会在当前阶段引入额外页表、TLB 与回收复杂度，因此两者都不作为稳定基础。分配器的对象所有权和锁边界允许以后接入 SMP；分配热路径是否增加 per-CPU cache 由基准和锁竞争证据决定。
+
+`block_device` 是 BoarOS 自有的同步、精确扇区接口。它负责检查扇区号、数量、容量和算术溢出，区分越界、超时、设备与内存错误，并保证普通失败不会把未完成数据冒充为有效结果。上层只依赖块设备语义，不依赖 VirtIO descriptor、MMIO 或 PCI；后端以后可以把轮询完成改为中断唤醒而不改变文件系统接口。读路径在对齐和所有权允许时直接以最终目标缓冲区提交 I/O，不能把固定的额外整文件复制固化进接口。
+
+### 平台与 transport 隔离
+
+RISC-V QEMU `virt` 通过 DTB 的 `compatible = "virtio,mmio"` 节点发现和映射 VirtIO MMIO transport，virtio-blk 在其上实现块设备；不得依赖固定的第几个窗口或设备永远位于某个地址。比赛 Harness 当前也以 `virtio-blk-device` 接到 `virtio-mmio-bus`，见[本地 Harness](../references/oscomp-autotest/kernel/run_qemu.py)。设备 ID、状态机、feature negotiation、split virtqueue、内存屏障和扇区容量遵循 [VirtIO 1.3](https://docs.oasis-open.org/virtio/virtio/v1.3/virtio-v1.3.html)。
+
+LoongArch QEMU 后续提供 virtio-pci transport，复用 virtqueue、virtio-blk、`block_device`、VFS 与 ext4 上层。VisionFive 2 与 2K1000LA 的真实开发板由各自 DTB 和手册决定 SD、eMMC、PCI 或其他存储后端；开发板适配只替换设备发现、transport、DMA/cache coherency 和中断等平台边界，不复制 VFS、ext4 或 ELF 逻辑。通用与架构代码只在第二个真实实现点出现后沿已经验证的接口抽取。
+
+### VFS、lwext4 与 ELF 边界
+
+初始 VFS 只形成根挂载、打开、按偏移读取、查询大小和关闭这一条真实文件生命周期，足以支持 `/init`，不提前建立没有消费者的完整 fd table、mount namespace 或 dentry cache。lwext4 作为私有 ext4 后端，类型和正值 errno 不得泄漏到通用 VFS、块设备或 ELF 接口；adapter 把它们转换为内核对象生命周期和负 errno。只读实现若发现文件系统需要 journal recovery，必须拒绝挂载，不能在没有 replay/write 能力时静默读取可能不一致的状态。
+
+ELF 装载器从“完整内存 buffer”推广为带总长度的随机访问源 `read_at(offset, dst, len)`。内存后端保留现有聚焦测试，VFS 文件后端成为生产来源。装载时一次读入并校验 ELF header 与有界数量的 program header，再把各 `PT_LOAD` 按页或块直接读入已经解析出的用户页，避免整文件常驻和重复复制；校验顺序仍保证格式、范围、权限或分配失败时不会暴露半初始化的进程映像。
+
+### 过渡桥梁、并发与性能证据
+
+首个 VirtIO 实现使用一个 split virtqueue 并轮询完成，因为当前尚无外部中断控制器、等待队列和阻塞唤醒路径。轮询只存在于设备后端，具有有界超时以及明确的 descriptor、request 和设备状态清理；外部中断与可阻塞调度建立后，替换为 IRQ 加 sleep/wake，`block_device` 以上接口保持不变。
+
+首次根挂载和 `/init` 装载发生在单 hart、单线程启动阶段。VFS 暂不对并发 syscall 暴露；以后开放并发访问前，文件与缓存对象必须具备可睡眠锁和完整引用生命周期，不能把“关中断并持有 spinlock 等待磁盘”变成长期设计。
+
+正确性验证覆盖设备缺失或 feature 不支持、容量和范围错误、I/O 超时与设备失败、错误 superblock 或 metadata checksum、需要 recovery 的文件系统、缺失 `/init`、截断或畸形 ELF，以及各层分配失败。每条失败路径都必须保持所有权可判定、资源可释放；清理本身失败时保留可重试状态。性能基线至少记录 I/O 请求与扇区数、动态分配峰值和次数、数据复制量以及启动和 ELF 装载耗时；缓存数量、请求合并、并行队列或 per-CPU 分配优化只在可重复工作负载和目标平台数据支持时引入。
+
 ## 源码组织
 
 文件和目录反映已经形成的稳定职责、依赖方向与资源生命周期，不以行数或文件数作为机械阈值，也不提前建立只有一个实现文件的分类目录。同一领域出现多个长期实现单元、需要共享私有接口，或者形成独立生命周期、失败域或验证边界时，随触发它的主线能力增量拆分；纯路径重排不单独充当能力阶段。
