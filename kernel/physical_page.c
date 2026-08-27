@@ -964,6 +964,36 @@ static int allocated_block_valid(
     return 1;
 }
 
+enum physical_page_status physical_page_allocation_order(
+    const struct physical_page_allocator *allocator,
+    uint64_t address,
+    uint32_t *order)
+{
+    uint32_t page_index;
+    const struct physical_page_metadata *metadata;
+
+    if (!allocator_initialized(allocator) || order == 0 ||
+        !page_lookup(allocator, address, 0, &page_index)) {
+        return PHYSICAL_PAGE_STATUS_INVALID;
+    }
+    if (!physical_page_allocator_is_finalized(allocator)) {
+        return PHYSICAL_PAGE_STATUS_STATE;
+    }
+
+    metadata = &allocator->metadata[page_index];
+    if (metadata->state == PHYSICAL_PAGE_STATE_FREE_HEAD ||
+        metadata->state == PHYSICAL_PAGE_STATE_FREE_TAIL) {
+        return PHYSICAL_PAGE_STATUS_DOUBLE_FREE;
+    }
+    if (metadata->state != PHYSICAL_PAGE_STATE_ALLOCATED_HEAD ||
+        !allocated_block_valid(allocator, page_index, metadata->order)) {
+        return PHYSICAL_PAGE_STATUS_INVALID;
+    }
+
+    *order = metadata->order;
+    return PHYSICAL_PAGE_STATUS_OK;
+}
+
 enum physical_page_status physical_page_release_order(
     struct physical_page_allocator *allocator,
     uint64_t address,

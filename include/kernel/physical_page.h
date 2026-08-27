@@ -74,6 +74,12 @@ enum physical_page_status physical_page_release_order(
     uint64_t address,
     uint32_t order);
 
+/* Return the order stored on an allocated buddy head. */
+enum physical_page_status physical_page_allocation_order(
+    const struct physical_page_allocator *allocator,
+    uint64_t address,
+    uint32_t *order);
+
 /* The caller must own an allocated page; this validates only address history. */
 enum physical_page_status physical_page_resolve(
     const struct physical_page_allocator *allocator,
