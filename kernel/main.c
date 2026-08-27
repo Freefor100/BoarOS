@@ -428,7 +428,9 @@ static void verify_direct_map_runtime(void)
     uint64_t virtual_address;
     uint64_t recycled_address;
     void *page_pointer;
+    void *recycled_pointer;
     volatile uint64_t *words;
+    volatile uint64_t *recycled_words;
     enum physical_page_status status;
 
     if (kernel_page_table.allocator != &page_allocator) {
@@ -467,7 +469,15 @@ static void verify_direct_map_runtime(void)
     if (status != PHYSICAL_PAGE_STATUS_OK) {
         shutdown_for_physical_page_error(status);
     }
-    if (recycled_address != physical_address || words[1] != pattern) {
+    status = physical_page_resolve(&page_allocator,
+                                   recycled_address,
+                                   &recycled_pointer);
+    if (status != PHYSICAL_PAGE_STATUS_OK) {
+        shutdown_for_direct_map_error();
+    }
+    recycled_words = recycled_pointer;
+    recycled_words[1] = pattern;
+    if (recycled_words[1] != pattern) {
         shutdown_for_direct_map_error();
     }
     status = physical_page_release(&page_allocator, recycled_address);
@@ -579,6 +589,14 @@ void kernel_main(unsigned long hart_id, const void *dtb)
     if (page_status != PHYSICAL_PAGE_STATUS_OK) {
         shutdown_for_physical_page_error(page_status);
     }
+    page_status = physical_page_allocator_finalize(&page_allocator);
+    if (page_status != PHYSICAL_PAGE_STATUS_OK) {
+        shutdown_for_physical_page_error(page_status);
+    }
+    virt_uart_puts("BoarOS: physical allocator mode=buddy metadata=");
+    virt_uart_put_hex(
+        (unsigned long)physical_page_metadata_pages(&page_allocator));
+    virt_uart_putc('\n');
     kernel_page_table.allocator = &page_allocator;
     verify_direct_map_runtime();
 

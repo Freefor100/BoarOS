@@ -173,10 +173,18 @@ run_case()
     if [ -z "$direct_map_values" ] ||
         [ "$direct_map_pa" = "$direct_map_values" ] ||
         [ "$direct_map_va" = "$direct_map_rest" ] ||
-        [ "$direct_map_reused" != "${direct_map_reused#* }" ] ||
-        [ "$direct_map_pa" != "$direct_map_reused" ]; then
+        [ "$direct_map_reused" != "${direct_map_reused#* }" ]; then
         cat "$output" >&2
-        echo "expected one successful direct-map allocation and reuse" >&2
+        echo "expected one successful direct-map allocation cycle" >&2
+        exit 1
+    fi
+
+    allocator_metadata=$(sed -n \
+        's/^BoarOS: physical allocator mode=buddy metadata=\(0x[1-9a-f][0-9a-f]*\)$/\1/p' \
+        "$output")
+    if [ -z "$allocator_metadata" ]; then
+        cat "$output" >&2
+        echo "expected finalized buddy allocator metadata accounting" >&2
         exit 1
     fi
 
@@ -215,9 +223,10 @@ run_case()
     if [ -z "$sv39_counts" ] || [ "$sv39_tables" = "$sv39_counts" ] ||
         [ "$sv39_leaf4k" = "$sv39_rest" ] ||
         [ "$sv39_leaf2m" != "${sv39_leaf2m#* }" ] ||
-        [ "$((page_total - page_available))" -ne "$((sv39_tables))" ]; then
+        [ "$((page_total - page_available))" -ne \
+            "$((sv39_tables + allocator_metadata))" ]; then
         cat "$output" >&2
-        echo "expected active Sv39 with accounted 4 KiB and 2 MiB leaves" >&2
+        echo "expected exact Sv39 and buddy metadata page accounting" >&2
         exit 1
     fi
 }

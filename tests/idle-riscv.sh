@@ -40,6 +40,12 @@ if [ "$(grep -cxF 'BoarOS: timer frequency=0x989680 tick-hz=0x64 period=0x186a0'
     exit 1
 fi
 
+if [ "$(grep -cE '^BoarOS: physical allocator mode=buddy metadata=0x[1-9a-f][0-9a-f]*$' "$output" || true)" -ne 1 ]; then
+    tail -n 100 "$output" >&2
+    echo "production kernel did not finalize the buddy allocator" >&2
+    exit 1
+fi
+
 if grep -qE 'BoarOS: (fatal trap|timer error|SBI shutdown failed)' "$output"; then
     tail -n 100 "$output" >&2
     echo "production kernel reported an error while idle" >&2
