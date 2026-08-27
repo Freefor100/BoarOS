@@ -26,6 +26,9 @@ DTB_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-dtb-rv
 PAGE_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-page-rv
 HEAP_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-heap-rv
 BLOCK_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-block-rv
+VFS_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-vfs-rv
+VFS_RECOVERY_TEST_KERNEL_RV := \
+	$(BUILD_DIR)/tests/kernel-vfs-recovery-rv
 SV39_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-sv39-rv
 SV39_FAULT_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-sv39-fault-rv
 MM_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-mm-rv
@@ -60,6 +63,27 @@ ASFLAGS := $(ARCH_FLAGS) -g3
 LDFLAGS := $(ARCH_FLAGS) -nostdlib -nostartfiles -static -no-pie \
 	-T arch/riscv/linker.ld -Wl,--build-id=none -Wl,--gc-sections
 
+LWEXT4_CPPFLAGS := -Ifs/lwext4_config -Ithird_party/lwext4/include \
+	-DCONFIG_USE_DEFAULT_CFG=0
+LWEXT4_SOURCES := \
+	third_party/lwext4/src/ext4.c \
+	third_party/lwext4/src/ext4_balloc.c \
+	third_party/lwext4/src/ext4_bcache.c \
+	third_party/lwext4/src/ext4_bitmap.c \
+	third_party/lwext4/src/ext4_block_group.c \
+	third_party/lwext4/src/ext4_blockdev.c \
+	third_party/lwext4/src/ext4_crc32.c \
+	third_party/lwext4/src/ext4_debug.c \
+	third_party/lwext4/src/ext4_dir.c \
+	third_party/lwext4/src/ext4_dir_idx.c \
+	third_party/lwext4/src/ext4_extent.c \
+	third_party/lwext4/src/ext4_fs.c \
+	third_party/lwext4/src/ext4_hash.c \
+	third_party/lwext4/src/ext4_ialloc.c \
+	third_party/lwext4/src/ext4_inode.c \
+	third_party/lwext4/src/ext4_super.c \
+	third_party/lwext4/src/ext4_trans.c
+
 C_SOURCES := \
 	arch/riscv/context.c \
 	arch/riscv/direct_map.c \
@@ -72,6 +96,8 @@ C_SOURCES := \
 	arch/riscv/user_elf.c \
 	arch/riscv/virt_uart.c \
 	arch/riscv/virtio_mmio_block.c \
+	fs/lwext4_port.c \
+	fs/vfs.c \
 	kernel/boot_memory.c \
 	kernel/block.c \
 	kernel/dtb.c \
@@ -82,8 +108,10 @@ C_SOURCES := \
 	kernel/scheduler.c \
 	kernel/syscall.c \
 	kernel/tick.c \
+	lib/qsort.c \
 	lib/string.c \
-	mm/heap.c
+	mm/heap.c \
+	$(LWEXT4_SOURCES)
 ASM_SOURCES := \
 	arch/riscv/boot.S \
 	arch/riscv/context_switch.S \
@@ -173,6 +201,24 @@ BLOCK_TEST_C_SOURCES := \
 BLOCK_TEST_OBJECTS := \
 	$(TEST_RUNTIME_OBJECTS) \
 	$(patsubst %.c,$(BUILD_DIR)/%.o,$(BLOCK_TEST_C_SOURCES))
+VFS_TEST_SUPPORT_C_SOURCES := \
+	fs/lwext4_port.c \
+	fs/vfs.c \
+	kernel/dtb.c \
+	lib/qsort.c \
+	$(LWEXT4_SOURCES)
+VFS_TEST_C_SOURCES := \
+	$(VFS_TEST_SUPPORT_C_SOURCES) \
+	tests/riscv/vfs_main.c
+VFS_TEST_OBJECTS := \
+	$(TEST_RUNTIME_OBJECTS) \
+	$(patsubst %.c,$(BUILD_DIR)/%.o,$(VFS_TEST_C_SOURCES))
+VFS_RECOVERY_TEST_MAIN_OBJECT := \
+	$(BUILD_DIR)/tests/riscv/vfs_recovery_main.o
+VFS_RECOVERY_TEST_OBJECTS := \
+	$(TEST_RUNTIME_OBJECTS) \
+	$(patsubst %.c,$(BUILD_DIR)/%.o,$(VFS_TEST_SUPPORT_C_SOURCES)) \
+	$(VFS_RECOVERY_TEST_MAIN_OBJECT)
 SV39_TEST_C_SOURCES := \
 	arch/riscv/direct_map.c \
 	tests/riscv/direct_map_cases.c \
@@ -279,6 +325,8 @@ DEPS := \
 	$(PAGE_TEST_OBJECTS:.o=.d) \
 	$(HEAP_TEST_OBJECTS:.o=.d) \
 	$(BLOCK_TEST_OBJECTS:.o=.d) \
+	$(VFS_TEST_OBJECTS:.o=.d) \
+	$(VFS_RECOVERY_TEST_MAIN_OBJECT:.o=.d) \
 	$(SV39_TEST_OBJECTS:.o=.d) \
 	$(SV39_FAULT_TEST_OBJECTS:.o=.d) \
 	$(MM_TEST_OBJECTS:.o=.d) \
@@ -303,7 +351,7 @@ DEPS := \
 	test-elf64-riscv test-user-elf-cases-riscv test-user-elf-riscv \
 	test-high-half-trap-riscv test-idle-riscv test-no-identity-riscv \
 	test-lwext4-host \
-	test-block-riscv test-heap-riscv test-page-riscv \
+	test-block-riscv test-heap-riscv test-page-riscv test-vfs-riscv \
 	test-scheduler-cases-riscv test-scheduler-riscv \
 	test-references test-riscv test-sv39-fault-riscv test-sv39-riscv \
 	test-syscall-riscv test-timer-riscv test-trap-riscv \
@@ -369,6 +417,21 @@ $(HEAP_TEST_KERNEL_RV): $(HEAP_TEST_OBJECTS) arch/riscv/linker.ld
 $(BLOCK_TEST_KERNEL_RV): $(BLOCK_TEST_OBJECTS) arch/riscv/linker.ld
 	$(CC) $(LDFLAGS) -Wl,-Map,$(BUILD_DIR)/tests/kernel-block-rv.map \
 		-o $@ $(BLOCK_TEST_OBJECTS)
+
+$(VFS_TEST_KERNEL_RV): $(VFS_TEST_OBJECTS) arch/riscv/linker.ld
+	$(CC) $(LDFLAGS) -Wl,-Map,$(BUILD_DIR)/tests/kernel-vfs-rv.map \
+		-o $@ $(VFS_TEST_OBJECTS)
+
+$(VFS_RECOVERY_TEST_KERNEL_RV): $(VFS_RECOVERY_TEST_OBJECTS) \
+		arch/riscv/linker.ld
+	$(CC) $(LDFLAGS) \
+		-Wl,-Map,$(BUILD_DIR)/tests/kernel-vfs-recovery-rv.map \
+		-o $@ $(VFS_RECOVERY_TEST_OBJECTS)
+
+$(VFS_RECOVERY_TEST_MAIN_OBJECT): tests/riscv/vfs_main.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -DVFS_EXPECT_RECOVERY \
+		-MMD -MP -c $< -o $@
 
 $(SV39_TEST_KERNEL_RV): $(SV39_TEST_OBJECTS) arch/riscv/linker.ld
 	$(CC) $(LDFLAGS) -Wl,-Map,$(BUILD_DIR)/tests/kernel-sv39-rv.map \
@@ -509,6 +572,16 @@ $(BUILD_DIR)/%.o: %.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c $< -o $@
 
+$(BUILD_DIR)/fs/lwext4_port.o $(BUILD_DIR)/fs/vfs.o: \
+	CPPFLAGS += $(LWEXT4_CPPFLAGS)
+
+$(BUILD_DIR)/third_party/lwext4/src/%.o: \
+		third_party/lwext4/src/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CPPFLAGS) $(LWEXT4_CPPFLAGS) $(CFLAGS) \
+		-Wno-unused-but-set-variable -Wno-stringop-truncation \
+		-MMD -MP -c $< -o $@
+
 $(BUILD_DIR)/%.o: %.S
 	@mkdir -p $(dir $@)
 	$(CC) $(CPPFLAGS) $(ASFLAGS) -MMD -MP -c $< -o $@
@@ -524,6 +597,8 @@ debug-riscv: $(KERNEL_RV)
 test-riscv: $(DTB_TEST_KERNEL_RV) $(PAGE_TEST_KERNEL_RV) \
 	$(HEAP_TEST_KERNEL_RV) \
 	$(BLOCK_TEST_KERNEL_RV) \
+	$(VFS_TEST_KERNEL_RV) \
+	$(VFS_RECOVERY_TEST_KERNEL_RV) \
 	$(CONTEXT_TEST_KERNEL_RV) $(SCHEDULER_CASES_TEST_KERNEL_RV) \
 	$(SCHEDULER_BOOT_TEST_KERNEL_RV) \
 	$(SYSCALL_TEST_KERNEL_RV) $(ELF64_TEST_KERNEL_RV) \
@@ -543,6 +618,10 @@ test-riscv: $(DTB_TEST_KERNEL_RV) $(PAGE_TEST_KERNEL_RV) \
 		HEAP_TEST_KERNEL_RV=$(HEAP_TEST_KERNEL_RV) ./tests/heap-riscv.sh
 	QEMU_RISCV64=$(QEMU_RISCV64) \
 		BLOCK_TEST_KERNEL_RV=$(BLOCK_TEST_KERNEL_RV) ./tests/block-riscv.sh
+	QEMU_RISCV64=$(QEMU_RISCV64) \
+		VFS_TEST_KERNEL_RV=$(VFS_TEST_KERNEL_RV) \
+		VFS_RECOVERY_TEST_KERNEL_RV=$(VFS_RECOVERY_TEST_KERNEL_RV) \
+		./tests/vfs-riscv.sh
 	QEMU_RISCV64=$(QEMU_RISCV64) OBJDUMP_RV=$(OBJDUMP) \
 		CONTEXT_TEST_KERNEL_RV=$(CONTEXT_TEST_KERNEL_RV) \
 		CONTEXT_OBJECT_RV=$(BUILD_DIR)/arch/riscv/context_switch.o \
@@ -621,6 +700,12 @@ test-heap-riscv: $(HEAP_TEST_KERNEL_RV)
 test-block-riscv: $(BLOCK_TEST_KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) BLOCK_TEST_KERNEL_RV=$< \
 		./tests/block-riscv.sh
+
+test-vfs-riscv: $(VFS_TEST_KERNEL_RV) $(VFS_RECOVERY_TEST_KERNEL_RV)
+	QEMU_RISCV64=$(QEMU_RISCV64) \
+		VFS_TEST_KERNEL_RV=$(VFS_TEST_KERNEL_RV) \
+		VFS_RECOVERY_TEST_KERNEL_RV=$(VFS_RECOVERY_TEST_KERNEL_RV) \
+		./tests/vfs-riscv.sh
 
 test-context-riscv: $(CONTEXT_TEST_KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) OBJDUMP_RV=$(OBJDUMP) \
