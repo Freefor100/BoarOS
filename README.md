@@ -11,7 +11,7 @@ BoarOS 是一个从零搭建，面向 OS Comp 能力建设的 C 语言（少量 
 - 启动代码建立 `gp`、清零 BSS、创建单 hart 启动栈，并把 OpenSBI 的 hart ID 与 DTB 指针交给 C 入口。
 - 启动代码安装 Direct-mode `stvec`；统一 Trap 入口让 S-mode 直接使用当前栈，并通过 `sscratch <-> tp` 为 U-mode 切到任务内核栈，保存完整整数 Trap Frame 后经过 C dispatcher 验证并执行 `sret`。生产 dispatcher 已处理 supervisor timer、U-mode ecall 和用户同步故障；其他未处理事件仍输出 CSR 现场后关机。
 - 内核校验并扫描 DTB，读取第一段 RAM、静态保留区和 RISC-V `timebase-frequency`，排除固件、内核镜像与 DTB 自身占用后形成启动内存布局。
-- 物理页分配器按 4 KiB 向内对齐可用区间，支持单页分配、释放、耗尽和重复释放诊断；进入高半区后一次性绑定物理地址访问函数，回收链节点通过该函数读写。
+- 物理页分配器按 4 KiB 向内对齐可用区间，分页启动期使用顺序游标与回收链；进入高半区、绑定 direct-map 访问函数后，一次性导入既有所有权并切换到自托管 metadata 的 buddy 模式。现有单页接口在最终模式使用 order 0，另支持自然对齐的二次幂连续页，释放时按 buddy head 做常数时间摘链和逐级合并。
 - RISC-V 内核 ELF 链接到 Sv39 高半区 `0xffffffff80000000`，QEMU 当前仍从物理地址 `0x80200000` 装载和进入；内核先用只覆盖切换所需低/高别名的过渡页表迁移 PC、栈、`gp` 和 `stvec`，再切换到只含高半区内核、从 `0xffffffc000000000` 开始的 128 GiB RAM direct map 和平台 MMIO 的最终页表。
 - Sv39 建表器按条件组合 2 MiB 与 4 KiB 叶子；最终页表不保留低地址映射，QEMU `virt` UART 的物理 MMIO 通过 `0xffffffe000000000` 的 supervisor-only 高半区别名访问。运行期用户地址空间拥有低半区 4 KiB U 页和页表页、借用包含 UART 在内的最终内核高半区根项，并以 ASID 0 全局刷新方式切换 `satp`。
 - 最终地址空间建立后，内核先把 boot context 初始化为 idle，再通过 SBI TIME 设置绝对 deadline，以 100 Hz 策略处理 supervisor timer interrupt；迟到时按原 deadline 相位一次补记 elapsed tick，并把同一 elapsed 交给 scheduler。
