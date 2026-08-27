@@ -9,7 +9,7 @@
 #error "the RISC-V target requires 4 KiB pages"
 #endif
 
-static unsigned char page_pool[BOAROS_PAGE_SIZE * 8U]
+static unsigned char page_pool[BOAROS_PAGE_SIZE * 64U]
     __attribute__((aligned(BOAROS_PAGE_SIZE)));
 
 #define TEST_PHYSICAL_BASE UINT64_C(0x40000000)
@@ -488,6 +488,400 @@ static void test_resolve_rejects_inaccessible_page(void)
     }
 }
 
+static void test_finalize_imports_bootstrap_state(void)
+{
+    struct boot_memory_layout layout;
+    struct physical_page_allocator allocator;
+    uint64_t first;
+    uint64_t recycled;
+    uint64_t third;
+    uint64_t run = UINT64_C(0x1122334455667788);
+    uint64_t available;
+    enum physical_page_status actual;
+
+    layout.usable_count = 1U;
+    layout.usable[0].base = TEST_PHYSICAL_BASE;
+    layout.usable[0].size = BOAROS_PAGE_SIZE * 64U;
+    actual = init_bound_page_allocator(&allocator,
+                                       &layout,
+                                       mapped_page_access);
+    if (actual != PHYSICAL_PAGE_STATUS_OK ||
+        physical_page_allocate(&allocator, &first) !=
+            PHYSICAL_PAGE_STATUS_OK ||
+        physical_page_allocate(&allocator, &recycled) !=
+            PHYSICAL_PAGE_STATUS_OK ||
+        physical_page_allocate(&allocator, &third) !=
+            PHYSICAL_PAGE_STATUS_OK ||
+        physical_page_release(&allocator, recycled) !=
+            PHYSICAL_PAGE_STATUS_OK) {
+        fail_page(54U, PHYSICAL_PAGE_STATUS_OK, actual);
+    }
+    available = physical_page_available(&allocator);
+
+    actual = physical_page_allocator_finalize(&allocator);
+    if (actual != PHYSICAL_PAGE_STATUS_OK ||
+        !physical_page_allocator_is_finalized(&allocator) ||
+        physical_page_metadata_pages(&allocator) != 1U ||
+        physical_page_available(&allocator) + 1U != available) {
+        fail_page(55U, PHYSICAL_PAGE_STATUS_OK, actual);
+    }
+
+    available = physical_page_available(&allocator);
+    actual = physical_page_release_order(&allocator, first, 1U);
+    if (actual != PHYSICAL_PAGE_STATUS_INVALID ||
+        physical_page_available(&allocator) != available) {
+        fail_page(56U, PHYSICAL_PAGE_STATUS_INVALID, actual);
+    }
+    actual = physical_page_allocate_order(&allocator, 1U, &run);
+    if (actual != PHYSICAL_PAGE_STATUS_OK ||
+        (run & ((BOAROS_PAGE_SIZE << 1U) - 1U)) != 0U ||
+        run < TEST_PHYSICAL_BASE ||
+        run >= TEST_PHYSICAL_BASE + BOAROS_PAGE_SIZE * 64U) {
+        fail_page(57U, PHYSICAL_PAGE_STATUS_OK, actual);
+    }
+    if (physical_page_release_order(&allocator, run, 1U) !=
+            PHYSICAL_PAGE_STATUS_OK ||
+        physical_page_release(&allocator, first) !=
+            PHYSICAL_PAGE_STATUS_OK ||
+        physical_page_release(&allocator, third) !=
+            PHYSICAL_PAGE_STATUS_OK) {
+        fail_page(58U, PHYSICAL_PAGE_STATUS_OK,
+                  PHYSICAL_PAGE_STATUS_INVALID);
+    }
+}
+
+static enum physical_page_status init_coalescing_buddy(
+    struct physical_page_allocator *allocator,
+    uint64_t *owned_page)
+{
+    struct boot_memory_layout layout;
+    uint64_t pages[5];
+    uint32_t index;
+    enum physical_page_status status;
+
+    layout.usable_count = 1U;
+    layout.usable[0].base = TEST_PHYSICAL_BASE;
+    layout.usable[0].size = BOAROS_PAGE_SIZE * 6U;
+    status = init_bound_page_allocator(allocator,
+                                       &layout,
+                                       mapped_page_access);
+    if (status != PHYSICAL_PAGE_STATUS_OK) {
+        return status;
+    }
+    for (index = 0U; index < 5U; index++) {
+        status = physical_page_allocate(allocator, &pages[index]);
+        if (status != PHYSICAL_PAGE_STATUS_OK) {
+            return status;
+        }
+    }
+    for (index = 0U; index < 4U; index++) {
+        status = physical_page_release(allocator, pages[index]);
+        if (status != PHYSICAL_PAGE_STATUS_OK) {
+            return status;
+        }
+    }
+    status = physical_page_allocator_finalize(allocator);
+    if (status == PHYSICAL_PAGE_STATUS_OK) {
+        *owned_page = pages[4];
+    }
+    return status;
+}
+
+static void test_buddy_allocates_aligned_runs_and_coalesces(void)
+{
+    struct physical_page_allocator allocator;
+    uint64_t owned_page;
+    uint64_t pages[4];
+    uint64_t run = UINT64_C(0x1122334455667788);
+    uint32_t index;
+    enum physical_page_status actual =
+        init_coalescing_buddy(&allocator, &owned_page);
+
+    if (actual != PHYSICAL_PAGE_STATUS_OK ||
+        physical_page_available(&allocator) != 4U) {
+        fail_page(59U, PHYSICAL_PAGE_STATUS_OK, actual);
+    }
+    for (index = 0U; index < 4U; index++) {
+        actual = physical_page_allocate_order(&allocator, 0U, &pages[index]);
+        if (actual != PHYSICAL_PAGE_STATUS_OK ||
+            pages[index] < TEST_PHYSICAL_BASE ||
+            pages[index] >= TEST_PHYSICAL_BASE + BOAROS_PAGE_SIZE * 4U) {
+            fail_page(60U + index, PHYSICAL_PAGE_STATUS_OK, actual);
+        }
+    }
+    if (physical_page_available(&allocator) != 0U) {
+        fail_page(64U,
+                  PHYSICAL_PAGE_STATUS_EMPTY,
+                  PHYSICAL_PAGE_STATUS_OK);
+    }
+
+    actual = physical_page_release_order(&allocator, pages[1], 0U);
+    if (actual == PHYSICAL_PAGE_STATUS_OK) {
+        actual = physical_page_release_order(&allocator, pages[3], 0U);
+    }
+    if (actual == PHYSICAL_PAGE_STATUS_OK) {
+        actual = physical_page_release_order(&allocator, pages[0], 0U);
+    }
+    if (actual == PHYSICAL_PAGE_STATUS_OK) {
+        actual = physical_page_release_order(&allocator, pages[2], 0U);
+    }
+    if (actual != PHYSICAL_PAGE_STATUS_OK ||
+        physical_page_available(&allocator) != 4U) {
+        fail_page(65U, PHYSICAL_PAGE_STATUS_OK, actual);
+    }
+
+    actual = physical_page_allocate_order(&allocator, 2U, &run);
+    if (actual != PHYSICAL_PAGE_STATUS_OK || run != TEST_PHYSICAL_BASE ||
+        (run & ((BOAROS_PAGE_SIZE << 2U) - 1U)) != 0U) {
+        fail_page(66U, PHYSICAL_PAGE_STATUS_OK, actual);
+    }
+    if (physical_page_release_order(&allocator, run, 2U) !=
+            PHYSICAL_PAGE_STATUS_OK ||
+        physical_page_release(&allocator, owned_page) !=
+            PHYSICAL_PAGE_STATUS_OK) {
+        fail_page(67U, PHYSICAL_PAGE_STATUS_OK,
+                  PHYSICAL_PAGE_STATUS_INVALID);
+    }
+}
+
+static void test_buddy_rejects_invalid_ownership(void)
+{
+    struct boot_memory_layout layout;
+    struct physical_page_allocator bootstrap;
+    struct physical_page_allocator allocator;
+    uint64_t owned_page;
+    uint64_t run = UINT64_C(0x1122334455667788);
+    uint64_t available;
+    enum physical_page_status actual;
+
+    layout.usable_count = 1U;
+    layout.usable[0].base = TEST_PHYSICAL_BASE;
+    layout.usable[0].size = BOAROS_PAGE_SIZE * 6U;
+    actual = init_bound_page_allocator(&bootstrap,
+                                       &layout,
+                                       mapped_page_access);
+    if (actual != PHYSICAL_PAGE_STATUS_OK ||
+        physical_page_allocator_is_finalized(&bootstrap) ||
+        physical_page_metadata_pages(&bootstrap) != 0U) {
+        fail_page(68U, PHYSICAL_PAGE_STATUS_OK, actual);
+    }
+    actual = physical_page_allocate_order(&bootstrap, 0U, &run);
+    if (actual != PHYSICAL_PAGE_STATUS_STATE ||
+        run != UINT64_C(0x1122334455667788)) {
+        fail_page(69U, PHYSICAL_PAGE_STATUS_STATE, actual);
+    }
+
+    actual = init_coalescing_buddy(&allocator, &owned_page);
+    if (actual != PHYSICAL_PAGE_STATUS_OK) {
+        fail_page(70U, PHYSICAL_PAGE_STATUS_OK, actual);
+    }
+    available = physical_page_available(&allocator);
+    actual = physical_page_allocate_order(&allocator,
+                                          PHYSICAL_PAGE_MAX_ORDER + 1U,
+                                          &run);
+    if (actual != PHYSICAL_PAGE_STATUS_INVALID ||
+        run != UINT64_C(0x1122334455667788) ||
+        physical_page_available(&allocator) != available) {
+        fail_page(71U, PHYSICAL_PAGE_STATUS_INVALID, actual);
+    }
+
+    actual = physical_page_allocate_order(&allocator, 1U, &run);
+    if (actual != PHYSICAL_PAGE_STATUS_OK) {
+        fail_page(72U, PHYSICAL_PAGE_STATUS_OK, actual);
+    }
+    available = physical_page_available(&allocator);
+    actual = physical_page_release_order(&allocator, run, 0U);
+    if (actual != PHYSICAL_PAGE_STATUS_INVALID ||
+        physical_page_available(&allocator) != available) {
+        fail_page(73U, PHYSICAL_PAGE_STATUS_INVALID, actual);
+    }
+    actual = physical_page_release_order(&allocator,
+                                         run + BOAROS_PAGE_SIZE,
+                                         0U);
+    if (actual != PHYSICAL_PAGE_STATUS_INVALID ||
+        physical_page_available(&allocator) != available) {
+        fail_page(74U, PHYSICAL_PAGE_STATUS_INVALID, actual);
+    }
+    actual = physical_page_release_order(&allocator,
+                                         allocator.metadata_address,
+                                         0U);
+    if (actual != PHYSICAL_PAGE_STATUS_INVALID ||
+        physical_page_available(&allocator) != available) {
+        fail_page(75U, PHYSICAL_PAGE_STATUS_INVALID, actual);
+    }
+    actual = physical_page_release_order(&allocator,
+                                         TEST_PHYSICAL_BASE +
+                                             BOAROS_PAGE_SIZE * 64U,
+                                         0U);
+    if (actual != PHYSICAL_PAGE_STATUS_INVALID ||
+        physical_page_available(&allocator) != available) {
+        fail_page(76U, PHYSICAL_PAGE_STATUS_INVALID, actual);
+    }
+    actual = physical_page_release_order(&allocator, run, 1U);
+    if (actual != PHYSICAL_PAGE_STATUS_OK) {
+        fail_page(77U, PHYSICAL_PAGE_STATUS_OK, actual);
+    }
+    available = physical_page_available(&allocator);
+    actual = physical_page_release_order(&allocator, run, 1U);
+    if (actual != PHYSICAL_PAGE_STATUS_DOUBLE_FREE ||
+        physical_page_available(&allocator) != available) {
+        fail_page(78U, PHYSICAL_PAGE_STATUS_DOUBLE_FREE, actual);
+    }
+    if (physical_page_release(&allocator, owned_page) !=
+        PHYSICAL_PAGE_STATUS_OK) {
+        fail_page(79U, PHYSICAL_PAGE_STATUS_OK,
+                  PHYSICAL_PAGE_STATUS_INVALID);
+    }
+}
+
+static void write_test_link(uint64_t address, uint64_t value)
+{
+    unsigned char *bytes = mapped_page_access(address);
+    uint32_t index;
+
+    for (index = 0U; index < sizeof(value); index++) {
+        bytes[index] = (unsigned char)(value >> (index * 8U));
+    }
+}
+
+static void test_failed_finalize_preserves_bootstrap_allocator(void)
+{
+    struct boot_memory_layout layout;
+    struct physical_page_allocator allocator;
+    uint64_t pages[4];
+    uint64_t available;
+    uint64_t metadata_address;
+    uint32_t index;
+    enum physical_page_status actual;
+
+    layout.usable_count = 1U;
+    layout.usable[0].base = TEST_PHYSICAL_BASE;
+    layout.usable[0].size = BOAROS_PAGE_SIZE * 4U;
+    actual = physical_page_allocator_init(&allocator, &layout);
+    if (actual != PHYSICAL_PAGE_STATUS_OK ||
+        physical_page_allocator_finalize(&allocator) !=
+            PHYSICAL_PAGE_STATUS_STATE ||
+        physical_page_allocate(&allocator, &pages[0]) !=
+            PHYSICAL_PAGE_STATUS_OK ||
+        pages[0] != TEST_PHYSICAL_BASE) {
+        fail_page(80U, PHYSICAL_PAGE_STATUS_OK, actual);
+    }
+
+    actual = init_bound_page_allocator(&allocator,
+                                       &layout,
+                                       mapped_page_access);
+    if (actual != PHYSICAL_PAGE_STATUS_OK) {
+        fail_page(81U, PHYSICAL_PAGE_STATUS_OK, actual);
+    }
+    for (index = 0U; index < 4U; index++) {
+        if (physical_page_allocate(&allocator, &pages[index]) !=
+            PHYSICAL_PAGE_STATUS_OK) {
+            fail_page(82U, PHYSICAL_PAGE_STATUS_OK,
+                      PHYSICAL_PAGE_STATUS_EMPTY);
+        }
+    }
+    if (physical_page_release(&allocator, pages[1]) !=
+        PHYSICAL_PAGE_STATUS_OK) {
+        fail_page(83U, PHYSICAL_PAGE_STATUS_OK,
+                  PHYSICAL_PAGE_STATUS_INVALID);
+    }
+    available = physical_page_available(&allocator);
+    actual = physical_page_allocator_finalize(&allocator);
+    if (actual != PHYSICAL_PAGE_STATUS_EMPTY ||
+        physical_page_available(&allocator) != available ||
+        physical_page_allocate(&allocator, &pages[0]) !=
+            PHYSICAL_PAGE_STATUS_OK ||
+        pages[0] != pages[1]) {
+        fail_page(84U, PHYSICAL_PAGE_STATUS_EMPTY, actual);
+    }
+
+    actual = init_bound_page_allocator(&allocator,
+                                       &layout,
+                                       mapped_page_access);
+    if (actual != PHYSICAL_PAGE_STATUS_OK ||
+        physical_page_allocate(&allocator, &pages[0]) !=
+            PHYSICAL_PAGE_STATUS_OK ||
+        physical_page_allocate(&allocator, &pages[1]) !=
+            PHYSICAL_PAGE_STATUS_OK ||
+        physical_page_release(&allocator, pages[0]) !=
+            PHYSICAL_PAGE_STATUS_OK) {
+        fail_page(85U, PHYSICAL_PAGE_STATUS_OK, actual);
+    }
+    available = physical_page_available(&allocator);
+    write_test_link(pages[0], TEST_PHYSICAL_BASE + BOAROS_PAGE_SIZE * 8U);
+    actual = physical_page_allocator_finalize(&allocator);
+    if (actual != PHYSICAL_PAGE_STATUS_INVALID ||
+        physical_page_available(&allocator) != available ||
+        physical_page_allocator_is_finalized(&allocator)) {
+        fail_page(86U, PHYSICAL_PAGE_STATUS_INVALID, actual);
+    }
+    write_test_link(pages[0], UINT64_MAX);
+    if (physical_page_allocate(&allocator, &pages[2]) !=
+            PHYSICAL_PAGE_STATUS_OK ||
+        pages[2] != pages[0]) {
+        fail_page(87U, PHYSICAL_PAGE_STATUS_OK,
+                  PHYSICAL_PAGE_STATUS_INVALID);
+    }
+
+    actual = init_bound_page_allocator(&allocator,
+                                       &layout,
+                                       mapped_page_access);
+    if (actual != PHYSICAL_PAGE_STATUS_OK ||
+        physical_page_allocator_finalize(&allocator) !=
+            PHYSICAL_PAGE_STATUS_OK) {
+        fail_page(88U, PHYSICAL_PAGE_STATUS_OK, actual);
+    }
+    available = physical_page_available(&allocator);
+    metadata_address = allocator.metadata_address;
+    actual = physical_page_allocator_finalize(&allocator);
+    if (actual != PHYSICAL_PAGE_STATUS_STATE ||
+        physical_page_available(&allocator) != available ||
+        allocator.metadata_address != metadata_address) {
+        fail_page(89U, PHYSICAL_PAGE_STATUS_STATE, actual);
+    }
+}
+
+static void test_single_page_api_uses_order_zero_after_finalize(void)
+{
+    struct physical_page_allocator allocator;
+    void *const sentinel = (void *)(uintptr_t)UINT64_C(0x1122334455667788);
+    void *pointer = sentinel;
+    uint64_t owned_page;
+    uint64_t address;
+    uint64_t available;
+    enum physical_page_status actual =
+        init_coalescing_buddy(&allocator, &owned_page);
+
+    if (actual != PHYSICAL_PAGE_STATUS_OK) {
+        fail_page(90U, PHYSICAL_PAGE_STATUS_OK, actual);
+    }
+    available = physical_page_available(&allocator);
+    actual = physical_page_allocate(&allocator, &address);
+    if (actual != PHYSICAL_PAGE_STATUS_OK ||
+        physical_page_available(&allocator) + 1U != available ||
+        physical_page_resolve(&allocator, address, &pointer) !=
+            PHYSICAL_PAGE_STATUS_OK ||
+        pointer != mapped_page_access(address)) {
+        fail_page(91U, PHYSICAL_PAGE_STATUS_OK, actual);
+    }
+    if (physical_page_release(&allocator, address) !=
+        PHYSICAL_PAGE_STATUS_OK) {
+        fail_page(92U, PHYSICAL_PAGE_STATUS_OK,
+                  PHYSICAL_PAGE_STATUS_INVALID);
+    }
+    pointer = sentinel;
+    actual = physical_page_resolve(&allocator, address, &pointer);
+    if (actual != PHYSICAL_PAGE_STATUS_INVALID || pointer != sentinel ||
+        physical_page_available(&allocator) != available) {
+        fail_page(93U, PHYSICAL_PAGE_STATUS_INVALID, actual);
+    }
+    if (physical_page_release(&allocator, owned_page) !=
+        PHYSICAL_PAGE_STATUS_OK) {
+        fail_page(94U, PHYSICAL_PAGE_STATUS_OK,
+                  PHYSICAL_PAGE_STATUS_INVALID);
+    }
+}
+
 void run_physical_page_tests(void)
 {
     test_aligns_allocates_and_reports_exhaustion();
@@ -499,4 +893,9 @@ void run_physical_page_tests(void)
     test_rejects_inaccessible_recycled_nodes();
     test_resolves_owned_pages_through_bound_access();
     test_resolve_rejects_inaccessible_page();
+    test_finalize_imports_bootstrap_state();
+    test_buddy_allocates_aligned_runs_and_coalesces();
+    test_buddy_rejects_invalid_ownership();
+    test_failed_finalize_preserves_bootstrap_allocator();
+    test_single_page_api_uses_order_zero_after_finalize();
 }

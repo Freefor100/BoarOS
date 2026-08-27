@@ -5,6 +5,8 @@
 
 #include <stdint.h>
 
+#define PHYSICAL_PAGE_MAX_ORDER 31U
+
 enum physical_page_status {
     PHYSICAL_PAGE_STATUS_OK = 0,
     PHYSICAL_PAGE_STATUS_INVALID,
@@ -15,19 +17,27 @@ enum physical_page_status {
 
 typedef void *(*physical_page_access_fn)(uint64_t physical_address);
 
+struct physical_page_metadata;
+
 struct physical_page_range {
     uint64_t base;
     uint64_t next;
     uint64_t end;
+    uint32_t first_page_index;
 };
 
 struct physical_page_allocator {
     uint64_t total_pages;
     uint64_t available_pages;
     uint64_t recycled_head;
+    uint64_t metadata_address;
+    uint64_t metadata_pages;
     uint32_t range_count;
     uint32_t initialized;
+    uint32_t finalized;
     physical_page_access_fn access;
+    struct physical_page_metadata *metadata;
+    uint32_t free_heads[PHYSICAL_PAGE_MAX_ORDER + 1U];
     struct physical_page_range ranges[BOOT_MEMORY_MAX_USABLE_RANGES];
 };
 
@@ -40,13 +50,29 @@ enum physical_page_status physical_page_allocator_bind_access(
     struct physical_page_allocator *allocator,
     physical_page_access_fn access);
 
+enum physical_page_status physical_page_allocator_finalize(
+    struct physical_page_allocator *allocator);
+
+int physical_page_allocator_is_finalized(
+    const struct physical_page_allocator *allocator);
+
 enum physical_page_status physical_page_allocate(
     struct physical_page_allocator *allocator,
+    uint64_t *address);
+
+enum physical_page_status physical_page_allocate_order(
+    struct physical_page_allocator *allocator,
+    uint32_t order,
     uint64_t *address);
 
 enum physical_page_status physical_page_release(
     struct physical_page_allocator *allocator,
     uint64_t address);
+
+enum physical_page_status physical_page_release_order(
+    struct physical_page_allocator *allocator,
+    uint64_t address,
+    uint32_t order);
 
 /* The caller must own an allocated page; this validates only address history. */
 enum physical_page_status physical_page_resolve(
@@ -58,6 +84,9 @@ uint64_t physical_page_total(
     const struct physical_page_allocator *allocator);
 
 uint64_t physical_page_available(
+    const struct physical_page_allocator *allocator);
+
+uint64_t physical_page_metadata_pages(
     const struct physical_page_allocator *allocator);
 
 #endif
