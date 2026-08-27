@@ -95,13 +95,13 @@ Ready 和 exited 都是侵入式 FIFO。每个非零 elapsed timer 事件最多�
 
 入口返回或用户 syscall/故障退出时，当前内核栈仍在任务页中，不能就地释放。退出路径先切到下一地址空间，把完成记录与任务移入 exited FIFO，再通过永不入队的 discard context 离开旧栈。若发现 current、边界或 canary 损坏，则锁存首个 fatal 状态并切回可信 idle，由可返回的 timer 路径报告。
 
-Reaper 只在 idle 和内核地址空间中运行，按以下顺序收口用户任务：
+Reaper 只在 idle 和内核地址空间中运行，完成记录在退出时先快照 TID/TGID，再按以下顺序收口用户任务：
 
 ```text
 release one MM reference -> release TID -> release task page -> publish completion
 ```
 
-MM 或页释放失败时，节点保持在 exited 队首，完成输出不变；重试从对象中记录的准确阶段继续。释放任务页前先清除 TID owner，因此若最后一步失败，重试不会重复释放 MM 或 TID。只有全部完成才出队并发布记录。内核任务没有 MM/TID，只释放任务页。
+MM 或页释放失败时，节点保持在 exited 队首，完成输出不变；重试从对象中记录的准确阶段继续。释放任务页前先清除 TID owner，因此若最后一步失败，重试不会重复释放 MM 或 TID；completion 中的身份快照仍保留，允许 PID 1 策略在对象释放后识别退出者。只有全部完成才出队并发布记录。内核任务没有 MM/TID，completion 身份固定为零，只释放任务页。
 
 ## 验证与限制
 

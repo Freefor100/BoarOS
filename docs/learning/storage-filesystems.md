@@ -1,0 +1,45 @@
+# 存储与文件系统学习总结
+
+本文整理从块设备读取 ext4 并把文件作为可执行映像来源时需要掌握的知识、BoarOS 当前选择及验证经验。稳定接口见[RISC-V VirtIO MMIO 块设备](../modules/riscv-virtio-block.md)、[VFS 与只读 ext4](../modules/vfs-ext4.md)和[RISC-V 根启动](../modules/riscv-root-boot.md)。
+
+## 从设备到文件的层次
+
+块设备只认识有容量边界的扇区或字节范围，不认识目录、文件名和权限。文件系统把 superblock、block group、inode、extent 和 directory entry 解释成文件；VFS 再给进程和可执行装载器提供稳定的 mount/file/read 接口。把这几层分开，才能让 ext4 复用不同的存储后端，也让同一块设备以后承载其他文件系统。
+
+VirtIO 也分 transport 与 device type。MMIO 或 PCI transport 规定寄存器、设备发现和队列配置；virtio-blk 规定 sector、capacity 和请求类型；split virtqueue 是 descriptor/available/used 三部分共享内存协议。设备与驱动通过状态位和 feature negotiation 确认共同能力，不能看到 VirtIO magic 就假定是块设备，更不能把 legacy 与 modern 队列布局混用。
+
+DMA 的地址是设备可见地址，不等于任意内核虚拟地址。QEMU `virt` 当前无 IOMMU、RAM 有固定 direct map，因此可把 direct-map VA 转回 PA；真实开发板还必须核对 DMA 可达位宽、cache coherency、内存屏障和 IOMMU。对齐的最终目标缓冲区可以 direct DMA；非整扇区范围需要 bounce，避免设备覆盖调用者未请求的前后字节。
+
+## 为什么当前是同步只读
+
+首个存储消费者发生在单 hart 启动期，尚无外部中断控制器、等待队列与阻塞调度。一个 outstanding request 加有界轮询能形成真实 I/O 闭环，并把过渡复杂性限制在设备后端。其缺点是等待期间 CPU 忙等且不能并行 I/O；建立 IRQ 和 sleep/wake 后，应替换完成方式而保留块设备和 VFS 语义。
+
+只读 ext4 降低的是写回、崩溃一致性和 journal replay 范围，不代表所有磁盘都能安全读取。ext3/4 若带 `needs_recovery`，最近的元数据事务可能只在 journal 中；没有 JBD2 replay 的实现必须拒绝挂载。metadata checksum 还要求根据 incompat feature 在 superblock checksum seed 与 UUID 派生 seed 之间正确选择，不能因镜像“能列目录”就认定所有元数据校验正确。
+
+BoarOS 引入固定 lwext4 源码快照，自有 block/VFS 接口保持在外层。这样避免从零实现 ext4 inode、extent、目录索引和 checksum 的高风险，同时不让第三方结构成为未来进程 ABI。代价是需要维护 freestanding libc/allocator adapter，并承担组合后的 GPL 许可证约束。
+
+## 文件随机读与 ELF
+
+ELF header、program header 和各个 `PT_LOAD` 位于文件不同偏移。接口若只接受完整连续 buffer，会要求启动时整文件常驻并再复制到用户页；接口若暴露文件系统 handle，又把 ELF 层绑定到 ext4。带总长度的 `read_at(context, offset, destination, length)` 是更稳定的中间语义：解析器先做范围检查，内存和 VFS 各提供 adapter，段内容直接读入目标用户页。
+
+“read_at 返回零”必须表示精确填满请求。文件变短、EOF 内短读或底层 I/O 错误不能留下半个 program header 后继续解析。格式或 I/O 失败时，输出 ELF image 与最终用户空间保持不变；已经取得的临时页由明确 owner 回收。这个接口以后可以接页缓存或按需分页，但本身不承诺缓存、异步 I/O 或 mmap。
+
+## 根设备与 PID 1
+
+无命令行解析阶段需要一个确定的根选择规则。BoarOS 当前使用 DTB 翻译后的物理 MMIO 地址排序，选择第一个成功初始化的 block device；选中后若不是可挂载 ext4 或缺少 `/init`，启动失败，不扫描磁盘内容寻找替代根。这让平台拓扑决定设备顺序，行为可复现；以后支持 Linux `root=` 时可在块设备身份层增加显式选择，而不改变 ext4/VFS。
+
+PID 1 是用户空间生命周期的根。Linux 通常在 init 退出时 panic，因为继续运行已没有负责收养孤儿和维持用户空间的进程。BoarOS 当前尚无完整父子进程和信号，但仍在 scheduler 完整回收地址空间、PID 和任务页后把 PID 1 退出视为系统终止，再卸载根和关机。完成记录必须保存 TID/TGID 快照，否则任务页和 PID 被释放后就无法可靠判断退出者身份。
+
+## 验证经验
+
+- 块设备测试要覆盖 direct DMA、bounce、批量合并、最后一个扇区、整数溢出、timeout 后 reset 和队列页回收。
+- 文件系统测试应建立真实镜像并通过工具设置 mode、checksum 与 incompat feature；只用手写 superblock fixture 很难覆盖 extent、目录和校验链。
+- 成功读取文件不足以证明生命周期完整；应在 open file 时验证 unmount 为 busy，并在 close/unmount/device destroy 后比较物理页和 heap live/current pages。
+- 根启动 fixture 应独立链接并写入磁盘，不能把 ELF 同时嵌入 kernel，否则无法证明 VFS 是生产数据来源。
+- QEMU 默认可能提供 legacy VirtIO MMIO；现代驱动测试与生产根盘必须显式设置 `virtio-mmio.force-legacy=false`。开发板 transport 和 DMA 一致性必须重新验证，不能从 QEMU 行为外推。
+
+## 资料依据
+
+- [VirtIO 1.3](https://docs.oasis-open.org/virtio/virtio/v1.3/virtio-v1.3.html)：modern transport、设备状态、feature negotiation、split virtqueue 和 virtio-blk。
+- `references/qemu/hw/virtio/virtio-mmio.c` 与 `references/qemu/hw/block/virtio-blk.c`：QEMU VirtIO MMIO 和块设备行为参照。
+- `third_party/lwext4/` 与上游文档：ext4 数据结构和当前库实现。

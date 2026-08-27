@@ -46,7 +46,7 @@ RISC-V Linux 用户 ABI 用 `a7` 传系统调用号，`a0..a5` 传最多六个�
 
 BoarOS 当前实现 `exit(93)`、`uname(160)`、`getpid(172)` 和 `gettid(178)`。退出状态取参数的低 8 位并形成完成记录，任务不再恢复；`uname` 使用 Linux 六个 65 字节字段、总计 390 字节的 `new_utsname`，用户目标无效时返回 `-EFAULT`；`getpid` 返回线程组 ID，`gettid` 返回当前任务 ID。当前用户任务都是单成员组，所以两个身份值相同，但内核字段和 syscall 语义已经分开。未知调用返回 `-ENOSYS`（错误号 38），同时前移 `sepc` 后继续执行。
 
-系统调用解码与架构 Trap 分开：Trap 层负责寄存器、`sepc` 和显式 current task，通用解码层负责编号、参数和结果语义。`exit` 目前只结束当前 task；尚未实现 `exit_group`、父子关系、zombie/wait、文件表、信号、用户输入复制、可执行文件来源与 `exec` 生命周期或 `fork/clone`，现有 MM/TID 机制不伪装这些能力。
+系统调用解码与架构 Trap 分开：Trap 层负责寄存器、`sepc` 和显式 current task，通用解码层负责编号、参数和结果语义。`exit` 目前只结束当前 task；生产启动已经从只读 ext4 装载 `/init`，但尚未实现用户可调用的 `execve`、`exit_group`、父子关系、zombie/wait、文件表、信号、用户输入复制或 `fork/clone`，现有 MM/TID 机制不伪装这些能力。
 
 ## 内核为什么不能直接解引用用户指针
 
@@ -68,7 +68,7 @@ BoarOS 当前的首个消费者是固定 390 字节的 `uname`，而内核尚无
 
 ## 当前项目选择与平台边界
 
-BoarOS 当前先用手工映射探针验证首次 `SRET`、真实 timer 抢占、U-mode syscall、同步页故障、调度恢复和完整资源回收，再用独立链接的静态 ELF 验证装载器产出的代码、数据、BSS 和 Linux 形态的 `argc/argv/envp/auxv` 初始栈能沿同一架构路径运行。已有 ELF 和参数仍来自完整的只读内核缓冲区，TID/TGID 也只有单成员线程组；这不等于已经具备文件系统 `exec`、`fork/clone/wait` 或通用 `copy_from_user`。
+BoarOS 先用手工映射探针验证首次 `SRET`、真实 timer 抢占、U-mode syscall、同步页故障、调度恢复和完整资源回收，再用独立链接的静态 ELF 验证装载器产出的代码、数据、BSS 和 Linux 形态的 `argc/argv/envp/auxv` 初始栈。生产路径进一步从 DTB 发现的 VirtIO 块设备只读挂载 ext4，以精确随机读直接把 `/init` 的 `PT_LOAD` 装入用户页，并在 PID 1 完成后沿同一回收路径释放全部资源。当前 TID/TGID 仍只有单成员线程组；能够启动一个磁盘 ELF 不等于已经具备 `execve`、`fork/clone/wait`、文件描述符或通用 `copy_from_user`。
 
 Sv39、`satp`、`sscratch`、Trap Frame 和 RISC-V syscall 寄存器约定属于架构层，可在 QEMU `virt` 与 VisionFive 2 复用。SBI/固件交接、RAM 与 MMIO 布局、timebase、UART 和中断控制器仍属于平台层；QEMU 上通过 U-mode 测试不等于开发板适配已经完成。
 

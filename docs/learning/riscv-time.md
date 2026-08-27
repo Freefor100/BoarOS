@@ -95,6 +95,6 @@ next    = previous_deadline + elapsed * period
 - 状态测试要覆盖“固件失败前后 CSR 和软件 armed 是否变化”，不只测成功日志。
 - deadline 数学应脱离真实等待做确定性边界测试，包括恰好到期、多周期迟到和 `UINT64_MAX` 回绕。
 - 真实 QEMU 测试仍必须让 timer trap 至少返回一次；只看 set_timer 返回成功不能证明 STIE/SIE、Trap Frame、dispatcher 和 `sret` 连通。
-- 正常内核预期停在 `wfi`，所以自动测试要把宿主 timeout 视为预期状态，同时检查期间没有 fatal；有限退出行为放在测试链接包装中。
+- 无根设备的正常内核预期停在 `wfi`，所以 idle 自动测试把宿主 timeout 视为预期状态并检查期间没有 fatal；挂载生产根盘后，PID 1 退出会触发资源收口和 SBI 关机，不能再把 timeout 当作成功。
 
 本地核对入口包括 `references/riscv/`、`references/qemu/`、`references/opensbi/` 和 `references/linux/`。固定版本、commit 与恢复方式见 [本地参考资料](../../references/README.md)。
