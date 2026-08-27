@@ -121,6 +121,8 @@ static enum kernel_scheduler_status validate_thread(
             thread->arch.user_mode != 0U ||
             thread->arch.satp != scheduler.kernel_satp ||
             thread->completion.kind != KERNEL_THREAD_KIND_KERNEL ||
+            thread->completion.tid != 0 ||
+            thread->completion.tgid != 0 ||
             thread->tid != 0 || thread->tid_owned != 0U ||
             thread->group_leader != 0 || thread->group_members != 0U ||
             thread->mm.state != KERNEL_MM_EMPTY) {
@@ -150,6 +152,8 @@ static enum kernel_scheduler_status validate_thread(
         if (thread->arch.user_sp != 0U ||
             thread->arch.satp != scheduler.kernel_satp ||
             thread->completion.kind != KERNEL_THREAD_KIND_KERNEL ||
+            thread->completion.tid != 0 ||
+            thread->completion.tgid != 0 ||
             thread->tid != 0 || thread->tid_owned != 0U ||
             thread->group_leader != 0 || thread->group_members != 0U ||
             thread->mm.state != KERNEL_MM_EMPTY) {
@@ -408,6 +412,8 @@ enum kernel_scheduler_status kernel_scheduler_init(
     scheduler.idle.group_members = 0U;
     scheduler.idle.completion.kind = KERNEL_THREAD_KIND_KERNEL;
     scheduler.idle.completion.reason = KERNEL_THREAD_EXIT_RETURNED;
+    scheduler.idle.completion.tid = 0;
+    scheduler.idle.completion.tgid = 0;
     scheduler.idle.completion.status = 0U;
     scheduler.idle.completion.detail = 0U;
     scheduler.current = &scheduler.idle;
@@ -503,6 +509,8 @@ enum kernel_scheduler_status kernel_thread_create(
     thread->group_members = 0U;
     thread->completion.kind = KERNEL_THREAD_KIND_KERNEL;
     thread->completion.reason = KERNEL_THREAD_EXIT_RETURNED;
+    thread->completion.tid = 0;
+    thread->completion.tgid = 0;
     thread->completion.status = 0U;
     thread->completion.detail = 0U;
     *(uint64_t *)(stack_low - sizeof(uint64_t)) = KERNEL_STACK_CANARY;
@@ -658,6 +666,8 @@ enum kernel_scheduler_status kernel_user_thread_create(
     thread->idle = 0U;
     thread->completion.kind = KERNEL_THREAD_KIND_USER;
     thread->completion.reason = KERNEL_THREAD_EXIT_SYSCALL;
+    thread->completion.tid = 0;
+    thread->completion.tgid = 0;
     thread->completion.status = 0U;
     thread->completion.detail = 0U;
     *(uint64_t *)(stack_low - sizeof(uint64_t)) = KERNEL_STACK_CANARY;
@@ -697,6 +707,8 @@ enum kernel_scheduler_status kernel_user_thread_create(
     thread->tid_owned = 1U;
     thread->group_leader = thread;
     thread->group_members = 1U;
+    thread->completion.tid = tid;
+    thread->completion.tgid = tid;
     if (kernel_mm_move(&thread->mm, mm) !=
         KERNEL_MM_STATUS_OK) {
         pid_status = kernel_pid_release(&scheduler.pid_allocator, tid);
@@ -823,12 +835,21 @@ enum kernel_scheduler_status kernel_scheduler_reap_one(
     result = thread->completion;
     if (result.kind == KERNEL_THREAD_KIND_KERNEL) {
         if (result.reason != KERNEL_THREAD_EXIT_RETURNED ||
+            result.tid != 0 || result.tgid != 0 ||
             result.status != 0U || result.detail != 0U) {
             return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
         }
     } else if (result.kind == KERNEL_THREAD_KIND_USER) {
         if (result.reason != KERNEL_THREAD_EXIT_SYSCALL &&
             result.reason != KERNEL_THREAD_EXIT_USER_FAULT) {
+            return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
+        }
+        if ((thread->tid_owned != 0U &&
+             (thread->group_leader == 0 ||
+              result.tid != thread->tid ||
+              result.tgid != thread->group_leader->tid)) ||
+            (thread->tid_owned == 0U &&
+             (result.tid <= 0 || result.tgid <= 0))) {
             return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
         }
         if (thread->mm.state == KERNEL_MM_LIVE ||
@@ -964,6 +985,8 @@ void kernel_thread_exit(void)
     const struct kernel_thread_completion completion = {
         .kind = KERNEL_THREAD_KIND_KERNEL,
         .reason = KERNEL_THREAD_EXIT_RETURNED,
+        .tid = 0,
+        .tgid = 0,
         .status = 0U,
         .detail = 0U,
     };
@@ -979,6 +1002,8 @@ void kernel_user_thread_exit(
     struct kernel_thread_completion completion = {
         .kind = KERNEL_THREAD_KIND_USER,
         .reason = reason,
+        .tid = 0,
+        .tgid = 0,
         .status = status,
         .detail = detail,
     };
@@ -991,6 +1016,8 @@ void kernel_user_thread_exit(
         scheduler.current->arch.user_mode != 1U) {
         switch_to_fatal_idle(KERNEL_SCHEDULER_STATUS_INVALID_STATE);
     }
+    completion.tid = scheduler.current->tid;
+    completion.tgid = scheduler.current->group_leader->tid;
     kernel_thread_finish(&completion);
 }
 

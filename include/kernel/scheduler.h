@@ -3,6 +3,7 @@
 
 #include <kernel/mm.h>
 #include <kernel/physical_page.h>
+#include <kernel/pid.h>
 
 #include <stdint.h>
 
@@ -35,6 +36,8 @@ enum kernel_thread_exit_reason {
 struct kernel_thread_completion {
     enum kernel_thread_kind kind;
     enum kernel_thread_exit_reason reason;
+    kernel_pid_t tid;
+    kernel_pid_t tgid;
     uint64_t status;
     uint64_t detail;
 };

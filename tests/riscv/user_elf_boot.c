@@ -184,6 +184,7 @@ static void check_completion(
     completion_count++;
     if (completion_count == 1U) {
         if (completion->kind != KERNEL_THREAD_KIND_USER ||
+            completion->tid != 1 || completion->tgid != 1 ||
             completion->reason != KERNEL_THREAD_EXIT_SYSCALL ||
             completion->status != USER_ELF_EXIT_STATUS ||
             completion->detail != 0U) {
@@ -193,6 +194,7 @@ static void check_completion(
     }
     if (completion_count == 2U) {
         if (completion->kind != KERNEL_THREAD_KIND_USER ||
+            completion->tid != 2 || completion->tgid != 2 ||
             completion->reason != KERNEL_THREAD_EXIT_USER_FAULT ||
             completion->status != RISCV_STORE_PAGE_FAULT ||
             completion->detail != fault_entry) {
@@ -202,6 +204,7 @@ static void check_completion(
     }
     if (completion_count != 3U ||
         completion->kind != KERNEL_THREAD_KIND_USER ||
+        completion->tid != 3 || completion->tgid != 3 ||
         completion->reason != KERNEL_THREAD_EXIT_USER_FAULT ||
         completion->status != RISCV_STORE_PAGE_FAULT ||
         completion->detail != guard_fault_address) {
