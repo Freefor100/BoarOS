@@ -1,4 +1,5 @@
 #include <kernel/elf64.h>
+#include <kernel/read_source.h>
 
 #include <stddef.h>
 #include <stdint.h>
@@ -8,6 +9,50 @@
 #define IMAGE_SIZE 0x180U
 #define LOAD_OFFSET UINT64_C(0x100)
 #define LOAD_VIRTUAL_ADDRESS UINT64_C(0x10100)
+
+struct test_read_context {
+    const unsigned char *bytes;
+    uint64_t size;
+    uint64_t fail_at;
+    size_t calls;
+    size_t largest_read;
+};
+
+static int test_read_at(void *context,
+                        uint64_t offset,
+                        void *buffer,
+                        size_t size)
+{
+    struct test_read_context *reader = context;
+    unsigned char *destination = buffer;
+    size_t index;
+
+    reader->calls++;
+    if (size > reader->largest_read) {
+        reader->largest_read = size;
+    }
+    if (offset >= reader->fail_at || offset > reader->size ||
+        (uint64_t)size > reader->size - offset) {
+        return -5;
+    }
+    for (index = 0U; index < size; index++) {
+        destination[index] = reader->bytes[offset + index];
+    }
+    return 0;
+}
+
+static enum kernel_elf64_status open_memory(
+    const void *bytes,
+    size_t size,
+    struct kernel_elf64_image *image)
+{
+    struct kernel_read_source source;
+
+    if (kernel_read_source_from_memory(bytes, size, &source) != 0) {
+        return KERNEL_ELF64_STATUS_INVALID_ARGUMENT;
+    }
+    return kernel_elf64_open(&source, image);
+}
 
 static void put_u16(unsigned char *bytes, size_t offset, uint16_t value)
 {
@@ -80,19 +125,25 @@ static void make_valid_image(unsigned char *bytes)
 
 static unsigned long image_changed(const struct kernel_elf64_image *image)
 {
-    return image->bytes != (const unsigned char *)(uintptr_t)0x11U ||
-           image->size != 0x22U || image->header.type != 0x33U ||
-           image->header.machine != 0x44U ||
-           image->header.entry != UINT64_C(0x55) ||
-           image->header.program_header_offset != UINT64_C(0x66) ||
-           image->header.program_header_count != 0x77U;
+    return (image->source.context != (void *)(uintptr_t)0x11U ? 1U : 0U) |
+           (image->source.size != 0x22U ? 2U : 0U) |
+           (image->source.read_at !=
+                (kernel_read_at_fn)(uintptr_t)0x33U ? 4U : 0U) |
+           (image->header.type != 0x33U ? 8U : 0U) |
+           (image->header.machine != 0x44U ? 16U : 0U) |
+           (image->header.entry != UINT64_C(0x55) ? 32U : 0U) |
+           (image->header.program_header_offset != UINT64_C(0x66) ? 64U : 0U) |
+           (image->header.program_header_count != 0x77U ? 128U : 0U);
 }
 
 static struct kernel_elf64_image sentinel_image(void)
 {
     struct kernel_elf64_image image = {
-        .bytes = (const unsigned char *)(uintptr_t)0x11U,
-        .size = 0x22U,
+        .source = {
+            .context = (void *)(uintptr_t)0x11U,
+            .size = 0x22U,
+            .read_at = (kernel_read_at_fn)(uintptr_t)0x33U,
+        },
         .header = {
             .type = 0x33U,
             .machine = 0x44U,
@@ -110,11 +161,14 @@ static unsigned long run_valid_case(void)
     unsigned char bytes[IMAGE_SIZE];
     struct kernel_elf64_image image;
     struct kernel_elf64_program_header header;
+    struct kernel_read_source source;
 
     make_valid_image(bytes);
-    if (kernel_elf64_open(bytes, sizeof(bytes), &image) !=
+    if (kernel_read_source_from_memory(bytes, sizeof(bytes), &source) != 0 ||
+        kernel_elf64_open(&source, &image) !=
             KERNEL_ELF64_STATUS_OK ||
-        image.bytes != bytes || image.size != sizeof(bytes) ||
+        image.source.context != bytes ||
+        image.source.size != sizeof(bytes) ||
         image.header.type != KERNEL_ELF64_TYPE_EXECUTABLE ||
         image.header.machine != KERNEL_ELF64_MACHINE_RISCV ||
         image.header.entry != LOAD_VIRTUAL_ADDRESS ||
@@ -141,7 +195,7 @@ static unsigned long expect_open_status(unsigned char *bytes,
 {
     struct kernel_elf64_image image = sentinel_image();
 
-    if (kernel_elf64_open(bytes, size, &image) != expected ||
+    if (open_memory(bytes, size, &image) != expected ||
         image_changed(&image)) {
         return 1U;
     }
@@ -155,10 +209,10 @@ static unsigned long run_argument_and_truncation_cases(void)
     unsigned long failures = 0U;
 
     make_valid_image(bytes);
-    if (kernel_elf64_open(0, sizeof(bytes), &image) !=
+    if (open_memory(0, sizeof(bytes), &image) !=
             KERNEL_ELF64_STATUS_INVALID_ARGUMENT ||
         image_changed(&image) ||
-        kernel_elf64_open(bytes, sizeof(bytes), 0) !=
+        open_memory(bytes, sizeof(bytes), 0) !=
             KERNEL_ELF64_STATUS_INVALID_ARGUMENT) {
         failures++;
     }
@@ -277,7 +331,7 @@ static unsigned long run_program_header_argument_cases(void)
     };
 
     make_valid_image(bytes);
-    if (kernel_elf64_open(bytes, sizeof(bytes), &image) !=
+    if (open_memory(bytes, sizeof(bytes), &image) !=
         KERNEL_ELF64_STATUS_OK) {
         return 1U;
     }
@@ -304,6 +358,37 @@ static unsigned long run_program_header_argument_cases(void)
     return 0U;
 }
 
+static unsigned long run_read_source_cases(void)
+{
+    unsigned char bytes[IMAGE_SIZE];
+    struct test_read_context context;
+    struct kernel_read_source source;
+    struct kernel_elf64_image image = sentinel_image();
+
+    make_valid_image(bytes);
+    context.bytes = bytes;
+    context.size = sizeof(bytes);
+    context.fail_at = UINT64_MAX;
+    context.calls = 0U;
+    context.largest_read = 0U;
+    source.context = &context;
+    source.size = sizeof(bytes);
+    source.read_at = test_read_at;
+    if (kernel_elf64_open(&source, &image) != KERNEL_ELF64_STATUS_OK ||
+        context.calls != 2U || context.largest_read > ELF_HEADER_SIZE) {
+        return 1U;
+    }
+
+    image = sentinel_image();
+    context.fail_at = ELF_HEADER_SIZE;
+    context.calls = 0U;
+    if (kernel_elf64_open(&source, &image) != KERNEL_ELF64_STATUS_IO ||
+        context.calls != 2U || image_changed(&image)) {
+        return 1U;
+    }
+    return 0U;
+}
+
 unsigned long run_elf64_cases(void)
 {
     unsigned long failures = run_valid_case();
@@ -313,5 +398,6 @@ unsigned long run_elf64_cases(void)
     failures += run_header_table_cases();
     failures += run_load_segment_cases();
     failures += run_program_header_argument_cases();
+    failures += run_read_source_cases();
     return failures;
 }

@@ -3,6 +3,7 @@
 
 #include <kernel/block.h>
 #include <kernel/heap.h>
+#include <kernel/read_source.h>
 
 #include <stddef.h>
 #include <stdint.h>
@@ -42,6 +43,10 @@ int kernel_vfs_pread(struct kernel_vfs_file *file,
                      void *buffer,
                      size_t size,
                      size_t *bytes_read);
+
+/* The file must remain open while the source is in use. */
+int kernel_vfs_file_read_source(struct kernel_vfs_file *file,
+                                struct kernel_read_source *source);
 
 int kernel_vfs_close(struct kernel_vfs_file *file);
 

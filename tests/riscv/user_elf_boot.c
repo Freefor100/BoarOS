@@ -74,8 +74,11 @@ static enum kernel_scheduler_status create_elf_task(
     arguments[1].length = sizeof(argument_one) - 1U;
     environment[0].bytes = environment_zero;
     environment[0].length = sizeof(environment_zero) - 1U;
-    request.image = start;
-    request.image_size = image_size(start, end);
+    if (kernel_read_source_from_memory(start,
+                                       image_size(start, end),
+                                       &request.source) != 0) {
+        return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
+    }
     request.arguments = arguments;
     request.argument_count = sizeof(arguments) / sizeof(arguments[0]);
     request.environment = environment;

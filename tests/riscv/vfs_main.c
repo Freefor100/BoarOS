@@ -101,6 +101,7 @@ static void run_vfs_test(const void *dtb)
     struct riscv_virtio_mmio_block_statistics statistics;
     struct kernel_vfs_file file = {0};
     struct kernel_vfs_file missing = {0};
+    struct kernel_read_source source;
     unsigned char buffer[64];
 #endif
     uint64_t baseline;
@@ -183,12 +184,13 @@ static void run_vfs_test(const void *dtb)
         fail_vfs(7U, 0, result);
     }
 
-    result = kernel_vfs_pread(&file,
-                              7U,
-                              buffer,
-                              sizeof(expected) - 1U - 7U,
-                              &read_count);
-    if (result != 0 || read_count != sizeof(expected) - 1U - 7U ||
+    result = kernel_vfs_file_read_source(&file, &source);
+    if (result != 0 || source.size != file.size ||
+        kernel_read_source_read_exact(
+            &source,
+            7U,
+            buffer,
+            sizeof(expected) - 1U - 7U) != 0 ||
         !bytes_equal(buffer,
                      expected + 7U,
                      sizeof(expected) - 1U - 7U)) {

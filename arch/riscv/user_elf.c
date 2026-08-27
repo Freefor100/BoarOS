@@ -30,6 +30,8 @@ static enum riscv_user_elf_status parser_status(
         return RISCV_USER_ELF_STATUS_MALFORMED;
     case KERNEL_ELF64_STATUS_UNSUPPORTED:
         return RISCV_USER_ELF_STATUS_UNSUPPORTED;
+    case KERNEL_ELF64_STATUS_IO:
+        return RISCV_USER_ELF_STATUS_IO;
     }
     return RISCV_USER_ELF_STATUS_MALFORMED;
 }
@@ -328,6 +330,12 @@ static enum riscv_user_elf_status copy_load_segments(
     struct riscv_sv39_user_space *space)
 {
     struct kernel_elf64_program_header segment;
+    struct riscv_sv39_mapping mapping;
+    unsigned char *page;
+    void *pointer;
+    uint64_t copied;
+    uint64_t current;
+    uint64_t chunk;
     uint16_t index;
     enum riscv_user_elf_status status;
 
@@ -342,12 +350,30 @@ static enum riscv_user_elf_status copy_load_segments(
             segment.file_size == 0U) {
             continue;
         }
-        if (riscv_sv39_user_space_populate(
-                space,
-                segment.virtual_address,
-                image->bytes + segment.offset,
-                (size_t)segment.file_size) != RISCV_SV39_STATUS_OK) {
-            return RISCV_USER_ELF_STATUS_ADDRESS_SPACE;
+        copied = 0U;
+        while (copied < segment.file_size) {
+            current = segment.virtual_address + copied;
+            if (riscv_sv39_user_lookup(space, current, &mapping) !=
+                    RISCV_SV39_STATUS_OK ||
+                physical_page_resolve(
+                    space->allocator,
+                    mapping.physical_address & ~BOAROS_PAGE_MASK,
+                    &pointer) != PHYSICAL_PAGE_STATUS_OK) {
+                return RISCV_USER_ELF_STATUS_ADDRESS_SPACE;
+            }
+            page = pointer;
+            chunk = BOAROS_PAGE_SIZE - (current & BOAROS_PAGE_MASK);
+            if (chunk > segment.file_size - copied) {
+                chunk = segment.file_size - copied;
+            }
+            if (kernel_read_source_read_exact(
+                    &image->source,
+                    segment.offset + copied,
+                    page + (current & BOAROS_PAGE_MASK),
+                    (size_t)chunk) != 0) {
+                return RISCV_USER_ELF_STATUS_IO;
+            }
+            copied += chunk;
         }
     }
     return RISCV_USER_ELF_STATUS_OK;
@@ -702,7 +728,7 @@ enum riscv_user_elf_status riscv_user_elf_load(
     enum riscv_sv39_status sv39_status;
     enum riscv_user_elf_status status;
 
-    if (request == 0 || request->image == 0 ||
+    if (request == 0 || request->source.read_at == 0 ||
         (request->argument_count != 0U && request->arguments == 0) ||
         (request->environment_count != 0U &&
          request->environment == 0) ||
@@ -713,9 +739,7 @@ enum riscv_user_elf_status riscv_user_elf_load(
         kernel_table->allocator != allocator) {
         return RISCV_USER_ELF_STATUS_INVALID_ARGUMENT;
     }
-    elf_status = kernel_elf64_open(request->image,
-                                   request->image_size,
-                                   &image);
+    elf_status = kernel_elf64_open(&request->source, &image);
     if (elf_status != KERNEL_ELF64_STATUS_OK) {
         return parser_status(elf_status);
     }

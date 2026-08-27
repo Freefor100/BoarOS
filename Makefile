@@ -105,6 +105,7 @@ C_SOURCES := \
 	kernel/main.c \
 	kernel/pid.c \
 	kernel/physical_page.c \
+	kernel/read_source.c \
 	kernel/scheduler.c \
 	kernel/syscall.c \
 	kernel/tick.c \
@@ -134,6 +135,7 @@ TEST_RUNTIME_C_SOURCES := \
 	kernel/elf64.c \
 	kernel/pid.c \
 	kernel/physical_page.c \
+	kernel/read_source.c \
 	kernel/scheduler.c \
 	kernel/syscall.c \
 	kernel/tick.c \

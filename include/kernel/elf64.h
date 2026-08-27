@@ -1,6 +1,8 @@
 #ifndef BOAROS_KERNEL_ELF64_H
 #define BOAROS_KERNEL_ELF64_H
 
+#include <kernel/read_source.h>
+
 #include <stddef.h>
 #include <stdint.h>
 
@@ -34,6 +36,7 @@ enum kernel_elf64_status {
     KERNEL_ELF64_STATUS_TRUNCATED,
     KERNEL_ELF64_STATUS_MALFORMED,
     KERNEL_ELF64_STATUS_UNSUPPORTED,
+    KERNEL_ELF64_STATUS_IO,
 };
 
 struct kernel_elf64_header {
@@ -56,14 +59,12 @@ struct kernel_elf64_program_header {
 };
 
 struct kernel_elf64_image {
-    const unsigned char *bytes;
-    size_t size;
+    struct kernel_read_source source;
     struct kernel_elf64_header header;
 };
 
 enum kernel_elf64_status kernel_elf64_open(
-    const void *bytes,
-    size_t size,
+    const struct kernel_read_source *source,
     struct kernel_elf64_image *image);
 
 enum kernel_elf64_status kernel_elf64_read_program_header(

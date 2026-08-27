@@ -376,6 +376,38 @@ int kernel_vfs_pread(struct kernel_vfs_file *file,
     return 0;
 }
 
+static int vfs_source_read_at(void *context,
+                              uint64_t offset,
+                              void *buffer,
+                              size_t size)
+{
+    struct kernel_vfs_file *file = context;
+    size_t bytes_read = 0U;
+    int result = kernel_vfs_pread(file,
+                                  offset,
+                                  buffer,
+                                  size,
+                                  &bytes_read);
+
+    if (result != 0) {
+        return result;
+    }
+    return bytes_read == size ? 0 : -KERNEL_EIO;
+}
+
+int kernel_vfs_file_read_source(struct kernel_vfs_file *file,
+                                struct kernel_read_source *source)
+{
+    if (file == 0 || file->state != VFS_FILE_STATE_LIVE ||
+        file->private_data == 0 || source == 0) {
+        return -KERNEL_EINVAL;
+    }
+    source->context = file;
+    source->size = file->size;
+    source->read_at = vfs_source_read_at;
+    return 0;
+}
+
 int kernel_vfs_close(struct kernel_vfs_file *file)
 {
     struct lwext4_file_adapter *handle;

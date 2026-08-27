@@ -4,6 +4,7 @@
 #include <arch/riscv/sv39.h>
 #include <kernel/page.h>
 #include <kernel/physical_page.h>
+#include <kernel/read_source.h>
 
 #include <stddef.h>
 #include <stdint.h>
@@ -29,6 +30,7 @@ enum riscv_user_elf_status {
     RISCV_USER_ELF_STATUS_ARGUMENT_TOO_LARGE,
     RISCV_USER_ELF_STATUS_NO_MEMORY,
     RISCV_USER_ELF_STATUS_ADDRESS_SPACE,
+    RISCV_USER_ELF_STATUS_IO,
     RISCV_USER_ELF_STATUS_CLEANUP_REQUIRED,
 };
 
@@ -43,8 +45,7 @@ struct riscv_user_elf_string {
 };
 
 struct riscv_user_elf_request {
-    const void *image;
-    size_t image_size;
+    struct kernel_read_source source;
     const struct riscv_user_elf_string *arguments;
     size_t argument_count;
     const struct riscv_user_elf_string *environment;

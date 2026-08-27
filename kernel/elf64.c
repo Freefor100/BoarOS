@@ -31,11 +31,9 @@ static uint64_t read_u64(const unsigned char *bytes)
     return value;
 }
 
-static int range_within(size_t size, uint64_t offset, uint64_t length)
+static int range_within(uint64_t size, uint64_t offset, uint64_t length)
 {
-    uint64_t limit = (uint64_t)size;
-
-    return offset <= limit && length <= limit - offset;
+    return offset <= size && length <= size - offset;
 }
 
 static void decode_program_header(
@@ -54,7 +52,7 @@ static void decode_program_header(
 
 static enum kernel_elf64_status validate_load_segment(
     const struct kernel_elf64_program_header *header,
-    size_t image_size)
+    uint64_t image_size)
 {
     uint64_t alignment_mask;
 
@@ -79,11 +77,10 @@ static enum kernel_elf64_status validate_load_segment(
 }
 
 enum kernel_elf64_status kernel_elf64_open(
-    const void *bytes,
-    size_t size,
+    const struct kernel_read_source *source,
     struct kernel_elf64_image *image)
 {
-    const unsigned char *data = bytes;
+    unsigned char data[ELF64_HEADER_SIZE];
     struct kernel_elf64_image decoded;
     struct kernel_elf64_program_header program_header;
     uint64_t program_header_bytes;
@@ -91,11 +88,17 @@ enum kernel_elf64_status kernel_elf64_open(
     uint16_t index;
     enum kernel_elf64_status status;
 
-    if (bytes == 0 || image == 0) {
+    if (source == 0 || source->read_at == 0 || image == 0) {
         return KERNEL_ELF64_STATUS_INVALID_ARGUMENT;
     }
-    if (size < ELF64_HEADER_SIZE) {
+    if (source->size < ELF64_HEADER_SIZE) {
         return KERNEL_ELF64_STATUS_TRUNCATED;
+    }
+    if (kernel_read_source_read_exact(source,
+                                      0U,
+                                      data,
+                                      sizeof(data)) != 0) {
+        return KERNEL_ELF64_STATUS_IO;
     }
     if (data[0] != 0x7fU || data[1] != 'E' || data[2] != 'L' ||
         data[3] != 'F') {
@@ -130,11 +133,13 @@ enum kernel_elf64_status kernel_elf64_open(
     program_header_bytes =
         (uint64_t)decoded.header.program_header_count *
         ELF64_PROGRAM_HEADER_SIZE;
-    if (!range_within(size,
+    if (!range_within(source->size,
                       decoded.header.program_header_offset,
                       program_header_bytes)) {
         return KERNEL_ELF64_STATUS_TRUNCATED;
     }
+
+    decoded.source = *source;
 
     for (index = 0U;
          index < decoded.header.program_header_count;
@@ -142,19 +147,22 @@ enum kernel_elf64_status kernel_elf64_open(
         program_header_offset =
             decoded.header.program_header_offset +
             (uint64_t)index * ELF64_PROGRAM_HEADER_SIZE;
-        decode_program_header(data + program_header_offset,
-                              &program_header);
+        if (kernel_read_source_read_exact(source,
+                                          program_header_offset,
+                                          data,
+                                          ELF64_PROGRAM_HEADER_SIZE) != 0) {
+            return KERNEL_ELF64_STATUS_IO;
+        }
+        decode_program_header(data, &program_header);
         if (program_header.type != KERNEL_ELF64_PROGRAM_LOAD) {
             continue;
         }
-        status = validate_load_segment(&program_header, size);
+        status = validate_load_segment(&program_header, source->size);
         if (status != KERNEL_ELF64_STATUS_OK) {
             return status;
         }
     }
 
-    decoded.bytes = data;
-    decoded.size = size;
     *image = decoded;
     return KERNEL_ELF64_STATUS_OK;
 }
@@ -165,10 +173,11 @@ enum kernel_elf64_status kernel_elf64_read_program_header(
     struct kernel_elf64_program_header *header)
 {
     struct kernel_elf64_program_header decoded;
+    unsigned char data[ELF64_PROGRAM_HEADER_SIZE];
     uint64_t offset;
     uint64_t relative_offset;
 
-    if (image == 0 || header == 0 || image->bytes == 0 ||
+    if (image == 0 || header == 0 || image->source.read_at == 0 ||
         index >= image->header.program_header_count) {
         return KERNEL_ELF64_STATUS_INVALID_ARGUMENT;
     }
@@ -178,10 +187,18 @@ enum kernel_elf64_status kernel_elf64_read_program_header(
         return KERNEL_ELF64_STATUS_TRUNCATED;
     }
     offset = image->header.program_header_offset + relative_offset;
-    if (!range_within(image->size, offset, ELF64_PROGRAM_HEADER_SIZE)) {
+    if (!range_within(image->source.size,
+                      offset,
+                      ELF64_PROGRAM_HEADER_SIZE)) {
         return KERNEL_ELF64_STATUS_TRUNCATED;
     }
-    decode_program_header(image->bytes + offset, &decoded);
+    if (kernel_read_source_read_exact(&image->source,
+                                      offset,
+                                      data,
+                                      sizeof(data)) != 0) {
+        return KERNEL_ELF64_STATUS_IO;
+    }
+    decode_program_header(data, &decoded);
     *header = decoded;
     return KERNEL_ELF64_STATUS_OK;
 }
