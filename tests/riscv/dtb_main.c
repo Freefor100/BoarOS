@@ -5,7 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define TEST_BLOB_CAPACITY 1024U
+#define TEST_BLOB_CAPACITY 4096U
 #define TEST_RESERVE_OFFSET 40U
 
 #define FDT_MAGIC 0xd00dfeedU
@@ -42,11 +42,13 @@ enum property_name_offset {
                               sizeof("device_type") + sizeof("reg") +
                               sizeof("ranges") + sizeof("size") +
                               sizeof("status"),
+    NAME_COMPATIBLE = NAME_TIMEBASE_FREQUENCY +
+                      sizeof("timebase-frequency"),
 };
 
 static const unsigned char property_names[] =
     "#address-cells\0#size-cells\0device_type\0reg\0ranges\0size\0status\0"
-    "timebase-frequency";
+    "timebase-frequency\0compatible";
 
 struct blob_builder {
     unsigned char bytes[TEST_BLOB_CAPACITY];
@@ -157,6 +159,14 @@ static void builder_property_string(struct blob_builder *builder,
                      name_offset,
                      (const unsigned char *)value,
                      length);
+}
+
+static void builder_property_string_list(struct blob_builder *builder,
+                                         uint32_t name_offset,
+                                         const unsigned char *value,
+                                         uint32_t length)
+{
+    builder_property(builder, name_offset, value, length);
 }
 
 static void builder_property_named_cells(struct blob_builder *builder,
@@ -285,9 +295,14 @@ static void poison_boot_info(struct dtb_boot_info *info)
     info->dtb_size = 0xa5a5a5a5U;
     info->timebase_frequency = 0x3c3c3c3cU;
     info->reserved_count = 0x5a5a5a5aU;
+    info->virtio_mmio_count = 0xc3c3c3c3U;
     for (index = 0U; index < DTB_MAX_RESERVED_RANGES; index++) {
         info->reserved[index].base = 0x1100000000000000ULL + index;
         info->reserved[index].size = 0x2200000000000000ULL + index;
+    }
+    for (index = 0U; index < DTB_MAX_VIRTIO_MMIO_RANGES; index++) {
+        info->virtio_mmio[index].base = 0x3300000000000000ULL + index;
+        info->virtio_mmio[index].size = 0x4400000000000000ULL + index;
     }
 }
 
@@ -299,7 +314,8 @@ static int boot_info_is_poisoned(const struct dtb_boot_info *info)
         info->memory.size != 0x8877665544332211ULL ||
         info->dtb_size != 0xa5a5a5a5U ||
         info->timebase_frequency != 0x3c3c3c3cU ||
-        info->reserved_count != 0x5a5a5a5aU) {
+        info->reserved_count != 0x5a5a5a5aU ||
+        info->virtio_mmio_count != 0xc3c3c3c3U) {
         return 0;
     }
     for (index = 0U; index < DTB_MAX_RESERVED_RANGES; index++) {
@@ -307,6 +323,14 @@ static int boot_info_is_poisoned(const struct dtb_boot_info *info)
                 0x1100000000000000ULL + index ||
             info->reserved[index].size !=
                 0x2200000000000000ULL + index) {
+            return 0;
+        }
+    }
+    for (index = 0U; index < DTB_MAX_VIRTIO_MMIO_RANGES; index++) {
+        if (info->virtio_mmio[index].base !=
+                0x3300000000000000ULL + index ||
+            info->virtio_mmio[index].size !=
+                0x4400000000000000ULL + index) {
             return 0;
         }
     }
@@ -812,6 +836,200 @@ static void test_ignores_timebase_outside_cpus(void)
     expect_timebase(30U, 0U);
 }
 
+static void builder_add_virtio_mmio(struct blob_builder *builder,
+                                    const char *name,
+                                    const uint32_t *reg,
+                                    uint32_t reg_cells,
+                                    const unsigned char *compatible,
+                                    uint32_t compatible_length,
+                                    const char *status)
+{
+    builder_begin_node(builder, name);
+    builder_property_string_list(builder,
+                                 NAME_COMPATIBLE,
+                                 compatible,
+                                 compatible_length);
+    if (status != NULL) {
+        builder_property_string(builder, NAME_STATUS, status, 1);
+    }
+    if (reg != NULL) {
+        builder_property_cells(builder, reg, reg_cells);
+    }
+    builder_end_node(builder);
+}
+
+static void test_discovers_sorts_and_filters_virtio_mmio(void)
+{
+    static const uint32_t memory_reg[] = {
+        0U, 0x80000000U, 0U, 0x20000000U,
+    };
+    static const uint32_t first_reg[] = {0U, 0x10002000U, 0U, 0x1000U};
+    static const uint32_t second_reg[] = {0U, 0x10001000U, 0U, 0x1000U};
+    static const uint32_t disabled_reg[] = {0U, 0x10000000U, 0U, 0x1000U};
+    static const unsigned char compatible_list[] =
+        "vendor,fallback\0virtio,mmio";
+    static const unsigned char compatible[] = "virtio,mmio";
+    struct dtb_boot_info info;
+    enum dtb_status actual;
+
+    builder_start(&test_blob);
+    builder_add_root_cells(&test_blob, 2U, 2U);
+    builder_begin_node(&test_blob, "soc");
+    builder_property_u32(&test_blob, NAME_ADDRESS_CELLS, 2U);
+    builder_property_u32(&test_blob, NAME_SIZE_CELLS, 2U);
+    builder_property(&test_blob, NAME_RANGES, NULL, 0U);
+    builder_add_virtio_mmio(&test_blob,
+                            "virtio_mmio@10002000",
+                            first_reg,
+                            4U,
+                            compatible_list,
+                            sizeof(compatible_list),
+                            NULL);
+    builder_add_virtio_mmio(&test_blob,
+                            "virtio_mmio@10001000",
+                            second_reg,
+                            4U,
+                            compatible,
+                            sizeof(compatible),
+                            "okay");
+    builder_add_virtio_mmio(&test_blob,
+                            "virtio_mmio@10000000",
+                            disabled_reg,
+                            4U,
+                            compatible,
+                            sizeof(compatible),
+                            "disabled");
+    builder_end_node(&test_blob);
+    builder_add_memory(&test_blob, "memory@80000000", memory_reg, 4U);
+    builder_finish(&test_blob);
+
+    actual = dtb_read_boot_info(test_blob.bytes, &info);
+    if (actual != DTB_STATUS_OK || info.virtio_mmio_count != 2U ||
+        info.virtio_mmio[0].base != 0x10001000ULL ||
+        info.virtio_mmio[0].size != 0x1000ULL ||
+        info.virtio_mmio[1].base != 0x10002000ULL ||
+        info.virtio_mmio[1].size != 0x1000ULL) {
+        fail_status(31U, DTB_STATUS_OK, actual);
+    }
+}
+
+static void test_translates_nested_bus_ranges(void)
+{
+    static const uint32_t memory_reg[] = {
+        0U, 0x80000000U, 0U, 0x20000000U,
+    };
+    static const uint32_t bus_ranges[] = {
+        0x1000U, 0U, 0x30000000U, 0x10000U,
+    };
+    static const uint32_t device_reg[] = {0x2000U, 0x1000U};
+    static const unsigned char compatible[] = "virtio,mmio";
+    struct dtb_boot_info info;
+    enum dtb_status actual;
+
+    builder_start(&test_blob);
+    builder_add_root_cells(&test_blob, 2U, 2U);
+    builder_begin_node(&test_blob, "platform");
+    builder_property_u32(&test_blob, NAME_ADDRESS_CELLS, 1U);
+    builder_property_u32(&test_blob, NAME_SIZE_CELLS, 1U);
+    builder_property_named_cells(&test_blob,
+                                 NAME_RANGES,
+                                 bus_ranges,
+                                 4U);
+    builder_add_virtio_mmio(&test_blob,
+                            "block@2000",
+                            device_reg,
+                            2U,
+                            compatible,
+                            sizeof(compatible),
+                            NULL);
+    builder_end_node(&test_blob);
+    builder_add_memory(&test_blob, "memory@80000000", memory_reg, 4U);
+    builder_finish(&test_blob);
+
+    actual = dtb_read_boot_info(test_blob.bytes, &info);
+    if (actual != DTB_STATUS_OK || info.virtio_mmio_count != 1U ||
+        info.virtio_mmio[0].base != 0x30001000ULL ||
+        info.virtio_mmio[0].size != 0x1000ULL) {
+        fail_status(32U, DTB_STATUS_OK, actual);
+    }
+}
+
+static void test_rejects_malformed_or_untranslatable_virtio(void)
+{
+    static const uint32_t memory_reg[] = {
+        0U, 0x80000000U, 0U, 0x20000000U,
+    };
+    static const uint32_t device_reg[] = {0U, 0x10001000U, 0U, 0x1000U};
+    static const unsigned char unterminated[] = "virtio,mmio";
+
+    builder_start(&test_blob);
+    builder_add_root_cells(&test_blob, 2U, 2U);
+    builder_begin_node(&test_blob, "soc");
+    builder_property_u32(&test_blob, NAME_ADDRESS_CELLS, 2U);
+    builder_property_u32(&test_blob, NAME_SIZE_CELLS, 2U);
+    builder_property(&test_blob, NAME_RANGES, NULL, 0U);
+    builder_add_virtio_mmio(&test_blob,
+                            "virtio_mmio@10001000",
+                            device_reg,
+                            4U,
+                            unterminated,
+                            sizeof(unterminated) - 1U,
+                            NULL);
+    builder_end_node(&test_blob);
+    builder_add_memory(&test_blob, "memory@80000000", memory_reg, 4U);
+    builder_finish(&test_blob);
+    expect_error(33U, DTB_STATUS_INVALID);
+
+    builder_start(&test_blob);
+    builder_add_root_cells(&test_blob, 2U, 2U);
+    builder_begin_node(&test_blob, "soc");
+    builder_property_u32(&test_blob, NAME_ADDRESS_CELLS, 2U);
+    builder_property_u32(&test_blob, NAME_SIZE_CELLS, 2U);
+    builder_add_virtio_mmio(&test_blob,
+                            "virtio_mmio@10001000",
+                            device_reg,
+                            4U,
+                            (const unsigned char *)"virtio,mmio",
+                            sizeof("virtio,mmio"),
+                            NULL);
+    builder_end_node(&test_blob);
+    builder_add_memory(&test_blob, "memory@80000000", memory_reg, 4U);
+    builder_finish(&test_blob);
+    expect_error(34U, DTB_STATUS_UNSUPPORTED);
+}
+
+static void test_reports_too_many_virtio_mmio_devices(void)
+{
+    static const uint32_t memory_reg[] = {
+        0U, 0x80000000U, 0U, 0x20000000U,
+    };
+    static const unsigned char compatible[] = "virtio,mmio";
+    uint32_t index;
+
+    builder_start(&test_blob);
+    builder_add_root_cells(&test_blob, 2U, 2U);
+    builder_begin_node(&test_blob, "soc");
+    builder_property_u32(&test_blob, NAME_ADDRESS_CELLS, 2U);
+    builder_property_u32(&test_blob, NAME_SIZE_CELLS, 2U);
+    builder_property(&test_blob, NAME_RANGES, NULL, 0U);
+    for (index = 0U; index <= DTB_MAX_VIRTIO_MMIO_RANGES; index++) {
+        uint32_t reg[] = {0U, 0x10000000U + index * 0x1000U,
+                          0U, 0x1000U};
+
+        builder_add_virtio_mmio(&test_blob,
+                                "virtio_mmio",
+                                reg,
+                                4U,
+                                compatible,
+                                sizeof(compatible),
+                                NULL);
+    }
+    builder_end_node(&test_blob);
+    builder_add_memory(&test_blob, "memory@80000000", memory_reg, 4U);
+    builder_finish(&test_blob);
+    expect_error(35U, DTB_STATUS_UNSUPPORTED);
+}
+
 void kernel_main(unsigned long hart_id, const void *dtb)
 {
     (void)hart_id;
@@ -847,6 +1065,10 @@ void kernel_main(unsigned long hart_id, const void *dtb)
     test_rejects_zero_timebase_frequency();
     test_rejects_duplicate_timebase_frequency();
     test_ignores_timebase_outside_cpus();
+    test_discovers_sorts_and_filters_virtio_mmio();
+    test_translates_nested_bus_ranges();
+    test_rejects_malformed_or_untranslatable_virtio();
+    test_reports_too_many_virtio_mmio_devices();
     run_boot_memory_tests();
 
     virt_uart_puts("BoarOS: DTB parser tests passed\n");

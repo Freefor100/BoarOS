@@ -4,7 +4,8 @@
 #include <arch/riscv/memory_layout.h>
 
 #define VIRT_UART_MMIO_PHYSICAL_BASE 0x10000000UL
-#define VIRT_UART_MMIO_KERNEL_BASE RISCV_KERNEL_MMIO_BASE
+#define VIRT_UART_MMIO_KERNEL_BASE \
+    (RISCV_KERNEL_MMIO_BASE + VIRT_UART_MMIO_PHYSICAL_BASE)
 #define VIRT_UART_MMIO_SIZE 0x1000UL
 
 void virt_uart_use_kernel_mapping(void);

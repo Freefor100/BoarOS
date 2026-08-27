@@ -244,6 +244,35 @@ static enum riscv_sv39_status map_direct_alias(
                                 permissions);
 }
 
+static enum riscv_sv39_status map_mmio_alias(
+    struct riscv_sv39_page_table *table,
+    uint64_t physical_address,
+    uint64_t size)
+{
+    uint64_t mapping_start;
+    uint64_t mapping_end;
+
+    if (size == 0U || size > UINT64_MAX - physical_address) {
+        return RISCV_SV39_STATUS_INVALID;
+    }
+    mapping_start = physical_address & ~BOAROS_PAGE_MASK;
+    mapping_end = physical_address + size;
+    if (mapping_end > UINT64_MAX - BOAROS_PAGE_MASK) {
+        return RISCV_SV39_STATUS_INVALID;
+    }
+    mapping_end = (mapping_end + BOAROS_PAGE_MASK) & ~BOAROS_PAGE_MASK;
+    if (mapping_start >= RISCV_KERNEL_MMIO_SIZE ||
+        mapping_end > RISCV_KERNEL_MMIO_SIZE) {
+        return RISCV_SV39_STATUS_INVALID;
+    }
+
+    return riscv_sv39_map_range(table,
+                                RISCV_KERNEL_MMIO_BASE + mapping_start,
+                                mapping_start,
+                                mapping_end - mapping_start,
+                                RISCV_SV39_READ | RISCV_SV39_WRITE);
+}
+
 static enum riscv_sv39_status build_transition_page_table(void)
 {
     struct boot_memory_layout layout;
@@ -335,6 +364,7 @@ static enum riscv_sv39_status build_kernel_page_table(
     uint64_t data_start = (uint64_t)(uintptr_t)__data_start;
     uint64_t data_end = (uint64_t)(uintptr_t)__data_end;
     enum riscv_sv39_status status;
+    uint32_t index;
 
     if (info == 0 || info->memory.size == 0U ||
         info->memory.size > UINT64_MAX - info->memory.base) {
@@ -414,11 +444,22 @@ static enum riscv_sv39_status build_kernel_page_table(
         return status;
     }
 
-    return riscv_sv39_map_range(&kernel_page_table,
-                                VIRT_UART_MMIO_KERNEL_BASE,
-                                VIRT_UART_MMIO_PHYSICAL_BASE,
-                                VIRT_UART_MMIO_SIZE,
-                                RISCV_SV39_READ | RISCV_SV39_WRITE);
+    status = map_mmio_alias(&kernel_page_table,
+                            VIRT_UART_MMIO_PHYSICAL_BASE,
+                            VIRT_UART_MMIO_SIZE);
+    if (status != RISCV_SV39_STATUS_OK) {
+        return status;
+    }
+    for (index = 0U; index < info->virtio_mmio_count; index++) {
+        status = map_mmio_alias(&kernel_page_table,
+                                info->virtio_mmio[index].base,
+                                info->virtio_mmio[index].size);
+        if (status != RISCV_SV39_STATUS_OK) {
+            return status;
+        }
+    }
+
+    return RISCV_SV39_STATUS_OK;
 }
 
 static void verify_direct_map_runtime(void)

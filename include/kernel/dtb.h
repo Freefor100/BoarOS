@@ -4,6 +4,7 @@
 #include <stdint.h>
 
 #define DTB_MAX_RESERVED_RANGES 16U
+#define DTB_MAX_VIRTIO_MMIO_RANGES 16U
 
 enum dtb_status {
     DTB_STATUS_OK = 0,
@@ -22,7 +23,9 @@ struct dtb_boot_info {
     uint32_t dtb_size;
     uint32_t timebase_frequency;
     uint32_t reserved_count;
+    uint32_t virtio_mmio_count;
     struct dtb_memory_range reserved[DTB_MAX_RESERVED_RANGES];
+    struct dtb_memory_range virtio_mmio[DTB_MAX_VIRTIO_MMIO_RANGES];
 };
 
 enum dtb_status dtb_read_boot_info(const void *dtb,
