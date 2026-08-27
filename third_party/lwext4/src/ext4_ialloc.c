@@ -39,6 +39,8 @@
  * @brief Inode allocation procedures.
  */
 
+/* BoarOS modification, 2026-08-27: use metadata checksum seeds. */
+
 #include <ext4_config.h>
 #include <ext4_types.h>
 #include <ext4_misc.h>
@@ -99,8 +101,8 @@ static uint32_t ext4_ialloc_bitmap_csum(struct ext4_sblock *sb,	void *bitmap)
 		uint32_t inodes_per_group =
 			ext4_get32(sb, inodes_per_group);
 
-		/* First calculate crc32 checksum against fs uuid */
-		csum = ext4_crc32c(EXT4_CRC32_INIT, sb->uuid, sizeof(sb->uuid));
+		/* Start with the filesystem metadata checksum seed. */
+		csum = ext4_sb_get_csum_seed(sb);
 		/* Then calculate crc32 checksum against inode bitmap */
 		csum = ext4_crc32c(csum, bitmap, (inodes_per_group + 7) / 8);
 	}

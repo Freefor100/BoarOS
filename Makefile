@@ -278,6 +278,7 @@ DEPS := \
 	test-context-riscv \
 	test-elf64-riscv test-user-elf-cases-riscv test-user-elf-riscv \
 	test-high-half-trap-riscv test-idle-riscv test-no-identity-riscv \
+	test-lwext4-host \
 	test-page-riscv test-scheduler-cases-riscv test-scheduler-riscv \
 	test-references test-riscv test-sv39-fault-riscv test-sv39-riscv \
 	test-syscall-riscv test-timer-riscv test-trap-riscv \
@@ -291,6 +292,9 @@ references:
 
 test-references:
 	./tests/references.sh
+
+test-lwext4-host:
+	./tests/lwext4-host.sh
 
 $(KERNEL_RV): $(OBJECTS) arch/riscv/linker.ld
 	$(CC) $(LDFLAGS) -Wl,-Map,$(BUILD_DIR)/kernel-rv.map \

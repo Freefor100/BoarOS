@@ -39,6 +39,8 @@
  * @brief Directory handle procedures.
  */
 
+/* BoarOS modification, 2026-08-27: use metadata checksum seeds. */
+
 #include <ext4_config.h>
 #include <ext4_types.h>
 #include <ext4_misc.h>
@@ -85,8 +87,8 @@ static uint32_t ext4_dir_csum(struct ext4_inode_ref *inode_ref,
 	uint32_t ino_index = to_le32(inode_ref->index);
 	uint32_t ino_gen = to_le32(ext4_inode_get_generation(inode_ref->inode));
 
-	/* First calculate crc32 checksum against fs uuid */
-	csum = ext4_crc32c(EXT4_CRC32_INIT, sb->uuid, sizeof(sb->uuid));
+	/* Start with the filesystem metadata checksum seed. */
+	csum = ext4_sb_get_csum_seed(sb);
 	/* Then calculate crc32 checksum against inode number
 	 * and inode generation */
 	csum = ext4_crc32c(csum, &ino_index, sizeof(ino_index));

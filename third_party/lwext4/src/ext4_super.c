@@ -39,6 +39,11 @@
  * @brief Superblock operations.
  */
 
+/*
+ * BoarOS modification, 2026-08-27:
+ * Honor metadata_csum_seed when initializing metadata checksums.
+ */
+
 #include <ext4_config.h>
 #include <ext4_types.h>
 #include <ext4_misc.h>
@@ -47,6 +52,16 @@
 
 #include <ext4_super.h>
 #include <ext4_crc32.h>
+
+uint32_t ext4_sb_get_csum_seed(const struct ext4_sblock *s)
+{
+	ext4_assert(s);
+
+	if (ext4_sb_feature_incom(s, EXT4_FINCOM_CSUM_SEED))
+		return ext4_get32(s, checksum_seed);
+
+	return ext4_crc32c(EXT4_CRC32_INIT, s->uuid, sizeof(s->uuid));
+}
 
 uint32_t ext4_block_group_cnt(struct ext4_sblock *s)
 {

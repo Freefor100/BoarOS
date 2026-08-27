@@ -39,6 +39,11 @@
  * @brief Superblock operations.
  */
 
+/*
+ * BoarOS modification, 2026-08-27:
+ * Expose the metadata checksum seed selected by the superblock feature bit.
+ */
+
 #ifndef EXT4_SUPER_H_
 #define EXT4_SUPER_H_
 
@@ -131,7 +136,8 @@ static inline bool ext4_sb_feature_com(struct ext4_sblock *s, uint32_t v)
  * @param   s superblock descriptor
  * @param   v feature to check
  * @return  true if feature is supported*/
-static inline bool ext4_sb_feature_incom(struct ext4_sblock *s, uint32_t v)
+static inline bool ext4_sb_feature_incom(const struct ext4_sblock *s,
+					 uint32_t v)
 {
 	return to_le32(s->features_incompatible) & v;
 }
@@ -172,6 +178,11 @@ static inline uint32_t ext4_sb_first_meta_bg(struct ext4_sblock *s)
 }
 
 /**************************More complex functions****************************/
+
+/**@brief   Get the initial CRC32C value for filesystem metadata.
+ * @param   s superblock descriptor
+ * @return  stored checksum seed or the seed derived from the UUID*/
+uint32_t ext4_sb_get_csum_seed(const struct ext4_sblock *s);
 
 /**@brief   Returns a block group count.
  * @param   s superblock descriptor

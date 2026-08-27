@@ -39,6 +39,11 @@
  * @brief Ext4 data structure definitions.
  */
 
+/*
+ * BoarOS modification, 2026-08-27:
+ * Describe current checksum-seed fields in the ext4 superblock.
+ */
+
 #ifndef EXT4_TYPES_H_
 #define EXT4_TYPES_H_
 
@@ -174,7 +179,20 @@ struct ext4_sblock {
 	uint8_t  encrypt_algos[4];	/* Encryption algorithms in use  */
 	uint8_t  encrypt_pw_salt[16];	/* Salt used for string2key algorithm */
 	uint32_t lpf_ino;		/* Location of the lost+found inode */
-	uint32_t padding[100];	/* Padding to the end of the block */
+	uint32_t prj_quota_inum;	/* inode for tracking project quota */
+	uint32_t checksum_seed;		/* crc32c(original uuid) */
+	uint8_t write_time_hi;
+	uint8_t mount_time_hi;
+	uint8_t mkfs_time_hi;
+	uint8_t last_check_time_hi;
+	uint8_t first_error_time_hi;
+	uint8_t last_error_time_hi;
+	uint8_t first_error_errcode;
+	uint8_t last_error_errcode;
+	uint16_t encoding;		/* Filename charset encoding */
+	uint16_t encoding_flags;	/* Filename charset encoding flags */
+	uint32_t orphan_file_inum;	/* Inode tracking orphaned files */
+	uint32_t reserved[94];		/* Padding to the end of the block */
 	uint32_t checksum;		/* crc32c(superblock) */
 };
 
@@ -183,6 +201,22 @@ struct ext4_sblock {
 #define EXT4_SUPERBLOCK_MAGIC 0xEF53
 #define EXT4_SUPERBLOCK_SIZE 1024
 #define EXT4_SUPERBLOCK_OFFSET 1024
+
+#ifdef __cplusplus
+static_assert(offsetof(struct ext4_sblock, checksum_seed) == 0x270,
+	      "ext4 checksum seed offset");
+static_assert(offsetof(struct ext4_sblock, checksum) == 0x3fc,
+	      "ext4 superblock checksum offset");
+static_assert(sizeof(struct ext4_sblock) == EXT4_SUPERBLOCK_SIZE,
+	      "ext4 superblock size");
+#else
+_Static_assert(offsetof(struct ext4_sblock, checksum_seed) == 0x270,
+	       "ext4 checksum seed offset");
+_Static_assert(offsetof(struct ext4_sblock, checksum) == 0x3fc,
+	       "ext4 superblock checksum offset");
+_Static_assert(sizeof(struct ext4_sblock) == EXT4_SUPERBLOCK_SIZE,
+	       "ext4 superblock size");
+#endif
 
 #define EXT4_SUPERBLOCK_OS_LINUX 0
 #define EXT4_SUPERBLOCK_OS_HURD 1
@@ -246,7 +280,7 @@ struct ext4_sblock {
 #define EXT4_FINCOM_FLEX_BG 0x0200
 #define EXT4_FINCOM_EA_INODE 0x0400	 /* EA in inode */
 #define EXT4_FINCOM_DIRDATA 0x1000	  /* data in dirent */
-#define EXT4_FINCOM_BG_USE_META_CSUM 0x2000 /* use crc32c for bg */
+#define EXT4_FINCOM_CSUM_SEED 0x2000 /* metadata checksum seed in superblock */
 #define EXT4_FINCOM_LARGEDIR 0x4000	 /* >2GB or 3-lvl htree */
 #define EXT4_FINCOM_INLINE_DATA 0x8000      /* data in inode */
 
@@ -281,7 +315,7 @@ struct ext4_sblock {
 #define EXT4_SUPPORTED_FINCOM                              \
 	(EXT4_FINCOM_FILETYPE | EXT4_FINCOM_META_BG |      \
 	 EXT4_FINCOM_EXTENTS | EXT4_FINCOM_FLEX_BG |       \
-	 EXT4_FINCOM_64BIT)
+	 EXT4_FINCOM_64BIT | EXT4_FINCOM_CSUM_SEED)
 
 #define EXT4_SUPPORTED_FRO_COM                             \
 	(EXT4_FRO_COM_SPARSE_SUPER |                       \
