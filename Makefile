@@ -49,6 +49,7 @@ USER_ELF_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-user-elf-rv
 USER_ELF_PROGRAM_RV := $(BUILD_DIR)/tests/user/elf-probe-rv
 USER_ELF_FAULT_PROGRAM_RV := $(BUILD_DIR)/tests/user/elf-text-fault-rv
 USER_ELF_GUARD_PROGRAM_RV := $(BUILD_DIR)/tests/user/elf-guard-fault-rv
+ROOT_INIT_PROGRAM_RV := $(BUILD_DIR)/tests/user/root-init-rv
 USER_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-user-rv
 USER_FATAL_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-user-fatal-rv
 
@@ -88,6 +89,7 @@ C_SOURCES := \
 	arch/riscv/context.c \
 	arch/riscv/direct_map.c \
 	arch/riscv/mm.c \
+	arch/riscv/root_boot.c \
 	arch/riscv/sbi.c \
 	arch/riscv/sv39.c \
 	arch/riscv/timer.c \
@@ -306,6 +308,8 @@ USER_ELF_FAULT_PROGRAM_OBJECT_RV := \
 	$(BUILD_DIR)/tests/user/user_elf_fault_program.o
 USER_ELF_GUARD_PROGRAM_OBJECT_RV := \
 	$(BUILD_DIR)/tests/user/user_elf_guard_program.o
+ROOT_INIT_PROGRAM_OBJECT_RV := \
+	$(BUILD_DIR)/tests/user/root_init.o
 USER_TEST_C_SOURCES := tests/riscv/user_boot.c
 USER_TEST_ASM_SOURCES := tests/riscv/user_payload.S
 USER_TEST_OBJECTS := \
@@ -345,12 +349,14 @@ DEPS := \
 	$(USER_ELF_PROGRAM_OBJECT_RV:.o=.d) \
 	$(USER_ELF_FAULT_PROGRAM_OBJECT_RV:.o=.d) \
 	$(USER_ELF_GUARD_PROGRAM_OBJECT_RV:.o=.d) \
+	$(ROOT_INIT_PROGRAM_OBJECT_RV:.o=.d) \
 	$(USER_TEST_OBJECTS:.o=.d) \
 	$(USER_FATAL_TEST_OBJECTS:.o=.d)
 
 .PHONY: all clean debug-riscv references run-riscv test-dtb-riscv \
 	test-context-riscv \
 	test-elf64-riscv test-user-elf-cases-riscv test-user-elf-riscv \
+	test-root-init-riscv \
 	test-high-half-trap-riscv test-idle-riscv test-no-identity-riscv \
 	test-lwext4-host \
 	test-block-riscv test-heap-riscv test-page-riscv test-vfs-riscv \
@@ -536,6 +542,16 @@ $(USER_ELF_GUARD_PROGRAM_RV): $(USER_ELF_GUARD_PROGRAM_OBJECT_RV) \
 		-T tests/riscv/user_elf.ld -Wl,--build-id=none \
 		-Wl,--gc-sections -o $@ $(USER_ELF_GUARD_PROGRAM_OBJECT_RV)
 
+$(ROOT_INIT_PROGRAM_OBJECT_RV): tests/riscv/root_init.S
+	@mkdir -p $(dir $@)
+	$(CC) $(CPPFLAGS) $(ASFLAGS) -MMD -MP -c $< -o $@
+
+$(ROOT_INIT_PROGRAM_RV): $(ROOT_INIT_PROGRAM_OBJECT_RV) \
+		tests/riscv/user_elf.ld
+	$(CC) $(ARCH_FLAGS) -nostdlib -nostartfiles -static -no-pie \
+		-T tests/riscv/user_elf.ld -Wl,--build-id=none \
+		-Wl,--gc-sections -o $@ $(ROOT_INIT_PROGRAM_OBJECT_RV)
+
 $(BUILD_DIR)/tests/riscv/user_elf_images.o: \
 		tests/riscv/user_elf_images.S \
 		$(USER_ELF_PROGRAM_RV) $(USER_ELF_FAULT_PROGRAM_RV) \
@@ -611,6 +627,7 @@ test-riscv: $(DTB_TEST_KERNEL_RV) $(PAGE_TEST_KERNEL_RV) \
 	$(TRAP_RETURN_TEST_KERNEL_RV) $(TRAP_RETURN_SIE_TEST_KERNEL_RV) \
 	$(HIGH_HALF_TRAP_TEST_KERNEL_RV) $(NO_IDENTITY_TEST_KERNEL_RV) \
 	$(TIMER_CASES_TEST_KERNEL_RV) $(TIMER_BOOT_TEST_KERNEL_RV) \
+	$(ROOT_INIT_PROGRAM_RV) \
 	$(KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) \
 		DTB_TEST_KERNEL_RV=$(DTB_TEST_KERNEL_RV) ./tests/dtb-riscv.sh
@@ -685,6 +702,9 @@ test-riscv: $(DTB_TEST_KERNEL_RV) $(PAGE_TEST_KERNEL_RV) \
 		NO_IDENTITY_TEST_KERNEL_RV=$(NO_IDENTITY_TEST_KERNEL_RV) \
 		./tests/no-identity-riscv.sh
 	QEMU_RISCV64=$(QEMU_RISCV64) KERNEL_RV=$(KERNEL_RV) \
+		ROOT_INIT_PROGRAM_RV=$(ROOT_INIT_PROGRAM_RV) \
+		./tests/root-init-riscv.sh
+	QEMU_RISCV64=$(QEMU_RISCV64) KERNEL_RV=$(KERNEL_RV) \
 		./tests/idle-riscv.sh
 
 test-dtb-riscv: $(DTB_TEST_KERNEL_RV)
@@ -746,6 +766,11 @@ test-user-elf-riscv: $(USER_ELF_TEST_KERNEL_RV) \
 		USER_ELF_FAULT_PROGRAM_RV=$(USER_ELF_FAULT_PROGRAM_RV) \
 		USER_ELF_GUARD_PROGRAM_RV=$(USER_ELF_GUARD_PROGRAM_RV) \
 		./tests/user-elf-riscv.sh
+
+test-root-init-riscv: $(KERNEL_RV) $(ROOT_INIT_PROGRAM_RV)
+	QEMU_RISCV64=$(QEMU_RISCV64) KERNEL_RV=$(KERNEL_RV) \
+		ROOT_INIT_PROGRAM_RV=$(ROOT_INIT_PROGRAM_RV) \
+		./tests/root-init-riscv.sh
 
 test-user-riscv: $(USER_TEST_KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) USER_TEST_KERNEL_RV=$< \

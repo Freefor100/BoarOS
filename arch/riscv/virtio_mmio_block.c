@@ -491,13 +491,13 @@ enum riscv_virtio_mmio_block_status riscv_virtio_mmio_block_init(
         VIRTIO_MMIO_MAGIC_VALUE) {
         return RISCV_VIRTIO_MMIO_BLOCK_STATUS_INVALID;
     }
-    if (mmio_read32(&result, VIRTIO_MMIO_VERSION_OFFSET) !=
-        VIRTIO_MMIO_VERSION_MODERN) {
-        return RISCV_VIRTIO_MMIO_BLOCK_STATUS_UNSUPPORTED;
-    }
     if (mmio_read32(&result, VIRTIO_MMIO_DEVICE_ID_OFFSET) !=
         VIRTIO_DEVICE_ID_BLOCK) {
         return RISCV_VIRTIO_MMIO_BLOCK_STATUS_NOT_BLOCK;
+    }
+    if (mmio_read32(&result, VIRTIO_MMIO_VERSION_OFFSET) !=
+        VIRTIO_MMIO_VERSION_MODERN) {
+        return RISCV_VIRTIO_MMIO_BLOCK_STATUS_UNSUPPORTED;
     }
 
     status = negotiate_features(&result);

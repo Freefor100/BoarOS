@@ -1,6 +1,7 @@
 #include <arch/riscv/context.h>
 #include <arch/riscv/direct_map.h>
 #include <arch/riscv/memory_layout.h>
+#include <arch/riscv/root_boot.h>
 #include <arch/riscv/sbi.h>
 #include <arch/riscv/sv39.h>
 #include <arch/riscv/timer.h>
@@ -33,6 +34,7 @@ static struct physical_page_allocator page_allocator;
 static struct riscv_sv39_page_table kernel_page_table;
 static struct physical_page_allocator transition_page_allocator;
 static struct riscv_sv39_page_table transition_page_table;
+static struct riscv_root_boot root_boot;
 static unsigned char
     transition_table_pages[RISCV_TRANSITION_TABLE_PAGE_COUNT *
                            BOAROS_PAGE_SIZE]
@@ -163,6 +165,18 @@ static void shutdown_for_scheduler_error(
     enum kernel_scheduler_status status)
 {
     virt_uart_puts("BoarOS: scheduler startup/idle error status=");
+    virt_uart_put_hex((unsigned long)status);
+    virt_uart_putc('\n');
+    sbi_shutdown();
+}
+
+static void shutdown_for_root_boot_error(
+    enum riscv_root_boot_status status) __attribute__((noreturn));
+
+static void shutdown_for_root_boot_error(
+    enum riscv_root_boot_status status)
+{
+    virt_uart_puts("BoarOS: root boot error status=");
     virt_uart_put_hex((unsigned long)status);
     virt_uart_putc('\n');
     sbi_shutdown();
@@ -583,6 +597,8 @@ void kernel_main(unsigned long hart_id, const void *dtb)
     enum riscv_sv39_status sv39_status;
     enum riscv_timer_status timer_status;
     enum kernel_scheduler_status scheduler_status;
+    enum riscv_root_boot_status root_status;
+    int root_started = 0;
 
     if (dtb_status != DTB_STATUS_OK) {
         shutdown_for_dtb_error(dtb_status);
@@ -647,6 +663,17 @@ void kernel_main(unsigned long hart_id, const void *dtb)
         (uintptr_t)__boot_stack_top);
     if (scheduler_status != KERNEL_SCHEDULER_STATUS_OK) {
         shutdown_for_scheduler_error(scheduler_status);
+    }
+
+    root_status = riscv_root_boot_start(&root_boot,
+                                        &info,
+                                        &page_allocator,
+                                        &kernel_page_table);
+    if (root_status == RISCV_ROOT_BOOT_STATUS_OK) {
+        root_started = 1;
+        virt_uart_puts("BoarOS: root /init started pid=0x1\n");
+    } else if (root_status != RISCV_ROOT_BOOT_STATUS_NO_DEVICE) {
+        shutdown_for_root_boot_error(root_status);
     }
 
     virt_uart_puts("BoarOS: high-half pc=");
@@ -726,11 +753,39 @@ void kernel_main(unsigned long hart_id, const void *dtb)
     for (;;) {
         uintptr_t interrupt_status = riscv_interrupt_save();
         struct kernel_thread_completion completion;
+        int init_reaped = 0;
 
         do {
             scheduler_status = kernel_scheduler_reap_one(&completion);
+            if (scheduler_status == KERNEL_SCHEDULER_STATUS_OK &&
+                root_started && completion.kind == KERNEL_THREAD_KIND_USER &&
+                completion.tgid == 1) {
+                init_reaped = 1;
+                break;
+            }
         } while (scheduler_status == KERNEL_SCHEDULER_STATUS_OK);
         riscv_interrupt_restore(interrupt_status);
+        if (init_reaped) {
+            struct kernel_heap_statistics heap_statistics;
+            uint64_t available_pages;
+
+            root_status = riscv_root_boot_finish(&root_boot,
+                                                  &completion,
+                                                  &heap_statistics,
+                                                  &available_pages);
+            if (root_status != RISCV_ROOT_BOOT_STATUS_OK) {
+                shutdown_for_root_boot_error(root_status);
+            }
+            virt_uart_puts("BoarOS: PID 1 exited status=");
+            virt_uart_put_hex((unsigned long)completion.status);
+            virt_uart_puts(" pages=");
+            virt_uart_put_hex((unsigned long)available_pages);
+            virt_uart_puts(" heap-live=");
+            virt_uart_put_hex(
+                (unsigned long)heap_statistics.live_allocations);
+            virt_uart_puts("; shutting down\n");
+            sbi_shutdown();
+        }
         if (scheduler_status != KERNEL_SCHEDULER_STATUS_EMPTY) {
             shutdown_for_scheduler_error(scheduler_status);
         }

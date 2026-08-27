@@ -8,10 +8,8 @@ qemu=${QEMU_RISCV64:-qemu-system-riscv64}
 nm_rv=${NM_RV:-nm}
 readelf_rv=${READELF_RV:-readelf}
 output_dir=$(mktemp -d)
-disk="$output_dir/sdcard-rv.img"
 
 trap 'rm -rf "$output_dir"' EXIT HUP INT TERM
-truncate -s 1M "$disk"
 
 if [ ! -f "$kernel" ]; then
     echo "missing kernel: $kernel" >&2
@@ -91,8 +89,6 @@ run_case()
         -smp 1 \
         -nographic \
         -no-reboot \
-        -drive file="$disk",if=none,format=raw,id=x0 \
-        -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
         -device virtio-net-device,netdev=net \
         -netdev user,id=net \
         -rtc base=utc </dev/null >"$output" 2>&1; then
