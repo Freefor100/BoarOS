@@ -29,6 +29,7 @@ BLOCK_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-block-rv
 VFS_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-vfs-rv
 VFS_RECOVERY_TEST_KERNEL_RV := \
 	$(BUILD_DIR)/tests/kernel-vfs-recovery-rv
+FILES_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-files-rv
 SV39_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-sv39-rv
 SV39_FAULT_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-sv39-fault-rv
 MM_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-mm-rv
@@ -99,6 +100,8 @@ C_SOURCES := \
 	arch/riscv/virt_uart.c \
 	arch/riscv/virtio_mmio_block.c \
 	fs/lwext4_port.c \
+	fs/files.c \
+	fs/fs_context.c \
 	fs/vfs.c \
 	kernel/boot_memory.c \
 	kernel/block.c \
@@ -223,6 +226,14 @@ VFS_RECOVERY_TEST_OBJECTS := \
 	$(TEST_RUNTIME_OBJECTS) \
 	$(patsubst %.c,$(BUILD_DIR)/%.o,$(VFS_TEST_SUPPORT_C_SOURCES)) \
 	$(VFS_RECOVERY_TEST_MAIN_OBJECT)
+FILES_TEST_C_SOURCES := \
+	$(VFS_TEST_SUPPORT_C_SOURCES) \
+	fs/files.c \
+	fs/fs_context.c \
+	tests/riscv/files_main.c
+FILES_TEST_OBJECTS := \
+	$(TEST_RUNTIME_OBJECTS) \
+	$(patsubst %.c,$(BUILD_DIR)/%.o,$(FILES_TEST_C_SOURCES))
 SV39_TEST_C_SOURCES := \
 	arch/riscv/direct_map.c \
 	tests/riscv/direct_map_cases.c \
@@ -333,6 +344,7 @@ DEPS := \
 	$(BLOCK_TEST_OBJECTS:.o=.d) \
 	$(VFS_TEST_OBJECTS:.o=.d) \
 	$(VFS_RECOVERY_TEST_MAIN_OBJECT:.o=.d) \
+	$(FILES_TEST_OBJECTS:.o=.d) \
 	$(SV39_TEST_OBJECTS:.o=.d) \
 	$(SV39_FAULT_TEST_OBJECTS:.o=.d) \
 	$(MM_TEST_OBJECTS:.o=.d) \
@@ -357,6 +369,7 @@ DEPS := \
 	test-context-riscv \
 	test-elf64-riscv test-user-elf-cases-riscv test-user-elf-riscv \
 	test-root-init-riscv \
+	test-files-riscv \
 	test-high-half-trap-riscv test-idle-riscv test-no-identity-riscv \
 	test-lwext4-host \
 	test-block-riscv test-heap-riscv test-page-riscv test-vfs-riscv \
@@ -462,6 +475,11 @@ $(UACCESS_TEST_KERNEL_RV): $(UACCESS_TEST_OBJECTS) \
 	$(CC) $(LDFLAGS) \
 		-Wl,-Map,$(BUILD_DIR)/tests/kernel-uaccess-rv.map \
 		-o $@ $(UACCESS_TEST_OBJECTS)
+
+$(FILES_TEST_KERNEL_RV): $(FILES_TEST_OBJECTS) arch/riscv/linker.ld
+	$(CC) $(LDFLAGS) -Wl,--wrap=kernel_heap_release \
+		-Wl,-Map,$(BUILD_DIR)/tests/kernel-files-rv.map \
+		-o $@ $(FILES_TEST_OBJECTS)
 
 $(TIMER_CASES_TEST_KERNEL_RV): $(TIMER_CASES_TEST_OBJECTS) \
 		arch/riscv/linker.ld
@@ -617,6 +635,7 @@ test-riscv: $(DTB_TEST_KERNEL_RV) $(PAGE_TEST_KERNEL_RV) \
 	$(BLOCK_TEST_KERNEL_RV) \
 	$(VFS_TEST_KERNEL_RV) \
 	$(VFS_RECOVERY_TEST_KERNEL_RV) \
+	$(FILES_TEST_KERNEL_RV) \
 	$(CONTEXT_TEST_KERNEL_RV) $(SCHEDULER_CASES_TEST_KERNEL_RV) \
 	$(SCHEDULER_BOOT_TEST_KERNEL_RV) \
 	$(SYSCALL_TEST_KERNEL_RV) $(ELF64_TEST_KERNEL_RV) \
@@ -641,6 +660,9 @@ test-riscv: $(DTB_TEST_KERNEL_RV) $(PAGE_TEST_KERNEL_RV) \
 		VFS_TEST_KERNEL_RV=$(VFS_TEST_KERNEL_RV) \
 		VFS_RECOVERY_TEST_KERNEL_RV=$(VFS_RECOVERY_TEST_KERNEL_RV) \
 		./tests/vfs-riscv.sh
+	QEMU_RISCV64=$(QEMU_RISCV64) \
+		FILES_TEST_KERNEL_RV=$(FILES_TEST_KERNEL_RV) \
+		./tests/files-riscv.sh
 	QEMU_RISCV64=$(QEMU_RISCV64) OBJDUMP_RV=$(OBJDUMP) \
 		CONTEXT_TEST_KERNEL_RV=$(CONTEXT_TEST_KERNEL_RV) \
 		CONTEXT_OBJECT_RV=$(BUILD_DIR)/arch/riscv/context_switch.o \
@@ -728,6 +750,10 @@ test-vfs-riscv: $(VFS_TEST_KERNEL_RV) $(VFS_RECOVERY_TEST_KERNEL_RV)
 		VFS_TEST_KERNEL_RV=$(VFS_TEST_KERNEL_RV) \
 		VFS_RECOVERY_TEST_KERNEL_RV=$(VFS_RECOVERY_TEST_KERNEL_RV) \
 		./tests/vfs-riscv.sh
+
+test-files-riscv: $(FILES_TEST_KERNEL_RV)
+	QEMU_RISCV64=$(QEMU_RISCV64) FILES_TEST_KERNEL_RV=$< \
+		./tests/files-riscv.sh
 
 test-context-riscv: $(CONTEXT_TEST_KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) OBJDUMP_RV=$(OBJDUMP) \

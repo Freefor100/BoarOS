@@ -298,6 +298,13 @@ int kernel_vfs_open(struct kernel_vfs_mount *mount,
         return -KERNEL_EINVAL;
     }
     adapter = mount->private_data;
+    result = ext4_mode_get(path, &mode);
+    if (result != EOK) {
+        return lwext4_error(result);
+    }
+    if ((mode & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFDIR) {
+        return -KERNEL_EISDIR;
+    }
     heap_status = kernel_heap_allocate_zeroed(adapter->heap,
                                               1U,
                                               sizeof(*handle),
@@ -312,13 +319,6 @@ int kernel_vfs_open(struct kernel_vfs_mount *mount,
         (void)kernel_heap_release(adapter->heap, handle);
         return lwext4_error(result);
     }
-    result = ext4_mode_get(path, &mode);
-    if (result != EOK) {
-        (void)ext4_fclose(&handle->file);
-        (void)kernel_heap_release(adapter->heap, handle);
-        return lwext4_error(result);
-    }
-
     file->private_data = handle;
     file->mount = mount;
     file->size = ext4_fsize(&handle->file);
