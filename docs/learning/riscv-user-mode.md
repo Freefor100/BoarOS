@@ -1,6 +1,6 @@
 # RISC-V 用户态与系统调用学习总结
 
-本文整理从内核线程走到可执行 U-mode 任务所需的特权级、地址空间、现场切换、系统调用和资源所有权知识，并记录 BoarOS 当前已经验证的选择。稳定接口和限制以 [RISC-V Trap 模块](../modules/riscv-trap.md)、[RISC-V Sv39 分页模块](../modules/riscv-sv39.md)、[内核 MM 模块](../modules/kernel-mm.md)、[用户内存访问模块](../modules/kernel-uaccess.md)、[内核任务调度模块](../modules/kernel-scheduler.md)和 [系统调用解码模块](../modules/kernel-syscall.md)为准。
+本文整理从内核线程走到可执行 U-mode 任务所需的特权级、地址空间、现场切换、系统调用和资源所有权知识，并记录 BoarOS 当前已经验证的选择。稳定接口和限制以 [RISC-V Trap 模块](../modules/riscv-trap.md)、[RISC-V Sv39 分页模块](../modules/riscv-sv39.md)、[内核 MM 模块](../modules/kernel-mm.md)、[用户内存访问模块](../modules/kernel-uaccess.md)、[进程文件资源模块](../modules/kernel-files.md)、[内核任务调度模块](../modules/kernel-scheduler.md)和 [系统调用解码模块](../modules/kernel-syscall.md)为准。
 
 ## U-mode 解决的边界
 
@@ -36,7 +36,7 @@ BoarOS 为每个用户任务建立独立的 Sv39 根页表。低半区包含该�
 
 任务表示一条可调度执行流，拥有内核栈、Trap Frame、switch context 和 TID；线程组用 TGID 表示 Linux 用户看到的进程身份。MM 只表示虚拟地址空间，文件表、当前目录、凭据和信号处理方式还有各自的共享规则。把这些都塞进一个“最小进程”在一进程一线程时可以运行，却会把 `clone/fork/exec/wait` 需要独立变化的生命周期锁死。
 
-BoarOS 的通用 `kernel_mm` 是可 acquire/move/release 的引用，RISC-V 用一个 4 KiB 记录页保存引用计数和唯一 Sv39 owner。Scheduler task 持有一份 MM 引用、自己的 TID 和组首关系，并缓存切换所需 `satp`。切换本身直接使用缓存，不在 tick 路径解析记录页；当前测试中的两个独立线程组已共享一个 MM，未来更换 LoongArch 后端也不改变 RISC-V switch context 汇编前缀。
+BoarOS 的通用 `kernel_mm` 是可 acquire/move/release 的引用，RISC-V 用一个 4 KiB 记录页保存引用计数和唯一 Sv39 owner。生产 scheduler task 还持有一张 fd 表和一个 fs context，以及自己的 TID 和组首关系，并缓存切换所需 `satp`。这些资源有独立对象和借用接口；切换本身直接使用缓存，不在 tick 路径解析记录页或执行 files/fs 生命周期。当前测试中的两个独立线程组已共享一个 MM，未来更换 LoongArch 后端也不改变 RISC-V switch context 汇编前缀。
 
 所有权转移必须是成功才发生：ELF 装载器先产出 LIVE Sv39 地址空间，MM 创建成功后把它变成 MOVED，用户任务创建成功后再把 MM 句柄变成 MOVED。共享时 `acquire` 只增加引用，最后一份 `release` 才销毁页表树。若记录页已经分配，但访问和立即释放同时失败，CLEANUP 句柄仍精确记住这张页；若地址空间已销毁而记录页释放失败，也只重试最后一页。状态化 owner 比“返回错误码并让调用者猜哪些资源已经释放”更适合内核错误路径。
 
@@ -44,9 +44,9 @@ BoarOS 的通用 `kernel_mm` 是可 acquire/move/release 的引用，RISC-V 用�
 
 RISC-V Linux 用户 ABI 用 `a7` 传系统调用号，`a0..a5` 传最多六个参数，返回值放在 `a0`。用户执行 `ECALL` 后，`sepc` 指向 `ECALL` 本身；若系统调用要返回用户代码，内核必须把 `sepc` 前移 4 字节，否则会再次执行同一条指令。
 
-BoarOS 当前实现 `exit(93)`、`uname(160)`、`getpid(172)` 和 `gettid(178)`。退出状态取参数的低 8 位并形成完成记录，任务不再恢复；`uname` 使用 Linux 六个 65 字节字段、总计 390 字节的 `new_utsname`，用户目标无效时返回 `-EFAULT`；`getpid` 返回线程组 ID，`gettid` 返回当前任务 ID。当前用户任务都是单成员组，所以两个身份值相同，但内核字段和 syscall 语义已经分开。未知调用返回 `-ENOSYS`（错误号 38），同时前移 `sepc` 后继续执行。
+BoarOS 当前实现 `openat(56)`、`close(57)`、`read(63)`、`exit(93)`、`uname(160)`、`getpid(172)` 和 `gettid(178)`。文件调用从 current task 借用 files/fs/MM，并返回 fd、字节数或负 Linux errno；退出状态取参数的低 8 位并形成完成记录，任务不再恢复；`uname` 使用 Linux 六个 65 字节字段、总计 390 字节的 `new_utsname`，用户目标无效时返回 `-EFAULT`；`getpid` 返回线程组 ID，`gettid` 返回当前任务 ID。当前用户任务都是单成员组，所以两个身份值相同，但内核字段和 syscall 语义已经分开。未知调用返回 `-ENOSYS`（错误号 38），同时前移 `sepc` 后继续执行。
 
-系统调用解码与架构 Trap 分开：Trap 层负责寄存器、`sepc` 和显式 current task，通用解码层负责编号、参数和结果语义。`exit` 目前只结束当前 task；生产启动已经从只读 ext4 装载 `/init`，但尚未实现用户可调用的 `execve`、`exit_group`、父子关系、zombie/wait、文件表、信号、用户输入复制或 `fork/clone`，现有 MM/TID 机制不伪装这些能力。
+系统调用解码与架构 Trap 分开：Trap 层负责寄存器、`sepc` 和显式 current task，通用解码层负责编号、参数和结果语义。`exit` 目前只结束当前 task；生产启动已经从只读 ext4 装载 `/init`，并拥有任务私有文件表、根 fs context 与用户输入复制，但尚未实现用户可调用的 `execve`、`exit_group`、父子关系、zombie/wait、资源共享、信号或 `fork/clone`，现有资源模型不伪装这些能力。
 
 ## 内核为什么不能直接解引用用户指针
 
@@ -54,7 +54,7 @@ BoarOS 当前实现 `exit(93)`、`uname(160)`、`getpid(172)` 和 `gettid(178)`�
 
 Linux RISC-V 的高性能 usercopy 会先验证用户范围，设置 SUM 后直接访问用户虚拟地址，并给可能故障的汇编指令登记 exception table。S-mode page fault 到来时，Trap 根据故障 PC 查表，把 `sepc` 修正到 fixup 路径，最终返回尚未复制的字节数。硬件 TLB 负责地址翻译，适合大缓冲区；代价是 SUM 开关纪律、异常表链接布局、汇编复制循环和 fault fixup 都必须完整正确。
 
-BoarOS 当前的首个消费者是固定 390 字节的 `uname`，而内核尚无 exception table、并发 unmap 或按需缺页。因此 RISC-V 后端先逐基页调用 `kernel_mm_lookup()`，检查 `USER|WRITE` 后通过高半区 direct map 写物理页。每个片段不跨页，范围越界在复制前失败，后续页故障则保留已经复制的连续前缀。该路径不会产生可恢复的 S-mode fault，也不需要修改 SUM；代价是每个涉及页执行一次三级软件遍历，所以不能从 `uname` 测试推断未来大块 `read/write` 的性能。
+BoarOS 当前逐基页调用 `kernel_mm_lookup()`，按复制方向检查 `USER|READ` 或 `USER|WRITE` 后通过高半区 direct map 访问物理页。每个片段不跨页，固定范围越界在复制前失败，后续页故障则保留已经复制的连续前缀；有界字符串读取还会区分 NUL、容量耗尽和用户 fault。该路径不会产生可恢复的 S-mode fault，也不需要修改 SUM。`uname` 是固定 390 字节，文件 `read` 已用 4 KiB staging chunk 处理更大缓冲区；每个涉及页仍执行一次三级软件遍历，目前没有开发板吞吐数据，不能把 QEMU 正确性测试当作性能结论。
 
 软件遍历是当前正确性路径，不是 syscall ABI 的组成部分。公共 uaccess 接口只表达 MM、用户地址、内核缓冲区、长度和已复制前缀；将来可以在 RISC-V 内部为当前活动 MM 增加 SUM+异常表快路径，在 LoongArch 使用其架构机制，而 `uname`、VFS 和错误码语义保持不变。SMP、COW 或运行期 unmap 出现后，还必须用 MM 读锁或页固定保证“查到映射”和“完成复制”之间的物理页生命周期。
 
@@ -64,11 +64,11 @@ BoarOS 当前的首个消费者是固定 390 字节的 `uname`，而内核尚无
 
 `sstatus.SPP` 能区分 trap 来源。U-mode 的非法访问是该任务的失败，BoarOS 将同步故障记录为包含 `scause/stval` 的任务完成原因，然后切走并回收它拥有的资源。S-mode 未处理故障表示内核自身不变量可能已经破坏，仍走 fatal 诊断和关机，不能套用“杀掉当前用户任务”继续运行。
 
-这一策略要求故障任务拥有独立内核栈和有效 MM 引用。调度器必须先切到其他可信栈，才能释放故障任务的任务页；用户页表也不能在 `satp` 仍指向它时销毁。BoarOS 的 idle reaper 在内核根页表和 boot stack 上处理完成队列，依次释放 MM 引用、TID 和任务页。
+这一策略要求故障任务拥有独立内核栈和有效资源 owner。调度器必须先切到其他可信栈，才能释放故障任务的任务页；用户页表也不能在 `satp` 仍指向它时销毁。BoarOS 的 idle reaper 在内核根页表和 boot stack 上处理完成队列，依次关闭 fd/open file description，释放 fs context、MM 引用、TID 和任务页。
 
 ## 当前项目选择与平台边界
 
-BoarOS 先用手工映射探针验证首次 `SRET`、真实 timer 抢占、U-mode syscall、同步页故障、调度恢复和完整资源回收，再用独立链接的静态 ELF 验证装载器产出的代码、数据、BSS 和 Linux 形态的 `argc/argv/envp/auxv` 初始栈。生产路径进一步从 DTB 发现的 VirtIO 块设备只读挂载 ext4，以精确随机读直接把 `/init` 的 `PT_LOAD` 装入用户页，并在 PID 1 完成后沿同一回收路径释放全部资源。当前 TID/TGID 仍只有单成员线程组；能够启动一个磁盘 ELF 不等于已经具备 `execve`、`fork/clone/wait`、文件描述符或通用 `copy_from_user`。
+BoarOS 先用手工映射探针验证首次 `SRET`、真实 timer 抢占、U-mode syscall、同步页故障、调度恢复和完整资源回收，再用独立链接的静态 ELF 验证装载器产出的代码、数据、BSS 和 Linux 形态的 `argc/argv/envp/auxv` 初始栈。生产路径进一步从 DTB 发现的 VirtIO 块设备只读挂载 ext4，以精确随机读直接把 `/init` 的 `PT_LOAD` 装入用户页；PID 1 再通过文件描述符读取同一根上的普通文件，退出时沿 files/fs/MM/TID/task 顺序释放全部资源。当前 TID/TGID 仍只有单成员线程组；具备任务私有 fd 与用户输入复制不等于已经实现 `execve`、`fork/clone/wait` 或 Linux 的资源共享规则。
 
 Sv39、`satp`、`sscratch`、Trap Frame 和 RISC-V syscall 寄存器约定属于架构层，可在 QEMU `virt` 与 VisionFive 2 复用。SBI/固件交接、RAM 与 MMIO 布局、timebase、UART 和中断控制器仍属于平台层；QEMU 上通过 U-mode 测试不等于开发板适配已经完成。
 

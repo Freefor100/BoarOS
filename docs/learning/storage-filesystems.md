@@ -1,6 +1,6 @@
 # 存储与文件系统学习总结
 
-本文整理从块设备读取 ext4 并把文件作为可执行映像来源时需要掌握的知识、BoarOS 当前选择及验证经验。稳定接口见[RISC-V VirtIO MMIO 块设备](../modules/riscv-virtio-block.md)、[VFS 与只读 ext4](../modules/vfs-ext4.md)和[RISC-V 根启动](../modules/riscv-root-boot.md)。
+本文整理从块设备读取 ext4、把文件作为可执行映像来源并向进程提供文件描述符时需要掌握的知识、BoarOS 当前选择及验证经验。稳定接口见[RISC-V VirtIO MMIO 块设备](../modules/riscv-virtio-block.md)、[VFS 与只读 ext4](../modules/vfs-ext4.md)、[进程文件资源](../modules/kernel-files.md)和[RISC-V 根启动](../modules/riscv-root-boot.md)。
 
 ## 从设备到文件的层次
 
@@ -24,17 +24,28 @@ ELF header、program header 和各个 `PT_LOAD` 位于文件不同偏移。接�
 
 “read_at 返回零”必须表示精确填满请求。文件变短、EOF 内短读或底层 I/O 错误不能留下半个 program header 后继续解析。格式或 I/O 失败时，输出 ELF image 与最终用户空间保持不变；已经取得的临时页由明确 owner 回收。这个接口以后可以接页缓存或按需分页，但本身不承诺缓存、异步 I/O 或 mmap。
 
+## fd、打开文件描述与文件系统上下文
+
+Linux 进程看到的整数 fd 只是文件描述符表的索引。槽内的 descriptor flags（典型例子是 `FD_CLOEXEC`）属于 fd；真正的打开文件描述（open file description）保存文件位置、打开状态和底层文件引用。`dup` 产生两个 fd 指向同一打开文件描述，所以共享 offset；两次 `open` 同一路径则产生两个描述，offset 独立。`fork` 通常复制 fd 表引用而共享打开文件描述，`CLONE_FILES` 才共享整张 fd 表。把 offset 直接放进 fd 槽虽然早期简单，却会阻碍这些既定 Linux 语义。
+
+路径解析需要另一组进程状态：根目录、当前工作目录和用于相对路径的目录 fd。Linux `openat` 对绝对路径忽略 dirfd；相对路径的 `AT_FDCWD` 表示从 cwd 开始，其他值必须引用有效目录 fd。BoarOS 当前只有单根 mount、cwd `/` 和 `AT_FDCWD`，但把 fs context 与 fd table 分开，是为了让以后 `CLONE_FS` 与 `CLONE_FILES` 独立控制共享关系，而不是把两类资源固化为同一个对象。
+
+Linux `read` 的返回值不仅取决于磁盘读取结果，还取决于数据实际交付用户空间的程度。若第一字节就无法写入用户 buffer，应返回 `-EFAULT` 且不推进文件位置；若已经复制一段连续前缀，之后 fault 或 I/O 出错，通常返回已复制长度并只推进这部分。用内核 staging buffer 时，不能把“已从文件系统读入”误当成“已交付用户”：open-file offset 必须按 usercopy 成功字节提交。零长度读仍先要求 fd 有效，但不应解引用用户地址。
+
+当前以 4 KiB scratch 分块是内存占用有界的同步实现，也让部分复制边界明确；代价是每块多一次复制、一次 VFS 调用和用户页软件遍历。未来页缓存、read-ahead、把用户页固定后直接 I/O 或异步请求都可能降低这些成本，但必须保持 fd/open-description 分层、短读、offset 与 errno 语义不变。性能取舍需要在 QEMU 和开发板上用文件大小、顺序/随机模式、page fault 比例及 cache/TLB 数据说明，不能只比较函数层数。
+
 ## 根设备与 PID 1
 
 无命令行解析阶段需要一个确定的根选择规则。BoarOS 当前使用 DTB 翻译后的物理 MMIO 地址排序，选择第一个成功初始化的 block device；选中后若不是可挂载 ext4 或缺少 `/init`，启动失败，不扫描磁盘内容寻找替代根。这让平台拓扑决定设备顺序，行为可复现；以后支持 Linux `root=` 时可在块设备身份层增加显式选择，而不改变 ext4/VFS。
 
-PID 1 是用户空间生命周期的根。Linux 通常在 init 退出时 panic，因为继续运行已没有负责收养孤儿和维持用户空间的进程。BoarOS 当前尚无完整父子进程和信号，但仍在 scheduler 完整回收地址空间、PID 和任务页后把 PID 1 退出视为系统终止，再卸载根和关机。完成记录必须保存 TID/TGID 快照，否则任务页和 PID 被释放后就无法可靠判断退出者身份。
+PID 1 是用户空间生命周期的根。Linux 通常在 init 退出时 panic，因为继续运行已没有负责收养孤儿和维持用户空间的进程。BoarOS 当前尚无完整父子进程和信号，但仍在 scheduler 关闭全部 fd、释放 fs context、地址空间、PID 和任务页后把 PID 1 退出视为系统终止，再卸载根和关机。顺序不能倒置：打开的 VFS file 借用 mount，任务退出时必须先释放文件资源，最后才能卸载根。完成记录必须保存 TID/TGID 快照，否则任务页和 PID 被释放后就无法可靠判断退出者身份。
 
 ## 验证经验
 
 - 块设备测试要覆盖 direct DMA、bounce、批量合并、最后一个扇区、整数溢出、timeout 后 reset 和队列页回收。
 - 文件系统测试应建立真实镜像并通过工具设置 mode、checksum 与 incompat feature；只用手写 superblock fixture 很难覆盖 extent、目录和校验链。
 - 成功读取文件不足以证明生命周期完整；应在 open file 时验证 unmount 为 busy，并在 close/unmount/device destroy 后比较物理页和 heap live/current pages。
+- 进程文件测试还应覆盖最低 fd 复用、扩容边界、两次 open 的独立 offset、路径 NUL 上限、跨页 usercopy、部分 fault 后 offset，以及 close 已摘除 fd 但底层释放需要重试的状态。
 - 根启动 fixture 应独立链接并写入磁盘，不能把 ELF 同时嵌入 kernel，否则无法证明 VFS 是生产数据来源。
 - QEMU 默认可能提供 legacy VirtIO MMIO；现代驱动测试与生产根盘必须显式设置 `virtio-mmio.force-legacy=false`。开发板 transport 和 DMA 一致性必须重新验证，不能从 QEMU 行为外推。
 
