@@ -42,15 +42,12 @@ static uint64_t tick_count;
 static uint64_t test_failures;
 static uint64_t worker_ran;
 static uint64_t user_results_checked;
-static uint64_t normal_record_address;
 static uint64_t normal_leaf_address;
 static uint64_t fault_record_address;
-static uint64_t fail_release_address = UINT64_MAX;
-static uint64_t fail_release_once;
-static uint64_t fail_thread_after_record;
-static uint64_t normal_record_released;
-static uint64_t fault_reap_failure_checked;
-static uint64_t normal_reap_failures_checked;
+static uint64_t fail_fault_record_once;
+static uint64_t fail_normal_leaf_once;
+static uint64_t fault_exit_failure_checked;
+static uint64_t normal_exit_failure_checked;
 
 struct test_utsname {
     char sysname[65];
@@ -248,7 +245,6 @@ static enum kernel_scheduler_status create_user_test(
         !remember_user_uname_pages(&mm)) {
         return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
     }
-    normal_record_address = mm.record_page_address;
     normal_leaf_address = code_address;
     available_before_invalid = physical_page_available(allocator);
     if (kernel_user_thread_create(&mm,
@@ -377,7 +373,12 @@ enum kernel_scheduler_status __wrap_kernel_scheduler_init(
     if (status != KERNEL_SCHEDULER_STATUS_OK) {
         return status;
     }
-    return create_fault_test(allocator);
+    status = create_fault_test(allocator);
+    if (status == KERNEL_SCHEDULER_STATUS_OK) {
+        fail_fault_record_once = 1U;
+        fail_normal_leaf_once = 1U;
+    }
+    return status;
 }
 
 static void check_completion(
@@ -409,47 +410,25 @@ static void check_completion(
     }
 }
 
-static void set_completion_sentinel(
-    struct kernel_thread_completion *completion)
-{
-    completion->kind = (enum kernel_thread_kind)0x31;
-    completion->reason = (enum kernel_thread_exit_reason)0x42;
-    completion->status = UINT64_C(0x5364758697a8b9ca);
-    completion->detail = UINT64_C(0xdbecfd0e1f203142);
-}
-
-static int completion_is_sentinel(
-    const struct kernel_thread_completion *completion)
-{
-    return completion->kind == (enum kernel_thread_kind)0x31 &&
-           completion->reason ==
-               (enum kernel_thread_exit_reason)0x42 &&
-           completion->status == UINT64_C(0x5364758697a8b9ca) &&
-           completion->detail == UINT64_C(0xdbecfd0e1f203142);
-}
-
 enum physical_page_status __wrap_physical_page_release(
     struct physical_page_allocator *allocator,
     uint64_t address)
 {
     enum physical_page_status status;
 
-    if (fail_release_once != 0U && address == fail_release_address) {
-        fail_release_once = 0U;
+    if (fail_fault_record_once != 0U &&
+        address == fault_record_address) {
+        fail_fault_record_once = 0U;
+        fault_exit_failure_checked = 1U;
         return PHYSICAL_PAGE_STATUS_INVALID;
     }
-    if (fail_thread_after_record != 0U &&
-        normal_record_released != 0U &&
-        address != normal_record_address) {
-        fail_thread_after_record = 0U;
-        normal_record_released = 0U;
+    if (fail_normal_leaf_once != 0U &&
+        address == normal_leaf_address) {
+        fail_normal_leaf_once = 0U;
+        normal_exit_failure_checked = 1U;
         return PHYSICAL_PAGE_STATUS_INVALID;
     }
     status = __real_physical_page_release(allocator, address);
-    if (status == PHYSICAL_PAGE_STATUS_OK &&
-        address == normal_record_address) {
-        normal_record_released = 1U;
-    }
     return status;
 }
 
@@ -491,41 +470,6 @@ enum kernel_scheduler_status __wrap_kernel_scheduler_reap_one(
         }
     }
 
-    if (completion_count == 1U && fault_reap_failure_checked == 0U) {
-        set_completion_sentinel(completion);
-        fail_release_address = fault_record_address;
-        fail_release_once = 1U;
-        status = __real_kernel_scheduler_reap_one(completion);
-        if (status != KERNEL_SCHEDULER_STATUS_PAGE_RELEASE ||
-            !completion_is_sentinel(completion)) {
-            test_failures++;
-        }
-        fault_reap_failure_checked = 1U;
-    }
-    if (completion_count == 3U && normal_reap_failures_checked == 0U) {
-        if (normal_record_released != 0U) {
-            test_failures++;
-        }
-        set_completion_sentinel(completion);
-        fail_release_address = normal_leaf_address;
-        fail_release_once = 1U;
-        status = __real_kernel_scheduler_reap_one(completion);
-        if (status != KERNEL_SCHEDULER_STATUS_ADDRESS_SPACE ||
-            !completion_is_sentinel(completion)) {
-            test_failures++;
-        }
-
-        set_completion_sentinel(completion);
-        fail_thread_after_record = 1U;
-        normal_record_released = 0U;
-        status = __real_kernel_scheduler_reap_one(completion);
-        if (status != KERNEL_SCHEDULER_STATUS_PAGE_RELEASE ||
-            !completion_is_sentinel(completion)) {
-            test_failures++;
-        }
-        normal_reap_failures_checked = 1U;
-    }
-
     status = __real_kernel_scheduler_reap_one(completion);
 
     if (status != KERNEL_SCHEDULER_STATUS_OK) {
@@ -534,8 +478,8 @@ enum kernel_scheduler_status __wrap_kernel_scheduler_reap_one(
     check_completion(completion);
     if (completion_count == 4U) {
         if (worker_ran == 0U || user_results_checked == 0U ||
-            fault_reap_failure_checked == 0U ||
-            normal_reap_failures_checked == 0U ||
+            fault_exit_failure_checked == 0U ||
+            normal_exit_failure_checked == 0U ||
             physical_page_available(test_allocator) != initial_available) {
             test_failures++;
         }

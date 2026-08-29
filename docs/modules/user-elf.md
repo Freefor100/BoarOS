@@ -33,16 +33,12 @@ enum kernel_elf64_status kernel_elf64_read_program_header(
 ## RISC-V 装载契约
 
 ```c
-struct riscv_user_elf_string {
-    const char *bytes;
-    size_t length;
-};
-
 struct riscv_user_elf_request {
     struct kernel_read_source source;
-    const struct riscv_user_elf_string *arguments;
+    struct kernel_exec_string executable;
+    const struct kernel_exec_string *arguments;
     size_t argument_count;
-    const struct riscv_user_elf_string *environment;
+    const struct kernel_exec_string *environment;
     size_t environment_count;
 };
 
@@ -54,7 +50,7 @@ enum riscv_user_elf_status riscv_user_elf_load(
     struct riscv_user_elf_entry *entry);
 ```
 
-请求中的 source、参数数组、环境数组和字符串都只在调用期间借用；source 背后的文件或内存必须保持有效。`length` 不含结尾 NUL，装载器不会在返回后保留这些指针。非零数量必须配有数组，每个字符串必须配有字节区间，声明区间内不能含 NUL。零个参数会规范化为一个空的 `argv[0]`。参数、环境、指针表、auxv 和 16 字节对齐填充合计不得超过 128 KiB；超限返回 `RISCV_USER_ELF_STATUS_ARGUMENT_TOO_LARGE`，并在遍历数组前先限制数量，避免恶意计数驱动越界读取。
+请求中的 source、可执行文件名、参数数组、环境数组和字符串都只在调用期间借用；source 背后的文件或内存必须保持有效。`length` 不含结尾 NUL，装载器不会在返回后保留这些指针。非零数量必须配有数组，每个字符串必须配有字节区间，声明区间内不能含 NUL。零个参数会规范化为一个空的 `argv[0]`。参数、环境、可执行文件名、指针表、auxv 和 16 字节对齐填充合计不得超过 128 KiB；超限返回 `RISCV_USER_ELF_STATUS_ARGUMENT_TOO_LARGE`，并在遍历数组前先限制数量，避免恶意计数驱动越界读取。
 
 输入映像必须是 RISC-V ELF64 小端 `ET_EXEC`，并且内核页表为 ACTIVE、与分配器一致，输出空间为 EMPTY。当前明确拒绝 `ET_DYN` 以及含 `PT_INTERP`、`PT_DYNAMIC` 或 `PT_TLS` 的映像，不把缺失的动态链接能力伪装成成功。其他不影响静态装载的 program header 可以忽略。
 
@@ -64,13 +60,13 @@ enum riscv_user_elf_status riscv_user_elf_load(
 
 用户栈占用 Sv39 低半区顶端预留的 8 MiB 虚拟区间 `[RISCV_USER_ELF_STACK_RESERVE_BASE, RISCV_USER_ELF_STACK_TOP)`，其下方 `[RISCV_USER_ELF_STACK_GUARD_BASE, RISCV_USER_ELF_STACK_RESERVE_BASE)` 永久不映射。初次提交从 `page_start(sp - 64 KiB)` 到栈顶的 RW/NX 页：既覆盖不超过 128 KiB 的已序列化初始栈，也在 SP 下方保留至少 64 KiB 立即可用空间；预留区其余部分暂不映射，当前没有自动扩栈。ELF 段不得进入 guard 或栈预留区。
 
-初始 SP 按 RISC-V psABI 保持 16 字节对齐，并按 Linux 入口形态依次放置 `argc`、`argv[]`、NULL、`envp[]`、NULL、auxv 键值对和高地址字符串。当前 auxv 提供 `AT_PAGESZ=4096`、`AT_PHDR`、`AT_PHENT=56`、`AT_PHNUM`、`AT_BASE=0`、`AT_FLAGS=0`、`AT_ENTRY` 和 `AT_NULL`；只有完整 program header table 位于某个 `PT_LOAD` 文件范围内时 `AT_PHDR` 才给出其用户虚拟地址，否则为 0。没有伪造尚无可靠来源的 `AT_RANDOM`、HWCAP、身份或平台条目。
+初始 SP 按 RISC-V psABI 保持 16 字节对齐，并按 Linux 入口形态依次放置 `argc`、`argv[]`、NULL、`envp[]`、NULL、auxv 键值对和高地址字符串。当前 auxv 提供 `AT_PAGESZ=4096`、`AT_PHDR`、`AT_PHENT=56`、`AT_PHNUM`、`AT_BASE=0`、`AT_FLAGS=0`、`AT_ENTRY`、指向请求文件名副本的 `AT_EXECFN` 和 `AT_NULL`；只有完整 program header table 位于某个 `PT_LOAD` 文件范围内时 `AT_PHDR` 才给出其用户虚拟地址，否则为 0。没有伪造尚无可靠来源的 `AT_RANDOM`、HWCAP、身份或平台条目。
 
 ## 所有权与失败语义
 
 成功时，装载器把完整 LIVE `riscv_sv39_user_space` 移入 `space`，并最后写出入口和 SP；调用者随后用 `riscv_kernel_mm_create()` 把空间移入通用 MM，再把 MM、入口和 SP 交给 `kernel_user_thread_create()`。普通请求、格式、布局、缺页和地址空间失败时，输出保持不变，已分配的临时页会回收。
 
-Sv39 的零页接口在地址空间内部完成叶子分配、清零、映射和所有权登记。若页已分配但访问与立即释放同时失败，空间进入 `CLEANUP` 并记录这张脱离页表树的页。若装载失败后的地址空间销毁仍不能完成，装载器返回 `RISCV_USER_ELF_STATUS_CLEANUP_REQUIRED`，并把 LIVE 或 CLEANUP 空间移给调用者；调用者必须重试 `riscv_sv39_user_space_destroy()`。这条状态同时覆盖正常树的部分回收与尚未挂入树的单页，错误路径不会丢失页所有权。装载器不接管输入 ELF、参数或环境缓冲区。
+Sv39 的零页接口在地址空间内部完成叶子分配、清零、映射和所有权登记。若页已分配但访问与立即释放同时失败，空间进入 `CLEANUP` 并记录这张脱离页表树的页。若装载失败后的地址空间销毁仍不能完成，装载器返回 `RISCV_USER_ELF_STATUS_CLEANUP_REQUIRED`，并把 LIVE 或 CLEANUP 空间移给调用者；调用者必须重试 `riscv_sv39_user_space_destroy()`。`riscv_user_elf_load_detailed()` 还单独输出清理前的映像错误，使 exec 可以保留 `ENOEXEC/E2BIG/ENOMEM/EIO`，而不是让后续清理故障覆盖用户可见原因。这条状态同时覆盖正常树的部分回收与尚未挂入树的单页，错误路径不会丢失页所有权。装载器不接管输入 ELF、文件名、参数或环境缓冲区。
 
 ## 验证与限制
 
@@ -78,9 +74,10 @@ Sv39 的零页接口在地址空间内部完成叶子分配、清零、映射和
 make test-elf64-riscv
 make test-user-elf-cases-riscv
 make test-user-elf-riscv
+make test-exec-riscv
 make test-riscv
 ```
 
 前两项覆盖随机读解析、source I/O 失败、格式与装载错误树，其中装载用例还读取真实用户 PTE 检查 `argc/argv/envp/auxv`、空参数规范化、128 KiB 恰好可接受的边界、8 MiB 预留区、64 KiB 初始余量和永久 guard；段读取失败与物理页故障都必须回收临时空间。第三项由 bare-metal 工具链独立链接三个静态 `ET_EXEC`，用 `readelf` 检查 ELF 形态，再通过内存 source 运行。`test-root-init-riscv` 则把独立 ELF 写入 ext4，由 VFS source 驱动同一装载器。
 
-当前支持内存与已打开 VFS 文件的同步随机读，没有页缓存、共享文件页、异步 I/O 或用户指针来源。只支持 RISC-V 静态 `ET_EXEC` 和 4 KiB 用户页；没有 `ET_DYN`/ASLR、动态解释器、重定位、TLS、完整 Linux auxv、VDSO、按需扩栈/分页或 LoongArch 物化器。生产启动会从只读 ext4 `/init` 创建 PID 1，但尚无通用 `execve` syscall。
+当前支持内存与已打开 VFS 文件的同步随机读；用户指针捕获由通用 exec 层完成。只支持 RISC-V 静态 `ET_EXEC` 和 4 KiB 用户页；没有页缓存、共享文件页、异步 I/O、`ET_DYN`/ASLR、动态解释器、重定位、TLS、完整 Linux auxv、VDSO、按需扩栈/分页或 LoongArch 物化器。

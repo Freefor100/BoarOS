@@ -27,8 +27,8 @@
 *.profdata
 *.gcda
 *.gcno
-core
-core.*
+/core
+/core.*
 
 # Local editor and operating-system metadata.
 .DS_Store

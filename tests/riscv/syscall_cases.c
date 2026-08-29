@@ -66,7 +66,7 @@ static unsigned long run_exit_cases(void)
 
 static unsigned long run_unknown_cases(void)
 {
-    static const uint64_t numbers[] = {0U, 94U, 173U, UINT64_MAX};
+    static const uint64_t numbers[] = {0U, 94U, 174U, UINT64_MAX};
     struct kernel_syscall_request request = {0};
     struct kernel_syscall_result result;
     unsigned long failures = 0U;
@@ -87,11 +87,61 @@ static unsigned long run_unknown_cases(void)
     return failures;
 }
 
+static unsigned long run_process_decode_cases(void)
+{
+    struct kernel_task *caller = (struct kernel_task *)(uintptr_t)1U;
+    struct kernel_syscall_request request = {
+        .number = 220U,
+        .arguments = {17U, 0U, 0U, 0U, 0U, 0U},
+    };
+    struct kernel_syscall_result result;
+    unsigned long failures = 0U;
+
+    if (kernel_syscall_dispatch(caller, &request, &result) !=
+            KERNEL_SYSCALL_STATUS_OK ||
+        result_changed(&result, KERNEL_SYSCALL_ACTION_CLONE, 0)) {
+        failures++;
+    }
+    request.arguments[0] = 0x111U;
+    if (kernel_syscall_dispatch(caller, &request, &result) !=
+            KERNEL_SYSCALL_STATUS_OK ||
+        result_changed(&result, KERNEL_SYSCALL_ACTION_RETURN, -95)) {
+        failures++;
+    }
+    request.arguments[0] = 18U;
+    if (kernel_syscall_dispatch(caller, &request, &result) !=
+            KERNEL_SYSCALL_STATUS_OK ||
+        result_changed(&result, KERNEL_SYSCALL_ACTION_RETURN, -22)) {
+        failures++;
+    }
+    request.arguments[0] = UINT64_C(1) << 40U;
+    if (kernel_syscall_dispatch(caller, &request, &result) !=
+            KERNEL_SYSCALL_STATUS_OK ||
+        result_changed(&result, KERNEL_SYSCALL_ACTION_RETURN, -22)) {
+        failures++;
+    }
+    request.arguments[0] = 17U;
+    request.arguments[1] = 0x1000U;
+    if (kernel_syscall_dispatch(caller, &request, &result) !=
+            KERNEL_SYSCALL_STATUS_OK ||
+        result_changed(&result, KERNEL_SYSCALL_ACTION_RETURN, -95)) {
+        failures++;
+    }
+    request.number = 260U;
+    if (kernel_syscall_dispatch(caller, &request, &result) !=
+            KERNEL_SYSCALL_STATUS_OK ||
+        result_changed(&result, KERNEL_SYSCALL_ACTION_WAIT4, 0)) {
+        failures++;
+    }
+    return failures;
+}
+
 unsigned long run_syscall_cases(void)
 {
     unsigned long failures = run_invalid_argument_cases();
 
     failures += run_exit_cases();
     failures += run_unknown_cases();
+    failures += run_process_decode_cases();
     return failures;
 }

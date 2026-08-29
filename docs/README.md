@@ -10,8 +10,8 @@
 | [RISC-V 启动模块](modules/riscv-boot.md) | 当前启动代码的入口、契约、不变量和限制 |
 | [RISC-V Trap 模块](modules/riscv-trap.md) | S/U-mode Trap Frame、换栈、返回、诊断契约和测试 |
 | [RISC-V Timer 与内核 Tick 模块](modules/riscv-timer.md) | DTB timebase、SBI TIME、deadline、生产 timer trap 和 tick 契约 |
-| [内核线程调度模块](modules/kernel-scheduler.md) | RISC-V switch context、单 hart FIFO 抢占、任务身份、进程资源接管和退出回收契约 |
-| [系统调用解码模块](modules/kernel-syscall.md) | 显式调用任务、文件 I/O、exit/uname/getpid/gettid 与未知系统调用契约 |
+| [内核调度与进程生命周期模块](modules/kernel-scheduler.md) | RISC-V switch context、FIFO 抢占、父子树、clone/wait、zombie/reparent 和失败回收契约 |
+| [系统调用解码模块](modules/kernel-syscall.md) | 显式调用任务、文件 I/O、身份、clone/exec/wait 与未知系统调用契约 |
 | [DTB 与启动内存布局模块](modules/dtb-memory.md) | RAM、静态保留区、VirtIO transport 与可用物理区间的接口和限制 |
 | [物理页分配模块](modules/physical-pages.md) | 启动分配、buddy 连续页、所有权与失败语义 |
 | [内核堆模块](modules/kernel-heap.md) | size-class slab、大对象 buddy 后备、统计和生命周期 |
@@ -23,10 +23,12 @@
 | [内核 MM 模块](modules/kernel-mm.md) | 跨架构 MM 句柄、RISC-V Sv39 后端、共享引用和可重试回收契约 |
 | [用户内存访问模块](modules/kernel-uaccess.md) | 用户范围、双向与字符串跨页复制、错误分类、并发与性能边界 |
 | [用户 ELF64 装载模块](modules/user-elf.md) | 有界 ELF64 解析、RISC-V 静态映像物化、权限和失败所有权契约 |
+| [进程映像替换模块](modules/kernel-exec.md) | Linux `execve` 准备事务、提交点、映像替换和 close-on-exec 契约 |
 | [RISC-V 启动学习总结](learning/riscv-boot.md) | 启动知识、BoarOS 的应用方式、平台差异和调试经验 |
 | [RISC-V Trap 学习总结](learning/riscv-traps.md) | Trap CSR、上下文保存、异常返回、中断确认和项目选择 |
 | [RISC-V 时间与周期 Tick 学习总结](learning/riscv-time.md) | timebase、clockevent、SBI/Sstc、周期 tick、性能和平台事实 |
 | [内核线程与抢占调度学习总结](learning/kernel-scheduling.md) | Trap/switch context、psABI、线程状态、栈所有权和 timer 抢占 |
+| [进程生命周期学习总结](learning/process-lifecycle.md) | fork/clone、资源复制与共享、zombie/wait、reparent、失败所有权和性能边界 |
 | [内存管理学习总结](learning/memory-management.md) | 内存与分页知识、架构能力、项目选择和验证依据 |
 | [RISC-V 用户态与系统调用学习总结](learning/riscv-user-mode.md) | 特权边界、首次进入、地址空间、系统调用 ABI 和故障隔离 |
 | [ELF 用户程序装载学习总结](learning/elf-loading.md) | ELF 形态、装载段、BSS、页权限、用户初始栈和比赛输入依据 |

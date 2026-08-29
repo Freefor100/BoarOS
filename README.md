@@ -15,14 +15,14 @@ BoarOS 是一个从零搭建，面向 OS Comp 能力建设的 C 语言（少量 
 - RISC-V 内核 ELF 链接到 Sv39 高半区 `0xffffffff80000000`，QEMU 当前仍从物理地址 `0x80200000` 装载和进入；内核先用只覆盖切换所需低/高别名的过渡页表迁移 PC、栈、`gp` 和 `stvec`，再切换到只含高半区内核、从 `0xffffffc000000000` 开始的 128 GiB RAM direct map 和平台 MMIO 的最终页表。
 - Sv39 建表器按条件组合 2 MiB 与 4 KiB 叶子；最终页表不保留低地址映射，QEMU `virt` UART 的物理 MMIO 通过 `0xffffffe000000000` 的 supervisor-only 高半区别名访问。运行期用户地址空间拥有低半区 4 KiB U 页和页表页、借用包含 UART 在内的最终内核高半区根项，并以 ASID 0 全局刷新方式切换 `satp`。
 - 最终地址空间建立后，内核先把 boot context 初始化为 idle，再通过 SBI TIME 设置绝对 deadline，以 100 Hz 策略处理 supervisor timer interrupt；迟到时按原 deadline 相位一次补记 elapsed tick，并把同一 elapsed 交给 scheduler。
-- RISC-V switch context 按 psABI 保存 `ra/sp/tp/s0..s11`，其中内核 `tp` 固定指向 current task。普通内核/用户任务各使用一个私有 4 KiB 页承载控制块、canary 和内核栈；生产用户任务同时拥有文件表、文件系统上下文和带引用计数的通用 MM，RISC-V MM 后端用一个 4 KiB 记录页拥有 Sv39 地址空间。单 hart FIFO scheduler 每 tick 最多抢占切换一次，直接使用任务缓存的 `satp`，热路径不执行进程资源生命周期操作。退出完成记录保存独立的 TID/TGID 快照，boot idle 再按 files、fs context、MM 引用、TID、任务页的顺序回收；复合失败保留可重试 owner。无根盘时生产内核保持 timer-idle，有根盘时该记录用于在完整回收后识别 PID 1。
-- Linux 风格系统调用边界显式接收当前调用任务，支持 `openat(56)`、`close(57)`、`read(63)`、`exit(93)`、`uname(160)`、`getpid(172)` 和 `gettid(178)`，未知调用返回 `-ENOSYS`。`uname` 通过任务只读借用的 MM 复制 Linux 390 字节 `new_utsname`；文件调用借用同一任务的 files/fs/MM，并保留正常 Linux 返回值与内核状态错误的边界。当前首线程的 TID 与 TGID 相同，取值来自可回收的 1..32768 位图分配器。用户同步故障只终止当前任务并保留 `scause/stval` 完成记录，S-mode 未处理故障仍为内核 fatal。
-- 有界 ELF64 解析器通过带总长度的 `read_at` 来源解码并校验 ELF header 与 program header，内存和 VFS 文件共用同一语义；RISC-V 装载器支持静态、小端 ELF64 `ET_EXEC`，把 `PT_LOAD` 按页直接读入独立 Sv39 用户地址空间，按页合并权限并执行 W^X 检查、补零 BSS，再根据带长度的参数请求建立 Linux 形态的 `argc/argv/envp/auxv` 初始栈。用户栈预留低半区顶端 8 MiB 虚拟区间，初次只提交容纳至多 128 KiB 栈镜像并额外向下留出 64 KiB 的页，预留区下方保持一页永久 guard；动态链接、TLS、随机数和按需扩栈尚未支持。
-- RISC-V QEMU 路径从 DTB transport 初始化第一个 modern VirtIO MMIO block device，使用一个 size 8 split queue、最多一个 outstanding request 和一秒轮询超时提供同步只读块 I/O。VFS 在 BoarOS 自有接口后私有接入 lwext4，把 raw whole-disk ext4 只读挂载为根；需要 journal recovery 的镜像以 `-EUCLEAN` 拒绝。进程文件表把 fd 槽与 open file description 分开，初始 32 槽、按倍数增长至 1024，保存独立 offset 与 `O_CLOEXEC`；fs context 当前借用根 mount、cwd 为 `/`。绝对路径忽略 dirfd，相对路径只支持 `AT_FDCWD`；只读普通文件可经 4 KiB staging buffer 读取，offset 只提交实际复制到用户空间的字节。
-- 生产内核打开并检查可执行普通文件 `/init`，从 VFS 来源装载为 PID 1，并把文件表、fs context 和 MM 一起交给任务。PID 1 会从真实根盘执行 `openat/read/close`；退出后 scheduler 先关闭 fd 并回收进程资源，再卸载文件系统、复位设备、核对 heap/物理页基线并通过 SBI 关机。
-- 自动测试除启动、物理页、分页、Trap、timer 和内核任务状态外，还验证共享 MM 引用、位图 PID 分配，以及记录页访问/释放与页表回收的复合失败，要求状态可重试且页所有权不丢失；uaccess 聚焦测试覆盖双向与字符串跨页前缀复制、整体用户范围、权限、未映射页和内核状态错误。进程文件测试使用真实 modern VirtIO/ext4，覆盖路径与 flags errno、最低 fd 复用和扩容、独立 offset、超过一页的跨页 read、部分 fault、EOF、统计与清理重试。两个共享 MM 但使用不同用户栈和身份的任务会真实进入 U-mode，经 timer 抢占到内核 worker 后恢复，核对寄存器、身份、跨页 `uname`、用户故障、未知 syscall 和退出；另一组测试独立链接完整静态 ELF，验证装载段、参数栈与权限故障。所有路径最终要求完成记录正确且 files/fs/MM/用户/任务页与 TID 全部回收。
+- RISC-V switch context 按 psABI 保存 `ra/sp/tp/s0..s11`，其中内核 `tp` 固定指向 current task。普通内核/用户任务各使用一个私有 4 KiB 页承载控制块、canary 和内核栈；生产用户任务拥有 MM、文件表、fs context、身份和父子关系。单 hart FIFO scheduler 每 tick 最多抢占一次，直接使用任务缓存的 `satp`，热路径不遍历进程树或执行资源生命周期操作。wait 无事件时把父进程置为 BLOCKED，子进程退出后唤醒；已清掉重资源的子进程以 zombie 保留 PID、wait status 和任务页，父进程 wait 后最终回收。复合清理失败由 idle 按 owner 状态重试。
+- Linux 风格系统调用边界显式接收当前调用任务，支持 `openat(56)`、`close(57)`、`read(63)`、`exit(93)`、`uname(160)`、`getpid(172)`、`getppid(173)`、`gettid(178)`、普通进程 `clone(220)`、`execve(221)` 和 `wait4(260)`，未知调用返回 `-ENOSYS`。clone 当前只接受 `SIGCHLD` 进程形态：子 MM eager 深复制，fd 表和 cwd 独立复制，open file description/offset 共享；子进程退出或同步故障产生 Linux 形态 wait status，孙进程在中间父进程退出后 reparent 到 PID 1。每个进程仍是单成员线程组，TID/TGID 来自可回收的 1..32768 位图。
+- 有界 ELF64 解析器通过带总长度的 `read_at` 来源解码并校验 ELF header 与 program header，内存和 VFS 文件共用同一语义；RISC-V 装载器支持静态、小端 ELF64 `ET_EXEC`，把 `PT_LOAD` 按页直接读入独立 Sv39 用户地址空间，按页合并权限并执行 W^X 检查、补零 BSS，再根据带长度的文件名和参数请求建立含 `AT_EXECFN` 的 Linux 形态 `argc/argv/envp/auxv` 初始栈。用户栈预留低半区顶端 8 MiB 虚拟区间，初次只提交容纳至多 128 KiB 栈镜像并额外向下留出 64 KiB 的页，预留区下方保持一页永久 guard；动态链接、TLS、随机数和按需扩栈尚未支持。
+- RISC-V QEMU 路径从 DTB transport 初始化第一个 modern VirtIO MMIO block device，使用一个 size 8 split queue、最多一个 outstanding request 和一秒轮询超时提供同步只读块 I/O。VFS 在 BoarOS 自有接口后私有接入 lwext4，把 raw whole-disk ext4 只读挂载为根；需要 journal recovery 的镜像以 `-EUCLEAN` 拒绝。进程文件表把 fd 槽与 open file description 分开，初始 32 槽、按倍数增长至 1024，保存独立 offset 与 `O_CLOEXEC`；exec 提交时先逻辑摘除 CLOEXEC fd，普通 fd 与 offset 保持。fs context 当前借用根 mount、cwd 为 `/`。绝对路径忽略 dirfd，相对路径只支持 `AT_FDCWD`；只读普通文件可经 4 KiB staging buffer 读取，offset 只提交实际复制到用户空间的字节。
+- 生产内核打开并检查可执行普通文件 `/init`，从 VFS 来源装载为 PID 1，并把文件表、fs context 和 MM 一起交给任务。用户 `execve` 先在旧 MM 上完成路径打开、argv/envp 快照和新映像准备，再由 scheduler 切换 `satp`、替换 MM 和完整 Trap Frame；失败保持旧映像，成功不返回并保留 PID/TID、cwd 与非 CLOEXEC fd。生产测试中的 PID 1 从真实根盘连续进入 `/init -> stage2 -> stage3`，第三段再创建并回收多组父子/孙进程；所有后代和 PID 1 回收后才卸载文件系统、复位设备、核对 heap/物理页基线并通过 SBI 关机。
+- 自动测试除启动、物理页、分页、Trap、timer 和调度状态外，还验证 MM 共享引用与 fork 深复制、父子独立写、fd 表复制/OFD offset 共享、PID 分配、clone 双返回、PPID、wait selector、WNOHANG/阻塞唤醒、zombie、reparent、退出/故障 status 和 EFAULT 后回收。各资源层的访问/释放失败注入要求状态可重试且 owner 不丢失；三映像真实 ext4 链继续覆盖 exec 失败原子性、`AT_EXECFN`、寄存器重置、身份/fd 保持和旧 MM 清理。最终要求 exec/files/fs/MM/用户页/任务页/TID、heap 和 mount 全部回到基线。
 
-当前只支持 RISC-V64 单 hart、QEMU `virt`、Sv39/4 KiB 用户页、S/U 整数 Trap Frame、SBI timer/100 Hz tick、单页内核栈与 FIFO 抢占、每个用户任务为单成员线程组，以及 raw whole-disk 只读 ext4 上的静态 `ET_EXEC` `/init`。调用者已经能把 acquire 得到的 MM 引用交给多个任务，但尚无从 current task 派生子任务的 `clone`、同组多线程、父子/zombie/wait 或完整 Linux 进程生命周期。现有文件层只支持任务私有 fd 表、单根 cwd、只读普通文件和 `openat/read/close`，没有目录 fd、dup/共享表、write、页缓存、symlink、分区表或并发访问；uaccess 没有按需缺页、并发 unmap/COW 或 SUM 快路径。`execve`、动态链接、阻塞与唤醒、外部中断、SMP、开发板和 LoongArch64 也尚未实现。完整比赛 Harness 仍会因缺少 `kernel-la` 失败。
+当前只支持 RISC-V64 单 hart、QEMU `virt`、Sv39/4 KiB 用户页、S/U 整数 Trap Frame、SBI timer/100 Hz tick、单页内核栈与 FIFO 抢占、单成员线程组、普通 `SIGCHLD` clone，以及 raw whole-disk 只读 ext4 上的静态 `ET_EXEC`。尚无 COW、`CLONE_VM/CLONE_FILES/CLONE_THREAD`、信号投递、futex、vfork、rusage、停止/继续事件或多线程 exec 收拢；ELF 暂不支持 PIE/动态解释器、shebang、TLS 或 `execveat`。文件层没有目录 fd、dup/共享整表、write、页缓存、symlink、分区表或并发访问；uaccess 没有按需缺页、并发 unmap 或 SUM 快路径。外部中断、SMP、开发板和 LoongArch64 也尚未实现，完整比赛 Harness 仍会因缺少 `kernel-la` 失败。
 
 ## 构建与运行
 
@@ -50,6 +50,7 @@ make test-lwext4-host
 make test-user-elf-cases-riscv
 make test-user-elf-riscv
 make test-root-init-riscv
+make test-exec-riscv
 make test-mm-riscv
 make test-user-riscv
 make test-user-fatal-riscv
@@ -64,18 +65,18 @@ make test-trap-return-riscv
 make test-references
 ```
 
-`make run-riscv` 不附加根盘，启动成功后持续在 timer-idle 中等待，需要由人退出 QEMU。`make test-root-init-riscv` 会建立真实 ext4 镜像，显式启用 modern VirtIO MMIO，把测试 ELF 和数据文件写入根盘，并验证参数栈、文件 syscall、退出状态、遗留 fd 回收和 SBI 关机。`make debug-riscv` 使用 `-S -s` 启动 QEMU：虚拟 CPU 会暂停并在宿主 TCP 端口 1234 等待 GDB，因此命令也不会自行返回。
+`make run-riscv` 不附加根盘，启动成功后持续在 timer-idle 中等待，需要由人退出 QEMU。`make test-root-init-riscv` 会建立真实 ext4 镜像，显式启用 modern VirtIO MMIO，把三个测试 ELF 和数据文件写入根盘，并验证连续 exec、参数栈、文件 syscall、退出状态、资源回收和 SBI 关机；`make test-exec-riscv` 还运行提交后旧 MM 首次释放失败的故障注入版本。`make debug-riscv` 使用 `-S -s` 启动 QEMU：虚拟 CPU 会暂停并在宿主 TCP 端口 1234 等待 GDB，因此命令也不会自行返回。
 
 ## 近期方向
 
-下一步在当前 files/fs/MM 资源模型上形成用户可调用的 `execve` 闭环，落实 ELF 替换、参数复制、close-on-exec 和失败原子性，再推进 `fork/clone/wait` 父子进程生命周期；RISC-V64 + OpenSBI 主路径稳定后，实现 LoongArch64 16 KiB/三级页表和对应 context/trap。
+近期方向是在现有普通进程闭环上继续扩展 Linux ABI；COW、信号、更多文件 syscall 与多线程共享语义按后续阶段的真实用户程序需求排序。RISC-V64 + OpenSBI 主路径稳定后，实现 LoongArch64 16 KiB/三级页表和对应 context/trap；开发板到手后验证固件交接、DTB、设备与真实 TLB/中断性能。
 
 ## 文档
 
 - [RISC-V 启动模块](docs/modules/riscv-boot.md)
 - [RISC-V Trap 模块](docs/modules/riscv-trap.md)
 - [RISC-V Timer 与内核 Tick 模块](docs/modules/riscv-timer.md)
-- [内核线程调度模块](docs/modules/kernel-scheduler.md)
+- [内核调度与进程生命周期模块](docs/modules/kernel-scheduler.md)
 - [系统调用解码模块](docs/modules/kernel-syscall.md)
 - [DTB 与启动内存布局模块](docs/modules/dtb-memory.md)
 - [物理页分配模块](docs/modules/physical-pages.md)
@@ -88,10 +89,12 @@ make test-references
 - [内核 MM 模块](docs/modules/kernel-mm.md)
 - [用户内存访问模块](docs/modules/kernel-uaccess.md)
 - [用户 ELF64 装载模块](docs/modules/user-elf.md)
+- [进程映像替换模块](docs/modules/kernel-exec.md)
 - [RISC-V 启动学习总结](docs/learning/riscv-boot.md)
 - [RISC-V Trap 学习总结](docs/learning/riscv-traps.md)
 - [RISC-V 时间与周期 Tick 学习总结](docs/learning/riscv-time.md)
 - [内核线程与抢占调度学习总结](docs/learning/kernel-scheduling.md)
+- [进程生命周期学习总结](docs/learning/process-lifecycle.md)
 - [内存管理学习总结](docs/learning/memory-management.md)
 - [RISC-V 用户态与系统调用学习总结](docs/learning/riscv-user-mode.md)
 - [ELF 用户程序装载学习总结](docs/learning/elf-loading.md)

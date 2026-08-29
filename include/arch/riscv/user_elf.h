@@ -2,6 +2,7 @@
 #define BOAROS_ARCH_RISCV_USER_ELF_H
 
 #include <arch/riscv/sv39.h>
+#include <kernel/exec_image.h>
 #include <kernel/page.h>
 #include <kernel/physical_page.h>
 #include <kernel/read_source.h>
@@ -39,16 +40,12 @@ struct riscv_user_elf_entry {
     uint64_t stack_pointer;
 };
 
-struct riscv_user_elf_string {
-    const char *bytes;
-    size_t length;
-};
-
 struct riscv_user_elf_request {
     struct kernel_read_source source;
-    const struct riscv_user_elf_string *arguments;
+    struct kernel_exec_string executable;
+    const struct kernel_exec_string *arguments;
     size_t argument_count;
-    const struct riscv_user_elf_string *environment;
+    const struct kernel_exec_string *environment;
     size_t environment_count;
 };
 
@@ -63,5 +60,14 @@ enum riscv_user_elf_status riscv_user_elf_load(
     const struct riscv_sv39_page_table *kernel_table,
     struct riscv_sv39_user_space *space,
     struct riscv_user_elf_entry *entry);
+
+/* image_failure preserves the pre-cleanup result when cleanup must retry. */
+enum riscv_user_elf_status riscv_user_elf_load_detailed(
+    const struct riscv_user_elf_request *request,
+    struct physical_page_allocator *allocator,
+    const struct riscv_sv39_page_table *kernel_table,
+    struct riscv_sv39_user_space *space,
+    struct riscv_user_elf_entry *entry,
+    enum riscv_user_elf_status *image_failure);
 
 #endif

@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 struct kernel_file_slot;
+struct kernel_files_record;
 struct kernel_fs_context;
 struct kernel_heap;
 struct kernel_mm;
@@ -43,17 +44,22 @@ struct kernel_files_statistics {
 
 struct kernel_files {
     struct kernel_heap *heap;
-    struct kernel_file_slot *slots;
-    struct kernel_open_file_description *cleanup_files;
-    void *cleanup_allocations;
-    struct kernel_files_statistics statistics;
-    uint32_t next_fd;
+    struct kernel_files_record *record;
     enum kernel_files_state state;
 };
 
 enum kernel_files_status kernel_files_create(
     struct kernel_files *files,
     struct kernel_heap *heap);
+
+/* Copy descriptor slots while sharing their open-file descriptions. */
+enum kernel_files_status kernel_files_fork(
+    struct kernel_files *destination,
+    const struct kernel_files *source);
+
+enum kernel_files_status kernel_files_move(
+    struct kernel_files *destination,
+    struct kernel_files *source);
 
 int kernel_files_is_live(const struct kernel_files *files);
 
@@ -80,6 +86,10 @@ enum kernel_files_status kernel_files_close(
     struct kernel_files *files,
     int64_t fd,
     int64_t *linux_result);
+
+/* All marked descriptors become unreachable even when cleanup must retry. */
+enum kernel_files_status kernel_files_close_on_exec(
+    struct kernel_files *files);
 
 void kernel_files_get_statistics(
     const struct kernel_files *files,

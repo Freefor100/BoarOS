@@ -129,6 +129,16 @@ enum riscv_sv39_status riscv_sv39_user_space_satp(
     const struct riscv_sv39_user_space *space,
     uint64_t *satp);
 
+/*
+ * Build an independent copy of every mapped user page.  The destination
+ * borrows the same kernel root entries as source.  After initialization,
+ * failure may leave destination as a LIVE or CLEANUP owner for the caller to
+ * destroy.
+ */
+enum riscv_sv39_status riscv_sv39_user_space_fork(
+    struct riscv_sv39_user_space *destination,
+    const struct riscv_sv39_user_space *source);
+
 /* Success consumes a LIVE or CLEANUP source; failure changes neither object. */
 enum riscv_sv39_status riscv_sv39_user_space_move(
     struct riscv_sv39_user_space *destination,

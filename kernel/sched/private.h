@@ -1,0 +1,99 @@
+#ifndef BOAROS_KERNEL_SCHED_PRIVATE_H
+#define BOAROS_KERNEL_SCHED_PRIVATE_H
+
+#include <arch/riscv/context.h>
+#include <arch/riscv/thread.h>
+#include <kernel/files.h>
+#include <kernel/fs_context.h>
+#include <kernel/mm.h>
+#include <kernel/physical_page.h>
+#include <kernel/pid.h>
+#include <kernel/scheduler.h>
+#include <kernel/task.h>
+
+#include <stdint.h>
+
+#define KERNEL_SCHEDULER_INITIALIZED UINT32_C(0x53434844)
+#define KERNEL_THREAD_MAGIC UINT64_C(0x424f415254485244)
+#define KERNEL_STACK_CANARY UINT64_C(0x535441434b4f4b21)
+#define KERNEL_THREAD_NO_PAGE UINT64_MAX
+#define KERNEL_THREAD_MINIMUM_STACK 512U
+#define KERNEL_PID_LIMIT 32768U
+
+struct kernel_exec_transaction;
+
+enum kernel_thread_state {
+    KERNEL_THREAD_STATE_IDLE = 0,
+    KERNEL_THREAD_STATE_READY,
+    KERNEL_THREAD_STATE_RUNNING,
+    KERNEL_THREAD_STATE_BLOCKED,
+    KERNEL_THREAD_STATE_EXITED,
+    KERNEL_THREAD_STATE_ZOMBIE,
+};
+
+struct kernel_task {
+    struct riscv_thread_state arch;
+    uint64_t magic;
+    uint64_t physical_address;
+    uintptr_t stack_low;
+    uintptr_t stack_high;
+    struct kernel_task *next;
+    struct kernel_task *parent;
+    struct kernel_task *first_child;
+    struct kernel_task *last_child;
+    struct kernel_task *previous_sibling;
+    struct kernel_task *next_sibling;
+    uint32_t state;
+    uint32_t idle;
+    kernel_pid_t tid;
+    kernel_pid_t process_group;
+    uint32_t tid_owned;
+    uint32_t publish_completion;
+    uint32_t wait_status;
+    struct kernel_task *group_leader;
+    uint32_t group_members;
+    struct kernel_thread_completion completion;
+    struct kernel_files files;
+    struct kernel_fs_context fs;
+    struct kernel_mm mm;
+    struct kernel_exec_transaction *exec_transaction;
+    struct riscv_switch_context context;
+} __attribute__((aligned(16)));
+
+struct kernel_scheduler {
+    uint32_t initialized;
+    uint32_t idle_context_saved;
+    uint64_t kernel_satp;
+    struct physical_page_allocator *allocator;
+    struct kernel_pid_allocator pid_allocator;
+    uint64_t pid_bitmap[KERNEL_PID_BITMAP_WORDS(KERNEL_PID_LIMIT)];
+    struct kernel_task idle;
+    struct kernel_task *current;
+    struct kernel_task *ready_head;
+    struct kernel_task *ready_tail;
+    struct kernel_task *exited_head;
+    struct kernel_task *exited_tail;
+    struct kernel_task *init_task;
+    uint64_t cleanup_page_address;
+    uint32_t cleanup_page_owned;
+    enum kernel_scheduler_status fatal_status;
+    struct riscv_switch_context discard_context;
+};
+
+extern struct kernel_scheduler scheduler;
+
+uintptr_t align_up_16(uintptr_t value);
+void clear_page(void *pointer);
+void ready_append(struct kernel_task *thread);
+struct kernel_task *ready_pop(void);
+enum kernel_scheduler_status activate_thread_address_space(
+    const struct kernel_task *thread);
+enum kernel_scheduler_status validate_queues(void);
+enum kernel_scheduler_status release_after_create_failure(
+    uint64_t physical_address,
+    enum kernel_scheduler_status original_status);
+enum kernel_scheduler_status validate_current(void);
+enum kernel_task_status validate_task_resource_borrow(
+    const struct kernel_task *task);
+
+#endif

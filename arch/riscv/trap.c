@@ -1,3 +1,4 @@
+#include <arch/riscv/process.h>
 #include <arch/riscv/sbi.h>
 #include <arch/riscv/timer.h>
 #include <arch/riscv/trap.h>
@@ -111,6 +112,41 @@ void riscv_trap_dispatch(struct riscv_trap_frame *frame)
             kernel_user_thread_exit(KERNEL_THREAD_EXIT_SYSCALL,
                                     (uint64_t)result.value,
                                     0U);
+        }
+        if (result.action == KERNEL_SYSCALL_ACTION_EXEC) {
+            enum kernel_scheduler_status scheduler_status =
+                kernel_scheduler_exec_commit();
+
+            if (scheduler_status != KERNEL_SCHEDULER_STATUS_OK) {
+                riscv_scheduler_fatal(frame, scheduler_status);
+            }
+            return;
+        }
+        if (result.action == KERNEL_SYSCALL_ACTION_CLONE) {
+            enum kernel_scheduler_status scheduler_status =
+                riscv_process_clone_current(
+                    frame,
+                    request.arguments[1],
+                    &result.value);
+
+            if (scheduler_status != KERNEL_SCHEDULER_STATUS_OK) {
+                riscv_scheduler_fatal(frame, scheduler_status);
+            }
+            result.action = KERNEL_SYSCALL_ACTION_RETURN;
+        }
+        if (result.action == KERNEL_SYSCALL_ACTION_WAIT4) {
+            enum kernel_scheduler_status scheduler_status =
+                kernel_scheduler_wait4_current(
+                    (int64_t)(int32_t)(uint32_t)request.arguments[0],
+                    request.arguments[1],
+                    (uint32_t)request.arguments[2],
+                    request.arguments[3],
+                    &result.value);
+
+            if (scheduler_status != KERNEL_SCHEDULER_STATUS_OK) {
+                riscv_scheduler_fatal(frame, scheduler_status);
+            }
+            result.action = KERNEL_SYSCALL_ACTION_RETURN;
         }
         if (result.action != KERNEL_SYSCALL_ACTION_RETURN) {
             riscv_trap_fatal(frame);

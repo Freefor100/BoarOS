@@ -58,9 +58,9 @@ static enum kernel_scheduler_status create_elf_task(
     static const char argument_zero[] = "elf-probe";
     static const char argument_one[] = "hello";
     static const char environment_zero[] = "MODE=test";
-    struct riscv_user_elf_string arguments[2];
-    struct riscv_user_elf_string environment[1];
-    struct riscv_user_elf_request request;
+    struct kernel_exec_string arguments[2];
+    struct kernel_exec_string environment[1];
+    struct riscv_user_elf_request request = {0};
     struct riscv_sv39_user_space space = {0};
     struct kernel_mm mm = {0};
     struct riscv_user_elf_entry entry;

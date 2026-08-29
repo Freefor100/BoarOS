@@ -191,6 +191,102 @@ enum kernel_mm_status kernel_mm_acquire(
     return KERNEL_MM_STATUS_OK;
 }
 
+static enum kernel_mm_status fork_status_from_sv39(
+    enum riscv_sv39_status status)
+{
+    if (status == RISCV_SV39_STATUS_NO_MEMORY) {
+        return KERNEL_MM_STATUS_NO_MEMORY;
+    }
+    if (status == RISCV_SV39_STATUS_INVALID) {
+        return KERNEL_MM_STATUS_INVALID_ARGUMENT;
+    }
+    return KERNEL_MM_STATUS_ADDRESS_SPACE;
+}
+
+enum kernel_mm_status kernel_mm_fork(
+    struct kernel_mm *destination,
+    const struct kernel_mm *source)
+{
+    struct riscv_kernel_mm_record *source_record;
+    struct riscv_kernel_mm_record *destination_record;
+    uint64_t record_page_address;
+    void *pointer;
+    enum physical_page_status page_status;
+    enum kernel_mm_status status;
+    enum kernel_mm_status failure;
+    enum riscv_sv39_status sv39_status;
+
+    if (destination == 0 || source == 0 || destination == source) {
+        return KERNEL_MM_STATUS_INVALID_ARGUMENT;
+    }
+    if (!empty_handle(destination) || source->state != KERNEL_MM_LIVE) {
+        return KERNEL_MM_STATUS_STATE;
+    }
+    status = resolve_record(source, &source_record);
+    if (status != KERNEL_MM_STATUS_OK ||
+        source_record->stage != RISCV_KERNEL_MM_RECORD_LIVE) {
+        return status == KERNEL_MM_STATUS_OK ? KERNEL_MM_STATUS_STATE
+                                             : status;
+    }
+    page_status = physical_page_allocate(source->allocator,
+                                         &record_page_address);
+    if (page_status == PHYSICAL_PAGE_STATUS_EMPTY) {
+        return KERNEL_MM_STATUS_NO_MEMORY;
+    }
+    if (page_status != PHYSICAL_PAGE_STATUS_OK) {
+        return KERNEL_MM_STATUS_STATE;
+    }
+    if (physical_page_resolve(source->allocator,
+                              record_page_address,
+                              &pointer) != PHYSICAL_PAGE_STATUS_OK) {
+        return abandon_unresolved_record(destination,
+                                         source->allocator,
+                                         record_page_address,
+                                         KERNEL_MM_STATUS_PAGE_ACCESS);
+    }
+    clear_page(pointer);
+    destination_record = pointer;
+    destination_record->magic = RISCV_KERNEL_MM_RECORD_MAGIC;
+    destination_record->references = 1U;
+    destination_record->stage = RISCV_KERNEL_MM_RECORD_LIVE;
+    sv39_status = riscv_sv39_user_space_fork(
+        &destination_record->space,
+        &source_record->space);
+    if (sv39_status == RISCV_SV39_STATUS_OK) {
+        destination->allocator = source->allocator;
+        destination->record_page_address = record_page_address;
+        destination->state = KERNEL_MM_LIVE;
+        destination->cleanup_stage = KERNEL_MM_CLEANUP_NONE;
+        return KERNEL_MM_STATUS_OK;
+    }
+
+    failure = fork_status_from_sv39(sv39_status);
+    if (destination_record->space.state == RISCV_SV39_USER_SPACE_LIVE ||
+        destination_record->space.state == RISCV_SV39_USER_SPACE_CLEANUP) {
+        sv39_status = riscv_sv39_user_space_destroy(
+            &destination_record->space);
+        if (sv39_status != RISCV_SV39_STATUS_OK) {
+            destination_record->stage =
+                RISCV_KERNEL_MM_RECORD_SPACE_CLEANUP;
+            destination->allocator = source->allocator;
+            destination->record_page_address = record_page_address;
+            destination->state = KERNEL_MM_CLEANUP;
+            destination->cleanup_stage = KERNEL_MM_CLEANUP_SPACE;
+            return KERNEL_MM_STATUS_CLEANUP_REQUIRED;
+        }
+    }
+    if (physical_page_release(source->allocator,
+                              record_page_address) !=
+        PHYSICAL_PAGE_STATUS_OK) {
+        destination->allocator = source->allocator;
+        destination->record_page_address = record_page_address;
+        destination->state = KERNEL_MM_CLEANUP;
+        destination->cleanup_stage = KERNEL_MM_CLEANUP_RECORD;
+        return KERNEL_MM_STATUS_CLEANUP_REQUIRED;
+    }
+    return failure;
+}
+
 enum kernel_mm_status kernel_mm_move(
     struct kernel_mm *destination,
     struct kernel_mm *source)

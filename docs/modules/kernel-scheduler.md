@@ -1,133 +1,124 @@
-# 内核任务调度模块
+# 内核调度与进程生命周期模块
 
-本文描述当前单 hart 内核/用户任务、RISC-V switch context、FIFO 调度、任务身份和退出回收契约。执行现场与抢占原理见[内核线程与抢占调度学习总结](../learning/kernel-scheduling.md)，地址空间所有权见[内核 MM 模块](kernel-mm.md)。
+本文描述当前单 hart FIFO 调度、任务身份、父子关系、普通进程 clone、阻塞 wait、退出与 zombie 回收契约。执行现场原理见[内核线程与抢占调度学习总结](../learning/kernel-scheduling.md)，进程语义背景见[进程生命周期学习总结](../learning/process-lifecycle.md)，地址空间所有权见[内核 MM 模块](kernel-mm.md)。
 
 ## 范围与入口
 
 | 文件 | 当前职责 |
 |---|---|
-| `include/arch/riscv/context.h`、`arch/riscv/context.c` | 初始化 RISC-V switch context，提供 current `tp` 和 SIE 临界区操作 |
-| `include/arch/riscv/thread.h`、`arch/riscv/context_switch.S` | 定义 Trap 汇编可见的任务前缀，保存/恢复 `ra/sp/tp/s0..s11` |
-| `include/kernel/pid.h`、`kernel/pid.c` | 提供调用者给定位图的有界整数 ID 分配器 |
-| `include/kernel/task.h` | 暴露不透明 current task、TID/TGID 查询和当前用户任务的 MM/files/fs 借用 |
-| `include/kernel/scheduler.h`、`kernel/scheduler.c` | 管理 idle、任务页、FIFO 队列、MM/文件资源/身份所有权和完成回收 |
-| `arch/riscv/trap.c` | 在 timer tick 后调用 scheduler，并把 current task 传给 syscall 层 |
-| `kernel/main.c` | 在 timer 启动前初始化 scheduler，在 boot idle 栈上回收退出任务 |
+| `include/arch/riscv/context.h`、`arch/riscv/context.c` | 初始化 RISC-V switch context，提供 current `tp` 与 SIE 临界区操作 |
+| `include/arch/riscv/thread.h`、`arch/riscv/context_switch.S` | 定义 Trap 汇编可见任务前缀，保存/恢复 `ra/sp/tp/s0..s11` |
+| `include/arch/riscv/process.h` | 隔离依赖 RISC-V Trap Frame 的 clone 入口 |
+| `include/kernel/pid.h`、`kernel/pid.c` | 管理 1..32768 的可回收 PID/TID 位图 |
+| `include/kernel/task.h` | 暴露不透明 current task、TID/TGID/PPID 与当前资源借用 |
+| `kernel/sched/core.c` | idle、任务页、ready FIFO、tick 抢占和首次用户任务创建 |
+| `kernel/sched/process.c` | 父子链、clone/wait、BLOCKED/wakeup、exit/zombie/reap |
+| `kernel/sched/exec.c` | exec 映像提交 |
+| `kernel/sched/private.h` | scheduler 私有对象布局与跨实现文件接口 |
 
-主要接口为：
+主要进程接口为：
 
 ```c
-enum kernel_scheduler_status kernel_thread_create(
-    void (*entry)(void *), void *argument);
+enum kernel_scheduler_status riscv_process_clone_current(
+    const struct riscv_trap_frame *parent_frame,
+    uint64_t child_stack,
+    int64_t *linux_result);
 
-enum kernel_scheduler_status kernel_user_thread_create(
-    struct kernel_mm *mm,
-    struct kernel_files *files,
-    struct kernel_fs_context *fs,
-    uintptr_t entry,
-    uintptr_t stack_pointer,
-    uintptr_t thread_pointer);
+enum kernel_scheduler_status kernel_scheduler_wait4_current(
+    int64_t pid,
+    uint64_t status_address,
+    uint32_t options,
+    uint64_t rusage_address,
+    int64_t *linux_result);
 
-enum kernel_scheduler_status kernel_scheduler_on_tick(uint64_t elapsed_ticks);
-
-enum kernel_scheduler_status kernel_scheduler_reap_one(
-    struct kernel_thread_completion *completion);
-
-struct kernel_task *kernel_task_current(void);
-enum kernel_task_status kernel_task_tid(
-    const struct kernel_task *task, kernel_pid_t *tid);
-enum kernel_task_status kernel_task_tgid(
-    const struct kernel_task *task, kernel_pid_t *tgid);
-enum kernel_task_status kernel_task_mm_borrow(
-    const struct kernel_task *task, const struct kernel_mm **mm);
-enum kernel_task_status kernel_task_files_borrow(
-    struct kernel_task *task, struct kernel_files **files);
-enum kernel_task_status kernel_task_fs_context_borrow(
-    const struct kernel_task *task,
-    const struct kernel_fs_context **fs);
+void kernel_user_thread_exit(
+    enum kernel_thread_exit_reason reason,
+    uint64_t status,
+    uint64_t detail) __attribute__((noreturn));
 ```
 
-`struct kernel_task` 对公共调用者不透明。历史接口名中的 `thread` 仍表示创建或结束一条执行流；内部对象使用 task，因为它同时承载调度状态、Linux 身份关系和资源引用。
+RISC-V clone 接口接收 syscall 入口保存的完整寄存器快照；通用 scheduler 头不暴露架构 Trap Frame。普通任务创建、tick、exec、资源借用和 idle reaper 仍由 `include/kernel/scheduler.h` 与 `include/kernel/task.h` 提供。
 
-三个 borrow 接口只接受 scheduler 当前正在运行的用户任务和对应 LIVE 资源，不增加引用计数。MM/fs 借用只读，files 借用允许同步 syscall 更新 fd 表和 offset；调用者不得保存或释放这些指针。任务在内核调用链和 timer 抢占期间仍拥有资源，退出回收要等任务离开该调用链。这样 syscall 不在每次操作时修改资源引用，未来 SMP 必须把这些借用纳入 task、文件表与 MM 的读写侧生命周期保护。底层用户态探针允许 files/fs 同时缺席，并得到独立的 `RESOURCE_UNAVAILABLE`，生产用户任务必须同时拥有二者。
+## 任务对象与创建所有权
 
-## 创建和所有权
+每个非 idle 任务使用一张 4 KiB 物理页，页内依次是任务元数据、canary 和向下增长的内核栈。用户任务拥有独立 TID、单成员线程组、MM 句柄、files 句柄、fs context 与可选 exec 清理事务。生产创建要求入口具有 U+X，`SP-1` 具有 U+R+W，SP 按 16 字节对齐，MM 与文件资源使用 scheduler 的分配器。
 
-每个普通任务占用一张 4 KiB 物理页，页内依次放置任务元数据、128 字节 switch context、canary 和向下增长的内核栈。用户首次 context 指向预构造 Trap Frame，第一次被调度便经公共 Trap 返回路径 `sret` 进入 U-mode。
+创建先验证全部输入，再分配任务页、构造 Trap Frame/context 和 TID，最后移动 MM/files/fs owner 并发布到 ready 队列。成功消耗调用者传入的 owner；普通失败保留调用者资源。任务页立即归还失败时由 scheduler 的单页清理槽保留唯一 owner，idle reaper 重试后才允许下一次可能占用该槽的创建。
 
-用户任务创建要求：
+`struct kernel_task` 对公共层不透明。MM/fs 借用只读，files 借用允许同步 syscall 更新 fd 表和 open-file offset；借用不增引用，只在 current RUNNING 用户任务的内核调用链内有效。
 
-- MM 使用 scheduler 的物理页分配器，并能生成有效 RISC-V `satp`；
-- 入口按 RISC-V IALIGN 的 2 字节边界对齐，映射具有 U+X；
-- SP 按 psABI 的 16 字节边界对齐，`SP-1` 映射具有 U+R+W。
+## 普通 clone 的资源语义
 
-生产任务还要求 files 与 fs context 成对传入、都处于 LIVE、共享同一内核堆，并且该堆使用 scheduler 的物理页分配器。创建先完成 MM/入口/栈与资源验证，再分配和初始化任务页、分配 TID；全部可能失败的步骤结束后，才以不可失败的本地所有权转移同时接管 MM/files/fs 并入 ready FIFO。成功消耗全部传入 owner；任何失败都保留调用者的全部资源，并由 scheduler 回滚已经取得的任务页和 TID。若新任务页的立即释放也失败，scheduler 保存唯一待清理物理地址，并在清理完成前拒绝覆盖它。
+当前只接受 Linux RISC-V `clone(SIGCHLD, 0, 0, 0, 0)`，语义等同普通 fork 进程：
 
-内核任务和永久 idle 不分配 Linux PID/TID，也不持有用户 MM。
+- 子进程获得新 TID/TGID，线程组只有自己，进程组继承父进程；
+- RISC-V Trap Frame 完整复制，子进程 `a0=0`，父进程得到子 PID，两者都从 ecall 后一条指令继续；
+- MM 通过 `kernel_mm_fork()` 深复制用户叶子页和页表，父子同一 VA 与权限对应不同 PA；
+- fd 表和 descriptor flags 独立复制，open file description 引用共享，因此 offset 与底层 file 生命周期共享；
+- fs context 独立复制当前 cwd，并继续借用同一个 root mount；
+- exec 清理事务不继承。
 
-## TID、TGID 与 PID 分配
+构造过程在子任务进入父子树和 ready 队列前完成。失败先释放已经取得的 fs/files/MM/TID/任务页；不能立即完成的 owner 放入不发布 completion 的 exited 清理队列，父进程仍得到准确的 `-ENOMEM` 或 `-EAGAIN`，不会看到半构造子进程。
 
-位图分配器管理闭区间 `1..limit`，0 保留给内核内部无身份任务。Scheduler 当前用静态 4096 字节位图，limit 为 32768；循环游标优先从最近位置继续搜索，释放后的较小空位可以重新利用。耗尽、非法释放和重复释放都有独立状态，不伪造成功。
+当前 eager copy 的 fork 成本与已提交用户页数线性相关，并在复制期间关闭本 hart 中断；这是正确性基线，不是最终性能形态。稳定的 `kernel_mm_fork()` 边界允许以后换成 COW，而不改变 scheduler、files 或 wait ABI。
 
-每个现有用户任务创建为单成员线程组：`tid` 是任务 ID，`group_leader` 指向自身，TGID 等于组首 TID，`group_members=1`。这些字段和 MM 分开，因而以后 `clone` 可以独立选择共享地址空间和加入线程组；当前创建接口尚不接受 clone flags，也不会构造第二个组成员。
+## 父子树、状态与 wait
 
-## 初始化、临界区与热路径
+父任务保存双向兄弟链的首尾，子任务保存 parent、前后兄弟。进程路径在 clone、wait、reparent 与退出回收边界检查以下不变量：首尾同时为空或同时存在；首节点无前驱、尾节点无后继；每个节点反向指向同一父任务；链长不超过 PID 上限；链上任务拥有有效用户身份且不发布 boot completion。tick 热路径不遍历父子树。
 
-稳定启动顺序为：
+状态转换为：
 
 ```text
-final Sv39/direct map
--> bind physical-page access
--> scheduler_init(boot stack bounds)
--> timer_start
--> boot idle: reap until EMPTY -> wfi
+                      timer
+READY <------------------------------ RUNNING
+  ^                                      |
+  |                                      +-- wait4(no event) --> BLOCKED
+  |                                              |
+  +---------------- child event / wake ----------+
+
+RUNNING -- exit, cleanup complete, has parent --> ZOMBIE
+RUNNING -- exit, cleanup pending/no parent -----> EXITED
+EXITED  -- idle retry complete, has parent -----> ZOMBIE
+ZOMBIE  -- matching parent wait4 --------------> PID/task page released
+EXITED  -- parentless retry complete -----------> PID/task page released
 ```
 
-初始化要求当前 SP 位于传入 boot stack、SIE 已关闭、物理页分配器有效，且当前地址空间为 Bare 或 Sv39 ASID 0。成功后静态 idle 成为 current，内核 `tp` 固定指向 current task；用户 `tp` 只存在于 Trap Frame/`sscratch`。
+`wait4` 支持 `pid>0`、`pid==0`、`pid==-1` 和 `pid<-1` 的 Linux 选择规则，并接受 `WNOHANG/WUNTRACED/WCONTINUED/__WNOTHREAD/__WALL/__WCLONE` 位。当前没有 stopped/continued 事件，因此后两类选项只影响等待集合，不会制造事件。普通 SIGCHLD 子进程被 `__WCLONE` 排除，除非同时使用 `__WALL`。无匹配子进程返回 `-ECHILD`；有匹配但无事件时 `WNOHANG` 返回 0，否则父进程进入 BLOCKED，由子进程成为 zombie 时唤醒。
 
-创建接口保存并关闭 SIE，timer 和 reaper 则要求调用者已经关闭 SIE。它们串行化当前单 hart 的队列、ID、文件资源和 MM 生命周期；这不是 SMP 锁。接入多 hart 时必须在 runqueue、PID 位图、线程组、文件表和 MM 引用边界增加锁或采用 per-hart 结构。
+退出码编码为 `(status & 0xff) << 8`。用户同步故障转换为 SIGILL/SIGTRAP/SIGBUS/SIGSEGV 形态的 wait status。非空 rusage 当前返回 `-ENOTSUP`；未知 option 返回 `-EINVAL`，无法安全取负的 `INT32_MIN` pid 返回 `-ESRCH`。与 Linux 回收顺序一致，zombie 先被逻辑回收，再向用户复制 status；因此 status 指针错误返回 `-EFAULT` 时，该子进程也已不可再次 wait。
 
-任务在创建时缓存 `satp`。tick 和 context switch 不查询 MM、不增减引用、不遍历页表；目标 `satp` 与当前不同才调用切换函数。当前 ASID 0 会为地址空间切换执行全局 `SFENCE.VMA`，这是现阶段主要的切换成本。
+## 退出、reparent 与失败恢复
 
-## 状态、切换与退出
+用户任务退出时仍运行在自己的任务页栈上，不能释放该页。路径先切到稳定内核 `satp`，把现有子进程重新挂到仍存活的 PID 1；没有可用 PID 1 时，活子进程成为 parentless，已有 zombie 转入静默 exited 回收。随后按以下顺序释放重资源：
 
 ```text
-allocate -> READY -> RUNNING -> READY
-                         |
-                         +-> EXITED -> idle reaper -> release
-IDLE <------- ready empty / running task exits
+pending exec transaction -> files/open descriptions
+-> fs context -> MM -> zombie 或 exited
 ```
 
-Ready 和 exited 都是侵入式 FIFO。每个非零 elapsed timer 事件最多切换一次；没有 READY 竞争者时保持 current。切换前先激活目标地址空间，成功后才更新队列和 current。Trap Frame 保存任意中断点的完整整数现场，switch context 只保存 scheduler C 调用链依 psABI 必须保留的寄存器。
+有父进程且重资源已清空时只保留 task 页、PID、亲缘和 wait status，进入 ZOMBIE；这保证 zombie 不长期占用用户页、页表或文件对象。清理失败时进入 EXITED，由 idle 在可信内核地址空间和 boot 栈上重试；成功后再转 zombie 并唤醒父进程。Parentless 任务由 idle 继续释放 PID 和任务页；只有启动路径直接创建且标记发布的任务会产生 boot completion，克隆失败和孤儿清理不会伪造 PID 1 完成事件。
 
-入口返回或用户 syscall/故障退出时，当前内核栈仍在任务页中，不能就地释放。退出路径先切到下一地址空间，把完成记录与任务移入 exited FIFO，再通过永不入队的 discard context 离开旧栈。若发现 current、边界或 canary 损坏，则锁存首个 fatal 状态并切回可信 idle，由可返回的 timer 路径报告。
+父进程 wait zombie 时先释放 PID、摘除亲缘，再释放 task 页。若最后一步失败，节点以无 PID、不可发布状态进入 exited 队列重试，避免重复 wait 或重复释放 PID。所有部分失败都由对象状态保留唯一 owner，错误码本身不代替所有权判断。
 
-Reaper 只在 idle 和内核地址空间中运行，完成记录在退出时先快照 TID/TGID，再按以下顺序收口用户任务：
+## 临界区与性能边界
 
-```text
-release files/open descriptions
--> release fs context
--> release one MM reference
--> release TID
--> release task page
--> publish completion
-```
+当前单 hart 通过关闭 SIE 串行化 runqueue、父子树、PID、files/fs/MM 生命周期；这不是 SMP 锁。接入多 hart 时必须为 runqueue、进程树、PID 分配、文件表/OFD 引用和 MM/COW 增加锁或原子协议，并处理远端 TLB shootdown。
 
-文件、fs context、MM 或页释放失败时，节点保持在 exited 队首，完成输出不变；重试从各 owner 记录的准确阶段继续。必须先关闭文件才能释放其借用的 mount，必须先释放 fs context 才能最终卸载根；释放任务页前先清除 TID owner，因此若最后一步失败，重试不会重复释放前面的资源。completion 中的身份快照仍保留，允许 PID 1 策略在对象释放后识别退出者。只有全部完成才出队并发布记录。内核任务没有 files/fs/MM/TID，completion 身份固定为零，只释放任务页。
+tick/context switch 只检查 task/queue 常量状态、读取缓存的 `satp` 并切换 context，不获取资源引用、不遍历父子树、不复制页。当前 ASID 0 的地址空间切换执行全局 `SFENCE.VMA`，是明确的切换成本。process 路径按子进程数线性扫描 wait 集合；fork 的主要成本是 eager MM copy 和 fd/cwd 复制。开发板性能验证尚未进行，不能据 QEMU 时间宣称硬件性能。
 
 ## 验证与限制
 
 ```sh
-make test-context-riscv
 make test-scheduler-cases-riscv
 make test-scheduler-riscv
 make test-mm-riscv
 make test-files-riscv
 make test-user-riscv
-make test-user-elf-riscv
+make test-root-init-riscv
+make test-exec-riscv
 make test-riscv
 ```
 
-聚焦测试覆盖 context 布局、位图分配/耗尽/回收、创建失败原子性、FIFO、退出和复合释放失败。QEMU 集成测试使用真实 timer 验证没有主动 yield 的内核/用户任务被抢占并恢复；两个使用不同用户栈的单成员线程组共享同一 MM，测试要求它们的 TID/TGID 分别相等、组间 ID 不同，且首个任务回收不销毁 MM、末引用才归还全部页。生产 PID 1 故意遗留一个打开 fd，最终 mount/heap/物理页基线验证 reaper 已完成文件资源收口。反汇编检查约束实际 context switch 保存集合，并要求 tick 及其状态校验调用图不出现 MM/PID/物理页或 files/fs 生命周期调用；这是热路径结构成本检查，不替代开发板上的周期、TLB miss 和缓存基准。
+聚焦测试覆盖调度状态、创建与清理失败；MM/files 测试分别证明地址空间深复制和 OFD 引用共享。生产 ext4 三映像链覆盖 clone 双返回、PPID、WNOHANG/阻塞唤醒、wait selector、退出码、故障状态、EFAULT 后已回收、fd offset 共享、MM 写隔离、孙进程向 PID 1 reparent，以及最终 heap/物理页基线。
 
-当前限制为 RISC-V64 单 hart、ASID 0、一个 tick 时间片、FIFO、4 KiB 单页内核栈和 canary。尚无第二个线程组成员、`clone/fork/wait`、BLOCKED/sleep/wakeup、主动 yield、优先级、SMP、内核栈 guard、F/V 上下文或 LoongArch context。
+当前限制是 RISC-V64 单 hart、ASID 0、FIFO/单 tick 时间片、4 KiB 单页内核栈、单成员线程组和普通 SIGCHLD clone。尚无 `CLONE_VM/CLONE_FILES/CLONE_THREAD`、COW、信号投递、futex、vfork、rusage、停止/继续事件、SMP、内核栈 guard、F/V 上下文或 LoongArch context。

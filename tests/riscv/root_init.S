@@ -176,9 +176,134 @@ _start:
     li t0, -9
     bne a0, t0, .Lfailure
 
-    li a0, 0x2a
-    li a7, 93
+    # Keep a normal descriptor at offset four across both execs.  fd 1 was
+    # opened with O_CLOEXEC above and remains open until a successful exec.
+    li a0, -100
+    la a1, .Labsolute_path
+    li a2, 0
+    li a3, 0
+    li a7, 56
     ecall
+    bnez a0, .Lfailure
+    mv s0, a0
+    mv a0, s0
+    la a1, .Lread_buffer
+    li a2, 4
+    li a7, 63
+    ecall
+    li t0, 4
+    bne a0, t0, .Lfailure
+
+    # Linux opens the executable before touching argv.  The invalid argv
+    # must therefore not mask ENOENT, and failed exec must not close fd 1.
+    la a0, .Lmissing_path
+    li a1, 0x1000
+    li a2, 0
+    li a7, 221
+    ecall
+    li t0, -2
+    bne a0, t0, .Lfailure
+    mv a0, s1
+    la a1, .Lread_buffer
+    li a2, 1
+    li a7, 63
+    ecall
+    li t0, 1
+    bne a0, t0, .Lfailure
+    la t0, .Lread_buffer
+    lbu t1, 0(t0)
+    li t2, 'D'
+    bne t1, t2, .Lfailure
+
+    la a0, .Lempty_path
+    li a1, 0
+    li a2, 0
+    li a7, 221
+    ecall
+    li t0, -2
+    bne a0, t0, .Lfailure
+    li a0, 0x1000
+    li a1, 0
+    li a2, 0
+    li a7, 221
+    ecall
+    li t0, -14
+    bne a0, t0, .Lfailure
+    la a0, .Lroot_path
+    li a1, 0
+    li a2, 0
+    li a7, 221
+    ecall
+    li t0, -13
+    bne a0, t0, .Lfailure
+    la a0, .Lscript_path
+    li a1, 0
+    li a2, 0
+    li a7, 221
+    ecall
+    li t0, -8
+    bne a0, t0, .Lfailure
+    la a0, .Lstage2_path
+    la a1, .Lfault_argv
+    li a2, 0
+    li a7, 221
+    ecall
+    li t0, -14
+    bne a0, t0, .Lfailure
+    la a0, .Lstage2_path
+    la a1, .Lstage2_argv
+    li a2, 0x1000
+    li a7, 221
+    ecall
+    li t0, -14
+    bne a0, t0, .Lfailure
+
+    la t0, .Lbig_string
+    li t1, 0x20000
+    li t2, 'x'
+.Lfill_big_string:
+    sb t2, 0(t0)
+    addi t0, t0, 1
+    addi t1, t1, -1
+    bnez t1, .Lfill_big_string
+    la a0, .Lstage2_path
+    la a1, .Lbig_argv
+    li a2, 0
+    li a7, 221
+    ecall
+    li t0, -7
+    bne a0, t0, .Lfailure
+
+    # A regular file without execute bits is rejected before replacement.
+    la a0, .Labsolute_path
+    la a1, .Lstage2_argv
+    la a2, .Lstage2_envp
+    li a7, 221
+    ecall
+    li t0, -13
+    bne a0, t0, .Lfailure
+
+    # Set non-argument registers to sentinels.  stage2 checks that exec did
+    # not leak them into the fresh image.
+    li s0, 0x10
+    li s1, 0x11
+    li s2, 0x12
+    li s3, 0x13
+    li s4, 0x14
+    li s5, 0x15
+    li s6, 0x16
+    li s7, 0x17
+    li s8, 0x18
+    li s9, 0x19
+    li s10, 0x1a
+    li s11, 0x1b
+    li tp, 0x1c
+    la a0, .Lstage2_path
+    la a1, .Lstage2_argv
+    la a2, .Lstage2_envp
+    li a7, 221
+    ecall
+    j .Lfailure
 
 .Lfailure:
     li a0, 0xe1
@@ -192,9 +317,42 @@ _start:
     .asciz "/data"
 .Lrelative_path:
     .asciz "data"
+.Lmissing_path:
+    .asciz "/missing"
+.Lempty_path:
+    .asciz ""
+.Lroot_path:
+    .asciz "/"
+.Lscript_path:
+    .asciz "/script"
+.Lstage2_path:
+    .asciz "stage2"
+.Lstage2_arg0:
+    .asciz "stage2"
+.Lstage2_arg1:
+    .asciz "hello"
+.Lstage2_env0:
+    .asciz "MODE=exec"
+    .balign 8
+.Lstage2_argv:
+    .dword .Lstage2_arg0
+    .dword .Lstage2_arg1
+    .dword 0
+.Lstage2_envp:
+    .dword .Lstage2_env0
+    .dword 0
+.Lfault_argv:
+    .dword 0x1000
+    .dword 0
+.Lbig_argv:
+    .dword .Lbig_string
+    .dword 0
 
     .section .bss, "aw", @nobits
     .balign 4096
     .skip 4000
 .Lread_buffer:
     .skip 5000
+    .balign 4096
+.Lbig_string:
+    .skip 0x20000

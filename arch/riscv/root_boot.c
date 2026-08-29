@@ -1,4 +1,5 @@
 #include <arch/riscv/direct_map.h>
+#include <arch/riscv/exec.h>
 #include <arch/riscv/memory_layout.h>
 #include <arch/riscv/mm.h>
 #include <arch/riscv/root_boot.h>
@@ -31,14 +32,6 @@ static int direct_map_dma_address(const void *pointer,
                                      size,
                                      physical_address) ==
            RISCV_DIRECT_MAP_STATUS_OK;
-}
-
-static int executable_regular_file(const struct kernel_vfs_file *file)
-{
-    return (file->mode & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFREG &&
-           (file->mode & (KERNEL_VFS_S_IXUSR |
-                          KERNEL_VFS_S_IXGRP |
-                          KERNEL_VFS_S_IXOTH)) != 0U;
 }
 
 static enum riscv_root_boot_status cleanup_start_failure(
@@ -95,7 +88,7 @@ enum riscv_root_boot_status riscv_root_boot_start(
     const struct riscv_sv39_page_table *kernel_table)
 {
     static const char init_path[] = "/init";
-    const struct riscv_user_elf_string arguments[1] = {
+    const struct kernel_exec_string arguments[1] = {
         {
             .bytes = init_path,
             .length = sizeof(init_path) - 1U,
@@ -128,6 +121,10 @@ enum riscv_root_boot_status riscv_root_boot_start(
                          direct_map_heap_address) !=
         KERNEL_HEAP_STATUS_OK) {
         return RISCV_ROOT_BOOT_STATUS_HEAP;
+    }
+    if (riscv_exec_init(allocator, kernel_table) !=
+        RISCV_EXEC_STATUS_OK) {
+        return RISCV_ROOT_BOOT_STATUS_INIT;
     }
     root->baseline_pages = physical_page_available(allocator);
 
@@ -163,8 +160,7 @@ enum riscv_root_boot_status riscv_root_boot_start(
         failure = RISCV_ROOT_BOOT_STATUS_MOUNT;
         goto fail;
     }
-    if (kernel_vfs_open(&root->mount, init_path, &file) != 0 ||
-        !executable_regular_file(&file) ||
+    if (kernel_vfs_open_executable(&root->mount, init_path, &file) != 0 ||
         kernel_vfs_file_read_source(&file, &request.source) != 0) {
         failure = RISCV_ROOT_BOOT_STATUS_INIT;
         goto fail;
@@ -173,6 +169,7 @@ enum riscv_root_boot_status riscv_root_boot_start(
     request.argument_count = 1U;
     request.environment = 0;
     request.environment_count = 0U;
+    request.executable = arguments[0];
     elf_status = riscv_user_elf_load(&request,
                                      allocator,
                                      kernel_table,

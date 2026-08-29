@@ -15,6 +15,9 @@ enum kernel_syscall_status {
 enum kernel_syscall_action {
     KERNEL_SYSCALL_ACTION_RETURN = 0,
     KERNEL_SYSCALL_ACTION_EXIT,
+    KERNEL_SYSCALL_ACTION_EXEC,
+    KERNEL_SYSCALL_ACTION_CLONE,
+    KERNEL_SYSCALL_ACTION_WAIT4,
 };
 
 struct kernel_syscall_request {

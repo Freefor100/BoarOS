@@ -6,7 +6,7 @@ project_root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 kernel=${SCHEDULER_BOOT_TEST_KERNEL_RV:-"$project_root/build/riscv/tests/kernel-scheduler-boot-rv"}
 qemu=${QEMU_RISCV64:-qemu-system-riscv64}
 objdump=${OBJDUMP_RV:-riscv64-unknown-elf-objdump}
-scheduler_object=${SCHEDULER_OBJECT_RV:-"$project_root/build/riscv/kernel/scheduler.o"}
+scheduler_object=${SCHEDULER_OBJECT_RV:-"$project_root/build/riscv/kernel/sched/core.o"}
 output_dir=$(mktemp -d)
 output="$output_dir/scheduler.log"
 hot_disassembly="$output_dir/scheduler-hot.dis"
@@ -53,7 +53,7 @@ if ! grep -q "<$validate_thread_symbol>:" "$hot_disassembly"; then
     exit 1
 fi
 
-if grep -Eq 'R_RISCV_CALL(_PLT)?[[:space:]]+(kernel_mm_|riscv_kernel_mm_|kernel_pid_|physical_page_|kernel_files_|kernel_fs_context_)' \
+if grep -Eq 'R_RISCV_CALL(_PLT)?[[:space:]]+(kernel_mm_|riscv_kernel_mm_|kernel_pid_|physical_page_|kernel_files_|kernel_fs_context_|kernel_exec_)' \
     "$hot_disassembly"; then
     cat "$hot_disassembly" >&2
     echo "scheduler tick path performs MM, PID, or physical-page lifecycle work" >&2

@@ -5,12 +5,15 @@ set -eu
 project_root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 kernel=${KERNEL_RV:-"$project_root/kernel-rv"}
 init=${ROOT_INIT_PROGRAM_RV:-"$project_root/build/riscv/tests/user/root-init-rv"}
+stage2=${ROOT_EXEC_STAGE2_RV:-"$project_root/build/riscv/tests/user/root-exec-stage2-rv"}
+stage3=${ROOT_EXEC_STAGE3_RV:-"$project_root/build/riscv/tests/user/root-exec-stage3-rv"}
 qemu=${QEMU_RISCV64:-qemu-system-riscv64}
 memory=${QEMU_MEMORY:-512M}
 work_dir=$(mktemp -d)
 output="$work_dir/root-init.log"
 disk="$work_dir/root.img"
 data="$work_dir/data"
+script="$work_dir/script"
 
 trap 'rm -rf "$work_dir"' EXIT HUP INT TERM
 
@@ -24,19 +27,31 @@ if [ ! -f "$kernel" ]; then
     echo "missing production kernel: $kernel" >&2
     exit 1
 fi
-if [ ! -f "$init" ]; then
-    echo "missing root-init fixture: $init" >&2
-    exit 1
-fi
+for fixture in "$init" "$stage2" "$stage3"; do
+    if [ ! -f "$fixture" ]; then
+        echo "missing root exec fixture: $fixture" >&2
+        exit 1
+    fi
+done
 
 truncate -s 32M "$disk"
 mkfs.ext4 -q -F "$disk"
 awk 'BEGIN { for (i = 0; i < 9000; i++) printf "%c", 65 + (i % 26) }' \
     >"$data"
+printf '%s\n' '#!/bin/sh' >"$script"
 debugfs -w -R "write $init /init" "$disk" >/dev/null 2>&1
 debugfs -w -R "set_inode_field /init mode 0100755" "$disk" \
     >/dev/null 2>&1
+debugfs -w -R "write $stage2 /stage2" "$disk" >/dev/null 2>&1
+debugfs -w -R "set_inode_field /stage2 mode 0100755" "$disk" \
+    >/dev/null 2>&1
+debugfs -w -R "write $stage3 /stage3" "$disk" >/dev/null 2>&1
+debugfs -w -R "set_inode_field /stage3 mode 0100755" "$disk" \
+    >/dev/null 2>&1
 debugfs -w -R "write $data /data" "$disk" >/dev/null 2>&1
+debugfs -w -R "write $script /script" "$disk" >/dev/null 2>&1
+debugfs -w -R "set_inode_field /script mode 0100755" "$disk" \
+    >/dev/null 2>&1
 
 if ! timeout -k 2s 15s "$qemu" \
     -machine virt \

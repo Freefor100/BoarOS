@@ -932,6 +932,202 @@ enum riscv_sv39_status riscv_sv39_user_space_satp(
     return RISCV_SV39_STATUS_OK;
 }
 
+static enum riscv_sv39_status init_forked_user_space(
+    struct riscv_sv39_user_space *destination,
+    const struct riscv_sv39_user_space *source)
+{
+    struct riscv_sv39_user_space result;
+    uint64_t *source_root;
+    uint64_t *destination_root;
+    uint64_t root_address;
+    uint32_t index;
+    enum physical_page_status page_status;
+    enum riscv_sv39_status status;
+
+    status = resolve_runtime_table(source->allocator,
+                                   source->root_address,
+                                   &source_root);
+    if (status != RISCV_SV39_STATUS_OK) {
+        return status;
+    }
+    page_status = physical_page_allocate(source->allocator, &root_address);
+    if (page_status == PHYSICAL_PAGE_STATUS_EMPTY) {
+        return RISCV_SV39_STATUS_NO_MEMORY;
+    }
+    if (page_status != PHYSICAL_PAGE_STATUS_OK) {
+        return page_status == PHYSICAL_PAGE_STATUS_STATE
+                   ? RISCV_SV39_STATUS_STATE
+                   : RISCV_SV39_STATUS_INVALID;
+    }
+    status = resolve_runtime_table(source->allocator,
+                                   root_address,
+                                   &destination_root);
+    if (status != RISCV_SV39_STATUS_OK) {
+        if (physical_page_release(source->allocator, root_address) !=
+            PHYSICAL_PAGE_STATUS_OK) {
+            result.allocator = source->allocator;
+            result.root_address = 0U;
+            result.table_pages = 0U;
+            result.leaf_pages = 0U;
+            result.cleanup_page_address = root_address;
+            result.cleanup_page_owned = 1U;
+            result.state = RISCV_SV39_USER_SPACE_CLEANUP;
+            *destination = result;
+            return RISCV_SV39_STATUS_CLEANUP_REQUIRED;
+        }
+        return status;
+    }
+
+    clear_runtime_table(destination_root);
+    for (index = RISCV_SV39_USER_ROOT_ENTRIES;
+         index < BOAROS_PAGE_SIZE / sizeof(*destination_root);
+         index++) {
+        destination_root[index] = source_root[index];
+    }
+    result.allocator = source->allocator;
+    result.root_address = root_address;
+    result.table_pages = 1U;
+    result.leaf_pages = 0U;
+    result.cleanup_page_address = 0U;
+    result.cleanup_page_owned = 0U;
+    result.state = RISCV_SV39_USER_SPACE_LIVE;
+    *destination = result;
+    return RISCV_SV39_STATUS_OK;
+}
+
+static enum riscv_sv39_status copy_user_leaf(
+    struct riscv_sv39_user_space *destination,
+    const struct riscv_sv39_user_space *source,
+    uint64_t virtual_address,
+    uint64_t source_entry)
+{
+    struct riscv_sv39_mapping destination_mapping;
+    uint64_t *source_words;
+    uint64_t *destination_words;
+    uint32_t index;
+    enum riscv_sv39_status status;
+
+    status = riscv_sv39_user_map_zeroed_page(
+        destination,
+        virtual_address,
+        entry_permissions(source_entry) & ~RISCV_SV39_USER);
+    if (status != RISCV_SV39_STATUS_OK) {
+        return status;
+    }
+    status = resolve_runtime_table(source->allocator,
+                                   entry_address(source_entry),
+                                   &source_words);
+    if (status != RISCV_SV39_STATUS_OK) {
+        return status;
+    }
+    status = riscv_sv39_user_lookup(destination,
+                                    virtual_address,
+                                    &destination_mapping);
+    if (status != RISCV_SV39_STATUS_OK) {
+        return status;
+    }
+    status = resolve_runtime_table(destination->allocator,
+                                   destination_mapping.physical_address,
+                                   &destination_words);
+    if (status != RISCV_SV39_STATUS_OK) {
+        return status;
+    }
+    for (index = 0U;
+         index < BOAROS_PAGE_SIZE / sizeof(*source_words);
+         index++) {
+        destination_words[index] = source_words[index];
+    }
+    return RISCV_SV39_STATUS_OK;
+}
+
+enum riscv_sv39_status riscv_sv39_user_space_fork(
+    struct riscv_sv39_user_space *destination,
+    const struct riscv_sv39_user_space *source)
+{
+    uint64_t *root;
+    uint64_t *level1;
+    uint64_t *level0;
+    uint64_t virtual_address;
+    uint32_t root_index;
+    uint32_t level1_index;
+    uint32_t level0_index;
+    enum riscv_sv39_status status;
+
+    if (destination == 0 || source == 0 || destination == source) {
+        return RISCV_SV39_STATUS_INVALID;
+    }
+    if (destination->state != RISCV_SV39_USER_SPACE_EMPTY ||
+        source->state != RISCV_SV39_USER_SPACE_LIVE ||
+        source->allocator == 0) {
+        return RISCV_SV39_STATUS_STATE;
+    }
+    status = init_forked_user_space(destination, source);
+    if (status != RISCV_SV39_STATUS_OK) {
+        return status;
+    }
+    status = resolve_runtime_table(source->allocator,
+                                   source->root_address,
+                                   &root);
+    if (status != RISCV_SV39_STATUS_OK) {
+        return status;
+    }
+    for (root_index = 0U;
+         root_index < RISCV_SV39_USER_ROOT_ENTRIES;
+         root_index++) {
+        if (root[root_index] == 0U) {
+            continue;
+        }
+        if (!valid_nonleaf_entry(root[root_index])) {
+            return RISCV_SV39_STATUS_STATE;
+        }
+        status = resolve_runtime_table(source->allocator,
+                                       entry_address(root[root_index]),
+                                       &level1);
+        if (status != RISCV_SV39_STATUS_OK) {
+            return status;
+        }
+        for (level1_index = 0U;
+             level1_index < BOAROS_PAGE_SIZE / sizeof(*level1);
+             level1_index++) {
+            if (level1[level1_index] == 0U) {
+                continue;
+            }
+            if (!valid_nonleaf_entry(level1[level1_index])) {
+                return RISCV_SV39_STATUS_STATE;
+            }
+            status = resolve_runtime_table(
+                source->allocator,
+                entry_address(level1[level1_index]),
+                &level0);
+            if (status != RISCV_SV39_STATUS_OK) {
+                return status;
+            }
+            for (level0_index = 0U;
+                 level0_index < BOAROS_PAGE_SIZE / sizeof(*level0);
+                 level0_index++) {
+                if (level0[level0_index] == 0U) {
+                    continue;
+                }
+                if (!valid_user_leaf_entry(level0[level0_index])) {
+                    return RISCV_SV39_STATUS_STATE;
+                }
+                virtual_address = ((uint64_t)root_index << 30U) |
+                                  ((uint64_t)level1_index << 21U) |
+                                  ((uint64_t)level0_index <<
+                                   BOAROS_PAGE_SHIFT);
+                status = copy_user_leaf(destination,
+                                        source,
+                                        virtual_address,
+                                        level0[level0_index]);
+                if (status != RISCV_SV39_STATUS_OK) {
+                    return status;
+                }
+            }
+        }
+    }
+    return RISCV_SV39_STATUS_OK;
+}
+
 enum riscv_sv39_status riscv_sv39_user_space_move(
     struct riscv_sv39_user_space *destination,
     struct riscv_sv39_user_space *source)

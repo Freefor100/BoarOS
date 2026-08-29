@@ -9,6 +9,7 @@
 
 struct kernel_heap;
 struct kernel_mm;
+struct kernel_fs_context_record;
 struct kernel_vfs_mount;
 
 enum kernel_fs_context_status {
@@ -29,8 +30,7 @@ enum kernel_fs_context_state {
 
 struct kernel_fs_context {
     struct kernel_heap *heap;
-    struct kernel_vfs_mount *root_mount;
-    char *cwd;
+    struct kernel_fs_context_record *record;
     enum kernel_fs_context_state state;
 };
 
@@ -39,7 +39,26 @@ enum kernel_fs_context_status kernel_fs_context_create(
     struct kernel_vfs_mount *root_mount,
     struct kernel_heap *heap);
 
+enum kernel_fs_context_status kernel_fs_context_fork(
+    struct kernel_fs_context *destination,
+    const struct kernel_fs_context *source);
+
+enum kernel_fs_context_status kernel_fs_context_move(
+    struct kernel_fs_context *destination,
+    struct kernel_fs_context *source);
+
 int kernel_fs_context_is_live(const struct kernel_fs_context *fs);
+
+/* path_length excludes NUL; normal path errors use linux_result. */
+enum kernel_fs_context_status kernel_fs_context_resolve_kernel_path(
+    const struct kernel_fs_context *fs,
+    int64_t dirfd,
+    const char *path,
+    size_t path_length,
+    char *buffer,
+    size_t capacity,
+    struct kernel_vfs_mount **mount,
+    int *linux_result);
 
 /* A normal path error is returned through linux_result. */
 enum kernel_fs_context_status kernel_fs_context_resolve_user_path(

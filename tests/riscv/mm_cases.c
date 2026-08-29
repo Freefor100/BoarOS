@@ -235,6 +235,85 @@ static unsigned long run_shared_mm_references(void)
     return 0U;
 }
 
+static unsigned long run_forked_mm(void)
+{
+    static const unsigned char text_bytes[] = {
+        0x13U, 0x05U, 0xa0U, 0x02U,
+    };
+    struct physical_page_allocator allocator;
+    struct riscv_sv39_page_table kernel_table = {0};
+    struct riscv_sv39_user_space space = {0};
+    struct kernel_mm parent = {0};
+    struct kernel_mm child = {0};
+    struct kernel_mm_mapping parent_text;
+    struct kernel_mm_mapping child_text;
+    struct kernel_mm_mapping parent_stack;
+    struct kernel_mm_mapping child_stack;
+    unsigned char *parent_stack_page;
+    unsigned char *child_stack_page;
+    uint64_t baseline;
+
+    if (!setup(&allocator, &kernel_table, &baseline) ||
+        !create_space(&allocator, &kernel_table, &space) ||
+        riscv_sv39_user_space_populate(&space,
+                                       TEST_TEXT_ADDRESS,
+                                       text_bytes,
+                                       sizeof(text_bytes)) !=
+            RISCV_SV39_STATUS_OK ||
+        riscv_kernel_mm_create(&parent, &space) != KERNEL_MM_STATUS_OK) {
+        return 1U;
+    }
+    if (kernel_mm_fork(&child, &parent) != KERNEL_MM_STATUS_OK ||
+        child.state != KERNEL_MM_LIVE ||
+        kernel_mm_lookup(&parent, TEST_TEXT_ADDRESS, &parent_text) !=
+            KERNEL_MM_STATUS_OK ||
+        kernel_mm_lookup(&child, TEST_TEXT_ADDRESS, &child_text) !=
+            KERNEL_MM_STATUS_OK ||
+        kernel_mm_lookup(&parent, TEST_STACK_ADDRESS, &parent_stack) !=
+            KERNEL_MM_STATUS_OK ||
+        kernel_mm_lookup(&child, TEST_STACK_ADDRESS, &child_stack) !=
+            KERNEL_MM_STATUS_OK) {
+        return 2U;
+    }
+    if (parent_text.permissions != child_text.permissions ||
+        parent_stack.permissions != child_stack.permissions ||
+        (parent_text.physical_address & ~BOAROS_PAGE_MASK) ==
+            (child_text.physical_address & ~BOAROS_PAGE_MASK) ||
+        (parent_stack.physical_address & ~BOAROS_PAGE_MASK) ==
+            (child_stack.physical_address & ~BOAROS_PAGE_MASK) ||
+        *(unsigned char *)(uintptr_t)parent_text.physical_address !=
+            text_bytes[0] ||
+        *(unsigned char *)(uintptr_t)child_text.physical_address !=
+            text_bytes[0]) {
+        return 3U;
+    }
+    if (physical_page_resolve(&allocator,
+                              parent_stack.physical_address &
+                                  ~BOAROS_PAGE_MASK,
+                              (void **)&parent_stack_page) !=
+            PHYSICAL_PAGE_STATUS_OK ||
+        physical_page_resolve(&allocator,
+                              child_stack.physical_address &
+                                  ~BOAROS_PAGE_MASK,
+                              (void **)&child_stack_page) !=
+            PHYSICAL_PAGE_STATUS_OK) {
+        return 4U;
+    }
+    parent_stack_page[0] = 0x35U;
+    child_stack_page[0] = 0x7aU;
+    if (parent_stack_page[0] != 0x35U || child_stack_page[0] != 0x7aU) {
+        return 5U;
+    }
+    if (kernel_mm_release(&parent) != KERNEL_MM_STATUS_OK ||
+        kernel_mm_lookup(&child, TEST_TEXT_ADDRESS, &child_text) !=
+            KERNEL_MM_STATUS_OK ||
+        kernel_mm_release(&child) != KERNEL_MM_STATUS_OK ||
+        physical_page_available(&allocator) != baseline) {
+        return 6U;
+    }
+    return 0U;
+}
+
 static unsigned long run_create_access_failures(void)
 {
     struct physical_page_allocator allocator;
@@ -479,6 +558,10 @@ unsigned long run_all_mm_cases(void)
     result = run_shared_mm_references();
     if (result != 0U) {
         return UINT64_C(0x280) + result;
+    }
+    result = run_forked_mm();
+    if (result != 0U) {
+        return UINT64_C(0x2c0) + result;
     }
     result = run_no_memory();
     if (result != 0U) {

@@ -328,6 +328,28 @@ int kernel_vfs_open(struct kernel_vfs_mount *mount,
     return 0;
 }
 
+int kernel_vfs_open_executable(struct kernel_vfs_mount *mount,
+                               const char *path,
+                               struct kernel_vfs_file *file)
+{
+    int result = kernel_vfs_open(mount, path, file);
+
+    if (result == -KERNEL_EISDIR) {
+        return -KERNEL_EACCES;
+    }
+    if (result != 0) {
+        return result;
+    }
+    if ((file->mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFREG ||
+        (file->mode & (KERNEL_VFS_S_IXUSR |
+                       KERNEL_VFS_S_IXGRP |
+                       KERNEL_VFS_S_IXOTH)) == 0U) {
+        return kernel_vfs_close(file) == 0 ? -KERNEL_EACCES
+                                           : -KERNEL_EIO;
+    }
+    return 0;
+}
+
 int kernel_vfs_pread(struct kernel_vfs_file *file,
                      uint64_t offset,
                      void *buffer,

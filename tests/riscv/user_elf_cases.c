@@ -24,7 +24,7 @@
 #define TEST_READ_ONLY_OFFSET UINT64_C(0x300)
 #define TEST_DATA_OFFSET UINT64_C(0x400)
 #define TEST_FILE_BYTES UINT64_C(0x80)
-#define TEST_LARGE_ARGUMENT_SIZE (0x20000U - 161U)
+#define TEST_LARGE_ARGUMENT_SIZE (0x20000U - 178U)
 
 static uint64_t test_page_pool[TEST_POOL_WORDS]
     __attribute__((aligned(BOAROS_PAGE_SIZE)));
@@ -416,15 +416,16 @@ static enum riscv_user_elf_status load_image(
 
 unsigned long run_user_elf_cases(void)
 {
+    static const char executable_path[] = "/bin/probe";
     static const char argument_zero[] = "alpha";
     static const char argument_one[] = "beta";
     static const char environment_zero[] = "KEY=value";
-    struct riscv_user_elf_string arguments[2];
-    struct riscv_user_elf_string environment[1];
+    struct kernel_exec_string arguments[2];
+    struct kernel_exec_string environment[1];
     struct physical_page_allocator allocator;
     struct riscv_sv39_page_table kernel_table = {0};
     struct riscv_sv39_user_space space = {0};
-    struct riscv_user_elf_request request;
+    struct riscv_user_elf_request request = {0};
     struct riscv_user_elf_entry entry = {
         .entry = UINT64_C(0x1111111111111111),
         .stack_pointer = UINT64_C(0x2222222222222222),
@@ -459,6 +460,8 @@ unsigned long run_user_elf_cases(void)
     request.argument_count = sizeof(arguments) / sizeof(arguments[0]);
     request.environment = environment;
     request.environment_count = sizeof(environment) / sizeof(environment[0]);
+    request.executable.bytes = executable_path;
+    request.executable.length = sizeof(executable_path) - 1U;
     make_valid_image();
     if (!init_allocator_and_kernel_table(&allocator,
                                          &kernel_table,
@@ -603,6 +606,16 @@ unsigned long run_user_elf_cases(void)
                         9U,
                         &auxiliary_value) ||
         auxiliary_value != TEST_TEXT_VA ||
+        !find_aux_value(&space,
+                        &allocator,
+                        entry.stack_pointer + 48U,
+                        31U,
+                        &auxiliary_value) ||
+        !expect_user_string(&space,
+                            &allocator,
+                            auxiliary_value,
+                            executable_path,
+                            sizeof(executable_path) - 1U) ||
         !find_aux_value(&space,
                         &allocator,
                         entry.stack_pointer + 48U,
@@ -776,8 +789,8 @@ static unsigned long run_request_failures(void)
     static const char embedded_nul[3] = {'a', '\0', 'b'};
     struct physical_page_allocator allocator;
     struct riscv_sv39_page_table kernel_table = {0};
-    struct riscv_user_elf_string string;
-    struct riscv_user_elf_request request;
+    struct kernel_exec_string string;
+    struct riscv_user_elf_request request = {0};
     unsigned long failures = 0U;
     size_t index;
 
@@ -849,8 +862,8 @@ static unsigned long run_stack_boundary_cases(void)
     struct physical_page_allocator allocator;
     struct riscv_sv39_page_table kernel_table = {0};
     struct riscv_sv39_user_space space = {0};
-    struct riscv_user_elf_string argument;
-    struct riscv_user_elf_request request;
+    struct kernel_exec_string argument;
+    struct riscv_user_elf_request request = {0};
     struct riscv_user_elf_entry entry = {0};
     struct riscv_sv39_mapping mapping;
     uint64_t argument_address;
@@ -1130,6 +1143,8 @@ static unsigned long run_oom_and_cleanup_cases(void)
         .entry = UINT64_C(0x1111111111111111),
         .stack_pointer = UINT64_C(0x2222222222222222),
     };
+    struct riscv_user_elf_request cleanup_request = {0};
+    enum riscv_user_elf_status image_failure = RISCV_USER_ELF_STATUS_OK;
     uint64_t available;
     enum riscv_sv39_status sv39_status;
 
@@ -1154,13 +1169,17 @@ static unsigned long run_oom_and_cleanup_cases(void)
     }
 
     force_destroy_failure = 1;
-    if (load_image(test_image,
-                   sizeof(test_image),
-                   &allocator,
-                   &kernel_table,
-                   &space,
-                   &entry) !=
+    if (kernel_read_source_from_memory(test_image,
+                                       sizeof(test_image),
+                                       &cleanup_request.source) != 0 ||
+        riscv_user_elf_load_detailed(&cleanup_request,
+                                     &allocator,
+                                     &kernel_table,
+                                     &space,
+                                     &entry,
+                                     &image_failure) !=
             RISCV_USER_ELF_STATUS_CLEANUP_REQUIRED ||
+        image_failure != RISCV_USER_ELF_STATUS_NO_MEMORY ||
         space.state != RISCV_SV39_USER_SPACE_LIVE ||
         entry_changed(&entry)) {
         force_destroy_failure = 0;

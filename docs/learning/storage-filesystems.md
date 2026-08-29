@@ -26,7 +26,7 @@ ELF header、program header 和各个 `PT_LOAD` 位于文件不同偏移。接�
 
 ## fd、打开文件描述与文件系统上下文
 
-Linux 进程看到的整数 fd 只是文件描述符表的索引。槽内的 descriptor flags（典型例子是 `FD_CLOEXEC`）属于 fd；真正的打开文件描述（open file description）保存文件位置、打开状态和底层文件引用。`dup` 产生两个 fd 指向同一打开文件描述，所以共享 offset；两次 `open` 同一路径则产生两个描述，offset 独立。`fork` 通常复制 fd 表引用而共享打开文件描述，`CLONE_FILES` 才共享整张 fd 表。把 offset 直接放进 fd 槽虽然早期简单，却会阻碍这些既定 Linux 语义。
+Linux 进程看到的整数 fd 只是文件描述符表的索引。槽内的 descriptor flags（典型例子是 `FD_CLOEXEC`）属于 fd；真正的打开文件描述（open file description）保存文件位置、打开状态和底层文件引用。`dup` 产生两个 fd 指向同一打开文件描述，所以共享 offset；两次 `open` 同一路径则产生两个描述，offset 独立。`fork` 通常复制 fd 表引用而共享打开文件描述，`CLONE_FILES` 才共享整张 fd 表。Exec 不替换文件表，只关闭标记了 `FD_CLOEXEC` 的槽，因此其他 open-file offset 要继续累积。把 offset 直接放进 fd 槽虽然早期简单，却会阻碍这些既定 Linux 语义。
 
 路径解析需要另一组进程状态：根目录、当前工作目录和用于相对路径的目录 fd。Linux `openat` 对绝对路径忽略 dirfd；相对路径的 `AT_FDCWD` 表示从 cwd 开始，其他值必须引用有效目录 fd。BoarOS 当前只有单根 mount、cwd `/` 和 `AT_FDCWD`，但把 fs context 与 fd table 分开，是为了让以后 `CLONE_FS` 与 `CLONE_FILES` 独立控制共享关系，而不是把两类资源固化为同一个对象。
 
@@ -46,6 +46,7 @@ PID 1 是用户空间生命周期的根。Linux 通常在 init 退出时 panic�
 - 文件系统测试应建立真实镜像并通过工具设置 mode、checksum 与 incompat feature；只用手写 superblock fixture 很难覆盖 extent、目录和校验链。
 - 成功读取文件不足以证明生命周期完整；应在 open file 时验证 unmount 为 busy，并在 close/unmount/device destroy 后比较物理页和 heap live/current pages。
 - 进程文件测试还应覆盖最低 fd 复用、扩容边界、两次 open 的独立 offset、路径 NUL 上限、跨页 usercopy、部分 fault 后 offset，以及 close 已摘除 fd 但底层释放需要重试的状态。
+- Exec 文件测试要同时保留普通 fd 和 CLOEXEC fd：新映像应从普通 fd 的原 offset 继续读取，而 CLOEXEC fd 即使底层 close 需要重试也必须立即不可见；失败的 exec 则不能关闭任何 fd。
 - 根启动 fixture 应独立链接并写入磁盘，不能把 ELF 同时嵌入 kernel，否则无法证明 VFS 是生产数据来源。
 - QEMU 默认可能提供 legacy VirtIO MMIO；现代驱动测试与生产根盘必须显式设置 `virtio-mmio.force-legacy=false`。开发板 transport 和 DMA 一致性必须重新验证，不能从 QEMU 行为外推。
 

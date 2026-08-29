@@ -26,6 +26,10 @@ enum kernel_task_status kernel_task_tgid(
     const struct kernel_task *task,
     kernel_pid_t *tgid);
 
+enum kernel_task_status kernel_task_ppid(
+    const struct kernel_task *task,
+    kernel_pid_t *ppid);
+
 /* The returned MM is borrowed for the duration of the current task call. */
 enum kernel_task_status kernel_task_mm_borrow(
     const struct kernel_task *task,

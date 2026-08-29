@@ -29,6 +29,7 @@
 static unsigned char page_pool[BOAROS_PAGE_SIZE * TEST_POOL_PAGES]
     __attribute__((aligned(BOAROS_PAGE_SIZE)));
 static int fail_next_heap_release;
+static char fork_resolved_path[KERNEL_FS_PATH_MAX];
 
 enum kernel_heap_status __real_kernel_heap_release(
     struct kernel_heap *heap,
@@ -411,12 +412,127 @@ static void run_file_operations(struct kernel_files *files,
         fail_files(32U, 64, statistics.capacity);
     }
 
+    if (kernel_files_close_on_exec(files) != KERNEL_FILES_STATUS_OK) {
+        fail_files(36U, KERNEL_FILES_STATUS_OK,
+                   KERNEL_FILES_STATUS_STATE);
+    }
+    kernel_files_get_statistics(files, &statistics);
+    if (statistics.current_open_fds != 33U ||
+        statistics.close_on_exec_fds != 0U ||
+        kernel_files_read(files,
+                          mm,
+                          2,
+                          TEST_USER_BUFFER,
+                          1U,
+                          &result) != KERNEL_FILES_STATUS_OK ||
+        result != -KERNEL_EBADF ||
+        kernel_files_read(files,
+                          mm,
+                          0,
+                          TEST_USER_BUFFER,
+                          1U,
+                          &result) != KERNEL_FILES_STATUS_OK ||
+        result != 1) {
+        fail_files(37U, 1, result);
+    }
+    expect_open(files,
+                fs,
+                mm,
+                TEST_AT_FDCWD,
+                "/data",
+                TEST_O_CLOEXEC,
+                2,
+                38U);
     fail_next_heap_release = 1;
-    if (kernel_files_close(files, 2, &result) !=
-            KERNEL_FILES_STATUS_OK || result != -KERNEL_EIO ||
+    if (kernel_files_close_on_exec(files) !=
+            KERNEL_FILES_STATUS_CLEANUP_REQUIRED ||
         kernel_files_close(files, 2, &result) !=
             KERNEL_FILES_STATUS_OK || result != -KERNEL_EBADF) {
-        fail_files(33U, -KERNEL_EBADF, result);
+        fail_files(39U, -KERNEL_EBADF, result);
+    }
+}
+
+static void run_fork_operations(struct kernel_files *parent_files,
+                                const struct kernel_fs_context *parent_fs,
+                                const struct kernel_mm *mm)
+{
+    struct kernel_files child_files = {0};
+    struct kernel_fs_context child_fs = {0};
+    struct kernel_vfs_mount *resolved_mount = 0;
+    int64_t result = INT64_MIN;
+    int path_result = INT32_MIN;
+
+    expect_open(parent_files,
+                parent_fs,
+                mm,
+                TEST_AT_FDCWD,
+                "/data",
+                0U,
+                0,
+                40U);
+    if (kernel_files_read(parent_files,
+                          mm,
+                          0,
+                          TEST_USER_BUFFER,
+                          1U,
+                          &result) != KERNEL_FILES_STATUS_OK ||
+        result != 1) {
+        fail_files(41U, 1, result);
+    }
+    expect_user_pattern(mm, TEST_USER_BUFFER, 0U, 1U, 42U);
+    if (kernel_files_fork(&child_files, parent_files) !=
+            KERNEL_FILES_STATUS_OK ||
+        kernel_fs_context_fork(&child_fs, parent_fs) !=
+            KERNEL_FS_CONTEXT_STATUS_OK ||
+        !kernel_files_is_live(&child_files) ||
+        !kernel_fs_context_is_live(&child_fs)) {
+        fail_files(43U, KERNEL_FILES_STATUS_OK,
+                   KERNEL_FILES_STATUS_STATE);
+    }
+    if (kernel_files_read(&child_files,
+                          mm,
+                          0,
+                          TEST_USER_BUFFER,
+                          1U,
+                          &result) != KERNEL_FILES_STATUS_OK ||
+        result != 1) {
+        fail_files(44U, 1, result);
+    }
+    expect_user_pattern(mm, TEST_USER_BUFFER, 1U, 1U, 45U);
+    if (kernel_files_close(&child_files, 0, &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != 0 ||
+        kernel_files_read(parent_files,
+                          mm,
+                          0,
+                          TEST_USER_BUFFER,
+                          1U,
+                          &result) != KERNEL_FILES_STATUS_OK ||
+        result != 1) {
+        fail_files(46U, 1, result);
+    }
+    expect_user_pattern(mm, TEST_USER_BUFFER, 2U, 1U, 47U);
+    if (kernel_fs_context_resolve_kernel_path(&child_fs,
+                                              TEST_AT_FDCWD,
+                                              "data",
+                                              4U,
+                                              fork_resolved_path,
+                                              sizeof(fork_resolved_path),
+                                              &resolved_mount,
+                                              &path_result) !=
+            KERNEL_FS_CONTEXT_STATUS_OK ||
+        path_result != 0 || resolved_mount == 0 ||
+        fork_resolved_path[0] != '/' ||
+        fork_resolved_path[1] != 'd') {
+        fail_files(48U, 0, path_result);
+    }
+    if (kernel_files_release(&child_files) != KERNEL_FILES_STATUS_OK ||
+        kernel_fs_context_release(&child_fs) !=
+            KERNEL_FS_CONTEXT_STATUS_OK ||
+        kernel_files_close(parent_files, 0, &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != 0) {
+        fail_files(49U, 0, result);
     }
 }
 
@@ -487,6 +603,16 @@ static void run_files_test(const void *dtb)
         fail_files(4U, 0, -1);
     }
 
+    run_fork_operations(&files, &fs, &mm);
+    if (kernel_files_release(&files) != KERNEL_FILES_STATUS_OK) {
+        fail_files(50U, KERNEL_FILES_STATUS_OK,
+                   KERNEL_FILES_STATUS_STATE);
+    }
+    files = (struct kernel_files){0};
+    if (kernel_files_create(&files, &heap) != KERNEL_FILES_STATUS_OK) {
+        fail_files(51U, KERNEL_FILES_STATUS_OK,
+                   KERNEL_FILES_STATUS_STATE);
+    }
     run_file_operations(&files, &fs, &mm);
 
     if (kernel_files_release(&files) != KERNEL_FILES_STATUS_OK ||

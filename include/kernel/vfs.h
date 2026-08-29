@@ -39,6 +39,11 @@ int kernel_vfs_open(struct kernel_vfs_mount *mount,
                     const char *path,
                     struct kernel_vfs_file *file);
 
+/* Rejects non-regular or non-executable files with EACCES. */
+int kernel_vfs_open_executable(struct kernel_vfs_mount *mount,
+                               const char *path,
+                               struct kernel_vfs_file *file);
+
 int kernel_vfs_pread(struct kernel_vfs_file *file,
                      uint64_t offset,
                      void *buffer,

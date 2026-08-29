@@ -29,7 +29,7 @@ enum kernel_uaccess_status kernel_copy_string_from_user(
     size_t *string_length);
 ```
 
-构建期直接选择架构实现，不使用运行期 vtable。syscall 和文件层从当前 task 借用只读 MM 后调用这些接口，不依赖 Sv39 PTE 位或物理地址布局。`uname(160)` 使用写入用户空间方向，`openat(56)` 的路径解析使用有界字符串读取，固定长度读侧接口供后续结构参数使用。公共 `kernel_user_range_check()` 在不访问页表的情况下校验整个用户半开区间。
+构建期直接选择架构实现，不使用运行期 vtable。syscall、文件层和 exec 准备阶段从当前 task 借用只读 MM 后调用这些接口，不依赖 Sv39 PTE 位或物理地址布局。`uname(160)` 使用写入用户空间方向，路径和 exec 字符串使用有界字符串读取，exec 的指针向量使用固定长度读侧接口。公共 `kernel_user_range_check()` 在不访问页表的情况下校验整个用户半开区间。
 
 ## 范围、权限与部分复制
 
@@ -43,7 +43,7 @@ enum kernel_uaccess_status kernel_copy_string_from_user(
 
 ## 并发与性能边界
 
-当前单 hart 内核没有运行期 `unmap/mprotect`、COW 或按需缺页，运行中任务拥有的 MM 在每个 lookup 与 direct-map 写入之间保持稳定。timer 可以抢占 syscall，但被抢占任务及其 MM 不会在调用栈恢复前被 reaper 释放。接入 SMP 或并发映射修改时，必须在 uaccess 内部增加 MM 读锁、页固定或等价的读侧协议，并与缺页、COW 和 TLB shootdown 协调；公共 syscall ABI 不需要因此改变。
+当前单 hart 内核没有运行期 `unmap/mprotect`、COW 或按需缺页，运行中任务拥有的 MM 在每个 lookup 与 direct-map 写入之间保持稳定。timer 可以抢占 syscall，但被抢占任务及其 MM 不会在调用栈恢复前被 reaper 释放；exec 也先完成全部用户字符串快照，之后才切换 MM。接入 SMP 或并发映射修改时，必须在 uaccess 内部增加 MM 读锁、页固定或等价的读侧协议，并与缺页、COW 和 TLB shootdown 协调；公共 syscall ABI 不需要因此改变。
 
 当前每个涉及的基页进行一次三级软件页表查询和一次物理页解析，随后执行页内线性字节复制；uaccess 自身不分配内存，不切换 `satp`，不执行 `SFENCE.VMA`，也不修改 `sstatus.SUM`。文件 `read` 已以 4 KiB staging chunk 使用该路径，但当前只用结构成本和 QEMU 正确性测试约束，尚未取得开发板吞吐、TLB miss 或 cache 数据。应在真实工作负载上比较软件遍历与 RISC-V SUM+异常表快路径，再决定阈值或替换策略。
 

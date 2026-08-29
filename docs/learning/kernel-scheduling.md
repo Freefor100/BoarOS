@@ -60,7 +60,7 @@ allocated page -> READY -> RUNNING -> READY
 
 队列操作不只是移动指针，还转移“谁拥有这张页、谁可能仍在使用这张栈”的事实。创建只有在页访问、元数据、canary 和初始 context 全部成功后才能提交 READY；此前失败必须回滚页。RUNNING 线程返回时，当前 SP 仍在自己的页中，因此不能边退出边释放。它先进入 EXITED 并永不恢复，等 idle 已运行在静态 boot stack 上再释放。
 
-用户任务持有一个 MM 引用，而不是直接拥有页表树。创建接口采用移动所有权：全部入口、用户栈权限、初始 Frame 和 TID 建立成功后，MM 才从调用者转交任务；失败时调用者仍然拥有它。MM 可以通过 acquire 被多个任务共享，末引用才销毁地址空间，因此 `CLONE_VM` 不需要复制或伪造页表 owner。当前测试已让两个独立线程组共享同一 MM，但创建入口仍只产生单成员线程组，尚无 `clone` flags。调度切换在修改队列/current 前使用任务创建时缓存的 `satp`，不会在 tick 热路径解析 MM；ASID 0 的根切换仍会全局刷新 TLB。
+用户任务持有 MM 句柄，而不是直接拥有页表树。首次创建采用移动所有权：入口、用户栈权限、初始 Frame 和 TID 建立成功后，MM 才从调用者转交任务；失败时调用者仍拥有它。普通 clone 通过 `kernel_mm_fork()` 建立独立地址空间，当前 eager 复制用户页；`acquire` 仍可表达多个 owner 共享同一 MM，未来 `CLONE_VM` 可以复用这个引用边界而不伪造页表所有权。调度切换在修改队列/current 前使用任务创建时缓存的 `satp`，不会在 tick 热路径解析 MM；ASID 0 的根切换仍会全局刷新 TLB。父子/zombie/wait 的生命周期知识见[进程生命周期学习总结](process-lifecycle.md)。
 
 退出切换把旧寄存器写入一份永不入队的 discard context。这样退出线程没有可再次选择的 switch context，idle 回收页也不会留下悬空恢复点。若退出路径发现 `tp`、状态、边界或 canary 损坏，它不能像普通函数那样返回错误；安全做法是记录错误、切到可信 idle 栈，再由仍能返回状态的 timer 调用链执行 fatal 诊断。
 

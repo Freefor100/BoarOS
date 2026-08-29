@@ -53,6 +53,11 @@ enum kernel_mm_status kernel_mm_acquire(
     struct kernel_mm *destination,
     const struct kernel_mm *source);
 
+/* Success creates an independent address space with copied user pages. */
+enum kernel_mm_status kernel_mm_fork(
+    struct kernel_mm *destination,
+    const struct kernel_mm *source);
+
 /* Success consumes a LIVE or CLEANUP source without changing its refcount. */
 enum kernel_mm_status kernel_mm_move(
     struct kernel_mm *destination,

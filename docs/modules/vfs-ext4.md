@@ -8,6 +8,8 @@
 
 `kernel_vfs_file_read_source()` 把保持打开的文件导出为带 `size/context/read_at` 的精确随机读源。回调只有填满整个范围才返回零；EOF 以内的短读转成 `-EIO`。ELF parser 因而能复用内存和 VFS 来源，而不依赖文件系统类型。
 
+`kernel_vfs_open_executable()` 在普通 open 之上统一要求 regular file 和至少一个执行位；目录、非普通文件或无执行位返回 `-EACCES`。生产 `/init` 与用户 `execve` 共用这一检查，权限拒绝时立即关闭临时 file；若清理需要重试，调用方仍保留 file owner。
+
 ## lwext4 配置和生命周期
 
 内核只编译 lwext4 读取路径需要的源码，关闭 journaling、xattr、debug/assert 和 mkfs，并把 malloc/calloc/realloc/free 绑定到当前内核堆。根设备是 raw whole-disk ext4，物理块大小固定为 512 字节；当前不解析分区表。
@@ -22,6 +24,7 @@
 make test-lwext4-host
 make test-vfs-riscv
 make test-files-riscv
+make test-exec-riscv
 make test-root-init-riscv
 ```
 

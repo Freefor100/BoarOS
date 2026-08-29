@@ -70,6 +70,16 @@ enum kernel_scheduler_status kernel_user_thread_create(
 enum kernel_scheduler_status kernel_scheduler_on_tick(
     uint64_t elapsed_ticks);
 
+/* Commits the image prepared by the current user task's exec transaction. */
+enum kernel_scheduler_status kernel_scheduler_exec_commit(void);
+
+enum kernel_scheduler_status kernel_scheduler_wait4_current(
+    int64_t pid,
+    uint64_t status_address,
+    uint32_t options,
+    uint64_t rusage_address,
+    int64_t *linux_result);
+
 enum kernel_scheduler_status kernel_scheduler_reap_one(
     struct kernel_thread_completion *completion);
 
