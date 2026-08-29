@@ -7,6 +7,9 @@
 
 #include <stdint.h>
 
+struct kernel_files;
+struct kernel_fs_context;
+
 enum kernel_scheduler_status {
     KERNEL_SCHEDULER_STATUS_OK = 0,
     KERNEL_SCHEDULER_STATUS_EMPTY,
@@ -20,6 +23,7 @@ enum kernel_scheduler_status {
     KERNEL_SCHEDULER_STATUS_STACK_CORRUPT,
     KERNEL_SCHEDULER_STATUS_PAGE_RELEASE,
     KERNEL_SCHEDULER_STATUS_ADDRESS_SPACE,
+    KERNEL_SCHEDULER_STATUS_RESOURCE_CLEANUP,
 };
 
 enum kernel_thread_kind {
@@ -51,9 +55,14 @@ enum kernel_scheduler_status kernel_thread_create(
     void (*entry)(void *),
     void *argument);
 
-/* Success consumes mm; failure leaves it owned by the caller. */
+/*
+ * Success consumes mm and, when non-null, the files/fs pair.  Failure
+ * leaves every caller-owned resource unchanged.
+ */
 enum kernel_scheduler_status kernel_user_thread_create(
     struct kernel_mm *mm,
+    struct kernel_files *files,
+    struct kernel_fs_context *fs,
     uintptr_t entry,
     uintptr_t stack_pointer,
     uintptr_t thread_pointer);

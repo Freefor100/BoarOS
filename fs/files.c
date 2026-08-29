@@ -102,21 +102,6 @@ enum kernel_files_status kernel_files_create(
     return KERNEL_FILES_STATUS_OK;
 }
 
-enum kernel_files_status kernel_files_move(
-    struct kernel_files *destination,
-    struct kernel_files *source)
-{
-    if (destination == 0 || source == 0 || destination == source) {
-        return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
-    }
-    if (!empty_files(destination) || !kernel_files_is_live(source)) {
-        return KERNEL_FILES_STATUS_STATE;
-    }
-    *destination = *source;
-    finish_files(source, KERNEL_FILES_MOVED);
-    return KERNEL_FILES_STATUS_OK;
-}
-
 static void queue_allocation_cleanup(struct kernel_files *files,
                                      void *pointer)
 {

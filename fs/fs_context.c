@@ -58,22 +58,6 @@ enum kernel_fs_context_status kernel_fs_context_create(
     return KERNEL_FS_CONTEXT_STATUS_OK;
 }
 
-enum kernel_fs_context_status kernel_fs_context_move(
-    struct kernel_fs_context *destination,
-    struct kernel_fs_context *source)
-{
-    if (destination == 0 || source == 0 || destination == source) {
-        return KERNEL_FS_CONTEXT_STATUS_INVALID_ARGUMENT;
-    }
-    if (!empty_context(destination) ||
-        !kernel_fs_context_is_live(source)) {
-        return KERNEL_FS_CONTEXT_STATUS_STATE;
-    }
-    *destination = *source;
-    finish_context(source, KERNEL_FS_CONTEXT_MOVED);
-    return KERNEL_FS_CONTEXT_STATUS_OK;
-}
-
 static size_t text_length(const char *text)
 {
     size_t length = 0U;

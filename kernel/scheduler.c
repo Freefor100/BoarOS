@@ -3,6 +3,9 @@
 #include <arch/riscv/sv39.h>
 #include <arch/riscv/thread.h>
 #include <arch/riscv/trap.h>
+#include <kernel/files.h>
+#include <kernel/fs_context.h>
+#include <kernel/heap.h>
 #include <kernel/mm.h>
 #include <kernel/page.h>
 #include <kernel/physical_page.h>
@@ -41,6 +44,8 @@ struct kernel_task {
     struct kernel_task *group_leader;
     uint32_t group_members;
     struct kernel_thread_completion completion;
+    struct kernel_files files;
+    struct kernel_fs_context fs;
     struct kernel_mm mm;
     struct riscv_switch_context context;
 } __attribute__((aligned(16)));
@@ -106,6 +111,7 @@ static enum kernel_scheduler_status validate_thread(
     uintptr_t base;
     uintptr_t expected_low;
     const uint64_t *canary;
+    int resources_absent;
 
     if (thread == 0 || thread->magic != KERNEL_THREAD_MAGIC ||
         thread->state != (uint32_t)expected_state) {
@@ -125,6 +131,8 @@ static enum kernel_scheduler_status validate_thread(
             thread->completion.tgid != 0 ||
             thread->tid != 0 || thread->tid_owned != 0U ||
             thread->group_leader != 0 || thread->group_members != 0U ||
+            thread->files.state != KERNEL_FILES_EMPTY ||
+            thread->fs.state != KERNEL_FS_CONTEXT_EMPTY ||
             thread->mm.state != KERNEL_MM_EMPTY) {
             return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
         }
@@ -156,10 +164,15 @@ static enum kernel_scheduler_status validate_thread(
             thread->completion.tgid != 0 ||
             thread->tid != 0 || thread->tid_owned != 0U ||
             thread->group_leader != 0 || thread->group_members != 0U ||
+            thread->files.state != KERNEL_FILES_EMPTY ||
+            thread->fs.state != KERNEL_FS_CONTEXT_EMPTY ||
             thread->mm.state != KERNEL_MM_EMPTY) {
             return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
         }
     } else {
+        resources_absent =
+            thread->files.state == KERNEL_FILES_EMPTY &&
+            thread->fs.state == KERNEL_FS_CONTEXT_EMPTY;
         if (thread->arch.user_mode != 1U ||
             thread->completion.kind != KERNEL_THREAD_KIND_USER ||
             thread->tid_owned > 1U ||
@@ -170,6 +183,38 @@ static enum kernel_scheduler_status validate_thread(
                thread->mm.state !=
                    KERNEL_MM_RELEASED)))) {
             return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
+        }
+        if ((thread->files.state == KERNEL_FILES_EMPTY) !=
+            (thread->fs.state == KERNEL_FS_CONTEXT_EMPTY)) {
+            return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
+        }
+        if (!resources_absent) {
+            if (expected_state != KERNEL_THREAD_STATE_EXITED) {
+                if (thread->files.state != KERNEL_FILES_LIVE ||
+                    thread->files.heap == 0 || thread->files.slots == 0 ||
+                    thread->fs.state != KERNEL_FS_CONTEXT_LIVE ||
+                    thread->fs.heap == 0 || thread->fs.root_mount == 0 ||
+                    thread->fs.cwd == 0 ||
+                    thread->files.heap != thread->fs.heap) {
+                    return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
+                }
+            } else {
+                if ((thread->files.state != KERNEL_FILES_LIVE &&
+                     thread->files.state != KERNEL_FILES_CLEANUP &&
+                     thread->files.state != KERNEL_FILES_RELEASED) ||
+                    (thread->fs.state != KERNEL_FS_CONTEXT_LIVE &&
+                     thread->fs.state != KERNEL_FS_CONTEXT_CLEANUP &&
+                     thread->fs.state != KERNEL_FS_CONTEXT_RELEASED)) {
+                    return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
+                }
+                if ((thread->files.state != KERNEL_FILES_RELEASED &&
+                     (thread->fs.state != KERNEL_FS_CONTEXT_LIVE ||
+                      thread->mm.state != KERNEL_MM_LIVE)) ||
+                    (thread->fs.state != KERNEL_FS_CONTEXT_RELEASED &&
+                     thread->mm.state != KERNEL_MM_LIVE)) {
+                    return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
+                }
+            }
         }
         if (thread->tid_owned != 0U) {
             if (thread->tid <= 0 || thread->group_leader != thread ||
@@ -536,6 +581,8 @@ restore_interrupts:
 
 enum kernel_scheduler_status kernel_user_thread_create(
     struct kernel_mm *mm,
+    struct kernel_files *files,
+    struct kernel_fs_context *fs,
     uintptr_t entry,
     uintptr_t stack_pointer,
     uintptr_t thread_pointer)
@@ -559,7 +606,7 @@ enum kernel_scheduler_status kernel_user_thread_create(
     if (scheduler.initialized != KERNEL_SCHEDULER_INITIALIZED) {
         return KERNEL_SCHEDULER_STATUS_NOT_INITIALIZED;
     }
-    if (mm == 0 || entry == 0U ||
+    if (mm == 0 || (files == 0) != (fs == 0) || entry == 0U ||
         (entry & (uintptr_t)1U) != 0U || stack_pointer == 0U ||
         (stack_pointer & (uintptr_t)15U) != 0U) {
         return KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
@@ -583,6 +630,13 @@ enum kernel_scheduler_status kernel_user_thread_create(
         goto restore_interrupts;
     }
     if (mm->allocator != scheduler.allocator) {
+        status = KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
+        goto restore_interrupts;
+    }
+    if (files != 0 &&
+        (!kernel_files_is_live(files) ||
+         !kernel_fs_context_is_live(fs) || files->heap != fs->heap ||
+         files->heap->page_allocator != scheduler.allocator)) {
         status = KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
         goto restore_interrupts;
     }
@@ -709,15 +763,25 @@ enum kernel_scheduler_status kernel_user_thread_create(
     thread->group_members = 1U;
     thread->completion.tid = tid;
     thread->completion.tgid = tid;
-    if (kernel_mm_move(&thread->mm, mm) !=
-        KERNEL_MM_STATUS_OK) {
-        pid_status = kernel_pid_release(&scheduler.pid_allocator, tid);
-        status = release_after_create_failure(
-            physical_address,
-            pid_status == KERNEL_PID_STATUS_OK
-                ? KERNEL_SCHEDULER_STATUS_ADDRESS_SPACE
-                : KERNEL_SCHEDULER_STATUS_INVALID_STATE);
-        goto restore_interrupts;
+    thread->mm = *mm;
+    mm->allocator = 0;
+    mm->record_page_address = 0U;
+    mm->state = KERNEL_MM_MOVED;
+    mm->cleanup_stage = KERNEL_MM_CLEANUP_NONE;
+    if (files != 0) {
+        thread->files = *files;
+        files->heap = 0;
+        files->slots = 0;
+        files->cleanup_files = 0;
+        files->cleanup_allocations = 0;
+        files->next_fd = 0U;
+        files->state = KERNEL_FILES_MOVED;
+
+        thread->fs = *fs;
+        fs->heap = 0;
+        fs->root_mount = 0;
+        fs->cwd = 0;
+        fs->state = KERNEL_FS_CONTEXT_MOVED;
     }
 
     ready_append(thread);
@@ -786,6 +850,8 @@ enum kernel_scheduler_status kernel_scheduler_reap_one(
     struct kernel_task *thread;
     struct kernel_task *next;
     enum kernel_mm_status mm_status;
+    enum kernel_files_status files_status;
+    enum kernel_fs_context_status fs_status;
     enum kernel_scheduler_status status;
 
     if (scheduler.initialized != KERNEL_SCHEDULER_INITIALIZED) {
@@ -850,6 +916,34 @@ enum kernel_scheduler_status kernel_scheduler_reap_one(
               result.tgid != thread->group_leader->tid)) ||
             (thread->tid_owned == 0U &&
              (result.tid <= 0 || result.tgid <= 0))) {
+            return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
+        }
+        if (thread->files.state == KERNEL_FILES_LIVE ||
+            thread->files.state == KERNEL_FILES_CLEANUP) {
+            files_status = kernel_files_release(&thread->files);
+            if (files_status != KERNEL_FILES_STATUS_OK) {
+                return files_status ==
+                               KERNEL_FILES_STATUS_CLEANUP_REQUIRED
+                           ? KERNEL_SCHEDULER_STATUS_RESOURCE_CLEANUP
+                           : KERNEL_SCHEDULER_STATUS_INVALID_STATE;
+            }
+        }
+        if (thread->files.state != KERNEL_FILES_EMPTY &&
+            thread->files.state != KERNEL_FILES_RELEASED) {
+            return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
+        }
+        if (thread->fs.state == KERNEL_FS_CONTEXT_LIVE ||
+            thread->fs.state == KERNEL_FS_CONTEXT_CLEANUP) {
+            fs_status = kernel_fs_context_release(&thread->fs);
+            if (fs_status != KERNEL_FS_CONTEXT_STATUS_OK) {
+                return fs_status ==
+                               KERNEL_FS_CONTEXT_STATUS_CLEANUP_REQUIRED
+                           ? KERNEL_SCHEDULER_STATUS_RESOURCE_CLEANUP
+                           : KERNEL_SCHEDULER_STATUS_INVALID_STATE;
+            }
+        }
+        if (thread->fs.state != KERNEL_FS_CONTEXT_EMPTY &&
+            thread->fs.state != KERNEL_FS_CONTEXT_RELEASED) {
             return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
         }
         if (thread->mm.state == KERNEL_MM_LIVE ||
@@ -1081,5 +1175,59 @@ enum kernel_task_status kernel_task_mm_borrow(
         return KERNEL_TASK_STATUS_STATE;
     }
     *mm = &task->mm;
+    return KERNEL_TASK_STATUS_OK;
+}
+
+static enum kernel_task_status validate_task_resource_borrow(
+    const struct kernel_task *task)
+{
+    if (task != scheduler.current ||
+        task->magic != KERNEL_THREAD_MAGIC ||
+        task->state != KERNEL_THREAD_STATE_RUNNING ||
+        task->arch.user_mode != 1U) {
+        return KERNEL_TASK_STATUS_STATE;
+    }
+    if (task->files.state == KERNEL_FILES_EMPTY &&
+        task->fs.state == KERNEL_FS_CONTEXT_EMPTY) {
+        return KERNEL_TASK_STATUS_RESOURCE_UNAVAILABLE;
+    }
+    if (!kernel_files_is_live(&task->files) ||
+        !kernel_fs_context_is_live(&task->fs)) {
+        return KERNEL_TASK_STATUS_STATE;
+    }
+    return KERNEL_TASK_STATUS_OK;
+}
+
+enum kernel_task_status kernel_task_files_borrow(
+    struct kernel_task *task,
+    struct kernel_files **files)
+{
+    enum kernel_task_status status;
+
+    if (task == 0 || files == 0) {
+        return KERNEL_TASK_STATUS_INVALID_ARGUMENT;
+    }
+    status = validate_task_resource_borrow(task);
+    if (status != KERNEL_TASK_STATUS_OK) {
+        return status;
+    }
+    *files = &task->files;
+    return KERNEL_TASK_STATUS_OK;
+}
+
+enum kernel_task_status kernel_task_fs_context_borrow(
+    const struct kernel_task *task,
+    const struct kernel_fs_context **fs)
+{
+    enum kernel_task_status status;
+
+    if (task == 0 || fs == 0) {
+        return KERNEL_TASK_STATUS_INVALID_ARGUMENT;
+    }
+    status = validate_task_resource_borrow(task);
+    if (status != KERNEL_TASK_STATUS_OK) {
+        return status;
+    }
+    *fs = &task->fs;
     return KERNEL_TASK_STATUS_OK;
 }

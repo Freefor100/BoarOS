@@ -39,10 +39,6 @@ enum kernel_fs_context_status kernel_fs_context_create(
     struct kernel_vfs_mount *root_mount,
     struct kernel_heap *heap);
 
-enum kernel_fs_context_status kernel_fs_context_move(
-    struct kernel_fs_context *destination,
-    struct kernel_fs_context *source);
-
 int kernel_fs_context_is_live(const struct kernel_fs_context *fs);
 
 /* A normal path error is returned through linux_result. */

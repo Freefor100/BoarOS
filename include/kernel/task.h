@@ -5,10 +5,13 @@
 
 struct kernel_task;
 struct kernel_mm;
+struct kernel_files;
+struct kernel_fs_context;
 
 enum kernel_task_status {
     KERNEL_TASK_STATUS_OK = 0,
     KERNEL_TASK_STATUS_INVALID_ARGUMENT,
+    KERNEL_TASK_STATUS_RESOURCE_UNAVAILABLE,
     KERNEL_TASK_STATUS_STATE,
 };
 
@@ -27,5 +30,14 @@ enum kernel_task_status kernel_task_tgid(
 enum kernel_task_status kernel_task_mm_borrow(
     const struct kernel_task *task,
     const struct kernel_mm **mm);
+
+/* The returned file table is borrowed and may be mutated by this syscall. */
+enum kernel_task_status kernel_task_files_borrow(
+    struct kernel_task *task,
+    struct kernel_files **files);
+
+enum kernel_task_status kernel_task_fs_context_borrow(
+    const struct kernel_task *task,
+    const struct kernel_fs_context **fs);
 
 #endif

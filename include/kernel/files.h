@@ -55,10 +55,6 @@ enum kernel_files_status kernel_files_create(
     struct kernel_files *files,
     struct kernel_heap *heap);
 
-enum kernel_files_status kernel_files_move(
-    struct kernel_files *destination,
-    struct kernel_files *source);
-
 int kernel_files_is_live(const struct kernel_files *files);
 
 /* Normal Linux ABI results, including negative errno, use linux_result. */

@@ -116,6 +116,8 @@ static enum kernel_scheduler_status create_elf_task(
                    : KERNEL_SCHEDULER_STATUS_ADDRESS_SPACE;
     }
     scheduler_status = kernel_user_thread_create(&mm,
+                                                 0,
+                                                 0,
                                                  entry.entry,
                                                  entry.stack_pointer,
                                                  0U);

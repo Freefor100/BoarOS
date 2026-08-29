@@ -26,8 +26,7 @@ for symbol in \
     kernel_scheduler_on_tick \
     activate_thread_address_space \
     validate_current \
-    validate_queues \
-    validate_thread.part.0
+    validate_queues
 do
     "$objdump" -dr --disassemble="$symbol" "$scheduler_object" \
         >>"$hot_disassembly"
@@ -38,7 +37,23 @@ do
     fi
 done
 
-if grep -Eq 'R_RISCV_CALL(_PLT)?[[:space:]]+(kernel_mm_|riscv_kernel_mm_|kernel_pid_|physical_page_)' \
+validate_thread_symbol=$(
+    "$objdump" -t "$scheduler_object" |
+        awk '$NF ~ /^validate_thread(\.part\.[0-9]+)?$/ { print $NF; exit }'
+)
+if [ -z "$validate_thread_symbol" ]; then
+    echo "missing scheduler hot-path symbol: validate_thread" >&2
+    exit 1
+fi
+"$objdump" -dr --disassemble="$validate_thread_symbol" "$scheduler_object" \
+    >>"$hot_disassembly"
+if ! grep -q "<$validate_thread_symbol>:" "$hot_disassembly"; then
+    cat "$hot_disassembly" >&2
+    echo "missing scheduler hot-path symbol: $validate_thread_symbol" >&2
+    exit 1
+fi
+
+if grep -Eq 'R_RISCV_CALL(_PLT)?[[:space:]]+(kernel_mm_|riscv_kernel_mm_|kernel_pid_|physical_page_|kernel_files_|kernel_fs_context_)' \
     "$hot_disassembly"; then
     cat "$hot_disassembly" >&2
     echo "scheduler tick path performs MM, PID, or physical-page lifecycle work" >&2

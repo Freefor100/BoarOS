@@ -252,11 +252,15 @@ static enum kernel_scheduler_status create_user_test(
     normal_leaf_address = code_address;
     available_before_invalid = physical_page_available(allocator);
     if (kernel_user_thread_create(&mm,
+                                  0,
+                                  0,
                                   USER_TEST_CODE_VA + 1U,
                                   USER_TEST_STACK_TOP,
                                   USER_TEST_TP_VALUE) !=
             KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT ||
         kernel_user_thread_create(&mm,
+                                  0,
+                                  0,
                                   USER_TEST_CODE_VA,
                                   USER_TEST_STACK_TOP - 8U,
                                   USER_TEST_TP_VALUE) !=
@@ -267,6 +271,8 @@ static enum kernel_scheduler_status create_user_test(
     }
     if (kernel_mm_acquire(&shared, &mm) != KERNEL_MM_STATUS_OK ||
         kernel_user_thread_create(&mm,
+                                  0,
+                                  0,
                                   USER_TEST_CODE_VA,
                                   USER_TEST_STACK_TOP,
                                   USER_TEST_TP_VALUE) !=
@@ -274,6 +280,8 @@ static enum kernel_scheduler_status create_user_test(
         return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
     }
     return kernel_user_thread_create(&shared,
+                                     0,
+                                     0,
                                      USER_TEST_CODE_VA,
                                      USER_TEST_SECOND_STACK_TOP,
                                      USER_TEST_SECOND_TP_VALUE);
@@ -328,6 +336,8 @@ static enum kernel_scheduler_status create_fault_test(
     }
     fault_record_address = mm.record_page_address;
     return kernel_user_thread_create(&mm,
+                                     0,
+                                     0,
                                      USER_TEST_CODE_VA,
                                      USER_TEST_STACK_TOP,
                                      0U);

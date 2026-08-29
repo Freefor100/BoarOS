@@ -3,6 +3,8 @@
 #include <arch/riscv/mm.h>
 #include <arch/riscv/root_boot.h>
 #include <arch/riscv/user_elf.h>
+#include <kernel/files.h>
+#include <kernel/fs_context.h>
 #include <kernel/mm.h>
 
 #include <stddef.h>
@@ -44,10 +46,23 @@ static enum riscv_root_boot_status cleanup_start_failure(
     struct kernel_vfs_file *file,
     struct riscv_sv39_user_space *space,
     struct kernel_mm *mm,
+    struct kernel_files *files,
+    struct kernel_fs_context *fs,
     enum riscv_root_boot_status failure)
 {
     int cleanup_failed = 0;
 
+    if ((files->state == KERNEL_FILES_LIVE ||
+         files->state == KERNEL_FILES_CLEANUP) &&
+        kernel_files_release(files) != KERNEL_FILES_STATUS_OK) {
+        cleanup_failed = 1;
+    }
+    if ((fs->state == KERNEL_FS_CONTEXT_LIVE ||
+         fs->state == KERNEL_FS_CONTEXT_CLEANUP) &&
+        kernel_fs_context_release(fs) !=
+            KERNEL_FS_CONTEXT_STATUS_OK) {
+        cleanup_failed = 1;
+    }
     if (file->private_data != 0 && kernel_vfs_close(file) != 0) {
         cleanup_failed = 1;
     }
@@ -89,6 +104,8 @@ enum riscv_root_boot_status riscv_root_boot_start(
     struct kernel_vfs_file file = {0};
     struct riscv_sv39_user_space space = {0};
     struct kernel_mm mm = {0};
+    struct kernel_files files = {0};
+    struct kernel_fs_context fs = {0};
     struct riscv_user_elf_request request = {0};
     struct riscv_user_elf_entry entry;
     enum riscv_virtio_mmio_block_status device_status;
@@ -177,7 +194,21 @@ enum riscv_root_boot_status riscv_root_boot_start(
         failure = RISCV_ROOT_BOOT_STATUS_ADDRESS_SPACE;
         goto fail;
     }
+    if (kernel_fs_context_create(&fs,
+                                 &root->mount,
+                                 &root->heap) !=
+        KERNEL_FS_CONTEXT_STATUS_OK) {
+        failure = RISCV_ROOT_BOOT_STATUS_RESOURCES;
+        goto fail;
+    }
+    if (kernel_files_create(&files, &root->heap) !=
+        KERNEL_FILES_STATUS_OK) {
+        failure = RISCV_ROOT_BOOT_STATUS_RESOURCES;
+        goto fail;
+    }
     scheduler_status = kernel_user_thread_create(&mm,
+                                                 &files,
+                                                 &fs,
                                                  entry.entry,
                                                  entry.stack_pointer,
                                                  0U);
@@ -194,6 +225,8 @@ fail:
                                  &file,
                                  &space,
                                  &mm,
+                                 &files,
+                                 &fs,
                                  failure);
 }
 

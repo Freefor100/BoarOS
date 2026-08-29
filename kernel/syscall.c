@@ -1,3 +1,6 @@
+#include <kernel/errno.h>
+#include <kernel/files.h>
+#include <kernel/fs_context.h>
 #include <kernel/mm.h>
 #include <kernel/syscall.h>
 #include <kernel/task.h>
@@ -6,12 +9,13 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#define LINUX_SYSCALL_OPENAT 56U
+#define LINUX_SYSCALL_CLOSE 57U
+#define LINUX_SYSCALL_READ 63U
 #define LINUX_SYSCALL_EXIT 93U
 #define LINUX_SYSCALL_UNAME 160U
 #define LINUX_SYSCALL_GETPID 172U
 #define LINUX_SYSCALL_GETTID 178U
-#define LINUX_ERROR_BAD_ADDRESS 14
-#define LINUX_ERROR_NOT_IMPLEMENTED 38
 #define LINUX_EXIT_STATUS_MASK UINT64_C(0xff)
 #define LINUX_UTS_FIELD_SIZE 65U
 
@@ -62,7 +66,7 @@ static enum kernel_syscall_status decode_uname(
                                         &copied);
     if (access_status == KERNEL_UACCESS_STATUS_FAULT) {
         decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
-        decoded->value = -LINUX_ERROR_BAD_ADDRESS;
+        decoded->value = -KERNEL_EFAULT;
         return KERNEL_SYSCALL_STATUS_OK;
     }
     if (access_status != KERNEL_UACCESS_STATUS_OK ||
@@ -71,6 +75,99 @@ static enum kernel_syscall_status decode_uname(
     }
     decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
     decoded->value = 0;
+    return KERNEL_SYSCALL_STATUS_OK;
+}
+
+static enum kernel_syscall_status decode_openat(
+    struct kernel_task *caller,
+    const struct kernel_syscall_request *request,
+    struct kernel_syscall_result *decoded)
+{
+    struct kernel_files *files;
+    const struct kernel_fs_context *fs;
+    const struct kernel_mm *mm;
+    int64_t linux_result;
+    enum kernel_task_status task_status;
+
+    task_status = kernel_task_files_borrow(caller, &files);
+    if (task_status == KERNEL_TASK_STATUS_RESOURCE_UNAVAILABLE) {
+        decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+        decoded->value = -KERNEL_ENODEV;
+        return KERNEL_SYSCALL_STATUS_OK;
+    }
+    if (task_status != KERNEL_TASK_STATUS_OK ||
+        kernel_task_fs_context_borrow(caller, &fs) !=
+            KERNEL_TASK_STATUS_OK ||
+        kernel_task_mm_borrow(caller, &mm) != KERNEL_TASK_STATUS_OK ||
+        kernel_files_openat(files,
+                            fs,
+                            mm,
+                            (int64_t)request->arguments[0],
+                            request->arguments[1],
+                            request->arguments[2],
+                            request->arguments[3],
+                            &linux_result) != KERNEL_FILES_STATUS_OK) {
+        return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    }
+    decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+    decoded->value = linux_result;
+    return KERNEL_SYSCALL_STATUS_OK;
+}
+
+static enum kernel_syscall_status decode_read(
+    struct kernel_task *caller,
+    const struct kernel_syscall_request *request,
+    struct kernel_syscall_result *decoded)
+{
+    struct kernel_files *files;
+    const struct kernel_mm *mm;
+    int64_t linux_result;
+    enum kernel_task_status task_status;
+
+    task_status = kernel_task_files_borrow(caller, &files);
+    if (task_status == KERNEL_TASK_STATUS_RESOURCE_UNAVAILABLE) {
+        decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+        decoded->value = -KERNEL_EBADF;
+        return KERNEL_SYSCALL_STATUS_OK;
+    }
+    if (task_status != KERNEL_TASK_STATUS_OK ||
+        kernel_task_mm_borrow(caller, &mm) != KERNEL_TASK_STATUS_OK ||
+        kernel_files_read(files,
+                          mm,
+                          (int64_t)request->arguments[0],
+                          request->arguments[1],
+                          request->arguments[2],
+                          &linux_result) != KERNEL_FILES_STATUS_OK) {
+        return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    }
+    decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+    decoded->value = linux_result;
+    return KERNEL_SYSCALL_STATUS_OK;
+}
+
+static enum kernel_syscall_status decode_close(
+    struct kernel_task *caller,
+    const struct kernel_syscall_request *request,
+    struct kernel_syscall_result *decoded)
+{
+    struct kernel_files *files;
+    int64_t linux_result;
+    enum kernel_task_status task_status;
+
+    task_status = kernel_task_files_borrow(caller, &files);
+    if (task_status == KERNEL_TASK_STATUS_RESOURCE_UNAVAILABLE) {
+        decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+        decoded->value = -KERNEL_EBADF;
+        return KERNEL_SYSCALL_STATUS_OK;
+    }
+    if (task_status != KERNEL_TASK_STATUS_OK ||
+        kernel_files_close(files,
+                           (int64_t)request->arguments[0],
+                           &linux_result) != KERNEL_FILES_STATUS_OK) {
+        return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    }
+    decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+    decoded->value = linux_result;
     return KERNEL_SYSCALL_STATUS_OK;
 }
 
@@ -87,7 +184,22 @@ enum kernel_syscall_status kernel_syscall_dispatch(
         return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     }
 
-    if (request->number == LINUX_SYSCALL_EXIT) {
+    if (request->number == LINUX_SYSCALL_OPENAT) {
+        if (decode_openat(caller, request, &decoded) !=
+            KERNEL_SYSCALL_STATUS_OK) {
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+        }
+    } else if (request->number == LINUX_SYSCALL_CLOSE) {
+        if (decode_close(caller, request, &decoded) !=
+            KERNEL_SYSCALL_STATUS_OK) {
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+        }
+    } else if (request->number == LINUX_SYSCALL_READ) {
+        if (decode_read(caller, request, &decoded) !=
+            KERNEL_SYSCALL_STATUS_OK) {
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+        }
+    } else if (request->number == LINUX_SYSCALL_EXIT) {
         decoded.action = KERNEL_SYSCALL_ACTION_EXIT;
         decoded.value = (int64_t)(request->arguments[0] &
                                   LINUX_EXIT_STATUS_MASK);
@@ -113,7 +225,7 @@ enum kernel_syscall_status kernel_syscall_dispatch(
         decoded.value = id;
     } else {
         decoded.action = KERNEL_SYSCALL_ACTION_RETURN;
-        decoded.value = -LINUX_ERROR_NOT_IMPLEMENTED;
+        decoded.value = -KERNEL_ENOSYS;
     }
 
     *result = decoded;

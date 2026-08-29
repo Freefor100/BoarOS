@@ -10,10 +10,11 @@ memory=${QEMU_MEMORY:-512M}
 work_dir=$(mktemp -d)
 output="$work_dir/root-init.log"
 disk="$work_dir/root.img"
+data="$work_dir/data"
 
 trap 'rm -rf "$work_dir"' EXIT HUP INT TERM
 
-for tool in truncate mkfs.ext4 debugfs; do
+for tool in truncate mkfs.ext4 debugfs awk; do
     if ! command -v "$tool" >/dev/null 2>&1; then
         echo "missing root-init test tool: $tool" >&2
         exit 1
@@ -30,9 +31,12 @@ fi
 
 truncate -s 32M "$disk"
 mkfs.ext4 -q -F "$disk"
+awk 'BEGIN { for (i = 0; i < 9000; i++) printf "%c", 65 + (i % 26) }' \
+    >"$data"
 debugfs -w -R "write $init /init" "$disk" >/dev/null 2>&1
 debugfs -w -R "set_inode_field /init mode 0100755" "$disk" \
     >/dev/null 2>&1
+debugfs -w -R "write $data /data" "$disk" >/dev/null 2>&1
 
 if ! timeout -k 2s 15s "$qemu" \
     -machine virt \

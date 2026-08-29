@@ -67,6 +67,28 @@ user_test_payload_start:
     li t0, USER_TEST_GP_VALUE
     bne gp, t0, 2f
 
+    # Low-level U-mode probes deliberately have no files/fs owners.
+    li a0, -100
+    li a1, USER_TEST_DATA_VA
+    li a2, 0
+    li a3, 0
+    li a7, 56
+    ecall
+    li t0, -19
+    bne a0, t0, 2f
+    li a0, 0
+    li a1, USER_TEST_DATA_VA
+    li a2, 1
+    li a7, 63
+    ecall
+    li t0, -9
+    bne a0, t0, 2f
+    li a0, 0
+    li a7, 57
+    ecall
+    li t0, -9
+    bne a0, t0, 2f
+
     li a7, 172
     ecall
     blez a0, 2f

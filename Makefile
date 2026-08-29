@@ -136,6 +136,10 @@ TEST_RUNTIME_C_SOURCES := \
 	arch/riscv/user_elf.c \
 	arch/riscv/virt_uart.c \
 	arch/riscv/virtio_mmio_block.c \
+	fs/files.c \
+	fs/fs_context.c \
+	fs/lwext4_port.c \
+	fs/vfs.c \
 	kernel/block.c \
 	kernel/elf64.c \
 	kernel/pid.c \
@@ -144,8 +148,10 @@ TEST_RUNTIME_C_SOURCES := \
 	kernel/scheduler.c \
 	kernel/syscall.c \
 	kernel/tick.c \
+	lib/qsort.c \
 	lib/string.c \
-	mm/heap.c
+	mm/heap.c \
+	$(LWEXT4_SOURCES)
 TEST_RUNTIME_ASM_SOURCES := \
 	arch/riscv/boot.S \
 	arch/riscv/context_switch.S \
@@ -209,11 +215,7 @@ BLOCK_TEST_OBJECTS := \
 	$(TEST_RUNTIME_OBJECTS) \
 	$(patsubst %.c,$(BUILD_DIR)/%.o,$(BLOCK_TEST_C_SOURCES))
 VFS_TEST_SUPPORT_C_SOURCES := \
-	fs/lwext4_port.c \
-	fs/vfs.c \
-	kernel/dtb.c \
-	lib/qsort.c \
-	$(LWEXT4_SOURCES)
+	kernel/dtb.c
 VFS_TEST_C_SOURCES := \
 	$(VFS_TEST_SUPPORT_C_SOURCES) \
 	tests/riscv/vfs_main.c
@@ -228,8 +230,6 @@ VFS_RECOVERY_TEST_OBJECTS := \
 	$(VFS_RECOVERY_TEST_MAIN_OBJECT)
 FILES_TEST_C_SOURCES := \
 	$(VFS_TEST_SUPPORT_C_SOURCES) \
-	fs/files.c \
-	fs/fs_context.c \
 	tests/riscv/files_main.c
 FILES_TEST_OBJECTS := \
 	$(TEST_RUNTIME_OBJECTS) \
