@@ -44,9 +44,9 @@ BoarOS 的通用 `kernel_mm` 是可 acquire/move/release 的引用，RISC-V 用�
 
 RISC-V Linux 用户 ABI 用 `a7` 传系统调用号，`a0..a5` 传最多六个参数，返回值放在 `a0`。用户执行 `ECALL` 后，`sepc` 指向 `ECALL` 本身；若系统调用要返回用户代码，内核必须把 `sepc` 前移 4 字节，否则会再次执行同一条指令。
 
-BoarOS 当前实现 `openat(56)`、`close(57)`、`read(63)`、`exit(93)`、`uname(160)`、`getpid(172)`、`getppid(173)`、`gettid(178)`、普通进程 `clone(220)`、`execve(221)` 和 `wait4(260)`。文件调用从 current task 借用 files/fs/MM，并返回 fd、字节数或负 Linux errno；`uname` 使用 Linux 六个 65 字节字段、总计 390 字节的 `new_utsname`，用户目标无效时返回 `-EFAULT`；getpid/gettid/getppid 分别观察线程组、任务和父进程身份。clone 是特殊的双返回系统调用，架构层必须复制 syscall 入口 Trap Frame，并分别设置父子 `a0`；wait 可能在内核中阻塞并在唤醒后才完成同一次 ecall。当前进程都是单成员组，所以 getpid 与 gettid 相同。未知调用返回 `-ENOSYS`（错误号 38），普通返回路径前移 `sepc` 后继续执行。
+BoarOS 当前实现 `openat(56)`、`close(57)`、`read(63)`、`exit(93)`、`uname(160)`、`getpid(172)`、`getppid(173)`、`gettid(178)`、`brk(214)`、普通进程 `clone(220)`、`execve(221)` 和 `wait4(260)`。文件调用从 current task 借用 files/fs/MM，并返回 fd、字节数或负 Linux errno；`uname` 使用 Linux 六个 65 字节字段、总计 390 字节的 `new_utsname`，用户目标无效时返回 `-EFAULT`；getpid/gettid/getppid 分别观察线程组、任务和父进程身份。raw `brk` 返回调整后的精确地址或拒绝时的原地址，不能套用 libc 的 0/-1 包装语义。clone 是特殊的双返回系统调用，架构层必须复制 syscall 入口 Trap Frame，并分别设置父子 `a0`；wait 可能在内核中阻塞并在唤醒后才完成同一次 ecall。当前进程都是单成员组，所以 getpid 与 gettid 相同。未知调用返回 `-ENOSYS`（错误号 38），普通返回路径前移 `sepc` 后继续执行。
 
-系统调用解码与架构 Trap 分开：Trap 层负责寄存器、`sepc` 和显式 current task，通用解码层负责编号、参数和结果语义。普通调用返回时推进旧 `sepc` 并写 `a0`；exec 成功则不能返回旧指令流，而要由 scheduler 安装新地址空间和全新 Trap Frame。`exit` 目前只结束当前 task；尚未实现 `exit_group`、父子关系、zombie/wait、资源共享、信号或 `fork/clone`，现有资源模型不伪装这些能力。
+系统调用解码与架构 Trap 分开：Trap 层负责寄存器、`sepc` 和显式 current task，通用解码层负责编号、参数和结果语义。普通调用返回时推进旧 `sepc` 并写 `a0`；exec 成功则不能返回旧指令流，而要由 scheduler 安装新地址空间和全新 Trap Frame。`exit` 目前只结束当前单成员进程，普通 clone 已建立父子、zombie/wait 和 reparent 生命周期；尚未实现 `exit_group`、线程组共享、信号或通用 clone flags，现有资源模型不伪装这些能力。
 
 ## Exec 为什么需要两阶段提交
 
@@ -68,13 +68,13 @@ BoarOS 当前逐基页调用 `kernel_mm_lookup()`，按复制方向检查 `USER|
 
 ## 用户故障与内核故障必须分开
 
-`sstatus.SPP` 能区分 trap 来源。U-mode page fault 先按当前 MM 的 VMA 权限和 fault policy 分类：合法匿名栈空洞补零页并重试原指令，VMA/权限不允许才记录包含 `scause/stval` 的用户故障；补页 OOM 以资源原因终止，父进程看到 wait status 9。PTE 已存在却仍发生允许访问的 page fault、页表状态错误和未完成清理说明内核不变量可能破坏，不能伪装成普通用户错误。S-mode 未处理故障同样走 fatal 诊断和关机，不能套用“杀掉当前用户任务”继续运行。
+`sstatus.SPP` 能区分 trap 来源。U-mode page fault 先按当前 MM 的 VMA 权限和 fault policy 分类：合法匿名栈/`brk` heap 空洞补零页并重试原指令，VMA/权限不允许才记录包含 `scause/stval` 的用户故障；补页 OOM 以资源原因终止，父进程看到 wait status 9。PTE 已存在却仍发生允许访问的 page fault、页表状态错误和未完成清理说明内核不变量可能破坏，不能伪装成普通用户错误。S-mode 未处理故障同样走 fatal 诊断和关机，不能套用“杀掉当前用户任务”继续运行。
 
 这一策略要求故障任务拥有独立内核栈和有效资源 owner。调度器必须先切到其他可信栈，才能释放故障任务的任务页；用户页表也不能在 `satp` 仍指向它时销毁。BoarOS 的 idle reaper 在内核根页表和 boot stack 上处理完成队列，依次关闭 fd/open file description，释放 fs context、MM 引用、TID 和任务页。
 
 ## 当前项目选择与平台边界
 
-BoarOS 先用手工映射探针验证首次 `SRET`、真实 timer 抢占、U-mode syscall、同步页故障、调度恢复和完整资源回收，再用独立链接的静态 ELF 验证装载器产出的代码、数据、BSS 和 Linux 形态的 `argc/argv/envp/auxv` 初始栈。生产路径进一步从 DTB 发现的 VirtIO 块设备只读挂载 ext4，以精确随机读直接把 `/init` 的 `PT_LOAD` 装入用户页；PID 1 通过文件描述符读取同一根上的普通文件，再连续 exec 两个独立静态 ELF，最后沿 exec/files/fs/MM/TID/task 顺序释放全部资源。当前 TID/TGID 仍只有单成员线程组；具备单线程 exec 不等于已经实现 `fork/clone/wait`、多线程 exec 收拢或 Linux 的资源共享规则。
+BoarOS 先用手工映射探针验证首次 `SRET`、真实 timer 抢占、U-mode syscall、同步页故障、调度恢复和完整资源回收，再用独立链接的静态 ELF 验证装载器产出的代码、数据、BSS 和 Linux 形态的 `argc/argv/envp/auxv` 初始栈。生产路径进一步从 DTB 发现的 VirtIO 块设备只读挂载 ext4，以精确随机读直接把 `/init` 的 `PT_LOAD` 装入用户页；PID 1 通过文件描述符读取同一根上的普通文件，再连续 exec 两个独立静态 ELF，并验证 `brk` heap、普通 clone/wait/reparent，最后沿 exec/files/fs/MM/TID/task 顺序释放全部资源。当前 TID/TGID 仍只有单成员线程组；具备普通进程 clone 不等于已经实现多线程 exec 收拢或 Linux 的通用资源共享规则。
 
 Sv39、`satp`、`sscratch`、Trap Frame 和 RISC-V syscall 寄存器约定属于架构层，可在 QEMU `virt` 与 VisionFive 2 复用。SBI/固件交接、RAM 与 MMIO 布局、timebase、UART 和中断控制器仍属于平台层；QEMU 上通过 U-mode 测试不等于开发板适配已经完成。
 

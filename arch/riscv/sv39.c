@@ -10,6 +10,7 @@
 #define RISCV_SV39_PTE_USER UINT64_C(0x010)
 #define RISCV_SV39_PTE_ACCESSED UINT64_C(0x040)
 #define RISCV_SV39_PTE_DIRTY UINT64_C(0x080)
+#define RISCV_SV39_PTE_RETIRED UINT64_C(0x100)
 #define RISCV_SV39_PTE_FLAGS_MASK UINT64_C(0x3ff)
 #define RISCV_SV39_PTE_ALLOWED_MASK ((UINT64_C(1) << 54U) - UINT64_C(1))
 #define RISCV_SV39_INDEX_MASK UINT64_C(0x1ff)
@@ -471,6 +472,13 @@ static int valid_user_leaf_entry(uint64_t entry)
              (entry & RISCV_SV39_PTE_READ) == 0U);
 }
 
+static int valid_retired_entry(uint64_t entry)
+{
+    return (entry & ~RISCV_SV39_PTE_ALLOWED_MASK) == 0U &&
+           (entry & RISCV_SV39_PTE_FLAGS_MASK) ==
+               RISCV_SV39_PTE_RETIRED;
+}
+
 static uint64_t entry_address(uint64_t entry)
 {
     return (entry >> 10U) << BOAROS_PAGE_SHIFT;
@@ -491,6 +499,12 @@ static int valid_user_permissions(uint32_t permissions)
 static uint64_t user_leaf_entry(uint64_t address, uint32_t permissions)
 {
     return leaf_entry(address, permissions) | RISCV_SV39_PTE_USER;
+}
+
+static uint64_t retired_entry(uint64_t address)
+{
+    return ((address >> BOAROS_PAGE_SHIFT) << 10U) |
+           RISCV_SV39_PTE_RETIRED;
 }
 
 enum riscv_sv39_status riscv_sv39_user_space_init(
@@ -542,6 +556,7 @@ enum riscv_sv39_status riscv_sv39_user_space_init(
             result.root_address = 0U;
             result.table_pages = 0U;
             result.leaf_pages = 0U;
+            result.retired_pages = 0U;
             result.cleanup_page_address = root_address;
             result.cleanup_page_owned = 1U;
             result.state = RISCV_SV39_USER_SPACE_CLEANUP;
@@ -562,6 +577,7 @@ enum riscv_sv39_status riscv_sv39_user_space_init(
     result.root_address = root_address;
     result.table_pages = 1U;
     result.leaf_pages = 0U;
+    result.retired_pages = 0U;
     result.cleanup_page_address = 0U;
     result.cleanup_page_owned = 0U;
     result.state = RISCV_SV39_USER_SPACE_LIVE;
@@ -827,6 +843,9 @@ enum riscv_sv39_status riscv_sv39_user_lookup(
             return RISCV_SV39_STATUS_NOT_MAPPED;
         }
         if (level == 2U) {
+            if (valid_retired_entry(entry)) {
+                return RISCV_SV39_STATUS_NOT_MAPPED;
+            }
             if (!valid_user_leaf_entry(entry)) {
                 return RISCV_SV39_STATUS_STATE;
             }
@@ -849,6 +868,381 @@ enum riscv_sv39_status riscv_sv39_user_lookup(
     }
 
     return RISCV_SV39_STATUS_STATE;
+}
+
+static int user_range_overlaps(uint64_t base,
+                               uint64_t span,
+                               uint64_t start,
+                               uint64_t end)
+{
+    return base < end && start < base + span;
+}
+
+static enum riscv_sv39_status validate_owned_range(
+    struct riscv_sv39_user_space *space,
+    uint64_t start,
+    uint64_t end,
+    int active_leaves_allowed,
+    uint32_t *active_pages,
+    uint32_t *retired_pages)
+{
+    uint64_t *root;
+    uint64_t *level1;
+    uint64_t *level0;
+    uint64_t root_base;
+    uint64_t level1_base;
+    uint64_t page_base;
+    void *owned_page;
+    uint32_t root_index;
+    uint32_t level1_index;
+    uint32_t level0_index;
+    enum riscv_sv39_status status;
+
+    *active_pages = 0U;
+    *retired_pages = 0U;
+
+    status = resolve_runtime_table(space->allocator,
+                                   space->root_address,
+                                   &root);
+    if (status != RISCV_SV39_STATUS_OK) {
+        return status;
+    }
+    for (root_index = 0U;
+         root_index < RISCV_SV39_USER_ROOT_ENTRIES;
+         root_index++) {
+        root_base = (uint64_t)root_index << 30U;
+        if (!user_range_overlaps(root_base,
+                                 UINT64_C(1) << 30U,
+                                 start,
+                                 end) ||
+            root[root_index] == 0U) {
+            continue;
+        }
+        if (!valid_nonleaf_entry(root[root_index])) {
+            return RISCV_SV39_STATUS_STATE;
+        }
+        status = resolve_runtime_table(space->allocator,
+                                       entry_address(root[root_index]),
+                                       &level1);
+        if (status != RISCV_SV39_STATUS_OK) {
+            return status;
+        }
+        for (level1_index = 0U;
+             level1_index < BOAROS_PAGE_SIZE / sizeof(*level1);
+             level1_index++) {
+            level1_base = root_base |
+                          ((uint64_t)level1_index << 21U);
+            if (!user_range_overlaps(level1_base,
+                                     UINT64_C(1) << 21U,
+                                     start,
+                                     end) ||
+                level1[level1_index] == 0U) {
+                continue;
+            }
+            if (!valid_nonleaf_entry(level1[level1_index])) {
+                return RISCV_SV39_STATUS_STATE;
+            }
+            status = resolve_runtime_table(
+                space->allocator,
+                entry_address(level1[level1_index]),
+                &level0);
+            if (status != RISCV_SV39_STATUS_OK) {
+                return status;
+            }
+            for (level0_index = 0U;
+                 level0_index < BOAROS_PAGE_SIZE / sizeof(*level0);
+                 level0_index++) {
+                page_base = level1_base |
+                            ((uint64_t)level0_index <<
+                             BOAROS_PAGE_SHIFT);
+                if (page_base < start || page_base >= end ||
+                    level0[level0_index] == 0U) {
+                    continue;
+                }
+                if (valid_user_leaf_entry(level0[level0_index])) {
+                    if (!active_leaves_allowed ||
+                        *active_pages == UINT32_MAX) {
+                        return RISCV_SV39_STATUS_STATE;
+                    }
+                    (*active_pages)++;
+                } else if (valid_retired_entry(
+                               level0[level0_index])) {
+                    if (*retired_pages == UINT32_MAX) {
+                        return RISCV_SV39_STATUS_STATE;
+                    }
+                    (*retired_pages)++;
+                } else {
+                    return RISCV_SV39_STATUS_STATE;
+                }
+                if (physical_page_resolve(
+                        space->allocator,
+                        entry_address(level0[level0_index]),
+                        &owned_page) != PHYSICAL_PAGE_STATUS_OK) {
+                    return RISCV_SV39_STATUS_STATE;
+                }
+            }
+        }
+    }
+    if (*active_pages > space->leaf_pages ||
+        *retired_pages > space->retired_pages ||
+        *active_pages > UINT32_MAX - space->retired_pages) {
+        return RISCV_SV39_STATUS_STATE;
+    }
+    return RISCV_SV39_STATUS_OK;
+}
+
+static enum riscv_sv39_status retire_owned_range(
+    struct riscv_sv39_user_space *space,
+    uint64_t start,
+    uint64_t end,
+    int *changed)
+{
+    uint64_t *root;
+    uint64_t *level1;
+    uint64_t *level0;
+    uint64_t root_base;
+    uint64_t level1_base;
+    uint64_t page_base;
+    uint32_t root_index;
+    uint32_t level1_index;
+    uint32_t level0_index;
+    enum riscv_sv39_status status;
+
+    status = resolve_runtime_table(space->allocator,
+                                   space->root_address,
+                                   &root);
+    if (status != RISCV_SV39_STATUS_OK) {
+        return status;
+    }
+    for (root_index = 0U;
+         root_index < RISCV_SV39_USER_ROOT_ENTRIES;
+         root_index++) {
+        root_base = (uint64_t)root_index << 30U;
+        if (!user_range_overlaps(root_base,
+                                 UINT64_C(1) << 30U,
+                                 start,
+                                 end) ||
+            root[root_index] == 0U) {
+            continue;
+        }
+        status = resolve_runtime_table(space->allocator,
+                                       entry_address(root[root_index]),
+                                       &level1);
+        if (status != RISCV_SV39_STATUS_OK) {
+            return status;
+        }
+        for (level1_index = 0U;
+             level1_index < BOAROS_PAGE_SIZE / sizeof(*level1);
+             level1_index++) {
+            level1_base = root_base |
+                          ((uint64_t)level1_index << 21U);
+            if (!user_range_overlaps(level1_base,
+                                     UINT64_C(1) << 21U,
+                                     start,
+                                     end) ||
+                level1[level1_index] == 0U) {
+                continue;
+            }
+            status = resolve_runtime_table(
+                space->allocator,
+                entry_address(level1[level1_index]),
+                &level0);
+            if (status != RISCV_SV39_STATUS_OK) {
+                return status;
+            }
+            for (level0_index = 0U;
+                 level0_index < BOAROS_PAGE_SIZE / sizeof(*level0);
+                 level0_index++) {
+                page_base = level1_base |
+                            ((uint64_t)level0_index <<
+                             BOAROS_PAGE_SHIFT);
+                if (page_base < start || page_base >= end ||
+                    !valid_user_leaf_entry(level0[level0_index])) {
+                    continue;
+                }
+                if (space->leaf_pages == 0U ||
+                    space->retired_pages == UINT32_MAX) {
+                    return RISCV_SV39_STATUS_STATE;
+                }
+                level0[level0_index] = retired_entry(
+                    entry_address(level0[level0_index]));
+                space->leaf_pages--;
+                space->retired_pages++;
+                *changed = 1;
+            }
+        }
+    }
+    return RISCV_SV39_STATUS_OK;
+}
+
+static enum riscv_sv39_status reclaim_retired_range(
+    struct riscv_sv39_user_space *space,
+    uint64_t start,
+    uint64_t end,
+    uint32_t *deferred_pages)
+{
+    uint64_t *root;
+    uint64_t *level1;
+    uint64_t *level0;
+    uint64_t root_base;
+    uint64_t level1_base;
+    uint64_t page_base;
+    uint32_t root_index;
+    uint32_t level1_index;
+    uint32_t level0_index;
+    enum riscv_sv39_status status;
+
+    *deferred_pages = 0U;
+    status = resolve_runtime_table(space->allocator,
+                                   space->root_address,
+                                   &root);
+    if (status != RISCV_SV39_STATUS_OK) {
+        return status;
+    }
+    for (root_index = 0U;
+         root_index < RISCV_SV39_USER_ROOT_ENTRIES;
+         root_index++) {
+        root_base = (uint64_t)root_index << 30U;
+        if (!user_range_overlaps(root_base,
+                                 UINT64_C(1) << 30U,
+                                 start,
+                                 end) ||
+            root[root_index] == 0U) {
+            continue;
+        }
+        status = resolve_runtime_table(space->allocator,
+                                       entry_address(root[root_index]),
+                                       &level1);
+        if (status != RISCV_SV39_STATUS_OK) {
+            return status;
+        }
+        for (level1_index = 0U;
+             level1_index < BOAROS_PAGE_SIZE / sizeof(*level1);
+             level1_index++) {
+            level1_base = root_base |
+                          ((uint64_t)level1_index << 21U);
+            if (!user_range_overlaps(level1_base,
+                                     UINT64_C(1) << 21U,
+                                     start,
+                                     end) ||
+                level1[level1_index] == 0U) {
+                continue;
+            }
+            status = resolve_runtime_table(
+                space->allocator,
+                entry_address(level1[level1_index]),
+                &level0);
+            if (status != RISCV_SV39_STATUS_OK) {
+                return status;
+            }
+            for (level0_index = 0U;
+                 level0_index < BOAROS_PAGE_SIZE / sizeof(*level0);
+                 level0_index++) {
+                page_base = level1_base |
+                            ((uint64_t)level0_index <<
+                             BOAROS_PAGE_SHIFT);
+                if (page_base < start || page_base >= end ||
+                    !valid_retired_entry(level0[level0_index])) {
+                    continue;
+                }
+                if (space->retired_pages == 0U) {
+                    return RISCV_SV39_STATUS_STATE;
+                }
+                if (physical_page_release(
+                        space->allocator,
+                        entry_address(level0[level0_index])) ==
+                    PHYSICAL_PAGE_STATUS_OK) {
+                    level0[level0_index] = 0U;
+                    space->retired_pages--;
+                } else {
+                    (*deferred_pages)++;
+                }
+            }
+        }
+    }
+    return RISCV_SV39_STATUS_OK;
+}
+
+enum riscv_sv39_status riscv_sv39_user_unmap_owned_range(
+    struct riscv_sv39_user_space *space,
+    uint64_t start,
+    uint64_t end,
+    uint32_t *deferred_pages)
+{
+    int changed = 0;
+    uint32_t active_pages;
+    uint32_t retired_pages;
+    enum riscv_sv39_status status;
+
+    if (space == 0 || deferred_pages == 0) {
+        return RISCV_SV39_STATUS_INVALID;
+    }
+    if (space->state != RISCV_SV39_USER_SPACE_LIVE) {
+        return RISCV_SV39_STATUS_STATE;
+    }
+    if (start < RISCV_SV39_PAGE_SIZE_4K || start >= end ||
+        end > RISCV_SV39_USER_LIMIT ||
+        (start & BOAROS_PAGE_MASK) != 0U ||
+        (end & BOAROS_PAGE_MASK) != 0U) {
+        return RISCV_SV39_STATUS_INVALID;
+    }
+    status = validate_owned_range(space,
+                                  start,
+                                  end,
+                                  1,
+                                  &active_pages,
+                                  &retired_pages);
+    if (status != RISCV_SV39_STATUS_OK) {
+        return status;
+    }
+    status = retire_owned_range(space, start, end, &changed);
+    if (status != RISCV_SV39_STATUS_OK) {
+        return status;
+    }
+    if (changed != 0) {
+        __asm__ volatile("sfence.vma zero, zero" : : : "memory");
+    }
+    return reclaim_retired_range(space,
+                                 start,
+                                 end,
+                                 deferred_pages);
+}
+
+enum riscv_sv39_status riscv_sv39_user_reclaim_retired_range(
+    struct riscv_sv39_user_space *space,
+    uint64_t start,
+    uint64_t end,
+    uint32_t *deferred_pages)
+{
+    uint32_t active_pages;
+    uint32_t retired_pages;
+    enum riscv_sv39_status status;
+
+    if (space == 0 || deferred_pages == 0) {
+        return RISCV_SV39_STATUS_INVALID;
+    }
+    if (space->state != RISCV_SV39_USER_SPACE_LIVE) {
+        return RISCV_SV39_STATUS_STATE;
+    }
+    if (start < RISCV_SV39_PAGE_SIZE_4K || start >= end ||
+        end > RISCV_SV39_USER_LIMIT ||
+        (start & BOAROS_PAGE_MASK) != 0U ||
+        (end & BOAROS_PAGE_MASK) != 0U) {
+        return RISCV_SV39_STATUS_INVALID;
+    }
+    status = validate_owned_range(space,
+                                  start,
+                                  end,
+                                  0,
+                                  &active_pages,
+                                  &retired_pages);
+    if (status != RISCV_SV39_STATUS_OK) {
+        return status;
+    }
+    return reclaim_retired_range(space,
+                                 start,
+                                 end,
+                                 deferred_pages);
 }
 
 enum riscv_sv39_status riscv_sv39_user_space_populate(
@@ -969,6 +1363,7 @@ static enum riscv_sv39_status init_forked_user_space(
             result.root_address = 0U;
             result.table_pages = 0U;
             result.leaf_pages = 0U;
+            result.retired_pages = 0U;
             result.cleanup_page_address = root_address;
             result.cleanup_page_owned = 1U;
             result.state = RISCV_SV39_USER_SPACE_CLEANUP;
@@ -988,6 +1383,7 @@ static enum riscv_sv39_status init_forked_user_space(
     result.root_address = root_address;
     result.table_pages = 1U;
     result.leaf_pages = 0U;
+    result.retired_pages = 0U;
     result.cleanup_page_address = 0U;
     result.cleanup_page_owned = 0U;
     result.state = RISCV_SV39_USER_SPACE_LIVE;
@@ -1108,6 +1504,9 @@ enum riscv_sv39_status riscv_sv39_user_space_fork(
                 if (level0[level0_index] == 0U) {
                     continue;
                 }
+                if (valid_retired_entry(level0[level0_index])) {
+                    continue;
+                }
                 if (!valid_user_leaf_entry(level0[level0_index])) {
                     return RISCV_SV39_STATUS_STATE;
                 }
@@ -1146,6 +1545,7 @@ enum riscv_sv39_status riscv_sv39_user_space_move(
     source->root_address = 0U;
     source->table_pages = 0U;
     source->leaf_pages = 0U;
+    source->retired_pages = 0U;
     source->cleanup_page_address = 0U;
     source->cleanup_page_owned = 0U;
     source->state = RISCV_SV39_USER_SPACE_MOVED;
@@ -1158,8 +1558,14 @@ static enum riscv_sv39_status release_leaf(
 {
     uint64_t saved_entry = *entry;
 
-    if (!valid_user_leaf_entry(saved_entry) ||
-        space->leaf_pages == 0U) {
+    if (!valid_user_leaf_entry(saved_entry) &&
+        !valid_retired_entry(saved_entry)) {
+        return RISCV_SV39_STATUS_STATE;
+    }
+    if ((valid_retired_entry(saved_entry) &&
+         space->retired_pages == 0U) ||
+        (valid_user_leaf_entry(saved_entry) &&
+         space->leaf_pages == 0U)) {
         return RISCV_SV39_STATUS_STATE;
     }
     *entry = 0U;
@@ -1167,9 +1573,15 @@ static enum riscv_sv39_status release_leaf(
                               entry_address(saved_entry)) !=
         PHYSICAL_PAGE_STATUS_OK) {
         *entry = saved_entry;
-        return RISCV_SV39_STATUS_STATE;
+        return valid_retired_entry(saved_entry)
+                   ? RISCV_SV39_STATUS_CLEANUP_REQUIRED
+                   : RISCV_SV39_STATUS_STATE;
     }
-    space->leaf_pages--;
+    if (valid_retired_entry(saved_entry)) {
+        space->retired_pages--;
+    } else {
+        space->leaf_pages--;
+    }
     return RISCV_SV39_STATUS_OK;
 }
 
@@ -1285,7 +1697,8 @@ enum riscv_sv39_status riscv_sv39_user_space_destroy(
         space->cleanup_page_owned = 0U;
     }
     if (space->table_pages == 0U) {
-        if (space->root_address != 0U || space->leaf_pages != 0U) {
+        if (space->root_address != 0U || space->leaf_pages != 0U ||
+            space->retired_pages != 0U) {
             return RISCV_SV39_STATUS_STATE;
         }
         space->allocator = 0;
@@ -1308,7 +1721,8 @@ enum riscv_sv39_status riscv_sv39_user_space_destroy(
             return status;
         }
     }
-    if (space->leaf_pages != 0U || space->table_pages != 1U) {
+    if (space->leaf_pages != 0U || space->retired_pages != 0U ||
+        space->table_pages != 1U) {
         return RISCV_SV39_STATUS_STATE;
     }
     if (physical_page_release(space->allocator,
@@ -1321,6 +1735,7 @@ enum riscv_sv39_status riscv_sv39_user_space_destroy(
     space->root_address = 0U;
     space->table_pages = 0U;
     space->leaf_pages = 0U;
+    space->retired_pages = 0U;
     space->cleanup_page_address = 0U;
     space->cleanup_page_owned = 0U;
     space->state = RISCV_SV39_USER_SPACE_DESTROYED;

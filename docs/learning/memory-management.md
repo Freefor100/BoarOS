@@ -216,10 +216,10 @@ BoarOS 因此把 `kernel_mm` 定义为引用计数的拥有型句柄：`acquire`
 VMA 不存在 + PTE 不存在  -> 无效地址，fault
 VMA 存在   + PTE 不存在  -> 合法性由 VMA 的 fault policy 决定
 VMA 存在   + PTE 存在    -> 当前可由硬件翻译
-VMA 不存在 + PTE 存在    -> 内核错误；撤销逻辑必须先收紧 VMA 再回收 PTE
+VMA 不存在 + active PTE 存在 -> 内核错误；撤销必须先让 PTE/TLB 失效再收紧 VMA
 ```
 
-BoarOS 为 VMA 显式记录 fault policy，而不是从 role 猜测行为。静态 `ET_EXEC` 仍急切物化所有 `PT_LOAD` 页并使用 `RESIDENT_REQUIRED`：若这类 VMA 中没有 PTE，说明装载或页表状态不满足契约。栈使用 `DEMAND_ZERO`：VMA 覆盖低半区顶端完整 8 MiB reserve，初始 PTE 只覆盖参数栈和 64 KiB headroom，其余页由真实 U-mode load/store page fault 首次访问时分配和清零。reserve 下方一页 guard 两者都没有，因此不会因“靠近栈”被隐式扩展。
+BoarOS 为 VMA 显式记录 fault policy，而不是从 role 猜测行为。静态 `ET_EXEC` 仍急切物化所有 `PT_LOAD` 页并使用 `RESIDENT_REQUIRED`：若这类 VMA 中没有 PTE，说明装载或页表状态不满足契约。栈和 `brk` heap 使用 `DEMAND_ZERO`：栈 VMA 覆盖低半区顶端完整 8 MiB reserve，初始 PTE 只覆盖参数栈和 64 KiB headroom；heap VMA 只覆盖当前 program break 向上对齐的范围。两者其余合法页都由真实 U-mode load/store page fault 首次访问时分配和清零。reserve 下方一页 guard 两者都没有，因此不会因“靠近栈”被隐式扩展。
 
 一次当前用户任务的页故障按互斥状态分类：
 
@@ -237,7 +237,7 @@ PTE 不存在 + 匿名 DEMAND_ZERO
 
 页故障是同步异常，`sepc` 指向需要重试的原指令。补页成功后不能像 `ecall` 一样把 `sepc` 前移；更新 PTE 后还要执行针对该虚拟页的本地 `SFENCE.VMA`，再由 `sret` 重执行 load/store/fetch。当前所有用户地址空间使用 ASID 0，且只有单 hart，所以本地单页失效足够；SMP 下必须把远端正在运行同一 MM 的 hart 纳入 shootdown。
 
-demand-zero 把未触碰栈页的物理内存和清零成本推迟到首次访问。代价是首次触页需要 trap、VMA 二分查找、软件页表查询、可能的中间表/叶子分配与清零、PTE 写入和 TLB 失效；驻留后的普通访问仍由硬件翻译，不增加软件热路径。当前解析器为确认“确实没有 PTE”先 lookup，再由映射函数走一次叶表路径，属于 cold fault path 的重复遍历；若开发板计数显示缺页延迟重要，可在不改变 VMA/MM 接口的前提下合并 walker，但不能据 QEMU 正确性结果宣称性能收益。
+demand-zero 把未触碰的栈/heap 页物理内存和清零成本推迟到首次访问。代价是首次触页需要 trap、VMA 二分查找、软件页表查询、可能的中间表/叶子分配与清零、PTE 写入和 TLB 失效；驻留后的普通访问仍由硬件翻译，不增加软件热路径。当前解析器为确认“确实没有 PTE”先 lookup，再由映射函数走一次叶表路径，属于 cold fault path 的重复遍历；若开发板计数显示缺页延迟重要，可在不改变 VMA/MM 接口的前提下合并 walker，但不能据 QEMU 正确性结果宣称性能收益。
 
 当前 VMA 集合用按起始地址排序的连续数组：查找二分为 `O(log n)`，插入为 `O(n)`，相邻且属性相同的区间合并。对于静态 ELF、栈和少量早期匿名区间，这比树节点、旋转和更多分配更小、更容易验证，且不在当前调度热路径上。真实 `mmap` 工作负载若显示大量频繁插入/删除，才应在保持 VMA 语义不变的前提下换成平衡树或区间树；没有测量不能把“树一定更快”当成结论。
 
@@ -245,11 +245,25 @@ VMA 属于 MM 而不是 task 或单张页表。fork 必须复制其逻辑布局�
 
 可重试的 owner 还必须比触发错误的栈帧活得更久。只让一个局部 `kernel_mm` 进入 `CLEANUP` 然后从启动函数返回，虽然状态机本身正确，唯一的记录页地址仍会随着栈帧消失。BoarOS 的根启动把尚未发布的 file、MM、VMA cleanup 阶段和相关资源移入持久 `riscv_root_boot`；调用者只要看到 root 仍处于 `CLEANUP` 就继续重试，直到 heap 和物理页都回到基线。这个原则同样适用于 exec transaction、任务退出队列和以后任何异步回收：错误码不能替代仍然存在的资源 owner。
 
+## `brk` 怎样形成匿名 heap？
+
+program break 是进程数据段高端之后的一个**字节地址**。Linux raw `brk` syscall 返回调整后的 break；若请求不能满足，则返回原值。常见 libc `brk()` 再把这个结果转换成 0/-1 并设置 `errno`，不能把 libc 包装层的返回约定写进内核 syscall ABI。
+
+静态 ELF 的初始 break 应覆盖所有装载段在内存中的末端，因此计算的是最高 `PT_LOAD.p_vaddr + p_memsz`，其中 `p_memsz` 已包含 BSS；program header 不保证按地址排序。BoarOS 把这个最高末端向上按 4 KiB 对齐作为 start/current break，把栈 guard 起点作为当前上界。当前 break 仍保存用户请求的精确字节值，只有 VMA/PTE 范围使用 `page_end(break)`：同页内调整不需要改页表，跨页增长才增加 VMA，跨页缩小才撤销整页。
+
+增长只建立 RW anonymous `DEMAND_ZERO` heap VMA，不立即分配数据页。这样申请一大片地址空间但只访问少量页面时，不会预先消耗所有物理页；代价由首次触页 fault 承担。相邻 heap VMA 属性相同会合并，所以反复小幅增长不会为每次 syscall 保留一个描述符。fork 复制调用时的精确 break、VMA 和已驻留页，父子随后独立调整；exec 则从新 ELF 重新计算，不继承旧 heap 高水位。
+
+缩小的关键不是“把 PTE 清零”这么简单，而是所有权与 TLB 顺序：先把 active PTE 改成硬件无效状态，再执行 `SFENCE.VMA`，确认旧翻译不能继续访问页框，之后才能把物理页归还分配器并收紧 VMA。若先释放页框再失效 TLB，用户可能通过旧 TLB 翻译访问已经分配给别处的内存；若先删 VMA却保留 active PTE，则形成逻辑无效但硬件仍可访问的地址。
+
+物理页释放也可能失败。BoarOS 使用 `V=0` 的 PTE，并占用 RISC-V 为 supervisor software 保留的 RSW 位标记 retired owner，同时保留 PPN。硬件把它视为无效映射，用户 lookup/fork 也不把它当作页面，但 MM 仍知道哪一个物理页必须重试释放。后续增长覆盖该范围前先重试，最终 MM destroy 也会处理它。这个状态同时满足“地址已经不可访问”和“owner 没有因错误码丢失”。
+
+当前 shrink 保留变空的中间页表直至 MM 销毁。对连续高水位，每覆盖 2 MiB 虚拟跨度最多保留一张 4 KiB Level 0 表，比例约 `4 KiB / 2 MiB = 0.195%`；若程序每隔 2 MiB 只触碰一页，页表相对实际数据页的开销会显著更高。立即回收中间表可降低长寿命进程 shrink 后的占用，但需要把表页释放失败、父表项撤销和 SMP TLB shootdown 纳入同一事务；当前先保留页表层级，待基准或目标工作负载证明需要时在不改变 raw `brk` ABI 的前提下优化。
+
 ## 地址空间激活与高半区 Direct Map
 
 切换分页前还要保证当前代码、栈、异常入口、页表页，以及马上访问的 UART 等 MMIO 在新地址空间中都有有效映射。缺少其中任何一项，都可能让 CPU 在分页生效后的第一条取指或访存时产生异常。
 
-若最终地址空间不准备保留低 RAM 映射，第一次启用分页仍需要处理“写 `satp` 后下一条指令还从哪里取”的过渡问题。BoarOS 先激活一张只覆盖内核低/高别名和 UART 的专用页表，迁移 PC、栈、`gp` 与 `stvec` 后，再从高半区激活最终页表。最终页表只包含高半区内核、RAM Direct Map 和平台 MMIO；低地址内核物理别名由真实 load page fault 测试证明已经失效。两阶段切换把硬件必需的过渡映射限制在启动边界内，不要求提前实现运行期 `unmap`。
+若最终地址空间不准备保留低 RAM 映射，第一次启用分页仍需要处理“写 `satp` 后下一条指令还从哪里取”的过渡问题。BoarOS 先激活一张只覆盖内核低/高别名和 UART 的专用页表，迁移 PC、栈、`gp` 与 `stvec` 后，再从高半区激活最终页表。最终页表只包含高半区内核、RAM Direct Map 和平台 MMIO；低地址内核物理别名由真实 load page fault 测试证明已经失效。两阶段切换把硬件必需的过渡映射限制在启动边界内；启动迁移不依赖后来为用户 heap shrink 增加的运行期范围撤销。
 
 平台 MMIO 也要考虑运行期地址空间共享。BoarOS 的 QEMU UART 在过渡表中使用物理低地址，最终表则把它映射到 direct-map 窗口之后的 supervisor-only 高半区；最终根生效后驱动只切换一次访问基址。用户根借用该高半区映射，所以 trap 诊断不必临时换回内核根，而缺少 U 位仍阻止用户直接访问 UART。把设备继续留在低半区会与每个进程私有的用户树冲突，也会让用户根下的 fatal 日志递归页故障。
 
@@ -334,6 +348,7 @@ make test-page-riscv
 make test-sv39-riscv
 make test-sv39-fault-riscv
 make test-vma-riscv
+make test-brk-riscv
 make test-demand-page-riscv
 make test-user-riscv
 make test-high-half-trap-riscv
@@ -341,7 +356,7 @@ make test-no-identity-riscv
 make test-riscv
 ```
 
-Sv39 建表测试覆盖精确 PTE、2 MiB/4 KiB 选择、16 GiB 规模、边界拒绝和部分提交；权限故障测试覆盖 MMU 生效后的只读保护；VMA/demand-page 测试覆盖策略边界、真实页耗尽、回滚 owner、U-mode 深栈补页、wait status 与完整回收。完整启动测试再验证 512 MiB、1 GiB 和 16 GiB RAM 下的 `satp`、buddy metadata 与页表页精确计数和高半区执行上下文；高半区 trap 测试验证硬件实际使用迁移后的 `stvec`，no-identity 测试验证最终页表真实拒绝低 RAM load。开发板到手后还必须补充同类硬件验证和 fault/TLB 性能测量，不能把 QEMU 结果直接等同于板级兼容。
+Sv39 建表测试覆盖精确 PTE、2 MiB/4 KiB 选择、16 GiB 规模、边界拒绝和部分提交；权限故障测试覆盖 MMU 生效后的只读保护；VMA/demand-page 测试覆盖策略边界、真实页耗尽、回滚 owner、U-mode 深栈/heap 补页、wait status 与完整回收。`test-brk-riscv` 还覆盖精确 raw 返回、跨页 shrink、retired owner、fork 独立值、exec 重置、缩小后 SIGSEGV 和重新增长零页。完整启动测试再验证 512 MiB、1 GiB 和 16 GiB RAM 下的 `satp`、buddy metadata 与页表页精确计数和高半区执行上下文；高半区 trap 测试验证硬件实际使用迁移后的 `stvec`，no-identity 测试验证最终页表真实拒绝低 RAM load。开发板到手后还必须补充同类硬件验证和 fault/TLB 性能测量，不能把 QEMU 结果直接等同于板级兼容。
 
 ## 资料依据
 

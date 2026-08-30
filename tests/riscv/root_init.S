@@ -49,6 +49,37 @@ _start:
     bne t1, t2, .Lfailure
     mv sp, s10
 
+    # The raw Linux brk syscall returns the exact program break rather than
+    # the libc wrapper's 0/-1 result.  Growth reserves a demand-zero heap;
+    # shrinking below the third page withdraws that page before the next exec.
+    li a0, 0
+    li a7, 214
+    ecall
+    la t0, __program_break
+    bne a0, t0, .Lfailure
+    mv s11, a0
+    li t0, 0x2031
+    add a0, s11, t0
+    li a7, 214
+    ecall
+    li t0, 0x2031
+    add t1, s11, t0
+    bne a0, t1, .Lfailure
+    addi t0, s11, 0
+    ld t1, 0(t0)
+    bnez t1, .Lfailure
+    li t1, 0x2000
+    add t0, s11, t1
+    li t1, 0x11223344
+    sd t1, 0(t0)
+    li t0, 0x321
+    add a0, s11, t0
+    li a7, 214
+    ecall
+    li t0, 0x321
+    add t1, s11, t0
+    bne a0, t1, .Lfailure
+
     # An absolute path ignores dirfd and receives the lowest free fd.
     li a0, 7
     la a1, .Labsolute_path

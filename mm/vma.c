@@ -271,3 +271,28 @@ enum kernel_vma_status kernel_vma_set_lookup(
     *vma = set->entries[index - 1U];
     return KERNEL_VMA_STATUS_OK;
 }
+
+enum kernel_vma_status kernel_vma_set_trim_end(
+    struct kernel_vma_set *set,
+    uint64_t start,
+    uint64_t old_end,
+    uint64_t new_end)
+{
+    uint32_t index;
+
+    if (!set_valid(set) || start >= old_end || new_end < start ||
+        new_end >= old_end) {
+        return KERNEL_VMA_STATUS_INVALID_ARGUMENT;
+    }
+    index = lower_bound(set, start);
+    if (index >= set->count || set->entries[index].start != start ||
+        set->entries[index].end != old_end) {
+        return KERNEL_VMA_STATUS_NOT_FOUND;
+    }
+    if (new_end == start) {
+        erase_entry(set, index);
+    } else {
+        set->entries[index].end = new_end;
+    }
+    return KERNEL_VMA_STATUS_OK;
+}

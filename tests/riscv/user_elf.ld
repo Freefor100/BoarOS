@@ -31,6 +31,8 @@ SECTIONS
         *(COMMON)
     } :data
 
+    __program_break = ALIGN(0x1000);
+
     /DISCARD/ :
     {
         *(.comment)

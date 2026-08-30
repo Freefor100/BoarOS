@@ -1400,6 +1400,7 @@ static unsigned long run_vma_registration_cases(void)
     struct riscv_user_elf_request request = {0};
     struct riscv_user_elf_entry entry = {0};
     uint64_t baseline;
+    uint64_t program_break;
 
     make_valid_image();
     if (!init_finalized_allocator_and_kernel_table(
@@ -1442,6 +1443,12 @@ static unsigned long run_vma_registration_cases(void)
         descriptor.role != KERNEL_VMA_ROLE_ELF) {
         (void)kernel_mm_release(&mm);
         return 5U;
+    }
+    if (kernel_mm_brk(&mm, 0U, &program_break) !=
+            KERNEL_MM_STATUS_OK ||
+        program_break != UINT64_C(0x21000)) {
+        (void)kernel_mm_release(&mm);
+        return 9U;
     }
     /* The read-only and writable segments share one page. */
     if (kernel_mm_vma_lookup(&mm, TEST_READ_ONLY_VA, &descriptor) !=

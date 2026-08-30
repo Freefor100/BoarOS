@@ -18,6 +18,7 @@
 #define LINUX_SYSCALL_GETPID 172U
 #define LINUX_SYSCALL_GETPPID 173U
 #define LINUX_SYSCALL_GETTID 178U
+#define LINUX_SYSCALL_BRK 214U
 #define LINUX_SYSCALL_CLONE 220U
 #define LINUX_SYSCALL_EXECVE 221U
 #define LINUX_SYSCALL_WAIT4 260U
@@ -200,6 +201,25 @@ static enum kernel_syscall_status decode_execve(
     return KERNEL_SYSCALL_STATUS_OK;
 }
 
+static enum kernel_syscall_status decode_brk(
+    struct kernel_task *caller,
+    uint64_t requested,
+    struct kernel_syscall_result *decoded)
+{
+    struct kernel_mm *mm;
+    uint64_t program_break;
+
+    if (kernel_task_mm_borrow_mutable(caller, &mm) !=
+            KERNEL_TASK_STATUS_OK ||
+        kernel_mm_brk(mm, requested, &program_break) !=
+            KERNEL_MM_STATUS_OK) {
+        return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    }
+    decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+    decoded->value = (int64_t)program_break;
+    return KERNEL_SYSCALL_STATUS_OK;
+}
+
 static void decode_clone(const struct kernel_syscall_request *request,
                          struct kernel_syscall_result *decoded)
 {
@@ -280,6 +300,12 @@ enum kernel_syscall_status kernel_syscall_dispatch(
         }
         decoded.action = KERNEL_SYSCALL_ACTION_RETURN;
         decoded.value = id;
+    } else if (request->number == LINUX_SYSCALL_BRK) {
+        if (decode_brk(caller,
+                       request->arguments[0],
+                       &decoded) != KERNEL_SYSCALL_STATUS_OK) {
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+        }
     } else if (request->number == LINUX_SYSCALL_EXECVE) {
         if (decode_execve(caller, request, &decoded) !=
             KERNEL_SYSCALL_STATUS_OK) {

@@ -84,7 +84,24 @@ _start:
     li t0, 1
     bne a0, t0, .Lfailure
 
+    # Every successful exec creates a fresh program break for the new ELF.
+    li a0, 0
+    li a7, 214
+    ecall
+    la t0, __program_break
+    bne a0, t0, .Lfailure
+
 #if ROOT_EXEC_STAGE == 2
+    # Leave a non-default exact break behind; stage3 must not inherit it.
+    mv t1, a0
+    li t0, 0x123
+    add a0, t1, t0
+    li a7, 214
+    ecall
+    li t0, 0x123
+    add t1, t1, t0
+    bne a0, t1, .Lfailure
+
     # fd 1 was CLOEXEC and must be unreachable; fd 0 keeps offset four.
     li a0, 1
     la a1, .Lbuffer
@@ -125,6 +142,32 @@ _start:
     ecall
     j .Lfailure
 #else
+    # Reserve three heap pages, commit the last, then shrink it away.  The
+    # first clone checks independent exact-break state; a later child proves
+    # that the released page faults before the parent regrows it as zero.
+    la t0, __program_break
+    la t1, .Lheap_base
+    sd t0, 0(t1)
+    li t2, 0x2000
+    add t3, t0, t2
+    la t1, .Lheap_fault_address
+    sd t3, 0(t1)
+    li t2, 0x2031
+    add t4, t0, t2
+    mv a0, t4
+    li a7, 214
+    ecall
+    bne a0, t4, .Lfailure
+    li t2, 0x55667788
+    sd t2, 0(t3)
+    li t2, 0x321
+    add a0, t0, t2
+    li a7, 214
+    ecall
+    li t2, 0x321
+    add t3, t0, t2
+    bne a0, t3, .Lfailure
+
     li a0, 0
     la a1, .Lbuffer
     li a2, 1
@@ -244,6 +287,15 @@ _start:
     li t2, 0x2500
     bne t1, t2, .Lfailure
 
+    li a0, 0
+    li a7, 214
+    ecall
+    la t0, .Lheap_base
+    ld t0, 0(t0)
+    li t1, 0x321
+    add t0, t0, t1
+    bne a0, t0, .Lfailure
+
     # The child wrote its private MM copy, while the inherited fd shared
     # one open-file description and therefore advanced the common offset.
     la t0, .Lfork_word
@@ -342,6 +394,19 @@ _start:
     li t2, ROOT_FAULT_WAIT_STATUS
     bne t1, t2, .Lfailure
 
+    la t0, .Lheap_base
+    ld t0, 0(t0)
+    li t1, 0x2031
+    add t2, t0, t1
+    mv a0, t2
+    li a7, 214
+    ecall
+    bne a0, t2, .Lfailure
+    la t0, .Lheap_fault_address
+    ld t0, 0(t0)
+    ld t1, 0(t0)
+    bnez t1, .Lfailure
+
     # Linux reaps the zombie before copying status to userspace.  Therefore
     # an invalid status pointer returns EFAULT, but the same child cannot be
     # waited for a second time.
@@ -386,6 +451,20 @@ _start:
     ecall
 
 .Lclone_child:
+    li a0, 0
+    li a7, 214
+    ecall
+    la t0, .Lheap_base
+    ld t0, 0(t0)
+    li t1, 0x321
+    add t2, t0, t1
+    bne a0, t2, .Lfailure
+    li t1, 0x1231
+    add t2, t0, t1
+    mv a0, t2
+    li a7, 214
+    ecall
+    bne a0, t2, .Lfailure
     li a7, 173
     ecall
     li t0, 1
@@ -440,7 +519,12 @@ _start:
     ecall
 
 .Lfault_child:
+#ifdef ROOT_FAULT_INJECT_OOM
     li t0, 0x1000
+#else
+    la t0, .Lheap_fault_address
+    ld t0, 0(t0)
+#endif
     ld t1, 0(t0)
     j .Lfailure
 
@@ -484,6 +568,10 @@ _start:
 .Lbuffer:
     .skip 16
 .Lwait_status:
+    .skip 8
+.Lheap_base:
+    .skip 8
+.Lheap_fault_address:
     .skip 8
 
     .section .data, "aw", @progbits

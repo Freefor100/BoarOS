@@ -71,4 +71,11 @@ enum kernel_vma_status kernel_vma_set_lookup(
     uint64_t virtual_address,
     struct kernel_vma *vma);
 
+/* Shrinks one exact VMA at its high end; new_end == start removes it. */
+enum kernel_vma_status kernel_vma_set_trim_end(
+    struct kernel_vma_set *set,
+    uint64_t start,
+    uint64_t old_end,
+    uint64_t new_end);
+
 #endif

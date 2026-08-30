@@ -20,7 +20,7 @@ Completion 在任务对象与 PID 被释放前快照 TID/TGID。PID 1 自身退�
 
 当前没有用户空间重启或 init supervision，因此 PID 1 正常退出和故障都视为系统终止条件。根启动对象随后卸载 ext4、复位 VirtIO device、归还队列和堆页，并要求物理空闲页精确回到开始根启动前的基线、heap live/current pages 均为零，最后调用 SBI shutdown。
 
-根 mount 在 PID 1 及其后代的文件资源回收期间保持存活。当前 `/init` 先通过 Linux RISC-V `openat/read/close` 读取根上的普通文件，覆盖绝对/相对路径、独立 offset、跨页大读取、fault 后 offset 保持、EOF 和错误 errno；随后从真实根盘依次 exec 相对路径 `stage2` 和绝对路径 `/stage3`。第三段映像执行普通 clone/wait：验证父子 MM 写隔离、继承 fd 的 OFD offset 共享、PPID、WNOHANG 与阻塞唤醒、进程组 selector、退出/故障 status、status EFAULT 后已回收，以及孙进程向 PID 1 reparent。PID 1 最终以状态 42 退出。
+根 mount 在 PID 1 及其后代的文件资源回收期间保持存活。当前 `/init` 先通过 Linux RISC-V `openat/read/close` 读取根上的普通文件，覆盖绝对/相对路径、独立 offset、跨页大读取、fault 后 offset 保持、EOF 和错误 errno；随后从真实根盘依次 exec 相对路径 `stage2` 和绝对路径 `/stage3`。三段映像分别验证 `brk` 初值、增长/缩小和 exec 重置；第三段还执行普通 clone/wait，验证精确 break 的父子独立性、shrink 后 heap 访问故障、重新增长零页、父子 MM 写隔离、继承 fd 的 OFD offset 共享、PPID、WNOHANG 与阻塞唤醒、进程组 selector、退出/故障 status、status EFAULT 后已回收，以及孙进程向 PID 1 reparent。PID 1 最终以状态 42 退出。
 
 ## 验证
 

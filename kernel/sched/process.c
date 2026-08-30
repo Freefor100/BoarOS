@@ -1142,6 +1142,24 @@ enum kernel_task_status kernel_task_mm_borrow(
     return KERNEL_TASK_STATUS_OK;
 }
 
+enum kernel_task_status kernel_task_mm_borrow_mutable(
+    struct kernel_task *task,
+    struct kernel_mm **mm)
+{
+    if (task == 0 || mm == 0) {
+        return KERNEL_TASK_STATUS_INVALID_ARGUMENT;
+    }
+    if (task != scheduler.current ||
+        task->magic != KERNEL_THREAD_MAGIC ||
+        task->state != KERNEL_THREAD_STATE_RUNNING ||
+        task->arch.user_mode != 1U ||
+        task->mm.state != KERNEL_MM_LIVE) {
+        return KERNEL_TASK_STATUS_STATE;
+    }
+    *mm = &task->mm;
+    return KERNEL_TASK_STATUS_OK;
+}
+
 enum kernel_task_status validate_task_resource_borrow(
     const struct kernel_task *task)
 {

@@ -424,7 +424,7 @@ DEPS := \
 	test-references test-riscv test-sv39-fault-riscv test-sv39-riscv \
 	test-syscall-riscv test-timer-riscv test-trap-riscv \
 	test-trap-return-riscv test-user-fatal-riscv test-mm-riscv \
-	test-uaccess-riscv test-user-riscv test-vma-riscv
+	test-uaccess-riscv test-user-riscv test-vma-riscv test-brk-riscv
 
 all: $(KERNEL_RV)
 
@@ -570,7 +570,8 @@ $(SCHEDULER_BOOT_TEST_KERNEL_RV): $(SCHEDULER_BOOT_TEST_OBJECTS) \
 		-o $@ $(SCHEDULER_BOOT_TEST_OBJECTS)
 
 $(SYSCALL_TEST_KERNEL_RV): $(SYSCALL_TEST_OBJECTS) arch/riscv/linker.ld
-	$(CC) $(LDFLAGS) \
+	$(CC) $(LDFLAGS) -Wl,--wrap=kernel_task_mm_borrow_mutable \
+		-Wl,--wrap=kernel_mm_brk \
 		-Wl,-Map,$(BUILD_DIR)/tests/kernel-syscall-rv.map \
 		-o $@ $(SYSCALL_TEST_OBJECTS)
 
@@ -640,7 +641,8 @@ $(ROOT_EXEC_STAGE3_OBJECT_RV): tests/riscv/root_exec_stage.S
 $(ROOT_EXEC_STAGE3_OOM_OBJECT_RV): tests/riscv/root_exec_stage.S
 	@mkdir -p $(dir $@)
 	$(CC) $(CPPFLAGS) $(ASFLAGS) -DROOT_EXEC_STAGE=3 \
-		-DROOT_FAULT_WAIT_STATUS=9 -MMD -MP -c $< -o $@
+		-DROOT_FAULT_WAIT_STATUS=9 -DROOT_FAULT_INJECT_OOM=1 \
+		-MMD -MP -c $< -o $@
 
 $(ROOT_EXEC_STAGE2_RV): $(ROOT_EXEC_STAGE2_OBJECT_RV) \
 		tests/riscv/user_elf.ld
@@ -914,6 +916,10 @@ test-scheduler-riscv: $(SCHEDULER_BOOT_TEST_KERNEL_RV)
 test-syscall-riscv: $(SYSCALL_TEST_KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) SYSCALL_TEST_KERNEL_RV=$< \
 		./tests/syscall-riscv.sh
+
+test-brk-riscv: test-sv39-riscv test-vma-riscv \
+		test-user-elf-cases-riscv test-syscall-riscv \
+		test-root-init-riscv
 
 test-elf64-riscv: $(ELF64_TEST_KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) ELF64_TEST_KERNEL_RV=$< \

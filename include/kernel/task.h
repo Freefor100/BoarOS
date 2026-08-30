@@ -35,6 +35,11 @@ enum kernel_task_status kernel_task_mm_borrow(
     const struct kernel_task *task,
     const struct kernel_mm **mm);
 
+/* The current task may mutate its MM through the returned borrowed handle. */
+enum kernel_task_status kernel_task_mm_borrow_mutable(
+    struct kernel_task *task,
+    struct kernel_mm **mm);
+
 /* The returned file table is borrowed and may be mutated by this syscall. */
 enum kernel_task_status kernel_task_files_borrow(
     struct kernel_task *task,

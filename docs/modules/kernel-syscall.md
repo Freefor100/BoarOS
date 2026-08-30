@@ -35,11 +35,14 @@ enum kernel_syscall_status kernel_syscall_dispatch(
 - `getpid` 编号为 172，返回调用任务所属线程组的 TGID。
 - `getppid` 编号为 173，返回当前父任务的 TGID；PID 1 或 parentless 进程返回 0，reparent 后观察到 PID 1。
 - `gettid` 编号为 178，返回调用任务自己的 TID。
+- `brk` 编号为 214，通过调用任务的 mutable MM borrow 调整精确 program break。raw syscall 成功返回请求值；参数 0 查询当前值；越过 ELF heap 起点/栈 guard、VMA 冲突、metadata OOM 或待回收页暂时无法释放时返回原 break，不使用负 errno。跨页增长登记 demand-zero heap，缩小撤销越界页；libc 把 raw 返回再包装成自己的 0/-1 接口，不属于内核 ABI。
 - `clone` 编号为 220。当前只接受 `flags=SIGCHLD` 且 `child_stack/parent_tid/tls/child_tid` 全为零的普通进程形态；成功时父进程返回子 PID，子进程返回 0。已识别但涉及共享资源、线程、tid 指针或另一个栈的组合返回 `-ENOTSUP`，未知 flag 或非 `SIGCHLD` 退出信号返回 `-EINVAL`。
 - `execve` 编号为 221，准备并提交新的静态 RISC-V `ET_EXEC` 映像；成功不返回，失败返回负 Linux errno。路径、参数、提交点和资源保持规则见[进程映像替换模块](kernel-exec.md)。
 - `wait4` 编号为 260，支持 Linux pid selector、`WNOHANG` 和 wait flag 校验；普通退出与同步故障产生 Linux 形态 status。无匹配子进程返回 `-ECHILD`，非法 option 返回 `-EINVAL`，status 用户指针错误返回 `-EFAULT`。当前不提供 rusage，非空指针返回 `-ENOTSUP`。
 - 其他编号产生 `RETURN`，返回 `-ENOSYS`（-38）。
 
+当前 `brk` 还没有 `RLIMIT_DATA`、内存承诺或 overcommit accounting；成功增长只承诺虚拟 VMA，实际物理页耗尽发生在后续 demand fault。这是明确的兼容性限制，不由伪造的 syscall 成功或预分配全部页来掩盖。
+
 生产用户任务拥有文件表、fs context 和 MM。底层 U-mode 调度探针可以有 MM 而故意没有进程文件资源，此时 `openat` 返回 `-ENODEV`，`read/close` 返回 `-EBADF`，用于明确区分探针配置与内核对象损坏；这不是生产进程模型。当前每个进程仍是单成员线程组，所以 `getpid()` 与 `gettid()` 数值相等，但普通 clone 已创建独立父子进程。接口语义和内部字段已经分离，增加线程组成员后无需改变 syscall ABI。内核任务与 idle 没有 Linux 身份，Trap 层只会从用户任务进入该接口。
 
-`make test-syscall-riscv` 验证空指针失败原子性、`exit(93)` 状态截断、clone 参数分类和未知编号。`make test-uaccess-riscv` 与 `make test-files-riscv` 验证用户复制和文件生命周期。`make test-user-riscv` 从真实 U-mode 验证基本身份、无文件资源探针、未知 ecall 和退出；`make test-root-init-riscv` 在真实 ext4/exec 链上验证 clone/getppid/wait4 的阻塞、选择、错误、状态和资源语义。
+`make test-syscall-riscv` 验证空指针失败原子性、`exit(93)` 状态截断、raw `brk` 转发/返回、clone 参数分类和未知编号。`make test-uaccess-riscv` 与 `make test-files-riscv` 验证用户复制和文件生命周期。`make test-user-riscv` 从真实 U-mode 验证基本身份、无文件资源探针、未知 ecall 和退出；`make test-brk-riscv` 与 `make test-root-init-riscv` 在真实 ext4/exec 链上验证 heap fault、shrink 后 SIGSEGV、fork 独立值、exec 重置和资源回收。

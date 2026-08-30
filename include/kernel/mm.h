@@ -93,6 +93,18 @@ enum kernel_mm_status kernel_mm_vma_lookup(
     uint64_t virtual_address,
     struct kernel_vma *vma);
 
+/* Initializes the exact Linux program break for a newly loaded image. */
+enum kernel_mm_status kernel_mm_brk_initialize(
+    struct kernel_mm *mm,
+    uint64_t start,
+    uint64_t limit);
+
+/* Implements the raw Linux brk syscall result: success or rejection address. */
+enum kernel_mm_status kernel_mm_brk(
+    struct kernel_mm *mm,
+    uint64_t requested,
+    uint64_t *result);
+
 /*
  * Resolve one hardware user fault in the MM active on this hart.  access must
  * be exactly one of READ, WRITE, or EXECUTE.  NOT_MAPPED means the access is

@@ -54,6 +54,7 @@ struct riscv_sv39_user_space {
     uint64_t root_address;
     uint32_t table_pages;
     uint32_t leaf_pages;
+    uint32_t retired_pages;
     uint64_t cleanup_page_address;
     uint32_t cleanup_page_owned;
     enum riscv_sv39_user_space_state state;
@@ -117,6 +118,25 @@ enum riscv_sv39_status riscv_sv39_user_lookup(
     const struct riscv_sv39_user_space *space,
     uint64_t virtual_address,
     struct riscv_sv39_mapping *mapping);
+
+/*
+ * Removes owned leaves in [start, end).  The caller must establish that this
+ * is the active address space before relying on the local TLB flush.  A
+ * release failure leaves an invalid, software-owned retired PTE and is
+ * reported through deferred_pages while the address remains inaccessible.
+ */
+enum riscv_sv39_status riscv_sv39_user_unmap_owned_range(
+    struct riscv_sv39_user_space *space,
+    uint64_t start,
+    uint64_t end,
+    uint32_t *deferred_pages);
+
+/* Retries retired-page release without changing any active mapping. */
+enum riscv_sv39_status riscv_sv39_user_reclaim_retired_range(
+    struct riscv_sv39_user_space *space,
+    uint64_t start,
+    uint64_t end,
+    uint32_t *deferred_pages);
 
 /* Populate mapped owned pages before this address space becomes active. */
 enum riscv_sv39_status riscv_sv39_user_space_populate(

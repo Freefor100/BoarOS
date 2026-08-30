@@ -15,6 +15,8 @@
 #define VMA_TEST_TEXT_END UINT64_C(0x13000)
 #define VMA_TEST_POLICY_BASE UINT64_C(0x20000)
 #define VMA_TEST_ORPHAN_PTE_BASE UINT64_C(0x31000)
+#define VMA_TEST_HEAP_BASE UINT64_C(0x1000000)
+#define VMA_TEST_HEAP_LIMIT UINT64_C(0x2000000)
 #define VMA_TEST_STACK_BASE UINT64_C(0x3f800000)
 #define VMA_TEST_STACK_END UINT64_C(0x40000000)
 
@@ -212,10 +214,14 @@ unsigned long run_all_vma_cases(void)
     uint64_t baseline;
     uint64_t available_before_fork;
     uint64_t available_before_oom;
+    uint64_t available_before_reclaim;
+    uint64_t brk_result;
+    uint64_t heap_page_address;
     uint64_t parent_satp;
     uint64_t cleanup_satp;
     uint32_t held_count;
     uint32_t index;
+    enum kernel_mm_status brk_status;
     enum physical_page_status page_status;
 
     if (!setup(&allocator, &kernel_table, &heap, &baseline) ||
@@ -327,6 +333,154 @@ unsigned long run_all_vma_cases(void)
         return 4U;
     }
     test_satp = parent_satp;
+    if (kernel_mm_brk_initialize(&parent,
+                                  VMA_TEST_HEAP_BASE,
+                                  VMA_TEST_HEAP_LIMIT) !=
+            KERNEL_MM_STATUS_OK ||
+        kernel_mm_brk(&parent, 0U, &brk_result) !=
+            KERNEL_MM_STATUS_OK ||
+        brk_result != VMA_TEST_HEAP_BASE ||
+        kernel_mm_brk(&parent,
+                       VMA_TEST_HEAP_BASE +
+                           2U * BOAROS_PAGE_SIZE + UINT64_C(0x321),
+                       &brk_result) != KERNEL_MM_STATUS_OK ||
+        brk_result != VMA_TEST_HEAP_BASE +
+                          2U * BOAROS_PAGE_SIZE + UINT64_C(0x321) ||
+        kernel_mm_vma_lookup(&parent,
+                             VMA_TEST_HEAP_BASE +
+                                 2U * BOAROS_PAGE_SIZE,
+                             &descriptor) != KERNEL_MM_STATUS_OK ||
+        descriptor.start != VMA_TEST_HEAP_BASE ||
+        descriptor.end != VMA_TEST_HEAP_BASE + 3U * BOAROS_PAGE_SIZE ||
+        descriptor.permissions != (KERNEL_MM_READ | KERNEL_MM_WRITE) ||
+        descriptor.role != KERNEL_VMA_ROLE_HEAP ||
+        descriptor.fault_policy != KERNEL_VMA_FAULT_DEMAND_ZERO ||
+        kernel_mm_lookup(&parent,
+                         VMA_TEST_HEAP_BASE,
+                         &mapping) != KERNEL_MM_STATUS_NOT_MAPPED ||
+        kernel_mm_resolve_user_fault(&parent,
+                                     VMA_TEST_HEAP_BASE,
+                                     KERNEL_MM_WRITE) !=
+            KERNEL_MM_STATUS_OK ||
+        kernel_mm_lookup(&parent,
+                         VMA_TEST_HEAP_BASE,
+                         &mapping) != KERNEL_MM_STATUS_OK) {
+        use_test_satp = 0;
+        return 19U;
+    }
+    heap_page_address = mapping.physical_address & ~BOAROS_PAGE_MASK;
+    if (kernel_mm_resolve_user_fault(
+            &parent,
+            VMA_TEST_HEAP_BASE + 2U * BOAROS_PAGE_SIZE,
+            KERNEL_MM_WRITE) != KERNEL_MM_STATUS_OK ||
+        kernel_mm_lookup(&parent,
+                         VMA_TEST_HEAP_BASE + 2U * BOAROS_PAGE_SIZE,
+                         &mapping) != KERNEL_MM_STATUS_OK ||
+        physical_page_resolve(
+            &allocator,
+            mapping.physical_address & ~BOAROS_PAGE_MASK,
+            &page) != PHYSICAL_PAGE_STATUS_OK) {
+        use_test_satp = 0;
+        return 19U;
+    }
+    ((unsigned char *)page)[0] = 0xa5U;
+    fault_page_address = mapping.physical_address & ~BOAROS_PAGE_MASK;
+    force_fault_page_release_failure = 1;
+    available_before_reclaim = physical_page_available(&allocator);
+    brk_status = kernel_mm_brk(&parent,
+                               VMA_TEST_HEAP_BASE + UINT64_C(0x321),
+                               &brk_result);
+    if (brk_status != KERNEL_MM_STATUS_OK) {
+        force_fault_page_release_failure = 0;
+        use_test_satp = 0;
+        return UINT64_C(0x200) + (unsigned long)brk_status;
+    }
+    if (brk_result != VMA_TEST_HEAP_BASE + UINT64_C(0x321)) {
+        force_fault_page_release_failure = 0;
+        use_test_satp = 0;
+        return 22U;
+    }
+    if (kernel_mm_lookup(&parent,
+                         VMA_TEST_HEAP_BASE + 2U * BOAROS_PAGE_SIZE,
+                         &mapping) != KERNEL_MM_STATUS_NOT_MAPPED) {
+        force_fault_page_release_failure = 0;
+        use_test_satp = 0;
+        return 23U;
+    }
+    if (kernel_mm_vma_lookup(&parent,
+                             VMA_TEST_HEAP_BASE + BOAROS_PAGE_SIZE,
+                             &descriptor) != KERNEL_MM_STATUS_NOT_MAPPED) {
+        force_fault_page_release_failure = 0;
+        use_test_satp = 0;
+        return 24U;
+    }
+    if (physical_page_available(&allocator) != available_before_reclaim) {
+        force_fault_page_release_failure = 0;
+        use_test_satp = 0;
+        return 25U;
+    }
+    if (kernel_mm_brk(&parent,
+                       VMA_TEST_HEAP_BASE +
+                           2U * BOAROS_PAGE_SIZE + UINT64_C(0x321),
+                       &brk_result) != KERNEL_MM_STATUS_OK ||
+        brk_result != VMA_TEST_HEAP_BASE + UINT64_C(0x321) ||
+        kernel_mm_vma_lookup(&parent,
+                             VMA_TEST_HEAP_BASE + BOAROS_PAGE_SIZE,
+                             &descriptor) != KERNEL_MM_STATUS_NOT_MAPPED ||
+        physical_page_available(&allocator) != available_before_reclaim) {
+        force_fault_page_release_failure = 0;
+        use_test_satp = 0;
+        return 27U;
+    }
+    if (kernel_mm_fork(&child, &parent) != KERNEL_MM_STATUS_OK ||
+        kernel_mm_brk(&child, 0U, &brk_result) != KERNEL_MM_STATUS_OK ||
+        brk_result != VMA_TEST_HEAP_BASE + UINT64_C(0x321) ||
+        kernel_mm_lookup(&child,
+                         VMA_TEST_HEAP_BASE + 2U * BOAROS_PAGE_SIZE,
+                         &mapping) != KERNEL_MM_STATUS_NOT_MAPPED ||
+        kernel_mm_release(&child) != KERNEL_MM_STATUS_OK) {
+        force_fault_page_release_failure = 0;
+        use_test_satp = 0;
+        return 26U;
+    }
+    child = (struct kernel_mm){0};
+    force_fault_page_release_failure = 0;
+    if (kernel_mm_brk(&parent,
+                       VMA_TEST_HEAP_BASE +
+                           2U * BOAROS_PAGE_SIZE + UINT64_C(0x321),
+                       &brk_result) != KERNEL_MM_STATUS_OK ||
+        brk_result != VMA_TEST_HEAP_BASE +
+                          2U * BOAROS_PAGE_SIZE + UINT64_C(0x321) ||
+        physical_page_available(&allocator) !=
+            available_before_reclaim + 1U ||
+        kernel_mm_resolve_user_fault(
+            &parent,
+            VMA_TEST_HEAP_BASE + 2U * BOAROS_PAGE_SIZE,
+            KERNEL_MM_READ) != KERNEL_MM_STATUS_OK ||
+        kernel_mm_lookup(&parent,
+                         VMA_TEST_HEAP_BASE + 2U * BOAROS_PAGE_SIZE,
+                         &mapping) != KERNEL_MM_STATUS_OK ||
+        physical_page_resolve(
+            &allocator,
+            mapping.physical_address & ~BOAROS_PAGE_MASK,
+            &page) != PHYSICAL_PAGE_STATUS_OK ||
+        !page_is_zero(page) ||
+        kernel_mm_brk(&parent,
+                       VMA_TEST_HEAP_BASE + UINT64_C(0x321),
+                       &brk_result) != KERNEL_MM_STATUS_OK ||
+        brk_result != VMA_TEST_HEAP_BASE + UINT64_C(0x321) ||
+        kernel_mm_brk(&parent,
+                       VMA_TEST_HEAP_BASE - 1U,
+                       &brk_result) != KERNEL_MM_STATUS_OK ||
+        brk_result != VMA_TEST_HEAP_BASE + UINT64_C(0x321) ||
+        kernel_mm_brk(&parent,
+                       VMA_TEST_HEAP_LIMIT + BOAROS_PAGE_SIZE,
+                       &brk_result) != KERNEL_MM_STATUS_OK ||
+        brk_result != VMA_TEST_HEAP_BASE + UINT64_C(0x321)) {
+        use_test_satp = 0;
+        return 21U;
+    }
+    fault_page_address = 0U;
     if (kernel_mm_resolve_user_fault(
             &parent,
             VMA_TEST_STACK_BASE + UINT64_C(0x321),
@@ -463,8 +617,12 @@ unsigned long run_all_vma_cases(void)
     use_test_satp = 0;
     available_before_fork = physical_page_available(&allocator);
     force_vma_resize_failure = 1;
-    if (kernel_mm_fork(&child, &parent) != KERNEL_MM_STATUS_NO_MEMORY ||
-        child.state != KERNEL_MM_EMPTY || child.allocator != 0 ||
+    brk_status = kernel_mm_fork(&child, &parent);
+    if (brk_status != KERNEL_MM_STATUS_NO_MEMORY) {
+        force_vma_resize_failure = 0;
+        return UINT64_C(0x300) + (unsigned long)brk_status;
+    }
+    if (child.state != KERNEL_MM_EMPTY || child.allocator != 0 ||
         child.record_page_address != 0U ||
         child.cleanup_stage != KERNEL_MM_CLEANUP_NONE ||
         physical_page_available(&allocator) != available_before_fork) {
@@ -473,6 +631,8 @@ unsigned long run_all_vma_cases(void)
     }
     force_vma_resize_failure = 0;
     if (kernel_mm_fork(&child, &parent) != KERNEL_MM_STATUS_OK ||
+        kernel_mm_brk(&child, 0U, &brk_result) != KERNEL_MM_STATUS_OK ||
+        brk_result != VMA_TEST_HEAP_BASE + UINT64_C(0x321) ||
         kernel_mm_vma_lookup(&child,
                              VMA_TEST_STACK_END - 1U,
                              &descriptor) != KERNEL_MM_STATUS_OK ||
@@ -495,8 +655,18 @@ unsigned long run_all_vma_cases(void)
         return 16U;
     }
     force_vma_release_failure = 0;
-    if (kernel_mm_release(&parent) != KERNEL_MM_STATUS_OK) {
+    fault_page_address = heap_page_address;
+    force_fault_page_release_failure = 1;
+    if (kernel_mm_release(&parent) != KERNEL_MM_STATUS_CLEANUP_REQUIRED ||
+        parent.state != KERNEL_MM_CLEANUP ||
+        parent.cleanup_stage != KERNEL_MM_CLEANUP_SPACE) {
+        force_fault_page_release_failure = 0;
         return 17U;
+    }
+    force_fault_page_release_failure = 0;
+    fault_page_address = 0U;
+    if (kernel_mm_release(&parent) != KERNEL_MM_STATUS_OK) {
+        return 28U;
     }
     kernel_heap_get_statistics(&heap, &statistics);
     if (statistics.live_allocations != 0U ||

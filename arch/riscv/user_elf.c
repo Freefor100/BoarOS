@@ -447,6 +447,39 @@ static enum riscv_user_elf_status register_load_vmas(
     return RISCV_USER_ELF_STATUS_OK;
 }
 
+static enum riscv_user_elf_status program_break_for_image(
+    const struct kernel_elf64_image *image,
+    uint64_t *program_break)
+{
+    struct kernel_elf64_program_header segment;
+    uint64_t highest_end = 0U;
+    uint64_t end;
+    uint16_t index;
+    enum riscv_user_elf_status status;
+
+    for (index = 0U;
+         index < image->header.program_header_count;
+         index++) {
+        status = read_program_header(image, index, &segment);
+        if (status != RISCV_USER_ELF_STATUS_OK) {
+            return status;
+        }
+        if (segment.type != KERNEL_ELF64_PROGRAM_LOAD ||
+            segment.memory_size == 0U) {
+            continue;
+        }
+        end = segment.virtual_address + segment.memory_size;
+        if (end > highest_end) {
+            highest_end = end;
+        }
+    }
+    if (highest_end == 0U) {
+        return RISCV_USER_ELF_STATUS_INVALID_LAYOUT;
+    }
+    *program_break = page_end(highest_end);
+    return RISCV_USER_ELF_STATUS_OK;
+}
+
 static enum riscv_user_elf_status register_stack_vma(
     const struct riscv_user_elf_stack_layout *layout,
     struct kernel_mm *mm)
@@ -1010,6 +1043,7 @@ enum riscv_user_elf_status riscv_user_elf_register_static_vmas(
 {
     struct kernel_elf64_image image;
     struct riscv_user_elf_stack_layout stack_layout;
+    uint64_t program_break;
     enum kernel_elf64_status elf_status;
     enum riscv_user_elf_status status;
 
@@ -1045,5 +1079,16 @@ enum riscv_user_elf_status riscv_user_elf_register_static_vmas(
     if (status != RISCV_USER_ELF_STATUS_OK) {
         return status;
     }
-    return register_stack_vma(&stack_layout, mm);
+    status = register_stack_vma(&stack_layout, mm);
+    if (status != RISCV_USER_ELF_STATUS_OK) {
+        return status;
+    }
+    status = program_break_for_image(&image, &program_break);
+    if (status != RISCV_USER_ELF_STATUS_OK) {
+        return status;
+    }
+    return mm_status(kernel_mm_brk_initialize(
+        mm,
+        program_break,
+        RISCV_USER_ELF_STACK_GUARD_BASE));
 }
