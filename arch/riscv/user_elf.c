@@ -1,5 +1,8 @@
 #include <arch/riscv/user_elf.h>
+#include <arch/riscv/mm.h>
 #include <kernel/elf64.h>
+#include <kernel/heap.h>
+#include <kernel/mm.h>
 #include <kernel/page.h>
 #include <kernel/physical_page.h>
 
@@ -51,6 +54,22 @@ static uint32_t segment_permissions(uint32_t flags)
         permissions |= RISCV_SV39_EXECUTE;
     }
     return permissions;
+}
+
+static uint32_t mm_permissions(uint32_t permissions)
+{
+    uint32_t result = 0U;
+
+    if ((permissions & RISCV_SV39_READ) != 0U) {
+        result |= KERNEL_MM_READ;
+    }
+    if ((permissions & RISCV_SV39_WRITE) != 0U) {
+        result |= KERNEL_MM_WRITE;
+    }
+    if ((permissions & RISCV_SV39_EXECUTE) != 0U) {
+        result |= KERNEL_MM_EXECUTE;
+    }
+    return result;
 }
 
 static int unsupported_program_type(uint32_t type)
@@ -324,6 +343,128 @@ static enum riscv_user_elf_status map_load_pages(
         }
     }
     return RISCV_USER_ELF_STATUS_OK;
+}
+
+static enum riscv_user_elf_status mm_status(
+    enum kernel_mm_status status)
+{
+    switch (status) {
+    case KERNEL_MM_STATUS_OK:
+        return RISCV_USER_ELF_STATUS_OK;
+    case KERNEL_MM_STATUS_INVALID_ARGUMENT:
+        return RISCV_USER_ELF_STATUS_INVALID_ARGUMENT;
+    case KERNEL_MM_STATUS_NO_MEMORY:
+        return RISCV_USER_ELF_STATUS_NO_MEMORY;
+    case KERNEL_MM_STATUS_CONFLICT:
+        return RISCV_USER_ELF_STATUS_INVALID_LAYOUT;
+    case KERNEL_MM_STATUS_CLEANUP_REQUIRED:
+        return RISCV_USER_ELF_STATUS_CLEANUP_REQUIRED;
+    case KERNEL_MM_STATUS_NOT_MAPPED:
+    case KERNEL_MM_STATUS_PAGE_ACCESS:
+    case KERNEL_MM_STATUS_PAGE_RELEASE:
+    case KERNEL_MM_STATUS_ADDRESS_SPACE:
+    case KERNEL_MM_STATUS_STATE:
+    default:
+        return RISCV_USER_ELF_STATUS_ADDRESS_SPACE;
+    }
+}
+
+static enum riscv_user_elf_status register_elf_vma_page(
+    struct kernel_mm *mm,
+    uint64_t virtual_address,
+    uint32_t sv39_permissions)
+{
+    struct kernel_mm_mapping mapping;
+    struct kernel_vma existing;
+    enum kernel_mm_status status;
+    uint32_t permissions = mm_permissions(sv39_permissions);
+
+    status = kernel_mm_lookup(mm, virtual_address, &mapping);
+    if (status != KERNEL_MM_STATUS_OK) {
+        return mm_status(status);
+    }
+    if (mapping.permissions != (permissions | KERNEL_MM_USER)) {
+        return RISCV_USER_ELF_STATUS_ADDRESS_SPACE;
+    }
+    status = kernel_mm_vma_lookup(mm, virtual_address, &existing);
+    if (status == KERNEL_MM_STATUS_NOT_MAPPED) {
+        return mm_status(kernel_mm_vma_insert_anon(
+            mm,
+            virtual_address,
+            virtual_address + BOAROS_PAGE_SIZE,
+            permissions,
+            KERNEL_VMA_ROLE_ELF));
+    }
+    if (status != KERNEL_MM_STATUS_OK) {
+        return mm_status(status);
+    }
+    return existing.permissions == permissions &&
+                   existing.kind == KERNEL_VMA_KIND_ANONYMOUS &&
+                   existing.role == KERNEL_VMA_ROLE_ELF
+               ? RISCV_USER_ELF_STATUS_OK
+               : RISCV_USER_ELF_STATUS_ADDRESS_SPACE;
+}
+
+static enum riscv_user_elf_status register_load_vmas(
+    const struct kernel_elf64_image *image,
+    struct kernel_mm *mm)
+{
+    struct kernel_elf64_program_header segment;
+    uint64_t current;
+    uint64_t end;
+    uint32_t permissions;
+    uint16_t index;
+    enum riscv_user_elf_status status;
+
+    for (index = 0U;
+         index < image->header.program_header_count;
+         index++) {
+        status = read_program_header(image, index, &segment);
+        if (status != RISCV_USER_ELF_STATUS_OK) {
+            return status;
+        }
+        if (segment.type != KERNEL_ELF64_PROGRAM_LOAD ||
+            segment.memory_size == 0U) {
+            continue;
+        }
+        current = page_start(segment.virtual_address);
+        end = page_end(segment.virtual_address + segment.memory_size);
+        while (current < end) {
+            status = permissions_for_page(image, current, &permissions);
+            if (status != RISCV_USER_ELF_STATUS_OK) {
+                return status;
+            }
+            status = register_elf_vma_page(mm, current, permissions);
+            if (status != RISCV_USER_ELF_STATUS_OK) {
+                return status;
+            }
+            current += BOAROS_PAGE_SIZE;
+        }
+    }
+    return RISCV_USER_ELF_STATUS_OK;
+}
+
+static enum riscv_user_elf_status register_stack_vma(
+    const struct riscv_user_elf_stack_layout *layout,
+    struct kernel_mm *mm)
+{
+    struct kernel_mm_mapping mapping;
+    const uint32_t permissions = KERNEL_MM_READ | KERNEL_MM_WRITE;
+    enum kernel_mm_status status;
+
+    status = kernel_mm_lookup(mm, layout->committed_base, &mapping);
+    if (status != KERNEL_MM_STATUS_OK) {
+        return mm_status(status);
+    }
+    if (mapping.permissions != (permissions | KERNEL_MM_USER)) {
+        return RISCV_USER_ELF_STATUS_ADDRESS_SPACE;
+    }
+    return mm_status(kernel_mm_vma_insert_anon(
+        mm,
+        RISCV_USER_ELF_STACK_RESERVE_BASE,
+        RISCV_USER_ELF_STACK_TOP,
+        permissions,
+        KERNEL_VMA_ROLE_STACK));
 }
 
 static enum riscv_user_elf_status copy_load_segments(
@@ -856,4 +997,49 @@ enum riscv_user_elf_status riscv_user_elf_load(
                                         space,
                                         entry,
                                         &image_failure);
+}
+
+enum riscv_user_elf_status riscv_user_elf_register_static_vmas(
+    const struct riscv_user_elf_request *request,
+    struct kernel_mm *mm,
+    struct kernel_heap *heap)
+{
+    struct kernel_elf64_image image;
+    struct riscv_user_elf_stack_layout stack_layout;
+    enum kernel_elf64_status elf_status;
+    enum riscv_user_elf_status status;
+
+    if (request == 0 || request->source.read_at == 0 || mm == 0 ||
+        heap == 0 ||
+        (request->argument_count != 0U && request->arguments == 0) ||
+        (request->environment_count != 0U && request->environment == 0)) {
+        return RISCV_USER_ELF_STATUS_INVALID_ARGUMENT;
+    }
+    elf_status = kernel_elf64_open(&request->source, &image);
+    if (elf_status != KERNEL_ELF64_STATUS_OK) {
+        return parser_status(elf_status);
+    }
+    if (image.header.machine != KERNEL_ELF64_MACHINE_RISCV) {
+        return RISCV_USER_ELF_STATUS_WRONG_ARCH;
+    }
+    if (image.header.type != KERNEL_ELF64_TYPE_EXECUTABLE) {
+        return RISCV_USER_ELF_STATUS_UNSUPPORTED;
+    }
+    status = calculate_stack_layout(request, &stack_layout);
+    if (status != RISCV_USER_ELF_STATUS_OK) {
+        return status;
+    }
+    status = validate_image_layout(&image, UINT64_MAX);
+    if (status != RISCV_USER_ELF_STATUS_OK) {
+        return status;
+    }
+    status = mm_status(kernel_mm_vma_enable(mm, heap));
+    if (status != RISCV_USER_ELF_STATUS_OK) {
+        return status;
+    }
+    status = register_load_vmas(&image, mm);
+    if (status != RISCV_USER_ELF_STATUS_OK) {
+        return status;
+    }
+    return register_stack_vma(&stack_layout, mm);
 }

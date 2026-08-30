@@ -33,6 +33,7 @@ FILES_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-files-rv
 SV39_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-sv39-rv
 SV39_FAULT_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-sv39-fault-rv
 MM_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-mm-rv
+VMA_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-vma-rv
 UACCESS_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-uaccess-rv
 TIMER_CASES_TEST_KERNEL_RV := \
 	$(BUILD_DIR)/tests/kernel-timer-cases-rv
@@ -55,6 +56,8 @@ ROOT_EXEC_STAGE2_RV := $(BUILD_DIR)/tests/user/root-exec-stage2-rv
 ROOT_EXEC_STAGE3_RV := $(BUILD_DIR)/tests/user/root-exec-stage3-rv
 EXEC_CLEANUP_TEST_KERNEL_RV := \
 	$(BUILD_DIR)/tests/kernel-exec-cleanup-rv
+ROOT_BOOT_CLEANUP_TEST_KERNEL_RV := \
+	$(BUILD_DIR)/tests/kernel-root-boot-cleanup-rv
 USER_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-user-rv
 USER_FATAL_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-user-fatal-rv
 
@@ -124,6 +127,7 @@ C_SOURCES := \
 	kernel/tick.c \
 	lib/qsort.c \
 	lib/string.c \
+	mm/vma.c \
 	mm/heap.c \
 	$(LWEXT4_SOURCES)
 ASM_SOURCES := \
@@ -162,6 +166,7 @@ TEST_RUNTIME_C_SOURCES := \
 	kernel/tick.c \
 	lib/qsort.c \
 	lib/string.c \
+	mm/vma.c \
 	mm/heap.c \
 	$(LWEXT4_SOURCES)
 TEST_RUNTIME_ASM_SOURCES := \
@@ -267,6 +272,12 @@ MM_TEST_C_SOURCES := \
 MM_TEST_OBJECTS := \
 	$(TEST_RUNTIME_OBJECTS) \
 	$(patsubst %.c,$(BUILD_DIR)/%.o,$(MM_TEST_C_SOURCES))
+VMA_TEST_C_SOURCES := \
+	tests/riscv/vma_cases.c \
+	tests/riscv/vma_cases_main.c
+VMA_TEST_OBJECTS := \
+	$(TEST_RUNTIME_OBJECTS) \
+	$(patsubst %.c,$(BUILD_DIR)/%.o,$(VMA_TEST_C_SOURCES))
 UACCESS_TEST_C_SOURCES := \
 	tests/riscv/uaccess_cases.c \
 	tests/riscv/uaccess_main.c
@@ -339,6 +350,8 @@ ROOT_EXEC_STAGE3_OBJECT_RV := \
 	$(BUILD_DIR)/tests/user/root_exec_stage3.o
 EXEC_CLEANUP_TEST_OBJECT_RV := \
 	$(BUILD_DIR)/tests/riscv/exec_cleanup_boot.o
+ROOT_BOOT_CLEANUP_TEST_OBJECT_RV := \
+	$(BUILD_DIR)/tests/riscv/root_boot_cleanup_boot.o
 USER_TEST_C_SOURCES := tests/riscv/user_boot.c
 USER_TEST_ASM_SOURCES := tests/riscv/user_payload.S
 USER_TEST_OBJECTS := \
@@ -366,6 +379,7 @@ DEPS := \
 	$(SV39_TEST_OBJECTS:.o=.d) \
 	$(SV39_FAULT_TEST_OBJECTS:.o=.d) \
 	$(MM_TEST_OBJECTS:.o=.d) \
+	$(VMA_TEST_OBJECTS:.o=.d) \
 	$(UACCESS_TEST_OBJECTS:.o=.d) \
 	$(TIMER_CASES_TEST_OBJECTS:.o=.d) \
 	$(TIMER_BOOT_TEST_OBJECTS:.o=.d) \
@@ -383,13 +397,14 @@ DEPS := \
 	$(ROOT_EXEC_STAGE2_OBJECT_RV:.o=.d) \
 	$(ROOT_EXEC_STAGE3_OBJECT_RV:.o=.d) \
 	$(EXEC_CLEANUP_TEST_OBJECT_RV:.o=.d) \
+	$(ROOT_BOOT_CLEANUP_TEST_OBJECT_RV:.o=.d) \
 	$(USER_TEST_OBJECTS:.o=.d) \
 	$(USER_FATAL_TEST_OBJECTS:.o=.d)
 
 .PHONY: all clean debug-riscv references run-riscv test-dtb-riscv \
 	test-context-riscv \
 	test-elf64-riscv test-user-elf-cases-riscv test-user-elf-riscv \
-	test-root-init-riscv test-exec-riscv \
+	test-root-init-riscv test-exec-riscv test-root-boot-cleanup-riscv \
 	test-files-riscv \
 	test-high-half-trap-riscv test-idle-riscv test-no-identity-riscv \
 	test-lwext4-host \
@@ -398,7 +413,7 @@ DEPS := \
 	test-references test-riscv test-sv39-fault-riscv test-sv39-riscv \
 	test-syscall-riscv test-timer-riscv test-trap-riscv \
 	test-trap-return-riscv test-user-fatal-riscv test-mm-riscv \
-	test-uaccess-riscv test-user-riscv
+	test-uaccess-riscv test-user-riscv test-vma-riscv
 
 all: $(KERNEL_RV)
 
@@ -490,6 +505,13 @@ $(MM_TEST_KERNEL_RV): $(MM_TEST_OBJECTS) \
 	$(CC) $(LDFLAGS) \
 		-Wl,-Map,$(BUILD_DIR)/tests/kernel-mm-rv.map \
 		-o $@ $(MM_TEST_OBJECTS)
+
+$(VMA_TEST_KERNEL_RV): $(VMA_TEST_OBJECTS) \
+		arch/riscv/linker.ld
+	$(CC) $(LDFLAGS) -Wl,--wrap=kernel_heap_release \
+		-Wl,--wrap=kernel_heap_resize \
+		-Wl,-Map,$(BUILD_DIR)/tests/kernel-vma-rv.map \
+		-o $@ $(VMA_TEST_OBJECTS)
 
 $(UACCESS_TEST_KERNEL_RV): $(UACCESS_TEST_OBJECTS) \
 		arch/riscv/linker.ld
@@ -619,6 +641,13 @@ $(EXEC_CLEANUP_TEST_KERNEL_RV): $(OBJECTS) \
 		-Wl,-Map,$(BUILD_DIR)/tests/kernel-exec-cleanup-rv.map \
 		-o $@ $(OBJECTS) $(EXEC_CLEANUP_TEST_OBJECT_RV)
 
+$(ROOT_BOOT_CLEANUP_TEST_KERNEL_RV): $(OBJECTS) \
+		$(ROOT_BOOT_CLEANUP_TEST_OBJECT_RV) arch/riscv/linker.ld
+	$(CC) $(LDFLAGS) -Wl,--wrap=kernel_fs_context_create \
+		-Wl,--wrap=kernel_vma_set_destroy \
+		-Wl,-Map,$(BUILD_DIR)/tests/kernel-root-boot-cleanup-rv.map \
+		-o $@ $(OBJECTS) $(ROOT_BOOT_CLEANUP_TEST_OBJECT_RV)
+
 $(BUILD_DIR)/tests/riscv/user_elf_images.o: \
 		tests/riscv/user_elf_images.S \
 		$(USER_ELF_PROGRAM_RV) $(USER_ELF_FAULT_PROGRAM_RV) \
@@ -691,6 +720,7 @@ test-riscv: $(DTB_TEST_KERNEL_RV) $(PAGE_TEST_KERNEL_RV) \
 	$(USER_ELF_CASES_TEST_KERNEL_RV) $(USER_ELF_TEST_KERNEL_RV) \
 	$(USER_TEST_KERNEL_RV) $(USER_FATAL_TEST_KERNEL_RV) \
 	$(MM_TEST_KERNEL_RV) $(UACCESS_TEST_KERNEL_RV) \
+	$(VMA_TEST_KERNEL_RV) \
 	$(SV39_TEST_KERNEL_RV) $(SV39_FAULT_TEST_KERNEL_RV) \
 	$(TRAP_RETURN_TEST_KERNEL_RV) $(TRAP_RETURN_SIE_TEST_KERNEL_RV) \
 	$(HIGH_HALF_TRAP_TEST_KERNEL_RV) $(NO_IDENTITY_TEST_KERNEL_RV) \
@@ -698,6 +728,7 @@ test-riscv: $(DTB_TEST_KERNEL_RV) $(PAGE_TEST_KERNEL_RV) \
 	$(ROOT_INIT_PROGRAM_RV) \
 	$(ROOT_EXEC_STAGE2_RV) $(ROOT_EXEC_STAGE3_RV) \
 	$(EXEC_CLEANUP_TEST_KERNEL_RV) \
+	$(ROOT_BOOT_CLEANUP_TEST_KERNEL_RV) \
 	$(KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) \
 		DTB_TEST_KERNEL_RV=$(DTB_TEST_KERNEL_RV) ./tests/dtb-riscv.sh
@@ -749,6 +780,9 @@ test-riscv: $(DTB_TEST_KERNEL_RV) $(PAGE_TEST_KERNEL_RV) \
 		MM_TEST_KERNEL_RV=$(MM_TEST_KERNEL_RV) \
 		./tests/mm-riscv.sh
 	QEMU_RISCV64=$(QEMU_RISCV64) \
+		VMA_TEST_KERNEL_RV=$(VMA_TEST_KERNEL_RV) \
+		./tests/vma-riscv.sh
+	QEMU_RISCV64=$(QEMU_RISCV64) \
 		UACCESS_TEST_KERNEL_RV=$(UACCESS_TEST_KERNEL_RV) \
 		./tests/uaccess-riscv.sh
 	QEMU_RISCV64=$(QEMU_RISCV64) \
@@ -779,6 +813,13 @@ test-riscv: $(DTB_TEST_KERNEL_RV) $(PAGE_TEST_KERNEL_RV) \
 		ROOT_INIT_PROGRAM_RV=$(ROOT_INIT_PROGRAM_RV) \
 		ROOT_EXEC_STAGE2_RV=$(ROOT_EXEC_STAGE2_RV) \
 		ROOT_EXEC_STAGE3_RV=$(ROOT_EXEC_STAGE3_RV) \
+		./tests/root-init-riscv.sh
+	QEMU_RISCV64=$(QEMU_RISCV64) QEMU_MEMORY=$(QEMU_MEMORY) \
+		KERNEL_RV=$(ROOT_BOOT_CLEANUP_TEST_KERNEL_RV) \
+		ROOT_INIT_PROGRAM_RV=$(ROOT_INIT_PROGRAM_RV) \
+		ROOT_EXEC_STAGE2_RV=$(ROOT_EXEC_STAGE2_RV) \
+		ROOT_EXEC_STAGE3_RV=$(ROOT_EXEC_STAGE3_RV) \
+		ROOT_BOOT_ERROR_STATUS=0x9 \
 		./tests/root-init-riscv.sh
 	QEMU_RISCV64=$(QEMU_RISCV64) QEMU_MEMORY=$(QEMU_MEMORY) \
 		KERNEL_RV=$(EXEC_CLEANUP_TEST_KERNEL_RV) \
@@ -878,6 +919,17 @@ test-exec-riscv: $(KERNEL_RV) $(EXEC_CLEANUP_TEST_KERNEL_RV) \
 		ROOT_EXEC_STAGE3_RV=$(ROOT_EXEC_STAGE3_RV) \
 		./tests/root-init-riscv.sh
 
+test-root-boot-cleanup-riscv: $(ROOT_BOOT_CLEANUP_TEST_KERNEL_RV) \
+		$(ROOT_INIT_PROGRAM_RV) $(ROOT_EXEC_STAGE2_RV) \
+		$(ROOT_EXEC_STAGE3_RV)
+	QEMU_RISCV64=$(QEMU_RISCV64) QEMU_MEMORY=$(QEMU_MEMORY) \
+		KERNEL_RV=$(ROOT_BOOT_CLEANUP_TEST_KERNEL_RV) \
+		ROOT_INIT_PROGRAM_RV=$(ROOT_INIT_PROGRAM_RV) \
+		ROOT_EXEC_STAGE2_RV=$(ROOT_EXEC_STAGE2_RV) \
+		ROOT_EXEC_STAGE3_RV=$(ROOT_EXEC_STAGE3_RV) \
+		ROOT_BOOT_ERROR_STATUS=0x9 \
+		./tests/root-init-riscv.sh
+
 test-user-riscv: $(USER_TEST_KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) USER_TEST_KERNEL_RV=$< \
 		./tests/user-riscv.sh
@@ -889,6 +941,10 @@ test-user-fatal-riscv: $(USER_FATAL_TEST_KERNEL_RV)
 test-mm-riscv: $(MM_TEST_KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) MM_TEST_KERNEL_RV=$< \
 		./tests/mm-riscv.sh
+
+test-vma-riscv: $(VMA_TEST_KERNEL_RV)
+	QEMU_RISCV64=$(QEMU_RISCV64) VMA_TEST_KERNEL_RV=$< \
+		./tests/vma-riscv.sh
 
 test-uaccess-riscv: $(UACCESS_TEST_KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) UACCESS_TEST_KERNEL_RV=$< \

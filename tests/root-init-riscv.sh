@@ -9,6 +9,7 @@ stage2=${ROOT_EXEC_STAGE2_RV:-"$project_root/build/riscv/tests/user/root-exec-st
 stage3=${ROOT_EXEC_STAGE3_RV:-"$project_root/build/riscv/tests/user/root-exec-stage3-rv"}
 qemu=${QEMU_RISCV64:-qemu-system-riscv64}
 memory=${QEMU_MEMORY:-512M}
+root_boot_error_status=${ROOT_BOOT_ERROR_STATUS:-}
 work_dir=$(mktemp -d)
 output="$work_dir/root-init.log"
 disk="$work_dir/root.img"
@@ -68,6 +69,21 @@ if ! timeout -k 2s 15s "$qemu" \
     tail -n 120 "$output" >&2
     echo "production kernel failed to run disk-backed /init" >&2
     exit 1
+fi
+
+if [ -n "$root_boot_error_status" ]; then
+    if [ "$(grep -cxF "BoarOS: root boot error status=$root_boot_error_status" "$output" || true)" -ne 1 ]; then
+        tail -n 120 "$output" >&2
+        echo "production kernel did not report the expected root boot error" >&2
+        exit 1
+    fi
+    if grep -qE 'BoarOS: root /init started|BoarOS: PID 1 exited' "$output"; then
+        tail -n 120 "$output" >&2
+        echo "production kernel started a user process after root boot failed" >&2
+        exit 1
+    fi
+    echo "RISC-V root-boot cleanup retried VMA teardown"
+    exit 0
 fi
 
 if [ "$(grep -cxF 'BoarOS: root /init started pid=0x1' "$output" || true)" -ne 1 ]; then

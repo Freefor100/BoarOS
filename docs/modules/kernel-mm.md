@@ -6,9 +6,10 @@
 
 | 文件 | 当前职责 |
 |---|---|
-| `include/kernel/mm.h` | 定义跨架构 MM 句柄、权限、状态和引用操作 |
-| `include/arch/riscv/mm.h`、`arch/riscv/mm.c` | 用一张记录页封装 Sv39 用户地址空间，并实现当前构建所选的通用 MM 操作 |
-| `tests/riscv/mm_cases.c`、`tests/mm-riscv.sh` | 验证创建、共享引用、移动、查询和可重试回收 |
+| `include/kernel/mm.h` | 定义跨架构 MM 句柄、权限、状态、引用和 VMA 入口 |
+| `include/arch/riscv/mm.h`、`arch/riscv/mm.c` | 用一张记录页封装 Sv39 用户地址空间与可选 VMA 集合，并实现当前构建所选的通用 MM 操作 |
+| `tests/riscv/mm_cases.c`、`tests/mm-riscv.sh` | 验证创建、共享引用、移动、查询和既有页表回收语义 |
+| `tests/riscv/vma_cases.c`、`tests/vma-riscv.sh` | 验证 VMA 集成后的 fork、冲突与 VMA 清理重试 |
 
 稳定接口为：
 
@@ -34,6 +35,22 @@ enum kernel_mm_status kernel_mm_lookup(
     uint64_t virtual_address,
     struct kernel_mm_mapping *mapping);
 
+enum kernel_mm_status kernel_mm_vma_enable(
+    struct kernel_mm *mm,
+    struct kernel_heap *heap);
+
+enum kernel_mm_status kernel_mm_vma_insert_anon(
+    struct kernel_mm *mm,
+    uint64_t start,
+    uint64_t end,
+    uint32_t permissions,
+    enum kernel_vma_role role);
+
+enum kernel_mm_status kernel_mm_vma_lookup(
+    const struct kernel_mm *mm,
+    uint64_t virtual_address,
+    struct kernel_vma *vma);
+
 enum kernel_mm_status kernel_mm_release(struct kernel_mm *mm);
 ```
 
@@ -44,7 +61,7 @@ enum kernel_mm_status kernel_mm_release(struct kernel_mm *mm);
 `struct kernel_mm` 是一个可移动的拥有型引用，不是地址空间本体。RISC-V 后端用 `record_page_address` 指向一张物理记录页；记录页保存引用计数、清理阶段和唯一的 `riscv_sv39_user_space`。多个 LIVE 句柄可以指向同一记录页：
 
 - `acquire` 增加引用计数并发布一个新的独立 owner；
-- `fork` 创建独立地址空间，复制用户映射、页内容和权限，不共享用户叶子页；
+- `fork` 创建独立地址空间，复制用户映射、页内容、权限和已启用的 VMA 描述符，不共享用户叶子页；
 - `move` 转移一个 owner，不改变引用计数；
 - `release` 消耗一个 owner，非末引用只减计数，末引用才销毁页表树和记录页；
 - `lookup` 把架构权限翻译为 `KERNEL_MM_READ/WRITE/EXECUTE/USER`，不让通用调用者依赖 RISC-V PTE 位值。
@@ -63,16 +80,17 @@ Eager copy 的时间和新增物理内存都与已提交用户页数线性相关
 
 ## 末引用回收
 
-末引用只能在其 `satp` 已不活动时释放。回收按两个阶段执行：
+末引用只能在其 `satp` 已不活动时释放。有 VMA 时回收按三个阶段执行：
 
 ```text
 LIVE(last ref)
+  -> release VMA metadata
   -> destroy private user leaves and page tables
   -> release MM record page
   -> RELEASED
 ```
 
-Sv39 销毁一旦发生部分提交，MM 转入 `CLEANUP_SPACE`；后续调用只继续地址空间回收。地址空间已经销毁而记录页释放失败时转入 `CLEANUP_RECORD`；后续调用只重试记录页。两种 CLEANUP 都可 move，不能 acquire、lookup 或生成 `satp`。非末引用释放不触碰页表树。
+VMA metadata 释放失败时转入 `CLEANUP_VMAS`，后续调用只重试这项释放；成功后才进入 Sv39 回收。Sv39 销毁一旦发生部分提交，MM 转入 `CLEANUP_SPACE`；后续调用只继续地址空间回收。地址空间已经销毁而记录页释放失败时转入 `CLEANUP_RECORD`；后续调用只重试记录页。所有 CLEANUP 都可 move，不能 acquire、lookup 或生成 `satp`。没有 VMA 的既有 MM 若 Sv39 销毁未发生提交即失败，则仍保持 LIVE；非末引用释放不触碰 VMA 或页表树。
 
 用户退出路径先切到内核根页表，再在仍有效的任务内核栈上调用 `kernel_mm_release()`；失败 owner 交给 idle reaper 在后续重试。因此不会销毁硬件当前仍在使用的用户根。MM 完成后才允许任务成为 zombie，zombie 只保留身份、亲缘、wait status 和任务页。
 
@@ -86,11 +104,12 @@ Scheduler 在用户任务创建时解析 MM、验证入口与栈权限，并缓�
 
 ```sh
 make test-mm-riscv
+make test-vma-riscv
 make test-user-riscv
 make test-user-elf-riscv
 make test-riscv
 ```
 
-MM 聚焦测试覆盖创建失败原子性、共享引用、移动、eager fork 的内容/权限复制与写隔离，以及页表部分回收、记录页访问/释放失败后的阶段化重试。用户与生产进程测试覆盖 scheduler 接管、父子分别退出和最终物理页计数复原。
+MM 聚焦测试覆盖创建失败原子性、共享引用、移动、eager fork 的内容/权限复制与写隔离，以及页表部分回收、记录页访问/释放失败后的阶段化重试。VMA 聚焦测试覆盖描述符 fork 复制、metadata 分配失败后目标恢复 EMPTY、VMA-first cleanup 和 heap 释放失败后的重试。用户与生产进程测试覆盖 scheduler 接管、父子分别退出和最终物理页计数复原。
 
 当前只有 RISC-V 后端；映射仍由 Sv39/4 KiB 用户页实现。普通 clone 已使用独立 MM，但尚无 COW 或 `CLONE_VM` 共享进程；文件表、信号处理表和其他进程资源不属于 MM。

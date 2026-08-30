@@ -1,9 +1,13 @@
 #include <arch/riscv/sv39.h>
+#include <arch/riscv/mm.h>
 #include <arch/riscv/user_elf.h>
 #include <kernel/boot_memory.h>
 #include <kernel/elf64.h>
+#include <kernel/heap.h>
+#include <kernel/mm.h>
 #include <kernel/page.h>
 #include <kernel/physical_page.h>
+#include <kernel/vma.h>
 
 #include <stddef.h>
 #include <stdint.h>
@@ -14,6 +18,9 @@
 #define TEST_OOM_POOL_PAGES 8U
 #define TEST_OOM_POOL_WORDS \
     ((BOAROS_PAGE_SIZE * TEST_OOM_POOL_PAGES) / sizeof(uint64_t))
+#define TEST_VMA_POOL_PAGES 64U
+#define TEST_VMA_POOL_WORDS \
+    ((BOAROS_PAGE_SIZE * TEST_VMA_POOL_PAGES) / sizeof(uint64_t))
 #define TEST_IMAGE_SIZE 0x800U
 #define TEST_HEADER_SIZE 64U
 #define TEST_PROGRAM_HEADER_SIZE 56U
@@ -29,6 +36,8 @@
 static uint64_t test_page_pool[TEST_POOL_WORDS]
     __attribute__((aligned(BOAROS_PAGE_SIZE)));
 static uint64_t test_oom_page_pool[TEST_OOM_POOL_WORDS]
+    __attribute__((aligned(BOAROS_PAGE_SIZE)));
+static uint64_t test_vma_page_pool[TEST_VMA_POOL_WORDS]
     __attribute__((aligned(BOAROS_PAGE_SIZE)));
 static uint64_t test_cleanup_page_pool[TEST_POOL_WORDS]
     __attribute__((aligned(BOAROS_PAGE_SIZE)));
@@ -79,6 +88,19 @@ enum riscv_sv39_status __wrap_riscv_sv39_user_space_destroy(
 static void *identity_page_access(uint64_t address)
 {
     return (void *)(uintptr_t)address;
+}
+
+static int vma_heap_address(const void *pointer, uint64_t *address)
+{
+    uintptr_t base = (uintptr_t)test_vma_page_pool;
+    uintptr_t value = (uintptr_t)pointer;
+
+    if (address == 0 || value < base ||
+        value - base >= sizeof(test_vma_page_pool)) {
+        return 0;
+    }
+    *address = (uint64_t)value;
+    return 1;
 }
 
 static void *faulting_page_access(uint64_t address)
@@ -235,6 +257,32 @@ static int init_allocator_and_kernel_table(
         pool,
         pool_size,
         identity_page_access);
+}
+
+static int init_finalized_allocator_and_kernel_table(
+    struct physical_page_allocator *allocator,
+    struct riscv_sv39_page_table *kernel_table,
+    void *pool,
+    size_t pool_size)
+{
+    struct boot_memory_layout layout = {0};
+
+    layout.usable_count = 1U;
+    layout.usable[0].base = (uint64_t)(uintptr_t)pool;
+    layout.usable[0].size = pool_size;
+    if (physical_page_allocator_init(allocator, &layout) !=
+            PHYSICAL_PAGE_STATUS_OK ||
+        physical_page_allocator_bind_access(allocator,
+                                            identity_page_access) !=
+            PHYSICAL_PAGE_STATUS_OK ||
+        physical_page_allocator_finalize(allocator) !=
+            PHYSICAL_PAGE_STATUS_OK ||
+        riscv_sv39_page_table_init(kernel_table, allocator) !=
+            RISCV_SV39_STATUS_OK) {
+        return 0;
+    }
+    kernel_table->state = RISCV_SV39_STATE_ACTIVE;
+    return 1;
 }
 
 static int expect_pattern(const unsigned char *page,
@@ -1340,6 +1388,96 @@ static unsigned long run_source_io_failure(void)
     return 0U;
 }
 
+static unsigned long run_vma_registration_cases(void)
+{
+    struct physical_page_allocator allocator;
+    struct riscv_sv39_page_table kernel_table = {0};
+    struct riscv_sv39_user_space space = {0};
+    struct kernel_heap heap;
+    struct kernel_mm mm = {0};
+    struct kernel_vma descriptor;
+    struct kernel_heap_statistics statistics;
+    struct riscv_user_elf_request request = {0};
+    struct riscv_user_elf_entry entry = {0};
+    uint64_t baseline;
+
+    make_valid_image();
+    if (!init_finalized_allocator_and_kernel_table(
+            &allocator,
+            &kernel_table,
+            test_vma_page_pool,
+            sizeof(test_vma_page_pool)) ||
+        kernel_heap_init(&heap, &allocator, vma_heap_address) !=
+            KERNEL_HEAP_STATUS_OK ||
+        kernel_read_source_from_memory(test_image,
+                                       sizeof(test_image),
+                                       &request.source) != 0) {
+        return 1U;
+    }
+    baseline = physical_page_available(&allocator);
+    if (riscv_user_elf_load(&request,
+                            &allocator,
+                            &kernel_table,
+                            &space,
+                            &entry) != RISCV_USER_ELF_STATUS_OK) {
+        return 2U;
+    }
+    if (riscv_kernel_mm_create(&mm, &space) != KERNEL_MM_STATUS_OK) {
+        (void)riscv_sv39_user_space_destroy(&space);
+        return 3U;
+    }
+    if (riscv_user_elf_register_static_vmas(&request, &mm, &heap) !=
+        RISCV_USER_ELF_STATUS_OK) {
+        (void)kernel_mm_release(&mm);
+        return 4U;
+    }
+    if (kernel_mm_vma_lookup(&mm, TEST_TEXT_VA, &descriptor) !=
+            KERNEL_MM_STATUS_OK ||
+        descriptor.start != (TEST_TEXT_VA & ~BOAROS_PAGE_MASK) ||
+        descriptor.end !=
+            (TEST_TEXT_VA & ~BOAROS_PAGE_MASK) + BOAROS_PAGE_SIZE ||
+        descriptor.permissions !=
+            (KERNEL_MM_READ | KERNEL_MM_EXECUTE) ||
+        descriptor.kind != KERNEL_VMA_KIND_ANONYMOUS ||
+        descriptor.role != KERNEL_VMA_ROLE_ELF) {
+        (void)kernel_mm_release(&mm);
+        return 5U;
+    }
+    /* The read-only and writable segments share one page. */
+    if (kernel_mm_vma_lookup(&mm, TEST_READ_ONLY_VA, &descriptor) !=
+            KERNEL_MM_STATUS_OK ||
+        descriptor.start != (TEST_READ_ONLY_VA & ~BOAROS_PAGE_MASK) ||
+        descriptor.end !=
+            (TEST_READ_ONLY_VA & ~BOAROS_PAGE_MASK) + BOAROS_PAGE_SIZE ||
+        descriptor.permissions != (KERNEL_MM_READ | KERNEL_MM_WRITE) ||
+        descriptor.kind != KERNEL_VMA_KIND_ANONYMOUS ||
+        descriptor.role != KERNEL_VMA_ROLE_ELF ||
+        kernel_mm_vma_lookup(&mm,
+                             RISCV_USER_ELF_STACK_RESERVE_BASE,
+                             &descriptor) != KERNEL_MM_STATUS_OK ||
+        descriptor.start != RISCV_USER_ELF_STACK_RESERVE_BASE ||
+        descriptor.end != RISCV_USER_ELF_STACK_TOP ||
+        descriptor.permissions != (KERNEL_MM_READ | KERNEL_MM_WRITE) ||
+        descriptor.kind != KERNEL_VMA_KIND_ANONYMOUS ||
+        descriptor.role != KERNEL_VMA_ROLE_STACK ||
+        kernel_mm_vma_lookup(&mm,
+                             RISCV_USER_ELF_STACK_GUARD_BASE,
+                             &descriptor) != KERNEL_MM_STATUS_NOT_MAPPED) {
+        (void)kernel_mm_release(&mm);
+        return 6U;
+    }
+    if (kernel_mm_release(&mm) != KERNEL_MM_STATUS_OK) {
+        return 7U;
+    }
+    kernel_heap_get_statistics(&heap, &statistics);
+    if (statistics.live_allocations != 0U ||
+        statistics.current_pages != 0U ||
+        physical_page_available(&allocator) != baseline) {
+        return 8U;
+    }
+    return 0U;
+}
+
 unsigned long run_all_user_elf_cases(void)
 {
     unsigned long result = run_user_elf_cases();
@@ -1372,5 +1510,9 @@ unsigned long run_all_user_elf_cases(void)
         return UINT64_C(0x700) + result;
     }
     result = run_source_io_failure();
-    return result == 0U ? 0U : UINT64_C(0x800) + result;
+    if (result != 0U) {
+        return UINT64_C(0x800) + result;
+    }
+    result = run_vma_registration_cases();
+    return result == 0U ? 0U : UINT64_C(0x900) + result;
 }

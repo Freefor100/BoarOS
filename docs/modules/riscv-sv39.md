@@ -100,4 +100,4 @@ make test-riscv
 
 聚焦建表测试除启动 PTE、规模和失败语义外，还检查用户根高半区借用、U 页权限、零页映射、跨页离线填充、用户地址半开区间、数值为 0 的合法用户根地址、lookup、move、活动根销毁拒绝、后序回收、OOM 回滚、`satp` 编码和失败输出不变。`test-user-elf-cases-riscv` 覆盖装载权限、参数栈、初始提交边界、共享边界页、BSS、永久 guard、错误树、OOM 回滚，以及根页、中间表和叶子页发生“访问与立即释放同时失败”时的 `CLEANUP` 所有权；其中还直接构造第二张中间表失败且上级表回滚释放也失败的组合，要求保留 `CLEANUP_REQUIRED` 状态。`test-user-elf-riscv` 让独立链接的完整 ELF 实际运行，并以 RX 文本写和永久 guard 两种 store page fault 验证最终硬件 PTE。`test-user-riscv` 进一步在两个真实用户根与内核根之间切换，验证可执行/可写用户页、timer 抢占、页故障隔离及最终页计数复原；`test-user-fatal-riscv` 在用户根仍活动时强制拒绝返回，验证高半区 UART 能完成 fatal 诊断和关机。其余权限、高半区和 no-identity 测试继续验证启动页表的硬件行为。
 
-当前未实现 1 GiB 叶子、用户 unmap/mprotect、共享叶子、copy-on-write、按需分页、ASID 分配和 SMP TLB shootdown。用户映射固定为 4 KiB；direct map 只映射 DTB 报告的第一段 RAM，不包含 MMIO，也不放宽内核 text/rodata 的别名权限。
+当前未实现 1 GiB 叶子、用户可调用的 `munmap`/`mprotect`、共享叶子、copy-on-write、按需分页、ASID 分配和 SMP TLB shootdown。用户映射固定为 4 KiB；direct map 只映射 DTB 报告的第一段 RAM，不包含 MMIO，也不放宽内核 text/rodata 的别名权限。

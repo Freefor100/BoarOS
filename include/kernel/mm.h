@@ -2,6 +2,7 @@
 #define BOAROS_KERNEL_MM_H
 
 #include <kernel/physical_page.h>
+#include <kernel/vma.h>
 
 #include <stdint.h>
 
@@ -20,6 +21,7 @@ enum kernel_mm_status {
     KERNEL_MM_STATUS_ADDRESS_SPACE,
     KERNEL_MM_STATUS_CLEANUP_REQUIRED,
     KERNEL_MM_STATUS_STATE,
+    KERNEL_MM_STATUS_CONFLICT,
 };
 
 enum kernel_mm_state {
@@ -32,6 +34,7 @@ enum kernel_mm_state {
 
 enum kernel_mm_cleanup_stage {
     KERNEL_MM_CLEANUP_NONE = 0,
+    KERNEL_MM_CLEANUP_VMAS,
     KERNEL_MM_CLEANUP_SPACE,
     KERNEL_MM_CLEANUP_RECORD,
 };
@@ -67,6 +70,27 @@ enum kernel_mm_status kernel_mm_lookup(
     const struct kernel_mm *mm,
     uint64_t virtual_address,
     struct kernel_mm_mapping *mapping);
+
+/*
+ * VMA metadata is enabled exactly once while this MM has one owner.  heap is
+ * borrowed and must outlive the MM, including every cleanup retry.
+ */
+enum kernel_mm_status kernel_mm_vma_enable(
+    struct kernel_mm *mm,
+    struct kernel_heap *heap);
+
+enum kernel_mm_status kernel_mm_vma_insert_anon(
+    struct kernel_mm *mm,
+    uint64_t start,
+    uint64_t end,
+    uint32_t permissions,
+    enum kernel_vma_role role);
+
+/* Returns NOT_MAPPED for a valid address outside all VMAs. */
+enum kernel_mm_status kernel_mm_vma_lookup(
+    const struct kernel_mm *mm,
+    uint64_t virtual_address,
+    struct kernel_vma *vma);
 
 /* Success consumes one reference; last-reference cleanup is retryable. */
 enum kernel_mm_status kernel_mm_release(struct kernel_mm *mm);

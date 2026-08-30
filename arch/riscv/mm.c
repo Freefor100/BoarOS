@@ -1,5 +1,7 @@
 #include <arch/riscv/mm.h>
+#include <kernel/heap.h>
 #include <kernel/page.h>
+#include <kernel/vma.h>
 
 #include <stddef.h>
 #include <stdint.h>
@@ -8,6 +10,7 @@
 
 enum riscv_kernel_mm_record_stage {
     RISCV_KERNEL_MM_RECORD_LIVE = 0,
+    RISCV_KERNEL_MM_RECORD_VMAS_CLEANUP,
     RISCV_KERNEL_MM_RECORD_SPACE_CLEANUP,
     RISCV_KERNEL_MM_RECORD_ONLY_CLEANUP,
 };
@@ -17,6 +20,7 @@ struct riscv_kernel_mm_record {
     uint32_t references;
     enum riscv_kernel_mm_record_stage stage;
     struct riscv_sv39_user_space space;
+    struct kernel_vma_set *vmas;
 };
 
 _Static_assert(sizeof(struct riscv_kernel_mm_record) <= BOAROS_PAGE_SIZE,
@@ -203,6 +207,44 @@ static enum kernel_mm_status fork_status_from_sv39(
     return KERNEL_MM_STATUS_ADDRESS_SPACE;
 }
 
+static enum kernel_mm_status status_from_vma(enum kernel_vma_status status)
+{
+    switch (status) {
+    case KERNEL_VMA_STATUS_OK:
+        return KERNEL_MM_STATUS_OK;
+    case KERNEL_VMA_STATUS_INVALID_ARGUMENT:
+        return KERNEL_MM_STATUS_INVALID_ARGUMENT;
+    case KERNEL_VMA_STATUS_NO_MEMORY:
+        return KERNEL_MM_STATUS_NO_MEMORY;
+    case KERNEL_VMA_STATUS_CONFLICT:
+        return KERNEL_MM_STATUS_CONFLICT;
+    case KERNEL_VMA_STATUS_NOT_FOUND:
+        return KERNEL_MM_STATUS_NOT_MAPPED;
+    case KERNEL_VMA_STATUS_CLEANUP_REQUIRED:
+        return KERNEL_MM_STATUS_CLEANUP_REQUIRED;
+    case KERNEL_VMA_STATUS_STATE:
+    default:
+        return KERNEL_MM_STATUS_STATE;
+    }
+}
+
+static int valid_vma_range(uint64_t start,
+                           uint64_t end,
+                           uint32_t permissions)
+{
+    uint32_t known = KERNEL_MM_READ | KERNEL_MM_WRITE |
+                     KERNEL_MM_EXECUTE;
+
+    return start >= RISCV_SV39_PAGE_SIZE_4K && start < end &&
+           end <= RISCV_SV39_USER_LIMIT &&
+           (start & BOAROS_PAGE_MASK) == 0U &&
+           (end & BOAROS_PAGE_MASK) == 0U &&
+           (permissions & ~known) == 0U &&
+           (permissions & known) != 0U &&
+           !((permissions & KERNEL_MM_WRITE) != 0U &&
+             (permissions & KERNEL_MM_READ) == 0U);
+}
+
 enum kernel_mm_status kernel_mm_fork(
     struct kernel_mm *destination,
     const struct kernel_mm *source)
@@ -253,6 +295,26 @@ enum kernel_mm_status kernel_mm_fork(
         &destination_record->space,
         &source_record->space);
     if (sv39_status == RISCV_SV39_STATUS_OK) {
+        if (source_record->vmas != 0) {
+            status = status_from_vma(kernel_vma_set_clone(
+                source_record->vmas,
+                &destination_record->vmas));
+            if (status != KERNEL_MM_STATUS_OK) {
+                destination_record->stage =
+                    RISCV_KERNEL_MM_RECORD_VMAS_CLEANUP;
+                destination->allocator = source->allocator;
+                destination->record_page_address = record_page_address;
+                destination->state = KERNEL_MM_CLEANUP;
+                destination->cleanup_stage = KERNEL_MM_CLEANUP_VMAS;
+                if (kernel_mm_release(destination) != KERNEL_MM_STATUS_OK) {
+                    return KERNEL_MM_STATUS_CLEANUP_REQUIRED;
+                }
+                finish_handle(destination, KERNEL_MM_EMPTY);
+                return status == KERNEL_MM_STATUS_CLEANUP_REQUIRED
+                           ? KERNEL_MM_STATUS_STATE
+                           : status;
+            }
+        }
         destination->allocator = source->allocator;
         destination->record_page_address = record_page_address;
         destination->state = KERNEL_MM_LIVE;
@@ -352,6 +414,90 @@ enum kernel_mm_status kernel_mm_lookup(
     return KERNEL_MM_STATUS_OK;
 }
 
+enum kernel_mm_status kernel_mm_vma_enable(
+    struct kernel_mm *mm,
+    struct kernel_heap *heap)
+{
+    struct riscv_kernel_mm_record *record;
+    enum kernel_mm_status status;
+
+    if (mm == 0 || heap == 0 || heap->page_allocator != mm->allocator) {
+        return KERNEL_MM_STATUS_INVALID_ARGUMENT;
+    }
+    if (mm->state != KERNEL_MM_LIVE) {
+        return KERNEL_MM_STATUS_STATE;
+    }
+    status = resolve_record(mm, &record);
+    if (status != KERNEL_MM_STATUS_OK ||
+        record->stage != RISCV_KERNEL_MM_RECORD_LIVE ||
+        record->references != 1U || record->vmas != 0) {
+        return status == KERNEL_MM_STATUS_OK ? KERNEL_MM_STATUS_STATE
+                                             : status;
+    }
+    return status_from_vma(kernel_vma_set_create(heap, &record->vmas));
+}
+
+enum kernel_mm_status kernel_mm_vma_insert_anon(
+    struct kernel_mm *mm,
+    uint64_t start,
+    uint64_t end,
+    uint32_t permissions,
+    enum kernel_vma_role role)
+{
+    struct riscv_kernel_mm_record *record;
+    struct kernel_vma vma;
+    enum kernel_mm_status status;
+
+    if (mm == 0 || !valid_vma_range(start, end, permissions) ||
+        role < KERNEL_VMA_ROLE_NONE || role > KERNEL_VMA_ROLE_MMAP) {
+        return KERNEL_MM_STATUS_INVALID_ARGUMENT;
+    }
+    if (mm->state != KERNEL_MM_LIVE) {
+        return KERNEL_MM_STATUS_STATE;
+    }
+    status = resolve_record(mm, &record);
+    if (status != KERNEL_MM_STATUS_OK ||
+        record->stage != RISCV_KERNEL_MM_RECORD_LIVE ||
+        record->references != 1U || record->vmas == 0) {
+        return status == KERNEL_MM_STATUS_OK ? KERNEL_MM_STATUS_STATE
+                                             : status;
+    }
+    vma.start = start;
+    vma.end = end;
+    vma.file_offset = 0U;
+    vma.permissions = permissions;
+    vma.kind = KERNEL_VMA_KIND_ANONYMOUS;
+    vma.role = role;
+    vma.backing = 0;
+    return status_from_vma(kernel_vma_set_insert(record->vmas, &vma));
+}
+
+enum kernel_mm_status kernel_mm_vma_lookup(
+    const struct kernel_mm *mm,
+    uint64_t virtual_address,
+    struct kernel_vma *vma)
+{
+    struct riscv_kernel_mm_record *record;
+    enum kernel_mm_status status;
+
+    if (mm == 0 || vma == 0 || virtual_address >= RISCV_SV39_USER_LIMIT) {
+        return KERNEL_MM_STATUS_INVALID_ARGUMENT;
+    }
+    if (mm->state != KERNEL_MM_LIVE) {
+        return KERNEL_MM_STATUS_STATE;
+    }
+    status = resolve_record(mm, &record);
+    if (status != KERNEL_MM_STATUS_OK ||
+        record->stage != RISCV_KERNEL_MM_RECORD_LIVE ||
+        record->vmas == 0) {
+        return status == KERNEL_MM_STATUS_OK ? KERNEL_MM_STATUS_STATE
+                                             : status;
+    }
+    return status_from_vma(kernel_vma_set_lookup(record->vmas,
+                                                 virtual_address,
+                                                 vma));
+}
+
 enum kernel_mm_status riscv_kernel_mm_satp(
     const struct kernel_mm *mm,
     uint64_t *satp)
@@ -384,6 +530,7 @@ enum kernel_mm_status kernel_mm_release(struct kernel_mm *mm)
     uint32_t leaf_pages;
     enum kernel_mm_status status;
     enum riscv_sv39_status sv39_status;
+    enum kernel_vma_status vma_status;
 
     if (mm == 0) {
         return KERNEL_MM_STATUS_INVALID_ARGUMENT;
@@ -408,8 +555,56 @@ enum kernel_mm_status kernel_mm_release(struct kernel_mm *mm)
             finish_handle(mm, KERNEL_MM_RELEASED);
             return KERNEL_MM_STATUS_OK;
         }
-    } else if (mm->cleanup_stage != KERNEL_MM_CLEANUP_SPACE ||
-               record->stage != RISCV_KERNEL_MM_RECORD_SPACE_CLEANUP) {
+        if (record->vmas == 0) {
+            table_pages = record->space.table_pages;
+            leaf_pages = record->space.leaf_pages;
+            sv39_status = riscv_sv39_user_space_destroy(&record->space);
+            if (sv39_status != RISCV_SV39_STATUS_OK) {
+                if (record->space.table_pages != table_pages ||
+                    record->space.leaf_pages != leaf_pages ||
+                    sv39_status == RISCV_SV39_STATUS_CLEANUP_REQUIRED) {
+                    record->stage =
+                        RISCV_KERNEL_MM_RECORD_SPACE_CLEANUP;
+                    mm->state = KERNEL_MM_CLEANUP;
+                    mm->cleanup_stage = KERNEL_MM_CLEANUP_SPACE;
+                    return KERNEL_MM_STATUS_CLEANUP_REQUIRED;
+                }
+                return KERNEL_MM_STATUS_ADDRESS_SPACE;
+            }
+            record->stage = RISCV_KERNEL_MM_RECORD_ONLY_CLEANUP;
+            mm->state = KERNEL_MM_CLEANUP;
+            mm->cleanup_stage = KERNEL_MM_CLEANUP_RECORD;
+            status = release_record_only(mm);
+            return status == KERNEL_MM_STATUS_PAGE_RELEASE
+                       ? KERNEL_MM_STATUS_CLEANUP_REQUIRED
+                       : status;
+        }
+        record->stage = RISCV_KERNEL_MM_RECORD_VMAS_CLEANUP;
+        mm->state = KERNEL_MM_CLEANUP;
+        mm->cleanup_stage = KERNEL_MM_CLEANUP_VMAS;
+    } else if ((mm->cleanup_stage != KERNEL_MM_CLEANUP_VMAS ||
+                record->stage != RISCV_KERNEL_MM_RECORD_VMAS_CLEANUP) &&
+               (mm->cleanup_stage != KERNEL_MM_CLEANUP_SPACE ||
+                record->stage != RISCV_KERNEL_MM_RECORD_SPACE_CLEANUP)) {
+        return KERNEL_MM_STATUS_STATE;
+    }
+
+    if (record->stage == RISCV_KERNEL_MM_RECORD_VMAS_CLEANUP) {
+        if (record->vmas != 0) {
+            vma_status = kernel_vma_set_destroy(&record->vmas);
+            if (vma_status != KERNEL_VMA_STATUS_OK) {
+                mm->state = KERNEL_MM_CLEANUP;
+                mm->cleanup_stage = KERNEL_MM_CLEANUP_VMAS;
+                return vma_status == KERNEL_VMA_STATUS_CLEANUP_REQUIRED
+                           ? KERNEL_MM_STATUS_CLEANUP_REQUIRED
+                           : KERNEL_MM_STATUS_STATE;
+            }
+        }
+        record->stage = RISCV_KERNEL_MM_RECORD_SPACE_CLEANUP;
+        mm->state = KERNEL_MM_CLEANUP;
+        mm->cleanup_stage = KERNEL_MM_CLEANUP_SPACE;
+    }
+    if (record->stage != RISCV_KERNEL_MM_RECORD_SPACE_CLEANUP) {
         return KERNEL_MM_STATUS_STATE;
     }
 

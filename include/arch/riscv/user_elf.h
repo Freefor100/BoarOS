@@ -10,6 +10,9 @@
 #include <stddef.h>
 #include <stdint.h>
 
+struct kernel_heap;
+struct kernel_mm;
+
 #define RISCV_USER_ELF_LIMIT RISCV_SV39_USER_LIMIT
 #define RISCV_USER_ELF_STACK_TOP RISCV_USER_ELF_LIMIT
 #define RISCV_USER_ELF_STACK_RESERVE_SIZE UINT64_C(0x800000)
@@ -69,5 +72,17 @@ enum riscv_user_elf_status riscv_user_elf_load_detailed(
     struct riscv_sv39_user_space *space,
     struct riscv_user_elf_entry *entry,
     enum riscv_user_elf_status *image_failure);
+
+/*
+ * Registers the static-ELF layout for a just-created MM.  The image remains
+ * eagerly resident in this stage; ELF pages are anonymous VMAs and the stack
+ * VMA covers its full reserve while the guard page remains unmapped.
+ *
+ * On failure the caller must release mm rather than run it.
+ */
+enum riscv_user_elf_status riscv_user_elf_register_static_vmas(
+    const struct riscv_user_elf_request *request,
+    struct kernel_mm *mm,
+    struct kernel_heap *heap);
 
 #endif

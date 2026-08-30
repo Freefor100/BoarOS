@@ -26,6 +26,7 @@
 -> 打开并检查可执行普通文件
 -> 一次性捕获 argv/envp 字符串
 -> 构造新地址空间、入口和初始栈
+-> 登记新映像的 ELF/栈 VMA
 -> 发布 PREPARED 事务
 ```
 
@@ -33,7 +34,7 @@
 
 `argv==NULL` 或首项为 NULL 会规范化成一个空的 `argv[0]`；`envp==NULL` 表示空环境。参数向量和每条字符串都按用户页逐段复制，任何用户指针只读取一次进入内核所有的快照；之后旧地址空间可以在提交时安全替换。当前单 hart 没有并发映射修改；引入 SMP、COW 或用户 `unmap` 后，这个快照过程必须纳入 MM 读侧稳定协议。
 
-普通 Linux 失败保持当前 MM、寄存器、PID/TID、cwd、文件表和所有 fd 不变，并从原 `ECALL` 的下一条指令返回负 errno。已分配的新映像和临时缓冲区由附着在 task 上的事务清理；物理释放暂时失败时 owner 仍保存在事务中，由下次 exec 或退出 reaper 重试。
+新地址空间转入 MM 后，RISC-V 后端在 executable file 仍由事务持有时登记按页权限合并的匿名 ELF VMA 和完整栈 reserve VMA；因此后续缺页或 VMA 操作有逻辑区间，而不是只观察已驻留 PTE。普通 Linux 失败保持当前 MM、寄存器、PID/TID、cwd、文件表和所有 fd 不变，并从原 `ECALL` 的下一条指令返回负 errno。已分配的新映像和临时缓冲区由附着在 task 上的事务清理；VMA metadata、物理页或其他资源释放暂时失败时 owner 仍保存在事务中，由下次 exec 或退出 reaper 重试。
 
 ## 提交点与永久状态
 

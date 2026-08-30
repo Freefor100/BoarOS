@@ -126,6 +126,20 @@ enum kernel_exec_image_status kernel_exec_image_prepare(
                    ? KERNEL_EXEC_IMAGE_STATUS_CLEANUP_REQUIRED
                    : KERNEL_EXEC_IMAGE_STATUS_STATE;
     }
+    elf_status = riscv_user_elf_register_static_vmas(&elf_request,
+                                                      &image->mm,
+                                                      heap);
+    if (elf_status != RISCV_USER_ELF_STATUS_OK) {
+        int64_t error = elf_linux_error(elf_status);
+
+        if (error != 0) {
+            *linux_result = error;
+            return KERNEL_EXEC_IMAGE_STATUS_LINUX_ERROR;
+        }
+        return elf_status == RISCV_USER_ELF_STATUS_CLEANUP_REQUIRED
+                   ? KERNEL_EXEC_IMAGE_STATUS_CLEANUP_REQUIRED
+                   : KERNEL_EXEC_IMAGE_STATUS_STATE;
+    }
     image->entry = (uintptr_t)entry.entry;
     image->stack_pointer = (uintptr_t)entry.stack_pointer;
     image->thread_pointer = 0U;

@@ -673,6 +673,9 @@ void kernel_main(unsigned long hart_id, const void *dtb)
         root_started = 1;
         virt_uart_puts("BoarOS: root /init started pid=0x1\n");
     } else if (root_status != RISCV_ROOT_BOOT_STATUS_NO_DEVICE) {
+        while (root_boot.state == RISCV_ROOT_BOOT_CLEANUP) {
+            root_status = riscv_root_boot_cleanup(&root_boot);
+        }
         shutdown_for_root_boot_error(root_status);
     }
 

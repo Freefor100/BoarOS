@@ -11,10 +11,6 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define RISCV_ROOT_BOOT_EMPTY 0U
-#define RISCV_ROOT_BOOT_LIVE UINT32_C(0x524f4f54)
-#define RISCV_ROOT_BOOT_FINISHED UINT32_C(0x444f4e45)
-
 static int direct_map_heap_address(const void *pointer,
                                    uint64_t *physical_address)
 {
@@ -43,42 +39,82 @@ static enum riscv_root_boot_status cleanup_start_failure(
     struct kernel_fs_context *fs,
     enum riscv_root_boot_status failure)
 {
+    root->cleanup_file = *file;
+    root->cleanup_space = *space;
+    root->cleanup_mm = *mm;
+    root->cleanup_files = *files;
+    root->cleanup_fs = *fs;
+    root->cleanup_device_owned = root->device.page_allocator != 0;
+    root->failure_status = failure;
+    root->state = RISCV_ROOT_BOOT_CLEANUP;
+    return riscv_root_boot_cleanup(root);
+}
+
+enum riscv_root_boot_status riscv_root_boot_cleanup(
+    struct riscv_root_boot *root)
+{
+    struct kernel_heap_statistics statistics;
+    uint64_t available_pages;
     int cleanup_failed = 0;
 
-    if ((files->state == KERNEL_FILES_LIVE ||
-         files->state == KERNEL_FILES_CLEANUP) &&
-        kernel_files_release(files) != KERNEL_FILES_STATUS_OK) {
+    if (root == 0 || root->state != RISCV_ROOT_BOOT_CLEANUP) {
+        return RISCV_ROOT_BOOT_STATUS_INVALID;
+    }
+    if ((root->cleanup_files.state == KERNEL_FILES_LIVE ||
+         root->cleanup_files.state == KERNEL_FILES_CLEANUP) &&
+        kernel_files_release(&root->cleanup_files) !=
+            KERNEL_FILES_STATUS_OK) {
         cleanup_failed = 1;
     }
-    if ((fs->state == KERNEL_FS_CONTEXT_LIVE ||
-         fs->state == KERNEL_FS_CONTEXT_CLEANUP) &&
-        kernel_fs_context_release(fs) !=
+    if ((root->cleanup_fs.state == KERNEL_FS_CONTEXT_LIVE ||
+         root->cleanup_fs.state == KERNEL_FS_CONTEXT_CLEANUP) &&
+        kernel_fs_context_release(&root->cleanup_fs) !=
             KERNEL_FS_CONTEXT_STATUS_OK) {
         cleanup_failed = 1;
     }
-    if (file->private_data != 0 && kernel_vfs_close(file) != 0) {
+    if (root->cleanup_file.private_data != 0 &&
+        kernel_vfs_close(&root->cleanup_file) != 0) {
         cleanup_failed = 1;
     }
-    if ((mm->state == KERNEL_MM_LIVE ||
-         mm->state == KERNEL_MM_CLEANUP) &&
-        kernel_mm_release(mm) != KERNEL_MM_STATUS_OK) {
+    if ((root->cleanup_mm.state == KERNEL_MM_LIVE ||
+         root->cleanup_mm.state == KERNEL_MM_CLEANUP) &&
+        kernel_mm_release(&root->cleanup_mm) != KERNEL_MM_STATUS_OK) {
         cleanup_failed = 1;
     }
-    if ((space->state == RISCV_SV39_USER_SPACE_LIVE ||
-         space->state == RISCV_SV39_USER_SPACE_CLEANUP) &&
-        riscv_sv39_user_space_destroy(space) != RISCV_SV39_STATUS_OK) {
+    if ((root->cleanup_space.state == RISCV_SV39_USER_SPACE_LIVE ||
+         root->cleanup_space.state == RISCV_SV39_USER_SPACE_CLEANUP) &&
+        riscv_sv39_user_space_destroy(&root->cleanup_space) !=
+            RISCV_SV39_STATUS_OK) {
         cleanup_failed = 1;
     }
     if (root->mount.private_data != 0 &&
         kernel_vfs_unmount(&root->mount) != 0) {
         cleanup_failed = 1;
     }
-    if (root->device.page_allocator != 0 &&
-        riscv_virtio_mmio_block_destroy(&root->device) !=
+    if (root->cleanup_device_owned != 0U) {
+        if (riscv_virtio_mmio_block_destroy(&root->device) !=
             RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK) {
-        cleanup_failed = 1;
+            cleanup_failed = 1;
+        } else {
+            root->cleanup_device_owned = 0U;
+        }
     }
-    return cleanup_failed ? RISCV_ROOT_BOOT_STATUS_CLEANUP : failure;
+    if (root->heap.page_allocator == 0) {
+        cleanup_failed = 1;
+    } else {
+        kernel_heap_get_statistics(&root->heap, &statistics);
+        available_pages = physical_page_available(root->heap.page_allocator);
+        if (statistics.live_allocations != 0U ||
+            statistics.current_pages != 0U ||
+            available_pages != root->baseline_pages) {
+            cleanup_failed = 1;
+        }
+    }
+    if (cleanup_failed) {
+        return RISCV_ROOT_BOOT_STATUS_CLEANUP;
+    }
+    root->state = RISCV_ROOT_BOOT_FAILED;
+    return root->failure_status;
 }
 
 enum riscv_root_boot_status riscv_root_boot_start(
@@ -181,14 +217,22 @@ enum riscv_root_boot_status riscv_root_boot_start(
                       : RISCV_ROOT_BOOT_STATUS_ELF;
         goto fail;
     }
-    if (kernel_vfs_close(&file) != 0) {
-        failure = RISCV_ROOT_BOOT_STATUS_CLEANUP;
-        goto fail;
-    }
-
     mm_status = riscv_kernel_mm_create(&mm, &space);
     if (mm_status != KERNEL_MM_STATUS_OK) {
         failure = RISCV_ROOT_BOOT_STATUS_ADDRESS_SPACE;
+        goto fail;
+    }
+    elf_status = riscv_user_elf_register_static_vmas(&request,
+                                                      &mm,
+                                                      &root->heap);
+    if (elf_status != RISCV_USER_ELF_STATUS_OK) {
+        failure = elf_status == RISCV_USER_ELF_STATUS_IO
+                      ? RISCV_ROOT_BOOT_STATUS_INIT
+                      : RISCV_ROOT_BOOT_STATUS_ELF;
+        goto fail;
+    }
+    if (kernel_vfs_close(&file) != 0) {
+        failure = RISCV_ROOT_BOOT_STATUS_CLEANUP;
         goto fail;
     }
     if (kernel_fs_context_create(&fs,
