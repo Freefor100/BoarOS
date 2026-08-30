@@ -29,6 +29,11 @@ enum kernel_vma_role {
     KERNEL_VMA_ROLE_MMAP,
 };
 
+enum kernel_vma_fault_policy {
+    KERNEL_VMA_FAULT_RESIDENT_REQUIRED = 0,
+    KERNEL_VMA_FAULT_DEMAND_ZERO,
+};
+
 /* A value copy; callers must not retain backing as a standalone owner. */
 struct kernel_vma {
     uint64_t start;
@@ -37,6 +42,7 @@ struct kernel_vma {
     uint32_t permissions;
     enum kernel_vma_kind kind;
     enum kernel_vma_role role;
+    enum kernel_vma_fault_policy fault_policy;
     void *backing;
 };
 

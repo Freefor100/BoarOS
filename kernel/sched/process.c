@@ -33,6 +33,23 @@
     (LINUX_WNOHANG | LINUX_WUNTRACED | LINUX_WCONTINUED | \
      LINUX___WNOTHREAD | LINUX___WALL | LINUX___WCLONE)
 
+enum kernel_mm_status kernel_scheduler_resolve_current_user_fault(
+    uint64_t virtual_address,
+    uint32_t access)
+{
+    if (scheduler.initialized != KERNEL_SCHEDULER_INITIALIZED ||
+        riscv_interrupt_is_enabled() ||
+        validate_current() != KERNEL_SCHEDULER_STATUS_OK ||
+        scheduler.current == &scheduler.idle ||
+        scheduler.current->state != KERNEL_THREAD_STATE_RUNNING ||
+        scheduler.current->arch.user_mode != 1U) {
+        return KERNEL_MM_STATUS_STATE;
+    }
+    return kernel_mm_resolve_user_fault(&scheduler.current->mm,
+                                        virtual_address,
+                                        access);
+}
+
 static enum kernel_scheduler_status validate_child_list(
     const struct kernel_task *parent,
     const struct kernel_task *required_child)
@@ -673,7 +690,12 @@ enum kernel_scheduler_status kernel_scheduler_reap_one(
         }
     } else if (result.kind == KERNEL_THREAD_KIND_USER) {
         if (result.reason != KERNEL_THREAD_EXIT_SYSCALL &&
-            result.reason != KERNEL_THREAD_EXIT_USER_FAULT) {
+            result.reason != KERNEL_THREAD_EXIT_USER_FAULT &&
+            result.reason != KERNEL_THREAD_EXIT_RESOURCE) {
+            return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
+        }
+        if (result.reason == KERNEL_THREAD_EXIT_RESOURCE &&
+            result.status != KERNEL_THREAD_RESOURCE_NO_MEMORY) {
             return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
         }
         if (publish != 0U &&
@@ -856,6 +878,18 @@ static uint32_t fault_wait_status(uint64_t scause)
     }
 }
 
+static uint32_t user_wait_status(
+    const struct kernel_thread_completion *completion)
+{
+    if (completion->reason == KERNEL_THREAD_EXIT_SYSCALL) {
+        return (uint32_t)((completion->status & UINT64_C(0xff)) << 8U);
+    }
+    if (completion->reason == KERNEL_THREAD_EXIT_RESOURCE) {
+        return 9U; /* SIGKILL */
+    }
+    return fault_wait_status(completion->status);
+}
+
 static enum kernel_scheduler_status reparent_children(
     struct kernel_task *parent)
 {
@@ -945,10 +979,7 @@ static void kernel_thread_finish(
             switch_to_fatal_idle(status);
         }
         cleanup_status = cleanup_user_task_resources(current);
-        current->wait_status =
-            completion->reason == KERNEL_THREAD_EXIT_SYSCALL
-                ? (uint32_t)((completion->status & UINT64_C(0xff)) << 8U)
-                : fault_wait_status(completion->status);
+        current->wait_status = user_wait_status(completion);
     }
     if (cleanup_status == KERNEL_SCHEDULER_STATUS_OK &&
         current->parent != 0) {
@@ -1008,7 +1039,12 @@ void kernel_user_thread_exit(
     };
 
     if (reason != KERNEL_THREAD_EXIT_SYSCALL &&
-        reason != KERNEL_THREAD_EXIT_USER_FAULT) {
+        reason != KERNEL_THREAD_EXIT_USER_FAULT &&
+        reason != KERNEL_THREAD_EXIT_RESOURCE) {
+        switch_to_fatal_idle(KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT);
+    }
+    if (reason == KERNEL_THREAD_EXIT_RESOURCE &&
+        status != KERNEL_THREAD_RESOURCE_NO_MEMORY) {
         switch_to_fatal_idle(KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT);
     }
     if (scheduler.current == 0 ||

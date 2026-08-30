@@ -28,7 +28,9 @@ static int vma_valid(const struct kernel_vma *vma)
         vma->kind < KERNEL_VMA_KIND_ANONYMOUS ||
         vma->kind > KERNEL_VMA_KIND_FILE_PRIVATE ||
         vma->role < KERNEL_VMA_ROLE_NONE ||
-        vma->role > KERNEL_VMA_ROLE_MMAP) {
+        vma->role > KERNEL_VMA_ROLE_MMAP ||
+        vma->fault_policy < KERNEL_VMA_FAULT_RESIDENT_REQUIRED ||
+        vma->fault_policy > KERNEL_VMA_FAULT_DEMAND_ZERO) {
         return 0;
     }
     if (vma->kind == KERNEL_VMA_KIND_ANONYMOUS &&
@@ -46,6 +48,7 @@ static int can_merge(const struct kernel_vma *left,
     if (left->end != right->start ||
         left->permissions != right->permissions ||
         left->kind != right->kind || left->role != right->role ||
+        left->fault_policy != right->fault_policy ||
         left->backing != right->backing) {
         return 0;
     }

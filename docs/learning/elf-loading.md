@@ -45,13 +45,13 @@ Auxv 的值必须来自真实机制，而不是为了让 libc 继续运行而伪
 
 参数限制必须针对最终初始栈，而不只是字符串字节。`argc`、两个指针向量、NULL 分隔、auxv、`AT_EXECFN` 和 16 字节对齐都会消耗空间；若只限制字符串，攻击者仍可用大量空字符串扩大指针表。BoarOS 当前把整个序列化栈镜像限制为 128 KiB，因此这个值是项目实现边界，不等于 Linux 完整的 `ARG_MAX` 策略。
 
-虚拟地址预留与物理页提交是两件不同的事。先在用户地址上界下方保留一个较大的连续栈区间，可以阻止 ELF 段占据未来扩栈范围；初次只映射覆盖参数镜像和一段运行余量的后缀，则不会为每个进程立即消耗整个预留区对应的物理页。向下增长的栈应把永久 guard 放在预留区底部以下；若只把 guard 放在当前已提交页下方，未来扩栈时就必须移动 guard 并处理竞态。guard 只能让越界尽早 fault，自动增长仍需要缺页处理、栈上限和提交策略共同实现。
+虚拟地址预留与物理页提交是两件不同的事。先在用户地址上界下方保留一个较大的连续栈区间，可以阻止 ELF 段占据未来扩栈范围；初次只映射覆盖参数镜像和一段运行余量的后缀，则不会为每个进程立即消耗整个预留区对应的物理页。向下增长的栈应把永久 guard 放在预留区底部以下；若只把 guard 放在当前已提交页下方，未来扩栈时就必须移动 guard 并处理竞态。BoarOS 现以固定 8 MiB 栈 VMA 作为上限，reserve 内的用户 load/store fault 按 4 KiB 提交零页，底部以下 guard 没有 VMA，因而不会被扩展逻辑接受。
 
 ## BoarOS 当前选择
 
-通用层只做有界 ELF64 小端字节解析，不引入通用 VM callback 框架。RISC-V 层固定 Sv39/4 KiB，当前只接受静态 `ET_EXEC`，拒绝 `ET_DYN`、`PT_INTERP`、`PT_DYNAMIC` 和 `PT_TLS`；它按页预检 W^X，物化 `PT_LOAD`，并建立 Linux 形态的初始参数栈。栈固定预留低半区顶端 8 MiB，初始参数、指针和对齐合计限制为 128 KiB，初次映射再从 SP 向下多留 64 KiB，预留区底部以下保持一页永久 guard。这个拆分让未来 LoongArch64 能复用 ELF 字节解析和栈内容规则，但用 16 KiB/三级页表实现自己的地址布局和页面物化。
+通用层只做有界 ELF64 小端字节解析，不引入通用 VM callback 框架。RISC-V 层固定 Sv39/4 KiB，当前只接受静态 `ET_EXEC`，拒绝 `ET_DYN`、`PT_INTERP`、`PT_DYNAMIC` 和 `PT_TLS`；它按页预检 W^X，物化 `PT_LOAD`，并建立 Linux 形态的初始参数栈。栈固定预留低半区顶端 8 MiB，初始参数、指针和对齐合计限制为 128 KiB，初次映射再从 SP 向下多留 64 KiB，其余 reserve 由匿名 demand-zero fault 提交，底部以下保持一页永久 guard。这个拆分让未来 LoongArch64 能复用 ELF 字节解析和栈内容规则，但用 16 KiB/三级页表实现自己的地址布局和页面物化。
 
-当前接口借用一个精确 read source 和带长度的文件名/参数/环境区间，装载结束后不持有文件或内存来源。生产启动把已打开的 ext4 `/init` 转成 source；用户 `execve` 则先打开路径、捕获用户字符串，再调用同一装载器。成功产出独立 LIVE 用户地址空间、入口和 SP，调用者把地址空间移入 MM；当前静态路径随后在 source 仍有效时登记 ELF 的匿名 VMA 和完整栈 reserve VMA，再由 scheduler 在提交点替换 task 的旧 MM。VMA 保存逻辑有效区间，PTE 只保存当前驻留页，这使后续按需缺页、file-backed mapping 和扩栈能从已有的真实布局演进。当前是只读根和受事务持有 executable file，所以重新读取 header/layout 是受限且可验证的桥梁；可写文件或 file-backed demand paging 需要让一次解析得到的 VMA 持有稳定 backing，而不是假设两次读取天然一致。
+当前接口借用一个精确 read source 和带长度的文件名/参数/环境区间，装载结束后不持有文件或内存来源。生产启动把已打开的 ext4 `/init` 转成 source；用户 `execve` 则先打开路径、捕获用户字符串，再调用同一装载器。成功产出独立 LIVE 用户地址空间、入口和 SP，调用者把地址空间移入 MM；当前静态路径随后在 source 仍有效时把 ELF 登记为 `RESIDENT_REQUIRED` 匿名 VMA、把完整栈 reserve 登记为 `DEMAND_ZERO` 匿名 VMA，再由 scheduler 在提交点替换 task 的旧 MM。当前是只读根和受事务持有 executable file，所以重新读取 header/layout 是受限且可验证的桥梁；可写文件或 file-backed demand paging 需要让一次解析得到的 VMA 持有稳定 backing，而不是假设两次读取天然一致。
 
 分配页交给页表之前存在一个需要特别封闭的错误窗口：如果访问该页失败，紧接着释放也失败，那么“调用者持有”与“页表持有”都不成立。BoarOS 把分配、清零、映射和所有权登记收进 Sv39 接口；双重失败时地址空间转为只允许 move/destroy 的 CLEANUP 状态并记录脱离页表树的页。这样所有已分配页始终能从一个可重试对象找到，而不是仅返回状态码。详细装载结果还要与清理结果分开保存，否则一次后续释放失败会掩盖原本应返回给用户的 `ENOEXEC`、`E2BIG` 或 `ENOMEM`。
 

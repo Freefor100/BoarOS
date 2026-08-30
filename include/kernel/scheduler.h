@@ -35,6 +35,11 @@ enum kernel_thread_exit_reason {
     KERNEL_THREAD_EXIT_RETURNED = 0,
     KERNEL_THREAD_EXIT_SYSCALL,
     KERNEL_THREAD_EXIT_USER_FAULT,
+    KERNEL_THREAD_EXIT_RESOURCE,
+};
+
+enum kernel_thread_resource {
+    KERNEL_THREAD_RESOURCE_NO_MEMORY = 1,
 };
 
 struct kernel_thread_completion {
@@ -79,6 +84,11 @@ enum kernel_scheduler_status kernel_scheduler_wait4_current(
     uint32_t options,
     uint64_t rusage_address,
     int64_t *linux_result);
+
+/* Resolves a hardware fault in the running user task's active MM. */
+enum kernel_mm_status kernel_scheduler_resolve_current_user_fault(
+    uint64_t virtual_address,
+    uint32_t access);
 
 enum kernel_scheduler_status kernel_scheduler_reap_one(
     struct kernel_thread_completion *completion);

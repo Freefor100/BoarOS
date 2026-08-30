@@ -33,6 +33,22 @@ _start:
     ld t0, 24(sp)
     bnez t0, .Lfailure
 
+    # Reach below the eagerly built argument image while remaining inside
+    # the fixed stack VMA.  The first access must observe a zero-filled page;
+    # the second must survive a store-page-fault retry and retain its value.
+    mv s10, sp
+    li t0, 0x20000
+    sub sp, sp, t0
+    ld t1, 0(sp)
+    bnez t1, .Lfailure
+    li t0, 0x1000
+    sub t0, sp, t0
+    li t1, 0x5a6b7c8d
+    sd t1, 0(t0)
+    ld t2, 0(t0)
+    bne t1, t2, .Lfailure
+    mv sp, s10
+
     # An absolute path ignores dirfd and receives the lowest free fd.
     li a0, 7
     la a1, .Labsolute_path

@@ -9,7 +9,7 @@
 | `include/kernel/mm.h` | 定义跨架构 MM 句柄、权限、状态、引用和 VMA 入口 |
 | `include/arch/riscv/mm.h`、`arch/riscv/mm.c` | 用一张记录页封装 Sv39 用户地址空间与可选 VMA 集合，并实现当前构建所选的通用 MM 操作 |
 | `tests/riscv/mm_cases.c`、`tests/mm-riscv.sh` | 验证创建、共享引用、移动、查询和既有页表回收语义 |
-| `tests/riscv/vma_cases.c`、`tests/vma-riscv.sh` | 验证 VMA 集成后的 fork、冲突与 VMA 清理重试 |
+| `tests/riscv/vma_cases.c`、`tests/vma-riscv.sh` | 验证 VMA 集成后的 fork、缺页解析、OOM 与 VMA 清理重试 |
 
 稳定接口为：
 
@@ -44,12 +44,18 @@ enum kernel_mm_status kernel_mm_vma_insert_anon(
     uint64_t start,
     uint64_t end,
     uint32_t permissions,
-    enum kernel_vma_role role);
+    enum kernel_vma_role role,
+    enum kernel_vma_fault_policy fault_policy);
 
 enum kernel_mm_status kernel_mm_vma_lookup(
     const struct kernel_mm *mm,
     uint64_t virtual_address,
     struct kernel_vma *vma);
+
+enum kernel_mm_status kernel_mm_resolve_user_fault(
+    struct kernel_mm *mm,
+    uint64_t virtual_address,
+    uint32_t access);
 
 enum kernel_mm_status kernel_mm_release(struct kernel_mm *mm);
 ```
@@ -69,6 +75,14 @@ enum kernel_mm_status kernel_mm_release(struct kernel_mm *mm);
 输入目标必须是全零 `EMPTY` 句柄。成功移动后源进入 `MOVED`，成功释放后进入 `RELEASED`；二者都不再拥有资源。失败时不会凭错误码暗示所有权，句柄状态仍精确说明调用者应重试还是继续持有。
 
 RISC-V 创建先分配并解析记录页，最后才把 LIVE Sv39 空间移入记录；成功后输入空间成为 MOVED。记录页已经分配但无法立即释放时，输出成为 CLEANUP owner，从而不会遗失唯一物理地址。
+
+## 硬件用户缺页解析
+
+`kernel_mm_resolve_user_fault()` 只处理当前 hart 上已经激活的 LIVE MM，`access` 必须恰为 READ、WRITE、EXECUTE 之一。RISC-V 后端同时核对 MM record、生成的 `satp` 与硬件当前 `satp`，再按以下顺序检查用户范围、VMA、逻辑权限和现有 PTE。只有匿名 `DEMAND_ZERO` VMA 中尚无 PTE 的页可以分配；静态 ELF 的 `RESIDENT_REQUIRED` 空洞、VMA 外地址和权限冲突返回 `NOT_MAPPED`。
+
+成功路径按 4 KiB 对齐故障地址，分配并清零一页，以 VMA 的完整 R/W/X 权限建立 U-mode PTE，然后执行针对该虚拟页、ASID 0 的本地 `SFENCE.VMA`。dispatcher 保持 `sepc` 不变，`sret` 后硬件重试原 load/store/fetch。物理页耗尽精确返回 `NO_MEMORY`；页已经分配但回滚释放失败返回 `CLEANUP_REQUIRED`；PTE 已存在却仍产生允许权限的页故障、页表损坏或非活动 MM 都是内核状态错误，不能降级成用户 `SIGSEGV`。
+
+当前 scheduler 只把实际 U-mode 硬件页故障送入该入口。`uaccess` 的软件页表遍历不会隐式提交 demand-zero 页；这两条路径需要不同的异常恢复、锁和部分复制语义，后续应在 uaccess 自身的真实消费者阶段统一设计。
 
 ## fork 与后续 COW 边界
 
@@ -98,18 +112,19 @@ VMA metadata 释放失败时转入 `CLEANUP_VMAS`，后续调用只重试这项�
 
 当前引用计数和记录内容由单 hart、关 SIE 的 scheduler 生命周期串行化，不是 SMP 原子操作。接入 SMP 时必须在 MM 引用和末引用判定处加入锁或原子协议，并与页表修改、TLB shootdown 协调；公共句柄接口不需要因此改变。
 
-Scheduler 在用户任务创建时解析 MM、验证入口与栈权限，并缓存目标 `satp`。tick、current 校验和 context switch 直接读取任务前缀中的缓存，不解析记录页、不增减 MM 引用，也不遍历用户页表。地址空间切换的当前主要成本仍是 ASID 0 下的 `satp`/全局 `SFENCE.VMA`。
+Scheduler 在用户任务创建时解析 MM、验证入口与栈权限，并缓存目标 `satp`。tick、current 校验和 context switch 直接读取任务前缀中的缓存，不解析记录页、不增减 MM 引用，也不遍历用户页表。地址空间切换的当前主要成本仍是 ASID 0 下的 `satp`/全局 `SFENCE.VMA`。demand-zero 只增加首次触页的 VMA 二分查找、页表查询、页分配/清零、PTE 写入和一次单页本地 fence；驻留后的普通用户访存不经过软件 fault 路径。尚无开发板 fault 延迟和 TLB 计数，不能从 QEMU 正确性测试推断硬件性能。
 
 ## 验证与限制
 
 ```sh
 make test-mm-riscv
 make test-vma-riscv
+make test-demand-page-riscv
 make test-user-riscv
 make test-user-elf-riscv
 make test-riscv
 ```
 
-MM 聚焦测试覆盖创建失败原子性、共享引用、移动、eager fork 的内容/权限复制与写隔离，以及页表部分回收、记录页访问/释放失败后的阶段化重试。VMA 聚焦测试覆盖描述符 fork 复制、metadata 分配失败后目标恢复 EMPTY、VMA-first cleanup 和 heap 释放失败后的重试。用户与生产进程测试覆盖 scheduler 接管、父子分别退出和最终物理页计数复原。
+MM 聚焦测试覆盖创建失败原子性、共享引用、移动、eager fork 的内容/权限复制与写隔离，以及页表部分回收、记录页访问/释放失败后的阶段化重试。VMA 聚焦测试覆盖描述符 fork 复制、活动 `satp` 约束、零页/权限、真实分配耗尽、映射回滚失败、metadata 分配失败后目标恢复 EMPTY 和 VMA-first cleanup。demand-page 生产测试覆盖真实 U-mode 深栈 load/store 重试与 OOM 子任务的 wait/reap 闭环。
 
 当前只有 RISC-V 后端；映射仍由 Sv39/4 KiB 用户页实现。普通 clone 已使用独立 MM，但尚无 COW 或 `CLONE_VM` 共享进程；文件表、信号处理表和其他进程资源不属于 MM。

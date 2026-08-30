@@ -63,6 +63,43 @@ static void riscv_scheduler_fatal(
     sbi_shutdown();
 }
 
+static void riscv_user_fault_resolver_fatal(
+    const struct riscv_trap_frame *frame,
+    enum kernel_mm_status status) __attribute__((noreturn));
+
+static void riscv_user_fault_resolver_fatal(
+    const struct riscv_trap_frame *frame,
+    enum kernel_mm_status status)
+{
+    virt_uart_puts("BoarOS: user fault resolver error status=");
+    virt_uart_put_hex((unsigned long)status);
+    virt_uart_puts(" scause=");
+    virt_uart_put_hex(frame->scause);
+    virt_uart_puts(" sepc=");
+    virt_uart_put_hex(frame->sepc);
+    virt_uart_puts(" stval=");
+    virt_uart_put_hex(frame->stval);
+    virt_uart_putc('\n');
+    sbi_shutdown();
+}
+
+static int user_page_fault_access(uint64_t scause, uint32_t *access)
+{
+    switch (scause) {
+    case RISCV_SCAUSE_INSTRUCTION_PAGE_FAULT:
+        *access = KERNEL_MM_EXECUTE;
+        return 1;
+    case RISCV_SCAUSE_LOAD_PAGE_FAULT:
+        *access = KERNEL_MM_READ;
+        return 1;
+    case RISCV_SCAUSE_STORE_PAGE_FAULT:
+        *access = KERNEL_MM_WRITE;
+        return 1;
+    default:
+        return 0;
+    }
+}
+
 void riscv_trap_dispatch(struct riscv_trap_frame *frame)
 {
     int from_user = (frame->sstatus & RISCV_SSTATUS_SPP) == 0U;
@@ -86,6 +123,34 @@ void riscv_trap_dispatch(struct riscv_trap_frame *frame)
             }
         }
         return;
+    }
+
+    if (from_user &&
+        (frame->scause & RISCV_SCAUSE_INTERRUPT) == 0U) {
+        uint32_t access;
+
+        if (user_page_fault_access(frame->scause, &access)) {
+            enum kernel_mm_status status =
+                kernel_scheduler_resolve_current_user_fault(
+                    frame->stval,
+                    access);
+
+            if (status == KERNEL_MM_STATUS_OK) {
+                return;
+            }
+            if (status == KERNEL_MM_STATUS_NOT_MAPPED) {
+                kernel_user_thread_exit(KERNEL_THREAD_EXIT_USER_FAULT,
+                                        frame->scause,
+                                        frame->stval);
+            }
+            if (status == KERNEL_MM_STATUS_NO_MEMORY) {
+                kernel_user_thread_exit(
+                    KERNEL_THREAD_EXIT_RESOURCE,
+                    KERNEL_THREAD_RESOURCE_NO_MEMORY,
+                    frame->stval);
+            }
+            riscv_user_fault_resolver_fatal(frame, status);
+        }
     }
 
     if (from_user && frame->scause == RISCV_SCAUSE_USER_ECALL) {

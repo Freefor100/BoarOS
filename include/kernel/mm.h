@@ -84,13 +84,24 @@ enum kernel_mm_status kernel_mm_vma_insert_anon(
     uint64_t start,
     uint64_t end,
     uint32_t permissions,
-    enum kernel_vma_role role);
+    enum kernel_vma_role role,
+    enum kernel_vma_fault_policy fault_policy);
 
 /* Returns NOT_MAPPED for a valid address outside all VMAs. */
 enum kernel_mm_status kernel_mm_vma_lookup(
     const struct kernel_mm *mm,
     uint64_t virtual_address,
     struct kernel_vma *vma);
+
+/*
+ * Resolve one hardware user fault in the MM active on this hart.  access must
+ * be exactly one of READ, WRITE, or EXECUTE.  NOT_MAPPED means the access is
+ * not resolvable from VMA policy; success makes the new PTE locally visible.
+ */
+enum kernel_mm_status kernel_mm_resolve_user_fault(
+    struct kernel_mm *mm,
+    uint64_t virtual_address,
+    uint32_t access);
 
 /* Success consumes one reference; last-reference cleanup is retryable. */
 enum kernel_mm_status kernel_mm_release(struct kernel_mm *mm);

@@ -54,6 +54,10 @@ USER_ELF_GUARD_PROGRAM_RV := $(BUILD_DIR)/tests/user/elf-guard-fault-rv
 ROOT_INIT_PROGRAM_RV := $(BUILD_DIR)/tests/user/root-init-rv
 ROOT_EXEC_STAGE2_RV := $(BUILD_DIR)/tests/user/root-exec-stage2-rv
 ROOT_EXEC_STAGE3_RV := $(BUILD_DIR)/tests/user/root-exec-stage3-rv
+ROOT_EXEC_STAGE3_OOM_RV := \
+	$(BUILD_DIR)/tests/user/root-exec-stage3-oom-rv
+DEMAND_PAGE_OOM_TEST_KERNEL_RV := \
+	$(BUILD_DIR)/tests/kernel-demand-page-oom-rv
 EXEC_CLEANUP_TEST_KERNEL_RV := \
 	$(BUILD_DIR)/tests/kernel-exec-cleanup-rv
 ROOT_BOOT_CLEANUP_TEST_KERNEL_RV := \
@@ -348,6 +352,10 @@ ROOT_EXEC_STAGE2_OBJECT_RV := \
 	$(BUILD_DIR)/tests/user/root_exec_stage2.o
 ROOT_EXEC_STAGE3_OBJECT_RV := \
 	$(BUILD_DIR)/tests/user/root_exec_stage3.o
+ROOT_EXEC_STAGE3_OOM_OBJECT_RV := \
+	$(BUILD_DIR)/tests/user/root_exec_stage3_oom.o
+DEMAND_PAGE_OOM_TEST_OBJECT_RV := \
+	$(BUILD_DIR)/tests/riscv/demand_page_oom.o
 EXEC_CLEANUP_TEST_OBJECT_RV := \
 	$(BUILD_DIR)/tests/riscv/exec_cleanup_boot.o
 ROOT_BOOT_CLEANUP_TEST_OBJECT_RV := \
@@ -396,6 +404,8 @@ DEPS := \
 	$(ROOT_INIT_PROGRAM_OBJECT_RV:.o=.d) \
 	$(ROOT_EXEC_STAGE2_OBJECT_RV:.o=.d) \
 	$(ROOT_EXEC_STAGE3_OBJECT_RV:.o=.d) \
+	$(ROOT_EXEC_STAGE3_OOM_OBJECT_RV:.o=.d) \
+	$(DEMAND_PAGE_OOM_TEST_OBJECT_RV:.o=.d) \
 	$(EXEC_CLEANUP_TEST_OBJECT_RV:.o=.d) \
 	$(ROOT_BOOT_CLEANUP_TEST_OBJECT_RV:.o=.d) \
 	$(USER_TEST_OBJECTS:.o=.d) \
@@ -404,7 +414,8 @@ DEPS := \
 .PHONY: all clean debug-riscv references run-riscv test-dtb-riscv \
 	test-context-riscv \
 	test-elf64-riscv test-user-elf-cases-riscv test-user-elf-riscv \
-	test-root-init-riscv test-exec-riscv test-root-boot-cleanup-riscv \
+	test-root-init-riscv test-demand-page-riscv test-exec-riscv \
+	test-root-boot-cleanup-riscv \
 	test-files-riscv \
 	test-high-half-trap-riscv test-idle-riscv test-no-identity-riscv \
 	test-lwext4-host \
@@ -510,6 +521,9 @@ $(VMA_TEST_KERNEL_RV): $(VMA_TEST_OBJECTS) \
 		arch/riscv/linker.ld
 	$(CC) $(LDFLAGS) -Wl,--wrap=kernel_heap_release \
 		-Wl,--wrap=kernel_heap_resize \
+		-Wl,--wrap=physical_page_allocate \
+		-Wl,--wrap=physical_page_release \
+		-Wl,--wrap=riscv_sv39_current_satp \
 		-Wl,-Map,$(BUILD_DIR)/tests/kernel-vma-rv.map \
 		-o $@ $(VMA_TEST_OBJECTS)
 
@@ -623,6 +637,11 @@ $(ROOT_EXEC_STAGE3_OBJECT_RV): tests/riscv/root_exec_stage.S
 	$(CC) $(CPPFLAGS) $(ASFLAGS) -DROOT_EXEC_STAGE=3 \
 		-MMD -MP -c $< -o $@
 
+$(ROOT_EXEC_STAGE3_OOM_OBJECT_RV): tests/riscv/root_exec_stage.S
+	@mkdir -p $(dir $@)
+	$(CC) $(CPPFLAGS) $(ASFLAGS) -DROOT_EXEC_STAGE=3 \
+		-DROOT_FAULT_WAIT_STATUS=9 -MMD -MP -c $< -o $@
+
 $(ROOT_EXEC_STAGE2_RV): $(ROOT_EXEC_STAGE2_OBJECT_RV) \
 		tests/riscv/user_elf.ld
 	$(CC) $(ARCH_FLAGS) -nostdlib -nostartfiles -static -no-pie \
@@ -634,6 +653,19 @@ $(ROOT_EXEC_STAGE3_RV): $(ROOT_EXEC_STAGE3_OBJECT_RV) \
 	$(CC) $(ARCH_FLAGS) -nostdlib -nostartfiles -static -no-pie \
 		-T tests/riscv/user_elf.ld -Wl,--build-id=none \
 		-Wl,--gc-sections -o $@ $(ROOT_EXEC_STAGE3_OBJECT_RV)
+
+$(ROOT_EXEC_STAGE3_OOM_RV): $(ROOT_EXEC_STAGE3_OOM_OBJECT_RV) \
+		tests/riscv/user_elf.ld
+	$(CC) $(ARCH_FLAGS) -nostdlib -nostartfiles -static -no-pie \
+		-T tests/riscv/user_elf.ld -Wl,--build-id=none \
+		-Wl,--gc-sections -o $@ $(ROOT_EXEC_STAGE3_OOM_OBJECT_RV)
+
+$(DEMAND_PAGE_OOM_TEST_KERNEL_RV): $(OBJECTS) \
+		$(DEMAND_PAGE_OOM_TEST_OBJECT_RV) arch/riscv/linker.ld
+	$(CC) $(LDFLAGS) \
+		-Wl,--wrap=kernel_scheduler_resolve_current_user_fault \
+		-Wl,-Map,$(BUILD_DIR)/tests/kernel-demand-page-oom-rv.map \
+		-o $@ $(OBJECTS) $(DEMAND_PAGE_OOM_TEST_OBJECT_RV)
 
 $(EXEC_CLEANUP_TEST_KERNEL_RV): $(OBJECTS) \
 		$(EXEC_CLEANUP_TEST_OBJECT_RV) arch/riscv/linker.ld
@@ -727,6 +759,7 @@ test-riscv: $(DTB_TEST_KERNEL_RV) $(PAGE_TEST_KERNEL_RV) \
 	$(TIMER_CASES_TEST_KERNEL_RV) $(TIMER_BOOT_TEST_KERNEL_RV) \
 	$(ROOT_INIT_PROGRAM_RV) \
 	$(ROOT_EXEC_STAGE2_RV) $(ROOT_EXEC_STAGE3_RV) \
+	$(ROOT_EXEC_STAGE3_OOM_RV) $(DEMAND_PAGE_OOM_TEST_KERNEL_RV) \
 	$(EXEC_CLEANUP_TEST_KERNEL_RV) \
 	$(ROOT_BOOT_CLEANUP_TEST_KERNEL_RV) \
 	$(KERNEL_RV)
@@ -815,6 +848,12 @@ test-riscv: $(DTB_TEST_KERNEL_RV) $(PAGE_TEST_KERNEL_RV) \
 		ROOT_EXEC_STAGE3_RV=$(ROOT_EXEC_STAGE3_RV) \
 		./tests/root-init-riscv.sh
 	QEMU_RISCV64=$(QEMU_RISCV64) QEMU_MEMORY=$(QEMU_MEMORY) \
+		KERNEL_RV=$(DEMAND_PAGE_OOM_TEST_KERNEL_RV) \
+		ROOT_INIT_PROGRAM_RV=$(ROOT_INIT_PROGRAM_RV) \
+		ROOT_EXEC_STAGE2_RV=$(ROOT_EXEC_STAGE2_RV) \
+		ROOT_EXEC_STAGE3_RV=$(ROOT_EXEC_STAGE3_OOM_RV) \
+		./tests/root-init-riscv.sh
+	QEMU_RISCV64=$(QEMU_RISCV64) QEMU_MEMORY=$(QEMU_MEMORY) \
 		KERNEL_RV=$(ROOT_BOOT_CLEANUP_TEST_KERNEL_RV) \
 		ROOT_INIT_PROGRAM_RV=$(ROOT_INIT_PROGRAM_RV) \
 		ROOT_EXEC_STAGE2_RV=$(ROOT_EXEC_STAGE2_RV) \
@@ -901,6 +940,23 @@ test-root-init-riscv: $(KERNEL_RV) $(ROOT_INIT_PROGRAM_RV) \
 		ROOT_INIT_PROGRAM_RV=$(ROOT_INIT_PROGRAM_RV) \
 		ROOT_EXEC_STAGE2_RV=$(ROOT_EXEC_STAGE2_RV) \
 		ROOT_EXEC_STAGE3_RV=$(ROOT_EXEC_STAGE3_RV) \
+		./tests/root-init-riscv.sh
+
+test-demand-page-riscv: $(KERNEL_RV) \
+		$(DEMAND_PAGE_OOM_TEST_KERNEL_RV) $(ROOT_INIT_PROGRAM_RV) \
+		$(ROOT_EXEC_STAGE2_RV) $(ROOT_EXEC_STAGE3_RV) \
+		$(ROOT_EXEC_STAGE3_OOM_RV)
+	QEMU_RISCV64=$(QEMU_RISCV64) QEMU_MEMORY=$(QEMU_MEMORY) \
+		KERNEL_RV=$(KERNEL_RV) \
+		ROOT_INIT_PROGRAM_RV=$(ROOT_INIT_PROGRAM_RV) \
+		ROOT_EXEC_STAGE2_RV=$(ROOT_EXEC_STAGE2_RV) \
+		ROOT_EXEC_STAGE3_RV=$(ROOT_EXEC_STAGE3_RV) \
+		./tests/root-init-riscv.sh
+	QEMU_RISCV64=$(QEMU_RISCV64) QEMU_MEMORY=$(QEMU_MEMORY) \
+		KERNEL_RV=$(DEMAND_PAGE_OOM_TEST_KERNEL_RV) \
+		ROOT_INIT_PROGRAM_RV=$(ROOT_INIT_PROGRAM_RV) \
+		ROOT_EXEC_STAGE2_RV=$(ROOT_EXEC_STAGE2_RV) \
+		ROOT_EXEC_STAGE3_RV=$(ROOT_EXEC_STAGE3_OOM_RV) \
 		./tests/root-init-riscv.sh
 
 test-exec-riscv: $(KERNEL_RV) $(EXEC_CLEANUP_TEST_KERNEL_RV) \

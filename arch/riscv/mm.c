@@ -442,14 +442,17 @@ enum kernel_mm_status kernel_mm_vma_insert_anon(
     uint64_t start,
     uint64_t end,
     uint32_t permissions,
-    enum kernel_vma_role role)
+    enum kernel_vma_role role,
+    enum kernel_vma_fault_policy fault_policy)
 {
     struct riscv_kernel_mm_record *record;
     struct kernel_vma vma;
     enum kernel_mm_status status;
 
     if (mm == 0 || !valid_vma_range(start, end, permissions) ||
-        role < KERNEL_VMA_ROLE_NONE || role > KERNEL_VMA_ROLE_MMAP) {
+        role < KERNEL_VMA_ROLE_NONE || role > KERNEL_VMA_ROLE_MMAP ||
+        fault_policy < KERNEL_VMA_FAULT_RESIDENT_REQUIRED ||
+        fault_policy > KERNEL_VMA_FAULT_DEMAND_ZERO) {
         return KERNEL_MM_STATUS_INVALID_ARGUMENT;
     }
     if (mm->state != KERNEL_MM_LIVE) {
@@ -468,6 +471,7 @@ enum kernel_mm_status kernel_mm_vma_insert_anon(
     vma.permissions = permissions;
     vma.kind = KERNEL_VMA_KIND_ANONYMOUS;
     vma.role = role;
+    vma.fault_policy = fault_policy;
     vma.backing = 0;
     return status_from_vma(kernel_vma_set_insert(record->vmas, &vma));
 }
@@ -496,6 +500,120 @@ enum kernel_mm_status kernel_mm_vma_lookup(
     return status_from_vma(kernel_vma_set_lookup(record->vmas,
                                                  virtual_address,
                                                  vma));
+}
+
+static uint32_t sv39_permissions_from_mm(uint32_t permissions)
+{
+    uint32_t result = 0U;
+
+    if ((permissions & KERNEL_MM_READ) != 0U) {
+        result |= RISCV_SV39_READ;
+    }
+    if ((permissions & KERNEL_MM_WRITE) != 0U) {
+        result |= RISCV_SV39_WRITE;
+    }
+    if ((permissions & KERNEL_MM_EXECUTE) != 0U) {
+        result |= RISCV_SV39_EXECUTE;
+    }
+    return result;
+}
+
+static void flush_user_page(uint64_t virtual_address)
+{
+    __asm__ volatile("sfence.vma %0, zero"
+                     :
+                     : "r"(virtual_address)
+                     : "memory");
+}
+
+enum kernel_mm_status kernel_mm_resolve_user_fault(
+    struct kernel_mm *mm,
+    uint64_t virtual_address,
+    uint32_t access)
+{
+    struct riscv_kernel_mm_record *record;
+    struct riscv_sv39_mapping mapping;
+    struct kernel_vma vma;
+    uint64_t satp;
+    uint64_t page_address;
+    uint32_t known = KERNEL_MM_READ | KERNEL_MM_WRITE |
+                     KERNEL_MM_EXECUTE;
+    enum kernel_mm_status status;
+    enum kernel_vma_status vma_status;
+    enum riscv_sv39_status sv39_status;
+
+    if (mm == 0 || (access & ~known) != 0U || access == 0U ||
+        (access & (access - 1U)) != 0U) {
+        return KERNEL_MM_STATUS_INVALID_ARGUMENT;
+    }
+    if (mm->state != KERNEL_MM_LIVE) {
+        return KERNEL_MM_STATUS_STATE;
+    }
+    status = resolve_record(mm, &record);
+    if (status != KERNEL_MM_STATUS_OK ||
+        record->stage != RISCV_KERNEL_MM_RECORD_LIVE) {
+        return status == KERNEL_MM_STATUS_OK ? KERNEL_MM_STATUS_STATE
+                                             : status;
+    }
+    if (riscv_sv39_user_space_satp(&record->space, &satp) !=
+            RISCV_SV39_STATUS_OK ||
+        riscv_sv39_current_satp() != satp) {
+        return KERNEL_MM_STATUS_STATE;
+    }
+    if (virtual_address < RISCV_SV39_PAGE_SIZE_4K ||
+        virtual_address >= RISCV_SV39_USER_LIMIT ||
+        record->vmas == 0) {
+        return KERNEL_MM_STATUS_NOT_MAPPED;
+    }
+    vma_status = kernel_vma_set_lookup(record->vmas,
+                                       virtual_address,
+                                       &vma);
+    if (vma_status == KERNEL_VMA_STATUS_NOT_FOUND) {
+        sv39_status = riscv_sv39_user_lookup(&record->space,
+                                             virtual_address,
+                                             &mapping);
+        if (sv39_status == RISCV_SV39_STATUS_OK) {
+            return KERNEL_MM_STATUS_ADDRESS_SPACE;
+        }
+        return sv39_status == RISCV_SV39_STATUS_NOT_MAPPED
+                   ? KERNEL_MM_STATUS_NOT_MAPPED
+                   : KERNEL_MM_STATUS_ADDRESS_SPACE;
+    }
+    if (vma_status != KERNEL_VMA_STATUS_OK) {
+        return status_from_vma(vma_status);
+    }
+    if ((vma.permissions & access) == 0U) {
+        return KERNEL_MM_STATUS_NOT_MAPPED;
+    }
+    sv39_status = riscv_sv39_user_lookup(&record->space,
+                                         virtual_address,
+                                         &mapping);
+    if (sv39_status == RISCV_SV39_STATUS_OK) {
+        return KERNEL_MM_STATUS_ADDRESS_SPACE;
+    }
+    if (sv39_status != RISCV_SV39_STATUS_NOT_MAPPED) {
+        return KERNEL_MM_STATUS_ADDRESS_SPACE;
+    }
+    if (vma.kind != KERNEL_VMA_KIND_ANONYMOUS ||
+        vma.fault_policy != KERNEL_VMA_FAULT_DEMAND_ZERO) {
+        return KERNEL_MM_STATUS_NOT_MAPPED;
+    }
+    page_address = virtual_address & ~BOAROS_PAGE_MASK;
+    sv39_status = riscv_sv39_user_map_zeroed_page(
+        &record->space,
+        page_address,
+        sv39_permissions_from_mm(vma.permissions));
+    if (sv39_status == RISCV_SV39_STATUS_OK) {
+        flush_user_page(page_address);
+        return KERNEL_MM_STATUS_OK;
+    }
+    if (sv39_status == RISCV_SV39_STATUS_NO_MEMORY) {
+        return KERNEL_MM_STATUS_NO_MEMORY;
+    }
+    if (sv39_status == RISCV_SV39_STATUS_CLEANUP_REQUIRED) {
+        return KERNEL_MM_STATUS_CLEANUP_REQUIRED;
+    }
+    return KERNEL_MM_STATUS_ADDRESS_SPACE;
 }
 
 enum kernel_mm_status riscv_kernel_mm_satp(

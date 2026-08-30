@@ -40,7 +40,9 @@ SIE 是 S-mode 全局中断开关，`sie` 则分别控制 supervisor software、
 
 ## 同步异常和异步中断怎样继续执行？
 
-对 `ECALL`、`EBREAK` 等同步异常，`sepc` 指向异常指令自身。如果 handler 决定消费该事件，通常需要根据指令语义决定重试、终止当前任务或前移 `sepc`。RISC-V 支持 16 位压缩指令后，不能对所有 breakpoint 都盲目增加 4；BoarOS 的恢复测试显式编码 32 位 `EBREAK`，所以测试 handler 的 `sepc += 4` 有确定依据。生产内核当前不把任意 breakpoint 当作可恢复事件。
+对 `ECALL`、`EBREAK` 和页故障等同步异常，`sepc` 指向异常指令自身。如果 handler 决定消费该事件，必须根据指令语义选择重试、终止当前任务或前移 `sepc`。`ECALL` 完成后应越过调用指令；demand paging 补好 PTE 后必须保持 `sepc` 不变，让同一条 load/store/fetch 重试。RISC-V 支持 16 位压缩指令后，不能对所有 breakpoint 都盲目增加 4；BoarOS 的恢复测试显式编码 32 位 `EBREAK`，所以测试 handler 的 `sepc += 4` 有确定依据。生产内核当前不把任意 breakpoint 当作可恢复事件。
+
+RISC-V 把 instruction、load、store/AMO page fault 分成 cause 12、13、15，`stval` 给出故障虚拟地址。cause 说明本次访问类型，VMA 权限决定它是否逻辑允许；不能只看到“VMA 存在”就补页。若 PTE 更新发生在当前地址空间，返回前还必须按平台并发模型执行 `SFENCE.VMA`：BoarOS 当前是 ASID 0、单 hart，因此成功补页后做本地单 VA 失效；SMP 共享 MM 需要远端 shootdown。
 
 异步中断的 `sepc` 表示恢复执行的位置，一般不需要前移。handler 必须先解除中断条件：软件中断可以清 `sip.SSIP`，定时器中断需要把比较值安排到未来或关闭对应 source，外部中断需要经平台中断控制器 claim/complete。若 pending 状态不消失，`sret` 恢复 SIE 后会立即再次 trap，形成中断风暴。
 
@@ -77,7 +79,7 @@ BoarOS 当前固定以下 RISC-V trap 基线：
 - 汇编只负责架构现场和关键返回验证，具体 cause 交给 C dispatcher。
 - handler 返回表示事件已经处理；未知或当前不能处理的事件必须 fatal，不伪造成功。
 - dispatcher 期间保持 SIE 关闭，不支持嵌套异步中断。
-- 最终地址空间稳定后开启 supervisor timer interrupt；生产 dispatcher 处理 timer、U-mode ecall 和 U-mode 同步故障。timer 在 tick 计数后触发线程调度，用户故障只终止所属任务，其他未知事件仍为 fatal。dispatcher 不提供运行期 handler 注册框架。
+- 最终地址空间稳定后开启 supervisor timer interrupt；生产 dispatcher 处理 timer、U-mode ecall 和 U-mode 同步故障。cause 12/13/15 先尝试依据当前 MM 的 VMA fault policy 补页，成功时重试原指令；权限/范围错误只终止所属任务，匿名补页 OOM 以资源原因终止，页表状态或清理失败仍 fatal。dispatcher 不提供运行期 handler 注册框架。
 
 这些选择属于 RISC-V 架构层，可在 QEMU `virt` 和 VisionFive 2 上复用。当前 timer 通过两边共有的 SBI TIME 抽象复用，实际 timebase 仍从 DTB 获取；外部中断控制器和设备 IRQ 编号属于平台层，不能从 QEMU 的行为推断开发板布局。时间机制的完整解释见 [RISC-V 时间与周期 Tick 学习总结](riscv-time.md)。
 
@@ -95,6 +97,7 @@ BoarOS 当前固定以下 RISC-V trap 基线：
 - 保留 store/load page fault 测试，防止 Frame 重构破坏原始 `scause`、`sepc`、`stval`、`sstatus` 诊断。
 - 让真实 U-mode 任务在独立 Sv39 根页表中运行，由 timer 抢占到内核线程后再恢复，逐项核对用户 `gp/sp/tp/s0..s11`，同时证明内核执行期间 `sscratch=0`；最终 ELF 反汇编还要证明入口确实重载了内核 `gp`。
 - 让第二个用户地址空间触发 load page fault，验证故障只形成任务完成记录，而不会破坏另一用户任务或把 S-mode 故障错误降级。
+- 让真实 ext4 `/init` 在初始栈提交区以下先 load 零页、再 store 另一页，证明 cause 13/15 能补页并保持 `sepc` 重试；测试内核再注入一次 OOM，要求父进程得到 wait status 9 且所有资源回到基线。
 
 ## 资料依据
 

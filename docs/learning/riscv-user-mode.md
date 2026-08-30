@@ -68,7 +68,7 @@ BoarOS 当前逐基页调用 `kernel_mm_lookup()`，按复制方向检查 `USER|
 
 ## 用户故障与内核故障必须分开
 
-`sstatus.SPP` 能区分 trap 来源。U-mode 的非法访问是该任务的失败，BoarOS 将同步故障记录为包含 `scause/stval` 的任务完成原因，然后切走并回收它拥有的资源。S-mode 未处理故障表示内核自身不变量可能已经破坏，仍走 fatal 诊断和关机，不能套用“杀掉当前用户任务”继续运行。
+`sstatus.SPP` 能区分 trap 来源。U-mode page fault 先按当前 MM 的 VMA 权限和 fault policy 分类：合法匿名栈空洞补零页并重试原指令，VMA/权限不允许才记录包含 `scause/stval` 的用户故障；补页 OOM 以资源原因终止，父进程看到 wait status 9。PTE 已存在却仍发生允许访问的 page fault、页表状态错误和未完成清理说明内核不变量可能破坏，不能伪装成普通用户错误。S-mode 未处理故障同样走 fatal 诊断和关机，不能套用“杀掉当前用户任务”继续运行。
 
 这一策略要求故障任务拥有独立内核栈和有效资源 owner。调度器必须先切到其他可信栈，才能释放故障任务的任务页；用户页表也不能在 `satp` 仍指向它时销毁。BoarOS 的 idle reaper 在内核根页表和 boot stack 上处理完成队列，依次关闭 fd/open file description，释放 fs context、MM 引用、TID 和任务页。
 

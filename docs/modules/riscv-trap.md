@@ -9,7 +9,7 @@
 | `include/arch/riscv/trap.h` | 定义汇编/C 共享的 Trap Frame 布局、CSR 位和 cause 编码 |
 | `arch/riscv/boot.S` | 在启动栈可用后清零 `sscratch` 并安装 Direct-mode `stvec` |
 | `arch/riscv/trap_entry.S` | 保存完整整数现场、调用 C dispatcher、验证并恢复或拒绝返回 |
-| `arch/riscv/trap.c` | 提供生产 dispatcher、timer/scheduler fatal 和非法返回诊断 |
+| `arch/riscv/trap.c` | 提供生产 dispatcher、用户页故障决策、timer/scheduler fatal 和非法返回诊断 |
 | `tests/riscv/trap_return_main.c`、`trap_return_sie_main.c`、`trap_return_trigger.S` | 提供只在测试 ELF 中生效的同步与异步返回 handler、独立非法状态探针和寄存器探针 |
 | `tests/trap-return-riscv.sh` | 在 QEMU 中验证低地址恢复、返回状态和拒绝路径 |
 | `tests/riscv/high_half_trap.c`、`tests/high-half-trap-riscv.sh` | 在最终 Sv39 地址空间验证高半区恢复及 fatal 回归 |
@@ -31,7 +31,7 @@
 void riscv_trap_dispatch(struct riscv_trap_frame *frame);
 ```
 
-dispatcher 返回表示当前恢复到的线程 Frame 已经可以恢复。生产路径处理三类事件：supervisor timer 先重设 deadline、累计 tick 并调用 scheduler；U-mode ecall 把 `a7` 和 `a0..a5` 复制到通用 syscall 解码器；U-mode 同步故障以 `{user-fault, scause, stval}` 终止当前任务。未知 syscall 把 `-ENOSYS` 写回 `a0` 并把 `sepc` 前移 4 字节；`exit(93)` 不返回。S-mode 未处理事件和不支持的中断仍输出原始 CSR 并通过 SBI 关机。
+dispatcher 返回表示当前恢复到的线程 Frame 已经可以恢复。生产路径处理 supervisor timer、U-mode ecall 和 U-mode 同步故障。timer 先重设 deadline、累计 tick 并调用 scheduler；ecall 把 `a7` 和 `a0..a5` 复制到通用 syscall 解码器。U-mode instruction/load/store page fault（cause 12/13/15）分别转换为 EXECUTE/READ/WRITE，并交给当前任务的 MM 解析；成功补页时保持 `sepc` 不变返回，让硬件重试原指令。VMA/权限不允许时仍以 `{user-fault, scause, stval}` 终止；分配耗尽以资源原因终止；内部 MM 状态或清理失败 fatal。其他 U-mode 同步异常继续按用户故障终止。未知 syscall 把 `-ENOSYS` 写回 `a0` 并把 `sepc` 前移 4 字节；`exit(93)` 不返回。S-mode 未处理事件和不支持的中断仍输出原始 CSR 并通过 SBI 关机。
 
 ## 返回契约
 
@@ -51,7 +51,7 @@ dispatcher 返回后，汇编总是要求 Frame 中 `sstatus.SIE=0`，避免在�
 - `sscratch` 在内核执行期间固定为零，用户执行期间保存 current thread。入口先用 `csrrw` 与用户 `tp` 交换，从可信线程前缀取得 `kernel_sp`；保存用户 `tp/sp` 后立即把 `sscratch` 清零，再进入 C。
 - 保存现场和 C dispatcher 期间不重新打开 SIE，不支持嵌套异步中断。同步异常可以再次进入当前栈，但 handler、栈或诊断路径自身故障后的递归失败仍没有独立恢复保证。
 - boot idle 使用 4 KiB 静态启动栈，普通内核线程各使用私有 4 KiB 单页栈；没有独立 Trap 栈、guard page、per-hart IRQ 栈或溢出恢复。
-- 当前只有静态 timer、U ecall 和用户同步故障处理，没有运行期 handler 注册、IPI、外部中断控制器、故障信号/上送或 F/V 上下文管理。用户故障直接终止任务，不支持修页、按需分页或用户级异常处理。
+- 当前只有静态 timer、U ecall、匿名栈 demand-zero 和用户同步故障处理，没有运行期 handler 注册、IPI、外部中断控制器、完整信号投递、file-backed/COW fault 或 F/V 上下文管理。不可解析的用户故障仍直接终止任务。
 
 ## 验证入口
 
@@ -62,6 +62,7 @@ make test-high-half-trap-riscv
 make test-timer-riscv
 make test-scheduler-riscv
 make test-user-riscv
+make test-demand-page-riscv
 make test-user-fatal-riscv
 make test-riscv
 ```
@@ -71,5 +72,7 @@ make test-riscv
 `test-user-riscv` 用两个用户根验证 U-mode：两个具有不同栈和 TID/TGID 的任务共享正常 MM，在用户循环中被真实 timer 抢占；内核 worker 运行时观察 `sscratch=0` 并设置共享页标志，两个任务恢复后核对用户 `gp/sp/tp/s0..s11`、身份 syscall、未知 syscall 返回和 `exit(93)`。另一独立 MM 任务访问未映射地址，要求生成用户故障完成记录且不影响正常任务。runner 最终要求内核线程、三个用户任务、两个 MM 及全部 TID 回收。
 
 `test-user-fatal-riscv` 在同一真实用户路径中让测试 wrapper 破坏已返回 ecall Frame 的可信 `kernel_tp`，要求汇编拒绝返回，并在用户根仍活动时经 supervisor-only 高半区 UART 输出唯一 fatal 行后关机。它防止诊断路径暗中依赖只存在于内核根的低地址设备映射。
+
+`test-demand-page-riscv` 让磁盘加载的 PID 1 越过初始栈提交区，分别由 load/store page fault 建立两个匿名零页并重试原指令；测试版内核还在子进程的 load page fault 注入 `NO_MEMORY`，要求父进程得到 wait status 9，全部后代与 PID 1 随后正常回收。普通 RX/guard 故障回归证明按需处理没有放宽 VMA 权限或 guard 边界。
 
 `test-timer-riscv` 使用实际 QEMU DTB、OpenSBI TIME 和 cause 5，让生产 dispatcher 至少两次经完整 Trap Frame 路径返回 `wfi`。`test-scheduler-riscv` 让两个不主动让出的内核线程只靠 timer 在各自 Frame/栈之间切换。`test-trap-riscv` 保留低地址未处理 breakpoint 的 fatal 契约；`test-high-half-trap-riscv` 验证最终 Sv39 高半区的 SSIP 恢复和 fatal 路径。

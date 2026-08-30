@@ -393,14 +393,17 @@ static enum riscv_user_elf_status register_elf_vma_page(
             virtual_address,
             virtual_address + BOAROS_PAGE_SIZE,
             permissions,
-            KERNEL_VMA_ROLE_ELF));
+            KERNEL_VMA_ROLE_ELF,
+            KERNEL_VMA_FAULT_RESIDENT_REQUIRED));
     }
     if (status != KERNEL_MM_STATUS_OK) {
         return mm_status(status);
     }
     return existing.permissions == permissions &&
                    existing.kind == KERNEL_VMA_KIND_ANONYMOUS &&
-                   existing.role == KERNEL_VMA_ROLE_ELF
+                   existing.role == KERNEL_VMA_ROLE_ELF &&
+                   existing.fault_policy ==
+                       KERNEL_VMA_FAULT_RESIDENT_REQUIRED
                ? RISCV_USER_ELF_STATUS_OK
                : RISCV_USER_ELF_STATUS_ADDRESS_SPACE;
 }
@@ -464,7 +467,8 @@ static enum riscv_user_elf_status register_stack_vma(
         RISCV_USER_ELF_STACK_RESERVE_BASE,
         RISCV_USER_ELF_STACK_TOP,
         permissions,
-        KERNEL_VMA_ROLE_STACK));
+        KERNEL_VMA_ROLE_STACK,
+        KERNEL_VMA_FAULT_DEMAND_ZERO));
 }
 
 static enum riscv_user_elf_status copy_load_segments(

@@ -31,6 +31,10 @@ enum kernel_scheduler_status kernel_scheduler_wait4_current(
     uint64_t rusage_address,
     int64_t *linux_result);
 
+enum kernel_mm_status kernel_scheduler_resolve_current_user_fault(
+    uint64_t virtual_address,
+    uint32_t access);
+
 void kernel_user_thread_exit(
     enum kernel_thread_exit_reason reason,
     uint64_t status,
@@ -85,7 +89,7 @@ EXITED  -- parentless retry complete -----------> PID/task page released
 
 `wait4` 支持 `pid>0`、`pid==0`、`pid==-1` 和 `pid<-1` 的 Linux 选择规则，并接受 `WNOHANG/WUNTRACED/WCONTINUED/__WNOTHREAD/__WALL/__WCLONE` 位。当前没有 stopped/continued 事件，因此后两类选项只影响等待集合，不会制造事件。普通 SIGCHLD 子进程被 `__WCLONE` 排除，除非同时使用 `__WALL`。无匹配子进程返回 `-ECHILD`；有匹配但无事件时 `WNOHANG` 返回 0，否则父进程进入 BLOCKED，由子进程成为 zombie 时唤醒。
 
-退出码编码为 `(status & 0xff) << 8`。用户同步故障转换为 SIGILL/SIGTRAP/SIGBUS/SIGSEGV 形态的 wait status。非空 rusage 当前返回 `-ENOTSUP`；未知 option 返回 `-EINVAL`，无法安全取负的 `INT32_MIN` pid 返回 `-ESRCH`。与 Linux 回收顺序一致，zombie 先被逻辑回收，再向用户复制 status；因此 status 指针错误返回 `-EFAULT` 时，该子进程也已不可再次 wait。
+退出码编码为 `(status & 0xff) << 8`。用户同步故障转换为 SIGILL/SIGTRAP/SIGBUS/SIGSEGV 形态的 wait status；用户 demand-zero 缺页耗尽物理页时，内部 completion 保留 `RESOURCE/NO_MEMORY`，父进程看到 SIGKILL 形态的 wait status 9。非空 rusage 当前返回 `-ENOTSUP`；未知 option 返回 `-EINVAL`，无法安全取负的 `INT32_MIN` pid 返回 `-ESRCH`。与 Linux 回收顺序一致，zombie 先被逻辑回收，再向用户复制 status；因此 status 指针错误返回 `-EFAULT` 时，该子进程也已不可再次 wait。
 
 ## 退出、reparent 与失败恢复
 
@@ -115,10 +119,11 @@ make test-mm-riscv
 make test-files-riscv
 make test-user-riscv
 make test-root-init-riscv
+make test-demand-page-riscv
 make test-exec-riscv
 make test-riscv
 ```
 
-聚焦测试覆盖调度状态、创建与清理失败；MM/files 测试分别证明地址空间深复制和 OFD 引用共享。生产 ext4 三映像链覆盖 clone 双返回、PPID、WNOHANG/阻塞唤醒、wait selector、退出码、故障状态、EFAULT 后已回收、fd offset 共享、MM 写隔离、孙进程向 PID 1 reparent，以及最终 heap/物理页基线。
+聚焦测试覆盖调度状态、创建与清理失败；MM/files 测试分别证明地址空间深复制和 OFD 引用共享。生产 ext4 三映像链覆盖 clone 双返回、PPID、WNOHANG/阻塞唤醒、wait selector、退出码、故障状态、EFAULT 后已回收、fd offset 共享、MM 写隔离、孙进程向 PID 1 reparent，以及最终 heap/物理页基线。demand-page OOM 版本验证资源退出编码为 wait status 9，且仍走同一 zombie/reap 资源闭环。
 
 当前限制是 RISC-V64 单 hart、ASID 0、FIFO/单 tick 时间片、4 KiB 单页内核栈、单成员线程组和普通 SIGCHLD clone。尚无 `CLONE_VM/CLONE_FILES/CLONE_THREAD`、COW、信号投递、futex、vfork、rusage、停止/继续事件、SMP、内核栈 guard、F/V 上下文或 LoongArch context。

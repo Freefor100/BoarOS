@@ -1,4 +1,8 @@
     .section .text.start, "ax", @progbits
+#ifndef ROOT_FAULT_WAIT_STATUS
+#define ROOT_FAULT_WAIT_STATUS 11
+#endif
+
     .align 2
     .globl _start
     .type _start, @function
@@ -335,7 +339,7 @@ _start:
     bne a0, s5, .Lfailure
     la t0, .Lwait_status
     lw t1, 0(t0)
-    li t2, 11
+    li t2, ROOT_FAULT_WAIT_STATUS
     bne t1, t2, .Lfailure
 
     # Linux reaps the zombie before copying status to userspace.  Therefore

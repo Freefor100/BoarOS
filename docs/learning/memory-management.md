@@ -214,12 +214,30 @@ BoarOS 因此把 `kernel_mm` 定义为引用计数的拥有型句柄：`acquire`
 
 ```text
 VMA 不存在 + PTE 不存在  -> 无效地址，fault
-VMA 存在   + PTE 不存在  -> 合法但未驻留，未来可按策略补页
+VMA 存在   + PTE 不存在  -> 合法性由 VMA 的 fault policy 决定
 VMA 存在   + PTE 存在    -> 当前可由硬件翻译
 VMA 不存在 + PTE 存在    -> 内核错误；撤销逻辑必须先收紧 VMA 再回收 PTE
 ```
 
-BoarOS 当前的静态 `ET_EXEC` 仍急切物化所有 `PT_LOAD` 页，所以 ELF VMA 与 PTE 同时存在；栈是第一个不同例子：VMA 覆盖低半区顶端完整 8 MiB reserve，而初始 PTE 只覆盖参数栈和 64 KiB headroom，reserve 下方一页 guard 两者都没有。这样把“以后可扩栈”的逻辑边界先固定下来，而不提前分配整个 reserve 的物理页。
+BoarOS 为 VMA 显式记录 fault policy，而不是从 role 猜测行为。静态 `ET_EXEC` 仍急切物化所有 `PT_LOAD` 页并使用 `RESIDENT_REQUIRED`：若这类 VMA 中没有 PTE，说明装载或页表状态不满足契约。栈使用 `DEMAND_ZERO`：VMA 覆盖低半区顶端完整 8 MiB reserve，初始 PTE 只覆盖参数栈和 64 KiB headroom，其余页由真实 U-mode load/store page fault 首次访问时分配和清零。reserve 下方一页 guard 两者都没有，因此不会因“靠近栈”被隐式扩展。
+
+一次当前用户任务的页故障按互斥状态分类：
+
+```text
+不是当前活动 MM / MM 状态损坏 --------------------> 内核 fatal
+地址不在 VMA，或访问不满足 VMA 权限 --------------> 用户访问故障
+PTE 已存在且权限也允许，却仍收到页故障 ------------> 内核地址空间错误
+PTE 不存在 + RESIDENT_REQUIRED ---------------------> 用户访问故障
+PTE 不存在 + 匿名 DEMAND_ZERO
+  +-- 页分配、清零和映射成功 ----------------------> 单页 SFENCE.VMA，原指令重试
+  +-- 物理页耗尽 ----------------------------------> 任务因资源原因退出，wait status 9
+  +-- 已分配页无法访问且回滚释放也失败 ------------> CLEANUP_REQUIRED，内核 fatal
+  +-- 其他页表/分配器状态错误 ----------------------> 内核 fatal
+```
+
+页故障是同步异常，`sepc` 指向需要重试的原指令。补页成功后不能像 `ecall` 一样把 `sepc` 前移；更新 PTE 后还要执行针对该虚拟页的本地 `SFENCE.VMA`，再由 `sret` 重执行 load/store/fetch。当前所有用户地址空间使用 ASID 0，且只有单 hart，所以本地单页失效足够；SMP 下必须把远端正在运行同一 MM 的 hart 纳入 shootdown。
+
+demand-zero 把未触碰栈页的物理内存和清零成本推迟到首次访问。代价是首次触页需要 trap、VMA 二分查找、软件页表查询、可能的中间表/叶子分配与清零、PTE 写入和 TLB 失效；驻留后的普通访问仍由硬件翻译，不增加软件热路径。当前解析器为确认“确实没有 PTE”先 lookup，再由映射函数走一次叶表路径，属于 cold fault path 的重复遍历；若开发板计数显示缺页延迟重要，可在不改变 VMA/MM 接口的前提下合并 walker，但不能据 QEMU 正确性结果宣称性能收益。
 
 当前 VMA 集合用按起始地址排序的连续数组：查找二分为 `O(log n)`，插入为 `O(n)`，相邻且属性相同的区间合并。对于静态 ELF、栈和少量早期匿名区间，这比树节点、旋转和更多分配更小、更容易验证，且不在当前调度热路径上。真实 `mmap` 工作负载若显示大量频繁插入/删除，才应在保持 VMA 语义不变的前提下换成平衡树或区间树；没有测量不能把“树一定更快”当成结论。
 
@@ -304,6 +322,7 @@ LoongArch64 Linux 默认选择 16 KiB/三级页表，该布局支持最多 47 �
 - 范围映射必须说明失败是否回滚。BoarOS 启动建表采用部分提交：中途 OOM 或冲突时保留已经写入的页表，但整个失败页表不得激活；测试同时检查计数和已写 PTE。
 - 只把“不允许继续使用”写进注释并不能维持不变量；页表对象用 `UNINITIALIZED/BUILDING/FAILED/ACTIVE` 状态机约束初始化、建表和激活，错误路径由接口本身拒绝，而不是依赖调用者记住约定。
 - 独立 page-table walker 可以从已生成的树反向计算 PA、叶子大小和权限，再与建表请求比较。它与建表器采用相反的数据流，比重复检查几个 PTE 常量更容易发现索引、边界或叶子层级错误。
+- 缺页测试要把“逻辑合法”和“当前驻留”分开：既检查 VMA/PTE 组合与权限，又要用真实 U-mode 深栈 load/store 证明 trap 后原指令重试；OOM 应耗尽真实分配器，回滚失败应注入“页访问失败且立即释放也失败”，并在最终比较页数/heap 基线。
 - QEMU 能验证架构机制和 `virt` 平台路径，但不能替代开发板上的固件交接、DTB、MMIO 和真实 TLB 行为验证。
 - 分页开启后，分配器托管的 RAM 必须存在可访问的连续内核映射，否则 bootstrap 回收节点和 buddy metadata 都无法安全访问；BoarOS 已由 Direct Map 承担最终地址空间的页内容访问，低 RAM 只存在于首次 `satp` 切换使用的专用过渡页表，高半区内核映射、Direct Map 和过渡别名的职责不能混为一谈。
 
@@ -314,13 +333,15 @@ make test-dtb-riscv
 make test-page-riscv
 make test-sv39-riscv
 make test-sv39-fault-riscv
+make test-vma-riscv
+make test-demand-page-riscv
 make test-user-riscv
 make test-high-half-trap-riscv
 make test-no-identity-riscv
 make test-riscv
 ```
 
-Sv39 建表测试覆盖精确 PTE、2 MiB/4 KiB 选择、16 GiB 规模、边界拒绝和部分提交；权限故障测试覆盖 MMU 生效后的只读保护；完整启动测试再验证 512 MiB、1 GiB 和 16 GiB RAM 下的 `satp`、buddy metadata 与页表页精确计数和高半区执行上下文；用户态测试用两个独立根页表验证切换、U 权限、故障隔离和完整回收；高半区 trap 测试验证硬件实际使用迁移后的 `stvec`，no-identity 测试验证最终页表真实拒绝低 RAM load。开发板到手后还必须补充同类硬件验证，不能把 QEMU 结果直接等同于板级兼容。
+Sv39 建表测试覆盖精确 PTE、2 MiB/4 KiB 选择、16 GiB 规模、边界拒绝和部分提交；权限故障测试覆盖 MMU 生效后的只读保护；VMA/demand-page 测试覆盖策略边界、真实页耗尽、回滚 owner、U-mode 深栈补页、wait status 与完整回收。完整启动测试再验证 512 MiB、1 GiB 和 16 GiB RAM 下的 `satp`、buddy metadata 与页表页精确计数和高半区执行上下文；高半区 trap 测试验证硬件实际使用迁移后的 `stvec`，no-identity 测试验证最终页表真实拒绝低 RAM load。开发板到手后还必须补充同类硬件验证和 fault/TLB 性能测量，不能把 QEMU 结果直接等同于板级兼容。
 
 ## 资料依据
 

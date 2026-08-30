@@ -43,7 +43,7 @@ enum kernel_uaccess_status kernel_copy_string_from_user(
 
 ## 并发与性能边界
 
-当前单 hart 内核没有运行期 `unmap/mprotect`、COW 或按需缺页，运行中任务拥有的 MM 在每个 lookup 与 direct-map 写入之间保持稳定。timer 可以抢占 syscall，但被抢占任务及其 MM 不会在调用栈恢复前被 reaper 释放；exec 也先完成全部用户字符串快照，之后才切换 MM。接入 SMP 或并发映射修改时，必须在 uaccess 内部增加 MM 读锁、页固定或等价的读侧协议，并与缺页、COW 和 TLB shootdown 协调；公共 syscall ABI 不需要因此改变。
+当前匿名栈已支持由真实 U-mode 硬件异常触发的 demand-zero，但 uaccess 的软件页表遍历不会调用缺页解析器：VMA 合法而 PTE 尚未驻留时仍返回 `FAULT`。这保持了现有部分复制和 syscall `-EFAULT` 边界，也避免在尚无异常表/重试协议的内核复制路径中隐式分配。当前单 hart 内核没有运行期 `unmap/mprotect` 或 COW，运行中任务拥有的 MM 在每个 lookup 与 direct-map 写入之间保持稳定。接入 uaccess 缺页、SMP 或并发映射修改时，必须一起定义 MM 读锁、页固定、分配失败、部分复制和 TLB shootdown 协议；公共 syscall ABI 不需要因此改变。
 
 当前每个涉及的基页进行一次三级软件页表查询和一次物理页解析，随后执行页内线性字节复制；uaccess 自身不分配内存，不切换 `satp`，不执行 `SFENCE.VMA`，也不修改 `sstatus.SUM`。文件 `read` 已以 4 KiB staging chunk 使用该路径，但当前只用结构成本和 QEMU 正确性测试约束，尚未取得开发板吞吐、TLB miss 或 cache 数据。应在真实工作负载上比较软件遍历与 RISC-V SUM+异常表快路径，再决定阈值或替换策略。
 
@@ -60,4 +60,4 @@ make test-riscv
 
 聚焦测试分别覆盖 copy-to、copy-from 和字符串复制的合法同页/跨页、零长度、整体用户范围、读写权限、容量内缺少 NUL、跨入未映射页后的精确前缀、非法内核参数、已释放 MM 和物理页访问失败。真实 U-mode 测试验证 `uname` 的跨页 Linux ABI；文件测试验证跨页路径、超过一页的读缓冲区、`-EFAULT` 与 offset 提交。
 
-当前没有缺页调入、COW、运行期 unmap、SUM/异常表快路径或 SMP 映射稳定协议，也没有面向原子用户结构读取的序列化辅助接口。
+当前 uaccess 不触发缺页调入，也没有 COW、运行期 unmap、SUM/异常表快路径或 SMP 映射稳定协议；另无面向原子用户结构读取的序列化辅助接口。
