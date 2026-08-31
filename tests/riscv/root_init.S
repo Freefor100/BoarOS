@@ -80,6 +80,106 @@ _start:
     add t1, s11, t0
     bne a0, t1, .Lfailure
 
+    # Exercise the Linux anonymous-private mmap lifecycle in real U-mode.
+    # The kernel chooses a top-down range, preserves a resident page through
+    # PROT_NONE, rejects NOREPLACE overlap, and lets a hint refill a hole.
+    li a0, 0
+    li a1, 0x3000
+    li a2, 3
+    li a3, 0x22
+    li a4, -1
+    li a5, 0
+    li a7, 222
+    ecall
+    bltz a0, .Lfailure
+    mv s9, a0
+    ld t0, 0(s9)
+    bnez t0, .Lfailure
+    li t0, 0x5a6b7c8d
+    li t1, 0x1000
+    add t3, s9, t1
+    sd t0, 0(t3)
+
+    addi a0, s9, 0
+    li t1, 0x1000
+    add a0, a0, t1
+    li a1, 0x1000
+    li a2, 0
+    li a7, 226
+    ecall
+    bnez a0, .Lfailure
+    addi a0, s9, 0
+    add a0, a0, t1
+    li a1, 0x1000
+    li a2, 2
+    li a7, 226
+    ecall
+    bnez a0, .Lfailure
+    li t1, 0x1000
+    add t3, s9, t1
+    ld t2, 0(t3)
+    li t0, 0x5a6b7c8d
+    bne t2, t0, .Lfailure
+
+    mv a0, s9
+    li a1, 0x1000
+    li a2, 3
+    li a3, 0x100022
+    li a4, -1
+    li a5, 0
+    li a7, 222
+    ecall
+    li t0, -17
+    bne a0, t0, .Lfailure
+
+    li t0, 0x1000
+    add a0, s9, t0
+    li a1, 0x1000
+    li a2, 3
+    li a3, 0x32
+    li a4, -1
+    li a5, 0
+    li a7, 222
+    ecall
+    li t0, 0x1000
+    add t1, s9, t0
+    bne a0, t1, .Lfailure
+    ld t2, 0(a0)
+    bnez t2, .Lfailure
+
+    mv a0, t1
+    li a1, 0x1000
+    li a7, 215
+    ecall
+    bnez a0, .Lfailure
+    mv a0, s9
+    li a1, 0x3000
+    li a2, 1
+    li a7, 226
+    ecall
+    li t0, -12
+    bne a0, t0, .Lfailure
+
+    li t0, 0x1000
+    add a0, s9, t0
+    li a1, 0x1000
+    li a2, 3
+    li a3, 0x22
+    li a4, -1
+    li a5, 0
+    li a7, 222
+    ecall
+    li t0, 0x1000
+    add t1, s9, t0
+    bne a0, t1, .Lfailure
+    ld t2, 0(a0)
+    bnez t2, .Lfailure
+    mv a0, s9
+    li a1, 0x3000
+    li a7, 215
+    ecall
+    bnez a0, .Lfailure
+
     # An absolute path ignores dirfd and receives the lowest free fd.
     li a0, 7
     la a1, .Labsolute_path

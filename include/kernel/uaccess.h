@@ -19,14 +19,14 @@ enum kernel_uaccess_status kernel_user_range_check(
     size_t size);
 
 enum kernel_uaccess_status kernel_copy_to_user(
-    const struct kernel_mm *mm,
+    struct kernel_mm *mm,
     uint64_t user_destination,
     const void *kernel_source,
     size_t size,
     size_t *bytes_copied);
 
 enum kernel_uaccess_status kernel_copy_from_user(
-    const struct kernel_mm *mm,
+    struct kernel_mm *mm,
     void *kernel_destination,
     uint64_t user_source,
     size_t size,
@@ -34,7 +34,7 @@ enum kernel_uaccess_status kernel_copy_from_user(
 
 /* On success, string_length excludes the terminating NUL byte. */
 enum kernel_uaccess_status kernel_copy_string_from_user(
-    const struct kernel_mm *mm,
+    struct kernel_mm *mm,
     char *kernel_destination,
     uint64_t user_source,
     size_t capacity,

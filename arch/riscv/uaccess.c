@@ -22,7 +22,7 @@ enum kernel_uaccess_status kernel_user_range_check(
 }
 
 static enum kernel_uaccess_status resolve_user_page(
-    const struct kernel_mm *mm,
+    struct kernel_mm *mm,
     uint64_t user_address,
     uint32_t required_permissions,
     unsigned char **page)
@@ -33,7 +33,18 @@ static enum kernel_uaccess_status resolve_user_page(
 
     mm_status = kernel_mm_lookup(mm, user_address, &mapping);
     if (mm_status == KERNEL_MM_STATUS_NOT_MAPPED) {
-        return KERNEL_UACCESS_STATUS_FAULT;
+        mm_status = kernel_mm_resolve_user_fault(
+            mm,
+            user_address,
+            required_permissions);
+        if (mm_status == KERNEL_MM_STATUS_NOT_MAPPED) {
+            return KERNEL_UACCESS_STATUS_FAULT;
+        }
+        if (mm_status != KERNEL_MM_STATUS_OK ||
+            kernel_mm_lookup(mm, user_address, &mapping) !=
+                KERNEL_MM_STATUS_OK) {
+            return KERNEL_UACCESS_STATUS_STATE;
+        }
     }
     if (mm_status != KERNEL_MM_STATUS_OK) {
         return KERNEL_UACCESS_STATUS_STATE;
@@ -54,7 +65,7 @@ static enum kernel_uaccess_status resolve_user_page(
 }
 
 enum kernel_uaccess_status kernel_copy_to_user(
-    const struct kernel_mm *mm,
+    struct kernel_mm *mm,
     uint64_t user_destination,
     const void *kernel_source,
     size_t size,
@@ -107,7 +118,7 @@ enum kernel_uaccess_status kernel_copy_to_user(
 }
 
 enum kernel_uaccess_status kernel_copy_from_user(
-    const struct kernel_mm *mm,
+    struct kernel_mm *mm,
     void *kernel_destination,
     uint64_t user_source,
     size_t size,
@@ -160,7 +171,7 @@ enum kernel_uaccess_status kernel_copy_from_user(
 }
 
 enum kernel_uaccess_status kernel_copy_string_from_user(
-    const struct kernel_mm *mm,
+    struct kernel_mm *mm,
     char *kernel_destination,
     uint64_t user_source,
     size_t capacity,

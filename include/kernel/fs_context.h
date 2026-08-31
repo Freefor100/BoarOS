@@ -63,7 +63,7 @@ enum kernel_fs_context_status kernel_fs_context_resolve_kernel_path(
 /* A normal path error is returned through linux_result. */
 enum kernel_fs_context_status kernel_fs_context_resolve_user_path(
     const struct kernel_fs_context *fs,
-    const struct kernel_mm *mm,
+    struct kernel_mm *mm,
     int64_t dirfd,
     uint64_t user_path,
     char *buffer,

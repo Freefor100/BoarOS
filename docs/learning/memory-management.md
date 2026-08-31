@@ -219,7 +219,7 @@ VMA 存在   + PTE 存在    -> 当前可由硬件翻译
 VMA 不存在 + active PTE 存在 -> 内核错误；撤销必须先让 PTE/TLB 失效再收紧 VMA
 ```
 
-BoarOS 为 VMA 显式记录 fault policy，而不是从 role 猜测行为。静态 `ET_EXEC` 仍急切物化所有 `PT_LOAD` 页并使用 `RESIDENT_REQUIRED`：若这类 VMA 中没有 PTE，说明装载或页表状态不满足契约。栈和 `brk` heap 使用 `DEMAND_ZERO`：栈 VMA 覆盖低半区顶端完整 8 MiB reserve，初始 PTE 只覆盖参数栈和 64 KiB headroom；heap VMA 只覆盖当前 program break 向上对齐的范围。两者其余合法页都由真实 U-mode load/store page fault 首次访问时分配和清零。reserve 下方一页 guard 两者都没有，因此不会因“靠近栈”被隐式扩展。
+BoarOS 为 VMA 显式记录 fault policy，而不是从 role 猜测行为。静态 `ET_EXEC` 仍急切物化所有 `PT_LOAD` 页并使用 `RESIDENT_REQUIRED`：若这类 VMA 中没有 PTE，说明装载或页表状态不满足契约。栈、`brk` heap 和 private-anonymous mmap 使用 `DEMAND_ZERO`：栈 VMA 覆盖低半区顶端完整 8 MiB reserve，初始 PTE 只覆盖参数栈和 64 KiB headroom；heap VMA 只覆盖当前 program break 向上对齐的范围；mmap 先保留地址区间。其余合法页由真实 U-mode load/store page fault 或当前 MM 的 uaccess 首次访问时分配和清零。reserve 下方一页 guard 没有 VMA，因此不会因“靠近栈”被隐式扩展。
 
 一次当前用户任务的页故障按互斥状态分类：
 
@@ -241,6 +241,22 @@ demand-zero 把未触碰的栈/heap 页物理内存和清零成本推迟到首�
 
 当前 VMA 集合用按起始地址排序的连续数组：查找二分为 `O(log n)`，插入为 `O(n)`，相邻且属性相同的区间合并。对于静态 ELF、栈和少量早期匿名区间，这比树节点、旋转和更多分配更小、更容易验证，且不在当前调度热路径上。真实 `mmap` 工作负载若显示大量频繁插入/删除，才应在保持 VMA 语义不变的前提下换成平衡树或区间树；没有测量不能把“树一定更快”当成结论。
 
+## 匿名 mmap、munmap 和 mprotect 怎样协作？
+
+`mmap` 分配的是虚拟地址区间，不等于立刻分配每个物理页。anonymous-private mapping 没有文件 backing；首次读取应看到零，首次写入只影响本进程。普通地址参数只是 hint，内核可以在冲突时另选空洞；`MAP_FIXED_NOREPLACE` 要求精确地址且冲突失败，`MAP_FIXED` 则要求精确地址并破坏性替换旧映射。BoarOS 当前先尝试对齐 hint，再从栈 guard 以下 top-down 选择空洞，不做 ASLR。`MAP_STACK` 暂不改变 VMA 增长模型，`MAP_NORESERVE` 在没有 commit accounting 时与普通匿名映射等价。
+
+`munmap` 的 Linux 语义允许区间包含洞：已经映射的部分被撤销，原本未映射的部分不构成错误。`mprotect` 不同，它要求整个非空区间都有 VMA，遇到洞返回 `ENOMEM`。两者都可能在起止边界拆分 VMA；若先改 PTE 后才发现 descriptor 扩容失败，会出现硬件状态已经提交而逻辑状态无法提交的问题。BoarOS 因此先校验并预留确实需要的 descriptor 容量，再修改页表/TLB，最后用不分配的 commit 完成拆分、删除、改权和相邻合并。
+
+RISC-V 叶子 PTE 的 `V=1` 才可供硬件翻译，但 `V=0` 时 RSW 两位仍可由 supervisor 保存软件状态。BoarOS 区分三种用户页 owner：
+
+```text
+active:    V=1，PPN 和 R/W/X/U 供硬件使用
+protected: V=0，RSW bit 9，PPN/内容仍属于映射，可由 mprotect 恢复
+retired:   V=0，RSW bit 8，映射已撤销，PPN 只等待释放重试
+```
+
+`PROT_NONE` 不能简单清零 PTE，否则 resident 物理页的 owner 和内容都会丢失；也不能复用 retired 标记，否则 fork/unmap/destroy 不知道它应该复制、恢复还是只释放。恢复保护时用同一 PPN 重建叶子，所以内容不变；fork 为 protected 页复制新的物理页并让子页继续保持 protected。RISC-V 规范保留 W=1、R=0 的叶子编码，项目因此把仅写请求规范化为 RW。增加执行权限前还需要 `FENCE.I` 让先前数据写入对后续取指可见，改 PTE 后再 `SFENCE.VMA` 失效旧地址翻译。
+
 VMA 属于 MM 而不是 task 或单张页表。fork 必须复制其逻辑布局，最后一个 MM owner 必须先释放 VMA metadata，再释放驻留页和页表，才能避免 metadata 指向已经丢失的状态。VMA metadata 的释放也会失败，所以它单独形成可重试 cleanup 阶段；测试既要检查正常页数回到基线，也要注入这一步失败并确认不会越过它销毁 PTE。
 
 可重试的 owner 还必须比触发错误的栈帧活得更久。只让一个局部 `kernel_mm` 进入 `CLEANUP` 然后从启动函数返回，虽然状态机本身正确，唯一的记录页地址仍会随着栈帧消失。BoarOS 的根启动把尚未发布的 file、MM、VMA cleanup 阶段和相关资源移入持久 `riscv_root_boot`；调用者只要看到 root 仍处于 `CLEANUP` 就继续重试，直到 heap 和物理页都回到基线。这个原则同样适用于 exec transaction、任务退出队列和以后任何异步回收：错误码不能替代仍然存在的资源 owner。
@@ -253,7 +269,7 @@ program break 是进程数据段高端之后的一个**字节地址**。Linux ra
 
 增长只建立 RW anonymous `DEMAND_ZERO` heap VMA，不立即分配数据页。这样申请一大片地址空间但只访问少量页面时，不会预先消耗所有物理页；代价由首次触页 fault 承担。相邻 heap VMA 属性相同会合并，所以反复小幅增长不会为每次 syscall 保留一个描述符。fork 复制调用时的精确 break、VMA 和已驻留页，父子随后独立调整；exec 则从新 ELF 重新计算，不继承旧 heap 高水位。
 
-缩小的关键不是“把 PTE 清零”这么简单，而是所有权与 TLB 顺序：先把 active PTE 改成硬件无效状态，再执行 `SFENCE.VMA`，确认旧翻译不能继续访问页框，之后才能把物理页归还分配器并收紧 VMA。若先释放页框再失效 TLB，用户可能通过旧 TLB 翻译访问已经分配给别处的内存；若先删 VMA却保留 active PTE，则形成逻辑无效但硬件仍可访问的地址。
+缩小的关键不是“把 PTE 清零”这么简单，而是所有权与 TLB 顺序：先把 active/protected PTE 改成硬件无效的 retired 状态，再执行 `SFENCE.VMA`，确认旧翻译不能继续访问页框，之后才能把物理页归还分配器并收紧 VMA。若先释放页框再失效 TLB，用户可能通过旧 TLB 翻译访问已经分配给别处的内存；若先删 VMA却保留 active PTE，则形成逻辑无效但硬件仍可访问的地址。用户可以先对 heap 打洞或局部改权，因此 brk shrink 复用通用范围删除，而不假定 heap 永远由单个连续 VMA 表示。
 
 物理页释放也可能失败。BoarOS 使用 `V=0` 的 PTE，并占用 RISC-V 为 supervisor software 保留的 RSW 位标记 retired owner，同时保留 PPN。硬件把它视为无效映射，用户 lookup/fork 也不把它当作页面，但 MM 仍知道哪一个物理页必须重试释放。后续增长覆盖该范围前先重试，最终 MM destroy 也会处理它。这个状态同时满足“地址已经不可访问”和“owner 没有因错误码丢失”。
 
@@ -349,6 +365,7 @@ make test-sv39-riscv
 make test-sv39-fault-riscv
 make test-vma-riscv
 make test-brk-riscv
+make test-mmap-riscv
 make test-demand-page-riscv
 make test-user-riscv
 make test-high-half-trap-riscv
@@ -356,7 +373,7 @@ make test-no-identity-riscv
 make test-riscv
 ```
 
-Sv39 建表测试覆盖精确 PTE、2 MiB/4 KiB 选择、16 GiB 规模、边界拒绝和部分提交；权限故障测试覆盖 MMU 生效后的只读保护；VMA/demand-page 测试覆盖策略边界、真实页耗尽、回滚 owner、U-mode 深栈/heap 补页、wait status 与完整回收。`test-brk-riscv` 还覆盖精确 raw 返回、跨页 shrink、retired owner、fork 独立值、exec 重置、缩小后 SIGSEGV 和重新增长零页。完整启动测试再验证 512 MiB、1 GiB 和 16 GiB RAM 下的 `satp`、buddy metadata 与页表页精确计数和高半区执行上下文；高半区 trap 测试验证硬件实际使用迁移后的 `stvec`，no-identity 测试验证最终页表真实拒绝低 RAM load。开发板到手后还必须补充同类硬件验证和 fault/TLB 性能测量，不能把 QEMU 结果直接等同于板级兼容。
+Sv39 建表测试覆盖精确 PTE、2 MiB/4 KiB 选择、16 GiB 规模、边界拒绝和部分提交；权限故障测试覆盖 MMU 生效后的只读保护；VMA/demand-page 测试覆盖策略边界、真实页耗尽、回滚 owner、U-mode 深栈/heap/mmap 补页、protected/retired owner、区间编辑和完整回收。`test-brk-riscv` 覆盖精确 raw 返回与 fork/exec heap 生命周期，`test-mmap-riscv` 覆盖真实 U-mode anonymous mmap/mprotect/munmap。完整启动测试再验证 512 MiB、1 GiB 和 16 GiB RAM 下的 `satp`、buddy metadata 与页表页精确计数和高半区执行上下文；高半区 trap 测试验证硬件实际使用迁移后的 `stvec`，no-identity 测试验证最终页表真实拒绝低 RAM load。开发板到手后还必须补充同类硬件验证和 fault/TLB 性能测量，不能把 QEMU 结果直接等同于板级兼容。
 
 ## 资料依据
 

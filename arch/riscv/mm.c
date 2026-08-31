@@ -560,16 +560,321 @@ static int align_brk_page(uint64_t address, uint64_t *aligned)
     return 1;
 }
 
-static int valid_heap_vma(const struct kernel_vma *vma,
-                          uint64_t start,
-                          uint64_t end)
+static int align_mapping_length(uint64_t length, uint64_t *aligned)
 {
-    return vma->start == start && vma->end == end &&
-           vma->permissions == (KERNEL_MM_READ | KERNEL_MM_WRITE) &&
-           vma->kind == KERNEL_VMA_KIND_ANONYMOUS &&
-           vma->role == KERNEL_VMA_ROLE_HEAP &&
-           vma->fault_policy == KERNEL_VMA_FAULT_DEMAND_ZERO &&
-           vma->file_offset == 0U && vma->backing == 0;
+    if (length == 0U ||
+        length > RISCV_SV39_USER_LIMIT - BOAROS_PAGE_MASK) {
+        return 0;
+    }
+    *aligned = (length + BOAROS_PAGE_MASK) & ~BOAROS_PAGE_MASK;
+    return *aligned != 0U;
+}
+
+static uint32_t sv39_permissions_from_mm(uint32_t permissions);
+
+static int normalize_user_permissions(uint32_t permissions,
+                                      uint32_t *normalized)
+{
+    uint32_t known = KERNEL_MM_READ | KERNEL_MM_WRITE |
+                     KERNEL_MM_EXECUTE;
+
+    if ((permissions & ~known) != 0U) {
+        return 0;
+    }
+    if ((permissions & KERNEL_MM_WRITE) != 0U) {
+        permissions |= KERNEL_MM_READ;
+    }
+    *normalized = permissions;
+    return 1;
+}
+
+static enum kernel_mm_status require_active_space(
+    const struct riscv_kernel_mm_record *record)
+{
+    uint64_t satp;
+
+    if (riscv_sv39_user_space_satp(&record->space, &satp) !=
+            RISCV_SV39_STATUS_OK ||
+        riscv_sv39_current_satp() != satp) {
+        return KERNEL_MM_STATUS_STATE;
+    }
+    return KERNEL_MM_STATUS_OK;
+}
+
+static enum kernel_mm_status mutable_vma_record(
+    struct kernel_mm *mm,
+    struct riscv_kernel_mm_record **record)
+{
+    enum kernel_mm_status status;
+
+    if (mm == 0) {
+        return KERNEL_MM_STATUS_INVALID_ARGUMENT;
+    }
+    if (mm->state != KERNEL_MM_LIVE) {
+        return KERNEL_MM_STATUS_STATE;
+    }
+    status = resolve_record(mm, record);
+    if (status != KERNEL_MM_STATUS_OK ||
+        (*record)->stage != RISCV_KERNEL_MM_RECORD_LIVE ||
+        (*record)->vmas == 0 || (*record)->brk_initialized != 1U) {
+        return status == KERNEL_MM_STATUS_OK ? KERNEL_MM_STATUS_STATE
+                                             : status;
+    }
+    return KERNEL_MM_STATUS_OK;
+}
+
+static enum kernel_mm_status unmap_space_range(
+    struct riscv_kernel_mm_record *record,
+    uint64_t start,
+    uint64_t end)
+{
+    uint32_t deferred_pages;
+    enum riscv_sv39_status status;
+
+    if (end <= RISCV_SV39_PAGE_SIZE_4K) {
+        return KERNEL_MM_STATUS_OK;
+    }
+    if (start < RISCV_SV39_PAGE_SIZE_4K) {
+        start = RISCV_SV39_PAGE_SIZE_4K;
+    }
+    status = riscv_sv39_user_unmap_owned_range(&record->space,
+                                               start,
+                                               end,
+                                               &deferred_pages);
+    if (status == RISCV_SV39_STATUS_OK) {
+        return KERNEL_MM_STATUS_OK;
+    }
+    return status == RISCV_SV39_STATUS_STATE
+               ? KERNEL_MM_STATUS_STATE
+               : KERNEL_MM_STATUS_ADDRESS_SPACE;
+}
+
+enum kernel_mm_status kernel_mm_mmap_anonymous(
+    struct kernel_mm *mm,
+    uint64_t hint,
+    uint64_t length,
+    uint32_t permissions,
+    uint32_t flags,
+    uint64_t *address)
+{
+    struct riscv_kernel_mm_record *record;
+    struct kernel_vma vma;
+    struct kernel_vma_edit edit;
+    uint64_t aligned_length;
+    uint64_t start;
+    uint64_t end;
+    uint32_t normalized;
+    int overlaps;
+    enum kernel_mm_status status;
+    enum kernel_vma_status vma_status;
+
+    if (address == 0 ||
+        !normalize_user_permissions(permissions, &normalized) ||
+        (flags & ~(KERNEL_MM_MAP_FIXED |
+                   KERNEL_MM_MAP_FIXED_NOREPLACE)) != 0U ||
+        flags == (KERNEL_MM_MAP_FIXED |
+                  KERNEL_MM_MAP_FIXED_NOREPLACE)) {
+        return KERNEL_MM_STATUS_INVALID_ARGUMENT;
+    }
+    if (length == 0U) {
+        return KERNEL_MM_STATUS_INVALID_ARGUMENT;
+    }
+    if (!align_mapping_length(length, &aligned_length)) {
+        return KERNEL_MM_STATUS_NO_MEMORY;
+    }
+    status = mutable_vma_record(mm, &record);
+    if (status != KERNEL_MM_STATUS_OK) {
+        return status;
+    }
+    if (flags != 0U) {
+        if (hint < RISCV_SV39_PAGE_SIZE_4K ||
+            (hint & BOAROS_PAGE_MASK) != 0U ||
+            hint > RISCV_SV39_USER_LIMIT - aligned_length) {
+            return KERNEL_MM_STATUS_INVALID_ARGUMENT;
+        }
+        start = hint;
+        if ((flags & KERNEL_MM_MAP_FIXED_NOREPLACE) != 0U) {
+            vma_status = kernel_vma_set_overlaps(record->vmas,
+                                                 start,
+                                                 start + aligned_length,
+                                                 &overlaps);
+            if (vma_status != KERNEL_VMA_STATUS_OK) {
+                return status_from_vma(vma_status);
+            }
+            if (overlaps != 0) {
+                return KERNEL_MM_STATUS_CONFLICT;
+            }
+        }
+    } else {
+        if (record->brk_limit < RISCV_SV39_PAGE_SIZE_4K ||
+            aligned_length >
+                record->brk_limit - RISCV_SV39_PAGE_SIZE_4K) {
+            return KERNEL_MM_STATUS_NO_MEMORY;
+        }
+        hint &= ~BOAROS_PAGE_MASK;
+        if (hint < RISCV_SV39_PAGE_SIZE_4K ||
+            hint > record->brk_limit - aligned_length) {
+            hint = 0U;
+        }
+        vma_status = kernel_vma_set_find_topdown_gap(
+            record->vmas,
+            hint,
+            RISCV_SV39_PAGE_SIZE_4K,
+            record->brk_limit,
+            aligned_length,
+            &start);
+        if (vma_status == KERNEL_VMA_STATUS_NOT_FOUND) {
+            return KERNEL_MM_STATUS_NO_MEMORY;
+        }
+        if (vma_status != KERNEL_VMA_STATUS_OK) {
+            return status_from_vma(vma_status);
+        }
+    }
+    end = start + aligned_length;
+    vma = (struct kernel_vma){
+        .start = start,
+        .end = end,
+        .file_offset = 0U,
+        .permissions = normalized,
+        .kind = KERNEL_VMA_KIND_ANONYMOUS,
+        .role = KERNEL_VMA_ROLE_MMAP,
+        .fault_policy = KERNEL_VMA_FAULT_DEMAND_ZERO,
+        .backing = 0,
+    };
+    if ((flags & KERNEL_MM_MAP_FIXED) == 0U) {
+        status = status_from_vma(kernel_vma_set_insert(record->vmas,
+                                                       &vma));
+        if (status == KERNEL_MM_STATUS_OK) {
+            *address = start;
+        }
+        return status;
+    }
+    vma_status = kernel_vma_set_prepare_replace(record->vmas,
+                                                start,
+                                                end,
+                                                &vma,
+                                                &edit);
+    if (vma_status != KERNEL_VMA_STATUS_OK) {
+        return status_from_vma(vma_status);
+    }
+    status = require_active_space(record);
+    if (status != KERNEL_MM_STATUS_OK) {
+        return status;
+    }
+    status = unmap_space_range(record, start, end);
+    if (status != KERNEL_MM_STATUS_OK) {
+        return status;
+    }
+    if (kernel_vma_set_commit_edit(record->vmas, &edit) !=
+        KERNEL_VMA_STATUS_OK) {
+        return KERNEL_MM_STATUS_STATE;
+    }
+    *address = start;
+    return KERNEL_MM_STATUS_OK;
+}
+
+enum kernel_mm_status kernel_mm_munmap(
+    struct kernel_mm *mm,
+    uint64_t address,
+    uint64_t length)
+{
+    struct riscv_kernel_mm_record *record;
+    struct kernel_vma_edit edit;
+    uint64_t aligned_length;
+    uint64_t end;
+    enum kernel_mm_status status;
+    enum kernel_vma_status vma_status;
+
+    if ((address & BOAROS_PAGE_MASK) != 0U ||
+        !align_mapping_length(length, &aligned_length) ||
+        address >= RISCV_SV39_USER_LIMIT ||
+        address > RISCV_SV39_USER_LIMIT - aligned_length) {
+        return KERNEL_MM_STATUS_INVALID_ARGUMENT;
+    }
+    end = address + aligned_length;
+    status = mutable_vma_record(mm, &record);
+    if (status != KERNEL_MM_STATUS_OK) {
+        return status;
+    }
+    vma_status = kernel_vma_set_prepare_replace(record->vmas,
+                                                address,
+                                                end,
+                                                0,
+                                                &edit);
+    if (vma_status != KERNEL_VMA_STATUS_OK) {
+        return status_from_vma(vma_status);
+    }
+    status = require_active_space(record);
+    if (status != KERNEL_MM_STATUS_OK) {
+        return status;
+    }
+    status = unmap_space_range(record, address, end);
+    if (status != KERNEL_MM_STATUS_OK) {
+        return status;
+    }
+    return kernel_vma_set_commit_edit(record->vmas, &edit) ==
+                   KERNEL_VMA_STATUS_OK
+               ? KERNEL_MM_STATUS_OK
+               : KERNEL_MM_STATUS_STATE;
+}
+
+enum kernel_mm_status kernel_mm_mprotect(
+    struct kernel_mm *mm,
+    uint64_t address,
+    uint64_t length,
+    uint32_t permissions)
+{
+    struct riscv_kernel_mm_record *record;
+    struct kernel_vma_edit edit;
+    uint64_t aligned_length;
+    uint64_t end;
+    uint32_t normalized;
+    enum kernel_mm_status status;
+    enum kernel_vma_status vma_status;
+    enum riscv_sv39_status sv39_status;
+
+    if ((address & BOAROS_PAGE_MASK) != 0U ||
+        !normalize_user_permissions(permissions, &normalized)) {
+        return KERNEL_MM_STATUS_INVALID_ARGUMENT;
+    }
+    if (length == 0U) {
+        return mutable_vma_record(mm, &record);
+    }
+    if (!align_mapping_length(length, &aligned_length) ||
+        address > RISCV_SV39_USER_LIMIT - aligned_length) {
+        return KERNEL_MM_STATUS_NO_MEMORY;
+    }
+    end = address + aligned_length;
+    status = mutable_vma_record(mm, &record);
+    if (status != KERNEL_MM_STATUS_OK) {
+        return status;
+    }
+    vma_status = kernel_vma_set_prepare_protect(record->vmas,
+                                                address,
+                                                end,
+                                                normalized,
+                                                &edit);
+    if (vma_status != KERNEL_VMA_STATUS_OK) {
+        return status_from_vma(vma_status);
+    }
+    status = require_active_space(record);
+    if (status != KERNEL_MM_STATUS_OK) {
+        return status;
+    }
+    sv39_status = riscv_sv39_user_protect_owned_range(
+        &record->space,
+        address,
+        end,
+        sv39_permissions_from_mm(normalized));
+    if (sv39_status != RISCV_SV39_STATUS_OK) {
+        return sv39_status == RISCV_SV39_STATUS_STATE
+                   ? KERNEL_MM_STATUS_STATE
+                   : KERNEL_MM_STATUS_ADDRESS_SPACE;
+    }
+    return kernel_vma_set_commit_edit(record->vmas, &edit) ==
+                   KERNEL_VMA_STATUS_OK
+               ? KERNEL_MM_STATUS_OK
+               : KERNEL_MM_STATUS_STATE;
 }
 
 enum kernel_mm_status kernel_mm_brk(
@@ -578,11 +883,10 @@ enum kernel_mm_status kernel_mm_brk(
     uint64_t *result)
 {
     struct riscv_kernel_mm_record *record;
-    struct kernel_vma heap_vma;
+    struct kernel_vma_edit edit;
     uint64_t old_page_end;
     uint64_t new_page_end;
     uint64_t old_brk;
-    uint64_t satp;
     uint32_t deferred_pages;
     enum kernel_mm_status status;
     enum kernel_vma_status vma_status;
@@ -615,6 +919,20 @@ enum kernel_mm_status kernel_mm_brk(
     }
 
     if (new_page_end > old_page_end) {
+        sv39_status = riscv_sv39_user_reclaim_retired_range(
+            &record->space,
+            old_page_end,
+            new_page_end,
+            &deferred_pages);
+        if (sv39_status != RISCV_SV39_STATUS_OK) {
+            return sv39_status == RISCV_SV39_STATUS_STATE
+                       ? KERNEL_MM_STATUS_STATE
+                       : KERNEL_MM_STATUS_ADDRESS_SPACE;
+        }
+        if (deferred_pages != 0U) {
+            *result = old_brk;
+            return KERNEL_MM_STATUS_OK;
+        }
         vma_status = kernel_vma_set_insert(
             record->vmas,
             &(const struct kernel_vma){
@@ -635,62 +953,29 @@ enum kernel_mm_status kernel_mm_brk(
         if (vma_status != KERNEL_VMA_STATUS_OK) {
             return status_from_vma(vma_status);
         }
-        sv39_status = riscv_sv39_user_reclaim_retired_range(
-            &record->space,
-            old_page_end,
-            new_page_end,
-            &deferred_pages);
-        if (sv39_status != RISCV_SV39_STATUS_OK ||
-            deferred_pages != 0U) {
-            vma_status = kernel_vma_set_trim_end(record->vmas,
-                                                 record->start_brk,
-                                                 new_page_end,
-                                                 old_page_end);
-            if (vma_status != KERNEL_VMA_STATUS_OK) {
-                return KERNEL_MM_STATUS_STATE;
-            }
-            if (sv39_status != RISCV_SV39_STATUS_OK) {
-                return sv39_status == RISCV_SV39_STATUS_STATE
-                           ? KERNEL_MM_STATUS_STATE
-                           : KERNEL_MM_STATUS_ADDRESS_SPACE;
-            }
-            *result = old_brk;
-            return KERNEL_MM_STATUS_OK;
-        }
         record->current_brk = requested;
         *result = requested;
         return KERNEL_MM_STATUS_OK;
     }
 
-    vma_status = kernel_vma_set_lookup(record->vmas,
-                                       old_page_end - 1U,
-                                       &heap_vma);
-    if (vma_status != KERNEL_VMA_STATUS_OK ||
-        !valid_heap_vma(&heap_vma,
-                        record->start_brk,
-                        old_page_end)) {
-        return KERNEL_MM_STATUS_STATE;
-    }
-    if (riscv_sv39_user_space_satp(&record->space, &satp) !=
-            RISCV_SV39_STATUS_OK ||
-        riscv_sv39_current_satp() != satp) {
-        return KERNEL_MM_STATUS_STATE;
-    }
-    sv39_status = riscv_sv39_user_unmap_owned_range(
-        &record->space,
-        new_page_end,
-        old_page_end,
-        &deferred_pages);
-    if (sv39_status != RISCV_SV39_STATUS_OK) {
-        return sv39_status == RISCV_SV39_STATUS_STATE
-                   ? KERNEL_MM_STATUS_STATE
-                   : KERNEL_MM_STATUS_ADDRESS_SPACE;
-    }
-    vma_status = kernel_vma_set_trim_end(record->vmas,
-                                         heap_vma.start,
-                                         heap_vma.end,
-                                         new_page_end);
+    vma_status = kernel_vma_set_prepare_replace(record->vmas,
+                                                new_page_end,
+                                                old_page_end,
+                                                0,
+                                                &edit);
     if (vma_status != KERNEL_VMA_STATUS_OK) {
+        return status_from_vma(vma_status);
+    }
+    status = require_active_space(record);
+    if (status != KERNEL_MM_STATUS_OK) {
+        return status;
+    }
+    status = unmap_space_range(record, new_page_end, old_page_end);
+    if (status != KERNEL_MM_STATUS_OK) {
+        return status;
+    }
+    if (kernel_vma_set_commit_edit(record->vmas, &edit) !=
+        KERNEL_VMA_STATUS_OK) {
         return KERNEL_MM_STATUS_STATE;
     }
     record->current_brk = requested;
@@ -732,6 +1017,7 @@ enum kernel_mm_status kernel_mm_resolve_user_fault(
     struct kernel_vma vma;
     uint64_t satp;
     uint64_t page_address;
+    uint32_t deferred_pages;
     uint32_t known = KERNEL_MM_READ | KERNEL_MM_WRITE |
                      KERNEL_MM_EXECUTE;
     enum kernel_mm_status status;
@@ -750,11 +1036,6 @@ enum kernel_mm_status kernel_mm_resolve_user_fault(
         record->stage != RISCV_KERNEL_MM_RECORD_LIVE) {
         return status == KERNEL_MM_STATUS_OK ? KERNEL_MM_STATUS_STATE
                                              : status;
-    }
-    if (riscv_sv39_user_space_satp(&record->space, &satp) !=
-            RISCV_SV39_STATUS_OK ||
-        riscv_sv39_current_satp() != satp) {
-        return KERNEL_MM_STATUS_STATE;
     }
     if (virtual_address < RISCV_SV39_PAGE_SIZE_4K ||
         virtual_address >= RISCV_SV39_USER_LIMIT ||
@@ -794,7 +1075,25 @@ enum kernel_mm_status kernel_mm_resolve_user_fault(
         vma.fault_policy != KERNEL_VMA_FAULT_DEMAND_ZERO) {
         return KERNEL_MM_STATUS_NOT_MAPPED;
     }
+    if (riscv_sv39_user_space_satp(&record->space, &satp) !=
+            RISCV_SV39_STATUS_OK ||
+        riscv_sv39_current_satp() != satp) {
+        return KERNEL_MM_STATUS_STATE;
+    }
     page_address = virtual_address & ~BOAROS_PAGE_MASK;
+    sv39_status = riscv_sv39_user_reclaim_retired_range(
+        &record->space,
+        page_address,
+        page_address + BOAROS_PAGE_SIZE,
+        &deferred_pages);
+    if (sv39_status != RISCV_SV39_STATUS_OK) {
+        return sv39_status == RISCV_SV39_STATUS_STATE
+                   ? KERNEL_MM_STATUS_STATE
+                   : KERNEL_MM_STATUS_ADDRESS_SPACE;
+    }
+    if (deferred_pages != 0U) {
+        return KERNEL_MM_STATUS_NO_MEMORY;
+    }
     sv39_status = riscv_sv39_user_map_zeroed_page(
         &record->space,
         page_address,
@@ -842,6 +1141,7 @@ enum kernel_mm_status kernel_mm_release(struct kernel_mm *mm)
     struct riscv_kernel_mm_record *record;
     uint32_t table_pages;
     uint32_t leaf_pages;
+    uint32_t protected_pages;
     uint32_t retired_pages;
     enum kernel_mm_status status;
     enum riscv_sv39_status sv39_status;
@@ -873,11 +1173,13 @@ enum kernel_mm_status kernel_mm_release(struct kernel_mm *mm)
         if (record->vmas == 0) {
             table_pages = record->space.table_pages;
             leaf_pages = record->space.leaf_pages;
+            protected_pages = record->space.protected_pages;
             retired_pages = record->space.retired_pages;
             sv39_status = riscv_sv39_user_space_destroy(&record->space);
             if (sv39_status != RISCV_SV39_STATUS_OK) {
                 if (record->space.table_pages != table_pages ||
                     record->space.leaf_pages != leaf_pages ||
+                    record->space.protected_pages != protected_pages ||
                     record->space.retired_pages != retired_pages ||
                     sv39_status == RISCV_SV39_STATUS_CLEANUP_REQUIRED) {
                     record->stage =
@@ -927,11 +1229,13 @@ enum kernel_mm_status kernel_mm_release(struct kernel_mm *mm)
 
     table_pages = record->space.table_pages;
     leaf_pages = record->space.leaf_pages;
+    protected_pages = record->space.protected_pages;
     retired_pages = record->space.retired_pages;
     sv39_status = riscv_sv39_user_space_destroy(&record->space);
     if (sv39_status != RISCV_SV39_STATUS_OK) {
         if (record->space.table_pages != table_pages ||
             record->space.leaf_pages != leaf_pages ||
+            record->space.protected_pages != protected_pages ||
             record->space.retired_pages != retired_pages ||
             sv39_status == RISCV_SV39_STATUS_CLEANUP_REQUIRED) {
             record->stage = RISCV_KERNEL_MM_RECORD_SPACE_CLEANUP;

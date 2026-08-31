@@ -6,6 +6,12 @@
 struct kernel_heap;
 struct kernel_vma_set;
 
+enum kernel_vma_edit_kind {
+    KERNEL_VMA_EDIT_REMOVE = 0,
+    KERNEL_VMA_EDIT_REPLACE,
+    KERNEL_VMA_EDIT_PROTECT,
+};
+
 enum kernel_vma_status {
     KERNEL_VMA_STATUS_OK = 0,
     KERNEL_VMA_STATUS_INVALID_ARGUMENT,
@@ -47,6 +53,21 @@ struct kernel_vma {
 };
 
 /*
+ * A prepared edit reserves every descriptor it can need without changing the
+ * logical VMA set.  Architecture MM code may then commit page-table state and
+ * finish the edit without another allocation.
+ */
+struct kernel_vma_edit {
+    const struct kernel_vma_set *set;
+    uint64_t generation;
+    uint64_t start;
+    uint64_t end;
+    uint32_t permissions;
+    enum kernel_vma_edit_kind kind;
+    struct kernel_vma replacement;
+};
+
+/*
  * These helpers are private to architecture MM backends.  A set borrows heap;
  * its owner must keep heap live through set destruction and every retry.
  */
@@ -70,6 +91,41 @@ enum kernel_vma_status kernel_vma_set_lookup(
     const struct kernel_vma_set *set,
     uint64_t virtual_address,
     struct kernel_vma *vma);
+
+enum kernel_vma_status kernel_vma_set_find_topdown_gap(
+    const struct kernel_vma_set *set,
+    uint64_t hint,
+    uint64_t lower,
+    uint64_t upper,
+    uint64_t length,
+    uint64_t *address);
+
+enum kernel_vma_status kernel_vma_set_overlaps(
+    const struct kernel_vma_set *set,
+    uint64_t start,
+    uint64_t end,
+    int *overlaps);
+
+/* replacement == NULL prepares a Linux munmap-style range removal. */
+enum kernel_vma_status kernel_vma_set_prepare_replace(
+    struct kernel_vma_set *set,
+    uint64_t start,
+    uint64_t end,
+    const struct kernel_vma *replacement,
+    struct kernel_vma_edit *edit);
+
+/* Every byte in the interval must already be covered by VMAs. */
+enum kernel_vma_status kernel_vma_set_prepare_protect(
+    struct kernel_vma_set *set,
+    uint64_t start,
+    uint64_t end,
+    uint32_t permissions,
+    struct kernel_vma_edit *edit);
+
+/* No allocation is performed; a stale or foreign edit returns STATE. */
+enum kernel_vma_status kernel_vma_set_commit_edit(
+    struct kernel_vma_set *set,
+    const struct kernel_vma_edit *edit);
 
 /* Shrinks one exact VMA at its high end; new_end == start removes it. */
 enum kernel_vma_status kernel_vma_set_trim_end(

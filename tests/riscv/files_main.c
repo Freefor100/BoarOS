@@ -225,7 +225,7 @@ static size_t text_length(const char *text)
 
 static void expect_open(struct kernel_files *files,
                         const struct kernel_fs_context *fs,
-                        const struct kernel_mm *mm,
+                        struct kernel_mm *mm,
                         int64_t dirfd,
                         const char *path,
                         uint64_t flags,
@@ -253,7 +253,7 @@ static void expect_open(struct kernel_files *files,
 
 static void run_file_operations(struct kernel_files *files,
                                 const struct kernel_fs_context *fs,
-                                const struct kernel_mm *mm)
+                                struct kernel_mm *mm)
 {
     struct kernel_files_statistics statistics;
     static unsigned char no_nul[KERNEL_FS_PATH_MAX];
@@ -454,7 +454,7 @@ static void run_file_operations(struct kernel_files *files,
 
 static void run_fork_operations(struct kernel_files *parent_files,
                                 const struct kernel_fs_context *parent_fs,
-                                const struct kernel_mm *mm)
+                                struct kernel_mm *mm)
 {
     struct kernel_files child_files = {0};
     struct kernel_fs_context child_fs = {0};

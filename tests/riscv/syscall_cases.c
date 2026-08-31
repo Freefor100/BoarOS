@@ -9,6 +9,17 @@ static enum kernel_task_status brk_borrow_status =
 static enum kernel_mm_status brk_mm_status = KERNEL_MM_STATUS_OK;
 static uint64_t brk_mm_result;
 static uint64_t brk_mm_requested;
+static enum kernel_mm_status mmap_mm_status = KERNEL_MM_STATUS_OK;
+static enum kernel_mm_status munmap_mm_status = KERNEL_MM_STATUS_OK;
+static enum kernel_mm_status mprotect_mm_status = KERNEL_MM_STATUS_OK;
+static uint64_t mmap_mm_result;
+static uint64_t mmap_mm_hint;
+static uint64_t mmap_mm_length;
+static uint32_t mmap_mm_permissions;
+static uint32_t mmap_mm_flags;
+static uint64_t range_mm_address;
+static uint64_t range_mm_length;
+static uint32_t range_mm_permissions;
 
 enum kernel_task_status __wrap_kernel_task_mm_borrow_mutable(
     struct kernel_task *task,
@@ -37,6 +48,55 @@ enum kernel_mm_status __wrap_kernel_mm_brk(
         *result = brk_mm_result;
     }
     return brk_mm_status;
+}
+
+enum kernel_mm_status __wrap_kernel_mm_mmap_anonymous(
+    struct kernel_mm *mm,
+    uint64_t hint,
+    uint64_t length,
+    uint32_t permissions,
+    uint32_t flags,
+    uint64_t *address)
+{
+    if (mm != (struct kernel_mm *)(uintptr_t)2U || address == 0) {
+        return KERNEL_MM_STATUS_INVALID_ARGUMENT;
+    }
+    mmap_mm_hint = hint;
+    mmap_mm_length = length;
+    mmap_mm_permissions = permissions;
+    mmap_mm_flags = flags;
+    if (mmap_mm_status == KERNEL_MM_STATUS_OK) {
+        *address = mmap_mm_result;
+    }
+    return mmap_mm_status;
+}
+
+enum kernel_mm_status __wrap_kernel_mm_munmap(
+    struct kernel_mm *mm,
+    uint64_t address,
+    uint64_t length)
+{
+    if (mm != (struct kernel_mm *)(uintptr_t)2U) {
+        return KERNEL_MM_STATUS_INVALID_ARGUMENT;
+    }
+    range_mm_address = address;
+    range_mm_length = length;
+    return munmap_mm_status;
+}
+
+enum kernel_mm_status __wrap_kernel_mm_mprotect(
+    struct kernel_mm *mm,
+    uint64_t address,
+    uint64_t length,
+    uint32_t permissions)
+{
+    if (mm != (struct kernel_mm *)(uintptr_t)2U) {
+        return KERNEL_MM_STATUS_INVALID_ARGUMENT;
+    }
+    range_mm_address = address;
+    range_mm_length = length;
+    range_mm_permissions = permissions;
+    return mprotect_mm_status;
 }
 
 static unsigned long result_changed(
@@ -213,6 +273,115 @@ static unsigned long run_brk_cases(void)
     return 0U;
 }
 
+static unsigned long run_memory_mapping_cases(void)
+{
+    struct kernel_task *caller = (struct kernel_task *)(uintptr_t)1U;
+    struct kernel_syscall_request request = {
+        .number = 222U,
+        .arguments = {UINT64_C(0x12000), UINT64_C(0x2345),
+                      3U, UINT64_C(0x22), UINT64_MAX, 0U},
+    };
+    struct kernel_syscall_result result;
+    unsigned long failures = 0U;
+
+    brk_borrow_status = KERNEL_TASK_STATUS_OK;
+    mmap_mm_status = KERNEL_MM_STATUS_OK;
+    mmap_mm_result = UINT64_C(0x3f000);
+    if (kernel_syscall_dispatch(caller, &request, &result) !=
+            KERNEL_SYSCALL_STATUS_OK ||
+        result_changed(&result, KERNEL_SYSCALL_ACTION_RETURN,
+                       INT64_C(0x3f000)) ||
+        mmap_mm_hint != UINT64_C(0x12000) ||
+        mmap_mm_length != UINT64_C(0x2345) ||
+        mmap_mm_permissions != (KERNEL_MM_READ | KERNEL_MM_WRITE) ||
+        mmap_mm_flags != 0U) {
+        failures++;
+    }
+    request.arguments[3] = UINT64_C(0x100022);
+    if (kernel_syscall_dispatch(caller, &request, &result) !=
+            KERNEL_SYSCALL_STATUS_OK ||
+        mmap_mm_flags != KERNEL_MM_MAP_FIXED_NOREPLACE) {
+        failures++;
+    }
+    mmap_mm_status = KERNEL_MM_STATUS_CONFLICT;
+    if (kernel_syscall_dispatch(caller, &request, &result) !=
+            KERNEL_SYSCALL_STATUS_OK ||
+        result_changed(&result, KERNEL_SYSCALL_ACTION_RETURN, -17)) {
+        failures++;
+    }
+    request.arguments[3] = UINT64_C(0x21);
+    if (kernel_syscall_dispatch(caller, &request, &result) !=
+            KERNEL_SYSCALL_STATUS_OK ||
+        result_changed(&result, KERNEL_SYSCALL_ACTION_RETURN, -95)) {
+        failures++;
+    }
+    request.arguments[3] = UINT64_C(0x80000022);
+    if (kernel_syscall_dispatch(caller, &request, &result) !=
+            KERNEL_SYSCALL_STATUS_OK ||
+        result_changed(&result, KERNEL_SYSCALL_ACTION_RETURN, -22)) {
+        failures++;
+    }
+
+    request.number = 215U;
+    request.arguments[0] = UINT64_C(0x23000);
+    request.arguments[1] = UINT64_C(0x3456);
+    munmap_mm_status = KERNEL_MM_STATUS_OK;
+    if (kernel_syscall_dispatch(caller, &request, &result) !=
+            KERNEL_SYSCALL_STATUS_OK ||
+        result_changed(&result, KERNEL_SYSCALL_ACTION_RETURN, 0) ||
+        range_mm_address != UINT64_C(0x23000) ||
+        range_mm_length != UINT64_C(0x3456)) {
+        failures++;
+    }
+
+    request.number = 226U;
+    request.arguments[0] = UINT64_C(0x34000);
+    request.arguments[1] = UINT64_C(0x4567);
+    request.arguments[2] = 2U;
+    mprotect_mm_status = KERNEL_MM_STATUS_NOT_MAPPED;
+    if (kernel_syscall_dispatch(caller, &request, &result) !=
+            KERNEL_SYSCALL_STATUS_OK ||
+        result_changed(&result, KERNEL_SYSCALL_ACTION_RETURN, -12) ||
+        range_mm_address != UINT64_C(0x34000) ||
+        range_mm_length != UINT64_C(0x4567) ||
+        range_mm_permissions != KERNEL_MM_WRITE) {
+        failures++;
+    }
+
+    result.action = KERNEL_SYSCALL_ACTION_EXIT;
+    result.value = INT64_C(0x55667788);
+    mprotect_mm_status = KERNEL_MM_STATUS_STATE;
+    if (kernel_syscall_dispatch(caller, &request, &result) !=
+            KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT ||
+        result_changed(&result,
+                       KERNEL_SYSCALL_ACTION_EXIT,
+                       INT64_C(0x55667788))) {
+        failures++;
+    }
+    request.number = 222U;
+    request.arguments[2] = 3U;
+    request.arguments[3] = UINT64_C(0x22);
+    request.arguments[5] = 0U;
+    mmap_mm_status = KERNEL_MM_STATUS_STATE;
+    if (kernel_syscall_dispatch(caller, &request, &result) !=
+            KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT ||
+        result_changed(&result,
+                       KERNEL_SYSCALL_ACTION_EXIT,
+                       INT64_C(0x55667788))) {
+        failures++;
+    }
+    request.number = 215U;
+    munmap_mm_status = KERNEL_MM_STATUS_STATE;
+    if (kernel_syscall_dispatch(caller, &request, &result) !=
+            KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT ||
+        result_changed(&result,
+                       KERNEL_SYSCALL_ACTION_EXIT,
+                       INT64_C(0x55667788))) {
+        failures++;
+    }
+    return failures;
+}
+
 unsigned long run_syscall_cases(void)
 {
     unsigned long failures = run_invalid_argument_cases();
@@ -221,5 +390,6 @@ unsigned long run_syscall_cases(void)
     failures += run_unknown_cases();
     failures += run_process_decode_cases();
     failures += run_brk_cases();
+    failures += run_memory_mapping_cases();
     return failures;
 }

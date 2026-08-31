@@ -424,7 +424,8 @@ DEPS := \
 	test-references test-riscv test-sv39-fault-riscv test-sv39-riscv \
 	test-syscall-riscv test-timer-riscv test-trap-riscv \
 	test-trap-return-riscv test-user-fatal-riscv test-mm-riscv \
-	test-uaccess-riscv test-user-riscv test-vma-riscv test-brk-riscv
+	test-uaccess-riscv test-user-riscv test-vma-riscv test-brk-riscv \
+	test-mmap-riscv
 
 all: $(KERNEL_RV)
 
@@ -572,6 +573,9 @@ $(SCHEDULER_BOOT_TEST_KERNEL_RV): $(SCHEDULER_BOOT_TEST_OBJECTS) \
 $(SYSCALL_TEST_KERNEL_RV): $(SYSCALL_TEST_OBJECTS) arch/riscv/linker.ld
 	$(CC) $(LDFLAGS) -Wl,--wrap=kernel_task_mm_borrow_mutable \
 		-Wl,--wrap=kernel_mm_brk \
+		-Wl,--wrap=kernel_mm_mmap_anonymous \
+		-Wl,--wrap=kernel_mm_munmap \
+		-Wl,--wrap=kernel_mm_mprotect \
 		-Wl,-Map,$(BUILD_DIR)/tests/kernel-syscall-rv.map \
 		-o $@ $(SYSCALL_TEST_OBJECTS)
 
@@ -920,6 +924,9 @@ test-syscall-riscv: $(SYSCALL_TEST_KERNEL_RV)
 test-brk-riscv: test-sv39-riscv test-vma-riscv \
 		test-user-elf-cases-riscv test-syscall-riscv \
 		test-root-init-riscv
+
+test-mmap-riscv: test-sv39-riscv test-vma-riscv \
+		test-syscall-riscv test-root-init-riscv
 
 test-elf64-riscv: $(ELF64_TEST_KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) ELF64_TEST_KERNEL_RV=$< \

@@ -33,5 +33,13 @@ if [ "$(grep -cxF 'BoarOS: VMA cases result=0x0' "$output" || true)" -ne 1 ]; th
     echo "VMA cases did not report success" >&2
     exit 1
 fi
+for count in 1 64 1024; do
+    if ! grep -qE "^BoarOS: VMA lookup cycles n=$count 0x[0-9a-f]+$" \
+        "$output"; then
+        tail -n 80 "$output" >&2
+        echo "VMA lookup baseline missing for n=$count" >&2
+        exit 1
+    fi
+done
 
 echo "RISC-V VMA cases passed"

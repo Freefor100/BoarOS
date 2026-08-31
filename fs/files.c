@@ -393,7 +393,7 @@ static enum kernel_files_status finish_open_path(
 enum kernel_files_status kernel_files_openat(
     struct kernel_files *files,
     const struct kernel_fs_context *fs,
-    const struct kernel_mm *mm,
+    struct kernel_mm *mm,
     int64_t dirfd,
     uint64_t user_path,
     uint64_t flags,
@@ -543,7 +543,7 @@ static struct kernel_open_file_description *lookup_description(
 
 enum kernel_files_status kernel_files_read(
     struct kernel_files *files,
-    const struct kernel_mm *mm,
+    struct kernel_mm *mm,
     int64_t fd,
     uint64_t user_buffer,
     uint64_t count,

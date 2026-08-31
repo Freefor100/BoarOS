@@ -32,7 +32,7 @@
 
 可执行文件先于参数向量读取，因此不存在的文件即使配合坏 `argv` 也先返回 `-ENOENT`。空路径返回 `-ENOENT`，不可读用户地址返回 `-EFAULT`，路径无 NUL 返回 `-ENAMETOOLONG`，目录、非普通文件或没有任何执行位返回 `-EACCES`。当前静态 ELF 格式、架构或布局不支持时返回 `-ENOEXEC`；分配失败返回 `-ENOMEM`，参数/环境字符串、指针表、auxv、`AT_EXECFN` 和对齐合计超过 128 KiB 返回 `-E2BIG`。
 
-`argv==NULL` 或首项为 NULL 会规范化成一个空的 `argv[0]`；`envp==NULL` 表示空环境。参数向量和每条字符串都按用户页逐段复制，任何用户指针只读取一次进入内核所有的快照；之后旧地址空间可以在提交时安全替换。当前单 hart 没有并发映射修改；引入 SMP、COW 或用户 `unmap` 后，这个快照过程必须纳入 MM 读侧稳定协议。
+`argv==NULL` 或首项为 NULL 会规范化成一个空的 `argv[0]`；`envp==NULL` 表示空环境。参数向量和每条字符串都按用户页逐段复制，任何用户指针只读取一次进入内核所有的快照；之后旧地址空间可以在提交时安全替换。当前单 hart、单成员线程组不会在快照期间并发执行 `unmap/mprotect`；引入共享 MM、SMP 或 COW 后，这个过程必须纳入 MM 读侧稳定协议。
 
 新地址空间转入 MM 后，RISC-V 后端在 executable file 仍由事务持有时登记按页权限合并的匿名 ELF VMA 和完整栈 reserve VMA；因此后续缺页或 VMA 操作有逻辑区间，而不是只观察已驻留 PTE。普通 Linux 失败保持当前 MM、寄存器、PID/TID、cwd、文件表和所有 fd 不变，并从原 `ECALL` 的下一条指令返回负 errno。已分配的新映像和临时缓冲区由附着在 task 上的事务清理；VMA metadata、物理页或其他资源释放暂时失败时 owner 仍保存在事务中，由下次 exec 或退出 reaper 重试。
 

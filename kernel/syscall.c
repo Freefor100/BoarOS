@@ -19,14 +19,33 @@
 #define LINUX_SYSCALL_GETPPID 173U
 #define LINUX_SYSCALL_GETTID 178U
 #define LINUX_SYSCALL_BRK 214U
+#define LINUX_SYSCALL_MUNMAP 215U
 #define LINUX_SYSCALL_CLONE 220U
 #define LINUX_SYSCALL_EXECVE 221U
+#define LINUX_SYSCALL_MMAP 222U
+#define LINUX_SYSCALL_MPROTECT 226U
 #define LINUX_SYSCALL_WAIT4 260U
 #define LINUX_EXIT_STATUS_MASK UINT64_C(0xff)
 #define LINUX_CLONE_SIGNAL_MASK UINT64_C(0xff)
 #define LINUX_SIGCHLD UINT64_C(17)
 #define LINUX_CLONE_KNOWN_FLAGS UINT64_C(0x3ffffffff)
 #define LINUX_UTS_FIELD_SIZE 65U
+#define LINUX_PROT_READ UINT64_C(0x1)
+#define LINUX_PROT_WRITE UINT64_C(0x2)
+#define LINUX_PROT_EXEC UINT64_C(0x4)
+#define LINUX_MAP_SHARED UINT64_C(0x1)
+#define LINUX_MAP_PRIVATE UINT64_C(0x2)
+#define LINUX_MAP_TYPE_MASK UINT64_C(0x3)
+#define LINUX_MAP_FIXED UINT64_C(0x10)
+#define LINUX_MAP_ANONYMOUS UINT64_C(0x20)
+#define LINUX_MAP_NORESERVE UINT64_C(0x4000)
+#define LINUX_MAP_POPULATE UINT64_C(0x8000)
+#define LINUX_MAP_STACK UINT64_C(0x20000)
+#define LINUX_MAP_FIXED_NOREPLACE UINT64_C(0x100000)
+#define LINUX_MAP_KNOWN_FLAGS                                             \
+    (LINUX_MAP_TYPE_MASK | LINUX_MAP_FIXED | LINUX_MAP_ANONYMOUS |       \
+     LINUX_MAP_NORESERVE | LINUX_MAP_POPULATE | LINUX_MAP_STACK |        \
+     LINUX_MAP_FIXED_NOREPLACE)
 
 #ifndef BOAROS_UTS_MACHINE
 #error "BOAROS_UTS_MACHINE must name the Linux architecture"
@@ -59,12 +78,12 @@ static enum kernel_syscall_status decode_uname(
     uint64_t user_address,
     struct kernel_syscall_result *decoded)
 {
-    const struct kernel_mm *mm;
+    struct kernel_mm *mm;
     size_t copied;
     enum kernel_task_status task_status;
     enum kernel_uaccess_status access_status;
 
-    task_status = kernel_task_mm_borrow(caller, &mm);
+    task_status = kernel_task_mm_borrow_mutable(caller, &mm);
     if (task_status != KERNEL_TASK_STATUS_OK) {
         return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     }
@@ -94,7 +113,7 @@ static enum kernel_syscall_status decode_openat(
 {
     struct kernel_files *files;
     const struct kernel_fs_context *fs;
-    const struct kernel_mm *mm;
+    struct kernel_mm *mm;
     int64_t linux_result;
     enum kernel_task_status task_status;
 
@@ -107,7 +126,8 @@ static enum kernel_syscall_status decode_openat(
     if (task_status != KERNEL_TASK_STATUS_OK ||
         kernel_task_fs_context_borrow(caller, &fs) !=
             KERNEL_TASK_STATUS_OK ||
-        kernel_task_mm_borrow(caller, &mm) != KERNEL_TASK_STATUS_OK ||
+        kernel_task_mm_borrow_mutable(caller, &mm) !=
+            KERNEL_TASK_STATUS_OK ||
         kernel_files_openat(files,
                             fs,
                             mm,
@@ -129,7 +149,7 @@ static enum kernel_syscall_status decode_read(
     struct kernel_syscall_result *decoded)
 {
     struct kernel_files *files;
-    const struct kernel_mm *mm;
+    struct kernel_mm *mm;
     int64_t linux_result;
     enum kernel_task_status task_status;
 
@@ -140,7 +160,8 @@ static enum kernel_syscall_status decode_read(
         return KERNEL_SYSCALL_STATUS_OK;
     }
     if (task_status != KERNEL_TASK_STATUS_OK ||
-        kernel_task_mm_borrow(caller, &mm) != KERNEL_TASK_STATUS_OK ||
+        kernel_task_mm_borrow_mutable(caller, &mm) !=
+            KERNEL_TASK_STATUS_OK ||
         kernel_files_read(files,
                           mm,
                           (int64_t)request->arguments[0],
@@ -217,6 +238,156 @@ static enum kernel_syscall_status decode_brk(
     }
     decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
     decoded->value = (int64_t)program_break;
+    return KERNEL_SYSCALL_STATUS_OK;
+}
+
+static uint32_t mm_permissions_from_linux(uint64_t protections)
+{
+    uint32_t permissions = 0U;
+
+    if ((protections & LINUX_PROT_READ) != 0U) {
+        permissions |= KERNEL_MM_READ;
+    }
+    if ((protections & LINUX_PROT_WRITE) != 0U) {
+        permissions |= KERNEL_MM_WRITE;
+    }
+    if ((protections & LINUX_PROT_EXEC) != 0U) {
+        permissions |= KERNEL_MM_EXECUTE;
+    }
+    return permissions;
+}
+
+static int64_t mmap_error(enum kernel_mm_status status)
+{
+    if (status == KERNEL_MM_STATUS_NO_MEMORY) {
+        return -KERNEL_ENOMEM;
+    }
+    if (status == KERNEL_MM_STATUS_CONFLICT) {
+        return -KERNEL_EEXIST;
+    }
+    return -KERNEL_EINVAL;
+}
+
+static enum kernel_syscall_status decode_mmap(
+    struct kernel_task *caller,
+    const struct kernel_syscall_request *request,
+    struct kernel_syscall_result *decoded)
+{
+    struct kernel_mm *mm;
+    uint64_t protections = request->arguments[2];
+    uint64_t flags = request->arguments[3];
+    uint64_t mapped_address;
+    uint32_t mm_flags = 0U;
+    enum kernel_mm_status status;
+
+    decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+    if ((protections & ~(LINUX_PROT_READ | LINUX_PROT_WRITE |
+                         LINUX_PROT_EXEC)) != 0U ||
+        (flags & ~LINUX_MAP_KNOWN_FLAGS) != 0U ||
+        ((flags & LINUX_MAP_FIXED) != 0U &&
+         (flags & LINUX_MAP_FIXED_NOREPLACE) != 0U) ||
+        request->arguments[5] != 0U) {
+        decoded->value = -KERNEL_EINVAL;
+        return KERNEL_SYSCALL_STATUS_OK;
+    }
+    if ((flags & LINUX_MAP_TYPE_MASK) != LINUX_MAP_PRIVATE ||
+        (flags & LINUX_MAP_ANONYMOUS) == 0U ||
+        (flags & LINUX_MAP_POPULATE) != 0U) {
+        decoded->value = -KERNEL_ENOTSUP;
+        return KERNEL_SYSCALL_STATUS_OK;
+    }
+    if ((flags & LINUX_MAP_FIXED) != 0U) {
+        mm_flags = KERNEL_MM_MAP_FIXED;
+    } else if ((flags & LINUX_MAP_FIXED_NOREPLACE) != 0U) {
+        mm_flags = KERNEL_MM_MAP_FIXED_NOREPLACE;
+    }
+    if (kernel_task_mm_borrow_mutable(caller, &mm) !=
+        KERNEL_TASK_STATUS_OK) {
+        return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    }
+    status = kernel_mm_mmap_anonymous(
+        mm,
+        request->arguments[0],
+        request->arguments[1],
+        mm_permissions_from_linux(protections),
+        mm_flags,
+        &mapped_address);
+    if (status != KERNEL_MM_STATUS_OK &&
+        status != KERNEL_MM_STATUS_INVALID_ARGUMENT &&
+        status != KERNEL_MM_STATUS_NO_MEMORY &&
+        status != KERNEL_MM_STATUS_CONFLICT) {
+        return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    }
+    decoded->value = status == KERNEL_MM_STATUS_OK
+                         ? (int64_t)mapped_address
+                         : mmap_error(status);
+    return KERNEL_SYSCALL_STATUS_OK;
+}
+
+static enum kernel_syscall_status decode_munmap(
+    struct kernel_task *caller,
+    const struct kernel_syscall_request *request,
+    struct kernel_syscall_result *decoded)
+{
+    struct kernel_mm *mm;
+    enum kernel_mm_status status;
+
+    if (kernel_task_mm_borrow_mutable(caller, &mm) !=
+        KERNEL_TASK_STATUS_OK) {
+        return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    }
+    status = kernel_mm_munmap(mm,
+                              request->arguments[0],
+                              request->arguments[1]);
+    if (status != KERNEL_MM_STATUS_OK &&
+        status != KERNEL_MM_STATUS_INVALID_ARGUMENT &&
+        status != KERNEL_MM_STATUS_NO_MEMORY) {
+        return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    }
+    decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+    decoded->value = status == KERNEL_MM_STATUS_OK
+                         ? 0
+                         : mmap_error(status);
+    return KERNEL_SYSCALL_STATUS_OK;
+}
+
+static enum kernel_syscall_status decode_mprotect(
+    struct kernel_task *caller,
+    const struct kernel_syscall_request *request,
+    struct kernel_syscall_result *decoded)
+{
+    struct kernel_mm *mm;
+    uint64_t protections = request->arguments[2];
+    enum kernel_mm_status status;
+
+    decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+    if ((protections & ~(LINUX_PROT_READ | LINUX_PROT_WRITE |
+                         LINUX_PROT_EXEC)) != 0U) {
+        decoded->value = -KERNEL_EINVAL;
+        return KERNEL_SYSCALL_STATUS_OK;
+    }
+    if (kernel_task_mm_borrow_mutable(caller, &mm) !=
+        KERNEL_TASK_STATUS_OK) {
+        return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    }
+    status = kernel_mm_mprotect(mm,
+                                request->arguments[0],
+                                request->arguments[1],
+                                mm_permissions_from_linux(protections));
+    if (status != KERNEL_MM_STATUS_OK &&
+        status != KERNEL_MM_STATUS_INVALID_ARGUMENT &&
+        status != KERNEL_MM_STATUS_NOT_MAPPED &&
+        status != KERNEL_MM_STATUS_NO_MEMORY) {
+        return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    }
+    if (status == KERNEL_MM_STATUS_NOT_MAPPED ||
+        status == KERNEL_MM_STATUS_NO_MEMORY) {
+        decoded->value = -KERNEL_ENOMEM;
+    } else {
+        decoded->value = status == KERNEL_MM_STATUS_OK
+                             ? 0
+                             : -KERNEL_EINVAL;
+    }
     return KERNEL_SYSCALL_STATUS_OK;
 }
 
@@ -304,6 +475,21 @@ enum kernel_syscall_status kernel_syscall_dispatch(
         if (decode_brk(caller,
                        request->arguments[0],
                        &decoded) != KERNEL_SYSCALL_STATUS_OK) {
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+        }
+    } else if (request->number == LINUX_SYSCALL_MUNMAP) {
+        if (decode_munmap(caller, request, &decoded) !=
+            KERNEL_SYSCALL_STATUS_OK) {
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+        }
+    } else if (request->number == LINUX_SYSCALL_MMAP) {
+        if (decode_mmap(caller, request, &decoded) !=
+            KERNEL_SYSCALL_STATUS_OK) {
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+        }
+    } else if (request->number == LINUX_SYSCALL_MPROTECT) {
+        if (decode_mprotect(caller, request, &decoded) !=
+            KERNEL_SYSCALL_STATUS_OK) {
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
         }
     } else if (request->number == LINUX_SYSCALL_EXECVE) {

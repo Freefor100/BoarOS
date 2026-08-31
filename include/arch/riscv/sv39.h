@@ -54,6 +54,7 @@ struct riscv_sv39_user_space {
     uint64_t root_address;
     uint32_t table_pages;
     uint32_t leaf_pages;
+    uint32_t protected_pages;
     uint32_t retired_pages;
     uint64_t cleanup_page_address;
     uint32_t cleanup_page_owned;
@@ -130,6 +131,17 @@ enum riscv_sv39_status riscv_sv39_user_unmap_owned_range(
     uint64_t start,
     uint64_t end,
     uint32_t *deferred_pages);
+
+/*
+ * Changes access for owned leaves in [start, end).  permissions == 0 keeps
+ * each physical page owned behind an invalid software PTE (PROT_NONE).
+ * Missing and retired leaves are unchanged; present leaves retain content.
+ */
+enum riscv_sv39_status riscv_sv39_user_protect_owned_range(
+    struct riscv_sv39_user_space *space,
+    uint64_t start,
+    uint64_t end,
+    uint32_t permissions);
 
 /* Retries retired-page release without changing any active mapping. */
 enum riscv_sv39_status riscv_sv39_user_reclaim_retired_range(

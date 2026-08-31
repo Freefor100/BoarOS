@@ -233,7 +233,7 @@ static enum exec_capture_status reserve_vector_slot(
 
 static enum exec_capture_status append_user_string(
     struct kernel_exec_transaction *transaction,
-    const struct kernel_mm *mm,
+    struct kernel_mm *mm,
     uint64_t user_string,
     struct kernel_exec_string *string,
     int64_t *linux_result)
@@ -288,7 +288,7 @@ static enum exec_capture_status append_user_string(
 
 static enum exec_capture_status capture_vector(
     struct kernel_exec_transaction *transaction,
-    const struct kernel_mm *mm,
+    struct kernel_mm *mm,
     uint64_t user_vector,
     int arguments,
     int64_t *linux_result)
@@ -428,7 +428,7 @@ enum kernel_exec_status kernel_execve_prepare(
     uint64_t user_envp,
     int64_t *linux_result)
 {
-    const struct kernel_mm *mm;
+    struct kernel_mm *mm;
     struct kernel_files *files;
     const struct kernel_fs_context *fs;
     struct kernel_exec_transaction *transaction;
@@ -449,7 +449,8 @@ enum kernel_exec_status kernel_execve_prepare(
     if (exec_status != KERNEL_EXEC_STATUS_OK) {
         return KERNEL_EXEC_STATUS_STATE;
     }
-    if (kernel_task_mm_borrow(task, &mm) != KERNEL_TASK_STATUS_OK ||
+    if (kernel_task_mm_borrow_mutable(task, &mm) !=
+            KERNEL_TASK_STATUS_OK ||
         kernel_task_files_borrow(task, &files) != KERNEL_TASK_STATUS_OK ||
         kernel_task_fs_context_borrow(task, &fs) != KERNEL_TASK_STATUS_OK) {
         *linux_result = -KERNEL_ENODEV;

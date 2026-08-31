@@ -62,6 +62,25 @@ enum kernel_mm_status kernel_mm_brk(
     uint64_t requested,
     uint64_t *result);
 
+enum kernel_mm_status kernel_mm_mmap_anonymous(
+    struct kernel_mm *mm,
+    uint64_t hint,
+    uint64_t length,
+    uint32_t permissions,
+    uint32_t flags,
+    uint64_t *address);
+
+enum kernel_mm_status kernel_mm_munmap(
+    struct kernel_mm *mm,
+    uint64_t address,
+    uint64_t length);
+
+enum kernel_mm_status kernel_mm_mprotect(
+    struct kernel_mm *mm,
+    uint64_t address,
+    uint64_t length,
+    uint32_t permissions);
+
 enum kernel_mm_status kernel_mm_resolve_user_fault(
     struct kernel_mm *mm,
     uint64_t virtual_address,
@@ -92,19 +111,25 @@ RISC-V 创建先分配并解析记录页，最后才把 LIVE Sv39 空间移入�
 
 `kernel_mm_brk()` 实现 raw Linux syscall 所需的返回语义：参数 0 查询当前值；落在起点以下、上界以上、溢出或因 VMA 冲突/metadata OOM 无法增长时，MM 保持不变并把原 break 写入结果，而不是产生负 errno。成功结果保留字节粒度；只有 VMA 和 PTE 操作向上按 4 KiB 对齐。
 
-跨页增长只把新增 `[old_page_end, new_page_end)` 登记为 RW anonymous `DEMAND_ZERO` heap VMA，不提前分配数据页。首次 U-mode load/store 复用普通匿名 fault 路径分配零页。跨页缩小要求该区间确实是从 break 起点连续延伸的 heap VMA，并要求目标 MM 当前活动；它先让范围内用户 PTE 失效并刷新本 hart TLB，再收缩/删除 VMA，最后提交精确 break。物理页释放失败不会恢复硬件映射：Sv39 以 invalid software-owned PTE 保留 owner，后续覆盖该范围的增长先重试释放，MM 最终销毁也会继续回收。
+跨页增长只把新增 `[old_page_end, new_page_end)` 登记为 RW anonymous `DEMAND_ZERO` heap VMA，不提前分配数据页。首次 U-mode load/store 复用普通匿名 fault 路径分配零页。跨页缩小通过通用区间编辑撤销目标范围，因此能容忍用户先用 `munmap` 打洞、用 `mprotect` 分段或用 fixed mmap 替换局部区域；它不再依赖一个从 break 起点连续延伸的阶段性 heap VMA。缩小先让范围内用户 PTE 失效并刷新本 hart TLB，再无分配地提交 VMA 删除和精确 break。物理页释放失败不会恢复硬件映射：Sv39 以 invalid software-owned PTE 保留 owner，后续覆盖该范围的增长先重试释放，MM 最终销毁也会继续回收。
+
+## 匿名映射与保护
+
+`kernel_mm_mmap_anonymous()` 当前实现 anonymous-private demand-zero 映射。非 fixed 请求优先使用空闲的页对齐 hint，否则在 heap 上界/栈 guard 以下 top-down 选址；`FIXED_NOREPLACE` 只检查冲突，`FIXED` 则撤销旧页和 VMA 后替换。长度向上按 4 KiB 对齐，返回地址只在成功时写入。RISC-V 的 W&&!R PTE 编码保留，因此仅写保护被规范化为 RW。
+
+`kernel_mm_munmap()` 采用 Linux 洞语义：输入范围中没有 VMA 或只覆盖部分 VMA 仍可成功；resident、`PROT_NONE` 和待释放页都由 Sv39 owner 状态处理。`kernel_mm_mprotect()` 要求整个范围无洞覆盖，先准备 VMA 拆分容量，再原地修改已有 PTE 权限，最后提交 metadata；长度 0 对齐地址直接成功。`PROT_NONE` 不释放物理页，恢复权限后仍看到原内容。
 
 ## 硬件用户缺页解析
 
-`kernel_mm_resolve_user_fault()` 只处理当前 hart 上已经激活的 LIVE MM，`access` 必须恰为 READ、WRITE、EXECUTE 之一。RISC-V 后端同时核对 MM record、生成的 `satp` 与硬件当前 `satp`，再按以下顺序检查用户范围、VMA、逻辑权限和现有 PTE。只有匿名 `DEMAND_ZERO` VMA 中尚无 PTE 的页可以分配；静态 ELF 的 `RESIDENT_REQUIRED` 空洞、VMA 外地址和权限冲突返回 `NOT_MAPPED`。
+`kernel_mm_resolve_user_fault()` 的 `access` 必须恰为 READ、WRITE、EXECUTE 之一。RISC-V 后端先检查用户范围、VMA、逻辑权限和现有 PTE；VMA 外地址、`PROT_NONE`/权限冲突和静态 ELF 的 `RESIDENT_REQUIRED` 空洞返回 `NOT_MAPPED`。只有确定需要为 anonymous `DEMAND_ZERO` VMA 建页时，才要求目标 MM 是本 hart 当前 `satp`，从而既不为非法软件访问分配，也能让 uaccess 对合法未驻留页复用同一解析器。
 
 成功路径按 4 KiB 对齐故障地址，分配并清零一页，以 VMA 的完整 R/W/X 权限建立 U-mode PTE，然后执行针对该虚拟页、ASID 0 的本地 `SFENCE.VMA`。dispatcher 保持 `sepc` 不变，`sret` 后硬件重试原 load/store/fetch。物理页耗尽精确返回 `NO_MEMORY`；页已经分配但回滚释放失败返回 `CLEANUP_REQUIRED`；PTE 已存在却仍产生允许权限的页故障、页表损坏或非活动 MM 都是内核状态错误，不能降级成用户 `SIGSEGV`。
 
-当前 scheduler 只把实际 U-mode 硬件页故障送入该入口。`uaccess` 的软件页表遍历不会隐式提交 demand-zero 页；这两条路径需要不同的异常恢复、锁和部分复制语义，后续应在 uaccess 自身的真实消费者阶段统一设计。
+scheduler 的 U-mode 硬件页故障和当前任务的 uaccess 都可进入该入口。uaccess 只在 `kernel_mm_lookup()` 报未驻留后尝试解析；合法页成功提交后重查 PTE，VMA 外或权限不符仍按用户 fault 处理。
 
 ## fork 与后续 COW 边界
 
-`kernel_mm_fork()` 当前使用 eager copy：遍历源 Sv39 用户树，为每个 4 KiB 用户叶子分配新物理页并复制内容，同时重建相同 VA 和权限的私有页表。内核高半区根项仍只借用稳定内核映射，不复制也不参与子 MM 的释放。成功后父子地址空间初始字节、VMA 和精确 break 相同，但任一方后续写页或调整 break 都不会改变另一方；已经从父 heap 撤销但仍等待释放的 retired 页不进入子地址空间。源 MM 始终保持 LIVE。
+`kernel_mm_fork()` 当前使用 eager copy：遍历源 Sv39 用户树，为每个 active 或 `PROT_NONE` 4 KiB owner 分配新物理页并复制内容，同时重建相同 VA 和逻辑权限；protected 页在子空间中仍保持硬件不可访问。内核高半区根项仍只借用稳定内核映射，不复制也不参与子 MM 的释放。成功后父子地址空间初始字节、VMA 和精确 break 相同，但任一方后续写页、改保护或调整 break 都不会改变另一方；retired 页不进入子地址空间。源 MM 始终保持 LIVE。
 
 创建失败时，目标句柄要么仍为 EMPTY，要么成为持有精确剩余 owner 的 CLEANUP；调用者必须按状态继续释放，不能只按错误码假定没有分配。测试同时核对映射、物理地址不等、双向写隔离、父先释放后子仍可用以及最终页数回到基线。
 
@@ -138,12 +163,13 @@ Scheduler 在用户任务创建时解析 MM、验证入口与栈权限，并缓�
 make test-mm-riscv
 make test-vma-riscv
 make test-brk-riscv
+make test-mmap-riscv
 make test-demand-page-riscv
 make test-user-riscv
 make test-user-elf-riscv
 make test-riscv
 ```
 
-MM 聚焦测试覆盖创建失败原子性、共享引用、移动、eager fork 的内容/权限复制与写隔离，以及页表部分回收、记录页访问/释放失败后的阶段化重试。VMA 聚焦测试还覆盖精确 break、跨页增长/缩小、拒绝结果、heap fault、release 失败后 owner 保留、带 retired 页的 fork 和 metadata 分配失败后目标恢复 EMPTY。`test-brk-riscv` 进一步汇总 ELF 初值、syscall 解码和真实 U-mode clone/exec/SIGSEGV/零页闭环。
+MM 聚焦测试覆盖创建失败原子性、共享引用、移动、eager fork 的内容/权限复制与写隔离，以及页表部分回收、记录页访问/释放失败后的阶段化重试。VMA 聚焦测试还覆盖精确 break、匿名映射区间编辑、打洞后的 brk、`PROT_NONE` fork、uaccess 补页、retired owner 和 metadata 失败。`test-mmap-riscv` 汇总 Sv39/VMA/syscall 并让真实 ext4 `/init` ELF 在 U-mode 完成 mmap/mprotect/munmap 生命周期。
 
-当前只有 RISC-V 后端；映射仍由 Sv39/4 KiB 用户页实现。普通 clone 已使用独立 MM，但尚无 COW 或 `CLONE_VM` 共享进程；`brk` 上界目前只由地址布局约束，尚未接入 `RLIMIT_DATA`/内存承诺策略。文件表、信号处理表和其他进程资源不属于 MM。
+当前只有 RISC-V 后端；映射仍由 Sv39/4 KiB 用户页实现。普通 clone 已使用独立 MM，但尚无 COW 或 `CLONE_VM` 共享进程；匿名映射没有 commit accounting/ASLR，file-backed/shared mmap 尚未实现；`brk` 上界目前只由地址布局约束，尚未接入 `RLIMIT_DATA`。文件表、信号处理表和其他进程资源不属于 MM。

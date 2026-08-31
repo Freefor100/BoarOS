@@ -11,6 +11,10 @@
 #define KERNEL_MM_EXECUTE (UINT32_C(1) << 2U)
 #define KERNEL_MM_USER (UINT32_C(1) << 3U)
 
+/* Architecture-neutral placement policy used by anonymous mmap. */
+#define KERNEL_MM_MAP_FIXED (UINT32_C(1) << 0U)
+#define KERNEL_MM_MAP_FIXED_NOREPLACE (UINT32_C(1) << 1U)
+
 enum kernel_mm_status {
     KERNEL_MM_STATUS_OK = 0,
     KERNEL_MM_STATUS_INVALID_ARGUMENT,
@@ -104,6 +108,27 @@ enum kernel_mm_status kernel_mm_brk(
     struct kernel_mm *mm,
     uint64_t requested,
     uint64_t *result);
+
+/* Anonymous private demand-zero mappings; length is rounded up to pages. */
+enum kernel_mm_status kernel_mm_mmap_anonymous(
+    struct kernel_mm *mm,
+    uint64_t hint,
+    uint64_t length,
+    uint32_t permissions,
+    uint32_t flags,
+    uint64_t *address);
+
+/* Linux range semantics: munmap tolerates holes; mprotect requires coverage. */
+enum kernel_mm_status kernel_mm_munmap(
+    struct kernel_mm *mm,
+    uint64_t address,
+    uint64_t length);
+
+enum kernel_mm_status kernel_mm_mprotect(
+    struct kernel_mm *mm,
+    uint64_t address,
+    uint64_t length,
+    uint32_t permissions);
 
 /*
  * Resolve one hardware user fault in the MM active on this hart.  access must
