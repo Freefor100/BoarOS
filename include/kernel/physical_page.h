@@ -16,6 +16,8 @@ enum physical_page_status {
 };
 
 typedef void *(*physical_page_access_fn)(uint64_t physical_address);
+typedef uint64_t (*physical_page_reclaim_fn)(void *context,
+                                             uint64_t target_pages);
 
 struct physical_page_metadata;
 
@@ -35,7 +37,10 @@ struct physical_page_allocator {
     uint32_t range_count;
     uint32_t initialized;
     uint32_t finalized;
+    uint32_t reclaiming;
     physical_page_access_fn access;
+    physical_page_reclaim_fn reclaimer;
+    void *reclaimer_context;
     struct physical_page_metadata *metadata;
     uint32_t free_heads[PHYSICAL_PAGE_MAX_ORDER + 1U];
     struct physical_page_range ranges[BOOT_MEMORY_MAX_USABLE_RANGES];
@@ -56,6 +61,14 @@ enum physical_page_status physical_page_allocator_finalize(
 int physical_page_allocator_is_finalized(
     const struct physical_page_allocator *allocator);
 
+enum physical_page_status physical_page_allocator_set_reclaimer(
+    struct physical_page_allocator *allocator,
+    physical_page_reclaim_fn reclaimer,
+    void *context);
+
+enum physical_page_status physical_page_allocator_clear_reclaimer(
+    struct physical_page_allocator *allocator);
+
 enum physical_page_status physical_page_allocate(
     struct physical_page_allocator *allocator,
     uint64_t *address);
@@ -68,6 +81,16 @@ enum physical_page_status physical_page_allocate_order(
 enum physical_page_status physical_page_release(
     struct physical_page_allocator *allocator,
     uint64_t address);
+
+/* Only finalized order-zero allocations may gain shared owners. */
+enum physical_page_status physical_page_acquire(
+    struct physical_page_allocator *allocator,
+    uint64_t address);
+
+enum physical_page_status physical_page_reference_count(
+    const struct physical_page_allocator *allocator,
+    uint64_t address,
+    uint32_t *references);
 
 enum physical_page_status physical_page_release_order(
     struct physical_page_allocator *allocator,

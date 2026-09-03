@@ -882,6 +882,179 @@ static void test_single_page_api_uses_order_zero_after_finalize(void)
     }
 }
 
+struct reclaim_test_context {
+    struct physical_page_allocator *allocator;
+    uint64_t page;
+    uint64_t target_pages;
+    uint32_t calls;
+    enum physical_page_status nested_status;
+};
+
+static uint64_t release_one_page_reclaimer(void *opaque,
+                                           uint64_t target_pages)
+{
+    struct reclaim_test_context *context = opaque;
+
+    context->calls++;
+    context->target_pages = target_pages;
+    if (physical_page_release(context->allocator, context->page) !=
+        PHYSICAL_PAGE_STATUS_OK) {
+        return 0U;
+    }
+    return 1U;
+}
+
+static uint64_t recursive_reclaimer(void *opaque, uint64_t target_pages)
+{
+    struct reclaim_test_context *context = opaque;
+    uint64_t ignored;
+
+    context->calls++;
+    context->target_pages = target_pages;
+    context->nested_status =
+        physical_page_allocate(context->allocator, &ignored);
+    return 0U;
+}
+
+static void test_finalized_order_zero_reference_counts(void)
+{
+    struct physical_page_allocator allocator;
+    uint64_t owned_page;
+    uint64_t page;
+    uint64_t available;
+    uint32_t references = UINT32_C(0xfeedface);
+    enum physical_page_status actual =
+        init_coalescing_buddy(&allocator, &owned_page);
+
+    if (actual != PHYSICAL_PAGE_STATUS_OK ||
+        physical_page_allocate(&allocator, &page) !=
+            PHYSICAL_PAGE_STATUS_OK ||
+        physical_page_reference_count(&allocator, page, &references) !=
+            PHYSICAL_PAGE_STATUS_OK ||
+        references != 1U) {
+        fail_page(95U, PHYSICAL_PAGE_STATUS_OK, actual);
+    }
+    available = physical_page_available(&allocator);
+    if (physical_page_acquire(&allocator, page) !=
+            PHYSICAL_PAGE_STATUS_OK ||
+        physical_page_reference_count(&allocator, page, &references) !=
+            PHYSICAL_PAGE_STATUS_OK ||
+        references != 2U ||
+        physical_page_available(&allocator) != available) {
+        fail_page(96U, PHYSICAL_PAGE_STATUS_OK,
+                  PHYSICAL_PAGE_STATUS_INVALID);
+    }
+    if (physical_page_release(&allocator, page) !=
+            PHYSICAL_PAGE_STATUS_OK ||
+        physical_page_reference_count(&allocator, page, &references) !=
+            PHYSICAL_PAGE_STATUS_OK ||
+        references != 1U ||
+        physical_page_available(&allocator) != available) {
+        fail_page(97U, PHYSICAL_PAGE_STATUS_OK,
+                  PHYSICAL_PAGE_STATUS_INVALID);
+    }
+    if (physical_page_release(&allocator, page) !=
+            PHYSICAL_PAGE_STATUS_OK ||
+        physical_page_available(&allocator) != available + 1U ||
+        physical_page_reference_count(&allocator, page, &references) !=
+            PHYSICAL_PAGE_STATUS_DOUBLE_FREE) {
+        fail_page(98U, PHYSICAL_PAGE_STATUS_DOUBLE_FREE,
+                  PHYSICAL_PAGE_STATUS_INVALID);
+    }
+
+    if (physical_page_allocate_order(&allocator, 1U, &page) !=
+            PHYSICAL_PAGE_STATUS_OK ||
+        physical_page_acquire(&allocator, page) !=
+            PHYSICAL_PAGE_STATUS_STATE ||
+        physical_page_release_order(&allocator, page, 1U) !=
+            PHYSICAL_PAGE_STATUS_OK ||
+        physical_page_release(&allocator, owned_page) !=
+            PHYSICAL_PAGE_STATUS_OK) {
+        fail_page(99U, PHYSICAL_PAGE_STATUS_STATE,
+                  PHYSICAL_PAGE_STATUS_INVALID);
+    }
+}
+
+static void test_finalized_allocator_reclaims_once_and_guards_recursion(void)
+{
+    struct physical_page_allocator allocator;
+    struct reclaim_test_context context;
+    uint64_t owned_page;
+    uint64_t pages[4];
+    uint64_t reclaimed;
+    uint32_t index;
+    enum physical_page_status actual =
+        init_coalescing_buddy(&allocator, &owned_page);
+
+    if (actual != PHYSICAL_PAGE_STATUS_OK) {
+        fail_page(100U, PHYSICAL_PAGE_STATUS_OK, actual);
+    }
+    for (index = 0U; index < 4U; index++) {
+        if (physical_page_allocate(&allocator, &pages[index]) !=
+            PHYSICAL_PAGE_STATUS_OK) {
+            fail_page(101U, PHYSICAL_PAGE_STATUS_OK,
+                      PHYSICAL_PAGE_STATUS_EMPTY);
+        }
+    }
+
+    context.allocator = &allocator;
+    context.page = pages[3];
+    context.target_pages = 0U;
+    context.calls = 0U;
+    context.nested_status = PHYSICAL_PAGE_STATUS_OK;
+    if (physical_page_allocator_set_reclaimer(
+            &allocator, release_one_page_reclaimer, &context) !=
+        PHYSICAL_PAGE_STATUS_OK) {
+        fail_page(102U, PHYSICAL_PAGE_STATUS_OK,
+                  PHYSICAL_PAGE_STATUS_INVALID);
+    }
+    reclaimed = UINT64_C(0x1122334455667788);
+    actual = physical_page_allocate(&allocator, &reclaimed);
+    if (actual != PHYSICAL_PAGE_STATUS_OK || reclaimed != pages[3] ||
+        context.calls != 1U || context.target_pages != 1U) {
+        fail_page(103U, PHYSICAL_PAGE_STATUS_OK, actual);
+    }
+    if (physical_page_allocator_clear_reclaimer(&allocator) !=
+        PHYSICAL_PAGE_STATUS_OK) {
+        fail_page(104U, PHYSICAL_PAGE_STATUS_OK,
+                  PHYSICAL_PAGE_STATUS_INVALID);
+    }
+
+    context.calls = 0U;
+    context.target_pages = 0U;
+    if (physical_page_allocator_set_reclaimer(
+            &allocator, recursive_reclaimer, &context) !=
+        PHYSICAL_PAGE_STATUS_OK) {
+        fail_page(105U, PHYSICAL_PAGE_STATUS_OK,
+                  PHYSICAL_PAGE_STATUS_INVALID);
+    }
+    actual = physical_page_allocate(&allocator, &reclaimed);
+    if (actual != PHYSICAL_PAGE_STATUS_EMPTY || context.calls != 1U ||
+        context.target_pages != 1U ||
+        context.nested_status != PHYSICAL_PAGE_STATUS_EMPTY) {
+        fail_page(106U, PHYSICAL_PAGE_STATUS_EMPTY, actual);
+    }
+    if (physical_page_allocator_clear_reclaimer(&allocator) !=
+            PHYSICAL_PAGE_STATUS_OK ||
+        physical_page_release(&allocator, reclaimed) !=
+            PHYSICAL_PAGE_STATUS_OK) {
+        fail_page(107U, PHYSICAL_PAGE_STATUS_OK,
+                  PHYSICAL_PAGE_STATUS_INVALID);
+    }
+    for (index = 0U; index < 3U; index++) {
+        if (physical_page_release(&allocator, pages[index]) !=
+            PHYSICAL_PAGE_STATUS_OK) {
+            fail_page(108U, PHYSICAL_PAGE_STATUS_OK,
+                      PHYSICAL_PAGE_STATUS_INVALID);
+        }
+    }
+    if (physical_page_release(&allocator, owned_page) !=
+        PHYSICAL_PAGE_STATUS_OK) {
+        fail_page(109U, PHYSICAL_PAGE_STATUS_OK,
+                  PHYSICAL_PAGE_STATUS_INVALID);
+    }
+}
+
 void run_physical_page_tests(void)
 {
     test_aligns_allocates_and_reports_exhaustion();
@@ -898,4 +1071,6 @@ void run_physical_page_tests(void)
     test_buddy_rejects_invalid_ownership();
     test_failed_finalize_preserves_bootstrap_allocator();
     test_single_page_api_uses_order_zero_after_finalize();
+    test_finalized_order_zero_reference_counts();
+    test_finalized_allocator_reclaims_once_and_guards_recursion();
 }
