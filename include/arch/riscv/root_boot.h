@@ -8,6 +8,7 @@
 #include <kernel/fs_context.h>
 #include <kernel/heap.h>
 #include <kernel/mm.h>
+#include <kernel/page_cache.h>
 #include <kernel/physical_page.h>
 #include <kernel/scheduler.h>
 #include <kernel/vfs.h>
@@ -39,6 +40,7 @@ enum riscv_root_boot_state {
 
 struct riscv_root_boot {
     struct kernel_heap heap;
+    struct kernel_page_cache page_cache;
     struct riscv_virtio_mmio_block device;
     struct kernel_vfs_mount mount;
     struct kernel_vfs_file cleanup_file;

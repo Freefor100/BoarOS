@@ -1,8 +1,10 @@
 #include "lwext4_port.h"
+#include "vfs_internal.h"
 
 #include <kernel/block.h>
 #include <kernel/errno.h>
 #include <kernel/heap.h>
+#include <kernel/page_cache.h>
 #include <kernel/vfs.h>
 
 #include <ext4.h>
@@ -30,14 +32,23 @@ struct lwext4_mount_adapter {
     struct ext4_blockdev_iface interface;
     struct ext4_blockdev device;
     unsigned char *physical_buffer;
-    uint32_t open_files;
+    struct kernel_page_cache *page_cache;
+    struct kernel_vfs_node *nodes;
+    struct kernel_vfs_node *cleanup_nodes;
+    uint32_t external_files;
     uint8_t registered;
     uint8_t mounted;
     uint8_t heap_bound;
 };
 
-struct lwext4_file_adapter {
+struct kernel_vfs_node {
+    struct kernel_vfs_node *next;
+    struct lwext4_mount_adapter *adapter;
+    struct kernel_vfs_mount *mount;
     ext4_file file;
+    uint64_t size;
+    uint32_t mode;
+    uint32_t references;
     uint8_t closed;
 };
 
@@ -160,12 +171,44 @@ static int release_mount_storage(struct kernel_vfs_mount *mount)
 static int cleanup_mount(struct kernel_vfs_mount *mount)
 {
     struct lwext4_mount_adapter *adapter = mount->private_data;
+    struct kernel_vfs_node **cleanup_link;
     int result;
 
-    if (adapter->open_files != 0U) {
+    if (adapter->external_files != 0U) {
         return -KERNEL_EBUSY;
     }
     mount->state = VFS_MOUNT_STATE_CLEANUP;
+    if (adapter->page_cache != 0) {
+        enum kernel_page_cache_status cache_status =
+            kernel_page_cache_purge_mount(adapter->page_cache, mount);
+
+        if (cache_status != KERNEL_PAGE_CACHE_STATUS_OK) {
+            return cache_status == KERNEL_PAGE_CACHE_STATUS_STATE
+                       ? -KERNEL_EBUSY : -KERNEL_EIO;
+        }
+    }
+    cleanup_link = &adapter->cleanup_nodes;
+    while (*cleanup_link != 0) {
+        struct kernel_vfs_node *node = *cleanup_link;
+        struct kernel_vfs_node *next = node->next;
+
+        if (!node->closed) {
+            result = ext4_fclose(&node->file);
+            if (result != EOK) {
+                return lwext4_error(result);
+            }
+            node->closed = 1U;
+        }
+        if (kernel_heap_release(adapter->heap, node) !=
+            KERNEL_HEAP_STATUS_OK) {
+            cleanup_link = &node->next;
+        } else {
+            *cleanup_link = next;
+        }
+    }
+    if (adapter->cleanup_nodes != 0 || adapter->nodes != 0) {
+        return -KERNEL_EIO;
+    }
     if (adapter->mounted) {
         result = ext4_umount(LWEXT4_MOUNT_POINT);
         if (result != EOK) {
@@ -186,7 +229,8 @@ static int cleanup_mount(struct kernel_vfs_mount *mount)
 
 int kernel_vfs_mount_root_readonly(struct kernel_vfs_mount *mount,
                                    struct kernel_block_device *block,
-                                   struct kernel_heap *heap)
+                                   struct kernel_heap *heap,
+                                   struct kernel_page_cache *page_cache)
 {
     struct lwext4_mount_adapter *adapter;
     struct ext4_sblock *superblock;
@@ -196,7 +240,8 @@ int kernel_vfs_mount_root_readonly(struct kernel_vfs_mount *mount,
     if (mount == 0 || mount->state != VFS_MOUNT_STATE_EMPTY ||
         mount->private_data != 0 || block == 0 || block->read == 0 ||
         block->logical_block_size != LWEXT4_PHYSICAL_BLOCK_SIZE ||
-        heap == 0) {
+        heap == 0 || page_cache == 0 ||
+        page_cache->state != KERNEL_PAGE_CACHE_LIVE) {
         return -KERNEL_EINVAL;
     }
     if (!boaros_lwext4_heap_bind(heap)) {
@@ -214,6 +259,7 @@ int kernel_vfs_mount_root_readonly(struct kernel_vfs_mount *mount,
     }
     adapter->heap = heap;
     adapter->block = block;
+    adapter->page_cache = page_cache;
     adapter->heap_bound = 1U;
     mount->private_data = adapter;
     mount->state = VFS_MOUNT_STATE_CLEANUP;
@@ -286,7 +332,8 @@ int kernel_vfs_open(struct kernel_vfs_mount *mount,
                     struct kernel_vfs_file *file)
 {
     struct lwext4_mount_adapter *adapter;
-    struct lwext4_file_adapter *handle;
+    struct kernel_vfs_node *node;
+    struct kernel_vfs_node *existing;
     enum kernel_heap_status heap_status;
     uint32_t mode;
     int result;
@@ -307,24 +354,56 @@ int kernel_vfs_open(struct kernel_vfs_mount *mount,
     }
     heap_status = kernel_heap_allocate_zeroed(adapter->heap,
                                               1U,
-                                              sizeof(*handle),
-                                              (void **)&handle);
+                                              sizeof(*node),
+                                              (void **)&node);
     if (heap_status != KERNEL_HEAP_STATUS_OK) {
         return heap_status == KERNEL_HEAP_STATUS_EMPTY ?
                    -KERNEL_ENOMEM : -KERNEL_EIO;
     }
 
-    result = ext4_fopen(&handle->file, path, "r");
+    result = ext4_fopen(&node->file, path, "r");
     if (result != EOK) {
-        (void)kernel_heap_release(adapter->heap, handle);
+        (void)kernel_heap_release(adapter->heap, node);
         return lwext4_error(result);
     }
-    file->private_data = handle;
+    for (existing = adapter->nodes;
+         existing != 0;
+         existing = existing->next) {
+        if (existing->file.inode == node->file.inode) {
+            break;
+        }
+    }
+    if (existing != 0) {
+        result = ext4_fclose(&node->file);
+        node->closed = 1U;
+        if (result != EOK ||
+            kernel_heap_release(adapter->heap, node) !=
+                KERNEL_HEAP_STATUS_OK) {
+            node->next = adapter->cleanup_nodes;
+            adapter->cleanup_nodes = node;
+            return result != EOK ? lwext4_error(result)
+                                 : -KERNEL_EIO;
+        }
+        if (existing->references == UINT32_MAX) {
+            return -KERNEL_EOVERFLOW;
+        }
+        existing->references++;
+        node = existing;
+    } else {
+        node->adapter = adapter;
+        node->mount = mount;
+        node->size = ext4_fsize(&node->file);
+        node->mode = mode;
+        node->references = 1U;
+        node->next = adapter->nodes;
+        adapter->nodes = node;
+    }
+    file->private_data = node;
     file->mount = mount;
-    file->size = ext4_fsize(&handle->file);
-    file->mode = mode;
+    file->size = node->size;
+    file->mode = node->mode;
     file->state = VFS_FILE_STATE_LIVE;
-    adapter->open_files++;
+    adapter->external_files++;
     return 0;
 }
 
@@ -356,46 +435,16 @@ int kernel_vfs_pread(struct kernel_vfs_file *file,
                      size_t size,
                      size_t *bytes_read)
 {
-    struct lwext4_file_adapter *handle;
-    size_t requested;
-    size_t result_count;
-    int result;
-
     if (file == 0 || file->state != VFS_FILE_STATE_LIVE ||
         file->private_data == 0 || bytes_read == 0 ||
         (buffer == 0 && size != 0U)) {
         return -KERNEL_EINVAL;
     }
-    if (offset > INT64_MAX) {
-        return -KERNEL_EOVERFLOW;
-    }
-    if (offset >= file->size || size == 0U) {
-        *bytes_read = 0U;
-        return 0;
-    }
-
-    requested = size;
-    if ((uint64_t)requested > file->size - offset) {
-        requested = (size_t)(file->size - offset);
-    }
-    handle = file->private_data;
-    result = ext4_fseek(&handle->file, (int64_t)offset, SEEK_SET);
-    if (result != EOK) {
-        return lwext4_error(result);
-    }
-    result = ext4_fread(&handle->file,
-                        buffer,
-                        requested,
-                        &result_count);
-    if (result != EOK) {
-        return lwext4_error(result);
-    }
-    if (result_count > requested) {
-        return -KERNEL_EIO;
-    }
-
-    *bytes_read = result_count;
-    return 0;
+    return kernel_vfs_node_pread(file->private_data,
+                                 offset,
+                                 buffer,
+                                 size,
+                                 bytes_read);
 }
 
 static int vfs_source_read_at(void *context,
@@ -432,43 +481,162 @@ int kernel_vfs_file_read_source(struct kernel_vfs_file *file,
 
 int kernel_vfs_close(struct kernel_vfs_file *file)
 {
-    struct lwext4_file_adapter *handle;
     struct lwext4_mount_adapter *adapter;
-    enum kernel_heap_status heap_status;
-    int result;
+    struct kernel_vfs_node *node;
 
     if (file == 0 || file->private_data == 0 || file->mount == 0 ||
         (file->state != VFS_FILE_STATE_LIVE &&
          file->state != VFS_FILE_STATE_CLEANUP)) {
         return -KERNEL_EINVAL;
     }
-    handle = file->private_data;
+    node = file->private_data;
     adapter = file->mount->private_data;
     if (adapter == 0) {
         return -KERNEL_EIO;
     }
 
-    if (!handle->closed) {
-        result = ext4_fclose(&handle->file);
-        if (result != EOK) {
-            return lwext4_error(result);
-        }
-        handle->closed = 1U;
-        if (adapter->open_files == 0U) {
-            return -KERNEL_EIO;
-        }
-        adapter->open_files--;
-        file->state = VFS_FILE_STATE_CLEANUP;
-    }
-
-    heap_status = kernel_heap_release(adapter->heap, handle);
-    if (heap_status != KERNEL_HEAP_STATUS_OK) {
+    file->state = VFS_FILE_STATE_CLEANUP;
+    if (kernel_vfs_node_release(&node) != 0) {
         return -KERNEL_EIO;
     }
+    if (adapter->external_files == 0U) {
+        return -KERNEL_EIO;
+    }
+    adapter->external_files--;
     file->private_data = 0;
     file->mount = 0;
     file->size = 0U;
     file->mode = 0U;
     file->state = VFS_FILE_STATE_EMPTY;
     return 0;
+}
+
+struct kernel_vfs_node *kernel_vfs_file_node(
+    const struct kernel_vfs_file *file)
+{
+    if (file == 0 || file->state != VFS_FILE_STATE_LIVE ||
+        file->private_data == 0) {
+        return 0;
+    }
+    return file->private_data;
+}
+
+int kernel_vfs_node_acquire(struct kernel_vfs_node *node)
+{
+    if (node == 0 || node->references == 0U || node->closed ||
+        node->references == UINT32_MAX) {
+        return -KERNEL_EINVAL;
+    }
+    node->references++;
+    return 0;
+}
+
+int kernel_vfs_node_release(struct kernel_vfs_node **owner)
+{
+    struct kernel_vfs_node *node;
+    struct kernel_vfs_node **link;
+    int result;
+
+    if (owner == 0 || *owner == 0) {
+        return -KERNEL_EINVAL;
+    }
+    node = *owner;
+    if (node->references > 1U) {
+        node->references--;
+        *owner = 0;
+        return 0;
+    }
+    if (node->references == 1U) {
+        node->references = 0U;
+        link = &node->adapter->nodes;
+        while (*link != 0 && *link != node) {
+            link = &(*link)->next;
+        }
+        if (*link != node) {
+            return -KERNEL_EIO;
+        }
+        *link = node->next;
+        node->next = 0;
+    }
+    if (!node->closed) {
+        result = ext4_fclose(&node->file);
+        if (result != EOK) {
+            return lwext4_error(result);
+        }
+        node->closed = 1U;
+    }
+    if (kernel_heap_release(node->adapter->heap, node) !=
+        KERNEL_HEAP_STATUS_OK) {
+        return -KERNEL_EIO;
+    }
+    *owner = 0;
+    return 0;
+}
+
+int kernel_vfs_node_pread(struct kernel_vfs_node *node,
+                          uint64_t offset,
+                          void *buffer,
+                          size_t size,
+                          size_t *bytes_read)
+{
+    size_t requested;
+    size_t result_count;
+    int result;
+
+    if (node == 0 || node->references == 0U || node->closed ||
+        bytes_read == 0 || (buffer == 0 && size != 0U)) {
+        return -KERNEL_EINVAL;
+    }
+    if (offset > INT64_MAX) {
+        return -KERNEL_EOVERFLOW;
+    }
+    if (offset >= node->size || size == 0U) {
+        *bytes_read = 0U;
+        return 0;
+    }
+    requested = size;
+    if ((uint64_t)requested > node->size - offset) {
+        requested = (size_t)(node->size - offset);
+    }
+    result = ext4_fseek(&node->file, (int64_t)offset, SEEK_SET);
+    if (result != EOK) {
+        return lwext4_error(result);
+    }
+    result = ext4_fread(&node->file, buffer, requested, &result_count);
+    if (result != EOK) {
+        return lwext4_error(result);
+    }
+    if (result_count > requested) {
+        return -KERNEL_EIO;
+    }
+    *bytes_read = result_count;
+    return 0;
+}
+
+uint64_t kernel_vfs_node_size(const struct kernel_vfs_node *node)
+{
+    return node != 0 && node->references != 0U && !node->closed
+               ? node->size : 0U;
+}
+
+const struct kernel_vfs_mount *kernel_vfs_node_mount(
+    const struct kernel_vfs_node *node)
+{
+    return node != 0 ? node->mount : 0;
+}
+
+int kernel_vfs_files_share_node(const struct kernel_vfs_file *left,
+                                const struct kernel_vfs_file *right)
+{
+    struct kernel_vfs_node *left_node = kernel_vfs_file_node(left);
+
+    return left_node != 0 && left_node == kernel_vfs_file_node(right);
+}
+
+struct kernel_page_cache *kernel_vfs_file_page_cache(
+    const struct kernel_vfs_file *file)
+{
+    struct kernel_vfs_node *node = kernel_vfs_file_node(file);
+
+    return node != 0 ? node->adapter->page_cache : 0;
 }

@@ -20,6 +20,8 @@ struct kernel_vfs_mount {
     uint32_t state;
 };
 
+struct kernel_page_cache;
+
 struct kernel_vfs_file {
     void *private_data;
     struct kernel_vfs_mount *mount;
@@ -31,7 +33,8 @@ struct kernel_vfs_file {
 /* Returns zero or a negative Linux-compatible errno value. */
 int kernel_vfs_mount_root_readonly(struct kernel_vfs_mount *mount,
                                    struct kernel_block_device *block,
-                                   struct kernel_heap *heap);
+                                   struct kernel_heap *heap,
+                                   struct kernel_page_cache *page_cache);
 
 int kernel_vfs_unmount(struct kernel_vfs_mount *mount);
 
@@ -55,5 +58,8 @@ int kernel_vfs_file_read_source(struct kernel_vfs_file *file,
                                 struct kernel_read_source *source);
 
 int kernel_vfs_close(struct kernel_vfs_file *file);
+
+int kernel_vfs_files_share_node(const struct kernel_vfs_file *left,
+                                const struct kernel_vfs_file *right);
 
 #endif

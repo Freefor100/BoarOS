@@ -11,6 +11,7 @@ output="$work_dir/vfs.log"
 disk="$work_dir/root.img"
 dirty_disk="$work_dir/dirty-root.img"
 fixture="$work_dir/init"
+large_fixture="$work_dir/large"
 
 trap 'rm -rf "$work_dir"' EXIT HUP INT TERM
 
@@ -19,7 +20,7 @@ show_output()
     tail -n 120 "$output" >&2
 }
 
-for tool in truncate mkfs.ext4 debugfs od cp tr; do
+for tool in truncate mkfs.ext4 debugfs od cp tr awk; do
     if ! command -v "$tool" >/dev/null 2>&1; then
         echo "missing VFS test tool: $tool" >&2
         exit 1
@@ -36,11 +37,15 @@ if [ ! -f "$recovery_kernel" ]; then
 fi
 
 printf '%s' 'BoarOS root init payload for VFS and ELF' >"$fixture"
+awk 'BEGIN { for (i = 0; i < 81920; i++) printf "%c", 65 + (i % 26) }' \
+    >"$large_fixture"
 truncate -s 32M "$disk"
 mkfs.ext4 -q -F "$disk"
 debugfs -w -R "write $fixture /init" "$disk" >/dev/null 2>&1
 debugfs -w -R "set_inode_field /init mode 0100755" "$disk" \
     >/dev/null 2>&1
+debugfs -w -R "ln /init /init-link" "$disk" >/dev/null 2>&1
+debugfs -w -R "write $large_fixture /large" "$disk" >/dev/null 2>&1
 
 if ! timeout -k 2s 15s "$qemu" \
     -machine virt \

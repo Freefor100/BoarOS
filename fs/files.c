@@ -1,9 +1,14 @@
+#include "open_file_internal.h"
+
 #include <kernel/errno.h>
 #include <kernel/files.h>
 #include <kernel/fs_context.h>
 #include <kernel/heap.h>
 #include <kernel/mm.h>
+#include <kernel/open_file.h>
 #include <kernel/page.h>
+#include <kernel/page_cache.h>
+#include <kernel/physical_page.h>
 #include <kernel/uaccess.h>
 #include <kernel/vfs.h>
 
@@ -34,14 +39,6 @@
 #define LINUX_O_SYNC UINT64_C(04010000)
 #define LINUX_O_PATH UINT64_C(010000000)
 #define LINUX_O_TMPFILE UINT64_C(020200000)
-
-struct kernel_open_file_description {
-    struct kernel_vfs_file file;
-    struct kernel_open_file_description *cleanup_next;
-    uint64_t offset;
-    uint32_t references;
-    uint8_t vfs_closed;
-};
 
 struct kernel_file_slot {
     struct kernel_open_file_description *description;
@@ -163,13 +160,11 @@ enum kernel_files_status kernel_files_fork(
             source->record->slots[index].description;
 
         if (description != 0) {
-            if (description->references == UINT32_MAX ||
-                description->references == 0U ||
-                description->vfs_closed != 0U) {
+            if (kernel_open_file_acquire(description) !=
+                KERNEL_OPEN_FILE_STATUS_OK) {
                 status = KERNEL_FILES_STATUS_STATE;
                 break;
             }
-            description->references++;
             destination->record->statistics.current_open_fds++;
             if ((source->record->slots[index].flags &
                  KERNEL_FILES_FD_CLOEXEC) != 0U) {
@@ -252,19 +247,15 @@ static enum kernel_files_status cleanup_description(
     struct kernel_files *files,
     struct kernel_open_file_description *description)
 {
-    if (description->references != 0U) {
-        return KERNEL_FILES_STATUS_STATE;
-    }
-    if (!description->vfs_closed) {
-        if (kernel_vfs_close(&description->file) != 0) {
-            return KERNEL_FILES_STATUS_CLEANUP_REQUIRED;
-        }
-        description->vfs_closed = 1U;
-    }
-    return kernel_heap_release(files->heap, description) ==
-                   KERNEL_HEAP_STATUS_OK
+    enum kernel_open_file_status status =
+        kernel_open_file_release(&description);
+
+    (void)files;
+    return status == KERNEL_OPEN_FILE_STATUS_OK
                ? KERNEL_FILES_STATUS_OK
-               : KERNEL_FILES_STATUS_CLEANUP_REQUIRED;
+               : status == KERNEL_OPEN_FILE_STATUS_CLEANUP_REQUIRED
+                     ? KERNEL_FILES_STATUS_CLEANUP_REQUIRED
+                     : KERNEL_FILES_STATUS_STATE;
 }
 
 static enum kernel_files_status drain_file_cleanup(
@@ -407,6 +398,7 @@ enum kernel_files_status kernel_files_openat(
     uint32_t fd_flags;
     int result;
     enum kernel_heap_status heap_status;
+    enum kernel_open_file_status open_status;
     enum kernel_fs_context_status fs_status;
     enum kernel_files_status files_status;
 
@@ -463,45 +455,39 @@ enum kernel_files_status kernel_files_openat(
         *linux_result = result;
         return KERNEL_FILES_STATUS_OK;
     }
-    heap_status = kernel_heap_allocate_zeroed(files->heap,
-                                              1U,
-                                              sizeof(*description),
-                                              (void **)&description);
-    if (heap_status != KERNEL_HEAP_STATUS_OK) {
-        files->record->statistics.open_failures++;
-        if (finish_open_path(files, path) != KERNEL_FILES_STATUS_OK) {
-            return KERNEL_FILES_STATUS_STATE;
-        }
-        if (heap_status == KERNEL_HEAP_STATUS_EMPTY) {
-            *linux_result = -KERNEL_ENOMEM;
-            return KERNEL_FILES_STATUS_OK;
+    description = 0;
+    open_status = kernel_open_file_create(files->heap,
+                                          mount,
+                                          path,
+                                          &description,
+                                          &result);
+    if (finish_open_path(files, path) != KERNEL_FILES_STATUS_OK) {
+        if (description != 0) {
+            queue_description(files, description);
+            (void)drain_file_cleanup(files);
         }
         return KERNEL_FILES_STATUS_STATE;
     }
-    result = kernel_vfs_open(mount, path, &description->file);
-    if (finish_open_path(files, path) != KERNEL_FILES_STATUS_OK) {
-        if (result == 0) {
+    if (open_status == KERNEL_OPEN_FILE_STATUS_CLEANUP_REQUIRED) {
+        if (description != 0) {
             queue_description(files, description);
-            (void)drain_file_cleanup(files);
-        } else {
-            (void)kernel_heap_release(files->heap, description);
         }
         return KERNEL_FILES_STATUS_STATE;
+    }
+    if (open_status != KERNEL_OPEN_FILE_STATUS_OK) {
+        return open_status == KERNEL_OPEN_FILE_STATUS_NO_MEMORY
+                   ? KERNEL_FILES_STATUS_NO_MEMORY
+                   : KERNEL_FILES_STATUS_STATE;
     }
     if (result != 0) {
         files->record->statistics.open_failures++;
-        if (kernel_heap_release(files->heap, description) !=
-            KERNEL_HEAP_STATUS_OK) {
-            queue_allocation_cleanup(files, description);
-            return KERNEL_FILES_STATUS_STATE;
-        }
         *linux_result = result;
         return KERNEL_FILES_STATUS_OK;
     }
-    if ((description->file.mode & KERNEL_VFS_S_IFMT) !=
+    if ((kernel_open_file_mode(description) & KERNEL_VFS_S_IFMT) !=
         KERNEL_VFS_S_IFREG) {
         int type_result =
-            (description->file.mode & KERNEL_VFS_S_IFMT) ==
+            (kernel_open_file_mode(description) & KERNEL_VFS_S_IFMT) ==
                     KERNEL_VFS_S_IFDIR
                 ? -KERNEL_EISDIR
                 : -KERNEL_ENOTSUP;
@@ -513,7 +499,6 @@ enum kernel_files_status kernel_files_openat(
         return KERNEL_FILES_STATUS_OK;
     }
 
-    description->references = 1U;
     files->record->slots[fd].description = description;
     files->record->slots[fd].flags = fd_flags;
     files->record->statistics.current_open_fds++;
@@ -541,6 +526,32 @@ static struct kernel_open_file_description *lookup_description(
     return files->record->slots[fd].description;
 }
 
+enum kernel_files_status kernel_files_pin(
+    struct kernel_files *files,
+    int64_t fd,
+    struct kernel_open_file_description **owner,
+    int64_t *linux_result)
+{
+    struct kernel_open_file_description *description;
+
+    if (!kernel_files_is_live(files) || owner == 0 || *owner != 0 ||
+        linux_result == 0) {
+        return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
+    }
+    description = lookup_description(files, fd);
+    if (description == 0) {
+        *linux_result = -KERNEL_EBADF;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    if (kernel_open_file_acquire(description) !=
+        KERNEL_OPEN_FILE_STATUS_OK) {
+        return KERNEL_FILES_STATUS_STATE;
+    }
+    *owner = description;
+    *linux_result = 0;
+    return KERNEL_FILES_STATUS_OK;
+}
+
 enum kernel_files_status kernel_files_read(
     struct kernel_files *files,
     struct kernel_mm *mm,
@@ -550,10 +561,8 @@ enum kernel_files_status kernel_files_read(
     int64_t *linux_result)
 {
     struct kernel_open_file_description *description;
-    unsigned char *scratch;
     uint64_t request;
     uint64_t total = 0U;
-    enum kernel_heap_status heap_status;
 
     if (!kernel_files_is_live(files) || mm == 0 || linux_result == 0) {
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
@@ -578,81 +587,88 @@ enum kernel_files_status kernel_files_read(
     request = count > KERNEL_FILES_MAX_RW_COUNT
                   ? KERNEL_FILES_MAX_RW_COUNT
                   : count;
-    heap_status = kernel_heap_allocate(
-        files->heap,
-        request < BOAROS_PAGE_SIZE ? (size_t)request
-                                   : (size_t)BOAROS_PAGE_SIZE,
-        (void **)&scratch);
-    if (heap_status == KERNEL_HEAP_STATUS_EMPTY) {
-        files->record->statistics.read_failures++;
-        *linux_result = -KERNEL_ENOMEM;
-        return KERNEL_FILES_STATUS_OK;
-    }
-    if (heap_status != KERNEL_HEAP_STATUS_OK) {
-        return KERNEL_FILES_STATUS_STATE;
-    }
-
     while (total < request) {
-        size_t chunk = BOAROS_PAGE_SIZE;
-        size_t bytes_read = 0U;
+        uint64_t file_offset = kernel_open_file_offset(description);
+        uint64_t page_index = file_offset >> BOAROS_PAGE_SHIFT;
+        size_t page_offset = (size_t)(file_offset & BOAROS_PAGE_MASK);
+        size_t valid_bytes;
+        size_t chunk;
         size_t copied = 0U;
-        int result;
+        uint64_t physical_address;
+        void *page;
+        enum kernel_page_cache_status cache_status;
         enum kernel_uaccess_status access_status;
 
-        if ((uint64_t)chunk > request - total) {
-            chunk = (size_t)(request - total);
-        }
-        result = kernel_vfs_pread(&description->file,
-                                  description->offset,
-                                  scratch,
-                                  chunk,
-                                  &bytes_read);
+        cache_status = kernel_open_file_get_page(description,
+                                                 page_index,
+                                                 &physical_address,
+                                                 &valid_bytes);
         files->record->statistics.read_chunks++;
-        if (result != 0) {
+        if (cache_status == KERNEL_PAGE_CACHE_STATUS_OUT_OF_RANGE) {
+            break;
+        }
+        if (cache_status != KERNEL_PAGE_CACHE_STATUS_OK) {
+            int result = cache_status ==
+                                     KERNEL_PAGE_CACHE_STATUS_NO_MEMORY
+                                 ? -KERNEL_ENOMEM
+                                 : -KERNEL_EIO;
+
             files->record->statistics.read_failures++;
-            if (release_or_queue_allocation(files, scratch) !=
-                KERNEL_FILES_STATUS_OK) {
-                return KERNEL_FILES_STATUS_STATE;
-            }
             *linux_result = total != 0U ? (int64_t)total : result;
             files->record->statistics.bytes_read += total;
             return KERNEL_FILES_STATUS_OK;
         }
-        if (bytes_read == 0U) {
+        if (page_offset >= valid_bytes) {
+            if (physical_page_release(files->heap->page_allocator,
+                                      physical_address) !=
+                PHYSICAL_PAGE_STATUS_OK) {
+                return KERNEL_FILES_STATUS_STATE;
+            }
             break;
+        }
+        chunk = valid_bytes - page_offset;
+        if ((uint64_t)chunk > request - total) {
+            chunk = (size_t)(request - total);
+        }
+        if (physical_page_resolve(files->heap->page_allocator,
+                                  physical_address,
+                                  &page) !=
+            PHYSICAL_PAGE_STATUS_OK) {
+            (void)physical_page_release(files->heap->page_allocator,
+                                        physical_address);
+            return KERNEL_FILES_STATUS_STATE;
         }
         access_status = kernel_copy_to_user(mm,
                                             user_buffer + total,
-                                            scratch,
-                                            bytes_read,
+                                            (unsigned char *)page +
+                                                page_offset,
+                                            chunk,
                                             &copied);
-        description->offset += copied;
+        if (kernel_open_file_advance(description, copied) !=
+                KERNEL_OPEN_FILE_STATUS_OK ||
+            physical_page_release(files->heap->page_allocator,
+                                  physical_address) !=
+                PHYSICAL_PAGE_STATUS_OK) {
+            return KERNEL_FILES_STATUS_STATE;
+        }
         total += copied;
         if (access_status == KERNEL_UACCESS_STATUS_FAULT) {
             files->record->statistics.read_failures++;
-            if (release_or_queue_allocation(files, scratch) !=
-                KERNEL_FILES_STATUS_OK) {
-                return KERNEL_FILES_STATUS_STATE;
-            }
             *linux_result = total != 0U ? (int64_t)total
                                         : -KERNEL_EFAULT;
             files->record->statistics.bytes_read += total;
             return KERNEL_FILES_STATUS_OK;
         }
         if (access_status != KERNEL_UACCESS_STATUS_OK ||
-            copied != bytes_read) {
-            (void)release_or_queue_allocation(files, scratch);
+            copied != chunk) {
             return KERNEL_FILES_STATUS_STATE;
         }
-        if (bytes_read < chunk) {
+        if (page_offset + chunk == valid_bytes &&
+            valid_bytes < BOAROS_PAGE_SIZE) {
             break;
         }
     }
 
-    if (release_or_queue_allocation(files, scratch) !=
-        KERNEL_FILES_STATUS_OK) {
-        return KERNEL_FILES_STATUS_STATE;
-    }
     files->record->statistics.bytes_read += total;
     *linux_result = (int64_t)total;
     return KERNEL_FILES_STATUS_OK;
@@ -663,13 +679,21 @@ static enum kernel_files_status detach_fd(struct kernel_files *files,
 {
     struct kernel_file_slot *slot = &files->record->slots[fd];
 
-    if (slot->description == 0 ||
-        slot->description->references == 0U) {
+    struct kernel_open_file_description *description;
+    enum kernel_open_file_status status;
+
+    if (slot->description == 0) {
         return KERNEL_FILES_STATUS_STATE;
     }
-    slot->description->references--;
-    if (slot->description->references == 0U) {
-        queue_description(files, slot->description);
+    description = slot->description;
+    status = kernel_open_file_detach(&description);
+    if (status == KERNEL_OPEN_FILE_STATUS_CLEANUP_REQUIRED) {
+        if (description == 0) {
+            return KERNEL_FILES_STATUS_STATE;
+        }
+        queue_description(files, description);
+    } else if (status != KERNEL_OPEN_FILE_STATUS_OK) {
+        return KERNEL_FILES_STATUS_STATE;
     }
 
     slot->description = 0;

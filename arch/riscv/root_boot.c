@@ -91,6 +91,12 @@ enum riscv_root_boot_status riscv_root_boot_cleanup(
         kernel_vfs_unmount(&root->mount) != 0) {
         cleanup_failed = 1;
     }
+    if ((root->page_cache.state == KERNEL_PAGE_CACHE_LIVE ||
+         root->page_cache.state == KERNEL_PAGE_CACHE_CLEANUP) &&
+        kernel_page_cache_destroy(&root->page_cache) !=
+            KERNEL_PAGE_CACHE_STATUS_OK) {
+        cleanup_failed = 1;
+    }
     if (root->cleanup_device_owned != 0U) {
         if (riscv_virtio_mmio_block_destroy(&root->device) !=
             RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK) {
@@ -149,7 +155,9 @@ enum riscv_root_boot_status riscv_root_boot_start(
     if (root == 0 || info == 0 || allocator == 0 ||
         kernel_table == 0 || root->state != RISCV_ROOT_BOOT_EMPTY ||
         root->device.page_allocator != 0 ||
-        root->mount.private_data != 0 || info->timebase_frequency == 0U) {
+        root->mount.private_data != 0 ||
+        root->page_cache.state != KERNEL_PAGE_CACHE_EMPTY ||
+        root->page_cache.record != 0 || info->timebase_frequency == 0U) {
         return RISCV_ROOT_BOOT_STATUS_INVALID;
     }
     if (kernel_heap_init(&root->heap,
@@ -190,9 +198,18 @@ enum riscv_root_boot_status riscv_root_boot_start(
         return RISCV_ROOT_BOOT_STATUS_NO_DEVICE;
     }
 
+    if (kernel_page_cache_init(&root->page_cache,
+                               &root->heap,
+                               allocator) !=
+        KERNEL_PAGE_CACHE_STATUS_OK) {
+        failure = RISCV_ROOT_BOOT_STATUS_RESOURCES;
+        goto fail;
+    }
+
     if (kernel_vfs_mount_root_readonly(&root->mount,
                                        &root->device.block,
-                                       &root->heap) != 0) {
+                                       &root->heap,
+                                       &root->page_cache) != 0) {
         failure = RISCV_ROOT_BOOT_STATUS_MOUNT;
         goto fail;
     }
@@ -284,6 +301,8 @@ enum riscv_root_boot_status riscv_root_boot_finish(
         return RISCV_ROOT_BOOT_STATUS_INVALID;
     }
     if (kernel_vfs_unmount(&root->mount) != 0 ||
+        kernel_page_cache_destroy(&root->page_cache) !=
+            KERNEL_PAGE_CACHE_STATUS_OK ||
         riscv_virtio_mmio_block_destroy(&root->device) !=
             RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK) {
         return RISCV_ROOT_BOOT_STATUS_CLEANUP;

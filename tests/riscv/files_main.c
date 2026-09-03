@@ -9,7 +9,9 @@
 #include <kernel/fs_context.h>
 #include <kernel/heap.h>
 #include <kernel/mm.h>
+#include <kernel/open_file.h>
 #include <kernel/page.h>
+#include <kernel/page_cache.h>
 #include <kernel/physical_page.h>
 #include <kernel/vfs.h>
 
@@ -458,7 +460,10 @@ static void run_fork_operations(struct kernel_files *parent_files,
 {
     struct kernel_files child_files = {0};
     struct kernel_fs_context child_fs = {0};
+    struct kernel_open_file_description *pinned = 0;
     struct kernel_vfs_mount *resolved_mount = 0;
+    uint64_t pinned_page;
+    size_t valid_bytes;
     int64_t result = INT64_MIN;
     int path_result = INT32_MIN;
 
@@ -470,6 +475,29 @@ static void run_fork_operations(struct kernel_files *parent_files,
                 0U,
                 0,
                 40U);
+    if (kernel_files_pin(parent_files, 0, &pinned, &result) !=
+            KERNEL_FILES_STATUS_OK || result != 0 || pinned == 0 ||
+        kernel_files_close(parent_files, 0, &result) !=
+            KERNEL_FILES_STATUS_OK || result != 0 ||
+        kernel_open_file_get_page(pinned,
+                                  0U,
+                                  &pinned_page,
+                                  &valid_bytes) !=
+            KERNEL_PAGE_CACHE_STATUS_OK || valid_bytes != 4096U ||
+        physical_page_release(mm->allocator, pinned_page) !=
+            PHYSICAL_PAGE_STATUS_OK ||
+        kernel_open_file_release(&pinned) != KERNEL_OPEN_FILE_STATUS_OK ||
+        pinned != 0) {
+        fail_files(52U, 0, result);
+    }
+    expect_open(parent_files,
+                parent_fs,
+                mm,
+                TEST_AT_FDCWD,
+                "/data",
+                0U,
+                0,
+                53U);
     if (kernel_files_read(parent_files,
                           mm,
                           0,
@@ -542,6 +570,7 @@ static void run_files_test(const void *dtb)
     struct boot_memory_layout layout;
     struct physical_page_allocator allocator;
     struct kernel_heap heap;
+    struct kernel_page_cache page_cache = {0};
     struct riscv_sv39_page_table kernel_table = {0};
     struct riscv_virtio_mmio_block device = {0};
     struct kernel_vfs_mount mount = {0};
@@ -573,6 +602,10 @@ static void run_files_test(const void *dtb)
     }
     kernel_table.state = RISCV_SV39_STATE_ACTIVE;
     baseline = physical_page_available(&allocator);
+    if (kernel_page_cache_init(&page_cache, &heap, &allocator) !=
+        KERNEL_PAGE_CACHE_STATUS_OK) {
+        fail_files(2U, 0, -1);
+    }
 
     for (index = 0U; index < info.virtio_mmio_count; index++) {
         enum riscv_virtio_mmio_block_status status =
@@ -595,7 +628,8 @@ static void run_files_test(const void *dtb)
     if (!found ||
         kernel_vfs_mount_root_readonly(&mount,
                                        &device.block,
-                                       &heap) != 0 ||
+                                       &heap,
+                                       &page_cache) != 0 ||
         !create_user_mm(&allocator, &kernel_table, &mm) ||
         kernel_fs_context_create(&fs, &mount, &heap) !=
             KERNEL_FS_CONTEXT_STATUS_OK ||
@@ -619,6 +653,8 @@ static void run_files_test(const void *dtb)
         kernel_fs_context_release(&fs) != KERNEL_FS_CONTEXT_STATUS_OK ||
         kernel_mm_release(&mm) != KERNEL_MM_STATUS_OK ||
         kernel_vfs_unmount(&mount) != 0 ||
+        kernel_page_cache_destroy(&page_cache) !=
+            KERNEL_PAGE_CACHE_STATUS_OK ||
         riscv_virtio_mmio_block_destroy(&device) !=
             RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK ||
         physical_page_available(&allocator) != baseline) {

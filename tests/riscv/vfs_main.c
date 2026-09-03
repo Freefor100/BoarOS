@@ -5,6 +5,7 @@
 #include <kernel/errno.h>
 #include <kernel/heap.h>
 #include <kernel/page.h>
+#include <kernel/page_cache.h>
 #include <kernel/physical_page.h>
 #include <kernel/vfs.h>
 
@@ -93,6 +94,7 @@ static void run_vfs_test(const void *dtb)
     struct boot_memory_layout layout;
     struct physical_page_allocator allocator;
     struct kernel_heap heap;
+    struct kernel_page_cache page_cache = {0};
     struct riscv_virtio_mmio_block device = {0};
     struct kernel_vfs_mount mount = {0};
 #ifndef VFS_EXPECT_RECOVERY
@@ -100,9 +102,16 @@ static void run_vfs_test(const void *dtb)
         "BoarOS root init payload for VFS and ELF";
     struct riscv_virtio_mmio_block_statistics statistics;
     struct kernel_vfs_file file = {0};
+    struct kernel_vfs_file alias = {0};
+    struct kernel_vfs_file large = {0};
     struct kernel_vfs_file missing = {0};
     struct kernel_read_source source;
     unsigned char buffer[64];
+    uint64_t first_page = 0U;
+    uint64_t alias_page = 0U;
+    size_t valid_bytes = 0U;
+    struct kernel_page_cache_statistics cache_statistics;
+    uint64_t cached_page = 0U;
 #endif
     uint64_t baseline;
     uint32_t index;
@@ -131,6 +140,10 @@ static void run_vfs_test(const void *dtb)
         fail_vfs(2U, 0, -1);
     }
     baseline = physical_page_available(&allocator);
+    if (kernel_page_cache_init(&page_cache, &heap, &allocator) !=
+        KERNEL_PAGE_CACHE_STATUS_OK) {
+        fail_vfs(2U, 0, -1);
+    }
 
     for (index = 0U; index < info.virtio_mmio_count; index++) {
         enum riscv_virtio_mmio_block_status status =
@@ -154,13 +167,18 @@ static void run_vfs_test(const void *dtb)
         fail_vfs(4U, 1, 0);
     }
 
-    result = kernel_vfs_mount_root_readonly(&mount, &device.block, &heap);
+    result = kernel_vfs_mount_root_readonly(&mount,
+                                            &device.block,
+                                            &heap,
+                                            &page_cache);
 #ifdef VFS_EXPECT_RECOVERY
     if (result != -KERNEL_EUCLEAN || mount.private_data != 0 ||
         mount.state != 0U) {
         fail_vfs(5U, -KERNEL_EUCLEAN, result);
     }
-    if (riscv_virtio_mmio_block_destroy(&device) !=
+    if (kernel_page_cache_destroy(&page_cache) !=
+            KERNEL_PAGE_CACHE_STATUS_OK ||
+        riscv_virtio_mmio_block_destroy(&device) !=
             RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK ||
         physical_page_available(&allocator) != baseline) {
         fail_vfs(6U,
@@ -182,6 +200,105 @@ static void run_vfs_test(const void *dtb)
                       KERNEL_VFS_S_IXGRP |
                       KERNEL_VFS_S_IXOTH)) == 0U) {
         fail_vfs(7U, 0, result);
+    }
+    result = kernel_vfs_open(&mount, "/init-link", &alias);
+    if (result != 0 || !kernel_vfs_files_share_node(&file, &alias) ||
+        kernel_page_cache_get(&page_cache,
+                              &file,
+                              0U,
+                              &first_page,
+                              &valid_bytes) !=
+            KERNEL_PAGE_CACHE_STATUS_OK ||
+        valid_bytes != sizeof(expected) - 1U ||
+        physical_page_release(&allocator, first_page) !=
+            PHYSICAL_PAGE_STATUS_OK ||
+        kernel_page_cache_get(&page_cache,
+                              &alias,
+                              0U,
+                              &alias_page,
+                              &valid_bytes) !=
+            KERNEL_PAGE_CACHE_STATUS_OK ||
+        alias_page != first_page) {
+        fail_vfs(15U, 0, result);
+    }
+    if (kernel_page_cache_reclaim(&page_cache, 1U) != 0U ||
+        physical_page_release(&allocator, alias_page) !=
+            PHYSICAL_PAGE_STATUS_OK ||
+        kernel_page_cache_reclaim(&page_cache, 1U) != 1U) {
+        fail_vfs(16U, 1, 0);
+    }
+    result = kernel_vfs_open(&mount, "/large", &large);
+    if (result != 0) {
+        fail_vfs(18U, 0, result);
+    }
+    for (index = 0U; index < 20U; index++) {
+        if (kernel_page_cache_get(&page_cache,
+                                  &large,
+                                  index,
+                                  &cached_page,
+                                  &valid_bytes) !=
+                KERNEL_PAGE_CACHE_STATUS_OK ||
+            valid_bytes != BOAROS_PAGE_SIZE ||
+            physical_page_release(&allocator, cached_page) !=
+                PHYSICAL_PAGE_STATUS_OK) {
+            fail_vfs(19U, KERNEL_PAGE_CACHE_STATUS_OK,
+                     KERNEL_PAGE_CACHE_STATUS_STATE);
+        }
+    }
+    if (kernel_page_cache_get(&page_cache,
+                              &large,
+                              0U,
+                              &cached_page,
+                              &valid_bytes) !=
+            KERNEL_PAGE_CACHE_STATUS_OK ||
+        physical_page_release(&allocator, cached_page) !=
+            PHYSICAL_PAGE_STATUS_OK ||
+        kernel_page_cache_reclaim(&page_cache, 1U) != 1U ||
+        kernel_page_cache_lookup(&page_cache,
+                                 &large,
+                                 1U,
+                                 &cached_page,
+                                 &valid_bytes) !=
+            KERNEL_PAGE_CACHE_STATUS_NOT_FOUND ||
+        kernel_page_cache_lookup(&page_cache,
+                                 &large,
+                                 0U,
+                                 &cached_page,
+                                 &valid_bytes) !=
+            KERNEL_PAGE_CACHE_STATUS_OK ||
+        physical_page_release(&allocator, cached_page) !=
+            PHYSICAL_PAGE_STATUS_OK ||
+        kernel_page_cache_get(&page_cache,
+                              &large,
+                              1U,
+                              &cached_page,
+                              &valid_bytes) !=
+            KERNEL_PAGE_CACHE_STATUS_OK ||
+        physical_page_release(&allocator, cached_page) !=
+            PHYSICAL_PAGE_STATUS_OK) {
+        fail_vfs(20U, KERNEL_PAGE_CACHE_STATUS_OK,
+                 KERNEL_PAGE_CACHE_STATUS_STATE);
+    }
+    kernel_page_cache_get_statistics(&page_cache, &cache_statistics);
+    if (cache_statistics.current_pages != 20U ||
+        cache_statistics.peak_pages != 20U ||
+        cache_statistics.hits < 3U ||
+        cache_statistics.evictions != 2U) {
+        fail_vfs(21U, 20, (long)cache_statistics.current_pages);
+    }
+    if (kernel_vfs_close(&large) != 0 ||
+        kernel_vfs_open(&mount, "/large", &large) != 0 ||
+        kernel_page_cache_lookup(&page_cache,
+                                 &large,
+                                 1U,
+                                 &cached_page,
+                                 &valid_bytes) !=
+            KERNEL_PAGE_CACHE_STATUS_OK ||
+        physical_page_release(&allocator, cached_page) !=
+            PHYSICAL_PAGE_STATUS_OK ||
+        kernel_vfs_close(&large) != 0) {
+        fail_vfs(22U, KERNEL_PAGE_CACHE_STATUS_OK,
+                 KERNEL_PAGE_CACHE_STATUS_STATE);
     }
 
     result = kernel_vfs_file_read_source(&file, &source);
@@ -210,6 +327,10 @@ static void run_vfs_test(const void *dtb)
         fail_vfs(10U, -KERNEL_EBUSY, result);
     }
 
+    result = kernel_vfs_close(&alias);
+    if (result != 0) {
+        fail_vfs(23U, 0, result);
+    }
     result = kernel_vfs_close(&file);
     if (result != 0) {
         fail_vfs(11U, 0, result);
@@ -224,7 +345,9 @@ static void run_vfs_test(const void *dtb)
         statistics.io_errors != 0U) {
         fail_vfs(13U, 1, (long)statistics.requests);
     }
-    if (riscv_virtio_mmio_block_destroy(&device) !=
+    if (kernel_page_cache_destroy(&page_cache) !=
+            KERNEL_PAGE_CACHE_STATUS_OK ||
+        riscv_virtio_mmio_block_destroy(&device) !=
             RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK ||
         physical_page_available(&allocator) != baseline) {
         fail_vfs(14U,

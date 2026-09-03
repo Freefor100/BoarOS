@@ -114,6 +114,8 @@ C_SOURCES := \
 	fs/lwext4_port.c \
 	fs/files.c \
 	fs/fs_context.c \
+	fs/open_file.c \
+	fs/page_cache.c \
 	fs/vfs.c \
 	kernel/boot_memory.c \
 	kernel/block.c \
@@ -156,6 +158,8 @@ TEST_RUNTIME_C_SOURCES := \
 	fs/files.c \
 	fs/fs_context.c \
 	fs/lwext4_port.c \
+	fs/open_file.c \
+	fs/page_cache.c \
 	fs/vfs.c \
 	kernel/block.c \
 	kernel/elf64.c \
