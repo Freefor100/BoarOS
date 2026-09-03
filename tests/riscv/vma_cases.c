@@ -214,6 +214,7 @@ unsigned long run_all_vma_cases(void)
     void *page;
     uint64_t baseline;
     uint64_t available_before_fork;
+    uint64_t available_before_cow;
     uint64_t available_before_oom;
     uint64_t available_before_reclaim;
     uint64_t brk_result;
@@ -222,13 +223,18 @@ unsigned long run_all_vma_cases(void)
     uint64_t parent_satp;
     uint64_t cleanup_satp;
     uint64_t child_satp;
+    uint64_t fork_failure_page;
     uint64_t mmap_address;
     uint64_t mmap_result;
     uint64_t mmap_physical_address;
     unsigned char mmap_byte = 0x6dU;
+    unsigned char child_byte = 0x7cU;
     size_t mmap_bytes_copied = SIZE_MAX;
     uint32_t held_count;
     uint32_t index;
+    uint32_t fork_failure_permissions;
+    uint32_t fork_failure_references;
+    uint32_t references;
     enum kernel_mm_status brk_status;
     enum physical_page_status page_status;
 
@@ -601,6 +607,7 @@ unsigned long run_all_vma_cases(void)
         return 37U;
     }
     test_satp = child_satp;
+    available_before_cow = physical_page_available(&allocator);
     if (kernel_mm_mprotect(&child,
                            mmap_address + BOAROS_PAGE_SIZE,
                            BOAROS_PAGE_SIZE,
@@ -609,13 +616,38 @@ unsigned long run_all_vma_cases(void)
         kernel_mm_lookup(&child,
                          mmap_address + BOAROS_PAGE_SIZE,
                          &mapping) != KERNEL_MM_STATUS_OK ||
-        (mapping.physical_address & ~BOAROS_PAGE_MASK) ==
+        (mapping.permissions & KERNEL_MM_WRITE) != 0U ||
+        (mapping.physical_address & ~BOAROS_PAGE_MASK) !=
             mmap_physical_address ||
         physical_page_resolve(
             &allocator,
             mapping.physical_address & ~BOAROS_PAGE_MASK,
             &page) != PHYSICAL_PAGE_STATUS_OK ||
         ((unsigned char *)page)[0] != 0x6dU) {
+        use_test_satp = 0;
+        return 37U;
+    }
+    mmap_bytes_copied = SIZE_MAX;
+    if (kernel_copy_to_user(&child,
+                            mmap_address + BOAROS_PAGE_SIZE,
+                            &child_byte,
+                            sizeof(child_byte),
+                            &mmap_bytes_copied) !=
+            KERNEL_UACCESS_STATUS_OK ||
+        mmap_bytes_copied != sizeof(child_byte) ||
+        physical_page_available(&allocator) + 1U !=
+            available_before_cow ||
+        kernel_mm_lookup(&child,
+                         mmap_address + BOAROS_PAGE_SIZE,
+                         &mapping) != KERNEL_MM_STATUS_OK ||
+        (mapping.permissions & KERNEL_MM_WRITE) == 0U ||
+        (mapping.physical_address & ~BOAROS_PAGE_MASK) ==
+            mmap_physical_address ||
+        physical_page_resolve(
+            &allocator,
+            mapping.physical_address & ~BOAROS_PAGE_MASK,
+            &page) != PHYSICAL_PAGE_STATUS_OK ||
+        ((unsigned char *)page)[0] != child_byte) {
         use_test_satp = 0;
         return 37U;
     }
@@ -625,17 +657,15 @@ unsigned long run_all_vma_cases(void)
         return 37U;
     }
     child = (struct kernel_mm){0};
-    if (
-        kernel_mm_mprotect(&parent,
+    available_before_cow = physical_page_available(&allocator);
+    if (kernel_mm_mprotect(&parent,
                            mmap_address + BOAROS_PAGE_SIZE,
                            BOAROS_PAGE_SIZE,
                            KERNEL_MM_WRITE) != KERNEL_MM_STATUS_OK ||
         kernel_mm_lookup(&parent,
                          mmap_address + BOAROS_PAGE_SIZE,
                          &mapping) != KERNEL_MM_STATUS_OK ||
-        (mapping.permissions &
-         (KERNEL_MM_READ | KERNEL_MM_WRITE | KERNEL_MM_USER)) !=
-            (KERNEL_MM_READ | KERNEL_MM_WRITE | KERNEL_MM_USER) ||
+        (mapping.permissions & KERNEL_MM_WRITE) != 0U ||
         (mapping.physical_address & ~BOAROS_PAGE_MASK) !=
             mmap_physical_address ||
         physical_page_resolve(
@@ -643,6 +673,26 @@ unsigned long run_all_vma_cases(void)
             mapping.physical_address & ~BOAROS_PAGE_MASK,
             &page) != PHYSICAL_PAGE_STATUS_OK ||
         ((unsigned char *)page)[0] != 0x6dU) {
+        use_test_satp = 0;
+        return 31U;
+    }
+    mmap_bytes_copied = SIZE_MAX;
+    if (kernel_copy_to_user(&parent,
+                            mmap_address + BOAROS_PAGE_SIZE,
+                            &mmap_byte,
+                            sizeof(mmap_byte),
+                            &mmap_bytes_copied) !=
+            KERNEL_UACCESS_STATUS_OK ||
+        mmap_bytes_copied != sizeof(mmap_byte) ||
+        physical_page_available(&allocator) != available_before_cow ||
+        kernel_mm_lookup(&parent,
+                         mmap_address + BOAROS_PAGE_SIZE,
+                         &mapping) != KERNEL_MM_STATUS_OK ||
+        (mapping.permissions &
+         (KERNEL_MM_READ | KERNEL_MM_WRITE | KERNEL_MM_USER)) !=
+            (KERNEL_MM_READ | KERNEL_MM_WRITE | KERNEL_MM_USER) ||
+        (mapping.physical_address & ~BOAROS_PAGE_MASK) !=
+            mmap_physical_address) {
         use_test_satp = 0;
         return 31U;
     }
@@ -844,6 +894,26 @@ unsigned long run_all_vma_cases(void)
         use_test_satp = 0;
         return 12U;
     }
+    use_test_satp = 1;
+    test_satp = parent_satp;
+    if (kernel_mm_resolve_user_fault(
+            &parent,
+            VMA_TEST_POLICY_BASE + BOAROS_PAGE_SIZE,
+            KERNEL_MM_WRITE) != KERNEL_MM_STATUS_OK ||
+        kernel_mm_lookup(
+            &parent,
+            VMA_TEST_POLICY_BASE + BOAROS_PAGE_SIZE,
+            &mapping) != KERNEL_MM_STATUS_OK ||
+        physical_page_reference_count(
+            &allocator,
+            mapping.physical_address & ~BOAROS_PAGE_MASK,
+            &fork_failure_references) != PHYSICAL_PAGE_STATUS_OK ||
+        fork_failure_references != 1U) {
+        use_test_satp = 0;
+        return 13U;
+    }
+    fork_failure_page = mapping.physical_address & ~BOAROS_PAGE_MASK;
+    fork_failure_permissions = mapping.permissions;
     use_test_satp = 0;
     available_before_fork = physical_page_available(&allocator);
     force_vma_resize_failure = 1;
@@ -855,7 +925,19 @@ unsigned long run_all_vma_cases(void)
     if (child.state != KERNEL_MM_EMPTY || child.allocator != 0 ||
         child.record_page_address != 0U ||
         child.cleanup_stage != KERNEL_MM_CLEANUP_NONE ||
-        physical_page_available(&allocator) != available_before_fork) {
+        physical_page_available(&allocator) != available_before_fork ||
+        kernel_mm_lookup(
+            &parent,
+            VMA_TEST_POLICY_BASE + BOAROS_PAGE_SIZE,
+            &mapping) != KERNEL_MM_STATUS_OK ||
+        (mapping.physical_address & ~BOAROS_PAGE_MASK) !=
+            fork_failure_page ||
+        mapping.permissions != fork_failure_permissions ||
+        physical_page_reference_count(&allocator,
+                                      fork_failure_page,
+                                      &references) !=
+            PHYSICAL_PAGE_STATUS_OK ||
+        references != fork_failure_references) {
         force_vma_resize_failure = 0;
         return 13U;
     }

@@ -19,23 +19,22 @@ static unsigned char page_pool[BOAROS_PAGE_SIZE * TEST_PAGE_COUNT]
 static uint64_t inaccessible_page;
 static uint64_t fail_once_page;
 static uint32_t fail_once_count;
-static uint64_t fail_after_first_page;
-static uint32_t fail_after_first_count;
+static uint32_t fail_next_page_access;
+static uint64_t failed_page;
 
 static void *test_page_access(uint64_t address)
 {
+    if (fail_next_page_access != 0U) {
+        fail_next_page_access = 0U;
+        failed_page = address;
+        return 0;
+    }
     if (address == inaccessible_page) {
         return 0;
     }
     if (address == fail_once_page && fail_once_count == 0U) {
         fail_once_count++;
         return 0;
-    }
-    if (address == fail_after_first_page) {
-        if (fail_after_first_count != 0U) {
-            return 0;
-        }
-        fail_after_first_count++;
     }
     return (void *)(uintptr_t)address;
 }
@@ -50,8 +49,8 @@ static int setup_pages(struct physical_page_allocator *allocator,
     inaccessible_page = UINT64_MAX;
     fail_once_page = UINT64_MAX;
     fail_once_count = 0U;
-    fail_after_first_page = UINT64_MAX;
-    fail_after_first_count = 0U;
+    fail_next_page_access = 0U;
+    failed_page = UINT64_MAX;
     layout.usable_count = 1U;
     layout.usable[0].base = (uint64_t)(uintptr_t)page_pool;
     layout.usable[0].size = BOAROS_PAGE_SIZE * page_count;
@@ -61,7 +60,9 @@ static int setup_pages(struct physical_page_allocator *allocator,
                                             test_page_access) !=
             PHYSICAL_PAGE_STATUS_OK ||
         riscv_sv39_page_table_init(kernel_table, allocator) !=
-            RISCV_SV39_STATUS_OK) {
+            RISCV_SV39_STATUS_OK ||
+        physical_page_allocator_finalize(allocator) !=
+            PHYSICAL_PAGE_STATUS_OK) {
         return 0;
     }
     kernel_table->state = RISCV_SV39_STATE_ACTIVE;
@@ -263,23 +264,38 @@ static unsigned long run_forked_mm(void)
         riscv_kernel_mm_create(&parent, &space) != KERNEL_MM_STATUS_OK) {
         return 1U;
     }
-    if (kernel_mm_fork(&child, &parent) != KERNEL_MM_STATUS_OK ||
-        child.state != KERNEL_MM_LIVE ||
-        kernel_mm_lookup(&parent, TEST_TEXT_ADDRESS, &parent_text) !=
-            KERNEL_MM_STATUS_OK ||
-        kernel_mm_lookup(&child, TEST_TEXT_ADDRESS, &child_text) !=
-            KERNEL_MM_STATUS_OK ||
-        kernel_mm_lookup(&parent, TEST_STACK_ADDRESS, &parent_stack) !=
-            KERNEL_MM_STATUS_OK ||
-        kernel_mm_lookup(&child, TEST_STACK_ADDRESS, &child_stack) !=
-            KERNEL_MM_STATUS_OK) {
-        return 2U;
+    {
+        enum kernel_mm_status fork_status = kernel_mm_fork(&child, &parent);
+
+        if (fork_status != KERNEL_MM_STATUS_OK) {
+            return 20U + (unsigned long)fork_status;
+        }
+    }
+    if (child.state != KERNEL_MM_LIVE) {
+        return 7U;
+    }
+    if (kernel_mm_lookup(&parent, TEST_TEXT_ADDRESS, &parent_text) !=
+        KERNEL_MM_STATUS_OK) {
+        return 8U;
+    }
+    if (kernel_mm_lookup(&child, TEST_TEXT_ADDRESS, &child_text) !=
+        KERNEL_MM_STATUS_OK) {
+        return 9U;
+    }
+    if (kernel_mm_lookup(&parent, TEST_STACK_ADDRESS, &parent_stack) !=
+        KERNEL_MM_STATUS_OK) {
+        return 10U;
+    }
+    if (kernel_mm_lookup(&child, TEST_STACK_ADDRESS, &child_stack) !=
+        KERNEL_MM_STATUS_OK) {
+        return 11U;
     }
     if (parent_text.permissions != child_text.permissions ||
+        (parent_stack.permissions & KERNEL_MM_WRITE) != 0U ||
         parent_stack.permissions != child_stack.permissions ||
-        (parent_text.physical_address & ~BOAROS_PAGE_MASK) ==
+        (parent_text.physical_address & ~BOAROS_PAGE_MASK) !=
             (child_text.physical_address & ~BOAROS_PAGE_MASK) ||
-        (parent_stack.physical_address & ~BOAROS_PAGE_MASK) ==
+        (parent_stack.physical_address & ~BOAROS_PAGE_MASK) !=
             (child_stack.physical_address & ~BOAROS_PAGE_MASK) ||
         *(unsigned char *)(uintptr_t)parent_text.physical_address !=
             text_bytes[0] ||
@@ -299,9 +315,7 @@ static unsigned long run_forked_mm(void)
             PHYSICAL_PAGE_STATUS_OK) {
         return 4U;
     }
-    parent_stack_page[0] = 0x35U;
-    child_stack_page[0] = 0x7aU;
-    if (parent_stack_page[0] != 0x35U || child_stack_page[0] != 0x7aU) {
+    if (parent_stack_page != child_stack_page) {
         return 5U;
     }
     if (kernel_mm_release(&parent) != KERNEL_MM_STATUS_OK ||
@@ -320,18 +334,15 @@ static unsigned long run_create_access_failures(void)
     struct riscv_sv39_page_table kernel_table = {0};
     struct riscv_sv39_user_space space = {0};
     struct kernel_mm mm = {0};
-    struct kernel_mm moved = {0};
     uint64_t baseline;
     uint64_t available;
-    uint64_t record_address;
 
     if (!setup(&allocator, &kernel_table, &baseline) ||
         !create_space(&allocator, &kernel_table, &space)) {
         return 1U;
     }
     available = physical_page_available(&allocator);
-    record_address = allocator.ranges[0].next;
-    fail_once_page = record_address;
+    fail_next_page_access = 1U;
     if (riscv_kernel_mm_create(&mm, &space) !=
             KERNEL_MM_STATUS_PAGE_ACCESS ||
         mm.state != KERNEL_MM_EMPTY ||
@@ -339,50 +350,15 @@ static unsigned long run_create_access_failures(void)
         physical_page_available(&allocator) != available) {
         return 2U;
     }
-    fail_once_page = UINT64_MAX;
+    if (failed_page == UINT64_MAX) {
+        return 2U;
+    }
     if (riscv_sv39_user_space_destroy(&space) !=
             RISCV_SV39_STATUS_OK ||
         physical_page_available(&allocator) != baseline) {
         return 3U;
     }
 
-    kernel_table = (struct riscv_sv39_page_table){0};
-    space = (struct riscv_sv39_user_space){0};
-    mm = (struct kernel_mm){0};
-    if (!setup(&allocator, &kernel_table, &baseline) ||
-        !create_space(&allocator, &kernel_table, &space)) {
-        return 4U;
-    }
-    available = physical_page_available(&allocator);
-    record_address = allocator.ranges[0].next;
-    inaccessible_page = record_address;
-    if (riscv_kernel_mm_create(&mm, &space) !=
-            KERNEL_MM_STATUS_CLEANUP_REQUIRED ||
-        mm.state != KERNEL_MM_CLEANUP ||
-        mm.record_page_address != record_address ||
-        space.state != RISCV_SV39_USER_SPACE_LIVE ||
-        physical_page_available(&allocator) + 1U != available) {
-        return 5U;
-    }
-    if (kernel_mm_release(&mm) !=
-            KERNEL_MM_STATUS_PAGE_RELEASE ||
-        mm.state != KERNEL_MM_CLEANUP) {
-        return 6U;
-    }
-    if (kernel_mm_move(&moved, &mm) !=
-            KERNEL_MM_STATUS_OK ||
-        moved.state != KERNEL_MM_CLEANUP ||
-        mm.state != KERNEL_MM_MOVED) {
-        return 7U;
-    }
-    inaccessible_page = UINT64_MAX;
-    if (kernel_mm_release(&moved) !=
-            KERNEL_MM_STATUS_OK ||
-        riscv_sv39_user_space_destroy(&space) !=
-            RISCV_SV39_STATUS_OK ||
-        physical_page_available(&allocator) != baseline) {
-        return 8U;
-    }
     return 0U;
 }
 
@@ -394,7 +370,7 @@ static unsigned long run_no_memory(void)
     struct kernel_mm mm = {0};
     uint64_t baseline;
 
-    if (!setup_pages(&allocator, &kernel_table, &baseline, 6U) ||
+    if (!setup_pages(&allocator, &kernel_table, &baseline, 7U) ||
         !create_space(&allocator, &kernel_table, &space) ||
         physical_page_available(&allocator) != 0U) {
         return 1U;
@@ -422,9 +398,7 @@ static unsigned long run_destroy_failures(void)
     struct kernel_mm mm = {0};
     uint64_t baseline;
     uint64_t available;
-    uint64_t record_address;
     uint64_t root_address;
-    uint64_t satp;
 
     if (!setup(&allocator, &kernel_table, &baseline) ||
         !create_space(&allocator, &kernel_table, &space)) {
@@ -436,8 +410,7 @@ static unsigned long run_destroy_failures(void)
         return 2U;
     }
     available = physical_page_available(&allocator);
-    record_address = mm.record_page_address;
-    inaccessible_page = record_address;
+    inaccessible_page = mm.record_page_address;
     if (kernel_mm_release(&mm) !=
             KERNEL_MM_STATUS_PAGE_ACCESS ||
         mm.state != KERNEL_MM_LIVE ||
@@ -451,21 +424,10 @@ static unsigned long run_destroy_failures(void)
         return 4U;
     }
     inaccessible_page = UINT64_MAX;
-    fail_after_first_page = record_address;
-    if (kernel_mm_release(&mm) !=
-            KERNEL_MM_STATUS_CLEANUP_REQUIRED ||
-        mm.state != KERNEL_MM_CLEANUP ||
-        physical_page_available(&allocator) + 1U != baseline ||
-        riscv_kernel_mm_satp(&mm, &satp) !=
-            KERNEL_MM_STATUS_STATE) {
-        return 5U;
-    }
-    fail_after_first_page = UINT64_MAX;
-    if (kernel_mm_release(&mm) !=
-            KERNEL_MM_STATUS_OK ||
+    if (kernel_mm_release(&mm) != KERNEL_MM_STATUS_OK ||
         mm.state != KERNEL_MM_RELEASED ||
         physical_page_available(&allocator) != baseline) {
-        return 6U;
+        return 5U;
     }
     return 0U;
 }

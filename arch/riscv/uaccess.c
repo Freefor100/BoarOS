@@ -32,12 +32,17 @@ static enum kernel_uaccess_status resolve_user_page(
     enum kernel_mm_status mm_status;
 
     mm_status = kernel_mm_lookup(mm, user_address, &mapping);
-    if (mm_status == KERNEL_MM_STATUS_NOT_MAPPED) {
+    if (mm_status == KERNEL_MM_STATUS_NOT_MAPPED ||
+        (mm_status == KERNEL_MM_STATUS_OK &&
+         (mapping.permissions &
+          (required_permissions | KERNEL_MM_USER)) !=
+             (required_permissions | KERNEL_MM_USER))) {
         mm_status = kernel_mm_resolve_user_fault(
             mm,
             user_address,
             required_permissions);
-        if (mm_status == KERNEL_MM_STATUS_NOT_MAPPED) {
+        if (mm_status == KERNEL_MM_STATUS_NOT_MAPPED ||
+            mm_status == KERNEL_MM_STATUS_ADDRESS_SPACE) {
             return KERNEL_UACCESS_STATUS_FAULT;
         }
         if (mm_status != KERNEL_MM_STATUS_OK ||

@@ -55,9 +55,12 @@ struct riscv_sv39_user_space {
     uint32_t table_pages;
     uint32_t leaf_pages;
     uint32_t protected_pages;
+    uint32_t cow_pages;
     uint32_t retired_pages;
     uint64_t cleanup_page_address;
     uint32_t cleanup_page_owned;
+    uint64_t cow_copies;
+    uint64_t cow_in_place;
     enum riscv_sv39_user_space_state state;
 };
 
@@ -101,6 +104,13 @@ enum riscv_sv39_status riscv_sv39_user_space_init(
 
 /* Success transfers ownership of physical_address to space. */
 enum riscv_sv39_status riscv_sv39_user_map_owned_page(
+    struct riscv_sv39_user_space *space,
+    uint64_t virtual_address,
+    uint64_t physical_address,
+    uint32_t permissions);
+
+/* Success transfers one already-acquired shared page reference to space. */
+enum riscv_sv39_status riscv_sv39_user_map_cow_page(
     struct riscv_sv39_user_space *space,
     uint64_t virtual_address,
     uint64_t physical_address,
@@ -162,14 +172,21 @@ enum riscv_sv39_status riscv_sv39_user_space_satp(
     uint64_t *satp);
 
 /*
- * Build an independent copy of every mapped user page.  The destination
- * borrows the same kernel root entries as source.  After initialization,
- * failure may leave destination as a LIVE or CLEANUP owner for the caller to
- * destroy.
+ * Build child tables that share every owned user page with source through
+ * copy-on-write.  The destination borrows the same kernel root entries as
+ * source.  Parent leaves are committed to COW only after child construction;
+ * after initialization, failure may leave destination as a LIVE or CLEANUP
+ * owner for the caller to destroy.
  */
 enum riscv_sv39_status riscv_sv39_user_space_fork(
     struct riscv_sv39_user_space *destination,
-    const struct riscv_sv39_user_space *source);
+    struct riscv_sv39_user_space *source);
+
+/* Resolves only a present COW leaf; other mappings return NOT_MAPPED. */
+enum riscv_sv39_status riscv_sv39_user_resolve_cow(
+    struct riscv_sv39_user_space *space,
+    uint64_t virtual_address,
+    uint32_t permissions);
 
 /* Success consumes a LIVE or CLEANUP source; failure changes neither object. */
 enum riscv_sv39_status riscv_sv39_user_space_move(
