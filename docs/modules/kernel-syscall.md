@@ -39,7 +39,7 @@ enum kernel_syscall_status kernel_syscall_dispatch(
 - `munmap` 编号为 215，要求页对齐起点和非零长度，长度向上按 4 KiB 对齐；范围包含未映射洞仍成功。越界或未对齐返回 `-EINVAL`。
 - `clone` 编号为 220。当前只接受 `flags=SIGCHLD` 且 `child_stack/parent_tid/tls/child_tid` 全为零的普通进程形态；成功时父进程返回子 PID，子进程返回 0。已识别但涉及共享资源、线程、tid 指针或另一个栈的组合返回 `-ENOTSUP`，未知 flag 或非 `SIGCHLD` 退出信号返回 `-EINVAL`。
 - `execve` 编号为 221，准备并提交新的静态 RISC-V `ET_EXEC` 映像；成功不返回，失败返回负 Linux errno。路径、参数、提交点和资源保持规则见[进程映像替换模块](kernel-exec.md)。
-- `mmap` 编号为 222，当前接受 `MAP_PRIVATE|MAP_ANONYMOUS` 和任意 `PROT_NONE/R/W/X` 组合。普通 hint、`MAP_FIXED`、`MAP_FIXED_NOREPLACE`、`MAP_STACK` 和 `MAP_NORESERVE` 已实现；fixed-noreplace 冲突返回 `-EEXIST`，地址空间/metadata 不足返回 `-ENOMEM`。shared、file-backed 和 `MAP_POPULATE` 返回 `-ENOTSUP`，未知 flag、非零 offset 或同时指定两种 fixed 模式返回 `-EINVAL`；anonymous fd 参数按 Linux 语义忽略。
+- `mmap` 编号为 222，当前接受 anonymous 或只读普通文件的 `MAP_PRIVATE`，以及任意 `PROT_NONE/R/W/X` 组合。普通 hint、`MAP_FIXED`、`MAP_FIXED_NOREPLACE`、`MAP_STACK` 和 `MAP_NORESERVE` 已实现；fixed-noreplace 冲突返回 `-EEXIST`，地址空间/metadata 不足返回 `-ENOMEM`。文件映射要求有效 fd 和页对齐 offset，成功后由 MM 独立持有 OFD，所以 close fd 不撤销映射；shared 和 `MAP_POPULATE` 返回 `-ENOTSUP`，未知 flag、未对齐 offset 或同时指定两种 fixed 模式返回 `-EINVAL`；anonymous fd 参数按 Linux 语义忽略。
 - `mprotect` 编号为 226，要求页对齐起点，整个非空范围必须已有 VMA；洞返回 `-ENOMEM`。长度 0 成功。`PROT_NONE` 保留 resident 内容，恢复权限后内容仍在；RISC-V 仅写请求被规范化为 RW。
 - `wait4` 编号为 260，支持 Linux pid selector、`WNOHANG` 和 wait flag 校验；普通退出与同步故障产生 Linux 形态 status。无匹配子进程返回 `-ECHILD`，非法 option 返回 `-EINVAL`，status 用户指针错误返回 `-EFAULT`。当前不提供 rusage，非空指针返回 `-ENOTSUP`。
 - 其他编号产生 `RETURN`，返回 `-ENOSYS`（-38）。
@@ -48,4 +48,4 @@ enum kernel_syscall_status kernel_syscall_dispatch(
 
 生产用户任务拥有文件表、fs context 和 MM。底层 U-mode 调度探针可以有 MM 而故意没有进程文件资源，此时 `openat` 返回 `-ENODEV`，`read/close` 返回 `-EBADF`，用于明确区分探针配置与内核对象损坏；这不是生产进程模型。当前每个进程仍是单成员线程组，所以 `getpid()` 与 `gettid()` 数值相等，但普通 clone 已创建独立父子进程。接口语义和内部字段已经分离，增加线程组成员后无需改变 syscall ABI。内核任务与 idle 没有 Linux 身份，Trap 层只会从用户任务进入该接口。
 
-`make test-syscall-riscv` 验证空指针失败原子性、`exit(93)`、raw `brk`、mmap flag/errno、munmap/mprotect 转发、内部 MM 状态升级、clone 参数分类和未知编号。`make test-uaccess-riscv` 与 `make test-files-riscv` 验证用户复制和文件生命周期。`make test-mmap-riscv` 让真实 ext4 `/init` ELF 从 U-mode 完成 demand-zero、PROT_NONE 恢复、fixed replace/noreplace、打洞/重填和释放；`make test-brk-riscv` 继续覆盖 heap/fork/exec 生命周期。
+`make test-syscall-riscv` 验证空指针失败原子性、`exit(93)`、raw `brk`、匿名/文件 mmap 参数、fd pin/失败释放、errno、munmap/mprotect 转发、内部 MM 状态升级、clone 参数分类和未知编号。`make test-uaccess-riscv` 与 `make test-files-riscv` 验证用户复制、页缓存和映射所需的文件生命周期。`make test-mmap-riscv` 让真实 ext4 `/init` ELF 从 U-mode 完成 demand-zero、file-private COW、EOF/SIGBUS、PROT_NONE、fixed replace/noreplace、打洞/重填和释放；`make test-brk-riscv` 继续覆盖 heap/fork/exec 生命周期。

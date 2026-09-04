@@ -31,6 +31,7 @@ static uint64_t test_satp;
 static int force_fault_page_access_failure;
 static int force_fault_page_release_failure;
 static uint64_t fault_page_address;
+static uint64_t second_fault_page_address;
 
 enum kernel_heap_status __real_kernel_heap_release(
     struct kernel_heap *heap,
@@ -73,7 +74,8 @@ enum physical_page_status __wrap_physical_page_release(
     uint64_t address)
 {
     if (force_fault_page_release_failure != 0 &&
-        address == fault_page_address) {
+        (address == fault_page_address ||
+         address == second_fault_page_address)) {
         return PHYSICAL_PAGE_STATUS_STATE;
     }
     return __real_physical_page_release(allocator, address);
@@ -208,6 +210,7 @@ unsigned long run_all_vma_cases(void)
     struct kernel_mm parent = {0};
     struct kernel_mm child = {0};
     struct kernel_mm cleanup_mm = {0};
+    struct riscv_sv39_user_space detached_cleanup_space = {0};
     struct kernel_vma descriptor;
     struct kernel_mm_mapping mapping;
     struct kernel_heap_statistics statistics;
@@ -227,6 +230,8 @@ unsigned long run_all_vma_cases(void)
     uint64_t mmap_address;
     uint64_t mmap_result;
     uint64_t mmap_physical_address;
+    uint64_t first_detached_page;
+    uint64_t second_detached_page;
     unsigned char mmap_byte = 0x6dU;
     unsigned char child_byte = 0x7cU;
     size_t mmap_bytes_copied = SIZE_MAX;
@@ -1026,6 +1031,38 @@ unsigned long run_all_vma_cases(void)
         statistics.current_pages != 0U ||
         physical_page_available(&allocator) != baseline) {
         return 18U;
+    }
+    if (riscv_sv39_user_space_init(&detached_cleanup_space,
+                                   &allocator,
+                                   &kernel_table) !=
+            RISCV_SV39_STATUS_OK ||
+        physical_page_allocate(&allocator, &first_detached_page) !=
+            PHYSICAL_PAGE_STATUS_OK ||
+        physical_page_allocate(&allocator, &second_detached_page) !=
+            PHYSICAL_PAGE_STATUS_OK) {
+        return 42U;
+    }
+    fault_page_address = first_detached_page;
+    second_fault_page_address = second_detached_page;
+    force_fault_page_release_failure = 1;
+    if (riscv_sv39_user_discard_owned_page(&detached_cleanup_space,
+                                           first_detached_page) !=
+            RISCV_SV39_STATUS_CLEANUP_REQUIRED ||
+        riscv_sv39_user_discard_owned_page(&detached_cleanup_space,
+                                           second_detached_page) !=
+            RISCV_SV39_STATUS_CLEANUP_REQUIRED ||
+        detached_cleanup_space.state != RISCV_SV39_USER_SPACE_CLEANUP ||
+        detached_cleanup_space.cleanup_page_count != 2U) {
+        force_fault_page_release_failure = 0;
+        return 43U;
+    }
+    force_fault_page_release_failure = 0;
+    fault_page_address = 0U;
+    second_fault_page_address = 0U;
+    if (riscv_sv39_user_space_destroy(&detached_cleanup_space) !=
+            RISCV_SV39_STATUS_OK ||
+        physical_page_available(&allocator) != baseline) {
+        return 44U;
     }
     return 0U;
 }

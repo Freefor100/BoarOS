@@ -32,13 +32,35 @@ Linux 进程看到的整数 fd 只是文件描述符表的索引。槽内的 des
 
 Linux `read` 的返回值不仅取决于磁盘读取结果，还取决于数据实际交付用户空间的程度。若第一字节就无法写入用户 buffer，应返回 `-EFAULT` 且不推进文件位置；若已经复制一段连续前缀，之后 fault 或 I/O 出错，通常返回已复制长度并只推进这部分。用内核 staging buffer 时，不能把“已从文件系统读入”误当成“已交付用户”：open-file offset 必须按 usercopy 成功字节提交。零长度读仍先要求 fd 有效，但不应解引用用户地址。
 
-当前以 4 KiB scratch 分块是内存占用有界的同步实现，也让部分复制边界明确；代价是每块多一次复制、一次 VFS 调用和用户页软件遍历。未来页缓存、read-ahead、把用户页固定后直接 I/O 或异步请求都可能降低这些成本，但必须保持 fd/open-description 分层、短读、offset 与 errno 语义不变。性能取舍需要在 QEMU 和开发板上用文件大小、顺序/随机模式、page fault 比例及 cache/TLB 数据说明，不能只比较函数层数。
+BoarOS 当前让 `read` 按文件页从共享页缓存取得内容，再复制到用户页。命中避免重复 ext4/块 I/O，但仍有 cache-to-user 复制和用户页软件遍历；read-ahead、固定用户页后的直接 I/O 或异步请求仍未实现。无论数据来自磁盘还是缓存，都必须保持 fd/open-description 分层、短读、offset 与 errno 语义：只有实际交付用户的前缀才能推进 offset。性能取舍需要在 QEMU 和开发板上用文件大小、顺序/随机模式、page fault 比例及 cache/TLB 数据说明，不能只比较函数层数。
+
+## 页缓存、私有映射与文件尾
+
+页缓存要按“文件对象身份 + 页号”而不是 fd 或 open offset 建键。fd 会关闭和复用，两次
+open 的 offset 也应独立；底层 VFS node/inode 身份才表达“这是同一文件内容”。缓存项持有
+node 和物理页引用，调用者临时 acquire 页引用，因此驱逐只能选择没有外部引用的页面。
+开放寻址哈希适合 fault/read 的查找热路径，LRU 链用于内存压力下选择冷页；两者承担不同职责。
+
+`MAP_PRIVATE` 的读 fault 可以直接把只读缓存页映入多个地址空间，写 fault 则必须保持文件
+和其他映射不变。常见做法是把缓存映射标记为 COW：若页面已经缓存，首次写复制一页；若
+write-first 且缓存未命中，直接把文件内容读入私有页可避免“先填缓存、马上再复制”的双分配。
+这项优化不能改变后续另一个只读映射看到原文件内容的语义。
+
+文件长度不是 VMA 长度。映射可以延伸到 EOF 之后：包含文件末字节的最后一个页，其页内剩余
+字节读取为零；但故障页的起点已经在 EOF 之外时应产生 `SIGBUS`。因此缓存需要同时返回尾页
+有效字节数，MM 需要在取页前按页起始 offset 分类。关闭 fd 也不能撤销映射，MM 必须独立持有
+文件引用；fork 后父子各自持有来源引用，直到各自最后一个相关 VMA 被撤销。
+
+内存压力回收必须避免无界递归。BoarOS 的物理分配器只注册一个缓存回收器：第一次分配失败
+时请求 LRU 释放目标页数并重试一次，回调期间抑制再次进入回收器。当前只读文件系统没有脏页，
+所以未固定缓存页可以直接丢弃；加入可写映射后，clean/dirty/writeback/error 状态会成为新的
+生命周期，而不是给现有驱逐函数加一个无条件写盘调用。
 
 ## 根设备与 PID 1
 
 无命令行解析阶段需要一个确定的根选择规则。BoarOS 当前使用 DTB 翻译后的物理 MMIO 地址排序，选择第一个成功初始化的 block device；选中后若不是可挂载 ext4 或缺少 `/init`，启动失败，不扫描磁盘内容寻找替代根。这让平台拓扑决定设备顺序，行为可复现；以后支持 Linux `root=` 时可在块设备身份层增加显式选择，而不改变 ext4/VFS。
 
-PID 1 是用户空间生命周期的根。Linux 通常在 init 退出时 panic，因为继续运行已没有负责收养孤儿和维持用户空间的进程。BoarOS 当前尚无完整父子进程和信号，但仍在 scheduler 关闭全部 fd、释放 fs context、地址空间、PID 和任务页后把 PID 1 退出视为系统终止，再卸载根和关机。顺序不能倒置：打开的 VFS file 借用 mount，任务退出时必须先释放文件资源，最后才能卸载根。完成记录必须保存 TID/TGID 快照，否则任务页和 PID 被释放后就无法可靠判断退出者身份。
+PID 1 是用户空间生命周期的根。Linux 通常在 init 退出时 panic，因为继续运行已没有负责收养孤儿和维持用户空间的进程。BoarOS 已实现普通父子进程、reparent、zombie/wait 和同步故障终止状态，但尚无可投递、阻塞或捕获的完整信号。PID 1 及全部后代退出后，scheduler 先关闭 fd、释放 fs context、地址空间、PID 和任务页，再由根启动 purge 文件缓存、卸载根并关机。顺序不能倒置：OFD、MM 文件 backing 与缓存 node 都借用 mount，必须先释放这些引用。完成记录必须保存 TID/TGID 快照，否则任务页和 PID 被释放后就无法可靠判断退出者身份。
 
 ## 验证经验
 
@@ -46,6 +68,7 @@ PID 1 是用户空间生命周期的根。Linux 通常在 init 退出时 panic�
 - 文件系统测试应建立真实镜像并通过工具设置 mode、checksum 与 incompat feature；只用手写 superblock fixture 很难覆盖 extent、目录和校验链。
 - 成功读取文件不足以证明生命周期完整；应在 open file 时验证 unmount 为 busy，并在 close/unmount/device destroy 后比较物理页和 heap live/current pages。
 - 进程文件测试还应覆盖最低 fd 复用、扩容边界、两次 open 的独立 offset、路径 NUL 上限、跨页 usercopy、部分 fault 后 offset，以及 close 已摘除 fd 但底层释放需要重试的状态。
+- 页缓存测试要区分 hit/miss、尾页有效长度、被映射页 pin、LRU 驱逐和分配失败触发的有界回收；file-private mmap 还要验证写后其他别名与文件内容不变、关闭 fd 后仍可 fault、fork 后来源有效，以及整页越过 EOF 的 `SIGBUS`。
 - Exec 文件测试要同时保留普通 fd 和 CLOEXEC fd：新映像应从普通 fd 的原 offset 继续读取，而 CLOEXEC fd 即使底层 close 需要重试也必须立即不可见；失败的 exec 则不能关闭任何 fd。
 - 根启动 fixture 应独立链接并写入磁盘，不能把 ELF 同时嵌入 kernel，否则无法证明 VFS 是生产数据来源。
 - QEMU 默认可能提供 legacy VirtIO MMIO；现代驱动测试与生产根盘必须显式设置 `virtio-mmio.force-legacy=false`。开发板 transport 和 DMA 一致性必须重新验证，不能从 QEMU 行为外推。

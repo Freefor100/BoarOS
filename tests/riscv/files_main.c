@@ -13,6 +13,7 @@
 #include <kernel/page.h>
 #include <kernel/page_cache.h>
 #include <kernel/physical_page.h>
+#include <kernel/uaccess.h>
 #include <kernel/vfs.h>
 
 #include <stddef.h>
@@ -21,6 +22,9 @@
 #define TEST_POOL_PAGES 512U
 #define TEST_USER_PATH UINT64_C(0x10000)
 #define TEST_USER_BUFFER UINT64_C(0x20000)
+#define TEST_MMAP_FIRST UINT64_C(0x10000000)
+#define TEST_MMAP_SECOND UINT64_C(0x10010000)
+#define TEST_MMAP_LIMIT UINT64_C(0x30000000)
 #define TEST_AT_FDCWD (-100)
 #define TEST_O_WRONLY UINT64_C(1)
 #define TEST_O_CREAT UINT64_C(0100)
@@ -32,10 +36,19 @@ static unsigned char page_pool[BOAROS_PAGE_SIZE * TEST_POOL_PAGES]
     __attribute__((aligned(BOAROS_PAGE_SIZE)));
 static int fail_next_heap_release;
 static char fork_resolved_path[KERNEL_FS_PATH_MAX];
+static int use_test_satp;
+static uint64_t test_satp;
 
 enum kernel_heap_status __real_kernel_heap_release(
     struct kernel_heap *heap,
     void *pointer);
+uint64_t __real_riscv_sv39_current_satp(void);
+
+uint64_t __wrap_riscv_sv39_current_satp(void)
+{
+    return use_test_satp != 0 ? test_satp
+                              : __real_riscv_sv39_current_satp();
+}
 
 enum kernel_heap_status __wrap_kernel_heap_release(
     struct kernel_heap *heap,
@@ -564,6 +577,166 @@ static void run_fork_operations(struct kernel_files *parent_files,
     }
 }
 
+static void run_mmap_operations(struct kernel_files *files,
+                                const struct kernel_fs_context *fs,
+                                struct kernel_mm *mm,
+                                struct physical_page_allocator *allocator)
+{
+    struct kernel_open_file_description *first_pin = 0;
+    struct kernel_open_file_description *second_pin = 0;
+    struct kernel_mm child = {0};
+    struct kernel_mm_mapping first_mapping;
+    struct kernel_mm_mapping second_mapping;
+    uint64_t first_address = UINT64_MAX;
+    uint64_t second_address = UINT64_MAX;
+    uint64_t private_page;
+    uint64_t child_satp;
+    void *page;
+    int64_t result = INT64_MIN;
+    unsigned char replacement = 0xe1U;
+    size_t copied = SIZE_MAX;
+
+    expect_open(files, fs, mm, TEST_AT_FDCWD, "/data", 0U, 0, 60U);
+    if (kernel_files_pin(files, 0, &first_pin, &result) !=
+            KERNEL_FILES_STATUS_OK || result != 0 || first_pin == 0 ||
+        kernel_files_pin(files, 0, &second_pin, &result) !=
+            KERNEL_FILES_STATUS_OK || result != 0 || second_pin == 0 ||
+        kernel_mm_mmap_file_private(
+            mm,
+            &first_pin,
+            TEST_MMAP_FIRST,
+            4U * BOAROS_PAGE_SIZE,
+            0U,
+            KERNEL_MM_READ | KERNEL_MM_WRITE,
+            KERNEL_MM_MAP_FIXED_NOREPLACE,
+            &first_address) != KERNEL_MM_STATUS_OK ||
+        first_pin != 0 || first_address != TEST_MMAP_FIRST ||
+        kernel_mm_mmap_file_private(
+            mm,
+            &second_pin,
+            TEST_MMAP_SECOND,
+            3U * BOAROS_PAGE_SIZE,
+            0U,
+            KERNEL_MM_READ | KERNEL_MM_WRITE,
+            KERNEL_MM_MAP_FIXED_NOREPLACE,
+            &second_address) != KERNEL_MM_STATUS_OK ||
+        second_pin != 0 || second_address != TEST_MMAP_SECOND ||
+        kernel_files_close(files, 0, &result) !=
+            KERNEL_FILES_STATUS_OK || result != 0) {
+        fail_files(61U, KERNEL_MM_STATUS_OK, result);
+    }
+
+    /* A write-first miss reads directly into a private page. */
+    if (kernel_mm_resolve_user_fault(
+            mm,
+            first_address + 2U * BOAROS_PAGE_SIZE,
+            KERNEL_MM_WRITE) != KERNEL_MM_STATUS_OK ||
+        kernel_mm_lookup(mm,
+                         first_address + 2U * BOAROS_PAGE_SIZE,
+                         &first_mapping) != KERNEL_MM_STATUS_OK ||
+        (first_mapping.permissions & KERNEL_MM_WRITE) == 0U ||
+        physical_page_resolve(
+            allocator,
+            first_mapping.physical_address & ~BOAROS_PAGE_MASK,
+            &page) != PHYSICAL_PAGE_STATUS_OK ||
+        ((unsigned char *)page)[0] !=
+            (unsigned char)('A' + ((2U * BOAROS_PAGE_SIZE) % 26U)) ||
+        ((unsigned char *)page)[807] !=
+            (unsigned char)('A' + (8999U % 26U)) ||
+        ((unsigned char *)page)[808] != 0U) {
+        fail_files(62U, 0, -1);
+    }
+    private_page = first_mapping.physical_address & ~BOAROS_PAGE_MASK;
+
+    /* A read alias receives the shared cache page, not the private copy. */
+    if (kernel_mm_resolve_user_fault(
+            mm,
+            second_address + 2U * BOAROS_PAGE_SIZE,
+            KERNEL_MM_READ) != KERNEL_MM_STATUS_OK ||
+        kernel_mm_lookup(mm,
+                         second_address + 2U * BOAROS_PAGE_SIZE,
+                         &second_mapping) != KERNEL_MM_STATUS_OK ||
+        (second_mapping.physical_address & ~BOAROS_PAGE_MASK) ==
+            private_page ||
+        physical_page_resolve(
+            allocator,
+            second_mapping.physical_address & ~BOAROS_PAGE_MASK,
+            &page) != PHYSICAL_PAGE_STATUS_OK ||
+        ((unsigned char *)page)[0] !=
+            (unsigned char)('A' + ((2U * BOAROS_PAGE_SIZE) % 26U)) ||
+        ((unsigned char *)page)[808] != 0U ||
+        kernel_mm_resolve_user_fault(
+            mm,
+            first_address + 3U * BOAROS_PAGE_SIZE,
+            KERNEL_MM_READ) != KERNEL_MM_STATUS_BUS_FAULT) {
+        fail_files(63U, KERNEL_MM_STATUS_OK, -1);
+    }
+
+    /* Two read mappings share cache storage; writing one breaks COW. */
+    if (kernel_mm_resolve_user_fault(mm,
+                                     first_address,
+                                     KERNEL_MM_READ) !=
+            KERNEL_MM_STATUS_OK ||
+        kernel_mm_resolve_user_fault(mm,
+                                     second_address,
+                                     KERNEL_MM_READ) !=
+            KERNEL_MM_STATUS_OK ||
+        kernel_mm_lookup(mm, first_address, &first_mapping) !=
+            KERNEL_MM_STATUS_OK ||
+        kernel_mm_lookup(mm, second_address, &second_mapping) !=
+            KERNEL_MM_STATUS_OK ||
+        (first_mapping.physical_address & ~BOAROS_PAGE_MASK) !=
+            (second_mapping.physical_address & ~BOAROS_PAGE_MASK) ||
+        kernel_copy_to_user(mm,
+                            first_address,
+                            &replacement,
+                            sizeof(replacement),
+                            &copied) != KERNEL_UACCESS_STATUS_OK ||
+        copied != sizeof(replacement) ||
+        kernel_mm_lookup(mm, first_address, &first_mapping) !=
+            KERNEL_MM_STATUS_OK ||
+        kernel_mm_lookup(mm, second_address, &second_mapping) !=
+            KERNEL_MM_STATUS_OK ||
+        (first_mapping.physical_address & ~BOAROS_PAGE_MASK) ==
+            (second_mapping.physical_address & ~BOAROS_PAGE_MASK) ||
+        !read_user_byte(mm, first_address, &replacement) ||
+        replacement != 0xe1U ||
+        !read_user_byte(mm, second_address, &replacement) ||
+        replacement != 'A') {
+        fail_files(64U, 0, -1);
+    }
+
+    /* Fork keeps an independent OFD registry after the parent unmaps. */
+    if (kernel_mm_fork(&child, mm) != KERNEL_MM_STATUS_OK ||
+        riscv_kernel_mm_satp(&child, &child_satp) !=
+            KERNEL_MM_STATUS_OK ||
+        kernel_mm_munmap(mm,
+                         first_address,
+                         4U * BOAROS_PAGE_SIZE) != KERNEL_MM_STATUS_OK ||
+        kernel_mm_munmap(mm,
+                         second_address,
+                         3U * BOAROS_PAGE_SIZE) != KERNEL_MM_STATUS_OK) {
+        fail_files(65U, KERNEL_MM_STATUS_OK, -1);
+    }
+    test_satp = child_satp;
+    if (kernel_mm_resolve_user_fault(
+            &child,
+            second_address + BOAROS_PAGE_SIZE,
+            KERNEL_MM_READ) != KERNEL_MM_STATUS_OK ||
+        !read_user_byte(&child,
+                        second_address + BOAROS_PAGE_SIZE,
+                        &replacement) ||
+        replacement !=
+            (unsigned char)('A' + (BOAROS_PAGE_SIZE % 26U))) {
+        fail_files(66U, KERNEL_MM_STATUS_OK, -1);
+    }
+    test_satp = test_satp ^ UINT64_C(1);
+    if (kernel_mm_release(&child) != KERNEL_MM_STATUS_OK) {
+        fail_files(67U, KERNEL_MM_STATUS_OK, -1);
+    }
+    test_satp = 0U;
+}
+
 static void run_files_test(const void *dtb)
 {
     struct dtb_boot_info info;
@@ -631,11 +804,19 @@ static void run_files_test(const void *dtb)
                                        &heap,
                                        &page_cache) != 0 ||
         !create_user_mm(&allocator, &kernel_table, &mm) ||
+        kernel_mm_vma_enable(&mm, &heap) != KERNEL_MM_STATUS_OK ||
+        kernel_mm_brk_initialize(&mm,
+                                 UINT64_C(0x1000000),
+                                 TEST_MMAP_LIMIT) != KERNEL_MM_STATUS_OK ||
         kernel_fs_context_create(&fs, &mount, &heap) !=
             KERNEL_FS_CONTEXT_STATUS_OK ||
         kernel_files_create(&files, &heap) != KERNEL_FILES_STATUS_OK) {
         fail_files(4U, 0, -1);
     }
+    if (riscv_kernel_mm_satp(&mm, &test_satp) != KERNEL_MM_STATUS_OK) {
+        fail_files(4U, 0, -1);
+    }
+    use_test_satp = 1;
 
     run_fork_operations(&files, &fs, &mm);
     if (kernel_files_release(&files) != KERNEL_FILES_STATUS_OK) {
@@ -649,6 +830,18 @@ static void run_files_test(const void *dtb)
     }
     run_file_operations(&files, &fs, &mm);
 
+    if (kernel_files_release(&files) != KERNEL_FILES_STATUS_OK) {
+        fail_files(58U, KERNEL_FILES_STATUS_OK,
+                   KERNEL_FILES_STATUS_STATE);
+    }
+    files = (struct kernel_files){0};
+    if (kernel_files_create(&files, &heap) != KERNEL_FILES_STATUS_OK) {
+        fail_files(59U, KERNEL_FILES_STATUS_OK,
+                   KERNEL_FILES_STATUS_STATE);
+    }
+    run_mmap_operations(&files, &fs, &mm, &allocator);
+
+    use_test_satp = 0;
     if (kernel_files_release(&files) != KERNEL_FILES_STATUS_OK ||
         kernel_fs_context_release(&fs) != KERNEL_FS_CONTEXT_STATUS_OK ||
         kernel_mm_release(&mm) != KERNEL_MM_STATUS_OK ||

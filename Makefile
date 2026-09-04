@@ -540,6 +540,7 @@ $(UACCESS_TEST_KERNEL_RV): $(UACCESS_TEST_OBJECTS) \
 
 $(FILES_TEST_KERNEL_RV): $(FILES_TEST_OBJECTS) arch/riscv/linker.ld
 	$(CC) $(LDFLAGS) -Wl,--wrap=kernel_heap_release \
+		-Wl,--wrap=riscv_sv39_current_satp \
 		-Wl,-Map,$(BUILD_DIR)/tests/kernel-files-rv.map \
 		-o $@ $(FILES_TEST_OBJECTS)
 
@@ -578,8 +579,12 @@ $(SYSCALL_TEST_KERNEL_RV): $(SYSCALL_TEST_OBJECTS) arch/riscv/linker.ld
 	$(CC) $(LDFLAGS) -Wl,--wrap=kernel_task_mm_borrow_mutable \
 		-Wl,--wrap=kernel_mm_brk \
 		-Wl,--wrap=kernel_mm_mmap_anonymous \
+		-Wl,--wrap=kernel_mm_mmap_file_private \
 		-Wl,--wrap=kernel_mm_munmap \
 		-Wl,--wrap=kernel_mm_mprotect \
+		-Wl,--wrap=kernel_task_files_borrow \
+		-Wl,--wrap=kernel_files_pin \
+		-Wl,--wrap=kernel_open_file_release \
 		-Wl,-Map,$(BUILD_DIR)/tests/kernel-syscall-rv.map \
 		-o $@ $(SYSCALL_TEST_OBJECTS)
 
@@ -930,7 +935,7 @@ test-brk-riscv: test-sv39-riscv test-vma-riscv \
 		test-root-init-riscv
 
 test-mmap-riscv: test-sv39-riscv test-vma-riscv \
-		test-syscall-riscv test-root-init-riscv
+		test-syscall-riscv test-files-riscv test-root-init-riscv
 
 test-elf64-riscv: $(ELF64_TEST_KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) ELF64_TEST_KERNEL_RV=$< \

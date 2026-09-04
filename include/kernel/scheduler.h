@@ -36,6 +36,7 @@ enum kernel_thread_exit_reason {
     KERNEL_THREAD_EXIT_SYSCALL,
     KERNEL_THREAD_EXIT_USER_FAULT,
     KERNEL_THREAD_EXIT_RESOURCE,
+    KERNEL_THREAD_EXIT_SIGNAL,
 };
 
 enum kernel_thread_resource {

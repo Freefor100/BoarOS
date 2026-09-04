@@ -202,6 +202,83 @@ _start:
     bne a0, t0, .Lfailure
     mv s1, a0
 
+    # Two MAP_PRIVATE views initially observe the same file bytes.  A write
+    # detaches only the modified view, the tail of the last file page is
+    # zero-filled, and a whole page beyond EOF terminates a child with SIGBUS.
+    li a0, 0
+    li a1, 0x4000
+    li a2, 3
+    li a3, 2
+    mv a4, s0
+    li a5, 0
+    li a7, 222
+    ecall
+    bltz a0, .Lfailure
+    mv s8, a0
+    li a0, 0
+    li a1, 0x4000
+    li a2, 3
+    li a3, 2
+    mv a4, s0
+    li a5, 0
+    li a7, 222
+    ecall
+    bltz a0, .Lfailure
+    mv s9, a0
+
+    lbu t0, 0(s8)
+    li t1, 'A'
+    bne t0, t1, .Lfailure
+    lbu t0, 0(s9)
+    bne t0, t1, .Lfailure
+    li t0, 'Z'
+    sb t0, 0(s8)
+    lbu t1, 0(s8)
+    bne t0, t1, .Lfailure
+    lbu t1, 0(s9)
+    li t0, 'A'
+    bne t0, t1, .Lfailure
+    li t0, 0x2327
+    add t0, s8, t0
+    lbu t1, 0(t0)
+    li t2, 'D'
+    bne t1, t2, .Lfailure
+    lbu t1, 1(t0)
+    bnez t1, .Lfailure
+
+    li a0, 17
+    li a1, 0
+    li a2, 0
+    li a3, 0
+    li a4, 0
+    li a7, 220
+    ecall
+    beqz a0, .Lmmap_bus_child
+    bltz a0, .Lfailure
+    mv s7, a0
+    mv a0, s7
+    la a1, .Lmmap_wait_status
+    li a2, 0
+    li a3, 0
+    li a7, 260
+    ecall
+    bne a0, s7, .Lfailure
+    la t0, .Lmmap_wait_status
+    lw t1, 0(t0)
+    li t2, 7
+    bne t1, t2, .Lfailure
+
+    mv a0, s8
+    li a1, 0x4000
+    li a7, 215
+    ecall
+    bnez a0, .Lfailure
+    mv a0, s9
+    li a1, 0x4000
+    li a7, 215
+    ecall
+    bnez a0, .Lfailure
+
     # The two descriptors have independent open-file descriptions.
     mv a0, s0
     la a1, .Lread_buffer
@@ -452,6 +529,12 @@ _start:
     ecall
     j .Lfailure
 
+.Lmmap_bus_child:
+    li t0, 0x3000
+    add t0, s8, t0
+    lbu t1, 0(t0)
+    j .Lfailure
+
 .Lfailure:
     li a0, 0xe1
     li a7, 93
@@ -500,6 +583,9 @@ _start:
     .skip 4000
 .Lread_buffer:
     .skip 5000
+    .balign 4
+.Lmmap_wait_status:
+    .skip 4
     .balign 4096
 .Lbig_string:
     .skip 0x20000

@@ -691,11 +691,16 @@ enum kernel_scheduler_status kernel_scheduler_reap_one(
     } else if (result.kind == KERNEL_THREAD_KIND_USER) {
         if (result.reason != KERNEL_THREAD_EXIT_SYSCALL &&
             result.reason != KERNEL_THREAD_EXIT_USER_FAULT &&
-            result.reason != KERNEL_THREAD_EXIT_RESOURCE) {
+            result.reason != KERNEL_THREAD_EXIT_RESOURCE &&
+            result.reason != KERNEL_THREAD_EXIT_SIGNAL) {
             return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
         }
         if (result.reason == KERNEL_THREAD_EXIT_RESOURCE &&
             result.status != KERNEL_THREAD_RESOURCE_NO_MEMORY) {
+            return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
+        }
+        if (result.reason == KERNEL_THREAD_EXIT_SIGNAL &&
+            (result.status == 0U || result.status > 64U)) {
             return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
         }
         if (publish != 0U &&
@@ -887,6 +892,9 @@ static uint32_t user_wait_status(
     if (completion->reason == KERNEL_THREAD_EXIT_RESOURCE) {
         return 9U; /* SIGKILL */
     }
+    if (completion->reason == KERNEL_THREAD_EXIT_SIGNAL) {
+        return (uint32_t)completion->status & UINT32_C(0x7f);
+    }
     return fault_wait_status(completion->status);
 }
 
@@ -1040,11 +1048,16 @@ void kernel_user_thread_exit(
 
     if (reason != KERNEL_THREAD_EXIT_SYSCALL &&
         reason != KERNEL_THREAD_EXIT_USER_FAULT &&
-        reason != KERNEL_THREAD_EXIT_RESOURCE) {
+        reason != KERNEL_THREAD_EXIT_RESOURCE &&
+        reason != KERNEL_THREAD_EXIT_SIGNAL) {
         switch_to_fatal_idle(KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT);
     }
     if (reason == KERNEL_THREAD_EXIT_RESOURCE &&
         status != KERNEL_THREAD_RESOURCE_NO_MEMORY) {
+        switch_to_fatal_idle(KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT);
+    }
+    if (reason == KERNEL_THREAD_EXIT_SIGNAL &&
+        (status == 0U || status > 64U)) {
         switch_to_fatal_idle(KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT);
     }
     if (scheduler.current == 0 ||

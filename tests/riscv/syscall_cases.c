@@ -1,5 +1,7 @@
 #include <kernel/syscall.h>
+#include <kernel/files.h>
 #include <kernel/mm.h>
+#include <kernel/open_file.h>
 #include <kernel/task.h>
 
 #include <stdint.h>
@@ -20,6 +22,14 @@ static uint32_t mmap_mm_flags;
 static uint64_t range_mm_address;
 static uint64_t range_mm_length;
 static uint32_t range_mm_permissions;
+static enum kernel_task_status files_borrow_status =
+    KERNEL_TASK_STATUS_OK;
+static enum kernel_files_status pin_status = KERNEL_FILES_STATUS_OK;
+static int64_t pin_linux_result;
+static enum kernel_mm_status file_mmap_status = KERNEL_MM_STATUS_OK;
+static int64_t file_mmap_fd;
+static uint64_t file_mmap_offset;
+static uint32_t file_release_calls;
 
 enum kernel_task_status __wrap_kernel_task_mm_borrow_mutable(
     struct kernel_task *task,
@@ -69,6 +79,77 @@ enum kernel_mm_status __wrap_kernel_mm_mmap_anonymous(
         *address = mmap_mm_result;
     }
     return mmap_mm_status;
+}
+
+enum kernel_task_status __wrap_kernel_task_files_borrow(
+    struct kernel_task *task,
+    struct kernel_files **files)
+{
+    if (files_borrow_status != KERNEL_TASK_STATUS_OK) {
+        return files_borrow_status;
+    }
+    if (task == 0 || files == 0) {
+        return KERNEL_TASK_STATUS_INVALID_ARGUMENT;
+    }
+    *files = (struct kernel_files *)(uintptr_t)3U;
+    return KERNEL_TASK_STATUS_OK;
+}
+
+enum kernel_files_status __wrap_kernel_files_pin(
+    struct kernel_files *files,
+    int64_t fd,
+    struct kernel_open_file_description **owner,
+    int64_t *linux_result)
+{
+    if (files != (struct kernel_files *)(uintptr_t)3U || owner == 0 ||
+        *owner != 0 || linux_result == 0) {
+        return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
+    }
+    file_mmap_fd = fd;
+    *linux_result = pin_linux_result;
+    if (pin_status == KERNEL_FILES_STATUS_OK && pin_linux_result == 0) {
+        *owner = (struct kernel_open_file_description *)(uintptr_t)4U;
+    }
+    return pin_status;
+}
+
+enum kernel_mm_status __wrap_kernel_mm_mmap_file_private(
+    struct kernel_mm *mm,
+    struct kernel_open_file_description **file,
+    uint64_t hint,
+    uint64_t length,
+    uint64_t file_offset,
+    uint32_t permissions,
+    uint32_t flags,
+    uint64_t *address)
+{
+    if (mm != (struct kernel_mm *)(uintptr_t)2U || file == 0 ||
+        *file != (struct kernel_open_file_description *)(uintptr_t)4U ||
+        address == 0) {
+        return KERNEL_MM_STATUS_INVALID_ARGUMENT;
+    }
+    mmap_mm_hint = hint;
+    mmap_mm_length = length;
+    mmap_mm_permissions = permissions;
+    mmap_mm_flags = flags;
+    file_mmap_offset = file_offset;
+    if (file_mmap_status == KERNEL_MM_STATUS_OK) {
+        *file = 0;
+        *address = mmap_mm_result;
+    }
+    return file_mmap_status;
+}
+
+enum kernel_open_file_status __wrap_kernel_open_file_release(
+    struct kernel_open_file_description **owner)
+{
+    if (owner == 0 ||
+        *owner != (struct kernel_open_file_description *)(uintptr_t)4U) {
+        return KERNEL_OPEN_FILE_STATUS_INVALID_ARGUMENT;
+    }
+    file_release_calls++;
+    *owner = 0;
+    return KERNEL_OPEN_FILE_STATUS_OK;
 }
 
 enum kernel_mm_status __wrap_kernel_mm_munmap(
@@ -319,6 +400,67 @@ static unsigned long run_memory_mapping_cases(void)
     if (kernel_syscall_dispatch(caller, &request, &result) !=
             KERNEL_SYSCALL_STATUS_OK ||
         result_changed(&result, KERNEL_SYSCALL_ACTION_RETURN, -22)) {
+        failures++;
+    }
+
+    request.arguments[0] = UINT64_C(0x45000);
+    request.arguments[1] = UINT64_C(0x3456);
+    request.arguments[2] = 5U;
+    request.arguments[3] = 2U;
+    request.arguments[4] = 7U;
+    request.arguments[5] = UINT64_C(0x2000);
+    files_borrow_status = KERNEL_TASK_STATUS_OK;
+    pin_status = KERNEL_FILES_STATUS_OK;
+    pin_linux_result = 0;
+    file_mmap_status = KERNEL_MM_STATUS_OK;
+    mmap_mm_result = UINT64_C(0x88000);
+    file_release_calls = 0U;
+    if (kernel_syscall_dispatch(caller, &request, &result) !=
+            KERNEL_SYSCALL_STATUS_OK ||
+        result_changed(&result,
+                       KERNEL_SYSCALL_ACTION_RETURN,
+                       INT64_C(0x88000)) ||
+        file_mmap_fd != 7 ||
+        file_mmap_offset != UINT64_C(0x2000) ||
+        mmap_mm_hint != UINT64_C(0x45000) ||
+        mmap_mm_length != UINT64_C(0x3456) ||
+        mmap_mm_permissions != (KERNEL_MM_READ | KERNEL_MM_EXECUTE) ||
+        mmap_mm_flags != 0U || file_release_calls != 0U) {
+        failures++;
+    }
+    file_mmap_status = KERNEL_MM_STATUS_NO_MEMORY;
+    if (kernel_syscall_dispatch(caller, &request, &result) !=
+            KERNEL_SYSCALL_STATUS_OK ||
+        result_changed(&result, KERNEL_SYSCALL_ACTION_RETURN, -12) ||
+        file_release_calls != 1U) {
+        failures++;
+    }
+    pin_linux_result = -9;
+    if (kernel_syscall_dispatch(caller, &request, &result) !=
+            KERNEL_SYSCALL_STATUS_OK ||
+        result_changed(&result, KERNEL_SYSCALL_ACTION_RETURN, -9) ||
+        file_release_calls != 1U) {
+        failures++;
+    }
+    pin_linux_result = 0;
+    files_borrow_status = KERNEL_TASK_STATUS_RESOURCE_UNAVAILABLE;
+    if (kernel_syscall_dispatch(caller, &request, &result) !=
+            KERNEL_SYSCALL_STATUS_OK ||
+        result_changed(&result, KERNEL_SYSCALL_ACTION_RETURN, -9)) {
+        failures++;
+    }
+    files_borrow_status = KERNEL_TASK_STATUS_OK;
+    request.arguments[5] = 1U;
+    if (kernel_syscall_dispatch(caller, &request, &result) !=
+            KERNEL_SYSCALL_STATUS_OK ||
+        result_changed(&result, KERNEL_SYSCALL_ACTION_RETURN, -22)) {
+        failures++;
+    }
+    request.arguments[5] = 0U;
+    request.arguments[3] = 1U;
+    if (kernel_syscall_dispatch(caller, &request, &result) !=
+            KERNEL_SYSCALL_STATUS_OK ||
+        result_changed(&result, KERNEL_SYSCALL_ACTION_RETURN, -95)) {
         failures++;
     }
 

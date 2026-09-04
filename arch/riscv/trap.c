@@ -139,8 +139,13 @@ void riscv_trap_dispatch(struct riscv_trap_frame *frame)
                 return;
             }
             if (status == KERNEL_MM_STATUS_NOT_MAPPED) {
-                kernel_user_thread_exit(KERNEL_THREAD_EXIT_USER_FAULT,
-                                        frame->scause,
+                kernel_user_thread_exit(KERNEL_THREAD_EXIT_SIGNAL,
+                                        11U,
+                                        frame->stval);
+            }
+            if (status == KERNEL_MM_STATUS_BUS_FAULT) {
+                kernel_user_thread_exit(KERNEL_THREAD_EXIT_SIGNAL,
+                                        7U,
                                         frame->stval);
             }
             if (status == KERNEL_MM_STATUS_NO_MEMORY) {

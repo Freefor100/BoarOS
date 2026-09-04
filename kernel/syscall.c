@@ -3,6 +3,8 @@
 #include <kernel/files.h>
 #include <kernel/fs_context.h>
 #include <kernel/mm.h>
+#include <kernel/open_file.h>
+#include <kernel/page.h>
 #include <kernel/syscall.h>
 #include <kernel/task.h>
 #include <kernel/uaccess.h>
@@ -273,12 +275,16 @@ static enum kernel_syscall_status decode_mmap(
     const struct kernel_syscall_request *request,
     struct kernel_syscall_result *decoded)
 {
+    struct kernel_files *files;
     struct kernel_mm *mm;
+    struct kernel_open_file_description *file = 0;
     uint64_t protections = request->arguments[2];
     uint64_t flags = request->arguments[3];
     uint64_t mapped_address;
     uint32_t mm_flags = 0U;
+    int64_t linux_result;
     enum kernel_mm_status status;
+    enum kernel_task_status task_status;
 
     decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
     if ((protections & ~(LINUX_PROT_READ | LINUX_PROT_WRITE |
@@ -286,12 +292,11 @@ static enum kernel_syscall_status decode_mmap(
         (flags & ~LINUX_MAP_KNOWN_FLAGS) != 0U ||
         ((flags & LINUX_MAP_FIXED) != 0U &&
          (flags & LINUX_MAP_FIXED_NOREPLACE) != 0U) ||
-        request->arguments[5] != 0U) {
+        (request->arguments[5] & BOAROS_PAGE_MASK) != 0U) {
         decoded->value = -KERNEL_EINVAL;
         return KERNEL_SYSCALL_STATUS_OK;
     }
     if ((flags & LINUX_MAP_TYPE_MASK) != LINUX_MAP_PRIVATE ||
-        (flags & LINUX_MAP_ANONYMOUS) == 0U ||
         (flags & LINUX_MAP_POPULATE) != 0U) {
         decoded->value = -KERNEL_ENOTSUP;
         return KERNEL_SYSCALL_STATUS_OK;
@@ -305,13 +310,46 @@ static enum kernel_syscall_status decode_mmap(
         KERNEL_TASK_STATUS_OK) {
         return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     }
-    status = kernel_mm_mmap_anonymous(
-        mm,
-        request->arguments[0],
-        request->arguments[1],
-        mm_permissions_from_linux(protections),
-        mm_flags,
-        &mapped_address);
+    if ((flags & LINUX_MAP_ANONYMOUS) != 0U) {
+        status = kernel_mm_mmap_anonymous(
+            mm,
+            request->arguments[0],
+            request->arguments[1],
+            mm_permissions_from_linux(protections),
+            mm_flags,
+            &mapped_address);
+    } else {
+        task_status = kernel_task_files_borrow(caller, &files);
+        if (task_status == KERNEL_TASK_STATUS_RESOURCE_UNAVAILABLE) {
+            decoded->value = -KERNEL_EBADF;
+            return KERNEL_SYSCALL_STATUS_OK;
+        }
+        if (task_status != KERNEL_TASK_STATUS_OK ||
+            kernel_files_pin(files,
+                             (int64_t)request->arguments[4],
+                             &file,
+                             &linux_result) != KERNEL_FILES_STATUS_OK) {
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+        }
+        if (linux_result != 0) {
+            decoded->value = linux_result;
+            return KERNEL_SYSCALL_STATUS_OK;
+        }
+        status = kernel_mm_mmap_file_private(
+            mm,
+            &file,
+            request->arguments[0],
+            request->arguments[1],
+            request->arguments[5],
+            mm_permissions_from_linux(protections),
+            mm_flags,
+            &mapped_address);
+        if (status != KERNEL_MM_STATUS_OK &&
+            kernel_open_file_release(&file) !=
+                KERNEL_OPEN_FILE_STATUS_OK) {
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+        }
+    }
     if (status != KERNEL_MM_STATUS_OK &&
         status != KERNEL_MM_STATUS_INVALID_ARGUMENT &&
         status != KERNEL_MM_STATUS_NO_MEMORY &&

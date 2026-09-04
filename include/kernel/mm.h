@@ -6,6 +6,8 @@
 
 #include <stdint.h>
 
+struct kernel_open_file_description;
+
 #define KERNEL_MM_READ (UINT32_C(1) << 0U)
 #define KERNEL_MM_WRITE (UINT32_C(1) << 1U)
 #define KERNEL_MM_EXECUTE (UINT32_C(1) << 2U)
@@ -26,6 +28,7 @@ enum kernel_mm_status {
     KERNEL_MM_STATUS_CLEANUP_REQUIRED,
     KERNEL_MM_STATUS_STATE,
     KERNEL_MM_STATUS_CONFLICT,
+    KERNEL_MM_STATUS_BUS_FAULT,
 };
 
 enum kernel_mm_state {
@@ -39,6 +42,7 @@ enum kernel_mm_state {
 enum kernel_mm_cleanup_stage {
     KERNEL_MM_CLEANUP_NONE = 0,
     KERNEL_MM_CLEANUP_VMAS,
+    KERNEL_MM_CLEANUP_FILE_SOURCES,
     KERNEL_MM_CLEANUP_SPACE,
     KERNEL_MM_CLEANUP_RECORD,
 };
@@ -114,6 +118,17 @@ enum kernel_mm_status kernel_mm_mmap_anonymous(
     struct kernel_mm *mm,
     uint64_t hint,
     uint64_t length,
+    uint32_t permissions,
+    uint32_t flags,
+    uint64_t *address);
+
+/* Success consumes *file; failure leaves the caller's OFD reference intact. */
+enum kernel_mm_status kernel_mm_mmap_file_private(
+    struct kernel_mm *mm,
+    struct kernel_open_file_description **file,
+    uint64_t hint,
+    uint64_t length,
+    uint64_t file_offset,
     uint32_t permissions,
     uint32_t flags,
     uint64_t *address);

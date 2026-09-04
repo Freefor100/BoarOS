@@ -38,6 +38,7 @@ enum kernel_vma_role {
 enum kernel_vma_fault_policy {
     KERNEL_VMA_FAULT_RESIDENT_REQUIRED = 0,
     KERNEL_VMA_FAULT_DEMAND_ZERO,
+    KERNEL_VMA_FAULT_FILE_PRIVATE,
 };
 
 /* A value copy; callers must not retain backing as a standalone owner. */
@@ -105,6 +106,11 @@ enum kernel_vma_status kernel_vma_set_overlaps(
     uint64_t start,
     uint64_t end,
     int *overlaps);
+
+enum kernel_vma_status kernel_vma_set_backing_in_use(
+    const struct kernel_vma_set *set,
+    const void *backing,
+    int *in_use);
 
 /* replacement == NULL prepares a Linux munmap-style range removal. */
 enum kernel_vma_status kernel_vma_set_prepare_replace(

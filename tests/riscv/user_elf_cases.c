@@ -1265,8 +1265,8 @@ static unsigned long run_oom_and_cleanup_cases(void)
         root_cleanup_space.state != RISCV_SV39_USER_SPACE_CLEANUP ||
         root_cleanup_space.table_pages != 0U ||
         root_cleanup_space.leaf_pages != 0U ||
-        root_cleanup_space.cleanup_page_owned == 0U ||
-        root_cleanup_space.cleanup_page_address != inaccessible_page ||
+        root_cleanup_space.cleanup_page_count != 1U ||
+        root_cleanup_space.cleanup_page_addresses[0] != inaccessible_page ||
         entry_changed(&entry) ||
         physical_page_available(&cleanup_allocator) >= available) {
         inaccessible_page = 0U;
@@ -1301,8 +1301,8 @@ static unsigned long run_oom_and_cleanup_cases(void)
             RISCV_SV39_USER_SPACE_CLEANUP ||
         rollback_cleanup_space.table_pages != 2U ||
         rollback_cleanup_space.leaf_pages != 0U ||
-        rollback_cleanup_space.cleanup_page_owned == 0U ||
-        rollback_cleanup_space.cleanup_page_address != inaccessible_page) {
+        rollback_cleanup_space.cleanup_page_count != 1U ||
+        rollback_cleanup_space.cleanup_page_addresses[0] != inaccessible_page) {
         inaccessible_page = 0U;
         fail_after_first_access_page = 0U;
         return 9U;
@@ -1330,8 +1330,8 @@ static unsigned long run_oom_and_cleanup_cases(void)
         cleanup_space.state != RISCV_SV39_USER_SPACE_CLEANUP ||
         cleanup_space.table_pages != 3U ||
         cleanup_space.leaf_pages != 0U ||
-        cleanup_space.cleanup_page_owned == 0U ||
-        cleanup_space.cleanup_page_address != inaccessible_page ||
+        cleanup_space.cleanup_page_count != 1U ||
+        cleanup_space.cleanup_page_addresses[0] != inaccessible_page ||
         entry_changed(&entry) ||
         physical_page_available(&cleanup_allocator) >= available) {
         inaccessible_page = 0U;

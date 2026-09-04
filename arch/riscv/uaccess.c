@@ -42,7 +42,8 @@ static enum kernel_uaccess_status resolve_user_page(
             user_address,
             required_permissions);
         if (mm_status == KERNEL_MM_STATUS_NOT_MAPPED ||
-            mm_status == KERNEL_MM_STATUS_ADDRESS_SPACE) {
+            mm_status == KERNEL_MM_STATUS_ADDRESS_SPACE ||
+            mm_status == KERNEL_MM_STATUS_BUS_FAULT) {
             return KERNEL_UACCESS_STATUS_FAULT;
         }
         if (mm_status != KERNEL_MM_STATUS_OK ||

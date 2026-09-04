@@ -7,7 +7,7 @@
 | 文件 | 当前职责 |
 |---|---|
 | `include/kernel/page.h` | 从构建目标导出页大小和掩码 |
-| `include/kernel/physical_page.h`、`kernel/physical_page.c` | 管理显式分配器对象、bootstrap→buddy 状态迁移、单页/连续页所有权和计数 |
+| `include/kernel/physical_page.h`、`kernel/physical_page.c` | 管理显式分配器对象、bootstrap→buddy 状态迁移、单页共享引用、连续页所有权、压力回收入口和计数 |
 | `tests/riscv/physical_page_cases.c` | 验证 bootstrap 兼容、buddy split/coalesce、状态分区和失败不变量 |
 | `tests/riscv/physical_page_main.c`、`tests/page-riscv.sh` | 构建并运行独立的 QEMU 聚焦测试内核 |
 
@@ -43,6 +43,16 @@ finalized 后，`physical_page_allocate_order(order)` 分配 `2^order` 个物理
 签名保持不变，在 finalized 模式委托给 order 0，因此 Sv39、MM 和 scheduler 不需要
 识别分配器模式。失败不改写分配输出或 `available_pages`。
 
+finalized 的 order-0 页可用 `physical_page_acquire()` 增加 32 位引用，
+`physical_page_release()` 只在末引用消失时把页归还 buddy；
+`physical_page_reference_count()` 供 COW 和缓存回收判断共享状态。高阶块仍是单 owner，
+不能通过单页 acquire 拆分引用，避免让连续分配的 tail 生命周期失去统一边界。引用达到
+`UINT32_MAX`、对 free/internal/tail 操作或在 bootstrap 阶段 acquire 都会失败且不改变状态。
+
+分配器还允许注册一个压力回收回调。一次 buddy 分配返回 `EMPTY` 时，若当前不在回调中，
+分配器以所需页数调用回收器并只重试一次；递归抑制防止回收器内部的堆/页分配再次进入自身。
+当前唯一回收器是根挂载的文件页缓存，卸载和销毁缓存前必须先从分配器注销。
+
 `physical_page_resolve()` 为持有分配页的调用者提供受检查的物理地址访问。bootstrap
 模式只能按发放历史检查；finalized 模式还要求 metadata 为 allocated head/tail，明确
 拒绝 free 和 internal 页。两种模式都只在访问回调返回非空指针后写输出。
@@ -50,8 +60,8 @@ finalized 后，`physical_page_allocate_order(order)` 分配 `2^order` 个物理
 `physical_page_total()` 保留所有对齐可用页的原始总数；
 `physical_page_available()` 在 finalized 后排除 bootstrap owner 与 metadata；
 `physical_page_metadata_pages()` 只在 finalized 后返回内部占用。metadata 每个物理页
-使用 12 字节，包含双向链索引、order 与所有权状态；16 GiB/4 KiB 的理论完整 RAM
-需要 48 MiB，即约 0.293% RAM，实际值按排除固件和内核后的页数向上取整。
+使用 16 字节，包含双向链索引、引用数、order 与所有权状态；16 GiB/4 KiB 的理论完整 RAM
+需要 64 MiB，即约 0.391% RAM，实际值按排除固件和内核后的页数向上取整。
 
 ## 算法与限制
 
@@ -62,8 +72,9 @@ finalize 初始化逐页 metadata，成本为 O(物理页数)，但每次启动�
 finalized 分配最多检查 32 个 order；free-list head 的插入和双向摘链为 O(1)，split
 与 coalesce 为 O(order)，不会扫描同 order 的其他空闲块。为了让 interior release 和
 resolve 能精确判定所有权，分配或释放 order N 块还会更新本次块内 `2^N` 条状态；
-常用 order-0 热路径只更新一个页记录。当前单 hart 不需要锁，SMP 接入前必须把
-free-list 与计数纳入同一同步边界。
+常用 order-0 热路径只更新一个页记录，acquire/非末 release 也只修改该页引用数。
+内存充足时不会调用回收器；只有首次分配失败才扫描缓存。当前单 hart 不需要锁，SMP
+接入前必须把 free-list、引用数、回收器注册和计数纳入同一同步边界。
 
 绑定前只允许顺序发放从未释放过的页；释放返回 `PHYSICAL_PAGE_STATUS_STATE`。
 显式 order API 只对 finalized 分配器开放，bootstrap 调用返回 `STATE`。
@@ -78,7 +89,7 @@ bootstrap 分散耗尽时 finalize 仍返回 `EMPTY`。当前 QEMU 满足该约�
 512 MiB、1 GiB 和 16 GiB 启动验证；开发板必须按
 真实 DTB 保留区和启动占用重新核对。若未来早期分配规模或稀疏内存使其不成立，应
 改为每 range metadata 或稀疏索引，而不是退回固定容量 heap。模块还没有清零分配、
-并发锁、NUMA、热插拔、CMA 或 per-CPU page cache。
+多回收器优先级、并发锁、NUMA、热插拔、CMA 或 per-CPU page cache。
 
 ## 验证
 
@@ -90,7 +101,8 @@ make test-riscv
 聚焦测试保留原有区间、耗尽、绑定、映射和失败输出契约，并新增 bootstrap owner/
 recycled/tail 导入、metadata 扣除、order 对齐、强制 split 与多级 coalesce、wrong
 order、interior/internal/outside/double-free 状态树、finalize 失败保留，以及 finalized
-resolve 拒绝空闲页。完整启动测试在 512 MiB、1 GiB 和 16 GiB QEMU 配置下通过
+resolve 拒绝空闲页。测试还覆盖 order-0 多引用、末引用归还、非法 acquire、引用溢出、
+单次压力回收重试和递归抑制。完整启动测试在 512 MiB、1 GiB 和 16 GiB QEMU 配置下通过
 direct map 执行分配—解析—释放—再分配，并精确要求
 `total - available == Sv39 table_pages + metadata_pages`；生产 idle 测试还要求 buddy
 模式在 timer 启动前已经生效。

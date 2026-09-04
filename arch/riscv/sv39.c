@@ -415,13 +415,33 @@ static enum riscv_sv39_status remember_cleanup_page(
     struct riscv_sv39_user_space *space,
     uint64_t address)
 {
-    if (space->cleanup_page_owned != 0U) {
+    if (space->cleanup_page_count >=
+        sizeof(space->cleanup_page_addresses) /
+            sizeof(space->cleanup_page_addresses[0])) {
         return RISCV_SV39_STATUS_STATE;
     }
-    space->cleanup_page_address = address;
-    space->cleanup_page_owned = 1U;
+    space->cleanup_page_addresses[space->cleanup_page_count] = address;
+    space->cleanup_page_count++;
     space->state = RISCV_SV39_USER_SPACE_CLEANUP;
     return RISCV_SV39_STATUS_CLEANUP_REQUIRED;
+}
+
+enum riscv_sv39_status riscv_sv39_user_discard_owned_page(
+    struct riscv_sv39_user_space *space,
+    uint64_t physical_address)
+{
+    if (space == 0 ||
+        (space->state != RISCV_SV39_USER_SPACE_LIVE &&
+         space->state != RISCV_SV39_USER_SPACE_CLEANUP) ||
+        space->allocator == 0 ||
+        (physical_address & BOAROS_PAGE_MASK) != 0U) {
+        return RISCV_SV39_STATUS_INVALID;
+    }
+    if (physical_page_release(space->allocator, physical_address) ==
+        PHYSICAL_PAGE_STATUS_OK) {
+        return RISCV_SV39_STATUS_OK;
+    }
+    return remember_cleanup_page(space, physical_address);
 }
 
 static enum riscv_sv39_status allocate_runtime_table(
@@ -605,8 +625,9 @@ enum riscv_sv39_status riscv_sv39_user_space_init(
             result.protected_pages = 0U;
             result.cow_pages = 0U;
             result.retired_pages = 0U;
-            result.cleanup_page_address = root_address;
-            result.cleanup_page_owned = 1U;
+            result.cleanup_page_addresses[0] = root_address;
+            result.cleanup_page_addresses[1] = 0U;
+            result.cleanup_page_count = 1U;
             result.cow_copies = 0U;
             result.cow_in_place = 0U;
             result.state = RISCV_SV39_USER_SPACE_CLEANUP;
@@ -630,8 +651,9 @@ enum riscv_sv39_status riscv_sv39_user_space_init(
     result.protected_pages = 0U;
     result.cow_pages = 0U;
     result.retired_pages = 0U;
-    result.cleanup_page_address = 0U;
-    result.cleanup_page_owned = 0U;
+    result.cleanup_page_addresses[0] = 0U;
+    result.cleanup_page_addresses[1] = 0U;
+    result.cleanup_page_count = 0U;
     result.cow_copies = 0U;
     result.cow_in_place = 0U;
     result.state = RISCV_SV39_USER_SPACE_LIVE;
@@ -1798,8 +1820,9 @@ static enum riscv_sv39_status init_forked_user_space(
             result.protected_pages = 0U;
             result.cow_pages = 0U;
             result.retired_pages = 0U;
-            result.cleanup_page_address = root_address;
-            result.cleanup_page_owned = 1U;
+            result.cleanup_page_addresses[0] = root_address;
+            result.cleanup_page_addresses[1] = 0U;
+            result.cleanup_page_count = 1U;
             result.cow_copies = 0U;
             result.cow_in_place = 0U;
             result.state = RISCV_SV39_USER_SPACE_CLEANUP;
@@ -1822,8 +1845,9 @@ static enum riscv_sv39_status init_forked_user_space(
     result.protected_pages = 0U;
     result.cow_pages = 0U;
     result.retired_pages = 0U;
-    result.cleanup_page_address = 0U;
-    result.cleanup_page_owned = 0U;
+    result.cleanup_page_addresses[0] = 0U;
+    result.cleanup_page_addresses[1] = 0U;
+    result.cleanup_page_count = 0U;
     result.cow_copies = 0U;
     result.cow_in_place = 0U;
     result.state = RISCV_SV39_USER_SPACE_LIVE;
@@ -2045,8 +2069,9 @@ enum riscv_sv39_status riscv_sv39_user_space_move(
     source->protected_pages = 0U;
     source->cow_pages = 0U;
     source->retired_pages = 0U;
-    source->cleanup_page_address = 0U;
-    source->cleanup_page_owned = 0U;
+    source->cleanup_page_addresses[0] = 0U;
+    source->cleanup_page_addresses[1] = 0U;
+    source->cleanup_page_count = 0U;
     source->cow_copies = 0U;
     source->cow_in_place = 0U;
     source->state = RISCV_SV39_USER_SPACE_MOVED;
@@ -2192,6 +2217,11 @@ enum riscv_sv39_status riscv_sv39_user_space_destroy(
         space->state != RISCV_SV39_USER_SPACE_CLEANUP) {
         return RISCV_SV39_STATUS_STATE;
     }
+    if (space->cleanup_page_count >
+        sizeof(space->cleanup_page_addresses) /
+            sizeof(space->cleanup_page_addresses[0])) {
+        return RISCV_SV39_STATUS_STATE;
+    }
     if (space->table_pages != 0U) {
         satp = riscv_sv39_current_satp();
         root_ppn = space->root_address >> BOAROS_PAGE_SHIFT;
@@ -2200,14 +2230,17 @@ enum riscv_sv39_status riscv_sv39_user_space_destroy(
             return RISCV_SV39_STATUS_STATE;
         }
     }
-    if (space->cleanup_page_owned != 0U) {
-        if (physical_page_release(space->allocator,
-                                  space->cleanup_page_address) !=
+    while (space->cleanup_page_count != 0U) {
+        uint32_t cleanup_index = space->cleanup_page_count - 1U;
+
+        if (physical_page_release(
+                space->allocator,
+                space->cleanup_page_addresses[cleanup_index]) !=
             PHYSICAL_PAGE_STATUS_OK) {
             return RISCV_SV39_STATUS_CLEANUP_REQUIRED;
         }
-        space->cleanup_page_address = 0U;
-        space->cleanup_page_owned = 0U;
+        space->cleanup_page_addresses[cleanup_index] = 0U;
+        space->cleanup_page_count--;
     }
     if (space->table_pages == 0U) {
         if (space->root_address != 0U || space->leaf_pages != 0U ||
@@ -2255,8 +2288,9 @@ enum riscv_sv39_status riscv_sv39_user_space_destroy(
     space->protected_pages = 0U;
     space->cow_pages = 0U;
     space->retired_pages = 0U;
-    space->cleanup_page_address = 0U;
-    space->cleanup_page_owned = 0U;
+    space->cleanup_page_addresses[0] = 0U;
+    space->cleanup_page_addresses[1] = 0U;
+    space->cleanup_page_count = 0U;
     space->cow_copies = 0U;
     space->cow_in_place = 0U;
     space->state = RISCV_SV39_USER_SPACE_DESTROYED;

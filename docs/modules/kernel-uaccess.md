@@ -35,7 +35,7 @@ enum kernel_uaccess_status kernel_copy_string_from_user(
 
 非零固定长度请求首先验证整个半开区间位于 Sv39 低半区 `[0, RISCV_SV39_USER_LIMIT)`；整数溢出或越过上限在复制前返回 `KERNEL_UACCESS_STATUS_FAULT`，`bytes_copied=0`。零长度请求不检查用户地址或内核 buffer，直接成功并报告 0。
 
-合法范围按 4 KiB 基页边界切分。每个片段先经 `kernel_mm_lookup()` 查询物理地址和通用权限：若 PTE 尚未驻留，uaccess 用实际读/写方向调用 `kernel_mm_resolve_user_fault()`；只有 anonymous `DEMAND_ZERO` VMA 可以由此分配零页，成功后重查 PTE。写入用户空间要求 `USER|WRITE`，读取用户空间要求 `USER|READ`，随后通过物理页分配器已绑定的 direct-map 访问函数复制。VMA 外、`PROT_NONE` 或权限不足返回 `FAULT`；MM 状态、页表结构、分配失败或已映射物理页无法解析返回 `STATE`，不能伪装成普通用户 `EFAULT`。
+合法范围按 4 KiB 基页边界切分。每个片段先经 `kernel_mm_lookup()` 查询物理地址和通用权限：若 PTE 尚未驻留，uaccess 用实际读/写方向调用 `kernel_mm_resolve_user_fault()`；anonymous `DEMAND_ZERO`、file-private 和 COW 页都复用该解析器，成功后重查 PTE。写入用户空间要求 `USER|WRITE`，读取用户空间要求 `USER|READ`，随后通过物理页分配器已绑定的 direct-map 访问函数复制。VMA 外、`PROT_NONE`、权限不足或文件整页越过 EOF 返回 `FAULT`；MM 状态、页表结构、分配失败或已映射物理页无法解析返回 `STATE`，不能伪装成普通用户 `EFAULT`。
 
 固定长度复制不是事务。若前面的完整片段已经复制，后续页未映射或权限不足，函数保留已复制的连续前缀并精确报告 `bytes_copied`；这与 Linux usercopy 允许部分修改目标缓冲区的内部语义一致。文件 `read` 依据这个前缀提交 open-file offset；`uname` 和文件层只把 `FAULT` 转成用户可见的 `-EFAULT`，内核状态错误仍由 syscall/Trap 边界判为 fatal。
 
@@ -43,7 +43,7 @@ enum kernel_uaccess_status kernel_copy_string_from_user(
 
 ## 并发与性能边界
 
-当前 uaccess 只对 scheduler 当前、已经激活的 MM 提交新页；VMA/PTE 检查会在真正分配前拒绝非法范围。单 hart、关中断 syscall 路径保证 lookup、fault-in、物理页解析和复制之间没有并发 unmap/mprotect。接入 SMP、共享 MM 或 COW 时，必须一起定义 MM 读锁、页固定、分配失败、部分复制和 TLB shootdown 协议；公共 syscall ABI 不需要因此改变。
+当前 uaccess 只对 scheduler 当前、已经激活的 MM 提交新页；VMA/PTE 检查会在真正分配前拒绝非法范围。单 hart、关中断 syscall 路径保证 lookup、fault-in/COW、物理页解析和复制之间没有并发 unmap/mprotect。接入 SMP 或共享 MM 时，必须一起定义 MM 读锁、页固定、原子页引用、分配失败、部分复制和 TLB shootdown 协议；公共 syscall ABI 不需要因此改变。
 
 驻留页每个基页进行一次三级软件页表查询和一次物理页解析，随后执行页内线性字节复制；首次提交的页额外承担 VMA 二分查找、页分配/清零、PTE 写入和单页 `SFENCE.VMA`。uaccess 不切换 `satp`，也不修改 `sstatus.SUM`。文件 `read` 已以 4 KiB staging chunk 使用该路径，但当前只用结构成本和 QEMU 正确性测试约束，尚未取得开发板吞吐、TLB miss 或 cache 数据。应在真实工作负载上比较软件遍历与 RISC-V SUM+异常表快路径，再决定阈值或替换策略。
 
@@ -60,4 +60,4 @@ make test-riscv
 
 聚焦测试分别覆盖 copy-to、copy-from 和字符串复制的合法同页/跨页、零长度、整体用户范围、读写权限、容量内缺少 NUL、跨入未映射页后的精确前缀、非法内核参数、已释放 MM 和物理页访问失败。VMA 测试让 copy-to 首次提交匿名 mmap 页；真实 U-mode 测试验证 `uname` 的跨页 Linux ABI；文件测试验证跨页路径、超过一页的读缓冲区、`-EFAULT` 与 offset 提交。
 
-当前没有 COW、SUM/异常表快路径、SMP 映射稳定协议或面向原子用户结构读取的序列化辅助接口。页分配失败目前分类为内核侧 `STATE`，尚未形成进程 OOM 终止路径。
+当前没有 SUM/异常表快路径、SMP 映射稳定协议或面向原子用户结构读取的序列化辅助接口。硬件用户 fault 的页分配耗尽会终止任务；syscall 内 uaccess 遇到同类耗尽仍分类为内核侧 `STATE`，尚未形成可返回的进程 OOM 协议。

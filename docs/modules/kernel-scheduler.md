@@ -57,14 +57,14 @@ RISC-V clone 接口接收 syscall 入口保存的完整寄存器快照；通用 
 
 - 子进程获得新 TID/TGID，线程组只有自己，进程组继承父进程；
 - RISC-V Trap Frame 完整复制，子进程 `a0=0`，父进程得到子 PID，两者都从 ecall 后一条指令继续；
-- MM 通过 `kernel_mm_fork()` 深复制用户叶子页和页表，父子同一 VA 与权限对应不同 PA；
+- MM 通过 `kernel_mm_fork()` 克隆 VMA/页表并以 COW 共享用户页，父子写入后按需获得不同 PA；
 - fd 表和 descriptor flags 独立复制，open file description 引用共享，因此 offset 与底层 file 生命周期共享；
 - fs context 独立复制当前 cwd，并继续借用同一个 root mount；
 - exec 清理事务不继承。
 
 构造过程在子任务进入父子树和 ready 队列前完成。失败先释放已经取得的 fs/files/MM/TID/任务页；不能立即完成的 owner 放入不发布 completion 的 exited 清理队列，父进程仍得到准确的 `-ENOMEM` 或 `-EAGAIN`，不会看到半构造子进程。
 
-当前 eager copy 的 fork 成本与已提交用户页数线性相关，并在复制期间关闭本 hart 中断；这是正确性基线，不是最终性能形态。稳定的 `kernel_mm_fork()` 边界允许以后换成 COW，而不改变 scheduler、files 或 wait ABI。
+当前 COW fork 仍需遍历已提交页并建立子页表，时间与页数线性，且构造期间关闭本 hart 中断；它避免了 fork 时的数据页复制和同量内存峰值，但最坏中断延迟仍需在开发板测量。文件 VMA 的 OFD 来源也在发布子任务前克隆，失败不会留下半构造父子关系。
 
 ## 父子树、状态与 wait
 
@@ -89,7 +89,7 @@ EXITED  -- parentless retry complete -----------> PID/task page released
 
 `wait4` 支持 `pid>0`、`pid==0`、`pid==-1` 和 `pid<-1` 的 Linux 选择规则，并接受 `WNOHANG/WUNTRACED/WCONTINUED/__WNOTHREAD/__WALL/__WCLONE` 位。当前没有 stopped/continued 事件，因此后两类选项只影响等待集合，不会制造事件。普通 SIGCHLD 子进程被 `__WCLONE` 排除，除非同时使用 `__WALL`。无匹配子进程返回 `-ECHILD`；有匹配但无事件时 `WNOHANG` 返回 0，否则父进程进入 BLOCKED，由子进程成为 zombie 时唤醒。
 
-退出码编码为 `(status & 0xff) << 8`。用户同步故障转换为 SIGILL/SIGTRAP/SIGBUS/SIGSEGV 形态的 wait status；用户 demand-zero 缺页耗尽物理页时，内部 completion 保留 `RESOURCE/NO_MEMORY`，父进程看到 SIGKILL 形态的 wait status 9。非空 rusage 当前返回 `-ENOTSUP`；未知 option 返回 `-EINVAL`，无法安全取负的 `INT32_MIN` pid 返回 `-ESRCH`。与 Linux 回收顺序一致，zombie 先被逻辑回收，再向用户复制 status；因此 status 指针错误返回 `-EFAULT` 时，该子进程也已不可再次 wait。
+退出码编码为 `(status & 0xff) << 8`。已分类的页访问错误以内部 `SIGNAL` 原因保存 `SIGSEGV(11)` 或 `SIGBUS(7)`；其他用户同步故障按 scause 转换为 SIGILL/SIGTRAP/SIGBUS/SIGSEGV 形态 wait status。用户缺页耗尽物理页时，内部 completion 保留 `RESOURCE/NO_MEMORY`，父进程看到 SIGKILL 形态的 wait status 9。当前这只是不可捕获的终止与 wait 编码，还没有信号投递/handler。非空 rusage 当前返回 `-ENOTSUP`；未知 option 返回 `-EINVAL`，无法安全取负的 `INT32_MIN` pid 返回 `-ESRCH`。与 Linux 回收顺序一致，zombie 先被逻辑回收，再向用户复制 status；因此 status 指针错误返回 `-EFAULT` 时，该子进程也已不可再次 wait。
 
 ## 退出、reparent 与失败恢复
 
@@ -108,7 +108,7 @@ pending exec transaction -> files/open descriptions
 
 当前单 hart 通过关闭 SIE 串行化 runqueue、父子树、PID、files/fs/MM 生命周期；这不是 SMP 锁。接入多 hart 时必须为 runqueue、进程树、PID 分配、文件表/OFD 引用和 MM/COW 增加锁或原子协议，并处理远端 TLB shootdown。
 
-tick/context switch 只检查 task/queue 常量状态、读取缓存的 `satp` 并切换 context，不获取资源引用、不遍历父子树、不复制页。当前 ASID 0 的地址空间切换执行全局 `SFENCE.VMA`，是明确的切换成本。process 路径按子进程数线性扫描 wait 集合；fork 的主要成本是 eager MM copy 和 fd/cwd 复制。开发板性能验证尚未进行，不能据 QEMU 时间宣称硬件性能。
+tick/context switch 只检查 task/queue 常量状态、读取缓存的 `satp` 并切换 context，不获取资源引用、不遍历父子树、不复制页。当前 ASID 0 的地址空间切换执行全局 `SFENCE.VMA`，是明确的切换成本。process 路径按子进程数线性扫描 wait 集合；fork 的主要成本是用户页表/VMA 遍历以及 fd/cwd/OFD 来源复制，数据页只在后续 COW 写 fault 时复制。开发板性能验证尚未进行，不能据 QEMU 时间宣称硬件性能。
 
 ## 验证与限制
 
@@ -124,6 +124,6 @@ make test-exec-riscv
 make test-riscv
 ```
 
-聚焦测试覆盖调度状态、创建与清理失败；MM/files 测试分别证明地址空间深复制和 OFD 引用共享。生产 ext4 三映像链覆盖 clone 双返回、PPID、WNOHANG/阻塞唤醒、wait selector、退出码、故障状态、EFAULT 后已回收、fd offset 共享、MM 写隔离、孙进程向 PID 1 reparent，以及最终 heap/物理页基线。demand-page OOM 版本验证资源退出编码为 wait status 9，且仍走同一 zombie/reap 资源闭环。
+聚焦测试覆盖调度状态、创建与清理失败；MM/files 测试分别证明地址空间 COW 与 OFD 引用共享。生产 ext4 三映像链覆盖 clone 双返回、PPID、WNOHANG/阻塞唤醒、wait selector、退出码、`SIGSEGV`/`SIGBUS` 状态、EFAULT 后已回收、fd offset 共享、MM 写隔离、孙进程向 PID 1 reparent，以及最终 heap/物理页基线。demand-page OOM 版本验证资源退出编码为 wait status 9，且仍走同一 zombie/reap 资源闭环。
 
-当前限制是 RISC-V64 单 hart、ASID 0、FIFO/单 tick 时间片、4 KiB 单页内核栈、单成员线程组和普通 SIGCHLD clone。尚无 `CLONE_VM/CLONE_FILES/CLONE_THREAD`、COW、信号投递、futex、vfork、rusage、停止/继续事件、SMP、内核栈 guard、F/V 上下文或 LoongArch context。
+当前限制是 RISC-V64 单 hart、ASID 0、FIFO/单 tick 时间片、4 KiB 单页内核栈、单成员线程组和普通 SIGCHLD clone。尚无 `CLONE_VM/CLONE_FILES/CLONE_THREAD`、信号投递/handler、futex、vfork、rusage、停止/继续事件、SMP COW 同步、内核栈 guard、F/V 上下文或 LoongArch context。

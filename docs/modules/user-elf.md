@@ -92,4 +92,4 @@ make test-riscv
 
 前两项覆盖随机读解析、source I/O 失败、格式与装载错误树，其中装载用例还读取真实用户 PTE 检查 `argc/argv/envp/auxv`、空参数规范化、128 KiB 恰好可接受的边界、8 MiB 预留区、64 KiB 初始余量、永久 guard 和由最高 load 末端计算的初始 break；它还验证静态 ELF VMA 的共享页权限并集、完整栈 reserve 和 guard 孔洞。第三项由 bare-metal 工具链独立链接三个静态 `ET_EXEC`，用 `readelf` 检查 ELF 形态，再通过内存 source 运行。`test-root-init-riscv` 与 `test-exec-riscv` 则把独立 ELF 写入 ext4，由 VFS source 驱动装载和 VMA 登记；`test-brk-riscv` 还验证连续 exec 会重置 break。
 
-当前支持内存与已打开 VFS 文件的同步随机读；静态 VMA 登记要求 source 在紧随装载后的重新解析期间仍保持稳定，当前只读根与 exec file owner 满足这一条件。用户指针捕获由通用 exec 层完成。只支持 RISC-V 静态 `ET_EXEC` 和 4 KiB 用户页；匿名栈和 `brk` heap 支持 demand-zero，没有页缓存、共享/按需文件页、异步 I/O、`ET_DYN`/ASLR、动态解释器、重定位、TLS、完整 Linux auxv、VDSO 或 LoongArch 物化器。
+当前支持内存与已打开 VFS 文件的同步随机读；静态 VMA 登记要求 source 在紧随装载后的重新解析期间仍保持稳定，当前只读根与 exec file owner 满足这一条件。用户指针捕获由通用 exec 层完成。只支持 RISC-V 静态 `ET_EXEC` 和 4 KiB 用户页；匿名栈和 `brk` heap 支持 demand-zero，普通文件另有共享页缓存与 private mmap，但 ELF `PT_LOAD` 仍由装载器同步物化，不使用 file-backed demand paging。尚无异步 I/O、`ET_DYN`/ASLR、动态解释器、重定位、TLS、完整 Linux auxv、VDSO 或 LoongArch 物化器。

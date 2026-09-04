@@ -197,8 +197,8 @@ static void check_completion(
     if (completion_count == 2U) {
         if (completion->kind != KERNEL_THREAD_KIND_USER ||
             completion->tid != 2 || completion->tgid != 2 ||
-            completion->reason != KERNEL_THREAD_EXIT_USER_FAULT ||
-            completion->status != RISCV_STORE_PAGE_FAULT ||
+            completion->reason != KERNEL_THREAD_EXIT_SIGNAL ||
+            completion->status != 11U ||
             completion->detail != fault_entry) {
             test_failures++;
         }
@@ -207,8 +207,8 @@ static void check_completion(
     if (completion_count != 3U ||
         completion->kind != KERNEL_THREAD_KIND_USER ||
         completion->tid != 3 || completion->tgid != 3 ||
-        completion->reason != KERNEL_THREAD_EXIT_USER_FAULT ||
-        completion->status != RISCV_STORE_PAGE_FAULT ||
+        completion->reason != KERNEL_THREAD_EXIT_SIGNAL ||
+        completion->status != 11U ||
         completion->detail != guard_fault_address) {
         test_failures++;
     }

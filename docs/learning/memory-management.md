@@ -83,11 +83,17 @@ buddy_pfn = pfn XOR (1 << order)
 继续向上合并。BoarOS 在 metadata 中保存双向链索引，因此已知 buddy head 可以 O(1)
 摘链；split/coalesce 只随 order 数增长，不再像启动回收链那样扫描所有空闲页。
 
-逐页 metadata 让错误语义也更精确：allocated head 记录原 order，allocated tail 不能
-单独释放，free head/tail 能识别重复释放，internal 页永远不能返回给调用者。代价是
-finalize 需要 O(页数) 初始化，并永久占用每页 12 字节；4 KiB 页下约占 RAM 的
-0.293%，16 GiB 理论完整 RAM 为 48 MiB。分配/释放大块还要更新本次块内的逐页状态，
+逐页 metadata 让错误语义也更精确：allocated head 记录原 order 和引用数，allocated tail
+不能单独释放，free head/tail 能识别重复释放，internal 页永远不能返回给调用者。代价是
+finalize 需要 O(页数) 初始化，并永久占用每页 16 字节；4 KiB 页下约占 RAM 的
+0.391%，16 GiB 理论完整 RAM 为 64 MiB。分配/释放大块还要更新本次块内的逐页状态，
 但常用 order 0 只触碰一条记录。
+
+共享物理页和共享虚拟地址空间不是一回事。COW 与只读文件缓存只让不同 PTE owner 持有
+同一 order-0 页的独立引用；每次 release 先减引用，末引用才归还 buddy。高阶连续块仍保持
+单 owner，避免任一 tail 单独存活。内存压力回收则发生在首次分配失败的慢路径：分配器调用
+一个已注册回收器并只重试一次，同时抑制回调中的递归回收。它让页缓存可回收，但不把 LRU、
+文件或 I/O 知识塞进通用 buddy 接口。
 
 metadata 从可用 RAM 自托管，而不是编进固定数组或预留固定 heap。这样 512 MiB、
 1 GiB、16 GiB 乃至不同开发板容量都按实际 RAM 缩放；当前实现要求某个未发放 range
@@ -219,7 +225,7 @@ VMA 存在   + PTE 存在    -> 当前可由硬件翻译
 VMA 不存在 + active PTE 存在 -> 内核错误；撤销必须先让 PTE/TLB 失效再收紧 VMA
 ```
 
-BoarOS 为 VMA 显式记录 fault policy，而不是从 role 猜测行为。静态 `ET_EXEC` 仍急切物化所有 `PT_LOAD` 页并使用 `RESIDENT_REQUIRED`：若这类 VMA 中没有 PTE，说明装载或页表状态不满足契约。栈、`brk` heap 和 private-anonymous mmap 使用 `DEMAND_ZERO`：栈 VMA 覆盖低半区顶端完整 8 MiB reserve，初始 PTE 只覆盖参数栈和 64 KiB headroom；heap VMA 只覆盖当前 program break 向上对齐的范围；mmap 先保留地址区间。其余合法页由真实 U-mode load/store page fault 或当前 MM 的 uaccess 首次访问时分配和清零。reserve 下方一页 guard 没有 VMA，因此不会因“靠近栈”被隐式扩展。
+BoarOS 为 VMA 显式记录 fault policy，而不是从 role 猜测行为。静态 `ET_EXEC` 仍急切物化所有 `PT_LOAD` 页并使用 `RESIDENT_REQUIRED`：若这类 VMA 中没有 PTE，说明装载或页表状态不满足契约。栈、`brk` heap 和 private-anonymous mmap 使用 `DEMAND_ZERO`：栈 VMA 覆盖低半区顶端完整 8 MiB reserve，初始 PTE 只覆盖参数栈和 64 KiB headroom；heap VMA 只覆盖当前 program break 向上对齐的范围；mmap 先保留地址区间。只读普通文件的 private mmap 使用 `FILE_PRIVATE`，VMA 保存文件页对齐 offset 并借用由 MM 独立持有的 OFD。其余合法页由真实 U-mode page fault 或当前 MM 的 uaccess 首次访问时提交。reserve 下方一页 guard 没有 VMA，因此不会因“靠近栈”被隐式扩展。
 
 一次当前用户任务的页故障按互斥状态分类：
 
@@ -233,31 +239,42 @@ PTE 不存在 + 匿名 DEMAND_ZERO
   +-- 物理页耗尽 ----------------------------------> 任务因资源原因退出，wait status 9
   +-- 已分配页无法访问且回滚释放也失败 ------------> CLEANUP_REQUIRED，内核 fatal
   +-- 其他页表/分配器状态错误 ----------------------> 内核 fatal
+PTE 不存在 + FILE_PRIVATE
+  +-- 页起点 >= 文件大小 --------------------------> SIGBUS，wait status 7
+  +-- read/execute fault ---------------------------> 共享缓存页，建立 COW PTE
+  +-- write fault ----------------------------------> 缓存命中则复制，否则直接读入私有页
+present COW PTE + write fault
+  +-- 物理引用数 == 1 -----------------------------> 原地恢复 W
+  +-- 物理引用数 > 1 ------------------------------> 复制一页、替换 PTE、释放旧引用
 ```
 
 页故障是同步异常，`sepc` 指向需要重试的原指令。补页成功后不能像 `ecall` 一样把 `sepc` 前移；更新 PTE 后还要执行针对该虚拟页的本地 `SFENCE.VMA`，再由 `sret` 重执行 load/store/fetch。当前所有用户地址空间使用 ASID 0，且只有单 hart，所以本地单页失效足够；SMP 下必须把远端正在运行同一 MM 的 hart 纳入 shootdown。
 
-demand-zero 把未触碰的栈/heap 页物理内存和清零成本推迟到首次访问。代价是首次触页需要 trap、VMA 二分查找、软件页表查询、可能的中间表/叶子分配与清零、PTE 写入和 TLB 失效；驻留后的普通访问仍由硬件翻译，不增加软件热路径。当前解析器为确认“确实没有 PTE”先 lookup，再由映射函数走一次叶表路径，属于 cold fault path 的重复遍历；若开发板计数显示缺页延迟重要，可在不改变 VMA/MM 接口的前提下合并 walker，但不能据 QEMU 正确性结果宣称性能收益。
+demand-zero 把未触碰的栈/heap 页物理内存和清零成本推迟到首次访问，file-private mapping 则把文件 I/O 推迟到首次触页。代价是首次触页需要 trap、VMA 二分查找、软件页表查询、可能的页分配/清零或文件 I/O、PTE 写入和 TLB 失效；驻留后的普通访问仍由硬件翻译，不增加软件热路径。缓存命中的文件读页无需复制，write-first miss 直接构造私有页，避免无用缓存页。当前解析器为确认“确实没有 PTE”先 lookup，再由映射函数走一次叶表路径，属于 cold fault path 的重复遍历；若开发板计数显示缺页延迟重要，可在不改变 VMA/MM 接口的前提下合并 walker，但不能据 QEMU 正确性结果宣称性能收益。
 
 当前 VMA 集合用按起始地址排序的连续数组：查找二分为 `O(log n)`，插入为 `O(n)`，相邻且属性相同的区间合并。对于静态 ELF、栈和少量早期匿名区间，这比树节点、旋转和更多分配更小、更容易验证，且不在当前调度热路径上。真实 `mmap` 工作负载若显示大量频繁插入/删除，才应在保持 VMA 语义不变的前提下换成平衡树或区间树；没有测量不能把“树一定更快”当成结论。
 
-## 匿名 mmap、munmap 和 mprotect 怎样协作？
+## mmap、munmap 和 mprotect 怎样协作？
 
 `mmap` 分配的是虚拟地址区间，不等于立刻分配每个物理页。anonymous-private mapping 没有文件 backing；首次读取应看到零，首次写入只影响本进程。普通地址参数只是 hint，内核可以在冲突时另选空洞；`MAP_FIXED_NOREPLACE` 要求精确地址且冲突失败，`MAP_FIXED` 则要求精确地址并破坏性替换旧映射。BoarOS 当前先尝试对齐 hint，再从栈 guard 以下 top-down 选择空洞，不做 ASLR。`MAP_STACK` 暂不改变 VMA 增长模型，`MAP_NORESERVE` 在没有 commit accounting 时与普通匿名映射等价。
 
+file-private mapping 把页对齐文件 offset 与虚拟区间对应，读页可以和 page cache 共享，写入必须通过 COW 与文件和其他映射隔离。包含 EOF 的尾页先保留有效文件字节并把页内余部补零，下一整个页才产生 `SIGBUS`。fd 是可关闭的进程槽，不能承担映射生命周期；MM 必须持有独立文件引用，直到最后一个相关 VMA 被 munmap、fixed replace 或 MM 销毁。
+
 `munmap` 的 Linux 语义允许区间包含洞：已经映射的部分被撤销，原本未映射的部分不构成错误。`mprotect` 不同，它要求整个非空区间都有 VMA，遇到洞返回 `ENOMEM`。两者都可能在起止边界拆分 VMA；若先改 PTE 后才发现 descriptor 扩容失败，会出现硬件状态已经提交而逻辑状态无法提交的问题。BoarOS 因此先校验并预留确实需要的 descriptor 容量，再修改页表/TLB，最后用不分配的 commit 完成拆分、删除、改权和相邻合并。
 
-RISC-V 叶子 PTE 的 `V=1` 才可供硬件翻译，但 `V=0` 时 RSW 两位仍可由 supervisor 保存软件状态。BoarOS 区分三种用户页 owner：
+RISC-V 叶子 PTE 的 `V=1` 才可供硬件翻译，但 `V=0` 时 RSW 两位仍可由 supervisor 保存软件状态。BoarOS 同时区分硬件有效性和软件所有权：
 
 ```text
-active:    V=1，PPN 和 R/W/X/U 供硬件使用
-protected: V=0，RSW bit 9，PPN/内容仍属于映射，可由 mprotect 恢复
-retired:   V=0，RSW bit 8，映射已撤销，PPN 只等待释放重试
+active exclusive: V=1，RSW=00，PPN 和 R/W/X/U 供硬件使用
+active COW:       V=1，RSW=01，去掉 W，共享 PPN 等待写 fault
+protected excl.:  V=0，RSW=10，PPN/内容仍属于 PROT_NONE 映射
+protected COW:    V=0，RSW=11，同时保留 PROT_NONE 与共享属性
+retired:          V=0，RSW=01，映射已撤销，PPN 只等待释放重试
 ```
 
-`PROT_NONE` 不能简单清零 PTE，否则 resident 物理页的 owner 和内容都会丢失；也不能复用 retired 标记，否则 fork/unmap/destroy 不知道它应该复制、恢复还是只释放。恢复保护时用同一 PPN 重建叶子，所以内容不变；fork 为 protected 页复制新的物理页并让子页继续保持 protected。RISC-V 规范保留 W=1、R=0 的叶子编码，项目因此把仅写请求规范化为 RW。增加执行权限前还需要 `FENCE.I` 让先前数据写入对后续取指可见，改 PTE 后再 `SFENCE.VMA` 失效旧地址翻译。
+相同 RSW 值在 `V=1` 时表示 present COW，在 `V=0` 时可表示 retired；硬件有效位给出了无歧义的第一层分类。`PROT_NONE` 不能简单清零 PTE，否则 resident 物理页的 owner 和内容都会丢失；也不能丢掉 COW 属性，否则恢复写权限可能绕过仍由其他地址空间持有的共享页。Fork 先让子页表取得所有物理引用，最后才无分配地提交父 COW PTE；失败时父权限不变。RISC-V 规范保留 W=1、R=0 的叶子编码，项目因此把仅写请求规范化为 RW。增加执行权限前还需要 `FENCE.I` 让先前数据写入对后续取指可见，改 PTE 后再 `SFENCE.VMA` 失效旧地址翻译。
 
-VMA 属于 MM 而不是 task 或单张页表。fork 必须复制其逻辑布局，最后一个 MM owner 必须先释放 VMA metadata，再释放驻留页和页表，才能避免 metadata 指向已经丢失的状态。VMA metadata 的释放也会失败，所以它单独形成可重试 cleanup 阶段；测试既要检查正常页数回到基线，也要注入这一步失败并确认不会越过它销毁 PTE。
+VMA 属于 MM 而不是 task 或单张页表。fork 必须复制其逻辑布局，文件 VMA 还要求子 MM 取得独立 OFD 来源引用。最后一个 MM owner 必须按 VMA metadata、文件来源、驻留页引用/页表的顺序释放，才能避免 metadata 指向已经丢失的状态。每层释放都可能失败，所以分别形成可重试 cleanup 阶段；测试既要检查正常页数回到基线，也要注入提交点失败并确认不会越过仍存在的 owner。
 
 可重试的 owner 还必须比触发错误的栈帧活得更久。只让一个局部 `kernel_mm` 进入 `CLEANUP` 然后从启动函数返回，虽然状态机本身正确，唯一的记录页地址仍会随着栈帧消失。BoarOS 的根启动把尚未发布的 file、MM、VMA cleanup 阶段和相关资源移入持久 `riscv_root_boot`；调用者只要看到 root 仍处于 `CLEANUP` 就继续重试，直到 heap 和物理页都回到基线。这个原则同样适用于 exec transaction、任务退出队列和以后任何异步回收：错误码不能替代仍然存在的资源 owner。
 

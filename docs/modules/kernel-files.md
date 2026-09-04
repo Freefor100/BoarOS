@@ -10,6 +10,12 @@
 - `kernel_open_file_description` 拥有一个 VFS file、当前 offset 和清理状态。分别打开同一路径会得到独立 description，因此 offset 互不影响。
 - `kernel_fs_context` 借用生产根 mount，拥有当前工作目录字符串；当前 cwd 固定从 `/` 开始。
 
+`kernel_files_pin()` 为 fd 指向的 open file description 增加一个独立引用。file-private mmap
+用它把文件生命周期从 fd 槽中分离：映射成功后 MM 消耗该引用，之后即使所有 fd 都关闭，
+缺页仍能读取原文件；映射失败则调用者释放 pin。一个 MM 对同一 OFD 只保存一个来源节点，
+节点计数并持有成功 mmap 转入的引用，
+多个 VMA 通过 backing 指针借用它，最后一个对应 VMA 消失后在冷清理路径释放。
+
 描述符表初始有 32 个槽，按 2 倍增长，硬上限为 1024。分配总是从 `next_fd` 指示的最低可能空位向后搜索；关闭较小 fd 后会回退该提示，因此当前没有预装 stdin/stdout/stderr 时第一次成功打开返回 0。`O_CLOEXEC` 作为 descriptor flag 保存在槽上；exec 提交后批量摘除这些槽，其他 fd 和 open-file offset 保持不变。
 
 普通 clone 通过 `kernel_files_fork()` 新建并复制 fd 槽数组和 descriptor flags，同时增加每个 open file description 的引用。因此父子可以分别 close 或修改各自的 `FD_CLOEXEC` 槽，但同一个已打开文件的 offset 与底层 VFS file 生命周期共享。fs context 通过 `kernel_fs_context_fork()` 独立复制 cwd 字符串并借用同一个 root mount。当前尚无 `dup`；未来 `dup` 应复用同一 OFD，`CLONE_FILES` 则应共享整张表，而不是调用当前的 fork-copy 接口。
@@ -24,11 +30,11 @@
 
 ## `read`、offset 与部分复制
 
-`kernel_files_read()` 最多传送 Linux `MAX_RW_COUNT` 形态的 `INT32_MAX` 向下页对齐值。无效 fd 返回 `-EBADF`；零长度在 fd 有效且用户地址无需解引用时返回 0。与当前参照的 Linux `vfs_read()` 顺序一致，非零读取先按调用者给出的原始 count 验证整个用户范围，再把实际请求截断到上限，分配一块至多 4 KiB 的 scratch buffer，循环执行 VFS `pread` 和 `copy_to_user`。
+`kernel_files_read()` 最多传送 Linux `MAX_RW_COUNT` 形态的 `INT32_MAX` 向下页对齐值。无效 fd 返回 `-EBADF`；零长度在 fd 有效且用户地址无需解引用时返回 0。与当前参照的 Linux `vfs_read()` 顺序一致，非零读取先按调用者给出的原始 count 验证整个用户范围，再把实际请求截断到上限，逐页从挂载共享缓存取得文件页并执行 `copy_to_user`。
 
-open file description 的 offset 只增加实际复制到用户空间的字节数。首块即发生用户 fault 时返回 `-EFAULT` 且 offset 不变；已经复制前缀后再 fault 或遇到底层读错误时返回前缀长度，并只提交该前缀。短读和 EOF 返回实际长度。这样磁盘预读到 scratch 但未交付用户的数据不会被错误计入文件位置。
+open file description 的 offset 只增加实际复制到用户空间的字节数。首块即发生用户 fault 时返回 `-EFAULT` 且 offset 不变；已经复制前缀后再 fault 或遇到底层读错误时返回前缀长度，并只提交该前缀。短读和 EOF 返回实际长度。这样已经进入缓存但未交付用户的数据不会被错误计入文件位置。
 
-当前一次非零 `read` 分配一块 scratch buffer，每个至多 4 KiB 的 chunk 做一次 VFS 随机读和按用户基页的软件页表查询。模块统计调用/失败次数、字节、chunk、当前/峰值 fd、表容量与 close-on-exec 数量，测试用它固定当前分配和分块成本；尚无页缓存、read-ahead、直接用户页 I/O 或异步阻塞。优化这些路径时必须保持部分读取、offset 和错误返回语义。
+每个 chunk 最多覆盖当前 4 KiB 文件页剩余部分：cache miss 承担一次底层随机读，hit 只增加页引用并复制；用户方向仍按基页做软件页表查询。模块统计调用/失败次数、字节、chunk、当前/峰值 fd、表容量与 close-on-exec 数量，页缓存另统计 hit/miss/insert/eviction/reclaim。当前仍有 cache-to-user 一次复制，尚无 read-ahead、直接用户页 I/O 或异步阻塞。优化这些路径时必须保持部分读取、offset 和错误返回语义。
 
 ## 关闭与退出回收
 
@@ -39,10 +45,11 @@ open file description 的 offset 只增加实际复制到用户空间的字节�
 用户 task 退出时先在任务仍位于自身内核栈、但硬件已经切回内核地址空间的边界处理重资源：
 
 ```text
-all fds/OFD references -> files table -> fs context -> MM -> zombie
+fd-slot OFD references -> files table -> fs context
+-> mapped OFD references/MM -> zombie
 ```
 
-最后一个 OFD 引用才关闭底层 VFS file；父进程关闭 fd 不会使仍由子进程引用的 OFD 失效。文件或 fs context 清理失败时 task 进入 exited 队列，idle 从记录状态重试；成功后有父任务的进程转成只保留轻量状态的 zombie。根 mount 必须活到 PID 1 及其子进程的文件资源全部回收，之后生产根启动路径才能 unmount 并检查 heap/物理页基线。
+最后一个 OFD 引用才关闭底层 VFS file；父进程关闭 fd 不会使仍由子进程或任一 MM 文件映射引用的 OFD 失效。文件、fs context 或 MM 清理失败时 task 进入 exited 队列，idle 从记录状态重试；成功后有父任务的进程转成只保留轻量状态的 zombie。根 mount 必须活到 PID 1 及其子进程的 fd 与映射来源全部回收，之后生产根启动路径才能 purge cache、unmount 并检查 heap/物理页基线。
 
 ## 验证与限制
 
@@ -55,6 +62,6 @@ make test-root-init-riscv
 make test-riscv
 ```
 
-聚焦测试在真实 modern VirtIO/ext4 上覆盖绝对/相对路径、错误 flags、目录与缺失文件、4096 字节路径上限、最低 fd 复用、表扩容、`O_CLOEXEC`、跨页读取、EOF、部分 fault、fork 后 fd 表独立与 OFD offset 共享，以及可重试清理。生产 exec/clone 链验证普通 fd 与 offset 跨映像和父子保持、CLOEXEC fd 不可见，并由最终资源基线证明退出清理生效。
+聚焦测试在真实 modern VirtIO/ext4 上覆盖绝对/相对路径、错误 flags、目录与缺失文件、4096 字节路径上限、最低 fd 复用、表扩容、`O_CLOEXEC`、缓存命中后的跨页读取、EOF、部分 fault、fork 后 fd 表独立与 OFD offset 共享，以及可重试清理。它还在关闭 fd 后通过 MM backing 继续缺页，并验证父子各自持有 OFD 引用。生产 exec/clone 链验证普通 fd 与 offset 跨映像和父子保持、CLOEXEC fd 不可见，并由最终资源基线证明退出清理生效。
 
-当前只有进程私有文件表、根 fs context 和只读普通文件；普通 clone 已实现“复制表、共享 OFD”，但没有 `CLONE_FILES`。也没有 `write/writev/lseek/fstat/getdents`、目录 fd、`dup/fcntl`、并发锁、页缓存或可写文件系统。
+当前只有进程私有文件表、根 fs context 和只读普通文件；普通 clone 已实现“复制表、共享 OFD”，但没有 `CLONE_FILES`。也没有 `write/writev/lseek/fstat/getdents`、目录 fd、`dup/fcntl`、并发锁、read-ahead、异步 I/O 或可写文件系统。

@@ -31,15 +31,18 @@ static int vma_valid(const struct kernel_vma *vma)
         vma->role < KERNEL_VMA_ROLE_NONE ||
         vma->role > KERNEL_VMA_ROLE_MMAP ||
         vma->fault_policy < KERNEL_VMA_FAULT_RESIDENT_REQUIRED ||
-        vma->fault_policy > KERNEL_VMA_FAULT_DEMAND_ZERO) {
+        vma->fault_policy > KERNEL_VMA_FAULT_FILE_PRIVATE) {
         return 0;
     }
     if (vma->kind == KERNEL_VMA_KIND_ANONYMOUS &&
-        (vma->file_offset != 0U || vma->backing != 0)) {
+        (vma->file_offset != 0U || vma->backing != 0 ||
+         vma->fault_policy == KERNEL_VMA_FAULT_FILE_PRIVATE)) {
         return 0;
     }
     if (vma->kind == KERNEL_VMA_KIND_FILE_PRIVATE &&
-        vma->file_offset > UINT64_MAX - (vma->end - vma->start)) {
+        (vma->backing == 0 ||
+         vma->fault_policy != KERNEL_VMA_FAULT_FILE_PRIVATE ||
+         vma->file_offset > UINT64_MAX - (vma->end - vma->start))) {
         return 0;
     }
     return 1;
@@ -353,6 +356,26 @@ enum kernel_vma_status kernel_vma_set_overlaps(
     index = lower_bound(set, start);
     *overlaps = (index > 0U && set->entries[index - 1U].end > start) ||
                 (index < set->count && set->entries[index].start < end);
+    return KERNEL_VMA_STATUS_OK;
+}
+
+enum kernel_vma_status kernel_vma_set_backing_in_use(
+    const struct kernel_vma_set *set,
+    const void *backing,
+    int *in_use)
+{
+    uint32_t index;
+
+    if (!set_valid(set) || backing == 0 || in_use == 0) {
+        return KERNEL_VMA_STATUS_INVALID_ARGUMENT;
+    }
+    *in_use = 0;
+    for (index = 0U; index < set->count; index++) {
+        if (set->entries[index].backing == backing) {
+            *in_use = 1;
+            break;
+        }
+    }
     return KERNEL_VMA_STATUS_OK;
 }
 

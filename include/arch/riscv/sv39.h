@@ -57,8 +57,8 @@ struct riscv_sv39_user_space {
     uint32_t protected_pages;
     uint32_t cow_pages;
     uint32_t retired_pages;
-    uint64_t cleanup_page_address;
-    uint32_t cleanup_page_owned;
+    uint64_t cleanup_page_addresses[2];
+    uint32_t cleanup_page_count;
     uint64_t cow_copies;
     uint64_t cow_in_place;
     enum riscv_sv39_user_space_state state;
@@ -115,6 +115,11 @@ enum riscv_sv39_status riscv_sv39_user_map_cow_page(
     uint64_t virtual_address,
     uint64_t physical_address,
     uint32_t permissions);
+
+/* Releases a detached owned page or retains it for destroy-time retry. */
+enum riscv_sv39_status riscv_sv39_user_discard_owned_page(
+    struct riscv_sv39_user_space *space,
+    uint64_t physical_address);
 
 /*
  * Success allocates, zeroes, maps, and transfers one page to space.

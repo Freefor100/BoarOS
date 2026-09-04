@@ -10,13 +10,30 @@
 
 `kernel_vfs_open_executable()` 在普通 open 之上统一要求 regular file 和至少一个执行位；目录、非普通文件或无执行位返回 `-EACCES`。生产 `/init` 与用户 `execve` 共用这一检查，权限拒绝时立即关闭临时 file；若清理需要重试，调用方仍保留 file owner。
 
+## 文件节点与页缓存
+
+VFS 为每个已解析普通文件维护引用计数 node；独立 open file description 各自保存 offset，
+但可指向同一 node。根启动建立一个挂载共享的 4 KiB 页缓存，键为 `(node, page_index)`：
+开放寻址哈希提供平均常数时间查找，双向 LRU 维护回收次序。缓存项持有 node 引用和一份
+物理页引用；命中时再给调用者一份临时引用，因此 `read`、不同 fd 和 file-private mmap
+可以安全共享同一只读页。
+
+miss 路径先分配并清零页，再通过 node 的无 offset 副作用 `pread` 填充，记录尾页有效字节数。
+读取整个越过 EOF 的页返回 `OUT_OF_RANGE`，尾页剩余字节保持为零。物理页分配器只有一个
+压力回收槽，当前由该缓存注册；分配首次耗尽时从 LRU 尾部扫描，仅驱逐引用数为 1 的未固定页，
+然后由分配器重试一次。被用户映射或正由 read 使用的页引用数大于 1，不会被回收。
+
+缓存销毁和 mount 卸载有严格顺序：先释放所有进程 MM 和临时读者，再 purge 该 mount 的缓存
+项、关闭最后的 node，之后才允许 lwext4 unmount；缓存最后注销 reclaimer 并释放哈希表。
+页/node/堆对象释放失败进入各自 cleanup 链，后续 destroy 重试而不重新发布已经驱逐的项。
+
 ## lwext4 配置和生命周期
 
 内核只编译 lwext4 读取路径需要的源码，关闭 journaling、xattr、debug/assert 和 mkfs，并把 malloc/calloc/realloc/free 绑定到当前内核堆。根设备是 raw whole-disk ext4，物理块大小固定为 512 字节；当前不解析分区表。
 
 挂载只读后额外检查 superblock `needs_recovery` incompat feature。因为当前没有 JBD2 replay 和写回能力，发现该位返回 `-EUCLEAN` 并完整撤销挂载，不能静默读取可能不一致的数据。打开前先读取 mode 并拒绝目录，避免为不支持的对象创建 lwext4 file handle；成功文件记录大小和 mode。unmount 在仍有 open file 时返回 `-EBUSY`。close/unmount 的底层释放失败保留 CLEANUP 状态，调用者可以重试而不会重复关闭或丢失 heap owner。
 
-当前 VFS 同时服务 ELF 随机读和进程文件表，但仍不是完整 Linux VFS：没有 inode/dentry cache、路径权限、symlink、目录遍历、写入、页缓存、并发锁或多挂载。进程层只持有 VFS mount/file 抽象，lwext4 handle 没有泄露到 task 或 syscall ABI。
+当前 VFS 同时服务 ELF 随机读、进程文件表和文件私有缺页，但仍不是完整 Linux VFS：没有通用 inode/dentry cache、路径权限、symlink、目录遍历、写入/writeback、read-ahead、并发锁或多挂载。页缓存只保存只读普通文件内容；进程层只持有 VFS mount/file 抽象，lwext4 handle 没有泄露到 task 或 syscall ABI。
 
 ## 验证
 
@@ -28,4 +45,4 @@ make test-exec-riscv
 make test-root-init-riscv
 ```
 
-宿主测试核对 lwext4 metadata checksum seed。QEMU 测试建立真实 ext4 镜像，验证 `/init` mode、目录预检、随机偏移、EOF、`-ENOENT`、open-file `-EBUSY`、dirty-journal `-EUCLEAN` 和全部页回收。文件资源测试在其上验证用户路径与 fd 语义；生产测试既用 VFS read source 装载磁盘中的静态 ELF，也由 PID 1 通过 syscall 读取普通文件。
+宿主测试核对 lwext4 metadata checksum seed。QEMU 测试建立真实 ext4 镜像，验证 `/init` mode、目录预检、随机偏移、EOF、`-ENOENT`、open-file `-EBUSY`、dirty-journal `-EUCLEAN`、缓存 miss/hit/LRU/pin、压力回收、mount purge 和全部页回收。文件资源测试证明不同 fd 与 mmap 共用 node/cache 而保持各自 offset；生产测试既用 VFS read source 装载磁盘中的静态 ELF，也由 PID 1 通过 syscall 读取和私有映射普通文件。

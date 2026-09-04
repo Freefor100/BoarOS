@@ -21,7 +21,7 @@ struct kernel_page_cache_entry {
     uint64_t page_index;
     uint64_t physical_address;
     size_t valid_bytes;
-    uint8_t page_owned;
+    uint8_t page_references_owned;
 };
 
 struct kernel_page_cache_record {
@@ -223,22 +223,37 @@ static int cleanup_entry(struct kernel_page_cache *cache,
                          struct kernel_page_cache_entry *entry,
                          uint64_t *pages_released)
 {
-    if (entry->page_owned) {
+    while (entry->page_references_owned != 0U) {
         if (physical_page_release(cache->allocator,
                                   entry->physical_address) !=
             PHYSICAL_PAGE_STATUS_OK) {
             return 0;
         }
-        entry->physical_address = 0U;
-        entry->page_owned = 0U;
+        entry->page_references_owned--;
         (*pages_released)++;
     }
+    entry->physical_address = 0U;
     if (entry->node != 0 &&
         kernel_vfs_node_release(&entry->node) != 0) {
         return 0;
     }
     return kernel_heap_release(cache->heap, entry) ==
            KERNEL_HEAP_STATUS_OK;
+}
+
+static enum kernel_page_cache_status abandon_entry(
+    struct kernel_page_cache *cache,
+    struct kernel_page_cache_entry *entry,
+    enum kernel_page_cache_status result)
+{
+    uint64_t pages_released = 0U;
+
+    if (cleanup_entry(cache, entry, &pages_released)) {
+        return result;
+    }
+    entry->cleanup_next = cache->record->cleanup_entries;
+    cache->record->cleanup_entries = entry;
+    return KERNEL_PAGE_CACHE_STATUS_CLEANUP_REQUIRED;
 }
 
 static int drain_entries(struct kernel_page_cache *cache,
@@ -449,14 +464,13 @@ enum kernel_page_cache_status kernel_page_cache_get(
         }
         return KERNEL_PAGE_CACHE_STATUS_NO_MEMORY;
     }
-    entry->page_owned = 1U;
+    entry->page_references_owned = 1U;
     if (physical_page_resolve(cache->allocator,
                               entry->physical_address,
                               &page) != PHYSICAL_PAGE_STATUS_OK) {
-        (void)physical_page_release(cache->allocator,
-                                    entry->physical_address);
-        (void)kernel_heap_release(cache->heap, entry);
-        return KERNEL_PAGE_CACHE_STATUS_STATE;
+        return abandon_entry(cache,
+                             entry,
+                             KERNEL_PAGE_CACHE_STATUS_STATE);
     }
     zero_bytes(page, BOAROS_PAGE_SIZE);
     if (kernel_vfs_node_pread(node,
@@ -464,39 +478,33 @@ enum kernel_page_cache_status kernel_page_cache_get(
                               page,
                               BOAROS_PAGE_SIZE,
                               &bytes_read) != 0) {
-        (void)physical_page_release(cache->allocator,
-                                    entry->physical_address);
-        (void)kernel_heap_release(cache->heap, entry);
-        return KERNEL_PAGE_CACHE_STATUS_IO;
+        return abandon_entry(cache,
+                             entry,
+                             KERNEL_PAGE_CACHE_STATUS_IO);
     }
     if (kernel_vfs_node_acquire(node) != 0) {
-        (void)physical_page_release(cache->allocator,
-                                    entry->physical_address);
-        (void)kernel_heap_release(cache->heap, entry);
-        return KERNEL_PAGE_CACHE_STATUS_STATE;
+        return abandon_entry(cache,
+                             entry,
+                             KERNEL_PAGE_CACHE_STATUS_STATE);
     }
     entry->node = node;
     if (physical_page_acquire(cache->allocator,
                               entry->physical_address) !=
         PHYSICAL_PAGE_STATUS_OK) {
-        (void)kernel_vfs_node_release(&entry->node);
-        (void)physical_page_release(cache->allocator,
-                                    entry->physical_address);
-        (void)kernel_heap_release(cache->heap, entry);
-        return KERNEL_PAGE_CACHE_STATUS_STATE;
+        return abandon_entry(cache,
+                             entry,
+                             KERNEL_PAGE_CACHE_STATUS_STATE);
     }
+    entry->page_references_owned = 2U;
     entry->page_index = page_index;
     entry->valid_bytes = bytes_read;
     bucket = find_bucket(cache->record, node, page_index, &found);
     if (found) {
-        (void)physical_page_release(cache->allocator,
-                                    entry->physical_address);
-        (void)physical_page_release(cache->allocator,
-                                    entry->physical_address);
-        (void)kernel_vfs_node_release(&entry->node);
-        (void)kernel_heap_release(cache->heap, entry);
-        return KERNEL_PAGE_CACHE_STATUS_STATE;
+        return abandon_entry(cache,
+                             entry,
+                             KERNEL_PAGE_CACHE_STATUS_STATE);
     }
+    entry->page_references_owned = 1U;
     if (cache->record->buckets[bucket] == PAGE_CACHE_TOMBSTONE) {
         cache->record->tombstones--;
     }

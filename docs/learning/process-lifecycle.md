@@ -42,7 +42,9 @@ Copy-on-write（COW）让父子暂时共享物理页，把可写映射改成只�
 - TLB 失效，SMP 下还要远端 shootdown；
 - fork 途中修改父 PTE 后的可靠回滚或提交协议。
 
-BoarOS 当前使用 eager copy 作为正确性基线，并把策略封装在 `kernel_mm_fork()` 后。Scheduler 只依赖“成功后得到独立 MM”的语义，因此以后改为 COW 不需要改变 clone/wait ABI。当前实现会在关中断临界区复制用户页，大进程的延迟与内存开销必须在加入更真实工作负载后测量，不能把它当成最终性能结论。
+BoarOS 当前已经使用 COW。物理分配器只允许 order-0 页增加共享引用；Sv39 用 RSW 软件位区分真正只读页与 COW 只读页。Fork 先构造完整子页表并取得页引用，最后才无分配地把父可写 PTE 提交为 COW，因此失败不会留下“子进程没创建、父页面却突然只读”的半状态。写 fault 在引用数大于 1 时复制，等于 1 时原地恢复；uaccess 写入也必须走同一路径。
+
+COW 降低的是数据页复制和 fork 内存峰值，不消除页表/VMA/OFD metadata 的遍历与分配；这些工作当前仍发生在关中断临界区。SMP 后需要原子页引用、MM 锁和远端 TLB shootdown，开发板上还要分别测量 fork 构造延迟、首次写 fault 延迟和实际复制页比例，才能判断下一步优化。
 
 ## fd 表与 open file description
 
@@ -117,13 +119,13 @@ BoarOS 的处理原则是：对象状态表达剩余 owner 和准确清理阶段
 
 当前 context switch 本身不复制内存、不遍历进程树，也不修改资源引用；ASID 0 导致的全局 TLB 刷新是主要固定成本。进程相关成本集中在：
 
-- eager fork 的用户页分配与复制；
+- COW fork 的页表/VMA 遍历，以及后续首次写入的单页复制；
 - fd 表和 cwd 的堆分配与复制；
 - wait 按子进程数线性扫描；
 - 退出时关闭文件和销毁页表；
 - 单 hart 关中断临界区造成的中断延迟。
 
-QEMU 可以验证语义和结构成本，但不能替代 VisionFive 2 上的 cycle、cache miss、TLB miss 和最坏中断延迟测量。COW、哈希 PID 查找或更复杂 wait 队列应由真实进程规模和可重复基准驱动，同时保持现有 ABI 与生命周期边界。
+QEMU 可以验证语义和结构成本，但不能替代 VisionFive 2 上的 cycle、cache miss、TLB miss 和最坏中断延迟测量。COW 已解决 fork 的结构性整页复制问题；更细的 walker、ASID、哈希 PID 查找或复杂 wait 队列仍应由真实进程规模和可重复基准驱动，同时保持现有 ABI 与生命周期边界。
 
 ## 资料依据
 
