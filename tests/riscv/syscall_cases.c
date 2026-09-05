@@ -26,6 +26,14 @@ static enum kernel_task_status files_borrow_status =
     KERNEL_TASK_STATUS_OK;
 static enum kernel_files_status pin_status = KERNEL_FILES_STATUS_OK;
 static int64_t pin_linux_result;
+static enum kernel_files_status write_files_status =
+    KERNEL_FILES_STATUS_OK;
+static int64_t write_linux_result;
+static int64_t write_fd = -1;
+static uint64_t write_user_buffer;
+static uint64_t write_count;
+static enum kernel_open_file_kind pinned_kind =
+    KERNEL_OPEN_FILE_KIND_REGULAR;
 static enum kernel_mm_status file_mmap_status = KERNEL_MM_STATUS_OK;
 static int64_t file_mmap_fd;
 static uint64_t file_mmap_offset;
@@ -95,6 +103,25 @@ enum kernel_task_status __wrap_kernel_task_files_borrow(
     return KERNEL_TASK_STATUS_OK;
 }
 
+enum kernel_files_status __wrap_kernel_files_write(
+    struct kernel_files *files,
+    struct kernel_mm *mm,
+    int64_t fd,
+    uint64_t user_buffer,
+    uint64_t count,
+    int64_t *linux_result)
+{
+    if (files != (struct kernel_files *)(uintptr_t)3U ||
+        mm != (struct kernel_mm *)(uintptr_t)2U || linux_result == 0) {
+        return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
+    }
+    write_fd = fd;
+    write_user_buffer = user_buffer;
+    write_count = count;
+    *linux_result = write_linux_result;
+    return write_files_status;
+}
+
 enum kernel_files_status __wrap_kernel_files_pin(
     struct kernel_files *files,
     int64_t fd,
@@ -138,6 +165,15 @@ enum kernel_mm_status __wrap_kernel_mm_mmap_file_private(
         *address = mmap_mm_result;
     }
     return file_mmap_status;
+}
+
+enum kernel_open_file_kind __wrap_kernel_open_file_kind(
+    const struct kernel_open_file_description *file)
+{
+    if (file != (struct kernel_open_file_description *)(uintptr_t)4U) {
+        return KERNEL_OPEN_FILE_KIND_REGULAR;
+    }
+    return pinned_kind;
 }
 
 enum kernel_open_file_status __wrap_kernel_open_file_release(
@@ -314,6 +350,56 @@ static unsigned long run_process_decode_cases(void)
     return failures;
 }
 
+static unsigned long run_write_cases(void)
+{
+    struct kernel_task *caller = (struct kernel_task *)(uintptr_t)1U;
+    struct kernel_syscall_request request = {
+        .number = 64U,
+        .arguments = {5U, UINT64_C(0x30000), UINT64_C(0x1234), 0U, 0U, 0U},
+    };
+    struct kernel_syscall_result result;
+    unsigned long failures = 0U;
+
+    files_borrow_status = KERNEL_TASK_STATUS_OK;
+    write_files_status = KERNEL_FILES_STATUS_OK;
+    write_linux_result = 0x1234;
+    if (kernel_syscall_dispatch(caller, &request, &result) !=
+            KERNEL_SYSCALL_STATUS_OK ||
+        result_changed(&result,
+                       KERNEL_SYSCALL_ACTION_RETURN,
+                       INT64_C(0x1234)) ||
+        write_fd != 5 ||
+        write_user_buffer != UINT64_C(0x30000) ||
+        write_count != UINT64_C(0x1234)) {
+        failures++;
+    }
+
+    /* A task without file resources reports EBADF before any decode work. */
+    files_borrow_status = KERNEL_TASK_STATUS_RESOURCE_UNAVAILABLE;
+    result.action = KERNEL_SYSCALL_ACTION_EXIT;
+    result.value = 1;
+    if (kernel_syscall_dispatch(caller, &request, &result) !=
+            KERNEL_SYSCALL_STATUS_OK ||
+        result_changed(&result, KERNEL_SYSCALL_ACTION_RETURN, -9)) {
+        failures++;
+    }
+    files_borrow_status = KERNEL_TASK_STATUS_OK;
+
+    /* A files-layer state failure is an internal error, not an ABI value. */
+    write_files_status = KERNEL_FILES_STATUS_STATE;
+    result.action = KERNEL_SYSCALL_ACTION_EXIT;
+    result.value = 1;
+    if (kernel_syscall_dispatch(caller, &request, &result) !=
+            KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT ||
+        result_changed(&result,
+                       KERNEL_SYSCALL_ACTION_EXIT,
+                       INT64_C(1))) {
+        failures++;
+    }
+    write_files_status = KERNEL_FILES_STATUS_OK;
+    return failures;
+}
+
 static unsigned long run_brk_cases(void)
 {
     struct kernel_task *caller = (struct kernel_task *)(uintptr_t)1U;
@@ -435,11 +521,19 @@ static unsigned long run_memory_mapping_cases(void)
         file_release_calls != 1U) {
         failures++;
     }
+    pinned_kind = KERNEL_OPEN_FILE_KIND_CONSOLE;
+    if (kernel_syscall_dispatch(caller, &request, &result) !=
+            KERNEL_SYSCALL_STATUS_OK ||
+        result_changed(&result, KERNEL_SYSCALL_ACTION_RETURN, -19) ||
+        file_release_calls != 2U) {
+        failures++;
+    }
+    pinned_kind = KERNEL_OPEN_FILE_KIND_REGULAR;
     pin_linux_result = -9;
     if (kernel_syscall_dispatch(caller, &request, &result) !=
             KERNEL_SYSCALL_STATUS_OK ||
         result_changed(&result, KERNEL_SYSCALL_ACTION_RETURN, -9) ||
-        file_release_calls != 1U) {
+        file_release_calls != 2U) {
         failures++;
     }
     pin_linux_result = 0;
@@ -531,6 +625,7 @@ unsigned long run_syscall_cases(void)
     failures += run_exit_cases();
     failures += run_unknown_cases();
     failures += run_process_decode_cases();
+    failures += run_write_cases();
     failures += run_brk_cases();
     failures += run_memory_mapping_cases();
     return failures;

@@ -89,6 +89,14 @@ user_test_payload_start:
     li t0, -9
     bne a0, t0, 2f
 
+    li a0, 1
+    li a1, USER_TEST_DATA_VA
+    li a2, 1
+    li a7, 64
+    ecall
+    li t0, -9
+    bne a0, t0, 2f
+
     li a7, 172
     ecall
     blez a0, 2f

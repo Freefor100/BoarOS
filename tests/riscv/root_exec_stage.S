@@ -102,15 +102,28 @@ _start:
     add t1, t1, t0
     bne a0, t1, .Lfailure
 
-    # fd 1 was CLOEXEC and must be unreachable; fd 0 keeps offset four.
+    # fd 4 was CLOEXEC and must be unreachable; fd 3 keeps offset four.
+    # The console descriptors survive exec unchanged on fd 0/1/2.
+    la a1, .Lstage2_marker
+    la t0, .Lstage2_marker_end
+    sub a2, t0, a1
+    addi a2, a2, -1
     li a0, 1
+    li a7, 64
+    ecall
+    la t0, .Lstage2_marker_end
+    la t1, .Lstage2_marker
+    sub t0, t0, t1
+    addi t0, t0, -1
+    bne a0, t0, .Lfailure
+    li a0, 4
     la a1, .Lbuffer
     li a2, 1
     li a7, 63
     ecall
     li t0, -9
     bne a0, t0, .Lfailure
-    li a0, 0
+    li a0, 3
     la a1, .Lbuffer
     li a2, 1
     li a7, 63
@@ -168,7 +181,7 @@ _start:
     add t3, t0, t2
     bne a0, t3, .Lfailure
 
-    li a0, 0
+    li a0, 3
     la a1, .Lbuffer
     li a2, 1
     li a7, 63
@@ -302,7 +315,7 @@ _start:
     ld t1, 0(t0)
     li t2, 0x33
     bne t1, t2, .Lfailure
-    li a0, 0
+    li a0, 3
     la a1, .Lbuffer
     li a2, 1
     li a7, 63
@@ -476,7 +489,7 @@ _start:
     la t0, .Lfork_word
     li t1, 0x44
     sd t1, 0(t0)
-    li a0, 0
+    li a0, 3
     la a1, .Lbuffer
     li a2, 1
     li a7, 63
@@ -556,6 +569,9 @@ _start:
     .section .rodata, "a", @progbits
 .Lstage2_name:
     .asciz "stage2"
+.Lstage2_marker:
+    .asciz "BoarOS: stage2 stdio write ok\n"
+.Lstage2_marker_end:
 .Lhello:
     .asciz "hello"
 .Lenvironment:

@@ -57,6 +57,42 @@ enum kernel_open_file_status kernel_open_file_create(
     return KERNEL_OPEN_FILE_STATUS_OK;
 }
 
+enum kernel_open_file_status kernel_open_file_create_console(
+    struct kernel_heap *heap,
+    struct kernel_open_file_description **owner)
+{
+    struct kernel_open_file_description *file;
+    enum kernel_heap_status heap_status;
+
+    if (heap == 0 || owner == 0 || *owner != 0) {
+        return KERNEL_OPEN_FILE_STATUS_INVALID_ARGUMENT;
+    }
+    heap_status = kernel_heap_allocate_zeroed(heap,
+                                              1U,
+                                              sizeof(*file),
+                                              (void **)&file);
+    if (heap_status == KERNEL_HEAP_STATUS_EMPTY) {
+        return KERNEL_OPEN_FILE_STATUS_NO_MEMORY;
+    }
+    if (heap_status != KERNEL_HEAP_STATUS_OK) {
+        return KERNEL_OPEN_FILE_STATUS_STATE;
+    }
+    file->heap = heap;
+    file->references = 1U;
+    file->kind = KERNEL_OPEN_FILE_KIND_CONSOLE;
+    *owner = file;
+    return KERNEL_OPEN_FILE_STATUS_OK;
+}
+
+enum kernel_open_file_kind kernel_open_file_kind(
+    const struct kernel_open_file_description *file)
+{
+    if (file == 0 || file->kind != KERNEL_OPEN_FILE_KIND_CONSOLE) {
+        return KERNEL_OPEN_FILE_KIND_REGULAR;
+    }
+    return KERNEL_OPEN_FILE_KIND_CONSOLE;
+}
+
 enum kernel_open_file_status kernel_open_file_acquire(
     struct kernel_open_file_description *file)
 {
@@ -90,10 +126,13 @@ enum kernel_open_file_status kernel_open_file_release(
         file->references = 0U;
     }
     if (!file->vfs_closed) {
-        if (kernel_vfs_close(&file->file) != 0) {
+        if (file->kind == KERNEL_OPEN_FILE_KIND_CONSOLE) {
+            file->vfs_closed = 1U;
+        } else if (kernel_vfs_close(&file->file) != 0) {
             return KERNEL_OPEN_FILE_STATUS_CLEANUP_REQUIRED;
+        } else {
+            file->vfs_closed = 1U;
         }
-        file->vfs_closed = 1U;
     }
     if (kernel_heap_release(file->heap, file) !=
         KERNEL_HEAP_STATUS_OK) {

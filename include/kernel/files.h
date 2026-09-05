@@ -32,9 +32,12 @@ struct kernel_files_statistics {
     uint64_t open_failures;
     uint64_t read_calls;
     uint64_t read_failures;
+    uint64_t write_calls;
+    uint64_t write_failures;
     uint64_t close_calls;
     uint64_t close_failures;
     uint64_t bytes_read;
+    uint64_t bytes_written;
     uint64_t read_chunks;
     uint32_t current_open_fds;
     uint32_t peak_open_fds;
@@ -80,6 +83,20 @@ enum kernel_files_status kernel_files_read(
     int64_t fd,
     uint64_t user_buffer,
     uint64_t count,
+    int64_t *linux_result);
+
+enum kernel_files_status kernel_files_write(
+    struct kernel_files *files,
+    struct kernel_mm *mm,
+    int64_t fd,
+    uint64_t user_buffer,
+    uint64_t count,
+    int64_t *linux_result);
+
+/* Install the console description at an empty fixed slot for PID 1 stdio. */
+enum kernel_files_status kernel_files_open_console(
+    struct kernel_files *files,
+    int64_t fd,
     int64_t *linux_result);
 
 enum kernel_files_status kernel_files_close(

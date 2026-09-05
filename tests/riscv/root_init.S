@@ -33,6 +33,28 @@ _start:
     ld t0, 24(sp)
     bnez t0, .Lfailure
 
+    # PID 1 starts with the console on fd 0/1/2: write(1) emits the marker
+    # through the serial console, and read(0) reports the empty input
+    # stream as EOF.
+    la a1, .Lstdio_marker
+    la t0, .Lstdio_marker_end
+    sub a2, t0, a1
+    addi a2, a2, -1
+    li a0, 1
+    li a7, 64
+    ecall
+    la t0, .Lstdio_marker_end
+    la t1, .Lstdio_marker
+    sub t0, t0, t1
+    addi t0, t0, -1
+    bne a0, t0, .Lfailure
+    li a0, 0
+    la a1, .Lread_buffer
+    li a2, 1
+    li a7, 63
+    ecall
+    bnez a0, .Lfailure
+
     # Reach below the eagerly built argument image while remaining inside
     # the fixed stack VMA.  The first access must observe a zero-filled page;
     # the second must survive a store-page-fault retry and retain its value.
@@ -180,14 +202,16 @@ _start:
     ecall
     bnez a0, .Lfailure
 
-    # An absolute path ignores dirfd and receives the lowest free fd.
+    # An absolute path ignores dirfd and receives the lowest free fd; the
+    # console descriptors occupy 0/1/2.
     li a0, 7
     la a1, .Labsolute_path
     li a2, 0
     li a3, 0
     li a7, 56
     ecall
-    bnez a0, .Lfailure
+    li t0, 3
+    bne a0, t0, .Lfailure
     mv s0, a0
 
     # A relative path resolves against cwd through AT_FDCWD.  Both
@@ -198,7 +222,7 @@ _start:
     li a3, 0
     li a7, 56
     ecall
-    li t0, 1
+    li t0, 4
     bne a0, t0, .Lfailure
     mv s1, a0
 
@@ -344,6 +368,16 @@ _start:
     ecall
     li t0, -14
     bne a0, t0, .Lfailure
+
+    # The read-only root gives every regular descriptor a read-only mode,
+    # so writing to the /data descriptor reports EBADF.
+    mv a0, s0
+    la a1, .Lread_buffer
+    li a2, 1
+    li a7, 64
+    ecall
+    li t0, -9
+    bne a0, t0, .Lfailure
     mv a0, s1
     la a1, .Lread_buffer
     li a2, 1
@@ -356,7 +390,7 @@ _start:
     li t2, 'C'
     bne t1, t2, .Lfailure
 
-    # fd 0 is at offset 5003 in a 9000-byte file.
+    # fd 3 is at offset 5003 in a 9000-byte file.
     mv a0, s0
     la a1, .Lread_buffer
     li a2, 5000
@@ -400,7 +434,7 @@ _start:
     li t0, -9
     bne a0, t0, .Lfailure
 
-    # Keep a normal descriptor at offset four across both execs.  fd 1 was
+    # Keep a normal descriptor at offset four across both execs.  fd 4 was
     # opened with O_CLOEXEC above and remains open until a successful exec.
     li a0, -100
     la a1, .Labsolute_path
@@ -408,7 +442,8 @@ _start:
     li a3, 0
     li a7, 56
     ecall
-    bnez a0, .Lfailure
+    li t0, 3
+    bne a0, t0, .Lfailure
     mv s0, a0
     mv a0, s0
     la a1, .Lread_buffer
@@ -543,6 +578,9 @@ _start:
     .size _start, . - _start
 
     .section .rodata, "a", @progbits
+.Lstdio_marker:
+    .asciz "BoarOS: root-init stdio write ok\n"
+.Lstdio_marker_end:
 .Labsolute_path:
     .asciz "/data"
 .Lrelative_path:

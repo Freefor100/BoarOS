@@ -760,6 +760,128 @@ static void run_mmap_operations(struct kernel_files *files,
     test_satp = 0U;
 }
 
+static void run_console_operations(struct kernel_files *files,
+                                   const struct kernel_fs_context *fs,
+                                   struct kernel_mm *mm)
+{
+    struct kernel_files child_files = {0};
+    struct kernel_files_statistics statistics;
+    static const char marker[] = "BoarOS: files console write ok\n";
+    uint64_t partial_buffer =
+        TEST_USER_BUFFER + 3U * BOAROS_PAGE_SIZE - 8U;
+    int64_t result = INT64_MIN;
+
+    if (kernel_files_open_console(files, 0, &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != 0 ||
+        kernel_files_open_console(files, 1, &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != 0 ||
+        kernel_files_open_console(files, 2, &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != 0 ||
+        kernel_files_open_console(files, 1, &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != -KERNEL_EBADF ||
+        kernel_files_open_console(files, -1, &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != -KERNEL_EBADF) {
+        fail_files(70U, 0, result);
+    }
+
+    /* The marker must reach the serial console through the OFD sink. */
+    if (!write_user_bytes(mm,
+                          TEST_USER_PATH,
+                          marker,
+                          sizeof(marker) - 1U) ||
+        kernel_files_write(files,
+                           mm,
+                           1,
+                           TEST_USER_PATH,
+                           sizeof(marker) - 1U,
+                           &result) != KERNEL_FILES_STATUS_OK ||
+        result != (int64_t)(sizeof(marker) - 1U)) {
+        fail_files(71U, (long)(sizeof(marker) - 1U), (long)result);
+    }
+
+    /* Regular descriptors are read-only, so writes report EBADF; reads on
+     * the console report the empty input stream as EOF. */
+    expect_open(files, fs, mm, TEST_AT_FDCWD, "/data", 0U, 3, 72U);
+    if (kernel_files_write(files,
+                           mm,
+                           3,
+                           TEST_USER_PATH,
+                           1U,
+                           &result) != KERNEL_FILES_STATUS_OK ||
+        result != -KERNEL_EBADF ||
+        kernel_files_read(files,
+                          mm,
+                          0,
+                          TEST_USER_BUFFER,
+                          4U,
+                          &result) != KERNEL_FILES_STATUS_OK ||
+        result != 0 ||
+        kernel_files_write(files,
+                           mm,
+                           1,
+                           UINT64_MAX,
+                           1U,
+                           &result) != KERNEL_FILES_STATUS_OK ||
+        result != -KERNEL_EFAULT ||
+        kernel_files_write(files,
+                           mm,
+                           1,
+                           TEST_USER_PATH,
+                           0U,
+                           &result) != KERNEL_FILES_STATUS_OK ||
+        result != 0 ||
+        kernel_files_write(files,
+                           mm,
+                           7,
+                           TEST_USER_PATH,
+                           1U,
+                           &result) != KERNEL_FILES_STATUS_OK ||
+        result != -KERNEL_EBADF) {
+        fail_files(73U, 0, result);
+    }
+
+    /* A copy that faults partway reports the emitted prefix. */
+    if (kernel_files_write(files,
+                           mm,
+                           1,
+                           partial_buffer,
+                           16U,
+                           &result) != KERNEL_FILES_STATUS_OK ||
+        result != 8) {
+        fail_files(74U, 8, result);
+    }
+
+    /* Fork shares the console descriptions and the child keeps writing. */
+    if (!write_user_bytes(mm,
+                          TEST_USER_BUFFER + BOAROS_PAGE_SIZE,
+                          marker,
+                          sizeof(marker) - 1U) ||
+        kernel_files_fork(&child_files, files) != KERNEL_FILES_STATUS_OK ||
+        kernel_files_write(&child_files,
+                           mm,
+                           2,
+                           TEST_USER_BUFFER + BOAROS_PAGE_SIZE,
+                           sizeof(marker) - 1U,
+                           &result) != KERNEL_FILES_STATUS_OK ||
+        result != (int64_t)(sizeof(marker) - 1U) ||
+        kernel_files_release(&child_files) != KERNEL_FILES_STATUS_OK) {
+        fail_files(75U, 0, result);
+    }
+
+    kernel_files_get_statistics(files, &statistics);
+    if (statistics.write_calls != 6U ||
+        statistics.write_failures != 4U ||
+        statistics.bytes_written != (sizeof(marker) - 1U) + 8U ||
+        statistics.current_open_fds != 4U) {
+        fail_files(76U, 4, statistics.write_failures);
+    }
+}
+
 static void run_files_test(const void *dtb)
 {
     struct dtb_boot_info info;
@@ -863,6 +985,17 @@ static void run_files_test(const void *dtb)
                    KERNEL_FILES_STATUS_STATE);
     }
     run_mmap_operations(&files, &fs, &mm, &allocator);
+
+    if (kernel_files_release(&files) != KERNEL_FILES_STATUS_OK) {
+        fail_files(58U, KERNEL_FILES_STATUS_OK,
+                   KERNEL_FILES_STATUS_STATE);
+    }
+    files = (struct kernel_files){0};
+    if (kernel_files_create(&files, &heap) != KERNEL_FILES_STATUS_OK) {
+        fail_files(69U, KERNEL_FILES_STATUS_OK,
+                   KERNEL_FILES_STATUS_STATE);
+    }
+    run_console_operations(&files, &fs, &mm);
 
     use_test_satp = 0;
     if (kernel_files_release(&files) != KERNEL_FILES_STATUS_OK ||

@@ -96,6 +96,16 @@ if [ "$(grep -cxF 'BoarOS: root /init started pid=0x1' "$output" || true)" -ne 1
     echo "production kernel did not start PID 1 from ext4" >&2
     exit 1
 fi
+if [ "$(grep -cxF 'BoarOS: root-init stdio write ok' "$output" || true)" -ne 1 ]; then
+    tail -n 120 "$output" >&2
+    echo "PID 1 did not write through the console descriptor" >&2
+    exit 1
+fi
+if [ "$(grep -cxF 'BoarOS: stage2 stdio write ok' "$output" || true)" -ne 1 ]; then
+    tail -n 120 "$output" >&2
+    echo "stage2 did not keep the console descriptors across exec" >&2
+    exit 1
+fi
 if [ "$(grep -cE '^BoarOS: PID 1 exited status=0x2a pages=0x[1-9a-f][0-9a-f]* heap-live=0x0; shutting down$' "$output" || true)" -ne 1 ]; then
     tail -n 120 "$output" >&2
     echo "production kernel did not fully reap PID 1 and root resources" >&2

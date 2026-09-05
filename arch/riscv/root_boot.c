@@ -150,6 +150,8 @@ enum riscv_root_boot_status riscv_root_boot_start(
     enum riscv_root_boot_status failure;
     uint64_t mmio_address;
     uint32_t index;
+    uint32_t stdio_index;
+    int64_t console_result;
     int found = 0;
 
     if (root == 0 || info == 0 || allocator == 0 ||
@@ -263,6 +265,21 @@ enum riscv_root_boot_status riscv_root_boot_start(
         KERNEL_FILES_STATUS_OK) {
         failure = RISCV_ROOT_BOOT_STATUS_RESOURCES;
         goto fail;
+    }
+    /*
+     * Bind PID 1 stdio to the console.  Bridge until a device filesystem
+     * provides /dev/console; fork already inherits the descriptors and
+     * exec only drops CLOEXEC ones.
+     */
+    for (stdio_index = 0U; stdio_index < 3U; stdio_index++) {
+        if (kernel_files_open_console(&files,
+                                      (int64_t)stdio_index,
+                                      &console_result) !=
+                KERNEL_FILES_STATUS_OK ||
+            console_result != 0) {
+            failure = RISCV_ROOT_BOOT_STATUS_RESOURCES;
+            goto fail;
+        }
     }
     scheduler_status = kernel_user_thread_create(&mm,
                                                  &files,

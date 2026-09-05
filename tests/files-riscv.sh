@@ -52,6 +52,12 @@ if [ "$(grep -cxF 'BoarOS: process files tests passed' "$output" || true)" -ne 1
     exit 1
 fi
 
+if [ "$(grep -cxF 'BoarOS: files console write ok' "$output" || true)" -lt 2 ]; then
+    tail -n 120 "$output" >&2
+    echo "process files test kernel did not write through the console descriptor" >&2
+    exit 1
+fi
+
 if grep -qF 'BoarOS: process files test failed' "$output"; then
     tail -n 120 "$output" >&2
     echo "process files test kernel reported a failed case" >&2

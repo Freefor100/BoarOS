@@ -588,11 +588,13 @@ $(SYSCALL_TEST_KERNEL_RV): $(SYSCALL_TEST_OBJECTS) arch/riscv/linker.ld
 		-Wl,--wrap=kernel_mm_mmap_file_private \
 		-Wl,--wrap=kernel_mm_munmap \
 		-Wl,--wrap=kernel_mm_mprotect \
-		-Wl,--wrap=kernel_task_files_borrow \
-		-Wl,--wrap=kernel_files_pin \
-		-Wl,--wrap=kernel_open_file_release \
-		-Wl,-Map,$(BUILD_DIR)/tests/kernel-syscall-rv.map \
-		-o $@ $(SYSCALL_TEST_OBJECTS)
+	-Wl,--wrap=kernel_task_files_borrow \
+	-Wl,--wrap=kernel_files_pin \
+	-Wl,--wrap=kernel_files_write \
+	-Wl,--wrap=kernel_open_file_kind \
+	-Wl,--wrap=kernel_open_file_release \
+	-Wl,-Map,$(BUILD_DIR)/tests/kernel-syscall-rv.map \
+	-o $@ $(SYSCALL_TEST_OBJECTS)
 
 $(ELF64_TEST_KERNEL_RV): $(ELF64_TEST_OBJECTS) arch/riscv/linker.ld
 	$(CC) $(LDFLAGS) \

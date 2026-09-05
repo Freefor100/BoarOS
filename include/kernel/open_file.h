@@ -18,6 +18,11 @@ enum kernel_open_file_status {
     KERNEL_OPEN_FILE_STATUS_STATE,
 };
 
+enum kernel_open_file_kind {
+    KERNEL_OPEN_FILE_KIND_REGULAR = 0,
+    KERNEL_OPEN_FILE_KIND_CONSOLE,
+};
+
 /* VFS errors are returned through linux_result when status is OK. */
 enum kernel_open_file_status kernel_open_file_create(
     struct kernel_heap *heap,
@@ -25,6 +30,14 @@ enum kernel_open_file_status kernel_open_file_create(
     const char *path,
     struct kernel_open_file_description **owner,
     int *linux_result);
+
+/* A console description owns no VFS node and never touches the page cache. */
+enum kernel_open_file_status kernel_open_file_create_console(
+    struct kernel_heap *heap,
+    struct kernel_open_file_description **owner);
+
+enum kernel_open_file_kind kernel_open_file_kind(
+    const struct kernel_open_file_description *file);
 
 enum kernel_open_file_status kernel_open_file_acquire(
     struct kernel_open_file_description *file);

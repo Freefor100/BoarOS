@@ -1,4 +1,5 @@
 #include <arch/riscv/virt_uart.h>
+#include <kernel/console.h>
 
 #define UART_THR 0UL
 #define UART_LSR 5UL
@@ -49,4 +50,9 @@ void virt_uart_put_hex(unsigned long value)
         length--;
         virt_uart_putc(buffer[length]);
     }
+}
+
+void kernel_console_putc(char character)
+{
+    virt_uart_putc(character);
 }

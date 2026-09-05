@@ -1,5 +1,6 @@
 #include "open_file_internal.h"
 
+#include <kernel/console.h>
 #include <kernel/errno.h>
 #include <kernel/files.h>
 #include <kernel/fs_context.h>
@@ -20,6 +21,7 @@
 #define KERNEL_FILES_FD_CLOEXEC UINT32_C(1)
 #define KERNEL_FILES_MAX_RW_COUNT \
     ((uint64_t)INT32_MAX & ~(uint64_t)BOAROS_PAGE_MASK)
+#define KERNEL_FILES_WRITE_STAGING 64U
 
 #define LINUX_O_ACCMODE UINT64_C(00000003)
 #define LINUX_O_WRONLY UINT64_C(00000001)
@@ -574,6 +576,11 @@ enum kernel_files_status kernel_files_read(
         *linux_result = -KERNEL_EBADF;
         return KERNEL_FILES_STATUS_OK;
     }
+    if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_CONSOLE) {
+        /* No console input source exists yet; report the empty stream as EOF. */
+        *linux_result = 0;
+        return KERNEL_FILES_STATUS_OK;
+    }
     if (kernel_user_range_check(user_buffer, (size_t)count) !=
         KERNEL_UACCESS_STATUS_OK) {
         files->record->statistics.read_failures++;
@@ -671,6 +678,112 @@ enum kernel_files_status kernel_files_read(
 
     files->record->statistics.bytes_read += total;
     *linux_result = (int64_t)total;
+    return KERNEL_FILES_STATUS_OK;
+}
+
+enum kernel_files_status kernel_files_write(
+    struct kernel_files *files,
+    struct kernel_mm *mm,
+    int64_t fd,
+    uint64_t user_buffer,
+    uint64_t count,
+    int64_t *linux_result)
+{
+    struct kernel_open_file_description *description;
+    unsigned char staging[KERNEL_FILES_WRITE_STAGING];
+    uint64_t request;
+    uint64_t total = 0U;
+
+    if (!kernel_files_is_live(files) || mm == 0 || linux_result == 0) {
+        return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
+    }
+    files->record->statistics.write_calls++;
+    description = lookup_description(files, fd);
+    if (description == 0 ||
+        kernel_open_file_kind(description) !=
+            KERNEL_OPEN_FILE_KIND_CONSOLE) {
+        /* Every regular-file descriptor is read-only on the read-only root. */
+        files->record->statistics.write_failures++;
+        *linux_result = -KERNEL_EBADF;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    if (kernel_user_range_check(user_buffer, (size_t)count) !=
+        KERNEL_UACCESS_STATUS_OK) {
+        files->record->statistics.write_failures++;
+        *linux_result = -KERNEL_EFAULT;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    if (count == 0U) {
+        *linux_result = 0;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    request = count > KERNEL_FILES_MAX_RW_COUNT
+                  ? KERNEL_FILES_MAX_RW_COUNT
+                  : count;
+    while (total < request) {
+        size_t chunk = request - total;
+        size_t copied = 0U;
+        size_t index;
+        enum kernel_uaccess_status access_status;
+
+        if (chunk > sizeof(staging)) {
+            chunk = sizeof(staging);
+        }
+        access_status = kernel_copy_from_user(mm,
+                                              staging,
+                                              user_buffer + total,
+                                              chunk,
+                                              &copied);
+        total += copied;
+        for (index = 0U; index < copied; index++) {
+            kernel_console_putc((char)staging[index]);
+        }
+        if (access_status == KERNEL_UACCESS_STATUS_FAULT) {
+            files->record->statistics.write_failures++;
+            files->record->statistics.bytes_written += total;
+            *linux_result = total != 0U ? (int64_t)total : -KERNEL_EFAULT;
+            return KERNEL_FILES_STATUS_OK;
+        }
+        if (access_status != KERNEL_UACCESS_STATUS_OK || copied != chunk) {
+            return KERNEL_FILES_STATUS_STATE;
+        }
+    }
+    files->record->statistics.bytes_written += total;
+    *linux_result = (int64_t)total;
+    return KERNEL_FILES_STATUS_OK;
+}
+
+enum kernel_files_status kernel_files_open_console(
+    struct kernel_files *files,
+    int64_t fd,
+    int64_t *linux_result)
+{
+    struct kernel_open_file_description *description = 0;
+    enum kernel_open_file_status open_status;
+
+    if (!kernel_files_is_live(files) || linux_result == 0) {
+        return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
+    }
+    if (fd < 0 || (uint64_t)fd >= files->record->statistics.capacity ||
+        lookup_description(files, fd) != 0) {
+        *linux_result = -KERNEL_EBADF;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    open_status = kernel_open_file_create_console(files->heap, &description);
+    if (open_status != KERNEL_OPEN_FILE_STATUS_OK) {
+        return open_status == KERNEL_OPEN_FILE_STATUS_NO_MEMORY
+                   ? KERNEL_FILES_STATUS_NO_MEMORY
+                   : KERNEL_FILES_STATUS_STATE;
+    }
+    files->record->slots[fd].description = description;
+    files->record->slots[fd].flags = 0U;
+    files->record->statistics.current_open_fds++;
+    if (files->record->statistics.current_open_fds >
+        files->record->statistics.peak_open_fds) {
+        files->record->statistics.peak_open_fds =
+            files->record->statistics.current_open_fds;
+    }
+    *linux_result = 0;
     return KERNEL_FILES_STATUS_OK;
 }
 
