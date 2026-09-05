@@ -20,6 +20,7 @@ enum kernel_open_file_status {
 
 enum kernel_open_file_kind {
     KERNEL_OPEN_FILE_KIND_REGULAR = 0,
+    KERNEL_OPEN_FILE_KIND_DIRECTORY,
     KERNEL_OPEN_FILE_KIND_CONSOLE,
 };
 

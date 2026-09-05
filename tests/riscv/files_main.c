@@ -407,7 +407,7 @@ static void run_file_operations(struct kernel_files *files,
     expect_open(files, fs, mm, TEST_AT_FDCWD, "/data", TEST_O_CREAT,
                 -KERNEL_EROFS, 23U);
     expect_open(files, fs, mm, TEST_AT_FDCWD, "/data", TEST_O_DIRECTORY,
-                -KERNEL_ENOTSUP, 24U);
+                -KERNEL_ENOTDIR, 24U);
     expect_open(files, fs, mm, TEST_AT_FDCWD, "/data", 3U,
                 -KERNEL_EINVAL, 34U);
     expect_open(files,
@@ -418,8 +418,16 @@ static void run_file_operations(struct kernel_files *files,
                 UINT64_C(1) << 63U,
                 -KERNEL_EINVAL,
                 35U);
-    expect_open(files, fs, mm, TEST_AT_FDCWD, "/", 0U,
-                -KERNEL_EISDIR, 25U);
+    /* The root directory opens read-only; reads stay reserved for
+     * regular files and getdents64. */
+    expect_open(files, fs, mm, TEST_AT_FDCWD, "/", 0U, 2, 25U);
+    if (kernel_files_read(files, mm, 2, TEST_USER_BUFFER, 1U, &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != -KERNEL_EISDIR ||
+        kernel_files_close(files, 2, &result) != KERNEL_FILES_STATUS_OK ||
+        result != 0) {
+        fail_files(25U, 0, result);
+    }
     expect_open(files, fs, mm, TEST_AT_FDCWD, "", 0U,
                 -KERNEL_ENOENT, 26U);
 
@@ -1106,6 +1114,184 @@ static void run_seek_stat_operations(struct kernel_files *files,
     }
 }
 
+static char directory_name[256];
+
+static int collect_dirent_name(struct kernel_mm *mm,
+                                uint64_t address,
+                                uint64_t *offset)
+{
+    unsigned char header[19];
+    uint16_t record_length = 0;
+    size_t index;
+
+    if (!read_user_bytes(mm, address, header, sizeof(header))) {
+        return -1;
+    }
+    for (index = 0U; index < sizeof(record_length); index++) {
+        record_length |= (uint16_t)((uint16_t)header[16U + index] <<
+                                    (8U * index));
+    }
+    if (record_length < 20U || record_length > 280U ||
+        !read_user_bytes(mm,
+                         address + 19U,
+                         directory_name,
+                         record_length - 19U)) {
+        return -1;
+    }
+    directory_name[record_length - 19U < sizeof(directory_name)
+                       ? record_length - 19U
+                       : sizeof(directory_name) - 1U] = '\0';
+    *offset = record_length;
+    return (int)header[18U];
+}
+
+static int dirent_name_is(const char *name, const char *expected)
+{
+    size_t index = 0U;
+
+    while (expected[index] != '\0') {
+        if (name[index] != expected[index]) {
+            return 0;
+        }
+        index++;
+    }
+    return name[index] == '\0';
+}
+
+static void run_directory_operations(struct kernel_files *files,
+                                     const struct kernel_fs_context *fs,
+                                     struct kernel_mm *mm)
+{
+    uint64_t dir_buffer = TEST_USER_BUFFER;
+    uint64_t offset;
+    int saw_data = 0;
+    int saw_lost = 0;
+    int64_t result = INT64_MIN;
+
+    /* The root directory opens read-only and lists its entries. */
+    expect_open(files, fs, mm, TEST_AT_FDCWD, "/", 0U, 0, 110U);
+    expect_open(files, fs, mm, TEST_AT_FDCWD, "/data", 0U, 1, 110U);
+    if (kernel_files_getdents(files,
+                              mm,
+                              0,
+                              dir_buffer,
+                              4096U,
+                              &result) != KERNEL_FILES_STATUS_OK ||
+        result <= 0) {
+        fail_files(111U, 0, result);
+    }
+
+    /* Walk the returned records: the image holds /data and lost+found. */
+    {
+        unsigned int dump;
+
+        for (dump = 0U; dump < 64U; dump++) {
+            unsigned char byte = 0U;
+
+            (void)read_user_byte(mm, dir_buffer + dump, &byte);
+            virt_uart_put_hex(byte);
+            virt_uart_putc(dump % 16U == 15U ? '\n' : ' ');
+        }
+    }
+    offset = 0U;
+    while (offset < (uint64_t)result) {
+        uint64_t record_size = 0U;
+        int type = collect_dirent_name(mm,
+                                       dir_buffer + offset,
+                                       &record_size);
+
+        if (type < 0) {
+            fail_files(112U, 0, type);
+        }
+        offset += record_size;
+        if (dirent_name_is(directory_name, "data") && type == KERNEL_VFS_DT_REG) {
+            saw_data = 1;
+        }
+        if (dirent_name_is(directory_name, "lost+found") &&
+            type == KERNEL_VFS_DT_DIR) {
+            saw_lost = 1;
+        }
+    }
+    if (!saw_data || !saw_lost) {
+        fail_files(113U, 0, (long)saw_data);
+    }
+
+    /* The next call reports end-of-directory. */
+    if (kernel_files_getdents(files,
+                              mm,
+                              0,
+                              dir_buffer,
+                              4096U,
+                              &result) != KERNEL_FILES_STATUS_OK ||
+        result != 0 ||
+        kernel_files_getdents(files,
+                              mm,
+                              1,
+                              dir_buffer,
+                              4096U,
+                              &result) != KERNEL_FILES_STATUS_OK ||
+        result != -KERNEL_ENOTDIR ||
+        kernel_files_getdents(files,
+                              mm,
+                              9,
+                              dir_buffer,
+                              4096U,
+                              &result) != KERNEL_FILES_STATUS_OK ||
+        result != -KERNEL_EBADF ||
+        kernel_files_getdents(files,
+                              mm,
+                              0,
+                              UINT64_MAX,
+                              4096U,
+                              &result) != KERNEL_FILES_STATUS_OK ||
+        result != -KERNEL_EFAULT) {
+        fail_files(114U, 0, result);
+    }
+    /* A buffer too small for even one entry is EINVAL, from the start. */
+    if (kernel_files_lseek(files, 0, 0U, KERNEL_FILES_SEEK_SET, &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != 0 ||
+        kernel_files_getdents(files,
+                              mm,
+                              0,
+                              dir_buffer,
+                              8U,
+                              &result) != KERNEL_FILES_STATUS_OK ||
+        result != -KERNEL_EINVAL) {
+        fail_files(118U, 0, result);
+    }
+
+    /* Seek repositions the entry cursor. */
+    if (kernel_files_lseek(files, 0, 1U, KERNEL_FILES_SEEK_SET, &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != 1 ||
+        kernel_files_getdents(files,
+                              mm,
+                              0,
+                              dir_buffer,
+                              4096U,
+                              &result) != KERNEL_FILES_STATUS_OK ||
+        result <= 0) {
+        fail_files(115U, 0, result);
+    }
+    offset = 0U;
+    {
+        int type = collect_dirent_name(mm,
+                                       dir_buffer + offset,
+                                       &offset);
+
+        if (type < 0 || !dirent_name_is(directory_name, "data")) {
+            fail_files(116U, 0, type);
+        }
+    }
+    if (kernel_files_close(files, 0, &result) != KERNEL_FILES_STATUS_OK ||
+        result != 0 ||
+        kernel_files_close(files, 1, &result) != KERNEL_FILES_STATUS_OK ||
+        result != 0) {
+        fail_files(117U, 0, result);
+    }
+}
+
 static void run_dup_fcntl_operations(struct kernel_files *files,
                                      const struct kernel_fs_context *fs,
                                      struct kernel_mm *mm)
@@ -1417,6 +1603,17 @@ static void run_files_test(const void *dtb)
                    KERNEL_FILES_STATUS_STATE);
     }
     run_dup_fcntl_operations(&files, &fs, &mm);
+
+    if (kernel_files_release(&files) != KERNEL_FILES_STATUS_OK) {
+        fail_files(58U, KERNEL_FILES_STATUS_OK,
+                   KERNEL_FILES_STATUS_STATE);
+    }
+    files = (struct kernel_files){0};
+    if (kernel_files_create(&files, &heap) != KERNEL_FILES_STATUS_OK) {
+        fail_files(109U, KERNEL_FILES_STATUS_OK,
+                   KERNEL_FILES_STATUS_STATE);
+    }
+    run_directory_operations(&files, &fs, &mm);
 
     if (kernel_files_release(&files) != KERNEL_FILES_STATUS_OK) {
         fail_files(58U, KERNEL_FILES_STATUS_OK,

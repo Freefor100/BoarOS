@@ -87,10 +87,17 @@ enum kernel_open_file_status kernel_open_file_create_console(
 enum kernel_open_file_kind kernel_open_file_kind(
     const struct kernel_open_file_description *file)
 {
-    if (file == 0 || file->kind != KERNEL_OPEN_FILE_KIND_CONSOLE) {
+    if (file == 0) {
         return KERNEL_OPEN_FILE_KIND_REGULAR;
     }
-    return KERNEL_OPEN_FILE_KIND_CONSOLE;
+    switch (file->kind) {
+    case KERNEL_OPEN_FILE_KIND_DIRECTORY:
+        return KERNEL_OPEN_FILE_KIND_DIRECTORY;
+    case KERNEL_OPEN_FILE_KIND_CONSOLE:
+        return KERNEL_OPEN_FILE_KIND_CONSOLE;
+    default:
+        return KERNEL_OPEN_FILE_KIND_REGULAR;
+    }
 }
 
 enum kernel_open_file_status kernel_open_file_acquire(

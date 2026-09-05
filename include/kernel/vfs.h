@@ -63,6 +63,28 @@ int kernel_vfs_close(struct kernel_vfs_file *file);
 /* Underlying ext4 inode number; zero when unavailable. */
 uint32_t kernel_vfs_file_inode(const struct kernel_vfs_file *file);
 
+/* Linux d_type values for directory entries. */
+#define KERNEL_VFS_DT_UNKNOWN UINT8_C(0)
+#define KERNEL_VFS_DT_FIFO UINT8_C(1)
+#define KERNEL_VFS_DT_CHR UINT8_C(2)
+#define KERNEL_VFS_DT_DIR UINT8_C(4)
+#define KERNEL_VFS_DT_BLK UINT8_C(6)
+#define KERNEL_VFS_DT_REG UINT8_C(8)
+#define KERNEL_VFS_DT_LNK UINT8_C(7)
+#define KERNEL_VFS_DT_SOCK UINT8_C(12)
+
+/*
+ * Report entry `index` (dot entries excluded) of an open directory:
+ * 1 with the fields filled, 0 past the end, or a negative errno.  Each
+ * call re-walks the directory, so the handle stays stateless.
+ */
+int kernel_vfs_dir_entry(struct kernel_vfs_file *file,
+                         uint64_t index,
+                         uint64_t *inode,
+                         uint8_t *type,
+                         char *name,
+                         size_t name_size);
+
 int kernel_vfs_files_share_node(const struct kernel_vfs_file *left,
                                 const struct kernel_vfs_file *right);
 

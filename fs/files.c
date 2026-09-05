@@ -12,6 +12,7 @@
 #include <kernel/physical_page.h>
 #include <kernel/uaccess.h>
 #include <kernel/vfs.h>
+#include <string.h>
 
 #include <stddef.h>
 #include <stdint.h>
@@ -288,12 +289,16 @@ static int validate_open_flags(uint64_t flags, uint32_t *fd_flags)
 {
     const uint64_t write_flags = LINUX_O_CREAT | LINUX_O_TRUNC |
                                  LINUX_O_APPEND;
+    /* O_TMPFILE embeds the O_DIRECTORY bit; only its own bit is
+     * unsupported, so a plain O_DIRECTORY open still validates. */
     const uint64_t unsupported_flags = LINUX_O_EXCL |
         LINUX_O_NONBLOCK | LINUX_O_DSYNC | LINUX_O_DIRECT |
-        LINUX_O_DIRECTORY | LINUX_O_NOFOLLOW | LINUX_O_NOATIME |
-        LINUX_O_SYNC | LINUX_O_PATH | LINUX_O_TMPFILE;
+        LINUX_O_NOFOLLOW | LINUX_O_NOATIME |
+        LINUX_O_SYNC | LINUX_O_PATH |
+        (LINUX_O_TMPFILE & ~LINUX_O_DIRECTORY);
     const uint64_t known_flags = LINUX_O_ACCMODE | write_flags |
-        unsupported_flags | LINUX_O_LARGEFILE | LINUX_O_CLOEXEC;
+        unsupported_flags | LINUX_O_DIRECTORY | LINUX_O_LARGEFILE |
+        LINUX_O_CLOEXEC;
     uint64_t access_mode = flags & LINUX_O_ACCMODE;
 
     if (access_mode == LINUX_O_WRONLY || access_mode == LINUX_O_RDWR ||
@@ -397,7 +402,7 @@ enum kernel_files_status kernel_files_openat(
     struct kernel_vfs_mount *mount;
     char *path;
     uint32_t fd;
-    uint32_t fd_flags;
+    uint32_t fd_flags = 0U;
     int result;
     enum kernel_heap_status heap_status;
     enum kernel_open_file_status open_status;
@@ -486,18 +491,24 @@ enum kernel_files_status kernel_files_openat(
         *linux_result = result;
         return KERNEL_FILES_STATUS_OK;
     }
-    if ((kernel_open_file_mode(description) & KERNEL_VFS_S_IFMT) !=
-        KERNEL_VFS_S_IFREG) {
-        int type_result =
-            (kernel_open_file_mode(description) & KERNEL_VFS_S_IFMT) ==
-                    KERNEL_VFS_S_IFDIR
-                ? -KERNEL_EISDIR
-                : -KERNEL_ENOTSUP;
-
+    if ((kernel_open_file_mode(description) & KERNEL_VFS_S_IFMT) ==
+        KERNEL_VFS_S_IFDIR) {
+        description->kind = KERNEL_OPEN_FILE_KIND_DIRECTORY;
+    } else if ((kernel_open_file_mode(description) & KERNEL_VFS_S_IFMT) ==
+               KERNEL_VFS_S_IFREG) {
+        if ((flags & LINUX_O_DIRECTORY) != 0U) {
+            files->record->statistics.open_failures++;
+            queue_description(files, description);
+            (void)drain_file_cleanup(files);
+            *linux_result = -KERNEL_ENOTDIR;
+            return KERNEL_FILES_STATUS_OK;
+        }
+        description->kind = KERNEL_OPEN_FILE_KIND_REGULAR;
+    } else {
         files->record->statistics.open_failures++;
         queue_description(files, description);
         (void)drain_file_cleanup(files);
-        *linux_result = type_result;
+        *linux_result = -KERNEL_ENOTSUP;
         return KERNEL_FILES_STATUS_OK;
     }
 
@@ -580,6 +591,12 @@ enum kernel_files_status kernel_files_read(
     if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_CONSOLE) {
         /* No console input source exists yet; report the empty stream as EOF. */
         *linux_result = 0;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    if (kernel_open_file_kind(description) ==
+        KERNEL_OPEN_FILE_KIND_DIRECTORY) {
+        files->record->statistics.read_failures++;
+        *linux_result = -KERNEL_EISDIR;
         return KERNEL_FILES_STATUS_OK;
     }
     if (kernel_user_range_check(user_buffer, (size_t)count) !=
@@ -902,8 +919,8 @@ enum kernel_files_status kernel_files_lseek(
         *linux_result = -KERNEL_EBADF;
         return KERNEL_FILES_STATUS_OK;
     }
-    if (kernel_open_file_kind(description) !=
-        KERNEL_OPEN_FILE_KIND_REGULAR) {
+    if (kernel_open_file_kind(description) ==
+        KERNEL_OPEN_FILE_KIND_CONSOLE) {
         *linux_result = -KERNEL_ESPIPE;
         return KERNEL_FILES_STATUS_OK;
     }
@@ -1373,6 +1390,131 @@ enum kernel_files_status kernel_files_fcntl(
         *linux_result = -KERNEL_EINVAL;
         return KERNEL_FILES_STATUS_OK;
     }
+}
+
+enum kernel_files_status kernel_files_getdents(
+    struct kernel_files *files,
+    struct kernel_mm *mm,
+    int64_t fd,
+    uint64_t user_buffer,
+    uint64_t count,
+    int64_t *linux_result)
+{
+    struct kernel_open_file_description *description;
+    unsigned char record[19U + 256U];
+    char name[256];
+    uint64_t inode;
+    uint8_t type;
+    uint64_t request;
+    uint64_t total = 0U;
+    uint64_t index;
+    int fill_result;
+
+    if (!kernel_files_is_live(files) || mm == 0 || linux_result == 0) {
+        return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
+    }
+    description = lookup_description(files, fd);
+    if (description == 0) {
+        *linux_result = -KERNEL_EBADF;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    if (kernel_open_file_kind(description) !=
+        KERNEL_OPEN_FILE_KIND_DIRECTORY) {
+        *linux_result = -KERNEL_ENOTDIR;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    if (kernel_user_range_check(user_buffer, (size_t)count) !=
+        KERNEL_UACCESS_STATUS_OK) {
+        *linux_result = -KERNEL_EFAULT;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    if (count == 0U) {
+        *linux_result = 0;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    request = count > KERNEL_FILES_MAX_RW_COUNT
+                  ? KERNEL_FILES_MAX_RW_COUNT
+                  : count;
+
+    /* The descriptor offset counts the entries already emitted; each
+     * call re-walks the directory and skips past them. */
+    index = kernel_open_file_offset(description);
+    while (total < request) {
+        size_t name_length;
+        size_t record_length;
+        size_t copied = 0U;
+        uint16_t reported_length;
+        uint16_t little;
+        uint64_t cookie;
+        enum kernel_uaccess_status access_status;
+
+        fill_result = kernel_vfs_dir_entry(&description->file,
+                                           index,
+                                           &inode,
+                                           &type,
+                                           name,
+                                           sizeof(name));
+        if (fill_result == 0) {
+            break;
+        }
+        if (fill_result < 0) {
+            *linux_result = fill_result;
+            return KERNEL_FILES_STATUS_OK;
+        }
+        name_length = strlen(name);
+        record_length = (19U + name_length + 1U + 7U) & ~(size_t)7U;
+        if ((uint64_t)record_length > request - total) {
+            /* Linux answers EINVAL when nothing fits at all. */
+            *linux_result = total == 0U ? -KERNEL_EINVAL : (int64_t)total;
+            files->record->statistics.bytes_read += total;
+            return KERNEL_FILES_STATUS_OK;
+        }
+        reported_length = (uint16_t)record_length;
+        little = 1;
+        if (*(unsigned char *)&little) {
+            /* Little-endian host byte order for the fixed fields. */
+            memcpy(&record[0], &inode, sizeof(inode));
+            cookie = index + 1U;
+            memcpy(&record[8], &cookie, sizeof(cookie));
+        } else {
+            for (uint8_t byte = 0U; byte < 8U; byte++) {
+                record[byte] =
+                    (unsigned char)((inode >> (8U * byte)) & 0xffU);
+                record[8U + byte] =
+                    (unsigned char)(((index + 1U) >> (8U * byte)) &
+                                    0xffU);
+            }
+        }
+        memcpy(&record[16], &reported_length, sizeof(reported_length));
+        record[18] = type;
+        memcpy(&record[19], name, name_length);
+        record[19U + name_length] = '\0';
+        for (size_t pad = 19U + name_length + 1U; pad < record_length;
+             pad++) {
+            record[pad] = 0U;
+        }
+
+        access_status = kernel_copy_to_user(mm,
+                                            user_buffer + total,
+                                            record,
+                                            record_length,
+                                            &copied);
+        if (access_status == KERNEL_UACCESS_STATUS_FAULT ||
+            copied != record_length) {
+            *linux_result = total == 0U ? -KERNEL_EFAULT : (int64_t)total;
+            files->record->statistics.bytes_read += total;
+            return KERNEL_FILES_STATUS_OK;
+        }
+        total += record_length;
+        index++;
+        if (kernel_open_file_seek(description, index) !=
+            KERNEL_OPEN_FILE_STATUS_OK) {
+            return KERNEL_FILES_STATUS_STATE;
+        }
+    }
+    files->record->statistics.bytes_read += total;
+    *linux_result = (int64_t)total;
+    return KERNEL_FILES_STATUS_OK;
 }
 
 enum kernel_files_status kernel_files_close(

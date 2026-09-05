@@ -17,6 +17,7 @@
 #define LINUX_SYSCALL_FCNTL 25U
 #define LINUX_SYSCALL_OPENAT 56U
 #define LINUX_SYSCALL_CLOSE 57U
+#define LINUX_SYSCALL_GETDENTS64 61U
 #define LINUX_SYSCALL_LSEEK 62U
 #define LINUX_SYSCALL_READ 63U
 #define LINUX_SYSCALL_WRITE 64U
@@ -422,6 +423,38 @@ static enum kernel_syscall_status decode_fcntl(
     return KERNEL_SYSCALL_STATUS_OK;
 }
 
+static enum kernel_syscall_status decode_getdents64(
+    struct kernel_task *caller,
+    const struct kernel_syscall_request *request,
+    struct kernel_syscall_result *decoded)
+{
+    struct kernel_files *files;
+    struct kernel_mm *mm;
+    int64_t linux_result;
+    enum kernel_task_status task_status;
+
+    task_status = kernel_task_files_borrow(caller, &files);
+    if (task_status == KERNEL_TASK_STATUS_RESOURCE_UNAVAILABLE) {
+        decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+        decoded->value = -KERNEL_EBADF;
+        return KERNEL_SYSCALL_STATUS_OK;
+    }
+    if (task_status != KERNEL_TASK_STATUS_OK ||
+        kernel_task_mm_borrow_mutable(caller, &mm) !=
+            KERNEL_TASK_STATUS_OK ||
+        kernel_files_getdents(files,
+                              mm,
+                              (int64_t)request->arguments[0],
+                              request->arguments[1],
+                              request->arguments[2],
+                              &linux_result) != KERNEL_FILES_STATUS_OK) {
+        return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    }
+    decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+    decoded->value = linux_result;
+    return KERNEL_SYSCALL_STATUS_OK;
+}
+
 static enum kernel_syscall_status decode_close(
     struct kernel_task *caller,
     const struct kernel_syscall_request *request,
@@ -755,6 +788,11 @@ enum kernel_syscall_status kernel_syscall_dispatch(
         }
     } else if (request->number == LINUX_SYSCALL_WRITE) {
         if (decode_write(caller, request, &decoded) !=
+            KERNEL_SYSCALL_STATUS_OK) {
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+        }
+    } else if (request->number == LINUX_SYSCALL_GETDENTS64) {
+        if (decode_getdents64(caller, request, &decoded) !=
             KERNEL_SYSCALL_STATUS_OK) {
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
         }

@@ -595,6 +595,7 @@ $(SYSCALL_TEST_KERNEL_RV): $(SYSCALL_TEST_OBJECTS) arch/riscv/linker.ld
 	-Wl,--wrap=kernel_files_lseek \
 	-Wl,--wrap=kernel_files_fstat \
 	-Wl,--wrap=kernel_files_fstatat \
+	-Wl,--wrap=kernel_files_getdents \
 	-Wl,--wrap=kernel_files_dup \
 	-Wl,--wrap=kernel_files_dup2 \
 	-Wl,--wrap=kernel_files_dup3 \

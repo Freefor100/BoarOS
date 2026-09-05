@@ -39,6 +39,9 @@ static int64_t fstat_fd = -1;
 static uint64_t fstat_buffer;
 static int64_t fstatat_dirfd = INT64_MIN;
 static uint64_t fstatat_flags = UINT64_MAX;
+static int64_t getdents_fd = INT64_MIN;
+static uint64_t getdents_buffer;
+static uint64_t getdents_count;
 static int64_t dup_oldfd = INT64_MIN;
 static int64_t dup_newfd = INT64_MIN;
 static uint64_t dup_flags = UINT64_MAX;
@@ -246,6 +249,25 @@ enum kernel_files_status __wrap_kernel_files_fstatat(
     fstatat_dirfd = dirfd;
     fstatat_flags = flags;
     fstat_buffer = user_buffer + user_path;
+    *linux_result = write_linux_result;
+    return write_files_status;
+}
+
+enum kernel_files_status __wrap_kernel_files_getdents(
+    struct kernel_files *files,
+    struct kernel_mm *mm,
+    int64_t fd,
+    uint64_t user_buffer,
+    uint64_t count,
+    int64_t *linux_result)
+{
+    if (files != (struct kernel_files *)(uintptr_t)3U ||
+        mm != (struct kernel_mm *)(uintptr_t)2U || linux_result == 0) {
+        return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
+    }
+    getdents_fd = fd;
+    getdents_buffer = user_buffer;
+    getdents_count = count;
     *linux_result = write_linux_result;
     return write_files_status;
 }
@@ -570,6 +592,21 @@ static unsigned long run_seek_stat_decode_cases(void)
         lseek_fd != 3 ||
         lseek_offset != INT64_C(0x1234) ||
         lseek_whence != 2U) {
+        failures++;
+    }
+
+    request.number = 61U;
+    request.arguments[0] = 8U;
+    request.arguments[1] = UINT64_C(0x4000);
+    request.arguments[2] = UINT64_C(0x2000);
+    if (kernel_syscall_dispatch(caller, &request, &result) !=
+            KERNEL_SYSCALL_STATUS_OK ||
+        result_changed(&result,
+                       KERNEL_SYSCALL_ACTION_RETURN,
+                       INT64_C(0x4321)) ||
+        getdents_fd != 8 ||
+        getdents_buffer != UINT64_C(0x4000) ||
+        getdents_count != UINT64_C(0x2000)) {
         failures++;
     }
 

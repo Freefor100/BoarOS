@@ -166,6 +166,14 @@ enum kernel_files_status kernel_files_fstatat(
     uint64_t flags,
     int64_t *linux_result);
 
+enum kernel_files_status kernel_files_getdents(
+    struct kernel_files *files,
+    struct kernel_mm *mm,
+    int64_t fd,
+    uint64_t user_buffer,
+    uint64_t count,
+    int64_t *linux_result);
+
 enum kernel_files_status kernel_files_dup(
     struct kernel_files *files,
     int64_t oldfd,
