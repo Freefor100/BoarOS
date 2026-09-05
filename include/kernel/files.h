@@ -50,6 +50,15 @@ struct kernel_files_statistics {
 #define KERNEL_FILES_SEEK_END UINT64_C(2)
 #define KERNEL_FILES_AT_SYMLINK_NOFOLLOW UINT64_C(0x100)
 #define KERNEL_FILES_AT_EMPTY_PATH UINT64_C(0x1000)
+#define KERNEL_FILES_F_DUPFD UINT64_C(0)
+#define KERNEL_FILES_F_GETFD UINT64_C(1)
+#define KERNEL_FILES_F_SETFD UINT64_C(2)
+#define KERNEL_FILES_F_GETFL UINT64_C(3)
+#define KERNEL_FILES_F_SETFL UINT64_C(4)
+#define KERNEL_FILES_F_DUPFD_CLOEXEC UINT64_C(1030)
+#define KERNEL_FILES_O_APPEND UINT64_C(00002000)
+#define KERNEL_FILES_O_NONBLOCK UINT64_C(00004000)
+#define KERNEL_FILES_O_CLOEXEC UINT64_C(02000000)
 
 /* Linux asm-generic struct stat as the riscv64 ABI defines it. */
 struct kernel_linux_stat {
@@ -155,6 +164,33 @@ enum kernel_files_status kernel_files_fstatat(
     uint64_t user_path,
     uint64_t user_buffer,
     uint64_t flags,
+    int64_t *linux_result);
+
+enum kernel_files_status kernel_files_dup(
+    struct kernel_files *files,
+    int64_t oldfd,
+    int64_t *linux_result);
+
+/* dup3 semantics: oldfd == newfd is EINVAL, flags accept O_CLOEXEC. */
+enum kernel_files_status kernel_files_dup3(
+    struct kernel_files *files,
+    int64_t oldfd,
+    int64_t newfd,
+    uint64_t flags,
+    int64_t *linux_result);
+
+/* dup2 semantics: oldfd == newfd returns newfd without closing it. */
+enum kernel_files_status kernel_files_dup2(
+    struct kernel_files *files,
+    int64_t oldfd,
+    int64_t newfd,
+    int64_t *linux_result);
+
+enum kernel_files_status kernel_files_fcntl(
+    struct kernel_files *files,
+    int64_t fd,
+    uint64_t command,
+    uint64_t argument,
     int64_t *linux_result);
 
 enum kernel_files_status kernel_files_close(

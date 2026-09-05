@@ -1109,6 +1109,272 @@ enum kernel_files_status kernel_files_fstatat(
     return KERNEL_FILES_STATUS_OK;
 }
 
+static enum kernel_files_status install_dup(
+    struct kernel_files *files,
+    struct kernel_open_file_description *description,
+    uint32_t newfd,
+    uint32_t fd_flags,
+    int64_t *linux_result)
+{
+    files->record->slots[newfd].description = description;
+    files->record->slots[newfd].flags = fd_flags;
+    files->record->statistics.current_open_fds++;
+    if (files->record->statistics.current_open_fds >
+        files->record->statistics.peak_open_fds) {
+        files->record->statistics.peak_open_fds =
+            files->record->statistics.current_open_fds;
+    }
+    if ((fd_flags & KERNEL_FILES_FD_CLOEXEC) != 0U) {
+        files->record->statistics.close_on_exec_fds++;
+    }
+    *linux_result = newfd;
+    return KERNEL_FILES_STATUS_OK;
+}
+
+static enum kernel_files_status ensure_slot_capacity(
+    struct kernel_files *files,
+    uint32_t needed,
+    int64_t *linux_result)
+{
+    uint32_t old_capacity = files->record->statistics.capacity;
+    uint32_t new_capacity;
+    uint32_t index;
+    enum kernel_heap_status heap_status;
+    struct kernel_file_slot *resized;
+
+    *linux_result = 0;
+    if (needed <= old_capacity) {
+        return KERNEL_FILES_STATUS_OK;
+    }
+    if (needed > KERNEL_FILES_MAX_CAPACITY) {
+        *linux_result = -KERNEL_EBADF;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    new_capacity = old_capacity;
+    while (new_capacity < needed) {
+        new_capacity *= 2U;
+    }
+    heap_status = kernel_heap_resize(files->heap,
+                                     files->record->slots,
+                                     (size_t)new_capacity *
+                                         sizeof(struct kernel_file_slot),
+                                     (void **)&resized);
+    if (heap_status == KERNEL_HEAP_STATUS_EMPTY) {
+        *linux_result = -KERNEL_ENOMEM;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    if (heap_status != KERNEL_HEAP_STATUS_OK) {
+        return KERNEL_FILES_STATUS_STATE;
+    }
+    files->record->slots = resized;
+    for (index = old_capacity; index < new_capacity; index++) {
+        files->record->slots[index].description = 0;
+        files->record->slots[index].flags = 0U;
+    }
+    files->record->statistics.capacity = new_capacity;
+    return KERNEL_FILES_STATUS_OK;
+}
+
+enum kernel_files_status kernel_files_dup(
+    struct kernel_files *files,
+    int64_t oldfd,
+    int64_t *linux_result)
+{
+    struct kernel_open_file_description *description;
+    uint32_t fd;
+    int result;
+    enum kernel_files_status status;
+
+    if (!kernel_files_is_live(files) || linux_result == 0) {
+        return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
+    }
+    description = lookup_description(files, oldfd);
+    if (description == 0) {
+        *linux_result = -KERNEL_EBADF;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    status = find_free_fd(files, &fd, &result);
+    if (status != KERNEL_FILES_STATUS_OK) {
+        return status;
+    }
+    if (result != 0) {
+        *linux_result = result;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    if (kernel_open_file_acquire(description) !=
+        KERNEL_OPEN_FILE_STATUS_OK) {
+        return KERNEL_FILES_STATUS_STATE;
+    }
+    /* dup never carries CLOEXEC across; only F_DUPFD_CLOEXEC sets it. */
+    return install_dup(files, description, fd, 0U, linux_result);
+}
+
+enum kernel_files_status kernel_files_dup3(
+    struct kernel_files *files,
+    int64_t oldfd,
+    int64_t newfd,
+    uint64_t flags,
+    int64_t *linux_result)
+{
+    struct kernel_open_file_description *description;
+    uint32_t fd_flags = 0U;
+    enum kernel_files_status status;
+
+    if (!kernel_files_is_live(files) || linux_result == 0) {
+        return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
+    }
+    if (newfd < 0 || (uint64_t)newfd >= KERNEL_FILES_MAX_CAPACITY ||
+        oldfd == newfd ||
+        (flags & ~LINUX_O_CLOEXEC) != 0U) {
+        *linux_result = -KERNEL_EINVAL;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    description = lookup_description(files, oldfd);
+    if (description == 0) {
+        *linux_result = -KERNEL_EBADF;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    status = ensure_slot_capacity(files, (uint32_t)newfd + 1U, linux_result);
+    if (status != KERNEL_FILES_STATUS_OK) {
+        return status;
+    }
+    if (*linux_result != 0) {
+        return KERNEL_FILES_STATUS_OK;
+    }
+    if (lookup_description(files, newfd) != 0 &&
+        detach_fd(files, (uint32_t)newfd) != KERNEL_FILES_STATUS_OK) {
+        return KERNEL_FILES_STATUS_STATE;
+    }
+    if (kernel_open_file_acquire(description) !=
+        KERNEL_OPEN_FILE_STATUS_OK) {
+        return KERNEL_FILES_STATUS_STATE;
+    }
+    if ((flags & LINUX_O_CLOEXEC) != 0U) {
+        fd_flags = KERNEL_FILES_FD_CLOEXEC;
+    }
+    return install_dup(files, description, (uint32_t)newfd, fd_flags,
+                       linux_result);
+}
+
+enum kernel_files_status kernel_files_dup2(
+    struct kernel_files *files,
+    int64_t oldfd,
+    int64_t newfd,
+    int64_t *linux_result)
+{
+    if (!kernel_files_is_live(files) || linux_result == 0) {
+        return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
+    }
+    if (oldfd == newfd) {
+        if (lookup_description(files, oldfd) == 0) {
+            *linux_result = -KERNEL_EBADF;
+            return KERNEL_FILES_STATUS_OK;
+        }
+        *linux_result = newfd;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    if (newfd < 0 || (uint64_t)newfd >= KERNEL_FILES_MAX_CAPACITY) {
+        /* dup2 reports an out-of-range target as EBADF, unlike dup3. */
+        *linux_result = -KERNEL_EBADF;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    return kernel_files_dup3(files, oldfd, newfd, 0U, linux_result);
+}
+
+enum kernel_files_status kernel_files_fcntl(
+    struct kernel_files *files,
+    int64_t fd,
+    uint64_t command,
+    uint64_t argument,
+    int64_t *linux_result)
+{
+    struct kernel_file_slot *slot;
+    struct kernel_open_file_description *description;
+    uint32_t fd_flags;
+
+    if (!kernel_files_is_live(files) || linux_result == 0) {
+        return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
+    }
+    if (command == KERNEL_FILES_F_DUPFD ||
+        command == KERNEL_FILES_F_DUPFD_CLOEXEC) {
+        uint32_t index;
+
+        if ((int64_t)argument < 0) {
+            *linux_result = -KERNEL_EINVAL;
+            return KERNEL_FILES_STATUS_OK;
+        }
+        description = lookup_description(files, fd);
+        if (description == 0) {
+            *linux_result = -KERNEL_EBADF;
+            return KERNEL_FILES_STATUS_OK;
+        }
+        for (index = (uint32_t)argument;
+             index < files->record->statistics.capacity;
+             index++) {
+            if (files->record->slots[index].description == 0) {
+                break;
+            }
+        }
+        if (index == files->record->statistics.capacity) {
+            *linux_result = -KERNEL_EMFILE;
+            return KERNEL_FILES_STATUS_OK;
+        }
+        if (kernel_open_file_acquire(description) !=
+            KERNEL_OPEN_FILE_STATUS_OK) {
+            return KERNEL_FILES_STATUS_STATE;
+        }
+        fd_flags = command == KERNEL_FILES_F_DUPFD_CLOEXEC
+                       ? KERNEL_FILES_FD_CLOEXEC
+                       : 0U;
+        return install_dup(files, description, index, fd_flags,
+                           linux_result);
+    }
+    if (fd < 0 ||
+        (uint64_t)fd >= files->record->statistics.capacity ||
+        files->record->slots[fd].description == 0) {
+        *linux_result = -KERNEL_EBADF;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    slot = &files->record->slots[fd];
+    switch (command) {
+    case KERNEL_FILES_F_GETFD:
+        /* The fd flag is FD_CLOEXEC, value 1, not the O_CLOEXEC bit. */
+        *linux_result = (slot->flags & KERNEL_FILES_FD_CLOEXEC) != 0U
+                            ? 1
+                            : 0;
+        return KERNEL_FILES_STATUS_OK;
+    case KERNEL_FILES_F_SETFD:
+        fd_flags = (argument & 1U) != 0U ? KERNEL_FILES_FD_CLOEXEC : 0U;
+        if ((fd_flags & KERNEL_FILES_FD_CLOEXEC) != 0U &&
+            (slot->flags & KERNEL_FILES_FD_CLOEXEC) == 0U) {
+            files->record->statistics.close_on_exec_fds++;
+        } else if ((fd_flags & KERNEL_FILES_FD_CLOEXEC) == 0U &&
+                   (slot->flags & KERNEL_FILES_FD_CLOEXEC) != 0U) {
+            files->record->statistics.close_on_exec_fds--;
+        }
+        slot->flags = fd_flags;
+        *linux_result = 0;
+        return KERNEL_FILES_STATUS_OK;
+    case KERNEL_FILES_F_GETFL:
+        *linux_result = (int64_t)kernel_open_file_flags(slot->description);
+        return KERNEL_FILES_STATUS_OK;
+    case KERNEL_FILES_F_SETFL:
+        if ((argument & ~(LINUX_O_APPEND | LINUX_O_NONBLOCK)) != 0U) {
+            *linux_result = -KERNEL_EINVAL;
+            return KERNEL_FILES_STATUS_OK;
+        }
+        slot->description->open_flags =
+            (slot->description->open_flags &
+             (uint32_t)~(LINUX_O_APPEND | LINUX_O_NONBLOCK)) |
+            (uint32_t)(argument & (LINUX_O_APPEND | LINUX_O_NONBLOCK));
+        *linux_result = 0;
+        return KERNEL_FILES_STATUS_OK;
+    default:
+        *linux_result = -KERNEL_EINVAL;
+        return KERNEL_FILES_STATUS_OK;
+    }
+}
+
 enum kernel_files_status kernel_files_close(
     struct kernel_files *files,
     int64_t fd,

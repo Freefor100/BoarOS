@@ -39,6 +39,11 @@ static int64_t fstat_fd = -1;
 static uint64_t fstat_buffer;
 static int64_t fstatat_dirfd = INT64_MIN;
 static uint64_t fstatat_flags = UINT64_MAX;
+static int64_t dup_oldfd = INT64_MIN;
+static int64_t dup_newfd = INT64_MIN;
+static uint64_t dup_flags = UINT64_MAX;
+static uint64_t fcntl_command = UINT64_MAX;
+static uint64_t fcntl_argument = UINT64_MAX;
 static enum kernel_open_file_kind pinned_kind =
     KERNEL_OPEN_FILE_KIND_REGULAR;
 static enum kernel_mm_status file_mmap_status = KERNEL_MM_STATUS_OK;
@@ -241,6 +246,72 @@ enum kernel_files_status __wrap_kernel_files_fstatat(
     fstatat_dirfd = dirfd;
     fstatat_flags = flags;
     fstat_buffer = user_buffer + user_path;
+    *linux_result = write_linux_result;
+    return write_files_status;
+}
+
+enum kernel_files_status __wrap_kernel_files_dup(
+    struct kernel_files *files,
+    int64_t oldfd,
+    int64_t *linux_result)
+{
+    if (files != (struct kernel_files *)(uintptr_t)3U ||
+        linux_result == 0) {
+        return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
+    }
+    dup_oldfd = oldfd;
+    *linux_result = write_linux_result;
+    return write_files_status;
+}
+
+enum kernel_files_status __wrap_kernel_files_dup2(
+    struct kernel_files *files,
+    int64_t oldfd,
+    int64_t newfd,
+    int64_t *linux_result)
+{
+    if (files != (struct kernel_files *)(uintptr_t)3U ||
+        linux_result == 0) {
+        return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
+    }
+    dup_oldfd = oldfd;
+    dup_newfd = newfd;
+    *linux_result = write_linux_result;
+    return write_files_status;
+}
+
+enum kernel_files_status __wrap_kernel_files_dup3(
+    struct kernel_files *files,
+    int64_t oldfd,
+    int64_t newfd,
+    uint64_t flags,
+    int64_t *linux_result)
+{
+    if (files != (struct kernel_files *)(uintptr_t)3U ||
+        linux_result == 0) {
+        return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
+    }
+    dup_oldfd = oldfd;
+    dup_newfd = newfd;
+    dup_flags = flags;
+    *linux_result = write_linux_result;
+    return write_files_status;
+}
+
+enum kernel_files_status __wrap_kernel_files_fcntl(
+    struct kernel_files *files,
+    int64_t fd,
+    uint64_t command,
+    uint64_t argument,
+    int64_t *linux_result)
+{
+    if (files != (struct kernel_files *)(uintptr_t)3U ||
+        linux_result == 0) {
+        return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
+    }
+    (void)fd;
+    fcntl_command = command;
+    fcntl_argument = argument;
     *linux_result = write_linux_result;
     return write_files_status;
 }
@@ -544,6 +615,68 @@ static unsigned long run_seek_stat_decode_cases(void)
     return failures;
 }
 
+static unsigned long run_dup_fcntl_decode_cases(void)
+{
+    struct kernel_task *caller = (struct kernel_task *)(uintptr_t)1U;
+    struct kernel_syscall_request request = {
+        .number = 23U,
+        .arguments = {5U, 0U, 0U, 0U, 0U, 0U},
+    };
+    struct kernel_syscall_result result;
+    unsigned long failures = 0U;
+
+    files_borrow_status = KERNEL_TASK_STATUS_OK;
+    write_files_status = KERNEL_FILES_STATUS_OK;
+    write_linux_result = 12;
+
+    if (kernel_syscall_dispatch(caller, &request, &result) !=
+            KERNEL_SYSCALL_STATUS_OK ||
+        result_changed(&result, KERNEL_SYSCALL_ACTION_RETURN, 12) ||
+        dup_oldfd != 5) {
+        failures++;
+    }
+
+    request.number = 33U;
+    request.arguments[1] = 9U;
+    if (kernel_syscall_dispatch(caller, &request, &result) !=
+            KERNEL_SYSCALL_STATUS_OK ||
+        result_changed(&result, KERNEL_SYSCALL_ACTION_RETURN, 12) ||
+        dup_oldfd != 5 || dup_newfd != 9) {
+        failures++;
+    }
+
+    request.number = 24U;
+    request.arguments[2] = 0x80000;
+    if (kernel_syscall_dispatch(caller, &request, &result) !=
+            KERNEL_SYSCALL_STATUS_OK ||
+        result_changed(&result, KERNEL_SYSCALL_ACTION_RETURN, 12) ||
+        dup_oldfd != 5 || dup_newfd != 9 || dup_flags != 0x80000) {
+        failures++;
+    }
+
+    request.number = 25U;
+    request.arguments[0] = 6U;
+    request.arguments[1] = 4U;
+    request.arguments[2] = 0x800;
+    if (kernel_syscall_dispatch(caller, &request, &result) !=
+            KERNEL_SYSCALL_STATUS_OK ||
+        result_changed(&result, KERNEL_SYSCALL_ACTION_RETURN, 12) ||
+        fcntl_command != 4U || fcntl_argument != 0x800) {
+        failures++;
+    }
+
+    files_borrow_status = KERNEL_TASK_STATUS_RESOURCE_UNAVAILABLE;
+    result.action = KERNEL_SYSCALL_ACTION_EXIT;
+    result.value = 1;
+    if (kernel_syscall_dispatch(caller, &request, &result) !=
+            KERNEL_SYSCALL_STATUS_OK ||
+        result_changed(&result, KERNEL_SYSCALL_ACTION_RETURN, -9)) {
+        failures++;
+    }
+    files_borrow_status = KERNEL_TASK_STATUS_OK;
+    return failures;
+}
+
 static unsigned long run_brk_cases(void)
 {
     struct kernel_task *caller = (struct kernel_task *)(uintptr_t)1U;
@@ -771,6 +904,7 @@ unsigned long run_syscall_cases(void)
     failures += run_process_decode_cases();
     failures += run_write_cases();
     failures += run_seek_stat_decode_cases();
+    failures += run_dup_fcntl_decode_cases();
     failures += run_brk_cases();
     failures += run_memory_mapping_cases();
     return failures;

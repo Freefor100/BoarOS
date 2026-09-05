@@ -486,6 +486,86 @@ _start:
     li t2, 9000
     bne t1, t2, .Lfailure
 
+    # dup2 duplicates the descriptor; both share one open-file
+    # description, so reads advance the common offset.
+    mv a0, s0
+    li a1, 7
+    li a7, 33
+    ecall
+    li t0, 7
+    bne a0, t0, .Lfailure
+    li a0, 7
+    la a1, .Lread_buffer
+    li a2, 1
+    li a7, 63
+    ecall
+    li t0, 1
+    bne a0, t0, .Lfailure
+    la t0, .Lread_buffer
+    lbu t1, 0(t0)
+    li t2, 'L'
+    bne t1, t2, .Lfailure
+
+    # fcntl separates per-fd flags from the per-file status flags, and
+    # F_SETFL accepts only the modifiable set.
+    li a0, 7
+    li a1, 3
+    li a2, 0
+    li a7, 25
+    ecall
+    bnez a0, .Lfailure
+    li a0, 7
+    li a1, 4
+    li a2, 04000
+    li a7, 25
+    ecall
+    bnez a0, .Lfailure
+    li a0, 7
+    li a1, 3
+    li a7, 25
+    ecall
+    li t0, 04000
+    bne a0, t0, .Lfailure
+    li a0, 7
+    li a1, 4
+    li a2, 040000
+    li a7, 25
+    ecall
+    li t0, -22
+    bne a0, t0, .Lfailure
+    li a0, 7
+    li a1, 2
+    li a2, 1
+    li a7, 25
+    ecall
+    bnez a0, .Lfailure
+    li a0, 7
+    li a1, 1
+    li a7, 25
+    ecall
+    li t0, 1
+    bne a0, t0, .Lfailure
+
+    # F_DUPFD_CLOEXEC honors its lower bound, and closing the duplicate
+    # leaves the original descriptor working.
+    li a0, 7
+    li a1, 1030
+    li a2, 9
+    li a7, 25
+    ecall
+    li t0, 9
+    bne a0, t0, .Lfailure
+    li a0, 9
+    li a1, 1
+    li a7, 25
+    ecall
+    li t0, 1
+    bne a0, t0, .Lfailure
+    li a0, 7
+    li a7, 57
+    ecall
+    bnez a0, .Lfailure
+
     mv a0, s0
     li a7, 57
     ecall

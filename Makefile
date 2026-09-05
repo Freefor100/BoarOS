@@ -595,6 +595,10 @@ $(SYSCALL_TEST_KERNEL_RV): $(SYSCALL_TEST_OBJECTS) arch/riscv/linker.ld
 	-Wl,--wrap=kernel_files_lseek \
 	-Wl,--wrap=kernel_files_fstat \
 	-Wl,--wrap=kernel_files_fstatat \
+	-Wl,--wrap=kernel_files_dup \
+	-Wl,--wrap=kernel_files_dup2 \
+	-Wl,--wrap=kernel_files_dup3 \
+	-Wl,--wrap=kernel_files_fcntl \
 	-Wl,--wrap=kernel_open_file_kind \
 	-Wl,--wrap=kernel_open_file_release \
 	-Wl,-Map,$(BUILD_DIR)/tests/kernel-syscall-rv.map \

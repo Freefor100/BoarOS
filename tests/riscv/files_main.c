@@ -1106,6 +1106,202 @@ static void run_seek_stat_operations(struct kernel_files *files,
     }
 }
 
+static void run_dup_fcntl_operations(struct kernel_files *files,
+                                     const struct kernel_fs_context *fs,
+                                     struct kernel_mm *mm)
+{
+    struct kernel_files child_files = {0};
+    int64_t result = INT64_MIN;
+
+    if (kernel_files_open_console(files, 0, &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != 0 ||
+        kernel_files_open_console(files, 1, &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != 0 ||
+        kernel_files_open_console(files, 2, &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != 0) {
+        fail_files(100U, 0, result);
+    }
+    expect_open(files, fs, mm, TEST_AT_FDCWD, "/data", 0U, 3, 100U);
+
+    /* dup shares one open-file description, so the offset is common. */
+    if (kernel_files_dup(files, 3, &result) != KERNEL_FILES_STATUS_OK ||
+        result != 4 ||
+        kernel_files_read(files, mm, 3, TEST_USER_BUFFER, 3U, &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != 3 ||
+        kernel_files_read(files, mm, 4, TEST_USER_BUFFER, 2U, &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != 2 ||
+        kernel_files_dup(files, 3, &result) != KERNEL_FILES_STATUS_OK ||
+        result != 5 ||
+        kernel_files_close(files, 4, &result) != KERNEL_FILES_STATUS_OK ||
+        result != 0 ||
+        kernel_files_close(files, 5, &result) != KERNEL_FILES_STATUS_OK ||
+        result != 0 ||
+        kernel_files_dup(files, 40, &result) != KERNEL_FILES_STATUS_OK ||
+        result != -KERNEL_EBADF) {
+        fail_files(101U, 0, result);
+    }
+
+    /* fd flags and file flags are distinct; SETFL accepts only the
+     * modifiable set. */
+    if (kernel_files_fcntl(files, 3, KERNEL_FILES_F_GETFD, 0U, &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != 0 ||
+        kernel_files_fcntl(files,
+                           3,
+                           KERNEL_FILES_F_SETFD,
+                           1U,
+                           &result) != KERNEL_FILES_STATUS_OK ||
+        result != 0 ||
+        kernel_files_fcntl(files,
+                           3,
+                           KERNEL_FILES_F_GETFD,
+                           0U,
+                           &result) != KERNEL_FILES_STATUS_OK ||
+        result != 1 ||
+        kernel_files_fcntl(files, 3, KERNEL_FILES_F_GETFL, 0U, &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != 0 ||
+        kernel_files_fcntl(files,
+                           3,
+                           KERNEL_FILES_F_SETFL,
+                           KERNEL_FILES_O_NONBLOCK | KERNEL_FILES_O_APPEND,
+                           &result) != KERNEL_FILES_STATUS_OK ||
+        result != 0 ||
+        kernel_files_fcntl(files, 3, KERNEL_FILES_F_GETFL, 0U, &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != (int64_t)(KERNEL_FILES_O_NONBLOCK |
+                            KERNEL_FILES_O_APPEND) ||
+        kernel_files_fcntl(files,
+                           3,
+                           KERNEL_FILES_F_SETFL,
+                           KERNEL_FILES_O_NONBLOCK,
+                           &result) != KERNEL_FILES_STATUS_OK ||
+        result != 0 ||
+        kernel_files_fcntl(files,
+                           3,
+                           KERNEL_FILES_F_SETFL,
+                           UINT64_C(0x40000),
+                           &result) != KERNEL_FILES_STATUS_OK ||
+        result != -KERNEL_EINVAL ||
+        kernel_files_fcntl(files, 40, KERNEL_FILES_F_GETFD, 0U, &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != -KERNEL_EBADF) {
+        fail_files(102U, 0, result);
+    }
+
+    /* dup2 replaces the target, treats oldfd == newfd as a no-op, and
+     * dup3 pins CLOEXEC but rejects other flags. */
+    if (kernel_files_dup(files, 3, &result) != KERNEL_FILES_STATUS_OK ||
+        result != 4 ||
+        kernel_files_dup2(files, 3, 4, &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != 4 ||
+        kernel_files_dup2(files, 3, 3, &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != 3) {
+        fail_files(103U, 0, result);
+    }
+    if (kernel_files_dup3(files, 3, 3, 0U, &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != -KERNEL_EINVAL ||
+        kernel_files_dup3(files,
+                          3,
+                          6,
+                          KERNEL_FILES_O_CLOEXEC,
+                          &result) != KERNEL_FILES_STATUS_OK ||
+        result != 6) {
+        fail_files(108U, 0, result);
+    }
+    if (kernel_files_fcntl(files, 6, KERNEL_FILES_F_GETFD, 0U, &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != 1 ||
+        kernel_files_dup3(files, 3, 7, KERNEL_FILES_O_NONBLOCK, &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != -KERNEL_EINVAL ||
+        kernel_files_dup3(files, 3, -1, 0U, &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != -KERNEL_EINVAL ||
+        kernel_files_dup2(files, 40, 7, &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != -KERNEL_EBADF ||
+        kernel_files_dup2(files, 3, 2000, &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != -KERNEL_EBADF) {
+        fail_files(109U, 0, result);
+    }
+
+    /* F_DUPFD honors the lower bound, and F_DUPFD_CLOEXEC marks it. */
+    if (kernel_files_fcntl(files,
+                           3,
+                           KERNEL_FILES_F_DUPFD,
+                           10U,
+                           &result) != KERNEL_FILES_STATUS_OK ||
+        result != 10 ||
+        kernel_files_fcntl(files,
+                           3,
+                           KERNEL_FILES_F_DUPFD,
+                           4U,
+                           &result) != KERNEL_FILES_STATUS_OK ||
+        result != 5 ||
+        kernel_files_fcntl(files,
+                           3,
+                           KERNEL_FILES_F_DUPFD_CLOEXEC,
+                           20U,
+                           &result) != KERNEL_FILES_STATUS_OK ||
+        result != 20 ||
+        kernel_files_fcntl(files, 20, KERNEL_FILES_F_GETFD, 0U, &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != 1 ||
+        kernel_files_fcntl(files,
+                           3,
+                           KERNEL_FILES_F_DUPFD,
+                           (uint64_t)-50,
+                           &result) != KERNEL_FILES_STATUS_OK ||
+        result != -KERNEL_EINVAL) {
+        fail_files(104U, 0, result);
+    }
+
+    /* Fork keeps the duplicated descriptors and their fd flags. */
+    if (kernel_files_fork(&child_files, files) != KERNEL_FILES_STATUS_OK ||
+        kernel_files_fcntl(&child_files,
+                           20,
+                           KERNEL_FILES_F_GETFD,
+                           0U,
+                           &result) != KERNEL_FILES_STATUS_OK ||
+        result != 1 ||
+        kernel_files_release(&child_files) != KERNEL_FILES_STATUS_OK) {
+        fail_files(105U, 0, result);
+    }
+
+    if (kernel_files_close_on_exec(files) != KERNEL_FILES_STATUS_OK) {
+        fail_files(106U, KERNEL_FILES_STATUS_OK,
+                   KERNEL_FILES_STATUS_STATE);
+    }
+    /* CLOEXEC descriptors 6 and 20 are gone, and fd 3's CLOEXEC flag was
+     * set through F_SETFD earlier; the plain dups remain. */
+    if (kernel_files_close(files, 3, &result) != KERNEL_FILES_STATUS_OK ||
+        result != -KERNEL_EBADF ||
+        kernel_files_close(files, 0, &result) != KERNEL_FILES_STATUS_OK ||
+        result != 0 ||
+        kernel_files_close(files, 1, &result) != KERNEL_FILES_STATUS_OK ||
+        result != 0 ||
+        kernel_files_close(files, 2, &result) != KERNEL_FILES_STATUS_OK ||
+        result != 0 ||
+        kernel_files_close(files, 4, &result) != KERNEL_FILES_STATUS_OK ||
+        result != 0 ||
+        kernel_files_close(files, 5, &result) != KERNEL_FILES_STATUS_OK ||
+        result != 0 ||
+        kernel_files_close(files, 10, &result) != KERNEL_FILES_STATUS_OK ||
+        result != 0) {
+        fail_files(107U, 0, result);
+    }
+}
+
 static void run_files_test(const void *dtb)
 {
     struct dtb_boot_info info;
@@ -1210,6 +1406,17 @@ static void run_files_test(const void *dtb)
     }
     run_console_operations(&files, &fs, &mm);
     run_seek_stat_operations(&files, &fs, &mm);
+
+    if (kernel_files_release(&files) != KERNEL_FILES_STATUS_OK) {
+        fail_files(58U, KERNEL_FILES_STATUS_OK,
+                   KERNEL_FILES_STATUS_STATE);
+    }
+    files = (struct kernel_files){0};
+    if (kernel_files_create(&files, &heap) != KERNEL_FILES_STATUS_OK) {
+        fail_files(99U, KERNEL_FILES_STATUS_OK,
+                   KERNEL_FILES_STATUS_STATE);
+    }
+    run_dup_fcntl_operations(&files, &fs, &mm);
 
     if (kernel_files_release(&files) != KERNEL_FILES_STATUS_OK) {
         fail_files(58U, KERNEL_FILES_STATUS_OK,
