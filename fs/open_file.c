@@ -180,10 +180,27 @@ uint32_t kernel_open_file_mode(
     return open_file_live(file) ? file->file.mode : 0U;
 }
 
+uint32_t kernel_open_file_flags(
+    const struct kernel_open_file_description *file)
+{
+    return open_file_live(file) ? file->open_flags : 0U;
+}
+
 uint64_t kernel_open_file_offset(
     const struct kernel_open_file_description *file)
 {
     return open_file_live(file) ? file->offset : 0U;
+}
+
+enum kernel_open_file_status kernel_open_file_seek(
+    struct kernel_open_file_description *file,
+    uint64_t offset)
+{
+    if (!open_file_live(file)) {
+        return KERNEL_OPEN_FILE_STATUS_STATE;
+    }
+    file->offset = offset;
+    return KERNEL_OPEN_FILE_STATUS_OK;
 }
 
 enum kernel_open_file_status kernel_open_file_advance(

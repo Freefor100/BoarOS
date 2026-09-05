@@ -14,6 +14,7 @@
 
 #define LINUX_SYSCALL_OPENAT 56U
 #define LINUX_SYSCALL_CLOSE 57U
+#define LINUX_SYSCALL_LSEEK 62U
 #define LINUX_SYSCALL_READ 63U
 #define LINUX_SYSCALL_WRITE 64U
 #define LINUX_SYSCALL_EXIT 93U
@@ -28,6 +29,8 @@
 #define LINUX_SYSCALL_MMAP 222U
 #define LINUX_SYSCALL_MPROTECT 226U
 #define LINUX_SYSCALL_WAIT4 260U
+#define LINUX_SYSCALL_NEWFSTATAT 79U
+#define LINUX_SYSCALL_FSTAT 80U
 #define LINUX_EXIT_STATUS_MASK UINT64_C(0xff)
 #define LINUX_CLONE_SIGNAL_MASK UINT64_C(0xff)
 #define LINUX_SIGCHLD UINT64_C(17)
@@ -203,6 +206,102 @@ static enum kernel_syscall_status decode_write(
                            request->arguments[1],
                            request->arguments[2],
                            &linux_result) != KERNEL_FILES_STATUS_OK) {
+        return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    }
+    decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+    decoded->value = linux_result;
+    return KERNEL_SYSCALL_STATUS_OK;
+}
+
+static enum kernel_syscall_status decode_lseek(
+    struct kernel_task *caller,
+    const struct kernel_syscall_request *request,
+    struct kernel_syscall_result *decoded)
+{
+    struct kernel_files *files;
+    int64_t linux_result;
+    enum kernel_task_status task_status;
+
+    task_status = kernel_task_files_borrow(caller, &files);
+    if (task_status == KERNEL_TASK_STATUS_RESOURCE_UNAVAILABLE) {
+        decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+        decoded->value = -KERNEL_EBADF;
+        return KERNEL_SYSCALL_STATUS_OK;
+    }
+    if (task_status != KERNEL_TASK_STATUS_OK ||
+        kernel_files_lseek(files,
+                           (int64_t)request->arguments[0],
+                           (int64_t)request->arguments[1],
+                           request->arguments[2],
+                           &linux_result) != KERNEL_FILES_STATUS_OK) {
+        return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    }
+    decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+    decoded->value = linux_result;
+    return KERNEL_SYSCALL_STATUS_OK;
+}
+
+static enum kernel_syscall_status decode_fstat(
+    struct kernel_task *caller,
+    const struct kernel_syscall_request *request,
+    struct kernel_syscall_result *decoded)
+{
+    struct kernel_files *files;
+    struct kernel_mm *mm;
+    int64_t linux_result;
+    enum kernel_task_status task_status;
+
+    task_status = kernel_task_files_borrow(caller, &files);
+    if (task_status == KERNEL_TASK_STATUS_RESOURCE_UNAVAILABLE) {
+        decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+        decoded->value = -KERNEL_EBADF;
+        return KERNEL_SYSCALL_STATUS_OK;
+    }
+    if (task_status != KERNEL_TASK_STATUS_OK ||
+        kernel_task_mm_borrow_mutable(caller, &mm) !=
+            KERNEL_TASK_STATUS_OK ||
+        kernel_files_fstat(files,
+                           mm,
+                           (int64_t)request->arguments[0],
+                           request->arguments[1],
+                           &linux_result) != KERNEL_FILES_STATUS_OK) {
+        return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    }
+    decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+    decoded->value = linux_result;
+    return KERNEL_SYSCALL_STATUS_OK;
+}
+
+static enum kernel_syscall_status decode_newfstatat(
+    struct kernel_task *caller,
+    const struct kernel_syscall_request *request,
+    struct kernel_syscall_result *decoded)
+{
+    struct kernel_files *files;
+    const struct kernel_fs_context *fs;
+    struct kernel_mm *mm;
+    int64_t linux_result;
+    enum kernel_task_status task_status;
+
+    task_status = kernel_task_files_borrow(caller, &files);
+    if (task_status == KERNEL_TASK_STATUS_RESOURCE_UNAVAILABLE) {
+        decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+        decoded->value = -KERNEL_EBADF;
+        return KERNEL_SYSCALL_STATUS_OK;
+    }
+    if (task_status != KERNEL_TASK_STATUS_OK ||
+        kernel_task_fs_context_borrow(caller, &fs) !=
+            KERNEL_TASK_STATUS_OK ||
+        kernel_task_mm_borrow_mutable(caller, &mm) !=
+            KERNEL_TASK_STATUS_OK ||
+        kernel_files_fstatat(files,
+                             fs,
+                             mm,
+                             (int64_t)request->arguments[0],
+                             request->arguments[1],
+                             request->arguments[2],
+                             request->arguments[3],
+                             &linux_result) != KERNEL_FILES_STATUS_OK) {
         return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     }
     decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
@@ -523,6 +622,21 @@ enum kernel_syscall_status kernel_syscall_dispatch(
         }
     } else if (request->number == LINUX_SYSCALL_WRITE) {
         if (decode_write(caller, request, &decoded) !=
+            KERNEL_SYSCALL_STATUS_OK) {
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+        }
+    } else if (request->number == LINUX_SYSCALL_LSEEK) {
+        if (decode_lseek(caller, request, &decoded) !=
+            KERNEL_SYSCALL_STATUS_OK) {
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+        }
+    } else if (request->number == LINUX_SYSCALL_NEWFSTATAT) {
+        if (decode_newfstatat(caller, request, &decoded) !=
+            KERNEL_SYSCALL_STATUS_OK) {
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+        }
+    } else if (request->number == LINUX_SYSCALL_FSTAT) {
+        if (decode_fstat(caller, request, &decoded) !=
             KERNEL_SYSCALL_STATUS_OK) {
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
         }

@@ -405,6 +405,87 @@ _start:
     ecall
     bnez a0, .Lfailure
 
+    # lseek(SEEK_END) reports the exact size; the next read sees EOF.
+    mv a0, s0
+    li a1, 0
+    li a2, 2
+    li a7, 62
+    ecall
+    li t0, 9000
+    bne a0, t0, .Lfailure
+    mv a0, s0
+    la a1, .Lread_buffer
+    li a2, 1
+    li a7, 63
+    ecall
+    bnez a0, .Lfailure
+
+    # SEEK_SET repositions, and the descriptor's own offset drives reads.
+    mv a0, s0
+    li a1, 10
+    li a2, 0
+    li a7, 62
+    ecall
+    li t0, 10
+    bne a0, t0, .Lfailure
+    mv a0, s0
+    la a1, .Lread_buffer
+    li a2, 1
+    li a7, 63
+    ecall
+    li t0, 1
+    bne a0, t0, .Lfailure
+    la t0, .Lread_buffer
+    lbu t1, 0(t0)
+    li t2, 'K'
+    bne t1, t2, .Lfailure
+
+    # The console is not seekable, negative targets are EINVAL, and the
+    # failed calls leave the position untouched.
+    li a0, 1
+    li a1, 0
+    li a2, 0
+    li a7, 62
+    ecall
+    li t0, -29
+    bne a0, t0, .Lfailure
+    mv a0, s0
+    li a1, -1
+    li a2, 0
+    li a7, 62
+    ecall
+    li t0, -22
+    bne a0, t0, .Lfailure
+
+    # fstat reports a regular mode and the exact file size for the ext4
+    # descriptor, while newfstatat resolves the same file by name.
+    mv a0, s0
+    la a1, .Lstat_buffer
+    li a7, 80
+    ecall
+    bnez a0, .Lfailure
+    la t0, .Lstat_buffer
+    lw t1, 16(t0)
+    li t2, 0100000
+    and t1, t1, t2
+    bne t1, t2, .Lfailure
+    la t0, .Lstat_buffer
+    ld t1, 48(t0)
+    li t2, 9000
+    bne t1, t2, .Lfailure
+
+    li a0, -100
+    la a1, .Labsolute_path
+    la a2, .Lstat_buffer
+    li a3, 0
+    li a7, 79
+    ecall
+    bnez a0, .Lfailure
+    la t0, .Lstat_buffer
+    ld t1, 48(t0)
+    li t2, 9000
+    bne t1, t2, .Lfailure
+
     mv a0, s0
     li a7, 57
     ecall
@@ -621,6 +702,9 @@ _start:
     .skip 4000
 .Lread_buffer:
     .skip 5000
+    .balign 8
+.Lstat_buffer:
+    .skip 128
     .balign 4
 .Lmmap_wait_status:
     .skip 4

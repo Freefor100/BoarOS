@@ -9,6 +9,7 @@ struct kernel_open_file_description {
     struct kernel_open_file_description *cleanup_next;
     struct kernel_heap *heap;
     uint64_t offset;
+    uint32_t open_flags;
     uint32_t references;
     uint8_t kind;
     uint8_t vfs_closed;

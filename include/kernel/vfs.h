@@ -11,6 +11,7 @@
 #define KERNEL_VFS_S_IFMT UINT32_C(0170000)
 #define KERNEL_VFS_S_IFREG UINT32_C(0100000)
 #define KERNEL_VFS_S_IFDIR UINT32_C(0040000)
+#define KERNEL_VFS_S_IFCHR UINT32_C(0020000)
 #define KERNEL_VFS_S_IXUSR UINT32_C(0000100)
 #define KERNEL_VFS_S_IXGRP UINT32_C(0000010)
 #define KERNEL_VFS_S_IXOTH UINT32_C(0000001)
@@ -58,6 +59,9 @@ int kernel_vfs_file_read_source(struct kernel_vfs_file *file,
                                 struct kernel_read_source *source);
 
 int kernel_vfs_close(struct kernel_vfs_file *file);
+
+/* Underlying ext4 inode number; zero when unavailable. */
+uint32_t kernel_vfs_file_inode(const struct kernel_vfs_file *file);
 
 int kernel_vfs_files_share_node(const struct kernel_vfs_file *left,
                                 const struct kernel_vfs_file *right);

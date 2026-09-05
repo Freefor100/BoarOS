@@ -183,6 +183,43 @@ static int read_user_byte(const struct kernel_mm *mm,
     return 1;
 }
 
+static int read_user_bytes(const struct kernel_mm *mm,
+                           uint64_t virtual_address,
+                           void *destination,
+                           size_t size)
+{
+    unsigned char *destination_bytes = destination;
+    size_t copied = 0U;
+
+    while (copied < size) {
+        struct kernel_mm_mapping mapping;
+        const unsigned char *page;
+        void *pointer;
+        uint64_t current = virtual_address + copied;
+        size_t offset = current & BOAROS_PAGE_MASK;
+        size_t chunk = BOAROS_PAGE_SIZE - offset;
+        size_t index;
+
+        if (chunk > size - copied) {
+            chunk = size - copied;
+        }
+        if (kernel_mm_lookup(mm, current, &mapping) !=
+                KERNEL_MM_STATUS_OK ||
+            physical_page_resolve(mm->allocator,
+                                  mapping.physical_address &
+                                      ~BOAROS_PAGE_MASK,
+                                  &pointer) != PHYSICAL_PAGE_STATUS_OK) {
+            return 0;
+        }
+        page = pointer;
+        for (index = 0U; index < chunk; index++) {
+            destination_bytes[copied + index] = page[offset + index];
+        }
+        copied += chunk;
+    }
+    return 1;
+}
+
 static void expect_user_pattern(const struct kernel_mm *mm,
                                 uint64_t address,
                                 uint64_t file_offset,
@@ -806,8 +843,8 @@ static void run_console_operations(struct kernel_files *files,
 
     /* Regular descriptors are read-only, so writes report EBADF; reads on
      * the console report the empty input stream as EOF. */
-    expect_open(files, fs, mm, TEST_AT_FDCWD, "/data", 0U, 3, 72U);
-    if (kernel_files_write(files,
+        expect_open(files, fs, mm, TEST_AT_FDCWD, "/data", 0U, 3, 72U);
+        if (kernel_files_write(files,
                            mm,
                            3,
                            TEST_USER_PATH,
@@ -844,9 +881,9 @@ static void run_console_operations(struct kernel_files *files,
         result != -KERNEL_EBADF) {
         fail_files(73U, 0, result);
     }
-
+    
     /* A copy that faults partway reports the emitted prefix. */
-    if (kernel_files_write(files,
+        if (kernel_files_write(files,
                            mm,
                            1,
                            partial_buffer,
@@ -855,8 +892,8 @@ static void run_console_operations(struct kernel_files *files,
         result != 8) {
         fail_files(74U, 8, result);
     }
-
-    /* Fork shares the console descriptions and the child keeps writing. */
+    
+        /* Fork shares the console descriptions and the child keeps writing. */
     if (!write_user_bytes(mm,
                           TEST_USER_BUFFER + BOAROS_PAGE_SIZE,
                           marker,
@@ -873,12 +910,199 @@ static void run_console_operations(struct kernel_files *files,
         fail_files(75U, 0, result);
     }
 
-    kernel_files_get_statistics(files, &statistics);
+        kernel_files_get_statistics(files, &statistics);
     if (statistics.write_calls != 6U ||
         statistics.write_failures != 4U ||
         statistics.bytes_written != (sizeof(marker) - 1U) + 8U ||
         statistics.current_open_fds != 4U) {
         fail_files(76U, 4, statistics.write_failures);
+    }
+}
+
+static void run_seek_stat_operations(struct kernel_files *files,
+                                     const struct kernel_fs_context *fs,
+                                     struct kernel_mm *mm)
+{
+    struct kernel_linux_stat stat;
+    static const char empty_path[] = "";
+    uint64_t stat_buffer = TEST_USER_BUFFER + 2U * BOAROS_PAGE_SIZE;
+    int64_t result = INT64_MIN;
+
+    /* The console descriptors 0/1/2 and the /data descriptor 3 are open;
+     * a fresh open therefore receives fd 4. */
+    expect_open(files, fs, mm, TEST_AT_FDCWD, "/data", 0U, 4, 80U);
+
+    /* The three whence forms and their exact repositioning results. */
+    if (kernel_files_lseek(files, 4, 10U, KERNEL_FILES_SEEK_SET, &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != 10 ||
+        kernel_files_read(files, mm, 4, TEST_USER_BUFFER, 1U, &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != 1 ||
+        kernel_files_lseek(files, 4, 0U, KERNEL_FILES_SEEK_END, &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != 9000 ||
+        kernel_files_read(files, mm, 4, TEST_USER_BUFFER, 1U, &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != 0 ||
+        kernel_files_lseek(files, 4, -5, KERNEL_FILES_SEEK_CUR, &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != 8995 ||
+        kernel_files_lseek(files, 4, 0U, KERNEL_FILES_SEEK_SET, &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != 0 ||
+        kernel_files_lseek(files,
+                           4,
+                           INT64_MAX,
+                           KERNEL_FILES_SEEK_CUR,
+                           &result) != KERNEL_FILES_STATUS_OK ||
+        result != INT64_MAX ||
+        kernel_files_lseek(files,
+                           4,
+                           INT64_MAX,
+                           KERNEL_FILES_SEEK_CUR,
+                           &result) != KERNEL_FILES_STATUS_OK ||
+        result != -KERNEL_EINVAL ||
+        kernel_files_lseek(files, 4, -1, KERNEL_FILES_SEEK_SET, &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != -KERNEL_EINVAL ||
+        kernel_files_lseek(files, 4, 0U, 7U, &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != -KERNEL_EINVAL ||
+        kernel_files_lseek(files, 9, 0U, KERNEL_FILES_SEEK_SET, &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != -KERNEL_EBADF ||
+        kernel_files_lseek(files, 1, 0U, KERNEL_FILES_SEEK_SET, &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != -KERNEL_ESPIPE) {
+        fail_files(82U, 0, result);
+    }
+    /* Rewind after the accepted huge seek; a rejected one does not move. */
+    if (kernel_files_lseek(files, 4, 0U, KERNEL_FILES_SEEK_SET, &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != 0 ||
+        kernel_files_read(files, mm, 4, TEST_USER_BUFFER, 1U, &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != 1) {
+        fail_files(83U, 1, result);
+    }
+
+    /* fstat reports the ext4 mode/size/ino and the console character
+     * device identity, with faults reported as EFAULT. */
+    if (kernel_files_fstat(files, mm, 4, stat_buffer, &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != 0 ||
+        !read_user_bytes(mm, stat_buffer, &stat, sizeof(stat))) {
+        fail_files(84U, 0, result);
+    }
+    if ((stat.st_mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFREG ||
+        stat.st_ino == 0U || stat.st_nlink != 1U ||
+        stat.st_size != 9000 || stat.st_blksize != BOAROS_PAGE_SIZE ||
+        stat.st_blocks != 18U || stat.st_rdev != 0U) {
+        fail_files(85U, 0, stat.st_mode);
+    }
+    if (kernel_files_fstat(files, mm, 1, stat_buffer, &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != 0 ||
+        !read_user_bytes(mm, stat_buffer, &stat, sizeof(stat)) ||
+        (stat.st_mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFCHR ||
+        stat.st_rdev != UINT64_C(0x501) ||
+        kernel_files_fstat(files, mm, 5, stat_buffer, &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != -KERNEL_EBADF ||
+        kernel_files_fstat(files, mm, 4, UINT64_MAX, &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != -KERNEL_EFAULT) {
+        fail_files(86U, 0, result);
+    }
+
+    /* newfstatat resolves absolute and cwd-relative paths, and reports
+     * the documented negative cases. */
+    if (!write_user_bytes(mm, TEST_USER_PATH, "/data", 6U) ||
+        kernel_files_fstatat(files,
+                             fs,
+                             mm,
+                             TEST_AT_FDCWD,
+                             TEST_USER_PATH,
+                             stat_buffer,
+                             0U,
+                             &result) != KERNEL_FILES_STATUS_OK ||
+        result != 0 ||
+        !read_user_bytes(mm, stat_buffer, &stat, sizeof(stat)) ||
+        stat.st_size != 9000 ||
+        (stat.st_mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFREG) {
+        fail_files(87U, 0, result);
+    }
+    if (!write_user_bytes(mm, TEST_USER_PATH, "data", 5U) ||
+        kernel_files_fstatat(files,
+                             fs,
+                             mm,
+                             TEST_AT_FDCWD,
+                             TEST_USER_PATH,
+                             stat_buffer,
+                             0U,
+                             &result) != KERNEL_FILES_STATUS_OK ||
+        result != 0 ||
+        !read_user_bytes(mm, stat_buffer, &stat, sizeof(stat)) ||
+        stat.st_size != 9000) {
+        fail_files(88U, 0, result);
+    }
+    if (!write_user_bytes(mm, TEST_USER_PATH, empty_path, 1U) ||
+        kernel_files_fstatat(files,
+                             fs,
+                             mm,
+                             TEST_AT_FDCWD,
+                             TEST_USER_PATH,
+                             stat_buffer,
+                             0U,
+                             &result) != KERNEL_FILES_STATUS_OK ||
+        result != -KERNEL_ENOENT ||
+        kernel_files_fstatat(files,
+                             fs,
+                             mm,
+                             TEST_AT_FDCWD,
+                             TEST_USER_PATH,
+                             stat_buffer,
+                             KERNEL_FILES_AT_EMPTY_PATH,
+                             &result) != KERNEL_FILES_STATUS_OK ||
+        result != -KERNEL_EBADF ||
+        kernel_files_fstatat(files,
+                             fs,
+                             mm,
+                             1,
+                             TEST_USER_PATH,
+                             stat_buffer,
+                             KERNEL_FILES_AT_EMPTY_PATH,
+                             &result) != KERNEL_FILES_STATUS_OK ||
+        result != 0 ||
+        !read_user_bytes(mm, stat_buffer, &stat, sizeof(stat)) ||
+        (stat.st_mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFCHR ||
+        kernel_files_fstatat(files,
+                             fs,
+                             mm,
+                             TEST_AT_FDCWD,
+                             TEST_USER_PATH,
+                             stat_buffer,
+                             UINT64_C(0x2000),
+                             &result) != KERNEL_FILES_STATUS_OK ||
+        result != -KERNEL_EINVAL) {
+        fail_files(89U, 0, result);
+    }
+    if (!write_user_bytes(mm, TEST_USER_PATH, "data", 5U) ||
+        kernel_files_fstatat(files,
+                             fs,
+                             mm,
+                             7,
+                             TEST_USER_PATH,
+                             stat_buffer,
+                             0U,
+                             &result) != KERNEL_FILES_STATUS_OK ||
+        result != -KERNEL_EBADF) {
+        fail_files(89U, 0, result);
+    }
+    if (kernel_files_close(files, 4, &result) != KERNEL_FILES_STATUS_OK ||
+        result != 0) {
+        fail_files(90U, 0, result);
     }
 }
 
@@ -984,7 +1208,8 @@ static void run_files_test(const void *dtb)
         fail_files(59U, KERNEL_FILES_STATUS_OK,
                    KERNEL_FILES_STATUS_STATE);
     }
-    run_mmap_operations(&files, &fs, &mm, &allocator);
+    run_console_operations(&files, &fs, &mm);
+    run_seek_stat_operations(&files, &fs, &mm);
 
     if (kernel_files_release(&files) != KERNEL_FILES_STATUS_OK) {
         fail_files(58U, KERNEL_FILES_STATUS_OK,
@@ -995,7 +1220,9 @@ static void run_files_test(const void *dtb)
         fail_files(69U, KERNEL_FILES_STATUS_OK,
                    KERNEL_FILES_STATUS_STATE);
     }
-    run_console_operations(&files, &fs, &mm);
+    /* Last: the COW fork inside leaves the raw test mappings
+     * write-protected for the remaining callers. */
+    run_mmap_operations(&files, &fs, &mm, &allocator);
 
     use_test_satp = 0;
     if (kernel_files_release(&files) != KERNEL_FILES_STATUS_OK ||

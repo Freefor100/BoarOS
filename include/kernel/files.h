@@ -45,6 +45,39 @@ struct kernel_files_statistics {
     uint32_t capacity;
 };
 
+#define KERNEL_FILES_SEEK_SET UINT64_C(0)
+#define KERNEL_FILES_SEEK_CUR UINT64_C(1)
+#define KERNEL_FILES_SEEK_END UINT64_C(2)
+#define KERNEL_FILES_AT_SYMLINK_NOFOLLOW UINT64_C(0x100)
+#define KERNEL_FILES_AT_EMPTY_PATH UINT64_C(0x1000)
+
+/* Linux asm-generic struct stat as the riscv64 ABI defines it. */
+struct kernel_linux_stat {
+    uint64_t st_dev;
+    uint64_t st_ino;
+    uint32_t st_mode;
+    uint32_t st_nlink;
+    uint32_t st_uid;
+    uint32_t st_gid;
+    uint64_t st_rdev;
+    uint64_t st_pad1;
+    int64_t st_size;
+    int32_t st_blksize;
+    int32_t st_pad2;
+    int64_t st_blocks;
+    int64_t st_atime;
+    int64_t st_atime_nsec;
+    int64_t st_mtime;
+    int64_t st_mtime_nsec;
+    int64_t st_ctime;
+    int64_t st_ctime_nsec;
+    uint32_t st_pad4;
+    uint32_t st_pad5;
+};
+
+_Static_assert(sizeof(struct kernel_linux_stat) == 128U,
+               "Linux struct stat ABI size must remain 128 bytes");
+
 struct kernel_files {
     struct kernel_heap *heap;
     struct kernel_files_record *record;
@@ -97,6 +130,31 @@ enum kernel_files_status kernel_files_write(
 enum kernel_files_status kernel_files_open_console(
     struct kernel_files *files,
     int64_t fd,
+    int64_t *linux_result);
+
+enum kernel_files_status kernel_files_lseek(
+    struct kernel_files *files,
+    int64_t fd,
+    int64_t offset,
+    uint64_t whence,
+    int64_t *linux_result);
+
+enum kernel_files_status kernel_files_fstat(
+    struct kernel_files *files,
+    struct kernel_mm *mm,
+    int64_t fd,
+    uint64_t user_buffer,
+    int64_t *linux_result);
+
+/* newfstatat: AT_FDCWD or absolute paths, plus AT_EMPTY_PATH on a fd. */
+enum kernel_files_status kernel_files_fstatat(
+    struct kernel_files *files,
+    const struct kernel_fs_context *fs,
+    struct kernel_mm *mm,
+    int64_t dirfd,
+    uint64_t user_path,
+    uint64_t user_buffer,
+    uint64_t flags,
     int64_t *linux_result);
 
 enum kernel_files_status kernel_files_close(

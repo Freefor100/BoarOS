@@ -50,12 +50,19 @@ uint64_t kernel_open_file_size(
     const struct kernel_open_file_description *file);
 uint32_t kernel_open_file_mode(
     const struct kernel_open_file_description *file);
+uint32_t kernel_open_file_flags(
+    const struct kernel_open_file_description *file);
 uint64_t kernel_open_file_offset(
     const struct kernel_open_file_description *file);
 
 enum kernel_open_file_status kernel_open_file_advance(
     struct kernel_open_file_description *file,
     uint64_t bytes);
+
+/* Absolute reposition; the caller validates the requested offset. */
+enum kernel_open_file_status kernel_open_file_seek(
+    struct kernel_open_file_description *file,
+    uint64_t offset);
 
 enum kernel_page_cache_status kernel_open_file_get_page(
     struct kernel_open_file_description *file,

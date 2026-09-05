@@ -32,6 +32,13 @@ static int64_t write_linux_result;
 static int64_t write_fd = -1;
 static uint64_t write_user_buffer;
 static uint64_t write_count;
+static int64_t lseek_fd = -1;
+static int64_t lseek_offset = -1;
+static uint64_t lseek_whence = UINT64_MAX;
+static int64_t fstat_fd = -1;
+static uint64_t fstat_buffer;
+static int64_t fstatat_dirfd = INT64_MIN;
+static uint64_t fstatat_flags = UINT64_MAX;
 static enum kernel_open_file_kind pinned_kind =
     KERNEL_OPEN_FILE_KIND_REGULAR;
 static enum kernel_mm_status file_mmap_status = KERNEL_MM_STATUS_OK;
@@ -103,6 +110,20 @@ enum kernel_task_status __wrap_kernel_task_files_borrow(
     return KERNEL_TASK_STATUS_OK;
 }
 
+enum kernel_task_status __wrap_kernel_task_fs_context_borrow(
+    const struct kernel_task *task,
+    const struct kernel_fs_context **fs)
+{
+    if (files_borrow_status != KERNEL_TASK_STATUS_OK) {
+        return files_borrow_status;
+    }
+    if (task == 0 || fs == 0) {
+        return KERNEL_TASK_STATUS_INVALID_ARGUMENT;
+    }
+    *fs = (const struct kernel_fs_context *)(uintptr_t)5U;
+    return KERNEL_TASK_STATUS_OK;
+}
+
 enum kernel_files_status __wrap_kernel_files_write(
     struct kernel_files *files,
     struct kernel_mm *mm,
@@ -165,6 +186,63 @@ enum kernel_mm_status __wrap_kernel_mm_mmap_file_private(
         *address = mmap_mm_result;
     }
     return file_mmap_status;
+}
+
+enum kernel_files_status __wrap_kernel_files_lseek(
+    struct kernel_files *files,
+    int64_t fd,
+    int64_t offset,
+    uint64_t whence,
+    int64_t *linux_result)
+{
+    if (files != (struct kernel_files *)(uintptr_t)3U ||
+        linux_result == 0) {
+        return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
+    }
+    lseek_fd = fd;
+    lseek_offset = offset;
+    lseek_whence = whence;
+    *linux_result = write_linux_result;
+    return write_files_status;
+}
+
+enum kernel_files_status __wrap_kernel_files_fstat(
+    struct kernel_files *files,
+    struct kernel_mm *mm,
+    int64_t fd,
+    uint64_t user_buffer,
+    int64_t *linux_result)
+{
+    if (files != (struct kernel_files *)(uintptr_t)3U ||
+        mm != (struct kernel_mm *)(uintptr_t)2U || linux_result == 0) {
+        return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
+    }
+    fstat_fd = fd;
+    fstat_buffer = user_buffer;
+    *linux_result = write_linux_result;
+    return write_files_status;
+}
+
+enum kernel_files_status __wrap_kernel_files_fstatat(
+    struct kernel_files *files,
+    const struct kernel_fs_context *fs,
+    struct kernel_mm *mm,
+    int64_t dirfd,
+    uint64_t user_path,
+    uint64_t user_buffer,
+    uint64_t flags,
+    int64_t *linux_result)
+{
+    if (files != (struct kernel_files *)(uintptr_t)3U ||
+        fs != (const struct kernel_fs_context *)(uintptr_t)5U ||
+        mm != (struct kernel_mm *)(uintptr_t)2U || linux_result == 0) {
+        return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
+    }
+    fstatat_dirfd = dirfd;
+    fstatat_flags = flags;
+    fstat_buffer = user_buffer + user_path;
+    *linux_result = write_linux_result;
+    return write_files_status;
 }
 
 enum kernel_open_file_kind __wrap_kernel_open_file_kind(
@@ -400,6 +478,72 @@ static unsigned long run_write_cases(void)
     return failures;
 }
 
+static unsigned long run_seek_stat_decode_cases(void)
+{
+    struct kernel_task *caller = (struct kernel_task *)(uintptr_t)1U;
+    struct kernel_syscall_request request = {
+        .number = 62U,
+        .arguments = {3U, UINT64_C(0x1234), 2U, 0U, 0U, 0U},
+    };
+    struct kernel_syscall_result result;
+    unsigned long failures = 0U;
+
+    files_borrow_status = KERNEL_TASK_STATUS_OK;
+    write_files_status = KERNEL_FILES_STATUS_OK;
+    write_linux_result = 0x4321;
+    if (kernel_syscall_dispatch(caller, &request, &result) !=
+            KERNEL_SYSCALL_STATUS_OK ||
+        result_changed(&result,
+                       KERNEL_SYSCALL_ACTION_RETURN,
+                       INT64_C(0x4321)) ||
+        lseek_fd != 3 ||
+        lseek_offset != INT64_C(0x1234) ||
+        lseek_whence != 2U) {
+        failures++;
+    }
+
+    request.number = 80U;
+    request.arguments[0] = 6U;
+    request.arguments[1] = UINT64_C(0x2000);
+    request.arguments[2] = 0U;
+    if (kernel_syscall_dispatch(caller, &request, &result) !=
+            KERNEL_SYSCALL_STATUS_OK ||
+        result_changed(&result,
+                       KERNEL_SYSCALL_ACTION_RETURN,
+                       INT64_C(0x4321)) ||
+        fstat_fd != 6 ||
+        fstat_buffer != UINT64_C(0x2000)) {
+        failures++;
+    }
+
+    request.number = 79U;
+    request.arguments[0] = (uint64_t)(int64_t)-100;
+    request.arguments[1] = UINT64_C(0x1000);
+    request.arguments[2] = UINT64_C(0x2000);
+    request.arguments[3] = UINT64_C(0x100);
+    if (kernel_syscall_dispatch(caller, &request, &result) !=
+            KERNEL_SYSCALL_STATUS_OK ||
+        result_changed(&result,
+                       KERNEL_SYSCALL_ACTION_RETURN,
+                       INT64_C(0x4321)) ||
+        fstatat_dirfd != -100 ||
+        fstatat_flags != UINT64_C(0x100) ||
+        fstat_buffer != UINT64_C(0x3000)) {
+        failures++;
+    }
+
+    files_borrow_status = KERNEL_TASK_STATUS_RESOURCE_UNAVAILABLE;
+    result.action = KERNEL_SYSCALL_ACTION_EXIT;
+    result.value = 1;
+    if (kernel_syscall_dispatch(caller, &request, &result) !=
+            KERNEL_SYSCALL_STATUS_OK ||
+        result_changed(&result, KERNEL_SYSCALL_ACTION_RETURN, -9)) {
+        failures++;
+    }
+    files_borrow_status = KERNEL_TASK_STATUS_OK;
+    return failures;
+}
+
 static unsigned long run_brk_cases(void)
 {
     struct kernel_task *caller = (struct kernel_task *)(uintptr_t)1U;
@@ -626,6 +770,7 @@ unsigned long run_syscall_cases(void)
     failures += run_unknown_cases();
     failures += run_process_decode_cases();
     failures += run_write_cases();
+    failures += run_seek_stat_decode_cases();
     failures += run_brk_cases();
     failures += run_memory_mapping_cases();
     return failures;

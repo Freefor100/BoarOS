@@ -511,6 +511,18 @@ int kernel_vfs_close(struct kernel_vfs_file *file)
     return 0;
 }
 
+uint32_t kernel_vfs_file_inode(const struct kernel_vfs_file *file)
+{
+    const struct kernel_vfs_node *node;
+
+    if (file == 0 || file->private_data == 0 ||
+        file->state != VFS_FILE_STATE_LIVE) {
+        return 0U;
+    }
+    node = file->private_data;
+    return node->file.inode;
+}
+
 struct kernel_vfs_node *kernel_vfs_file_node(
     const struct kernel_vfs_file *file)
 {

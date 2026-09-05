@@ -503,6 +503,7 @@ enum kernel_files_status kernel_files_openat(
 
     files->record->slots[fd].description = description;
     files->record->slots[fd].flags = fd_flags;
+    description->open_flags = (uint32_t)flags;
     files->record->statistics.current_open_fds++;
     if (files->record->statistics.current_open_fds >
         files->record->statistics.peak_open_fds) {
@@ -821,6 +822,290 @@ static enum kernel_files_status detach_fd(struct kernel_files *files,
     if (fd < files->record->next_fd) {
         files->record->next_fd = fd;
     }
+    return KERNEL_FILES_STATUS_OK;
+}
+
+static void fill_linux_stat(
+    struct kernel_linux_stat *stat,
+    const struct kernel_open_file_description *description)
+{
+    uint64_t size = kernel_open_file_size(description);
+
+    if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_CONSOLE) {
+        /* The console is the character device this kernel exposes. */
+        stat->st_mode = KERNEL_VFS_S_IFCHR | UINT32_C(0000600);
+        stat->st_rdev = UINT64_C(0x501);
+    } else {
+        stat->st_mode = kernel_open_file_mode(description);
+        stat->st_rdev = 0U;
+        stat->st_ino = kernel_vfs_file_inode(&description->file);
+        stat->st_blocks = (int64_t)((size + 511U) / 512U);
+    }
+    stat->st_dev = 0U;
+    stat->st_nlink = 1U;
+    stat->st_uid = 0U;
+    stat->st_gid = 0U;
+    stat->st_pad1 = 0U;
+    stat->st_size = (int64_t)size;
+    stat->st_blksize = (int32_t)BOAROS_PAGE_SIZE;
+    stat->st_pad2 = 0;
+    stat->st_atime = 0;
+    stat->st_atime_nsec = 0;
+    stat->st_mtime = 0;
+    stat->st_mtime_nsec = 0;
+    stat->st_ctime = 0;
+    stat->st_ctime_nsec = 0;
+    stat->st_pad4 = 0U;
+    stat->st_pad5 = 0U;
+}
+
+static int copy_stat_to_user(struct kernel_mm *mm,
+                             uint64_t user_buffer,
+                             const struct kernel_linux_stat *stat,
+                             int64_t *linux_result)
+{
+    size_t copied = 0U;
+    enum kernel_uaccess_status access_status;
+
+    access_status = kernel_copy_to_user(mm,
+                                        user_buffer,
+                                        stat,
+                                        sizeof(*stat),
+                                        &copied);
+    if (access_status == KERNEL_UACCESS_STATUS_FAULT) {
+        *linux_result = -KERNEL_EFAULT;
+        return 0;
+    }
+    if (access_status != KERNEL_UACCESS_STATUS_OK ||
+        copied != sizeof(*stat)) {
+        return -1;
+    }
+    return 1;
+}
+
+enum kernel_files_status kernel_files_lseek(
+    struct kernel_files *files,
+    int64_t fd,
+    int64_t offset,
+    uint64_t whence,
+    int64_t *linux_result)
+{
+    struct kernel_open_file_description *description;
+    int64_t current;
+    int64_t target;
+
+    if (!kernel_files_is_live(files) || linux_result == 0) {
+        return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
+    }
+    description = lookup_description(files, fd);
+    if (description == 0) {
+        *linux_result = -KERNEL_EBADF;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    if (kernel_open_file_kind(description) !=
+        KERNEL_OPEN_FILE_KIND_REGULAR) {
+        *linux_result = -KERNEL_ESPIPE;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    current = (int64_t)kernel_open_file_offset(description);
+    switch (whence) {
+    case KERNEL_FILES_SEEK_SET:
+        target = offset;
+        break;
+    case KERNEL_FILES_SEEK_CUR:
+        if ((offset > 0 && current > INT64_MAX - offset) ||
+            (offset < 0 && current < INT64_MIN - offset)) {
+            *linux_result = -KERNEL_EINVAL;
+            return KERNEL_FILES_STATUS_OK;
+        }
+        target = current + offset;
+        break;
+    case KERNEL_FILES_SEEK_END:
+        current = (int64_t)kernel_open_file_size(description);
+        if ((offset > 0 && current > INT64_MAX - offset) ||
+            (offset < 0 && current < INT64_MIN - offset)) {
+            *linux_result = -KERNEL_EINVAL;
+            return KERNEL_FILES_STATUS_OK;
+        }
+        target = current + offset;
+        break;
+    default:
+        *linux_result = -KERNEL_EINVAL;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    if (target < 0) {
+        *linux_result = -KERNEL_EINVAL;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    if (kernel_open_file_seek(description, (uint64_t)target) !=
+        KERNEL_OPEN_FILE_STATUS_OK) {
+        return KERNEL_FILES_STATUS_STATE;
+    }
+    *linux_result = target;
+    return KERNEL_FILES_STATUS_OK;
+}
+
+enum kernel_files_status kernel_files_fstat(
+    struct kernel_files *files,
+    struct kernel_mm *mm,
+    int64_t fd,
+    uint64_t user_buffer,
+    int64_t *linux_result)
+{
+    struct kernel_open_file_description *description;
+    struct kernel_linux_stat stat;
+    int copy_result;
+
+    if (!kernel_files_is_live(files) || mm == 0 || linux_result == 0) {
+        return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
+    }
+    description = lookup_description(files, fd);
+    if (description == 0) {
+        *linux_result = -KERNEL_EBADF;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    fill_linux_stat(&stat, description);
+    copy_result = copy_stat_to_user(mm, user_buffer, &stat, linux_result);
+    if (copy_result < 0) {
+        return KERNEL_FILES_STATUS_STATE;
+    }
+    if (copy_result == 0) {
+        return KERNEL_FILES_STATUS_OK;
+    }
+    *linux_result = 0;
+    return KERNEL_FILES_STATUS_OK;
+}
+
+enum kernel_files_status kernel_files_fstatat(
+    struct kernel_files *files,
+    const struct kernel_fs_context *fs,
+    struct kernel_mm *mm,
+    int64_t dirfd,
+    uint64_t user_path,
+    uint64_t user_buffer,
+    uint64_t flags,
+    int64_t *linux_result)
+{
+    struct kernel_open_file_description *description = 0;
+    struct kernel_vfs_mount *mount;
+    char *path;
+    struct kernel_linux_stat stat;
+    size_t path_length;
+    enum kernel_heap_status heap_status;
+    enum kernel_fs_context_status fs_status;
+    enum kernel_open_file_status open_status;
+    int copy_result;
+    int result;
+
+    if (!kernel_files_is_live(files) || !kernel_fs_context_is_live(fs) ||
+        mm == 0 || linux_result == 0) {
+        return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
+    }
+    if ((flags & ~(KERNEL_FILES_AT_SYMLINK_NOFOLLOW |
+                   KERNEL_FILES_AT_EMPTY_PATH)) != 0U) {
+        *linux_result = -KERNEL_EINVAL;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    heap_status = kernel_heap_allocate(files->heap,
+                                       KERNEL_FS_PATH_MAX,
+                                       (void **)&path);
+    if (heap_status == KERNEL_HEAP_STATUS_EMPTY) {
+        *linux_result = -KERNEL_ENOMEM;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    if (heap_status != KERNEL_HEAP_STATUS_OK) {
+        return KERNEL_FILES_STATUS_STATE;
+    }
+    {
+        enum kernel_uaccess_status access_status =
+            kernel_copy_string_from_user(mm,
+                                         path,
+                                         user_path,
+                                         KERNEL_FS_PATH_MAX,
+                                         &path_length);
+
+        if (access_status == KERNEL_UACCESS_STATUS_FAULT) {
+            (void)release_or_queue_allocation(files, path);
+            *linux_result = -KERNEL_EFAULT;
+            return KERNEL_FILES_STATUS_OK;
+        }
+        if (access_status != KERNEL_UACCESS_STATUS_OK) {
+            (void)release_or_queue_allocation(files, path);
+            return KERNEL_FILES_STATUS_STATE;
+        }
+    }
+    if (path_length == 0U) {
+        if ((flags & KERNEL_FILES_AT_EMPTY_PATH) == 0U) {
+            (void)release_or_queue_allocation(files, path);
+            *linux_result = -KERNEL_ENOENT;
+            return KERNEL_FILES_STATUS_OK;
+        }
+        description = lookup_description(files, dirfd);
+        if (description == 0) {
+            (void)release_or_queue_allocation(files, path);
+            *linux_result = -KERNEL_EBADF;
+            return KERNEL_FILES_STATUS_OK;
+        }
+        if (kernel_open_file_acquire(description) !=
+            KERNEL_OPEN_FILE_STATUS_OK) {
+            (void)release_or_queue_allocation(files, path);
+            return KERNEL_FILES_STATUS_STATE;
+        }
+    } else {
+        fs_status = kernel_fs_context_resolve_kernel_path(fs,
+                                                          dirfd,
+                                                          path,
+                                                          path_length,
+                                                          path,
+                                                          KERNEL_FS_PATH_MAX,
+                                                          &mount,
+                                                          &result);
+        if (fs_status != KERNEL_FS_CONTEXT_STATUS_OK) {
+            (void)release_or_queue_allocation(files, path);
+            return KERNEL_FILES_STATUS_STATE;
+        }
+        if (result != 0) {
+            (void)release_or_queue_allocation(files, path);
+            *linux_result = result;
+            return KERNEL_FILES_STATUS_OK;
+        }
+            open_status = kernel_open_file_create(files->heap,
+                                              mount,
+                                              path,
+                                              &description,
+                                              &result);
+        if (open_status != KERNEL_OPEN_FILE_STATUS_OK) {
+            (void)release_or_queue_allocation(files, path);
+            return open_status == KERNEL_OPEN_FILE_STATUS_NO_MEMORY
+                       ? KERNEL_FILES_STATUS_NO_MEMORY
+                       : KERNEL_FILES_STATUS_STATE;
+        }
+        if (result != 0) {
+            if (kernel_open_file_release(&description) !=
+                KERNEL_OPEN_FILE_STATUS_OK) {
+                (void)release_or_queue_allocation(files, path);
+                return KERNEL_FILES_STATUS_STATE;
+            }
+            (void)release_or_queue_allocation(files, path);
+            *linux_result = result;
+            return KERNEL_FILES_STATUS_OK;
+        }
+    }
+    (void)release_or_queue_allocation(files, path);
+    fill_linux_stat(&stat, description);
+    copy_result = copy_stat_to_user(mm, user_buffer, &stat, linux_result);
+    if (description != 0 &&
+        kernel_open_file_release(&description) !=
+            KERNEL_OPEN_FILE_STATUS_OK) {
+        return KERNEL_FILES_STATUS_STATE;
+    }
+    if (copy_result < 0) {
+        return KERNEL_FILES_STATUS_STATE;
+    }
+    if (copy_result == 0) {
+        return KERNEL_FILES_STATUS_OK;
+    }
+    *linux_result = 0;
     return KERNEL_FILES_STATUS_OK;
 }
 
