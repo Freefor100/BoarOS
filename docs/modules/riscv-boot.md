@@ -32,7 +32,7 @@
 - `kernel_main` 在 Bare 状态构建两张页表。过渡页表从内核镜像内 5 个静态 4 KiB 页取得页表页，把覆盖镜像的 2 MiB 对齐物理包络同时映射到低地址和高半区，并以物理地址精确映射 QEMU UART；两组镜像叶子只在中断关闭的切换窗口内临时使用 RWX。最终页表从正式物理页分配器取得页表页，只建立严格权限的高半区内核、固定偏移且全局 NX 的 RAM direct map，以及 supervisor-only UART 高半区别名。
 - 第一次写入 `satp.MODE=8` 后，过渡页表保证低地址返回路径和当前栈仍可访问；`riscv_relocate_to_high` 再把 `ra`、`sp`、`stvec` 加上固定偏移，跳到高地址代码并重新建立高地址 `gp`。高半区 continuation 第二次切换 `satp` 到最终页表，此后低地址映射不可访问；它立即把 UART 驱动切到高半区别名，再绑定高地址物理页访问函数并修正最终页表对象的 allocator 指针，物理页回收节点由此只通过 direct map 访问。
 - 过渡页表页属于内核静态镜像，不进入正式物理页分配器；正常启动日志中的最终页表数必须等于正式物理页总数与可用页数之差。
-- 最终页表和 direct-map 访问路径验证完成前保持中断关闭。Scheduler 发布后先尝试从 modern virtio-blk/ext4 建立 PID 1，再从 DTB timebase 启动 SBI timer，先设置未来 deadline 后开启 STIE 和 SIE。无根设备时成功路径永久执行 `wfi`；有根设备时 PID 1 被完整 reaper 后卸载根并通过 SBI 关机。
+- 最终页表和 direct-map 访问路径验证完成前保持中断关闭。Scheduler 发布后先尝试从 VirtIO MMIO legacy 或 modern virtio-blk/ext4 建立 PID 1，再从 DTB timebase 启动 SBI timer，先设置未来 deadline 后开启 STIE 和 SIE。无根设备时成功路径永久执行 `wfi`；有根设备时 PID 1 被完整 reaper 后卸载根并通过 SBI 关机。
 - UART 物理基址 `0x10000000` 是 QEMU `virt` 的 guest MMIO 地址，不是 RAM 或宿主 I/O 端口。过渡表按该低地址访问；最终 `satp` 生效后驱动切到 `0xffffffe000000000` 高半区别名。发送路径轮询 LSR bit 5，再向 THR 写一个字节。
 - 关机使用 SBI System Reset 扩展：`a7=0x53525354`、`a6=0`、`a0=0`、`a1=0` 后执行 `ecall`。调用若返回则输出失败信息并停在 `wfi`，不会报告假成功。
 

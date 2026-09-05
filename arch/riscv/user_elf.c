@@ -558,6 +558,11 @@ static enum riscv_user_elf_status copy_load_segments(
     return RISCV_USER_ELF_STATUS_OK;
 }
 
+static void synchronize_instruction_memory(void)
+{
+    __asm__ volatile("fence.i" : : : "memory");
+}
+
 static enum riscv_user_elf_status populate_u64(
     struct riscv_sv39_user_space *space,
     uint64_t virtual_address,
@@ -996,6 +1001,7 @@ enum riscv_user_elf_status riscv_user_elf_load_detailed(
         *image_failure = status;
         return finish_failure(status, &working, space);
     }
+    synchronize_instruction_memory();
 
     loaded.entry = image.header.entry;
     status = build_argument_stack(request,

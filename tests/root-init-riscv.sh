@@ -10,6 +10,7 @@ stage3=${ROOT_EXEC_STAGE3_RV:-"$project_root/build/riscv/tests/user/root-exec-st
 qemu=${QEMU_RISCV64:-qemu-system-riscv64}
 memory=${QEMU_MEMORY:-512M}
 root_boot_error_status=${ROOT_BOOT_ERROR_STATUS:-}
+virtio_mmio_force_legacy=${VIRTIO_MMIO_FORCE_LEGACY:-}
 work_dir=$(mktemp -d)
 output="$work_dir/root-init.log"
 disk="$work_dir/root.img"
@@ -54,18 +55,22 @@ debugfs -w -R "write $script /script" "$disk" >/dev/null 2>&1
 debugfs -w -R "set_inode_field /script mode 0100755" "$disk" \
     >/dev/null 2>&1
 
-if ! timeout -k 2s 15s "$qemu" \
+set -- "$qemu" \
     -machine virt \
     -bios default \
     -kernel "$kernel" \
     -m "$memory" \
     -smp 1 \
     -nographic \
-    -no-reboot \
-    -global virtio-mmio.force-legacy=false \
+    -no-reboot
+if [ -n "$virtio_mmio_force_legacy" ]; then
+    set -- "$@" -global "virtio-mmio.force-legacy=$virtio_mmio_force_legacy"
+fi
+set -- "$@" \
     -drive file="$disk",if=none,format=raw,readonly=on,id=root \
-    -device virtio-blk-device,drive=root,bus=virtio-mmio-bus.0 \
-    </dev/null >"$output" 2>&1; then
+    -device virtio-blk-device,drive=root,bus=virtio-mmio-bus.0
+
+if ! timeout -k 2s 15s "$@" </dev/null >"$output" 2>&1; then
     tail -n 120 "$output" >&2
     echo "production kernel failed to run disk-backed /init" >&2
     exit 1

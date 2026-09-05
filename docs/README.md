@@ -15,7 +15,7 @@
 | [DTB 与启动内存布局模块](modules/dtb-memory.md) | RAM、静态保留区、VirtIO transport 与可用物理区间的接口和限制 |
 | [物理页分配模块](modules/physical-pages.md) | 启动分配、buddy 连续页、所有权与失败语义 |
 | [内核堆模块](modules/kernel-heap.md) | size-class slab、大对象 buddy 后备、统计和生命周期 |
-| [RISC-V VirtIO MMIO 块设备模块](modules/riscv-virtio-block.md) | modern transport、split queue、同步只读 I/O 和资源回收 |
+| [RISC-V VirtIO MMIO 块设备模块](modules/riscv-virtio-block.md) | legacy/modern transport、split queue、同步只读 I/O 和资源回收 |
 | [VFS 与只读 ext4 模块](modules/vfs-ext4.md) | 通用块/VFS 边界、lwext4 私有适配和精确随机读 |
 | [进程文件资源模块](modules/kernel-files.md) | fd/open-file-description、fs context、路径、offset、错误与退出清理契约 |
 | [RISC-V 根启动模块](modules/riscv-root-boot.md) | 根盘选择、`/init` 装载、PID 1 回收和系统终止 |

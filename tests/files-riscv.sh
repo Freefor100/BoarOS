@@ -38,7 +38,6 @@ if ! timeout -k 2s 20s "$qemu" \
     -smp 1 \
     -nographic \
     -no-reboot \
-    -global virtio-mmio.force-legacy=false \
     -drive file="$disk",if=none,format=raw,readonly=on,id=x0 \
     -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
     </dev/null >"$output" 2>&1; then

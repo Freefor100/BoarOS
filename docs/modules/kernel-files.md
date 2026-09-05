@@ -13,8 +13,8 @@
 `kernel_files_pin()` 为 fd 指向的 open file description 增加一个独立引用。file-private mmap
 用它把文件生命周期从 fd 槽中分离：映射成功后 MM 消耗该引用，之后即使所有 fd 都关闭，
 缺页仍能读取原文件；映射失败则调用者释放 pin。一个 MM 对同一 OFD 只保存一个来源节点，
-节点计数并持有成功 mmap 转入的引用，
-多个 VMA 通过 backing 指针借用它，最后一个对应 VMA 消失后在冷清理路径释放。
+由该节点持有一份成功 mmap 转入的引用；重复映射不增加历史引用，
+多个 VMA 通过 backing 指针借用它，最后一个对应 VMA 消失后在冷清理路径释放；底层 close 或堆释放失败时来源节点本身保留为可重试 owner，不重复累积引用。
 
 描述符表初始有 32 个槽，按 2 倍增长，硬上限为 1024。分配总是从 `next_fd` 指示的最低可能空位向后搜索；关闭较小 fd 后会回退该提示，因此当前没有预装 stdin/stdout/stderr 时第一次成功打开返回 0。`O_CLOEXEC` 作为 descriptor flag 保存在槽上；exec 提交后批量摘除这些槽，其他 fd 和 open-file offset 保持不变。
 
@@ -62,6 +62,6 @@ make test-root-init-riscv
 make test-riscv
 ```
 
-聚焦测试在真实 modern VirtIO/ext4 上覆盖绝对/相对路径、错误 flags、目录与缺失文件、4096 字节路径上限、最低 fd 复用、表扩容、`O_CLOEXEC`、缓存命中后的跨页读取、EOF、部分 fault、fork 后 fd 表独立与 OFD offset 共享，以及可重试清理。它还在关闭 fd 后通过 MM backing 继续缺页，并验证父子各自持有 OFD 引用。生产 exec/clone 链验证普通 fd 与 offset 跨映像和父子保持、CLOEXEC fd 不可见，并由最终资源基线证明退出清理生效。
+聚焦测试在真实 QEMU legacy 与 modern VirtIO/ext4 上覆盖绝对/相对路径、错误 flags、目录与缺失文件、4096 字节路径上限、最低 fd 复用、表扩容、`O_CLOEXEC`、缓存命中后的跨页读取、EOF、部分 fault、fork 后 fd 表独立与 OFD offset 共享，以及可重试清理。它还在关闭 fd 后通过 MM backing 继续缺页，反复固定地址映射同一 OFD 并检查来源释放只发生一次，验证父子各自持有一份来源引用。生产 exec/clone 链验证普通 fd 与 offset 跨映像和父子保持、CLOEXEC fd 不可见，并由最终资源基线证明退出清理生效。
 
 当前只有进程私有文件表、根 fs context 和只读普通文件；普通 clone 已实现“复制表、共享 OFD”，但没有 `CLONE_FILES`。也没有 `write/writev/lseek/fstat/getdents`、目录 fd、`dup/fcntl`、并发锁、read-ahead、异步 I/O 或可写文件系统。

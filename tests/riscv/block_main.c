@@ -68,7 +68,7 @@ static int bytes_equal(const unsigned char *bytes,
     return 1;
 }
 
-static void test_rejects_non_modern_or_non_block_mmio(void)
+static void test_rejects_invalid_or_non_block_mmio(void)
 {
     uint32_t registers[0x200U / sizeof(uint32_t)] = {0U};
     struct boot_memory_layout layout;
@@ -89,7 +89,7 @@ static void test_rejects_non_modern_or_non_block_mmio(void)
     }
 
     registers[0x000U / 4U] = UINT32_C(0x74726976);
-    registers[0x004U / 4U] = 1U;
+    registers[0x004U / 4U] = 3U;
     registers[0x008U / 4U] = 2U;
     status = riscv_virtio_mmio_block_init(&device,
                                           registers,
@@ -233,7 +233,7 @@ void kernel_main(unsigned long hart_id, const void *dtb)
 {
     (void)hart_id;
 
-    test_rejects_non_modern_or_non_block_mmio();
+    test_rejects_invalid_or_non_block_mmio();
     test_reads_real_virtio_block(dtb);
 
     virt_uart_puts("BoarOS: VirtIO block tests passed\n");

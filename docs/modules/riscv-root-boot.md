@@ -4,7 +4,7 @@
 
 ## 启动路径
 
-最终 Sv39、direct map、buddy 和 scheduler 就绪后，`arch/riscv/root_boot.c` 初始化页支持内核堆并为后续 exec 绑定同一物理分配器和内核根表，按 DTB 物理地址顺序选择首个成功初始化的 modern virtio-blk，raw whole-disk 只读挂载 ext4，并通过公共 executable-open 检查打开 `/init`。文件必须是 regular 且至少有一个 execute bit；请求使用 `argv[0]="/init"`、`argc=1`、`AT_EXECFN="/init"` 和空环境。
+最终 Sv39、direct map、buddy 和 scheduler 就绪后，`arch/riscv/root_boot.c` 初始化页支持内核堆并为后续 exec 绑定同一物理分配器和内核根表，按 DTB 物理地址顺序选择首个成功初始化的 VirtIO MMIO version 1 legacy 或 version 2 modern virtio-blk，raw whole-disk 只读挂载 ext4，并通过公共 executable-open 检查打开 `/init`。文件必须是 regular 且至少有一个 execute bit；请求使用 `argv[0]="/init"`、`argc=1`、`AT_EXECFN="/init"` 和空环境。
 
 VFS 文件成为精确 `read_at` 源，ELF loader 把静态 RISC-V `ET_EXEC` 的 `PT_LOAD` 直接读入新 Sv39 用户页；空间转入 MM 后，根启动用仍打开的同一 file source 登记 ELF 和完整栈 reserve 的 VMA，随后才关闭启动期 `/init` handle。根启动路径再创建借用根 mount、cwd 为 `/` 的 fs context 和空文件表，与 MM 一起原子转交 scheduler task。生产系统创建的第一个用户线程组得到 TID/TGID 1；完成以上步骤后才启动 timer，因此任务不会在根对象尚未发布时运行。
 

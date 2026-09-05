@@ -127,9 +127,9 @@ RISC-V 创建先分配并解析记录页，最后才把 LIVE Sv39 空间移入�
 
 `kernel_mm_mmap_anonymous()` 当前实现 anonymous-private demand-zero 映射。非 fixed 请求优先使用空闲的页对齐 hint，否则在 heap 上界/栈 guard 以下 top-down 选址；`FIXED_NOREPLACE` 只检查冲突，`FIXED` 则撤销旧页和 VMA 后替换。长度向上按 4 KiB 对齐，返回地址只在成功时写入。RISC-V 的 W&&!R PTE 编码保留，因此仅写保护被规范化为 RW。
 
-`kernel_mm_mmap_file_private()` 接收调用者已经 pin 的只读普通文件 OFD、页对齐文件偏移和同一组选址/权限参数。成功时 MM 消耗 pin，失败时仍由调用者持有。MM 对每个不同 OFD 只建一个来源节点，节点计数并持有历次成功 mmap 转入的引用，VMA backing 借用同一对象；这样 VMA 提交之后不再执行可能失败的 OFD release，系统调用不会出现“返回错误但映射已生效”。关闭 fd 不影响映射；fork 为子 MM 建立独立来源节点并取得一份足以覆盖其全部 VMA 的引用。`munmap`/fixed replace 在提交 VMA 后的冷路径扫描并释放已经没有 VMA 使用的全部来源引用。页故障查到 VMA 后直接取得 backing，不在 fault 热路径遍历 fd 表或来源链。
+`kernel_mm_mmap_file_private()` 接收调用者已经 pin 的只读普通文件 OFD、页对齐文件偏移和同一组选址/权限参数。成功时 MM 消耗 pin，失败时仍由调用者持有。MM 对每个不同 OFD 只建一个来源节点，并由该节点持有一份来源引用；重复 mmap 不累积历史引用，VMA backing 借用同一对象。VMA 提交后若来源已存在，只递减一个由调用者刚取得且必然不是末引用的临时 pin，不触发可能失败的底层 close/heap release；新来源则直接转移 pin，因此系统调用不会出现“返回错误但映射已生效”。关闭 fd 不影响映射；fork 为子 MM 建立独立来源节点并取得一份引用。`munmap`/fixed replace 在提交 VMA 后的冷路径扫描并释放已经没有 VMA 使用的来源节点；若底层 close 或堆释放暂时失败，节点保留为可重试 owner。页故障查到 VMA 后直接取得 backing，不在 fault 热路径遍历 fd 表或来源链。
 
-文件 VMA 不预分配数据页。read/execute 首次缺页从挂载页缓存取得共享页并建立 COW PTE；首次写若缓存已命中则复制缓存页，未命中则直接把文件内容读入新私有页，避免先创建缓存页再立即复制。文件最后一页的有效内容之后补零；故障页起点已经不小于文件大小时返回 `BUS_FAULT`。当前只读根不会发生 truncate/writeback 并发，因此映射使用创建时 OFD 持有的稳定 node/size；加入可写文件后必须补充截断、脏页和失效协议。
+文件 VMA 不预分配数据页。read/execute 首次缺页从挂载页缓存取得共享页并建立 COW PTE；首次写若缓存已命中则复制缓存页，未命中则直接把文件内容读入新私有页，避免先创建缓存页再立即复制。缓存命中的写时 COW 例程自身完成该页的 `SFENCE.VMA`/必要 `FENCE.I`，外层缺页路径不重复刷新；其他新填充页由外层统一刷新。文件最后一页的有效内容之后补零；故障页起点已经不小于文件大小时返回 `BUS_FAULT`。当前只读根不会发生 truncate/writeback 并发，因此映射使用创建时 OFD 持有的稳定 node/size；加入可写文件后必须补充截断、脏页和失效协议。
 
 `kernel_mm_munmap()` 采用 Linux 洞语义：输入范围中没有 VMA 或只覆盖部分 VMA 仍可成功；resident、`PROT_NONE` 和待释放页都由 Sv39 owner 状态处理。`kernel_mm_mprotect()` 要求整个范围无洞覆盖，先准备 VMA 拆分容量，再原地修改已有 PTE 权限，最后提交 metadata；长度 0 对齐地址直接成功。`PROT_NONE` 不释放物理页，恢复权限后仍看到原内容。
 
@@ -137,7 +137,7 @@ RISC-V 创建先分配并解析记录页，最后才把 LIVE Sv39 空间移入�
 
 `kernel_mm_resolve_user_fault()` 的 `access` 必须恰为 READ、WRITE、EXECUTE 之一。RISC-V 后端先检查用户范围、VMA、逻辑权限和现有 PTE；VMA 外地址、`PROT_NONE`/权限冲突和静态 ELF 的 `RESIDENT_REQUIRED` 空洞返回 `NOT_MAPPED`。只有确认需要提交 anonymous/file-private 页或解析 present COW 后，才要求目标 MM 是本 hart 当前 `satp`，从而既不为非法软件访问分配，也能让 uaccess 对合法未驻留页复用同一解析器。
 
-匿名成功路径按 4 KiB 对齐故障地址，分配并清零一页，以 VMA 的完整 R/W/X 权限建立 U-mode PTE。文件路径则按上述缓存/私有策略取得页面。两者成功后都执行针对该虚拟页、ASID 0 的本地 `SFENCE.VMA`；dispatcher 保持 `sepc` 不变，`sret` 后硬件重试原 load/store/fetch。`NOT_MAPPED` 在 Trap 边界终止为 `SIGSEGV(11)`，文件整页越过 EOF 的 `BUS_FAULT` 终止为 `SIGBUS(7)`；uaccess 把二者都转换为 `EFAULT`。物理页耗尽精确返回 `NO_MEMORY`；页已经分配但回滚释放失败返回 `CLEANUP_REQUIRED`；PTE 已存在却仍产生允许权限的页故障、页表损坏或非活动 MM 都是内核状态错误。
+匿名成功路径按 4 KiB 对齐故障地址，分配并清零一页，以 VMA 的完整 R/W/X 权限建立 U-mode PTE。文件路径则按上述缓存/私有策略取得页面。两者成功后都执行针对该虚拟页、ASID 0 的本地 `SFENCE.VMA`；VMA 带执行权限时还执行本 hart 的 `FENCE.I`，保证新填充的指令字节对后续取指可见。该规则覆盖匿名清零、文件填充和先读后执行的 file-private fault；COW 复制和恢复执行权限的页表路径也各自同步指令缓存。dispatcher 保持 `sepc` 不变，`sret` 后硬件重试原 load/store/fetch。`NOT_MAPPED` 在 Trap 边界终止为 `SIGSEGV(11)`，文件整页越过 EOF 的 `BUS_FAULT` 终止为 `SIGBUS(7)`；uaccess 把二者都转换为 `EFAULT`。物理页耗尽精确返回 `NO_MEMORY`；页已经分配但回滚释放失败返回 `CLEANUP_REQUIRED`；PTE 已存在却仍产生允许权限的页故障、页表损坏或非活动 MM 都是内核状态错误。
 
 scheduler 的 U-mode 硬件页故障和当前任务的 uaccess 都可进入该入口。uaccess 只在 `kernel_mm_lookup()` 报未驻留后尝试解析；合法页成功提交后重查 PTE，VMA 外或权限不符仍按用户 fault 处理。
 

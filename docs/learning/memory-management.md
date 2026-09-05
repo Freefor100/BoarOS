@@ -235,7 +235,7 @@ BoarOS 为 VMA 显式记录 fault policy，而不是从 role 猜测行为。静�
 PTE 已存在且权限也允许，却仍收到页故障 ------------> 内核地址空间错误
 PTE 不存在 + RESIDENT_REQUIRED ---------------------> 用户访问故障
 PTE 不存在 + 匿名 DEMAND_ZERO
-  +-- 页分配、清零和映射成功 ----------------------> 单页 SFENCE.VMA，原指令重试
+  +-- 页分配、清零和映射成功 ----------------------> 单页 SFENCE.VMA；可执行页另 FENCE.I；原指令重试
   +-- 物理页耗尽 ----------------------------------> 任务因资源原因退出，wait status 9
   +-- 已分配页无法访问且回滚释放也失败 ------------> CLEANUP_REQUIRED，内核 fatal
   +-- 其他页表/分配器状态错误 ----------------------> 内核 fatal
@@ -248,7 +248,9 @@ present COW PTE + write fault
   +-- 物理引用数 > 1 ------------------------------> 复制一页、替换 PTE、释放旧引用
 ```
 
-页故障是同步异常，`sepc` 指向需要重试的原指令。补页成功后不能像 `ecall` 一样把 `sepc` 前移；更新 PTE 后还要执行针对该虚拟页的本地 `SFENCE.VMA`，再由 `sret` 重执行 load/store/fetch。当前所有用户地址空间使用 ASID 0，且只有单 hart，所以本地单页失效足够；SMP 下必须把远端正在运行同一 MM 的 hart 纳入 shootdown。
+同一个 MM fault 入口被硬件 U-mode 和内核 uaccess 共用，但两者的失败边界不同：硬件用户缺页时物理页耗尽属于任务资源耗尽，可生成资源退出；syscall 的 uaccess 在复制过程中遇到 `NO_MEMORY`、未映射或权限错误，则把这次复制报告为 `FAULT`，保留已复制前缀，由 syscall 按自身 ABI 转成 `-EFAULT` 或部分成功。页表损坏、已映射页无法解析等真正的内核状态错误仍不能伪装成用户指针错误。
+
+页故障是同步异常，`sepc` 指向需要重试的原指令。补页成功后不能像 `ecall` 一样把 `sepc` 前移；更新 PTE 后还要执行针对该虚拟页的本地 `SFENCE.VMA`，带执行权限的页还要用 `FENCE.I` 排序此前写入的指令字节，再由 `sret` 重执行 load/store/fetch。当前所有用户地址空间使用 ASID 0，且只有单 hart，所以本地失效足够；SMP 下必须把远端正在运行同一 MM 的 hart 纳入 shootdown，并让每个执行 hart 完成自己的指令同步。
 
 demand-zero 把未触碰的栈/heap 页物理内存和清零成本推迟到首次访问，file-private mapping 则把文件 I/O 推迟到首次触页。代价是首次触页需要 trap、VMA 二分查找、软件页表查询、可能的页分配/清零或文件 I/O、PTE 写入和 TLB 失效；驻留后的普通访问仍由硬件翻译，不增加软件热路径。缓存命中的文件读页无需复制，write-first miss 直接构造私有页，避免无用缓存页。当前解析器为确认“确实没有 PTE”先 lookup，再由映射函数走一次叶表路径，属于 cold fault path 的重复遍历；若开发板计数显示缺页延迟重要，可在不改变 VMA/MM 接口的前提下合并 walker，但不能据 QEMU 正确性结果宣称性能收益。
 
@@ -258,7 +260,7 @@ demand-zero 把未触碰的栈/heap 页物理内存和清零成本推迟到首�
 
 `mmap` 分配的是虚拟地址区间，不等于立刻分配每个物理页。anonymous-private mapping 没有文件 backing；首次读取应看到零，首次写入只影响本进程。普通地址参数只是 hint，内核可以在冲突时另选空洞；`MAP_FIXED_NOREPLACE` 要求精确地址且冲突失败，`MAP_FIXED` 则要求精确地址并破坏性替换旧映射。BoarOS 当前先尝试对齐 hint，再从栈 guard 以下 top-down 选择空洞，不做 ASLR。`MAP_STACK` 暂不改变 VMA 增长模型，`MAP_NORESERVE` 在没有 commit accounting 时与普通匿名映射等价。
 
-file-private mapping 把页对齐文件 offset 与虚拟区间对应，读页可以和 page cache 共享，写入必须通过 COW 与文件和其他映射隔离。包含 EOF 的尾页先保留有效文件字节并把页内余部补零，下一整个页才产生 `SIGBUS`。fd 是可关闭的进程槽，不能承担映射生命周期；MM 必须持有独立文件引用，直到最后一个相关 VMA 被 munmap、fixed replace 或 MM 销毁。
+file-private mapping 把页对齐文件 offset 与虚拟区间对应，读页可以和 page cache 共享，写入必须通过 COW 与文件和其他映射隔离。包含 EOF 的尾页先保留有效文件字节并把页内余部补零，下一整个页才产生 `SIGBUS`。fd 是可关闭的进程槽，不能承担映射生命周期；MM 对同一 OFD 只持有一个来源引用，直到最后一个相关 VMA 被 munmap、fixed replace 或 MM 销毁；重复映射不增加历史引用，fork 子 MM 取得自己的一份。
 
 `munmap` 的 Linux 语义允许区间包含洞：已经映射的部分被撤销，原本未映射的部分不构成错误。`mprotect` 不同，它要求整个非空区间都有 VMA，遇到洞返回 `ENOMEM`。两者都可能在起止边界拆分 VMA；若先改 PTE 后才发现 descriptor 扩容失败，会出现硬件状态已经提交而逻辑状态无法提交的问题。BoarOS 因此先校验并预留确实需要的 descriptor 容量，再修改页表/TLB，最后用不分配的 commit 完成拆分、删除、改权和相邻合并。
 

@@ -41,6 +41,8 @@ struct riscv_virtio_mmio_block {
     uint64_t timeout_ticks;
     uint16_t queue_size;
     uint16_t last_used_index;
+    uint32_t transport_version;
+    uint32_t queue_allocation_order;
     uint32_t state;
     struct riscv_virtio_mmio_block_statistics statistics;
 };

@@ -83,7 +83,7 @@ CLEANUP --move--> MOVED
 
 `move` 成功才转移全部所有权，包括待回收页。`destroy` 先重试待回收页，再按 active/protected/retired 叶子、Level 0、Level 1、根表的后序顺序释放正常树；当前 `satp` 指向该根时拒绝销毁。普通释放错误会保留仍存在的表项与精确计数，`CLEANUP` 回收失败则保留待回收页记录，二者都可重试。根物理地址可以为 0，因此是否存在正常树由 `table_pages` 判断，不能由 `root_address != 0` 推断。
 
-`riscv_sv39_user_space_satp()` 只为 LIVE 对象生成 `MODE=8, ASID=0, PPN=root`；`riscv_sv39_switch_satp()` 只接受 Bare 或 Sv39 ASID 0，并在根切换前后执行全局 `SFENCE.VMA`。scheduler 在修改 ready/current 状态之前完成切根。运行期 demand-zero、file-private 或 COW fault 成功更新当前 MM 的单页 PTE 后执行 `SFENCE.VMA fault_va, zero`，只失效本 hart 上该 VA 的 ASID 0 翻译；当前没有 ASID 分配或 SMP 远端 shootdown。
+`riscv_sv39_user_space_satp()` 只为 LIVE 对象生成 `MODE=8, ASID=0, PPN=root`；`riscv_sv39_switch_satp()` 只接受 Bare 或 Sv39 ASID 0，并在根切换前后执行全局 `SFENCE.VMA`。scheduler 在修改 ready/current 状态之前完成切根。运行期 demand-zero、file-private 或 COW fault 成功更新当前 MM 的单页 PTE 后执行 `SFENCE.VMA fault_va, zero`，只失效本 hart 上该 VA 的 ASID 0 翻译；新填充或复制到执行映射的页面还执行 `FENCE.I`。当前没有 ASID 分配或 SMP 远端 shootdown。
 
 `riscv_sv39_user_unmap_owned_range()` 只处理对齐的 4 KiB 用户范围。调用方先证明目标就是本 hart 当前活动 MM；walker 预检覆盖范围中已有的页表分支、表项形态、物理页可访问性和 active/protected/retired 计数，输入或状态错误在写 PTE 前返回。提交时把 active 和 protected owner 改写为 `V=0`、RSW bit 8 标记且保留 PPN 的 retired PTE，再执行一次本地全局 `SFENCE.VMA`。只有硬件不可能再使用旧翻译后才释放物理页并清零 PTE，从而避免把已归还页框继续暴露给用户。
 

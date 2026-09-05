@@ -77,6 +77,7 @@ enum kernel_open_file_status kernel_open_file_release(
         return KERNEL_OPEN_FILE_STATUS_INVALID_ARGUMENT;
     }
     file = *owner;
+    /* A detached last reference is kept at zero until cleanup drains it. */
     if (file->heap == 0 || file->references == UINT32_MAX) {
         return KERNEL_OPEN_FILE_STATUS_STATE;
     }

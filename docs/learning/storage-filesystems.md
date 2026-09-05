@@ -49,7 +49,7 @@ write-first 且缓存未命中，直接把文件内容读入私有页可避免�
 文件长度不是 VMA 长度。映射可以延伸到 EOF 之后：包含文件末字节的最后一个页，其页内剩余
 字节读取为零；但故障页的起点已经在 EOF 之外时应产生 `SIGBUS`。因此缓存需要同时返回尾页
 有效字节数，MM 需要在取页前按页起始 offset 分类。关闭 fd 也不能撤销映射，MM 必须独立持有
-文件引用；fork 后父子各自持有来源引用，直到各自最后一个相关 VMA 被撤销。
+文件引用；fork 后父子各自持有一份来源引用，直到各自最后一个相关 VMA 被撤销。同一 MM 对同一 OFD 的重复映射仍只保留一个来源 owner，临时 pin 在成功提交后立即释放。
 
 内存压力回收必须避免无界递归。BoarOS 的物理分配器只注册一个缓存回收器：第一次分配失败
 时请求 LRU 释放目标页数并重试一次，回调期间抑制再次进入回收器。当前只读文件系统没有脏页，
@@ -71,7 +71,7 @@ PID 1 是用户空间生命周期的根。Linux 通常在 init 退出时 panic�
 - 页缓存测试要区分 hit/miss、尾页有效长度、被映射页 pin、LRU 驱逐和分配失败触发的有界回收；file-private mmap 还要验证写后其他别名与文件内容不变、关闭 fd 后仍可 fault、fork 后来源有效，以及整页越过 EOF 的 `SIGBUS`。
 - Exec 文件测试要同时保留普通 fd 和 CLOEXEC fd：新映像应从普通 fd 的原 offset 继续读取，而 CLOEXEC fd 即使底层 close 需要重试也必须立即不可见；失败的 exec 则不能关闭任何 fd。
 - 根启动 fixture 应独立链接并写入磁盘，不能把 ELF 同时嵌入 kernel，否则无法证明 VFS 是生产数据来源。
-- QEMU 默认可能提供 legacy VirtIO MMIO；现代驱动测试与生产根盘必须显式设置 `virtio-mmio.force-legacy=false`。开发板 transport 和 DMA 一致性必须重新验证，不能从 QEMU 行为外推。
+- QEMU 默认可能提供 legacy VirtIO MMIO；驱动和生产根盘必须分别验证默认 legacy 与显式 `virtio-mmio.force-legacy=false` 的 modern 路径。legacy 的 `GuestPageSize/QueueAlign/QueuePFN` 与 modern 的 64 位队列地址不能混用；开发板 transport 和 DMA 一致性必须重新验证，不能从 QEMU 行为外推。
 
 ## 资料依据
 

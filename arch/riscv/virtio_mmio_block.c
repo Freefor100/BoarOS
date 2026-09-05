@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 #define VIRTIO_MMIO_MAGIC_VALUE UINT32_C(0x74726976)
+#define VIRTIO_MMIO_VERSION_LEGACY 1U
 #define VIRTIO_MMIO_VERSION_MODERN 2U
 #define VIRTIO_DEVICE_ID_BLOCK 2U
 
@@ -18,6 +19,9 @@
 #define VIRTIO_MMIO_QUEUE_SEL_OFFSET 0x030U
 #define VIRTIO_MMIO_QUEUE_NUM_MAX_OFFSET 0x034U
 #define VIRTIO_MMIO_QUEUE_NUM_OFFSET 0x038U
+#define VIRTIO_MMIO_GUEST_PAGE_SIZE_OFFSET 0x028U
+#define VIRTIO_MMIO_QUEUE_ALIGN_OFFSET 0x03cU
+#define VIRTIO_MMIO_QUEUE_PFN_OFFSET 0x040U
 #define VIRTIO_MMIO_QUEUE_READY_OFFSET 0x044U
 #define VIRTIO_MMIO_QUEUE_NOTIFY_OFFSET 0x050U
 #define VIRTIO_MMIO_INTERRUPT_STATUS_OFFSET 0x060U
@@ -59,6 +63,15 @@
 #define VIRTIO_REQUEST_HEADER_OFFSET 256U
 #define VIRTIO_REQUEST_STATUS_OFFSET 272U
 #define VIRTIO_BOUNCE_OFFSET 512U
+
+#define VIRTIO_LEGACY_QUEUE_USED_OFFSET BOAROS_PAGE_SIZE
+#define VIRTIO_LEGACY_REQUEST_HEADER_OFFSET (2U * BOAROS_PAGE_SIZE)
+#define VIRTIO_LEGACY_REQUEST_STATUS_OFFSET \
+    (VIRTIO_LEGACY_REQUEST_HEADER_OFFSET + 16U)
+#define VIRTIO_LEGACY_BOUNCE_OFFSET (VIRTIO_LEGACY_REQUEST_HEADER_OFFSET + \
+                                    BOAROS_PAGE_SIZE / 8U)
+#define VIRTIO_LEGACY_QUEUE_ALLOCATION_ORDER 2U
+#define VIRTIO_LEGACY_QUEUE_ALIGNMENT BOAROS_PAGE_SIZE
 
 #define RISCV_VIRTIO_BLOCK_STATE_EMPTY 0U
 #define RISCV_VIRTIO_BLOCK_STATE_LIVE UINT32_C(0x56424c4b)
@@ -102,6 +115,42 @@ _Static_assert(sizeof(struct virtq_descriptor) == 16U,
 _Static_assert(VIRTIO_BOUNCE_OFFSET + VIRTIO_BLOCK_SECTOR_SIZE <=
                    BOAROS_PAGE_SIZE,
                "VirtIO queue and bounce buffer must fit in one page");
+_Static_assert(VIRTIO_LEGACY_BOUNCE_OFFSET + VIRTIO_BLOCK_SECTOR_SIZE <=
+                   ((size_t)BOAROS_PAGE_SIZE
+                    << VIRTIO_LEGACY_QUEUE_ALLOCATION_ORDER),
+               "legacy VirtIO queue and bounce buffer must fit its allocation");
+
+static int legacy_transport(const struct riscv_virtio_mmio_block *device)
+{
+    return device->transport_version == VIRTIO_MMIO_VERSION_LEGACY;
+}
+
+static uint32_t queue_used_offset(
+    const struct riscv_virtio_mmio_block *device)
+{
+    return legacy_transport(device) ? VIRTIO_LEGACY_QUEUE_USED_OFFSET
+                                    : VIRTIO_QUEUE_USED_OFFSET;
+}
+
+static uint32_t request_header_offset(
+    const struct riscv_virtio_mmio_block *device)
+{
+    return legacy_transport(device) ? VIRTIO_LEGACY_REQUEST_HEADER_OFFSET
+                                    : VIRTIO_REQUEST_HEADER_OFFSET;
+}
+
+static uint32_t request_status_offset(
+    const struct riscv_virtio_mmio_block *device)
+{
+    return legacy_transport(device) ? VIRTIO_LEGACY_REQUEST_STATUS_OFFSET
+                                    : VIRTIO_REQUEST_STATUS_OFFSET;
+}
+
+static uint32_t bounce_offset(const struct riscv_virtio_mmio_block *device)
+{
+    return legacy_transport(device) ? VIRTIO_LEGACY_BOUNCE_OFFSET
+                                    : VIRTIO_BOUNCE_OFFSET;
+}
 
 static int device_live(const struct riscv_virtio_mmio_block *device)
 {
@@ -197,7 +246,7 @@ static enum riscv_virtio_mmio_block_status init_failure(
         enum physical_page_status page_status =
             physical_page_release_order(device->page_allocator,
                                         device->queue_physical_address,
-                                        0U);
+                                        device->queue_allocation_order);
 
         if (page_status != PHYSICAL_PAGE_STATUS_OK) {
             device->state = RISCV_VIRTIO_BLOCK_STATE_FAILED;
@@ -221,6 +270,13 @@ static enum riscv_virtio_mmio_block_status negotiate_features(
                  VIRTIO_MMIO_STATUS_OFFSET,
                  VIRTIO_STATUS_ACKNOWLEDGE);
     mmio_write32(device, VIRTIO_MMIO_STATUS_OFFSET, status);
+
+    if (legacy_transport(device)) {
+        mmio_write32(device, VIRTIO_MMIO_DEVICE_FEATURES_SEL_OFFSET, 0U);
+        mmio_write32(device, VIRTIO_MMIO_DRIVER_FEATURES_SEL_OFFSET, 0U);
+        mmio_write32(device, VIRTIO_MMIO_DRIVER_FEATURES_OFFSET, 0U);
+        return RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK;
+    }
 
     mmio_write32(device, VIRTIO_MMIO_DEVICE_FEATURES_SEL_OFFSET, 1U);
     device_features_high =
@@ -249,6 +305,14 @@ static enum riscv_virtio_mmio_block_status negotiate_features(
 static uint64_t read_capacity(struct riscv_virtio_mmio_block *device)
 {
     uint32_t attempt;
+
+    if (legacy_transport(device)) {
+        uint32_t low = mmio_read32(device, VIRTIO_MMIO_CONFIG_OFFSET);
+        uint32_t high = mmio_read32(device,
+                                    VIRTIO_MMIO_CONFIG_OFFSET + 4U);
+
+        return ((uint64_t)high << 32U) | low;
+    }
 
     for (attempt = 0U; attempt < 8U; attempt++) {
         uint32_t generation_before =
@@ -293,14 +357,14 @@ static enum kernel_block_status submit_read(
     volatile struct virtq_used *used =
         (volatile struct virtq_used *)(
             (unsigned char *)device->queue_memory +
-            VIRTIO_QUEUE_USED_OFFSET);
+            queue_used_offset(device));
     struct virtio_block_request_header *header =
         (struct virtio_block_request_header *)(
             (unsigned char *)device->queue_memory +
-            VIRTIO_REQUEST_HEADER_OFFSET);
+            request_header_offset(device));
     volatile unsigned char *request_status =
         (volatile unsigned char *)device->queue_memory +
-        VIRTIO_REQUEST_STATUS_OFFSET;
+        request_status_offset(device);
     uint16_t available_index;
     uint64_t start;
     struct virtq_used_element element;
@@ -316,7 +380,7 @@ static enum kernel_block_status submit_read(
     *request_status = UINT8_MAX;
 
     descriptors[0].address = device->queue_physical_address +
-                             VIRTIO_REQUEST_HEADER_OFFSET;
+                             request_header_offset(device);
     descriptors[0].length = sizeof(*header);
     descriptors[0].flags = VIRTQ_DESC_NEXT;
     descriptors[0].next = 1U;
@@ -325,7 +389,7 @@ static enum kernel_block_status submit_read(
     descriptors[1].flags = VIRTQ_DESC_WRITE | VIRTQ_DESC_NEXT;
     descriptors[1].next = 2U;
     descriptors[2].address = device->queue_physical_address +
-                             VIRTIO_REQUEST_STATUS_OFFSET;
+                             request_status_offset(device);
     descriptors[2].length = 1U;
     descriptors[2].flags = VIRTQ_DESC_WRITE;
     descriptors[2].next = 0U;
@@ -433,7 +497,7 @@ static enum kernel_block_status virtio_block_read(void *context,
         }
         {
             unsigned char *bounce =
-                (unsigned char *)device->queue_memory + VIRTIO_BOUNCE_OFFSET;
+                (unsigned char *)device->queue_memory + bounce_offset(device);
             size_t copied = VIRTIO_BLOCK_SECTOR_SIZE - sector_offset;
             enum kernel_block_status status;
 
@@ -443,7 +507,7 @@ static enum kernel_block_status virtio_block_read(void *context,
             status = submit_read(device,
                                  sector,
                                  device->queue_physical_address +
-                                     VIRTIO_BOUNCE_OFFSET,
+                                     bounce_offset(device),
                                  VIRTIO_BLOCK_SECTOR_SIZE,
                                  1);
             if (status != KERNEL_BLOCK_STATUS_OK) {
@@ -472,6 +536,7 @@ enum riscv_virtio_mmio_block_status riscv_virtio_mmio_block_init(
     enum physical_page_status page_status;
     uint64_t capacity_sectors;
     uint32_t queue_max;
+    uint32_t version;
     void *queue_memory;
 
     if (device == 0 || device->state != RISCV_VIRTIO_BLOCK_STATE_EMPTY ||
@@ -495,10 +560,15 @@ enum riscv_virtio_mmio_block_status riscv_virtio_mmio_block_init(
         VIRTIO_DEVICE_ID_BLOCK) {
         return RISCV_VIRTIO_MMIO_BLOCK_STATUS_NOT_BLOCK;
     }
-    if (mmio_read32(&result, VIRTIO_MMIO_VERSION_OFFSET) !=
-        VIRTIO_MMIO_VERSION_MODERN) {
+    version = mmio_read32(&result, VIRTIO_MMIO_VERSION_OFFSET);
+    if (version != VIRTIO_MMIO_VERSION_LEGACY &&
+        version != VIRTIO_MMIO_VERSION_MODERN) {
         return RISCV_VIRTIO_MMIO_BLOCK_STATUS_UNSUPPORTED;
     }
+    result.transport_version = version;
+    result.queue_allocation_order =
+        legacy_transport(&result) ? VIRTIO_LEGACY_QUEUE_ALLOCATION_ORDER
+                                  : 0U;
 
     status = negotiate_features(&result);
     if (status != RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK) {
@@ -507,19 +577,19 @@ enum riscv_virtio_mmio_block_status riscv_virtio_mmio_block_init(
 
     mmio_write32(&result, VIRTIO_MMIO_QUEUE_SEL_OFFSET, 0U);
     queue_max = mmio_read32(&result, VIRTIO_MMIO_QUEUE_NUM_MAX_OFFSET);
-    if (queue_max < 4U ||
-        mmio_read32(&result, VIRTIO_MMIO_QUEUE_READY_OFFSET) != 0U) {
+    if (queue_max < VIRTIO_QUEUE_SIZE ||
+        (!legacy_transport(&result) &&
+         mmio_read32(&result, VIRTIO_MMIO_QUEUE_READY_OFFSET) != 0U)) {
         return init_failure(&result,
                             device,
                             RISCV_VIRTIO_MMIO_BLOCK_STATUS_UNSUPPORTED,
                             1,
                             0);
     }
-    result.queue_size = queue_max >= VIRTIO_QUEUE_SIZE ?
-                            VIRTIO_QUEUE_SIZE : 4U;
+    result.queue_size = VIRTIO_QUEUE_SIZE;
 
     page_status = physical_page_allocate_order(page_allocator,
-                                                0U,
+                                                result.queue_allocation_order,
                                                 &result.queue_physical_address);
     if (page_status != PHYSICAL_PAGE_STATUS_OK) {
         return init_failure(&result,
@@ -541,28 +611,51 @@ enum riscv_virtio_mmio_block_status riscv_virtio_mmio_block_init(
                             1);
     }
     result.queue_memory = queue_memory;
-    bytes_zero(queue_memory, BOAROS_PAGE_SIZE);
+    bytes_zero(queue_memory,
+               (size_t)BOAROS_PAGE_SIZE << result.queue_allocation_order);
 
     mmio_write32(&result,
                  VIRTIO_MMIO_QUEUE_NUM_OFFSET,
                  result.queue_size);
-    write_queue_address(&result,
-                        VIRTIO_MMIO_QUEUE_DESC_LOW_OFFSET,
-                        VIRTIO_MMIO_QUEUE_DESC_HIGH_OFFSET,
-                        result.queue_physical_address +
-                            VIRTIO_QUEUE_DESC_OFFSET);
-    write_queue_address(&result,
-                        VIRTIO_MMIO_QUEUE_DRIVER_LOW_OFFSET,
-                        VIRTIO_MMIO_QUEUE_DRIVER_HIGH_OFFSET,
-                        result.queue_physical_address +
-                            VIRTIO_QUEUE_AVAIL_OFFSET);
-    write_queue_address(&result,
-                        VIRTIO_MMIO_QUEUE_DEVICE_LOW_OFFSET,
-                        VIRTIO_MMIO_QUEUE_DEVICE_HIGH_OFFSET,
-                        result.queue_physical_address +
-                            VIRTIO_QUEUE_USED_OFFSET);
-    memory_barrier();
-    mmio_write32(&result, VIRTIO_MMIO_QUEUE_READY_OFFSET, 1U);
+    if (legacy_transport(&result)) {
+        if (result.queue_physical_address >> BOAROS_PAGE_SHIFT >
+            UINT32_MAX) {
+            return init_failure(&result,
+                                device,
+                                RISCV_VIRTIO_MMIO_BLOCK_STATUS_UNSUPPORTED,
+                                1,
+                                1);
+        }
+        mmio_write32(&result,
+                     VIRTIO_MMIO_GUEST_PAGE_SIZE_OFFSET,
+                     BOAROS_PAGE_SIZE);
+        mmio_write32(&result,
+                     VIRTIO_MMIO_QUEUE_ALIGN_OFFSET,
+                     VIRTIO_LEGACY_QUEUE_ALIGNMENT);
+        memory_barrier();
+        mmio_write32(&result,
+                     VIRTIO_MMIO_QUEUE_PFN_OFFSET,
+                     (uint32_t)(result.queue_physical_address >>
+                                BOAROS_PAGE_SHIFT));
+    } else {
+        write_queue_address(&result,
+                            VIRTIO_MMIO_QUEUE_DESC_LOW_OFFSET,
+                            VIRTIO_MMIO_QUEUE_DESC_HIGH_OFFSET,
+                            result.queue_physical_address +
+                                VIRTIO_QUEUE_DESC_OFFSET);
+        write_queue_address(&result,
+                            VIRTIO_MMIO_QUEUE_DRIVER_LOW_OFFSET,
+                            VIRTIO_MMIO_QUEUE_DRIVER_HIGH_OFFSET,
+                            result.queue_physical_address +
+                                VIRTIO_QUEUE_AVAIL_OFFSET);
+        write_queue_address(&result,
+                            VIRTIO_MMIO_QUEUE_DEVICE_LOW_OFFSET,
+                            VIRTIO_MMIO_QUEUE_DEVICE_HIGH_OFFSET,
+                            result.queue_physical_address +
+                                queue_used_offset(&result));
+        memory_barrier();
+        mmio_write32(&result, VIRTIO_MMIO_QUEUE_READY_OFFSET, 1U);
+    }
 
     capacity_sectors = read_capacity(&result);
     if (capacity_sectors == 0U ||
@@ -578,7 +671,8 @@ enum riscv_virtio_mmio_block_status riscv_virtio_mmio_block_init(
                  VIRTIO_MMIO_STATUS_OFFSET,
                  VIRTIO_STATUS_ACKNOWLEDGE |
                      VIRTIO_STATUS_DRIVER |
-                     VIRTIO_STATUS_FEATURES_OK |
+                     (legacy_transport(&result) ? 0U
+                                                 : VIRTIO_STATUS_FEATURES_OK) |
                      VIRTIO_STATUS_DRIVER_OK);
     memory_barrier();
 
@@ -607,7 +701,7 @@ enum riscv_virtio_mmio_block_status riscv_virtio_mmio_block_destroy(
     device_reset(device);
     page_status = physical_page_release_order(device->page_allocator,
                                               device->queue_physical_address,
-                                              0U);
+                                              device->queue_allocation_order);
     if (page_status != PHYSICAL_PAGE_STATUS_OK) {
         return RISCV_VIRTIO_MMIO_BLOCK_STATUS_STATE;
     }

@@ -6,14 +6,14 @@
 
 人负责目标、技术路线和取舍，并通过阅读关键代码和亲自调试掌握实现。Agent 负责调查事实、解释机制、提供候选方案，以及在已确认范围内实现、测试和整理必要文档。
 
-涉及架构、接口、不变量、算法、依赖、范围、性能或兼容性的设计按以下方式推进：
+涉及架构、ABI、所有权、依赖、范围或结构性性能取舍的设计按以下方式推进：
 
 1. Agent 检查源码、资料和测试，说明已知事实与未知项。
-2. Agent 给出 2–3 个真实候选，比较复杂度、正确性、性能、可调试性和演进代价，并给出推荐理由。
+2. Agent 给出 2–3 个真实候选，比较复杂度、正确性、性能、可调试性和演进代价，并给出推荐理由；若约束只允许一个方案，说明排除其他路线的原因。
 3. 人确认路线与边界。
 4. Agent 小步实现并验证；若出现新的实质取舍，回到讨论。
 
-明确、可逆且没有新取舍的小修不必等待额外确认。普通编译和测试错误由 Agent 在既定范围内继续定位。跨 Session 只有在设计上下文确实无法由代码、模块说明和提交保存时，才在征得人同意后增加临时设计记录。
+明确、可逆且没有新取舍的小修不必等待额外确认。普通实现、编译和测试错误由 Agent 在既定范围内继续定位，不为同一路线反复制造候选。跨 Session 只有在设计上下文确实无法由代码、模块说明和提交保存时，才在征得人同意后增加临时设计记录。
 
 push、发布、比赛提交、许可证和阶段转换由人决定，除非人已对当前操作明确授权。
 
@@ -26,6 +26,19 @@ push、发布、比赛提交、许可证和阶段转换由人决定，除非人�
 - 用户输入、指针、长度、权限和资源状态均视为不可信。
 - 错误码、对象所有权、清理顺序、锁和内存序属于接口语义。
 - 从设计开始考虑多核，但单核行为尚不可验证时不预建复杂 SMP 框架。
+
+## 错误模型与阶段闭环
+
+每个能力组都要从真实入口走到可观察结果，并同时写清支持范围、正常结果、用户输入错误、资源耗尽、设备故障、内核不变量损坏、所有权和回收顺序。阶段不是按代码量或提交数切分；只增加未被生产路径消费的 API、测试 fixture、空壳结构或“成功存根”不构成阶段能力。
+
+错误处理遵循以下边界：
+
+- 用户范围、权限、格式和 syscall 参数错误转换为该 Linux ABI 规定的负 errno 或用户 fault，不改变已经提交的前缀语义。
+- 可恢复的物理页/堆耗尽、设备超时和底层 I/O 错误由所属对象返回明确资源或设备状态；只有确实仍拥有资源且之后可重试的清理失败才进入持久 `CLEANUP` owner。
+- uaccess 看到 MM 的 `NO_MEMORY`、未映射、地址空间或总线故障时，只能把本次复制视为 `FAULT`，保留已复制前缀；`read` 只提交前缀 offset，`uname` 返回 `-EFAULT`。这不等于把所有内核分配失败都伪装成 `EFAULT`。
+- 页表、对象 magic、引用计数或状态机损坏属于内核错误，不以“未来重构”或测例未覆盖为理由吞掉；故障注入只验证已有契约，不反向增加没有生产依据的复杂状态。
+
+测试先验证能证伪当前改动的最窄边界，再在能力组收口时运行真实 U-mode/未特改程序、官方配置和完整架构回归。模块通过、真实入口通过与 Harness 通过分别记录；预期缺少能力的测例记录阻塞原因，不报告为回归。
 
 ## 根文件系统与可执行文件来源
 
@@ -56,7 +69,7 @@ DTB 设备发现
 
 RISC-V QEMU `virt` 通过 DTB 的 `compatible = "virtio,mmio"` 节点发现和映射 VirtIO MMIO transport，virtio-blk 在其上实现块设备；不得依赖固定的第几个窗口或设备永远位于某个地址。比赛 Harness 当前也以 `virtio-blk-device` 接到 `virtio-mmio-bus`，见[本地 Harness](../references/oscomp-autotest/kernel/run_qemu.py)。设备 ID、状态机、feature negotiation、split virtqueue、内存屏障和扇区容量遵循 [VirtIO 1.3](https://docs.oasis-open.org/virtio/virtio/v1.3/virtio-v1.3.html)。
 
-LoongArch QEMU 后续提供 virtio-pci transport，复用 virtqueue、virtio-blk、`block_device`、VFS 与 ext4 上层。VisionFive 2 与 2K1000LA 的真实开发板由各自 DTB 和手册决定 SD、eMMC、PCI 或其他存储后端；开发板适配只替换设备发现、transport、DMA/cache coherency 和中断等平台边界，不复制 VFS、ext4 或 ELF 逻辑。通用与架构代码只在第二个真实实现点出现后沿已经验证的接口抽取。
+RISC-V QEMU `virt` 的驱动同时支持 VirtIO MMIO version 1 legacy 与 version 2 modern，共用块请求和 `block_device` 上层；legacy 使用 `GuestPageSize/QueueAlign/QueuePFN` 和连续对齐的队列内存，modern 使用 64 位 descriptor/available/used 地址。LoongArch QEMU 后续提供 virtio-pci transport，复用 virtqueue、virtio-blk、`block_device`、VFS 与 ext4 上层。VisionFive 2 与 2K1000LA 的真实开发板由各自 DTB 和手册决定 SD、eMMC、PCI 或其他存储后端；开发板适配只替换设备发现、transport、DMA/cache coherency 和中断等平台边界，不复制 VFS、ext4 或 ELF 逻辑。通用与架构代码只在第二个真实实现点出现后沿已经验证的接口抽取。
 
 ### VFS、lwext4 与 ELF 边界
 
@@ -68,7 +81,7 @@ ELF 装载器从“完整内存 buffer”推广为带总长度的随机访问源
 
 首个 VirtIO 实现使用一个 split virtqueue 并轮询完成，因为当前尚无外部中断控制器、等待队列和阻塞唤醒路径。轮询只存在于设备后端，具有有界超时以及明确的 descriptor、request 和设备状态清理；外部中断与可阻塞调度建立后，替换为 IRQ 加 sleep/wake，`block_device` 以上接口保持不变。
 
-首次根挂载和 `/init` 装载发生在单 hart、单线程启动阶段。VFS 暂不对并发 syscall 暴露；以后开放并发访问前，文件与缓存对象必须具备可睡眠锁和完整引用生命周期，不能把“关中断并持有 spinlock 等待磁盘”变成长期设计。
+首次根挂载和 `/init` 装载发生在单 hart、单线程启动阶段。VFS 暂不对并发 syscall 暴露；以后开放并发访问前，文件与缓存对象必须具备可睡眠锁和完整引用生命周期，不能把“关中断并持有 spinlock 等待磁盘”变成长期设计。当前映射每个 MM 对同一 OFD 只保留一个 file-source 引用，重复 mmap 只转移一次来源所有权；fork 的子 MM 取得独立引用，最后一个对应 VMA 消失后在冷路径释放。
 
 正确性验证覆盖设备缺失或 feature 不支持、容量和范围错误、I/O 超时与设备失败、错误 superblock 或 metadata checksum、需要 recovery 的文件系统、缺失 `/init`、截断或畸形 ELF，以及各层分配失败。每条失败路径都必须保持所有权可判定、资源可释放；清理本身失败时保留可重试状态。性能基线至少记录 I/O 请求与扇区数、动态分配峰值和次数、数据复制量以及启动和 ELF 装载耗时；缓存数量、请求合并、并行队列或 per-CPU 分配优化只在可重复工作负载和目标平台数据支持时引入。
 

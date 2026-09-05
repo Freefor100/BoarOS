@@ -37,10 +37,13 @@ BoarOS 是人主导、Agent 有界执行的长期项目。提交应小、直接�
 
 提交标题概括结果。除拼写、格式等从标题和 diff 即可完整理解的小修外，提交必须在空行后写说明性 body，简要交代改动动机、关键行为或约束，以及与风险相称的验证和仍存限制；`Co-authored-by` 等 trailer 不算正文。
 
-AI 对设计或代码有实质贡献时添加：
+AI 对设计或代码有实质贡献时根据当时的Agent添加例如：
 
 ```text
 Co-authored-by: GPT-5.6 Sol <codex@openai.com>
+Co-authored-by: GPT-5.6 Luna <codex@openai.com>
+Co-authored-by: GLM 5.3 <noreply@z.ai>
+Co-authored-by: DeepSeek V4 Flash <noreply@deepseek.com>
 ```
 
 仓库不保存本地 JSONL、完整对话或秘密。push、发布和比赛提交由人决定，除非已明确授权。

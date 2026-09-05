@@ -52,6 +52,7 @@ USER_ELF_PROGRAM_RV := $(BUILD_DIR)/tests/user/elf-probe-rv
 USER_ELF_FAULT_PROGRAM_RV := $(BUILD_DIR)/tests/user/elf-text-fault-rv
 USER_ELF_GUARD_PROGRAM_RV := $(BUILD_DIR)/tests/user/elf-guard-fault-rv
 ROOT_INIT_PROGRAM_RV := $(BUILD_DIR)/tests/user/root-init-rv
+UACCESS_OOM_PROGRAM_RV := $(BUILD_DIR)/tests/user/uaccess-oom-rv
 ROOT_EXEC_STAGE2_RV := $(BUILD_DIR)/tests/user/root-exec-stage2-rv
 ROOT_EXEC_STAGE3_RV := $(BUILD_DIR)/tests/user/root-exec-stage3-rv
 ROOT_EXEC_STAGE3_OOM_RV := \
@@ -352,6 +353,8 @@ USER_ELF_GUARD_PROGRAM_OBJECT_RV := \
 	$(BUILD_DIR)/tests/user/user_elf_guard_program.o
 ROOT_INIT_PROGRAM_OBJECT_RV := \
 	$(BUILD_DIR)/tests/user/root_init.o
+UACCESS_OOM_PROGRAM_OBJECT_RV := \
+	$(BUILD_DIR)/tests/user/uaccess_oom.o
 ROOT_EXEC_STAGE2_OBJECT_RV := \
 	$(BUILD_DIR)/tests/user/root_exec_stage2.o
 ROOT_EXEC_STAGE3_OBJECT_RV := \
@@ -406,6 +409,7 @@ DEPS := \
 	$(USER_ELF_FAULT_PROGRAM_OBJECT_RV:.o=.d) \
 	$(USER_ELF_GUARD_PROGRAM_OBJECT_RV:.o=.d) \
 	$(ROOT_INIT_PROGRAM_OBJECT_RV:.o=.d) \
+	$(UACCESS_OOM_PROGRAM_OBJECT_RV:.o=.d) \
 	$(ROOT_EXEC_STAGE2_OBJECT_RV:.o=.d) \
 	$(ROOT_EXEC_STAGE3_OBJECT_RV:.o=.d) \
 	$(ROOT_EXEC_STAGE3_OOM_OBJECT_RV:.o=.d) \
@@ -420,6 +424,7 @@ DEPS := \
 	test-elf64-riscv test-user-elf-cases-riscv test-user-elf-riscv \
 	test-root-init-riscv test-demand-page-riscv test-exec-riscv \
 	test-root-boot-cleanup-riscv \
+	test-uaccess-oom-riscv test-icache-riscv \
 	test-files-riscv \
 	test-high-half-trap-riscv test-idle-riscv test-no-identity-riscv \
 	test-lwext4-host \
@@ -540,6 +545,7 @@ $(UACCESS_TEST_KERNEL_RV): $(UACCESS_TEST_OBJECTS) \
 
 $(FILES_TEST_KERNEL_RV): $(FILES_TEST_OBJECTS) arch/riscv/linker.ld
 	$(CC) $(LDFLAGS) -Wl,--wrap=kernel_heap_release \
+		-Wl,--wrap=kernel_open_file_release \
 		-Wl,--wrap=riscv_sv39_current_satp \
 		-Wl,-Map,$(BUILD_DIR)/tests/kernel-files-rv.map \
 		-o $@ $(FILES_TEST_OBJECTS)
@@ -640,6 +646,16 @@ $(ROOT_INIT_PROGRAM_RV): $(ROOT_INIT_PROGRAM_OBJECT_RV) \
 	$(CC) $(ARCH_FLAGS) -nostdlib -nostartfiles -static -no-pie \
 		-T tests/riscv/user_elf.ld -Wl,--build-id=none \
 		-Wl,--gc-sections -o $@ $(ROOT_INIT_PROGRAM_OBJECT_RV)
+
+$(UACCESS_OOM_PROGRAM_OBJECT_RV): tests/riscv/uaccess_oom.S
+	@mkdir -p $(dir $@)
+	$(CC) $(CPPFLAGS) $(ASFLAGS) -MMD -MP -c $< -o $@
+
+$(UACCESS_OOM_PROGRAM_RV): $(UACCESS_OOM_PROGRAM_OBJECT_RV) \
+		tests/riscv/user_elf.ld
+	$(CC) $(ARCH_FLAGS) -nostdlib -nostartfiles -static -no-pie \
+		-T tests/riscv/user_elf.ld -Wl,--build-id=none \
+		-Wl,--gc-sections -o $@ $(UACCESS_OOM_PROGRAM_OBJECT_RV)
 
 $(ROOT_EXEC_STAGE2_OBJECT_RV): tests/riscv/root_exec_stage.S
 	@mkdir -p $(dir $@)
@@ -773,6 +789,7 @@ test-riscv: $(DTB_TEST_KERNEL_RV) $(PAGE_TEST_KERNEL_RV) \
 	$(HIGH_HALF_TRAP_TEST_KERNEL_RV) $(NO_IDENTITY_TEST_KERNEL_RV) \
 	$(TIMER_CASES_TEST_KERNEL_RV) $(TIMER_BOOT_TEST_KERNEL_RV) \
 	$(ROOT_INIT_PROGRAM_RV) \
+	$(UACCESS_OOM_PROGRAM_RV) \
 	$(ROOT_EXEC_STAGE2_RV) $(ROOT_EXEC_STAGE3_RV) \
 	$(ROOT_EXEC_STAGE3_OOM_RV) $(DEMAND_PAGE_OOM_TEST_KERNEL_RV) \
 	$(EXEC_CLEANUP_TEST_KERNEL_RV) \
@@ -862,6 +879,21 @@ test-riscv: $(DTB_TEST_KERNEL_RV) $(PAGE_TEST_KERNEL_RV) \
 		ROOT_EXEC_STAGE2_RV=$(ROOT_EXEC_STAGE2_RV) \
 		ROOT_EXEC_STAGE3_RV=$(ROOT_EXEC_STAGE3_RV) \
 		./tests/root-init-riscv.sh
+	QEMU_RISCV64=$(QEMU_RISCV64) QEMU_MEMORY=$(QEMU_MEMORY) \
+		VIRTIO_MMIO_FORCE_LEGACY=false \
+		KERNEL_RV=$(KERNEL_RV) \
+		ROOT_INIT_PROGRAM_RV=$(ROOT_INIT_PROGRAM_RV) \
+		ROOT_EXEC_STAGE2_RV=$(ROOT_EXEC_STAGE2_RV) \
+		ROOT_EXEC_STAGE3_RV=$(ROOT_EXEC_STAGE3_RV) \
+		./tests/root-init-riscv.sh
+	QEMU_RISCV64=$(QEMU_RISCV64) QEMU_MEMORY=64M \
+		VIRTIO_MMIO_FORCE_LEGACY=false \
+		KERNEL_RV=$(KERNEL_RV) \
+		ROOT_INIT_PROGRAM_RV=$(UACCESS_OOM_PROGRAM_RV) \
+		ROOT_EXEC_STAGE2_RV=$(ROOT_EXEC_STAGE2_RV) \
+		ROOT_EXEC_STAGE3_RV=$(ROOT_EXEC_STAGE3_RV) \
+		./tests/uaccess-oom-riscv.sh
+	OBJDUMP_RV=$(OBJDUMP) ./tests/icache-riscv.sh
 	QEMU_RISCV64=$(QEMU_RISCV64) QEMU_MEMORY=$(QEMU_MEMORY) \
 		KERNEL_RV=$(DEMAND_PAGE_OOM_TEST_KERNEL_RV) \
 		ROOT_INIT_PROGRAM_RV=$(ROOT_INIT_PROGRAM_RV) \
@@ -963,6 +995,26 @@ test-root-init-riscv: $(KERNEL_RV) $(ROOT_INIT_PROGRAM_RV) \
 		ROOT_EXEC_STAGE2_RV=$(ROOT_EXEC_STAGE2_RV) \
 		ROOT_EXEC_STAGE3_RV=$(ROOT_EXEC_STAGE3_RV) \
 		./tests/root-init-riscv.sh
+	QEMU_RISCV64=$(QEMU_RISCV64) QEMU_MEMORY=$(QEMU_MEMORY) \
+		VIRTIO_MMIO_FORCE_LEGACY=false \
+		KERNEL_RV=$(KERNEL_RV) \
+		ROOT_INIT_PROGRAM_RV=$(ROOT_INIT_PROGRAM_RV) \
+		ROOT_EXEC_STAGE2_RV=$(ROOT_EXEC_STAGE2_RV) \
+		ROOT_EXEC_STAGE3_RV=$(ROOT_EXEC_STAGE3_RV) \
+		./tests/root-init-riscv.sh
+
+test-uaccess-oom-riscv: $(KERNEL_RV) $(UACCESS_OOM_PROGRAM_RV) \
+		$(ROOT_EXEC_STAGE2_RV) $(ROOT_EXEC_STAGE3_RV)
+	QEMU_RISCV64=$(QEMU_RISCV64) QEMU_MEMORY=64M \
+		VIRTIO_MMIO_FORCE_LEGACY=false \
+		KERNEL_RV=$(KERNEL_RV) \
+		ROOT_INIT_PROGRAM_RV=$(UACCESS_OOM_PROGRAM_RV) \
+		ROOT_EXEC_STAGE2_RV=$(ROOT_EXEC_STAGE2_RV) \
+		ROOT_EXEC_STAGE3_RV=$(ROOT_EXEC_STAGE3_RV) \
+		./tests/uaccess-oom-riscv.sh
+
+test-icache-riscv: $(KERNEL_RV)
+	OBJDUMP_RV=$(OBJDUMP) ./tests/icache-riscv.sh
 
 test-demand-page-riscv: $(KERNEL_RV) \
 		$(DEMAND_PAGE_OOM_TEST_KERNEL_RV) $(ROOT_INIT_PROGRAM_RV) \

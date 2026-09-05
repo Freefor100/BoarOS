@@ -35,6 +35,8 @@
 static unsigned char page_pool[BOAROS_PAGE_SIZE * TEST_POOL_PAGES]
     __attribute__((aligned(BOAROS_PAGE_SIZE)));
 static int fail_next_heap_release;
+static int count_open_file_releases;
+static uint32_t counted_open_file_releases;
 static char fork_resolved_path[KERNEL_FS_PATH_MAX];
 static int use_test_satp;
 static uint64_t test_satp;
@@ -42,6 +44,8 @@ static uint64_t test_satp;
 enum kernel_heap_status __real_kernel_heap_release(
     struct kernel_heap *heap,
     void *pointer);
+enum kernel_open_file_status __real_kernel_open_file_release(
+    struct kernel_open_file_description **owner);
 uint64_t __real_riscv_sv39_current_satp(void);
 
 uint64_t __wrap_riscv_sv39_current_satp(void)
@@ -59,6 +63,15 @@ enum kernel_heap_status __wrap_kernel_heap_release(
         return KERNEL_HEAP_STATUS_STATE;
     }
     return __real_kernel_heap_release(heap, pointer);
+}
+
+enum kernel_open_file_status __wrap_kernel_open_file_release(
+    struct kernel_open_file_description **owner)
+{
+    if (count_open_file_releases != 0) {
+        counted_open_file_releases++;
+    }
+    return __real_kernel_open_file_release(owner);
 }
 
 static void *identity_access(uint64_t physical_address)
@@ -599,8 +612,6 @@ static void run_mmap_operations(struct kernel_files *files,
     expect_open(files, fs, mm, TEST_AT_FDCWD, "/data", 0U, 0, 60U);
     if (kernel_files_pin(files, 0, &first_pin, &result) !=
             KERNEL_FILES_STATUS_OK || result != 0 || first_pin == 0 ||
-        kernel_files_pin(files, 0, &second_pin, &result) !=
-            KERNEL_FILES_STATUS_OK || result != 0 || second_pin == 0 ||
         kernel_mm_mmap_file_private(
             mm,
             &first_pin,
@@ -610,7 +621,14 @@ static void run_mmap_operations(struct kernel_files *files,
             KERNEL_MM_READ | KERNEL_MM_WRITE,
             KERNEL_MM_MAP_FIXED_NOREPLACE,
             &first_address) != KERNEL_MM_STATUS_OK ||
-        first_pin != 0 || first_address != TEST_MMAP_FIRST ||
+        first_pin != 0 || first_address != TEST_MMAP_FIRST) {
+        fail_files(61U, KERNEL_MM_STATUS_OK, result);
+    }
+
+    counted_open_file_releases = 0U;
+    count_open_file_releases = 1;
+    if (kernel_files_pin(files, 0, &second_pin, &result) !=
+            KERNEL_FILES_STATUS_OK || result != 0 || second_pin == 0 ||
         kernel_mm_mmap_file_private(
             mm,
             &second_pin,
@@ -620,10 +638,15 @@ static void run_mmap_operations(struct kernel_files *files,
             KERNEL_MM_READ | KERNEL_MM_WRITE,
             KERNEL_MM_MAP_FIXED_NOREPLACE,
             &second_address) != KERNEL_MM_STATUS_OK ||
-        second_pin != 0 || second_address != TEST_MMAP_SECOND ||
+        second_pin != 0 || second_address != TEST_MMAP_SECOND) {
+        count_open_file_releases = 0;
+        fail_files(61U, KERNEL_MM_STATUS_OK, result);
+    }
+    count_open_file_releases = 0;
+    if (counted_open_file_releases != 1U ||
         kernel_files_close(files, 0, &result) !=
             KERNEL_FILES_STATUS_OK || result != 0) {
-        fail_files(61U, KERNEL_MM_STATUS_OK, result);
+        fail_files(68U, 1, counted_open_file_releases);
     }
 
     /* A write-first miss reads directly into a private page. */
