@@ -29,8 +29,11 @@ enum kernel_syscall_status kernel_syscall_dispatch(
 
 - `openat` 编号为 56，通过调用任务的 fs context 解析用户路径并在文件表分配最低可用 fd；当前只支持根 mount 上的只读普通文件。准确 flags、路径和 errno 边界见[进程文件资源模块](kernel-files.md)。
 - `close` 编号为 57，从调用任务的文件表移除 fd；无效或已关闭 fd 返回 `-EBADF`。
+- `dup` 编号 23、`dup2` 编号 33、`dup3` 编号 24 与 `fcntl` 编号 25 复制或检查描述符；flag 边界、目标替换与 `F_DUPFD*` 搜索规则见[进程文件资源模块](kernel-files.md)。
 - `read` 编号为 63，使用 open file description 的当前 offset 把数据复制到用户缓冲区；返回实际字节数、0 表示 EOF，用户 fault 与部分复制按 Linux read 形态提交。
-- `exit` 编号为 93，产生 `EXIT`；状态保留参数 0 的低 8 位。
+- `write` 编号 64 与 `writev` 编号 66 当前只作用于 console 描述符并经架构串口输出；regular fd 返回 `-EBADF`，用户 fault 按前缀保持。console read 返回 0 的空流 EOF、`lseek` 编号 62 的 SEEK 形态与目录 cookie、`fstat` 编号 80 与 `newfstatat` 编号 79 的 128 字节 stat 填充、`getdents64` 编号 61 的 linux_dirent64 编码与条目 cookie，均见[进程文件资源模块](kernel-files.md)。
+- `exit` 编号 93 与 `exit_group` 编号 94 均产生 `EXIT`；状态保留参数 0 的低 8 位。单成员线程组下两者等价，增加线程组成员后 exit_group 收敛为全组终止。
+- `set_tid_address` 编号 96 记录 clear_tid 用户指针并返回调用 TID；指针的 futex 清醒语义随 futex 落地。
 - `uname` 编号为 160，把六个 65 字节字段组成的 Linux `new_utsname` 写到参数 0 指向的用户缓冲区；成功返回 0，用户范围、映射或写权限错误返回 `-EFAULT`（-14）。当前固定报告 `Linux/boaros/0.1.0-boaros-dev/#1 BoarOS/riscv64/(none)`，其中 release 是 BoarOS 自身开发版本而非 Linux 能力等级，机器名由架构构建配置提供。
 - `getpid` 编号为 172，返回调用任务所属线程组的 TGID。
 - `getppid` 编号为 173，返回当前父任务的 TGID；PID 1 或 parentless 进程返回 0，reparent 后观察到 PID 1。
@@ -48,4 +51,4 @@ enum kernel_syscall_status kernel_syscall_dispatch(
 
 生产用户任务拥有文件表、fs context 和 MM。底层 U-mode 调度探针可以有 MM 而故意没有进程文件资源，此时 `openat` 返回 `-ENODEV`，`read/close` 返回 `-EBADF`，用于明确区分探针配置与内核对象损坏；这不是生产进程模型。当前每个进程仍是单成员线程组，所以 `getpid()` 与 `gettid()` 数值相等，但普通 clone 已创建独立父子进程。接口语义和内部字段已经分离，增加线程组成员后无需改变 syscall ABI。内核任务与 idle 没有 Linux 身份，Trap 层只会从用户任务进入该接口。
 
-`make test-syscall-riscv` 验证空指针失败原子性、`exit(93)`、raw `brk`、匿名/文件 mmap 参数、fd pin/失败释放、errno、munmap/mprotect 转发、内部 MM 状态升级、clone 参数分类和未知编号。`make test-uaccess-riscv` 与 `make test-files-riscv` 验证用户复制、页缓存和映射所需的文件生命周期。`make test-mmap-riscv` 让真实 ext4 `/init` ELF 从 U-mode 完成 demand-zero、file-private COW、EOF/SIGBUS、PROT_NONE、fixed replace/noreplace、打洞/重填和释放；`make test-brk-riscv` 继续覆盖 heap/fork/exec 生命周期。
+`make test-syscall-riscv` 验证空指针失败原子性、`exit(93)`、`exit_group(94)`、`set_tid_address(96)`、raw `brk`、匿名/文件 mmap 参数、fd pin/失败释放、errno、munmap/mprotect 转发、内部 MM 状态升级、clone 参数分类和未知编号。`make test-uaccess-riscv` 与 `make test-files-riscv` 验证用户复制、页缓存和映射所需的文件生命周期。`make test-mmap-riscv` 让真实 ext4 `/init` ELF 从 U-mode 完成 demand-zero、file-private COW、EOF/SIGBUS、PROT_NONE、fixed replace/noreplace、打洞/重填和释放；`make test-brk-riscv` 继续覆盖 heap/fork/exec 生命周期。

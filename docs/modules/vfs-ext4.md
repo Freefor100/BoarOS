@@ -31,9 +31,9 @@ miss 路径先分配并清零页，再通过 node 的无 offset 副作用 `pread
 
 内核只编译 lwext4 读取路径需要的源码，关闭 journaling、xattr、debug/assert 和 mkfs，并把 malloc/calloc/realloc/free 绑定到当前内核堆。根设备是 raw whole-disk ext4，物理块大小固定为 512 字节；当前不解析分区表。
 
-挂载只读后额外检查 superblock `needs_recovery` incompat feature。因为当前没有 JBD2 replay 和写回能力，发现该位返回 `-EUCLEAN` 并完整撤销挂载，不能静默读取可能不一致的数据。打开前先读取 mode 并拒绝目录，避免为不支持的对象创建 lwext4 file handle；成功文件记录大小和 mode。unmount 在仍有 open file 时返回 `-EBUSY`。close/unmount 的底层释放失败保留 CLEANUP 状态，调用者可以重试而不会重复关闭或丢失 heap owner。
+挂载只读后额外检查 superblock `needs_recovery` incompat feature。因为当前没有 JBD2 replay 和写回能力，发现该位返回 `-EUCLEAN` 并完整撤销挂载，不能静默读取可能不一致的数据。打开前先读取 mode；普通文件走 `ext4_fopen`，目录走 `ext4_dir_open`（`ext4_fopen` 自身拒绝目录 inode），成功文件记录大小和 mode。unmount 在仍有 open file 时返回 `-EBUSY`。close/unmount 的底层释放失败保留 CLEANUP 状态，调用者可以重试而不会重复关闭或丢失 heap owner。
 
-当前 VFS 同时服务 ELF 随机读、进程文件表和文件私有缺页，但仍不是完整 Linux VFS：没有通用 inode/dentry cache、路径权限、symlink、目录遍历、写入/writeback、read-ahead、并发锁或多挂载。页缓存只保存只读普通文件内容；进程层只持有 VFS mount/file 抽象，lwext4 handle 没有泄露到 task 或 syscall ABI。
+当前 VFS 同时服务 ELF 随机读、进程文件表和文件私有缺页，但仍不是完整 Linux VFS：没有通用 inode/dentry cache、路径权限、symlink、写入/writeback、read-ahead、并发锁或多挂载。目录支持打开与线性枚举（`kernel_vfs_dir_entry`，跳过 dot 项，重 walk 无状态），没有目录 fd 语义之外的 seek 目录项缓存。页缓存只保存只读普通文件内容；进程层只持有 VFS mount/file 抽象，lwext4 handle 没有泄露到 task 或 syscall ABI。
 
 ## 验证
 

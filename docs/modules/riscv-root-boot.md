@@ -12,6 +12,10 @@ VFS 文件成为精确 `read_at` 源，ELF loader 把静态 RISC-V `ET_EXEC` 的
 
 没有 block device 时，生产内核保留无根 timer-idle 模式；一旦发现 block device，unsupported transport、挂载失败、缺失/不可执行 `/init` 或 ELF 错误都是明确的 root boot failure，不扫描后续磁盘寻找“碰巧可启动”的文件系统。
 
+## PID 1 stdio
+
+创建 PID 1 文件表后，root boot 把 console 描述符绑定到 fd 0/1/2，使真实用户程序拥有 stdin/stdout/stderr。这是设备文件系统落地前的桥接：fork 继承描述符、exec 只摘除 CLOEXEC 槽，因此 stdio 跨整条进程链保持。console 的读写语义见[进程文件资源模块](kernel-files.md)。
+
 ## PID 1、子进程与最终回收
 
 PID 1 可以普通 clone 子进程并通过 wait4 回收。子进程退出时先释放 exec/files/fs/MM 重资源，再保留 PID、任务页和 wait status 成为 zombie；若清理失败则由 idle 从 exited 队列重试后再转 zombie。子进程继续派生的任务在父进程退出时重新挂到仍存活的 PID 1，因而不会因中间父进程消失而丢失可等待事件。
