@@ -18,6 +18,12 @@ enum kernel_task_status {
 /* Returns the scheduler current task, or null before scheduler publication. */
 struct kernel_task *kernel_task_current(void);
 
+/* Records the set_tid_address clear pointer and returns the caller tid. */
+enum kernel_task_status kernel_task_set_tid_address(
+    struct kernel_task *task,
+    uint64_t address,
+    kernel_pid_t *tid);
+
 enum kernel_task_status kernel_task_tid(
     const struct kernel_task *task,
     kernel_pid_t *tid);

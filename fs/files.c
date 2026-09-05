@@ -771,6 +771,102 @@ enum kernel_files_status kernel_files_write(
     return KERNEL_FILES_STATUS_OK;
 }
 
+enum kernel_files_status kernel_files_writev(
+    struct kernel_files *files,
+    struct kernel_mm *mm,
+    int64_t fd,
+    uint64_t user_iov,
+    uint64_t iovcnt,
+    int64_t *linux_result)
+{
+    struct kernel_open_file_description *description;
+    unsigned char staging[KERNEL_FILES_WRITE_STAGING];
+    uint64_t total = 0U;
+    uint64_t index;
+
+    if (!kernel_files_is_live(files) || mm == 0 || linux_result == 0) {
+        return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
+    }
+    files->record->statistics.write_calls++;
+    description = lookup_description(files, fd);
+    if (description == 0 ||
+        kernel_open_file_kind(description) !=
+            KERNEL_OPEN_FILE_KIND_CONSOLE) {
+        files->record->statistics.write_failures++;
+        *linux_result = -KERNEL_EBADF;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    if (iovcnt == 0U) {
+        *linux_result = 0;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    if (iovcnt > 1024U) {
+        *linux_result = -KERNEL_EINVAL;
+        return KERNEL_FILES_STATUS_OK;
+    }
+
+    for (index = 0U; index < iovcnt; index++) {
+        struct kernel_uaccess_iovec iovec;
+        size_t copied = 0U;
+        uint64_t offset = 0U;
+        enum kernel_uaccess_status access_status;
+
+        access_status = kernel_copy_from_user(mm,
+                                              &iovec,
+                                              user_iov +
+                                                  index * sizeof(iovec),
+                                              sizeof(iovec),
+                                              &copied);
+        if (access_status != KERNEL_UACCESS_STATUS_OK ||
+            copied != sizeof(iovec)) {
+            files->record->statistics.write_failures++;
+            *linux_result = total != 0U ? (int64_t)total
+                                        : -KERNEL_EFAULT;
+            files->record->statistics.bytes_written += total;
+            return KERNEL_FILES_STATUS_OK;
+        }
+        if (kernel_user_range_check(iovec.base, (size_t)iovec.length) !=
+            KERNEL_UACCESS_STATUS_OK) {
+            *linux_result = total != 0U ? (int64_t)total
+                                        : -KERNEL_EFAULT;
+            files->record->statistics.bytes_written += total;
+            return KERNEL_FILES_STATUS_OK;
+        }
+        while (offset < iovec.length) {
+            size_t chunk = iovec.length - offset;
+            size_t emitted = 0U;
+            size_t position;
+
+            if (chunk > sizeof(staging)) {
+                chunk = sizeof(staging);
+            }
+            access_status = kernel_copy_from_user(mm,
+                                                  staging,
+                                                  iovec.base + offset,
+                                                  chunk,
+                                                  &emitted);
+            total += emitted;
+            for (position = 0U; position < emitted; position++) {
+                kernel_console_putc((char)staging[position]);
+            }
+            if (access_status == KERNEL_UACCESS_STATUS_FAULT) {
+                *linux_result = total != 0U ? (int64_t)total
+                                            : -KERNEL_EFAULT;
+                files->record->statistics.bytes_written += total;
+                return KERNEL_FILES_STATUS_OK;
+            }
+            if (access_status != KERNEL_UACCESS_STATUS_OK ||
+                emitted != chunk) {
+                return KERNEL_FILES_STATUS_STATE;
+            }
+            offset += emitted;
+        }
+    }
+    files->record->statistics.bytes_written += total;
+    *linux_result = (int64_t)total;
+    return KERNEL_FILES_STATUS_OK;
+}
+
 enum kernel_files_status kernel_files_open_console(
     struct kernel_files *files,
     int64_t fd,

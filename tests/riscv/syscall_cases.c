@@ -42,6 +42,10 @@ static uint64_t fstatat_flags = UINT64_MAX;
 static int64_t getdents_fd = INT64_MIN;
 static uint64_t getdents_buffer;
 static uint64_t getdents_count;
+static uint64_t set_tid_address_value = UINT64_MAX;
+static int64_t writev_fd = INT64_MIN;
+static uint64_t writev_iov = UINT64_MAX;
+static uint64_t writev_iovcnt = UINT64_MAX;
 static int64_t dup_oldfd = INT64_MIN;
 static int64_t dup_newfd = INT64_MIN;
 static uint64_t dup_flags = UINT64_MAX;
@@ -253,6 +257,19 @@ enum kernel_files_status __wrap_kernel_files_fstatat(
     return write_files_status;
 }
 
+enum kernel_task_status __wrap_kernel_task_set_tid_address(
+    struct kernel_task *task,
+    uint64_t address,
+    kernel_pid_t *tid)
+{
+    if (task != (struct kernel_task *)(uintptr_t)1U || tid == 0) {
+        return KERNEL_TASK_STATUS_INVALID_ARGUMENT;
+    }
+    set_tid_address_value = address;
+    *tid = 7;
+    return KERNEL_TASK_STATUS_OK;
+}
+
 enum kernel_files_status __wrap_kernel_files_getdents(
     struct kernel_files *files,
     struct kernel_mm *mm,
@@ -268,6 +285,25 @@ enum kernel_files_status __wrap_kernel_files_getdents(
     getdents_fd = fd;
     getdents_buffer = user_buffer;
     getdents_count = count;
+    *linux_result = write_linux_result;
+    return write_files_status;
+}
+
+enum kernel_files_status __wrap_kernel_files_writev(
+    struct kernel_files *files,
+    struct kernel_mm *mm,
+    int64_t fd,
+    uint64_t user_iov,
+    uint64_t iovcnt,
+    int64_t *linux_result)
+{
+    if (files != (struct kernel_files *)(uintptr_t)3U ||
+        mm != (struct kernel_mm *)(uintptr_t)2U || linux_result == 0) {
+        return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
+    }
+    writev_fd = fd;
+    writev_iov = user_iov;
+    writev_iovcnt = iovcnt;
     *linux_result = write_linux_result;
     return write_files_status;
 }
@@ -451,7 +487,7 @@ static unsigned long run_exit_cases(void)
 
 static unsigned long run_unknown_cases(void)
 {
-    static const uint64_t numbers[] = {0U, 94U, 174U, UINT64_MAX};
+    static const uint64_t numbers[] = {0U, 95U, 174U, UINT64_MAX};
     struct kernel_syscall_request request = {0};
     struct kernel_syscall_result result;
     unsigned long failures = 0U;
@@ -595,6 +631,23 @@ static unsigned long run_seek_stat_decode_cases(void)
         failures++;
     }
 
+    request.number = 94U;
+    request.arguments[0] = UINT64_C(0x11223344556677ab);
+    if (kernel_syscall_dispatch(caller, &request, &result) !=
+            KERNEL_SYSCALL_STATUS_OK ||
+        result_changed(&result, KERNEL_SYSCALL_ACTION_EXIT, 0xab)) {
+        failures++;
+    }
+
+    request.number = 96U;
+    request.arguments[0] = UINT64_C(0x4000);
+    if (kernel_syscall_dispatch(caller, &request, &result) !=
+            KERNEL_SYSCALL_STATUS_OK ||
+        result_changed(&result, KERNEL_SYSCALL_ACTION_RETURN, 7) ||
+        set_tid_address_value != UINT64_C(0x4000)) {
+        failures++;
+    }
+
     request.number = 61U;
     request.arguments[0] = 8U;
     request.arguments[1] = UINT64_C(0x4000);
@@ -607,6 +660,21 @@ static unsigned long run_seek_stat_decode_cases(void)
         getdents_fd != 8 ||
         getdents_buffer != UINT64_C(0x4000) ||
         getdents_count != UINT64_C(0x2000)) {
+        failures++;
+    }
+
+    request.number = 66U;
+    request.arguments[0] = 4U;
+    request.arguments[1] = UINT64_C(0x1000);
+    request.arguments[2] = 3U;
+    if (kernel_syscall_dispatch(caller, &request, &result) !=
+            KERNEL_SYSCALL_STATUS_OK ||
+        result_changed(&result,
+                       KERNEL_SYSCALL_ACTION_RETURN,
+                       INT64_C(0x4321)) ||
+        writev_fd != 4 ||
+        writev_iov != UINT64_C(0x1000) ||
+        writev_iovcnt != 3U) {
         failures++;
     }
 

@@ -21,7 +21,10 @@
 #define LINUX_SYSCALL_LSEEK 62U
 #define LINUX_SYSCALL_READ 63U
 #define LINUX_SYSCALL_WRITE 64U
+#define LINUX_SYSCALL_WRITEV 66U
 #define LINUX_SYSCALL_EXIT 93U
+#define LINUX_SYSCALL_EXIT_GROUP 94U
+#define LINUX_SYSCALL_SET_TID_ADDRESS 96U
 #define LINUX_SYSCALL_UNAME 160U
 #define LINUX_SYSCALL_GETPID 172U
 #define LINUX_SYSCALL_GETPPID 173U
@@ -314,6 +317,22 @@ static enum kernel_syscall_status decode_newfstatat(
     return KERNEL_SYSCALL_STATUS_OK;
 }
 
+static enum kernel_syscall_status decode_set_tid_address(
+    struct kernel_task *caller,
+    uint64_t address,
+    struct kernel_syscall_result *decoded)
+{
+    kernel_pid_t tid;
+
+    if (kernel_task_set_tid_address(caller, address, &tid) !=
+        KERNEL_TASK_STATUS_OK) {
+        return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    }
+    decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+    decoded->value = tid;
+    return KERNEL_SYSCALL_STATUS_OK;
+}
+
 static enum kernel_syscall_status decode_dup(
     struct kernel_task *caller,
     const struct kernel_syscall_request *request,
@@ -448,6 +467,38 @@ static enum kernel_syscall_status decode_getdents64(
                               request->arguments[1],
                               request->arguments[2],
                               &linux_result) != KERNEL_FILES_STATUS_OK) {
+        return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    }
+    decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+    decoded->value = linux_result;
+    return KERNEL_SYSCALL_STATUS_OK;
+}
+
+static enum kernel_syscall_status decode_writev(
+    struct kernel_task *caller,
+    const struct kernel_syscall_request *request,
+    struct kernel_syscall_result *decoded)
+{
+    struct kernel_files *files;
+    struct kernel_mm *mm;
+    int64_t linux_result;
+    enum kernel_task_status task_status;
+
+    task_status = kernel_task_files_borrow(caller, &files);
+    if (task_status == KERNEL_TASK_STATUS_RESOURCE_UNAVAILABLE) {
+        decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+        decoded->value = -KERNEL_EBADF;
+        return KERNEL_SYSCALL_STATUS_OK;
+    }
+    if (task_status != KERNEL_TASK_STATUS_OK ||
+        kernel_task_mm_borrow_mutable(caller, &mm) !=
+            KERNEL_TASK_STATUS_OK ||
+        kernel_files_writev(files,
+                            mm,
+                            (int64_t)request->arguments[0],
+                            request->arguments[1],
+                            request->arguments[2],
+                            &linux_result) != KERNEL_FILES_STATUS_OK) {
         return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     }
     decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
@@ -791,6 +842,11 @@ enum kernel_syscall_status kernel_syscall_dispatch(
             KERNEL_SYSCALL_STATUS_OK) {
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
         }
+    } else if (request->number == LINUX_SYSCALL_WRITEV) {
+        if (decode_writev(caller, request, &decoded) !=
+            KERNEL_SYSCALL_STATUS_OK) {
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+        }
     } else if (request->number == LINUX_SYSCALL_GETDENTS64) {
         if (decode_getdents64(caller, request, &decoded) !=
             KERNEL_SYSCALL_STATUS_OK) {
@@ -811,10 +867,19 @@ enum kernel_syscall_status kernel_syscall_dispatch(
             KERNEL_SYSCALL_STATUS_OK) {
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
         }
-    } else if (request->number == LINUX_SYSCALL_EXIT) {
+    } else if (request->number == LINUX_SYSCALL_EXIT ||
+               request->number == LINUX_SYSCALL_EXIT_GROUP) {
+        /* Single-member thread groups: exit_group terminates this task. */
         decoded.action = KERNEL_SYSCALL_ACTION_EXIT;
         decoded.value = (int64_t)(request->arguments[0] &
                                   LINUX_EXIT_STATUS_MASK);
+    } else if (request->number == LINUX_SYSCALL_SET_TID_ADDRESS) {
+        if (decode_set_tid_address(caller,
+                                   request->arguments[0],
+                                   &decoded) !=
+            KERNEL_SYSCALL_STATUS_OK) {
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+        }
     } else if (request->number == LINUX_SYSCALL_UNAME) {
         if (decode_uname(caller,
                          request->arguments[0],

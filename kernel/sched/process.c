@@ -1079,6 +1079,19 @@ struct kernel_task *kernel_task_current(void)
     return scheduler.current;
 }
 
+enum kernel_task_status kernel_task_set_tid_address(
+    struct kernel_task *task,
+    uint64_t address,
+    kernel_pid_t *tid)
+{
+    if (task == 0 || tid == 0) {
+        return KERNEL_TASK_STATUS_INVALID_ARGUMENT;
+    }
+    task->clear_tid_address = address;
+    *tid = task->tid;
+    return KERNEL_TASK_STATUS_OK;
+}
+
 enum kernel_task_status kernel_task_tid(
     const struct kernel_task *task,
     kernel_pid_t *tid)

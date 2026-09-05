@@ -590,8 +590,10 @@ $(SYSCALL_TEST_KERNEL_RV): $(SYSCALL_TEST_OBJECTS) arch/riscv/linker.ld
 		-Wl,--wrap=kernel_mm_mprotect \
 	-Wl,--wrap=kernel_task_files_borrow \
 	-Wl,--wrap=kernel_task_fs_context_borrow \
+	-Wl,--wrap=kernel_task_set_tid_address \
 	-Wl,--wrap=kernel_files_pin \
 	-Wl,--wrap=kernel_files_write \
+	-Wl,--wrap=kernel_files_writev \
 	-Wl,--wrap=kernel_files_lseek \
 	-Wl,--wrap=kernel_files_fstat \
 	-Wl,--wrap=kernel_files_fstatat \
@@ -972,6 +974,33 @@ test-scheduler-riscv: $(SCHEDULER_BOOT_TEST_KERNEL_RV)
 test-syscall-riscv: $(SYSCALL_TEST_KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) SYSCALL_TEST_KERNEL_RV=$< \
 		./tests/syscall-riscv.sh
+
+MUSL_TARBALL := references/musl/musl-1.2.5.tar.gz
+MUSL_ROOT := $(BUILD_DIR)/musl-root
+MUSL_STAMP := $(MUSL_ROOT)/.built
+REAL_USERLAND_RV := $(BUILD_DIR)/tests/user/real-userland-rv
+
+$(MUSL_STAMP): $(MUSL_TARBALL)
+	@mkdir -p $(BUILD_DIR)/musl-src
+	rm -rf $(BUILD_DIR)/musl-src/musl-1.2.5 $(MUSL_ROOT)
+	tar -C $(BUILD_DIR)/musl-src -xzf $<
+	cd $(BUILD_DIR)/musl-src/musl-1.2.5 && \
+		CC=riscv64-linux-gnu-gcc AR=riscv64-linux-gnu-ar \
+		RANLIB=riscv64-linux-gnu-ranlib ./configure \
+			--target=riscv64-linux-musl \
+			--prefix=$(abspath $(MUSL_ROOT)) --disable-shared && \
+		make && make install
+	touch $@
+
+$(REAL_USERLAND_RV): tests/userland/real.c $(MUSL_STAMP)
+	@mkdir -p $(dir $@)
+	$(MUSL_ROOT)/bin/musl-gcc -static -O2 \
+		-L/usr/riscv64-linux-gnu/lib -o $@ $<
+
+.PHONY: test-userland-riscv
+test-userland-riscv: $(REAL_USERLAND_RV) kernel-rv
+	QEMU_RISCV64=$(QEMU_RISCV64) REAL_USERLAND_RV=$(REAL_USERLAND_RV) \
+		./tests/userland-riscv.sh
 
 test-brk-riscv: test-sv39-riscv test-vma-riscv \
 		test-user-elf-cases-riscv test-syscall-riscv \

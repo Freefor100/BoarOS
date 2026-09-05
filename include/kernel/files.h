@@ -135,6 +135,19 @@ enum kernel_files_status kernel_files_write(
     uint64_t count,
     int64_t *linux_result);
 
+struct kernel_uaccess_iovec {
+    uint64_t base;
+    uint64_t length;
+};
+
+enum kernel_files_status kernel_files_writev(
+    struct kernel_files *files,
+    struct kernel_mm *mm,
+    int64_t fd,
+    uint64_t user_iov,
+    uint64_t iovcnt,
+    int64_t *linux_result);
+
 /* Install the console description at an empty fixed slot for PID 1 stdio. */
 enum kernel_files_status kernel_files_open_console(
     struct kernel_files *files,

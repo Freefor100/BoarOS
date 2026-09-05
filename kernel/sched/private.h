@@ -50,6 +50,7 @@ struct kernel_task {
     uint32_t tid_owned;
     uint32_t publish_completion;
     uint32_t wait_status;
+    uint64_t clear_tid_address;
     struct kernel_task *group_leader;
     uint32_t group_members;
     struct kernel_thread_completion completion;
