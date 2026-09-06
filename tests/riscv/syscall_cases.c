@@ -1007,6 +1007,7 @@ static unsigned long run_time_cases(void)
     struct kernel_syscall_result result;
     unsigned long failures = 0U;
     struct kernel_task *caller = (struct kernel_task *)(uintptr_t)1U;
+    uint64_t deadline = 0U;
 
     /* Conversion math at the initialized 10 MHz timebase. */
     if (kernel_time_init(10000000U, UINT64_C(1577836800000000000)) !=
@@ -1066,6 +1067,39 @@ static unsigned long run_time_cases(void)
     if (kernel_syscall_dispatch(caller, &request, &result) !=
             KERNEL_SYSCALL_STATUS_OK ||
         result_changed(&result, KERNEL_SYSCALL_ACTION_RETURN, 0)) {
+        failures++;
+    }
+
+    /* Sleep deadline conversion: past targets report no sleep needed. */
+    if (kernel_time_deadline_from_monotonic(0U, &deadline) !=
+        KERNEL_TIME_STATUS_DEADLINE_PASSED) {
+        failures++;
+    }
+    if (kernel_time_deadline_from_monotonic(UINT64_MAX / 2U, &deadline) !=
+            KERNEL_TIME_STATUS_OK ||
+        deadline == 0U) {
+        failures++;
+    }
+    if (kernel_time_deadline_from_monotonic(0U, 0) !=
+        KERNEL_TIME_STATUS_INVALID_ARGUMENT) {
+        failures++;
+    }
+
+    /* clock_nanosleep validates clock id and flags before any copy. */
+    request.number = 115U;
+    request.arguments[0] = 2U;
+    request.arguments[1] = 0U;
+    request.arguments[2] = 0x1000U;
+    if (kernel_syscall_dispatch(caller, &request, &result) !=
+            KERNEL_SYSCALL_STATUS_OK ||
+        result_changed(&result, KERNEL_SYSCALL_ACTION_RETURN, -22)) {
+        failures++;
+    }
+    request.arguments[0] = 1U;
+    request.arguments[1] = 2U;
+    if (kernel_syscall_dispatch(caller, &request, &result) !=
+            KERNEL_SYSCALL_STATUS_OK ||
+        result_changed(&result, KERNEL_SYSCALL_ACTION_RETURN, -22)) {
         failures++;
     }
 

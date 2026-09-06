@@ -5,6 +5,7 @@
 #include <kernel/mm.h>
 #include <kernel/open_file.h>
 #include <kernel/page.h>
+#include <kernel/scheduler.h>
 #include <kernel/syscall.h>
 #include <kernel/task.h>
 #include <kernel/time.h>
@@ -34,10 +35,13 @@
 #define LINUX_SYSCALL_SCHED_YIELD 124U
 #define LINUX_SYSCALL_CLOCK_GETTIME 113U
 #define LINUX_SYSCALL_CLOCK_GETRES 114U
+#define LINUX_SYSCALL_NANOSLEEP 101U
+#define LINUX_SYSCALL_CLOCK_NANOSLEEP 115U
 #define LINUX_SYSCALL_GETTIMEOFDAY 169U
 #define LINUX_CLOCK_REALTIME 0U
 #define LINUX_CLOCK_MONOTONIC 1U
 #define LINUX_CLOCK_NSECS_PER_SEC UINT64_C(1000000000)
+#define LINUX_TIMER_ABSTIME UINT64_C(1)
 #define LINUX_SYSCALL_MUNMAP 215U
 #define LINUX_SYSCALL_CLONE 220U
 #define LINUX_SYSCALL_EXECVE 221U
@@ -259,6 +263,150 @@ static enum kernel_syscall_status decode_gettimeofday(
                                 seconds,
                                 sub_nanoseconds / 1000,
                                 decoded);
+}
+
+struct linux_timespec {
+    int64_t tv_sec;
+    int64_t tv_nsec;
+};
+
+/*
+ * Shared core of nanosleep(101) and clock_nanosleep(115).  The requested
+ * point is normalized to the monotonic domain, the sleep blocks on the
+ * timer deadline, and the remaining time is only reported on an early
+ * wake (signals do not exist yet, so relative sleeps currently always
+ * run to the deadline and never touch `remaining`).
+ */
+static enum kernel_syscall_status decode_sleep_for(
+    struct kernel_task *caller,
+    uint32_t clock_id,
+    uint32_t flags,
+    uint64_t request_address,
+    uint64_t remaining_address,
+    struct kernel_syscall_result *decoded)
+{
+    struct kernel_mm *mm;
+    struct linux_timespec request_spec;
+    enum kernel_task_status task_status;
+    enum kernel_uaccess_status access_status;
+    enum kernel_time_status time_status;
+    enum kernel_scheduler_status sleep_status;
+    enum kernel_wait_wake_reason wake_reason = KERNEL_WAIT_WOKEN;
+    size_t copied;
+    uint64_t duration_ns;
+    uint64_t target_monotonic_ns;
+    uint64_t deadline;
+    uint64_t now_ns;
+
+    if (clock_id != LINUX_CLOCK_REALTIME && clock_id != LINUX_CLOCK_MONOTONIC) {
+        decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+        decoded->value = -KERNEL_EINVAL;
+        return KERNEL_SYSCALL_STATUS_OK;
+    }
+    if ((flags & ~LINUX_TIMER_ABSTIME) != 0U) {
+        decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+        decoded->value = -KERNEL_EINVAL;
+        return KERNEL_SYSCALL_STATUS_OK;
+    }
+
+    task_status = kernel_task_mm_borrow_mutable(caller, &mm);
+    if (task_status != KERNEL_TASK_STATUS_OK) {
+        return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    }
+    access_status = kernel_copy_from_user(mm,
+                                          &request_spec,
+                                          request_address,
+                                          sizeof(request_spec),
+                                          &copied);
+    if (access_status == KERNEL_UACCESS_STATUS_FAULT) {
+        decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+        decoded->value = -KERNEL_EFAULT;
+        return KERNEL_SYSCALL_STATUS_OK;
+    }
+    if (access_status != KERNEL_UACCESS_STATUS_OK ||
+        copied != sizeof(request_spec)) {
+        return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    }
+    if (request_spec.tv_sec < 0 || request_spec.tv_nsec < 0 ||
+        (uint64_t)request_spec.tv_nsec >= LINUX_CLOCK_NSECS_PER_SEC) {
+        decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+        decoded->value = -KERNEL_EINVAL;
+        return KERNEL_SYSCALL_STATUS_OK;
+    }
+
+    duration_ns = (uint64_t)request_spec.tv_sec >=
+                          UINT64_MAX / LINUX_CLOCK_NSECS_PER_SEC
+                      ? UINT64_MAX
+                      : (uint64_t)request_spec.tv_sec *
+                                LINUX_CLOCK_NSECS_PER_SEC +
+                            (uint64_t)request_spec.tv_nsec;
+    if ((flags & LINUX_TIMER_ABSTIME) != 0U) {
+        target_monotonic_ns = clock_id == LINUX_CLOCK_REALTIME
+                                  ? duration_ns -
+                                        kernel_time_boot_realtime_offset()
+                                  : duration_ns;
+        if (clock_id == LINUX_CLOCK_REALTIME &&
+            duration_ns < kernel_time_boot_realtime_offset()) {
+            target_monotonic_ns = 0;
+        }
+    } else {
+        now_ns = kernel_time_monotonic_ns();
+        target_monotonic_ns = duration_ns > UINT64_MAX - now_ns
+                                  ? UINT64_MAX
+                                  : now_ns + duration_ns;
+    }
+
+    time_status = kernel_time_deadline_from_monotonic(target_monotonic_ns,
+                                                      &deadline);
+    if (time_status == KERNEL_TIME_STATUS_DEADLINE_PASSED) {
+        decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+        decoded->value = 0;
+        return KERNEL_SYSCALL_STATUS_OK;
+    }
+    if (time_status != KERNEL_TIME_STATUS_OK) {
+        return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    }
+
+    sleep_status = kernel_scheduler_block_current(0, deadline, &wake_reason);
+    if (sleep_status != KERNEL_SCHEDULER_STATUS_OK) {
+        return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    }
+
+    if (wake_reason == KERNEL_WAIT_WOKEN &&
+        (flags & LINUX_TIMER_ABSTIME) == 0U && remaining_address != 0U) {
+        uint64_t remaining_ns = target_monotonic_ns -
+                                kernel_time_monotonic_ns();
+
+        if ((int64_t)remaining_ns > 0) {
+            int64_t seconds;
+            int64_t sub_nanoseconds;
+
+            decode_split_nanoseconds(remaining_ns,
+                                     &seconds,
+                                     &sub_nanoseconds);
+            access_status = kernel_copy_to_user(mm,
+                                                remaining_address,
+                                                &(struct linux_timespec){
+                                                    .tv_sec = seconds,
+                                                    .tv_nsec = sub_nanoseconds,
+                                                },
+                                                sizeof(struct linux_timespec),
+                                                &copied);
+            if (access_status != KERNEL_UACCESS_STATUS_OK ||
+                copied != sizeof(struct linux_timespec)) {
+                if (access_status == KERNEL_UACCESS_STATUS_FAULT) {
+                    decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+                    decoded->value = -KERNEL_EFAULT;
+                    return KERNEL_SYSCALL_STATUS_OK;
+                }
+                return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+            }
+        }
+    }
+
+    decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+    decoded->value = 0;
+    return KERNEL_SYSCALL_STATUS_OK;
 }
 
 static enum kernel_syscall_status decode_openat(
@@ -1095,6 +1243,24 @@ enum kernel_syscall_status kernel_syscall_dispatch(
     } else if (request->number == LINUX_SYSCALL_GETTIMEOFDAY) {
         if (decode_gettimeofday(caller, request, &decoded) !=
             KERNEL_SYSCALL_STATUS_OK) {
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+        }
+    } else if (request->number == LINUX_SYSCALL_NANOSLEEP) {
+        if (decode_sleep_for(caller,
+                             LINUX_CLOCK_REALTIME,
+                             0U,
+                             request->arguments[0],
+                             request->arguments[1],
+                             &decoded) != KERNEL_SYSCALL_STATUS_OK) {
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+        }
+    } else if (request->number == LINUX_SYSCALL_CLOCK_NANOSLEEP) {
+        if (decode_sleep_for(caller,
+                             (uint32_t)request->arguments[0],
+                             (uint32_t)request->arguments[1],
+                             request->arguments[2],
+                             request->arguments[3],
+                             &decoded) != KERNEL_SYSCALL_STATUS_OK) {
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
         }
     } else {

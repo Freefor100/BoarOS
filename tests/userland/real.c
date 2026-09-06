@@ -3,10 +3,12 @@
  * descriptor duplication, and the clock ABI against the Linux surface. */
 
 #include <dirent.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
@@ -101,6 +103,50 @@ int main(void)
     }
     if (write(1, "BoarOS: real userland clock checks ok\n", 38) != 38) {
         return 17;
+    }
+
+    /* Sleep: musl nanosleep routes to clock_nanosleep; the raw SYS_nanosleep
+     * entry must behave identically.  Each call must sleep at least the
+     * requested duration, and the kernel must not busy-wait the core. */
+    if (clock_gettime(CLOCK_MONOTONIC, &mono_before) != 0) {
+        return 18;
+    }
+    struct timespec pause = { .tv_sec = 0, .tv_nsec = 20000000L };
+    if (nanosleep(&pause, 0) != 0) {
+        return 19;
+    }
+    if (clock_gettime(CLOCK_MONOTONIC, &mono_after) != 0) {
+        return 20;
+    }
+    if (mono_after.tv_sec < mono_before.tv_sec ||
+        (mono_after.tv_sec == mono_before.tv_sec &&
+         (long)(mono_after.tv_nsec - mono_before.tv_nsec) < 20000000L)) {
+        return 21;
+    }
+    if (clock_gettime(CLOCK_MONOTONIC, &mono_before) != 0) {
+        return 22;
+    }
+    pause.tv_nsec = 5000000L;
+    if (syscall(SYS_nanosleep, &pause, 0) != 0) {
+        return 23;
+    }
+    /* A NULL request pointer must fault the kernel copy, not the kernel. */
+    pause.tv_nsec = 0;
+    errno = 0;
+    if (syscall(SYS_clock_nanosleep, CLOCK_REALTIME, 0, 0, 0) != -1L ||
+        errno != EFAULT) {
+        return 24;
+    }
+    if (clock_gettime(CLOCK_MONOTONIC, &mono_after) != 0) {
+        return 25;
+    }
+    if (mono_after.tv_sec < mono_before.tv_sec ||
+        (mono_after.tv_sec == mono_before.tv_sec &&
+         (long)(mono_after.tv_nsec - mono_before.tv_nsec) < 5000000L)) {
+        return 26;
+    }
+    if (write(1, "BoarOS: real userland sleep checks ok\n", 38) != 38) {
+        return 27;
     }
 
     return 42;

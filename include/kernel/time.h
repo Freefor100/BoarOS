@@ -8,6 +8,7 @@ enum kernel_time_status {
     KERNEL_TIME_STATUS_INVALID_ARGUMENT,
     KERNEL_TIME_STATUS_ALREADY_INITIALIZED,
     KERNEL_TIME_STATUS_NOT_INITIALIZED,
+    KERNEL_TIME_STATUS_DEADLINE_PASSED,
 };
 
 /*
@@ -28,5 +29,17 @@ uint64_t kernel_time_realtime_ns(void);
 
 /* Converts time-counter ticks to nanoseconds (0 before init). */
 uint64_t kernel_time_ticks_to_ns(uint64_t ticks);
+
+/* The wall-clock reading captured at boot (0 without an RTC source). */
+uint64_t kernel_time_boot_realtime_offset(void);
+
+/*
+ * Turns a monotonic-domain nanosecond timestamp into an absolute
+ * time-counter deadline for the sleep path.  DEADLINE_PASSED means the
+ * timestamp is not in the future and no sleep is needed.
+ */
+enum kernel_time_status kernel_time_deadline_from_monotonic(
+    uint64_t target_monotonic_ns,
+    uint64_t *deadline);
 
 #endif
