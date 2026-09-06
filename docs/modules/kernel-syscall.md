@@ -43,12 +43,13 @@ enum kernel_syscall_status kernel_syscall_dispatch(
 - `gettid` 编号为 178，返回调用任务自己的 TID。
 - `brk` 编号为 214，通过调用任务的 mutable MM borrow 调整精确 program break。raw syscall 成功返回请求值；参数 0 查询当前值；越过 ELF heap 起点/栈 guard、VMA 冲突、metadata OOM 或待回收页暂时无法释放时返回原 break，不使用负 errno。跨页增长登记 demand-zero heap，缩小撤销越界页；libc 把 raw 返回再包装成自己的 0/-1 接口，不属于内核 ABI。
 - `munmap` 编号为 215，要求页对齐起点和非零长度，长度向上按 4 KiB 对齐；范围包含未映射洞仍成功。越界或未对齐返回 `-EINVAL`。
-- `clone` 编号为 220。当前只接受 `flags=SIGCHLD` 且 `child_stack/parent_tid/tls/child_tid` 全为零的普通进程形态；成功时父进程返回子 PID，子进程返回 0。已识别但涉及共享资源、线程、tid 指针或另一个栈的组合返回 `-ENOTSUP`，未知 flag 或非 `SIGCHLD` 退出信号返回 `-EINVAL`。
+- `clone` 编号为 220。当前接受 `flags=SIGCHLD` 的普通进程形态（`child_stack` 可为 0 或自定义子栈）与 `flags=SIGCHLD|CLONE_VM|CLONE_VFORK` 的 vfork 形态；成功时父进程返回子 PID，子进程返回 0。vfork 语义见[内核调度与进程生命周期模块](kernel-scheduler.md)。tid 指针、TLS、`CLONE_VFORK` 无 `CLONE_VM` 及其他组合返回 `-ENOTSUP`，未知 flag 或非 `SIGCHLD` 退出信号返回 `-EINVAL`。
 - `execve` 编号为 221，准备并提交新的静态 RISC-V `ET_EXEC` 映像；成功不返回，失败返回负 Linux errno。路径、参数、提交点和资源保持规则见[进程映像替换模块](kernel-exec.md)。
 - `mmap` 编号为 222，当前接受 anonymous 或只读普通文件的 `MAP_PRIVATE`，以及任意 `PROT_NONE/R/W/X` 组合。普通 hint、`MAP_FIXED`、`MAP_FIXED_NOREPLACE`、`MAP_STACK` 和 `MAP_NORESERVE` 已实现；fixed-noreplace 冲突返回 `-EEXIST`，地址空间/metadata 不足返回 `-ENOMEM`。文件映射要求有效 fd 和页对齐 offset，成功后由 MM 独立持有 OFD，所以 close fd 不撤销映射；shared 和 `MAP_POPULATE` 返回 `-ENOTSUP`，未知 flag、未对齐 offset 或同时指定两种 fixed 模式返回 `-EINVAL`；anonymous fd 参数按 Linux 语义忽略。
 - `mprotect` 编号为 226，要求页对齐起点，整个非空范围必须已有 VMA；洞返回 `-ENOMEM`。长度 0 成功。`PROT_NONE` 保留 resident 内容，恢复权限后内容仍在；RISC-V 仅写请求被规范化为 RW。
-- `wait4` 编号为 260，支持 Linux pid selector、`WNOHANG` 和 wait flag 校验；普通退出与同步故障产生 Linux 形态 status。无匹配子进程返回 `-ECHILD`，非法 option 返回 `-EINVAL`，status 用户指针错误返回 `-EFAULT`。当前不提供 rusage，非空指针返回 `-ENOTSUP`。
-- 其他编号产生 `RETURN`，返回 `-ENOSYS`（-38）。`times(153)` 与每任务 CPU 记账随进程模型阶段补齐。
+- `wait4` 编号为 260，支持 Linux pid selector、`WNOHANG`、wait flag 校验与 rusage 输出；普通退出与同步故障产生 Linux 形态 status。无匹配子进程返回 `-ECHILD`，非法 option 返回 `-EINVAL`，status/rusage 用户指针错误返回 `-EFAULT`（回收先行，子进程不可再次 wait）。
+- `times` 编号为 153，填写可选的 32 字节 `tms`（`utime/stime/cutime/cstime`，单位为 scheduler tick，`CLK_TCK`=100）并返回自启动的 uptime tick 数；tms 为 NULL 时只返回 uptime。记账在 tick 边界记到被中断任务，idle 不记账；子进程记账在 wait 回收时回卷给父进程，孙辈随回收归并。
+- 其他编号产生 `RETURN`，返回 `-ENOSYS`（-38）。
 
 当前 `brk`/mmap 还没有 `RLIMIT_DATA`、VMA 数量上限、内存承诺或 overcommit accounting；`MAP_NORESERVE` 因而与普通匿名映射等价。成功增长只承诺虚拟 VMA，实际物理页耗尽发生在后续 demand fault。这是明确的兼容性限制，不由伪造的 syscall 成功或预分配全部页来掩盖。
 

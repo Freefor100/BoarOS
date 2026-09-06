@@ -42,7 +42,7 @@
 
 ```text
 switch to new satp
--> move old MM into retired owner
+-> move old MM into retired owner（vfork 共享引用在此点释放，唤醒父进程）
 -> install new MM and cached satp
 -> zero and rebuild complete user Trap Frame
 -> detach FD_CLOEXEC descriptors

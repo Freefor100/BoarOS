@@ -105,7 +105,7 @@ enum kernel_mm_status kernel_mm_release(struct kernel_mm *mm);
 
 `struct kernel_mm` 是一个可移动的拥有型引用，不是地址空间本体。RISC-V 后端用 `record_page_address` 指向一张物理记录页；记录页保存引用计数、清理阶段和唯一的 `riscv_sv39_user_space`。多个 LIVE 句柄可以指向同一记录页：
 
-- `acquire` 增加引用计数并发布一个新的独立 owner；
+- `acquire` 增加引用计数并发布一个新的独立 owner；vfork（clone CLONE_VM|CLONE_VFORK）用它共享父地址空间，子进程 exec 或退出释放引用后父进程句柄不受影响；
 - `fork` 创建独立地址空间，克隆 VMA/文件来源并让父子暂时共享用户物理页，逻辑 MM 和后续写入仍独立；
 - `move` 转移一个 owner，不改变引用计数；
 - `release` 消耗一个 owner，非末引用只减计数，末引用才销毁页表树和记录页；

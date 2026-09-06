@@ -24,7 +24,7 @@ Linux ABI 兼容是最终功能方向，不是对当前完成度的声明；READ
 |---|---|---|
 | 启动与内存 | DTB 内存/保留区和设备发现、启动布局、物理页分配、内核堆、RISC-V Sv39/4 KiB、direct map | RISC-V QEMU 已验证 |
 | 文件与根启动 | VirtIO MMIO version 1 legacy 与 version 2 modern、只读块 I/O、lwext4 适配、VFS、文件页缓存、静态 ELF `/init` | RISC-V QEMU 已验证；默认 legacy 与显式 modern 都有入口测试 |
-| 进程与基础 syscall | `openat/read/close`、`write/writev`、`lseek/fstat/newfstatat/getdents64`、`dup/dup2/dup3/fcntl`、`mmap/mprotect/munmap/brk`、`clone/execve/wait4/exit_group/set_tid_address`、`sched_yield`、COW、阻塞 wait、zombie/reparent、`uname` | 已实现并按模块和真实根盘链路验证，覆盖仍是明确子集 |
+| 进程与基础 syscall | `openat/read/close`、`write/writev`、`lseek/fstat/newfstatat/getdents64`、`dup/dup2/dup3/fcntl`、`mmap/mprotect/munmap/brk`、`clone`（自定义子栈 + vfork 共享地址空间）/`execve`/`wait4`（rusage）/`exit_group`/`set_tid_address`、`times`、`sched_yield`、COW、阻塞 wait、zombie/reparent、`uname` | 已实现并按模块和真实根盘链路验证，覆盖仍是明确子集 |
 | 阻塞唤醒与时间 | 通用等待队列（事件通道 + deadline）、全局 blocked 链不变量、`clock_gettime/clock_getres/gettimeofday`（REALTIME/MONOTONIC）、`clock_nanosleep/nanosleep`、goldfish RTC 启动墙钟、console read 阻塞等待 UART 输入 | 已实现并经 scheduler 单测与 musl 真实睡眠/时钟闭环验证；`times` 与每任务记账、信号驱动的可中断睡眠、PLIC 驱动接收仍是已知缺口 |
 | 用户态映像 | Linux 形态初始栈和 auxv、静态 `ET_EXEC`、匿名/文件私有按需页、W^X、指令同步 | RISC-V 已验证；动态 ELF、PIE、解释器和 TLS 尚未实现 |
 | 其他架构与平台 | LoongArch64 2K1000LA 的 16 KiB/三级页表；VisionFive 2 的 RISC-V 板级启动与设备/DMA 边界 | 目标已确认，开发板实机验证和 LoongArch 物化器尚未完成 |

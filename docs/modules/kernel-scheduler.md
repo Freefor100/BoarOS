@@ -74,7 +74,7 @@ enum kernel_scheduler_status kernel_scheduler_yield_current(void);
 
 ## 普通 clone 的资源语义
 
-当前只接受 Linux RISC-V `clone(SIGCHLD, 0, 0, 0, 0)`，语义等同普通 fork 进程：
+当前接受两种 Linux RISC-V 进程 clone 形态：`clone(SIGCHLD, 0, 0, 0, 0)`（fork）与 `clone(SIGCHLD|CLONE_VM|CLONE_VFORK, stack, 0, 0, 0)`（vfork）；fork 形态可传自定义子栈，非零 stack 替换子进程继承的用户 sp，其余 tid/TLS 指针参数返回 `-ENOTSUP`。fork 语义：
 
 - 子进程获得新 TID/TGID，线程组只有自己，进程组继承父进程；
 - RISC-V Trap Frame 完整复制，子进程 `a0=0`，父进程得到子 PID，两者都从 ecall 后一条指令继续；
@@ -82,6 +82,8 @@ enum kernel_scheduler_status kernel_scheduler_yield_current(void);
 - fd 表和 descriptor flags 独立复制，open file description 引用共享，因此 offset 与底层 file 生命周期共享；
 - fs context 独立复制当前 cwd，并继续借用同一个 root mount；
 - exec 清理事务不继承。
+
+vfork 语义：子进程经 `kernel_mm_acquire` 共享父地址空间（同一 record 页，引用计数），files/fs 仍独立复制；父进程在 clone syscall 内阻塞于自己的 `vfork_done_queue`，子进程在 exec 提交释放 retired mm 或退出清理释放共享引用时各唤醒一次（第二次为空队列空转）。父进程恢复后可直接观察子进程对共享地址空间的修改（如 brk）。VFORK 无 CLONE_VM 的组合返回 `-ENOTSUP`。无线程组的 `exit_group` 与 `exit` 等价。
 
 构造过程在子任务进入父子树和 ready 队列前完成。失败先释放已经取得的 fs/files/MM/TID/任务页；不能立即完成的 owner 放入不发布 completion 的 exited 清理队列，父进程仍得到准确的 `-ENOMEM` 或 `-EAGAIN`，不会看到半构造子进程。
 
@@ -108,7 +110,7 @@ ZOMBIE  -- matching parent wait4 --------------> PID/task page released
 EXITED  -- parentless retry complete -----------> PID/task page released
 ```
 
-`wait4` 支持 `pid>0`、`pid==0`、`pid==-1` 和 `pid<-1` 的 Linux 选择规则，并接受 `WNOHANG/WUNTRACED/WCONTINUED/__WNOTHREAD/__WALL/__WCLONE` 位。当前没有 stopped/continued 事件，因此后两类选项只影响等待集合，不会制造事件。普通 SIGCHLD 子进程被 `__WCLONE` 排除，除非同时使用 `__WALL`。无匹配子进程返回 `-ECHILD`；有匹配但无事件时 `WNOHANG` 返回 0，否则父进程进入 BLOCKED，由子进程成为 zombie 时唤醒。
+`wait4` 支持 `pid>0`、`pid==0`、`pid==-1` 和 `pid<-1` 的 Linux 选择规则，并接受 `WNOHANG/WUNTRACED/WCONTINUED/__WNOTHREAD/__WALL/__WCLONE` 位。当前没有 stopped/continued 事件，因此后两类选项只影响等待集合，不会制造事件。普通 SIGCHLD 子进程被 `__WCLONE` 排除，除非同时使用 `__WALL`。无匹配子进程返回 `-ECHILD`；有匹配但无事件时 `WNOHANG` 返回 0，否则父进程经通用等待队列阻塞在自己的 `child_exit_queue` 上，由子进程成为 zombie 时唤醒。rusage 非空时在回收点填 `struct kernel_linux_rusage`（144 字节）：`ru_utime/ru_stime` 来自被回收子进程自身与孙辈回卷的 tick 记账，其余字段为 0，坏指针返回 `-EFAULT` 且子进程同样已回收。
 
 退出码编码为 `(status & 0xff) << 8`。已分类的页访问错误以内部 `SIGNAL` 原因保存 `SIGSEGV(11)` 或 `SIGBUS(7)`；其他用户同步故障按 scause 转换为 SIGILL/SIGTRAP/SIGBUS/SIGSEGV 形态 wait status。用户缺页耗尽物理页时，内部 completion 保留 `RESOURCE/NO_MEMORY`，父进程看到 SIGKILL 形态的 wait status 9。当前这只是不可捕获的终止与 wait 编码，还没有信号投递/handler。非空 rusage 当前返回 `-ENOTSUP`；未知 option 返回 `-EINVAL`，无法安全取负的 `INT32_MIN` pid 返回 `-ESRCH`。与 Linux 回收顺序一致，zombie 先被逻辑回收，再向用户复制 status；因此 status 指针错误返回 `-EFAULT` 时，该子进程也已不可再次 wait。
 
