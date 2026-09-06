@@ -5,6 +5,7 @@
 #include <arch/riscv/sbi.h>
 #include <arch/riscv/sv39.h>
 #include <arch/riscv/timer.h>
+#include <arch/riscv/virt_rtc.h>
 #include <arch/riscv/virt_uart.h>
 #include <kernel/boot_memory.h>
 #include <kernel/dtb.h>
@@ -12,6 +13,7 @@
 #include <kernel/physical_page.h>
 #include <kernel/scheduler.h>
 #include <kernel/tick.h>
+#include <kernel/time.h>
 
 #include <stdint.h>
 
@@ -131,6 +133,21 @@ static void shutdown_for_direct_map_error(void) __attribute__((noreturn));
 static void shutdown_for_direct_map_error(void)
 {
     virt_uart_puts("BoarOS: direct map verification failed\n");
+    sbi_shutdown();
+}
+
+static void shutdown_for_time_error(enum kernel_time_status status)
+    __attribute__((noreturn));
+
+static void shutdown_for_time_error(enum kernel_time_status status)
+{
+    if (status == KERNEL_TIME_STATUS_INVALID_ARGUMENT) {
+        virt_uart_puts("BoarOS: invalid time argument\n");
+    } else if (status == KERNEL_TIME_STATUS_ALREADY_INITIALIZED) {
+        virt_uart_puts("BoarOS: time already initialized\n");
+    } else {
+        virt_uart_puts("BoarOS: unknown time startup error\n");
+    }
     sbi_shutdown();
 }
 
@@ -464,6 +481,12 @@ static enum riscv_sv39_status build_kernel_page_table(
     if (status != RISCV_SV39_STATUS_OK) {
         return status;
     }
+    status = map_mmio_alias(&kernel_page_table,
+                            VIRT_RTC_MMIO_PHYSICAL_BASE,
+                            VIRT_RTC_MMIO_SIZE);
+    if (status != RISCV_SV39_STATUS_OK) {
+        return status;
+    }
     for (index = 0U; index < info->virtio_mmio_count; index++) {
         status = map_mmio_alias(&kernel_page_table,
                                 info->virtio_mmio[index].base,
@@ -596,8 +619,10 @@ void kernel_main(unsigned long hart_id, const void *dtb)
     enum physical_page_status page_status;
     enum riscv_sv39_status sv39_status;
     enum riscv_timer_status timer_status;
+    enum kernel_time_status time_status;
     enum kernel_scheduler_status scheduler_status;
     enum riscv_root_boot_status root_status;
+    uint64_t boot_realtime_ns = 0;
     int root_started = 0;
 
     if (dtb_status != DTB_STATUS_OK) {
@@ -737,6 +762,16 @@ void kernel_main(unsigned long hart_id, const void *dtb)
     virt_uart_puts(" satp=");
     virt_uart_put_hex((unsigned long)riscv_sv39_current_satp());
     virt_uart_putc('\n');
+
+    if (riscv_virt_rtc_read_ns(&boot_realtime_ns) !=
+        RISCV_VIRT_RTC_STATUS_OK) {
+        boot_realtime_ns = 0;
+    }
+    time_status = kernel_time_init(info.timebase_frequency,
+                                   boot_realtime_ns);
+    if (time_status != KERNEL_TIME_STATUS_OK) {
+        shutdown_for_time_error(time_status);
+    }
 
     timer_status = riscv_timer_start(info.timebase_frequency,
                                      KERNEL_TICKS_PER_SECOND);

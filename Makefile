@@ -110,6 +110,7 @@ C_SOURCES := \
 	arch/riscv/trap.c \
 	arch/riscv/uaccess.c \
 	arch/riscv/user_elf.c \
+	arch/riscv/virt_rtc.c \
 	arch/riscv/virt_uart.c \
 	arch/riscv/virtio_mmio_block.c \
 	fs/lwext4_port.c \
@@ -133,6 +134,7 @@ C_SOURCES := \
 	kernel/sched/wait.c \
 	kernel/syscall.c \
 	kernel/tick.c \
+	kernel/time.c \
 	lib/qsort.c \
 	lib/string.c \
 	mm/vma.c \
@@ -155,6 +157,7 @@ TEST_RUNTIME_C_SOURCES := \
 	arch/riscv/trap.c \
 	arch/riscv/uaccess.c \
 	arch/riscv/user_elf.c \
+	arch/riscv/virt_rtc.c \
 	arch/riscv/virt_uart.c \
 	arch/riscv/virtio_mmio_block.c \
 	fs/files.c \
@@ -175,6 +178,7 @@ TEST_RUNTIME_C_SOURCES := \
 	kernel/sched/wait.c \
 	kernel/syscall.c \
 	kernel/tick.c \
+	kernel/time.c \
 	lib/qsort.c \
 	lib/string.c \
 	mm/vma.c \

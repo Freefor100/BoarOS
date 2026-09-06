@@ -1,12 +1,14 @@
 /* The first compiler-generated BoarOS user program: a static musl
  * binary exercising stdio, directory enumeration, regular-file reads,
- * and descriptor duplication against the Linux ABI surface. */
+ * descriptor duplication, and the clock ABI against the Linux surface. */
 
 #include <dirent.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 
 int main(void)
@@ -62,6 +64,44 @@ int main(void)
         return 9;
     }
     close(fd);
+
+    /* Clocks: monotonic must advance, realtime must dominate it, and
+     * gettimeofday must agree with clock_gettime on the same clock. */
+    struct timespec mono_before;
+    struct timespec mono_after;
+    struct timespec realtime;
+    if (clock_gettime(CLOCK_MONOTONIC, &mono_before) != 0) {
+        return 10;
+    }
+    for (volatile unsigned long spin = 0; spin < 200000UL; spin++) {
+    }
+    if (clock_gettime(CLOCK_MONOTONIC, &mono_after) != 0) {
+        return 11;
+    }
+    if (mono_after.tv_sec < mono_before.tv_sec ||
+        (mono_after.tv_sec == mono_before.tv_sec &&
+         mono_after.tv_nsec <= mono_before.tv_nsec)) {
+        return 12;
+    }
+    if (clock_gettime(CLOCK_REALTIME, &realtime) != 0) {
+        return 13;
+    }
+    /* The virt board's goldfish RTC must back CLOCK_REALTIME with a
+     * plausible wall clock; boot-relative time would sit near zero. */
+    if (realtime.tv_sec < (time_t)1577836800L) {
+        return 14;
+    }
+    struct timeval day;
+    if (gettimeofday(&day, 0) != 0) {
+        return 15;
+    }
+    long realtime_seconds = (long)realtime.tv_sec;
+    if (day.tv_sec < realtime_seconds || day.tv_sec > realtime_seconds + 1) {
+        return 16;
+    }
+    if (write(1, "BoarOS: real userland clock checks ok\n", 38) != 38) {
+        return 17;
+    }
 
     return 42;
 }

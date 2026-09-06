@@ -64,6 +64,11 @@ if [ "$(grep -cxF 'BoarOS: real userland file checks ok' "$output" || true)" -ne
     echo "real userland program did not complete the file checks" >&2
     exit 1
 fi
+if [ "$(grep -cxF 'BoarOS: real userland clock checks ok' "$output" || true)" -ne 1 ]; then
+    tail -n 120 "$output" >&2
+    echo "real userland program did not complete the clock checks" >&2
+    exit 1
+fi
 if [ "$(grep -cE '^BoarOS: PID 1 exited status=0x2a pages=0x[1-9a-f][0-9a-f]* heap-live=0x0; shutting down$' "$output" || true)" -ne 1 ]; then
     tail -n 120 "$output" >&2
     echo "real userland program did not exit cleanly with all resources reaped" >&2

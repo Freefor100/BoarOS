@@ -3,6 +3,7 @@
 #include <kernel/mm.h>
 #include <kernel/open_file.h>
 #include <kernel/task.h>
+#include <kernel/time.h>
 
 #include <stdint.h>
 
@@ -1000,6 +1001,77 @@ static unsigned long run_memory_mapping_cases(void)
     return failures;
 }
 
+static unsigned long run_time_cases(void)
+{
+    struct kernel_syscall_request request = {0};
+    struct kernel_syscall_result result;
+    unsigned long failures = 0U;
+    struct kernel_task *caller = (struct kernel_task *)(uintptr_t)1U;
+
+    /* Conversion math at the initialized 10 MHz timebase. */
+    if (kernel_time_init(10000000U, UINT64_C(1577836800000000000)) !=
+        KERNEL_TIME_STATUS_OK) {
+        failures++;
+    }
+    if (kernel_time_init(10000000U, 0U) !=
+        KERNEL_TIME_STATUS_ALREADY_INITIALIZED) {
+        failures++;
+    }
+    if (kernel_time_init(0U, 0U) != KERNEL_TIME_STATUS_INVALID_ARGUMENT) {
+        failures++;
+    }
+    if (kernel_time_ticks_to_ns(0U) != 0U ||
+        kernel_time_ticks_to_ns(UINT64_C(10000000)) !=
+            UINT64_C(1000000000) ||
+        kernel_time_ticks_to_ns(UINT64_C(4294967296)) !=
+            UINT64_C(429496729600)) {
+        failures++;
+    }
+    if (kernel_time_is_initialized() != 1U) {
+        failures++;
+    }
+
+    request.arguments[0] = 0U;
+    request.number = 124U;
+    if (kernel_syscall_dispatch(caller, &request, &result) !=
+            KERNEL_SYSCALL_STATUS_OK ||
+        result_changed(&result, KERNEL_SYSCALL_ACTION_YIELD, 0)) {
+        failures++;
+    }
+
+    request.number = 113U;
+    request.arguments[0] = 2U;
+    if (kernel_syscall_dispatch(caller, &request, &result) !=
+            KERNEL_SYSCALL_STATUS_OK ||
+        result_changed(&result, KERNEL_SYSCALL_ACTION_RETURN, -22)) {
+        failures++;
+    }
+    request.arguments[0] = UINT64_MAX;
+    if (kernel_syscall_dispatch(caller, &request, &result) !=
+            KERNEL_SYSCALL_STATUS_OK ||
+        result_changed(&result, KERNEL_SYSCALL_ACTION_RETURN, -22)) {
+        failures++;
+    }
+
+    request.number = 114U;
+    request.arguments[0] = 42U;
+    if (kernel_syscall_dispatch(caller, &request, &result) !=
+            KERNEL_SYSCALL_STATUS_OK ||
+        result_changed(&result, KERNEL_SYSCALL_ACTION_RETURN, -22)) {
+        failures++;
+    }
+
+    request.number = 169U;
+    request.arguments[0] = 0U;
+    if (kernel_syscall_dispatch(caller, &request, &result) !=
+            KERNEL_SYSCALL_STATUS_OK ||
+        result_changed(&result, KERNEL_SYSCALL_ACTION_RETURN, 0)) {
+        failures++;
+    }
+
+    return failures;
+}
+
 unsigned long run_syscall_cases(void)
 {
     unsigned long failures = run_invalid_argument_cases();
@@ -1012,5 +1084,6 @@ unsigned long run_syscall_cases(void)
     failures += run_dup_fcntl_decode_cases();
     failures += run_brk_cases();
     failures += run_memory_mapping_cases();
+    failures += run_time_cases();
     return failures;
 }

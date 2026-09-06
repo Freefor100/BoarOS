@@ -7,6 +7,7 @@
 #include <kernel/page.h>
 #include <kernel/syscall.h>
 #include <kernel/task.h>
+#include <kernel/time.h>
 #include <kernel/uaccess.h>
 
 #include <stddef.h>
@@ -31,6 +32,12 @@
 #define LINUX_SYSCALL_GETTID 178U
 #define LINUX_SYSCALL_BRK 214U
 #define LINUX_SYSCALL_SCHED_YIELD 124U
+#define LINUX_SYSCALL_CLOCK_GETTIME 113U
+#define LINUX_SYSCALL_CLOCK_GETRES 114U
+#define LINUX_SYSCALL_GETTIMEOFDAY 169U
+#define LINUX_CLOCK_REALTIME 0U
+#define LINUX_CLOCK_MONOTONIC 1U
+#define LINUX_CLOCK_NSECS_PER_SEC UINT64_C(1000000000)
 #define LINUX_SYSCALL_MUNMAP 215U
 #define LINUX_SYSCALL_CLONE 220U
 #define LINUX_SYSCALL_EXECVE 221U
@@ -119,6 +126,139 @@ static enum kernel_syscall_status decode_uname(
     decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
     decoded->value = 0;
     return KERNEL_SYSCALL_STATUS_OK;
+}
+
+/*
+ * clockid support covers the clocks the kernel can actually back:
+ * CLOCK_REALTIME from the boot RTC reading plus the time counter, and
+ * CLOCK_MONOTONIC from the time counter.  Everything else reports EINVAL.
+ */
+static int decode_clock_id_valid(uint64_t clock_id)
+{
+    return clock_id == LINUX_CLOCK_REALTIME || clock_id == LINUX_CLOCK_MONOTONIC;
+}
+
+static void decode_split_nanoseconds(uint64_t nanoseconds,
+                                     int64_t *seconds,
+                                     int64_t *sub_nanoseconds)
+{
+    *seconds = (int64_t)(nanoseconds / LINUX_CLOCK_NSECS_PER_SEC);
+    *sub_nanoseconds = (int64_t)(nanoseconds % LINUX_CLOCK_NSECS_PER_SEC);
+}
+
+/* timespec and timeval share the {i64, i64} riscv64 layout. */
+static enum kernel_syscall_status decode_copy_time_out(
+    struct kernel_task *caller,
+    uint64_t user_address,
+    int64_t seconds,
+    int64_t sub_seconds,
+    struct kernel_syscall_result *decoded)
+{
+    struct kernel_mm *mm;
+    struct {
+        int64_t seconds;
+        int64_t sub_seconds;
+    } value;
+    size_t copied;
+    enum kernel_task_status task_status;
+    enum kernel_uaccess_status access_status;
+
+    value.seconds = seconds;
+    value.sub_seconds = sub_seconds;
+
+    task_status = kernel_task_mm_borrow_mutable(caller, &mm);
+    if (task_status != KERNEL_TASK_STATUS_OK) {
+        return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    }
+    access_status = kernel_copy_to_user(mm,
+                                        user_address,
+                                        &value,
+                                        sizeof(value),
+                                        &copied);
+    if (access_status == KERNEL_UACCESS_STATUS_FAULT) {
+        decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+        decoded->value = -KERNEL_EFAULT;
+        return KERNEL_SYSCALL_STATUS_OK;
+    }
+    if (access_status != KERNEL_UACCESS_STATUS_OK ||
+        copied != sizeof(value)) {
+        return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    }
+    decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+    decoded->value = 0;
+    return KERNEL_SYSCALL_STATUS_OK;
+}
+
+static enum kernel_syscall_status decode_clock_gettime(
+    struct kernel_task *caller,
+    const struct kernel_syscall_request *request,
+    struct kernel_syscall_result *decoded)
+{
+    uint64_t nanoseconds;
+    int64_t seconds;
+    int64_t sub_nanoseconds;
+
+    if (!decode_clock_id_valid(request->arguments[0])) {
+        decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+        decoded->value = -KERNEL_EINVAL;
+        return KERNEL_SYSCALL_STATUS_OK;
+    }
+    nanoseconds = request->arguments[0] == LINUX_CLOCK_REALTIME
+                      ? kernel_time_realtime_ns()
+                      : kernel_time_monotonic_ns();
+    decode_split_nanoseconds(nanoseconds, &seconds, &sub_nanoseconds);
+    return decode_copy_time_out(caller,
+                                request->arguments[1],
+                                seconds,
+                                sub_nanoseconds,
+                                decoded);
+}
+
+static enum kernel_syscall_status decode_clock_getres(
+    struct kernel_task *caller,
+    const struct kernel_syscall_request *request,
+    struct kernel_syscall_result *decoded)
+{
+    if (!decode_clock_id_valid(request->arguments[0])) {
+        decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+        decoded->value = -KERNEL_EINVAL;
+        return KERNEL_SYSCALL_STATUS_OK;
+    }
+    if (request->arguments[1] == 0U) {
+        decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+        decoded->value = 0;
+        return KERNEL_SYSCALL_STATUS_OK;
+    }
+    /* Nanosecond time-counter resolution. */
+    return decode_copy_time_out(caller,
+                                request->arguments[1],
+                                0,
+                                1,
+                                decoded);
+}
+
+static enum kernel_syscall_status decode_gettimeofday(
+    struct kernel_task *caller,
+    const struct kernel_syscall_request *request,
+    struct kernel_syscall_result *decoded)
+{
+    uint64_t nanoseconds;
+    int64_t seconds;
+    int64_t sub_nanoseconds;
+
+    if (request->arguments[0] == 0U) {
+        /* Linux returns success for a NULL timeval; tz is ignored. */
+        decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+        decoded->value = 0;
+        return KERNEL_SYSCALL_STATUS_OK;
+    }
+    nanoseconds = kernel_time_realtime_ns();
+    decode_split_nanoseconds(nanoseconds, &seconds, &sub_nanoseconds);
+    return decode_copy_time_out(caller,
+                                request->arguments[0],
+                                seconds,
+                                sub_nanoseconds / 1000,
+                                decoded);
 }
 
 static enum kernel_syscall_status decode_openat(
@@ -942,6 +1082,21 @@ enum kernel_syscall_status kernel_syscall_dispatch(
     } else if (request->number == LINUX_SYSCALL_SCHED_YIELD) {
         decoded.action = KERNEL_SYSCALL_ACTION_YIELD;
         decoded.value = 0;
+    } else if (request->number == LINUX_SYSCALL_CLOCK_GETTIME) {
+        if (decode_clock_gettime(caller, request, &decoded) !=
+            KERNEL_SYSCALL_STATUS_OK) {
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+        }
+    } else if (request->number == LINUX_SYSCALL_CLOCK_GETRES) {
+        if (decode_clock_getres(caller, request, &decoded) !=
+            KERNEL_SYSCALL_STATUS_OK) {
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+        }
+    } else if (request->number == LINUX_SYSCALL_GETTIMEOFDAY) {
+        if (decode_gettimeofday(caller, request, &decoded) !=
+            KERNEL_SYSCALL_STATUS_OK) {
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+        }
     } else {
         decoded.action = KERNEL_SYSCALL_ACTION_RETURN;
         decoded.value = -KERNEL_ENOSYS;
