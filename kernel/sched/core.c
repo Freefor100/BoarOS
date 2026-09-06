@@ -895,3 +895,18 @@ enum kernel_scheduler_status kernel_scheduler_yield_current(void)
     ready_append(previous);
     return scheduler_switch_current_away(previous);
 }
+
+void kernel_scheduler_charge_ticks(uint64_t elapsed_ticks, int from_user)
+{
+    struct kernel_task *current = scheduler.current;
+
+    if (current == 0 || current == &scheduler.idle ||
+        current->magic != KERNEL_THREAD_MAGIC) {
+        return;
+    }
+    if (from_user) {
+        current->user_ticks += elapsed_ticks;
+    } else {
+        current->kernel_ticks += elapsed_ticks;
+    }
+}

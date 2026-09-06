@@ -8,6 +8,7 @@
 #include <kernel/scheduler.h>
 #include <kernel/syscall.h>
 #include <kernel/task.h>
+#include <kernel/tick.h>
 #include <kernel/time.h>
 #include <kernel/uaccess.h>
 
@@ -38,6 +39,7 @@
 #define LINUX_SYSCALL_NANOSLEEP 101U
 #define LINUX_SYSCALL_CLOCK_NANOSLEEP 115U
 #define LINUX_SYSCALL_GETTIMEOFDAY 169U
+#define LINUX_SYSCALL_TIMES 153U
 #define LINUX_CLOCK_REALTIME 0U
 #define LINUX_CLOCK_MONOTONIC 1U
 #define LINUX_CLOCK_NSECS_PER_SEC UINT64_C(1000000000)
@@ -151,24 +153,17 @@ static void decode_split_nanoseconds(uint64_t nanoseconds,
 }
 
 /* timespec and timeval share the {i64, i64} riscv64 layout. */
-static enum kernel_syscall_status decode_copy_time_out(
+static enum kernel_syscall_status decode_copy_out(
     struct kernel_task *caller,
     uint64_t user_address,
-    int64_t seconds,
-    int64_t sub_seconds,
+    const void *kernel_source,
+    size_t size,
     struct kernel_syscall_result *decoded)
 {
     struct kernel_mm *mm;
-    struct {
-        int64_t seconds;
-        int64_t sub_seconds;
-    } value;
     size_t copied;
     enum kernel_task_status task_status;
     enum kernel_uaccess_status access_status;
-
-    value.seconds = seconds;
-    value.sub_seconds = sub_seconds;
 
     task_status = kernel_task_mm_borrow_mutable(caller, &mm);
     if (task_status != KERNEL_TASK_STATUS_OK) {
@@ -176,8 +171,8 @@ static enum kernel_syscall_status decode_copy_time_out(
     }
     access_status = kernel_copy_to_user(mm,
                                         user_address,
-                                        &value,
-                                        sizeof(value),
+                                        kernel_source,
+                                        size,
                                         &copied);
     if (access_status == KERNEL_UACCESS_STATUS_FAULT) {
         decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
@@ -185,12 +180,33 @@ static enum kernel_syscall_status decode_copy_time_out(
         return KERNEL_SYSCALL_STATUS_OK;
     }
     if (access_status != KERNEL_UACCESS_STATUS_OK ||
-        copied != sizeof(value)) {
+        copied != size) {
         return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     }
     decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
     decoded->value = 0;
     return KERNEL_SYSCALL_STATUS_OK;
+}
+
+static enum kernel_syscall_status decode_copy_time_out(
+    struct kernel_task *caller,
+    uint64_t user_address,
+    int64_t seconds,
+    int64_t sub_seconds,
+    struct kernel_syscall_result *decoded)
+{
+    struct {
+        int64_t seconds;
+        int64_t sub_seconds;
+    } value;
+
+    value.seconds = seconds;
+    value.sub_seconds = sub_seconds;
+    return decode_copy_out(caller,
+                           user_address,
+                           &value,
+                           sizeof(value),
+                           decoded);
 }
 
 static enum kernel_syscall_status decode_clock_gettime(
@@ -269,6 +285,68 @@ struct linux_timespec {
     int64_t tv_sec;
     int64_t tv_nsec;
 };
+
+struct linux_tms {
+    int64_t utime;
+    int64_t stime;
+    int64_t cutime;
+    int64_t cstime;
+};
+
+/*
+ * times(153): fills the optional tms buffer with scheduler-tick CPU
+ * accounting (CLK_TCK = KERNEL_TICKS_PER_SECOND) and returns the tick
+ * count since boot.  A NULL tms pointer only samples the uptime ticks.
+ */
+static enum kernel_syscall_status decode_times(
+    struct kernel_task *caller,
+    uint64_t tms_address,
+    struct kernel_syscall_result *decoded)
+{
+    uint64_t user_ticks;
+    uint64_t kernel_ticks;
+    uint64_t child_user_ticks;
+    uint64_t child_kernel_ticks;
+
+    kernel_task_cpu_ticks(caller,
+                          &user_ticks,
+                          &kernel_ticks,
+                          &child_user_ticks,
+                          &child_kernel_ticks);
+    if (tms_address != 0U) {
+        struct kernel_mm *mm;
+        struct linux_tms value;
+        size_t copied;
+        enum kernel_task_status task_status;
+        enum kernel_uaccess_status access_status;
+
+        value.utime = (int64_t)user_ticks;
+        value.stime = (int64_t)kernel_ticks;
+        value.cutime = (int64_t)child_user_ticks;
+        value.cstime = (int64_t)child_kernel_ticks;
+        task_status = kernel_task_mm_borrow_mutable(caller, &mm);
+        if (task_status != KERNEL_TASK_STATUS_OK) {
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+        }
+        access_status = kernel_copy_to_user(mm,
+                                            tms_address,
+                                            &value,
+                                            sizeof(value),
+                                            &copied);
+        if (access_status == KERNEL_UACCESS_STATUS_FAULT) {
+            decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+            decoded->value = -KERNEL_EFAULT;
+            return KERNEL_SYSCALL_STATUS_OK;
+        }
+        if (access_status != KERNEL_UACCESS_STATUS_OK ||
+            copied != sizeof(value)) {
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+        }
+    }
+    decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+    decoded->value = (int64_t)kernel_tick_count();
+    return KERNEL_SYSCALL_STATUS_OK;
+}
 
 /*
  * Shared core of nanosleep(101) and clock_nanosleep(115).  The requested
@@ -1242,6 +1320,11 @@ enum kernel_syscall_status kernel_syscall_dispatch(
         }
     } else if (request->number == LINUX_SYSCALL_GETTIMEOFDAY) {
         if (decode_gettimeofday(caller, request, &decoded) !=
+            KERNEL_SYSCALL_STATUS_OK) {
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+        }
+    } else if (request->number == LINUX_SYSCALL_TIMES) {
+        if (decode_times(caller, request->arguments[0], &decoded) !=
             KERNEL_SYSCALL_STATUS_OK) {
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
         }

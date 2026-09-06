@@ -115,6 +115,7 @@ void riscv_trap_dispatch(struct riscv_trap_frame *frame)
             riscv_timer_fatal(frame, status);
         }
         kernel_tick_advance(elapsed_ticks);
+        kernel_scheduler_charge_ticks(elapsed_ticks, (int)from_user);
         {
             enum kernel_scheduler_status scheduler_status =
                 kernel_scheduler_expire_deadlines(riscv_time_read());

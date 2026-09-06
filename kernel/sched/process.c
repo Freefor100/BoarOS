@@ -1136,6 +1136,21 @@ enum kernel_task_status kernel_task_ppid(
     return KERNEL_TASK_STATUS_OK;
 }
 
+void kernel_task_cpu_ticks(const struct kernel_task *task,
+                           uint64_t *user_ticks,
+                           uint64_t *kernel_ticks,
+                           uint64_t *child_user_ticks,
+                           uint64_t *child_kernel_ticks)
+{
+    if (task == 0 || task->magic != KERNEL_THREAD_MAGIC) {
+        return;
+    }
+    *user_ticks = task->user_ticks;
+    *kernel_ticks = task->kernel_ticks;
+    *child_user_ticks = task->child_user_ticks;
+    *child_kernel_ticks = task->child_kernel_ticks;
+}
+
 enum kernel_task_status kernel_task_mm_borrow(
     const struct kernel_task *task,
     const struct kernel_mm **mm)

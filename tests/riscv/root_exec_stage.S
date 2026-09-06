@@ -459,6 +459,31 @@ _start:
     ecall
     li t0, -10
     bne a0, t0, .Lfailure
+
+    # times(153): after spinning, own CPU time is nonzero, child roll-up
+    # fields are non-negative, and uptime ticks dominate all of them.
+    li t4, 20000000
+.Ltimes_spin:
+    addi t4, t4, -1
+    bnez t4, .Ltimes_spin
+    la a0, .Ltms
+    li a7, 153
+    ecall
+    bltz a0, .Lfailure
+    beqz a0, .Lfailure
+    la t0, .Ltms
+    ld t1, 0(t0)
+    ld t2, 8(t0)
+    ld t3, 16(t0)
+    ld t5, 24(t0)
+    add t1, t1, t2
+    beqz t1, .Lfailure
+    bltz t3, .Lfailure
+    bltz t5, .Lfailure
+    add t2, t1, t3
+    add t2, t2, t5
+    bgeu t2, a0, .Lfailure
+
     li a0, 0x2a
     li a7, 93
     ecall
@@ -589,6 +614,8 @@ _start:
     .skip 8
 .Lheap_fault_address:
     .skip 8
+.Ltms:
+    .skip 32
 
     .section .data, "aw", @progbits
     .balign 8

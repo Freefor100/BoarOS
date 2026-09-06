@@ -271,6 +271,26 @@ enum kernel_task_status __wrap_kernel_task_set_tid_address(
     return KERNEL_TASK_STATUS_OK;
 }
 
+static uint64_t ticks_user;
+static uint64_t ticks_kernel;
+static uint64_t ticks_child_user;
+static uint64_t ticks_child_kernel;
+
+void __wrap_kernel_task_cpu_ticks(const struct kernel_task *task,
+                                  uint64_t *user_ticks,
+                                  uint64_t *kernel_ticks,
+                                  uint64_t *child_user_ticks,
+                                  uint64_t *child_kernel_ticks)
+{
+    if (task != (struct kernel_task *)(uintptr_t)1U) {
+        return;
+    }
+    *user_ticks = ticks_user;
+    *kernel_ticks = ticks_kernel;
+    *child_user_ticks = ticks_child_user;
+    *child_kernel_ticks = ticks_child_kernel;
+}
+
 enum kernel_files_status __wrap_kernel_files_getdents(
     struct kernel_files *files,
     struct kernel_mm *mm,
@@ -1063,6 +1083,16 @@ static unsigned long run_time_cases(void)
     }
 
     request.number = 169U;
+    request.arguments[0] = 0U;
+    if (kernel_syscall_dispatch(caller, &request, &result) !=
+            KERNEL_SYSCALL_STATUS_OK ||
+        result_changed(&result, KERNEL_SYSCALL_ACTION_RETURN, 0)) {
+        failures++;
+    }
+
+    /* times() with a NULL tms buffer only samples the uptime tick count,
+     * which stays zero while the test kernel never starts the timer. */
+    request.number = 153U;
     request.arguments[0] = 0U;
     if (kernel_syscall_dispatch(caller, &request, &result) !=
             KERNEL_SYSCALL_STATUS_OK ||

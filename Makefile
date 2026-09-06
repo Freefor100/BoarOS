@@ -597,6 +597,7 @@ $(SYSCALL_TEST_KERNEL_RV): $(SYSCALL_TEST_OBJECTS) arch/riscv/linker.ld
 	-Wl,--wrap=kernel_task_files_borrow \
 	-Wl,--wrap=kernel_task_fs_context_borrow \
 	-Wl,--wrap=kernel_task_set_tid_address \
+	-Wl,--wrap=kernel_task_cpu_ticks \
 	-Wl,--wrap=kernel_files_pin \
 	-Wl,--wrap=kernel_files_write \
 	-Wl,--wrap=kernel_files_writev \

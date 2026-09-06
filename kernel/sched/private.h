@@ -54,6 +54,10 @@ struct kernel_task {
     struct kernel_wait_queue *wait_queue;
     uint64_t wakeup_deadline;
     uint32_t wake_reason;
+    uint64_t user_ticks;
+    uint64_t kernel_ticks;
+    uint64_t child_user_ticks;
+    uint64_t child_kernel_ticks;
     struct kernel_task *group_leader;
     uint32_t group_members;
     struct kernel_thread_completion completion;

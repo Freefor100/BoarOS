@@ -126,6 +126,13 @@ enum kernel_scheduler_status kernel_scheduler_expire_deadlines(uint64_t now);
 /* Requeues the current task behind any ready task and switches away. */
 enum kernel_scheduler_status kernel_scheduler_yield_current(void);
 
+/*
+ * Timer-interrupt path: credits `elapsed_ticks` to the interrupted task
+ * as user or kernel time.  The idle task is never charged.  Call with
+ * interrupts disabled before any switch decisions.
+ */
+void kernel_scheduler_charge_ticks(uint64_t elapsed_ticks, int from_user);
+
 /* Resolves a hardware fault in the running user task's active MM. */
 enum kernel_mm_status kernel_scheduler_resolve_current_user_fault(
     uint64_t virtual_address,

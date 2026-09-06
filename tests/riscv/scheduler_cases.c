@@ -6,6 +6,7 @@
 #include <kernel/physical_page.h>
 #include <kernel/pid.h>
 #include <kernel/scheduler.h>
+#include <kernel/task.h>
 
 #include <stdint.h>
 
@@ -417,6 +418,62 @@ static void yielding_worker(void *argument)
     yield_runs++;
 }
 
+static volatile unsigned long charged_user;
+static volatile unsigned long charged_kernel;
+
+static void charging_worker(void *argument)
+{
+    uint64_t user_ticks = 0;
+    uint64_t kernel_ticks = 0;
+    uint64_t child_user = 0;
+    uint64_t child_kernel = 0;
+
+    (void)argument;
+    kernel_scheduler_charge_ticks(5U, 1);
+    kernel_scheduler_charge_ticks(3U, 0);
+    kernel_task_cpu_ticks(kernel_task_current(),
+                          &user_ticks,
+                          &kernel_ticks,
+                          &child_user,
+                          &child_kernel);
+    charged_user = (unsigned long)user_ticks;
+    charged_kernel = (unsigned long)kernel_ticks;
+}
+
+static unsigned long run_accounting_cases(
+    struct physical_page_allocator *allocator)
+{
+    uint64_t initial_available = physical_page_available(allocator);
+    struct kernel_thread_completion completion = {
+        .kind = (enum kernel_thread_kind)0,
+        .reason = (enum kernel_thread_exit_reason)0,
+        .status = 0U,
+        .detail = 0U,
+    };
+    unsigned long failures = 0U;
+
+    /* Charging with no published current is a no-op. */
+    kernel_scheduler_charge_ticks(7U, 1);
+
+    failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
+                              kernel_thread_create(charging_worker, 0));
+    failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
+                              kernel_scheduler_on_tick(1U));
+    if (charged_user != 5U || charged_kernel != 3U) {
+        failures++;
+    }
+    failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
+                              kernel_scheduler_reap_one(&completion));
+    if (completion.kind != KERNEL_THREAD_KIND_KERNEL ||
+        completion.reason != KERNEL_THREAD_EXIT_RETURNED ||
+        completion.status != 0U || completion.detail != 0U ||
+        physical_page_available(allocator) != initial_available) {
+        failures++;
+    }
+
+    return failures;
+}
+
 static unsigned long run_wait_cases(
     struct physical_page_allocator *allocator)
 {
@@ -588,6 +645,7 @@ void kernel_main(unsigned long hart_id, const void *dtb)
     failures += run_idle_cases();
     failures += run_create_cases(&allocator);
     failures += run_wait_cases(&allocator);
+    failures += run_accounting_cases(&allocator);
 
     virt_uart_puts("BoarOS: scheduler cases failures=");
     virt_uart_put_hex(failures);

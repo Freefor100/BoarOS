@@ -55,4 +55,14 @@ enum kernel_task_status kernel_task_fs_context_borrow(
     const struct kernel_task *task,
     const struct kernel_fs_context **fs);
 
+/*
+ * CPU accounting in scheduler ticks: own user/kernel time plus the rolled
+ * up time of reaped children.
+ */
+void kernel_task_cpu_ticks(const struct kernel_task *task,
+                           uint64_t *user_ticks,
+                           uint64_t *kernel_ticks,
+                           uint64_t *child_user_ticks,
+                           uint64_t *child_kernel_ticks);
+
 #endif
