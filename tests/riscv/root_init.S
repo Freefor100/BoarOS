@@ -34,8 +34,8 @@ _start:
     bnez t0, .Lfailure
 
     # PID 1 starts with the console on fd 0/1/2: write(1) emits the marker
-    # through the serial console, and read(0) reports the empty input
-    # stream as EOF.
+    # through the serial console.  read(0) blocks until input arrives, which
+    # the serial-fed real-userland run covers; no probe here.
     la a1, .Lstdio_marker
     la t0, .Lstdio_marker_end
     sub a2, t0, a1
@@ -48,12 +48,6 @@ _start:
     sub t0, t0, t1
     addi t0, t0, -1
     bne a0, t0, .Lfailure
-    li a0, 0
-    la a1, .Lread_buffer
-    li a2, 1
-    li a7, 63
-    ecall
-    bnez a0, .Lfailure
 
     # Reach below the eagerly built argument image while remaining inside
     # the fixed stack VMA.  The first access must observe a zero-filled page;

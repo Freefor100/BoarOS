@@ -7,4 +7,10 @@
  */
 void kernel_console_putc(char character);
 
+/*
+ * Timer-interrupt hook: wakes one blocked console reader when receive
+ * data is pending.  Call with interrupts disabled from the tick path.
+ */
+void kernel_console_poll_input(void);
+
 #endif

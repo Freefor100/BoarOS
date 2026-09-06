@@ -1,5 +1,7 @@
 #include "open_file_internal.h"
 
+#include <arch/riscv/context.h>
+#include <arch/riscv/virt_uart.h>
 #include <kernel/console.h>
 #include <kernel/errno.h>
 #include <kernel/files.h>
@@ -10,6 +12,7 @@
 #include <kernel/page.h>
 #include <kernel/page_cache.h>
 #include <kernel/physical_page.h>
+#include <kernel/scheduler.h>
 #include <kernel/uaccess.h>
 #include <kernel/vfs.h>
 #include <string.h>
@@ -23,6 +26,7 @@
 #define KERNEL_FILES_MAX_RW_COUNT \
     ((uint64_t)INT32_MAX & ~(uint64_t)BOAROS_PAGE_MASK)
 #define KERNEL_FILES_WRITE_STAGING 64U
+#define KERNEL_FILES_CONSOLE_STAGING 64U
 
 #define LINUX_O_ACCMODE UINT64_C(00000003)
 #define LINUX_O_WRONLY UINT64_C(00000001)
@@ -566,6 +570,85 @@ enum kernel_files_status kernel_files_pin(
     return KERNEL_FILES_STATUS_OK;
 }
 
+/*
+ * All console descriptors share one receive channel.  The timer tick
+ * polls the UART and wakes a reader through this queue; readers drain
+ * the FIFO themselves, so the poller only needs the data-ready edge.
+ */
+static struct kernel_wait_queue console_input_queue;
+
+void kernel_console_poll_input(void)
+{
+    if (console_input_queue.initialized == KERNEL_WAIT_QUEUE_INITIALIZED &&
+        virt_uart_rx_ready() != 0U) {
+        (void)kernel_wait_queue_wake_one(&console_input_queue);
+    }
+}
+
+static enum kernel_files_status kernel_files_read_console(
+    struct kernel_files *files,
+    struct kernel_mm *mm,
+    uint64_t user_buffer,
+    uint64_t count,
+    int64_t *linux_result)
+{
+    unsigned char staging[KERNEL_FILES_CONSOLE_STAGING];
+    enum kernel_wait_wake_reason wake_reason = KERNEL_WAIT_WOKEN;
+    enum kernel_uaccess_status access_status;
+    enum kernel_scheduler_status sleep_status;
+    size_t staged = 0;
+    size_t copied = 0;
+    uintptr_t saved;
+
+    if (kernel_user_range_check(user_buffer, (size_t)count) !=
+        KERNEL_UACCESS_STATUS_OK) {
+        files->record->statistics.read_failures++;
+        *linux_result = -KERNEL_EFAULT;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    if (count == 0U) {
+        *linux_result = 0;
+        return KERNEL_FILES_STATUS_OK;
+    }
+
+    saved = riscv_interrupt_save();
+    if (console_input_queue.initialized != KERNEL_WAIT_QUEUE_INITIALIZED) {
+        kernel_wait_queue_init(&console_input_queue);
+    }
+    for (;;) {
+        while (staged < KERNEL_FILES_CONSOLE_STAGING &&
+               virt_uart_rx_ready() != 0U) {
+            staging[staged] = (unsigned char)virt_uart_getc();
+            staged++;
+        }
+        if (staged != 0U) {
+            break;
+        }
+        sleep_status = kernel_scheduler_block_current(&console_input_queue,
+                                                      0U,
+                                                      &wake_reason);
+        if (sleep_status != KERNEL_SCHEDULER_STATUS_OK) {
+            riscv_interrupt_restore(saved);
+            return KERNEL_FILES_STATUS_STATE;
+        }
+    }
+    riscv_interrupt_restore(saved);
+
+    access_status = kernel_copy_to_user(mm,
+                                        user_buffer,
+                                        staging,
+                                        staged,
+                                        &copied);
+    if (access_status != KERNEL_UACCESS_STATUS_OK && copied == 0U) {
+        files->record->statistics.read_failures++;
+        *linux_result = -KERNEL_EFAULT;
+        return KERNEL_FILES_STATUS_OK;
+    }
+
+    *linux_result = (int64_t)copied;
+    return KERNEL_FILES_STATUS_OK;
+}
+
 enum kernel_files_status kernel_files_read(
     struct kernel_files *files,
     struct kernel_mm *mm,
@@ -589,9 +672,8 @@ enum kernel_files_status kernel_files_read(
         return KERNEL_FILES_STATUS_OK;
     }
     if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_CONSOLE) {
-        /* No console input source exists yet; report the empty stream as EOF. */
-        *linux_result = 0;
-        return KERNEL_FILES_STATUS_OK;
+        return kernel_files_read_console(files, mm, user_buffer, count,
+                                         linux_result);
     }
     if (kernel_open_file_kind(description) ==
         KERNEL_OPEN_FILE_KIND_DIRECTORY) {

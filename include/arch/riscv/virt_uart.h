@@ -12,5 +12,7 @@ void virt_uart_use_kernel_mapping(void);
 void virt_uart_putc(char character);
 void virt_uart_puts(const char *text);
 void virt_uart_put_hex(unsigned long value);
+uint32_t virt_uart_rx_ready(void);
+char virt_uart_getc(void);
 
 #endif

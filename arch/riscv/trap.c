@@ -3,6 +3,7 @@
 #include <arch/riscv/timer.h>
 #include <arch/riscv/trap.h>
 #include <arch/riscv/virt_uart.h>
+#include <kernel/console.h>
 #include <kernel/scheduler.h>
 #include <kernel/syscall.h>
 #include <kernel/task.h>
@@ -122,6 +123,7 @@ void riscv_trap_dispatch(struct riscv_trap_frame *frame)
                 riscv_scheduler_fatal(frame, scheduler_status);
             }
         }
+        kernel_console_poll_input();
         {
             enum kernel_scheduler_status scheduler_status =
                 kernel_scheduler_on_tick(elapsed_ticks);

@@ -149,5 +149,19 @@ int main(void)
         return 27;
     }
 
+    /* Console input: stdin is the UART.  The harness feeds a line after
+     * boot; the read must block until it arrives, then deliver it. */
+    char line[8];
+    ssize_t got = read(0, line, sizeof(line));
+    if (got < 1) {
+        return 28;
+    }
+    if (line[0] != 'g' || line[1] != 'o') {
+        return 29;
+    }
+    if (write(1, "BoarOS: real userland console input ok\n", 40) != 40) {
+        return 30;
+    }
+
     return 42;
 }

@@ -2,8 +2,10 @@
 #include <kernel/console.h>
 
 #define UART_THR 0UL
+#define UART_RBR 0UL
 #define UART_LSR 5UL
 #define UART_LSR_THR_EMPTY (1U << 5)
+#define UART_LSR_DATA_READY (1U << 0)
 
 static unsigned long uart_mmio_base = VIRT_UART_MMIO_PHYSICAL_BASE;
 
@@ -50,6 +52,16 @@ void virt_uart_put_hex(unsigned long value)
         length--;
         virt_uart_putc(buffer[length]);
     }
+}
+
+uint32_t virt_uart_rx_ready(void)
+{
+    return (*uart_register(UART_LSR) & UART_LSR_DATA_READY) != 0U;
+}
+
+char virt_uart_getc(void)
+{
+    return (char)*uart_register(UART_RBR);
 }
 
 void kernel_console_putc(char character)

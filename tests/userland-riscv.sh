@@ -38,7 +38,9 @@ debugfs -w -R "set_inode_field /init mode 0100755" "$disk" \
     >/dev/null 2>&1
 debugfs -w -R "write $data /data" "$disk" >/dev/null 2>&1
 
-if ! timeout -k 2s 15s "$qemu" \
+# The userland program blocks reading stdin after the clock and sleep
+# checks, so the harness feeds one line into the serial console.
+if ! { sleep 4; printf 'go\n'; } | timeout -k 2s 15s "$qemu" \
     -machine virt \
     -bios default \
     -kernel "$kernel" \
@@ -48,7 +50,7 @@ if ! timeout -k 2s 15s "$qemu" \
     -no-reboot \
     -drive file="$disk",if=none,format=raw,readonly=on,id=root \
     -device virtio-blk-device,drive=root,bus=virtio-mmio-bus.0 \
-    </dev/null >"$output" 2>&1; then
+    >"$output" 2>&1; then
     tail -n 120 "$output" >&2
     echo "production kernel failed to run the real userland program" >&2
     exit 1
@@ -72,6 +74,11 @@ fi
 if [ "$(grep -cxF 'BoarOS: real userland sleep checks ok' "$output" || true)" -ne 1 ]; then
     tail -n 120 "$output" >&2
     echo "real userland program did not complete the sleep checks" >&2
+    exit 1
+fi
+if [ "$(grep -cxF 'BoarOS: real userland console input ok' "$output" || true)" -ne 1 ]; then
+    tail -n 120 "$output" >&2
+    echo "real userland program did not read the fed console input" >&2
     exit 1
 fi
 if [ "$(grep -cE '^BoarOS: PID 1 exited status=0x2a pages=0x[1-9a-f][0-9a-f]* heap-live=0x0; shutting down$' "$output" || true)" -ne 1 ]; then

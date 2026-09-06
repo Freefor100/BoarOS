@@ -849,8 +849,11 @@ static void run_console_operations(struct kernel_files *files,
         fail_files(71U, (long)(sizeof(marker) - 1U), (long)result);
     }
 
-    /* Regular descriptors are read-only, so writes report EBADF; reads on
-     * the console report the empty input stream as EOF. */
+    /* Regular descriptors are read-only, so writes report EBADF.  The
+     * console read blocks until the tick poller feeds it, which only the
+     * serial-input end-to-end run can exercise; here the non-blocking
+     * edges are checked: an empty request returns 0 and a bad buffer
+     * faults before any wait. */
         expect_open(files, fs, mm, TEST_AT_FDCWD, "/data", 0U, 3, 72U);
         if (kernel_files_write(files,
                            mm,
@@ -863,9 +866,16 @@ static void run_console_operations(struct kernel_files *files,
                           mm,
                           0,
                           TEST_USER_BUFFER,
-                          4U,
+                          0U,
                           &result) != KERNEL_FILES_STATUS_OK ||
         result != 0 ||
+        kernel_files_read(files,
+                          mm,
+                          0,
+                          UINT64_MAX,
+                          4U,
+                          &result) != KERNEL_FILES_STATUS_OK ||
+        result != -KERNEL_EFAULT ||
         kernel_files_write(files,
                            mm,
                            1,
