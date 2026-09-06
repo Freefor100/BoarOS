@@ -55,7 +55,7 @@ SECTIONS
 
         . = ALIGN(16);
         __boot_stack_bottom = .;
-        . += 0x1000;
+        . += 0x4000;
         __boot_stack_top = .;
         __bss_end = .;
     } :data
