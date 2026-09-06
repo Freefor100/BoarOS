@@ -137,6 +137,11 @@ enum kernel_scheduler_status kernel_scheduler_exec_commit(void)
                                 UINT64_C(0x45584543),
                                 exec_status);
     }
+    /* The retired (possibly vfork-shared) mm is released by the cleanup
+     * above; on CLEANUP_REQUIRED the wake happens at the later retry. */
+    if (exec_status == KERNEL_EXEC_STATUS_OK) {
+        vfork_notify_done(thread);
+    }
     return KERNEL_SCHEDULER_STATUS_OK;
 }
 

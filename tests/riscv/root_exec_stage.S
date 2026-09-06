@@ -45,7 +45,22 @@ _start:
 #else
     ld t0, 0(sp)
     li t1, 1
+    beq t0, t1, .Largc_one
+    li t1, 2
     bne t0, t1, .Lfailure
+    # The vfork-exec child image: argv[1] must be exactly "V"; it proves
+    # the exec happened and exits 0x29 without running the full suite.
+    ld t0, 16(sp)
+    beqz t0, .Lfailure
+    lbu t1, 0(t0)
+    li t2, 'V'
+    bne t1, t2, .Lfailure
+    lbu t1, 1(t0)
+    bnez t1, .Lfailure
+    li a0, 0x29
+    li a7, 93
+    ecall
+.Largc_one:
     ld t0, 8(sp)
     beqz t0, .Lfailure
     lbu t1, 0(t0)
@@ -499,6 +514,45 @@ _start:
     li t2, 0x2700
     bne t1, t2, .Lfailure
 
+    # vfork: the child shares this address space, grows the shared break,
+    # then execs a second-level stage3 with argv "V".  The parent resumes
+    # from the clone when the exec commit retires the shared mm, reaps
+    # status 0x2900, and observes the child's break change.
+    li a0, 0x4111
+    la a1, .Lchild_stack
+    li t0, 4096
+    add a1, a1, t0
+    li a2, 0
+    li a3, 0
+    li a4, 0
+    li a7, 220
+    ecall
+    beqz a0, .Lvfork_child
+    bltz a0, .Lfailure
+    la t0, .Lvfork_pid
+    sd a0, 0(t0)
+    ld a0, 0(t0)
+    la a1, .Lwait_status
+    li a2, 0
+    li a3, 0
+    li a7, 260
+    ecall
+    la t0, .Lvfork_pid
+    ld t1, 0(t0)
+    bne a0, t1, .Lfailure
+    la t0, .Lwait_status
+    lw t1, 0(t0)
+    li t2, 0x2900
+    bne t1, t2, .Lfailure
+    li a0, 0
+    li a7, 214
+    ecall
+    la t1, .Lheap_base
+    ld t1, 0(t1)
+    li t2, 0x3031
+    add t1, t1, t2
+    bne a0, t1, .Lfailure
+
     # times(153): after spinning, own CPU time is nonzero, child roll-up
     # fields are non-negative, and uptime ticks dominate all of them.
     li t4, 20000000
@@ -545,6 +599,27 @@ _start:
     ecall
 .Lcustom_stack_bad:
     li a0, 0x28
+    li a7, 93
+    ecall
+
+.Lvfork_child:
+    # Running on the shared address space: grow the shared break so the
+    # parent can observe the sharing after it resumes, then exec a
+    # second-level stage3 with argv "V".
+    la t0, .Lheap_base
+    ld t0, 0(t0)
+    li t1, 0x3031
+    add a0, t0, t1
+    li a7, 214
+    ecall
+    bltz a0, .Lcustom_stack_bad
+    la a0, .Lstage3_path
+    la a1, .Lvfork_argv
+    li a2, 0
+    li a7, 221
+    ecall
+    # exec must not return
+    li a0, 0x2b
     li a7, 93
     ecall
 
@@ -680,6 +755,8 @@ _start:
     .skip 32
 .Lcustom_pid:
     .skip 8
+.Lvfork_pid:
+    .skip 8
 .Lchild_stack:
     .skip 4096
 
@@ -687,3 +764,9 @@ _start:
     .balign 8
 .Lfork_word:
     .dword 0x33
+.Lvfork_argv:
+    .dword .Lstage3_path
+    .dword .Lvfork_arg
+    .dword 0
+.Lvfork_arg:
+    .asciz "V"

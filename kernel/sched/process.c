@@ -33,6 +33,8 @@
 #define LINUX_WAIT4_SUPPORTED_OPTIONS \
     (LINUX_WNOHANG | LINUX_WUNTRACED | LINUX_WCONTINUED | \
      LINUX___WNOTHREAD | LINUX___WALL | LINUX___WCLONE)
+#define LINUX_CLONE_VM UINT64_C(0x100)
+#define LINUX_CLONE_VFORK UINT64_C(0x4000)
 
 enum kernel_mm_status kernel_scheduler_resolve_current_user_fault(
     uint64_t virtual_address,
@@ -153,6 +155,16 @@ static void wake_waiting_parent(struct kernel_task *child)
     }
 }
 
+/* Notifies a vfork-suspended parent that the child released its shared
+ * address space (through exec or exit). */
+void vfork_notify_done(struct kernel_task *thread)
+{
+    if (thread->vfork_child != 0U && thread->parent != 0) {
+        (void)kernel_wait_queue_wake_one(
+            &thread->parent->vfork_done_queue);
+    }
+}
+
 static void exited_append(struct kernel_task *thread)
 {
     thread->next = 0;
@@ -245,6 +257,7 @@ static enum kernel_scheduler_status finish_clone_failure(
 
 enum kernel_scheduler_status riscv_process_clone_current(
     const struct riscv_trap_frame *parent_frame,
+    uint64_t flags,
     uint64_t child_stack,
     int64_t *linux_result)
 {
@@ -256,6 +269,9 @@ enum kernel_scheduler_status riscv_process_clone_current(
     uintptr_t stack_low;
     void *page;
     kernel_pid_t tid;
+    uint32_t vfork = (flags & (LINUX_CLONE_VM | LINUX_CLONE_VFORK)) ==
+                     (LINUX_CLONE_VM | LINUX_CLONE_VFORK);
+    enum kernel_wait_wake_reason wake_reason = KERNEL_WAIT_WOKEN;
     enum physical_page_status page_status;
     enum kernel_mm_status mm_status;
     enum kernel_files_status files_status;
@@ -326,7 +342,14 @@ enum kernel_scheduler_status riscv_process_clone_current(
     child->completion.reason = KERNEL_THREAD_EXIT_USER_FAULT;
     *(uint64_t *)(stack_low - sizeof(uint64_t)) = KERNEL_STACK_CANARY;
 
-    mm_status = kernel_mm_fork(&child->mm, &parent->mm);
+    /* vfork shares the parent address space instead of cloning it; the
+     * shared record reference keeps the parent's handle valid across the
+     * child's exec or exit. */
+    if (vfork) {
+        mm_status = kernel_mm_acquire(&child->mm, &parent->mm);
+    } else {
+        mm_status = kernel_mm_fork(&child->mm, &parent->mm);
+    }
     if (mm_status != KERNEL_MM_STATUS_OK) {
         return finish_clone_failure(
             child,
@@ -388,9 +411,11 @@ enum kernel_scheduler_status riscv_process_clone_current(
     child->group_leader = child;
     child->group_members = 1U;
     child->publish_completion = 0U;
+    child->vfork_child = vfork;
     child->completion.tid = tid;
     child->completion.tgid = tid;
     kernel_wait_queue_init(&child->child_exit_queue);
+    kernel_wait_queue_init(&child->vfork_done_queue);
     mm_status = riscv_kernel_mm_satp(&child->mm, &child_satp);
     if (mm_status != KERNEL_MM_STATUS_OK) {
         return finish_clone_failure(
@@ -428,6 +453,18 @@ enum kernel_scheduler_status riscv_process_clone_current(
     child->state = KERNEL_THREAD_STATE_READY;
     ready_append(child);
     *linux_result = tid;
+
+    if (vfork) {
+        /* Linux suspends the vfork parent inside the syscall until the
+         * child execs or exits; the child wakes vfork_done_queue. */
+        kernel_wait_queue_init(&parent->vfork_done_queue);
+        status = kernel_scheduler_block_current(&parent->vfork_done_queue,
+                                                0U,
+                                                &wake_reason);
+        if (status != KERNEL_SCHEDULER_STATUS_OK) {
+            return status;
+        }
+    }
     return KERNEL_SCHEDULER_STATUS_OK;
 }
 
@@ -1005,6 +1042,9 @@ static void kernel_thread_finish(
         }
         cleanup_status = cleanup_user_task_resources(current);
         current->wait_status = user_wait_status(completion);
+        /* The vfork parent resumes once the shared mm reference is gone,
+         * regardless of which wait state the child ends up in. */
+        vfork_notify_done(current);
     }
     if (cleanup_status == KERNEL_SCHEDULER_STATUS_OK &&
         current->parent != 0) {

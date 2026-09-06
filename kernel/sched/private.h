@@ -59,6 +59,8 @@ struct kernel_task {
     uint64_t child_user_ticks;
     uint64_t child_kernel_ticks;
     struct kernel_wait_queue child_exit_queue;
+    struct kernel_wait_queue vfork_done_queue;
+    uint32_t vfork_child;
     struct kernel_task *group_leader;
     uint32_t group_members;
     struct kernel_thread_completion completion;
@@ -101,6 +103,7 @@ void blocked_append(struct kernel_task *thread);
 void blocked_unlink(struct kernel_task *thread);
 enum kernel_scheduler_status scheduler_switch_current_away(
     struct kernel_task *previous);
+void vfork_notify_done(struct kernel_task *thread);
 enum kernel_scheduler_status activate_thread_address_space(
     const struct kernel_task *thread);
 enum kernel_scheduler_status validate_queues(void);

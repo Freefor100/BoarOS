@@ -207,6 +207,7 @@ void riscv_trap_dispatch(struct riscv_trap_frame *frame)
             enum kernel_scheduler_status scheduler_status =
                 riscv_process_clone_current(
                     frame,
+                    request.arguments[0],
                     request.arguments[1],
                     &result.value);
 

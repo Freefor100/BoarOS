@@ -1138,10 +1138,12 @@ static enum kernel_syscall_status decode_mprotect(
 }
 
 /*
- * clone(220) accepts the process form: fork with an optional custom
- * child stack.  Tid-pointer and TLS arguments belong to the thread
- * model and stay ENOTSUP; the vfork flag set lands with shared-MM
- * process support.
+ * clone(220) accepts the process forms: fork with an optional custom
+ * child stack, and vfork (CLONE_VM|CLONE_VFORK) which shares the parent
+ * address space and suspends the parent until the child execs or exits.
+ * Tid-pointer and TLS arguments belong to the thread model and stay
+ * ENOTSUP; CLONE_VFORK without CLONE_VM has distinct Linux semantics and
+ * is rejected until needed.
  */
 static void decode_clone(const struct kernel_syscall_request *request,
                          struct kernel_syscall_result *decoded)
@@ -1154,8 +1156,13 @@ static void decode_clone(const struct kernel_syscall_request *request,
         decoded->value = -KERNEL_EINVAL;
         return;
     }
-    if (flags != LINUX_SIGCHLD || request->arguments[2] != 0U ||
-        request->arguments[3] != 0U || request->arguments[4] != 0U) {
+    if (flags != LINUX_SIGCHLD &&
+        flags != (LINUX_SIGCHLD | LINUX_CLONE_VM | LINUX_CLONE_VFORK)) {
+        decoded->value = -KERNEL_ENOTSUP;
+        return;
+    }
+    if (request->arguments[2] != 0U || request->arguments[3] != 0U ||
+        request->arguments[4] != 0U) {
         decoded->value = -KERNEL_ENOTSUP;
         return;
     }

@@ -569,6 +569,21 @@ static unsigned long run_process_decode_cases(void)
         result_changed(&result, KERNEL_SYSCALL_ACTION_CLONE, 0)) {
         failures++;
     }
+    /* The vfork flag set is accepted; VFORK without VM is not. */
+    request.arguments[0] = UINT64_C(0x4111);
+    request.arguments[1] = 0x1000U;
+    if (kernel_syscall_dispatch(caller, &request, &result) !=
+            KERNEL_SYSCALL_STATUS_OK ||
+        result_changed(&result, KERNEL_SYSCALL_ACTION_CLONE, 0)) {
+        failures++;
+    }
+    request.arguments[0] = UINT64_C(0x4011);
+    request.arguments[1] = 0U;
+    if (kernel_syscall_dispatch(caller, &request, &result) !=
+            KERNEL_SYSCALL_STATUS_OK ||
+        result_changed(&result, KERNEL_SYSCALL_ACTION_RETURN, -95)) {
+        failures++;
+    }
     request.arguments[0] = 17U;
     request.arguments[1] = 0U;
     request.arguments[2] = 0x1000U;
