@@ -143,6 +143,7 @@ C_SOURCES := \
 ASM_SOURCES := \
 	arch/riscv/boot.S \
 	arch/riscv/context_switch.S \
+	arch/riscv/fpu.S \
 	arch/riscv/trap_entry.S
 OBJECTS := \
 	$(patsubst %.c,$(BUILD_DIR)/%.o,$(C_SOURCES)) \
@@ -187,6 +188,7 @@ TEST_RUNTIME_C_SOURCES := \
 TEST_RUNTIME_ASM_SOURCES := \
 	arch/riscv/boot.S \
 	arch/riscv/context_switch.S \
+	arch/riscv/fpu.S \
 	arch/riscv/trap_entry.S
 TEST_RUNTIME_OBJECTS := \
 	$(patsubst %.c,$(BUILD_DIR)/%.o,$(TEST_RUNTIME_C_SOURCES)) \

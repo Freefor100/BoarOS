@@ -773,6 +773,16 @@ void kernel_main(unsigned long hart_id, const void *dtb)
         shutdown_for_time_error(time_status);
     }
 
+    /* OpenSBI hands the hart over with sstatus.FS=Dirty; start Clean so
+     * kernel-only execution never produces an FP save. */
+    {
+        uintptr_t fs_mask = 0x6000U;
+        uintptr_t fs_clean = 0x4000U;
+
+        __asm__ volatile("csrc sstatus, %0" ::"r"(fs_mask) : "memory");
+        __asm__ volatile("csrs sstatus, %0" ::"r"(fs_clean) : "memory");
+    }
+
     timer_status = riscv_timer_start(info.timebase_frequency,
                                      KERNEL_TICKS_PER_SECOND);
     if (timer_status != RISCV_TIMER_STATUS_OK) {

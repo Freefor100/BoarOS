@@ -2,6 +2,7 @@
 #define BOAROS_KERNEL_SCHED_PRIVATE_H
 
 #include <arch/riscv/context.h>
+#include <arch/riscv/fpu.h>
 #include <arch/riscv/thread.h>
 #include <kernel/files.h>
 #include <kernel/fs_context.h>
@@ -66,6 +67,7 @@ struct kernel_task {
     struct kernel_thread_completion completion;
     struct kernel_files files;
     struct kernel_fs_context fs;
+    struct riscv_fpu_state fpu;
     struct kernel_mm mm;
     struct kernel_exec_transaction *exec_transaction;
     struct riscv_switch_context context;

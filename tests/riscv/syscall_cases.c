@@ -586,17 +586,20 @@ static unsigned long run_process_decode_cases(void)
     }
     request.arguments[0] = 17U;
     request.arguments[1] = 0U;
+    /* Without the CLONE_*SETTID/SETTLS flag bits the remaining clone
+     * arguments are ignored, as Linux does (musl's fork passes only
+     * two arguments and leaves stale register values behind). */
     request.arguments[2] = 0x1000U;
     if (kernel_syscall_dispatch(caller, &request, &result) !=
             KERNEL_SYSCALL_STATUS_OK ||
-        result_changed(&result, KERNEL_SYSCALL_ACTION_RETURN, -95)) {
+        result_changed(&result, KERNEL_SYSCALL_ACTION_CLONE, 0)) {
         failures++;
     }
     request.arguments[2] = 0U;
     request.arguments[3] = 0x1000U;
     if (kernel_syscall_dispatch(caller, &request, &result) !=
             KERNEL_SYSCALL_STATUS_OK ||
-        result_changed(&result, KERNEL_SYSCALL_ACTION_RETURN, -95)) {
+        result_changed(&result, KERNEL_SYSCALL_ACTION_CLONE, 0)) {
         failures++;
     }
     request.arguments[3] = 0U;

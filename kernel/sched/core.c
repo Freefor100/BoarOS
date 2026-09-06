@@ -1,4 +1,5 @@
 #include <arch/riscv/context.h>
+#include <arch/riscv/fpu.h>
 #include <arch/riscv/mm.h>
 #include <arch/riscv/sv39.h>
 #include <arch/riscv/thread.h>
@@ -367,6 +368,7 @@ enum kernel_scheduler_status scheduler_switch_current_away(
             return KERNEL_SCHEDULER_STATUS_ADDRESS_SPACE;
         }
         scheduler.current = &scheduler.idle;
+        riscv_fpu_switch(&previous->fpu, &scheduler.idle.fpu);
         riscv_context_switch(&previous->context, &scheduler.idle.context);
         return KERNEL_SCHEDULER_STATUS_OK;
     }
@@ -379,6 +381,7 @@ enum kernel_scheduler_status scheduler_switch_current_away(
     next = ready_pop();
     next->state = KERNEL_THREAD_STATE_RUNNING;
     scheduler.current = next;
+    riscv_fpu_switch(&previous->fpu, &next->fpu);
     riscv_context_switch(&previous->context, &next->context);
     return KERNEL_SCHEDULER_STATUS_OK;
 }
@@ -759,9 +762,13 @@ enum kernel_scheduler_status kernel_user_thread_create(
     }
     frame->sp = stack_pointer;
     frame->tp = thread_pointer;
-    frame->sstatus = RISCV_SSTATUS_SPIE | RISCV_SSTATUS_UXL_64;
+    /* The user image starts with the FP unit enabled but unmodified;
+     * the zeroed task page is its saved register image. */
+    frame->sstatus = RISCV_SSTATUS_SPIE | RISCV_SSTATUS_UXL_64 |
+                     RISCV_SSTATUS_FS_INITIAL;
     frame->sepc = entry;
     frame->kernel_tp = (uintptr_t)thread;
+    thread->fpu.saved = 1U;
     context_status = riscv_context_init_user(&thread->context,
                                              (uintptr_t)frame,
                                              thread);
@@ -860,6 +867,7 @@ enum kernel_scheduler_status kernel_scheduler_on_tick(
     }
     next->state = KERNEL_THREAD_STATE_RUNNING;
     scheduler.current = next;
+    riscv_fpu_switch(&previous->fpu, &next->fpu);
     riscv_context_switch(&previous->context, &next->context);
 
     if (scheduler.fatal_status != KERNEL_SCHEDULER_STATUS_OK) {

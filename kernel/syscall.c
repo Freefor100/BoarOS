@@ -1161,11 +1161,8 @@ static void decode_clone(const struct kernel_syscall_request *request,
         decoded->value = -KERNEL_ENOTSUP;
         return;
     }
-    if (request->arguments[2] != 0U || request->arguments[3] != 0U ||
-        request->arguments[4] != 0U) {
-        decoded->value = -KERNEL_ENOTSUP;
-        return;
-    }
+    /* Without the CLONE_*SETTID/SETTLS flag bits (rejected above) Linux
+     * ignores the remaining arguments; musl's fork passes only two. */
     decoded->action = KERNEL_SYSCALL_ACTION_CLONE;
     decoded->value = 0;
 }

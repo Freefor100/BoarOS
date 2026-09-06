@@ -1,6 +1,7 @@
 #include "../exec_internal.h"
 #include "private.h"
 
+#include <arch/riscv/fpu.h>
 #include <arch/riscv/mm.h>
 #include <arch/riscv/sv39.h>
 #include <arch/riscv/thread.h>
@@ -38,9 +39,14 @@ static void reset_exec_trap_frame(struct kernel_task *thread,
     }
     frame->sp = stack_pointer;
     frame->tp = thread_pointer;
-    frame->sstatus = RISCV_SSTATUS_SPIE | RISCV_SSTATUS_UXL_64;
+    frame->sstatus = RISCV_SSTATUS_SPIE | RISCV_SSTATUS_UXL_64 |
+                     RISCV_SSTATUS_FS_INITIAL;
     frame->sepc = entry;
     frame->kernel_tp = (uintptr_t)thread;
+    /* The execing task returns to user space without a context switch,
+     * so the old image's register contents are cleared here rather than
+     * by the first dispatch. */
+    riscv_fpu_reset_current(&thread->fpu);
 }
 
 enum kernel_scheduler_status kernel_scheduler_exec_commit(void)

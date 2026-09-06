@@ -416,6 +416,9 @@ enum kernel_scheduler_status riscv_process_clone_current(
     child->completion.tgid = tid;
     kernel_wait_queue_init(&child->child_exit_queue);
     kernel_wait_queue_init(&child->vfork_done_queue);
+    /* The cleared task page is the child's FP register image; the next
+     * dispatch loads it before any child code runs. */
+    child->fpu.saved = 1U;
     mm_status = riscv_kernel_mm_satp(&child->mm, &child_satp);
     if (mm_status != KERNEL_MM_STATUS_OK) {
         return finish_clone_failure(
@@ -431,6 +434,11 @@ enum kernel_scheduler_status riscv_process_clone_current(
             KERNEL_SCHEDULER_STATUS_INVALID_STATE);
     }
     *child_frame = *parent_frame;
+    /* The child starts with an unmodified FP unit, not the parent's
+     * live dirty state. */
+    child_frame->sstatus =
+        (child_frame->sstatus & ~RISCV_SSTATUS_FS_MASK) |
+        RISCV_SSTATUS_FS_INITIAL;
     child_frame->a0 = 0U;
     child_frame->sepc = parent_frame->sepc + 4U;
     child_frame->scause = 0U;
@@ -836,6 +844,7 @@ static void switch_to_fatal_idle(enum kernel_scheduler_status status)
             }
         }
         scheduler.current = &scheduler.idle;
+        riscv_fpu_switch(0, &scheduler.idle.fpu);
         riscv_context_switch(&scheduler.discard_context,
                              &scheduler.idle.context);
     }
@@ -1070,6 +1079,9 @@ static void kernel_thread_finish(
         next->state = KERNEL_THREAD_STATE_RUNNING;
     }
     scheduler.current = next;
+    /* The dying task's FP state is discarded, but the dispatched task
+     * must still have its own image reloaded. */
+    riscv_fpu_switch(0, &next->fpu);
     riscv_context_switch(&scheduler.discard_context, &next->context);
 
     switch_to_fatal_idle(KERNEL_SCHEDULER_STATUS_INVALID_STATE);

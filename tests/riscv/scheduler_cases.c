@@ -1,6 +1,8 @@
 #include <arch/riscv/context.h>
+#include <arch/riscv/fpu.h>
 #include <arch/riscv/sbi.h>
 #include <arch/riscv/thread.h>
+#include <arch/riscv/trap.h>
 #include <arch/riscv/virt_uart.h>
 #include <kernel/page.h>
 #include <kernel/physical_page.h>
@@ -618,6 +620,101 @@ static unsigned long run_wait_cases(
     return failures;
 }
 
+static unsigned long run_fpu_cases(void)
+{
+    struct riscv_fpu_state previous;
+    struct riscv_fpu_state next;
+    uintptr_t saved_interrupts;
+    uintptr_t sstatus;
+    unsigned long failures = 0U;
+    unsigned index;
+
+    saved_interrupts = riscv_interrupt_save();
+
+    /* Restore: the saved image must travel through the real registers
+     * and the unit must end Clean, not Dirty. */
+    for (index = 0U; index < 32U; index++) {
+        next.regs[index] = UINT64_C(0x1111000000000000) + index;
+        previous.regs[index] = 0U;
+    }
+    next.fcsr = UINT64_C(0xaa);
+    previous.fcsr = 0U;
+    next.saved = 1U;
+    previous.saved = 0U;
+
+    riscv_fpu_switch(&previous, &next);
+    __asm__ volatile("csrr %0, sstatus" : "=r"(sstatus));
+    if (((sstatus >> 13) & 3U) != 2U) {
+        failures++;
+    }
+
+    /* Save: mark the live state Dirty and round-trip it back through
+     * the same registers into the same memory image. */
+    {
+        uintptr_t dirty = RISCV_SSTATUS_FS_DIRTY;
+
+        __asm__ volatile("csrs sstatus, %0" ::"r"(dirty) : "memory");
+    }
+    riscv_fpu_switch(&next, &next);
+    __asm__ volatile("csrr %0, sstatus" : "=r"(sstatus));
+    if (((sstatus >> 13) & 3U) != 2U || next.saved != 1U) {
+        failures++;
+    }
+    for (index = 0U; index < 32U; index++) {
+        if (next.regs[index] != UINT64_C(0x1111000000000000) + index) {
+            failures++;
+        }
+    }
+    if (next.fcsr != UINT64_C(0xaa)) {
+        failures++;
+    }
+
+    /* Clean state must not be saved: `previous` keeps its zero image. */
+    riscv_fpu_switch(&previous, &next);
+    if (previous.saved != 0U) {
+        failures++;
+    }
+    for (index = 0U; index < 32U; index++) {
+        if (previous.regs[index] != 0U) {
+            failures++;
+        }
+    }
+
+    /* Reset: the exec path must leave initial register contents in both
+     * the live unit and the memory image. */
+    for (index = 0U; index < 32U; index++) {
+        next.regs[index] = UINT64_C(0x2222000000000000) + index;
+    }
+    next.fcsr = UINT64_C(0xbb);
+    next.saved = 1U;
+    riscv_fpu_switch(&previous, &next);
+    riscv_fpu_reset_current(&next);
+    __asm__ volatile("csrr %0, sstatus" : "=r"(sstatus));
+    if (((sstatus >> 13) & 3U) != 1U || next.saved != 1U) {
+        failures++;
+    }
+    for (index = 0U; index < 32U; index++) {
+        if (next.regs[index] != 0U) {
+            failures++;
+        }
+    }
+    if (next.fcsr != 0U) {
+        failures++;
+    }
+
+    /* The reset set Initial; restore Clean so later cases are unaffected. */
+    {
+        uintptr_t clean = RISCV_SSTATUS_FS_CLEAN;
+
+        __asm__ volatile("csrc sstatus, %0" ::"r"((uintptr_t)0x6000)
+                         : "memory");
+        __asm__ volatile("csrs sstatus, %0" ::"r"(clean) : "memory");
+    }
+
+    riscv_interrupt_restore(saved_interrupts);
+    return failures;
+}
+
 void kernel_main(unsigned long hart_id, const void *dtb)
 {
     struct boot_memory_layout layout;
@@ -646,6 +743,7 @@ void kernel_main(unsigned long hart_id, const void *dtb)
     failures += run_create_cases(&allocator);
     failures += run_wait_cases(&allocator);
     failures += run_accounting_cases(&allocator);
+    failures += run_fpu_cases();
 
     virt_uart_puts("BoarOS: scheduler cases failures=");
     virt_uart_put_hex(failures);
