@@ -79,6 +79,36 @@ enum kernel_scheduler_status kernel_scheduler_on_tick(
 /* Commits the image prepared by the current user task's exec transaction. */
 enum kernel_scheduler_status kernel_scheduler_exec_commit(void);
 
+/*
+ * Linux riscv64 asm-generic rusage layout (144 bytes): only ru_utime and
+ * ru_stime carry real values; the remaining fields are zero until the
+ * kernel tracks those resources.
+ */
+struct kernel_linux_rusage {
+    struct {
+        int64_t tv_sec;
+        int64_t tv_usec;
+    } ru_utime;
+    struct {
+        int64_t tv_sec;
+        int64_t tv_usec;
+    } ru_stime;
+    int64_t ru_maxrss;
+    int64_t ru_ixrss;
+    int64_t ru_idrss;
+    int64_t ru_isrss;
+    int64_t ru_minflt;
+    int64_t ru_majflt;
+    int64_t ru_nswap;
+    int64_t ru_inblock;
+    int64_t ru_oublock;
+    int64_t ru_msgsnd;
+    int64_t ru_msgrcv;
+    int64_t ru_nsignals;
+    int64_t ru_nvcsw;
+    int64_t ru_nivcsw;
+};
+
 enum kernel_scheduler_status kernel_scheduler_wait4_current(
     int64_t pid,
     uint64_t status_address,

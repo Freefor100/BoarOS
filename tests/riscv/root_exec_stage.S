@@ -250,16 +250,6 @@ _start:
     bltz a0, .Lfailure
     mv s3, a0
 
-    # Non-null rusage is outside the current accounting contract.
-    mv a0, s3
-    li a1, 0
-    li a2, 1
-    la a3, .Lwait_status
-    li a7, 260
-    ecall
-    li t0, -95
-    bne a0, t0, .Lfailure
-
     # Normal children are excluded by __WCLONE, and no child belongs to
     # process group 2.
     li a0, -1
@@ -279,19 +269,25 @@ _start:
     li t0, -10
     bne a0, t0, .Lfailure
 
-    # The child has not produced an exit event yet, so WNOHANG returns 0.
+    # WNOHANG with a rusage pointer reports no child yet and must not
+    # touch the buffer.
     mv a0, s3
     li a1, 0
     li a2, 1
-    li a3, 0
+    la a3, .Lrusage
     li a7, 260
     ecall
     bnez a0, .Lfailure
+    la t0, .Lrusage
+    ld t1, 0(t0)
+    bnez t1, .Lfailure
 
+    # The blocking wait now reaps the delayed child and reports its CPU
+    # time through rusage; the child spun for many ticks in user mode.
     mv a0, s3
     la a1, .Lwait_status
     li a2, 0
-    li a3, 0
+    la a3, .Lrusage
     li a7, 260
     ecall
     bne a0, s3, .Lfailure
@@ -326,6 +322,19 @@ _start:
     lbu t1, 0(t0)
     li t2, 'H'
     bne t1, t2, .Lfailure
+
+    # The reaped child's rusage carries its user-mode tick time in the
+    # utime timeval; stime may legitimately stay zero for a child whose
+    # kernel time never crossed a tick boundary.
+    la t0, .Lrusage
+    ld t1, 0(t0)
+    ld t2, 8(t0)
+    or t1, t1, t2
+    beqz t1, .Lfailure
+    bltz t2, .Lfailure
+    # usec stays below one second for sub-minute children.
+    li t2, 1000000
+    bgeu t1, t2, .Lfailure
 
     # A child that clones once more and exits first leaves its live
     # grandchild reparented to PID 1.
@@ -422,7 +431,7 @@ _start:
 
     # Linux reaps the zombie before copying status to userspace.  Therefore
     # an invalid status pointer returns EFAULT, but the same child cannot be
-    # waited for a second time.
+    # waited for a second time.  A bad rusage pointer faults the same way.
     li a0, 17
     li a1, 0
     li a2, 0
@@ -436,7 +445,7 @@ _start:
     mv a0, s6
     li a1, 0x1000
     li a2, 0
-    li a3, 0
+    li a3, 0x1000
     li a7, 260
     ecall
     li t0, -14
@@ -614,6 +623,8 @@ _start:
     .skip 8
 .Lheap_fault_address:
     .skip 8
+.Lrusage:
+    .skip 144
 .Ltms:
     .skip 32
 

@@ -10,6 +10,7 @@
 #include <kernel/fs_context.h>
 #include <kernel/heap.h>
 #include <kernel/mm.h>
+#include <kernel/tick.h>
 #include <kernel/page.h>
 #include <kernel/physical_page.h>
 #include <kernel/pid.h>
@@ -447,10 +448,13 @@ static enum kernel_scheduler_status reap_waited_child(
     struct kernel_task *parent,
     struct kernel_task *child,
     uint64_t status_address,
+    uint64_t rusage_address,
     int64_t *linux_result)
 {
     kernel_pid_t pid = child->tid;
     uint32_t wait_status = child->wait_status;
+    uint64_t user_ticks = child->user_ticks + child->child_user_ticks;
+    uint64_t kernel_ticks = child->kernel_ticks + child->child_kernel_ticks;
     size_t copied = 0U;
     enum kernel_uaccess_status access_status = KERNEL_UACCESS_STATUS_OK;
 
@@ -468,6 +472,8 @@ static enum kernel_scheduler_status reap_waited_child(
         KERNEL_PID_STATUS_OK) {
         return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
     }
+    parent->child_user_ticks += user_ticks;
+    parent->child_kernel_ticks += kernel_ticks;
     child_remove(parent, child);
     if (scheduler.init_task == child) {
         scheduler.init_task = 0;
@@ -500,6 +506,30 @@ static enum kernel_scheduler_status reap_waited_child(
         (status_address != 0U && copied != sizeof(wait_status))) {
         return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
     }
+    if (rusage_address != 0U) {
+        struct kernel_linux_rusage rusage = {0};
+        size_t rusage_copied = 0U;
+        rusage.ru_utime.tv_sec = (int64_t)(user_ticks /
+                                           KERNEL_TICKS_PER_SECOND);
+        rusage.ru_utime.tv_usec =
+            (int64_t)(user_ticks % KERNEL_TICKS_PER_SECOND) *
+            (int64_t)(1000000U / KERNEL_TICKS_PER_SECOND);
+        rusage.ru_stime.tv_sec = (int64_t)(kernel_ticks /
+                                           KERNEL_TICKS_PER_SECOND);
+        rusage.ru_stime.tv_usec =
+            (int64_t)(kernel_ticks % KERNEL_TICKS_PER_SECOND) *
+            (int64_t)(1000000U / KERNEL_TICKS_PER_SECOND);
+        access_status = kernel_copy_to_user(&parent->mm,
+                                            rusage_address,
+                                            &rusage,
+                                            sizeof(rusage),
+                                            &rusage_copied);
+        if (access_status != KERNEL_UACCESS_STATUS_OK ||
+            rusage_copied != sizeof(rusage)) {
+            *linux_result = -KERNEL_EFAULT;
+            return KERNEL_SCHEDULER_STATUS_OK;
+        }
+    }
     *linux_result = pid;
     return KERNEL_SCHEDULER_STATUS_OK;
 }
@@ -526,10 +556,6 @@ enum kernel_scheduler_status kernel_scheduler_wait4_current(
     }
     if (pid == INT32_MIN) {
         *linux_result = -KERNEL_ESRCH;
-        return KERNEL_SCHEDULER_STATUS_OK;
-    }
-    if (rusage_address != 0U) {
-        *linux_result = -KERNEL_ENOTSUP;
         return KERNEL_SCHEDULER_STATUS_OK;
     }
 
@@ -583,6 +609,7 @@ enum kernel_scheduler_status kernel_scheduler_wait4_current(
                 return reap_waited_child(parent,
                                          child,
                                          status_address,
+                                         rusage_address,
                                          linux_result);
             }
         }
