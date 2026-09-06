@@ -116,6 +116,14 @@ void riscv_trap_dispatch(struct riscv_trap_frame *frame)
         kernel_tick_advance(elapsed_ticks);
         {
             enum kernel_scheduler_status scheduler_status =
+                kernel_scheduler_expire_deadlines(riscv_time_read());
+
+            if (scheduler_status != KERNEL_SCHEDULER_STATUS_OK) {
+                riscv_scheduler_fatal(frame, scheduler_status);
+            }
+        }
+        {
+            enum kernel_scheduler_status scheduler_status =
                 kernel_scheduler_on_tick(elapsed_ticks);
 
             if (scheduler_status != KERNEL_SCHEDULER_STATUS_OK) {
@@ -216,6 +224,16 @@ void riscv_trap_dispatch(struct riscv_trap_frame *frame)
             if (scheduler_status != KERNEL_SCHEDULER_STATUS_OK) {
                 riscv_scheduler_fatal(frame, scheduler_status);
             }
+            result.action = KERNEL_SYSCALL_ACTION_RETURN;
+        }
+        if (result.action == KERNEL_SYSCALL_ACTION_YIELD) {
+            enum kernel_scheduler_status scheduler_status =
+                kernel_scheduler_yield_current();
+
+            if (scheduler_status != KERNEL_SCHEDULER_STATUS_OK) {
+                riscv_scheduler_fatal(frame, scheduler_status);
+            }
+            result.value = 0;
             result.action = KERNEL_SYSCALL_ACTION_RETURN;
         }
         if (result.action != KERNEL_SYSCALL_ACTION_RETURN) {

@@ -30,6 +30,7 @@
 #define LINUX_SYSCALL_GETPPID 173U
 #define LINUX_SYSCALL_GETTID 178U
 #define LINUX_SYSCALL_BRK 214U
+#define LINUX_SYSCALL_SCHED_YIELD 124U
 #define LINUX_SYSCALL_MUNMAP 215U
 #define LINUX_SYSCALL_CLONE 220U
 #define LINUX_SYSCALL_EXECVE 221U
@@ -937,6 +938,9 @@ enum kernel_syscall_status kernel_syscall_dispatch(
         decode_clone(request, &decoded);
     } else if (request->number == LINUX_SYSCALL_WAIT4) {
         decoded.action = KERNEL_SYSCALL_ACTION_WAIT4;
+        decoded.value = 0;
+    } else if (request->number == LINUX_SYSCALL_SCHED_YIELD) {
+        decoded.action = KERNEL_SYSCALL_ACTION_YIELD;
         decoded.value = 0;
     } else {
         decoded.action = KERNEL_SYSCALL_ACTION_RETURN;

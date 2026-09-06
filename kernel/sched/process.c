@@ -148,6 +148,7 @@ static void wake_waiting_parent(struct kernel_task *child)
     struct kernel_task *parent = child->parent;
 
     if (parent != 0 && parent->state == KERNEL_THREAD_STATE_BLOCKED) {
+        blocked_unlink(parent);
         parent->state = KERNEL_THREAD_STATE_READY;
         ready_append(parent);
     }
@@ -597,25 +598,10 @@ enum kernel_scheduler_status kernel_scheduler_wait4_current(
             return KERNEL_SCHEDULER_STATUS_OK;
         }
         parent->state = KERNEL_THREAD_STATE_BLOCKED;
-        if (scheduler.ready_head == 0) {
-            if (activate_thread_address_space(&scheduler.idle) !=
-                KERNEL_SCHEDULER_STATUS_OK) {
-                return KERNEL_SCHEDULER_STATUS_ADDRESS_SPACE;
-            }
-            scheduler.current = &scheduler.idle;
-            riscv_context_switch(&parent->context,
-                                 &scheduler.idle.context);
-        } else {
-            struct kernel_task *next = scheduler.ready_head;
-
-            status = activate_thread_address_space(next);
-            if (status != KERNEL_SCHEDULER_STATUS_OK) {
-                return status;
-            }
-            next = ready_pop();
-            next->state = KERNEL_THREAD_STATE_RUNNING;
-            scheduler.current = next;
-            riscv_context_switch(&parent->context, &next->context);
+        blocked_append(parent);
+        status = scheduler_switch_current_away(parent);
+        if (status != KERNEL_SCHEDULER_STATUS_OK) {
+            return status;
         }
     }
 }

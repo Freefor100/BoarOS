@@ -314,6 +314,21 @@ enum kernel_scheduler_status validate_queues(void)
             return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
         }
     }
+    status = validate_queue_shape(scheduler.blocked_head,
+                                  scheduler.blocked_tail);
+    if (status != KERNEL_SCHEDULER_STATUS_OK) {
+        return status;
+    }
+    if (scheduler.blocked_head != 0) {
+        if (scheduler.blocked_head->magic != KERNEL_THREAD_MAGIC ||
+            scheduler.blocked_tail->magic != KERNEL_THREAD_MAGIC ||
+            scheduler.blocked_head->state != KERNEL_THREAD_STATE_BLOCKED ||
+            scheduler.blocked_tail->state != KERNEL_THREAD_STATE_BLOCKED ||
+            scheduler.blocked_head->idle != 0U ||
+            scheduler.blocked_tail->idle != 0U) {
+            return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
+        }
+    }
     return KERNEL_SCHEDULER_STATUS_OK;
 }
 
@@ -338,6 +353,34 @@ struct kernel_task *ready_pop(void)
     }
     thread->next = 0;
     return thread;
+}
+
+enum kernel_scheduler_status scheduler_switch_current_away(
+    struct kernel_task *previous)
+{
+    struct kernel_task *next;
+    enum kernel_scheduler_status status;
+
+    if (scheduler.ready_head == 0) {
+        if (activate_thread_address_space(&scheduler.idle) !=
+            KERNEL_SCHEDULER_STATUS_OK) {
+            return KERNEL_SCHEDULER_STATUS_ADDRESS_SPACE;
+        }
+        scheduler.current = &scheduler.idle;
+        riscv_context_switch(&previous->context, &scheduler.idle.context);
+        return KERNEL_SCHEDULER_STATUS_OK;
+    }
+
+    next = scheduler.ready_head;
+    status = activate_thread_address_space(next);
+    if (status != KERNEL_SCHEDULER_STATUS_OK) {
+        return status;
+    }
+    next = ready_pop();
+    next->state = KERNEL_THREAD_STATE_RUNNING;
+    scheduler.current = next;
+    riscv_context_switch(&previous->context, &next->context);
+    return KERNEL_SCHEDULER_STATUS_OK;
 }
 
 void clear_page(void *pointer)
@@ -819,4 +862,36 @@ enum kernel_scheduler_status kernel_scheduler_on_tick(
         return scheduler.fatal_status;
     }
     return validate_current();
+}
+
+enum kernel_scheduler_status kernel_scheduler_yield_current(void)
+{
+    struct kernel_task *previous;
+    enum kernel_scheduler_status status;
+
+    if (scheduler.initialized != KERNEL_SCHEDULER_INITIALIZED) {
+        return KERNEL_SCHEDULER_STATUS_NOT_INITIALIZED;
+    }
+    if (riscv_interrupt_is_enabled()) {
+        return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
+    }
+    if (scheduler.fatal_status != KERNEL_SCHEDULER_STATUS_OK) {
+        return scheduler.fatal_status;
+    }
+    status = validate_current();
+    if (status != KERNEL_SCHEDULER_STATUS_OK) {
+        return status;
+    }
+    status = validate_queues();
+    if (status != KERNEL_SCHEDULER_STATUS_OK) {
+        return status;
+    }
+    if (scheduler.current == &scheduler.idle || scheduler.ready_head == 0) {
+        return KERNEL_SCHEDULER_STATUS_OK;
+    }
+
+    previous = scheduler.current;
+    previous->state = KERNEL_THREAD_STATE_READY;
+    ready_append(previous);
+    return scheduler_switch_current_away(previous);
 }

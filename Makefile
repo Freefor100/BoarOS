@@ -130,6 +130,7 @@ C_SOURCES := \
 	kernel/sched/core.c \
 	kernel/sched/exec.c \
 	kernel/sched/process.c \
+	kernel/sched/wait.c \
 	kernel/syscall.c \
 	kernel/tick.c \
 	lib/qsort.c \
@@ -171,6 +172,7 @@ TEST_RUNTIME_C_SOURCES := \
 	kernel/sched/core.c \
 	kernel/sched/exec.c \
 	kernel/sched/process.c \
+	kernel/sched/wait.c \
 	kernel/syscall.c \
 	kernel/tick.c \
 	lib/qsort.c \

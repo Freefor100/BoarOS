@@ -86,6 +86,46 @@ enum kernel_scheduler_status kernel_scheduler_wait4_current(
     uint64_t rusage_address,
     int64_t *linux_result);
 
+enum kernel_wait_wake_reason {
+    KERNEL_WAIT_WOKEN = 0,
+    KERNEL_WAIT_TIMEOUT = 1,
+};
+
+#define KERNEL_WAIT_QUEUE_INITIALIZED UINT32_C(0x57414954)
+
+/*
+ * Token identifying a sleep channel.  Resources that can block embed one
+ * queue per wake condition and hand it to block/wake.
+ */
+struct kernel_wait_queue {
+    uint32_t initialized;
+};
+
+void kernel_wait_queue_init(struct kernel_wait_queue *queue);
+
+/* Wakes the longest-blocked waiter.  Requires interrupts disabled. */
+enum kernel_scheduler_status kernel_wait_queue_wake_one(
+    struct kernel_wait_queue *queue);
+
+/*
+ * Sleeps until woken through `queue` (NULL = pure timeout sleep) or until
+ * `deadline` time-counter ticks elapse (0 = no deadline).  Requires
+ * interrupts disabled; the caller must recheck its condition on return.
+ */
+enum kernel_scheduler_status kernel_scheduler_block_current(
+    struct kernel_wait_queue *queue,
+    uint64_t deadline,
+    enum kernel_wait_wake_reason *wake_reason);
+
+/*
+ * Timer-interrupt path: wakes every blocked task whose deadline has
+ * passed.  Requires interrupts disabled; `now` is the time-counter value.
+ */
+enum kernel_scheduler_status kernel_scheduler_expire_deadlines(uint64_t now);
+
+/* Requeues the current task behind any ready task and switches away. */
+enum kernel_scheduler_status kernel_scheduler_yield_current(void);
+
 /* Resolves a hardware fault in the running user task's active MM. */
 enum kernel_mm_status kernel_scheduler_resolve_current_user_fault(
     uint64_t virtual_address,

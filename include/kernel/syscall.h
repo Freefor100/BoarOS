@@ -18,6 +18,7 @@ enum kernel_syscall_action {
     KERNEL_SYSCALL_ACTION_EXEC,
     KERNEL_SYSCALL_ACTION_CLONE,
     KERNEL_SYSCALL_ACTION_WAIT4,
+    KERNEL_SYSCALL_ACTION_YIELD,
 };
 
 struct kernel_syscall_request {

@@ -125,14 +125,30 @@ static unsigned long run_preinit_cases(void)
         .status = UINT64_C(0x33445566778899aa),
         .detail = UINT64_C(0xbbccddeeff001122),
     };
+    struct kernel_wait_queue queue = {0};
+    enum kernel_wait_wake_reason reason = KERNEL_WAIT_WOKEN;
     unsigned long failures = 0U;
 
+    kernel_wait_queue_init(&queue);
     failures += expect_status(KERNEL_SCHEDULER_STATUS_NOT_INITIALIZED,
                               kernel_thread_create(thread_entry, 0));
     failures += expect_status(KERNEL_SCHEDULER_STATUS_NOT_INITIALIZED,
                               kernel_scheduler_on_tick(1U));
     failures += expect_status(KERNEL_SCHEDULER_STATUS_NOT_INITIALIZED,
                               kernel_scheduler_reap_one(&completion));
+    failures += expect_status(KERNEL_SCHEDULER_STATUS_NOT_INITIALIZED,
+                              kernel_wait_queue_wake_one(&queue));
+    failures += expect_status(KERNEL_SCHEDULER_STATUS_NOT_INITIALIZED,
+                              kernel_scheduler_block_current(&queue,
+                                                             0U,
+                                                             &reason));
+    failures += expect_status(KERNEL_SCHEDULER_STATUS_NOT_INITIALIZED,
+                              kernel_scheduler_expire_deadlines(1U));
+    failures += expect_status(KERNEL_SCHEDULER_STATUS_NOT_INITIALIZED,
+                              kernel_scheduler_yield_current());
+    if (reason != KERNEL_WAIT_WOKEN) {
+        failures++;
+    }
     if (completion.kind != (enum kernel_thread_kind)0x11 ||
         completion.reason != (enum kernel_thread_exit_reason)0x22 ||
         completion.status != UINT64_C(0x33445566778899aa) ||
@@ -359,6 +375,192 @@ static unsigned long run_create_cases(
     return failures;
 }
 
+static struct kernel_wait_queue test_queue;
+static volatile unsigned long timeout_wake_count;
+static volatile unsigned long timeout_reason_value;
+static volatile unsigned long event_wake_count;
+static volatile unsigned long event_reason_value;
+static volatile unsigned long yield_runs;
+
+static void blocked_worker(void *argument)
+{
+    unsigned long slot = (uintptr_t)argument;
+    enum kernel_wait_wake_reason reason = (enum kernel_wait_wake_reason)0xF0;
+    uintptr_t saved = riscv_interrupt_save();
+
+    if (kernel_scheduler_block_current(&test_queue,
+                                       slot == 0U ? 1000U : 0U,
+                                       &reason) !=
+        KERNEL_SCHEDULER_STATUS_OK) {
+        riscv_interrupt_restore(saved);
+        return;
+    }
+    riscv_interrupt_restore(saved);
+    if (slot == 0U) {
+        timeout_reason_value = (unsigned long)reason;
+        timeout_wake_count++;
+    } else {
+        event_reason_value = (unsigned long)reason;
+        event_wake_count++;
+    }
+}
+
+static void yielding_worker(void *argument)
+{
+    unsigned long slot = (uintptr_t)argument;
+    uintptr_t saved = riscv_interrupt_save();
+
+    if (slot == 0U) {
+        kernel_scheduler_yield_current();
+    }
+    riscv_interrupt_restore(saved);
+    yield_runs++;
+}
+
+static unsigned long run_wait_cases(
+    struct physical_page_allocator *allocator)
+{
+    uint64_t initial_available = physical_page_available(allocator);
+    struct kernel_thread_completion completion = {
+        .kind = (enum kernel_thread_kind)0,
+        .reason = (enum kernel_thread_exit_reason)0,
+        .status = 0U,
+        .detail = 0U,
+    };
+    struct kernel_wait_queue invalid_queue = {0};
+    enum kernel_wait_wake_reason reason = KERNEL_WAIT_WOKEN;
+    unsigned long failures = 0U;
+
+    kernel_wait_queue_init(&test_queue);
+
+    failures += expect_status(KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT,
+                              kernel_scheduler_block_current(0, 0U, 0));
+    failures += expect_status(KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT,
+                              kernel_scheduler_block_current(&invalid_queue,
+                                                             0U,
+                                                             &reason));
+    failures += expect_status(KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT,
+                              kernel_wait_queue_wake_one(0));
+    failures += expect_status(KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT,
+                              kernel_wait_queue_wake_one(&invalid_queue));
+    if (reason != KERNEL_WAIT_WOKEN) {
+        failures++;
+    }
+
+    __asm__ volatile("csrsi sstatus, 2" ::: "memory");
+    failures += expect_status(KERNEL_SCHEDULER_STATUS_INVALID_STATE,
+                              kernel_scheduler_block_current(&test_queue,
+                                                             0U,
+                                                             &reason));
+    failures += expect_status(KERNEL_SCHEDULER_STATUS_INVALID_STATE,
+                              kernel_wait_queue_wake_one(&test_queue));
+    failures += expect_status(KERNEL_SCHEDULER_STATUS_INVALID_STATE,
+                              kernel_scheduler_expire_deadlines(1U));
+    failures += expect_status(KERNEL_SCHEDULER_STATUS_INVALID_STATE,
+                              kernel_scheduler_yield_current());
+    __asm__ volatile("csrci sstatus, 2" ::: "memory");
+
+    failures += expect_status(KERNEL_SCHEDULER_STATUS_INVALID_STATE,
+                              kernel_scheduler_block_current(&test_queue,
+                                                             0U,
+                                                             &reason));
+    failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
+                              kernel_wait_queue_wake_one(&test_queue));
+
+    failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
+                              kernel_thread_create(blocked_worker, 0));
+    if (physical_page_available(allocator) + 1U != initial_available) {
+        failures++;
+    }
+    failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
+                              kernel_scheduler_on_tick(1U));
+    if (timeout_wake_count != 0U) {
+        failures++;
+    }
+    failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
+                              kernel_scheduler_expire_deadlines(999U));
+    failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
+                              kernel_scheduler_on_tick(1U));
+    if (timeout_wake_count != 0U) {
+        failures++;
+    }
+    failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
+                              kernel_scheduler_expire_deadlines(1000U));
+    failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
+                              kernel_scheduler_on_tick(1U));
+    if (timeout_wake_count != 1U ||
+        timeout_reason_value != (unsigned long)KERNEL_WAIT_TIMEOUT) {
+        failures++;
+    }
+    failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
+                              kernel_scheduler_reap_one(&completion));
+    if (completion.kind != KERNEL_THREAD_KIND_KERNEL ||
+        completion.reason != KERNEL_THREAD_EXIT_RETURNED ||
+        completion.status != 0U || completion.detail != 0U ||
+        physical_page_available(allocator) != initial_available) {
+        failures++;
+    }
+
+    failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
+                              kernel_thread_create(blocked_worker,
+                                                   (void *)(uintptr_t)1U));
+    failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
+                              kernel_scheduler_on_tick(1U));
+    if (event_wake_count != 0U) {
+        failures++;
+    }
+    failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
+                              kernel_wait_queue_wake_one(&test_queue));
+    failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
+                              kernel_scheduler_on_tick(1U));
+    if (event_wake_count != 1U ||
+        event_reason_value != (unsigned long)KERNEL_WAIT_WOKEN) {
+        failures++;
+    }
+    failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
+                              kernel_scheduler_reap_one(&completion));
+    if (completion.kind != KERNEL_THREAD_KIND_KERNEL ||
+        completion.reason != KERNEL_THREAD_EXIT_RETURNED ||
+        completion.status != 0U || completion.detail != 0U ||
+        physical_page_available(allocator) != initial_available) {
+        failures++;
+    }
+
+    /* Yield switch path: the first worker yields to the second one. */
+    failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
+                              kernel_thread_create(yielding_worker, 0));
+    failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
+                              kernel_thread_create(yielding_worker,
+                                                   (void *)(uintptr_t)1U));
+    failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
+                              kernel_scheduler_on_tick(1U));
+    if (yield_runs != 2U) {
+        failures++;
+    }
+    failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
+                              kernel_scheduler_reap_one(&completion));
+    if (completion.kind != KERNEL_THREAD_KIND_KERNEL ||
+        completion.reason != KERNEL_THREAD_EXIT_RETURNED ||
+        completion.status != 0U || completion.detail != 0U) {
+        failures++;
+    }
+    failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
+                              kernel_scheduler_reap_one(&completion));
+    if (completion.kind != KERNEL_THREAD_KIND_KERNEL ||
+        completion.reason != KERNEL_THREAD_EXIT_RETURNED ||
+        completion.status != 0U || completion.detail != 0U ||
+        physical_page_available(allocator) != initial_available) {
+        failures++;
+    }
+    failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
+                              kernel_scheduler_yield_current());
+    if (yield_runs != 2U) {
+        failures++;
+    }
+
+    return failures;
+}
+
 void kernel_main(unsigned long hart_id, const void *dtb)
 {
     struct boot_memory_layout layout;
@@ -385,6 +587,7 @@ void kernel_main(unsigned long hart_id, const void *dtb)
     failures += run_init_cases(&allocator);
     failures += run_idle_cases();
     failures += run_create_cases(&allocator);
+    failures += run_wait_cases(&allocator);
 
     virt_uart_puts("BoarOS: scheduler cases failures=");
     virt_uart_put_hex(failures);

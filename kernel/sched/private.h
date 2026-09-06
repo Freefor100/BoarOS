@@ -51,6 +51,9 @@ struct kernel_task {
     uint32_t publish_completion;
     uint32_t wait_status;
     uint64_t clear_tid_address;
+    struct kernel_wait_queue *wait_queue;
+    uint64_t wakeup_deadline;
+    uint32_t wake_reason;
     struct kernel_task *group_leader;
     uint32_t group_members;
     struct kernel_thread_completion completion;
@@ -74,6 +77,8 @@ struct kernel_scheduler {
     struct kernel_task *ready_tail;
     struct kernel_task *exited_head;
     struct kernel_task *exited_tail;
+    struct kernel_task *blocked_head;
+    struct kernel_task *blocked_tail;
     struct kernel_task *init_task;
     uint64_t cleanup_page_address;
     uint32_t cleanup_page_owned;
@@ -87,6 +92,10 @@ uintptr_t align_up_16(uintptr_t value);
 void clear_page(void *pointer);
 void ready_append(struct kernel_task *thread);
 struct kernel_task *ready_pop(void);
+void blocked_append(struct kernel_task *thread);
+void blocked_unlink(struct kernel_task *thread);
+enum kernel_scheduler_status scheduler_switch_current_away(
+    struct kernel_task *previous);
 enum kernel_scheduler_status activate_thread_address_space(
     const struct kernel_task *thread);
 enum kernel_scheduler_status validate_queues(void);

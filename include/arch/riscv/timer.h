@@ -19,5 +19,6 @@ enum riscv_timer_status riscv_timer_start(uint32_t timebase_frequency,
                                           uint32_t ticks_per_second);
 enum riscv_timer_status riscv_timer_handle_interrupt(
     uint64_t *elapsed_ticks);
+uint64_t riscv_time_read(void);
 
 #endif

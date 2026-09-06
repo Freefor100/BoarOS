@@ -17,7 +17,7 @@ struct riscv_timer_state {
 
 static struct riscv_timer_state timer_state;
 
-static uint64_t riscv_time_read(void)
+uint64_t riscv_time_read(void)
 {
     uint64_t value;
 
