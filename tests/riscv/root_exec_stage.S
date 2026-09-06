@@ -469,6 +469,36 @@ _start:
     li t0, -10
     bne a0, t0, .Lfailure
 
+    # clone(17, custom_stack): the child starts on the supplied stack,
+    # verifies its own sp lies inside the buffer, writes through it, and
+    # exits with 0x27; the parent reaps and checks the status.
+    li a0, 17
+    la a1, .Lchild_stack
+    li t0, 4096
+    add a1, a1, t0
+    li a2, 0
+    li a3, 0
+    li a4, 0
+    li a7, 220
+    ecall
+    beqz a0, .Lcustom_stack_child
+    bltz a0, .Lfailure
+    la t0, .Lcustom_pid
+    sd a0, 0(t0)
+    ld a0, 0(t0)
+    la a1, .Lwait_status
+    li a2, 0
+    li a3, 0
+    li a7, 260
+    ecall
+    la t0, .Lcustom_pid
+    ld t1, 0(t0)
+    bne a0, t1, .Lfailure
+    la t0, .Lwait_status
+    lw t1, 0(t0)
+    li t2, 0x2700
+    bne t1, t2, .Lfailure
+
     # times(153): after spinning, own CPU time is nonzero, child roll-up
     # fields are non-negative, and uptime ticks dominate all of them.
     li t4, 20000000
@@ -494,6 +524,27 @@ _start:
     bgeu t2, a0, .Lfailure
 
     li a0, 0x2a
+    li a7, 93
+    ecall
+
+.Lcustom_stack_child:
+    # The child runs on the caller-supplied stack: verify sp lies inside
+    # the buffer, then store through it below sp before exiting 0x27.
+    la t0, .Lchild_stack
+    li t1, 4096
+    add t2, t0, t1
+    bltu sp, t0, .Lcustom_stack_bad
+    bgtu sp, t2, .Lcustom_stack_bad
+    addi t3, sp, -32
+    li t4, 0x5a5a5a5a5a5a5a5a
+    sd t4, 0(t3)
+    ld t5, 0(t3)
+    bne t4, t5, .Lcustom_stack_bad
+    li a0, 0x27
+    li a7, 93
+    ecall
+.Lcustom_stack_bad:
+    li a0, 0x28
     li a7, 93
     ecall
 
@@ -627,6 +678,10 @@ _start:
     .skip 144
 .Ltms:
     .skip 32
+.Lcustom_pid:
+    .skip 8
+.Lchild_stack:
+    .skip 4096
 
     .section .data, "aw", @progbits
     .balign 8

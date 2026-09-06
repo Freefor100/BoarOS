@@ -267,7 +267,7 @@ enum kernel_scheduler_status riscv_process_clone_current(
     if (scheduler.initialized != KERNEL_SCHEDULER_INITIALIZED) {
         return KERNEL_SCHEDULER_STATUS_NOT_INITIALIZED;
     }
-    if (parent_frame == 0 || linux_result == 0 || child_stack != 0U ||
+    if (parent_frame == 0 || linux_result == 0 ||
         riscv_interrupt_is_enabled()) {
         return KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
     }
@@ -411,6 +411,10 @@ enum kernel_scheduler_status riscv_process_clone_current(
     child_frame->scause = 0U;
     child_frame->stval = 0U;
     child_frame->kernel_tp = (uintptr_t)child;
+    /* A nonzero clone stack argument replaces the inherited user sp. */
+    if (child_stack != 0U) {
+        child_frame->sp = child_stack;
+    }
     context_status = riscv_context_init_user(&child->context,
                                              (uintptr_t)child_frame,
                                              child);

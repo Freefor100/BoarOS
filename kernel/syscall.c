@@ -56,6 +56,8 @@
 #define LINUX_EXIT_STATUS_MASK UINT64_C(0xff)
 #define LINUX_CLONE_SIGNAL_MASK UINT64_C(0xff)
 #define LINUX_SIGCHLD UINT64_C(17)
+#define LINUX_CLONE_VM UINT64_C(0x100)
+#define LINUX_CLONE_VFORK UINT64_C(0x4000)
 #define LINUX_CLONE_KNOWN_FLAGS UINT64_C(0x3ffffffff)
 #define LINUX_UTS_FIELD_SIZE 65U
 #define LINUX_PROT_READ UINT64_C(0x1)
@@ -1135,6 +1137,12 @@ static enum kernel_syscall_status decode_mprotect(
     return KERNEL_SYSCALL_STATUS_OK;
 }
 
+/*
+ * clone(220) accepts the process form: fork with an optional custom
+ * child stack.  Tid-pointer and TLS arguments belong to the thread
+ * model and stay ENOTSUP; the vfork flag set lands with shared-MM
+ * process support.
+ */
 static void decode_clone(const struct kernel_syscall_request *request,
                          struct kernel_syscall_result *decoded)
 {
@@ -1146,9 +1154,8 @@ static void decode_clone(const struct kernel_syscall_request *request,
         decoded->value = -KERNEL_EINVAL;
         return;
     }
-    if (flags != LINUX_SIGCHLD || request->arguments[1] != 0U ||
-        request->arguments[2] != 0U || request->arguments[3] != 0U ||
-        request->arguments[4] != 0U) {
+    if (flags != LINUX_SIGCHLD || request->arguments[2] != 0U ||
+        request->arguments[3] != 0U || request->arguments[4] != 0U) {
         decoded->value = -KERNEL_ENOTSUP;
         return;
     }
