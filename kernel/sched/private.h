@@ -58,6 +58,7 @@ struct kernel_task {
     uint64_t kernel_ticks;
     uint64_t child_user_ticks;
     uint64_t child_kernel_ticks;
+    struct kernel_wait_queue child_exit_queue;
     struct kernel_task *group_leader;
     uint32_t group_members;
     struct kernel_thread_completion completion;

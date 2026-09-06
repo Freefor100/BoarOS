@@ -576,6 +576,7 @@ enum kernel_scheduler_status kernel_thread_create(
     thread->completion.status = 0U;
     thread->completion.detail = 0U;
     thread->exec_transaction = 0;
+    kernel_wait_queue_init(&thread->child_exit_queue);
     *(uint64_t *)(stack_low - sizeof(uint64_t)) = KERNEL_STACK_CANARY;
     context_status = riscv_context_init(&thread->context,
                                         thread->stack_high,
@@ -743,6 +744,7 @@ enum kernel_scheduler_status kernel_user_thread_create(
     thread->completion.status = 0U;
     thread->completion.detail = 0U;
     thread->exec_transaction = 0;
+    kernel_wait_queue_init(&thread->child_exit_queue);
     *(uint64_t *)(stack_low - sizeof(uint64_t)) = KERNEL_STACK_CANARY;
 
     frame = (struct riscv_trap_frame *)(thread->stack_high -

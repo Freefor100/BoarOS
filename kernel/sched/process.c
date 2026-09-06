@@ -148,10 +148,8 @@ static void wake_waiting_parent(struct kernel_task *child)
 {
     struct kernel_task *parent = child->parent;
 
-    if (parent != 0 && parent->state == KERNEL_THREAD_STATE_BLOCKED) {
-        blocked_unlink(parent);
-        parent->state = KERNEL_THREAD_STATE_READY;
-        ready_append(parent);
+    if (parent != 0) {
+        (void)kernel_wait_queue_wake_one(&parent->child_exit_queue);
     }
 }
 
@@ -392,6 +390,7 @@ enum kernel_scheduler_status riscv_process_clone_current(
     child->publish_completion = 0U;
     child->completion.tid = tid;
     child->completion.tgid = tid;
+    kernel_wait_queue_init(&child->child_exit_queue);
     mm_status = riscv_kernel_mm_satp(&child->mm, &child_satp);
     if (mm_status != KERNEL_MM_STATUS_OK) {
         return finish_clone_failure(
@@ -542,6 +541,7 @@ enum kernel_scheduler_status kernel_scheduler_wait4_current(
     int64_t *linux_result)
 {
     struct kernel_task *parent;
+    enum kernel_wait_wake_reason wake_reason = KERNEL_WAIT_WOKEN;
     enum kernel_scheduler_status status;
 
     if (scheduler.initialized != KERNEL_SCHEDULER_INITIALIZED) {
@@ -624,9 +624,9 @@ enum kernel_scheduler_status kernel_scheduler_wait4_current(
             *linux_result = 0;
             return KERNEL_SCHEDULER_STATUS_OK;
         }
-        parent->state = KERNEL_THREAD_STATE_BLOCKED;
-        blocked_append(parent);
-        status = scheduler_switch_current_away(parent);
+        status = kernel_scheduler_block_current(&parent->child_exit_queue,
+                                                0U,
+                                                &wake_reason);
         if (status != KERNEL_SCHEDULER_STATUS_OK) {
             return status;
         }
