@@ -97,4 +97,15 @@ next    = previous_deadline + elapsed * period
 - 真实 QEMU 测试仍必须让 timer trap 至少返回一次；只看 set_timer 返回成功不能证明 STIE/SIE、Trap Frame、dispatcher 和 `sret` 连通。
 - 无根设备的正常内核预期停在 `wfi`，所以 idle 自动测试把宿主 timeout 视为预期状态并检查期间没有 fatal；挂载生产根盘后，PID 1 退出会触发资源收口和 SBI 关机，不能再把 timeout 当作成功。
 
+## 墙钟来源与定点换算（当前结论）
+
+- QEMU `virt` 板载 goldfish RTC 位于 MMIO `0x101000`：读 `TIME_LOW`（offset 0）会锁存 `TIME_HIGH`（offset 4），两寄存器合成为自 Unix epoch 的纳秒。先读 LOW 再读 HIGH 即得到一致的样本，无需重试循环。
+- 墙钟只在启动时采样一次作为 `boot_realtime`，此后 realtime = boot_realtime + 单调值；Linux 桌面系统同样以 RTC 校准启动时刻、运行期靠时钟源推进。接收样本必须做合理性检查（非递减、间隔有界、不早于选定阈值），把"设备不存在/寄存器读回垃圾"归一成明确的不可用状态。
+- ns↔ticks 换算用启动时预算的 32.32 定点乘数：`ceil(1e9·2^32/freq)` 与 `ceil(freq·2^32/1e9)`，热路径一次 `mulhu`，相对误差 < 2^-32，且不引入 libgcc 的 128 位除法（`-nostdlib` 下没有 `__udivti3`）。直接 `ns * freq` 会在大睡眠时长溢出 64 位，两个乘数方案天然避免。
+
+## 可复用的验证与调试方法（补充）
+
+- 布局相关的远端损坏（堆 magic 失败、lwext4 ENOENT、页分配器 STATE 同时出现且位置随无关代码增减移动）应首先怀疑栈溢出：把嫌疑栈临时放大数倍复测，若症状消失即为栈深度问题，再去量化和定尺寸。
+- 深调用链（如 openat → fs context 路径解析 → lwext4 遍历）叠加在测试 harness 主流程栈帧上，单看生产路径的深度会低估需求；按最深的真实消费者预算栈。
+
 本地核对入口包括 `references/riscv/`、`references/qemu/`、`references/opensbi/` 和 `references/linux/`。固定版本、commit 与恢复方式见 [本地参考资料](../../references/README.md)。

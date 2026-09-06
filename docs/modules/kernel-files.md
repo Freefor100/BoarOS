@@ -38,7 +38,7 @@ open file description 的 offset 只增加实际复制到用户空间的字节�
 
 ## console 描述符与 `write`/`writev`
 
-`kernel_open_file_create_console()` 创建无 VFS 节点、不经页缓存的 console 描述符；root boot 在创建 PID 1 文件表后把它绑定到 fd 0/1/2。该桥接在设备文件系统提供 `/dev/console` 后退出。console 的 `write/writev` 经 `kernel_console_putc` 逐字节输出并返回完整计数；用户 fault 与部分复制按前缀保持返回，与 read 对称。console 的 `read` 在 UART 输入与等待队列落地前固定返回 0（空输入流 EOF），`lseek` 返回 `-ESPIPE`，`fstat` 以 5:1 字符设备形态出现。regular/directory 描述符上的 write 返回 `-EBADF`（只读根上每个常规 fd 都是只读打开）。
+`kernel_open_file_create_console()` 创建无 VFS 节点、不经页缓存的 console 描述符；root boot 在创建 PID 1 文件表后把它绑定到 fd 0/1/2。该桥接在设备文件系统提供 `/dev/console` 后退出。console 的 `write/writev` 经 `kernel_console_putc` 逐字节输出并返回完整计数；用户 fault 与部分复制按前缀保持返回，与 read 对称。console 的 `read` 阻塞等待真实 UART 输入：tick 路径轮询 NS16550A 接收位并唤醒共享的 console 等待队列，读者把接收 FIFO 整批搬入 staging 后一次性复制到用户；无数据时阻塞一个 tick 内被唤醒，`count==0` 返回 0，坏缓冲区返回 `-EFAULT`。`lseek` 返回 `-ESPIPE`，`fstat` 以 5:1 字符设备形态出现。fd 0/1/2 是三个独立 OFD，但共享同一输入队列。regular/directory 描述符上的 write 返回 `-EBADF`（只读根上每个常规 fd 都是只读打开）。
 
 `writev` 按用户 iovec 数组逐项输出，`iovcnt` 上限 1024；这是 musl stdio 实际使用的写路径，`__stdio_write` 以两段 iovec 发出缓冲内容。
 
@@ -78,4 +78,4 @@ make test-riscv
 
 聚焦测试在真实 QEMU legacy 与 modern VirtIO/ext4 上覆盖绝对/相对路径、错误 flags、目录与缺失文件、4096 字节路径上限、最低 fd 复用、表扩容、`O_CLOEXEC`、缓存命中后的跨页读取、EOF、部分 fault、fork 后 fd 表独立与 OFD offset 共享，以及可重试清理。它还在关闭 fd 后通过 MM backing 继续缺页，反复固定地址映射同一 OFD 并检查来源释放只发生一次，验证父子各自持有一份来源引用。生产 exec/clone 链验证普通 fd 与 offset 跨映像和父子保持、CLOEXEC fd 不可见，PID 1 的 stdio 与跨 exec 的 console 描述符由串口标记验证，并由最终资源基线证明退出清理生效。`make test-userland-riscv` 用静态 musl 程序作为 PID 1 运行 stdio、readdir、read/lseek/fstat 与 dup，是真实 U-mode 外部测例的入口。
 
-当前只有进程私有文件表、根 fs context 和只读文件系统；普通 clone 已实现“复制表、共享 OFD”，但没有 `CLONE_FILES`。也没有目录 fd（`dirfd` 相对路径）、`chdir`、可写文件、并发锁、read-ahead、异步 I/O 或可写文件系统；常规文件的 write 以只读语义返回 `-EBADF`，可写 ext4 需要块写接口、journal 策略与页缓存 dirty/失效协议先行。console read 的 EOF 语义在 UART 输入与等待队列落地后替换。
+当前只有进程私有文件表、根 fs context 和只读文件系统；普通 clone 已实现“复制表、共享 OFD”，但没有 `CLONE_FILES`。也没有目录 fd（`dirfd` 相对路径）、`chdir`、可写文件、并发锁、read-ahead、异步 I/O 或可写文件系统；常规文件的 write 以只读语义返回 `-EBADF`，可写 ext4 需要块写接口、journal 策略与页缓存 dirty/失效协议先行。console 接收现为 tick 轮询（唤醒延迟上界一个 tick），外部中断（PLIC/SEIE）落地后替换为中断驱动。

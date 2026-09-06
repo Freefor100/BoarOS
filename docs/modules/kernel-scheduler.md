@@ -13,6 +13,7 @@
 | `include/kernel/task.h` | 暴露不透明 current task、TID/TGID/PPID 与当前资源借用 |
 | `kernel/sched/core.c` | idle、任务页、ready FIFO、tick 抢占和首次用户任务创建 |
 | `kernel/sched/process.c` | 父子链、clone/wait、BLOCKED/wakeup、exit/zombie/reap |
+| `kernel/sched/wait.c` | 全局 blocked 链、等待队列唤醒与 deadline 到期 |
 | `kernel/sched/exec.c` | exec 映像提交 |
 | `kernel/sched/private.h` | scheduler 私有对象布局与跨实现文件接口 |
 
@@ -42,6 +43,26 @@ void kernel_user_thread_exit(
 ```
 
 RISC-V clone 接口接收 syscall 入口保存的完整寄存器快照；通用 scheduler 头不暴露架构 Trap Frame。普通任务创建、tick、exec、资源借用和 idle reaper 仍由 `include/kernel/scheduler.h` 与 `include/kernel/task.h` 提供。
+
+## 阻塞与唤醒
+
+所有 BLOCKED 任务都在全局 blocked 链上；`BLOCKED ⇔ 在 blocked 链上` 是 `validate_queues` 校验的不变量。任务携带可选的 `wait_queue` 令牌（wait4 式父唤醒为 NULL）、可选的 `wakeup_deadline`（`time` CSR 原始刻度，0 为无限）和 `wake_reason`。每个可阻塞资源内嵌一个 `struct kernel_wait_queue` 作为唤醒通道：
+
+```c
+void kernel_wait_queue_init(struct kernel_wait_queue *queue);
+enum kernel_scheduler_status kernel_wait_queue_wake_one(
+    struct kernel_wait_queue *queue);
+enum kernel_scheduler_status kernel_scheduler_block_current(
+    struct kernel_wait_queue *queue,
+    uint64_t deadline,
+    enum kernel_wait_wake_reason *wake_reason);
+enum kernel_scheduler_status kernel_scheduler_expire_deadlines(uint64_t now);
+enum kernel_scheduler_status kernel_scheduler_yield_current(void);
+```
+
+阻塞协议沿用 wait4 先例：调用方在关中断内检查条件，不满足则 `block_current` 置 BLOCKED、入 blocked 链并通过 `scheduler_switch_current_away` 切走；醒来后必须重查条件。`wake_one` 按 FIFO 走 blocked 链唤醒等待同一队列的最久任务；`expire_deadlines` 由 tick 路径调用，唤醒全部过期 deadline 任务。唤醒与到期都把任务摘链、清空等待字段、置 READY 并加入 ready 队尾。内核线程经 trampoline 运行在开中断态，调用上述接口前须用 `riscv_interrupt_save/restore` 收敛临界区。
+
+唤醒走链成本为 O(阻塞数)，到期扫描同样；等待队列不排序。等待数量增长后，per-queue 链与按 deadline 排序的 timer 链是预留的演进路径。当前 BLOCKED 不区分可中断/不可中断——信号落地时才拆分状态或引入信号驱动唤醒。
 
 ## 任务对象与创建所有权
 
@@ -126,4 +147,4 @@ make test-riscv
 
 聚焦测试覆盖调度状态、创建与清理失败；MM/files 测试分别证明地址空间 COW 与 OFD 引用共享。生产 ext4 三映像链覆盖 clone 双返回、PPID、WNOHANG/阻塞唤醒、wait selector、退出码、`SIGSEGV`/`SIGBUS` 状态、EFAULT 后已回收、fd offset 共享、MM 写隔离、孙进程向 PID 1 reparent，以及最终 heap/物理页基线。demand-page OOM 版本验证资源退出编码为 wait status 9，且仍走同一 zombie/reap 资源闭环。
 
-当前限制是 RISC-V64 单 hart、ASID 0、FIFO/单 tick 时间片、4 KiB 单页内核栈、单成员线程组和普通 SIGCHLD clone。尚无 `CLONE_VM/CLONE_FILES/CLONE_THREAD`、信号投递/handler、futex、vfork、rusage、停止/继续事件、SMP COW 同步、内核栈 guard、F/V 上下文或 LoongArch context。
+当前限制是 RISC-V64 单 hart、ASID 0、FIFO/单 tick 时间片、4 KiB 单页内核栈、单成员线程组和普通 SIGCHLD clone。尚无 `CLONE_VM/CLONE_FILES/CLONE_THREAD`、信号投递/handler、futex、vfork、rusage、停止/继续事件、SMP COW 同步、内核栈 guard、F/V 上下文或 LoongArch context。BLOCKED 尚无可中断/不可中断区分，`wait4` 的唤醒仍由子进程事件直接驱动而非等待队列令牌，两者分别随信号与进程模型阶段收敛。

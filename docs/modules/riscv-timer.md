@@ -9,9 +9,10 @@
 | `kernel/dtb.c`、`include/kernel/dtb.h` | 从根节点直属 `/cpus` 读取原始 `timebase-frequency` |
 | `arch/riscv/sbi.c`、`include/arch/riscv/sbi.h` | 探测 SBI 扩展并通过 TIME 设置绝对 deadline |
 | `arch/riscv/timer.c`、`include/arch/riscv/timer.h` | 维护单 hart timer 状态、读取 `time`、计算和重设 deadline、开启 STIE/SIE |
-| `arch/riscv/trap.c` | 处理 supervisor timer interrupt，把 elapsed 交给 tick 计数和 scheduler |
+| `arch/riscv/trap.c` | 处理 supervisor timer interrupt：重设 deadline 后依次驱动 deadline 到期、console 输入轮询和 scheduler tick |
+| `arch/riscv/virt_rtc.c`、`include/arch/riscv/virt_rtc.h` | goldfish RTC 墙钟读取，供内核时间子系统捕获启动时刻 |
 | `kernel/tick.c`、`include/kernel/tick.h` | 维护 100 Hz 策略使用的 64 位累计 tick |
-| `kernel/main.c` | 在最终 Sv39/direct map 后先初始化 scheduler，再启动 timer 并进入 `wfi` idle |
+| `kernel/main.c` | 在最终 Sv39/direct map 后初始化时间子系统，再初始化 scheduler、启动 timer 并进入 `wfi` idle |
 | `tests/riscv/timer_cases.c`、`tests/timer-riscv.sh` | 验证状态、deadline 数学、SBI 错误与真实 QEMU timer trap |
 | `tests/riscv/timer_boot.c` | 只在测试 ELF 中累计真实中断并于有限 tick 后关机 |
 | `tests/idle-riscv.sh` | 验证正常内核启动 timer 后持续 idle |
@@ -59,7 +60,7 @@ Direct-mode dispatcher 精确匹配：
 scause = interrupt bit | 5
 ```
 
-timer trap 进入时硬件已把旧 SIE 保存到 SPIE 并清 SIE，当前 handler 不重新开启嵌套中断。它不修改 `sepc`；在 SBI 安排新的未来 deadline 后累计 tick，再调用 scheduler。没有 READY 竞争者时 Trap Frame 通过 `sret` 回到原被中断位置；发生切换时则先切目标 `satp`，再恢复被选任务先前的调用链。U-mode ecall 和同步故障由同一 dispatcher 的独立分支处理，其他未知 cause 进入 fatal 诊断。
+timer trap 进入时硬件已把旧 SIE 保存到 SPIE 并清 SIE，当前 handler 不重新开启嵌套中断。它不修改 `sepc`；在 SBI 安排新的未来 deadline 后，dispatcher 依次执行：`kernel_tick_advance` 累计 tick、`kernel_scheduler_expire_deadlines(riscv_time_read())` 唤醒过期睡眠者（先于 tick 切换，使刚到期的任务可被同一次切换选中）、`kernel_console_poll_input()` 在 UART 有接收数据时唤醒 console 读阻塞者，最后调用 scheduler。没有 READY 竞争者时 Trap Frame 通过 `sret` 回到原被中断位置；发生切换时则先切目标 `satp`，再恢复被选任务先前的调用链。U-mode ecall 和同步故障由同一 dispatcher 的独立分支处理，其他未知 cause 进入 fatal 诊断。
 
 ## Deadline 与失败原子性
 
@@ -89,4 +90,4 @@ make test-riscv
 
 合成 DTB 覆盖缺失、错误位置、错误长度、零值、重复属性和失败输出不变。timer cases 覆盖全部启动状态，以及恰好到期、周期内迟到、跨周期迟到、无效输出和 `UINT64_MAX` 回绕。真实 QEMU 测试使用实际 DTB、`time` CSR、OpenSBI TIME 和 Trap Frame 返回路径，至少两次返回 `wfi` 后由测试链接包装在第三个累计 tick 关机。无根盘的正常 `kernel-rv` 持续 idle；挂载生产根盘时，timer 调度 PID 1，退出后由根生命周期主动关机。
 
-当前限制为单 hart、固定 100 Hz 周期策略和 SBI TIME 后端。Scheduler 当前把每个非零 elapsed 事件作为一次时间片到期，并保证一次 trap 最多切换一次。尚无线程睡眠/超时队列、tickless、Sstc 直写、外部中断、IPI、per-hart timer 或 LoongArch timer。正常 tick 和调度不写 UART；日志只出现在初始化和错误路径。
+当前限制为单 hart、固定 100 Hz 周期策略和 SBI TIME 后端。Scheduler 当前把每个非零 elapsed 事件作为一次时间片到期，并保证一次 trap 最多切换一次；deadline 到期与 console 轮询在每次 tick 各做一次 O(阻塞数) 走链。尚无 tickless、Sstc 直写、外部中断（console 接收现为 tick 轮询，延迟上界一个 tick）、IPI、per-hart timer 或 LoongArch timer。正常 tick 和调度不写 UART；日志只出现在初始化和错误路径。

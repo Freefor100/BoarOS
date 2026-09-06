@@ -25,7 +25,7 @@
 
 - OpenSBI 进入 `_start` 时，`a0` 是 boot hart ID，`a1` 是 DTB 的 guest 物理地址。入口立即保存二者，建立环境后再按 C ABI 传给 `kernel_main`。
 - 链接脚本把内核 VMA 放在 `0xffffffff80000000`，同时把第一个 `PT_LOAD` 的物理地址和 ELF 入口设为 `0x80200000`。该物理地址位于 QEMU `virt` 从 `0x80000000` 开始的 RAM 中；分页关闭时，`-mcmodel=medany` 生成的 PC 相对代码在低物理装载地址执行。
-- `_start` 不继承固件栈。它初始化 `gp`、关闭 S-mode 中断、将 `__bss_start..__bss_end` 清零，再使用 BSS 末尾 4 KiB、16 字节对齐的单 hart 启动栈。
+- `_start` 不继承固件栈。它初始化 `gp`、关闭 S-mode 中断、将 `__bss_start..__bss_end` 清零，再使用 BSS 末尾 16 KiB、16 字节对齐的单 hart 启动栈。该栈承载启动、idle 与测试 harness 主流程；4 KiB 时代在深文件路径（openat 经 fs context 解析进入 lwext4）确定性地溢出并破坏相邻 `.bss`，症状远离成因且随镜像布局移动，因此按内核路径深度预算放大。
 - 启动栈可用后，`_start` 将 `sscratch` 清零并把 `riscv_trap_entry` 写入 Direct-mode `stvec`。入口可以在当前内核栈保存完整整数 Frame 并执行 `sret`；生产 dispatcher 正式处理 timer interrupt，其他未处理 trap 仍进入致命诊断。
 - DTB 地址不是常量。`kernel_main` 读取第一段 RAM 和静态保留区，再加入 `[__kernel_start, __kernel_end)` 与 DTB 自身范围；只有形成非空可用区间后才报告启动布局。
 - 启动布局成功后，`kernel_main` 以 RISC-V 构建期固定的 4 KiB 页粒度初始化物理页分配器；不足一页的区间边缘不会进入分配器。

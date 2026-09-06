@@ -110,6 +110,12 @@ ready/exited 队列会同时被普通线程创建路径、timer handler 和 idle
 - 正常生产内核会永久 idle，有限关机逻辑应放在测试 ELF 的链接包装中；生产映像需用符号表确认不含测试 worker。
 - 静态分析适合发现 C 状态路径中的空指针、未初始化、双重释放和释放后使用；汇编寄存器集合、Trap Frame/context 配合及真实抢占顺序仍需要反汇编和 QEMU 端到端测试。
 
+## 阻塞与唤醒（当前结论）
+
+- BoarOS 的阻塞机制沿用 wait4 确立的模式：关中断内检查条件、置 BLOCKED、经 `riscv_context_switch` 切走；唤醒方把任务置 READY 并入 ready 队尾，被唤醒者从原调用点返回后必须重查条件。所有 BLOCKED 任务都在全局 blocked 链上，事件通道（wait_queue 令牌）与超时（deadline 刻度）是任务的字段而不是独立节点，唤醒按 FIFO 走链。
+- 单 hart 下丢失唤醒的唯一来源是"检查条件与阻塞之间开中断"；因此内核线程（trampoline 运行在 SIE=1）调用阻塞接口前必须用 `riscv_interrupt_save/restore` 收敛临界区，而 syscall/trap 上下文天然关中断。Linux 的 `schedule()` 把这一职责收进调度器本身并保存/恢复中断状态，等 BoarOS 引入线程和 SMP 时需要对齐这一语义。
+- 超时唤醒与事件唤醒共用一条 blocked 链：tick 处理器在抢占检查之前先扫描到期 deadline，使刚到期的任务能在同一次切换中被选中；唤醒延迟上界是一个 tick 周期。Linux 用红黑树/timer wheel 组织到期任务，等待队列按需唤醒；BoarOS 的 O(阻塞数) 走链是有意的阶段性简化，扩展路径已在模块文档声明。
+
 ## 资料依据
 
 - [RISC-V ELF psABI](https://riscv-non-isa.github.io/riscv-elf-psabi-doc/)：RV64 调用约定、callee-saved 寄存器和栈对齐。
