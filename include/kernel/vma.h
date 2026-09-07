@@ -30,6 +30,7 @@ enum kernel_vma_kind {
 enum kernel_vma_role {
     KERNEL_VMA_ROLE_NONE = 0,
     KERNEL_VMA_ROLE_ELF,
+    KERNEL_VMA_ROLE_VDSO,
     KERNEL_VMA_ROLE_STACK,
     KERNEL_VMA_ROLE_HEAP,
     KERNEL_VMA_ROLE_MMAP,

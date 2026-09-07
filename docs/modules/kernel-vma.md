@@ -40,7 +40,7 @@ enum kernel_mm_status kernel_mm_mprotect(
 
 集合是 MM record 通过 kernel heap 拥有的动态排序数组。按地址查找使用二分搜索；插入、拆分、删除和合并可能移动后缀。相邻 VMA 只有在权限、kind、role、fault policy、backing 以及连续文件偏移全部一致时才合并，因而不会跨越缺页策略或资源生命周期边界。
 
-非 fixed mmap 先尝试页对齐 hint；冲突时在 `brk_limit`（当前也是栈 guard 起点）以下 top-down 查找空洞，不做 ASLR。`MAP_FIXED_NOREPLACE` 在任意重叠时返回冲突且不改输出；`MAP_FIXED` 删除范围内所有旧 VMA/PTE 后放入新的匿名或文件私有映射。RISC-V 不能编码 W&&!R 用户叶子，因此 MM 把仅写请求规范化为 RW；`PROT_NONE` 用零权限 VMA 表示。
+非 fixed mmap 先尝试页对齐 hint；冲突时在 `brk_limit`（当前是固定 VDSO 起点）以下、避开栈 guard 的用户区间内 top-down 查找空洞，不做 ASLR。`MAP_FIXED_NOREPLACE` 在任意重叠时返回冲突且不改输出；`MAP_FIXED` 删除范围内所有旧 VMA/PTE 后放入新的匿名或文件私有映射。固定 VDSO VMA 由装载器登记并受普通用户映射边界保护。RISC-V 不能编码 W&&!R 用户叶子，因此 MM 把仅写请求规范化为 RW；`PROT_NONE` 用零权限 VMA 表示。
 
 排序数组的查找成本为 `O(log n)`，编辑成本最坏为 `O(n)`，内存连续且每个 VMA 不需要独立节点分配。`make test-vma-riscv` 在 QEMU `virt` 单 hart 上预热后分别对 1、64、1024 个间隔 VMA 重复 256 次 lookup，并输出平均 `rdcycle` 读数；脚本只要求三组基线存在，不把 QEMU 周期值当成开发板性能结论。若真实 mmap 密集工作负载显示数组移动或锁持有时间成为瓶颈，可在保持当前 MM 语义的前提下换成平衡树/Maple Tree 类结构。
 

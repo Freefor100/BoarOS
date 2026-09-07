@@ -284,7 +284,7 @@ VMA 属于 MM 而不是 task 或单张页表。fork 必须复制其逻辑布局�
 
 program break 是进程数据段高端之后的一个**字节地址**。Linux raw `brk` syscall 返回调整后的 break；若请求不能满足，则返回原值。常见 libc `brk()` 再把这个结果转换成 0/-1 并设置 `errno`，不能把 libc 包装层的返回约定写进内核 syscall ABI。
 
-静态 ELF 的初始 break 应覆盖所有装载段在内存中的末端，因此计算的是最高 `PT_LOAD.p_vaddr + p_memsz`，其中 `p_memsz` 已包含 BSS；program header 不保证按地址排序。BoarOS 把这个最高末端向上按 4 KiB 对齐作为 start/current break，把栈 guard 起点作为当前上界。当前 break 仍保存用户请求的精确字节值，只有 VMA/PTE 范围使用 `page_end(break)`：同页内调整不需要改页表，跨页增长才增加 VMA，跨页缩小才撤销整页。
+静态 ELF 的初始 break 应覆盖所有装载段在内存中的末端，因此计算的是最高 `PT_LOAD.p_vaddr + p_memsz`，其中 `p_memsz` 已包含 BSS；program header 不保证按地址排序。BoarOS 把这个最高末端向上按 4 KiB 对齐作为 start/current break，把固定 RX VDSO 起点作为当前上界，VDSO 紧邻 stack guard 并由独立 VMA 保护。当前 break 仍保存用户请求的精确字节值，只有 VMA/PTE 范围使用 `page_end(break)`：同页内调整不需要改页表，跨页增长才增加 VMA，跨页缩小才撤销整页。
 
 增长只建立 RW anonymous `DEMAND_ZERO` heap VMA，不立即分配数据页。这样申请一大片地址空间但只访问少量页面时，不会预先消耗所有物理页；代价由首次触页 fault 承担。相邻 heap VMA 属性相同会合并，所以反复小幅增长不会为每次 syscall 保留一个描述符。fork 复制调用时的精确 break、VMA 和已驻留页，父子随后独立调整；exec 则从新 ELF 重新计算，不继承旧 heap 高水位。
 

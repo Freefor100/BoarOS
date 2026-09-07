@@ -1,4 +1,5 @@
 #include "open_file_internal.h"
+#include "pipe_internal.h"
 #include "vfs_internal.h"
 
 #include <kernel/errno.h>
@@ -84,6 +85,57 @@ enum kernel_open_file_status kernel_open_file_create_console(
     return KERNEL_OPEN_FILE_STATUS_OK;
 }
 
+enum kernel_open_file_status kernel_open_file_create_pipe(
+    struct kernel_heap *heap,
+    struct kernel_pipe *pipe,
+    uint32_t endpoint,
+    uint64_t flags,
+    struct kernel_open_file_description **owner)
+{
+    struct kernel_open_file_description *file;
+    enum kernel_heap_status heap_status;
+    enum kernel_pipe_status pipe_status;
+
+    if (heap == 0 || pipe == 0 || owner == 0 || *owner != 0 ||
+        (endpoint != KERNEL_PIPE_ENDPOINT_READ &&
+         endpoint != KERNEL_PIPE_ENDPOINT_WRITE)) {
+        return KERNEL_OPEN_FILE_STATUS_INVALID_ARGUMENT;
+    }
+    heap_status = kernel_heap_allocate_zeroed(heap,
+                                              1U,
+                                              sizeof(*file),
+                                              (void **)&file);
+    if (heap_status != KERNEL_HEAP_STATUS_OK) {
+        return heap_status == KERNEL_HEAP_STATUS_EMPTY
+                   ? KERNEL_OPEN_FILE_STATUS_NO_MEMORY
+                   : KERNEL_OPEN_FILE_STATUS_STATE;
+    }
+    /* Keep an allocated description self-owned even if endpoint acquisition
+     * fails and heap cleanup has to be retried by the file table. */
+    file->heap = heap;
+    file->vfs_closed = 1U;
+    pipe_status = kernel_pipe_acquire_endpoint(pipe, endpoint);
+    if (pipe_status != KERNEL_PIPE_STATUS_OK) {
+        if (kernel_heap_release(heap, file) != KERNEL_HEAP_STATUS_OK) {
+            *owner = file;
+            return KERNEL_OPEN_FILE_STATUS_CLEANUP_REQUIRED;
+        }
+        return pipe_status == KERNEL_PIPE_STATUS_NO_MEMORY
+                   ? KERNEL_OPEN_FILE_STATUS_NO_MEMORY
+                   : KERNEL_OPEN_FILE_STATUS_STATE;
+    }
+    file->references = 1U;
+    file->kind = KERNEL_OPEN_FILE_KIND_PIPE;
+    file->file.mode = KERNEL_VFS_S_IFIFO | UINT32_C(0000600);
+    file->open_flags = (uint32_t)flags |
+                       (endpoint == KERNEL_PIPE_ENDPOINT_WRITE ? 1U : 0U);
+    file->pipe = pipe;
+    file->pipe_endpoint = (uint8_t)endpoint;
+    file->vfs_closed = 0U;
+    *owner = file;
+    return KERNEL_OPEN_FILE_STATUS_OK;
+}
+
 enum kernel_open_file_kind kernel_open_file_kind(
     const struct kernel_open_file_description *file)
 {
@@ -95,6 +147,8 @@ enum kernel_open_file_kind kernel_open_file_kind(
         return KERNEL_OPEN_FILE_KIND_DIRECTORY;
     case KERNEL_OPEN_FILE_KIND_CONSOLE:
         return KERNEL_OPEN_FILE_KIND_CONSOLE;
+    case KERNEL_OPEN_FILE_KIND_PIPE:
+        return KERNEL_OPEN_FILE_KIND_PIPE;
     default:
         return KERNEL_OPEN_FILE_KIND_REGULAR;
     }
@@ -115,6 +169,7 @@ enum kernel_open_file_status kernel_open_file_release(
     struct kernel_open_file_description **owner)
 {
     struct kernel_open_file_description *file;
+    enum kernel_pipe_status pipe_status;
 
     if (owner == 0 || *owner == 0) {
         return KERNEL_OPEN_FILE_STATUS_INVALID_ARGUMENT;
@@ -134,6 +189,20 @@ enum kernel_open_file_status kernel_open_file_release(
     }
     if (!file->vfs_closed) {
         if (file->kind == KERNEL_OPEN_FILE_KIND_CONSOLE) {
+            file->vfs_closed = 1U;
+        } else if (file->kind == KERNEL_OPEN_FILE_KIND_PIPE) {
+            if (file->pipe_endpoint_closed == 0U) {
+                pipe_status = kernel_pipe_release_endpoint(
+                    file->pipe,
+                    file->pipe_endpoint);
+                if (pipe_status != KERNEL_PIPE_STATUS_OK) {
+                    return pipe_status == KERNEL_PIPE_STATUS_CLEANUP_REQUIRED
+                               ? KERNEL_OPEN_FILE_STATUS_CLEANUP_REQUIRED
+                               : KERNEL_OPEN_FILE_STATUS_STATE;
+                }
+                file->pipe_endpoint_closed = 1U;
+                file->pipe = 0;
+            }
             file->vfs_closed = 1U;
         } else if (kernel_vfs_close(&file->file) != 0) {
             return KERNEL_OPEN_FILE_STATUS_CLEANUP_REQUIRED;

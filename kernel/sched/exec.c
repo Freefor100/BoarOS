@@ -11,6 +11,7 @@
 #include <kernel/heap.h>
 #include <kernel/mm.h>
 #include <kernel/scheduler.h>
+#include <kernel/signal.h>
 
 #include <stddef.h>
 #include <stdint.h>
@@ -126,6 +127,7 @@ enum kernel_scheduler_status kernel_scheduler_exec_commit(void)
                           transaction->image.entry,
                           transaction->image.stack_pointer,
                           transaction->image.thread_pointer);
+    kernel_signal_reset_on_exec(thread);
     transaction->state = KERNEL_EXEC_TRANSACTION_COMMITTED_CLEANUP;
 
     files_status = kernel_files_close_on_exec(&thread->files);

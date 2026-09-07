@@ -330,6 +330,23 @@ enum kernel_scheduler_status validate_queues(void)
             return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
         }
     }
+    status = validate_queue_shape(scheduler.stopped_head,
+                                  scheduler.stopped_tail);
+    if (status != KERNEL_SCHEDULER_STATUS_OK) {
+        return status;
+    }
+    if (scheduler.stopped_head != 0) {
+        if (scheduler.stopped_head->magic != KERNEL_THREAD_MAGIC ||
+            scheduler.stopped_tail->magic != KERNEL_THREAD_MAGIC ||
+            scheduler.stopped_head->state !=
+                KERNEL_THREAD_STATE_STOPPED ||
+            scheduler.stopped_tail->state !=
+                KERNEL_THREAD_STATE_STOPPED ||
+            scheduler.stopped_head->idle != 0U ||
+            scheduler.stopped_tail->idle != 0U) {
+            return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
+        }
+    }
     return KERNEL_SCHEDULER_STATUS_OK;
 }
 
@@ -482,6 +499,10 @@ enum kernel_scheduler_status kernel_scheduler_init(
     scheduler.ready_tail = 0;
     scheduler.exited_head = 0;
     scheduler.exited_tail = 0;
+    scheduler.blocked_head = 0;
+    scheduler.blocked_tail = 0;
+    scheduler.stopped_head = 0;
+    scheduler.stopped_tail = 0;
     scheduler.init_task = 0;
     scheduler.cleanup_page_address = 0U;
     scheduler.cleanup_page_owned = 0U;

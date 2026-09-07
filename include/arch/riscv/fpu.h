@@ -35,6 +35,8 @@ _Static_assert(sizeof(struct riscv_fpu_state) == RISCV_FPU_STATE_SIZE,
 
 void riscv_fpu_switch(struct riscv_fpu_state *previous,
                       struct riscv_fpu_state *next);
+void riscv_fpu_state_save(struct riscv_fpu_state *state);
+void riscv_fpu_state_restore(struct riscv_fpu_state *state);
 void riscv_fpu_reset_current(struct riscv_fpu_state *state);
 
 #endif

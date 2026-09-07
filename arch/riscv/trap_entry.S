@@ -89,6 +89,8 @@ riscv_trap_entry:
     .globl riscv_trap_return
     .type riscv_trap_return, @function
 riscv_trap_return:
+    mv a0, sp
+    call riscv_trap_return_prepare
     ld t0, RISCV_TRAP_FRAME_SSTATUS(sp)
     andi t1, t0, RISCV_SSTATUS_SIE
     bnez t1, .Lbad_return

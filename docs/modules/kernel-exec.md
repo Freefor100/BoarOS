@@ -68,4 +68,4 @@ make test-riscv
 
 生产测试把独立链接的 `/init`、`/stage2` 和 `/stage3` 写入真实只读 ext4，实际进入 U-mode 后连续执行相对和绝对路径 exec。测试覆盖路径/ELF/argv/envp/大小错误、失败原子性、PID/TID/cwd/fd offset 保持、close-on-exec、`AT_EXECFN`、寄存器重置、空 argv/envp 规范化、最终资源基线，并注入旧 MM 首次释放失败验证提交后的可重试清理。
 
-当前仅支持 RISC-V64 静态 `ET_EXEC`、单 hart 和单成员线程组。没有 shebang、`ET_DYN`/PIE、动态解释器、TLS、信号 disposition 重置、多线程 exec 收拢、凭据变化、`execveat`、文件写入并发规则或 LoongArch 映像后端。128 KiB 是当前整个初始栈映像的硬上限，不是完整 Linux `ARG_MAX` 实现。
+当前仅支持 RISC-V64 静态 `ET_EXEC`、单 hart 和单成员线程组。exec 已实现标准信号 disposition 重置（自定义 handler 恢复为 DFL、IGN 保留）以及 F/D 状态清零；没有 shebang、`ET_DYN`/PIE、动态解释器、TLS、多线程 exec 收拢、凭据变化、`execveat`、文件写入并发规则或 LoongArch 映像后端。128 KiB 是当前整个初始栈映像的硬上限，不是完整 Linux `ARG_MAX` 实现。

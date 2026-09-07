@@ -4,7 +4,9 @@
 #include <arch/riscv/trap.h>
 #include <arch/riscv/virt_uart.h>
 #include <kernel/console.h>
+#include <kernel/errno.h>
 #include <kernel/scheduler.h>
+#include <kernel/signal.h>
 #include <kernel/syscall.h>
 #include <kernel/task.h>
 #include <kernel/tick.h>
@@ -240,8 +242,16 @@ void riscv_trap_dispatch(struct riscv_trap_frame *frame)
             result.value = 0;
             result.action = KERNEL_SYSCALL_ACTION_RETURN;
         }
+        if (result.action == KERNEL_SYSCALL_ACTION_SIGNAL_RETURN) {
+            kernel_signal_restore_current(frame);
+            return;
+        }
         if (result.action != KERNEL_SYSCALL_ACTION_RETURN) {
             riscv_trap_fatal(frame);
+        }
+        if (result.value == -KERNEL_ERESTARTSYS) {
+            kernel_signal_note_syscall_restart(kernel_task_current());
+            return;
         }
         if (frame->sepc > UINT64_MAX - 4U) {
             kernel_user_thread_exit(KERNEL_THREAD_EXIT_USER_FAULT,
@@ -261,6 +271,11 @@ void riscv_trap_dispatch(struct riscv_trap_frame *frame)
     }
 
     riscv_trap_fatal(frame);
+}
+
+void riscv_trap_return_prepare(struct riscv_trap_frame *frame)
+{
+    kernel_signal_prepare_user_return(frame);
 }
 
 void riscv_trap_bad_return(struct riscv_trap_frame *frame)

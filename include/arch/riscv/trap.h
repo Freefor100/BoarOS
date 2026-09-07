@@ -148,6 +148,7 @@ _Static_assert(sizeof(struct riscv_trap_frame) == RISCV_TRAP_FRAME_SIZE,
 #undef RISCV_TRAP_ASSERT_OFFSET
 
 void riscv_trap_dispatch(struct riscv_trap_frame *frame);
+void riscv_trap_return_prepare(struct riscv_trap_frame *frame);
 void riscv_trap_bad_return(struct riscv_trap_frame *frame)
     __attribute__((noreturn));
 

@@ -10,8 +10,10 @@
 | [RISC-V 启动模块](modules/riscv-boot.md) | 当前启动代码的入口、契约、不变量和限制 |
 | [RISC-V Trap 模块](modules/riscv-trap.md) | S/U-mode Trap Frame、换栈、返回、诊断契约和测试 |
 | [RISC-V Timer 与内核 Tick 模块](modules/riscv-timer.md) | DTB timebase、SBI TIME、deadline、生产 timer trap 和 tick 契约 |
-| [内核调度与进程生命周期模块](modules/kernel-scheduler.md) | RISC-V switch context、FIFO 抢占、父子树、clone/wait、zombie/reparent 和失败回收契约 |
-| [系统调用解码模块](modules/kernel-syscall.md) | 显式调用任务、文件 I/O、身份、clone/exec/wait 与未知系统调用契约 |
+| [内核调度与进程生命周期模块](modules/kernel-scheduler.md) | RISC-V switch context、FIFO 抢占、阻塞/信号唤醒、父子树、clone/wait、zombie/reparent 和失败回收契约 |
+| [内核信号模块](modules/kernel-signal.md) | 标准信号、handler frame、sigreturn、stop/continue 和可中断 syscall 重启 |
+| [RISC-V 浮点状态模块](modules/riscv-fpu.md) | F/D per-task 状态、FS lazy 保存恢复、调度/exec/signal 边界 |
+| [系统调用解码模块](modules/kernel-syscall.md) | 显式调用任务、文件/pipe I/O、信号、身份、clone/exec/wait 与未知系统调用契约 |
 | [DTB 与启动内存布局模块](modules/dtb-memory.md) | RAM、静态保留区、VirtIO transport 与可用物理区间的接口和限制 |
 | [物理页分配模块](modules/physical-pages.md) | 启动分配、buddy 连续页、所有权与失败语义 |
 | [内核堆模块](modules/kernel-heap.md) | size-class slab、大对象 buddy 后备、统计和生命周期 |

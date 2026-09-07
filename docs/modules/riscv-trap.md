@@ -1,6 +1,6 @@
 # RISC-V Trap 模块
 
-本文描述当前 RISC-V S/U-mode trap 入口、整数上下文 ABI、返回与失败契约。架构机制和设计理由见 [RISC-V Trap 学习总结](../learning/riscv-traps.md)，正式 timer handler 见 [RISC-V Timer 与内核 Tick 模块](riscv-timer.md)，trap 内的线程切换见[内核线程调度模块](kernel-scheduler.md)。
+本文描述当前 RISC-V S/U-mode trap 入口、整数上下文 ABI、返回与失败契约，以及信号/FP 状态如何接入公共返回尾。架构机制和设计理由见 [RISC-V Trap 学习总结](../learning/riscv-traps.md)，正式 timer handler 见 [RISC-V Timer 与内核 Tick 模块](riscv-timer.md)，trap 内的线程切换见[内核线程调度模块](kernel-scheduler.md)，信号和 FP 所有权见[内核信号模块](kernel-signal.md)与[RISC-V 浮点状态模块](riscv-fpu.md)。
 
 ## 范围与入口
 
@@ -10,6 +10,7 @@
 | `arch/riscv/boot.S` | 在启动栈可用后清零 `sscratch` 并安装 Direct-mode `stvec` |
 | `arch/riscv/trap_entry.S` | 保存完整整数现场、调用 C dispatcher、验证并恢复或拒绝返回 |
 | `arch/riscv/trap.c` | 提供生产 dispatcher、用户页故障决策、timer/scheduler fatal 和非法返回诊断 |
+| `kernel/sched/signal.c`、`arch/riscv/fpu.S` | 在公共用户返回尾处理 signal frame/restart，并维护独立的 per-task F/D 状态 |
 | `tests/riscv/trap_return_main.c`、`trap_return_sie_main.c`、`trap_return_trigger.S` | 提供只在测试 ELF 中生效的同步与异步返回 handler、独立非法状态探针和寄存器探针 |
 | `tests/trap-return-riscv.sh` | 在 QEMU 中验证低地址恢复、返回状态和拒绝路径 |
 | `tests/riscv/high_half_trap.c`、`tests/high-half-trap-riscv.sh` | 在最终 Sv39 地址空间验证高半区恢复及 fatal 回归 |
@@ -23,7 +24,7 @@
 - 偏移 `0..240` 按 x1 到 x31 的架构编号保存 `ra`、原始 `sp`、`gp`、`tp` 和其余整数寄存器；x0 恒为零，不保存。用户 `gp` 保存后，入口以禁止 relaxation 的 PC 相对序列重载内核 `__global_pointer$`，C dispatcher 不依赖用户提供的全局数据基址。
 - 偏移 `248`、`256`、`264`、`272` 依次保存 `sstatus`、`sepc`、`scause`、`stval`；偏移 `280` 保存可信的内核 `tp`，结构总长 288 字节。
 - 汇编常量和 C 结构定义共享同一头文件；所有字段偏移和结构总大小均由编译期断言核对。
-- 当前 RV64IMAC 构建不包含浮点和向量指令，Trap Frame 不保存 F/V 状态；这些状态也不属于当前整数入口 ABI。
+- 基础内核按 RV64IMAC 构建，Trap Frame 仍不保存 F/V 状态；用户 F/D 状态由独立 per-task image 按 FS Dirty/Initial/ Clean 规则保存恢复，向量状态尚未实现。
 
 入口在破坏用户现场前先通过 `sscratch` 暂存用户 `tp`，并在切换可信栈后保存全部可写整数寄存器、原始 `sp` 和 CSR。完成保存后以 `a0=frame` 调用：
 
@@ -35,13 +36,15 @@ dispatcher 返回表示当前恢复到的线程 Frame 已经可以恢复。生�
 
 ## 返回契约
 
-dispatcher 返回后，汇编总是要求 Frame 中 `sstatus.SIE=0`，避免在寄存器恢复窗口提前接受中断。SPP=1 直接返回 S-mode；SPP=0 还要求 Frame 的 `kernel_tp` 非零、等于当前内核 `tp`，且线程前缀标记为用户任务，否则进入 `invalid trap return`，不会把任意 S-mode `tp` 当指针解引用。
+dispatcher 返回后，汇编总是要求 Frame 中 `sstatus.SIE=0`，避免在寄存器恢复窗口提前接受中断。进入汇编恢复前，C return tail 会调用 `kernel_signal_prepare_user_return()`：它处理 pending signal、默认动作/handler frame、被信号唤醒的 syscall restart，并在有 F/D 状态时由独立 FP 模块维护寄存器。SPP=1 直接返回 S-mode；SPP=0 还要求 Frame 的 `kernel_tp` 非零、等于当前内核 `tp`，且线程前缀标记为用户任务，否则进入 `invalid trap return`，不会把任意 S-mode `tp` 当指针解引用。
 
 合法返回按以下顺序完成：
 
 1. 对 Frame 内可写且自然对齐的 `sepc` 槽执行一次 `sc.d`，显式结束可能遗留的 LR/SC reservation；若条件存储成功，写回值仍是原 `sepc`。
 2. 将 Frame 中的 `sepc` 和 `sstatus` 写回 CSR。保存的 SIE 必须为零，因此寄存器恢复的关键窗口不会提前接受异步中断。
 3. S-mode 返回前保持 `sscratch=0`；U-mode 返回前把 current thread 写入 `sscratch`，随后恢复包括用户 `tp/sp` 在内的 x1..x31 并执行 `sret`。
+
+用户 handler 通过固定 RX VDSO 页进入 `rt_sigreturn(139)`，而不是执行用户栈上的代码。`rt_sigreturn` 在 C dispatcher 中恢复 signal frame；普通 syscall 被信号唤醒时，return tail 按 `SA_RESTART` 保持或跳过原 `sepc`，因此 ecall 的推进规则和 handler 返回规则集中在同一条返回路径。
 
 `sret` 根据 SPP 返回 S-mode，根据 SPIE 恢复 SIE。同步异常 handler 只有在理解故障指令长度和重试语义时才能修改 `sepc`；异步中断通常保持 `sepc` 不变，并必须在返回前解除或屏蔽中断源，否则会立即再次进入 trap。
 
@@ -51,7 +54,7 @@ dispatcher 返回后，汇编总是要求 Frame 中 `sstatus.SIE=0`，避免在�
 - `sscratch` 在内核执行期间固定为零，用户执行期间保存 current thread。入口先用 `csrrw` 与用户 `tp` 交换，从可信线程前缀取得 `kernel_sp`；保存用户 `tp/sp` 后立即把 `sscratch` 清零，再进入 C。
 - 保存现场和 C dispatcher 期间不重新打开 SIE，不支持嵌套异步中断。同步异常可以再次进入当前栈，但 handler、栈或诊断路径自身故障后的递归失败仍没有独立恢复保证。
 - boot idle 使用 4 KiB 静态启动栈，普通内核线程各使用私有 4 KiB 单页栈；没有独立 Trap 栈、guard page、per-hart IRQ 栈或溢出恢复。
-- 当前只有静态 timer、U ecall、匿名 demand-zero、file-private/COW fault 和用户同步故障终止处理，没有运行期 handler 注册、IPI、外部中断控制器、完整信号投递或 F/V 上下文管理。不可解析的用户故障仍直接终止任务。
+- 当前已处理静态 timer、U ecall、匿名 demand-zero、file-private/COW fault、标准 signal delivery/handler/sigreturn 和用户同步故障终止；没有 IPI、外部中断控制器、V 向量上下文或嵌套异步中断。不可解析的用户故障仍直接终止任务。
 
 ## 验证入口
 
@@ -61,6 +64,8 @@ make test-trap-riscv
 make test-high-half-trap-riscv
 make test-timer-riscv
 make test-scheduler-riscv
+make test-signal-riscv
+make test-userland-riscv
 make test-user-riscv
 make test-demand-page-riscv
 make test-user-fatal-riscv

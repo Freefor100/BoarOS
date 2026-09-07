@@ -9,6 +9,7 @@
 
 struct kernel_files;
 struct kernel_fs_context;
+struct kernel_task;
 
 enum kernel_scheduler_status {
     KERNEL_SCHEDULER_STATUS_OK = 0,
@@ -119,6 +120,7 @@ enum kernel_scheduler_status kernel_scheduler_wait4_current(
 enum kernel_wait_wake_reason {
     KERNEL_WAIT_WOKEN = 0,
     KERNEL_WAIT_TIMEOUT = 1,
+    KERNEL_WAIT_SIGNALLED = 2,
 };
 
 #define KERNEL_WAIT_QUEUE_INITIALIZED UINT32_C(0x57414954)
@@ -145,7 +147,12 @@ enum kernel_scheduler_status kernel_wait_queue_wake_one(
 enum kernel_scheduler_status kernel_scheduler_block_current(
     struct kernel_wait_queue *queue,
     uint64_t deadline,
+    int interruptible,
     enum kernel_wait_wake_reason *wake_reason);
+
+/* Wakes an interruptible waiter so a pending signal can be delivered. */
+enum kernel_scheduler_status kernel_scheduler_wake_signal(
+    struct kernel_task *task);
 
 /*
  * Timer-interrupt path: wakes every blocked task whose deadline has

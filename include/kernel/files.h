@@ -58,6 +58,7 @@ struct kernel_files_statistics {
 #define KERNEL_FILES_F_DUPFD_CLOEXEC UINT64_C(1030)
 #define KERNEL_FILES_O_APPEND UINT64_C(00002000)
 #define KERNEL_FILES_O_NONBLOCK UINT64_C(00004000)
+#define KERNEL_FILES_O_LARGEFILE UINT64_C(00100000)
 #define KERNEL_FILES_O_CLOEXEC UINT64_C(02000000)
 
 /* Linux asm-generic struct stat as the riscv64 ABI defines it. */
@@ -117,6 +118,14 @@ enum kernel_files_status kernel_files_openat(
     uint64_t user_path,
     uint64_t flags,
     uint64_t mode,
+    int64_t *linux_result);
+
+/* Creates a read/write pipe pair and copies the two descriptors to userland. */
+enum kernel_files_status kernel_files_pipe2(
+    struct kernel_files *files,
+    struct kernel_mm *mm,
+    uint64_t user_pipefd,
+    uint64_t flags,
     int64_t *linux_result);
 
 enum kernel_files_status kernel_files_read(

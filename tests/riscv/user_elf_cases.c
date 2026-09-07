@@ -481,9 +481,11 @@ unsigned long run_user_elf_cases(void)
     struct riscv_sv39_mapping text_mapping;
     struct riscv_sv39_mapping data_mapping;
     struct riscv_sv39_mapping stack_mapping;
+    struct riscv_sv39_mapping vdso_mapping;
     unsigned char *text_page;
     unsigned char *data_page;
     unsigned char *stack_page;
+    unsigned char *vdso_page;
     uint64_t argv_zero;
     uint64_t argv_one;
     uint64_t argv_null;
@@ -535,7 +537,7 @@ unsigned long run_user_elf_cases(void)
         RISCV_USER_ELF_STACK_RESERVE_BASE !=
             RISCV_USER_ELF_LIMIT - UINT64_C(0x800000) ||
         space.state != RISCV_SV39_USER_SPACE_LIVE ||
-        space.leaf_pages != 19U || space.table_pages != 5U) {
+        space.leaf_pages != 20U || space.table_pages != 6U) {
         return 3U;
     }
     if (!resolve_user_page(&space,
@@ -564,6 +566,18 @@ unsigned long run_user_elf_cases(void)
         !expect_pattern(data_page, 0x200U, TEST_FILE_BYTES, 0xc0U) ||
         !expect_zero(data_page, 0x280U, BOAROS_PAGE_SIZE)) {
         return 5U;
+    }
+    if (!resolve_user_page(&space,
+                           &allocator,
+                           RISCV_USER_ELF_VDSO_BASE,
+                           &vdso_mapping,
+                           &vdso_page) ||
+        vdso_mapping.permissions !=
+            (RISCV_SV39_USER | RISCV_SV39_READ | RISCV_SV39_EXECUTE) ||
+        *(const uint32_t *)vdso_page != UINT32_C(0x08b00893) ||
+        *(const uint32_t *)(vdso_page + sizeof(uint32_t)) !=
+            UINT32_C(0x00000073)) {
+        return 6U;
     }
     if (!resolve_user_page(&space,
                            &allocator,
@@ -685,12 +699,12 @@ unsigned long run_user_elf_cases(void)
                                RISCV_USER_ELF_STACK_GUARD_BASE,
                                &stack_mapping) !=
             RISCV_SV39_STATUS_NOT_MAPPED) {
-        return 6U;
+        return 7U;
     }
     if (riscv_sv39_user_space_destroy(&space) !=
             RISCV_SV39_STATUS_OK ||
         physical_page_available(&allocator) != available_before) {
-        return 7U;
+        return 8U;
     }
     return 0U;
 }
@@ -1014,7 +1028,7 @@ static unsigned long run_stack_boundary_cases(void)
         entry.stack_pointer !=
             RISCV_USER_ELF_STACK_TOP -
                 RISCV_USER_ELF_STACK_IMAGE_LIMIT ||
-        space.leaf_pages != 50U || space.table_pages != 5U ||
+        space.leaf_pages != 51U || space.table_pages != 6U ||
         !read_user_u64(&space,
                        &allocator,
                        entry.stack_pointer + 8U,
@@ -1467,6 +1481,15 @@ static unsigned long run_vma_registration_cases(void)
         descriptor.permissions != (KERNEL_MM_READ | KERNEL_MM_WRITE) ||
         descriptor.kind != KERNEL_VMA_KIND_ANONYMOUS ||
         descriptor.role != KERNEL_VMA_ROLE_STACK ||
+        kernel_mm_vma_lookup(&mm,
+                             RISCV_USER_ELF_VDSO_BASE,
+                             &descriptor) != KERNEL_MM_STATUS_OK ||
+        descriptor.start != RISCV_USER_ELF_VDSO_BASE ||
+        descriptor.end !=
+            RISCV_USER_ELF_VDSO_BASE + BOAROS_PAGE_SIZE ||
+        descriptor.permissions != (KERNEL_MM_READ | KERNEL_MM_EXECUTE) ||
+        descriptor.kind != KERNEL_VMA_KIND_ANONYMOUS ||
+        descriptor.role != KERNEL_VMA_ROLE_VDSO ||
         kernel_mm_vma_lookup(&mm,
                              RISCV_USER_ELF_STACK_GUARD_BASE,
                              &descriptor) != KERNEL_MM_STATUS_NOT_MAPPED) {

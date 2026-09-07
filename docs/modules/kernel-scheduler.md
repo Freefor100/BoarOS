@@ -1,6 +1,6 @@
 # 内核调度与进程生命周期模块
 
-本文描述当前单 hart FIFO 调度、任务身份、父子关系、普通进程 clone、阻塞 wait、退出与 zombie 回收契约。执行现场原理见[内核线程与抢占调度学习总结](../learning/kernel-scheduling.md)，进程语义背景见[进程生命周期学习总结](../learning/process-lifecycle.md)，地址空间所有权见[内核 MM 模块](kernel-mm.md)。
+本文描述当前单 hart FIFO 调度、任务身份、父子关系、普通进程 clone、可中断阻塞 wait、标准信号状态、退出与 zombie 回收契约。执行现场原理见[内核线程与抢占调度学习总结](../learning/kernel-scheduling.md)，信号 ABI 见[内核信号模块](kernel-signal.md)，进程语义背景见[进程生命周期学习总结](../learning/process-lifecycle.md)，地址空间所有权见[内核 MM 模块](kernel-mm.md)。
 
 ## 范围与入口
 
@@ -14,6 +14,7 @@
 | `kernel/sched/core.c` | idle、任务页、ready FIFO、tick 抢占和首次用户任务创建 |
 | `kernel/sched/process.c` | 父子链、clone/wait、BLOCKED/wakeup、exit/zombie/reap |
 | `kernel/sched/wait.c` | 全局 blocked 链、等待队列唤醒与 deadline 到期 |
+| `kernel/sched/signal.c`、`include/kernel/signal.h` | pending/blocked、默认动作、handler frame、stop/continue 和 syscall restart |
 | `kernel/sched/exec.c` | exec 映像提交 |
 | `kernel/sched/private.h` | scheduler 私有对象布局与跨实现文件接口 |
 
@@ -55,14 +56,17 @@ enum kernel_scheduler_status kernel_wait_queue_wake_one(
 enum kernel_scheduler_status kernel_scheduler_block_current(
     struct kernel_wait_queue *queue,
     uint64_t deadline,
+    int interruptible,
     enum kernel_wait_wake_reason *wake_reason);
+enum kernel_scheduler_status kernel_scheduler_wake_signal(
+    struct kernel_task *task);
 enum kernel_scheduler_status kernel_scheduler_expire_deadlines(uint64_t now);
 enum kernel_scheduler_status kernel_scheduler_yield_current(void);
 ```
 
 阻塞协议沿用 wait4 先例：调用方在关中断内检查条件，不满足则 `block_current` 置 BLOCKED、入 blocked 链并通过 `scheduler_switch_current_away` 切走；醒来后必须重查条件。`wake_one` 按 FIFO 走 blocked 链唤醒等待同一队列的最久任务；`expire_deadlines` 由 tick 路径调用，唤醒全部过期 deadline 任务。唤醒与到期都把任务摘链、清空等待字段、置 READY 并加入 ready 队尾。内核线程经 trampoline 运行在开中断态，调用上述接口前须用 `riscv_interrupt_save/restore` 收敛临界区。
 
-唤醒走链成本为 O(阻塞数)，到期扫描同样；等待队列不排序。等待数量增长后，per-queue 链与按 deadline 排序的 timer 链是预留的演进路径。当前 BLOCKED 不区分可中断/不可中断——信号落地时才拆分状态或引入信号驱动唤醒。
+唤醒走链成本为 O(阻塞数)，到期扫描同样；等待队列不排序。`interruptible` waiter 只接受未被 blocked 的 pending signal 唤醒，并返回 `KERNEL_WAIT_SIGNALLED`；vfork 等必须等待资源生命周期的路径传入不可中断标志。等待数量增长后，per-queue 链与按 deadline 排序的 timer 链是预留的演进路径。
 
 ## 任务对象与创建所有权
 
@@ -110,9 +114,9 @@ ZOMBIE  -- matching parent wait4 --------------> PID/task page released
 EXITED  -- parentless retry complete -----------> PID/task page released
 ```
 
-`wait4` 支持 `pid>0`、`pid==0`、`pid==-1` 和 `pid<-1` 的 Linux 选择规则，并接受 `WNOHANG/WUNTRACED/WCONTINUED/__WNOTHREAD/__WALL/__WCLONE` 位。当前没有 stopped/continued 事件，因此后两类选项只影响等待集合，不会制造事件。普通 SIGCHLD 子进程被 `__WCLONE` 排除，除非同时使用 `__WALL`。无匹配子进程返回 `-ECHILD`；有匹配但无事件时 `WNOHANG` 返回 0，否则父进程经通用等待队列阻塞在自己的 `child_exit_queue` 上，由子进程成为 zombie 时唤醒。rusage 非空时在回收点填 `struct kernel_linux_rusage`（144 字节）：`ru_utime/ru_stime` 来自被回收子进程自身与孙辈回卷的 tick 记账，其余字段为 0，坏指针返回 `-EFAULT` 且子进程同样已回收。
+`wait4` 支持 `pid>0`、`pid==0`、`pid==-1` 和 `pid<-1` 的 Linux 选择规则，并接受 `WNOHANG/WUNTRACED/WCONTINUED/__WNOTHREAD/__WALL/__WCLONE` 位。子进程的 stop/continue/exit 事件分别保存在 completion 状态中；`WUNTRACED` 和 `WCONTINUED` 决定父进程能否取出前两类事件，取出后只消费对应通知。普通 SIGCHLD 子进程被 `__WCLONE` 排除，除非同时使用 `__WALL`。无匹配子进程返回 `-ECHILD`；有匹配但无事件时 `WNOHANG` 返回 0，否则父进程经通用等待队列阻塞在自己的 `child_exit_queue` 上，由子进程状态变化唤醒。rusage 非空时在回收点填 `struct kernel_linux_rusage`（144 字节）：`ru_utime/ru_stime` 来自被回收子进程自身与孙辈回卷的 tick 记账，其余字段为 0，坏指针返回 `-EFAULT` 且子进程同样已回收。
 
-退出码编码为 `(status & 0xff) << 8`。已分类的页访问错误以内部 `SIGNAL` 原因保存 `SIGSEGV(11)` 或 `SIGBUS(7)`；其他用户同步故障按 scause 转换为 SIGILL/SIGTRAP/SIGBUS/SIGSEGV 形态 wait status。用户缺页耗尽物理页时，内部 completion 保留 `RESOURCE/NO_MEMORY`，父进程看到 SIGKILL 形态的 wait status 9。当前这只是不可捕获的终止与 wait 编码，还没有信号投递/handler。非空 rusage 当前返回 `-ENOTSUP`；未知 option 返回 `-EINVAL`，无法安全取负的 `INT32_MIN` pid 返回 `-ESRCH`。与 Linux 回收顺序一致，zombie 先被逻辑回收，再向用户复制 status；因此 status 指针错误返回 `-EFAULT` 时，该子进程也已不可再次 wait。
+普通退出码编码为 `(status & 0xff) << 8`；被信号终止的 child 编码为 `(signal & 0x7f)`，core 默认动作另置 `0x80`。用户同步故障和不可恢复的缺页仍可直接形成 SIGILL/SIGTRAP/SIGBUS/SIGSEGV/SIGKILL 形态 wait status；可捕获信号则先进入用户 handler，只有 handler 不返回或默认动作要求终止时才完成 child。信号、stop/continue 和 wait 的状态变化由 `kernel/sched/signal.c` 与 process completion 共同维护。非空 rusage 当前返回 `-ENOTSUP`；未知 option 返回 `-EINVAL`，无法安全取负的 `INT32_MIN` pid 返回 `-ESRCH`。与 Linux 回收顺序一致，zombie 先被逻辑回收，再向用户复制 status；因此 status 指针错误返回 `-EFAULT` 时，该子进程也已不可再次 wait。
 
 ## 退出、reparent 与失败恢复
 
@@ -141,6 +145,8 @@ make test-scheduler-riscv
 make test-mm-riscv
 make test-files-riscv
 make test-user-riscv
+make test-signal-riscv
+make test-userland-riscv
 make test-root-init-riscv
 make test-demand-page-riscv
 make test-exec-riscv
@@ -149,4 +155,4 @@ make test-riscv
 
 聚焦测试覆盖调度状态、创建与清理失败；MM/files 测试分别证明地址空间 COW 与 OFD 引用共享。生产 ext4 三映像链覆盖 clone 双返回、PPID、WNOHANG/阻塞唤醒、wait selector、退出码、`SIGSEGV`/`SIGBUS` 状态、EFAULT 后已回收、fd offset 共享、MM 写隔离、孙进程向 PID 1 reparent，以及最终 heap/物理页基线。demand-page OOM 版本验证资源退出编码为 wait status 9，且仍走同一 zombie/reap 资源闭环。
 
-当前限制是 RISC-V64 单 hart、ASID 0、FIFO/单 tick 时间片、4 KiB 单页内核栈、单成员线程组和普通 SIGCHLD clone。尚无 `CLONE_VM/CLONE_FILES/CLONE_THREAD`、信号投递/handler、futex、vfork、rusage、停止/继续事件、SMP COW 同步、内核栈 guard、F/V 上下文或 LoongArch context。BLOCKED 尚无可中断/不可中断区分，`wait4` 的唤醒仍由子进程事件直接驱动而非等待队列令牌，两者分别随信号与进程模型阶段收敛。
+当前限制是 RISC-V64 单 hart、ASID 0、FIFO/单 tick 时间片、4 KiB 单页内核栈、单成员线程组和普通 SIGCHLD clone。尚无 `CLONE_VM/CLONE_FILES/CLONE_THREAD`、实时信号排队、`sigaltstack`、signalfd、futex、SMP COW 同步、内核栈 guard、F/V 向量上下文或 LoongArch context。BLOCKED 的 wake queue 仍按全局 blocked 链 O(n) 扫描，wait4 的 child event 以父任务专属等待队列唤醒；这些是当前单 hart 路径的明确成本，不是 SMP 锁协议。

@@ -25,10 +25,10 @@ Linux ABI 兼容是最终功能方向，不是对当前完成度的声明；READ
 | 启动与内存 | DTB 内存/保留区和设备发现、启动布局、物理页分配、内核堆、RISC-V Sv39/4 KiB、direct map | RISC-V QEMU 已验证 |
 | 文件与根启动 | VirtIO MMIO version 1 legacy 与 version 2 modern、只读块 I/O、lwext4 适配、VFS、文件页缓存、静态 ELF `/init` | RISC-V QEMU 已验证；默认 legacy 与显式 modern 都有入口测试 |
 | 进程与基础 syscall | `openat/read/close`、`write/writev`、`lseek/fstat/newfstatat/getdents64`、`dup/dup2/dup3/fcntl`、`mmap/mprotect/munmap/brk`、`clone`（自定义子栈 + vfork 共享地址空间）/`execve`/`wait4`（rusage）/`exit_group`/`set_tid_address`、`times`、`sched_yield`、COW、阻塞 wait、zombie/reparent、`uname` | 已实现并按模块和真实根盘链路验证，覆盖仍是明确子集 |
-| 阻塞唤醒与时间 | 通用等待队列（事件通道 + deadline）、全局 blocked 链不变量、`clock_gettime/clock_getres/gettimeofday`（REALTIME/MONOTONIC）、`clock_nanosleep/nanosleep`、goldfish RTC 启动墙钟、console read 阻塞等待 UART 输入 | 已实现并经 scheduler 单测与 musl 真实睡眠/时钟闭环验证；`times` 与每任务记账、信号驱动的可中断睡眠、PLIC 驱动接收仍是已知缺口 |
+| 阻塞唤醒与时间 | 通用等待队列（事件通道 + deadline）、全局 blocked 链不变量、`clock_gettime/clock_getres/gettimeofday`（REALTIME/MONOTONIC）、`clock_nanosleep/nanosleep`、goldfish RTC 启动墙钟、console read 阻塞等待 UART 输入、标准信号驱动唤醒与 `SA_RESTART` | 已实现并经 scheduler 单测与 musl 真实睡眠/时钟/信号闭环验证；`times` 与每任务记账、PLIC 驱动接收仍是已知缺口 |
 | 用户态映像 | Linux 形态初始栈和 auxv、静态 `ET_EXEC`、匿名/文件私有按需页、W^X、指令同步 | RISC-V 已验证；动态 ELF、PIE、解释器和 TLS 尚未实现 |
 | 其他架构与平台 | LoongArch64 2K1000LA 的 16 KiB/三级页表；VisionFive 2 的 RISC-V 板级启动与设备/DMA 边界 | 目标已确认，开发板实机验证和 LoongArch 物化器尚未完成 |
-| 后续 Linux 能力组 | 动态链接、更多文件 syscall、信号、线程/共享资源、futex、外部中断、SMP、可写文件系统及更多设备 transport | 属于长期 ABI 路线，按真实用户程序和依赖推进，不能伪装成当前已支持 |
+| 后续 Linux 能力组 | 动态链接、更多文件 syscall、实时信号排队与 `sigaltstack`/signalfd、线程/共享资源、futex、外部中断、SMP、可写文件系统及更多设备 transport | 属于长期 ABI 路线，按真实用户程序和依赖推进，不能伪装成当前已支持 |
 
 “所有 syscall”必须绑定架构、内核版本和功能范围；未实现或仅返回 `ENOSYS` 的调用不计作完成。官方测例、未特改用户程序和 LTP 用来发现缺口和防止回归，不反向定义内核的全部语义。
 

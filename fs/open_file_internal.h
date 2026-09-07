@@ -13,7 +13,17 @@ struct kernel_open_file_description {
     uint32_t references;
     uint8_t kind;
     uint8_t vfs_closed;
+    struct kernel_pipe *pipe;
+    uint8_t pipe_endpoint;
+    uint8_t pipe_endpoint_closed;
 };
+
+enum kernel_open_file_status kernel_open_file_create_pipe(
+    struct kernel_heap *heap,
+    struct kernel_pipe *pipe,
+    uint32_t endpoint,
+    uint64_t flags,
+    struct kernel_open_file_description **owner);
 
 /* Drop a live container reference without running fallible final cleanup. */
 enum kernel_open_file_status kernel_open_file_detach(

@@ -60,7 +60,7 @@ write-first 且缓存未命中，直接把文件内容读入私有页可避免�
 
 无命令行解析阶段需要一个确定的根选择规则。BoarOS 当前使用 DTB 翻译后的物理 MMIO 地址排序，选择第一个成功初始化的 block device；选中后若不是可挂载 ext4 或缺少 `/init`，启动失败，不扫描磁盘内容寻找替代根。这让平台拓扑决定设备顺序，行为可复现；以后支持 Linux `root=` 时可在块设备身份层增加显式选择，而不改变 ext4/VFS。
 
-PID 1 是用户空间生命周期的根。Linux 通常在 init 退出时 panic，因为继续运行已没有负责收养孤儿和维持用户空间的进程。BoarOS 已实现普通父子进程、reparent、zombie/wait 和同步故障终止状态，但尚无可投递、阻塞或捕获的完整信号。PID 1 及全部后代退出后，scheduler 先关闭 fd、释放 fs context、地址空间、PID 和任务页，再由根启动 purge 文件缓存、卸载根并关机。顺序不能倒置：OFD、MM 文件 backing 与缓存 node 都借用 mount，必须先释放这些引用。完成记录必须保存 TID/TGID 快照，否则任务页和 PID 被释放后就无法可靠判断退出者身份。
+PID 1 是用户空间生命周期的根。Linux 通常在 init 退出时 panic，因为继续运行已没有负责收养孤儿和维持用户空间的进程。BoarOS 已实现普通父子进程、reparent、zombie/wait、标准信号 handler 和同步故障终止状态；pipe endpoint 也在同一 task 资源回收边界内关闭。PID 1 及全部后代退出后，scheduler 先关闭 fd、pipe、释放 fs context、地址空间、PID 和任务页，再由根启动 purge 文件缓存、卸载根并关机。顺序不能倒置：OFD、MM 文件 backing 与缓存 node 都借用 mount，必须先释放这些引用。完成记录必须保存 TID/TGID 快照，否则任务页和 PID 被释放后就无法可靠判断退出者身份。
 
 ## 验证经验
 
@@ -68,6 +68,7 @@ PID 1 是用户空间生命周期的根。Linux 通常在 init 退出时 panic�
 - 文件系统测试应建立真实镜像并通过工具设置 mode、checksum 与 incompat feature；只用手写 superblock fixture 很难覆盖 extent、目录和校验链。
 - 成功读取文件不足以证明生命周期完整；应在 open file 时验证 unmount 为 busy，并在 close/unmount/device destroy 后比较物理页和 heap live/current pages。
 - 进程文件测试还应覆盖最低 fd 复用、扩容边界、两次 open 的独立 offset、路径 NUL 上限、跨页 usercopy、部分 fault 后 offset，以及 close 已摘除 fd 但底层释放需要重试的状态。
+- pipe 测试要覆盖两端引用、≤PIPE_BUF 写原子性、读写阻塞/`O_NONBLOCK`、EOF、EPIPE/SIGPIPE、FIFO `fstat`/`ESPIPE` 和创建/关闭失败后的 owner 重试。
 - 页缓存测试要区分 hit/miss、尾页有效长度、被映射页 pin、LRU 驱逐和分配失败触发的有界回收；file-private mmap 还要验证写后其他别名与文件内容不变、关闭 fd 后仍可 fault、fork 后来源有效，以及整页越过 EOF 的 `SIGBUS`。
 - Exec 文件测试要同时保留普通 fd 和 CLOEXEC fd：新映像应从普通 fd 的原 offset 继续读取，而 CLOEXEC fd 即使底层 close 需要重试也必须立即不可见；失败的 exec 则不能关闭任何 fd。
 - 根启动 fixture 应独立链接并写入磁盘，不能把 ELF 同时嵌入 kernel，否则无法证明 VFS 是生产数据来源。

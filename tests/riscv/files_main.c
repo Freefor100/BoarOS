@@ -1375,7 +1375,8 @@ static void run_dup_fcntl_operations(struct kernel_files *files,
         kernel_files_fcntl(files,
                            3,
                            KERNEL_FILES_F_SETFL,
-                           KERNEL_FILES_O_NONBLOCK,
+                           KERNEL_FILES_O_NONBLOCK |
+                               KERNEL_FILES_O_LARGEFILE,
                            &result) != KERNEL_FILES_STATUS_OK ||
         result != 0 ||
         kernel_files_fcntl(files,

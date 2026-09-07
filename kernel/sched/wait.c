@@ -46,10 +46,48 @@ void blocked_unlink(struct kernel_task *thread)
     thread->next = 0;
 }
 
+/* STOPPED tasks park on their own list so the blocked-list invariant
+ * (state == BLOCKED) stays intact; SIGCONT/SIGKILL move them back to
+ * the ready queue. */
+void stopped_append(struct kernel_task *thread)
+{
+    thread->next = 0;
+    if (scheduler.stopped_tail == 0) {
+        scheduler.stopped_head = thread;
+    } else {
+        scheduler.stopped_tail->next = thread;
+    }
+    scheduler.stopped_tail = thread;
+}
+
+void stopped_unlink(struct kernel_task *thread)
+{
+    struct kernel_task *previous = 0;
+    struct kernel_task *current = scheduler.stopped_head;
+
+    while (current != 0 && current != thread) {
+        previous = current;
+        current = current->next;
+    }
+    if (current != thread) {
+        return;
+    }
+    if (previous == 0) {
+        scheduler.stopped_head = thread->next;
+    } else {
+        previous->next = thread->next;
+    }
+    if (scheduler.stopped_tail == thread) {
+        scheduler.stopped_tail = previous;
+    }
+    thread->next = 0;
+}
+
 static void wake_task(struct kernel_task *thread, uint32_t reason)
 {
     thread->wait_queue = 0;
     thread->wakeup_deadline = 0;
+    thread->wait_interruptible = 0U;
     thread->wake_reason = reason;
     thread->state = KERNEL_THREAD_STATE_READY;
     ready_append(thread);
@@ -132,6 +170,7 @@ enum kernel_scheduler_status kernel_scheduler_expire_deadlines(uint64_t now)
 enum kernel_scheduler_status kernel_scheduler_block_current(
     struct kernel_wait_queue *queue,
     uint64_t deadline,
+    int interruptible,
     enum kernel_wait_wake_reason *wake_reason)
 {
     struct kernel_task *current;
@@ -140,7 +179,7 @@ enum kernel_scheduler_status kernel_scheduler_block_current(
     if (scheduler.initialized != KERNEL_SCHEDULER_INITIALIZED) {
         return KERNEL_SCHEDULER_STATUS_NOT_INITIALIZED;
     }
-    if (wake_reason == 0 ||
+    if (wake_reason == 0 || (interruptible != 0 && interruptible != 1) ||
         (queue != 0 && queue->initialized != KERNEL_WAIT_QUEUE_INITIALIZED)) {
         return KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
     }
@@ -163,6 +202,7 @@ enum kernel_scheduler_status kernel_scheduler_block_current(
     current->wait_queue = queue;
     current->wakeup_deadline = deadline;
     current->wake_reason = (uint32_t)KERNEL_WAIT_WOKEN;
+    current->wait_interruptible = (uint32_t)interruptible;
     current->state = KERNEL_THREAD_STATE_BLOCKED;
     blocked_append(current);
     status = scheduler_switch_current_away(current);
@@ -171,5 +211,23 @@ enum kernel_scheduler_status kernel_scheduler_block_current(
     }
 
     *wake_reason = (enum kernel_wait_wake_reason)current->wake_reason;
+    return KERNEL_SCHEDULER_STATUS_OK;
+}
+
+enum kernel_scheduler_status kernel_scheduler_wake_signal(
+    struct kernel_task *task)
+{
+    if (scheduler.initialized != KERNEL_SCHEDULER_INITIALIZED) {
+        return KERNEL_SCHEDULER_STATUS_NOT_INITIALIZED;
+    }
+    if (task == 0 || riscv_interrupt_is_enabled()) {
+        return KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
+    }
+    if (task->state != KERNEL_THREAD_STATE_BLOCKED ||
+        task->wait_interruptible == 0U) {
+        return KERNEL_SCHEDULER_STATUS_OK;
+    }
+    blocked_unlink(task);
+    wake_task(task, (uint32_t)KERNEL_WAIT_SIGNALLED);
     return KERNEL_SCHEDULER_STATUS_OK;
 }

@@ -117,6 +117,7 @@ C_SOURCES := \
 	fs/files.c \
 	fs/fs_context.c \
 	fs/open_file.c \
+	fs/pipe.c \
 	fs/page_cache.c \
 	fs/vfs.c \
 	kernel/boot_memory.c \
@@ -131,6 +132,7 @@ C_SOURCES := \
 	kernel/sched/core.c \
 	kernel/sched/exec.c \
 	kernel/sched/process.c \
+	kernel/sched/signal.c \
 	kernel/sched/wait.c \
 	kernel/syscall.c \
 	kernel/tick.c \
@@ -150,6 +152,7 @@ OBJECTS := \
 	$(patsubst %.S,$(BUILD_DIR)/%.o,$(ASM_SOURCES))
 TEST_RUNTIME_C_SOURCES := \
 	arch/riscv/context.c \
+	arch/riscv/direct_map.c \
 	arch/riscv/exec.c \
 	arch/riscv/mm.c \
 	arch/riscv/sbi.c \
@@ -165,6 +168,7 @@ TEST_RUNTIME_C_SOURCES := \
 	fs/fs_context.c \
 	fs/lwext4_port.c \
 	fs/open_file.c \
+	fs/pipe.c \
 	fs/page_cache.c \
 	fs/vfs.c \
 	kernel/block.c \
@@ -176,6 +180,7 @@ TEST_RUNTIME_C_SOURCES := \
 	kernel/sched/core.c \
 	kernel/sched/exec.c \
 	kernel/sched/process.c \
+	kernel/sched/signal.c \
 	kernel/sched/wait.c \
 	kernel/syscall.c \
 	kernel/tick.c \
@@ -269,7 +274,6 @@ FILES_TEST_OBJECTS := \
 	$(TEST_RUNTIME_OBJECTS) \
 	$(patsubst %.c,$(BUILD_DIR)/%.o,$(FILES_TEST_C_SOURCES))
 SV39_TEST_C_SOURCES := \
-	arch/riscv/direct_map.c \
 	tests/riscv/direct_map_cases.c \
 	tests/riscv/sv39_cases.c \
 	tests/riscv/sv39_main.c
@@ -335,6 +339,13 @@ SYSCALL_TEST_C_SOURCES := \
 SYSCALL_TEST_OBJECTS := \
 	$(TEST_RUNTIME_OBJECTS) \
 	$(patsubst %.c,$(BUILD_DIR)/%.o,$(SYSCALL_TEST_C_SOURCES))
+SIGNAL_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-signal-rv
+SIGNAL_TEST_C_SOURCES := \
+	tests/riscv/signal_cases.c \
+	tests/riscv/signal_main.c
+SIGNAL_TEST_OBJECTS := \
+	$(TEST_RUNTIME_OBJECTS) \
+	$(patsubst %.c,$(BUILD_DIR)/%.o,$(SIGNAL_TEST_C_SOURCES))
 ELF64_TEST_C_SOURCES := \
 	tests/riscv/elf64_cases.c \
 	tests/riscv/elf64_main.c
@@ -410,6 +421,7 @@ DEPS := \
 	$(SCHEDULER_CASES_TEST_OBJECTS:.o=.d) \
 	$(SCHEDULER_BOOT_TEST_OBJECTS:.o=.d) \
 	$(SYSCALL_TEST_OBJECTS:.o=.d) \
+	$(SIGNAL_TEST_OBJECTS:.o=.d) \
 	$(ELF64_TEST_OBJECTS:.o=.d) \
 	$(USER_ELF_CASES_TEST_OBJECTS:.o=.d) \
 	$(USER_ELF_TEST_OBJECTS:.o=.d) \
@@ -439,7 +451,7 @@ DEPS := \
 	test-block-riscv test-heap-riscv test-page-riscv test-vfs-riscv \
 	test-scheduler-cases-riscv test-scheduler-riscv \
 	test-references test-riscv test-sv39-fault-riscv test-sv39-riscv \
-	test-syscall-riscv test-timer-riscv test-trap-riscv \
+	test-syscall-riscv test-signal-riscv test-timer-riscv test-trap-riscv \
 	test-trap-return-riscv test-user-fatal-riscv test-mm-riscv \
 	test-uaccess-riscv test-user-riscv test-vma-riscv test-brk-riscv \
 	test-mmap-riscv
@@ -614,7 +626,23 @@ $(SYSCALL_TEST_KERNEL_RV): $(SYSCALL_TEST_OBJECTS) arch/riscv/linker.ld
 	-Wl,--wrap=kernel_open_file_kind \
 	-Wl,--wrap=kernel_open_file_release \
 	-Wl,-Map,$(BUILD_DIR)/tests/kernel-syscall-rv.map \
-	-o $@ $(SYSCALL_TEST_OBJECTS)
+		-o $@ $(SYSCALL_TEST_OBJECTS)
+
+$(SIGNAL_TEST_KERNEL_RV): $(SIGNAL_TEST_OBJECTS) arch/riscv/linker.ld
+	$(CC) $(LDFLAGS) \
+		-Wl,--wrap=kernel_copy_from_user \
+		-Wl,--wrap=kernel_copy_to_user \
+		-Wl,--wrap=kernel_signal_get_action \
+		-Wl,--wrap=kernel_signal_set_action \
+		-Wl,--wrap=kernel_signal_get_blocked \
+		-Wl,--wrap=kernel_signal_update_blocked \
+		-Wl,--wrap=kernel_signal_get_pending \
+		-Wl,--wrap=kernel_signal_send_targets \
+		-Wl,--wrap=kernel_signal_send_thread \
+		-Wl,--wrap=kernel_task_mm_borrow_mutable \
+		-Wl,--wrap=kernel_task_tid \
+		-Wl,-Map,$(BUILD_DIR)/tests/kernel-signal-rv.map \
+		-o $@ $(SIGNAL_TEST_OBJECTS)
 
 $(ELF64_TEST_KERNEL_RV): $(ELF64_TEST_OBJECTS) arch/riscv/linker.ld
 	$(CC) $(LDFLAGS) \
@@ -801,7 +829,8 @@ test-riscv: $(DTB_TEST_KERNEL_RV) $(PAGE_TEST_KERNEL_RV) \
 	$(FILES_TEST_KERNEL_RV) \
 	$(CONTEXT_TEST_KERNEL_RV) $(SCHEDULER_CASES_TEST_KERNEL_RV) \
 	$(SCHEDULER_BOOT_TEST_KERNEL_RV) \
-	$(SYSCALL_TEST_KERNEL_RV) $(ELF64_TEST_KERNEL_RV) \
+	$(SYSCALL_TEST_KERNEL_RV) $(SIGNAL_TEST_KERNEL_RV) \
+	$(ELF64_TEST_KERNEL_RV) \
 	$(USER_ELF_CASES_TEST_KERNEL_RV) $(USER_ELF_TEST_KERNEL_RV) \
 	$(USER_TEST_KERNEL_RV) $(USER_FATAL_TEST_KERNEL_RV) \
 	$(MM_TEST_KERNEL_RV) $(UACCESS_TEST_KERNEL_RV) \
@@ -846,6 +875,9 @@ test-riscv: $(DTB_TEST_KERNEL_RV) $(PAGE_TEST_KERNEL_RV) \
 	QEMU_RISCV64=$(QEMU_RISCV64) \
 		SYSCALL_TEST_KERNEL_RV=$(SYSCALL_TEST_KERNEL_RV) \
 		./tests/syscall-riscv.sh
+	QEMU_RISCV64=$(QEMU_RISCV64) \
+		SIGNAL_TEST_KERNEL_RV=$(SIGNAL_TEST_KERNEL_RV) \
+		./tests/signal-riscv.sh
 	QEMU_RISCV64=$(QEMU_RISCV64) \
 		ELF64_TEST_KERNEL_RV=$(ELF64_TEST_KERNEL_RV) \
 		./tests/elf64-riscv.sh
@@ -983,6 +1015,10 @@ test-scheduler-riscv: $(SCHEDULER_BOOT_TEST_KERNEL_RV)
 test-syscall-riscv: $(SYSCALL_TEST_KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) SYSCALL_TEST_KERNEL_RV=$< \
 		./tests/syscall-riscv.sh
+
+test-signal-riscv: $(SIGNAL_TEST_KERNEL_RV)
+	QEMU_RISCV64=$(QEMU_RISCV64) SIGNAL_TEST_KERNEL_RV=$< \
+		./tests/signal-riscv.sh
 
 MUSL_TARBALL := references/musl/musl-1.2.5.tar.gz
 MUSL_ROOT := $(BUILD_DIR)/musl-root

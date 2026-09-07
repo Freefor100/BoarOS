@@ -8,27 +8,13 @@
      * code allowed to touch the FP unit. */
     .option arch, +f, +d
 
-/* void riscv_fpu_switch(struct riscv_fpu_state *previous,
- *                       struct riscv_fpu_state *next)
+/* void riscv_fpu_state_save(struct riscv_fpu_state *state)
  *
- * Runs with interrupts off at every context switch, before the integer
- * context switch.  When the live state is Dirty it is saved into
- * `previous` and marked Clean; when `next` carries a saved image it is
- * reloaded from memory and left Clean so the Dirty flag again tracks
- * only user modification (privileged spec table 14: restore completes
- * as Clean).  Kernel threads never save (FS is never Dirty while only
- * kernel code ran) and never restore (saved stays zero).  The task exit
- * path passes a NULL `previous`: only the next image is reloaded. */
-    .globl riscv_fpu_switch
-    .type riscv_fpu_switch, @function
-riscv_fpu_switch:
-    beqz a0, .Lswitch_restore
-    csrr t0, sstatus
-    srli t0, t0, 13
-    andi t0, t0, 3
-    li t1, 3
-    bne t0, t1, .Lswitch_restore
-
+ * Saves the live registers into `state` and marks it authoritative;
+ * FS ends Clean so later user modification is tracked again. */
+    .globl riscv_fpu_state_save
+    .type riscv_fpu_state_save, @function
+riscv_fpu_state_save:
     fsd f0, 0(a0)
     fsd f1, 8(a0)
     fsd f2, 16(a0)
@@ -69,50 +55,93 @@ riscv_fpu_switch:
     csrc sstatus, t0
     li t0, RISCV_SSTATUS_FS_CLEAN
     csrs sstatus, t0
+    ret
 
-.Lswitch_restore:
-    ld t0, RISCV_FPU_STATE_SAVED_OFFSET(a1)
-    beqz t0, .Lswitch_done
-    fld f0, 0(a1)
-    fld f1, 8(a1)
-    fld f2, 16(a1)
-    fld f3, 24(a1)
-    fld f4, 32(a1)
-    fld f5, 40(a1)
-    fld f6, 48(a1)
-    fld f7, 56(a1)
-    fld f8, 64(a1)
-    fld f9, 72(a1)
-    fld f10, 80(a1)
-    fld f11, 88(a1)
-    fld f12, 96(a1)
-    fld f13, 104(a1)
-    fld f14, 112(a1)
-    fld f15, 120(a1)
-    fld f16, 128(a1)
-    fld f17, 136(a1)
-    fld f18, 144(a1)
-    fld f19, 152(a1)
-    fld f20, 160(a1)
-    fld f21, 168(a1)
-    fld f22, 176(a1)
-    fld f23, 184(a1)
-    fld f24, 192(a1)
-    fld f25, 200(a1)
-    fld f26, 208(a1)
-    fld f27, 216(a1)
-    fld f28, 224(a1)
-    fld f29, 232(a1)
-    fld f30, 240(a1)
-    fld f31, 248(a1)
-    ld t0, RISCV_FPU_STATE_FCSR_OFFSET(a1)
+    .size riscv_fpu_state_save, . - riscv_fpu_state_save
+
+/* void riscv_fpu_state_restore(struct riscv_fpu_state *state)
+ *
+ * Reloads the registers from `state`; the memory image stays
+ * authoritative for the next dispatch.  FS ends Clean. */
+    .globl riscv_fpu_state_restore
+    .type riscv_fpu_state_restore, @function
+riscv_fpu_state_restore:
+    fld f0, 0(a0)
+    fld f1, 8(a0)
+    fld f2, 16(a0)
+    fld f3, 24(a0)
+    fld f4, 32(a0)
+    fld f5, 40(a0)
+    fld f6, 48(a0)
+    fld f7, 56(a0)
+    fld f8, 64(a0)
+    fld f9, 72(a0)
+    fld f10, 80(a0)
+    fld f11, 88(a0)
+    fld f12, 96(a0)
+    fld f13, 104(a0)
+    fld f14, 112(a0)
+    fld f15, 120(a0)
+    fld f16, 128(a0)
+    fld f17, 136(a0)
+    fld f18, 144(a0)
+    fld f19, 152(a0)
+    fld f20, 160(a0)
+    fld f21, 168(a0)
+    fld f22, 176(a0)
+    fld f23, 184(a0)
+    fld f24, 192(a0)
+    fld f25, 200(a0)
+    fld f26, 208(a0)
+    fld f27, 216(a0)
+    fld f28, 224(a0)
+    fld f29, 232(a0)
+    fld f30, 240(a0)
+    fld f31, 248(a0)
+    ld t0, RISCV_FPU_STATE_FCSR_OFFSET(a0)
     csrw fcsr, t0
     li t0, RISCV_SSTATUS_FS_MASK
     csrc sstatus, t0
     li t0, RISCV_SSTATUS_FS_CLEAN
     csrs sstatus, t0
+    ret
+
+    .size riscv_fpu_state_restore, . - riscv_fpu_state_restore
+
+/* void riscv_fpu_switch(struct riscv_fpu_state *previous,
+ *                       struct riscv_fpu_state *next)
+ *
+ * Runs with interrupts off at every context switch, before the integer
+ * context switch.  When the live state is Dirty it is saved into
+ * `previous` and marked Clean; when `next` carries a saved image it is
+ * reloaded from memory so the Dirty flag again tracks only user
+ * modification (privileged spec table 14: restore completes as Clean).
+ * Kernel threads never save (FS is never Dirty while only kernel code
+ * ran) and never restore (saved stays zero).  The task exit path
+ * passes a NULL `previous`: only the next image is reloaded. */
+    .globl riscv_fpu_switch
+    .type riscv_fpu_switch, @function
+riscv_fpu_switch:
+    addi sp, sp, -16
+    sd ra, 0(sp)
+    beqz a0, .Lswitch_restore
+    csrr t0, sstatus
+    srli t0, t0, 13
+    andi t0, t0, 3
+    li t1, 3
+    bne t0, t1, .Lswitch_restore
+
+    call riscv_fpu_state_save
+
+.Lswitch_restore:
+    ld t0, RISCV_FPU_STATE_SAVED_OFFSET(a1)
+    beqz t0, .Lswitch_done
+    mv a0, a1
+    call riscv_fpu_state_restore
 
 .Lswitch_done:
+    ld ra, 0(sp)
+    addi sp, sp, 16
     ret
 
     .size riscv_fpu_switch, . - riscv_fpu_switch

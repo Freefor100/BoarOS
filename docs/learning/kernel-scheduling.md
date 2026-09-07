@@ -10,7 +10,7 @@ Trap Frame 面向任意指令边界。中断发生前没有调用者按 ABI 准�
 
 Switch context 面向 `riscv_context_switch(previous, next)` 这一普通函数调用。编译器已经按 psABI 允许 caller-saved 寄存器被调用破坏；调用链只要求 callee-saved 寄存器恢复。RV64 整数 psABI 中，`s0..s11` 和 `sp` 是 callee-saved，`ra` 决定 `ret` 的恢复点。BoarOS 还保存 `tp`，因为它被确定为当前任务指针。于是基础 switch context 是 `ra/sp/tp/s0..s11`，不重复保存 `a*`、`t*`、Trap CSR 或完整 Trap Frame。
 
-这种分工也适用于以后会阻塞的系统调用：线程可以在任意内核调用深度通过 switch context 暂停，恢复后继续原 C 调用链；用户或中断现场仍由该线程栈上的 Trap Frame 管理。若只交换最外层 Trap Frame，普通内核调用链的阻塞点就无法自然保存。
+这种分工也适用于会阻塞的系统调用：线程可以在任意内核调用深度通过 switch context 暂停，恢复后继续原 C 调用链；用户或中断现场仍由该线程栈上的 Trap Frame 管理。用户 F/D 状态再由 per-task FP image 按 FS 状态单独保存，不能把它误当成普通 C callee-saved 寄存器。若只交换最外层 Trap Frame，普通内核调用链的阻塞点就无法自然保存。
 
 ## `tp` 为什么适合表示 current
 
@@ -55,6 +55,8 @@ BoarOS 的 timer backend 保留 deadline 相位，并可能一次报告多个迟
 ```text
 allocated page -> READY -> RUNNING -> READY
                                   |
+                                  +-> BLOCKED --event/deadline/signal--> READY
+                                  |
                                   +-> EXITED -> idle releases page
 ```
 
@@ -95,7 +97,7 @@ ready/exited 队列会同时被普通线程创建路径、timer handler 和 idle
 - 单 hart FIFO round-robin，一个 tick 时间片，一次 trap 最多切换一次。
 - 普通内核/用户任务使用私有 4 KiB 单页内核栈布局；用户任务持有可共享 MM 引用和独立 TID/线程组身份；boot context 成为永久 idle，继续使用静态 boot stack。
 - 内核线程入口返回即退出；用户任务通过 syscall 或同步故障退出。idle 在另一张栈上依次释放 MM 引用、TID 和任务页。
-- 队列临界区保存并关闭 SIE；当前不为尚未实现的 SMP、阻塞、优先级或 F/V 状态建立占位层，MM/身份字段则是 `clone/fork/exec/wait` 已确定路径的必要永久机制。
+- 队列临界区保存并关闭 SIE；interruptible wait 使用同一 blocked 链并由未阻塞 pending signal 返回 `SIGNALLED`，vfork 等资源生命周期等待保持不可中断。F/D 状态由 scheduler switch 的 FS Dirty 检查按需保存/恢复；不为尚未实现的 SMP、优先级或 V 状态建立占位层，MM/身份/信号字段则是 `clone/fork/exec/wait` 已确定路径的必要永久机制。
 
 这些选择形成完整、可测的内核线程闭环，同时把以后可能变化的策略、栈布局和 per-hart 组织留在模块内部。RISC-V context 机制可在 QEMU `virt` 与 VisionFive 2 复用；平台 timebase 仍由 DTB 决定。LoongArch 需要自己的 switch context、CSR/中断和 16 KiB 栈页实现，不能复用 RISC-V 汇编。
 
@@ -115,6 +117,12 @@ ready/exited 队列会同时被普通线程创建路径、timer handler 和 idle
 - BoarOS 的阻塞机制沿用 wait4 确立的模式：关中断内检查条件、置 BLOCKED、经 `riscv_context_switch` 切走；唤醒方把任务置 READY 并入 ready 队尾，被唤醒者从原调用点返回后必须重查条件。所有 BLOCKED 任务都在全局 blocked 链上，事件通道（wait_queue 令牌）与超时（deadline 刻度）是任务的字段而不是独立节点，唤醒按 FIFO 走链。
 - 单 hart 下丢失唤醒的唯一来源是"检查条件与阻塞之间开中断"；因此内核线程（trampoline 运行在 SIE=1）调用阻塞接口前必须用 `riscv_interrupt_save/restore` 收敛临界区，而 syscall/trap 上下文天然关中断。Linux 的 `schedule()` 把这一职责收进调度器本身并保存/恢复中断状态，等 BoarOS 引入线程和 SMP 时需要对齐这一语义。
 - 超时唤醒与事件唤醒共用一条 blocked 链：tick 处理器在抢占检查之前先扫描到期 deadline，使刚到期的任务能在同一次切换中被选中；唤醒延迟上界是一个 tick 周期。Linux 用红黑树/timer wheel 组织到期任务，等待队列按需唤醒；BoarOS 的 O(阻塞数) 走链是有意的阶段性简化，扩展路径已在模块文档声明。
+
+## FP 状态为什么不塞进基础 Trap Frame
+
+RISC-V `sstatus.FS` 给出了 Initial/Clean/Dirty 状态，适合把少见的 F/D 使用从每次整数 trap 和普通内核线程切换中分离。BoarOS 的基础 Frame 保持固定 288 字节；用户 task 另有 272 字节的 32 个 D 寄存器、fcsr 和 saved 标志。context switch 只在前一个 task 为 Dirty 时保存，再在下一个 task 有 saved image 时恢复，恢复后把 FS 留在 Clean。
+
+这要求 FP 保存代码是唯一触碰 F/D 的汇编边界，并且在 scheduler 关闭 SIE 的窗口内与 current/task owner 一起切换。exec 必须清空硬件和 image，signal frame 必须把 image 纳入 ucontext；否则旧映像或 handler 会观察到不属于自己的浮点寄存器。当前只覆盖单 hart F/D，V 扩展和 SMP owner 协议留在后续独立阶段。
 
 ## 资料依据
 

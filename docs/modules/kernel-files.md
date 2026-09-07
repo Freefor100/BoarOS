@@ -4,10 +4,11 @@
 
 ## 对象与所有权
 
-`include/kernel/files.h` 和 `fs/files.c` 管理文件描述符表，`include/kernel/fs_context.h` 和 `fs/fs_context.c` 管理根挂载与当前工作目录。两者都从同一内核堆分配，并随用户 task 一起被 scheduler 接管：
+`include/kernel/files.h`、`fs/files.c`、`fs/pipe.c` 管理文件描述符表和 pipe endpoint，`include/kernel/fs_context.h` 和 `fs/fs_context.c` 管理根挂载与当前工作目录。两者都从同一内核堆分配，并随用户 task 一起被 scheduler 接管：
 
 - `kernel_files` 是进程可见的 fd 槽数组；槽保存 descriptor flags 和指向 open file description 的指针。
 - `kernel_open_file_description` 拥有一个 VFS file、当前 offset 和清理状态。分别打开同一路径会得到独立 description，因此 offset 互不影响。
+- pipe description 不拥有 VFS file，而是各自持有同一个 `struct kernel_pipe` 的读/写 endpoint；pipe 对象拥有连续 64 KiB ring buffer、读写端引用和等待队列。
 - `kernel_fs_context` 借用生产根 mount，拥有当前工作目录字符串；当前 cwd 固定从 `/` 开始。
 
 `kernel_files_pin()` 为 fd 指向的 open file description 增加一个独立引用。file-private mmap
@@ -28,6 +29,14 @@
 
 只支持打开只读普通文件与目录。`O_LARGEFILE`、`O_CLOEXEC` 和 `O_DIRECTORY` 可用；写访问、`O_CREAT/O_TRUNC/O_APPEND` 返回 `-EROFS`，普通文件配 `O_DIRECTORY` 返回 `-ENOTDIR`，其他已识别但未支持的打开行为返回 `-ENOTSUP`，未知位或非法 access mode 返回 `-EINVAL`。打开成功后按 VFS mode 把描述符分类为 regular、directory 或 console；directory 描述符支持 `getdents64`、`lseek` 与 `fstat`，`read` 返回 `-EISDIR`。文件不存在等路径错误由 VFS 保留为负 Linux errno；表满返回 `-EMFILE`，堆耗尽返回 `-ENOMEM`。
 
+## `pipe2` 与 FIFO endpoint
+
+`kernel_files_pipe2()` 创建两个新的 open file description 和两个 fd 槽；它们共享一个 order-4、64 KiB 连续 ring buffer，但读端只增加 read-side 引用，写端只增加 write-side 引用。`O_CLOEXEC` 保存在两个 descriptor flag 中，`O_NONBLOCK` 保存在两个 OFD status 中；`F_SETFL` 可切换 `O_NONBLOCK`，并接受 64 位目标上 musl 每次带来的 `O_LARGEFILE` 兼容位而不改变该位。
+
+读端有数据时按 ring 顺序返回，空且仍有 writer 时：阻塞 fd 进入 interruptible wait，非阻塞 fd 返回 `-EAGAIN`。所有 writer 关闭后空读返回 EOF；写端没有 reader 时返回 `-EPIPE`，同时向当前 task 发送 SIGPIPE，因此有 handler 时先观察信号、无 handler 时按默认动作终止。写端空间不足时阻塞或返回 `-EAGAIN`；不超过 4096 字节的单次写在当前单 hart 实现中保持原子，较大写按可用空间推进。读写条件变化分别唤醒对端等待队列，并可被未阻塞信号唤醒后返回 `-EINTR`/按 `SA_RESTART` 重启。
+
+pipe 的 `fstat` 以 `S_IFIFO` 形态报告，`lseek` 返回 `-ESPIPE`；它不进入 ext4 页缓存，也不暴露普通 VFS node。两个 endpoint 的最后一个 OFD 关闭后，ring buffer、等待队列和 pipe owner 一起释放。创建或双 fd 安装的任一步失败都会先回收已创建 description/fd，再由文件表私有 cleanup 链保留无法立即释放的 pipe owner，避免丢失物理页或重复关闭。
+
 ## `read`、offset 与部分复制
 
 `kernel_files_read()` 最多传送 Linux `MAX_RW_COUNT` 形态的 `INT32_MAX` 向下页对齐值。无效 fd 返回 `-EBADF`；零长度在 fd 有效且用户地址无需解引用时返回 0。与当前参照的 Linux `vfs_read()` 顺序一致，非零读取先按调用者给出的原始 count 验证整个用户范围，再把实际请求截断到上限，逐页从挂载共享缓存取得文件页并执行 `copy_to_user`。
@@ -40,7 +49,7 @@ open file description 的 offset 只增加实际复制到用户空间的字节�
 
 `kernel_open_file_create_console()` 创建无 VFS 节点、不经页缓存的 console 描述符；root boot 在创建 PID 1 文件表后把它绑定到 fd 0/1/2。该桥接在设备文件系统提供 `/dev/console` 后退出。console 的 `write/writev` 经 `kernel_console_putc` 逐字节输出并返回完整计数；用户 fault 与部分复制按前缀保持返回，与 read 对称。console 的 `read` 阻塞等待真实 UART 输入：tick 路径轮询 NS16550A 接收位并唤醒共享的 console 等待队列，读者把接收 FIFO 整批搬入 staging 后一次性复制到用户；无数据时阻塞一个 tick 内被唤醒，`count==0` 返回 0，坏缓冲区返回 `-EFAULT`。`lseek` 返回 `-ESPIPE`，`fstat` 以 5:1 字符设备形态出现。fd 0/1/2 是三个独立 OFD，但共享同一输入队列。regular/directory 描述符上的 write 返回 `-EBADF`（只读根上每个常规 fd 都是只读打开）。
 
-`writev` 按用户 iovec 数组逐项输出，`iovcnt` 上限 1024；这是 musl stdio 实际使用的写路径，`__stdio_write` 以两段 iovec 发出缓冲内容。
+`writev` 按用户 iovec 数组逐项输出，`iovcnt` 上限 1024；这是 musl stdio 实际使用的写路径，`__stdio_write` 以两段 iovec 发出缓冲内容。pipe 的 `writev` 汇总 iovec 后沿用 pipe 单次写的空间、原子性、阻塞、EPIPE/SIGPIPE 和部分复制规则。
 
 ## `lseek`、`fstat`/`newfstatat` 与 `getdents64`
 
@@ -63,7 +72,7 @@ fd-slot OFD references -> files table -> fs context
 -> mapped OFD references/MM -> zombie
 ```
 
-最后一个 OFD 引用才关闭底层 VFS file；父进程关闭 fd 不会使仍由子进程或任一 MM 文件映射引用的 OFD 失效。文件、fs context 或 MM 清理失败时 task 进入 exited 队列，idle 从记录状态重试；成功后有父任务的进程转成只保留轻量状态的 zombie。根 mount 必须活到 PID 1 及其子进程的 fd 与映射来源全部回收，之后生产根启动路径才能 purge cache、unmount 并检查 heap/物理页基线。
+最后一个普通 OFD 引用才关闭底层 VFS file；pipe OFD 的最后一个读/写端引用还会更新 endpoint 计数并在两端归零时释放 ring。父进程关闭 fd 不会使仍由子进程或任一 MM 文件映射引用的 OFD 失效。文件、pipe、fs context 或 MM 清理失败时 task 进入 exited 队列，idle 从记录状态重试；成功后有父任务的进程转成只保留轻量状态的 zombie。根 mount 必须活到 PID 1 及其子进程的 fd 与映射来源全部回收，之后生产根启动路径才能 purge cache、unmount 并检查 heap/物理页基线。
 
 ## 验证与限制
 
@@ -72,10 +81,11 @@ make test-uaccess-riscv
 make test-files-riscv
 make test-syscall-riscv
 make test-exec-riscv
+make test-userland-riscv
 make test-root-init-riscv
 make test-riscv
 ```
 
-聚焦测试在真实 QEMU legacy 与 modern VirtIO/ext4 上覆盖绝对/相对路径、错误 flags、目录与缺失文件、4096 字节路径上限、最低 fd 复用、表扩容、`O_CLOEXEC`、缓存命中后的跨页读取、EOF、部分 fault、fork 后 fd 表独立与 OFD offset 共享，以及可重试清理。它还在关闭 fd 后通过 MM backing 继续缺页，反复固定地址映射同一 OFD 并检查来源释放只发生一次，验证父子各自持有一份来源引用。生产 exec/clone 链验证普通 fd 与 offset 跨映像和父子保持、CLOEXEC fd 不可见，PID 1 的 stdio 与跨 exec 的 console 描述符由串口标记验证，并由最终资源基线证明退出清理生效。`make test-userland-riscv` 用静态 musl 程序作为 PID 1 运行 stdio、readdir、read/lseek/fstat 与 dup，是真实 U-mode 外部测例的入口。
+聚焦测试在真实 QEMU legacy 与 modern VirtIO/ext4 上覆盖绝对/相对路径、错误 flags、目录与缺失文件、4096 字节路径上限、最低 fd 复用、表扩容、`O_CLOEXEC`、缓存命中后的跨页读取、EOF、部分 fault、fork 后 fd 表独立与 OFD offset 共享，以及可重试清理。它还在关闭 fd 后通过 MM backing 继续缺页，反复固定地址映射同一 OFD 并检查来源释放只发生一次，验证父子各自持有一份来源引用。生产 exec/clone 链验证普通 fd 与 offset 跨映像和父子保持、CLOEXEC fd 不可见，PID 1 的 stdio 与跨 exec 的 console 描述符由串口标记验证，并由最终资源基线证明退出清理生效。`make test-userland-riscv` 用静态 musl 程序作为 PID 1 运行 stdio、readdir、read/lseek/fstat、dup、signal 和 pipe，是真实 U-mode 外部测例的入口。
 
-当前只有进程私有文件表、根 fs context 和只读文件系统；普通 clone 已实现“复制表、共享 OFD”，但没有 `CLONE_FILES`。也没有目录 fd（`dirfd` 相对路径）、`chdir`、可写文件、并发锁、read-ahead、异步 I/O 或可写文件系统；常规文件的 write 以只读语义返回 `-EBADF`，可写 ext4 需要块写接口、journal 策略与页缓存 dirty/失效协议先行。console 接收现为 tick 轮询（唤醒延迟上界一个 tick），外部中断（PLIC/SEIE）落地后替换为中断驱动。
+当前只有进程私有文件表、根 fs context、内存 pipe 和只读文件系统；普通 clone 已实现“复制表、共享 OFD”，但没有 `CLONE_FILES`。也没有目录 fd（`dirfd` 相对路径）、`chdir`、可写文件、SMP 并发锁、read-ahead、异步 I/O 或可写文件系统；常规文件的 write 以只读语义返回 `-EBADF`，可写 ext4 需要块写接口、journal 策略与页缓存 dirty/失效协议先行。pipe 当前为单 hart 内核对象，不能在 SMP 下直接复用其无锁字段。console 接收现为 tick 轮询（唤醒延迟上界一个 tick），外部中断（PLIC/SEIE）落地后替换为中断驱动。

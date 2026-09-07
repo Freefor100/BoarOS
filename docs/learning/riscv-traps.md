@@ -50,7 +50,7 @@ RISC-V 把 instruction、load、store/AMO page fault 分成 cause 12、13、15�
 
 中断发生时，x1..x31 都可能承载被打断代码仍需使用的值。只考虑 C 函数的 caller-saved/callee-saved 分类可以构造较小的即时返回入口，但无法直接作为抢占、调度、信号和用户态异常的完整执行上下文。BoarOS 保存全部可写整数寄存器和四个 trap CSR，并在原有尾槽保存入口取得的可信内核 `tp`，得到固定 288 字节、16 字节对齐的 Frame。
 
-当前内核使用 RV64IMAC，不生成浮点或向量指令，因此整数入口不保存 F/V 状态。以后允许用户程序或内核使用这些扩展时，应把 F/V 作为带所有权和启用状态的扩展上下文管理，通常采用按需保存，而不是无条件把大型向量状态塞进每次基础 trap。
+基础内核按 RV64IMAC 构建，因此整数入口不保存 F/V 状态；用户 F/D 状态由独立的 272 字节 per-task image 依据 `sstatus.FS` 按需保存恢复。这样不会把 FP 或未来更大的向量上下文塞进每次基础 trap。当前只实现 F/D，V 扩展仍需要独立的 owner、异常和调度协议。
 
 S-mode trap 直接在当前内核栈建立 Frame；U-mode trap 先从 current 取得可信内核栈，再建立相同布局的 Frame。两种路径都继续消耗所属任务内核栈的剩余空间；当前 boot idle 和普通内核/用户任务都使用 4 KiB 内核栈，没有 guard page 或溢出恢复。是否再设置 per-hart IRQ 栈应根据嵌套、中断负载和栈高水位决定。Trap Frame 与 scheduler switch context 的分工见[内核线程与抢占调度学习总结](kernel-scheduling.md)。
 
@@ -79,7 +79,7 @@ BoarOS 当前固定以下 RISC-V trap 基线：
 - 汇编只负责架构现场和关键返回验证，具体 cause 交给 C dispatcher。
 - handler 返回表示事件已经处理；未知或当前不能处理的事件必须 fatal，不伪造成功。
 - dispatcher 期间保持 SIE 关闭，不支持嵌套异步中断。
-- 最终地址空间稳定后开启 supervisor timer interrupt；生产 dispatcher 处理 timer、U-mode ecall 和 U-mode 同步故障。cause 12/13/15 先尝试依据当前 MM 的 VMA fault policy 补页，成功时重试原指令；权限/范围错误只终止所属任务，匿名补页 OOM 以资源原因终止，页表状态或清理失败仍 fatal。dispatcher 不提供运行期 handler 注册框架。
+- 最终地址空间稳定后开启 supervisor timer interrupt；生产 dispatcher 处理 timer、U-mode ecall、U-mode 同步故障以及公共用户返回尾的标准 signal handler/sigreturn 和 syscall restart。cause 12/13/15 先尝试依据当前 MM 的 VMA fault policy 补页，成功时重试原指令；权限/范围错误只终止所属任务，匿名补页 OOM 以资源原因终止，页表状态或清理失败仍 fatal。信号 handler 通过固定 RX VDSO ecall stub 返回，dispatcher 不提供超出当前标准子集的运行期架构注册框架。
 
 这些选择属于 RISC-V 架构层，可在 QEMU `virt` 和 VisionFive 2 上复用。当前 timer 通过两边共有的 SBI TIME 抽象复用，实际 timebase 仍从 DTB 获取；外部中断控制器和设备 IRQ 编号属于平台层，不能从 QEMU 的行为推断开发板布局。时间机制的完整解释见 [RISC-V 时间与周期 Tick 学习总结](riscv-time.md)。
 
@@ -98,6 +98,7 @@ BoarOS 当前固定以下 RISC-V trap 基线：
 - 让真实 U-mode 任务在独立 Sv39 根页表中运行，由 timer 抢占到内核线程后再恢复，逐项核对用户 `gp/sp/tp/s0..s11`，同时证明内核执行期间 `sscratch=0`；最终 ELF 反汇编还要证明入口确实重载了内核 `gp`。
 - 让第二个用户地址空间触发 load page fault，验证故障只形成任务完成记录，而不会破坏另一用户任务或把 S-mode 故障错误降级。
 - 让真实 ext4 `/init` 在初始栈提交区以下先 load 零页、再 store 另一页，证明 cause 13/15 能补页并保持 `sepc` 重试；测试内核再注入一次 OOM，要求父进程得到 wait status 9 且所有资源回到基线。
+- 让真实静态 musl 使用 F/D 寄存器跨 timer 抢占和 signal handler/sigreturn，检查独立 FP image 没有泄漏；同时让 pipe 和 nanosleep 在 pending signal 下唤醒，验证公共 return tail 的 EINTR/SA_RESTART 路径。
 
 ## 资料依据
 

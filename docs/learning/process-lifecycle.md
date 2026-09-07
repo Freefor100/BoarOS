@@ -76,7 +76,7 @@ BoarOS 普通 clone 已复制 fd 槽数组并给每个继承的 open file descri
 
 BoarOS 也采用这个边界。退出路径先切回稳定内核地址空间，再在任务自己的内核栈上释放 exec/files/fs/MM；清理完整且存在父任务时成为 zombie。任务页不能在当前仍使用它的栈上释放，所以它必须保留到父进程 wait。若重资源清理暂时失败，任务进入 exited 清理队列，由 idle 在可信栈上重试，完成后才发布 zombie 事件。
 
-退出码在 wait status 中放在 bit 8..15。同步异常则转换为信号终止形态，例如非法指令对应 SIGILL、地址访问故障通常对应 SIGSEGV。当前只是 wait status 编码，还没有实现信号投递与 handler。
+普通退出码在 wait status 中放在 bit 8..15；信号终止使用低 7 位，core 默认动作另置 bit 7。同步异常则转换为信号终止形态，例如非法指令对应 SIGILL、地址访问故障通常对应 SIGSEGV。标准信号现在可以在用户返回尾进入 handler，`rt_sigreturn` 恢复整数/FP frame；实时排队和备用信号栈仍未实现。
 
 ## wait、阻塞与唤醒
 
@@ -89,7 +89,7 @@ BoarOS 也采用这个边界。退出路径先切回稳定内核地址空间，�
 | `-1` | 任意子进程 |
 | `< -1` | 进程组 ID 等于 `-pid` 的子进程 |
 
-没有匹配子进程时返回 `ECHILD`。存在匹配子进程但没有可报告事件时，`WNOHANG` 返回 0；否则调用者必须进入 BLOCKED，让出 CPU，直到子进程退出路径把它放回 READY。阻塞不是循环执行 `wfi` 或忙等，而是 scheduler 状态转换；被唤醒后必须重新扫描条件，因为未来 SMP、信号和多个子事件都会使“一次唤醒必然对应目标事件”的假设失效。
+没有匹配子进程时返回 `ECHILD`。存在匹配子进程但没有可报告事件时，`WNOHANG` 返回 0；否则调用者必须进入 BLOCKED，让出 CPU，直到子进程 stop/continue/exit 路径把它放回 READY。阻塞不是循环执行 `wfi` 或忙等，而是 scheduler 状态转换；wait4 和 pipe/nanosleep 等 interruptible waiter 还可由未阻塞信号返回 `SIGNALLED`，被唤醒后必须重新扫描条件，因为未来 SMP、信号和多个子事件都会使“一次唤醒必然对应目标事件”的假设失效。
 
 Linux 的 wait 回收与用户复制之间有一个重要顺序：选中的 zombie 先被内核逻辑回收，再把 status 写到用户地址。因此 status 指针错误返回 `EFAULT` 时，同一个子进程也不能再次 wait。测试要验证这个副作用，不能只检查 errno。
 

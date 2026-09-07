@@ -15,6 +15,7 @@
 #include <kernel/physical_page.h>
 #include <kernel/pid.h>
 #include <kernel/scheduler.h>
+#include <kernel/signal.h>
 #include <kernel/task.h>
 #include <kernel/uaccess.h>
 
@@ -27,6 +28,7 @@
 #define LINUX_WNOHANG UINT32_C(0x00000001)
 #define LINUX_WUNTRACED UINT32_C(0x00000002)
 #define LINUX_WCONTINUED UINT32_C(0x00000008)
+#define LINUX_WAIT_CONTINUED UINT32_C(0xffff)
 #define LINUX___WNOTHREAD UINT32_C(0x20000000)
 #define LINUX___WALL UINT32_C(0x40000000)
 #define LINUX___WCLONE UINT32_C(0x80000000)
@@ -82,7 +84,7 @@ static enum kernel_scheduler_status validate_child_list(
             child->previous_sibling != previous ||
             child->publish_completion != 0U ||
             child->state < KERNEL_THREAD_STATE_READY ||
-            child->state > KERNEL_THREAD_STATE_ZOMBIE) {
+            child->state > KERNEL_THREAD_STATE_STOPPED) {
             return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
         }
         if (child == required_child) {
@@ -146,7 +148,7 @@ static void child_remove(struct kernel_task *parent,
     child->next_sibling = 0;
 }
 
-static void wake_waiting_parent(struct kernel_task *child)
+void wake_waiting_parent(struct kernel_task *child)
 {
     struct kernel_task *parent = child->parent;
 
@@ -179,6 +181,11 @@ static void exited_append(struct kernel_task *thread)
 static int release_clone_resources(struct kernel_task *thread)
 {
     int cleanup_failed = 0;
+
+    if (kernel_signal_release_table(thread) !=
+        KERNEL_SIGNAL_STATUS_OK) {
+        cleanup_failed = 1;
+    }
 
     if (thread->files.state == KERNEL_FILES_LIVE ||
         thread->files.state == KERNEL_FILES_CLEANUP) {
@@ -277,6 +284,7 @@ enum kernel_scheduler_status riscv_process_clone_current(
     enum kernel_files_status files_status;
     enum kernel_fs_context_status fs_status;
     enum kernel_pid_status pid_status;
+    enum kernel_signal_status signal_status;
     enum riscv_context_status context_status;
     enum kernel_scheduler_status status;
 
@@ -416,6 +424,17 @@ enum kernel_scheduler_status riscv_process_clone_current(
     child->completion.tgid = tid;
     kernel_wait_queue_init(&child->child_exit_queue);
     kernel_wait_queue_init(&child->vfork_done_queue);
+    signal_status = kernel_signal_fork(child, parent);
+    if (signal_status != KERNEL_SIGNAL_STATUS_OK) {
+        return finish_clone_failure(
+            child,
+            signal_status == KERNEL_SIGNAL_STATUS_NO_MEMORY
+                ? -KERNEL_ENOMEM : -KERNEL_EAGAIN,
+            linux_result,
+            signal_status == KERNEL_SIGNAL_STATUS_NO_MEMORY
+                ? KERNEL_SCHEDULER_STATUS_OK
+                : KERNEL_SCHEDULER_STATUS_INVALID_STATE);
+    }
     /* The cleared task page is the child's FP register image; the next
      * dispatch loads it before any child code runs. */
     child->fpu.saved = 1U;
@@ -468,6 +487,7 @@ enum kernel_scheduler_status riscv_process_clone_current(
         kernel_wait_queue_init(&parent->vfork_done_queue);
         status = kernel_scheduler_block_current(&parent->vfork_done_queue,
                                                 0U,
+                                                1,
                                                 &wake_reason);
         if (status != KERNEL_SCHEDULER_STATUS_OK) {
             return status;
@@ -582,6 +602,54 @@ static enum kernel_scheduler_status reap_waited_child(
     return KERNEL_SCHEDULER_STATUS_OK;
 }
 
+static enum kernel_scheduler_status report_wait_event(
+    struct kernel_task *parent,
+    struct kernel_task *child,
+    uint32_t wait_status,
+    uint64_t status_address,
+    uint64_t rusage_address,
+    int64_t *linux_result)
+{
+    size_t copied = 0U;
+    enum kernel_uaccess_status access_status;
+
+    if (status_address != 0U) {
+        access_status = kernel_copy_to_user(&parent->mm,
+                                            status_address,
+                                            &wait_status,
+                                            sizeof(wait_status),
+                                            &copied);
+        if (access_status == KERNEL_UACCESS_STATUS_FAULT) {
+            *linux_result = -KERNEL_EFAULT;
+            return KERNEL_SCHEDULER_STATUS_OK;
+        }
+        if (access_status != KERNEL_UACCESS_STATUS_OK ||
+            copied != sizeof(wait_status)) {
+            return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
+        }
+    }
+    if (rusage_address != 0U) {
+        struct kernel_linux_rusage rusage = {0};
+
+        copied = 0U;
+        access_status = kernel_copy_to_user(&parent->mm,
+                                            rusage_address,
+                                            &rusage,
+                                            sizeof(rusage),
+                                            &copied);
+        if (access_status == KERNEL_UACCESS_STATUS_FAULT) {
+            *linux_result = -KERNEL_EFAULT;
+            return KERNEL_SCHEDULER_STATUS_OK;
+        }
+        if (access_status != KERNEL_UACCESS_STATUS_OK ||
+            copied != sizeof(rusage)) {
+            return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
+        }
+    }
+    *linux_result = child->tid;
+    return KERNEL_SCHEDULER_STATUS_OK;
+}
+
 enum kernel_scheduler_status kernel_scheduler_wait4_current(
     int64_t pid,
     uint64_t status_address,
@@ -642,7 +710,7 @@ enum kernel_scheduler_status kernel_scheduler_wait4_current(
                 child->previous_sibling != previous ||
                 child->publish_completion != 0U ||
                 child->state < KERNEL_THREAD_STATE_READY ||
-                child->state > KERNEL_THREAD_STATE_ZOMBIE) {
+                child->state > KERNEL_THREAD_STATE_STOPPED) {
                 return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
             }
             previous = child;
@@ -661,6 +729,38 @@ enum kernel_scheduler_status kernel_scheduler_wait4_current(
                                          rusage_address,
                                          linux_result);
             }
+            if (child->state == KERNEL_THREAD_STATE_STOPPED &&
+                (options & LINUX_WUNTRACED) != 0U &&
+                child->stop_notified == 0U) {
+                status = report_wait_event(parent,
+                                           child,
+                                           child->wait_status,
+                                           status_address,
+                                           rusage_address,
+                                           linux_result);
+                if (status != KERNEL_SCHEDULER_STATUS_OK ||
+                    *linux_result != child->tid) {
+                    return status;
+                }
+                child->stop_notified = 1U;
+                return KERNEL_SCHEDULER_STATUS_OK;
+            }
+            if (child->state != KERNEL_THREAD_STATE_STOPPED &&
+                (options & LINUX_WCONTINUED) != 0U &&
+                child->continue_notified != 0U) {
+                status = report_wait_event(parent,
+                                           child,
+                                           LINUX_WAIT_CONTINUED,
+                                           status_address,
+                                           rusage_address,
+                                           linux_result);
+                if (status != KERNEL_SCHEDULER_STATUS_OK ||
+                    *linux_result != child->tid) {
+                    return status;
+                }
+                child->continue_notified = 0U;
+                return KERNEL_SCHEDULER_STATUS_OK;
+            }
         }
         if (previous != parent->last_child) {
             return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
@@ -675,9 +775,15 @@ enum kernel_scheduler_status kernel_scheduler_wait4_current(
         }
         status = kernel_scheduler_block_current(&parent->child_exit_queue,
                                                 0U,
+                                                1,
                                                 &wake_reason);
         if (status != KERNEL_SCHEDULER_STATUS_OK) {
             return status;
+        }
+        if (wake_reason == KERNEL_WAIT_SIGNALLED) {
+            kernel_signal_note_syscall_restart(parent);
+            *linux_result = -KERNEL_ERESTARTSYS;
+            return KERNEL_SCHEDULER_STATUS_OK;
         }
     }
 }
@@ -857,10 +963,16 @@ static void switch_to_fatal_idle(enum kernel_scheduler_status status)
 static enum kernel_scheduler_status cleanup_user_task_resources(
     struct kernel_task *thread)
 {
+    enum kernel_signal_status signal_status;
     enum kernel_mm_status mm_status;
     enum kernel_exec_status exec_status;
     enum kernel_files_status files_status;
     enum kernel_fs_context_status fs_status;
+
+    signal_status = kernel_signal_release_table(thread);
+    if (signal_status != KERNEL_SIGNAL_STATUS_OK) {
+        return KERNEL_SCHEDULER_STATUS_PAGE_RELEASE;
+    }
 
     if (thread->exec_transaction != 0) {
         struct kernel_exec_transaction *transaction =
@@ -956,9 +1068,10 @@ static uint32_t user_wait_status(
         return 9U; /* SIGKILL */
     }
     if (completion->reason == KERNEL_THREAD_EXIT_SIGNAL) {
-        return (uint32_t)completion->status & UINT32_C(0x7f);
+        return ((uint32_t)completion->status & UINT32_C(0x7f)) |
+               (completion->detail != 0U ? UINT32_C(0x80) : 0U);
     }
-    return fault_wait_status(completion->status);
+    return fault_wait_status(completion->status) | UINT32_C(0x80);
 }
 
 static enum kernel_scheduler_status reparent_children(
@@ -1059,7 +1172,7 @@ static void kernel_thread_finish(
         current->parent != 0) {
         current->state = KERNEL_THREAD_STATE_ZOMBIE;
         current->publish_completion = 0U;
-        wake_waiting_parent(current);
+        kernel_signal_notify_child_exit(current);
     } else {
         current->state = KERNEL_THREAD_STATE_EXITED;
         exited_append(current);

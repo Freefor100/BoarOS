@@ -144,6 +144,7 @@ static unsigned long run_preinit_cases(void)
     failures += expect_status(KERNEL_SCHEDULER_STATUS_NOT_INITIALIZED,
                               kernel_scheduler_block_current(&queue,
                                                              0U,
+                                                             0,
                                                              &reason));
     failures += expect_status(KERNEL_SCHEDULER_STATUS_NOT_INITIALIZED,
                               kernel_scheduler_expire_deadlines(1U));
@@ -383,6 +384,9 @@ static volatile unsigned long timeout_wake_count;
 static volatile unsigned long timeout_reason_value;
 static volatile unsigned long event_wake_count;
 static volatile unsigned long event_reason_value;
+static volatile unsigned long signal_wake_count;
+static volatile unsigned long signal_reason_value;
+static volatile struct kernel_task *signal_waiter;
 static volatile unsigned long yield_runs;
 
 static void blocked_worker(void *argument)
@@ -391,8 +395,12 @@ static void blocked_worker(void *argument)
     enum kernel_wait_wake_reason reason = (enum kernel_wait_wake_reason)0xF0;
     uintptr_t saved = riscv_interrupt_save();
 
+    if (slot == 2U) {
+        signal_waiter = kernel_task_current();
+    }
     if (kernel_scheduler_block_current(&test_queue,
                                        slot == 0U ? 1000U : 0U,
+                                       slot == 2U ? 1 : 0,
                                        &reason) !=
         KERNEL_SCHEDULER_STATUS_OK) {
         riscv_interrupt_restore(saved);
@@ -402,9 +410,12 @@ static void blocked_worker(void *argument)
     if (slot == 0U) {
         timeout_reason_value = (unsigned long)reason;
         timeout_wake_count++;
-    } else {
+    } else if (slot == 1U) {
         event_reason_value = (unsigned long)reason;
         event_wake_count++;
+    } else {
+        signal_reason_value = (unsigned long)reason;
+        signal_wake_count++;
     }
 }
 
@@ -488,15 +499,17 @@ static unsigned long run_wait_cases(
     };
     struct kernel_wait_queue invalid_queue = {0};
     enum kernel_wait_wake_reason reason = KERNEL_WAIT_WOKEN;
+    uintptr_t saved_interrupts;
     unsigned long failures = 0U;
 
     kernel_wait_queue_init(&test_queue);
 
     failures += expect_status(KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT,
-                              kernel_scheduler_block_current(0, 0U, 0));
+                              kernel_scheduler_block_current(0, 0U, 0, 0));
     failures += expect_status(KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT,
                               kernel_scheduler_block_current(&invalid_queue,
                                                              0U,
+                                                             0,
                                                              &reason));
     failures += expect_status(KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT,
                               kernel_wait_queue_wake_one(0));
@@ -510,6 +523,7 @@ static unsigned long run_wait_cases(
     failures += expect_status(KERNEL_SCHEDULER_STATUS_INVALID_STATE,
                               kernel_scheduler_block_current(&test_queue,
                                                              0U,
+                                                             0,
                                                              &reason));
     failures += expect_status(KERNEL_SCHEDULER_STATUS_INVALID_STATE,
                               kernel_wait_queue_wake_one(&test_queue));
@@ -522,6 +536,7 @@ static unsigned long run_wait_cases(
     failures += expect_status(KERNEL_SCHEDULER_STATUS_INVALID_STATE,
                               kernel_scheduler_block_current(&test_queue,
                                                              0U,
+                                                             0,
                                                              &reason));
     failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
                               kernel_wait_queue_wake_one(&test_queue));
@@ -574,6 +589,40 @@ static unsigned long run_wait_cases(
                               kernel_scheduler_on_tick(1U));
     if (event_wake_count != 1U ||
         event_reason_value != (unsigned long)KERNEL_WAIT_WOKEN) {
+        failures++;
+    }
+    failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
+                              kernel_scheduler_reap_one(&completion));
+    if (completion.kind != KERNEL_THREAD_KIND_KERNEL ||
+        completion.reason != KERNEL_THREAD_EXIT_RETURNED ||
+        completion.status != 0U || completion.detail != 0U ||
+        physical_page_available(allocator) != initial_available) {
+        failures++;
+    }
+
+    /* An interruptible waiter must leave its queue with SIGNALLED rather
+     * than the ordinary event wake reason. */
+    signal_waiter = 0;
+    signal_wake_count = 0U;
+    signal_reason_value = UINT32_MAX;
+    failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
+                              kernel_thread_create(
+                                  blocked_worker,
+                                  (void *)(uintptr_t)2U));
+    failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
+                              kernel_scheduler_on_tick(1U));
+    if (signal_waiter == 0 || signal_wake_count != 0U) {
+        failures++;
+    }
+    saved_interrupts = riscv_interrupt_save();
+    failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
+                              kernel_scheduler_wake_signal(
+                                  (struct kernel_task *)signal_waiter));
+    riscv_interrupt_restore(saved_interrupts);
+    failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
+                              kernel_scheduler_on_tick(1U));
+    if (signal_wake_count != 1U ||
+        signal_reason_value != (unsigned long)KERNEL_WAIT_SIGNALLED) {
         failures++;
     }
     failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,

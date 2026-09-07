@@ -4,6 +4,7 @@
 #define KERNEL_EPERM 1
 #define KERNEL_ENOENT 2
 #define KERNEL_ESRCH 3
+#define KERNEL_EINTR 4
 #define KERNEL_EIO 5
 #define KERNEL_ENXIO 6
 #define KERNEL_E2BIG 7
@@ -24,6 +25,7 @@
 #define KERNEL_EFBIG 27
 #define KERNEL_ENOSPC 28
 #define KERNEL_ESPIPE 29
+#define KERNEL_EPIPE 32
 #define KERNEL_EROFS 30
 #define KERNEL_ERANGE 34
 #define KERNEL_ENAMETOOLONG 36
@@ -33,5 +35,8 @@
 #define KERNEL_EOVERFLOW 75
 #define KERNEL_ENOTSUP 95
 #define KERNEL_EUCLEAN 117
+
+/* Internal scheduler result; never exposed as a Linux errno. */
+#define KERNEL_ERESTARTSYS 512
 
 #endif

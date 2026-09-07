@@ -10,6 +10,7 @@
 #include <kernel/physical_page.h>
 #include <kernel/pid.h>
 #include <kernel/scheduler.h>
+#include <kernel/signal.h>
 #include <kernel/task.h>
 
 #include <stdint.h>
@@ -30,6 +31,30 @@ enum kernel_thread_state {
     KERNEL_THREAD_STATE_BLOCKED,
     KERNEL_THREAD_STATE_EXITED,
     KERNEL_THREAD_STATE_ZOMBIE,
+    KERNEL_THREAD_STATE_STOPPED,
+};
+
+enum kernel_syscall_restart_kind {
+    KERNEL_SYSCALL_RESTART_NONE = 0,
+    KERNEL_SYSCALL_RESTART_GENERIC,
+    KERNEL_SYSCALL_RESTART_NANOSLEEP,
+};
+
+/* Signal state per task.  `signal_pending`/`signal_blocked` are bitmaps
+ * with bit (sig - 1); `signal_table_address` is a lazily allocated page
+ * of dispositions (0 until the first rt_sigaction).  The sender array
+ * keeps the first sender of each pending standard signal. */
+#define KERNEL_SIGNAL_TABLE_MAGIC UINT64_C(0x5349475441424C45)
+
+struct kernel_signal_action {
+    uint64_t handler;
+    uint64_t flags;
+    uint64_t mask;
+};
+
+struct kernel_signal_table {
+    uint64_t magic;
+    struct kernel_signal_action actions[KERNEL_SIGNAL_COUNT];
 };
 
 struct kernel_task {
@@ -55,6 +80,11 @@ struct kernel_task {
     struct kernel_wait_queue *wait_queue;
     uint64_t wakeup_deadline;
     uint32_t wake_reason;
+    uint32_t wait_interruptible;
+    uint32_t syscall_restart_kind;
+    uint32_t syscall_restart_reserved;
+    uint64_t syscall_restart_deadline;
+    uint64_t syscall_restart_remaining_address;
     uint64_t user_ticks;
     uint64_t kernel_ticks;
     uint64_t child_user_ticks;
@@ -64,6 +94,12 @@ struct kernel_task {
     uint32_t vfork_child;
     struct kernel_task *group_leader;
     uint32_t group_members;
+    uint64_t signal_pending;
+    uint64_t signal_blocked;
+    uint64_t signal_table_address;
+    uint32_t signal_sender[KERNEL_SIGNAL_COUNT];
+    uint32_t stop_notified;
+    uint32_t continue_notified;
     struct kernel_thread_completion completion;
     struct kernel_files files;
     struct kernel_fs_context fs;
@@ -88,6 +124,8 @@ struct kernel_scheduler {
     struct kernel_task *exited_tail;
     struct kernel_task *blocked_head;
     struct kernel_task *blocked_tail;
+    struct kernel_task *stopped_head;
+    struct kernel_task *stopped_tail;
     struct kernel_task *init_task;
     uint64_t cleanup_page_address;
     uint32_t cleanup_page_owned;
@@ -115,5 +153,10 @@ enum kernel_scheduler_status release_after_create_failure(
 enum kernel_scheduler_status validate_current(void);
 enum kernel_task_status validate_task_resource_borrow(
     const struct kernel_task *task);
+void wake_waiting_parent(struct kernel_task *child);
+void stopped_append(struct kernel_task *thread);
+void stopped_unlink(struct kernel_task *thread);
+enum kernel_signal_status kernel_signal_release_table(
+    struct kernel_task *task);
 
 #endif

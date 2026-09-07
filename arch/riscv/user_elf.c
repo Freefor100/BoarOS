@@ -123,7 +123,7 @@ static enum riscv_user_elf_status validate_segment(
     }
     end = segment->virtual_address + segment->memory_size;
     if (segment->virtual_address < BOAROS_PAGE_SIZE ||
-        end > RISCV_USER_ELF_STACK_GUARD_BASE) {
+        end > RISCV_USER_ELF_VDSO_BASE) {
         return RISCV_USER_ELF_STATUS_INVALID_LAYOUT;
     }
     permissions = segment_permissions(segment->flags);
@@ -780,6 +780,53 @@ static enum riscv_user_elf_status map_stack_pages(
     return RISCV_USER_ELF_STATUS_OK;
 }
 
+static enum riscv_user_elf_status map_vdso_page(
+    struct riscv_sv39_user_space *space)
+{
+    static const uint32_t signal_return_code[2] = {
+        UINT32_C(0x08b00893),
+        UINT32_C(0x00000073),
+    };
+    enum riscv_user_elf_status status;
+
+    status = map_zeroed_page(space,
+                             RISCV_USER_ELF_VDSO_BASE,
+                             RISCV_SV39_READ | RISCV_SV39_EXECUTE);
+    if (status != RISCV_USER_ELF_STATUS_OK) {
+        return status;
+    }
+    return riscv_sv39_user_space_populate(
+               space,
+               RISCV_USER_ELF_VDSO_BASE,
+               signal_return_code,
+               sizeof(signal_return_code)) == RISCV_SV39_STATUS_OK
+               ? RISCV_USER_ELF_STATUS_OK
+               : RISCV_USER_ELF_STATUS_ADDRESS_SPACE;
+}
+
+static enum riscv_user_elf_status register_vdso_vma(
+    struct kernel_mm *mm)
+{
+    struct kernel_mm_mapping mapping;
+    enum kernel_mm_status status;
+
+    status = kernel_mm_lookup(mm, RISCV_USER_ELF_VDSO_BASE, &mapping);
+    if (status != KERNEL_MM_STATUS_OK ||
+        mapping.permissions !=
+            (KERNEL_MM_USER | KERNEL_MM_READ | KERNEL_MM_EXECUTE)) {
+        return mm_status(status == KERNEL_MM_STATUS_OK
+                             ? KERNEL_MM_STATUS_STATE
+                             : status);
+    }
+    return mm_status(kernel_mm_vma_insert_anon(
+        mm,
+        RISCV_USER_ELF_VDSO_BASE,
+        RISCV_USER_ELF_VDSO_BASE + BOAROS_PAGE_SIZE,
+        KERNEL_MM_READ | KERNEL_MM_EXECUTE,
+        KERNEL_VMA_ROLE_VDSO,
+        KERNEL_VMA_FAULT_RESIDENT_REQUIRED));
+}
+
 static enum riscv_user_elf_status build_argument_stack(
     const struct riscv_user_elf_request *request,
     const struct kernel_elf64_image *image,
@@ -996,6 +1043,11 @@ enum riscv_user_elf_status riscv_user_elf_load_detailed(
         *image_failure = status;
         return finish_failure(status, &working, space);
     }
+    status = map_vdso_page(&working);
+    if (status != RISCV_USER_ELF_STATUS_OK) {
+        *image_failure = status;
+        return finish_failure(status, &working, space);
+    }
     status = copy_load_segments(&image, &working);
     if (status != RISCV_USER_ELF_STATUS_OK) {
         *image_failure = status;
@@ -1089,6 +1141,10 @@ enum riscv_user_elf_status riscv_user_elf_register_static_vmas(
     if (status != RISCV_USER_ELF_STATUS_OK) {
         return status;
     }
+    status = register_vdso_vma(mm);
+    if (status != RISCV_USER_ELF_STATUS_OK) {
+        return status;
+    }
     status = program_break_for_image(&image, &program_break);
     if (status != RISCV_USER_ELF_STATUS_OK) {
         return status;
@@ -1096,5 +1152,5 @@ enum riscv_user_elf_status riscv_user_elf_register_static_vmas(
     return mm_status(kernel_mm_brk_initialize(
         mm,
         program_break,
-        RISCV_USER_ELF_STACK_GUARD_BASE));
+        RISCV_USER_ELF_VDSO_BASE));
 }

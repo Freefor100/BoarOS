@@ -117,7 +117,7 @@ RISC-V 创建先分配并解析记录页，最后才把 LIVE Sv39 空间移入�
 
 ## Program break 与匿名 heap
 
-`kernel_mm_brk_initialize()` 只用于尚未发布、只有一个 owner 且已经启用 VMA 的新映像。它记录页对齐的起始 break、当前精确 break 和页对齐上界；RISC-V 静态 ELF 路径把最高非空 `PT_LOAD` 的 `p_vaddr + p_memsz` 向上对齐作为起点，把栈 guard 起点作为上界。每次 exec 因而得到由新 ELF 独立计算的 break，而 fork 复制父进程调用时的精确值。
+`kernel_mm_brk_initialize()` 只用于尚未发布、只有一个 owner 且已经启用 VMA 的新映像。它记录页对齐的起始 break、当前精确 break 和页对齐上界；RISC-V 静态 ELF 路径把最高非空 `PT_LOAD` 的 `p_vaddr + p_memsz` 向上对齐作为起点，把固定 VDSO 起点作为上界。每次 exec 因而得到由新 ELF 独立计算的 break，而 fork 复制父进程调用时的精确值。
 
 `kernel_mm_brk()` 实现 raw Linux syscall 所需的返回语义：参数 0 查询当前值；落在起点以下、上界以上、溢出或因 VMA 冲突/metadata OOM 无法增长时，MM 保持不变并把原 break 写入结果，而不是产生负 errno。成功结果保留字节粒度；只有 VMA 和 PTE 操作向上按 4 KiB 对齐。
 
@@ -125,7 +125,7 @@ RISC-V 创建先分配并解析记录页，最后才把 LIVE Sv39 空间移入�
 
 ## 匿名与文件私有映射
 
-`kernel_mm_mmap_anonymous()` 当前实现 anonymous-private demand-zero 映射。非 fixed 请求优先使用空闲的页对齐 hint，否则在 heap 上界/栈 guard 以下 top-down 选址；`FIXED_NOREPLACE` 只检查冲突，`FIXED` 则撤销旧页和 VMA 后替换。长度向上按 4 KiB 对齐，返回地址只在成功时写入。RISC-V 的 W&&!R PTE 编码保留，因此仅写保护被规范化为 RW。
+`kernel_mm_mmap_anonymous()` 当前实现 anonymous-private demand-zero 映射。非 fixed 请求优先使用空闲的页对齐 hint，否则在固定 VDSO 起点以下、栈 guard 之外 top-down 选址；`FIXED_NOREPLACE` 只检查冲突，`FIXED` 则撤销旧页和 VMA 后替换。长度向上按 4 KiB 对齐，返回地址只在成功时写入。RISC-V 的 W&&!R PTE 编码保留，因此仅写保护被规范化为 RW。
 
 `kernel_mm_mmap_file_private()` 接收调用者已经 pin 的只读普通文件 OFD、页对齐文件偏移和同一组选址/权限参数。成功时 MM 消耗 pin，失败时仍由调用者持有。MM 对每个不同 OFD 只建一个来源节点，并由该节点持有一份来源引用；重复 mmap 不累积历史引用，VMA backing 借用同一对象。VMA 提交后若来源已存在，只递减一个由调用者刚取得且必然不是末引用的临时 pin，不触发可能失败的底层 close/heap release；新来源则直接转移 pin，因此系统调用不会出现“返回错误但映射已生效”。关闭 fd 不影响映射；fork 为子 MM 建立独立来源节点并取得一份引用。`munmap`/fixed replace 在提交 VMA 后的冷路径扫描并释放已经没有 VMA 使用的来源节点；若底层 close 或堆释放暂时失败，节点保留为可重试 owner。页故障查到 VMA 后直接取得 backing，不在 fault 热路径遍历 fd 表或来源链。
 

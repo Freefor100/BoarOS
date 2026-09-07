@@ -1,4 +1,5 @@
 #include "open_file_internal.h"
+#include "pipe_internal.h"
 
 #include <arch/riscv/context.h>
 #include <arch/riscv/virt_uart.h>
@@ -13,6 +14,8 @@
 #include <kernel/page_cache.h>
 #include <kernel/physical_page.h>
 #include <kernel/scheduler.h>
+#include <kernel/signal.h>
+#include <kernel/task.h>
 #include <kernel/uaccess.h>
 #include <kernel/vfs.h>
 #include <string.h>
@@ -55,6 +58,7 @@ struct kernel_file_slot {
 struct kernel_files_record {
     struct kernel_file_slot *slots;
     struct kernel_open_file_description *cleanup_files;
+    struct kernel_pipe *cleanup_pipes;
     void *cleanup_allocations;
     struct kernel_files_statistics statistics;
     uint32_t references;
@@ -280,6 +284,34 @@ static enum kernel_files_status drain_file_cleanup(
         if (cleanup_description(files, description) !=
             KERNEL_FILES_STATUS_OK) {
             link = &description->cleanup_next;
+            failed = 1;
+        } else {
+            *link = next;
+        }
+    }
+    return failed ? KERNEL_FILES_STATUS_CLEANUP_REQUIRED
+                  : KERNEL_FILES_STATUS_OK;
+}
+
+static void queue_pipe_cleanup(struct kernel_files *files,
+                               struct kernel_pipe *pipe)
+{
+    pipe->cleanup_next = files->record->cleanup_pipes;
+    files->record->cleanup_pipes = pipe;
+}
+
+static enum kernel_files_status drain_pipe_cleanup(
+    struct kernel_files *files)
+{
+    struct kernel_pipe **link = &files->record->cleanup_pipes;
+    int failed = 0;
+
+    while (*link != 0) {
+        struct kernel_pipe *pipe = *link;
+        struct kernel_pipe *next = pipe->cleanup_next;
+
+        if (kernel_pipe_destroy_unowned(pipe) != KERNEL_PIPE_STATUS_OK) {
+            link = &pipe->cleanup_next;
             failed = 1;
         } else {
             *link = next;
@@ -626,10 +658,17 @@ static enum kernel_files_status kernel_files_read_console(
         }
         sleep_status = kernel_scheduler_block_current(&console_input_queue,
                                                       0U,
+                                                      1,
                                                       &wake_reason);
         if (sleep_status != KERNEL_SCHEDULER_STATUS_OK) {
             riscv_interrupt_restore(saved);
             return KERNEL_FILES_STATUS_STATE;
+        }
+        if (wake_reason == KERNEL_WAIT_SIGNALLED) {
+            kernel_signal_note_syscall_restart(kernel_task_current());
+            riscv_interrupt_restore(saved);
+            *linux_result = -KERNEL_ERESTARTSYS;
+            return KERNEL_FILES_STATUS_OK;
         }
     }
     riscv_interrupt_restore(saved);
@@ -674,6 +713,25 @@ enum kernel_files_status kernel_files_read(
     if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_CONSOLE) {
         return kernel_files_read_console(files, mm, user_buffer, count,
                                          linux_result);
+    }
+    if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_PIPE) {
+        enum kernel_pipe_status pipe_status = kernel_pipe_read(
+            description->pipe,
+            mm,
+            user_buffer,
+            count,
+            description->open_flags,
+            linux_result);
+
+        if (pipe_status != KERNEL_PIPE_STATUS_OK) {
+            return KERNEL_FILES_STATUS_STATE;
+        }
+        if (*linux_result >= 0) {
+            files->record->statistics.bytes_read += (uint64_t)*linux_result;
+        } else {
+            files->record->statistics.read_failures++;
+        }
+        return KERNEL_FILES_STATUS_OK;
     }
     if (kernel_open_file_kind(description) ==
         KERNEL_OPEN_FILE_KIND_DIRECTORY) {
@@ -799,9 +857,33 @@ enum kernel_files_status kernel_files_write(
     }
     files->record->statistics.write_calls++;
     description = lookup_description(files, fd);
-    if (description == 0 ||
-        kernel_open_file_kind(description) !=
-            KERNEL_OPEN_FILE_KIND_CONSOLE) {
+    if (description == 0) {
+        /* Every regular-file descriptor is read-only on the read-only root. */
+        files->record->statistics.write_failures++;
+        *linux_result = -KERNEL_EBADF;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_PIPE) {
+        enum kernel_pipe_status pipe_status = kernel_pipe_write(
+            description->pipe,
+            mm,
+            user_buffer,
+            count,
+            description->open_flags,
+            linux_result);
+
+        if (pipe_status != KERNEL_PIPE_STATUS_OK) {
+            return KERNEL_FILES_STATUS_STATE;
+        }
+        if (*linux_result >= 0) {
+            files->record->statistics.bytes_written +=
+                (uint64_t)*linux_result;
+        } else {
+            files->record->statistics.write_failures++;
+        }
+        return KERNEL_FILES_STATUS_OK;
+    }
+    if (kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_CONSOLE) {
         /* Every regular-file descriptor is read-only on the read-only root. */
         files->record->statistics.write_failures++;
         *linux_result = -KERNEL_EBADF;
@@ -872,8 +954,9 @@ enum kernel_files_status kernel_files_writev(
     files->record->statistics.write_calls++;
     description = lookup_description(files, fd);
     if (description == 0 ||
-        kernel_open_file_kind(description) !=
-            KERNEL_OPEN_FILE_KIND_CONSOLE) {
+        (kernel_open_file_kind(description) !=
+             KERNEL_OPEN_FILE_KIND_CONSOLE &&
+         kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_PIPE)) {
         files->record->statistics.write_failures++;
         *linux_result = -KERNEL_EBADF;
         return KERNEL_FILES_STATUS_OK;
@@ -884,6 +967,56 @@ enum kernel_files_status kernel_files_writev(
     }
     if (iovcnt > 1024U) {
         *linux_result = -KERNEL_EINVAL;
+        return KERNEL_FILES_STATUS_OK;
+    }
+
+    if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_PIPE) {
+        for (index = 0U; index < iovcnt; index++) {
+            struct kernel_uaccess_iovec iovec;
+            size_t copied = 0U;
+            int64_t written;
+            enum kernel_uaccess_status access_status;
+            enum kernel_pipe_status pipe_status;
+
+            access_status = kernel_copy_from_user(mm,
+                                                  &iovec,
+                                                  user_iov +
+                                                      index * sizeof(iovec),
+                                                  sizeof(iovec),
+                                                  &copied);
+            if (access_status != KERNEL_UACCESS_STATUS_OK ||
+                copied != sizeof(iovec)) {
+                files->record->statistics.write_failures++;
+                *linux_result = total != 0U ? (int64_t)total : -KERNEL_EFAULT;
+                files->record->statistics.bytes_written += total;
+                return KERNEL_FILES_STATUS_OK;
+            }
+            pipe_status = kernel_pipe_write(description->pipe,
+                                             mm,
+                                             iovec.base,
+                                             iovec.length,
+                                             description->open_flags,
+                                             &written);
+            if (pipe_status != KERNEL_PIPE_STATUS_OK) {
+                return KERNEL_FILES_STATUS_STATE;
+            }
+            if (written < 0) {
+                *linux_result = total != 0U ? (int64_t)total : written;
+                files->record->statistics.bytes_written += total;
+                if (total == 0U) {
+                    files->record->statistics.write_failures++;
+                }
+                return KERNEL_FILES_STATUS_OK;
+            }
+            total += (uint64_t)written;
+            if ((uint64_t)written != iovec.length) {
+                *linux_result = (int64_t)total;
+                files->record->statistics.bytes_written += total;
+                return KERNEL_FILES_STATUS_OK;
+            }
+        }
+        files->record->statistics.bytes_written += total;
+        *linux_result = (int64_t)total;
         return KERNEL_FILES_STATUS_OK;
     }
 
@@ -1026,10 +1159,14 @@ static void fill_linux_stat(
 {
     uint64_t size = kernel_open_file_size(description);
 
+    memset(stat, 0, sizeof(*stat));
     if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_CONSOLE) {
         /* The console is the character device this kernel exposes. */
         stat->st_mode = KERNEL_VFS_S_IFCHR | UINT32_C(0000600);
         stat->st_rdev = UINT64_C(0x501);
+    } else if (kernel_open_file_kind(description) ==
+               KERNEL_OPEN_FILE_KIND_PIPE) {
+        stat->st_mode = KERNEL_VFS_S_IFIFO | UINT32_C(0000600);
     } else {
         stat->st_mode = kernel_open_file_mode(description);
         stat->st_rdev = 0U;
@@ -1098,7 +1235,8 @@ enum kernel_files_status kernel_files_lseek(
         return KERNEL_FILES_STATUS_OK;
     }
     if (kernel_open_file_kind(description) ==
-        KERNEL_OPEN_FILE_KIND_CONSOLE) {
+            KERNEL_OPEN_FILE_KIND_CONSOLE ||
+        kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_PIPE) {
         *linux_result = -KERNEL_ESPIPE;
         return KERNEL_FILES_STATUS_OK;
     }
@@ -1370,6 +1508,241 @@ static enum kernel_files_status ensure_slot_capacity(
     return KERNEL_FILES_STATUS_OK;
 }
 
+static enum kernel_files_status find_two_free_fds(
+    struct kernel_files *files,
+    uint32_t *first,
+    uint32_t *second,
+    int64_t *linux_result)
+{
+    uint32_t found = 0U;
+    uint32_t capacity;
+    uint32_t offset;
+    enum kernel_files_status status;
+
+    if (files == 0 || first == 0 || second == 0 || linux_result == 0) {
+        return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
+    }
+    *linux_result = 0;
+    capacity = files->record->statistics.capacity;
+    for (offset = 0U; offset < capacity && found < 2U; offset++) {
+        uint32_t index = (files->record->next_fd + offset) % capacity;
+
+        if (files->record->slots[index].description == 0) {
+            if (found == 0U) {
+                *first = index;
+            } else {
+                *second = index;
+            }
+            found++;
+        }
+    }
+    if (found == 2U) {
+        return KERNEL_FILES_STATUS_OK;
+    }
+    if (capacity == KERNEL_FILES_MAX_CAPACITY) {
+        *linux_result = -KERNEL_EMFILE;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    status = ensure_slot_capacity(files,
+                                   capacity + (2U - found),
+                                   linux_result);
+    if (status != KERNEL_FILES_STATUS_OK || *linux_result != 0) {
+        return status;
+    }
+    capacity = files->record->statistics.capacity;
+    for (offset = 0U; offset < capacity && found < 2U; offset++) {
+        uint32_t index = (files->record->next_fd + offset) % capacity;
+
+        if (files->record->slots[index].description == 0) {
+            if (found == 0U) {
+                *first = index;
+            } else {
+                *second = index;
+            }
+            found++;
+        }
+    }
+    return found == 2U ? KERNEL_FILES_STATUS_OK
+                       : KERNEL_FILES_STATUS_STATE;
+}
+
+static enum kernel_files_status release_uninstalled_description(
+    struct kernel_files *files,
+    struct kernel_open_file_description **owner)
+{
+    enum kernel_open_file_status status;
+
+    if (owner == 0 || *owner == 0) {
+        return KERNEL_FILES_STATUS_OK;
+    }
+    status = kernel_open_file_release(owner);
+    if (status == KERNEL_OPEN_FILE_STATUS_OK) {
+        return KERNEL_FILES_STATUS_OK;
+    }
+    if (status == KERNEL_OPEN_FILE_STATUS_CLEANUP_REQUIRED &&
+        *owner != 0) {
+        queue_description(files, *owner);
+        *owner = 0;
+        return KERNEL_FILES_STATUS_CLEANUP_REQUIRED;
+    }
+    return KERNEL_FILES_STATUS_STATE;
+}
+
+enum kernel_files_status kernel_files_pipe2(
+    struct kernel_files *files,
+    struct kernel_mm *mm,
+    uint64_t user_pipefd,
+    uint64_t flags,
+    int64_t *linux_result)
+{
+    struct kernel_pipe *pipe = 0;
+    struct kernel_open_file_description *read_description = 0;
+    struct kernel_open_file_description *write_description = 0;
+    uint32_t read_fd = 0U;
+    uint32_t write_fd = 0U;
+    uint32_t fd_flags;
+    int64_t result;
+    int32_t pair[2];
+    size_t copied = 0U;
+    enum kernel_pipe_status pipe_status;
+    enum kernel_open_file_status open_status;
+    enum kernel_files_status status;
+    enum kernel_uaccess_status access_status;
+
+    if (!kernel_files_is_live(files) || mm == 0 || linux_result == 0) {
+        return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
+    }
+    if ((flags & ~(KERNEL_FILES_O_CLOEXEC | KERNEL_FILES_O_NONBLOCK)) !=
+        0U) {
+        *linux_result = -KERNEL_EINVAL;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    if (kernel_user_range_check(user_pipefd, sizeof(pair)) !=
+        KERNEL_UACCESS_STATUS_OK) {
+        *linux_result = -KERNEL_EFAULT;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    pipe_status = kernel_pipe_create(files->heap, &pipe);
+    if (pipe_status != KERNEL_PIPE_STATUS_OK) {
+        if (pipe_status == KERNEL_PIPE_STATUS_CLEANUP_REQUIRED &&
+            pipe != 0) {
+            queue_pipe_cleanup(files, pipe);
+            return KERNEL_FILES_STATUS_CLEANUP_REQUIRED;
+        }
+        *linux_result = pipe_status == KERNEL_PIPE_STATUS_NO_MEMORY
+                            ? -KERNEL_ENOMEM
+                            : -KERNEL_EIO;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    open_status = kernel_open_file_create_pipe(files->heap,
+                                               pipe,
+                                               KERNEL_PIPE_ENDPOINT_READ,
+                                               flags,
+                                               &read_description);
+    if (open_status != KERNEL_OPEN_FILE_STATUS_OK) {
+        status = release_uninstalled_description(files, &read_description);
+        if (kernel_pipe_destroy_unowned(pipe) != KERNEL_PIPE_STATUS_OK) {
+            queue_pipe_cleanup(files, pipe);
+            status = KERNEL_FILES_STATUS_CLEANUP_REQUIRED;
+        }
+        if (status != KERNEL_FILES_STATUS_OK) {
+            return status;
+        }
+        *linux_result = open_status == KERNEL_OPEN_FILE_STATUS_NO_MEMORY
+                            ? -KERNEL_ENOMEM
+                            : -KERNEL_EIO;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    open_status = kernel_open_file_create_pipe(files->heap,
+                                               pipe,
+                                               KERNEL_PIPE_ENDPOINT_WRITE,
+                                               flags,
+                                               &write_description);
+    if (open_status != KERNEL_OPEN_FILE_STATUS_OK) {
+        enum kernel_files_status write_cleanup_status;
+        enum kernel_files_status read_cleanup_status;
+
+        write_cleanup_status = release_uninstalled_description(
+            files,
+            &write_description);
+        read_cleanup_status = release_uninstalled_description(
+            files,
+            &read_description);
+        status = write_cleanup_status != KERNEL_FILES_STATUS_OK
+                     ? write_cleanup_status
+                     : read_cleanup_status;
+        /* The first endpoint owns the last pipe reference here.  Its
+         * release either destroys the pipe or queues the OFD to retry that
+         * release; never touch pipe after a successful read cleanup. */
+        *linux_result = open_status == KERNEL_OPEN_FILE_STATUS_NO_MEMORY
+                            ? -KERNEL_ENOMEM
+                            : -KERNEL_EIO;
+        return status;
+    }
+    status = find_two_free_fds(files, &read_fd, &write_fd, &result);
+    if (status != KERNEL_FILES_STATUS_OK || result != 0) {
+        enum kernel_files_status cleanup_status;
+
+        cleanup_status = release_uninstalled_description(files,
+                                                          &write_description);
+        {
+            enum kernel_files_status read_cleanup_status =
+                release_uninstalled_description(files, &read_description);
+
+            if (cleanup_status == KERNEL_FILES_STATUS_OK) {
+                cleanup_status = read_cleanup_status;
+            }
+        }
+        if (cleanup_status != KERNEL_FILES_STATUS_OK) {
+            return cleanup_status;
+        }
+        *linux_result = result;
+        return status;
+    }
+
+    fd_flags = (flags & KERNEL_FILES_O_CLOEXEC) != 0U
+                   ? KERNEL_FILES_FD_CLOEXEC
+                   : 0U;
+    files->record->slots[read_fd].description = read_description;
+    files->record->slots[read_fd].flags = fd_flags;
+    files->record->slots[write_fd].description = write_description;
+    files->record->slots[write_fd].flags = fd_flags;
+    read_description = 0;
+    write_description = 0;
+    files->record->statistics.current_open_fds += 2U;
+    if (files->record->statistics.current_open_fds >
+        files->record->statistics.peak_open_fds) {
+        files->record->statistics.peak_open_fds =
+            files->record->statistics.current_open_fds;
+    }
+    if (fd_flags != 0U) {
+        files->record->statistics.close_on_exec_fds += 2U;
+    }
+    files->record->next_fd = (write_fd + 1U <
+                              files->record->statistics.capacity)
+                                 ? write_fd + 1U
+                                 : 0U;
+    pair[0] = (int32_t)read_fd;
+    pair[1] = (int32_t)write_fd;
+    access_status = kernel_copy_to_user(mm,
+                                        user_pipefd,
+                                        pair,
+                                        sizeof(pair),
+                                        &copied);
+    if (access_status != KERNEL_UACCESS_STATUS_OK ||
+        copied != sizeof(pair)) {
+        (void)detach_fd(files, write_fd);
+        (void)detach_fd(files, read_fd);
+        (void)drain_file_cleanup(files);
+        (void)drain_pipe_cleanup(files);
+        (void)drain_allocation_cleanup(files);
+        *linux_result = -KERNEL_EFAULT;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    *linux_result = 0;
+    return KERNEL_FILES_STATUS_OK;
+}
+
 enum kernel_files_status kernel_files_dup(
     struct kernel_files *files,
     int64_t oldfd,
@@ -1554,7 +1927,13 @@ enum kernel_files_status kernel_files_fcntl(
         *linux_result = (int64_t)kernel_open_file_flags(slot->description);
         return KERNEL_FILES_STATUS_OK;
     case KERNEL_FILES_F_SETFL:
-        if ((argument & ~(LINUX_O_APPEND | LINUX_O_NONBLOCK)) != 0U) {
+        /*
+         * musl passes O_LARGEFILE with every F_SETFL request on 64-bit
+         * targets.  It is an accepted, non-modifiable status bit; only
+         * APPEND and NONBLOCK are changed here.
+         */
+        if ((argument & ~(LINUX_O_APPEND | LINUX_O_NONBLOCK |
+                          LINUX_O_LARGEFILE)) != 0U) {
             *linux_result = -KERNEL_EINVAL;
             return KERNEL_FILES_STATUS_OK;
         }
@@ -1701,6 +2080,7 @@ enum kernel_files_status kernel_files_close(
     int64_t *linux_result)
 {
     struct kernel_open_file_description *description;
+    int cleanup_required = 0;
 
     if (!kernel_files_is_live(files) || linux_result == 0) {
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
@@ -1716,8 +2096,16 @@ enum kernel_files_status kernel_files_close(
     if (detach_fd(files, (uint32_t)fd) != KERNEL_FILES_STATUS_OK) {
         return KERNEL_FILES_STATUS_STATE;
     }
-    if (drain_file_cleanup(files) != KERNEL_FILES_STATUS_OK ||
-        drain_allocation_cleanup(files) != KERNEL_FILES_STATUS_OK) {
+    if (drain_file_cleanup(files) != KERNEL_FILES_STATUS_OK) {
+        cleanup_required = 1;
+    }
+    if (drain_pipe_cleanup(files) != KERNEL_FILES_STATUS_OK) {
+        cleanup_required = 1;
+    }
+    if (drain_allocation_cleanup(files) != KERNEL_FILES_STATUS_OK) {
+        cleanup_required = 1;
+    }
+    if (cleanup_required != 0) {
         files->record->statistics.close_failures++;
         *linux_result = -KERNEL_EIO;
         return KERNEL_FILES_STATUS_OK;
@@ -1748,6 +2136,9 @@ enum kernel_files_status kernel_files_close_on_exec(
     if (drain_file_cleanup(files) != KERNEL_FILES_STATUS_OK) {
         cleanup_required = 1;
     }
+    if (drain_pipe_cleanup(files) != KERNEL_FILES_STATUS_OK) {
+        cleanup_required = 1;
+    }
     if (drain_allocation_cleanup(files) != KERNEL_FILES_STATUS_OK) {
         cleanup_required = 1;
     }
@@ -1774,6 +2165,7 @@ enum kernel_files_status kernel_files_release(
     struct kernel_files *files)
 {
     uint32_t index;
+    int cleanup_required = 0;
 
     if (files == 0) {
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
@@ -1795,8 +2187,16 @@ enum kernel_files_status kernel_files_release(
         }
         files->state = KERNEL_FILES_CLEANUP;
     }
-    if (drain_file_cleanup(files) != KERNEL_FILES_STATUS_OK ||
-        drain_allocation_cleanup(files) != KERNEL_FILES_STATUS_OK) {
+    if (drain_file_cleanup(files) != KERNEL_FILES_STATUS_OK) {
+        cleanup_required = 1;
+    }
+    if (drain_pipe_cleanup(files) != KERNEL_FILES_STATUS_OK) {
+        cleanup_required = 1;
+    }
+    if (drain_allocation_cleanup(files) != KERNEL_FILES_STATUS_OK) {
+        cleanup_required = 1;
+    }
+    if (cleanup_required != 0) {
         return KERNEL_FILES_STATUS_CLEANUP_REQUIRED;
     }
     if (files->record->slots != 0) {
