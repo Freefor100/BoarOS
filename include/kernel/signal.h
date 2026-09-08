@@ -23,9 +23,8 @@
 #define LINUX_SA_NODEFER UINT64_C(0x40000000)
 #define LINUX_SA_RESETHAND UINT64_C(0x80000000)
 
-/* Linux uapi struct sigaction prefix used by riscv64 rt_sigaction.  The
- * kernel consumes the first 64-bit sigset word; the remaining user sigset
- * storage is reserved and must be zero when passed from musl. */
+/* Linux riscv64 rt_sigaction layout. The syscall consumes one 64-bit mask,
+ * not libc's larger sigset_t or its userspace struct sigaction layout. */
 struct kernel_linux_sigaction {
     uint64_t handler;
     uint64_t flags;
@@ -41,17 +40,33 @@ enum kernel_signal_status {
 };
 
 struct kernel_task;
-struct riscv_trap_frame;
+struct kernel_signal_delivery {
+    uint32_t signal;
+    uint32_t sender;
+    uint64_t handler;
+    uint64_t flags;
+    uint64_t restore_mask;
+};
 
-/* Applies the default action or enters a user handler for one pending
- * signal at a user-return tail of the trap dispatch.  Runs until the
- * task stops, exits, or has nothing deliverable left. */
-void kernel_signal_deliver_pending(struct riscv_trap_frame *frame);
+enum kernel_signal_restart {
+    KERNEL_SIGNAL_RESTART_NONE = 0,
+    KERNEL_SIGNAL_RESTART_RETRY,
+    KERNEL_SIGNAL_RESTART_BLOCK,
+    KERNEL_SIGNAL_RESTART_INTERRUPTED,
+};
 
-/* rt_sigreturn: rebuilds the interrupted trap frame from the signal
- * frame at the user stack pointer.  A frame that cannot be read kills
- * the task with SIGSEGV. */
-void kernel_signal_restore_current(struct riscv_trap_frame *frame);
+/* Applies default actions or selects and commits one handler's policy.
+ * Architecture code encodes the returned delivery into its user frame. */
+int kernel_signal_select(struct kernel_task *task,
+                         struct kernel_signal_delivery *delivery);
+enum kernel_signal_restart kernel_signal_restart_decide(
+    struct kernel_task *task, int has_handler, uint64_t flags);
+void kernel_signal_clear_syscall_restart(struct kernel_task *task);
+int kernel_signal_nanosleep_restart(const struct kernel_task *task,
+                                    uint64_t *deadline,
+                                    uint64_t *remaining_address);
+enum kernel_signal_status kernel_signal_suspend(struct kernel_task *task,
+                                                uint64_t mask);
 
 /* Records that the current user syscall must be retried after signal
  * handling; the generic form keeps the original trap arguments. */
@@ -61,10 +76,6 @@ void kernel_signal_note_syscall_restart(struct kernel_task *task);
 void kernel_signal_note_nanosleep_restart(struct kernel_task *task,
                                           uint64_t deadline,
                                           uint64_t remaining_address);
-
-/* Called immediately before returning to user mode, including from a
- * freshly scheduled task whose context starts at the trap-return stub. */
-void kernel_signal_prepare_user_return(struct riscv_trap_frame *frame);
 
 /* Marks the signal pending on the target (first sender wins) and drops
  * ignored signals.  Stopped targets are resumed for SIGCONT and
@@ -107,13 +118,12 @@ enum kernel_signal_status kernel_signal_get_pending(
     const struct kernel_task *task,
     uint64_t *pending);
 
-/* execve: every installed handler resets to DFL, IGN stays, and
- * pending signals that are now ignored are flushed. */
+/* execve resets installed handlers to DFL, retaining IGN and pending. */
 void kernel_signal_reset_on_exec(struct kernel_task *task);
 
-/* Nonzero when the parent has a real SIGCHLD handler (SA_NOCLDWAIT not
- * set), i.e. a child state change should send SIGCHLD. */
+/* Exit notification and zombie retention are separate decisions. */
 int kernel_signal_wants_sigchld(const struct kernel_task *parent);
+int kernel_signal_child_autoreap(const struct kernel_task *parent);
 
 /* Child state transitions wake wait4 and optionally raise SIGCHLD. */
 void kernel_signal_notify_child_exit(struct kernel_task *child);

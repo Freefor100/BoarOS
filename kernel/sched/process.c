@@ -38,6 +38,11 @@
 #define LINUX_CLONE_VM UINT64_C(0x100)
 #define LINUX_CLONE_VFORK UINT64_C(0x4000)
 
+struct riscv_fpu_state *riscv_process_fpu_borrow_current(void)
+{
+    return &scheduler.current->fpu;
+}
+
 enum kernel_mm_status kernel_scheduler_resolve_current_user_fault(
     uint64_t virtual_address,
     uint32_t access)
@@ -159,9 +164,20 @@ void wake_waiting_parent(struct kernel_task *child)
 
 /* Notifies a vfork-suspended parent that the child released its shared
  * address space (through exec or exit). */
-void vfork_notify_done(struct kernel_task *thread)
+void process_complete_vfork(struct kernel_task *thread)
 {
     if (thread->vfork_child != 0U && thread->parent != 0) {
+        /* Failed exec preparation also frees its transaction, but leaves
+         * the child in the shared MM. That is not vfork completion. */
+        if (thread->mm.state == KERNEL_MM_LIVE &&
+            thread->mm.record_page_address ==
+                thread->parent->mm.record_page_address) {
+            return;
+        }
+        /* Consume this child's completion before waking; an exec followed
+         * by exit must not complete the parent's next vfork. */
+        thread->vfork_child = 0U;
+        thread->parent->vfork_waiting = 0U;
         (void)kernel_wait_queue_wake_one(
             &thread->parent->vfork_done_queue);
     }
@@ -435,9 +451,9 @@ enum kernel_scheduler_status riscv_process_clone_current(
                 ? KERNEL_SCHEDULER_STATUS_OK
                 : KERNEL_SCHEDULER_STATUS_INVALID_STATE);
     }
-    /* The cleared task page is the child's FP register image; the next
-     * dispatch loads it before any child code runs. */
-    child->fpu.saved = 1U;
+    /* Snapshot live registers, not merely the potentially stale image. */
+    riscv_fpu_state_save(&parent->fpu);
+    child->fpu = parent->fpu;
     mm_status = riscv_kernel_mm_satp(&child->mm, &child_satp);
     if (mm_status != KERNEL_MM_STATUS_OK) {
         return finish_clone_failure(
@@ -453,11 +469,10 @@ enum kernel_scheduler_status riscv_process_clone_current(
             KERNEL_SCHEDULER_STATUS_INVALID_STATE);
     }
     *child_frame = *parent_frame;
-    /* The child starts with an unmodified FP unit, not the parent's
-     * live dirty state. */
+    /* The inherited image is loaded by the first context switch. */
     child_frame->sstatus =
         (child_frame->sstatus & ~RISCV_SSTATUS_FS_MASK) |
-        RISCV_SSTATUS_FS_INITIAL;
+        RISCV_SSTATUS_FS_CLEAN;
     child_frame->a0 = 0U;
     child_frame->sepc = parent_frame->sepc + 4U;
     child_frame->scause = 0U;
@@ -485,12 +500,13 @@ enum kernel_scheduler_status riscv_process_clone_current(
         /* Linux suspends the vfork parent inside the syscall until the
          * child execs or exits; the child wakes vfork_done_queue. */
         kernel_wait_queue_init(&parent->vfork_done_queue);
-        status = kernel_scheduler_block_current(&parent->vfork_done_queue,
-                                                0U,
-                                                1,
-                                                &wake_reason);
-        if (status != KERNEL_SCHEDULER_STATUS_OK) {
-            return status;
+        parent->vfork_waiting = 1U;
+        while (parent->vfork_waiting != 0U) {
+            status = kernel_scheduler_block_current(&parent->vfork_done_queue,
+                                                    0U, 0, &wake_reason);
+            if (status != KERNEL_SCHEDULER_STATUS_OK) {
+                return status;
+            }
         }
     }
     return KERNEL_SCHEDULER_STATUS_OK;
@@ -885,6 +901,12 @@ enum kernel_scheduler_status kernel_scheduler_reap_one(
             return status;
         }
         if (thread->parent != 0) {
+            kernel_signal_notify_child_exit(thread);
+            if (kernel_signal_child_autoreap(thread->parent)) {
+                child_remove(thread->parent, thread);
+            }
+        }
+        if (thread->parent != 0) {
             status = validate_child_list(thread->parent, thread);
             if (status != KERNEL_SCHEDULER_STATUS_OK) {
                 return status;
@@ -896,7 +918,6 @@ enum kernel_scheduler_status kernel_scheduler_reap_one(
             thread->next = 0;
             thread->state = KERNEL_THREAD_STATE_ZOMBIE;
             thread->publish_completion = 0U;
-            wake_waiting_parent(thread);
             return KERNEL_SCHEDULER_STATUS_EMPTY;
         }
         if (thread->tid_owned != 0U) {
@@ -1036,6 +1057,9 @@ static enum kernel_scheduler_status cleanup_user_task_resources(
                        : KERNEL_SCHEDULER_STATUS_INVALID_STATE;
         }
     }
+    if (thread->mm.state == KERNEL_MM_RELEASED) {
+        process_complete_vfork(thread);
+    }
     return (thread->mm.state == KERNEL_MM_RELEASED ||
             (thread->publish_completion == 0U &&
              thread->mm.state == KERNEL_MM_EMPTY))
@@ -1109,7 +1133,13 @@ static enum kernel_scheduler_status reparent_children(
         if (new_parent != 0) {
             child_append(new_parent, child);
             if (child->state == KERNEL_THREAD_STATE_ZOMBIE) {
-                wake_waiting_parent(child);
+                kernel_signal_notify_child_exit(child);
+                if (kernel_signal_child_autoreap(new_parent)) {
+                    child_remove(new_parent, child);
+                    child->state = KERNEL_THREAD_STATE_EXITED;
+                    child->publish_completion = 0U;
+                    exited_append(child);
+                }
             }
         } else if (child->state == KERNEL_THREAD_STATE_ZOMBIE) {
             child->state = KERNEL_THREAD_STATE_EXITED;
@@ -1164,15 +1194,17 @@ static void kernel_thread_finish(
         }
         cleanup_status = cleanup_user_task_resources(current);
         current->wait_status = user_wait_status(completion);
-        /* The vfork parent resumes once the shared mm reference is gone,
-         * regardless of which wait state the child ends up in. */
-        vfork_notify_done(current);
+    }
+    if (cleanup_status == KERNEL_SCHEDULER_STATUS_OK && current->parent != 0) {
+        kernel_signal_notify_child_exit(current);
+        if (kernel_signal_child_autoreap(current->parent)) {
+            child_remove(current->parent, current);
+        }
     }
     if (cleanup_status == KERNEL_SCHEDULER_STATUS_OK &&
         current->parent != 0) {
         current->state = KERNEL_THREAD_STATE_ZOMBIE;
         current->publish_completion = 0U;
-        kernel_signal_notify_child_exit(current);
     } else {
         current->state = KERNEL_THREAD_STATE_EXITED;
         exited_append(current);

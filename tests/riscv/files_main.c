@@ -1118,6 +1118,18 @@ static void run_seek_stat_operations(struct kernel_files *files,
         result != -KERNEL_EBADF) {
         fail_files(89U, 0, result);
     }
+    if (!write_user_bytes(mm, TEST_USER_PATH, "/missing", 9U) ||
+        kernel_files_fstatat(files,
+                             fs,
+                             mm,
+                             TEST_AT_FDCWD,
+                             TEST_USER_PATH,
+                             stat_buffer,
+                             0U,
+                             &result) != KERNEL_FILES_STATUS_OK ||
+        result != -KERNEL_ENOENT) {
+        fail_files(91U, -KERNEL_ENOENT, result);
+    }
     if (kernel_files_close(files, 4, &result) != KERNEL_FILES_STATUS_OK ||
         result != 0) {
         fail_files(90U, 0, result);
@@ -1145,7 +1157,8 @@ static int collect_dirent_name(struct kernel_mm *mm,
         !read_user_bytes(mm,
                          address + 19U,
                          directory_name,
-                         record_length - 19U)) {
+                         record_length - 19U < sizeof(directory_name)
+                             ? record_length - 19U : sizeof(directory_name))) {
         return -1;
     }
     directory_name[record_length - 19U < sizeof(directory_name)
@@ -1176,6 +1189,7 @@ static void run_directory_operations(struct kernel_files *files,
     uint64_t offset;
     int saw_data = 0;
     int saw_lost = 0;
+    int saw_long = 0;
     int64_t result = INT64_MIN;
 
     /* The root directory opens read-only and lists its entries. */
@@ -1191,18 +1205,8 @@ static void run_directory_operations(struct kernel_files *files,
         fail_files(111U, 0, result);
     }
 
-    /* Walk the returned records: the image holds /data and lost+found. */
-    {
-        unsigned int dump;
-
-        for (dump = 0U; dump < 64U; dump++) {
-            unsigned char byte = 0U;
-
-            (void)read_user_byte(mm, dir_buffer + dump, &byte);
-            virt_uart_put_hex(byte);
-            virt_uart_putc(dump % 16U == 15U ? '\n' : ' ');
-        }
-    }
+    /* The longest ext4 name requires a 280-byte aligned dirent, not the
+     * 275 bytes occupied by its fields before alignment. */
     offset = 0U;
     while (offset < (uint64_t)result) {
         uint64_t record_size = 0U;
@@ -1221,8 +1225,20 @@ static void run_directory_operations(struct kernel_files *files,
             type == KERNEL_VFS_DT_DIR) {
             saw_lost = 1;
         }
+        if (directory_name[0] == 'n') {
+            uint32_t length = 0U;
+
+            while (length < 255U && directory_name[length] == 'n') {
+                length++;
+            }
+            if (length != 255U || directory_name[length] != '\0' ||
+                record_size != 280U) {
+                fail_files(128U, 280, record_size);
+            }
+            saw_long = 1;
+        }
     }
-    if (!saw_data || !saw_lost) {
+    if (!saw_data || !saw_lost || !saw_long) {
         fail_files(113U, 0, (long)saw_data);
     }
 
@@ -1422,7 +1438,10 @@ static void run_dup_fcntl_operations(struct kernel_files *files,
         result != -KERNEL_EINVAL ||
         kernel_files_dup3(files, 3, -1, 0U, &result) !=
             KERNEL_FILES_STATUS_OK ||
-        result != -KERNEL_EINVAL ||
+        result != -KERNEL_EBADF ||
+        kernel_files_dup3(files, 3, 1024, 0U, &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != -KERNEL_EBADF ||
         kernel_files_dup2(files, 40, 7, &result) !=
             KERNEL_FILES_STATUS_OK ||
         result != -KERNEL_EBADF ||
@@ -1462,6 +1481,16 @@ static void run_dup_fcntl_operations(struct kernel_files *files,
         result != -KERNEL_EINVAL) {
         fail_files(104U, 0, result);
     }
+    if (kernel_files_fcntl(files,
+                           3,
+                           KERNEL_FILES_F_DUPFD,
+                           100U,
+                           &result) != KERNEL_FILES_STATUS_OK ||
+        result != 100 ||
+        kernel_files_close(files, 100, &result) != KERNEL_FILES_STATUS_OK ||
+        result != 0) {
+        fail_files(110U, 100, result);
+    }
 
     /* Fork keeps the duplicated descriptors and their fd flags. */
     if (kernel_files_fork(&child_files, files) != KERNEL_FILES_STATUS_OK ||
@@ -1496,6 +1525,148 @@ static void run_dup_fcntl_operations(struct kernel_files *files,
         kernel_files_close(files, 10, &result) != KERNEL_FILES_STATUS_OK ||
         result != 0) {
         fail_files(107U, 0, result);
+    }
+}
+
+static void run_pipe_operations(struct kernel_files *files,
+                                const struct kernel_fs_context *fs,
+                                struct kernel_mm *mm)
+{
+    struct kernel_uaccess_iovec iov[2];
+    int32_t pair[2];
+    int64_t result = INT64_MIN;
+    uint32_t index;
+
+    /* When only fd 31 is free, growing the table must allocate a distinct
+     * second descriptor from the new slots. */
+    for (index = 0U; index < 31U; index++) {
+        expect_open(files,
+                    fs,
+                    mm,
+                    TEST_AT_FDCWD,
+                    "/data",
+                    0U,
+                    (int64_t)index,
+                    120U);
+    }
+    if (kernel_files_pipe2(files,
+                           mm,
+                           TEST_USER_PATH,
+                           KERNEL_FILES_O_NONBLOCK,
+                           &result) != KERNEL_FILES_STATUS_OK ||
+        result != 0 ||
+        !read_user_bytes(mm, TEST_USER_PATH, pair, sizeof(pair)) ||
+        pair[0] != 31 || pair[1] != 32) {
+        fail_files(121U, 32, pair[1]);
+    }
+    for (index = 0U; index <= 32U; index++) {
+        if (kernel_files_close(files, index, &result) !=
+                KERNEL_FILES_STATUS_OK ||
+            result != 0) {
+            fail_files(122U, 0, result);
+        }
+    }
+
+    if (kernel_files_pipe2(files,
+                           mm,
+                           TEST_USER_PATH,
+                           KERNEL_FILES_O_NONBLOCK,
+                           &result) != KERNEL_FILES_STATUS_OK ||
+        result != 0 ||
+        !read_user_bytes(mm, TEST_USER_PATH, pair, sizeof(pair)) ||
+        kernel_files_write(files,
+                           mm,
+                           pair[0],
+                           TEST_USER_BUFFER,
+                           1U,
+                           &result) != KERNEL_FILES_STATUS_OK ||
+        result != -KERNEL_EBADF ||
+        kernel_files_read(files,
+                          mm,
+                          pair[1],
+                          TEST_USER_BUFFER,
+                          1U,
+                          &result) != KERNEL_FILES_STATUS_OK ||
+        result != -KERNEL_EBADF) {
+        fail_files(123U, -KERNEL_EBADF, result);
+    }
+
+    /* writev atomicity is decided from the aggregate request, not from
+     * each iovec independently. */
+    for (index = 0U; index < 15U; index++) {
+        if (kernel_files_write(files,
+                               mm,
+                               pair[1],
+                               TEST_USER_BUFFER,
+                               BOAROS_PAGE_SIZE,
+                               &result) != KERNEL_FILES_STATUS_OK ||
+            result != BOAROS_PAGE_SIZE) {
+            fail_files(124U, BOAROS_PAGE_SIZE, result);
+        }
+    }
+    if (kernel_files_write(files,
+                           mm,
+                           pair[1],
+                           TEST_USER_BUFFER,
+                           BOAROS_PAGE_SIZE - 3U,
+                           &result) != KERNEL_FILES_STATUS_OK ||
+        result != BOAROS_PAGE_SIZE - 3U) {
+        fail_files(125U, BOAROS_PAGE_SIZE - 3U, result);
+    }
+    iov[0].base = TEST_USER_BUFFER;
+    iov[0].length = 2U;
+    iov[1].base = TEST_USER_BUFFER + 2U;
+    iov[1].length = 2U;
+    if (!write_user_bytes(mm, TEST_USER_PATH, iov, sizeof(iov)) ||
+        kernel_files_writev(files,
+                            mm,
+                            pair[1],
+                            TEST_USER_PATH,
+                            2U,
+                            &result) != KERNEL_FILES_STATUS_OK ||
+        result != -KERNEL_EAGAIN ||
+        kernel_files_write(files,
+                           mm,
+                           pair[1],
+                           TEST_USER_BUFFER,
+                           3U,
+                           &result) != KERNEL_FILES_STATUS_OK ||
+        result != 3) {
+        fail_files(126U, 3, result);
+    }
+
+    /* Replacing the sole writer logically closes it before the new OFD is
+     * installed, so an empty read observes EOF immediately. */
+    if (kernel_files_close(files, pair[1], &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != 0 ||
+        kernel_files_close(files, pair[0], &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != 0 ||
+        kernel_files_pipe2(files,
+                           mm,
+                           TEST_USER_PATH,
+                           KERNEL_FILES_O_NONBLOCK,
+                           &result) != KERNEL_FILES_STATUS_OK ||
+        result != 0 ||
+        !read_user_bytes(mm, TEST_USER_PATH, pair, sizeof(pair)) ||
+        kernel_files_dup3(files, pair[0], pair[1], 0U, &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != pair[1] ||
+        kernel_files_read(files,
+                          mm,
+                          pair[0],
+                          TEST_USER_BUFFER,
+                          1U,
+                          &result) != KERNEL_FILES_STATUS_OK ||
+        result != 0 ||
+        kernel_files_close(files, pair[0], &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != 0 ||
+        kernel_files_close(files, pair[1], &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != 0) {
+        fail_files(127U, 0, result);
     }
 }
 
@@ -1625,6 +1796,17 @@ static void run_files_test(const void *dtb)
                    KERNEL_FILES_STATUS_STATE);
     }
     run_directory_operations(&files, &fs, &mm);
+
+    if (kernel_files_release(&files) != KERNEL_FILES_STATUS_OK) {
+        fail_files(58U, KERNEL_FILES_STATUS_OK,
+                   KERNEL_FILES_STATUS_STATE);
+    }
+    files = (struct kernel_files){0};
+    if (kernel_files_create(&files, &heap) != KERNEL_FILES_STATUS_OK) {
+        fail_files(119U, KERNEL_FILES_STATUS_OK,
+                   KERNEL_FILES_STATUS_STATE);
+    }
+    run_pipe_operations(&files, &fs, &mm);
 
     if (kernel_files_release(&files) != KERNEL_FILES_STATUS_OK) {
         fail_files(58U, KERNEL_FILES_STATUS_OK,

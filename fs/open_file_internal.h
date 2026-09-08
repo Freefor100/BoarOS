@@ -25,7 +25,8 @@ enum kernel_open_file_status kernel_open_file_create_pipe(
     uint64_t flags,
     struct kernel_open_file_description **owner);
 
-/* Drop a live container reference without running fallible final cleanup. */
+/* Drop a live container reference. Final pipe endpoints close immediately;
+ * a real cleanup failure leaves a retry owner, as for other final OFDs. */
 enum kernel_open_file_status kernel_open_file_detach(
     struct kernel_open_file_description **owner);
 

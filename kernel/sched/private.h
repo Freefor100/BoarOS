@@ -92,10 +92,13 @@ struct kernel_task {
     struct kernel_wait_queue child_exit_queue;
     struct kernel_wait_queue vfork_done_queue;
     uint32_t vfork_child;
+    uint32_t vfork_waiting;
     struct kernel_task *group_leader;
     uint32_t group_members;
     uint64_t signal_pending;
     uint64_t signal_blocked;
+    uint64_t signal_saved_mask;
+    uint32_t signal_restore_mask;
     uint64_t signal_table_address;
     uint32_t signal_sender[KERNEL_SIGNAL_COUNT];
     uint32_t stop_notified;
@@ -143,7 +146,7 @@ void blocked_append(struct kernel_task *thread);
 void blocked_unlink(struct kernel_task *thread);
 enum kernel_scheduler_status scheduler_switch_current_away(
     struct kernel_task *previous);
-void vfork_notify_done(struct kernel_task *thread);
+void process_complete_vfork(struct kernel_task *thread);
 enum kernel_scheduler_status activate_thread_address_space(
     const struct kernel_task *thread);
 enum kernel_scheduler_status validate_queues(void);

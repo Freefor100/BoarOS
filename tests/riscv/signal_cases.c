@@ -140,11 +140,13 @@ enum kernel_signal_status __wrap_kernel_signal_update_blocked(
     const uint64_t *new_mask,
     uint64_t *old_mask)
 {
-    if (task != (struct kernel_task *)(uintptr_t)1U || new_mask == 0) {
+    if (task != (struct kernel_task *)(uintptr_t)1U) {
         return KERNEL_SIGNAL_STATUS_INVALID_ARGUMENT;
     }
     update_how = how;
-    update_mask = *new_mask;
+    if (new_mask != 0) {
+        update_mask = *new_mask;
+    }
     if (old_mask != 0) {
         *old_mask = old_blocked;
     }
@@ -235,6 +237,30 @@ static unsigned long run_sigaction_cases(struct kernel_task *caller)
         result_changed(&result, KERNEL_SYSCALL_ACTION_RETURN, -KERNEL_EINVAL)) {
         failures++;
     }
+    request.arguments[3] = 8U;
+    request.arguments[1] = 1U;
+    set_sig = 0U;
+    copied_action.handler = UINT64_MAX;
+    if (kernel_syscall_dispatch(caller, &request, &result) !=
+            KERNEL_SYSCALL_STATUS_OK ||
+        result.value != -KERNEL_EFAULT || set_sig != 0U ||
+        copied_action.handler != UINT64_MAX) {
+        failures++;
+    }
+    request.arguments[1] = 0U;
+    request.arguments[2] = 1U;
+    if (kernel_syscall_dispatch(caller, &request, &result) !=
+            KERNEL_SYSCALL_STATUS_OK || result.value != -KERNEL_EFAULT) {
+        failures++;
+    }
+    request.arguments[1] = UINT64_C(0x1000);
+    request.arguments[2] = 0U;
+    signal_status = KERNEL_SIGNAL_STATUS_NO_MEMORY;
+    if (kernel_syscall_dispatch(caller, &request, &result) !=
+            KERNEL_SYSCALL_STATUS_OK || result.value != -KERNEL_ENOMEM) {
+        failures++;
+    }
+    signal_status = KERNEL_SIGNAL_STATUS_OK;
     return failures;
 }
 
@@ -264,6 +290,30 @@ static unsigned long run_sigmask_cases(struct kernel_task *caller)
             KERNEL_SYSCALL_STATUS_OK ||
         result_changed(&result, KERNEL_SYSCALL_ACTION_RETURN, 0) ||
         copied_pending != pending) {
+        failures++;
+    }
+    request.arguments[0] = 1U;
+    if (kernel_syscall_dispatch(caller, &request, &result) !=
+            KERNEL_SYSCALL_STATUS_OK || result.value != -KERNEL_EFAULT) {
+        failures++;
+    }
+    request.number = 135U;
+    request.arguments[0] = LINUX_SIG_SETMASK;
+    request.arguments[1] = 1U;
+    request.arguments[2] = UINT64_C(0x4000);
+    request.arguments[3] = 8U;
+    copied_mask = UINT64_MAX;
+    update_mask = UINT64_MAX;
+    if (kernel_syscall_dispatch(caller, &request, &result) !=
+            KERNEL_SYSCALL_STATUS_OK || result.value != -KERNEL_EFAULT ||
+        copied_mask != UINT64_MAX || update_mask != UINT64_MAX) {
+        failures++;
+    }
+    request.arguments[0] = UINT64_MAX;
+    request.arguments[1] = 0U;
+    if (kernel_syscall_dispatch(caller, &request, &result) !=
+            KERNEL_SYSCALL_STATUS_OK || result.value != 0 ||
+        copied_mask != old_blocked) {
         failures++;
     }
     return failures;

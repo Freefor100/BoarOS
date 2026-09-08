@@ -10,7 +10,7 @@
 | `include/kernel/exec_image.h` | 定义构建期选择的架构映像请求和结果，不暴露 Sv39 类型 |
 | `include/arch/riscv/exec.h`、`arch/riscv/exec.c` | 绑定 RISC-V 分配器与内核根表，把静态 ELF 装载结果变成通用 MM |
 | `kernel/sched/exec.c` | 验证 prepared 事务、切换 `satp`、替换 MM 和 Trap Frame、处理 close-on-exec |
-| `kernel/syscall.c`、`arch/riscv/trap.c` | 解码 Linux syscall 221，并区分返回旧程序与进入新程序两种动作 |
+| `kernel/syscall/process.c`、`arch/riscv/trap.c` | 解码 Linux syscall 221，并区分返回旧程序与进入新程序两种动作 |
 
 用户接口为 Linux RISC-V `execve(const char *filename, char *const argv[], char *const envp[])`，成功不返回；当前只允许单成员线程组执行。内部 `kernel_execve_prepare()` 在成功时只建立 `PREPARED` 事务，Trap 边界随后调用 `kernel_scheduler_exec_commit()` 完成不可返回的提交。
 

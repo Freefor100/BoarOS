@@ -6,6 +6,10 @@
 
 #include <stdint.h>
 
+struct riscv_fpu_state;
+/* Borrow the current user task's architecture-owned register image. */
+struct riscv_fpu_state *riscv_process_fpu_borrow_current(void);
+
 /*
  * Clone the current process from the syscall-entry register snapshot.
  * `flags` selects fork or the vfork form (CLONE_VM|CLONE_VFORK), which

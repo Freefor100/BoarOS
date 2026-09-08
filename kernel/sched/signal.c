@@ -1,9 +1,6 @@
 #include "private.h"
 
 #include <arch/riscv/direct_map.h>
-#include <arch/riscv/fpu.h>
-#include <arch/riscv/trap.h>
-#include <arch/riscv/user_elf.h>
 #include <kernel/errno.h>
 #include <kernel/physical_page.h>
 #include <kernel/page.h>
@@ -16,57 +13,10 @@
 #include <stdint.h>
 #include <string.h>
 
-#define LINUX_SIGINFO_SIZE 128U
-#define LINUX_SIGINFO_PID_OFFSET 16U
-#define LINUX_UCONTEXT_SIZE 688U
-#define LINUX_UCONTEXT_SIGMASK_OFFSET 40U
-#define LINUX_UCONTEXT_MCONTEXT_OFFSET 168U
-#define LINUX_SIGCONTEXT_FP_OFFSET 256U
-#define LINUX_SS_DISABLE UINT64_C(2)
-#define LINUX_SIGFRAME_SIZE (LINUX_SIGINFO_SIZE + LINUX_UCONTEXT_SIZE)
-#define LINUX_WAIT_STOPPED 0x7fU
-#define LINUX_SI_USER UINT32_C(0)
-
 #define SIGNAL_KILL 9U
 #define SIGNAL_CONTINUE 18U
 #define SIGNAL_STOP 19U
-
-/* ptrace register order: index 0 is pc, then ra, sp, gp, tp, t0-t2,
- * s0-s1, a0-a7, s2-s11, t3-t6. */
-static const uint32_t signal_gpr_offsets[32] = {
-    RISCV_TRAP_FRAME_SEPC,
-    RISCV_TRAP_FRAME_RA,
-    RISCV_TRAP_FRAME_SP,
-    RISCV_TRAP_FRAME_GP,
-    RISCV_TRAP_FRAME_TP,
-    RISCV_TRAP_FRAME_T0,
-    RISCV_TRAP_FRAME_T1,
-    RISCV_TRAP_FRAME_T2,
-    RISCV_TRAP_FRAME_S0,
-    RISCV_TRAP_FRAME_S1,
-    RISCV_TRAP_FRAME_A0,
-    RISCV_TRAP_FRAME_A1,
-    RISCV_TRAP_FRAME_A2,
-    RISCV_TRAP_FRAME_A3,
-    RISCV_TRAP_FRAME_A4,
-    RISCV_TRAP_FRAME_A5,
-    RISCV_TRAP_FRAME_A6,
-    RISCV_TRAP_FRAME_A7,
-    RISCV_TRAP_FRAME_S2,
-    RISCV_TRAP_FRAME_S3,
-    RISCV_TRAP_FRAME_S4,
-    RISCV_TRAP_FRAME_S5,
-    RISCV_TRAP_FRAME_S6,
-    RISCV_TRAP_FRAME_S7,
-    RISCV_TRAP_FRAME_S8,
-    RISCV_TRAP_FRAME_S9,
-    RISCV_TRAP_FRAME_S10,
-    RISCV_TRAP_FRAME_S11,
-    RISCV_TRAP_FRAME_T3,
-    RISCV_TRAP_FRAME_T4,
-    RISCV_TRAP_FRAME_T5,
-    RISCV_TRAP_FRAME_T6,
-};
+#define LINUX_WAIT_STOPPED 0x7fU
 
 #define SIGNAL_MASK_KILL_STOP KERNEL_SIGNAL_UNBLOCKABLE_MASK
 
@@ -283,6 +233,11 @@ enum kernel_signal_status kernel_signal_set_action(
     entry->handler = action->handler;
     entry->flags = action->flags;
     entry->mask = action->mask & ~SIGNAL_MASK_KILL_STOP;
+    if (entry->handler == KERNEL_SIGNAL_IGN ||
+        (entry->handler == KERNEL_SIGNAL_DFL &&
+         signal_default_action(sig) == KERNEL_SIGNAL_DEFAULT_IGNORE)) {
+        task->signal_pending &= ~signal_mask(sig);
+    }
     return KERNEL_SIGNAL_STATUS_OK;
 }
 
@@ -353,7 +308,7 @@ enum kernel_signal_status kernel_signal_update_blocked(
     uint64_t mask = 0U;
 
     if (task == 0 || !signal_dispatchable(task) ||
-        how > LINUX_SIG_SETMASK) {
+        (new_mask != 0 && how > LINUX_SIG_SETMASK)) {
         return KERNEL_SIGNAL_STATUS_INVALID_ARGUMENT;
     }
     if (old_mask != 0) {
@@ -380,55 +335,46 @@ enum kernel_signal_status kernel_signal_get_pending(
     if (task == 0 || pending == 0 || !signal_dispatchable(task)) {
         return KERNEL_SIGNAL_STATUS_INVALID_ARGUMENT;
     }
-    *pending = task->signal_pending;
+    *pending = task->signal_pending & task->signal_blocked;
     return KERNEL_SIGNAL_STATUS_OK;
 }
 
 void kernel_signal_reset_on_exec(struct kernel_task *task)
 {
-    struct kernel_signal_table *table;
-    uint32_t index;
+    struct kernel_signal_table *table = signal_table_of(task);
 
-    if (task == 0 || !signal_dispatchable(task)) {
-        return;
-    }
-    table = signal_table_of(task);
     if (table != 0) {
-        for (index = 1U; index <= KERNEL_SIGNAL_COUNT; index++) {
-            struct kernel_signal_action *entry =
-                &table->actions[index - 1U];
+        for (uint32_t index = 0U; index < KERNEL_SIGNAL_COUNT; index++) {
+            struct kernel_signal_action *entry = &table->actions[index];
 
-            if (entry->handler == KERNEL_SIGNAL_IGN) {
-                task->signal_pending &= ~signal_mask(index);
-            } else if (entry->handler != KERNEL_SIGNAL_DFL) {
+            if (entry->handler != KERNEL_SIGNAL_IGN) {
                 entry->handler = KERNEL_SIGNAL_DFL;
                 entry->flags = 0U;
                 entry->mask = 0U;
             }
         }
-    } else {
-        task->signal_pending &=
-            ~(signal_mask(17U) | signal_mask(23U) | signal_mask(28U));
-        return;
     }
-    task->signal_pending &=
-        ~(signal_mask(17U) | signal_mask(23U) | signal_mask(28U));
+    task->signal_restore_mask = 0U;
+    kernel_signal_clear_syscall_restart(task);
 }
 
 int kernel_signal_wants_sigchld(const struct kernel_task *parent)
 {
-    const struct kernel_signal_action *entry;
+    const struct kernel_signal_action *entry =
+        parent == 0 ? 0 : signal_action_of(parent, 17U);
 
-    if (parent == 0) {
-        return 0;
-    }
-    entry = signal_action_of(parent, 17U);
-    if (entry == 0 || entry->handler == KERNEL_SIGNAL_DFL ||
-        entry->handler == KERNEL_SIGNAL_IGN ||
-        (entry->flags & LINUX_SA_NOCLDWAIT) != 0U) {
-        return 0;
-    }
-    return 1;
+    /* A blocked default-ignored SIGCHLD is still observable via pending. */
+    return parent != 0 &&
+           (entry == 0 || entry->handler != KERNEL_SIGNAL_IGN);
+}
+
+int kernel_signal_child_autoreap(const struct kernel_task *parent)
+{
+    const struct kernel_signal_action *entry =
+        parent == 0 ? 0 : signal_action_of(parent, 17U);
+
+    return entry != 0 && (entry->handler == KERNEL_SIGNAL_IGN ||
+                          (entry->flags & LINUX_SA_NOCLDWAIT) != 0U);
 }
 
 static int signal_wants_sigchld_stop(const struct kernel_task *parent)
@@ -441,7 +387,7 @@ static int signal_wants_sigchld_stop(const struct kernel_task *parent)
     entry = signal_action_of(parent, 17U);
     return entry != 0 && entry->handler != KERNEL_SIGNAL_DFL &&
            entry->handler != KERNEL_SIGNAL_IGN &&
-           (entry->flags & (LINUX_SA_NOCLDSTOP | LINUX_SA_NOCLDWAIT)) == 0U;
+           (entry->flags & LINUX_SA_NOCLDSTOP) == 0U;
 }
 
 void kernel_signal_notify_child_exit(struct kernel_task *child)
@@ -498,29 +444,14 @@ enum kernel_signal_status kernel_signal_send(struct kernel_task *target,
     }
     bit = signal_mask(sig);
     if (sig == SIGNAL_CONTINUE) {
-        /* SIGCONT discards pending stop signals and resumes the task. */
         target->signal_pending &=
-            ~(signal_mask(20U) | signal_mask(21U) | signal_mask(22U));
+            ~(signal_mask(19U) | signal_mask(20U) |
+              signal_mask(21U) | signal_mask(22U));
         if (target->state == KERNEL_THREAD_STATE_STOPPED) {
             signal_resume_stopped(target, 1);
         }
-        {
-            const struct kernel_signal_action *entry =
-                signal_action_of(target, sig);
-
-            if (entry != 0 && entry->handler != KERNEL_SIGNAL_DFL &&
-                entry->handler != KERNEL_SIGNAL_IGN &&
-                (target->signal_pending & bit) == 0U) {
-                target->signal_pending |= bit;
-                target->signal_sender[sig - 1U] = (uint32_t)sender_tid;
-                if ((target->signal_blocked & bit) == 0U &&
-                    kernel_scheduler_wake_signal(target) !=
-                        KERNEL_SCHEDULER_STATUS_OK) {
-                    return KERNEL_SIGNAL_STATUS_INVALID_STATE;
-                }
-            }
-        }
-        return KERNEL_SIGNAL_STATUS_OK;
+    } else if (sig >= SIGNAL_STOP && sig <= 22U) {
+        target->signal_pending &= ~signal_mask(SIGNAL_CONTINUE);
     }
     if (target->signal_pending & bit) {
         /* Standard signals merge; the first sender's identity stays. */
@@ -531,12 +462,13 @@ enum kernel_signal_status kernel_signal_send(struct kernel_task *target,
                                                                      sig);
 
         if ((entry == 0 || entry->handler == KERNEL_SIGNAL_DFL) &&
-            signal_default_action(sig) == KERNEL_SIGNAL_DEFAULT_IGNORE) {
+            (signal_default_action(sig) == KERNEL_SIGNAL_DEFAULT_IGNORE ||
+             signal_default_action(sig) == KERNEL_SIGNAL_DEFAULT_CONTINUE) &&
+            (target->signal_blocked & bit) == 0U) {
             return KERNEL_SIGNAL_STATUS_OK;
         }
-        if (entry != 0 &&
-            (entry->handler == KERNEL_SIGNAL_IGN ||
-             (sig == 17U && (entry->flags & LINUX_SA_NOCLDWAIT) != 0U))) {
+        if (entry != 0 && entry->handler == KERNEL_SIGNAL_IGN &&
+            (target->signal_blocked & bit) == 0U) {
             return KERNEL_SIGNAL_STATUS_OK;
         }
     }
@@ -746,175 +678,115 @@ static void signal_terminate(uint32_t sig, int core_dump)
                             core_dump != 0 ? 1U : 0U);
 }
 
-static void signal_clear_restart(struct kernel_task *task)
+void kernel_signal_clear_syscall_restart(struct kernel_task *task)
 {
     task->syscall_restart_kind = KERNEL_SYSCALL_RESTART_NONE;
     task->syscall_restart_deadline = 0U;
     task->syscall_restart_remaining_address = 0U;
 }
 
-static void signal_restart_without_handler(struct kernel_task *task,
-                                           struct riscv_trap_frame *frame)
+int kernel_signal_nanosleep_restart(const struct kernel_task *task,
+                                    uint64_t *deadline,
+                                    uint64_t *remaining_address)
 {
-    if (task->syscall_restart_kind == KERNEL_SYSCALL_RESTART_NANOSLEEP) {
-        /* restart_syscall(128) consumes the saved absolute deadline. */
-        frame->a7 = 128U;
-    } else if (task->syscall_restart_kind ==
-               KERNEL_SYSCALL_RESTART_GENERIC) {
-        signal_clear_restart(task);
+    if (task->syscall_restart_kind != KERNEL_SYSCALL_RESTART_NANOSLEEP) {
+        return 0;
     }
+    *deadline = task->syscall_restart_deadline;
+    *remaining_address = task->syscall_restart_remaining_address;
+    return 1;
 }
 
-static void signal_finish_interrupted_syscall(
-    struct kernel_task *task,
-    struct riscv_trap_frame *frame,
-    const struct kernel_signal_action *entry)
+enum kernel_signal_restart kernel_signal_restart_decide(
+    struct kernel_task *task, int has_handler, uint64_t flags)
 {
-    if (task->syscall_restart_kind == KERNEL_SYSCALL_RESTART_NONE) {
-        return;
+    uint32_t kind = task->syscall_restart_kind;
+
+    if (kind == KERNEL_SYSCALL_RESTART_NONE) {
+        return KERNEL_SIGNAL_RESTART_NONE;
     }
-    if ((entry->flags & LINUX_SA_RESTART) != 0U) {
-        if (task->syscall_restart_kind == KERNEL_SYSCALL_RESTART_NANOSLEEP) {
-            frame->a7 = 128U;
+    if (!has_handler && kind == KERNEL_SYSCALL_RESTART_NANOSLEEP) {
+        return KERNEL_SIGNAL_RESTART_BLOCK;
+    }
+    /* Handler syscalls must not inherit an outer restart block. The
+     * interrupted register snapshot itself carries a generic retry. */
+    kernel_signal_clear_syscall_restart(task);
+    if (has_handler && (kind == KERNEL_SYSCALL_RESTART_NANOSLEEP ||
+                         (flags & LINUX_SA_RESTART) == 0U)) {
+        return KERNEL_SIGNAL_RESTART_INTERRUPTED;
+    }
+    return KERNEL_SIGNAL_RESTART_RETRY;
+}
+
+enum kernel_signal_status kernel_signal_suspend(struct kernel_task *task,
+                                                uint64_t mask)
+{
+    enum kernel_wait_wake_reason reason;
+
+    if (task != scheduler.current || !signal_dispatchable(task)) {
+        return KERNEL_SIGNAL_STATUS_INVALID_ARGUMENT;
+    }
+    task->signal_saved_mask = task->signal_blocked;
+    task->signal_restore_mask = 1U;
+    task->signal_blocked = mask & ~SIGNAL_MASK_KILL_STOP;
+    while ((task->signal_pending & ~task->signal_blocked) == 0U) {
+        if (kernel_scheduler_block_current(0, 0U, 1, &reason) !=
+            KERNEL_SCHEDULER_STATUS_OK) {
+            task->signal_blocked = task->signal_saved_mask;
+            task->signal_restore_mask = 0U;
+            return KERNEL_SIGNAL_STATUS_INVALID_STATE;
         }
-        return;
     }
-    if (frame->sepc > UINT64_MAX - 4U) {
-        signal_terminate(11U, 1);
-    }
-    frame->a0 = (uint64_t)(int64_t)-KERNEL_EINTR;
-    frame->sepc += 4U;
-    signal_clear_restart(task);
+    /* Keep the temporary mask until delivery. The signal frame contains
+     * the pre-suspend mask, which sigreturn restores atomically. */
+    return KERNEL_SIGNAL_STATUS_OK;
 }
 
-static void signal_fill_gprs(const struct riscv_trap_frame *frame,
-                             uint8_t *mcontext)
+int kernel_signal_select(struct kernel_task *task,
+                         struct kernel_signal_delivery *delivery)
 {
-    uint32_t index;
-
-    for (index = 0U; index < 32U; index++) {
-        uint64_t value;
-
-        if (index == 0U) {
-            value = frame->sepc;
-        } else {
-            value = *(const uint64_t *)((const uint8_t *)frame +
-                                        signal_gpr_offsets[index]);
-        }
-        memcpy(mcontext + (size_t)index * 8U, &value, sizeof(value));
-    }
-}
-
-static void signal_fill_fp(struct kernel_task *task, uint8_t *mcontext)
-{
-    uint32_t index;
-
-    riscv_fpu_state_save(&task->fpu);
-    for (index = 0U; index < 32U; index++) {
-        memcpy(mcontext + LINUX_SIGCONTEXT_FP_OFFSET +
-                   (size_t)index * 8U,
-               &task->fpu.regs[index],
-               sizeof(uint64_t));
-    }
-    memcpy(mcontext + LINUX_SIGCONTEXT_FP_OFFSET + 256U,
-           &task->fpu.fcsr,
-           sizeof(uint64_t));
-}
-
-static void signal_build_frame(struct kernel_task *task,
-                               struct riscv_trap_frame *frame,
-                               uint32_t sig,
-                               const struct kernel_signal_action *entry,
-                               uint64_t user_sp)
-{
-    uint8_t buffer[LINUX_SIGFRAME_SIZE];
-    uint64_t old_blocked = task->signal_blocked;
-    uint32_t sig32 = sig;
-    uint32_t code = LINUX_SI_USER;
-    uint32_t sender = task->signal_sender[sig - 1U];
-    uint32_t ss_disable = (uint32_t)LINUX_SS_DISABLE;
-    size_t copied = 0U;
-    memset(buffer, 0, sizeof(buffer));
-    /* siginfo: SI_USER with the first sender's pid. */
-    memcpy(buffer, &sig32, sizeof(sig32));
-    memcpy(buffer + 8U, &code, sizeof(code));
-    memcpy(buffer + LINUX_SIGINFO_PID_OFFSET, &sender, sizeof(sender));
-    /* ucontext: uc_flags 0, uc_link NULL, uc_stack SS_DISABLE. */
-    memcpy(buffer + LINUX_SIGINFO_SIZE + 24U,
-           &ss_disable,
-           sizeof(ss_disable));
-    /* uc_sigmask: the mask the interrupted context runs under. */
-    memcpy(buffer + LINUX_SIGINFO_SIZE + LINUX_UCONTEXT_SIGMASK_OFFSET,
-           &old_blocked,
-           sizeof(old_blocked));
-    signal_fill_gprs(frame,
-                     buffer + LINUX_SIGINFO_SIZE +
-                         LINUX_UCONTEXT_MCONTEXT_OFFSET);
-    signal_fill_fp(task,
-                   buffer + LINUX_SIGINFO_SIZE +
-                       LINUX_UCONTEXT_MCONTEXT_OFFSET);
-
-    if (kernel_copy_to_user(&task->mm,
-                            user_sp,
-                            buffer,
-                            LINUX_SIGFRAME_SIZE,
-                            &copied) != KERNEL_UACCESS_STATUS_OK ||
-        copied != LINUX_SIGFRAME_SIZE) {
-        signal_terminate(11U, 1);
-    }
-    frame->sp = user_sp;
-    frame->sepc = entry->handler;
-    frame->ra = RISCV_USER_ELF_VDSO_BASE;
-    frame->a0 = sig;
-    frame->a1 = user_sp;
-    frame->a2 = user_sp + LINUX_SIGINFO_SIZE;
-    task->signal_blocked |=
-        entry->mask | ((entry->flags & LINUX_SA_NODEFER) != 0U
-                           ? 0U
-                           : signal_mask(sig));
-    if ((entry->flags & LINUX_SA_RESETHAND) != 0U) {
-        struct kernel_signal_table *table = signal_table_of(task);
-        struct kernel_signal_action *reset = &table->actions[sig - 1U];
-
-        reset->handler = KERNEL_SIGNAL_DFL;
-        reset->flags = 0U;
-        reset->mask = 0U;
-    }
-}
-
-void kernel_signal_deliver_pending(struct riscv_trap_frame *frame)
-{
-    struct kernel_task *task = scheduler.current;
-    uint64_t pending;
-    uint32_t sig;
-    const struct kernel_signal_action *entry;
-
-    if (task == 0 || task == &scheduler.idle ||
-        task->arch.user_mode != 1U ||
-        (frame->sstatus & RISCV_SSTATUS_SPP) != 0U) {
-        return;
-    }
     for (;;) {
-        pending = task->signal_pending & ~task->signal_blocked;
+        uint64_t pending = task->signal_pending & ~task->signal_blocked;
+        uint32_t sig;
+        const struct kernel_signal_action *entry;
+
         if (pending == 0U) {
-            return;
+            if (task->signal_restore_mask != 0U) {
+                enum kernel_wait_wake_reason reason;
+
+                if (kernel_scheduler_block_current(0, 0U, 1, &reason) !=
+                    KERNEL_SCHEDULER_STATUS_OK) {
+                    signal_terminate(11U, 1);
+                }
+                continue;
+            }
+            return 0;
         }
         sig = signal_first_set(pending);
         task->signal_pending &= ~signal_mask(sig);
         entry = signal_action_of(task, sig);
         if (entry != 0 && entry->handler != KERNEL_SIGNAL_DFL &&
             entry->handler != KERNEL_SIGNAL_IGN) {
-            uint64_t user_sp;
+            delivery->signal = sig;
+            delivery->sender = task->signal_sender[sig - 1U];
+            delivery->handler = entry->handler;
+            delivery->flags = entry->flags;
+            delivery->restore_mask = task->signal_restore_mask != 0U
+                                         ? task->signal_saved_mask
+                                         : task->signal_blocked;
+            task->signal_restore_mask = 0U;
+            task->signal_blocked |= entry->mask |
+                ((entry->flags & LINUX_SA_NODEFER) != 0U
+                     ? 0U : signal_mask(sig));
+            if ((entry->flags & LINUX_SA_RESETHAND) != 0U) {
+                struct kernel_signal_action *reset =
+                    &signal_table_of(task)->actions[sig - 1U];
 
-            if (frame->sp < LINUX_SIGFRAME_SIZE) {
-                signal_terminate(11U, 1);
+                reset->handler = KERNEL_SIGNAL_DFL;
+                reset->flags = 0U;
+                reset->mask = 0U;
             }
-            user_sp = (frame->sp - LINUX_SIGFRAME_SIZE) &
-                      ~(uintptr_t)15U;
-            signal_finish_interrupted_syscall(task, frame, entry);
-
-            signal_build_frame(task, frame, sig, entry, user_sp);
-            return;
+            return 1;
         }
         if (entry != 0 && entry->handler == KERNEL_SIGNAL_IGN) {
             continue;
@@ -925,93 +797,13 @@ void kernel_signal_deliver_pending(struct riscv_trap_frame *frame)
             continue;
         case KERNEL_SIGNAL_DEFAULT_STOP:
             signal_stop_current(task, sig);
-            return;
+            continue;
         case KERNEL_SIGNAL_DEFAULT_CORE:
             signal_terminate(sig, 1);
-            return;
+            return 0;
         default:
             signal_terminate(sig, 0);
-            return;
+            return 0;
         }
     }
-}
-
-void kernel_signal_prepare_user_return(struct riscv_trap_frame *frame)
-{
-    struct kernel_task *task = scheduler.current;
-
-    if (frame == 0 || task == 0 || task == &scheduler.idle ||
-        task->arch.user_mode != 1U ||
-        (frame->sstatus & RISCV_SSTATUS_SPP) != 0U) {
-        return;
-    }
-    if ((task->signal_pending & ~task->signal_blocked) == 0U) {
-        signal_restart_without_handler(task, frame);
-        return;
-    }
-    kernel_signal_deliver_pending(frame);
-}
-
-void kernel_signal_restore_current(struct riscv_trap_frame *frame)
-{
-    struct kernel_task *task = scheduler.current;
-    uint8_t mcontext[32U * 8U + 264U];
-    uint8_t fp[264U];
-    uint64_t sigmask = 0U;
-    uint64_t value;
-    size_t copied = 0U;
-    uint64_t user_sp = frame == 0 ? 0U : frame->sp;
-    uint32_t index;
-    enum kernel_uaccess_status copy_status;
-
-    if (frame == 0 || task == 0 || task == &scheduler.idle ||
-        task->arch.user_mode != 1U ||
-        frame->sp > UINT64_MAX -
-                          (LINUX_SIGINFO_SIZE +
-                           LINUX_UCONTEXT_MCONTEXT_OFFSET +
-                           sizeof(mcontext)) ||
-        frame->sp < LINUX_SIGINFO_SIZE + LINUX_UCONTEXT_MCONTEXT_OFFSET) {
-        signal_terminate(11U, 1);
-    }
-    copied = 0U;
-    copy_status = kernel_copy_from_user(&task->mm,
-                                        &sigmask,
-                                        user_sp + LINUX_SIGINFO_SIZE +
-                                            LINUX_UCONTEXT_SIGMASK_OFFSET,
-                                        sizeof(sigmask),
-                                        &copied);
-    if (copy_status != KERNEL_UACCESS_STATUS_OK ||
-        copied != sizeof(sigmask)) {
-        signal_terminate(11U, 1);
-    }
-    copied = 0U;
-    copy_status = kernel_copy_from_user(&task->mm,
-                                        mcontext,
-                                        user_sp + LINUX_SIGINFO_SIZE +
-                                            LINUX_UCONTEXT_MCONTEXT_OFFSET,
-                                        sizeof(mcontext),
-                                        &copied);
-    if (copy_status != KERNEL_UACCESS_STATUS_OK ||
-        copied != sizeof(mcontext)) {
-        signal_terminate(11U, 1);
-    }
-    task->signal_blocked = sigmask & ~SIGNAL_MASK_KILL_STOP;
-    for (index = 0U; index < 32U; index++) {
-        memcpy(&value, mcontext + (size_t)index * 8U, sizeof(value));
-        if (index == 0U) {
-            frame->sepc = value;
-        } else {
-            *(uint64_t *)((uint8_t *)frame + signal_gpr_offsets[index]) =
-                value;
-        }
-    }
-    memcpy(fp, mcontext + LINUX_SIGCONTEXT_FP_OFFSET, sizeof(fp));
-    for (index = 0U; index < 32U; index++) {
-        memcpy(&task->fpu.regs[index],
-               fp + (size_t)index * 8U,
-               sizeof(uint64_t));
-    }
-    memcpy(&task->fpu.fcsr, fp + 256U, sizeof(uint64_t));
-    task->fpu.saved = 1U;
-    riscv_fpu_state_restore(&task->fpu);
 }

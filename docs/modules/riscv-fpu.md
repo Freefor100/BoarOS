@@ -9,14 +9,14 @@
 | `include/arch/riscv/fpu.h` | per-task FPU state 的布局、偏移和汇编接口 |
 | `arch/riscv/fpu.S` | 唯一允许触碰 F/D 寄存器的保存、恢复、切换和 reset 代码 |
 | `kernel/sched/core.c`、`kernel/sched/process.c` | 创建、调度、clone 和退出时的 FP owner 生命周期 |
-| `kernel/sched/exec.c`、`kernel/sched/signal.c` | exec 清空状态、signal frame 保存/恢复 |
+| `kernel/sched/exec.c`、`arch/riscv/signal.c` | exec 清空状态、signal frame 保存/恢复 |
 | `tests/userland/real.c` | 真实 U-mode FP 抢占和寄存器保持测试 |
 
 每个用户 task 的 `struct riscv_fpu_state` 包含 32 个 64 位寄存器、`fcsr` 和一个 `saved` 标志，共 272 字节、16 字节对齐。基础整数 Trap Frame 仍为 288 字节，不把 FP 状态混入每次 trap 保存；FP 状态由当前 task 单独拥有。
 
 ## FS 状态机与调度
 
-用户入口和新 clone 的 Frame 将 `sstatus.FS` 置为 Initial，并把 task 的内存镜像标记为 saved。只有汇编封装 `riscv_fpu_state_save/restore` 和 `riscv_fpu_switch` 使用 F/D 指令；内核 C 和普通汇编按 RV64IMAC 编译，不在 FP owner 之外触碰浮点单元。
+初次 ELF 入口和 exec 的 Frame 将 `sstatus.FS` 置为 Initial；fork 继承父进程实际 FP image，子 Frame 标记 Clean，首次调度加载该 image。只有汇编封装 `riscv_fpu_state_save/restore` 和 `riscv_fpu_switch` 使用 F/D 指令；内核 C 和普通汇编按 RV64IMAC 编译，不在 FP owner 之外触碰浮点单元。
 
 context switch 在关闭 SIE 的临界区先观察 FS：前一个用户 task 为 Dirty 时保存 32 个寄存器和 fcsr、将 FS 收敛到 Clean，再按需加载下一个 task 的 saved image；恢复完成后保持 Clean，使下一次用户 FP 指令重新产生 Dirty。内核线程没有用户 FP owner，不保存也不恢复。task 退出时丢弃其 FP image，只加载下一个用户 task 的状态。
 
@@ -24,7 +24,7 @@ context switch 在关闭 SIE 的临界区先观察 FS：前一个用户 task 为
 
 ## exec、clone 与 signal 边界
 
-fork/clone 为 child 从清零 task 页开始新的 FP image，不复制父 task 当前硬件寄存器；child 从自己的初始用户 Frame 开始。exec 在提交新 MM 和 Trap Frame 前调用 reset：硬件 32 个寄存器、fcsr 和内存 image 都清零，并让新程序从 FS Initial 开始，避免旧映像的 callee-saved FP 值泄漏。
+fork/clone 先保存父进程当前硬件 FP 寄存器，再复制 32 个 D 寄存器、fcsr 和 saved 状态到 child。不能仅复制可能过时的内存 image，更不能把 fork 当成 exec 清零。exec 在提交新 MM 和 Trap Frame 前调用 reset：硬件 32 个寄存器、fcsr 和内存 image 都清零，并让新程序从 FS Initial 开始，避免旧映像的 callee-saved FP 值泄漏。
 
 信号 frame 的 ucontext 保存当前 task 的 32 个 D 寄存器和 fcsr；`rt_sigreturn` 先通过用户 frame 校验，再把它恢复为下一次调度可加载的 per-task image。FP 仍不改变整数寄存器的 ptrace 顺序和 Trap Frame ABI。
 

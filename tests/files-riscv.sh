@@ -29,6 +29,8 @@ awk 'BEGIN { for (i = 0; i < 9000; i++) printf "%c", 65 + (i % 26) }' \
 truncate -s 32M "$disk"
 mkfs.ext4 -q -F "$disk"
 debugfs -w -R "write $fixture /data" "$disk" >/dev/null 2>&1
+long_name=$(awk 'BEGIN { for (i = 0; i < 255; i++) printf "n" }')
+debugfs -w -R "write $fixture /$long_name" "$disk" >/dev/null 2>&1
 
 if ! timeout -k 2s 20s "$qemu" \
     -machine virt \

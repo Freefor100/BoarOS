@@ -1,4 +1,5 @@
 #include <kernel/syscall.h>
+#include <kernel/errno.h>
 #include <kernel/files.h>
 #include <kernel/mm.h>
 #include <kernel/open_file.h>
@@ -343,21 +344,6 @@ enum kernel_files_status __wrap_kernel_files_dup(
     return write_files_status;
 }
 
-enum kernel_files_status __wrap_kernel_files_dup2(
-    struct kernel_files *files,
-    int64_t oldfd,
-    int64_t newfd,
-    int64_t *linux_result)
-{
-    if (files != (struct kernel_files *)(uintptr_t)3U ||
-        linux_result == 0) {
-        return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
-    }
-    dup_oldfd = oldfd;
-    dup_newfd = newfd;
-    *linux_result = write_linux_result;
-    return write_files_status;
-}
 
 enum kernel_files_status __wrap_kernel_files_dup3(
     struct kernel_files *files,
@@ -798,10 +784,12 @@ static unsigned long run_dup_fcntl_decode_cases(void)
 
     request.number = 33U;
     request.arguments[1] = 9U;
+    /* asm-generic 33 is mknodat, not dup2: it must not mutate fds. */
+    dup_newfd = -1;
     if (kernel_syscall_dispatch(caller, &request, &result) !=
             KERNEL_SYSCALL_STATUS_OK ||
-        result_changed(&result, KERNEL_SYSCALL_ACTION_RETURN, 12) ||
-        dup_oldfd != 5 || dup_newfd != 9) {
+        result_changed(&result, KERNEL_SYSCALL_ACTION_RETURN, -KERNEL_ENOSYS) ||
+        dup_newfd != -1) {
         failures++;
     }
 

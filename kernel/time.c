@@ -10,8 +10,8 @@
  * Nanoseconds are derived from the arch time-counter through a fixed-point
  * multiplier `m = ceil(1e9 * 2^32 / frequency)` computed once at init, so
  * the hot path is one 64x64->128 multiply-high per read instead of a
- * division.  The rounding relative error stays below 2^-32; sleeps and
- * timeouts compensate by rounding deadlines in the tick domain.
+ * division. The absolute coefficient error is below 2^-32; relative
+ * error depends on frequency. Deadlines also round up in the tick domain.
  */
 static uint32_t time_initialized;
 static uint64_t time_multiplier;
@@ -74,6 +74,7 @@ enum kernel_time_status kernel_time_deadline_from_monotonic(
     uint64_t now_ticks;
     uint64_t now_ns;
     uint64_t delta_ns;
+    unsigned __int128 delta_ticks;
 
     if (deadline == 0) {
         return KERNEL_TIME_STATUS_INVALID_ARGUMENT;
@@ -84,14 +85,20 @@ enum kernel_time_status kernel_time_deadline_from_monotonic(
 
     now_ticks = riscv_time_read();
     now_ns = kernel_time_ticks_to_ns(now_ticks);
-    delta_ns = target_monotonic_ns - now_ns;
-    if ((int64_t)delta_ns <= 0) {
+    if (target_monotonic_ns <= now_ns) {
         return KERNEL_TIME_STATUS_DEADLINE_PASSED;
     }
-
-    *deadline = now_ticks +
-                (uint64_t)(((unsigned __int128)delta_ns *
-                            time_ticks_multiplier) >>
-                           KERNEL_TIME_MULTIPLIER_SHIFT);
+    delta_ns = target_monotonic_ns - now_ns;
+    delta_ticks = ((unsigned __int128)delta_ns * time_ticks_multiplier +
+                   UINT32_MAX) >> KERNEL_TIME_MULTIPLIER_SHIFT;
+    /* The scheduler compares wrapping tick deadlines with signed deltas.
+     * Keep the future distance within that half-range; zero means no timer. */
+    if (delta_ticks > INT64_MAX) {
+        delta_ticks = INT64_MAX;
+    }
+    *deadline = now_ticks + (uint64_t)delta_ticks;
+    if (*deadline == 0U) {
+        *deadline = 1U;
+    }
     return KERNEL_TIME_STATUS_OK;
 }

@@ -9,6 +9,7 @@
 struct kernel_heap;
 struct physical_page_allocator;
 struct kernel_mm;
+struct kernel_uaccess_iovec;
 
 /* Shared only by the file-table cleanup retry list and pipe.c. */
 struct kernel_pipe {
@@ -68,10 +69,11 @@ enum kernel_pipe_status kernel_pipe_read(
     uint32_t open_flags,
     int64_t *linux_result);
 
-enum kernel_pipe_status kernel_pipe_write(
+enum kernel_pipe_status kernel_pipe_writev(
     struct kernel_pipe *pipe,
     struct kernel_mm *mm,
-    uint64_t user_buffer,
+    const struct kernel_uaccess_iovec *iov,
+    size_t iov_count,
     uint64_t count,
     uint32_t open_flags,
     int64_t *linux_result);

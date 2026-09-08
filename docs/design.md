@@ -21,7 +21,7 @@ push、发布、比赛提交、许可证和阶段转换由人决定，除非人�
 
 - 使用 GNU C11 和必要的架构汇编。选择 C 是为了利用现有能力并减少早期学习和调试变量，不代表 C 天生比 Rust 更快。
 - RISC-V64 + OpenSBI 优先，LoongArch64 随后接入。
-- 通用机制与架构、平台差异分开，但只在真实的第二个使用点出现时抽取公共边界。
+- 通用机制与架构、平台差异按实际职责分开；当前已经混合的稳定职责无需等待第二架构才拆分，也不预建未使用框架。
 - 优先形成可启动、可观察、可失败的端到端路径，再补全横向能力。
 - 用户输入、指针、长度、权限和资源状态均视为不可信。
 - 错误码、对象所有权、清理顺序、锁和内存序属于接口语义。
@@ -69,7 +69,7 @@ DTB 设备发现
 
 RISC-V QEMU `virt` 通过 DTB 的 `compatible = "virtio,mmio"` 节点发现和映射 VirtIO MMIO transport，virtio-blk 在其上实现块设备；不得依赖固定的第几个窗口或设备永远位于某个地址。比赛 Harness 当前也以 `virtio-blk-device` 接到 `virtio-mmio-bus`，见[本地 Harness](../references/oscomp-autotest/kernel/run_qemu.py)。设备 ID、状态机、feature negotiation、split virtqueue、内存屏障和扇区容量遵循 [VirtIO 1.3](https://docs.oasis-open.org/virtio/virtio/v1.3/virtio-v1.3.html)。
 
-RISC-V QEMU `virt` 的驱动同时支持 VirtIO MMIO version 1 legacy 与 version 2 modern，共用块请求和 `block_device` 上层；legacy 使用 `GuestPageSize/QueueAlign/QueuePFN` 和连续对齐的队列内存，modern 使用 64 位 descriptor/available/used 地址。LoongArch QEMU 后续提供 virtio-pci transport，复用 virtqueue、virtio-blk、`block_device`、VFS 与 ext4 上层。VisionFive 2 与 2K1000LA 的真实开发板由各自 DTB 和手册决定 SD、eMMC、PCI 或其他存储后端；开发板适配只替换设备发现、transport、DMA/cache coherency 和中断等平台边界，不复制 VFS、ext4 或 ELF 逻辑。通用与架构代码只在第二个真实实现点出现后沿已经验证的接口抽取。
+RISC-V QEMU `virt` 的驱动同时支持 VirtIO MMIO version 1 legacy 与 version 2 modern，共用块请求和 `block_device` 上层；legacy 使用 `GuestPageSize/QueueAlign/QueuePFN` 和连续对齐的队列内存，modern 使用 64 位 descriptor/available/used 地址。LoongArch QEMU 后续提供 virtio-pci transport，复用 virtqueue、virtio-blk、`block_device`、VFS 与 ext4 上层。VisionFive 2 与 2K1000LA 的真实开发板由各自 DTB 和手册决定 SD、eMMC、PCI 或其他存储后端；开发板适配只替换设备发现、transport、DMA/cache coherency 和中断等平台边界，不复制 VFS、ext4 或 ELF 逻辑。通用与架构边界依据当前实际职责分离；复用抽象需要真实消费者，不机械等待第二架构，也不预建空框架。
 
 ### VFS、lwext4 与 ELF 边界
 
@@ -89,7 +89,7 @@ ELF 装载器从“完整内存 buffer”推广为带总长度的随机访问源
 
 文件和目录反映已经形成的稳定职责、依赖方向与资源生命周期，不以行数或文件数作为机械阈值，也不提前建立只有一个实现文件的分类目录。同一领域出现多个长期实现单元、需要共享私有接口，或者形成独立生命周期、失败域或验证边界时，随触发它的主线能力增量拆分；纯路径重排不单独充当能力阶段。
 
-当前 `kernel/` 保持扁平。系统调用入口只负责分派和用户可观察结果，新增语义进入 VFS、进程、信号等所属子系统；VFS 形成时直接使用顶层 `fs/`。任务调度与进程资源生命周期在 `clone/exec/wait` 使二者独立演进时再沿真实接口拆分。第二架构或平台接入时，`kernel/main.c` 中不能复用的 RISC-V 与板级启动职责移入对应 `arch/` 边界。DTB 出现内存之外的多个设备消费者后，再把通用遍历与设备解码分开。具体文件名和私有接口由触发拆分的实现事实决定，不在此前预留。
+当前 `kernel/sched/` 组织调度、进程、exec、等待和通用信号策略；`kernel/syscall/` 按文件、内存、进程、信号与时间处理 ABI，dispatch 保存分派与简单系统信息。`fs/files/` 隔离 fd 表所有权、路径/stat、I/O 和 console 等待。RISC-V 信号帧与寄存器恢复归 `arch/riscv/signal.c`。共享私有接口仅在所属模块内部声明，不以拆分为由扩大公共接口。后续目录调整仍由真实职责和消费者触发，不按行数或文件数预建目录。
 
 ## 简单与验证
 

@@ -114,7 +114,10 @@ C_SOURCES := \
 	arch/riscv/virt_uart.c \
 	arch/riscv/virtio_mmio_block.c \
 	fs/lwext4_port.c \
-	fs/files.c \
+	fs/files/table.c \
+	fs/files/io.c \
+	fs/files/path.c \
+	fs/files/console.c \
 	fs/fs_context.c \
 	fs/open_file.c \
 	fs/pipe.c \
@@ -134,7 +137,13 @@ C_SOURCES := \
 	kernel/sched/process.c \
 	kernel/sched/signal.c \
 	kernel/sched/wait.c \
-	kernel/syscall.c \
+	kernel/syscall/dispatch.c \
+	kernel/syscall/file.c \
+	kernel/syscall/memory.c \
+	kernel/syscall/process.c \
+	kernel/syscall/signal.c \
+	kernel/syscall/time.c \
+	arch/riscv/signal.c \
 	kernel/tick.c \
 	kernel/time.c \
 	lib/qsort.c \
@@ -164,7 +173,10 @@ TEST_RUNTIME_C_SOURCES := \
 	arch/riscv/virt_rtc.c \
 	arch/riscv/virt_uart.c \
 	arch/riscv/virtio_mmio_block.c \
-	fs/files.c \
+	fs/files/table.c \
+	fs/files/io.c \
+	fs/files/path.c \
+	fs/files/console.c \
 	fs/fs_context.c \
 	fs/lwext4_port.c \
 	fs/open_file.c \
@@ -182,7 +194,13 @@ TEST_RUNTIME_C_SOURCES := \
 	kernel/sched/process.c \
 	kernel/sched/signal.c \
 	kernel/sched/wait.c \
-	kernel/syscall.c \
+	kernel/syscall/dispatch.c \
+	kernel/syscall/file.c \
+	kernel/syscall/memory.c \
+	kernel/syscall/process.c \
+	kernel/syscall/signal.c \
+	kernel/syscall/time.c \
+	arch/riscv/signal.c \
 	kernel/tick.c \
 	kernel/time.c \
 	lib/qsort.c \
@@ -620,7 +638,6 @@ $(SYSCALL_TEST_KERNEL_RV): $(SYSCALL_TEST_OBJECTS) arch/riscv/linker.ld
 	-Wl,--wrap=kernel_files_fstatat \
 	-Wl,--wrap=kernel_files_getdents \
 	-Wl,--wrap=kernel_files_dup \
-	-Wl,--wrap=kernel_files_dup2 \
 	-Wl,--wrap=kernel_files_dup3 \
 	-Wl,--wrap=kernel_files_fcntl \
 	-Wl,--wrap=kernel_open_file_kind \

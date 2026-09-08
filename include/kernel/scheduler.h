@@ -138,6 +138,8 @@ void kernel_wait_queue_init(struct kernel_wait_queue *queue);
 /* Wakes the longest-blocked waiter.  Requires interrupts disabled. */
 enum kernel_scheduler_status kernel_wait_queue_wake_one(
     struct kernel_wait_queue *queue);
+enum kernel_scheduler_status kernel_wait_queue_wake_all(
+    struct kernel_wait_queue *queue);
 
 /*
  * Sleeps until woken through `queue` (NULL = pure timeout sleep) or until

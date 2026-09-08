@@ -230,6 +230,12 @@ enum kernel_open_file_status kernel_open_file_detach(
     if (!open_file_live(file)) {
         return KERNEL_OPEN_FILE_STATUS_STATE;
     }
+    /* A pipe endpoint's last live owner closes it immediately, even when
+     * its allocation must survive on a cleanup list. Otherwise dup/exec
+     * can indefinitely postpone EOF or EPIPE behind an unrelated drain. */
+    if (file->kind == KERNEL_OPEN_FILE_KIND_PIPE && file->references == 1U) {
+        return kernel_open_file_release(owner);
+    }
     file->references--;
     if (file->references != 0U) {
         *owner = 0;

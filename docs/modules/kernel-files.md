@@ -4,7 +4,7 @@
 
 ## 对象与所有权
 
-`include/kernel/files.h`、`fs/files.c`、`fs/pipe.c` 管理文件描述符表和 pipe endpoint，`include/kernel/fs_context.h` 和 `fs/fs_context.c` 管理根挂载与当前工作目录。两者都从同一内核堆分配，并随用户 task 一起被 scheduler 接管：
+`include/kernel/files.h` 是公共接口；`fs/files/table.c` 管槽位、引用及回收，`io.c` 管读写/定位/枚举，`path.c` 管打开与 stat，`console.c` 管输入等待和暂存，`fs/pipe.c` 管 pipe endpoint 与 ring，`include/kernel/fs_context.h` 和 `fs/fs_context.c` 管理根挂载与当前工作目录。两者都从同一内核堆分配，并随用户 task 一起被 scheduler 接管：
 
 - `kernel_files` 是进程可见的 fd 槽数组；槽保存 descriptor flags 和指向 open file description 的指针。
 - `kernel_open_file_description` 拥有一个 VFS file、当前 offset 和清理状态。分别打开同一路径会得到独立 description，因此 offset 互不影响。
@@ -19,7 +19,7 @@
 
 描述符表初始有 32 个槽，按 2 倍增长，硬上限为 1024。分配总是从 `next_fd` 指示的最低可能空位向后搜索；关闭较小 fd 后会回退该提示，因此当前没有预装 stdin/stdout/stderr 时第一次成功打开返回 0。`O_CLOEXEC` 作为 descriptor flag 保存在槽上；exec 提交后批量摘除这些槽，其他 fd 和 open-file offset 保持不变。
 
-普通 clone 通过 `kernel_files_fork()` 新建并复制 fd 槽数组和 descriptor flags，同时增加每个 open file description 的引用。因此父子可以分别 close 或修改各自的 `FD_CLOEXEC` 槽，但同一个已打开文件的 offset 与底层 VFS file 生命周期共享。fs context 通过 `kernel_fs_context_fork()` 独立复制 cwd 字符串并借用同一个 root mount。`dup/dup2/dup3/fcntl(F_DUPFD*)` 复用同一 OFD：`dup` 不携带 `FD_CLOEXEC`，`dup3` 只接受 `O_CLOEXEC` 且 `oldfd == newfd` 返回 `-EINVAL`，`dup2` 对 `oldfd == newfd` 无条件成功、对越界目标返回 `-EBADF`，目标槽被替换时按 close 语义摘除；`F_DUPFD/F_DUPFD_CLOEXEC` 从下界向上找第一个空槽。`CLONE_FILES` 尚不存在，将来应共享整张表而不是调用当前的 fork-copy 接口。
+普通 clone 通过 `kernel_files_fork()` 新建并复制 fd 槽数组和 descriptor flags，同时增加每个 open file description 的引用。因此父子可以分别 close 或修改各自的 `FD_CLOEXEC` 槽，但同一个已打开文件的 offset 与底层 VFS file 生命周期共享。fs context 通过 `kernel_fs_context_fork()` 独立复制 cwd 字符串并借用同一个 root mount。`dup/dup2/dup3/fcntl(F_DUPFD*)` 复用同一 OFD：`dup` 不携带 `FD_CLOEXEC`，`dup3` 只接受 `O_CLOEXEC` 且 `oldfd == newfd` 返回 `-EINVAL`；内部 `dup2` 对相同且有效的 fd 成功，不改变槽位。`dup2/dup3` 都对越界目标返回 `-EBADF`，目标槽被替换时按 close 语义摘除；`F_DUPFD/F_DUPFD_CLOEXEC` 从下界向上找第一个空槽，下界越界则返回 `-EINVAL`。错误区分依据 [Linux dup 接口说明](https://man7.org/linux/man-pages/man2/dup.2.html)。`CLONE_FILES` 尚不存在，将来应共享整张表而不是调用当前的 fork-copy 接口。
 
 ## `openat` 与路径边界
 
@@ -33,7 +33,7 @@
 
 `kernel_files_pipe2()` 创建两个新的 open file description 和两个 fd 槽；它们共享一个 order-4、64 KiB 连续 ring buffer，但读端只增加 read-side 引用，写端只增加 write-side 引用。`O_CLOEXEC` 保存在两个 descriptor flag 中，`O_NONBLOCK` 保存在两个 OFD status 中；`F_SETFL` 可切换 `O_NONBLOCK`，并接受 64 位目标上 musl 每次带来的 `O_LARGEFILE` 兼容位而不改变该位。
 
-读端有数据时按 ring 顺序返回，空且仍有 writer 时：阻塞 fd 进入 interruptible wait，非阻塞 fd 返回 `-EAGAIN`。所有 writer 关闭后空读返回 EOF；写端没有 reader 时返回 `-EPIPE`，同时向当前 task 发送 SIGPIPE，因此有 handler 时先观察信号、无 handler 时按默认动作终止。写端空间不足时阻塞或返回 `-EAGAIN`；不超过 4096 字节的单次写在当前单 hart 实现中保持原子，较大写按可用空间推进。读写条件变化分别唤醒对端等待队列，并可被未阻塞信号唤醒后返回 `-EINTR`/按 `SA_RESTART` 重启。
+读端有数据时按 ring 顺序返回，空且仍有 writer 时：阻塞 fd 进入 interruptible wait，非阻塞 fd 返回 `-EAGAIN`。所有 writer 关闭后空读返回 EOF；写端没有 reader 时返回 `-EPIPE`，同时向当前 task 发送 SIGPIPE，因此有 handler 时先观察信号、无 handler 时按默认动作终止。写端空间不足时阻塞或返回 `-EAGAIN`；不超过 4096 字节的单次写在当前单 hart 实现中保持原子，较大写按可用空间推进。EOF/EPIPE 唤醒全部受影响 waiter；数据/空间变化也唤醒对端全部 waiter，被唤醒后重查条件，并可被未阻塞信号唤醒后返回 `-EINTR`/按 `SA_RESTART` 重启。
 
 pipe 的 `fstat` 以 `S_IFIFO` 形态报告，`lseek` 返回 `-ESPIPE`；它不进入 ext4 页缓存，也不暴露普通 VFS node。两个 endpoint 的最后一个 OFD 关闭后，ring buffer、等待队列和 pipe owner 一起释放。创建或双 fd 安装的任一步失败都会先回收已创建 description/fd，再由文件表私有 cleanup 链保留无法立即释放的 pipe owner，避免丢失物理页或重复关闭。
 
@@ -47,9 +47,9 @@ open file description 的 offset 只增加实际复制到用户空间的字节�
 
 ## console 描述符与 `write`/`writev`
 
-`kernel_open_file_create_console()` 创建无 VFS 节点、不经页缓存的 console 描述符；root boot 在创建 PID 1 文件表后把它绑定到 fd 0/1/2。该桥接在设备文件系统提供 `/dev/console` 后退出。console 的 `write/writev` 经 `kernel_console_putc` 逐字节输出并返回完整计数；用户 fault 与部分复制按前缀保持返回，与 read 对称。console 的 `read` 阻塞等待真实 UART 输入：tick 路径轮询 NS16550A 接收位并唤醒共享的 console 等待队列，读者把接收 FIFO 整批搬入 staging 后一次性复制到用户；无数据时阻塞一个 tick 内被唤醒，`count==0` 返回 0，坏缓冲区返回 `-EFAULT`。`lseek` 返回 `-ESPIPE`，`fstat` 以 5:1 字符设备形态出现。fd 0/1/2 是三个独立 OFD，但共享同一输入队列。regular/directory 描述符上的 write 返回 `-EBADF`（只读根上每个常规 fd 都是只读打开）。
+`kernel_open_file_create_console()` 创建无 VFS 节点、不经页缓存的 console 描述符；root boot 在创建 PID 1 文件表后把它绑定到 fd 0/1/2。该桥接在设备文件系统提供 `/dev/console` 后退出。console 的 `write/writev` 经 `kernel_console_putc` 逐字节输出并返回完整计数；用户 fault 与部分复制按前缀保持返回，与 read 对称。console 的 `read` 阻塞等待真实 UART 输入：tick 路径轮询 NS16550A 接收位并唤醒共享的 console 等待队列，读者最多暂存 min(count, 64) 字节后复制到用户；无数据时阻塞一个 tick 内被唤醒，`count==0` 返回 0，坏缓冲区返回 `-EFAULT`。`lseek` 返回 `-ESPIPE`，`fstat` 以 5:1 字符设备形态出现。fd 0/1/2 是三个独立 OFD，但共享同一输入队列。regular/directory 描述符上的 write 返回 `-EBADF`（只读根上每个常规 fd 都是只读打开）。
 
-`writev` 按用户 iovec 数组逐项输出，`iovcnt` 上限 1024；这是 musl stdio 实际使用的写路径，`__stdio_write` 以两段 iovec 发出缓冲内容。pipe 的 `writev` 汇总 iovec 后沿用 pipe 单次写的空间、原子性、阻塞、EPIPE/SIGPIPE 和部分复制规则。
+`writev` 先快照完整用户 iovec 数组，校验长度和范围，再与 write 共用写入核心；`iovcnt` 上限 1024；这是 musl stdio 实际使用的写路径，`__stdio_write` 以两段 iovec 发出缓冲内容。pipe 的 `writev` 汇总 iovec 后沿用 pipe 单次写的空间、原子性、阻塞、EPIPE/SIGPIPE 和部分复制规则。
 
 ## `lseek`、`fstat`/`newfstatat` 与 `getdents64`
 
@@ -72,9 +72,30 @@ fd-slot OFD references -> files table -> fs context
 -> mapped OFD references/MM -> zombie
 ```
 
-最后一个普通 OFD 引用才关闭底层 VFS file；pipe OFD 的最后一个读/写端引用还会更新 endpoint 计数并在两端归零时释放 ring。父进程关闭 fd 不会使仍由子进程或任一 MM 文件映射引用的 OFD 失效。文件、pipe、fs context 或 MM 清理失败时 task 进入 exited 队列，idle 从记录状态重试；成功后有父任务的进程转成只保留轻量状态的 zombie。根 mount 必须活到 PID 1 及其子进程的 fd 与映射来源全部回收，之后生产根启动路径才能 purge cache、unmount 并检查 heap/物理页基线。
+最后一个普通 OFD 引用才关闭底层 VFS file；pipe OFD 的最后一个读/写端引用在 detach（包括 dup 替换）时立即更新 endpoint 计数并在两端归零时释放 ring。父进程关闭 fd 不会使仍由子进程或任一 MM 文件映射引用的 OFD 失效。文件、pipe、fs context 或 MM 清理失败时 task 进入 exited 队列，idle 从记录状态重试；成功后根据父进程 SIGCHLD disposition 转成 zombie 或自动回收。根 mount 必须活到 PID 1 及其子进程的 fd 与映射来源全部回收，之后生产根启动路径才能 purge cache、unmount 并检查 heap/物理页基线。
 
 ## 验证与限制
+
+`write` 和不超过 8 个 iovec 的 `writev` 不分配导入缓冲；更长数组为完整输入快照分配至多 16 KiB 元数据，释放失败时由文件表持有 owner。数据仍直接从用户空间复制到 pipe ring，console 使用 64 字节暂存；目录拆分本身没有引入转发层或额外数据复制。等待唤醒扫描当前 blocked 链，单次 wake-all 为 O(阻塞任务数)，不是已完成的可扩展并发队列。
+
+目录枚举仍对每条待输出记录从头跳过已输出条目，完整枚举的遍历成本为 O(N²)，即使一次 getdents 提供大缓冲区也不能消除重复扫描。文件拆分没有解决这一性能限制，后续修正见下节。
+
+## 已确认的目录枚举优化方向（尚未实现）
+
+改为由 OFD 拥有可继续的目录游标，VFS 适配层保存底层位置并隐藏 lwext4 类型；不把可变游标放入按 inode 共享的 VFS node。这样独立 open 各自推进，dup 和 fork 则共享同一 OFD 的目录位置，最后一个 OFD 引用释放时回收游标。当前 lwext4 已有 `ext4_dir.next_off`，可以作为适配依据，但不能直接把第三方结构变成通用接口。
+
+此次优化需一起完成以下语义和验证，不能只缓存一次遍历结果便宣称收口：
+
+- 区分待输出位置与已提交位置：只有整条 dirent 成功复制后才提交 cookie；缓冲区不足或 usercopy 失败时不能跳过未交付记录，已交付前缀仍返回字节数。
+- `d_off` 是可用于恢复枚举的位置 cookie，不应要求调用者对它做算术；明确 `lseek`/rewind 与游标的同步和失效规则，验证保存 cookie 后恢复、dup/fork 交替枚举和分别 open 的独立性。
+- 当前 lwext4 的 `ext4_dir_entry_next` 以空指针同时表示结束和部分内部失败；适配时必须区分 EOF 与 I/O 错误，不能把设备失败误报成完整枚举结束。审查 dot 项、EOF、最大文件名以及中途错误，保留正确的部分结果。
+- 以现有 runner 比较不同目录规模和用户缓冲区大小，计数底层条目访问与块读取；目标是顺序完整枚举的条目访问由 O(N²) 降至 O(N)，同时检查游标内存及最终资源基线。随机 seek 的额外成本单独记录，不用 QEMU 耗时替代条目计数证据。
+
+该项沿文件能力主线落实，不依赖动态链接或可写文件系统；引入共享 OFD 的并发访问前还需为位置更新建立同步协议。当前未实现此优化，也没有实测吞吐提升。
+
+## 成本与验证入口
+
+在当前 RV64 `-O2` 构建的编译器栈使用检查中，getdents 帧为 672 字节，writev 输入快照使用至多 8 个栈上 iovec；这些是静态成本，不是板级吞吐基准。QEMU 验证资源回收，开发板缓存行为和竞争负载性能尚缺实测。
 
 ```sh
 make test-uaccess-riscv

@@ -14,7 +14,7 @@
 | `kernel/sched/core.c` | idle、任务页、ready FIFO、tick 抢占和首次用户任务创建 |
 | `kernel/sched/process.c` | 父子链、clone/wait、BLOCKED/wakeup、exit/zombie/reap |
 | `kernel/sched/wait.c` | 全局 blocked 链、等待队列唤醒与 deadline 到期 |
-| `kernel/sched/signal.c`、`include/kernel/signal.h` | pending/blocked、默认动作、handler frame、stop/continue 和 syscall restart |
+| `kernel/sched/signal.c`、`include/kernel/signal.h` | pending/blocked、默认动作、handler 选择、stop/continue 和 syscall restart 策略 |
 | `kernel/sched/exec.c` | exec 映像提交 |
 | `kernel/sched/private.h` | scheduler 私有对象布局与跨实现文件接口 |
 
@@ -87,7 +87,7 @@ enum kernel_scheduler_status kernel_scheduler_yield_current(void);
 - fs context 独立复制当前 cwd，并继续借用同一个 root mount；
 - exec 清理事务不继承。
 
-vfork 语义：子进程经 `kernel_mm_acquire` 共享父地址空间（同一 record 页，引用计数），files/fs 仍独立复制；父进程在 clone syscall 内阻塞于自己的 `vfork_done_queue`，子进程在 exec 提交释放 retired mm 或退出清理释放共享引用时各唤醒一次（第二次为空队列空转）。父进程恢复后可直接观察子进程对共享地址空间的修改（如 brk）。VFORK 无 CLONE_VM 的组合返回 `-ENOTSUP`。无线程组的 `exit_group` 与 `exit` 等价。
+vfork 语义：子进程经 `kernel_mm_acquire` 共享父地址空间（同一 record 页，引用计数），files/fs 仍独立复制；父进程在 clone syscall 内阻塞于自己的 `vfork_done_queue`，子进程在 exec 清理释放 retired MM 或退出释放共享引用后，消费自身的一次性完成标志并清除父进程的等待条件；清理重试也经过该完成边界。旧子进程之后退出不能唤醒父进程的下一次 vfork。父进程恢复后可直接观察子进程对共享地址空间的修改（如 brk）。VFORK 无 CLONE_VM 的组合返回 `-ENOTSUP`。无线程组的 `exit_group` 与 `exit` 等价。
 
 构造过程在子任务进入父子树和 ready 队列前完成。失败先释放已经取得的 fs/files/MM/TID/任务页；不能立即完成的 owner 放入不发布 completion 的 exited 清理队列，父进程仍得到准确的 `-ENOMEM` 或 `-EAGAIN`，不会看到半构造子进程。
 
@@ -116,7 +116,7 @@ EXITED  -- parentless retry complete -----------> PID/task page released
 
 `wait4` 支持 `pid>0`、`pid==0`、`pid==-1` 和 `pid<-1` 的 Linux 选择规则，并接受 `WNOHANG/WUNTRACED/WCONTINUED/__WNOTHREAD/__WALL/__WCLONE` 位。子进程的 stop/continue/exit 事件分别保存在 completion 状态中；`WUNTRACED` 和 `WCONTINUED` 决定父进程能否取出前两类事件，取出后只消费对应通知。普通 SIGCHLD 子进程被 `__WCLONE` 排除，除非同时使用 `__WALL`。无匹配子进程返回 `-ECHILD`；有匹配但无事件时 `WNOHANG` 返回 0，否则父进程经通用等待队列阻塞在自己的 `child_exit_queue` 上，由子进程状态变化唤醒。rusage 非空时在回收点填 `struct kernel_linux_rusage`（144 字节）：`ru_utime/ru_stime` 来自被回收子进程自身与孙辈回卷的 tick 记账，其余字段为 0，坏指针返回 `-EFAULT` 且子进程同样已回收。
 
-普通退出码编码为 `(status & 0xff) << 8`；被信号终止的 child 编码为 `(signal & 0x7f)`，core 默认动作另置 `0x80`。用户同步故障和不可恢复的缺页仍可直接形成 SIGILL/SIGTRAP/SIGBUS/SIGSEGV/SIGKILL 形态 wait status；可捕获信号则先进入用户 handler，只有 handler 不返回或默认动作要求终止时才完成 child。信号、stop/continue 和 wait 的状态变化由 `kernel/sched/signal.c` 与 process completion 共同维护。非空 rusage 当前返回 `-ENOTSUP`；未知 option 返回 `-EINVAL`，无法安全取负的 `INT32_MIN` pid 返回 `-ESRCH`。与 Linux 回收顺序一致，zombie 先被逻辑回收，再向用户复制 status；因此 status 指针错误返回 `-EFAULT` 时，该子进程也已不可再次 wait。
+普通退出码编码为 `(status & 0xff) << 8`；被信号终止的 child 编码为 `(signal & 0x7f)`，core 默认动作另置 `0x80`。用户同步故障和不可恢复的缺页仍可直接形成 SIGILL/SIGTRAP/SIGBUS/SIGSEGV/SIGKILL 形态 wait status；可捕获信号则先进入用户 handler，只有 handler 不返回或默认动作要求终止时才完成 child。信号、stop/continue 和 wait 的状态变化由 `kernel/sched/signal.c` 与 process completion 共同维护。非空 rusage 返回已支持的 CPU 时间及其余零初始化字段；未知 option 返回 `-EINVAL`，无法安全取负的 `INT32_MIN` pid 返回 `-ESRCH`。与 Linux 回收顺序一致，zombie 先被逻辑回收，再向用户复制 status；因此 status 指针错误返回 `-EFAULT` 时，该子进程也已不可再次 wait。
 
 ## 退出、reparent 与失败恢复
 
@@ -155,4 +155,4 @@ make test-riscv
 
 聚焦测试覆盖调度状态、创建与清理失败；MM/files 测试分别证明地址空间 COW 与 OFD 引用共享。生产 ext4 三映像链覆盖 clone 双返回、PPID、WNOHANG/阻塞唤醒、wait selector、退出码、`SIGSEGV`/`SIGBUS` 状态、EFAULT 后已回收、fd offset 共享、MM 写隔离、孙进程向 PID 1 reparent，以及最终 heap/物理页基线。demand-page OOM 版本验证资源退出编码为 wait status 9，且仍走同一 zombie/reap 资源闭环。
 
-当前限制是 RISC-V64 单 hart、ASID 0、FIFO/单 tick 时间片、4 KiB 单页内核栈、单成员线程组和普通 SIGCHLD clone。尚无 `CLONE_VM/CLONE_FILES/CLONE_THREAD`、实时信号排队、`sigaltstack`、signalfd、futex、SMP COW 同步、内核栈 guard、F/V 向量上下文或 LoongArch context。BLOCKED 的 wake queue 仍按全局 blocked 链 O(n) 扫描，wait4 的 child event 以父任务专属等待队列唤醒；这些是当前单 hart 路径的明确成本，不是 SMP 锁协议。
+当前限制是 RISC-V64 单 hart、ASID 0、FIFO/单 tick 时间片、4 KiB 单页内核栈、单成员线程组和普通 SIGCHLD clone。尚无 `CLONE_VM/CLONE_FILES/CLONE_THREAD`、实时信号排队、`sigaltstack`、signalfd、futex、SMP COW 同步、内核栈 guard、V 向量上下文或 LoongArch context。BLOCKED 的 wake queue 仍按全局 blocked 链 O(n) 扫描，wait4 的 child event 以父任务专属等待队列唤醒；这些是当前单 hart 路径的明确成本，不是 SMP 锁协议。

@@ -482,11 +482,12 @@ _start:
     li t2, 9000
     bne t1, t2, .Lfailure
 
-    # dup2 duplicates the descriptor; both share one open-file
+    # RISC-V dup3 duplicates the descriptor; both share one open-file
     # description, so reads advance the common offset.
     mv a0, s0
     li a1, 7
-    li a7, 33
+    li a2, 0
+    li a7, 24
     ecall
     li t0, 7
     bne a0, t0, .Lfailure

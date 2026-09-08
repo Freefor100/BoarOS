@@ -2,15 +2,21 @@
  * binary exercising stdio, directory enumeration, regular-file reads,
  * descriptor duplication, and the clock ABI against the Linux surface. */
 
+#define _GNU_SOURCE
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <sched.h>
+#include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
+#include <sys/uio.h>
+#include <ucontext.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -56,6 +62,70 @@ static int fp_worker(int slot)
 }
 
 static volatile sig_atomic_t user_signal_seen;
+static volatile uintptr_t context_sp;
+static volatile sig_atomic_t vfork_done;
+static unsigned char vfork_stack[65536] __attribute__((aligned(16)));
+
+_Static_assert(offsetof(ucontext_t, uc_mcontext) == 176U,
+               "musl RISC-V ucontext alignment");
+_Static_assert(sizeof(ucontext_t) == 960U, "musl RISC-V ucontext size");
+
+static void context_handler(int sig, siginfo_t *info, void *context)
+{
+    ucontext_t *uc = context;
+
+    if (sig == SIGUSR1 && info->si_signo == sig) {
+        context_sp = uc->uc_mcontext.__gregs[REG_SP];
+    }
+}
+
+static int vfork_worker(void *argument)
+{
+    struct timespec delay = {0, 20000000L};
+    char *args[] = {"/missing-executable", 0};
+    char *env[] = {0};
+
+    /* Retiring a failed exec transaction must not complete vfork while
+     * the child still uses the parent's MM. */
+    if (execve(args[0], args, env) != -1 || errno != ENOENT) {
+        return 2;
+    }
+
+    if (kill((pid_t)(uintptr_t)argument, SIGUSR1) != 0 ||
+        nanosleep(&delay, 0) != 0) {
+        return 1;
+    }
+    vfork_done = 1;
+    return 0;
+}
+
+/* Keep registers live across the exact syscall boundary; libc fork may
+ * itself use caller-saved FP registers before reaching ecall. */
+static int check_fork_fp(void)
+{
+    register long a0 __asm__("a0") = SIGCHLD;
+    register long a1 __asm__("a1") = 0;
+    register long a7 __asm__("a7") = SYS_clone;
+    uint64_t fp;
+    unsigned long fcsr;
+    unsigned long old_fcsr;
+    const uint64_t sentinel = UINT64_C(0x3ff123456789abcd);
+
+    __asm__ volatile("csrr %0, fcsr" : "=r"(old_fcsr));
+    __asm__ volatile("fmv.d.x fs0, %4\n\tcsrwi fcsr, 1\n\tecall\n\t"
+                     "fmv.x.d %0, fs0\n\tcsrr %1, fcsr"
+                     : "=r"(fp), "=r"(fcsr), "+r"(a0), "+r"(a1)
+                     : "r"(sentinel), "r"(a7)
+                     : "fs0", "memory");
+    __asm__ volatile("csrw fcsr, %0" : : "r"(old_fcsr));
+    if (a0 == 0) {
+        _exit(fp != sentinel || fcsr != 1U);
+    }
+    int status;
+    return a0 < 0 || fp != sentinel || fcsr != 1U ||
+           waitpid((pid_t)a0, &status, 0) != a0 ||
+           !WIFEXITED(status) || WEXITSTATUS(status) != 0;
+}
 
 static void user_signal_handler(int signal_number)
 {
@@ -70,6 +140,134 @@ static void signal_parent_after_delay(pid_t parent, int signal_number)
         _exit(90);
     }
     _exit(0);
+}
+
+static int check_signal_context_and_lifecycle(void)
+{
+    struct sigaction action = {0};
+    struct sigaction old_action;
+    uintptr_t sp;
+    int status;
+
+    action.sa_sigaction = context_handler;
+    action.sa_flags = SA_SIGINFO;
+    if (sigaction(SIGUSR1, &action, &old_action) != 0) {
+        return 1;
+    }
+    /* libc syscall does not move sp on this target; use raw ecall so the
+     * compared value is exactly the interrupted register snapshot. */
+    register long a0 __asm__("a0") = getpid();
+    register long a1 __asm__("a1") = SIGUSR1;
+    register long a7 __asm__("a7") = SYS_kill;
+    __asm__ volatile("mv %0, sp\n\tecall"
+                     : "=&r"(sp), "+r"(a0) : "r"(a1), "r"(a7) : "memory");
+    if (a0 != 0 || context_sp != sp ||
+        sigaction(SIGUSR1, &old_action, 0) != 0) {
+        return 2;
+    }
+    pid_t child = clone(vfork_worker, vfork_stack + sizeof(vfork_stack),
+                        CLONE_VM | CLONE_VFORK | SIGCHLD,
+                        (void *)(uintptr_t)getpid());
+    if (child <= 0 || !vfork_done ||
+        waitpid(child, &status, 0) != child ||
+        !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        return 3;
+    }
+    for (int mode = 0; mode < 2; mode++) {
+        action.sa_handler = mode == 0 ? SIG_IGN : user_signal_handler;
+        action.sa_flags = mode == 0 ? 0 : SA_NOCLDWAIT | SA_RESTART;
+        if (sigaction(SIGCHLD, &action, 0) != 0) {
+            return 4;
+        }
+        child = fork();
+        if (child < 0) {
+            return 5;
+        }
+        if (child == 0) {
+            _exit(12);
+        }
+        /* wait4 must wake and report ECHILD, never a zombie status. */
+        if (waitpid(child, &status, 0) != -1 || errno != ECHILD) {
+            return 6;
+        }
+    }
+    action.sa_handler = SIG_DFL;
+    action.sa_flags = 0;
+    return sigaction(SIGCHLD, &action, 0) != 0;
+}
+
+static int check_pipe_waiters(void)
+{
+    static char fill[4096];
+
+    for (int mode = 0; mode < 3; mode++) {
+        int pipe_fd[2];
+        int ready[2];
+        pid_t children[2];
+        char byte;
+
+        if (pipe(pipe_fd) != 0 || pipe(ready) != 0) {
+            return 1;
+        }
+        if (mode == 2) {
+            for (int chunk = 0; chunk < 16; chunk++) {
+                if (write(pipe_fd[1], fill, sizeof(fill)) != sizeof(fill)) {
+                    return 6;
+                }
+            }
+        }
+        for (int index = 0; index < 2; index++) {
+            children[index] = fork();
+            if (children[index] < 0) {
+                return 2;
+            }
+            if (children[index] == 0) {
+                close(pipe_fd[mode == 2 ? 0 : 1]);
+                close(ready[0]);
+                if (write(ready[1], "r", 1) != 1) {
+                    _exit(1);
+                }
+                if (mode == 2) {
+                    if (write(pipe_fd[1], "x", 1) != -1 || errno != EPIPE) {
+                        _exit(2);
+                    }
+                } else if (read(pipe_fd[0], &byte, 1) != mode) {
+                    _exit(3);
+                }
+                _exit(0);
+            }
+        }
+        close(ready[1]);
+        for (int index = 0; index < 2; index++) {
+            if (read(ready[0], &byte, 1) != 1) {
+                return 3;
+            }
+        }
+        close(ready[0]);
+        if (mode == 1 && write(pipe_fd[1], "ab", 2) != 2) {
+            return 4;
+        }
+        /* Keep the writer open in the data case: a missing progress wake
+         * must not accidentally be repaired by the EOF wake. */
+        if (mode != 1) {
+            close(pipe_fd[mode == 2 ? 0 : 1]);
+        }
+        for (int index = 0; index < 2; index++) {
+            int status;
+
+            if (waitpid(children[index], &status, 0) != children[index] ||
+                !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+                return 5;
+            }
+        }
+        if (mode != 2) {
+            close(pipe_fd[0]);
+        }
+        if (mode != 0) {
+            close(pipe_fd[1]);
+        }
+    }
+    return 0;
 }
 
 int main(void)
@@ -210,16 +408,21 @@ int main(void)
 
     /* Console input: stdin is the UART.  The harness feeds a line after
      * boot; the read must block until it arrives, then deliver it. */
-    char line[8];
-    ssize_t got = read(0, line, sizeof(line));
-    if (got < 1) {
+    char line[8] = {0};
+    ssize_t got = read(0, line, 1);
+    if (got != 1 || line[1] != 0) {
         return 28;
     }
-    if (line[0] != 'g' || line[1] != 'o') {
+    got = read(0, line + 1, sizeof(line) - 1);
+    if (got < 1 || line[0] != 'g' || line[1] != 'o') {
         return 29;
     }
     if (write(1, "BoarOS: real userland console input ok\n", 40) != 40) {
         return 30;
+    }
+
+    if (check_fork_fp()) {
+        return 77;
     }
 
     /* Floating point: forked workers must each see their own FP register
@@ -374,8 +577,8 @@ int main(void)
         return 48;
     }
 
-    /* SA_RESTART must resume the same absolute sleep deadline through
-     * restart_syscall rather than returning an EINTR to libc. */
+    /* Handler delivery interrupts nanosleep even with SA_RESTART. A huge
+     * valid duration must wait for that signal, not wrap into the past. */
     signal_action.sa_flags = SA_RESTART;
     if (sigaction(SIGUSR1, &signal_action, 0) != 0) {
         return 49;
@@ -387,9 +590,10 @@ int main(void)
     if (signal_child == 0) {
         signal_parent_after_delay(getppid(), SIGUSR1);
     }
-    interrupted_pause.tv_nsec = 100000000L;
+    interrupted_pause.tv_sec = 10000000000L;
+    interrupted_pause.tv_nsec = 0;
     user_signal_seen = 0;
-    if (nanosleep(&interrupted_pause, 0) != 0 ||
+    if (nanosleep(&interrupted_pause, 0) != -1 || errno != EINTR ||
         user_signal_seen != SIGUSR1) {
         return 51;
     }
@@ -407,6 +611,9 @@ int main(void)
     }
     sigset_t suspend_mask;
     sigemptyset(&suspend_mask);
+    if (sigprocmask(SIG_BLOCK, &signal_set, &signal_old) != 0) {
+        return 78;
+    }
     signal_child = fork();
     if (signal_child < 0) {
         return 54;
@@ -420,6 +627,11 @@ int main(void)
         user_signal_seen != SIGUSR1) {
         return 55;
     }
+    if (sigprocmask(SIG_SETMASK, 0, &signal_pending) != 0 ||
+        !sigismember(&signal_pending, SIGUSR1) ||
+        sigprocmask(SIG_SETMASK, &signal_old, 0) != 0) {
+        return 79;
+    }
     if (waitpid(signal_child, &signal_child_status, 0) != signal_child ||
         !WIFEXITED(signal_child_status) ||
         WEXITSTATUS(signal_child_status) != 0) {
@@ -431,6 +643,11 @@ int main(void)
     if (write(1, signal_marker, sizeof(signal_marker) - 1) !=
         (ssize_t)(sizeof(signal_marker) - 1)) {
         return 40;
+    }
+    int lifecycle_result = check_signal_context_and_lifecycle();
+    if (lifecycle_result != 0) {
+        fprintf(stderr, "signal lifecycle check failed: %d\n", lifecycle_result);
+        return 80;
     }
 
     /* pipe2 supplies two independent descriptors over one bounded ring. */
@@ -576,5 +793,8 @@ int main(void)
         return 44;
     }
 
+    if (check_pipe_waiters() != 0) {
+        return 81;
+    }
     return 42;
 }

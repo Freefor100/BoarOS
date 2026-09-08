@@ -99,6 +99,14 @@ Linux 的 wait 回收与用户复制之间有一个重要顺序：选中的 zomb
 
 BoarOS 当前把仍有父关系的后代重新挂到存活的 PID 1。若 PID 1 本身正在退出或不存在，任务成为 parentless，由 idle 在退出后静默回收；它不会伪造一个 PID 1 completion。父子树使用双向兄弟链，并在 clone、wait、退出和 reparent 边界检查首尾、前后链接、反向 parent、身份与状态，避免只读一两个指针就把结构损坏当成合法事件。
 
+## 信号 ABI 与恢复现场
+
+信号处理函数是插入用户执行流的一次调用。内核必须保存被中断的 PC、整数/浮点寄存器和 mask，再安排 handler 入口；sigreturn 恢复的是这份用户现场，不是内核 C 调用栈。RISC-V 即使只实现 D 扩展，也要遵守 libc 为 Q 扩展保留的对齐和容量：ucontext 的 mcontext 偏移 176 字节、总大小 960 字节。仅让内核用同一套错误偏移保存和恢复，可能看似能返回，却会让 SA_SIGINFO handler 读取错误寄存器；应通过 libc 类型和真实上下文访问交叉验证。
+
+sigsuspend 的临时 mask 用于选择本次 handler，原 mask 放进恢复现场，不能在选择信号前恢复。SA_RESTART 也不是所有 syscall 的统一开关：可重启的阻塞 I/O 可以重执行，nanosleep 遇到用户 handler 仍应 EINTR；没有 handler 的停止/继续则可借 restart block 保持原绝对 deadline。
+
+SIGCHLD 的默认忽略与显式 SIG_IGN 具有不同回收语义：前者仍允许 wait 获取 zombie，后者及 SA_NOCLDWAIT 不保留待 wait 的子进程。通知、调度唤醒和资源释放应分别建模，不能用“是否安装 handler”同时决定三者。
+
 ## 所有权与失败处理
 
 内核资源释放可能只完成一部分。例如文件槽已经不可见，但底层 close 或堆对象释放失败；页表的部分叶子已经回收，但记录页仍未释放。这样的对象不能退回 LIVE，也不能丢失唯一指针。
@@ -129,7 +137,7 @@ QEMU 可以验证语义和结构成本，但不能替代 VisionFive 2 上的 cyc
 
 ## vfork 与 CPU 记账（当前结论）
 
-- vfork 的本质是"共享地址空间 + 挂起父进程"：子进程经 MM 句柄引用共享（`kernel_mm_acquire`）运行在父进程页表上，父进程在 clone syscall 内阻塞到子进程 exec 或退出。由于 exec 提交和退出清理都会释放子进程持有的 MM 引用，"引用真正落地释放"就是唯一需要的唤醒条件，两个唤醒点天然幂等。VFORK 不带 CLONE_VM 在 Linux 里是另一种语义（只挂起不共享），没有真实消费者前保持 ENOTSUP。
+- vfork 的本质是"共享地址空间 + 挂起父进程"：子进程经 MM 句柄引用共享（`kernel_mm_acquire`）运行在父进程页表上，父进程在 clone syscall 内阻塞到子进程 exec 或退出。完成条件绑定具体 child：共享 MM 引用释放后，先清除 child 的完成关联，再唤醒父进程；父进程循环检查一次性完成条件，普通信号不能提前解除等待。两个代码位置都调用 wake 并不天然幂等，旧 child 的后续 exit 可能误唤醒下一次 vfork。VFORK 不带 CLONE_VM 在 Linux 里是另一种语义（只挂起不共享），没有真实消费者前保持 ENOTSUP。
 - 共享地址空间窗口内父子不同时运行（单 hart + 父挂起），因此没有 TLB/并发问题；这依赖"父进程必须挂起"的 vfork 契约，线程化后该论证不再成立。
 - 每 task CPU 记账在 tick 边界记给被中断的任务：固定 tick 记账的量化误差最多一个 tick，且 CLK_TCK=100 时 `tms` 的用户可见值本来就是整数 tick，切换边界采样的精度收益不可观察。子进程记账在 wait 回收点回卷（自身 + 已回卷的孙辈），孤儿由 PID 1 回收时同路径归并，无父回收时消亡——与 Linux 的 rusage 回卷一致。
 - 可观察的共享证明：子进程在共享窗口内修改 brk，父进程恢复后 `brk(0)` 直接读到修改值；这比检查私有/共享页内容更能确定地证明语义。

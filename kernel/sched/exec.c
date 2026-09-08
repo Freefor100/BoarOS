@@ -145,11 +145,6 @@ enum kernel_scheduler_status kernel_scheduler_exec_commit(void)
                                 UINT64_C(0x45584543),
                                 exec_status);
     }
-    /* The retired (possibly vfork-shared) mm is released by the cleanup
-     * above; on CLEANUP_REQUIRED the wake happens at the later retry. */
-    if (exec_status == KERNEL_EXEC_STATUS_OK) {
-        vfork_notify_done(thread);
-    }
     return KERNEL_SCHEDULER_STATUS_OK;
 }
 
@@ -200,6 +195,9 @@ enum kernel_exec_status kernel_task_exec_finish(
         !kernel_exec_transaction_valid(transaction, task->files.heap)) {
         return KERNEL_EXEC_STATUS_STATE;
     }
+    /* Also reached by a later cleanup retry. No user of the retired MM
+     * remains, even if freeing the transaction container needs retry. */
+    process_complete_vfork(task);
     heap = transaction->heap;
     if (kernel_heap_release(heap, transaction) != KERNEL_HEAP_STATUS_OK) {
         return KERNEL_EXEC_STATUS_CLEANUP_REQUIRED;

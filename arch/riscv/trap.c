@@ -7,6 +7,7 @@
 #include <kernel/errno.h>
 #include <kernel/scheduler.h>
 #include <kernel/signal.h>
+#include <arch/riscv/signal.h>
 #include <kernel/syscall.h>
 #include <kernel/task.h>
 #include <kernel/tick.h>
@@ -243,7 +244,7 @@ void riscv_trap_dispatch(struct riscv_trap_frame *frame)
             result.action = KERNEL_SYSCALL_ACTION_RETURN;
         }
         if (result.action == KERNEL_SYSCALL_ACTION_SIGNAL_RETURN) {
-            kernel_signal_restore_current(frame);
+            riscv_signal_restore_current(frame);
             return;
         }
         if (result.action != KERNEL_SYSCALL_ACTION_RETURN) {
@@ -275,7 +276,7 @@ void riscv_trap_dispatch(struct riscv_trap_frame *frame)
 
 void riscv_trap_return_prepare(struct riscv_trap_frame *frame)
 {
-    kernel_signal_prepare_user_return(frame);
+    riscv_signal_prepare_user_return(frame);
 }
 
 void riscv_trap_bad_return(struct riscv_trap_frame *frame)

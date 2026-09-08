@@ -36,7 +36,7 @@ dispatcher 返回表示当前恢复到的线程 Frame 已经可以恢复。生�
 
 ## 返回契约
 
-dispatcher 返回后，汇编总是要求 Frame 中 `sstatus.SIE=0`，避免在寄存器恢复窗口提前接受中断。进入汇编恢复前，C return tail 会调用 `kernel_signal_prepare_user_return()`：它处理 pending signal、默认动作/handler frame、被信号唤醒的 syscall restart，并在有 F/D 状态时由独立 FP 模块维护寄存器。SPP=1 直接返回 S-mode；SPP=0 还要求 Frame 的 `kernel_tp` 非零、等于当前内核 `tp`，且线程前缀标记为用户任务，否则进入 `invalid trap return`，不会把任意 S-mode `tp` 当指针解引用。
+dispatcher 返回后，汇编总是要求 Frame 中 `sstatus.SIE=0`，避免在寄存器恢复窗口提前接受中断。进入汇编恢复前，C return tail 会调用 `riscv_signal_prepare_user_return()`：它处理 pending signal、默认动作/handler frame、被信号唤醒的 syscall restart，并在有 F/D 状态时由独立 FP 模块维护寄存器。SPP=1 直接返回 S-mode；SPP=0 还要求 Frame 的 `kernel_tp` 非零、等于当前内核 `tp`，且线程前缀标记为用户任务，否则进入 `invalid trap return`，不会把任意 S-mode `tp` 当指针解引用。
 
 合法返回按以下顺序完成：
 
@@ -44,7 +44,7 @@ dispatcher 返回后，汇编总是要求 Frame 中 `sstatus.SIE=0`，避免在�
 2. 将 Frame 中的 `sepc` 和 `sstatus` 写回 CSR。保存的 SIE 必须为零，因此寄存器恢复的关键窗口不会提前接受异步中断。
 3. S-mode 返回前保持 `sscratch=0`；U-mode 返回前把 current thread 写入 `sscratch`，随后恢复包括用户 `tp/sp` 在内的 x1..x31 并执行 `sret`。
 
-用户 handler 通过固定 RX VDSO 页进入 `rt_sigreturn(139)`，而不是执行用户栈上的代码。`rt_sigreturn` 在 C dispatcher 中恢复 signal frame；普通 syscall 被信号唤醒时，return tail 按 `SA_RESTART` 保持或跳过原 `sepc`，因此 ecall 的推进规则和 handler 返回规则集中在同一条返回路径。
+用户 handler 通过固定 RX VDSO 页进入 `rt_sigreturn(139)`，而不是执行用户栈上的代码。`rt_sigreturn` 在 C dispatcher 中恢复 signal frame；普通 syscall 被信号唤醒时，return tail 按 syscall 重启类别及 `SA_RESTART` 保持或跳过原 `sepc`；nanosleep 的用户 handler 路径始终 EINTR，因此 ecall 的推进规则和 handler 返回规则集中在同一条返回路径。
 
 `sret` 根据 SPP 返回 S-mode，根据 SPIE 恢复 SIE。同步异常 handler 只有在理解故障指令长度和重试语义时才能修改 `sepc`；异步中断通常保持 `sepc` 不变，并必须在返回前解除或屏蔽中断源，否则会立即再次进入 trap。
 

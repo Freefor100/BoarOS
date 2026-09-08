@@ -2,6 +2,7 @@
 
 #include <arch/riscv/context.h>
 #include <kernel/errno.h>
+#include <kernel/files.h>
 #include <kernel/heap.h>
 #include <kernel/mm.h>
 #include <kernel/physical_page.h>
@@ -164,8 +165,12 @@ enum kernel_pipe_status kernel_pipe_release_endpoint(
         }
         pipe->writers--;
     }
-    (void)kernel_wait_queue_wake_one(&pipe->read_queue);
-    (void)kernel_wait_queue_wake_one(&pipe->write_queue);
+    if (pipe->writers == 0U) {
+        (void)kernel_wait_queue_wake_all(&pipe->read_queue);
+    }
+    if (pipe->readers == 0U) {
+        (void)kernel_wait_queue_wake_all(&pipe->write_queue);
+    }
     if (pipe->readers == 0U && pipe->writers == 0U) {
         pipe->destroy_pending = 1U;
         status = pipe_destroy(pipe);
@@ -213,6 +218,10 @@ enum kernel_pipe_status kernel_pipe_read(
     if (pipe == 0 || mm == 0 || linux_result == 0 ||
         pipe->heap == 0 || pipe->buffer == 0) {
         return KERNEL_PIPE_STATUS_INVALID_ARGUMENT;
+    }
+    if ((open_flags & 3U) == 1U) {
+        *linux_result = -KERNEL_EBADF;
+        return KERNEL_PIPE_STATUS_OK;
     }
     if (kernel_user_range_check(user_buffer, (size_t)count) !=
         KERNEL_UACCESS_STATUS_OK) {
@@ -280,7 +289,7 @@ enum kernel_pipe_status kernel_pipe_read(
         }
     }
     if (copied != 0U) {
-        (void)kernel_wait_queue_wake_one(&pipe->write_queue);
+        (void)kernel_wait_queue_wake_all(&pipe->write_queue);
     }
     riscv_interrupt_restore(saved);
     if (copied == 0U && access_status == KERNEL_UACCESS_STATUS_FAULT) {
@@ -307,10 +316,11 @@ static enum kernel_pipe_status pipe_signal_broken(
     return KERNEL_PIPE_STATUS_OK;
 }
 
-enum kernel_pipe_status kernel_pipe_write(
+enum kernel_pipe_status kernel_pipe_writev(
     struct kernel_pipe *pipe,
     struct kernel_mm *mm,
-    uint64_t user_buffer,
+    const struct kernel_uaccess_iovec *iov,
+    size_t iov_count,
     uint64_t count,
     uint32_t open_flags,
     int64_t *linux_result)
@@ -320,14 +330,15 @@ enum kernel_pipe_status kernel_pipe_write(
     enum kernel_wait_wake_reason wake_reason = KERNEL_WAIT_WOKEN;
     uint64_t total = 0U;
     int atomic;
+    size_t iov_index = 0U;
+    uint64_t iov_offset = 0U;
 
     if (pipe == 0 || mm == 0 || linux_result == 0 ||
         pipe->heap == 0 || pipe->buffer == 0) {
         return KERNEL_PIPE_STATUS_INVALID_ARGUMENT;
     }
-    if (kernel_user_range_check(user_buffer, (size_t)count) !=
-        KERNEL_UACCESS_STATUS_OK) {
-        *linux_result = -KERNEL_EFAULT;
+    if ((open_flags & 3U) == 0U) {
+        *linux_result = -KERNEL_EBADF;
         return KERNEL_PIPE_STATUS_OK;
     }
     if (count == 0U) {
@@ -385,18 +396,32 @@ enum kernel_pipe_status kernel_pipe_write(
         if (chunk64 > pipe_remaining(pipe->write_position)) {
             chunk64 = pipe_remaining(pipe->write_position);
         }
+        while (iov_index < iov_count && iov_offset == iov[iov_index].length) {
+            iov_index++;
+            iov_offset = 0U;
+        }
+        if (iov_index == iov_count) {
+            riscv_interrupt_restore(saved);
+            return KERNEL_PIPE_STATUS_STATE;
+        }
+        if (chunk64 > iov[iov_index].length - iov_offset) {
+            chunk64 = iov[iov_index].length - iov_offset;
+        }
         chunk = (size_t)chunk64;
         copied = 0U;
         access_status = kernel_copy_from_user(
             mm,
             pipe->buffer + pipe->write_position,
-            user_buffer + total,
+            iov[iov_index].base + iov_offset,
             chunk,
             &copied);
         pipe_produce(pipe, copied);
         total += copied;
-        if (copied != 0U) {
-            (void)kernel_wait_queue_wake_one(&pipe->read_queue);
+        iov_offset += copied;
+        /* Empty -> readable makes every sleeping reader eligible. Further
+         * iovecs before a schedule need no repeated blocked-list scan. */
+        if (copied != 0U && pipe->bytes == copied) {
+            (void)kernel_wait_queue_wake_all(&pipe->read_queue);
         }
         if (access_status != KERNEL_UACCESS_STATUS_OK || copied != chunk) {
             riscv_interrupt_restore(saved);

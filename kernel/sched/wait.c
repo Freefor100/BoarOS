@@ -126,6 +126,44 @@ enum kernel_scheduler_status kernel_wait_queue_wake_one(
     return KERNEL_SCHEDULER_STATUS_OK;
 }
 
+enum kernel_scheduler_status kernel_wait_queue_wake_all(
+    struct kernel_wait_queue *queue)
+{
+    struct kernel_task *previous = 0;
+    struct kernel_task *thread;
+
+    if (queue == 0 || queue->initialized != KERNEL_WAIT_QUEUE_INITIALIZED) {
+        return KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
+    }
+    if (scheduler.initialized != KERNEL_SCHEDULER_INITIALIZED) {
+        return KERNEL_SCHEDULER_STATUS_NOT_INITIALIZED;
+    }
+    if (riscv_interrupt_is_enabled()) {
+        return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
+    }
+    thread = scheduler.blocked_head;
+    while (thread != 0) {
+        struct kernel_task *next = thread->next;
+
+        if (thread->wait_queue == queue) {
+            if (previous == 0) {
+                scheduler.blocked_head = next;
+            } else {
+                previous->next = next;
+            }
+            if (scheduler.blocked_tail == thread) {
+                scheduler.blocked_tail = previous;
+            }
+            thread->next = 0;
+            wake_task(thread, (uint32_t)KERNEL_WAIT_WOKEN);
+        } else {
+            previous = thread;
+        }
+        thread = next;
+    }
+    return KERNEL_SCHEDULER_STATUS_OK;
+}
+
 enum kernel_scheduler_status kernel_scheduler_expire_deadlines(uint64_t now)
 {
     struct kernel_task *previous = 0;
