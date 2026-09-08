@@ -33,7 +33,21 @@ miss 路径先分配并清零页，再通过 node 的无 offset 副作用 `pread
 
 挂载只读后额外检查 superblock `needs_recovery` incompat feature。因为当前没有 JBD2 replay 和写回能力，发现该位返回 `-EUCLEAN` 并完整撤销挂载，不能静默读取可能不一致的数据。打开前先读取 mode；普通文件走 `ext4_fopen`，目录走 `ext4_dir_open`（`ext4_fopen` 自身拒绝目录 inode），成功文件记录大小和 mode。unmount 在仍有 open file 时返回 `-EBUSY`。close/unmount 的底层释放失败保留 CLEANUP 状态，调用者可以重试而不会重复关闭或丢失 heap owner。
 
-当前 VFS 同时服务 ELF 随机读、进程文件表和文件私有缺页，但仍不是完整 Linux VFS：没有通用 inode/dentry cache、路径权限、symlink、写入/writeback、read-ahead、并发锁或多挂载。目录支持打开与按索引查询（`kernel_vfs_dir_entry`，跳过 dot 项，每次从头重走），完整枚举的条目访问为 O(N²)，并非可继续的线性遍历。后续由 OFD 拥有目录游标，适配和验证要求见[进程文件资源模块](kernel-files.md#已确认的目录枚举优化方向尚未实现)。页缓存只保存只读普通文件内容；进程层只持有 VFS mount/file 抽象，lwext4 handle 没有泄露到 task 或 syscall ABI。
+当前 VFS 同时服务 ELF 随机读、进程文件表和文件私有缺页，但仍不是完整 Linux VFS：没有通用 inode/dentry cache、路径权限、symlink、写入/writeback、read-ahead、并发锁或多挂载。目录支持打开与按后端 cookie 查询（`kernel_vfs_dir_entry`），会返回真实的 `.`/`..` 条目；每次查询从传入的 ext4 字节位置开始，而不是从目录起点重走，顺序枚举的条目访问为 O(N)。适配层把 lwext4 的正 errno 与 EOF 分开，再向文件资源层返回负 Linux errno。页缓存只保存只读普通文件内容；进程层只持有 VFS mount/file 抽象，lwext4 handle 没有泄露到 task 或 syscall ABI。
+
+目录游标设计依据固定 Linux 快照 `f4cdf7ca9a1f`：[`fs/readdir.c`](../../references/linux/fs/readdir.c)
+的 `iterate_dir()` 在每次枚举前后同步 open file 的 `f_pos` 与 `dir_context.pos`，`filldir64()`
+把继续位置写入 `d_off`；[`fs/ext4/dir.c`](../../references/linux/fs/ext4/dir.c) 的
+`ext4_readdir()`、`ext4_dx_readdir()` 和 `ext4_dir_llseek()` 表明 ext4 cookie 既可能是字节位置，
+也可能是目录 hash 编码的位置，并会在 seek 后重建迭代状态。因此 VFS 把它当作底层提供的
+不透明恢复值，而不能固化为条目序号。BoarOS 当前线性 ext4 适配器返回记录结束的字节位置；
+文件资源层将该值放进 OFD offset 和 `linux_dirent64.d_off`，只有完整 usercopy 后才提交。
+
+`ext4_dir_entry_next_status()` 是当前适配器的错误保留入口：一次调用从 `next_off` 定位并推进
+一个或多个物理记录，inode 为零的目录尾记录不会被误判为 EOF；返回 `UINT64_MAX` 只表示真实结束。
+`kernel_vfs_dir_entry()` 对任意 seek 位置向前对齐到 4 字节边界并规范化到下一个记录，因而保存的
+cookie 可以交给 `lseek`/`telldir`/`seekdir` 恢复。OFD 持有位置，所以独立 open 的游标独立，dup/fork
+共享游标；目录节点本身不保存可变遍历状态。
 
 ## 验证
 

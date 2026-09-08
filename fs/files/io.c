@@ -442,7 +442,8 @@ enum kernel_files_status kernel_files_getdents(
     uint8_t type;
     uint64_t request;
     uint64_t total = 0U;
-    uint64_t index;
+    uint64_t position;
+    uint64_t next_position;
     int fill_result;
 
     if (!kernel_files_is_live(files) || mm == 0 || linux_result == 0) {
@@ -471,9 +472,8 @@ enum kernel_files_status kernel_files_getdents(
                   ? KERNEL_FILES_MAX_RW_COUNT
                   : count;
 
-    /* The descriptor offset counts the entries already emitted; each
-     * call re-walks the directory and skips past them. */
-    index = kernel_open_file_offset(description);
+    /* The descriptor offset is the backend cookie for the next record. */
+    position = kernel_open_file_offset(description);
     while (total < request) {
         size_t name_length;
         size_t record_length;
@@ -484,16 +484,24 @@ enum kernel_files_status kernel_files_getdents(
         enum kernel_uaccess_status access_status;
 
         fill_result = kernel_vfs_dir_entry(&description->file,
-                                           index,
+                                           position,
+                                           &next_position,
                                            &inode,
                                            &type,
                                            name,
                                            sizeof(name));
         if (fill_result == 0) {
+            if (kernel_open_file_seek(description, next_position) !=
+                KERNEL_OPEN_FILE_STATUS_OK) {
+                return KERNEL_FILES_STATUS_STATE;
+            }
             break;
         }
         if (fill_result < 0) {
-            *linux_result = fill_result;
+            /* Linux returns a completed prefix when a later directory
+             * record fails; the failing record remains the next cookie. */
+            *linux_result = total != 0U ? (int64_t)total : fill_result;
+            files->record->statistics.bytes_read += total;
             return KERNEL_FILES_STATUS_OK;
         }
         name_length = strlen(name);
@@ -509,14 +517,14 @@ enum kernel_files_status kernel_files_getdents(
         if (*(unsigned char *)&little) {
             /* Little-endian host byte order for the fixed fields. */
             memcpy(&record[0], &inode, sizeof(inode));
-            cookie = index + 1U;
+            cookie = next_position;
             memcpy(&record[8], &cookie, sizeof(cookie));
         } else {
             for (uint8_t byte = 0U; byte < 8U; byte++) {
                 record[byte] =
                     (unsigned char)((inode >> (8U * byte)) & 0xffU);
                 record[8U + byte] =
-                    (unsigned char)(((index + 1U) >> (8U * byte)) &
+                    (unsigned char)((next_position >> (8U * byte)) &
                                     0xffU);
             }
         }
@@ -541,8 +549,8 @@ enum kernel_files_status kernel_files_getdents(
             return KERNEL_FILES_STATUS_OK;
         }
         total += record_length;
-        index++;
-        if (kernel_open_file_seek(description, index) !=
+        position = next_position;
+        if (kernel_open_file_seek(description, position) !=
             KERNEL_OPEN_FILE_STATUS_OK) {
             return KERNEL_FILES_STATUS_STATE;
         }

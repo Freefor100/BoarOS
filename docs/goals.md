@@ -26,7 +26,7 @@ Linux ABI 兼容是最终功能方向，不是对当前完成度的声明；READ
 | 文件与根启动 | VirtIO MMIO version 1 legacy 与 version 2 modern、只读块 I/O、lwext4 适配、VFS、文件页缓存、静态 ELF `/init` | RISC-V QEMU 已验证；默认 legacy 与显式 modern 都有入口测试 |
 | 进程与基础 syscall | `openat/read/close`、`write/writev`、`lseek/fstat/newfstatat/getdents64`、`dup/dup3/fcntl`、`mmap/mprotect/munmap/brk`、`clone`（自定义子栈 + vfork 共享地址空间）/`execve`/`wait4`（rusage）/`exit_group`/`set_tid_address`、`times`、`sched_yield`、COW、阻塞 wait、zombie/reparent、`uname` | 已实现并按模块和真实根盘链路验证，覆盖仍是明确子集；内部 dup2 操作不代表 RISC-V 存在独立 dup2 syscall |
 | 阻塞唤醒与时间 | 通用等待队列（事件通道 + deadline）、全局 blocked 链不变量、`clock_gettime/clock_getres/gettimeofday`（REALTIME/MONOTONIC）、`clock_nanosleep/nanosleep`、goldfish RTC 启动墙钟、console read 阻塞等待 UART 输入、标准信号驱动唤醒与按 syscall 分类的重启 | 已实现并经 scheduler 单测与 musl 真实睡眠/时钟/信号闭环验证；`times` 与每任务记账已落地，PLIC 驱动接收仍未实现 |
-| 目录枚举成本修正 | OFD 拥有可继续游标，保持独立 open、dup/fork 共享、cookie/seek、部分复制及关闭回收语义 | 已确认、尚未实现；当前完整枚举 O(N²)，目标为顺序条目访问 O(N)，实现与成本验收要求见[文件模块](modules/kernel-files.md#已确认的目录枚举优化方向尚未实现) |
+| 目录枚举成本修正 | OFD 拥有可继续游标，保持独立 open、dup/fork 共享、cookie/seek、部分复制及关闭回收语义 | 已实现并由真实 ext4/QEMU 文件测试验证；当前线性适配器顺序条目访问为 O(N)，开发板吞吐基线待测，见[文件模块](modules/kernel-files.md#lseekfstatnewfstatat-与-getdents64) |
 | 用户态映像 | Linux 形态初始栈和 auxv、静态 `ET_EXEC`、匿名/文件私有按需页、W^X、指令同步 | RISC-V 已验证；动态 ELF、PIE、解释器和 TLS 尚未实现 |
 | 其他架构与平台 | LoongArch64 2K1000LA 的 16 KiB/三级页表；VisionFive 2 的 RISC-V 板级启动与设备/DMA 边界 | 目标已确认，开发板实机验证和 LoongArch 物化器尚未完成 |
 | 后续 Linux 能力组 | 动态链接、更多文件 syscall、实时信号排队与 `sigaltstack`/signalfd、线程/共享资源、futex、外部中断、SMP、可写文件系统及更多设备 transport | 属于长期 ABI 路线，按真实用户程序和依赖推进，不能伪装成当前已支持 |

@@ -36,8 +36,8 @@
 ## 设计依据
 
 - [Devicetree Specification：扁平格式](https://devicetree-specification.readthedocs.io/en/stable/flattened-format.html)、[memory 与 reserved-memory 节点](https://devicetree-specification.readthedocs.io/en/stable/devicenodes.html)
-- [OpenSBI v1.8.1 `fdt_fixup.c`](https://github.com/riscv-software-src/opensbi/blob/v1.8.1/lib/utils/fdt/fdt_fixup.c)：OpenSBI 将固件/PMP 保护范围加入 `/reserved-memory`
-- Linux `f4cdf7ca9a1f` 的 [`drivers/of/fdt.c`](https://github.com/torvalds/linux/blob/f4cdf7ca9a1fdcca413157df19753f388a5a224e/drivers/of/fdt.c) 与 [`arch/riscv/mm/init.c`](https://github.com/torvalds/linux/blob/f4cdf7ca9a1fdcca413157df19753f388a5a224e/arch/riscv/mm/init.c)：确认 RAM 发现、静态保留区、内核和 DTB 自保留的启动顺序
+- 固定 OpenSBI v1.8.1 快照的 [`fdt_fixup.c`](../../references/opensbi/lib/utils/fdt/fdt_fixup.c)：OpenSBI 将固件/PMP 保护范围加入 `/reserved-memory`
+- 固定 Linux `f4cdf7ca9a1f` 快照的 [`drivers/of/fdt.c`](../../references/linux/drivers/of/fdt.c) 与 [`arch/riscv/mm/init.c`](../../references/linux/arch/riscv/mm/init.c)：确认 RAM 发现、静态保留区、内核和 DTB 自保留的启动顺序
 
 本地 Linux 固定提交快照保存在被忽略的 `references/linux/`；项目没有复制上述来源的代码，因此不构成第三方源码引入。
 

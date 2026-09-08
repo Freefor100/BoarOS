@@ -200,6 +200,17 @@ int ext4_dir_iterator_init(struct ext4_dir_iter *it,
  */
 int ext4_dir_iterator_next(struct ext4_dir_iter *it);
 
+/**@brief Advance exactly one on-disk directory record.
+ *
+ * Unlike ext4_dir_iterator_next(), this helper does not skip records whose
+ * inode number is zero.  It is used by the BoarOS adapter so a persistent
+ * directory cookie can advance without re-walking prior records.
+ *
+ * @param it Initialized iterator with a current record.
+ * @return Error code.
+ */
+int ext4_dir_iterator_next_raw(struct ext4_dir_iter *it);
+
 /**@brief Uninitialize directory iterator.
  *        Release all allocated structures.
  * @param it Iterator to be finished

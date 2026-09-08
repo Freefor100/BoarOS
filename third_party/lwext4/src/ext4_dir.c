@@ -288,6 +288,20 @@ int ext4_dir_iterator_next(struct ext4_dir_iter *it)
 	return r;
 }
 
+int ext4_dir_iterator_next_raw(struct ext4_dir_iter *it)
+{
+	uint16_t skip;
+
+	if (it == NULL || it->curr == NULL) {
+		return EINVAL;
+	}
+	skip = ext4_dir_en_get_entry_len(it->curr);
+	if (skip < 8U || it->curr_off > UINT64_MAX - skip) {
+		return EIO;
+	}
+	return ext4_dir_iterator_seek(it, it->curr_off + skip);
+}
+
 int ext4_dir_iterator_fini(struct ext4_dir_iter *it)
 {
 	it->curr = 0;

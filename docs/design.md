@@ -67,7 +67,7 @@ DTB 设备发现
 
 ### 平台与 transport 隔离
 
-RISC-V QEMU `virt` 通过 DTB 的 `compatible = "virtio,mmio"` 节点发现和映射 VirtIO MMIO transport，virtio-blk 在其上实现块设备；不得依赖固定的第几个窗口或设备永远位于某个地址。比赛 Harness 当前也以 `virtio-blk-device` 接到 `virtio-mmio-bus`，见[本地 Harness](../references/oscomp-autotest/kernel/run_qemu.py)。设备 ID、状态机、feature negotiation、split virtqueue、内存屏障和扇区容量遵循 [VirtIO 1.3](https://docs.oasis-open.org/virtio/virtio/v1.3/virtio-v1.3.html)。
+RISC-V QEMU `virt` 通过 DTB 的 `compatible = "virtio,mmio"` 节点发现和映射 VirtIO MMIO transport，virtio-blk 在其上实现块设备；不得依赖固定的第几个窗口或设备永远位于某个地址。比赛 Harness 当前也以 `virtio-blk-device` 接到 `virtio-mmio-bus`，见[本地 Harness](../references/oscomp-autotest/kernel/run_qemu.py)。固定 QEMU v11.1.0（`84f07211cc5b`）快照的 [`virtio-mmio.c`](../references/qemu/hw/virtio/virtio-mmio.c) 与 [`virtio-blk.c`](../references/qemu/hw/block/virtio-blk.c)用于核对设备 ID、状态机、feature negotiation、split virtqueue、内存屏障和扇区容量；规范依据仍为 [VirtIO 1.3](https://docs.oasis-open.org/virtio/virtio/v1.3/virtio-v1.3.html)。
 
 RISC-V QEMU `virt` 的驱动同时支持 VirtIO MMIO version 1 legacy 与 version 2 modern，共用块请求和 `block_device` 上层；legacy 使用 `GuestPageSize/QueueAlign/QueuePFN` 和连续对齐的队列内存，modern 使用 64 位 descriptor/available/used 地址。LoongArch QEMU 后续提供 virtio-pci transport，复用 virtqueue、virtio-blk、`block_device`、VFS 与 ext4 上层。VisionFive 2 与 2K1000LA 的真实开发板由各自 DTB 和手册决定 SD、eMMC、PCI 或其他存储后端；开发板适配只替换设备发现、transport、DMA/cache coherency 和中断等平台边界，不复制 VFS、ext4 或 ELF 逻辑。通用与架构边界依据当前实际职责分离；复用抽象需要真实消费者，不机械等待第二架构，也不预建空框架。
 

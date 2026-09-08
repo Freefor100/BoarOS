@@ -32,6 +32,24 @@ Linux 进程看到的整数 fd 只是文件描述符表的索引。槽内的 des
 
 Linux `read` 的返回值不仅取决于磁盘读取结果，还取决于数据实际交付用户空间的程度。若第一字节就无法写入用户 buffer，应返回 `-EFAULT` 且不推进文件位置；若已经复制一段连续前缀，之后 fault 或 I/O 出错，通常返回已复制长度并只推进这部分。用内核 staging buffer 时，不能把“已从文件系统读入”误当成“已交付用户”：open-file offset 必须按 usercopy 成功字节提交。零长度读仍先要求 fd 有效，但不应解引用用户地址。
 
+目录位置也属于 open file description，而不是 fd 槽或 inode。固定 Linux 快照
+`f4cdf7ca9a1f` 的 [`fs/readdir.c`](../../references/linux/fs/readdir.c) 由 `iterate_dir()` 在
+open file 的 `f_pos` 与 `dir_context.pos` 间传递位置，并由 `filldir64()` 把可恢复位置写入
+`d_off`；[`fs/ext4/dir.c`](../../references/linux/fs/ext4/dir.c) 还显示线性目录和 htree 目录
+可使用不同形态的 cookie，所以调用者不应对它做序号算术。固定 musl 1.2.5 压缩包
+[`musl-1.2.5.tar.gz`](../../references/musl/musl-1.2.5.tar.gz) 中的
+`src/dirent/readdir.c` 把返回项的 `d_off` 保存为 `DIR.tell`，`src/dirent/telldir.c` 返回该值，
+`src/dirent/seekdir.c` 用它执行 `lseek(fd, off, SEEK_SET)` 并清空用户态目录缓冲。因此内核若承诺
+`telldir`/`seekdir` 可恢复枚举，必须让目录 `lseek` 接受先前返回的 cookie，并使下一次
+`getdents` 从相应位置继续；cookie 的编码仍由文件系统适配层掌握。
+
+BoarOS 的线性 ext4 适配器现在把每条记录结束的字节位置作为 cookie，OFD offset 保存下一条记录
+的位置；独立 `open` 得到独立游标，`dup`/`fork` 因共享 OFD 而共享游标。`getdents64` 只有在整条
+记录完成 usercopy 后才提交 offset，缓冲区不足或坏指针不会跳过该记录。lwext4 的错误返回入口
+把 inode 为零的目录尾记录与真实 EOF 区分，并把块读取/格式错误转换为 `-EIO`，避免把损坏目录
+误报成正常结束。该设计使顺序目录枚举从旧的反复重走 O(N²) 变为每条记录一次推进的 O(N)；
+这是条目访问的结构性结论，不等同于已经测得的 QEMU 或开发板吞吐提升。
+
 BoarOS 当前让 `read` 按文件页从共享页缓存取得内容，再复制到用户页。命中避免重复 ext4/块 I/O，但仍有 cache-to-user 复制和用户页软件遍历；read-ahead、固定用户页后的直接 I/O 或异步请求仍未实现。无论数据来自磁盘还是缓存，都必须保持 fd/open-description 分层、短读、offset 与 errno 语义：只有实际交付用户的前缀才能推进 offset。性能取舍需要在 QEMU 和开发板上用文件大小、顺序/随机模式、page fault 比例及 cache/TLB 数据说明，不能只比较函数层数。
 
 ## 页缓存、私有映射与文件尾

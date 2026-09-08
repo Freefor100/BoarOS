@@ -19,7 +19,7 @@
 
 描述符表初始有 32 个槽，按 2 倍增长，硬上限为 1024。分配总是从 `next_fd` 指示的最低可能空位向后搜索；关闭较小 fd 后会回退该提示，因此当前没有预装 stdin/stdout/stderr 时第一次成功打开返回 0。`O_CLOEXEC` 作为 descriptor flag 保存在槽上；exec 提交后批量摘除这些槽，其他 fd 和 open-file offset 保持不变。
 
-普通 clone 通过 `kernel_files_fork()` 新建并复制 fd 槽数组和 descriptor flags，同时增加每个 open file description 的引用。因此父子可以分别 close 或修改各自的 `FD_CLOEXEC` 槽，但同一个已打开文件的 offset 与底层 VFS file 生命周期共享。fs context 通过 `kernel_fs_context_fork()` 独立复制 cwd 字符串并借用同一个 root mount。`dup/dup2/dup3/fcntl(F_DUPFD*)` 复用同一 OFD：`dup` 不携带 `FD_CLOEXEC`，`dup3` 只接受 `O_CLOEXEC` 且 `oldfd == newfd` 返回 `-EINVAL`；内部 `dup2` 对相同且有效的 fd 成功，不改变槽位。`dup2/dup3` 都对越界目标返回 `-EBADF`，目标槽被替换时按 close 语义摘除；`F_DUPFD/F_DUPFD_CLOEXEC` 从下界向上找第一个空槽，下界越界则返回 `-EINVAL`。错误区分依据 [Linux dup 接口说明](https://man7.org/linux/man-pages/man2/dup.2.html)。`CLONE_FILES` 尚不存在，将来应共享整张表而不是调用当前的 fork-copy 接口。
+普通 clone 通过 `kernel_files_fork()` 新建并复制 fd 槽数组和 descriptor flags，同时增加每个 open file description 的引用。因此父子可以分别 close 或修改各自的 `FD_CLOEXEC` 槽，但同一个已打开文件的 offset 与底层 VFS file 生命周期共享。fs context 通过 `kernel_fs_context_fork()` 独立复制 cwd 字符串并借用同一个 root mount。`dup/dup2/dup3/fcntl(F_DUPFD*)` 复用同一 OFD：`dup` 不携带 `FD_CLOEXEC`，`dup3` 只接受 `O_CLOEXEC` 且 `oldfd == newfd` 返回 `-EINVAL`；内部 `dup2` 对相同且有效的 fd 成功，不改变槽位。`dup2/dup3` 都对越界目标返回 `-EBADF`，目标槽被替换时按 close 语义摘除；`F_DUPFD/F_DUPFD_CLOEXEC` 从下界向上找第一个空槽，下界越界则返回 `-EINVAL`。固定 Linux 快照中的 [`fs/file.c`](../../references/linux/fs/file.c)、[`fs/fcntl.c`](../../references/linux/fs/fcntl.c) 与 [Linux dup 接口说明](https://man7.org/linux/man-pages/man2/dup.2.html)可用于核对这些边界。`CLONE_FILES` 尚不存在，将来应共享整张表而不是调用当前的 fork-copy 接口。
 
 ## `openat` 与路径边界
 
@@ -57,7 +57,7 @@ open file description 的 offset 只增加实际复制到用户空间的字节�
 
 `kernel_files_fstat()/newfstatat()` 按 riscv64 asm-generic 128 字节 `struct stat` 填充：regular 文件的 mode/ino/size 来自 VFS 与 ext4，console 呈现 5:1 字符设备；`nlink` 固定为 1，时间戳当前填 0，需在适配层缓存 inode 时间后补全。`newfstatat` 支持 `AT_FDCWD`/绝对路径与 `AT_EMPTY_PATH`（直接按 fd 取描述符），真实 dirfd 的相对路径返回 `-EBADF`；目录路径在目录打开落地后可统计，`AT_SYMLINK_NOFOLLOW` 因无 symlink 而无条件接受。
 
-`kernel_files_getdents64()` 只作用于目录描述符，其他类型返回 `-ENOTDIR`。每条记录按 linux_dirent64 编码（`d_reclen` 8 字节对齐，`d_type` 来自 ext4 filetype），条目计数即 `d_off` cookie；缓冲区连第一条记录都放不下返回 `-EINVAL`，用户 fault 在已完整发出的记录上返回前缀计数。
+`kernel_files_getdents64()` 只作用于目录描述符，其他类型返回 `-ENOTDIR`。每条记录按 linux_dirent64 编码（`d_reclen` 8 字节对齐，`d_type` 来自 ext4 filetype），`d_off` 是下一条记录的后端 cookie，不是条目计数；缓冲区连第一条记录都放不下返回 `-EINVAL`，用户 fault 在已完整发出的记录上返回前缀计数。
 
 ## 关闭与退出回收
 
@@ -76,22 +76,18 @@ fd-slot OFD references -> files table -> fs context
 
 ## 验证与限制
 
-`write` 和不超过 8 个 iovec 的 `writev` 不分配导入缓冲；更长数组为完整输入快照分配至多 16 KiB 元数据，释放失败时由文件表持有 owner。数据仍直接从用户空间复制到 pipe ring，console 使用 64 字节暂存；目录拆分本身没有引入转发层或额外数据复制。等待唤醒扫描当前 blocked 链，单次 wake-all 为 O(阻塞任务数)，不是已完成的可扩展并发队列。
+`write` 和不超过 8 个 iovec 的 `writev` 不分配导入缓冲；更长数组为完整输入快照分配至多 16 KiB 元数据，释放失败时由文件表持有 owner。数据仍直接从用户空间复制到 pipe ring，console 使用 64 字节暂存；目录条目在固定内核缓冲区中编码一次，再复制到用户空间，目录拆分没有引入转发层或额外数据复制。等待唤醒扫描当前 blocked 链，单次 wake-all 为 O(阻塞任务数)，不是已完成的可扩展并发队列。
 
-目录枚举仍对每条待输出记录从头跳过已输出条目，完整枚举的遍历成本为 O(N²)，即使一次 getdents 提供大缓冲区也不能消除重复扫描。文件拆分没有解决这一性能限制，后续修正见下节。
+目录枚举现在由 OFD offset 保存可继续的后端 cookie，VFS 适配层隐藏 lwext4 类型；可变游标不放入按 inode 共享的 VFS node。独立 open 各自推进，dup 和 fork 共享同一 OFD 的目录位置。当前线性 ext4 适配器的 `ext4_dir_entry_next_status()` 区分真实 EOF 与正 errno，使用记录结束字节位置作为 cookie；未来的 htree 或其他文件系统可以替换编码而不改变文件资源接口。
 
-## 已确认的目录枚举优化方向（尚未实现）
+实现保持以下语义：
 
-改为由 OFD 拥有可继续的目录游标，VFS 适配层保存底层位置并隐藏 lwext4 类型；不把可变游标放入按 inode 共享的 VFS node。这样独立 open 各自推进，dup 和 fork 则共享同一 OFD 的目录位置，最后一个 OFD 引用释放时回收游标。当前 lwext4 已有 `ext4_dir.next_off`，可以作为适配依据，但不能直接把第三方结构变成通用接口。
+- 待输出位置与已提交位置分离；只有整条 dirent 成功复制后才提交 cookie。缓冲区不足或 usercopy 失败时不跳过未交付记录，已交付前缀仍返回字节数。
+- `d_off` 是可用于恢复枚举的位置 cookie，不要求调用者对它做序号算术。`lseek` 接受保存的 cookie；任意未对齐值由适配器向前规范化到下一个记录。
+- dot 项和目录尾记录按 ext4 inode 号处理；inode 为零的尾记录只用于推进，不会被当作 EOF。lwext4 块读取或格式错误向上转成 `-EIO` 等 errno。
+- 顺序完整枚举按每个物理记录一次推进，结构性条目访问为 O(N)。随机 seek 仍可能加载和扫描一个块，且尚未有开发板吞吐基线；不能把这一结构性结论写成未经测量的“更快”。
 
-此次优化需一起完成以下语义和验证，不能只缓存一次遍历结果便宣称收口：
-
-- 区分待输出位置与已提交位置：只有整条 dirent 成功复制后才提交 cookie；缓冲区不足或 usercopy 失败时不能跳过未交付记录，已交付前缀仍返回字节数。
-- `d_off` 是可用于恢复枚举的位置 cookie，不应要求调用者对它做算术；明确 `lseek`/rewind 与游标的同步和失效规则，验证保存 cookie 后恢复、dup/fork 交替枚举和分别 open 的独立性。
-- 当前 lwext4 的 `ext4_dir_entry_next` 以空指针同时表示结束和部分内部失败；适配时必须区分 EOF 与 I/O 错误，不能把设备失败误报成完整枚举结束。审查 dot 项、EOF、最大文件名以及中途错误，保留正确的部分结果。
-- 以现有 runner 比较不同目录规模和用户缓冲区大小，计数底层条目访问与块读取；目标是顺序完整枚举的条目访问由 O(N²) 降至 O(N)，同时检查游标内存及最终资源基线。随机 seek 的额外成本单独记录，不用 QEMU 耗时替代条目计数证据。
-
-该项沿文件能力主线落实，不依赖动态链接或可写文件系统；引入共享 OFD 的并发访问前还需为位置更新建立同步协议。当前未实现此优化，也没有实测吞吐提升。
+该能力沿文件主线收口，不依赖动态链接或可写文件系统；未来在启用 SMP 或共享 OFD 并发访问前，仍需为位置更新建立同步协议。
 
 ## 成本与验证入口
 

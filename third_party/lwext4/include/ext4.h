@@ -611,6 +611,18 @@ int ext4_dir_close(ext4_dir *dir);
  * @return  Directory entry id (NULL if no entry)*/
 const ext4_direntry *ext4_dir_entry_next(ext4_dir *dir);
 
+/**@brief Return one directory entry and preserve iterator errors.
+ *
+ * @param dir Directory handle. `next_off` is the byte position to inspect.
+ * @param entry Destination entry descriptor.
+ * @param entry_offset Receives the entry's byte position, or UINT64_MAX at
+ *        end of directory.
+ * @return EOK for an entry or end of directory, otherwise an ext4 error.
+ */
+int ext4_dir_entry_next_status(ext4_dir *dir,
+                               ext4_direntry *entry,
+                               uint64_t *entry_offset);
+
 /**@brief   Rewine directory entry offset.
  *
  * @param   dir Directory handle.*/

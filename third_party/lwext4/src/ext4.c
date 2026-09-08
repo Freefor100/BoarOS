@@ -3179,56 +3179,98 @@ int ext4_dir_close(ext4_dir *dir)
 
 const ext4_direntry *ext4_dir_entry_next(ext4_dir *dir)
 {
-#define EXT4_DIR_ENTRY_OFFSET_TERM (uint64_t)(-1)
+    uint64_t entry_offset;
 
-	int r;
-	uint16_t name_length;
-	ext4_direntry *de = 0;
-	struct ext4_inode_ref dir_inode;
-	struct ext4_dir_iter it;
+    if (ext4_dir_entry_next_status(dir, &dir->de, &entry_offset) != EOK ||
+        entry_offset == UINT64_MAX) {
+        return 0;
+    }
+    return &dir->de;
+}
 
-	EXT4_MP_LOCK(dir->f.mp);
+int ext4_dir_entry_next_status(ext4_dir *dir,
+                               ext4_direntry *entry,
+                               uint64_t *entry_offset)
+{
+    struct ext4_inode_ref dir_inode;
+    struct ext4_dir_iter it = {0};
+    uint64_t directory_size;
+    int result = EOK;
+    int finish_result;
 
-	if (dir->next_off == EXT4_DIR_ENTRY_OFFSET_TERM) {
-		EXT4_MP_UNLOCK(dir->f.mp);
-		return 0;
-	}
+    if (dir == 0 || entry == 0 || entry_offset == 0 || dir->f.mp == 0) {
+        return EINVAL;
+    }
+    memset(entry, 0, sizeof(*entry));
+    *entry_offset = UINT64_MAX;
 
-	r = ext4_fs_get_inode_ref(&dir->f.mp->fs, dir->f.inode, &dir_inode);
-	if (r != EOK) {
-		goto Finish;
-	}
+    EXT4_MP_LOCK(dir->f.mp);
+    if (dir->next_off == UINT64_MAX) {
+        EXT4_MP_UNLOCK(dir->f.mp);
+        return EOK;
+    }
 
-	r = ext4_dir_iterator_init(&it, &dir_inode, dir->next_off);
-	if (r != EOK) {
-		ext4_fs_put_inode_ref(&dir_inode);
-		goto Finish;
-	}
+    result = ext4_fs_get_inode_ref(&dir->f.mp->fs, dir->f.inode,
+                                   &dir_inode);
+    if (result != EOK) {
+        EXT4_MP_UNLOCK(dir->f.mp);
+        return result;
+    }
+    directory_size = ext4_inode_get_size(&dir_inode.fs->sb,
+                                         dir_inode.inode);
+    result = ext4_dir_iterator_init(&it, &dir_inode, dir->next_off);
+    if (result == EOK && it.curr != 0) {
+        for (;;) {
+            uint64_t current_offset = it.curr_off;
+            uint16_t record_length =
+                ext4_dir_en_get_entry_len(it.curr);
 
-	memset(&dir->de.name, 0, sizeof(dir->de.name));
-	name_length = ext4_dir_en_get_name_len(&dir->f.mp->fs.sb,
-					       it.curr);
-	memcpy(&dir->de.name, it.curr->name, name_length);
+            if (record_length < 8U ||
+                current_offset > UINT64_MAX - record_length ||
+                current_offset > directory_size ||
+                record_length > directory_size - current_offset) {
+                result = EIO;
+                break;
+            }
+            dir->next_off = current_offset + record_length;
+            if (ext4_dir_en_get_inode(it.curr) != 0U) {
+                uint16_t name_length =
+                    ext4_dir_en_get_name_len(&dir_inode.fs->sb, it.curr);
 
-	/* Directly copying the content isn't safe for Big-endian targets*/
-	dir->de.inode = ext4_dir_en_get_inode(it.curr);
-	dir->de.entry_length = ext4_dir_en_get_entry_len(it.curr);
-	dir->de.name_length = name_length;
-	dir->de.inode_type = ext4_dir_en_get_inode_type(&dir->f.mp->fs.sb,
-						      it.curr);
-
-	de = &dir->de;
-
-	ext4_dir_iterator_next(&it);
-
-	dir->next_off = it.curr ? it.curr_off : EXT4_DIR_ENTRY_OFFSET_TERM;
-
-	ext4_dir_iterator_fini(&it);
-	ext4_fs_put_inode_ref(&dir_inode);
-
-Finish:
-	EXT4_MP_UNLOCK(dir->f.mp);
-	return de;
+                if (name_length > sizeof(entry->name)) {
+                    result = EIO;
+                    break;
+                }
+                entry->inode = ext4_dir_en_get_inode(it.curr);
+                entry->entry_length = record_length;
+                entry->name_length = (uint8_t)name_length;
+                entry->inode_type = ext4_dir_en_get_inode_type(
+                    &dir_inode.fs->sb, it.curr);
+                memcpy(entry->name, it.curr->name, name_length);
+                *entry_offset = current_offset;
+                break;
+            }
+            result = ext4_dir_iterator_next_raw(&it);
+            if (result != EOK || it.curr == 0) {
+                break;
+            }
+        }
+    }
+    if (result == EOK && it.curr == 0) {
+        dir->next_off = UINT64_MAX;
+    }
+    if (it.inode_ref != 0) {
+        finish_result = ext4_dir_iterator_fini(&it);
+        if (result == EOK && finish_result != EOK) {
+            result = finish_result;
+        }
+    }
+    finish_result = ext4_fs_put_inode_ref(&dir_inode);
+    if (result == EOK && finish_result != EOK) {
+        result = finish_result;
+    }
+    EXT4_MP_UNLOCK(dir->f.mp);
+    return result;
 }
 
 void ext4_dir_entry_rewind(ext4_dir *dir)

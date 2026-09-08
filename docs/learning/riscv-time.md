@@ -40,9 +40,9 @@ SBI TIME 扩展 ID 为 `0x54494d45`，函数 0 接收绝对 `stime_value`。它�
 
 ## 为什么频率必须来自 DTB？
 
-timebase 是平台事实，不是 Sv39 或 RV64 固定常量。RISC-V CPU DT binding 要求 `/cpus/timebase-frequency` 描述该值；Linux RISC-V 启动也从该属性初始化全局 timebase，缺失时停止启动。[Linux RISC-V CPU binding](https://github.com/torvalds/linux/blob/f4cdf7ca9a1fdcca413157df19753f388a5a224e/Documentation/devicetree/bindings/riscv/cpus.yaml)和 [`arch/riscv/kernel/time.c`](https://github.com/torvalds/linux/blob/f4cdf7ca9a1fdcca413157df19753f388a5a224e/arch/riscv/kernel/time.c)可用于核对这一契约。
+timebase 是平台事实，不是 Sv39 或 RV64 固定常量。RISC-V CPU DT binding 要求 `/cpus/timebase-frequency` 描述该值；Linux RISC-V 启动也从该属性初始化全局 timebase，缺失时停止启动。固定 Linux 快照中的 [CPU binding](../../references/linux/Documentation/devicetree/bindings/riscv/cpus.yaml) 和 [`arch/riscv/kernel/time.c`](../../references/linux/arch/riscv/kernel/time.c)可用于核对这一契约。
 
-固定的 QEMU v11.1.0 源码在 `hw/riscv/virt.c` 使用默认 ACLINT timebase，并由 `hw/riscv/fdt-common.c` 写入 `/cpus`；当前真实 QEMU DTB 和 OpenSBI 输出都验证为 10 MHz。Linux 固定快照的 [`jh7110-common.dtsi`](https://github.com/torvalds/linux/blob/f4cdf7ca9a1fdcca413157df19753f388a5a224e/arch/riscv/boot/dts/starfive/jh7110-common.dtsi)为 VisionFive 2/JH7110 覆盖成 4 MHz。因此两块平台可以复用同一 SBI timer 代码，但不能共享硬编码 period。
+固定的 [QEMU v11.1.0 `hw/riscv/virt.c`](../../references/qemu/hw/riscv/virt.c)使用默认 ACLINT timebase，并由 [`hw/riscv/fdt-common.c`](../../references/qemu/hw/riscv/fdt-common.c)写入 `/cpus`；当前真实 QEMU DTB 和 OpenSBI 输出都验证为 10 MHz。Linux 固定快照的 [`jh7110-common.dtsi`](../../references/linux/arch/riscv/boot/dts/starfive/jh7110-common.dtsi)为 VisionFive 2/JH7110 覆盖成 4 MHz。因此两块平台可以复用同一 SBI timer 代码，但不能共享硬编码 period。
 
 BoarOS 的通用 DTB 读取允许该属性缺失并输出零，因为未来 LoongArch 不使用这一 RISC-V 属性；RISC-V timer 启动再把零频率作为精确错误。属性一旦存在，就必须是一个非零 32 位大端 cell，错误长度或重复值属于无效输入。
 
@@ -84,7 +84,7 @@ next    = previous_deadline + elapsed * period
 
 - [xv6-riscv](https://github.com/mit-pdos/xv6-riscv/blob/riscv/kernel/start.c)当前教学实现直接使用 Sstc/stimecmp，并以简单固定间隔重设；[`trap.c`](https://github.com/mit-pdos/xv6-riscv/blob/riscv/kernel/trap.c)在 timer interrupt 中推进全局 ticks，并在存在进程时触发调度。它强调机制清晰，周期约为 10 Hz。
 - [rCore Tutorial](https://rcore-os.cn/rCore-Tutorial-Book-v3/chapter3/4time-sharing-system.html)通过 SBI 设置下一 timer，使用 100 Hz 时间片并在 trap 中进入任务切换，适合观察“one-shot 固件接口怎样构成周期 tick”。
-- Linux 的 [`timer-riscv.c`](https://github.com/torvalds/linux/blob/f4cdf7ca9a1fdcca413157df19753f388a5a224e/drivers/clocksource/timer-riscv.c)把 time 作为 clocksource，把 timer 作为 one-shot clockevent；有 Sstc 时直接写 compare，否则调用 SBI。上层可选择不同 [HZ](https://github.com/torvalds/linux/blob/f4cdf7ca9a1fdcca413157df19753f388a5a224e/kernel/Kconfig.hz)，并通过 [NO_HZ](https://github.com/torvalds/linux/blob/f4cdf7ca9a1fdcca413157df19753f388a5a224e/kernel/time/Kconfig)减少空闲或指定 CPU 的周期 tick。
+- Linux 固定快照的 [`timer-riscv.c`](../../references/linux/drivers/clocksource/timer-riscv.c)把 time 作为 clocksource，把 timer 作为 one-shot clockevent；有 Sstc 时直接写 compare，否则调用 SBI。上层可选择不同 [`HZ`](../../references/linux/kernel/Kconfig.hz)，并通过 [`NO_HZ`](../../references/linux/kernel/time/Kconfig)减少空闲或指定 CPU 的周期 tick。
 
 这些系统的共同点是把“硬件绝对 deadline”和“上层何时需要事件”分开。BoarOS 当前只实现其中最小、已经有真实消费者的部分，不提前复制完整 Linux clockevents 框架。
 

@@ -75,12 +75,14 @@ uint32_t kernel_vfs_file_inode(const struct kernel_vfs_file *file);
 #define KERNEL_VFS_DT_SOCK UINT8_C(12)
 
 /*
- * Report entry `index` (dot entries excluded) of an open directory:
- * 1 with the fields filled, 0 past the end, or a negative errno.  Each
- * call re-walks the directory, so the handle stays stateless.
+ * Report the first entry at or after the opaque byte `position` of an open
+ * directory.  `next_position` receives the cookie to use for the following
+ * entry.  Return 1 with fields filled, 0 at end of directory, or a negative
+ * errno.  The position is a backend cookie, not an entry ordinal.
  */
 int kernel_vfs_dir_entry(struct kernel_vfs_file *file,
-                         uint64_t index,
+                         uint64_t position,
+                         uint64_t *next_position,
                          uint64_t *inode,
                          uint8_t *type,
                          char *name,

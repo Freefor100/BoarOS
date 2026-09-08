@@ -6,6 +6,50 @@
 内容；来源不符、固定版本不符、校验失败或 Git 工作区有修改时立即失败，
 不会覆盖本地分析。
 
+## 恢复、校验与阅读
+
+```sh
+make references
+make test-references
+```
+
+`sources.tsv` 是来源、固定 revision 和文件校验值的唯一清单。`full` 项保留上游历史，适合
+比赛规则、Harness 和公开测例的分支分析；`snapshot` 项只保证清单 commit 的源码，不保证父提交
+或完整历史；`file` 项只保证下载文件的 SHA-256。引用结论时写明本地路径和清单中的 commit、
+tag、文档版本或 SHA-256。完整仓库若临时切到其他分支，还要用
+`git -C references/<name> rev-parse HEAD` 记录实际 commit；分析后切回清单 commit 才能再次通过校验。
+
+源码先用 `rg` 在本地路径搜索，再打开命中的上下文。Linux 工作区可能同时是 shallow、partial
+clone 和 sparse checkout；可分别用以下命令确认：
+
+```sh
+git -C references/linux rev-parse HEAD
+git -C references/linux rev-parse --is-shallow-repository
+git -C references/linux config --get remote.origin.partialclonefilter
+git -C references/linux sparse-checkout list
+```
+
+工作树里没有路径或对象、`git log` 看不到父提交，都不能作为 Linux 不存在该实现或历史的证据。
+先用 `git -C references/linux sparse-checkout add <目录>` 展开固定 commit 所需目录；读取缺失 blob
+时让 Git 从清单 origin 补取该对象，不切换 HEAD。只有固定 commit 本身不含所需主题，或对象确实
+无法恢复时，才查 Linux 官方文档或上游仓库，并明确它不是当前固定基线。
+
+musl 以校验过的 `musl/musl-1.2.5.tar.gz` 保存，不在 `references/` 另建源码快照。列出和读取
+单个成员可直接使用：
+
+```sh
+tar -tzf references/musl/musl-1.2.5.tar.gz
+tar -xOf references/musl/musl-1.2.5.tar.gz musl-1.2.5/src/dirent/seekdir.c
+```
+
+确需整树阅读时解包到仓库外的临时目录或已忽略的 `build/`，结束后删除。不要 `git add -f`
+恢复出的仓库、PDF、压缩包或解包树，也不要把手工下载的网页副本留在仓库其他位置成为未跟踪
+快照；要长期固定的新输入应加入 `sources.tsv`，由恢复器校验。
+
+若本地输入缺少当前问题必需的官方新规则、勘误或板级资料，可回退到标准组织、上游项目或厂商
+官网。记录 URL、版本和访问日期；若网页内容与固定输入冲突，先保留固定输入作为可复现基线，
+说明差异并确认是否更新清单，而不是混用两个版本。
+
 ## 比赛输入
 
 | 本地路径 | 上游 | 保存方式 |

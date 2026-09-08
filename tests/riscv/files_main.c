@@ -18,6 +18,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 #define TEST_POOL_PAGES 512U
 #define TEST_USER_PATH UINT64_C(0x10000)
@@ -1187,6 +1188,15 @@ static void run_directory_operations(struct kernel_files *files,
 {
     uint64_t dir_buffer = TEST_USER_BUFFER;
     uint64_t offset;
+    uint64_t resume_cookie = 0U;
+    int have_resume_cookie = 0;
+    uint64_t first_record_size = 0U;
+    uint64_t second_record_size = 0U;
+    uint64_t third_record_size = 0U;
+    char first_name[256] = {0};
+    char resume_name[256] = {0};
+    char third_name[256] = {0};
+    uint32_t record_index = 0U;
     int saw_data = 0;
     int saw_lost = 0;
     int saw_long = 0;
@@ -1195,6 +1205,33 @@ static void run_directory_operations(struct kernel_files *files,
     /* The root directory opens read-only and lists its entries. */
     expect_open(files, fs, mm, TEST_AT_FDCWD, "/", 0U, 0, 110U);
     expect_open(files, fs, mm, TEST_AT_FDCWD, "/data", 0U, 1, 110U);
+    /* getdents64 exposes the real dot entries; the VFS must not silently
+     * turn a directory stream into an inode-name-only index. */
+    if (kernel_files_getdents(files,
+                              mm,
+                              0,
+                              dir_buffer,
+                              4096U,
+                              &result) != KERNEL_FILES_STATUS_OK ||
+        result <= 0) {
+        fail_files(129U, 0, result);
+    }
+    offset = 0U;
+    {
+        uint64_t record_size = 0U;
+        int type = collect_dirent_name(mm,
+                                       dir_buffer + offset,
+                                       &record_size);
+
+        if (type < 0 || !dirent_name_is(directory_name, ".")) {
+            fail_files(129U, KERNEL_VFS_DT_DIR, type);
+        }
+    }
+    if (kernel_files_lseek(files, 0, 0U, KERNEL_FILES_SEEK_SET, &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != 0) {
+        fail_files(130U, 0, result);
+    }
     if (kernel_files_getdents(files,
                               mm,
                               0,
@@ -1210,6 +1247,7 @@ static void run_directory_operations(struct kernel_files *files,
     offset = 0U;
     while (offset < (uint64_t)result) {
         uint64_t record_size = 0U;
+        unsigned char cookie_bytes[8];
         int type = collect_dirent_name(mm,
                                        dir_buffer + offset,
                                        &record_size);
@@ -1217,6 +1255,28 @@ static void run_directory_operations(struct kernel_files *files,
         if (type < 0) {
             fail_files(112U, 0, type);
         }
+        if (record_index == 0U) {
+            first_record_size = record_size;
+            memcpy(first_name, directory_name, sizeof(first_name));
+            if (!read_user_bytes(mm,
+                                 dir_buffer + 8U,
+                                 cookie_bytes,
+                                 sizeof(cookie_bytes))) {
+                fail_files(112U, 0, -KERNEL_EFAULT);
+            }
+            resume_cookie = 0U;
+            for (uint32_t byte = 0U; byte < sizeof(cookie_bytes); byte++) {
+                resume_cookie |= (uint64_t)cookie_bytes[byte] << (8U * byte);
+            }
+            have_resume_cookie = 1;
+        } else if (record_index == 1U) {
+            second_record_size = record_size;
+            memcpy(resume_name, directory_name, sizeof(resume_name));
+        } else if (record_index == 2U) {
+            third_record_size = record_size;
+            memcpy(third_name, directory_name, sizeof(third_name));
+        }
+        record_index++;
         offset += record_size;
         if (dirent_name_is(directory_name, "data") && type == KERNEL_VFS_DT_REG) {
             saw_data = 1;
@@ -1287,10 +1347,15 @@ static void run_directory_operations(struct kernel_files *files,
         fail_files(118U, 0, result);
     }
 
-    /* Seek repositions the entry cursor. */
-    if (kernel_files_lseek(files, 0, 1U, KERNEL_FILES_SEEK_SET, &result) !=
+    /* d_off is an opaque resume cookie, not the entry ordinal. */
+    if (!have_resume_cookie ||
+        kernel_files_lseek(files,
+                           0,
+                           (int64_t)resume_cookie,
+                           KERNEL_FILES_SEEK_SET,
+                           &result) !=
             KERNEL_FILES_STATUS_OK ||
-        result != 1 ||
+        result != (int64_t)resume_cookie ||
         kernel_files_getdents(files,
                               mm,
                               0,
@@ -1306,8 +1371,186 @@ static void run_directory_operations(struct kernel_files *files,
                                        dir_buffer + offset,
                                        &offset);
 
-        if (type < 0 || !dirent_name_is(directory_name, "data")) {
+        if (type < 0 || !dirent_name_is(directory_name, resume_name)) {
             fail_files(116U, 0, type);
+        }
+    }
+
+    /* Separate open calls have independent cursors even for one VFS node. */
+    {
+        int64_t independent_fd = INT64_MIN;
+
+        if (!write_user_bytes(mm, TEST_USER_PATH, "/", 2U) ||
+            kernel_files_openat(files,
+                                fs,
+                                mm,
+                                TEST_AT_FDCWD,
+                                TEST_USER_PATH,
+                                0U,
+                                0U,
+                                &independent_fd) != KERNEL_FILES_STATUS_OK ||
+            independent_fd < 0 ||
+            kernel_files_lseek(files,
+                               0,
+                               0U,
+                               KERNEL_FILES_SEEK_SET,
+                               &result) != KERNEL_FILES_STATUS_OK ||
+            result != 0 ||
+            kernel_files_getdents(files,
+                                  mm,
+                                  independent_fd,
+                                  dir_buffer,
+                                  first_record_size,
+                                  &result) != KERNEL_FILES_STATUS_OK ||
+            result != (int64_t)first_record_size) {
+            fail_files(131U, (long)first_record_size, result);
+        }
+        offset = 0U;
+        if (collect_dirent_name(mm, dir_buffer + offset, &offset) < 0 ||
+            !dirent_name_is(directory_name, first_name) ||
+            kernel_files_getdents(files,
+                                  mm,
+                                  0,
+                                  dir_buffer,
+                                  first_record_size,
+                                  &result) != KERNEL_FILES_STATUS_OK ||
+            result != (int64_t)first_record_size) {
+            fail_files(132U, (long)first_record_size, result);
+        }
+    if (kernel_files_close(files, independent_fd, &result) !=
+                KERNEL_FILES_STATUS_OK ||
+            result != 0) {
+            fail_files(133U, 0, result);
+        }
+    }
+
+    /* A fault after one complete record returns that prefix and leaves the
+     * next record at the saved cookie for a retry. */
+    if (kernel_files_lseek(files,
+                           0,
+                           0U,
+                           KERNEL_FILES_SEEK_SET,
+                           &result) != KERNEL_FILES_STATUS_OK ||
+        result != 0 ||
+        kernel_files_getdents(files,
+                              mm,
+                              0,
+                              TEST_USER_BUFFER + 3U * BOAROS_PAGE_SIZE -
+                                  first_record_size,
+                              first_record_size + second_record_size,
+                              &result) != KERNEL_FILES_STATUS_OK ||
+        result != (int64_t)first_record_size) {
+        fail_files(142U, (long)first_record_size, result);
+    }
+    if (kernel_files_getdents(files,
+                              mm,
+                              0,
+                              dir_buffer,
+                              second_record_size,
+                              &result) != KERNEL_FILES_STATUS_OK ||
+        result != (int64_t)second_record_size) {
+        fail_files(143U, (long)second_record_size, result);
+    }
+    offset = 0U;
+    if (collect_dirent_name(mm, dir_buffer + offset, &offset) < 0 ||
+        !dirent_name_is(directory_name, resume_name)) {
+        fail_files(144U, 0, 0);
+    }
+
+    /* dup shares the OFD cursor: consuming one record through the duplicate
+     * advances the original descriptor to the following record. */
+    if (kernel_files_lseek(files,
+                           0,
+                           0U,
+                           KERNEL_FILES_SEEK_SET,
+                           &result) != KERNEL_FILES_STATUS_OK ||
+        result != 0 ||
+        kernel_files_getdents(files,
+                              mm,
+                              0,
+                              dir_buffer,
+                              first_record_size,
+                              &result) != KERNEL_FILES_STATUS_OK ||
+        result != (int64_t)first_record_size) {
+        fail_files(134U, (long)first_record_size, result);
+    }
+    {
+        int64_t duplicate_fd = INT64_MIN;
+
+        if (kernel_files_dup(files, 0, &duplicate_fd) !=
+                KERNEL_FILES_STATUS_OK ||
+            duplicate_fd < 0 ||
+            kernel_files_getdents(files,
+                                  mm,
+                                  duplicate_fd,
+                                  dir_buffer,
+                                  second_record_size,
+                                  &result) != KERNEL_FILES_STATUS_OK ||
+            result != (int64_t)second_record_size) {
+            fail_files(135U, (long)second_record_size, result);
+        }
+        offset = 0U;
+        if (collect_dirent_name(mm, dir_buffer + offset, &offset) < 0 ||
+            !dirent_name_is(directory_name, resume_name) ||
+            kernel_files_getdents(files,
+                                  mm,
+                                  0,
+                                  dir_buffer,
+                                  third_record_size,
+                                  &result) != KERNEL_FILES_STATUS_OK ||
+            result != (int64_t)third_record_size) {
+            fail_files(136U, (long)third_record_size, result);
+        }
+        offset = 0U;
+        if (collect_dirent_name(mm, dir_buffer + offset, &offset) < 0 ||
+            !dirent_name_is(directory_name, third_name)) {
+            fail_files(137U, 0, 0);
+        }
+        if (kernel_files_close(files, duplicate_fd, &result) !=
+                KERNEL_FILES_STATUS_OK ||
+            result != 0) {
+            fail_files(138U, 0, result);
+        }
+    }
+
+    /* fork also shares the OFD cursor while duplicating the descriptor table. */
+    {
+        struct kernel_files child_files = {0};
+
+        if (kernel_files_lseek(files,
+                               0,
+                               0U,
+                               KERNEL_FILES_SEEK_SET,
+                               &result) != KERNEL_FILES_STATUS_OK ||
+            result != 0 ||
+            kernel_files_fork(&child_files, files) !=
+                KERNEL_FILES_STATUS_OK ||
+            kernel_files_getdents(&child_files,
+                                  mm,
+                                  0,
+                                  dir_buffer,
+                                  first_record_size,
+                                  &result) != KERNEL_FILES_STATUS_OK ||
+            result != (int64_t)first_record_size) {
+            fail_files(139U, (long)first_record_size, result);
+        }
+        offset = 0U;
+        if (collect_dirent_name(mm, dir_buffer + offset, &offset) < 0 ||
+            !dirent_name_is(directory_name, first_name) ||
+            kernel_files_getdents(files,
+                                  mm,
+                                  0,
+                                  dir_buffer,
+                                  second_record_size,
+                                  &result) != KERNEL_FILES_STATUS_OK ||
+            result != (int64_t)second_record_size) {
+            fail_files(140U, (long)second_record_size, result);
+        }
+        offset = 0U;
+        if (collect_dirent_name(mm, dir_buffer + offset, &offset) < 0 ||
+            !dirent_name_is(directory_name, resume_name) ||
+            kernel_files_release(&child_files) != KERNEL_FILES_STATUS_OK) {
+            fail_files(141U, 0, result);
         }
     }
     if (kernel_files_close(files, 0, &result) != KERNEL_FILES_STATUS_OK ||

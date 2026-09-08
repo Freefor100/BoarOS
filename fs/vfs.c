@@ -557,7 +557,8 @@ static uint8_t dirent_type_from_ext4(uint8_t inode_type)
 }
 
 int kernel_vfs_dir_entry(struct kernel_vfs_file *file,
-                         uint64_t index,
+                         uint64_t position,
+                         uint64_t *next_position,
                          uint64_t *inode,
                          uint8_t *type,
                          char *name,
@@ -565,12 +566,14 @@ int kernel_vfs_dir_entry(struct kernel_vfs_file *file,
 {
     const struct kernel_vfs_node *node;
     ext4_dir directory;
-    const ext4_direntry *entry;
-    uint64_t position = 0U;
+    ext4_direntry entry;
+    uint64_t entry_offset;
+    uint64_t start;
+    int result;
     size_t name_length;
 
-    if (file == 0 || file->private_data == 0 || inode == 0 || type == 0 ||
-        name == 0 || name_size == 0U ||
+    if (file == 0 || file->private_data == 0 || next_position == 0 ||
+        inode == 0 || type == 0 || name == 0 || name_size == 0U ||
         file->state != VFS_FILE_STATE_LIVE) {
         return -KERNEL_EINVAL;
     }
@@ -578,34 +581,48 @@ int kernel_vfs_dir_entry(struct kernel_vfs_file *file,
     if ((node->mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFDIR) {
         return -KERNEL_ENOTDIR;
     }
-
-    directory.f = node->file;
-    ext4_dir_entry_rewind(&directory);
-    while ((entry = ext4_dir_entry_next(&directory)) != 0) {
-        if (entry->name_length == 1U && entry->name[0] == '.') {
-            continue;
-        }
-        if (entry->name_length == 2U && entry->name[0] == '.' &&
-            entry->name[1] == '.') {
-            continue;
-        }
-        if (position == index) {
-            break;
-        }
-        position++;
-    }
-    if (entry == 0) {
+    *next_position = position;
+    if (position >= node->size) {
+        *next_position = node->size;
         return 0;
     }
-    name_length = entry->name_length;
-    if (name_length >= name_size) {
-        return -KERNEL_ENAMETOOLONG;
+    start = position & ~UINT64_C(3);
+    directory.f = node->file;
+    directory.next_off = start;
+    for (;;) {
+        result = ext4_dir_entry_next_status(&directory,
+                                            &entry,
+                                            &entry_offset);
+        if (result != EOK) {
+            return lwext4_error(result);
+        }
+        if (entry_offset == UINT64_MAX) {
+            *next_position = node->size;
+            return 0;
+        }
+        if (entry_offset < position) {
+            if (directory.next_off <= entry_offset ||
+                directory.next_off == UINT64_MAX) {
+                return -KERNEL_EIO;
+            }
+            continue;
+        }
+        name_length = entry.name_length;
+        if (name_length >= name_size) {
+            return -KERNEL_ENAMETOOLONG;
+        }
+        memcpy(name, entry.name, name_length);
+        name[name_length] = '\0';
+        *inode = entry.inode;
+        *type = dirent_type_from_ext4(entry.inode_type);
+        *next_position = directory.next_off;
+        if (entry_offset >= node->size || *next_position <= entry_offset ||
+            *next_position > node->size ||
+            *next_position == UINT64_MAX) {
+            return -KERNEL_EIO;
+        }
+        return 1;
     }
-    memcpy(name, entry->name, name_length);
-    name[name_length] = '\0';
-    *inode = entry->inode;
-    *type = dirent_type_from_ext4(entry->inode_type);
-    return 1;
 }
 
 struct kernel_vfs_node *kernel_vfs_file_node(
