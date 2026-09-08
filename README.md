@@ -1,6 +1,8 @@
 # BoarOS
 
-<img src="assets/logo-concept.png" alt="BoarOS 正面野猪 Logo" width="180">
+<p align="center">
+  <img src="assets/boaros_header.png" alt="BoarOS 吉祥物与字标" width="100%">
+</p>
 
 BoarOS 是一个从零搭建、面向 OS Comp 能力建设，并以兼容 Linux 用户态 ABI 为最终功能目标的 C 语言（少量 Asm）内核。当前兼容子集以本文和模块文档列出的已验证能力为准。
 
