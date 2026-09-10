@@ -45,12 +45,6 @@ SCHEDULER_BOOT_TEST_KERNEL_RV := \
 	$(BUILD_DIR)/tests/kernel-scheduler-boot-rv
 SYSCALL_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-syscall-rv
 ELF64_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-elf64-rv
-USER_ELF_CASES_TEST_KERNEL_RV := \
-	$(BUILD_DIR)/tests/kernel-user-elf-cases-rv
-USER_ELF_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-user-elf-rv
-USER_ELF_PROGRAM_RV := $(BUILD_DIR)/tests/user/elf-probe-rv
-USER_ELF_FAULT_PROGRAM_RV := $(BUILD_DIR)/tests/user/elf-text-fault-rv
-USER_ELF_GUARD_PROGRAM_RV := $(BUILD_DIR)/tests/user/elf-guard-fault-rv
 ROOT_INIT_PROGRAM_RV := $(BUILD_DIR)/tests/user/root-init-rv
 UACCESS_OOM_PROGRAM_RV := $(BUILD_DIR)/tests/user/uaccess-oom-rv
 ROOT_EXEC_STAGE2_RV := $(BUILD_DIR)/tests/user/root-exec-stage2-rv
@@ -101,6 +95,7 @@ LWEXT4_SOURCES := \
 C_SOURCES := \
 	arch/riscv/context.c \
 	arch/riscv/direct_map.c \
+	arch/riscv/elf_image.c \
 	arch/riscv/exec.c \
 	arch/riscv/mm.c \
 	arch/riscv/root_boot.c \
@@ -109,7 +104,6 @@ C_SOURCES := \
 	arch/riscv/timer.c \
 	arch/riscv/trap.c \
 	arch/riscv/uaccess.c \
-	arch/riscv/user_elf.c \
 	arch/riscv/virt_rtc.c \
 	arch/riscv/virt_uart.c \
 	arch/riscv/virtio_mmio_block.c \
@@ -127,11 +121,13 @@ C_SOURCES := \
 	kernel/block.c \
 	kernel/dtb.c \
 	kernel/elf64.c \
+	kernel/elf64_source.c \
 	kernel/exec.c \
 	kernel/main.c \
 	kernel/pid.c \
 	kernel/physical_page.c \
 	kernel/read_source.c \
+	kernel/random.c \
 	kernel/sched/core.c \
 	kernel/sched/exec.c \
 	kernel/sched/process.c \
@@ -162,6 +158,7 @@ OBJECTS := \
 TEST_RUNTIME_C_SOURCES := \
 	arch/riscv/context.c \
 	arch/riscv/direct_map.c \
+	arch/riscv/elf_image.c \
 	arch/riscv/exec.c \
 	arch/riscv/mm.c \
 	arch/riscv/sbi.c \
@@ -169,7 +166,6 @@ TEST_RUNTIME_C_SOURCES := \
 	arch/riscv/timer.c \
 	arch/riscv/trap.c \
 	arch/riscv/uaccess.c \
-	arch/riscv/user_elf.c \
 	arch/riscv/virt_rtc.c \
 	arch/riscv/virt_uart.c \
 	arch/riscv/virtio_mmio_block.c \
@@ -185,10 +181,12 @@ TEST_RUNTIME_C_SOURCES := \
 	fs/vfs.c \
 	kernel/block.c \
 	kernel/elf64.c \
+	kernel/elf64_source.c \
 	kernel/exec.c \
 	kernel/pid.c \
 	kernel/physical_page.c \
 	kernel/read_source.c \
+	kernel/random.c \
 	kernel/sched/core.c \
 	kernel/sched/exec.c \
 	kernel/sched/process.c \
@@ -370,24 +368,6 @@ ELF64_TEST_C_SOURCES := \
 ELF64_TEST_OBJECTS := \
 	$(TEST_RUNTIME_OBJECTS) \
 	$(patsubst %.c,$(BUILD_DIR)/%.o,$(ELF64_TEST_C_SOURCES))
-USER_ELF_CASES_TEST_C_SOURCES := \
-	tests/riscv/user_elf_cases.c \
-	tests/riscv/user_elf_cases_main.c
-USER_ELF_CASES_TEST_OBJECTS := \
-	$(TEST_RUNTIME_OBJECTS) \
-	$(patsubst %.c,$(BUILD_DIR)/%.o,$(USER_ELF_CASES_TEST_C_SOURCES))
-USER_ELF_TEST_C_SOURCES := tests/riscv/user_elf_boot.c
-USER_ELF_TEST_ASM_SOURCES := tests/riscv/user_elf_images.S
-USER_ELF_TEST_OBJECTS := \
-	$(OBJECTS) \
-	$(patsubst %.c,$(BUILD_DIR)/%.o,$(USER_ELF_TEST_C_SOURCES)) \
-	$(patsubst %.S,$(BUILD_DIR)/%.o,$(USER_ELF_TEST_ASM_SOURCES))
-USER_ELF_PROGRAM_OBJECT_RV := \
-	$(BUILD_DIR)/tests/user/user_elf_program.o
-USER_ELF_FAULT_PROGRAM_OBJECT_RV := \
-	$(BUILD_DIR)/tests/user/user_elf_fault_program.o
-USER_ELF_GUARD_PROGRAM_OBJECT_RV := \
-	$(BUILD_DIR)/tests/user/user_elf_guard_program.o
 ROOT_INIT_PROGRAM_OBJECT_RV := \
 	$(BUILD_DIR)/tests/user/root_init.o
 UACCESS_OOM_PROGRAM_OBJECT_RV := \
@@ -441,11 +421,6 @@ DEPS := \
 	$(SYSCALL_TEST_OBJECTS:.o=.d) \
 	$(SIGNAL_TEST_OBJECTS:.o=.d) \
 	$(ELF64_TEST_OBJECTS:.o=.d) \
-	$(USER_ELF_CASES_TEST_OBJECTS:.o=.d) \
-	$(USER_ELF_TEST_OBJECTS:.o=.d) \
-	$(USER_ELF_PROGRAM_OBJECT_RV:.o=.d) \
-	$(USER_ELF_FAULT_PROGRAM_OBJECT_RV:.o=.d) \
-	$(USER_ELF_GUARD_PROGRAM_OBJECT_RV:.o=.d) \
 	$(ROOT_INIT_PROGRAM_OBJECT_RV:.o=.d) \
 	$(UACCESS_OOM_PROGRAM_OBJECT_RV:.o=.d) \
 	$(ROOT_EXEC_STAGE2_OBJECT_RV:.o=.d) \
@@ -459,7 +434,7 @@ DEPS := \
 
 .PHONY: all clean debug-riscv references run-riscv test-dtb-riscv \
 	test-context-riscv \
-	test-elf64-riscv test-user-elf-cases-riscv test-user-elf-riscv \
+	test-elf64-riscv \
 	test-root-init-riscv test-demand-page-riscv test-exec-riscv \
 	test-root-boot-cleanup-riscv \
 	test-uaccess-oom-riscv test-icache-riscv \
@@ -468,7 +443,8 @@ DEPS := \
 	test-lwext4-host \
 	test-block-riscv test-heap-riscv test-page-riscv test-vfs-riscv \
 	test-scheduler-cases-riscv test-scheduler-riscv \
-	test-references test-riscv test-sv39-fault-riscv test-sv39-riscv \
+	test-boot-riscv test-references test-riscv \
+	test-sv39-fault-riscv test-sv39-riscv \
 	test-syscall-riscv test-signal-riscv test-timer-riscv test-trap-riscv \
 	test-trap-return-riscv test-user-fatal-riscv test-mm-riscv \
 	test-uaccess-riscv test-user-riscv test-vma-riscv test-brk-riscv \
@@ -666,44 +642,6 @@ $(ELF64_TEST_KERNEL_RV): $(ELF64_TEST_OBJECTS) arch/riscv/linker.ld
 		-Wl,-Map,$(BUILD_DIR)/tests/kernel-elf64-rv.map \
 		-o $@ $(ELF64_TEST_OBJECTS)
 
-$(USER_ELF_CASES_TEST_KERNEL_RV): $(USER_ELF_CASES_TEST_OBJECTS) \
-		arch/riscv/linker.ld
-	$(CC) $(LDFLAGS) -Wl,--wrap=riscv_sv39_user_space_destroy \
-		-Wl,-Map,$(BUILD_DIR)/tests/kernel-user-elf-cases-rv.map \
-		-o $@ $(USER_ELF_CASES_TEST_OBJECTS)
-
-$(USER_ELF_PROGRAM_OBJECT_RV): tests/riscv/user_elf_program.S
-	@mkdir -p $(dir $@)
-	$(CC) $(CPPFLAGS) $(ASFLAGS) -MMD -MP -c $< -o $@
-
-$(USER_ELF_FAULT_PROGRAM_OBJECT_RV): tests/riscv/user_elf_program.S
-	@mkdir -p $(dir $@)
-	$(CC) $(CPPFLAGS) $(ASFLAGS) -DUSER_ELF_TEXT_FAULT \
-		-MMD -MP -c $< -o $@
-
-$(USER_ELF_GUARD_PROGRAM_OBJECT_RV): tests/riscv/user_elf_program.S
-	@mkdir -p $(dir $@)
-	$(CC) $(CPPFLAGS) $(ASFLAGS) -DUSER_ELF_GUARD_FAULT \
-		-MMD -MP -c $< -o $@
-
-$(USER_ELF_PROGRAM_RV): $(USER_ELF_PROGRAM_OBJECT_RV) \
-		tests/riscv/user_elf.ld
-	$(CC) $(ARCH_FLAGS) -nostdlib -nostartfiles -static -no-pie \
-		-T tests/riscv/user_elf.ld -Wl,--build-id=none \
-		-Wl,--gc-sections -o $@ $(USER_ELF_PROGRAM_OBJECT_RV)
-
-$(USER_ELF_FAULT_PROGRAM_RV): $(USER_ELF_FAULT_PROGRAM_OBJECT_RV) \
-		tests/riscv/user_elf.ld
-	$(CC) $(ARCH_FLAGS) -nostdlib -nostartfiles -static -no-pie \
-		-T tests/riscv/user_elf.ld -Wl,--build-id=none \
-		-Wl,--gc-sections -o $@ $(USER_ELF_FAULT_PROGRAM_OBJECT_RV)
-
-$(USER_ELF_GUARD_PROGRAM_RV): $(USER_ELF_GUARD_PROGRAM_OBJECT_RV) \
-		tests/riscv/user_elf.ld
-	$(CC) $(ARCH_FLAGS) -nostdlib -nostartfiles -static -no-pie \
-		-T tests/riscv/user_elf.ld -Wl,--build-id=none \
-		-Wl,--gc-sections -o $@ $(USER_ELF_GUARD_PROGRAM_OBJECT_RV)
-
 $(ROOT_INIT_PROGRAM_OBJECT_RV): tests/riscv/root_init.S
 	@mkdir -p $(dir $@)
 	$(CC) $(CPPFLAGS) $(ASFLAGS) -MMD -MP -c $< -o $@
@@ -778,21 +716,6 @@ $(ROOT_BOOT_CLEANUP_TEST_KERNEL_RV): $(OBJECTS) \
 		-Wl,-Map,$(BUILD_DIR)/tests/kernel-root-boot-cleanup-rv.map \
 		-o $@ $(OBJECTS) $(ROOT_BOOT_CLEANUP_TEST_OBJECT_RV)
 
-$(BUILD_DIR)/tests/riscv/user_elf_images.o: \
-		tests/riscv/user_elf_images.S \
-		$(USER_ELF_PROGRAM_RV) $(USER_ELF_FAULT_PROGRAM_RV) \
-		$(USER_ELF_GUARD_PROGRAM_RV)
-	@mkdir -p $(dir $@)
-	$(CC) $(CPPFLAGS) $(ASFLAGS) -MMD -MP -c $< -o $@
-
-$(USER_ELF_TEST_KERNEL_RV): $(USER_ELF_TEST_OBJECTS) arch/riscv/linker.ld
-	$(CC) $(LDFLAGS) -Wl,--wrap=riscv_sv39_activate \
-		-Wl,--wrap=kernel_scheduler_init \
-		-Wl,--wrap=kernel_scheduler_reap_one \
-		-Wl,--wrap=kernel_tick_advance \
-		-Wl,-Map,$(BUILD_DIR)/tests/kernel-user-elf-rv.map \
-		-o $@ $(USER_ELF_TEST_OBJECTS)
-
 $(USER_TEST_KERNEL_RV): $(USER_TEST_OBJECTS) arch/riscv/linker.ld
 	$(CC) $(LDFLAGS) -Wl,--wrap=riscv_sv39_activate \
 		-Wl,--wrap=kernel_scheduler_init \
@@ -838,154 +761,19 @@ debug-riscv: $(KERNEL_RV)
 	$(QEMU_RISCV64) -machine virt -bios default -kernel $< \
 		-m $(QEMU_MEMORY) -smp 1 -nographic -no-reboot -S -s
 
-test-riscv: $(DTB_TEST_KERNEL_RV) $(PAGE_TEST_KERNEL_RV) \
-	$(HEAP_TEST_KERNEL_RV) \
-	$(BLOCK_TEST_KERNEL_RV) \
-	$(VFS_TEST_KERNEL_RV) \
-	$(VFS_RECOVERY_TEST_KERNEL_RV) \
-	$(FILES_TEST_KERNEL_RV) \
-	$(CONTEXT_TEST_KERNEL_RV) $(SCHEDULER_CASES_TEST_KERNEL_RV) \
-	$(SCHEDULER_BOOT_TEST_KERNEL_RV) \
-	$(SYSCALL_TEST_KERNEL_RV) $(SIGNAL_TEST_KERNEL_RV) \
-	$(ELF64_TEST_KERNEL_RV) \
-	$(USER_ELF_CASES_TEST_KERNEL_RV) $(USER_ELF_TEST_KERNEL_RV) \
-	$(USER_TEST_KERNEL_RV) $(USER_FATAL_TEST_KERNEL_RV) \
-	$(MM_TEST_KERNEL_RV) $(UACCESS_TEST_KERNEL_RV) \
-	$(VMA_TEST_KERNEL_RV) \
-	$(SV39_TEST_KERNEL_RV) $(SV39_FAULT_TEST_KERNEL_RV) \
-	$(TRAP_RETURN_TEST_KERNEL_RV) $(TRAP_RETURN_SIE_TEST_KERNEL_RV) \
-	$(HIGH_HALF_TRAP_TEST_KERNEL_RV) $(NO_IDENTITY_TEST_KERNEL_RV) \
-	$(TIMER_CASES_TEST_KERNEL_RV) $(TIMER_BOOT_TEST_KERNEL_RV) \
-	$(ROOT_INIT_PROGRAM_RV) \
-	$(UACCESS_OOM_PROGRAM_RV) \
-	$(ROOT_EXEC_STAGE2_RV) $(ROOT_EXEC_STAGE3_RV) \
-	$(ROOT_EXEC_STAGE3_OOM_RV) $(DEMAND_PAGE_OOM_TEST_KERNEL_RV) \
-	$(EXEC_CLEANUP_TEST_KERNEL_RV) \
-	$(ROOT_BOOT_CLEANUP_TEST_KERNEL_RV) \
-	$(KERNEL_RV)
-	QEMU_RISCV64=$(QEMU_RISCV64) \
-		DTB_TEST_KERNEL_RV=$(DTB_TEST_KERNEL_RV) ./tests/dtb-riscv.sh
-	QEMU_RISCV64=$(QEMU_RISCV64) \
-		PAGE_TEST_KERNEL_RV=$(PAGE_TEST_KERNEL_RV) ./tests/page-riscv.sh
-	QEMU_RISCV64=$(QEMU_RISCV64) \
-		HEAP_TEST_KERNEL_RV=$(HEAP_TEST_KERNEL_RV) ./tests/heap-riscv.sh
-	QEMU_RISCV64=$(QEMU_RISCV64) \
-		BLOCK_TEST_KERNEL_RV=$(BLOCK_TEST_KERNEL_RV) ./tests/block-riscv.sh
-	QEMU_RISCV64=$(QEMU_RISCV64) \
-		VFS_TEST_KERNEL_RV=$(VFS_TEST_KERNEL_RV) \
-		VFS_RECOVERY_TEST_KERNEL_RV=$(VFS_RECOVERY_TEST_KERNEL_RV) \
-		./tests/vfs-riscv.sh
-	QEMU_RISCV64=$(QEMU_RISCV64) \
-		FILES_TEST_KERNEL_RV=$(FILES_TEST_KERNEL_RV) \
-		./tests/files-riscv.sh
-	QEMU_RISCV64=$(QEMU_RISCV64) OBJDUMP_RV=$(OBJDUMP) \
-		CONTEXT_TEST_KERNEL_RV=$(CONTEXT_TEST_KERNEL_RV) \
-		CONTEXT_OBJECT_RV=$(BUILD_DIR)/arch/riscv/context_switch.o \
-		./tests/context-riscv.sh
-	QEMU_RISCV64=$(QEMU_RISCV64) \
-		SCHEDULER_CASES_TEST_KERNEL_RV=$(SCHEDULER_CASES_TEST_KERNEL_RV) \
-		./tests/scheduler-cases-riscv.sh
-	QEMU_RISCV64=$(QEMU_RISCV64) OBJDUMP_RV=$(OBJDUMP) \
-		SCHEDULER_BOOT_TEST_KERNEL_RV=$(SCHEDULER_BOOT_TEST_KERNEL_RV) \
-		SCHEDULER_OBJECT_RV=$(BUILD_DIR)/kernel/sched/core.o \
-		./tests/scheduler-riscv.sh
-	QEMU_RISCV64=$(QEMU_RISCV64) \
-		SYSCALL_TEST_KERNEL_RV=$(SYSCALL_TEST_KERNEL_RV) \
-		./tests/syscall-riscv.sh
-	QEMU_RISCV64=$(QEMU_RISCV64) \
-		SIGNAL_TEST_KERNEL_RV=$(SIGNAL_TEST_KERNEL_RV) \
-		./tests/signal-riscv.sh
-	QEMU_RISCV64=$(QEMU_RISCV64) \
-		ELF64_TEST_KERNEL_RV=$(ELF64_TEST_KERNEL_RV) \
-		./tests/elf64-riscv.sh
-	QEMU_RISCV64=$(QEMU_RISCV64) \
-		USER_ELF_CASES_TEST_KERNEL_RV=$(USER_ELF_CASES_TEST_KERNEL_RV) \
-		./tests/user-elf-cases-riscv.sh
-	QEMU_RISCV64=$(QEMU_RISCV64) READELF_RV=$(READELF) \
-		USER_ELF_TEST_KERNEL_RV=$(USER_ELF_TEST_KERNEL_RV) \
-		USER_ELF_PROGRAM_RV=$(USER_ELF_PROGRAM_RV) \
-		USER_ELF_FAULT_PROGRAM_RV=$(USER_ELF_FAULT_PROGRAM_RV) \
-		USER_ELF_GUARD_PROGRAM_RV=$(USER_ELF_GUARD_PROGRAM_RV) \
-		./tests/user-elf-riscv.sh
-	QEMU_RISCV64=$(QEMU_RISCV64) USER_TEST_KERNEL_RV=$(USER_TEST_KERNEL_RV) \
-		./tests/user-riscv.sh
-	QEMU_RISCV64=$(QEMU_RISCV64) \
-		USER_FATAL_TEST_KERNEL_RV=$(USER_FATAL_TEST_KERNEL_RV) \
-		./tests/user-fatal-riscv.sh
-	QEMU_RISCV64=$(QEMU_RISCV64) \
-		MM_TEST_KERNEL_RV=$(MM_TEST_KERNEL_RV) \
-		./tests/mm-riscv.sh
-	QEMU_RISCV64=$(QEMU_RISCV64) \
-		VMA_TEST_KERNEL_RV=$(VMA_TEST_KERNEL_RV) \
-		./tests/vma-riscv.sh
-	QEMU_RISCV64=$(QEMU_RISCV64) \
-		UACCESS_TEST_KERNEL_RV=$(UACCESS_TEST_KERNEL_RV) \
-		./tests/uaccess-riscv.sh
-	QEMU_RISCV64=$(QEMU_RISCV64) \
-		SV39_TEST_KERNEL_RV=$(SV39_TEST_KERNEL_RV) ./tests/sv39-riscv.sh
-	QEMU_RISCV64=$(QEMU_RISCV64) \
-		SV39_FAULT_TEST_KERNEL_RV=$(SV39_FAULT_TEST_KERNEL_RV) \
-		./tests/sv39-fault-riscv.sh
-	QEMU_RISCV64=$(QEMU_RISCV64) \
-		TRAP_RETURN_TEST_KERNEL_RV=$(TRAP_RETURN_TEST_KERNEL_RV) \
-		TRAP_RETURN_SIE_TEST_KERNEL_RV=$(TRAP_RETURN_SIE_TEST_KERNEL_RV) \
-		OBJDUMP_RV=$(OBJDUMP) \
-		./tests/trap-return-riscv.sh
-	QEMU_RISCV64=$(QEMU_RISCV64) \
-		TIMER_CASES_TEST_KERNEL_RV=$(TIMER_CASES_TEST_KERNEL_RV) \
-		TIMER_BOOT_TEST_KERNEL_RV=$(TIMER_BOOT_TEST_KERNEL_RV) \
-		./tests/timer-riscv.sh
-	QEMU_RISCV64=$(QEMU_RISCV64) NM_RV=$(NM) READELF_RV=$(READELF) \
-		BOOT_TEST_KERNEL_RV=$(TIMER_BOOT_TEST_KERNEL_RV) \
-		./tests/boot-riscv.sh
-	QEMU_RISCV64=$(QEMU_RISCV64) NM_RV=$(NM) \
-		HIGH_HALF_TRAP_TEST_KERNEL_RV=$(HIGH_HALF_TRAP_TEST_KERNEL_RV) \
-		./tests/high-half-trap-riscv.sh
-	QEMU_RISCV64=$(QEMU_RISCV64) \
-		NO_IDENTITY_TEST_KERNEL_RV=$(NO_IDENTITY_TEST_KERNEL_RV) \
-		./tests/no-identity-riscv.sh
-	QEMU_RISCV64=$(QEMU_RISCV64) QEMU_MEMORY=$(QEMU_MEMORY) \
-		KERNEL_RV=$(KERNEL_RV) \
-		ROOT_INIT_PROGRAM_RV=$(ROOT_INIT_PROGRAM_RV) \
-		ROOT_EXEC_STAGE2_RV=$(ROOT_EXEC_STAGE2_RV) \
-		ROOT_EXEC_STAGE3_RV=$(ROOT_EXEC_STAGE3_RV) \
-		./tests/root-init-riscv.sh
-	QEMU_RISCV64=$(QEMU_RISCV64) QEMU_MEMORY=$(QEMU_MEMORY) \
-		VIRTIO_MMIO_FORCE_LEGACY=false \
-		KERNEL_RV=$(KERNEL_RV) \
-		ROOT_INIT_PROGRAM_RV=$(ROOT_INIT_PROGRAM_RV) \
-		ROOT_EXEC_STAGE2_RV=$(ROOT_EXEC_STAGE2_RV) \
-		ROOT_EXEC_STAGE3_RV=$(ROOT_EXEC_STAGE3_RV) \
-		./tests/root-init-riscv.sh
-	QEMU_RISCV64=$(QEMU_RISCV64) QEMU_MEMORY=64M \
-		VIRTIO_MMIO_FORCE_LEGACY=false \
-		KERNEL_RV=$(KERNEL_RV) \
-		ROOT_INIT_PROGRAM_RV=$(UACCESS_OOM_PROGRAM_RV) \
-		ROOT_EXEC_STAGE2_RV=$(ROOT_EXEC_STAGE2_RV) \
-		ROOT_EXEC_STAGE3_RV=$(ROOT_EXEC_STAGE3_RV) \
-		./tests/uaccess-oom-riscv.sh
-	OBJDUMP_RV=$(OBJDUMP) ./tests/icache-riscv.sh
-	QEMU_RISCV64=$(QEMU_RISCV64) QEMU_MEMORY=$(QEMU_MEMORY) \
-		KERNEL_RV=$(DEMAND_PAGE_OOM_TEST_KERNEL_RV) \
-		ROOT_INIT_PROGRAM_RV=$(ROOT_INIT_PROGRAM_RV) \
-		ROOT_EXEC_STAGE2_RV=$(ROOT_EXEC_STAGE2_RV) \
-		ROOT_EXEC_STAGE3_RV=$(ROOT_EXEC_STAGE3_OOM_RV) \
-		./tests/root-init-riscv.sh
-	QEMU_RISCV64=$(QEMU_RISCV64) QEMU_MEMORY=$(QEMU_MEMORY) \
-		KERNEL_RV=$(ROOT_BOOT_CLEANUP_TEST_KERNEL_RV) \
-		ROOT_INIT_PROGRAM_RV=$(ROOT_INIT_PROGRAM_RV) \
-		ROOT_EXEC_STAGE2_RV=$(ROOT_EXEC_STAGE2_RV) \
-		ROOT_EXEC_STAGE3_RV=$(ROOT_EXEC_STAGE3_RV) \
-		ROOT_BOOT_ERROR_STATUS=0x9 \
-		./tests/root-init-riscv.sh
-	QEMU_RISCV64=$(QEMU_RISCV64) QEMU_MEMORY=$(QEMU_MEMORY) \
-		KERNEL_RV=$(EXEC_CLEANUP_TEST_KERNEL_RV) \
-		ROOT_INIT_PROGRAM_RV=$(ROOT_INIT_PROGRAM_RV) \
-		ROOT_EXEC_STAGE2_RV=$(ROOT_EXEC_STAGE2_RV) \
-		ROOT_EXEC_STAGE3_RV=$(ROOT_EXEC_STAGE3_RV) \
-		./tests/root-init-riscv.sh
-	QEMU_RISCV64=$(QEMU_RISCV64) KERNEL_RV=$(KERNEL_RV) \
-		./tests/idle-riscv.sh
+.NOTPARALLEL: test-riscv
+test-riscv: test-dtb-riscv test-page-riscv test-heap-riscv \
+	test-block-riscv test-vfs-riscv test-files-riscv \
+	test-context-riscv test-scheduler-cases-riscv \
+	test-scheduler-riscv test-syscall-riscv test-signal-riscv \
+	test-elf64-riscv test-user-riscv test-user-fatal-riscv \
+	test-mm-riscv test-vma-riscv test-uaccess-riscv \
+	test-sv39-riscv test-sv39-fault-riscv \
+	test-trap-return-riscv test-timer-riscv test-boot-riscv \
+	test-high-half-trap-riscv test-no-identity-riscv \
+	test-root-init-riscv test-uaccess-oom-riscv test-icache-riscv \
+	test-demand-page-riscv test-root-boot-cleanup-riscv \
+	test-exec-riscv test-idle-riscv
 
 test-dtb-riscv: $(DTB_TEST_KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) DTB_TEST_KERNEL_RV=$< \
@@ -1065,7 +853,7 @@ test-userland-riscv: $(REAL_USERLAND_RV) kernel-rv
 		./tests/userland-riscv.sh
 
 test-brk-riscv: test-sv39-riscv test-vma-riscv \
-		test-user-elf-cases-riscv test-syscall-riscv \
+		test-elf64-riscv test-syscall-riscv \
 		test-root-init-riscv
 
 test-mmap-riscv: test-sv39-riscv test-vma-riscv \
@@ -1074,20 +862,6 @@ test-mmap-riscv: test-sv39-riscv test-vma-riscv \
 test-elf64-riscv: $(ELF64_TEST_KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) ELF64_TEST_KERNEL_RV=$< \
 		./tests/elf64-riscv.sh
-
-test-user-elf-cases-riscv: $(USER_ELF_CASES_TEST_KERNEL_RV)
-	QEMU_RISCV64=$(QEMU_RISCV64) USER_ELF_CASES_TEST_KERNEL_RV=$< \
-		./tests/user-elf-cases-riscv.sh
-
-test-user-elf-riscv: $(USER_ELF_TEST_KERNEL_RV) \
-		$(USER_ELF_PROGRAM_RV) $(USER_ELF_FAULT_PROGRAM_RV) \
-		$(USER_ELF_GUARD_PROGRAM_RV)
-	QEMU_RISCV64=$(QEMU_RISCV64) READELF_RV=$(READELF) \
-		USER_ELF_TEST_KERNEL_RV=$(USER_ELF_TEST_KERNEL_RV) \
-		USER_ELF_PROGRAM_RV=$(USER_ELF_PROGRAM_RV) \
-		USER_ELF_FAULT_PROGRAM_RV=$(USER_ELF_FAULT_PROGRAM_RV) \
-		USER_ELF_GUARD_PROGRAM_RV=$(USER_ELF_GUARD_PROGRAM_RV) \
-		./tests/user-elf-riscv.sh
 
 test-root-init-riscv: $(KERNEL_RV) $(ROOT_INIT_PROGRAM_RV) \
 		$(ROOT_EXEC_STAGE2_RV) $(ROOT_EXEC_STAGE3_RV)
@@ -1118,16 +892,10 @@ test-uaccess-oom-riscv: $(KERNEL_RV) $(UACCESS_OOM_PROGRAM_RV) \
 test-icache-riscv: $(KERNEL_RV)
 	OBJDUMP_RV=$(OBJDUMP) ./tests/icache-riscv.sh
 
-test-demand-page-riscv: $(KERNEL_RV) \
+test-demand-page-riscv: test-root-init-riscv \
 		$(DEMAND_PAGE_OOM_TEST_KERNEL_RV) $(ROOT_INIT_PROGRAM_RV) \
 		$(ROOT_EXEC_STAGE2_RV) $(ROOT_EXEC_STAGE3_RV) \
 		$(ROOT_EXEC_STAGE3_OOM_RV)
-	QEMU_RISCV64=$(QEMU_RISCV64) QEMU_MEMORY=$(QEMU_MEMORY) \
-		KERNEL_RV=$(KERNEL_RV) \
-		ROOT_INIT_PROGRAM_RV=$(ROOT_INIT_PROGRAM_RV) \
-		ROOT_EXEC_STAGE2_RV=$(ROOT_EXEC_STAGE2_RV) \
-		ROOT_EXEC_STAGE3_RV=$(ROOT_EXEC_STAGE3_RV) \
-		./tests/root-init-riscv.sh
 	QEMU_RISCV64=$(QEMU_RISCV64) QEMU_MEMORY=$(QEMU_MEMORY) \
 		KERNEL_RV=$(DEMAND_PAGE_OOM_TEST_KERNEL_RV) \
 		ROOT_INIT_PROGRAM_RV=$(ROOT_INIT_PROGRAM_RV) \
@@ -1135,15 +903,9 @@ test-demand-page-riscv: $(KERNEL_RV) \
 		ROOT_EXEC_STAGE3_RV=$(ROOT_EXEC_STAGE3_OOM_RV) \
 		./tests/root-init-riscv.sh
 
-test-exec-riscv: $(KERNEL_RV) $(EXEC_CLEANUP_TEST_KERNEL_RV) \
+test-exec-riscv: test-root-init-riscv $(EXEC_CLEANUP_TEST_KERNEL_RV) \
 		$(ROOT_INIT_PROGRAM_RV) $(ROOT_EXEC_STAGE2_RV) \
 		$(ROOT_EXEC_STAGE3_RV)
-	QEMU_RISCV64=$(QEMU_RISCV64) QEMU_MEMORY=$(QEMU_MEMORY) \
-		KERNEL_RV=$(KERNEL_RV) \
-		ROOT_INIT_PROGRAM_RV=$(ROOT_INIT_PROGRAM_RV) \
-		ROOT_EXEC_STAGE2_RV=$(ROOT_EXEC_STAGE2_RV) \
-		ROOT_EXEC_STAGE3_RV=$(ROOT_EXEC_STAGE3_RV) \
-		./tests/root-init-riscv.sh
 	QEMU_RISCV64=$(QEMU_RISCV64) QEMU_MEMORY=$(QEMU_MEMORY) \
 		KERNEL_RV=$(EXEC_CLEANUP_TEST_KERNEL_RV) \
 		ROOT_INIT_PROGRAM_RV=$(ROOT_INIT_PROGRAM_RV) \
@@ -1195,6 +957,10 @@ test-timer-riscv: $(TIMER_CASES_TEST_KERNEL_RV) \
 	QEMU_RISCV64=$(QEMU_RISCV64) TIMER_CASES_TEST_KERNEL_RV=$< \
 		TIMER_BOOT_TEST_KERNEL_RV=$(TIMER_BOOT_TEST_KERNEL_RV) \
 		./tests/timer-riscv.sh
+
+test-boot-riscv: $(TIMER_BOOT_TEST_KERNEL_RV)
+	QEMU_RISCV64=$(QEMU_RISCV64) NM_RV=$(NM) READELF_RV=$(READELF) \
+		BOOT_TEST_KERNEL_RV=$< ./tests/boot-riscv.sh
 
 test-idle-riscv: $(KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) KERNEL_RV=$< ./tests/idle-riscv.sh

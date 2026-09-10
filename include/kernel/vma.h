@@ -25,6 +25,7 @@ enum kernel_vma_status {
 enum kernel_vma_kind {
     KERNEL_VMA_KIND_ANONYMOUS = 0,
     KERNEL_VMA_KIND_FILE_PRIVATE,
+    KERNEL_VMA_KIND_ELF_PRIVATE,
 };
 
 enum kernel_vma_role {
@@ -40,13 +41,14 @@ enum kernel_vma_fault_policy {
     KERNEL_VMA_FAULT_RESIDENT_REQUIRED = 0,
     KERNEL_VMA_FAULT_DEMAND_ZERO,
     KERNEL_VMA_FAULT_FILE_PRIVATE,
+    KERNEL_VMA_FAULT_ELF,
 };
 
 /* A value copy; callers must not retain backing as a standalone owner. */
 struct kernel_vma {
     uint64_t start;
     uint64_t end;
-    uint64_t file_offset;
+    uint64_t backing_offset;
     uint32_t permissions;
     enum kernel_vma_kind kind;
     enum kernel_vma_role role;

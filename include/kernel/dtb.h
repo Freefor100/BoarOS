@@ -3,6 +3,8 @@
 
 #include <stdint.h>
 
+#define DTB_RNG_SEED_SIZE 32U
+
 #define DTB_MAX_RESERVED_RANGES 16U
 #define DTB_MAX_VIRTIO_MMIO_RANGES 16U
 
@@ -26,6 +28,8 @@ struct dtb_boot_info {
     uint32_t virtio_mmio_count;
     struct dtb_memory_range reserved[DTB_MAX_RESERVED_RANGES];
     struct dtb_memory_range virtio_mmio[DTB_MAX_VIRTIO_MMIO_RANGES];
+    uint8_t rng_seed[DTB_RNG_SEED_SIZE];
+    uint32_t rng_seed_size;
 };
 
 enum dtb_status dtb_read_boot_info(const void *dtb,

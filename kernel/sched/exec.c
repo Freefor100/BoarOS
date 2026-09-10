@@ -56,11 +56,13 @@ enum kernel_scheduler_status kernel_scheduler_exec_commit(void)
     struct kernel_exec_transaction *transaction;
     struct kernel_mm_mapping entry_mapping;
     struct kernel_mm_mapping stack_mapping;
+    struct kernel_vma entry_vma;
     uint64_t new_satp;
     enum kernel_exec_status exec_status;
     enum kernel_files_status files_status;
     enum kernel_mm_status mm_status;
     enum kernel_scheduler_status status;
+    int entry_present = 0;
 
     if (scheduler.initialized != KERNEL_SCHEDULER_INITIALIZED) {
         return KERNEL_SCHEDULER_STATUS_NOT_INITIALIZED;
@@ -93,10 +95,23 @@ enum kernel_scheduler_status kernel_scheduler_exec_commit(void)
     mm_status = kernel_mm_lookup(&transaction->image.mm,
                                  transaction->image.entry,
                                  &entry_mapping);
+    if (mm_status == KERNEL_MM_STATUS_OK) {
+        entry_present = 1;
+    }
+    if (mm_status == KERNEL_MM_STATUS_NOT_MAPPED) {
+        mm_status = kernel_mm_vma_lookup(&transaction->image.mm,
+                                         transaction->image.entry,
+                                         &entry_vma);
+        if (mm_status == KERNEL_MM_STATUS_OK &&
+            (entry_vma.permissions & KERNEL_MM_EXECUTE) != 0U) {
+            mm_status = KERNEL_MM_STATUS_OK;
+        }
+    }
     if (mm_status != KERNEL_MM_STATUS_OK ||
-        (entry_mapping.permissions &
-         (KERNEL_MM_USER | KERNEL_MM_EXECUTE)) !=
-            (KERNEL_MM_USER | KERNEL_MM_EXECUTE)) {
+        (entry_present != 0 &&
+         (entry_mapping.permissions &
+          (KERNEL_MM_USER | KERNEL_MM_EXECUTE)) !=
+             (KERNEL_MM_USER | KERNEL_MM_EXECUTE))) {
         return mm_status == KERNEL_MM_STATUS_ADDRESS_SPACE ||
                        mm_status == KERNEL_MM_STATUS_PAGE_ACCESS
                    ? KERNEL_SCHEDULER_STATUS_ADDRESS_SPACE

@@ -55,7 +55,7 @@ DTB 设备发现
   -> 用户地址空间与 /init
 ```
 
-阶段收口的可观察结果是：QEMU 从真实 raw ext4 磁盘发现块设备，只读挂载根文件系统，通过 VFS 打开 `/init`，按偏移装载静态 ELF 并进入 U-mode，最后沿已有 syscall 与任务回收路径退出。实现可以按物理内存、块设备、文件和进程映像各自的资源生命周期形成审查边界，但独立边界必须具有真实消费者、失败语义和验证证据；只新增未使用 API 不构成阶段能力。
+阶段收口的可观察结果是：QEMU 从真实 raw ext4 磁盘发现块设备，只读挂载根文件系统，通过 VFS 打开 `/init`，一次解析不可变 ELF source，构造 RISC-V `ET_EXEC`/`ET_DYN`/非递归 `PT_INTERP` 映像并按需进入 U-mode；静态真实入口与动态映像构造分别记录证据，最后沿已有 syscall 与任务回收路径退出。实现可以按物理内存、块设备、文件和进程映像各自的资源生命周期形成审查边界，但独立边界必须具有真实消费者、失败语义和验证证据；只新增未使用 API 不构成阶段能力。
 
 ### 内存与块设备边界
 
@@ -75,7 +75,7 @@ RISC-V QEMU `virt` 的驱动同时支持 VirtIO MMIO version 1 legacy 与 versio
 
 初始 VFS 只形成根挂载、打开、按偏移读取、查询大小和关闭这一条真实文件生命周期，足以支持 `/init`，不提前建立没有消费者的完整 fd table、mount namespace 或 dentry cache。lwext4 作为私有 ext4 后端，类型和正值 errno 不得泄漏到通用 VFS、块设备或 ELF 接口；adapter 把它们转换为内核对象生命周期和负 errno。只读实现若发现文件系统需要 journal recovery，必须拒绝挂载，不能在没有 replay/write 能力时静默读取可能不一致的状态。
 
-ELF 装载器从“完整内存 buffer”推广为带总长度的随机访问源 `read_at(offset, dst, len)`。内存后端保留现有聚焦测试，VFS 文件后端成为生产来源。装载时一次读入并校验 ELF header 与有界数量的 program header，再把各 `PT_LOAD` 按页或块直接读入已经解析出的用户页，避免整文件常驻和重复复制；校验顺序仍保证格式、范围、权限或分配失败时不会暴露半初始化的进程映像。
+ELF 装载器从“完整内存 buffer”推广为带总长度的随机访问源 `read_at(offset, dst, len)`。内存后端保留现有聚焦测试，VFS 文件后端成为生产来源。装载时一次读入并缓存 ELF header 与有界数量的 program header，生成按虚拟页排序的 FILE/ZERO/COMPOSITE 区间，再以 `ELF_PRIVATE` VMA 专用缺页路径提供页面：完整文件页借用 page cache 并以 COW 发布，边界页和 BSS 私有化、精确复制并清零；每个 MM 对仍在使用的 source 持有引用。新建可执行页发布前完成地址转换同步和 `FENCE.I`，避免整文件常驻、重复解析和半初始化映像。
 
 ### 过渡桥梁、并发与性能证据
 

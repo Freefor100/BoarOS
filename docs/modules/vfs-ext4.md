@@ -59,4 +59,4 @@ make test-exec-riscv
 make test-root-init-riscv
 ```
 
-宿主测试核对 lwext4 metadata checksum seed。QEMU 测试建立真实 ext4 镜像，验证 `/init` mode、目录预检、随机偏移、EOF、`-ENOENT`、open-file `-EBUSY`、dirty-journal `-EUCLEAN`、缓存 miss/hit/LRU/pin、压力回收、mount purge 和全部页回收。文件资源测试证明不同 fd 与 mmap 共用 node/cache 而保持各自 offset；生产测试既用 VFS read source 装载磁盘中的静态 ELF，也由 PID 1 通过 syscall 读取和私有映射普通文件。
+宿主测试核对 lwext4 metadata checksum seed。QEMU 测试建立真实 ext4 镜像，验证 `/init` mode、目录预检、随机偏移、EOF、`-ENOENT`、open-file `-EBUSY`、dirty-journal `-EUCLEAN`、缓存 miss/hit/LRU/pin、压力回收、mount purge 和全部页回收。文件资源测试证明不同 fd 与 mmap 共用 node/cache 而保持各自 offset；生产测试既用 VFS read source 装载磁盘中的静态 ELF，也由同一 source-backed 入口构造动态形态（动态链接器消费者尚未纳入），并由 PID 1 通过 syscall 读取和私有映射普通文件。

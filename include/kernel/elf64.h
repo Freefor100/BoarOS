@@ -67,6 +67,13 @@ enum kernel_elf64_status kernel_elf64_open(
     const struct kernel_read_source *source,
     struct kernel_elf64_image *image);
 
+/* Parses and validates program headers into caller-owned storage once. */
+enum kernel_elf64_status kernel_elf64_open_cached(
+    const struct kernel_read_source *source,
+    struct kernel_elf64_image *image,
+    struct kernel_elf64_program_header *program_headers,
+    uint16_t program_header_capacity);
+
 enum kernel_elf64_status kernel_elf64_read_program_header(
     const struct kernel_elf64_image *image,
     uint16_t index,

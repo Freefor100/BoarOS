@@ -104,8 +104,7 @@ _start:
     li a7, 214
     ecall
     la t0, __program_break
-    bne a0, t0, .Lfailure
-
+    bltu a0, t0, .Lfailure
 #if ROOT_EXEC_STAGE == 2
     # Leave a non-default exact break behind; stage3 must not inherit it.
     mv t1, a0
@@ -173,7 +172,10 @@ _start:
     # Reserve three heap pages, commit the last, then shrink it away.  The
     # first clone checks independent exact-break state; a later child proves
     # that the released page faults before the parent regrows it as zero.
-    la t0, __program_break
+    li a0, 0
+    li a7, 214
+    ecall
+    mv t0, a0
     la t1, .Lheap_base
     sd t0, 0(t1)
     li t2, 0x2000

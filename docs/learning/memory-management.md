@@ -225,7 +225,7 @@ VMA 存在   + PTE 存在    -> 当前可由硬件翻译
 VMA 不存在 + active PTE 存在 -> 内核错误；撤销必须先让 PTE/TLB 失效再收紧 VMA
 ```
 
-BoarOS 为 VMA 显式记录 fault policy，而不是从 role 猜测行为。静态 `ET_EXEC` 仍急切物化所有 `PT_LOAD` 页并使用 `RESIDENT_REQUIRED`：若这类 VMA 中没有 PTE，说明装载或页表状态不满足契约。栈、`brk` heap 和 private-anonymous mmap 使用 `DEMAND_ZERO`：栈 VMA 覆盖低半区顶端完整 8 MiB reserve，初始 PTE 只覆盖参数栈和 64 KiB headroom；heap VMA 只覆盖当前 program break 向上对齐的范围；mmap 先保留地址区间。只读普通文件的 private mmap 使用 `FILE_PRIVATE`，VMA 保存文件页对齐 offset 并借用由 MM 独立持有的 OFD。其余合法页由真实 U-mode page fault 或当前 MM 的 uaccess 首次访问时提交。reserve 下方一页 guard 没有 VMA，因此不会因“靠近栈”被隐式扩展。
+BoarOS 为 VMA 显式记录 fault policy，而不是从 role 猜测行为。栈、`brk` heap 和 private-anonymous mmap 使用 `DEMAND_ZERO`：栈 VMA 覆盖低半区顶端完整 8 MiB reserve，初始 PTE 只覆盖参数栈和 64 KiB headroom；heap VMA 只覆盖当前 program break 向上对齐的范围；mmap 先保留地址区间。只读普通文件的 private mmap 使用 `FILE_PRIVATE`，VMA 保存文件页对齐 offset 并借用由 MM 独立持有的 OFD。ELF `PT_LOAD` 使用专用 `ELF_PRIVATE`：完整文件页从 page cache 取得并以 COW 发布，文件/BSS 边界页和纯 BSS 页由 fault 路径私有分配、清零和填充；MM 对 source 保留引用。其余合法页由真实 U-mode page fault 或当前 MM 的 uaccess 首次访问时提交。reserve 下方的一页 guard 没有 VMA，因此不会因“靠近栈”被隐式扩展。
 
 一次当前用户任务的页故障按互斥状态分类：
 
@@ -254,11 +254,11 @@ present COW PTE + write fault
 
 demand-zero 把未触碰的栈/heap 页物理内存和清零成本推迟到首次访问，file-private mapping 则把文件 I/O 推迟到首次触页。代价是首次触页需要 trap、VMA 二分查找、软件页表查询、可能的页分配/清零或文件 I/O、PTE 写入和 TLB 失效；驻留后的普通访问仍由硬件翻译，不增加软件热路径。缓存命中的文件读页无需复制，write-first miss 直接构造私有页，避免无用缓存页。当前解析器为确认“确实没有 PTE”先 lookup，再由映射函数走一次叶表路径，属于 cold fault path 的重复遍历；若开发板计数显示缺页延迟重要，可在不改变 VMA/MM 接口的前提下合并 walker，但不能据 QEMU 正确性结果宣称性能收益。
 
-当前 VMA 集合用按起始地址排序的连续数组：查找二分为 `O(log n)`，插入为 `O(n)`，相邻且属性相同的区间合并。对于静态 ELF、栈和少量早期匿名区间，这比树节点、旋转和更多分配更小、更容易验证，且不在当前调度热路径上。真实 `mmap` 工作负载若显示大量频繁插入/删除，才应在保持 VMA 语义不变的前提下换成平衡树或区间树；没有测量不能把“树一定更快”当成结论。
+当前 VMA 集合用按起始地址排序的连续数组：查找二分为 `O(log n)`，插入为 `O(n)`，相邻且属性相同的区间合并。对于 ELF source、栈和少量早期匿名区间，这比树节点、旋转和更多分配更小、更容易验证，且不在当前调度热路径上。真实 `mmap` 工作负载若显示大量频繁插入/删除，才应在保持 VMA 语义不变的前提下换成平衡树或区间树；没有测量不能把“树一定更快”当成结论。
 
 ## mmap、munmap 和 mprotect 怎样协作？
 
-`mmap` 分配的是虚拟地址区间，不等于立刻分配每个物理页。anonymous-private mapping 没有文件 backing；首次读取应看到零，首次写入只影响本进程。普通地址参数只是 hint，内核可以在冲突时另选空洞；`MAP_FIXED_NOREPLACE` 要求精确地址且冲突失败，`MAP_FIXED` 则要求精确地址并破坏性替换旧映射。BoarOS 当前先尝试对齐 hint，再从栈 guard 以下 top-down 选择空洞，不做 ASLR。`MAP_STACK` 暂不改变 VMA 增长模型，`MAP_NORESERVE` 在没有 commit accounting 时与普通匿名映射等价。
+`mmap` 分配的是虚拟地址区间，不等于立刻分配每个物理页。anonymous-private mapping 没有文件 backing；首次读取应看到零，首次写入只影响本进程。普通地址参数只是 hint，内核可以在冲突时另选空洞；`MAP_FIXED_NOREPLACE` 要求精确地址且冲突失败，`MAP_FIXED` 则要求精确地址并破坏性替换旧映射。BoarOS 当前先尝试对齐 hint，再从每个 MM 独立的随机或无种子确定性 mmap ceiling 以下 top-down 选择空洞。`MAP_STACK` 暂不改变 VMA 增长模型，`MAP_NORESERVE` 在没有 commit accounting 时与普通匿名映射等价。
 
 file-private mapping 把页对齐文件 offset 与虚拟区间对应，读页可以和 page cache 共享，写入必须通过 COW 与文件和其他映射隔离。包含 EOF 的尾页先保留有效文件字节并把页内余部补零，下一整个页才产生 `SIGBUS`。fd 是可关闭的进程槽，不能承担映射生命周期；MM 对同一 OFD 只持有一个来源引用，直到最后一个相关 VMA 被 munmap、fixed replace 或 MM 销毁；重复映射不增加历史引用，fork 子 MM 取得自己的一份。
 
@@ -284,7 +284,7 @@ VMA 属于 MM 而不是 task 或单张页表。fork 必须复制其逻辑布局�
 
 program break 是进程数据段高端之后的一个**字节地址**。Linux raw `brk` syscall 返回调整后的 break；若请求不能满足，则返回原值。常见 libc `brk()` 再把这个结果转换成 0/-1 并设置 `errno`，不能把 libc 包装层的返回约定写进内核 syscall ABI。
 
-静态 ELF 的初始 break 应覆盖所有装载段在内存中的末端，因此计算的是最高 `PT_LOAD.p_vaddr + p_memsz`，其中 `p_memsz` 已包含 BSS；program header 不保证按地址排序。BoarOS 把这个最高末端向上按 4 KiB 对齐作为 start/current break，把固定 RX VDSO 起点作为当前上界，VDSO 紧邻 stack guard 并由独立 VMA 保护。当前 break 仍保存用户请求的精确字节值，只有 VMA/PTE 范围使用 `page_end(break)`：同页内调整不需要改页表，跨页增长才增加 VMA，跨页缩小才撤销整页。
+ELF 映像的初始 break 应覆盖所有装载段在内存中的末端，因此计算的是最高 `PT_LOAD.p_vaddr + p_memsz`，其中 `p_memsz` 已包含 BSS；program header 不保证按地址排序。BoarOS 把这个最高末端向上按 4 KiB 对齐并叠加独立随机（或无种子确定性）偏移作为 start/current break，把每 MM 的 mmap ceiling 和随机选择的 RX vDSO 作为增长上界约束，VDSO 由独立 VMA 保护。当前 break 仍保存用户请求的精确字节值，只有 VMA/PTE 范围使用 `page_end(break)`：同页内调整不需要改页表，跨页增长才增加 VMA，跨页缩小才撤销整页。
 
 增长只建立 RW anonymous `DEMAND_ZERO` heap VMA，不立即分配数据页。这样申请一大片地址空间但只访问少量页面时，不会预先消耗所有物理页；代价由首次触页 fault 承担。相邻 heap VMA 属性相同会合并，所以反复小幅增长不会为每次 syscall 保留一个描述符。fork 复制调用时的精确 break、VMA 和已驻留页，父子随后独立调整；exec 则从新 ELF 重新计算，不继承旧 heap 高水位。
 

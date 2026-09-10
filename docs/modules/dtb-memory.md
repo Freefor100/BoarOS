@@ -6,14 +6,14 @@
 
 | 文件 | 当前职责 |
 |---|---|
-| `include/kernel/dtb.h`、`kernel/dtb.c` | 校验 DTB，读取第一段 RAM、DTB 大小、RISC-V timebase、静态保留区和 VirtIO MMIO 范围 |
+| `include/kernel/dtb.h`、`kernel/dtb.c` | 校验 DTB，读取第一段 RAM、DTB 大小、RISC-V timebase、`/chosen/rng-seed`、静态保留区和 VirtIO MMIO 范围 |
 | `include/kernel/boot_memory.h`、`kernel/boot_memory.c` | 规范化保留区并生成字节粒度的可用区间 |
 | `kernel/main.c` | 加入内核与 DTB 占用，输出启动布局诊断 |
 | `tests/riscv/dtb_main.c` | 用合成 DTB 验证格式、状态和输出契约 |
 | `tests/riscv/boot_memory_cases.c` | 验证区间裁剪、排序、合并与相减 |
 | `tests/dtb-riscv.sh`、`tests/boot-riscv.sh` | 运行聚焦测试和真实 QEMU 启动测试 |
 
-`dtb_read_boot_info` 成功时写出第一段非空 RAM、header 的 `total_size`、根节点直属 `/cpus/timebase-frequency`，以及 memory reservation block 和静态 `/reserved-memory/*/reg` 中的非空区间。两种保留区来源合计最多 16 项；超限返回 `DTB_STATUS_UNSUPPORTED`。任何失败都不修改输出。
+`dtb_read_boot_info` 成功时写出第一段非空 RAM、header 的 `total_size`、根节点直属 `/cpus/timebase-frequency`、`/chosen/rng-seed` 的前 32 字节（若存在且长度至少 32），以及 memory reservation block 和静态 `/reserved-memory/*/reg` 中的非空区间。两种保留区来源合计最多 16 项；超限返回 `DTB_STATUS_UNSUPPORTED`。缺少 `rng-seed` 不影响 DTB 成功，调用者据 `rng_seed_size == 0` 选择安全降级；长度不足返回 `DTB_STATUS_UNSUPPORTED`，重复属性返回 `DTB_STATUS_INVALID`。任何失败都不修改输出。
 
 `timebase-frequency` 缺失时字段为零，通用 DTB 读取仍成功；RISC-V timer 启动负责把零频率作为平台缺失错误。属性存在时必须恰为一个非零 32 位 cell，错误长度或重复属性返回 `DTB_STATUS_INVALID`。其他节点中的同名属性不冒充 `/cpus` 值。
 
@@ -27,6 +27,7 @@
 - header 总长度、块顺序与范围、对齐、版本、reservation terminator、结构 token、字符串终止和属性填充都受边界检查。
 - 根节点缺省使用两个 address cell 和一个 size cell；显式值只能是一或二。memory 节点必须位于根节点下，并提供合法的 `device_type = "memory"` 与 `reg`。
 - `timebase-frequency` 是平台提供的原始计数频率；本模块不计算 tick period，也不假设 QEMU 或开发板频率。
+- `/chosen/rng-seed` 是启动期可信熵输入的可选 DTB 属性；本模块只保存至少 32 字节的固定快照，不把时间、地址或常量当作随机种子。随机流初始化和 `AT_RANDOM` 由内核随机模块负责。
 - `/reserved-memory` 必须使用与根节点相同的 cell 数并带空 `ranges`；静态子节点的每个 `reg` tuple 都会保存。动态 `size` 形式和相关节点的 `status` 语义尚未实现，读取器明确返回 unsupported。
 - 布局构建器检查所有 `base + size` 运算，要求内核区间完整位于所选 RAM 中；DTB 或设备树保留区位于 RAM 外的部分会被裁掉。
 - 保留区排序后合并重叠或相邻项，再从 RAM 中相减。结果保持字节粒度，页边界对齐由后续物理页分配器负责。

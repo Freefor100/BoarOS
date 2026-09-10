@@ -5,7 +5,7 @@ set -eu
 project_root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 objdump=${OBJDUMP_RV:-riscv64-unknown-elf-objdump}
 mm_object=${MM_OBJECT_RV:-"$project_root/build/riscv/arch/riscv/mm.o"}
-elf_object=${USER_ELF_OBJECT_RV:-"$project_root/build/riscv/arch/riscv/user_elf.o"}
+elf_object=${ELF_IMAGE_OBJECT_RV:-"$project_root/build/riscv/arch/riscv/elf_image.o"}
 sv39_object=${SV39_OBJECT_RV:-"$project_root/build/riscv/arch/riscv/sv39.o"}
 
 has_fence_i()
@@ -32,7 +32,7 @@ if ! has_fence_i "$mm_object" kernel_mm_resolve_user_fault; then
     echo "demand-populated executable mappings lack fence.i" >&2
     exit 1
 fi
-if ! has_fence_i "$elf_object" riscv_user_elf_load_detailed; then
+if ! has_fence_i "$elf_object" riscv_elf_image_build; then
     echo "loaded executable image lacks fence.i before activation" >&2
     exit 1
 fi

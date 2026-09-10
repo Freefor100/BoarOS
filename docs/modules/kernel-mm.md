@@ -117,7 +117,7 @@ RISC-V 创建先分配并解析记录页，最后才把 LIVE Sv39 空间移入�
 
 ## Program break 与匿名 heap
 
-`kernel_mm_brk_initialize()` 只用于尚未发布、只有一个 owner 且已经启用 VMA 的新映像。它记录页对齐的起始 break、当前精确 break 和页对齐上界；RISC-V 静态 ELF 路径把最高非空 `PT_LOAD` 的 `p_vaddr + p_memsz` 向上对齐作为起点，把固定 VDSO 起点作为上界。每次 exec 因而得到由新 ELF 独立计算的 break，而 fork 复制父进程调用时的精确值。
+`kernel_mm_brk_initialize()` 只用于尚未发布、只有一个 owner 且已经启用 VMA 的新映像。它记录页对齐的起始 break、当前精确 break 和页对齐上界；RISC-V ELF image 把最高非空 `PT_LOAD` 的 `p_vaddr + p_memsz` 向上对齐作为起点，并将独立布局计算出的 mmap ceiling/vDSO 作为约束。每次 exec 因而得到由新 ELF 独立计算的 break，而 fork 复制父进程调用时的精确值。
 
 `kernel_mm_brk()` 实现 raw Linux syscall 所需的返回语义：参数 0 查询当前值；落在起点以下、上界以上、溢出或因 VMA 冲突/metadata OOM 无法增长时，MM 保持不变并把原 break 写入结果，而不是产生负 errno。成功结果保留字节粒度；只有 VMA 和 PTE 操作向上按 4 KiB 对齐。
 
@@ -125,17 +125,19 @@ RISC-V 创建先分配并解析记录页，最后才把 LIVE Sv39 空间移入�
 
 ## 匿名与文件私有映射
 
-`kernel_mm_mmap_anonymous()` 当前实现 anonymous-private demand-zero 映射。非 fixed 请求优先使用空闲的页对齐 hint，否则在固定 VDSO 起点以下、栈 guard 之外 top-down 选址；`FIXED_NOREPLACE` 只检查冲突，`FIXED` 则撤销旧页和 VMA 后替换。长度向上按 4 KiB 对齐，返回地址只在成功时写入。RISC-V 的 W&&!R PTE 编码保留，因此仅写保护被规范化为 RW。
+`kernel_mm_mmap_anonymous()` 当前实现 anonymous-private demand-zero 映射。非 fixed 请求优先使用空闲的页对齐 hint，否则在每个 MM 的随机 mmap ceiling 以下、栈 guard 之外 top-down 选址；`FIXED_NOREPLACE` 只检查冲突，`FIXED` 则撤销旧页和 VMA 后替换。长度向上按 4 KiB 对齐，返回地址只在成功时写入。RISC-V 的 W&&!R PTE 编码保留，因此仅写保护被规范化为 RW。
 
 `kernel_mm_mmap_file_private()` 接收调用者已经 pin 的只读普通文件 OFD、页对齐文件偏移和同一组选址/权限参数。成功时 MM 消耗 pin，失败时仍由调用者持有。MM 对每个不同 OFD 只建一个来源节点，并由该节点持有一份来源引用；重复 mmap 不累积历史引用，VMA backing 借用同一对象。VMA 提交后若来源已存在，只递减一个由调用者刚取得且必然不是末引用的临时 pin，不触发可能失败的底层 close/heap release；新来源则直接转移 pin，因此系统调用不会出现“返回错误但映射已生效”。关闭 fd 不影响映射；fork 为子 MM 建立独立来源节点并取得一份引用。`munmap`/fixed replace 在提交 VMA 后的冷路径扫描并释放已经没有 VMA 使用的来源节点；若底层 close 或堆释放暂时失败，节点保留为可重试 owner。页故障查到 VMA 后直接取得 backing，不在 fault 热路径遍历 fd 表或来源链。
 
 文件 VMA 不预分配数据页。read/execute 首次缺页从挂载页缓存取得共享页并建立 COW PTE；首次写若缓存已命中则复制缓存页，未命中则直接把文件内容读入新私有页，避免先创建缓存页再立即复制。缓存命中的写时 COW 例程自身完成该页的 `SFENCE.VMA`/必要 `FENCE.I`，外层缺页路径不重复刷新；其他新填充页由外层统一刷新。文件最后一页的有效内容之后补零；故障页起点已经不小于文件大小时返回 `BUS_FAULT`。当前只读根不会发生 truncate/writeback 并发，因此映射使用创建时 OFD 持有的稳定 node/size；加入可写文件后必须补充截断、脏页和失效协议。
 
+ELF image 使用独立的 `kernel_elf64_source`，不把 `PT_LOAD` 当作普通 file-private mmap。source 在 exec 时一次解析 program headers，并将页区间规范化为 `ELF_PRIVATE` VMA 的 `backing_offset`。完整文件页可以共享 page cache；文件/BSS 边界页、多个段贡献页和 BSS 页由 fault 路径私有分配、清零并精确填充。source 引用由 MM 记录，重复映射不增加历史引用，fork 子 MM 获取独立引用，最后一个相关 VMA 消失才 release。可执行页发布后执行本地 `SFENCE.VMA` 和必要 `FENCE.I`，覆盖先读后取指。source 的 OFD、run/table metadata 和物理页释放失败保留为可重试 owner。
+
 `kernel_mm_munmap()` 采用 Linux 洞语义：输入范围中没有 VMA 或只覆盖部分 VMA 仍可成功；resident、`PROT_NONE` 和待释放页都由 Sv39 owner 状态处理。`kernel_mm_mprotect()` 要求整个范围无洞覆盖，先准备 VMA 拆分容量，再原地修改已有 PTE 权限，最后提交 metadata；长度 0 对齐地址直接成功。`PROT_NONE` 不释放物理页，恢复权限后仍看到原内容。
 
 ## 硬件用户缺页解析
 
-`kernel_mm_resolve_user_fault()` 的 `access` 必须恰为 READ、WRITE、EXECUTE 之一。RISC-V 后端先检查用户范围、VMA、逻辑权限和现有 PTE；VMA 外地址、`PROT_NONE`/权限冲突和静态 ELF 的 `RESIDENT_REQUIRED` 空洞返回 `NOT_MAPPED`。只有确认需要提交 anonymous/file-private 页或解析 present COW 后，才要求目标 MM 是本 hart 当前 `satp`，从而既不为非法软件访问分配，也能让 uaccess 对合法未驻留页复用同一解析器。
+`kernel_mm_resolve_user_fault()` 的 `access` 必须恰为 READ、WRITE、EXECUTE 之一。RISC-V 后端先检查用户范围、VMA、逻辑权限和现有 PTE；VMA 外地址、`PROT_NONE`/权限冲突和仅驻留策略 VMA 的空洞返回 `NOT_MAPPED`。`ELF_PRIVATE/ELF` VMA 再按 source 区间二分取得 FILE、COMPOSITE 或 ZERO backing；只有确认需要提交 anonymous/file/ELF 页或解析 present COW 后，才要求目标 MM 是本 hart 当前 `satp`，从而既不为非法软件访问分配，也能让 uaccess 对合法未驻留页复用同一解析器。
 
 匿名成功路径按 4 KiB 对齐故障地址，分配并清零一页，以 VMA 的完整 R/W/X 权限建立 U-mode PTE。文件路径则按上述缓存/私有策略取得页面。两者成功后都执行针对该虚拟页、ASID 0 的本地 `SFENCE.VMA`；VMA 带执行权限时还执行本 hart 的 `FENCE.I`，保证新填充的指令字节对后续取指可见。该规则覆盖匿名清零、文件填充和先读后执行的 file-private fault；COW 复制和恢复执行权限的页表路径也各自同步指令缓存。dispatcher 保持 `sepc` 不变，`sret` 后硬件重试原 load/store/fetch。`NOT_MAPPED` 在 Trap 边界终止为 `SIGSEGV(11)`，文件整页越过 EOF 的 `BUS_FAULT` 终止为 `SIGBUS(7)`；uaccess 把二者都转换为 `EFAULT`。物理页耗尽精确返回 `NO_MEMORY`；页已经分配但回滚释放失败返回 `CLEANUP_REQUIRED`；PTE 已存在却仍产生允许权限的页故障、页表损坏或非活动 MM 都是内核状态错误。
 
@@ -181,10 +183,9 @@ make test-brk-riscv
 make test-mmap-riscv
 make test-demand-page-riscv
 make test-user-riscv
-make test-user-elf-riscv
 make test-riscv
 ```
 
 MM 聚焦测试覆盖创建失败原子性、共享引用、移动、COW fork 的父子共享/写隔离/末引用原地恢复、`PROT_NONE` COW 属性，以及页表部分回收、记录页访问/释放失败后的阶段化重试。文件测试覆盖 cache hit/miss、write-first、尾页补零、整页越 EOF、fd 关闭后 fault、fork 后 OFD 来源和最终回收。`test-mmap-riscv` 与真实 ext4 `/init` 从 U-mode 完成匿名/文件私有 mmap、COW、SIGBUS、mprotect/munmap 生命周期。
 
-当前只有 RISC-V 后端；映射仍由 Sv39/4 KiB 用户页实现。普通 clone 使用独立 MM+COW，尚无 `CLONE_VM` 共享进程；匿名映射没有 commit accounting/ASLR，只读普通文件支持 `MAP_PRIVATE`，但尚无 `MAP_SHARED`、写回或 truncate 并发；`brk` 上界目前只由地址布局约束，尚未接入 `RLIMIT_DATA`。文件表和信号处理表不属于 MM，MM 只持有文件映射所需的 OFD 引用。
+当前只有 RISC-V 后端；映射仍由 Sv39/4 KiB 用户页实现。普通 clone 使用独立 MM+COW，尚无 `CLONE_VM` 共享进程；匿名映射和 ELF image 已使用每 MM 的 ASLR mmap ceiling（无可信种子时确定性降级），但没有 commit accounting；只读普通文件支持 `MAP_PRIVATE`，尚无 `MAP_SHARED`、写回或 truncate 并发；`brk` 上界目前只由地址布局约束，尚未接入 `RLIMIT_DATA`。文件表和信号处理表不属于 MM，MM 还持有 ELF source 和普通文件映射所需的引用。

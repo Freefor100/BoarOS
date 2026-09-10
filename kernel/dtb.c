@@ -659,7 +659,7 @@ enum dtb_status dtb_read_boot_info(const void *dtb,
     uint32_t size_cells = 1U;
     uint32_t reserved_address_cells = 0U;
     uint32_t reserved_size_cells = 0U;
-    struct dtb_boot_info result;
+    struct dtb_boot_info result = {0};
     int saw_root = 0;
     int address_cells_seen = 0;
     int size_cells_seen = 0;
@@ -677,6 +677,8 @@ enum dtb_status dtb_read_boot_info(const void *dtb,
     int reserved_reg_seen = 0;
     int reserved_size_seen = 0;
     int cpus_node = 0;
+    int chosen_node = 0;
+    int rng_seed_seen = 0;
     int timebase_frequency_seen = 0;
 
     if (blob == NULL || info == NULL) {
@@ -719,9 +721,7 @@ enum dtb_status dtb_read_boot_info(const void *dtb,
     }
 
     result.dtb_size = total_size;
-    result.timebase_frequency = 0U;
-    result.reserved_count = 0U;
-    result.virtio_mmio_count = 0U;
+    result.rng_seed_size = 0U;
     reserve_position = reserve_offset;
     for (;;) {
         if (reserve_position > structure_offset ||
@@ -786,6 +786,7 @@ enum dtb_status dtb_read_boot_info(const void *dtb,
 
             if (depth == 2U) {
                 cpus_node = bytes_equal_string(name, name_length, "cpus");
+                chosen_node = bytes_equal_string(name, name_length, "chosen");
                 memory_name = classify_memory_node_name(name, name_length);
                 if (memory_name < 0) {
                     return DTB_STATUS_INVALID;
@@ -871,6 +872,7 @@ enum dtb_status dtb_read_boot_info(const void *dtb,
 
             if (depth == 2U) {
                 cpus_node = 0;
+                chosen_node = 0;
             }
 
             if (property_depth == depth) {
@@ -927,6 +929,23 @@ enum dtb_status dtb_read_boot_info(const void *dtb,
                     return DTB_STATUS_INVALID;
                 }
                 timebase_frequency_seen = 1;
+            } else if (depth == 2U && chosen_node &&
+                       bytes_equal_string(name, name_length, "rng-seed")) {
+                uint32_t copy_size;
+
+                if (rng_seed_seen || length < DTB_RNG_SEED_SIZE) {
+                    return length < DTB_RNG_SEED_SIZE
+                               ? DTB_STATUS_UNSUPPORTED
+                               : DTB_STATUS_INVALID;
+                }
+                copy_size = DTB_RNG_SEED_SIZE;
+                for (uint32_t seed_index = 0U;
+                     seed_index < copy_size;
+                     seed_index++) {
+                    result.rng_seed[seed_index] = value[seed_index];
+                }
+                result.rng_seed_size = copy_size;
+                rng_seed_seen = 1;
             } else if (depth == 1U &&
                 bytes_equal_string(name, name_length, "#address-cells")) {
                 if (address_cells_seen || length != 4U) {

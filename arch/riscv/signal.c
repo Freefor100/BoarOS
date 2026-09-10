@@ -2,8 +2,8 @@
 #include <arch/riscv/fpu.h>
 #include <arch/riscv/process.h>
 #include <arch/riscv/trap.h>
-#include <arch/riscv/user_elf.h>
 #include <kernel/errno.h>
+#include <kernel/mm.h>
 #include <kernel/scheduler.h>
 #include <kernel/signal.h>
 #include <kernel/task.h>
@@ -105,6 +105,7 @@ static void riscv_signal_build_frame(
     uint64_t user_sp;
     uint32_t disabled = 2U;
     uint32_t fcsr;
+    uint64_t vdso;
     size_t copied;
 
     if (frame->sp < RISCV_SIGNAL_FRAME_SIZE) {
@@ -137,9 +138,13 @@ static void riscv_signal_build_frame(
             KERNEL_UACCESS_STATUS_OK || copied != sizeof(data.context)) {
         riscv_signal_bad_frame();
     }
+    if (kernel_mm_vdso_address(mm, &vdso) != KERNEL_MM_STATUS_OK ||
+        vdso > UINT64_MAX - 4U) {
+        riscv_signal_bad_frame();
+    }
     frame->sp = user_sp;
     frame->sepc = delivery->handler;
-    frame->ra = RISCV_USER_ELF_VDSO_BASE;
+    frame->ra = vdso;
     frame->a0 = delivery->signal;
     frame->a1 = user_sp;
     frame->a2 = user_sp + RISCV_SIGNAL_INFO_SIZE;

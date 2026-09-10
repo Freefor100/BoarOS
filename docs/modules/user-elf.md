@@ -1,95 +1,77 @@
 # 用户 ELF64 装载模块
 
-本文描述当前有界 ELF64 解析器和 RISC-V 静态用户映像装载器的稳定接口。ELF 结构、装载语义和项目选择的背景见 [ELF 用户程序装载学习总结](../learning/elf-loading.md)。
+本文描述当前 RISC-V 生产 ELF 路径：通用 ELF64 字节解析、不可变来源对象、专用缺页 backing 和 Sv39 映像布局。ELF 的背景知识见[ELF 用户程序装载学习总结](../learning/elf-loading.md)，exec 事务见[进程映像替换模块](kernel-exec.md)。
 
-## 范围与入口
+## 稳定单元
 
-| 文件 | 当前职责 |
+| 文件 | 职责 |
 |---|---|
-| `include/kernel/read_source.h`、`kernel/read_source.c` | 定义有总长度的精确随机读源和内存 adapter |
-| `include/kernel/elf64.h`、`kernel/elf64.c` | 从随机读源解码 ELF64 header/program header，并完成与架构无关的边界检查 |
-| `include/arch/riscv/user_elf.h`、`arch/riscv/user_elf.c` | 校验 RISC-V 静态 `ET_EXEC` 布局，把 `PT_LOAD` 物化到新 Sv39 用户空间、建立栈并登记静态 VMA |
-| `tests/riscv/elf64_cases.c` | 覆盖有界解析、截断、格式、段范围和整数溢出 |
-| `tests/riscv/user_elf_cases.c` | 覆盖架构、权限、地址布局、初始栈边界、共享边界页、回滚和失败所有权 |
-| `tests/riscv/user_elf_program.S`、`user_elf.ld`、`user_elf_boot.c` | 独立链接并实际运行完整静态 ELF，验证数据、BSS、参数栈、RX/guard 故障和回收 |
+| `include/kernel/elf64.h`、`kernel/elf64.c` | 有界 little-endian ELF64 header/program-header 解码；支持调用者提供的 program-header cache |
+| `include/kernel/elf64_source.h`、`kernel/elf64_source.c` | 拥有 executable OFD、一次解析结果和规范化 `PT_LOAD` 区间的引用计数来源 |
+| `include/arch/riscv/elf_image.h`、`arch/riscv/elf_image.c` | Sv39 地址布局、ASLR、初始栈/auxv 和 source-backed VMA 构造 |
+| `kernel/exec.c`、`arch/riscv/exec.c` | `execve` 的路径/解释器事务和架构映像绑定 |
+| `tests/riscv/elf64_cases.c` | 解析边界及 RFC 8439 ChaCha20 已知向量 |
 
-解析接口为：
+解析器入口为：
 
 ```c
 enum kernel_elf64_status kernel_elf64_open(
     const struct kernel_read_source *source,
     struct kernel_elf64_image *image);
 
-enum kernel_elf64_status kernel_elf64_read_program_header(
-    const struct kernel_elf64_image *image,
-    uint16_t index,
-    struct kernel_elf64_program_header *header);
+enum kernel_elf64_status kernel_elf64_open_cached(
+    const struct kernel_read_source *source,
+    struct kernel_elf64_image *image,
+    struct kernel_elf64_program_header *program_headers,
+    uint16_t program_header_capacity);
 ```
 
-`kernel_read_source` 保存 `context`、总长度和 `read_at`；回调返回零必须表示完整填满请求。内存 adapter 和 VFS file adapter 共享这项语义。`kernel_elf64_open()` 借用并复制 source 描述符，不分配，也不把整个文件复制到内核。它分别读取 64 字节 ELF header 与有界的 56 字节 program header，逐字节解码小端整数。成功要求 ELF64、小端、当前 ELF version、标准 header 尺寸、1..128 个 program header，并验证整个表位于 source 范围内。每个 `PT_LOAD` 还必须满足 `p_filesz <= p_memsz`、文件范围完整、虚拟范围不溢出，以及 `p_align` 为 0/1 或二的幂且 `p_vaddr` 与 `p_offset` 同余。底层读取失败返回独立 `IO` 状态且不修改输出。
+`kernel_read_source` 只有 `context`、总长度和精确 `read_at`；回调返回零必须表示整个请求已填满。解析器逐字节解码，不把文件映射成内核整块 buffer。成功要求 ELF64、小端、当前版本、标准 header 大小、1..128 个 program header，且每个 `PT_LOAD` 满足文件范围、`p_filesz <= p_memsz`、虚拟范围不溢出和 `p_align` 同余规则。底层读取失败是独立的 `IO` 状态，输出保持不变。`open_cached` 在一次表扫描中把 program header 写入调用者存储，source 不再为布局/缺页重复读取 header。
 
-解析器不决定 CPU、ELF 类型、用户虚拟地址或 PTE 权限，因此以后 LoongArch 可以复用字节解析，而不复用 Sv39 物化代码。`kernel_elf64_read_program_header()` 仍会重新检查索引、偏移加法和缓冲区边界；调用者不能通过伪造 `kernel_elf64_image` 绕过有界读取。
+## 不可变 ELF source
 
-## RISC-V 装载契约
+`kernel_elf64_source_create()` 接收一个已打开的 regular-file OFD 和当前架构 machine，成功后消费调用者的 OFD owner；失败仍由调用者持有。source 保存 header、program headers、唯一的绝对 `PT_INTERP` 路径和按虚拟页排序、无重叠的 FILE/ZERO/COMPOSITE runs。source 具备 `create/acquire/release` 引用协议；最后一个 release 按 file、解释器字符串、临时边界、run/table allocation 的顺序清理。任一释放失败都会保持 `CLEANUP` owner，可由后续路径重试。
 
-```c
-struct riscv_user_elf_request {
-    struct kernel_read_source source;
-    struct kernel_exec_string executable;
-    const struct kernel_exec_string *arguments;
-    size_t argument_count;
-    const struct kernel_exec_string *environment;
-    size_t environment_count;
-};
+`kernel_elf64_source_page(source, allocator, offset, ...)` 以 source-relative、页对齐 offset 查找区间并二分定位：
 
-enum riscv_user_elf_status riscv_user_elf_load(
-    const struct riscv_user_elf_request *request,
-    struct physical_page_allocator *allocator,
-    const struct riscv_sv39_page_table *kernel_table,
-    struct riscv_sv39_user_space *space,
-    struct riscv_user_elf_entry *entry);
+- 完整文件页从 OFD page cache 借用共享物理页，MM 以 COW PTE 发布；
+- 文件/BSS 边界页或页内多段贡献分配私有页，先清零，再精确读取文件字节；
+- 纯 BSS 页按需分配并保持全零。
 
-enum riscv_user_elf_status riscv_user_elf_register_static_vmas(
-    const struct riscv_user_elf_request *request,
-    struct kernel_mm *mm,
-    struct kernel_heap *heap);
-```
+物理页分配后若解析、读取或立即释放失败，source 保留一个可重试的页 owner；不会让悬空物理页或无 owner 的 PTE 进入系统。缺页 I/O 在 MM 层转为用户 `SIGBUS`，物理耗尽转为用户资源失败；source/OFD/heap 的清理失败不覆盖原始格式或 I/O 结果。
 
-请求中的 source、可执行文件名、参数数组、环境数组和字符串都只在调用期间借用；source 背后的文件或内存必须保持有效。`length` 不含结尾 NUL，装载器不会在返回后保留这些指针。非零数量必须配有数组，每个字符串必须配有字节区间，声明区间内不能含 NUL。零个参数会规范化为一个空的 `argv[0]`。参数、环境、可执行文件名、指针表、auxv 和 16 字节对齐填充合计不得超过 128 KiB；超限返回 `RISCV_USER_ELF_STATUS_ARGUMENT_TOO_LARGE`，并在遍历数组前先限制数量，避免恶意计数驱动越界读取。
+## RISC-V 映像与 ELF 形态
 
-输入映像必须是 RISC-V ELF64 小端 `ET_EXEC`，并且内核页表为 ACTIVE、与分配器一致，输出空间为 EMPTY。当前明确拒绝 `ET_DYN` 以及含 `PT_INTERP`、`PT_DYNAMIC` 或 `PT_TLS` 的映像，不把缺失的动态链接能力伪装成成功。其他不影响静态装载的 program header 可以忽略。
+`riscv_elf_image_build()` 是生产入口。它固定 Sv39/4 KiB，并接受：
 
-每个非空 `PT_LOAD` 的内存范围必须位于 `[0x1000, RISCV_USER_ELF_VDSO_BASE)`，至少有 R/W/X 之一，拒绝 RISC-V 保留的 W&&!R 和 W+X。VDSO 位于 stack guard 上方的固定 RX 页，装载段不能覆盖它。两个段的实际内存字节范围不能重叠；仅页对齐包络相交时允许共享同一 4 KiB 叶子，最终权限为相关段权限并集，但并集仍必须满足 W^X。入口必须按 RISC-V 压缩指令允许的 2 字节边界对齐，并落在可执行段的文件内容范围内，不能指向 BSS 或只因页权限合并而可执行的字节。
+- 非 PIE `ET_EXEC`，有或无解释器；
+- PIE `ET_DYN`，带 `PT_INTERP`；
+- 无解释器的 `ET_DYN`。
 
-装载器先完成请求大小、映像结构和布局预检，再建立临时用户空间。所有装载页先清零；`PT_LOAD` 文件内容按目标页边界分块，解析出用户 PTE 的物理页后让 source 直接填入对应 direct-map 地址。RX text 无需临时放宽权限，没有完整文件中间副本，BSS 和页内空隙仍保持为零。所有段复制完成后、临时空间交给 MM 和 U-mode 之前执行一次 RISC-V `FENCE.I`，确保先写入的指令字节不会停留在本 hart 的取指缓存中。
+主程序和解释器各由 exec 事务持有一个 source；解释器不能递归含 `PT_INTERP`。`PT_DYNAMIC`、`PT_TLS`、GNU RELRO/STACK 等信息保留在 source 中，供动态链接器读取；内核本身当前不执行重定位、加载额外 DSO 或分配 TLS。主文件格式/架构错误返回 `ENOEXEC`；解释器缺失保留路径错误，解释器格式或架构错误返回 `ELIBBAD`。
 
-用户栈占用 Sv39 低半区顶端预留的 8 MiB 虚拟区间 `[RISCV_USER_ELF_STACK_RESERVE_BASE, RISCV_USER_ELF_STACK_TOP)`，其下方 `[RISCV_USER_ELF_STACK_GUARD_BASE, RISCV_USER_ELF_STACK_RESERVE_BASE)` 永久不映射；guard 紧上方的 `[RISCV_USER_ELF_VDSO_BASE, RISCV_USER_ELF_STACK_GUARD_BASE)` 映射一页固定 RX VDSO。初次提交从 `page_start(sp - 64 KiB)` 到栈顶的 RW/NX 页：既覆盖不超过 128 KiB 的已序列化初始栈，也在 SP 下方保留至少 64 KiB 立即可用空间；预留区其余部分由真实 U-mode load/store page fault 按 4 KiB 建立匿名零页。ELF 段不得进入 VDSO、guard 或栈预留区。
+每个 source 的 `PT_LOAD` run 映射成 `ELF_PRIVATE` VMA，VMA 的 `backing_offset` 是 source-relative 起点，故障策略为 `ELF`。完整文件页共享 page cache，写入时 COW；复合页和 BSS 私有化。VMA 与 MM 各保留 source 引用：重复映射不会累积历史引用，fork 的子 MM 取得独立引用，最后一个相关 VMA 消失后释放。每次新建可执行页后先做地址转换失效并执行必要的 `FENCE.I`，覆盖先读后取指的路径。
 
-初始 SP 按 RISC-V psABI 保持 16 字节对齐，并按 Linux 入口形态依次放置 `argc`、`argv[]`、NULL、`envp[]`、NULL、auxv 键值对和高地址字符串。当前 auxv 提供 `AT_PAGESZ=4096`、`AT_PHDR`、`AT_PHENT=56`、`AT_PHNUM`、`AT_BASE=0`、`AT_FLAGS=0`、`AT_ENTRY`、指向请求文件名副本的 `AT_EXECFN` 和 `AT_NULL`；只有完整 program header table 位于某个 `PT_LOAD` 文件范围内时 `AT_PHDR` 才给出其用户虚拟地址，否则为 0。没有伪造尚无可靠来源的 `AT_RANDOM`、HWCAP、身份或平台条目。
+入口必须按 RISC-V IALIGN 2 字节对齐并落在可执行 `PT_LOAD` 的文件字节中，不能落在 BSS 或段间空洞。`AT_PHDR` 只有完整 program-header table 位于某个 `PT_LOAD` 的文件和内存范围内时才给出用户地址；动态/PIE 映像缺少该地址时视为格式错误。
 
-`riscv_user_elf_load()` 成功后，调用者先把 space 移入一个单 owner 的 `kernel_mm`，再调用 `riscv_user_elf_register_static_vmas()`。后者用仍有效的同一 source 重新读取和校验静态 header/layout，创建 VMA 集合，以 `RESIDENT_REQUIRED` 和已经按页合并的最终权限登记匿名 ELF VMA，并核对每个相应 PTE；随后以 RW/`DEMAND_ZERO` 登记完整栈 reserve，guard 仍不登记，并登记固定 RX VDSO VMA。它最后取所有非空 `PT_LOAD` 的最高 `p_vaddr + p_memsz` 并向上按 4 KiB 对齐，初始化新 MM 的 start/current break，VDSO 起点作为当前 heap 上界。当前根启动与 exec 事务都在关闭可执行 VFS file 前执行这一步。登记或 break 初始化失败时调用者只能清理这个新 MM，不能发布它。
+## 地址布局和初始栈
 
-初始 break 来自内存大小 `p_memsz` 而不是文件大小 `p_filesz`，因此已包含 BSS；使用所有 load segment 的最高末端而不是假设 program header 已排序。break 是每个映像的 MM 状态：普通 fork 复制当时的精确值，成功 exec 由新 ELF 重新初始化，旧映像曾经增长的 heap 不会泄漏到新映像。
+DTB `/chosen/rng-seed` 至少 32 字节时，`kernel/random.c` 以 ChaCha20 产生独立布局熵和 16 字节 `AT_RANDOM`；QEMU `virt` 的固定 DTB 输入提供该种子。没有可信种子时仍启动，但使用确定性旧布局并省略 `AT_RANDOM`，不使用时间、地址或常量冒充熵。RISC-V 布局独立随机化 PIE/解释器 bias、mmap top-down base、8 MiB 栈 reserve 顶端、brk 起点和 vDSO 页，并逐项检查对齐、Sv39 上界和 VMA 冲突；无合法空洞返回 `ENOMEM`。
 
-## 所有权与失败语义
+栈 VMA 保留 8 MiB，底部 guard 页永不映射；初次只提交覆盖序列化参数和 64 KiB headroom 的 RW/NX 页，其余页由匿名 demand-zero fault 提交。入口栈按 psABI 16 字节对齐，依次包含 `argc`、`argv[]`、`envp[]`、auxv 和字符串。当前 auxv 提供真实 `AT_PAGESZ`、`AT_PHDR/AT_PHENT/AT_PHNUM`、`AT_BASE`、`AT_FLAGS`、`AT_ENTRY`、`AT_HWCAP=IMAFDC`、`AT_CLKTCK`、固定 root UID/GID、`AT_SECURE=0`、可用时的 `AT_RANDOM`、`AT_EXECFN` 和 `AT_NULL`。
 
-成功时，装载器把完整 LIVE `riscv_sv39_user_space` 移入 `space`，并最后写出入口和 SP；调用者随后用 `riscv_kernel_mm_create()` 把空间移入通用 MM，再把 MM、入口和 SP 交给 `kernel_user_thread_create()`。普通请求、格式、布局、缺页和地址空间失败时，输出保持不变，已分配的临时页会回收。
+映像建立完成后，MM 记录 source-backed VMA、每 MM 的 mmap ceiling、vDSO 地址和从最高 `PT_LOAD` 内存末端得到的 brk 起点。scheduler 在提交点允许入口页尚未驻留，只要求它属于可执行 VMA；第一次取指由专用 ELF fault backing 完成。
 
-Sv39 的零页接口在地址空间内部完成叶子分配、清零、映射和所有权登记。若页已分配但访问与立即释放同时失败，空间进入 `CLEANUP` 并记录这张脱离页表树的页。若装载失败后的地址空间销毁仍不能完成，装载器返回 `RISCV_USER_ELF_STATUS_CLEANUP_REQUIRED`，并把 LIVE 或 CLEANUP 空间移给调用者；调用者必须重试 `riscv_sv39_user_space_destroy()`。`riscv_user_elf_load_detailed()` 还单独输出清理前的映像错误，使 exec 可以保留 `ENOEXEC/E2BIG/ENOMEM/EIO`，而不是让后续清理故障覆盖用户可见原因。这条状态同时覆盖正常树的部分回收与尚未挂入树的单页，错误路径不会丢失页所有权。静态 VMA 登记不转移 source 所有权；它失败后，MM 的 VMA-first cleanup 会释放已创建的部分 metadata。装载器不接管输入 ELF、文件名、参数或环境缓冲区。
+## 所有权和验证
 
-## 验证与限制
+source、临时映像和 MM 的所有权按 exec 事务分层：事务持有创建期 source/OFD，MM 持有 VMA 所需 source 引用，提交成功后事务释放临时 owner。任何失败都先保留原 MM；新 MM 或 source 清理失败进入可重试 owner，不能返回“已清理”而丢失资源。
 
 ```sh
 make test-elf64-riscv
-make test-user-elf-cases-riscv
-make test-user-elf-riscv
-make test-vma-riscv
 make test-demand-page-riscv
-make test-brk-riscv
 make test-exec-riscv
+make test-root-init-riscv
 make test-riscv
 ```
 
-前两项覆盖随机读解析、source I/O 失败、格式与装载错误树，其中装载用例还读取真实用户 PTE 检查 `argc/argv/envp/auxv`、空参数规范化、128 KiB 恰好可接受的边界、8 MiB 预留区、64 KiB 初始余量、永久 guard 和由最高 load 末端计算的初始 break；它还验证静态 ELF VMA 的共享页权限并集、完整栈 reserve 和 guard 孔洞。第三项由 bare-metal 工具链独立链接三个静态 `ET_EXEC`，用 `readelf` 检查 ELF 形态，再通过内存 source 运行；对象检查确认装载器在激活前发出 `FENCE.I`。`test-root-init-riscv` 与 `test-exec-riscv` 则把独立 ELF 写入 ext4，由 VFS source 驱动装载和 VMA 登记；`test-brk-riscv` 还验证连续 exec 会重置 break。
-
-当前支持内存与已打开 VFS 文件的同步随机读；静态 VMA 登记要求 source 在紧随装载后的重新解析期间仍保持稳定，当前只读根与 exec file owner 满足这一条件。用户指针捕获由通用 exec 层完成。只支持 RISC-V 静态 `ET_EXEC` 和 4 KiB 用户页；匿名栈和 `brk` heap 支持 demand-zero，普通文件另有共享页缓存与 private mmap，但 ELF `PT_LOAD` 仍由装载器同步物化，不使用 file-backed demand paging。固定 VDSO 当前只提供 signal return 序列，不是完整 Linux auxv/VDSO 实现。尚无异步 I/O、`ET_DYN`/ASLR、动态解释器、重定位、TLS、完整 Linux auxv 或 LoongArch 物化器。
+真实根启动 fixture 直接验证当前 source-backed 静态入口；动态 ET_DYN/解释器已经进入生产构造路径，但 musl/glibc 的重定位、额外 DSO、TLS 和真实开发板 I-cache/熵源验证仍是后续能力闭环，不把静态 fixture 当作动态能力证据。LoongArch 复用通用 ELF 字节解析，使用自己的 16 KiB/三级页表映像后端。

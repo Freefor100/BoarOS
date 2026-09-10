@@ -33,6 +33,13 @@ enum kernel_open_file_status kernel_open_file_create(
     struct kernel_open_file_description **owner,
     int *linux_result);
 
+enum kernel_open_file_status kernel_open_file_create_executable(
+    struct kernel_heap *heap,
+    struct kernel_vfs_mount *mount,
+    const char *path,
+    struct kernel_open_file_description **owner,
+    int *linux_result);
+
 /* A console description owns no VFS node and never touches the page cache. */
 enum kernel_open_file_status kernel_open_file_create_console(
     struct kernel_heap *heap,

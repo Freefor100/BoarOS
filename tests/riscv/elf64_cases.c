@@ -1,4 +1,5 @@
 #include <kernel/elf64.h>
+#include <kernel/random.h>
 #include <kernel/read_source.h>
 
 #include <stddef.h>
@@ -389,6 +390,38 @@ static unsigned long run_read_source_cases(void)
     return 0U;
 }
 
+static unsigned long run_chacha20_vector_case(void)
+{
+    static const uint8_t expected[64] = {
+        0x10U, 0xf1U, 0xe7U, 0xe4U, 0xd1U, 0x3bU, 0x59U, 0x15U,
+        0x50U, 0x0fU, 0xddU, 0x1fU, 0xa3U, 0x20U, 0x71U, 0xc4U,
+        0xc7U, 0xd1U, 0xf4U, 0xc7U, 0x33U, 0xc0U, 0x68U, 0x03U,
+        0x04U, 0x22U, 0xaaU, 0x9aU, 0xc3U, 0xd4U, 0x6cU, 0x4eU,
+        0xd2U, 0x82U, 0x64U, 0x46U, 0x07U, 0x9fU, 0xaaU, 0x09U,
+        0x14U, 0xc2U, 0xd7U, 0x05U, 0xd9U, 0x8bU, 0x02U, 0xa2U,
+        0xb5U, 0x12U, 0x9cU, 0xd1U, 0xdeU, 0x16U, 0x4eU, 0xb9U,
+        0xcbU, 0xd0U, 0x83U, 0xe8U, 0xa2U, 0x50U, 0x3cU, 0x4eU,
+    };
+    uint8_t key[32];
+    uint8_t nonce[12] = {
+        0x00U, 0x00U, 0x00U, 0x09U, 0x00U, 0x00U,
+        0x00U, 0x4aU, 0x00U, 0x00U, 0x00U, 0x00U,
+    };
+    uint8_t output[64];
+    uint32_t index;
+
+    for (index = 0U; index < sizeof(key); index++) {
+        key[index] = (uint8_t)index;
+    }
+    kernel_random_chacha20_block(key, nonce, 1U, output);
+    for (index = 0U; index < sizeof(output); index++) {
+        if (output[index] != expected[index]) {
+            return 1U;
+        }
+    }
+    return 0U;
+}
+
 unsigned long run_elf64_cases(void)
 {
     unsigned long failures = run_valid_case();
@@ -399,5 +432,6 @@ unsigned long run_elf64_cases(void)
     failures += run_load_segment_cases();
     failures += run_program_header_argument_cases();
     failures += run_read_source_cases();
+    failures += run_chacha20_vector_case();
     return failures;
 }

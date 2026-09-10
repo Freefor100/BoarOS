@@ -1,11 +1,14 @@
 #include "exec_internal.h"
 
 #include <kernel/errno.h>
+#include <kernel/elf64_source.h>
 #include <kernel/exec.h>
 #include <kernel/files.h>
 #include <kernel/fs_context.h>
 #include <kernel/heap.h>
 #include <kernel/mm.h>
+#include <kernel/open_file.h>
+#include <kernel/page.h>
 #include <kernel/task.h>
 #include <kernel/uaccess.h>
 #include <kernel/vfs.h>
@@ -45,7 +48,10 @@ static int transaction_resources_empty(
            transaction->string_bytes == 0 &&
            transaction->arguments == 0 &&
            transaction->environment == 0 &&
-           transaction->executable_file.private_data == 0 &&
+           transaction->executable_file == 0 &&
+           transaction->interpreter_file == 0 &&
+           transaction->executable_source == 0 &&
+           transaction->interpreter_source == 0 &&
            image_cleanup_complete(&transaction->image) &&
            mm_owner_absent(&transaction->retired_mm);
 }
@@ -85,9 +91,29 @@ enum kernel_exec_status kernel_exec_transaction_cleanup(
             failed = 1;
         }
     }
-    if (transaction->executable_file.private_data != 0 &&
-        kernel_vfs_close(&transaction->executable_file) != 0) {
-        failed = 1;
+    if (transaction->interpreter_source != 0) {
+        if (kernel_elf64_source_release(&transaction->interpreter_source) !=
+            KERNEL_ELF64_SOURCE_STATUS_OK) {
+            failed = 1;
+        }
+    }
+    if (transaction->executable_source != 0) {
+        if (kernel_elf64_source_release(&transaction->executable_source) !=
+            KERNEL_ELF64_SOURCE_STATUS_OK) {
+            failed = 1;
+        }
+    }
+    if (transaction->interpreter_file != 0) {
+        if (kernel_open_file_release(&transaction->interpreter_file) !=
+            KERNEL_OPEN_FILE_STATUS_OK) {
+            failed = 1;
+        }
+    }
+    if (transaction->executable_file != 0) {
+        if (kernel_open_file_release(&transaction->executable_file) !=
+            KERNEL_OPEN_FILE_STATUS_OK) {
+            failed = 1;
+        }
     }
     if (!release_allocation(transaction,
                             (void **)&transaction->environment)) {
@@ -433,6 +459,8 @@ enum kernel_exec_status kernel_execve_prepare(
     const struct kernel_fs_context *fs;
     struct kernel_exec_transaction *transaction;
     struct kernel_vfs_mount *mount;
+    const char *interpreter_path;
+    size_t interpreter_length;
     struct kernel_exec_image_request image_request;
     size_t filename_length;
     int path_result;
@@ -534,15 +562,111 @@ enum kernel_exec_status kernel_execve_prepare(
                                       path_result,
                                       linux_result);
     }
-    path_result = kernel_vfs_open_executable(
-        mount,
-        transaction->resolved_path,
-        &transaction->executable_file);
+    if (kernel_open_file_create_executable(transaction->heap,
+                                           mount,
+                                           transaction->resolved_path,
+                                           &transaction->executable_file,
+                                           &path_result) !=
+            KERNEL_OPEN_FILE_STATUS_OK) {
+        return finish_prepare_state(task, transaction);
+    }
     if (path_result != 0) {
         return finish_prepare_failure(task,
                                       transaction,
                                       path_result,
                                       linux_result);
+    }
+    {
+        enum kernel_elf64_source_status source_status =
+            kernel_elf64_source_create(transaction->heap,
+                                       &transaction->executable_file,
+                                       BOAROS_PAGE_SIZE,
+                                       KERNEL_ELF64_MACHINE_RISCV,
+                                       &transaction->executable_source);
+
+        if (source_status != KERNEL_ELF64_SOURCE_STATUS_OK) {
+            if (source_status == KERNEL_ELF64_SOURCE_STATUS_NO_MEMORY) {
+                return finish_prepare_failure(task,
+                                              transaction,
+                                              -KERNEL_ENOMEM,
+                                              linux_result);
+            }
+            if (source_status == KERNEL_ELF64_SOURCE_STATUS_IO) {
+                return finish_prepare_failure(task,
+                                              transaction,
+                                              -KERNEL_EIO,
+                                              linux_result);
+            }
+            return finish_prepare_failure(task,
+                                          transaction,
+                                          -KERNEL_ENOEXEC,
+                                          linux_result);
+        }
+    }
+    interpreter_path = kernel_elf64_source_interpreter(
+        transaction->executable_source,
+        &interpreter_length);
+    if (interpreter_path != 0) {
+        if (kernel_fs_context_resolve_kernel_path(
+                fs,
+                KERNEL_FS_AT_FDCWD,
+                interpreter_path,
+                interpreter_length,
+                transaction->resolved_path,
+                KERNEL_FS_PATH_MAX,
+                &mount,
+                &path_result) != KERNEL_FS_CONTEXT_STATUS_OK) {
+            return finish_prepare_state(task, transaction);
+        }
+        if (path_result != 0) {
+            return finish_prepare_failure(task,
+                                          transaction,
+                                          path_result,
+                                          linux_result);
+        }
+        if (kernel_open_file_create_executable(transaction->heap,
+                                               mount,
+                                               transaction->resolved_path,
+                                               &transaction->interpreter_file,
+                                               &path_result) !=
+                KERNEL_OPEN_FILE_STATUS_OK) {
+            return finish_prepare_state(task, transaction);
+        }
+        if (path_result != 0) {
+            return finish_prepare_failure(task,
+                                          transaction,
+                                          path_result,
+                                          linux_result);
+        }
+        {
+            enum kernel_elf64_source_status source_status =
+                kernel_elf64_source_create(transaction->heap,
+                                           &transaction->interpreter_file,
+                                           BOAROS_PAGE_SIZE,
+                                           KERNEL_ELF64_MACHINE_RISCV,
+                                           &transaction->interpreter_source);
+
+            if (source_status != KERNEL_ELF64_SOURCE_STATUS_OK) {
+                int64_t interpreter_error = -KERNEL_ELIBBAD;
+
+                if (source_status == KERNEL_ELF64_SOURCE_STATUS_NO_MEMORY) {
+                    interpreter_error = -KERNEL_ENOMEM;
+                } else if (source_status == KERNEL_ELF64_SOURCE_STATUS_IO) {
+                    interpreter_error = -KERNEL_EIO;
+                }
+                return finish_prepare_failure(task,
+                                              transaction,
+                                              interpreter_error,
+                                              linux_result);
+            }
+            if (kernel_elf64_source_interpreter(transaction->interpreter_source,
+                                                0) != 0) {
+                return finish_prepare_failure(task,
+                                              transaction,
+                                              -KERNEL_ELIBBAD,
+                                              linux_result);
+            }
+        }
     }
     capture_status = capture_vector(transaction,
                                     mm,
@@ -578,13 +702,8 @@ enum kernel_exec_status kernel_execve_prepare(
     resolve_staged_strings(transaction->environment,
                            transaction->environment_count,
                            transaction->string_bytes);
-    if (kernel_vfs_file_read_source(&transaction->executable_file,
-                                    &image_request.source) != 0) {
-        return finish_prepare_failure(task,
-                                      transaction,
-                                      -KERNEL_EIO,
-                                      linux_result);
-    }
+    image_request.executable_source = transaction->executable_source;
+    image_request.interpreter_source = transaction->interpreter_source;
     image_request.executable.bytes = transaction->original_path;
     image_request.executable.length = filename_length;
     image_request.arguments = transaction->arguments;

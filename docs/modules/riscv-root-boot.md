@@ -6,7 +6,7 @@
 
 最终 Sv39、direct map、buddy 和 scheduler 就绪后，`arch/riscv/root_boot.c` 初始化页支持内核堆并为后续 exec 绑定同一物理分配器和内核根表，按 DTB 物理地址顺序选择首个成功初始化的 VirtIO MMIO version 1 legacy 或 version 2 modern virtio-blk，raw whole-disk 只读挂载 ext4，并通过公共 executable-open 检查打开 `/init`。文件必须是 regular 且至少有一个 execute bit；请求使用 `argv[0]="/init"`、`argc=1`、`AT_EXECFN="/init"` 和空环境。
 
-VFS 文件成为精确 `read_at` 源，ELF loader 把静态 RISC-V `ET_EXEC` 的 `PT_LOAD` 直接读入新 Sv39 用户页；空间转入 MM 后，根启动用仍打开的同一 file source 登记 ELF 和完整栈 reserve 的 VMA，随后才关闭启动期 `/init` handle。根启动路径再创建借用根 mount、cwd 为 `/` 的 fs context 和空文件表，与 MM 一起原子转交 scheduler task。生产系统创建的第一个用户线程组得到 TID/TGID 1；完成以上步骤后才启动 timer，因此任务不会在根对象尚未发布时运行。
+VFS 文件成为精确 `read_at` 源，ELF source 一次解析 RISC-V `ET_EXEC`/`ET_DYN` 的 program headers；根启动支持非递归 `PT_INTERP`，将 `PT_LOAD` 登记为专用 source-backed VMA，页面在首次取指或访问时按需物化。随机布局从 DTB `/chosen/rng-seed` 取得可信种子；缺少种子时安全降级为确定性布局并省略 `AT_RANDOM`。根启动路径再创建借用根 mount、cwd 为 `/` 的 fs context 和空文件表，与 MM 一起原子转交 scheduler task。生产系统创建的第一个用户线程组得到 TID/TGID 1；完成以上步骤后才启动 timer，因此任务不会在根对象尚未发布时运行。
 
 未发布对象的失败清理由 `struct riscv_root_boot` 持久保存 file、原始 Sv39 space、MM、files、fs 与设备 owner，而不是留在 `riscv_root_boot_start()` 的栈帧中。首次清理若得到可重试状态，`start()` 返回 `RISCV_ROOT_BOOT_STATUS_CLEANUP` 且 root 进入 `RISCV_ROOT_BOOT_CLEANUP`；`riscv_root_boot_cleanup()` 只重试仍拥有的对象，所有对象、heap 统计和物理页基线都恢复后才进入 `RISCV_ROOT_BOOT_FAILED` 并返回最初的启动错误。生产 `kernel/main.c` 在关机前持续重试这个状态，因此一次 VMA metadata 释放失败不会丢失唯一 MM owner 或被误报为另一种启动错误。
 
@@ -37,4 +37,4 @@ QEMU_MEMORY=16G make test-exec-riscv
 make test-idle-riscv
 ```
 
-fixture 是三个独立链接并写入真实 ext4 的静态 ELF，镜像还包含一个 9000 字节确定性数据文件、不可执行数据文件和可执行的非 ELF 脚本。程序在 U-mode 检查初始栈、errno、exec 与父子生命周期后以状态 42 调用 `exit(93)`。runner 要求 PID 1 身份、父子状态、fd/MM 语义、完整资源基线和 SBI 关机均成立；exec 聚焦入口还用链接器 wrapper 注入一次旧 MM 释放失败。`test-root-boot-cleanup-riscv` 则在 VMA 已登记后注入 fs context 创建失败和第一次 VMA metadata 销毁失败，要求启动路径重试清理、恢复所有资源，并最终报告原始 `RESOURCES` 错误。无盘测试仍要求 timer idle 持续工作。
+fixture 当前仍是三个独立链接并写入真实 ext4 的静态 ELF；生产入口也接受动态形态，但动态运行时消费者尚未纳入该 fixture。镜像还包含一个 9000 字节确定性数据文件、不可执行数据文件和可执行的非 ELF 脚本。程序在 U-mode 检查初始栈、errno、exec 与父子生命周期后以状态 42 调用 `exit(93)`。runner 要求 PID 1 身份、父子状态、fd/MM 语义、完整资源基线和 SBI 关机均成立；exec 聚焦入口还用链接器 wrapper 注入一次旧 MM 释放失败。`test-root-boot-cleanup-riscv` 则在 VMA 已登记后注入 fs context 创建失败和第一次 VMA metadata 销毁失败，要求启动路径重试清理、恢复所有资源，并最终报告原始 `RESOURCES` 错误。无盘测试仍要求 timer idle 持续工作。

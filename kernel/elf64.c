@@ -76,9 +76,11 @@ static enum kernel_elf64_status validate_load_segment(
     return KERNEL_ELF64_STATUS_OK;
 }
 
-enum kernel_elf64_status kernel_elf64_open(
+static enum kernel_elf64_status kernel_elf64_open_internal(
     const struct kernel_read_source *source,
-    struct kernel_elf64_image *image)
+    struct kernel_elf64_image *image,
+    struct kernel_elf64_program_header *cached_headers,
+    uint16_t cached_capacity)
 {
     unsigned char data[ELF64_HEADER_SIZE];
     struct kernel_elf64_image decoded;
@@ -89,6 +91,9 @@ enum kernel_elf64_status kernel_elf64_open(
     enum kernel_elf64_status status;
 
     if (source == 0 || source->read_at == 0 || image == 0) {
+        return KERNEL_ELF64_STATUS_INVALID_ARGUMENT;
+    }
+    if ((cached_headers == 0) != (cached_capacity == 0U)) {
         return KERNEL_ELF64_STATUS_INVALID_ARGUMENT;
     }
     if (source->size < ELF64_HEADER_SIZE) {
@@ -127,6 +132,10 @@ enum kernel_elf64_status kernel_elf64_open(
         KERNEL_ELF64_MAX_PROGRAM_HEADERS) {
         return KERNEL_ELF64_STATUS_UNSUPPORTED;
     }
+    if (cached_headers != 0 &&
+        cached_capacity < decoded.header.program_header_count) {
+        return KERNEL_ELF64_STATUS_INVALID_ARGUMENT;
+    }
     if (decoded.header.program_header_offset < ELF64_HEADER_SIZE) {
         return KERNEL_ELF64_STATUS_MALFORMED;
     }
@@ -154,6 +163,9 @@ enum kernel_elf64_status kernel_elf64_open(
             return KERNEL_ELF64_STATUS_IO;
         }
         decode_program_header(data, &program_header);
+        if (cached_headers != 0) {
+            cached_headers[index] = program_header;
+        }
         if (program_header.type != KERNEL_ELF64_PROGRAM_LOAD) {
             continue;
         }
@@ -165,6 +177,28 @@ enum kernel_elf64_status kernel_elf64_open(
 
     *image = decoded;
     return KERNEL_ELF64_STATUS_OK;
+}
+
+enum kernel_elf64_status kernel_elf64_open(
+    const struct kernel_read_source *source,
+    struct kernel_elf64_image *image)
+{
+    return kernel_elf64_open_internal(source, image, 0, 0U);
+}
+
+enum kernel_elf64_status kernel_elf64_open_cached(
+    const struct kernel_read_source *source,
+    struct kernel_elf64_image *image,
+    struct kernel_elf64_program_header *program_headers,
+    uint16_t program_header_capacity)
+{
+    if (program_headers == 0 || program_header_capacity == 0U) {
+        return KERNEL_ELF64_STATUS_INVALID_ARGUMENT;
+    }
+    return kernel_elf64_open_internal(source,
+                                      image,
+                                      program_headers,
+                                      program_header_capacity);
 }
 
 enum kernel_elf64_status kernel_elf64_read_program_header(

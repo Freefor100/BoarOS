@@ -4,10 +4,13 @@
 #include <arch/riscv/sv39.h>
 #include <arch/riscv/virtio_mmio_block.h>
 #include <kernel/dtb.h>
+#include <kernel/elf64_source.h>
+#include <kernel/exec_image.h>
 #include <kernel/files.h>
 #include <kernel/fs_context.h>
 #include <kernel/heap.h>
 #include <kernel/mm.h>
+#include <kernel/open_file.h>
 #include <kernel/page_cache.h>
 #include <kernel/physical_page.h>
 #include <kernel/scheduler.h>
@@ -43,9 +46,12 @@ struct riscv_root_boot {
     struct kernel_page_cache page_cache;
     struct riscv_virtio_mmio_block device;
     struct kernel_vfs_mount mount;
-    struct kernel_vfs_file cleanup_file;
-    struct riscv_sv39_user_space cleanup_space;
-    struct kernel_mm cleanup_mm;
+    struct kernel_exec_image cleanup_image;
+    struct kernel_elf64_source *cleanup_executable_source;
+    struct kernel_elf64_source *cleanup_interpreter_source;
+    struct kernel_open_file_description *cleanup_file_owner;
+    struct kernel_open_file_description *cleanup_interpreter_file_owner;
+    char *cleanup_path;
     struct kernel_files cleanup_files;
     struct kernel_fs_context cleanup_fs;
     uint32_t cleanup_device_owned;

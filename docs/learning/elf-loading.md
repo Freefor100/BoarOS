@@ -16,7 +16,7 @@ ELF header 描述整个文件的基本形态，包括位数、端序、机器架
 - 静态与动态描述运行时是否还需要共享库。动态 ELF 通常带 `PT_INTERP`，内核装入指定解释器，由动态链接器继续装入依赖库和执行重定位；静态 ELF 已把所需库链接进文件，不需要解释器。
 - “从哪里读入”描述 I/O 形态。完整内存缓冲区、逐段文件读取和 demand paging 都能装载同一种 ELF，但依赖的文件系统、页缓存和 VM 能力不同。
 
-BoarOS 先用“内存缓冲区中的静态 `ET_EXEC`”验证 ELF 到地址空间的转换，随后把来源收敛为有总长度的精确随机读接口：内存和 VFS 文件提供同一种 `read_at`，program header 小块读取，`PT_LOAD` 按目标页直接读入。这样生产 `/init` 不要求整文件常驻或重复复制，同时没有提前承诺页缓存、动态链接或 demand paging。
+BoarOS 先用“内存缓冲区中的静态 `ET_EXEC`”验证 ELF 到地址空间的转换，随后把来源收敛为有总长度的精确随机读接口：内存和 VFS 文件提供同一种 `read_at`，program header 小块读取，并由不可变 source 缓存一次解析结果。生产映像把 `PT_LOAD` 规范化为按页排序的 FILE、ZERO、COMPOSITE 区间，由专用缺页路径按需从 page cache 或文件生成用户页；这使得解析、文件生命周期和地址空间映射可以分别验证，同时避免整文件常驻和重复解析。
 
 ## `PT_LOAD` 的内存语义
 
@@ -49,13 +49,13 @@ Auxv 的值必须来自真实机制，而不是为了让 libc 继续运行而伪
 
 ## BoarOS 当前选择
 
-通用层只做有界 ELF64 小端字节解析，不引入通用 VM callback 框架。RISC-V 层固定 Sv39/4 KiB，当前只接受静态 `ET_EXEC`，拒绝 `ET_DYN`、`PT_INTERP`、`PT_DYNAMIC` 和 `PT_TLS`；它按页预检 W^X，物化 `PT_LOAD`，并建立 Linux 形态的初始参数栈。栈固定预留低半区顶端 8 MiB，初始参数、指针和对齐合计限制为 128 KiB，初次映射再从 SP 向下多留 64 KiB，其余 reserve 由匿名 demand-zero fault 提交，底部以下保持一页永久 guard。这个拆分让未来 LoongArch64 能复用 ELF 字节解析和栈内容规则，但用 16 KiB/三级页表实现自己的地址布局和页面物化。
+通用层只做有界 ELF64 小端字节解析，不引入通用 VM callback 框架。RISC-V 层固定 Sv39/4 KiB，接受非 PIE `ET_EXEC`、PIE/无解释器 `ET_DYN` 以及非递归 `PT_INTERP`；`PT_DYNAMIC`、`PT_TLS` 和 GNU 扩展元数据保留在 source 中，供尚未实现的动态链接器消费。它按页预检 W^X，建立 `ELF_PRIVATE` VMA，并按 FILE/COW、COMPOSITE 或 ZERO 规则在缺页时物化 `PT_LOAD`。入口要求 2 字节对齐并位于可执行文件字节；栈固定预留低半区顶端 8 MiB，初始参数、指针和对齐合计限制为 128 KiB，初次映射再从 SP 向下多留 64 KiB，其余 reserve 由匿名 demand-zero fault 提交，底部以下保持一页永久 guard。这个拆分让未来 LoongArch64 能复用 ELF 字节解析和栈内容规则，但用 16 KiB/三级页表实现自己的地址布局和页面物化。
 
-当前接口借用一个精确 read source 和带长度的文件名/参数/环境区间，装载结束后不持有文件或内存来源。生产启动把已打开的 ext4 `/init` 转成 source；用户 `execve` 则先打开路径、捕获用户字符串，再调用同一装载器。成功产出独立 LIVE 用户地址空间、入口和 SP，调用者把地址空间移入 MM；当前静态路径随后在 source 仍有效时把 ELF 登记为 `RESIDENT_REQUIRED` 匿名 VMA、把完整栈 reserve 登记为 `DEMAND_ZERO` 匿名 VMA，并用最高 `PT_LOAD` 的内存末端初始化新映像 program break，再由 scheduler 在提交点替换 task 的旧 MM。当前是只读根和受事务持有 executable file，所以重新读取 header/layout 是受限且可验证的桥梁；可写文件或 file-backed demand paging 需要让一次解析得到的 VMA 持有稳定 backing，而不是假设两次读取天然一致。
+当前接口借用一个精确 read source 和带长度的文件名/参数/环境区间。生产启动把已打开的 ext4 `/init` 转成不可变 source；用户 `execve` 则先打开路径、捕获用户字符串，再调用同一装载器。source 由 MM/VMA 持有引用，重复映射不累积历史引用，fork 后子 MM 获得自己的引用；最后一个相关 VMA 消失时释放 source。成功产出独立 LIVE 用户地址空间、入口和 SP，调用者把地址空间移入 MM；scheduler 在提交点替换旧 MM。RISC-V image 同时建立独立随机或无可信种子确定性降级的 PIE/解释器、mmap、brk、栈和 vDSO 布局，并在可用种子时把独立字节放入 `AT_RANDOM`。动态链接器重定位、额外 DSO、TLS 和 `getrandom` 仍不是内核已完成能力。
 
 分配页交给页表之前存在一个需要特别封闭的错误窗口：如果访问该页失败，紧接着释放也失败，那么“调用者持有”与“页表持有”都不成立。BoarOS 把分配、清零、映射和所有权登记收进 Sv39 接口；双重失败时地址空间转为只允许 move/destroy 的 CLEANUP 状态并记录脱离页表树的页。这样所有已分配页始终能从一个可重试对象找到，而不是仅返回状态码。详细装载结果还要与清理结果分开保存，否则一次后续释放失败会掩盖原本应返回给用户的 `ENOEXEC`、`E2BIG` 或 `ENOMEM`。
 
-本地 `oscomp-testsuits` 的 `final-2026` 分支固定提交 `b5ec6ef8497e1818cbdec3b54bb722f036e57972`，其中 BusyBox 和 `ss` 明确静态链接；这证明静态 ELF 路径有直接比赛价值。`pre-2025` 分支固定提交 `8b58dd16d26d30f7c74d48d5832d870d3051b703`，同时组织 musl/glibc 运行库、动态解释器和 DSO 测例；这说明静态装载不是最终兼容边界，后续仍要根据选定比赛分支实现动态链接相关的 `exec`、mmap/TLS 等能力，而不是现在把它们伪装成已支持。
+本地固定版本的 `oscomp-testsuits` 可作为真实用户态输入和回归来源，但不能决定内核实现顺序或语义。静态程序能验证当前 source-backed `ET_EXEC` 入口；动态解释器、DSO 和 TLS 输入只在相应消费者完成后用于验收，不把“能够解析和构造动态映像”表述成动态运行时已经完成。
 
 ## 验证和调试经验
 

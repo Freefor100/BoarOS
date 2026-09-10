@@ -211,6 +211,7 @@ unsigned long run_all_vma_cases(void)
     struct kernel_mm child = {0};
     struct kernel_mm cleanup_mm = {0};
     struct riscv_sv39_user_space detached_cleanup_space = {0};
+    struct kernel_vma_set *elf_vmas = 0;
     struct kernel_vma descriptor;
     struct kernel_mm_mapping mapping;
     struct kernel_heap_statistics statistics;
@@ -282,9 +283,25 @@ unsigned long run_all_vma_cases(void)
                                   VMA_TEST_STACK_END,
                                   KERNEL_MM_READ | KERNEL_MM_WRITE,
                                   KERNEL_VMA_ROLE_STACK,
-                                  KERNEL_VMA_FAULT_DEMAND_ZERO) !=
+            KERNEL_VMA_FAULT_DEMAND_ZERO) !=
             KERNEL_MM_STATUS_OK) {
         return 1U;
+    }
+    if (kernel_vma_set_create(&heap, &elf_vmas) != KERNEL_VMA_STATUS_OK ||
+        kernel_vma_set_insert(elf_vmas,
+                              &(const struct kernel_vma){
+                                  .start = UINT64_C(0x50000),
+                                  .end = UINT64_C(0x52000),
+                                  .backing_offset = 0U,
+                                  .permissions = KERNEL_MM_READ |
+                                                 KERNEL_MM_EXECUTE,
+                                  .kind = KERNEL_VMA_KIND_ELF_PRIVATE,
+                                  .role = KERNEL_VMA_ROLE_ELF,
+                                  .fault_policy = KERNEL_VMA_FAULT_ELF,
+                                  .backing = (void *)(uintptr_t)1U,
+                              }) != KERNEL_VMA_STATUS_OK ||
+        kernel_vma_set_destroy(&elf_vmas) != KERNEL_VMA_STATUS_OK) {
+        return 2U;
     }
     if (kernel_mm_vma_lookup(&parent,
                              VMA_TEST_TEXT_BASE + UINT64_C(0x800),

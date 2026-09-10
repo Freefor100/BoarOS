@@ -8,10 +8,10 @@
 |---|---|
 | `include/kernel/vma.h`、`mm/vma.c` | VMA 描述符、排序集合、查找/选址以及准备—提交式区间编辑 |
 | `include/kernel/mm.h`、`arch/riscv/mm.c` | 匿名/文件私有 `mmap`、`munmap`、`mprotect`、`brk` 和缺页解析 |
-| `arch/riscv/user_elf.c` | 登记已物化的静态 ELF、栈 reserve 与初始 heap 布局 |
+| `arch/riscv/elf_image.c`、`arch/riscv/mm.c` | 登记 source-backed ELF、栈 reserve、随机 mmap ceiling 与初始 heap 布局 |
 | `tests/riscv/vma_cases.c`、`tests/vma-riscv.sh` | 区间语义、失败原子性、fork、缺页与 1/64/1024 VMA 查找基线 |
 
-一个 VMA 用半开区间 `[start, end)`、R/W/X 权限、kind、role、fault policy 和可选 backing 表示一段逻辑有效的用户地址。PTE 只表示其中已经驻留的 4 KiB 页；没有 PTE 不等于没有 VMA。`RESIDENT_REQUIRED` 用于已经物化的静态 ELF，`DEMAND_ZERO` 用于栈、heap 和匿名 mmap，`FILE_PRIVATE` 用 OFD backing 与文件偏移描述按需私有映射。guard 和被 `munmap` 的洞不属于任何 VMA。
+一个 VMA 用半开区间 `[start, end)`、R/W/X 权限、kind、role、fault policy 和可选 backing 表示一段逻辑有效的用户地址。PTE 只表示其中已经驻留的 4 KiB 页；没有 PTE 不等于没有 VMA。`ELF_PRIVATE/ELF` 用不可变 ELF source 和 `backing_offset` 描述专用按需装载，`DEMAND_ZERO` 用于栈、heap 和匿名 mmap，`FILE_PRIVATE` 用 OFD backing 与文件偏移描述普通文件私有映射。guard 和被 `munmap` 的洞不属于任何 VMA。
 
 当前生产 MM 入口除静态登记/查询外还包括：
 
@@ -40,7 +40,7 @@ enum kernel_mm_status kernel_mm_mprotect(
 
 集合是 MM record 通过 kernel heap 拥有的动态排序数组。按地址查找使用二分搜索；插入、拆分、删除和合并可能移动后缀。相邻 VMA 只有在权限、kind、role、fault policy、backing 以及连续文件偏移全部一致时才合并，因而不会跨越缺页策略或资源生命周期边界。
 
-非 fixed mmap 先尝试页对齐 hint；冲突时在 `brk_limit`（当前是固定 VDSO 起点）以下、避开栈 guard 的用户区间内 top-down 查找空洞，不做 ASLR。`MAP_FIXED_NOREPLACE` 在任意重叠时返回冲突且不改输出；`MAP_FIXED` 删除范围内所有旧 VMA/PTE 后放入新的匿名或文件私有映射。固定 VDSO VMA 由装载器登记并受普通用户映射边界保护。RISC-V 不能编码 W&&!R 用户叶子，因此 MM 把仅写请求规范化为 RW；`PROT_NONE` 用零权限 VMA 表示。
+非 fixed mmap 先尝试页对齐 hint；冲突时在每个 MM 的随机 mmap ceiling 以下、避开栈 guard 和 vDSO 的用户区间内 top-down 查找空洞。无可信 DTB 种子时 ceiling 使用确定性布局。`MAP_FIXED_NOREPLACE` 在任意重叠时返回冲突且不改输出；`MAP_FIXED` 删除范围内所有旧 VMA/PTE 后放入新的匿名或文件私有映射。vDSO VMA 由 ELF image 独立选择并受普通用户映射边界保护。RISC-V 不能编码 W&&!R 用户叶子，因此 MM 把仅写请求规范化为 RW；`PROT_NONE` 用零权限 VMA 表示。
 
 排序数组的查找成本为 `O(log n)`，编辑成本最坏为 `O(n)`，内存连续且每个 VMA 不需要独立节点分配。`make test-vma-riscv` 在 QEMU `virt` 单 hart 上预热后分别对 1、64、1024 个间隔 VMA 重复 256 次 lookup，并输出平均 `rdcycle` 读数；脚本只要求三组基线存在，不把 QEMU 周期值当成开发板性能结论。若真实 mmap 密集工作负载显示数组移动或锁持有时间成为瓶颈，可在保持当前 MM 语义的前提下换成平衡树/Maple Tree 类结构。
 
@@ -74,4 +74,4 @@ make test-riscv
 
 聚焦测试覆盖相邻合并、孔洞、冲突、两端拆分、hint/top-down、fixed replace/noreplace、文件 backing/offset 合并边界、`PROT_NONE` 内容保持、W→RW、mprotect 全覆盖、munmap 洞语义、打洞后的 brk、fork COW、retired owner、metadata OOM/cleanup retry 和资源基线。真实 ext4 `/init` ELF 从 U-mode 调用匿名与文件私有 mmap/mprotect/munmap，验证写隔离、EOF/SIGBUS、errno 与最终回收。
 
-当前只实现只读普通文件的 private mapping，没有 shared mapping、写回、`MAP_POPULATE`、内存承诺 accounting、ASLR、VMA 数量上限或 SMP 并发修改。`MAP_STACK` 目前只是兼容性标志，不改变增长方向；`MAP_NORESERVE` 与全局尚无 commit accounting 的当前策略等价。
+当前只实现只读普通文件的 private mapping，没有 shared mapping、写回、`MAP_POPULATE`、内存承诺 accounting、VMA 数量上限或 SMP 并发修改。ELF source-backed demand paging 和 RISC-V Sv39 ASLR 已接入；没有可信种子时按设计降级为确定性布局。`MAP_STACK` 目前只是兼容性标志，不改变增长方向；`MAP_NORESERVE` 与全局尚无 commit accounting 的当前策略等价。

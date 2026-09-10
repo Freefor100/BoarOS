@@ -136,6 +136,16 @@ enum kernel_files_status kernel_files_read(
     uint64_t count,
     int64_t *linux_result);
 
+/* pread64 reads without changing the shared open-file description offset. */
+enum kernel_files_status kernel_files_pread(
+    struct kernel_files *files,
+    struct kernel_mm *mm,
+    int64_t fd,
+    uint64_t user_buffer,
+    uint64_t count,
+    int64_t offset,
+    int64_t *linux_result);
+
 enum kernel_files_status kernel_files_write(
     struct kernel_files *files,
     struct kernel_mm *mm,

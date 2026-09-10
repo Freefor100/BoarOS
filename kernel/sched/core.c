@@ -16,6 +16,7 @@
 #include <kernel/scheduler.h>
 #include <kernel/task.h>
 #include <kernel/uaccess.h>
+#include <kernel/vma.h>
 
 #include <stddef.h>
 #include <stdint.h>
@@ -633,6 +634,7 @@ enum kernel_scheduler_status kernel_user_thread_create(
 {
     struct kernel_mm_mapping entry_mapping;
     struct kernel_mm_mapping stack_mapping;
+    struct kernel_vma entry_vma;
     struct riscv_trap_frame *frame;
     struct kernel_task *thread;
     uint64_t physical_address;
@@ -646,6 +648,7 @@ enum kernel_scheduler_status kernel_user_thread_create(
     kernel_pid_t tid;
     enum kernel_mm_status mm_status;
     enum kernel_scheduler_status status;
+    int entry_present = 0;
 
     if (scheduler.initialized != KERNEL_SCHEDULER_INITIALIZED) {
         return KERNEL_SCHEDULER_STATUS_NOT_INITIALIZED;
@@ -692,9 +695,17 @@ enum kernel_scheduler_status kernel_user_thread_create(
                      : KERNEL_SCHEDULER_STATUS_ADDRESS_SPACE;
         goto restore_interrupts;
     }
-    mm_status = kernel_mm_lookup(mm,
-                                               entry,
-                                               &entry_mapping);
+    mm_status = kernel_mm_lookup(mm, entry, &entry_mapping);
+    if (mm_status == KERNEL_MM_STATUS_OK) {
+        entry_present = 1;
+    }
+    if (mm_status == KERNEL_MM_STATUS_NOT_MAPPED) {
+        mm_status = kernel_mm_vma_lookup(mm, entry, &entry_vma);
+        if (mm_status == KERNEL_MM_STATUS_OK &&
+            (entry_vma.permissions & KERNEL_MM_EXECUTE) != 0U) {
+            mm_status = KERNEL_MM_STATUS_OK;
+        }
+    }
     if (mm_status != KERNEL_MM_STATUS_OK) {
         status = mm_status == KERNEL_MM_STATUS_NOT_MAPPED ||
                          mm_status ==
@@ -703,9 +714,10 @@ enum kernel_scheduler_status kernel_user_thread_create(
                      : KERNEL_SCHEDULER_STATUS_ADDRESS_SPACE;
         goto restore_interrupts;
     }
-    if ((entry_mapping.permissions &
+    if (entry_present != 0 &&
+        (entry_mapping.permissions &
          (KERNEL_MM_USER | KERNEL_MM_EXECUTE)) !=
-        (KERNEL_MM_USER | KERNEL_MM_EXECUTE)) {
+            (KERNEL_MM_USER | KERNEL_MM_EXECUTE)) {
         status = KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
         goto restore_interrupts;
     }

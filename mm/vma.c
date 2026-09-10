@@ -27,22 +27,27 @@ static int vma_valid(const struct kernel_vma *vma)
 {
     if (vma == 0 || vma->start >= vma->end ||
         vma->kind < KERNEL_VMA_KIND_ANONYMOUS ||
-        vma->kind > KERNEL_VMA_KIND_FILE_PRIVATE ||
+        vma->kind > KERNEL_VMA_KIND_ELF_PRIVATE ||
         vma->role < KERNEL_VMA_ROLE_NONE ||
         vma->role > KERNEL_VMA_ROLE_MMAP ||
         vma->fault_policy < KERNEL_VMA_FAULT_RESIDENT_REQUIRED ||
-        vma->fault_policy > KERNEL_VMA_FAULT_FILE_PRIVATE) {
+        vma->fault_policy > KERNEL_VMA_FAULT_ELF) {
         return 0;
     }
     if (vma->kind == KERNEL_VMA_KIND_ANONYMOUS &&
-        (vma->file_offset != 0U || vma->backing != 0 ||
-         vma->fault_policy == KERNEL_VMA_FAULT_FILE_PRIVATE)) {
+        (vma->backing_offset != 0U || vma->backing != 0 ||
+         vma->fault_policy == KERNEL_VMA_FAULT_FILE_PRIVATE ||
+         vma->fault_policy == KERNEL_VMA_FAULT_ELF)) {
         return 0;
     }
-    if (vma->kind == KERNEL_VMA_KIND_FILE_PRIVATE &&
+    if ((vma->kind == KERNEL_VMA_KIND_FILE_PRIVATE &&
         (vma->backing == 0 ||
          vma->fault_policy != KERNEL_VMA_FAULT_FILE_PRIVATE ||
-         vma->file_offset > UINT64_MAX - (vma->end - vma->start))) {
+         vma->backing_offset > UINT64_MAX - (vma->end - vma->start))) ||
+        (vma->kind == KERNEL_VMA_KIND_ELF_PRIVATE &&
+         (vma->backing == 0 ||
+          vma->fault_policy != KERNEL_VMA_FAULT_ELF ||
+          vma->backing_offset > UINT64_MAX - (vma->end - vma->start)))) {
         return 0;
     }
     return 1;
@@ -64,8 +69,8 @@ static int can_merge(const struct kernel_vma *left,
         return 1;
     }
     left_size = left->end - left->start;
-    return left->file_offset <= UINT64_MAX - left_size &&
-           left->file_offset + left_size == right->file_offset;
+    return left->backing_offset <= UINT64_MAX - left_size &&
+           left->backing_offset + left_size == right->backing_offset;
 }
 
 static uint32_t lower_bound(const struct kernel_vma_set *set,
@@ -211,10 +216,10 @@ static enum kernel_vma_status split_at(struct kernel_vma_set *set,
     right = set->entries[index];
     delta = address - right.start;
     if (right.kind != KERNEL_VMA_KIND_ANONYMOUS) {
-        if (right.file_offset > UINT64_MAX - delta) {
+        if (right.backing_offset > UINT64_MAX - delta) {
             return KERNEL_VMA_STATUS_STATE;
         }
-        right.file_offset += delta;
+        right.backing_offset += delta;
     }
     right.start = address;
     set->entries[index].end = address;

@@ -11,6 +11,7 @@
 #include <kernel/dtb.h>
 #include <kernel/page.h>
 #include <kernel/physical_page.h>
+#include <kernel/random.h>
 #include <kernel/scheduler.h>
 #include <kernel/tick.h>
 #include <kernel/time.h>
@@ -628,6 +629,7 @@ void kernel_main(unsigned long hart_id, const void *dtb)
     if (dtb_status != DTB_STATUS_OK) {
         shutdown_for_dtb_error(dtb_status);
     }
+    (void)kernel_random_initialize(info.rng_seed, info.rng_seed_size);
 
     memory_status = boot_memory_build(
         &info,

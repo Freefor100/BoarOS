@@ -72,7 +72,7 @@ _start:
     li a7, 214
     ecall
     la t0, __program_break
-    bne a0, t0, .Lfailure
+    bltu a0, t0, .Lfailure
     mv s11, a0
     li t0, 0x2031
     add a0, s11, t0

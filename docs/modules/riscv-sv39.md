@@ -8,7 +8,7 @@
 |---|---|
 | `include/arch/riscv/direct_map.h`、`arch/riscv/direct_map.c` | 校验并转换 direct-map 中的 PA/VA 范围 |
 | `include/arch/riscv/sv39.h`、`arch/riscv/sv39.c` | 建立启动页表与运行期用户根表、切换 `satp` 并回收用户树 |
-| `include/arch/riscv/user_elf.h`、`arch/riscv/user_elf.c` | 把已校验的静态 ELF `PT_LOAD` 物化为 4 KiB 用户叶子并建立初始栈 |
+| `include/arch/riscv/elf_image.h`、`arch/riscv/elf_image.c` | 把已校验的 `ET_EXEC`/`ET_DYN`/`PT_INTERP` source 变成 Sv39 布局、专用 ELF fault VMA 和初始栈 |
 | `include/kernel/mm.h`、`arch/riscv/mm.c` | 依据活动 MM 的 VMA 策略处理匿名缺页、区间撤销与权限变更 |
 | `arch/riscv/linker.ld`、`include/arch/riscv/memory_layout.h` | 固定高半区 VMA 并导出页对齐的 text、rodata、data 边界 |
 | `kernel/main.c` | 根据 DTB RAM、ELF 边界和 QEMU UART 建立启动地址空间与高半区别名 |
@@ -93,7 +93,7 @@ CLEANUP --move--> MOVED
 
 `riscv_sv39_user_space_fork()` 使用“两阶段子构造—父提交”。它先建立完整子树、逐页 acquire 并记录需要把父可写页转成 COW 的位置；任何分配/acquire 失败只销毁子 owner，父页表保持原样。子空间全部成功后，提交阶段不再分配，只修改父 PTE、更新计数并执行全局本地 `SFENCE.VMA`。这保证普通 fork 的失败原子性，同时把页面内容复制推迟到父或子真正写入时。
 
-RISC-V ELF 装载器是当前用户映射接口的真实调用方。它先完成格式、范围、段重叠和页级 W^X 预检，再逐页分配、清零和映射；两个不重叠的 `PT_LOAD` 落在同一 4 KiB 页时只建立一个叶子，权限取覆盖该页各段的并集。文件内容通过离线填充接口复制后，`p_memsz - p_filesz` 与页内空隙保持为零。RW/NX 用户栈预留 Sv39 低半区顶端 8 MiB，初次只映射覆盖初始参数栈并额外向下留出 64 KiB 的后缀；其余 reserve 在真实 U-mode load/store page fault 时按 4 KiB 分配零页。预留区下方一页永久没有 VMA/PTE，作为边界 guard。
+RISC-V ELF 映像构造器是当前用户映射接口的真实调用方。它先完成格式、范围、段重叠和页级 W^X 预检，再登记 source-backed VMA；完整文件页在首次 fault 时共享 page cache 并以 COW 发布，文件/BSS 边界页和纯 BSS 页按需私有分配、精确填充与清零。RW/NX 用户栈预留 Sv39 低半区顶端 8 MiB，初次只映射覆盖初始参数栈并额外向下留出 64 KiB 的后缀；其余 reserve 在真实 U-mode load/store page fault 时按 4 KiB 分配零页。预留区下方一页永久没有 VMA/PTE，作为边界 guard。
 
 ## 验证
 
@@ -104,8 +104,6 @@ make test-high-half-trap-riscv
 make test-no-identity-riscv
 make test-user-riscv
 make test-user-fatal-riscv
-make test-user-elf-cases-riscv
-make test-user-elf-riscv
 make test-demand-page-riscv
 make test-brk-riscv
 make test-mmap-riscv

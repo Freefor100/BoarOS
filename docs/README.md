@@ -25,7 +25,7 @@
 | [内核 MM 模块](modules/kernel-mm.md) | 跨架构 MM 句柄、RISC-V Sv39 后端、共享引用和可重试回收契约 |
 | [虚拟内存区域（VMA）模块](modules/kernel-vma.md) | 逻辑用户区间、PTE 驻留关系、fork 复制与阶段化回收 |
 | [用户内存访问模块](modules/kernel-uaccess.md) | 用户范围、双向与字符串跨页复制、错误分类、并发与性能边界 |
-| [用户 ELF64 装载模块](modules/user-elf.md) | 有界 ELF64 解析、RISC-V 静态映像物化、权限和失败所有权契约 |
+| [用户 ELF64 装载模块](modules/user-elf.md) | 有界 ELF64 解析、source-backed RISC-V 映像、Sv39 ASLR、权限和失败所有权契约 |
 | [进程映像替换模块](modules/kernel-exec.md) | Linux `execve` 准备事务、提交点、映像替换和 close-on-exec 契约 |
 | [RISC-V 启动学习总结](learning/riscv-boot.md) | 启动知识、BoarOS 的应用方式、平台差异和调试经验 |
 | [RISC-V Trap 学习总结](learning/riscv-traps.md) | Trap CSR、上下文保存、异常返回、中断确认和项目选择 |

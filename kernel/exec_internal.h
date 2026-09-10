@@ -2,8 +2,8 @@
 #define BOAROS_KERNEL_EXEC_INTERNAL_H
 
 #include <kernel/exec_image.h>
+#include <kernel/elf64_source.h>
 #include <kernel/mm.h>
-#include <kernel/vfs.h>
 
 #include <stddef.h>
 #include <stdint.h>
@@ -31,7 +31,11 @@ struct kernel_exec_transaction {
     struct kernel_exec_string *environment;
     size_t environment_count;
     size_t environment_capacity;
-    struct kernel_vfs_file executable_file;
+    /* Until source creation succeeds, these are the retryable OFD owners. */
+    struct kernel_open_file_description *executable_file;
+    struct kernel_open_file_description *interpreter_file;
+    struct kernel_elf64_source *executable_source;
+    struct kernel_elf64_source *interpreter_source;
     struct kernel_exec_image image;
     struct kernel_mm retired_mm;
     enum kernel_exec_transaction_state state;

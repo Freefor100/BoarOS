@@ -33,6 +33,7 @@ enum kernel_syscall_status kernel_syscall_dispatch(
 - `pipe2` 编号为 59，创建一对共享 64 KiB 环形缓冲的 read/write OFD；支持 `O_CLOEXEC` 与 `O_NONBLOCK`，成功返回两个最低可用 fd，表满或资源不足返回准确错误。读写、EOF、`EPIPE`/SIGPIPE 和 FIFO stat 形态见[进程文件资源模块](kernel-files.md)。
 - `dup` 编号 23、`dup3` 编号 24 与 `fcntl` 编号 25 复制或检查描述符；flag 边界、目标替换与 `F_DUPFD*` 搜索规则见[进程文件资源模块](kernel-files.md)。
 - `read` 编号为 63，使用 open file description 的当前 offset 把数据复制到用户缓冲区；返回实际字节数、0 表示 EOF，用户 fault 与部分复制按 Linux read 形态提交。console 描述符的 read 阻塞等待 UART 输入，经 tick 轮询唤醒后整批交付，行为见[进程文件资源模块](kernel-files.md)。
+- `pread64` 编号为 67，按调用者给出的非负 offset 读取 regular file，保留 OFD 当前 offset；用户缓冲区部分 fault 返回已复制前缀。pipe、console 和目录按 Linux 形态返回不可定位错误。
 - `write` 编号 64 与 `writev` 编号 66 作用于 console 和 pipe：console 经架构串口输出，pipe 在 `PIPE_BUF=4096` 内保持单次写原子并按可用空间阻塞或返回 `-EAGAIN`；regular fd 仍按只读根语义返回 `-EBADF`，用户 fault 按前缀保持。console read、pipe read/write 的阻塞语义、`lseek` 编号 62 的 SEEK 形态与目录 cookie、`fstat` 编号 80 与 `newfstatat` 编号 79 的 128 字节 stat 填充、`getdents64` 编号 61 的 linux_dirent64 编码与条目 cookie，均见[进程文件资源模块](kernel-files.md)。
 - `clock_gettime` 编号 113、`clock_getres` 编号 114、`gettimeofday` 编号 169、`clock_nanosleep` 编号 115 与 `nanosleep` 编号 101 构成时间族，语义见[内核时间模块](kernel-time.md)。
 - `sched_yield` 编号 124 在存在 READY 竞争者时把当前任务排到 ready 队尾并切换；无竞争者时立即返回 0。调度失败属于内核不变量破坏，由 Trap 边界 fatal。
@@ -45,7 +46,7 @@ enum kernel_syscall_status kernel_syscall_dispatch(
 - `brk` 编号为 214，通过调用任务的 mutable MM borrow 调整精确 program break。raw syscall 成功返回请求值；参数 0 查询当前值；越过 ELF heap 起点/栈 guard、VMA 冲突、metadata OOM 或待回收页暂时无法释放时返回原 break，不使用负 errno。跨页增长登记 demand-zero heap，缩小撤销越界页；libc 把 raw 返回再包装成自己的 0/-1 接口，不属于内核 ABI。
 - `munmap` 编号为 215，要求页对齐起点和非零长度，长度向上按 4 KiB 对齐；范围包含未映射洞仍成功。越界或未对齐返回 `-EINVAL`。
 - `clone` 编号为 220。当前接受 `flags=SIGCHLD` 的普通进程形态（`child_stack` 可为 0 或自定义子栈）与 `flags=SIGCHLD|CLONE_VM|CLONE_VFORK` 的 vfork 形态；成功时父进程返回子 PID，子进程返回 0。vfork 语义见[内核调度与进程生命周期模块](kernel-scheduler.md)。tid 指针、TLS、`CLONE_VFORK` 无 `CLONE_VM` 及其他组合返回 `-ENOTSUP`，未知 flag 或非 `SIGCHLD` 退出信号返回 `-EINVAL`。
-- `execve` 编号为 221，准备并提交新的静态 RISC-V `ET_EXEC` 映像；成功不返回，失败返回负 Linux errno。路径、参数、提交点和资源保持规则见[进程映像替换模块](kernel-exec.md)。
+- `execve` 编号为 221，准备并提交 RISC-V `ET_EXEC`/`ET_DYN` 映像及非递归 `PT_INTERP` source；成功不返回，失败返回负 Linux errno。路径、解释器、提交点和资源保持规则见[进程映像替换模块](kernel-exec.md)。
 - `mmap` 编号为 222，当前接受 anonymous 或只读普通文件的 `MAP_PRIVATE`，以及任意 `PROT_NONE/R/W/X` 组合。普通 hint、`MAP_FIXED`、`MAP_FIXED_NOREPLACE`、`MAP_STACK` 和 `MAP_NORESERVE` 已实现；fixed-noreplace 冲突返回 `-EEXIST`，地址空间/metadata 不足返回 `-ENOMEM`。文件映射要求有效 fd 和页对齐 offset，成功后由 MM 独立持有 OFD，所以 close fd 不撤销映射；shared 和 `MAP_POPULATE` 返回 `-ENOTSUP`，未知 flag、未对齐 offset 或同时指定两种 fixed 模式返回 `-EINVAL`；anonymous fd 参数按 Linux 语义忽略。
 - `mprotect` 编号为 226，要求页对齐起点，整个非空范围必须已有 VMA；洞返回 `-ENOMEM`。长度 0 成功。`PROT_NONE` 保留 resident 内容，恢复权限后内容仍在；RISC-V 仅写请求被规范化为 RW。
 - `wait4` 编号为 260，支持 Linux pid selector、`WNOHANG`、wait flag 校验与 rusage 输出；普通退出与同步故障产生 Linux 形态 status。无匹配子进程返回 `-ECHILD`，非法 option 返回 `-EINVAL`，status/rusage 用户指针错误返回 `-EFAULT`（回收先行，子进程不可再次 wait）。

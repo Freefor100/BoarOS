@@ -7,6 +7,7 @@
 #include <stdint.h>
 
 struct kernel_open_file_description;
+struct kernel_elf64_source;
 
 #define KERNEL_MM_READ (UINT32_C(1) << 0U)
 #define KERNEL_MM_WRITE (UINT32_C(1) << 1U)
@@ -43,6 +44,7 @@ enum kernel_mm_cleanup_stage {
     KERNEL_MM_CLEANUP_NONE = 0,
     KERNEL_MM_CLEANUP_VMAS,
     KERNEL_MM_CLEANUP_FILE_SOURCES,
+    KERNEL_MM_CLEANUP_ELF_SOURCES,
     KERNEL_MM_CLEANUP_SPACE,
     KERNEL_MM_CLEANUP_RECORD,
 };
@@ -95,6 +97,12 @@ enum kernel_mm_status kernel_mm_vma_insert_anon(
     enum kernel_vma_role role,
     enum kernel_vma_fault_policy fault_policy);
 
+/* Maps normalized PT_LOAD runs and keeps one source reference in this MM. */
+enum kernel_mm_status kernel_mm_map_elf_source(
+    struct kernel_mm *mm,
+    struct kernel_elf64_source *source,
+    uint64_t load_bias);
+
 /* Returns NOT_MAPPED for a valid address outside all VMAs. */
 enum kernel_mm_status kernel_mm_vma_lookup(
     const struct kernel_mm *mm,
@@ -106,6 +114,19 @@ enum kernel_mm_status kernel_mm_brk_initialize(
     struct kernel_mm *mm,
     uint64_t start,
     uint64_t limit);
+
+/* Non-fixed mmap uses this per-MM top-down ceiling. */
+enum kernel_mm_status kernel_mm_mmap_base_initialize(
+    struct kernel_mm *mm,
+    uint64_t base);
+
+enum kernel_mm_status kernel_mm_vdso_set_address(
+    struct kernel_mm *mm,
+    uint64_t address);
+
+enum kernel_mm_status kernel_mm_vdso_address(
+    const struct kernel_mm *mm,
+    uint64_t *address);
 
 /* Implements the raw Linux brk syscall result: success or rejection address. */
 enum kernel_mm_status kernel_mm_brk(

@@ -171,6 +171,142 @@ enum kernel_files_status kernel_files_read(
     return KERNEL_FILES_STATUS_OK;
 }
 
+enum kernel_files_status kernel_files_pread(
+    struct kernel_files *files,
+    struct kernel_mm *mm,
+    int64_t fd,
+    uint64_t user_buffer,
+    uint64_t count,
+    int64_t offset,
+    int64_t *linux_result)
+{
+    struct kernel_open_file_description *description;
+    uint64_t position;
+    uint64_t request;
+    uint64_t total = 0U;
+    uint64_t file_size;
+
+    if (!kernel_files_is_live(files) || mm == 0 || linux_result == 0) {
+        return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
+    }
+    files->record->statistics.read_calls++;
+    description = kernel_files_lookup_description(files, fd);
+    if (description == 0) {
+        files->record->statistics.read_failures++;
+        *linux_result = -KERNEL_EBADF;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    if (offset < 0) {
+        files->record->statistics.read_failures++;
+        *linux_result = -KERNEL_EINVAL;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    if (kernel_open_file_kind(description) ==
+            KERNEL_OPEN_FILE_KIND_DIRECTORY) {
+        files->record->statistics.read_failures++;
+        *linux_result = -KERNEL_EISDIR;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    if (kernel_open_file_kind(description) ==
+            KERNEL_OPEN_FILE_KIND_CONSOLE ||
+        kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_PIPE) {
+        files->record->statistics.read_failures++;
+        *linux_result = -KERNEL_ESPIPE;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    if (count == 0U) {
+        *linux_result = 0;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    request = count > KERNEL_FILES_MAX_RW_COUNT
+                  ? KERNEL_FILES_MAX_RW_COUNT
+                  : count;
+    position = (uint64_t)offset;
+    file_size = kernel_open_file_size(description);
+    if (position >= file_size) {
+        *linux_result = 0;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    if (request > file_size - position) {
+        request = file_size - position;
+    }
+    while (total < request) {
+        uint64_t page_index = position >> BOAROS_PAGE_SHIFT;
+        size_t page_offset = (size_t)(position & BOAROS_PAGE_MASK);
+        size_t valid_bytes;
+        size_t chunk;
+        size_t copied = 0U;
+        uint64_t physical_address;
+        void *page;
+        enum kernel_page_cache_status cache_status;
+        enum kernel_uaccess_status access_status;
+
+        cache_status = kernel_open_file_get_page(description,
+                                                  page_index,
+                                                  &physical_address,
+                                                  &valid_bytes);
+        files->record->statistics.read_chunks++;
+        if (cache_status == KERNEL_PAGE_CACHE_STATUS_OUT_OF_RANGE) {
+            break;
+        }
+        if (cache_status != KERNEL_PAGE_CACHE_STATUS_OK) {
+            int result = cache_status == KERNEL_PAGE_CACHE_STATUS_NO_MEMORY
+                             ? -KERNEL_ENOMEM
+                             : -KERNEL_EIO;
+
+            files->record->statistics.read_failures++;
+            *linux_result = total != 0U ? (int64_t)total : result;
+            files->record->statistics.bytes_read += total;
+            return KERNEL_FILES_STATUS_OK;
+        }
+        if (page_offset >= valid_bytes) {
+            if (physical_page_release(files->heap->page_allocator,
+                                      physical_address) !=
+                PHYSICAL_PAGE_STATUS_OK) {
+                return KERNEL_FILES_STATUS_STATE;
+            }
+            break;
+        }
+        chunk = valid_bytes - page_offset;
+        if ((uint64_t)chunk > request - total) {
+            chunk = (size_t)(request - total);
+        }
+        if (physical_page_resolve(files->heap->page_allocator,
+                                  physical_address,
+                                  &page) != PHYSICAL_PAGE_STATUS_OK) {
+            (void)physical_page_release(files->heap->page_allocator,
+                                        physical_address);
+            return KERNEL_FILES_STATUS_STATE;
+        }
+        access_status = kernel_copy_to_user(mm,
+                                            user_buffer + total,
+                                            (unsigned char *)page + page_offset,
+                                            chunk,
+                                            &copied);
+        if (physical_page_release(files->heap->page_allocator,
+                                  physical_address) != PHYSICAL_PAGE_STATUS_OK) {
+            return KERNEL_FILES_STATUS_STATE;
+        }
+        total += copied;
+        position += copied;
+        if (access_status == KERNEL_UACCESS_STATUS_FAULT) {
+            files->record->statistics.read_failures++;
+            *linux_result = total != 0U ? (int64_t)total : -KERNEL_EFAULT;
+            files->record->statistics.bytes_read += total;
+            return KERNEL_FILES_STATUS_OK;
+        }
+        if (access_status != KERNEL_UACCESS_STATUS_OK || copied != chunk) {
+            return KERNEL_FILES_STATUS_STATE;
+        }
+        if (page_offset + chunk == valid_bytes && valid_bytes < BOAROS_PAGE_SIZE) {
+            break;
+        }
+    }
+    files->record->statistics.bytes_read += total;
+    *linux_result = (int64_t)total;
+    return KERNEL_FILES_STATUS_OK;
+}
+
 static struct kernel_open_file_description *writable_description(
     struct kernel_files *files, int64_t fd)
 {
