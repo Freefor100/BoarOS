@@ -671,6 +671,36 @@ static unsigned long run_wait_cases(
         failures++;
     }
 
+    {
+        struct kernel_wait_queue q1, q2;
+        struct kernel_wait_node n1, n2;
+
+        kernel_wait_queue_init(&q1);
+        kernel_wait_queue_init(&q2);
+        kernel_wait_node_init(&n1, 0);
+        kernel_wait_node_init(&n2, 0);
+
+        kernel_wait_queue_add(&q1, &n1);
+        kernel_wait_queue_add(&q2, &n2);
+
+        if (q1.head != &n1 || q1.tail != &n1 || n1.queue != &q1) {
+            failures++;
+        }
+        if (q2.head != &n2 || q2.tail != &n2 || n2.queue != &q2) {
+            failures++;
+        }
+
+        kernel_wait_queue_remove(&n1);
+        if (q1.head != 0 || q1.tail != 0 || n1.queue != 0) {
+            failures++;
+        }
+
+        kernel_wait_queue_remove(&n2);
+        if (q2.head != 0 || q2.tail != 0 || n2.queue != 0) {
+            failures++;
+        }
+    }
+
     return failures;
 }
 

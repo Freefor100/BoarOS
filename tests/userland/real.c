@@ -12,6 +12,8 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <poll.h>
+#include <sys/select.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
@@ -267,6 +269,261 @@ static int check_pipe_waiters(void)
             close(pipe_fd[1]);
         }
     }
+    return 0;
+}
+
+static int check_poll_and_select(void)
+{
+    /* 1. Pipe poll: immediate nonblocking check on empty pipe and writable pipe */
+    int p[2];
+    if (pipe(p) != 0) {
+        return 1;
+    }
+    struct pollfd pfds[2];
+    pfds[0].fd = p[0];
+    pfds[0].events = POLLIN;
+    pfds[0].revents = 0;
+    pfds[1].fd = p[1];
+    pfds[1].events = POLLOUT;
+    pfds[1].revents = 0;
+
+    int ret = poll(pfds, 2, 0);
+    if (ret != 1 || pfds[0].revents != 0 || pfds[1].revents != POLLOUT) {
+        return 2;
+    }
+
+    /* Write data: pipe reader becomes ready */
+    if (write(p[1], "test", 4) != 4) {
+        return 3;
+    }
+    ret = poll(pfds, 2, 0);
+    if (ret != 2 || (pfds[0].revents & POLLIN) == 0 || (pfds[1].revents & POLLOUT) == 0) {
+        return 4;
+    }
+
+    /* Drain pipe */
+    char buf[16];
+    if (read(p[0], buf, 4) != 4) {
+        return 5;
+    }
+
+    /* Close writer: reader sees POLLHUP */
+    if (close(p[1]) != 0) {
+        return 6;
+    }
+    ret = poll(pfds, 1, 0);
+    if (ret != 1 || (pfds[0].revents & POLLHUP) == 0) {
+        return 7;
+    }
+    if (close(p[0]) != 0) {
+        return 8;
+    }
+
+    /* 2. Negative fd and unallocated fd behavior */
+    struct pollfd edge_fds[3];
+    edge_fds[0].fd = -1;
+    edge_fds[0].events = POLLIN;
+    edge_fds[0].revents = 0x5a;
+    edge_fds[1].fd = 200; /* unallocated fd */
+    edge_fds[1].events = POLLIN;
+    edge_fds[1].revents = 0;
+    edge_fds[2].fd = -5;
+    edge_fds[2].events = POLLOUT;
+    edge_fds[2].revents = 0xa5;
+
+    ret = poll(edge_fds, 3, 0);
+    if (ret != 1 || edge_fds[0].revents != 0 || edge_fds[2].revents != 0 ||
+        edge_fds[1].revents != POLLNVAL) {
+        return 9;
+    }
+
+    /* 3. Timeout behavior: poll on empty pipe with 30ms timeout */
+    if (pipe(p) != 0) {
+        return 10;
+    }
+    pfds[0].fd = p[0];
+    pfds[0].events = POLLIN;
+    pfds[0].revents = 0;
+
+    struct timespec ts0, ts1;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts0) != 0) {
+        return 11;
+    }
+    ret = poll(pfds, 1, 30);
+    if (clock_gettime(CLOCK_MONOTONIC, &ts1) != 0) {
+        return 12;
+    }
+    if (ret != 0 || pfds[0].revents != 0) {
+        return 13;
+    }
+    long elapsed_ms = (ts1.tv_sec - ts0.tv_sec) * 1000 +
+                      (ts1.tv_nsec - ts0.tv_nsec) / 1000000;
+    if (elapsed_ms < 15) {
+        return 14;
+    }
+
+    /* 4. Child wakes parent poll via pipe write */
+    pid_t child = fork();
+    if (child < 0) {
+        return 15;
+    }
+    if (child == 0) {
+        close(p[0]);
+        struct timespec delay = { .tv_sec = 0, .tv_nsec = 20000000L };
+        if (nanosleep(&delay, 0) != 0 || write(p[1], "w", 1) != 1) {
+            _exit(1);
+        }
+        _exit(0);
+    }
+    close(p[1]);
+    pfds[0].fd = p[0];
+    pfds[0].events = POLLIN;
+    pfds[0].revents = 0;
+    ret = poll(pfds, 1, 1000);
+    if (ret != 1 || (pfds[0].revents & POLLIN) == 0) {
+        return 16;
+    }
+    if (read(p[0], buf, 1) != 1) {
+        return 17;
+    }
+    int status = 0;
+    if (waitpid(child, &status, 0) != child || !WIFEXITED(status) ||
+        WEXITSTATUS(status) != 0) {
+        return 18;
+    }
+    close(p[0]);
+
+    /* 5. Select & pselect basic, timeout, and EBADF */
+    if (pipe(p) != 0) {
+        return 19;
+    }
+    fd_set rfds, wfds;
+    FD_ZERO(&rfds);
+    FD_ZERO(&wfds);
+    FD_SET(p[0], &rfds);
+    FD_SET(p[1], &wfds);
+    struct timeval tv = {0, 0};
+
+    ret = select(p[1] + 1, &rfds, &wfds, NULL, &tv);
+    if (ret != 1 || FD_ISSET(p[0], &rfds) || !FD_ISSET(p[1], &wfds)) {
+        return 20;
+    }
+
+    if (write(p[1], "x", 1) != 1) {
+        return 21;
+    }
+    FD_ZERO(&rfds);
+    FD_ZERO(&wfds);
+    FD_SET(p[0], &rfds);
+    FD_SET(p[1], &wfds);
+    ret = select(p[1] + 1, &rfds, &wfds, NULL, &tv);
+    if (ret != 2 || !FD_ISSET(p[0], &rfds) || !FD_ISSET(p[1], &wfds)) {
+        return 22;
+    }
+
+    /* Invalid fd triggers EBADF in select */
+    FD_ZERO(&rfds);
+    FD_SET(200, &rfds);
+    errno = 0;
+    ret = select(201, &rfds, NULL, NULL, &tv);
+    if (ret != -1 || errno != EBADF) {
+        return 23;
+    }
+
+    /* pselect timeout */
+    struct timespec pts = { .tv_sec = 0, .tv_nsec = 10000000L };
+    ret = pselect(0, NULL, NULL, NULL, &pts, NULL);
+    if (ret != 0) {
+        return 24;
+    }
+    close(p[0]);
+    close(p[1]);
+
+    /* 6. ppoll with temporary signal mask & EINTR */
+    struct sigaction sa = {0};
+    sa.sa_handler = user_signal_handler;
+    if (sigaction(SIGUSR1, &sa, NULL) != 0) {
+        return 25;
+    }
+    sigset_t block_mask, orig_mask, ppoll_mask;
+    sigemptyset(&block_mask);
+    sigaddset(&block_mask, SIGUSR1);
+    if (sigprocmask(SIG_BLOCK, &block_mask, &orig_mask) != 0) {
+        return 26;
+    }
+    sigemptyset(&ppoll_mask); /* SIGUSR1 unblocked during ppoll */
+
+    if (pipe(p) != 0) {
+        return 27;
+    }
+    child = fork();
+    if (child < 0) {
+        return 28;
+    }
+    if (child == 0) {
+        signal_parent_after_delay(getppid(), SIGUSR1);
+    }
+    pfds[0].fd = p[0];
+    pfds[0].events = POLLIN;
+    pfds[0].revents = 0;
+    struct timespec poll_timeout = { .tv_sec = 2, .tv_nsec = 0 };
+    user_signal_seen = 0;
+    errno = 0;
+    ret = ppoll(pfds, 1, &poll_timeout, &ppoll_mask);
+    if (ret != -1 || errno != EINTR || user_signal_seen != SIGUSR1) {
+        return 29;
+    }
+
+    /* Verify that SIGUSR1 is restored to blocked state */
+    sigset_t current_mask;
+    sigemptyset(&current_mask);
+    if (sigprocmask(SIG_SETMASK, NULL, &current_mask) != 0 ||
+        !sigismember(&current_mask, SIGUSR1)) {
+        return 30;
+    }
+    /* Restore original mask */
+    if (sigprocmask(SIG_SETMASK, &orig_mask, NULL) != 0) {
+        return 31;
+    }
+    if (waitpid(child, &status, 0) != child || !WIFEXITED(status) ||
+        WEXITSTATUS(status) != 0) {
+        return 32;
+    }
+    close(p[0]);
+    close(p[1]);
+
+    /* 7. Console stdout polling */
+    struct pollfd pfd_stdout;
+    pfd_stdout.fd = 1;
+    pfd_stdout.events = POLLOUT;
+    pfd_stdout.revents = 0;
+    ret = poll(&pfd_stdout, 1, 0);
+    if (ret != 1 || (pfd_stdout.revents & POLLOUT) == 0) {
+        return 33;
+    }
+
+    /* 8. Regular file polling */
+    int file_fd = open("/data", O_RDONLY);
+    if (file_fd < 0) {
+        return 34;
+    }
+    struct pollfd pfd_file;
+    pfd_file.fd = file_fd;
+    pfd_file.events = POLLIN;
+    pfd_file.revents = 0;
+    ret = poll(&pfd_file, 1, 0);
+    close(file_fd);
+    if (ret != 1 || (pfd_file.revents & POLLIN) == 0) {
+        return 35;
+    }
+
+    static const char poll_marker[] =
+        "BoarOS: real userland poll/select checks ok\n";
+    if (write(1, poll_marker, sizeof(poll_marker) - 1) !=
+        (ssize_t)(sizeof(poll_marker) - 1)) {
+        return 36;
+    }
+
     return 0;
 }
 
@@ -796,5 +1053,13 @@ int main(void)
     if (check_pipe_waiters() != 0) {
         return 81;
     }
+
+    int poll_result = check_poll_and_select();
+    if (poll_result != 0) {
+        fprintf(stderr, "poll/select check failed: %d errno=%d\n",
+                poll_result, errno);
+        return 82;
+    }
+
     return 42;
 }

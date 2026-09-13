@@ -3,6 +3,7 @@
 #include <arch/riscv/context.h>
 #include <arch/riscv/virt_uart.h>
 #include <kernel/errno.h>
+#include <kernel/open_file.h>
 #include <kernel/scheduler.h>
 #include <kernel/signal.h>
 #include <kernel/task.h>
@@ -19,8 +20,33 @@ void kernel_console_poll_input(void)
 {
     if (console_input_queue.initialized == KERNEL_WAIT_QUEUE_INITIALIZED &&
         virt_uart_rx_ready() != 0U) {
-        (void)kernel_wait_queue_wake_one(&console_input_queue);
+        (void)kernel_wait_queue_wake_all(&console_input_queue);
     }
+}
+
+uint32_t kernel_console_poll(uint32_t requested_events,
+                             struct kernel_wait_queue **out_queue)
+{
+    uint32_t events = KERNEL_POLLOUT | KERNEL_POLLWRNORM;
+
+    if (console_input_queue.initialized != KERNEL_WAIT_QUEUE_INITIALIZED) {
+        kernel_wait_queue_init(&console_input_queue);
+    }
+
+    if (virt_uart_rx_ready() != 0U) {
+        events |= (KERNEL_POLLIN | KERNEL_POLLRDNORM);
+    }
+
+    if (out_queue != 0) {
+        if ((requested_events & (KERNEL_POLLIN | KERNEL_POLLRDNORM)) != 0U ||
+            requested_events == 0U) {
+            *out_queue = &console_input_queue;
+        } else {
+            *out_queue = 0;
+        }
+    }
+
+    return events;
 }
 
 enum kernel_files_status kernel_files_read_console(

@@ -2,6 +2,7 @@
 #include "pipe_internal.h"
 #include "vfs_internal.h"
 
+#include <kernel/console.h>
 #include <kernel/errno.h>
 #include <kernel/heap.h>
 #include <kernel/open_file.h>
@@ -389,4 +390,28 @@ int kernel_open_file_pread(struct kernel_open_file_description *file,
                                   size,
                                   bytes_read)
                : -KERNEL_EINVAL;
+}
+
+uint32_t kernel_open_file_poll(
+    struct kernel_open_file_description *file,
+    uint32_t requested_events,
+    struct kernel_wait_queue **out_queue)
+{
+    if (out_queue != 0) {
+        *out_queue = 0;
+    }
+    if (!open_file_live(file)) {
+        return KERNEL_POLLNVAL;
+    }
+    switch (file->kind) {
+    case KERNEL_OPEN_FILE_KIND_PIPE:
+        return kernel_pipe_poll(file->pipe, file->pipe_endpoint, out_queue);
+    case KERNEL_OPEN_FILE_KIND_CONSOLE:
+        return kernel_console_poll(requested_events, out_queue);
+    case KERNEL_OPEN_FILE_KIND_REGULAR:
+    case KERNEL_OPEN_FILE_KIND_DIRECTORY:
+        return KERNEL_POLLIN | KERNEL_POLLOUT | KERNEL_POLLRDNORM | KERNEL_POLLWRNORM;
+    default:
+        return KERNEL_POLLNVAL;
+    }
 }

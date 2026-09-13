@@ -91,4 +91,22 @@ int kernel_open_file_pread(struct kernel_open_file_description *file,
                            size_t size,
                            size_t *bytes_read);
 
+#define KERNEL_POLLIN 0x0001U
+#define KERNEL_POLLPRI 0x0002U
+#define KERNEL_POLLOUT 0x0004U
+#define KERNEL_POLLERR 0x0008U
+#define KERNEL_POLLHUP 0x0010U
+#define KERNEL_POLLNVAL 0x0020U
+#define KERNEL_POLLRDNORM 0x0040U
+#define KERNEL_POLLRDBAND 0x0080U
+#define KERNEL_POLLWRNORM 0x0100U
+#define KERNEL_POLLWRBAND 0x0200U
+
+struct kernel_wait_queue;
+
+uint32_t kernel_open_file_poll(
+    struct kernel_open_file_description *file,
+    uint32_t requested_events,
+    struct kernel_wait_queue **out_queue);
+
 #endif

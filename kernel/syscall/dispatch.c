@@ -21,6 +21,8 @@
 #define LINUX_SYSCALL_WRITE 64U
 #define LINUX_SYSCALL_PREAD64 67U
 #define LINUX_SYSCALL_WRITEV 66U
+#define LINUX_SYSCALL_PSELECT6 72U
+#define LINUX_SYSCALL_PPOLL 73U
 #define LINUX_SYSCALL_EXIT 93U
 #define LINUX_SYSCALL_EXIT_GROUP 94U
 #define LINUX_SYSCALL_SET_TID_ADDRESS 96U
@@ -197,6 +199,16 @@ enum kernel_syscall_status kernel_syscall_dispatch(
         }
     } else if (request->number == LINUX_SYSCALL_FSTAT) {
         if (syscall_handle_fstat(caller, request, &decoded) !=
+            KERNEL_SYSCALL_STATUS_OK) {
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+        }
+    } else if (request->number == LINUX_SYSCALL_PSELECT6) {
+        if (syscall_handle_pselect6(caller, request, &decoded) !=
+            KERNEL_SYSCALL_STATUS_OK) {
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+        }
+    } else if (request->number == LINUX_SYSCALL_PPOLL) {
+        if (syscall_handle_ppoll(caller, request, &decoded) !=
             KERNEL_SYSCALL_STATUS_OK) {
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
         }

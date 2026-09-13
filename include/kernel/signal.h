@@ -78,6 +78,14 @@ int kernel_signal_nanosleep_restart(const struct kernel_task *task,
                                     uint64_t *remaining_address);
 enum kernel_signal_status kernel_signal_suspend(struct kernel_task *task,
                                                 uint64_t mask);
+enum kernel_signal_status kernel_signal_set_temporary_mask(
+    struct kernel_task *task,
+    uint64_t new_mask,
+    uint64_t *saved_mask);
+void kernel_signal_restore_temporary_mask(
+    struct kernel_task *task,
+    uint64_t saved_mask,
+    int interrupted);
 
 /* Records that the current user syscall must be retried after signal
  * handling; the generic form keeps the original trap arguments. */

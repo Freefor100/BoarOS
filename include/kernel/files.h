@@ -10,6 +10,7 @@ struct kernel_fs_context;
 struct kernel_heap;
 struct kernel_mm;
 struct kernel_open_file_description;
+struct kernel_task;
 
 enum kernel_files_status {
     KERNEL_FILES_STATUS_OK = 0,
@@ -260,5 +261,28 @@ void kernel_files_get_statistics(
 
 enum kernel_files_status kernel_files_release(
     struct kernel_files *files);
+
+enum kernel_files_status kernel_files_ppoll(
+    struct kernel_files *files,
+    struct kernel_mm *mm,
+    struct kernel_task *task,
+    uint64_t user_fds,
+    uint64_t nfds,
+    uint64_t user_timeout,
+    uint64_t user_sigmask,
+    size_t sigsetsize,
+    int64_t *linux_result);
+
+enum kernel_files_status kernel_files_pselect6(
+    struct kernel_files *files,
+    struct kernel_mm *mm,
+    struct kernel_task *task,
+    int64_t nfds,
+    uint64_t user_readfds,
+    uint64_t user_writefds,
+    uint64_t user_exceptfds,
+    uint64_t user_timeout,
+    uint64_t user_sigdata,
+    int64_t *linux_result);
 
 #endif

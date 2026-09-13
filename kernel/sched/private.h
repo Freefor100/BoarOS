@@ -109,8 +109,7 @@ struct kernel_task {
     struct kernel_wait_queue group_wait_queue;
     uint64_t group_pending;
     uint32_t group_sender[KERNEL_SIGNAL_COUNT];
-    struct kernel_task *wait_previous;
-    struct kernel_task *wait_next;
+    struct kernel_wait_node default_wait_node;
     struct kernel_task *blocked_previous;
     uint64_t futex_mm;
     uint64_t futex_address;

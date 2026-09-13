@@ -5,6 +5,7 @@
 #include <kernel/files.h>
 #include <kernel/heap.h>
 #include <kernel/mm.h>
+#include <kernel/open_file.h>
 #include <kernel/physical_page.h>
 #include <kernel/scheduler.h>
 #include <kernel/signal.h>
@@ -432,4 +433,43 @@ enum kernel_pipe_status kernel_pipe_writev(
     riscv_interrupt_restore(saved);
     *linux_result = (int64_t)total;
     return KERNEL_PIPE_STATUS_OK;
+}
+
+uint32_t kernel_pipe_poll(
+    struct kernel_pipe *pipe,
+    uint32_t endpoint,
+    struct kernel_wait_queue **out_queue)
+{
+    uint32_t events = 0U;
+
+    if (pipe == 0) {
+        if (out_queue != 0) *out_queue = 0;
+        return KERNEL_POLLNVAL;
+    }
+
+    if (endpoint == KERNEL_PIPE_ENDPOINT_READ) {
+        if (out_queue != 0) {
+            *out_queue = &pipe->read_queue;
+        }
+        if (pipe->bytes > 0U) {
+            events |= (KERNEL_POLLIN | KERNEL_POLLRDNORM);
+        }
+        if (pipe->writers == 0U) {
+            events |= KERNEL_POLLHUP;
+        }
+    } else if (endpoint == KERNEL_PIPE_ENDPOINT_WRITE) {
+        if (out_queue != 0) {
+            *out_queue = &pipe->write_queue;
+        }
+        if (pipe->readers == 0U) {
+            events |= KERNEL_POLLERR;
+        } else if (pipe->bytes < KERNEL_PIPE_CAPACITY) {
+            events |= (KERNEL_POLLOUT | KERNEL_POLLWRNORM);
+        }
+    } else {
+        if (out_queue != 0) *out_queue = 0;
+        return KERNEL_POLLNVAL;
+    }
+
+    return events;
 }
