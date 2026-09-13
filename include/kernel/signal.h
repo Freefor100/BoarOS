@@ -5,6 +5,8 @@
 
 #include <stdint.h>
 
+struct kernel_task;
+
 #define KERNEL_SIGNAL_COUNT 64U
 #define KERNEL_SIGNAL_DFL UINT64_C(0)
 #define KERNEL_SIGNAL_IGN UINT64_C(1)
@@ -39,13 +41,21 @@ enum kernel_signal_status {
     KERNEL_SIGNAL_STATUS_NO_MEMORY,
 };
 
-struct kernel_task;
+enum kernel_signal_select_result {
+    KERNEL_SIGNAL_SELECT_NONE = 0,
+    KERNEL_SIGNAL_SELECT_HANDLER,
+    KERNEL_SIGNAL_SELECT_EXIT,
+};
+
 struct kernel_signal_delivery {
     uint32_t signal;
     uint32_t sender;
     uint64_t handler;
     uint64_t flags;
     uint64_t restore_mask;
+    uint32_t exit_reason;
+    uint64_t exit_status;
+    uint64_t exit_detail;
 };
 
 enum kernel_signal_restart {
@@ -57,8 +67,9 @@ enum kernel_signal_restart {
 
 /* Applies default actions or selects and commits one handler's policy.
  * Architecture code encodes the returned delivery into its user frame. */
-int kernel_signal_select(struct kernel_task *task,
-                         struct kernel_signal_delivery *delivery);
+enum kernel_signal_select_result kernel_signal_select(
+    struct kernel_task *task,
+    struct kernel_signal_delivery *delivery);
 enum kernel_signal_restart kernel_signal_restart_decide(
     struct kernel_task *task, int has_handler, uint64_t flags);
 void kernel_signal_clear_syscall_restart(struct kernel_task *task);
@@ -77,12 +88,16 @@ void kernel_signal_note_nanosleep_restart(struct kernel_task *task,
                                           uint64_t deadline,
                                           uint64_t remaining_address);
 
-/* Marks the signal pending on the target (first sender wins) and drops
- * ignored signals.  Stopped targets are resumed for SIGCONT and
- * SIGKILL; waking blocked targets is the interruptible-sleep path. */
+/* Sends a process-directed signal to the target's thread group. */
 enum kernel_signal_status kernel_signal_send(struct kernel_task *target,
                                              uint32_t sig,
                                              kernel_pid_t sender_tid);
+
+/* Sends a thread-directed signal to exactly one task. */
+enum kernel_signal_status kernel_signal_send_task(
+    struct kernel_task *target,
+    uint32_t sig,
+    kernel_pid_t sender_tid);
 
 enum kernel_signal_status kernel_signal_get_action(
     struct kernel_task *task,
@@ -101,6 +116,8 @@ enum kernel_signal_status kernel_signal_set_action(
 enum kernel_signal_status kernel_signal_fork(
     struct kernel_task *child,
     const struct kernel_task *parent);
+enum kernel_signal_status kernel_signal_share(
+    struct kernel_task *child, struct kernel_task *parent);
 
 enum kernel_signal_status kernel_signal_get_blocked(
     const struct kernel_task *task,

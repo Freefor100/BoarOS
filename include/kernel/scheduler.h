@@ -79,6 +79,9 @@ enum kernel_scheduler_status kernel_scheduler_on_tick(
 
 /* Commits the image prepared by the current user task's exec transaction. */
 enum kernel_scheduler_status kernel_scheduler_exec_commit(void);
+void kernel_user_group_exit(enum kernel_thread_exit_reason reason,
+                            uint64_t status, uint64_t detail)
+    __attribute__((noreturn));
 
 /*
  * Linux riscv64 asm-generic rusage layout (144 bytes): only ru_utime and
@@ -131,6 +134,8 @@ enum kernel_wait_wake_reason {
  */
 struct kernel_wait_queue {
     uint32_t initialized;
+    struct kernel_task *head;
+    struct kernel_task *tail;
 };
 
 void kernel_wait_queue_init(struct kernel_wait_queue *queue);
@@ -179,6 +184,9 @@ enum kernel_mm_status kernel_scheduler_resolve_current_user_fault(
 
 enum kernel_scheduler_status kernel_scheduler_reap_one(
     struct kernel_thread_completion *completion);
+
+/* O(1) cleanup work predicate; call with interrupts disabled. */
+int kernel_scheduler_reap_pending(void);
 
 void kernel_thread_exit(void) __attribute__((noreturn));
 

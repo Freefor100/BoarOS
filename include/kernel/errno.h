@@ -35,6 +35,7 @@
 #define KERNEL_EOVERFLOW 75
 #define KERNEL_ELIBBAD 80
 #define KERNEL_ENOTSUP 95
+#define KERNEL_ETIMEDOUT 110
 #define KERNEL_EUCLEAN 117
 
 /* Internal scheduler result; never exposed as a Linux errno. */

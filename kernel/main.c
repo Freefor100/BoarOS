@@ -813,7 +813,9 @@ void kernel_main(unsigned long hart_id, const void *dtb)
                 init_reaped = 1;
                 break;
             }
-        } while (scheduler_status == KERNEL_SCHEDULER_STATUS_OK);
+        } while (scheduler_status == KERNEL_SCHEDULER_STATUS_OK ||
+                 (scheduler_status == KERNEL_SCHEDULER_STATUS_EMPTY &&
+                  kernel_scheduler_reap_pending()));
         riscv_interrupt_restore(interrupt_status);
         if (init_reaped) {
             struct kernel_heap_statistics heap_statistics;
@@ -836,9 +838,23 @@ void kernel_main(unsigned long hart_id, const void *dtb)
             virt_uart_puts("; shutting down\n");
             sbi_shutdown();
         }
-        if (scheduler_status != KERNEL_SCHEDULER_STATUS_EMPTY) {
+        if (scheduler_status != KERNEL_SCHEDULER_STATUS_EMPTY &&
+            scheduler_status != KERNEL_SCHEDULER_STATUS_PAGE_RELEASE &&
+            scheduler_status != KERNEL_SCHEDULER_STATUS_RESOURCE_CLEANUP) {
             shutdown_for_scheduler_error(scheduler_status);
         }
+        int cleanup_retry =
+            scheduler_status == KERNEL_SCHEDULER_STATUS_PAGE_RELEASE ||
+            scheduler_status == KERNEL_SCHEDULER_STATUS_RESOURCE_CLEANUP;
+        interrupt_status = riscv_interrupt_save();
+        scheduler_status = kernel_scheduler_yield_current();
+        riscv_interrupt_restore(interrupt_status);
+        if (scheduler_status != KERNEL_SCHEDULER_STATUS_OK)
+            shutdown_for_scheduler_error(scheduler_status);
+        interrupt_status = riscv_interrupt_save();
+        int cleanup_pending = kernel_scheduler_reap_pending();
+        riscv_interrupt_restore(interrupt_status);
+        if (cleanup_pending && !cleanup_retry) continue;
         asm volatile("wfi");
     }
 }

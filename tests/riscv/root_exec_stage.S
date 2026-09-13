@@ -286,21 +286,21 @@ _start:
     li t0, -10
     bne a0, t0, .Lfailure
 
-    # WNOHANG with a rusage pointer reports no child yet and must not
-    # touch the buffer.
+    # WNOHANG may observe either a live or already exited child; a finite
+    # user loop is not synchronization with the parent's scheduling.
     mv a0, s3
-    li a1, 0
+    la a1, .Lwait_status
     li a2, 1
     la a3, .Lrusage
     li a7, 260
     ecall
+    beq a0, s3, .Lfirst_child_reaped
     bnez a0, .Lfailure
     la t0, .Lrusage
     ld t1, 0(t0)
     bnez t1, .Lfailure
 
-    # The blocking wait now reaps the delayed child and reports its CPU
-    # time through rusage; the child spun for many ticks in user mode.
+    # A zero result leaves rusage untouched; the blocking wait then reaps.
     mv a0, s3
     la a1, .Lwait_status
     li a2, 0
@@ -308,6 +308,7 @@ _start:
     li a7, 260
     ecall
     bne a0, s3, .Lfailure
+.Lfirst_child_reaped:
     la t0, .Lwait_status
     lw t1, 0(t0)
     li t2, 0x2500
@@ -340,14 +341,12 @@ _start:
     li t2, 'H'
     bne t1, t2, .Lfailure
 
-    # The reaped child's rusage carries its user-mode tick time in the
-    # utime timeval; stime may legitimately stay zero for a child whose
-    # kernel time never crossed a tick boundary.
+    # Tick-resolution CPU time may be zero if execution did not intersect
+    # a sampling tick. Exact charging is checked by scheduler cases.
     la t0, .Lrusage
     ld t1, 0(t0)
     ld t2, 8(t0)
     or t1, t1, t2
-    beqz t1, .Lfailure
     bltz t2, .Lfailure
     # usec stays below one second for sub-minute children.
     li t2, 1000000
@@ -556,8 +555,9 @@ _start:
     add t1, t1, t2
     bne a0, t1, .Lfailure
 
-    # times(153): after spinning, own CPU time is nonzero, child roll-up
-    # fields are non-negative, and uptime ticks dominate all of them.
+    # times(153): child roll-up fields are non-negative and charged time
+    # cannot exceed elapsed single-hart ticks; equality is valid without
+    # sampled idle time. A finite spin need not intersect a sampling tick.
     li t4, 20000000
 .Ltimes_spin:
     addi t4, t4, -1
@@ -566,19 +566,17 @@ _start:
     li a7, 153
     ecall
     bltz a0, .Lfailure
-    beqz a0, .Lfailure
     la t0, .Ltms
     ld t1, 0(t0)
     ld t2, 8(t0)
     ld t3, 16(t0)
     ld t5, 24(t0)
     add t1, t1, t2
-    beqz t1, .Lfailure
     bltz t3, .Lfailure
     bltz t5, .Lfailure
     add t2, t1, t3
     add t2, t2, t5
-    bgeu t2, a0, .Lfailure
+    bltu a0, t2, .Lfailure
 
     li a0, 0x2a
     li a7, 93

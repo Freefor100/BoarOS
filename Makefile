@@ -97,6 +97,7 @@ C_SOURCES := \
 	arch/riscv/direct_map.c \
 	arch/riscv/elf_image.c \
 	arch/riscv/exec.c \
+	arch/riscv/process.c \
 	arch/riscv/mm.c \
 	arch/riscv/root_boot.c \
 	arch/riscv/sbi.c \
@@ -133,6 +134,7 @@ C_SOURCES := \
 	kernel/sched/process.c \
 	kernel/sched/signal.c \
 	kernel/sched/wait.c \
+	kernel/sched/futex.c \
 	kernel/syscall/dispatch.c \
 	kernel/syscall/file.c \
 	kernel/syscall/memory.c \
@@ -160,6 +162,7 @@ TEST_RUNTIME_C_SOURCES := \
 	arch/riscv/direct_map.c \
 	arch/riscv/elf_image.c \
 	arch/riscv/exec.c \
+	arch/riscv/process.c \
 	arch/riscv/mm.c \
 	arch/riscv/sbi.c \
 	arch/riscv/sv39.c \
@@ -192,6 +195,7 @@ TEST_RUNTIME_C_SOURCES := \
 	kernel/sched/process.c \
 	kernel/sched/signal.c \
 	kernel/sched/wait.c \
+	kernel/sched/futex.c \
 	kernel/syscall/dispatch.c \
 	kernel/syscall/file.c \
 	kernel/syscall/memory.c \
@@ -827,8 +831,11 @@ test-signal-riscv: $(SIGNAL_TEST_KERNEL_RV)
 
 MUSL_TARBALL := references/musl/musl-1.2.5.tar.gz
 MUSL_ROOT := $(BUILD_DIR)/musl-root
-MUSL_STAMP := $(MUSL_ROOT)/.built
+MUSL_STAMP := $(MUSL_ROOT)/.shared-built
+MUSL_LDSO := $(MUSL_ROOT)/lib/ld-musl-riscv64.so.1
 REAL_USERLAND_RV := $(BUILD_DIR)/tests/user/real-userland-rv
+PTHREAD_USERLAND_RV := $(BUILD_DIR)/tests/user/pthread-userland-rv
+PTHREAD_TLS_DSO_RV := $(BUILD_DIR)/tests/user/libboaros-tls.so
 
 $(MUSL_STAMP): $(MUSL_TARBALL)
 	@mkdir -p $(BUILD_DIR)/musl-src
@@ -838,18 +845,37 @@ $(MUSL_STAMP): $(MUSL_TARBALL)
 		CC=riscv64-linux-gnu-gcc AR=riscv64-linux-gnu-ar \
 		RANLIB=riscv64-linux-gnu-ranlib ./configure \
 			--target=riscv64-linux-musl \
-			--prefix=$(abspath $(MUSL_ROOT)) --disable-shared && \
+			--prefix=$(abspath $(MUSL_ROOT)) \
+			--syslibdir=$(abspath $(MUSL_ROOT))/lib && \
 		make && make install
 	touch $@
+
+$(MUSL_LDSO): $(MUSL_STAMP)
+	@test -f $@
 
 $(REAL_USERLAND_RV): tests/userland/real.c $(MUSL_STAMP)
 	@mkdir -p $(dir $@)
 	$(MUSL_ROOT)/bin/musl-gcc -static -O2 \
 		-L/usr/riscv64-linux-gnu/lib -o $@ $<
 
+$(PTHREAD_USERLAND_RV): tests/userland/pthread.c $(MUSL_STAMP)
+	@mkdir -p $(dir $@)
+	$(MUSL_ROOT)/bin/musl-gcc -fPIE -pie -O2 -pthread \
+		-Wl,--dynamic-linker=/lib/ld-musl-riscv64.so.1 \
+		-L/usr/riscv64-linux-gnu/lib -o $@ $< -ldl
+
+$(PTHREAD_TLS_DSO_RV): tests/userland/tls_dso.c $(MUSL_STAMP)
+	@mkdir -p $(dir $@)
+	$(MUSL_ROOT)/bin/musl-gcc -fPIC -shared -O2 \
+		-Wl,-soname,libboaros-tls.so \
+		-L/usr/riscv64-linux-gnu/lib -o $@ $<
+
 .PHONY: test-userland-riscv
-test-userland-riscv: $(REAL_USERLAND_RV) kernel-rv
+test-userland-riscv: $(REAL_USERLAND_RV) $(PTHREAD_USERLAND_RV) \
+		$(PTHREAD_TLS_DSO_RV) $(MUSL_LDSO) kernel-rv
 	QEMU_RISCV64=$(QEMU_RISCV64) REAL_USERLAND_RV=$(REAL_USERLAND_RV) \
+		PTHREAD_USERLAND_RV=$(PTHREAD_USERLAND_RV) \
+		PTHREAD_TLS_DSO_RV=$(PTHREAD_TLS_DSO_RV) MUSL_LDSO=$(MUSL_LDSO) \
 		./tests/userland-riscv.sh
 
 test-brk-riscv: test-sv39-riscv test-vma-riscv \

@@ -105,7 +105,7 @@ enum kernel_mm_status kernel_mm_release(struct kernel_mm *mm);
 
 `struct kernel_mm` 是一个可移动的拥有型引用，不是地址空间本体。RISC-V 后端用 `record_page_address` 指向一张物理记录页；记录页保存引用计数、清理阶段和唯一的 `riscv_sv39_user_space`。多个 LIVE 句柄可以指向同一记录页：
 
-- `acquire` 增加引用计数并发布一个新的独立 owner；vfork（clone CLONE_VM|CLONE_VFORK）用它共享父地址空间，子进程 exec 或退出释放引用后父进程句柄不受影响；
+- `acquire` 增加引用计数并发布一个新的独立 owner；vfork 与线程 clone 用它共享地址空间，任一线程释放自己的引用不撤销其他 owner。共享 MM 的 VMA/PTE 变更对同组立即可见；当前单 hart 关闭 SIE 串行化，并执行本地 TLB 失效，不等同于 SMP 同步；
 - `fork` 创建独立地址空间，克隆 VMA/文件来源并让父子暂时共享用户物理页，逻辑 MM 和后续写入仍独立；
 - `move` 转移一个 owner，不改变引用计数；
 - `release` 消耗一个 owner，非末引用只减计数，末引用才销毁页表树和记录页；
@@ -188,4 +188,4 @@ make test-riscv
 
 MM 聚焦测试覆盖创建失败原子性、共享引用、移动、COW fork 的父子共享/写隔离/末引用原地恢复、`PROT_NONE` COW 属性，以及页表部分回收、记录页访问/释放失败后的阶段化重试。文件测试覆盖 cache hit/miss、write-first、尾页补零、整页越 EOF、fd 关闭后 fault、fork 后 OFD 来源和最终回收。`test-mmap-riscv` 与真实 ext4 `/init` 从 U-mode 完成匿名/文件私有 mmap、COW、SIGBUS、mprotect/munmap 生命周期。
 
-当前只有 RISC-V 后端；映射仍由 Sv39/4 KiB 用户页实现。普通 clone 使用独立 MM+COW，尚无 `CLONE_VM` 共享进程；匿名映射和 ELF image 已使用每 MM 的 ASLR mmap ceiling（无可信种子时确定性降级），但没有 commit accounting；只读普通文件支持 `MAP_PRIVATE`，尚无 `MAP_SHARED`、写回或 truncate 并发；`brk` 上界目前只由地址布局约束，尚未接入 `RLIMIT_DATA`。文件表和信号处理表不属于 MM，MM 还持有 ELF source 和普通文件映射所需的引用。
+当前只有 RISC-V 后端；映射仍由 Sv39/4 KiB 用户页实现。普通 fork 使用独立 MM+COW，线程 clone/vfork 共享同一 MM record；匿名映射和 ELF image 使用每 MM 的 ASLR mmap ceiling（无可信种子时确定性降级），但没有 commit accounting。只读普通文件支持 MAP_PRIVATE，尚无 MAP_SHARED、写回或 truncate 并发；brk 尚未接入 RLIMIT_DATA。文件表和信号表不属于 MM。futex 当前以 MM 身份与用户地址为 key，共享文件映射落地前不提供跨 MM futex 语义。

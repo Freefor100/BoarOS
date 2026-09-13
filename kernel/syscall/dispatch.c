@@ -1,6 +1,7 @@
 #include "private.h"
 
 #include <kernel/errno.h>
+#include <kernel/futex.h>
 #include <kernel/task.h>
 #include <kernel/mm.h>
 #include <kernel/uaccess.h>
@@ -202,9 +203,21 @@ enum kernel_syscall_status kernel_syscall_dispatch(
     } else if (request->number == LINUX_SYSCALL_EXIT ||
                request->number == LINUX_SYSCALL_EXIT_GROUP) {
         /* Single-member thread groups: exit_group terminates this task. */
-        decoded.action = KERNEL_SYSCALL_ACTION_EXIT;
+        decoded.action = request->number == LINUX_SYSCALL_EXIT_GROUP
+                             ? KERNEL_SYSCALL_ACTION_EXIT_GROUP
+                             : KERNEL_SYSCALL_ACTION_EXIT;
         decoded.value = (int64_t)(request->arguments[0] &
                                   LINUX_EXIT_STATUS_MASK);
+    } else if (request->number == 98U) {
+        enum kernel_scheduler_status futex_status;
+        decoded.action = KERNEL_SYSCALL_ACTION_RETURN;
+        decoded.value = kernel_futex(caller, request->arguments[0],
+                                      (uint32_t)request->arguments[1],
+                                      (uint32_t)request->arguments[2],
+                                      request->arguments[3],
+                                      request->arguments[4], &futex_status);
+        if (futex_status != KERNEL_SCHEDULER_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     } else if (request->number == LINUX_SYSCALL_SET_TID_ADDRESS) {
         if (syscall_handle_set_tid_address(caller,
                                    request->arguments[0],

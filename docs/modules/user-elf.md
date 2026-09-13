@@ -74,4 +74,4 @@ make test-root-init-riscv
 make test-riscv
 ```
 
-真实根启动 fixture 直接验证当前 source-backed 静态入口；动态 ET_DYN/解释器已经进入生产构造路径，但 musl/glibc 的重定位、额外 DSO、TLS 和真实开发板 I-cache/熵源验证仍是后续能力闭环，不把静态 fixture 当作动态能力证据。LoongArch 复用通用 ELF 字节解析，使用自己的 16 KiB/三级页表映像后端。
+真实根启动 fixture 验证 source-backed 静态入口；动态 musl PIE、解释器、额外 DSO、初始 TLS 和线程运行期间的 dlopen TLS 已通过生产入口验证，消费者复用 userland runner。重定位与 TLS 分配由用户态动态链接器/libc 完成，不是待添加的内核 ELF 算法。glibc 与真实开发板 I-cache/熵源仍需单独验证；musl 成功不代表所有动态运行时已经兼容。LoongArch 后续复用通用 ELF 解析并提供 16 KiB/三级页表映像后端。

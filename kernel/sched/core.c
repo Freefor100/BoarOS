@@ -185,8 +185,9 @@ static enum kernel_scheduler_status validate_thread(
             return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
         }
         if (thread->tid_owned != 0U) {
-            if (thread->tid <= 0 || thread->group_leader != thread ||
-                thread->group_members != 1U) {
+            if (thread->tid <= 0 || thread->group_leader == 0 ||
+                thread->group_leader->group_leader != thread->group_leader ||
+                thread->group_leader->group_members == 0U) {
                 return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
             }
         } else if (expected_state != KERNEL_THREAD_STATE_EXITED ||
@@ -827,6 +828,7 @@ enum kernel_scheduler_status kernel_user_thread_create(
     thread->wait_status = 0U;
     thread->group_leader = thread;
     thread->group_members = 1U;
+    process_group_initialize(thread);
     thread->completion.tid = tid;
     thread->completion.tgid = tid;
     mm_status = kernel_mm_move(&thread->mm, mm);
@@ -881,24 +883,26 @@ enum kernel_scheduler_status kernel_scheduler_on_tick(
         return status;
     }
     status = validate_queues();
-    if (status != KERNEL_SCHEDULER_STATUS_OK || scheduler.ready_head == 0) {
+    if (status != KERNEL_SCHEDULER_STATUS_OK) {
         return status;
     }
 
     previous = scheduler.current;
-    next = scheduler.ready_head;
+    next = previous != &scheduler.idle && kernel_scheduler_reap_pending()
+               ? &scheduler.idle : scheduler.ready_head;
+    if (next == 0) return KERNEL_SCHEDULER_STATUS_OK;
     status = activate_thread_address_space(next);
     if (status != KERNEL_SCHEDULER_STATUS_OK) {
         return status;
     }
-    next = ready_pop();
+    if (next != &scheduler.idle) next = ready_pop();
     if (previous->idle == 0U) {
         previous->state = KERNEL_THREAD_STATE_READY;
         ready_append(previous);
     } else {
         scheduler.idle_context_saved = 1U;
     }
-    next->state = KERNEL_THREAD_STATE_RUNNING;
+    if (next != &scheduler.idle) next->state = KERNEL_THREAD_STATE_RUNNING;
     scheduler.current = next;
     riscv_fpu_switch(&previous->fpu, &next->fpu);
     riscv_context_switch(&previous->context, &next->context);
@@ -931,13 +935,17 @@ enum kernel_scheduler_status kernel_scheduler_yield_current(void)
     if (status != KERNEL_SCHEDULER_STATUS_OK) {
         return status;
     }
-    if (scheduler.current == &scheduler.idle || scheduler.ready_head == 0) {
+    if (scheduler.ready_head == 0) {
         return KERNEL_SCHEDULER_STATUS_OK;
     }
 
     previous = scheduler.current;
-    previous->state = KERNEL_THREAD_STATE_READY;
-    ready_append(previous);
+    if (previous != &scheduler.idle) {
+        previous->state = KERNEL_THREAD_STATE_READY;
+        ready_append(previous);
+    } else {
+        scheduler.idle_context_saved = 1U;
+    }
     return scheduler_switch_current_away(previous);
 }
 

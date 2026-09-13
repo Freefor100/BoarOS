@@ -1,158 +1,71 @@
-# 内核调度与进程生命周期模块
+# 内核调度、线程组与生命周期
 
-本文描述当前单 hart FIFO 调度、任务身份、父子关系、普通进程 clone、可中断阻塞 wait、标准信号状态、退出与 zombie 回收契约。执行现场原理见[内核线程与抢占调度学习总结](../learning/kernel-scheduling.md)，信号 ABI 见[内核信号模块](kernel-signal.md)，进程语义背景见[进程生命周期学习总结](../learning/process-lifecycle.md)，地址空间所有权见[内核 MM 模块](kernel-mm.md)。
+本文记录单 hart FIFO 调度、线程组资源、clone/exec/wait 和回收契约。背景见[线程组与 futex](../learning/threads-and-futex.md)，信号、文件资源、MM 的稳定边界分别见对应模块文档。
 
-## 范围与入口
+## 实现入口
 
-| 文件 | 当前职责 |
+| 文件 | 职责 |
 |---|---|
-| `include/arch/riscv/context.h`、`arch/riscv/context.c` | 初始化 RISC-V switch context，提供 current `tp` 与 SIE 临界区操作 |
-| `include/arch/riscv/thread.h`、`arch/riscv/context_switch.S` | 定义 Trap 汇编可见任务前缀，保存/恢复 `ra/sp/tp/s0..s11` |
-| `include/arch/riscv/process.h` | 隔离依赖 RISC-V Trap Frame 的 clone 入口 |
-| `include/kernel/pid.h`、`kernel/pid.c` | 管理 1..32768 的可回收 PID/TID 位图 |
-| `include/kernel/task.h` | 暴露不透明 current task、TID/TGID/PPID 与当前资源借用 |
-| `kernel/sched/core.c` | idle、任务页、ready FIFO、tick 抢占和首次用户任务创建 |
-| `kernel/sched/process.c` | 父子链、clone/wait、BLOCKED/wakeup、exit/zombie/reap |
-| `kernel/sched/wait.c` | 全局 blocked 链、等待队列唤醒与 deadline 到期 |
-| `kernel/sched/signal.c`、`include/kernel/signal.h` | pending/blocked、默认动作、handler 选择、stop/continue 和 syscall restart 策略 |
-| `kernel/sched/exec.c` | exec 映像提交 |
-| `kernel/sched/private.h` | scheduler 私有对象布局与跨实现文件接口 |
+| `kernel/sched/core.c` | 创建、ready FIFO、tick 抢占、资源借用校验 |
+| `kernel/sched/process.c` | clone、线程组/父子树、wait、退出、回收与记账 |
+| `kernel/sched/exec.c` | 已准备映像的提交与旧资源清理 |
+| `kernel/sched/wait.c` | 全局 blocked 链、每队列 FIFO、超时和信号唤醒 |
+| `kernel/sched/futex.c` | 256 桶 WAIT/WAKE/REQUEUE、clear-child-tid 唤醒 |
+| `kernel/sched/signal.c` | 组/线程 pending、disposition、stop/continue 和重启 |
+| `arch/riscv/process.c` | clone 寄存器、FP/TLS 继承与 exec 寄存器清零 |
+| `arch/riscv/context.c`、`context_switch.S` | psABI context 和 SIE 临界区 |
+| `kernel/sched/private.h` | 私有任务布局、组与队列成员关系 |
 
-主要进程接口为：
+公共 scheduler 头不暴露 Trap Frame；架构 clone 入口位于 `include/arch/riscv/process.h`。syscall 通过不透明 task 接口取得 TID/TGID/PPID 和资源，不直接修改调度私有字段。
 
-```c
-enum kernel_scheduler_status riscv_process_clone_current(
-    const struct riscv_trap_frame *parent_frame,
-    uint64_t child_stack,
-    int64_t *linux_result);
+## 身份与资源
 
-enum kernel_scheduler_status kernel_scheduler_wait4_current(
-    int64_t pid,
-    uint64_t status_address,
-    uint32_t options,
-    uint64_t rusage_address,
-    int64_t *linux_result);
+每个用户执行线程有独立 TID、FP/整数寄存器、signal mask、线程 pending、clear-child-tid、restart 状态和私有任务页。组长承载 TGID、进程组、父子树、组 pending、退出通知及已回卷记账。双向成员环包含组长容器；组长停止执行后仍留在环中，直到组结束或非组长 exec 接管身份。
 
-enum kernel_mm_status kernel_scheduler_resolve_current_user_fault(
-    uint64_t virtual_address,
-    uint32_t access);
+普通 fork 从调用线程复制 MM 的 COW 页表/VMA、fd 表、fs context 和 disposition；OFD 仍按现有语义共享。子进程挂在调用线程的组长父子树中，并记录创建者 TID。线程 clone 通过 MM/files/fs/disposition 引用共享已有对象，不复制页表或 fd 槽。首次需要共享 disposition 而父线程尚无表时，会按需分配表页。
 
-void kernel_user_thread_exit(
-    enum kernel_thread_exit_reason reason,
-    uint64_t status,
-    uint64_t detail) __attribute__((noreturn));
-```
+同组 fd 变更立即可见。阻塞 read/write/writev 在睡眠期间持有 OFD 引用；即使其他线程 close/dup 替换槽位，也不能提前回收正在使用的端点。退出请求必须使调用栈完成清理，不能直接释放阻塞任务页。
 
-RISC-V clone 接口接收 syscall 入口保存的完整寄存器快照；通用 scheduler 头不暴露架构 Trap Frame。普通任务创建、tick、exec、资源借用和 idle reaper 仍由 `include/kernel/scheduler.h` 与 `include/kernel/task.h` 提供。
+## clone 与 vfork
 
-## 阻塞与唤醒
+RISC-V clone 接收 flags、child_stack、parent_tid、tls、child_tid 和完整 syscall 入口寄存器。支持普通 SIGCHLD fork/vfork，以及共享 VM/FS/FILES/SIGHAND/THREAD 的线程组合和 SETTLS/PARENT_SETTID/CHILD_SETTID/CHILD_CLEARTID/SYSVSEM/DETACHED 兼容位。非法依赖返回 EINVAL，尚未闭环的合法资源组合返回 ENOTSUP。SYSVSEM 位不代表已经支持 SysV semaphore。
 
-所有 BLOCKED 任务都在全局 blocked 链上；`BLOCKED ⇔ 在 blocked 链上` 是 `validate_queues` 校验的不变量。任务携带可选的 `wait_queue` 令牌（wait4 式父唤醒为 NULL）、可选的 `wakeup_deadline`（`time` CSR 原始刻度，0 为无限）和 `wake_reason`。每个可阻塞资源内嵌一个 `struct kernel_wait_queue` 作为唤醒通道：
+子线程继承完整 FP、整数现场和 mask；a0 为 0，PC 越过 ecall，非零 child_stack 替换 sp，SETTLS 设置 tp。SETTID 用户存储失败不回滚已经创建的任务，与固定 Linux clone 路径一致。所有内核分配失败都在发布前回滚，无法立即释放的 owner 留在退出清理队列；不会发布半构造子进程。
 
-```c
-void kernel_wait_queue_init(struct kernel_wait_queue *queue);
-enum kernel_scheduler_status kernel_wait_queue_wake_one(
-    struct kernel_wait_queue *queue);
-enum kernel_scheduler_status kernel_scheduler_block_current(
-    struct kernel_wait_queue *queue,
-    uint64_t deadline,
-    int interruptible,
-    enum kernel_wait_wake_reason *wake_reason);
-enum kernel_scheduler_status kernel_scheduler_wake_signal(
-    struct kernel_task *task);
-enum kernel_scheduler_status kernel_scheduler_expire_deadlines(uint64_t now);
-enum kernel_scheduler_status kernel_scheduler_yield_current(void);
-```
+vfork 共享 MM，但复制 files/fs。父线程和具体子进程保持双向完成关联；子进程释放共享 MM 引用后一次性完成等待。普通信号不解除等待。组退出/exec 的致命取消先断开双向关联，再唤醒父线程；子进程自己的 MM 引用仍有效，之后完成也不能访问已释放父任务。
 
-阻塞协议沿用 wait4 先例：调用方在关中断内检查条件，不满足则 `block_current` 置 BLOCKED、入 blocked 链并通过 `scheduler_switch_current_away` 切走；醒来后必须重查条件。`wake_one` 按 FIFO 走 blocked 链唤醒等待同一队列的最久任务；`expire_deadlines` 由 tick 路径调用，唤醒全部过期 deadline 任务。唤醒与到期都把任务摘链、清空等待字段、置 READY 并加入 ready 队尾。内核线程经 trampoline 运行在开中断态，调用上述接口前须用 `riscv_interrupt_save/restore` 收敛临界区。
+## 等待与 futex
 
-唤醒走链成本为 O(阻塞数)，到期扫描同样；等待队列不排序。`interruptible` waiter 只接受未被 blocked 的 pending signal 唤醒，并返回 `KERNEL_WAIT_SIGNALLED`；vfork 等必须等待资源生命周期的路径传入不可中断标志。等待数量增长后，per-queue 链与按 deadline 排序的 timer 链是预留的演进路径。
+所有 BLOCKED 任务在全局双向 blocked 链上，并可加入一个等待队列 FIFO。队列 wake-one 取队首，wake-all 唤醒全部；摘除 blocked 和 queue 成员均为 O(1)。deadline 使用原始 time ticks，0 表示无限；tick 仍扫描 blocked 链处理到期。
 
-## 任务对象与创建所有权
+WAIT 在关中断内读取用户字、比较 expected、登记并阻塞。futex key 为 MM record 身份和四字节对齐地址；哈希碰撞需二次匹配，REQUEUE 保留 FIFO，返回唤醒数与迁移数之和。值不匹配为 EAGAIN，非法地址为 EFAULT，非法参数为 EINVAL，超时为 ETIMEDOUT，信号为 EINTR，未支持命令为 ENOSYS。用户访问层状态损坏不能转换成普通用户错误。
 
-每个非 idle 任务使用一张 4 KiB 物理页，页内依次是任务元数据、canary 和向下增长的内核栈。用户任务拥有独立 TID、单成员线程组、MM 句柄、files 句柄、fs context 与可选 exec 清理事务。生产创建要求入口具有 U+X，`SP-1` 具有 U+R+W，SP 按 16 字节对齐，MM 与文件资源使用 scheduler 的分配器。
+没有 MAP_SHARED 时，非 private futex 仅保证同一 MM 内语义，不提供跨 MM 共享 backing key。PI/bitset/wake-op 和 robust-list 回收尚未实现。
 
-创建先验证全部输入，再分配任务页、构造 Trap Frame/context 和 TID，最后移动 MM/files/fs owner 并发布到 ready 队列。成功消耗调用者传入的 owner；普通失败保留调用者资源。任务页立即归还失败时由 scheduler 的单页清理槽保留唯一 owner，idle reaper 重试后才允许下一次可能占用该槽的创建。
+## 退出与 exec
 
-`struct kernel_task` 对公共层不透明。MM/fs 借用只读，files 借用允许同步 syscall 更新 fd 表和 open-file offset；借用不增引用，只在 current RUNNING 用户任务的内核调用链内有效。
+exit 只退出当前线程，exit_group 和默认致命信号结束全组。退出先执行 clear-child-tid 清零/唤醒，再释放 exec/files/fs/MM 等资源。任务仍在自己的内核栈上时不释放任务页。
 
-## 普通 clone 的资源语义
+组长先退出进入 GROUP_DEAD，保留进程容器；普通成员资源清理成功后从组环移除并回卷时间。最后一个成员结束后，组长才成为唯一进程退出对象，向父进程产生一次 zombie/SIGCHLD。SIGCHLD 显式忽略或 NOCLDWAIT 的自动回收仍遵循信号模块契约。
 
-当前接受两种 Linux RISC-V 进程 clone 形态：`clone(SIGCHLD, 0, 0, 0, 0)`（fork）与 `clone(SIGCHLD|CLONE_VM|CLONE_VFORK, stack, 0, 0, 0)`（vfork）；fork 形态可传自定义子栈，非零 stack 替换子进程继承的用户 sp，其余 tid/TLS 指针参数返回 `-ENOTSUP`。fork 语义：
+退出切回保存的 idle/cleanup context，不依赖所有用户任务都阻塞。该 context 排空可完成的清理后主动派发 ready 任务；tick 对待清理标志只做 O(1) 检查并切换，不在中断热路径执行释放。确实可重试的释放失败保留原 owner，在后续清理机会重试；不变量错误仍明确失败。
 
-- 子进程获得新 TID/TGID，线程组只有自己，进程组继承父进程；
-- RISC-V Trap Frame 完整复制，子进程 `a0=0`，父进程得到子 PID，两者都从 ecall 后一条指令继续；
-- MM 通过 `kernel_mm_fork()` 克隆 VMA/页表并以 COW 共享用户页，父子写入后按需获得不同 PA；
-- fd 表和 descriptor flags 独立复制，open file description 引用共享，因此 offset 与底层 file 生命周期共享；
-- fs context 独立复制当前 cwd，并继续借用同一个 root mount；
-- exec 清理事务不继承。
+exec 完成映像验证后收拢组内其他线程。竞争 exec 或已被组终止的线程清理自己的事务并退出；准备失败仍保留原映像。非组长成功 exec 接管原 TGID、父子树位置、组 pending 和累计记账，旧 TID 被释放，旧组长容器静默回收。新映像最终只有一个执行成员，重置自定义 handler 和寄存器，按 CLOEXEC 关闭描述符。
 
-vfork 语义：子进程经 `kernel_mm_acquire` 共享父地址空间（同一 record 页，引用计数），files/fs 仍独立复制；父进程在 clone syscall 内阻塞于自己的 `vfork_done_queue`，子进程在 exec 清理释放 retired MM 或退出释放共享引用后，消费自身的一次性完成标志并清除父进程的等待条件；清理重试也经过该完成边界。旧子进程之后退出不能唤醒父进程的下一次 vfork。父进程恢复后可直接观察子进程对共享地址空间的修改（如 brk）。VFORK 无 CLONE_VM 的组合返回 `-ENOTSUP`。无线程组的 `exit_group` 与 `exit` 等价。
+## wait 与记账
 
-构造过程在子任务进入父子树和 ready 队列前完成。失败先释放已经取得的 fs/files/MM/TID/任务页；不能立即完成的 owner 放入不发布 completion 的 exited 清理队列，父进程仍得到准确的 `-ENOMEM` 或 `-EAGAIN`，不会看到半构造子进程。
+wait4 遍历组长父子树，默认允许等待同组其他线程的子进程；线程本身不作为独立子进程出现。`__WNOTHREAD` 按创建/收养线程关系过滤。创建者退出时迁移给仍存活成员，进程退出时收养到 PID1；迁移必须在旧 TID 重用前更新记录。
 
-当前 COW fork 仍需遍历已提交页并建立子页表，时间与页数线性，且构造期间关闭本 hart 中断；它避免了 fork 时的数据页复制和同量内存峰值，但最坏中断延迟仍需在开发板测量。文件 VMA 的 OFD 来源也在发布子任务前克隆，失败不会留下半构造父子关系。
+支持 pid 选择、WNOHANG/WUNTRACED/WCONTINUED/__WALL/__WCLONE。组 stop 完成状态与组长执行状态分离，因此 GROUP_DEAD 容器仍能报告存活成员的组 stop/continue。不可中断等待尚未完成的成员保留 stop pending，不提前宣称整组停止。
 
-## 父子树、状态与 wait
+zombie 先逻辑回收再复制 status/rusage，因此坏输出指针的 EFAULT 不让它再次可 wait。退出和 reparent 可能向退出队尾追加 orphan zombie，摘头必须使用更新后的链关系，不能丢失新增 owner。`times()` 累计所有仍在组环中的线程及已回卷成员；子进程时间保存在组长，不重复计数。
 
-父任务保存双向兄弟链的首尾，子任务保存 parent、前后兄弟。进程路径在 clone、wait、reparent 与退出回收边界检查以下不变量：首尾同时为空或同时存在；首节点无前驱、尾节点无后继；每个节点反向指向同一父任务；链长不超过 PID 上限；链上任务拥有有效用户身份且不发布 boot completion。tick 热路径不遍历父子树。
+## 同步、成本与验证边界
 
-状态转换为：
+单 hart 的 SIE 临界区串行化组关系、fd/MM 引用和 futex 登记。共享 MM 使用同一页表与本地 SFENCE.VMA；这不是 SMP 协议。多 hart 前仍须补锁、页引用原子操作和远端 TLB shootdown。
 
-```text
-                      timer
-READY <------------------------------ RUNNING
-  ^                                      |
-  |                                      +-- wait4(no event) --> BLOCKED
-  |                                              |
-  +---------------- child event / wake ----------+
+每线程任务页仍为 4 KiB，包括控制块、canary、内核栈和 Trap Frame。新增元数据减少栈余量，必须结合静态栈用量与真实 canary 检查审查调用链；单函数栈大小不是完整栈界证明。ASID 0 的切换刷新成本、FIFO/100 Hz tick、线性 wait4 与 deadline 扫描仍存在。
 
-RUNNING -- exit, cleanup complete, has parent --> ZOMBIE
-RUNNING -- exit, cleanup pending/no parent -----> EXITED
-EXITED  -- idle retry complete, has parent -----> ZOMBIE
-ZOMBIE  -- matching parent wait4 --------------> PID/task page released
-EXITED  -- parentless retry complete -----------> PID/task page released
-```
+聚焦入口为 `make test-scheduler-cases-riscv`、`make test-scheduler-riscv`、`make test-files-riscv`、`make test-signal-riscv` 和 `make test-root-init-riscv`；组合消费者复用 `make test-userland-riscv`，阶段收口使用 `make test-riscv`。各次实际通过范围以 README 和提交验证说明为准，不把实现路径存在等同于全部线程负载已验证。
 
-`wait4` 支持 `pid>0`、`pid==0`、`pid==-1` 和 `pid<-1` 的 Linux 选择规则，并接受 `WNOHANG/WUNTRACED/WCONTINUED/__WNOTHREAD/__WALL/__WCLONE` 位。子进程的 stop/continue/exit 事件分别保存在 completion 状态中；`WUNTRACED` 和 `WCONTINUED` 决定父进程能否取出前两类事件，取出后只消费对应通知。普通 SIGCHLD 子进程被 `__WCLONE` 排除，除非同时使用 `__WALL`。无匹配子进程返回 `-ECHILD`；有匹配但无事件时 `WNOHANG` 返回 0，否则父进程经通用等待队列阻塞在自己的 `child_exit_queue` 上，由子进程状态变化唤醒。rusage 非空时在回收点填 `struct kernel_linux_rusage`（144 字节）：`ru_utime/ru_stime` 来自被回收子进程自身与孙辈回卷的 tick 记账，其余字段为 0，坏指针返回 `-EFAULT` 且子进程同样已回收。
-
-普通退出码编码为 `(status & 0xff) << 8`；被信号终止的 child 编码为 `(signal & 0x7f)`，core 默认动作另置 `0x80`。用户同步故障和不可恢复的缺页仍可直接形成 SIGILL/SIGTRAP/SIGBUS/SIGSEGV/SIGKILL 形态 wait status；可捕获信号则先进入用户 handler，只有 handler 不返回或默认动作要求终止时才完成 child。信号、stop/continue 和 wait 的状态变化由 `kernel/sched/signal.c` 与 process completion 共同维护。非空 rusage 返回已支持的 CPU 时间及其余零初始化字段；未知 option 返回 `-EINVAL`，无法安全取负的 `INT32_MIN` pid 返回 `-ESRCH`。与 Linux 回收顺序一致，zombie 先被逻辑回收，再向用户复制 status；因此 status 指针错误返回 `-EFAULT` 时，该子进程也已不可再次 wait。
-
-## 退出、reparent 与失败恢复
-
-用户任务退出时仍运行在自己的任务页栈上，不能释放该页。路径先切到稳定内核 `satp`，把现有子进程重新挂到仍存活的 PID 1；没有可用 PID 1 时，活子进程成为 parentless，已有 zombie 转入静默 exited 回收。随后按以下顺序释放重资源：
-
-```text
-pending exec transaction -> files/open descriptions
--> fs context -> MM -> zombie 或 exited
-```
-
-有父进程且重资源已清空时只保留 task 页、PID、亲缘和 wait status，进入 ZOMBIE；这保证 zombie 不长期占用用户页、页表或文件对象。清理失败时进入 EXITED，由 idle 在可信内核地址空间和 boot 栈上重试；成功后再转 zombie 并唤醒父进程。Parentless 任务由 idle 继续释放 PID 和任务页；只有启动路径直接创建且标记发布的任务会产生 boot completion，克隆失败和孤儿清理不会伪造 PID 1 完成事件。
-
-父进程 wait zombie 时先释放 PID、摘除亲缘，再释放 task 页。若最后一步失败，节点以无 PID、不可发布状态进入 exited 队列重试，避免重复 wait 或重复释放 PID。所有部分失败都由对象状态保留唯一 owner，错误码本身不代替所有权判断。
-
-## 临界区与性能边界
-
-当前单 hart 通过关闭 SIE 串行化 runqueue、父子树、PID、files/fs/MM 生命周期；这不是 SMP 锁。接入多 hart 时必须为 runqueue、进程树、PID 分配、文件表/OFD 引用和 MM/COW 增加锁或原子协议，并处理远端 TLB shootdown。
-
-tick/context switch 只检查 task/queue 常量状态、读取缓存的 `satp` 并切换 context，不获取资源引用、不遍历父子树、不复制页。当前 ASID 0 的地址空间切换执行全局 `SFENCE.VMA`，是明确的切换成本。process 路径按子进程数线性扫描 wait 集合；fork 的主要成本是用户页表/VMA 遍历以及 fd/cwd/OFD 来源复制，数据页只在后续 COW 写 fault 时复制。开发板性能验证尚未进行，不能据 QEMU 时间宣称硬件性能。
-
-## 验证与限制
-
-```sh
-make test-scheduler-cases-riscv
-make test-scheduler-riscv
-make test-mm-riscv
-make test-files-riscv
-make test-user-riscv
-make test-signal-riscv
-make test-userland-riscv
-make test-root-init-riscv
-make test-demand-page-riscv
-make test-exec-riscv
-make test-riscv
-```
-
-聚焦测试覆盖调度状态、创建与清理失败；MM/files 测试分别证明地址空间 COW 与 OFD 引用共享。生产 ext4 三映像链覆盖 clone 双返回、PPID、WNOHANG/阻塞唤醒、wait selector、退出码、`SIGSEGV`/`SIGBUS` 状态、EFAULT 后已回收、fd offset 共享、MM 写隔离、孙进程向 PID 1 reparent，以及最终 heap/物理页基线。demand-page OOM 版本验证资源退出编码为 wait status 9，且仍走同一 zombie/reap 资源闭环。
-
-当前限制是 RISC-V64 单 hart、ASID 0、FIFO/单 tick 时间片、4 KiB 单页内核栈、单成员线程组和普通 SIGCHLD clone。尚无 `CLONE_VM/CLONE_FILES/CLONE_THREAD`、实时信号排队、`sigaltstack`、signalfd、futex、SMP COW 同步、内核栈 guard、V 向量上下文或 LoongArch context。BLOCKED 的 wake queue 仍按全局 blocked 链 O(n) 扫描，wait4 的 child event 以父任务专属等待队列唤醒；这些是当前单 hart 路径的明确成本，不是 SMP 锁协议。
+尚无 SMP、MAP_SHARED、PI futex、实时信号队列、sigaltstack、clone3、内核 robust-list 回收或 LoongArch context。固定语义依据见学习总结的 Linux commit 与 musl 归档。

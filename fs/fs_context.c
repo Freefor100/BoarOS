@@ -32,7 +32,7 @@ int kernel_fs_context_is_live(const struct kernel_fs_context *fs)
 {
     return fs != 0 && fs->state == KERNEL_FS_CONTEXT_LIVE &&
            fs->heap != 0 && fs->record != 0 &&
-           fs->record->references == 1U &&
+           fs->record->references != 0U &&
            fs->record->root_mount != 0 && fs->record->cwd != 0;
 }
 
@@ -99,6 +99,24 @@ enum kernel_fs_context_status kernel_fs_context_create(
                           heap,
                           root_path,
                           sizeof(root_path));
+}
+
+enum kernel_fs_context_status kernel_fs_context_acquire(
+    struct kernel_fs_context *destination,
+    const struct kernel_fs_context *source)
+{
+    if (destination == 0 || source == 0 || destination == source) {
+        return KERNEL_FS_CONTEXT_STATUS_INVALID_ARGUMENT;
+    }
+    if (!empty_context(destination) || !kernel_fs_context_is_live(source) ||
+        source->record->references == UINT32_MAX) {
+        return KERNEL_FS_CONTEXT_STATUS_STATE;
+    }
+    source->record->references++;
+    destination->heap = source->heap;
+    destination->record = source->record;
+    destination->state = KERNEL_FS_CONTEXT_LIVE;
+    return KERNEL_FS_CONTEXT_STATUS_OK;
 }
 
 static size_t text_length(const char *text)
@@ -269,8 +287,17 @@ enum kernel_fs_context_status kernel_fs_context_release(
     if ((fs->state != KERNEL_FS_CONTEXT_LIVE &&
          fs->state != KERNEL_FS_CONTEXT_CLEANUP) ||
         fs->heap == 0 || fs->record == 0 ||
-        fs->record->references != 1U ||
+        fs->record->references == 0U ||
         fs->record->root_mount == 0) {
+        return KERNEL_FS_CONTEXT_STATUS_STATE;
+    }
+    if (fs->state == KERNEL_FS_CONTEXT_LIVE &&
+        fs->record->references > 1U) {
+        fs->record->references--;
+        finish_context(fs, KERNEL_FS_CONTEXT_RELEASED);
+        return KERNEL_FS_CONTEXT_STATUS_OK;
+    }
+    if (fs->record->references != 1U) {
         return KERNEL_FS_CONTEXT_STATUS_STATE;
     }
     fs->state = KERNEL_FS_CONTEXT_CLEANUP;

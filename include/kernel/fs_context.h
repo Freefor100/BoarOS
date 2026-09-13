@@ -39,6 +39,11 @@ enum kernel_fs_context_status kernel_fs_context_create(
     struct kernel_vfs_mount *root_mount,
     struct kernel_heap *heap);
 
+/* Share the root and current-working-directory context. */
+enum kernel_fs_context_status kernel_fs_context_acquire(
+    struct kernel_fs_context *destination,
+    const struct kernel_fs_context *source);
+
 enum kernel_fs_context_status kernel_fs_context_fork(
     struct kernel_fs_context *destination,
     const struct kernel_fs_context *source);

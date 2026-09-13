@@ -192,6 +192,10 @@ void riscv_trap_dispatch(struct riscv_trap_frame *frame)
             KERNEL_SYSCALL_STATUS_OK) {
             riscv_trap_fatal(frame);
         }
+        if (result.action == KERNEL_SYSCALL_ACTION_EXIT_GROUP) {
+            kernel_user_group_exit(KERNEL_THREAD_EXIT_SYSCALL,
+                                   (uint64_t)result.value, 0U);
+        }
         if (result.action == KERNEL_SYSCALL_ACTION_EXIT) {
             kernel_user_thread_exit(KERNEL_THREAD_EXIT_SYSCALL,
                                     (uint64_t)result.value,
@@ -212,6 +216,9 @@ void riscv_trap_dispatch(struct riscv_trap_frame *frame)
                     frame,
                     request.arguments[0],
                     request.arguments[1],
+                    request.arguments[2],
+                    request.arguments[3],
+                    request.arguments[4],
                     &result.value);
 
             if (scheduler_status != KERNEL_SCHEDULER_STATUS_OK) {

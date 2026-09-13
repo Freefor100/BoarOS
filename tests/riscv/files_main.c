@@ -636,6 +636,83 @@ static void run_fork_operations(struct kernel_files *parent_files,
     }
 }
 
+static void run_shared_handle_operations(
+    struct kernel_files *files,
+    const struct kernel_fs_context *fs,
+    struct kernel_mm *mm)
+{
+    struct kernel_files shared_files = {0};
+    struct kernel_fs_context shared_fs = {0};
+    struct kernel_vfs_mount *resolved_mount = 0;
+    int64_t result = INT64_MIN;
+    int path_result = INT32_MIN;
+
+    expect_open(files, fs, mm, TEST_AT_FDCWD, "/data", 0U, 0, 128U);
+    if (kernel_files_acquire(&shared_files, files) !=
+            KERNEL_FILES_STATUS_OK ||
+        kernel_fs_context_acquire(&shared_fs, fs) !=
+            KERNEL_FS_CONTEXT_STATUS_OK ||
+        !kernel_files_is_live(files) ||
+        !kernel_files_is_live(&shared_files) ||
+        !kernel_fs_context_is_live(fs) ||
+        !kernel_fs_context_is_live(&shared_fs) ||
+        kernel_fs_context_resolve_kernel_path(&shared_fs,
+                                              TEST_AT_FDCWD,
+                                              "data",
+                                              4U,
+                                              fork_resolved_path,
+                                              sizeof(fork_resolved_path),
+                                              &resolved_mount,
+                                              &path_result) !=
+            KERNEL_FS_CONTEXT_STATUS_OK ||
+        path_result != 0 || resolved_mount == 0) {
+        fail_files(129U, KERNEL_FILES_STATUS_OK,
+                   KERNEL_FILES_STATUS_STATE);
+    }
+
+    if (kernel_files_close(&shared_files, 0, &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != 0 ||
+        kernel_files_read(files,
+                          mm,
+                          0,
+                          TEST_USER_BUFFER,
+                          1U,
+                          &result) != KERNEL_FILES_STATUS_OK ||
+        result != -KERNEL_EBADF) {
+        fail_files(130U, -KERNEL_EBADF, result);
+    }
+
+    expect_open(files, fs, mm, TEST_AT_FDCWD, "/data", 0U, 0, 131U);
+    count_open_file_releases = 1;
+    counted_open_file_releases = 0U;
+    if (kernel_files_release(&shared_files) != KERNEL_FILES_STATUS_OK ||
+        kernel_fs_context_release(&shared_fs) !=
+            KERNEL_FS_CONTEXT_STATUS_OK ||
+        counted_open_file_releases != 0U ||
+        !kernel_files_is_live(files) ||
+        !kernel_fs_context_is_live(fs)) {
+        count_open_file_releases = 0;
+        fail_files(132U, 0, counted_open_file_releases);
+    }
+    if (kernel_files_read(files,
+                          mm,
+                          0,
+                          TEST_USER_BUFFER,
+                          1U,
+                          &result) != KERNEL_FILES_STATUS_OK ||
+        result != 1 || counted_open_file_releases != 1U) {
+        count_open_file_releases = 0;
+        fail_files(133U, 1, counted_open_file_releases);
+    }
+    count_open_file_releases = 0;
+    expect_user_pattern(mm, TEST_USER_BUFFER, 0U, 1U, 134U);
+    if (kernel_files_close(files, 0, &result) != KERNEL_FILES_STATUS_OK ||
+        result != 0) {
+        fail_files(135U, 0, result);
+    }
+}
+
 static void run_mmap_operations(struct kernel_files *files,
                                 const struct kernel_fs_context *fs,
                                 struct kernel_mm *mm,
@@ -839,16 +916,23 @@ static void run_console_operations(struct kernel_files *files,
     if (!write_user_bytes(mm,
                           TEST_USER_PATH,
                           marker,
-                          sizeof(marker) - 1U) ||
-        kernel_files_write(files,
+                          sizeof(marker) - 1U)) {
+        fail_files(71U, 1, 0);
+    }
+    counted_open_file_releases = 0U;
+    count_open_file_releases = 1;
+    if (kernel_files_write(files,
                            mm,
                            1,
                            TEST_USER_PATH,
                            sizeof(marker) - 1U,
                            &result) != KERNEL_FILES_STATUS_OK ||
-        result != (int64_t)(sizeof(marker) - 1U)) {
+        result != (int64_t)(sizeof(marker) - 1U) ||
+        counted_open_file_releases != 1U) {
+        count_open_file_releases = 0;
         fail_files(71U, (long)(sizeof(marker) - 1U), (long)result);
     }
+    count_open_file_releases = 0;
 
     /* Regular descriptors are read-only, so writes report EBADF.  The
      * console read blocks until the tick poller feeds it, which only the
@@ -1860,15 +1944,24 @@ static void run_pipe_operations(struct kernel_files *files,
     iov[0].length = 2U;
     iov[1].base = TEST_USER_BUFFER + 2U;
     iov[1].length = 2U;
-    if (!write_user_bytes(mm, TEST_USER_PATH, iov, sizeof(iov)) ||
-        kernel_files_writev(files,
+    if (!write_user_bytes(mm, TEST_USER_PATH, iov, sizeof(iov))) {
+        fail_files(126U, 1, 0);
+    }
+    counted_open_file_releases = 0U;
+    count_open_file_releases = 1;
+    if (kernel_files_writev(files,
                             mm,
                             pair[1],
                             TEST_USER_PATH,
                             2U,
                             &result) != KERNEL_FILES_STATUS_OK ||
         result != -KERNEL_EAGAIN ||
-        kernel_files_write(files,
+        counted_open_file_releases != 1U) {
+        count_open_file_releases = 0;
+        fail_files(126U, 1, counted_open_file_releases);
+    }
+    count_open_file_releases = 0;
+    if (kernel_files_write(files,
                            mm,
                            pair[1],
                            TEST_USER_BUFFER,
@@ -1994,6 +2087,7 @@ static void run_files_test(const void *dtb)
     }
     use_test_satp = 1;
 
+    run_shared_handle_operations(&files, &fs, &mm);
     run_fork_operations(&files, &fs, &mm);
     if (kernel_files_release(&files) != KERNEL_FILES_STATUS_OK) {
         fail_files(50U, KERNEL_FILES_STATUS_OK,

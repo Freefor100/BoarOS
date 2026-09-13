@@ -328,6 +328,9 @@ static unsigned long run_create_cases(
 
     failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
                               kernel_scheduler_on_tick(1U));
+    /* Each exit returns to the cleanup context before the next dispatch. */
+    failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
+                              kernel_scheduler_on_tick(1U));
     if (entry_count != TEST_PAGE_COUNT ||
         entry_order[0] != 1U || entry_order[1] != 2U ||
         entry_tp[0] == 0 || entry_tp[1] == 0 ||
@@ -640,6 +643,8 @@ static unsigned long run_wait_cases(
     failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
                               kernel_thread_create(yielding_worker,
                                                    (void *)(uintptr_t)1U));
+    failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
+                              kernel_scheduler_on_tick(1U));
     failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
                               kernel_scheduler_on_tick(1U));
     if (yield_runs != 2U) {

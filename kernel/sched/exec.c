@@ -3,6 +3,7 @@
 
 #include <arch/riscv/fpu.h>
 #include <arch/riscv/mm.h>
+#include <arch/riscv/process.h>
 #include <arch/riscv/sv39.h>
 #include <arch/riscv/thread.h>
 #include <arch/riscv/trap.h>
@@ -22,32 +23,6 @@ static void finish_mm_move(struct kernel_mm *mm)
     mm->record_page_address = 0U;
     mm->state = KERNEL_MM_MOVED;
     mm->cleanup_stage = KERNEL_MM_CLEANUP_NONE;
-}
-
-static void reset_exec_trap_frame(struct kernel_task *thread,
-                                  uintptr_t entry,
-                                  uintptr_t stack_pointer,
-                                  uintptr_t thread_pointer)
-{
-    struct riscv_trap_frame *frame =
-        (struct riscv_trap_frame *)(thread->stack_high -
-                                    sizeof(struct riscv_trap_frame));
-    volatile unsigned char *bytes = (volatile unsigned char *)frame;
-    size_t index;
-
-    for (index = 0U; index < sizeof(*frame); index++) {
-        bytes[index] = 0U;
-    }
-    frame->sp = stack_pointer;
-    frame->tp = thread_pointer;
-    frame->sstatus = RISCV_SSTATUS_SPIE | RISCV_SSTATUS_UXL_64 |
-                     RISCV_SSTATUS_FS_INITIAL;
-    frame->sepc = entry;
-    frame->kernel_tp = (uintptr_t)thread;
-    /* The execing task returns to user space without a context switch,
-     * so the old image's register contents are cleared here rather than
-     * by the first dispatch. */
-    riscv_fpu_reset_current(&thread->fpu);
 }
 
 enum kernel_scheduler_status kernel_scheduler_exec_commit(void)
@@ -77,7 +52,6 @@ enum kernel_scheduler_status kernel_scheduler_exec_commit(void)
     thread = scheduler.current;
     transaction = thread->exec_transaction;
     if (thread == &scheduler.idle || thread->arch.user_mode != 1U ||
-        thread->group_leader != thread || thread->group_members != 1U ||
         transaction == 0 ||
         transaction->state != KERNEL_EXEC_TRANSACTION_PREPARED ||
         transaction->retired_mm.state != KERNEL_MM_EMPTY ||
@@ -131,6 +105,8 @@ enum kernel_scheduler_status kernel_scheduler_exec_commit(void)
                    : KERNEL_SCHEDULER_STATUS_INVALID_STATE;
     }
 
+    status = process_group_exec_current();
+    if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
     if (riscv_sv39_switch_satp(new_satp) != RISCV_SV39_STATUS_OK) {
         return KERNEL_SCHEDULER_STATUS_ADDRESS_SPACE;
     }
@@ -138,7 +114,7 @@ enum kernel_scheduler_status kernel_scheduler_exec_commit(void)
     thread->mm = transaction->image.mm;
     finish_mm_move(&transaction->image.mm);
     thread->arch.satp = new_satp;
-    reset_exec_trap_frame(thread,
+    riscv_process_prepare_exec(thread,
                           transaction->image.entry,
                           transaction->image.stack_pointer,
                           transaction->image.thread_pointer);

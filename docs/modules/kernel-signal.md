@@ -11,15 +11,15 @@
 
 ## 状态与生命周期
 
-每个任务使用 64 位 pending/blocked 位图，位 `sig-1` 对应信号。重复标准信号合并并保留首个 sender；disposition 表按需分配一页。SIGKILL/SIGSTOP 不能捕获、忽略或阻塞。fork 继承 disposition 和 blocked mask，清空 child pending；exec 重置自定义 handler，保留忽略 disposition、blocked mask 和 pending。
+每个线程使用 64 位 pending/blocked 位图，位 `sig-1` 对应信号；组长另持进程定向 pending。重复标准信号合并并保留首个 sender，handler 由一个未屏蔽成员执行。disposition 表按需分配一页并在组内引用共享；fork 复制当时的表和调用线程 mask，清空 child pending。exec 收拢组后重置自定义 handler，保留忽略 disposition、mask 和仍有效 pending。SIGKILL/SIGSTOP 不能捕获、忽略或阻塞。
 
 默认动作包括忽略、继续、停止、终止和 core 标志；core 位不意味着已经生成 core 文件。SIGCONT 清除所有 pending stop 信号并恢复 stopped task；发送任一 stop 信号清除 pending SIGCONT。这些取消规则不依赖信号是否被阻塞。
 
-SIGCHLD 的默认忽略不同于显式 SIG_IGN：默认仍保留 zombie 供 wait4 回收；显式 SIG_IGN 或 SA_NOCLDWAIT 在退出资源清理完成后自动回收。SA_NOCLDWAIT 不抑制已安装 handler 的退出通知；SA_NOCLDSTOP 单独控制 stop/continue 通知。清理失败保留 task/owner，由 idle 重试，不能丢失父进程的唤醒。
+SIGCHLD 的默认忽略不同于显式 SIG_IGN：默认仍保留 zombie 供 wait4 回收；显式 SIG_IGN 或 SA_NOCLDWAIT 在全组退出资源清理完成后自动回收。SA_NOCLDWAIT 不抑制已安装 handler 的退出通知；SA_NOCLDSTOP 单独控制 stop/continue 通知。清理失败保留 task/owner，由 cleanup context 重试，不能丢失父进程的唤醒。kill 使用组 pending，tkill/tgkill 与同步产生的 SIGPIPE 使用线程 pending；SIGKILL 和默认致命动作终止全组。
 
 ## 输入、信号帧与恢复
 
-rt_sigaction/rt_sigprocmask 先完整复制输入，再提交状态，最后输出旧状态，允许输入输出地址别名。输入 EFAULT 不提交；输出 EFAULT 不回滚已经提交的有效动作。复制 helper 返回真实 uaccess 状态，handler 映射 errno。rt_sigpending 返回 pending 与 blocked 的交集。
+rt_sigaction/rt_sigprocmask 先完整复制输入，再提交状态，最后输出旧状态，允许输入输出地址别名。输入 EFAULT 不提交；输出 EFAULT 不回滚已经提交的有效动作。复制 helper 返回真实 uaccess 状态，handler 映射 errno。rt_sigpending 返回组与线程 pending 的并集再与 blocked 取交集。
 
 RISC-V frame 共 1088 字节，16 字节对齐：128 字节 siginfo 加 960 字节 ucontext。ucontext 内 sigmask 偏移 40、mcontext 偏移 176；mcontext 包含 32 个整数寄存器和按 Q 扩展容量保留的 528 字节、16 字节对齐 FP union。当前只填写 D 寄存器与 32 位 fcsr，其余扩展存储清零。内核静态断言和真实 musl ucontext 共同核对布局，不能仅用同一套手写偏移自证正确。
 
@@ -35,8 +35,8 @@ sigsuspend 在等待和选择 handler 时保留临时 mask，把原 mask 写入�
 
 ## 验证与当前边界
 
-当前 RV64 `-O2` 的静态栈检查中，构帧函数使用 880 字节、sigreturn 使用 864 字节；构帧复用 784 字节存储分别编码前缀与 mcontext，不在内核栈放置整份 1088 字节 frame。任务控制块为 1088 字节；4 KiB 页扣除控制块、canary/对齐和 288 字节 Trap Frame 后剩余 2704 字节。单函数统计不是完整调用链栈界证明，真实回归同时检查 canary；深层缺页/失败清理链和未来功能仍需沿调用链复查预算。
+当前 RV64 `-O2` 静态栈检查中，构帧函数使用 896 字节、sigreturn 使用 864 字节；构帧复用前缀/mcontext 存储，不在内核栈放置整份 1088 字节 frame。线程组改动后的任务控制块为 1504 字节；4 KiB 页扣除控制块、canary/对齐和 288 字节 Trap Frame 后剩余 2288 字节。真实静态用户态曾在 getdents→ext4→heap 释放调用链触发 canary；getdents 改为直接填充输出记录中的文件名，去掉额外 256 字节副本，其静态栈降至 416 字节，组合回归通过。单函数统计和一次回归均不是完整栈界证明，深层缺页和失败清理链仍须沿调用链审查。
 
 `make test-signal-riscv` 覆盖 syscall 复制失败、状态提交与 errno；`make test-userland-riscv` 以真实静态 musl 验证 handler/sigreturn、libc ucontext、sigsuspend、睡眠 EINTR、vfork、SIGCHLD 回收及 pipe 等待。架构和调度边界由 `make test-riscv` 回归。
 
-当前为单 hart、单成员线程组和标准信号；尚无实时信号队列、sigaltstack、signalfd、完整会话/控制终端语义或 SMP 同步。siginfo 当前主要提供 SI_USER 信号与 sender，不宣称完整的故障 siginfo/用户故障 handler 路径。
+当前为单 hart 线程组和位图 pending；尚无实时信号队列、sigaltstack、signalfd、完整会话/控制终端语义或 SMP 同步。libc 内部信号可走线程定向路径，但不据此宣称完整实时信号排队。siginfo 当前主要提供 SI_USER 信号与 sender，不宣称完整故障 siginfo。组 stop/continue 与致命取消不能直接释放睡眠中的任务栈；不可中断的 vfork 有独立取消握手。

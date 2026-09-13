@@ -27,7 +27,7 @@ int kernel_files_is_live(const struct kernel_files *files)
 {
     return files != 0 && files->state == KERNEL_FILES_LIVE &&
            files->heap != 0 && files->record != 0 &&
-           files->record->references == 1U &&
+           files->record->references != 0U &&
            files->record->slots != 0 &&
            files->record->statistics.capacity >=
                KERNEL_FILES_INITIAL_CAPACITY;
@@ -94,6 +94,24 @@ enum kernel_files_status kernel_files_create(
         return KERNEL_FILES_STATUS_STATE;
     }
     return create_files(files, heap, KERNEL_FILES_INITIAL_CAPACITY);
+}
+
+enum kernel_files_status kernel_files_acquire(
+    struct kernel_files *destination,
+    const struct kernel_files *source)
+{
+    if (destination == 0 || source == 0 || destination == source) {
+        return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
+    }
+    if (!empty_files(destination) || !kernel_files_is_live(source) ||
+        source->record->references == UINT32_MAX) {
+        return KERNEL_FILES_STATUS_STATE;
+    }
+    source->record->references++;
+    destination->heap = source->heap;
+    destination->record = source->record;
+    destination->state = KERNEL_FILES_LIVE;
+    return KERNEL_FILES_STATUS_OK;
 }
 
 enum kernel_files_status kernel_files_fork(
@@ -984,7 +1002,16 @@ enum kernel_files_status kernel_files_release(
     if ((files->state != KERNEL_FILES_LIVE &&
          files->state != KERNEL_FILES_CLEANUP) ||
         files->heap == 0 || files->record == 0 ||
-        files->record->references != 1U) {
+        files->record->references == 0U) {
+        return KERNEL_FILES_STATUS_STATE;
+    }
+    if (files->state == KERNEL_FILES_LIVE &&
+        files->record->references > 1U) {
+        files->record->references--;
+        finish_files(files, KERNEL_FILES_RELEASED);
+        return KERNEL_FILES_STATUS_OK;
+    }
+    if (files->record->references != 1U) {
         return KERNEL_FILES_STATUS_STATE;
     }
     if (files->state == KERNEL_FILES_LIVE) {

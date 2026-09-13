@@ -20,28 +20,39 @@
     ((uint64_t)INT32_MAX & ~(uint64_t)BOAROS_PAGE_MASK)
 #define KERNEL_FILES_WRITE_STAGING 64U
 
-enum kernel_files_status kernel_files_read(
+static enum kernel_files_status release_io_description(
+    struct kernel_files *files,
+    struct kernel_open_file_description **owner,
+    enum kernel_files_status operation_status)
+{
+    enum kernel_open_file_status release_status;
+
+    release_status = kernel_open_file_release(owner);
+    if (release_status == KERNEL_OPEN_FILE_STATUS_OK) {
+        return operation_status;
+    }
+    if (release_status == KERNEL_OPEN_FILE_STATUS_CLEANUP_REQUIRED &&
+        *owner != 0) {
+        kernel_files_queue_description(files, *owner);
+        *owner = 0;
+        return operation_status == KERNEL_FILES_STATUS_STATE
+                   ? operation_status
+                   : KERNEL_FILES_STATUS_CLEANUP_REQUIRED;
+    }
+    return KERNEL_FILES_STATUS_STATE;
+}
+
+static enum kernel_files_status read_pinned(
     struct kernel_files *files,
     struct kernel_mm *mm,
-    int64_t fd,
+    struct kernel_open_file_description *description,
     uint64_t user_buffer,
     uint64_t count,
     int64_t *linux_result)
 {
-    struct kernel_open_file_description *description;
     uint64_t request;
     uint64_t total = 0U;
 
-    if (!kernel_files_is_live(files) || mm == 0 || linux_result == 0) {
-        return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
-    }
-    files->record->statistics.read_calls++;
-    description = kernel_files_lookup_description(files, fd);
-    if (description == 0) {
-        files->record->statistics.read_failures++;
-        *linux_result = -KERNEL_EBADF;
-        return KERNEL_FILES_STATUS_OK;
-    }
     if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_CONSOLE) {
         return kernel_files_read_console(files, mm, user_buffer, count,
                                          linux_result);
@@ -169,6 +180,34 @@ enum kernel_files_status kernel_files_read(
     files->record->statistics.bytes_read += total;
     *linux_result = (int64_t)total;
     return KERNEL_FILES_STATUS_OK;
+}
+
+enum kernel_files_status kernel_files_read(
+    struct kernel_files *files,
+    struct kernel_mm *mm,
+    int64_t fd,
+    uint64_t user_buffer,
+    uint64_t count,
+    int64_t *linux_result)
+{
+    struct kernel_open_file_description *description = 0;
+    enum kernel_files_status status;
+
+    if (!kernel_files_is_live(files) || mm == 0 || linux_result == 0) {
+        return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
+    }
+    files->record->statistics.read_calls++;
+    status = kernel_files_pin(files, fd, &description, linux_result);
+    if (status != KERNEL_FILES_STATUS_OK) {
+        return status;
+    }
+    if (*linux_result != 0) {
+        files->record->statistics.read_failures++;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    status = read_pinned(files, mm, description, user_buffer, count,
+                         linux_result);
+    return release_io_description(files, &description, status);
 }
 
 enum kernel_files_status kernel_files_pread(
@@ -307,20 +346,16 @@ enum kernel_files_status kernel_files_pread(
     return KERNEL_FILES_STATUS_OK;
 }
 
-static struct kernel_open_file_description *writable_description(
-    struct kernel_files *files, int64_t fd)
+static int description_writable(
+    const struct kernel_open_file_description *description)
 {
-    struct kernel_open_file_description *description =
-        kernel_files_lookup_description(files, fd);
-
-    if (description == 0 ||
-        (kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_CONSOLE &&
+    if ((kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_CONSOLE &&
          kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_PIPE) ||
         (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_PIPE &&
          (description->open_flags & 3U) == 0U)) {
         return 0;
     }
-    return description;
+    return 1;
 }
 
 static enum kernel_files_status write_request(
@@ -390,18 +425,27 @@ enum kernel_files_status kernel_files_write(
     uint64_t user_buffer, uint64_t count, int64_t *linux_result)
 {
     struct kernel_uaccess_iovec iov = {user_buffer, count};
-    struct kernel_open_file_description *description;
+    struct kernel_open_file_description *description = 0;
     enum kernel_files_status status;
 
     if (!kernel_files_is_live(files) || mm == 0 || linux_result == 0) {
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
     }
     files->record->statistics.write_calls++;
-    description = writable_description(files, fd);
-    if (description == 0) {
+    status = kernel_files_pin(files, fd, &description, linux_result);
+    if (status != KERNEL_FILES_STATUS_OK) {
+        return status;
+    }
+    if (*linux_result != 0) {
         *linux_result = -KERNEL_EBADF;
         account_write(files, *linux_result);
         return KERNEL_FILES_STATUS_OK;
+    }
+    if (!description_writable(description)) {
+        *linux_result = -KERNEL_EBADF;
+        account_write(files, *linux_result);
+        return release_io_description(files, &description,
+                                      KERNEL_FILES_STATUS_OK);
     }
     if (count > KERNEL_FILES_MAX_RW_COUNT) {
         count = KERNEL_FILES_MAX_RW_COUNT;
@@ -410,13 +454,14 @@ enum kernel_files_status kernel_files_write(
         KERNEL_UACCESS_STATUS_OK) {
         *linux_result = -KERNEL_EFAULT;
         account_write(files, *linux_result);
-        return KERNEL_FILES_STATUS_OK;
+        return release_io_description(files, &description,
+                                      KERNEL_FILES_STATUS_OK);
     }
     status = write_request(files, mm, description, &iov, 1U, count, linux_result);
     if (status == KERNEL_FILES_STATUS_OK) {
         account_write(files, *linux_result);
     }
-    return status;
+    return release_io_description(files, &description, status);
 }
 
 enum kernel_files_status kernel_files_writev(
@@ -425,7 +470,7 @@ enum kernel_files_status kernel_files_writev(
 {
     struct kernel_uaccess_iovec local[8];
     struct kernel_uaccess_iovec *iov = local;
-    struct kernel_open_file_description *description;
+    struct kernel_open_file_description *description = 0;
     uint64_t total = 0U;
     size_t copied = 0U;
     enum kernel_files_status status = KERNEL_FILES_STATUS_OK;
@@ -435,16 +480,24 @@ enum kernel_files_status kernel_files_writev(
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
     }
     files->record->statistics.write_calls++;
-    description = writable_description(files, fd);
-    if (description == 0) {
+    status = kernel_files_pin(files, fd, &description, linux_result);
+    if (status != KERNEL_FILES_STATUS_OK) {
+        return status;
+    }
+    if (*linux_result != 0) {
         *linux_result = -KERNEL_EBADF;
         account_write(files, *linux_result);
         return KERNEL_FILES_STATUS_OK;
     }
+    if (!description_writable(description)) {
+        *linux_result = -KERNEL_EBADF;
+        account_write(files, *linux_result);
+        return release_io_description(files, &description,
+                                      KERNEL_FILES_STATUS_OK);
+    }
     if (iovcnt > 1024U) {
         *linux_result = -KERNEL_EINVAL;
-        account_write(files, *linux_result);
-        return KERNEL_FILES_STATUS_OK;
+        goto out;
     }
     if (iovcnt > sizeof(local) / sizeof(local[0])) {
         enum kernel_heap_status allocation =
@@ -453,11 +506,11 @@ enum kernel_files_status kernel_files_writev(
 
         if (allocation != KERNEL_HEAP_STATUS_OK) {
             if (allocation != KERNEL_HEAP_STATUS_EMPTY) {
-                return KERNEL_FILES_STATUS_STATE;
+                status = KERNEL_FILES_STATUS_STATE;
+                goto out;
             }
             *linux_result = -KERNEL_ENOMEM;
-            account_write(files, *linux_result);
-            return KERNEL_FILES_STATUS_OK;
+            goto out;
         }
     }
     /* Import descriptors once before any output or blocking. This is also
@@ -497,7 +550,7 @@ out:
     if (status == KERNEL_FILES_STATUS_OK) {
         account_write(files, *linux_result);
     }
-    return status;
+    return release_io_description(files, &description, status);
 }
 
 enum kernel_files_status kernel_files_lseek(
@@ -573,7 +626,9 @@ enum kernel_files_status kernel_files_getdents(
 {
     struct kernel_open_file_description *description;
     unsigned char record[(19U + 256U + 7U) & ~(size_t)7U];
-    char name[256];
+    /* Fill the name directly in the outgoing dirent. Keeping a second
+     * 256-byte copy consumes the single-page task stack on ext4 faults. */
+    char *name = (char *)&record[19];
     uint64_t inode;
     uint8_t type;
     uint64_t request;
@@ -625,7 +680,7 @@ enum kernel_files_status kernel_files_getdents(
                                            &inode,
                                            &type,
                                            name,
-                                           sizeof(name));
+                                           256U);
         if (fill_result == 0) {
             if (kernel_open_file_seek(description, next_position) !=
                 KERNEL_OPEN_FILE_STATUS_OK) {
@@ -666,7 +721,6 @@ enum kernel_files_status kernel_files_getdents(
         }
         memcpy(&record[16], &reported_length, sizeof(reported_length));
         record[18] = type;
-        memcpy(&record[19], name, name_length);
         record[19U + name_length] = '\0';
         for (size_t pad = 19U + name_length + 1U; pad < record_length;
              pad++) {

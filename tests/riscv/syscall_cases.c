@@ -676,7 +676,7 @@ static unsigned long run_seek_stat_decode_cases(void)
     request.arguments[0] = UINT64_C(0x11223344556677ab);
     if (kernel_syscall_dispatch(caller, &request, &result) !=
             KERNEL_SYSCALL_STATUS_OK ||
-        result_changed(&result, KERNEL_SYSCALL_ACTION_EXIT, 0xab)) {
+        result_changed(&result, KERNEL_SYSCALL_ACTION_EXIT_GROUP, 0xab)) {
         failures++;
     }
 

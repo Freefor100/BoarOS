@@ -32,6 +32,7 @@ enum kernel_thread_state {
     KERNEL_THREAD_STATE_EXITED,
     KERNEL_THREAD_STATE_ZOMBIE,
     KERNEL_THREAD_STATE_STOPPED,
+    KERNEL_THREAD_STATE_GROUP_DEAD,
 };
 
 enum kernel_syscall_restart_kind {
@@ -54,6 +55,7 @@ struct kernel_signal_action {
 
 struct kernel_signal_table {
     uint64_t magic;
+    uint32_t references;
     struct kernel_signal_action actions[KERNEL_SIGNAL_COUNT];
 };
 
@@ -93,8 +95,25 @@ struct kernel_task {
     struct kernel_wait_queue vfork_done_queue;
     uint32_t vfork_child;
     uint32_t vfork_waiting;
+    struct kernel_task *vfork_parent;
+    struct kernel_task *vfork_wait_child;
     struct kernel_task *group_leader;
     uint32_t group_members;
+    struct kernel_task *group_next;
+    struct kernel_task *group_previous;
+    kernel_pid_t child_creator_tid;
+    uint32_t terminate_requested;
+    uint32_t group_exiting;
+    uint32_t group_execing;
+    uint32_t group_stopped;
+    struct kernel_wait_queue group_wait_queue;
+    uint64_t group_pending;
+    uint32_t group_sender[KERNEL_SIGNAL_COUNT];
+    struct kernel_task *wait_previous;
+    struct kernel_task *wait_next;
+    struct kernel_task *blocked_previous;
+    uint64_t futex_mm;
+    uint64_t futex_address;
     uint64_t signal_pending;
     uint64_t signal_blocked;
     uint64_t signal_saved_mask;
@@ -137,6 +156,16 @@ struct kernel_scheduler {
 };
 
 extern struct kernel_scheduler scheduler;
+
+void scheduler_wake_task(struct kernel_task *thread, uint32_t reason);
+void scheduler_wait_requeue(struct kernel_task *task,
+                            struct kernel_wait_queue *queue);
+void process_group_initialize(struct kernel_task *task);
+void process_group_request_exit(struct kernel_task *task,
+                                enum kernel_thread_exit_reason reason,
+                                uint64_t status, uint64_t detail);
+enum kernel_scheduler_status process_group_exec_current(void);
+int kernel_signal_has_pending(const struct kernel_task *task);
 
 uintptr_t align_up_16(uintptr_t value);
 void clear_page(void *pointer);

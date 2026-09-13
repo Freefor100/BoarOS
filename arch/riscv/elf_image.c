@@ -786,6 +786,7 @@ enum riscv_elf_image_status riscv_elf_image_build(
     uint64_t interpreter_alignment;
     uint64_t random_value;
     uint8_t stack_random[16];
+    uint64_t image_ceiling;
     enum riscv_elf_image_status status;
     enum riscv_sv39_status sv39_status;
     enum kernel_mm_status mm_status;
@@ -872,10 +873,22 @@ enum riscv_elf_image_status riscv_elf_image_build(
     }
     base.mmap_base = base.stack_guard - RISCV_ELF_MMAP_GAP -
                      random_value * BOAROS_PAGE_SIZE;
+    /* Leave a nonempty heap interval and room for an ET_DYN interpreter.
+     * Independent random draws must select legal holes, not occasionally
+     * consume the space required by the next part of the same image. */
+    image_ceiling = base.mmap_base - BOAROS_PAGE_SIZE;
+    if (interpreter_header != 0 &&
+        interpreter_header->type == KERNEL_ELF64_TYPE_SHARED) {
+        uint64_t reserve = interpreter_maximum - interpreter_minimum;
+        if (reserve > UINT64_MAX - interpreter_alignment ||
+            reserve + interpreter_alignment >= image_ceiling)
+            return RISCV_ELF_IMAGE_STATUS_ADDRESS_SPACE;
+        image_ceiling -= reserve + interpreter_alignment;
+    }
     if (main_header->type == KERNEL_ELF64_TYPE_EXECUTABLE) {
         base.main_bias = 0U;
     } else if (!choose_pie_bias(request->executable_source,
-                                base.mmap_base,
+                                image_ceiling,
                                 &base.main_bias)) {
         return RISCV_ELF_IMAGE_STATUS_ADDRESS_SPACE;
     }
@@ -891,7 +904,7 @@ enum riscv_elf_image_status riscv_elf_image_build(
             base.interpreter_bias = 0U;
         } else if (!choose_interpreter_bias(request->interpreter_source,
                                             base.mmap_base,
-                                            base.main_end,
+                                            base.main_end + BOAROS_PAGE_SIZE,
                                             &base.interpreter_bias)) {
             return RISCV_ELF_IMAGE_STATUS_ADDRESS_SPACE;
         }
@@ -929,9 +942,18 @@ enum riscv_elf_image_status riscv_elf_image_build(
         base.main_phdr == 0U) {
         return RISCV_ELF_IMAGE_STATUS_MALFORMED;
     }
+    base.brk_limit = base.mmap_base;
+    if (base.has_interpreter &&
+        base.interpreter_bias + interpreter_minimum > base.main_end &&
+        base.interpreter_bias + interpreter_minimum < base.brk_limit)
+        base.brk_limit = base.interpreter_bias + interpreter_minimum;
+    if (base.main_end >= base.brk_limit)
+        return RISCV_ELF_IMAGE_STATUS_ADDRESS_SPACE;
     if (!random_pages(18U, &random_value)) {
         return RISCV_ELF_IMAGE_STATUS_ADDRESS_SPACE;
     }
+    random_value %= (base.brk_limit - base.main_end - 1U) /
+                         BOAROS_PAGE_SIZE + 1U;
     if (base.main_end > UINT64_MAX - random_value * BOAROS_PAGE_SIZE) {
         return RISCV_ELF_IMAGE_STATUS_ADDRESS_SPACE;
     }
@@ -943,7 +965,6 @@ enum riscv_elf_image_status riscv_elf_image_build(
                              : 0U;
     }
     /* Keep the growing brk interval below the independent mmap window. */
-    base.brk_limit = base.mmap_base;
     if (base.brk_start < BOAROS_PAGE_SIZE ||
         base.brk_start >= base.brk_limit ||
         base.mmap_base <= base.brk_start) {
@@ -953,7 +974,7 @@ enum riscv_elf_image_status riscv_elf_image_build(
         return RISCV_ELF_IMAGE_STATUS_ADDRESS_SPACE;
     }
     /* Keep the heap below the independently selected VDSO when necessary. */
-    if (base.vdso > base.brk_start) {
+    if (base.vdso > base.brk_start && base.vdso < base.brk_limit) {
         base.brk_limit = base.vdso;
     }
     status = prepare_stack_layout(request, &base, &layout);

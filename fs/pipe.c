@@ -306,7 +306,7 @@ static enum kernel_pipe_status pipe_signal_broken(
     struct kernel_pipe *pipe,
     int64_t *linux_result)
 {
-    if (kernel_signal_send(kernel_task_current(),
+    if (kernel_signal_send_task(kernel_task_current(),
                            KERNEL_PIPE_SIGPIPE,
                            0) != KERNEL_SIGNAL_STATUS_OK) {
         return KERNEL_PIPE_STATUS_STATE;

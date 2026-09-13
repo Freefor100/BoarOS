@@ -56,18 +56,35 @@ enum kernel_syscall_status syscall_handle_execve(
  * clone(220) accepts the process forms: fork with an optional custom
  * child stack, and vfork (CLONE_VM|CLONE_VFORK) which shares the parent
  * address space and suspends the parent until the child execs or exits.
- * Tid-pointer and TLS arguments belong to the thread model and stay
- * ENOTSUP; CLONE_VFORK without CLONE_VM has distinct Linux semantics and
- * is rejected until needed.
+ * The thread form shares MM/files/fs/dispositions with its group and
+ * accepts the TLS and TID lifecycle flags. Other resource-sharing forms
+ * require their own complete lifecycle before they can be enabled.
  */
 void syscall_decode_clone(const struct kernel_syscall_request *request,
                          struct kernel_syscall_result *decoded)
 {
     uint64_t flags = request->arguments[0];
+    const uint64_t thread_required = UINT64_C(0x100) | UINT64_C(0x200) |
+        UINT64_C(0x400) | UINT64_C(0x800) | UINT64_C(0x10000);
+    const uint64_t thread_optional = UINT64_C(0x40000) | UINT64_C(0x80000) |
+        UINT64_C(0x100000) | UINT64_C(0x200000) | UINT64_C(0x400000) |
+        UINT64_C(0x1000000);
 
     decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
     if ((flags & ~LINUX_CLONE_KNOWN_FLAGS) != 0U ||
-        (flags & LINUX_CLONE_SIGNAL_MASK) != LINUX_SIGCHLD) {
+        ((flags & UINT64_C(0x10000)) && !(flags & UINT64_C(0x800))) ||
+        ((flags & UINT64_C(0x800)) && !(flags & LINUX_CLONE_VM))) {
+        decoded->value = -KERNEL_EINVAL;
+        return;
+    }
+    if ((flags & thread_required) == thread_required &&
+        (flags & ~(thread_required | thread_optional)) == 0U) {
+        decoded->action = KERNEL_SYSCALL_ACTION_CLONE;
+        decoded->value = 0;
+        return;
+    }
+    if ((flags & LINUX_CLONE_SIGNAL_MASK) != LINUX_SIGCHLD &&
+        !(flags & UINT64_C(0x10000))) {
         decoded->value = -KERNEL_EINVAL;
         return;
     }
@@ -76,7 +93,7 @@ void syscall_decode_clone(const struct kernel_syscall_request *request,
         decoded->value = -KERNEL_ENOTSUP;
         return;
     }
-    /* Without the CLONE_*SETTID/SETTLS flag bits (rejected above) Linux
+    /* Without the CLONE_*SETTID/SETTLS flag bits Linux
      * ignores the remaining arguments; musl's fork passes only two. */
     decoded->action = KERNEL_SYSCALL_ACTION_CLONE;
     decoded->value = 0;

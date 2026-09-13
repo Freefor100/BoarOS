@@ -20,6 +20,7 @@ enum kernel_syscall_action {
     KERNEL_SYSCALL_ACTION_WAIT4,
     KERNEL_SYSCALL_ACTION_YIELD,
     KERNEL_SYSCALL_ACTION_SIGNAL_RETURN,
+    KERNEL_SYSCALL_ACTION_EXIT_GROUP,
 };
 
 struct kernel_syscall_request {

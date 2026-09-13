@@ -7,6 +7,13 @@
 #include <stdint.h>
 
 struct riscv_fpu_state;
+struct kernel_task;
+enum kernel_scheduler_status riscv_process_prepare_clone(
+    struct kernel_task *child, struct kernel_task *parent,
+    const struct riscv_trap_frame *parent_frame,
+    uint64_t child_stack, int set_tls, uint64_t tls);
+void riscv_process_prepare_exec(struct kernel_task *task, uintptr_t entry,
+                                uintptr_t stack, uintptr_t tls);
 /* Borrow the current user task's architecture-owned register image. */
 struct riscv_fpu_state *riscv_process_fpu_borrow_current(void);
 
@@ -20,6 +27,9 @@ enum kernel_scheduler_status riscv_process_clone_current(
     const struct riscv_trap_frame *parent_frame,
     uint64_t flags,
     uint64_t child_stack,
+    uint64_t parent_tid,
+    uint64_t tls,
+    uint64_t child_tid,
     int64_t *linux_result);
 
 #endif

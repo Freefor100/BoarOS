@@ -98,6 +98,11 @@ enum kernel_files_status kernel_files_create(
     struct kernel_files *files,
     struct kernel_heap *heap);
 
+/* Share the complete descriptor table and its cleanup ownership. */
+enum kernel_files_status kernel_files_acquire(
+    struct kernel_files *destination,
+    const struct kernel_files *source);
+
 /* Copy descriptor slots while sharing their open-file descriptions. */
 enum kernel_files_status kernel_files_fork(
     struct kernel_files *destination,

@@ -7,6 +7,7 @@
 #include <kernel/errno.h>
 #include <kernel/exec.h>
 #include <kernel/files.h>
+#include <kernel/futex.h>
 #include <kernel/fs_context.h>
 #include <kernel/heap.h>
 #include <kernel/mm.h>
@@ -37,6 +38,86 @@
      LINUX___WNOTHREAD | LINUX___WALL | LINUX___WCLONE)
 #define LINUX_CLONE_VM UINT64_C(0x100)
 #define LINUX_CLONE_VFORK UINT64_C(0x4000)
+#define LINUX_CLONE_THREAD UINT64_C(0x10000)
+#define LINUX_CLONE_SETTLS UINT64_C(0x80000)
+#define LINUX_CLONE_PARENT_SETTID UINT64_C(0x100000)
+#define LINUX_CLONE_CHILD_CLEARTID UINT64_C(0x200000)
+#define LINUX_CLONE_CHILD_SETTID UINT64_C(0x1000000)
+
+void process_group_initialize(struct kernel_task *task)
+{
+    task->group_next = task;
+    task->group_previous = task;
+    kernel_wait_queue_init(&task->group_wait_queue);
+}
+
+static kernel_pid_t child_reaper_tid(struct kernel_task *leader,
+                                     const struct kernel_task *departing)
+{
+    struct kernel_task *member = leader;
+    do {
+        if (member != departing && !member->terminate_requested &&
+            member->state != KERNEL_THREAD_STATE_EXITED &&
+            member->state != KERNEL_THREAD_STATE_ZOMBIE &&
+            member->state != KERNEL_THREAD_STATE_GROUP_DEAD)
+            return member->tid;
+        member = member->group_next;
+    } while (member != leader);
+    return leader->tid;
+}
+
+static void request_thread_termination(struct kernel_task *task)
+{
+    if (task->state == KERNEL_THREAD_STATE_EXITED ||
+        task->state == KERNEL_THREAD_STATE_ZOMBIE ||
+        task->state == KERNEL_THREAD_STATE_GROUP_DEAD) return;
+    task->terminate_requested = 1U;
+    if (task->vfork_waiting && task->vfork_wait_child != 0) {
+        /* Fatal cancellation severs both pointers before the parent's
+         * task can disappear. The child retains its independent MM ref. */
+        task->vfork_wait_child->vfork_parent = 0;
+        task->vfork_wait_child->vfork_child = 0U;
+        task->vfork_wait_child = 0;
+        task->vfork_waiting = 0U;
+        if (task->state == KERNEL_THREAD_STATE_BLOCKED &&
+            task->wait_queue == &task->vfork_done_queue) {
+            blocked_unlink(task);
+            scheduler_wake_task(task, KERNEL_WAIT_SIGNALLED);
+        }
+    }
+    if (task->state == KERNEL_THREAD_STATE_STOPPED) {
+        stopped_unlink(task);
+        task->state = KERNEL_THREAD_STATE_READY;
+        ready_append(task);
+    }
+    (void)kernel_scheduler_wake_signal(task);
+}
+
+void process_group_request_exit(struct kernel_task *task,
+                                enum kernel_thread_exit_reason reason,
+                                uint64_t status, uint64_t detail)
+{
+    struct kernel_task *leader = task->group_leader;
+    struct kernel_task *member = leader;
+    if (!leader->group_exiting) {
+        leader->group_exiting = 1U;
+        leader->completion.reason = reason;
+        leader->completion.status = status;
+        leader->completion.detail = detail;
+    }
+    do {
+        request_thread_termination(member);
+        member = member->group_next;
+    } while (member != leader);
+    (void)kernel_wait_queue_wake_all(&leader->group_wait_queue);
+}
+
+void kernel_user_group_exit(enum kernel_thread_exit_reason reason,
+                            uint64_t status, uint64_t detail)
+{
+    process_group_request_exit(scheduler.current, reason, status, detail);
+    kernel_user_thread_exit(reason, status, detail);
+}
 
 struct riscv_fpu_state *riscv_process_fpu_borrow_current(void)
 {
@@ -89,7 +170,7 @@ static enum kernel_scheduler_status validate_child_list(
             child->previous_sibling != previous ||
             child->publish_completion != 0U ||
             child->state < KERNEL_THREAD_STATE_READY ||
-            child->state > KERNEL_THREAD_STATE_STOPPED) {
+            child->state > KERNEL_THREAD_STATE_GROUP_DEAD) {
             return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
         }
         if (child == required_child) {
@@ -158,7 +239,7 @@ void wake_waiting_parent(struct kernel_task *child)
     struct kernel_task *parent = child->parent;
 
     if (parent != 0) {
-        (void)kernel_wait_queue_wake_one(&parent->child_exit_queue);
+        (void)kernel_wait_queue_wake_all(&parent->child_exit_queue);
     }
 }
 
@@ -166,20 +247,23 @@ void wake_waiting_parent(struct kernel_task *child)
  * address space (through exec or exit). */
 void process_complete_vfork(struct kernel_task *thread)
 {
-    if (thread->vfork_child != 0U && thread->parent != 0) {
+    if (thread->vfork_child != 0U && thread->vfork_parent != 0) {
+        struct kernel_task *parent = thread->vfork_parent;
         /* Failed exec preparation also frees its transaction, but leaves
          * the child in the shared MM. That is not vfork completion. */
         if (thread->mm.state == KERNEL_MM_LIVE &&
             thread->mm.record_page_address ==
-                thread->parent->mm.record_page_address) {
+                parent->mm.record_page_address) {
             return;
         }
         /* Consume this child's completion before waking; an exec followed
          * by exit must not complete the parent's next vfork. */
         thread->vfork_child = 0U;
-        thread->parent->vfork_waiting = 0U;
+        thread->vfork_parent = 0;
+        parent->vfork_waiting = 0U;
+        parent->vfork_wait_child = 0;
         (void)kernel_wait_queue_wake_one(
-            &thread->parent->vfork_done_queue);
+            &parent->vfork_done_queue);
     }
 }
 
@@ -192,6 +276,86 @@ static void exited_append(struct kernel_task *thread)
         scheduler.exited_tail->next = thread;
     }
     scheduler.exited_tail = thread;
+}
+
+enum kernel_scheduler_status process_group_exec_current(void)
+{
+    struct kernel_task *task = scheduler.current;
+    struct kernel_task *leader = task->group_leader;
+    struct kernel_task *member;
+    enum kernel_wait_wake_reason reason;
+    enum kernel_scheduler_status status;
+
+    /* The first prepared exec owns group teardown. A competing exec must
+     * unwind its own prepared image through the ordinary exit cleanup. */
+    if (leader->group_exiting || leader->group_execing ||
+        task->terminate_requested)
+        kernel_user_thread_exit(KERNEL_THREAD_EXIT_SYSCALL, 0U, 0U);
+    leader->group_execing = 1U;
+    member = leader;
+    do {
+        if (member != task) request_thread_termination(member);
+        member = member->group_next;
+    } while (member != leader);
+    while (leader->group_members != (task == leader ? 1U : 2U) ||
+           (task != leader && leader->state != KERNEL_THREAD_STATE_GROUP_DEAD)) {
+        status = kernel_scheduler_block_current(&leader->group_wait_queue,
+                                                 0U, 0, &reason);
+        if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
+        if (leader->group_exiting)
+            kernel_user_thread_exit(KERNEL_THREAD_EXIT_SYSCALL, 0U, 0U);
+    }
+    if (task != leader) {
+        kernel_pid_t old_tid = task->tid;
+        if (kernel_pid_release(&scheduler.pid_allocator, task->tid) !=
+            KERNEL_PID_STATUS_OK) return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
+        task->tid = leader->tid;
+        task->parent = leader->parent;
+        task->previous_sibling = leader->previous_sibling;
+        task->next_sibling = leader->next_sibling;
+        if (task->parent != 0) {
+            if (task->previous_sibling != 0)
+                task->previous_sibling->next_sibling = task;
+            else task->parent->first_child = task;
+            if (task->next_sibling != 0)
+                task->next_sibling->previous_sibling = task;
+            else task->parent->last_child = task;
+        }
+        task->first_child = leader->first_child;
+        task->last_child = leader->last_child;
+        for (member = task->first_child; member != 0;
+             member = member->next_sibling) {
+            member->parent = task;
+            if (member->child_creator_tid == old_tid)
+                member->child_creator_tid = task->tid;
+        }
+        task->child_creator_tid = leader->child_creator_tid;
+        task->user_ticks += leader->user_ticks;
+        task->kernel_ticks += leader->kernel_ticks;
+        task->child_user_ticks = leader->child_user_ticks;
+        task->child_kernel_ticks = leader->child_kernel_ticks;
+        task->group_pending = leader->group_pending;
+        for (unsigned i = 0U; i < KERNEL_SIGNAL_COUNT; i++)
+            task->group_sender[i] = leader->group_sender[i];
+        task->publish_completion = leader->publish_completion;
+        if (scheduler.init_task == leader) scheduler.init_task = task;
+        leader->parent = 0;
+        leader->first_child = leader->last_child = 0;
+        leader->previous_sibling = leader->next_sibling = 0;
+        leader->tid_owned = 0U;
+        leader->tid = 0;
+        leader->publish_completion = 0U;
+        leader->group_leader = 0;
+        leader->group_members = 0U;
+        leader->state = KERNEL_THREAD_STATE_EXITED;
+        exited_append(leader);
+        task->group_leader = task;
+        task->group_members = 1U;
+        process_group_initialize(task);
+    }
+    task->group_execing = 0U;
+    task->clear_tid_address = 0U;
+    return KERNEL_SCHEDULER_STATUS_OK;
 }
 
 static int release_clone_resources(struct kernel_task *thread)
@@ -245,7 +409,12 @@ static enum kernel_scheduler_status finish_clone_failure(
     int64_t *linux_result,
     enum kernel_scheduler_status scheduler_failure)
 {
-    int cleanup_failed = release_clone_resources(thread);
+    int cleanup_failed;
+
+    /* No failed construction has published a parent completion channel. */
+    thread->vfork_parent = 0;
+    thread->vfork_child = 0U;
+    cleanup_failed = release_clone_resources(thread);
 
     if (thread->tid_owned != 0U) {
         if (kernel_pid_release(&scheduler.pid_allocator, thread->tid) !=
@@ -282,11 +451,13 @@ enum kernel_scheduler_status riscv_process_clone_current(
     const struct riscv_trap_frame *parent_frame,
     uint64_t flags,
     uint64_t child_stack,
+    uint64_t parent_tid,
+    uint64_t tls,
+    uint64_t child_tid,
     int64_t *linux_result)
 {
     struct kernel_task *parent;
     struct kernel_task *child;
-    struct riscv_trap_frame *child_frame;
     uint64_t physical_address;
     uint64_t child_satp;
     uintptr_t stack_low;
@@ -294,6 +465,7 @@ enum kernel_scheduler_status riscv_process_clone_current(
     kernel_pid_t tid;
     uint32_t vfork = (flags & (LINUX_CLONE_VM | LINUX_CLONE_VFORK)) ==
                      (LINUX_CLONE_VM | LINUX_CLONE_VFORK);
+    int thread_clone = (flags & LINUX_CLONE_THREAD) != 0U;
     enum kernel_wait_wake_reason wake_reason = KERNEL_WAIT_WOKEN;
     enum physical_page_status page_status;
     enum kernel_mm_status mm_status;
@@ -301,7 +473,6 @@ enum kernel_scheduler_status riscv_process_clone_current(
     enum kernel_fs_context_status fs_status;
     enum kernel_pid_status pid_status;
     enum kernel_signal_status signal_status;
-    enum riscv_context_status context_status;
     enum kernel_scheduler_status status;
 
     if (scheduler.initialized != KERNEL_SCHEDULER_INITIALIZED) {
@@ -369,7 +540,7 @@ enum kernel_scheduler_status riscv_process_clone_current(
     /* vfork shares the parent address space instead of cloning it; the
      * shared record reference keeps the parent's handle valid across the
      * child's exec or exit. */
-    if (vfork) {
+    if (vfork || thread_clone) {
         mm_status = kernel_mm_acquire(&child->mm, &parent->mm);
     } else {
         mm_status = kernel_mm_fork(&child->mm, &parent->mm);
@@ -390,8 +561,9 @@ enum kernel_scheduler_status riscv_process_clone_current(
                               : KERNEL_SCHEDULER_STATUS_INVALID_STATE)));
     }
     if (parent->files.state != KERNEL_FILES_EMPTY) {
-        files_status = kernel_files_fork(&child->files,
-                                         &parent->files);
+        files_status = thread_clone
+            ? kernel_files_acquire(&child->files, &parent->files)
+            : kernel_files_fork(&child->files, &parent->files);
         if (files_status != KERNEL_FILES_STATUS_OK) {
             return finish_clone_failure(
                 child,
@@ -404,7 +576,9 @@ enum kernel_scheduler_status riscv_process_clone_current(
                     ? KERNEL_SCHEDULER_STATUS_OK
                     : KERNEL_SCHEDULER_STATUS_INVALID_STATE);
         }
-        fs_status = kernel_fs_context_fork(&child->fs, &parent->fs);
+        fs_status = thread_clone
+            ? kernel_fs_context_acquire(&child->fs, &parent->fs)
+            : kernel_fs_context_fork(&child->fs, &parent->fs);
         if (fs_status != KERNEL_FS_CONTEXT_STATUS_OK) {
             return finish_clone_failure(
                 child,
@@ -434,13 +608,16 @@ enum kernel_scheduler_status riscv_process_clone_current(
     child->tid_owned = 1U;
     child->group_leader = child;
     child->group_members = 1U;
+    process_group_initialize(child);
     child->publish_completion = 0U;
     child->vfork_child = vfork;
+    child->vfork_parent = vfork ? parent : 0;
     child->completion.tid = tid;
     child->completion.tgid = tid;
     kernel_wait_queue_init(&child->child_exit_queue);
     kernel_wait_queue_init(&child->vfork_done_queue);
-    signal_status = kernel_signal_fork(child, parent);
+    signal_status = thread_clone ? kernel_signal_share(child, parent)
+                                 : kernel_signal_fork(child, parent);
     if (signal_status != KERNEL_SIGNAL_STATUS_OK) {
         return finish_clone_failure(
             child,
@@ -451,9 +628,6 @@ enum kernel_scheduler_status riscv_process_clone_current(
                 ? KERNEL_SCHEDULER_STATUS_OK
                 : KERNEL_SCHEDULER_STATUS_INVALID_STATE);
     }
-    /* Snapshot live registers, not merely the potentially stale image. */
-    riscv_fpu_state_save(&parent->fpu);
-    child->fpu = parent->fpu;
     mm_status = riscv_kernel_mm_satp(&child->mm, &child_satp);
     if (mm_status != KERNEL_MM_STATUS_OK) {
         return finish_clone_failure(
@@ -461,37 +635,42 @@ enum kernel_scheduler_status riscv_process_clone_current(
             KERNEL_SCHEDULER_STATUS_ADDRESS_SPACE);
     }
     child->arch.satp = child_satp;
-    child_frame = (struct riscv_trap_frame *)(child->stack_high -
-                                               sizeof(*child_frame));
-    if ((uintptr_t)child_frame < child->stack_low) {
-        return finish_clone_failure(
-            child, -KERNEL_EAGAIN, linux_result,
-            KERNEL_SCHEDULER_STATUS_INVALID_STATE);
-    }
-    *child_frame = *parent_frame;
-    /* The inherited image is loaded by the first context switch. */
-    child_frame->sstatus =
-        (child_frame->sstatus & ~RISCV_SSTATUS_FS_MASK) |
-        RISCV_SSTATUS_FS_CLEAN;
-    child_frame->a0 = 0U;
-    child_frame->sepc = parent_frame->sepc + 4U;
-    child_frame->scause = 0U;
-    child_frame->stval = 0U;
-    child_frame->kernel_tp = (uintptr_t)child;
-    /* A nonzero clone stack argument replaces the inherited user sp. */
-    if (child_stack != 0U) {
-        child_frame->sp = child_stack;
-    }
-    context_status = riscv_context_init_user(&child->context,
-                                             (uintptr_t)child_frame,
-                                             child);
-    if (context_status != RISCV_CONTEXT_STATUS_OK) {
+    if ((flags & LINUX_CLONE_CHILD_CLEARTID) != 0U)
+        child->clear_tid_address = child_tid;
+    status = riscv_process_prepare_clone(child, parent, parent_frame,
+                                         child_stack,
+                                         (flags & LINUX_CLONE_SETTLS) != 0U,
+                                         tls);
+    if (status != KERNEL_SCHEDULER_STATUS_OK) {
         return finish_clone_failure(
             child, -KERNEL_EAGAIN, linux_result,
             KERNEL_SCHEDULER_STATUS_INVALID_STATE);
     }
 
-    child_append(parent, child);
+    /* Linux does not roll clone back when a SETTID user store faults. */
+    {
+        size_t copied;
+        if ((flags & LINUX_CLONE_PARENT_SETTID) != 0U)
+            (void)kernel_copy_to_user(&parent->mm, parent_tid,
+                                      &tid, sizeof(tid), &copied);
+        if ((flags & LINUX_CLONE_CHILD_SETTID) != 0U)
+            (void)kernel_copy_to_user(&child->mm, child_tid,
+                                      &tid, sizeof(tid), &copied);
+    }
+    if (thread_clone) {
+        struct kernel_task *leader = parent->group_leader;
+        child->group_leader = leader;
+        child->group_members = 0U;
+        child->group_next = leader;
+        child->group_previous = leader->group_previous;
+        leader->group_previous->group_next = child;
+        leader->group_previous = child;
+        leader->group_members++;
+        child->completion.tgid = leader->tid;
+    } else {
+        child->child_creator_tid = parent->tid;
+        child_append(parent->group_leader, child);
+    }
     child->state = KERNEL_THREAD_STATE_READY;
     ready_append(child);
     *linux_result = tid;
@@ -501,6 +680,7 @@ enum kernel_scheduler_status riscv_process_clone_current(
          * child execs or exits; the child wakes vfork_done_queue. */
         kernel_wait_queue_init(&parent->vfork_done_queue);
         parent->vfork_waiting = 1U;
+        parent->vfork_wait_child = child;
         while (parent->vfork_waiting != 0U) {
             status = kernel_scheduler_block_current(&parent->vfork_done_queue,
                                                     0U, 0, &wake_reason);
@@ -543,7 +723,7 @@ static enum kernel_scheduler_status reap_waited_child(
     enum kernel_uaccess_status access_status = KERNEL_UACCESS_STATUS_OK;
 
     if (child->state != KERNEL_THREAD_STATE_ZOMBIE ||
-        child->parent != parent || child->tid_owned != 1U || pid <= 0 ||
+        child->parent != parent->group_leader || child->tid_owned != 1U || pid <= 0 ||
         child->mm.state != KERNEL_MM_RELEASED ||
         (child->files.state != KERNEL_FILES_EMPTY &&
          child->files.state != KERNEL_FILES_RELEASED) ||
@@ -556,9 +736,9 @@ static enum kernel_scheduler_status reap_waited_child(
         KERNEL_PID_STATUS_OK) {
         return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
     }
-    parent->child_user_ticks += user_ticks;
-    parent->child_kernel_ticks += kernel_ticks;
-    child_remove(parent, child);
+    parent->group_leader->child_user_ticks += user_ticks;
+    parent->group_leader->child_kernel_ticks += kernel_ticks;
+    child_remove(parent->group_leader, child);
     if (scheduler.init_task == child) {
         scheduler.init_task = 0;
     }
@@ -711,25 +891,27 @@ enum kernel_scheduler_status kernel_scheduler_wait4_current(
             parent->tid_owned != 1U) {
             return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
         }
-        status = validate_child_endpoints(parent);
+        status = validate_child_endpoints(parent->group_leader);
         if (status != KERNEL_SCHEDULER_STATUS_OK) {
             return status;
         }
-        for (child = parent->first_child;
+        for (child = parent->group_leader->first_child;
              child != 0;
              child = child->next_sibling) {
             if (++child_count > KERNEL_PID_LIMIT || child == parent ||
                 child->magic != KERNEL_THREAD_MAGIC ||
                 child->idle != 0U || child->arch.user_mode != 1U ||
                 child->tid_owned != 1U || child->tid <= 0 ||
-                child->parent != parent ||
+                child->parent != parent->group_leader ||
                 child->previous_sibling != previous ||
                 child->publish_completion != 0U ||
                 child->state < KERNEL_THREAD_STATE_READY ||
-                child->state > KERNEL_THREAD_STATE_STOPPED) {
+                child->state > KERNEL_THREAD_STATE_GROUP_DEAD) {
                 return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
             }
             previous = child;
+            if ((options & LINUX___WNOTHREAD) != 0U &&
+                child->child_creator_tid != parent->tid) continue;
             if ((options & LINUX___WCLONE) != 0U &&
                 (options & LINUX___WALL) == 0U) {
                 continue;
@@ -745,7 +927,7 @@ enum kernel_scheduler_status kernel_scheduler_wait4_current(
                                          rusage_address,
                                          linux_result);
             }
-            if (child->state == KERNEL_THREAD_STATE_STOPPED &&
+            if (child->group_stopped != 0U &&
                 (options & LINUX_WUNTRACED) != 0U &&
                 child->stop_notified == 0U) {
                 status = report_wait_event(parent,
@@ -761,7 +943,7 @@ enum kernel_scheduler_status kernel_scheduler_wait4_current(
                 child->stop_notified = 1U;
                 return KERNEL_SCHEDULER_STATUS_OK;
             }
-            if (child->state != KERNEL_THREAD_STATE_STOPPED &&
+            if (child->group_stopped == 0U &&
                 (options & LINUX_WCONTINUED) != 0U &&
                 child->continue_notified != 0U) {
                 status = report_wait_event(parent,
@@ -778,7 +960,7 @@ enum kernel_scheduler_status kernel_scheduler_wait4_current(
                 return KERNEL_SCHEDULER_STATUS_OK;
             }
         }
-        if (previous != parent->last_child) {
+        if (previous != parent->group_leader->last_child) {
             return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
         }
         if (!matching_child) {
@@ -789,7 +971,7 @@ enum kernel_scheduler_status kernel_scheduler_wait4_current(
             *linux_result = 0;
             return KERNEL_SCHEDULER_STATUS_OK;
         }
-        status = kernel_scheduler_block_current(&parent->child_exit_queue,
+        status = kernel_scheduler_block_current(&parent->group_leader->child_exit_queue,
                                                 0U,
                                                 1,
                                                 &wake_reason);
@@ -806,6 +988,13 @@ enum kernel_scheduler_status kernel_scheduler_wait4_current(
 
 static enum kernel_scheduler_status cleanup_user_task_resources(
     struct kernel_task *thread);
+static uint32_t user_wait_status(const struct kernel_thread_completion *completion);
+static enum kernel_scheduler_status reparent_children(struct kernel_task *parent);
+
+int kernel_scheduler_reap_pending(void)
+{
+    return scheduler.exited_head != 0 || scheduler.cleanup_page_owned != 0U;
+}
 
 enum kernel_scheduler_status kernel_scheduler_reap_one(
     struct kernel_thread_completion *completion)
@@ -900,6 +1089,56 @@ enum kernel_scheduler_status kernel_scheduler_reap_one(
         if (status != KERNEL_SCHEDULER_STATUS_OK) {
             return status;
         }
+        if (thread->group_leader == thread && thread->group_members > 1U) {
+            struct kernel_task *child;
+            for (child = thread->first_child; child != 0;
+                 child = child->next_sibling)
+                if (child->child_creator_tid == thread->tid)
+                    child->child_creator_tid = child_reaper_tid(thread, thread);
+            /* Keep the group identity until its last member has left. */
+            scheduler.exited_head = next;
+            if (next == 0) scheduler.exited_tail = 0;
+            thread->next = 0;
+            thread->state = KERNEL_THREAD_STATE_GROUP_DEAD;
+            (void)kernel_wait_queue_wake_all(&thread->group_wait_queue);
+            return KERNEL_SCHEDULER_STATUS_EMPTY;
+        }
+        if (thread->group_leader != 0 && thread->group_leader != thread) {
+            struct kernel_task *leader = thread->group_leader;
+            struct kernel_task *child;
+            /* Children survive their creator thread. Reassign this wait
+             * relationship before its TID can be recycled. */
+            for (child = leader->first_child; child != 0;
+                 child = child->next_sibling)
+                if (child->child_creator_tid == thread->tid)
+                    child->child_creator_tid = child_reaper_tid(leader, thread);
+            leader->user_ticks += thread->user_ticks;
+            leader->kernel_ticks += thread->kernel_ticks;
+            thread->group_previous->group_next = thread->group_next;
+            thread->group_next->group_previous = thread->group_previous;
+            leader->group_members--;
+            if (leader->group_members == 1U &&
+                leader->state == KERNEL_THREAD_STATE_GROUP_DEAD) {
+                if (!leader->group_exiting) {
+                    leader->completion.reason = thread->completion.reason;
+                    leader->completion.status = thread->completion.status;
+                    leader->completion.detail = thread->completion.detail;
+                }
+                leader->wait_status = user_wait_status(&leader->completion);
+                leader->state = KERNEL_THREAD_STATE_EXITED;
+                exited_append(leader);
+                next = thread->next;
+            }
+            (void)kernel_wait_queue_wake_all(&leader->group_wait_queue);
+            thread->group_leader = thread;
+            thread->group_members = 1U;
+            process_group_initialize(thread);
+        }
+        if (thread->group_leader == thread &&
+            reparent_children(thread) != KERNEL_SCHEDULER_STATUS_OK)
+            return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
+        /* Reparenting may append orphan zombies behind this tail. */
+        next = thread->next;
         if (thread->parent != 0) {
             kernel_signal_notify_child_exit(thread);
             if (kernel_signal_child_autoreap(thread->parent)) {
@@ -990,7 +1229,8 @@ static enum kernel_scheduler_status cleanup_user_task_resources(
     enum kernel_files_status files_status;
     enum kernel_fs_context_status fs_status;
 
-    signal_status = kernel_signal_release_table(thread);
+    signal_status = thread->group_leader == thread && thread->group_members > 1U
+        ? KERNEL_SIGNAL_STATUS_OK : kernel_signal_release_table(thread);
     if (signal_status != KERNEL_SIGNAL_STATUS_OK) {
         return KERNEL_SCHEDULER_STATUS_PAGE_RELEASE;
     }
@@ -1000,9 +1240,10 @@ static enum kernel_scheduler_status cleanup_user_task_resources(
             thread->exec_transaction;
         struct kernel_heap *heap = transaction->heap;
 
-        if (transaction->state == KERNEL_EXEC_TRANSACTION_PREPARED) {
-            return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
-        }
+        /* A sibling may terminate a thread after exec preparation. The
+         * prepared image is still owned by this transaction and is aborted. */
+        if (transaction->state == KERNEL_EXEC_TRANSACTION_PREPARED)
+            transaction->state = KERNEL_EXEC_TRANSACTION_PREPARING;
         exec_status = kernel_exec_transaction_cleanup(transaction);
         if (exec_status != KERNEL_EXEC_STATUS_OK) {
             return exec_status == KERNEL_EXEC_STATUS_CLEANUP_REQUIRED
@@ -1132,6 +1373,7 @@ static enum kernel_scheduler_status reparent_children(
         child->next_sibling = 0;
         if (new_parent != 0) {
             child_append(new_parent, child);
+            child->child_creator_tid = child_reaper_tid(new_parent, 0);
             if (child->state == KERNEL_THREAD_STATE_ZOMBIE) {
                 kernel_signal_notify_child_exit(child);
                 if (kernel_signal_child_autoreap(new_parent)) {
@@ -1181,40 +1423,24 @@ static void kernel_thread_finish(
         switch_to_fatal_idle(status);
     }
 
-    current->completion = *completion;
+    if (!current->group_exiting) current->completion = *completion;
     if (current->arch.user_mode == 1U) {
+        kernel_futex_clear_tid(current);
         if (riscv_sv39_switch_satp(scheduler.kernel_satp) !=
             RISCV_SV39_STATUS_OK) {
             switch_to_fatal_idle(
                 KERNEL_SCHEDULER_STATUS_ADDRESS_SPACE);
         }
-        status = reparent_children(current);
-        if (status != KERNEL_SCHEDULER_STATUS_OK) {
-            switch_to_fatal_idle(status);
-        }
         cleanup_status = cleanup_user_task_resources(current);
-        current->wait_status = user_wait_status(completion);
+        current->wait_status = user_wait_status(&current->completion);
     }
-    if (cleanup_status == KERNEL_SCHEDULER_STATUS_OK && current->parent != 0) {
-        kernel_signal_notify_child_exit(current);
-        if (kernel_signal_child_autoreap(current->parent)) {
-            child_remove(current->parent, current);
-        }
-    }
-    if (cleanup_status == KERNEL_SCHEDULER_STATUS_OK &&
-        current->parent != 0) {
-        current->state = KERNEL_THREAD_STATE_ZOMBIE;
-        current->publish_completion = 0U;
-    } else {
-        current->state = KERNEL_THREAD_STATE_EXITED;
-        exited_append(current);
-    }
+    (void)cleanup_status;
+    current->state = KERNEL_THREAD_STATE_EXITED;
+    exited_append(current);
 
-    if (scheduler.ready_head == 0) {
-        next = &scheduler.idle;
-    } else {
-        next = scheduler.ready_head;
-    }
+    /* Resume the saved cleanup context even when users remain runnable;
+     * zombie publication and group teardown must not depend on idleness. */
+    next = &scheduler.idle;
     status = activate_thread_address_space(next);
     if (status != KERNEL_SCHEDULER_STATUS_OK) {
         switch_to_fatal_idle(status);
@@ -1280,6 +1506,8 @@ void kernel_user_thread_exit(
     }
     completion.tid = scheduler.current->tid;
     completion.tgid = scheduler.current->group_leader->tid;
+    if (reason != KERNEL_THREAD_EXIT_SYSCALL)
+        process_group_request_exit(scheduler.current, reason, status, detail);
     kernel_thread_finish(&completion);
 }
 
@@ -1352,6 +1580,7 @@ enum kernel_task_status kernel_task_ppid(
         task->tid <= 0 || task->arch.user_mode != 1U) {
         return KERNEL_TASK_STATUS_STATE;
     }
+    task = task->group_leader;
     if (task->parent == 0) {
         *ppid = 0;
         return KERNEL_TASK_STATUS_OK;
@@ -1377,6 +1606,19 @@ void kernel_task_cpu_ticks(const struct kernel_task *task,
     *kernel_ticks = task->kernel_ticks;
     *child_user_ticks = task->child_user_ticks;
     *child_kernel_ticks = task->child_kernel_ticks;
+    if (task->group_leader != 0) {
+        const struct kernel_task *leader = task->group_leader;
+        const struct kernel_task *member = leader;
+        *user_ticks = 0U;
+        *kernel_ticks = 0U;
+        do {
+            *user_ticks += member->user_ticks;
+            *kernel_ticks += member->kernel_ticks;
+            member = member->group_next;
+        } while (member != leader);
+        *child_user_ticks = leader->child_user_ticks;
+        *child_kernel_ticks = leader->child_kernel_ticks;
+    }
 }
 
 enum kernel_task_status kernel_task_mm_borrow(

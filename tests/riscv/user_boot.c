@@ -437,7 +437,9 @@ enum kernel_scheduler_status __wrap_kernel_scheduler_reap_one(
 {
     enum kernel_scheduler_status status;
 
-    if (completion_count == 2U) {
+    /* Inspect the shared result page at the injected final-MM cleanup
+     * boundary, not after an incidental number of other completions. */
+    if (normal_exit_failure_checked != 0U && user_results_checked == 0U) {
         user_results_checked = 1U;
         if (user_data == 0 ||
             user_data[USER_TEST_STARTED_OFFSET / sizeof(uint64_t)] !=
