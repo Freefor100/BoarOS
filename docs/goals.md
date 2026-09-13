@@ -24,7 +24,7 @@ Linux ABI 兼容是最终功能方向，不是对当前完成度的声明；READ
 |---|---|---|
 | 启动与内存 | DTB 内存/保留区和设备发现、启动布局、物理页分配、内核堆、RISC-V Sv39/4 KiB、direct map | RISC-V QEMU 已验证 |
 | 文件与根启动 | VirtIO MMIO version 1 legacy 与 version 2 modern、只读块 I/O、lwext4 适配、VFS、文件页缓存、source-backed ELF `/init`（ET_EXEC/ET_DYN/非递归 `PT_INTERP`） | RISC-V QEMU 已验证静态真实入口；动态构造路径已接入，运行时重定位/TLS 证据待补 |
-| 进程与基础 syscall | `openat/read/close`、`write/writev`、`lseek/fstat/newfstatat/getdents64`、`dup/dup3/fcntl`、`mmap/mprotect/munmap/brk`、`clone`（自定义子栈 + vfork 共享地址空间）/`execve`/`wait4`（rusage）/`exit_group`/`set_tid_address`、`times`、`sched_yield`、COW、阻塞 wait、zombie/reparent、`uname` | 已实现并按模块和真实根盘链路验证，覆盖仍是明确子集；内部 dup2 操作不代表 RISC-V 存在独立 dup2 syscall |
+| 进程与基础 syscall | `openat/read/close`、`write/writev`、`pselect6/ppoll`、`lseek/fstat/newfstatat/getdents64`、`dup/dup3/fcntl`、`mmap/mprotect/munmap/brk`、`clone`（自定义子栈 + vfork 共享地址空间）/`execve`/`wait4`（rusage）/`exit_group`/`set_tid_address`、`times`、`sched_yield`、COW、阻塞 wait、zombie/reparent、`uname` | 已实现并按模块和真实根盘链路验证，覆盖仍是明确子集；内部 dup2 操作不代表 RISC-V 存在独立 dup2 syscall |
 | 阻塞唤醒与时间 | 通用等待队列（事件通道 + deadline）、全局 blocked 链不变量、`clock_gettime/clock_getres/gettimeofday`（REALTIME/MONOTONIC）、`clock_nanosleep/nanosleep`、goldfish RTC 启动墙钟、console read 阻塞等待 UART 输入、标准信号驱动唤醒与按 syscall 分类的重启 | 已实现并经 scheduler 单测与 musl 真实睡眠/时钟/信号闭环验证；`times` 与每任务记账已落地，PLIC 驱动接收仍未实现 |
 | 目录枚举成本修正 | OFD 拥有可继续游标，保持独立 open、dup/fork 共享、cookie/seek、部分复制及关闭回收语义 | 已实现并由真实 ext4/QEMU 文件测试验证；当前线性适配器顺序条目访问为 O(N)，开发板吞吐基线待测，见[文件模块](modules/kernel-files.md#lseekfstatnewfstatat-与-getdents64) |
 | 用户态映像 | Linux 形态初始栈和 auxv、source-backed `ELF_PRIVATE` demand paging、`ET_EXEC`/`ET_DYN`/`PT_INTERP`、Sv39 ASLR/W^X/指令同步 | RISC-V 构造和静态入口已验证；动态链接器重定位、额外 DSO、TLS 和真实动态 libc 运行时待验证 |

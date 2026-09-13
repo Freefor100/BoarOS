@@ -34,6 +34,8 @@ enum kernel_syscall_status kernel_syscall_dispatch(
 - `dup` 编号 23、`dup3` 编号 24 与 `fcntl` 编号 25 复制或检查描述符；flag 边界、目标替换与 `F_DUPFD*` 搜索规则见[进程文件资源模块](kernel-files.md)。
 - `read` 编号为 63，使用 open file description 的当前 offset 把数据复制到用户缓冲区；返回实际字节数、0 表示 EOF，用户 fault 与部分复制按 Linux read 形态提交。console 描述符的 read 阻塞等待 UART 输入，经 tick 轮询唤醒后整批交付，行为见[进程文件资源模块](kernel-files.md)。
 - `pread64` 编号为 67，按调用者给出的非负 offset 读取 regular file，保留 OFD 当前 offset；用户缓冲区部分 fault 返回已复制前缀。pipe、console 和目录按 Linux 形态返回不可定位错误。
+- `pselect6` 编号为 72，支持 `fd_set`（可读/可写/异常）、相对超时与可选的 16 字节 `sigset_argpack` 临时信号屏蔽字；空集合或任何未打开 fd 按 Linux 语义返回 `-EBADF`，就绪总数通过返回值输出，行为与生命周期见[进程文件资源模块](kernel-files.md)。
+- `ppoll` 编号为 73，支持 `struct pollfd` 数组（`POLLIN/POLLOUT/POLLPRI/POLLERR/POLLHUP/POLLNVAL`）、相对超时与可选的临时信号屏蔽字；负 fd 忽略不报错，未分配 fd 产生 `POLLNVAL` 并计入就绪数，信号打断返回 `-EINTR` 且自动恢复原信号掩码，行为见[进程文件资源模块](kernel-files.md)。
 - `write` 编号 64 与 `writev` 编号 66 作用于 console 和 pipe：console 经架构串口输出，pipe 在 `PIPE_BUF=4096` 内保持单次写原子并按可用空间阻塞或返回 `-EAGAIN`；regular fd 仍按只读根语义返回 `-EBADF`，用户 fault 按前缀保持。console read、pipe read/write 的阻塞语义、`lseek` 编号 62 的 SEEK 形态与目录 cookie、`fstat` 编号 80 与 `newfstatat` 编号 79 的 128 字节 stat 填充、`getdents64` 编号 61 的 linux_dirent64 编码与条目 cookie，均见[进程文件资源模块](kernel-files.md)。
 - `clock_gettime` 编号 113、`clock_getres` 编号 114、`gettimeofday` 编号 169、`clock_nanosleep` 编号 115 与 `nanosleep` 编号 101 构成时间族，语义见[内核时间模块](kernel-time.md)。
 - `sched_yield` 编号 124 在存在 READY 竞争者时把当前任务排到 ready 队尾并切换；无竞争者时立即返回 0。调度失败属于内核不变量破坏，由 Trap 边界 fatal。

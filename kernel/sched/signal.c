@@ -1061,6 +1061,35 @@ enum kernel_signal_status kernel_signal_suspend(struct kernel_task *task,
     return KERNEL_SIGNAL_STATUS_OK;
 }
 
+enum kernel_signal_status kernel_signal_set_temporary_mask(
+    struct kernel_task *task,
+    uint64_t new_mask,
+    uint64_t *saved_mask)
+{
+    if (task == 0 || saved_mask == 0) {
+        return KERNEL_SIGNAL_STATUS_INVALID_ARGUMENT;
+    }
+    *saved_mask = task->signal_blocked;
+    task->signal_saved_mask = task->signal_blocked;
+    task->signal_restore_mask = 1U;
+    task->signal_blocked = new_mask & ~SIGNAL_MASK_KILL_STOP;
+    return KERNEL_SIGNAL_STATUS_OK;
+}
+
+void kernel_signal_restore_temporary_mask(
+    struct kernel_task *task,
+    uint64_t saved_mask,
+    int interrupted)
+{
+    if (task == 0) {
+        return;
+    }
+    if (!interrupted) {
+        task->signal_blocked = saved_mask;
+        task->signal_restore_mask = 0U;
+    }
+}
+
 enum kernel_signal_select_result kernel_signal_select(
     struct kernel_task *task,
     struct kernel_signal_delivery *delivery)

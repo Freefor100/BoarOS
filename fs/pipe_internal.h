@@ -78,4 +78,9 @@ enum kernel_pipe_status kernel_pipe_writev(
     uint32_t open_flags,
     int64_t *linux_result);
 
+uint32_t kernel_pipe_poll(
+    struct kernel_pipe *pipe,
+    uint32_t endpoint,
+    struct kernel_wait_queue **out_queue);
+
 #endif

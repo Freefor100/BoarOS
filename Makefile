@@ -113,6 +113,7 @@ C_SOURCES := \
 	fs/files/io.c \
 	fs/files/path.c \
 	fs/files/console.c \
+	fs/files/poll.c \
 	fs/fs_context.c \
 	fs/open_file.c \
 	fs/pipe.c \
@@ -176,6 +177,7 @@ TEST_RUNTIME_C_SOURCES := \
 	fs/files/io.c \
 	fs/files/path.c \
 	fs/files/console.c \
+	fs/files/poll.c \
 	fs/fs_context.c \
 	fs/lwext4_port.c \
 	fs/open_file.c \

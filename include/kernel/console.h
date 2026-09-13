@@ -13,4 +13,9 @@ void kernel_console_putc(char character);
  */
 void kernel_console_poll_input(void);
 
+struct kernel_wait_queue;
+
+uint32_t kernel_console_poll(uint32_t requested_events,
+                             struct kernel_wait_queue **out_queue);
+
 #endif

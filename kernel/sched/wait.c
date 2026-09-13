@@ -41,28 +41,67 @@ void blocked_unlink(struct kernel_task *thread)
     thread->next = 0;
 }
 
+void kernel_wait_node_init(struct kernel_wait_node *node,
+                           struct kernel_task *task)
+{
+    if (node != 0) {
+        node->task = task;
+        node->queue = 0;
+        node->previous = 0;
+        node->next = 0;
+    }
+}
+
+void kernel_wait_queue_add(struct kernel_wait_queue *queue,
+                           struct kernel_wait_node *node)
+{
+    if (queue == 0 || node == 0) {
+        return;
+    }
+    node->queue = queue;
+    node->previous = queue->tail;
+    node->next = 0;
+    if (queue->tail != 0) {
+        queue->tail->next = node;
+    } else {
+        queue->head = node;
+    }
+    queue->tail = node;
+}
+
+void kernel_wait_queue_remove(struct kernel_wait_node *node)
+{
+    struct kernel_wait_queue *queue;
+
+    if (node == 0 || node->queue == 0) {
+        return;
+    }
+    queue = node->queue;
+    if (node->previous != 0) {
+        node->previous->next = node->next;
+    } else {
+        queue->head = node->next;
+    }
+    if (node->next != 0) {
+        node->next->previous = node->previous;
+    } else {
+        queue->tail = node->previous;
+    }
+    node->queue = 0;
+    node->previous = 0;
+    node->next = 0;
+}
+
 void scheduler_wait_requeue(struct kernel_task *task,
                             struct kernel_wait_queue *queue)
 {
-    struct kernel_wait_queue *old = task->wait_queue;
-
-    if (old != 0) {
-        if (task->wait_previous != 0)
-            task->wait_previous->wait_next = task->wait_next;
-        else
-            old->head = task->wait_next;
-        if (task->wait_next != 0)
-            task->wait_next->wait_previous = task->wait_previous;
-        else
-            old->tail = task->wait_previous;
+    if (task->wait_queue != 0) {
+        kernel_wait_queue_remove(&task->default_wait_node);
     }
     task->wait_queue = queue;
-    task->wait_previous = queue != 0 ? queue->tail : 0;
-    task->wait_next = 0;
     if (queue != 0) {
-        if (queue->tail != 0) queue->tail->wait_next = task;
-        else queue->head = task;
-        queue->tail = task;
+        task->default_wait_node.task = task;
+        kernel_wait_queue_add(queue, &task->default_wait_node);
     }
 }
 
@@ -125,7 +164,7 @@ void kernel_wait_queue_init(struct kernel_wait_queue *queue)
 enum kernel_scheduler_status kernel_wait_queue_wake_one(
     struct kernel_wait_queue *queue)
 {
-    struct kernel_task *thread;
+    struct kernel_wait_node *node;
 
     if (queue == 0 || queue->initialized != KERNEL_WAIT_QUEUE_INITIALIZED) {
         return KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
@@ -137,10 +176,15 @@ enum kernel_scheduler_status kernel_wait_queue_wake_one(
         return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
     }
 
-    thread = queue->head;
-    if (thread != 0) {
-        blocked_unlink(thread);
-        scheduler_wake_task(thread, (uint32_t)KERNEL_WAIT_WOKEN);
+    node = queue->head;
+    while (node != 0) {
+        struct kernel_task *thread = node->task;
+        node = node->next;
+        if (thread != 0 && thread->state == KERNEL_THREAD_STATE_BLOCKED) {
+            blocked_unlink(thread);
+            scheduler_wake_task(thread, (uint32_t)KERNEL_WAIT_WOKEN);
+            break;
+        }
     }
     return KERNEL_SCHEDULER_STATUS_OK;
 }
@@ -148,7 +192,7 @@ enum kernel_scheduler_status kernel_wait_queue_wake_one(
 enum kernel_scheduler_status kernel_wait_queue_wake_all(
     struct kernel_wait_queue *queue)
 {
-    struct kernel_task *thread;
+    struct kernel_wait_node *node;
 
     if (queue == 0 || queue->initialized != KERNEL_WAIT_QUEUE_INITIALIZED) {
         return KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
@@ -159,9 +203,14 @@ enum kernel_scheduler_status kernel_wait_queue_wake_all(
     if (riscv_interrupt_is_enabled()) {
         return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
     }
-    while ((thread = queue->head) != 0) {
-        blocked_unlink(thread);
-        scheduler_wake_task(thread, (uint32_t)KERNEL_WAIT_WOKEN);
+    node = queue->head;
+    while (node != 0) {
+        struct kernel_task *thread = node->task;
+        node = node->next;
+        if (thread != 0 && thread->state == KERNEL_THREAD_STATE_BLOCKED) {
+            blocked_unlink(thread);
+            scheduler_wake_task(thread, (uint32_t)KERNEL_WAIT_WOKEN);
+        }
     }
     return KERNEL_SCHEDULER_STATUS_OK;
 }

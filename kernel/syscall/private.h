@@ -63,6 +63,16 @@ enum kernel_syscall_status syscall_handle_getdents64(
     const struct kernel_syscall_request *request,
     struct kernel_syscall_result *decoded);
 
+enum kernel_syscall_status syscall_handle_ppoll(
+    struct kernel_task *caller,
+    const struct kernel_syscall_request *request,
+    struct kernel_syscall_result *decoded);
+
+enum kernel_syscall_status syscall_handle_pselect6(
+    struct kernel_task *caller,
+    const struct kernel_syscall_request *request,
+    struct kernel_syscall_result *decoded);
+
 enum kernel_syscall_status syscall_handle_writev(
     struct kernel_task *caller,
     const struct kernel_syscall_request *request,

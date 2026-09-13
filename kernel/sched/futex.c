@@ -23,14 +23,15 @@ static int64_t futex_wake(uint64_t mm, uint64_t address, uint32_t count,
                           uint32_t requeue, uint64_t address2)
 {
     struct kernel_wait_queue *queue = futex_bucket(mm, address);
-    struct kernel_task *task = queue->head;
-    struct kernel_task *last = queue->tail;
+    struct kernel_wait_node *node = queue->head;
+    struct kernel_wait_node *last = queue->tail;
     uint32_t woken = 0U, moved = 0U;
 
-    while (task != 0 && (woken < count || moved < requeue)) {
-        struct kernel_task *next = task->wait_next;
+    while (node != 0 && (woken < count || moved < requeue)) {
+        struct kernel_wait_node *next = node->next;
+        struct kernel_task *task = node->task;
 
-        if (task->futex_mm == mm && task->futex_address == address) {
+        if (task != 0 && task->futex_mm == mm && task->futex_address == address) {
             if (woken < count) {
                 blocked_unlink(task);
                 scheduler_wake_task(task, KERNEL_WAIT_WOKEN);
@@ -41,8 +42,8 @@ static int64_t futex_wake(uint64_t mm, uint64_t address, uint32_t count,
                 moved++;
             }
         }
-        if (task == last) break;
-        task = next;
+        if (node == last) break;
+        node = next;
     }
     return (int64_t)woken + moved;
 }

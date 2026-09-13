@@ -78,7 +78,8 @@ for marker in \
     'BoarOS: real userland console input ok' \
     'BoarOS: real userland fp checks ok' \
     'BoarOS: real userland signal checks ok' \
-    'BoarOS: real userland pipe checks ok'; do
+    'BoarOS: real userland pipe checks ok' \
+    'BoarOS: real userland poll/select checks ok'; do
     if [ "$(grep -cxF "$marker" "$static_output" || true)" -ne 1 ]; then
         tail -n 120 "$static_output" >&2
         echo "real userland marker missing or duplicated: $marker" >&2

@@ -128,17 +128,29 @@ enum kernel_wait_wake_reason {
 
 #define KERNEL_WAIT_QUEUE_INITIALIZED UINT32_C(0x57414954)
 
+struct kernel_wait_node {
+    struct kernel_task *task;
+    struct kernel_wait_queue *queue;
+    struct kernel_wait_node *previous;
+    struct kernel_wait_node *next;
+};
+
 /*
  * Token identifying a sleep channel.  Resources that can block embed one
  * queue per wake condition and hand it to block/wake.
  */
 struct kernel_wait_queue {
     uint32_t initialized;
-    struct kernel_task *head;
-    struct kernel_task *tail;
+    struct kernel_wait_node *head;
+    struct kernel_wait_node *tail;
 };
 
+void kernel_wait_node_init(struct kernel_wait_node *node,
+                           struct kernel_task *task);
 void kernel_wait_queue_init(struct kernel_wait_queue *queue);
+void kernel_wait_queue_add(struct kernel_wait_queue *queue,
+                           struct kernel_wait_node *node);
+void kernel_wait_queue_remove(struct kernel_wait_node *node);
 
 /* Wakes the longest-blocked waiter.  Requires interrupts disabled. */
 enum kernel_scheduler_status kernel_wait_queue_wake_one(
