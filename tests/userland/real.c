@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <poll.h>
+#include <sys/epoll.h>
 #include <sys/select.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -522,6 +523,437 @@ static int check_poll_and_select(void)
     if (write(1, poll_marker, sizeof(poll_marker) - 1) !=
         (ssize_t)(sizeof(poll_marker) - 1)) {
         return 36;
+    }
+
+    return 0;
+}
+
+static int check_epoll(void)
+{
+    /* 1. epoll_create1 and flags */
+    int epfd = epoll_create1(0);
+    if (epfd < 0) {
+        return 1;
+    }
+    int epfd_cloexec = epoll_create1(EPOLL_CLOEXEC);
+    if (epfd_cloexec < 0) {
+        close(epfd);
+        return 2;
+    }
+    close(epfd_cloexec);
+
+    errno = 0;
+    int epfd_bad = epoll_create1(0x1234);
+    if (epfd_bad != -1 || errno != EINVAL) {
+        close(epfd);
+        return 3;
+    }
+
+    /* 2. epoll_ctl error handling */
+    struct epoll_event ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.events = EPOLLIN;
+    ev.data.u64 = 0x1111ULL;
+
+    errno = 0;
+    if (epoll_ctl(-1, EPOLL_CTL_ADD, 0, &ev) != -1 || errno != EBADF) {
+        close(epfd);
+        return 4;
+    }
+    errno = 0;
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, -1, &ev) != -1 || errno != EBADF) {
+        close(epfd);
+        return 5;
+    }
+    errno = 0;
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, epfd, &ev) != -1 || errno != EINVAL) {
+        close(epfd);
+        return 6;
+    }
+    errno = 0;
+    if (epoll_ctl(epfd, 999, 0, &ev) != -1 || errno != EINVAL) {
+        close(epfd);
+        return 7;
+    }
+    errno = 0;
+    if (epoll_ctl(epfd, EPOLL_CTL_DEL, 0, NULL) != -1 || errno != ENOENT) {
+        close(epfd);
+        return 8;
+    }
+
+    /* 3. Empty epoll wait */
+    struct epoll_event evs[4];
+    memset(evs, 0, sizeof(evs));
+    if (epoll_wait(epfd, evs, 4, 0) != 0) {
+        close(epfd);
+        return 9;
+    }
+    if (epoll_wait(epfd, evs, 4, 20) != 0) {
+        close(epfd);
+        return 10;
+    }
+    errno = 0;
+    if (epoll_wait(epfd, evs, 0, 0) != -1 || errno != EINVAL) {
+        close(epfd);
+        return 11;
+    }
+    errno = 0;
+    if (epoll_wait(epfd, NULL, 4, 0) != -1 || errno != EFAULT) {
+        close(epfd);
+        return 12;
+    }
+
+    /* 4. Pipe read readiness & Level Triggered (LT) mode */
+    int p[2];
+    if (pipe(p) != 0) {
+        close(epfd);
+        return 13;
+    }
+    ev.events = EPOLLIN;
+    ev.data.u64 = 0x12345678ULL;
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, p[0], &ev) != 0) {
+        close(p[0]);
+        close(p[1]);
+        close(epfd);
+        return 14;
+    }
+    errno = 0;
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, p[0], &ev) != -1 || errno != EEXIST) {
+        close(p[0]);
+        close(p[1]);
+        close(epfd);
+        return 15;
+    }
+
+    if (epoll_wait(epfd, evs, 4, 0) != 0) {
+        close(p[0]);
+        close(p[1]);
+        close(epfd);
+        return 16;
+    }
+
+    if (write(p[1], "abcd", 4) != 4) {
+        close(p[0]);
+        close(p[1]);
+        close(epfd);
+        return 17;
+    }
+
+    int n = epoll_wait(epfd, evs, 4, 100);
+    if (n != 1 || !(evs[0].events & EPOLLIN) || evs[0].data.u64 != 0x12345678ULL) {
+        close(p[0]);
+        close(p[1]);
+        close(epfd);
+        return 18;
+    }
+
+    /* LT test: data remains in pipe, next epoll_wait MUST also return 1 */
+    n = epoll_wait(epfd, evs, 4, 0);
+    if (n != 1 || !(evs[0].events & EPOLLIN) || evs[0].data.u64 != 0x12345678ULL) {
+        close(p[0]);
+        close(p[1]);
+        close(epfd);
+        return 19;
+    }
+
+    /* Partial read: 2 bytes read, 2 bytes unread */
+    char buf[8];
+    if (read(p[0], buf, 2) != 2) {
+        close(p[0]);
+        close(p[1]);
+        close(epfd);
+        return 20;
+    }
+    n = epoll_wait(epfd, evs, 4, 0);
+    if (n != 1 || !(evs[0].events & EPOLLIN)) {
+        close(p[0]);
+        close(p[1]);
+        close(epfd);
+        return 21;
+    }
+    /* Drain remaining 2 bytes */
+    if (read(p[0], buf, 2) != 2) {
+        close(p[0]);
+        close(p[1]);
+        close(epfd);
+        return 22;
+    }
+    if (epoll_wait(epfd, evs, 4, 0) != 0) {
+        close(p[0]);
+        close(p[1]);
+        close(epfd);
+        return 23;
+    }
+
+    /* 5. Child delayed write wakeup */
+    pid_t child = fork();
+    if (child < 0) {
+        close(p[0]);
+        close(p[1]);
+        close(epfd);
+        return 24;
+    }
+    if (child == 0) {
+        close(p[0]);
+        struct timespec delay = { .tv_sec = 0, .tv_nsec = 20000000L };
+        nanosleep(&delay, NULL);
+        if (write(p[1], "wake", 4) != 4) {
+            _exit(1);
+        }
+        _exit(0);
+    }
+    n = epoll_wait(epfd, evs, 4, 2000);
+    if (n != 1 || !(evs[0].events & EPOLLIN)) {
+        close(p[0]);
+        close(p[1]);
+        close(epfd);
+        return 25;
+    }
+    if (read(p[0], buf, 4) != 4) {
+        close(p[0]);
+        close(p[1]);
+        close(epfd);
+        return 26;
+    }
+    int child_status = 0;
+    if (waitpid(child, &child_status, 0) != child || !WIFEXITED(child_status) ||
+        WEXITSTATUS(child_status) != 0) {
+        close(p[0]);
+        close(p[1]);
+        close(epfd);
+        return 27;
+    }
+
+    /* 6. Edge Triggered (ET) mode */
+    ev.events = EPOLLIN | EPOLLET;
+    ev.data.u64 = 0x9999ULL;
+    if (epoll_ctl(epfd, EPOLL_CTL_MOD, p[0], &ev) != 0) {
+        close(p[0]);
+        close(p[1]);
+        close(epfd);
+        return 28;
+    }
+    if (write(p[1], "abcd", 4) != 4) {
+        close(p[0]);
+        close(p[1]);
+        close(epfd);
+        return 29;
+    }
+    n = epoll_wait(epfd, evs, 4, 100);
+    if (n != 1 || !(evs[0].events & EPOLLIN) || evs[0].data.u64 != 0x9999ULL) {
+        close(p[0]);
+        close(p[1]);
+        close(epfd);
+        return 30;
+    }
+    /* Partial read under ET */
+    if (read(p[0], buf, 2) != 2) {
+        close(p[0]);
+        close(p[1]);
+        close(epfd);
+        return 31;
+    }
+    /* Under ET, unread data does NOT re-trigger without a new event edge */
+    n = epoll_wait(epfd, evs, 4, 0);
+    if (n != 0) {
+        close(p[0]);
+        close(p[1]);
+        close(epfd);
+        return 32;
+    }
+    /* New write edge arrives */
+    if (write(p[1], "e", 1) != 1) {
+        close(p[0]);
+        close(p[1]);
+        close(epfd);
+        return 33;
+    }
+    n = epoll_wait(epfd, evs, 4, 100);
+    if (n != 1 || !(evs[0].events & EPOLLIN)) {
+        close(p[0]);
+        close(p[1]);
+        close(epfd);
+        return 34;
+    }
+    /* Drain pipe: 2 bytes left from earlier + 1 new byte = 3 bytes */
+    if (read(p[0], buf, 3) != 3) {
+        close(p[0]);
+        close(p[1]);
+        close(epfd);
+        return 35;
+    }
+
+    /* 7. EPOLLONESHOT mode */
+    ev.events = EPOLLIN | EPOLLONESHOT;
+    ev.data.u64 = 0x7777ULL;
+    if (epoll_ctl(epfd, EPOLL_CTL_MOD, p[0], &ev) != 0) {
+        close(p[0]);
+        close(p[1]);
+        close(epfd);
+        return 36;
+    }
+    if (write(p[1], "x", 1) != 1) {
+        close(p[0]);
+        close(p[1]);
+        close(epfd);
+        return 37;
+    }
+    n = epoll_wait(epfd, evs, 4, 100);
+    if (n != 1 || !(evs[0].events & EPOLLIN) || evs[0].data.u64 != 0x7777ULL) {
+        close(p[0]);
+        close(p[1]);
+        close(epfd);
+        return 38;
+    }
+    /* More data written while disarmed */
+    if (write(p[1], "y", 1) != 1) {
+        close(p[0]);
+        close(p[1]);
+        close(epfd);
+        return 39;
+    }
+    n = epoll_wait(epfd, evs, 4, 0);
+    if (n != 0) {
+        close(p[0]);
+        close(p[1]);
+        close(epfd);
+        return 40;
+    }
+    /* Re-arm via MOD */
+    if (epoll_ctl(epfd, EPOLL_CTL_MOD, p[0], &ev) != 0) {
+        close(p[0]);
+        close(p[1]);
+        close(epfd);
+        return 41;
+    }
+    n = epoll_wait(epfd, evs, 4, 0);
+    if (n != 1 || !(evs[0].events & EPOLLIN)) {
+        close(p[0]);
+        close(p[1]);
+        close(epfd);
+        return 42;
+    }
+    /* Drain pipe (2 bytes) */
+    if (read(p[0], buf, 2) != 2) {
+        close(p[0]);
+        close(p[1]);
+        close(epfd);
+        return 43;
+    }
+
+    /* 8. Deletion (EPOLL_CTL_DEL) */
+    if (epoll_ctl(epfd, EPOLL_CTL_DEL, p[0], NULL) != 0) {
+        close(p[0]);
+        close(p[1]);
+        close(epfd);
+        return 44;
+    }
+    if (write(p[1], "z", 1) != 1) {
+        close(p[0]);
+        close(p[1]);
+        close(epfd);
+        return 45;
+    }
+    if (epoll_wait(epfd, evs, 4, 0) != 0) {
+        close(p[0]);
+        close(p[1]);
+        close(epfd);
+        return 46;
+    }
+    close(p[0]);
+    close(p[1]);
+
+    /* 9. epoll_pwait with signal mask & EINTR */
+    struct sigaction sa = {0};
+    sa.sa_handler = user_signal_handler;
+    if (sigaction(SIGUSR1, &sa, NULL) != 0) {
+        close(epfd);
+        return 47;
+    }
+    sigset_t block_mask, orig_mask, wait_mask;
+    sigemptyset(&block_mask);
+    sigaddset(&block_mask, SIGUSR1);
+    if (sigprocmask(SIG_BLOCK, &block_mask, &orig_mask) != 0) {
+        close(epfd);
+        return 48;
+    }
+    sigemptyset(&wait_mask); /* SIGUSR1 unblocked during epoll_pwait */
+
+    child = fork();
+    if (child < 0) {
+        close(epfd);
+        return 49;
+    }
+    if (child == 0) {
+        signal_parent_after_delay(getppid(), SIGUSR1);
+    }
+    user_signal_seen = 0;
+    errno = 0;
+    n = epoll_pwait(epfd, evs, 4, 2000, &wait_mask);
+    if (n != -1 || errno != EINTR || user_signal_seen != SIGUSR1) {
+        close(epfd);
+        return 50;
+    }
+    /* Verify SIGUSR1 remains blocked in parent */
+    sigset_t current_mask;
+    sigemptyset(&current_mask);
+    if (sigprocmask(SIG_SETMASK, NULL, &current_mask) != 0 ||
+        !sigismember(&current_mask, SIGUSR1)) {
+        close(epfd);
+        return 51;
+    }
+    if (sigprocmask(SIG_SETMASK, &orig_mask, NULL) != 0) {
+        close(epfd);
+        return 52;
+    }
+    if (waitpid(child, &child_status, 0) != child || !WIFEXITED(child_status) ||
+        WEXITSTATUS(child_status) != 0) {
+        close(epfd);
+        return 53;
+    }
+
+    /* 10. Composability: poll() on epfd */
+    int p2[2];
+    if (pipe(p2) != 0) {
+        close(epfd);
+        return 54;
+    }
+    ev.events = EPOLLIN;
+    ev.data.u64 = 0x42ULL;
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, p2[0], &ev) != 0) {
+        close(p2[0]);
+        close(p2[1]);
+        close(epfd);
+        return 55;
+    }
+    struct pollfd pfd = { .fd = epfd, .events = POLLIN, .revents = 0 };
+    if (poll(&pfd, 1, 0) != 0) {
+        close(p2[0]);
+        close(p2[1]);
+        close(epfd);
+        return 56;
+    }
+    if (write(p2[1], "ok", 2) != 2) {
+        close(p2[0]);
+        close(p2[1]);
+        close(epfd);
+        return 57;
+    }
+    if (poll(&pfd, 1, 100) != 1 || !(pfd.revents & POLLIN)) {
+        close(p2[0]);
+        close(p2[1]);
+        close(epfd);
+        return 58;
+    }
+    close(p2[0]);
+    close(p2[1]);
+    close(epfd);
+
+    static const char epoll_marker[] =
+        "BoarOS: real userland epoll checks ok\n";
+    if (write(1, epoll_marker, sizeof(epoll_marker) - 1) !=
+        (ssize_t)(sizeof(epoll_marker) - 1)) {
+        return 59;
     }
 
     return 0;
@@ -1059,6 +1491,13 @@ int main(void)
         fprintf(stderr, "poll/select check failed: %d errno=%d\n",
                 poll_result, errno);
         return 82;
+    }
+
+    int epoll_result = check_epoll();
+    if (epoll_result != 0) {
+        fprintf(stderr, "epoll check failed: %d errno=%d\n",
+                epoll_result, errno);
+        return 83;
     }
 
     return 42;

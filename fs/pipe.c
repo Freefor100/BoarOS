@@ -419,9 +419,8 @@ enum kernel_pipe_status kernel_pipe_writev(
         pipe_produce(pipe, copied);
         total += copied;
         iov_offset += copied;
-        /* Empty -> readable makes every sleeping reader eligible. Further
-         * iovecs before a schedule need no repeated blocked-list scan. */
-        if (copied != 0U && pipe->bytes == copied) {
+        /* Any bytes produced make sleeping readers or epoll watchers eligible. */
+        if (copied != 0U) {
             (void)kernel_wait_queue_wake_all(&pipe->read_queue);
         }
         if (access_status != KERNEL_UACCESS_STATUS_OK || copied != chunk) {

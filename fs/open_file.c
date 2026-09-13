@@ -1,6 +1,7 @@
 #include "open_file_internal.h"
 #include "pipe_internal.h"
 #include "vfs_internal.h"
+#include "files/epoll_internal.h"
 
 #include <kernel/console.h>
 #include <kernel/errno.h>
@@ -181,6 +182,38 @@ enum kernel_open_file_status kernel_open_file_create_pipe(
     return KERNEL_OPEN_FILE_STATUS_OK;
 }
 
+enum kernel_open_file_status kernel_open_file_create_epoll(
+    struct kernel_heap *heap,
+    struct kernel_epoll *epoll,
+    uint32_t flags,
+    struct kernel_open_file_description **owner)
+{
+    struct kernel_open_file_description *file;
+    enum kernel_heap_status heap_status;
+
+    if (heap == 0 || epoll == 0 || owner == 0 || *owner != 0) {
+        return KERNEL_OPEN_FILE_STATUS_INVALID_ARGUMENT;
+    }
+    heap_status = kernel_heap_allocate_zeroed(heap,
+                                              1U,
+                                              sizeof(*file),
+                                              (void **)&file);
+    if (heap_status == KERNEL_HEAP_STATUS_EMPTY) {
+        return KERNEL_OPEN_FILE_STATUS_NO_MEMORY;
+    }
+    if (heap_status != KERNEL_HEAP_STATUS_OK) {
+        return KERNEL_OPEN_FILE_STATUS_STATE;
+    }
+    file->heap = heap;
+    file->references = 1U;
+    file->kind = KERNEL_OPEN_FILE_KIND_EPOLL;
+    file->epoll = epoll;
+    file->open_flags = flags;
+    file->vfs_closed = 0U;
+    *owner = file;
+    return KERNEL_OPEN_FILE_STATUS_OK;
+}
+
 enum kernel_open_file_kind kernel_open_file_kind(
     const struct kernel_open_file_description *file)
 {
@@ -194,6 +227,8 @@ enum kernel_open_file_kind kernel_open_file_kind(
         return KERNEL_OPEN_FILE_KIND_CONSOLE;
     case KERNEL_OPEN_FILE_KIND_PIPE:
         return KERNEL_OPEN_FILE_KIND_PIPE;
+    case KERNEL_OPEN_FILE_KIND_EPOLL:
+        return KERNEL_OPEN_FILE_KIND_EPOLL;
     default:
         return KERNEL_OPEN_FILE_KIND_REGULAR;
     }
@@ -232,6 +267,9 @@ enum kernel_open_file_status kernel_open_file_release(
     if (file->references == 1U) {
         file->references = 0U;
     }
+    if (file->ep_items != 0) {
+        kernel_epoll_notify_file_release(file);
+    }
     if (!file->vfs_closed) {
         if (file->kind == KERNEL_OPEN_FILE_KIND_CONSOLE) {
             file->vfs_closed = 1U;
@@ -242,11 +280,17 @@ enum kernel_open_file_status kernel_open_file_release(
                     file->pipe_endpoint);
                 if (pipe_status != KERNEL_PIPE_STATUS_OK) {
                     return pipe_status == KERNEL_PIPE_STATUS_CLEANUP_REQUIRED
-                               ? KERNEL_OPEN_FILE_STATUS_CLEANUP_REQUIRED
-                               : KERNEL_OPEN_FILE_STATUS_STATE;
+                                ? KERNEL_OPEN_FILE_STATUS_CLEANUP_REQUIRED
+                                : KERNEL_OPEN_FILE_STATUS_STATE;
                 }
                 file->pipe_endpoint_closed = 1U;
                 file->pipe = 0;
+            }
+            file->vfs_closed = 1U;
+        } else if (file->kind == KERNEL_OPEN_FILE_KIND_EPOLL) {
+            if (file->epoll != 0) {
+                kernel_epoll_destroy(file->epoll);
+                file->epoll = 0;
             }
             file->vfs_closed = 1U;
         } else if (kernel_vfs_close(&file->file) != 0) {
@@ -275,10 +319,11 @@ enum kernel_open_file_status kernel_open_file_detach(
     if (!open_file_live(file)) {
         return KERNEL_OPEN_FILE_STATUS_STATE;
     }
-    /* A pipe endpoint's last live owner closes it immediately, even when
-     * its allocation must survive on a cleanup list. Otherwise dup/exec
-     * can indefinitely postpone EOF or EPIPE behind an unrelated drain. */
-    if (file->kind == KERNEL_OPEN_FILE_KIND_PIPE && file->references == 1U) {
+    /* A pipe endpoint or epoll descriptor's last live owner closes it immediately,
+     * even when its allocation must survive on a cleanup list. */
+    if ((file->kind == KERNEL_OPEN_FILE_KIND_PIPE ||
+         file->kind == KERNEL_OPEN_FILE_KIND_EPOLL) &&
+        file->references == 1U) {
         return kernel_open_file_release(owner);
     }
     file->references--;
@@ -411,6 +456,8 @@ uint32_t kernel_open_file_poll(
     case KERNEL_OPEN_FILE_KIND_REGULAR:
     case KERNEL_OPEN_FILE_KIND_DIRECTORY:
         return KERNEL_POLLIN | KERNEL_POLLOUT | KERNEL_POLLRDNORM | KERNEL_POLLWRNORM;
+    case KERNEL_OPEN_FILE_KIND_EPOLL:
+        return kernel_epoll_poll(file->epoll, requested_events, out_queue);
     default:
         return KERNEL_POLLNVAL;
     }

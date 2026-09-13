@@ -64,6 +64,19 @@ open file description 的 offset 只增加实际复制到用户空间的字节�
 - **原子信号掩码替换**：`ppoll` 和 `pselect6` 支持以原子方式应用调用者指定的临时 `sigmask`，使阻塞等待能够被特定信号打断并返回 `-EINTR`，返回或打断时自动恢复原有信号掩码。
 - **紧凑栈预算与堆回退**：受限于内核任务单页（4 KiB）控制块与内核栈共享布局，`poll` 与 `pselect6` 严格控制栈帧大小（快速路径最多 4 个描述符节点、select 最多 64 个 fd 的单字 bitset）；超出快速路径容量时统一从进程私有 `files->heap` 动态分配并在返回前完全回收，避免击穿内核栈金丝雀（Canary）。
 
+## epoll 事件通知子系统
+
+`kernel_files_epoll_create1()`、`kernel_files_epoll_ctl()` 与 `kernel_files_epoll_pwait()` 实现了 Linux 现代事件驱动 I/O 子系统：
+- **epoll OFD 与长效事件绑定**：`epoll_create1` 创建 `KERNEL_OPEN_FILE_KIND_EPOLL` 类型的 open file description。不同于 `poll/select` 每次调用时的全量队列挂载，`epoll_ctl(EPOLL_CTL_ADD)` 将监听项（`struct kernel_epoll_item`）常驻注册在目标 OFD 的等待队列上，实现控制面与数据面解耦。
+- **Push 模型就绪列表（Ready List）与回调**：当目标 OFD 状态变化并执行 `kernel_wait_queue_wake_all()` 时，安装在 `kernel_wait_node` 上的 `kernel_epoll_wait_callback()` 自动将所属 `epitem` 追加至 epoll 实例的就绪列表（`ready_head/tail`），并级联唤醒阻塞在 `epoll_pwait` 上的进程。
+- **水平触发（LT）、边缘触发（ET）与单次触发（ONESHOT）**：
+  - 水平触发（LT，默认）：`epoll_wait` 在返回就绪事件后，若底层数据仍可读写（`kernel_open_file_poll` 仍报告匹配事件），将该 item 重新排入就绪队尾，确保未读完的数据持续通知；
+  - 边缘触发（ET，`EPOLLET`）：事件一旦交付用户态，立即从就绪列表移出；仅当目标底层产生新的写入/唤醒边缘时才会重新入列；
+  - 单次触发（`EPOLLONESHOT`）：事件交付后将 item 标记为 disarmed，直至用户显式通过 `EPOLL_CTL_MOD` 重新激活。
+- **OFD 双向解绑与安全性**：目标 OFD 中维护指向所有监视它的 `epitem` 双向链表（`file->ep_items`）。当目标 OFD 的所有文件描述符被全部关闭、底层 OFD 最终释放（`kernel_open_file_release`）时，自动触发 `kernel_epoll_notify_file_release()` 从所属 epoll 实例中解绑并清理对应等待节点与内存，防止悬垂指针。同时，`close(epfd)` 销毁 epoll 实例时也会遍历所有项安全脱钩。
+- **可组合性**：epoll 描述符自身实现了 `kernel_epoll_poll()`，允许嵌套使用 `poll/select` 或其他 epoll 实例监视 epoll fd 自身的就绪态。
+- **资源生命周期与栈预算**：epoll 实例和 epitem 由文件表堆管理，`epoll_pwait` 快速路径在栈上维护至多 8 个事件缓冲（128 字节），超出时动态分配并释放，确保严守 1.8 KiB 内核栈空间。
+
 ## `lseek`、`fstat`/`newfstatat` 与 `getdents64`
 
 `kernel_files_lseek()` 支持 `SEEK_SET/CUR/END` 的有符号运算与溢出检查，负结果返回 `-EINVAL` 且不移动 offset，越过 EOF 的定位成功；console 返回 `-ESPIPE`。目录也支持 `lseek`，其 offset 兼作 `getdents64` 的条目 cookie。

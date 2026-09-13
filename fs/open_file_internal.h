@@ -4,6 +4,9 @@
 #include <kernel/open_file.h>
 #include <kernel/vfs.h>
 
+struct kernel_epoll;
+struct kernel_epoll_item;
+
 struct kernel_open_file_description {
     struct kernel_vfs_file file;
     struct kernel_open_file_description *cleanup_next;
@@ -16,6 +19,8 @@ struct kernel_open_file_description {
     struct kernel_pipe *pipe;
     uint8_t pipe_endpoint;
     uint8_t pipe_endpoint_closed;
+    struct kernel_epoll *epoll;
+    struct kernel_epoll_item *ep_items;
 };
 
 enum kernel_open_file_status kernel_open_file_create_pipe(
@@ -23,6 +28,12 @@ enum kernel_open_file_status kernel_open_file_create_pipe(
     struct kernel_pipe *pipe,
     uint32_t endpoint,
     uint64_t flags,
+    struct kernel_open_file_description **owner);
+
+enum kernel_open_file_status kernel_open_file_create_epoll(
+    struct kernel_heap *heap,
+    struct kernel_epoll *epoll,
+    uint32_t flags,
     struct kernel_open_file_description **owner);
 
 /* Drop a live container reference. Final pipe endpoints close immediately;
