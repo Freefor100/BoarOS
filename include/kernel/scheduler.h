@@ -128,8 +128,15 @@ enum kernel_wait_wake_reason {
 
 #define KERNEL_WAIT_QUEUE_INITIALIZED UINT32_C(0x57414954)
 
+struct kernel_wait_node;
+
+typedef void (*kernel_wait_callback_fn)(struct kernel_wait_node *node,
+                                        uint32_t reason);
+
 struct kernel_wait_node {
     struct kernel_task *task;
+    kernel_wait_callback_fn callback;
+    void *context;
     struct kernel_wait_queue *queue;
     struct kernel_wait_node *previous;
     struct kernel_wait_node *next;
@@ -147,6 +154,9 @@ struct kernel_wait_queue {
 
 void kernel_wait_node_init(struct kernel_wait_node *node,
                            struct kernel_task *task);
+void kernel_wait_node_init_callback(struct kernel_wait_node *node,
+                                    kernel_wait_callback_fn callback,
+                                    void *context);
 void kernel_wait_queue_init(struct kernel_wait_queue *queue);
 void kernel_wait_queue_add(struct kernel_wait_queue *queue,
                            struct kernel_wait_node *node);

@@ -9,6 +9,9 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#define LINUX_SYSCALL_EPOLL_CREATE1 20U
+#define LINUX_SYSCALL_EPOLL_CTL 21U
+#define LINUX_SYSCALL_EPOLL_PWAIT 22U
 #define LINUX_SYSCALL_DUP 23U
 #define LINUX_SYSCALL_DUP3 24U
 #define LINUX_SYSCALL_FCNTL 25U
@@ -132,7 +135,22 @@ enum kernel_syscall_status kernel_syscall_dispatch(
         return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     }
 
-    if (request->number == LINUX_SYSCALL_DUP) {
+    if (request->number == LINUX_SYSCALL_EPOLL_CREATE1) {
+        if (syscall_handle_epoll_create1(caller, request, &decoded) !=
+            KERNEL_SYSCALL_STATUS_OK) {
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+        }
+    } else if (request->number == LINUX_SYSCALL_EPOLL_CTL) {
+        if (syscall_handle_epoll_ctl(caller, request, &decoded) !=
+            KERNEL_SYSCALL_STATUS_OK) {
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+        }
+    } else if (request->number == LINUX_SYSCALL_EPOLL_PWAIT) {
+        if (syscall_handle_epoll_pwait(caller, request, &decoded) !=
+            KERNEL_SYSCALL_STATUS_OK) {
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+        }
+    } else if (request->number == LINUX_SYSCALL_DUP) {
         if (syscall_handle_dup(caller, request, &decoded) !=
             KERNEL_SYSCALL_STATUS_OK) {
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;

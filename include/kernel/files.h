@@ -285,4 +285,30 @@ enum kernel_files_status kernel_files_pselect6(
     uint64_t user_sigdata,
     int64_t *linux_result);
 
+enum kernel_files_status kernel_files_epoll_create1(
+    struct kernel_files *files,
+    uint32_t flags,
+    int64_t *linux_result);
+
+enum kernel_files_status kernel_files_epoll_ctl(
+    struct kernel_files *files,
+    int64_t epfd,
+    int32_t op,
+    int64_t fd,
+    uint32_t events,
+    uint64_t data,
+    int64_t *linux_result);
+
+enum kernel_files_status kernel_files_epoll_pwait(
+    struct kernel_files *files,
+    struct kernel_mm *mm,
+    struct kernel_task *task,
+    int64_t epfd,
+    uint64_t user_events,
+    int32_t maxevents,
+    int32_t timeout,
+    uint64_t user_sigmask,
+    size_t sigsetsize,
+    int64_t *linux_result);
+
 #endif
