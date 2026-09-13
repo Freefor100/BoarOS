@@ -26,6 +26,7 @@ struct riscv_virtio_mmio_block_statistics {
     uint64_t direct_requests;
     uint64_t bounce_requests;
     uint64_t sectors_read;
+    uint64_t sectors_written;
     uint64_t timeouts;
     uint64_t io_errors;
 };
@@ -44,6 +45,7 @@ struct riscv_virtio_mmio_block {
     uint32_t transport_version;
     uint32_t queue_allocation_order;
     uint32_t state;
+    uint32_t read_only;
     struct riscv_virtio_mmio_block_statistics statistics;
 };
 

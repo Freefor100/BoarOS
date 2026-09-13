@@ -36,8 +36,8 @@
 static int validate_open_flags(uint64_t flags, uint32_t *fd_flags)
 {
     const uint64_t write_flags = LINUX_O_CREAT | LINUX_O_TRUNC |
-                                 LINUX_O_APPEND;
-    const uint64_t unsupported_flags = LINUX_O_EXCL |
+                                 LINUX_O_APPEND | LINUX_O_EXCL;
+    const uint64_t unsupported_flags =
         LINUX_O_NONBLOCK | LINUX_O_DSYNC | LINUX_O_DIRECT |
         LINUX_O_NOFOLLOW | LINUX_O_NOATIME | LINUX_O_SYNC | LINUX_O_PATH |
         (LINUX_O_TMPFILE & ~LINUX_O_DIRECTORY);
@@ -46,11 +46,10 @@ static int validate_open_flags(uint64_t flags, uint32_t *fd_flags)
         LINUX_O_CLOEXEC;
     uint64_t access_mode = flags & LINUX_O_ACCMODE;
 
-    if (access_mode == LINUX_O_WRONLY || access_mode == LINUX_O_RDWR ||
-        (flags & write_flags) != 0U) {
-        return -KERNEL_EROFS;
+    if (access_mode == 3U || (flags & ~known_flags) != 0U) {
+        return -KERNEL_EINVAL;
     }
-    if (access_mode != 0U || (flags & ~known_flags) != 0U) {
+    if ((flags & LINUX_O_DIRECTORY) != 0U && (flags & LINUX_O_CREAT) != 0U) {
         return -KERNEL_EINVAL;
     }
     if ((flags & unsupported_flags) != 0U) {
@@ -111,7 +110,8 @@ enum kernel_files_status kernel_files_openat(
     enum kernel_fs_context_status fs_status;
     enum kernel_files_status files_status;
 
-    (void)mode;
+    int created = 0;
+
     if (!kernel_files_is_live(files) || !kernel_fs_context_is_live(fs) ||
         mm == 0 || linux_result == 0) {
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
@@ -163,11 +163,37 @@ enum kernel_files_status kernel_files_openat(
         *linux_result = result;
         return KERNEL_FILES_STATUS_OK;
     }
+    if (kernel_vfs_mount_is_readonly(mount)) {
+        uint64_t access_mode = flags & LINUX_O_ACCMODE;
+        const uint64_t write_flags = LINUX_O_CREAT | LINUX_O_TRUNC |
+                                     LINUX_O_APPEND;
+
+        if (access_mode == LINUX_O_WRONLY || access_mode == LINUX_O_RDWR ||
+            (flags & write_flags) != 0U) {
+            files->record->statistics.open_failures++;
+            if (finish_path(files, path) != KERNEL_FILES_STATUS_OK) {
+                return KERNEL_FILES_STATUS_STATE;
+            }
+            *linux_result = -KERNEL_EROFS;
+            return KERNEL_FILES_STATUS_OK;
+        }
+    }
     open_status = kernel_open_file_create(files->heap,
                                           mount,
                                           path,
                                           &description,
                                           &result);
+    if (open_status == KERNEL_OPEN_FILE_STATUS_OK &&
+        result == -KERNEL_ENOENT &&
+        (flags & LINUX_O_CREAT) != 0U) {
+        created = 1;
+        open_status = kernel_open_file_create_mode(files->heap,
+                                                   mount,
+                                                   path,
+                                                   (uint32_t)mode,
+                                                   &description,
+                                                   &result);
+    }
     if (finish_path(files, path) != KERNEL_FILES_STATUS_OK) {
         if (description != 0) {
             kernel_files_queue_description(files, description);
@@ -191,8 +217,26 @@ enum kernel_files_status kernel_files_openat(
         *linux_result = result;
         return KERNEL_FILES_STATUS_OK;
     }
+    if (!created && (flags & LINUX_O_CREAT) != 0U &&
+        (flags & LINUX_O_EXCL) != 0U) {
+        files->record->statistics.open_failures++;
+        kernel_files_queue_description(files, description);
+        (void)kernel_files_drain_file_cleanup(files);
+        *linux_result = -KERNEL_EEXIST;
+        return KERNEL_FILES_STATUS_OK;
+    }
     if ((kernel_open_file_mode(description) & KERNEL_VFS_S_IFMT) ==
         KERNEL_VFS_S_IFDIR) {
+        uint64_t access_mode = flags & LINUX_O_ACCMODE;
+
+        if (access_mode == LINUX_O_WRONLY || access_mode == LINUX_O_RDWR ||
+            (flags & LINUX_O_TRUNC) != 0U) {
+            files->record->statistics.open_failures++;
+            kernel_files_queue_description(files, description);
+            (void)kernel_files_drain_file_cleanup(files);
+            *linux_result = -KERNEL_EISDIR;
+            return KERNEL_FILES_STATUS_OK;
+        }
         description->kind = KERNEL_OPEN_FILE_KIND_DIRECTORY;
     } else if ((kernel_open_file_mode(description) & KERNEL_VFS_S_IFMT) ==
                KERNEL_VFS_S_IFREG) {
@@ -202,6 +246,17 @@ enum kernel_files_status kernel_files_openat(
             (void)kernel_files_drain_file_cleanup(files);
             *linux_result = -KERNEL_ENOTDIR;
             return KERNEL_FILES_STATUS_OK;
+        }
+        if (!created && (flags & LINUX_O_TRUNC) != 0U) {
+            int trunc_result = kernel_vfs_ftruncate(&description->file, 0U);
+
+            if (trunc_result != 0) {
+                files->record->statistics.open_failures++;
+                kernel_files_queue_description(files, description);
+                (void)kernel_files_drain_file_cleanup(files);
+                *linux_result = trunc_result;
+                return KERNEL_FILES_STATUS_OK;
+            }
         }
         description->kind = KERNEL_OPEN_FILE_KIND_REGULAR;
     } else {
@@ -437,5 +492,125 @@ enum kernel_files_status kernel_files_fstatat(
     if (copy_result > 0) {
         *linux_result = 0;
     }
+    return KERNEL_FILES_STATUS_OK;
+}
+
+enum kernel_files_status kernel_files_mkdirat(
+    struct kernel_files *files,
+    const struct kernel_fs_context *fs,
+    struct kernel_mm *mm,
+    int64_t dirfd,
+    uint64_t user_path,
+    uint32_t mode,
+    int64_t *linux_result)
+{
+    struct kernel_vfs_mount *mount;
+    char *path;
+    int result;
+    enum kernel_heap_status heap_status;
+    enum kernel_fs_context_status fs_status;
+
+    if (!kernel_files_is_live(files) || !kernel_fs_context_is_live(fs) ||
+        mm == 0 || linux_result == 0) {
+        return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
+    }
+    heap_status = kernel_heap_allocate(files->heap,
+                                       KERNEL_FS_PATH_MAX,
+                                       (void **)&path);
+    if (heap_status == KERNEL_HEAP_STATUS_EMPTY) {
+        *linux_result = -KERNEL_ENOMEM;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    if (heap_status != KERNEL_HEAP_STATUS_OK) {
+        return KERNEL_FILES_STATUS_STATE;
+    }
+    fs_status = kernel_fs_context_resolve_user_path(fs,
+                                                    mm,
+                                                    dirfd,
+                                                    user_path,
+                                                    path,
+                                                    KERNEL_FS_PATH_MAX,
+                                                    &mount,
+                                                    &result);
+    if (fs_status != KERNEL_FS_CONTEXT_STATUS_OK) {
+        (void)finish_path(files, path);
+        return KERNEL_FILES_STATUS_STATE;
+    }
+    if (result != 0) {
+        if (finish_path(files, path) != KERNEL_FILES_STATUS_OK) {
+            return KERNEL_FILES_STATUS_STATE;
+        }
+        *linux_result = result;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    result = kernel_vfs_mkdir(mount, path, mode);
+    if (finish_path(files, path) != KERNEL_FILES_STATUS_OK) {
+        return KERNEL_FILES_STATUS_STATE;
+    }
+    *linux_result = result;
+    return KERNEL_FILES_STATUS_OK;
+}
+
+enum kernel_files_status kernel_files_unlinkat(
+    struct kernel_files *files,
+    const struct kernel_fs_context *fs,
+    struct kernel_mm *mm,
+    int64_t dirfd,
+    uint64_t user_path,
+    uint32_t flags,
+    int64_t *linux_result)
+{
+    struct kernel_vfs_mount *mount;
+    char *path;
+    int result;
+    enum kernel_heap_status heap_status;
+    enum kernel_fs_context_status fs_status;
+
+    if (!kernel_files_is_live(files) || !kernel_fs_context_is_live(fs) ||
+        mm == 0 || linux_result == 0) {
+        return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
+    }
+    if ((flags & ~KERNEL_FILES_AT_REMOVEDIR) != 0U) {
+        *linux_result = -KERNEL_EINVAL;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    heap_status = kernel_heap_allocate(files->heap,
+                                       KERNEL_FS_PATH_MAX,
+                                       (void **)&path);
+    if (heap_status == KERNEL_HEAP_STATUS_EMPTY) {
+        *linux_result = -KERNEL_ENOMEM;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    if (heap_status != KERNEL_HEAP_STATUS_OK) {
+        return KERNEL_FILES_STATUS_STATE;
+    }
+    fs_status = kernel_fs_context_resolve_user_path(fs,
+                                                    mm,
+                                                    dirfd,
+                                                    user_path,
+                                                    path,
+                                                    KERNEL_FS_PATH_MAX,
+                                                    &mount,
+                                                    &result);
+    if (fs_status != KERNEL_FS_CONTEXT_STATUS_OK) {
+        (void)finish_path(files, path);
+        return KERNEL_FILES_STATUS_STATE;
+    }
+    if (result != 0) {
+        if (finish_path(files, path) != KERNEL_FILES_STATUS_OK) {
+            return KERNEL_FILES_STATUS_STATE;
+        }
+        *linux_result = result;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    if ((flags & KERNEL_FILES_AT_REMOVEDIR) != 0U) {
+        result = kernel_vfs_rmdir(mount, path);
+    } else {
+        result = kernel_vfs_unlink(mount, path);
+    }
+    if (finish_path(files, path) != KERNEL_FILES_STATUS_OK) {
+        return KERNEL_FILES_STATUS_STATE;
+    }
+    *linux_result = result;
     return KERNEL_FILES_STATUS_OK;
 }

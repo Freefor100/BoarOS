@@ -23,9 +23,16 @@ typedef enum kernel_block_status (*kernel_block_read_fn)(
     void *buffer,
     size_t size);
 
+typedef enum kernel_block_status (*kernel_block_write_fn)(
+    void *context,
+    uint64_t offset,
+    const void *buffer,
+    size_t size);
+
 struct kernel_block_device {
     void *context;
     kernel_block_read_fn read;
+    kernel_block_write_fn write;
     uint64_t capacity_bytes;
     uint32_t logical_block_size;
 };
@@ -34,6 +41,12 @@ enum kernel_block_status kernel_block_read_at(
     struct kernel_block_device *device,
     uint64_t offset,
     void *buffer,
+    size_t size);
+
+enum kernel_block_status kernel_block_write_at(
+    struct kernel_block_device *device,
+    uint64_t offset,
+    const void *buffer,
     size_t size);
 
 #endif

@@ -62,7 +62,7 @@ if ! { sleep 4; printf 'go\n'; } | timeout -k 2s 15s "$qemu" \
     -smp 1 \
     -nographic \
     -no-reboot \
-    -drive file="$static_disk",if=none,format=raw,readonly=on,id=root \
+    -drive file="$static_disk",if=none,format=raw,readonly=off,id=root \
     -device virtio-blk-device,drive=root,bus=virtio-mmio-bus.0 \
     >"$static_output" 2>&1; then
     tail -n 120 "$static_output" >&2
@@ -73,6 +73,7 @@ fi
 for marker in \
     'BoarOS: real userland stdio ok' \
     'BoarOS: real userland file checks ok' \
+    'BoarOS: real userland fs rw checks ok' \
     'BoarOS: real userland clock checks ok' \
     'BoarOS: real userland sleep checks ok' \
     'BoarOS: real userland console input ok' \

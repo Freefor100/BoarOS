@@ -40,9 +40,16 @@ int kernel_vfs_mount_root_readonly(struct kernel_vfs_mount *mount,
 
 int kernel_vfs_unmount(struct kernel_vfs_mount *mount);
 
+int kernel_vfs_mount_is_readonly(const struct kernel_vfs_mount *mount);
+
 int kernel_vfs_open(struct kernel_vfs_mount *mount,
                     const char *path,
                     struct kernel_vfs_file *file);
+
+int kernel_vfs_create(struct kernel_vfs_mount *mount,
+                      const char *path,
+                      uint32_t mode,
+                      struct kernel_vfs_file *file);
 
 /* Rejects non-regular or non-executable files with EACCES. */
 int kernel_vfs_open_executable(struct kernel_vfs_mount *mount,
@@ -55,6 +62,25 @@ int kernel_vfs_pread(struct kernel_vfs_file *file,
                      size_t size,
                      size_t *bytes_read);
 
+int kernel_vfs_pwrite(struct kernel_vfs_file *file,
+                      uint64_t offset,
+                      const void *buffer,
+                      size_t size,
+                      size_t *bytes_written);
+
+int kernel_vfs_ftruncate(struct kernel_vfs_file *file,
+                         uint64_t size);
+
+int kernel_vfs_mkdir(struct kernel_vfs_mount *mount,
+                     const char *path,
+                     uint32_t mode);
+
+int kernel_vfs_unlink(struct kernel_vfs_mount *mount,
+                      const char *path);
+
+int kernel_vfs_rmdir(struct kernel_vfs_mount *mount,
+                     const char *path);
+
 /* The file must remain open while the source is in use. */
 int kernel_vfs_file_read_source(struct kernel_vfs_file *file,
                                 struct kernel_read_source *source);
@@ -63,6 +89,9 @@ int kernel_vfs_close(struct kernel_vfs_file *file);
 
 /* Underlying ext4 inode number; zero when unavailable. */
 uint32_t kernel_vfs_file_inode(const struct kernel_vfs_file *file);
+
+/* Returns the current file size in bytes from the live VFS node. */
+uint64_t kernel_vfs_file_size(const struct kernel_vfs_file *file);
 
 /* Linux d_type values for directory entries. */
 #define KERNEL_VFS_DT_UNKNOWN UINT8_C(0)

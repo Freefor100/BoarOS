@@ -959,6 +959,198 @@ static int check_epoll(void)
     return 0;
 }
 
+static int check_filesystem_rw(void)
+{
+    /* 1. File creation and exclusive open */
+    int wfd = open("/testfile.txt", O_CREAT | O_WRONLY | O_TRUNC, 0644);
+    if (wfd < 0) {
+        return 1;
+    }
+    /* O_CREAT | O_EXCL on existing file must fail with EEXIST */
+    errno = 0;
+    int excl_fd = open("/testfile.txt", O_CREAT | O_EXCL | O_WRONLY, 0644);
+    if (excl_fd >= 0 || errno != EEXIST) {
+        if (excl_fd >= 0) close(excl_fd);
+        close(wfd);
+        return 2;
+    }
+
+    /* 2. Write regular file and writev */
+    const char msg1[] = "Hello BoarOS ext4 write!\n";
+    size_t len1 = sizeof(msg1) - 1;
+    if (write(wfd, msg1, len1) != (ssize_t)len1) {
+        close(wfd);
+        return 3;
+    }
+    struct iovec iov[2];
+    iov[0].iov_base = (void *)"12345";
+    iov[0].iov_len = 5;
+    iov[1].iov_base = (void *)"67890";
+    iov[1].iov_len = 5;
+    if (writev(wfd, iov, 2) != 10) {
+        close(wfd);
+        return 4;
+    }
+    if (lseek(wfd, 0, SEEK_CUR) != (off_t)(len1 + 10)) {
+        close(wfd);
+        return 5;
+    }
+    if (close(wfd) != 0) {
+        return 6;
+    }
+
+    /* 3. Read back and verify */
+    int rfd = open("/testfile.txt", O_RDONLY);
+    if (rfd < 0) {
+        return 7;
+    }
+    struct stat st;
+    if (fstat(rfd, &st) != 0 || st.st_size != (off_t)(len1 + 10)) {
+        close(rfd);
+        return 8;
+    }
+    char readbuf[64];
+    memset(readbuf, 0, sizeof(readbuf));
+    if (read(rfd, readbuf, sizeof(readbuf)) != (ssize_t)(len1 + 10)) {
+        close(rfd);
+        return 9;
+    }
+    if (memcmp(readbuf, msg1, len1) != 0 ||
+        memcmp(readbuf + len1, "1234567890", 10) != 0) {
+        close(rfd);
+        return 10;
+    }
+    /* ftruncate on O_RDONLY fd must fail with EINVAL */
+    errno = 0;
+    if (ftruncate(rfd, 0) != -1 || errno != EINVAL) {
+        close(rfd);
+        return 11;
+    }
+    close(rfd);
+
+    /* 4. Append mode */
+    int afd = open("/testfile.txt", O_WRONLY | O_APPEND);
+    if (afd < 0) {
+        return 12;
+    }
+    if (write(afd, "+append", 7) != 7) {
+        close(afd);
+        return 13;
+    }
+    close(afd);
+
+    rfd = open("/testfile.txt", O_RDONLY);
+    if (rfd < 0) {
+        return 14;
+    }
+    if (fstat(rfd, &st) != 0 || st.st_size != (off_t)(len1 + 10 + 7)) {
+        close(rfd);
+        return 15;
+    }
+    close(rfd);
+
+    /* 5. Truncate */
+    int rwfd = open("/testfile.txt", O_RDWR);
+    if (rwfd < 0) {
+        return 16;
+    }
+    if (ftruncate(rwfd, 5) != 0) {
+        close(rwfd);
+        return 17;
+    }
+    if (fstat(rwfd, &st) != 0 || st.st_size != 5) {
+        close(rwfd);
+        return 18;
+    }
+    memset(readbuf, 0, sizeof(readbuf));
+    if (lseek(rwfd, 0, SEEK_SET) != 0 || read(rwfd, readbuf, sizeof(readbuf)) != 5 ||
+        memcmp(readbuf, "Hello", 5) != 0) {
+        close(rwfd);
+        return 19;
+    }
+    close(rwfd);
+
+    /* O_TRUNC on open */
+    wfd = open("/testfile.txt", O_WRONLY | O_TRUNC);
+    if (wfd < 0) {
+        return 20;
+    }
+    if (fstat(wfd, &st) != 0 || st.st_size != 0) {
+        close(wfd);
+        return 21;
+    }
+    close(wfd);
+
+    /* 6. Directory operations: mkdir / unlink / rmdir */
+    if (mkdir("/testdir", 0755) != 0) {
+        return 22;
+    }
+    /* Opening directory with O_WRONLY must fail with EISDIR */
+    errno = 0;
+    int dir_wfd = open("/testdir", O_WRONLY);
+    if (dir_wfd >= 0 || errno != EISDIR) {
+        if (dir_wfd >= 0) close(dir_wfd);
+        return 23;
+    }
+    /* Create a file inside /testdir */
+    int subfd = open("/testdir/sub.txt", O_CREAT | O_WRONLY, 0644);
+    if (subfd < 0) {
+        return 24;
+    }
+    if (write(subfd, "boar", 4) != 4) {
+        close(subfd);
+        return 25;
+    }
+    close(subfd);
+
+    /* Non-empty rmdir should fail */
+    errno = 0;
+    if (rmdir("/testdir") != -1 || (errno != ENOTEMPTY && errno != EEXIST)) {
+        return 26;
+    }
+
+    /* Unlink file inside directory */
+    if (unlink("/testdir/sub.txt") != 0) {
+        return 27;
+    }
+    /* Confirm file is gone */
+    errno = 0;
+    if (open("/testdir/sub.txt", O_RDONLY) >= 0 || errno != ENOENT) {
+        return 28;
+    }
+
+    /* rmdir empty directory */
+    if (rmdir("/testdir") != 0) {
+        return 29;
+    }
+    /* Confirm directory is gone */
+    errno = 0;
+    if (open("/testdir", O_RDONLY) >= 0 || errno != ENOENT) {
+        return 30;
+    }
+
+    /* 7. Unlink /testfile.txt */
+    if (unlink("/testfile.txt") != 0) {
+        return 31;
+    }
+    errno = 0;
+    if (open("/testfile.txt", O_RDONLY) >= 0 || errno != ENOENT) {
+        return 32;
+    }
+
+    /* Unlinking non-existent file must fail with ENOENT */
+    errno = 0;
+    if (unlink("/testfile.txt") != -1 || errno != ENOENT) {
+        return 33;
+    }
+
+    static const char rw_marker[] = "BoarOS: real userland fs rw checks ok\n";
+    if (write(1, rw_marker, sizeof(rw_marker) - 1) != (ssize_t)(sizeof(rw_marker) - 1)) {
+        return 34;
+    }
+    return 0;
+}
+
 int main(void)
 {
     printf("BoarOS: real userland stdio ok\n");
@@ -1012,6 +1204,12 @@ int main(void)
         return 9;
     }
     close(fd);
+
+    int rw_err = check_filesystem_rw();
+    if (rw_err != 0) {
+        fprintf(stderr, "check_filesystem_rw failed: %d errno=%d\n", rw_err, errno);
+        return 70 + rw_err;
+    }
 
     /* Clocks: monotonic must advance, realtime must dominate it, and
      * gettimeofday must agree with clock_gettime on the same clock. */

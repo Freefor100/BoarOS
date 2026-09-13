@@ -28,7 +28,10 @@ enum kernel_syscall_status kernel_syscall_dispatch(
 
 当前采用 Linux RISC-V 系统调用编号和错误值：
 
-- `openat` 编号为 56，通过调用任务的 fs context 解析用户路径并在文件表分配最低可用 fd；当前只支持根 mount 上的只读普通文件。准确 flags、路径和 errno 边界见[进程文件资源模块](kernel-files.md)。
+- `mkdirat` 编号为 34，创建目录；只读根挂载返回 `-EROFS`。
+- `unlinkat` 编号为 35，删除普通文件或目录（`AT_REMOVEDIR` 标志）；非空目录返回 `-ENOTEMPTY`，只读挂载返回 `-EROFS`。
+- `ftruncate` 编号为 46，调整可写常规文件的大小；非写模式打开或目录返回 `-EBADF`，只读挂载返回 `-EROFS`。
+- `openat` 编号为 56，通过调用任务的 fs context 解析用户路径并在文件表分配最低可用 fd；支持常规文件读写打开与新建（`O_CREAT/O_EXCL/O_TRUNC/O_APPEND`），只读挂载拒绝写访问与修改性标志（返回 `-EROFS`）。准确 flags、路径和 errno 边界见[进程文件资源模块](kernel-files.md)。
 - `close` 编号为 57，从调用任务的文件表移除 fd；无效或已关闭 fd 返回 `-EBADF`。
 - `pipe2` 编号为 59，创建一对共享 64 KiB 环形缓冲的 read/write OFD；支持 `O_CLOEXEC` 与 `O_NONBLOCK`，成功返回两个最低可用 fd，表满或资源不足返回准确错误。读写、EOF、`EPIPE`/SIGPIPE 和 FIFO stat 形态见[进程文件资源模块](kernel-files.md)。
 - `dup` 编号 23、`dup3` 编号 24 与 `fcntl` 编号 25 复制或检查描述符；flag 边界、目标替换与 `F_DUPFD*` 搜索规则见[进程文件资源模块](kernel-files.md)。
@@ -37,7 +40,7 @@ enum kernel_syscall_status kernel_syscall_dispatch(
 - `pselect6` 编号为 72，支持 `fd_set`（可读/可写/异常）、相对超时与可选的 16 字节 `sigset_argpack` 临时信号屏蔽字；空集合或任何未打开 fd 按 Linux 语义返回 `-EBADF`，就绪总数通过返回值输出，行为与生命周期见[进程文件资源模块](kernel-files.md)。
 - `ppoll` 编号为 73，支持 `struct pollfd` 数组（`POLLIN/POLLOUT/POLLPRI/POLLERR/POLLHUP/POLLNVAL`）、相对超时与可选的临时信号屏蔽字；负 fd 忽略不报错，未分配 fd 产生 `POLLNVAL` 并计入就绪数，信号打断返回 `-EINTR` 且自动恢复原信号掩码，行为见[进程文件资源模块](kernel-files.md)。
 - `epoll_create1` 编号 20、`epoll_ctl` 编号 21、`epoll_pwait` 编号 22 构成 epoll 事件通知子系统：`epoll_create1` 支持 `EPOLL_CLOEXEC`（0x80000），创建专用的 epoll OFD；`epoll_ctl` 支持 `EPOLL_CTL_ADD/DEL/MOD` 并复制 16 字节 `struct linux_epoll_event`（支持 `EPOLLIN/EPOLLOUT/EPOLLPRI/EPOLLERR/EPOLLHUP/EPOLLET/EPOLLONESHOT`，禁止对 epfd 自身监听形成环路）；`epoll_pwait` 支持就绪队列提取、LT 重新入队校验、ET 边沿触发、ONESHOT 自动去使能、相对超时阻塞与 8 字节临时信号屏蔽字原子切换，行为见[进程文件资源模块](kernel-files.md)。
-- `write` 编号 64 与 `writev` 编号 66 作用于 console 和 pipe：console 经架构串口输出，pipe 在 `PIPE_BUF=4096` 内保持单次写原子并按可用空间阻塞或返回 `-EAGAIN`；regular fd 仍按只读根语义返回 `-EBADF`，用户 fault 按前缀保持。console read、pipe read/write 的阻塞语义、`lseek` 编号 62 的 SEEK 形态与目录 cookie、`fstat` 编号 80 与 `newfstatat` 编号 79 的 128 字节 stat 填充、`getdents64` 编号 61 的 linux_dirent64 编码与条目 cookie，均见[进程文件资源模块](kernel-files.md)。
+- `write` 编号 64 与 `writev` 编号 66 作用于 console、pipe 与具备写权限的可写常规文件：console 经架构串口输出，pipe 在 `PIPE_BUF=4096` 内保持单次写原子并按可用空间阻塞或返回 `-EAGAIN`；可写 regular fd 写入介质并失效页缓存，支持 `O_APPEND` 自动定位文件尾，无写权限返回 `-EBADF`。用户 fault 按前缀保持。console read、pipe read/write 的阻塞语义、`lseek` 编号 62 的 SEEK 形态与目录 cookie、`fstat` 编号 80 与 `newfstatat` 编号 79 的 128 字节 stat 填充、`getdents64` 编号 61 的 linux_dirent64 编码与条目 cookie，均见[进程文件资源模块](kernel-files.md)。
 - `clock_gettime` 编号 113、`clock_getres` 编号 114、`gettimeofday` 编号 169、`clock_nanosleep` 编号 115 与 `nanosleep` 编号 101 构成时间族，语义见[内核时间模块](kernel-time.md)。
 - `sched_yield` 编号 124 在存在 READY 竞争者时把当前任务排到 ready 队尾并切换；无竞争者时立即返回 0。调度失败属于内核不变量破坏，由 Trap 边界 fatal。
 - `exit` 编号 93 产生线程 `EXIT`，`exit_group` 编号 94 产生全组 `EXIT_GROUP`；状态保留参数 0 的低 8 位。组退出等待成员沿原内核调用栈释放在用资源，最后产生一次进程退出通知。

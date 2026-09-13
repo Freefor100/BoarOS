@@ -50,6 +50,7 @@ struct kernel_files_statistics {
 #define KERNEL_FILES_SEEK_CUR UINT64_C(1)
 #define KERNEL_FILES_SEEK_END UINT64_C(2)
 #define KERNEL_FILES_AT_SYMLINK_NOFOLLOW UINT64_C(0x100)
+#define KERNEL_FILES_AT_REMOVEDIR UINT64_C(0x200)
 #define KERNEL_FILES_AT_EMPTY_PATH UINT64_C(0x1000)
 #define KERNEL_FILES_F_DUPFD UINT64_C(0)
 #define KERNEL_FILES_F_GETFD UINT64_C(1)
@@ -126,6 +127,24 @@ enum kernel_files_status kernel_files_openat(
     uint64_t mode,
     int64_t *linux_result);
 
+enum kernel_files_status kernel_files_mkdirat(
+    struct kernel_files *files,
+    const struct kernel_fs_context *fs,
+    struct kernel_mm *mm,
+    int64_t dirfd,
+    uint64_t user_path,
+    uint32_t mode,
+    int64_t *linux_result);
+
+enum kernel_files_status kernel_files_unlinkat(
+    struct kernel_files *files,
+    const struct kernel_fs_context *fs,
+    struct kernel_mm *mm,
+    int64_t dirfd,
+    uint64_t user_path,
+    uint32_t flags,
+    int64_t *linux_result);
+
 /* Creates a read/write pipe pair and copies the two descriptors to userland. */
 enum kernel_files_status kernel_files_pipe2(
     struct kernel_files *files,
@@ -184,6 +203,12 @@ enum kernel_files_status kernel_files_lseek(
     int64_t fd,
     int64_t offset,
     uint64_t whence,
+    int64_t *linux_result);
+
+enum kernel_files_status kernel_files_ftruncate(
+    struct kernel_files *files,
+    int64_t fd,
+    uint64_t length,
     int64_t *linux_result);
 
 enum kernel_files_status kernel_files_fstat(
