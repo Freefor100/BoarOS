@@ -29,7 +29,13 @@
 
 绝对路径忽略 dirfd，直接使用根 mount；相对路径只支持 `AT_FDCWD`，与当前 cwd 拼接，其他 dirfd 返回 `-EBADF`。当前没有目录 fd、`chdir`、mount namespace、symlink 策略或逐分量权限检查。
 
-只支持打开只读普通文件与目录。`O_LARGEFILE`、`O_CLOEXEC` 和 `O_DIRECTORY` 可用；写访问、`O_CREAT/O_TRUNC/O_APPEND` 返回 `-EROFS`，普通文件配 `O_DIRECTORY` 返回 `-ENOTDIR`，其他已识别但未支持的打开行为返回 `-ENOTSUP`，未知位或非法 access mode 返回 `-EINVAL`。打开成功后按 VFS mode 把描述符分类为 regular、directory 或 console；directory 描述符支持 `getdents64`、`lseek` 与 `fstat`，`read` 返回 `-EISDIR`。文件不存在等路径错误由 VFS 保留为负 Linux errno；表满返回 `-EMFILE`，堆耗尽返回 `-ENOMEM`。
+支持普通文件与目录的打开，以及新建文件：
+- 标志支持：`O_RDONLY`、`O_WRONLY`、`O_RDWR`、`O_CREAT`、`O_EXCL`、`O_TRUNC`、`O_APPEND`、`O_LARGEFILE`、`O_CLOEXEC` 和 `O_DIRECTORY`。
+- 只读挂载保护：若当前挂载为只读（`kernel_vfs_mount_is_readonly(mount)` 为真），请求写访问（`O_WRONLY/O_RDWR`）或带有修改性标志（`O_CREAT/O_TRUNC/O_APPEND`）一律返回 `-EROFS`。
+- 创建语义：当指定 `O_CREAT` 且文件不存在时，调用 `kernel_open_file_create_mode()` 新建普通文件；若同时指定 `O_EXCL` 且文件已存在，返回 `-EEXIST`。
+- 目录检查：目录以写模式（`O_WRONLY/O_RDWR`）或带 `O_TRUNC` 打开时返回 `-EISDIR`；普通文件配 `O_DIRECTORY` 返回 `-ENOTDIR`。
+- 截断语义：对已存在的普通文件指定 `O_TRUNC` 时，在打开成功后调用 `kernel_vfs_ftruncate(&description->file, 0U)` 将大小截断为 0。
+- 打开成功后按 VFS mode 把描述符分类为 regular、directory 或 console；directory 描述符支持 `getdents64`、`lseek` 与 `fstat`，`read` 返回 `-EISDIR`。文件不存在等路径错误由 VFS 保留为负 Linux errno；表满返回 `-EMFILE`，堆耗尽返回 `-ENOMEM`。
 
 ## `pipe2` 与 FIFO endpoint
 
@@ -47,11 +53,19 @@ open file description 的 offset 只增加实际复制到用户空间的字节�
 
 每个 chunk 最多覆盖当前 4 KiB 文件页剩余部分：cache miss 承担一次底层随机读，hit 只增加页引用并复制；用户方向仍按基页做软件页表查询。模块统计调用/失败次数、字节、chunk、当前/峰值 fd、表容量与 close-on-exec 数量，页缓存另统计 hit/miss/insert/eviction/reclaim。当前仍有 cache-to-user 一次复制，尚无 read-ahead、直接用户页 I/O 或异步阻塞。优化这些路径时必须保持部分读取、offset 和错误返回语义。
 
-## console 描述符与 `write`/`writev`
+## 描述符 `write`/`writev` 与文件修改
 
-`kernel_open_file_create_console()` 创建无 VFS 节点、不经页缓存的 console 描述符；root boot 在创建 PID 1 文件表后把它绑定到 fd 0/1/2。该桥接在设备文件系统提供 `/dev/console` 后退出。console 的 `write/writev` 经 `kernel_console_putc` 逐字节输出并返回完整计数；用户 fault 与部分复制按前缀保持返回，与 read 对称。console 的 `read` 阻塞等待真实 UART 输入：tick 路径轮询 NS16550A 接收位并唤醒共享的 console 等待队列，读者最多暂存 min(count, 64) 字节后复制到用户；无数据时阻塞一个 tick 内被唤醒，`count==0` 返回 0，坏缓冲区返回 `-EFAULT`。`lseek` 返回 `-ESPIPE`，`fstat` 以 5:1 字符设备形态出现。fd 0/1/2 是三个独立 OFD，但共享同一输入队列。regular/directory 描述符上的 write 返回 `-EBADF`（只读根上每个常规 fd 都是只读打开）。
+`write` 与 `writev` 支持 console、pipe 以及具备写权限（`O_WRONLY/O_RDWR`）的常规文件：
+- console 经 `kernel_console_putc` 逐字节输出并返回完整计数；用户 fault 与部分复制按前缀保持返回。console 的 `read` 阻塞等待真实 UART 输入。
+- pipe 的 `write/writev` 汇总后沿用 pipe 单次写空间、原子性、阻塞、EPIPE/SIGPIPE 和部分复制规则。
+- regular 文件写入通过 `kernel_vfs_pwrite()` 执行底层介质写入，并调用页缓存失效确保缓存一致性。若描述符设置了 `O_APPEND`，写入前自动将文件 offset 更新至当前文件末尾。写入成功后推进 OFD offset。未以写权限打开的描述符或目录描述符调用 write 返回 `-EBADF`。
+- `writev` 先快照完整用户 iovec 数组，校验长度和范围，再与 write 共用写入核心；`iovcnt` 上限 1024。
 
-`writev` 先快照完整用户 iovec 数组，校验长度和范围，再与 write 共用写入核心；`iovcnt` 上限 1024；这是 musl stdio 实际使用的写路径，`__stdio_write` 以两段 iovec 发出缓冲内容。pipe 的 `writev` 汇总 iovec 后沿用 pipe 单次写的空间、原子性、阻塞、EPIPE/SIGPIPE 和部分复制规则。
+## 目录与文件系统操作
+
+- `kernel_files_mkdirat()`：通过 fs context 解析路径后调用 `kernel_vfs_mkdir()`；只读挂载返回 `-EROFS`。
+- `kernel_files_unlinkat()`：支持文件删除与目录删除（`AT_REMOVEDIR` 标志）。普通文件调用 `kernel_vfs_unlink()` 并使对应节点页缓存失效；目录删除调用 `kernel_vfs_rmdir()`，非空目录返回 `-ENOTEMPTY`。
+- `kernel_files_ftruncate()`：校验 fd 具备可写权限且为常规文件，调用 `kernel_vfs_ftruncate()` 调整文件大小并精确失效该节点页缓存；只读描述符返回 `-EBADF`。
 
 `read`、`write` 和 `writev` 在 fd lookup 后立即取得独立 OFD 引用，并在本次操作的全部复制、等待和唤醒处理结束后释放。共享表中的另一个线程即使在操作睡眠期间 close 并复用同一 fd 号，本次操作仍使用 lookup 时的 OFD；对于 pipe，这份引用也让原读/写 endpoint 在 in-flight I/O 结束前保持逻辑存活，避免提前产生 EOF/EPIPE 或释放等待队列。末次操作引用触发的底层 cleanup 失败会转交给共享文件表的原有 cleanup 链。该语义基线对应固定 Linux `f4cdf7ca9a1f` 中 [`fs/file.c`](../../references/linux/fs/file.c) 的 `fdget()`/`fdput()` 生命周期。
 

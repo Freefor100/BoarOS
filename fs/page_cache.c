@@ -601,6 +601,34 @@ enum kernel_page_cache_status kernel_page_cache_purge_mount(
                   : KERNEL_PAGE_CACHE_STATUS_OK;
 }
 
+enum kernel_page_cache_status kernel_page_cache_invalidate_node(
+    struct kernel_page_cache *cache,
+    const struct kernel_vfs_node *node)
+{
+    struct kernel_page_cache_entry *entry;
+    uint64_t released = 0U;
+
+    if (!cache_live(cache) || node == 0) {
+        return KERNEL_PAGE_CACHE_STATUS_INVALID_ARGUMENT;
+    }
+    entry = cache->record->lru_tail;
+    while (entry != 0) {
+        struct kernel_page_cache_entry *previous = entry->lru_previous;
+
+        if (entry->node == node) {
+            remove_entry(cache, entry);
+        }
+        entry = previous;
+    }
+    if (!drain_entries(cache, &released) ||
+        !drain_allocations(cache)) {
+        cache->record->statistics.pages_reclaimed += released;
+        return KERNEL_PAGE_CACHE_STATUS_CLEANUP_REQUIRED;
+    }
+    cache->record->statistics.pages_reclaimed += released;
+    return KERNEL_PAGE_CACHE_STATUS_OK;
+}
+
 void kernel_page_cache_get_statistics(
     const struct kernel_page_cache *cache,
     struct kernel_page_cache_statistics *statistics)

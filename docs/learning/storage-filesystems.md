@@ -74,6 +74,23 @@ write-first 且缓存未命中，直接把文件内容读入私有页可避免�
 所以未固定缓存页可以直接丢弃；加入可写映射后，clean/dirty/writeback/error 状态会成为新的
 生命周期，而不是给现有驱逐函数加一个无条件写盘调用。
 
+## 可写文件系统与介质写入演进
+
+从只读走向可写是内核文件系统的关键跨越，涉及块驱动、VFS、文件资源和缓存一致性多个层次：
+
+1. **VirtIO 块设备写驱动与只读协商**：
+   - 块设备写请求采用 `VIRTIO_BLOCK_REQUEST_OUT` 类型，与读取不同，数据描述符**不得**带有 `VIRTQ_DESC_WRITE` 标志（对设备而言是只读输入）。
+   - 非整扇区写入通过 512 字节 bounce buffer 执行读-改-写（RMW）：先读入包含目标偏移的完整扇区，将修改字节合并入缓冲，再整扇区写回介质，避免破坏相邻数据。
+   - 特性协商与只读降级：QEMU 或虚拟化平台在指定 `readonly=on` 时会提供 `VIRTIO_BLK_F_RO`（bit 5）。驱动在探测阶段读取 low 32-bit 特性，若包含只读标志则回写确认该特性，并将 `block.write` 置空（0）。上层 VFS 通过 `kernel_vfs_mount_is_readonly()` 感知该状态，避免在只读介质上尝试写回超级块/日志导致挂载失败（如错误码 5/EIO）。
+
+2. **lwext4 写路径与 POSIX 语义修正**：
+   - 普通文件创建调用 `ext4_fopen2`，写与追加调用 `ext4_fseek` + `ext4_fwrite`，大小调整调用 `ext4_ftruncate`。
+   - lwext4 的 `ext4_dir_rm` 默认行为是递归删除（`rm -rf`），与 Linux/POSIX 的 `rmdir` 规范不符。VFS 适配层在执行 `kernel_vfs_rmdir` 时，先通过 `ext4_dir_open` 与 `ext4_dir_entry_next` 扫描目录条目（跳过 `.` 和 `..`），若发现任何子项则准确返回 `-ENOTEMPTY`，只有空目录才调用底层 `ext4_dir_rm`。
+
+3. **页缓存失效（Page Cache Invalidation）**：
+   - 当文件被 `write`、`ftruncate` 或 `unlink` 改变时，若页缓存中仍存有旧物理页，后续的 `read` 或 `mmap` 会读取到过期数据。
+   - 当前同步写架构下，`kernel_page_cache_invalidate_node()` 会在每次写入、截断或删除后立即从哈希表与 LRU 链中摘除该 node 关联的所有物理页项并释放页引用，确保后续访问重新从磁盘介质加载最新数据。对于更长期的直接写回（writeback dirty page），这一机制为显式同步缓存提供了过渡契约。
+
 ## 根设备与 PID 1
 
 无命令行解析阶段需要一个确定的根选择规则。BoarOS 当前使用 DTB 翻译后的物理 MMIO 地址排序，选择第一个成功初始化的 block device；选中后若不是可挂载 ext4 或缺少 `/init`，启动失败，不扫描磁盘内容寻找替代根。这让平台拓扑决定设备顺序，行为可复现；以后支持 Linux `root=` 时可在块设备身份层增加显式选择，而不改变 ext4/VFS。

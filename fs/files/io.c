@@ -349,13 +349,22 @@ enum kernel_files_status kernel_files_pread(
 static int description_writable(
     const struct kernel_open_file_description *description)
 {
-    if ((kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_CONSOLE &&
-         kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_PIPE) ||
-        (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_PIPE &&
-         (description->open_flags & 3U) == 0U)) {
+    uint32_t access_mode;
+
+    if (description == 0) {
         return 0;
     }
-    return 1;
+    access_mode = description->open_flags & 3U;
+    if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_REGULAR) {
+        return access_mode == 1U || access_mode == 2U;
+    }
+    if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_PIPE) {
+        return access_mode != 0U;
+    }
+    if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_CONSOLE) {
+        return 1;
+    }
+    return 0;
 }
 
 static enum kernel_files_status write_request(
@@ -372,6 +381,66 @@ static enum kernel_files_status write_request(
                                    count, description->open_flags, linux_result)
                        == KERNEL_PIPE_STATUS_OK
                    ? KERNEL_FILES_STATUS_OK : KERNEL_FILES_STATUS_STATE;
+    }
+    if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_REGULAR) {
+        uint64_t file_offset;
+
+        if ((description->open_flags & KERNEL_FILES_O_APPEND) != 0U) {
+            file_offset = kernel_open_file_size(description);
+            description->offset = file_offset;
+        } else {
+            file_offset = kernel_open_file_offset(description);
+        }
+        for (size_t index = 0U; index < iov_count && total < count; index++) {
+            uint64_t offset = 0U;
+
+            while (offset < iov[index].length && total < count) {
+                size_t chunk = (size_t)(iov[index].length - offset);
+                size_t copied = 0U;
+                size_t written = 0U;
+                enum kernel_uaccess_status status;
+                int vfs_result;
+
+                if ((uint64_t)chunk > count - total) {
+                    chunk = (size_t)(count - total);
+                }
+                if (chunk > sizeof(staging)) {
+                    chunk = sizeof(staging);
+                }
+                status = kernel_copy_from_user(mm, staging,
+                                                iov[index].base + offset,
+                                                chunk, &copied);
+                if (status == KERNEL_UACCESS_STATUS_FAULT) {
+                    if (total != 0U) {
+                        files->record->statistics.write_failures++;
+                    }
+                    *linux_result = total != 0U ? (int64_t)total : -KERNEL_EFAULT;
+                    return KERNEL_FILES_STATUS_OK;
+                }
+                if (status != KERNEL_UACCESS_STATUS_OK || copied != chunk) {
+                    return KERNEL_FILES_STATUS_STATE;
+                }
+                vfs_result = kernel_vfs_pwrite(&description->file,
+                                               file_offset,
+                                               staging,
+                                               chunk,
+                                               &written);
+                if (vfs_result != 0) {
+                    files->record->statistics.write_failures++;
+                    *linux_result = total != 0U ? (int64_t)total : vfs_result;
+                    return KERNEL_FILES_STATUS_OK;
+                }
+                total += (uint64_t)written;
+                offset += (uint64_t)written;
+                file_offset += (uint64_t)written;
+                description->offset = file_offset;
+                if (written < chunk) {
+                    break;
+                }
+            }
+        }
+        *linux_result = (int64_t)total;
+        return KERNEL_FILES_STATUS_OK;
     }
     for (size_t index = 0U; index < iov_count && total < count; index++) {
         uint64_t offset = 0U;
@@ -614,6 +683,44 @@ enum kernel_files_status kernel_files_lseek(
     }
     *linux_result = target;
     return KERNEL_FILES_STATUS_OK;
+}
+
+enum kernel_files_status kernel_files_ftruncate(
+    struct kernel_files *files,
+    int64_t fd,
+    uint64_t length,
+    int64_t *linux_result)
+{
+    struct kernel_open_file_description *description = 0;
+    enum kernel_files_status status;
+    int vfs_result;
+
+    if (!kernel_files_is_live(files) || linux_result == 0) {
+        return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
+    }
+    status = kernel_files_pin(files, fd, &description, linux_result);
+    if (status != KERNEL_FILES_STATUS_OK) {
+        return status;
+    }
+    if (*linux_result != 0) {
+        *linux_result = -KERNEL_EBADF;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_DIRECTORY) {
+        *linux_result = -KERNEL_EISDIR;
+        return release_io_description(files, &description, KERNEL_FILES_STATUS_OK);
+    }
+    if (kernel_open_file_kind(description) != KERNEL_OPEN_FILE_KIND_REGULAR) {
+        *linux_result = -KERNEL_EINVAL;
+        return release_io_description(files, &description, KERNEL_FILES_STATUS_OK);
+    }
+    if (!description_writable(description)) {
+        *linux_result = -KERNEL_EINVAL;
+        return release_io_description(files, &description, KERNEL_FILES_STATUS_OK);
+    }
+    vfs_result = kernel_vfs_ftruncate(&description->file, length);
+    *linux_result = vfs_result;
+    return release_io_description(files, &description, KERNEL_FILES_STATUS_OK);
 }
 
 enum kernel_files_status kernel_files_getdents(

@@ -47,7 +47,10 @@
 #define VIRTIO_FEATURE_VERSION_1_HIGH_MASK \
     (UINT32_C(1) << VIRTIO_FEATURE_VERSION_1_LOW_BIT)
 
+#define VIRTIO_BLOCK_FEATURE_RO (UINT32_C(1) << 5)
+
 #define VIRTIO_BLOCK_REQUEST_IN 0U
+#define VIRTIO_BLOCK_REQUEST_OUT 1U
 #define VIRTIO_BLOCK_STATUS_OK 0U
 #define VIRTIO_BLOCK_STATUS_IO_ERROR 1U
 #define VIRTIO_BLOCK_STATUS_UNSUPPORTED 2U
@@ -263,7 +266,9 @@ static enum riscv_virtio_mmio_block_status negotiate_features(
     struct riscv_virtio_mmio_block *device)
 {
     uint32_t status = VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER;
+    uint32_t device_features_low;
     uint32_t device_features_high;
+    uint32_t driver_features_low = 0U;
 
     mmio_write32(device, VIRTIO_MMIO_STATUS_OFFSET, 0U);
     mmio_write32(device,
@@ -271,10 +276,17 @@ static enum riscv_virtio_mmio_block_status negotiate_features(
                  VIRTIO_STATUS_ACKNOWLEDGE);
     mmio_write32(device, VIRTIO_MMIO_STATUS_OFFSET, status);
 
+    mmio_write32(device, VIRTIO_MMIO_DEVICE_FEATURES_SEL_OFFSET, 0U);
+    device_features_low =
+        mmio_read32(device, VIRTIO_MMIO_DEVICE_FEATURES_OFFSET);
+    if ((device_features_low & VIRTIO_BLOCK_FEATURE_RO) != 0U) {
+        driver_features_low |= VIRTIO_BLOCK_FEATURE_RO;
+        device->read_only = 1U;
+    }
+
     if (legacy_transport(device)) {
-        mmio_write32(device, VIRTIO_MMIO_DEVICE_FEATURES_SEL_OFFSET, 0U);
         mmio_write32(device, VIRTIO_MMIO_DRIVER_FEATURES_SEL_OFFSET, 0U);
-        mmio_write32(device, VIRTIO_MMIO_DRIVER_FEATURES_OFFSET, 0U);
+        mmio_write32(device, VIRTIO_MMIO_DRIVER_FEATURES_OFFSET, driver_features_low);
         return RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK;
     }
 
@@ -286,7 +298,7 @@ static enum riscv_virtio_mmio_block_status negotiate_features(
     }
 
     mmio_write32(device, VIRTIO_MMIO_DRIVER_FEATURES_SEL_OFFSET, 0U);
-    mmio_write32(device, VIRTIO_MMIO_DRIVER_FEATURES_OFFSET, 0U);
+    mmio_write32(device, VIRTIO_MMIO_DRIVER_FEATURES_OFFSET, driver_features_low);
     mmio_write32(device, VIRTIO_MMIO_DRIVER_FEATURES_SEL_OFFSET, 1U);
     mmio_write32(device,
                  VIRTIO_MMIO_DRIVER_FEATURES_OFFSET,
@@ -340,8 +352,9 @@ static enum kernel_block_status fail_live_device(
     return status;
 }
 
-static enum kernel_block_status submit_read(
+static enum kernel_block_status submit_request(
     struct riscv_virtio_mmio_block *device,
+    uint32_t type,
     uint64_t sector,
     uint64_t data_address,
     uint32_t data_length,
@@ -374,7 +387,7 @@ static enum kernel_block_status submit_read(
         return KERNEL_BLOCK_STATUS_STATE;
     }
 
-    header->type = VIRTIO_BLOCK_REQUEST_IN;
+    header->type = type;
     header->reserved = 0U;
     header->sector = sector;
     *request_status = UINT8_MAX;
@@ -386,7 +399,8 @@ static enum kernel_block_status submit_read(
     descriptors[0].next = 1U;
     descriptors[1].address = data_address;
     descriptors[1].length = data_length;
-    descriptors[1].flags = VIRTQ_DESC_WRITE | VIRTQ_DESC_NEXT;
+    descriptors[1].flags = (type == VIRTIO_BLOCK_REQUEST_IN ? VIRTQ_DESC_WRITE : 0U) |
+                           VIRTQ_DESC_NEXT;
     descriptors[1].next = 2U;
     descriptors[2].address = device->queue_physical_address +
                              request_status_offset(device);
@@ -424,8 +438,13 @@ static enum kernel_block_status submit_read(
     }
 
     device->statistics.requests++;
-    device->statistics.sectors_read +=
-        data_length / VIRTIO_BLOCK_SECTOR_SIZE;
+    if (type == VIRTIO_BLOCK_REQUEST_IN) {
+        device->statistics.sectors_read +=
+            data_length / VIRTIO_BLOCK_SECTOR_SIZE;
+    } else {
+        device->statistics.sectors_written +=
+            data_length / VIRTIO_BLOCK_SECTOR_SIZE;
+    }
     if (bounce) {
         device->statistics.bounce_requests++;
     } else {
@@ -479,8 +498,9 @@ static enum kernel_block_status virtio_block_read(void *context,
                 direct_size = 0U;
             }
             if (direct_size != 0U) {
-                enum kernel_block_status status = submit_read(
+                enum kernel_block_status status = submit_request(
                     device,
+                    VIRTIO_BLOCK_REQUEST_IN,
                     sector,
                     data_address,
                     (uint32_t)direct_size,
@@ -504,17 +524,113 @@ static enum kernel_block_status virtio_block_read(void *context,
             if (copied > size) {
                 copied = size;
             }
-            status = submit_read(device,
-                                 sector,
-                                 device->queue_physical_address +
-                                     bounce_offset(device),
-                                 VIRTIO_BLOCK_SECTOR_SIZE,
-                                 1);
+            status = submit_request(device,
+                                    VIRTIO_BLOCK_REQUEST_IN,
+                                    sector,
+                                    device->queue_physical_address +
+                                        bounce_offset(device),
+                                    VIRTIO_BLOCK_SECTOR_SIZE,
+                                    1);
             if (status != KERNEL_BLOCK_STATUS_OK) {
                 return status;
             }
             bytes_copy(output, bounce + sector_offset, copied);
             output += copied;
+            offset += copied;
+            size -= copied;
+        }
+    }
+
+    return KERNEL_BLOCK_STATUS_OK;
+}
+
+static enum kernel_block_status virtio_block_write(void *context,
+                                                   uint64_t offset,
+                                                   const void *buffer,
+                                                   size_t size)
+{
+    struct riscv_virtio_mmio_block *device = context;
+    const unsigned char *input = buffer;
+
+    if (!device_live(device)) {
+        return KERNEL_BLOCK_STATUS_STATE;
+    }
+    if (device->read_only != 0U) {
+        return KERNEL_BLOCK_STATUS_UNSUPPORTED;
+    }
+
+    while (size != 0U) {
+        uint64_t sector = offset / VIRTIO_BLOCK_SECTOR_SIZE;
+        uint32_t sector_offset =
+            (uint32_t)(offset % VIRTIO_BLOCK_SECTOR_SIZE);
+        uint64_t data_address;
+
+        if (sector_offset == 0U && size >= VIRTIO_BLOCK_SECTOR_SIZE) {
+            size_t direct_size = size;
+            const size_t maximum_direct_size =
+                (size_t)UINT32_MAX &
+                ~(size_t)(VIRTIO_BLOCK_SECTOR_SIZE - 1U);
+
+            if (direct_size > maximum_direct_size) {
+                direct_size = maximum_direct_size;
+            }
+            direct_size &= ~(size_t)(VIRTIO_BLOCK_SECTOR_SIZE - 1U);
+            if (!device->dma_address(input,
+                                     direct_size,
+                                     &data_address)) {
+                direct_size = 0U;
+            }
+            if (direct_size != 0U) {
+                enum kernel_block_status status = submit_request(
+                    device,
+                    VIRTIO_BLOCK_REQUEST_OUT,
+                    sector,
+                    data_address,
+                    (uint32_t)direct_size,
+                    0);
+
+                if (status != KERNEL_BLOCK_STATUS_OK) {
+                    return status;
+                }
+                input += direct_size;
+                offset += direct_size;
+                size -= direct_size;
+                continue;
+            }
+        }
+        {
+            unsigned char *bounce =
+                (unsigned char *)device->queue_memory + bounce_offset(device);
+            size_t copied = VIRTIO_BLOCK_SECTOR_SIZE - sector_offset;
+            enum kernel_block_status status;
+
+            if (copied > size) {
+                copied = size;
+            }
+            if (sector_offset != 0U || copied < VIRTIO_BLOCK_SECTOR_SIZE) {
+                status = submit_request(device,
+                                        VIRTIO_BLOCK_REQUEST_IN,
+                                        sector,
+                                        device->queue_physical_address +
+                                            bounce_offset(device),
+                                        VIRTIO_BLOCK_SECTOR_SIZE,
+                                        1);
+                if (status != KERNEL_BLOCK_STATUS_OK) {
+                    return status;
+                }
+            }
+            bytes_copy(bounce + sector_offset, input, copied);
+            status = submit_request(device,
+                                    VIRTIO_BLOCK_REQUEST_OUT,
+                                    sector,
+                                    device->queue_physical_address +
+                                        bounce_offset(device),
+                                    VIRTIO_BLOCK_SECTOR_SIZE,
+                                    1);
+            if (status != KERNEL_BLOCK_STATUS_OK) {
+                return status;
+            }
+            input += copied;
             offset += copied;
             size -= copied;
         }
@@ -678,6 +794,7 @@ enum riscv_virtio_mmio_block_status riscv_virtio_mmio_block_init(
 
     result.block.context = device;
     result.block.read = virtio_block_read;
+    result.block.write = result.read_only != 0U ? 0 : virtio_block_write;
     result.block.capacity_bytes =
         capacity_sectors * VIRTIO_BLOCK_SECTOR_SIZE;
     result.block.logical_block_size = VIRTIO_BLOCK_SECTOR_SIZE;
@@ -708,6 +825,7 @@ enum riscv_virtio_mmio_block_status riscv_virtio_mmio_block_destroy(
 
     device->block.context = 0;
     device->block.read = 0;
+    device->block.write = 0;
     device->block.capacity_bytes = 0U;
     device->block.logical_block_size = 0U;
     device->queue_memory = 0;

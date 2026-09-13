@@ -60,6 +60,52 @@ enum kernel_open_file_status kernel_open_file_create(
     return KERNEL_OPEN_FILE_STATUS_OK;
 }
 
+enum kernel_open_file_status kernel_open_file_create_mode(
+    struct kernel_heap *heap,
+    struct kernel_vfs_mount *mount,
+    const char *path,
+    uint32_t mode,
+    struct kernel_open_file_description **owner,
+    int *linux_result)
+{
+    struct kernel_open_file_description *file;
+    enum kernel_heap_status heap_status;
+    int result;
+
+    if (heap == 0 || mount == 0 || path == 0 || owner == 0 ||
+        *owner != 0 || linux_result == 0) {
+        return KERNEL_OPEN_FILE_STATUS_INVALID_ARGUMENT;
+    }
+    heap_status = kernel_heap_allocate_zeroed(heap,
+                                              1U,
+                                              sizeof(*file),
+                                              (void **)&file);
+    if (heap_status != KERNEL_HEAP_STATUS_OK) {
+        if (heap_status == KERNEL_HEAP_STATUS_EMPTY) {
+            *linux_result = -KERNEL_ENOMEM;
+            return KERNEL_OPEN_FILE_STATUS_OK;
+        }
+        return KERNEL_OPEN_FILE_STATUS_STATE;
+    }
+    result = kernel_vfs_create(mount, path, mode, &file->file);
+    if (result != 0) {
+        file->heap = heap;
+        file->vfs_closed = 1U;
+        if (kernel_heap_release(heap, file) != KERNEL_HEAP_STATUS_OK) {
+            *owner = file;
+            return KERNEL_OPEN_FILE_STATUS_CLEANUP_REQUIRED;
+        }
+        *linux_result = result;
+        return KERNEL_OPEN_FILE_STATUS_OK;
+    }
+    file->heap = heap;
+    file->references = 1U;
+    file->kind = KERNEL_OPEN_FILE_KIND_REGULAR;
+    *owner = file;
+    *linux_result = 0;
+    return KERNEL_OPEN_FILE_STATUS_OK;
+}
+
 enum kernel_open_file_status kernel_open_file_create_executable(
     struct kernel_heap *heap,
     struct kernel_vfs_mount *mount,
@@ -343,7 +389,7 @@ static int open_file_live(const struct kernel_open_file_description *file)
 uint64_t kernel_open_file_size(
     const struct kernel_open_file_description *file)
 {
-    return open_file_live(file) ? file->file.size : 0U;
+    return open_file_live(file) ? kernel_vfs_file_size(&file->file) : 0U;
 }
 
 uint32_t kernel_open_file_mode(

@@ -8,6 +8,7 @@ struct kernel_heap;
 struct kernel_page_cache_record;
 struct kernel_vfs_file;
 struct kernel_vfs_mount;
+struct kernel_vfs_node;
 struct physical_page_allocator;
 
 enum kernel_page_cache_status {
@@ -73,6 +74,10 @@ uint64_t kernel_page_cache_reclaim(struct kernel_page_cache *cache,
 enum kernel_page_cache_status kernel_page_cache_purge_mount(
     struct kernel_page_cache *cache,
     const struct kernel_vfs_mount *mount);
+
+enum kernel_page_cache_status kernel_page_cache_invalidate_node(
+    struct kernel_page_cache *cache,
+    const struct kernel_vfs_node *node);
 
 void kernel_page_cache_get_statistics(
     const struct kernel_page_cache *cache,

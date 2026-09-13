@@ -15,6 +15,9 @@
 #define LINUX_SYSCALL_DUP 23U
 #define LINUX_SYSCALL_DUP3 24U
 #define LINUX_SYSCALL_FCNTL 25U
+#define LINUX_SYSCALL_MKDIRAT 34U
+#define LINUX_SYSCALL_UNLINKAT 35U
+#define LINUX_SYSCALL_FTRUNCATE 46U
 #define LINUX_SYSCALL_OPENAT 56U
 #define LINUX_SYSCALL_CLOSE 57U
 #define LINUX_SYSCALL_PIPE2 59U
@@ -167,6 +170,21 @@ enum kernel_syscall_status kernel_syscall_dispatch(
         }
     } else if (request->number == LINUX_SYSCALL_PIPE2) {
         if (syscall_handle_pipe2(caller, request, &decoded) !=
+            KERNEL_SYSCALL_STATUS_OK) {
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+        }
+    } else if (request->number == LINUX_SYSCALL_MKDIRAT) {
+        if (syscall_handle_mkdirat(caller, request, &decoded) !=
+            KERNEL_SYSCALL_STATUS_OK) {
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+        }
+    } else if (request->number == LINUX_SYSCALL_UNLINKAT) {
+        if (syscall_handle_unlinkat(caller, request, &decoded) !=
+            KERNEL_SYSCALL_STATUS_OK) {
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+        }
+    } else if (request->number == LINUX_SYSCALL_FTRUNCATE) {
+        if (syscall_handle_ftruncate(caller, request, &decoded) !=
             KERNEL_SYSCALL_STATUS_OK) {
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
         }
