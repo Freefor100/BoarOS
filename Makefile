@@ -711,6 +711,7 @@ $(DEMAND_PAGE_OOM_TEST_KERNEL_RV): $(OBJECTS) \
 $(ROOT_BOOT_CLEANUP_TEST_KERNEL_RV): $(OBJECTS) \
 		$(ROOT_BOOT_CLEANUP_TEST_OBJECT_RV) arch/riscv/linker.ld
 	$(CC) $(LDFLAGS) -Wl,--wrap=kernel_fs_context_create \
+		-Wl,--wrap=kernel_block_write_at \
 		-Wl,-Map,$(BUILD_DIR)/tests/kernel-root-boot-cleanup-rv.map \
 		-o $@ $(OBJECTS) $(ROOT_BOOT_CLEANUP_TEST_OBJECT_RV)
 

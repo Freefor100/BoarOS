@@ -32,6 +32,7 @@ extern unsigned char __boot_stack_top[];
 void riscv_relocate_to_high(uint64_t offset);
 
 #define RISCV_TRANSITION_TABLE_PAGE_COUNT 5U
+#define RISCV_ROOT_BOOT_CLEANUP_ATTEMPTS 3U
 
 static struct physical_page_allocator page_allocator;
 static struct riscv_sv39_page_table kernel_page_table;
@@ -700,7 +701,11 @@ void kernel_main(unsigned long hart_id, const void *dtb)
         root_started = 1;
         virt_uart_puts("BoarOS: root /init started pid=0x1\n");
     } else if (root_status != RISCV_ROOT_BOOT_STATUS_NO_DEVICE) {
-        while (root_boot.state == RISCV_ROOT_BOOT_CLEANUP) {
+        uint32_t cleanup_attempts = 0U;
+
+        while (root_boot.state == RISCV_ROOT_BOOT_CLEANUP &&
+               cleanup_attempts < RISCV_ROOT_BOOT_CLEANUP_ATTEMPTS) {
+            cleanup_attempts++;
             root_status = riscv_root_boot_cleanup(&root_boot);
         }
         shutdown_for_root_boot_error(root_status);

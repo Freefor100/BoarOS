@@ -10,6 +10,10 @@ stage3=${ROOT_EXEC_STAGE3_RV:-"$project_root/build/riscv/tests/user/root-exec-st
 qemu=${QEMU_RISCV64:-qemu-system-riscv64}
 memory=${QEMU_MEMORY:-512M}
 root_boot_error_status=${ROOT_BOOT_ERROR_STATUS:-}
+root_readonly=on
+if [ -n "$root_boot_error_status" ]; then
+    root_readonly=off
+fi
 virtio_mmio_force_legacy=${VIRTIO_MMIO_FORCE_LEGACY:-}
 work_dir=$(mktemp -d)
 output="$work_dir/root-init.log"
@@ -67,7 +71,7 @@ if [ -n "$virtio_mmio_force_legacy" ]; then
     set -- "$@" -global "virtio-mmio.force-legacy=$virtio_mmio_force_legacy"
 fi
 set -- "$@" \
-    -drive file="$disk",if=none,format=raw,readonly=on,id=root \
+    -drive file="$disk",if=none,format=raw,readonly="$root_readonly",id=root \
     -device virtio-blk-device,drive=root,bus=virtio-mmio-bus.0
 
 if ! timeout -k 2s 15s "$@" </dev/null >"$output" 2>&1; then
@@ -87,7 +91,12 @@ if [ -n "$root_boot_error_status" ]; then
         echo "production kernel started a user process after root boot failed" >&2
         exit 1
     fi
-    echo "RISC-V root-boot cleanup retried VMA teardown"
+    if [ "$(grep -cxF 'BoarOS: root cleanup injected ext4 block write failure' "$output" || true)" -ne 1 ]; then
+        tail -n 120 "$output" >&2
+        echo "root-boot cleanup did not exercise the ext4 block-write failure" >&2
+        exit 1
+    fi
+    echo "RISC-V root-boot cleanup retried ext4 block I/O"
     exit 0
 fi
 

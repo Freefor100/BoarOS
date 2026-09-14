@@ -120,22 +120,26 @@ enum riscv_root_boot_status riscv_root_boot_cleanup(
         (void)kernel_heap_release(&root->heap, root->cleanup_path);
         root->cleanup_path = 0;
     }
-    if (root->mount.private_data != 0 &&
-        kernel_vfs_unmount(&root->mount) != 0) {
-        cleanup_failed = 1;
-    }
-    if ((root->page_cache.state == KERNEL_PAGE_CACHE_LIVE ||
-         root->page_cache.state == KERNEL_PAGE_CACHE_CLEANUP) &&
-        kernel_page_cache_destroy(&root->page_cache) !=
-            KERNEL_PAGE_CACHE_STATUS_OK) {
-        cleanup_failed = 1;
-    }
-    if (root->cleanup_device_owned != 0U) {
-        if (riscv_virtio_mmio_block_destroy(&root->device) !=
-            RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK) {
+    if (root->mount.private_data != 0) {
+        if (kernel_vfs_unmount(&root->mount) != 0) {
             cleanup_failed = 1;
-        } else {
-            root->cleanup_device_owned = 0U;
+        }
+    }
+    /* The cache and block device remain owners of a live mount's I/O state. */
+    if (root->mount.private_data == 0) {
+        if ((root->page_cache.state == KERNEL_PAGE_CACHE_LIVE ||
+             root->page_cache.state == KERNEL_PAGE_CACHE_CLEANUP) &&
+            kernel_page_cache_destroy(&root->page_cache) !=
+                KERNEL_PAGE_CACHE_STATUS_OK) {
+            cleanup_failed = 1;
+        }
+        if (root->cleanup_device_owned != 0U) {
+            if (riscv_virtio_mmio_block_destroy(&root->device) !=
+                RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK) {
+                cleanup_failed = 1;
+            } else {
+                root->cleanup_device_owned = 0U;
+            }
         }
     }
     if (root->heap.page_allocator == 0) {

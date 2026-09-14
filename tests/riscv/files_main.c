@@ -2181,7 +2181,7 @@ static void run_epoll_operations(struct kernel_files *files,
     }
 
 
-    /* 3. Target file closed first with item heap release failure */
+    /* A target file may close before its epoll instance. */
     if (kernel_files_pipe2(files,
                            mm,
                            TEST_USER_PATH,
