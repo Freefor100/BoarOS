@@ -1050,6 +1050,102 @@ static int check_epoll(void)
     close(p2[1]);
     close(epfd);
 
+    /* 11. fd reuse regression test: (fd, OFD) identity */
+    int ep_reuse = epoll_create1(0);
+    if (ep_reuse < 0) {
+        return 60;
+    }
+    int p_a[2];
+    if (pipe(p_a) != 0) {
+        close(ep_reuse);
+        return 61;
+    }
+    int oldfd = p_a[0];
+    int keepfd = dup(oldfd);
+    if (keepfd < 0) {
+        close(p_a[0]); close(p_a[1]); close(ep_reuse);
+        return 62;
+    }
+    struct epoll_event ev_a = { .events = EPOLLIN, .data.u32 = 0xaaaa };
+    if (epoll_ctl(ep_reuse, EPOLL_CTL_ADD, oldfd, &ev_a) != 0) {
+        close(keepfd); close(p_a[0]); close(p_a[1]); close(ep_reuse);
+        return 63;
+    }
+    /* Close oldfd. OFD A is kept alive by keepfd. epoll interest (oldfd, OFD A) should remain. */
+    close(oldfd);
+
+    /* Create pipe B and ensure it reuses oldfd number */
+    int p_b[2];
+    if (pipe(p_b) != 0) {
+        close(keepfd); close(p_a[1]); close(ep_reuse);
+        return 64;
+    }
+    int p_b_read = p_b[0];
+    if (p_b_read != oldfd) {
+        if (dup2(p_b[0], oldfd) < 0) {
+            close(p_b[0]); close(p_b[1]); close(keepfd); close(p_a[1]); close(ep_reuse);
+            return 65;
+        }
+        close(p_b[0]);
+        p_b_read = oldfd;
+    }
+    /* epoll ADD (oldfd, OFD B) must succeed and NOT return EEXIST */
+    struct epoll_event ev_b = { .events = EPOLLIN, .data.u32 = 0xbbbb };
+    if (epoll_ctl(ep_reuse, EPOLL_CTL_ADD, p_b_read, &ev_b) != 0) {
+        close(p_b_read); close(p_b[1]); close(keepfd); close(p_a[1]); close(ep_reuse);
+        return 66;
+    }
+
+    /* Trigger both A and B */
+    if (write(p_a[1], "a", 1) != 1 || write(p_b[1], "b", 1) != 1) {
+        close(p_b_read); close(p_b[1]); close(keepfd); close(p_a[1]); close(ep_reuse);
+        return 67;
+    }
+    struct epoll_event reuse_evs[4];
+    int r_cnt = epoll_wait(ep_reuse, reuse_evs, 4, 100);
+    if (r_cnt != 2) {
+        close(p_b_read); close(p_b[1]); close(keepfd); close(p_a[1]); close(ep_reuse);
+        return 68;
+    }
+    int seen_a = 0, seen_b = 0;
+    for (int i = 0; i < 2; i++) {
+        if (reuse_evs[i].data.u32 == 0xaaaa) seen_a = 1;
+        if (reuse_evs[i].data.u32 == 0xbbbb) seen_b = 1;
+    }
+    if (!seen_a || !seen_b) {
+        close(p_b_read); close(p_b[1]); close(keepfd); close(p_a[1]); close(ep_reuse);
+        return 69;
+    }
+
+    /* Drain B */
+    char reuse_buf[4];
+    if (read(p_b_read, reuse_buf, 1) != 1) {
+        close(p_b_read); close(p_b[1]); close(keepfd); close(p_a[1]); close(ep_reuse);
+        return 70;
+    }
+    /* DEL reused oldfd (OFD B) */
+    if (epoll_ctl(ep_reuse, EPOLL_CTL_DEL, p_b_read, NULL) != 0) {
+        close(p_b_read); close(p_b[1]); close(keepfd); close(p_a[1]); close(ep_reuse);
+        return 71;
+    }
+
+    /* Trigger A again */
+    if (write(p_a[1], "A", 1) != 1) {
+        close(p_b_read); close(p_b[1]); close(keepfd); close(p_a[1]); close(ep_reuse);
+        return 72;
+    }
+    r_cnt = epoll_wait(ep_reuse, reuse_evs, 4, 100);
+    if (r_cnt != 1 || reuse_evs[0].data.u32 != 0xaaaa) {
+        close(p_b_read); close(p_b[1]); close(keepfd); close(p_a[1]); close(ep_reuse);
+        return 73;
+    }
+    /* Close keepfd: OFD A is released, registration for A must be torn down automatically */
+    close(keepfd);
+    close(p_a[1]);
+    close(p_b_read);
+    close(p_b[1]);
+    close(ep_reuse);
+
     static const char epoll_marker[] =
         "BoarOS: real userland epoll checks ok\n";
     if (write(1, epoll_marker, sizeof(epoll_marker) - 1) !=
