@@ -860,19 +860,19 @@ $(MUSL_LDSO): $(MUSL_STAMP)
 $(REAL_USERLAND_RV): tests/userland/real.c $(MUSL_STAMP)
 	@mkdir -p $(dir $@)
 	$(MUSL_ROOT)/bin/musl-gcc -static -O2 \
-		-L/usr/riscv64-linux-gnu/lib -o $@ $<
+		-o $@ $<
 
 $(PTHREAD_USERLAND_RV): tests/userland/pthread.c $(MUSL_STAMP)
 	@mkdir -p $(dir $@)
 	$(MUSL_ROOT)/bin/musl-gcc -fPIE -pie -O2 -pthread \
 		-Wl,--dynamic-linker=/lib/ld-musl-riscv64.so.1 \
-		-L/usr/riscv64-linux-gnu/lib -o $@ $< -ldl
+		-o $@ $< -ldl
 
 $(PTHREAD_TLS_DSO_RV): tests/userland/tls_dso.c $(MUSL_STAMP)
 	@mkdir -p $(dir $@)
 	$(MUSL_ROOT)/bin/musl-gcc -fPIC -shared -O2 \
 		-Wl,-soname,libboaros-tls.so \
-		-L/usr/riscv64-linux-gnu/lib -o $@ $<
+		-o $@ $<
 
 .PHONY: test-userland-riscv
 test-userland-riscv: $(REAL_USERLAND_RV) $(PTHREAD_USERLAND_RV) \
