@@ -27,7 +27,7 @@
 - 链接脚本把内核 VMA 放在 `0xffffffff80000000`，同时把第一个 `PT_LOAD` 的物理地址和 ELF 入口设为 `0x80200000`。该物理地址位于 QEMU `virt` 从 `0x80000000` 开始的 RAM 中；分页关闭时，`-mcmodel=medany` 生成的 PC 相对代码在低物理装载地址执行。
 - `_start` 不继承固件栈。它初始化 `gp`、关闭 S-mode 中断、将 `__bss_start..__bss_end` 清零，再使用 BSS 末尾 16 KiB、16 字节对齐的单 hart 启动栈。该栈承载启动、idle 与测试 harness 主流程；4 KiB 时代在深文件路径（openat 经 fs context 解析进入 lwext4）确定性地溢出并破坏相邻 `.bss`，症状远离成因且随镜像布局移动，因此按内核路径深度预算放大。
 - 启动栈可用后，`_start` 将 `sscratch` 清零并把 `riscv_trap_entry` 写入 Direct-mode `stvec`。入口可以在当前内核栈保存完整整数 Frame 并执行 `sret`；生产 dispatcher 正式处理 timer interrupt，其他未处理 trap 仍进入致命诊断。
-- DTB 地址不是常量。`kernel_main` 读取第一段 RAM 和静态保留区，再加入 `[__kernel_start, __kernel_end)` 与 DTB 自身范围；只有形成非空可用区间后才报告启动布局。
+- DTB 地址由 OpenSBI 在运行时通过 `a1` 传入，内核不假设固定值，也不要求它随 RAM 大小变化。`kernel_main` 读取第一段 RAM 和静态保留区，再加入 `[__kernel_start, __kernel_end)` 与 DTB 自身范围；只有形成非空可用区间后才报告启动布局。
 - 启动布局成功后，`kernel_main` 以 RISC-V 构建期固定的 4 KiB 页粒度初始化物理页分配器；不足一页的区间边缘不会进入分配器。
 - `kernel_main` 在 Bare 状态构建两张页表。过渡页表从内核镜像内 5 个静态 4 KiB 页取得页表页，把覆盖镜像的 2 MiB 对齐物理包络同时映射到低地址和高半区，并以物理地址精确映射 QEMU UART；两组镜像叶子只在中断关闭的切换窗口内临时使用 RWX。最终页表从正式物理页分配器取得页表页，只建立严格权限的高半区内核、固定偏移且全局 NX 的 RAM direct map，以及 supervisor-only UART 高半区别名。
 - 第一次写入 `satp.MODE=8` 后，过渡页表保证低地址返回路径和当前栈仍可访问；`riscv_relocate_to_high` 再把 `ra`、`sp`、`stvec` 加上固定偏移，跳到高地址代码并重新建立高地址 `gp`。高半区 continuation 第二次切换 `satp` 到最终页表，此后低地址映射不可访问；它立即把 UART 驱动切到高半区别名，再绑定高地址物理页访问函数并修正最终页表对象的 allocator 指针，物理页回收节点由此只通过 direct map 访问。
@@ -57,4 +57,4 @@ make test-no-identity-riscv
 make debug-riscv
 ```
 
-`make test-riscv` 依次运行 DTB/布局、物理页、heap、VirtIO block、VFS/ext4、direct-map、Sv39、Trap、timer、scheduler、syscall、ELF 与生产根启动测试。通用完整启动在 512 MiB、1 GiB 与 16 GiB 下验证高 VMA/低物理装载、DTB 移动、timebase、`satp.MODE=8`、页表/metadata 计数及 PC/SP/GP/`stvec`；它不再夹带无文件系统的占位块设备。根启动 runner 把独立静态 ELF 写入真实 ext4，要求 PID 1 执行、回收和关机；另一个 runner 要求无盘 `kernel-rv` 持续 idle。`make debug-riscv` 会在第一条 guest 指令前暂停，并在宿主 TCP 端口 1234 等待 GDB。
+`make test-riscv` 依次运行 DTB/布局、物理页、heap、VirtIO block、VFS/ext4、direct-map、Sv39、Trap、timer、scheduler、syscall、ELF 与生产根启动测试。通用完整启动在 512 MiB、1 GiB 与 16 GiB 下验证高 VMA/低物理装载、OpenSBI 传入的有效 DTB 指针、timebase、`satp.MODE=8`、页表/metadata 计数及 PC/SP/GP/`stvec`；它不对 QEMU 的 DTB 放置地址作跨配置相异性要求，也不再夹带无文件系统的占位块设备。根启动 runner 把独立静态 ELF 写入真实 ext4，要求 PID 1 执行、回收和关机；另一个 runner 要求无盘 `kernel-rv` 持续 idle。`make debug-riscv` 会在第一条 guest 指令前暂停，并在宿主 TCP 端口 1234 等待 GDB。
