@@ -1436,7 +1436,7 @@ int ext4_cache_flush(const char *path)
 	return ret;
 }
 
-int ext4_fremove(const char *path)
+int ext4_funlink_dentry(const char *path, uint32_t *out_inode, bool *out_is_orphan)
 {
 	ext4_file f;
 	uint32_t parent_inode;
@@ -1483,28 +1483,14 @@ int ext4_fremove(const char *path)
 		EXT4_MP_UNLOCK(mp);
 		return r;
 	}
-	/* We do not allow opening files here. */
+	/* We do not allow unlinking directories via this call. */
 	if (ext4_inode_type(&mp->fs.sb, child.inode) ==
 	    EXT4_INODE_MODE_DIRECTORY) {
 		ext4_fs_put_inode_ref(&parent);
 		ext4_fs_put_inode_ref(&child);
 		ext4_trans_abort(mp);
 		EXT4_MP_UNLOCK(mp);
-		return r;
-	}
-
-	/*Link count will be zero, the inode should be freed. */
-	if (ext4_inode_get_links_cnt(child.inode) == 1) {
-		ext4_block_cache_write_back(mp->fs.bdev, 1);
-		r = ext4_trunc_inode(mp, child.index, 0);
-		if (r != EOK) {
-			ext4_fs_put_inode_ref(&parent);
-			ext4_fs_put_inode_ref(&child);
-			ext4_trans_abort(mp);
-			EXT4_MP_UNLOCK(mp);
-			return r;
-		}
-		ext4_block_cache_write_back(mp->fs.bdev, 0);
+		return EISDIR;
 	}
 
 	/*Set path*/
@@ -1514,19 +1500,13 @@ int ext4_fremove(const char *path)
 
 	/*Unlink from parent*/
 	r = ext4_unlink(mp, &parent, &child, path, len);
-	if (r != EOK)
-		goto Finish;
-
-	/*Link count is zero, the inode should be freed. */
-	if (!ext4_inode_get_links_cnt(child.inode)) {
-		ext4_inode_set_del_time(child.inode, -1L);
-
-		r = ext4_fs_free_inode(&child);
-		if (r != EOK)
-			goto Finish;
+	if (r == EOK) {
+		if (out_inode)
+			*out_inode = child_inode;
+		if (out_is_orphan)
+			*out_is_orphan = (ext4_inode_get_links_cnt(child.inode) == 0);
 	}
 
-Finish:
 	ext4_fs_put_inode_ref(&child);
 	ext4_fs_put_inode_ref(&parent);
 
@@ -1537,6 +1517,66 @@ Finish:
 
 	EXT4_MP_UNLOCK(mp);
 	return r;
+}
+
+int ext4_orphan_free(const char *path, uint32_t inode)
+{
+	int r;
+	struct ext4_inode_ref child;
+	struct ext4_mountpoint *mp = ext4_get_mount(path);
+
+	if (!mp)
+		return ENOENT;
+
+	if (mp->fs.read_only)
+		return EROFS;
+
+	EXT4_MP_LOCK(mp);
+	ext4_trans_start(mp);
+
+	r = ext4_fs_get_inode_ref(&mp->fs, inode, &child);
+	if (r != EOK) {
+		ext4_trans_abort(mp);
+		EXT4_MP_UNLOCK(mp);
+		return r;
+	}
+
+	if (!ext4_inode_get_links_cnt(child.inode)) {
+		ext4_block_cache_write_back(mp->fs.bdev, 1);
+		r = ext4_trunc_inode(mp, child.index, 0);
+		if (r != EOK) {
+			ext4_fs_put_inode_ref(&child);
+			ext4_trans_abort(mp);
+			EXT4_MP_UNLOCK(mp);
+			return r;
+		}
+		ext4_block_cache_write_back(mp->fs.bdev, 0);
+
+		ext4_inode_set_del_time(child.inode, -1L);
+		r = ext4_fs_free_inode(&child);
+	}
+
+	ext4_fs_put_inode_ref(&child);
+
+	if (r != EOK)
+		ext4_trans_abort(mp);
+	else
+		ext4_trans_stop(mp);
+
+	EXT4_MP_UNLOCK(mp);
+	return r;
+}
+
+int ext4_fremove(const char *path)
+{
+	uint32_t inode = 0;
+	bool is_orphan = false;
+	int r = ext4_funlink_dentry(path, &inode, &is_orphan);
+	if (r != EOK)
+		return r;
+	if (is_orphan)
+		return ext4_orphan_free(path, inode);
+	return EOK;
 }
 
 int ext4_fopen(ext4_file *file, const char *path, const char *flags)

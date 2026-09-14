@@ -24,6 +24,9 @@
 #include <time.h>
 #include <unistd.h>
 
+__attribute__((section(".rodata.unlink_test_far"), aligned(4096)))
+const char unlink_far_page[8192] = "UNLINK_DEMAND_FAULT_PAGE_PAYLOAD";
+
 /* Ten live double accumulators force the loop to hold FP state in the
  * registers across preemptions; every sum is an exact integer below
  * 2^53, so a switch that fails to save or restore FP state corrupts a
@@ -1675,49 +1678,184 @@ static int check_filesystem_rw(void)
     close(trfd);
     unlink("/trunc_extend.txt");
 
-    /* 13. Unlink-but-open lifecycle:
-     * Open ufd, unlink file, subsequent open fails ENOENT.
-     * Original ufd can still be closed cleanly, and re-creation gets a new file. */
-    int ufd = open("/unlink_open.txt", O_CREAT | O_RDWR | O_TRUNC, 0644);
+    /* 13. True unlink-but-open read/write/fstat lifecycle:
+     * Open fd, write data, unlink file.
+     * Subsequent open fails with ENOENT.
+     * Original fd must continue to support fstat, lseek, read, and write! */
+    int ufd = open("/unlink_live.txt", O_CREAT | O_RDWR | O_TRUNC, 0644);
     if (ufd < 0) {
         return 74;
     }
-    if (write(ufd, "initial data", 12) != 12) {
+    if (write(ufd, "abcdef", 6) != 6) {
         close(ufd);
         return 75;
     }
-    if (unlink("/unlink_open.txt") != 0) {
+    if (unlink("/unlink_live.txt") != 0) {
         close(ufd);
         return 76;
     }
     errno = 0;
-    int re_open = open("/unlink_open.txt", O_RDONLY);
+    int re_open = open("/unlink_live.txt", O_RDONLY);
     if (re_open >= 0 || errno != ENOENT) {
         if (re_open >= 0) close(re_open);
         close(ufd);
+        return 77;
+    }
+    struct stat ust;
+    memset(&ust, 0, sizeof(ust));
+    if (fstat(ufd, &ust) != 0 || ust.st_size != 6) {
+        close(ufd);
         return 78;
     }
-    if (close(ufd) != 0) {
+    char ubuf[16];
+    memset(ubuf, 0, sizeof(ubuf));
+    if (lseek(ufd, 0, SEEK_SET) != 0 || read(ufd, ubuf, 6) != 6 ||
+        memcmp(ubuf, "abcdef", 6) != 0) {
+        close(ufd);
         return 79;
     }
-    /* Re-create file with same name: must succeed and allow fresh write/read */
-    int new_ufd = open("/unlink_open.txt", O_CREAT | O_RDWR | O_TRUNC, 0644);
-    if (new_ufd < 0) {
+    if (lseek(ufd, 6, SEEK_SET) != 6 || write(ufd, "XYZ", 3) != 3) {
+        close(ufd);
         return 80;
+    }
+    if (fstat(ufd, &ust) != 0 || ust.st_size != 9) {
+        close(ufd);
+        return 81;
+    }
+    if (close(ufd) != 0) {
+        return 82;
+    }
+
+    /* Same pathname can now be recreated as a distinct inode */
+    int new_ufd = open("/unlink_live.txt", O_CREAT | O_RDWR | O_TRUNC, 0644);
+    if (new_ufd < 0) {
+        return 130;
     }
     if (write(new_ufd, "recreated", 9) != 9) {
         close(new_ufd);
-        return 81;
+        return 131;
     }
-    char new_buf[16];
-    memset(new_buf, 0, sizeof(new_buf));
-    if (lseek(new_ufd, 0, SEEK_SET) != 0 || read(new_ufd, new_buf, 9) != 9 ||
-        memcmp(new_buf, "recreated", 9) != 0) {
+    memset(ubuf, 0, sizeof(ubuf));
+    if (lseek(new_ufd, 0, SEEK_SET) != 0 || read(new_ufd, ubuf, 9) != 9 ||
+        memcmp(ubuf, "recreated", 9) != 0) {
         close(new_ufd);
-        return 82;
+        return 132;
     }
     close(new_ufd);
-    unlink("/unlink_open.txt");
+    unlink("/unlink_live.txt");
+
+    /* 13b. Multi-OFD unlink lifecycle:
+     * fd1 and fd2 both open before unlink.
+     * After unlink, both remain usable; close(fd1) leaves fd2 usable. */
+    int m_fd1 = open("/unlink_multi.txt", O_CREAT | O_RDWR | O_TRUNC, 0644);
+    if (m_fd1 < 0) {
+        return 133;
+    }
+    if (write(m_fd1, "HELLO", 5) != 5) {
+        close(m_fd1);
+        return 134;
+    }
+    int m_fd2 = open("/unlink_multi.txt", O_RDONLY);
+    if (m_fd2 < 0) {
+        close(m_fd1);
+        return 135;
+    }
+    if (unlink("/unlink_multi.txt") != 0) {
+        close(m_fd1);
+        close(m_fd2);
+        return 136;
+    }
+    char m_buf[16];
+    memset(m_buf, 0, sizeof(m_buf));
+    if (lseek(m_fd1, 0, SEEK_SET) != 0 || read(m_fd1, m_buf, 5) != 5 ||
+        memcmp(m_buf, "HELLO", 5) != 0) {
+        close(m_fd1);
+        close(m_fd2);
+        return 137;
+    }
+    memset(m_buf, 0, sizeof(m_buf));
+    if (lseek(m_fd2, 0, SEEK_SET) != 0 || read(m_fd2, m_buf, 5) != 5 ||
+        memcmp(m_buf, "HELLO", 5) != 0) {
+        close(m_fd1);
+        close(m_fd2);
+        return 138;
+    }
+    if (close(m_fd1) != 0) {
+        close(m_fd2);
+        return 139;
+    }
+    memset(m_buf, 0, sizeof(m_buf));
+    if (lseek(m_fd2, 0, SEEK_SET) != 0 || read(m_fd2, m_buf, 5) != 5 ||
+        memcmp(m_buf, "HELLO", 5) != 0) {
+        close(m_fd2);
+        return 140;
+    }
+    if (close(m_fd2) != 0) {
+        return 141;
+    }
+
+    /* 13c. Executable demand-paging across unlink:
+     * Harness has placed /unlink_exec on the root disk.
+     * Child execs /unlink_exec, handshakes with parent.
+     * Parent unlinks /unlink_exec.
+     * Child accesses far page, triggering demand page fault on unlinked inode. */
+    int p_ready[2];
+    int p_ack[2];
+    if (pipe(p_ready) != 0 || pipe(p_ack) != 0) {
+        return 146;
+    }
+    char rdy_arg[16];
+    char ack_arg[16];
+    snprintf(rdy_arg, sizeof(rdy_arg), "%d", p_ready[1]);
+    snprintf(ack_arg, sizeof(ack_arg), "%d", p_ack[0]);
+    pid_t ex_cpid = fork();
+    if (ex_cpid < 0) {
+        return 147;
+    }
+    if (ex_cpid == 0) {
+        close(p_ready[0]);
+        close(p_ack[1]);
+        char *ex_args[] = { "/unlink_exec", "unlink_exec_child", rdy_arg, ack_arg, NULL };
+        char *ex_env[] = { NULL };
+        execve("/unlink_exec", ex_args, ex_env);
+        _exit(129);
+    }
+    close(p_ready[1]);
+    close(p_ack[0]);
+
+    char rdy_buf[8];
+    if (read(p_ready[0], rdy_buf, 6) != 6 || memcmp(rdy_buf, "READY\n", 6) != 0) {
+        close(p_ready[0]);
+        close(p_ack[1]);
+        return 148;
+    }
+    close(p_ready[0]);
+
+    if (unlink("/unlink_exec") != 0) {
+        close(p_ack[1]);
+        return 149;
+    }
+    errno = 0;
+    int ex_ck = open("/unlink_exec", O_RDONLY);
+    if (ex_ck >= 0 || errno != ENOENT) {
+        if (ex_ck >= 0) close(ex_ck);
+        close(p_ack[1]);
+        return 150;
+    }
+
+    if (write(p_ack[1], "UNLINKED", 8) != 8) {
+        close(p_ack[1]);
+        return 151;
+    }
+    close(p_ack[1]);
+
+    int ex_status = 0;
+    if (waitpid(ex_cpid, &ex_status, 0) != ex_cpid) {
+        return 152;
+    }
+    if (!WIFEXITED(ex_status) || WEXITSTATUS(ex_status) != 43) {
+        return 153;
+    }
 
     /* 14. Append mode atomic offset resolution:
      * Open O_APPEND, write 10 bytes, lseek to offset 0, write 3 bytes.
@@ -1781,6 +1919,22 @@ int main(int argc, char **argv)
 {
     if (argc > 1 && strcmp(argv[1], "child_exit") == 0) {
         return 42;
+    }
+    if (argc > 3 && strcmp(argv[1], "unlink_exec_child") == 0) {
+        int rdy_fd = 0, ack_fd = 0;
+        for (const char *p = argv[2]; *p >= '0' && *p <= '9'; p++) rdy_fd = rdy_fd * 10 + (*p - '0');
+        for (const char *p = argv[3]; *p >= '0' && *p <= '9'; p++) ack_fd = ack_fd * 10 + (*p - '0');
+        if (write(rdy_fd, "READY\n", 6) != 6) {
+            return 120;
+        }
+        char ack[10];
+        if (read(ack_fd, ack, 8) != 8 || memcmp(ack, "UNLINKED", 8) != 0) {
+            return 121;
+        }
+        if (memcmp(unlink_far_page, "UNLINK_DEMAND_FAULT_PAGE_PAYLOAD", 32) != 0) {
+            return 122;
+        }
+        return 43;
     }
 
     printf("BoarOS: real userland stdio ok\n");

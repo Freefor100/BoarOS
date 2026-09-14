@@ -50,6 +50,9 @@ mkfs.ext4 -q -F "$static_disk"
 debugfs -w -R "write $program /init" "$static_disk" >/dev/null 2>&1
 debugfs -w -R "set_inode_field /init mode 0100755" "$static_disk" \
     >/dev/null 2>&1
+debugfs -w -R "write $program /unlink_exec" "$static_disk" >/dev/null 2>&1
+debugfs -w -R "set_inode_field /unlink_exec mode 0100755" "$static_disk" \
+    >/dev/null 2>&1
 debugfs -w -R "write $data /data" "$static_disk" >/dev/null 2>&1
 
 # The userland program blocks reading stdin after the clock and sleep

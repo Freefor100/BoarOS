@@ -277,6 +277,24 @@ int ext4_cache_flush(const char *path);
  * @return  Standard error code. */
 int ext4_fremove(const char *path);
 
+/**@brief   Remove directory entry by path and decrement inode links count,
+ *          without truncating blocks or freeing inode bitmap.
+ *
+ * @param   path Path to file.
+ * @param   out_inode Pointer to receive unlinked inode number (optional, can be NULL).
+ * @param   out_is_orphan Pointer to receive bool indicating if links_cnt became 0 (optional, can be NULL).
+ *
+ * @return  Standard error code. */
+int ext4_funlink_dentry(const char *path, uint32_t *out_inode, bool *out_is_orphan);
+
+/**@brief   Free an orphan inode whose link count is zero (truncate blocks and free inode).
+ *
+ * @param   path Mount point or file path to identify mount.
+ * @param   inode Inode number to truncate and free.
+ *
+ * @return  Standard error code. */
+int ext4_orphan_free(const char *path, uint32_t inode);
+
 /**@brief   Create a hardlink for a file.
  *
  * @param   path Path to file.

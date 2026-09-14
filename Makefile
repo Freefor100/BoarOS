@@ -857,22 +857,24 @@ $(MUSL_STAMP): $(MUSL_TARBALL)
 $(MUSL_LDSO): $(MUSL_STAMP)
 	@test -f $@
 
+MUSL_GCC_FLAGS ?= $(shell $(MUSL_ROOT)/bin/musl-gcc -fno-link-libatomic -E -x c /dev/null >/dev/null 2>&1 && echo -fno-link-libatomic)
+
 $(REAL_USERLAND_RV): tests/userland/real.c $(MUSL_STAMP)
 	@mkdir -p $(dir $@)
-	$(MUSL_ROOT)/bin/musl-gcc -static -O2 \
+	$(MUSL_ROOT)/bin/musl-gcc $(MUSL_GCC_FLAGS) -static -O2 \
 		-o $@ $<
 
 $(PTHREAD_USERLAND_RV): tests/userland/pthread.c $(MUSL_STAMP)
 	@mkdir -p $(dir $@)
-	$(MUSL_ROOT)/bin/musl-gcc -fPIE -pie -O2 -pthread \
+	$(MUSL_ROOT)/bin/musl-gcc $(MUSL_GCC_FLAGS) -fPIE -pie -O2 -pthread \
 		-Wl,--dynamic-linker=/lib/ld-musl-riscv64.so.1 \
-		-o $@ $< -ldl
+		-o $@ $< -ldl -lc
 
 $(PTHREAD_TLS_DSO_RV): tests/userland/tls_dso.c $(MUSL_STAMP)
 	@mkdir -p $(dir $@)
-	$(MUSL_ROOT)/bin/musl-gcc -fPIC -shared -O2 \
+	$(MUSL_ROOT)/bin/musl-gcc $(MUSL_GCC_FLAGS) -fPIC -shared -O2 \
 		-Wl,-soname,libboaros-tls.so \
-		-o $@ $<
+		-o $@ $< -lc
 
 .PHONY: test-userland-riscv
 test-userland-riscv: $(REAL_USERLAND_RV) $(PTHREAD_USERLAND_RV) \

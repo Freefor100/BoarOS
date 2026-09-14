@@ -51,9 +51,11 @@ struct kernel_vfs_node {
     uint64_t size;
     uint32_t mode;
     uint32_t references;
+    uint32_t open_files;
     uint32_t write_openers;
     uint32_t exec_users;
     uint8_t closed;
+    uint8_t unlinked;
 };
 
 static int lwext4_error(int error)
@@ -439,7 +441,7 @@ int kernel_vfs_open(struct kernel_vfs_mount *mount,
     for (existing = adapter->nodes;
          existing != 0;
          existing = existing->next) {
-        if (existing->file.inode == node->file.inode) {
+        if (existing->file.inode == node->file.inode && !existing->unlinked) {
             break;
         }
     }
@@ -454,10 +456,12 @@ int kernel_vfs_open(struct kernel_vfs_mount *mount,
             return result != EOK ? lwext4_error(result)
                                  : -KERNEL_EIO;
         }
-        if (existing->references == UINT32_MAX) {
+        if (existing->references == UINT32_MAX ||
+            existing->open_files == UINT32_MAX) {
             return -KERNEL_EOVERFLOW;
         }
         existing->references++;
+        existing->open_files++;
         node = existing;
     } else {
         node->adapter = adapter;
@@ -465,8 +469,10 @@ int kernel_vfs_open(struct kernel_vfs_mount *mount,
         node->size = ext4_fsize(&node->file);
         node->mode = mode;
         node->references = 1U;
+        node->open_files = 1U;
         node->write_openers = 0U;
         node->exec_users = 0U;
+        node->unlinked = 0U;
         node->next = adapter->nodes;
         adapter->nodes = node;
     }
@@ -527,7 +533,7 @@ int kernel_vfs_create(struct kernel_vfs_mount *mount,
     for (existing = adapter->nodes;
          existing != 0;
          existing = existing->next) {
-        if (existing->file.inode == node->file.inode) {
+        if (existing->file.inode == node->file.inode && !existing->unlinked) {
             break;
         }
     }
@@ -547,10 +553,12 @@ int kernel_vfs_create(struct kernel_vfs_mount *mount,
             return result != EOK ? lwext4_error(result)
                                  : -KERNEL_EIO;
         }
-        if (existing->references == UINT32_MAX) {
+        if (existing->references == UINT32_MAX ||
+            existing->open_files == UINT32_MAX) {
             return -KERNEL_EOVERFLOW;
         }
         existing->references++;
+        existing->open_files++;
         node = existing;
     } else {
         node->adapter = adapter;
@@ -558,8 +566,10 @@ int kernel_vfs_create(struct kernel_vfs_mount *mount,
         node->size = ext4_fsize(&node->file);
         node->mode = (mode & 07777U) | KERNEL_VFS_S_IFREG;
         node->references = 1U;
+        node->open_files = 1U;
         node->write_openers = 0U;
         node->exec_users = 0U;
+        node->unlinked = 0U;
         node->next = adapter->nodes;
         adapter->nodes = node;
     }
@@ -865,9 +875,16 @@ int kernel_vfs_close(struct kernel_vfs_file *file)
         }
         file->exec_lease = 0U;
     }
+    if (node->open_files > 0U) {
+        node->open_files--;
+    }
     adapter = file->mount->private_data;
     if (adapter == 0) {
         return -KERNEL_EIO;
+    }
+
+    if (node->unlinked && node->open_files == 0U && adapter->page_cache != 0) {
+        (void)kernel_page_cache_invalidate_node(adapter->page_cache, node);
     }
 
     file->state = VFS_FILE_STATE_CLEANUP;
@@ -944,6 +961,8 @@ int kernel_vfs_unlink(struct kernel_vfs_mount *mount,
     struct lwext4_mount_adapter *adapter;
     struct kernel_vfs_node *node;
     uint32_t mode = 0U;
+    uint32_t inode = 0U;
+    bool is_orphan = false;
     int result;
 
     if (mount == 0 || mount->state != VFS_MOUNT_STATE_LIVE ||
@@ -962,16 +981,30 @@ int kernel_vfs_unlink(struct kernel_vfs_mount *mount,
         return -KERNEL_EISDIR;
     }
 
-    result = ext4_fremove(path);
+    result = ext4_funlink_dentry(path, &inode, &is_orphan);
     if (result != EOK) {
         return lwext4_error(result);
     }
-    if (adapter->page_cache != 0) {
-        struct kernel_vfs_node *next_node;
-        for (node = adapter->nodes; node != 0; node = next_node) {
-            next_node = node->next;
-            (void)kernel_page_cache_invalidate_node(adapter->page_cache, node);
+
+    for (node = adapter->nodes; node != 0; node = node->next) {
+        if (node->file.inode == inode && !node->unlinked) {
+            break;
         }
+    }
+
+    if (node != 0) {
+        node->unlinked = 1U;
+        if (node->open_files == 0U) {
+            if (adapter->page_cache != 0) {
+                (void)kernel_page_cache_invalidate_node(adapter->page_cache,
+                                                        node);
+            }
+            if (is_orphan) {
+                (void)ext4_orphan_free(LWEXT4_MOUNT_POINT, inode);
+            }
+        }
+    } else if (is_orphan) {
+        (void)ext4_orphan_free(LWEXT4_MOUNT_POINT, inode);
     }
     return 0;
 }
@@ -1165,6 +1198,9 @@ int kernel_vfs_node_release(struct kernel_vfs_node **owner)
         }
         *link = node->next;
         node->next = 0;
+    }
+    if (node->unlinked) {
+        (void)ext4_orphan_free(LWEXT4_MOUNT_POINT, node->file.inode);
     }
     if (!node->closed) {
         result = ext4_fclose(&node->file);
