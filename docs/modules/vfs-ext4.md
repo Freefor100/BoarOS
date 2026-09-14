@@ -6,11 +6,11 @@
 
 `include/kernel/block.h` 定义同步块设备（支持读与可选写），`include/kernel/vfs.h` 定义不透明 mount/file 对象以及根挂载、open/create、pread/pwrite、ftruncate、mkdir、unlink、rmdir、close、unmount 与 `kernel_vfs_mount_is_readonly()` 查询。VFS 对外返回负 Linux errno；lwext4 的结构、全局设备名和正值 errno 不泄漏到调用者。当前只有一个根挂载与一个 lwext4 heap binding；进程 fd/open-file-description 位于独立的[文件资源层](kernel-files.md)，VFS 本身没有 mount namespace 或并发访问协议。
 
-`kernel_vfs_mount_root_readonly()` 根据传入块设备是否提供 `write` 回调自动决定只读还是读写挂载：若底层设备 `write == 0`，以只读挂载且拒绝任何修改；若底层设备可写，则以读写模式挂载。若磁盘镜像需要 recovery（`needs_recovery` incompat feature），则返回 `-EUCLEAN`。
+`kernel_vfs_mount_root()` 根据传入块设备是否提供 `write` 回调自动决定只读还是读写挂载：若底层设备 `write == 0`，以只读挂载且拒绝任何修改；若底层设备可写，则以读写模式挂载。若磁盘镜像需要 recovery（`needs_recovery` incompat feature），则返回 `-EUCLEAN`。
 
 `kernel_vfs_file_read_source()` 把保持打开的文件导出为带 `size/context/read_at` 的精确随机读源。回调只有填满整个范围才返回零；EOF 以内的短读转成 `-EIO`。ELF parser 因而能复用内存和 VFS 来源，而不依赖文件系统类型。
 
-`kernel_vfs_open_executable()` 在普通 open 之上统一要求 regular file 和至少一个执行位；目录、非普通文件或无执行位返回 `-EACCES`。生产 `/init` 与用户 `execve` 共用这一检查，权限拒绝时立即关闭临时 file；若清理需要重试，调用方仍保留 file owner。
+`kernel_vfs_open_executable()` 在普通 open 之上统一要求 regular file 和至少一个执行位；目录、非普通文件或无执行位返回 `-EACCES`。若目标 node 存在活动的写打开者（`node->write_openers > 0`），返回 `-ETXTBSY`；检查通过后累加 `node->exec_users` 并持有 `file->exec_lease`。对应地，以写权限打开普通文件需调用 `kernel_vfs_file_acquire_write()`，当 `node->exec_users > 0` 时准确返回 `-ETXTBSY`，否则累加 `node->write_openers` 并持有 `file->write_lease`。该租约在 `kernel_vfs_close()` 时释放，严格保障运行中二进制与写入者之间的互斥。
 
 ## 文件节点与页缓存
 
@@ -18,7 +18,7 @@ VFS 为每个已解析普通文件维护引用计数 node；独立 open file des
 
 根启动建立一个挂载共享的 4 KiB 页缓存，键为 `(node, page_index)`：开放寻址哈希提供平均常数时间查找，双向 LRU 维护回收次序。缓存项持有 node 引用和一份物理页引用；命中时再给调用者一份临时引用，因此 `read`、不同 fd 和 file-private mmap 可以安全共享同一页。
 
-写入与截断通过 `kernel_page_cache_invalidate_node()` 精确失效指定 node 在页缓存中的所有对应页项，释放物理页引用，确保后续读取或重新缺页从底层介质加载最新数据。
+写入与截断通过 `kernel_page_cache_invalidate_node()` 精确失效指定 node 在页缓存中的所有对应页项，释放物理页引用，确保后续读取或重新缺页从底层介质加载最新数据。文件删除（`kernel_vfs_unlink`）在底层目录项移除后，遍历当前挂载的所有存活节点（`adapter->nodes`）进行保守失效。
 
 miss 路径先分配并清零页，再通过 node 的无 offset 副作用 `pread` 填充，记录尾页有效字节数。读取整个越过 EOF 的页返回 `OUT_OF_RANGE`，尾页剩余字节保持为零。物理页分配器只有一个压力回收槽，当前由该缓存注册；分配首次耗尽时从 LRU 尾部扫描，仅驱逐引用数为 1 的未固定页，然后由分配器重试一次。被用户映射或正由 read 使用的页引用数大于 1，不会被回收。
 
@@ -30,8 +30,9 @@ miss 路径先分配并清零页，再通过 node 的无 offset 副作用 `pread
 
 挂载后额外检查 superblock `needs_recovery` incompat feature。发现该位返回 `-EUCLEAN` 并完整撤销挂载。
 普通文件打开走 `ext4_fopen`，新建走 `ext4_fopen2`（`kernel_vfs_create`），目录走 `ext4_dir_open`。
-写入操作通过 `kernel_vfs_pwrite`（`ext4_fseek` + `ext4_fwrite`）执行，截断通过 `kernel_vfs_ftruncate`（`ext4_ftruncate`）执行。
+普通文件随机写入通过 `kernel_vfs_pwrite`（`ext4_fseek` + `ext4_fwrite`）执行，追加写入通过 `kernel_vfs_append` 在底层原子解析当前 EOF 并写入，确保 `O_APPEND` 的原子推进；截断通过 `kernel_vfs_ftruncate` 执行，向下截断调用 `ext4_ftruncate`，向上截断通过连续写零填充至目标长度（符合 POSIX 语义）。
 目录操作中，`kernel_vfs_mkdir` 调用 `ext4_dir_mk`；`kernel_vfs_unlink` 调用 `ext4_fremove`。
+由于底层 lwext4 的 `ext4_fremove` 在删除最后一个目录项时立即执行 `ext4_trunc_inode(..., 0)` 并释放 inode，当前在文件仍被打开时执行 unlink 会立即回收底层 inode 数据；VFS 安全管理 node 引用计数，允许旧描述符正常 close，后续 open 准确返回 `-ENOENT`，重新创建同名文件获得全新 inode。
 由于 lwext4 的 `ext4_dir_rm` 会递归删除非空目录，`kernel_vfs_rmdir` 在调用底层删除前先遍历目录项（跳过 `.` 和 `..`），若存在子条目则准确返回 `-ENOTEMPTY`。
 只读挂载下，所有上述修改操作直接返回 `-EROFS`。
 unmount 在仍有 open file 时返回 `-EBUSY`。close/unmount 的底层释放失败保留 CLEANUP 状态，调用者可以重试而不会重复关闭或丢失 heap owner。
