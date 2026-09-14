@@ -422,6 +422,50 @@ static enum kernel_files_status detach_fd(struct kernel_files *files,
     return KERNEL_FILES_STATUS_OK;
 }
 
+static enum kernel_files_status close_fd(struct kernel_files *files,
+                                         uint32_t fd)
+{
+    struct kernel_file_slot *slot = &files->record->slots[fd];
+    struct kernel_open_file_description *description;
+    enum kernel_open_file_status open_status;
+    enum kernel_files_status cleanup_status;
+
+    if (slot->description == 0) {
+        return KERNEL_FILES_STATUS_STATE;
+    }
+    description = slot->description;
+    slot->description = 0;
+    if ((slot->flags & KERNEL_FILES_FD_CLOEXEC) != 0U &&
+        files->record->statistics.close_on_exec_fds != 0U) {
+        files->record->statistics.close_on_exec_fds--;
+    }
+    slot->flags = 0U;
+    if (files->record->statistics.current_open_fds != 0U) {
+        files->record->statistics.current_open_fds--;
+    }
+    if (fd < files->record->next_fd) {
+        files->record->next_fd = fd;
+    }
+
+    open_status = kernel_open_file_detach(&description);
+    if (open_status == KERNEL_OPEN_FILE_STATUS_OK) {
+        return KERNEL_FILES_STATUS_OK;
+    }
+    if (open_status != KERNEL_OPEN_FILE_STATUS_CLEANUP_REQUIRED ||
+        description == 0) {
+        return KERNEL_FILES_STATUS_STATE;
+    }
+    cleanup_status = cleanup_description(files, description);
+    if (cleanup_status == KERNEL_FILES_STATUS_OK) {
+        return KERNEL_FILES_STATUS_OK;
+    }
+    if (cleanup_status != KERNEL_FILES_STATUS_CLEANUP_REQUIRED) {
+        return KERNEL_FILES_STATUS_STATE;
+    }
+    kernel_files_queue_description(files, description);
+    return KERNEL_FILES_STATUS_OK;
+}
+
 static enum kernel_files_status install_dup(
     struct kernel_files *files,
     struct kernel_open_file_description *description,
@@ -831,30 +875,17 @@ enum kernel_files_status kernel_files_close(
     int64_t fd,
     int64_t *linux_result)
 {
-    struct kernel_open_file_description *description;
-    int cleanup_required = 0;
-
     if (!kernel_files_is_live(files) || linux_result == 0) {
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
     }
     files->record->statistics.close_calls++;
-    description = kernel_files_lookup_description(files, fd);
-    if (description == 0) {
+    if (kernel_files_lookup_description(files, fd) == 0) {
         files->record->statistics.close_failures++;
         *linux_result = -KERNEL_EBADF;
         return KERNEL_FILES_STATUS_OK;
     }
-    (void)description;
-    if (detach_fd(files, (uint32_t)fd) != KERNEL_FILES_STATUS_OK) {
+    if (close_fd(files, (uint32_t)fd) != KERNEL_FILES_STATUS_OK) {
         return KERNEL_FILES_STATUS_STATE;
-    }
-    if (kernel_files_drain_file_cleanup(files) != KERNEL_FILES_STATUS_OK) {
-        cleanup_required = 1;
-    }
-    if (cleanup_required != 0) {
-        files->record->statistics.close_failures++;
-        *linux_result = -KERNEL_EIO;
-        return KERNEL_FILES_STATUS_OK;
     }
     *linux_result = 0;
     return KERNEL_FILES_STATUS_OK;

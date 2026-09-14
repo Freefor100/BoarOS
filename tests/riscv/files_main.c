@@ -16,6 +16,9 @@
 #include <kernel/uaccess.h>
 #include <kernel/vfs.h>
 
+#include "../../fs/files/private.h"
+#include "../../fs/open_file_internal.h"
+
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
@@ -1006,6 +1009,53 @@ static void run_console_operations(struct kernel_files *files,
         statistics.bytes_written != (sizeof(marker) - 1U) + 8U ||
         statistics.current_open_fds != 4U) {
         fail_files(76U, 4, statistics.write_failures);
+    }
+}
+
+/* A close must not drain cleanup work that belonged to an earlier OFD. */
+static void run_close_cleanup_isolation(struct kernel_files *files)
+{
+    struct kernel_open_file_description *historical = 0;
+    struct kernel_files_statistics before;
+    struct kernel_files_statistics after;
+    int64_t result = INT64_MIN;
+
+    if (kernel_open_file_create_console(files->heap, &historical) !=
+            KERNEL_OPEN_FILE_STATUS_OK ||
+        kernel_open_file_detach(&historical) !=
+            KERNEL_OPEN_FILE_STATUS_CLEANUP_REQUIRED ||
+        historical == 0) {
+        fail_files(165U, KERNEL_OPEN_FILE_STATUS_CLEANUP_REQUIRED,
+                   KERNEL_OPEN_FILE_STATUS_STATE);
+    }
+    kernel_files_queue_description(files, historical);
+
+    if (kernel_files_open_console(files, 0, &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != 0) {
+        fail_files(166U, 0, result);
+    }
+    kernel_files_get_statistics(files, &before);
+    counted_open_file_releases = 0U;
+    count_open_file_releases = 1;
+    if (kernel_files_close(files, 0, &result) != KERNEL_FILES_STATUS_OK ||
+        result != 0) {
+        count_open_file_releases = 0;
+        fail_files(167U, 0, result);
+    }
+    count_open_file_releases = 0;
+    kernel_files_get_statistics(files, &after);
+    if (counted_open_file_releases != 1U ||
+        after.close_calls != before.close_calls + 1U ||
+        after.close_failures != before.close_failures ||
+        after.current_open_fds + 1U != before.current_open_fds ||
+        kernel_files_close(files, 0, &result) != KERNEL_FILES_STATUS_OK ||
+        result != -KERNEL_EBADF) {
+        fail_files(168U, 1, counted_open_file_releases);
+    }
+    if (kernel_files_drain_file_cleanup(files) != KERNEL_FILES_STATUS_OK) {
+        fail_files(169U, KERNEL_FILES_STATUS_OK,
+                   KERNEL_FILES_STATUS_CLEANUP_REQUIRED);
     }
 }
 
@@ -2279,6 +2329,7 @@ static void run_files_test(const void *dtb)
         fail_files(59U, KERNEL_FILES_STATUS_OK,
                    KERNEL_FILES_STATUS_STATE);
     }
+    run_close_cleanup_isolation(&files);
     run_console_operations(&files, &fs, &mm);
     run_seek_stat_operations(&files, &fs, &mm);
 
