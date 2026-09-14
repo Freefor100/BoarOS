@@ -105,32 +105,57 @@ int kernel_epoll_create(
     return 0;
 }
 
+static void epoll_item_unlink_and_destroy(struct kernel_epoll_item *item)
+{
+    if (item == 0) {
+        return;
+    }
+    struct kernel_epoll *epoll = item->epoll;
+    struct kernel_open_file_description *target_file = item->target_file;
+
+    if (item->wait_node.queue != 0) {
+        kernel_wait_queue_remove(&item->wait_node);
+    }
+
+    if (epoll != 0) {
+        epoll_remove_from_ready_list(epoll, item);
+        if (item->items_prev != 0) {
+            item->items_prev->items_next = item->items_next;
+        } else if (epoll->items_head == item) {
+            epoll->items_head = item->items_next;
+        }
+        if (item->items_next != 0) {
+            item->items_next->items_prev = item->items_prev;
+        }
+        if (epoll->item_count > 0U) {
+            epoll->item_count--;
+        }
+    }
+
+    if (target_file != 0) {
+        if (item->target_prev != 0) {
+            item->target_prev->target_next = item->target_next;
+        } else if (target_file->ep_items == item) {
+            target_file->ep_items = item->target_next;
+        }
+        if (item->target_next != 0) {
+            item->target_next->target_prev = item->target_prev;
+        }
+        item->target_file = 0;
+    }
+
+    if (epoll != 0 && epoll->heap != 0) {
+        (void)kernel_heap_release(epoll->heap, item);
+    }
+}
+
 void kernel_epoll_destroy(struct kernel_epoll *epoll)
 {
-    struct kernel_epoll_item *item;
-    struct kernel_epoll_item *next;
-
     if (epoll == 0) {
         return;
     }
-    item = epoll->items_head;
-    while (item != 0) {
-        next = item->items_next;
-        if (item->wait_node.queue != 0) {
-            kernel_wait_queue_remove(&item->wait_node);
-        }
-        if (item->target_file != 0) {
-            if (item->target_prev != 0) {
-                item->target_prev->target_next = item->target_next;
-            } else if (item->target_file->ep_items == item) {
-                item->target_file->ep_items = item->target_next;
-            }
-            if (item->target_next != 0) {
-                item->target_next->target_prev = item->target_prev;
-            }
-        }
-        (void)kernel_heap_release(epoll->heap, item);
-        item = next;
+    while (epoll->items_head != 0) {
+        epoll_item_unlink_and_destroy(epoll->items_head);
     }
     epoll->items_head = 0;
     epoll->ready_head = 0;
@@ -142,34 +167,11 @@ void kernel_epoll_destroy(struct kernel_epoll *epoll)
 void kernel_epoll_notify_file_release(
     struct kernel_open_file_description *file)
 {
-    struct kernel_epoll_item *item;
-    struct kernel_epoll_item *next;
-
     if (file == 0) {
         return;
     }
-    item = file->ep_items;
-    while (item != 0) {
-        next = item->target_next;
-        if (item->wait_node.queue != 0) {
-            kernel_wait_queue_remove(&item->wait_node);
-        }
-        if (item->epoll != 0) {
-            epoll_remove_from_ready_list(item->epoll, item);
-            if (item->items_prev != 0) {
-                item->items_prev->items_next = item->items_next;
-            } else if (item->epoll->items_head == item) {
-                item->epoll->items_head = item->items_next;
-            }
-            if (item->items_next != 0) {
-                item->items_next->items_prev = item->items_prev;
-            }
-            if (item->epoll->item_count > 0U) {
-                item->epoll->item_count--;
-            }
-            (void)kernel_heap_release(item->epoll->heap, item);
-        }
-        item = next;
+    while (file->ep_items != 0) {
+        epoll_item_unlink_and_destroy(file->ep_items);
     }
     file->ep_items = 0;
 }
@@ -249,6 +251,21 @@ enum kernel_files_status kernel_files_epoll_create1(
     return KERNEL_FILES_STATUS_OK;
 }
 
+static struct kernel_epoll_item *epoll_find_item(
+    struct kernel_epoll *epoll,
+    int fd,
+    struct kernel_open_file_description *target_file)
+{
+    struct kernel_epoll_item *item = epoll->items_head;
+    while (item != 0) {
+        if (item->target_fd == fd && item->target_file == target_file) {
+            return item;
+        }
+        item = item->items_next;
+    }
+    return 0;
+}
+
 enum kernel_files_status kernel_files_epoll_ctl(
     struct kernel_files *files,
     int64_t epfd,
@@ -258,37 +275,41 @@ enum kernel_files_status kernel_files_epoll_ctl(
     uint64_t data,
     int64_t *linux_result)
 {
-    struct kernel_open_file_description *epoll_file;
-    struct kernel_open_file_description *target_file;
+    struct kernel_open_file_description *epoll_file = 0;
+    struct kernel_open_file_description *target_file = 0;
     struct kernel_epoll *epoll;
     struct kernel_epoll_item *item;
     enum kernel_heap_status heap_status;
     struct kernel_wait_queue *target_queue;
     uint32_t current_revents;
+    enum kernel_files_status pin_status;
 
     if (!kernel_files_is_live(files) || linux_result == 0) {
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
     }
-    epoll_file = kernel_files_lookup_description(files, epfd);
-    if (epoll_file == 0) {
-        *linux_result = -KERNEL_EBADF;
-        return KERNEL_FILES_STATUS_OK;
+    pin_status = kernel_files_pin(files, epfd, &epoll_file, linux_result);
+    if (pin_status != KERNEL_FILES_STATUS_OK || *linux_result != 0 || epoll_file == 0) {
+        return pin_status;
     }
     if (kernel_open_file_kind(epoll_file) != KERNEL_OPEN_FILE_KIND_EPOLL ||
         epoll_file->epoll == 0) {
+        (void)kernel_open_file_release(&epoll_file);
         *linux_result = -KERNEL_EINVAL;
         return KERNEL_FILES_STATUS_OK;
     }
     if (epfd == fd) {
+        (void)kernel_open_file_release(&epoll_file);
         *linux_result = -KERNEL_EINVAL;
         return KERNEL_FILES_STATUS_OK;
     }
-    target_file = kernel_files_lookup_description(files, fd);
-    if (target_file == 0) {
-        *linux_result = -KERNEL_EBADF;
-        return KERNEL_FILES_STATUS_OK;
+    pin_status = kernel_files_pin(files, fd, &target_file, linux_result);
+    if (pin_status != KERNEL_FILES_STATUS_OK || *linux_result != 0 || target_file == 0) {
+        (void)kernel_open_file_release(&epoll_file);
+        return pin_status;
     }
     if (target_file == epoll_file) {
+        (void)kernel_open_file_release(&target_file);
+        (void)kernel_open_file_release(&epoll_file);
         *linux_result = -KERNEL_EINVAL;
         return KERNEL_FILES_STATUS_OK;
     }
@@ -296,13 +317,9 @@ enum kernel_files_status kernel_files_epoll_ctl(
 
     switch (op) {
     case KERNEL_EPOLL_CTL_ADD:
-        item = epoll->items_head;
-        while (item != 0) {
-            if (item->target_fd == (int)fd) {
-                *linux_result = -KERNEL_EEXIST;
-                return KERNEL_FILES_STATUS_OK;
-            }
-            item = item->items_next;
+        if (epoll_find_item(epoll, (int)fd, target_file) != 0) {
+            *linux_result = -KERNEL_EEXIST;
+            break;
         }
         heap_status = kernel_heap_allocate_zeroed(epoll->heap,
                                                   1U,
@@ -310,7 +327,7 @@ enum kernel_files_status kernel_files_epoll_ctl(
                                                   (void **)&item);
         if (heap_status != KERNEL_HEAP_STATUS_OK) {
             *linux_result = -KERNEL_ENOMEM;
-            return KERNEL_FILES_STATUS_OK;
+            break;
         }
         item->target_fd = (int)fd;
         item->target_file = target_file;
@@ -360,19 +377,13 @@ enum kernel_files_status kernel_files_epoll_ctl(
             kernel_wait_queue_wake_all(&epoll->wait_queue);
         }
         *linux_result = 0;
-        return KERNEL_FILES_STATUS_OK;
+        break;
 
     case KERNEL_EPOLL_CTL_MOD:
-        item = epoll->items_head;
-        while (item != 0) {
-            if (item->target_fd == (int)fd) {
-                break;
-            }
-            item = item->items_next;
-        }
+        item = epoll_find_item(epoll, (int)fd, target_file);
         if (item == 0) {
             *linux_result = -KERNEL_ENOENT;
-            return KERNEL_FILES_STATUS_OK;
+            break;
         }
         item->events = events;
         item->data = data;
@@ -393,53 +404,26 @@ enum kernel_files_status kernel_files_epoll_ctl(
             }
         }
         *linux_result = 0;
-        return KERNEL_FILES_STATUS_OK;
+        break;
 
     case KERNEL_EPOLL_CTL_DEL:
-        item = epoll->items_head;
-        while (item != 0) {
-            if (item->target_fd == (int)fd) {
-                break;
-            }
-            item = item->items_next;
-        }
+        item = epoll_find_item(epoll, (int)fd, target_file);
         if (item == 0) {
             *linux_result = -KERNEL_ENOENT;
-            return KERNEL_FILES_STATUS_OK;
+            break;
         }
-        if (item->wait_node.queue != 0) {
-            kernel_wait_queue_remove(&item->wait_node);
-        }
-        epoll_remove_from_ready_list(epoll, item);
-
-        if (item->target_prev != 0) {
-            item->target_prev->target_next = item->target_next;
-        } else if (target_file->ep_items == item) {
-            target_file->ep_items = item->target_next;
-        }
-        if (item->target_next != 0) {
-            item->target_next->target_prev = item->target_prev;
-        }
-
-        if (item->items_prev != 0) {
-            item->items_prev->items_next = item->items_next;
-        } else if (epoll->items_head == item) {
-            epoll->items_head = item->items_next;
-        }
-        if (item->items_next != 0) {
-            item->items_next->items_prev = item->items_prev;
-        }
-        if (epoll->item_count > 0U) {
-            epoll->item_count--;
-        }
-        (void)kernel_heap_release(epoll->heap, item);
+        epoll_item_unlink_and_destroy(item);
         *linux_result = 0;
-        return KERNEL_FILES_STATUS_OK;
+        break;
 
     default:
         *linux_result = -KERNEL_EINVAL;
-        return KERNEL_FILES_STATUS_OK;
+        break;
     }
+
+    (void)kernel_open_file_release(&target_file);
+    (void)kernel_open_file_release(&epoll_file);
+    return KERNEL_FILES_STATUS_OK;
 }
 
 static int epoll_calculate_deadline(
