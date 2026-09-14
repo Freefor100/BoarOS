@@ -30,13 +30,15 @@ struct kernel_vfs_file {
     uint64_t size;
     uint32_t mode;
     uint32_t state;
+    uint32_t write_lease;
+    uint32_t exec_lease;
 };
 
 /* Returns zero or a negative Linux-compatible errno value. */
-int kernel_vfs_mount_root_readonly(struct kernel_vfs_mount *mount,
-                                   struct kernel_block_device *block,
-                                   struct kernel_heap *heap,
-                                   struct kernel_page_cache *page_cache);
+int kernel_vfs_mount_root(struct kernel_vfs_mount *mount,
+                          struct kernel_block_device *block,
+                          struct kernel_heap *heap,
+                          struct kernel_page_cache *page_cache);
 
 int kernel_vfs_unmount(struct kernel_vfs_mount *mount);
 
@@ -51,10 +53,12 @@ int kernel_vfs_create(struct kernel_vfs_mount *mount,
                       uint32_t mode,
                       struct kernel_vfs_file *file);
 
-/* Rejects non-regular or non-executable files with EACCES. */
+/* Rejects non-regular or non-executable files with EACCES, or running executables with ETXTBSY. */
 int kernel_vfs_open_executable(struct kernel_vfs_mount *mount,
                                const char *path,
                                struct kernel_vfs_file *file);
+
+int kernel_vfs_file_acquire_write(struct kernel_vfs_file *file);
 
 int kernel_vfs_pread(struct kernel_vfs_file *file,
                      uint64_t offset,
@@ -66,6 +70,12 @@ int kernel_vfs_pwrite(struct kernel_vfs_file *file,
                       uint64_t offset,
                       const void *buffer,
                       size_t size,
+                      size_t *bytes_written);
+
+int kernel_vfs_append(struct kernel_vfs_file *file,
+                      const void *buffer,
+                      size_t size,
+                      uint64_t *written_offset,
                       size_t *bytes_written);
 
 int kernel_vfs_ftruncate(struct kernel_vfs_file *file,

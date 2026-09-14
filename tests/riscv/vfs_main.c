@@ -167,10 +167,10 @@ static void run_vfs_test(const void *dtb)
         fail_vfs(4U, 1, 0);
     }
 
-    result = kernel_vfs_mount_root_readonly(&mount,
-                                            &device.block,
-                                            &heap,
-                                            &page_cache);
+    result = kernel_vfs_mount_root(&mount,
+                                    &device.block,
+                                    &heap,
+                                    &page_cache);
 #ifdef VFS_EXPECT_RECOVERY
     if (result != -KERNEL_EUCLEAN || mount.private_data != 0 ||
         mount.state != 0U) {

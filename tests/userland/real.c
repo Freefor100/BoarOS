@@ -1428,6 +1428,109 @@ static int check_filesystem_rw(void)
         return 33;
     }
 
+    /* 8. ETXTBSY tests: cannot open running executable (/init) for writing */
+    errno = 0;
+    int exec_wfd = open("/init", O_WRONLY);
+    if (exec_wfd >= 0 || errno != ETXTBSY) {
+        if (exec_wfd >= 0) close(exec_wfd);
+        return 35;
+    }
+    errno = 0;
+    int exec_rwfd = open("/init", O_RDWR);
+    if (exec_rwfd >= 0 || errno != ETXTBSY) {
+        if (exec_rwfd >= 0) close(exec_rwfd);
+        return 36;
+    }
+    errno = 0;
+    int exec_trfd = open("/init", O_RDONLY | O_TRUNC);
+    if (exec_trfd >= 0 || errno != ETXTBSY) {
+        if (exec_trfd >= 0) close(exec_trfd);
+        return 37;
+    }
+    /* open /init for reading must succeed */
+    int exec_rfd = open("/init", O_RDONLY);
+    if (exec_rfd < 0) {
+        return 38;
+    }
+    char elf_hdr[4];
+    if (read(exec_rfd, elf_hdr, 4) != 4 || memcmp(elf_hdr, "\177ELF", 4) != 0) {
+        close(exec_rfd);
+        return 39;
+    }
+    close(exec_rfd);
+
+    /* 9. Executable text denial on newly written file:
+     * Copy /init to /test_exec, keep write fd open, fork+execve must fail with ETXTBSY.
+     * Close write fd, fork+execve must succeed. */
+    int src_fd = open("/init", O_RDONLY);
+    if (src_fd < 0) {
+        return 40;
+    }
+    int bin_wfd = open("/test_exec", O_CREAT | O_WRONLY | O_TRUNC, 0755);
+    if (bin_wfd < 0) {
+        close(src_fd);
+        return 41;
+    }
+    char copy_buf[512];
+    ssize_t nread;
+    while ((nread = read(src_fd, copy_buf, sizeof(copy_buf))) > 0) {
+        if (write(bin_wfd, copy_buf, (size_t)nread) != nread) {
+            close(src_fd);
+            close(bin_wfd);
+            return 42;
+        }
+    }
+    close(src_fd);
+
+    /* While bin_wfd is still open for write, fork a child to execve /test_exec */
+    pid_t cpid = fork();
+    if (cpid < 0) {
+        close(bin_wfd);
+        return 43;
+    }
+    if (cpid == 0) {
+        char *exec_args[] = { "/test_exec", "child_exit", NULL };
+        char *exec_env[] = { NULL };
+        execve("/test_exec", exec_args, exec_env);
+        /* execve should have failed with ETXTBSY! */
+        _exit(errno == ETXTBSY ? 77 : 88);
+    }
+    int status = 0;
+    if (waitpid(cpid, &status, 0) != cpid) {
+        close(bin_wfd);
+        return 44;
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 77) {
+        close(bin_wfd);
+        return 45;
+    }
+
+    /* Now close the write descriptor */
+    if (close(bin_wfd) != 0) {
+        return 46;
+    }
+
+    /* Now execve should succeed! */
+    cpid = fork();
+    if (cpid < 0) {
+        return 47;
+    }
+    if (cpid == 0) {
+        char *exec_args[] = { "/test_exec", "child_exit", NULL };
+        char *exec_env[] = { NULL };
+        execve("/test_exec", exec_args, exec_env);
+        _exit(99);
+    }
+    if (waitpid(cpid, &status, 0) != cpid) {
+        return 48;
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 42) {
+        return 49;
+    }
+
+    /* Clean up /test_exec */
+    unlink("/test_exec");
+
     static const char rw_marker[] = "BoarOS: real userland fs rw checks ok\n";
     if (write(1, rw_marker, sizeof(rw_marker) - 1) != (ssize_t)(sizeof(rw_marker) - 1)) {
         return 34;
@@ -1435,8 +1538,12 @@ static int check_filesystem_rw(void)
     return 0;
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+    if (argc > 1 && strcmp(argv[1], "child_exit") == 0) {
+        return 42;
+    }
+
     printf("BoarOS: real userland stdio ok\n");
 
     DIR *dir = opendir("/");

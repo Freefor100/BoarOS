@@ -405,7 +405,7 @@ static void run_file_operations(struct kernel_files *files,
     expect_open(files, fs, mm, 7, "data", 0U, -KERNEL_EBADF, 21U);
     expect_open(files, fs, mm, 7, "/data", TEST_O_WRONLY,
                 -KERNEL_EROFS, 22U);
-    expect_open(files, fs, mm, TEST_AT_FDCWD, "/data", TEST_O_CREAT,
+    expect_open(files, fs, mm, TEST_AT_FDCWD, "/missing", TEST_O_CREAT,
                 -KERNEL_EROFS, 23U);
     expect_open(files, fs, mm, TEST_AT_FDCWD, "/data", TEST_O_DIRECTORY,
                 -KERNEL_ENOTDIR, 24U);
@@ -1218,6 +1218,68 @@ static void run_seek_stat_operations(struct kernel_files *files,
     if (kernel_files_close(files, 4, &result) != KERNEL_FILES_STATUS_OK ||
         result != 0) {
         fail_files(90U, 0, result);
+    }
+
+    /* Test openat semantics on read-only mount */
+    {
+        int64_t ro_fd = -1;
+        /* existing + O_RDONLY: success */
+        if (!write_user_bytes(mm, TEST_USER_PATH, "/data", 6U) ||
+            kernel_files_openat(files, fs, mm, TEST_AT_FDCWD, TEST_USER_PATH,
+                                0U, 0U, &ro_fd) != KERNEL_FILES_STATUS_OK ||
+            ro_fd < 0 ||
+            kernel_files_close(files, ro_fd, &result) != KERNEL_FILES_STATUS_OK ||
+            result != 0) {
+            fail_files(92U, 0, (int32_t)ro_fd);
+        }
+        /* existing + O_RDONLY | O_APPEND (02000): success */
+        if (kernel_files_openat(files, fs, mm, TEST_AT_FDCWD, TEST_USER_PATH,
+                                02000U, 0U, &ro_fd) != KERNEL_FILES_STATUS_OK ||
+            ro_fd < 0 ||
+            kernel_files_close(files, ro_fd, &result) != KERNEL_FILES_STATUS_OK ||
+            result != 0) {
+            fail_files(93U, 0, (int32_t)ro_fd);
+        }
+        /* existing + O_RDONLY | O_CREAT (0100): success */
+        if (kernel_files_openat(files, fs, mm, TEST_AT_FDCWD, TEST_USER_PATH,
+                                0100U, 0U, &ro_fd) != KERNEL_FILES_STATUS_OK ||
+            ro_fd < 0 ||
+            kernel_files_close(files, ro_fd, &result) != KERNEL_FILES_STATUS_OK ||
+            result != 0) {
+            fail_files(94U, 0, (int32_t)ro_fd);
+        }
+        /* existing + O_RDONLY | O_CREAT | O_EXCL (0100 | 0200 = 0300): EEXIST */
+        if (kernel_files_openat(files, fs, mm, TEST_AT_FDCWD, TEST_USER_PATH,
+                                0300U, 0U, &ro_fd) != KERNEL_FILES_STATUS_OK ||
+            ro_fd != -KERNEL_EEXIST) {
+            fail_files(95U, -KERNEL_EEXIST, (int32_t)ro_fd);
+        }
+        /* missing + O_RDONLY | O_CREAT (0100): EROFS */
+        if (!write_user_bytes(mm, TEST_USER_PATH, "/missing", 9U) ||
+            kernel_files_openat(files, fs, mm, TEST_AT_FDCWD, TEST_USER_PATH,
+                                0100U, 0U, &ro_fd) != KERNEL_FILES_STATUS_OK ||
+            ro_fd != -KERNEL_EROFS) {
+            fail_files(96U, -KERNEL_EROFS, (int32_t)ro_fd);
+        }
+        /* existing + O_WRONLY (1): EROFS */
+        if (!write_user_bytes(mm, TEST_USER_PATH, "/data", 6U) ||
+            kernel_files_openat(files, fs, mm, TEST_AT_FDCWD, TEST_USER_PATH,
+                                1U, 0U, &ro_fd) != KERNEL_FILES_STATUS_OK ||
+            ro_fd != -KERNEL_EROFS) {
+            fail_files(97U, -KERNEL_EROFS, (int32_t)ro_fd);
+        }
+        /* existing + O_RDWR (2): EROFS */
+        if (kernel_files_openat(files, fs, mm, TEST_AT_FDCWD, TEST_USER_PATH,
+                                2U, 0U, &ro_fd) != KERNEL_FILES_STATUS_OK ||
+            ro_fd != -KERNEL_EROFS) {
+            fail_files(98U, -KERNEL_EROFS, (int32_t)ro_fd);
+        }
+        /* existing + O_RDONLY | O_TRUNC (01000): EROFS */
+        if (kernel_files_openat(files, fs, mm, TEST_AT_FDCWD, TEST_USER_PATH,
+                                01000U, 0U, &ro_fd) != KERNEL_FILES_STATUS_OK ||
+            ro_fd != -KERNEL_EROFS) {
+            fail_files(99U, -KERNEL_EROFS, (int32_t)ro_fd);
+        }
     }
 }
 
@@ -2068,10 +2130,10 @@ static void run_files_test(const void *dtb)
         }
     }
     if (!found ||
-        kernel_vfs_mount_root_readonly(&mount,
-                                       &device.block,
-                                       &heap,
-                                       &page_cache) != 0 ||
+        kernel_vfs_mount_root(&mount,
+                              &device.block,
+                              &heap,
+                              &page_cache) != 0 ||
         !create_user_mm(&allocator, &kernel_table, &mm) ||
         kernel_mm_vma_enable(&mm, &heap) != KERNEL_MM_STATUS_OK ||
         kernel_mm_brk_initialize(&mm,
