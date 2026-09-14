@@ -11,6 +11,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <poll.h>
 #include <sys/epoll.h>
@@ -1787,7 +1788,24 @@ int main(int argc, char **argv)
 
     DIR *dir = opendir("/");
     if (dir == 0) {
-        fprintf(stderr, "opendir(/) failed: errno=%d\n", errno);
+        int opendir_errno = errno;
+        errno = 0;
+        int root_fd = open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        int open_errno = errno;
+        if (root_fd >= 0) {
+            close(root_fd);
+        }
+        errno = 0;
+        void *allocation = calloc(1, 2048);
+        int calloc_errno = errno;
+        fprintf(stderr,
+                "opendir(/) failed: errno=%d open=%d/%d calloc=%d/%d\n",
+                opendir_errno,
+                root_fd,
+                open_errno,
+                allocation != 0,
+                calloc_errno);
+        free(allocation);
         return 1;
     }
     int saw_data = 0;
