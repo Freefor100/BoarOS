@@ -256,6 +256,7 @@ enum kernel_open_file_status kernel_open_file_create_epoll(
     file->epoll = epoll;
     file->open_flags = flags;
     file->vfs_closed = 0U;
+    epoll->file = file;
     *owner = file;
     return KERNEL_OPEN_FILE_STATUS_OK;
 }
@@ -277,6 +278,22 @@ enum kernel_open_file_kind kernel_open_file_kind(
         return KERNEL_OPEN_FILE_KIND_EPOLL;
     default:
         return KERNEL_OPEN_FILE_KIND_REGULAR;
+    }
+}
+
+int kernel_open_file_supports_epoll(
+    const struct kernel_open_file_description *file)
+{
+    if (file == 0) {
+        return 0;
+    }
+    switch (file->kind) {
+    case KERNEL_OPEN_FILE_KIND_PIPE:
+    case KERNEL_OPEN_FILE_KIND_CONSOLE:
+    case KERNEL_OPEN_FILE_KIND_EPOLL:
+        return 1;
+    default:
+        return 0;
     }
 }
 

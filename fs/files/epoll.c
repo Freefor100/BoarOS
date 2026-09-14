@@ -15,8 +15,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define KERNEL_EPOLL_STACK_CAPACITY 8U
-#define KERNEL_EPOLL_MAX_EVENTS 1024U
+#define KERNEL_EPOLL_STACK_CAPACITY 4U
+#define KERNEL_EPOLL_MAX_NESTS 4U
 
 static void kernel_epoll_wait_callback(
     struct kernel_wait_node *node,
@@ -266,6 +266,128 @@ static struct kernel_epoll_item *epoll_find_item(
     return 0;
 }
 
+struct epoll_down_frame {
+    struct kernel_epoll_item *item;
+    int depth;
+};
+
+static int epoll_check_downward(
+    struct kernel_epoll *inserting_into,
+    struct kernel_epoll *target_epoll,
+    int *out_down_depth)
+{
+    struct epoll_down_frame stack[8];
+    int top = 0;
+    int max_depth = 0;
+
+    stack[0].item = target_epoll->items_head;
+    stack[0].depth = 0;
+
+    while (top >= 0) {
+        struct kernel_epoll_item *item = stack[top].item;
+        if (item == 0) {
+            top--;
+            continue;
+        }
+        stack[top].item = item->items_next;
+
+        if (item->target_file != 0 &&
+            kernel_open_file_kind(item->target_file) == KERNEL_OPEN_FILE_KIND_EPOLL &&
+            item->target_file->epoll != 0) {
+            struct kernel_epoll *child_ep = item->target_file->epoll;
+            if (child_ep == inserting_into) {
+                return -KERNEL_ELOOP;
+            }
+            int d = stack[top].depth + 1;
+            if (d > max_depth) {
+                max_depth = d;
+            }
+            if (d > (int)KERNEL_EPOLL_MAX_NESTS) {
+                return -KERNEL_ELOOP;
+            }
+            if (top + 1 < 8) {
+                top++;
+                stack[top].item = child_ep->items_head;
+                stack[top].depth = d;
+            }
+        }
+    }
+    *out_down_depth = max_depth;
+    return 0;
+}
+
+struct epoll_up_frame {
+    struct kernel_epoll_item *item;
+    int depth;
+};
+
+static int epoll_check_upward(
+    struct kernel_epoll *inserting_into,
+    int *out_up_depth)
+{
+    struct epoll_up_frame stack[8];
+    int top = 0;
+    int max_depth = 0;
+
+    if (inserting_into->file == 0) {
+        *out_up_depth = 0;
+        return 0;
+    }
+
+    stack[0].item = inserting_into->file->ep_items;
+    stack[0].depth = 0;
+
+    while (top >= 0) {
+        struct kernel_epoll_item *item = stack[top].item;
+        if (item == 0) {
+            top--;
+            continue;
+        }
+        stack[top].item = item->target_next;
+
+        if (item->epoll != 0) {
+            struct kernel_epoll *parent_ep = item->epoll;
+            int d = stack[top].depth + 1;
+            if (d > max_depth) {
+                max_depth = d;
+            }
+            if (d > (int)KERNEL_EPOLL_MAX_NESTS) {
+                return -KERNEL_ELOOP;
+            }
+            if (parent_ep->file != 0 && top + 1 < 8) {
+                top++;
+                stack[top].item = parent_ep->file->ep_items;
+                stack[top].depth = d;
+            }
+        }
+    }
+    *out_up_depth = max_depth;
+    return 0;
+}
+
+static int epoll_check_nesting(
+    struct kernel_epoll *inserting_into,
+    struct kernel_epoll *target_epoll)
+{
+    if (inserting_into == target_epoll) {
+        return -KERNEL_EINVAL;
+    }
+    int down_depth = 0;
+    int err = epoll_check_downward(inserting_into, target_epoll, &down_depth);
+    if (err != 0) {
+        return err;
+    }
+    int up_depth = 0;
+    err = epoll_check_upward(inserting_into, &up_depth);
+    if (err != 0) {
+        return err;
+    }
+    if (down_depth + 1 + up_depth > (int)KERNEL_EPOLL_MAX_NESTS) {
+        return -KERNEL_ELOOP;
+    }
+    return 0;
+}
+
 enum kernel_files_status kernel_files_epoll_ctl(
     struct kernel_files *files,
     int64_t epfd,
@@ -317,6 +439,17 @@ enum kernel_files_status kernel_files_epoll_ctl(
 
     switch (op) {
     case KERNEL_EPOLL_CTL_ADD:
+        if (!kernel_open_file_supports_epoll(target_file)) {
+            *linux_result = -KERNEL_EPERM;
+            break;
+        }
+        if (kernel_open_file_kind(target_file) == KERNEL_OPEN_FILE_KIND_EPOLL) {
+            int loop_err = epoll_check_nesting(epoll, target_file->epoll);
+            if (loop_err != 0) {
+                *linux_result = loop_err;
+                break;
+            }
+        }
         if (epoll_find_item(epoll, (int)fd, target_file) != 0) {
             *linux_result = -KERNEL_EEXIST;
             break;
@@ -529,7 +662,7 @@ enum kernel_files_status kernel_files_epoll_pwait(
     if (!kernel_files_is_live(files) || mm == 0 || task == 0 || linux_result == 0) {
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
     }
-    if (maxevents <= 0 || maxevents > (int32_t)KERNEL_EPOLL_MAX_EVENTS) {
+    if (maxevents <= 0) {
         *linux_result = -KERNEL_EINVAL;
         return KERNEL_FILES_STATUS_OK;
     }
@@ -558,6 +691,15 @@ enum kernel_files_status kernel_files_epoll_pwait(
     }
 
     buffer_capacity = (size_t)maxevents;
+    if (epoll->item_count > 0U && buffer_capacity > epoll->item_count) {
+        buffer_capacity = epoll->item_count;
+    }
+    if (buffer_capacity > KERNEL_FILES_MAX_CAPACITY) {
+        buffer_capacity = KERNEL_FILES_MAX_CAPACITY;
+    }
+    if (buffer_capacity == 0U) {
+        buffer_capacity = 1U;
+    }
     if (buffer_capacity > KERNEL_EPOLL_STACK_CAPACITY) {
         enum kernel_heap_status heap_status = kernel_heap_allocate_zeroed(
             files->heap,
@@ -660,6 +802,10 @@ enum kernel_files_status kernel_files_epoll_pwait(
         {
             enum kernel_wait_wake_reason wake_reason = KERNEL_WAIT_WOKEN;
             uint64_t saved_intr = riscv_interrupt_save();
+            if (epoll->ready_head != 0) {
+                riscv_interrupt_restore(saved_intr);
+                continue;
+            }
             enum kernel_scheduler_status sched_status =
                 kernel_scheduler_block_current(&epoll->wait_queue,
                                                deadline,
