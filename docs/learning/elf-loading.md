@@ -49,13 +49,13 @@ Auxv 的值必须来自真实机制，而不是为了让 libc 继续运行而伪
 
 ## BoarOS 当前选择
 
-通用层只做有界 ELF64 小端字节解析，不引入通用 VM callback 框架。RISC-V 层固定 Sv39/4 KiB，接受非 PIE `ET_EXEC`、PIE/无解释器 `ET_DYN` 以及非递归 `PT_INTERP`；`PT_DYNAMIC`、`PT_TLS` 和 GNU 扩展元数据保留在 source 中，供尚未实现的动态链接器消费。它按页预检 W^X，建立 `ELF_PRIVATE` VMA，并按 FILE/COW、COMPOSITE 或 ZERO 规则在缺页时物化 `PT_LOAD`。入口要求 2 字节对齐并位于可执行文件字节；栈固定预留低半区顶端 8 MiB，初始参数、指针和对齐合计限制为 128 KiB，初次映射再从 SP 向下多留 64 KiB，其余 reserve 由匿名 demand-zero fault 提交，底部以下保持一页永久 guard。这个拆分让未来 LoongArch64 能复用 ELF 字节解析和栈内容规则，但用 16 KiB/三级页表实现自己的地址布局和页面物化。
+通用层只做有界 ELF64 小端字节解析，不引入通用 VM callback 框架。RISC-V 层固定 Sv39/4 KiB，接受非 PIE `ET_EXEC`、PIE/无解释器 `ET_DYN` 以及非递归 `PT_INTERP`；`PT_DYNAMIC`、`PT_TLS` 和 GNU 扩展元数据保留在 source 中，供用户态动态链接器消费。它按页预检 W^X，建立 `ELF_PRIVATE` VMA，并按 FILE/COW、COMPOSITE 或 ZERO 规则在缺页时物化 `PT_LOAD`。入口要求 2 字节对齐并位于可执行文件字节；栈固定预留低半区顶端 8 MiB，初始参数、指针和对齐合计限制为 128 KiB，初次映射再从 SP 向下多留 64 KiB，其余 reserve 由匿名 demand-zero fault 提交，底部以下保持一页永久 guard。这个拆分让未来 LoongArch64 能复用 ELF 字节解析和栈内容规则，但用 16 KiB/三级页表实现自己的地址布局和页面物化。
 
-当前接口借用一个精确 read source 和带长度的文件名/参数/环境区间。生产启动把已打开的 ext4 `/init` 转成不可变 source；用户 `execve` 则先打开路径、捕获用户字符串，再调用同一装载器。source 由 MM/VMA 持有引用，重复映射不累积历史引用，fork 后子 MM 获得自己的引用；最后一个相关 VMA 消失时释放 source。成功产出独立 LIVE 用户地址空间、入口和 SP，调用者把地址空间移入 MM；scheduler 在提交点替换旧 MM。RISC-V image 同时建立独立随机或无可信种子确定性降级的 PIE/解释器、mmap、brk、栈和 vDSO 布局，并在可用种子时把独立字节放入 `AT_RANDOM`。动态链接器重定位、额外 DSO、TLS 和 `getrandom` 仍不是内核已完成能力。
+当前接口借用一个精确 read source 和带长度的文件名/参数/环境区间。生产启动把已打开的 ext4 `/init` 转成不可变 source；用户 `execve` 则先打开路径、捕获用户字符串，再调用同一装载器。source 由 MM/VMA 持有引用，重复映射不累积历史引用，fork 后子 MM 获得自己的引用；最后一个相关 VMA 消失时释放 source。成功产出独立 LIVE 用户地址空间、入口和 SP，调用者把地址空间移入 MM；scheduler 在提交点替换旧 MM。RISC-V image 同时建立独立随机或无可信种子确定性降级的 PIE/解释器、mmap、brk、栈和 vDSO 布局，并在可用种子时把独立字节放入 `AT_RANDOM`。真实 userland runner 已验证动态 musl PIE、解释器、额外 DSO、初始 TLS 和运行中 dlopen TLS；内核仍不执行重定位或分配 TLS，更广动态 libc/DSO 矩阵与 `getrandom` 仍待补齐。
 
-分配页交给页表之前存在一个需要特别封闭的错误窗口：如果访问该页失败，紧接着释放也失败，那么“调用者持有”与“页表持有”都不成立。BoarOS 把分配、清零、映射和所有权登记收进 Sv39 接口；双重失败时地址空间转为只允许 move/destroy 的 CLEANUP 状态并记录脱离页表树的页。这样所有已分配页始终能从一个可重试对象找到，而不是仅返回状态码。详细装载结果还要与清理结果分开保存，否则一次后续释放失败会掩盖原本应返回给用户的 `ENOEXEC`、`E2BIG` 或 `ENOMEM`。
+分配页交给页表之前必须先完成访问、清零和所有权登记；若解析或读取失败，立即释放临时页并返回原始错误。物理页和堆释放遵循 fail-stop 契约，非法 owner、引用或 allocator metadata 进入 fatal，不把 allocator 错误扩散成 CLEANUP 状态。只有 source/OFD 的真实 VFS/I/O 清理错误保留持久 owner，且不能覆盖原本应返回给用户的 `ENOEXEC`、`E2BIG` 或 `ENOMEM`。
 
-本地固定版本的 `oscomp-testsuits` 可作为真实用户态输入和回归来源，但不能决定内核实现顺序或语义。静态程序能验证当前 source-backed `ET_EXEC` 入口；动态解释器、DSO 和 TLS 输入只在相应消费者完成后用于验收，不把“能够解析和构造动态映像”表述成动态运行时已经完成。
+本地固定版本的 `oscomp-testsuits` 可作为真实用户态输入和回归来源，但不能决定内核实现顺序或语义。静态程序和 userland runner 的动态 musl 输入都经 source-backed 生产入口验收；更广动态 libc/DSO 负载仍按真实消费者缺口安排，不把单一 fixture 当作全部运行时兼容。
 
 ## 验证和调试经验
 
@@ -65,7 +65,7 @@ Auxv 的值必须来自真实机制，而不是为了让 libc 继续运行而伪
 - 同时准备正常退出、写 RX text 和向下越过栈底的映像，可以证明 `.data`、BSS、栈、系统调用、PTE W^X、guard 方向和用户故障隔离。结束时比较物理空闲页数，覆盖叶子页、页表页和线程页的所有权闭环。
 - 初始栈不能只测一个短字符串。至少要读取真实用户页表验证空参数规范化、argv/envp 的 NULL 分隔、auxv 类型查找、跨页字符串、恰好达到总大小上限的成功边界，以及超过上限时输出和页数均不变化。Auxv 的顺序不是消费者应依赖的接口，测试应按类型扫描。
 - 用户可调用的 exec 还要让三个独立 ELF 连续替换，才能同时检查成功不返回、相对/绝对路径、`AT_EXECFN`、寄存器清零、身份与非 CLOEXEC fd 保持。只在装载器单元测试中读取新页表，无法覆盖 Trap Frame 和 point of no return。
-- 错误测试不能只看状态码，还要检查输出对象未变化、分配器页数复原；物理页访问与立即释放同时失败时，应分别覆盖根页、中间表和叶子页，确认页地址仍记录在 CLEANUP 对象中，故障解除后可以重试销毁。多个回收动作连续失败时还要核对最具体的状态码没有被后续失败降格。
+- 错误测试不能只看状态码，还要检查输出对象未变化、分配器页数复原；非法页/引用/allocator metadata 应验证进入 fatal，真实 VFS/block I/O 失败则验证 owner 留在正确的 mount 或文件对象并可在有限次数内重试。多个回收动作连续失败时还要核对最具体的状态码没有被后续失败降格。
 - 高半区内核在第一次地址迁移前仍通过物理别名执行。此时，自动聚合初始化若包含链接器符号指针，编译器可能把整个常量放进高半区 rodata，早期代码读取它就会 fault；逐字段运行时赋值通常能生成可在物理别名执行的 PC 相对取址。早期测试夹具也必须服从这个启动边界，不能因为它不是生产代码就假定最终高半区已经可访问。
 
 ## 资料依据

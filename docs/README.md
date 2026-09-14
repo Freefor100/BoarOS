@@ -17,13 +17,13 @@
 | [DTB 与启动内存布局模块](modules/dtb-memory.md) | RAM、静态保留区、VirtIO transport 与可用物理区间的接口和限制 |
 | [物理页分配模块](modules/physical-pages.md) | 启动分配、buddy 连续页、所有权与失败语义 |
 | [内核堆模块](modules/kernel-heap.md) | size-class slab、大对象 buddy 后备、统计和生命周期 |
-| [RISC-V VirtIO MMIO 块设备模块](modules/riscv-virtio-block.md) | legacy/modern transport、split queue、同步只读 I/O 和资源回收 |
-| [VFS 与只读 ext4 模块](modules/vfs-ext4.md) | 通用块/VFS 边界、lwext4 私有适配和精确随机读 |
+| [RISC-V VirtIO MMIO 块设备模块](modules/riscv-virtio-block.md) | legacy/modern transport、split queue、同步读写 I/O 和资源回收 |
+| [VFS 与可写 ext4 模块](modules/vfs-ext4.md) | 通用块/VFS 边界、lwext4 私有适配、读写和精确随机访问 |
 | [进程文件资源模块](modules/kernel-files.md) | fd/open-file-description、fs context、路径、offset、错误与退出清理契约 |
 | [RISC-V 根启动模块](modules/riscv-root-boot.md) | 根盘选择、`/init` 装载、PID 1 回收和系统终止 |
 | [RISC-V Sv39 分页模块](modules/riscv-sv39.md) | 启动建表、运行期用户根、SATP 切换、所有权和失败语义 |
-| [内核 MM 模块](modules/kernel-mm.md) | 跨架构 MM 句柄、RISC-V Sv39 后端、共享引用和可重试回收契约 |
-| [虚拟内存区域（VMA）模块](modules/kernel-vma.md) | 逻辑用户区间、PTE 驻留关系、fork 复制与阶段化回收 |
+| [内核 MM 模块](modules/kernel-mm.md) | 跨架构 MM 句柄、RISC-V Sv39 后端、共享引用和所有权回收契约 |
+| [虚拟内存区域（VMA）模块](modules/kernel-vma.md) | 逻辑用户区间、PTE 驻留关系、fork 复制与回收顺序 |
 | [用户内存访问模块](modules/kernel-uaccess.md) | 用户范围、双向与字符串跨页复制、错误分类、并发与性能边界 |
 | [用户 ELF64 装载模块](modules/user-elf.md) | 有界 ELF64 解析、source-backed RISC-V 映像、Sv39 ASLR、权限和失败所有权契约 |
 | [进程映像替换模块](modules/kernel-exec.md) | Linux `execve` 准备事务、提交点、映像替换和 close-on-exec 契约 |

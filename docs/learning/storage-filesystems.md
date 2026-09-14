@@ -1,6 +1,6 @@
 # 存储与文件系统学习总结
 
-本文整理从块设备读取 ext4、把文件作为可执行映像来源并向进程提供文件描述符时需要掌握的知识、BoarOS 当前选择及验证经验。稳定接口见[RISC-V VirtIO MMIO 块设备](../modules/riscv-virtio-block.md)、[VFS 与只读 ext4](../modules/vfs-ext4.md)、[进程文件资源](../modules/kernel-files.md)和[RISC-V 根启动](../modules/riscv-root-boot.md)。
+本文整理从块设备读取 ext4、把文件作为可执行映像来源并向进程提供文件描述符时需要掌握的知识、BoarOS 当前选择及验证经验。稳定接口见[RISC-V VirtIO MMIO 块设备](../modules/riscv-virtio-block.md)、[VFS 与 ext4](../modules/vfs-ext4.md)、[进程文件资源](../modules/kernel-files.md)和[RISC-V 根启动](../modules/riscv-root-boot.md)。
 
 ## 从设备到文件的层次
 
@@ -10,11 +10,11 @@ VirtIO 也分 transport 与 device type。MMIO 或 PCI transport 规定寄存器
 
 DMA 的地址是设备可见地址，不等于任意内核虚拟地址。QEMU `virt` 当前无 IOMMU、RAM 有固定 direct map，因此可把 direct-map VA 转回 PA；真实开发板还必须核对 DMA 可达位宽、cache coherency、内存屏障和 IOMMU。对齐的最终目标缓冲区可以 direct DMA；非整扇区范围需要 bounce，避免设备覆盖调用者未请求的前后字节。
 
-## 为什么当前是同步只读
+## 为什么当前是同步 I/O
 
 首个存储消费者发生在单 hart 启动期，尚无外部中断控制器、等待队列与阻塞调度。一个 outstanding request 加有界轮询能形成真实 I/O 闭环，并把过渡复杂性限制在设备后端。其缺点是等待期间 CPU 忙等且不能并行 I/O；建立 IRQ 和 sleep/wake 后，应替换完成方式而保留块设备和 VFS 语义。
 
-只读 ext4 降低的是写回、崩溃一致性和 journal replay 范围，不代表所有磁盘都能安全读取。ext3/4 若带 `needs_recovery`，最近的元数据事务可能只在 journal 中；没有 JBD2 replay 的实现必须拒绝挂载。metadata checksum 还要求根据 incompat feature 在 superblock checksum seed 与 UUID 派生 seed 之间正确选择，不能因镜像“能列目录”就认定所有元数据校验正确。
+当前 ext4 既可挂载为只读，也可在块设备提供写回调时挂载为读写；同步轮询只解决首个单 hart 消费者的 I/O 边界。写路径增加了介质更新、页缓存失效和真实清理错误，不能把它们简化成分配器重试。ext3/4 若带 `needs_recovery`，最近的元数据事务可能只在 journal 中；没有 JBD2 replay 的实现必须拒绝挂载。metadata checksum 还要求根据 incompat feature 在 superblock checksum seed 与 UUID 派生 seed 之间正确选择，不能因镜像“能列目录”就认定所有元数据校验正确。
 
 BoarOS 引入固定 lwext4 源码快照，自有 block/VFS 接口保持在外层。这样避免从零实现 ext4 inode、extent、目录索引和 checksum 的高风险，同时不让第三方结构成为未来进程 ABI。代价是需要维护 freestanding libc/allocator adapter，并承担组合后的 GPL 许可证约束。
 
@@ -92,7 +92,7 @@ write-first 且缓存未命中，直接把文件内容读入私有页可避免�
 
 3. **页缓存失效（Page Cache Invalidation）**：
    - 当文件被 `write` 或 `ftruncate` 改变时，`kernel_page_cache_invalidate_node()` 从哈希表与 LRU 链中精确摘除该 node 关联的所有物理页项并释放页引用，确保后续的 `read` 或缺页重新从磁盘介质加载最新数据。
-   - 当执行文件删除（`unlink`）时，若目标文件未被打开，立即通过 `ext4_orphan_free` 截断释放并使缓存失效；若目标文件仍被打开，页缓存继续为现有描述符与缺页服务，直至最后一次 `close` 释放孤儿 inode 时同步调用 `kernel_page_cache_invalidate_node()`，保证无脏引用泄漏并满足 `heap-live=0x0`。释放失败保留 `adapter->cleanup_nodes` 重试所有权。
+   - 当执行文件删除（`unlink`）时，若目标文件未被打开，立即通过 `ext4_orphan_free` 截断释放并使缓存失效；若目标文件仍被打开，页缓存继续为现有描述符与缺页服务，直至最后一次 `close` 释放孤儿 inode 时同步调用 `kernel_page_cache_invalidate_node()`。unlink 前会为无现存 node 的路径预留 mount orphan 记录；`ext4_orphan_free` 的真实 I/O 错误由 mount 保留唯一 owner，路径不会复现，重试成功后才完成卸载。
 
 ## 根设备与 PID 1
 
@@ -105,10 +105,10 @@ PID 1 是用户空间生命周期的根。Linux 通常在 init 退出时 panic�
 - 块设备测试要覆盖 direct DMA、bounce、批量合并、最后一个扇区、整数溢出、timeout 后 reset 和队列页回收。
 - 文件系统测试应建立真实镜像并通过工具设置 mode、checksum 与 incompat feature；只用手写 superblock fixture 很难覆盖 extent、目录和校验链。
 - 成功读取文件不足以证明生命周期完整；应在 open file 时验证 unmount 为 busy，并在 close/unmount/device destroy 后比较物理页和 heap live/current pages。
-- 进程文件测试还应覆盖最低 fd 复用、扩容边界、两次 open 的独立 offset、路径 NUL 上限、跨页 usercopy、部分 fault 后 offset，以及 close 已摘除 fd 但底层释放需要重试的状态。
-- pipe 测试要覆盖两端引用、≤PIPE_BUF 写原子性、读写阻塞/`O_NONBLOCK`、EOF、EPIPE/SIGPIPE、FIFO `fstat`/`ESPIPE` 和创建/关闭失败后的 owner 重试。
+- 进程文件测试还应覆盖最低 fd 复用、扩容边界、两次 open 的独立 offset、路径 NUL 上限、跨页 usercopy、部分 fault 后 offset，以及 close 已摘除 fd 后真实 VFS/I/O owner 的状态。
+- pipe 测试要覆盖两端引用、≤PIPE_BUF 写原子性、读写阻塞/`O_NONBLOCK`、EOF、EPIPE/SIGPIPE、FIFO `fstat`/`ESPIPE` 和创建/关闭时的 VFS/I/O owner。
 - 页缓存测试要区分 hit/miss、尾页有效长度、被映射页 pin、LRU 驱逐和分配失败触发的有界回收；file-private mmap 还要验证写后其他别名与文件内容不变、关闭 fd 后仍可 fault、fork 后来源有效，以及整页越过 EOF 的 `SIGBUS`。
-- Exec 文件测试要同时保留普通 fd 和 CLOEXEC fd：新映像应从普通 fd 的原 offset 继续读取，而 CLOEXEC fd 即使底层 close 需要重试也必须立即不可见；失败的 exec 则不能关闭任何 fd。
+- Exec 文件测试要同时保留普通 fd 和 CLOEXEC fd：新映像应从普通 fd 的原 offset 继续读取，而 CLOEXEC fd 即使底层 VFS/I/O close 需要后续处理也必须立即不可见；失败的 exec 则不能关闭任何 fd。
 - 根启动 fixture 应独立链接并写入磁盘，不能把 ELF 同时嵌入 kernel，否则无法证明 VFS 是生产数据来源。
 - QEMU 默认可能提供 legacy VirtIO MMIO；驱动和生产根盘必须分别验证默认 legacy 与显式 `virtio-mmio.force-legacy=false` 的 modern 路径。legacy 的 `GuestPageSize/QueueAlign/QueuePFN` 与 modern 的 64 位队列地址不能混用；开发板 transport 和 DMA 一致性必须重新验证，不能从 QEMU 行为外推。
 

@@ -23,13 +23,13 @@ Linux ABI 兼容是最终功能方向，不是对当前完成度的声明；READ
 | 能力组 | 已确认范围与依赖 | 当前状态 |
 |---|---|---|
 | 启动与内存 | DTB 内存/保留区和设备发现、启动布局、物理页分配、内核堆、RISC-V Sv39/4 KiB、direct map | RISC-V QEMU 已验证 |
-| 文件与根启动 | VirtIO MMIO version 1 legacy 与 version 2 modern、块读写 I/O（含子扇区 bounce RMW 与 VIRTIO_BLK_F_RO 只读协商）、lwext4 读写适配、VFS、文件页缓存及失效、可写/只读根挂载、source-backed ELF `/init`（ET_EXEC/ET_DYN/非递归 `PT_INTERP`） | RISC-V QEMU 已验证可写与只读真实入口；动态构造路径已接入，运行时重定位/TLS 证据待补 |
-| 进程与基础 syscall | `epoll_create1/epoll_ctl/epoll_pwait`、`mkdirat/unlinkat/ftruncate`、`openat/read/write/writev/close`、`pselect6/ppoll`、`lseek/fstat/newfstatat/getdents64`、`dup/dup3/fcntl`、`mmap/mprotect/munmap/brk`、`clone`（自定义子栈 + vfork 共享地址空间）/`execve`/`wait4`（rusage）/`exit_group`/`set_tid_address`、`times`、`sched_yield`、COW、阻塞 wait、zombie/reparent、`uname` | 已实现并按模块和真实根盘链路验证，覆盖仍是明确子集；内部 dup2 操作不代表 RISC-V 存在独立 dup2 syscall |
+| 文件与根启动 | VirtIO MMIO version 1 legacy 与 version 2 modern、块读写 I/O（含子扇区 bounce RMW 与 VIRTIO_BLK_F_RO 只读协商）、lwext4 读写适配、VFS、文件页缓存及失效、可写/只读根挂载、source-backed ELF `/init`（ET_EXEC/ET_DYN/非递归 `PT_INTERP`） | RISC-V QEMU 已验证可写与只读真实入口；未完成的 ext4 orphan 回收由 mount owner 保留，真实 I/O 清理错误有独立失败路径 |
+| 进程与基础 syscall | `epoll_create1/epoll_ctl/epoll_pwait`、`mkdirat/unlinkat/ftruncate`、`openat/read/write/writev/close`、`pselect6/ppoll`、`lseek/fstat/newfstatat/getdents64`、`dup/dup3/fcntl`、`mmap/mprotect/munmap/brk`、`clone`（自定义子栈、vfork 共享地址空间和线程资源共享）/`execve`/`wait4`（rusage）/`exit_group`/`set_tid_address`、`times`、`sched_yield`、COW、阻塞 wait、zombie/reparent、`uname` | 已实现并按模块和真实根盘链路验证，覆盖仍是明确子集；内部 dup2 操作不代表 RISC-V 存在独立 dup2 syscall |
 | 阻塞唤醒与时间 | 通用等待队列（事件通道 + deadline）、全局 blocked 链不变量、`clock_gettime/clock_getres/gettimeofday`（REALTIME/MONOTONIC）、`clock_nanosleep/nanosleep`、goldfish RTC 启动墙钟、console read 阻塞等待 UART 输入、标准信号驱动唤醒与按 syscall 分类的重启 | 已实现并经 scheduler 单测与 musl 真实睡眠/时钟/信号闭环验证；`times` 与每任务记账已落地，PLIC 驱动接收仍未实现 |
 | 目录枚举成本修正 | OFD 拥有可继续游标，保持独立 open、dup/fork 共享、cookie/seek、部分复制及关闭回收语义 | 已实现并由真实 ext4/QEMU 文件测试验证；当前线性适配器顺序条目访问为 O(N)，开发板吞吐基线待测，见[文件模块](modules/kernel-files.md#lseekfstatnewfstatat-与-getdents64) |
-| 用户态映像 | Linux 形态初始栈和 auxv、source-backed `ELF_PRIVATE` demand paging、`ET_EXEC`/`ET_DYN`/`PT_INTERP`、Sv39 ASLR/W^X/指令同步 | RISC-V 构造和静态入口已验证；动态链接器重定位、额外 DSO、TLS 和真实动态 libc 运行时待验证 |
+| 用户态映像 | Linux 形态初始栈和 auxv、source-backed `ELF_PRIVATE` demand paging、`ET_EXEC`/`ET_DYN`/`PT_INTERP`、Sv39 ASLR/W^X/指令同步 | RISC-V 构造和静态入口已验证；真实动态 musl PIE、解释器、额外 DSO、初始 TLS 和运行中 dlopen TLS 已由用户态入口验证，其他动态 libc/DSO 矩阵仍待补 |
 | 其他架构与平台 | LoongArch64 2K1000LA 的 16 KiB/三级页表；VisionFive 2 的 RISC-V 板级启动与设备/DMA 边界 | 目标已确认，开发板实机验证和 LoongArch 物化器尚未完成 |
-| 后续 Linux 能力组 | 动态链接完善、设备文件系统（devtmpfs）、软硬链接（linkat/symlinkat）、实时信号排队与 `sigaltstack`/signalfd、线程/共享资源（进一步扩展）、外部中断、SMP、异步脏页写回及更多设备 transport | 属于长期 ABI 路线，按真实用户程序和依赖推进，不能伪装成当前已支持 |
+| 后续 Linux 能力组 | 更广的动态 libc/DSO 兼容、设备文件系统（devtmpfs）、软硬链接（linkat/symlinkat）、实时信号排队与 `sigaltstack`/signalfd、线程组与共享资源的进一步扩展、外部中断、SMP、异步脏页写回及更多设备 transport | 属于长期 ABI 路线，按真实用户程序和依赖推进，不能伪装成当前已支持 |
 
 “所有 syscall”必须绑定架构、内核版本和功能范围；未实现或仅返回 `ENOSYS` 的调用不计作完成。官方测例、未特改用户程序和 LTP 用来发现缺口和防止回归，不反向定义内核的全部语义。
 
@@ -37,7 +37,7 @@ Linux ABI 兼容是最终功能方向，不是对当前完成度的声明；READ
 
 - `final-2025` 作为明年初赛沿用的规划假设，除非组委会正式公布，不写成已确认规则；`final-2026` 和本地保存的测例仓库用于观察今年真实负载与接口趋势。
 - QEMU、VisionFive 2 和 LoongArch 2K1000LA 的 RAM、DTB、MMIO、DMA 一致性和中断拓扑属于平台事实。通用 VFS、文件、ELF 和 syscall 语义不因平台复制；架构页表、trap、context 和设备后端在真实第二个实现点出现时隔离。
-- 当前只读 ext4、单 hart、单成员线程组、同步轮询和动态链接器运行时未完成是已记录的能力边界，不是长期目标的替代品。RISC-V source-backed `ET_EXEC`/`ET_DYN`、`PT_INTERP` 和 ASLR 构造已实现；动态 libc 的重定位、额外 DSO、TLS 仍未验证。边界内必须正确，扩展到共享 MM、SMP、写回或动态链接运行时前必须补齐相应同步、引用和失败协议。
+- 当前单 hart、同步轮询和动态兼容矩阵仍是已记录的边界，不是长期目标的替代品。RISC-V source-backed `ET_EXEC`/`ET_DYN`、`PT_INTERP`、ASLR 构造，以及真实动态 musl 的重定位、额外 DSO、TLS 入口已经验证；更广的动态 libc、共享 MM、SMP 和写回仍需补齐同步、引用和失败协议。可写与只读 ext4 都已有真实入口，分配器释放不变量错误按 fatal 处理，真实文件系统 I/O 清理错误才保留 owner。
 - 官方完整 Harness 在缺少 `kernel-la` 或其他未实现能力时可以阻塞；记录阻塞原因，不把预期缺口报告成已验证回归。
 
 ## 工程与资料边界

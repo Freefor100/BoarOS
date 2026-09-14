@@ -30,7 +30,7 @@ enum kernel_syscall_status kernel_syscall_dispatch(
 
 - `mkdirat` 编号为 34，创建目录；只读根挂载返回 `-EROFS`。
 - `unlinkat` 编号为 35，删除普通文件或目录（`AT_REMOVEDIR` 标志）；非空目录返回 `-ENOTEMPTY`，只读挂载返回 `-EROFS`。
-- `ftruncate` 编号为 46，调整可写常规文件的大小；非写模式打开或目录返回 `-EBADF`，只读挂载返回 `-EROFS`。
+- `ftruncate` 编号为 46，调整可写常规文件的大小；只读 descriptor 返回 `-EINVAL`，目录返回 `-EISDIR`，只读挂载返回 `-EROFS`。
 - `openat` 编号为 56，通过调用任务的 fs context 解析用户路径并在文件表分配最低可用 fd；支持常规文件读写打开与新建（`O_CREAT/O_EXCL/O_TRUNC/O_APPEND`），只读挂载拒绝写访问与修改性标志（返回 `-EROFS`）。准确 flags、路径和 errno 边界见[进程文件资源模块](kernel-files.md)。
 - `close` 编号为 57，从调用任务的文件表移除 fd；无效或已关闭 fd 返回 `-EBADF`。
 - `pipe2` 编号为 59，创建一对共享 64 KiB 环形缓冲的 read/write OFD；支持 `O_CLOEXEC` 与 `O_NONBLOCK`，成功返回两个最低可用 fd，表满或资源不足返回准确错误。读写、EOF、`EPIPE`/SIGPIPE 和 FIFO stat 形态见[进程文件资源模块](kernel-files.md)。

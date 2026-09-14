@@ -72,24 +72,22 @@ RISC-V direct map 使用固定公式 `VA = 0xffffffc000000000 + PA`，窗口大�
 EMPTY --init成功--> LIVE --move--> MOVED
   |                  |  \
   |                  |   +--destroy（非当前 root）--> DESTROYED
-  |                  +--分配后既无法访问也无法释放--> CLEANUP
-  +--根页发生同类失败-------------------------------> CLEANUP
-
-CLEANUP --move--> MOVED
-        +--destroy 重试成功--> DESTROYED
+  +--destroy（非当前 root）--------------------------> DESTROYED
 ```
 
-`CLEANUP` 表示对象曾因“页已经分配或取得引用，但立即释放也失败”进入只回收状态；它在正常页表树之外精确记录尚未挂入树的物理页引用，仅有脱离页、尚未形成根表的对象也使用同一状态。Sv39 单次操作自身最多产生一张脱离页；文件缺页调用者还可能同时归还一张缓存页或私有页，因此当前对象保存两个有明确来源上界的槽，而不是无界 cleanup 容器。`riscv_sv39_user_discard_owned_page()` 成功时立即释放调用者的页引用，失败时把引用转交给这些槽。重试 destroy 先逐个释放脱离引用，随后回收正常树；状态保持 CLEANUP，直至整棵树销毁完成。此状态不能继续 lookup、map、生成 `satp` 或交给 scheduler，只能 move 或重试 destroy。
-
-`move` 成功才转移全部所有权，包括待回收页。`destroy` 先重试待回收页，再按 active/protected/retired 叶子、Level 0、Level 1、根表的后序顺序释放正常树；当前 `satp` 指向该根时拒绝销毁。普通释放错误会保留仍存在的表项与精确计数，`CLEANUP` 回收失败则保留待回收页记录，二者都可重试。根物理地址可以为 0，因此是否存在正常树由 `table_pages` 判断，不能由 `root_address != 0` 推断。
+Sv39 不为物理页释放失败保留 `CLEANUP` owner。`move` 成功转移整棵 LIVE 页表树，
+`destroy` 在当前 `satp` 未指向该根时按叶子、Level 0、Level 1、根表的后序顺序释放；
+释放调用完成后对象进入 DESTROYED。分配器检测到非法页、引用或元数据时直接 fatal trap。
+根物理地址可以为 0，因此是否存在正常树由 `table_pages` 判断，不能由 `root_address != 0`
+推断。
 
 `riscv_sv39_user_space_satp()` 只为 LIVE 对象生成 `MODE=8, ASID=0, PPN=root`；`riscv_sv39_switch_satp()` 只接受 Bare 或 Sv39 ASID 0，并在根切换前后执行全局 `SFENCE.VMA`。scheduler 在修改 ready/current 状态之前完成切根。运行期 demand-zero、file-private 或 COW fault 成功更新当前 MM 的单页 PTE 后执行 `SFENCE.VMA fault_va, zero`，只失效本 hart 上该 VA 的 ASID 0 翻译；新填充或复制到执行映射的页面还执行 `FENCE.I`。当前没有 ASID 分配或 SMP 远端 shootdown。
 
-`riscv_sv39_user_unmap_owned_range()` 只处理对齐的 4 KiB 用户范围。调用方先证明目标就是本 hart 当前活动 MM；walker 预检覆盖范围中已有的页表分支、表项形态、物理页可访问性和 active/protected/retired 计数，输入或状态错误在写 PTE 前返回。提交时把 active 和 protected owner 改写为 `V=0`、RSW bit 8 标记且保留 PPN 的 retired PTE，再执行一次本地全局 `SFENCE.VMA`。只有硬件不可能再使用旧翻译后才释放物理页并清零 PTE，从而避免把已归还页框继续暴露给用户。
+`riscv_sv39_user_unmap_owned_range()` 只处理对齐的 4 KiB 用户范围。调用方先证明目标就是本 hart 当前活动 MM；walker 预检覆盖范围中已有的页表分支、表项形态、物理页可访问性和 active/protected 计数，输入或状态错误在写 PTE 前返回。提交时先把 active 和 protected owner 暂时改为 `V=0` 的软件 PTE，再执行一次本地全局 `SFENCE.VMA`，随后立即释放物理页并清零 PTE。函数返回时不保留临时 invalid PTE、页计数或回收接口；释放不变量错误直接 fatal。
 
-物理页释放失败时 retired PTE 保持 invalid，因此用户 lookup 观察为未映射，fork 跳过它，但地址空间仍保有该 PPN 的唯一 owner。`riscv_sv39_user_reclaim_retired_range()` 供后续 heap 增长重试；destroy 也识别并回收 retired 叶子。运行期不回收变空的 Level 0/Level 1 表，它们保留到 MM 销毁，以避免在 shrink 提交中增加中间表释放失败与回挂协议。连续高水位每 2 MiB 至多保留一张 4 KiB Level 0 表，约为虚拟跨度的 0.2%；极稀疏触页时相对实际驻留数据的比例会更高。
+运行期不回收变空的 Level 0/Level 1 表，它们保留到 MM 销毁，以避免在 shrink 提交中增加中间表的额外遍历。连续高水位每 2 MiB 至多保留一张 4 KiB Level 0 表，约为虚拟跨度的 0.2%；极稀疏触页时相对实际驻留数据的比例会更高。
 
-`riscv_sv39_user_protect_owned_range()` 原地改变已有 owner 的权限，缺页和 retired PTE 保持不变。非零权限重建同一 PPN 的 U-mode leaf；切换到 `PROT_NONE` 时使用 RSW bit 9 建立 `V=0` 的 protected PTE，并用 bit 8 继续区分 COW。protected 与 retired 都对硬件无效，但前者保留内容及 exclusive/COW 属性并可恢复，后者只等待释放；二者有独立计数且不能混用。恢复执行权限前先执行 `FENCE.I`，任何实际 PTE 变化后执行本地全局 `SFENCE.VMA`。fork 为 active/protected owner 增加物理页引用并在父子页表保持相同 COW 关系；unmap 和 destroy 都释放自己持有的一份引用。
+`riscv_sv39_user_protect_owned_range()` 原地改变已有 owner 的权限。非零权限重建同一 PPN 的 U-mode leaf；切换到 `PROT_NONE` 时使用 RSW bit 9 建立 `V=0` 的 protected PTE，并用 bit 8 继续区分 COW。protected owner 保留内容及 exclusive/COW 属性并可恢复，不能与 unmap 的瞬时 invalid PTE 混用。恢复执行权限前先执行 `FENCE.I`，任何实际 PTE 变化后执行本地全局 `SFENCE.VMA`。fork 为 active/protected owner 增加物理页引用并在父子页表保持相同 COW 关系；unmap 和 destroy 都释放自己持有的一份引用。
 
 `riscv_sv39_user_space_fork()` 使用“两阶段子构造—父提交”。它先建立完整子树、逐页 acquire 并记录需要把父可写页转成 COW 的位置；任何分配/acquire 失败只销毁子 owner，父页表保持原样。子空间全部成功后，提交阶段不再分配，只修改父 PTE、更新计数并执行全局本地 `SFENCE.VMA`。这保证普通 fork 的失败原子性，同时把页面内容复制推迟到父或子真正写入时。
 
@@ -110,6 +108,6 @@ make test-mmap-riscv
 make test-riscv
 ```
 
-聚焦建表测试除启动 PTE、规模和失败语义外，还检查用户根高半区借用、U 页权限、零页/COW 映射、fork 父提交失败原子性、复制与末引用原地恢复、owned-range 参数失败不变、实际撤销/释放、跨页离线填充、用户地址半开区间、数值为 0 的合法用户根地址、lookup、move、活动根销毁拒绝、后序回收、OOM 回滚、`satp` 编码和失败输出不变。VMA/mmap 用例覆盖 protected COW 保持、fixed replace、unmap 与 retired 释放失败；真实 U-mode mmap 还覆盖匿名和 ext4 文件私有映射、EOF/SIGBUS。
+聚焦建表测试除启动 PTE、规模和失败语义外，还检查用户根高半区借用、U 页权限、零页/COW 映射、fork 父提交失败原子性、复制与末引用原地恢复、owned-range 参数失败不变、实际撤销/释放、跨页离线填充、用户地址半开区间、数值为 0 的合法用户根地址、lookup、move、活动根销毁拒绝、后序回收、OOM 回滚、`satp` 编码和失败输出不变。VMA/mmap 用例覆盖 protected COW 保持、fixed replace 和 unmap 的 PTE—fence—release 顺序；真实 U-mode mmap 还覆盖匿名和 ext4 文件私有映射、EOF/SIGBUS。非法释放由 allocator fatal-path 测试覆盖。
 
 当前未实现 1 GiB 叶子、`MAP_SHARED` 写共享、ASID 分配和 SMP TLB shootdown。按需提交用于匿名栈、`brk` heap、private-anonymous mmap 和只读普通文件的 private mapping，用户映射固定为 4 KiB；运行期改权/撤销/COW 要求当前单 hart 活动 MM。direct map 只映射 DTB 报告的第一段 RAM，不包含 MMIO，也不放宽内核 text/rodata 的别名权限。

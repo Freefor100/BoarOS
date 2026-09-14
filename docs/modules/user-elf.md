@@ -30,7 +30,7 @@ enum kernel_elf64_status kernel_elf64_open_cached(
 
 ## 不可变 ELF source
 
-`kernel_elf64_source_create()` 接收一个已打开的 regular-file OFD 和当前架构 machine，成功后消费调用者的 OFD owner；失败仍由调用者持有。source 保存 header、program headers、唯一的绝对 `PT_INTERP` 路径和按虚拟页排序、无重叠的 FILE/ZERO/COMPOSITE runs。source 具备 `create/acquire/release` 引用协议；最后一个 release 按 file、解释器字符串、临时边界、run/table allocation 的顺序清理。任一释放失败都会保持 `CLEANUP` owner，可由后续路径重试。
+`kernel_elf64_source_create()` 接收一个已打开的 regular-file OFD 和当前架构 machine，成功后消费调用者的 OFD owner；失败仍由调用者持有。source 保存 header、program headers、唯一的绝对 `PT_INTERP` 路径和按虚拟页排序、无重叠的 FILE/ZERO/COMPOSITE runs。source 具备 `create/acquire/release` 引用协议；最后一个 release 按 file、解释器字符串、临时边界、run/table allocation 的顺序清理。真实 VFS/I/O 清理失败保持 source/OFD owner；物理页与堆的合法释放完成即返回，分配器不变量错误进入 fatal。
 
 `kernel_elf64_source_page(source, allocator, offset, ...)` 以 source-relative、页对齐 offset 查找区间并二分定位：
 
@@ -38,7 +38,7 @@ enum kernel_elf64_status kernel_elf64_open_cached(
 - 文件/BSS 边界页或页内多段贡献分配私有页，先清零，再精确读取文件字节；
 - 纯 BSS 页按需分配并保持全零。
 
-物理页分配后若解析、读取或立即释放失败，source 保留一个可重试的页 owner；不会让悬空物理页或无 owner 的 PTE 进入系统。缺页 I/O 在 MM 层转为用户 `SIGBUS`，物理耗尽转为用户资源失败；source/OFD/heap 的清理失败不覆盖原始格式或 I/O 结果。
+物理页分配后若解析或读取失败，source 先释放临时页再返回原始错误；合法释放不会产生重试状态。缺页 I/O 在 MM 层转为用户 `SIGBUS`，物理耗尽转为用户资源失败；source/OFD 的真实 VFS/I/O 清理错误不覆盖原始格式或 I/O 结果。
 
 ## RISC-V 映像与 ELF 形态
 
@@ -64,7 +64,7 @@ DTB `/chosen/rng-seed` 至少 32 字节时，`kernel/random.c` 以 ChaCha20 产�
 
 ## 所有权和验证
 
-source、临时映像和 MM 的所有权按 exec 事务分层：事务持有创建期 source/OFD，MM 持有 VMA 所需 source 引用，提交成功后事务释放临时 owner。任何失败都先保留原 MM；新 MM 或 source 清理失败进入可重试 owner，不能返回“已清理”而丢失资源。
+source、临时映像和 MM 的所有权按 exec 事务分层：事务持有创建期 source/OFD，MM 持有 VMA 所需 source 引用，提交成功后事务释放临时 owner。任何失败都先保留原 MM；新 MM 的合法页表/堆释放完成即结束，只有 source/OFD 的真实 VFS/I/O 清理错误进入持久 owner，不能返回“已清理”而丢失资源。
 
 ```sh
 make test-elf64-riscv

@@ -15,7 +15,9 @@
 - 零长度分配成功并返回空指针；释放空指针成功。
 - calloc 在乘法溢出时返回 `OVERFLOW`，不修改输出。
 - resize 在原容量足够时原地成功；扩容先取得新对象并复制，失败保留旧对象和输出。
-- slab bitmap 区分有效释放、内部地址、非本堆页和 double free；底层页释放失败时恢复 slab 链、bitmap 与计数。
+- slab bitmap 区分有效释放、内部地址、非本堆页和 double free；底层物理页释放属于
+  已建立的 owner 协议，释放完成后同步更新 slab 链、bitmap 与计数。检测到堆或页
+  分配器不变量损坏时直接 fatal trap，不把释放失败转成重试状态。
 - 统计记录调用、失败、活对象、当前页与峰值页。它用于资源回收检查，不等同于按调用点或大小分布的性能 profiler。
 
 当前实现针对单 hart 启动和文件系统路径，没有锁与 per-CPU cache。size-class 热路径是一次链首访问、slot 链更新和 bitmap 更新；新建/回收 slab 或大对象才进入 buddy。引入 SMP 后必须先定义锁边界，再由争用与缓存基准决定是否增加 per-CPU magazine。

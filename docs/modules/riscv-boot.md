@@ -38,7 +38,7 @@
 
 ## 当前限制
 
-当前代码只处理单 hart、QEMU `virt` UART、固定高半区内核 VMA、最终 high/direct RAM 映射、S/U-mode 整数 Trap Frame、第一段 DTB RAM、SBI timer/100 Hz tick、FIFO 内核/用户任务，以及 raw whole-disk 只读 ext4。生产 ELF 入口支持 source-backed `ET_EXEC`/`ET_DYN`/非递归 `PT_INTERP` 的 RISC-V 映像构造；真实静态 `/init` 已验证，动态重定位、额外 DSO、TLS 和运行时消费者仍待完成。QEMU ELF 的物理装载地址仍固定为 `0x80200000`；VisionFive 2 的装载地址、固件入口和存储后端必须在板级适配时单独提供，不能直接沿用平台常量。外部中断、通用文件 syscall、完整进程、SMP 或 LoongArch64 尚未实现。
+当前代码只处理单 hart、QEMU `virt` UART、固定高半区内核 VMA、最终 high/direct RAM 映射、S/U-mode 整数 Trap Frame、第一段 DTB RAM、SBI timer/100 Hz tick、FIFO 内核/用户任务，以及 raw whole-disk ext4（按设备能力读写或只读）。生产 ELF 入口支持 source-backed `ET_EXEC`/`ET_DYN`/非递归 `PT_INTERP` 的 RISC-V 映像构造；真实静态与动态 musl 入口、额外 DSO 和 TLS 已验证，更多动态 libc/DSO 负载仍待补齐。QEMU ELF 的物理装载地址仍固定为 `0x80200000`；VisionFive 2 的装载地址、固件入口和存储后端必须在板级适配时单独提供，不能直接沿用平台常量。外部中断、通用文件 syscall、完整进程、SMP 或 LoongArch64 尚未实现。
 
 ## 验证入口
 

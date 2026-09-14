@@ -8,7 +8,7 @@
 |---|---|
 | `include/kernel/page.h` | 从构建目标导出页大小和掩码 |
 | `include/kernel/physical_page.h`、`kernel/physical_page.c` | 管理显式分配器对象、bootstrap→buddy 状态迁移、单页共享引用、连续页所有权、压力回收入口和计数 |
-| `tests/riscv/physical_page_cases.c` | 验证 bootstrap 兼容、buddy split/coalesce、状态分区和失败不变量 |
+| `tests/riscv/physical_page_cases.c` | 验证 bootstrap 兼容、buddy split/coalesce、所有权状态和耗尽语义 |
 | `tests/riscv/physical_page_main.c`、`tests/page-riscv.sh` | 构建并运行独立的 QEMU 聚焦测试内核 |
 
 RISC-V64 构建固定 `BOAROS_PAGE_SHIFT=12`。初始化把每个字节粒度可用区间
@@ -38,16 +38,18 @@ finalize 只允许成功一次；访问函数未绑定或重复调用返回
 
 finalized 后，`physical_page_allocate_order(order)` 分配 `2^order` 个物理连续且按总
 字节数自然对齐的页，`physical_page_release_order()` 要求地址、head 和原 order 完全
-匹配。wrong-order、allocated tail、internal、越界和非对齐地址返回 `INVALID`；任何
-已空闲 head/tail 再释放返回 `DOUBLE_FREE`。现有 `physical_page_allocate/release`
-签名保持不变，在 finalized 模式委托给 order 0，因此 Sv39、MM 和 scheduler 不需要
-识别分配器模式。失败不改写分配输出或 `available_pages`。
+匹配。wrong-order、allocated tail、internal、越界、非对齐地址和已经释放的 head/tail
+都是分配器不变量错误，直接触发 fatal trap；不会把释放失败变成可重试状态。现有
+`physical_page_allocate/release` 签名保持不变，在 finalized 模式委托给 order 0，因此
+Sv39、MM 和 scheduler 不需要识别分配器模式。分配耗尽仍返回 `EMPTY`，分配调用不会
+修改输出或 `available_pages`。
 
 finalized 的 order-0 页可用 `physical_page_acquire()` 增加 32 位引用，
 `physical_page_release()` 只在末引用消失时把页归还 buddy；
 `physical_page_reference_count()` 供 COW 和缓存回收判断共享状态。高阶块仍是单 owner，
 不能通过单页 acquire 拆分引用，避免让连续分配的 tail 生命周期失去统一边界。引用达到
-`UINT32_MAX`、对 free/internal/tail 操作或在 bootstrap 阶段 acquire 都会失败且不改变状态。
+`UINT32_MAX`、对 free/internal/tail 操作或在 bootstrap 阶段 acquire 都是
+不变量错误并触发 fatal trap；合法 acquire/release 只改变引用和最终可用页计数。
 
 分配器还允许注册一个压力回收回调。一次 buddy 分配返回 `EMPTY` 时，若当前不在回调中，
 分配器以所需页数调用回收器并只重试一次；递归抑制防止回收器内部的堆/页分配再次进入自身。
@@ -76,7 +78,8 @@ resolve 能精确判定所有权，分配或释放 order N 块还会更新本次
 内存充足时不会调用回收器；只有首次分配失败才扫描缓存。当前单 hart 不需要锁，SMP
 接入前必须把 free-list、引用数、回收器注册和计数纳入同一同步边界。
 
-绑定前只允许顺序发放从未释放过的页；释放返回 `PHYSICAL_PAGE_STATUS_STATE`。
+绑定前只允许顺序发放从未释放过的页；合法 bootstrap 释放完成即返回。越界、重复或
+不属于当前 owner 的释放触发 fatal trap。
 显式 order API 只对 finalized 分配器开放，bootstrap 调用返回 `STATE`。
 
 RISC-V 启动路径先以未绑定状态顺序分配最终页表页；高半区和最终 Sv39 根激活后才
@@ -98,11 +101,11 @@ make test-page-riscv
 make test-riscv
 ```
 
-聚焦测试保留原有区间、耗尽、绑定、映射和失败输出契约，并新增 bootstrap owner/
-recycled/tail 导入、metadata 扣除、order 对齐、强制 split 与多级 coalesce、wrong
-order、interior/internal/outside/double-free 状态树、finalize 失败保留，以及 finalized
-resolve 拒绝空闲页。测试还覆盖 order-0 多引用、末引用归还、非法 acquire、引用溢出、
-单次压力回收重试和递归抑制。完整启动测试在 512 MiB、1 GiB 和 16 GiB QEMU 配置下通过
-direct map 执行分配—解析—释放—再分配，并精确要求
+聚焦测试保留原有区间、耗尽、绑定、映射和失败输出契约，并覆盖 bootstrap owner/
+recycled/tail 导入、metadata 扣除、order 对齐、强制 split 与多级 coalesce、finalize
+失败保留，以及 finalized resolve 拒绝空闲页。测试还覆盖 order-0 多引用、末引用归还、
+合法 owner 的释放和压力回收的单次重试；非法释放由独立 fatal-path 测试验证，不再注入
+人工释放失败。完整启动测试在 512 MiB、1 GiB 和 16 GiB QEMU 配置下通过 direct map
+执行分配—解析—释放—再分配，并精确要求
 `total - available == Sv39 table_pages + metadata_pages`；生产 idle 测试还要求 buddy
 模式在 timer 启动前已经生效。

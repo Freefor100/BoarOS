@@ -22,7 +22,7 @@ VFS 为每个已解析普通文件维护引用计数 node；独立 open file des
 
 miss 路径先分配并清零页，再通过 node 的无 offset 副作用 `pread` 填充，记录尾页有效字节数。读取整个越过 EOF 的页返回 `OUT_OF_RANGE`，尾页剩余字节保持为零。物理页分配器只有一个压力回收槽，当前由该缓存注册；分配首次耗尽时从 LRU 尾部扫描，仅驱逐引用数为 1 的未固定页，然后由分配器重试一次。被用户映射或正由 read 使用的页引用数大于 1，不会被回收。
 
-缓存销毁和 mount 卸载有严格顺序：先释放所有进程 MM 和临时读者，再 purge 该 mount 的缓存项、关闭最后的 node，之后才允许 lwext4 unmount；缓存最后注销 reclaimer 并释放哈希表。页/node/堆对象释放失败进入各自 cleanup 链，后续 destroy 重试而不重新发布已经驱逐的项。
+缓存销毁和 mount 卸载有严格顺序：先释放所有进程 MM 和临时读者，再 purge 该 mount 的缓存项、关闭最后的 node，之后才允许 lwext4 unmount；缓存最后注销 reclaimer 并释放哈希表。物理页和堆对象的合法释放完成即返回，分配器不变量错误进入 fatal；只有真实 ext4/block I/O 清理错误保留 mount owner。
 
 ## lwext4 配置和生命周期
 
@@ -32,12 +32,12 @@ miss 路径先分配并清零页，再通过 node 的无 offset 副作用 `pread
 普通文件打开走 `ext4_fopen`，新建走 `ext4_fopen2`（`kernel_vfs_create`），目录打开走专有的 `ext4_dir_open_file` 直接绑定 `node->file`，免去在内核任务栈上分配 304 字节的完整 `ext4_dir` 结构。
 普通文件随机写入通过 `kernel_vfs_pwrite`（`ext4_fseek` + `ext4_fwrite`）执行，追加写入通过 `kernel_vfs_append` 在底层原子解析当前 EOF 并写入，确保 `O_APPEND` 的原子推进；截断通过 `kernel_vfs_ftruncate` 执行，向下截断调用 `ext4_ftruncate`，向上截断通过连续写零填充至目标长度（符合 POSIX 语义）。
 目录操作中，`kernel_vfs_mkdir` 调用 `ext4_dir_mk`；`kernel_vfs_unlink` 实现了真正的 Linux `unlink`-but-open 语义：
-- `kernel_vfs_unlink` 调用 `ext4_funlink_dentry` 从父目录中立即移除目标目录项，后续对原路径的 `open` 立即返回 `-ENOENT`，并在同名路径重新创建时分配独立全新 inode；
+- `kernel_vfs_unlink` 在需要时先从挂载的 orphan 记录池预留一个回收记录，再调用 `ext4_funlink_dentry` 从父目录中立即移除目标目录项；后续对原路径的 `open` 立即返回 `-ENOENT`，并在同名路径重新创建时分配独立全新 inode。没有现存 node 的文件也使用这份预留记录，因而 orphan 回收失败时由 mount 单独持有。
 - 若目标文件当前仍处于打开状态（`node->open_files > 0`），VFS 标记 `node->unlinked = 1`，旧 open 描述符（包括只读/读写 OFD 以及正在运行的源映射 ELF 可执行文件）保留底层 inode 数据与有效物理块，继续正常执行 `read/write/fstat` 与缺页加载（demand fault）；
-- 只有当最后一个打开描述符与执行租约释放（`node->open_files == 0 && node->exec_users == 0`）时，VFS 才通过专有的 `kernel_vfs_try_release_orphan` 驱动物理存储释放。该过程先持有临时节点引用并安全使页缓存失效，再在扁平调用栈上调用 `ext4_orphan_free` 截断释放底层 inode，最后标记 `node->orphan_freed = 1`。通用的 `kernel_vfs_node_release` 仅负责内存节点对象的生命周期，绝不隐式或嵌套调用 `ext4_orphan_free`，从根源消除双重释放与页缓存深度嵌套破坏 4 KiB 任务栈的风险；若底层释放失败，节点转移至 `adapter->cleanup_nodes` 保留重试所有权。若文件在 unlink 时未处于打开状态，则立即在顶层栈帧截断释放。
+- 只有当最后一个打开描述符与执行租约释放（`node->open_files == 0 && node->exec_users == 0`）时，VFS 才通过专有的 `kernel_vfs_try_release_orphan` 驱动物理存储释放。该过程先持有临时节点引用并安全使页缓存失效，再在扁平调用栈上调用 `ext4_orphan_free` 截断释放底层 inode，最后标记 `node->orphan_freed = 1`。通用的 `kernel_vfs_node_release` 仅负责内存节点对象的生命周期，绝不隐式或嵌套调用 `ext4_orphan_free`，从根源消除双重释放与页缓存深度嵌套破坏 4 KiB 任务栈的风险；若底层释放失败，节点转移至 `adapter->cleanup_nodes`，由 mount 保留唯一重试 owner，绝不重新指向 file。若文件在 unlink 时没有现存 node，则使用预留记录直接调用 orphan free；失败后记录留在 mount 链，路径仍保持已删除。
 由于 lwext4 的 `ext4_dir_rm` 会递归删除非空目录，`kernel_vfs_rmdir` 将目录判空逻辑隔离在独立辅助函数 `check_directory_empty` 中（遍历目录项跳过 `.` 和 `..`，存在子条目返回 `-ENOTEMPTY`），使 304 字节的 `ext4_dir` 栈帧在调用 `ext4_dir_rm` 之前及时退栈，保证深层递归删除时调用栈扁平受控。
 只读挂载下，所有上述修改操作直接返回 `-EROFS`。
-unmount 在仍有 open file 时返回 `-EBUSY`。close/unmount 的底层释放失败保留 CLEANUP 状态，调用者可以重试而不会重复关闭或丢失 heap owner。
+unmount 在仍有 open file 时返回 `-EBUSY`。close/unmount 的真实 ext4/block I/O 释放失败保留 CLEANUP 状态，mount 或所属文件表可重试而不会重复关闭；合法 heap/page 释放不返回可重试状态。
 
 当前 VFS 同时服务 ELF 随机读、进程文件表（支持读写与目录修改）和文件私有缺页，但仍不是完整 Linux VFS：没有通用 inode/dentry cache、路径权限、symlink、writeback、read-ahead、并发锁或多挂载。目录支持打开与按后端 cookie 查询（`kernel_vfs_dir_entry`），会返回真实的 `.`/`..` 条目；每次查询从传入的 ext4 字节位置开始，而不是从目录起点重走，顺序枚举的条目访问为 O(N)。适配层把 lwext4 的正 errno 与 EOF 分开，再向文件资源层返回负 Linux errno。页缓存只保存普通文件内容；进程层只持有 VFS mount/file 抽象，lwext4 handle 没有泄露到 task 或 syscall ABI。
 
@@ -65,4 +65,4 @@ make test-exec-riscv
 make test-root-init-riscv
 ```
 
-宿主测试核对 lwext4 metadata checksum seed。QEMU 测试建立真实 ext4 镜像，验证 `/init` mode、目录预检、随机偏移、EOF、`-ENOENT`、open-file `-EBUSY`、dirty-journal `-EUCLEAN`、缓存 miss/hit/LRU/pin、压力回收、mount purge 和全部页回收。文件资源测试证明不同 fd 与 mmap 共用 node/cache 而保持各自 offset；生产测试既用 VFS read source 装载磁盘中的静态 ELF，也由同一 source-backed 入口构造动态形态（动态链接器消费者尚未纳入），并由 PID 1 通过 syscall 读取和私有映射普通文件。
+宿主测试核对 lwext4 metadata checksum seed。QEMU 测试建立真实 ext4 镜像，验证 `/init` mode、目录预检、随机偏移、EOF、`-ENOENT`、open-file `-EBUSY`、dirty-journal `-EUCLEAN`、缓存 miss/hit/LRU/pin、压力回收、mount purge 和全部页回收；VFS runner 注入一次 orphan free 失败，覆盖仍有打开 fd 与无现存 node 两条路径，确认路径不复现、mount 只保留一个 owner、重试后可卸载。文件资源测试证明不同 fd 与 mmap 共用 node/cache 而保持各自 offset；生产测试由静态和动态 musl 入口通过 VFS read source 读取真实根盘。

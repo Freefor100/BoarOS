@@ -38,7 +38,7 @@ BoarOS 为每个用户任务建立独立的 Sv39 根页表。低半区包含该�
 
 BoarOS 的通用 `kernel_mm` 是可 acquire/move/release 的引用，RISC-V 用一个 4 KiB 记录页保存引用计数和唯一 Sv39 owner。生产 scheduler task 还持有一张 fd 表和一个 fs context，以及自己的 TID 和组首关系，并缓存切换所需 `satp`。这些资源有独立对象和借用接口；切换本身直接使用缓存，不在 tick 路径解析记录页或执行 files/fs 生命周期。当前测试中的两个独立线程组已共享一个 MM，未来更换 LoongArch 后端也不改变 RISC-V switch context 汇编前缀。
 
-所有权转移必须是成功才发生：ELF 装载器先产出 LIVE Sv39 地址空间，MM 创建成功后把它变成 MOVED，用户任务创建成功后再把 MM 句柄变成 MOVED。共享时 `acquire` 只增加引用，最后一份 `release` 才销毁页表树。若记录页已经分配，但访问和立即释放同时失败，CLEANUP 句柄仍精确记住这张页；若地址空间已销毁而记录页释放失败，也只重试最后一页。状态化 owner 比“返回错误码并让调用者猜哪些资源已经释放”更适合内核错误路径。
+所有权转移必须是成功才发生：ELF 装载器先产出 LIVE Sv39 地址空间，MM 创建成功后把它变成 MOVED，用户任务创建成功后再把 MM 句柄变成 MOVED。共享时 `acquire` 只增加引用，最后一份 `release` 才销毁页表树。物理页和堆释放遵循 fail-stop 契约，非法 owner、引用或 allocator metadata 直接 fatal，不把释放失败包装成跨层 CLEANUP；真实 VFS/block I/O 错误才由所属 owner 延后处理。状态化 owner 仍用于表达确有外部资源未完成的生命周期。
 
 ## Linux 风格 RISC-V 系统调用 ABI
 
@@ -74,7 +74,7 @@ BoarOS 当前逐基页调用 `kernel_mm_lookup()`，按复制方向检查 `USER|
 
 ## 当前项目选择与平台边界
 
-BoarOS 先用手工映射探针验证首次 `SRET`、真实 timer 抢占、U-mode syscall、同步页故障、调度恢复和完整资源回收，再用独立链接的静态 ELF 验证装载器产出的代码、数据、BSS 和 Linux 形态的 `argc/argv/envp/auxv` 初始栈。生产路径进一步从 DTB 发现的 VirtIO 块设备只读挂载 ext4，以精确随机读构造 source-backed `ET_EXEC`/`ET_DYN`/`PT_INTERP` 映像；静态 `/init` 已实际进入 U-mode，动态形态目前验证到 source、VMA、布局和初始栈构造，动态重定位/DSO/TLS 消费者仍待完成。PID 1 通过文件描述符读取同一根上的普通文件，再连续 exec 两个独立静态 ELF，并验证 `brk` heap、普通 clone/wait/reparent，最后沿 exec/files/fs/MM/TID/task 顺序释放全部资源。当前 TID/TGID 仍只有单成员线程组；具备普通进程 clone 不等于已经实现多线程 exec 收拢或 Linux 的通用资源共享规则。`make test-userland-riscv` 进一步以静态 musl 程序作为 PID 1 运行：stdio（musl 用 writev 发出缓冲内容，非 tty 的 stdout 全缓冲并在 exit 时刷新）、`readdir`、`read/lseek/fstat`、`dup`、F/D 浮点抢占、signal handler/sigreturn、可中断 nanosleep 和 pipe，这是编译器生成的真实用户程序入口。用户产物由 `musl-gcc` specs 提供 musl 头文件、启动对象和库搜索路径；链接命令不能再把交叉工具链的 glibc sysroot 通过 `-L` 放到它之前，否则会生成启动对象和 libc 来源混杂、但仍可能成功链接的错误 ELF。
+BoarOS 先用手工映射探针验证首次 `SRET`、真实 timer 抢占、U-mode syscall、同步页故障、调度恢复和完整资源回收，再用独立链接的静态 ELF 验证装载器产出的代码、数据、BSS 和 Linux 形态的 `argc/argv/envp/auxv` 初始栈。生产路径进一步从 DTB 发现的 VirtIO 块设备按能力读写或只读挂载 ext4，以精确随机读构造 source-backed `ET_EXEC`/`ET_DYN`/`PT_INTERP` 映像；静态 `/init` 与动态 musl PIE、解释器、额外 DSO、TLS 已实际进入 U-mode，动态重定位由用户态链接器完成。PID 1 通过文件描述符读取同一根上的普通文件，再连续 exec 两个独立静态 ELF，并验证 `brk` heap、普通 clone/wait/reparent，最后沿 exec/files/fs/MM/TID/task 顺序释放全部资源。当前 TID/TGID 仍只有单成员线程组；具备普通进程 clone 不等于已经实现多线程 exec 收拢或 Linux 的通用资源共享规则。`make test-userland-riscv` 进一步以静态和动态 musl 程序作为 PID 1 运行 stdio、readdir、read/lseek/fstat、dup、F/D 浮点抢占、signal handler/sigreturn、可中断 nanosleep、pipe、pthread、TLS 和 dlopen，这是编译器生成用户程序入口。用户产物由 `musl-gcc` specs 提供 musl 头文件、启动对象和库搜索路径；链接命令不能再把交叉工具链的 glibc sysroot 通过 `-L` 放到它之前，否则会生成启动对象和 libc 来源混杂、但仍可能成功链接的错误 ELF。
 
 静态 musl 启动阶段对内核的 ABI 依赖很小：`set_tid_address`（`__init_libc` 记录 clear_tid）、`brk`、`mmap`/`mprotect`、stdio 的 `write/writev`、退出时的 `exit_group`；运行 signal/pipe 测试时还会调用 `rt_sigaction/rt_sigprocmask/rt_sigreturn`、`nanosleep`/`restart_syscall` 和 `pipe2`。`AT_RANDOM` 缺失时 musl 使用固定栈保护常量，不要求熵源；`isatty` 经 `ioctl` 返回 `ENOSYS` 后按非 tty 处理（stdout 全缓冲）。这些是编译器生成用户程序与手写汇编探针的本质差异：程序依赖 libc 启动序列，而 libc 依赖一小组必须真实可用的 syscall。
 
@@ -88,8 +88,7 @@ Sv39、`satp`、`sscratch`、Trap Frame 和 RISC-V syscall 寄存器约定属于
 - ELF 集成测试应嵌入完整链接产物并经生产解析器装载；直接复制测试汇编字节只能验证 U-mode 路径，不能验证 ELF program header、BSS 或页权限物化。
 - Exec 集成测试应让旧程序先填充所有 callee-saved 寄存器和 `tp`，再由新程序检查它们没有泄漏；同时用跨映像 fd offset、CLOEXEC 和 PID/TID 检查“替换映像但保留进程身份”的边界。
 - 内核 worker 在用户任务被抢占后检查 `sscratch=0`，能发现入口忘记清 scratch 导致后续 S-mode trap 误判来源。
-- 创建失败测试既要检查返回错误，也要检查地址空间或 MM owner 仍在调用者手中；记录页访问和释放同时失败时要验证 CLEANUP 可移动并可重试。回收测试比较开始和结束的物理空闲页数，覆盖叶子页、各级页表、MM 记录页和任务页，并验证 TID 可重新分配。
-- “立即释放失败”不能只返回错误码：若新任务页尚未挂入任何队列，scheduler 必须先保存其物理地址，并在清理成功前禁止下一次创建覆盖该 owner。退出回收也要分别在页表、MM 记录页和任务页处注入失败，检查完成记录尚未发布且重试从准确阶段继续。
+- 创建失败测试既要检查返回错误，也要检查地址空间或 MM owner 仍在调用者手中；回收测试比较开始和结束的物理空闲页数，覆盖叶子页、各级页表、MM 记录页和任务页，并验证 TID 可重新分配。非法 allocator 释放由 fatal-path 测试覆盖，真实 ext4/block I/O 失败则检查所属 owner 的有限重试。
 - 汇编返回路径应检查最终 ELF 反汇编。符号可能被链接器拆成多个范围，只截取入口符号容易漏掉公共 return 路径。
 - fatal 测试要在用户根仍为当前 `satp` 时破坏返回凭据，确认 supervisor-only 高半区 UART 能打印诊断并关机；等任务回到内核根后再测试无法发现低地址设备映射缺失。
 

@@ -50,7 +50,7 @@ enum kernel_mm_status kernel_mm_mprotect(
 
 ```text
 prepare: 校验范围/覆盖条件，只为确实需要的拆分或插入预留 descriptor 容量
-page table commit: 修改 PTE、刷新 TLB，并保留失败时的物理页 owner
+page table commit: 修改 PTE、刷新 TLB，然后完成物理页释放
 VMA commit: 不再分配，按 generation 验证 prepared edit 后拆分/删除/改权/合并
 ```
 
@@ -58,9 +58,9 @@ VMA commit: 不再分配，按 generation 验证 prepared edit 后拆分/删除/
 
 ## `brk`、fork 与回收
 
-raw `brk` 保存精确字节地址，只在跨页时编辑 VMA。增长增加 RW anonymous `HEAP/DEMAND_ZERO` 区间；冲突、metadata OOM 或 retired 页暂时无法释放时返回旧 break。缩小使用通用范围删除，因此即使用户先 `munmap` heap、`mprotect` 其中一段，或用 fixed mmap 替换局部区域，收缩仍能撤销 `[page_end(new), page_end(old))` 中的全部映射，而不依赖“只有一个连续 heap VMA”的阶段假设。
+raw `brk` 保存精确字节地址，只在跨页时编辑 VMA。增长增加 RW anonymous `HEAP/DEMAND_ZERO` 区间；冲突或 metadata OOM 时返回旧 break。缩小使用通用范围删除，因此即使用户先 `munmap` heap、`mprotect` 其中一段，或用 fixed mmap 替换局部区域，收缩仍能撤销 `[page_end(new), page_end(old))` 中的全部映射，而不依赖“只有一个连续 heap VMA”的阶段假设。撤销顺序为 PTE 失效、`SFENCE.VMA`、物理页释放和 VMA 提交；合法释放完成即结束，分配器不变量错误进入 fatal。
 
-`kernel_mm_fork()` 克隆整套 VMA 描述符与文件来源，再以 COW 共享驻留用户页；父子随后独立编辑区间，文件 VMA backing 在两个 MM 中各由独立的 file-source owner 维持。最后一个 MM owner 的回收顺序固定为 VMA metadata、file-source registry、Sv39 页引用/页表、MM record；每个阶段都保留可重试 owner。
+`kernel_mm_fork()` 克隆整套 VMA 描述符与文件来源，再以 COW 共享驻留用户页；父子随后独立编辑区间，文件 VMA backing 在两个 MM 中各由独立的 file-source owner 维持。最后一个 MM owner 的回收顺序固定为 VMA metadata、file-source registry、Sv39 页引用/页表、MM record；只有 file-source 的真实 VFS/I/O 清理错误需要保留 owner。
 
 ## 验证与限制
 
@@ -72,6 +72,6 @@ make test-root-init-riscv
 make test-riscv
 ```
 
-聚焦测试覆盖相邻合并、孔洞、冲突、两端拆分、hint/top-down、fixed replace/noreplace、文件 backing/offset 合并边界、`PROT_NONE` 内容保持、W→RW、mprotect 全覆盖、munmap 洞语义、打洞后的 brk、fork COW、retired owner、metadata OOM/cleanup retry 和资源基线。真实 ext4 `/init` ELF 从 U-mode 调用匿名与文件私有 mmap/mprotect/munmap，验证写隔离、EOF/SIGBUS、errno 与最终回收。
+聚焦测试覆盖相邻合并、孔洞、冲突、两端拆分、hint/top-down、fixed replace/noreplace、文件 backing/offset 合并边界、`PROT_NONE` 内容保持、W→RW、mprotect 全覆盖、munmap 洞语义、打洞后的 brk、fork COW、metadata OOM 和资源基线。真实 ext4 `/init` ELF 从 U-mode 调用匿名与文件私有 mmap/mprotect/munmap，验证写隔离、EOF/SIGBUS、errno 与最终回收；非法分配器释放由 fatal-path 测试覆盖。
 
 当前只实现只读普通文件的 private mapping，没有 shared mapping、写回、`MAP_POPULATE`、内存承诺 accounting、VMA 数量上限或 SMP 并发修改。ELF source-backed demand paging 和 RISC-V Sv39 ASLR 已接入；没有可信种子时按设计降级为确定性布局。`MAP_STACK` 目前只是兼容性标志，不改变增长方向；`MAP_NORESERVE` 与全局尚无 commit accounting 的当前策略等价。
