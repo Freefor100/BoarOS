@@ -51,6 +51,8 @@ struct kernel_vfs_node {
     uint64_t size;
     uint32_t mode;
     uint32_t references;
+    uint32_t write_openers;
+    uint32_t exec_users;
     uint8_t closed;
 };
 
@@ -267,10 +269,10 @@ static int cleanup_mount(struct kernel_vfs_mount *mount)
     return release_mount_storage(mount);
 }
 
-int kernel_vfs_mount_root_readonly(struct kernel_vfs_mount *mount,
-                                   struct kernel_block_device *block,
-                                   struct kernel_heap *heap,
-                                   struct kernel_page_cache *page_cache)
+int kernel_vfs_mount_root(struct kernel_vfs_mount *mount,
+                          struct kernel_block_device *block,
+                          struct kernel_heap *heap,
+                          struct kernel_page_cache *page_cache)
 {
     struct lwext4_mount_adapter *adapter;
     struct ext4_sblock *superblock;
@@ -463,6 +465,8 @@ int kernel_vfs_open(struct kernel_vfs_mount *mount,
         node->size = ext4_fsize(&node->file);
         node->mode = mode;
         node->references = 1U;
+        node->write_openers = 0U;
+        node->exec_users = 0U;
         node->next = adapter->nodes;
         adapter->nodes = node;
     }
@@ -471,6 +475,8 @@ int kernel_vfs_open(struct kernel_vfs_mount *mount,
     file->size = node->size;
     file->mode = node->mode;
     file->state = VFS_FILE_STATE_LIVE;
+    file->write_lease = 0U;
+    file->exec_lease = 0U;
     adapter->external_files++;
     return 0;
 }
@@ -510,7 +516,13 @@ int kernel_vfs_create(struct kernel_vfs_mount *mount,
         (void)kernel_heap_release(adapter->heap, node);
         return lwext4_error(result);
     }
-    (void)ext4_mode_set(path, (mode & 07777U) | KERNEL_VFS_S_IFREG);
+    result = ext4_mode_set(path, (mode & 07777U) | KERNEL_VFS_S_IFREG);
+    if (result != EOK) {
+        (void)ext4_fclose(&node->file);
+        (void)ext4_fremove(path);
+        (void)kernel_heap_release(adapter->heap, node);
+        return lwext4_error(result);
+    }
 
     for (existing = adapter->nodes;
          existing != 0;
@@ -520,6 +532,11 @@ int kernel_vfs_create(struct kernel_vfs_mount *mount,
         }
     }
     if (existing != 0) {
+        if (existing->exec_users > 0U) {
+            (void)ext4_fclose(&node->file);
+            (void)kernel_heap_release(adapter->heap, node);
+            return -KERNEL_ETXTBSY;
+        }
         result = ext4_fclose(&node->file);
         node->closed = 1U;
         if (result != EOK ||
@@ -541,6 +558,8 @@ int kernel_vfs_create(struct kernel_vfs_mount *mount,
         node->size = ext4_fsize(&node->file);
         node->mode = (mode & 07777U) | KERNEL_VFS_S_IFREG;
         node->references = 1U;
+        node->write_openers = 0U;
+        node->exec_users = 0U;
         node->next = adapter->nodes;
         adapter->nodes = node;
     }
@@ -549,6 +568,8 @@ int kernel_vfs_create(struct kernel_vfs_mount *mount,
     file->size = node->size;
     file->mode = node->mode;
     file->state = VFS_FILE_STATE_LIVE;
+    file->write_lease = 0U;
+    file->exec_lease = 0U;
     adapter->external_files++;
     return 0;
 }
@@ -571,6 +592,42 @@ int kernel_vfs_open_executable(struct kernel_vfs_mount *mount,
                        KERNEL_VFS_S_IXOTH)) == 0U) {
         return kernel_vfs_close(file) == 0 ? -KERNEL_EACCES
                                            : -KERNEL_EIO;
+    }
+    struct kernel_vfs_node *node = file->private_data;
+    if (node->write_openers > 0U) {
+        (void)kernel_vfs_close(file);
+        return -KERNEL_ETXTBSY;
+    }
+    if (node->exec_users == UINT32_MAX) {
+        (void)kernel_vfs_close(file);
+        return -KERNEL_EOVERFLOW;
+    }
+    node->exec_users++;
+    file->exec_lease = 1U;
+    return 0;
+}
+
+int kernel_vfs_file_acquire_write(struct kernel_vfs_file *file)
+{
+    struct kernel_vfs_node *node;
+
+    if (file == 0 || file->state != VFS_FILE_STATE_LIVE ||
+        file->private_data == 0) {
+        return -KERNEL_EINVAL;
+    }
+    node = file->private_data;
+    if (node->adapter != 0 && node->adapter->read_only) {
+        return -KERNEL_EROFS;
+    }
+    if (node->exec_users > 0U) {
+        return -KERNEL_ETXTBSY;
+    }
+    if (file->write_lease == 0U) {
+        if (node->write_openers == UINT32_MAX) {
+            return -KERNEL_EOVERFLOW;
+        }
+        node->write_openers++;
+        file->write_lease = 1U;
     }
     return 0;
 }
@@ -630,6 +687,59 @@ int kernel_vfs_pwrite(struct kernel_vfs_file *file,
     }
     node->size = ext4_fsize(&node->file);
     file->size = node->size;
+    *bytes_written = written;
+
+    if (node->adapter->page_cache != 0) {
+        (void)kernel_page_cache_invalidate_node(node->adapter->page_cache,
+                                                node);
+    }
+    return 0;
+}
+
+int kernel_vfs_append(struct kernel_vfs_file *file,
+                      const void *buffer,
+                      size_t size,
+                      uint64_t *written_offset,
+                      size_t *bytes_written)
+{
+    struct kernel_vfs_node *node;
+    uint64_t offset;
+    size_t written = 0U;
+    int result;
+
+    if (file == 0 || file->state != VFS_FILE_STATE_LIVE ||
+        file->private_data == 0 || (buffer == 0 && size != 0U) ||
+        bytes_written == 0) {
+        return -KERNEL_EINVAL;
+    }
+    node = file->private_data;
+    if ((node->mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFREG) {
+        return -KERNEL_EINVAL;
+    }
+    if (node->adapter == 0 || node->adapter->read_only) {
+        return -KERNEL_EROFS;
+    }
+    offset = ext4_fsize(&node->file);
+    if (size == 0U) {
+        if (written_offset != 0) {
+            *written_offset = offset;
+        }
+        *bytes_written = 0U;
+        return 0;
+    }
+    result = ext4_fseek(&node->file, (int64_t)offset, SEEK_SET);
+    if (result != EOK) {
+        return lwext4_error(result);
+    }
+    result = ext4_fwrite(&node->file, buffer, size, &written);
+    if (result != EOK) {
+        return lwext4_error(result);
+    }
+    node->size = ext4_fsize(&node->file);
+    file->size = node->size;
+    if (written_offset != 0) {
+        *written_offset = offset + (uint64_t)written;
+    }
     *bytes_written = written;
 
     if (node->adapter->page_cache != 0) {
@@ -714,6 +824,18 @@ int kernel_vfs_close(struct kernel_vfs_file *file)
         return -KERNEL_EINVAL;
     }
     node = file->private_data;
+    if (file->write_lease != 0U) {
+        if (node->write_openers > 0U) {
+            node->write_openers--;
+        }
+        file->write_lease = 0U;
+    }
+    if (file->exec_lease != 0U) {
+        if (node->exec_users > 0U) {
+            node->exec_users--;
+        }
+        file->exec_lease = 0U;
+    }
     adapter = file->mount->private_data;
     if (adapter == 0) {
         return -KERNEL_EIO;
@@ -779,7 +901,11 @@ int kernel_vfs_mkdir(struct kernel_vfs_mount *mount,
     if (result != EOK) {
         return lwext4_error(result);
     }
-    (void)ext4_mode_set(path, (mode & 07777U) | KERNEL_VFS_S_IFDIR);
+    result = ext4_mode_set(path, (mode & 07777U) | KERNEL_VFS_S_IFDIR);
+    if (result != EOK) {
+        (void)ext4_dir_rm(path);
+        return lwext4_error(result);
+    }
     return 0;
 }
 
@@ -812,7 +938,9 @@ int kernel_vfs_unlink(struct kernel_vfs_mount *mount,
         return lwext4_error(result);
     }
     if (adapter->page_cache != 0) {
-        for (node = adapter->nodes; node != 0; node = node->next) {
+        struct kernel_vfs_node *next_node;
+        for (node = adapter->nodes; node != 0; node = next_node) {
+            next_node = node->next;
             (void)kernel_page_cache_invalidate_node(adapter->page_cache, node);
         }
     }
@@ -856,10 +984,16 @@ int kernel_vfs_rmdir(struct kernel_vfs_mount *mount,
             entry->name[1] == '.') {
             continue;
         }
-        (void)ext4_dir_close(&directory);
+        int close_res = ext4_dir_close(&directory);
+        if (close_res != EOK) {
+            return lwext4_error(close_res);
+        }
         return -KERNEL_ENOTEMPTY;
     }
-    (void)ext4_dir_close(&directory);
+    int close_res = ext4_dir_close(&directory);
+    if (close_res != EOK) {
+        return lwext4_error(close_res);
+    }
 
     result = ext4_dir_rm(path);
     return lwext4_error(result);

@@ -383,14 +383,9 @@ static enum kernel_files_status write_request(
                    ? KERNEL_FILES_STATUS_OK : KERNEL_FILES_STATUS_STATE;
     }
     if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_REGULAR) {
-        uint64_t file_offset;
+        int is_append = (description->open_flags & KERNEL_FILES_O_APPEND) != 0U;
+        uint64_t file_offset = kernel_open_file_offset(description);
 
-        if ((description->open_flags & KERNEL_FILES_O_APPEND) != 0U) {
-            file_offset = kernel_open_file_size(description);
-            description->offset = file_offset;
-        } else {
-            file_offset = kernel_open_file_offset(description);
-        }
         for (size_t index = 0U; index < iov_count && total < count; index++) {
             uint64_t offset = 0U;
 
@@ -420,11 +415,28 @@ static enum kernel_files_status write_request(
                 if (status != KERNEL_UACCESS_STATUS_OK || copied != chunk) {
                     return KERNEL_FILES_STATUS_STATE;
                 }
-                vfs_result = kernel_vfs_pwrite(&description->file,
-                                               file_offset,
-                                               staging,
-                                               chunk,
-                                               &written);
+                if (is_append) {
+                    uint64_t new_offset = 0U;
+                    vfs_result = kernel_vfs_append(&description->file,
+                                                   staging,
+                                                   chunk,
+                                                   &new_offset,
+                                                   &written);
+                    if (vfs_result == 0) {
+                        description->offset = new_offset;
+                        file_offset = new_offset;
+                    }
+                } else {
+                    vfs_result = kernel_vfs_pwrite(&description->file,
+                                                   file_offset,
+                                                   staging,
+                                                   chunk,
+                                                   &written);
+                    if (vfs_result == 0) {
+                        file_offset += (uint64_t)written;
+                        description->offset = file_offset;
+                    }
+                }
                 if (vfs_result != 0) {
                     files->record->statistics.write_failures++;
                     *linux_result = total != 0U ? (int64_t)total : vfs_result;
@@ -432,8 +444,6 @@ static enum kernel_files_status write_request(
                 }
                 total += (uint64_t)written;
                 offset += (uint64_t)written;
-                file_offset += (uint64_t)written;
-                description->offset = file_offset;
                 if (written < chunk) {
                     break;
                 }

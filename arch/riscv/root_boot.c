@@ -251,10 +251,10 @@ enum riscv_root_boot_status riscv_root_boot_start(
         goto fail;
     }
 
-    if (kernel_vfs_mount_root_readonly(&root->mount,
-                                       &root->device.block,
-                                       &root->heap,
-                                       &root->page_cache) != 0) {
+    if (kernel_vfs_mount_root(&root->mount,
+                               &root->device.block,
+                               &root->heap,
+                               &root->page_cache) != 0) {
         failure = RISCV_ROOT_BOOT_STATUS_MOUNT;
         goto fail;
     }

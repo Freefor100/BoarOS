@@ -163,21 +163,6 @@ enum kernel_files_status kernel_files_openat(
         *linux_result = result;
         return KERNEL_FILES_STATUS_OK;
     }
-    if (kernel_vfs_mount_is_readonly(mount)) {
-        uint64_t access_mode = flags & LINUX_O_ACCMODE;
-        const uint64_t write_flags = LINUX_O_CREAT | LINUX_O_TRUNC |
-                                     LINUX_O_APPEND;
-
-        if (access_mode == LINUX_O_WRONLY || access_mode == LINUX_O_RDWR ||
-            (flags & write_flags) != 0U) {
-            files->record->statistics.open_failures++;
-            if (finish_path(files, path) != KERNEL_FILES_STATUS_OK) {
-                return KERNEL_FILES_STATUS_STATE;
-            }
-            *linux_result = -KERNEL_EROFS;
-            return KERNEL_FILES_STATUS_OK;
-        }
-    }
     open_status = kernel_open_file_create(files->heap,
                                           mount,
                                           path,
@@ -186,6 +171,14 @@ enum kernel_files_status kernel_files_openat(
     if (open_status == KERNEL_OPEN_FILE_STATUS_OK &&
         result == -KERNEL_ENOENT &&
         (flags & LINUX_O_CREAT) != 0U) {
+        if (kernel_vfs_mount_is_readonly(mount)) {
+            files->record->statistics.open_failures++;
+            if (finish_path(files, path) != KERNEL_FILES_STATUS_OK) {
+                return KERNEL_FILES_STATUS_STATE;
+            }
+            *linux_result = -KERNEL_EROFS;
+            return KERNEL_FILES_STATUS_OK;
+        }
         created = 1;
         open_status = kernel_open_file_create_mode(files->heap,
                                                    mount,
@@ -225,6 +218,17 @@ enum kernel_files_status kernel_files_openat(
         *linux_result = -KERNEL_EEXIST;
         return KERNEL_FILES_STATUS_OK;
     }
+    if (kernel_vfs_mount_is_readonly(mount)) {
+        uint64_t access_mode = flags & LINUX_O_ACCMODE;
+        if (access_mode == LINUX_O_WRONLY || access_mode == LINUX_O_RDWR ||
+            (flags & LINUX_O_TRUNC) != 0U) {
+            files->record->statistics.open_failures++;
+            kernel_files_queue_description(files, description);
+            (void)kernel_files_drain_file_cleanup(files);
+            *linux_result = -KERNEL_EROFS;
+            return KERNEL_FILES_STATUS_OK;
+        }
+    }
     if ((kernel_open_file_mode(description) & KERNEL_VFS_S_IFMT) ==
         KERNEL_VFS_S_IFDIR) {
         uint64_t access_mode = flags & LINUX_O_ACCMODE;
@@ -240,12 +244,25 @@ enum kernel_files_status kernel_files_openat(
         description->kind = KERNEL_OPEN_FILE_KIND_DIRECTORY;
     } else if ((kernel_open_file_mode(description) & KERNEL_VFS_S_IFMT) ==
                KERNEL_VFS_S_IFREG) {
+        uint64_t access_mode = flags & LINUX_O_ACCMODE;
+
         if ((flags & LINUX_O_DIRECTORY) != 0U) {
             files->record->statistics.open_failures++;
             kernel_files_queue_description(files, description);
             (void)kernel_files_drain_file_cleanup(files);
             *linux_result = -KERNEL_ENOTDIR;
             return KERNEL_FILES_STATUS_OK;
+        }
+        if (access_mode == LINUX_O_WRONLY || access_mode == LINUX_O_RDWR ||
+            (flags & LINUX_O_TRUNC) != 0U) {
+            int lease_result = kernel_vfs_file_acquire_write(&description->file);
+            if (lease_result != 0) {
+                files->record->statistics.open_failures++;
+                kernel_files_queue_description(files, description);
+                (void)kernel_files_drain_file_cleanup(files);
+                *linux_result = lease_result;
+                return KERNEL_FILES_STATUS_OK;
+            }
         }
         if (!created && (flags & LINUX_O_TRUNC) != 0U) {
             int trunc_result = kernel_vfs_ftruncate(&description->file, 0U);
