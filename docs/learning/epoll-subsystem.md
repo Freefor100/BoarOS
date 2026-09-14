@@ -9,9 +9,14 @@ Linux `epoll` 引入“推模型”（Push Model）：
 2. **事件驱动推入**：被监听对象（如管道、套接字）在状态发生改变（写入数据、写端关闭 EOF 等）时，主动调用其等待队列的唤醒链；epoll 通过注册的回调函数直接将就绪的项（`epitem`）追加到就绪链表（`ready_list`）；
 3. **常数级就绪收集**：`epoll_pwait` 无需遍历数千个监听目标，仅需从就绪链表中按需提取已就绪的事件，时间复杂度降为与就绪事件数成正比的 $O(K)$。
 
-## 双向关联与 OFD 生命周期解耦
+## 双向关联与 (target_fd, OFD) 键化模型
 
-`epoll` 监听的本质是打开文件描述（Open File Description, OFD），而非某个进程私有的文件描述符（fd）。在支持 `dup`、`fork` 或 `CLONE_FILES` 的环境中，多个 fd 可能指向同一个 OFD；相反，一个 fd 被 `close` 后，只要该 OFD 还有其他引用存活，其在 epoll 中的监听条目就依然有效。只有当底层 OFD 的所有引用计数归零、执行析构时，监听条目才会被内核隐式自动清理。
+Linux `epoll` 监听条目的索引键并非单纯的进程私有 fd，也不是单纯的打开文件描述（OFD），而是 `(target_fd, struct file *)` 二元组（在 Linux 源码中体现为 `struct epoll_filefd`）。
+
+这一设计的关键语义推论包括：
+1. **dup 描述符的独立监听**：若一个进程通过 `dup()` 将 `fd1` 复制为 `fd2`（两者指向同一底层 OFD），用户可以将 `fd1` 与 `fd2` 均添加到同一个 epoll 实例中，分别配置不同的事件掩码或用户 `data` 标记，两者在 epoll 树中互为独立的合法条目；
+2. **OFD 存活与生命周期解耦**：若 `fd1` 被 `close()`，但该 OFD 仍有 `fd2` 引用存活，`fd1` 的监听项会被摘除或停用，而 `fd2` 关联的监听依然有效；只有当底层 OFD 的最后一个引用归零、执行析构时，内核才隐式全量清理挂在该 OFD 上的所有 epoll 关联。
+3. **目标类型能力约束**：与 `poll/select` 允许传入任何合法文件描述符（常规文件和目录无条件立即报告可读写）不同，Linux `epoll` 仅允许监听其文件操作集提供了真实等待队列与回调通知机制的对象（如管道、套接字、终端等）。对常规文件或目录执行 `epoll_ctl(ADD)` 时，内核严格拒绝并返回 `-EPERM`。
 
 若只由 epoll 实例单向持有指向 target OFD 的指针，当某个进程通过 `close` 释放了 target OFD 的最后一个引用时，target OFD 将被释放，而 epoll 仍保留野指针，导致后续 `epoll_pwait` 或 `epoll_ctl` 触发 Use-After-Free (UAF)。
 
@@ -19,10 +24,10 @@ BoarOS 建立了 epoll 实例与 target OFD 之间的**双向链表关联**：
 ```text
   [struct kernel_epoll]
       │
-      ├─ items ────► [struct kernel_epoll_item] ◄─── ep_items ─── [target OFD]
+      ├─ items ────► [struct kernel_epoll_item (target_fd, ofd)] ◄─── ep_items ─── [target OFD]
       └─ ready_list ───┘ (epitem 挂入就绪链)
 ```
-- 每个 `struct kernel_epoll_item` 拥有两条链表节点：
+- 每个 `struct kernel_epoll_item` 记录了 `target_fd` 与所属 target OFD 指针，拥有两条链表节点：
   1. `item_link`：挂入所属 epoll 实例的 `items` 全局链表；
   2. `file_link`：挂入目标 OFD（`struct kernel_open_file_description`）的 `ep_items` 链表。
 - 当 target OFD 的引用计数降为 0（`kernel_open_file_release`）时，内核主动遍历其 `ep_items`，调用 `kernel_epoll_notify_file_release` 将所有监听该文件的 `epitem` 从其所属的 epoll 实例中彻底摘除并释放；
@@ -78,7 +83,29 @@ Linux epoll 拥有三种核心触发语义，BoarOS 通过对 `ready_list` 的�
 - 对 epoll fd 执行 `poll` 或 `ppoll`；
 - 将一个 epoll fd 通过 `epoll_ctl(ADD)` 注册到另一个 epoll 实例中（嵌套 epoll）。
 
-BoarOS 为 epoll OFD 实现了 `kernel_epoll_poll` 操作：当且仅当 epoll 内部的 `ready_list` 非空时，报告 `POLLIN`。同时，为了防止死锁与无限循环递归，`epoll_ctl` 显式禁止将 epoll fd 自身添加到自己的监听集中（返回 `-EINVAL`）。
+BoarOS 为 epoll OFD 实现了 `kernel_epoll_poll` 操作：当且仅当 epoll 内部的 `ready_list` 非空时，报告 `POLLIN`。同时，为了防止死锁、深度递归击穿内核栈与无限循环依赖，BoarOS 实现了对齐 Linux 的严格嵌套校验与循环检测机制：
+1. **直接自监听校验**：`epoll_ctl` 显式禁止将 epoll fd 自身添加到自己的监听集中（`epfd == fd` 或底层 OFD 相同），返回 `-EINVAL`。
+2. **深度优先遍历与环路检测（Cycle Detection）**：
+   - 在将一个 epoll 文件注册到另一个 epoll 实例时，执行 `epoll_check_nesting()`；
+   - 通过向下迭代式深度优先搜索（`epoll_check_downward`）检查目标 epoll 内部是否已经直接或间接包含当前 epoll 实例；一旦出现环路，立即返回 `-ELOOP`；
+   - 通过向上迭代式深度优先搜索（`epoll_check_upward`）检查父级 epoll 树；
+   - 累加双向嵌套深度：当 `down_depth + 1 + up_depth > KERNEL_EPOLL_MAX_NESTS`（上限为 4）时，拒绝注册并返回 `-ELOOP`；
+   - 整个 DFS 遍历采用固定长度栈帧（容量为 8），完全在紧凑内核栈内以迭代代替 C 语言函数递归，零堆分配且绝不击穿栈 Canary。
+3. **确定性无级联清理**：当嵌套的 epoll OFD 被 `close` 销毁时，`kernel_epoll_destroy` 仅遍历并解绑其直接注册的 item 与等待节点，不进行跨实例级联递归清理，保证销毁路径的常数栈开销与资源回收安全。
+
+## 竞态防护与原子阻塞等待协议
+
+在多任务操作系统中，多路复用等待（`epoll_pwait` / `ppoll`）的核心挑战之一是**唤醒丢失（Lost Wakeup）**：如果任务在发现就绪链表为空后、但在真正将自身挂入等待队列并休眠前发生硬件中断（如定时器中断、网卡或块设备完成中断、管道写入抢占），而中断处理程序恰好执行了唤醒，则后续任务将陷入死等直到下一次事件或超时。
+
+BoarOS 在 `kernel_files_epoll_pwait` 与调度器等待协议中构建了原子关中断保护路径：
+1. **关中断原子校验与入队**：
+   - 任务在提取就绪事件为空且需要休眠前，调用 `riscv_interrupt_save()` 关闭本地中断；
+   - 在关中断状态下重新检查 `epoll->ready_head != 0`；若在提取间隙已有事件到达，立即开中断并重试提取，避免无效睡眠；
+   - 确认无就绪事件后，调用 `kernel_scheduler_block_current(&epoll->wait_queue, deadline, 1, &wake_reason)`，将任务状态原子切换为 `INTERRUPTIBLE` 并挂入 epoll 等待队列；
+   - 调度恢复后调用 `riscv_interrupt_restore()` 重新使能中断。
+2. **信号临时掩码安全还原**：
+   - 若传入了 `sigmask`，内核在进入等待循环前设置临时掩码；
+   - 退出循环后无论正常唤醒、超时还是信号中断，均通过 `kernel_signal_restore_temporary_mask(task, saved_mask, interrupted)` 恢复原掩码，确保信号中断（`-EINTR`）与信号处理上下文一致。
 
 ## 紧凑栈预算与堆回退设计
 
