@@ -56,6 +56,7 @@ struct kernel_vfs_node {
     uint32_t exec_users;
     uint8_t closed;
     uint8_t unlinked;
+    uint8_t orphan_freed;
 };
 
 static int lwext4_error(int error)
@@ -236,6 +237,14 @@ static int cleanup_mount(struct kernel_vfs_mount *mount)
         struct kernel_vfs_node *node = *cleanup_link;
         struct kernel_vfs_node *next = node->next;
 
+        if (node->unlinked && !node->orphan_freed) {
+            result = ext4_orphan_free(LWEXT4_MOUNT_POINT, node->file.inode);
+            if (result == EOK) {
+                node->orphan_freed = 1U;
+            } else {
+                return lwext4_error(result);
+            }
+        }
         if (!node->closed) {
             result = ext4_fclose(&node->file);
             if (result != EOK) {
@@ -473,6 +482,7 @@ int kernel_vfs_open(struct kernel_vfs_mount *mount,
         node->write_openers = 0U;
         node->exec_users = 0U;
         node->unlinked = 0U;
+        node->orphan_freed = 0U;
         node->next = adapter->nodes;
         adapter->nodes = node;
     }
@@ -570,6 +580,7 @@ int kernel_vfs_create(struct kernel_vfs_mount *mount,
         node->write_openers = 0U;
         node->exec_users = 0U;
         node->unlinked = 0U;
+        node->orphan_freed = 0U;
         node->next = adapter->nodes;
         adapter->nodes = node;
     }
@@ -852,6 +863,36 @@ int kernel_vfs_file_read_source(struct kernel_vfs_file *file,
     return 0;
 }
 
+static int kernel_vfs_try_release_orphan(struct kernel_vfs_node *node)
+{
+    struct kernel_vfs_node *temp;
+    int result;
+
+    if (node == 0 || !node->unlinked || node->orphan_freed) {
+        return 0;
+    }
+    if (node->open_files > 0U || node->exec_users > 0U) {
+        return 0;
+    }
+
+    node->references++;
+
+    if (node->adapter != 0 && node->adapter->page_cache != 0) {
+        (void)kernel_page_cache_invalidate_node(node->adapter->page_cache,
+                                                node);
+    }
+
+    result = ext4_orphan_free(LWEXT4_MOUNT_POINT, node->file.inode);
+    if (result == EOK) {
+        node->orphan_freed = 1U;
+    }
+
+    temp = node;
+    (void)kernel_vfs_node_release(&temp);
+
+    return result != EOK ? lwext4_error(result) : 0;
+}
+
 int kernel_vfs_close(struct kernel_vfs_file *file)
 {
     struct lwext4_mount_adapter *adapter;
@@ -883,8 +924,8 @@ int kernel_vfs_close(struct kernel_vfs_file *file)
         return -KERNEL_EIO;
     }
 
-    if (node->unlinked && node->open_files == 0U && adapter->page_cache != 0) {
-        (void)kernel_page_cache_invalidate_node(adapter->page_cache, node);
+    if (node->unlinked) {
+        (void)kernel_vfs_try_release_orphan(node);
     }
 
     file->state = VFS_FILE_STATE_CLEANUP;
@@ -993,18 +1034,18 @@ int kernel_vfs_unlink(struct kernel_vfs_mount *mount,
     }
 
     if (node != 0) {
-        node->unlinked = 1U;
-        if (node->open_files == 0U) {
-            if (adapter->page_cache != 0) {
-                (void)kernel_page_cache_invalidate_node(adapter->page_cache,
-                                                        node);
-            }
-            if (is_orphan) {
-                (void)ext4_orphan_free(LWEXT4_MOUNT_POINT, inode);
+        if (is_orphan) {
+            node->unlinked = 1U;
+            result = kernel_vfs_try_release_orphan(node);
+            if (result != 0) {
+                return result;
             }
         }
     } else if (is_orphan) {
-        (void)ext4_orphan_free(LWEXT4_MOUNT_POINT, inode);
+        result = ext4_orphan_free(LWEXT4_MOUNT_POINT, inode);
+        if (result != EOK) {
+            return lwext4_error(result);
+        }
     }
     return 0;
 }
@@ -1198,9 +1239,12 @@ int kernel_vfs_node_release(struct kernel_vfs_node **owner)
         }
         *link = node->next;
         node->next = 0;
-    }
-    if (node->unlinked) {
-        (void)ext4_orphan_free(LWEXT4_MOUNT_POINT, node->file.inode);
+        if (node->unlinked && !node->orphan_freed) {
+            node->next = node->adapter->cleanup_nodes;
+            node->adapter->cleanup_nodes = node;
+            *owner = 0;
+            return -KERNEL_EIO;
+        }
     }
     if (!node->closed) {
         result = ext4_fclose(&node->file);
