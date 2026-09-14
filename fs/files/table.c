@@ -65,12 +65,7 @@ static enum kernel_files_status create_files(
                                               sizeof(*slots),
                                               (void **)&slots);
     if (heap_status != KERNEL_HEAP_STATUS_OK) {
-        if (kernel_heap_release(heap, record) != KERNEL_HEAP_STATUS_OK) {
-            files->heap = heap;
-            files->record = record;
-            files->state = KERNEL_FILES_CLEANUP;
-            return KERNEL_FILES_STATUS_CLEANUP_REQUIRED;
-        }
+        (void)kernel_heap_release(heap, record);
         return heap_status == KERNEL_HEAP_STATUS_EMPTY
                    ? KERNEL_FILES_STATUS_NO_MEMORY
                    : KERNEL_FILES_STATUS_STATE;
@@ -183,45 +178,12 @@ enum kernel_files_status kernel_files_move(
     return KERNEL_FILES_STATUS_OK;
 }
 
-static void queue_allocation_cleanup(struct kernel_files *files,
-                                     void *pointer)
-{
-    *(void **)pointer = files->record->cleanup_allocations;
-    files->record->cleanup_allocations = pointer;
-}
-
-enum kernel_files_status kernel_files_release_or_queue_allocation(
+enum kernel_files_status kernel_files_release_allocation(
     struct kernel_files *files,
     void *pointer)
 {
-    if (kernel_heap_release(files->heap, pointer) ==
-        KERNEL_HEAP_STATUS_OK) {
-        return KERNEL_FILES_STATUS_OK;
-    }
-    queue_allocation_cleanup(files, pointer);
-    return KERNEL_FILES_STATUS_CLEANUP_REQUIRED;
-}
-
-static enum kernel_files_status drain_allocation_cleanup(
-    struct kernel_files *files)
-{
-    void **link = &files->record->cleanup_allocations;
-    int failed = 0;
-
-    while (*link != 0) {
-        void *pointer = *link;
-        void *next = *(void **)pointer;
-
-        if (kernel_heap_release(files->heap, pointer) !=
-            KERNEL_HEAP_STATUS_OK) {
-            link = (void **)pointer;
-            failed = 1;
-        } else {
-            *link = next;
-        }
-    }
-    return failed ? KERNEL_FILES_STATUS_CLEANUP_REQUIRED
-                  : KERNEL_FILES_STATUS_OK;
+    (void)kernel_heap_release(files->heap, pointer);
+    return KERNEL_FILES_STATUS_OK;
 }
 
 static enum kernel_files_status cleanup_description(
@@ -254,34 +216,6 @@ enum kernel_files_status kernel_files_drain_file_cleanup(
         if (cleanup_description(files, description) !=
             KERNEL_FILES_STATUS_OK) {
             link = &description->cleanup_next;
-            failed = 1;
-        } else {
-            *link = next;
-        }
-    }
-    return failed ? KERNEL_FILES_STATUS_CLEANUP_REQUIRED
-                  : KERNEL_FILES_STATUS_OK;
-}
-
-static void queue_pipe_cleanup(struct kernel_files *files,
-                               struct kernel_pipe *pipe)
-{
-    pipe->cleanup_next = files->record->cleanup_pipes;
-    files->record->cleanup_pipes = pipe;
-}
-
-static enum kernel_files_status drain_pipe_cleanup(
-    struct kernel_files *files)
-{
-    struct kernel_pipe **link = &files->record->cleanup_pipes;
-    int failed = 0;
-
-    while (*link != 0) {
-        struct kernel_pipe *pipe = *link;
-        struct kernel_pipe *next = pipe->cleanup_next;
-
-        if (kernel_pipe_destroy_unowned(pipe) != KERNEL_PIPE_STATUS_OK) {
-            link = &pipe->cleanup_next;
             failed = 1;
         } else {
             *link = next;
@@ -581,11 +515,6 @@ enum kernel_files_status kernel_files_pipe2(
     }
     pipe_status = kernel_pipe_create(files->heap, &pipe);
     if (pipe_status != KERNEL_PIPE_STATUS_OK) {
-        if (pipe_status == KERNEL_PIPE_STATUS_CLEANUP_REQUIRED &&
-            pipe != 0) {
-            queue_pipe_cleanup(files, pipe);
-            return KERNEL_FILES_STATUS_CLEANUP_REQUIRED;
-        }
         *linux_result = pipe_status == KERNEL_PIPE_STATUS_NO_MEMORY
                             ? -KERNEL_ENOMEM
                             : -KERNEL_EIO;
@@ -598,10 +527,7 @@ enum kernel_files_status kernel_files_pipe2(
                                                &read_description);
     if (open_status != KERNEL_OPEN_FILE_STATUS_OK) {
         status = release_uninstalled_description(files, &read_description);
-        if (kernel_pipe_destroy_unowned(pipe) != KERNEL_PIPE_STATUS_OK) {
-            queue_pipe_cleanup(files, pipe);
-            status = KERNEL_FILES_STATUS_CLEANUP_REQUIRED;
-        }
+        (void)kernel_pipe_destroy_unowned(pipe);
         if (status != KERNEL_FILES_STATUS_OK) {
             return status;
         }
@@ -628,9 +554,8 @@ enum kernel_files_status kernel_files_pipe2(
         status = write_cleanup_status != KERNEL_FILES_STATUS_OK
                      ? write_cleanup_status
                      : read_cleanup_status;
-        /* The first endpoint owns the last pipe reference here.  Its
-         * release either destroys the pipe or queues the OFD to retry that
-         * release; never touch pipe after a successful read cleanup. */
+        /* The first endpoint owns the last pipe reference here.  Do not
+         * touch the pipe after the read description is released. */
         *linux_result = open_status == KERNEL_OPEN_FILE_STATUS_NO_MEMORY
                             ? -KERNEL_ENOMEM
                             : -KERNEL_EIO;
@@ -691,8 +616,6 @@ enum kernel_files_status kernel_files_pipe2(
         (void)detach_fd(files, write_fd);
         (void)detach_fd(files, read_fd);
         (void)kernel_files_drain_file_cleanup(files);
-        (void)drain_pipe_cleanup(files);
-        (void)drain_allocation_cleanup(files);
         *linux_result = -KERNEL_EFAULT;
         return KERNEL_FILES_STATUS_OK;
     }
@@ -928,12 +851,6 @@ enum kernel_files_status kernel_files_close(
     if (kernel_files_drain_file_cleanup(files) != KERNEL_FILES_STATUS_OK) {
         cleanup_required = 1;
     }
-    if (drain_pipe_cleanup(files) != KERNEL_FILES_STATUS_OK) {
-        cleanup_required = 1;
-    }
-    if (drain_allocation_cleanup(files) != KERNEL_FILES_STATUS_OK) {
-        cleanup_required = 1;
-    }
     if (cleanup_required != 0) {
         files->record->statistics.close_failures++;
         *linux_result = -KERNEL_EIO;
@@ -963,12 +880,6 @@ enum kernel_files_status kernel_files_close_on_exec(
         }
     }
     if (kernel_files_drain_file_cleanup(files) != KERNEL_FILES_STATUS_OK) {
-        cleanup_required = 1;
-    }
-    if (drain_pipe_cleanup(files) != KERNEL_FILES_STATUS_OK) {
-        cleanup_required = 1;
-    }
-    if (drain_allocation_cleanup(files) != KERNEL_FILES_STATUS_OK) {
         cleanup_required = 1;
     }
     return cleanup_required ? KERNEL_FILES_STATUS_CLEANUP_REQUIRED
@@ -1028,27 +939,15 @@ enum kernel_files_status kernel_files_release(
     if (kernel_files_drain_file_cleanup(files) != KERNEL_FILES_STATUS_OK) {
         cleanup_required = 1;
     }
-    if (drain_pipe_cleanup(files) != KERNEL_FILES_STATUS_OK) {
-        cleanup_required = 1;
-    }
-    if (drain_allocation_cleanup(files) != KERNEL_FILES_STATUS_OK) {
-        cleanup_required = 1;
-    }
     if (cleanup_required != 0) {
         return KERNEL_FILES_STATUS_CLEANUP_REQUIRED;
     }
     if (files->record->slots != 0) {
-        if (kernel_heap_release(files->heap,
-                                files->record->slots) !=
-            KERNEL_HEAP_STATUS_OK) {
-            return KERNEL_FILES_STATUS_CLEANUP_REQUIRED;
-        }
+        (void)kernel_heap_release(files->heap,
+                                files->record->slots);
         files->record->slots = 0;
     }
-    if (kernel_heap_release(files->heap, files->record) !=
-        KERNEL_HEAP_STATUS_OK) {
-        return KERNEL_FILES_STATUS_CLEANUP_REQUIRED;
-    }
+    (void)kernel_heap_release(files->heap, files->record);
     finish_files(files, KERNEL_FILES_RELEASED);
     return KERNEL_FILES_STATUS_OK;
 }

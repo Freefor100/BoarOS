@@ -29,7 +29,6 @@ struct kernel_page_cache_record {
     struct kernel_page_cache_entry *lru_head;
     struct kernel_page_cache_entry *lru_tail;
     struct kernel_page_cache_entry *cleanup_entries;
-    void *cleanup_allocations;
     struct kernel_page_cache_statistics statistics;
     size_t capacity;
     size_t occupied;
@@ -97,33 +96,6 @@ static size_t find_bucket(struct kernel_page_cache_record *record,
     }
 }
 
-static void queue_allocation(struct kernel_page_cache *cache,
-                             void *pointer)
-{
-    *(void **)pointer = cache->record->cleanup_allocations;
-    cache->record->cleanup_allocations = pointer;
-}
-
-static int drain_allocations(struct kernel_page_cache *cache)
-{
-    void **link = &cache->record->cleanup_allocations;
-    int failed = 0;
-
-    while (*link != 0) {
-        void *pointer = *link;
-        void *next = *(void **)pointer;
-
-        if (kernel_heap_release(cache->heap, pointer) !=
-            KERNEL_HEAP_STATUS_OK) {
-            link = (void **)pointer;
-            failed = 1;
-        } else {
-            *link = next;
-        }
-    }
-    return !failed;
-}
-
 static int resize_hash(struct kernel_page_cache *cache, size_t capacity)
 {
     struct kernel_page_cache_record *record = cache->record;
@@ -158,10 +130,7 @@ static int resize_hash(struct kernel_page_cache *cache, size_t capacity)
             buckets[destination] = entry;
         }
     }
-    if (kernel_heap_release(cache->heap, old_buckets) !=
-        KERNEL_HEAP_STATUS_OK) {
-        queue_allocation(cache, old_buckets);
-    }
+    (void)kernel_heap_release(cache->heap, old_buckets);
     return 1;
 }
 
@@ -224,11 +193,8 @@ static int cleanup_entry(struct kernel_page_cache *cache,
                          uint64_t *pages_released)
 {
     while (entry->page_references_owned != 0U) {
-        if (physical_page_release(cache->allocator,
-                                  entry->physical_address) !=
-            PHYSICAL_PAGE_STATUS_OK) {
-            return 0;
-        }
+        (void)physical_page_release(cache->allocator,
+                                  entry->physical_address);
         entry->page_references_owned--;
         (*pages_released)++;
     }
@@ -237,8 +203,8 @@ static int cleanup_entry(struct kernel_page_cache *cache,
         kernel_vfs_node_release(&entry->node) != 0) {
         return 0;
     }
-    return kernel_heap_release(cache->heap, entry) ==
-           KERNEL_HEAP_STATUS_OK;
+    (void)kernel_heap_release(cache->heap, entry);
+    return 1;
 }
 
 static enum kernel_page_cache_status abandon_entry(
@@ -457,11 +423,7 @@ enum kernel_page_cache_status kernel_page_cache_get(
     if (physical_page_allocate(cache->allocator,
                                &entry->physical_address) !=
         PHYSICAL_PAGE_STATUS_OK) {
-        if (kernel_heap_release(cache->heap, entry) !=
-            KERNEL_HEAP_STATUS_OK) {
-            queue_allocation(cache, entry);
-            return KERNEL_PAGE_CACHE_STATUS_STATE;
-        }
+        (void)kernel_heap_release(cache->heap, entry);
         return KERNEL_PAGE_CACHE_STATUS_NO_MEMORY;
     }
     entry->page_references_owned = 1U;
@@ -556,7 +518,6 @@ uint64_t kernel_page_cache_reclaim(struct kernel_page_cache *cache,
         entry = previous;
     }
     (void)drain_entries(cache, &released);
-    (void)drain_allocations(cache);
     cache->record->statistics.pages_reclaimed += released;
     return released;
 }
@@ -591,8 +552,7 @@ enum kernel_page_cache_status kernel_page_cache_purge_mount(
         }
         entry = previous;
     }
-    if (!drain_entries(cache, &released) ||
-        !drain_allocations(cache)) {
+    if (!drain_entries(cache, &released)) {
         cache->record->statistics.pages_reclaimed += released;
         return KERNEL_PAGE_CACHE_STATUS_CLEANUP_REQUIRED;
     }
@@ -620,8 +580,7 @@ enum kernel_page_cache_status kernel_page_cache_invalidate_node(
         }
         entry = previous;
     }
-    if (!drain_entries(cache, &released) ||
-        !drain_allocations(cache)) {
+    if (!drain_entries(cache, &released)) {
         cache->record->statistics.pages_reclaimed += released;
         return KERNEL_PAGE_CACHE_STATUS_CLEANUP_REQUIRED;
     }
@@ -677,22 +636,15 @@ enum kernel_page_cache_status kernel_page_cache_destroy(
         }
         cache->state = KERNEL_PAGE_CACHE_CLEANUP;
     }
-    if (!drain_entries(cache, &released) ||
-        !drain_allocations(cache)) {
+    if (!drain_entries(cache, &released)) {
         return KERNEL_PAGE_CACHE_STATUS_CLEANUP_REQUIRED;
     }
     if (cache->record->buckets != 0) {
-        if (kernel_heap_release(cache->heap,
-                                cache->record->buckets) !=
-            KERNEL_HEAP_STATUS_OK) {
-            return KERNEL_PAGE_CACHE_STATUS_CLEANUP_REQUIRED;
-        }
+        (void)kernel_heap_release(cache->heap,
+                                cache->record->buckets);
         cache->record->buckets = 0;
     }
-    if (kernel_heap_release(cache->heap, cache->record) !=
-        KERNEL_HEAP_STATUS_OK) {
-        return KERNEL_PAGE_CACHE_STATUS_CLEANUP_REQUIRED;
-    }
+    (void)kernel_heap_release(cache->heap, cache->record);
     cache->heap = 0;
     cache->allocator = 0;
     cache->record = 0;

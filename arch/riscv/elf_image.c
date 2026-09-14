@@ -78,13 +78,10 @@ static enum riscv_elf_image_status cleanup_space(
                        : RISCV_ELF_IMAGE_STATUS_ADDRESS_SPACE;
         }
     }
-    if (space->state == RISCV_SV39_USER_SPACE_LIVE ||
-        space->state == RISCV_SV39_USER_SPACE_CLEANUP) {
+    if (space->state == RISCV_SV39_USER_SPACE_LIVE) {
         space_status = riscv_sv39_user_space_destroy(space);
         if (space_status != RISCV_SV39_STATUS_OK) {
-            return space_status == RISCV_SV39_STATUS_CLEANUP_REQUIRED
-                       ? RISCV_ELF_IMAGE_STATUS_CLEANUP_REQUIRED
-                       : RISCV_ELF_IMAGE_STATUS_ADDRESS_SPACE;
+            return RISCV_ELF_IMAGE_STATUS_ADDRESS_SPACE;
         }
     }
     return RISCV_ELF_IMAGE_STATUS_OK;

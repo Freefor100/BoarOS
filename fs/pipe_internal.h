@@ -11,7 +11,7 @@ struct physical_page_allocator;
 struct kernel_mm;
 struct kernel_uaccess_iovec;
 
-/* Shared only by the file-table cleanup retry list and pipe.c. */
+/* Shared pipe endpoint and ring ownership. */
 struct kernel_pipe {
     struct kernel_heap *heap;
     struct physical_page_allocator *allocator;
@@ -22,8 +22,6 @@ struct kernel_pipe {
     uint64_t bytes;
     uint32_t readers;
     uint32_t writers;
-    uint32_t destroy_pending;
-    struct kernel_pipe *cleanup_next;
     struct kernel_wait_queue read_queue;
     struct kernel_wait_queue write_queue;
 };
@@ -38,7 +36,6 @@ enum kernel_pipe_status {
     KERNEL_PIPE_STATUS_OK = 0,
     KERNEL_PIPE_STATUS_INVALID_ARGUMENT,
     KERNEL_PIPE_STATUS_NO_MEMORY,
-    KERNEL_PIPE_STATUS_CLEANUP_REQUIRED,
     KERNEL_PIPE_STATUS_STATE,
 };
 

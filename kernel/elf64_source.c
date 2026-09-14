@@ -30,9 +30,6 @@ struct kernel_elf64_source {
     uint32_t run_count;
     uint32_t references;
     uint64_t page_size;
-    struct physical_page_allocator *cleanup_page_allocator;
-    uint64_t cleanup_page_address;
-    uint8_t cleanup_page_valid;
     enum source_state state;
 };
 
@@ -143,30 +140,9 @@ static int release_pointer(struct kernel_elf64_source *source,
     if (*pointer == 0) {
         return 1;
     }
-    if (kernel_heap_release(source->heap, *pointer) !=
-        KERNEL_HEAP_STATUS_OK) {
-        return 0;
-    }
+    (void)kernel_heap_release(source->heap, *pointer);
     *pointer = 0;
     return 1;
-}
-
-static enum kernel_elf64_source_status release_pending_page(
-    struct kernel_elf64_source *source)
-{
-    if (source->cleanup_page_valid == 0U) {
-        return KERNEL_ELF64_SOURCE_STATUS_OK;
-    }
-    if (source->cleanup_page_allocator == 0 ||
-        physical_page_release(source->cleanup_page_allocator,
-                              source->cleanup_page_address) !=
-            PHYSICAL_PAGE_STATUS_OK) {
-        return KERNEL_ELF64_SOURCE_STATUS_CLEANUP_REQUIRED;
-    }
-    source->cleanup_page_allocator = 0;
-    source->cleanup_page_address = 0U;
-    source->cleanup_page_valid = 0U;
-    return KERNEL_ELF64_SOURCE_STATUS_OK;
 }
 
 static enum kernel_elf64_source_status discard_page(
@@ -175,17 +151,9 @@ static enum kernel_elf64_source_status discard_page(
     uint64_t address,
     enum kernel_elf64_source_status failure)
 {
-    if (physical_page_release(allocator, address) ==
-        PHYSICAL_PAGE_STATUS_OK) {
-        return failure;
-    }
-    if (source->cleanup_page_valid != 0U) {
-        return KERNEL_ELF64_SOURCE_STATUS_STATE;
-    }
-    source->cleanup_page_allocator = allocator;
-    source->cleanup_page_address = address;
-    source->cleanup_page_valid = 1U;
-    return KERNEL_ELF64_SOURCE_STATUS_CLEANUP_REQUIRED;
+    (void)source;
+    (void)physical_page_release(allocator, address);
+    return failure;
 }
 
 static enum kernel_elf64_source_status source_cleanup(
@@ -195,9 +163,6 @@ static enum kernel_elf64_source_status source_cleanup(
     int failed = 0;
 
     source->state = SOURCE_CLEANUP;
-    if (release_pending_page(source) != KERNEL_ELF64_SOURCE_STATUS_OK) {
-        failed = 1;
-    }
     if (source->file != 0) {
         struct kernel_open_file_description *file = source->file;
 
@@ -220,15 +185,12 @@ static enum kernel_elf64_source_status source_cleanup(
         failed = 1;
     }
     if (source->file != 0 || source->interpreter != 0 ||
-        source->boundaries != 0 || source->cleanup_page_valid != 0U ||
+        source->boundaries != 0 ||
         source->runs != 0 || source->program_headers != 0 || failed) {
         return KERNEL_ELF64_SOURCE_STATUS_CLEANUP_REQUIRED;
     }
     source->magic = 0U;
-    if (kernel_heap_release(source->heap, source) != KERNEL_HEAP_STATUS_OK) {
-        source->magic = KERNEL_ELF64_SOURCE_MAGIC;
-        return KERNEL_ELF64_SOURCE_STATUS_CLEANUP_REQUIRED;
-    }
+    (void)kernel_heap_release(source->heap, source);
     *owner = 0;
     return KERNEL_ELF64_SOURCE_STATUS_OK;
 }
@@ -825,16 +787,11 @@ enum kernel_elf64_source_status kernel_elf64_source_page(
     uint64_t address;
     void *page;
     enum physical_page_status page_status;
-    enum kernel_elf64_source_status cleanup_status;
 
     if (!source_valid(source) || source->state != SOURCE_LIVE ||
         source->file == 0 || allocator == 0 || physical_address == 0 || shared == 0 ||
         virtual_offset % source->page_size != 0U) {
         return KERNEL_ELF64_SOURCE_STATUS_INVALID_ARGUMENT;
-    }
-    cleanup_status = release_pending_page(source);
-    if (cleanup_status != KERNEL_ELF64_SOURCE_STATUS_OK) {
-        return cleanup_status;
     }
     run = find_run(source, virtual_offset);
     if (run == 0) {

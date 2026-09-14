@@ -61,12 +61,7 @@ static enum kernel_fs_context_status create_context(
     record->references = 1U;
     heap_status = kernel_heap_allocate(heap, cwd_size, (void **)&copy);
     if (heap_status != KERNEL_HEAP_STATUS_OK) {
-        if (kernel_heap_release(heap, record) != KERNEL_HEAP_STATUS_OK) {
-            fs->heap = heap;
-            fs->record = record;
-            fs->state = KERNEL_FS_CONTEXT_CLEANUP;
-            return KERNEL_FS_CONTEXT_STATUS_CLEANUP_REQUIRED;
-        }
+        (void)kernel_heap_release(heap, record);
         return heap_status == KERNEL_HEAP_STATUS_EMPTY
                    ? KERNEL_FS_CONTEXT_STATUS_NO_MEMORY
                    : KERNEL_FS_CONTEXT_STATUS_STATE;
@@ -158,8 +153,7 @@ enum kernel_fs_context_status kernel_fs_context_move(
         return KERNEL_FS_CONTEXT_STATUS_INVALID_ARGUMENT;
     }
     if (!empty_context(destination) ||
-        (source->state != KERNEL_FS_CONTEXT_LIVE &&
-         source->state != KERNEL_FS_CONTEXT_CLEANUP) ||
+        source->state != KERNEL_FS_CONTEXT_LIVE ||
         source->heap == 0 || source->record == 0) {
         return KERNEL_FS_CONTEXT_STATUS_STATE;
     }
@@ -284,8 +278,7 @@ enum kernel_fs_context_status kernel_fs_context_release(
     if (fs == 0) {
         return KERNEL_FS_CONTEXT_STATUS_INVALID_ARGUMENT;
     }
-    if ((fs->state != KERNEL_FS_CONTEXT_LIVE &&
-         fs->state != KERNEL_FS_CONTEXT_CLEANUP) ||
+    if (fs->state != KERNEL_FS_CONTEXT_LIVE ||
         fs->heap == 0 || fs->record == 0 ||
         fs->record->references == 0U ||
         fs->record->root_mount == 0) {
@@ -300,18 +293,11 @@ enum kernel_fs_context_status kernel_fs_context_release(
     if (fs->record->references != 1U) {
         return KERNEL_FS_CONTEXT_STATUS_STATE;
     }
-    fs->state = KERNEL_FS_CONTEXT_CLEANUP;
     if (fs->record->cwd != 0) {
-        if (kernel_heap_release(fs->heap, fs->record->cwd) !=
-            KERNEL_HEAP_STATUS_OK) {
-            return KERNEL_FS_CONTEXT_STATUS_CLEANUP_REQUIRED;
-        }
+        (void)kernel_heap_release(fs->heap, fs->record->cwd);
         fs->record->cwd = 0;
     }
-    if (kernel_heap_release(fs->heap, fs->record) !=
-        KERNEL_HEAP_STATUS_OK) {
-        return KERNEL_FS_CONTEXT_STATUS_CLEANUP_REQUIRED;
-    }
+    (void)kernel_heap_release(fs->heap, fs->record);
     finish_context(fs, KERNEL_FS_CONTEXT_RELEASED);
     return KERNEL_FS_CONTEXT_STATUS_OK;
 }

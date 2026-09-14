@@ -22,7 +22,6 @@ enum riscv_sv39_status {
     RISCV_SV39_STATUS_CONFLICT,
     RISCV_SV39_STATUS_STATE,
     RISCV_SV39_STATUS_NOT_MAPPED,
-    RISCV_SV39_STATUS_CLEANUP_REQUIRED,
 };
 
 enum riscv_sv39_page_table_state {
@@ -46,7 +45,6 @@ enum riscv_sv39_user_space_state {
     RISCV_SV39_USER_SPACE_LIVE,
     RISCV_SV39_USER_SPACE_MOVED,
     RISCV_SV39_USER_SPACE_DESTROYED,
-    RISCV_SV39_USER_SPACE_CLEANUP,
 };
 
 struct riscv_sv39_user_space {
@@ -56,9 +54,6 @@ struct riscv_sv39_user_space {
     uint32_t leaf_pages;
     uint32_t protected_pages;
     uint32_t cow_pages;
-    uint32_t retired_pages;
-    uint64_t cleanup_page_addresses[2];
-    uint32_t cleanup_page_count;
     uint64_t cow_copies;
     uint64_t cow_in_place;
     enum riscv_sv39_user_space_state state;
@@ -116,15 +111,12 @@ enum riscv_sv39_status riscv_sv39_user_map_cow_page(
     uint64_t physical_address,
     uint32_t permissions);
 
-/* Releases a detached owned page or retains it for destroy-time retry. */
+/* Releases a detached owned page. Invalid ownership is fail-stop. */
 enum riscv_sv39_status riscv_sv39_user_discard_owned_page(
     struct riscv_sv39_user_space *space,
     uint64_t physical_address);
 
-/*
- * Success allocates, zeroes, maps, and transfers one page to space.
- * CLEANUP_REQUIRED leaves a retryable CLEANUP owner; only move/destroy it.
- */
+/* Success allocates, zeroes, maps, and transfers one page to space. */
 enum riscv_sv39_status riscv_sv39_user_map_zeroed_page(
     struct riscv_sv39_user_space *space,
     uint64_t virtual_address,
@@ -138,19 +130,17 @@ enum riscv_sv39_status riscv_sv39_user_lookup(
 /*
  * Removes owned leaves in [start, end).  The caller must establish that this
  * is the active address space before relying on the local TLB flush.  A
- * release failure leaves an invalid, software-owned retired PTE and is
- * reported through deferred_pages while the address remains inaccessible.
+ * release is fail-stop. All owners are released before this call returns.
  */
 enum riscv_sv39_status riscv_sv39_user_unmap_owned_range(
     struct riscv_sv39_user_space *space,
     uint64_t start,
-    uint64_t end,
-    uint32_t *deferred_pages);
+    uint64_t end);
 
 /*
  * Changes access for owned leaves in [start, end).  permissions == 0 keeps
  * each physical page owned behind an invalid software PTE (PROT_NONE).
- * Missing and retired leaves are unchanged; present leaves retain content.
+ * Missing leaves are unchanged; present leaves retain content.
  */
 enum riscv_sv39_status riscv_sv39_user_protect_owned_range(
     struct riscv_sv39_user_space *space,
@@ -158,12 +148,7 @@ enum riscv_sv39_status riscv_sv39_user_protect_owned_range(
     uint64_t end,
     uint32_t permissions);
 
-/* Retries retired-page release without changing any active mapping. */
-enum riscv_sv39_status riscv_sv39_user_reclaim_retired_range(
-    struct riscv_sv39_user_space *space,
-    uint64_t start,
-    uint64_t end,
-    uint32_t *deferred_pages);
+
 
 /* Populate mapped owned pages before this address space becomes active. */
 enum riscv_sv39_status riscv_sv39_user_space_populate(
@@ -180,8 +165,8 @@ enum riscv_sv39_status riscv_sv39_user_space_satp(
  * Build child tables that share every owned user page with source through
  * copy-on-write.  The destination borrows the same kernel root entries as
  * source.  Parent leaves are committed to COW only after child construction;
- * after initialization, failure may leave destination as a LIVE or CLEANUP
- * owner for the caller to destroy.
+ * after initialization, failure may leave destination as a LIVE owner for
+ * the caller to destroy.
  */
 enum riscv_sv39_status riscv_sv39_user_space_fork(
     struct riscv_sv39_user_space *destination,
@@ -193,12 +178,12 @@ enum riscv_sv39_status riscv_sv39_user_resolve_cow(
     uint64_t virtual_address,
     uint32_t permissions);
 
-/* Success consumes a LIVE or CLEANUP source; failure changes neither object. */
+/* Success consumes a LIVE source; failure changes neither object. */
 enum riscv_sv39_status riscv_sv39_user_space_move(
     struct riscv_sv39_user_space *destination,
     struct riscv_sv39_user_space *source);
 
-/* The active satp root cannot be destroyed; CLEANUP is retryable. */
+/* The active satp root cannot be destroyed. */
 enum riscv_sv39_status riscv_sv39_user_space_destroy(
     struct riscv_sv39_user_space *space);
 

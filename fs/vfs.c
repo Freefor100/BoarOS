@@ -197,13 +197,9 @@ static int release_mount_storage(struct kernel_vfs_mount *mount)
 {
     struct lwext4_mount_adapter *adapter = mount->private_data;
     struct kernel_heap *heap = adapter->heap;
-    enum kernel_heap_status heap_status;
 
     if (adapter->physical_buffer != 0) {
-        heap_status = kernel_heap_release(heap, adapter->physical_buffer);
-        if (heap_status != KERNEL_HEAP_STATUS_OK) {
-            return -KERNEL_EIO;
-        }
+        (void)kernel_heap_release(heap, adapter->physical_buffer);
         adapter->physical_buffer = 0;
     }
     if (adapter->heap_bound) {
@@ -211,10 +207,7 @@ static int release_mount_storage(struct kernel_vfs_mount *mount)
         adapter->heap_bound = 0U;
     }
 
-    heap_status = kernel_heap_release(heap, adapter);
-    if (heap_status != KERNEL_HEAP_STATUS_OK) {
-        return -KERNEL_EIO;
-    }
+    (void)kernel_heap_release(heap, adapter);
     mount->private_data = 0;
     mount->state = VFS_MOUNT_STATE_EMPTY;
     return 0;
@@ -227,15 +220,10 @@ static void queue_orphan(struct lwext4_mount_adapter *adapter,
     adapter->orphans = orphan;
 }
 
-static int release_orphan(struct lwext4_mount_adapter *adapter,
-                          struct lwext4_orphan *orphan)
+static void release_orphan(struct lwext4_mount_adapter *adapter,
+                           struct lwext4_orphan *orphan)
 {
-    if (kernel_heap_release(adapter->heap, orphan) ==
-        KERNEL_HEAP_STATUS_OK) {
-        return 0;
-    }
-    queue_orphan(adapter, orphan);
-    return -KERNEL_EIO;
+    (void)kernel_heap_release(adapter->heap, orphan);
 }
 
 static int reserve_orphan(struct lwext4_mount_adapter *adapter,
@@ -287,12 +275,8 @@ static int cleanup_mount(struct kernel_vfs_mount *mount)
             }
             orphan->orphan_freed = 1U;
         }
-        if (kernel_heap_release(adapter->heap, orphan) !=
-            KERNEL_HEAP_STATUS_OK) {
-            orphan_link = &orphan->next;
-        } else {
-            *orphan_link = next;
-        }
+        (void)kernel_heap_release(adapter->heap, orphan);
+        *orphan_link = next;
     }
     cleanup_link = &adapter->cleanup_nodes;
     while (*cleanup_link != 0) {
@@ -314,12 +298,8 @@ static int cleanup_mount(struct kernel_vfs_mount *mount)
             }
             node->closed = 1U;
         }
-        if (kernel_heap_release(adapter->heap, node) !=
-            KERNEL_HEAP_STATUS_OK) {
-            cleanup_link = &node->next;
-        } else {
-            *cleanup_link = next;
-        }
+        (void)kernel_heap_release(adapter->heap, node);
+        *cleanup_link = next;
     }
     if (adapter->orphans != 0 || adapter->cleanup_nodes != 0 ||
         adapter->nodes != 0) {
@@ -517,14 +497,12 @@ int kernel_vfs_open(struct kernel_vfs_mount *mount,
     if (existing != 0) {
         result = ext4_fclose(&node->file);
         node->closed = 1U;
-        if (result != EOK ||
-            kernel_heap_release(adapter->heap, node) !=
-                KERNEL_HEAP_STATUS_OK) {
+        if (result != EOK) {
             node->next = adapter->cleanup_nodes;
             adapter->cleanup_nodes = node;
-            return result != EOK ? lwext4_error(result)
-                                 : -KERNEL_EIO;
+            return lwext4_error(result);
         }
+        (void)kernel_heap_release(adapter->heap, node);
         if (existing->references == UINT32_MAX ||
             existing->open_files == UINT32_MAX) {
             return -KERNEL_EOVERFLOW;
@@ -615,14 +593,12 @@ int kernel_vfs_create(struct kernel_vfs_mount *mount,
         }
         result = ext4_fclose(&node->file);
         node->closed = 1U;
-        if (result != EOK ||
-            kernel_heap_release(adapter->heap, node) !=
-                KERNEL_HEAP_STATUS_OK) {
+        if (result != EOK) {
             node->next = adapter->cleanup_nodes;
             adapter->cleanup_nodes = node;
-            return result != EOK ? lwext4_error(result)
-                                 : -KERNEL_EIO;
+            return lwext4_error(result);
         }
+        (void)kernel_heap_release(adapter->heap, node);
         if (existing->references == UINT32_MAX ||
             existing->open_files == UINT32_MAX) {
             return -KERNEL_EOVERFLOW;
@@ -1080,7 +1056,7 @@ int kernel_vfs_unlink(struct kernel_vfs_mount *mount,
 
     result = ext4_funlink_dentry(path, &inode, &is_orphan);
     if (result != EOK) {
-        (void)release_orphan(adapter, orphan);
+        release_orphan(adapter, orphan);
         return lwext4_error(result);
     }
 
@@ -1095,7 +1071,8 @@ int kernel_vfs_unlink(struct kernel_vfs_mount *mount,
             node->unlinked = 1U;
             kernel_vfs_try_release_orphan(node);
         }
-        return release_orphan(adapter, orphan);
+        release_orphan(adapter, orphan);
+        return 0;
     } else if (is_orphan) {
         orphan->inode = inode;
         orphan->orphan_freed = 0U;
@@ -1106,7 +1083,8 @@ int kernel_vfs_unlink(struct kernel_vfs_mount *mount,
         }
         orphan->orphan_freed = 1U;
     }
-    return release_orphan(adapter, orphan);
+    release_orphan(adapter, orphan);
+    return 0;
 }
 
 static int check_directory_empty(const char *path)
@@ -1316,10 +1294,7 @@ int kernel_vfs_node_release(struct kernel_vfs_node **owner)
         }
         node->closed = 1U;
     }
-    if (kernel_heap_release(node->adapter->heap, node) !=
-        KERNEL_HEAP_STATUS_OK) {
-        return -KERNEL_EIO;
-    }
+    (void)kernel_heap_release(node->adapter->heap, node);
     *owner = 0;
     return 0;
 }

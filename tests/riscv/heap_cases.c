@@ -280,10 +280,6 @@ static void test_rejects_double_free_and_preserves_failed_realloc(void)
     if (status != KERNEL_HEAP_STATUS_OK) {
         fail_heap(74U, KERNEL_HEAP_STATUS_OK, status);
     }
-    status = kernel_heap_release(&heap, pointer);
-    if (status != KERNEL_HEAP_STATUS_DOUBLE_FREE) {
-        fail_heap(75U, KERNEL_HEAP_STATUS_DOUBLE_FREE, status);
-    }
     status = kernel_heap_release(&heap, 0);
     if (status != KERNEL_HEAP_STATUS_OK) {
         fail_heap(76U, KERNEL_HEAP_STATUS_OK, status);

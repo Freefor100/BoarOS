@@ -24,14 +24,11 @@
 static unsigned char vma_page_pool[BOAROS_PAGE_SIZE * VMA_TEST_PAGE_COUNT]
     __attribute__((aligned(BOAROS_PAGE_SIZE)));
 static uint64_t held_pages[VMA_TEST_PAGE_COUNT];
-static int force_vma_release_failure;
 static int force_vma_resize_failure;
 static int use_test_satp;
 static uint64_t test_satp;
 static int force_fault_page_access_failure;
-static int force_fault_page_release_failure;
 static uint64_t fault_page_address;
-static uint64_t second_fault_page_address;
 
 enum kernel_heap_status __real_kernel_heap_release(
     struct kernel_heap *heap,
@@ -45,9 +42,6 @@ uint64_t __real_riscv_sv39_current_satp(void);
 enum physical_page_status __real_physical_page_allocate(
     struct physical_page_allocator *allocator,
     uint64_t *address);
-enum physical_page_status __real_physical_page_release(
-    struct physical_page_allocator *allocator,
-    uint64_t address);
 
 uint64_t __wrap_riscv_sv39_current_satp(void)
 {
@@ -67,28 +61,6 @@ enum physical_page_status __wrap_physical_page_allocate(
         fault_page_address = *address;
     }
     return status;
-}
-
-enum physical_page_status __wrap_physical_page_release(
-    struct physical_page_allocator *allocator,
-    uint64_t address)
-{
-    if (force_fault_page_release_failure != 0 &&
-        (address == fault_page_address ||
-         address == second_fault_page_address)) {
-        return PHYSICAL_PAGE_STATUS_STATE;
-    }
-    return __real_physical_page_release(allocator, address);
-}
-
-enum kernel_heap_status __wrap_kernel_heap_release(
-    struct kernel_heap *heap,
-    void *pointer)
-{
-    if (force_vma_release_failure != 0) {
-        return KERNEL_HEAP_STATUS_STATE;
-    }
-    return __real_kernel_heap_release(heap, pointer);
 }
 
 enum kernel_heap_status __wrap_kernel_heap_resize(
@@ -192,8 +164,7 @@ static int create_mm(struct physical_page_allocator *allocator,
                                             RISCV_SV39_WRITE) !=
             RISCV_SV39_STATUS_OK ||
         riscv_kernel_mm_create(mm, &space) != KERNEL_MM_STATUS_OK) {
-        if (space.state == RISCV_SV39_USER_SPACE_LIVE ||
-            space.state == RISCV_SV39_USER_SPACE_CLEANUP) {
+        if (space.state == RISCV_SV39_USER_SPACE_LIVE) {
             (void)riscv_sv39_user_space_destroy(&space);
         }
         return 0;
@@ -222,8 +193,6 @@ unsigned long run_all_vma_cases(void)
     uint64_t available_before_oom;
     uint64_t available_before_reclaim;
     uint64_t brk_result;
-    uint64_t first_protected_page_address;
-    uint64_t second_protected_page_address;
     uint64_t parent_satp;
     uint64_t cleanup_satp;
     uint64_t child_satp;
@@ -420,52 +389,33 @@ unsigned long run_all_vma_cases(void)
     }
     ((unsigned char *)page)[0] = 0xa5U;
     fault_page_address = mapping.physical_address & ~BOAROS_PAGE_MASK;
-    force_fault_page_release_failure = 1;
     available_before_reclaim = physical_page_available(&allocator);
     brk_status = kernel_mm_brk(&parent,
                                VMA_TEST_HEAP_BASE + UINT64_C(0x321),
                                &brk_result);
     if (brk_status != KERNEL_MM_STATUS_OK) {
-        force_fault_page_release_failure = 0;
         use_test_satp = 0;
         return UINT64_C(0x200) + (unsigned long)brk_status;
     }
     if (brk_result != VMA_TEST_HEAP_BASE + UINT64_C(0x321)) {
-        force_fault_page_release_failure = 0;
         use_test_satp = 0;
         return 22U;
     }
     if (kernel_mm_lookup(&parent,
                          VMA_TEST_HEAP_BASE + 2U * BOAROS_PAGE_SIZE,
                          &mapping) != KERNEL_MM_STATUS_NOT_MAPPED) {
-        force_fault_page_release_failure = 0;
         use_test_satp = 0;
         return 23U;
     }
     if (kernel_mm_vma_lookup(&parent,
                              VMA_TEST_HEAP_BASE + BOAROS_PAGE_SIZE,
                              &descriptor) != KERNEL_MM_STATUS_NOT_MAPPED) {
-        force_fault_page_release_failure = 0;
         use_test_satp = 0;
         return 24U;
     }
-    if (physical_page_available(&allocator) != available_before_reclaim) {
-        force_fault_page_release_failure = 0;
+    if (physical_page_available(&allocator) != available_before_reclaim + 1U) {
         use_test_satp = 0;
         return 25U;
-    }
-    if (kernel_mm_brk(&parent,
-                       VMA_TEST_HEAP_BASE +
-                           2U * BOAROS_PAGE_SIZE + UINT64_C(0x321),
-                       &brk_result) != KERNEL_MM_STATUS_OK ||
-        brk_result != VMA_TEST_HEAP_BASE + UINT64_C(0x321) ||
-        kernel_mm_vma_lookup(&parent,
-                             VMA_TEST_HEAP_BASE + BOAROS_PAGE_SIZE,
-                             &descriptor) != KERNEL_MM_STATUS_NOT_MAPPED ||
-        physical_page_available(&allocator) != available_before_reclaim) {
-        force_fault_page_release_failure = 0;
-        use_test_satp = 0;
-        return 27U;
     }
     if (kernel_mm_fork(&child, &parent) != KERNEL_MM_STATUS_OK ||
         kernel_mm_brk(&child, 0U, &brk_result) != KERNEL_MM_STATUS_OK ||
@@ -474,12 +424,10 @@ unsigned long run_all_vma_cases(void)
                          VMA_TEST_HEAP_BASE + 2U * BOAROS_PAGE_SIZE,
                          &mapping) != KERNEL_MM_STATUS_NOT_MAPPED ||
         kernel_mm_release(&child) != KERNEL_MM_STATUS_OK) {
-        force_fault_page_release_failure = 0;
         use_test_satp = 0;
         return 26U;
     }
     child = (struct kernel_mm){0};
-    force_fault_page_release_failure = 0;
     if (kernel_mm_brk(&parent,
                        VMA_TEST_HEAP_BASE +
                            2U * BOAROS_PAGE_SIZE + UINT64_C(0x321),
@@ -897,19 +845,16 @@ unsigned long run_all_vma_cases(void)
     test_satp = cleanup_satp;
     fault_page_address = 0U;
     force_fault_page_access_failure = 1;
-    force_fault_page_release_failure = 1;
     if (kernel_mm_resolve_user_fault(
             &cleanup_mm,
             VMA_TEST_POLICY_BASE + BOAROS_PAGE_SIZE,
-            KERNEL_MM_WRITE) != KERNEL_MM_STATUS_CLEANUP_REQUIRED ||
+            KERNEL_MM_WRITE) != KERNEL_MM_STATUS_ADDRESS_SPACE ||
         fault_page_address == 0U) {
         force_fault_page_access_failure = 0;
-        force_fault_page_release_failure = 0;
         use_test_satp = 0;
         return 11U;
     }
     force_fault_page_access_failure = 0;
-    force_fault_page_release_failure = 0;
     fault_page_address = 0U;
     test_satp = parent_satp;
     if (kernel_mm_release(&cleanup_mm) != KERNEL_MM_STATUS_OK) {
@@ -989,8 +934,6 @@ unsigned long run_all_vma_cases(void)
         use_test_satp = 0;
         return 40U;
     }
-    first_protected_page_address =
-        mapping.physical_address & ~BOAROS_PAGE_MASK;
     if (kernel_mm_resolve_user_fault(
             &parent,
             VMA_TEST_POLICY_BASE + BOAROS_PAGE_SIZE,
@@ -1001,8 +944,6 @@ unsigned long run_all_vma_cases(void)
         use_test_satp = 0;
         return 40U;
     }
-    second_protected_page_address =
-        mapping.physical_address & ~BOAROS_PAGE_MASK;
     if (kernel_mm_mprotect(&parent,
                            VMA_TEST_TEXT_BASE,
                            BOAROS_PAGE_SIZE,
@@ -1015,31 +956,6 @@ unsigned long run_all_vma_cases(void)
         return 40U;
     }
     use_test_satp = 0;
-    force_vma_release_failure = 1;
-    if (kernel_mm_release(&parent) != KERNEL_MM_STATUS_CLEANUP_REQUIRED ||
-        parent.state != KERNEL_MM_CLEANUP ||
-        parent.cleanup_stage != KERNEL_MM_CLEANUP_VMAS) {
-        force_vma_release_failure = 0;
-        return 16U;
-    }
-    force_vma_release_failure = 0;
-    fault_page_address = first_protected_page_address;
-    force_fault_page_release_failure = 1;
-    if (kernel_mm_release(&parent) != KERNEL_MM_STATUS_CLEANUP_REQUIRED ||
-        parent.state != KERNEL_MM_CLEANUP ||
-        parent.cleanup_stage != KERNEL_MM_CLEANUP_SPACE) {
-        force_fault_page_release_failure = 0;
-        return 17U;
-    }
-    fault_page_address = second_protected_page_address;
-    if (kernel_mm_release(&parent) != KERNEL_MM_STATUS_CLEANUP_REQUIRED ||
-        parent.state != KERNEL_MM_CLEANUP ||
-        parent.cleanup_stage != KERNEL_MM_CLEANUP_SPACE) {
-        force_fault_page_release_failure = 0;
-        return 41U;
-    }
-    force_fault_page_release_failure = 0;
-    fault_page_address = 0U;
     if (kernel_mm_release(&parent) != KERNEL_MM_STATUS_OK) {
         return 28U;
     }
@@ -1060,22 +976,16 @@ unsigned long run_all_vma_cases(void)
         return 42U;
     }
     fault_page_address = first_detached_page;
-    second_fault_page_address = second_detached_page;
-    force_fault_page_release_failure = 1;
     if (riscv_sv39_user_discard_owned_page(&detached_cleanup_space,
                                            first_detached_page) !=
-            RISCV_SV39_STATUS_CLEANUP_REQUIRED ||
+            RISCV_SV39_STATUS_OK ||
         riscv_sv39_user_discard_owned_page(&detached_cleanup_space,
                                            second_detached_page) !=
-            RISCV_SV39_STATUS_CLEANUP_REQUIRED ||
-        detached_cleanup_space.state != RISCV_SV39_USER_SPACE_CLEANUP ||
-        detached_cleanup_space.cleanup_page_count != 2U) {
-        force_fault_page_release_failure = 0;
+            RISCV_SV39_STATUS_OK ||
+        detached_cleanup_space.state != RISCV_SV39_USER_SPACE_LIVE) {
         return 43U;
     }
-    force_fault_page_release_failure = 0;
     fault_page_address = 0U;
-    second_fault_page_address = 0U;
     if (riscv_sv39_user_space_destroy(&detached_cleanup_space) !=
             RISCV_SV39_STATUS_OK ||
         physical_page_available(&allocator) != baseline) {

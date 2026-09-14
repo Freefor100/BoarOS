@@ -18,7 +18,6 @@ enum kernel_vma_status {
     KERNEL_VMA_STATUS_NO_MEMORY,
     KERNEL_VMA_STATUS_CONFLICT,
     KERNEL_VMA_STATUS_NOT_FOUND,
-    KERNEL_VMA_STATUS_CLEANUP_REQUIRED,
     KERNEL_VMA_STATUS_STATE,
 };
 
@@ -73,18 +72,17 @@ struct kernel_vma_edit {
 
 /*
  * These helpers are private to architecture MM backends.  A set borrows heap;
- * its owner must keep heap live through set destruction and every retry.
+ * its owner must keep heap live through set destruction.
  */
 enum kernel_vma_status kernel_vma_set_create(
     struct kernel_heap *heap,
     struct kernel_vma_set **set);
 
-/* On cleanup-required failure, destination remains an owned retryable set. */
 enum kernel_vma_status kernel_vma_set_clone(
     const struct kernel_vma_set *source,
     struct kernel_vma_set **destination);
 
-/* Success clears *set; cleanup-required leaves it retryable. */
+/* Success clears *set. */
 enum kernel_vma_status kernel_vma_set_destroy(struct kernel_vma_set **set);
 
 enum kernel_vma_status kernel_vma_set_insert(

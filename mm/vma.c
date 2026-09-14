@@ -296,10 +296,7 @@ enum kernel_vma_status kernel_vma_set_clone(
         *destination = working;
         return KERNEL_VMA_STATUS_OK;
     }
-    if (kernel_vma_set_destroy(&working) != KERNEL_VMA_STATUS_OK) {
-        *destination = working;
-        return KERNEL_VMA_STATUS_CLEANUP_REQUIRED;
-    }
+    (void)kernel_vma_set_destroy(&working);
     return status;
 }
 
@@ -312,18 +309,12 @@ enum kernel_vma_status kernel_vma_set_destroy(struct kernel_vma_set **set)
     }
     working = *set;
     if (working->entries != 0) {
-        if (kernel_heap_release(working->heap, working->entries) !=
-            KERNEL_HEAP_STATUS_OK) {
-            return KERNEL_VMA_STATUS_CLEANUP_REQUIRED;
-        }
+        (void)kernel_heap_release(working->heap, working->entries);
         working->entries = 0;
         working->count = 0U;
         working->capacity = 0U;
     }
-    if (kernel_heap_release(working->heap, working) !=
-        KERNEL_HEAP_STATUS_OK) {
-        return KERNEL_VMA_STATUS_CLEANUP_REQUIRED;
-    }
+    (void)kernel_heap_release(working->heap, working);
     *set = 0;
     return KERNEL_VMA_STATUS_OK;
 }

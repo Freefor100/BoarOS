@@ -338,33 +338,33 @@ static enum physical_page_status physical_page_release_bootstrap(
     uint64_t scanned = 0U;
 
     if (!address_was_allocated(allocator, address)) {
-        return PHYSICAL_PAGE_STATUS_INVALID;
+        __builtin_trap();
     }
     if (allocator->access == 0) {
-        return PHYSICAL_PAGE_STATUS_STATE;
+        __builtin_trap();
     }
 
     current = allocator->recycled_head;
     while (current != PHYSICAL_PAGE_NONE &&
            scanned < allocator->total_pages) {
         if (current == address) {
-            return PHYSICAL_PAGE_STATUS_DOUBLE_FREE;
+            __builtin_trap();
         }
         if (!address_was_allocated(allocator, current)) {
-            return PHYSICAL_PAGE_STATUS_INVALID;
+            __builtin_trap();
         }
         if (!read_recycled_node(allocator, current, &current)) {
-            return PHYSICAL_PAGE_STATUS_INVALID;
+            __builtin_trap();
         }
         scanned++;
     }
     if (current != PHYSICAL_PAGE_NONE ||
         allocator->available_pages >= allocator->total_pages) {
-        return PHYSICAL_PAGE_STATUS_INVALID;
+        __builtin_trap();
     }
 
     if (!write_recycled_node(allocator, address, allocator->recycled_head)) {
-        return PHYSICAL_PAGE_STATUS_INVALID;
+        __builtin_trap();
     }
     allocator->recycled_head = address;
     allocator->available_pages++;
@@ -1051,19 +1051,19 @@ enum physical_page_status physical_page_release_order(
     if (!allocator_initialized(allocator) ||
         order > PHYSICAL_PAGE_MAX_ORDER ||
         !page_lookup(allocator, address, &original_range, &page_index)) {
-        return PHYSICAL_PAGE_STATUS_INVALID;
+        __builtin_trap();
     }
     if (!physical_page_allocator_is_finalized(allocator)) {
-        return PHYSICAL_PAGE_STATUS_STATE;
+        __builtin_trap();
     }
 
     metadata = &allocator->metadata[page_index];
     if (metadata->state == PHYSICAL_PAGE_STATE_FREE_HEAD ||
         metadata->state == PHYSICAL_PAGE_STATE_FREE_TAIL) {
-        return PHYSICAL_PAGE_STATUS_DOUBLE_FREE;
+        __builtin_trap();
     }
     if (!allocated_block_valid(allocator, page_index, order)) {
-        return PHYSICAL_PAGE_STATUS_INVALID;
+        __builtin_trap();
     }
 
     if (order == 0U && metadata->reference_count > 1U) {
@@ -1071,12 +1071,13 @@ enum physical_page_status physical_page_release_order(
         return PHYSICAL_PAGE_STATUS_OK;
     }
     if (metadata->reference_count != 1U) {
-        return PHYSICAL_PAGE_STATUS_INVALID;
+        __builtin_trap();
     }
 
     block_pages = order_page_count(order);
-    if (block_pages > allocator->total_pages - allocator->available_pages) {
-        return PHYSICAL_PAGE_STATUS_INVALID;
+    if (allocator->available_pages > allocator->total_pages ||
+        block_pages > allocator->total_pages - allocator->available_pages) {
+        __builtin_trap();
     }
 
     current_address = address;
@@ -1093,10 +1094,12 @@ enum physical_page_status physical_page_release_order(
                          &buddy_range,
                          &buddy_index) ||
             buddy_range != original_range ||
-            !free_list_node_valid(allocator,
-                                  buddy_index,
-                                  current_order)) {
+            allocator->metadata[buddy_index].state != PHYSICAL_PAGE_STATE_FREE_HEAD ||
+            allocator->metadata[buddy_index].order != current_order) {
             break;
+        }
+        if (!free_list_node_valid(allocator, buddy_index, current_order)) {
+            __builtin_trap();
         }
         merge_buddies[merge_count++] = buddy_index;
         if (buddy_address < current_address) {
@@ -1109,7 +1112,7 @@ enum physical_page_status physical_page_release_order(
         !free_list_node_valid(allocator,
                               allocator->free_heads[current_order],
                               current_order)) {
-        return PHYSICAL_PAGE_STATUS_INVALID;
+        __builtin_trap();
     }
 
     mark_block(allocator,
@@ -1125,7 +1128,7 @@ enum physical_page_status physical_page_release_order(
         if (!free_list_remove(allocator,
                               merge_buddies[page_index],
                               buddy_order)) {
-            return PHYSICAL_PAGE_STATUS_INVALID;
+            __builtin_trap();
         }
         buddy_metadata = &allocator->metadata[merge_buddies[page_index]];
         buddy_metadata->order = 0U;
@@ -1133,7 +1136,7 @@ enum physical_page_status physical_page_release_order(
     }
     if (!page_lookup(allocator, current_address, 0, &page_index) ||
         !free_list_insert(allocator, page_index, current_order)) {
-        return PHYSICAL_PAGE_STATUS_INVALID;
+        __builtin_trap();
     }
 
     allocator->available_pages += block_pages;
@@ -1158,7 +1161,7 @@ enum physical_page_status physical_page_release(
     uint64_t address)
 {
     if (!allocator_initialized(allocator)) {
-        return PHYSICAL_PAGE_STATUS_INVALID;
+        __builtin_trap();
     }
     if (physical_page_allocator_is_finalized(allocator)) {
         return physical_page_release_order(allocator, address, 0U);
@@ -1174,25 +1177,23 @@ enum physical_page_status physical_page_acquire(
     struct physical_page_metadata *metadata;
 
     if (!allocator_initialized(allocator) ||
-        !page_lookup(allocator, address, 0, &page_index)) {
-        return PHYSICAL_PAGE_STATUS_INVALID;
-    }
-    if (!physical_page_allocator_is_finalized(allocator)) {
-        return PHYSICAL_PAGE_STATUS_STATE;
+        !page_lookup(allocator, address, 0, &page_index) ||
+        !physical_page_allocator_is_finalized(allocator)) {
+        __builtin_trap();
     }
 
     metadata = &allocator->metadata[page_index];
     if (metadata->state == PHYSICAL_PAGE_STATE_FREE_HEAD ||
         metadata->state == PHYSICAL_PAGE_STATE_FREE_TAIL) {
-        return PHYSICAL_PAGE_STATUS_DOUBLE_FREE;
+        __builtin_trap();
     }
     if (metadata->state != PHYSICAL_PAGE_STATE_ALLOCATED_HEAD ||
         metadata->order != 0U ||
         !allocated_block_valid(allocator, page_index, 0U)) {
-        return PHYSICAL_PAGE_STATUS_STATE;
+        __builtin_trap();
     }
     if (metadata->reference_count == UINT32_MAX) {
-        return PHYSICAL_PAGE_STATUS_STATE;
+        __builtin_trap();
     }
 
     metadata->reference_count++;
@@ -1208,23 +1209,21 @@ enum physical_page_status physical_page_reference_count(
     const struct physical_page_metadata *metadata;
 
     if (!allocator_initialized(allocator) || references == 0 ||
-        !page_lookup(allocator, address, 0, &page_index)) {
-        return PHYSICAL_PAGE_STATUS_INVALID;
-    }
-    if (!physical_page_allocator_is_finalized(allocator)) {
-        return PHYSICAL_PAGE_STATUS_STATE;
+        !page_lookup(allocator, address, 0, &page_index) ||
+        !physical_page_allocator_is_finalized(allocator)) {
+        __builtin_trap();
     }
 
     metadata = &allocator->metadata[page_index];
     if (metadata->state == PHYSICAL_PAGE_STATE_FREE_HEAD ||
         metadata->state == PHYSICAL_PAGE_STATE_FREE_TAIL) {
-        return PHYSICAL_PAGE_STATUS_DOUBLE_FREE;
+        __builtin_trap();
     }
     if (metadata->state != PHYSICAL_PAGE_STATE_ALLOCATED_HEAD ||
         !allocated_block_valid(allocator,
                                page_index,
                                metadata->order)) {
-        return PHYSICAL_PAGE_STATUS_INVALID;
+        __builtin_trap();
     }
 
     *references = metadata->reference_count;

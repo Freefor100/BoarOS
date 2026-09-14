@@ -127,11 +127,8 @@ static enum kernel_files_status read_pinned(
             return KERNEL_FILES_STATUS_OK;
         }
         if (page_offset >= valid_bytes) {
-            if (physical_page_release(files->heap->page_allocator,
-                                      physical_address) !=
-                PHYSICAL_PAGE_STATUS_OK) {
-                return KERNEL_FILES_STATUS_STATE;
-            }
+            (void)physical_page_release(files->heap->page_allocator,
+                                      physical_address);
             break;
         }
         chunk = valid_bytes - page_offset;
@@ -299,11 +296,8 @@ enum kernel_files_status kernel_files_pread(
             return KERNEL_FILES_STATUS_OK;
         }
         if (page_offset >= valid_bytes) {
-            if (physical_page_release(files->heap->page_allocator,
-                                      physical_address) !=
-                PHYSICAL_PAGE_STATUS_OK) {
-                return KERNEL_FILES_STATUS_STATE;
-            }
+            (void)physical_page_release(files->heap->page_allocator,
+                                      physical_address);
             break;
         }
         chunk = valid_bytes - page_offset;
@@ -322,10 +316,8 @@ enum kernel_files_status kernel_files_pread(
                                             (unsigned char *)page + page_offset,
                                             chunk,
                                             &copied);
-        if (physical_page_release(files->heap->page_allocator,
-                                  physical_address) != PHYSICAL_PAGE_STATUS_OK) {
-            return KERNEL_FILES_STATUS_STATE;
-        }
+        (void)physical_page_release(files->heap->page_allocator,
+                                  physical_address);
         total += copied;
         position += copied;
         if (access_status == KERNEL_UACCESS_STATUS_FAULT) {
@@ -622,7 +614,7 @@ enum kernel_files_status kernel_files_writev(
                            linux_result);
 out:
     if (iov != local &&
-        kernel_files_release_or_queue_allocation(files, iov) ==
+        kernel_files_release_allocation(files, iov) ==
             KERNEL_FILES_STATUS_STATE) {
         status = KERNEL_FILES_STATUS_STATE;
     }

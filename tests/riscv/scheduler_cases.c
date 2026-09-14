@@ -269,40 +269,6 @@ static unsigned long run_create_cases(
     };
     unsigned long failures = 0U;
 
-    access_calls_before_failure = 0U;
-    fail_access_count = 2U;
-    failures += expect_status(KERNEL_SCHEDULER_STATUS_PAGE_RELEASE,
-                              kernel_thread_create(thread_entry, 0));
-    if (physical_page_available(allocator) + 1U != initial_available) {
-        failures++;
-    }
-    fail_access_count = 0U;
-    failures += expect_status(KERNEL_SCHEDULER_STATUS_PAGE_RELEASE,
-                              kernel_thread_create(thread_entry, 0));
-    if (physical_page_available(allocator) + 1U != initial_available) {
-        failures++;
-    }
-    access_calls_before_failure = 0U;
-    fail_access_count = 1U;
-    failures += expect_status(KERNEL_SCHEDULER_STATUS_PAGE_RELEASE,
-                              kernel_scheduler_reap_one(&completion));
-    if (completion.kind != (enum kernel_thread_kind)0x21 ||
-        completion.reason != (enum kernel_thread_exit_reason)0x43 ||
-        completion.status != UINT64_C(0x65768798a9bacbdc) ||
-        completion.detail != UINT64_C(0xedfe0f1021324354) ||
-        physical_page_available(allocator) + 1U != initial_available) {
-        failures++;
-    }
-    failures += expect_status(KERNEL_SCHEDULER_STATUS_EMPTY,
-                              kernel_scheduler_reap_one(&completion));
-    if (completion.kind != (enum kernel_thread_kind)0x21 ||
-        completion.reason != (enum kernel_thread_exit_reason)0x43 ||
-        completion.status != UINT64_C(0x65768798a9bacbdc) ||
-        completion.detail != UINT64_C(0xedfe0f1021324354) ||
-        physical_page_available(allocator) != initial_available) {
-        failures++;
-    }
-
     access_calls_before_failure = 1U;
     fail_access_count = 1U;
     failures += expect_status(KERNEL_SCHEDULER_STATUS_PAGE_ACCESS,

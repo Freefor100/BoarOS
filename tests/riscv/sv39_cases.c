@@ -526,7 +526,6 @@ static int test_user_space_lifecycle(void)
     void *stack_page;
     uint64_t available_before_invalid;
     uint64_t user_satp = UINT64_C(0x1122334455667788);
-    uint32_t deferred_pages;
 
     layout.usable_count = 1U;
     layout.usable[0].base = (uint64_t)(uintptr_t)user_space_page_pool;
@@ -660,13 +659,11 @@ static int test_user_space_lifecycle(void)
     }
 
     available_before_invalid = physical_page_available(&allocator);
-    deferred_pages = UINT32_MAX;
     if (riscv_sv39_user_unmap_owned_range(
             &source,
             code_va + 1U,
-            code_va + RISCV_SV39_PAGE_SIZE_4K,
-            &deferred_pages) != RISCV_SV39_STATUS_INVALID ||
-        source.leaf_pages != 2U || source.retired_pages != 0U ||
+            code_va + RISCV_SV39_PAGE_SIZE_4K) != RISCV_SV39_STATUS_INVALID ||
+        source.leaf_pages != 2U ||
         physical_page_available(&allocator) != available_before_invalid ||
         riscv_sv39_user_lookup(&source, code_va, &mapping) !=
             RISCV_SV39_STATUS_OK) {
@@ -675,20 +672,12 @@ static int test_user_space_lifecycle(void)
     if (riscv_sv39_user_unmap_owned_range(
             &source,
             code_va,
-            code_va + RISCV_SV39_PAGE_SIZE_4K,
-            &deferred_pages) != RISCV_SV39_STATUS_OK ||
-        deferred_pages != 0U || source.leaf_pages != 1U ||
-        source.retired_pages != 0U ||
+            code_va + RISCV_SV39_PAGE_SIZE_4K) != RISCV_SV39_STATUS_OK ||
+        source.leaf_pages != 1U ||
         physical_page_available(&allocator) !=
             available_before_invalid + 1U ||
         riscv_sv39_user_lookup(&source, code_va, &mapping) !=
-            RISCV_SV39_STATUS_NOT_MAPPED ||
-        riscv_sv39_user_reclaim_retired_range(
-            &source,
-            code_va,
-            code_va + RISCV_SV39_PAGE_SIZE_4K,
-            &deferred_pages) != RISCV_SV39_STATUS_OK ||
-        deferred_pages != 0U) {
+            RISCV_SV39_STATUS_NOT_MAPPED) {
         return 67;
     }
 

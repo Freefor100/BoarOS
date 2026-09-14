@@ -64,7 +64,7 @@ static int validate_open_flags(uint64_t flags, uint32_t *fd_flags)
 static enum kernel_files_status finish_path(struct kernel_files *files,
                                              char *path)
 {
-    return kernel_files_release_or_queue_allocation(files, path) ==
+    return kernel_files_release_allocation(files, path) ==
                    KERNEL_FILES_STATUS_OK
                ? KERNEL_FILES_STATUS_OK
                : KERNEL_FILES_STATUS_STATE;
@@ -415,7 +415,7 @@ enum kernel_files_status kernel_files_fstatat(
                                          &path_length);
 
         if (access_status != KERNEL_UACCESS_STATUS_OK) {
-            (void)kernel_files_release_or_queue_allocation(files, path);
+            (void)kernel_files_release_allocation(files, path);
             if (access_status == KERNEL_UACCESS_STATUS_FAULT) {
                 *linux_result = -KERNEL_EFAULT;
                 return KERNEL_FILES_STATUS_OK;
@@ -429,19 +429,19 @@ enum kernel_files_status kernel_files_fstatat(
     }
     if (path_length == 0U) {
         if ((flags & KERNEL_FILES_AT_EMPTY_PATH) == 0U) {
-            (void)kernel_files_release_or_queue_allocation(files, path);
+            (void)kernel_files_release_allocation(files, path);
             *linux_result = -KERNEL_ENOENT;
             return KERNEL_FILES_STATUS_OK;
         }
         description = kernel_files_lookup_description(files, dirfd);
         if (description == 0) {
-            (void)kernel_files_release_or_queue_allocation(files, path);
+            (void)kernel_files_release_allocation(files, path);
             *linux_result = -KERNEL_EBADF;
             return KERNEL_FILES_STATUS_OK;
         }
         if (kernel_open_file_acquire(description) !=
             KERNEL_OPEN_FILE_STATUS_OK) {
-            (void)kernel_files_release_or_queue_allocation(files, path);
+            (void)kernel_files_release_allocation(files, path);
             return KERNEL_FILES_STATUS_STATE;
         }
     } else {
@@ -454,11 +454,11 @@ enum kernel_files_status kernel_files_fstatat(
                                                           &mount,
                                                           &result);
         if (fs_status != KERNEL_FS_CONTEXT_STATUS_OK) {
-            (void)kernel_files_release_or_queue_allocation(files, path);
+            (void)kernel_files_release_allocation(files, path);
             return KERNEL_FILES_STATUS_STATE;
         }
         if (result != 0) {
-            (void)kernel_files_release_or_queue_allocation(files, path);
+            (void)kernel_files_release_allocation(files, path);
             *linux_result = result;
             return KERNEL_FILES_STATUS_OK;
         }
@@ -468,7 +468,7 @@ enum kernel_files_status kernel_files_fstatat(
                                               &description,
                                               &result);
         if (open_status != KERNEL_OPEN_FILE_STATUS_OK) {
-            (void)kernel_files_release_or_queue_allocation(files, path);
+            (void)kernel_files_release_allocation(files, path);
             if (open_status == KERNEL_OPEN_FILE_STATUS_CLEANUP_REQUIRED &&
                 description != 0) {
                 kernel_files_queue_description(files, description);
@@ -485,15 +485,15 @@ enum kernel_files_status kernel_files_fstatat(
             if (description != 0 &&
                 kernel_open_file_release(&description) !=
                     KERNEL_OPEN_FILE_STATUS_OK) {
-                (void)kernel_files_release_or_queue_allocation(files, path);
+                (void)kernel_files_release_allocation(files, path);
                 return KERNEL_FILES_STATUS_STATE;
             }
-            (void)kernel_files_release_or_queue_allocation(files, path);
+            (void)kernel_files_release_allocation(files, path);
             *linux_result = result;
             return KERNEL_FILES_STATUS_OK;
         }
     }
-    (void)kernel_files_release_or_queue_allocation(files, path);
+    (void)kernel_files_release_allocation(files, path);
     fill_linux_stat(&stat, description);
     copy_result = copy_stat_to_user(mm, user_buffer, &stat, linux_result);
     open_status = kernel_open_file_release(&description);

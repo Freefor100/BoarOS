@@ -271,13 +271,6 @@ enum kernel_scheduler_status validate_queues(void)
 {
     enum kernel_scheduler_status status;
 
-    if (scheduler.cleanup_page_owned > 1U ||
-        (scheduler.cleanup_page_owned == 0U &&
-         scheduler.cleanup_page_address != 0U) ||
-        (scheduler.cleanup_page_owned != 0U &&
-         (scheduler.cleanup_page_address & BOAROS_PAGE_MASK) != 0U)) {
-        return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
-    }
 
     status = validate_queue_shape(scheduler.ready_head,
                                   scheduler.ready_tail);
@@ -419,15 +412,7 @@ enum kernel_scheduler_status release_after_create_failure(
     uint64_t physical_address,
     enum kernel_scheduler_status original_status)
 {
-    if (scheduler.cleanup_page_owned != 0U) {
-        return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
-    }
-    if (physical_page_release(scheduler.allocator, physical_address) !=
-        PHYSICAL_PAGE_STATUS_OK) {
-        scheduler.cleanup_page_address = physical_address;
-        scheduler.cleanup_page_owned = 1U;
-        return KERNEL_SCHEDULER_STATUS_PAGE_RELEASE;
-    }
+    (void)physical_page_release(scheduler.allocator, physical_address);
     return original_status;
 }
 
@@ -506,8 +491,6 @@ enum kernel_scheduler_status kernel_scheduler_init(
     scheduler.stopped_head = 0;
     scheduler.stopped_tail = 0;
     scheduler.init_task = 0;
-    scheduler.cleanup_page_address = 0U;
-    scheduler.cleanup_page_owned = 0U;
     scheduler.fatal_status = KERNEL_SCHEDULER_STATUS_OK;
     scheduler.idle_context_saved = 0U;
     scheduler.initialized = KERNEL_SCHEDULER_INITIALIZED;
@@ -546,10 +529,6 @@ enum kernel_scheduler_status kernel_thread_create(
     }
     status = validate_queues();
     if (status != KERNEL_SCHEDULER_STATUS_OK) {
-        goto restore_interrupts;
-    }
-    if (scheduler.cleanup_page_owned != 0U) {
-        status = KERNEL_SCHEDULER_STATUS_PAGE_RELEASE;
         goto restore_interrupts;
     }
 
@@ -671,10 +650,6 @@ enum kernel_scheduler_status kernel_user_thread_create(
     }
     status = validate_queues();
     if (status != KERNEL_SCHEDULER_STATUS_OK) {
-        goto restore_interrupts;
-    }
-    if (scheduler.cleanup_page_owned != 0U) {
-        status = KERNEL_SCHEDULER_STATUS_PAGE_RELEASE;
         goto restore_interrupts;
     }
     if (mm->allocator != scheduler.allocator) {

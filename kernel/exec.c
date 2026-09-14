@@ -62,10 +62,7 @@ static int release_allocation(struct kernel_exec_transaction *transaction,
     if (*pointer == 0) {
         return 1;
     }
-    if (kernel_heap_release(transaction->heap, *pointer) !=
-        KERNEL_HEAP_STATUS_OK) {
-        return 0;
-    }
+    (void)kernel_heap_release(transaction->heap, *pointer);
     *pointer = 0;
     return 1;
 }

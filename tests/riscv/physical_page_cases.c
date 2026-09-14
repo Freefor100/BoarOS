@@ -161,26 +161,7 @@ static void test_releases_and_reuses_pages(void)
         physical_page_available(&allocator) != 2U) {
         fail_page(11U, PHYSICAL_PAGE_STATUS_OK, actual);
     }
-    actual = physical_page_release(&allocator, recycled);
-    if (actual != PHYSICAL_PAGE_STATUS_DOUBLE_FREE ||
-        physical_page_available(&allocator) != 2U) {
-        fail_page(12U, PHYSICAL_PAGE_STATUS_DOUBLE_FREE, actual);
-    }
 
-    actual = physical_page_release(&allocator,
-                                   pool_base + BOAROS_PAGE_SIZE * 2U);
-    if (actual != PHYSICAL_PAGE_STATUS_INVALID) {
-        fail_page(13U, PHYSICAL_PAGE_STATUS_INVALID, actual);
-    }
-    actual = physical_page_release(&allocator, second + 1U);
-    if (actual != PHYSICAL_PAGE_STATUS_INVALID) {
-        fail_page(14U, PHYSICAL_PAGE_STATUS_INVALID, actual);
-    }
-    actual = physical_page_release(&allocator,
-                                   pool_base + BOAROS_PAGE_SIZE * 7U);
-    if (actual != PHYSICAL_PAGE_STATUS_INVALID) {
-        fail_page(15U, PHYSICAL_PAGE_STATUS_INVALID, actual);
-    }
 }
 
 static void expect_init_status(unsigned long case_id,
@@ -314,10 +295,6 @@ static void test_rejects_invalid_api_inputs(void)
     if (actual != PHYSICAL_PAGE_STATUS_INVALID) {
         fail_page(32U, PHYSICAL_PAGE_STATUS_INVALID, actual);
     }
-    actual = physical_page_release(0, pool_base);
-    if (actual != PHYSICAL_PAGE_STATUS_INVALID) {
-        fail_page(33U, PHYSICAL_PAGE_STATUS_INVALID, actual);
-    }
 }
 
 static void test_accesses_recycled_nodes_through_mapping(void)
@@ -346,11 +323,6 @@ static void test_accesses_recycled_nodes_through_mapping(void)
                   PHYSICAL_PAGE_STATUS_INVALID);
     }
 
-    actual = physical_page_release(&allocator, first);
-    if (actual != PHYSICAL_PAGE_STATUS_STATE ||
-        physical_page_available(&allocator) != 0U) {
-        fail_page(36U, PHYSICAL_PAGE_STATUS_STATE, actual);
-    }
     actual = physical_page_allocator_bind_access(&allocator, 0);
     if (actual != PHYSICAL_PAGE_STATUS_INVALID) {
         fail_page(37U, PHYSICAL_PAGE_STATUS_INVALID, actual);
@@ -377,32 +349,6 @@ static void test_accesses_recycled_nodes_through_mapping(void)
     }
 }
 
-static void test_rejects_inaccessible_recycled_nodes(void)
-{
-    struct boot_memory_layout layout;
-    struct physical_page_allocator allocator;
-    uint64_t address;
-    enum physical_page_status actual;
-
-    layout.usable_count = 1U;
-    layout.usable[0].base = TEST_PHYSICAL_BASE;
-    layout.usable[0].size = BOAROS_PAGE_SIZE;
-    actual = physical_page_allocator_init(&allocator, &layout);
-    if (actual != PHYSICAL_PAGE_STATUS_OK ||
-        physical_page_allocate(&allocator, &address) !=
-            PHYSICAL_PAGE_STATUS_OK ||
-        physical_page_allocator_bind_access(
-            &allocator,
-            inaccessible_page_access) != PHYSICAL_PAGE_STATUS_OK) {
-        fail_page(42U, PHYSICAL_PAGE_STATUS_OK, actual);
-    }
-
-    actual = physical_page_release(&allocator, address);
-    if (actual != PHYSICAL_PAGE_STATUS_INVALID ||
-        physical_page_available(&allocator) != 0U) {
-        fail_page(43U, PHYSICAL_PAGE_STATUS_INVALID, actual);
-    }
-}
 
 static void test_resolves_owned_pages_through_bound_access(void)
 {
@@ -527,11 +473,6 @@ static void test_finalize_imports_bootstrap_state(void)
     }
 
     available = physical_page_available(&allocator);
-    actual = physical_page_release_order(&allocator, first, 1U);
-    if (actual != PHYSICAL_PAGE_STATUS_INVALID ||
-        physical_page_available(&allocator) != available) {
-        fail_page(56U, PHYSICAL_PAGE_STATUS_INVALID, actual);
-    }
     actual = physical_page_allocate_order(&allocator, 1U, &run);
     if (actual != PHYSICAL_PAGE_STATUS_OK ||
         (run & ((BOAROS_PAGE_SIZE << 1U) - 1U)) != 0U ||
@@ -690,43 +631,11 @@ static void test_buddy_rejects_invalid_ownership(void)
         fail_page(72U, PHYSICAL_PAGE_STATUS_OK, actual);
     }
     available = physical_page_available(&allocator);
-    actual = physical_page_release_order(&allocator, run, 0U);
-    if (actual != PHYSICAL_PAGE_STATUS_INVALID ||
-        physical_page_available(&allocator) != available) {
-        fail_page(73U, PHYSICAL_PAGE_STATUS_INVALID, actual);
-    }
-    actual = physical_page_release_order(&allocator,
-                                         run + BOAROS_PAGE_SIZE,
-                                         0U);
-    if (actual != PHYSICAL_PAGE_STATUS_INVALID ||
-        physical_page_available(&allocator) != available) {
-        fail_page(74U, PHYSICAL_PAGE_STATUS_INVALID, actual);
-    }
-    actual = physical_page_release_order(&allocator,
-                                         allocator.metadata_address,
-                                         0U);
-    if (actual != PHYSICAL_PAGE_STATUS_INVALID ||
-        physical_page_available(&allocator) != available) {
-        fail_page(75U, PHYSICAL_PAGE_STATUS_INVALID, actual);
-    }
-    actual = physical_page_release_order(&allocator,
-                                         TEST_PHYSICAL_BASE +
-                                             BOAROS_PAGE_SIZE * 64U,
-                                         0U);
-    if (actual != PHYSICAL_PAGE_STATUS_INVALID ||
-        physical_page_available(&allocator) != available) {
-        fail_page(76U, PHYSICAL_PAGE_STATUS_INVALID, actual);
-    }
     actual = physical_page_release_order(&allocator, run, 1U);
     if (actual != PHYSICAL_PAGE_STATUS_OK) {
         fail_page(77U, PHYSICAL_PAGE_STATUS_OK, actual);
     }
     available = physical_page_available(&allocator);
-    actual = physical_page_release_order(&allocator, run, 1U);
-    if (actual != PHYSICAL_PAGE_STATUS_DOUBLE_FREE ||
-        physical_page_available(&allocator) != available) {
-        fail_page(78U, PHYSICAL_PAGE_STATUS_DOUBLE_FREE, actual);
-    }
     if (physical_page_release(&allocator, owned_page) !=
         PHYSICAL_PAGE_STATUS_OK) {
         fail_page(79U, PHYSICAL_PAGE_STATUS_OK,
@@ -955,22 +864,18 @@ static void test_finalized_order_zero_reference_counts(void)
     }
     if (physical_page_release(&allocator, page) !=
             PHYSICAL_PAGE_STATUS_OK ||
-        physical_page_available(&allocator) != available + 1U ||
-        physical_page_reference_count(&allocator, page, &references) !=
-            PHYSICAL_PAGE_STATUS_DOUBLE_FREE) {
-        fail_page(98U, PHYSICAL_PAGE_STATUS_DOUBLE_FREE,
+        physical_page_available(&allocator) != available + 1U) {
+        fail_page(98U, PHYSICAL_PAGE_STATUS_OK,
                   PHYSICAL_PAGE_STATUS_INVALID);
     }
 
     if (physical_page_allocate_order(&allocator, 1U, &page) !=
             PHYSICAL_PAGE_STATUS_OK ||
-        physical_page_acquire(&allocator, page) !=
-            PHYSICAL_PAGE_STATUS_STATE ||
         physical_page_release_order(&allocator, page, 1U) !=
             PHYSICAL_PAGE_STATUS_OK ||
         physical_page_release(&allocator, owned_page) !=
             PHYSICAL_PAGE_STATUS_OK) {
-        fail_page(99U, PHYSICAL_PAGE_STATUS_STATE,
+        fail_page(99U, PHYSICAL_PAGE_STATUS_OK,
                   PHYSICAL_PAGE_STATUS_INVALID);
     }
 }
@@ -1063,7 +968,6 @@ void run_physical_page_tests(void)
     test_failed_init_preserves_allocator();
     test_rejects_invalid_api_inputs();
     test_accesses_recycled_nodes_through_mapping();
-    test_rejects_inaccessible_recycled_nodes();
     test_resolves_owned_pages_through_bound_access();
     test_resolve_rejects_inaccessible_page();
     test_finalize_imports_bootstrap_state();

@@ -128,8 +128,7 @@ static enum kernel_mm_status resolve_record(
           (*record)->vdso_address >= RISCV_SV39_USER_LIMIT)) ||
         (!empty_space_cleanup &&
          ((*record)->space.allocator != mm->allocator ||
-          ((*record)->space.state != RISCV_SV39_USER_SPACE_LIVE &&
-           (*record)->space.state != RISCV_SV39_USER_SPACE_CLEANUP)))) {
+          (*record)->space.state != RISCV_SV39_USER_SPACE_LIVE))) {
         return KERNEL_MM_STATUS_STATE;
     }
     return KERNEL_MM_STATUS_OK;
@@ -137,13 +136,8 @@ static enum kernel_mm_status resolve_record(
 
 static enum kernel_mm_status release_record_only(struct kernel_mm *mm)
 {
-    if (physical_page_release(mm->allocator,
-                              mm->record_page_address) !=
-        PHYSICAL_PAGE_STATUS_OK) {
-        mm->state = KERNEL_MM_CLEANUP;
-        mm->cleanup_stage = KERNEL_MM_CLEANUP_RECORD;
-        return KERNEL_MM_STATUS_PAGE_RELEASE;
-    }
+    (void)physical_page_release(mm->allocator,
+                              mm->record_page_address);
     finish_handle(mm, KERNEL_MM_RELEASED);
     return KERNEL_MM_STATUS_OK;
 }
@@ -154,15 +148,9 @@ static enum kernel_mm_status abandon_unresolved_record(
     uint64_t record_page_address,
     enum kernel_mm_status failure)
 {
-    if (physical_page_release(allocator, record_page_address) ==
-        PHYSICAL_PAGE_STATUS_OK) {
-        return failure;
-    }
-    mm->allocator = allocator;
-    mm->record_page_address = record_page_address;
-    mm->state = KERNEL_MM_CLEANUP;
-    mm->cleanup_stage = KERNEL_MM_CLEANUP_RECORD;
-    return KERNEL_MM_STATUS_CLEANUP_REQUIRED;
+    (void)mm;
+    (void)physical_page_release(allocator, record_page_address);
+    return failure;
 }
 
 enum kernel_mm_status riscv_kernel_mm_create(
@@ -257,8 +245,6 @@ static enum kernel_mm_status fork_status_from_sv39(
         return KERNEL_MM_STATUS_INVALID_ARGUMENT;
     case RISCV_SV39_STATUS_CONFLICT:
         return KERNEL_MM_STATUS_CONFLICT;
-    case RISCV_SV39_STATUS_CLEANUP_REQUIRED:
-        return KERNEL_MM_STATUS_CLEANUP_REQUIRED;
     case RISCV_SV39_STATUS_STATE:
         return KERNEL_MM_STATUS_STATE;
     case RISCV_SV39_STATUS_NOT_MAPPED:
@@ -281,8 +267,6 @@ static enum kernel_mm_status status_from_vma(enum kernel_vma_status status)
         return KERNEL_MM_STATUS_CONFLICT;
     case KERNEL_VMA_STATUS_NOT_FOUND:
         return KERNEL_MM_STATUS_NOT_MAPPED;
-    case KERNEL_VMA_STATUS_CLEANUP_REQUIRED:
-        return KERNEL_MM_STATUS_CLEANUP_REQUIRED;
     case KERNEL_VMA_STATUS_STATE:
     default:
         return KERNEL_MM_STATUS_STATE;
@@ -341,12 +325,7 @@ static enum kernel_mm_status drain_file_sources(
             }
             source->file = 0;
         }
-        if (kernel_heap_release(record->vma_heap, source) !=
-            KERNEL_HEAP_STATUS_OK) {
-            link = &source->next;
-            failed = 1;
-            continue;
-        }
+        (void)kernel_heap_release(record->vma_heap, source);
         *link = next;
     }
     return failed != 0 ? KERNEL_MM_STATUS_CLEANUP_REQUIRED
@@ -406,12 +385,7 @@ static enum kernel_mm_status drain_elf_sources(
                 entry->source = 0;
             }
         }
-        if (kernel_heap_release(record->vma_heap, entry) !=
-            KERNEL_HEAP_STATUS_OK) {
-            failed = 1;
-            link = &entry->next;
-            continue;
-        }
+        (void)kernel_heap_release(record->vma_heap, entry);
         *link = next;
     }
     return failed != 0 ? KERNEL_MM_STATUS_CLEANUP_REQUIRED
@@ -451,12 +425,7 @@ static enum kernel_mm_status clone_elf_sources(
         }
         if (kernel_elf64_source_acquire(source->source) !=
             KERNEL_ELF64_SOURCE_STATUS_OK) {
-            if (kernel_heap_release(destination_record->vma_heap, copy) !=
-                KERNEL_HEAP_STATUS_OK) {
-                copy->next = destination_record->elf_sources;
-                destination_record->elf_sources = copy;
-                return KERNEL_MM_STATUS_CLEANUP_REQUIRED;
-            }
+            (void)kernel_heap_release(destination_record->vma_heap, copy);
             return KERNEL_MM_STATUS_STATE;
         }
         copy->source = source->source;
@@ -503,12 +472,8 @@ static enum kernel_mm_status clone_file_sources(
         }
         if (kernel_open_file_acquire(source->file) !=
             KERNEL_OPEN_FILE_STATUS_OK) {
-            if (kernel_heap_release(destination_record->vma_heap,
-                                    copy) != KERNEL_HEAP_STATUS_OK) {
-                copy->next = destination_record->file_sources;
-                destination_record->file_sources = copy;
-                return KERNEL_MM_STATUS_CLEANUP_REQUIRED;
-            }
+            (void)kernel_heap_release(destination_record->vma_heap,
+                                    copy);
             return KERNEL_MM_STATUS_STATE;
         }
         copy->file = source->file;
@@ -608,15 +573,8 @@ enum kernel_mm_status kernel_mm_fork(
                     return KERNEL_MM_STATUS_CLEANUP_REQUIRED;
                 }
                 finish_handle(destination, KERNEL_MM_EMPTY);
-            } else if (physical_page_release(source->allocator,
-                                             record_page_address) !=
-                       PHYSICAL_PAGE_STATUS_OK) {
-                destination->allocator = source->allocator;
-                destination->record_page_address = record_page_address;
-                destination->state = KERNEL_MM_CLEANUP;
-                destination->cleanup_stage = KERNEL_MM_CLEANUP_RECORD;
-                return KERNEL_MM_STATUS_CLEANUP_REQUIRED;
-            }
+            } else (void)physical_page_release(source->allocator,
+                                             record_page_address);
             return status == KERNEL_MM_STATUS_CLEANUP_REQUIRED
                        ? KERNEL_MM_STATUS_STATE
                        : status;
@@ -867,13 +825,7 @@ enum kernel_mm_status kernel_mm_map_elf_source(
         }
         if (kernel_elf64_source_acquire(source) !=
             KERNEL_ELF64_SOURCE_STATUS_OK) {
-            if (kernel_heap_release(record->vma_heap, source_owner) !=
-                KERNEL_HEAP_STATUS_OK) {
-                source_owner->source = 0;
-                source_owner->next = record->elf_sources;
-                record->elf_sources = source_owner;
-                return KERNEL_MM_STATUS_CLEANUP_REQUIRED;
-            }
+            (void)kernel_heap_release(record->vma_heap, source_owner);
             return KERNEL_MM_STATUS_STATE;
         }
         source_owner->source = source;
@@ -1177,7 +1129,6 @@ static enum kernel_mm_status unmap_space_range(
     uint64_t start,
     uint64_t end)
 {
-    uint32_t deferred_pages;
     enum riscv_sv39_status status;
 
     if (end <= RISCV_SV39_PAGE_SIZE_4K) {
@@ -1188,8 +1139,7 @@ static enum kernel_mm_status unmap_space_range(
     }
     status = riscv_sv39_user_unmap_owned_range(&record->space,
                                                start,
-                                               end,
-                                               &deferred_pages);
+                                               end);
     if (status == RISCV_SV39_STATUS_OK) {
         return KERNEL_MM_STATUS_OK;
     }
@@ -1624,10 +1574,8 @@ enum kernel_mm_status kernel_mm_brk(
     uint64_t old_page_end;
     uint64_t new_page_end;
     uint64_t old_brk;
-    uint32_t deferred_pages;
     enum kernel_mm_status status;
     enum kernel_vma_status vma_status;
-    enum riscv_sv39_status sv39_status;
 
     if (mm == 0 || result == 0) {
         return KERNEL_MM_STATUS_INVALID_ARGUMENT;
@@ -1656,20 +1604,6 @@ enum kernel_mm_status kernel_mm_brk(
     }
 
     if (new_page_end > old_page_end) {
-        sv39_status = riscv_sv39_user_reclaim_retired_range(
-            &record->space,
-            old_page_end,
-            new_page_end,
-            &deferred_pages);
-        if (sv39_status != RISCV_SV39_STATUS_OK) {
-            return sv39_status == RISCV_SV39_STATUS_STATE
-                       ? KERNEL_MM_STATUS_STATE
-                       : KERNEL_MM_STATUS_ADDRESS_SPACE;
-        }
-        if (deferred_pages != 0U) {
-            *result = old_brk;
-            return KERNEL_MM_STATUS_OK;
-        }
         vma_status = kernel_vma_set_insert(
             record->vmas,
             &(const struct kernel_vma){
@@ -1756,9 +1690,6 @@ static enum kernel_mm_status map_file_page_status(
     if (status == RISCV_SV39_STATUS_NO_MEMORY) {
         return KERNEL_MM_STATUS_NO_MEMORY;
     }
-    if (status == RISCV_SV39_STATUS_CLEANUP_REQUIRED) {
-        return KERNEL_MM_STATUS_CLEANUP_REQUIRED;
-    }
     return status == RISCV_SV39_STATUS_STATE
                ? KERNEL_MM_STATUS_STATE
                : KERNEL_MM_STATUS_ADDRESS_SPACE;
@@ -1775,9 +1706,7 @@ static enum kernel_mm_status discard_file_page(
     if (status == RISCV_SV39_STATUS_OK) {
         return result;
     }
-    return status == RISCV_SV39_STATUS_CLEANUP_REQUIRED
-               ? KERNEL_MM_STATUS_CLEANUP_REQUIRED
-               : KERNEL_MM_STATUS_STATE;
+    return KERNEL_MM_STATUS_STATE;
 }
 
 /* Undo a leaf that was already published before a later COW step failed. */
@@ -1786,20 +1715,16 @@ static enum kernel_mm_status discard_mapped_page(
     uint64_t page_address,
     enum kernel_mm_status result)
 {
-    uint32_t deferred_pages = 0U;
     enum riscv_sv39_status status;
 
     status = riscv_sv39_user_unmap_owned_range(
         space,
         page_address,
-        page_address + BOAROS_PAGE_SIZE,
-        &deferred_pages);
+        page_address + BOAROS_PAGE_SIZE);
     if (status != RISCV_SV39_STATUS_OK) {
-        return status == RISCV_SV39_STATUS_CLEANUP_REQUIRED
-                   ? KERNEL_MM_STATUS_CLEANUP_REQUIRED
-                   : KERNEL_MM_STATUS_STATE;
+        return KERNEL_MM_STATUS_STATE;
     }
-    return deferred_pages != 0U ? KERNEL_MM_STATUS_CLEANUP_REQUIRED : result;
+    return result;
 }
 
 static enum kernel_mm_status map_cached_file_page(
@@ -2031,7 +1956,6 @@ enum kernel_mm_status kernel_mm_resolve_user_fault(
     uint64_t file_page_offset;
     uint64_t file_page_index;
     uint64_t file_size;
-    uint32_t deferred_pages;
     uint32_t known = KERNEL_MM_READ | KERNEL_MM_WRITE |
                      KERNEL_MM_EXECUTE;
     int translation_synchronized = 0;
@@ -2097,9 +2021,6 @@ enum kernel_mm_status kernel_mm_resolve_user_fault(
             if (sv39_status == RISCV_SV39_STATUS_NO_MEMORY) {
                 return KERNEL_MM_STATUS_NO_MEMORY;
             }
-            if (sv39_status == RISCV_SV39_STATUS_CLEANUP_REQUIRED) {
-                return KERNEL_MM_STATUS_CLEANUP_REQUIRED;
-            }
             return sv39_status == RISCV_SV39_STATUS_STATE
                        ? KERNEL_MM_STATUS_STATE
                        : KERNEL_MM_STATUS_ADDRESS_SPACE;
@@ -2115,19 +2036,6 @@ enum kernel_mm_status kernel_mm_resolve_user_fault(
         return KERNEL_MM_STATUS_STATE;
     }
     page_address = virtual_address & ~BOAROS_PAGE_MASK;
-    sv39_status = riscv_sv39_user_reclaim_retired_range(
-        &record->space,
-        page_address,
-        page_address + BOAROS_PAGE_SIZE,
-        &deferred_pages);
-    if (sv39_status != RISCV_SV39_STATUS_OK) {
-        return sv39_status == RISCV_SV39_STATUS_STATE
-                   ? KERNEL_MM_STATUS_STATE
-                   : KERNEL_MM_STATUS_ADDRESS_SPACE;
-    }
-    if (deferred_pages != 0U) {
-        return KERNEL_MM_STATUS_NO_MEMORY;
-    }
     if (vma.kind == KERNEL_VMA_KIND_FILE_PRIVATE &&
         vma.fault_policy == KERNEL_VMA_FAULT_FILE_PRIVATE &&
         vma.backing != 0) {
@@ -2183,9 +2091,6 @@ enum kernel_mm_status kernel_mm_resolve_user_fault(
     if (sv39_status == RISCV_SV39_STATUS_NO_MEMORY) {
         return KERNEL_MM_STATUS_NO_MEMORY;
     }
-    if (sv39_status == RISCV_SV39_STATUS_CLEANUP_REQUIRED) {
-        return KERNEL_MM_STATUS_CLEANUP_REQUIRED;
-    }
     return KERNEL_MM_STATUS_ADDRESS_SPACE;
 }
 
@@ -2217,11 +2122,6 @@ enum kernel_mm_status riscv_kernel_mm_satp(
 enum kernel_mm_status kernel_mm_release(struct kernel_mm *mm)
 {
     struct riscv_kernel_mm_record *record;
-    uint32_t table_pages;
-    uint32_t leaf_pages;
-    uint32_t protected_pages;
-    uint32_t cow_pages;
-    uint32_t retired_pages;
     enum kernel_mm_status status;
     enum riscv_sv39_status sv39_status;
     enum kernel_vma_status vma_status;
@@ -2251,34 +2151,15 @@ enum kernel_mm_status kernel_mm_release(struct kernel_mm *mm)
         }
         if (record->vmas == 0 && record->file_sources == 0 &&
             record->elf_sources == 0) {
-            table_pages = record->space.table_pages;
-            leaf_pages = record->space.leaf_pages;
-            protected_pages = record->space.protected_pages;
-            cow_pages = record->space.cow_pages;
-            retired_pages = record->space.retired_pages;
             sv39_status = riscv_sv39_user_space_destroy(&record->space);
             if (sv39_status != RISCV_SV39_STATUS_OK) {
-                if (record->space.table_pages != table_pages ||
-                    record->space.leaf_pages != leaf_pages ||
-                    record->space.protected_pages != protected_pages ||
-                    record->space.cow_pages != cow_pages ||
-                    record->space.retired_pages != retired_pages ||
-                    sv39_status == RISCV_SV39_STATUS_CLEANUP_REQUIRED) {
-                    record->stage =
-                        RISCV_KERNEL_MM_RECORD_SPACE_CLEANUP;
-                    mm->state = KERNEL_MM_CLEANUP;
-                    mm->cleanup_stage = KERNEL_MM_CLEANUP_SPACE;
-                    return KERNEL_MM_STATUS_CLEANUP_REQUIRED;
-                }
                 return KERNEL_MM_STATUS_ADDRESS_SPACE;
             }
             record->stage = RISCV_KERNEL_MM_RECORD_ONLY_CLEANUP;
             mm->state = KERNEL_MM_CLEANUP;
             mm->cleanup_stage = KERNEL_MM_CLEANUP_RECORD;
             status = release_record_only(mm);
-            return status == KERNEL_MM_STATUS_PAGE_RELEASE
-                       ? KERNEL_MM_STATUS_CLEANUP_REQUIRED
-                       : status;
+            return status;
         }
         record->stage = RISCV_KERNEL_MM_RECORD_VMAS_CLEANUP;
         mm->state = KERNEL_MM_CLEANUP;
@@ -2301,11 +2182,7 @@ enum kernel_mm_status kernel_mm_release(struct kernel_mm *mm)
         if (record->vmas != 0) {
             vma_status = kernel_vma_set_destroy(&record->vmas);
             if (vma_status != KERNEL_VMA_STATUS_OK) {
-                mm->state = KERNEL_MM_CLEANUP;
-                mm->cleanup_stage = KERNEL_MM_CLEANUP_VMAS;
-                return vma_status == KERNEL_VMA_STATUS_CLEANUP_REQUIRED
-                           ? KERNEL_MM_STATUS_CLEANUP_REQUIRED
-                           : KERNEL_MM_STATUS_STATE;
+                return KERNEL_MM_STATUS_STATE;
             }
         }
         record->stage = RISCV_KERNEL_MM_RECORD_FILE_SOURCES_CLEANUP;
@@ -2338,9 +2215,7 @@ enum kernel_mm_status kernel_mm_release(struct kernel_mm *mm)
             record->stage = RISCV_KERNEL_MM_RECORD_ONLY_CLEANUP;
             mm->cleanup_stage = KERNEL_MM_CLEANUP_RECORD;
             status = release_record_only(mm);
-            return status == KERNEL_MM_STATUS_PAGE_RELEASE
-                       ? KERNEL_MM_STATUS_CLEANUP_REQUIRED
-                       : status;
+            return status;
         }
         record->stage = RISCV_KERNEL_MM_RECORD_SPACE_CLEANUP;
         mm->state = KERNEL_MM_CLEANUP;
@@ -2350,31 +2225,13 @@ enum kernel_mm_status kernel_mm_release(struct kernel_mm *mm)
         return KERNEL_MM_STATUS_STATE;
     }
 
-    table_pages = record->space.table_pages;
-    leaf_pages = record->space.leaf_pages;
-    protected_pages = record->space.protected_pages;
-    cow_pages = record->space.cow_pages;
-    retired_pages = record->space.retired_pages;
     sv39_status = riscv_sv39_user_space_destroy(&record->space);
     if (sv39_status != RISCV_SV39_STATUS_OK) {
-        if (record->space.table_pages != table_pages ||
-            record->space.leaf_pages != leaf_pages ||
-            record->space.protected_pages != protected_pages ||
-            record->space.cow_pages != cow_pages ||
-            record->space.retired_pages != retired_pages ||
-            sv39_status == RISCV_SV39_STATUS_CLEANUP_REQUIRED) {
-            record->stage = RISCV_KERNEL_MM_RECORD_SPACE_CLEANUP;
-            mm->state = KERNEL_MM_CLEANUP;
-            mm->cleanup_stage = KERNEL_MM_CLEANUP_SPACE;
-            return KERNEL_MM_STATUS_CLEANUP_REQUIRED;
-        }
         return KERNEL_MM_STATUS_ADDRESS_SPACE;
     }
     record->stage = RISCV_KERNEL_MM_RECORD_ONLY_CLEANUP;
     mm->state = KERNEL_MM_CLEANUP;
     mm->cleanup_stage = KERNEL_MM_CLEANUP_RECORD;
     status = release_record_only(mm);
-    return status == KERNEL_MM_STATUS_PAGE_RELEASE
-               ? KERNEL_MM_STATUS_CLEANUP_REQUIRED
-               : status;
+    return status;
 }

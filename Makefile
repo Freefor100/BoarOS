@@ -53,8 +53,6 @@ ROOT_EXEC_STAGE3_OOM_RV := \
 	$(BUILD_DIR)/tests/user/root-exec-stage3-oom-rv
 DEMAND_PAGE_OOM_TEST_KERNEL_RV := \
 	$(BUILD_DIR)/tests/kernel-demand-page-oom-rv
-EXEC_CLEANUP_TEST_KERNEL_RV := \
-	$(BUILD_DIR)/tests/kernel-exec-cleanup-rv
 ROOT_BOOT_CLEANUP_TEST_KERNEL_RV := \
 	$(BUILD_DIR)/tests/kernel-root-boot-cleanup-rv
 USER_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-user-rv
@@ -388,8 +386,6 @@ ROOT_EXEC_STAGE3_OOM_OBJECT_RV := \
 	$(BUILD_DIR)/tests/user/root_exec_stage3_oom.o
 DEMAND_PAGE_OOM_TEST_OBJECT_RV := \
 	$(BUILD_DIR)/tests/riscv/demand_page_oom.o
-EXEC_CLEANUP_TEST_OBJECT_RV := \
-	$(BUILD_DIR)/tests/riscv/exec_cleanup_boot.o
 ROOT_BOOT_CLEANUP_TEST_OBJECT_RV := \
 	$(BUILD_DIR)/tests/riscv/root_boot_cleanup_boot.o
 USER_TEST_C_SOURCES := tests/riscv/user_boot.c
@@ -435,7 +431,6 @@ DEPS := \
 	$(ROOT_EXEC_STAGE3_OBJECT_RV:.o=.d) \
 	$(ROOT_EXEC_STAGE3_OOM_OBJECT_RV:.o=.d) \
 	$(DEMAND_PAGE_OOM_TEST_OBJECT_RV:.o=.d) \
-	$(EXEC_CLEANUP_TEST_OBJECT_RV:.o=.d) \
 	$(ROOT_BOOT_CLEANUP_TEST_OBJECT_RV:.o=.d) \
 	$(USER_TEST_OBJECTS:.o=.d) \
 	$(USER_FATAL_TEST_OBJECTS:.o=.d)
@@ -554,10 +549,9 @@ $(MM_TEST_KERNEL_RV): $(MM_TEST_OBJECTS) \
 
 $(VMA_TEST_KERNEL_RV): $(VMA_TEST_OBJECTS) \
 		arch/riscv/linker.ld
-	$(CC) $(LDFLAGS) -Wl,--wrap=kernel_heap_release \
+	$(CC) $(LDFLAGS) \
 		-Wl,--wrap=kernel_heap_resize \
 		-Wl,--wrap=physical_page_allocate \
-		-Wl,--wrap=physical_page_release \
 		-Wl,--wrap=riscv_sv39_current_satp \
 		-Wl,-Map,$(BUILD_DIR)/tests/kernel-vma-rv.map \
 		-o $@ $(VMA_TEST_OBJECTS)
@@ -569,7 +563,7 @@ $(UACCESS_TEST_KERNEL_RV): $(UACCESS_TEST_OBJECTS) \
 		-o $@ $(UACCESS_TEST_OBJECTS)
 
 $(FILES_TEST_KERNEL_RV): $(FILES_TEST_OBJECTS) arch/riscv/linker.ld
-	$(CC) $(LDFLAGS) -Wl,--wrap=kernel_heap_release \
+	$(CC) $(LDFLAGS) \
 		-Wl,--wrap=kernel_open_file_release \
 		-Wl,--wrap=riscv_sv39_current_satp \
 		-Wl,-Map,$(BUILD_DIR)/tests/kernel-files-rv.map \
@@ -714,16 +708,9 @@ $(DEMAND_PAGE_OOM_TEST_KERNEL_RV): $(OBJECTS) \
 		-Wl,-Map,$(BUILD_DIR)/tests/kernel-demand-page-oom-rv.map \
 		-o $@ $(OBJECTS) $(DEMAND_PAGE_OOM_TEST_OBJECT_RV)
 
-$(EXEC_CLEANUP_TEST_KERNEL_RV): $(OBJECTS) \
-		$(EXEC_CLEANUP_TEST_OBJECT_RV) arch/riscv/linker.ld
-	$(CC) $(LDFLAGS) -Wl,--wrap=kernel_mm_release \
-		-Wl,-Map,$(BUILD_DIR)/tests/kernel-exec-cleanup-rv.map \
-		-o $@ $(OBJECTS) $(EXEC_CLEANUP_TEST_OBJECT_RV)
-
 $(ROOT_BOOT_CLEANUP_TEST_KERNEL_RV): $(OBJECTS) \
 		$(ROOT_BOOT_CLEANUP_TEST_OBJECT_RV) arch/riscv/linker.ld
 	$(CC) $(LDFLAGS) -Wl,--wrap=kernel_fs_context_create \
-		-Wl,--wrap=kernel_vma_set_destroy \
 		-Wl,-Map,$(BUILD_DIR)/tests/kernel-root-boot-cleanup-rv.map \
 		-o $@ $(OBJECTS) $(ROOT_BOOT_CLEANUP_TEST_OBJECT_RV)
 
@@ -938,15 +925,7 @@ test-demand-page-riscv: test-root-init-riscv \
 		ROOT_EXEC_STAGE3_RV=$(ROOT_EXEC_STAGE3_OOM_RV) \
 		./tests/root-init-riscv.sh
 
-test-exec-riscv: test-root-init-riscv $(EXEC_CLEANUP_TEST_KERNEL_RV) \
-		$(ROOT_INIT_PROGRAM_RV) $(ROOT_EXEC_STAGE2_RV) \
-		$(ROOT_EXEC_STAGE3_RV)
-	QEMU_RISCV64=$(QEMU_RISCV64) QEMU_MEMORY=$(QEMU_MEMORY) \
-		KERNEL_RV=$(EXEC_CLEANUP_TEST_KERNEL_RV) \
-		ROOT_INIT_PROGRAM_RV=$(ROOT_INIT_PROGRAM_RV) \
-		ROOT_EXEC_STAGE2_RV=$(ROOT_EXEC_STAGE2_RV) \
-		ROOT_EXEC_STAGE3_RV=$(ROOT_EXEC_STAGE3_RV) \
-		./tests/root-init-riscv.sh
+test-exec-riscv: test-root-init-riscv
 
 test-root-boot-cleanup-riscv: $(ROOT_BOOT_CLEANUP_TEST_KERNEL_RV) \
 		$(ROOT_INIT_PROGRAM_RV) $(ROOT_EXEC_STAGE2_RV) \
@@ -1022,3 +1001,9 @@ clean:
 	$(RM) -r -- $(BUILD_DIR) $(KERNEL_RV)
 
 -include $(DEPS)
+
+.PHONY: test-allocator-release-host
+test-allocator-release-host:
+	mkdir -p build/host
+	cc -std=c11 -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=12 -Iinclude tests/host/allocator_release.c kernel/physical_page.c mm/heap.c -o build/host/allocator-release
+	build/host/allocator-release

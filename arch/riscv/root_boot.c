@@ -116,11 +116,8 @@ enum riscv_root_boot_status riscv_root_boot_cleanup(
             KERNEL_OPEN_FILE_STATUS_OK) {
         cleanup_failed = 1;
     }
-    if (root->cleanup_path != 0 &&
-        kernel_heap_release(&root->heap, root->cleanup_path) !=
-            KERNEL_HEAP_STATUS_OK) {
-        cleanup_failed = 1;
-    } else {
+    if (root->cleanup_path != 0) {
+        (void)kernel_heap_release(&root->heap, root->cleanup_path);
         root->cleanup_path = 0;
     }
     if (root->mount.private_data != 0 &&
@@ -365,11 +362,8 @@ enum riscv_root_boot_status riscv_root_boot_start(
             goto fail;
         }
     }
-    if (resolved_interpreter_path != 0 &&
-        kernel_heap_release(&root->heap, resolved_interpreter_path) !=
-            KERNEL_HEAP_STATUS_OK) {
-        failure = RISCV_ROOT_BOOT_STATUS_CLEANUP;
-        goto fail;
+    if (resolved_interpreter_path != 0) {
+        (void)kernel_heap_release(&root->heap, resolved_interpreter_path);
     }
     resolved_interpreter_path = 0;
     request.executable_source = executable_source;
@@ -446,9 +440,8 @@ enum riscv_root_boot_status riscv_root_boot_start(
     return RISCV_ROOT_BOOT_STATUS_OK;
 
 fail:
-    if (resolved_interpreter_path != 0 &&
-        kernel_heap_release(&root->heap, resolved_interpreter_path) ==
-            KERNEL_HEAP_STATUS_OK) {
+    if (resolved_interpreter_path != 0) {
+        (void)kernel_heap_release(&root->heap, resolved_interpreter_path);
         resolved_interpreter_path = 0;
     }
     return cleanup_start_failure(root,

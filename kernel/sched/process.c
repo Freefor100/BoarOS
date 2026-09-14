@@ -429,16 +429,8 @@ static enum kernel_scheduler_status finish_clone_failure(
         }
     }
     if (!cleanup_failed) {
-        if (physical_page_release(scheduler.allocator,
-                                  thread->physical_address) !=
-            PHYSICAL_PAGE_STATUS_OK) {
-            if (scheduler.cleanup_page_owned == 0U) {
-                scheduler.cleanup_page_address = thread->physical_address;
-                scheduler.cleanup_page_owned = 1U;
-            } else {
-                cleanup_failed = 1;
-            }
-        }
+        (void)physical_page_release(scheduler.allocator,
+                                  thread->physical_address);
     }
     if (cleanup_failed) {
         queue_abandoned_clone(thread);
@@ -748,12 +740,8 @@ static enum kernel_scheduler_status reap_waited_child(
     child->group_leader = 0;
     child->group_members = 0U;
     child->publish_completion = 0U;
-    if (physical_page_release(scheduler.allocator,
-                              child->physical_address) !=
-        PHYSICAL_PAGE_STATUS_OK) {
-        child->state = KERNEL_THREAD_STATE_EXITED;
-        exited_append(child);
-    }
+    (void)physical_page_release(scheduler.allocator,
+                              child->physical_address);
 
     if (status_address != 0U) {
         access_status = kernel_copy_to_user(&parent->mm,
@@ -993,7 +981,7 @@ static enum kernel_scheduler_status reparent_children(struct kernel_task *parent
 
 int kernel_scheduler_reap_pending(void)
 {
-    return scheduler.exited_head != 0 || scheduler.cleanup_page_owned != 0U;
+    return scheduler.exited_head != 0;
 }
 
 enum kernel_scheduler_status kernel_scheduler_reap_one(
@@ -1029,15 +1017,6 @@ enum kernel_scheduler_status kernel_scheduler_reap_one(
         return status;
     }
 
-    if (scheduler.cleanup_page_owned != 0U) {
-        if (physical_page_release(scheduler.allocator,
-                                  scheduler.cleanup_page_address) !=
-            PHYSICAL_PAGE_STATUS_OK) {
-            return KERNEL_SCHEDULER_STATUS_PAGE_RELEASE;
-        }
-        scheduler.cleanup_page_address = 0U;
-        scheduler.cleanup_page_owned = 0U;
-    }
 
     if (scheduler.exited_head == 0) {
         return KERNEL_SCHEDULER_STATUS_EMPTY;
@@ -1177,11 +1156,8 @@ enum kernel_scheduler_status kernel_scheduler_reap_one(
     } else {
         return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
     }
-    if (physical_page_release(scheduler.allocator,
-                              thread->physical_address) !=
-        PHYSICAL_PAGE_STATUS_OK) {
-        return KERNEL_SCHEDULER_STATUS_PAGE_RELEASE;
-    }
+    (void)physical_page_release(scheduler.allocator,
+                              thread->physical_address);
     scheduler.exited_head = next;
     if (next == 0) {
         scheduler.exited_tail = 0;
@@ -1232,7 +1208,7 @@ static enum kernel_scheduler_status cleanup_user_task_resources(
     signal_status = thread->group_leader == thread && thread->group_members > 1U
         ? KERNEL_SIGNAL_STATUS_OK : kernel_signal_release_table(thread);
     if (signal_status != KERNEL_SIGNAL_STATUS_OK) {
-        return KERNEL_SCHEDULER_STATUS_PAGE_RELEASE;
+        return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
     }
 
     if (thread->exec_transaction != 0) {
@@ -1250,10 +1226,7 @@ static enum kernel_scheduler_status cleanup_user_task_resources(
                        ? KERNEL_SCHEDULER_STATUS_RESOURCE_CLEANUP
                        : KERNEL_SCHEDULER_STATUS_INVALID_STATE;
         }
-        if (kernel_heap_release(heap, transaction) !=
-            KERNEL_HEAP_STATUS_OK) {
-            return KERNEL_SCHEDULER_STATUS_RESOURCE_CLEANUP;
-        }
+        (void)kernel_heap_release(heap, transaction);
         thread->exec_transaction = 0;
     }
     if (thread->files.state == KERNEL_FILES_LIVE ||
@@ -1289,9 +1262,8 @@ static enum kernel_scheduler_status cleanup_user_task_resources(
             if (mm_status == KERNEL_MM_STATUS_PAGE_ACCESS) {
                 return KERNEL_SCHEDULER_STATUS_PAGE_ACCESS;
             }
-            if (mm_status == KERNEL_MM_STATUS_PAGE_RELEASE ||
-                mm_status == KERNEL_MM_STATUS_CLEANUP_REQUIRED) {
-                return KERNEL_SCHEDULER_STATUS_PAGE_RELEASE;
+            if (mm_status == KERNEL_MM_STATUS_CLEANUP_REQUIRED) {
+                return KERNEL_SCHEDULER_STATUS_RESOURCE_CLEANUP;
             }
             return mm_status == KERNEL_MM_STATUS_ADDRESS_SPACE
                        ? KERNEL_SCHEDULER_STATUS_ADDRESS_SPACE

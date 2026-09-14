@@ -46,10 +46,7 @@ enum kernel_open_file_status kernel_open_file_create(
     if (result != 0) {
         file->heap = heap;
         file->vfs_closed = 1U;
-        if (kernel_heap_release(heap, file) != KERNEL_HEAP_STATUS_OK) {
-            *owner = file;
-            return KERNEL_OPEN_FILE_STATUS_CLEANUP_REQUIRED;
-        }
+        (void)kernel_heap_release(heap, file);
         *linux_result = result;
         return KERNEL_OPEN_FILE_STATUS_OK;
     }
@@ -91,10 +88,7 @@ enum kernel_open_file_status kernel_open_file_create_mode(
     if (result != 0) {
         file->heap = heap;
         file->vfs_closed = 1U;
-        if (kernel_heap_release(heap, file) != KERNEL_HEAP_STATUS_OK) {
-            *owner = file;
-            return KERNEL_OPEN_FILE_STATUS_CLEANUP_REQUIRED;
-        }
+        (void)kernel_heap_release(heap, file);
         *linux_result = result;
         return KERNEL_OPEN_FILE_STATUS_OK;
     }
@@ -136,10 +130,7 @@ enum kernel_open_file_status kernel_open_file_create_executable(
     if (result != 0) {
         file->heap = heap;
         file->vfs_closed = 1U;
-        if (kernel_heap_release(heap, file) != KERNEL_HEAP_STATUS_OK) {
-            *owner = file;
-            return KERNEL_OPEN_FILE_STATUS_CLEANUP_REQUIRED;
-        }
+        (void)kernel_heap_release(heap, file);
         *linux_result = result;
         return KERNEL_OPEN_FILE_STATUS_OK;
     }
@@ -202,16 +193,12 @@ enum kernel_open_file_status kernel_open_file_create_pipe(
                    ? KERNEL_OPEN_FILE_STATUS_NO_MEMORY
                    : KERNEL_OPEN_FILE_STATUS_STATE;
     }
-    /* Keep an allocated description self-owned even if endpoint acquisition
-     * fails and heap cleanup has to be retried by the file table. */
+    /* Keep the description self-contained until endpoint acquisition commits. */
     file->heap = heap;
     file->vfs_closed = 1U;
     pipe_status = kernel_pipe_acquire_endpoint(pipe, endpoint);
     if (pipe_status != KERNEL_PIPE_STATUS_OK) {
-        if (kernel_heap_release(heap, file) != KERNEL_HEAP_STATUS_OK) {
-            *owner = file;
-            return KERNEL_OPEN_FILE_STATUS_CLEANUP_REQUIRED;
-        }
+        (void)kernel_heap_release(heap, file);
         return pipe_status == KERNEL_PIPE_STATUS_NO_MEMORY
                    ? KERNEL_OPEN_FILE_STATUS_NO_MEMORY
                    : KERNEL_OPEN_FILE_STATUS_STATE;
@@ -342,9 +329,7 @@ enum kernel_open_file_status kernel_open_file_release(
                     file->pipe,
                     file->pipe_endpoint);
                 if (pipe_status != KERNEL_PIPE_STATUS_OK) {
-                    return pipe_status == KERNEL_PIPE_STATUS_CLEANUP_REQUIRED
-                                ? KERNEL_OPEN_FILE_STATUS_CLEANUP_REQUIRED
-                                : KERNEL_OPEN_FILE_STATUS_STATE;
+                    return KERNEL_OPEN_FILE_STATUS_STATE;
                 }
                 file->pipe_endpoint_closed = 1U;
                 file->pipe = 0;
@@ -368,10 +353,7 @@ enum kernel_open_file_status kernel_open_file_release(
             file->vfs_closed = 1U;
         }
     }
-    if (kernel_heap_release(file->heap, file) !=
-        KERNEL_HEAP_STATUS_OK) {
-        return KERNEL_OPEN_FILE_STATUS_CLEANUP_REQUIRED;
-    }
+    (void)kernel_heap_release(file->heap, file);
     *owner = 0;
     return KERNEL_OPEN_FILE_STATUS_OK;
 }
@@ -388,8 +370,7 @@ enum kernel_open_file_status kernel_open_file_detach(
     if (!open_file_live(file)) {
         return KERNEL_OPEN_FILE_STATUS_STATE;
     }
-    /* A pipe endpoint's last live owner closes it immediately, even when
-     * its allocation must survive on a cleanup list. */
+    /* A pipe endpoint's last live owner closes it immediately. */
     if (file->kind == KERNEL_OPEN_FILE_KIND_PIPE && file->references == 1U) {
         return kernel_open_file_release(owner);
     }

@@ -148,8 +148,6 @@ struct kernel_scheduler {
     struct kernel_task *stopped_head;
     struct kernel_task *stopped_tail;
     struct kernel_task *init_task;
-    uint64_t cleanup_page_address;
-    uint32_t cleanup_page_owned;
     enum kernel_scheduler_status fatal_status;
     struct riscv_switch_context discard_context;
 };

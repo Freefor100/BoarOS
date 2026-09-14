@@ -22,18 +22,13 @@
 static enum kernel_pipe_status pipe_destroy(struct kernel_pipe *pipe)
 {
     if (pipe->buffer_physical != KERNEL_PIPE_NO_BUFFER) {
-        if (physical_page_release_order(pipe->allocator,
+        (void)physical_page_release_order(pipe->allocator,
                                         pipe->buffer_physical,
-                                        KERNEL_PIPE_ORDER) !=
-            PHYSICAL_PAGE_STATUS_OK) {
-            return KERNEL_PIPE_STATUS_CLEANUP_REQUIRED;
-        }
+                                        KERNEL_PIPE_ORDER);
         pipe->buffer_physical = KERNEL_PIPE_NO_BUFFER;
         pipe->buffer = 0;
     }
-    if (kernel_heap_release(pipe->heap, pipe) != KERNEL_HEAP_STATUS_OK) {
-        return KERNEL_PIPE_STATUS_CLEANUP_REQUIRED;
-    }
+    (void)kernel_heap_release(pipe->heap, pipe);
     return KERNEL_PIPE_STATUS_OK;
 }
 
@@ -66,10 +61,7 @@ enum kernel_pipe_status kernel_pipe_create(
                                                KERNEL_PIPE_ORDER,
                                                &physical_address);
     if (page_status != PHYSICAL_PAGE_STATUS_OK) {
-        if (pipe_destroy(pipe) != KERNEL_PIPE_STATUS_OK) {
-            *owner = pipe;
-            return KERNEL_PIPE_STATUS_CLEANUP_REQUIRED;
-        }
+        (void)pipe_destroy(pipe);
         return page_status == PHYSICAL_PAGE_STATUS_EMPTY
                    ? KERNEL_PIPE_STATUS_NO_MEMORY
                    : KERNEL_PIPE_STATUS_STATE;
@@ -79,10 +71,7 @@ enum kernel_pipe_status kernel_pipe_create(
                                         &buffer);
     if (page_status != PHYSICAL_PAGE_STATUS_OK) {
         pipe->buffer_physical = physical_address;
-        if (pipe_destroy(pipe) != KERNEL_PIPE_STATUS_OK) {
-            *owner = pipe;
-            return KERNEL_PIPE_STATUS_CLEANUP_REQUIRED;
-        }
+        (void)pipe_destroy(pipe);
         return KERNEL_PIPE_STATUS_STATE;
     }
     memset(buffer, 0, KERNEL_PIPE_CAPACITY);
@@ -99,7 +88,6 @@ enum kernel_pipe_status kernel_pipe_acquire_endpoint(
     uint32_t endpoint)
 {
     if (pipe == 0 || pipe->heap == 0 || pipe->buffer == 0 ||
-        pipe->destroy_pending != 0U ||
         (endpoint != KERNEL_PIPE_ENDPOINT_READ &&
          endpoint != KERNEL_PIPE_ENDPOINT_WRITE)) {
         return KERNEL_PIPE_STATUS_INVALID_ARGUMENT;
@@ -129,7 +117,6 @@ enum kernel_pipe_status kernel_pipe_destroy_unowned(
         return KERNEL_PIPE_STATUS_INVALID_ARGUMENT;
     }
     saved = riscv_interrupt_save();
-    pipe->destroy_pending = 1U;
     status = pipe_destroy(pipe);
     riscv_interrupt_restore(saved);
     return status;
@@ -148,11 +135,6 @@ enum kernel_pipe_status kernel_pipe_release_endpoint(
         return KERNEL_PIPE_STATUS_INVALID_ARGUMENT;
     }
     saved = riscv_interrupt_save();
-    if (pipe->destroy_pending != 0U) {
-        status = pipe_destroy(pipe);
-        riscv_interrupt_restore(saved);
-        return status;
-    }
     if (endpoint == KERNEL_PIPE_ENDPOINT_READ) {
         if (pipe->readers == 0U) {
             riscv_interrupt_restore(saved);
@@ -173,7 +155,6 @@ enum kernel_pipe_status kernel_pipe_release_endpoint(
         (void)kernel_wait_queue_wake_all(&pipe->write_queue);
     }
     if (pipe->readers == 0U && pipe->writers == 0U) {
-        pipe->destroy_pending = 1U;
         status = pipe_destroy(pipe);
     } else {
         status = KERNEL_PIPE_STATUS_OK;

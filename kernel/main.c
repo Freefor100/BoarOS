@@ -839,12 +839,10 @@ void kernel_main(unsigned long hart_id, const void *dtb)
             sbi_shutdown();
         }
         if (scheduler_status != KERNEL_SCHEDULER_STATUS_EMPTY &&
-            scheduler_status != KERNEL_SCHEDULER_STATUS_PAGE_RELEASE &&
             scheduler_status != KERNEL_SCHEDULER_STATUS_RESOURCE_CLEANUP) {
             shutdown_for_scheduler_error(scheduler_status);
         }
         int cleanup_retry =
-            scheduler_status == KERNEL_SCHEDULER_STATUS_PAGE_RELEASE ||
             scheduler_status == KERNEL_SCHEDULER_STATUS_RESOURCE_CLEANUP;
         interrupt_status = riscv_interrupt_save();
         scheduler_status = kernel_scheduler_yield_current();

@@ -234,10 +234,7 @@ enum kernel_signal_status kernel_signal_release_table(
         RISCV_DIRECT_MAP_STATUS_OK) {
         return KERNEL_SIGNAL_STATUS_INVALID_STATE;
     }
-    if (physical_page_release(scheduler.allocator, physical_address) !=
-        PHYSICAL_PAGE_STATUS_OK) {
-        return KERNEL_SIGNAL_STATUS_INVALID_STATE;
-    }
+    (void)physical_page_release(scheduler.allocator, physical_address);
     task->signal_table_address = 0U;
     return KERNEL_SIGNAL_STATUS_OK;
 }

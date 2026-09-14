@@ -79,7 +79,6 @@ struct kernel_epoll {
     struct kernel_epoll_item *items_head;
     struct kernel_epoll_item *ready_head;
     struct kernel_epoll_item *ready_tail;
-    struct kernel_epoll_item *cleanup_items;
     uint32_t item_count;
 };
 

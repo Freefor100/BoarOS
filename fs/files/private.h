@@ -23,8 +23,6 @@ struct kernel_file_slot {
 struct kernel_files_record {
     struct kernel_file_slot *slots;
     struct kernel_open_file_description *cleanup_files;
-    struct kernel_pipe *cleanup_pipes;
-    void *cleanup_allocations;
     struct kernel_files_statistics statistics;
     uint32_t references;
     uint32_t next_fd;
@@ -39,7 +37,7 @@ enum kernel_files_status kernel_files_find_free_fd(
     uint32_t *fd,
     int *linux_result);
 
-enum kernel_files_status kernel_files_release_or_queue_allocation(
+enum kernel_files_status kernel_files_release_allocation(
     struct kernel_files *files,
     void *pointer);
 

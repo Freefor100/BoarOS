@@ -120,7 +120,7 @@ static void statistics_remove_pages(struct kernel_heap *heap, uint32_t order)
     if (pages <= heap->statistics.current_pages) {
         heap->statistics.current_pages -= pages;
     } else {
-        heap->statistics.current_pages = 0U;
+        __builtin_trap();
     }
 }
 
@@ -143,6 +143,11 @@ static void partial_remove(struct kernel_heap *heap,
 {
     uint32_t class_index = slab->class_index;
 
+    if ((slab->previous != 0 && slab->previous->next != slab) ||
+        (slab->previous == 0 && heap->partial_slabs[class_index] != slab) ||
+        (slab->next != 0 && slab->next->previous != slab)) {
+        __builtin_trap();
+    }
     if (slab->previous != 0) {
         slab->previous->next = slab->next;
     } else {
@@ -550,10 +555,9 @@ enum kernel_heap_status kernel_heap_release(
     struct kernel_slab *slab;
     uint32_t slot_index;
     enum kernel_heap_status status;
-    enum physical_page_status page_status;
 
     if (!heap_initialized(heap)) {
-        return KERNEL_HEAP_STATUS_INVALID;
+        __builtin_trap();
     }
     if (pointer == 0) {
         return KERNEL_HEAP_STATUS_OK;
@@ -568,24 +572,22 @@ enum kernel_heap_status kernel_heap_release(
                                     &slot_index);
     (void)capacity;
     if (status != KERNEL_HEAP_STATUS_OK) {
-        return status;
+        __builtin_trap();
     }
     if (heap->statistics.live_allocations == 0U) {
-        return KERNEL_HEAP_STATUS_STATE;
+        __builtin_trap();
     }
 
     if (slab == 0) {
-        page_status = physical_page_release_order(heap->page_allocator,
+        (void)physical_page_release_order(heap->page_allocator,
                                                   physical_address,
                                                   order);
-        if (page_status != PHYSICAL_PAGE_STATUS_OK) {
-            return page_status_to_heap(page_status);
-        }
         statistics_remove_pages(heap, order);
     } else {
         int was_full = slab->free_count == 0U;
-        uint32_t old_free_head = slab->free_head;
-        uint16_t old_free_count = slab->free_count;
+        if (slab->free_count >= slab->slot_count) {
+            __builtin_trap();
+        }
 
         bitmap_clear(slab, slot_index);
         slot_set_next(slab, slot_index, slab->free_head);
@@ -597,19 +599,9 @@ enum kernel_heap_status kernel_heap_release(
         if (slab->free_count == slab->slot_count) {
             partial_remove(heap, slab);
             slab->magic = 0U;
-            page_status = physical_page_release_order(heap->page_allocator,
+            (void)physical_page_release_order(heap->page_allocator,
                                                       physical_address,
                                                       0U);
-            if (page_status != PHYSICAL_PAGE_STATUS_OK) {
-                slab->magic = KERNEL_SLAB_MAGIC;
-                bitmap_set(slab, slot_index);
-                slab->free_head = old_free_head;
-                slab->free_count = old_free_count;
-                if (!was_full) {
-                    partial_insert(heap, slab);
-                }
-                return page_status_to_heap(page_status);
-            }
             statistics_remove_pages(heap, 0U);
         }
     }

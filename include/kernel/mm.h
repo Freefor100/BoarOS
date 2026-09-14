@@ -24,7 +24,6 @@ enum kernel_mm_status {
     KERNEL_MM_STATUS_NO_MEMORY,
     KERNEL_MM_STATUS_NOT_MAPPED,
     KERNEL_MM_STATUS_PAGE_ACCESS,
-    KERNEL_MM_STATUS_PAGE_RELEASE,
     KERNEL_MM_STATUS_ADDRESS_SPACE,
     KERNEL_MM_STATUS_CLEANUP_REQUIRED,
     KERNEL_MM_STATUS_STATE,
@@ -176,7 +175,7 @@ enum kernel_mm_status kernel_mm_resolve_user_fault(
     uint64_t virtual_address,
     uint32_t access);
 
-/* Success consumes one reference; last-reference cleanup is retryable. */
+/* Success consumes one reference; last-reference cleanup can retain VFS owners. */
 enum kernel_mm_status kernel_mm_release(struct kernel_mm *mm);
 
 #endif

@@ -190,9 +190,7 @@ enum kernel_exec_status kernel_task_exec_finish(
      * remains, even if freeing the transaction container needs retry. */
     process_complete_vfork(task);
     heap = transaction->heap;
-    if (kernel_heap_release(heap, transaction) != KERNEL_HEAP_STATUS_OK) {
-        return KERNEL_EXEC_STATUS_CLEANUP_REQUIRED;
-    }
+    (void)kernel_heap_release(heap, transaction);
     task->exec_transaction = 0;
     return KERNEL_EXEC_STATUS_OK;
 }
