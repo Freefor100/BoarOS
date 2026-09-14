@@ -48,7 +48,9 @@ static int poll_compute_deadline(
     uint64_t user_timeout,
     uint64_t *out_deadline,
     int *out_has_timeout,
-    int *out_immediate)
+    int *out_immediate,
+    uint64_t *out_target_monotonic_ns,
+    int *out_zero_timeout)
 {
     struct kernel_timespec ts;
     size_t copied = 0U;
@@ -58,6 +60,8 @@ static int poll_compute_deadline(
         *out_has_timeout = 0;
         *out_immediate = 0;
         *out_deadline = 0U;
+        *out_target_monotonic_ns = 0U;
+        *out_zero_timeout = 0;
         return 0;
     }
     *out_has_timeout = 1;
@@ -75,8 +79,11 @@ static int poll_compute_deadline(
     if (ts.tv_sec == 0 && ts.tv_nsec == 0) {
         *out_immediate = 1;
         *out_deadline = 0U;
+        *out_target_monotonic_ns = 0U;
+        *out_zero_timeout = 1;
         return 0;
     }
+    *out_zero_timeout = 0;
     {
         unsigned __int128 requested =
             (unsigned __int128)(uint64_t)ts.tv_sec * 1000000000ULL +
@@ -88,6 +95,7 @@ static int poll_compute_deadline(
         uint64_t target_monotonic_ns =
             duration_ns > (uint64_t)INT64_MAX - now_ns ? (uint64_t)INT64_MAX
                                                        : now_ns + duration_ns;
+        *out_target_monotonic_ns = target_monotonic_ns;
         enum kernel_time_status time_status =
             kernel_time_deadline_from_monotonic(target_monotonic_ns,
                                                 out_deadline);
@@ -102,6 +110,27 @@ static int poll_compute_deadline(
     }
     *out_immediate = 0;
     return 0;
+}
+
+static void poll_write_remaining_timeout(
+    struct kernel_mm *mm,
+    uint64_t user_timeout,
+    int has_timeout,
+    int zero_timeout,
+    uint64_t target_monotonic_ns)
+{
+    if (user_timeout == 0U || !has_timeout || zero_timeout) {
+        return;
+    }
+    struct kernel_timespec rem_ts = {0, 0};
+    uint64_t now_ns = kernel_time_monotonic_ns();
+    if (target_monotonic_ns > now_ns) {
+        uint64_t diff_ns = target_monotonic_ns - now_ns;
+        rem_ts.tv_sec = (int64_t)(diff_ns / 1000000000ULL);
+        rem_ts.tv_nsec = (int64_t)(diff_ns % 1000000000ULL);
+    }
+    size_t copied = 0U;
+    (void)kernel_copy_to_user(mm, user_timeout, &rem_ts, sizeof(rem_ts), &copied);
 }
 
 static int poll_setup_sigmask(
@@ -335,7 +364,9 @@ enum kernel_files_status kernel_files_ppoll(
     struct kernel_pollfd *pfds = stack_pfds;
     void *heap_pfds = 0;
     uint64_t deadline = 0U;
+    uint64_t target_monotonic_ns = 0U;
     int has_timeout = 0;
+    int zero_timeout = 0;
     int immediate = 0;
     uint64_t saved_mask = 0U;
     int mask_modified = 0;
@@ -353,7 +384,9 @@ enum kernel_files_status kernel_files_ppoll(
                                 user_timeout,
                                 &deadline,
                                 &has_timeout,
-                                &immediate);
+                                &immediate,
+                                &target_monotonic_ns,
+                                &zero_timeout);
     if (err != 0) {
         *linux_result = err;
         return KERNEL_FILES_STATUS_OK;
@@ -433,6 +466,12 @@ enum kernel_files_status kernel_files_ppoll(
         (void)kernel_heap_release(files->heap, heap_pfds);
     }
 
+    poll_write_remaining_timeout(mm,
+                                 user_timeout,
+                                 has_timeout,
+                                 zero_timeout,
+                                 target_monotonic_ns);
+
     *linux_result = ret;
     return KERNEL_FILES_STATUS_OK;
 }
@@ -461,7 +500,9 @@ enum kernel_files_status kernel_files_pselect6(
     struct kernel_pollfd *pfds = stack_pfds;
     void *heap_pfds = 0;
     uint64_t deadline = 0U;
+    uint64_t target_monotonic_ns = 0U;
     int has_timeout = 0;
+    int zero_timeout = 0;
     int immediate = 0;
     uint64_t saved_mask = 0U;
     int mask_modified = 0;
@@ -504,7 +545,9 @@ enum kernel_files_status kernel_files_pselect6(
                                 user_timeout,
                                 &deadline,
                                 &has_timeout,
-                                &immediate);
+                                &immediate,
+                                &target_monotonic_ns,
+                                &zero_timeout);
     if (err != 0) {
         *linux_result = err;
         return KERNEL_FILES_STATUS_OK;
@@ -713,6 +756,12 @@ cleanup:
     if (heap_bitsets != 0) {
         (void)kernel_heap_release(files->heap, heap_bitsets);
     }
+
+    poll_write_remaining_timeout(mm,
+                                 user_timeout,
+                                 has_timeout,
+                                 zero_timeout,
+                                 target_monotonic_ns);
 
     *linux_result = ret;
     return KERNEL_FILES_STATUS_OK;

@@ -462,6 +462,7 @@ uint32_t kernel_pipe_poll(
         }
         if (pipe->readers == 0U) {
             events |= KERNEL_POLLERR;
+            events |= (KERNEL_POLLOUT | KERNEL_POLLWRNORM);
         } else if (pipe->bytes < KERNEL_PIPE_CAPACITY) {
             events |= (KERNEL_POLLOUT | KERNEL_POLLWRNORM);
         }
