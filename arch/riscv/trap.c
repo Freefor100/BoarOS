@@ -57,12 +57,18 @@ static void riscv_scheduler_fatal(
     const struct riscv_trap_frame *frame,
     enum kernel_scheduler_status status)
 {
+    struct kernel_task *curr = kernel_task_current();
+    kernel_pid_t tid = 0;
     virt_uart_puts("BoarOS: scheduler error status=");
     virt_uart_put_hex((unsigned long)status);
     virt_uart_puts(" scause=");
     virt_uart_put_hex(frame->scause);
     virt_uart_puts(" sepc=");
     virt_uart_put_hex(frame->sepc);
+    if (curr != 0 && kernel_task_tid(curr, &tid) == KERNEL_TASK_STATUS_OK) {
+        virt_uart_puts(" tid=");
+        virt_uart_put_hex((unsigned long)tid);
+    }
     virt_uart_putc('\n');
     sbi_shutdown();
 }

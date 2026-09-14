@@ -1621,6 +1621,8 @@ static int check_filesystem_rw(void)
         }
     }
     close(src_fd);
+    printf("BoarOS: fsrw stage 9 copy ok\n");
+    fflush(stdout);
 
     /* While bin_wfd is still open for write, fork a child to execve /test_exec */
     pid_t cpid = fork();
@@ -1644,6 +1646,8 @@ static int check_filesystem_rw(void)
         close(bin_wfd);
         return 45;
     }
+    printf("BoarOS: fsrw stage 9 etxtbsy child ok\n");
+    fflush(stdout);
 
     /* Now close the write descriptor */
     if (close(bin_wfd) != 0) {
@@ -1667,6 +1671,8 @@ static int check_filesystem_rw(void)
     if (!WIFEXITED(status) || WEXITSTATUS(status) != 42) {
         return 49;
     }
+    printf("BoarOS: fsrw stage 9 exec child ok\n");
+    fflush(stdout);
 
     /* Clean up /test_exec */
     unlink("/test_exec");

@@ -614,6 +614,7 @@ int ext4_dir_mk(const char *path);
  *
  * @return  Standard error code.*/
 int ext4_dir_open(ext4_dir *dir, const char *path);
+int ext4_dir_open_file(ext4_file *file, const char *path);
 
 /**@brief   Directory close.
  *

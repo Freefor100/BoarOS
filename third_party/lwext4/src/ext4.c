@@ -3197,7 +3197,7 @@ Finish:
 	return r;
 }
 
-int ext4_dir_open(ext4_dir *dir, const char *path)
+int ext4_dir_open_file(ext4_file *file, const char *path)
 {
 	struct ext4_mountpoint *mp = ext4_get_mount(path);
 	int r;
@@ -3206,9 +3206,20 @@ int ext4_dir_open(ext4_dir *dir, const char *path)
 		return ENOENT;
 
 	EXT4_MP_LOCK(mp);
-	r = ext4_generic_open(&dir->f, path, "r", false, 0, 0);
-	dir->next_off = 0;
+	r = ext4_generic_open(file, path, "r", false, 0, 0);
 	EXT4_MP_UNLOCK(mp);
+	return r;
+}
+
+int ext4_dir_open(ext4_dir *dir, const char *path)
+{
+	int r;
+
+	if (!dir)
+		return ENOENT;
+
+	r = ext4_dir_open_file(&dir->f, path);
+	dir->next_off = 0;
 	return r;
 }
 
