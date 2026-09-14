@@ -44,15 +44,15 @@ BoarOS 的通用 `kernel_mm` 是可 acquire/move/release 的引用，RISC-V 用�
 
 RISC-V Linux 用户 ABI 用 `a7` 传系统调用号，`a0..a5` 传最多六个参数，返回值放在 `a0`。用户执行 `ECALL` 后，`sepc` 指向 `ECALL` 本身；若系统调用要返回用户代码，内核必须把 `sepc` 前移 4 字节，否则会再次执行同一条指令。
 
-BoarOS 当前实现 `openat(56)`、`close(57)`、`pipe2(59)`、`dup(23)/dup3(24)/fcntl(25)`、`lseek(62)`、`read(63)`、`write(64)/writev(66)`、`getdents64(61)`、`fstat(80)`、`newfstatat(79)`、`exit(93)`、`exit_group(94)`、`set_tid_address(96)`、`restart_syscall(128)`、`kill(129)/tkill(130)/tgkill(131)`、`rt_sigsuspend(133)`、`rt_sigaction(134)`、`rt_sigprocmask(135)`、`rt_sigpending(136)`、`rt_sigreturn(139)`、`uname(160)`、`getpid(172)`、`getppid(173)`、`gettid(178)`、`brk(214)`、普通进程 `clone(220)`、`execve(221)`、`mmap(222)`、`munmap(215)`、`mprotect(226)` 和 `wait4(260)`。文件调用从 current task 借用 files/fs/MM，并返回 fd、字节数或负 Linux errno；`uname` 使用 Linux 六个 65 字节字段、总计 390 字节的 `new_utsname`，用户目标无效时返回 `-EFAULT`；getpid/gettid/getppid 分别观察线程组、任务和父进程身份。raw `brk` 返回调整后的精确地址或拒绝时的原地址，不能套用 libc 的 0/-1 包装语义。clone 是特殊的双返回系统调用，架构层必须复制 syscall 入口 Trap Frame，并分别设置父子 `a0`；wait 可能在内核中阻塞并在唤醒后才完成同一次 ecall。当前进程都是单成员组，所以 getpid 与 gettid 相同。未知调用返回 `-ENOSYS`（错误号 38），普通返回路径前移 `sepc` 后继续执行；信号 handler 返回通过固定 VDSO ecall stub 恢复。
+BoarOS 当前实现 `openat(56)`、`close(57)`、`pipe2(59)`、`dup(23)/dup3(24)/fcntl(25)`、`lseek(62)`、`read(63)`、`write(64)/writev(66)`、`getdents64(61)`、`fstat(80)`、`newfstatat(79)`、`exit(93)`、`exit_group(94)`、`set_tid_address(96)`、`restart_syscall(128)`、`kill(129)/tkill(130)/tgkill(131)`、`rt_sigsuspend(133)`、`rt_sigaction(134)`、`rt_sigprocmask(135)`、`rt_sigpending(136)`、`rt_sigreturn(139)`、`uname(160)`、`getpid(172)`、`getppid(173)`、`gettid(178)`、`brk(214)`、普通进程与线程子集 `clone(220)`、`execve(221)`、`mmap(222)`、`munmap(215)`、`mprotect(226)` 和 `wait4(260)`。文件调用从 current task 借用 files/fs/MM，并返回 fd、字节数或负 Linux errno；`uname` 使用 Linux 六个 65 字节字段、总计 390 字节的 `new_utsname`，用户目标无效时返回 `-EFAULT`；getpid/gettid/getppid 分别观察线程组、任务和父进程身份。raw `brk` 返回调整后的精确地址或拒绝时的原地址，不能套用 libc 的 0/-1 包装语义。clone 是特殊的双返回系统调用，架构层必须复制 syscall 入口 Trap Frame，并分别设置父子 `a0`；wait 可能在内核中阻塞并在唤醒后才完成同一次 ecall。未知调用返回 `-ENOSYS`（错误号 38），普通返回路径前移 `sepc` 后继续执行；信号 handler 返回通过固定 VDSO ecall stub 恢复。
 
-系统调用解码与架构 Trap 分开：Trap 层负责寄存器、`sepc`、显式 current task、signal return 和 restart；通用解码层负责编号、参数和结果语义。普通调用返回时推进旧 `sepc` 并写 `a0`；被 signal 打断的 interruptible syscall 暂存 `ERESTARTSYS`，公共返回尾按 handler 的 `SA_RESTART` 决定跳过 ecall 或重新执行；exec 成功则不能返回旧指令流，而要由 scheduler 安装新地址空间和全新 Trap Frame。当前 `exit_group` 在单成员线程组下与 exit 等价，普通 clone 已建立父子、zombie/wait、stop/continue 和 reparent 生命周期；尚未实现线程组共享和通用 clone flags，现有资源模型不伪装这些能力。
+系统调用解码与架构 Trap 分开：Trap 层负责寄存器、`sepc`、显式 current task、signal return 和 restart；通用解码层负责编号、参数和结果语义。普通调用返回时推进旧 `sepc` 并写 `a0`；被 signal 打断的 interruptible syscall 暂存 `ERESTARTSYS`，公共返回尾按 handler 的 `SA_RESTART` 决定跳过 ecall 或重新执行；exec 成功则不能返回旧指令流，而要由 scheduler 安装新地址空间和全新 Trap Frame。普通 clone 已建立父子、zombie/wait、stop/continue 和 reparent 生命周期；线程子集已验证共享资源、pthread create/join、组长先退、非组长 exec 与 exit_group，完整线程组矩阵仍有限。
 
 ## Exec 为什么需要两阶段提交
 
-`execve` 替换的是当前任务的程序映像，不是创建一个新 PID。路径查找、用户字符串复制、ELF 校验和新页表分配都可能失败，所以它们必须在旧 MM 仍活动时完成；失败可以释放临时 owner，并让旧程序从 `ECALL` 后继续运行。新入口、栈和 `satp` 全部验证后，scheduler 才切换地址空间。切换完成后旧用户指针和旧 PC 已经失效，这就是 point of no return，后续清理失败只能保留 owner 重试，不能再返回旧程序。
+`execve` 替换的是当前任务的程序映像，不是创建一个新 PID。路径查找、用户字符串复制、ELF 校验和新页表分配都可能失败，所以它们必须在旧 MM 仍活动时完成；失败可以释放临时 owner，并让旧程序从 `ECALL` 后继续运行。新入口、栈和 `satp` 全部验证后，scheduler 才切换地址空间。切换完成后旧用户指针和旧 PC 已经失效，这就是 point of no return；若真实 VFS/block I/O 清理失败，只能保留对应 owner 继续处理，不能再返回旧程序。
 
-成功 exec 保留 task、TID/TGID、cwd、文件表以及没有 `FD_CLOEXEC` 的打开文件描述；被标记的 fd 在提交后关闭。Trap Frame 必须整体重建，而不是只改 `sepc/sp`：否则旧参数寄存器、callee-saved 寄存器或用户 `tp` 会泄漏到新程序。BoarOS 当前把除新 PC、SP、架构指定 `tp` 和 Trap 返回元数据外的整数现场清零。多线程 exec 还需要终止同组其他线程并协调共享 MM；在该生命周期建立前，当前实现只接受单成员线程组。
+成功 exec 保留 task、TID/TGID、cwd、文件表以及没有 `FD_CLOEXEC` 的打开文件描述；被标记的 fd 在提交后关闭。Trap Frame 必须整体重建，而不是只改 `sepc/sp`：否则旧参数寄存器、callee-saved 寄存器或用户 `tp` 会泄漏到新程序。BoarOS 当前把除新 PC、SP、架构指定 `tp` 和 Trap 返回元数据外的整数现场清零。线程组 exec 的成员收拢和共享 MM 协调已有生产入口验证，完整 Linux 生命周期矩阵仍有限。
 
 ## 内核为什么不能直接解引用用户指针
 
@@ -74,7 +74,7 @@ BoarOS 当前逐基页调用 `kernel_mm_lookup()`，按复制方向检查 `USER|
 
 ## 当前项目选择与平台边界
 
-BoarOS 先用手工映射探针验证首次 `SRET`、真实 timer 抢占、U-mode syscall、同步页故障、调度恢复和完整资源回收，再用独立链接的静态 ELF 验证装载器产出的代码、数据、BSS 和 Linux 形态的 `argc/argv/envp/auxv` 初始栈。生产路径进一步从 DTB 发现的 VirtIO 块设备按能力读写或只读挂载 ext4，以精确随机读构造 source-backed `ET_EXEC`/`ET_DYN`/`PT_INTERP` 映像；静态 `/init` 与动态 musl PIE、解释器、额外 DSO、TLS 已实际进入 U-mode，动态重定位由用户态链接器完成。PID 1 通过文件描述符读取同一根上的普通文件，再连续 exec 两个独立静态 ELF，并验证 `brk` heap、普通 clone/wait/reparent，最后沿 exec/files/fs/MM/TID/task 顺序释放全部资源。当前 TID/TGID 仍只有单成员线程组；具备普通进程 clone 不等于已经实现多线程 exec 收拢或 Linux 的通用资源共享规则。`make test-userland-riscv` 进一步以静态和动态 musl 程序作为 PID 1 运行 stdio、readdir、read/lseek/fstat、dup、F/D 浮点抢占、signal handler/sigreturn、可中断 nanosleep、pipe、pthread、TLS 和 dlopen，这是编译器生成用户程序入口。用户产物由 `musl-gcc` specs 提供 musl 头文件、启动对象和库搜索路径；链接命令不能再把交叉工具链的 glibc sysroot 通过 `-L` 放到它之前，否则会生成启动对象和 libc 来源混杂、但仍可能成功链接的错误 ELF。
+BoarOS 先用手工映射探针验证首次 `SRET`、真实 timer 抢占、U-mode syscall、同步页故障、调度恢复和完整资源回收，再用独立链接的静态 ELF 验证装载器产出的代码、数据、BSS 和 Linux 形态的 `argc/argv/envp/auxv` 初始栈。生产路径进一步从 DTB 发现的 VirtIO 块设备按能力读写或只读挂载 ext4，以精确随机读构造 source-backed `ET_EXEC`/`ET_DYN`/`PT_INTERP` 映像；静态 `/init` 与动态 musl PIE、解释器、额外 DSO、TLS 已实际进入 U-mode，动态重定位由用户态链接器完成。PID 1 通过文件描述符读取同一根上的普通文件，再连续 exec 两个独立静态 ELF，并验证 `brk` heap、普通 clone/wait/reparent，最后沿 exec/files/fs/MM/TID/task 顺序释放全部资源。`make test-userland-riscv` 进一步以静态和动态 musl 程序作为 PID 1 运行 stdio、readdir、read/lseek/fstat、dup、F/D 浮点抢占、signal handler/sigreturn、可中断 nanosleep、pipe、pthread、TLS 和 dlopen，并覆盖组长先退、非组长 exec 与 exit_group；这是编译器生成用户程序入口。用户产物由 `musl-gcc` specs 提供 musl 头文件、启动对象和库搜索路径；链接命令不能再把交叉工具链的 glibc sysroot 通过 `-L` 放到它之前，否则会生成启动对象和 libc 来源混杂、但仍可能成功链接的错误 ELF。
 
 静态 musl 启动阶段对内核的 ABI 依赖很小：`set_tid_address`（`__init_libc` 记录 clear_tid）、`brk`、`mmap`/`mprotect`、stdio 的 `write/writev`、退出时的 `exit_group`；运行 signal/pipe 测试时还会调用 `rt_sigaction/rt_sigprocmask/rt_sigreturn`、`nanosleep`/`restart_syscall` 和 `pipe2`。`AT_RANDOM` 缺失时 musl 使用固定栈保护常量，不要求熵源；`isatty` 经 `ioctl` 返回 `ENOSYS` 后按非 tty 处理（stdout 全缓冲）。这些是编译器生成用户程序与手写汇编探针的本质差异：程序依赖 libc 启动序列，而 libc 依赖一小组必须真实可用的 syscall。
 
@@ -88,7 +88,7 @@ Sv39、`satp`、`sscratch`、Trap Frame 和 RISC-V syscall 寄存器约定属于
 - ELF 集成测试应嵌入完整链接产物并经生产解析器装载；直接复制测试汇编字节只能验证 U-mode 路径，不能验证 ELF program header、BSS 或页权限物化。
 - Exec 集成测试应让旧程序先填充所有 callee-saved 寄存器和 `tp`，再由新程序检查它们没有泄漏；同时用跨映像 fd offset、CLOEXEC 和 PID/TID 检查“替换映像但保留进程身份”的边界。
 - 内核 worker 在用户任务被抢占后检查 `sscratch=0`，能发现入口忘记清 scratch 导致后续 S-mode trap 误判来源。
-- 创建失败测试既要检查返回错误，也要检查地址空间或 MM owner 仍在调用者手中；回收测试比较开始和结束的物理空闲页数，覆盖叶子页、各级页表、MM 记录页和任务页，并验证 TID 可重新分配。非法 allocator 释放由 fatal-path 测试覆盖，真实 ext4/block I/O 失败则检查所属 owner 的有限重试。
+- 创建失败测试既要检查返回错误，也要检查地址空间或 MM owner 仍在调用者手中；回收测试比较开始和结束的物理空闲页数，覆盖叶子页、各级页表、MM 记录页和任务页，并验证 TID 可重新分配。非法 allocator 释放由 fatal-path 测试覆盖，真实 ext4/block I/O 失败则检查所属 owner 在后续清理机会继续处理。
 - 汇编返回路径应检查最终 ELF 反汇编。符号可能被链接器拆成多个范围，只截取入口符号容易漏掉公共 return 路径。
 - fatal 测试要在用户根仍为当前 `satp` 时破坏返回凭据，确认 supervisor-only 高半区 UART 能打印诊断并关机；等任务回到内核根后再测试无法发现低地址设备映射缺失。
 

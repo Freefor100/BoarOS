@@ -6,7 +6,7 @@
 
 可调度任务是 scheduler 能选择执行的实体。进程是用户可观察的资源与身份容器，线程是共享大部分进程资源、但拥有独立执行现场的任务。Linux 内部用统一 task 对象表达进程和线程，再由 clone flags 决定资源共享关系；用户看到的 PID 通常是线程组 ID（TGID），TID 则标识具体任务。
 
-BoarOS 当前每个用户进程只有一个任务，所以 TID 等于 TGID；字段仍然分开，避免以后加入线程时修改 `getpid/gettid` ABI。内核任务和 idle 没有 Linux 用户身份。
+BoarOS 已支持共享 MM、files、fs context 和信号 disposition 的线程 clone 子集；这些任务拥有独立 TID，并与组首共享 TGID。完整线程组生命周期和 clone flags 矩阵仍有限。内核任务和 idle 没有 Linux 用户身份。
 
 一个用户任务至少要保存两类现场：
 
@@ -26,7 +26,7 @@ Fork 要复制前者，让父子从同一个 syscall 返回点继续；context s
 - 当前工作目录语义被继承；
 - 子进程拥有新的 PID，并记录创建它的父进程。
 
-BoarOS 当前只接受 RISC-V `clone(SIGCHLD, 0, 0, 0, 0)`。这形成真实的普通进程闭环，同时拒绝尚未实现的 `CLONE_VM`、`CLONE_FILES`、`CLONE_THREAD`、替代用户栈和用户态 TID 指针，避免把共享资源或线程语义伪装成 fork。
+BoarOS 接受 RISC-V `clone(SIGCHLD, 0, 0, 0, 0)` 的普通进程形态，也接受已验证的共享资源线程子集（`CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD` 及当前支持的 TID/TLS flags）。未覆盖的 clone flags、共享映射和完整线程组 exec/退出矩阵仍返回准确错误或留在后续兼容性工作中。
 
 ## 地址空间复制：eager copy 与 COW
 
@@ -74,7 +74,7 @@ BoarOS 普通 clone 已复制 fd 槽数组并给每个继承的 open file descri
   -> 释放 PID 和最后的任务对象
 ```
 
-BoarOS 也采用这个边界。退出路径先切回稳定内核地址空间，再在任务自己的内核栈上释放 exec/files/fs/MM；清理完整且存在父任务时成为 zombie。任务页不能在当前仍使用它的栈上释放，所以它必须保留到父进程 wait。只有真实 VFS/block I/O 清理错误会把任务留在 exited 清理队列，由 idle 在可信栈上有限重试；合法页和堆释放完成即返回，分配器不变量错误进入 fatal。
+BoarOS 也采用这个边界。退出路径先切回稳定内核地址空间，再在任务自己的内核栈上释放 exec/files/fs/MM；清理完整且存在父任务时成为 zombie。任务页不能在当前仍使用它的栈上释放，所以它必须保留到父进程 wait。真实 VFS/block I/O 清理错误会把任务留在 exited 清理队列，由 idle 在可信栈上按 owner 状态继续尝试；合法页和堆释放完成即返回，分配器不变量错误进入 fatal。
 
 普通退出码在 wait status 中放在 bit 8..15；信号终止使用低 7 位，core 默认动作另置 bit 7。同步异常则转换为信号终止形态，例如非法指令对应 SIGILL、地址访问故障通常对应 SIGSEGV。标准信号现在可以在用户返回尾进入 handler，`rt_sigreturn` 恢复整数/FP frame；实时排队和备用信号栈仍未实现。
 

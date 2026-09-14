@@ -46,7 +46,7 @@ RISC-V 后端固定 Sv39/4 KiB，并支持：
 
 ## 不可返回提交
 
-提交前 scheduler 验证当前 task、新 MM 的 `satp`、入口可执行 VMA/PTE、栈 RW PTE 和 SP 对齐。多线程进程随后先终止其他成员，等待其调用栈与资源清理完成；非组长调用者接管原 TGID 和父子树位置，形成单成员组。竞争 exec 的未提交事务由退出路径清理。随后：
+提交前 scheduler 验证当前 task、新 MM 的 `satp`、入口可执行 VMA/PTE、栈 RW PTE 和 SP 对齐。线程组 exec 先终止其他成员并等待其调用栈与资源清理完成；非组长调用者接管原 TGID 和父子树位置。竞争 exec 的未提交事务由退出路径清理。随后：
 
 ```text
 切换 new satp

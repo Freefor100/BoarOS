@@ -123,7 +123,7 @@ BoarOS 在 RISC-V 架构下采用单页（4 KiB）紧凑任务布局，扣除任
 
 ## 关闭与所有权
 
-epoll OFD 关闭时先把监听项从等待队列、目标 OFD 和就绪队列解绑，再按 owner 顺序释放 item 与实例；同一逻辑解绑不会执行两次。物理页和堆释放若遇到非法地址、引用或 allocator metadata，直接进入 fatal，不建立 `cleanup_items` 或人工失败注入路径。若目标 OFD 或关联 source 的真实 VFS/block I/O 清理失败，owner 由文件表或 mount 保留，fd 槽已经摘除，当前 `close()` 仍返回 0，重复 close 返回 `-EBADF`。这让 epoll 的监听图生命周期与文件系统 I/O 错误分属不同失败域。
+epoll OFD 关闭时先把监听项从等待队列、目标 OFD 和就绪队列解绑，再按 owner 顺序释放 item 与实例；同一逻辑解绑不会执行两次。监听项的物理页和堆释放属于同步完成的内部回收，非法地址、引用或 allocator metadata 直接进入 fatal。若目标 OFD 或关联 source 的真实 VFS/block I/O 清理失败，owner 由文件表或 mount 保留，fd 槽已经摘除，当前 `close()` 仍返回 0，重复 close 返回 `-EBADF`。这让 epoll 的监听图生命周期与文件系统 I/O 错误分属不同失败域。
 
 ## 固定资料
 

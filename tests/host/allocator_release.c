@@ -12,6 +12,35 @@ static unsigned char pool[256 * BOAROS_PAGE_SIZE]
     __attribute__((aligned(BOAROS_PAGE_SIZE)));
 static struct physical_page_allocator allocator;
 static struct kernel_heap heap;
+
+#define TEST_SLAB_BITMAP_WORDS 4U
+#define TEST_PAGE_STATE_FREE_HEAD 3U
+
+/* These mirrors are used only to inject corruption into the metadata paths
+ * whose invariants are part of the allocator contract. */
+struct test_slab_header {
+    uint64_t magic;
+    struct kernel_heap *heap;
+    struct test_slab_header *next;
+    struct test_slab_header *previous;
+    uint64_t allocated[TEST_SLAB_BITMAP_WORDS];
+    uint32_t free_head;
+    uint16_t class_index;
+    uint16_t slot_count;
+    uint16_t free_count;
+    uint16_t slot_offset;
+    uint32_t reserved;
+};
+
+struct test_page_metadata {
+    uint32_t next;
+    uint32_t previous;
+    uint32_t reference_count;
+    uint8_t order;
+    uint8_t state;
+    uint16_t reserved;
+};
+
 static void *access_page(uint64_t address) { return (void *)(uintptr_t)address; }
 static int page_address(const void *pointer, uint64_t *address)
 {
@@ -32,6 +61,22 @@ static void setup(void)
     assert(physical_page_allocator_finalize(&allocator) == 0);
     assert(kernel_heap_init(&heap, &allocator, page_address) == 0);
 }
+static uint32_t test_page_index(uint64_t address)
+{
+    uint32_t index;
+
+    for (index = 0U; index < allocator.range_count; index++) {
+        const struct physical_page_range *range = &allocator.ranges[index];
+
+        if (address >= range->base && address < range->end) {
+            return range->first_page_index +
+                   (uint32_t)((address - range->base) >> BOAROS_PAGE_SHIFT);
+        }
+    }
+    assert(0);
+    return 0U;
+}
+
 static void invalid_release(unsigned int which)
 {
     uint64_t page;
@@ -56,13 +101,56 @@ static void invalid_release(unsigned int which)
             physical_page_acquire(&allocator, page); break;
     case 9: physical_page_release_order(&allocator, page, 1);
             physical_page_reference_count(&allocator, page, &references); break;
+    case 10: {
+        void *other;
+        struct test_slab_header *slab;
+
+        assert(kernel_heap_allocate(&heap, 32, &other) == 0);
+        slab = (struct test_slab_header *)heap.partial_slabs[1];
+        assert(slab != 0 && slab->free_count > 0U);
+        slab->free_count++;
+        kernel_heap_release(&heap, object);
+        break;
+    }
+    case 11: {
+        uint64_t pages[128];
+        uint32_t page_count = 0U;
+        uint32_t first;
+        uint32_t second;
+        struct test_page_metadata *metadata;
+
+        while (page_count < 128U &&
+               physical_page_allocate_order(&allocator,
+                                             0U,
+                                             &pages[page_count]) == 0) {
+            page_count++;
+        }
+        for (first = 0U; first < page_count; first++) {
+            for (second = first + 1U; second < page_count; second++) {
+                if ((pages[first] ^ BOAROS_PAGE_SIZE) == pages[second]) {
+                    metadata = (struct test_page_metadata *)allocator.metadata;
+                    physical_page_release_order(&allocator, pages[first], 0U);
+                    assert(metadata[test_page_index(pages[first])].state ==
+                           TEST_PAGE_STATE_FREE_HEAD);
+                    metadata[test_page_index(pages[first])].order = 1U;
+                    physical_page_release_order(&allocator, pages[second], 0U);
+                    break;
+                }
+            }
+            if (second < page_count) {
+                break;
+            }
+        }
+        assert(0);
+        break;
+    }
     }
 }
 int main(void)
 {
     struct rlimit limit = {0, 0};
     assert(setrlimit(RLIMIT_CORE, &limit) == 0);
-    for (unsigned int i = 0; i < 10; i++) {
+    for (unsigned int i = 0; i < 12; i++) {
         pid_t child = fork();
         int status;
         assert(child >= 0);

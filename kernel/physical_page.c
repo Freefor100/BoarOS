@@ -389,7 +389,8 @@ static int block_geometry(
     uint32_t result_range;
     const struct physical_page_range *range;
 
-    if (order > PHYSICAL_PAGE_MAX_ORDER) {
+    if (order > PHYSICAL_PAGE_MAX_ORDER ||
+        (uint64_t)page_index >= allocator->total_pages) {
         return 0;
     }
     block_pages = order_page_count(order);
@@ -494,8 +495,14 @@ static int free_block_valid(
     }
     count = order_page_count(order);
     for (offset = 1U; offset < count; offset++) {
-        if (allocator->metadata[page_index + (uint32_t)offset].state !=
-            PHYSICAL_PAGE_STATE_FREE_TAIL) {
+        const struct physical_page_metadata *tail =
+            &allocator->metadata[page_index + (uint32_t)offset];
+
+        if (tail->state != PHYSICAL_PAGE_STATE_FREE_TAIL ||
+            tail->order != 0U || tail->reference_count != 0U ||
+            tail->next != PHYSICAL_PAGE_INDEX_NONE ||
+            tail->previous != PHYSICAL_PAGE_INDEX_NONE ||
+            tail->reserved != 0U) {
             return 0;
         }
     }
@@ -514,21 +521,53 @@ static int free_list_node_valid(
     }
     metadata = &allocator->metadata[page_index];
     if (metadata->state != PHYSICAL_PAGE_STATE_FREE_HEAD ||
-        metadata->order != order) {
+        metadata->order != order || metadata->reference_count != 0U ||
+        metadata->reserved != 0U) {
         return 0;
     }
     if (metadata->previous == PHYSICAL_PAGE_INDEX_NONE) {
         if (allocator->free_heads[order] != page_index) {
             return 0;
         }
-    } else if ((uint64_t)metadata->previous >= allocator->total_pages ||
-               allocator->metadata[metadata->previous].next != page_index) {
-        return 0;
+    } else {
+        const struct physical_page_metadata *previous;
+
+        if ((uint64_t)metadata->previous >= allocator->total_pages ||
+            !block_geometry(allocator, metadata->previous, order, 0, 0)) {
+            return 0;
+        }
+        previous = &allocator->metadata[metadata->previous];
+        if (previous->state != PHYSICAL_PAGE_STATE_FREE_HEAD ||
+            previous->order != order || previous->reference_count != 0U ||
+            previous->reserved != 0U || previous->next != page_index) {
+            return 0;
+        }
+        if ((uint64_t)metadata->previous + order_page_count(order) >
+                page_index &&
+            (uint64_t)page_index + order_page_count(order) >
+                metadata->previous) {
+            return 0;
+        }
     }
-    if (metadata->next != PHYSICAL_PAGE_INDEX_NONE &&
-        ((uint64_t)metadata->next >= allocator->total_pages ||
-         allocator->metadata[metadata->next].previous != page_index)) {
-        return 0;
+    if (metadata->next != PHYSICAL_PAGE_INDEX_NONE) {
+        const struct physical_page_metadata *next;
+
+        if ((uint64_t)metadata->next >= allocator->total_pages ||
+            !block_geometry(allocator, metadata->next, order, 0, 0)) {
+            return 0;
+        }
+        next = &allocator->metadata[metadata->next];
+        if (next->state != PHYSICAL_PAGE_STATE_FREE_HEAD ||
+            next->order != order || next->reference_count != 0U ||
+            next->reserved != 0U || next->previous != page_index) {
+            return 0;
+        }
+        if ((uint64_t)metadata->next + order_page_count(order) >
+                page_index &&
+            (uint64_t)page_index + order_page_count(order) >
+                metadata->next) {
+            return 0;
+        }
     }
 
     return 1;
@@ -985,7 +1024,10 @@ static int allocated_block_valid(
     if (!block_geometry(allocator, page_index, order, 0, 0) ||
         allocator->metadata[page_index].state !=
             PHYSICAL_PAGE_STATE_ALLOCATED_HEAD ||
-        allocator->metadata[page_index].order != order) {
+        allocator->metadata[page_index].order != order ||
+        allocator->metadata[page_index].next != PHYSICAL_PAGE_INDEX_NONE ||
+        allocator->metadata[page_index].previous != PHYSICAL_PAGE_INDEX_NONE ||
+        allocator->metadata[page_index].reserved != 0U) {
         return 0;
     }
     count = order_page_count(order);
@@ -997,7 +1039,10 @@ static int allocated_block_valid(
             &allocator->metadata[page_index + (uint32_t)offset];
 
         if (tail->state != PHYSICAL_PAGE_STATE_ALLOCATED_TAIL ||
-            tail->reference_count != 0U) {
+            tail->order != 0U || tail->reference_count != 0U ||
+            tail->next != PHYSICAL_PAGE_INDEX_NONE ||
+            tail->previous != PHYSICAL_PAGE_INDEX_NONE ||
+            tail->reserved != 0U) {
             return 0;
         }
     }
@@ -1093,19 +1138,49 @@ enum physical_page_status physical_page_release_order(
                          buddy_address,
                          &buddy_range,
                          &buddy_index) ||
-            buddy_range != original_range ||
-            allocator->metadata[buddy_index].state != PHYSICAL_PAGE_STATE_FREE_HEAD ||
-            allocator->metadata[buddy_index].order != current_order) {
+            buddy_range != original_range) {
             break;
         }
-        if (!free_list_node_valid(allocator, buddy_index, current_order)) {
+
+        switch (allocator->metadata[buddy_index].state) {
+        case PHYSICAL_PAGE_STATE_FREE_HEAD:
+            if (allocator->metadata[buddy_index].order >
+                    PHYSICAL_PAGE_MAX_ORDER ||
+                !block_geometry(allocator,
+                                buddy_index,
+                                allocator->metadata[buddy_index].order,
+                                0,
+                                0) ||
+                !free_list_node_valid(allocator,
+                                      buddy_index,
+                                      allocator->metadata[buddy_index].order)) {
+                __builtin_trap();
+            }
+            if (allocator->metadata[buddy_index].order > current_order) {
+                __builtin_trap();
+            }
+            if (allocator->metadata[buddy_index].order < current_order) {
+                break;
+            }
+            merge_buddies[merge_count++] = buddy_index;
+            if (buddy_address < current_address) {
+                current_address = buddy_address;
+            }
+            current_order++;
+            continue;
+        case PHYSICAL_PAGE_STATE_FREE_TAIL:
+        case PHYSICAL_PAGE_STATE_CANDIDATE:
             __builtin_trap();
+            break;
+        case PHYSICAL_PAGE_STATE_ALLOCATED_HEAD:
+        case PHYSICAL_PAGE_STATE_ALLOCATED_TAIL:
+        case PHYSICAL_PAGE_STATE_INTERNAL:
+            break;
+        default:
+            __builtin_trap();
+            break;
         }
-        merge_buddies[merge_count++] = buddy_index;
-        if (buddy_address < current_address) {
-            current_address = buddy_address;
-        }
-        current_order++;
+        break;
     }
 
     if (allocator->free_heads[current_order] != PHYSICAL_PAGE_INDEX_NONE &&

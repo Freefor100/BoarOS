@@ -221,6 +221,94 @@ static void bitmap_clear(struct kernel_slab *slab, uint32_t slot_index)
     slab->allocated[word] &= ~(UINT64_C(1) << bit);
 }
 
+static uint32_t bitmap_count(uint64_t value)
+{
+    value = value - ((value >> 1U) & UINT64_C(0x5555555555555555));
+    value = (value & UINT64_C(0x3333333333333333)) +
+            ((value >> 2U) & UINT64_C(0x3333333333333333));
+    value = (value + (value >> 4U)) & UINT64_C(0x0f0f0f0f0f0f0f0f);
+    return (uint32_t)((value * UINT64_C(0x0101010101010101)) >> 56U);
+}
+
+static int slab_metadata_valid(const struct kernel_heap *heap,
+                               const struct kernel_slab *slab)
+{
+    uint32_t allocated_count = 0U;
+    uint32_t slots_remaining;
+    uint32_t word;
+
+    if (slab->magic != KERNEL_SLAB_MAGIC || slab->heap != heap ||
+        slab->class_index >= KERNEL_HEAP_SIZE_CLASS_COUNT ||
+        slab->slot_offset != sizeof(*slab) || slab->slot_count == 0U ||
+        slab->slot_count > KERNEL_SLAB_BITMAP_WORDS * 64U ||
+        slab->reserved != 0U || slab->free_count > slab->slot_count) {
+        return 0;
+    }
+
+    slots_remaining = slab->slot_count;
+    for (word = 0U; word < KERNEL_SLAB_BITMAP_WORDS; word++) {
+        uint64_t mask;
+
+        if (slots_remaining >= 64U) {
+            mask = UINT64_MAX;
+            slots_remaining -= 64U;
+        } else if (slots_remaining == 0U) {
+            mask = 0U;
+        } else {
+            mask = (UINT64_C(1) << slots_remaining) - 1U;
+            slots_remaining = 0U;
+        }
+        if ((slab->allocated[word] & ~mask) != 0U) {
+            return 0;
+        }
+        allocated_count += bitmap_count(slab->allocated[word] & mask);
+    }
+    if (allocated_count + slab->free_count != slab->slot_count) {
+        return 0;
+    }
+
+    if (slab->free_count == 0U) {
+        if (slab->free_head != KERNEL_SLAB_INDEX_NONE) {
+            return 0;
+        }
+    } else {
+        uint32_t next;
+
+        if (slab->free_head >= slab->slot_count ||
+            bitmap_test(slab, slab->free_head)) {
+            return 0;
+        }
+        next = slot_next(slab, slab->free_head);
+        if (next != KERNEL_SLAB_INDEX_NONE &&
+            (next >= slab->slot_count || bitmap_test(slab, next))) {
+            return 0;
+        }
+    }
+
+    if (slab->free_count == 0U) {
+        return slab->next == 0 && slab->previous == 0;
+    }
+    if (slab->previous == 0) {
+        if (heap->partial_slabs[slab->class_index] != slab) {
+            return 0;
+        }
+    } else if (slab->previous->magic != KERNEL_SLAB_MAGIC ||
+               slab->previous->heap != heap ||
+               slab->previous->class_index != slab->class_index ||
+               slab->previous->next != slab) {
+        return 0;
+    }
+    if (slab->next != 0 &&
+        (slab->next->magic != KERNEL_SLAB_MAGIC ||
+         slab->next->heap != heap ||
+         slab->next->class_index != slab->class_index ||
+         slab->next->previous != slab)) {
+        return 0;
+    }
+
+    return 1;
+}
+
 static enum kernel_heap_status slab_create(struct kernel_heap *heap,
                                            uint32_t class_index,
                                            struct kernel_slab **slab_out)
@@ -572,6 +660,9 @@ enum kernel_heap_status kernel_heap_release(
                                     &slot_index);
     (void)capacity;
     if (status != KERNEL_HEAP_STATUS_OK) {
+        __builtin_trap();
+    }
+    if (slab != 0 && !slab_metadata_valid(heap, slab)) {
         __builtin_trap();
     }
     if (heap->statistics.live_allocations == 0U) {

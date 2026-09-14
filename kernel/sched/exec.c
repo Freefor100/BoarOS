@@ -186,8 +186,8 @@ enum kernel_exec_status kernel_task_exec_finish(
         !kernel_exec_transaction_valid(transaction, task->files.heap)) {
         return KERNEL_EXEC_STATUS_STATE;
     }
-    /* Also reached by a later cleanup retry. No user of the retired MM
-     * remains, even if freeing the transaction container needs retry. */
+    /* Also reached after a real source/OFD cleanup retry. No user of the
+     * replaced MM remains when the transaction container is finally freed. */
     process_complete_vfork(task);
     heap = transaction->heap;
     (void)kernel_heap_release(heap, transaction);
