@@ -1596,6 +1596,8 @@ static int check_filesystem_rw(void)
         return 39;
     }
     close(exec_rfd);
+    printf("BoarOS: fsrw stage etxtbsy ok\n");
+    fflush(stdout);
 
     /* 9. Executable text denial on newly written file:
      * Copy /init to /test_exec, keep write fd open, fork+execve must fail with ETXTBSY.
@@ -1668,6 +1670,8 @@ static int check_filesystem_rw(void)
 
     /* Clean up /test_exec */
     unlink("/test_exec");
+    printf("BoarOS: fsrw stage test-exec unlink ok\n");
+    fflush(stdout);
 
     /* 10. Warm page-cache overwrite coherence:
      * Read file to populate page cache, overwrite from another fd, then read back from first fd. */
@@ -1713,6 +1717,8 @@ static int check_filesystem_rw(void)
     close(cache_wfd);
     close(cache_rfd);
     unlink("/cache_test.txt");
+    printf("BoarOS: fsrw stage cache ok\n");
+    fflush(stdout);
 
     /* 11. Multi-OFD size coherence:
      * fd1 write extends size, fd2 fstat observes immediately.
@@ -1813,71 +1819,111 @@ static int check_filesystem_rw(void)
     close(trfd);
     unlink("/trunc_extend.txt");
 
-    /* 13. True unlink-but-open read/write/fstat lifecycle:
+    /* 13a. Unlink unopened cached file:
+     * Create file, write data, close file (cached in page cache).
+     * Unlink must reclaim page-cache held inode without double free. */
+    int uc_fd = open("/unlink_cached.txt", O_CREAT | O_RDWR | O_TRUNC, 0644);
+    if (uc_fd < 0) {
+        return 74;
+    }
+    if (write(uc_fd, "CACHED_DATA", 11) != 11) {
+        close(uc_fd);
+        return 75;
+    }
+    if (close(uc_fd) != 0) {
+        return 76;
+    }
+    if (unlink("/unlink_cached.txt") != 0) {
+        return 77;
+    }
+    errno = 0;
+    int uc_re = open("/unlink_cached.txt", O_RDONLY);
+    if (uc_re >= 0 || errno != ENOENT) {
+        if (uc_re >= 0) close(uc_re);
+        return 78;
+    }
+
+    /* 13b. True unlink-but-open read/write/fstat lifecycle:
      * Open fd, write data, unlink file.
      * Subsequent open fails with ENOENT.
-     * Original fd must continue to support fstat, lseek, read, and write! */
+     * Original fd must continue to support fstat, lseek, read, and write!
+     * Same pathname recreated while orphan is still open must yield a distinct inode! */
     int ufd = open("/unlink_live.txt", O_CREAT | O_RDWR | O_TRUNC, 0644);
     if (ufd < 0) {
-        return 74;
+        return 79;
     }
     if (write(ufd, "abcdef", 6) != 6) {
         close(ufd);
-        return 75;
+        return 80;
+    }
+    struct stat ust_orig;
+    memset(&ust_orig, 0, sizeof(ust_orig));
+    if (fstat(ufd, &ust_orig) != 0 || ust_orig.st_size != 6) {
+        close(ufd);
+        return 81;
     }
     if (unlink("/unlink_live.txt") != 0) {
         close(ufd);
-        return 76;
+        return 82;
     }
     errno = 0;
     int re_open = open("/unlink_live.txt", O_RDONLY);
     if (re_open >= 0 || errno != ENOENT) {
         if (re_open >= 0) close(re_open);
         close(ufd);
-        return 77;
+        return 120;
     }
-    struct stat ust;
-    memset(&ust, 0, sizeof(ust));
-    if (fstat(ufd, &ust) != 0 || ust.st_size != 6) {
+    /* WHILE ufd IS STILL OPEN: Recreate /unlink_live.txt with same path.
+     * New file must obtain a distinct inode from the live orphan! */
+    int new_ufd = open("/unlink_live.txt", O_CREAT | O_RDWR | O_TRUNC, 0644);
+    if (new_ufd < 0) {
         close(ufd);
-        return 78;
+        return 121;
+    }
+    struct stat ust_new;
+    memset(&ust_new, 0, sizeof(ust_new));
+    if (fstat(new_ufd, &ust_new) != 0 || ust_new.st_ino == ust_orig.st_ino) {
+        close(new_ufd);
+        close(ufd);
+        return 122;
+    }
+    if (write(new_ufd, "recreated", 9) != 9) {
+        close(new_ufd);
+        close(ufd);
+        return 123;
     }
     char ubuf[16];
     memset(ubuf, 0, sizeof(ubuf));
     if (lseek(ufd, 0, SEEK_SET) != 0 || read(ufd, ubuf, 6) != 6 ||
         memcmp(ubuf, "abcdef", 6) != 0) {
+        close(new_ufd);
         close(ufd);
-        return 79;
+        return 124;
     }
     if (lseek(ufd, 6, SEEK_SET) != 6 || write(ufd, "XYZ", 3) != 3) {
-        close(ufd);
-        return 80;
-    }
-    if (fstat(ufd, &ust) != 0 || ust.st_size != 9) {
-        close(ufd);
-        return 81;
-    }
-    if (close(ufd) != 0) {
-        return 82;
-    }
-
-    /* Same pathname can now be recreated as a distinct inode */
-    int new_ufd = open("/unlink_live.txt", O_CREAT | O_RDWR | O_TRUNC, 0644);
-    if (new_ufd < 0) {
-        return 130;
-    }
-    if (write(new_ufd, "recreated", 9) != 9) {
         close(new_ufd);
-        return 131;
+        close(ufd);
+        return 125;
+    }
+    struct stat ust;
+    memset(&ust, 0, sizeof(ust));
+    if (fstat(ufd, &ust) != 0 || ust.st_size != 9 || ust.st_ino != ust_orig.st_ino) {
+        close(new_ufd);
+        close(ufd);
+        return 126;
     }
     memset(ubuf, 0, sizeof(ubuf));
     if (lseek(new_ufd, 0, SEEK_SET) != 0 || read(new_ufd, ubuf, 9) != 9 ||
         memcmp(ubuf, "recreated", 9) != 0) {
         close(new_ufd);
-        return 132;
+        close(ufd);
+        return 127;
     }
-    close(new_ufd);
-    unlink("/unlink_live.txt");
+    if (close(ufd) != 0 || close(new_ufd) != 0 || unlink("/unlink_live.txt") != 0) {
+        return 128;
+    }
+    printf("BoarOS: fsrw stage unlink-live ok\n");
+    fflush(stdout);
 
     /* 13b. Multi-OFD unlink lifecycle:
      * fd1 and fd2 both open before unlink.
@@ -1928,6 +1974,8 @@ static int check_filesystem_rw(void)
     if (close(m_fd2) != 0) {
         return 141;
     }
+    printf("BoarOS: fsrw stage unlink-multi ok\n");
+    fflush(stdout);
 
     /* 13c. Executable demand-paging across unlink:
      * Harness has placed /unlink_exec on the root disk.
@@ -1991,6 +2039,8 @@ static int check_filesystem_rw(void)
     if (!WIFEXITED(ex_status) || WEXITSTATUS(ex_status) != 43) {
         return 153;
     }
+    printf("BoarOS: fsrw stage unlink-exec ok\n");
+    fflush(stdout);
 
     /* 14. Append mode atomic offset resolution:
      * Open O_APPEND, write 10 bytes, lseek to offset 0, write 3 bytes.
