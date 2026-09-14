@@ -1278,11 +1278,8 @@ static void discard_prepared_file_source(
     struct riscv_kernel_mm_record *record,
     struct riscv_kernel_mm_file_source *source)
 {
-    if (source != 0 &&
-        kernel_heap_release(record->vma_heap, source) !=
-            KERNEL_HEAP_STATUS_OK) {
-        source->next = record->file_sources;
-        record->file_sources = source;
+    if (source != 0) {
+        (void)kernel_heap_release(record->vma_heap, source);
     }
 }
 
