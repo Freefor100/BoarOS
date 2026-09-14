@@ -115,11 +115,27 @@ BoarOS 在 RISC-V 架构下采用单页（4 KiB）紧凑任务布局，扣除任
 
 因此，BoarOS 延续严格的栈预算分级策略：
 - **微型栈缓冲（Fast-path）**：
-  - 定义 `KERNEL_EPOLL_STACK_CAPACITY = 8`，占用 $8 \times 16 = 128$ 字节栈空间；
-  - 绝大多数常见事件提取循环（$\le 8$ 个事件）完全在栈内完成，零堆内存分配开销；
+  - 定义 `KERNEL_EPOLL_STACK_CAPACITY = 4`，占用 $4 \times 16 = 64$ 字节栈空间；
+  - 常见小规模事件提取循环（$\le 4$ 个事件）完全在栈内完成，零堆内存分配开销；
 - **动态堆回退（Heap Fallback）**：
   - 当 `maxevents > KERNEL_EPOLL_STACK_CAPACITY` 时，从进程私有 `files->heap` 中动态分配临时事件数组；
   - 无论正常返回还是用户空间写错误（`EFAULT`），在函数退出路径（统一 `out` 标签）无条件确定性释放堆内存，严格保持堆基线 `heap-live=0x0`。
+
+## 可重试清理不变量（Retryable Cleanup Invariant）
+
+在 BoarOS 故障注入（Fault Injection）与内存受限模型下，文件描述符与内核对象的销毁必须遵循统一的“先逻辑解绑、物理失败可重试”契约：
+
+1. **逻辑解绑仅执行一次**：
+   - 当 epoll OFD 被关闭（`close(epfd)`）时，内核遍历其直接持有的监听项，依次注销等待节点（`kernel_wait_queue_remove`）、从对应 target OFD 的 `ep_items` 中摘除、从就绪队列摘除；
+   - 无论后续底层堆释放是否成功，所有逻辑关联已彻底解除，避免再次触发或留下悬垂指针。
+2. **物理堆释放允许失败**：
+   - 若堆内存释放（`kernel_heap_release`）在故障注入下失败，未释放的监听项挂入 `epoll->cleanup_items` 队列；
+   - `kernel_epoll_destroy` 返回 `KERNEL_FILES_STATUS_CLEANUP_REQUIRED`，使未完成释放的 epoll OFD 保存在 `files->record->cleanup_files` 链表中；
+   - `close(epfd)` 此时已将描述符槽（slot）置空（后续针对该 fd 的 `close()` 准确返回 `-EBADF`），并向用户态返回 `-EIO`。
+3. **后续重试与基线回收**：
+   - 随后的 `kernel_files_drain_file_cleanup()` 或进程退出回收将对 `cleanup_files` 中的对象重试物理释放；
+   - `kernel_epoll_destroy` 重试时直接排空 `cleanup_items` 并释放 `epoll` 结构自身，不再重复执行逻辑解绑；
+   - 重试成功后，所有物理页与堆资源归还分配器，恢复 `heap-live=0x0` 基线。
 
 ## 固定资料
 

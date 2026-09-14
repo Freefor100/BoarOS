@@ -31,8 +31,10 @@ miss 路径先分配并清零页，再通过 node 的无 offset 副作用 `pread
 挂载后额外检查 superblock `needs_recovery` incompat feature。发现该位返回 `-EUCLEAN` 并完整撤销挂载。
 普通文件打开走 `ext4_fopen`，新建走 `ext4_fopen2`（`kernel_vfs_create`），目录走 `ext4_dir_open`。
 普通文件随机写入通过 `kernel_vfs_pwrite`（`ext4_fseek` + `ext4_fwrite`）执行，追加写入通过 `kernel_vfs_append` 在底层原子解析当前 EOF 并写入，确保 `O_APPEND` 的原子推进；截断通过 `kernel_vfs_ftruncate` 执行，向下截断调用 `ext4_ftruncate`，向上截断通过连续写零填充至目标长度（符合 POSIX 语义）。
-目录操作中，`kernel_vfs_mkdir` 调用 `ext4_dir_mk`；`kernel_vfs_unlink` 调用 `ext4_fremove`。
-由于底层 lwext4 的 `ext4_fremove` 在删除最后一个目录项时立即执行 `ext4_trunc_inode(..., 0)` 并释放 inode，当前在文件仍被打开时执行 unlink 会立即回收底层 inode 数据；VFS 安全管理 node 引用计数，允许旧描述符正常 close，后续 open 准确返回 `-ENOENT`，重新创建同名文件获得全新 inode。
+目录操作中，`kernel_vfs_mkdir` 调用 `ext4_dir_mk`；`kernel_vfs_unlink` 实现了真正的 Linux `unlink`-but-open 语义：
+- `kernel_vfs_unlink` 调用 `ext4_funlink_dentry` 从父目录中立即移除目标目录项，后续对原路径的 `open` 立即返回 `-ENOENT`，并在同名路径重新创建时分配独立全新 inode；
+- 若目标文件当前仍处于打开状态（`node->open_files > 0`），VFS 标记 `node->unlinked = 1`，旧 open 描述符（包括只读/读写 OFD 以及正在运行的源映射 ELF 可执行文件）保留底层 inode 数据与有效物理块，继续正常执行 `read/write/fstat` 与缺页加载（demand fault）；
+- 只有当最后一个打开描述符被关闭（`node->open_files == 0`）时，VFS 才执行 `ext4_orphan_free` 截断释放底层 inode 数据块，并调用 `kernel_page_cache_invalidate_node` 彻底失效页缓存。若文件在 unlink 时未处于打开状态，则立即截断释放。
 由于 lwext4 的 `ext4_dir_rm` 会递归删除非空目录，`kernel_vfs_rmdir` 在调用底层删除前先遍历目录项（跳过 `.` 和 `..`），若存在子条目则准确返回 `-ENOTEMPTY`。
 只读挂载下，所有上述修改操作直接返回 `-EROFS`。
 unmount 在仍有 open file 时返回 `-EBUSY`。close/unmount 的底层释放失败保留 CLEANUP 状态，调用者可以重试而不会重复关闭或丢失 heap owner。

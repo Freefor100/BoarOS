@@ -87,11 +87,11 @@ write-first 且缓存未命中，直接把文件内容读入私有页可避免�
    - 普通文件创建调用 `ext4_fopen2`。普通写调用 `kernel_vfs_pwrite`（`ext4_fseek` + `ext4_fwrite`）；追加写入由 `kernel_vfs_append` 在底层原子解析当前 EOF 并写入，确保多 OFD 或与 `lseek` 组合时，写入点严格原子重定位到文件尾并推进 offset。
    - 文件大小截断通过 `kernel_vfs_ftruncate` 实现：向下截断调用 `ext4_ftruncate` 释放末尾块；向上截断由于 lwext4 原生实现只做向下收缩，VFS 适配层通过连续写零填充至目标长度，严格符合 POSIX 中“文件扩展部分读取为零”的契约。
    - 可执行映像互斥（`ETXTBSY`）：VFS node 维护 `write_openers` 与 `exec_users` 计数器。打开已在运行的可执行二进制请求写权限（或带 `O_TRUNC`）返回 `-ETXTBSY`（错误码 26）；已被写打开的文件被 `execve` 装载时同样返回 `-ETXTBSY`。写租约与执行租约在 `kernel_vfs_close` 时对称释放。
-   - 目录与删除语义：lwext4 的 `ext4_dir_rm` 默认递归删除，VFS 适配层在 `kernel_vfs_rmdir` 中先遍历目录项（跳过 `.` 和 `..`），存在子条目时准确返回 `-ENOTEMPTY`。对于文件删除，lwext4 的 `ext4_fremove` 在删除最后一个目录项时立即执行 `ext4_trunc_inode(..., 0)` 并释放底层 inode；VFS 通过 node 引用计数管理使得已有 open 描述符仍可正常执行读写与关闭清理，后续新 open 准确返回 `-ENOENT`，重新创建同名文件获得全新 inode。
+   - 目录与删除语义：lwext4 的 `ext4_dir_rm` 默认递归删除，VFS 适配层在 `kernel_vfs_rmdir` 中先遍历目录项（跳过 `.` 和 `..`），存在子条目时准确返回 `-ENOTEMPTY`。对于文件删除，实现真正的 Linux `unlink`-but-open 语义：`kernel_vfs_unlink` 调用 `ext4_funlink_dentry` 从目录中摘除 dentry，使路径查找立即返回 `-ENOENT`。若文件仍被打开或作为源可执行文件映射运行（`node->open_files > 0`），标记 `node->unlinked = 1`，保留底层 inode 块数据供已有描述符正常 `read/write/fstat` 与缺页加载；只有当最后一个打开描述符关闭时才调用 `ext4_orphan_free` 截断释放 inode 并使页缓存失效。
 
 3. **页缓存失效（Page Cache Invalidation）**：
    - 当文件被 `write` 或 `ftruncate` 改变时，`kernel_page_cache_invalidate_node()` 从哈希表与 LRU 链中精确摘除该 node 关联的所有物理页项并释放页引用，确保后续的 `read` 或缺页重新从磁盘介质加载最新数据。
-   - 当执行文件删除（`unlink`）时，由于 lwext4 内部可能调整目录与 inode 状态，VFS 适配层遍历当前挂载的所有存活节点（`adapter->nodes`）进行保守失效，避免留下陈旧缓存项。对于更长期的直接写回（writeback dirty page），这一机制为显式同步缓存提供了过渡契约。
+   - 当执行文件删除（`unlink`）时，若目标文件未被打开，立即通过 `ext4_orphan_free` 截断释放并使缓存失效；若目标文件仍被打开，页缓存继续为现有描述符与缺页服务，直至最后一次 `close` 释放孤儿 inode 时同步调用 `kernel_page_cache_invalidate_node()`，保证无脏引用泄漏并满足 `heap-live=0x0`。
 
 ## 根设备与 PID 1
 

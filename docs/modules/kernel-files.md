@@ -90,9 +90,13 @@ open file description 的 offset 只增加实际复制到用户空间的字节�
   - 水平触发（LT，默认）：`epoll_wait` 在返回就绪事件后，若底层数据仍可读写（`kernel_open_file_poll` 仍报告匹配事件），将该 item 重新排入就绪队尾，确保未读完的数据持续通知；
   - 边缘触发（ET，`EPOLLET`）：事件一旦交付用户态，立即从就绪列表移出；仅当目标底层产生新的写入/唤醒边缘时才会重新入列；
   - 单次触发（`EPOLLONESHOT`）：事件交付后将 item 标记为 disarmed，直至用户显式通过 `EPOLL_CTL_MOD` 重新激活。
-- **OFD 双向解绑与安全性**：目标 OFD 中维护指向所有监视它的 `epitem` 双向链表（`file->ep_items`）。当目标 OFD 的所有文件描述符被全部关闭、底层 OFD 最终释放（`kernel_open_file_release`）时，自动触发 `kernel_epoll_notify_file_release()` 从所属 epoll 实例中解绑并清理对应等待节点与内存，防止悬垂指针。同时，`close(epfd)` 销毁 epoll 实例时也会遍历所有项安全脱钩。
+- **OFD 双向解绑与可重试清理**：目标 OFD 中维护指向所有监视它的 `epitem` 双向链表（`file->ep_items`）。当目标 OFD 的底层释放时，自动触发 `kernel_epoll_notify_file_release()` 从所属 epoll 实例中解绑。销毁 epoll 实例（`close(epfd)`）时遵循 BoarOS 可重试清理契约：
+  1. 逻辑解绑（注销 wait 节点、从 target OFD 的 `ep_items` 摘除、从就绪列表摘除）仅执行一次；
+  2. 物理堆内存释放（item 与 epoll 实例自身）允许在 fault injection 或内存受限下失败；
+  3. 释放失败的 item 暂存入 `epoll->cleanup_items`，未释放的 epoll OFD 保留在 `files->record->cleanup_files`，并向用户空间 `close()` 返回 `-EIO`（此时 fd 槽已置空，后续对该 fd 调用 `close()` 准确返回 `-EBADF`）；
+  4. 后续调用 `kernel_files_drain_file_cleanup()` 或进程退出时重试释放，成功后达成 `heap-live=0x0`。
 - **休眠唤醒竞态防护**：`epoll_pwait` 进入休眠前关闭中断，在将当前任务挂入 `epoll->wait_queue` 后再次复核就绪列表；若在挂入瞬间发生唤醒，可立即捕获事件避免漏唤醒死锁。
-- **放宽 maxevents 与栈预算**：`epoll_pwait` 接受任意 `maxevents > 0`；快速路径在栈上维护至多 8 个事件缓冲（128 字节），超出时从堆分配并在返回前严格释放，守住内核栈 Canary。
+- **放宽 maxevents 与栈预算**：`epoll_pwait` 接受任意 `maxevents > 0`；快速路径在栈上维护至多 4 个事件缓冲（64 字节，`KERNEL_EPOLL_STACK_CAPACITY = 4`），超出时从堆分配并在返回前严格释放，守住内核栈 Canary。
 
 ## `lseek`、`fstat`/`newfstatat` 与 `getdents64`
 
