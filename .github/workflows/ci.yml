@@ -25,6 +25,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
+        with:
+            fetch-depth: 2
 
       - name: Install toolchain and test dependencies
         run: |
@@ -62,12 +64,7 @@ jobs:
             | sha256sum -c -
 
       - name: Check patch formatting
-        run: |
-          if git rev-parse --verify HEAD^ >/dev/null 2>&1; then
-            git diff --check HEAD^ HEAD
-          else
-            git diff --check "$(git hash-object -t tree /dev/null)" HEAD
-          fi
+        run: git diff --check HEAD^ HEAD
 
       - name: Test reference infrastructure
         run: make test-references
