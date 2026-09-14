@@ -2119,6 +2119,10 @@ enum kernel_mm_status riscv_kernel_mm_satp(
 enum kernel_mm_status kernel_mm_release(struct kernel_mm *mm)
 {
     struct riscv_kernel_mm_record *record;
+    uint32_t table_pages;
+    uint32_t leaf_pages;
+    uint32_t protected_pages;
+    uint32_t cow_pages;
     enum kernel_mm_status status;
     enum riscv_sv39_status sv39_status;
     enum kernel_vma_status vma_status;
@@ -2148,8 +2152,20 @@ enum kernel_mm_status kernel_mm_release(struct kernel_mm *mm)
         }
         if (record->vmas == 0 && record->file_sources == 0 &&
             record->elf_sources == 0) {
+            table_pages = record->space.table_pages;
+            leaf_pages = record->space.leaf_pages;
+            protected_pages = record->space.protected_pages;
+            cow_pages = record->space.cow_pages;
             sv39_status = riscv_sv39_user_space_destroy(&record->space);
             if (sv39_status != RISCV_SV39_STATUS_OK) {
+                if (record->space.table_pages != table_pages ||
+                    record->space.leaf_pages != leaf_pages ||
+                    record->space.protected_pages != protected_pages ||
+                    record->space.cow_pages != cow_pages) {
+                    record->stage = RISCV_KERNEL_MM_RECORD_SPACE_CLEANUP;
+                    mm->state = KERNEL_MM_CLEANUP;
+                    mm->cleanup_stage = KERNEL_MM_CLEANUP_SPACE;
+                }
                 return KERNEL_MM_STATUS_ADDRESS_SPACE;
             }
             record->stage = RISCV_KERNEL_MM_RECORD_ONLY_CLEANUP;
@@ -2222,8 +2238,20 @@ enum kernel_mm_status kernel_mm_release(struct kernel_mm *mm)
         return KERNEL_MM_STATUS_STATE;
     }
 
+    table_pages = record->space.table_pages;
+    leaf_pages = record->space.leaf_pages;
+    protected_pages = record->space.protected_pages;
+    cow_pages = record->space.cow_pages;
     sv39_status = riscv_sv39_user_space_destroy(&record->space);
     if (sv39_status != RISCV_SV39_STATUS_OK) {
+        if (record->space.table_pages != table_pages ||
+            record->space.leaf_pages != leaf_pages ||
+            record->space.protected_pages != protected_pages ||
+            record->space.cow_pages != cow_pages) {
+            record->stage = RISCV_KERNEL_MM_RECORD_SPACE_CLEANUP;
+            mm->state = KERNEL_MM_CLEANUP;
+            mm->cleanup_stage = KERNEL_MM_CLEANUP_SPACE;
+        }
         return KERNEL_MM_STATUS_ADDRESS_SPACE;
     }
     record->stage = RISCV_KERNEL_MM_RECORD_ONLY_CLEANUP;

@@ -269,7 +269,7 @@ static unsigned long run_create_cases(
     };
     unsigned long failures = 0U;
 
-    access_calls_before_failure = 1U;
+    access_calls_before_failure = 0U;
     fail_access_count = 1U;
     failures += expect_status(KERNEL_SCHEDULER_STATUS_PAGE_ACCESS,
                               kernel_thread_create(thread_entry, 0));

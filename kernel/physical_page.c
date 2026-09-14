@@ -448,6 +448,11 @@ static int free_list_node_valid(
     uint32_t page_index,
     uint32_t order);
 
+static int free_block_valid(
+    const struct physical_page_allocator *allocator,
+    uint32_t page_index,
+    uint32_t order);
+
 static int free_list_insert(
     struct physical_page_allocator *allocator,
     uint32_t page_index,
@@ -463,7 +468,7 @@ static int free_list_insert(
     if (head != PHYSICAL_PAGE_INDEX_NONE) {
         struct physical_page_metadata *old_head = &allocator->metadata[head];
 
-        if (!free_list_node_valid(allocator, head, order) ||
+        if (!free_block_valid(allocator, head, order) ||
             old_head->previous != PHYSICAL_PAGE_INDEX_NONE) {
             return 0;
         }
@@ -582,7 +587,7 @@ static int free_list_remove(
     uint32_t next;
     uint32_t previous;
 
-    if (!free_list_node_valid(allocator, page_index, order)) {
+    if (!free_block_valid(allocator, page_index, order)) {
         return 0;
     }
     metadata = &allocator->metadata[page_index];
@@ -707,7 +712,7 @@ static int validate_free_lists(
             uint64_t offset;
 
             if ((uint64_t)page_index >= allocator->total_pages ||
-                !free_list_node_valid(allocator, page_index, order)) {
+                !free_block_valid(allocator, page_index, order)) {
                 return 0;
             }
             metadata = &allocator->metadata[page_index];
@@ -946,9 +951,9 @@ static enum physical_page_status physical_page_allocate_order_once(
         target_order = found;
         target_head = allocator->free_heads[target_order];
         if (target_head != PHYSICAL_PAGE_INDEX_NONE &&
-            !free_list_node_valid(allocator,
-                                  target_head,
-                                  target_order)) {
+            !free_block_valid(allocator,
+                              target_head,
+                              target_order)) {
             return PHYSICAL_PAGE_STATUS_INVALID;
         }
         if (!block_geometry(allocator,
@@ -1146,14 +1151,9 @@ enum physical_page_status physical_page_release_order(
         case PHYSICAL_PAGE_STATE_FREE_HEAD:
             if (allocator->metadata[buddy_index].order >
                     PHYSICAL_PAGE_MAX_ORDER ||
-                !block_geometry(allocator,
-                                buddy_index,
-                                allocator->metadata[buddy_index].order,
-                                0,
-                                0) ||
-                !free_list_node_valid(allocator,
-                                      buddy_index,
-                                      allocator->metadata[buddy_index].order)) {
+                !free_block_valid(allocator,
+                                  buddy_index,
+                                  allocator->metadata[buddy_index].order)) {
                 __builtin_trap();
             }
             if (allocator->metadata[buddy_index].order > current_order) {
@@ -1184,17 +1184,11 @@ enum physical_page_status physical_page_release_order(
     }
 
     if (allocator->free_heads[current_order] != PHYSICAL_PAGE_INDEX_NONE &&
-        !free_list_node_valid(allocator,
-                              allocator->free_heads[current_order],
-                              current_order)) {
+        !free_block_valid(allocator,
+                          allocator->free_heads[current_order],
+                          current_order)) {
         __builtin_trap();
     }
-
-    mark_block(allocator,
-               page_index,
-               order,
-               PHYSICAL_PAGE_STATE_FREE_TAIL,
-               PHYSICAL_PAGE_STATE_FREE_TAIL);
 
     for (page_index = 0U; page_index < merge_count; page_index++) {
         uint32_t buddy_order = order + page_index;
@@ -1209,8 +1203,17 @@ enum physical_page_status physical_page_release_order(
         buddy_metadata->order = 0U;
         buddy_metadata->state = PHYSICAL_PAGE_STATE_FREE_TAIL;
     }
-    if (!page_lookup(allocator, current_address, 0, &page_index) ||
-        !free_list_insert(allocator, page_index, current_order)) {
+    /* The merged head can move to a lower-address buddy; rebuild every
+     * metadata entry so no tail retains the released block's old order. */
+    if (!page_lookup(allocator, current_address, 0, &page_index)) {
+        __builtin_trap();
+    }
+    mark_block(allocator,
+               page_index,
+               current_order,
+               PHYSICAL_PAGE_STATE_FREE_TAIL,
+               PHYSICAL_PAGE_STATE_FREE_TAIL);
+    if (!free_list_insert(allocator, page_index, current_order)) {
         __builtin_trap();
     }
 

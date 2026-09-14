@@ -166,6 +166,8 @@ LIVE(last ref)
 
 `CLEANUP_VMAS`、`CLEANUP_FILE_SOURCES` 和 `CLEANUP_ELF_SOURCES` 只表示仍由 MM 持有的文件/OFD/source owner 需要完成真实 VFS/I/O 清理；页表树、VMA metadata、记录页和物理页的合法释放完成即推进流程，不产生 allocator retry。所有 CLEANUP 句柄都只能 move 或由所属上层继续处理，不能 acquire、lookup 或生成 `satp`。非末引用释放不触碰 VMA、文件来源或页表树。
 
+如果页表访问边界在销毁过程中失败，Sv39 可能已经释放部分页表树；MM 会保留 `CLEANUP_SPACE` owner 并返回 `ADDRESS_SPACE`，下一次 `release` 从剩余结构继续。这个状态只表示硬件/访问错误，合法物理页释放本身不返回可重试状态。
+
 用户退出路径先切到内核根页表，再在仍有效的任务内核栈上调用 `kernel_mm_release()`；只有真实 VFS/OFD cleanup 仍有 owner 时才交给后续回收上下文处理。因此不会销毁硬件当前仍在使用的用户根。MM 完成后才允许任务成为 zombie，zombie 只保留身份、亲缘、wait status 和任务页。
 
 ## 并发与性能边界

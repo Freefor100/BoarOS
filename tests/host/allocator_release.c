@@ -15,6 +15,7 @@ static struct kernel_heap heap;
 
 #define TEST_SLAB_BITMAP_WORDS 4U
 #define TEST_PAGE_STATE_FREE_HEAD 3U
+#define TEST_PAGE_STATE_FREE_TAIL 4U
 
 /* These mirrors are used only to inject corruption into the metadata paths
  * whose invariants are part of the allocator contract. */
@@ -144,13 +145,46 @@ static void invalid_release(unsigned int which)
         assert(0);
         break;
     }
+    case 12: {
+        uint64_t pages[64];
+        uint32_t page_count = 0U;
+        uint32_t first;
+        uint32_t second;
+        struct test_page_metadata *metadata;
+
+        while (page_count < 64U &&
+               physical_page_allocate_order(&allocator,
+                                             1U,
+                                             &pages[page_count]) == 0) {
+            page_count++;
+        }
+        for (first = 0U; first < page_count; first++) {
+            for (second = first + 1U; second < page_count; second++) {
+                if ((pages[first] ^
+                     (2U * BOAROS_PAGE_SIZE)) == pages[second]) {
+                    metadata = (struct test_page_metadata *)allocator.metadata;
+                    physical_page_release_order(&allocator, pages[first], 1U);
+                    assert(metadata[test_page_index(pages[first]) + 1U].state ==
+                           TEST_PAGE_STATE_FREE_TAIL);
+                    metadata[test_page_index(pages[first]) + 1U].reserved = 1U;
+                    physical_page_release_order(&allocator, pages[second], 1U);
+                    break;
+                }
+            }
+            if (second < page_count) {
+                break;
+            }
+        }
+        assert(0);
+        break;
+    }
     }
 }
 int main(void)
 {
     struct rlimit limit = {0, 0};
     assert(setrlimit(RLIMIT_CORE, &limit) == 0);
-    for (unsigned int i = 0; i < 12; i++) {
+    for (unsigned int i = 0; i < 13; i++) {
         pid_t child = fork();
         int status;
         assert(child >= 0);

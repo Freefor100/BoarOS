@@ -1,6 +1,5 @@
 # 参与开发
 
-BoarOS 是人主导、Agent 有界执行的长期项目。提交应小、直接、容易审查和复现。
 
 ## 修改流程
 
@@ -47,5 +46,3 @@ Co-authored-by: GLM 5.3 <noreply@z.ai>
 Co-authored-by: DeepSeek V4 Flash <noreply@deepseek.com>
 Assisted-by: Google Antigravity
 ```
-
-仓库不保存本地 JSONL、完整对话或秘密。push、发布和比赛提交由人决定，除非已明确授权。

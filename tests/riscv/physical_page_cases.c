@@ -585,6 +585,104 @@ static void test_buddy_allocates_aligned_runs_and_coalesces(void)
     }
 }
 
+static enum physical_page_status init_split_merge_buddy(
+    struct physical_page_allocator *allocator,
+    uint64_t *owned_page)
+{
+    struct boot_memory_layout layout;
+    uint64_t pages[9];
+    uint32_t index;
+    enum physical_page_status status;
+
+    layout.usable_count = 1U;
+    layout.usable[0].base = TEST_PHYSICAL_BASE;
+    layout.usable[0].size = BOAROS_PAGE_SIZE * 10U;
+    status = init_bound_page_allocator(allocator,
+                                       &layout,
+                                       mapped_page_access);
+    if (status != PHYSICAL_PAGE_STATUS_OK) {
+        return status;
+    }
+    for (index = 0U; index < 9U; index++) {
+        status = physical_page_allocate(allocator, &pages[index]);
+        if (status != PHYSICAL_PAGE_STATUS_OK) {
+            return status;
+        }
+    }
+    for (index = 0U; index < 8U; index++) {
+        status = physical_page_release(allocator, pages[index]);
+        if (status != PHYSICAL_PAGE_STATUS_OK) {
+            return status;
+        }
+    }
+    status = physical_page_allocator_finalize(allocator);
+    if (status == PHYSICAL_PAGE_STATUS_OK) {
+        *owned_page = pages[8];
+    }
+    return status;
+}
+
+static void test_buddy_releases_upper_block_after_lower_coalesces(void)
+{
+    struct physical_page_allocator allocator;
+    uint64_t owned_page;
+    uint64_t lower_pages[4];
+    uint64_t upper = UINT64_C(0x1122334455667788);
+    uint64_t run = UINT64_C(0x1122334455667788);
+    uint32_t index;
+    enum physical_page_status actual =
+        init_split_merge_buddy(&allocator, &owned_page);
+
+    if (actual != PHYSICAL_PAGE_STATUS_OK ||
+        physical_page_available(&allocator) != 8U) {
+        fail_page(110U, PHYSICAL_PAGE_STATUS_OK, actual);
+    }
+    for (index = 0U; index < 4U; index++) {
+        actual = physical_page_allocate_order(&allocator,
+                                              0U,
+                                              &lower_pages[index]);
+        if (actual != PHYSICAL_PAGE_STATUS_OK ||
+            lower_pages[index] != TEST_PHYSICAL_BASE +
+                                      (uint64_t)index * BOAROS_PAGE_SIZE) {
+            fail_page(111U + index, PHYSICAL_PAGE_STATUS_OK, actual);
+        }
+    }
+    actual = physical_page_allocate_order(&allocator, 2U, &upper);
+    if (actual != PHYSICAL_PAGE_STATUS_OK ||
+        upper != TEST_PHYSICAL_BASE + 4U * BOAROS_PAGE_SIZE) {
+        fail_page(115U, PHYSICAL_PAGE_STATUS_OK, actual);
+    }
+    actual = physical_page_release_order(&allocator, lower_pages[1], 0U);
+    if (actual == PHYSICAL_PAGE_STATUS_OK) {
+        actual = physical_page_release_order(&allocator, lower_pages[3], 0U);
+    }
+    if (actual == PHYSICAL_PAGE_STATUS_OK) {
+        actual = physical_page_release_order(&allocator, lower_pages[0], 0U);
+    }
+    if (actual == PHYSICAL_PAGE_STATUS_OK) {
+        actual = physical_page_release_order(&allocator, lower_pages[2], 0U);
+    }
+    if (actual == PHYSICAL_PAGE_STATUS_OK) {
+        actual = physical_page_release_order(&allocator, upper, 2U);
+    }
+    if (actual != PHYSICAL_PAGE_STATUS_OK ||
+        physical_page_available(&allocator) != 8U) {
+        fail_page(116U, PHYSICAL_PAGE_STATUS_OK, actual);
+    }
+    actual = physical_page_allocate_order(&allocator, 3U, &run);
+    if (actual != PHYSICAL_PAGE_STATUS_OK ||
+        run != TEST_PHYSICAL_BASE) {
+        fail_page(117U, PHYSICAL_PAGE_STATUS_OK, actual);
+    }
+    if (physical_page_release_order(&allocator, run, 3U) !=
+            PHYSICAL_PAGE_STATUS_OK ||
+        physical_page_release(&allocator, owned_page) !=
+            PHYSICAL_PAGE_STATUS_OK) {
+        fail_page(118U, PHYSICAL_PAGE_STATUS_OK,
+                  PHYSICAL_PAGE_STATUS_INVALID);
+    }
+}
+
 static void test_buddy_rejects_invalid_ownership(void)
 {
     struct boot_memory_layout layout;
@@ -972,6 +1070,7 @@ void run_physical_page_tests(void)
     test_resolve_rejects_inaccessible_page();
     test_finalize_imports_bootstrap_state();
     test_buddy_allocates_aligned_runs_and_coalesces();
+    test_buddy_releases_upper_block_after_lower_coalesces();
     test_buddy_rejects_invalid_ownership();
     test_failed_finalize_preserves_bootstrap_allocator();
     test_single_page_api_uses_order_zero_after_finalize();

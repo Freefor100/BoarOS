@@ -463,7 +463,7 @@ static unsigned long run_partial_destroy_requires_cleanup(void)
     }
 
     inaccessible_page = blocked_table;
-    if (kernel_mm_release(&mm) != KERNEL_MM_STATUS_CLEANUP_REQUIRED ||
+    if (kernel_mm_release(&mm) != KERNEL_MM_STATUS_ADDRESS_SPACE ||
         mm.state != KERNEL_MM_CLEANUP ||
         mm.cleanup_stage != KERNEL_MM_CLEANUP_SPACE ||
         kernel_mm_lookup(&mm, TEST_SECOND_REGION_ADDRESS, &mapping) !=

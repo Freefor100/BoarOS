@@ -111,7 +111,7 @@ SIGCHLD 的默认忽略与显式 SIG_IGN 具有不同回收语义：前者仍允
 
 内核资源释放可能只完成一部分。例如文件槽已经不可见，但底层 ext4 close 或 block I/O 仍报错；此时对象不能退回 LIVE，也不能丢失唯一指针。页表、物理页和堆的合法释放则一次完成，分配器不变量错误直接 fatal。
 
-BoarOS 的处理原则是：对象状态表达剩余 owner 和准确清理阶段，错误码只描述本次尝试。进程退出依依赖顺序释放 exec transaction、files/OFD、fs context、MM、PID、任务页；只有真实 VFS/block I/O 错误把仍拥有资源的对象留在清理队列，allocator 释放错误不转换为队列状态。克隆构造在发布父子关系和 ready 状态前完成，失败子对象不产生用户可见 completion。
+BoarOS 的处理原则是：对象状态表达剩余 owner 和准确清理阶段，错误码只描述本次尝试。进程退出依赖顺序释放 exec transaction、files/OFD、fs context、MM、PID、任务页；只有真实 VFS/block I/O 错误把仍拥有资源的对象留在清理队列，allocator 释放错误不转换为队列状态。克隆构造在发布父子关系和 ready 状态前完成，失败子对象不产生用户可见 completion。
 
 检查完整性时可以把每个任务按“调度状态 × 是否有父任务 × 重资源是否清空 × PID 是否拥有”分类：
 
