@@ -605,6 +605,141 @@ static int check_poll_and_select(void)
     close(ready_p[0]);
     close(ready_p[1]);
 
+    /* Interrupted raw SYS_ppoll and SYS_pselect6 timeout writeback */
+    sigset_t poll_block_mask, poll_orig_mask, poll_wait_mask;
+    sigemptyset(&poll_block_mask);
+    sigaddset(&poll_block_mask, SIGUSR1);
+    if (sigprocmask(SIG_BLOCK, &poll_block_mask, &poll_orig_mask) != 0) {
+        return 116;
+    }
+    sigemptyset(&poll_wait_mask);
+
+    int intr_p[2];
+    if (pipe(intr_p) != 0) {
+        return 117;
+    }
+    pid_t intr_child = fork();
+    if (intr_child < 0) {
+        return 118;
+    }
+    if (intr_child == 0) {
+        close(intr_p[0]);
+        close(intr_p[1]);
+        signal_parent_after_delay(getppid(), SIGUSR1);
+    }
+    struct pollfd intr_pfd = { .fd = intr_p[0], .events = POLLIN, .revents = 0 };
+    raw_ts.tv_sec = 5;
+    raw_ts.tv_nsec = 0;
+    user_signal_seen = 0;
+    errno = 0;
+    raw_ret = syscall(SYS_ppoll, &intr_pfd, 1, &raw_ts, &poll_wait_mask, sizeof(uint64_t));
+    int intr_wait_status;
+    waitpid(intr_child, &intr_wait_status, 0);
+    close(intr_p[0]);
+    close(intr_p[1]);
+    if (raw_ret != -1 || errno != EINTR || user_signal_seen != SIGUSR1) {
+        return 119;
+    }
+    if (raw_ts.tv_sec < 3 || raw_ts.tv_sec > 5 ||
+        (raw_ts.tv_sec == 5 && raw_ts.tv_nsec != 0)) {
+        return 120;
+    }
+
+    if (pipe(intr_p) != 0) {
+        return 121;
+    }
+    intr_child = fork();
+    if (intr_child < 0) {
+        return 122;
+    }
+    if (intr_child == 0) {
+        close(intr_p[0]);
+        close(intr_p[1]);
+        signal_parent_after_delay(getppid(), SIGUSR1);
+    }
+    fd_set intr_rfds;
+    FD_ZERO(&intr_rfds);
+    FD_SET(intr_p[0], &intr_rfds);
+    raw_ts.tv_sec = 5;
+    raw_ts.tv_nsec = 0;
+    user_signal_seen = 0;
+    errno = 0;
+    struct {
+        const sigset_t *ss;
+        size_t ss_len;
+    } intr_sigpack = { &poll_wait_mask, sizeof(uint64_t) };
+    raw_ret = syscall(SYS_pselect6, intr_p[0] + 1, &intr_rfds, NULL, NULL, &raw_ts, &intr_sigpack);
+    waitpid(intr_child, &intr_wait_status, 0);
+    close(intr_p[0]);
+    close(intr_p[1]);
+    if (raw_ret != -1 || errno != EINTR || user_signal_seen != SIGUSR1) {
+        return 123;
+    }
+    if (raw_ts.tv_sec < 3 || raw_ts.tv_sec > 5 ||
+        (raw_ts.tv_sec == 5 && raw_ts.tv_nsec != 0)) {
+        return 124;
+    }
+
+    /* Interrupted raw SYS_ppoll with NULL timeout */
+    if (pipe(intr_p) != 0) {
+        return 125;
+    }
+    intr_child = fork();
+    if (intr_child < 0) {
+        return 126;
+    }
+    if (intr_child == 0) {
+        close(intr_p[0]);
+        close(intr_p[1]);
+        signal_parent_after_delay(getppid(), SIGUSR1);
+    }
+    intr_pfd.fd = intr_p[0];
+    intr_pfd.events = POLLIN;
+    intr_pfd.revents = 0;
+    user_signal_seen = 0;
+    errno = 0;
+    raw_ret = syscall(SYS_ppoll, &intr_pfd, 1, NULL, &poll_wait_mask, sizeof(uint64_t));
+    waitpid(intr_child, &intr_wait_status, 0);
+    close(intr_p[0]);
+    close(intr_p[1]);
+    if (raw_ret != -1 || errno != EINTR || user_signal_seen != SIGUSR1) {
+        return 127;
+    }
+
+    /* Boundary and invalid timeout checks */
+    raw_ts.tv_sec = -1;
+    raw_ts.tv_nsec = 0;
+    errno = 0;
+    raw_ret = syscall(SYS_ppoll, NULL, 0, &raw_ts, NULL, 0);
+    if (raw_ret != -1 || errno != EINVAL) {
+        return 128;
+    }
+    raw_ts.tv_sec = 0;
+    raw_ts.tv_nsec = 1000000000L;
+    errno = 0;
+    raw_ret = syscall(SYS_ppoll, NULL, 0, &raw_ts, NULL, 0);
+    if (raw_ret != -1 || errno != EINVAL) {
+        return 129;
+    }
+    raw_ts.tv_sec = 0;
+    raw_ts.tv_nsec = -1L;
+    errno = 0;
+    raw_ret = syscall(SYS_ppoll, NULL, 0, &raw_ts, NULL, 0);
+    if (raw_ret != -1 || errno != EINVAL) {
+        return 130;
+    }
+    raw_ts.tv_sec = 0;
+    raw_ts.tv_nsec = 0;
+    errno = 0;
+    raw_ret = syscall(SYS_ppoll, NULL, 0, &raw_ts, NULL, 0);
+    if (raw_ret != 0 || raw_ts.tv_sec != 0 || raw_ts.tv_nsec != 0) {
+        return 131;
+    }
+
+    if (sigprocmask(SIG_SETMASK, &poll_orig_mask, NULL) != 0) {
+        return 132;
+    }
+
     /* 11. select total_bits with single fd in both readfds and writefds */
     int rw_fd = open("/test_total_bits.tmp", O_RDWR | O_CREAT | O_TRUNC, 0644);
     if (rw_fd >= 0) {
