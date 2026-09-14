@@ -99,6 +99,12 @@ if grep -qE 'BoarOS: (root boot error|scheduler startup/idle error|fatal trap|SB
     exit 1
 fi
 
+persisted_content=$(debugfs -R "cat /persist.txt" "$static_disk" 2>/dev/null || true)
+if [ "$persisted_content" != "BoarOS-ext4-persisted-data" ]; then
+    echo "persisted content mismatch on static root: expected 'BoarOS-ext4-persisted-data', got '$persisted_content'" >&2
+    exit 1
+fi
+
 truncate -s 32M "$pthread_disk"
 mkfs.ext4 -q -F "$pthread_disk"
 debugfs -w -R "write $pthread_program /init" "$pthread_disk" >/dev/null 2>&1

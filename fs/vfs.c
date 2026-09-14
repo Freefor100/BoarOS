@@ -766,13 +766,42 @@ int kernel_vfs_ftruncate(struct kernel_vfs_file *file,
     if (node->adapter == 0 || node->adapter->read_only) {
         return -KERNEL_EROFS;
     }
-
-    result = ext4_ftruncate(&node->file, size);
-    if (result != EOK) {
-        return lwext4_error(result);
+    if (node->exec_users > 0U) {
+        return -KERNEL_ETXTBSY;
     }
-    node->size = ext4_fsize(&node->file);
-    file->size = node->size;
+
+    if (size < node->size) {
+        result = ext4_ftruncate(&node->file, size);
+        if (result != EOK) {
+            return lwext4_error(result);
+        }
+        node->size = ext4_fsize(&node->file);
+        file->size = node->size;
+    } else if (size > node->size) {
+        static const unsigned char zeros[256] = {0};
+        uint64_t current_offset = node->size;
+        while (current_offset < size) {
+            size_t chunk = (size_t)(size - current_offset);
+            size_t written = 0U;
+            if (chunk > sizeof(zeros)) {
+                chunk = sizeof(zeros);
+            }
+            result = ext4_fseek(&node->file, (int64_t)current_offset, SEEK_SET);
+            if (result != EOK) {
+                return lwext4_error(result);
+            }
+            result = ext4_fwrite(&node->file, zeros, chunk, &written);
+            if (result != EOK) {
+                return lwext4_error(result);
+            }
+            if (written == 0U) {
+                return -KERNEL_ENOSPC;
+            }
+            current_offset += (uint64_t)written;
+        }
+        node->size = ext4_fsize(&node->file);
+        file->size = node->size;
+    }
 
     if (node->adapter->page_cache != 0) {
         (void)kernel_page_cache_invalidate_node(node->adapter->page_cache,
