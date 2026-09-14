@@ -1531,6 +1531,245 @@ static int check_filesystem_rw(void)
     /* Clean up /test_exec */
     unlink("/test_exec");
 
+    /* 10. Warm page-cache overwrite coherence:
+     * Read file to populate page cache, overwrite from another fd, then read back from first fd. */
+    int cache_wfd = open("/cache_test.txt", O_CREAT | O_RDWR | O_TRUNC, 0644);
+    if (cache_wfd < 0) {
+        return 50;
+    }
+    if (write(cache_wfd, "INITIAL_CACHE_DATA_STRING_12345", 31) != 31) {
+        close(cache_wfd);
+        return 51;
+    }
+    /* Open for reading to populate warm cache */
+    int cache_rfd = open("/cache_test.txt", O_RDONLY);
+    if (cache_rfd < 0) {
+        close(cache_wfd);
+        return 52;
+    }
+    char cbuf[32];
+    memset(cbuf, 0, sizeof(cbuf));
+    if (read(cache_rfd, cbuf, 31) != 31 || memcmp(cbuf, "INITIAL_CACHE_DATA_STRING_12345", 31) != 0) {
+        close(cache_wfd);
+        close(cache_rfd);
+        return 53;
+    }
+    /* Overwrite first 7 bytes via write fd */
+    if (lseek(cache_wfd, 0, SEEK_SET) != 0 || write(cache_wfd, "UPDATED", 7) != 7) {
+        close(cache_wfd);
+        close(cache_rfd);
+        return 54;
+    }
+    /* Read back from read fd: must observe "UPDATED_CACHE_DATA_STRING_12345" */
+    if (lseek(cache_rfd, 0, SEEK_SET) != 0) {
+        close(cache_wfd);
+        close(cache_rfd);
+        return 55;
+    }
+    memset(cbuf, 0, sizeof(cbuf));
+    if (read(cache_rfd, cbuf, 31) != 31 || memcmp(cbuf, "UPDATED_CACHE_DATA_STRING_12345", 31) != 0) {
+        close(cache_wfd);
+        close(cache_rfd);
+        return 56;
+    }
+    close(cache_wfd);
+    close(cache_rfd);
+    unlink("/cache_test.txt");
+
+    /* 11. Multi-OFD size coherence:
+     * fd1 write extends size, fd2 fstat observes immediately.
+     * fd2 ftruncate shrinks size, fd1 fstat observes immediately. */
+    int sofd1 = open("/size_test.txt", O_CREAT | O_RDWR | O_TRUNC, 0644);
+    if (sofd1 < 0) {
+        return 57;
+    }
+    int sofd2 = open("/size_test.txt", O_RDWR);
+    if (sofd2 < 0) {
+        close(sofd1);
+        return 58;
+    }
+    char hundred[100];
+    memset(hundred, 'H', sizeof(hundred));
+    if (write(sofd1, hundred, sizeof(hundred)) != 100) {
+        close(sofd1);
+        close(sofd2);
+        return 59;
+    }
+    struct stat sst;
+    if (fstat(sofd2, &sst) != 0 || sst.st_size != 100) {
+        close(sofd1);
+        close(sofd2);
+        return 60;
+    }
+    if (ftruncate(sofd2, 40) != 0) {
+        close(sofd1);
+        close(sofd2);
+        return 61;
+    }
+    if (fstat(sofd1, &sst) != 0 || sst.st_size != 40) {
+        close(sofd1);
+        close(sofd2);
+        return 62;
+    }
+    close(sofd1);
+    close(sofd2);
+    unlink("/size_test.txt");
+
+    /* 12. Truncate extend zero fill and file offset preservation:
+     * Write 5 bytes, check lseek(CUR) == 5.
+     * ftruncate to 8192 + 50.
+     * Assert lseek(CUR) remains 5.
+     * Read from 5 to 55: all bytes must be zero.
+     * lseek to 8192, read 50 bytes: all bytes must be zero. */
+    int trfd = open("/trunc_extend.txt", O_CREAT | O_RDWR | O_TRUNC, 0644);
+    if (trfd < 0) {
+        return 63;
+    }
+    if (write(trfd, "12345", 5) != 5) {
+        close(trfd);
+        return 64;
+    }
+    if (lseek(trfd, 0, SEEK_CUR) != 5) {
+        close(trfd);
+        return 65;
+    }
+    if (ftruncate(trfd, 8192 + 50) != 0) {
+        close(trfd);
+        return 66;
+    }
+    if (lseek(trfd, 0, SEEK_CUR) != 5) {
+        close(trfd);
+        return 67;
+    }
+    if (fstat(trfd, &sst) != 0 || sst.st_size != 8192 + 50) {
+        close(trfd);
+        return 68;
+    }
+    char zbuf[50];
+    memset(zbuf, 0xff, sizeof(zbuf));
+    if (read(trfd, zbuf, sizeof(zbuf)) != sizeof(zbuf)) {
+        close(trfd);
+        return 69;
+    }
+    for (int zi = 0; zi < 50; zi++) {
+        if (zbuf[zi] != 0) {
+            close(trfd);
+            return 70;
+        }
+    }
+    if (lseek(trfd, 8192, SEEK_SET) != 8192) {
+        close(trfd);
+        return 71;
+    }
+    memset(zbuf, 0xff, sizeof(zbuf));
+    if (read(trfd, zbuf, sizeof(zbuf)) != sizeof(zbuf)) {
+        close(trfd);
+        return 72;
+    }
+    for (int zi = 0; zi < 50; zi++) {
+        if (zbuf[zi] != 0) {
+            close(trfd);
+            return 73;
+        }
+    }
+    close(trfd);
+    unlink("/trunc_extend.txt");
+
+    /* 13. Unlink-but-open lifecycle:
+     * Open ufd, unlink file, subsequent open fails ENOENT.
+     * Original ufd can still be closed cleanly, and re-creation gets a new file. */
+    int ufd = open("/unlink_open.txt", O_CREAT | O_RDWR | O_TRUNC, 0644);
+    if (ufd < 0) {
+        return 74;
+    }
+    if (write(ufd, "initial data", 12) != 12) {
+        close(ufd);
+        return 75;
+    }
+    if (unlink("/unlink_open.txt") != 0) {
+        close(ufd);
+        return 76;
+    }
+    errno = 0;
+    int re_open = open("/unlink_open.txt", O_RDONLY);
+    if (re_open >= 0 || errno != ENOENT) {
+        if (re_open >= 0) close(re_open);
+        close(ufd);
+        return 78;
+    }
+    if (close(ufd) != 0) {
+        return 79;
+    }
+    /* Re-create file with same name: must succeed and allow fresh write/read */
+    int new_ufd = open("/unlink_open.txt", O_CREAT | O_RDWR | O_TRUNC, 0644);
+    if (new_ufd < 0) {
+        return 80;
+    }
+    if (write(new_ufd, "recreated", 9) != 9) {
+        close(new_ufd);
+        return 81;
+    }
+    char new_buf[16];
+    memset(new_buf, 0, sizeof(new_buf));
+    if (lseek(new_ufd, 0, SEEK_SET) != 0 || read(new_ufd, new_buf, 9) != 9 ||
+        memcmp(new_buf, "recreated", 9) != 0) {
+        close(new_ufd);
+        return 82;
+    }
+    close(new_ufd);
+    unlink("/unlink_open.txt");
+
+    /* 14. Append mode atomic offset resolution:
+     * Open O_APPEND, write 10 bytes, lseek to offset 0, write 3 bytes.
+     * Bytes must be appended at offset 10, offset becomes 13. */
+    int apfd = open("/append_lseek.txt", O_CREAT | O_RDWR | O_APPEND | O_TRUNC, 0644);
+    if (apfd < 0) {
+        return 83;
+    }
+    if (write(apfd, "0123456789", 10) != 10) {
+        close(apfd);
+        return 84;
+    }
+    if (lseek(apfd, 0, SEEK_CUR) != 10) {
+        close(apfd);
+        return 85;
+    }
+    if (lseek(apfd, 0, SEEK_SET) != 0) {
+        close(apfd);
+        return 86;
+    }
+    if (write(apfd, "ABC", 3) != 3) {
+        close(apfd);
+        return 87;
+    }
+    if (lseek(apfd, 0, SEEK_CUR) != 13) {
+        close(apfd);
+        return 88;
+    }
+    char apbuf[16];
+    memset(apbuf, 0, sizeof(apbuf));
+    if (lseek(apfd, 0, SEEK_SET) != 0 || read(apfd, apbuf, 13) != 13 ||
+        memcmp(apbuf, "0123456789ABC", 13) != 0) {
+        close(apfd);
+        return 89;
+    }
+    close(apfd);
+    unlink("/append_lseek.txt");
+
+    /* 15. Create persistence marker file for host-side verification */
+    int pfd = open("/persist.txt", O_CREAT | O_WRONLY | O_TRUNC, 0644);
+    if (pfd < 0) {
+        return 90;
+    }
+    static const char persist_data[] = "BoarOS-ext4-persisted-data";
+    if (write(pfd, persist_data, sizeof(persist_data) - 1) != (ssize_t)(sizeof(persist_data) - 1)) {
+        close(pfd);
+        return 91;
+    }
+    if (close(pfd) != 0) {
+        return 92;
+    }
+
     static const char rw_marker[] = "BoarOS: real userland fs rw checks ok\n";
     if (write(1, rw_marker, sizeof(rw_marker) - 1) != (ssize_t)(sizeof(rw_marker) - 1)) {
         return 34;
