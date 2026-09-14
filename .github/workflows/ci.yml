@@ -62,7 +62,12 @@ jobs:
             | sha256sum -c -
 
       - name: Check patch formatting
-        run: git diff --check HEAD^
+        run: |
+          if git rev-parse --verify HEAD^ >/dev/null 2>&1; then
+            git diff --check HEAD^ HEAD
+          else
+            git diff --check "$(git hash-object -t tree /dev/null)" HEAD
+          fi
 
       - name: Test reference infrastructure
         run: make test-references
