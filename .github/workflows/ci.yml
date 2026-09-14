@@ -1,0 +1,77 @@
+name: BoarOS CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: boaros-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  riscv-tests:
+    name: RISC-V full test suite
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install toolchain and test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            gcc-riscv64-unknown-elf \
+            binutils-riscv64-unknown-elf \
+            gcc-riscv64-linux-gnu \
+            binutils-riscv64-linux-gnu \
+            libc6-dev-riscv64-cross \
+            qemu-system-misc \
+            opensbi \
+            e2fsprogs \
+            curl \
+            git
+
+      - name: Show tool versions
+        run: |
+          riscv64-unknown-elf-gcc --version
+          riscv64-linux-gnu-gcc --version
+          qemu-system-riscv64 --version
+          git --version
+          debugfs -V || true
+
+      - name: Fetch pinned musl source
+        run: |
+          mkdir -p references/musl
+          curl --fail --location \
+            https://musl.libc.org/releases/musl-1.2.5.tar.gz \
+            -o references/musl/musl-1.2.5.tar.gz
+
+          echo \
+            "a9a118bbe84d8764da0ea0d28b3ab3fae8477fc7e4085d90102b8596fc7c75e4  references/musl/musl-1.2.5.tar.gz" \
+            | sha256sum -c -
+
+      - name: Check patch formatting
+        run: git diff --check HEAD^
+
+      - name: Test reference infrastructure
+        run: make test-references
+
+      - name: Test lwext4 host integration
+        run: make test-lwext4-host
+
+      - name: Run RISC-V kernel tests
+        run: make test-riscv
+
+      - name: Run real userland tests
+        run: make test-userland-riscv
