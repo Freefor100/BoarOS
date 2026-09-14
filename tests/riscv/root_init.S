@@ -576,7 +576,7 @@ _start:
     # Mutating flags are rejected by the read-only root, and a relative
     # path with a non-AT_FDCWD dirfd is not silently treated as root.
     li a0, -100
-    la a1, .Labsolute_path
+    la a1, .Lmissing_path
     li a2, 0100
     li a3, 0
     li a7, 56
