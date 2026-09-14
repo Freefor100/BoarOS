@@ -55,7 +55,7 @@ if ! timeout -k 2s 15s "$qemu" \
     -smp 1 \
     -nographic \
     -no-reboot \
-    -drive file="$disk",if=none,format=raw,readonly=on,id=x0 \
+    -drive file="$disk",if=none,format=raw,id=x0 \
     -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
     </dev/null >"$output" 2>&1; then
     show_output

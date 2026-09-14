@@ -12,6 +12,11 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#ifndef VFS_EXPECT_RECOVERY
+#include <kernel/open_file.h>
+#include <ext4_errno.h>
+#endif
+
 #define TEST_POOL_PAGES 512U
 
 static unsigned char page_pool[BOAROS_PAGE_SIZE * TEST_POOL_PAGES]
@@ -73,6 +78,21 @@ static void fail_vfs(unsigned long case_id,
 }
 
 #ifndef VFS_EXPECT_RECOVERY
+static uint32_t fail_orphan_free_calls;
+static uint32_t orphan_free_calls;
+
+int __real_ext4_orphan_free(const char *path, uint32_t inode);
+
+int __wrap_ext4_orphan_free(const char *path, uint32_t inode)
+{
+    orphan_free_calls++;
+    if (fail_orphan_free_calls != 0U) {
+        fail_orphan_free_calls--;
+        return EIO;
+    }
+    return __real_ext4_orphan_free(path, inode);
+}
+
 static int bytes_equal(const unsigned char *bytes,
                        const char *expected,
                        size_t length)
@@ -85,6 +105,59 @@ static int bytes_equal(const unsigned char *bytes,
         }
     }
     return 1;
+}
+
+static void run_orphan_cleanup_regression(struct kernel_vfs_mount *mount,
+                                          struct kernel_heap *heap)
+{
+    struct kernel_open_file_description *orphan_open = 0;
+    struct kernel_open_file_description *unrelated = 0;
+    struct kernel_vfs_file unopened = {0};
+    struct kernel_vfs_file missing = {0};
+    int linux_result = -1;
+
+    if (kernel_open_file_create_mode(heap,
+                                     mount,
+                                     "/orphan-open",
+                                     0600U,
+                                     &orphan_open,
+                                     &linux_result) !=
+            KERNEL_OPEN_FILE_STATUS_OK ||
+        linux_result != 0 || orphan_open == 0 ||
+        kernel_open_file_create(heap,
+                                mount,
+                                "/init",
+                                &unrelated,
+                                &linux_result) !=
+            KERNEL_OPEN_FILE_STATUS_OK ||
+        linux_result != 0 || unrelated == 0 ||
+        kernel_vfs_unlink(mount, "/orphan-open") != 0) {
+        fail_vfs(24U, 0, linux_result);
+    }
+
+    fail_orphan_free_calls = 1U;
+    if (kernel_open_file_release(&orphan_open) !=
+            KERNEL_OPEN_FILE_STATUS_OK ||
+        orphan_open != 0 || orphan_free_calls != 1U ||
+        kernel_open_file_release(&unrelated) !=
+            KERNEL_OPEN_FILE_STATUS_OK ||
+        unrelated != 0 || orphan_free_calls != 1U) {
+        fail_vfs(25U, KERNEL_OPEN_FILE_STATUS_OK,
+                 KERNEL_OPEN_FILE_STATUS_CLEANUP_REQUIRED);
+    }
+
+    if (kernel_vfs_create(mount, "/orphan-unopened", 0600U, &unopened) !=
+            0 ||
+        kernel_vfs_close(&unopened) != 0) {
+        fail_vfs(26U, 0, -1);
+    }
+    fail_orphan_free_calls = 1U;
+    if (kernel_vfs_unlink(mount, "/orphan-unopened") != 0 ||
+        kernel_vfs_open(mount, "/orphan-unopened", &missing) !=
+            -KERNEL_ENOENT ||
+        missing.private_data != 0 || orphan_free_calls != 2U) {
+        fail_vfs(27U, -KERNEL_ENOENT, orphan_free_calls);
+    }
 }
 #endif
 
@@ -335,8 +408,9 @@ static void run_vfs_test(const void *dtb)
     if (result != 0) {
         fail_vfs(11U, 0, result);
     }
+    run_orphan_cleanup_regression(&mount, &heap);
     result = kernel_vfs_unmount(&mount);
-    if (result != 0) {
+    if (result != 0 || orphan_free_calls != 4U) {
         fail_vfs(12U, 0, result);
     }
 

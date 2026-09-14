@@ -27,6 +27,12 @@
 #define LWEXT4_MOUNT_POINT "/"
 #define LWEXT4_PHYSICAL_BLOCK_SIZE 512U
 
+struct lwext4_orphan {
+    struct lwext4_orphan *next;
+    uint32_t inode;
+    uint8_t orphan_freed;
+};
+
 struct lwext4_mount_adapter {
     struct kernel_heap *heap;
     struct kernel_block_device *block;
@@ -36,6 +42,7 @@ struct lwext4_mount_adapter {
     struct kernel_page_cache *page_cache;
     struct kernel_vfs_node *nodes;
     struct kernel_vfs_node *cleanup_nodes;
+    struct lwext4_orphan *orphans;
     uint32_t external_files;
     uint8_t registered;
     uint8_t mounted;
@@ -213,9 +220,45 @@ static int release_mount_storage(struct kernel_vfs_mount *mount)
     return 0;
 }
 
+static void queue_orphan(struct lwext4_mount_adapter *adapter,
+                         struct lwext4_orphan *orphan)
+{
+    orphan->next = adapter->orphans;
+    adapter->orphans = orphan;
+}
+
+static int release_orphan(struct lwext4_mount_adapter *adapter,
+                          struct lwext4_orphan *orphan)
+{
+    if (kernel_heap_release(adapter->heap, orphan) ==
+        KERNEL_HEAP_STATUS_OK) {
+        return 0;
+    }
+    queue_orphan(adapter, orphan);
+    return -KERNEL_EIO;
+}
+
+static int reserve_orphan(struct lwext4_mount_adapter *adapter,
+                          struct lwext4_orphan **owner)
+{
+    enum kernel_heap_status status;
+
+    status = kernel_heap_allocate_zeroed(adapter->heap,
+                                         1U,
+                                         sizeof(**owner),
+                                         (void **)owner);
+    if (status == KERNEL_HEAP_STATUS_OK) {
+        (*owner)->orphan_freed = 1U;
+        return 0;
+    }
+    return status == KERNEL_HEAP_STATUS_EMPTY ? -KERNEL_ENOMEM
+                                              : -KERNEL_EIO;
+}
+
 static int cleanup_mount(struct kernel_vfs_mount *mount)
 {
     struct lwext4_mount_adapter *adapter = mount->private_data;
+    struct lwext4_orphan **orphan_link;
     struct kernel_vfs_node **cleanup_link;
     int result;
 
@@ -230,6 +273,25 @@ static int cleanup_mount(struct kernel_vfs_mount *mount)
         if (cache_status != KERNEL_PAGE_CACHE_STATUS_OK) {
             return cache_status == KERNEL_PAGE_CACHE_STATUS_STATE
                        ? -KERNEL_EBUSY : -KERNEL_EIO;
+        }
+    }
+    orphan_link = &adapter->orphans;
+    while (*orphan_link != 0) {
+        struct lwext4_orphan *orphan = *orphan_link;
+        struct lwext4_orphan *next = orphan->next;
+
+        if (!orphan->orphan_freed) {
+            result = ext4_orphan_free(LWEXT4_MOUNT_POINT, orphan->inode);
+            if (result != EOK) {
+                return lwext4_error(result);
+            }
+            orphan->orphan_freed = 1U;
+        }
+        if (kernel_heap_release(adapter->heap, orphan) !=
+            KERNEL_HEAP_STATUS_OK) {
+            orphan_link = &orphan->next;
+        } else {
+            *orphan_link = next;
         }
     }
     cleanup_link = &adapter->cleanup_nodes;
@@ -259,7 +321,8 @@ static int cleanup_mount(struct kernel_vfs_mount *mount)
             *cleanup_link = next;
         }
     }
-    if (adapter->cleanup_nodes != 0 || adapter->nodes != 0) {
+    if (adapter->orphans != 0 || adapter->cleanup_nodes != 0 ||
+        adapter->nodes != 0) {
         return -KERNEL_EIO;
     }
     if (adapter->mounted) {
@@ -860,16 +923,16 @@ int kernel_vfs_file_read_source(struct kernel_vfs_file *file,
     return 0;
 }
 
-static int kernel_vfs_try_release_orphan(struct kernel_vfs_node *node)
+static void kernel_vfs_try_release_orphan(struct kernel_vfs_node *node)
 {
     struct kernel_vfs_node *temp;
     int result;
 
     if (node == 0 || !node->unlinked || node->orphan_freed) {
-        return 0;
+        return;
     }
     if (node->open_files > 0U || node->exec_users > 0U) {
-        return 0;
+        return;
     }
 
     node->references++;
@@ -887,7 +950,6 @@ static int kernel_vfs_try_release_orphan(struct kernel_vfs_node *node)
     temp = node;
     (void)kernel_vfs_node_release(&temp);
 
-    return result != EOK ? lwext4_error(result) : 0;
 }
 
 int kernel_vfs_close(struct kernel_vfs_file *file)
@@ -998,6 +1060,7 @@ int kernel_vfs_unlink(struct kernel_vfs_mount *mount,
 {
     struct lwext4_mount_adapter *adapter;
     struct kernel_vfs_node *node;
+    struct lwext4_orphan *orphan = 0;
     uint32_t inode = 0U;
     bool is_orphan = false;
     int result;
@@ -1010,9 +1073,14 @@ int kernel_vfs_unlink(struct kernel_vfs_mount *mount,
     if (adapter->read_only) {
         return -KERNEL_EROFS;
     }
+    result = reserve_orphan(adapter, &orphan);
+    if (result != 0) {
+        return result;
+    }
 
     result = ext4_funlink_dentry(path, &inode, &is_orphan);
     if (result != EOK) {
+        (void)release_orphan(adapter, orphan);
         return lwext4_error(result);
     }
 
@@ -1025,18 +1093,20 @@ int kernel_vfs_unlink(struct kernel_vfs_mount *mount,
     if (node != 0) {
         if (is_orphan) {
             node->unlinked = 1U;
-            result = kernel_vfs_try_release_orphan(node);
-            if (result != 0) {
-                return result;
-            }
+            kernel_vfs_try_release_orphan(node);
         }
+        return release_orphan(adapter, orphan);
     } else if (is_orphan) {
+        orphan->inode = inode;
+        orphan->orphan_freed = 0U;
         result = ext4_orphan_free(LWEXT4_MOUNT_POINT, inode);
         if (result != EOK) {
-            return lwext4_error(result);
+            queue_orphan(adapter, orphan);
+            return 0;
         }
+        orphan->orphan_freed = 1U;
     }
-    return 0;
+    return release_orphan(adapter, orphan);
 }
 
 static int check_directory_empty(const char *path)
@@ -1236,7 +1306,7 @@ int kernel_vfs_node_release(struct kernel_vfs_node **owner)
             node->next = node->adapter->cleanup_nodes;
             node->adapter->cleanup_nodes = node;
             *owner = 0;
-            return -KERNEL_EIO;
+            return 0;
         }
     }
     if (!node->closed) {
