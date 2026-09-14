@@ -59,8 +59,8 @@ enum kernel_heap_status __wrap_kernel_heap_release(
     struct kernel_heap *heap,
     void *pointer)
 {
-    if (fail_next_heap_release) {
-        fail_next_heap_release = 0;
+    if (fail_next_heap_release > 0) {
+        fail_next_heap_release--;
         return KERNEL_HEAP_STATUS_STATE;
     }
     return __real_kernel_heap_release(heap, pointer);
@@ -2200,6 +2200,97 @@ static void run_epoll_operations(struct kernel_files *files,
     if (kernel_files_close(files, epfd, &result) != KERNEL_FILES_STATUS_OK ||
         result != 0) {
         fail_files(155U, 0, result);
+    }
+
+    /* 4. Multiple cleanup_items with multi-stage drain retry */
+    int32_t pipe2_fds[2];
+    if (kernel_files_pipe2(files,
+                           mm,
+                           TEST_USER_PATH,
+                           0,
+                           &result) != KERNEL_FILES_STATUS_OK ||
+        result != 0 ||
+        !read_user_bytes(mm, TEST_USER_PATH, pipe_fds, sizeof(pipe_fds)) ||
+        kernel_files_pipe2(files,
+                           mm,
+                           TEST_USER_PATH,
+                           0,
+                           &result) != KERNEL_FILES_STATUS_OK ||
+        result != 0 ||
+        !read_user_bytes(mm, TEST_USER_PATH, pipe2_fds, sizeof(pipe2_fds))) {
+        fail_files(156U, 0, result);
+    }
+
+    if (kernel_files_epoll_create1(files, 0, &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result < 0) {
+        fail_files(157U, 0, result);
+    }
+    epfd = result;
+
+    if (kernel_files_epoll_ctl(files,
+                               epfd,
+                               1 /* KERNEL_EPOLL_CTL_ADD */,
+                               pipe_fds[0],
+                               KERNEL_POLLIN,
+                               101ULL,
+                               &result) != KERNEL_FILES_STATUS_OK ||
+        result != 0 ||
+        kernel_files_epoll_ctl(files,
+                               epfd,
+                               1 /* KERNEL_EPOLL_CTL_ADD */,
+                               pipe2_fds[0],
+                               KERNEL_POLLIN,
+                               102ULL,
+                               &result) != KERNEL_FILES_STATUS_OK ||
+        result != 0) {
+        fail_files(158U, 0, result);
+    }
+
+    /* Target pipes closed: both item releases fail and queue into epoll->cleanup_items */
+    fail_next_heap_release = 1;
+    if (kernel_files_close(files, pipe_fds[0], &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != 0 ||
+        kernel_files_close(files, pipe_fds[1], &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != 0) {
+        fail_files(159U, 0, result);
+    }
+
+    fail_next_heap_release = 1;
+    if (kernel_files_close(files, pipe2_fds[0], &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != 0 ||
+        kernel_files_close(files, pipe2_fds[1], &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != 0) {
+        fail_files(160U, 0, result);
+    }
+
+    /* Close epfd with heap failure: first cleanup_item release fails */
+    fail_next_heap_release = 1;
+    if (kernel_files_close(files, epfd, &result) != KERNEL_FILES_STATUS_OK ||
+        result != -KERNEL_EIO) {
+        fail_files(161U, -KERNEL_EIO, result);
+    }
+
+    /* Second close: descriptor is logically detached, returns -EBADF */
+    if (kernel_files_close(files, epfd, &result) != KERNEL_FILES_STATUS_OK ||
+        result != -KERNEL_EBADF) {
+        fail_files(162U, -KERNEL_EBADF, result);
+    }
+
+    /* First drain: fail next heap release, still requires cleanup */
+    fail_next_heap_release = 1;
+    if (kernel_files_drain_file_cleanup(files) !=
+        KERNEL_FILES_STATUS_CLEANUP_REQUIRED) {
+        fail_files(163U, KERNEL_FILES_STATUS_CLEANUP_REQUIRED, KERNEL_FILES_STATUS_OK);
+    }
+
+    /* Second drain: completes all remaining cleanups */
+    if (kernel_files_drain_file_cleanup(files) != KERNEL_FILES_STATUS_OK) {
+        fail_files(164U, KERNEL_FILES_STATUS_OK, KERNEL_FILES_STATUS_STATE);
     }
 }
 

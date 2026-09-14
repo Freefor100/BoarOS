@@ -166,10 +166,11 @@ enum kernel_files_status kernel_epoll_destroy(struct kernel_epoll *epoll)
     }
     while (epoll->cleanup_items != 0) {
         struct kernel_epoll_item *item = epoll->cleanup_items;
+        struct kernel_epoll_item *next = item->items_next;
         if (kernel_heap_release(epoll->heap, item) != KERNEL_HEAP_STATUS_OK) {
             return KERNEL_FILES_STATUS_CLEANUP_REQUIRED;
         }
-        epoll->cleanup_items = item->items_next;
+        epoll->cleanup_items = next;
     }
     while (epoll->items_head != 0) {
         struct kernel_epoll_item *item = epoll->items_head;
