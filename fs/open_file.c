@@ -352,7 +352,13 @@ enum kernel_open_file_status kernel_open_file_release(
             file->vfs_closed = 1U;
         } else if (file->kind == KERNEL_OPEN_FILE_KIND_EPOLL) {
             if (file->epoll != 0) {
-                kernel_epoll_destroy(file->epoll);
+                enum kernel_files_status epoll_status =
+                    kernel_epoll_destroy(file->epoll);
+                if (epoll_status != KERNEL_FILES_STATUS_OK) {
+                    return epoll_status == KERNEL_FILES_STATUS_CLEANUP_REQUIRED
+                               ? KERNEL_OPEN_FILE_STATUS_CLEANUP_REQUIRED
+                               : KERNEL_OPEN_FILE_STATUS_STATE;
+                }
                 file->epoll = 0;
             }
             file->vfs_closed = 1U;
@@ -382,11 +388,9 @@ enum kernel_open_file_status kernel_open_file_detach(
     if (!open_file_live(file)) {
         return KERNEL_OPEN_FILE_STATUS_STATE;
     }
-    /* A pipe endpoint or epoll descriptor's last live owner closes it immediately,
-     * even when its allocation must survive on a cleanup list. */
-    if ((file->kind == KERNEL_OPEN_FILE_KIND_PIPE ||
-         file->kind == KERNEL_OPEN_FILE_KIND_EPOLL) &&
-        file->references == 1U) {
+    /* A pipe endpoint's last live owner closes it immediately, even when
+     * its allocation must survive on a cleanup list. */
+    if (file->kind == KERNEL_OPEN_FILE_KIND_PIPE && file->references == 1U) {
         return kernel_open_file_release(owner);
     }
     file->references--;

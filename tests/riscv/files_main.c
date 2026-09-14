@@ -2068,6 +2068,141 @@ static void run_pipe_operations(struct kernel_files *files,
     }
 }
 
+static void run_epoll_operations(struct kernel_files *files,
+                                 const struct kernel_fs_context *fs,
+                                 struct kernel_mm *mm)
+{
+    int32_t pipe_fds[2];
+    int64_t result = INT64_MIN;
+    int64_t epfd = -1;
+
+    (void)fs;
+    /* 1. Pipe and epoll with registered item under fault injection */
+    if (kernel_files_pipe2(files,
+                           mm,
+                           TEST_USER_PATH,
+                           0,
+                           &result) != KERNEL_FILES_STATUS_OK ||
+        result != 0 ||
+        !read_user_bytes(mm, TEST_USER_PATH, pipe_fds, sizeof(pipe_fds))) {
+        fail_files(140U, 0, result);
+    }
+
+    if (kernel_files_epoll_create1(files, 0, &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result < 0) {
+        fail_files(141U, 0, result);
+    }
+    epfd = result;
+
+    if (kernel_files_epoll_ctl(files,
+                               epfd,
+                               1 /* KERNEL_EPOLL_CTL_ADD */,
+                               pipe_fds[0],
+                               KERNEL_POLLIN,
+                               42ULL,
+                               &result) != KERNEL_FILES_STATUS_OK ||
+        result != 0) {
+        fail_files(142U, 0, result);
+    }
+
+    /* Inject heap release failure on closing epoll descriptor */
+    fail_next_heap_release = 1;
+    if (kernel_files_close(files, epfd, &result) != KERNEL_FILES_STATUS_OK ||
+        result != -KERNEL_EIO) {
+        fail_files(143U, -KERNEL_EIO, result);
+    }
+
+    /* Descriptor is logically detached: second close must return -EBADF */
+    if (kernel_files_close(files, epfd, &result) != KERNEL_FILES_STATUS_OK ||
+        result != -KERNEL_EBADF) {
+        fail_files(144U, -KERNEL_EBADF, result);
+    }
+
+    /* Retryable cleanup: draining pending cleanups must succeed */
+    if (kernel_files_drain_file_cleanup(files) != KERNEL_FILES_STATUS_OK) {
+        fail_files(145U, KERNEL_FILES_STATUS_OK, KERNEL_FILES_STATUS_STATE);
+    }
+
+    if (kernel_files_close(files, pipe_fds[0], &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != 0 ||
+        kernel_files_close(files, pipe_fds[1], &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != 0) {
+        fail_files(146U, 0, result);
+    }
+
+    /* 2. Empty epoll instance under fault injection on epoll struct itself */
+    if (kernel_files_epoll_create1(files, 0, &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result < 0) {
+        fail_files(147U, 0, result);
+    }
+    epfd = result;
+
+    fail_next_heap_release = 1;
+    if (kernel_files_close(files, epfd, &result) != KERNEL_FILES_STATUS_OK ||
+        result != -KERNEL_EIO) {
+        fail_files(148U, -KERNEL_EIO, result);
+    }
+
+    if (kernel_files_close(files, epfd, &result) != KERNEL_FILES_STATUS_OK ||
+        result != -KERNEL_EBADF) {
+        fail_files(149U, -KERNEL_EBADF, result);
+    }
+
+    if (kernel_files_drain_file_cleanup(files) != KERNEL_FILES_STATUS_OK) {
+        fail_files(150U, KERNEL_FILES_STATUS_OK, KERNEL_FILES_STATUS_STATE);
+    }
+
+    /* 3. Target file closed first with item heap release failure */
+    if (kernel_files_pipe2(files,
+                           mm,
+                           TEST_USER_PATH,
+                           0,
+                           &result) != KERNEL_FILES_STATUS_OK ||
+        result != 0 ||
+        !read_user_bytes(mm, TEST_USER_PATH, pipe_fds, sizeof(pipe_fds))) {
+        fail_files(151U, 0, result);
+    }
+
+    if (kernel_files_epoll_create1(files, 0, &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result < 0) {
+        fail_files(152U, 0, result);
+    }
+    epfd = result;
+
+    if (kernel_files_epoll_ctl(files,
+                               epfd,
+                               1 /* KERNEL_EPOLL_CTL_ADD */,
+                               pipe_fds[0],
+                               KERNEL_POLLIN,
+                               99ULL,
+                               &result) != KERNEL_FILES_STATUS_OK ||
+        result != 0) {
+        fail_files(153U, 0, result);
+    }
+
+    /* Target file closed; item heap release fails and gets queued to epoll->cleanup_items */
+    fail_next_heap_release = 1;
+    if (kernel_files_close(files, pipe_fds[0], &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != 0 ||
+        kernel_files_close(files, pipe_fds[1], &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != 0) {
+        fail_files(154U, 0, result);
+    }
+
+    /* Closing epfd drains the queued cleanup item and epoll itself */
+    if (kernel_files_close(files, epfd, &result) != KERNEL_FILES_STATUS_OK ||
+        result != 0) {
+        fail_files(155U, 0, result);
+    }
+}
+
 static void run_files_test(const void *dtb)
 {
     struct dtb_boot_info info;
@@ -2206,6 +2341,17 @@ static void run_files_test(const void *dtb)
                    KERNEL_FILES_STATUS_STATE);
     }
     run_pipe_operations(&files, &fs, &mm);
+
+    if (kernel_files_release(&files) != KERNEL_FILES_STATUS_OK) {
+        fail_files(58U, KERNEL_FILES_STATUS_OK,
+                   KERNEL_FILES_STATUS_STATE);
+    }
+    files = (struct kernel_files){0};
+    if (kernel_files_create(&files, &heap) != KERNEL_FILES_STATUS_OK) {
+        fail_files(139U, KERNEL_FILES_STATUS_OK,
+                   KERNEL_FILES_STATUS_STATE);
+    }
+    run_epoll_operations(&files, &fs, &mm);
 
     if (kernel_files_release(&files) != KERNEL_FILES_STATUS_OK) {
         fail_files(58U, KERNEL_FILES_STATUS_OK,

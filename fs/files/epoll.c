@@ -105,10 +105,11 @@ int kernel_epoll_create(
     return 0;
 }
 
-static void epoll_item_unlink_and_destroy(struct kernel_epoll_item *item)
+static enum kernel_files_status epoll_item_unlink_and_destroy(
+    struct kernel_epoll_item *item)
 {
     if (item == 0) {
-        return;
+        return KERNEL_FILES_STATUS_OK;
     }
     struct kernel_epoll *epoll = item->epoll;
     struct kernel_open_file_description *target_file = item->target_file;
@@ -127,6 +128,8 @@ static void epoll_item_unlink_and_destroy(struct kernel_epoll_item *item)
         if (item->items_next != 0) {
             item->items_next->items_prev = item->items_prev;
         }
+        item->items_prev = 0;
+        item->items_next = 0;
         if (epoll->item_count > 0U) {
             epoll->item_count--;
         }
@@ -141,27 +144,49 @@ static void epoll_item_unlink_and_destroy(struct kernel_epoll_item *item)
         if (item->target_next != 0) {
             item->target_next->target_prev = item->target_prev;
         }
+        item->target_prev = 0;
+        item->target_next = 0;
         item->target_file = 0;
     }
 
     if (epoll != 0 && epoll->heap != 0) {
-        (void)kernel_heap_release(epoll->heap, item);
+        if (kernel_heap_release(epoll->heap, item) != KERNEL_HEAP_STATUS_OK) {
+            item->items_next = epoll->cleanup_items;
+            epoll->cleanup_items = item;
+            return KERNEL_FILES_STATUS_CLEANUP_REQUIRED;
+        }
     }
+    return KERNEL_FILES_STATUS_OK;
 }
 
-void kernel_epoll_destroy(struct kernel_epoll *epoll)
+enum kernel_files_status kernel_epoll_destroy(struct kernel_epoll *epoll)
 {
     if (epoll == 0) {
-        return;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    while (epoll->cleanup_items != 0) {
+        struct kernel_epoll_item *item = epoll->cleanup_items;
+        if (kernel_heap_release(epoll->heap, item) != KERNEL_HEAP_STATUS_OK) {
+            return KERNEL_FILES_STATUS_CLEANUP_REQUIRED;
+        }
+        epoll->cleanup_items = item->items_next;
     }
     while (epoll->items_head != 0) {
-        epoll_item_unlink_and_destroy(epoll->items_head);
+        struct kernel_epoll_item *item = epoll->items_head;
+        (void)epoll_item_unlink_and_destroy(item);
     }
     epoll->items_head = 0;
     epoll->ready_head = 0;
     epoll->ready_tail = 0;
     epoll->item_count = 0U;
-    (void)kernel_heap_release(epoll->heap, epoll);
+
+    if (epoll->cleanup_items != 0) {
+        return KERNEL_FILES_STATUS_CLEANUP_REQUIRED;
+    }
+    if (kernel_heap_release(epoll->heap, epoll) != KERNEL_HEAP_STATUS_OK) {
+        return KERNEL_FILES_STATUS_CLEANUP_REQUIRED;
+    }
+    return KERNEL_FILES_STATUS_OK;
 }
 
 void kernel_epoll_notify_file_release(
@@ -171,7 +196,7 @@ void kernel_epoll_notify_file_release(
         return;
     }
     while (file->ep_items != 0) {
-        epoll_item_unlink_and_destroy(file->ep_items);
+        (void)epoll_item_unlink_and_destroy(file->ep_items);
     }
     file->ep_items = 0;
 }
@@ -233,7 +258,7 @@ enum kernel_files_status kernel_files_epoll_create1(
     }
     if (kernel_open_file_create_epoll(files->heap, epoll, flags, &ofd) !=
         KERNEL_OPEN_FILE_STATUS_OK) {
-        kernel_epoll_destroy(epoll);
+        (void)kernel_epoll_destroy(epoll);
         *linux_result = -KERNEL_ENOMEM;
         return KERNEL_FILES_STATUS_OK;
     }

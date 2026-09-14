@@ -287,6 +287,9 @@ void kernel_files_get_statistics(
 enum kernel_files_status kernel_files_release(
     struct kernel_files *files);
 
+enum kernel_files_status kernel_files_drain_file_cleanup(
+    struct kernel_files *files);
+
 enum kernel_files_status kernel_files_ppoll(
     struct kernel_files *files,
     struct kernel_mm *mm,

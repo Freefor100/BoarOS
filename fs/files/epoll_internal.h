@@ -1,6 +1,7 @@
 #ifndef BOAROS_FS_FILES_EPOLL_INTERNAL_H
 #define BOAROS_FS_FILES_EPOLL_INTERNAL_H
 
+#include <kernel/files.h>
 #include <kernel/open_file.h>
 #include <kernel/scheduler.h>
 
@@ -78,13 +79,14 @@ struct kernel_epoll {
     struct kernel_epoll_item *items_head;
     struct kernel_epoll_item *ready_head;
     struct kernel_epoll_item *ready_tail;
+    struct kernel_epoll_item *cleanup_items;
     uint32_t item_count;
 };
 
 int kernel_epoll_create(struct kernel_heap *heap,
                         struct kernel_epoll **out_epoll);
 
-void kernel_epoll_destroy(struct kernel_epoll *epoll);
+enum kernel_files_status kernel_epoll_destroy(struct kernel_epoll *epoll);
 
 void kernel_epoll_notify_file_release(
     struct kernel_open_file_description *file);
