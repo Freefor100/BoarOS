@@ -1787,6 +1787,7 @@ int main(int argc, char **argv)
 
     DIR *dir = opendir("/");
     if (dir == 0) {
+        fprintf(stderr, "opendir(/) failed: errno=%d\n", errno);
         return 1;
     }
     int saw_data = 0;
