@@ -518,6 +518,107 @@ static int check_poll_and_select(void)
         return 35;
     }
 
+    /* 9. Broken pipe write-end readiness */
+    int bp[2];
+    if (pipe(bp) != 0) {
+        return 101;
+    }
+    if (close(bp[0]) != 0) {
+        return 102;
+    }
+    struct pollfd bp_pfd = { .fd = bp[1], .events = POLLOUT, .revents = 0 };
+    ret = poll(&bp_pfd, 1, 0);
+    if (ret != 1 || (bp_pfd.revents & POLLOUT) == 0 || (bp_pfd.revents & POLLERR) == 0) {
+        return 103;
+    }
+    fd_set bp_wfds;
+    FD_ZERO(&bp_wfds);
+    FD_SET(bp[1], &bp_wfds);
+    struct timeval bp_tv = {0, 0};
+    ret = select(bp[1] + 1, NULL, &bp_wfds, NULL, &bp_tv);
+    if (ret != 1 || !FD_ISSET(bp[1], &bp_wfds)) {
+        return 104;
+    }
+    int bp_ep = epoll_create1(0);
+    if (bp_ep < 0) {
+        return 105;
+    }
+    struct epoll_event bp_ev = { .events = EPOLLOUT, .data.u32 = 77 };
+    if (epoll_ctl(bp_ep, EPOLL_CTL_ADD, bp[1], &bp_ev) != 0) {
+        return 106;
+    }
+    struct epoll_event bp_out;
+    ret = epoll_wait(bp_ep, &bp_out, 1, 0);
+    if (ret != 1 || (bp_out.events & EPOLLOUT) == 0 || (bp_out.events & EPOLLERR) == 0) {
+        return 107;
+    }
+    close(bp_ep);
+    /* Write to broken pipe must fail with EPIPE and raise SIGPIPE (SIGPIPE is ignored in real.c) */
+    errno = 0;
+    if (write(bp[1], "z", 1) != -1 || errno != EPIPE) {
+        return 108;
+    }
+    close(bp[1]);
+
+    /* 10. Raw ppoll & pselect6 timeout writeback ABI */
+    struct timespec raw_ts = { .tv_sec = 0, .tv_nsec = 30000000L };
+    long raw_ret = syscall(SYS_ppoll, NULL, 0, &raw_ts, NULL, 0);
+    if (raw_ret != 0 || raw_ts.tv_sec != 0 || raw_ts.tv_nsec != 0) {
+        return 109;
+    }
+    struct {
+        void *ss;
+        size_t ss_len;
+    } raw_sigpack = { NULL, 0 };
+    raw_ts.tv_sec = 0;
+    raw_ts.tv_nsec = 30000000L;
+    raw_ret = syscall(SYS_pselect6, 0, NULL, NULL, NULL, &raw_ts, &raw_sigpack);
+    if (raw_ret != 0 || raw_ts.tv_sec != 0 || raw_ts.tv_nsec != 0) {
+        return 110;
+    }
+    int ready_p[2];
+    if (pipe(ready_p) != 0) {
+        return 111;
+    }
+    if (write(ready_p[1], "q", 1) != 1) {
+        return 112;
+    }
+    struct pollfd ready_pfd = { .fd = ready_p[0], .events = POLLIN, .revents = 0 };
+    raw_ts.tv_sec = 5;
+    raw_ts.tv_nsec = 0;
+    raw_ret = syscall(SYS_ppoll, &ready_pfd, 1, &raw_ts, NULL, 0);
+    if (raw_ret != 1 || raw_ts.tv_sec < 4) {
+        return 113;
+    }
+    fd_set ready_rfds;
+    FD_ZERO(&ready_rfds);
+    FD_SET(ready_p[0], &ready_rfds);
+    raw_ts.tv_sec = 5;
+    raw_ts.tv_nsec = 0;
+    raw_ret = syscall(SYS_pselect6, ready_p[0] + 1, &ready_rfds, NULL, NULL, &raw_ts, &raw_sigpack);
+    if (raw_ret != 1 || raw_ts.tv_sec < 4) {
+        return 114;
+    }
+    close(ready_p[0]);
+    close(ready_p[1]);
+
+    /* 11. select total_bits with single fd in both readfds and writefds */
+    int rw_fd = open("/test_total_bits.tmp", O_RDWR | O_CREAT | O_TRUNC, 0644);
+    if (rw_fd >= 0) {
+        fd_set both_rfds, both_wfds;
+        FD_ZERO(&both_rfds);
+        FD_ZERO(&both_wfds);
+        FD_SET(rw_fd, &both_rfds);
+        FD_SET(rw_fd, &both_wfds);
+        struct timeval both_tv = {0, 0};
+        ret = select(rw_fd + 1, &both_rfds, &both_wfds, NULL, &both_tv);
+        unlink("/test_total_bits.tmp");
+        close(rw_fd);
+        if (ret != 2 || !FD_ISSET(rw_fd, &both_rfds) || !FD_ISSET(rw_fd, &both_wfds)) {
+            return 115;
+        }
+    }
+
     static const char poll_marker[] =
         "BoarOS: real userland poll/select checks ok\n";
     if (write(1, poll_marker, sizeof(poll_marker) - 1) !=
