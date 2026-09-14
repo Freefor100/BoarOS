@@ -34,7 +34,7 @@ miss 路径先分配并清零页，再通过 node 的无 offset 副作用 `pread
 目录操作中，`kernel_vfs_mkdir` 调用 `ext4_dir_mk`；`kernel_vfs_unlink` 实现了真正的 Linux `unlink`-but-open 语义：
 - `kernel_vfs_unlink` 调用 `ext4_funlink_dentry` 从父目录中立即移除目标目录项，后续对原路径的 `open` 立即返回 `-ENOENT`，并在同名路径重新创建时分配独立全新 inode；
 - 若目标文件当前仍处于打开状态（`node->open_files > 0`），VFS 标记 `node->unlinked = 1`，旧 open 描述符（包括只读/读写 OFD 以及正在运行的源映射 ELF 可执行文件）保留底层 inode 数据与有效物理块，继续正常执行 `read/write/fstat` 与缺页加载（demand fault）；
-- 只有当最后一个打开描述符被关闭（`node->open_files == 0`）时，VFS 才执行 `ext4_orphan_free` 截断释放底层 inode 数据块，并调用 `kernel_page_cache_invalidate_node` 彻底失效页缓存。若文件在 unlink 时未处于打开状态，则立即截断释放。
+- 只有当最后一个打开描述符与执行租约释放（`node->open_files == 0 && node->exec_users == 0`）时，VFS 才通过专有的 `kernel_vfs_try_release_orphan` 驱动物理存储释放。该过程先持有临时节点引用并安全使页缓存失效，再在扁平调用栈上调用 `ext4_orphan_free` 截断释放底层 inode，最后标记 `node->orphan_freed = 1`。通用的 `kernel_vfs_node_release` 仅负责内存节点对象的生命周期，绝不隐式或嵌套调用 `ext4_orphan_free`，从根源消除双重释放与页缓存深度嵌套破坏 4 KiB 任务栈的风险；若底层释放失败，节点转移至 `adapter->cleanup_nodes` 保留重试所有权。若文件在 unlink 时未处于打开状态，则立即在顶层栈帧截断释放。
 由于 lwext4 的 `ext4_dir_rm` 会递归删除非空目录，`kernel_vfs_rmdir` 在调用底层删除前先遍历目录项（跳过 `.` 和 `..`），若存在子条目则准确返回 `-ENOTEMPTY`。
 只读挂载下，所有上述修改操作直接返回 `-EROFS`。
 unmount 在仍有 open file 时返回 `-EBUSY`。close/unmount 的底层释放失败保留 CLEANUP 状态，调用者可以重试而不会重复关闭或丢失 heap owner。
