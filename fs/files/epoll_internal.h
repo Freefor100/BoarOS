@@ -74,6 +74,7 @@ struct kernel_epoll_item {
 struct kernel_epoll {
     struct kernel_heap *heap;
     struct kernel_wait_queue wait_queue;
+    struct kernel_open_file_description *file;
     struct kernel_epoll_item *items_head;
     struct kernel_epoll_item *ready_head;
     struct kernel_epoll_item *ready_tail;

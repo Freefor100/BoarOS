@@ -57,6 +57,9 @@ enum kernel_open_file_status kernel_open_file_create_console(
 enum kernel_open_file_kind kernel_open_file_kind(
     const struct kernel_open_file_description *file);
 
+int kernel_open_file_supports_epoll(
+    const struct kernel_open_file_description *file);
+
 enum kernel_open_file_status kernel_open_file_acquire(
     struct kernel_open_file_description *file);
 

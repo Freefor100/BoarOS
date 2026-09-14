@@ -682,6 +682,28 @@ static int check_epoll(void)
         return 8;
     }
 
+    /* Regular file and directory must be rejected with EPERM on ADD */
+    int reg_fd = open("/data", O_RDONLY);
+    if (reg_fd >= 0) {
+        errno = 0;
+        if (epoll_ctl(epfd, EPOLL_CTL_ADD, reg_fd, &ev) != -1 || errno != EPERM) {
+            close(reg_fd);
+            close(epfd);
+            return 801;
+        }
+        close(reg_fd);
+    }
+    int dir_fd = open("/", O_RDONLY | O_DIRECTORY);
+    if (dir_fd >= 0) {
+        errno = 0;
+        if (epoll_ctl(epfd, EPOLL_CTL_ADD, dir_fd, &ev) != -1 || errno != EPERM) {
+            close(dir_fd);
+            close(epfd);
+            return 802;
+        }
+        close(dir_fd);
+    }
+
     /* 3. Empty epoll wait */
     struct epoll_event evs[4];
     memset(evs, 0, sizeof(evs));
@@ -1145,6 +1167,71 @@ static int check_epoll(void)
     close(p_b_read);
     close(p_b[1]);
     close(ep_reuse);
+
+    /* 12. Nested epoll, loop detection, and nesting limit */
+    int ep_a = epoll_create1(0);
+    int ep_b = epoll_create1(0);
+    if (ep_a < 0 || ep_b < 0) {
+        if (ep_a >= 0) close(ep_a);
+        if (ep_b >= 0) close(ep_b);
+        return 74;
+    }
+    struct epoll_event nest_ev = { .events = EPOLLIN, .data.u32 = 1 };
+    /* ep_a watches ep_b */
+    if (epoll_ctl(ep_a, EPOLL_CTL_ADD, ep_b, &nest_ev) != 0) {
+        close(ep_a); close(ep_b);
+        return 75;
+    }
+    /* ep_b watches ep_a: cycle -> ELOOP */
+    errno = 0;
+    if (epoll_ctl(ep_b, EPOLL_CTL_ADD, ep_a, &nest_ev) != -1 || errno != ELOOP) {
+        close(ep_a); close(ep_b);
+        return 76;
+    }
+    int ep_c = epoll_create1(0);
+    /* ep_b watches ep_c */
+    if (epoll_ctl(ep_b, EPOLL_CTL_ADD, ep_c, &nest_ev) != 0) {
+        close(ep_a); close(ep_b); close(ep_c);
+        return 77;
+    }
+    /* ep_c watches ep_a: cycle -> ELOOP */
+    errno = 0;
+    if (epoll_ctl(ep_c, EPOLL_CTL_ADD, ep_a, &nest_ev) != -1 || errno != ELOOP) {
+        close(ep_a); close(ep_b); close(ep_c);
+        return 78;
+    }
+    close(ep_a); close(ep_b); close(ep_c);
+
+    /* Nesting chain limit: ep0 -> ep1 -> ep2 -> ep3 -> ep4 (depth 4) */
+    int chain[6];
+    for (int i = 0; i < 6; i++) {
+        chain[i] = epoll_create1(0);
+        if (chain[i] < 0) return 79;
+    }
+    for (int i = 0; i < 4; i++) {
+        if (epoll_ctl(chain[i], EPOLL_CTL_ADD, chain[i+1], &nest_ev) != 0) {
+            for (int j = 0; j < 6; j++) close(chain[j]);
+            return 80;
+        }
+    }
+    /* 5th nesting level exceeds EP_MAX_NESTS (4) -> ELOOP */
+    errno = 0;
+    if (epoll_ctl(chain[4], EPOLL_CTL_ADD, chain[5], &nest_ev) != -1 || errno != ELOOP) {
+        for (int j = 0; j < 6; j++) close(chain[j]);
+        return 81;
+    }
+    for (int j = 0; j < 6; j++) close(chain[j]);
+
+    /* 13. maxevents > 1024 (e.g. 2048) on epoll_wait */
+    int ep_large = epoll_create1(0);
+    if (ep_large >= 0) {
+        struct epoll_event large_evs[2];
+        if (epoll_wait(ep_large, large_evs, 2048, 0) != 0) {
+            close(ep_large);
+            return 82;
+        }
+        close(ep_large);
+    }
 
     static const char epoll_marker[] =
         "BoarOS: real userland epoll checks ok\n";
