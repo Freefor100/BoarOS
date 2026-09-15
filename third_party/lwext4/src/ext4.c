@@ -1641,13 +1641,13 @@ int ext4_fclose(ext4_file *file)
 	return EOK;
 }
 
-static int ext4_zero_fblock_range(struct ext4_inode_ref *ref,
-				  ext4_fsblk_t fblock, uint32_t offset,
-				  uint32_t length)
+static int ext4_initialize_fblock(struct ext4_inode_ref *ref,
+				  ext4_fsblk_t fblock)
 {
 	static const uint8_t zeros[256] = {0};
 	uint32_t block_size = ext4_sb_get_block_size(&ref->fs->sb);
-	uint64_t disk_offset = fblock * block_size + offset;
+	uint64_t disk_offset = fblock * block_size;
+	uint32_t length = block_size;
 
 	while (length) {
 		uint32_t chunk = length > sizeof(zeros) ? sizeof(zeros) : length;
@@ -1660,6 +1660,60 @@ static int ext4_zero_fblock_range(struct ext4_inode_ref *ref,
 	}
 
 	return EOK;
+}
+
+static int ext4_zero_fblock_range(struct ext4_inode_ref *ref,
+				  ext4_fsblk_t fblock, uint32_t offset,
+				  uint32_t length)
+{
+	struct ext4_block block = EXT4_BLOCK_ZERO();
+	int r;
+
+	r = ext4_trans_block_get(ref->fs->bdev, &block, fblock);
+	if (r != EOK)
+		return r;
+	memset(block.data + offset, 0, length);
+	ext4_trans_set_block_dirty(block.buf);
+	return ext4_block_set(ref->fs->bdev, &block);
+}
+
+static int ext4_write_fblock_range(struct ext4_inode_ref *ref,
+				   ext4_fsblk_t fblock, uint32_t offset,
+				   const uint8_t *buf, uint32_t length)
+{
+	uint32_t block_size = ext4_sb_get_block_size(&ref->fs->sb);
+	struct ext4_block block = EXT4_BLOCK_ZERO();
+	int r;
+
+	if (offset == 0 && length == block_size)
+		r = ext4_trans_block_get_noread(ref->fs->bdev, &block, fblock);
+	else
+		r = ext4_trans_block_get(ref->fs->bdev, &block, fblock);
+	if (r != EOK)
+		return r;
+	memcpy(block.data + offset, buf, length);
+	ext4_trans_set_block_dirty(block.buf);
+	return ext4_block_set(ref->fs->bdev, &block);
+}
+
+static int ext4_flush_fblock_range(struct ext4_blockdev *bdev,
+				   ext4_fsblk_t first, size_t count)
+{
+	for (size_t i = 0; i < count; i++) {
+		int r = ext4_block_flush_lba(bdev, first + i);
+		if (r != EOK)
+			return r;
+	}
+	return EOK;
+}
+
+static uint64_t ext4_file_max_size(const ext4_file *file)
+{
+	uint32_t block_size = ext4_sb_get_block_size(&file->mp->fs.sb);
+
+	/* EXT_MAX_BLOCKS is the extent walker's sentinel, not a usable logical
+	 * block number. */
+	return (uint64_t)EXT_MAX_BLOCKS * block_size;
 }
 
 static int ext4_zero_allocated_eof_tail(struct ext4_inode_ref *ref,
@@ -1696,6 +1750,9 @@ static int ext4_ftruncate_no_lock(ext4_file *file, uint64_t size)
 	bool write_back = false;
 	int r;
 	int cleanup_r;
+
+	if (size > ext4_file_max_size(file))
+		return EFBIG;
 
 	r = ext4_fs_get_inode_ref(&file->mp->fs, file->inode, &ref);
 	if (r != EOK)
@@ -1791,6 +1848,10 @@ int ext4_fread(ext4_file *file, void *buf, size_t size, size_t *rcnt)
 
 	/*Sync file size*/
 	file->fsize = ext4_inode_get_size(sb, ref.inode);
+	if (file->fsize > ext4_file_max_size(file)) {
+		r = EFBIG;
+		goto Finish;
+	}
 	if (file->fpos >= file->fsize) {
 		r = EOK;
 		goto Finish;
@@ -1836,6 +1897,9 @@ int ext4_fread(ext4_file *file, void *buf, size_t size, size_t *rcnt)
 			memset(u8_buf, 0, length);
 		} else {
 			uint64_t disk_offset = fblock * block_size + offset;
+			r = ext4_flush_fblock_range(file->mp->fs.bdev, fblock, 1);
+			if (r != EOK)
+				goto Finish;
 			r = ext4_block_readbytes(file->mp->fs.bdev, disk_offset,
 						 u8_buf, (uint32_t)length);
 			if (r != EOK)
@@ -1876,6 +1940,10 @@ int ext4_fread(ext4_file *file, void *buf, size_t size, size_t *rcnt)
 		if (!fblock) {
 			memset(u8_buf, 0, length);
 		} else {
+			r = ext4_flush_fblock_range(file->mp->fs.bdev, fblock,
+						    run_count);
+			if (r != EOK)
+				goto Finish;
 			r = ext4_blocks_get_direct(file->mp->fs.bdev, u8_buf,
 						   fblock, (uint32_t)run_count);
 			if (r != EOK)
@@ -1899,6 +1967,9 @@ int ext4_fread(ext4_file *file, void *buf, size_t size, size_t *rcnt)
 		if (!fblock) {
 			memset(u8_buf, 0, size);
 		} else {
+			r = ext4_flush_fblock_range(file->mp->fs.bdev, fblock, 1);
+			if (r != EOK)
+				goto Finish;
 			r = ext4_block_readbytes(file->mp->fs.bdev,
 						 fblock * block_size,
 						 u8_buf, (uint32_t)size);
@@ -1964,7 +2035,7 @@ int ext4_fwrite(ext4_file *file, const void *buf, size_t size, size_t *wcnt)
 	file->fsize = ext4_inode_get_size(sb, ref.inode);
 	block_size = ext4_sb_get_block_size(sb);
 
-	if ((write_end - 1) / block_size > UINT32_MAX) {
+	if (write_end > ext4_file_max_size(file)) {
 		r = EFBIG;
 		goto Finish;
 	}
@@ -1991,15 +2062,19 @@ int ext4_fwrite(ext4_file *file, const void *buf, size_t size, size_t *wcnt)
 							&fblock, &allocated);
 		if (r != EOK)
 			goto Finish;
-		if (allocated && (offset || length != block_size)) {
-			r = ext4_zero_fblock_range(&ref, fblock, 0, block_size);
-			if (r != EOK)
+		if (allocated) {
+			r = ext4_initialize_fblock(&ref, fblock);
+			if (r != EOK) {
+				cleanup_r = ext4_fs_release_inode_dblk_idx(
+				    &ref, iblock, fblock);
+				if (cleanup_r != EOK)
+					r = cleanup_r;
 				goto Finish;
+			}
 		}
 
-		r = ext4_block_writebytes(file->mp->fs.bdev,
-					  fblock * block_size + offset,
-					  u8_buf, (uint32_t)length);
+		r = ext4_write_fblock_range(&ref, fblock, offset, u8_buf,
+					    (uint32_t)length);
 		if (r != EOK)
 			goto Finish;
 
@@ -2036,23 +2111,36 @@ Finish:
 
 int ext4_fseek(ext4_file *file, int64_t offset, uint32_t origin)
 {
+	uint64_t max_size = ext4_file_max_size(file);
+
 	switch (origin) {
 	case SEEK_SET:
-		if (offset < 0)
+		if (offset < 0 || (uint64_t)offset > max_size)
 			return EINVAL;
 
 		file->fpos = offset;
 		return EOK;
-	case SEEK_CUR:
-		if ((offset < 0 && (uint64_t)(-offset) > file->fpos) ||
-		    (offset > 0 &&
-		     (uint64_t)offset > (file->fsize - file->fpos)))
-			return EINVAL;
+	case SEEK_CUR: {
+		uint64_t magnitude;
 
-		file->fpos += offset;
+		if (file->fpos > max_size)
+			return EINVAL;
+		if (offset < 0) {
+			magnitude = (uint64_t)(-(offset + 1)) + 1;
+			if (magnitude > file->fpos)
+				return EINVAL;
+			file->fpos -= magnitude;
+		} else {
+			magnitude = (uint64_t)offset;
+			if (magnitude > max_size - file->fpos)
+				return EINVAL;
+			file->fpos += magnitude;
+		}
 		return EOK;
+	}
 	case SEEK_END:
-		if (offset < 0 || (uint64_t)offset > file->fsize)
+		if (file->fsize > max_size || offset < 0 ||
+		    (uint64_t)offset > file->fsize)
 			return EINVAL;
 
 		file->fpos = file->fsize - offset;

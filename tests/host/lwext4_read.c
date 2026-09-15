@@ -24,6 +24,7 @@
 struct host_image {
 	int fd;
 	uint64_t size;
+	bool fail_next_initialization_io;
 };
 
 static int host_open(struct ext4_blockdev *bdev)
@@ -86,6 +87,10 @@ static int host_read(struct ext4_blockdev *bdev, void *buffer,
 		return rc;
 
 	image = bdev->bdif->p_user;
+	if (image->fail_next_initialization_io && count == 1) {
+		image->fail_next_initialization_io = false;
+		return EIO;
+	}
 	while (done < length) {
 		size_t remaining = length - done;
 		size_t chunk = remaining > (size_t)SSIZE_MAX ?
@@ -246,7 +251,160 @@ static int check_aligned_hole(void)
 	return failed;
 }
 
-static int check_sparse_behavior(void)
+static int check_sparse_address_limit(void)
+{
+	const uint64_t aliased_offset = UINT64_C(1) << 42;
+	const uint64_t max_offset = aliased_offset - 1024;
+	const uint64_t oversized = aliased_offset + 1024;
+	uint8_t byte = 0;
+	ext4_file file = {0};
+	size_t count = 0;
+	int truncate_rc;
+	int seek_rc;
+	int write_rc;
+	int seek_cur_rc;
+	int failed = 0;
+	int rc;
+
+	rc = ext4_fopen2(&file, "/sparse-limit", O_CREAT | O_RDWR | O_TRUNC);
+	if (rc != EOK)
+		return report_error("create sparse limit file", rc);
+	rc = ext4_fwrite(&file, "L", 1, &count);
+	if (rc != EOK || count != 1) {
+		failed = report_error("write sparse limit marker",
+				      rc != EOK ? rc : EIO);
+		goto close;
+	}
+
+	truncate_rc = ext4_ftruncate(&file, oversized);
+	seek_rc = ext4_fseek(&file, (int64_t)aliased_offset, SEEK_SET);
+	if (seek_rc == EOK) {
+		count = 0;
+		rc = ext4_fread(&file, &byte, 1, &count);
+		if (rc == EOK && count == 1 && byte == 'L')
+			fprintf(stderr,
+				"oversized sparse offset aliased logical block zero\n");
+	}
+	count = 0;
+	if (ext4_fseek(&file, (int64_t)max_offset, SEEK_SET) != EOK) {
+		write_rc = EIO;
+		seek_cur_rc = EIO;
+	} else {
+		write_rc = ext4_fwrite(&file, "X", 1, &count);
+		seek_cur_rc = ext4_fseek(&file, 1, SEEK_CUR);
+	}
+	if (truncate_rc != EFBIG || seek_rc != EINVAL ||
+	    write_rc != EFBIG || count != 0 || seek_cur_rc != EINVAL ||
+	    ext4_fsize(&file) != 1) {
+		fprintf(stderr,
+			"sparse address limit mismatch: truncate=%d seek=%d write=%d count=%zu seek_cur=%d size=%" PRIu64 "\n",
+			truncate_rc, seek_rc, write_rc, count, seek_cur_rc,
+			ext4_fsize(&file));
+		failed = 1;
+	}
+
+close:
+	/* Restore a small position/size even when the regression is present so
+	 * the RED run can still unmount and check the image. */
+	(void)ext4_fseek(&file, 0, SEEK_SET);
+	(void)ext4_ftruncate(&file, 1);
+	rc = ext4_fclose(&file);
+	if (rc != EOK) {
+		report_error("close sparse limit file", rc);
+		failed = 1;
+	}
+	return failed;
+}
+
+static int check_failed_block_initialization(struct host_image *image)
+{
+	struct ext4_inode inode;
+	ext4_file file = {0};
+	size_t count = 0;
+	int failed = 0;
+	int rc;
+
+	rc = ext4_fopen2(&file, "/failed-initialization",
+			 O_CREAT | O_RDWR | O_TRUNC);
+	if (rc != EOK)
+		return report_error("create failed-initialization file", rc);
+	if (ext4_fseek(&file, 73, SEEK_SET) != EOK) {
+		failed = report_error("seek failed-initialization file", EIO);
+		goto close;
+	}
+
+	image->fail_next_initialization_io = true;
+	rc = ext4_fwrite(&file, "X", 1, &count);
+	if (rc != EIO || count != 0 || ext4_fsize(&file) != 0) {
+		fprintf(stderr,
+			"initialization failure result mismatch: rc=%d count=%zu size=%" PRIu64 "\n",
+			rc, count, ext4_fsize(&file));
+		failed = 1;
+	}
+	rc = ext4_fraw_inode_fill(&file, &inode);
+	if (rc != EOK || to_le32(inode.blocks_count_lo) != 0) {
+		fprintf(stderr,
+			"initialization failure left an allocated mapping: rc=%d blocks=%" PRIu32 "\n",
+			rc, to_le32(inode.blocks_count_lo));
+		failed = 1;
+	}
+
+close:
+	image->fail_next_initialization_io = false;
+	rc = ext4_fclose(&file);
+	if (rc != EOK) {
+		report_error("close failed-initialization file", rc);
+		failed = 1;
+	}
+	return failed;
+}
+
+static int check_preexisting_unwritten_extent(void)
+{
+	static const uint8_t marker[] = "LIVE";
+	uint8_t block[1024];
+	ext4_file file = {0};
+	size_t count = 0;
+	int failed = 0;
+	int rc;
+
+	rc = ext4_fopen2(&file, "/unwritten-partial", O_RDWR);
+	if (rc != EOK)
+		return report_error("open unwritten extent", rc);
+	if (ext4_fsize(&file) != sizeof(block) ||
+	    ext4_fseek(&file, 17, SEEK_SET) != EOK) {
+		failed = report_error("prepare unwritten extent", EIO);
+		goto close;
+	}
+	rc = ext4_fwrite(&file, marker, sizeof(marker) - 1, &count);
+	if (rc != EOK || count != sizeof(marker) - 1 ||
+	    ext4_fseek(&file, 0, SEEK_SET) != EOK) {
+		failed = report_error("write unwritten extent marker",
+				      rc != EOK ? rc : EIO);
+		goto close;
+	}
+	memset(block, 0xa5, sizeof(block));
+	rc = ext4_fread(&file, block, sizeof(block), &count);
+	if (rc != EOK || count != sizeof(block) ||
+	    !all_zero(block, 17) ||
+	    memcmp(block + 17, marker, sizeof(marker) - 1) != 0 ||
+	    !all_zero(block + 17 + sizeof(marker) - 1,
+		      sizeof(block) - 17 - (sizeof(marker) - 1))) {
+		fprintf(stderr,
+			"partial write into unwritten extent did not persist\n");
+		failed = 1;
+	}
+
+close:
+	rc = ext4_fclose(&file);
+	if (rc != EOK) {
+		report_error("close unwritten extent", rc);
+		failed = 1;
+	}
+	return failed;
+}
+
+static int check_sparse_behavior(struct host_image *image)
 {
 	static const uint8_t marker[] = "BOAR";
 	const uint64_t sparse_offset = 8192 + 17;
@@ -256,6 +414,12 @@ static int check_sparse_behavior(void)
 	size_t count = 0;
 	int failed = 0;
 	int rc;
+
+	failed = check_sparse_address_limit();
+	if (check_failed_block_initialization(image) != 0)
+		failed = 1;
+	if (check_preexisting_unwritten_extent() != 0)
+		failed = 1;
 
 	rc = ext4_fopen2(&file, "/sparse-write", O_CREAT | O_RDWR | O_TRUNC);
 	if (rc != EOK)
@@ -434,7 +598,7 @@ int main(int argc, char **argv)
 	mounted = true;
 
 	if (sparse_mode)
-		failed = check_sparse_behavior();
+		failed = check_sparse_behavior(&image);
 	else if (aligned_hole_mode)
 		failed = check_aligned_hole();
 	else

@@ -1696,6 +1696,31 @@ int ext4_fs_get_or_alloc_inode_dblk_idx(struct ext4_inode_ref *inode_ref,
 	return EOK;
 }
 
+int ext4_fs_release_inode_dblk_idx(struct ext4_inode_ref *inode_ref,
+				   ext4_lblk_t iblock,
+				   ext4_fsblk_t fblock)
+{
+	struct ext4_fs *fs = inode_ref->fs;
+
+	if (!fblock)
+		return EINVAL;
+
+#if CONFIG_EXTENT_ENABLE && CONFIG_EXTENTS_ENABLE
+	if (ext4_sb_feature_incom(&fs->sb, EXT4_FINCOM_EXTENTS) &&
+	    ext4_inode_has_flag(inode_ref->inode, EXT4_INODE_FLAG_EXTENTS)) {
+		ext4_fsblk_t current;
+		int rc = ext4_extent_get_blocks(inode_ref, iblock, 1,
+					       &current, false, NULL);
+		if (rc != EOK)
+			return rc;
+		if (current != fblock)
+			return EIO;
+		return ext4_extent_remove_space(inode_ref, iblock, iblock);
+	}
+#endif
+
+	return ext4_fs_release_inode_block(inode_ref, iblock);
+}
 
 int ext4_fs_append_inode_dblk(struct ext4_inode_ref *inode_ref,
 			      ext4_fsblk_t *fblock, ext4_lblk_t *iblock)

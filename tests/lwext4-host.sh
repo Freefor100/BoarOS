@@ -96,6 +96,12 @@ debugfs -w -R "write $empty_fixture /aligned-hole" "$sparse_image" \
 	>/dev/null 2>&1
 debugfs -w -R "set_inode_field /aligned-hole size 1024" "$sparse_image" \
 	>/dev/null 2>&1
+debugfs -w -R "write $empty_fixture /unwritten-partial" "$sparse_image" \
+	>/dev/null 2>&1
+debugfs -w -R "fallocate /unwritten-partial 0 0" "$sparse_image" \
+	>/dev/null 2>&1
+debugfs -w -R "set_inode_field /unwritten-partial size 1024" "$sparse_image" \
+	>/dev/null 2>&1
 
 sparse_status=0
 "$work_dir/lwext4-read" "$sparse_image" --aligned-hole || sparse_status=1
