@@ -29,7 +29,7 @@ miss 路径先分配并清零页，再通过 node 的无 offset 副作用 `pread
 内核编译 lwext4 读写路径需要的源码，关闭 journaling、xattr、debug/assert 和 mkfs，并把 malloc/calloc/realloc/free 绑定到当前内核堆。根设备是 raw whole-disk ext4，物理块大小固定为 512 字节；当前不解析分区表。
 
 挂载后额外检查 superblock `needs_recovery` incompat feature。发现该位返回 `-EUCLEAN` 并完整撤销挂载。
-普通文件打开走 `ext4_fopen`，新建走 `ext4_fopen2`（`kernel_vfs_create`），目录打开走专有的 `ext4_dir_open_file` 直接绑定 `node->file`，免去在内核任务栈上分配 304 字节的完整 `ext4_dir` 结构。
+普通文件打开走 `ext4_fopen`，新建走 `ext4_fopen2`（`kernel_vfs_create`），目录打开走专有的 `ext4_dir_open_file` 直接绑定 `node->file`，免去在内核任务栈上分配 312 字节的完整 `ext4_dir` 结构。
 普通文件随机写入通过 `kernel_vfs_pwrite`（`ext4_fseek` + `ext4_fwrite`）执行，追加写入通过 `kernel_vfs_append` 在底层原子解析当前 EOF 并写入，确保 `O_APPEND` 的原子推进。lwext4 的 `SEEK_SET` 允许定位到 EOF 之后而不改变 inode size；后续写入只为调用者数据相交的逻辑块分配物理块，新分配的部分写块先清零，已分配的旧 EOF 尾部在扩大 size 前清零，完整中间 hole 保持未映射。读取未映射逻辑块时直接向调用者缓冲写零，绝不把物理块号 0 当作数据块读取。
 
 截断统一通过 sparse-capable `ext4_ftruncate` 执行：缩小仍释放尾部块，扩大只清零已分配的旧 EOF 块尾并发布新 inode size，不为完整逻辑 gap 分配块，且不改变调用 OFD offset。文件打开时按实际 inode mapping 缓存可寻址 size 上限：extent inode 使用 `EXT_MAX_BLOCKS * block_size`，legacy block-map inode 使用 `fs->inode_block_limits[3] * block_size`。truncate/write 超界返回 `EFBIG`，seek 超界返回 `EINVAL`，在任何尾部清零、64-bit offset 缩窄为 `ext4_lblk_t` 或 inode size 更新前拒绝。lwext4 在写入或截断所有可能改变状态的返回路径上，让 handle 的 `fsize` 保持为当前 inode 中可知的最新 size；VFS 成功后同步 node/file size。错误后的 VFS size reconciliation 与 partial-write syscall 报告由后续错误路径工作补齐。
@@ -41,7 +41,7 @@ miss 路径先分配并清零页，再通过 node 的无 offset 副作用 `pread
 - `kernel_vfs_unlink` 在需要时先从挂载的 orphan 记录池预留一个回收记录，再调用 `ext4_funlink_dentry` 从父目录中立即移除目标目录项；后续对原路径的 `open` 立即返回 `-ENOENT`，并在同名路径重新创建时分配独立全新 inode。没有现存 node 的文件也使用这份预留记录，因而 orphan 回收失败时由 mount 单独持有。
 - 若目标文件当前仍处于打开状态（`node->open_files > 0`），VFS 标记 `node->unlinked = 1`，旧 open 描述符（包括只读/读写 OFD 以及正在运行的源映射 ELF 可执行文件）保留底层 inode 数据与有效物理块，继续正常执行 `read/write/fstat` 与缺页加载（demand fault）；
 - 只有当最后一个打开描述符与执行租约释放（`node->open_files == 0 && node->exec_users == 0`）时，VFS 才通过专有的 `kernel_vfs_try_release_orphan` 驱动物理存储释放。该过程先持有临时节点引用并安全使页缓存失效，再在扁平调用栈上调用 `ext4_orphan_free` 截断释放底层 inode，最后标记 `node->orphan_freed = 1`。通用的 `kernel_vfs_node_release` 仅负责内存节点对象的生命周期，绝不隐式或嵌套调用 `ext4_orphan_free`，从根源消除双重释放与页缓存深度嵌套破坏 4 KiB 任务栈的风险；若底层释放失败，节点转移至 `adapter->cleanup_nodes`，由 mount 保留唯一重试 owner，绝不重新指向 file。若文件在 unlink 时没有现存 node，则使用预留记录直接调用 orphan free；失败后记录留在 mount 链，路径仍保持已删除。
-由于 lwext4 的 `ext4_dir_rm` 会递归删除非空目录，`kernel_vfs_rmdir` 将目录判空逻辑隔离在独立辅助函数 `check_directory_empty` 中（遍历目录项跳过 `.` 和 `..`，存在子条目返回 `-ENOTEMPTY`），使 304 字节的 `ext4_dir` 栈帧在调用 `ext4_dir_rm` 之前及时退栈，保证深层递归删除时调用栈扁平受控。
+由于 lwext4 的 `ext4_dir_rm` 会递归删除非空目录，`kernel_vfs_rmdir` 将目录判空逻辑隔离在独立辅助函数 `check_directory_empty` 中（遍历目录项跳过 `.` 和 `..`，存在子条目返回 `-ENOTEMPTY`），使 312 字节的 `ext4_dir` 栈帧在调用 `ext4_dir_rm` 之前及时退栈，保证深层递归删除时调用栈扁平受控。
 只读挂载下，所有上述修改操作直接返回 `-EROFS`。
 unmount 在仍有 open file 时返回 `-EBUSY`。close/unmount 的真实 ext4/block I/O 释放失败保留 CLEANUP 状态，mount 或所属文件表可重试而不会重复关闭；合法 heap/page 释放不返回可重试状态。
 
