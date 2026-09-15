@@ -1640,6 +1640,62 @@ static int ext4_fs_set_inode_data_block_index(struct ext4_inode_ref *inode_ref,
 	return EOK;
 }
 
+int ext4_fs_get_or_alloc_inode_dblk_idx(struct ext4_inode_ref *inode_ref,
+					ext4_lblk_t iblock,
+					ext4_fsblk_t *fblock,
+					bool *allocated)
+{
+	struct ext4_fs *fs = inode_ref->fs;
+	int rc;
+
+	if (!fblock || !allocated)
+		return EINVAL;
+
+	*allocated = false;
+	*fblock = 0;
+
+#if CONFIG_EXTENT_ENABLE && CONFIG_EXTENTS_ENABLE
+	if (ext4_sb_feature_incom(&fs->sb, EXT4_FINCOM_EXTENTS) &&
+	    ext4_inode_has_flag(inode_ref->inode, EXT4_INODE_FLAG_EXTENTS)) {
+		uint32_t existing_count = 0;
+
+		rc = ext4_extent_get_blocks(inode_ref, iblock, 1, fblock,
+					    false, &existing_count);
+		if (rc != EOK || *fblock)
+			return rc;
+
+		rc = ext4_extent_get_blocks(inode_ref, iblock, 1, fblock,
+					    true, NULL);
+		if (rc == EOK)
+			*allocated = existing_count == 0;
+		return rc;
+	}
+#endif
+
+	rc = ext4_fs_get_inode_dblk_idx(inode_ref, iblock, fblock, true);
+	if (rc != EOK || *fblock)
+		return rc;
+
+	ext4_fsblk_t goal;
+	rc = ext4_fs_indirect_find_goal(inode_ref, &goal);
+	if (rc != EOK)
+		return rc;
+
+	rc = ext4_balloc_alloc_block(inode_ref, goal, fblock);
+	if (rc != EOK)
+		return rc;
+
+	rc = ext4_fs_set_inode_data_block_index(inode_ref, iblock, *fblock);
+	if (rc != EOK) {
+		int free_rc = ext4_balloc_free_block(inode_ref, *fblock);
+		*fblock = 0;
+		return free_rc != EOK ? free_rc : rc;
+	}
+
+	*allocated = true;
+	return EOK;
+}
+
 
 int ext4_fs_append_inode_dblk(struct ext4_inode_ref *inode_ref,
 			      ext4_fsblk_t *fblock, ext4_lblk_t *iblock)

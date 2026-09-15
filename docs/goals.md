@@ -37,7 +37,7 @@ Linux ABI 兼容是最终功能方向，不是对当前完成度的声明；READ
 
 - 先建立 differential ABI harness MVP：同一 raw-syscall 文件生命周期 case 分别运行于带版本信息的 Linux reference 与 BoarOS RISC-V，normalize 后自动 diff，mismatch 返回非零；目标入口为 `make test-diff-abi-riscv`。之后再分 OFD/open/stat、poll/epoll、signal/futex/time、mmap/truncate case pack 扩展，不在 C 源码硬编码 reference 输出。
 - 用 differential 证据决定 open/openat 对任意 unknown flag bits 的兼容策略；固定 Linux 会忽略一部分未知 bit，不能把“一律拒绝”直接写成 ABI 要求。
-- ext4 timestamp mutation 与 sparse ftruncate 分成独立目标：前者定义 create/read/write/truncate/unlink 的 atime/mtime/ctime 更新，后者用 inode-size/hole 能力替换逐段写零增长，并以真实 `st_blocks` 验证未分配中间块。
+- ext4 timestamp mutation 仍是独立目标，需要定义 create/read/write/truncate/unlink 的 atime/mtime/ctime 更新。sparse ftruncate 与越过 EOF 写入已经用 inode-size/hole 能力替换逐段写零增长，并由真实 `st_blocks`、aligned/unaligned zero read 和卸载后 `e2fsck` 验证。
 - 真实 userspace 按 musl libc-test failure inventory、BusyBox、pthread stress、SQLite、Git 推进。每轮按 failure cluster、最小复现、Linux differential、kernel primitive regression、重跑 workload 闭环；SQLite 的验收包含事务、journal、并发 reader/writer、重开和 integrity_check。
 - task metadata 与 kernel stack 分离为 SMP 前置目标，迁移现有 canary 并增加 high-water 和 frame/stack usage 检查，栈大小依据测量决定。SMP 只在 differential ABI、真实 userspace、task/stack 分离及同步协议准备完成后开始；multi-hart boot 只是第一个检查点。
 

@@ -1641,48 +1641,99 @@ int ext4_fclose(ext4_file *file)
 	return EOK;
 }
 
+static int ext4_zero_fblock_range(struct ext4_inode_ref *ref,
+				  ext4_fsblk_t fblock, uint32_t offset,
+				  uint32_t length)
+{
+	static const uint8_t zeros[256] = {0};
+	uint32_t block_size = ext4_sb_get_block_size(&ref->fs->sb);
+	uint64_t disk_offset = fblock * block_size + offset;
+
+	while (length) {
+		uint32_t chunk = length > sizeof(zeros) ? sizeof(zeros) : length;
+		int r = ext4_block_writebytes(ref->fs->bdev, disk_offset,
+					    zeros, chunk);
+		if (r != EOK)
+			return r;
+		disk_offset += chunk;
+		length -= chunk;
+	}
+
+	return EOK;
+}
+
+static int ext4_zero_allocated_eof_tail(struct ext4_inode_ref *ref,
+					uint64_t old_size,
+					uint64_t visible_end)
+{
+	uint32_t block_size = ext4_sb_get_block_size(&ref->fs->sb);
+	uint32_t offset = (uint32_t)(old_size % block_size);
+	ext4_fsblk_t fblock;
+	uint64_t block_end;
+	uint32_t length;
+	int r;
+
+	if (!offset || visible_end <= old_size)
+		return EOK;
+
+	block_end = old_size - offset + block_size;
+	if (visible_end < block_end)
+		block_end = visible_end;
+	length = (uint32_t)(block_end - old_size);
+	r = ext4_fs_get_inode_dblk_idx(ref,
+			(ext4_lblk_t)(old_size / block_size), &fblock, true);
+	if (r != EOK || !fblock)
+		return r;
+
+	return ext4_zero_fblock_range(ref, fblock, offset, length);
+}
+
 static int ext4_ftruncate_no_lock(ext4_file *file, uint64_t size)
 {
 	struct ext4_inode_ref ref;
+	struct ext4_sblock *sb = &file->mp->fs.sb;
+	uint64_t old_size;
+	bool write_back = false;
 	int r;
-
+	int cleanup_r;
 
 	r = ext4_fs_get_inode_ref(&file->mp->fs, file->inode, &ref);
-	if (r != EOK) {
-		EXT4_MP_UNLOCK(file->mp);
+	if (r != EOK)
 		return r;
-	}
 
-	/*Sync file size*/
-	file->fsize = ext4_inode_get_size(&file->mp->fs.sb, ref.inode);
-	if (file->fsize <= size) {
-		r = EOK;
+	old_size = ext4_inode_get_size(sb, ref.inode);
+	file->fsize = old_size;
+	if (old_size == size)
 		goto Finish;
-	}
 
-	/*Start write back cache mode.*/
 	r = ext4_block_cache_write_back(file->mp->fs.bdev, 1);
 	if (r != EOK)
 		goto Finish;
+	write_back = true;
 
-	r = ext4_trunc_inode(file->mp, ref.index, size);
-	if (r != EOK)
-		goto Finish;
-
-	file->fsize = size;
-	if (file->fpos > size)
-		file->fpos = size;
-
-	/*Stop write back cache mode*/
-	ext4_block_cache_write_back(file->mp->fs.bdev, 0);
-
-	if (r != EOK)
-		goto Finish;
+	if (old_size < size) {
+		r = ext4_zero_allocated_eof_tail(&ref, old_size, size);
+		if (r == EOK) {
+			ext4_inode_set_size(ref.inode, size);
+			ref.dirty = true;
+		}
+	} else {
+		r = ext4_trunc_inode(file->mp, ref.index, size);
+		if (r == EOK && file->fpos > size)
+			file->fpos = size;
+	}
 
 Finish:
-	ext4_fs_put_inode_ref(&ref);
+	file->fsize = ext4_inode_get_size(sb, ref.inode);
+	if (write_back) {
+		cleanup_r = ext4_block_cache_write_back(file->mp->fs.bdev, 0);
+		if (r == EOK)
+			r = cleanup_r;
+	}
+	cleanup_r = ext4_fs_put_inode_ref(&ref);
+	if (r == EOK)
+		r = cleanup_r;
 	return r;
-
 }
 
 int ext4_ftruncate(ext4_file *f, uint64_t size)
@@ -1711,15 +1762,7 @@ int ext4_ftruncate(ext4_file *f, uint64_t size)
 
 int ext4_fread(ext4_file *file, void *buf, size_t size, size_t *rcnt)
 {
-	uint32_t unalg;
-	uint32_t iblock_idx;
-	uint32_t iblock_last;
 	uint32_t block_size;
-
-	ext4_fsblk_t fblock;
-	ext4_fsblk_t fblock_start;
-	uint32_t fblock_count;
-
 	uint8_t *u8_buf = buf;
 	int r;
 	struct ext4_inode_ref ref;
@@ -1748,14 +1791,14 @@ int ext4_fread(ext4_file *file, void *buf, size_t size, size_t *rcnt)
 
 	/*Sync file size*/
 	file->fsize = ext4_inode_get_size(sb, ref.inode);
+	if (file->fpos >= file->fsize) {
+		r = EOK;
+		goto Finish;
+	}
 
 	block_size = ext4_sb_get_block_size(sb);
 	size = ((uint64_t)size > (file->fsize - file->fpos))
 		? ((size_t)(file->fsize - file->fpos)) : size;
-
-	iblock_idx = (uint32_t)((file->fpos) / block_size);
-	iblock_last = (uint32_t)((file->fpos + size) / block_size);
-	unalg = (file->fpos) % block_size;
 
 	/*If the size of symlink is smaller than 60 bytes*/
 	bool softlink;
@@ -1766,9 +1809,8 @@ int ext4_fread(ext4_file *file, void *buf, size_t size, size_t *rcnt)
 		char *content = (char *)ref.inode->blocks;
 		if (file->fpos < file->fsize) {
 			size_t len = size;
-			if (unalg + size > (uint32_t)file->fsize)
-				len = (uint32_t)file->fsize - unalg;
-			memcpy(buf, content + unalg, len);
+			memcpy(buf, content + file->fpos, len);
+			file->fpos += len;
 			if (rcnt)
 				*rcnt = len;
 
@@ -1778,111 +1820,115 @@ int ext4_fread(ext4_file *file, void *buf, size_t size, size_t *rcnt)
 		goto Finish;
 	}
 
-	if (unalg) {
-		size_t len =  size;
-		if (size > (block_size - unalg))
-			len = block_size - unalg;
+	while (size && file->fpos % block_size) {
+		uint32_t offset = (uint32_t)(file->fpos % block_size);
+		ext4_lblk_t iblock = (ext4_lblk_t)(file->fpos / block_size);
+		size_t length = block_size - offset;
+		ext4_fsblk_t fblock;
 
-		r = ext4_fs_get_inode_dblk_idx(&ref, iblock_idx, &fblock, true);
+		if (length > size)
+			length = size;
+		r = ext4_fs_get_inode_dblk_idx(&ref, iblock, &fblock, true);
 		if (r != EOK)
 			goto Finish;
 
-		/* Do we get an unwritten range? */
-		if (fblock != 0) {
-			uint64_t off = fblock * block_size + unalg;
-			r = ext4_block_readbytes(file->mp->fs.bdev, off, u8_buf, len);
+		if (!fblock) {
+			memset(u8_buf, 0, length);
+		} else {
+			uint64_t disk_offset = fblock * block_size + offset;
+			r = ext4_block_readbytes(file->mp->fs.bdev, disk_offset,
+						 u8_buf, (uint32_t)length);
 			if (r != EOK)
 				goto Finish;
-
-		} else {
-			/* Yes, we do. */
-			memset(u8_buf, 0, len);
 		}
 
-		u8_buf += len;
-		size -= len;
-		file->fpos += len;
-
+		u8_buf += length;
+		size -= length;
+		file->fpos += length;
 		if (rcnt)
-			*rcnt += len;
-
-		iblock_idx++;
+			*rcnt += length;
 	}
 
-	fblock_start = 0;
-	fblock_count = 0;
 	while (size >= block_size) {
-		while (iblock_idx < iblock_last) {
-			r = ext4_fs_get_inode_dblk_idx(&ref, iblock_idx,
-						       &fblock, true);
-			if (r != EOK)
-				goto Finish;
+		ext4_lblk_t iblock = (ext4_lblk_t)(file->fpos / block_size);
+		size_t block_count = size / block_size;
+		size_t run_count = 1;
+		ext4_fsblk_t fblock;
 
-			iblock_idx++;
-
-			if (!fblock_start)
-				fblock_start = fblock;
-
-			if ((fblock_start + fblock_count) != fblock)
-				break;
-
-			fblock_count++;
-		}
-
-		r = ext4_blocks_get_direct(file->mp->fs.bdev, u8_buf, fblock_start,
-					   fblock_count);
+		r = ext4_fs_get_inode_dblk_idx(&ref, iblock, &fblock, true);
 		if (r != EOK)
 			goto Finish;
+		while (run_count < block_count) {
+			ext4_fsblk_t next;
 
-		size -= block_size * fblock_count;
-		u8_buf += block_size * fblock_count;
-		file->fpos += block_size * fblock_count;
+			r = ext4_fs_get_inode_dblk_idx(&ref,
+							iblock + (ext4_lblk_t)run_count,
+							&next, true);
+			if (r != EOK)
+				goto Finish;
+			if ((!fblock && next) ||
+			    (fblock && next != fblock + run_count))
+				break;
+			run_count++;
+		}
 
+		size_t length = run_count * block_size;
+		if (!fblock) {
+			memset(u8_buf, 0, length);
+		} else {
+			r = ext4_blocks_get_direct(file->mp->fs.bdev, u8_buf,
+						   fblock, (uint32_t)run_count);
+			if (r != EOK)
+				goto Finish;
+		}
+
+		u8_buf += length;
+		size -= length;
+		file->fpos += length;
 		if (rcnt)
-			*rcnt += block_size * fblock_count;
-
-		fblock_start = fblock;
-		fblock_count = 1;
+			*rcnt += length;
 	}
 
 	if (size) {
-		uint64_t off;
-		r = ext4_fs_get_inode_dblk_idx(&ref, iblock_idx, &fblock, true);
+		ext4_lblk_t iblock = (ext4_lblk_t)(file->fpos / block_size);
+		ext4_fsblk_t fblock;
+
+		r = ext4_fs_get_inode_dblk_idx(&ref, iblock, &fblock, true);
 		if (r != EOK)
 			goto Finish;
-
-		off = fblock * block_size;
-		r = ext4_block_readbytes(file->mp->fs.bdev, off, u8_buf, size);
-		if (r != EOK)
-			goto Finish;
-
+		if (!fblock) {
+			memset(u8_buf, 0, size);
+		} else {
+			r = ext4_block_readbytes(file->mp->fs.bdev,
+						 fblock * block_size,
+						 u8_buf, (uint32_t)size);
+			if (r != EOK)
+				goto Finish;
+		}
 		file->fpos += size;
-
 		if (rcnt)
 			*rcnt += size;
 	}
 
 Finish:
-	ext4_fs_put_inode_ref(&ref);
+	{
+		int cleanup_r = ext4_fs_put_inode_ref(&ref);
+		if (r == EOK)
+			r = cleanup_r;
+	}
 	EXT4_MP_UNLOCK(file->mp);
 	return r;
 }
 
 int ext4_fwrite(ext4_file *file, const void *buf, size_t size, size_t *wcnt)
 {
-	uint32_t unalg;
-	uint32_t iblk_idx;
-	uint32_t iblock_last;
-	uint32_t ifile_blocks;
 	uint32_t block_size;
-
-	uint32_t fblock_count;
-	ext4_fsblk_t fblk;
-	ext4_fsblk_t fblock_start;
-
 	struct ext4_inode_ref ref;
 	const uint8_t *u8_buf = buf;
-	int r, rr = EOK;
+	uint64_t write_end;
+	bool write_back = false;
+	int r;
+	int cleanup_r;
 
 	ext4_assert(file && file->mp);
 
@@ -1894,6 +1940,9 @@ int ext4_fwrite(ext4_file *file, const void *buf, size_t size, size_t *wcnt)
 
 	if (!size)
 		return EOK;
+	if (file->fpos > UINT64_MAX - size)
+		return EFBIG;
+	write_end = file->fpos + size;
 
 	EXT4_MP_LOCK(file->mp);
 	ext4_trans_start(file->mp);
@@ -1915,138 +1964,66 @@ int ext4_fwrite(ext4_file *file, const void *buf, size_t size, size_t *wcnt)
 	file->fsize = ext4_inode_get_size(sb, ref.inode);
 	block_size = ext4_sb_get_block_size(sb);
 
-	iblock_last = (uint32_t)((file->fpos + size) / block_size);
-	iblk_idx = (uint32_t)(file->fpos / block_size);
-	ifile_blocks = (uint32_t)((file->fsize + block_size - 1) / block_size);
-
-	unalg = (file->fpos) % block_size;
-
-	if (unalg) {
-		size_t len =  size;
-		uint64_t off;
-		if (size > (block_size - unalg))
-			len = block_size - unalg;
-
-		r = ext4_fs_init_inode_dblk_idx(&ref, iblk_idx, &fblk);
-		if (r != EOK)
-			goto Finish;
-
-		off = fblk * block_size + unalg;
-		r = ext4_block_writebytes(file->mp->fs.bdev, off, u8_buf, len);
-		if (r != EOK)
-			goto Finish;
-
-		u8_buf += len;
-		size -= len;
-		file->fpos += len;
-
-		if (wcnt)
-			*wcnt += len;
-
-		iblk_idx++;
+	if ((write_end - 1) / block_size > UINT32_MAX) {
+		r = EFBIG;
+		goto Finish;
 	}
 
-	/*Start write back cache mode.*/
 	r = ext4_block_cache_write_back(file->mp->fs.bdev, 1);
 	if (r != EOK)
 		goto Finish;
+	write_back = true;
 
-	fblock_start = 0;
-	fblock_count = 0;
-	while (size >= block_size) {
-
-		while (iblk_idx < iblock_last) {
-			if (iblk_idx < ifile_blocks) {
-				r = ext4_fs_init_inode_dblk_idx(&ref, iblk_idx,
-								&fblk);
-				if (r != EOK)
-					goto Finish;
-			} else {
-				rr = ext4_fs_append_inode_dblk(&ref, &fblk,
-							       &iblk_idx);
-				if (rr != EOK) {
-					/* Unable to append more blocks. But
-					 * some block might be allocated already
-					 * */
-					break;
-				}
-			}
-
-			iblk_idx++;
-
-			if (!fblock_start) {
-				fblock_start = fblk;
-			}
-
-			if ((fblock_start + fblock_count) != fblk)
-				break;
-
-			fblock_count++;
-		}
-
-		r = ext4_blocks_set_direct(file->mp->fs.bdev, u8_buf, fblock_start,
-					   fblock_count);
-		if (r != EOK)
-			break;
-
-		size -= block_size * fblock_count;
-		u8_buf += block_size * fblock_count;
-		file->fpos += block_size * fblock_count;
-
-		if (wcnt)
-			*wcnt += block_size * fblock_count;
-
-		fblock_start = fblk;
-		fblock_count = 1;
-
-		if (rr != EOK) {
-			/*ext4_fs_append_inode_block has failed and no
-			 * more blocks might be written. But node size
-			 * should be updated.*/
-			r = rr;
-			goto out_fsize;
-		}
-	}
-
-	/*Stop write back cache mode*/
-	ext4_block_cache_write_back(file->mp->fs.bdev, 0);
-
+	r = ext4_zero_allocated_eof_tail(&ref, file->fsize, write_end);
 	if (r != EOK)
 		goto Finish;
 
-	if (size) {
-		uint64_t off;
-		if (iblk_idx < ifile_blocks) {
-			r = ext4_fs_init_inode_dblk_idx(&ref, iblk_idx, &fblk);
+	while (size) {
+		uint32_t offset = (uint32_t)(file->fpos % block_size);
+		ext4_lblk_t iblock = (ext4_lblk_t)(file->fpos / block_size);
+		size_t length = block_size - offset;
+		ext4_fsblk_t fblock;
+		bool allocated;
+
+		if (length > size)
+			length = size;
+		r = ext4_fs_get_or_alloc_inode_dblk_idx(&ref, iblock,
+							&fblock, &allocated);
+		if (r != EOK)
+			goto Finish;
+		if (allocated && (offset || length != block_size)) {
+			r = ext4_zero_fblock_range(&ref, fblock, 0, block_size);
 			if (r != EOK)
 				goto Finish;
-		} else {
-			r = ext4_fs_append_inode_dblk(&ref, &fblk, &iblk_idx);
-			if (r != EOK)
-				/*Node size sholud be updated.*/
-				goto out_fsize;
 		}
 
-		off = fblk * block_size;
-		r = ext4_block_writebytes(file->mp->fs.bdev, off, u8_buf, size);
+		r = ext4_block_writebytes(file->mp->fs.bdev,
+					  fblock * block_size + offset,
+					  u8_buf, (uint32_t)length);
 		if (r != EOK)
 			goto Finish;
 
-		file->fpos += size;
-
+		u8_buf += length;
+		size -= length;
+		file->fpos += length;
 		if (wcnt)
-			*wcnt += size;
-	}
-
-out_fsize:
-	if (file->fpos > file->fsize) {
-		file->fsize = file->fpos;
-		ext4_inode_set_size(ref.inode, file->fsize);
-		ref.dirty = true;
+			*wcnt += length;
+		if (file->fpos > ext4_inode_get_size(sb, ref.inode)) {
+			ext4_inode_set_size(ref.inode, file->fpos);
+			ref.dirty = true;
+		}
 	}
 
 Finish:
-	r = ext4_fs_put_inode_ref(&ref);
+	file->fsize = ext4_inode_get_size(sb, ref.inode);
+	if (write_back) {
+		cleanup_r = ext4_block_cache_write_back(file->mp->fs.bdev, 0);
+		if (r == EOK)
+			r = cleanup_r;
+	}
+	cleanup_r = ext4_fs_put_inode_ref(&ref);
+	if (r == EOK)
+		r = cleanup_r;
 
 	if (r != EOK)
 		ext4_trans_abort(file->mp);
@@ -2061,7 +2038,7 @@ int ext4_fseek(ext4_file *file, int64_t offset, uint32_t origin)
 {
 	switch (origin) {
 	case SEEK_SET:
-		if (offset < 0 || (uint64_t)offset > file->fsize)
+		if (offset < 0)
 			return EINVAL;
 
 		file->fpos = offset;

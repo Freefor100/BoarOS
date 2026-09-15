@@ -6,13 +6,15 @@ project_root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 work_dir=$(mktemp -d)
 image="$work_dir/root.img"
 uuid_seeded_image="$work_dir/uuid-seeded.img"
+sparse_image="$work_dir/sparse.img"
 fixture="$work_dir/fixture"
+empty_fixture="$work_dir/empty"
 expected='BoarOS lwext4 modern image probe'
 host_cc=${HOST_CC:-cc}
 
 trap 'rm -rf "$work_dir"' EXIT HUP INT TERM
 
-for tool in "$host_cc" truncate mkfs.ext4 debugfs dumpe2fs; do
+for tool in "$host_cc" truncate mkfs.ext4 debugfs dumpe2fs e2fsck dd; do
 	if ! command -v "$tool" >/dev/null 2>&1; then
 		echo "missing lwext4 host-test tool: $tool" >&2
 		exit 1
@@ -20,8 +22,9 @@ for tool in "$host_cc" truncate mkfs.ext4 debugfs dumpe2fs; do
 done
 
 printf '%s' "$expected" >"$fixture"
+printf '' >"$empty_fixture"
 truncate -s 128M "$image"
-mkfs.ext4 -q -F "$image"
+mkfs.ext4 -q -F -b 1024 -I 256 "$image"
 
 features=$(dumpe2fs -h "$image" 2>/dev/null |
 	sed -n 's/^Filesystem features:[[:space:]]*//p')
@@ -29,7 +32,8 @@ case " $features " in
 *' metadata_csum_seed '*)
 	;;
 *)
-	mkfs.ext4 -q -F -O metadata_csum,metadata_csum_seed "$image"
+	mkfs.ext4 -q -F -b 1024 -I 256 \
+		-O metadata_csum,metadata_csum_seed "$image"
 	;;
 esac
 
@@ -39,7 +43,8 @@ dumpe2fs -h "$image" 2>/dev/null |
 	sed -n '/^Filesystem features:/p;/^Block size:/p;/^Inode size:/p'
 
 truncate -s 128M "$uuid_seeded_image"
-mkfs.ext4 -q -F -O metadata_csum,^metadata_csum_seed "$uuid_seeded_image"
+mkfs.ext4 -q -F -b 1024 -I 256 \
+	-O metadata_csum,^metadata_csum_seed "$uuid_seeded_image"
 debugfs -w -R "write $fixture /boaros-probe" "$uuid_seeded_image" \
 	>/dev/null 2>&1
 uuid_seeded_features=$(dumpe2fs -h "$uuid_seeded_image" 2>/dev/null |
@@ -81,3 +86,19 @@ done
 
 "$work_dir/lwext4-read" "$image" /boaros-probe "$expected"
 "$work_dir/lwext4-read" "$uuid_seeded_image" /boaros-probe "$expected"
+
+# Preserve both checksum images as read-only probes. Sparse mutations happen
+# only in this dedicated copy, whose block size is fixed for exact hole tests.
+cp "$image" "$sparse_image"
+printf '%s' 'physical-block-zero-must-not-leak' |
+	dd of="$sparse_image" bs=1 conv=notrunc status=none
+debugfs -w -R "write $empty_fixture /aligned-hole" "$sparse_image" \
+	>/dev/null 2>&1
+debugfs -w -R "set_inode_field /aligned-hole size 1024" "$sparse_image" \
+	>/dev/null 2>&1
+
+sparse_status=0
+"$work_dir/lwext4-read" "$sparse_image" --aligned-hole || sparse_status=1
+"$work_dir/lwext4-read" "$sparse_image" --sparse || sparse_status=1
+e2fsck -fn "$sparse_image" || sparse_status=1
+exit "$sparse_status"

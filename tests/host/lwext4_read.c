@@ -2,6 +2,7 @@
 
 #include <ext4.h>
 #include <ext4_blockdev.h>
+#include <ext4_misc.h>
 
 #include <errno.h>
 #include <fcntl.h>
@@ -108,8 +109,11 @@ static int host_read(struct ext4_blockdev *bdev, void *buffer,
 static int host_write(struct ext4_blockdev *bdev, const void *buffer,
 		      uint64_t block, uint32_t count)
 {
+	struct host_image *image;
+	const uint8_t *cursor = buffer;
 	uint64_t offset;
 	size_t length;
+	size_t done = 0;
 	int rc;
 
 	if (buffer == NULL && count != 0)
@@ -119,9 +123,25 @@ static int host_write(struct ext4_blockdev *bdev, const void *buffer,
 	if (rc != EOK)
 		return rc;
 
-	(void)offset;
-	(void)length;
-	return EROFS;
+	image = bdev->bdif->p_user;
+	while (done < length) {
+		size_t remaining = length - done;
+		size_t chunk = remaining > (size_t)SSIZE_MAX ?
+			(size_t)SSIZE_MAX : remaining;
+		ssize_t bytes = pwrite(image->fd, cursor + done, chunk,
+				       (off_t)(offset + done));
+
+		if (bytes < 0) {
+			if (errno == EINTR)
+				continue;
+			return EIO;
+		}
+		if (bytes == 0)
+			return EIO;
+		done += (size_t)bytes;
+	}
+
+	return EOK;
 }
 
 static int host_close(struct ext4_blockdev *bdev)
@@ -138,6 +158,211 @@ static int report_error(const char *operation, int rc)
 	return 1;
 }
 
+static bool all_zero(const uint8_t *buffer, size_t size)
+{
+	for (size_t i = 0; i < size; ++i) {
+		if (buffer[i] != 0)
+			return false;
+	}
+	return true;
+}
+
+static int check_fixture(const char *path, const char *expected)
+{
+	ext4_file file = {0};
+	size_t expected_length = strlen(expected);
+	uint8_t *actual = malloc(expected_length + 1);
+	size_t read_count = 0;
+	int failed = 0;
+	int rc;
+
+	if (actual == NULL)
+		return report_error("allocate read buffer", ENOMEM);
+	rc = ext4_fopen(&file, path, "rb");
+	if (rc != EOK) {
+		failed = report_error("open fixture", rc);
+		goto cleanup;
+	}
+	rc = ext4_fread(&file, actual, expected_length, &read_count);
+	if (rc != EOK) {
+		failed = report_error("read fixture", rc);
+		goto close;
+	}
+	if (read_count != expected_length ||
+	    memcmp(actual, expected, expected_length) != 0) {
+		fprintf(stderr, "fixture contents differ: got %zu of %zu bytes\n",
+			read_count, expected_length);
+		failed = 1;
+		goto close;
+	}
+	read_count = 1;
+	rc = ext4_fread(&file, actual, 1, &read_count);
+	if (rc != EOK) {
+		failed = report_error("read fixture EOF", rc);
+		goto close;
+	}
+	if (read_count != 0) {
+		fprintf(stderr, "fixture has trailing data\n");
+		failed = 1;
+	}
+
+close:
+	rc = ext4_fclose(&file);
+	if (rc != EOK) {
+		report_error("close fixture", rc);
+		failed = 1;
+	}
+cleanup:
+	free(actual);
+	return failed;
+}
+
+static int check_aligned_hole(void)
+{
+	uint8_t actual[1024];
+	ext4_file file = {0};
+	size_t read_count = 0;
+	int failed = 0;
+	int rc;
+
+	memset(actual, 0xa5, sizeof(actual));
+	rc = ext4_fopen(&file, "/aligned-hole", "rb");
+	if (rc != EOK)
+		return report_error("open aligned hole", rc);
+	rc = ext4_fread(&file, actual, sizeof(actual), &read_count);
+	if (rc != EOK) {
+		failed = report_error("read aligned hole", rc);
+	} else if (read_count != sizeof(actual) ||
+		   !all_zero(actual, sizeof(actual))) {
+		fprintf(stderr,
+			"aligned unmapped block was not returned as zero\n");
+		failed = 1;
+	}
+	rc = ext4_fclose(&file);
+	if (rc != EOK) {
+		report_error("close aligned hole", rc);
+		failed = 1;
+	}
+	return failed;
+}
+
+static int check_sparse_behavior(void)
+{
+	static const uint8_t marker[] = "BOAR";
+	const uint64_t sparse_offset = 8192 + 17;
+	uint8_t buffer[8192 + 50];
+	struct ext4_inode inode;
+	ext4_file file = {0};
+	size_t count = 0;
+	int failed = 0;
+	int rc;
+
+	rc = ext4_fopen2(&file, "/sparse-write", O_CREAT | O_RDWR | O_TRUNC);
+	if (rc != EOK)
+		return report_error("create sparse write", rc);
+	rc = ext4_fseek(&file, (int64_t)sparse_offset, SEEK_SET);
+	if (rc != EOK) {
+		failed = report_error("seek sparse write", rc);
+		goto close;
+	}
+	rc = ext4_fwrite(&file, marker, sizeof(marker) - 1, &count);
+	if (rc != EOK || count != sizeof(marker) - 1) {
+		failed = report_error("write sparse marker", rc != EOK ? rc : EIO);
+		goto close;
+	}
+	if (ext4_fsize(&file) != sparse_offset + sizeof(marker) - 1) {
+		fprintf(stderr, "sparse write size differs: got %" PRIu64 "\n",
+			ext4_fsize(&file));
+		failed = 1;
+		goto close;
+	}
+	rc = ext4_fseek(&file, 0, SEEK_SET);
+	if (rc != EOK) {
+		failed = report_error("rewind sparse write", rc);
+		goto close;
+	}
+	memset(buffer, 0xa5, (size_t)sparse_offset + sizeof(marker) - 1);
+	rc = ext4_fread(&file, buffer,
+			(size_t)sparse_offset + sizeof(marker) - 1, &count);
+	if (rc != EOK || count != sparse_offset + sizeof(marker) - 1 ||
+	    !all_zero(buffer, (size_t)sparse_offset) ||
+	    memcmp(buffer + sparse_offset, marker, sizeof(marker) - 1) != 0) {
+		failed = report_error("verify sparse write", rc != EOK ? rc : EIO);
+		goto close;
+	}
+	rc = ext4_fclose(&file);
+	if (rc != EOK)
+		return report_error("close sparse write", rc);
+
+	memset(&file, 0, sizeof(file));
+	rc = ext4_fopen2(&file, "/same-block-sparse",
+			 O_CREAT | O_RDWR | O_TRUNC);
+	if (rc != EOK)
+		return report_error("create same-block sparse file", rc);
+	count = 0;
+	rc = ext4_fwrite(&file, "PRE", 3, &count);
+	if (rc != EOK || count != 3 ||
+	    ext4_fseek(&file, 73, SEEK_SET) != EOK) {
+		failed = report_error("prepare same-block sparse write",
+				      rc != EOK ? rc : EIO);
+		goto close;
+	}
+	count = 0;
+	rc = ext4_fwrite(&file, "END", 3, &count);
+	if (rc != EOK || count != 3 || ext4_fseek(&file, 0, SEEK_SET) != EOK) {
+		failed = report_error("write same-block sparse marker",
+				      rc != EOK ? rc : EIO);
+		goto close;
+	}
+	memset(buffer, 0xa5, 76);
+	rc = ext4_fread(&file, buffer, 76, &count);
+	if (rc != EOK || count != 76 || memcmp(buffer, "PRE", 3) != 0 ||
+	    !all_zero(buffer + 3, 70) || memcmp(buffer + 73, "END", 3) != 0) {
+		failed = report_error("verify same-block sparse write",
+				      rc != EOK ? rc : EIO);
+		goto close;
+	}
+	rc = ext4_fclose(&file);
+	if (rc != EOK)
+		return report_error("close same-block sparse file", rc);
+
+	memset(&file, 0, sizeof(file));
+	rc = ext4_fopen2(&file, "/sparse-truncate",
+			 O_CREAT | O_RDWR | O_TRUNC);
+	if (rc != EOK)
+		return report_error("create sparse truncate file", rc);
+	count = 0;
+	rc = ext4_fwrite(&file, "12345", 5, &count);
+	if (rc != EOK || count != 5 || ext4_ftruncate(&file, 8192 + 50) != EOK ||
+	    ext4_ftell(&file) != 5 || ext4_fsize(&file) != 8192 + 50) {
+		failed = report_error("grow sparse truncate file",
+				      rc != EOK ? rc : EIO);
+		goto close;
+	}
+	memset(buffer, 0xa5, 8192 + 45);
+	rc = ext4_fread(&file, buffer, 8192 + 45, &count);
+	if (rc != EOK || count != 8192 + 45 ||
+	    !all_zero(buffer, 8192 + 45)) {
+		failed = report_error("verify sparse truncate zeros",
+				      rc != EOK ? rc : EIO);
+		goto close;
+	}
+	rc = ext4_fraw_inode_fill(&file, &inode);
+	if (rc != EOK ||
+	    (uint64_t)to_le32(inode.blocks_count_lo) * 512 >= ext4_fsize(&file)) {
+		failed = report_error("verify sparse truncate allocation",
+				      rc != EOK ? rc : EIO);
+	}
+
+close:
+	rc = ext4_fclose(&file);
+	if (rc != EOK) {
+		report_error("close sparse test file", rc);
+		failed = 1;
+	}
+	return failed;
+}
+
 int main(int argc, char **argv)
 {
 	uint8_t physical_buffer[PHYSICAL_SECTOR_SIZE];
@@ -145,29 +370,28 @@ int main(int argc, char **argv)
 	struct ext4_blockdev device = {0};
 	struct host_image image = {.fd = -1, .size = 0};
 	struct stat status;
-	ext4_file file = {0};
-	const char *expected;
-	uint8_t *actual = NULL;
-	size_t expected_length;
-	size_t read_count = 0;
+	const char *expected = NULL;
+	bool sparse_mode;
+	bool aligned_hole_mode;
 	bool registered = false;
 	bool mounted = false;
-	bool opened = false;
 	int failed = 0;
 	int rc;
 
-	if (argc != 4) {
-		fprintf(stderr, "usage: %s IMAGE PATH EXPECTED\n", argv[0]);
+	sparse_mode = argc == 3 && strcmp(argv[2], "--sparse") == 0;
+	aligned_hole_mode = argc == 3 &&
+		strcmp(argv[2], "--aligned-hole") == 0;
+	if (argc != 4 && !sparse_mode && !aligned_hole_mode) {
+		fprintf(stderr,
+			"usage: %s IMAGE PATH EXPECTED | IMAGE --aligned-hole | IMAGE --sparse\n",
+			argv[0]);
 		return 2;
 	}
 
-	expected = argv[3];
-	expected_length = strlen(expected);
-	actual = malloc(expected_length + 1);
-	if (actual == NULL)
-		return report_error("allocate read buffer", ENOMEM);
+	if (argc == 4)
+		expected = argv[3];
 
-	image.fd = open(argv[1], O_RDONLY | O_CLOEXEC);
+	image.fd = open(argv[1], (sparse_mode ? O_RDWR : O_RDONLY) | O_CLOEXEC);
 	if (image.fd < 0) {
 		failed = report_error("open image", errno);
 		goto cleanup;
@@ -202,52 +426,21 @@ int main(int argc, char **argv)
 	}
 	registered = true;
 
-	rc = ext4_mount(DEVICE_NAME, MOUNT_POINT, true);
+	rc = ext4_mount(DEVICE_NAME, MOUNT_POINT, !sparse_mode);
 	if (rc != EOK) {
 		failed = report_error("mount image", rc);
 		goto cleanup;
 	}
 	mounted = true;
 
-	rc = ext4_fopen(&file, argv[2], "rb");
-	if (rc != EOK) {
-		failed = report_error("open fixture", rc);
-		goto cleanup;
-	}
-	opened = true;
-
-	rc = ext4_fread(&file, actual, expected_length, &read_count);
-	if (rc != EOK) {
-		failed = report_error("read fixture", rc);
-		goto cleanup;
-	}
-	if (read_count != expected_length ||
-	    memcmp(actual, expected, expected_length) != 0) {
-		fprintf(stderr, "fixture contents differ: got %zu of %zu bytes\n",
-			read_count, expected_length);
-		failed = 1;
-		goto cleanup;
-	}
-
-	read_count = 1;
-	rc = ext4_fread(&file, actual, 1, &read_count);
-	if (rc != EOK) {
-		failed = report_error("read fixture EOF", rc);
-		goto cleanup;
-	}
-	if (read_count != 0) {
-		fprintf(stderr, "fixture has trailing data\n");
-		failed = 1;
-	}
+	if (sparse_mode)
+		failed = check_sparse_behavior();
+	else if (aligned_hole_mode)
+		failed = check_aligned_hole();
+	else
+		failed = check_fixture(argv[2], expected);
 
 cleanup:
-	if (opened) {
-		rc = ext4_fclose(&file);
-		if (rc != EOK) {
-			report_error("close fixture", rc);
-			failed = 1;
-		}
-	}
 	if (mounted) {
 		rc = ext4_umount(MOUNT_POINT);
 		if (rc != EOK) {
@@ -266,9 +459,7 @@ cleanup:
 		report_error("close image", errno);
 		failed = 1;
 	}
-	free(actual);
-
 	if (failed == 0)
-		puts("lwext4 host read passed");
+		puts("lwext4 host check passed");
 	return failed;
 }

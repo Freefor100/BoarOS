@@ -379,7 +379,8 @@ int ext4_fwrite(ext4_file *file, const void *buf, size_t size, size_t *wcnt);
 /**@brief   File seek operation.
  *
  * @param   file File handle.
- * @param   offset Offset to seek.
+ * @param   offset Offset to seek. SEEK_SET accepts positions beyond EOF
+ *                 without changing the file size.
  * @param   origin Seek type:
  *              @ref SEEK_SET
  *              @ref SEEK_CUR

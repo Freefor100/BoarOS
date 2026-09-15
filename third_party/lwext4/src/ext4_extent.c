@@ -1702,6 +1702,9 @@ static bool ext4_ext_more_to_rm(struct ext4_extent_path *path, ext4_lblk_t to)
 	return true;
 }
 
+static ext4_lblk_t
+ext4_ext_next_allocated_block(struct ext4_extent_path *path);
+
 int ext4_extent_remove_space(struct ext4_inode_ref *inode_ref, ext4_lblk_t from,
 			     ext4_lblk_t to)
 {
@@ -1723,8 +1726,35 @@ int ext4_extent_remove_space(struct ext4_inode_ref *inode_ref, ext4_lblk_t from,
 				 ext4_ext_get_actual_len(path[depth].extent));
 
 	if (!in_range) {
-		ret = EOK;
-		goto out;
+		ext4_lblk_t next;
+		ext4_lblk_t extent_start =
+		    to_le32(path[depth].extent->first_block);
+
+		if (from < extent_start)
+			next = extent_start;
+		else
+			next = ext4_ext_next_allocated_block(path);
+
+		if (next == EXT_MAX_BLOCKS || next > to) {
+			ret = EOK;
+			goto out;
+		}
+
+		/* Restart at the first extent after the hole. This is needed when
+		 * the next extent lives in another leaf as well as when it is in
+		 * the current leaf. */
+		from = next;
+		ret = ext4_find_extent(inode_ref, from, &path, 0);
+		if (ret != EOK)
+			goto out;
+
+		if (!path[depth].extent ||
+		    !IN_RANGE(from,
+			      to_le32(path[depth].extent->first_block),
+			      ext4_ext_get_actual_len(path[depth].extent))) {
+			ret = EIO;
+			goto out;
+		}
 	}
 
 	/* If we do remove_space inside the range of an extent */

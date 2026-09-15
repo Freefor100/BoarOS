@@ -249,6 +249,18 @@ int ext4_fs_get_inode_dblk_idx(struct ext4_inode_ref *inode_ref,
 int ext4_fs_init_inode_dblk_idx(struct ext4_inode_ref *inode_ref,
 				  ext4_lblk_t iblock, ext4_fsblk_t *fblock);
 
+/**@brief Get or allocate one exact logical data block.
+ * @param inode_ref I-node to proceed on.
+ * @param iblock    Logical index of block.
+ * @param fblock    Output physical block address.
+ * @param allocated Set when a new physical data block was allocated.
+ * @return Error code
+ */
+int ext4_fs_get_or_alloc_inode_dblk_idx(struct ext4_inode_ref *inode_ref,
+					ext4_lblk_t iblock,
+					ext4_fsblk_t *fblock,
+					bool *allocated);
+
 /**@brief Append following logical block to the i-node.
  * @param inode_ref I-node to append block to
  * @param fblock    Output physical block address of newly allocated block

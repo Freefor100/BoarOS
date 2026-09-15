@@ -1936,6 +1936,110 @@ static int check_filesystem_rw(void)
     close(trfd);
     unlink("/trunc_extend.txt");
 
+    /* Sparse writes preserve holes instead of allocating or exposing stale
+     * bytes. Cover both a hole spanning whole filesystem blocks and a gap
+     * within an already allocated block. */
+    static const char sparse_marker[] = "BOAR";
+    const off_t sparse_offset = 8192 + 17;
+    int sparse_fd = open("/sparse_write.txt",
+                         O_CREAT | O_RDWR | O_TRUNC, 0644);
+    if (sparse_fd < 0) {
+        return 155;
+    }
+    if (lseek(sparse_fd, sparse_offset, SEEK_SET) != sparse_offset ||
+        write(sparse_fd, sparse_marker, sizeof(sparse_marker) - 1) !=
+            (ssize_t)(sizeof(sparse_marker) - 1)) {
+        close(sparse_fd);
+        return 156;
+    }
+    if (fstat(sparse_fd, &sst) != 0 ||
+        sst.st_size != sparse_offset + (off_t)(sizeof(sparse_marker) - 1)) {
+        close(sparse_fd);
+        return 157;
+    }
+    char sparse_buf[8192 + 17 + sizeof(sparse_marker) - 1];
+    memset(sparse_buf, 0xff, sizeof(sparse_buf));
+    if (lseek(sparse_fd, 0, SEEK_SET) != 0 ||
+        read(sparse_fd, sparse_buf, sizeof(sparse_buf)) !=
+            (ssize_t)sizeof(sparse_buf)) {
+        close(sparse_fd);
+        return 158;
+    }
+    for (size_t sparse_i = 0; sparse_i < (size_t)sparse_offset; sparse_i++) {
+        if (sparse_buf[sparse_i] != 0) {
+            close(sparse_fd);
+            return 159;
+        }
+    }
+    if (memcmp(sparse_buf + sparse_offset, sparse_marker,
+               sizeof(sparse_marker) - 1) != 0) {
+        close(sparse_fd);
+        return 160;
+    }
+
+    /* With extents at logical blocks 0 and 8, shrinking into block 0 must
+     * remove the later extent. Regrowth must not expose its old marker. */
+    if (lseek(sparse_fd, 0, SEEK_SET) != 0 ||
+        write(sparse_fd, "12345", 5) != 5 ||
+        ftruncate(sparse_fd, 5) != 0 ||
+        ftruncate(sparse_fd, 8192 + 50) != 0 ||
+        lseek(sparse_fd, 0, SEEK_CUR) != 5 ||
+        fstat(sparse_fd, &sst) != 0 ||
+        sst.st_size != 8192 + 50 || sst.st_blocks * 512 >= sst.st_size) {
+        close(sparse_fd);
+        return 168;
+    }
+    char sparse_trunc_buf[8192 + 45];
+    memset(sparse_trunc_buf, 0xff, sizeof(sparse_trunc_buf));
+    if (read(sparse_fd, sparse_trunc_buf,
+             sizeof(sparse_trunc_buf)) != (ssize_t)sizeof(sparse_trunc_buf)) {
+        close(sparse_fd);
+        return 169;
+    }
+    for (size_t sparse_i = 0; sparse_i < sizeof(sparse_trunc_buf); sparse_i++) {
+        if (sparse_trunc_buf[sparse_i] != 0) {
+            fprintf(stderr, "sparse truncate byte %zu is %#x\n", sparse_i,
+                    (unsigned char)sparse_trunc_buf[sparse_i]);
+            close(sparse_fd);
+            return 170;
+        }
+    }
+    if (close(sparse_fd) != 0 || unlink("/sparse_write.txt") != 0) {
+        return 161;
+    }
+
+    int same_block_fd = open("/same_block_sparse.txt",
+                             O_CREAT | O_RDWR | O_TRUNC, 0644);
+    if (same_block_fd < 0) {
+        return 162;
+    }
+    if (write(same_block_fd, "PRE", 3) != 3 ||
+        lseek(same_block_fd, 73, SEEK_SET) != 73 ||
+        write(same_block_fd, "END", 3) != 3) {
+        close(same_block_fd);
+        return 163;
+    }
+    char same_block_buf[76];
+    memset(same_block_buf, 0xff, sizeof(same_block_buf));
+    if (lseek(same_block_fd, 0, SEEK_SET) != 0 ||
+        read(same_block_fd, same_block_buf, sizeof(same_block_buf)) !=
+            (ssize_t)sizeof(same_block_buf) ||
+        memcmp(same_block_buf, "PRE", 3) != 0 ||
+        memcmp(same_block_buf + 73, "END", 3) != 0) {
+        close(same_block_fd);
+        return 164;
+    }
+    for (size_t sparse_i = 3; sparse_i < 73; sparse_i++) {
+        if (same_block_buf[sparse_i] != 0) {
+            close(same_block_fd);
+            return 165;
+        }
+    }
+    if (close(same_block_fd) != 0 ||
+        unlink("/same_block_sparse.txt") != 0) {
+        return 171;
+    }
+
     /* 13a. Unlink unopened cached file:
      * Create file, write data, close file (cached in page cache).
      * Unlink must reclaim page-cache held inode without double free. */

@@ -57,7 +57,7 @@ debugfs -w -R "write $data /data" "$static_disk" >/dev/null 2>&1
 
 # The userland program blocks reading stdin after the clock and sleep
 # checks, so the harness feeds one line into the serial console.
-if ! { sleep 4; printf 'go\n'; } | timeout -k 2s 15s "$qemu" \
+if ! { sleep 4; printf 'go\n'; } | timeout -k 2s 20s "$qemu" \
     -machine virt \
     -bios default \
     -kernel "$kernel" \
