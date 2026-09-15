@@ -110,6 +110,7 @@ PID 1 是用户空间生命周期的根。Linux 通常在 init 退出时 panic�
 
 - 块设备测试要覆盖 direct DMA、bounce、批量合并、最后一个扇区、整数溢出、timeout 后 reset 和队列页回收。
 - 文件系统测试应建立真实镜像并通过工具设置 mode、checksum 与 incompat feature；只用手写 superblock fixture 很难覆盖 extent、目录和校验链。
+- 测试若断言 `st_blksize` 或精确 `st_blocks`，镜像构造必须显式固定 filesystem block size 与 inode size，不能继承宿主 `/etc/mke2fs.conf` 的发行版默认值。`tests/files-riscv.sh` 因而使用 `mkfs.ext4 -b 1024 -I 256`；失败时同时输出 `dumpe2fs -h` 以及 `debugfs stat`，把 fixture 几何差异与内核字段解码错误分开。
 - 成功读取文件不足以证明生命周期完整；应在 open file 时验证 unmount 为 busy，并在 close/unmount/device destroy 后比较物理页和 heap live/current pages。
 - 进程文件测试还应覆盖最低 fd 复用、扩容边界、两次 open 的独立 offset、路径 NUL 上限、跨页 usercopy、部分 fault 后 offset，以及 close 已摘除 fd 后真实 VFS/I/O owner 的状态。
 - pipe 测试要覆盖两端引用、≤PIPE_BUF 写原子性、读写阻塞/`O_NONBLOCK`、EOF、EPIPE/SIGPIPE、FIFO `fstat`/`ESPIPE` 和创建/关闭时的 VFS/I/O owner。

@@ -73,6 +73,9 @@ uint32_t kernel_open_file_mode(
     const struct kernel_open_file_description *file);
 uint32_t kernel_open_file_flags(
     const struct kernel_open_file_description *file);
+/* Access mode is OFD state and therefore survives descriptor duplication. */
+int kernel_open_file_readable(
+    const struct kernel_open_file_description *file);
 uint64_t kernel_open_file_offset(
     const struct kernel_open_file_description *file);
 

@@ -55,9 +55,14 @@ static uint64_t fcntl_command = UINT64_MAX;
 static uint64_t fcntl_argument = UINT64_MAX;
 static enum kernel_open_file_kind pinned_kind =
     KERNEL_OPEN_FILE_KIND_REGULAR;
+static int pinned_readable = 1;
+static enum kernel_mm_status file_mmap_validation_status =
+    KERNEL_MM_STATUS_OK;
 static enum kernel_mm_status file_mmap_status = KERNEL_MM_STATUS_OK;
 static int64_t file_mmap_fd;
 static uint64_t file_mmap_offset;
+static uint32_t file_mmap_validation_calls;
+static uint32_t file_mmap_calls;
 static uint32_t file_release_calls;
 
 enum kernel_task_status __wrap_kernel_task_mm_borrow_mutable(
@@ -195,11 +200,32 @@ enum kernel_mm_status __wrap_kernel_mm_mmap_file_private(
     mmap_mm_permissions = permissions;
     mmap_mm_flags = flags;
     file_mmap_offset = file_offset;
+    file_mmap_calls++;
     if (file_mmap_status == KERNEL_MM_STATUS_OK) {
         *file = 0;
         *address = mmap_mm_result;
     }
     return file_mmap_status;
+}
+
+enum kernel_mm_status __wrap_kernel_mm_validate_file_private_mapping(
+    struct kernel_mm *mm,
+    uint64_t hint,
+    uint64_t length,
+    uint64_t file_offset,
+    uint32_t permissions,
+    uint32_t flags)
+{
+    if (mm != (struct kernel_mm *)(uintptr_t)2U) {
+        return KERNEL_MM_STATUS_INVALID_ARGUMENT;
+    }
+    mmap_mm_hint = hint;
+    mmap_mm_length = length;
+    file_mmap_offset = file_offset;
+    mmap_mm_permissions = permissions;
+    mmap_mm_flags = flags;
+    file_mmap_validation_calls++;
+    return file_mmap_validation_status;
 }
 
 enum kernel_files_status __wrap_kernel_files_lseek(
@@ -388,6 +414,15 @@ enum kernel_open_file_kind __wrap_kernel_open_file_kind(
         return KERNEL_OPEN_FILE_KIND_REGULAR;
     }
     return pinned_kind;
+}
+
+int __wrap_kernel_open_file_readable(
+    const struct kernel_open_file_description *file)
+{
+    return file ==
+               (const struct kernel_open_file_description *)(uintptr_t)4U
+               ? pinned_readable
+               : 0;
 }
 
 enum kernel_open_file_status __wrap_kernel_open_file_release(
@@ -923,8 +958,12 @@ static unsigned long run_memory_mapping_cases(void)
     files_borrow_status = KERNEL_TASK_STATUS_OK;
     pin_status = KERNEL_FILES_STATUS_OK;
     pin_linux_result = 0;
+    file_mmap_validation_status = KERNEL_MM_STATUS_OK;
     file_mmap_status = KERNEL_MM_STATUS_OK;
     mmap_mm_result = UINT64_C(0x88000);
+    pinned_readable = 1;
+    file_mmap_validation_calls = 0U;
+    file_mmap_calls = 0U;
     file_release_calls = 0U;
     if (kernel_syscall_dispatch(caller, &request, &result) !=
             KERNEL_SYSCALL_STATUS_OK ||
@@ -936,13 +975,16 @@ static unsigned long run_memory_mapping_cases(void)
         mmap_mm_hint != UINT64_C(0x45000) ||
         mmap_mm_length != UINT64_C(0x3456) ||
         mmap_mm_permissions != (KERNEL_MM_READ | KERNEL_MM_EXECUTE) ||
-        mmap_mm_flags != 0U || file_release_calls != 0U) {
+        mmap_mm_flags != 0U || file_mmap_validation_calls != 1U ||
+        file_mmap_calls != 1U ||
+        file_release_calls != 0U) {
         failures++;
     }
     file_mmap_status = KERNEL_MM_STATUS_NO_MEMORY;
     if (kernel_syscall_dispatch(caller, &request, &result) !=
             KERNEL_SYSCALL_STATUS_OK ||
         result_changed(&result, KERNEL_SYSCALL_ACTION_RETURN, -12) ||
+        file_mmap_validation_calls != 2U || file_mmap_calls != 2U ||
         file_release_calls != 1U) {
         failures++;
     }
@@ -950,15 +992,44 @@ static unsigned long run_memory_mapping_cases(void)
     if (kernel_syscall_dispatch(caller, &request, &result) !=
             KERNEL_SYSCALL_STATUS_OK ||
         result_changed(&result, KERNEL_SYSCALL_ACTION_RETURN, -19) ||
+        file_mmap_validation_calls != 2U || file_mmap_calls != 2U ||
         file_release_calls != 2U) {
         failures++;
     }
     pinned_kind = KERNEL_OPEN_FILE_KIND_REGULAR;
+    pinned_readable = 0;
+    if (kernel_syscall_dispatch(caller, &request, &result) !=
+            KERNEL_SYSCALL_STATUS_OK ||
+        result_changed(&result, KERNEL_SYSCALL_ACTION_RETURN, -13) ||
+        file_mmap_validation_calls != 3U || file_mmap_calls != 2U ||
+        file_release_calls != 3U) {
+        failures++;
+    }
+    request.arguments[1] = 0U;
+    file_mmap_validation_status = KERNEL_MM_STATUS_INVALID_ARGUMENT;
+    if (kernel_syscall_dispatch(caller, &request, &result) !=
+            KERNEL_SYSCALL_STATUS_OK ||
+        result_changed(&result, KERNEL_SYSCALL_ACTION_RETURN, -22) ||
+        file_mmap_validation_calls != 4U || file_mmap_calls != 2U ||
+        file_release_calls != 4U) {
+        failures++;
+    }
+    request.arguments[1] = UINT64_C(0x3456);
+    file_mmap_validation_status = KERNEL_MM_STATUS_CONFLICT;
+    if (kernel_syscall_dispatch(caller, &request, &result) !=
+            KERNEL_SYSCALL_STATUS_OK ||
+        result_changed(&result, KERNEL_SYSCALL_ACTION_RETURN, -17) ||
+        file_mmap_validation_calls != 5U || file_mmap_calls != 2U ||
+        file_release_calls != 5U) {
+        failures++;
+    }
+    file_mmap_validation_status = KERNEL_MM_STATUS_OK;
+    pinned_readable = 1;
     pin_linux_result = -9;
     if (kernel_syscall_dispatch(caller, &request, &result) !=
             KERNEL_SYSCALL_STATUS_OK ||
         result_changed(&result, KERNEL_SYSCALL_ACTION_RETURN, -9) ||
-        file_release_calls != 2U) {
+        file_release_calls != 5U) {
         failures++;
     }
     pin_linux_result = 0;

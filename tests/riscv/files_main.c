@@ -1222,15 +1222,53 @@ static void run_seek_stat_operations(struct kernel_files *files,
         !read_user_bytes(mm, stat_buffer, &stat, sizeof(stat))) {
         fail_files(84U, 0, result);
     }
-    if (stat.st_dev != 1U || stat.st_mode != UINT32_C(0100640) ||
-        stat.st_ino == 0U || stat.st_nlink != 1U ||
-        stat.st_uid != 1234U || stat.st_gid != 2345U ||
-        stat.st_size != 9000 || stat.st_blksize != 1024 ||
-        stat.st_blocks != 18U || stat.st_rdev != 0U ||
-        stat.st_atime != 1700000001 || stat.st_atime_nsec != 111 ||
-        stat.st_mtime != 1700000002 || stat.st_mtime_nsec != 222 ||
-        stat.st_ctime != 1700000003 || stat.st_ctime_nsec != 333) {
-        fail_files(85U, 0, stat.st_mode);
+    if (stat.st_dev != 1U) {
+        fail_files(219U, 1, stat.st_dev);
+    }
+    if (stat.st_mode != UINT32_C(0100640)) {
+        fail_files(85U, 0100640, stat.st_mode);
+    }
+    if (stat.st_ino == 0U) {
+        fail_files(220U, 1, 0);
+    }
+    if (stat.st_nlink != 1U) {
+        fail_files(221U, 1, stat.st_nlink);
+    }
+    if (stat.st_uid != 1234U) {
+        fail_files(222U, 1234, stat.st_uid);
+    }
+    if (stat.st_gid != 2345U) {
+        fail_files(223U, 2345, stat.st_gid);
+    }
+    if (stat.st_size != 9000) {
+        fail_files(224U, 9000, stat.st_size);
+    }
+    if (stat.st_blksize != 1024) {
+        fail_files(225U, 1024, stat.st_blksize);
+    }
+    if (stat.st_blocks != 18U) {
+        fail_files(226U, 18, stat.st_blocks);
+    }
+    if (stat.st_rdev != 0U) {
+        fail_files(227U, 0, stat.st_rdev);
+    }
+    if (stat.st_atime != 1700000001) {
+        fail_files(228U, 1700000001, stat.st_atime);
+    }
+    if (stat.st_atime_nsec != 111) {
+        fail_files(229U, 111, stat.st_atime_nsec);
+    }
+    if (stat.st_mtime != 1700000002) {
+        fail_files(230U, 1700000002, stat.st_mtime);
+    }
+    if (stat.st_mtime_nsec != 222) {
+        fail_files(231U, 222, stat.st_mtime_nsec);
+    }
+    if (stat.st_ctime != 1700000003) {
+        fail_files(232U, 1700000003, stat.st_ctime);
+    }
+    if (stat.st_ctime_nsec != 333) {
+        fail_files(233U, 333, stat.st_ctime_nsec);
     }
     file_stat = stat;
     if (kernel_files_fstat(files, mm, 1, stat_buffer, &result) !=

@@ -141,6 +141,15 @@ enum kernel_mm_status kernel_mm_mmap_anonymous(
     uint32_t flags,
     uint64_t *address);
 
+/* Side-effect-free validation; success does not reserve the chosen range. */
+enum kernel_mm_status kernel_mm_validate_file_private_mapping(
+    struct kernel_mm *mm,
+    uint64_t hint,
+    uint64_t length,
+    uint64_t file_offset,
+    uint32_t permissions,
+    uint32_t flags);
+
 /* Success consumes *file; failure leaves the caller's OFD reference intact. */
 enum kernel_mm_status kernel_mm_mmap_file_private(
     struct kernel_mm *mm,

@@ -406,6 +406,28 @@ uint32_t kernel_open_file_flags(
     return open_file_live(file) ? file->open_flags : 0U;
 }
 
+int kernel_open_file_readable(
+    const struct kernel_open_file_description *file)
+{
+    uint32_t access_mode;
+
+    if (!open_file_live(file)) {
+        return 0;
+    }
+    access_mode = file->open_flags & 3U;
+    switch (file->kind) {
+    case KERNEL_OPEN_FILE_KIND_REGULAR:
+    case KERNEL_OPEN_FILE_KIND_DIRECTORY:
+        return access_mode == 0U || access_mode == 2U;
+    case KERNEL_OPEN_FILE_KIND_PIPE:
+        return access_mode == 0U;
+    case KERNEL_OPEN_FILE_KIND_CONSOLE:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
 uint64_t kernel_open_file_offset(
     const struct kernel_open_file_description *file)
 {

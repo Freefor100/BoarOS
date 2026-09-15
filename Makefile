@@ -613,9 +613,10 @@ $(SCHEDULER_BOOT_TEST_KERNEL_RV): $(SCHEDULER_BOOT_TEST_OBJECTS) \
 
 $(SYSCALL_TEST_KERNEL_RV): $(SYSCALL_TEST_OBJECTS) arch/riscv/linker.ld
 	$(CC) $(LDFLAGS) -Wl,--wrap=kernel_task_mm_borrow_mutable \
-		-Wl,--wrap=kernel_mm_brk \
-		-Wl,--wrap=kernel_mm_mmap_anonymous \
-		-Wl,--wrap=kernel_mm_mmap_file_private \
+	-Wl,--wrap=kernel_mm_brk \
+	-Wl,--wrap=kernel_mm_mmap_anonymous \
+	-Wl,--wrap=kernel_mm_validate_file_private_mapping \
+	-Wl,--wrap=kernel_mm_mmap_file_private \
 		-Wl,--wrap=kernel_mm_munmap \
 		-Wl,--wrap=kernel_mm_mprotect \
 	-Wl,--wrap=kernel_task_files_borrow \
@@ -633,6 +634,7 @@ $(SYSCALL_TEST_KERNEL_RV): $(SYSCALL_TEST_OBJECTS) arch/riscv/linker.ld
 	-Wl,--wrap=kernel_files_dup3 \
 	-Wl,--wrap=kernel_files_fcntl \
 	-Wl,--wrap=kernel_open_file_kind \
+	-Wl,--wrap=kernel_open_file_readable \
 	-Wl,--wrap=kernel_open_file_release \
 	-Wl,-Map,$(BUILD_DIR)/tests/kernel-syscall-rv.map \
 		-o $@ $(SYSCALL_TEST_OBJECTS)

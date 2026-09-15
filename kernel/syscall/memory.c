@@ -150,19 +150,40 @@ enum kernel_syscall_status syscall_handle_mmap(
             decoded->value = -KERNEL_ENODEV;
             return KERNEL_SYSCALL_STATUS_OK;
         }
-        status = kernel_mm_mmap_file_private(
+        status = kernel_mm_validate_file_private_mapping(
             mm,
-            &file,
             request->arguments[0],
             request->arguments[1],
             request->arguments[5],
             mm_permissions_from_linux(protections),
-            mm_flags,
-            &mapped_address);
-        if (status != KERNEL_MM_STATUS_OK &&
-            kernel_open_file_release(&file) !=
+            mm_flags);
+        if (status != KERNEL_MM_STATUS_OK) {
+            if (kernel_open_file_release(&file) !=
                 KERNEL_OPEN_FILE_STATUS_OK) {
-            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+                return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+            }
+        } else if (!kernel_open_file_readable(file)) {
+            if (kernel_open_file_release(&file) !=
+                KERNEL_OPEN_FILE_STATUS_OK) {
+                return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+            }
+            decoded->value = -KERNEL_EACCES;
+            return KERNEL_SYSCALL_STATUS_OK;
+        } else {
+            status = kernel_mm_mmap_file_private(
+                mm,
+                &file,
+                request->arguments[0],
+                request->arguments[1],
+                request->arguments[5],
+                mm_permissions_from_linux(protections),
+                mm_flags,
+                &mapped_address);
+            if (status != KERNEL_MM_STATUS_OK &&
+                kernel_open_file_release(&file) !=
+                    KERNEL_OPEN_FILE_STATUS_OK) {
+                return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+            }
         }
     }
     if (status != KERNEL_MM_STATUS_OK &&

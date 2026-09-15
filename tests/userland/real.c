@@ -14,6 +14,7 @@
 #include <string.h>
 #include <poll.h>
 #include <sys/epoll.h>
+#include <sys/mman.h>
 #include <sys/select.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -1402,6 +1403,88 @@ static int check_epoll(void)
     return 0;
 }
 
+static int check_write_only_read_denied(int fd)
+{
+    char byte;
+    void *invalid_buffer = (void *)(uintptr_t)UINTPTR_MAX;
+    void *mapping;
+
+    errno = 0;
+    if (read(fd, &byte, 1) != -1 || errno != EBADF) {
+        return 1;
+    }
+    errno = 0;
+    if (pread(fd, &byte, 1, 0) != -1 || errno != EBADF) {
+        return 2;
+    }
+    errno = 0;
+    if (read(fd, invalid_buffer, 1) != -1 || errno != EBADF) {
+        return 3;
+    }
+    errno = 0;
+    if (pread(fd, invalid_buffer, 1, 0) != -1 || errno != EBADF) {
+        return 4;
+    }
+    errno = 0;
+    if (read(fd, invalid_buffer, 0) != -1 || errno != EBADF) {
+        return 5;
+    }
+    errno = 0;
+    if (pread(fd, invalid_buffer, 0, 0) != -1 || errno != EBADF) {
+        return 6;
+    }
+    errno = 0;
+    mapping = mmap(0, 0, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (mapping != MAP_FAILED || errno != EINVAL) {
+        return 7;
+    }
+    errno = 0;
+    mapping = mmap((void *)1, 4096, PROT_READ,
+                   MAP_PRIVATE | MAP_FIXED, fd, 0);
+    if (mapping != MAP_FAILED || errno != EINVAL) {
+        if (mapping != MAP_FAILED) {
+            munmap(mapping, 4096);
+        }
+        return 8;
+    }
+    errno = 0;
+    mapping = mmap(0, 4096, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (mapping != MAP_FAILED || errno != EACCES) {
+        if (mapping != MAP_FAILED) {
+            munmap(mapping, 4096);
+        }
+        return 9;
+    }
+
+    int duplicate = dup(fd);
+    if (duplicate < 0) {
+        return 10;
+    }
+    errno = 0;
+    if (read(duplicate, &byte, 1) != -1 || errno != EBADF) {
+        close(duplicate);
+        return 11;
+    }
+    errno = 0;
+    if (pread(duplicate, &byte, 1, 0) != -1 || errno != EBADF) {
+        close(duplicate);
+        return 12;
+    }
+    errno = 0;
+    mapping = mmap(0, 4096, PROT_READ, MAP_PRIVATE, duplicate, 0);
+    if (mapping != MAP_FAILED || errno != EACCES) {
+        if (mapping != MAP_FAILED) {
+            munmap(mapping, 4096);
+        }
+        close(duplicate);
+        return 13;
+    }
+    if (close(duplicate) != 0) {
+        return 14;
+    }
+    return 0;
+}
+
 static int check_filesystem_rw(void)
 {
     /* 1. File creation and exclusive open */
@@ -1437,6 +1520,13 @@ static int check_filesystem_rw(void)
     if (lseek(wfd, 0, SEEK_CUR) != (off_t)(len1 + 10)) {
         close(wfd);
         return 5;
+    }
+    int access_mode_error = check_write_only_read_denied(wfd);
+    if (access_mode_error != 0) {
+        fprintf(stderr, "write-only read access check failed: %d errno=%d\n",
+                access_mode_error, errno);
+        close(wfd);
+        return 154;
     }
     if (close(wfd) != 0) {
         return 6;

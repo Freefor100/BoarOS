@@ -1303,34 +1303,31 @@ static void finish_file_mapping(
     (void)drain_elf_sources(record, 1);
 }
 
-enum kernel_mm_status kernel_mm_mmap_file_private(
+struct riscv_file_mapping_plan {
+    struct riscv_kernel_mm_record *record;
+    uint64_t start;
+    uint64_t end;
+    uint32_t permissions;
+};
+
+static enum kernel_mm_status prepare_file_mapping(
     struct kernel_mm *mm,
-    struct kernel_open_file_description **file,
     uint64_t hint,
     uint64_t length,
     uint64_t file_offset,
     uint32_t permissions,
     uint32_t flags,
-    uint64_t *address)
+    struct riscv_file_mapping_plan *plan)
 {
     struct riscv_kernel_mm_record *record;
-    struct riscv_kernel_mm_file_source *prepared = 0;
-    struct riscv_kernel_mm_file_source *existing;
-    struct kernel_vma vma;
-    struct kernel_vma_edit edit;
     uint64_t aligned_length;
     uint64_t start;
-    uint64_t end;
     uint32_t normalized;
     int overlaps;
-    enum kernel_heap_status heap_status;
     enum kernel_mm_status status;
     enum kernel_vma_status vma_status;
 
-    if (file == 0 || *file == 0 || address == 0 ||
-        (kernel_open_file_mode(*file) & KERNEL_VFS_S_IFMT) !=
-            KERNEL_VFS_S_IFREG ||
-        (file_offset & BOAROS_PAGE_MASK) != 0U ||
+    if (plan == 0 || (file_offset & BOAROS_PAGE_MASK) != 0U ||
         !normalize_user_permissions(permissions, &normalized) ||
         (flags & ~(KERNEL_MM_MAP_FIXED |
                    KERNEL_MM_MAP_FIXED_NOREPLACE)) != 0U ||
@@ -1349,23 +1346,10 @@ enum kernel_mm_status kernel_mm_mmap_file_private(
     if (status != KERNEL_MM_STATUS_OK) {
         return status;
     }
-    existing = find_file_source(record, *file);
-    if (existing == 0) {
-        heap_status = kernel_heap_allocate_zeroed(record->vma_heap,
-                                                  1U,
-                                                  sizeof(*prepared),
-                                                  (void **)&prepared);
-        if (heap_status != KERNEL_HEAP_STATUS_OK) {
-            return heap_status == KERNEL_HEAP_STATUS_EMPTY
-                       ? KERNEL_MM_STATUS_NO_MEMORY
-                       : KERNEL_MM_STATUS_STATE;
-        }
-    }
     if (flags != 0U) {
         if (hint < RISCV_SV39_PAGE_SIZE_4K ||
             (hint & BOAROS_PAGE_MASK) != 0U ||
             hint > RISCV_SV39_USER_LIMIT - aligned_length) {
-            discard_prepared_file_source(record, prepared);
             return KERNEL_MM_STATUS_INVALID_ARGUMENT;
         }
         start = hint;
@@ -1375,7 +1359,6 @@ enum kernel_mm_status kernel_mm_mmap_file_private(
                                                  start + aligned_length,
                                                  &overlaps);
             if (vma_status != KERNEL_VMA_STATUS_OK || overlaps != 0) {
-                discard_prepared_file_source(record, prepared);
                 return vma_status == KERNEL_VMA_STATUS_OK
                            ? KERNEL_MM_STATUS_CONFLICT
                            : status_from_vma(vma_status);
@@ -1385,7 +1368,6 @@ enum kernel_mm_status kernel_mm_mmap_file_private(
         if (record->mmap_base < RISCV_SV39_PAGE_SIZE_4K ||
             aligned_length >
                 record->mmap_base - RISCV_SV39_PAGE_SIZE_4K) {
-            discard_prepared_file_source(record, prepared);
             return KERNEL_MM_STATUS_NO_MEMORY;
         }
         hint &= ~BOAROS_PAGE_MASK;
@@ -1401,18 +1383,92 @@ enum kernel_mm_status kernel_mm_mmap_file_private(
             aligned_length,
             &start);
         if (vma_status != KERNEL_VMA_STATUS_OK) {
-            discard_prepared_file_source(record, prepared);
             return vma_status == KERNEL_VMA_STATUS_NOT_FOUND
                        ? KERNEL_MM_STATUS_NO_MEMORY
                        : status_from_vma(vma_status);
         }
     }
-    end = start + aligned_length;
-    vma = (struct kernel_vma){
+    *plan = (struct riscv_file_mapping_plan){
+        .record = record,
         .start = start,
-        .end = end,
-        .backing_offset = file_offset,
+        .end = start + aligned_length,
         .permissions = normalized,
+    };
+    return KERNEL_MM_STATUS_OK;
+}
+
+enum kernel_mm_status kernel_mm_validate_file_private_mapping(
+    struct kernel_mm *mm,
+    uint64_t hint,
+    uint64_t length,
+    uint64_t file_offset,
+    uint32_t permissions,
+    uint32_t flags)
+{
+    struct riscv_file_mapping_plan plan;
+
+    return prepare_file_mapping(mm,
+                                hint,
+                                length,
+                                file_offset,
+                                permissions,
+                                flags,
+                                &plan);
+}
+
+enum kernel_mm_status kernel_mm_mmap_file_private(
+    struct kernel_mm *mm,
+    struct kernel_open_file_description **file,
+    uint64_t hint,
+    uint64_t length,
+    uint64_t file_offset,
+    uint32_t permissions,
+    uint32_t flags,
+    uint64_t *address)
+{
+    struct riscv_file_mapping_plan plan;
+    struct riscv_kernel_mm_record *record;
+    struct riscv_kernel_mm_file_source *prepared = 0;
+    struct riscv_kernel_mm_file_source *existing;
+    struct kernel_vma vma;
+    struct kernel_vma_edit edit;
+    enum kernel_heap_status heap_status;
+    enum kernel_mm_status status;
+    enum kernel_vma_status vma_status;
+
+    if (file == 0 || *file == 0 || address == 0 ||
+        (kernel_open_file_mode(*file) & KERNEL_VFS_S_IFMT) !=
+            KERNEL_VFS_S_IFREG) {
+        return KERNEL_MM_STATUS_INVALID_ARGUMENT;
+    }
+    status = prepare_file_mapping(mm,
+                                  hint,
+                                  length,
+                                  file_offset,
+                                  permissions,
+                                  flags,
+                                  &plan);
+    if (status != KERNEL_MM_STATUS_OK) {
+        return status;
+    }
+    record = plan.record;
+    existing = find_file_source(record, *file);
+    if (existing == 0) {
+        heap_status = kernel_heap_allocate_zeroed(record->vma_heap,
+                                                  1U,
+                                                  sizeof(*prepared),
+                                                  (void **)&prepared);
+        if (heap_status != KERNEL_HEAP_STATUS_OK) {
+            return heap_status == KERNEL_HEAP_STATUS_EMPTY
+                       ? KERNEL_MM_STATUS_NO_MEMORY
+                       : KERNEL_MM_STATUS_STATE;
+        }
+    }
+    vma = (struct kernel_vma){
+        .start = plan.start,
+        .end = plan.end,
+        .backing_offset = file_offset,
+        .permissions = plan.permissions,
         .kind = KERNEL_VMA_KIND_FILE_PRIVATE,
         .role = KERNEL_VMA_ROLE_MMAP,
         .fault_policy = KERNEL_VMA_FAULT_FILE_PRIVATE,
@@ -1427,8 +1483,8 @@ enum kernel_mm_status kernel_mm_mmap_file_private(
         }
     } else {
         vma_status = kernel_vma_set_prepare_replace(record->vmas,
-                                                    start,
-                                                    end,
+                                                    plan.start,
+                                                    plan.end,
                                                     &vma,
                                                     &edit);
         if (vma_status != KERNEL_VMA_STATUS_OK) {
@@ -1437,7 +1493,7 @@ enum kernel_mm_status kernel_mm_mmap_file_private(
         }
         status = require_active_space(record);
         if (status == KERNEL_MM_STATUS_OK) {
-            status = unmap_space_range(record, start, end);
+            status = unmap_space_range(record, plan.start, plan.end);
         }
         if (status != KERNEL_MM_STATUS_OK ||
             kernel_vma_set_commit_edit(record->vmas, &edit) !=
@@ -1449,7 +1505,7 @@ enum kernel_mm_status kernel_mm_mmap_file_private(
         }
     }
     finish_file_mapping(record, file, prepared);
-    *address = start;
+    *address = plan.start;
     return KERNEL_MM_STATUS_OK;
 }
 

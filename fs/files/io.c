@@ -82,6 +82,12 @@ static enum kernel_files_status read_pinned(
         *linux_result = -KERNEL_EISDIR;
         return KERNEL_FILES_STATUS_OK;
     }
+    if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_REGULAR &&
+        !kernel_open_file_readable(description)) {
+        files->record->statistics.read_failures++;
+        *linux_result = -KERNEL_EBADF;
+        return KERNEL_FILES_STATUS_OK;
+    }
     if (kernel_user_range_check(user_buffer, (size_t)count) !=
         KERNEL_UACCESS_STATUS_OK) {
         files->record->statistics.read_failures++;
@@ -228,6 +234,12 @@ enum kernel_files_status kernel_files_pread(
     files->record->statistics.read_calls++;
     description = kernel_files_lookup_description(files, fd);
     if (description == 0) {
+        files->record->statistics.read_failures++;
+        *linux_result = -KERNEL_EBADF;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_REGULAR &&
+        !kernel_open_file_readable(description)) {
         files->record->statistics.read_failures++;
         *linux_result = -KERNEL_EBADF;
         return KERNEL_FILES_STATUS_OK;
