@@ -455,7 +455,8 @@ static enum kernel_files_status write_request(
                     return KERNEL_FILES_STATUS_OK;
                 }
                 if (written < chunk) {
-                    break;
+                    *linux_result = (int64_t)total;
+                    return KERNEL_FILES_STATUS_OK;
                 }
             }
         }

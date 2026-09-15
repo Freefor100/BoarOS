@@ -2757,6 +2757,7 @@ static void run_partial_write_test(const void *dtb)
     static const char path[] = "/partial";
     static const char initial[] = "old";
     static const char payload[] = "PREFIX!!";
+    static const char tail[] = "TAIL";
     struct dtb_boot_info info;
     struct boot_memory_layout layout;
     struct physical_page_allocator allocator;
@@ -2772,6 +2773,7 @@ static void run_partial_write_test(const void *dtb)
     struct kernel_linux_stat linux_stat;
     struct kernel_vfs_stat vfs_stat;
     struct kernel_files_statistics statistics;
+    struct kernel_uaccess_iovec iov[2];
     unsigned char observed[sizeof(payload) - 1U];
     uint64_t cached_page = 0U;
     uint64_t baseline;
@@ -2872,13 +2874,23 @@ static void run_partial_write_test(const void *dtb)
             KERNEL_FILES_STATUS_OK ||
         result != 8 ||
         !write_user_bytes(&mm, TEST_USER_BUFFER, payload,
-                          sizeof(payload) - 1U)) {
+                          sizeof(payload) - 1U) ||
+        !write_user_bytes(&mm,
+                          TEST_USER_BUFFER + sizeof(payload) - 1U,
+                          tail,
+                          sizeof(tail) - 1U)) {
         fail_files(302U, 8, result);
+    }
+    iov[0].base = TEST_USER_BUFFER;
+    iov[0].length = sizeof(payload) - 1U;
+    iov[1].base = TEST_USER_BUFFER + sizeof(payload) - 1U;
+    iov[1].length = sizeof(tail) - 1U;
+    if (!write_user_bytes(&mm, TEST_USER_PATH, iov, sizeof(iov))) {
+        fail_files(302U, 1, 0);
     }
 
     inject_partial_write_error = 1;
-    if (kernel_files_write(&files, &mm, 0, TEST_USER_BUFFER,
-                           sizeof(payload) - 1U, &result) !=
+    if (kernel_files_writev(&files, &mm, 0, TEST_USER_PATH, 2U, &result) !=
             KERNEL_FILES_STATUS_OK ||
         result != 5) {
         fail_files(303U, 5, result);
@@ -2907,7 +2919,10 @@ static void run_partial_write_test(const void *dtb)
                            5U, 8, &result) != KERNEL_FILES_STATUS_OK ||
         result != 5 ||
         !read_user_bytes(&mm, TEST_USER_BUFFER, observed, 5U) ||
-        memcmp(observed, payload, 5U) != 0) {
+        memcmp(observed, payload, 5U) != 0 ||
+        kernel_files_pread(&files, &mm, 0, TEST_USER_BUFFER,
+                           1U, 13, &result) != KERNEL_FILES_STATUS_OK ||
+        result != 0) {
         fail_files(305U, 5, result);
     }
     kernel_files_get_statistics(&files, &statistics);
@@ -2925,12 +2940,22 @@ static void run_partial_write_test(const void *dtb)
             KERNEL_FILES_STATUS_OK ||
         result != 1 ||
         !write_user_bytes(&mm, TEST_USER_BUFFER, payload,
-                          sizeof(payload) - 1U)) {
+                          sizeof(payload) - 1U) ||
+        !write_user_bytes(&mm,
+                          TEST_USER_BUFFER + sizeof(payload) - 1U,
+                          tail,
+                          sizeof(tail) - 1U)) {
         fail_files(307U, 1, result);
     }
+    iov[0].base = TEST_USER_BUFFER;
+    iov[0].length = sizeof(payload) - 1U;
+    iov[1].base = TEST_USER_BUFFER + sizeof(payload) - 1U;
+    iov[1].length = sizeof(tail) - 1U;
+    if (!write_user_bytes(&mm, TEST_USER_PATH, iov, sizeof(iov))) {
+        fail_files(307U, 1, 0);
+    }
     inject_partial_write_error = 1;
-    if (kernel_files_write(&files, &mm, 0, TEST_USER_BUFFER,
-                           sizeof(payload) - 1U, &result) !=
+    if (kernel_files_writev(&files, &mm, 0, TEST_USER_PATH, 2U, &result) !=
             KERNEL_FILES_STATUS_OK ||
         result != 5) {
         fail_files(308U, 5, result);
@@ -2941,6 +2966,14 @@ static void run_partial_write_test(const void *dtb)
         kernel_open_file_size(description) != 18U ||
         kernel_vfs_node_size(kernel_vfs_file_node(&description->file)) !=
             18U ||
+        kernel_vfs_fstat(&description->file, &vfs_stat) != 0 ||
+        vfs_stat.size != 18U ||
+        kernel_files_fstat(&files, &mm, 0, stat_buffer, &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != 0 ||
+        !read_user_bytes(&mm, stat_buffer, &linux_stat,
+                         sizeof(linux_stat)) ||
+        linux_stat.st_size != 18 ||
         kernel_open_file_lookup_page(description, 0U, &cached_page,
                                      &valid_bytes) !=
             KERNEL_PAGE_CACHE_STATUS_NOT_FOUND ||
@@ -2948,7 +2981,10 @@ static void run_partial_write_test(const void *dtb)
                            5U, 13, &result) != KERNEL_FILES_STATUS_OK ||
         result != 5 ||
         !read_user_bytes(&mm, TEST_USER_BUFFER, observed, 5U) ||
-        memcmp(observed, payload, 5U) != 0) {
+        memcmp(observed, payload, 5U) != 0 ||
+        kernel_files_pread(&files, &mm, 0, TEST_USER_BUFFER,
+                           1U, 18, &result) != KERNEL_FILES_STATUS_OK ||
+        result != 0) {
         fail_files(309U, 18, result);
     }
     kernel_files_get_statistics(&files, &statistics);
