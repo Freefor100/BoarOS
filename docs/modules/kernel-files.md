@@ -73,7 +73,7 @@ open file description 的 offset 只增加实际复制到用户空间的字节�
 
 - `kernel_files_mkdirat()`：通过 fs context 解析路径后调用 `kernel_vfs_mkdir()`；只读挂载返回 `-EROFS`。
 - `kernel_files_unlinkat()`：支持文件删除与目录删除（`AT_REMOVEDIR` 标志）。普通文件调用 `kernel_vfs_unlink()` 并使挂载存活节点页缓存失效；目录删除调用 `kernel_vfs_rmdir()`，非空目录返回 `-ENOTEMPTY`。
-- `kernel_files_ftruncate()`：校验 fd 具备可写权限且为常规文件，调用 `kernel_vfs_ftruncate()` 调整文件大小（向下截断或向上 sparse 扩展）并精确失效该节点页缓存；backend 已改变 inode 后才返回错误时，仍先同步 node/file size 并失效缓存，再把 errno 返回用户态。只读描述符返回 `-EINVAL`，目录返回 `-EISDIR`。
+- `kernel_files_ftruncate()`：校验 fd 具备可写权限且为常规文件，调用 `kernel_vfs_ftruncate()` 调整文件大小（向下截断或向上 sparse 扩展）并精确失效该节点页缓存；backend 已改变 inode 后才返回错误时，仍先同步 node/file size 并失效缓存，再把 errno 返回用户态。只读描述符返回 `-EINVAL`，目录返回 `-EISDIR`。当前失效只摘除 page-cache 项，不撤销其他 MM 已经安装的 file-private PTE；向下截断后已驻留且页起点位于新 EOF 之外的映射重新 fault/SIGBUS 语义仍待实现。
 
 `read`、`write` 和 `writev` 在 fd lookup 后立即取得独立 OFD 引用，并在本次操作的全部复制、等待和唤醒处理结束后释放。共享表中的另一个线程即使在操作睡眠期间 close 并复用同一 fd 号，本次操作仍使用 lookup 时的 OFD；对于 pipe，这份引用也让原读/写 endpoint 在 in-flight I/O 结束前保持逻辑存活，避免提前产生 EOF/EPIPE 或释放等待队列。末次操作引用触发的底层 cleanup 失败会转交给共享文件表的原有 cleanup 链。该语义基线对应固定 Linux `f4cdf7ca9a1f` 中 [`fs/file.c`](../../references/linux/fs/file.c) 的 `fdget()`/`fdput()` 生命周期。
 

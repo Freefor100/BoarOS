@@ -20,6 +20,8 @@ VFS 为每个已解析普通文件维护引用计数 node；独立 open file des
 
 写入与截断通过 `kernel_page_cache_invalidate_node()` 精确失效指定 node 在页缓存中的所有对应页项，释放物理页引用，确保后续读取或重新缺页从底层介质加载最新数据。文件删除（`kernel_vfs_unlink`）在底层目录项移除后，遍历当前挂载的所有存活节点（`adapter->nodes`）进行保守失效。
 
+该失效当前只移除 page-cache 索引和缓存自身引用，不遍历 MM 或撤销已经安装的 file-private PTE。因而向下 `ftruncate` 后，尚未 fault 且页起点位于新 EOF 之外的映射会按更新后的 live size 产生 `SIGBUS`，但同一范围内此前已经驻留的页面可能继续命中旧 PTE；truncate-to-resident-mapping invalidation 明确延期。固定 Linux `references/linux` commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 `mm/truncate.c::truncate_pagecache()` 会以 `even_cows=1` 两次调用 `unmap_mapping_range()`，而 `mm/memory.c::unmap_mapping_range()` 通过 address-space mapping 撤销覆盖范围内的 mmap。BoarOS 在补齐反向 mapping 注册和跨 MM PTE/TLB 失效前不宣称这部分语义完成。
+
 miss 路径先分配并清零页，再通过 node 的无 offset 副作用 `pread` 填充，记录尾页有效字节数。读取整个越过 EOF 的页返回 `OUT_OF_RANGE`，尾页剩余字节保持为零。物理页分配器只有一个压力回收槽，当前由该缓存注册；分配首次耗尽时从 LRU 尾部扫描，仅驱逐引用数为 1 的未固定页，然后由分配器重试一次。被用户映射或正由 read 使用的页引用数大于 1，不会被回收。
 
 缓存销毁和 mount 卸载有严格顺序：先释放所有进程 MM 和临时读者，再 purge 该 mount 的缓存项、关闭最后的 node，之后才允许 lwext4 unmount；缓存最后注销 reclaimer 并释放哈希表。物理页和堆对象的合法释放完成即返回，分配器不变量错误进入 fatal；只有真实 ext4/block I/O 清理错误保留 mount owner。
