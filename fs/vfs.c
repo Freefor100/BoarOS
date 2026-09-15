@@ -9,6 +9,8 @@
 
 #include <ext4.h>
 #include <ext4_blockdev.h>
+#include <ext4_inode.h>
+#include <ext4_misc.h>
 #include <ext4_super.h>
 #include <ext4_types.h>
 #include <string.h>
@@ -26,6 +28,7 @@
 #define LWEXT4_DEVICE_NAME "root"
 #define LWEXT4_MOUNT_POINT "/"
 #define LWEXT4_PHYSICAL_BLOCK_SIZE 512U
+#define VFS_ROOT_MOUNT_ID UINT64_C(1)
 
 struct lwext4_orphan {
     struct lwext4_orphan *next;
@@ -40,6 +43,7 @@ struct lwext4_mount_adapter {
     struct ext4_blockdev device;
     unsigned char *physical_buffer;
     struct kernel_page_cache *page_cache;
+    struct ext4_sblock *superblock;
     struct kernel_vfs_node *nodes;
     struct kernel_vfs_node *cleanup_nodes;
     struct lwext4_orphan *orphans;
@@ -209,6 +213,7 @@ static int release_mount_storage(struct kernel_vfs_mount *mount)
 
     (void)kernel_heap_release(heap, adapter);
     mount->private_data = 0;
+    mount->id = 0U;
     mount->state = VFS_MOUNT_STATE_EMPTY;
     return 0;
 }
@@ -334,7 +339,8 @@ int kernel_vfs_mount_root(struct kernel_vfs_mount *mount,
     int result;
 
     if (mount == 0 || mount->state != VFS_MOUNT_STATE_EMPTY ||
-        mount->private_data != 0 || block == 0 || block->read == 0 ||
+        mount->private_data != 0 || mount->id != 0U ||
+        block == 0 || block->read == 0 ||
         block->logical_block_size != LWEXT4_PHYSICAL_BLOCK_SIZE ||
         heap == 0 || page_cache == 0 ||
         page_cache->state != KERNEL_PAGE_CACHE_LIVE) {
@@ -410,6 +416,8 @@ int kernel_vfs_mount_root(struct kernel_vfs_mount *mount,
         return -KERNEL_EUCLEAN;
     }
 
+    adapter->superblock = superblock;
+    mount->id = VFS_ROOT_MOUNT_ID;
     mount->state = VFS_MOUNT_STATE_LIVE;
     return 0;
 }
@@ -1001,6 +1009,95 @@ uint64_t kernel_vfs_file_size(const struct kernel_vfs_file *file)
     }
     node = file->private_data;
     return node->size;
+}
+
+static int inode_extra_field_present(struct ext4_sblock *superblock,
+                                     struct ext4_inode *inode,
+                                     size_t field_offset,
+                                     size_t field_size)
+{
+    uint16_t extra_size = ext4_inode_get_extra_isize(superblock, inode);
+
+    return field_offset <= SIZE_MAX - field_size &&
+           field_offset + field_size <=
+               EXT4_GOOD_OLD_INODE_SIZE + (size_t)extra_size;
+}
+
+static struct kernel_vfs_timespec decode_inode_time(
+    uint32_t base, uint32_t extra, int has_extra)
+{
+    struct kernel_vfs_timespec result = {
+        .seconds = (int32_t)base,
+        .nanoseconds = 0,
+    };
+
+    if (has_extra) {
+        extra = to_le32(extra);
+        if ((extra & 3U) != 0U)
+            result.seconds += (int64_t)(extra & 3U) << 32U;
+        result.nanoseconds = (int64_t)(extra >> 2U);
+    }
+    return result;
+}
+
+int kernel_vfs_fstat(const struct kernel_vfs_file *file,
+                     struct kernel_vfs_stat *stat)
+{
+    const struct kernel_vfs_node *node;
+    struct ext4_inode inode;
+    struct ext4_sblock *superblock;
+    uint32_t creator_os;
+    int result;
+
+    if (file == 0 || stat == 0 || file->state != VFS_FILE_STATE_LIVE ||
+        file->private_data == 0 || file->mount == 0 ||
+        file->mount->state != VFS_MOUNT_STATE_LIVE || file->mount->id == 0U) {
+        return -KERNEL_EINVAL;
+    }
+    node = file->private_data;
+    if (node->adapter == 0 || node->adapter->superblock == 0)
+        return -KERNEL_EIO;
+    superblock = node->adapter->superblock;
+    result = ext4_fraw_inode_fill(&node->file, &inode);
+    if (result != EOK) return lwext4_error(result);
+
+    memset(stat, 0, sizeof(*stat));
+    stat->dev = file->mount->id;
+    stat->ino = node->file.inode;
+    stat->mode = ext4_inode_get_mode(superblock, &inode);
+    stat->nlink = ext4_inode_get_links_cnt(&inode);
+    stat->uid = to_le16(inode.uid);
+    stat->gid = to_le16(inode.gid);
+    creator_os = ext4_get32(superblock, creator_os);
+    if (creator_os == EXT4_SUPERBLOCK_OS_LINUX) {
+        stat->uid |= (uint32_t)to_le16(inode.osd2.linux2.uid_high) << 16U;
+        stat->gid |= (uint32_t)to_le16(inode.osd2.linux2.gid_high) << 16U;
+    }
+    if ((stat->mode & EXT4_INODE_MODE_TYPE_MASK) ==
+            EXT4_INODE_MODE_CHARDEV ||
+        (stat->mode & EXT4_INODE_MODE_TYPE_MASK) ==
+            EXT4_INODE_MODE_BLOCKDEV) {
+        stat->rdev = ext4_inode_get_dev(&inode);
+    }
+    stat->size = ext4_inode_get_size(superblock, &inode);
+    stat->blocks = ext4_inode_get_blocks_count(superblock, &inode);
+    stat->blksize = ext4_sb_get_block_size(superblock);
+    stat->atime = decode_inode_time(
+        ext4_inode_get_access_time(&inode), inode.atime_extra,
+        inode_extra_field_present(superblock, &inode,
+                                  offsetof(struct ext4_inode, atime_extra),
+                                  sizeof(inode.atime_extra)));
+    stat->mtime = decode_inode_time(
+        ext4_inode_get_modif_time(&inode), inode.mtime_extra,
+        inode_extra_field_present(superblock, &inode,
+                                  offsetof(struct ext4_inode, mtime_extra),
+                                  sizeof(inode.mtime_extra)));
+    stat->ctime = decode_inode_time(
+        ext4_inode_get_change_inode_time(&inode), inode.ctime_extra,
+        inode_extra_field_present(superblock, &inode,
+                                  offsetof(struct ext4_inode, ctime_extra),
+                                  sizeof(inode.ctime_extra)));
+    return 0;
 }
 
 int kernel_vfs_mkdir(struct kernel_vfs_mount *mount,

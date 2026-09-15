@@ -29,13 +29,15 @@ handler 的 a0/a1/a2 分别为信号、siginfo 地址和 ucontext 地址；ra �
 
 wait4、console read 和 pipe I/O 可被未阻塞信号唤醒；handler 的 SA_RESTART 决定这些可重启调用是重执行还是 EINTR。进入 handler 前清除任务内的外层重启状态，重执行所需参数保存在被中断的用户寄存器现场中。
 
+无超时 FUTEX_WAIT 使用 generic restart，handler 的 SA_RESTART 决定重试或 EINTR；重试会重新读取 futex word，值已变化返回 EAGAIN。带超时 FUTEX_WAIT 与 nanosleep 一样使用独立 tagged restart state：进入任何用户 handler 都返回 EINTR，不由 SA_RESTART 自动继续；没有进入 handler 的 stop/continue 等路径由 restart_syscall 使用首次调用保存的 monotonic absolute deadline，不能重新获得完整 relative timeout。
+
 nanosleep/clock_nanosleep 遇到用户 handler 始终返回 EINTR，不受 SA_RESTART 影响。只有没有进入 handler 的 stop/continue 等路径使用 restart_syscall 恢复原绝对 deadline；绝对睡眠不写 remaining。纳秒输入及 tick deadline 使用明确的饱和范围，tick 的未来距离不超过 INT64_MAX，避免远期时间被有符号差值误判为过去。
 
 sigsuspend 在等待和选择 handler 时保留临时 mask，把原 mask 写入信号恢复上下文，由 sigreturn 恢复；不能先恢复旧 mask 再选择信号。vfork 使用具体子进程的一次性完成条件，不由普通信号解除等待。
 
 ## 验证与当前边界
 
-当前 RV64 `-O2` 静态栈检查中，构帧函数使用 896 字节、sigreturn 使用 864 字节；构帧复用前缀/mcontext 存储，不在内核栈放置整份 1088 字节 frame。线程组改动后的任务控制块为 1504 字节；4 KiB 页扣除控制块、canary/对齐和 288 字节 Trap Frame 后剩余 2288 字节。真实静态用户态曾在 getdents→ext4→heap 释放调用链触发 canary；getdents 改为直接填充输出记录中的文件名，去掉额外 256 字节副本，其静态栈降至 416 字节，组合回归通过。单函数统计和一次回归均不是完整栈界证明，深层缺页和失败清理链仍须沿调用链审查。
+当前 RV64 `-O2` 静态栈检查中，构帧函数使用 896 字节、sigreturn 使用 864 字节；构帧复用前缀/mcontext 存储，不在内核栈放置整份 1088 字节 frame。加入 tagged restart state 后任务控制块为 1552 字节；4 KiB 页扣除控制块、canary/16-byte 对齐和 288 字节 Trap Frame 后剩余 2240 字节。真实静态用户态曾在 getdents→ext4→heap 释放调用链触发 canary；getdents 改为直接填充输出记录中的文件名，去掉额外 256 字节副本，其静态栈降至 416 字节，组合回归通过。单函数统计和一次回归均不是完整栈界证明，深层缺页和失败清理链仍须沿调用链审查。
 
 `make test-signal-riscv` 覆盖 syscall 复制失败、状态提交与 errno；`make test-userland-riscv` 以真实静态 musl 验证 handler/sigreturn、libc ucontext、sigsuspend、睡眠 EINTR、vfork、SIGCHLD 回收及 pipe 等待。架构和调度边界由 `make test-riscv` 回归。
 

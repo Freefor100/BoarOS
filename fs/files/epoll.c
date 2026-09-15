@@ -249,12 +249,22 @@ enum kernel_files_status kernel_files_epoll_create1(
     if (kernel_files_find_free_fd(files, &fd, &find_result) !=
         KERNEL_FILES_STATUS_OK) {
         (void)kernel_open_file_release(&ofd);
+        return KERNEL_FILES_STATUS_STATE;
+    }
+    if (find_result != 0) {
+        (void)kernel_open_file_release(&ofd);
         *linux_result = (int64_t)find_result;
         return KERNEL_FILES_STATUS_OK;
     }
-    files->record->slots[fd].description = ofd;
-    if ((flags & KERNEL_EPOLL_CLOEXEC) != 0U) {
-        files->record->slots[fd].flags |= KERNEL_FILES_FD_CLOEXEC;
+    if (kernel_files_install_new_owned_at(
+            files,
+            fd,
+            (flags & KERNEL_EPOLL_CLOEXEC) != 0U
+                ? KERNEL_FILES_FD_CLOEXEC
+                : 0U,
+            &ofd) != KERNEL_FILES_STATUS_OK) {
+        (void)kernel_open_file_release(&ofd);
+        return KERNEL_FILES_STATUS_STATE;
     }
     *linux_result = (int64_t)fd;
     return KERNEL_FILES_STATUS_OK;

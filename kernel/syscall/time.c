@@ -2,6 +2,7 @@
 
 #include <arch/riscv/timer.h>
 #include <kernel/errno.h>
+#include <kernel/futex.h>
 #include <kernel/mm.h>
 #include <kernel/scheduler.h>
 #include <kernel/signal.h>
@@ -212,9 +213,29 @@ enum kernel_syscall_status syscall_handle_restart_syscall(
     enum kernel_scheduler_status sleep_status;
     uint64_t deadline;
     uint64_t remaining_address;
+    uint64_t futex_address;
+    uint64_t futex_deadline_ns;
+    uint32_t futex_operation;
+    uint32_t futex_expected;
 
     decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
-    if (!kernel_signal_nanosleep_restart(caller, &deadline, &remaining_address)) {
+    if (kernel_signal_futex_timed_restart(caller, &futex_address,
+                                           &futex_operation,
+                                           &futex_expected,
+                                           &futex_deadline_ns)) {
+        enum kernel_scheduler_status futex_status;
+
+        decoded->value = kernel_futex_restart_timed(
+            caller, futex_address, futex_operation, futex_expected,
+            futex_deadline_ns, &futex_status);
+        if (futex_status != KERNEL_SCHEDULER_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+        if (decoded->value != -KERNEL_ERESTARTSYS)
+            kernel_signal_clear_syscall_restart(caller);
+        return KERNEL_SYSCALL_STATUS_OK;
+    }
+    if (!kernel_signal_nanosleep_restart(caller, &deadline,
+                                         &remaining_address)) {
         decoded->value = -KERNEL_ENOSYS;
         return KERNEL_SYSCALL_STATUS_OK;
     }

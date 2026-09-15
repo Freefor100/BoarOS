@@ -114,6 +114,8 @@ static void run_orphan_cleanup_regression(struct kernel_vfs_mount *mount,
     struct kernel_open_file_description *unrelated = 0;
     struct kernel_vfs_file unopened = {0};
     struct kernel_vfs_file missing = {0};
+    struct kernel_vfs_file orphan_stat_file = {0};
+    struct kernel_vfs_stat orphan_stat;
     int linux_result = -1;
 
     if (kernel_open_file_create_mode(heap,
@@ -158,6 +160,15 @@ static void run_orphan_cleanup_regression(struct kernel_vfs_mount *mount,
         missing.private_data != 0 || orphan_free_calls != 2U) {
         fail_vfs(27U, -KERNEL_ENOENT, orphan_free_calls);
     }
+    if (kernel_vfs_create(mount, "/orphan-stat", 0640U,
+                          &orphan_stat_file) != 0 ||
+        kernel_vfs_unlink(mount, "/orphan-stat") != 0 ||
+        kernel_vfs_fstat(&orphan_stat_file, &orphan_stat) != 0 ||
+        orphan_stat.nlink != 0U || orphan_stat.dev != mount->id ||
+        (orphan_stat.mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFREG ||
+        kernel_vfs_close(&orphan_stat_file) != 0) {
+        fail_vfs(28U, 0, orphan_stat.nlink);
+    }
 }
 #endif
 
@@ -179,6 +190,7 @@ static void run_vfs_test(const void *dtb)
     struct kernel_vfs_file large = {0};
     struct kernel_vfs_file missing = {0};
     struct kernel_read_source source;
+    struct kernel_vfs_stat metadata;
     unsigned char buffer[64];
     uint64_t first_page = 0U;
     uint64_t alias_page = 0U;
@@ -273,6 +285,13 @@ static void run_vfs_test(const void *dtb)
                       KERNEL_VFS_S_IXGRP |
                       KERNEL_VFS_S_IXOTH)) == 0U) {
         fail_vfs(7U, 0, result);
+    }
+    if (kernel_vfs_fstat(&file, &metadata) != 0 || metadata.dev != 1U ||
+        metadata.ino == 0U || metadata.nlink != 2U ||
+        metadata.size != sizeof(expected) - 1U || metadata.blocks == 0U ||
+        metadata.blksize == 0U ||
+        (metadata.mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFREG) {
+        fail_vfs(29U, 2, metadata.nlink);
     }
     result = kernel_vfs_open(&mount, "/init-link", &alias);
     if (result != 0 || !kernel_vfs_files_share_node(&file, &alias) ||
@@ -410,7 +429,7 @@ static void run_vfs_test(const void *dtb)
     }
     run_orphan_cleanup_regression(&mount, &heap);
     result = kernel_vfs_unmount(&mount);
-    if (result != 0 || orphan_free_calls != 4U) {
+    if (result != 0 || orphan_free_calls != 5U) {
         fail_vfs(12U, 0, result);
     }
 

@@ -8,7 +8,7 @@
 |---|---|
 | `include/kernel/mm.h` | 定义跨架构 MM 句柄、权限、状态、引用和 VMA 入口 |
 | `include/arch/riscv/mm.h`、`arch/riscv/mm.c` | 用一张记录页封装 Sv39 用户地址空间与可选 VMA 集合，并实现当前构建所选的通用 MM 操作 |
-| `tests/riscv/mm_cases.c`、`tests/mm-riscv.sh` | 验证创建、共享引用、移动、查询和既有页表回收语义 |
+| `tests/riscv/mm_cases.c`、`tests/mm-riscv.sh`、`tests/mm-fatal-riscv.sh` | 验证创建、共享引用、移动、查询、页表回收和 resolution invariant fatal |
 | `tests/riscv/vma_cases.c`、`tests/vma-riscv.sh` | 验证 VMA 集成后的 fork、缺页解析、OOM 与所有权回收 |
 
 稳定接口为：
@@ -158,7 +158,7 @@ scheduler 的 U-mode 硬件页故障和当前任务的 uaccess 都可进入该�
 ```text
 LIVE(last ref)
   -> release VMA metadata
-  -> release file-source OFD registry
+  -> release file/ELF-source registry
   -> release user-leaf references and destroy page tables
   -> release MM record page
   -> RELEASED
@@ -166,7 +166,7 @@ LIVE(last ref)
 
 `CLEANUP_VMAS`、`CLEANUP_FILE_SOURCES` 和 `CLEANUP_ELF_SOURCES` 只表示仍由 MM 持有的文件/OFD/source owner 需要完成真实 VFS/I/O 清理；页表树、VMA metadata、记录页和物理页的合法释放完成即推进流程，不产生 allocator retry。所有 CLEANUP 句柄都只能 move 或由所属上层继续处理，不能 acquire、lookup 或生成 `satp`。非末引用释放不触碰 VMA、文件来源或页表树。
 
-如果页表访问边界在销毁过程中失败，Sv39 可能已经释放部分页表树；MM 会保留 `CLEANUP_SPACE` owner 并返回 `ADDRESS_SPACE`，下一次 `release` 从剩余结构继续。这个状态只表示硬件/访问错误，合法物理页释放本身不返回可重试状态。
+页表页在 production 中只经 finalized physical-page allocator 和固定 direct map 解析。合法且仍归 MM owner 所有的页表页没有异步缺页、I/O 或其他能让失败条件稍后消失的 producer；解析失败只可能表示页所有权、allocator metadata 或 direct-map 不变量已经破坏。因此 Sv39 teardown 直接触发 fatal trap，不保留 `CLEANUP_SPACE`，也不允许下一次 `release` 把部分释放的树伪装成恢复成功。VFS/OFD 的真实外部 I/O owner 仍使用各自 cleanup 状态。
 
 用户退出路径先切到内核根页表，再在仍有效的任务内核栈上调用 `kernel_mm_release()`；只有真实 VFS/OFD cleanup 仍有 owner 时才交给后续回收上下文处理。因此不会销毁硬件当前仍在使用的用户根。MM 完成后才允许任务成为 zombie，zombie 只保留身份、亲缘、wait status 和任务页。
 
@@ -188,6 +188,6 @@ make test-user-riscv
 make test-riscv
 ```
 
-MM 聚焦测试覆盖创建失败原子性、共享引用、移动、COW fork 的父子共享/写隔离/末引用原地恢复、`PROT_NONE` COW 属性，以及页表回收和物理页基线。文件测试覆盖 cache hit/miss、write-first、尾页补零、整页越 EOF、fd 关闭后 fault、fork 后 OFD 来源和最终回收。`test-mmap-riscv` 与真实 ext4 `/init` 从 U-mode 完成匿名/文件私有 mmap、COW、SIGBUS、mprotect/munmap 生命周期。
+MM 聚焦测试覆盖创建失败原子性、共享引用、移动、COW fork 的父子共享/写隔离/末引用原地恢复、`PROT_NONE` COW 属性，以及正常页表回收和物理页基线；同一 target 还运行独立 fatal kernel，注入一次页表 backing 无法解析并确认只产生一个 fatal 结果、不会返回 retry/success 路径。文件测试覆盖 cache hit/miss、write-first、尾页补零、整页越 EOF、fd 关闭后 fault、fork 后 OFD 来源和最终回收。`test-mmap-riscv` 与真实 ext4 `/init` 从 U-mode 完成匿名/文件私有 mmap、COW、SIGBUS、mprotect/munmap 生命周期。
 
 当前只有 RISC-V 后端；映射仍由 Sv39/4 KiB 用户页实现。普通 fork 使用独立 MM+COW，线程 clone/vfork 共享同一 MM record；匿名映射和 ELF image 使用每 MM 的 ASLR mmap ceiling（无可信种子时确定性降级），但没有 commit accounting。只读普通文件支持 MAP_PRIVATE，尚无 MAP_SHARED、写回或 truncate 并发；brk 尚未接入 RLIMIT_DATA。文件表和信号表不属于 MM。futex 当前以 MM 身份与用户地址为 key，共享文件映射落地前不提供跨 MM futex 语义。

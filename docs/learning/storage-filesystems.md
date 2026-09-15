@@ -52,6 +52,12 @@ BoarOS 的线性 ext4 适配器现在把每条记录结束的字节位置作为 
 
 BoarOS 当前让 `read` 按文件页从共享页缓存取得内容，再复制到用户页。命中避免重复 ext4/块 I/O，但仍有 cache-to-user 复制和用户页软件遍历；read-ahead、固定用户页后的直接 I/O 或异步请求仍未实现。无论数据来自磁盘还是缓存，都必须保持 fd/open-description 分层、短读、offset 与 errno 语义：只有实际交付用户的前缀才能推进 offset。性能取舍需要在 QEMU 和开发板上用文件大小、顺序/随机模式、page fault 比例及 cache/TLB 数据说明，不能只比较函数层数。
 
+## inode metadata 与 stat ABI
+
+`fstat` 与 pathname stat 应只在对象获取方式上不同，不能各自猜一份 inode 信息。稳定分层是 filesystem backend 从仍存活的 handle 读取 raw inode，VFS 转成统一 metadata，再由 syscall 层做架构 ABI 布局转换。这样 unlink-but-open 仍能报告同一个 inode 且 `nlink == 0`，以后增加 statx 也不必复制 ext4 解码。
+
+`st_blocks` 的单位固定为 512 字节，不是 filesystem block size，也不能由 logical size 向上取整：extent、间接块、稀疏 hole 与 metadata allocation 都会让二者不同。ext4 inode 已保存 512-byte block count，VFS 应直接读取；`st_blksize` 则报告 filesystem 的建议 I/O block size。ext4 的 atime/mtime/ctime 基础秒是有符号 32 位，extra 字段低 2 位扩展 epoch、其余位保存纳秒，并且只有字段落在 inode `extra_isize` 范围内时才可读取。字段解码正确不代表 mutation policy 已完整实现；create/read/write/truncate/unlink 何时更新各时间仍需独立定义与 regression。
+
 ## 页缓存、私有映射与文件尾
 
 页缓存要按“文件对象身份 + 页号”而不是 fd 或 open offset 建键。fd 会关闭和复用，两次

@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <sched.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -16,11 +17,214 @@
 #define ARRAY_SIZE(array) (sizeof(array) / sizeof((array)[0]))
 #define WORKERS 3
 #define FUTEX_WAIT 0
+#define FUTEX_WAKE 1
 #define FUTEX_PRIVATE_FLAG 128
 #define FUTEX_WAIT_BITSET 9
 #define FUTEX_WAIT_PRIVATE (FUTEX_WAIT | FUTEX_PRIVATE_FLAG)
 #define FUTEX_WAIT_BITSET_PRIVATE (FUTEX_WAIT_BITSET | FUTEX_PRIVATE_FLAG)
 #define FUTEX_BITSET_MATCH_ANY UINT32_MAX
+
+static volatile sig_atomic_t futex_signal_seen;
+static volatile sig_atomic_t futex_signal_changes_word;
+static volatile int *futex_signal_word;
+
+static void futex_signal_handler(int signal_number)
+{
+    futex_signal_seen = signal_number;
+    if (futex_signal_changes_word && futex_signal_word != 0)
+        *futex_signal_word = 1;
+}
+
+struct futex_signal_case {
+    int word;
+    volatile int ready;
+    int timed;
+    long timeout_nanoseconds;
+    int result;
+    int error;
+};
+
+static void *futex_signal_waiter(void *opaque)
+{
+    struct futex_signal_case *test = opaque;
+    struct timespec timeout = {
+        .tv_sec = test->timeout_nanoseconds / 1000000000L,
+        .tv_nsec = test->timeout_nanoseconds % 1000000000L,
+    };
+
+    test->ready = 1;
+    errno = 0;
+    test->result = (int)syscall(SYS_futex, &test->word,
+                                FUTEX_WAIT_PRIVATE, 0,
+                                test->timed ? &timeout : 0, 0, 0);
+    test->error = errno;
+    return 0;
+}
+
+static int wait_for_futex_case_ready(struct futex_signal_case *test)
+{
+    for (int tries = 0; tries < 10000 && !test->ready; tries++)
+        sched_yield();
+    return test->ready ? 0 : 1;
+}
+
+static int wait_for_futex_signal(void)
+{
+    for (int tries = 0; tries < 10000 && !futex_signal_seen; tries++)
+        sched_yield();
+    return futex_signal_seen ? 0 : 1;
+}
+
+static int run_futex_signal_case(int restart, int timed, int change_word,
+                                 int expected_error)
+{
+    struct sigaction action = {0};
+    struct futex_signal_case test = {
+        .timed = timed,
+        .timeout_nanoseconds = 1000000000L,
+    };
+    pthread_t thread;
+    void *thread_result = 0;
+
+    sigemptyset(&action.sa_mask);
+    action.sa_handler = futex_signal_handler;
+    action.sa_flags = restart ? SA_RESTART : 0;
+    if (sigaction(SIGUSR1, &action, 0) != 0) return 1;
+    futex_signal_seen = 0;
+    futex_signal_changes_word = change_word;
+    futex_signal_word = &test.word;
+    if (pthread_create(&thread, 0, futex_signal_waiter, &test) != 0)
+        return 2;
+    if (wait_for_futex_case_ready(&test) != 0 ||
+        pthread_kill(thread, SIGUSR1) != 0 || wait_for_futex_signal() != 0) {
+        test.word = 1;
+        syscall(SYS_futex, &test.word, FUTEX_WAKE, 1, 0, 0, 0);
+        pthread_join(thread, &thread_result);
+        return 3;
+    }
+    if (!change_word) {
+        test.word = 1;
+        syscall(SYS_futex, &test.word, FUTEX_WAKE, 1, 0, 0, 0);
+    }
+    if (pthread_join(thread, &thread_result) != 0 || thread_result != 0)
+        return 4;
+    futex_signal_word = 0;
+    if (expected_error == 0)
+        return test.result == 0 ? 0 : 5;
+    return test.result == -1 && test.error == expected_error ? 0 : 6;
+}
+
+static int check_futex_wake_signal_boundary(void)
+{
+    struct sigaction action = {0};
+    struct futex_signal_case test = {0};
+    struct timespec settle = { .tv_sec = 0, .tv_nsec = 20000000L };
+    pthread_t thread;
+    void *thread_result = 0;
+
+    sigemptyset(&action.sa_mask);
+    action.sa_handler = futex_signal_handler;
+    action.sa_flags = SA_RESTART;
+    if (sigaction(SIGUSR1, &action, 0) != 0) return 1;
+    futex_signal_seen = 0;
+    futex_signal_changes_word = 0;
+    futex_signal_word = &test.word;
+    if (pthread_create(&thread, 0, futex_signal_waiter, &test) != 0)
+        return 2;
+    if (wait_for_futex_case_ready(&test) != 0 || nanosleep(&settle, 0) != 0)
+        return 3;
+
+    /* Publish the changed condition, wake the waiter, then queue a signal
+     * before it can run. The completed wake wins; the signal is still
+     * delivered, and must not turn the successful wait into a retry. */
+    test.word = 1;
+    if (syscall(SYS_futex, &test.word, FUTEX_WAKE, 1, 0, 0, 0) != 1 ||
+        pthread_kill(thread, SIGUSR1) != 0 ||
+        pthread_join(thread, &thread_result) != 0 || thread_result != 0 ||
+        test.result != 0 || wait_for_futex_signal() != 0) return 4;
+    futex_signal_word = 0;
+    return 0;
+}
+
+static int check_futex_timeout_signal_boundary(void)
+{
+    struct sigaction action = {0};
+    struct futex_signal_case test = {
+        .timed = 1,
+        .timeout_nanoseconds = 50000000L,
+    };
+    struct timespec near_deadline = {
+        .tv_sec = 0,
+        .tv_nsec = 40000000L,
+    };
+    pthread_t thread;
+    void *thread_result = 0;
+
+    sigemptyset(&action.sa_mask);
+    action.sa_handler = futex_signal_handler;
+    action.sa_flags = SA_RESTART;
+    if (sigaction(SIGUSR1, &action, 0) != 0) return 1;
+    futex_signal_seen = 0;
+    futex_signal_changes_word = 0;
+    futex_signal_word = &test.word;
+    if (pthread_create(&thread, 0, futex_signal_waiter, &test) != 0)
+        return 2;
+    if (wait_for_futex_case_ready(&test) != 0 ||
+        nanosleep(&near_deadline, 0) != 0 ||
+        pthread_kill(thread, SIGUSR1) != 0 ||
+        pthread_join(thread, &thread_result) != 0 || thread_result != 0 ||
+        wait_for_futex_signal() != 0) return 3;
+    futex_signal_word = 0;
+
+    /* At the deadline boundary Linux permits either event to win. A caught
+     * handler may expose EINTR; an already committed timeout exposes
+     * ETIMEDOUT. No fresh timeout or unrelated result is valid. */
+    return test.result == -1 &&
+                   (test.error == EINTR || test.error == ETIMEDOUT)
+               ? 0
+               : 4;
+}
+
+static int check_timed_futex_stop_restart(void)
+{
+    struct timespec timeout = { .tv_sec = 0, .tv_nsec = 300000000L };
+    struct timespec delay = { .tv_sec = 0, .tv_nsec = 60000000L };
+    struct timespec stopped = { .tv_sec = 0, .tv_nsec = 100000000L };
+    struct timespec before, after;
+    int word = 0;
+    int status = 0;
+    pid_t controller = fork();
+
+    if (controller < 0) return 1;
+    if (controller == 0) {
+        pid_t parent = getppid();
+
+        if (nanosleep(&delay, 0) != 0 || kill(parent, SIGSTOP) != 0 ||
+            nanosleep(&stopped, 0) != 0 || kill(parent, SIGCONT) != 0)
+            _exit(1);
+        _exit(0);
+    }
+    if (clock_gettime(CLOCK_MONOTONIC, &before) != 0) return 2;
+    errno = 0;
+    if (syscall(SYS_futex, &word, FUTEX_WAIT_PRIVATE, 0,
+                &timeout, 0, 0) != -1 || errno != ETIMEDOUT) {
+        kill(controller, SIGCONT);
+        waitpid(controller, &status, 0);
+        return 3;
+    }
+    if (clock_gettime(CLOCK_MONOTONIC, &after) != 0 ||
+        waitpid(controller, &status, 0) != controller ||
+        !WIFEXITED(status) || WEXITSTATUS(status) != 0) return 4;
+    {
+        int64_t elapsed_ns =
+            (int64_t)(after.tv_sec - before.tv_sec) * INT64_C(1000000000) +
+            after.tv_nsec - before.tv_nsec;
+
+        if (elapsed_ns < INT64_C(250000000) ||
+            elapsed_ns > INT64_C(400000000)) return 5;
+    }
+    return 0;
+}
 
 static _Thread_local int executable_tls = 101;
 
@@ -571,6 +775,25 @@ static int check_raw_futex(void)
                     cases[i].bitset) != -1 || errno != cases[i].error)
             return (int)i + 1;
     }
+    /* Untimed FUTEX_WAIT follows ERESTARTSYS: a caught handler without
+     * SA_RESTART exposes EINTR, while SA_RESTART retries until a wake. */
+    if (run_futex_signal_case(0, 0, 0, EINTR) != 0) return 10;
+    if (run_futex_signal_case(1, 0, 0, 0) != 0) return 11;
+
+    /* A retried wait must compare the futex word again. The handler changes
+     * it before sigreturn, so the retry observes EAGAIN rather than sleeping. */
+    if (run_futex_signal_case(1, 0, 1, EAGAIN) != 0) return 12;
+
+    /* Timed waits use restart-block semantics: a caught handler sees EINTR
+     * even with SA_RESTART. */
+    if (run_futex_signal_case(0, 1, 0, EINTR) != 0) return 13;
+    if (run_futex_signal_case(1, 1, 0, EINTR) != 0) return 14;
+
+    /* A stop/continue has no userspace handler, so restart_syscall resumes
+     * the timed wait against its first absolute deadline. */
+    if (check_timed_futex_stop_restart() != 0) return 15;
+    if (check_futex_wake_signal_boundary() != 0) return 16;
+    if (check_futex_timeout_signal_boundary() != 0) return 17;
     return 0;
 }
 

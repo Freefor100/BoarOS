@@ -38,12 +38,12 @@ static int validate_open_flags(uint64_t flags, uint32_t *fd_flags)
     const uint64_t write_flags = LINUX_O_CREAT | LINUX_O_TRUNC |
                                  LINUX_O_APPEND | LINUX_O_EXCL;
     const uint64_t unsupported_flags =
-        LINUX_O_NONBLOCK | LINUX_O_DSYNC | LINUX_O_DIRECT |
-        LINUX_O_NOFOLLOW | LINUX_O_NOATIME | LINUX_O_SYNC | LINUX_O_PATH |
+        LINUX_O_DSYNC | LINUX_O_DIRECT | LINUX_O_NOFOLLOW |
+        LINUX_O_NOATIME | LINUX_O_SYNC | LINUX_O_PATH |
         (LINUX_O_TMPFILE & ~LINUX_O_DIRECTORY);
     const uint64_t known_flags = LINUX_O_ACCMODE | write_flags |
-        unsupported_flags | LINUX_O_DIRECTORY | LINUX_O_LARGEFILE |
-        LINUX_O_CLOEXEC;
+        unsupported_flags | LINUX_O_NONBLOCK | LINUX_O_DIRECTORY |
+        LINUX_O_LARGEFILE | LINUX_O_CLOEXEC;
     uint64_t access_mode = flags & LINUX_O_ACCMODE;
 
     if (access_mode == 3U || (flags & ~known_flags) != 0U) {
@@ -68,25 +68,6 @@ static enum kernel_files_status finish_path(struct kernel_files *files,
                    KERNEL_FILES_STATUS_OK
                ? KERNEL_FILES_STATUS_OK
                : KERNEL_FILES_STATUS_STATE;
-}
-
-static void install_open_file(struct kernel_files *files,
-                              struct kernel_open_file_description *description,
-                              uint32_t fd,
-                              uint32_t fd_flags)
-{
-    files->record->slots[fd].description = description;
-    files->record->slots[fd].flags = fd_flags;
-    files->record->statistics.current_open_fds++;
-    if (files->record->statistics.current_open_fds >
-        files->record->statistics.peak_open_fds) {
-        files->record->statistics.peak_open_fds =
-            files->record->statistics.current_open_fds;
-    }
-    if ((fd_flags & KERNEL_FILES_FD_CLOEXEC) != 0U) {
-        files->record->statistics.close_on_exec_fds++;
-    }
-    files->record->next_fd = fd + 1U;
 }
 
 enum kernel_files_status kernel_files_openat(
@@ -285,32 +266,61 @@ enum kernel_files_status kernel_files_openat(
     }
 
     description->open_flags = (uint32_t)flags;
-    install_open_file(files, description, fd, fd_flags);
+    files_status = kernel_files_install_new_owned_at(files,
+                                                     fd,
+                                                     fd_flags,
+                                                     &description);
+    if (files_status != KERNEL_FILES_STATUS_OK) {
+        kernel_files_queue_description(files, description);
+        (void)kernel_files_drain_file_cleanup(files);
+        return files_status;
+    }
     *linux_result = fd;
     return KERNEL_FILES_STATUS_OK;
 }
 
-static void fill_linux_stat(
+static int fill_linux_stat(
     struct kernel_linux_stat *stat,
     const struct kernel_open_file_description *description)
 {
     uint64_t size = kernel_open_file_size(description);
+    enum kernel_open_file_kind kind = kernel_open_file_kind(description);
 
     memset(stat, 0, sizeof(*stat));
-    if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_CONSOLE) {
+    if (kind == KERNEL_OPEN_FILE_KIND_CONSOLE) {
         stat->st_mode = KERNEL_VFS_S_IFCHR | UINT32_C(0000600);
         stat->st_rdev = UINT64_C(0x501);
-    } else if (kernel_open_file_kind(description) ==
-               KERNEL_OPEN_FILE_KIND_PIPE) {
+    } else if (kind == KERNEL_OPEN_FILE_KIND_PIPE) {
         stat->st_mode = KERNEL_VFS_S_IFIFO | UINT32_C(0000600);
+    } else if (kind == KERNEL_OPEN_FILE_KIND_EPOLL) {
+        /* epoll is an anonymous synthetic object, not a VFS inode. */
     } else {
-        stat->st_mode = kernel_open_file_mode(description);
-        stat->st_ino = kernel_vfs_file_inode(&description->file);
-        stat->st_blocks = (int64_t)((size + 511U) / 512U);
+        struct kernel_vfs_stat vfs_stat;
+        int result = kernel_vfs_fstat(&description->file, &vfs_stat);
+
+        if (result != 0) return result;
+        stat->st_dev = vfs_stat.dev;
+        stat->st_ino = vfs_stat.ino;
+        stat->st_mode = vfs_stat.mode;
+        stat->st_nlink = vfs_stat.nlink;
+        stat->st_uid = vfs_stat.uid;
+        stat->st_gid = vfs_stat.gid;
+        stat->st_rdev = vfs_stat.rdev;
+        stat->st_size = (int64_t)vfs_stat.size;
+        stat->st_blksize = (int32_t)vfs_stat.blksize;
+        stat->st_blocks = (int64_t)vfs_stat.blocks;
+        stat->st_atime = vfs_stat.atime.seconds;
+        stat->st_atime_nsec = vfs_stat.atime.nanoseconds;
+        stat->st_mtime = vfs_stat.mtime.seconds;
+        stat->st_mtime_nsec = vfs_stat.mtime.nanoseconds;
+        stat->st_ctime = vfs_stat.ctime.seconds;
+        stat->st_ctime_nsec = vfs_stat.ctime.nanoseconds;
+        return 0;
     }
     stat->st_nlink = 1U;
     stat->st_size = (int64_t)size;
     stat->st_blksize = (int32_t)BOAROS_PAGE_SIZE;
+    return 0;
 }
 
 static int copy_stat_to_user(struct kernel_mm *mm,
@@ -346,6 +356,7 @@ enum kernel_files_status kernel_files_fstat(
     struct kernel_open_file_description *description;
     struct kernel_linux_stat stat;
     int copy_result;
+    int result;
 
     if (!kernel_files_is_live(files) || mm == 0 || linux_result == 0) {
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
@@ -355,7 +366,11 @@ enum kernel_files_status kernel_files_fstat(
         *linux_result = -KERNEL_EBADF;
         return KERNEL_FILES_STATUS_OK;
     }
-    fill_linux_stat(&stat, description);
+    result = fill_linux_stat(&stat, description);
+    if (result != 0) {
+        *linux_result = result;
+        return KERNEL_FILES_STATUS_OK;
+    }
     copy_result = copy_stat_to_user(mm, user_buffer, &stat, linux_result);
     if (copy_result < 0) {
         return KERNEL_FILES_STATUS_STATE;
@@ -494,7 +509,18 @@ enum kernel_files_status kernel_files_fstatat(
         }
     }
     (void)kernel_files_release_allocation(files, path);
-    fill_linux_stat(&stat, description);
+    result = fill_linux_stat(&stat, description);
+    if (result != 0) {
+        open_status = kernel_open_file_release(&description);
+        if (open_status == KERNEL_OPEN_FILE_STATUS_CLEANUP_REQUIRED &&
+            description != 0) {
+            kernel_files_queue_description(files, description);
+        } else if (open_status != KERNEL_OPEN_FILE_STATUS_OK) {
+            return KERNEL_FILES_STATUS_STATE;
+        }
+        *linux_result = result;
+        return KERNEL_FILES_STATUS_OK;
+    }
     copy_result = copy_stat_to_user(mm, user_buffer, &stat, linux_result);
     open_status = kernel_open_file_release(&description);
     if (open_status == KERNEL_OPEN_FILE_STATUS_CLEANUP_REQUIRED &&

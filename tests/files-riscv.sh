@@ -9,6 +9,7 @@ work_dir=$(mktemp -d)
 output="$work_dir/files.log"
 disk="$work_dir/root.img"
 fixture="$work_dir/data"
+small_fixture="$work_dir/allocated"
 
 trap 'rm -rf "$work_dir"' EXIT HUP INT TERM
 
@@ -26,9 +27,20 @@ fi
 
 awk 'BEGIN { for (i = 0; i < 9000; i++) printf "%c", 65 + (i % 26) }' \
     >"$fixture"
+printf 'x' >"$small_fixture"
 truncate -s 32M "$disk"
 mkfs.ext4 -q -F "$disk"
 debugfs -w -R "write $fixture /data" "$disk" >/dev/null 2>&1
+debugfs -w -R "set_inode_field /data mode 0100640" "$disk" >/dev/null 2>&1
+debugfs -w -R "set_inode_field /data uid 1234" "$disk" >/dev/null 2>&1
+debugfs -w -R "set_inode_field /data gid 2345" "$disk" >/dev/null 2>&1
+debugfs -w -R "set_inode_field /data atime @1700000001" "$disk" >/dev/null 2>&1
+debugfs -w -R "set_inode_field /data atime_extra 444" "$disk" >/dev/null 2>&1
+debugfs -w -R "set_inode_field /data mtime @1700000002" "$disk" >/dev/null 2>&1
+debugfs -w -R "set_inode_field /data mtime_extra 888" "$disk" >/dev/null 2>&1
+debugfs -w -R "set_inode_field /data ctime @1700000003" "$disk" >/dev/null 2>&1
+debugfs -w -R "set_inode_field /data ctime_extra 1332" "$disk" >/dev/null 2>&1
+debugfs -w -R "write $small_fixture /allocated" "$disk" >/dev/null 2>&1
 long_name=$(awk 'BEGIN { for (i = 0; i < 255; i++) printf "n" }')
 debugfs -w -R "write $fixture /$long_name" "$disk" >/dev/null 2>&1
 

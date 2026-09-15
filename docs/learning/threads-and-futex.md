@@ -20,6 +20,8 @@ RISC-V 的 `tp` 保存用户线程指针。动态链接器或 libc 为各线程�
 
 futex 是“用户态原子变量 + 内核等待队列”，不是每次加锁都进入内核的锁对象。无竞争 mutex 通常只在用户态用原子指令完成；竞争时才请求内核睡眠或唤醒。
 
+固定 Linux `kernel/futex/waitwake.c` 中，无超时 WAIT 的 signal 结果是 `-ERESTARTSYS`；带超时 WAIT 则把用户地址、expected、flags 和首次换算出的 absolute time 写入 `restart_block`，返回 `-ERESTART_RESTARTBLOCK`。RISC-V signal 返回路径只让前者受 handler 的 `SA_RESTART` 控制；后者一旦实际执行用户 handler 就改为 EINTR，只有没有 handler 的路径切换到 `restart_syscall`。因此 timed WAIT 不能简单套用 generic restart，也不能在重启时重新解析原 relative timeout。
+
 WAIT 必须原子地完成“比较用户字与 expected → 登记 waiter → 阻塞”。若比较与登记之间允许另一个线程修改用户字并执行 WAKE，唤醒可能落在空队列上，随后登记的线程就会错过通知。单 hart 的 BoarOS 通过关闭中断覆盖该区间；未来 SMP 必须在同一哈希桶锁保护下重新完成比较与登记，关本地中断并不能阻止其他 hart。
 
 每个 waiter 的身份由 MM 和四字节对齐用户地址组成，哈希仅用于定位桶，命中后仍须比较完整 key。不同 MM 的相同虚拟地址不是同一个私有 futex。当前没有共享映射，所以非 private 操作也只保证同一 MM 内语义；跨 MM 共享 futex 需要共享 backing 的身份，不能简单删掉 key 中的 MM。

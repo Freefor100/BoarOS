@@ -820,27 +820,48 @@ static int check_epoll(void)
         return 8;
     }
 
-    /* Regular file and directory must be rejected with EPERM on ADD */
-    int reg_fd = open("/data", O_RDONLY);
-    if (reg_fd >= 0) {
-        errno = 0;
-        if (epoll_ctl(epfd, EPOLL_CTL_ADD, reg_fd, &ev) != -1 || errno != EPERM) {
-            close(reg_fd);
-            close(epfd);
-            return 801;
-        }
+    /* O_NONBLOCK is a preserved status flag for regular files and
+     * directories; it does not turn ordinary file reads into EAGAIN. */
+    int reg_fd = open("/data", O_RDONLY | O_NONBLOCK);
+    char reg_byte;
+    if (reg_fd < 0) {
+        close(epfd);
+        return 803;
+    }
+    if ((fcntl(reg_fd, F_GETFL) & O_NONBLOCK) == 0 ||
+        read(reg_fd, &reg_byte, 1) != 1 ||
+        fcntl(reg_fd, F_SETFL, 0) != 0 ||
+        (fcntl(reg_fd, F_GETFL) & O_NONBLOCK) != 0 ||
+        fcntl(reg_fd, F_SETFL, O_NONBLOCK) != 0 ||
+        (fcntl(reg_fd, F_GETFL) & O_NONBLOCK) == 0) {
         close(reg_fd);
+        close(epfd);
+        return 803;
     }
-    int dir_fd = open("/", O_RDONLY | O_DIRECTORY);
-    if (dir_fd >= 0) {
-        errno = 0;
-        if (epoll_ctl(epfd, EPOLL_CTL_ADD, dir_fd, &ev) != -1 || errno != EPERM) {
-            close(dir_fd);
-            close(epfd);
-            return 802;
-        }
+    errno = 0;
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, reg_fd, &ev) != -1 || errno != EPERM) {
+        close(reg_fd);
+        close(epfd);
+        return 801;
+    }
+    close(reg_fd);
+    int dir_fd = open("/", O_RDONLY | O_DIRECTORY | O_NONBLOCK);
+    if (dir_fd < 0) {
+        close(epfd);
+        return 804;
+    }
+    if ((fcntl(dir_fd, F_GETFL) & O_NONBLOCK) == 0) {
         close(dir_fd);
+        close(epfd);
+        return 804;
     }
+    errno = 0;
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, dir_fd, &ev) != -1 || errno != EPERM) {
+        close(dir_fd);
+        close(epfd);
+        return 802;
+    }
+    close(dir_fd);
 
     /* 3. Empty epoll wait */
     struct epoll_event evs[4];
@@ -1864,13 +1885,24 @@ static int check_filesystem_rw(void)
     }
     struct stat ust_orig;
     memset(&ust_orig, 0, sizeof(ust_orig));
-    if (fstat(ufd, &ust_orig) != 0 || ust_orig.st_size != 6) {
+    if (fstat(ufd, &ust_orig) != 0 || ust_orig.st_size != 6 ||
+        ust_orig.st_nlink != 1 || ust_orig.st_blocks <= 0) {
         close(ufd);
         return 81;
     }
     if (unlink("/unlink_live.txt") != 0) {
         close(ufd);
         return 82;
+    }
+    {
+        struct stat unlinked_stat;
+
+        if (fstat(ufd, &unlinked_stat) != 0 ||
+            unlinked_stat.st_ino != ust_orig.st_ino ||
+            unlinked_stat.st_nlink != 0 || unlinked_stat.st_size != 6) {
+            close(ufd);
+            return 86;
+        }
     }
     errno = 0;
     int re_open = open("/unlink_live.txt", O_RDONLY);

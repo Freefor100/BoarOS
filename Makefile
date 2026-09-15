@@ -33,6 +33,7 @@ FILES_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-files-rv
 SV39_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-sv39-rv
 SV39_FAULT_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-sv39-fault-rv
 MM_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-mm-rv
+MM_FATAL_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-mm-fatal-rv
 VMA_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-vma-rv
 UACCESS_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-uaccess-rv
 TIMER_CASES_TEST_KERNEL_RV := \
@@ -315,6 +316,9 @@ MM_TEST_C_SOURCES := \
 MM_TEST_OBJECTS := \
 	$(TEST_RUNTIME_OBJECTS) \
 	$(patsubst %.c,$(BUILD_DIR)/%.o,$(MM_TEST_C_SOURCES))
+MM_FATAL_TEST_OBJECTS := \
+	$(filter-out $(BUILD_DIR)/tests/riscv/mm_cases_main.o,$(MM_TEST_OBJECTS)) \
+	$(BUILD_DIR)/tests/riscv/mm_fatal_main.o
 VMA_TEST_C_SOURCES := \
 	tests/riscv/vma_cases.c \
 	tests/riscv/vma_cases_main.c
@@ -415,6 +419,7 @@ DEPS := \
 	$(SV39_TEST_OBJECTS:.o=.d) \
 	$(SV39_FAULT_TEST_OBJECTS:.o=.d) \
 	$(MM_TEST_OBJECTS:.o=.d) \
+	$(MM_FATAL_TEST_OBJECTS:.o=.d) \
 	$(VMA_TEST_OBJECTS:.o=.d) \
 	$(UACCESS_TEST_OBJECTS:.o=.d) \
 	$(TIMER_CASES_TEST_OBJECTS:.o=.d) \
@@ -546,6 +551,12 @@ $(MM_TEST_KERNEL_RV): $(MM_TEST_OBJECTS) \
 	$(CC) $(LDFLAGS) \
 		-Wl,-Map,$(BUILD_DIR)/tests/kernel-mm-rv.map \
 		-o $@ $(MM_TEST_OBJECTS)
+
+$(MM_FATAL_TEST_KERNEL_RV): $(MM_FATAL_TEST_OBJECTS) \
+		arch/riscv/linker.ld
+	$(CC) $(LDFLAGS) \
+		-Wl,-Map,$(BUILD_DIR)/tests/kernel-mm-fatal-rv.map \
+		-o $@ $(MM_FATAL_TEST_OBJECTS)
 
 $(VMA_TEST_KERNEL_RV): $(VMA_TEST_OBJECTS) \
 		arch/riscv/linker.ld
@@ -947,9 +958,12 @@ test-user-fatal-riscv: $(USER_FATAL_TEST_KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) USER_FATAL_TEST_KERNEL_RV=$< \
 		./tests/user-fatal-riscv.sh
 
-test-mm-riscv: $(MM_TEST_KERNEL_RV)
+test-mm-riscv: $(MM_TEST_KERNEL_RV) $(MM_FATAL_TEST_KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) MM_TEST_KERNEL_RV=$< \
 		./tests/mm-riscv.sh
+	QEMU_RISCV64=$(QEMU_RISCV64) \
+		MM_FATAL_TEST_KERNEL_RV=$(MM_FATAL_TEST_KERNEL_RV) \
+		./tests/mm-fatal-riscv.sh
 
 test-vma-riscv: $(VMA_TEST_KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) VMA_TEST_KERNEL_RV=$< \

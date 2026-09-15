@@ -45,6 +45,7 @@ debugfs -w -R "write $fixture /init" "$disk" >/dev/null 2>&1
 debugfs -w -R "set_inode_field /init mode 0100755" "$disk" \
     >/dev/null 2>&1
 debugfs -w -R "ln /init /init-link" "$disk" >/dev/null 2>&1
+debugfs -w -R "set_inode_field /init links_count 2" "$disk" >/dev/null 2>&1
 debugfs -w -R "write $large_fixture /large" "$disk" >/dev/null 2>&1
 
 if ! timeout -k 2s 15s "$qemu" \

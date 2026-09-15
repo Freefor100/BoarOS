@@ -47,7 +47,7 @@ BoarOS 在进入 poll 阻塞前，通过 `kernel_files_pin()` 为每一个监听
 
 ## 内核栈预算与堆回退设计
 
-BoarOS 采用单 4 KiB 物理页承载任务控制块（`struct kernel_task`）、金丝雀（Canary）与内核运行栈的紧凑设计。控制块及内部字段占用约 2.2 KiB，留给整条内核调用链的栈空间仅约 1.8 KiB。
+BoarOS 采用单 4 KiB 物理页承载任务控制块（`struct kernel_task`）、金丝雀（Canary）与内核运行栈的紧凑设计。当前控制块为 1552 字节，扣除 Canary/16-byte 对齐后，Trap Frame 建立前留给内核调用链 2528 字节；用户 trap 的 288 字节 Frame 建立后为 2240 字节。
 
 在多路复用实现中，若在栈上静态分配支持 1024 个 fd 的完整位图数组（$6 \times 16 \times 8 = 768$ 字节）以及 16 个描述符节点（约 650 字节），栈帧将迅速超过 1.5 KiB。一旦发生 Trap 或中断嵌套，栈指针将越界并击穿 Canary，触发 `KERNEL_SCHEDULER_STATUS_STACK_CORRUPT`。
 

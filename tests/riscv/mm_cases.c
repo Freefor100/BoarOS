@@ -398,13 +398,11 @@ static unsigned long run_destroy_failures(void)
     struct kernel_mm mm = {0};
     uint64_t baseline;
     uint64_t available;
-    uint64_t root_address;
 
     if (!setup(&allocator, &kernel_table, &baseline) ||
         !create_space(&allocator, &kernel_table, &space)) {
         return 1U;
     }
-    root_address = space.root_address;
     if (riscv_kernel_mm_create(&mm, &space) !=
         KERNEL_MM_STATUS_OK) {
         return 2U;
@@ -417,34 +415,23 @@ static unsigned long run_destroy_failures(void)
         physical_page_available(&allocator) != available) {
         return 3U;
     }
-    inaccessible_page = root_address;
-    if (kernel_mm_release(&mm) !=
-            KERNEL_MM_STATUS_ADDRESS_SPACE ||
-        mm.state != KERNEL_MM_LIVE) {
-        return 4U;
-    }
     inaccessible_page = UINT64_MAX;
     if (kernel_mm_release(&mm) != KERNEL_MM_STATUS_OK ||
         mm.state != KERNEL_MM_RELEASED ||
         physical_page_available(&allocator) != baseline) {
-        return 5U;
+        return 4U;
     }
     return 0U;
 }
 
-static unsigned long run_partial_destroy_requires_cleanup(void)
+void run_mm_resolution_invariant_fatal_case(void)
 {
     struct physical_page_allocator allocator;
     struct riscv_sv39_page_table kernel_table = {0};
     struct riscv_sv39_user_space space = {0};
     struct kernel_mm mm = {0};
-    struct kernel_mm_mapping mapping = {
-        .physical_address = UINT64_MAX,
-        .permissions = UINT32_MAX,
-    };
     uint64_t baseline;
     uint64_t blocked_table;
-    uint64_t satp = UINT64_MAX;
 
     if (!setup(&allocator, &kernel_table, &baseline) ||
         !create_space(&allocator, &kernel_table, &space) ||
@@ -453,33 +440,17 @@ static unsigned long run_partial_destroy_requires_cleanup(void)
             TEST_SECOND_REGION_ADDRESS,
             RISCV_SV39_READ | RISCV_SV39_WRITE) !=
             RISCV_SV39_STATUS_OK) {
-        return 1U;
+        return;
     }
     blocked_table = level0_table_address(&space,
                                          TEST_SECOND_REGION_ADDRESS);
     if (blocked_table == UINT64_MAX ||
         riscv_kernel_mm_create(&mm, &space) != KERNEL_MM_STATUS_OK) {
-        return 2U;
+        return;
     }
 
     inaccessible_page = blocked_table;
-    if (kernel_mm_release(&mm) != KERNEL_MM_STATUS_ADDRESS_SPACE ||
-        mm.state != KERNEL_MM_CLEANUP ||
-        mm.cleanup_stage != KERNEL_MM_CLEANUP_SPACE ||
-        kernel_mm_lookup(&mm, TEST_SECOND_REGION_ADDRESS, &mapping) !=
-            KERNEL_MM_STATUS_STATE ||
-        riscv_kernel_mm_satp(&mm, &satp) != KERNEL_MM_STATUS_STATE ||
-        mapping.physical_address != UINT64_MAX ||
-        mapping.permissions != UINT32_MAX || satp != UINT64_MAX) {
-        return 3U;
-    }
-    inaccessible_page = UINT64_MAX;
-    if (kernel_mm_release(&mm) != KERNEL_MM_STATUS_OK ||
-        mm.state != KERNEL_MM_RELEASED ||
-        physical_page_available(&allocator) != baseline) {
-        return 4U;
-    }
-    return 0U;
+    (void)kernel_mm_release(&mm);
 }
 
 static unsigned long run_invalid_cases(void)
@@ -532,10 +503,6 @@ unsigned long run_all_mm_cases(void)
     result = run_create_access_failures();
     if (result != 0U) {
         return UINT64_C(0x400) + result;
-    }
-    result = run_partial_destroy_requires_cleanup();
-    if (result != 0U) {
-        return UINT64_C(0x480) + result;
     }
     result = run_destroy_failures();
     return result == 0U ? 0U : UINT64_C(0x500) + result;

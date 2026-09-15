@@ -306,6 +306,72 @@ enum kernel_files_status kernel_files_find_free_fd(
     return status;
 }
 
+static enum kernel_files_status install_owned_at(
+    struct kernel_files *files,
+    uint32_t fd,
+    uint32_t fd_flags,
+    struct kernel_open_file_description **owner)
+{
+    struct kernel_file_slot *slot;
+
+    if (!kernel_files_is_live(files) || owner == 0 || *owner == 0) {
+        return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
+    }
+    if (fd >= files->record->statistics.capacity ||
+        (fd_flags & ~KERNEL_FILES_FD_CLOEXEC) != 0U) {
+        return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
+    }
+    slot = &files->record->slots[fd];
+    if (files->record->next_fd > files->record->statistics.capacity ||
+        slot->description != 0 || slot->flags != 0U ||
+        files->record->statistics.current_open_fds >=
+            files->record->statistics.capacity ||
+        files->record->statistics.close_on_exec_fds >
+            files->record->statistics.current_open_fds) {
+        return KERNEL_FILES_STATUS_STATE;
+    }
+
+    slot->description = *owner;
+    slot->flags = fd_flags;
+    files->record->statistics.current_open_fds++;
+    if (files->record->statistics.current_open_fds >
+        files->record->statistics.peak_open_fds) {
+        files->record->statistics.peak_open_fds =
+            files->record->statistics.current_open_fds;
+    }
+    if ((fd_flags & KERNEL_FILES_FD_CLOEXEC) != 0U) {
+        files->record->statistics.close_on_exec_fds++;
+    }
+    if (fd == files->record->next_fd) {
+        do {
+            files->record->next_fd++;
+        } while (files->record->next_fd <
+                     files->record->statistics.capacity &&
+                 files->record->slots[files->record->next_fd].description !=
+                     0);
+    }
+    *owner = 0;
+    return KERNEL_FILES_STATUS_OK;
+}
+
+enum kernel_files_status kernel_files_install_new_owned_at(
+    struct kernel_files *files,
+    uint32_t fd,
+    uint32_t fd_flags,
+    struct kernel_open_file_description **owner)
+{
+    return install_owned_at(files, fd, fd_flags, owner);
+}
+
+enum kernel_files_status kernel_files_install_shared_acquired_at(
+    struct kernel_files *files,
+    uint32_t fd,
+    uint32_t fd_flags,
+    struct kernel_open_file_description **owner)
+{
+    return install_owned_at(files, fd, fd_flags, owner);
+}
+
 void kernel_files_queue_description(
     struct kernel_files *files,
     struct kernel_open_file_description *description)
@@ -373,13 +439,16 @@ enum kernel_files_status kernel_files_open_console(
                    ? KERNEL_FILES_STATUS_NO_MEMORY
                    : KERNEL_FILES_STATUS_STATE;
     }
-    files->record->slots[fd].description = description;
-    files->record->slots[fd].flags = 0U;
-    files->record->statistics.current_open_fds++;
-    if (files->record->statistics.current_open_fds >
-        files->record->statistics.peak_open_fds) {
-        files->record->statistics.peak_open_fds =
-            files->record->statistics.current_open_fds;
+    if (kernel_files_install_new_owned_at(files,
+                                          (uint32_t)fd,
+                                          0U,
+                                          &description) !=
+        KERNEL_FILES_STATUS_OK) {
+        if (kernel_open_file_release(&description) !=
+            KERNEL_OPEN_FILE_STATUS_OK) {
+            return KERNEL_FILES_STATUS_STATE;
+        }
+        return KERNEL_FILES_STATUS_STATE;
     }
     *linux_result = 0;
     return KERNEL_FILES_STATUS_OK;
@@ -468,21 +537,24 @@ static enum kernel_files_status close_fd(struct kernel_files *files,
 
 static enum kernel_files_status install_dup(
     struct kernel_files *files,
-    struct kernel_open_file_description *description,
+    struct kernel_open_file_description **acquired_owner,
     uint32_t newfd,
     uint32_t fd_flags,
     int64_t *linux_result)
 {
-    files->record->slots[newfd].description = description;
-    files->record->slots[newfd].flags = fd_flags;
-    files->record->statistics.current_open_fds++;
-    if (files->record->statistics.current_open_fds >
-        files->record->statistics.peak_open_fds) {
-        files->record->statistics.peak_open_fds =
-            files->record->statistics.current_open_fds;
-    }
-    if ((fd_flags & KERNEL_FILES_FD_CLOEXEC) != 0U) {
-        files->record->statistics.close_on_exec_fds++;
+    enum kernel_files_status status =
+        kernel_files_install_shared_acquired_at(files,
+                                                newfd,
+                                                fd_flags,
+                                                acquired_owner);
+
+    if (status != KERNEL_FILES_STATUS_OK) {
+        enum kernel_open_file_status open_status =
+            kernel_open_file_release(acquired_owner);
+
+        return open_status == KERNEL_OPEN_FILE_STATUS_OK
+                   ? status
+                   : KERNEL_FILES_STATUS_STATE;
     }
     *linux_result = newfd;
     return KERNEL_FILES_STATUS_OK;
@@ -629,25 +701,24 @@ enum kernel_files_status kernel_files_pipe2(
     fd_flags = (flags & KERNEL_FILES_O_CLOEXEC) != 0U
                    ? KERNEL_FILES_FD_CLOEXEC
                    : 0U;
-    files->record->slots[read_fd].description = read_description;
-    files->record->slots[read_fd].flags = fd_flags;
-    files->record->slots[write_fd].description = write_description;
-    files->record->slots[write_fd].flags = fd_flags;
-    read_description = 0;
-    write_description = 0;
-    files->record->statistics.current_open_fds += 2U;
-    if (files->record->statistics.current_open_fds >
-        files->record->statistics.peak_open_fds) {
-        files->record->statistics.peak_open_fds =
-            files->record->statistics.current_open_fds;
+    status = kernel_files_install_new_owned_at(files,
+                                               read_fd,
+                                               fd_flags,
+                                               &read_description);
+    if (status != KERNEL_FILES_STATUS_OK) {
+        (void)release_uninstalled_description(files, &write_description);
+        (void)release_uninstalled_description(files, &read_description);
+        return status;
     }
-    if (fd_flags != 0U) {
-        files->record->statistics.close_on_exec_fds += 2U;
+    status = kernel_files_install_new_owned_at(files,
+                                               write_fd,
+                                               fd_flags,
+                                               &write_description);
+    if (status != KERNEL_FILES_STATUS_OK) {
+        (void)detach_fd(files, read_fd);
+        (void)release_uninstalled_description(files, &write_description);
+        return status;
     }
-    files->record->next_fd = (write_fd + 1U <
-                              files->record->statistics.capacity)
-                                 ? write_fd + 1U
-                                 : 0U;
     pair[0] = (int32_t)read_fd;
     pair[1] = (int32_t)write_fd;
     access_status = kernel_copy_to_user(mm,
@@ -698,7 +769,7 @@ enum kernel_files_status kernel_files_dup(
         return KERNEL_FILES_STATUS_STATE;
     }
     /* dup never carries CLOEXEC across; only F_DUPFD_CLOEXEC sets it. */
-    return install_dup(files, description, fd, 0U, linux_result);
+    return install_dup(files, &description, fd, 0U, linux_result);
 }
 
 enum kernel_files_status kernel_files_dup3(
@@ -746,7 +817,7 @@ enum kernel_files_status kernel_files_dup3(
     if ((flags & LINUX_O_CLOEXEC) != 0U) {
         fd_flags = KERNEL_FILES_FD_CLOEXEC;
     }
-    return install_dup(files, description, (uint32_t)newfd, fd_flags,
+    return install_dup(files, &description, (uint32_t)newfd, fd_flags,
                        linux_result);
 }
 
@@ -815,7 +886,7 @@ enum kernel_files_status kernel_files_fcntl(
         fd_flags = command == KERNEL_FILES_F_DUPFD_CLOEXEC
                        ? KERNEL_FILES_FD_CLOEXEC
                        : 0U;
-        return install_dup(files, description, index, fd_flags,
+        return install_dup(files, &description, index, fd_flags,
                            linux_result);
     }
     if (fd < 0 ||

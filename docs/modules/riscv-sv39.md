@@ -78,6 +78,8 @@ EMPTY --init成功--> LIVE --move--> MOVED
 Sv39 不为物理页释放失败保留 `CLEANUP` owner。`move` 成功转移整棵 LIVE 页表树，
 `destroy` 在当前 `satp` 未指向该根时按叶子、Level 0、Level 1、根表的后序顺序释放；
 释放调用完成后对象进入 DESTROYED。分配器检测到非法页、引用或元数据时直接 fatal trap。
+若仍由该 LIVE 空间拥有的任一页表页无法经 runtime physical-page access 解析，同样属于
+direct-map/allocator/owner invariant 破坏并直接 fatal；没有可恢复 producer，也不保留部分树重试状态。
 根物理地址可以为 0，因此是否存在正常树由 `table_pages` 判断，不能由 `root_address != 0`
 推断。
 

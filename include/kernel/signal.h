@@ -76,6 +76,11 @@ void kernel_signal_clear_syscall_restart(struct kernel_task *task);
 int kernel_signal_nanosleep_restart(const struct kernel_task *task,
                                     uint64_t *deadline,
                                     uint64_t *remaining_address);
+int kernel_signal_futex_timed_restart(const struct kernel_task *task,
+                                      uint64_t *address,
+                                      uint32_t *operation,
+                                      uint32_t *expected,
+                                      uint64_t *deadline_ns);
 enum kernel_signal_status kernel_signal_suspend(struct kernel_task *task,
                                                 uint64_t mask);
 enum kernel_signal_status kernel_signal_set_temporary_mask(
@@ -95,6 +100,14 @@ void kernel_signal_note_syscall_restart(struct kernel_task *task);
 void kernel_signal_note_nanosleep_restart(struct kernel_task *task,
                                           uint64_t deadline,
                                           uint64_t remaining_address);
+
+/* Records a timed futex wait using the first call's absolute monotonic
+ * deadline so restart_syscall cannot grant a fresh relative timeout. */
+void kernel_signal_note_futex_timed_restart(struct kernel_task *task,
+                                            uint64_t address,
+                                            uint32_t operation,
+                                            uint32_t expected,
+                                            uint64_t deadline_ns);
 
 /* Sends a process-directed signal to the target's thread group. */
 enum kernel_signal_status kernel_signal_send(struct kernel_task *target,

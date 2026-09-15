@@ -39,6 +39,24 @@ enum kernel_syscall_restart_kind {
     KERNEL_SYSCALL_RESTART_NONE = 0,
     KERNEL_SYSCALL_RESTART_GENERIC,
     KERNEL_SYSCALL_RESTART_NANOSLEEP,
+    KERNEL_SYSCALL_RESTART_FUTEX_TIMED,
+};
+
+struct kernel_syscall_restart_state {
+    uint32_t kind;
+    uint32_t reserved;
+    union {
+        struct {
+            uint64_t deadline;
+            uint64_t remaining_address;
+        } nanosleep;
+        struct {
+            uint64_t address;
+            uint64_t deadline_ns;
+            uint32_t operation;
+            uint32_t expected;
+        } futex_timed;
+    } value;
 };
 
 /* Signal state per task.  `signal_pending`/`signal_blocked` are bitmaps
@@ -83,10 +101,7 @@ struct kernel_task {
     uint64_t wakeup_deadline;
     uint32_t wake_reason;
     uint32_t wait_interruptible;
-    uint32_t syscall_restart_kind;
-    uint32_t syscall_restart_reserved;
-    uint64_t syscall_restart_deadline;
-    uint64_t syscall_restart_remaining_address;
+    struct kernel_syscall_restart_state syscall_restart;
     uint64_t user_ticks;
     uint64_t kernel_ticks;
     uint64_t child_user_ticks;

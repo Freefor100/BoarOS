@@ -32,9 +32,12 @@
 #define TEST_AT_FDCWD (-100)
 #define TEST_O_WRONLY UINT64_C(1)
 #define TEST_O_CREAT UINT64_C(0100)
+#define TEST_O_NONBLOCK UINT64_C(00004000)
+#define TEST_O_DIRECT UINT64_C(00040000)
 #define TEST_O_LARGEFILE UINT64_C(00100000)
 #define TEST_O_DIRECTORY UINT64_C(00200000)
 #define TEST_O_CLOEXEC UINT64_C(02000000)
+#define TEST_EPOLL_CLOEXEC UINT32_C(0x80000)
 
 static unsigned char page_pool[BOAROS_PAGE_SIZE * TEST_POOL_PAGES]
     __attribute__((aligned(BOAROS_PAGE_SIZE)));
@@ -328,6 +331,43 @@ static void run_file_operations(struct kernel_files *files,
                 TEST_O_LARGEFILE,
                 1,
                 11U);
+    expect_open(files,
+                fs,
+                mm,
+                TEST_AT_FDCWD,
+                "/data",
+                TEST_O_NONBLOCK,
+                2,
+                212U);
+    if (kernel_files_fcntl(files,
+                           2,
+                           KERNEL_FILES_F_GETFL,
+                           0U,
+                           &result) != KERNEL_FILES_STATUS_OK ||
+        result != (int64_t)TEST_O_NONBLOCK ||
+        kernel_files_read(files,
+                          mm,
+                          2,
+                          TEST_USER_BUFFER,
+                          1U,
+                          &result) != KERNEL_FILES_STATUS_OK ||
+        result != 1 ||
+        kernel_files_fcntl(files,
+                           2,
+                           KERNEL_FILES_F_SETFL,
+                           0U,
+                           &result) != KERNEL_FILES_STATUS_OK ||
+        result != 0 ||
+        kernel_files_fcntl(files,
+                           2,
+                           KERNEL_FILES_F_GETFL,
+                           0U,
+                           &result) != KERNEL_FILES_STATUS_OK ||
+        result != 0 ||
+        kernel_files_close(files, 2, &result) != KERNEL_FILES_STATUS_OK ||
+        result != 0) {
+        fail_files(213U, 0, result);
+    }
     if (kernel_files_read(files,
                           mm,
                           0,
@@ -410,15 +450,60 @@ static void run_file_operations(struct kernel_files *files,
                 UINT64_C(1) << 63U,
                 -KERNEL_EINVAL,
                 35U);
+    expect_open(files,
+                fs,
+                mm,
+                TEST_AT_FDCWD,
+                "/data",
+                TEST_O_DIRECT,
+                -KERNEL_ENOTSUP,
+                214U);
     /* The root directory opens read-only; reads stay reserved for
      * regular files and getdents64. */
-    expect_open(files, fs, mm, TEST_AT_FDCWD, "/", 0U, 2, 25U);
-    if (kernel_files_read(files, mm, 2, TEST_USER_BUFFER, 1U, &result) !=
+    expect_open(files,
+                fs,
+                mm,
+                TEST_AT_FDCWD,
+                "/",
+                TEST_O_DIRECTORY | TEST_O_NONBLOCK,
+                2,
+                215U);
+    if (kernel_files_fcntl(files,
+                           2,
+                           KERNEL_FILES_F_GETFL,
+                           0U,
+                           &result) != KERNEL_FILES_STATUS_OK ||
+        result != (int64_t)(TEST_O_DIRECTORY | TEST_O_NONBLOCK) ||
+        kernel_files_fcntl(files,
+                           2,
+                           KERNEL_FILES_F_SETFL,
+                           0U,
+                           &result) != KERNEL_FILES_STATUS_OK ||
+        result != 0 ||
+        kernel_files_fcntl(files,
+                           2,
+                           KERNEL_FILES_F_GETFL,
+                           0U,
+                           &result) != KERNEL_FILES_STATUS_OK ||
+        result != (int64_t)TEST_O_DIRECTORY ||
+        kernel_files_fcntl(files,
+                           2,
+                           KERNEL_FILES_F_SETFL,
+                           TEST_O_NONBLOCK,
+                           &result) != KERNEL_FILES_STATUS_OK ||
+        result != 0 ||
+        kernel_files_fcntl(files,
+                           2,
+                           KERNEL_FILES_F_GETFL,
+                           0U,
+                           &result) != KERNEL_FILES_STATUS_OK ||
+        result != (int64_t)(TEST_O_DIRECTORY | TEST_O_NONBLOCK) ||
+        kernel_files_read(files, mm, 2, TEST_USER_BUFFER, 1U, &result) !=
             KERNEL_FILES_STATUS_OK ||
         result != -KERNEL_EISDIR ||
         kernel_files_close(files, 2, &result) != KERNEL_FILES_STATUS_OK ||
         result != 0) {
-        fail_files(25U, 0, result);
+        fail_files(216U, 0, result);
     }
     expect_open(files, fs, mm, TEST_AT_FDCWD, "", 0U,
                 -KERNEL_ENOENT, 26U);
@@ -473,7 +558,7 @@ static void run_file_operations(struct kernel_files *files,
         statistics.current_open_fds != 34U ||
         statistics.close_on_exec_fds != 1U ||
         statistics.read_chunks < 4U ||
-        statistics.bytes_read != 9005U) {
+        statistics.bytes_read != 9006U) {
         fail_files(32U, 64, statistics.capacity);
     }
 
@@ -1064,6 +1149,8 @@ static void run_seek_stat_operations(struct kernel_files *files,
                                      struct kernel_mm *mm)
 {
     struct kernel_linux_stat stat;
+    struct kernel_linux_stat file_stat;
+    struct kernel_linux_stat path_stat;
     static const char empty_path[] = "";
     uint64_t stat_buffer = TEST_USER_BUFFER + 2U * BOAROS_PAGE_SIZE;
     int64_t result = INT64_MIN;
@@ -1127,20 +1214,25 @@ static void run_seek_stat_operations(struct kernel_files *files,
         fail_files(83U, 1, result);
     }
 
-    /* fstat reports the ext4 mode/size/ino and the console character
-     * device identity, with faults reported as EFAULT. */
+    /* fstat reports metadata stored in the ext4 inode, including allocated
+     * 512-byte blocks and extra timestamp nanoseconds. */
     if (kernel_files_fstat(files, mm, 4, stat_buffer, &result) !=
             KERNEL_FILES_STATUS_OK ||
         result != 0 ||
         !read_user_bytes(mm, stat_buffer, &stat, sizeof(stat))) {
         fail_files(84U, 0, result);
     }
-    if ((stat.st_mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFREG ||
+    if (stat.st_dev != 1U || stat.st_mode != UINT32_C(0100640) ||
         stat.st_ino == 0U || stat.st_nlink != 1U ||
-        stat.st_size != 9000 || stat.st_blksize != BOAROS_PAGE_SIZE ||
-        stat.st_blocks != 18U || stat.st_rdev != 0U) {
+        stat.st_uid != 1234U || stat.st_gid != 2345U ||
+        stat.st_size != 9000 || stat.st_blksize != 1024 ||
+        stat.st_blocks != 18U || stat.st_rdev != 0U ||
+        stat.st_atime != 1700000001 || stat.st_atime_nsec != 111 ||
+        stat.st_mtime != 1700000002 || stat.st_mtime_nsec != 222 ||
+        stat.st_ctime != 1700000003 || stat.st_ctime_nsec != 333) {
         fail_files(85U, 0, stat.st_mode);
     }
+    file_stat = stat;
     if (kernel_files_fstat(files, mm, 1, stat_buffer, &result) !=
             KERNEL_FILES_STATUS_OK ||
         result != 0 ||
@@ -1168,10 +1260,69 @@ static void run_seek_stat_operations(struct kernel_files *files,
                              0U,
                              &result) != KERNEL_FILES_STATUS_OK ||
         result != 0 ||
-        !read_user_bytes(mm, stat_buffer, &stat, sizeof(stat)) ||
-        stat.st_size != 9000 ||
-        (stat.st_mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFREG) {
+        !read_user_bytes(mm, stat_buffer, &path_stat, sizeof(path_stat)) ||
+        path_stat.st_size != 9000 ||
+        (path_stat.st_mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFREG ||
+        path_stat.st_dev != file_stat.st_dev ||
+        path_stat.st_ino != file_stat.st_ino ||
+        path_stat.st_mode != file_stat.st_mode ||
+        path_stat.st_nlink != file_stat.st_nlink ||
+        path_stat.st_uid != file_stat.st_uid ||
+        path_stat.st_gid != file_stat.st_gid ||
+        path_stat.st_blocks != file_stat.st_blocks ||
+        path_stat.st_atime != file_stat.st_atime ||
+        path_stat.st_atime_nsec != file_stat.st_atime_nsec ||
+        path_stat.st_mtime != file_stat.st_mtime ||
+        path_stat.st_mtime_nsec != file_stat.st_mtime_nsec ||
+        path_stat.st_ctime != file_stat.st_ctime ||
+        path_stat.st_ctime_nsec != file_stat.st_ctime_nsec) {
         fail_files(87U, 0, result);
+    }
+    /* Directory descriptors use the same VFS metadata representation. */
+    {
+        int64_t directory_fd = INT64_MIN;
+
+        if (!write_user_bytes(mm, TEST_USER_PATH, "/", 2U) ||
+            kernel_files_openat(files, fs, mm, TEST_AT_FDCWD,
+                                TEST_USER_PATH, 0U, 0U, &directory_fd) !=
+                KERNEL_FILES_STATUS_OK ||
+            directory_fd < 0 ||
+            kernel_files_fstat(files, mm, directory_fd, stat_buffer,
+                               &result) != KERNEL_FILES_STATUS_OK ||
+            result != 0 ||
+            !read_user_bytes(mm, stat_buffer, &path_stat,
+                             sizeof(path_stat)) ||
+            path_stat.st_dev != 1U ||
+            (path_stat.st_mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFDIR ||
+            path_stat.st_ino == 0U || path_stat.st_nlink < 2U ||
+            path_stat.st_blocks <= 0 ||
+            kernel_files_close(files, directory_fd, &result) !=
+                KERNEL_FILES_STATUS_OK ||
+            result != 0) {
+            fail_files(145U, 0, result);
+        }
+    }
+    /* A one-byte allocated file consumes one 1 KiB ext4 block, reported as
+     * two 512-byte st_blocks units rather than a logical-size estimate. */
+    {
+        int64_t allocated_fd = INT64_MIN;
+
+        if (!write_user_bytes(mm, TEST_USER_PATH, "/allocated", 11U) ||
+            kernel_files_openat(files, fs, mm, TEST_AT_FDCWD,
+                                TEST_USER_PATH, 0U, 0U, &allocated_fd) !=
+                KERNEL_FILES_STATUS_OK ||
+            allocated_fd < 0 ||
+            kernel_files_fstat(files, mm, allocated_fd, stat_buffer,
+                               &result) != KERNEL_FILES_STATUS_OK ||
+            result != 0 ||
+            !read_user_bytes(mm, stat_buffer, &path_stat,
+                             sizeof(path_stat)) ||
+            path_stat.st_size != 1 || path_stat.st_blocks != 2 ||
+            kernel_files_close(files, allocated_fd, &result) !=
+                KERNEL_FILES_STATUS_OK ||
+            result != 0) {
+            fail_files(146U, 2, path_stat.st_blocks);
+        }
     }
     if (!write_user_bytes(mm, TEST_USER_PATH, "data", 5U) ||
         kernel_files_fstatat(files,
@@ -1749,6 +1900,7 @@ static void run_dup_fcntl_operations(struct kernel_files *files,
                                      struct kernel_mm *mm)
 {
     struct kernel_files child_files = {0};
+    struct kernel_files_statistics statistics;
     int64_t result = INT64_MIN;
 
     if (kernel_files_open_console(files, 0, &result) !=
@@ -1917,6 +2069,11 @@ static void run_dup_fcntl_operations(struct kernel_files *files,
         result != 0) {
         fail_files(110U, 100, result);
     }
+    kernel_files_get_statistics(files, &statistics);
+    if (statistics.current_open_fds != 9U ||
+        statistics.close_on_exec_fds != 3U) {
+        fail_files(217U, 9, statistics.current_open_fds);
+    }
 
     /* Fork keeps the duplicated descriptors and their fd flags. */
     if (kernel_files_fork(&child_files, files) != KERNEL_FILES_STATUS_OK ||
@@ -1958,6 +2115,7 @@ static void run_pipe_operations(struct kernel_files *files,
                                 const struct kernel_fs_context *fs,
                                 struct kernel_mm *mm)
 {
+    struct kernel_files_statistics statistics;
     struct kernel_uaccess_iovec iov[2];
     int32_t pair[2];
     int64_t result = INT64_MIN;
@@ -1984,6 +2142,11 @@ static void run_pipe_operations(struct kernel_files *files,
         !read_user_bytes(mm, TEST_USER_PATH, pair, sizeof(pair)) ||
         pair[0] != 31 || pair[1] != 32) {
         fail_files(121U, 32, pair[1]);
+    }
+    kernel_files_get_statistics(files, &statistics);
+    if (statistics.current_open_fds != 33U ||
+        statistics.close_on_exec_fds != 0U) {
+        fail_files(218U, 33, statistics.current_open_fds);
     }
     for (index = 0U; index <= 32U; index++) {
         if (kernel_files_close(files, index, &result) !=
@@ -2109,11 +2272,72 @@ static void run_epoll_operations(struct kernel_files *files,
                                  const struct kernel_fs_context *fs,
                                  struct kernel_mm *mm)
 {
+    struct kernel_files_statistics before;
+    struct kernel_files_statistics after;
+    struct kernel_open_file_description *first_description;
     int32_t pipe_fds[2];
     int64_t result = INT64_MIN;
     int64_t epfd = -1;
+    int64_t reused_epfd = -1;
+    int64_t second_epfd = -1;
+    uint32_t index;
 
-    (void)fs;
+    /* epoll_create1 installs an ordinary fd: statistics, CLOEXEC and the
+     * lowest-free hint must follow the same contract as open and dup. */
+    kernel_files_get_statistics(files, &before);
+    if (kernel_files_epoll_create1(files, TEST_EPOLL_CLOEXEC, &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != 0) {
+        fail_files(200U, 0, result);
+    }
+    kernel_files_get_statistics(files, &after);
+    if (after.current_open_fds != before.current_open_fds + 1U ||
+        after.peak_open_fds != before.peak_open_fds + 1U ||
+        after.close_on_exec_fds != before.close_on_exec_fds + 1U ||
+        files->record->next_fd != 1U) {
+        fail_files(201U, before.current_open_fds + 1U,
+                   after.current_open_fds);
+    }
+    if (kernel_files_close(files, 0, &result) != KERNEL_FILES_STATUS_OK ||
+        result != 0) {
+        fail_files(202U, 0, result);
+    }
+    kernel_files_get_statistics(files, &after);
+    if (after.current_open_fds != before.current_open_fds ||
+        after.close_on_exec_fds != before.close_on_exec_fds ||
+        files->record->next_fd != 0U) {
+        fail_files(203U, before.current_open_fds, after.current_open_fds);
+    }
+
+    if (kernel_files_epoll_create1(files, 0, &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != 0) {
+        fail_files(204U, 0, result);
+    }
+    epfd = result;
+    if (kernel_files_epoll_create1(files, 0, &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != 1) {
+        fail_files(205U, 1, result);
+    }
+    second_epfd = result;
+    if (kernel_files_close(files, epfd, &result) != KERNEL_FILES_STATUS_OK ||
+        result != 0 ||
+        kernel_files_epoll_create1(files, TEST_EPOLL_CLOEXEC, &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != epfd || files->record->next_fd != 2U) {
+        fail_files(206U, epfd, result);
+    }
+    reused_epfd = result;
+    if (kernel_files_close(files, reused_epfd, &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != 0 ||
+        kernel_files_close(files, second_epfd, &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != 0) {
+        fail_files(207U, 0, result);
+    }
+
     if (kernel_files_pipe2(files,
                            mm,
                            TEST_USER_PATH,
@@ -2222,6 +2446,31 @@ static void run_epoll_operations(struct kernel_files *files,
     if (kernel_files_close(files, epfd, &result) != KERNEL_FILES_STATUS_OK ||
         result != 0) {
         fail_files(155U, 0, result);
+    }
+
+    /* A full table reports EMFILE transactionally.  In particular, fd 0 and
+     * all counters remain owned by the pre-existing description. */
+    expect_open(files, fs, mm, TEST_AT_FDCWD, "/data", 0U, 0, 208U);
+    first_description = kernel_files_lookup_description(files, 0);
+    for (index = 1U; index < KERNEL_FILES_MAX_CAPACITY; index++) {
+        if (kernel_files_dup(files, 0, &result) != KERNEL_FILES_STATUS_OK ||
+            result != (int64_t)index) {
+            fail_files(209U, index, result);
+        }
+    }
+    kernel_files_get_statistics(files, &before);
+    if (kernel_files_epoll_create1(files, TEST_EPOLL_CLOEXEC, &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != -KERNEL_EMFILE) {
+        fail_files(210U, -KERNEL_EMFILE, result);
+    }
+    kernel_files_get_statistics(files, &after);
+    if (kernel_files_lookup_description(files, 0) != first_description ||
+        after.current_open_fds != before.current_open_fds ||
+        after.peak_open_fds != before.peak_open_fds ||
+        after.close_on_exec_fds != before.close_on_exec_fds ||
+        files->record->next_fd != KERNEL_FILES_MAX_CAPACITY) {
+        fail_files(211U, before.current_open_fds, after.current_open_fds);
     }
 
 }

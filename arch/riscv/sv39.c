@@ -1981,7 +1981,7 @@ static enum riscv_sv39_status destroy_level0(
                                    entry_address(*parent_entry),
                                    &entries);
     if (status != RISCV_SV39_STATUS_OK) {
-        return status;
+        __builtin_trap();
     }
     for (index = 0U; index < BOAROS_PAGE_SIZE / sizeof(*entries); index++) {
         if (entries[index] == 0U) {
@@ -2010,7 +2010,7 @@ static enum riscv_sv39_status destroy_level1(
                                    entry_address(*parent_entry),
                                    &entries);
     if (status != RISCV_SV39_STATUS_OK) {
-        return status;
+        __builtin_trap();
     }
     for (index = 0U; index < BOAROS_PAGE_SIZE / sizeof(*entries); index++) {
         if (entries[index] == 0U) {
@@ -2061,7 +2061,7 @@ enum riscv_sv39_status riscv_sv39_user_space_destroy(
                                    space->root_address,
                                    &root);
     if (status != RISCV_SV39_STATUS_OK) {
-        return status;
+        __builtin_trap();
     }
 
     for (index = 0U; index < RISCV_SV39_USER_ROOT_ENTRIES; index++) {

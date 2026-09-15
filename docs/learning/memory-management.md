@@ -212,6 +212,8 @@ BoarOS 因此把 `kernel_mm` 定义为引用计数的拥有型句柄：`acquire`
 
 地址空间释放按固定的后序顺序完成：先撤销叶子、刷新 TLB，再释放物理页和下级页表，最后释放根表与 MM record。合法 owner 的释放不会返回可重试状态；非法页、引用或分配器元数据直接触发 fatal。只有文件来源的真实 VFS/I/O 清理错误由其 owner 保留。测试应覆盖释放顺序、非法释放 fatal 和最终空闲页基线，而不是伪造 allocator 释放失败。
 
+“访问函数有错误返回”不自动证明 teardown 可以重试。BoarOS production 的 runtime page access 是固定 direct-map 地址转换；finalized allocator 又先确认目标仍是 allocated page。它没有 pager、设备 I/O 或异步修复者，页表 owner 也不会在两次 release 之间重新建立映射。因此合法页表 backing 无法 resolve 只能归为 kernel invariant violation。测试 wrapper 可以制造一次失败再恢复，但这属于仅测试可达的 producer；若据此保留 cleanup 状态，反而会把已经部分释放的页表树暴露给第二次销毁。正确 regression 应验证 fail-stop，而不是验证人工恢复。
+
 ## VMA 和 PTE 为什么都需要？
 
 页表回答的是“此刻这个虚拟页有没有硬件翻译、落在哪个物理页、权限是什么”。它不足以表达一个尚未驻留但已经合法的逻辑区间：按需分页的匿名堆、只提交了栈顶的向下栈、file-backed mapping 都可能没有某个地址的 PTE，却仍要求 fault handler 知道它可以怎样补页。VMA（virtual memory area）补充这一层，保存半开区间、逻辑权限、匿名或文件 backing 和用途；fault 路径先查 VMA 决定合法性和补页策略，再把驻留结果写入 PTE。

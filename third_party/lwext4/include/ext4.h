@@ -413,6 +413,13 @@ uint64_t ext4_fsize(ext4_file *file);
 int ext4_raw_inode_fill(const char *path, uint32_t *ret_ino,
 			struct ext4_inode *inode);
 
+/**@brief Copy the raw inode addressed by an open file handle.
+ *
+ * Unlike the path form, this continues to work after the final directory
+ * entry has been unlinked while the handle still owns the inode.
+ */
+int ext4_fraw_inode_fill(const ext4_file *file, struct ext4_inode *inode);
+
 /**@brief Check if inode exists.
  *
  * @param path    Parh to file/dir/link.

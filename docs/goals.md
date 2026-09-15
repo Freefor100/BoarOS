@@ -33,6 +33,14 @@ Linux ABI 兼容是最终功能方向，不是对当前完成度的声明；READ
 
 “所有 syscall”必须绑定架构、内核版本和功能范围；未实现或仅返回 `ENOSYS` 的调用不计作完成。官方测例、未特改用户程序和 LTP 用来发现缺口和防止回归，不反向定义内核的全部语义。
 
+## 下一阶段顺序
+
+- 先建立 differential ABI harness MVP：同一 raw-syscall 文件生命周期 case 分别运行于带版本信息的 Linux reference 与 BoarOS RISC-V，normalize 后自动 diff，mismatch 返回非零；目标入口为 `make test-diff-abi-riscv`。之后再分 OFD/open/stat、poll/epoll、signal/futex/time、mmap/truncate case pack 扩展，不在 C 源码硬编码 reference 输出。
+- 用 differential 证据决定 open/openat 对任意 unknown flag bits 的兼容策略；固定 Linux 会忽略一部分未知 bit，不能把“一律拒绝”直接写成 ABI 要求。
+- ext4 timestamp mutation 与 sparse ftruncate 分成独立目标：前者定义 create/read/write/truncate/unlink 的 atime/mtime/ctime 更新，后者用 inode-size/hole 能力替换逐段写零增长，并以真实 `st_blocks` 验证未分配中间块。
+- 真实 userspace 按 musl libc-test failure inventory、BusyBox、pthread stress、SQLite、Git 推进。每轮按 failure cluster、最小复现、Linux differential、kernel primitive regression、重跑 workload 闭环；SQLite 的验收包含事务、journal、并发 reader/writer、重开和 integrity_check。
+- task metadata 与 kernel stack 分离为 SMP 前置目标，迁移现有 canary 并增加 high-water 和 frame/stack usage 检查，栈大小依据测量决定。SMP 只在 differential ABI、真实 userspace、task/stack 分离及同步协议准备完成后开始；multi-hart boot 只是第一个检查点。
+
 ## 规划假设与边界
 
 - `final-2025` 作为明年初赛沿用的规划假设，除非组委会正式公布，不写成已确认规则；`final-2026` 和本地保存的测例仓库用于观察今年真实负载与接口趋势。

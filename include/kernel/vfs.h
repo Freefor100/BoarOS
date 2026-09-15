@@ -19,7 +19,29 @@
 
 struct kernel_vfs_mount {
     void *private_data;
+    uint64_t id;
     uint32_t state;
+};
+
+struct kernel_vfs_timespec {
+    int64_t seconds;
+    int64_t nanoseconds;
+};
+
+struct kernel_vfs_stat {
+    uint64_t dev;
+    uint64_t ino;
+    uint32_t mode;
+    uint32_t nlink;
+    uint32_t uid;
+    uint32_t gid;
+    uint64_t rdev;
+    uint64_t size;
+    uint64_t blocks;
+    uint64_t blksize;
+    struct kernel_vfs_timespec atime;
+    struct kernel_vfs_timespec mtime;
+    struct kernel_vfs_timespec ctime;
 };
 
 struct kernel_page_cache;
@@ -96,6 +118,10 @@ int kernel_vfs_file_read_source(struct kernel_vfs_file *file,
                                 struct kernel_read_source *source);
 
 int kernel_vfs_close(struct kernel_vfs_file *file);
+
+/* Reads live inode metadata into a filesystem-independent representation. */
+int kernel_vfs_fstat(const struct kernel_vfs_file *file,
+                     struct kernel_vfs_stat *stat);
 
 /* Underlying ext4 inode number; zero when unavailable. */
 uint32_t kernel_vfs_file_inode(const struct kernel_vfs_file *file);

@@ -48,17 +48,68 @@ static int64_t futex_wake(uint64_t mm, uint64_t address, uint32_t count,
     return (int64_t)woken + moved;
 }
 
+static int64_t futex_wait_until(struct kernel_task *task, uint64_t address,
+                                uint32_t operation, uint32_t value,
+                                int has_timeout, uint64_t deadline_ns,
+                                enum kernel_scheduler_status *status)
+{
+    uint32_t actual;
+    uint64_t deadline = 0U;
+    int expired = 0;
+    size_t copied = 0U;
+    enum kernel_wait_wake_reason reason;
+    enum kernel_uaccess_status access;
+
+    if (has_timeout) {
+        enum kernel_time_status time_status =
+            kernel_time_deadline_from_monotonic(deadline_ns, &deadline);
+
+        if (time_status == KERNEL_TIME_STATUS_DEADLINE_PASSED) expired = 1;
+        else if (time_status != KERNEL_TIME_STATUS_OK) {
+            *status = KERNEL_SCHEDULER_STATUS_INVALID_STATE;
+            return 0;
+        }
+    }
+    access = kernel_copy_from_user(&task->mm, &actual, address,
+                                   sizeof(actual), &copied);
+    if (access != KERNEL_UACCESS_STATUS_OK &&
+        access != KERNEL_UACCESS_STATUS_FAULT) {
+        *status = KERNEL_SCHEDULER_STATUS_INVALID_STATE;
+        return 0;
+    }
+    if (access != KERNEL_UACCESS_STATUS_OK || copied != sizeof(actual))
+        return -KERNEL_EFAULT;
+    if (actual != value) return -KERNEL_EAGAIN;
+    if (expired) return -KERNEL_ETIMEDOUT;
+
+    /* SIE stays clear from comparison through enqueue and context switch.
+     * No other user thread can change the word between these operations. */
+    task->futex_mm = task->mm.record_page_address;
+    task->futex_address = address;
+    *status = kernel_scheduler_block_current(
+        futex_bucket(task->futex_mm, address), deadline, 1, &reason);
+    task->futex_mm = 0U;
+    task->futex_address = 0U;
+    if (*status != KERNEL_SCHEDULER_STATUS_OK) return 0;
+    if (reason == KERNEL_WAIT_TIMEOUT) return -KERNEL_ETIMEDOUT;
+    if (reason == KERNEL_WAIT_SIGNALLED) {
+        if (has_timeout) {
+            kernel_signal_note_futex_timed_restart(task, address, operation,
+                                                   value, deadline_ns);
+        }
+        return -KERNEL_ERESTARTSYS;
+    }
+    return 0;
+}
+
 int64_t kernel_futex(struct kernel_task *task, uint64_t address,
                      uint32_t operation, uint32_t value,
                      uint64_t timeout_or_count, uint64_t address2,
                      enum kernel_scheduler_status *status)
 {
     uint32_t command = operation & ~FUTEX_PRIVATE;
-    uint32_t actual;
-    uint64_t deadline = 0U;
-    int expired = 0;
+    uint64_t deadline_ns = 0U;
     size_t copied = 0U;
-    enum kernel_wait_wake_reason reason;
     enum kernel_uaccess_status access;
 
     *status = KERNEL_SCHEDULER_STATUS_OK;
@@ -85,9 +136,8 @@ int64_t kernel_futex(struct kernel_task *task, uint64_t address,
     }
     if (timeout_or_count != 0U) {
         struct { int64_t seconds, nanoseconds; } duration;
-        uint64_t now, target;
+        uint64_t now;
         __uint128_t delta;
-        enum kernel_time_status time_status;
 
         access = kernel_copy_from_user(&task->mm, &duration,
                                         timeout_or_count, sizeof(duration),
@@ -104,37 +154,35 @@ int64_t kernel_futex(struct kernel_task *task, uint64_t address,
         delta = (__uint128_t)(uint64_t)duration.seconds * 1000000000U +
                 (uint64_t)duration.nanoseconds;
         now = kernel_time_monotonic_ns();
-        target = now >= INT64_MAX || delta > (uint64_t)INT64_MAX - now ? INT64_MAX :
-                 now + (uint64_t)delta;
-        time_status = kernel_time_deadline_from_monotonic(target, &deadline);
-        if (time_status == KERNEL_TIME_STATUS_DEADLINE_PASSED) expired = 1;
-        else if (time_status != KERNEL_TIME_STATUS_OK) {
-            *status = KERNEL_SCHEDULER_STATUS_INVALID_STATE;
-            return 0;
-        }
+        deadline_ns = now >= INT64_MAX ||
+                      delta > (uint64_t)INT64_MAX - now
+                          ? INT64_MAX
+                          : now + (uint64_t)delta;
     }
-    access = kernel_copy_from_user(&task->mm, &actual, address,
-                                   sizeof(actual), &copied);
-    if (access != KERNEL_UACCESS_STATUS_OK &&
-        access != KERNEL_UACCESS_STATUS_FAULT) {
+    return futex_wait_until(task, address, operation, value,
+                            timeout_or_count != 0U, deadline_ns, status);
+}
+
+int64_t kernel_futex_restart_timed(
+    struct kernel_task *task, uint64_t address, uint32_t operation,
+    uint32_t value, uint64_t deadline_ns,
+    enum kernel_scheduler_status *status)
+{
+    uint32_t command = operation & ~FUTEX_PRIVATE;
+
+    *status = KERNEL_SCHEDULER_STATUS_OK;
+    if (task != scheduler.current || riscv_interrupt_is_enabled()) {
         *status = KERNEL_SCHEDULER_STATUS_INVALID_STATE;
         return 0;
     }
-    if (access != KERNEL_UACCESS_STATUS_OK || copied != sizeof(actual))
-        return -KERNEL_EFAULT;
-    if (actual != value) return -KERNEL_EAGAIN;
-    if (expired) return -KERNEL_ETIMEDOUT;
-    /* SIE stays clear from comparison through enqueue and context switch.
-     * No other user thread can change the word between these operations. */
-    task->futex_mm = task->mm.record_page_address;
-    task->futex_address = address;
-    *status = kernel_scheduler_block_current(
-        futex_bucket(task->futex_mm, address), deadline, 1, &reason);
-    task->futex_mm = 0U;
-    task->futex_address = 0U;
-    if (*status != KERNEL_SCHEDULER_STATUS_OK) return 0;
-    return reason == KERNEL_WAIT_TIMEOUT ? -KERNEL_ETIMEDOUT :
-           reason == KERNEL_WAIT_SIGNALLED ? -KERNEL_EINTR : 0;
+    if (command != 0U || (address & 3U) != 0U ||
+        kernel_user_range_check(address, sizeof(uint32_t)) !=
+            KERNEL_UACCESS_STATUS_OK) {
+        *status = KERNEL_SCHEDULER_STATUS_INVALID_STATE;
+        return 0;
+    }
+    return futex_wait_until(task, address, operation, value, 1,
+                            deadline_ns, status);
 }
 
 void kernel_futex_clear_tid(struct kernel_task *task)

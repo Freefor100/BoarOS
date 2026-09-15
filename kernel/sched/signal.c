@@ -43,10 +43,10 @@ void kernel_signal_note_syscall_restart(struct kernel_task *task)
 {
     if (task != 0 && task != &scheduler.idle &&
         task->magic == KERNEL_THREAD_MAGIC && task->arch.user_mode == 1U) {
-        if (task->syscall_restart_kind == KERNEL_SYSCALL_RESTART_NONE) {
-            task->syscall_restart_kind = KERNEL_SYSCALL_RESTART_GENERIC;
-            task->syscall_restart_deadline = 0U;
-            task->syscall_restart_remaining_address = 0U;
+        if (task->syscall_restart.kind == KERNEL_SYSCALL_RESTART_NONE) {
+            task->syscall_restart = (struct kernel_syscall_restart_state){
+                .kind = KERNEL_SYSCALL_RESTART_GENERIC,
+            };
         }
     }
 }
@@ -57,9 +57,33 @@ void kernel_signal_note_nanosleep_restart(struct kernel_task *task,
 {
     if (task != 0 && task != &scheduler.idle &&
         task->magic == KERNEL_THREAD_MAGIC && task->arch.user_mode == 1U) {
-        task->syscall_restart_kind = KERNEL_SYSCALL_RESTART_NANOSLEEP;
-        task->syscall_restart_deadline = deadline;
-        task->syscall_restart_remaining_address = remaining_address;
+        task->syscall_restart = (struct kernel_syscall_restart_state){
+            .kind = KERNEL_SYSCALL_RESTART_NANOSLEEP,
+            .value.nanosleep = {
+                .deadline = deadline,
+                .remaining_address = remaining_address,
+            },
+        };
+    }
+}
+
+void kernel_signal_note_futex_timed_restart(struct kernel_task *task,
+                                            uint64_t address,
+                                            uint32_t operation,
+                                            uint32_t expected,
+                                            uint64_t deadline_ns)
+{
+    if (task != 0 && task != &scheduler.idle &&
+        task->magic == KERNEL_THREAD_MAGIC && task->arch.user_mode == 1U) {
+        task->syscall_restart = (struct kernel_syscall_restart_state){
+            .kind = KERNEL_SYSCALL_RESTART_FUTEX_TIMED,
+            .value.futex_timed = {
+                .address = address,
+                .deadline_ns = deadline_ns,
+                .operation = operation,
+                .expected = expected,
+            },
+        };
     }
 }
 
@@ -995,38 +1019,57 @@ static void signal_terminate(uint32_t sig, int core_dump)
 
 void kernel_signal_clear_syscall_restart(struct kernel_task *task)
 {
-    task->syscall_restart_kind = KERNEL_SYSCALL_RESTART_NONE;
-    task->syscall_restart_deadline = 0U;
-    task->syscall_restart_remaining_address = 0U;
+    task->syscall_restart = (struct kernel_syscall_restart_state){
+        .kind = KERNEL_SYSCALL_RESTART_NONE,
+    };
 }
 
 int kernel_signal_nanosleep_restart(const struct kernel_task *task,
                                     uint64_t *deadline,
                                     uint64_t *remaining_address)
 {
-    if (task->syscall_restart_kind != KERNEL_SYSCALL_RESTART_NANOSLEEP) {
+    if (task->syscall_restart.kind != KERNEL_SYSCALL_RESTART_NANOSLEEP) {
         return 0;
     }
-    *deadline = task->syscall_restart_deadline;
-    *remaining_address = task->syscall_restart_remaining_address;
+    *deadline = task->syscall_restart.value.nanosleep.deadline;
+    *remaining_address =
+        task->syscall_restart.value.nanosleep.remaining_address;
+    return 1;
+}
+
+int kernel_signal_futex_timed_restart(const struct kernel_task *task,
+                                      uint64_t *address,
+                                      uint32_t *operation,
+                                      uint32_t *expected,
+                                      uint64_t *deadline_ns)
+{
+    if (task->syscall_restart.kind != KERNEL_SYSCALL_RESTART_FUTEX_TIMED)
+        return 0;
+    *address = task->syscall_restart.value.futex_timed.address;
+    *operation = task->syscall_restart.value.futex_timed.operation;
+    *expected = task->syscall_restart.value.futex_timed.expected;
+    *deadline_ns = task->syscall_restart.value.futex_timed.deadline_ns;
     return 1;
 }
 
 enum kernel_signal_restart kernel_signal_restart_decide(
     struct kernel_task *task, int has_handler, uint64_t flags)
 {
-    uint32_t kind = task->syscall_restart_kind;
+    uint32_t kind = task->syscall_restart.kind;
 
     if (kind == KERNEL_SYSCALL_RESTART_NONE) {
         return KERNEL_SIGNAL_RESTART_NONE;
     }
-    if (!has_handler && kind == KERNEL_SYSCALL_RESTART_NANOSLEEP) {
+    if (!has_handler &&
+        (kind == KERNEL_SYSCALL_RESTART_NANOSLEEP ||
+         kind == KERNEL_SYSCALL_RESTART_FUTEX_TIMED)) {
         return KERNEL_SIGNAL_RESTART_BLOCK;
     }
     /* Handler syscalls must not inherit an outer restart block. The
      * interrupted register snapshot itself carries a generic retry. */
     kernel_signal_clear_syscall_restart(task);
     if (has_handler && (kind == KERNEL_SYSCALL_RESTART_NANOSLEEP ||
+                         kind == KERNEL_SYSCALL_RESTART_FUTEX_TIMED ||
                          (flags & LINUX_SA_RESTART) == 0U)) {
         return KERNEL_SIGNAL_RESTART_INTERRUPTED;
     }
