@@ -18,6 +18,12 @@
 
 #include "../../fs/files/private.h"
 #include "../../fs/open_file_internal.h"
+#ifdef FILES_PARTIAL_WRITE_TEST
+#include "../../fs/vfs_internal.h"
+
+#include <ext4.h>
+#include <ext4_errno.h>
+#endif
 
 #include <stddef.h>
 #include <stdint.h>
@@ -46,6 +52,10 @@ static uint32_t counted_open_file_releases;
 static char fork_resolved_path[KERNEL_FS_PATH_MAX];
 static int use_test_satp;
 static uint64_t test_satp;
+#ifdef FILES_PARTIAL_WRITE_TEST
+static int inject_partial_write_error;
+static int inject_truncate_error;
+#endif
 
 enum kernel_heap_status __real_kernel_heap_release(
     struct kernel_heap *heap,
@@ -53,6 +63,13 @@ enum kernel_heap_status __real_kernel_heap_release(
 enum kernel_open_file_status __real_kernel_open_file_release(
     struct kernel_open_file_description **owner);
 uint64_t __real_riscv_sv39_current_satp(void);
+#ifdef FILES_PARTIAL_WRITE_TEST
+int __real_ext4_fwrite(ext4_file *file,
+                       const void *buffer,
+                       size_t size,
+                       size_t *bytes_written);
+int __real_ext4_ftruncate(ext4_file *file, uint64_t size);
+#endif
 
 uint64_t __wrap_riscv_sv39_current_satp(void)
 {
@@ -68,6 +85,43 @@ enum kernel_open_file_status __wrap_kernel_open_file_release(
     }
     return __real_kernel_open_file_release(owner);
 }
+
+#ifdef FILES_PARTIAL_WRITE_TEST
+int __wrap_ext4_fwrite(ext4_file *file,
+                       const void *buffer,
+                       size_t size,
+                       size_t *bytes_written)
+{
+    size_t committed = 0U;
+    int result;
+
+    if (!inject_partial_write_error) {
+        return __real_ext4_fwrite(file, buffer, size, bytes_written);
+    }
+    inject_partial_write_error = 0;
+    if (size < 5U) {
+        return __real_ext4_fwrite(file, buffer, size, bytes_written);
+    }
+
+    result = __real_ext4_fwrite(file, buffer, 5U, &committed);
+    if (bytes_written != 0) {
+        *bytes_written = committed;
+    }
+    return result == EOK && committed == 5U ? EIO : result;
+}
+
+int __wrap_ext4_ftruncate(ext4_file *file, uint64_t size)
+{
+    int result;
+
+    if (!inject_truncate_error) {
+        return __real_ext4_ftruncate(file, size);
+    }
+    inject_truncate_error = 0;
+    result = __real_ext4_ftruncate(file, size);
+    return result == EOK ? EIO : result;
+}
+#endif
 
 static void *identity_access(uint64_t physical_address)
 {
@@ -2513,6 +2567,10 @@ static void run_epoll_operations(struct kernel_files *files,
 
 }
 
+#ifdef FILES_PARTIAL_WRITE_TEST
+static void run_files_test(const void *dtb) __attribute__((unused));
+#endif
+
 static void run_files_test(const void *dtb)
 {
     struct dtb_boot_info info;
@@ -2693,11 +2751,276 @@ static void run_files_test(const void *dtb)
     }
 }
 
+#ifdef FILES_PARTIAL_WRITE_TEST
+static void run_partial_write_test(const void *dtb)
+{
+    static const char path[] = "/partial";
+    static const char initial[] = "old";
+    static const char payload[] = "PREFIX!!";
+    struct dtb_boot_info info;
+    struct boot_memory_layout layout;
+    struct physical_page_allocator allocator;
+    struct kernel_heap heap;
+    struct kernel_page_cache page_cache = {0};
+    struct riscv_sv39_page_table kernel_table = {0};
+    struct riscv_virtio_mmio_block device = {0};
+    struct kernel_vfs_mount mount = {0};
+    struct kernel_mm mm = {0};
+    struct kernel_files files = {0};
+    struct kernel_fs_context fs = {0};
+    struct kernel_open_file_description *description;
+    struct kernel_linux_stat linux_stat;
+    struct kernel_vfs_stat vfs_stat;
+    struct kernel_files_statistics statistics;
+    unsigned char observed[sizeof(payload) - 1U];
+    uint64_t cached_page = 0U;
+    uint64_t baseline;
+    uint64_t stat_buffer = TEST_USER_BUFFER + 2U * BOAROS_PAGE_SIZE;
+    size_t valid_bytes = 0U;
+    int64_t result = INT64_MIN;
+    uint32_t index;
+    int found = 0;
+
+    if (dtb_read_boot_info(dtb, &info) != DTB_STATUS_OK ||
+        info.timebase_frequency == 0U) {
+        fail_files(300U, DTB_STATUS_OK, -1);
+    }
+    layout.usable_count = 1U;
+    layout.usable[0].base = (uint64_t)(uintptr_t)&page_pool[0];
+    layout.usable[0].size = sizeof(page_pool);
+    if (physical_page_allocator_init(&allocator, &layout) !=
+            PHYSICAL_PAGE_STATUS_OK ||
+        physical_page_allocator_bind_access(&allocator, identity_access) !=
+            PHYSICAL_PAGE_STATUS_OK ||
+        physical_page_allocator_finalize(&allocator) !=
+            PHYSICAL_PAGE_STATUS_OK ||
+        kernel_heap_init(&heap, &allocator, heap_physical_address) !=
+            KERNEL_HEAP_STATUS_OK ||
+        riscv_sv39_page_table_init(&kernel_table, &allocator) !=
+            RISCV_SV39_STATUS_OK) {
+        fail_files(300U, 0, -1);
+    }
+    kernel_table.state = RISCV_SV39_STATE_ACTIVE;
+    baseline = physical_page_available(&allocator);
+    if (kernel_page_cache_init(&page_cache, &heap, &allocator) !=
+        KERNEL_PAGE_CACHE_STATUS_OK) {
+        fail_files(300U, 0, -1);
+    }
+
+    for (index = 0U; index < info.virtio_mmio_count; index++) {
+        enum riscv_virtio_mmio_block_status status =
+            riscv_virtio_mmio_block_init(
+                &device,
+                (volatile void *)(uintptr_t)info.virtio_mmio[index].base,
+                info.virtio_mmio[index].size,
+                &allocator,
+                dma_physical_address,
+                info.timebase_frequency);
+
+        if (status == RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK) {
+            found = 1;
+            break;
+        }
+        if (status != RISCV_VIRTIO_MMIO_BLOCK_STATUS_NOT_BLOCK) {
+            fail_files(300U, RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK, status);
+        }
+    }
+    if (!found ||
+        kernel_vfs_mount_root(&mount, &device.block, &heap, &page_cache) != 0 ||
+        kernel_vfs_mount_is_readonly(&mount) ||
+        !create_user_mm(&allocator, &kernel_table, &mm) ||
+        kernel_mm_vma_enable(&mm, &heap) != KERNEL_MM_STATUS_OK ||
+        kernel_mm_brk_initialize(&mm, UINT64_C(0x1000000),
+                                 TEST_MMAP_LIMIT) != KERNEL_MM_STATUS_OK ||
+        kernel_fs_context_create(&fs, &mount, &heap) !=
+            KERNEL_FS_CONTEXT_STATUS_OK ||
+        kernel_files_create(&files, &heap) != KERNEL_FILES_STATUS_OK ||
+        riscv_kernel_mm_satp(&mm, &test_satp) != KERNEL_MM_STATUS_OK) {
+        fail_files(300U, 0, -1);
+    }
+    use_test_satp = 1;
+
+    if (!write_user_bytes(&mm, TEST_USER_PATH, path, sizeof(path)) ||
+        kernel_files_openat(&files, &fs, &mm, TEST_AT_FDCWD,
+                            TEST_USER_PATH, TEST_O_CREAT | 2U, 0600U,
+                            &result) != KERNEL_FILES_STATUS_OK ||
+        result != 0 ||
+        !write_user_bytes(&mm, TEST_USER_BUFFER, initial,
+                          sizeof(initial) - 1U) ||
+        kernel_files_write(&files, &mm, 0, TEST_USER_BUFFER,
+                           sizeof(initial) - 1U, &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != (int64_t)(sizeof(initial) - 1U) ||
+        kernel_files_lseek(&files, 0, 0, KERNEL_FILES_SEEK_SET, &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != 0 ||
+        kernel_files_read(&files, &mm, 0, TEST_USER_BUFFER,
+                          sizeof(initial) - 1U, &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != (int64_t)(sizeof(initial) - 1U)) {
+        fail_files(301U, sizeof(initial) - 1U, result);
+    }
+    description = kernel_files_lookup_description(&files, 0);
+    if (description == 0 ||
+        kernel_open_file_lookup_page(description, 0U, &cached_page,
+                                     &valid_bytes) !=
+            KERNEL_PAGE_CACHE_STATUS_OK ||
+        valid_bytes != sizeof(initial) - 1U ||
+        physical_page_release(&allocator, cached_page) !=
+            PHYSICAL_PAGE_STATUS_OK ||
+        kernel_files_lseek(&files, 0, 8, KERNEL_FILES_SEEK_SET, &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != 8 ||
+        !write_user_bytes(&mm, TEST_USER_BUFFER, payload,
+                          sizeof(payload) - 1U)) {
+        fail_files(302U, 8, result);
+    }
+
+    inject_partial_write_error = 1;
+    if (kernel_files_write(&files, &mm, 0, TEST_USER_BUFFER,
+                           sizeof(payload) - 1U, &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != 5) {
+        fail_files(303U, 5, result);
+    }
+    if (inject_partial_write_error != 0 ||
+        kernel_open_file_offset(description) != 13U ||
+        description->file.size != 13U ||
+        kernel_vfs_file_size(&description->file) != 13U ||
+        kernel_open_file_size(description) != 13U ||
+        kernel_vfs_node_size(kernel_vfs_file_node(&description->file)) !=
+            13U ||
+        kernel_vfs_fstat(&description->file, &vfs_stat) != 0 ||
+        vfs_stat.size != 13U ||
+        kernel_files_fstat(&files, &mm, 0, stat_buffer, &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != 0 ||
+        !read_user_bytes(&mm, stat_buffer, &linux_stat,
+                         sizeof(linux_stat)) ||
+        linux_stat.st_size != 13) {
+        fail_files(304U, 13, result);
+    }
+    if (kernel_open_file_lookup_page(description, 0U, &cached_page,
+                                     &valid_bytes) !=
+            KERNEL_PAGE_CACHE_STATUS_NOT_FOUND ||
+        kernel_files_pread(&files, &mm, 0, TEST_USER_BUFFER,
+                           5U, 8, &result) != KERNEL_FILES_STATUS_OK ||
+        result != 5 ||
+        !read_user_bytes(&mm, TEST_USER_BUFFER, observed, 5U) ||
+        memcmp(observed, payload, 5U) != 0) {
+        fail_files(305U, 5, result);
+    }
+    kernel_files_get_statistics(&files, &statistics);
+    if (statistics.write_calls != 2U ||
+        statistics.write_failures != 0U ||
+        statistics.bytes_written != 8U) {
+        fail_files(306U, 8, statistics.bytes_written);
+    }
+
+    if (kernel_files_fcntl(&files, 0, KERNEL_FILES_F_SETFL,
+                           KERNEL_FILES_O_APPEND, &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != 0 ||
+        kernel_files_lseek(&files, 0, 1, KERNEL_FILES_SEEK_SET, &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != 1 ||
+        !write_user_bytes(&mm, TEST_USER_BUFFER, payload,
+                          sizeof(payload) - 1U)) {
+        fail_files(307U, 1, result);
+    }
+    inject_partial_write_error = 1;
+    if (kernel_files_write(&files, &mm, 0, TEST_USER_BUFFER,
+                           sizeof(payload) - 1U, &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != 5) {
+        fail_files(308U, 5, result);
+    }
+    if (kernel_open_file_offset(description) != 18U ||
+        description->file.size != 18U ||
+        kernel_vfs_file_size(&description->file) != 18U ||
+        kernel_open_file_size(description) != 18U ||
+        kernel_vfs_node_size(kernel_vfs_file_node(&description->file)) !=
+            18U ||
+        kernel_open_file_lookup_page(description, 0U, &cached_page,
+                                     &valid_bytes) !=
+            KERNEL_PAGE_CACHE_STATUS_NOT_FOUND ||
+        kernel_files_pread(&files, &mm, 0, TEST_USER_BUFFER,
+                           5U, 13, &result) != KERNEL_FILES_STATUS_OK ||
+        result != 5 ||
+        !read_user_bytes(&mm, TEST_USER_BUFFER, observed, 5U) ||
+        memcmp(observed, payload, 5U) != 0) {
+        fail_files(309U, 18, result);
+    }
+    kernel_files_get_statistics(&files, &statistics);
+    if (statistics.write_calls != 3U ||
+        statistics.write_failures != 0U ||
+        statistics.bytes_written != 13U) {
+        fail_files(310U, 13, statistics.bytes_written);
+    }
+
+    if (kernel_open_file_lookup_page(description, 0U, &cached_page,
+                                     &valid_bytes) !=
+            KERNEL_PAGE_CACHE_STATUS_OK ||
+        physical_page_release(&allocator, cached_page) !=
+            PHYSICAL_PAGE_STATUS_OK) {
+        fail_files(311U, KERNEL_PAGE_CACHE_STATUS_OK,
+                   KERNEL_PAGE_CACHE_STATUS_STATE);
+    }
+    inject_truncate_error = 1;
+    if (kernel_files_ftruncate(&files, 0, 2U, &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != -KERNEL_EIO || inject_truncate_error != 0) {
+        fail_files(312U, -KERNEL_EIO, result);
+    }
+    if (kernel_open_file_offset(description) != 18U ||
+        description->file.size != 2U ||
+        kernel_vfs_file_size(&description->file) != 2U ||
+        kernel_open_file_size(description) != 2U ||
+        kernel_vfs_node_size(kernel_vfs_file_node(&description->file)) != 2U ||
+        kernel_vfs_fstat(&description->file, &vfs_stat) != 0 ||
+        vfs_stat.size != 2U ||
+        kernel_files_fstat(&files, &mm, 0, stat_buffer, &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != 0 ||
+        !read_user_bytes(&mm, stat_buffer, &linux_stat,
+                         sizeof(linux_stat)) ||
+        linux_stat.st_size != 2 ||
+        kernel_open_file_lookup_page(description, 0U, &cached_page,
+                                     &valid_bytes) !=
+            KERNEL_PAGE_CACHE_STATUS_NOT_FOUND ||
+        kernel_files_pread(&files, &mm, 0, TEST_USER_BUFFER,
+                           1U, 2, &result) != KERNEL_FILES_STATUS_OK ||
+        result != 0) {
+        fail_files(313U, 2, result);
+    }
+
+    use_test_satp = 0;
+    if (kernel_files_close(&files, 0, &result) != KERNEL_FILES_STATUS_OK ||
+        result != 0 ||
+        kernel_files_release(&files) != KERNEL_FILES_STATUS_OK ||
+        kernel_fs_context_release(&fs) != KERNEL_FS_CONTEXT_STATUS_OK ||
+        kernel_mm_release(&mm) != KERNEL_MM_STATUS_OK ||
+        kernel_vfs_unmount(&mount) != 0 ||
+        kernel_page_cache_destroy(&page_cache) !=
+            KERNEL_PAGE_CACHE_STATUS_OK ||
+        riscv_virtio_mmio_block_destroy(&device) !=
+            RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK ||
+        physical_page_available(&allocator) != baseline) {
+        fail_files(314U, baseline, physical_page_available(&allocator));
+    }
+}
+#endif
+
 void kernel_main(unsigned long hart_id, const void *dtb)
 {
     (void)hart_id;
 
+#ifdef FILES_PARTIAL_WRITE_TEST
+    run_partial_write_test(dtb);
+    virt_uart_puts("BoarOS: process files partial write tests passed\n");
+#else
     run_files_test(dtb);
     virt_uart_puts("BoarOS: process files tests passed\n");
+#endif
     sbi_shutdown();
 }

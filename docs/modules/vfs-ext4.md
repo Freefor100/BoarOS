@@ -30,11 +30,11 @@ miss 路径先分配并清零页，再通过 node 的无 offset 副作用 `pread
 
 挂载后额外检查 superblock `needs_recovery` incompat feature。发现该位返回 `-EUCLEAN` 并完整撤销挂载。
 普通文件打开走 `ext4_fopen`，新建走 `ext4_fopen2`（`kernel_vfs_create`），目录打开走专有的 `ext4_dir_open_file` 直接绑定 `node->file`，免去在内核任务栈上分配 312 字节的完整 `ext4_dir` 结构。
-普通文件随机写入通过 `kernel_vfs_pwrite`（`ext4_fseek` + `ext4_fwrite`）执行，追加写入通过 `kernel_vfs_append` 在底层原子解析当前 EOF 并写入，确保 `O_APPEND` 的原子推进。lwext4 的 `SEEK_SET` 允许定位到 EOF 之后而不改变 inode size；后续写入只为调用者数据相交的逻辑块分配物理块，新分配的部分写块先清零，已分配的旧 EOF 尾部在扩大 size 前清零，完整中间 hole 保持未映射。读取未映射逻辑块时直接向调用者缓冲写零，绝不把物理块号 0 当作数据块读取。
+普通文件随机写入通过 `kernel_vfs_pwrite`（`ext4_fseek` + `ext4_fwrite`）执行，追加写入通过 `kernel_vfs_append` 在底层原子解析当前 EOF 并写入，确保 `O_APPEND` 的原子推进。lwext4 的 `SEEK_SET` 允许定位到 EOF 之后而不改变 inode size；后续写入只为调用者数据相交的逻辑块分配物理块，新分配的部分写块先清零，已分配的旧 EOF 尾部在扩大 size 前清零，完整中间 hole 保持未映射。读取未映射逻辑块时直接向调用者缓冲写零，绝不把物理块号 0 当作数据块读取。若 lwext4 提交正字节前缀后报告后续错误，VFS 先消费该前缀、从 handle 刷新 live inode size 并失效 node 页缓存，再向文件资源层返回成功与正字节数；只有零进度时才返回 errno。
 
-截断统一通过 sparse-capable `ext4_ftruncate` 执行：缩小仍释放尾部块，扩大只清零已分配的旧 EOF 块尾并发布新 inode size，不为完整逻辑 gap 分配块，且不改变调用 OFD offset。文件打开时按实际 inode mapping 缓存可寻址 size 上限：extent inode 使用 `EXT_MAX_BLOCKS * block_size`，legacy block-map inode 使用 `fs->inode_block_limits[3] * block_size`。truncate/write 超界返回 `EFBIG`，seek 超界返回 `EINVAL`，在任何尾部清零、64-bit offset 缩窄为 `ext4_lblk_t` 或 inode size 更新前拒绝。lwext4 在写入或截断所有可能改变状态的返回路径上，让 handle 的 `fsize` 保持为当前 inode 中可知的最新 size；VFS 成功后同步 node/file size。错误后的 VFS size reconciliation 与 partial-write syscall 报告由后续错误路径工作补齐。
+截断统一通过 sparse-capable `ext4_ftruncate` 执行：缩小仍释放尾部块，扩大只清零已分配的旧 EOF 块尾并发布新 inode size，不为完整逻辑 gap 分配块，且不改变调用 OFD offset。文件打开时按实际 inode mapping 缓存可寻址 size 上限：extent inode 使用 `EXT_MAX_BLOCKS * block_size`，legacy block-map inode 使用 `fs->inode_block_limits[3] * block_size`。truncate/write 超界返回 `EFBIG`，seek 超界返回 `EINVAL`，在任何尾部清零、64-bit offset 缩窄为 `ext4_lblk_t` 或 inode size 更新前拒绝。lwext4 在写入或截断所有可能改变状态的返回路径上，让 handle 的 `fsize` 保持为当前 inode 中可知的最新 size。
 
-新分配的数据块在 caller data 写入前整块初始化；初始化失败只撤销该 exact logical block 的 mapping，不回滚此前已经完成的块。对预置 unwritten extent 的初始化和 caller 部分写使用同一个 block-cache buffer，避免延迟的 zero buffer 在 direct I/O 之后覆盖用户数据；读取 mapped block 前先排空该物理块的 dirty cache，flush 失败则返回错误而不从旧磁盘内容读取。
+新分配的数据块在 caller data 写入前整块初始化；初始化失败只撤销该 exact logical block 的 mapping，不回滚此前已经完成的块。对预置 unwritten extent 的初始化和 caller 部分写使用同一个 block-cache buffer，避免延迟的 zero buffer 在 direct I/O 之后覆盖用户数据；读取 mapped block 前先排空该物理块的 dirty cache，flush 失败则返回错误而不从旧磁盘内容读取。lwext4 在写入或截断所有可能改变状态的返回路径上，让 handle 的 `fsize` 保持为当前 inode 中可知的最新 size；VFS 每次调用这两类 backend 操作后都据此同步 node/file size 并失效缓存，包括 truncate 已改变 inode 后才返回错误的路径。部分写返回依据固定 Linux `references/linux` commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 `mm/filemap.c::generic_perform_write()` 与 `fs/read_write.c::new_sync_write()`：正进度覆盖后续错误并只推进相同字节数的文件位置。
 
 `kernel_vfs_fstat()` 把当前 open handle 指向的 raw ext4 inode 转换为统一 `kernel_vfs_stat`，不按路径重新查找，也不从 logical size 猜 metadata。它读取 inode 的 ino/mode/nlink、Linux low/high uid/gid、64-bit size、以 512 字节为单位的 allocated block count，以及 filesystem block size；atime/mtime/ctime 按 inode `extra_isize` 判断 extra 字段是否存在，再解码 2-bit epoch 与纳秒。该编码依据固定 Linux commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 `references/linux/fs/ext4/ext4.h`。根 mount 保存稳定的内部 ID 1 作为 `dev`，不表达物理设备 major/minor。lwext4 的 `ext4_fraw_inode_fill()` 是最小 handle adapter，使最后一个 dentry 删除后仍能查询活着的 inode。
 目录操作中，`kernel_vfs_mkdir` 调用 `ext4_dir_mk`；`kernel_vfs_unlink` 实现了真正的 Linux `unlink`-but-open 语义：
@@ -67,6 +67,7 @@ cookie 可以交给 `lseek`/`telldir`/`seekdir` 恢复。OFD 持有位置，所�
 make test-lwext4-host
 make test-vfs-riscv
 make test-files-riscv
+make test-files-partial-write-riscv
 make test-exec-riscv
 make test-root-init-riscv
 ```

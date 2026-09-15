@@ -715,6 +715,17 @@ int kernel_vfs_pread(struct kernel_vfs_file *file,
                                  bytes_read);
 }
 
+static void reconcile_file_after_mutation(struct kernel_vfs_node *node,
+                                          struct kernel_vfs_file *file)
+{
+    node->size = ext4_fsize(&node->file);
+    file->size = node->size;
+    if (node->adapter->page_cache != 0) {
+        (void)kernel_page_cache_invalidate_node(node->adapter->page_cache,
+                                                node);
+    }
+}
+
 int kernel_vfs_pwrite(struct kernel_vfs_file *file,
                       uint64_t offset,
                       const void *buffer,
@@ -747,16 +758,13 @@ int kernel_vfs_pwrite(struct kernel_vfs_file *file,
         return lwext4_error(result);
     }
     result = ext4_fwrite(&node->file, buffer, size, &written);
-    if (result != EOK) {
-        return lwext4_error(result);
-    }
-    node->size = ext4_fsize(&node->file);
-    file->size = node->size;
+    reconcile_file_after_mutation(node, file);
     *bytes_written = written;
-
-    if (node->adapter->page_cache != 0) {
-        (void)kernel_page_cache_invalidate_node(node->adapter->page_cache,
-                                                node);
+    if (written > size) {
+        return -KERNEL_EIO;
+    }
+    if (result != EOK && written == 0U) {
+        return lwext4_error(result);
     }
     return 0;
 }
@@ -797,19 +805,16 @@ int kernel_vfs_append(struct kernel_vfs_file *file,
         return lwext4_error(result);
     }
     result = ext4_fwrite(&node->file, buffer, size, &written);
-    if (result != EOK) {
-        return lwext4_error(result);
-    }
-    node->size = ext4_fsize(&node->file);
-    file->size = node->size;
+    reconcile_file_after_mutation(node, file);
     if (written_offset != 0) {
         *written_offset = offset + (uint64_t)written;
     }
     *bytes_written = written;
-
-    if (node->adapter->page_cache != 0) {
-        (void)kernel_page_cache_invalidate_node(node->adapter->page_cache,
-                                                node);
+    if (written > size) {
+        return -KERNEL_EIO;
+    }
+    if (result != EOK && written == 0U) {
+        return lwext4_error(result);
     }
     return 0;
 }
@@ -837,14 +842,11 @@ int kernel_vfs_ftruncate(struct kernel_vfs_file *file,
 
     if (size != node->size) {
         result = ext4_ftruncate(&node->file, size);
+        reconcile_file_after_mutation(node, file);
         if (result != EOK) {
             return lwext4_error(result);
         }
-        node->size = ext4_fsize(&node->file);
-        file->size = node->size;
-    }
-
-    if (node->adapter->page_cache != 0) {
+    } else if (node->adapter->page_cache != 0) {
         (void)kernel_page_cache_invalidate_node(node->adapter->page_cache,
                                                 node);
     }

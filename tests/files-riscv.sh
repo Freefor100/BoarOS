@@ -5,6 +5,9 @@ set -eu
 project_root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 kernel=${FILES_TEST_KERNEL_RV:-"$project_root/build/riscv/tests/kernel-files-rv"}
 qemu=${QEMU_RISCV64:-qemu-system-riscv64}
+readonly=${FILES_TEST_READONLY:-on}
+success_marker=${FILES_TEST_SUCCESS_MARKER:-BoarOS: process files tests passed}
+console_writes=${FILES_TEST_EXPECT_CONSOLE_WRITES:-2}
 work_dir=$(mktemp -d)
 output="$work_dir/files.log"
 disk="$work_dir/root.img"
@@ -76,7 +79,7 @@ if ! timeout -k 2s 20s "$qemu" \
     -smp 1 \
     -nographic \
     -no-reboot \
-    -drive file="$disk",if=none,format=raw,readonly=on,id=x0 \
+    -drive file="$disk",if=none,format=raw,readonly="$readonly",id=x0 \
     -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
     </dev/null >"$output" 2>&1; then
     tail -n 120 "$output" >&2
@@ -85,14 +88,15 @@ if ! timeout -k 2s 20s "$qemu" \
     exit 1
 fi
 
-if [ "$(grep -cxF 'BoarOS: process files tests passed' "$output" || true)" -ne 1 ]; then
+if [ "$(grep -cxF "$success_marker" "$output" || true)" -ne 1 ]; then
     tail -n 120 "$output" >&2
     dump_fixture_metadata
     echo "process files test kernel did not report success" >&2
     exit 1
 fi
 
-if [ "$(grep -cxF 'BoarOS: files console write ok' "$output" || true)" -lt 2 ]; then
+if [ "$console_writes" -gt 0 ] &&
+    [ "$(grep -cxF 'BoarOS: files console write ok' "$output" || true)" -lt "$console_writes" ]; then
     tail -n 120 "$output" >&2
     dump_fixture_metadata
     echo "process files test kernel did not write through the console descriptor" >&2

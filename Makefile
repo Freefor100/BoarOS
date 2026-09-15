@@ -30,6 +30,8 @@ VFS_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-vfs-rv
 VFS_RECOVERY_TEST_KERNEL_RV := \
 	$(BUILD_DIR)/tests/kernel-vfs-recovery-rv
 FILES_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-files-rv
+FILES_PARTIAL_WRITE_TEST_KERNEL_RV := \
+	$(BUILD_DIR)/tests/kernel-files-partial-write-rv
 SV39_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-sv39-rv
 SV39_FAULT_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-sv39-fault-rv
 MM_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-mm-rv
@@ -296,6 +298,12 @@ FILES_TEST_C_SOURCES := \
 FILES_TEST_OBJECTS := \
 	$(TEST_RUNTIME_OBJECTS) \
 	$(patsubst %.c,$(BUILD_DIR)/%.o,$(FILES_TEST_C_SOURCES))
+FILES_PARTIAL_WRITE_TEST_MAIN_OBJECT := \
+	$(BUILD_DIR)/tests/riscv/files_partial_write_main.o
+FILES_PARTIAL_WRITE_TEST_OBJECTS := \
+	$(TEST_RUNTIME_OBJECTS) \
+	$(patsubst %.c,$(BUILD_DIR)/%.o,$(VFS_TEST_SUPPORT_C_SOURCES)) \
+	$(FILES_PARTIAL_WRITE_TEST_MAIN_OBJECT)
 SV39_TEST_C_SOURCES := \
 	tests/riscv/direct_map_cases.c \
 	tests/riscv/sv39_cases.c \
@@ -416,6 +424,7 @@ DEPS := \
 	$(VFS_TEST_OBJECTS:.o=.d) \
 	$(VFS_RECOVERY_TEST_MAIN_OBJECT:.o=.d) \
 	$(FILES_TEST_OBJECTS:.o=.d) \
+	$(FILES_PARTIAL_WRITE_TEST_MAIN_OBJECT:.o=.d) \
 	$(SV39_TEST_OBJECTS:.o=.d) \
 	$(SV39_FAULT_TEST_OBJECTS:.o=.d) \
 	$(MM_TEST_OBJECTS:.o=.d) \
@@ -447,6 +456,7 @@ DEPS := \
 	test-root-boot-cleanup-riscv \
 	test-uaccess-oom-riscv test-icache-riscv \
 	test-files-riscv \
+	test-files-partial-write-riscv \
 	test-high-half-trap-riscv test-idle-riscv test-no-identity-riscv \
 	test-lwext4-host \
 	test-block-riscv test-heap-riscv test-page-riscv test-vfs-riscv \
@@ -579,6 +589,21 @@ $(FILES_TEST_KERNEL_RV): $(FILES_TEST_OBJECTS) arch/riscv/linker.ld
 		-Wl,--wrap=riscv_sv39_current_satp \
 		-Wl,-Map,$(BUILD_DIR)/tests/kernel-files-rv.map \
 		-o $@ $(FILES_TEST_OBJECTS)
+
+$(FILES_PARTIAL_WRITE_TEST_KERNEL_RV): \
+		$(FILES_PARTIAL_WRITE_TEST_OBJECTS) arch/riscv/linker.ld
+	$(CC) $(LDFLAGS) \
+		-Wl,--wrap=kernel_open_file_release \
+		-Wl,--wrap=riscv_sv39_current_satp \
+		-Wl,--wrap=ext4_fwrite \
+		-Wl,--wrap=ext4_ftruncate \
+		-Wl,-Map,$(BUILD_DIR)/tests/kernel-files-partial-write-rv.map \
+		-o $@ $(FILES_PARTIAL_WRITE_TEST_OBJECTS)
+
+$(FILES_PARTIAL_WRITE_TEST_MAIN_OBJECT): tests/riscv/files_main.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CPPFLAGS) $(LWEXT4_CPPFLAGS) $(CFLAGS) \
+		-DFILES_PARTIAL_WRITE_TEST -MMD -MP -c $< -o $@
 
 $(TIMER_CASES_TEST_KERNEL_RV): $(TIMER_CASES_TEST_OBJECTS) \
 		arch/riscv/linker.ld
@@ -776,6 +801,7 @@ debug-riscv: $(KERNEL_RV)
 .NOTPARALLEL: test-riscv
 test-riscv: test-dtb-riscv test-page-riscv test-heap-riscv \
 	test-block-riscv test-vfs-riscv test-files-riscv \
+	test-files-partial-write-riscv \
 	test-context-riscv test-scheduler-cases-riscv \
 	test-scheduler-riscv test-syscall-riscv test-signal-riscv \
 	test-elf64-riscv test-user-riscv test-user-fatal-riscv \
@@ -811,6 +837,13 @@ test-vfs-riscv: $(VFS_TEST_KERNEL_RV) $(VFS_RECOVERY_TEST_KERNEL_RV)
 
 test-files-riscv: $(FILES_TEST_KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) FILES_TEST_KERNEL_RV=$< \
+		./tests/files-riscv.sh
+
+test-files-partial-write-riscv: $(FILES_PARTIAL_WRITE_TEST_KERNEL_RV)
+	QEMU_RISCV64=$(QEMU_RISCV64) \
+		FILES_TEST_KERNEL_RV=$< FILES_TEST_READONLY=off \
+		FILES_TEST_EXPECT_CONSOLE_WRITES=0 \
+		FILES_TEST_SUCCESS_MARKER='BoarOS: process files partial write tests passed' \
 		./tests/files-riscv.sh
 
 test-context-riscv: $(CONTEXT_TEST_KERNEL_RV)

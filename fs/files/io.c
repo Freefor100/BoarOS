@@ -426,7 +426,10 @@ static enum kernel_files_status write_request(
                                                    chunk,
                                                    &new_offset,
                                                    &written);
-                    if (vfs_result == 0) {
+                    if (written > chunk) {
+                        return KERNEL_FILES_STATUS_STATE;
+                    }
+                    if (written != 0U) {
                         description->offset = new_offset;
                         file_offset = new_offset;
                     }
@@ -436,18 +439,21 @@ static enum kernel_files_status write_request(
                                                    staging,
                                                    chunk,
                                                    &written);
-                    if (vfs_result == 0) {
+                    if (written > chunk) {
+                        return KERNEL_FILES_STATUS_STATE;
+                    }
+                    if (written != 0U) {
                         file_offset += (uint64_t)written;
                         description->offset = file_offset;
                     }
                 }
+                total += (uint64_t)written;
+                offset += (uint64_t)written;
                 if (vfs_result != 0) {
                     files->record->statistics.write_failures++;
                     *linux_result = total != 0U ? (int64_t)total : vfs_result;
                     return KERNEL_FILES_STATUS_OK;
                 }
-                total += (uint64_t)written;
-                offset += (uint64_t)written;
                 if (written < chunk) {
                     break;
                 }
