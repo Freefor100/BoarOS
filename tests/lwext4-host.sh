@@ -8,6 +8,7 @@ image="$work_dir/root.img"
 uuid_seeded_image="$work_dir/uuid-seeded.img"
 sparse_image="$work_dir/sparse.img"
 legacy_image="$work_dir/legacy.img"
+wide_legacy_image="$work_dir/wide-legacy.img"
 fixture="$work_dir/fixture"
 empty_fixture="$work_dir/empty"
 expected='BoarOS lwext4 modern image probe'
@@ -109,10 +110,18 @@ mkfs.ext4 -q -F -b 1024 -I 256 -O ^extent,^64bit "$legacy_image"
 debugfs -w -R "write $empty_fixture /legacy-limit" "$legacy_image" \
 	>/dev/null 2>&1
 
+truncate -s 128M "$wide_legacy_image"
+mkfs.ext4 -q -F -b 8192 -I 256 -O ^extent,^64bit "$wide_legacy_image"
+debugfs -w -R "write $empty_fixture /wide-legacy-limit" \
+	"$wide_legacy_image" >/dev/null 2>&1
+
 sparse_status=0
 "$work_dir/lwext4-read" "$sparse_image" --aligned-hole || sparse_status=1
 "$work_dir/lwext4-read" "$sparse_image" --sparse || sparse_status=1
 "$work_dir/lwext4-read" "$legacy_image" --legacy-limit || sparse_status=1
+"$work_dir/lwext4-read" "$wide_legacy_image" --wide-legacy-limit || \
+	sparse_status=1
 e2fsck -fn "$sparse_image" || sparse_status=1
 e2fsck -fn "$legacy_image" || sparse_status=1
+e2fsck -fn "$wide_legacy_image" || sparse_status=1
 exit "$sparse_status"

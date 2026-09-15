@@ -395,6 +395,147 @@ close:
 	return failed;
 }
 
+static int check_wide_legacy_address_limit(void)
+{
+	static const uint8_t marker[] = "WIDE";
+	const uint64_t legacy_max = UINT64_C(35184372080640);
+	const uint64_t beyond = legacy_max + 1;
+	const uint64_t aliased_offset = UINT64_C(35184372088832);
+	const uint64_t aliased_size = aliased_offset + 1;
+	uint8_t byte = 0xa5;
+	uint8_t actual[sizeof(marker) - 1];
+	ext4_file file = {0};
+	size_t count = 0;
+	int alias_seek_rc;
+	int failed = 0;
+	int rc;
+
+	rc = ext4_fopen2(&file, "/wide-legacy-limit", O_RDWR);
+	if (rc != EOK)
+		return report_error("open wide legacy limit file", rc);
+	rc = ext4_fwrite(&file, marker, sizeof(marker) - 1, &count);
+	if (rc != EOK || count != sizeof(marker) - 1) {
+		failed = report_error("write wide legacy limit marker",
+				      rc != EOK ? rc : EIO);
+		goto close;
+	}
+
+	rc = ext4_ftruncate(&file, legacy_max);
+	if (rc != EOK || ext4_fsize(&file) != legacy_max ||
+	    ext4_ftell(&file) != sizeof(marker) - 1) {
+		fprintf(stderr,
+			"wide legacy exact-limit truncate mismatch: rc=%d size=%" PRIu64 " pos=%" PRIu64 "\n",
+			rc, ext4_fsize(&file), ext4_ftell(&file));
+		failed = 1;
+		goto close;
+	}
+	if (ext4_fseek(&file, (int64_t)(legacy_max - 1), SEEK_SET) != EOK) {
+		failed = report_error("seek wide legacy last byte", EIO);
+		goto close;
+	}
+	count = 0;
+	rc = ext4_fread(&file, &byte, 1, &count);
+	if (rc != EOK || count != 1 || byte != 0 ||
+	    ext4_ftell(&file) != legacy_max) {
+		fprintf(stderr,
+			"wide legacy exact-limit read mismatch: rc=%d count=%zu byte=%#x pos=%" PRIu64 "\n",
+			rc, count, byte, ext4_ftell(&file));
+		failed = 1;
+	}
+
+	rc = ext4_ftruncate(&file, beyond);
+	if (rc != EFBIG || ext4_fsize(&file) != legacy_max ||
+	    ext4_ftell(&file) != legacy_max) {
+		fprintf(stderr,
+			"wide legacy first-disallowed truncate mismatch: rc=%d size=%" PRIu64 " pos=%" PRIu64 "\n",
+			rc, ext4_fsize(&file), ext4_ftell(&file));
+		failed = 1;
+	}
+	rc = ext4_fseek(&file, (int64_t)beyond, SEEK_SET);
+	if (rc != EINVAL || ext4_ftell(&file) != legacy_max) {
+		fprintf(stderr,
+			"wide legacy first-disallowed seek mismatch: rc=%d pos=%" PRIu64 "\n",
+			rc, ext4_ftell(&file));
+		failed = 1;
+	}
+	if (ext4_fseek(&file, (int64_t)legacy_max, SEEK_SET) != EOK) {
+		failed = report_error("seek wide legacy exact EOF", EIO);
+		goto verify_marker;
+	}
+	count = 0;
+	byte = 0xa5;
+	rc = ext4_fread(&file, &byte, 1, &count);
+	if (rc != EOK || count != 0 || ext4_ftell(&file) != legacy_max) {
+		fprintf(stderr,
+			"wide legacy exact-EOF read mismatch: rc=%d count=%zu byte=%#x pos=%" PRIu64 "\n",
+			rc, count, byte, ext4_ftell(&file));
+		failed = 1;
+	}
+	(void)ext4_fseek(&file, (int64_t)legacy_max, SEEK_SET);
+	count = 0;
+	rc = ext4_fwrite(&file, "X", 1, &count);
+	if (rc != EFBIG || count != 0 || ext4_fsize(&file) != legacy_max ||
+	    ext4_ftell(&file) != legacy_max) {
+		fprintf(stderr,
+			"wide legacy first-disallowed write mismatch: rc=%d count=%zu size=%" PRIu64 " pos=%" PRIu64 "\n",
+			rc, count, ext4_fsize(&file), ext4_ftell(&file));
+		failed = 1;
+	}
+
+	(void)ext4_fseek(&file, (int64_t)legacy_max, SEEK_SET);
+	rc = ext4_ftruncate(&file, aliased_size);
+	if (rc != EFBIG || ext4_fsize(&file) != legacy_max ||
+	    ext4_ftell(&file) != legacy_max) {
+		fprintf(stderr,
+			"wide legacy aliased-size truncate mismatch: rc=%d size=%" PRIu64 " pos=%" PRIu64 "\n",
+			rc, ext4_fsize(&file), ext4_ftell(&file));
+		failed = 1;
+	}
+	alias_seek_rc = ext4_fseek(&file, (int64_t)aliased_offset, SEEK_SET);
+	if (alias_seek_rc == EOK) {
+		count = 0;
+		byte = 0xa5;
+		rc = ext4_fread(&file, &byte, 1, &count);
+		if (rc == EOK && count == 1 && byte == marker[0])
+			fprintf(stderr,
+				"wide legacy offset 2^45 aliased logical block zero\n");
+		(void)ext4_fseek(&file, (int64_t)aliased_offset, SEEK_SET);
+		count = 0;
+		(void)ext4_fwrite(&file, "X", 1, &count);
+	}
+	if (alias_seek_rc != EINVAL || ext4_ftell(&file) != legacy_max ||
+	    ext4_fsize(&file) != legacy_max) {
+		fprintf(stderr,
+			"wide legacy aliased offset was accepted: seek=%d size=%" PRIu64 " pos=%" PRIu64 "\n",
+			alias_seek_rc, ext4_fsize(&file), ext4_ftell(&file));
+		failed = 1;
+	}
+
+verify_marker:
+	if (ext4_fseek(&file, 0, SEEK_SET) != EOK) {
+		failed = report_error("rewind wide legacy marker", EIO);
+		goto close;
+	}
+	memset(actual, 0, sizeof(actual));
+	count = 0;
+	rc = ext4_fread(&file, actual, sizeof(actual), &count);
+	if (rc != EOK || count != sizeof(actual) ||
+	    memcmp(actual, marker, sizeof(actual)) != 0) {
+		fprintf(stderr,
+			"wide legacy marker changed: rc=%d count=%zu first=%#x size=%" PRIu64 "\n",
+			rc, count, actual[0], ext4_fsize(&file));
+		failed = 1;
+	}
+
+close:
+	rc = ext4_fclose(&file);
+	if (rc != EOK) {
+		report_error("close wide legacy limit file", rc);
+		failed = 1;
+	}
+	return failed;
+}
+
 static int check_failed_block_initialization(struct host_image *image)
 {
 	struct ext4_inode inode;
@@ -617,6 +758,7 @@ int main(int argc, char **argv)
 	bool sparse_mode;
 	bool aligned_hole_mode;
 	bool legacy_limit_mode;
+	bool wide_legacy_limit_mode;
 	bool registered = false;
 	bool mounted = false;
 	int failed = 0;
@@ -627,10 +769,12 @@ int main(int argc, char **argv)
 		strcmp(argv[2], "--aligned-hole") == 0;
 	legacy_limit_mode = argc == 3 &&
 		strcmp(argv[2], "--legacy-limit") == 0;
+	wide_legacy_limit_mode = argc == 3 &&
+		strcmp(argv[2], "--wide-legacy-limit") == 0;
 	if (argc != 4 && !sparse_mode && !aligned_hole_mode &&
-	    !legacy_limit_mode) {
+	    !legacy_limit_mode && !wide_legacy_limit_mode) {
 		fprintf(stderr,
-			"usage: %s IMAGE PATH EXPECTED | IMAGE --aligned-hole | IMAGE --sparse | IMAGE --legacy-limit\n",
+			"usage: %s IMAGE PATH EXPECTED | IMAGE --aligned-hole | IMAGE --sparse | IMAGE --legacy-limit | IMAGE --wide-legacy-limit\n",
 			argv[0]);
 		return 2;
 	}
@@ -639,7 +783,8 @@ int main(int argc, char **argv)
 		expected = argv[3];
 
 	image.fd = open(argv[1],
-			(sparse_mode || legacy_limit_mode ? O_RDWR : O_RDONLY) |
+			(sparse_mode || legacy_limit_mode || wide_legacy_limit_mode ?
+			 O_RDWR : O_RDONLY) |
 			O_CLOEXEC);
 	if (image.fd < 0) {
 		failed = report_error("open image", errno);
@@ -676,7 +821,8 @@ int main(int argc, char **argv)
 	registered = true;
 
 	rc = ext4_mount(DEVICE_NAME, MOUNT_POINT,
-			!sparse_mode && !legacy_limit_mode);
+			!sparse_mode && !legacy_limit_mode &&
+			!wide_legacy_limit_mode);
 	if (rc != EOK) {
 		failed = report_error("mount image", rc);
 		goto cleanup;
@@ -687,6 +833,8 @@ int main(int argc, char **argv)
 		failed = check_sparse_behavior(&image);
 	else if (legacy_limit_mode)
 		failed = check_legacy_address_limit();
+	else if (wide_legacy_limit_mode)
+		failed = check_wide_legacy_address_limit();
 	else if (aligned_hole_mode)
 		failed = check_aligned_hole();
 	else

@@ -96,6 +96,54 @@ struct ext4_mountpoint {
 	struct ext4_bcache bc;
 };
 
+static uint64_t ext4_legacy_max_blocks(struct ext4_fs *fs)
+{
+	uint64_t block_size = ext4_sb_get_block_size(&fs->sb);
+	uint64_t pointers_per_block = block_size / sizeof(uint32_t);
+	uint64_t pointers_squared = pointers_per_block * pointers_per_block;
+	uint64_t inode_blocks_limit;
+	uint64_t metadata_blocks;
+	uint64_t remaining;
+	uint64_t result = fs->inode_block_limits[3];
+
+	/* i_blocks is either a 32-bit count of 512-byte sectors, or, with the
+	 * huge_file feature, a 48-bit count that can switch to filesystem-block
+	 * units. Keep enough room for every indirect block of a dense file. */
+	if (ext4_sb_feature_ro_com(&fs->sb, EXT4_FRO_COM_HUGE_FILE))
+		inode_blocks_limit = (UINT64_C(1) << 48) - 1;
+	else
+		inode_blocks_limit = UINT32_MAX /
+			(block_size / EXT4_INODE_BLOCK_SIZE);
+
+	metadata_blocks = 3 + pointers_per_block + pointers_squared;
+	if (result + metadata_blocks > inode_blocks_limit) {
+		result = inode_blocks_limit;
+		remaining = inode_blocks_limit - EXT4_INODE_DIRECT_BLOCK_COUNT;
+
+		metadata_blocks = 1;
+		remaining -= pointers_per_block;
+		if (remaining < pointers_squared) {
+			metadata_blocks += 1 +
+				EXT4_DIV_ROUND_UP(remaining, pointers_per_block);
+		} else {
+			metadata_blocks += 1 + pointers_per_block;
+			remaining -= pointers_squared;
+			metadata_blocks += 1 +
+				EXT4_DIV_ROUND_UP(remaining, pointers_per_block) +
+				EXT4_DIV_ROUND_UP(remaining, pointers_squared);
+		}
+		result -= metadata_blocks;
+	}
+
+	/* EXT_MAX_BLOCKS is both the extent walker's sentinel and the largest
+	 * block count that fits the legacy truncate path's ext4_lblk_t counts.
+	 * Thus 0xfffffffe is the last usable logical block. */
+	if (result > (uint64_t)EXT_MAX_BLOCKS)
+		result = (uint64_t)EXT_MAX_BLOCKS;
+
+	return result;
+}
+
 static uint64_t ext4_inode_max_size(struct ext4_fs *fs,
 				    struct ext4_inode *inode)
 {
@@ -110,7 +158,7 @@ static uint64_t ext4_inode_max_size(struct ext4_fs *fs,
 	}
 #endif
 
-	return fs->inode_block_limits[3] * block_size;
+	return ext4_legacy_max_blocks(fs) * block_size;
 }
 
 /**@brief   Block devices descriptor.*/
