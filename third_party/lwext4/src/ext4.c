@@ -96,6 +96,23 @@ struct ext4_mountpoint {
 	struct ext4_bcache bc;
 };
 
+static uint64_t ext4_inode_max_size(struct ext4_fs *fs,
+				    struct ext4_inode *inode)
+{
+	uint32_t block_size = ext4_sb_get_block_size(&fs->sb);
+
+#if CONFIG_EXTENT_ENABLE && CONFIG_EXTENTS_ENABLE
+	if (ext4_sb_feature_incom(&fs->sb, EXT4_FINCOM_EXTENTS) &&
+	    ext4_inode_has_flag(inode, EXT4_INODE_FLAG_EXTENTS)) {
+		/* EXT_MAX_BLOCKS is the extent walker's sentinel, not a usable
+		 * logical block number. */
+		return (uint64_t)EXT_MAX_BLOCKS * block_size;
+	}
+#endif
+
+	return fs->inode_block_limits[3] * block_size;
+}
+
 /**@brief   Block devices descriptor.*/
 struct ext4_block_devices {
 
@@ -1085,6 +1102,7 @@ static int ext4_generic_open2(ext4_file *f, const char *path, int flags,
 
 		f->mp = mp;
 		f->fsize = ext4_inode_get_size(sb, ref.inode);
+		f->fmax = ext4_inode_max_size(fs, ref.inode);
 		f->inode = ref.index;
 		f->fpos = 0;
 
@@ -1636,7 +1654,7 @@ int ext4_fclose(ext4_file *file)
 	file->mp = 0;
 	file->flags = 0;
 	file->inode = 0;
-	file->fpos = file->fsize = 0;
+	file->fpos = file->fsize = file->fmax = 0;
 
 	return EOK;
 }
@@ -1707,15 +1725,6 @@ static int ext4_flush_fblock_range(struct ext4_blockdev *bdev,
 	return EOK;
 }
 
-static uint64_t ext4_file_max_size(const ext4_file *file)
-{
-	uint32_t block_size = ext4_sb_get_block_size(&file->mp->fs.sb);
-
-	/* EXT_MAX_BLOCKS is the extent walker's sentinel, not a usable logical
-	 * block number. */
-	return (uint64_t)EXT_MAX_BLOCKS * block_size;
-}
-
 static int ext4_zero_allocated_eof_tail(struct ext4_inode_ref *ref,
 					uint64_t old_size,
 					uint64_t visible_end)
@@ -1751,7 +1760,7 @@ static int ext4_ftruncate_no_lock(ext4_file *file, uint64_t size)
 	int r;
 	int cleanup_r;
 
-	if (size > ext4_file_max_size(file))
+	if (size > file->fmax)
 		return EFBIG;
 
 	r = ext4_fs_get_inode_ref(&file->mp->fs, file->inode, &ref);
@@ -1848,7 +1857,7 @@ int ext4_fread(ext4_file *file, void *buf, size_t size, size_t *rcnt)
 
 	/*Sync file size*/
 	file->fsize = ext4_inode_get_size(sb, ref.inode);
-	if (file->fsize > ext4_file_max_size(file)) {
+	if (file->fsize > file->fmax) {
 		r = EFBIG;
 		goto Finish;
 	}
@@ -2035,7 +2044,7 @@ int ext4_fwrite(ext4_file *file, const void *buf, size_t size, size_t *wcnt)
 	file->fsize = ext4_inode_get_size(sb, ref.inode);
 	block_size = ext4_sb_get_block_size(sb);
 
-	if (write_end > ext4_file_max_size(file)) {
+	if (write_end > file->fmax) {
 		r = EFBIG;
 		goto Finish;
 	}
@@ -2111,7 +2120,7 @@ Finish:
 
 int ext4_fseek(ext4_file *file, int64_t offset, uint32_t origin)
 {
-	uint64_t max_size = ext4_file_max_size(file);
+	uint64_t max_size = file->fmax;
 
 	switch (origin) {
 	case SEEK_SET:

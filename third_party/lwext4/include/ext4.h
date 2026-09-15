@@ -82,6 +82,9 @@ typedef struct ext4_file {
 	/**@brief   File size.*/
 	uint64_t fsize;
 
+	/**@brief   Maximum size addressable by this inode's block mapping.*/
+	uint64_t fmax;
+
 	/**@brief   Actual file position.*/
 	uint64_t fpos;
 } ext4_file;

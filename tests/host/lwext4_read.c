@@ -316,6 +316,85 @@ close:
 	return failed;
 }
 
+static int check_legacy_address_limit(void)
+{
+	static const uint8_t marker[] = "LEGACY";
+	const uint64_t legacy_max = UINT64_C(17247252480);
+	const uint64_t beyond = legacy_max + 1;
+	uint8_t byte = 0xa5;
+	ext4_file file = {0};
+	size_t count = 0;
+	int failed = 0;
+	int rc;
+
+	rc = ext4_fopen2(&file, "/legacy-limit", O_RDWR);
+	if (rc != EOK)
+		return report_error("open legacy limit file", rc);
+	rc = ext4_fwrite(&file, marker, sizeof(marker) - 1, &count);
+	if (rc != EOK || count != sizeof(marker) - 1) {
+		failed = report_error("write legacy limit marker",
+				      rc != EOK ? rc : EIO);
+		goto close;
+	}
+
+	rc = ext4_ftruncate(&file, legacy_max);
+	if (rc != EOK || ext4_fsize(&file) != legacy_max ||
+	    ext4_ftell(&file) != sizeof(marker) - 1) {
+		fprintf(stderr,
+			"legacy exact-limit truncate mismatch: rc=%d size=%" PRIu64 " pos=%" PRIu64 "\n",
+			rc, ext4_fsize(&file), ext4_ftell(&file));
+		failed = 1;
+		goto close;
+	}
+	if (ext4_fseek(&file, (int64_t)(legacy_max - 1), SEEK_SET) != EOK) {
+		failed = report_error("seek legacy last byte", EIO);
+		goto close;
+	}
+	count = 0;
+	rc = ext4_fread(&file, &byte, 1, &count);
+	if (rc != EOK || count != 1 || byte != 0 ||
+	    ext4_ftell(&file) != legacy_max) {
+		fprintf(stderr,
+			"legacy exact-limit read mismatch: rc=%d count=%zu byte=%#x pos=%" PRIu64 "\n",
+			rc, count, byte, ext4_ftell(&file));
+		failed = 1;
+	}
+
+	rc = ext4_ftruncate(&file, beyond);
+	if (rc != EFBIG || ext4_fsize(&file) != legacy_max ||
+	    ext4_ftell(&file) != legacy_max) {
+		fprintf(stderr,
+			"legacy beyond-limit truncate mismatch: rc=%d size=%" PRIu64 " pos=%" PRIu64 "\n",
+			rc, ext4_fsize(&file), ext4_ftell(&file));
+		failed = 1;
+	}
+	rc = ext4_fseek(&file, (int64_t)beyond, SEEK_SET);
+	if (rc != EINVAL || ext4_ftell(&file) != legacy_max) {
+		fprintf(stderr,
+			"legacy beyond-limit seek mismatch: rc=%d pos=%" PRIu64 "\n",
+			rc, ext4_ftell(&file));
+		failed = 1;
+	}
+	(void)ext4_fseek(&file, (int64_t)legacy_max, SEEK_SET);
+	count = 0;
+	rc = ext4_fwrite(&file, "X", 1, &count);
+	if (rc != EFBIG || count != 0 || ext4_fsize(&file) != legacy_max ||
+	    ext4_ftell(&file) != legacy_max) {
+		fprintf(stderr,
+			"legacy beyond-limit write mismatch: rc=%d count=%zu size=%" PRIu64 " pos=%" PRIu64 "\n",
+			rc, count, ext4_fsize(&file), ext4_ftell(&file));
+		failed = 1;
+	}
+
+close:
+	rc = ext4_fclose(&file);
+	if (rc != EOK) {
+		report_error("close legacy limit file", rc);
+		failed = 1;
+	}
+	return failed;
+}
+
 static int check_failed_block_initialization(struct host_image *image)
 {
 	struct ext4_inode inode;
@@ -537,6 +616,7 @@ int main(int argc, char **argv)
 	const char *expected = NULL;
 	bool sparse_mode;
 	bool aligned_hole_mode;
+	bool legacy_limit_mode;
 	bool registered = false;
 	bool mounted = false;
 	int failed = 0;
@@ -545,9 +625,12 @@ int main(int argc, char **argv)
 	sparse_mode = argc == 3 && strcmp(argv[2], "--sparse") == 0;
 	aligned_hole_mode = argc == 3 &&
 		strcmp(argv[2], "--aligned-hole") == 0;
-	if (argc != 4 && !sparse_mode && !aligned_hole_mode) {
+	legacy_limit_mode = argc == 3 &&
+		strcmp(argv[2], "--legacy-limit") == 0;
+	if (argc != 4 && !sparse_mode && !aligned_hole_mode &&
+	    !legacy_limit_mode) {
 		fprintf(stderr,
-			"usage: %s IMAGE PATH EXPECTED | IMAGE --aligned-hole | IMAGE --sparse\n",
+			"usage: %s IMAGE PATH EXPECTED | IMAGE --aligned-hole | IMAGE --sparse | IMAGE --legacy-limit\n",
 			argv[0]);
 		return 2;
 	}
@@ -555,7 +638,9 @@ int main(int argc, char **argv)
 	if (argc == 4)
 		expected = argv[3];
 
-	image.fd = open(argv[1], (sparse_mode ? O_RDWR : O_RDONLY) | O_CLOEXEC);
+	image.fd = open(argv[1],
+			(sparse_mode || legacy_limit_mode ? O_RDWR : O_RDONLY) |
+			O_CLOEXEC);
 	if (image.fd < 0) {
 		failed = report_error("open image", errno);
 		goto cleanup;
@@ -590,7 +675,8 @@ int main(int argc, char **argv)
 	}
 	registered = true;
 
-	rc = ext4_mount(DEVICE_NAME, MOUNT_POINT, !sparse_mode);
+	rc = ext4_mount(DEVICE_NAME, MOUNT_POINT,
+			!sparse_mode && !legacy_limit_mode);
 	if (rc != EOK) {
 		failed = report_error("mount image", rc);
 		goto cleanup;
@@ -599,6 +685,8 @@ int main(int argc, char **argv)
 
 	if (sparse_mode)
 		failed = check_sparse_behavior(&image);
+	else if (legacy_limit_mode)
+		failed = check_legacy_address_limit();
 	else if (aligned_hole_mode)
 		failed = check_aligned_hole();
 	else
