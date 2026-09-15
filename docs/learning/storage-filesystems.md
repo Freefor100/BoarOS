@@ -80,7 +80,7 @@ write-first 且缓存未命中，直接把文件内容读入私有页可避免�
 可以直接丢弃；可写挂载在 write/truncate 后先完成同步介质更新，再精确失效对应 node 的缓存页，
 真实 I/O 错误由 VFS/mount owner 保留。
 
-页缓存失效不等于驻留映射失效：从 cache 哈希/LRU 摘除一页只释放缓存 owner，用户页表仍可通过独立物理页引用命中原 PTE。文件向下截断时，Linux 还必须撤销新 EOF 外的 mmap（包括 private COW 页），让后续访问重新 fault 并按新 size 判定。固定 Linux `references/linux` commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 `mm/truncate.c::truncate_pagecache()` 因此在截断 page cache 前后各调用一次 `unmap_mapping_range(..., even_cows=1)`，具体映射遍历见 `mm/memory.c::unmap_mapping_range()`。BoarOS 当前没有从 VFS node 到所有 MM/VMA/PTE 的反向登记，这个 truncate-to-resident-mapping invalidation 必须在建立清晰 owner、锁序和 TLB 失效协议后另行实现。
+页缓存失效不等于驻留映射失效：从 cache 哈希/LRU 摘除一页只释放缓存 owner，用户页表仍可通过独立物理页引用命中原 PTE。文件向下截断时，Linux 还必须撤销页起点位于新 EOF 之外的已驻留映射（包括该范围内的 private COW 页），让后续访问重新 fault 并按新 size 判定；这不表示包含新 EOF 的 partial page 会被整体撤销。固定 Linux `references/linux` commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 `mm/truncate.c::truncate_pagecache()` 因此以 `round_up(newsize, PAGE_SIZE)` 为 unmap 起点，在截断 page cache 前后各调用一次 `unmap_mapping_range(..., even_cows=1)`，具体映射遍历见 `mm/memory.c::unmap_mapping_range()`。BoarOS 当前没有从 VFS node 到所有 MM/VMA/PTE 的反向登记，这个 truncate-to-resident-mapping invalidation 必须在建立清晰 owner、锁序和 TLB 失效协议后另行实现。
 
 ## 可写文件系统与介质写入演进
 
