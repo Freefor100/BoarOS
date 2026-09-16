@@ -6,14 +6,16 @@ project_root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 kernel=${VFS_TEST_KERNEL_RV:-"$project_root/build/riscv/tests/kernel-vfs-rv"}
 recovery_kernel=${VFS_RECOVERY_TEST_KERNEL_RV:-"$project_root/build/riscv/tests/kernel-vfs-recovery-rv"}
 qemu=${QEMU_RISCV64:-qemu-system-riscv64}
-work_dir=$(mktemp -d)
+mkdir -p "$project_root/build/riscv/artifacts"
+work_dir=$(mktemp -d "$project_root/build/riscv/artifacts/vfs.XXXXXX")
 output="$work_dir/vfs.log"
 disk="$work_dir/root.img"
 dirty_disk="$work_dir/dirty-root.img"
 fixture="$work_dir/init"
 large_fixture="$work_dir/large"
 
-trap 'rm -rf "$work_dir"' EXIT HUP INT TERM
+trap 'result=$?; if [ "$result" -eq 0 ]; then rm -rf "$work_dir"; else echo "test artifacts retained: $work_dir" >&2; fi' EXIT
+trap 'exit 1' HUP INT TERM
 
 show_output()
 {

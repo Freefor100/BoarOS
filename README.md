@@ -39,9 +39,12 @@ make all
 make run-riscv
 make test-riscv
 make test-userland-riscv
+make test-diff-abi-riscv
 make test-lwext4-host
 make test-references
 ```
+
+`make test-diff-abi-riscv` 在固定 RISC-V Linux 与 BoarOS 上运行同一 raw-syscall 文件用例并严格比较，版本、协议、失败产物见[差分模块](docs/modules/differential-abi.md)。
 
 `make test-riscv` 串行运行通用模块、RISC-V 架构边界、故障注入和真实 ext4 根启动回归；各模块的聚焦入口只在对应 `docs/modules/` 说明中维护。`make test-userland-riscv` 共用根盘构造和生产入口验证静态 musl 与动态 pthread 程序，`make test-lwext4-host` 验证宿主侧 lwext4 集成，`make test-references` 核对固定参考资料元数据。`make run-riscv` 不附加根盘，启动成功后持续在 timer-idle 中等待，需要由人退出 QEMU；`make debug-riscv` 使用 `-S -s` 在第一条 guest 指令前暂停并等待 GDB。
 

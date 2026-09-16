@@ -8,7 +8,8 @@ qemu=${QEMU_RISCV64:-qemu-system-riscv64}
 readonly=${FILES_TEST_READONLY:-on}
 success_marker=${FILES_TEST_SUCCESS_MARKER:-BoarOS: process files tests passed}
 console_writes=${FILES_TEST_EXPECT_CONSOLE_WRITES:-2}
-work_dir=$(mktemp -d)
+mkdir -p "$project_root/build/riscv/artifacts"
+work_dir=$(mktemp -d "$project_root/build/riscv/artifacts/files.XXXXXX")
 output="$work_dir/files.log"
 disk="$work_dir/root.img"
 fixture="$work_dir/data"
@@ -16,7 +17,8 @@ small_fixture="$work_dir/allocated"
 debugfs_error="$work_dir/debugfs.err"
 debugfs_filtered_error="$work_dir/debugfs-filtered.err"
 
-trap 'rm -rf "$work_dir"' EXIT HUP INT TERM
+trap 'result=$?; if [ "$result" -eq 0 ]; then rm -rf "$work_dir"; else echo "test artifacts retained: $work_dir" >&2; fi' EXIT
+trap 'exit 1' HUP INT TERM
 
 for tool in truncate mkfs.ext4 debugfs dumpe2fs awk sed; do
     if ! command -v "$tool" >/dev/null 2>&1; then

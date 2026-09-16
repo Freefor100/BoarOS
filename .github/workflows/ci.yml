@@ -77,3 +77,68 @@ jobs:
 
       - name: Run real userland tests
         run: make test-userland-riscv
+
+      - name: Upload RISC-V test logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: riscv-test-logs
+          path: build/riscv/**/*.log
+          if-no-files-found: ignore
+      - name: Upload failed RISC-V filesystem images
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: riscv-failed-images
+          path: build/riscv/**/*.img
+          if-no-files-found: ignore
+          retention-days: 7
+
+  differential-abi:
+    name: Linux / BoarOS differential ABI
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+      - name: Install differential test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential gcc-riscv64-unknown-elf \
+            binutils-riscv64-unknown-elf gcc-riscv64-linux-gnu \
+            binutils-riscv64-linux-gnu qemu-system-misc opensbi e2fsprogs \
+            flex bison bc libssl-dev libelf-dev python3 git
+      - name: Compute exact Linux cache identity
+        id: linux-key
+        run: echo "key=$(python3 tests/diff-abi/harness.py --cache-key)" >> "$GITHUB_OUTPUT"
+      - name: Restore pinned Linux build
+        uses: actions/cache@v5
+        with:
+          path: build/diff-abi/linux
+          key: diff-abi-linux-${{ runner.os }}-${{ steps.linux-key.outputs.key }}
+      - name: Run differential ABI tests
+        run: make test-diff-abi-riscv
+      - name: Upload logs and normalized observations
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: differential-abi-logs
+          path: |
+            build/diff-abi/run/*.log
+            build/diff-abi/run/*.json
+            build/diff-abi/run/*.normalized
+            build/diff-abi/run/*.diff
+            build/diff-abi/linux/**/build.log
+            build/diff-abi/linux/**/configure.log
+            build/diff-abi/linux/**/identity.json
+            build/diff-abi/linux/**/.config
+          include-hidden-files: true
+          if-no-files-found: warn
+      - name: Upload failed filesystem images
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: differential-abi-failed-images
+          path: build/diff-abi/run/*.img
+          if-no-files-found: ignore
+          retention-days: 7

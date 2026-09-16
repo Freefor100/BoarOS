@@ -1057,3 +1057,5 @@ test-allocator-release-host:
 	mkdir -p build/host
 	cc -std=c11 -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=12 -Iinclude tests/host/allocator_release.c kernel/physical_page.c mm/heap.c -o build/host/allocator-release
 	build/host/allocator-release
+
+include tests/diff-abi/Makefile.inc
