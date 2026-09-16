@@ -162,4 +162,6 @@ if grep -qE 'BoarOS: (root boot error|scheduler startup/idle error|fatal trap|SB
     exit 1
 fi
 
+python3 "$project_root/tests/check-stack-report.py" "$static_output" "$pthread_output"
+
 echo "RISC-V static and pthread userland programs ran on the production kernel"

@@ -410,10 +410,13 @@ static enum kernel_scheduler_status finish_clone_failure(
     enum kernel_scheduler_status scheduler_failure)
 {
     int cleanup_failed;
+    enum kernel_scheduler_status stack_status;
 
     /* No failed construction has published a parent completion channel. */
     thread->vfork_parent = 0;
     thread->vfork_child = 0U;
+    stack_status = release_task_stack(thread);
+    if (stack_status != KERNEL_SCHEDULER_STATUS_OK) return stack_status;
     cleanup_failed = release_clone_resources(thread);
 
     if (thread->tid_owned != 0U) {
@@ -450,16 +453,12 @@ enum kernel_scheduler_status riscv_process_clone_current(
 {
     struct kernel_task *parent;
     struct kernel_task *child;
-    uint64_t physical_address;
     uint64_t child_satp;
-    uintptr_t stack_low;
-    void *page;
     kernel_pid_t tid;
     uint32_t vfork = (flags & (LINUX_CLONE_VM | LINUX_CLONE_VFORK)) ==
                      (LINUX_CLONE_VM | LINUX_CLONE_VFORK);
     int thread_clone = (flags & LINUX_CLONE_THREAD) != 0U;
     enum kernel_wait_wake_reason wake_reason = KERNEL_WAIT_WOKEN;
-    enum physical_page_status page_status;
     enum kernel_mm_status mm_status;
     enum kernel_files_status files_status;
     enum kernel_fs_context_status fs_status;
@@ -496,38 +495,17 @@ enum kernel_scheduler_status riscv_process_clone_current(
         return status;
     }
 
-    page_status = physical_page_allocate(scheduler.allocator,
-                                         &physical_address);
-    if (page_status == PHYSICAL_PAGE_STATUS_EMPTY) {
+    status = allocate_task_storage(&child);
+    if (status == KERNEL_SCHEDULER_STATUS_NO_MEMORY) {
         *linux_result = -KERNEL_ENOMEM;
         return KERNEL_SCHEDULER_STATUS_OK;
     }
-    if (page_status != PHYSICAL_PAGE_STATUS_OK ||
-        physical_page_resolve(scheduler.allocator,
-                              physical_address,
-                              &page) != PHYSICAL_PAGE_STATUS_OK) {
-        if (page_status == PHYSICAL_PAGE_STATUS_OK) {
-            (void)release_after_create_failure(
-                physical_address,
-                KERNEL_SCHEDULER_STATUS_PAGE_ACCESS);
-        }
-        return KERNEL_SCHEDULER_STATUS_PAGE_ACCESS;
-    }
-
-    clear_page(page);
-    child = page;
-    child->physical_address = physical_address;
+    if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
     child->magic = KERNEL_THREAD_MAGIC;
     child->arch.user_mode = 1U;
-    child->arch.kernel_sp = (uintptr_t)child + BOAROS_PAGE_SIZE;
-    child->stack_high = (uintptr_t)child + BOAROS_PAGE_SIZE;
-    stack_low = align_up_16((uintptr_t)child + sizeof(*child) +
-                            sizeof(uint64_t));
-    child->stack_low = stack_low;
     child->state = KERNEL_THREAD_STATE_EXITED;
     child->completion.kind = KERNEL_THREAD_KIND_USER;
     child->completion.reason = KERNEL_THREAD_EXIT_USER_FAULT;
-    *(uint64_t *)(stack_low - sizeof(uint64_t)) = KERNEL_STACK_CANARY;
 
     /* vfork shares the parent address space instead of cloning it; the
      * shared record reference keeps the parent's handle valid across the
@@ -715,6 +693,8 @@ static enum kernel_scheduler_status reap_waited_child(
     enum kernel_uaccess_status access_status = KERNEL_UACCESS_STATUS_OK;
 
     if (child->state != KERNEL_THREAD_STATE_ZOMBIE ||
+        child->stack_physical_address != KERNEL_THREAD_NO_PAGE ||
+        child->stack_low != 0U || child->stack_high != 0U ||
         child->parent != parent->group_leader || child->tid_owned != 1U || pid <= 0 ||
         child->mm.state != KERNEL_MM_RELEASED ||
         (child->files.state != KERNEL_FILES_EMPTY &&
@@ -1031,6 +1011,10 @@ enum kernel_scheduler_status kernel_scheduler_reap_one(
         thread->publish_completion > 1U) {
         return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
     }
+    /* Execution is finished and current is idle. Release this owner even
+     * when later VFS cleanup must retain the metadata for an I/O retry. */
+    status = release_task_stack(thread);
+    if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
     result = thread->completion;
     publish = thread->publish_completion;
     if (result.kind == KERNEL_THREAD_KIND_KERNEL) {

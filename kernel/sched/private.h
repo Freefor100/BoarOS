@@ -8,6 +8,7 @@
 #include <kernel/fs_context.h>
 #include <kernel/mm.h>
 #include <kernel/physical_page.h>
+#include <kernel/stack.h>
 #include <kernel/pid.h>
 #include <kernel/scheduler.h>
 #include <kernel/signal.h>
@@ -19,7 +20,7 @@
 #define KERNEL_THREAD_MAGIC UINT64_C(0x424f415254485244)
 #define KERNEL_STACK_CANARY UINT64_C(0x535441434b4f4b21)
 #define KERNEL_THREAD_NO_PAGE UINT64_MAX
-#define KERNEL_THREAD_MINIMUM_STACK 512U
+#define KERNEL_STACK_FILL 0xa5U
 #define KERNEL_PID_LIMIT 32768U
 
 struct kernel_exec_transaction;
@@ -81,6 +82,7 @@ struct kernel_task {
     struct riscv_thread_state arch;
     uint64_t magic;
     uint64_t physical_address;
+    uint64_t stack_physical_address;
     uintptr_t stack_low;
     uintptr_t stack_high;
     struct kernel_task *next;
@@ -165,6 +167,7 @@ struct kernel_scheduler {
     struct kernel_task *init_task;
     enum kernel_scheduler_status fatal_status;
     struct riscv_switch_context discard_context;
+    struct kernel_stack_statistics stack_statistics;
 };
 
 extern struct kernel_scheduler scheduler;
@@ -179,8 +182,11 @@ void process_group_request_exit(struct kernel_task *task,
 enum kernel_scheduler_status process_group_exec_current(void);
 int kernel_signal_has_pending(const struct kernel_task *task);
 
-uintptr_t align_up_16(uintptr_t value);
 void clear_page(void *pointer);
+enum kernel_scheduler_status allocate_task_storage(struct kernel_task **task);
+enum kernel_scheduler_status release_task_stack(struct kernel_task *task);
+enum kernel_scheduler_status release_task_storage(struct kernel_task *task,
+    enum kernel_scheduler_status original_status);
 void ready_append(struct kernel_task *thread);
 struct kernel_task *ready_pop(void);
 void blocked_append(struct kernel_task *thread);

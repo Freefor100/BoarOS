@@ -20,7 +20,7 @@
 
 ## 身份与资源
 
-每个用户执行线程有独立 TID、FP/整数寄存器、signal mask、线程 pending、clear-child-tid、restart 状态和私有任务页。组长承载 TGID、进程组、父子树、组 pending、退出通知及已回卷记账。双向成员环包含组长容器；组长停止执行后仍留在环中，直到组结束或非组长 exec 接管身份。
+每个用户执行线程有独立 TID、FP/整数寄存器、signal mask、线程 pending、clear-child-tid、restart 状态、私有元数据页和独立的物理内核栈页。组长承载 TGID、进程组、父子树、组 pending、退出通知及已回卷记账。双向成员环包含组长容器；组长停止执行后仍留在环中，直到组结束或非组长 exec 接管身份。
 
 普通 fork 从调用线程复制 MM 的 COW 页表/VMA、fd 表、fs context 和 disposition；OFD 仍按现有语义共享。子进程挂在调用线程的组长父子树中，并记录创建者 TID。线程 clone 通过 MM/files/fs/disposition 引用共享已有对象，不复制页表或 fd 槽。首次需要共享 disposition 而父线程尚无表时，会按需分配表页。
 
@@ -44,11 +44,11 @@ WAIT 在关中断内读取用户字、比较 expected、登记并阻塞。futex 
 
 ## 退出与 exec
 
-exit 只退出当前线程，exit_group 和默认致命信号结束全组。退出先执行 clear-child-tid 清零/唤醒，再释放 exec/files/fs/MM 等资源。任务仍在自己的内核栈上时不释放任务页。
+exit 只退出当前线程，exit_group 和默认致命信号结束全组。退出先执行 clear-child-tid 清零/唤醒，再释放 exec/files/fs/MM 等资源。任务仍在自己的内核栈上时不释放栈；切回可信 idle 栈后，先检查 canary、记录高水位并释放栈，再继续处理元数据和其他资源。
 
 组长先退出进入 GROUP_DEAD，保留进程容器；普通成员资源清理成功后从组环移除并回卷时间。最后一个成员结束后，组长才成为唯一进程退出对象，向父进程产生一次 zombie/SIGCHLD。SIGCHLD 显式忽略或 NOCLDWAIT 的自动回收仍遵循信号模块契约。
 
-退出切回保存的 idle/cleanup context，不依赖所有用户任务都阻塞。该 context 排空可完成的清理后主动派发 ready 任务；tick 对待清理标志只做 O(1) 检查并切换，不在中断热路径执行释放。只有真实 VFS/block I/O 清理失败保留原 owner，在后续清理机会重试；合法页/堆释放完成即返回，分配器不变量错误进入 fatal。任务仍在自身内核栈上时，任务页回收可以延后。
+退出切回保存的 idle/cleanup context，不依赖所有用户任务都阻塞。该 context 排空可完成的清理后主动派发 ready 任务；tick 对待清理标志只做 O(1) 检查并切换，不在中断热路径执行释放。只有真实 VFS/block I/O 清理失败保留原 owner，在后续清理机会重试；合法页/堆释放完成即返回，分配器不变量错误进入 fatal。真实 I/O 清理重试、GROUP_DEAD 和 zombie 只保留元数据，均不保留已经停止执行的内核栈；再次进入退出队列的旧组长不会重复释放栈。
 
 exec 完成映像验证后收拢组内其他线程。竞争 exec 或已被组终止的线程清理自己的事务并退出；准备失败仍保留原映像。非组长成功 exec 接管原 TGID、父子树位置、组 pending 和累计记账，旧 TID 被释放，旧组长容器静默回收。新映像最终只有一个执行成员，重置自定义 handler 和寄存器，按 CLOEXEC 关闭描述符。
 
@@ -64,8 +64,10 @@ zombie 先逻辑回收再复制 status/rusage，因此坏输出指针的 EFAULT 
 
 单 hart 的 SIE 临界区串行化组关系、fd/MM 引用和 futex 登记。共享 MM 使用同一页表与本地 SFENCE.VMA；这不是 SMP 协议。多 hart 前仍须补锁、页引用原子操作和远端 TLB shootdown。
 
-每线程任务页仍为 4 KiB，包括控制块、canary、内核栈和 Trap Frame。新增元数据减少栈余量，必须结合静态栈用量与真实 canary 检查审查调用链；单函数栈大小不是完整栈界证明。ASID 0 的切换刷新成本、FIFO/100 Hz tick、线性 wait4 与 deadline 扫描仍存在。
+每线程拥有独立的 4 KiB 元数据页和 4 KiB 物理内核栈；栈底留 16 字节对齐区和 canary，剩余 4080 字节包含 Trap Frame 与 C 调用链。新栈填充固定字节，初始用户 Trap Frame 显式清零。退出后只在其他可信栈扫描未覆盖前缀；累计最小剩余空间和最大已用空间由只读统计接口提供，生产 PID 1 完成时报告。构造回滚同样释放独立栈，不让资源清理失败保留它。
 
-聚焦入口为 `make test-scheduler-cases-riscv`、`make test-scheduler-riscv`、`make test-files-riscv`、`make test-signal-riscv` 和 `make test-root-init-riscv`；组合消费者复用 `make test-userland-riscv`，阶段收口使用 `make test-riscv`。各次实际通过范围以 README 和提交验证说明为准，不把实现路径存在等同于全部线程负载已验证。
+`make test-stack-usage` 强制重建隔离的生产对象，编译器 `-fstack-usage` 产出逐函数记录；host probe 从实际栈配置和 Trap Frame 头计算容量、guard、汇编 Frame 与余量预算，避免测试大栈或旧报告污染门禁。`tests/stack-usage.py` 拒绝超出“栈容量减 16 字节、288 字节汇编 Trap Frame、1024 字节余量”的单帧及无界动态栈；该检查不能证明完整调用链。真实 root-init、静态 musl 与动态 pthread 测试另要求已退出任务的最小实测余量至少 1024 字节，不足时必须扩大栈后重新运行。Canary 用于发现破坏，填充测量用于观察高水位；两者都不等价于未映射 guard page，也不证明未执行分支的栈界。ASID 0 的切换刷新成本、FIFO/100 Hz tick、线性 wait4 与 deadline 扫描仍存在。
+
+聚焦入口为 `make test-stack-usage`、`make test-scheduler-cases-riscv`、`make test-scheduler-riscv`、`make test-files-riscv`、`make test-signal-riscv` 和 `make test-root-init-riscv`；组合消费者复用 `make test-userland-riscv`，阶段收口使用 `make test-riscv`。各次实际通过范围以 README 和提交验证说明为准，不把实现路径存在等同于全部线程负载已验证。
 
 尚无 SMP、MAP_SHARED、PI futex、实时信号队列、sigaltstack、clone3、内核 robust-list 回收或 LoongArch context。固定语义依据见学习总结的 Linux commit 与 musl 归档。

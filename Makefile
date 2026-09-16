@@ -67,7 +67,7 @@ CPPFLAGS := -Iinclude -DBOAROS_PAGE_SHIFT=12 \
 CFLAGS := $(ARCH_FLAGS) -std=gnu11 -O2 -g3 \
 	-ffreestanding -fno-builtin -fno-stack-protector -fno-pic -fno-pie \
 	-ffunction-sections -fdata-sections -Wall -Wextra -Werror
-CFLAGS += $(CFLAGS_EXTRA)
+CFLAGS += -fstack-usage $(CFLAGS_EXTRA)
 ASFLAGS := $(ARCH_FLAGS) -g3
 LDFLAGS := $(ARCH_FLAGS) -nostdlib -nostartfiles -static -no-pie \
 	-T arch/riscv/linker.ld -Wl,--build-id=none -Wl,--gc-sections
@@ -1063,3 +1063,14 @@ test-allocator-release-host:
 	build/host/allocator-release
 
 include tests/diff-abi/Makefile.inc
+
+# Rebuild only production code in isolation: stale .su files and boot-only
+# test fixture frames cannot silently satisfy or distort this gate.
+.PHONY: test-stack-usage
+test-stack-usage:
+	mkdir -p build/stack-usage
+	$(MAKE) -B BUILD_DIR=build/stack-usage KERNEL_RV=build/stack-usage/kernel-rv all >build/stack-usage/build.log 2>&1
+	cc $(CPPFLAGS) -std=c11 -Wall -Wextra -Werror tests/stack-budget.c -o build/stack-usage/stack-budget
+	python3 tests/test-stack-usage.py
+	python3 tests/stack-usage.py build/stack-usage $$(build/stack-usage/stack-budget) >build/stack-usage/report.log
+	cat build/stack-usage/report.log

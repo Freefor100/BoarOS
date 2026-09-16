@@ -52,6 +52,15 @@ struct kernel_thread_completion {
     uint64_t detail;
 };
 
+/* Measurements are accumulated only when a non-running stack is released.
+ * No scan or allocation occurs on the tick/context-switch hot path. */
+struct kernel_stack_statistics {
+    uint64_t stacks_released;
+    uint64_t minimum_free_bytes;
+    uint64_t maximum_used_bytes;
+};
+void kernel_scheduler_stack_statistics(struct kernel_stack_statistics *statistics);
+
 enum kernel_scheduler_status kernel_scheduler_init(
     struct physical_page_allocator *allocator,
     uintptr_t idle_stack_low,

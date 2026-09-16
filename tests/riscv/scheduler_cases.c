@@ -9,6 +9,7 @@
 #include <kernel/pid.h>
 #include <kernel/scheduler.h>
 #include <kernel/task.h>
+#include "../../kernel/sched/private.h"
 
 #include <stdint.h>
 
@@ -16,15 +17,17 @@ extern unsigned char __boot_stack_bottom[];
 extern unsigned char __boot_stack_top[];
 
 #define TEST_PHYSICAL_BASE UINT64_C(0x41000000)
-#define TEST_PAGE_COUNT 2U
+#define TEST_THREAD_COUNT 2U
+#define TEST_PAGE_COUNT (2U * TEST_THREAD_COUNT)
 
 static unsigned char page_pool[BOAROS_PAGE_SIZE * TEST_PAGE_COUNT]
     __attribute__((aligned(BOAROS_PAGE_SIZE)));
 static unsigned long access_calls_before_failure;
 static unsigned long fail_access_count;
-static uintptr_t entry_sp[TEST_PAGE_COUNT];
-static void *entry_tp[TEST_PAGE_COUNT];
-static uintptr_t entry_order[TEST_PAGE_COUNT];
+static uint64_t fail_access_address = UINT64_MAX;
+static uintptr_t entry_sp[TEST_THREAD_COUNT];
+static void *entry_tp[TEST_THREAD_COUNT];
+static uintptr_t entry_order[TEST_THREAD_COUNT];
 static unsigned long entry_count;
 
 _Static_assert(RISCV_THREAD_STATE_KERNEL_SP ==
@@ -45,6 +48,10 @@ _Static_assert(RISCV_THREAD_STATE_SIZE ==
 
 static void *scheduler_page_access(uint64_t physical_address)
 {
+    if (physical_address == fail_access_address) {
+        fail_access_address = UINT64_MAX;
+        return 0;
+    }
     if (fail_access_count != 0U) {
         if (access_calls_before_failure == 0U) {
             fail_access_count--;
@@ -66,7 +73,7 @@ static void thread_entry(void *argument)
     unsigned long index = entry_count;
 
     __asm__ volatile("mv %0, sp" : "=r"(stack_pointer));
-    if (index < TEST_PAGE_COUNT) {
+    if (index < TEST_THREAD_COUNT) {
         entry_sp[index] = stack_pointer;
         entry_tp[index] = riscv_current_thread_get();
         entry_order[index] = (uintptr_t)argument;
@@ -277,6 +284,27 @@ static unsigned long run_create_cases(
         failures++;
     }
 
+    /* A stack page that cannot be mapped must release both allocations. */
+    fail_access_address = TEST_PHYSICAL_BASE + BOAROS_PAGE_SIZE;
+    failures += expect_status(KERNEL_SCHEDULER_STATUS_PAGE_ACCESS,
+                              kernel_thread_create(thread_entry, 0));
+    if (fail_access_address != UINT64_MAX ||
+        physical_page_available(allocator) != initial_available)
+        failures++;
+
+    /* One free page cannot satisfy metadata plus its independent stack.
+     * A failed creation must return that first allocation immediately. */
+    uint64_t held[TEST_PAGE_COUNT - 1U];
+    for (unsigned i = 0U; i < TEST_PAGE_COUNT - 1U; i++) {
+        if (physical_page_allocate(allocator, &held[i]) !=
+            PHYSICAL_PAGE_STATUS_OK) return failures + 1U;
+    }
+    failures += expect_status(KERNEL_SCHEDULER_STATUS_NO_MEMORY,
+                              kernel_thread_create(thread_entry, 0));
+    if (physical_page_available(allocator) != 1U) failures++;
+    for (unsigned i = 0U; i < TEST_PAGE_COUNT - 1U; i++)
+        (void)physical_page_release(allocator, held[i]);
+
     failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
                               kernel_thread_create(thread_entry,
                                                    (void *)(uintptr_t)1U));
@@ -297,10 +325,12 @@ static unsigned long run_create_cases(
     /* Each exit returns to the cleanup context before the next dispatch. */
     failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
                               kernel_scheduler_on_tick(1U));
-    if (entry_count != TEST_PAGE_COUNT ||
+    if (entry_count != TEST_THREAD_COUNT ||
         entry_order[0] != 1U || entry_order[1] != 2U ||
         entry_tp[0] == 0 || entry_tp[1] == 0 ||
         entry_tp[0] == entry_tp[1] ||
+        ((entry_sp[0] - 1U) & ~(uintptr_t)BOAROS_PAGE_MASK) ==
+            ((uintptr_t)entry_tp[0] & ~(uintptr_t)BOAROS_PAGE_MASK) ||
         (entry_sp[0] & ~(uintptr_t)BOAROS_PAGE_MASK) ==
             (entry_sp[1] & ~(uintptr_t)BOAROS_PAGE_MASK)) {
         failures++;
@@ -314,7 +344,7 @@ static unsigned long run_create_cases(
     if (completion.kind != KERNEL_THREAD_KIND_KERNEL ||
         completion.reason != KERNEL_THREAD_EXIT_RETURNED ||
         completion.status != 0U || completion.detail != 0U ||
-        physical_page_available(allocator) != initial_available - 1U) {
+        physical_page_available(allocator) != initial_available - 2U) {
         failures++;
     }
 
@@ -512,7 +542,7 @@ static unsigned long run_wait_cases(
 
     failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
                               kernel_thread_create(blocked_worker, 0));
-    if (physical_page_available(allocator) + 1U != initial_available) {
+    if (physical_page_available(allocator) + 2U != initial_available) {
         failures++;
     }
     failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
@@ -765,6 +795,65 @@ static unsigned long run_fpu_cases(void)
     return failures;
 }
 
+static unsigned long stack_contract_failures;
+
+static void stack_contract_worker(void *argument)
+{
+    struct kernel_task *task = kernel_task_current();
+    uint64_t *canary = (uint64_t *)(task->stack_low - sizeof(uint64_t));
+    uintptr_t old_status = riscv_interrupt_save();
+    uint64_t saved = *canary;
+    (void)argument;
+    *canary ^= 1U;
+    stack_contract_failures += expect_status(
+        KERNEL_SCHEDULER_STATUS_STACK_CORRUPT,
+        kernel_scheduler_yield_current());
+    *canary = saved;
+    riscv_interrupt_restore(old_status);
+}
+
+static unsigned long run_stack_contract_cases(
+    struct physical_page_allocator *allocator)
+{
+    struct kernel_thread_completion completion;
+    struct kernel_stack_statistics before, after;
+    uint64_t available = physical_page_available(allocator);
+    unsigned long failures = 0U;
+    struct kernel_task *retained;
+    failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
+                              allocate_task_storage(&retained));
+    retained->state = KERNEL_THREAD_STATE_EXITED;
+    failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
+                              release_task_stack(retained));
+    if (physical_page_available(allocator) != available - 1U ||
+        retained->stack_physical_address != KERNEL_THREAD_NO_PAGE ||
+        retained->context.sp != 0U || retained->arch.kernel_sp != 0U)
+        failures++;
+    /* A retained zombie/group leader can re-enter cleanup; only metadata
+     * remains owned and a repeated visit must never free another stack. */
+    failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
+                              release_task_stack(retained));
+    if (physical_page_available(allocator) != available - 1U) failures++;
+    failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
+        release_task_storage(retained, KERNEL_SCHEDULER_STATUS_OK));
+    kernel_scheduler_stack_statistics(&before);
+    failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
+                              kernel_thread_create(stack_contract_worker, 0));
+    failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
+                              kernel_scheduler_on_tick(1U));
+    failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
+                              kernel_scheduler_reap_one(&completion));
+    kernel_scheduler_stack_statistics(&after);
+    if (after.stacks_released != before.stacks_released + 1U ||
+        after.maximum_used_bytes == 0U ||
+        after.minimum_free_bytes < KERNEL_STACK_MINIMUM_RESERVE ||
+        after.minimum_free_bytes + after.maximum_used_bytes !=
+            KERNEL_STACK_BYTES - KERNEL_STACK_GUARD_BYTES ||
+        physical_page_available(allocator) != available)
+        failures++;
+    return failures + stack_contract_failures;
+}
+
 void kernel_main(unsigned long hart_id, const void *dtb)
 {
     struct boot_memory_layout layout;
@@ -794,6 +883,7 @@ void kernel_main(unsigned long hart_id, const void *dtb)
     failures += run_wait_cases(&allocator);
     failures += run_accounting_cases(&allocator);
     failures += run_fpu_cases();
+    failures += run_stack_contract_cases(&allocator);
 
     virt_uart_puts("BoarOS: scheduler cases failures=");
     virt_uart_put_hex(failures);

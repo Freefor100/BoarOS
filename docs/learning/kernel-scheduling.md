@@ -16,7 +16,7 @@ Switch context 面向 `riscv_context_switch(previous, next)` 这一普通函数�
 
 RISC-V psABI 把 `tp` 作为固定用途寄存器，普通函数不能把它当临时寄存器。内核可以约定它始终指向当前可调度任务，从而无需全局查找或用 `sp & page_mask` 推导对象。
 
-`sp` 掩码方案把线程对象布局、栈大小和对齐永久耦合起来；一旦改成多页栈、guard page 或独立控制块，所有调用点都要变化。`tp=current` 让单页布局保持 scheduler 私有。代价是内核不能同时把 `tp` 用作 C TLS 基址。用户态可以拥有自己的 `tp`；trap 入口通过 `sscratch <-> tp` 暂存它并恢复内核 current，返回用户态时再反向交换。
+`sp` 掩码方案把线程对象布局、栈大小和对齐永久耦合起来；一旦改成多页栈、guard page 或独立控制块，所有调用点都要变化。`tp=current` 让元数据与执行栈的布局保持 scheduler 私有。代价是内核不能同时把 `tp` 用作 C TLS 基址。用户态可以拥有自己的 `tp`；trap 入口通过 `sscratch <-> tp` 暂存它并恢复内核 current，返回用户态时再反向交换。
 
 ## 从 Timer Trap 到抢占再返回
 
@@ -53,14 +53,14 @@ BoarOS 的 timer backend 保留 deadline 相位，并可能一次报告多个迟
 当前任务生命周期为：
 
 ```text
-allocated page -> READY -> RUNNING -> READY
+metadata + stack -> READY -> RUNNING -> READY
                                   |
                                   +-> BLOCKED --event/deadline/signal--> READY
                                   |
-                                  +-> EXITED -> idle releases page
+                                  +-> EXITED -> idle releases stack; retains metadata if needed
 ```
 
-队列操作不只是移动指针，还转移“谁拥有这张页、谁可能仍在使用这张栈”的事实。创建只有在页访问、元数据、canary 和初始 context 全部成功后才能提交 READY；此前失败必须回滚页。RUNNING 线程返回时，当前 SP 仍在自己的页中，因此不能边退出边释放。它先进入 EXITED 并永不恢复，等 idle 已运行在静态 boot stack 上再释放。
+队列操作不只是移动指针，还转移“谁拥有元数据与栈、谁可能仍在使用这张栈”的事实。创建只有在页访问、元数据、canary 和初始 context 全部成功后才能提交 READY；此前失败必须回滚页。RUNNING 线程返回时，当前 SP 仍在自己的页中，因此不能边退出边释放。它先进入 EXITED 并永不恢复，等 idle 已运行在静态 boot stack 上再释放执行栈。元数据页可以作为真实 I/O 清理 owner、GROUP_DEAD 或 zombie 继续存在，两种生命周期不再绑定。
 
 用户任务持有 MM 句柄，而不是直接拥有页表树。首次创建采用移动所有权：入口、用户栈权限、初始 Frame 和 TID 建立成功后，MM 才从调用者转交任务；失败时调用者仍拥有它。普通 clone 通过 `kernel_mm_fork()` 建立独立逻辑地址空间，父子物理页先以 COW 共享；`acquire` 则表达多个 owner 共享同一 MM，未来 `CLONE_VM` 可以复用这个引用边界而不伪造页表所有权。调度切换在修改队列/current 前使用任务创建时缓存的 `satp`，不会在 tick 热路径解析 MM；ASID 0 的根切换仍会全局刷新 TLB。父子/zombie/wait 的生命周期知识见[进程生命周期学习总结](process-lifecycle.md)。
 
@@ -74,13 +74,27 @@ BoarOS 用不透明 `kernel_task` 保存调度状态、TID、组首关系和 MM 
 
 有界 ID 可用位图管理：一位表示一个数值是否占用，分配搜索和释放不会额外分配内存，32768 个 ID 只需 4 KiB。线性扫描最坏为 O(limit)，但循环游标使连续创建通常很快；只有进程创建/退出触碰它，不进入 timer/context switch。未来若真实并发创建使扫描或全局锁成为瓶颈，可换成分层位图或 per-CPU 缓存，而不改变 TID/TGID ABI。
 
-回收顺序必须与可观察生命周期一致：先释放 task 的 MM 引用，再归还 TID，最后释放仍承载内核栈和元数据的任务页。真实 VFS/block I/O 清理失败才保留 exited 节点并从准确阶段重试；合法页/堆释放完成即返回，分配器不变量错误进入 fatal。只有全部完成后才发布 completion。以后实现 `wait` 时，退出后的 zombie 元数据和父进程观察点会延长“退出”和“最终释放 PID”之间的生命周期，不能直接沿用当前立即完成记录作为完整 Linux wait 语义。
+回收顺序必须与可观察生命周期一致：先释放 task 的 MM 引用，再归还 TID，最后释放元数据页；执行栈在可信 idle 上先行归还，不等父进程 wait。真实 VFS/block I/O 清理失败才保留 exited 节点并从准确阶段重试；合法页/堆释放完成即返回，分配器不变量错误进入 fatal。只有全部完成后才发布 completion。以后实现 `wait` 时，退出后的 zombie 元数据和父进程观察点会延长“退出”和“最终释放 PID”之间的生命周期，不能直接沿用当前立即完成记录作为完整 Linux wait 语义。
 
 ## 内核栈大小、对齐和保护
 
 RISC-V psABI 要求函数入口栈保持 16 字节对齐。线程初始栈顶必须满足这一点，context switch 也必须恢复原 ABI 对齐。中断会在当前栈额外压入 BoarOS 的 288 字节 Trap Frame，再调用 C dispatcher 和 scheduler，因此评估栈大小不能只看线程入口的局部变量。
 
-当前普通线程把私有元数据、128 字节 switch context、canary 和向下增长的栈放在同一个 4 KiB 页。实际 timer-only 测试让 worker 带着保存区经历多次 Trap Frame 和调度调用链，证明当前最小路径有可用余量。Canary 只能发现越过栈底后的部分破坏，不能像未映射 guard page 那样在第一次越界访问时立即 fault；它也不是任意内存破坏的恢复机制。
+原先控制块与栈共享 4 KiB 页，控制块增至 1552 字节时，按 16 字节对齐后只剩 2528 字节，压入 288 字节用户 Trap Frame 后只剩 2240 字节。当前将元数据与物理栈分别分配，4 KiB 栈除去底部 16 字节后有 4080 字节，元数据增长不再侵占它。
+
+栈先填充 `0xa5`，canary 单独放在底部。由于填充不再为零，首次用户入口必须显式清零完整 Trap Frame，避免把填充值作为用户整数寄存器。clone 复制父 Frame，exec 清零 Frame，两条路径保留既有语义。退出切换后从栈底扫描连续填充值，累计最小未触及空间；扫描只在非运行栈回收时进行，不增加 tick 热路径工作。
+
+`-fstack-usage` 记录单帧与动态分配类别；汇编额外占用的 288 字节必须显式预算。单帧通过不能排除深调用链、间接调用和递归，因此还要求 root-init、静态 musl、动态 pthread 真实组合负载的最小实测余量至少 1 KiB。如果不足，按倍数扩大栈并重跑；测量只说明已执行路径。2026-09-16 的同一生产构建实测如下，因此保留 4 KiB 物理栈：
+
+| 真实负载 | 已释放栈数 | 最小未触及空间 | 峰值使用 |
+|---|---:|---:|---:|
+| root-init / exec 链 | 10 | 2112 B | 1968 B |
+| 静态 musl | 40 | 1824 B | 2256 B |
+| 动态 pthread | 34 | 2096 B | 1984 B |
+
+这些数值来自 `make test-root-init-riscv test-userland-riscv` 的退出报告。`make test-stack-usage` 强制重建的生产报告覆盖 796 个函数，最大单帧为 boot/idle 上的 `kernel_main` 1920 字节，没有无界动态栈。该门禁使用实际头文件导出的 288 字节汇编 Frame 与 1024 字节余量预算；共享映射、更多驱动或更深调用链接入后应重新测量。
+
+Canary 只能发现越过栈底后的部分破坏，不能像未映射 guard page 那样在第一次越界访问时立即 fault；它也不是任意内存破坏的恢复机制。
 
 未来是否扩大栈或增加 guard page，应结合真实调用深度和高水位。把页布局留在 scheduler 内部、通过 `tp` 获取 current，正是为了让这种变化不扩散成公共 ABI。
 
@@ -95,8 +109,8 @@ ready/exited 队列会同时被普通线程创建路径、timer handler 和 idle
 - RISC-V 异步现场继续使用完整 Trap Frame，普通调度使用独立的 psABI switch context。
 - 内核 `tp` 固定为 current；用户 `tp` 独立保存，`sscratch` 只在 U-mode 保存 current，内核态保持为零。
 - 单 hart FIFO round-robin，一个 tick 时间片，一次 trap 最多切换一次。
-- 普通内核/用户任务使用私有 4 KiB 单页内核栈布局；用户任务持有可共享 MM 引用和独立 TID/线程组身份；boot context 成为永久 idle，继续使用静态 boot stack。
-- 内核线程入口返回即退出；用户任务通过 syscall 或同步故障退出。idle 在另一张栈上依次释放 MM 引用、TID 和任务页。
+- 普通内核/用户任务分别拥有私有 4 KiB 元数据页与 4 KiB 物理内核栈；用户任务持有可共享 MM 引用和独立 TID/线程组身份；boot context 成为永久 idle，继续使用静态 boot stack。
+- 内核线程入口返回即退出；用户任务通过 syscall 或同步故障退出。idle 在可信栈上先释放已停止执行的任务栈，继续完成 MM/文件等清理；TID 与元数据按组关系和 wait 生命周期释放。
 - 队列临界区保存并关闭 SIE；interruptible wait 使用同一 blocked 链并由未阻塞 pending signal 返回 `SIGNALLED`，vfork 等资源生命周期等待保持不可中断。F/D 状态由 scheduler switch 的 FS Dirty 检查按需保存/恢复；不为尚未实现的 SMP、优先级或 V 状态建立占位层，MM/身份/信号字段则是 `clone/fork/exec/wait` 已确定路径的必要永久机制。
 
 这些选择形成完整、可测的内核线程闭环，同时把以后可能变化的策略、栈布局和 per-hart 组织留在模块内部。RISC-V context 机制可在 QEMU `virt` 与 VisionFive 2 复用；平台 timebase 仍由 DTB 决定。LoongArch 需要自己的 switch context、CSR/中断和 16 KiB 栈页实现，不能复用 RISC-V 汇编。

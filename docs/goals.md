@@ -40,7 +40,7 @@ Linux ABI 兼容是最终功能方向，不是对当前完成度的声明；READ
 - ext4 timestamp mutation 仍是独立目标，需要定义 create/read/write/truncate/unlink 的 atime/mtime/ctime 更新。sparse ftruncate 与越过 EOF 写入已经用 inode-size/hole 能力替换逐段写零增长，并由真实 `st_blocks`、aligned/unaligned zero read 和卸载后 `e2fsck` 验证。
 - truncate-to-resident-mapping invalidation 已用稳定 node–MM 登记和驻留页来源记录闭环：涵盖 private COW、PROT_NONE、非当前 MM、尾页、fork、关闭 fd/unlink、O_TRUNC 和重新增长；真实 RISC-V Linux 差分与分配失败回滚回归共同验收。仍不包含 MAP_SHARED 或 SMP 同步。
 - 真实 userspace 按 musl libc-test failure inventory、BusyBox、pthread stress、SQLite、Git 推进。每轮按 failure cluster、最小复现、Linux differential、kernel primitive regression、重跑 workload 闭环；SQLite 的验收包含事务、journal、并发 reader/writer、重开和 integrity_check。
-- task metadata 与 kernel stack 分离为 SMP 前置目标，迁移现有 canary 并增加 high-water 和 frame/stack usage 检查，栈大小依据测量决定。SMP 只在 differential ABI、真实 userspace、task/stack 分离及同步协议准备完成后开始；multi-hart boot 只是第一个检查点。
+- task metadata 与 kernel stack 已分离：独立 4 KiB 栈保留 canary、高水位，CI 运行隔离重建的 compiler stack usage 检查；真实 root-init、musl、pthread 栈余量均超过 1 KiB。扩大调用链后继续测量，不能把单帧检查当成整体界证明。SMP 仍需真实 userspace 与同步协议准备完成后开始；multi-hart boot 只是第一个检查点。
 
 ## 规划假设与边界
 

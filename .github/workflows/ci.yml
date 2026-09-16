@@ -78,6 +78,19 @@ jobs:
       - name: Run real userland tests
         run: make test-userland-riscv
 
+      - name: Check production compiler stack bounds
+        run: make test-stack-usage
+
+      - name: Upload compiler stack reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: riscv-stack-reports
+          path: |
+            build/stack-usage/**/*.su
+            build/stack-usage/*.log
+          if-no-files-found: ignore
+
       - name: Upload RISC-V test logs
         if: always()
         uses: actions/upload-artifact@v7

@@ -833,6 +833,15 @@ void kernel_main(unsigned long hart_id, const void *dtb)
             if (root_status != RISCV_ROOT_BOOT_STATUS_OK) {
                 shutdown_for_root_boot_error(root_status);
             }
+            struct kernel_stack_statistics stack_statistics;
+            kernel_scheduler_stack_statistics(&stack_statistics);
+            virt_uart_puts("BoarOS: task stacks released=");
+            virt_uart_put_hex((unsigned long)stack_statistics.stacks_released);
+            virt_uart_puts(" min-free=");
+            virt_uart_put_hex((unsigned long)stack_statistics.minimum_free_bytes);
+            virt_uart_puts(" max-used=");
+            virt_uart_put_hex((unsigned long)stack_statistics.maximum_used_bytes);
+            virt_uart_putc('\n');
             virt_uart_puts("BoarOS: PID 1 exited status=");
             virt_uart_put_hex((unsigned long)completion.status);
             virt_uart_puts(" pages=");

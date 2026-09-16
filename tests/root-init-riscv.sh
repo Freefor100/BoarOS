@@ -132,4 +132,6 @@ if grep -qE 'BoarOS: (root boot error|scheduler startup/idle error|fatal trap|SB
     exit 1
 fi
 
+python3 "$project_root/tests/check-stack-report.py" "$output"
+
 echo "RISC-V production kernel loaded /init from read-only ext4"
