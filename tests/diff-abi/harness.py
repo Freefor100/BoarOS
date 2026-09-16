@@ -213,14 +213,16 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--cache-key', action='store_true')
     parser.add_argument('--build-linux', action='store_true')
+    parser.add_argument('--linux-config', type=Path,
+                        help='Linux configuration for cache-key/build-linux')
     parser.add_argument('--kernel', type=Path, default=ROOT / 'kernel-rv')
     parser.add_argument('--program', type=Path, default=BUILD / 'cases-rv')
     parser.add_argument('--timeout', type=float, default=60)
     args = parser.parse_args()
     if args.cache_key:
-        print(identity()[0])
+        print(identity(args.linux_config)[0])
     elif args.build_linux:
-        print(linux_build()[0])
+        print(linux_build(args.linux_config)[0])
     else:
         run(args)
 

@@ -88,8 +88,8 @@ write 自身成为 pending cancellation 的取消点，原错误输出因而消�
 `ni_array\0.data.r` 与 ELF 文件同偏移的非装载尾部字节一致，正常 BSS 应为零。
 这证明程序已进入 main，不能归因于缺 loader 或把所有动态程序称为不支持。
 源码 `kernel/elf64_source.c` 的 run 分界没有将包含文件末尾的局部页从此前完整文件页分开，
-是待聚焦回归验证的原因线索。调试命令、寄存器、哈希及串口证据保存在
-`build/program-dynamic-probe/`；该缺陷尚未修复。
+已被双侧真实回归证实并修复。调试命令、寄存器、哈希及串口证据保存在
+`build/program-dynamic-probe/`；修复前的原始证据继续保留。
 
 ## 2026-09-16 补齐环境后的完整运行
 
@@ -115,3 +115,15 @@ free、hwclock、后台 sleep/kill、touch、od、mv、rmdir、find；脚本依�
 ELF、配置及 UAPI 树哈希。BusyBox ELF SHA-256 为
 `f2cda5fcdff6d41c8a553ac658e8aa55b6a48aa40898cb123a19f7865f3773ac`。
 对同一结果使用 `--require-pass` 已确认返回 1，不会将“清单完成”误报为“全部通过”。
+
+## ELF 文件尾页修复后的动态直接用例
+
+`tests/riscv/elf_tail_main.c` 的真实静态 ELF 使用页对齐的可写装载段、三个完整文件页、
+非对齐文件尾和多页 BSS。旧内核在相同 Linux/BoarOS 双侧执行中分别输出
+`ELF BSS PASS` 与 `ELF BSS FAIL`；run 边界修复后两侧均输出 PASS。
+`make test-elf-tail-riscv` 将该双侧回归接入 CI，保留 QEMU 串口、独立镜像与结果。
+
+同一份固定 libc-test 动态 entry 的 `argv` 修复后双侧退出 0；全部 110 个动态直接
+用例在 `build/elf-stage-dynamic/` 重跑，Linux 110/110 满足契约，BoarOS 99/110
+双侧一致，余下 11 项与静态失败集合相同。此结果只针对动态直接用例；完整
+226 项清单须在 readv 阶段后再次运行，旧完整运行的 104/226 不应当作当前内核状态。

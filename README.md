@@ -40,6 +40,7 @@ make run-riscv
 make test-riscv
 make test-userland-riscv
 make test-diff-abi-riscv
+make test-elf-tail-riscv
 make test-stack-usage
 make inventory-userland-riscv
 make test-lwext4-host

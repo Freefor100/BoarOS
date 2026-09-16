@@ -271,10 +271,10 @@ static int validate_program_headers(
         low = header->virtual_address < low ? header->virtual_address : low;
         high = page_end > high ? page_end : high;
         load_count++;
-        if (capacity > UINT32_MAX - 4U) {
+        if (capacity > UINT32_MAX - 6U) {
             return 0;
         }
-        capacity += 4U;
+        capacity += 6U;
     }
     if (load_count == 0U || low == UINT64_MAX || high <= low ||
         interpreter_count > 1U) {
@@ -380,7 +380,9 @@ static enum kernel_elf64_source_status build_runs(
             &source->program_headers[index];
         uint64_t end;
         uint64_t start_page;
+        uint64_t first_full_page;
         uint64_t end_page;
+        uint64_t last_full_file_page;
         uint64_t file_end_page;
 
         if (header->type != KERNEL_ELF64_PROGRAM_LOAD ||
@@ -389,7 +391,12 @@ static enum kernel_elf64_source_status build_runs(
         }
         end = header->virtual_address + header->memory_size;
         start_page = align_down(header->virtual_address, source->page_size);
-        if (!align_up(end, source->page_size, &end_page) ||
+        last_full_file_page = align_down(header->virtual_address +
+                                         header->file_size,
+                                         source->page_size);
+        if (!align_up(header->virtual_address, source->page_size,
+                      &first_full_page) ||
+            !align_up(end, source->page_size, &end_page) ||
             !align_up(header->virtual_address + header->file_size,
                       source->page_size,
                       &file_end_page) ||
@@ -397,6 +404,14 @@ static enum kernel_elf64_source_status build_runs(
                              &boundary_count,
                              boundary_capacity,
                              start_page) ||
+            !insert_boundary(source->boundaries,
+                             &boundary_count,
+                             boundary_capacity,
+                             first_full_page) ||
+            !insert_boundary(source->boundaries,
+                             &boundary_count,
+                             boundary_capacity,
+                             last_full_file_page) ||
             !insert_boundary(source->boundaries,
                              &boundary_count,
                              boundary_capacity,
@@ -468,7 +483,7 @@ static enum kernel_elf64_source_status build_runs(
         } else if (contributors == 1U && file_contributors == 1U &&
                    page >= source->program_headers[file_index].virtual_address &&
                    page <= UINT64_MAX - source->page_size &&
-                   page + source->page_size <=
+                   next <=
                        source->program_headers[file_index].virtual_address +
                        source->program_headers[file_index].file_size &&
                    source->program_headers[file_index].offset <=

@@ -120,7 +120,14 @@ jobs:
           sudo apt-get install -y build-essential gcc-riscv64-unknown-elf \
             binutils-riscv64-unknown-elf gcc-riscv64-linux-gnu \
             binutils-riscv64-linux-gnu qemu-system-misc opensbi e2fsprogs \
-            flex bison bc libssl-dev libelf-dev python3 git
+            flex bison bc libssl-dev libelf-dev python3 git curl
+      - name: Fetch pinned musl source for ELF regression
+        run: |
+          mkdir -p references/musl
+          curl --fail --location https://musl.libc.org/releases/musl-1.2.5.tar.gz \
+            -o references/musl/musl-1.2.5.tar.gz
+          echo "a9a118bbe84d8764da0ea0d28b3ab3fae8477fc7e4085d90102b8596fc7c75e4  references/musl/musl-1.2.5.tar.gz" \
+            | sha256sum -c -
       - name: Compute exact Linux cache identity
         id: linux-key
         run: echo "key=$(python3 tests/diff-abi/harness.py --cache-key)" >> "$GITHUB_OUTPUT"
@@ -129,8 +136,18 @@ jobs:
         with:
           path: build/diff-abi/linux
           key: diff-abi-linux-${{ runner.os }}-${{ steps.linux-key.outputs.key }}
+      - name: Compute ELF regression Linux cache identity
+        id: elf-linux-key
+        run: echo "key=$(python3 tests/diff-abi/harness.py --cache-key --linux-config tests/program-inventory/linux.config)" >> "$GITHUB_OUTPUT"
+      - name: Restore ELF regression Linux build
+        uses: actions/cache@v5
+        with:
+          path: build/diff-abi/linux/${{ steps.elf-linux-key.outputs.key }}
+          key: elf-tail-linux-${{ runner.os }}-${{ steps.elf-linux-key.outputs.key }}
       - name: Run differential ABI tests
         run: make test-diff-abi-riscv
+      - name: Check ELF file tail and BSS on both kernels
+        run: make test-elf-tail-riscv
       - name: Upload logs and normalized observations
         if: always()
         uses: actions/upload-artifact@v7
@@ -145,6 +162,9 @@ jobs:
             build/diff-abi/linux/**/configure.log
             build/diff-abi/linux/**/identity.json
             build/diff-abi/linux/**/.config
+            build/elf-tail-riscv/**/suite.json
+            build/elf-tail-riscv/**/result.json
+            build/elf-tail-riscv/**/*.log
           include-hidden-files: true
           if-no-files-found: warn
       - name: Upload failed filesystem images
@@ -152,6 +172,8 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: differential-abi-failed-images
-          path: build/diff-abi/run/*.img
+          path: |
+            build/diff-abi/run/*.img
+            build/elf-tail-riscv/**/*.img
           if-no-files-found: ignore
           retention-days: 7

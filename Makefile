@@ -1085,3 +1085,7 @@ inventory-userland-riscv: $(KERNEL_RV) $(MUSL_STAMP) test-program-inventory-host
 	python3 tests/program-inventory/run.py
 
 include tests/program-inventory/Makefile.inc
+
+.PHONY: test-elf-tail-riscv
+test-elf-tail-riscv: $(KERNEL_RV) $(MUSL_STAMP)
+	python3 tests/elf-tail-riscv.py

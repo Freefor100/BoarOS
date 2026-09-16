@@ -38,6 +38,8 @@ enum kernel_elf64_status kernel_elf64_open_cached(
 - 文件/BSS 边界页或页内多段贡献分配私有页，先清零，再精确读取文件字节；
 - 纯 BSS 页按需分配并保持全零。
 
+run 边界同时包含每个装载段的首个完整页、最后一个完整文件页和文件尾所在页；FILE 判定覆盖整个 run。这样多页 FILE 区间不会把最后一个不完整文件页一起映射为缓存页。该页由 COMPOSITE 私有物化，只读入 `p_filesz` 内的字节，并把其余 BSS 清零。
+
 物理页分配后若解析或读取失败，source 先释放临时页再返回原始错误；合法释放不会产生重试状态。缺页 I/O 在 MM 层转为用户 `SIGBUS`，物理耗尽转为用户资源失败；source/OFD 的真实 VFS/I/O 清理错误不覆盖原始格式或 I/O 结果。
 
 ## RISC-V 映像与 ELF 形态
@@ -68,6 +70,7 @@ source、临时映像和 MM 的所有权按 exec 事务分层：事务持有创�
 
 ```sh
 make test-elf64-riscv
+make test-elf-tail-riscv
 make test-demand-page-riscv
 make test-exec-riscv
 make test-root-init-riscv
