@@ -139,6 +139,35 @@ static void partial_cases(void)
     }
     abi_require(SC2(215, map, 8192) == 0);
 }
+static int root_identity(void)
+{
+    return SC0(174) == 0 && SC0(175) == 0 &&
+           SC0(176) == 0 && SC0(177) == 0;
+}
+
+static void identity_cases(void)
+{
+    static const char *names[] = {
+        "identity.uid", "identity.euid", "identity.gid", "identity.egid"
+    };
+    for (long i = 0; i < 4; ++i) {
+        long ret = CALL(174 + i, -1, -1, -1, -1, -1, -1);
+        abi_record(names[i], ret, -1, -1, 0, 0, 0);
+    }
+    long child = CALL(220, 17, 0, 0, 0, 0, 0);
+    abi_require(child >= 0);
+    if (child == 0) {
+        if (!root_identity()) abi_exit(90);
+        const char *argv[] = {"/init", "identity-exec-probe", 0};
+        const char *envp[] = {0};
+        SC3(221, argv[0], argv, envp);
+        abi_exit(91);
+    }
+    int status = 0;
+    abi_require(SC4(260, child, &status, 0, 0) == child);
+    abi_record("identity.fork-exec", 0, -1, -1, status, 0, 0);
+}
+
 void abi_main(const unsigned long *initial_stack)
 {
     if (initial_stack[0] >= 2) {
@@ -147,6 +176,12 @@ void abi_main(const unsigned long *initial_stack)
         usize index = 0;
         while (marker[index] && argument[index] == marker[index]) ++index;
         if (!marker[index] && !argument[index]) abi_limit_exec_probe();
+        static const char identity_marker[] = "identity-exec-probe";
+        index = 0;
+        while (identity_marker[index] &&
+               argument[index] == identity_marker[index]) ++index;
+        if (!identity_marker[index] && !argument[index])
+            abi_exit(root_identity() ? 0 : 92);
     }
     text("ABI BEGIN 1"); flush();
     mode_cases(); sparse_cases(); partial_cases(); abi_truncate_cases();
@@ -154,6 +189,7 @@ void abi_main(const unsigned long *initial_stack)
     abi_link_cases();
     abi_signal_wait_cases();
     abi_limit_cases();
+    identity_cases();
     text("ABI END "); number(records); flush();
     SC0(81); /* Linux sync; unsupported on BoarOS, outside observed cases. */
     CALL(142, 0xfee1dead, 672274793, 0x4321fedc, 0, 0, 0);

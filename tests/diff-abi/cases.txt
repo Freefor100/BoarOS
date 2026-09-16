@@ -183,3 +183,8 @@ limit.stack-set
 limit.stack-overflow
 limit.exec-inherit-grow
 limit.stack-restored
+identity.uid
+identity.euid
+identity.gid
+identity.egid
+identity.fork-exec

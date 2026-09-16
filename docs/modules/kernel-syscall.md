@@ -50,6 +50,7 @@ enum kernel_syscall_status kernel_syscall_dispatch(
 - `uname` 编号为 160，把六个 65 字节字段组成的 Linux `new_utsname` 写到参数 0 指向的用户缓冲区；成功返回 0，用户范围、映射或写权限错误返回 `-EFAULT`（-14）。当前固定报告 `Linux/boaros/0.1.0-boaros-dev/#1 BoarOS/riscv64/(none)`，其中 release 是 BoarOS 自身开发版本而非 Linux 能力等级，机器名由架构构建配置提供。
 - `getpid` 编号为 172，返回调用任务所属线程组的 TGID。
 - `getppid` 编号为 173，返回当前父任务的 TGID；PID 1 或 parentless 进程返回 0，reparent 后观察到 PID 1。
+- `getuid/geteuid/getgid/getegid` 编号 174/175/176/177，返回当前不可变 root 身份的 0；调用无参数，忽略残留寄存器。fork/线程 clone/exec 不改变该身份。凭据变更、补充组与完整权限检查尚未实现，不能把此结果扩展成多用户支持；引入可变凭据时须统一替换查询和现有 root 权限假设。
 - `gettid` 编号为 178，返回调用任务自己的 TID。
 - `brk` 编号为 214，通过调用任务的 mutable MM borrow 调整精确 program break。raw syscall 成功返回请求值；参数 0 查询当前值；越过 ELF heap 起点/栈 guard、VMA 冲突或 metadata OOM 时返回原 break，不使用负 errno。跨页增长登记 demand-zero heap，缩小撤销越界页；libc 把 raw 返回再包装成自己的 0/-1 接口，不属于内核 ABI。
 - `munmap` 编号为 215，要求页对齐起点和非零长度，长度向上按 4 KiB 对齐；范围包含未映射洞仍成功。越界或未对齐返回 `-EINVAL`。
@@ -70,3 +71,10 @@ enum kernel_syscall_status kernel_syscall_dispatch(
 生产用户任务拥有文件表、fs context 和 MM。底层 U-mode 调度探针可以有 MM 而故意没有进程文件资源，此时 `openat` 返回 `-ENODEV`，`read/close` 返回 `-EBADF`，用于明确区分探针配置与内核对象损坏；这不是生产进程模型。普通 clone 已覆盖独立父子进程，线程 clone 子集共享 MM、files、fs context 和信号 disposition；完整线程组与共享资源矩阵仍有限。接口语义和内部字段已经分离，内核任务与 idle 没有 Linux 身份，Trap 层只会从用户任务进入该接口。
 
 `make test-syscall-riscv` 验证空指针失败原子性、`exit(93)`、`exit_group(94)`、`set_tid_address(96)`、raw `brk`、匿名/文件 mmap 参数、不可读文件映射的 `EACCES`、fd pin/失败释放、errno、munmap/mprotect 转发、内部 MM 状态升级、clone 参数分类和未知编号。`make test-signal-riscv` 验证信号 syscall、handler frame/sigreturn、默认动作和 syscall restart；`make test-uaccess-riscv` 与 `make test-files-riscv` 验证用户复制、页缓存、pipe 和映射所需的文件生命周期。`make test-mmap-riscv` 让真实 ext4 `/init` ELF 从 U-mode 完成 demand-zero、file-private COW、EOF/SIGBUS、PROT_NONE、fixed replace/noreplace、打洞/重填和释放；`make test-userland-riscv` 继续覆盖真实 musl 的 heap/fork/exec、文件访问模式、signal 和 pipe 生命周期。
+
+身份查询依据本地 `references/linux/kernel/sys.c` 的四个 `SYSCALL_DEFINE0` 和
+`references/linux/include/uapi/asm-generic/unistd.h`，commit
+`f4cdf7ca9a1fdcca413157df19753f388a5a224e`。BoarOS 已有 root 假设见
+`kernel/syscall/process.c:syscall_handle_prlimit64`；查询没有新增对象或引用 owner，
+也没有改变凭据。`test-syscall-riscv` 保护四项返回与忽略参数，
+`test-diff-abi-riscv` 保护真实 U-mode 查询及 fork/exec 继承。

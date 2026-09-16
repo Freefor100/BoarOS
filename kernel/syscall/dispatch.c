@@ -38,6 +38,10 @@
 #define LINUX_SYSCALL_UNAME 160U
 #define LINUX_SYSCALL_GETPID 172U
 #define LINUX_SYSCALL_GETPPID 173U
+#define LINUX_SYSCALL_GETUID 174U
+#define LINUX_SYSCALL_GETEUID 175U
+#define LINUX_SYSCALL_GETGID 176U
+#define LINUX_SYSCALL_GETEGID 177U
 #define LINUX_SYSCALL_GETTID 178U
 #define LINUX_SYSCALL_BRK 214U
 #define LINUX_SYSCALL_SCHED_YIELD 124U
@@ -369,6 +373,15 @@ enum kernel_syscall_status kernel_syscall_dispatch(
         }
         decoded.action = KERNEL_SYSCALL_ACTION_RETURN;
         decoded.value = id;
+    } else if (request->number == LINUX_SYSCALL_GETUID ||
+               request->number == LINUX_SYSCALL_GETEUID ||
+               request->number == LINUX_SYSCALL_GETGID ||
+               request->number == LINUX_SYSCALL_GETEGID) {
+        /* Every task currently runs as immutable root, including after
+         * fork/clone and exec. Credential-changing calls remain unsupported;
+         * introducing mutable credentials must replace these queries too. */
+        decoded.action = KERNEL_SYSCALL_ACTION_RETURN;
+        decoded.value = 0;
     } else if (request->number == LINUX_SYSCALL_GETTID) {
         task_status = kernel_task_tid(caller, &id);
         if (task_status != KERNEL_TASK_STATUS_OK) {

@@ -20,6 +20,7 @@ Linux 原有源码许可证见 `references/linux/COPYING`，构建产物位于�
 - `timestamps.c`：22 条 create/read/write/truncate/unlink 与父目录时间观测。Linux 根挂载沿固定源码 `fs/namespace.c` 的默认 `MNT_RELATIME`，BoarOS 使用同一策略。
 - `readv.c`：覆盖向量导入顺序、零项及零长度、1024/1025 项、`MAX_RW_COUNT`、普通文件跨页/共享 OFD/EOF、0/1/32/63/64/65 字节可写前缀，以及 pipe 的未完成片段保留、写入故障、尾片段合并、环回、非阻塞/EOF 和可写 poll 边界。与上述测试合计 126 条记录；不以手工 Linux 输出替代双侧执行。
 - `links.c`、`signals.c`、`limits.c`：覆盖符号链接解析和元数据、同步信号等待、NOFILE 对 open/dup/pipe/fcntl 的实际约束、降低限制后保留旧 fd、跨 PID 访问、fork/exec 继承、STACK fault，以及 `prlimit64` 参数错误和设置后旧值输出故障。exec 子进程仍执行同一 `/init` ELF，由启动栈中的专用参数进入查询分支，不另造参考程序。
+- `cases.c` 另覆盖 root UID/GID 四项无参数查询（寄存器留有无效地址仍须忽略）及 fork/exec 后身份；与固定 Linux PID 1 root 环境比较。
 - `harness.py`：构建 Linux、制作镜像、运行两个系统、校验完整协议并做严格 diff。
 - `linux.config`：以 `allnoconfig` 为基础，启用 virt、MMU、ELF、串口、VirtIO
   MMIO/block、ext4 和关机所需能力；Linux 自己解析依赖。

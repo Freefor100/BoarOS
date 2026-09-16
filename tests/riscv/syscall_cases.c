@@ -529,7 +529,7 @@ static unsigned long run_exit_cases(void)
 
 static unsigned long run_unknown_cases(void)
 {
-    static const uint64_t numbers[] = {0U, 95U, 174U, UINT64_MAX};
+    static const uint64_t numbers[] = {0U, 95U, 146U, UINT64_MAX};
     struct kernel_syscall_request request = {0};
     struct kernel_syscall_result result;
     unsigned long failures = 0U;
@@ -547,6 +547,32 @@ static unsigned long run_unknown_cases(void)
         }
     }
 
+    return failures;
+}
+
+static unsigned long run_identity_cases(void)
+{
+    struct kernel_task *caller = (struct kernel_task *)(uintptr_t)1U;
+    struct kernel_syscall_request request = {
+        .arguments = {UINT64_MAX, UINT64_MAX, UINT64_MAX,
+                      UINT64_MAX, UINT64_MAX, UINT64_MAX},
+    };
+    unsigned long failures = 0U;
+
+    /* All tasks currently have immutable root identity. These queries
+     * take no arguments, including no user pointers to validate. */
+    for (uint64_t number = 174U; number <= 177U; number++) {
+        struct kernel_syscall_result result = {
+            .action = KERNEL_SYSCALL_ACTION_EXIT,
+            .value = -1,
+        };
+        request.number = number;
+        if (kernel_syscall_dispatch(caller, &request, &result) !=
+                KERNEL_SYSCALL_STATUS_OK ||
+            result_changed(&result, KERNEL_SYSCALL_ACTION_RETURN, 0)) {
+            failures++;
+        }
+    }
     return failures;
 }
 
@@ -1235,6 +1261,7 @@ unsigned long run_syscall_cases(void)
 
     failures += run_exit_cases();
     failures += run_unknown_cases();
+    failures += run_identity_cases();
     failures += run_process_decode_cases();
     failures += run_write_cases();
     failures += run_seek_stat_decode_cases();
