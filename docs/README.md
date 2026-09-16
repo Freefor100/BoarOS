@@ -41,6 +41,7 @@
 | [Linux epoll 事件通知子系统学习总结](learning/epoll-subsystem.md) | 推模型就绪队列、等待节点回调、LT/ET/ONESHOT 触发与 OFD 双向解链 |
 | [RISC-V Linux ABI 差分](modules/differential-abi.md) | 固定双侧运行、严格观测、CI 缓存与失败产物 |
 | [文件时间戳](learning/file-timestamps.md) | live inode、relatime、纳秒编码与错误传播 |
+| [用户程序环境](modules/program-environment.md) | 完整 BusyBox、固定 libc-test、目标 UAPI 与构建身份 |
 | [真实程序失败清单](learning/user-program-inventory.md) | 固定 BusyBox/libc-test 输入、构建阻塞与双侧观测 |
 | [第三方代码](third-party.md) | 实际引入的外部源码、版本与许可 |
 

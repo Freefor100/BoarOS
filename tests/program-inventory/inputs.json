@@ -1,0 +1,24 @@
+{
+  "repository": "https://github.com/oscomp/testsuits-for-oskernel.git",
+  "object_store": "references/oscomp-testsuits",
+  "busybox": {
+    "revision": "b5ec6ef8497e1818cbdec3b54bb722f036e57972",
+    "config": "config/busybox-config-riscv64"
+  },
+  "preliminary_suite": {
+    "branch_at_selection": "pre-2025",
+    "revision": "8b58dd16d26d30f7c74d48d5832d870d3051b703",
+    "paths": [
+      "libc-test",
+      "scripts/libctest",
+      "scripts/busybox"
+    ]
+  },
+  "busybox_uapi": {
+    "tag": "v6.6",
+    "revision": "ffc253263a1375a65fa6c9f62a893e9767fbebfa",
+    "tag_source": "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git",
+    "accessed": "2026-09-16",
+    "archive_reference": "linux-uapi/linux-6.6.tar.xz"
+  }
+}

@@ -1,77 +1,117 @@
 # 固定真实程序的失败清单
 
-本入口用于收集外部真实程序的构建、启动和语义阻塞，不是比赛成绩，也不代表完整 BusyBox/libc-test 已通过。执行器只保存观察结果，不修改内核或外部源码来绕过失败。
+入口收集外部程序的构建、运行与语义失败。清单生成成功不等于程序通过，也不是比赛成绩。
+环境缺失必须先修复；不能把未构建、未运行的程序作为 BoarOS 不兼容的证据。
 
-## 输入与许可证
+## 输入与构建
 
-输入固定到 `references/sources.tsv` 中的 `references/oscomp-testsuits/` commit
-`b5ec6ef8497e1818cbdec3b54bb722f036e57972`。该 commit 的 `README.md` 是决赛
-CAgent/BuildStorm 说明；`Makefile.sub` 的 BusyBox 配方使用
-`config/busybox-config-riscv64` 和静态编译器。
+`references/oscomp-testsuits` 是完整 Git 对象库。默认固定的决赛 commit
+`b5ec6ef8497e1818cbdec3b54bb722f036e57972` 不含 libc-test，仅能说明这个 commit 的目录内容。
+它不能证明上游没有可用 libc-test。程序配置现在额外固定 `pre-2025` 分支选定时的 commit
+`8b58dd16d26d30f7c74d48d5832d870d3051b703`，通过 `git archive` 提取 libc-test 与原始脚本，
+不切换参考工作树 HEAD，也不追踪浮动分支。
 
-此 commit 根目录没有 `libc-test`：`git ls-tree --name-only <commit>` 的原始输出保存在
-`source-tree.log`。因此 libc-test 标为 `build-blocked`，原因是固定输入缺失；不切换到另一分支，
-也不把 BoarOS 自有 libc 测试当成上游 libc-test。
+`tests/program-inventory/inputs.json` 明确区分 BusyBox 源码、比赛配置、初赛脚本和 libc-test
+来源。BusyBox 仍用决赛 commit 的原 `config/busybox-config-riscv64`，398 个 applet 全部保留。
+旧版本的 `tc` 依赖已被当前 Linux UAPI 移除的 CBQ 定义，因此使用完整、校验过的 Linux v6.6
+UAPI 编译。运行内核仍是 `references/linux` 的固定 commit
+`f4cdf7ca9a1fdcca413157df19753f388a5a224e`。缺 `linux/kd.h` 是原工具链环境没有导出 Linux
+UAPI，补齐正确的目标头即可解决；不是 BoarOS 的能力结论。详细来源、工具身份与缓存约束见
+[用户程序环境模块](../modules/program-environment.md)。不再提供裁剪配置的 smoke 回退。
 
-BusyBox 的 `busybox/README`、`busybox/INSTALL` 和 `busybox/LICENSE` 是使用与构建入口。
-该版本采用 GPL-2.0-only，许可证原文和源码留在固定外部资料中；本仓库仅维护驱动和配置，
-构建得到的二进制不入库。后续若分发该二进制，应一并履行该许可证的源码提供要求。
+libc-test 使用已有 musl 1.2.5，运行原始 `make disk` 配方；只在命令行指定交叉编译器、
+工具链兼容选项和客体解释器路径 `/lib/ld-musl-riscv64.so.1`，不修改上游 C 源码。
+构建原始静态/动态 entry、runtest 和 DSO，并将 musl loader、libc.so 和依赖 DSO 放入镜像。
+静态表有 107 项、动态表有 110 项，每项用上游生成的 dispatch 名称直接执行。
+另外执行两份原始 libc shell 包装脚本，独立暴露 runtest 自身的系统调用依赖。
 
-## 复现
+BusyBox 采用 GPL-2.0-only，libc-test 的许可见固定输入 `libc-test/COPYRIGHT`。
+源码、配置、许可证和构建产物保存在忽略的 `build/` 中，不纳入本仓库。
 
-先准备本仓库现有 RISC-V musl 工具链、生产 `kernel-rv` 与差分 Linux 基线，然后运行：
+## 复现与判定
 
 ```sh
 make inventory-userland-riscv
-make test-program-inventory-host
+make test-program-inventory-host test-diff-abi-host
+# 明确复用已校验的构建产物，所有程序失败也要求非零退出：
+python3 tests/program-inventory/run.py --reuse-builds --require-pass --output build/program-check
 ```
 
-依赖与差分入口相同，包含宿主 `bc`；本地临时解包的工具可通过 PATH 提供，不属于仓库依赖安装方式。
+默认输出 `build/program-inventory-full/`。首次构建准备完整 UAPI 与程序，不要求人工复制头文件。
+`--case` 可选择单例，`--suite` 可选 busybox/libc/all。输入未变时可恢复未完成运行；身份变化必须用
+新输出目录，保留之前证据。`--build-only` 只构建，不能当成运行证据。
 
-默认结果在忽略目录 `build/program-inventory/`；`--output` 可保留不同实验目录，
-`--timeout` 设置每个内核的启动/运行超时。重新运行会覆盖同一输出目录中的生成源码与日志；
-需保留旧结果时指定新目录。脚本不下载外部依赖，不修改 `references/oscomp-testsuits/`。
-BusyBox 源码与原配置经 `git archive` 从固定 commit 复制到构建目录。
+每个用例分别启动固定 RISC-V Linux 和生产 BoarOS：QEMU system 模式、单 hart、512 MiB、
+独立的同源 ext4 镜像副本、同一测试 ELF。用例之间也不共享改动后的磁盘。Linux 使用独立的
+`tests/program-inventory/linux.config`，启用真实程序所需的设备、网络、IPC 等能力；不会改变
+文件 ABI 差分的最小配置。驱动准备 proc/sysfs、共享内存和消息队列挂载及 loopback；Linux
+环境初始化失败单独记录，不得成为有效差分参考。
 
-先真实尝试原比赛配置；若构建失败，保留 `busybox-competition` 的 `build-blocked` 记录，
-再用仓库中的 `busybox-smoke.config` 构建有限 applet 子集。最小配置只改变构建选项，
-不修改 BusyBox 源码；它的结果单独记为 `busybox-smoke`，不能代替比赛配置结果。
-静态 musl 编译沿用本仓库工具链；若编译器支持，使用与现有用户态构建一致的
-`-fno-link-libatomic`，避免工具链自动请求不存在的 `libatomic_asneeded`。
+fixture 包含账号文件、设备节点、临时目录、所有 applet 链接和动态库。BoarOS 不支持挂载、
+网络、symlink 或某设备的错误保留在日志中，不以成功存根替代。程序分别记录 stdout、stderr、
+wait status、signal、exec/setup errno、超时和客体退出状态；任意输出按十六进制编码传输。
+原始日志、独立 stdout/stderr、镜像、构建配置、命令及产物 SHA-256 均保留。
 
-Linux 使用 `tests/diff-abi/harness.py` 的固定源码/配置/工具身份缓存；fixture 与 QEMU
-启动形态沿用同一入口：512 MiB、单 hart、VirtIO MMIO ext4 根盘。两个内核各取得相同初始
-磁盘副本。驱动对同一 BusyBox ELF 执行 `true`、`false`、`echo`、`cat`、`ls` 与一条
-调用外部 `cat` 的 shell 命令，收集完整 stdout/stderr 字节及真实 `waitpid` 状态。
-`false` 的退出码 1 是该命令的正确行为，不作为执行失败。
+原 BusyBox 脚本执行 55 条命令；检查组边界和完整、有序的每条 success/fail 记录，不能只看 shell
+退出码。原 libc runtest 即使打印 `Pass!` 也固定返回 1，故包装脚本预期退出 1，但必须同时具有
+每个案例的 START/Pass!/END，不能出现 FAIL、缺项或重复。直接 entry 则预期退出 0。
 
-## 记录和判定
+`runs/suite.json` 和每例 `result.json` 区分 `pass`、`nonzero-exit`、`signal`、`timeout`、
+`exec-error`、`setup-error`、`upstream-failure`、`output-mismatch`、客体/协议失败与
+`reference-not-pass`。后者表示 Linux 自己未满足契约，必须调查参考环境、测试及 libc，不能
+直接归因于 BoarOS。保留双侧状态，单侧错误不隐藏另一侧结果。输出未做宽泛归一化：时间、设备号
+等不同可能产生 output-mismatch，需要阅读原始记录区分环境值和语义差异。
 
-`inventory.json` 保存固定 revision、源码归档和许可证 SHA-256、原始及解析后配置 SHA-256、
-编译器/binutils/make/QEMU/mkfs 身份、musl archive/specs 身份、完整执行命令、构建和串口日志路径、
-Linux 构建身份、BusyBox/驱动/BoarOS ELF 和 fixture 校验值。`linux.log`、`boaros.log` 保留完整
-原始输出；测试输出另以十六进制编码，防止程序文本被误认为结构化结果。
+默认命令成功表示清单完整生成，程序失败仍列在清单中；构建/执行器异常非零。
+`--require-pass` 在任意失败或未完成时也返回非零。没有手工 Linux 参考答案或隐式跳过。
 
-- `build-blocked`：固定源码或工具缺失、配置或编译失败；明确保留原因和日志。
-- `missing-capability`：已有直接证据，例如驱动记录 `execve errno=38`（ENOSYS）；不凭非零退出猜测缺失 syscall。
-- `semantic-mismatch`：Linux 基线本身未按命令契约退出，或 BoarOS 的 wait status/输出与有效 Linux 观察不一致。
-- `crash`：子程序被信号终止，或 QEMU 已退出但没有完整程序记录。
-- `timeout`：QEMU 到期且对应程序没有完整记录；之前已完成的程序保留独立结果。
-- `protocol-error`：运行记录缺失、重复、乱序或格式不合法；不能当作完整执行。
-- `pass`：Linux 命令退出符合契约，BoarOS 与该有效基线的退出状态和原始输出均相同。
+## 证据边界与后续定位
 
-`guest_runs` 单独记录 QEMU 退出、严格 BEGIN/有序结果/END 协议及 BoarOS 最终回收状态；`runtime_status` 只有双侧完整退出且语义一致时才是 `passed`。超时前已经完成的用例可保留独立结果，但不能把不完整运行标为整体通过。
+最初六例只测 true、false、echo、cat、ls 和 shell 调用外部 cat，且使用裁剪 BusyBox；其通过
+只保护这几个命令的输出与退出状态，不能代表完整 BusyBox，更不能代替 libc-test。现在保留这六个
+基础命令，但使用完整比赛配置二进制，并增加原脚本及全部 libc entry。完整运行共 226 个顶层案例；
+其中 BusyBox 的一个脚本案例内部有 55 条命令，libc 两个脚本案例重复覆盖原 entry 表并增加包装器契约。
+不能把 226 当作互不重复的上游测例数。
 
-这些状态是清单，不是自动放宽的回归预期。清单生成成功时脚本退出 0，即使其中有构建阻塞或
-程序失败；执行器自身异常退出非零。审查时必须读取每项状态和原始日志，不能把脚本退出码当成
-所有程序已通过。
+运行结果和依赖清单见 `docs/goals.md`。对非零退出只记录观测，不凭退出数字推断 syscall 根因；
+需要由原始错误输出或最小复现确认。修复顺序按能力依赖和失败簇确定，不按固定测例名称写特判。
 
-## 2026-09-16 的首轮事实
+环境排查不能只检查磁盘内容：固定 Linux 的 `init/do_mounts.c` 在启动 `/init` 前自动挂载
+devtmpfs，镜像原有 `/dev/shm` 会被遮住。首轮 `pthread_cancel_points` 没有打印 shm_open
+错误，却在线程 join 后报告错误取消；原因是 shm_open 失败后的测试诊断通过 write 输出，
+write 自身成为 pending cancellation 的取消点，原错误输出因而消失。重建可见目录并挂载 tmpfs
+后，同一 Linux/ELF 用例通过。类似地，socket 用例访问 127.0.0.1 前必须启用 loopback。
+这些都是参考环境准备责任，不能列为内核语义差异。
 
-按上述固定输入真实执行后，原比赛配置构建在 `console-tools/kbd_mode.c` 包含
-`linux/kd.h` 时失败：当前 musl 工具链安装树没有该 Linux UAPI 头。
-日志为 `build/program-inventory/busybox-build.log`；这属于构建环境阻塞，不能归因于 BoarOS syscall。
-最小配置完整构建成功，六个 applet 用例在固定 Linux 和 BoarOS 上的输出、wait status 全部一致，
-包括 `false` 的退出码 1 以及 shell 通过 `/busybox cat` 执行外部程序。
-BoarOS 最终记录 PID 1 状态 `0x2a`、`heap-live=0x0`。
-该轮未覆盖网络、procfs、复杂 shell/job control 或完整比赛脚本。
+动态 `argv` 的进一步定位没有修改内核或被测 ELF：GDB 在 `argv_main` 返回点读到
+`t_status`（映像偏移 `0x4ddd8`）为 `0x615f696e`，实际退出低八位为 110；该地址起的
+`ni_array\0.data.r` 与 ELF 文件同偏移的非装载尾部字节一致，正常 BSS 应为零。
+这证明程序已进入 main，不能归因于缺 loader 或把所有动态程序称为不支持。
+源码 `kernel/elf64_source.c` 的 run 分界没有将包含文件末尾的局部页从此前完整文件页分开，
+是待聚焦回归验证的原因线索。调试命令、寄存器、哈希及串口证据保存在
+`build/program-dynamic-probe/`；该缺陷尚未修复。
+
+## 2026-09-16 补齐环境后的完整运行
+
+执行命令为 `python3 tests/program-inventory/run.py --reuse-builds --suite all --output build/program-inventory-final`。
+所有 226 项均完成，Linux 全部满足各自退出与脚本断言契约；BoarOS 双侧一致 104 项、
+退出状态不符 119 项、上游脚本断言失败 3 项，无参考环境失败或隐式跳过。
+
+| 集合 | Linux | BoarOS |
+|---|---:|---:|
+| 完整 BusyBox 二进制的六个基础命令 | 6/6 | 6/6 双侧一致 |
+| BusyBox 原脚本内命令 | 55/55 success | 42 success、13 fail |
+| libc 静态 entry | 107/107 | 96 双侧一致、11 退出不符 |
+| libc 动态 entry | 110/110 | 2 双侧一致、108 退出不符 |
+| libc 原静态/动态包装脚本 | 两份所有断言通过 | 两份断言失败 |
+
+包装脚本在 BoarOS 上明确报告 `sigtimedwait: Function not implemented`；不能将其包装器
+失败等同于所有直接 entry 都失败。BusyBox 的 13 条失败命令为 df、dmesg、du、which ls、pwd、
+free、hwclock、后台 sleep/kill、touch、od、mv、rmdir、find；脚本依赖前序状态，不能把它们
+计为 13 个独立内核缺陷。逐项原因仍以 stderr 和聚焦复现为准。
+
+证据目录 `build/program-inventory-final/` 包含 manifest、inventory、运行身份、每例原始日志与
+磁盘；`build/program-environment/reproducibility.json` 记录两次独立完整 BusyBox 构建得到相同
+ELF、配置及 UAPI 树哈希。BusyBox ELF SHA-256 为
+`f2cda5fcdff6d41c8a553ac658e8aa55b6a48aa40898cb123a19f7865f3773ac`。
+对同一结果使用 `--require-pass` 已确认返回 1，不会将“清单完成”误报为“全部通过”。

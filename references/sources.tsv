@@ -19,3 +19,4 @@ file	loongarch/loongson-embedded-system-architecture-v1.1.pdf	https://raw.github
 file	loongarch/nebula-board-README.md	https://gitee.com/loongarch_community/2k1000la-doc/raw/5f4921e408e5f935d0c047816f3050111856dcbc/README.md	-	5b9bf159aea98e2655cb21f7a31744ba691c310d46b0f535ceeeeb0674e5077f
 file	loongarch/nebula-board-README.en.md	https://gitee.com/loongarch_community/2k1000la-doc/raw/5f4921e408e5f935d0c047816f3050111856dcbc/README.en.md	-	509fd32f4ee9cd92157ec481b3aa2dbaa06d49de2c74c32cb5c49ed6a7543ee6
 file	musl/musl-1.2.5.tar.gz	https://musl.libc.org/releases/musl-1.2.5.tar.gz	-	a9a118bbe84d8764da0ea0d28b3ab3fae8477fc7e4085d90102b8596fc7c75e4
+file	linux-uapi/linux-6.6.tar.xz	https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.6.tar.xz	-	d926a06c63dd8ac7df3f86ee1ffc2ce2a3b81a2d168484e76b5b389aba8e56d0

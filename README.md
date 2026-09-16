@@ -52,7 +52,7 @@ make test-references
 
 ## 近期方向
 
-静态 musl 和动态 PIE/解释器/DSO/TLS 已通过生产入口。当前线程组共享 MM/files/fs/disposition，支持 musl pthread create/join、竞争同步、取消、运行中 dlopen TLS，以及组长先退、非组长 exec 和 exit_group。可写 ext4 文件系统与 `mkdirat/unlinkat/ftruncate` 已完成闭环，文件部分写、跨 MM 截断驻留页和 relatime 时间更新已接入固定 RISC-V Linux 差分。固定输入中的 libc-test 缺失，完整 BusyBox 配置受工具链 UAPI 头阻塞；最小 BusyBox 配置的六个用例已有双侧运行证据。阶段仍以完整回归与生命周期审查收口为准，syscall 数量不是完成度。后续按内核能力依赖推进共享映射与同步扩展、设备抽象、devtmpfs、软硬链接以及 mount/procfs；不按测例选择路线。RISC-V64 + OpenSBI 主路径稳定后，实现 LoongArch64 16 KiB/三级页表和对应 context/trap；开发板到手后验证固件交接、DTB、设备、熵源与真实 TLB/中断性能。
+静态 musl 和动态 PIE/解释器/DSO/TLS 已通过生产入口。当前线程组共享 MM/files/fs/disposition，支持 musl pthread create/join、竞争同步、取消、运行中 dlopen TLS，以及组长先退、非组长 exec 和 exit_group。可写 ext4 文件系统与 `mkdirat/unlinkat/ftruncate` 已完成闭环，文件部分写、跨 MM 截断驻留页和 relatime 时间更新已接入固定 RISC-V Linux 差分。真实程序环境已补齐：完整 398 applet BusyBox 与固定 `pre-2025` libc-test 均可构建，逐例双侧运行及原始脚本生成明确的失败清单；不能把有限基础命令的通过当作完整程序兼容。阶段仍以完整回归与生命周期审查收口为准，syscall 数量不是完成度。后续按内核能力依赖推进共享映射与同步扩展、设备抽象、devtmpfs、软硬链接以及 mount/procfs；不按测例选择路线。RISC-V64 + OpenSBI 主路径稳定后，实现 LoongArch64 16 KiB/三级页表和对应 context/trap；开发板到手后验证固件交接、DTB、设备、熵源与真实 TLB/中断性能。
 
 ## 文档
 

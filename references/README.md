@@ -63,6 +63,31 @@ tar -xOf references/musl/musl-1.2.5.tar.gz musl-1.2.5/src/dirent/seekdir.c
 但切离清单 commit 或产生本地修改后不会通过下一次恢复校验。分析结束后
 切回 `sources.tsv` 记录的 commit 即可重新验证。
 
+`tests/program-inventory/inputs.json` 是执行 profile：BusyBox 源码和配置取自
+清单的 `b5ec6ef8497e1818cbdec3b54bb722f036e57972`，libc-test 和比赛脚本取自
+同一个完整 object store 的附加 commit
+`8b58dd16d26d30f7c74d48d5832d870d3051b703`（选择时分支名为 `pre-2025`）。
+profile 使用明确 commit 做 `git archive`，不切换 `references/oscomp-testsuits`
+的 HEAD，也不把易变分支名当作运行输入。它固定测试树选择，仓库 URL 与默认
+HEAD 仍只由 `sources.tsv` 管理。
+
+## 用户程序 UAPI 构建输入
+
+`linux-uapi/linux-6.6.tar.xz` 是官方 Linux v6.6 源码 archive，下载 URL 与
+SHA-256 唯一记录在 `sources.tsv`，由 `fetch.sh` 验证；环境脚本通过
+`inputs.json` 中的 `archive_reference` 引用该项，不维护第二份 URL/校验值。
+官方 tag v6.6 的 peeled commit 为
+`ffc253263a1375a65fa6c9f62a893e9767fbebfa`，2026-09-16 从
+[Linux 官方 Git](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git)
+核对，并与 kernel.org 发布的 `sha256sums.asc` 核对 archive 哈希。
+
+固定 `references/linux/Makefile` 的版本为 **7.2**；commit 标题提到的
+子系统 tag 并不是 Linux 版本。它仍用于运行内核和默认 UAPI。
+完整 BusyBox 1.33.1 的 `tc` 引用较新 Linux 已移除的 CBQ 定义，因此其
+构建单独使用从官方 v6.6 archive 执行 `ARCH=riscv headers_install` 导出的
+完整 UAPI。该选择不修改 BusyBox 源码、不裁剪 applet、不改变运行内核。
+解包树及两套 UAPI 产物均在忽略的 `build/` 中；不混入宿主 glibc 头。
+
 ## 架构、模拟器与固件
 
 | 本地路径 | 上游/版本 | 用途 |

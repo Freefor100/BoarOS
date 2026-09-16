@@ -70,7 +70,8 @@ def source_info():
     return rows[0][2], rows[0][4]
 
 
-def identity():
+def identity(config=None):
+    config = Path(config) if config is not None else HERE / 'linux.config'
     compiler = os.environ.get('LINUX_CC', 'riscv64-linux-gnu-gcc')
     prefix = compiler.removesuffix('gcc')
     identities = {}
@@ -79,14 +80,15 @@ def identity():
         if not path:
             raise RuntimeError(f'missing build tool: {tool}')
         identities[tool] = {'version': output([tool, '--version']), 'sha256': digest(path)}
-    data = {'source': list(source_info()), 'config': digest(HERE / 'linux.config'),
+    data = {'source': list(source_info()), 'config': digest(config),
             'builder': digest(__file__), 'tools': identities}
     key = hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
     return key, data, prefix
 
 
-def linux_build():
-    key, data, prefix = identity()
+def linux_build(config=None):
+    config = Path(config).resolve() if config is not None else HERE / 'linux.config'
+    key, data, prefix = identity(config)
     destination = BUILD / 'linux' / key
     image = destination / 'arch/riscv/boot/Image'
     metadata = destination / 'identity.json'
@@ -113,7 +115,7 @@ def linux_build():
                'CROSS_COMPILE=' + prefix, 'HOSTCC=gcc', 'KBUILD_BUILD_USER=boaros',
                'KBUILD_BUILD_HOST=diff-abi', 'KBUILD_BUILD_TIMESTAMP=2026-01-01 00:00:00 UTC']
     env = os.environ.copy()
-    env['KCONFIG_ALLCONFIG'] = str(HERE / 'linux.config')
+    env['KCONFIG_ALLCONFIG'] = str(config)
     with (destination / 'configure.log').open('w') as stream:
         subprocess.run(command + ['allnoconfig'], env=env, stdout=stream, stderr=subprocess.STDOUT, check=True)
     run_logged(command + ['-j' + os.environ.get('DIFF_JOBS', str(min(os.cpu_count() or 2, 8))), 'Image'], destination / 'build.log')

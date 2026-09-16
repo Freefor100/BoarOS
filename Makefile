@@ -1077,9 +1077,11 @@ test-stack-usage:
 
 .PHONY: inventory-userland-riscv test-program-inventory-host
 test-program-inventory-host:
-	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests/program-inventory -p test_inventory.py
+	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests/program-inventory -p 'test_*.py'
 
-# An inventory records unsupported inputs as blocked; it is not an assertion
-# that the complete upstream suite passes.
+# Program incompatibilities remain inventory records unless --require-pass
+# is requested; build and runner errors always fail.
 inventory-userland-riscv: $(KERNEL_RV) $(MUSL_STAMP) test-program-inventory-host
 	python3 tests/program-inventory/run.py
+
+include tests/program-inventory/Makefile.inc
