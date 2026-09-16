@@ -2772,7 +2772,10 @@ int main(int argc, char **argv)
     }
     if (stopped_child == 0) {
         raise(SIGSTOP);
-        _exit(94);
+        /* Keep the resumed child alive until the parent observes WCONTINUED.
+         * Otherwise a tick can run it through exit before the wait, turning
+         * this into a scheduler race instead of a continuation assertion. */
+        for (;;) sched_yield();
     }
     int stopped_status = 0;
     if (waitpid(stopped_child, &stopped_status, WUNTRACED) !=
