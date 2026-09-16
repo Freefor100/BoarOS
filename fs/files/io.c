@@ -98,6 +98,9 @@ static enum kernel_files_status read_pinned(
         *linux_result = 0;
         return KERNEL_FILES_STATUS_OK;
     }
+    if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_REGULAR) {
+        kernel_vfs_file_accessed(&description->file);
+    }
     request = count > KERNEL_FILES_MAX_RW_COUNT
                   ? KERNEL_FILES_MAX_RW_COUNT
                   : count;
@@ -262,9 +265,24 @@ enum kernel_files_status kernel_files_pread(
         *linux_result = -KERNEL_ESPIPE;
         return KERNEL_FILES_STATUS_OK;
     }
+    /* Linux vfs_read checks the caller's original range before MAX_RW_COUNT
+     * clipping and before EOF. Its empty range permits the user limit itself
+     * but rejects higher addresses; generic uaccess deliberately skips zeros. */
+    if (kernel_user_range_check(user_buffer, (size_t)count) !=
+            KERNEL_UACCESS_STATUS_OK ||
+        (count == 0U && user_buffer != 0U &&
+         kernel_user_range_check(user_buffer - 1U, 1U) !=
+             KERNEL_UACCESS_STATUS_OK)) {
+        files->record->statistics.read_failures++;
+        *linux_result = -KERNEL_EFAULT;
+        return KERNEL_FILES_STATUS_OK;
+    }
     if (count == 0U) {
         *linux_result = 0;
         return KERNEL_FILES_STATUS_OK;
+    }
+    if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_REGULAR) {
+        kernel_vfs_file_accessed(&description->file);
     }
     request = count > KERNEL_FILES_MAX_RW_COUNT
                   ? KERNEL_FILES_MAX_RW_COUNT
@@ -390,6 +408,16 @@ static enum kernel_files_status write_request(
         int is_append = (description->open_flags & KERNEL_FILES_O_APPEND) != 0U;
         uint64_t file_offset = kernel_open_file_offset(description);
 
+        /* ext4 modifies mtime/ctime before usercopy, including a first-byte
+         * fault. Zero-length requests and earlier validation failures skip it. */
+        if (count != 0U) {
+            int result = kernel_vfs_file_modified(&description->file,
+                                                   file_offset, is_append);
+            if (result != 0) {
+                *linux_result = result;
+                return KERNEL_FILES_STATUS_OK;
+            }
+        }
         for (size_t index = 0U; index < iov_count && total < count; index++) {
             uint64_t offset = 0U;
 

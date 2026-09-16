@@ -1,5 +1,5 @@
 DIFF_ABI_RV := build/diff-abi/cases-rv
-DIFF_ABI_SOURCES := tests/diff-abi/cases.c tests/diff-abi/start.S tests/diff-abi/truncate.c
+DIFF_ABI_SOURCES := tests/diff-abi/cases.c tests/diff-abi/start.S tests/diff-abi/truncate.c tests/diff-abi/timestamps.c
 
 $(DIFF_ABI_RV): $(DIFF_ABI_SOURCES) tests/diff-abi/abi.h tests/riscv/user_elf.ld
 	@mkdir -p $(@D)
@@ -11,7 +11,7 @@ $(DIFF_ABI_RV): $(DIFF_ABI_SOURCES) tests/diff-abi/abi.h tests/riscv/user_elf.ld
 .PHONY: test-diff-abi-host test-diff-abi-riscv build-diff-abi-linux
 
 test-diff-abi-host:
-	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests/diff-abi -p test_harness.py
+	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests/diff-abi -p 'test_*.py'
 
 build-diff-abi-linux:
 	python3 tests/diff-abi/harness.py --build-linux

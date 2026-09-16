@@ -900,7 +900,7 @@ $(MUSL_LDSO): $(MUSL_STAMP)
 
 MUSL_GCC_FLAGS ?= $(shell $(MUSL_ROOT)/bin/musl-gcc -fno-link-libatomic -E -x c /dev/null >/dev/null 2>&1 && echo -fno-link-libatomic)
 
-$(REAL_USERLAND_RV): tests/userland/real.c tests/userland/truncate.h $(MUSL_STAMP)
+$(REAL_USERLAND_RV): tests/userland/real.c tests/userland/truncate.h tests/userland/timestamps.h $(MUSL_STAMP)
 	@mkdir -p $(dir $@)
 	$(MUSL_ROOT)/bin/musl-gcc $(MUSL_GCC_FLAGS) -static -O2 \
 		-o $@ $<
@@ -1074,3 +1074,12 @@ test-stack-usage:
 	python3 tests/test-stack-usage.py
 	python3 tests/stack-usage.py build/stack-usage $$(build/stack-usage/stack-budget) >build/stack-usage/report.log
 	cat build/stack-usage/report.log
+
+.PHONY: inventory-userland-riscv test-program-inventory-host
+test-program-inventory-host:
+	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests/program-inventory -p test_inventory.py
+
+# An inventory records unsupported inputs as blocked; it is not an assertion
+# that the complete upstream suite passes.
+inventory-userland-riscv: $(KERNEL_RV) $(MUSL_STAMP) test-program-inventory-host
+	python3 tests/program-inventory/run.py

@@ -54,7 +54,7 @@ pipe 的 `fstat` 以 `S_IFIFO` 形态报告，`lseek` 返回 `-ESPIPE`；它不�
 
 ## `read`、offset 与部分复制
 
-`kernel_files_read()` 最多传送 Linux `MAX_RW_COUNT` 形态的 `INT32_MAX` 向下页对齐值。无效 fd 或普通文件 OFD 的访问模式为 `O_WRONLY` 时返回 `-EBADF`；该访问模式属于 OFD，因此 `dup`/fork 后仍保持。访问模式检查先于零长度和用户地址检查；通过后，零长度无需解引用用户地址并返回 0。`pread64` 对普通文件使用同一可读性契约，但按调用者给出的非负 offset 读取且不推进 OFD offset。与固定 Linux `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 [`fs/read_write.c`](../../references/linux/fs/read_write.c) 中 `vfs_read()` 顺序一致，非零读取先按调用者给出的原始 count 验证整个用户范围，再把实际请求截断到上限，逐页从挂载共享缓存取得文件页并执行 `copy_to_user`。
+`kernel_files_read()` 最多传送 Linux `MAX_RW_COUNT` 形态的 `INT32_MAX` 向下页对齐值。无效 fd 或普通文件 OFD 的访问模式为 `O_WRONLY` 时返回 `-EBADF`；该访问模式属于 OFD，因此 `dup`/fork 后仍保持。访问模式检查先于零长度和用户地址检查；通过后，零长度无需解引用用户地址并返回 0。`pread64` 对普通文件使用同一可读性契约，但按调用者给出的非负 offset 读取且不推进 OFD offset。它在 MAX_RW_COUNT 截断和 EOF 判断前校验原始用户范围，非法高地址即使 count 为零也返回 `-EFAULT`。与固定 Linux `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 [`fs/read_write.c`](../../references/linux/fs/read_write.c) 中 `vfs_read()` 顺序一致，非零读取先按调用者给出的原始 count 验证整个用户范围，再把实际请求截断到上限，逐页从挂载共享缓存取得文件页并执行 `copy_to_user`。
 
 open file description 的 offset 只增加实际复制到用户空间的字节数。首块即发生用户 fault 时返回 `-EFAULT` 且 offset 不变；已经复制前缀后再 fault 或遇到底层读错误时返回前缀长度，并只提交该前缀。短读和 EOF 返回实际长度。这样已经进入缓存但未交付用户的数据不会被错误计入文件位置。
 
@@ -85,7 +85,7 @@ open file description 的 offset 只增加实际复制到用户空间的字节�
 - **多队列等待节点（Wait Node）泛化**：调度器等待队列泛化为由 `struct kernel_wait_node` 串联的双向链表。当 poll 需要睡眠等待时，在被关心的所有有效 OFD 等待队列上分别挂载独立的等待节点（均关联当前 `task`），任一队列事件触发唤醒即退出阻塞，并在返回前可靠从全部队列脱链。
 - **OFD 钉住引用（Pinned References）生命周期**：进入阻塞前，poll 引擎通过 `kernel_files_pin()` 对所有被监听的有效 OFD 各获取一份独立引用。这确保了在多线程共享文件表环境中，即使另一线程在睡眠期间 `close()` 并复用相应 fd，正在被 poll 的 OFD 及其内部等待队列依然受保护，不会发生 Use-After-Free；唤醒与清理时统一通过 `kernel_open_file_release()` 释放。
 - **原子信号掩码替换**：`ppoll` 和 `pselect6` 支持以原子方式应用调用者指定的临时 `sigmask`，使阻塞等待能够被特定信号打断并返回 `-EINTR`，返回或打断时自动恢复原有信号掩码。
-- **紧凑栈预算与堆回退**：受限于内核任务单页（4 KiB）控制块与内核栈共享布局，`poll` 与 `pselect6` 严格控制栈帧大小（快速路径最多 4 个描述符节点、select 最多 64 个 fd 的单字 bitset）；超出快速路径容量时统一从进程私有 `files->heap` 动态分配并在返回前完全回收，避免击穿内核栈金丝雀（Canary）。
+- **紧凑栈预算与堆回退**：任务元数据虽已与 8 KiB 执行栈分离，仍需为 Trap 和深调用链保留余量；`poll` 与 `pselect6` 严格控制栈帧大小（快速路径最多 4 个描述符节点、select 最多 64 个 fd 的单字 bitset）；超出快速路径容量时统一从进程私有 `files->heap` 动态分配并在返回前完全回收，避免击穿内核栈金丝雀（Canary）。
 
 ## epoll 事件通知子系统
 
@@ -109,7 +109,7 @@ open file description 的 offset 只增加实际复制到用户空间的字节�
 
 `kernel_files_fstat()/newfstatat()` 按 riscv64 asm-generic 128 字节 `struct stat` 填充。regular file 与 directory 都先由 `kernel_vfs_fstat()` 取得同一份 filesystem-independent metadata，再转换为 Linux ABI；dev/ino/mode/nlink/uid/gid/size、512-byte `blocks`、filesystem `blksize` 和 atime/mtime/ctime 均来自当前 ext4 inode。打开后 unlink 的 file handle 仍指向活着的 inode，因此 `fstat` 可继续读取内容与 metadata，并观察到 `nlink == 0`。当前根 mount 的 `st_dev` 是稳定的 VFS 内部 mount ID 1，只用于同一挂载内的身份比较，不冒充硬件 major/minor。
 
-console、pipe 和 epoll 是不属于 filesystem inode 的合成对象，继续走各自的显式 stat 形态；console 呈现 5:1 字符设备，pipe 呈现 FIFO。`newfstatat` 支持 `AT_FDCWD`/绝对路径与 `AT_EMPTY_PATH`（直接按 fd 取描述符），真实 dirfd 的相对路径返回 `-EBADF`；目录路径可统计，`AT_SYMLINK_NOFOLLOW` 因无 symlink 而无条件接受。当前只读取 ext4 已存 metadata；create/read/write/truncate/unlink 的完整 timestamp mutation policy 仍未建立，不能把字段可读取等同于所有时间更新语义已经实现。
+console、pipe 和 epoll 是不属于 filesystem inode 的合成对象，继续走各自的显式 stat 形态；console 呈现 5:1 字符设备，pipe 呈现 FIFO。`newfstatat` 支持 `AT_FDCWD`/绝对路径与 `AT_EMPTY_PATH`（直接按 fd 取描述符），真实 dirfd 的相对路径返回 `-EBADF`；目录路径可统计，`AT_SYMLINK_NOFOLLOW` 因无 symlink 而无条件接受。常规文件 create/read/pread/write/writev/truncate/unlink 已更新 realtime 时间戳：读取按 relatime（含缓存命中、非零 EOF 和 user fault），写入先校验 inode maxbytes，再在 usercopy 前修改 mtime/ctime，同长度 truncate 也更新；零长度或访问模式拒绝不更新。创建/移除更新父目录 mtime/ctime，unlink 后仍打开的 inode 继续通过 live handle 更新。扩展 inode 保留纳秒与 signed epoch，旧 128-byte inode 按秒截断；只读挂载不写 atime，未初始化时钟不覆盖 fixture metadata。触发、I/O 错误 owner 和固定 Linux 依据见[文件时间戳](../learning/file-timestamps.md)。
 
 `kernel_files_getdents64()` 只作用于目录描述符，其他类型返回 `-ENOTDIR`。每条记录按 linux_dirent64 编码（`d_reclen` 8 字节对齐，`d_type` 来自 ext4 filetype），`d_off` 是下一条记录的后端 cookie，不是条目计数；缓冲区连第一条记录都放不下返回 `-EINVAL`，用户 fault 在已完整发出的记录上返回前缀计数。
 

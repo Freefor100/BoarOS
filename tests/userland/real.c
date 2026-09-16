@@ -27,6 +27,8 @@
 
 #include "truncate.h"
 
+#include "timestamps.h"
+
 __attribute__((section(".rodata.unlink_test_far"), aligned(4096)))
 const char unlink_far_page[8192] = "UNLINK_DEMAND_FAULT_PAGE_PAYLOAD";
 
@@ -2488,6 +2490,10 @@ int main(int argc, char **argv)
         return 9;
     }
     close(fd);
+
+    if (check_file_timestamps() != 0) {
+        return 68;
+    }
 
     int partial_err = check_partial_usercopy_write();
     if (partial_err != 0) {

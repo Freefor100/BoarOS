@@ -39,6 +39,9 @@
 | [Linux I/O 多路复用与等待架构学习总结](learning/io-multiplexing.md) | pselect6 与 ppoll 参数解包、多等待队列挂载、OFD 钉住与栈预算回退 |
 | [Linux 线程组与 futex 学习总结](learning/threads-and-futex.md) | 线程身份、clone/TLS、exit_group 级联回收与 futex 原子等待队列 |
 | [Linux epoll 事件通知子系统学习总结](learning/epoll-subsystem.md) | 推模型就绪队列、等待节点回调、LT/ET/ONESHOT 触发与 OFD 双向解链 |
+| [RISC-V Linux ABI 差分](modules/differential-abi.md) | 固定双侧运行、严格观测、CI 缓存与失败产物 |
+| [文件时间戳](learning/file-timestamps.md) | live inode、relatime、纳秒编码与错误传播 |
+| [真实程序失败清单](learning/user-program-inventory.md) | 固定 BusyBox/libc-test 输入、构建阻塞与双侧观测 |
 | [第三方代码](third-party.md) | 实际引入的外部源码、版本与许可 |
 
 `modules/` 保存当前实现的稳定事实，接口或不变量变化时同步更新。`learning/` 保存开发过程中值得集中复习的知识、已经确定的项目选择及理由、架构或板级资料依据，以及可复用的验证和调试经验；它不保存未确认方案、TODO、临时 plan 或流水账。根目录 `README.md` 记录当前能力、运行入口和近期方向。每个可独立验证的子系统阶段结束时都要主动检查这三类文档，而不是等到人再次提问，也不是每个提交都追加流水账。

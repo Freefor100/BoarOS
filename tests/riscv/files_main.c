@@ -80,6 +80,28 @@ static int inject_partial_write_error;
 static int inject_truncate_error;
 static int inject_usercopy_write_mode;
 static unsigned int usercopy_write_skip;
+static kernel_block_write_fn time_original_write;
+static unsigned int time_write_failures;
+static unsigned int time_write_calls;
+static uint32_t time_clock_nanoseconds;
+
+static bool timestamp_test_clock(struct ext4_timestamp *now)
+{
+    now->seconds = INT64_C(1780000000);
+    now->nanoseconds = ++time_clock_nanoseconds;
+    return true;
+}
+
+static enum kernel_block_status timestamp_test_write(
+    void *context, uint64_t offset, const void *buffer, size_t size)
+{
+    time_write_calls++;
+    if (time_write_failures != 0U) {
+        time_write_failures--;
+        return KERNEL_BLOCK_STATUS_IO;
+    }
+    return time_original_write(context, offset, buffer, size);
+}
 #endif
 
 enum kernel_heap_status __real_kernel_heap_release(
@@ -3236,6 +3258,50 @@ static void run_partial_write_test(const void *dtb)
             check_usercopy_write(&files, &mm, 32U, 1, append, 7U, mode);
         }
     }
+
+    /* A real block failure while writing timestamp metadata must abort
+     * before data, while the dirty inode remains owned by the mount cache. */
+    uint64_t prior_offset = kernel_open_file_offset(description);
+    uint64_t prior_size = kernel_open_file_size(description);
+    if (ext4_mount_setup_clock("/", timestamp_test_clock) != EOK ||
+        kernel_vfs_file_modified(&description->file, prior_offset, 0) != 0) {
+        fail_files(400U, 0, -1);
+    }
+    time_original_write = device.block.write;
+    device.block.write = timestamp_test_write;
+    time_write_failures = 1U;
+    if (kernel_files_write(&files, &mm, 0, TEST_USER_BUFFER, 0U, &result) !=
+            KERNEL_FILES_STATUS_OK || result != 0 || time_write_failures != 1U) {
+        fail_files(401U, 0, result);
+    }
+    if (kernel_files_write(&files, &mm, 0, TEST_USER_BUFFER, 1U, &result) !=
+            KERNEL_FILES_STATUS_OK || result != -KERNEL_EIO ||
+        time_write_failures != 0U ||
+        kernel_open_file_offset(description) != prior_offset ||
+        kernel_open_file_size(description) != prior_size) {
+        fail_files(402U, -KERNEL_EIO, result);
+    }
+    unsigned int before_flush = time_write_calls;
+    if (ext4_cache_flush("/") != EOK || time_write_calls <= before_flush ||
+        kernel_vfs_fstat(&description->file, &vfs_stat) != 0 ||
+        vfs_stat.mtime.seconds != INT64_C(1780000000) ||
+        vfs_stat.mtime.nanoseconds != time_clock_nanoseconds) {
+        fail_files(403U, 0, -1);
+    }
+    time_write_failures = 1U;
+    if (kernel_files_ftruncate(&files, 0, prior_size, &result) !=
+            KERNEL_FILES_STATUS_OK || result != -KERNEL_EIO ||
+        time_write_failures != 0U ||
+        kernel_open_file_offset(description) != prior_offset ||
+        kernel_open_file_size(description) != prior_size) {
+        fail_files(405U, -KERNEL_EIO, result);
+    }
+    before_flush = time_write_calls;
+    if (ext4_cache_flush("/") != EOK || time_write_calls <= before_flush) {
+        fail_files(406U, 0, -1);
+    }
+    device.block.write = time_original_write;
+    if (ext4_mount_setup_clock("/", 0) != EOK) fail_files(404U, 0, -1);
 
     use_test_satp = 0;
     if (kernel_files_close(&files, 0, &result) != KERNEL_FILES_STATUS_OK ||

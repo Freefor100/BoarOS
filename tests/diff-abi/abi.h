@@ -32,4 +32,5 @@ void abi_record(const char *id, long ret, long size, long offset, long signal,
 void abi_require(int condition);
 void abi_exit(long code) __attribute__((noreturn));
 void abi_truncate_cases(void);
+void abi_timestamp_cases(void);
 #endif

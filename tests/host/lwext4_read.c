@@ -747,6 +747,8 @@ close:
 	return failed;
 }
 
+#include "lwext4_timestamps.h"
+
 int main(int argc, char **argv)
 {
 	uint8_t physical_buffer[PHYSICAL_SECTOR_SIZE];
@@ -756,6 +758,8 @@ int main(int argc, char **argv)
 	struct stat status;
 	const char *expected = NULL;
 	bool sparse_mode;
+	bool timestamp_mode;
+	bool timestamp_readonly;
 	bool aligned_hole_mode;
 	bool legacy_limit_mode;
 	bool wide_legacy_limit_mode;
@@ -764,6 +768,8 @@ int main(int argc, char **argv)
 	int failed = 0;
 	int rc;
 
+    timestamp_mode = argc == 3 && strcmp(argv[2], "--timestamps") == 0;
+    timestamp_readonly = argc == 3 && strcmp(argv[2], "--timestamps-readonly") == 0;
 	sparse_mode = argc == 3 && strcmp(argv[2], "--sparse") == 0;
 	aligned_hole_mode = argc == 3 &&
 		strcmp(argv[2], "--aligned-hole") == 0;
@@ -772,7 +778,8 @@ int main(int argc, char **argv)
 	wide_legacy_limit_mode = argc == 3 &&
 		strcmp(argv[2], "--wide-legacy-limit") == 0;
 	if (argc != 4 && !sparse_mode && !aligned_hole_mode &&
-	    !legacy_limit_mode && !wide_legacy_limit_mode) {
+	    !legacy_limit_mode && !wide_legacy_limit_mode &&
+        !timestamp_mode && !timestamp_readonly) {
 		fprintf(stderr,
 			"usage: %s IMAGE PATH EXPECTED | IMAGE --aligned-hole | IMAGE --sparse | IMAGE --legacy-limit | IMAGE --wide-legacy-limit\n",
 			argv[0]);
@@ -783,7 +790,7 @@ int main(int argc, char **argv)
 		expected = argv[3];
 
 	image.fd = open(argv[1],
-			(sparse_mode || legacy_limit_mode || wide_legacy_limit_mode ?
+			(sparse_mode || legacy_limit_mode || wide_legacy_limit_mode || timestamp_mode ?
 			 O_RDWR : O_RDONLY) |
 			O_CLOEXEC);
 	if (image.fd < 0) {
@@ -822,14 +829,16 @@ int main(int argc, char **argv)
 
 	rc = ext4_mount(DEVICE_NAME, MOUNT_POINT,
 			!sparse_mode && !legacy_limit_mode &&
-			!wide_legacy_limit_mode);
+			!wide_legacy_limit_mode && !timestamp_mode);
 	if (rc != EOK) {
 		failed = report_error("mount image", rc);
 		goto cleanup;
 	}
 	mounted = true;
 
-	if (sparse_mode)
+	if (timestamp_mode || timestamp_readonly)
+		failed = check_timestamp_behavior(timestamp_readonly);
+	else if (sparse_mode)
 		failed = check_sparse_behavior(&image);
 	else if (legacy_limit_mode)
 		failed = check_legacy_address_limit();

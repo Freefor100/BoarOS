@@ -17,6 +17,7 @@ Linux 原有源码许可证见 `references/linux/COPYING`，构建产物位于�
   文件初始位置为 1；该参数契约保存在 `cases.txt` 并记录其 SHA-256。
 - `abi.h`：case pack 公共 syscall、stat、输出与 setup 检查。`truncate.c` 提供驻留页/COW/PROT_NONE、当前与非当前 MM、关闭 fd/unlink、
   非对齐尾页、O_TRUNC 与重新增长的观测；记录 ID 同步维护在 `cases.txt`。
+- `timestamps.c`：22 条 create/read/write/truncate/unlink 与父目录时间观测；与前述文件及截断观测合计 76 条。Linux 根挂载沿固定源码 `fs/namespace.c` 的默认 `MNT_RELATIME`，BoarOS 使用同一策略。
 - `harness.py`：构建 Linux、制作镜像、运行两个系统、校验完整协议并做严格 diff。
 - `linux.config`：以 `allnoconfig` 为基础，启用 virt、MMU、ELF、串口、VirtIO
   MMIO/block、ext4 和关机所需能力；Linux 自己解析依赖。
@@ -24,9 +25,11 @@ Linux 原有源码许可证见 `references/linux/COPYING`，构建产物位于�
 每条记录含 ID、返回值、errno、文件 size、OFD offset、子进程 wait status 和
 完整观测数据的十六进制值。fd 与 mmap 地址只有其成功身份规范为 0；错误返回、
 部分计数、字节、大小、位置和退出/信号状态均保留。未观测 size/offset 用 -1。
-规范化只去除引导噪声和串口 CRLF；缺失、重复、未知、乱序、格式错误的记录，
+除时间观测外，规范化只去除引导噪声和串口 CRLF；缺失、重复、未知、乱序、格式错误的记录，
 错误 errno、缺少 END、QEMU 非零退出和超时均失败。BoarOS 还必须报告 PID 1
 状态 42、heap-live 为零及完整资源回收关机。
+
+时间观测保留原始 224 字节（28 个有符号 little-endian RV64 word）：操作前后时钟区间、文件操作前后的 atime/mtime/ctime、父目录操作前后的三个时间，均以秒/纳秒成对编码。`timestamps.py` 校验纳秒范围、变化字段属于操作时钟区间，再比较字段变化关系、创建时间相等关系、mtime/ctime 关系及 relatime 前置条件；不直接比较两次独立启动的绝对墙钟。规范化器自身的哈希进入运行清单，原值仍保存在串口日志。宿主测试故意破坏纳秒、时钟范围和变化关系以验证其会失败。
 
 Linux PID 1 在完整输出后 sync 并 reboot poweroff；同一程序在 BoarOS 的未实现
 调用返回后 exit(42)。这些启动/终止适配不参与案例观测，不影响文件操作路径。

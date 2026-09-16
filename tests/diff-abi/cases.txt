@@ -54,3 +54,28 @@ truncate.reopen.cached
 truncate.tail.evicted
 truncate.grow.evicted
 truncate.reopen.evicted
+# time.*: 28 signed LE64 words: lo,hi,before,after,parent_before,parent_after
+# timespec pairs: seconds,nanoseconds; file/parent triples: atime,mtime,ctime
+# low clock precedes 50ms wait; zero before triple marks new file
+time.create
+time.write-zero
+time.write-denied
+time.write
+time.read
+time.write-fault
+time.cached-pread
+time.read-zero
+time.pread-eof
+time.read-fault
+time.write-partial
+time.truncate-same
+time.truncate-grow
+time.truncate-shrink
+time.unlink
+time.unlinked-write
+time.unlinked-read
+time.write-maxbytes
+time.pread-invalid
+time.pread-invalid-zero
+time.pread-invalid-eof
+time.pread-wrap

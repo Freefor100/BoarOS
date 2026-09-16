@@ -112,4 +112,4 @@ make test-riscv
 
 聚焦建表测试除启动 PTE、规模和失败语义外，还检查用户根高半区借用、U 页权限、零页/COW 映射、fork 父提交失败原子性、复制与末引用原地恢复、owned-range 参数失败不变、实际撤销/释放、跨页离线填充、用户地址半开区间、数值为 0 的合法用户根地址、lookup、move、活动根销毁拒绝、后序回收、OOM 回滚、`satp` 编码和失败输出不变。VMA/mmap 用例覆盖 protected COW 保持、fixed replace 和 unmap 的 PTE—fence—release 顺序；真实 U-mode mmap 还覆盖匿名和 ext4 文件私有映射、EOF/SIGBUS。非法释放由 allocator fatal-path 测试覆盖。
 
-当前未实现 1 GiB 叶子、`MAP_SHARED` 写共享、ASID 分配和 SMP TLB shootdown。按需提交用于匿名栈、`brk` heap、private-anonymous mmap 和只读普通文件的 private mapping，用户映射固定为 4 KiB；运行期改权/撤销/COW 要求当前单 hart 活动 MM。direct map 只映射 DTB 报告的第一段 RAM，不包含 MMIO，也不放宽内核 text/rodata 的别名权限。
+当前未实现 1 GiB 叶子、`MAP_SHARED` 写共享、ASID 分配和 SMP TLB shootdown。按需提交用于匿名栈、`brk` heap、private-anonymous mmap 和只读普通文件的 private mapping，用户映射固定为 4 KiB；运行期改权/撤销/COW 在单 hart 的不可调度区执行，截断撤销支持非当前 MM，尚无跨 hart 同步协议。direct map 只映射 DTB 报告的第一段 RAM，不包含 MMIO，也不放宽内核 text/rodata 的别名权限。

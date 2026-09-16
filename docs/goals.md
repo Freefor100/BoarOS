@@ -37,10 +37,10 @@ Linux ABI 兼容是最终功能方向，不是对当前完成度的声明；READ
 
 - differential ABI harness MVP 已落地：`make test-diff-abi-riscv` 将同一 raw-syscall ELF 分别运行于固定 commit 构建的 RISC-V Linux 与 BoarOS，严格比较返回值、errno、数据、长度、偏移与 wait status；缺失结果、超时或差异返回非零。CI 独立运行并保留日志与失败镜像。后续按 OFD/open/stat、poll/epoll、signal/futex/time、mmap/truncate 扩展，不在 C 源码硬编码 reference 输出。
 - 用 differential 证据决定 open/openat 对任意 unknown flag bits 的兼容策略；固定 Linux 会忽略一部分未知 bit，不能把“一律拒绝”直接写成 ABI 要求。
-- ext4 timestamp mutation 仍是独立目标，需要定义 create/read/write/truncate/unlink 的 atime/mtime/ctime 更新。sparse ftruncate 与越过 EOF 写入已经用 inode-size/hole 能力替换逐段写零增长，并由真实 `st_blocks`、aligned/unaligned zero read 和卸载后 `e2fsck` 验证。
+- ext4 timestamp mutation 已接入活 inode 与 realtime：create/read/write/truncate/unlink 及父目录更新、relatime 缓存命中和 EOF/部分成功/失败语义由真实用户态及 RISC-V Linux 差分验证；受控时钟和块写失败由聚焦测试保护。sparse ftruncate 与越过 EOF 写入已经用 inode-size/hole 能力替换逐段写零增长，并由真实 `st_blocks`、aligned/unaligned zero read 和卸载后 `e2fsck` 验证。
 - truncate-to-resident-mapping invalidation 已用稳定 node–MM 登记和驻留页来源记录闭环：涵盖 private COW、PROT_NONE、非当前 MM、尾页、fork、关闭 fd/unlink、O_TRUNC 和重新增长；真实 RISC-V Linux 差分与分配失败回滚回归共同验收。仍不包含 MAP_SHARED 或 SMP 同步。
-- 真实 userspace 按 musl libc-test failure inventory、BusyBox、pthread stress、SQLite、Git 推进。每轮按 failure cluster、最小复现、Linux differential、kernel primitive regression、重跑 workload 闭环；SQLite 的验收包含事务、journal、并发 reader/writer、重开和 integrity_check。
-- task metadata 与 kernel stack 已分离：独立 4 KiB 栈保留 canary、高水位，CI 运行隔离重建的 compiler stack usage 检查；真实 root-init、musl、pthread 栈余量均超过 1 KiB。扩大调用链后继续测量，不能把单帧检查当成整体界证明。SMP 仍需真实 userspace 与同步协议准备完成后开始；multi-hart boot 只是第一个检查点。
+- 固定真实程序清单已落地（`make inventory-userland-riscv`）：参考 commit 不含 libc-test，完整 BusyBox 配置因工具链缺少 `linux/kd.h` 构建阻塞；有限六个 BusyBox applet 用例双侧一致。下一步先补齐固定输入与构建依赖，再按 libc-test、BusyBox、pthread stress、SQLite、Git 推进。每轮按 failure cluster、最小复现、Linux differential、kernel primitive regression、重跑 workload 闭环；SQLite 的验收包含事务、journal、并发 reader/writer、重开和 integrity_check。
+- task metadata 与 kernel stack 已分离：独立 8 KiB 连续物理栈保留 canary、高水位，CI 运行隔离重建的 compiler stack usage 检查；按信号帧、冷文件缺页及内存回收的代表调用链预算从 4 KiB 扩至 8 KiB，真实 root-init、musl、pthread 另检查至少 1 KiB 余量。扩大调用链后继续测量，不能把单帧检查当成整体界证明。SMP 仍需真实 userspace 与同步协议准备完成后开始；multi-hart boot 只是第一个检查点。
 
 ## 规划假设与边界
 

@@ -10,6 +10,7 @@ import re
 import shutil
 import subprocess
 import sys
+from timestamps import normalize_timestamps
 
 ROOT = Path(__file__).resolve().parents[2]
 HERE = Path(__file__).resolve().parent
@@ -48,6 +49,8 @@ def normalize(text, expected):
         ret, errno, size, offset, status = map(int, (ret, errno, size, offset, status))
         if errno != (-ret if -4095 <= ret < 0 else 0):
             raise ValueError(f'inconsistent return/errno: {name}')
+        if name.startswith('time.'):
+            data = normalize_timestamps(data)
         records.append((name, ret, errno, size, offset, status, data))
     if [record[0] for record in records] != expected:
         raise ValueError('missing, duplicated, unknown, or reordered case result')
@@ -142,7 +145,7 @@ def run(args):
     if directory.exists():
         shutil.rmtree(directory)
     directory.mkdir(parents=True)
-    metadata = {'status': 'preparing'}
+    metadata = {'status': 'preparing', 'timestamp_normalizer_sha256': digest(HERE / 'timestamps.py')}
     metadata_path = directory / 'metadata.json'
     try:
         kernel_snapshot = directory / 'boaros-kernel'
@@ -172,6 +175,8 @@ def run(args):
                        '-drive', f'file={target},if=none,format=raw,id=root',
                        '-device', 'virtio-blk-device,drive=root,bus=virtio-mmio-bus.0']
             if name == 'linux':
+                # init_mount uses namespace.c's default MNT_RELATIME. relatime
+                # is a VFS flag, not an ext4 rootflags= filesystem parameter.
                 command += ['-append', 'root=/dev/vda rw rootwait console=ttyS0 init=/init loglevel=0 panic=-1']
             metadata[name + '_command'] = command
             logfile = directory / (name + '.log')

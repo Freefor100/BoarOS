@@ -89,6 +89,21 @@ typedef struct ext4_file {
 	uint64_t fpos;
 } ext4_file;
 
+/* BoarOS adapter: optional realtime source and live-inode timestamp updates.
+ * The callback returns false until wall-clock initialization is complete.
+ * Seconds are signed; nanoseconds must be in [0, 1000000000). */
+struct ext4_timestamp {
+    int64_t seconds;
+    uint32_t nanoseconds;
+};
+typedef bool (*ext4_clock_read)(struct ext4_timestamp *now);
+#define EXT4_TIME_ATIME 1U
+#define EXT4_TIME_MTIME 2U
+#define EXT4_TIME_CTIME 4U
+#define EXT4_TIME_RELATIME 8U
+int ext4_mount_setup_clock(const char *mount_point, ext4_clock_read clock);
+int ext4_file_touch(ext4_file *file, unsigned int fields);
+
 /*****************************DIRECTORY DESCRIPTOR***************************/
 
 /**@brief   Directory entry descriptor. */

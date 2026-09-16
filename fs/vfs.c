@@ -7,6 +7,7 @@
 #include <kernel/heap.h>
 #include <kernel/page_cache.h>
 #include <kernel/vfs.h>
+#include <kernel/time.h>
 
 #include <ext4.h>
 #include <ext4_blockdev.h>
@@ -71,6 +72,16 @@ struct kernel_vfs_node {
     uint8_t unlinked;
     uint8_t orphan_freed;
 };
+
+static bool vfs_realtime(struct ext4_timestamp *now)
+{
+    uint64_t nanoseconds;
+    if (!kernel_time_is_initialized()) return false;
+    nanoseconds = kernel_time_realtime_ns();
+    now->seconds = (int64_t)(nanoseconds / UINT64_C(1000000000));
+    now->nanoseconds = (uint32_t)(nanoseconds % UINT64_C(1000000000));
+    return true;
+}
 
 static int lwext4_error(int error)
 {
@@ -407,6 +418,11 @@ int kernel_vfs_mount_root(struct kernel_vfs_mount *mount,
         return lwext4_error(result);
     }
     adapter->mounted = 1U;
+    result = ext4_mount_setup_clock(LWEXT4_MOUNT_POINT, vfs_realtime);
+    if (result != EOK) {
+        (void)cleanup_mount(mount);
+        return lwext4_error(result);
+    }
 
     result = ext4_get_sblock(LWEXT4_MOUNT_POINT, &superblock);
     if (result != EOK) {
@@ -699,6 +715,33 @@ int kernel_vfs_file_acquire_write(struct kernel_vfs_file *file)
     return 0;
 }
 
+void kernel_vfs_file_accessed(struct kernel_vfs_file *file)
+{
+    struct kernel_vfs_node *node;
+    if (file == 0 || file->state != VFS_FILE_STATE_LIVE ||
+        file->private_data == 0) return;
+    node = file->private_data;
+    /* Linux touch_atime does not change a read's result on metadata I/O
+     * failure. The mount's dirty block cache continues to own that state. */
+    (void)ext4_file_touch(&node->file, EXT4_TIME_ATIME | EXT4_TIME_RELATIME);
+}
+
+int kernel_vfs_file_modified(struct kernel_vfs_file *file,
+                              uint64_t offset, int append)
+{
+    struct kernel_vfs_node *node;
+    if (file == 0 || file->state != VFS_FILE_STATE_LIVE ||
+        file->private_data == 0) return -KERNEL_EINVAL;
+    node = file->private_data;
+    if (node->adapter->read_only) return -KERNEL_EROFS;
+    if (append) offset = ext4_fsize(&node->file);
+    /* Linux generic/ext4 write checks reject the maximum position before
+     * file_modified, even when the user buffer would fault. */
+    if (offset >= node->file.fmax) return -KERNEL_EFBIG;
+    return lwext4_error(ext4_file_touch(&node->file,
+                                       EXT4_TIME_MTIME | EXT4_TIME_CTIME));
+}
+
 int kernel_vfs_pread(struct kernel_vfs_file *file,
                      uint64_t offset,
                      void *buffer,
@@ -849,15 +892,12 @@ int kernel_vfs_ftruncate(struct kernel_vfs_file *file,
         return -KERNEL_ETXTBSY;
     }
 
-    if (size != node->size) {
-        result = ext4_ftruncate(&node->file, size);
-        reconcile_file_after_mutation(node, file);
-        if (result != EOK) {
-            return lwext4_error(result);
-        }
-    } else if (node->adapter->page_cache != 0) {
-        (void)kernel_page_cache_invalidate_node(node->adapter->page_cache,
-                                                node);
+    /* Even a same-size ftruncate updates mtime/ctime. Reconciliation also
+     * preserves visible inode mutations when the backend reports an error. */
+    result = ext4_ftruncate(&node->file, size);
+    reconcile_file_after_mutation(node, file);
+    if (result != EOK) {
+        return lwext4_error(result);
     }
     return 0;
 }
@@ -1006,6 +1046,7 @@ static int inode_extra_field_present(struct ext4_sblock *superblock,
     uint16_t extra_size = ext4_inode_get_extra_isize(superblock, inode);
 
     return field_offset <= SIZE_MAX - field_size &&
+           field_offset + field_size <= ext4_get16(superblock, inode_size) &&
            field_offset + field_size <=
                EXT4_GOOD_OLD_INODE_SIZE + (size_t)extra_size;
 }

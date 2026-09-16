@@ -54,6 +54,7 @@
 #include <ext4_journal.h>
 
 
+#include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -82,6 +83,9 @@ struct ext4_mountpoint {
 
 	/**@brief   OS dependent lock/unlock functions.*/
 	const struct ext4_lock *os_locks;
+
+	/* Optional adapter-owned realtime source; cleared on mount reuse. */
+	ext4_clock_read clock;
 
 	/**@brief   Ext4 filesystem internals.*/
 	struct ext4_fs fs;
@@ -279,6 +283,95 @@ static int ext4_has_children(bool *has_children, struct ext4_inode_ref *enode)
 	return EOK;
 }
 
+/* ext4 stores signed 32-bit seconds plus a two-bit epoch in each extra
+ * field. Old 128-byte inodes have only seconds; never overwrite their tail. */
+static bool ext4_time_has_extra(struct ext4_inode_ref *ref, size_t offset)
+{
+    size_t present = EXT4_GOOD_OLD_INODE_SIZE +
+        ext4_inode_get_extra_isize(&ref->fs->sb, ref->inode);
+    return offset + sizeof(uint32_t) <= present &&
+        offset + sizeof(uint32_t) <= ext4_get16(&ref->fs->sb, inode_size);
+}
+
+static struct ext4_timestamp ext4_time_load(struct ext4_inode_ref *ref,
+                                           size_t base_offset,
+                                           size_t extra_offset)
+{
+    uint32_t base, extra = 0;
+    struct ext4_timestamp time;
+    memcpy(&base, (unsigned char *)ref->inode + base_offset, sizeof(base));
+    time.seconds = (int32_t)to_le32(base);
+    if (ext4_time_has_extra(ref, extra_offset)) {
+        memcpy(&extra, (unsigned char *)ref->inode + extra_offset, sizeof(extra));
+        extra = to_le32(extra);
+        time.seconds += (int64_t)(extra & 3U) << 32;
+    }
+    time.nanoseconds = extra >> 2;
+    return time;
+}
+
+static int ext4_time_compare(struct ext4_timestamp a, struct ext4_timestamp b)
+{
+    if (a.seconds != b.seconds) return a.seconds > b.seconds ? 1 : -1;
+    if (a.nanoseconds != b.nanoseconds)
+        return a.nanoseconds > b.nanoseconds ? 1 : -1;
+    return 0;
+}
+
+static void ext4_time_store(struct ext4_inode_ref *ref, size_t base_offset,
+                            size_t extra_offset, struct ext4_timestamp time)
+{
+    bool extended = ext4_time_has_extra(ref, extra_offset);
+    int64_t maximum = extended ? INT64_C(15032385535) : INT32_MAX;
+    uint32_t base, extra;
+    if (time.seconds < INT32_MIN) {
+        time.seconds = INT32_MIN;
+        time.nanoseconds = 0;
+    } else if (time.seconds > maximum) {
+        time.seconds = maximum;
+        time.nanoseconds = 999999999U;
+    }
+    if (!extended) time.nanoseconds = 0;
+    if (!ext4_time_compare(time, ext4_time_load(ref, base_offset, extra_offset)))
+        return;
+    base = to_le32((uint32_t)time.seconds);
+    memcpy((unsigned char *)ref->inode + base_offset, &base, sizeof(base));
+    if (extended) {
+        uint32_t epoch = (uint32_t)((time.seconds - (int32_t)time.seconds) >> 32);
+        extra = to_le32((time.nanoseconds << 2) | epoch);
+        memcpy((unsigned char *)ref->inode + extra_offset, &extra, sizeof(extra));
+    }
+    ref->dirty = true;
+}
+
+static void ext4_touch_inode(struct ext4_mountpoint *mp,
+                             struct ext4_inode_ref *ref, unsigned int fields)
+{
+    struct ext4_timestamp now;
+    if (mp->fs.read_only || !mp->clock || !mp->clock(&now)) return;
+    if (fields & EXT4_TIME_RELATIME) {
+        struct ext4_timestamp atime = ext4_time_load(ref,
+            offsetof(struct ext4_inode, access_time), offsetof(struct ext4_inode, atime_extra));
+        struct ext4_timestamp mtime = ext4_time_load(ref,
+            offsetof(struct ext4_inode, modification_time), offsetof(struct ext4_inode, mtime_extra));
+        struct ext4_timestamp ctime = ext4_time_load(ref,
+            offsetof(struct ext4_inode, change_inode_time), offsetof(struct ext4_inode, ctime_extra));
+        if (ext4_time_compare(mtime, atime) < 0 &&
+            ext4_time_compare(ctime, atime) < 0 &&
+            now.seconds - atime.seconds < 86400)
+            fields &= ~EXT4_TIME_ATIME;
+    }
+    if (fields & EXT4_TIME_ATIME)
+        ext4_time_store(ref, offsetof(struct ext4_inode, access_time),
+                        offsetof(struct ext4_inode, atime_extra), now);
+    if (fields & EXT4_TIME_MTIME)
+        ext4_time_store(ref, offsetof(struct ext4_inode, modification_time),
+                        offsetof(struct ext4_inode, mtime_extra), now);
+    if (fields & EXT4_TIME_CTIME)
+        ext4_time_store(ref, offsetof(struct ext4_inode, change_inode_time),
+                        offsetof(struct ext4_inode, ctime_extra), now);
+}
+
 static int ext4_link(struct ext4_mountpoint *mp, struct ext4_inode_ref *parent,
 		     struct ext4_inode_ref *ch, const char *n,
 		     uint32_t len, bool rename)
@@ -331,6 +424,7 @@ static int ext4_link(struct ext4_mountpoint *mp, struct ext4_inode_ref *parent,
 		ext4_fs_inode_links_count_inc(parent);
 		ch->dirty = true;
 		parent->dirty = true;
+		ext4_touch_inode(mp, parent, EXT4_TIME_MTIME | EXT4_TIME_CTIME);
 		return r;
 	}
 	/*
@@ -369,6 +463,7 @@ static int ext4_link(struct ext4_mountpoint *mp, struct ext4_inode_ref *parent,
 		ch->dirty = true;
 	}
 
+	ext4_touch_inode(mp, parent, EXT4_TIME_MTIME | EXT4_TIME_CTIME);
 	return r;
 }
 
@@ -400,21 +495,8 @@ static int ext4_unlink(struct ext4_mountpoint *mp,
 		parent->dirty = true;
 	}
 
-	/*
-	 * TODO: Update timestamps of the parent
-	 * (when we have wall-clock time).
-	 *
-	 * ext4_inode_set_change_inode_time(parent->inode, (uint32_t) now);
-	 * ext4_inode_set_modification_time(parent->inode, (uint32_t) now);
-	 * parent->dirty = true;
-	 */
-
-	/*
-	 * TODO: Update timestamp for inode.
-	 *
-	 * ext4_inode_set_change_inode_time(child->inode,
-	 *     (uint32_t) now);
-	 */
+    ext4_touch_inode(mp, parent, EXT4_TIME_MTIME | EXT4_TIME_CTIME);
+    ext4_touch_inode(mp, child, EXT4_TIME_CTIME);
 	if (ext4_inode_get_links_cnt(child->inode)) {
 		ext4_fs_inode_links_count_dec(child);
 		child->dirty = true;
@@ -457,6 +539,7 @@ int ext4_mount(const char *dev_name, const char *mount_point,
 	for (size_t i = 0; i < CONFIG_EXT4_MOUNTPOINTS_COUNT; ++i) {
 		if (!s_mp[i].mounted) {
 			strcpy(s_mp[i].name, mount_point);
+			s_mp[i].clock = NULL;
 			mp = &s_mp[i];
 			break;
 		}
@@ -818,6 +901,52 @@ int ext4_mount_setup_locks(const char *mount_point,
 	return EOK;
 }
 
+int ext4_mount_setup_clock(const char *mount_point, ext4_clock_read clock)
+{
+    struct ext4_mountpoint *mp = ext4_get_mount(mount_point);
+    if (!mp) return ENOENT;
+    mp->clock = clock;
+    return EOK;
+}
+
+int ext4_file_touch(ext4_file *file, unsigned int fields)
+{
+    struct ext4_inode_ref ref;
+    struct ext4_mountpoint *mp;
+    struct ext4_timestamp now;
+    int result, flush_result;
+    if (!file || !file->mp || !file->mp->mounted) return EINVAL;
+    mp = file->mp;
+    if (mp->fs.read_only)
+        return fields & (EXT4_TIME_MTIME | EXT4_TIME_CTIME) ? EROFS : EOK;
+    if (!mp->clock || !mp->clock(&now)) return EOK;
+    EXT4_MP_LOCK(mp);
+    ext4_trans_start(mp);
+    result = ext4_fs_get_inode_ref(&mp->fs, file->inode, &ref);
+    if (result == EOK) {
+        ext4_touch_inode(mp, &ref, fields);
+        if (ref.dirty) {
+            /* put_inode_ref's immediate flush does not propagate I/O errors.
+             * Keep the dirty inode mount-owned until an explicit flush has
+             * reported success; restore nesting even after a failed put. */
+            result = ext4_block_cache_write_back(mp->fs.bdev, 1);
+            if (result == EOK) {
+                result = ext4_fs_put_inode_ref(&ref);
+                flush_result = ext4_block_cache_write_back(mp->fs.bdev, 0);
+                if (result == EOK) result = flush_result;
+            } else {
+                (void)ext4_fs_put_inode_ref(&ref);
+            }
+        } else {
+            result = ext4_fs_put_inode_ref(&ref);
+        }
+    }
+    if (result == EOK) ext4_trans_stop(mp);
+    else ext4_trans_abort(mp);
+    EXT4_MP_UNLOCK(mp);
+    return result;
+}
+
 /********************************FILE OPERATIONS*****************************/
 
 static int ext4_path_check(const char *path, bool *is_goal)
@@ -1064,6 +1193,8 @@ static int ext4_generic_open2(ext4_file *f, const char *path, int flags,
 				break;
 
 			ext4_fs_inode_blocks_init(fs, &child_ref);
+			ext4_touch_inode(mp, &child_ref,
+			    EXT4_TIME_ATIME | EXT4_TIME_MTIME | EXT4_TIME_CTIME);
 
 			/*Link with root dir.*/
 			r = ext4_link(mp, &ref, &child_ref, path, len, false);
@@ -1838,15 +1969,28 @@ static int ext4_ftruncate_no_lock(ext4_file *file, uint64_t size)
 	}
 
 Finish:
+	if (r == EOK || ext4_inode_get_size(sb, ref.inode) != old_size) {
+		ext4_touch_inode(file->mp, &ref, EXT4_TIME_MTIME | EXT4_TIME_CTIME);
+	}
 	file->fsize = ext4_inode_get_size(sb, ref.inode);
-	if (write_back) {
-		cleanup_r = ext4_block_cache_write_back(file->mp->fs.bdev, 0);
-		if (r == EOK)
+	/* Same-size truncate can still dirty timestamps. Keep the final inode
+	 * put inside the bracket so its metadata error cannot be swallowed by
+	 * the block cache's immediate-flush path. */
+	if (ref.dirty && !write_back) {
+		cleanup_r = ext4_block_cache_write_back(file->mp->fs.bdev, 1);
+		if (cleanup_r == EOK)
+			write_back = true;
+		else if (r == EOK)
 			r = cleanup_r;
 	}
 	cleanup_r = ext4_fs_put_inode_ref(&ref);
 	if (r == EOK)
 		r = cleanup_r;
+	if (write_back) {
+		cleanup_r = ext4_block_cache_write_back(file->mp->fs.bdev, 0);
+		if (r == EOK)
+			r = cleanup_r;
+	}
 	return r;
 }
 

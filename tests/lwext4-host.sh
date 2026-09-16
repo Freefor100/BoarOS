@@ -89,6 +89,17 @@ done
 "$work_dir/lwext4-read" "$image" /boaros-probe "$expected"
 "$work_dir/lwext4-read" "$uuid_seeded_image" /boaros-probe "$expected"
 
+# Timestamp encoding is an on-disk contract for both old and extended inodes.
+for inode_size in 128 256; do
+    time_image="$work_dir/timestamps-$inode_size.img"
+    truncate -s 32M "$time_image"
+    mkfs.ext4 -q -F -b 1024 -I "$inode_size" "$time_image"
+    debugfs -w -R "write $fixture /boaros-probe" "$time_image" >/dev/null 2>&1
+    "$work_dir/lwext4-read" "$time_image" --timestamps
+    "$work_dir/lwext4-read" "$time_image" --timestamps-readonly
+    e2fsck -fn "$time_image" >/dev/null
+ done
+
 # Preserve both checksum images as read-only probes. Sparse mutations happen
 # only in this dedicated copy, whose block size is fixed for exact hole tests.
 cp "$image" "$sparse_image"

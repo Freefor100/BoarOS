@@ -82,6 +82,13 @@ int kernel_vfs_open_executable(struct kernel_vfs_mount *mount,
 
 int kernel_vfs_file_acquire_write(struct kernel_vfs_file *file);
 
+/* Request-boundary touches include cache hits, EOF and partial user faults.
+ * Access-time I/O errors do not override the read result; modification errors
+ * are returned before copying caller data. Neither API depends on a path. */
+void kernel_vfs_file_accessed(struct kernel_vfs_file *file);
+int kernel_vfs_file_modified(struct kernel_vfs_file *file,
+                              uint64_t offset, int append);
+
 int kernel_vfs_pread(struct kernel_vfs_file *file,
                      uint64_t offset,
                      void *buffer,
