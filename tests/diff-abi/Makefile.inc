@@ -1,5 +1,5 @@
 DIFF_ABI_RV := build/diff-abi/cases-rv
-DIFF_ABI_SOURCES := tests/diff-abi/cases.c tests/diff-abi/start.S $(wildcard tests/diff-abi/truncate.c)
+DIFF_ABI_SOURCES := tests/diff-abi/cases.c tests/diff-abi/start.S tests/diff-abi/truncate.c
 
 $(DIFF_ABI_RV): $(DIFF_ABI_SOURCES) tests/diff-abi/abi.h tests/riscv/user_elf.ld
 	@mkdir -p $(@D)

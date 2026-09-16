@@ -586,6 +586,8 @@ $(UACCESS_TEST_KERNEL_RV): $(UACCESS_TEST_OBJECTS) \
 $(FILES_TEST_KERNEL_RV): $(FILES_TEST_OBJECTS) arch/riscv/linker.ld
 	$(CC) $(LDFLAGS) \
 		-Wl,--wrap=kernel_open_file_release \
+		-Wl,--wrap=kernel_heap_allocate_zeroed \
+		-Wl,--wrap=physical_page_allocate \
 		-Wl,--wrap=riscv_sv39_current_satp \
 		-Wl,-Map,$(BUILD_DIR)/tests/kernel-files-rv.map \
 		-o $@ $(FILES_TEST_OBJECTS)
@@ -594,6 +596,8 @@ $(FILES_PARTIAL_WRITE_TEST_KERNEL_RV): \
 		$(FILES_PARTIAL_WRITE_TEST_OBJECTS) arch/riscv/linker.ld
 	$(CC) $(LDFLAGS) \
 		-Wl,--wrap=kernel_open_file_release \
+		-Wl,--wrap=kernel_heap_allocate_zeroed \
+		-Wl,--wrap=physical_page_allocate \
 		-Wl,--wrap=riscv_sv39_current_satp \
 		-Wl,--wrap=ext4_fwrite \
 		-Wl,--wrap=ext4_ftruncate \
@@ -896,7 +900,7 @@ $(MUSL_LDSO): $(MUSL_STAMP)
 
 MUSL_GCC_FLAGS ?= $(shell $(MUSL_ROOT)/bin/musl-gcc -fno-link-libatomic -E -x c /dev/null >/dev/null 2>&1 && echo -fno-link-libatomic)
 
-$(REAL_USERLAND_RV): tests/userland/real.c $(MUSL_STAMP)
+$(REAL_USERLAND_RV): tests/userland/real.c tests/userland/truncate.h $(MUSL_STAMP)
 	@mkdir -p $(dir $@)
 	$(MUSL_ROOT)/bin/musl-gcc $(MUSL_GCC_FLAGS) -static -O2 \
 		-o $@ $<

@@ -15,8 +15,8 @@ Linux 原有源码许可证见 `references/linux/COPYING`，构建产物位于�
   sparse hole/尾页零填充/越过 EOF 的 SIGBUS，以及 write/writev/append 的
   0、1、32、63、64、65 字节有效用户前缀。请求长度统一为有效前缀 + 1，
   文件初始位置为 1；该参数契约保存在 `cases.txt` 并记录其 SHA-256。
-- `abi.h`：case pack 公共 syscall、stat、输出与 setup 检查。可以在
-  `truncate.c` 提供 `abi_truncate_cases()`；记录 ID 同步追加 `cases.txt`。
+- `abi.h`：case pack 公共 syscall、stat、输出与 setup 检查。`truncate.c` 提供驻留页/COW/PROT_NONE、当前与非当前 MM、关闭 fd/unlink、
+  非对齐尾页、O_TRUNC 与重新增长的观测；记录 ID 同步维护在 `cases.txt`。
 - `harness.py`：构建 Linux、制作镜像、运行两个系统、校验完整协议并做严格 diff。
 - `linux.config`：以 `allnoconfig` 为基础，启用 virt、MMU、ELF、串口、VirtIO
   MMIO/block、ext4 和关机所需能力；Linux 自己解析依赖。

@@ -139,7 +139,6 @@ static void partial_cases(void)
     }
     abi_require(SC2(215, map, 8192) == 0);
 }
-__attribute__((weak)) void abi_truncate_cases(void) {}
 void abi_main(void)
 {
     text("ABI BEGIN 1"); flush();

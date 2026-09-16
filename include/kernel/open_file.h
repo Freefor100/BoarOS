@@ -9,6 +9,11 @@
 struct kernel_heap;
 struct kernel_open_file_description;
 struct kernel_vfs_mount;
+struct kernel_vfs_node;
+
+/* Borrowed identity, valid while the regular-file OFD is owned. */
+struct kernel_vfs_node *kernel_open_file_node(
+    const struct kernel_open_file_description *description);
 
 enum kernel_open_file_status {
     KERNEL_OPEN_FILE_STATUS_OK = 0,

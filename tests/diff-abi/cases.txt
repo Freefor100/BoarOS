@@ -40,3 +40,17 @@ appendv.32
 appendv.63
 appendv.64
 appendv.65
+truncate.local.clean
+truncate.local.cow
+truncate.local.protected
+truncate.local.protected-cow
+truncate.foreign.clean
+truncate.foreign.cow
+truncate.foreign.protected
+truncate.foreign.protected-cow
+truncate.tail.cached
+truncate.grow.cached
+truncate.reopen.cached
+truncate.tail.evicted
+truncate.grow.evicted
+truncate.reopen.evicted

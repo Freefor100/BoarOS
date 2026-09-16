@@ -1,5 +1,6 @@
 #include <arch/riscv/mm.h>
 #include <kernel/elf64_source.h>
+#include <kernel/file_mapping.h>
 #include <kernel/heap.h>
 #include <kernel/open_file.h>
 #include <kernel/page.h>
@@ -24,6 +25,20 @@ struct riscv_kernel_mm_file_source {
     struct kernel_open_file_description *file;
 };
 
+struct riscv_file_mapping {
+    struct riscv_file_mapping *next;
+    struct kernel_file_mapping registration;
+};
+
+/* PTE owns the physical reference. This metadata survives cache eviction and
+ * PROT_NONE; fork copies provenance, not a guess based on the PTE COW bit. */
+struct riscv_file_resident {
+    struct riscv_file_resident *next;
+    uint64_t address;
+    uint64_t physical_address;
+    int private;
+};
+
 struct riscv_kernel_mm_elf_source {
     struct riscv_kernel_mm_elf_source *next;
     struct kernel_elf64_source *source;
@@ -43,6 +58,8 @@ struct riscv_kernel_mm_record {
     struct kernel_vma_set *vmas;
     struct kernel_heap *vma_heap;
     struct riscv_kernel_mm_file_source *file_sources;
+    struct riscv_file_mapping *file_mappings;
+    struct riscv_file_resident *file_residents;
     struct riscv_kernel_mm_elf_source *elf_sources;
 };
 
@@ -288,12 +305,136 @@ static struct riscv_kernel_mm_file_source *find_file_source(
     return 0;
 }
 
+static void forget_file_residents(struct riscv_kernel_mm_record *record,
+                                  uint64_t start, uint64_t end)
+{
+    struct riscv_file_resident **link = &record->file_residents;
+    while (*link != 0) {
+        struct riscv_file_resident *page = *link;
+        if (page->address >= start && page->address < end) {
+            *link = page->next;
+            (void)kernel_heap_release(record->vma_heap, page);
+        } else {
+            link = &page->next;
+        }
+    }
+}
+
+static struct riscv_file_resident *find_file_resident(
+    struct riscv_kernel_mm_record *record, uint64_t address)
+{
+    for (struct riscv_file_resident *page = record->file_residents;
+         page != 0; page = page->next) {
+        if (page->address == address) return page;
+    }
+    return 0;
+}
+
+static void truncate_file_residents(void *owner, struct kernel_vfs_node *node,
+                                    uint64_t size)
+{
+    struct riscv_kernel_mm_record *record = owner;
+    struct riscv_file_resident **link = &record->file_residents;
+    uint64_t last_page = size & ~BOAROS_PAGE_MASK;
+    int cleared = 0;
+
+    while (*link != 0) {
+        struct riscv_file_resident *page = *link;
+        struct kernel_vma vma;
+        uint64_t offset;
+        if (kernel_vma_set_lookup(record->vmas, page->address, &vma) !=
+                KERNEL_VMA_STATUS_OK ||
+            vma.kind != KERNEL_VMA_KIND_FILE_PRIVATE) {
+            __builtin_trap();
+        }
+        if (kernel_open_file_node(vma.backing) != node) {
+            link = &page->next;
+            continue;
+        }
+        offset = vma.backing_offset + page->address - vma.start;
+        if (offset >= size) {
+            /* All resident file offsets are page aligned; this includes the
+             * exact-boundary case without overflowing a round-up operation. */
+            if (riscv_sv39_user_unmap_owned_range(&record->space,
+                    page->address, page->address + BOAROS_PAGE_SIZE) !=
+                    RISCV_SV39_STATUS_OK) __builtin_trap();
+            *link = page->next;
+            (void)kernel_heap_release(record->vma_heap, page);
+            continue;
+        }
+        if (offset == last_page && !page->private) {
+            unsigned char *bytes;
+            if (physical_page_resolve(record->space.allocator,
+                    page->physical_address, (void **)&bytes) !=
+                    PHYSICAL_PAGE_STATUS_OK) __builtin_trap();
+            for (size_t i = (size_t)(size & BOAROS_PAGE_MASK);
+                 i < BOAROS_PAGE_SIZE; i++) bytes[i] = 0U;
+            cleared = 1;
+        }
+        link = &page->next;
+    }
+    if (cleared) __asm__ volatile("fence.i" : : : "memory");
+}
+
+static enum kernel_mm_status prepare_file_registration(
+    struct riscv_kernel_mm_record *record,
+    struct kernel_open_file_description *file,
+    struct riscv_file_mapping **prepared)
+{
+    struct kernel_vfs_node *node = kernel_open_file_node(file);
+    enum kernel_heap_status status;
+    *prepared = 0;
+    if (node == 0) return KERNEL_MM_STATUS_STATE;
+    for (struct riscv_file_mapping *entry = record->file_mappings;
+         entry != 0; entry = entry->next) {
+        if (entry->registration.node == node) return KERNEL_MM_STATUS_OK;
+    }
+    status = kernel_heap_allocate_zeroed(record->vma_heap, 1U,
+                                         sizeof(**prepared), (void **)prepared);
+    if (status != KERNEL_HEAP_STATUS_OK) {
+        return status == KERNEL_HEAP_STATUS_EMPTY ? KERNEL_MM_STATUS_NO_MEMORY
+                                                  : KERNEL_MM_STATUS_STATE;
+    }
+    (*prepared)->registration.node = node;
+    (*prepared)->registration.owner = record;
+    (*prepared)->registration.truncate = truncate_file_residents;
+    return KERNEL_MM_STATUS_OK;
+}
+
+static void drain_file_registrations(struct riscv_kernel_mm_record *record,
+                                     int unused_only)
+{
+    struct riscv_file_mapping **link = &record->file_mappings;
+    while (*link != 0) {
+        struct riscv_file_mapping *entry = *link;
+        int used = 0;
+        for (struct riscv_kernel_mm_file_source *source = record->file_sources;
+             unused_only && source != 0; source = source->next) {
+            if (kernel_open_file_node(source->file) != entry->registration.node)
+                continue;
+            if (kernel_vma_set_backing_in_use(record->vmas, source->file,
+                                               &used) != KERNEL_VMA_STATUS_OK)
+                __builtin_trap();
+            if (used) break;
+        }
+        if (used) {
+            link = &entry->next;
+        } else {
+            kernel_file_mapping_unregister(&entry->registration);
+            *link = entry->next;
+            (void)kernel_heap_release(record->vma_heap, entry);
+        }
+    }
+}
+
 static enum kernel_mm_status drain_file_sources(
     struct riscv_kernel_mm_record *record,
     int unused_only)
 {
     struct riscv_kernel_mm_file_source **link = &record->file_sources;
     int failed = 0;
+
+    drain_file_registrations(record, unused_only);
 
     while (*link != 0) {
         struct riscv_kernel_mm_file_source *source = *link;
@@ -594,7 +735,34 @@ enum kernel_mm_status kernel_mm_fork(
                    ? KERNEL_MM_STATUS_STATE
                    : status;
     }
-    status = clone_elf_sources(source_record, destination_record);
+    /* Reserve per-node registration and resident provenance before the final
+     * PTE-sharing commit. Unpublished records are also handled by release. */
+    for (struct riscv_kernel_mm_file_source *source = destination_record->file_sources;
+         source != 0 && status == KERNEL_MM_STATUS_OK; source = source->next) {
+        struct riscv_file_mapping *prepared;
+        status = prepare_file_registration(destination_record, source->file,
+                                             &prepared);
+        if (status == KERNEL_MM_STATUS_OK && prepared != 0) {
+            prepared->next = destination_record->file_mappings;
+            destination_record->file_mappings = prepared;
+        }
+    }
+    for (struct riscv_file_resident *page = source_record->file_residents;
+         page != 0 && status == KERNEL_MM_STATUS_OK; page = page->next) {
+        struct riscv_file_resident *copy;
+        enum kernel_heap_status hs = kernel_heap_allocate_zeroed(
+            destination_record->vma_heap, 1U, sizeof(*copy), (void **)&copy);
+        if (hs != KERNEL_HEAP_STATUS_OK) {
+            status = hs == KERNEL_HEAP_STATUS_EMPTY ? KERNEL_MM_STATUS_NO_MEMORY
+                                                     : KERNEL_MM_STATUS_STATE;
+            break;
+        }
+        *copy = *page;
+        copy->next = destination_record->file_residents;
+        destination_record->file_residents = copy;
+    }
+    if (status == KERNEL_MM_STATUS_OK)
+        status = clone_elf_sources(source_record, destination_record);
     if (status != KERNEL_MM_STATUS_OK) {
         destination_record->stage = RISCV_KERNEL_MM_RECORD_VMAS_CLEANUP;
         destination->allocator = source->allocator;
@@ -605,15 +773,16 @@ enum kernel_mm_status kernel_mm_fork(
             return KERNEL_MM_STATUS_CLEANUP_REQUIRED;
         }
         finish_handle(destination, KERNEL_MM_EMPTY);
-        return status == KERNEL_MM_STATUS_CLEANUP_REQUIRED
-                   ? KERNEL_MM_STATUS_CLEANUP_REQUIRED
-                   : KERNEL_MM_STATUS_STATE;
+        return status;
     }
 
     sv39_status = riscv_sv39_user_space_fork(
         &destination_record->space,
         &source_record->space);
     if (sv39_status == RISCV_SV39_STATUS_OK) {
+        for (struct riscv_file_mapping *entry = destination_record->file_mappings;
+             entry != 0; entry = entry->next)
+            kernel_file_mapping_register(&entry->registration);
         destination_record->start_brk = source_record->start_brk;
         destination_record->current_brk = source_record->current_brk;
         destination_record->brk_limit = source_record->brk_limit;
@@ -1140,6 +1309,7 @@ static enum kernel_mm_status unmap_space_range(
                                                start,
                                                end);
     if (status == RISCV_SV39_STATUS_OK) {
+        forget_file_residents(record, start, end);
         return KERNEL_MM_STATUS_OK;
     }
     return status == RISCV_SV39_STATUS_STATE
@@ -1431,6 +1601,7 @@ enum kernel_mm_status kernel_mm_mmap_file_private(
     struct riscv_kernel_mm_file_source *prepared = 0;
     struct riscv_kernel_mm_file_source *existing;
     struct kernel_vma vma;
+    struct riscv_file_mapping *registration = 0;
     struct kernel_vma_edit edit;
     enum kernel_heap_status heap_status;
     enum kernel_mm_status status;
@@ -1464,6 +1635,11 @@ enum kernel_mm_status kernel_mm_mmap_file_private(
                        : KERNEL_MM_STATUS_STATE;
         }
     }
+    status = prepare_file_registration(record, *file, &registration);
+    if (status != KERNEL_MM_STATUS_OK) {
+        discard_prepared_file_source(record, prepared);
+        return status;
+    }
     vma = (struct kernel_vma){
         .start = plan.start,
         .end = plan.end,
@@ -1479,6 +1655,8 @@ enum kernel_mm_status kernel_mm_mmap_file_private(
                                                        &vma));
         if (status != KERNEL_MM_STATUS_OK) {
             discard_prepared_file_source(record, prepared);
+            if (registration != 0)
+                (void)kernel_heap_release(record->vma_heap, registration);
             return status;
         }
     } else {
@@ -1489,6 +1667,8 @@ enum kernel_mm_status kernel_mm_mmap_file_private(
                                                     &edit);
         if (vma_status != KERNEL_VMA_STATUS_OK) {
             discard_prepared_file_source(record, prepared);
+            if (registration != 0)
+                (void)kernel_heap_release(record->vma_heap, registration);
             return status_from_vma(vma_status);
         }
         status = require_active_space(record);
@@ -1499,10 +1679,17 @@ enum kernel_mm_status kernel_mm_mmap_file_private(
             kernel_vma_set_commit_edit(record->vmas, &edit) !=
                 KERNEL_VMA_STATUS_OK) {
             discard_prepared_file_source(record, prepared);
+            if (registration != 0)
+                (void)kernel_heap_release(record->vma_heap, registration);
             return status != KERNEL_MM_STATUS_OK
                        ? status
                        : KERNEL_MM_STATUS_STATE;
         }
+    }
+    if (registration != 0) {
+        registration->next = record->file_mappings;
+        record->file_mappings = registration;
+        kernel_file_mapping_register(&registration->registration);
     }
     finish_file_mapping(record, file, prepared);
     *address = plan.start;
@@ -1868,6 +2055,11 @@ static enum kernel_mm_status map_private_file_page(
         if (sv39_status == RISCV_SV39_STATUS_OK) {
             /* The COW resolver already published its local TLB/I-cache fence. */
             *translation_synchronized = 1;
+        } else {
+            /* No provenance is published for a failed fault. Do not leave
+             * the temporary cache PTE behind after private allocation fails. */
+            return discard_mapped_page(&record->space, page_address,
+                                         map_file_page_status(sv39_status));
         }
         return map_file_page_status(sv39_status);
     }
@@ -2068,6 +2260,15 @@ enum kernel_mm_status kernel_mm_resolve_user_fault(
                 virtual_address & ~BOAROS_PAGE_MASK,
                 sv39_permissions_from_mm(vma.permissions));
             if (sv39_status == RISCV_SV39_STATUS_OK) {
+                if (vma.kind == KERNEL_VMA_KIND_FILE_PRIVATE) {
+                    struct riscv_file_resident *page = find_file_resident(record,
+                        virtual_address & ~BOAROS_PAGE_MASK);
+                    if (page == 0 || riscv_sv39_user_lookup(&record->space,
+                            page->address, &mapping) != RISCV_SV39_STATUS_OK)
+                        __builtin_trap();
+                    page->private = 1;
+                    page->physical_address = mapping.physical_address;
+                }
                 return KERNEL_MM_STATUS_OK;
             }
             if (sv39_status == RISCV_SV39_STATUS_NO_MEMORY) {
@@ -2101,6 +2302,12 @@ enum kernel_mm_status kernel_mm_resolve_user_fault(
         if (file_page_offset >= file_size) {
             return KERNEL_MM_STATUS_BUS_FAULT;
         }
+        struct riscv_file_resident *resident;
+        enum kernel_heap_status hs = kernel_heap_allocate_zeroed(
+            record->vma_heap, 1U, sizeof(*resident), (void **)&resident);
+        if (hs != KERNEL_HEAP_STATUS_OK)
+            return hs == KERNEL_HEAP_STATUS_EMPTY ? KERNEL_MM_STATUS_NO_MEMORY
+                                                   : KERNEL_MM_STATUS_STATE;
         file_page_index = file_page_offset >> BOAROS_PAGE_SHIFT;
         status = access == KERNEL_MM_WRITE
                      ? map_private_file_page(record,
@@ -2114,6 +2321,17 @@ enum kernel_mm_status kernel_mm_resolve_user_fault(
                                             &vma,
                                             page_address,
                                             file_page_index);
+        if (status == KERNEL_MM_STATUS_OK) {
+            if (riscv_sv39_user_lookup(&record->space, page_address, &mapping) !=
+                    RISCV_SV39_STATUS_OK) __builtin_trap();
+            resident->address = page_address;
+            resident->physical_address = mapping.physical_address;
+            resident->private = access == KERNEL_MM_WRITE;
+            resident->next = record->file_residents;
+            record->file_residents = resident;
+        } else {
+            (void)kernel_heap_release(record->vma_heap, resident);
+        }
         if (status == KERNEL_MM_STATUS_OK &&
             translation_synchronized == 0) {
             flush_user_page(page_address, vma.permissions);
@@ -2229,6 +2447,8 @@ enum kernel_mm_status kernel_mm_release(struct kernel_mm *mm)
     }
 
     if (record->stage == RISCV_KERNEL_MM_RECORD_VMAS_CLEANUP) {
+        drain_file_registrations(record, 0);
+        forget_file_residents(record, 0, UINT64_MAX);
         if (record->vmas != 0) {
             vma_status = kernel_vma_set_destroy(&record->vmas);
             if (vma_status != KERNEL_VMA_STATUS_OK) {

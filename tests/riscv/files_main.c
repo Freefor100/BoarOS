@@ -9,6 +9,7 @@
 #include <kernel/fs_context.h>
 #include <kernel/heap.h>
 #include <kernel/mm.h>
+#include <kernel/vma.h>
 #include <kernel/open_file.h>
 #include <kernel/page.h>
 #include <kernel/page_cache.h>
@@ -50,6 +51,28 @@ static unsigned char page_pool[BOAROS_PAGE_SIZE * TEST_POOL_PAGES]
 static int count_open_file_releases;
 static uint32_t counted_open_file_releases;
 static char fork_resolved_path[KERNEL_FS_PATH_MAX];
+static unsigned fail_physical_allocation;
+enum physical_page_status __real_physical_page_allocate(
+    struct physical_page_allocator *, uint64_t *);
+enum physical_page_status __wrap_physical_page_allocate(
+    struct physical_page_allocator *allocator, uint64_t *out)
+{
+    if (fail_physical_allocation && --fail_physical_allocation == 0)
+        return PHYSICAL_PAGE_STATUS_EMPTY;
+    return __real_physical_page_allocate(allocator, out);
+}
+
+static unsigned fail_metadata_allocation;
+enum kernel_heap_status __real_kernel_heap_allocate_zeroed(
+    struct kernel_heap *, size_t, size_t, void **);
+enum kernel_heap_status __wrap_kernel_heap_allocate_zeroed(
+    struct kernel_heap *heap, size_t count, size_t size, void **out)
+{
+    if (fail_metadata_allocation && --fail_metadata_allocation == 0)
+        return KERNEL_HEAP_STATUS_EMPTY;
+    return __real_kernel_heap_allocate_zeroed(heap, count, size, out);
+}
+
 static int use_test_satp;
 static uint64_t test_satp;
 #ifdef FILES_PARTIAL_WRITE_TEST
@@ -877,6 +900,37 @@ static void run_mmap_operations(struct kernel_files *files,
     size_t copied = SIZE_MAX;
 
     expect_open(files, fs, mm, TEST_AT_FDCWD, "/data", 0U, 0, 60U);
+    /* Sweep allocation failures through source/node-MM/VMA preparation.
+     * A failed fixed replacement must retain the old resident anonymous page
+     * and the caller's OFD pin, irrespective of private allocation order. */
+    if (kernel_mm_mmap_anonymous(mm, TEST_MMAP_FIRST, BOAROS_PAGE_SIZE,
+            KERNEL_MM_READ | KERNEL_MM_WRITE, KERNEL_MM_MAP_FIXED_NOREPLACE,
+            &first_address) != KERNEL_MM_STATUS_OK ||
+        kernel_mm_resolve_user_fault(mm, first_address, KERNEL_MM_WRITE) !=
+            KERNEL_MM_STATUS_OK ||
+        !write_user_bytes(mm, first_address, &replacement, 1U) ||
+        kernel_files_pin(files, 0, &first_pin, &result) != KERNEL_FILES_STATUS_OK)
+        fail_files(330U, 0, -1);
+    for (unsigned failure = 1; ; failure++) {
+        if (failure > 64) fail_files(331U, 0, failure);
+        fail_metadata_allocation = failure;
+        enum kernel_mm_status status = kernel_mm_mmap_file_private(mm,
+            &first_pin, TEST_MMAP_FIRST, BOAROS_PAGE_SIZE, 0,
+            KERNEL_MM_READ | KERNEL_MM_WRITE, KERNEL_MM_MAP_FIXED,
+            &first_address);
+        fail_metadata_allocation = 0;
+        if (status == KERNEL_MM_STATUS_OK) break;
+        struct kernel_vma old;
+        unsigned char value;
+        if (status != KERNEL_MM_STATUS_NO_MEMORY || first_pin == 0 ||
+            kernel_mm_vma_lookup(mm, first_address, &old) != KERNEL_MM_STATUS_OK ||
+            old.kind != KERNEL_VMA_KIND_ANONYMOUS ||
+            !read_user_byte(mm, first_address, &value) || value != replacement)
+            fail_files(332U, KERNEL_MM_STATUS_NO_MEMORY, status);
+    }
+    if (first_pin != 0 || kernel_mm_munmap(mm, first_address, BOAROS_PAGE_SIZE) !=
+            KERNEL_MM_STATUS_OK) fail_files(333U, 0, -1);
+
     if (kernel_files_pin(files, 0, &first_pin, &result) !=
             KERNEL_FILES_STATUS_OK || result != 0 || first_pin == 0 ||
         kernel_mm_mmap_file_private(
@@ -994,6 +1048,51 @@ static void run_mmap_operations(struct kernel_files *files,
         !read_user_byte(mm, second_address, &replacement) ||
         replacement != 'A') {
         fail_files(64U, 0, -1);
+    }
+
+    /* Fault-in allocation failure publishes neither PTE nor provenance. */
+    fail_metadata_allocation = 1;
+    enum kernel_mm_status resident_status = kernel_mm_resolve_user_fault(
+        mm, second_address + BOAROS_PAGE_SIZE, KERNEL_MM_READ);
+    fail_metadata_allocation = 0;
+    if (resident_status != KERNEL_MM_STATUS_NO_MEMORY ||
+        kernel_mm_lookup(mm, second_address + BOAROS_PAGE_SIZE, &second_mapping) !=
+            KERNEL_MM_STATUS_NOT_MAPPED)
+        fail_files(334U, KERNEL_MM_STATUS_NO_MEMORY, resident_status);
+    /* A cached write-first fault publishes a COW PTE before copying. If the
+     * private allocation fails, that temporary PTE must be removed as well. */
+    struct kernel_vma alias_vma;
+    uint64_t alias = first_address + 3U * BOAROS_PAGE_SIZE;
+    if (kernel_mm_vma_lookup(mm, first_address, &alias_vma) != KERNEL_MM_STATUS_OK ||
+        kernel_open_file_acquire(alias_vma.backing) != KERNEL_OPEN_FILE_STATUS_OK)
+        fail_files(338U, 0, -1);
+    first_pin = alias_vma.backing;
+    if (kernel_mm_mmap_file_private(mm, &first_pin, alias, BOAROS_PAGE_SIZE, 0,
+            KERNEL_MM_READ | KERNEL_MM_WRITE, KERNEL_MM_MAP_FIXED, &alias) !=
+            KERNEL_MM_STATUS_OK) fail_files(338U, 0, -1);
+    fail_physical_allocation = 1;
+    resident_status = kernel_mm_resolve_user_fault(mm, alias, KERNEL_MM_WRITE);
+    fail_physical_allocation = 0;
+    if (resident_status != KERNEL_MM_STATUS_NO_MEMORY ||
+        kernel_mm_lookup(mm, alias, &first_mapping) != KERNEL_MM_STATUS_NOT_MAPPED)
+        fail_files(339U, KERNEL_MM_STATUS_NO_MEMORY, resident_status);
+    if (kernel_mm_resolve_user_fault(mm, alias, KERNEL_MM_WRITE) != KERNEL_MM_STATUS_OK)
+        fail_files(340U, 0, -1);
+    /* Fork metadata failure leaves the parent and its private byte intact. */
+    for (unsigned failure = 1; ; failure++) {
+        struct kernel_mm trial = {0};
+        if (failure > 64) fail_files(335U, 0, failure);
+        fail_metadata_allocation = failure;
+        enum kernel_mm_status status = kernel_mm_fork(&trial, mm);
+        fail_metadata_allocation = 0;
+        if (status == KERNEL_MM_STATUS_OK) {
+            if (kernel_mm_release(&trial) != KERNEL_MM_STATUS_OK)
+                fail_files(336U, 0, -1);
+            break;
+        }
+        if (status != KERNEL_MM_STATUS_NO_MEMORY ||
+            !read_user_byte(mm, first_address, &replacement) || replacement != 0xe1U)
+            fail_files(337U, KERNEL_MM_STATUS_NO_MEMORY, status);
     }
 
     /* Fork keeps an independent OFD registry after the parent unmaps. */

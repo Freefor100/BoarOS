@@ -25,6 +25,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "truncate.h"
+
 __attribute__((section(".rodata.unlink_test_far"), aligned(4096)))
 const char unlink_far_page[8192] = "UNLINK_DEMAND_FAULT_PAGE_PAYLOAD";
 
@@ -2499,6 +2501,12 @@ int main(int argc, char **argv)
         return 70 + rw_err;
     }
 
+    int truncate_err = check_resident_truncate();
+    if (truncate_err != 0) {
+        fprintf(stderr, "resident truncate failed: %d\n", truncate_err);
+        return 71;
+    }
+
     /* Clocks: monotonic must advance, realtime must dominate it, and
      * gettimeofday must agree with clock_gettime on the same clock. */
     struct timespec mono_before;
@@ -2704,7 +2712,7 @@ int main(int argc, char **argv)
         return 74;
     }
 
-    /* Core-producing default actions carry the Linux wait status core bit. */
+    /* A core-class signal without a produced dump must not set WCOREDUMP. */
     pid_t core_child = fork();
     if (core_child < 0) {
         return 75;
@@ -2716,7 +2724,7 @@ int main(int argc, char **argv)
     int core_status = 0;
     if (waitpid(core_child, &core_status, 0) != core_child ||
         !WIFSIGNALED(core_status) || WTERMSIG(core_status) != SIGQUIT ||
-        (core_status & 0x80) == 0) {
+        (core_status & 0x80) != 0) {
         return 76;
     }
 

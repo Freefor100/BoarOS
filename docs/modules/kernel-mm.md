@@ -191,3 +191,28 @@ make test-riscv
 MM 聚焦测试覆盖创建失败原子性、共享引用、移动、COW fork 的父子共享/写隔离/末引用原地恢复、`PROT_NONE` COW 属性，以及正常页表回收和物理页基线；同一 target 还运行独立 fatal kernel，注入一次页表 backing 无法解析并确认只产生一个 fatal 结果、不会返回 retry/success 路径。文件测试覆盖 cache hit/miss、write-first、尾页补零、整页越 EOF、fd 关闭后 fault、fork 后 OFD 来源和最终回收。syscall 聚焦测试验证校验错误先于不可读 OFD 的 `EACCES`，两类拒绝都释放临时 pin 且不进入 MM 提交；`test-userland-riscv` 用真实 musl mmap 覆盖零长度、非法 fixed 地址、原 fd 与 dup。`test-mmap-riscv` 与真实 ext4 `/init` 从 U-mode 完成匿名/文件私有 mmap、COW、SIGBUS、mprotect/munmap 生命周期。
 
 当前只有 RISC-V 后端；映射仍由 Sv39/4 KiB 用户页实现。普通 fork 使用独立 MM+COW，线程 clone/vfork 共享同一 MM record；匿名映射和 ELF image 使用每 MM 的 ASLR mmap ceiling（无可信种子时确定性降级），但没有 commit accounting。可读普通文件支持 MAP_PRIVATE，尚无 MAP_SHARED、写回或 truncate 并发；brk 尚未接入 RLIMIT_DATA。文件表和信号表不属于 MM。futex 当前以 MM 身份与用户地址为 key，共享文件映射落地前不提供跨 MM futex 语义。
+
+## 驻留文件映射与截断
+
+MM record 拥有按 VFS node 去重的稳定关联记录，以及每个驻留文件页的地址、物理页
+身份和私有化状态。VFS 只借用关联；OFD 来源持有 node 的生命周期。共享 MM 不重复
+登记，fork 在页表共享提交前复制来源/关联/驻留元数据，成功后登记新 MM。mmap 在
+VMA/PTE 修改前预留关联；失败不消耗调用者 OFD。末个 VMA 消失或销毁时先解除关联，
+再释放 OFD。不得登记可移动的 VMA 数组元素或 MM handle 地址。
+
+首次文件 fault 在发布 PTE 前预留驻留记录；COW 成功后更新私有标志及物理地址。
+缓存命中的 write-first fault 若 COW 物理分配失败，必须撤销临时 cache PTE 后返回，
+不能留下无来源记录的 PTE。fork 后私有页面即使再次带 COW 标志，仍保持私有来源。
+munmap/fixed replace 清除对应驻留记录，mprotect/PROT_NONE 保留来源。
+
+VFS 向下截断按实际 live size（包括部分生效后报错）同步通知相关 MM。扫描每个
+驻留记录并查询当前 VMA 与文件偏移，撤销整页起点不小于新 EOF 的 PTE，保留 VMA；
+非对齐尾页只清零文件来源页的后缀，保留 private 页内容。当前与非当前 MM 使用
+相同的 PTE 失效、全局本 hart SFENCE.VMA、物理引用释放顺序；尾页代码修改执行
+FENCE.I。当前单 hart syscall 不可调度区保证登记和通知稳定，不代表 SMP 协议。
+
+关联只扫描相关 MM；每个 MM 的驻留记录为链表，COW 查找 O(驻留文件页数)，截断
+每页 VMA 查找 O(log VMA 数)。元数据随驻留规模增长；不在 tick 热路径扫描。
+`test-files-riscv` 扫描准备阶段分配失败与 fork 回滚，并注入缓存命中后的 COW
+物理分配失败；`test-userland-riscv` 与 `test-diff-abi-riscv` 验证真实驻留/COW、
+PROT_NONE、非当前 MM、尾页、关闭 fd、unlink、O_TRUNC 与重新增长。

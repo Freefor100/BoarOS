@@ -3,6 +3,7 @@
 
 #include <kernel/block.h>
 #include <kernel/errno.h>
+#include <kernel/file_mapping.h>
 #include <kernel/heap.h>
 #include <kernel/page_cache.h>
 #include <kernel/vfs.h>
@@ -56,6 +57,7 @@ struct lwext4_mount_adapter {
 
 struct kernel_vfs_node {
     struct kernel_vfs_node *next;
+    struct kernel_file_mapping *mappings;
     struct lwext4_mount_adapter *adapter;
     struct kernel_vfs_mount *mount;
     ext4_file file;
@@ -718,8 +720,15 @@ int kernel_vfs_pread(struct kernel_vfs_file *file,
 static void reconcile_file_after_mutation(struct kernel_vfs_node *node,
                                           struct kernel_vfs_file *file)
 {
+    uint64_t old_size = node->size;
     node->size = ext4_fsize(&node->file);
     file->size = node->size;
+    if (node->size < old_size) {
+        for (struct kernel_file_mapping *mapping = node->mappings;
+             mapping != 0; mapping = mapping->next) {
+            mapping->truncate(mapping->owner, node, node->size);
+        }
+    }
     if (node->adapter->page_cache != 0) {
         (void)kernel_page_cache_invalidate_node(node->adapter->page_cache,
                                                 node);
@@ -1329,6 +1338,27 @@ int kernel_vfs_node_acquire(struct kernel_vfs_node *node)
     return 0;
 }
 
+void kernel_file_mapping_register(struct kernel_file_mapping *mapping)
+{
+    if (mapping == 0 || mapping->node == 0 || mapping->owner == 0 ||
+        mapping->truncate == 0 || mapping->previous != 0) {
+        __builtin_trap();
+    }
+    mapping->next = mapping->node->mappings;
+    mapping->previous = &mapping->node->mappings;
+    if (mapping->next != 0) mapping->next->previous = &mapping->next;
+    mapping->node->mappings = mapping;
+}
+
+void kernel_file_mapping_unregister(struct kernel_file_mapping *mapping)
+{
+    if (mapping->previous == 0) return;
+    *mapping->previous = mapping->next;
+    if (mapping->next != 0) mapping->next->previous = mapping->previous;
+    mapping->next = 0;
+    mapping->previous = 0;
+}
+
 int kernel_vfs_node_release(struct kernel_vfs_node **owner)
 {
     struct kernel_vfs_node *node;
@@ -1345,6 +1375,7 @@ int kernel_vfs_node_release(struct kernel_vfs_node **owner)
         return 0;
     }
     if (node->references == 1U) {
+        if (node->mappings != 0) __builtin_trap();
         node->references = 0U;
         link = &node->adapter->nodes;
         while (*link != 0 && *link != node) {

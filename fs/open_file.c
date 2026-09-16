@@ -388,6 +388,14 @@ static int open_file_live(const struct kernel_open_file_description *file)
            !file->vfs_closed;
 }
 
+struct kernel_vfs_node *kernel_open_file_node(
+    const struct kernel_open_file_description *description)
+{
+    return description != 0 &&
+                   description->kind == KERNEL_OPEN_FILE_KIND_REGULAR
+               ? kernel_vfs_file_node(&description->file) : 0;
+}
+
 uint64_t kernel_open_file_size(
     const struct kernel_open_file_description *file)
 {

@@ -407,3 +407,17 @@ Sv39 建表测试覆盖精确 PTE、2 MiB/4 KiB 选择、16 GiB 规模、边界�
 - `git -C references/linux show HEAD:arch/loongarch/Kconfig`：LoongArch Linux 的页大小与页表层级组合。
 
 资料的固定版本、上游地址和恢复方式见 [本地参考资料](../../references/README.md)。
+
+## 截断不能只依靠缺页检查
+
+固定 Linux `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的
+`references/linux/mm/truncate.c::truncate_pagecache()` 从 round_up(newsize,
+PAGE_SIZE) 撤销映射且 even_cows=1；`truncate_inode_partial_folio()` 只清零文件
+页尾，不能据此清零匿名 COW 尾页。BoarOS 原有缓存失效只摘索引，已驻留 PTE
+不会重新检查 EOF。真实 U-mode 子进程探针在修复前继续读取旧页，修复后收到 SIGBUS。
+
+稳定 node–MM 关联限定扫描范围；每页独立来源记录解决两个歧义：fork 后匿名私有页
+也带 COW 位，而普通文件写可摘掉仍被 PTE 引用的 cache 索引。来源不能靠这两者
+猜测。物理 COW 分配失败还必须撤销首次写 fault 临时装入的 PTE；否则元数据已
+回滚却遗留硬件映射，后续截断遗漏或 COW 重试触发不变量错误。聚焦故障注入已
+覆盖这一失败窗口，正常差分通过不能代替它。
