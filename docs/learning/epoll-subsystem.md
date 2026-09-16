@@ -109,9 +109,9 @@ BoarOS 在 `kernel_files_epoll_pwait` 与调度器等待协议中构建了原子
 
 ## 紧凑栈预算与堆回退设计
 
-BoarOS 在 RISC-V 架构下采用单页（4 KiB）紧凑任务布局；当前 1552 字节任务控制块与 Canary/对齐之后，Trap Frame 建立前的内核栈预算为 2528 字节。
+epoll 的小缓冲策略最初用于任务元数据与执行栈共用 4 KiB 页的布局。当前已分离为元数据页与 8 KiB 连续物理栈；仍需给 Trap 和完整调用链留余量，详见[调度学习记录](kernel-scheduling.md)。
 
-每个 `struct linux_epoll_event` 占用 16 字节（包含 32 位 events 掩码与 64 位用户 data 联合体）。如果用户在 `epoll_pwait` 中传入 `maxevents = 128` 甚至更高，若在内核栈上分配该数组，将消耗超过 2 KiB 栈空间，必然击穿 Canary 导致内核崩溃。
+每个 `struct linux_epoll_event` 占用 16 字节（包含 32 位 events 掩码与 64 位用户 data 联合体）。如果用户在 `epoll_pwait` 中传入 `maxevents = 128` 甚至更高，若在内核栈上分配该数组，将消耗超过 2 KiB 栈空间，明显压缩其他调用链余量，不能随用户规模无界增长。
 
 因此，BoarOS 延续严格的栈预算分级策略：
 - **微型栈缓冲（Fast-path）**：

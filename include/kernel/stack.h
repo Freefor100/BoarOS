@@ -5,7 +5,9 @@
 
 /* Chosen from compiler frame reports and measured production workloads.
  * This is a physical stack allocation; it has no unmapped guard page. */
-#define KERNEL_STACK_BYTES BOAROS_PAGE_SIZE
+#define KERNEL_STACK_ORDER 1U
+#define KERNEL_STACK_PAGES (UINT64_C(1) << KERNEL_STACK_ORDER)
+#define KERNEL_STACK_BYTES (BOAROS_PAGE_SIZE * KERNEL_STACK_PAGES)
 #define KERNEL_STACK_GUARD_BYTES 16U
 #define KERNEL_STACK_MINIMUM_RESERVE 1024U
 

@@ -18,13 +18,16 @@ extern unsigned char __boot_stack_top[];
 
 #define TEST_PHYSICAL_BASE UINT64_C(0x41000000)
 #define TEST_THREAD_COUNT 2U
-#define TEST_PAGE_COUNT (2U * TEST_THREAD_COUNT)
+#define TEST_TASK_PAGES (1U + KERNEL_STACK_PAGES)
+/* One buddy metadata page plus enough alignment slack for two tasks. */
+#define TEST_PAGE_COUNT (2U + TEST_THREAD_COUNT * TEST_TASK_PAGES)
 
 static unsigned char page_pool[BOAROS_PAGE_SIZE * TEST_PAGE_COUNT]
     __attribute__((aligned(BOAROS_PAGE_SIZE)));
 static unsigned long access_calls_before_failure;
 static unsigned long fail_access_count;
-static uint64_t fail_access_address = UINT64_MAX;
+static int fail_stack_access;
+static struct physical_page_allocator *test_page_allocator;
 static uintptr_t entry_sp[TEST_THREAD_COUNT];
 static void *entry_tp[TEST_THREAD_COUNT];
 static uintptr_t entry_order[TEST_THREAD_COUNT];
@@ -48,9 +51,14 @@ _Static_assert(RISCV_THREAD_STATE_SIZE ==
 
 static void *scheduler_page_access(uint64_t physical_address)
 {
-    if (physical_address == fail_access_address) {
-        fail_access_address = UINT64_MAX;
-        return 0;
+    if (fail_stack_access) {
+        uint32_t order;
+        if (physical_page_allocation_order(test_page_allocator, physical_address,
+                                            &order) == PHYSICAL_PAGE_STATUS_OK &&
+            order == KERNEL_STACK_ORDER) {
+            fail_stack_access = 0;
+            return 0;
+        }
     }
     if (fail_access_count != 0U) {
         if (access_calls_before_failure == 0U) {
@@ -285,24 +293,24 @@ static unsigned long run_create_cases(
     }
 
     /* A stack page that cannot be mapped must release both allocations. */
-    fail_access_address = TEST_PHYSICAL_BASE + BOAROS_PAGE_SIZE;
+    fail_stack_access = 1;
     failures += expect_status(KERNEL_SCHEDULER_STATUS_PAGE_ACCESS,
                               kernel_thread_create(thread_entry, 0));
-    if (fail_access_address != UINT64_MAX ||
+    if (fail_stack_access != 0 ||
         physical_page_available(allocator) != initial_available)
         failures++;
 
     /* One free page cannot satisfy metadata plus its independent stack.
      * A failed creation must return that first allocation immediately. */
     uint64_t held[TEST_PAGE_COUNT - 1U];
-    for (unsigned i = 0U; i < TEST_PAGE_COUNT - 1U; i++) {
+    for (unsigned i = 0U; i < initial_available - 1U; i++) {
         if (physical_page_allocate(allocator, &held[i]) !=
             PHYSICAL_PAGE_STATUS_OK) return failures + 1U;
     }
     failures += expect_status(KERNEL_SCHEDULER_STATUS_NO_MEMORY,
                               kernel_thread_create(thread_entry, 0));
     if (physical_page_available(allocator) != 1U) failures++;
-    for (unsigned i = 0U; i < TEST_PAGE_COUNT - 1U; i++)
+    for (unsigned i = 0U; i < initial_available - 1U; i++)
         (void)physical_page_release(allocator, held[i]);
 
     failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
@@ -311,12 +319,14 @@ static unsigned long run_create_cases(
     failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
                               kernel_thread_create(thread_entry,
                                                    (void *)(uintptr_t)2U));
-    if (physical_page_available(allocator) != 0U) {
+    if (physical_page_available(allocator) !=
+        initial_available - TEST_THREAD_COUNT * TEST_TASK_PAGES) {
         failures++;
     }
     failures += expect_status(KERNEL_SCHEDULER_STATUS_NO_MEMORY,
                               kernel_thread_create(thread_entry, 0));
-    if (physical_page_available(allocator) != 0U) {
+    if (physical_page_available(allocator) !=
+        initial_available - TEST_THREAD_COUNT * TEST_TASK_PAGES) {
         failures++;
     }
 
@@ -344,7 +354,7 @@ static unsigned long run_create_cases(
     if (completion.kind != KERNEL_THREAD_KIND_KERNEL ||
         completion.reason != KERNEL_THREAD_EXIT_RETURNED ||
         completion.status != 0U || completion.detail != 0U ||
-        physical_page_available(allocator) != initial_available - 2U) {
+        physical_page_available(allocator) != initial_available - TEST_TASK_PAGES) {
         failures++;
     }
 
@@ -542,7 +552,7 @@ static unsigned long run_wait_cases(
 
     failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
                               kernel_thread_create(blocked_worker, 0));
-    if (physical_page_available(allocator) + 2U != initial_available) {
+    if (physical_page_available(allocator) + TEST_TASK_PAGES != initial_available) {
         failures++;
     }
     failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
@@ -799,16 +809,27 @@ static unsigned long stack_contract_failures;
 
 static void stack_contract_worker(void *argument)
 {
+    /* Exercise a 3 KiB live C frame plus ordinary scheduler calls.
+     * The stack contract still requires a full KiB of untouched reserve. */
+    volatile unsigned char workload[3072];
+    for (size_t i = 0U; i < sizeof(workload); i++) workload[i] = (unsigned char)i;
     struct kernel_task *task = kernel_task_current();
     uint64_t *canary = (uint64_t *)(task->stack_low - sizeof(uint64_t));
     uintptr_t old_status = riscv_interrupt_save();
     uint64_t saved = *canary;
+    uint32_t order;
+    if (physical_page_allocation_order(test_page_allocator,
+            task->stack_physical_address, &order) != PHYSICAL_PAGE_STATUS_OK ||
+        order != KERNEL_STACK_ORDER ||
+        (task->stack_physical_address & (KERNEL_STACK_BYTES - 1U)) != 0U)
+        stack_contract_failures++;
     (void)argument;
     *canary ^= 1U;
     stack_contract_failures += expect_status(
         KERNEL_SCHEDULER_STATUS_STACK_CORRUPT,
         kernel_scheduler_yield_current());
     *canary = saved;
+    if (workload[sizeof(workload) - 1U] != 255U) stack_contract_failures++;
     riscv_interrupt_restore(old_status);
 }
 
@@ -859,7 +880,7 @@ void kernel_main(unsigned long hart_id, const void *dtb)
     struct boot_memory_layout layout;
     struct physical_page_allocator allocator;
     enum physical_page_status page_status;
-    unsigned long failures;
+    unsigned long failures = 0U;
 
     (void)hart_id;
     (void)dtb;
@@ -874,7 +895,14 @@ void kernel_main(unsigned long hart_id, const void *dtb)
             scheduler_page_access);
     }
 
-    failures = page_status != PHYSICAL_PAGE_STATUS_OK;
+    if (page_status == PHYSICAL_PAGE_STATUS_OK) {
+        failures += expect_status(KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT,
+            kernel_scheduler_init(&allocator, (uintptr_t)__boot_stack_bottom,
+                                   (uintptr_t)__boot_stack_top));
+        page_status = physical_page_allocator_finalize(&allocator);
+    }
+    test_page_allocator = &allocator;
+    failures += page_status != PHYSICAL_PAGE_STATUS_OK;
     failures += run_pid_cases();
     failures += run_preinit_cases();
     failures += run_init_cases(&allocator);

@@ -41,7 +41,7 @@ finalized 后，`physical_page_allocate_order(order)` 分配 `2^order` 个物理
 匹配。wrong-order、allocated tail、internal、越界、非对齐地址和已经释放的 head/tail
 都是分配器不变量错误，直接触发 fatal trap；不会把释放失败变成可重试状态。现有
 `physical_page_allocate/release` 签名保持不变，在 finalized 模式委托给 order 0，因此
-Sv39、MM 和 scheduler 不需要识别分配器模式。分配耗尽仍返回 `EMPTY`，分配调用不会
+Sv39 和 MM 的单页接口不需要识别分配器模式；scheduler 初始化要求 finalized allocator，为独立内核栈取得 order-1 连续页。分配耗尽仍返回 `EMPTY`，分配调用不会
 修改输出或 `available_pages`。
 
 finalized 的 order-0 页可用 `physical_page_acquire()` 增加 32 位引用，
@@ -83,8 +83,7 @@ resolve 能精确判定所有权，分配或释放 order N 块还会更新本次
 显式 order API 只对 finalized 分配器开放，bootstrap 调用返回 `STATE`。
 
 RISC-V 启动路径先以未绑定状态顺序分配最终页表页；高半区和最终 Sv39 根激活后才
-绑定 `direct_map_page_access` 并立即 finalize，scheduler 及其后的所有消费者因此只
-看到 buddy order-0 行为。独立过渡页表使用内核镜像内的静态页池，不属于正式
+绑定 `direct_map_page_access` 并立即 finalize，后续消费者使用 buddy：单页接口为 order-0，scheduler 的 8 KiB 栈为 order-1 连续分配。独立过渡页表使用内核镜像内的静态页池，不属于正式
 分配器。
 
 当前 metadata 必须来自一个从未发放且足够大的连续 range tail；总空闲页足够但被

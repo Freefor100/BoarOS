@@ -52,7 +52,7 @@ RISC-V 把 instruction、load、store/AMO page fault 分成 cause 12、13、15�
 
 基础内核按 RV64IMAC 构建，因此整数入口不保存 F/V 状态；用户 F/D 状态由独立的 272 字节 per-task image 依据 `sstatus.FS` 按需保存恢复。这样不会把 FP 或未来更大的向量上下文塞进每次基础 trap。当前只实现 F/D，V 扩展仍需要独立的 owner、异常和调度协议。
 
-S-mode trap 直接在当前内核栈建立 Frame；U-mode trap 先从 current 取得可信内核栈，再建立相同布局的 Frame。两种路径都继续消耗所属任务内核栈的剩余空间；当前 boot idle 和普通内核/用户任务都使用 4 KiB 内核栈，没有 guard page 或溢出恢复。是否再设置 per-hart IRQ 栈应根据嵌套、中断负载和栈高水位决定。Trap Frame 与 scheduler switch context 的分工见[内核线程与抢占调度学习总结](kernel-scheduling.md)。
+S-mode trap 直接在当前内核栈建立 Frame；U-mode trap 先从 current 取得可信内核栈，再建立相同布局的 Frame。两种路径都继续消耗所属任务内核栈的剩余空间；当前 boot idle 使用 16 KiB 静态栈，普通内核/用户任务使用独立 8 KiB 连续物理栈，没有 guard page 或溢出恢复。是否再设置 per-hart IRQ 栈应根据嵌套、中断负载和栈高水位决定。Trap Frame 与 scheduler switch context 的分工见[内核线程与抢占调度学习总结](kernel-scheduling.md)。
 
 ## `sscratch` 与 U-mode 换栈
 

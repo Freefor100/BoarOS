@@ -31,8 +31,11 @@ struct kernel_scheduler scheduler;
 
 _Static_assert(sizeof(struct kernel_task) <= BOAROS_PAGE_SIZE,
                "kernel thread metadata exceeds its owned page");
-_Static_assert(KERNEL_STACK_BYTES == BOAROS_PAGE_SIZE,
-               "larger task stacks require a matching contiguous-page owner");
+_Static_assert(KERNEL_STACK_ORDER <= PHYSICAL_PAGE_MAX_ORDER &&
+                   BOAROS_PAGE_SHIFT + KERNEL_STACK_ORDER < 64U,
+               "kernel stack order must fit the physical allocator");
+_Static_assert(KERNEL_STACK_BYTES == (BOAROS_PAGE_SIZE << KERNEL_STACK_ORDER),
+               "kernel stack size must match its contiguous-page owner");
 _Static_assert(KERNEL_STACK_BYTES >= KERNEL_STACK_GUARD_BYTES +
                    RISCV_TRAP_FRAME_SIZE + KERNEL_STACK_MINIMUM_RESERVE,
                "kernel stack needs room for a trap frame and reserve");
@@ -106,7 +109,7 @@ static enum kernel_scheduler_status validate_thread(
                    KERNEL_STACK_GUARD_BYTES;
     if (thread->stack_low != expected_low ||
         thread->stack_physical_address == KERNEL_THREAD_NO_PAGE ||
-        (thread->stack_physical_address & BOAROS_PAGE_MASK) != 0U ||
+        (thread->stack_physical_address & (KERNEL_STACK_BYTES - 1U)) != 0U ||
         thread->stack_physical_address == thread->physical_address ||
         thread->stack_high < KERNEL_STACK_BYTES ||
         (thread->stack_high & BOAROS_PAGE_MASK) != 0U ||
@@ -444,7 +447,8 @@ enum kernel_scheduler_status allocate_task_storage(struct kernel_task **task)
     thread = metadata;
     thread->physical_address = metadata_address;
     thread->stack_physical_address = KERNEL_THREAD_NO_PAGE;
-    status = physical_page_allocate(scheduler.allocator, &stack_address);
+    status = physical_page_allocate_order(scheduler.allocator,
+                                          KERNEL_STACK_ORDER, &stack_address);
     if (status != PHYSICAL_PAGE_STATUS_OK)
         return release_after_create_failure(metadata_address,
             status == PHYSICAL_PAGE_STATUS_EMPTY
@@ -452,7 +456,8 @@ enum kernel_scheduler_status allocate_task_storage(struct kernel_task **task)
                 : KERNEL_SCHEDULER_STATUS_INVALID_STATE);
     status = physical_page_resolve(scheduler.allocator, stack_address, &stack);
     if (status != PHYSICAL_PAGE_STATUS_OK) {
-        (void)physical_page_release(scheduler.allocator, stack_address);
+        (void)physical_page_release_order(scheduler.allocator, stack_address,
+                                          KERNEL_STACK_ORDER);
         return release_after_create_failure(metadata_address,
                                              KERNEL_SCHEDULER_STATUS_PAGE_ACCESS);
     }
@@ -482,7 +487,7 @@ enum kernel_scheduler_status release_task_stack(struct kernel_task *thread)
                        thread->arch.kernel_sp == 0U && thread->context.sp == 0U
                    ? KERNEL_SCHEDULER_STATUS_OK
                    : KERNEL_SCHEDULER_STATUS_INVALID_STATE;
-    if ((thread->stack_physical_address & BOAROS_PAGE_MASK) != 0U ||
+    if ((thread->stack_physical_address & (KERNEL_STACK_BYTES - 1U)) != 0U ||
         thread->stack_physical_address == thread->physical_address ||
         thread->stack_high < KERNEL_STACK_BYTES ||
         (thread->stack_high & BOAROS_PAGE_MASK) != 0U ||
@@ -502,8 +507,9 @@ enum kernel_scheduler_status release_task_stack(struct kernel_task *thread)
         scheduler.stack_statistics.minimum_free_bytes = free_bytes;
     if (used_bytes > scheduler.stack_statistics.maximum_used_bytes)
         scheduler.stack_statistics.maximum_used_bytes = used_bytes;
-    (void)physical_page_release(scheduler.allocator,
-                                thread->stack_physical_address);
+    (void)physical_page_release_order(scheduler.allocator,
+                                      thread->stack_physical_address,
+                                      KERNEL_STACK_ORDER);
     thread->stack_physical_address = KERNEL_THREAD_NO_PAGE;
     thread->stack_low = 0U;
     thread->stack_high = 0U;
@@ -545,6 +551,7 @@ enum kernel_scheduler_status kernel_scheduler_init(
         (idle_stack_low & (uintptr_t)15U) != 0U ||
         (idle_stack_high & (uintptr_t)15U) != 0U ||
         stack_pointer < idle_stack_low || stack_pointer >= idle_stack_high ||
+        !physical_page_allocator_is_finalized(allocator) ||
         physical_page_total(allocator) == 0U ||
         physical_page_available(allocator) > physical_page_total(allocator)) {
         return KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;

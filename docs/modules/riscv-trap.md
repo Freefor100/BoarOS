@@ -53,7 +53,7 @@ dispatcher 返回后，汇编总是要求 Frame 中 `sstatus.SIE=0`，避免在�
 - `stvec` 使用 Direct 模式，所有 S-mode trap 进入同一入口；启动和页表切换阶段保持 `sie=0` 与全局 SIE 关闭，最终地址空间稳定后只开启 STIE 和全局 SIE。
 - `sscratch` 在内核执行期间固定为零，用户执行期间保存 current thread。入口先用 `csrrw` 与用户 `tp` 交换，从可信线程前缀取得 `kernel_sp`；保存用户 `tp/sp` 后立即把 `sscratch` 清零，再进入 C。
 - 保存现场和 C dispatcher 期间不重新打开 SIE，不支持嵌套异步中断。同步异常可以再次进入当前栈，但 handler、栈或诊断路径自身故障后的递归失败仍没有独立恢复保证。
-- boot idle 使用 4 KiB 静态启动栈，普通内核线程各使用私有 4 KiB 单页栈；没有独立 Trap 栈、guard page、per-hart IRQ 栈或溢出恢复。
+- boot idle 使用 16 KiB 静态启动栈，普通内核/用户任务各使用独立 8 KiB 连续物理栈；没有独立 Trap 栈、guard page、per-hart IRQ 栈或溢出恢复。
 - 当前已处理静态 timer、U ecall、匿名 demand-zero、file-private/COW fault、标准 signal delivery/handler/sigreturn 和用户同步故障终止；没有 IPI、外部中断控制器、V 向量上下文或嵌套异步中断。不可解析的用户故障仍直接终止任务。
 
 ## 验证入口
