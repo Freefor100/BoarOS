@@ -7,6 +7,12 @@
 
 struct kernel_task;
 
+struct kernel_signal_wait_info {
+    uint32_t signal;
+    uint32_t sender;
+    int32_t code;
+};
+
 #define KERNEL_SIGNAL_COUNT 64U
 #define KERNEL_SIGNAL_DFL UINT64_C(0)
 #define KERNEL_SIGNAL_IGN UINT64_C(1)
@@ -155,6 +161,16 @@ enum kernel_signal_status kernel_signal_update_blocked(
 enum kernel_signal_status kernel_signal_get_pending(
     const struct kernel_task *task,
     uint64_t *pending);
+int kernel_signal_has_pending(const struct kernel_task *task);
+int kernel_signal_termination_requested(const struct kernel_task *task);
+
+/* A synchronous standard-signal wait is owned by the current task until
+ * end; take removes one matching pending signal before normal delivery. */
+enum kernel_signal_status kernel_signal_wait_begin(struct kernel_task *task,
+                                                   uint64_t mask);
+enum kernel_signal_status kernel_signal_wait_take(
+    struct kernel_task *task, struct kernel_signal_wait_info *info);
+void kernel_signal_wait_end(struct kernel_task *task);
 
 /* execve resets installed handlers to DFL, retaining IGN and pending. */
 void kernel_signal_reset_on_exec(struct kernel_task *task);

@@ -19,7 +19,7 @@ SIGCHLD 的默认忽略不同于显式 SIG_IGN：默认仍保留 zombie 供 wait
 
 ## 输入、信号帧与恢复
 
-rt_sigaction/rt_sigprocmask 先完整复制输入，再提交状态，最后输出旧状态，允许输入输出地址别名。输入 EFAULT 不提交；输出 EFAULT 不回滚已经提交的有效动作。复制 helper 返回真实 uaccess 状态，handler 映射 errno。rt_sigpending 返回组与线程 pending 的并集再与 blocked 取交集。
+rt_sigaction/rt_sigprocmask 先完整复制输入，再提交状态，最后输出旧状态，允许输入输出地址别名。输入 EFAULT 不提交；输出 EFAULT 不回滚已经提交的有效动作。复制 helper 返回真实 uaccess 状态，handler 映射 errno。rt_sigpending 返回组与线程 pending 的并集再与 blocked 取交集。`rt_sigtimedwait` 校验 8 字节 mask 和相对 timespec，在当前线程登记临时等待集合；匹配的标准信号可以唤醒线程，但只由等待 syscall 从线程或组 pending 中取走，不经普通 handler。返回 `siginfo` 的 signo、SI_USER/SI_TKILL、发送者进程 ID 和 uid；`siginfo` 输出 EFAULT 发生在取走信号之后。超时返回 EAGAIN，其他可递送信号打断返回 EINTR。实时信号位明确返回 ENOTSUP，因为现有位图不能保存其队列语义。
 
 RISC-V frame 共 1088 字节，16 字节对齐：128 字节 siginfo 加 960 字节 ucontext。ucontext 内 sigmask 偏移 40、mcontext 偏移 176；mcontext 包含 32 个整数寄存器和按 Q 扩展容量保留的 528 字节、16 字节对齐 FP union。当前只填写 D 寄存器与 32 位 fcsr，其余扩展存储清零。内核静态断言和真实 musl ucontext 共同核对布局，不能仅用同一套手写偏移自证正确。
 
@@ -39,6 +39,6 @@ sigsuspend 在等待和选择 handler 时保留临时 mask，把原 mask 写入�
 
 当前 RV64 `-O2` 静态栈检查中，构帧函数使用 896 字节、sigreturn 使用 864 字节；构帧复用前缀/mcontext 存储，不在内核栈放置整份 1088 字节 frame。加入 tagged restart state 后任务控制块为 1552 字节；4 KiB 页扣除控制块、canary/16-byte 对齐和 288 字节 Trap Frame 后剩余 2240 字节。真实静态用户态曾在 getdents→ext4→heap 释放调用链触发 canary；getdents 改为直接填充输出记录中的文件名，去掉额外 256 字节副本，其静态栈降至 416 字节，组合回归通过。单函数统计和一次回归均不是完整栈界证明，深层缺页和失败清理链仍须沿调用链审查。
 
-`make test-signal-riscv` 覆盖 syscall 复制失败、状态提交与 errno；`make test-userland-riscv` 以真实静态 musl 验证 handler/sigreturn、libc ucontext、sigsuspend、睡眠 EINTR、vfork、SIGCHLD 回收及 pipe 等待。架构和调度边界由 `make test-riscv` 回归。
+`make test-signal-riscv` 覆盖 syscall 复制失败、状态提交与 errno；`make test-diff-abi-riscv` 以同一 RISC-V ELF 对照等待信号的参数、真实超时、线程/进程定向来源、阻塞送达、siginfo EFAULT 消费和其他 handler 打断；`make test-userland-riscv` 以真实静态 musl 验证 handler/sigreturn、libc ucontext、sigsuspend、睡眠 EINTR、vfork、SIGCHLD 回收及 pipe 等待。架构和调度边界由 `make test-riscv` 回归。
 
 当前为单 hart 线程组和位图 pending；尚无实时信号队列、sigaltstack、signalfd、完整会话/控制终端语义或 SMP 同步。libc 内部信号可走线程定向路径，但不据此宣称完整实时信号排队。siginfo 当前主要提供 SI_USER 信号与 sender，不宣称完整故障 siginfo。组 stop/continue 与致命取消不能直接释放睡眠中的任务栈；不可中断的 vfork 有独立取消握手。

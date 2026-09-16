@@ -337,6 +337,8 @@ enum kernel_scheduler_status process_group_exec_current(void)
         task->group_pending = leader->group_pending;
         for (unsigned i = 0U; i < KERNEL_SIGNAL_COUNT; i++)
             task->group_sender[i] = leader->group_sender[i];
+        for (unsigned i = 0U; i < KERNEL_SIGNAL_COUNT; i++)
+            task->group_signal_code[i] = leader->group_signal_code[i];
         task->publish_completion = leader->publish_completion;
         if (scheduler.init_task == leader) scheduler.init_task = task;
         leader->parent = 0;

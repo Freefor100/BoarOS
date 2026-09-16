@@ -63,6 +63,7 @@
 #define LINUX_SYSCALL_RT_SIGACTION 134U
 #define LINUX_SYSCALL_RT_SIGPROCMASK 135U
 #define LINUX_SYSCALL_RT_SIGPENDING 136U
+#define LINUX_SYSCALL_RT_SIGTIMEDWAIT 137U
 #define LINUX_SYSCALL_RT_SIGRETURN 139U
 #define LINUX_SYSCALL_RESTART_SYSCALL 128U
 #define LINUX_EXIT_STATUS_MASK UINT64_C(0xff)
@@ -318,6 +319,11 @@ enum kernel_syscall_status kernel_syscall_dispatch(
         if (syscall_handle_rt_sigpending(caller,
                                  request,
                                  &decoded) !=
+            KERNEL_SYSCALL_STATUS_OK) {
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+        }
+    } else if (request->number == LINUX_SYSCALL_RT_SIGTIMEDWAIT) {
+        if (syscall_handle_rt_sigtimedwait(caller, request, &decoded) !=
             KERNEL_SYSCALL_STATUS_OK) {
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
         }

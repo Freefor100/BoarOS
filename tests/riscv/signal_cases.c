@@ -205,6 +205,16 @@ enum kernel_task_status __wrap_kernel_task_tid(
     return KERNEL_TASK_STATUS_OK;
 }
 
+enum kernel_task_status __wrap_kernel_task_tgid(
+    const struct kernel_task *task,
+    kernel_pid_t *tgid)
+{
+    if (task != (const struct kernel_task *)(uintptr_t)1U || tgid == 0)
+        return KERNEL_TASK_STATUS_INVALID_ARGUMENT;
+    *tgid = 5;
+    return KERNEL_TASK_STATUS_OK;
+}
+
 static unsigned long result_changed(const struct kernel_syscall_result *result,
                                     enum kernel_syscall_action action,
                                     int64_t value)
@@ -332,7 +342,7 @@ static unsigned long run_send_cases(struct kernel_task *caller)
     if (kernel_syscall_dispatch(caller, &request, &result) !=
             KERNEL_SYSCALL_STATUS_OK ||
         result_changed(&result, KERNEL_SYSCALL_ACTION_RETURN, 0) ||
-        sent_pid != 42 || sent_sig != 10U || sent_sender != 7) {
+        sent_pid != 42 || sent_sig != 10U || sent_sender != 5) {
         failures++;
     }
     sent_count = 0U;

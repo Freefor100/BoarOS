@@ -687,6 +687,7 @@ $(SIGNAL_TEST_KERNEL_RV): $(SIGNAL_TEST_OBJECTS) arch/riscv/linker.ld
 		-Wl,--wrap=kernel_signal_send_thread \
 		-Wl,--wrap=kernel_task_mm_borrow_mutable \
 		-Wl,--wrap=kernel_task_tid \
+		-Wl,--wrap=kernel_task_tgid \
 		-Wl,-Map,$(BUILD_DIR)/tests/kernel-signal-rv.map \
 		-o $@ $(SIGNAL_TEST_OBJECTS)
 

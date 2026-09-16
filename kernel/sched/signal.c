@@ -350,8 +350,10 @@ enum kernel_signal_status kernel_signal_fork(
     }
     child->signal_pending = 0U;
     child->signal_blocked = parent->signal_blocked;
+    child->signal_wait_mask = 0U;
     child->signal_table_address = 0U;
     memset(child->signal_sender, 0, sizeof(child->signal_sender));
+    memset(child->signal_code, 0, sizeof(child->signal_code));
     child->stop_notified = 0U;
     child->continue_notified = 0U;
     parent_table = signal_table_of(parent);
@@ -407,7 +409,9 @@ enum kernel_signal_status kernel_signal_share(
     child->signal_table_address = parent->signal_table_address;
     child->signal_blocked = parent->signal_blocked;
     child->signal_pending = 0U;
+    child->signal_wait_mask = 0U;
     memset(child->signal_sender, 0, sizeof(child->signal_sender));
+    memset(child->signal_code, 0, sizeof(child->signal_code));
     return KERNEL_SIGNAL_STATUS_OK;
 }
 
@@ -418,7 +422,12 @@ int kernel_signal_has_pending(const struct kernel_task *task)
     if (signal_group_leader(task) != 0) {
         pending |= task->group_leader->group_pending;
     }
-    return (pending & ~task->signal_blocked) != 0U;
+    return (pending & (~task->signal_blocked | task->signal_wait_mask)) != 0U;
+}
+
+int kernel_signal_termination_requested(const struct kernel_task *task)
+{
+    return task != 0 && task->terminate_requested != 0U;
 }
 
 enum kernel_signal_status kernel_signal_get_blocked(
@@ -476,6 +485,52 @@ enum kernel_signal_status kernel_signal_get_pending(
     return KERNEL_SIGNAL_STATUS_OK;
 }
 
+enum kernel_signal_status kernel_signal_wait_begin(struct kernel_task *task,
+                                                   uint64_t mask)
+{
+    if (task != scheduler.current || !signal_dispatchable(task) ||
+        task->signal_wait_mask != 0U) return KERNEL_SIGNAL_STATUS_INVALID_ARGUMENT;
+    task->signal_wait_mask = mask & ~SIGNAL_MASK_KILL_STOP;
+    return KERNEL_SIGNAL_STATUS_OK;
+}
+
+enum kernel_signal_status kernel_signal_wait_take(
+    struct kernel_task *task, struct kernel_signal_wait_info *info)
+{
+    struct kernel_task *leader;
+    uint64_t matching;
+    uint32_t sig;
+    int shared = 0;
+
+    if (task != scheduler.current || !signal_dispatchable(task) || info == 0)
+        return KERNEL_SIGNAL_STATUS_INVALID_ARGUMENT;
+    memset(info, 0, sizeof(*info));
+    matching = task->signal_pending & task->signal_wait_mask;
+    leader = signal_group_leader(task);
+    if (matching == 0U && leader != 0) {
+        matching = leader->group_pending & task->signal_wait_mask;
+        shared = matching != 0U;
+    }
+    if (matching == 0U) return KERNEL_SIGNAL_STATUS_OK;
+    sig = signal_first_set(matching);
+    if (shared) {
+        leader->group_pending &= ~signal_mask(sig);
+        info->sender = leader->group_sender[sig - 1U];
+        info->code = leader->group_signal_code[sig - 1U];
+    } else {
+        task->signal_pending &= ~signal_mask(sig);
+        info->sender = task->signal_sender[sig - 1U];
+        info->code = task->signal_code[sig - 1U];
+    }
+    info->signal = sig;
+    return KERNEL_SIGNAL_STATUS_OK;
+}
+
+void kernel_signal_wait_end(struct kernel_task *task)
+{
+    if (task != 0) task->signal_wait_mask = 0U;
+}
+
 void kernel_signal_reset_on_exec(struct kernel_task *task)
 {
     struct kernel_signal_table *table = signal_table_of(task);
@@ -492,6 +547,7 @@ void kernel_signal_reset_on_exec(struct kernel_task *task)
         }
     }
     task->signal_restore_mask = 0U;
+    task->signal_wait_mask = 0U;
     kernel_signal_clear_syscall_restart(task);
 }
 
@@ -627,7 +683,8 @@ static int signal_wants_signal(const struct kernel_task *task,
                                uint32_t sig)
 {
     if (!signal_dispatchable(task) || task->terminate_requested != 0U ||
-        (task->signal_blocked & signal_mask(sig)) != 0U) {
+        ((task->signal_blocked & signal_mask(sig)) != 0U &&
+         (task->signal_wait_mask & signal_mask(sig)) == 0U)) {
         return 0;
     }
     return task->state != KERNEL_THREAD_STATE_STOPPED ||
@@ -661,6 +718,8 @@ static int signal_ignored_unblocked(const struct kernel_task *target,
 {
     const struct kernel_signal_action *entry;
 
+    if (target != 0 &&
+        (target->signal_wait_mask & signal_mask(sig)) != 0U) return 0;
     if (target == 0 ||
         (target->signal_blocked & signal_mask(sig)) != 0U) {
         return 0;
@@ -714,6 +773,8 @@ static enum kernel_signal_status signal_send_one(
     }
     *pending |= bit;
     senders[sig - 1U] = (uint32_t)sender_tid;
+    if (process_directed) leader->group_signal_code[sig - 1U] = 0;
+    else target->signal_code[sig - 1U] = -6;
     if (wake_target != 0 && signal_wants_signal(wake_target, sig) &&
         kernel_scheduler_wake_signal(wake_target) !=
             KERNEL_SCHEDULER_STATUS_OK) {

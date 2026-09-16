@@ -158,3 +158,15 @@ robust mutex、socket、statvfs、utimensat 等缺失；`stat` 与 `syscall_sign
 20 次固定内核/fixture 重复中均完成资源清理。诊断重复日志保存在
 `build/root-finish-repeat/` 与 `build/root-finish-fixed-repeat/`，原异常运行仍不计入通过数；
 这不是 libc syscall 的直接失败。
+
+## 同步信号等待后的原包装脚本
+
+`rt_sigtimedwait` 接入后，用未修改的原静态/动态 libc 脚本分别重跑
+`libc.official.static` 和 `libc.official.dynamic`，证据在
+`build/signal-wait-wrapper/`。两侧均完成脚本的 107/110 条逐例记录，BoarOS
+不再出现 `sigtimedwait: Function not implemented`；两份脚本各有九条上游断言失败：
+`daemon_failure`、`pthread_robust_detach`、`rlimit_open_files`、`socket`、
+`sscanf_long`、`stat`、`statvfs`、`syscall_sign_extend`、`utime`。
+包装脚本内的 `pthread_cancel_points` 此次通过，但先前独立 entry 的失败不能据此
+自动关闭；脚本运行顺序和测试上下文不同，需单独复跑。九条失败仍按各自首个 syscall
+或设备依赖调查，不能归因于同步信号等待。

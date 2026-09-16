@@ -126,16 +126,19 @@ struct kernel_task {
     struct kernel_wait_queue group_wait_queue;
     uint64_t group_pending;
     uint32_t group_sender[KERNEL_SIGNAL_COUNT];
+    int8_t group_signal_code[KERNEL_SIGNAL_COUNT];
     struct kernel_wait_node default_wait_node;
     struct kernel_task *blocked_previous;
     uint64_t futex_mm;
     uint64_t futex_address;
     uint64_t signal_pending;
     uint64_t signal_blocked;
+    uint64_t signal_wait_mask;
     uint64_t signal_saved_mask;
     uint32_t signal_restore_mask;
     uint64_t signal_table_address;
     uint32_t signal_sender[KERNEL_SIGNAL_COUNT];
+    int8_t signal_code[KERNEL_SIGNAL_COUNT];
     uint32_t stop_notified;
     uint32_t continue_notified;
     struct kernel_thread_completion completion;
@@ -180,7 +183,6 @@ void process_group_request_exit(struct kernel_task *task,
                                 enum kernel_thread_exit_reason reason,
                                 uint64_t status, uint64_t detail);
 enum kernel_scheduler_status process_group_exec_current(void);
-int kernel_signal_has_pending(const struct kernel_task *task);
 
 void clear_page(void *pointer);
 enum kernel_scheduler_status allocate_task_storage(struct kernel_task **task);

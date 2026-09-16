@@ -152,3 +152,14 @@ link.read-via-parent
 link.unlink-via-parent
 link.parent-child-removed
 link.readlink-regular
+signal.wait-size
+signal.wait-mask-fault
+signal.wait-timeout-invalid
+signal.wait-empty
+signal.wait-timed-out
+signal.wait-thread-pending
+signal.wait-group-pending
+signal.wait-child-delivery
+signal.wait-info-fault
+signal.wait-info-consumed
+signal.wait-interrupted

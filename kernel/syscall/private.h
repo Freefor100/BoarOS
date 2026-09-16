@@ -161,6 +161,11 @@ enum kernel_syscall_status syscall_handle_rt_sigpending(
     const struct kernel_syscall_request *request,
     struct kernel_syscall_result *decoded);
 
+enum kernel_syscall_status syscall_handle_rt_sigtimedwait(
+    struct kernel_task *caller,
+    const struct kernel_syscall_request *request,
+    struct kernel_syscall_result *decoded);
+
 enum kernel_syscall_status syscall_handle_rt_sigsuspend(
     struct kernel_task *caller,
     const struct kernel_syscall_request *request,
