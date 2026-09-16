@@ -55,6 +55,8 @@ static uint64_t test_satp;
 #ifdef FILES_PARTIAL_WRITE_TEST
 static int inject_partial_write_error;
 static int inject_truncate_error;
+static int inject_usercopy_write_mode;
+static unsigned int usercopy_write_skip;
 #endif
 
 enum kernel_heap_status __real_kernel_heap_release(
@@ -95,6 +97,19 @@ int __wrap_ext4_fwrite(ext4_file *file,
     size_t committed = 0U;
     int result;
 
+    if (inject_usercopy_write_mode != 0) {
+        if (usercopy_write_skip != 0U) {
+            usercopy_write_skip--;
+        } else {
+            int mode = inject_usercopy_write_mode;
+            size_t limit = mode == 3 ? 0U : (size < 5U ? size : 5U);
+
+            inject_usercopy_write_mode = 0;
+            result = __real_ext4_fwrite(file, buffer, limit, &committed);
+            *bytes_written = committed;
+            return result == EOK && mode != 1 ? EIO : result;
+        }
+    }
     if (!inject_partial_write_error) {
         return __real_ext4_fwrite(file, buffer, size, bytes_written);
     }
@@ -2752,6 +2767,84 @@ static void run_files_test(const void *dtb)
 }
 
 #ifdef FILES_PARTIAL_WRITE_TEST
+/* The writable mapping ends at boundary; the next page has no mapping.
+ * A readable final iovec detects accidentally continuing after the fault. */
+static void check_usercopy_write(struct kernel_files *files,
+                                 struct kernel_mm *mm, size_t prefix,
+                                 int vector, int append, size_t prior,
+                                 int backend_mode)
+{
+    const uint64_t boundary = TEST_USER_BUFFER + 3U * BOAROS_PAGE_SIZE;
+    struct kernel_uaccess_iovec vectors[3];
+    struct kernel_open_file_description *description =
+        kernel_files_lookup_description(files, 0);
+    struct kernel_vfs_stat stat;
+    struct kernel_files_statistics before, after;
+    unsigned char payload[80], expected[90], observed[90];
+    size_t accepted = backend_mode == 3 ? 0U :
+        backend_mode != 0 && prefix > 5U ? 5U : prefix;
+    size_t progress = prior + accepted;
+    size_t start = append ? 3U : 1U;
+    size_t end = progress != 0U ? start + progress : 1U;
+    size_t size = progress != 0U && start + progress > 3U ?
+        start + progress : 3U;
+    int64_t result;
+    int64_t wanted = progress != 0U ? (int64_t)progress :
+        backend_mode == 3 && prefix != 0U ? -KERNEL_EIO : -KERNEL_EFAULT;
+
+    memset(payload, 'P', sizeof(payload));
+    memset(expected, 'P', sizeof(expected));
+    memcpy(expected, "old", 3U);
+    if (progress != 0U) {
+        memset(expected + start, 'P', progress);
+    }
+    if (kernel_files_fcntl(files, 0, KERNEL_FILES_F_SETFL, 0, &result) !=
+            KERNEL_FILES_STATUS_OK || result != 0 ||
+        kernel_files_ftruncate(files, 0, 0, &result) !=
+            KERNEL_FILES_STATUS_OK || result != 0 ||
+        kernel_files_lseek(files, 0, 0, KERNEL_FILES_SEEK_SET, &result) !=
+            KERNEL_FILES_STATUS_OK || result != 0 ||
+        !write_user_bytes(mm, TEST_USER_BUFFER, "old", 3U) ||
+        kernel_files_write(files, mm, 0, TEST_USER_BUFFER, 3U, &result) !=
+            KERNEL_FILES_STATUS_OK || result != 3 ||
+        kernel_files_lseek(files, 0, 1, KERNEL_FILES_SEEK_SET, &result) !=
+            KERNEL_FILES_STATUS_OK || result != 1 ||
+        kernel_files_fcntl(files, 0, KERNEL_FILES_F_SETFL,
+                           append ? KERNEL_FILES_O_APPEND : 0, &result) !=
+            KERNEL_FILES_STATUS_OK || result != 0 ||
+        !write_user_bytes(mm, TEST_USER_BUFFER, payload, sizeof(payload)) ||
+        !write_user_bytes(mm, boundary - prefix, payload, prefix)) {
+        fail_files(320U, 0, result);
+    }
+    vectors[0] = (struct kernel_uaccess_iovec){TEST_USER_BUFFER, prior};
+    vectors[1] = (struct kernel_uaccess_iovec){boundary - prefix, prefix + 1U};
+    vectors[2] = (struct kernel_uaccess_iovec){TEST_USER_BUFFER, 3U};
+    if (!write_user_bytes(mm, TEST_USER_PATH, vectors, sizeof(vectors))) {
+        fail_files(321U, 1, 0);
+    }
+    kernel_files_get_statistics(files, &before);
+    inject_usercopy_write_mode = backend_mode;
+    usercopy_write_skip = prior != 0U ? 1U : 0U;
+    if ((vector ? kernel_files_writev(files, mm, 0, TEST_USER_PATH, 3U, &result)
+                : kernel_files_write(files, mm, 0, boundary - prefix,
+                                      prefix + 1U, &result)) !=
+            KERNEL_FILES_STATUS_OK || result != wanted) {
+        fail_files(322U + prefix, wanted, result);
+    }
+    inject_usercopy_write_mode = 0;
+    kernel_files_get_statistics(files, &after);
+    if (kernel_open_file_offset(description) != end ||
+        kernel_vfs_fstat(&description->file, &stat) != 0 || stat.size != size ||
+        after.bytes_written - before.bytes_written != progress ||
+        kernel_files_pread(files, mm, 0, TEST_USER_BUFFER, sizeof(observed),
+                           0, &result) != KERNEL_FILES_STATUS_OK ||
+        result != (int64_t)size ||
+        !read_user_bytes(mm, TEST_USER_BUFFER, observed, size) ||
+        memcmp(observed, expected, size) != 0) {
+        fail_files(390U, end, kernel_open_file_offset(description));
+    }
+}
+
 static void run_partial_write_test(const void *dtb)
 {
     static const char path[] = "/partial";
@@ -3028,6 +3121,21 @@ static void run_partial_write_test(const void *dtb)
                            1U, 2, &result) != KERNEL_FILES_STATUS_OK ||
         result != 0) {
         fail_files(313U, 2, result);
+    }
+
+    static const size_t prefixes[] = {0U, 1U, 32U, 63U, 64U, 65U};
+    for (size_t n = 0U; n < sizeof(prefixes) / sizeof(prefixes[0]); n++) {
+        for (int append = 0; append < 2; append++) {
+            check_usercopy_write(&files, &mm, prefixes[n], 0, append, 0U, 0);
+            check_usercopy_write(&files, &mm, prefixes[n], 1, append, 0U, 0);
+            check_usercopy_write(&files, &mm, prefixes[n], 1, append, 7U, 0);
+        }
+    }
+    for (int mode = 1; mode <= 3; mode++) {
+        for (int append = 0; append < 2; append++) {
+            check_usercopy_write(&files, &mm, 32U, 0, append, 0U, mode);
+            check_usercopy_write(&files, &mm, 32U, 1, append, 7U, mode);
+        }
     }
 
     use_test_satp = 0;

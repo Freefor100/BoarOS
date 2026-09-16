@@ -66,6 +66,7 @@ open file description 的 offset 只增加实际复制到用户空间的字节�
 - console 经 `kernel_console_putc` 逐字节输出并返回完整计数；用户 fault 与部分复制按前缀保持返回。console 的 `read` 阻塞等待真实 UART 输入。
 - pipe 的 `write/writev` 汇总后沿用 pipe 单次写空间、原子性、阻塞、EPIPE/SIGPIPE 和部分复制规则。
 - regular 文件写入通过 `kernel_vfs_pwrite()` 执行底层介质写入，并调用节点页缓存失效确保缓存一致性。若描述符设置了 `O_APPEND`，写入前通过 `kernel_vfs_append()` 原子解析当前 EOF 并写入，成功后将 OFD offset 更新至新文件末尾。未以写权限打开的描述符或目录描述符调用 write 返回 `-EBADF`。
+- regular 文件 usercopy 跨入不可读或未映射页时，仍把已复制的连续前缀交给 backend；返回值和 OFD offset 只计入实际写入量。零进度用户 fault 返回 `-EFAULT`；若提交此前缀的 backend 在零进度时返回错误，保留 backend errno。fault 一旦发生即结束整个请求，不继续后续 iovec；`STATE` 仍作为内核状态错误传播。该前缀提交原则对应固定 Linux `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 [`mm/filemap.c`](../../references/linux/mm/filemap.c) 中 `generic_perform_write()`：usercopy 的 copied 与 `write_end()` 实际接受量分开，位置只按后者推进。
 - backend 已提交正字节前缀后才报告错误时，`write/writev` 返回该前缀，OFD offset 只增加该正字节数；只有零进度才把 errno 返回用户态。VFS 在结果判定前同步 live inode/node/file size 并使旧页缓存失效，因此 `fstat`、后续读取和共享 node 的描述符不会观察到旧长度或旧内容。
 - `writev` 先快照完整用户 iovec 数组，校验长度和范围，再与 write 共用写入核心；`iovcnt` 上限 1024。
 
@@ -156,6 +157,8 @@ make test-userland-riscv
 make test-root-init-riscv
 make test-riscv
 ```
+
+`make test-files-partial-write-riscv` 覆盖跨入未映射页前可读 0、1、32、63、64、65 字节的普通写、append 和 writev（含已有进度及后续可读 iovec），核对返回值、offset、文件长度、内容和字节统计；真实 ext4 后端注入短写、带前缀错误与零进度错误，验证只提交实际写入量。`make test-userland-riscv` 以 `mmap/mprotect(PROT_NONE)` 对同组边界执行真实 musl 系统调用并核对内容和 metadata。
 
 聚焦测试在真实 QEMU legacy 与 modern VirtIO/ext4 上覆盖绝对/相对路径、错误 flags、目录与缺失文件、4096 字节路径上限、最低 fd 复用、表扩容、统一 fd 安装统计、epoll 满表原子性、`O_CLOEXEC/O_NONBLOCK`、缓存命中后的跨页读取、EOF、部分 fault、fork 后 fd 表独立与 OFD offset 共享，以及 VFS orphan/I/O owner。stat 回归核对 regular/directory 的真实 inode metadata、allocated blocks、fstat/newfstatat 共同字段和 unlink-but-open 的零链接计数。它还在关闭 fd 后通过 MM backing 继续缺页，反复固定地址映射同一 OFD 并检查来源释放只发生一次，验证父子各自持有一份来源引用。生产 exec/clone 链验证普通 fd 与 offset 跨映像和父子保持、CLOEXEC fd 不可见，PID 1 的 stdio 与跨 exec 的 console 描述符由串口标记验证，并由最终资源基线证明退出清理生效。`make test-userland-riscv` 用静态和动态 musl 程序作为 PID 1 运行 stdio、readdir、read/lseek/fstat、dup、signal、pipe、pthread、TLS 和 dlopen；其中写打开普通文件的真实 `read/pread` 及其 dup 均验证 `EBADF`，是真实 U-mode 外部测例的入口。
 

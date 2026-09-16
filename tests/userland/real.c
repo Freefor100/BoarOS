@@ -1485,6 +1485,87 @@ static int check_write_only_read_denied(int fd)
     return 0;
 }
 
+static int check_partial_usercopy_write(void)
+{
+    static const size_t prefixes[] = {0, 1, 32, 63, 64, 65};
+    unsigned char *mapping = mmap(0, 8192, PROT_READ | PROT_WRITE,
+                                  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    int fd = open("/partial-usercopy", O_CREAT | O_TRUNC | O_RDWR, 0600);
+    int failure = 0;
+
+    if (mapping == MAP_FAILED || fd < 0) {
+        failure = 1;
+        goto out;
+    }
+    memset(mapping, 'P', 4096);
+    if (mprotect(mapping + 4096, 4096, PROT_NONE) != 0) {
+        failure = 2;
+        goto out;
+    }
+    for (size_t n = 0; n < sizeof(prefixes) / sizeof(prefixes[0]); n++) {
+        for (int append = 0; append < 2; append++) {
+            for (int variant = 0; variant < 3; variant++) {
+                size_t prefix = prefixes[n];
+                size_t prior = variant == 2 ? 7 : 0;
+                size_t progress = prefix + prior;
+                size_t start = append ? 3 : 1;
+                size_t end = progress ? start + progress : 1;
+                size_t size = progress && start + progress > 3 ?
+                    start + progress : 3;
+                unsigned char expected[80], observed[80];
+                struct stat st;
+                struct iovec vectors[] = {
+                    {mapping, prior},
+                    {mapping + 4096 - prefix, prefix + 1},
+                    {mapping, 3},
+                };
+                ssize_t result;
+                int write_errno;
+
+                memset(expected, 'P', sizeof(expected));
+                memcpy(expected, "old", 3);
+                if (progress) {
+                    memset(expected + start, 'P', progress);
+                }
+                if (fcntl(fd, F_SETFL, 0) != 0 || ftruncate(fd, 0) != 0 ||
+                    lseek(fd, 0, SEEK_SET) != 0 || write(fd, "old", 3) != 3 ||
+                    lseek(fd, 1, SEEK_SET) != 1 ||
+                    fcntl(fd, F_SETFL, append ? O_APPEND : 0) != 0) {
+                    failure = 3;
+                    goto out;
+                }
+                errno = 0;
+                result = variant ? writev(fd, vectors, 3) :
+                    write(fd, mapping + 4096 - prefix, prefix + 1);
+                write_errno = errno;
+                if (result != (progress ? (ssize_t)progress : -1) ||
+                    (!progress && write_errno != EFAULT) ||
+                    lseek(fd, 0, SEEK_CUR) != (off_t)end ||
+                    fstat(fd, &st) != 0 || st.st_size != (off_t)size ||
+                    pread(fd, observed, sizeof(observed), 0) != (ssize_t)size ||
+                    memcmp(observed, expected, size) != 0) {
+                    fprintf(stderr, "partial usercopy prefix=%zu append=%d "
+                            "variant=%d result=%zd errno=%d\n",
+                            prefix, append, variant, result, write_errno);
+                    failure = 4;
+                    goto out;
+                }
+            }
+        }
+    }
+out:
+    if (fd >= 0 && close(fd) != 0 && failure == 0) {
+        failure = 5;
+    }
+    if (mapping != MAP_FAILED && munmap(mapping, 8192) != 0 && failure == 0) {
+        failure = 6;
+    }
+    if (unlink("/partial-usercopy") != 0 && failure == 0) {
+        failure = 7;
+    }
+    return failure;
+}
+
 static int check_filesystem_rw(void)
 {
     /* 1. File creation and exclusive open */
@@ -2405,6 +2486,12 @@ int main(int argc, char **argv)
         return 9;
     }
     close(fd);
+
+    int partial_err = check_partial_usercopy_write();
+    if (partial_err != 0) {
+        fprintf(stderr, "partial usercopy write failed: %d\n", partial_err);
+        return 69;
+    }
 
     int rw_err = check_filesystem_rw();
     if (rw_err != 0) {

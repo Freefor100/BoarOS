@@ -409,24 +409,29 @@ static enum kernel_files_status write_request(
                 status = kernel_copy_from_user(mm, staging,
                                                 iov[index].base + offset,
                                                 chunk, &copied);
-                if (status == KERNEL_UACCESS_STATUS_FAULT) {
+                if ((status != KERNEL_UACCESS_STATUS_OK &&
+                     status != KERNEL_UACCESS_STATUS_FAULT) ||
+                    copied > chunk ||
+                    (status == KERNEL_UACCESS_STATUS_OK && copied != chunk)) {
+                    return KERNEL_FILES_STATUS_STATE;
+                }
+                if (copied == 0U) {
                     if (total != 0U) {
                         files->record->statistics.write_failures++;
                     }
                     *linux_result = total != 0U ? (int64_t)total : -KERNEL_EFAULT;
                     return KERNEL_FILES_STATUS_OK;
                 }
-                if (status != KERNEL_UACCESS_STATUS_OK || copied != chunk) {
-                    return KERNEL_FILES_STATUS_STATE;
-                }
+                /* A user fault leaves a valid prefix in staging. Only the
+                 * backend's committed bytes belong to the file or offset. */
                 if (is_append) {
                     uint64_t new_offset = 0U;
                     vfs_result = kernel_vfs_append(&description->file,
                                                    staging,
-                                                   chunk,
+                                                   copied,
                                                    &new_offset,
                                                    &written);
-                    if (written > chunk) {
+                    if (written > copied) {
                         return KERNEL_FILES_STATUS_STATE;
                     }
                     if (written != 0U) {
@@ -437,9 +442,9 @@ static enum kernel_files_status write_request(
                     vfs_result = kernel_vfs_pwrite(&description->file,
                                                    file_offset,
                                                    staging,
-                                                   chunk,
+                                                   copied,
                                                    &written);
-                    if (written > chunk) {
+                    if (written > copied) {
                         return KERNEL_FILES_STATUS_STATE;
                     }
                     if (written != 0U) {
@@ -454,7 +459,14 @@ static enum kernel_files_status write_request(
                     *linux_result = total != 0U ? (int64_t)total : vfs_result;
                     return KERNEL_FILES_STATUS_OK;
                 }
-                if (written < chunk) {
+                if (status == KERNEL_UACCESS_STATUS_FAULT) {
+                    if (total != 0U) {
+                        files->record->statistics.write_failures++;
+                    }
+                    *linux_result = total != 0U ? (int64_t)total : -KERNEL_EFAULT;
+                    return KERNEL_FILES_STATUS_OK;
+                }
+                if (written < copied) {
                     *linux_result = (int64_t)total;
                     return KERNEL_FILES_STATUS_OK;
                 }
