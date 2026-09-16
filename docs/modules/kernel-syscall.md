@@ -13,14 +13,16 @@ enum kernel_syscall_status kernel_syscall_dispatch(
     struct kernel_syscall_result *result);
 ```
 
-调用者是 scheduler 当前不透明 task，供依赖任务身份或资源的系统调用取得明确上下文；通用解码层不从 RISC-V `tp` 隐式寻找 current。请求包含系统调用号和六个 64 位参数。结果是以下六种动作之一：
+调用者是 scheduler 当前不透明 task，供依赖任务身份或资源的系统调用取得明确上下文；通用解码层不从 RISC-V `tp` 隐式寻找 current。请求包含系统调用号和六个 64 位参数。结果动作定义在公共头中：
 
 - `KERNEL_SYSCALL_ACTION_RETURN`：把 `value` 写回用户返回值寄存器后继续执行。
 - `KERNEL_SYSCALL_ACTION_EXIT`：以 `value` 作为退出状态终止当前用户任务。
 - `KERNEL_SYSCALL_ACTION_EXEC`：新映像已经准备完成；不推进旧 `sepc`，由 scheduler 切换 MM 并重建 Trap Frame。
-- `KERNEL_SYSCALL_ACTION_CLONE`：参数已经符合当前普通进程 clone 子集；架构 Trap 层把完整寄存器快照交给进程层构造子进程。
+- `KERNEL_SYSCALL_ACTION_CLONE`：参数符合当前支持的进程/线程 clone 子集；架构 Trap 层把完整寄存器快照交给进程层构造任务。
 - `KERNEL_SYSCALL_ACTION_WAIT4`：参数保持 Linux ABI 形态，由 scheduler 完成选择、阻塞、唤醒与 zombie 回收。
-- `KERNEL_SYSCALL_ACTION_YIELD`：参数已经为空；由 scheduler 把当前任务重新排到 ready 队尾并在存在竞争者时切换。
+- `KERNEL_SYSCALL_ACTION_YIELD`：忽略无参数调用的残留寄存器，由 scheduler 把当前任务重新排到 ready 队尾并在存在竞争者时切换。
+- `KERNEL_SYSCALL_ACTION_SIGNAL_RETURN`：由架构信号返回路径恢复用户现场。
+- `KERNEL_SYSCALL_ACTION_EXIT_GROUP`：终止调用任务所属线程组，各成员沿原栈清理资源。
 
 空调用者、空请求或空输出返回 `KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT`；依赖任务资源的调用无法取得有效身份、LIVE MM 或一致的文件资源，以及 uaccess 报告内核状态损坏时，也返回该状态并由 Trap 边界视为 fatal。失败时不修改输出。有效请求均返回 `KERNEL_SYSCALL_STATUS_OK`，包括负 Linux errno；具体语义由结果动作表达。
 
@@ -28,20 +30,13 @@ enum kernel_syscall_status kernel_syscall_dispatch(
 
 当前采用 Linux RISC-V 系统调用编号和错误值：
 
-- `mkdirat` 编号为 34，创建目录；只读根挂载返回 `-EROFS`。
-- `unlinkat` 编号为 35，删除普通文件或目录（`AT_REMOVEDIR` 标志）；非空目录返回 `-ENOTEMPTY`，只读挂载返回 `-EROFS`。
-- `ftruncate` 编号为 46，调整可写常规文件的大小；只读 descriptor 返回 `-EINVAL`，目录返回 `-EISDIR`，只读挂载返回 `-EROFS`。
-- `openat` 编号为 56，通过调用任务的 fs context 解析用户路径并在文件表分配最低可用 fd；支持常规文件读写打开与新建（`O_CREAT/O_EXCL/O_TRUNC/O_APPEND`），只读挂载拒绝写访问与修改性标志（返回 `-EROFS`）。准确 flags、路径和 errno 边界见[进程文件资源模块](kernel-files.md)。
-- `close` 编号为 57，从调用任务的文件表移除 fd；无效或已关闭 fd 返回 `-EBADF`。
-- `pipe2` 编号为 59，创建一对共享 64 KiB 环形缓冲的 read/write OFD；支持 `O_CLOEXEC` 与 `O_NONBLOCK`，成功返回两个最低可用 fd，表满或资源不足返回准确错误。读写、EOF、`EPIPE`/SIGPIPE 和 FIFO stat 形态见[进程文件资源模块](kernel-files.md)。
-- `dup` 编号 23、`dup3` 编号 24 与 `fcntl` 编号 25 复制或检查描述符；flag 边界、目标替换与 `F_DUPFD*` 搜索规则见[进程文件资源模块](kernel-files.md)。
-- `read` 编号为 63，使用 open file description 的当前 offset 把数据复制到用户缓冲区；返回实际字节数、0 表示 EOF，用户 fault 与部分复制按 Linux read 形态提交。console 描述符的 read 阻塞等待 UART 输入，经 tick 轮询唤醒后整批交付，行为见[进程文件资源模块](kernel-files.md)。
-- `readv` 编号为 65，快照最多 1024 个 iovec，累计请求截断到 `MAX_RW_COUNT`，按一个 OFD 请求分散读取普通文件、pipe 或 console；普通文件只按交付前缀推进共享 offset，pipe 只消费已完整复制的页片段。fd 权限、向量导入、零长度和 fault 的顺序见[进程文件资源模块](kernel-files.md)。
-- `pread64` 编号为 67，按调用者给出的非负 offset 读取 regular file，保留 OFD 当前 offset；`O_WRONLY` OFD 返回 `-EBADF`，用户缓冲区部分 fault 返回已复制前缀。pipe、console 和目录按 Linux 形态返回不可定位错误。
-- `pselect6` 编号为 72，支持 `fd_set`（可读/可写/异常）、相对超时与可选的 16 字节 `sigset_argpack` 临时信号屏蔽字；空集合或任何未打开 fd 按 Linux 语义返回 `-EBADF`，就绪总数通过返回值输出，行为与生命周期见[进程文件资源模块](kernel-files.md)。
-- `ppoll` 编号为 73，支持 `struct pollfd` 数组（`POLLIN/POLLOUT/POLLPRI/POLLERR/POLLHUP/POLLNVAL`）、相对超时与可选的临时信号屏蔽字；负 fd 忽略不报错，未分配 fd 产生 `POLLNVAL` 并计入就绪数，信号打断返回 `-EINTR` 且自动恢复原信号掩码，行为见[进程文件资源模块](kernel-files.md)。
-- `epoll_create1` 编号 20、`epoll_ctl` 编号 21、`epoll_pwait` 编号 22 构成 epoll 事件通知子系统：`epoll_create1` 支持 `EPOLL_CLOEXEC`（0x80000），创建专用的 epoll OFD；`epoll_ctl` 支持 `EPOLL_CTL_ADD/DEL/MOD` 并复制 16 字节 `struct linux_epoll_event`（支持 `EPOLLIN/EPOLLOUT/EPOLLPRI/EPOLLERR/EPOLLHUP/EPOLLET/EPOLLONESHOT`，禁止对 epfd 自身监听形成环路）；`epoll_pwait` 支持就绪队列提取、LT 重新入队校验、ET 边沿触发、ONESHOT 自动去使能、相对超时阻塞与 8 字节临时信号屏蔽字原子切换，行为见[进程文件资源模块](kernel-files.md)。
-- `write` 编号 64 与 `writev` 编号 66 作用于 console、pipe 与具备写权限的可写常规文件：console 经架构串口输出，pipe 在 `PIPE_BUF=4096` 内保持单次写原子并按可用空间阻塞或返回 `-EAGAIN`；可写 regular fd 写入介质并失效页缓存，支持 `O_APPEND` 自动定位文件尾，无写权限返回 `-EBADF`。普通文件和 console 的用户 fault 按实际前缀保持；pipe 只发布完整复制的片段。console read、pipe read/write 的阻塞语义、`lseek` 编号 62 的 SEEK 形态与目录 cookie、`fstat` 编号 80 与 `newfstatat` 编号 79 的 128 字节 stat 填充、`getdents64` 编号 61 的 linux_dirent64 编码与条目 cookie，均见[进程文件资源模块](kernel-files.md)。
+| 调用族（RISC-V 编号） | 契约归属 |
+|---|---|
+| epoll_create1/ctl/pwait（20–22）、dup/dup3/fcntl（23–25） | [文件模块](kernel-files.md)：OFD 共享、就绪与生命周期 |
+| mkdirat/unlinkat/symlinkat（34–36）、openat/close（56/57）、readlinkat（78） | [文件模块](kernel-files.md)：路径、flags、dirfd 与错误 |
+| ftruncate（46）、pipe2（59）、getdents64/lseek（61/62）、read/write/readv/writev/pread64（63–67） | [文件模块](kernel-files.md)：部分成功、offset、pin、稀疏文件、pipe 与目录 cookie |
+| pselect6/ppoll（72/73）、newfstatat/fstat（79/80） | [文件模块](kernel-files.md)：集合/信号屏蔽、stat 编码和元数据 |
+
 - `clock_gettime` 编号 113、`clock_getres` 编号 114、`gettimeofday` 编号 169、`clock_nanosleep` 编号 115 与 `nanosleep` 编号 101 构成时间族，语义见[内核时间模块](kernel-time.md)。
 - `sched_yield` 编号 124 在存在 READY 竞争者时把当前任务排到 ready 队尾并切换；无竞争者时立即返回 0。调度失败属于内核不变量破坏，由 Trap 边界 fatal。
 - `exit` 编号 93 产生线程 `EXIT`，`exit_group` 编号 94 产生全组 `EXIT_GROUP`；状态保留参数 0 的低 8 位。组退出等待成员沿原内核调用栈释放在用资源，最后产生一次进程退出通知。
