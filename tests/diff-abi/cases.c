@@ -142,7 +142,8 @@ static void partial_cases(void)
 void abi_main(void)
 {
     text("ABI BEGIN 1"); flush();
-    mode_cases(); sparse_cases(); partial_cases(); abi_truncate_cases(); abi_timestamp_cases();
+    mode_cases(); sparse_cases(); partial_cases(); abi_truncate_cases();
+    abi_timestamp_cases(); abi_readv_cases();
     text("ABI END "); number(records); flush();
     SC0(81); /* Linux sync; unsupported on BoarOS, outside observed cases. */
     CALL(142, 0xfee1dead, 672274793, 0x4321fedc, 0, 0, 0);

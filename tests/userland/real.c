@@ -242,8 +242,14 @@ static int check_pipe_waiters(void)
                     if (write(pipe_fd[1], "x", 1) != -1 || errno != EPIPE) {
                         _exit(2);
                     }
-                } else if (read(pipe_fd[0], &byte, 1) != mode) {
-                    _exit(3);
+                } else {
+                    struct iovec vector = {&byte, 1};
+                    ssize_t count = index == 0
+                                        ? readv(pipe_fd[0], &vector, 1)
+                                        : read(pipe_fd[0], &byte, 1);
+                    if (count != mode) {
+                        _exit(3);
+                    }
                 }
                 _exit(0);
             }
@@ -279,6 +285,64 @@ static int check_pipe_waiters(void)
         }
     }
     return 0;
+}
+
+static int check_readv_pipe_signals(void)
+{
+    struct sigaction action = {0};
+    struct sigaction old_action;
+    action.sa_handler = user_signal_handler;
+    sigemptyset(&action.sa_mask);
+    if (sigaction(SIGUSR1, &action, &old_action) != 0) {
+        return 1;
+    }
+    for (int mode = 0; mode < 2; mode++) {
+        int data[2], ready[2], status;
+        char first = 0, second = 0x5a, marker;
+        struct iovec vector[2] = {{&first, 1}, {&second, 1}};
+        action.sa_flags = mode == 0 ? 0 : SA_RESTART;
+        if (sigaction(SIGUSR1, &action, 0) != 0 ||
+            pipe(data) != 0 || pipe(ready) != 0) {
+            return 2;
+        }
+        pid_t child = fork();
+        if (child < 0) {
+            return 3;
+        }
+        if (child == 0) {
+            struct timespec delay = {0, 30000000L};
+            close(data[0]); close(ready[1]);
+            if (read(ready[0], &marker, 1) != 1 ||
+                nanosleep(&delay, 0) != 0 ||
+                kill(getppid(), SIGUSR1) != 0 ||
+                nanosleep(&delay, 0) != 0 ||
+                write(data[1], "x", 1) != 1) {
+                _exit(1);
+            }
+            _exit(0);
+        }
+        close(data[1]); close(ready[0]);
+        user_signal_seen = 0;
+        if (write(ready[1], "r", 1) != 1 || close(ready[1]) != 0) {
+            return 4;
+        }
+        ssize_t count = readv(data[0], vector, 2);
+        if (mode == 0) {
+            if (count != -1 || errno != EINTR ||
+                user_signal_seen != SIGUSR1) {
+                return 5;
+            }
+            count = readv(data[0], vector, 2);
+        }
+        if (count != 1 || first != 'x' || second != 0x5a ||
+            user_signal_seen != SIGUSR1 ||
+            waitpid(child, &status, 0) != child ||
+            !WIFEXITED(status) || WEXITSTATUS(status) != 0 ||
+            close(data[0]) != 0) {
+            return 6;
+        }
+    }
+    return sigaction(SIGUSR1, &old_action, 0) != 0;
 }
 
 static int check_poll_and_select(void)
@@ -791,6 +855,13 @@ static int check_epoll(void)
     if (epfd_bad != -1 || errno != EINVAL) {
         close(epfd);
         return 3;
+    }
+    char byte = 0;
+    struct iovec unreadable = {&byte, 1};
+    errno = 0;
+    if (readv(epfd, &unreadable, 1) != -1 || errno != EINVAL) {
+        close(epfd);
+        return 141;
     }
 
     /* 2. epoll_ctl error handling */
@@ -2984,6 +3055,12 @@ int main(int argc, char **argv)
 
     if (check_pipe_waiters() != 0) {
         return 81;
+    }
+    int readv_signal_result = check_readv_pipe_signals();
+    if (readv_signal_result != 0) {
+        fprintf(stderr, "readv pipe signal check failed: %d errno=%d\n",
+                readv_signal_result, errno);
+        return 84;
     }
 
     int poll_result = check_poll_and_select();

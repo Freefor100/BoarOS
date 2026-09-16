@@ -8,7 +8,8 @@
 struct kernel_pipe;
 
 enum kernel_files_status kernel_files_read_console(
-    struct kernel_files *files, struct kernel_mm *mm, uint64_t user_buffer,
+    struct kernel_files *files, struct kernel_mm *mm,
+    const struct kernel_uaccess_iovec *iov, size_t iov_count,
     uint64_t count, int64_t *linux_result);
 
 #define KERNEL_FILES_INITIAL_CAPACITY 32U

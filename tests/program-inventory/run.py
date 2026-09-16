@@ -45,7 +45,9 @@ def busybox_manifest(build, directory, inputs):
         ('true', ['true'], 0), ('false', ['false'], 1),
         ('echo', ['echo', 'inventory'], 0), ('cat', ['cat', '/inventory-data'], 0),
         ('ls', ['ls', '/inventory-dir'], 0),
-        ('shell', ['sh', '-c', "printf 'shell\\n'; /busybox cat /inventory-data"], 0)]
+        ('shell', ['sh', '-c', "printf 'shell\\n'; /busybox cat /inventory-data"], 0),
+        ('od', ['od', '-An', '-tx1', '/inventory-data'], 0),
+        ('hexdump', ['hexdump', '-C', '/inventory-data'], 0)]
     cases = [{'id': 'busybox.' + name, 'argv': ['/busybox', *argv],
               'expected_exit': expected} for name, argv, expected in commands]
     commands_data = (directory / 'busybox_cmd.txt').read_bytes()

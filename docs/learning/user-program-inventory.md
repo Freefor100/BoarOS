@@ -69,9 +69,9 @@ wait status、signal、exec/setup errno、超时和客体退出状态；任意�
 
 最初六例只测 true、false、echo、cat、ls 和 shell 调用外部 cat，且使用裁剪 BusyBox；其通过
 只保护这几个命令的输出与退出状态，不能代表完整 BusyBox，更不能代替 libc-test。现在保留这六个
-基础命令，但使用完整比赛配置二进制，并增加原脚本及全部 libc entry。完整运行共 226 个顶层案例；
+基础命令，但使用完整比赛配置二进制，并增加原脚本及全部 libc entry。最初完整运行共 226 个顶层案例；
 其中 BusyBox 的一个脚本案例内部有 55 条命令，libc 两个脚本案例重复覆盖原 entry 表并增加包装器契约。
-不能把 226 当作互不重复的上游测例数。
+不能把 226 当作互不重复的上游测例数。readv 阶段另加完整 BusyBox `od/hexdump` 两个独立输出对照案例，原 226 项均保留。
 
 运行结果和依赖清单见 `docs/goals.md`。对非零退出只记录观测，不凭退出数字推断 syscall 根因；
 需要由原始错误输出或最小复现确认。修复顺序按能力依赖和失败簇确定，不按固定测例名称写特判。
@@ -126,4 +126,29 @@ ELF、配置及 UAPI 树哈希。BusyBox ELF SHA-256 为
 同一份固定 libc-test 动态 entry 的 `argv` 修复后双侧退出 0；全部 110 个动态直接
 用例在 `build/elf-stage-dynamic/` 重跑，Linux 110/110 满足契约，BoarOS 99/110
 双侧一致，余下 11 项与静态失败集合相同。此结果只针对动态直接用例；完整
-226 项清单须在 readv 阶段后再次运行，旧完整运行的 104/226 不应当作当前内核状态。
+旧完整运行的 104/226 是 ELF/readv 修复前基线，不应当作当前内核状态。
+
+## ELF 与 readv 修复后的完整复跑
+
+`python3 tests/program-inventory/run.py --reuse-builds --suite all --output build/readv-inventory-verified`
+运行了原 226 项及新增的两个完整 BusyBox 命令。Linux 228/228 满足各自契约；BoarOS
+205 项与 Linux 的退出状态及完整输出一致，20 项直接 entry 退出不符，3 项原脚本断言失败。
+原 226 项中 203 项一致。静态 libc entry 为 97/107，动态为 100/110；两组剩余失败名称完全相同。
+固定 libc-test 的静态和动态 `ungetc` 都通过，完整 BusyBox `od -An -tx1` 与
+`hexdump -C` 对 `inventory data\n` 的输出也逐字节双侧一致。原 BusyBox 脚本仍是独立案例，
+内部 43/55 条 success（此前 42/55），`od` 已恢复，余下 12 条不能据名称一一归因为独立内核缺陷。
+
+直接 libc 的十个剩余名称为 `daemon_failure`、`pthread_cancel_points`、
+`pthread_robust_detach`、`rlimit_open_files`、`socket`、`sscanf_long`、`stat`、
+`statvfs`、`syscall_sign_extend`、`utime`。原始输出明确报告 `getrlimit/setrlimit`、
+robust mutex、socket、statvfs、utimensat 等缺失；`stat` 与 `syscall_sign_extend`
+依赖 `/dev/null` 或 `/dev/zero`，并暴露身份调用尚未实现；`pthread_cancel_points`
+只报告 shm_open 取消检查失败，原因仍待聚焦复现。两份原 libc 包装脚本依旧打印
+`sigtimedwait: Function not implemented`，不改变直接 entry 的 197 项通过事实。
+运行身份、逐例 stdout/stderr、原始串口、镜像和比较状态保存在上述证据目录；没有把参考
+输出粘入 C 测试，也没有把未运行案例计入通过。
+
+此前一次全量复跑的静态 libc 包装案例输出了完整 `SUITE END`，但 PID 1 退出时报告
+`root boot error status=0xb`，因此保留在 `build/readv-inventory-final/` 中并计为
+`guest-incomplete`。相同内核的单例重跑及本节完整 228 项复跑均完成资源清理；目前只确认
+这次退出清理异常未稳定复现，不将异常运行计入上述通过数或归因于具体 syscall。

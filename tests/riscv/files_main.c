@@ -51,6 +51,36 @@ static unsigned char page_pool[BOAROS_PAGE_SIZE * TEST_POOL_PAGES]
 static int count_open_file_releases;
 static uint32_t counted_open_file_releases;
 static char fork_resolved_path[KERNEL_FS_PATH_MAX];
+#ifndef FILES_PARTIAL_WRITE_TEST
+static const char *injected_console_input;
+static size_t injected_console_remaining;
+static unsigned fail_readv_allocation;
+enum kernel_heap_status __real_kernel_heap_allocate(
+    struct kernel_heap *, size_t, void **);
+enum kernel_heap_status __wrap_kernel_heap_allocate(
+    struct kernel_heap *heap, size_t size, void **out)
+{
+    if (fail_readv_allocation && --fail_readv_allocation == 0U) {
+        return KERNEL_HEAP_STATUS_EMPTY;
+    }
+    return __real_kernel_heap_allocate(heap, size, out);
+}
+uint32_t __real_virt_uart_rx_ready(void);
+uint32_t __wrap_virt_uart_rx_ready(void)
+{
+    return injected_console_remaining != 0U
+               ? 1U : __real_virt_uart_rx_ready();
+}
+char __real_virt_uart_getc(void);
+char __wrap_virt_uart_getc(void)
+{
+    if (injected_console_remaining != 0U) {
+        injected_console_remaining--;
+        return *injected_console_input++;
+    }
+    return __real_virt_uart_getc();
+}
+#endif
 static unsigned fail_physical_allocation;
 enum physical_page_status __real_physical_page_allocate(
     struct physical_page_allocator *, uint64_t *);
@@ -1199,11 +1229,53 @@ static void run_console_operations(struct kernel_files *files,
     }
     count_open_file_releases = 0;
 
-    /* Regular descriptors are read-only, so writes report EBADF.  The
-     * console read blocks until the tick poller feeds it, which only the
-     * serial-input end-to-end run can exercise; here the non-blocking
-     * edges are checked: an empty request returns 0 and a bad buffer
-     * faults before any wait. */
+#ifndef FILES_PARTIAL_WRITE_TEST
+    /* A single UART batch must scatter over both readv destinations. */
+    struct kernel_uaccess_iovec read_vector[2] = {
+        {TEST_USER_BUFFER, 1U}, {TEST_USER_BUFFER + 1U, 2U}
+    };
+    char received[3];
+    if (!write_user_bytes(mm, TEST_USER_PATH, read_vector,
+                          sizeof(read_vector))) {
+        fail_files(72U, 1, 0);
+    }
+    injected_console_input = "abc";
+    injected_console_remaining = 3U;
+    if (kernel_files_readv(files, mm, 0, TEST_USER_PATH, 2U, &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != 3 || injected_console_remaining != 0U ||
+        !read_user_bytes(mm, TEST_USER_BUFFER, received,
+                         sizeof(received)) ||
+        memcmp(received, "abc", sizeof(received)) != 0) {
+        fail_files(72U, 3, result);
+    }
+    struct kernel_uaccess_iovec long_vector[9] = {0};
+    struct kernel_files_statistics before_readv;
+    struct kernel_files_statistics after_readv;
+    if (!write_user_bytes(mm, TEST_USER_PATH, long_vector,
+                          sizeof(long_vector))) {
+        fail_files(72U, 1, 0);
+    }
+    kernel_files_get_statistics(files, &before_readv);
+    counted_open_file_releases = 0U;
+    count_open_file_releases = 1;
+    fail_readv_allocation = 1U;
+    enum kernel_files_status readv_status = kernel_files_readv(
+        files, mm, 0, TEST_USER_PATH, 9U, &result);
+    count_open_file_releases = 0;
+    kernel_files_get_statistics(files, &after_readv);
+    if (readv_status != KERNEL_FILES_STATUS_OK ||
+        result != -KERNEL_ENOMEM || counted_open_file_releases != 1U ||
+        fail_readv_allocation != 0U ||
+        after_readv.read_calls != before_readv.read_calls + 1U ||
+        after_readv.read_failures != before_readv.read_failures + 1U) {
+        fail_files(72U, -KERNEL_ENOMEM, result);
+    }
+#endif
+
+    /* Regular descriptors are read-only, so writes report EBADF. The
+     * blocking wait for real serial input needs an interactive run; here
+     * the non-blocking edges are checked before any wait. */
         expect_open(files, fs, mm, TEST_AT_FDCWD, "/data", 0U, 3, 72U);
         if (kernel_files_write(files,
                            mm,

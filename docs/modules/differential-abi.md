@@ -17,7 +17,8 @@ Linux 原有源码许可证见 `references/linux/COPYING`，构建产物位于�
   文件初始位置为 1；该参数契约保存在 `cases.txt` 并记录其 SHA-256。
 - `abi.h`：case pack 公共 syscall、stat、输出与 setup 检查。`truncate.c` 提供驻留页/COW/PROT_NONE、当前与非当前 MM、关闭 fd/unlink、
   非对齐尾页、O_TRUNC 与重新增长的观测；记录 ID 同步维护在 `cases.txt`。
-- `timestamps.c`：22 条 create/read/write/truncate/unlink 与父目录时间观测；与前述文件及截断观测合计 76 条。Linux 根挂载沿固定源码 `fs/namespace.c` 的默认 `MNT_RELATIME`，BoarOS 使用同一策略。
+- `timestamps.c`：22 条 create/read/write/truncate/unlink 与父目录时间观测。Linux 根挂载沿固定源码 `fs/namespace.c` 的默认 `MNT_RELATIME`，BoarOS 使用同一策略。
+- `readv.c`：覆盖向量导入顺序、零项及零长度、1024/1025 项、`MAX_RW_COUNT`、普通文件跨页/共享 OFD/EOF、0/1/32/63/64/65 字节可写前缀，以及 pipe 的未完成片段保留、写入故障、尾片段合并、环回、非阻塞/EOF 和可写 poll 边界。与上述测试合计 126 条记录；不以手工 Linux 输出替代双侧执行。
 - `harness.py`：构建 Linux、制作镜像、运行两个系统、校验完整协议并做严格 diff。
 - `linux.config`：以 `allnoconfig` 为基础，启用 virt、MMU、ELF、串口、VirtIO
   MMIO/block、ext4 和关机所需能力；Linux 自己解析依赖。

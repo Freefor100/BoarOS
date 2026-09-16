@@ -8,7 +8,7 @@
 
 - `kernel_files` 是进程可见的 fd 槽数组；槽保存 descriptor flags 和指向 open file description 的指针。
 - `kernel_open_file_description` 拥有一个 VFS file、当前 offset 和清理状态。分别打开同一路径会得到独立 description，因此 offset 互不影响。
-- pipe description 不拥有 VFS file，而是各自持有同一个 `struct kernel_pipe` 的读/写 endpoint；pipe 对象拥有连续 64 KiB ring buffer、读写端引用和等待队列。
+- pipe description 不拥有 VFS file，而是各自持有同一个 `struct kernel_pipe` 的读/写 endpoint；pipe 对象拥有连续 64 KiB 数据区、16 个固定页片段的有效范围、读写端引用和等待队列。
 - `kernel_fs_context` 借用生产根 mount，拥有当前工作目录字符串；当前 cwd 固定从 `/` 开始。
 
 `kernel_files_pin()` 为 fd 指向的 open file description 增加一个独立引用。file-private mmap
@@ -50,13 +50,17 @@ normal open、dup/F_DUPFD、console、pipe2 和 epoll_create1 最终都经过 `t
 
 读端有数据时按 ring 顺序返回，空且仍有 writer 时：阻塞 fd 进入 interruptible wait，非阻塞 fd 返回 `-EAGAIN`。所有 writer 关闭后空读返回 EOF；写端没有 reader 时返回 `-EPIPE`，同时向当前 task 发送 SIGPIPE，因此有 handler 时先观察信号、无 handler 时按默认动作终止。写端空间不足时阻塞或返回 `-EAGAIN`；不超过 4096 字节的单次写在当前单 hart 实现中保持原子，较大写按可用空间推进。EOF/EPIPE 唤醒全部受影响 waiter；数据/空间变化也唤醒对端全部 waiter，被唤醒后重查条件，并可被未阻塞信号唤醒后返回 `-EINTR`/按 `SA_RESTART` 重启。
 
+每个已发布的 pipe 片段对应数据区中的一页。`write/writev` 跨 iovec 复制完整片段后才增加有效长度；复制中途 fault 时丢弃尚未发布的片段，已发布的前缀仍返回。后续写入只按请求长度的页内余数尝试并入尾片段，其余使用新页片段。`read/readv` 对一个片段的本轮请求必须完整复制到用户空间才消费它；fault 可使用户缓冲区出现前缀，但该未完成片段仍可被再次读取。已消费的先前片段决定返回进度，之后不会为了下一 iovec 再等待新数据。16 个槽已占满时 `poll` 不报告可写，即使尾页尚有可合并空间；小写入仍可尝试尾页合并。这些边界按固定 Linux `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 `references/linux/fs/pipe.c` 对照。
+
 pipe 的 `fstat` 以 `S_IFIFO` 形态报告，`lseek` 返回 `-ESPIPE`；它不进入 ext4 页缓存，也不暴露普通 VFS node。两个 endpoint 的最后一个 OFD 关闭后，ring buffer、等待队列和 pipe owner 一起释放。创建或双 fd 安装的任一步失败都会先回收已创建 description/fd；只有真实 VFS/I/O 清理错误才由文件表保留 pipe 或 OFD owner，物理页和堆释放不建立重试状态。
 
-## `read`、offset 与部分复制
+## `read/readv`、offset 与部分复制
 
 `kernel_files_read()` 最多传送 Linux `MAX_RW_COUNT` 形态的 `INT32_MAX` 向下页对齐值。无效 fd 或普通文件 OFD 的访问模式为 `O_WRONLY` 时返回 `-EBADF`；该访问模式属于 OFD，因此 `dup`/fork 后仍保持。访问模式检查先于零长度和用户地址检查；通过后，零长度无需解引用用户地址并返回 0。`pread64` 对普通文件使用同一可读性契约，但按调用者给出的非负 offset 读取且不推进 OFD offset。它在 MAX_RW_COUNT 截断和 EOF 判断前校验原始用户范围，非法高地址即使 count 为零也返回 `-EFAULT`。与固定 Linux `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 [`fs/read_write.c`](../../references/linux/fs/read_write.c) 中 `vfs_read()` 顺序一致，非零读取先按调用者给出的原始 count 验证整个用户范围，再把实际请求截断到上限，逐页从挂载共享缓存取得文件页并执行 `copy_to_user`。
 
 open file description 的 offset 只增加实际复制到用户空间的字节数。首块即发生用户 fault 时返回 `-EFAULT` 且 offset 不变；已经复制前缀后再 fault 或遇到底层读错误时返回前缀长度，并只提交该前缀。短读和 EOF 返回实际长度。这样已经进入缓存但未交付用户的数据不会被错误计入文件位置。
+
+`kernel_files_readv()` 使用相同的普通文件读取核心，整个调用只钉住一次 OFD，并把用户 iovec 快照到最多 8 项的栈数组或最多 1024 项的受限堆数组。先检查 fd 的读权限，再导入向量；每项长度与地址按固定 Linux 的 `references/linux/lib/iov_iter.c` 校验，单项向量先按 `MAX_RW_COUNT` 截断，多项向量先校验原始范围再截断累计长度。零项向量返回 0，零长度段跳过；普通文件按实际交付量推进共享 OFD，EOF、短读、fault 与后端错误均结束本次请求。console 从一次 UART 暂存分散到多个 iovec，不为每项重新等待。pipe 按上述片段提交规则消费数据。epoll 描述符没有 read 操作，在向量导入前返回 `-EINVAL`。
 
 每个 chunk 最多覆盖当前 4 KiB 文件页剩余部分：cache miss 承担一次底层随机读，hit 只增加页引用并复制；用户方向仍按基页做软件页表查询。模块统计调用/失败次数、字节、chunk、当前/峰值 fd、表容量与 close-on-exec 数量，页缓存另统计 hit/miss/insert/eviction/reclaim。当前仍有 cache-to-user 一次复制，尚无 read-ahead、直接用户页 I/O 或异步阻塞。优化这些路径时必须保持部分读取、offset 和错误返回语义。
 
@@ -64,7 +68,7 @@ open file description 的 offset 只增加实际复制到用户空间的字节�
 
 `write` 与 `writev` 支持 console、pipe 以及具备写权限（`O_WRONLY/O_RDWR`）的常规文件：
 - console 经 `kernel_console_putc` 逐字节输出并返回完整计数；用户 fault 与部分复制按前缀保持返回。console 的 `read` 阻塞等待真实 UART 输入。
-- pipe 的 `write/writev` 汇总后沿用 pipe 单次写空间、原子性、阻塞、EPIPE/SIGPIPE 和部分复制规则。
+- pipe 的 `write/writev` 汇总后沿用 pipe 单次写空间、原子性、阻塞、EPIPE/SIGPIPE 和片段提交规则。
 - regular 文件写入通过 `kernel_vfs_pwrite()` 执行底层介质写入，并调用节点页缓存失效确保缓存一致性。若描述符设置了 `O_APPEND`，写入前通过 `kernel_vfs_append()` 原子解析当前 EOF 并写入，成功后将 OFD offset 更新至新文件末尾。未以写权限打开的描述符或目录描述符调用 write 返回 `-EBADF`。
 - regular 文件 usercopy 跨入不可读或未映射页时，仍把已复制的连续前缀交给 backend；返回值和 OFD offset 只计入实际写入量。零进度用户 fault 返回 `-EFAULT`；若提交此前缀的 backend 在零进度时返回错误，保留 backend errno。fault 一旦发生即结束整个请求，不继续后续 iovec；`STATE` 仍作为内核状态错误传播。该前缀提交原则对应固定 Linux `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 [`mm/filemap.c`](../../references/linux/mm/filemap.c) 中 `generic_perform_write()`：usercopy 的 copied 与 `write_end()` 实际接受量分开，位置只按后者推进。
 - backend 已提交正字节前缀后才报告错误时，`write/writev` 返回该前缀，OFD offset 只增加该正字节数；只有零进度才把 errno 返回用户态。VFS 在结果判定前同步 live inode/node/file size 并使旧页缓存失效，因此 `fstat`、后续读取和共享 node 的描述符不会观察到旧长度或旧内容。
@@ -76,7 +80,7 @@ open file description 的 offset 只增加实际复制到用户空间的字节�
 - `kernel_files_unlinkat()`：支持文件删除与目录删除（`AT_REMOVEDIR` 标志）。普通文件调用 `kernel_vfs_unlink()` 并使挂载存活节点页缓存失效；目录删除调用 `kernel_vfs_rmdir()`，非空目录返回 `-ENOTEMPTY`。
 - `kernel_files_ftruncate()`：校验 fd 具备可写权限且为常规文件，调用 `kernel_vfs_ftruncate()` 调整文件大小（向下截断或向上 sparse 扩展）并精确失效该节点页缓存；backend 已改变 inode 后才返回错误时，仍先同步 node/file size 并失效缓存，再把 errno 返回用户态。只读描述符返回 `-EINVAL`，目录返回 `-EISDIR`。向下截断根据实际新大小通知稳定 node–MM 登记，撤销所有相关 MM 中越过新 EOF 的整页 PTE（包含私有 COW 与 PROT_NONE），保留 VMA 以便随后 fault/SIGBUS。非对齐尾页的文件来源后缀清零，已私有化内容保留；来源记录不依赖缓存索引或 PTE COW 位。
 
-`read`、`write` 和 `writev` 在 fd lookup 后立即取得独立 OFD 引用，并在本次操作的全部复制、等待和唤醒处理结束后释放。共享表中的另一个线程即使在操作睡眠期间 close 并复用同一 fd 号，本次操作仍使用 lookup 时的 OFD；对于 pipe，这份引用也让原读/写 endpoint 在 in-flight I/O 结束前保持逻辑存活，避免提前产生 EOF/EPIPE 或释放等待队列。末次操作引用触发的底层 cleanup 失败会转交给共享文件表的原有 cleanup 链。该语义基线对应固定 Linux `f4cdf7ca9a1f` 中 [`fs/file.c`](../../references/linux/fs/file.c) 的 `fdget()`/`fdput()` 生命周期。
+`read/readv` 与 `write/writev` 在 fd lookup 后立即取得独立 OFD 引用，并在本次操作的全部复制、等待和唤醒处理结束后释放。共享表中的另一个线程即使在操作睡眠期间 close 并复用同一 fd 号，本次操作仍使用 lookup 时的 OFD；对于 pipe，这份引用也让原读/写 endpoint 在 in-flight I/O 结束前保持逻辑存活，避免提前产生 EOF/EPIPE 或释放等待队列。末次操作引用触发的底层 cleanup 失败会转交给共享文件表的原有 cleanup 链。该语义基线对应固定 Linux `f4cdf7ca9a1f` 中 [`fs/file.c`](../../references/linux/fs/file.c) 的 `fdget()`/`fdput()` 生命周期。
 
 ## I/O 多路复用与 `poll/select`
 
@@ -130,7 +134,7 @@ fd-slot OFD references -> files table -> fs context
 
 ## 验证与限制
 
-`write` 和不超过 8 个 iovec 的 `writev` 不分配导入缓冲；更长数组为完整输入快照分配至多 16 KiB 元数据，释放遵循堆不变量。数据仍直接从用户空间复制到 pipe ring，console 使用 64 字节暂存；目录条目在固定内核缓冲区中编码一次，再复制到用户空间，目录拆分没有引入转发层或额外数据复制。等待唤醒扫描当前 blocked 链，单次 wake-all 为 O(阻塞任务数)，不是已完成的可扩展并发队列。
+`readv/writev` 的 8 项以内向量不分配导入缓冲；更长数组为完整输入快照分配至多 16 KiB 元数据，释放遵循堆不变量。数据仍直接从用户空间复制到 pipe 数据区，console 使用 64 字节暂存；目录条目在固定内核缓冲区中编码一次，再复制到用户空间，目录拆分没有引入转发层或额外数据复制。等待唤醒扫描当前 blocked 链，单次 wake-all 为 O(阻塞任务数)，不是已完成的可扩展并发队列。
 
 目录枚举现在由 OFD offset 保存可继续的后端 cookie，VFS 适配层隐藏 lwext4 类型；可变游标不放入按 inode 共享的 VFS node。独立 open 各自推进，dup 和 fork 共享同一 OFD 的目录位置。当前线性 ext4 适配器的 `ext4_dir_entry_next_status()` 区分真实 EOF 与正 errno，使用记录结束字节位置作为 cookie；未来的 htree 或其他文件系统可以替换编码而不改变文件资源接口。
 
@@ -154,11 +158,14 @@ make test-files-partial-write-riscv
 make test-syscall-riscv
 make test-exec-riscv
 make test-userland-riscv
+make test-diff-abi-riscv
 make test-root-init-riscv
 make test-riscv
 ```
 
 `make test-files-partial-write-riscv` 覆盖跨入未映射页前可读 0、1、32、63、64、65 字节的普通写、append 和 writev（含已有进度及后续可读 iovec），核对返回值、offset、文件长度、内容和字节统计；真实 ext4 后端注入短写、带前缀错误与零进度错误，验证只提交实际写入量。`make test-userland-riscv` 以 `mmap/mprotect(PROT_NONE)` 对同组边界执行真实 musl 系统调用并核对内容和 metadata。
+
+`make test-diff-abi-riscv` 用相同 raw-syscall ELF 比较固定 RISC-V Linux 和 BoarOS 的 readv 参数顺序、0/1/32/63/64/65 字节可写前缀、1024/1025 项、跨文件页/共享 OFD、pipe 片段故障后重读、尾片段合并、环回以及 poll 可写边界；保留原始串口与规范化差异。`make test-files-riscv` 注入 UART 三字节批次并核对 console readv 跨两个向量分散，同时注入长向量分配失败，核对 `ENOMEM`、OFD 释放和调用统计；`make test-userland-riscv` 以真实 musl 验证两个 pipe 读者及 readv 的 EINTR/SA_RESTART。固定 libc-test 的静态/动态 `ungetc` 和完整 BusyBox 的 `od/hexdump` 另以真实程序套件逐例比较完整输出。
 
 聚焦测试在真实 QEMU legacy 与 modern VirtIO/ext4 上覆盖绝对/相对路径、错误 flags、目录与缺失文件、4096 字节路径上限、最低 fd 复用、表扩容、统一 fd 安装统计、epoll 满表原子性、`O_CLOEXEC/O_NONBLOCK`、缓存命中后的跨页读取、EOF、部分 fault、fork 后 fd 表独立与 OFD offset 共享，以及 VFS orphan/I/O owner。stat 回归核对 regular/directory 的真实 inode metadata、allocated blocks、fstat/newfstatat 共同字段和 unlink-but-open 的零链接计数。它还在关闭 fd 后通过 MM backing 继续缺页，反复固定地址映射同一 OFD 并检查来源释放只发生一次，验证父子各自持有一份来源引用。生产 exec/clone 链验证普通 fd 与 offset 跨映像和父子保持、CLOEXEC fd 不可见，PID 1 的 stdio 与跨 exec 的 console 描述符由串口标记验证，并由最终资源基线证明退出清理生效。`make test-userland-riscv` 用静态和动态 musl 程序作为 PID 1 运行 stdio、readdir、read/lseek/fstat、dup、signal、pipe、pthread、TLS 和 dlopen；其中写打开普通文件的真实 `read/pread` 及其 dup 均验证 `EBADF`，是真实 U-mode 外部测例的入口。
 

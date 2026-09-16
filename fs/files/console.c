@@ -1,4 +1,5 @@
 #include "private.h"
+#include "../uaccess_iov_internal.h"
 
 #include <arch/riscv/context.h>
 #include <arch/riscv/virt_uart.h>
@@ -52,10 +53,12 @@ uint32_t kernel_console_poll(uint32_t requested_events,
 enum kernel_files_status kernel_files_read_console(
     struct kernel_files *files,
     struct kernel_mm *mm,
-    uint64_t user_buffer,
+    const struct kernel_uaccess_iovec *iov,
+    size_t iov_count,
     uint64_t count,
     int64_t *linux_result)
 {
+    struct kernel_uaccess_iov_cursor cursor = {iov, iov_count, 0U, 0U};
     unsigned char staging[KERNEL_FILES_CONSOLE_STAGING];
     enum kernel_wait_wake_reason wake_reason = KERNEL_WAIT_WOKEN;
     enum kernel_uaccess_status access_status;
@@ -64,11 +67,14 @@ enum kernel_files_status kernel_files_read_console(
     size_t copied = 0;
     uintptr_t saved;
 
-    if (kernel_user_range_check(user_buffer, (size_t)count) !=
-        KERNEL_UACCESS_STATUS_OK) {
-        files->record->statistics.read_failures++;
-        *linux_result = -KERNEL_EFAULT;
-        return KERNEL_FILES_STATUS_OK;
+    for (size_t index = 0U; index < iov_count; index++) {
+        if (kernel_user_range_check(iov[index].base,
+                                    (size_t)iov[index].length) !=
+            KERNEL_UACCESS_STATUS_OK) {
+            files->record->statistics.read_failures++;
+            *linux_result = -KERNEL_EFAULT;
+            return KERNEL_FILES_STATUS_OK;
+        }
     }
     if (count == 0U) {
         *linux_result = 0;
@@ -105,12 +111,13 @@ enum kernel_files_status kernel_files_read_console(
     }
     riscv_interrupt_restore(saved);
 
-    access_status = kernel_copy_to_user(mm,
-                                        user_buffer,
-                                        staging,
-                                        staged,
-                                        &copied);
-    if (access_status != KERNEL_UACCESS_STATUS_OK && copied == 0U) {
+    access_status = kernel_copy_to_user_iov(mm, &cursor, staging,
+                                            staged, &copied);
+    if (access_status != KERNEL_UACCESS_STATUS_OK &&
+        access_status != KERNEL_UACCESS_STATUS_FAULT) {
+        return KERNEL_FILES_STATUS_STATE;
+    }
+    if (access_status == KERNEL_UACCESS_STATUS_FAULT && copied == 0U) {
         files->record->statistics.read_failures++;
         *linux_result = -KERNEL_EFAULT;
         return KERNEL_FILES_STATUS_OK;

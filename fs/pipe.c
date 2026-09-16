@@ -1,4 +1,5 @@
 #include "pipe_internal.h"
+#include "uaccess_iov_internal.h"
 
 #include <arch/riscv/context.h>
 #include <kernel/errno.h>
@@ -6,6 +7,7 @@
 #include <kernel/heap.h>
 #include <kernel/mm.h>
 #include <kernel/open_file.h>
+#include <kernel/page.h>
 #include <kernel/physical_page.h>
 #include <kernel/scheduler.h>
 #include <kernel/signal.h>
@@ -163,39 +165,54 @@ enum kernel_pipe_status kernel_pipe_release_endpoint(
     return status;
 }
 
-static uint64_t pipe_remaining(uint64_t position)
+static uint16_t next_slot(uint16_t slot)
 {
-    return KERNEL_PIPE_CAPACITY - position;
+    return (uint16_t)((slot + 1U) %
+                      (KERNEL_PIPE_CAPACITY / BOAROS_PAGE_SIZE));
 }
 
 static void pipe_consume(struct kernel_pipe *pipe, uint64_t count)
 {
-    pipe->read_position =
-        (pipe->read_position + count) % KERNEL_PIPE_CAPACITY;
+    uint16_t slot = pipe->head;
+
+    pipe->page_offset[slot] += (uint16_t)count;
+    pipe->page_length[slot] -= (uint16_t)count;
     pipe->bytes -= count;
+    if (pipe->page_length[slot] == 0U) {
+        pipe->page_offset[slot] = 0U;
+        pipe->head = next_slot(slot);
+        pipe->slots--;
+    }
 }
 
-static void pipe_produce(struct kernel_pipe *pipe, uint64_t count)
+static uint16_t pipe_tail_space(const struct kernel_pipe *pipe)
 {
-    pipe->write_position =
-        (pipe->write_position + count) % KERNEL_PIPE_CAPACITY;
-    pipe->bytes += count;
+    uint16_t last;
+
+    if (pipe->slots == 0U) return 0U;
+    last = (uint16_t)((pipe->tail +
+                       KERNEL_PIPE_CAPACITY / BOAROS_PAGE_SIZE - 1U) %
+                      (KERNEL_PIPE_CAPACITY / BOAROS_PAGE_SIZE));
+    return (uint16_t)(BOAROS_PAGE_SIZE - pipe->page_offset[last] -
+                      pipe->page_length[last]);
 }
 
-enum kernel_pipe_status kernel_pipe_read(
+enum kernel_pipe_status kernel_pipe_readv(
     struct kernel_pipe *pipe,
     struct kernel_mm *mm,
-    uint64_t user_buffer,
+    const struct kernel_uaccess_iovec *iov,
+    size_t iov_count,
     uint64_t count,
     uint32_t open_flags,
     int64_t *linux_result)
 {
+    struct kernel_uaccess_iov_cursor cursor = {iov, iov_count, 0U, 0U};
     uintptr_t saved;
     enum kernel_scheduler_status scheduler_status;
     enum kernel_wait_wake_reason wake_reason = KERNEL_WAIT_WOKEN;
-    enum kernel_uaccess_status access_status;
     uint64_t requested;
-    size_t copied;
+    size_t committed;
+    int fault = 0;
 
     if (pipe == 0 || mm == 0 || linux_result == 0 ||
         pipe->heap == 0 || pipe->buffer == 0) {
@@ -205,10 +222,13 @@ enum kernel_pipe_status kernel_pipe_read(
         *linux_result = -KERNEL_EBADF;
         return KERNEL_PIPE_STATUS_OK;
     }
-    if (kernel_user_range_check(user_buffer, (size_t)count) !=
-        KERNEL_UACCESS_STATUS_OK) {
-        *linux_result = -KERNEL_EFAULT;
-        return KERNEL_PIPE_STATUS_OK;
+    for (size_t index = 0U; index < iov_count; index++) {
+        if (kernel_user_range_check(iov[index].base,
+                                    (size_t)iov[index].length) !=
+            KERNEL_UACCESS_STATUS_OK) {
+            *linux_result = -KERNEL_EFAULT;
+            return KERNEL_PIPE_STATUS_OK;
+        }
     }
     if (count == 0U) {
         *linux_result = 0;
@@ -244,42 +264,48 @@ enum kernel_pipe_status kernel_pipe_read(
         requested = count < pipe->bytes ? count : pipe->bytes;
     }
 
-    copied = 0U;
-    access_status = KERNEL_UACCESS_STATUS_OK;
-    while ((uint64_t)copied < requested) {
-        uint64_t chunk64 = requested - (uint64_t)copied;
+    committed = 0U;
+    while ((uint64_t)committed < requested) {
+        uint16_t slot = pipe->head;
+        uint64_t chunk64 = requested - (uint64_t)committed;
         size_t chunk;
         size_t part_copied = 0U;
         enum kernel_uaccess_status part_status;
 
-        if (chunk64 > pipe_remaining(pipe->read_position)) {
-            chunk64 = pipe_remaining(pipe->read_position);
+        if (pipe->slots == 0U || pipe->page_length[slot] == 0U) {
+            riscv_interrupt_restore(saved);
+            return KERNEL_PIPE_STATUS_STATE;
+        }
+        if (chunk64 > pipe->page_length[slot]) {
+            chunk64 = pipe->page_length[slot];
         }
         chunk = (size_t)chunk64;
-        part_status = kernel_copy_to_user(
-            mm,
-            user_buffer + copied,
-            pipe->buffer + pipe->read_position,
+        part_status = kernel_copy_to_user_iov(
+            mm, &cursor,
+            pipe->buffer + (size_t)slot * BOAROS_PAGE_SIZE +
+                pipe->page_offset[slot],
             chunk,
             &part_copied);
-        pipe_consume(pipe, part_copied);
-        copied += part_copied;
         if (part_status != KERNEL_UACCESS_STATUS_OK ||
             part_copied != chunk) {
-            access_status = part_status;
+            if (part_status != KERNEL_UACCESS_STATUS_FAULT) {
+                riscv_interrupt_restore(saved);
+                return KERNEL_PIPE_STATUS_STATE;
+            }
+            fault = 1;
             break;
         }
+        pipe_consume(pipe, chunk);
+        committed += chunk;
     }
-    if (copied != 0U) {
+    if (committed != 0U) {
         (void)kernel_wait_queue_wake_all(&pipe->write_queue);
     }
     riscv_interrupt_restore(saved);
-    if (copied == 0U && access_status == KERNEL_UACCESS_STATUS_FAULT) {
+    if (committed == 0U && fault) {
         *linux_result = -KERNEL_EFAULT;
-    } else if (copied == 0U) {
-        *linux_result = -KERNEL_EIO;
     } else {
-        *linux_result = (int64_t)copied;
+        *linux_result = (int64_t)committed;
     }
     return KERNEL_PIPE_STATUS_OK;
 }
@@ -311,9 +337,8 @@ enum kernel_pipe_status kernel_pipe_writev(
     enum kernel_scheduler_status scheduler_status;
     enum kernel_wait_wake_reason wake_reason = KERNEL_WAIT_WOKEN;
     uint64_t total = 0U;
-    int atomic;
-    size_t iov_index = 0U;
-    uint64_t iov_offset = 0U;
+    uint16_t merge_bytes = (uint16_t)(count & BOAROS_PAGE_MASK);
+    struct kernel_uaccess_iov_cursor cursor = {iov, iov_count, 0U, 0U};
 
     if (pipe == 0 || mm == 0 || linux_result == 0 ||
         pipe->heap == 0 || pipe->buffer == 0) {
@@ -327,12 +352,16 @@ enum kernel_pipe_status kernel_pipe_writev(
         *linux_result = 0;
         return KERNEL_PIPE_STATUS_OK;
     }
-    atomic = count <= KERNEL_PIPE_ATOMIC_WRITE;
     saved = riscv_interrupt_save();
     while (total < count) {
-        uint64_t free_bytes = KERNEL_PIPE_CAPACITY - pipe->bytes;
+        uint64_t free_slots = KERNEL_PIPE_CAPACITY / BOAROS_PAGE_SIZE -
+                              pipe->slots;
         uint64_t request = count - total;
         uint64_t chunk64;
+        uint16_t tail_space = pipe_tail_space(pipe);
+        uint16_t slot;
+        int merging = total == 0U && merge_bytes != 0U &&
+                      pipe->slots != 0U && tail_space >= merge_bytes;
         size_t copied;
         size_t chunk;
         enum kernel_uaccess_status access_status;
@@ -347,7 +376,7 @@ enum kernel_pipe_status kernel_pipe_writev(
             riscv_interrupt_restore(saved);
             return status;
         }
-        if (free_bytes == 0U || (atomic != 0 && free_bytes < request)) {
+        if (!merging && free_slots == 0U) {
             if ((open_flags & KERNEL_PIPE_NONBLOCK) != 0U) {
                 riscv_interrupt_restore(saved);
                 *linux_result = total != 0U ? (int64_t)total : -KERNEL_EAGAIN;
@@ -374,41 +403,48 @@ enum kernel_pipe_status kernel_pipe_writev(
             }
             continue;
         }
-        chunk64 = request < free_bytes ? request : free_bytes;
-        if (chunk64 > pipe_remaining(pipe->write_position)) {
-            chunk64 = pipe_remaining(pipe->write_position);
-        }
-        while (iov_index < iov_count && iov_offset == iov[iov_index].length) {
-            iov_index++;
-            iov_offset = 0U;
-        }
-        if (iov_index == iov_count) {
-            riscv_interrupt_restore(saved);
-            return KERNEL_PIPE_STATUS_STATE;
-        }
-        if (chunk64 > iov[iov_index].length - iov_offset) {
-            chunk64 = iov[iov_index].length - iov_offset;
+        /* Linux merges only the request's page remainder into the previous
+         * fragment, then publishes fresh page-sized fragments. The boundary
+         * determines what a later faulting read may consume. */
+        if (!merging) {
+            slot = pipe->tail;
+            chunk64 = request < BOAROS_PAGE_SIZE
+                          ? request : BOAROS_PAGE_SIZE;
+        } else {
+            slot = (uint16_t)((pipe->tail +
+                       KERNEL_PIPE_CAPACITY / BOAROS_PAGE_SIZE - 1U) %
+                       (KERNEL_PIPE_CAPACITY / BOAROS_PAGE_SIZE));
+            chunk64 = merge_bytes;
         }
         chunk = (size_t)chunk64;
         copied = 0U;
-        access_status = kernel_copy_from_user(
+        access_status = kernel_copy_from_user_iov(
             mm,
-            pipe->buffer + pipe->write_position,
-            iov[iov_index].base + iov_offset,
+            &cursor,
+            pipe->buffer + (size_t)slot * BOAROS_PAGE_SIZE +
+                (!merging ? 0U : pipe->page_offset[slot] +
+                                   pipe->page_length[slot]),
             chunk,
             &copied);
-        pipe_produce(pipe, copied);
-        total += copied;
-        iov_offset += copied;
-        /* Any bytes produced make sleeping readers or epoll watchers eligible. */
-        if (copied != 0U) {
-            (void)kernel_wait_queue_wake_all(&pipe->read_queue);
-        }
         if (access_status != KERNEL_UACCESS_STATUS_OK || copied != chunk) {
             riscv_interrupt_restore(saved);
+            if (access_status != KERNEL_UACCESS_STATUS_FAULT) {
+                return KERNEL_PIPE_STATUS_STATE;
+            }
             *linux_result = total != 0U ? (int64_t)total : -KERNEL_EFAULT;
             return KERNEL_PIPE_STATUS_OK;
         }
+        if (!merging) {
+            pipe->page_offset[slot] = 0U;
+            pipe->page_length[slot] = 0U;
+            pipe->tail = next_slot(slot);
+            pipe->slots++;
+        }
+        pipe->page_length[slot] += (uint16_t)chunk;
+        pipe->bytes += chunk;
+        total += chunk;
+        /* Any bytes produced make sleeping readers or epoll watchers eligible. */
+        (void)kernel_wait_queue_wake_all(&pipe->read_queue);
     }
     riscv_interrupt_restore(saved);
     *linux_result = (int64_t)total;
@@ -444,7 +480,7 @@ uint32_t kernel_pipe_poll(
         if (pipe->readers == 0U) {
             events |= KERNEL_POLLERR;
             events |= (KERNEL_POLLOUT | KERNEL_POLLWRNORM);
-        } else if (pipe->bytes < KERNEL_PIPE_CAPACITY) {
+        } else if (pipe->slots < KERNEL_PIPE_CAPACITY / BOAROS_PAGE_SIZE) {
             events |= (KERNEL_POLLOUT | KERNEL_POLLWRNORM);
         }
     } else {

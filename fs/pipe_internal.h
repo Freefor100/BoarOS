@@ -17,8 +17,11 @@ struct kernel_pipe {
     struct physical_page_allocator *allocator;
     uint64_t buffer_physical;
     unsigned char *buffer;
-    uint64_t read_position;
-    uint64_t write_position;
+    uint16_t head;
+    uint16_t tail;
+    uint16_t slots;
+    uint16_t page_offset[16];
+    uint16_t page_length[16];
     uint64_t bytes;
     uint32_t readers;
     uint32_t writers;
@@ -58,10 +61,11 @@ enum kernel_pipe_status kernel_pipe_release_endpoint(
     struct kernel_pipe *pipe,
     uint32_t endpoint);
 
-enum kernel_pipe_status kernel_pipe_read(
+enum kernel_pipe_status kernel_pipe_readv(
     struct kernel_pipe *pipe,
     struct kernel_mm *mm,
-    uint64_t user_buffer,
+    const struct kernel_uaccess_iovec *iov,
+    size_t iov_count,
     uint64_t count,
     uint32_t open_flags,
     int64_t *linux_result);

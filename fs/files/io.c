@@ -1,6 +1,7 @@
 #include "private.h"
 #include "../open_file_internal.h"
 #include "../pipe_internal.h"
+#include "../uaccess_iov_internal.h"
 
 #include <kernel/console.h>
 #include <kernel/errno.h>
@@ -46,22 +47,24 @@ static enum kernel_files_status read_pinned(
     struct kernel_files *files,
     struct kernel_mm *mm,
     struct kernel_open_file_description *description,
-    uint64_t user_buffer,
+    const struct kernel_uaccess_iovec *iov,
+    size_t iov_count,
     uint64_t count,
     int64_t *linux_result)
 {
     uint64_t request;
     uint64_t total = 0U;
+    struct kernel_uaccess_iov_cursor cursor = {iov, iov_count, 0U, 0U};
 
     if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_CONSOLE) {
-        return kernel_files_read_console(files, mm, user_buffer, count,
+        return kernel_files_read_console(files, mm, iov, iov_count, count,
                                          linux_result);
     }
     if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_PIPE) {
-        enum kernel_pipe_status pipe_status = kernel_pipe_read(
+        enum kernel_pipe_status pipe_status = kernel_pipe_readv(
             description->pipe,
             mm,
-            user_buffer,
+            iov, iov_count,
             count,
             description->open_flags,
             linux_result);
@@ -88,11 +91,14 @@ static enum kernel_files_status read_pinned(
         *linux_result = -KERNEL_EBADF;
         return KERNEL_FILES_STATUS_OK;
     }
-    if (kernel_user_range_check(user_buffer, (size_t)count) !=
-        KERNEL_UACCESS_STATUS_OK) {
-        files->record->statistics.read_failures++;
-        *linux_result = -KERNEL_EFAULT;
-        return KERNEL_FILES_STATUS_OK;
+    for (size_t index = 0U; index < iov_count; index++) {
+        if (kernel_user_range_check(iov[index].base,
+                                    (size_t)iov[index].length) !=
+            KERNEL_UACCESS_STATUS_OK) {
+            files->record->statistics.read_failures++;
+            *linux_result = -KERNEL_EFAULT;
+            return KERNEL_FILES_STATUS_OK;
+        }
     }
     if (count == 0U) {
         *linux_result = 0;
@@ -152,12 +158,10 @@ static enum kernel_files_status read_pinned(
                                         physical_address);
             return KERNEL_FILES_STATUS_STATE;
         }
-        access_status = kernel_copy_to_user(mm,
-                                            user_buffer + total,
-                                            (unsigned char *)page +
-                                                page_offset,
-                                            chunk,
-                                            &copied);
+        access_status = kernel_copy_to_user_iov(mm, &cursor,
+                                                (unsigned char *)page +
+                                                    page_offset,
+                                                chunk, &copied);
         if (kernel_open_file_advance(description, copied) !=
                 KERNEL_OPEN_FILE_STATUS_OK ||
             physical_page_release(files->heap->page_allocator,
@@ -196,6 +200,7 @@ enum kernel_files_status kernel_files_read(
     uint64_t count,
     int64_t *linux_result)
 {
+    struct kernel_uaccess_iovec iov = {user_buffer, count};
     struct kernel_open_file_description *description = 0;
     enum kernel_files_status status;
 
@@ -211,8 +216,125 @@ enum kernel_files_status kernel_files_read(
         files->record->statistics.read_failures++;
         return KERNEL_FILES_STATUS_OK;
     }
-    status = read_pinned(files, mm, description, user_buffer, count,
+    status = read_pinned(files, mm, description, &iov, 1U, count,
                          linux_result);
+    return release_io_description(files, &description, status);
+}
+
+enum kernel_files_status kernel_files_readv(
+    struct kernel_files *files,
+    struct kernel_mm *mm,
+    int64_t fd,
+    uint64_t user_iov,
+    uint64_t iovcnt,
+    int64_t *linux_result)
+{
+    struct kernel_uaccess_iovec local[8];
+    struct kernel_uaccess_iovec *iov = local;
+    struct kernel_open_file_description *description = 0;
+    uint64_t total = 0U;
+    size_t copied = 0U;
+    enum kernel_files_status status;
+    enum kernel_uaccess_status access;
+    int dispatched = 0;
+
+    if (!kernel_files_is_live(files) || mm == 0 || linux_result == 0) {
+        return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
+    }
+    files->record->statistics.read_calls++;
+    status = kernel_files_pin(files, fd, &description, linux_result);
+    if (status != KERNEL_FILES_STATUS_OK) {
+        return status;
+    }
+    if (*linux_result != 0) {
+        files->record->statistics.read_failures++;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_EPOLL) {
+        *linux_result = -KERNEL_EINVAL;
+        status = KERNEL_FILES_STATUS_OK;
+        goto out;
+    }
+    if ((kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_REGULAR ||
+         kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_PIPE) &&
+        !kernel_open_file_readable(description)) {
+        *linux_result = -KERNEL_EBADF;
+        status = KERNEL_FILES_STATUS_OK;
+        goto out;
+    }
+    if (iovcnt > 1024U) {
+        *linux_result = -KERNEL_EINVAL;
+        status = KERNEL_FILES_STATUS_OK;
+        goto out;
+    }
+    if (iovcnt > sizeof(local) / sizeof(local[0])) {
+        enum kernel_heap_status allocation =
+            kernel_heap_allocate(files->heap, iovcnt * sizeof(*iov),
+                                  (void **)&iov);
+
+        if (allocation != KERNEL_HEAP_STATUS_OK) {
+            if (allocation != KERNEL_HEAP_STATUS_EMPTY) {
+                status = KERNEL_FILES_STATUS_STATE;
+                goto out;
+            }
+            *linux_result = -KERNEL_ENOMEM;
+            status = KERNEL_FILES_STATUS_OK;
+            goto out;
+        }
+    }
+    if (iovcnt != 0U) {
+        access = kernel_copy_from_user(mm, iov, user_iov,
+                                       iovcnt * sizeof(*iov), &copied);
+        if (access != KERNEL_UACCESS_STATUS_OK ||
+            copied != iovcnt * sizeof(*iov)) {
+            *linux_result = -KERNEL_EFAULT;
+            status = access == KERNEL_UACCESS_STATUS_FAULT
+                         ? KERNEL_FILES_STATUS_OK : KERNEL_FILES_STATUS_STATE;
+            goto out;
+        }
+    }
+    for (size_t index = 0U; index < iovcnt; index++) {
+        if (iov[index].length > (uint64_t)INT64_MAX) {
+            *linux_result = -KERNEL_EINVAL;
+            status = KERNEL_FILES_STATUS_OK;
+            goto out;
+        }
+        /* Linux imports a sole iovec through import_ubuf (cap first),
+         * whereas a multi-entry vector checks each original range first. */
+        if (iovcnt == 1U && iov[index].length > KERNEL_FILES_MAX_RW_COUNT) {
+            iov[index].length = KERNEL_FILES_MAX_RW_COUNT;
+        }
+        if (kernel_user_range_check(iov[index].base,
+                                    (size_t)(iov[index].length == 0U
+                                                 ? 1U : iov[index].length)) !=
+            KERNEL_UACCESS_STATUS_OK) {
+            *linux_result = -KERNEL_EFAULT;
+            status = KERNEL_FILES_STATUS_OK;
+            goto out;
+        }
+        if (iov[index].length > KERNEL_FILES_MAX_RW_COUNT - total) {
+            iov[index].length = KERNEL_FILES_MAX_RW_COUNT - total;
+        }
+        total += iov[index].length;
+    }
+    if (total == 0U) {
+        *linux_result = 0;
+        status = KERNEL_FILES_STATUS_OK;
+        goto out;
+    }
+    status = read_pinned(files, mm, description, iov, (size_t)iovcnt,
+                         total, linux_result);
+    dispatched = 1;
+out:
+    if (iov != local &&
+        kernel_files_release_allocation(files, iov) ==
+            KERNEL_FILES_STATUS_STATE) {
+        status = KERNEL_FILES_STATUS_STATE;
+    }
+    if (!dispatched && status == KERNEL_FILES_STATUS_OK &&
+        *linux_result < 0) {
+        files->record->statistics.read_failures++;
+    }
     return release_io_description(files, &description, status);
 }
 

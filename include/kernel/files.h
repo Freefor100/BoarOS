@@ -184,6 +184,14 @@ struct kernel_uaccess_iovec {
     uint64_t length;
 };
 
+enum kernel_files_status kernel_files_readv(
+    struct kernel_files *files,
+    struct kernel_mm *mm,
+    int64_t fd,
+    uint64_t user_iov,
+    uint64_t iovcnt,
+    int64_t *linux_result);
+
 enum kernel_files_status kernel_files_writev(
     struct kernel_files *files,
     struct kernel_mm *mm,

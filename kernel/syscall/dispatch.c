@@ -25,8 +25,9 @@
 #define LINUX_SYSCALL_LSEEK 62U
 #define LINUX_SYSCALL_READ 63U
 #define LINUX_SYSCALL_WRITE 64U
-#define LINUX_SYSCALL_PREAD64 67U
+#define LINUX_SYSCALL_READV 65U
 #define LINUX_SYSCALL_WRITEV 66U
+#define LINUX_SYSCALL_PREAD64 67U
 #define LINUX_SYSCALL_PSELECT6 72U
 #define LINUX_SYSCALL_PPOLL 73U
 #define LINUX_SYSCALL_EXIT 93U
@@ -200,6 +201,11 @@ enum kernel_syscall_status kernel_syscall_dispatch(
         }
     } else if (request->number == LINUX_SYSCALL_READ) {
         if (syscall_handle_read(caller, request, &decoded) !=
+            KERNEL_SYSCALL_STATUS_OK) {
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+        }
+    } else if (request->number == LINUX_SYSCALL_READV) {
+        if (syscall_handle_readv(caller, request, &decoded) !=
             KERNEL_SYSCALL_STATUS_OK) {
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
         }
