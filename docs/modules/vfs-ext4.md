@@ -49,7 +49,7 @@ miss 路径先分配并清零页，再通过 node 的无 offset 副作用 `pread
 只读挂载下，所有上述修改操作直接返回 `-EROFS`。
 unmount 在仍有 open file 时返回 `-EBUSY`。close/unmount 的真实 ext4/block I/O 释放失败保留 CLEANUP 状态，mount 或所属文件表可重试而不会重复关闭；合法 heap/page 释放不返回可重试状态。
 
-当前 VFS 同时服务 ELF 随机读、进程文件表（支持读写与目录修改）和文件私有缺页，但仍不是完整 Linux VFS：没有通用 inode/dentry cache、路径权限、symlink、writeback、read-ahead、并发锁或多挂载。目录支持打开与按后端 cookie 查询（`kernel_vfs_dir_entry`），会返回真实的 `.`/`..` 条目；每次查询从传入的 ext4 字节位置开始，而不是从目录起点重走，顺序枚举的条目访问为 O(N)。适配层把 lwext4 的正 errno 与 EOF 分开，再向文件资源层返回负 Linux errno。页缓存只保存普通文件内容；进程层只持有 VFS mount/file 抽象，lwext4 handle 没有泄露到 task 或 syscall ABI。
+当前 VFS 同时服务 ELF 随机读、进程文件表（支持读写与目录修改）和文件私有缺页，但仍不是完整 Linux VFS：没有通用 inode/dentry cache、逐分量权限检查、硬链接、writeback、read-ahead、并发锁或多挂载。逐分量解析在 `fs/vfs.c`，对每个现存分量查询 ext4 mode，处理相对/绝对符号链接与最多 40 次展开；最终分量是否跟随由 open/stat 或创建/删除入口决定。解析工作区由 VFS heap 临时持有，释放后不留下路径指针。目录支持打开与按后端 cookie 查询（`kernel_vfs_dir_entry`），会返回真实的 `.`/`..` 条目；每次查询从传入的 ext4 字节位置开始，而不是从目录起点重走，顺序枚举的条目访问为 O(N)。适配层把 lwext4 的正 errno 与 EOF 分开，再向文件资源层返回负 Linux errno。页缓存只保存普通文件内容；进程层只持有 VFS mount/file 抽象，lwext4 handle 没有泄露到 task 或 syscall ABI。
 
 目录游标设计依据固定 Linux 快照 `f4cdf7ca9a1f`：[`fs/readdir.c`](../../references/linux/fs/readdir.c)
 的 `iterate_dir()` 在每次枚举前后同步 open file 的 `f_pos` 与 `dir_context.pos`，`filldir64()`

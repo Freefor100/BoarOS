@@ -39,6 +39,13 @@ enum kernel_open_file_status kernel_open_file_create(
     struct kernel_open_file_description **owner,
     int *linux_result);
 
+enum kernel_open_file_status kernel_open_file_create_nofollow(
+    struct kernel_heap *heap,
+    struct kernel_vfs_mount *mount,
+    const char *path,
+    struct kernel_open_file_description **owner,
+    int *linux_result);
+
 enum kernel_open_file_status kernel_open_file_create_mode(
     struct kernel_heap *heap,
     struct kernel_vfs_mount *mount,

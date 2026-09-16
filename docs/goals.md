@@ -29,7 +29,7 @@ Linux ABI 兼容是最终功能方向，不是对当前完成度的声明；READ
 | 目录枚举成本修正 | OFD 拥有可继续游标，保持独立 open、dup/fork 共享、cookie/seek、部分复制及关闭回收语义 | 已实现并由真实 ext4/QEMU 文件测试验证；当前线性适配器顺序条目访问为 O(N)，开发板吞吐基线待测，见[文件模块](modules/kernel-files.md#lseekfstatnewfstatat-与-getdents64) |
 | 用户态映像 | Linux 形态初始栈和 auxv、source-backed `ELF_PRIVATE` demand paging、`ET_EXEC`/`ET_DYN`/`PT_INTERP`、Sv39 ASLR/W^X/指令同步 | RISC-V 构造和静态入口已验证；真实动态 musl PIE、解释器、额外 DSO、初始 TLS 和运行中 dlopen TLS 已由用户态入口验证，其他动态 libc/DSO 矩阵仍待补 |
 | 其他架构与平台 | LoongArch64 2K1000LA 的 16 KiB/三级页表；VisionFive 2 的 RISC-V 板级启动与设备/DMA 边界 | 目标已确认，开发板实机验证和 LoongArch 物化器尚未完成 |
-| 后续 Linux 能力组 | 更广的动态 libc/DSO 兼容、设备文件系统（devtmpfs）、软硬链接（linkat/symlinkat）、实时信号排队与 `sigaltstack`/signalfd、线程组与共享资源的进一步扩展、外部中断、SMP、异步脏页写回及更多设备 transport | 属于长期 ABI 路线，按真实用户程序和依赖推进，不能伪装成当前已支持 |
+| 后续 Linux 能力组 | 更广的动态 libc/DSO 兼容、设备文件系统（devtmpfs）、硬链接（linkat）与更广的链接权限语义、实时信号排队与 `sigaltstack`/signalfd、线程组与共享资源的进一步扩展、外部中断、SMP、异步脏页写回及更多设备 transport | 属于长期 ABI 路线，按真实用户程序和依赖推进，不能伪装成当前已支持 |
 
 “所有 syscall”必须绑定架构、内核版本和功能范围；未实现或仅返回 `ENOSYS` 的调用不计作完成。官方测例、未特改用户程序和 LTP 用来发现缺口和防止回归，不反向定义内核的全部语义。
 

@@ -127,6 +127,25 @@ enum kernel_files_status kernel_files_openat(
     uint64_t mode,
     int64_t *linux_result);
 
+enum kernel_files_status kernel_files_symlinkat(
+    struct kernel_files *files,
+    const struct kernel_fs_context *fs,
+    struct kernel_mm *mm,
+    uint64_t user_target,
+    int64_t dirfd,
+    uint64_t user_linkpath,
+    int64_t *linux_result);
+
+enum kernel_files_status kernel_files_readlinkat(
+    struct kernel_files *files,
+    const struct kernel_fs_context *fs,
+    struct kernel_mm *mm,
+    int64_t dirfd,
+    uint64_t user_path,
+    uint64_t user_buffer,
+    uint64_t size,
+    int64_t *linux_result);
+
 enum kernel_files_status kernel_files_mkdirat(
     struct kernel_files *files,
     const struct kernel_fs_context *fs,

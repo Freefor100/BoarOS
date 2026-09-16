@@ -38,11 +38,12 @@ static int validate_open_flags(uint64_t flags, uint32_t *fd_flags)
     const uint64_t write_flags = LINUX_O_CREAT | LINUX_O_TRUNC |
                                  LINUX_O_APPEND | LINUX_O_EXCL;
     const uint64_t unsupported_flags =
-        LINUX_O_DSYNC | LINUX_O_DIRECT | LINUX_O_NOFOLLOW |
+        LINUX_O_DSYNC | LINUX_O_DIRECT |
         LINUX_O_NOATIME | LINUX_O_SYNC | LINUX_O_PATH |
         (LINUX_O_TMPFILE & ~LINUX_O_DIRECTORY);
     const uint64_t known_flags = LINUX_O_ACCMODE | write_flags |
         unsupported_flags | LINUX_O_NONBLOCK | LINUX_O_DIRECTORY |
+        LINUX_O_NOFOLLOW |
         LINUX_O_LARGEFILE | LINUX_O_CLOEXEC;
     uint64_t access_mode = flags & LINUX_O_ACCMODE;
 
@@ -144,11 +145,26 @@ enum kernel_files_status kernel_files_openat(
         *linux_result = result;
         return KERNEL_FILES_STATUS_OK;
     }
-    open_status = kernel_open_file_create(files->heap,
-                                          mount,
-                                          path,
-                                          &description,
-                                          &result);
+    if ((flags & LINUX_O_NOFOLLOW) != 0U ||
+        (flags & (LINUX_O_CREAT | LINUX_O_EXCL)) ==
+            (LINUX_O_CREAT | LINUX_O_EXCL)) {
+        open_status = kernel_open_file_create_nofollow(files->heap,
+                                                      mount,
+                                                      path,
+                                                      &description,
+                                                      &result);
+    } else {
+        open_status = kernel_open_file_create(files->heap,
+                                              mount,
+                                              path,
+                                              &description,
+                                              &result);
+    }
+    if (result == -KERNEL_ELOOP &&
+        (flags & (LINUX_O_CREAT | LINUX_O_EXCL)) ==
+            (LINUX_O_CREAT | LINUX_O_EXCL)) {
+        result = -KERNEL_EEXIST;
+    }
     if (open_status == KERNEL_OPEN_FILE_STATUS_OK &&
         result == -KERNEL_ENOENT &&
         (flags & LINUX_O_CREAT) != 0U) {
@@ -279,6 +295,150 @@ enum kernel_files_status kernel_files_openat(
     return KERNEL_FILES_STATUS_OK;
 }
 
+enum kernel_files_status kernel_files_symlinkat(
+    struct kernel_files *files,
+    const struct kernel_fs_context *fs,
+    struct kernel_mm *mm,
+    uint64_t user_target,
+    int64_t dirfd,
+    uint64_t user_linkpath,
+    int64_t *linux_result)
+{
+    struct kernel_vfs_mount *mount;
+    char *storage;
+    char *linkpath;
+    size_t target_length;
+    int result;
+    enum kernel_heap_status heap_status;
+    enum kernel_uaccess_status access_status;
+    enum kernel_fs_context_status fs_status;
+
+    if (!kernel_files_is_live(files) || !kernel_fs_context_is_live(fs) ||
+        mm == 0 || linux_result == 0) return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
+    heap_status = kernel_heap_allocate(files->heap, 2U * KERNEL_FS_PATH_MAX,
+                                       (void **)&storage);
+    if (heap_status == KERNEL_HEAP_STATUS_EMPTY) {
+        *linux_result = -KERNEL_ENOMEM;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    if (heap_status != KERNEL_HEAP_STATUS_OK) return KERNEL_FILES_STATUS_STATE;
+    linkpath = storage + KERNEL_FS_PATH_MAX;
+    access_status = kernel_copy_string_from_user(mm, storage, user_target,
+                                                 KERNEL_FS_PATH_MAX,
+                                                 &target_length);
+    if (access_status != KERNEL_UACCESS_STATUS_OK) {
+        result = access_status == KERNEL_UACCESS_STATUS_FAULT ? -KERNEL_EFAULT :
+                 access_status == KERNEL_UACCESS_STATUS_TOO_LONG ?
+                     -KERNEL_ENAMETOOLONG : 0;
+        if (finish_path(files, storage) != KERNEL_FILES_STATUS_OK ||
+            result == 0) return KERNEL_FILES_STATUS_STATE;
+        *linux_result = result;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    fs_status = kernel_fs_context_resolve_user_path(fs, mm, dirfd,
+                                                    user_linkpath, linkpath,
+                                                    KERNEL_FS_PATH_MAX,
+                                                    &mount, &result);
+    if (fs_status != KERNEL_FS_CONTEXT_STATUS_OK) {
+        (void)finish_path(files, storage);
+        return KERNEL_FILES_STATUS_STATE;
+    }
+    if (result == 0) {
+        result = target_length == 0U ? -KERNEL_ENOENT :
+            kernel_vfs_symlink(mount, storage, linkpath);
+    }
+    if (finish_path(files, storage) != KERNEL_FILES_STATUS_OK)
+        return KERNEL_FILES_STATUS_STATE;
+    *linux_result = result;
+    return KERNEL_FILES_STATUS_OK;
+}
+
+enum kernel_files_status kernel_files_readlinkat(
+    struct kernel_files *files,
+    const struct kernel_fs_context *fs,
+    struct kernel_mm *mm,
+    int64_t dirfd,
+    uint64_t user_path,
+    uint64_t user_buffer,
+    uint64_t size,
+    int64_t *linux_result)
+{
+    struct kernel_vfs_mount *mount;
+    char *storage;
+    char *buffer;
+    size_t bytes_read = 0U;
+    size_t copied = 0U;
+    int result;
+    enum kernel_heap_status heap_status;
+    enum kernel_fs_context_status fs_status;
+    enum kernel_uaccess_status access_status;
+
+    if (!kernel_files_is_live(files) || !kernel_fs_context_is_live(fs) ||
+        mm == 0 || linux_result == 0) return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
+    if (size == 0U) {
+        *linux_result = -KERNEL_EINVAL;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    heap_status = kernel_heap_allocate(files->heap, 2U * KERNEL_FS_PATH_MAX,
+                                       (void **)&storage);
+    if (heap_status == KERNEL_HEAP_STATUS_EMPTY) {
+        *linux_result = -KERNEL_ENOMEM;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    if (heap_status != KERNEL_HEAP_STATUS_OK) return KERNEL_FILES_STATUS_STATE;
+    buffer = storage + KERNEL_FS_PATH_MAX;
+    fs_status = kernel_fs_context_resolve_user_path(fs, mm, dirfd,
+                                                    user_path, storage,
+                                                    KERNEL_FS_PATH_MAX,
+                                                    &mount, &result);
+    if (fs_status != KERNEL_FS_CONTEXT_STATUS_OK) {
+        (void)finish_path(files, storage);
+        return KERNEL_FILES_STATUS_STATE;
+    }
+    if (result == 0) {
+        size_t capacity = size < KERNEL_FS_PATH_MAX ? (size_t)size :
+                          KERNEL_FS_PATH_MAX;
+        result = kernel_vfs_readlink(mount, storage, buffer, capacity,
+                                     &bytes_read);
+    }
+    if (result == 0) {
+        access_status = kernel_copy_to_user(mm, user_buffer, buffer,
+                                            bytes_read, &copied);
+        if (access_status == KERNEL_UACCESS_STATUS_FAULT)
+            result = -KERNEL_EFAULT;
+        else if (access_status != KERNEL_UACCESS_STATUS_OK ||
+                 copied != bytes_read) {
+            (void)finish_path(files, storage);
+            return KERNEL_FILES_STATUS_STATE;
+        }
+    }
+    if (finish_path(files, storage) != KERNEL_FILES_STATUS_OK)
+        return KERNEL_FILES_STATUS_STATE;
+    *linux_result = result == 0 ? (int64_t)bytes_read : result;
+    return KERNEL_FILES_STATUS_OK;
+}
+
+static void fill_linux_vfs_stat(struct kernel_linux_stat *stat,
+                                const struct kernel_vfs_stat *vfs_stat)
+{
+    stat->st_dev = vfs_stat->dev;
+    stat->st_ino = vfs_stat->ino;
+    stat->st_mode = vfs_stat->mode;
+    stat->st_nlink = vfs_stat->nlink;
+    stat->st_uid = vfs_stat->uid;
+    stat->st_gid = vfs_stat->gid;
+    stat->st_rdev = vfs_stat->rdev;
+    stat->st_size = (int64_t)vfs_stat->size;
+    stat->st_blksize = (int32_t)vfs_stat->blksize;
+    stat->st_blocks = (int64_t)vfs_stat->blocks;
+    stat->st_atime = vfs_stat->atime.seconds;
+    stat->st_atime_nsec = vfs_stat->atime.nanoseconds;
+    stat->st_mtime = vfs_stat->mtime.seconds;
+    stat->st_mtime_nsec = vfs_stat->mtime.nanoseconds;
+    stat->st_ctime = vfs_stat->ctime.seconds;
+    stat->st_ctime_nsec = vfs_stat->ctime.nanoseconds;
+}
+
 static int fill_linux_stat(
     struct kernel_linux_stat *stat,
     const struct kernel_open_file_description *description)
@@ -299,22 +459,7 @@ static int fill_linux_stat(
         int result = kernel_vfs_fstat(&description->file, &vfs_stat);
 
         if (result != 0) return result;
-        stat->st_dev = vfs_stat.dev;
-        stat->st_ino = vfs_stat.ino;
-        stat->st_mode = vfs_stat.mode;
-        stat->st_nlink = vfs_stat.nlink;
-        stat->st_uid = vfs_stat.uid;
-        stat->st_gid = vfs_stat.gid;
-        stat->st_rdev = vfs_stat.rdev;
-        stat->st_size = (int64_t)vfs_stat.size;
-        stat->st_blksize = (int32_t)vfs_stat.blksize;
-        stat->st_blocks = (int64_t)vfs_stat.blocks;
-        stat->st_atime = vfs_stat.atime.seconds;
-        stat->st_atime_nsec = vfs_stat.atime.nanoseconds;
-        stat->st_mtime = vfs_stat.mtime.seconds;
-        stat->st_mtime_nsec = vfs_stat.mtime.nanoseconds;
-        stat->st_ctime = vfs_stat.ctime.seconds;
-        stat->st_ctime_nsec = vfs_stat.ctime.nanoseconds;
+        fill_linux_vfs_stat(stat, &vfs_stat);
         return 0;
     }
     stat->st_nlink = 1U;
@@ -475,6 +620,24 @@ enum kernel_files_status kernel_files_fstatat(
         if (result != 0) {
             (void)kernel_files_release_allocation(files, path);
             *linux_result = result;
+            return KERNEL_FILES_STATUS_OK;
+        }
+        if ((flags & KERNEL_FILES_AT_SYMLINK_NOFOLLOW) != 0U) {
+            struct kernel_vfs_stat vfs_stat;
+
+            result = kernel_vfs_stat_path(mount, path, 0, &vfs_stat);
+            if (kernel_files_release_allocation(files, path) !=
+                KERNEL_FILES_STATUS_OK) return KERNEL_FILES_STATUS_STATE;
+            if (result != 0) {
+                *linux_result = result;
+                return KERNEL_FILES_STATUS_OK;
+            }
+            memset(&stat, 0, sizeof(stat));
+            fill_linux_vfs_stat(&stat, &vfs_stat);
+            copy_result = copy_stat_to_user(mm, user_buffer, &stat,
+                                            linux_result);
+            if (copy_result < 0) return KERNEL_FILES_STATUS_STATE;
+            if (copy_result > 0) *linux_result = 0;
             return KERNEL_FILES_STATUS_OK;
         }
         open_status = kernel_open_file_create(files->heap,

@@ -16,12 +16,13 @@
 static int open_file_live(
     const struct kernel_open_file_description *file);
 
-enum kernel_open_file_status kernel_open_file_create(
+static enum kernel_open_file_status create_open_file(
     struct kernel_heap *heap,
     struct kernel_vfs_mount *mount,
     const char *path,
     struct kernel_open_file_description **owner,
-    int *linux_result)
+    int *linux_result,
+    int follow_final)
 {
     struct kernel_open_file_description *file;
     enum kernel_heap_status heap_status;
@@ -42,7 +43,9 @@ enum kernel_open_file_status kernel_open_file_create(
         }
         return KERNEL_OPEN_FILE_STATUS_STATE;
     }
-    result = kernel_vfs_open(mount, path, &file->file);
+    result = follow_final
+                 ? kernel_vfs_open(mount, path, &file->file)
+                 : kernel_vfs_open_nofollow(mount, path, &file->file);
     if (result != 0) {
         file->heap = heap;
         file->vfs_closed = 1U;
@@ -55,6 +58,26 @@ enum kernel_open_file_status kernel_open_file_create(
     *owner = file;
     *linux_result = 0;
     return KERNEL_OPEN_FILE_STATUS_OK;
+}
+
+enum kernel_open_file_status kernel_open_file_create(
+    struct kernel_heap *heap,
+    struct kernel_vfs_mount *mount,
+    const char *path,
+    struct kernel_open_file_description **owner,
+    int *linux_result)
+{
+    return create_open_file(heap, mount, path, owner, linux_result, 1);
+}
+
+enum kernel_open_file_status kernel_open_file_create_nofollow(
+    struct kernel_heap *heap,
+    struct kernel_vfs_mount *mount,
+    const char *path,
+    struct kernel_open_file_description **owner,
+    int *linux_result)
+{
+    return create_open_file(heap, mount, path, owner, linux_result, 0);
 }
 
 enum kernel_open_file_status kernel_open_file_create_mode(

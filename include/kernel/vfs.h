@@ -11,6 +11,7 @@
 #define KERNEL_VFS_S_IFMT UINT32_C(0170000)
 #define KERNEL_VFS_S_IFREG UINT32_C(0100000)
 #define KERNEL_VFS_S_IFDIR UINT32_C(0040000)
+#define KERNEL_VFS_S_IFLNK UINT32_C(0120000)
 #define KERNEL_VFS_S_IFCHR UINT32_C(0020000)
 #define KERNEL_VFS_S_IFIFO UINT32_C(0010000)
 #define KERNEL_VFS_S_IXUSR UINT32_C(0000100)
@@ -70,6 +71,10 @@ int kernel_vfs_open(struct kernel_vfs_mount *mount,
                     const char *path,
                     struct kernel_vfs_file *file);
 
+int kernel_vfs_open_nofollow(struct kernel_vfs_mount *mount,
+                             const char *path,
+                             struct kernel_vfs_file *file);
+
 int kernel_vfs_create(struct kernel_vfs_mount *mount,
                       const char *path,
                       uint32_t mode,
@@ -120,6 +125,16 @@ int kernel_vfs_unlink(struct kernel_vfs_mount *mount,
 int kernel_vfs_rmdir(struct kernel_vfs_mount *mount,
                      const char *path);
 
+int kernel_vfs_symlink(struct kernel_vfs_mount *mount,
+                       const char *target,
+                       const char *path);
+
+int kernel_vfs_readlink(struct kernel_vfs_mount *mount,
+                        const char *path,
+                        char *buffer,
+                        size_t size,
+                        size_t *bytes_read);
+
 /* The file must remain open while the source is in use. */
 int kernel_vfs_file_read_source(struct kernel_vfs_file *file,
                                 struct kernel_read_source *source);
@@ -129,6 +144,11 @@ int kernel_vfs_close(struct kernel_vfs_file *file);
 /* Reads live inode metadata into a filesystem-independent representation. */
 int kernel_vfs_fstat(const struct kernel_vfs_file *file,
                      struct kernel_vfs_stat *stat);
+
+int kernel_vfs_stat_path(struct kernel_vfs_mount *mount,
+                         const char *path,
+                         int follow_final,
+                         struct kernel_vfs_stat *stat);
 
 /* Underlying ext4 inode number; zero when unavailable. */
 uint32_t kernel_vfs_file_inode(const struct kernel_vfs_file *file);

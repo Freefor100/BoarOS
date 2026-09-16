@@ -17,6 +17,7 @@
 #define LINUX_SYSCALL_FCNTL 25U
 #define LINUX_SYSCALL_MKDIRAT 34U
 #define LINUX_SYSCALL_UNLINKAT 35U
+#define LINUX_SYSCALL_SYMLINKAT 36U
 #define LINUX_SYSCALL_FTRUNCATE 46U
 #define LINUX_SYSCALL_OPENAT 56U
 #define LINUX_SYSCALL_CLOSE 57U
@@ -30,6 +31,7 @@
 #define LINUX_SYSCALL_PREAD64 67U
 #define LINUX_SYSCALL_PSELECT6 72U
 #define LINUX_SYSCALL_PPOLL 73U
+#define LINUX_SYSCALL_READLINKAT 78U
 #define LINUX_SYSCALL_EXIT 93U
 #define LINUX_SYSCALL_EXIT_GROUP 94U
 #define LINUX_SYSCALL_SET_TID_ADDRESS 96U
@@ -184,6 +186,11 @@ enum kernel_syscall_status kernel_syscall_dispatch(
             KERNEL_SYSCALL_STATUS_OK) {
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
         }
+    } else if (request->number == LINUX_SYSCALL_SYMLINKAT) {
+        if (syscall_handle_symlinkat(caller, request, &decoded) !=
+            KERNEL_SYSCALL_STATUS_OK) {
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+        }
     } else if (request->number == LINUX_SYSCALL_FTRUNCATE) {
         if (syscall_handle_ftruncate(caller, request, &decoded) !=
             KERNEL_SYSCALL_STATUS_OK) {
@@ -236,6 +243,11 @@ enum kernel_syscall_status kernel_syscall_dispatch(
         }
     } else if (request->number == LINUX_SYSCALL_NEWFSTATAT) {
         if (syscall_handle_newfstatat(caller, request, &decoded) !=
+            KERNEL_SYSCALL_STATUS_OK) {
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+        }
+    } else if (request->number == LINUX_SYSCALL_READLINKAT) {
+        if (syscall_handle_readlinkat(caller, request, &decoded) !=
             KERNEL_SYSCALL_STATUS_OK) {
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
         }
