@@ -4,6 +4,7 @@
 #include <kernel/heap.h>
 #include <kernel/open_file.h>
 #include <kernel/page.h>
+#include <kernel/task.h>
 #include <kernel/vma.h>
 #include <kernel/vfs.h>
 
@@ -2282,6 +2283,11 @@ enum kernel_mm_status kernel_mm_resolve_user_fault(
     }
     if (sv39_status != RISCV_SV39_STATUS_NOT_MAPPED) {
         return KERNEL_MM_STATUS_ADDRESS_SPACE;
+    }
+    if (vma.role == KERNEL_VMA_ROLE_STACK &&
+        vma.end - (virtual_address & ~BOAROS_PAGE_MASK) >
+            kernel_task_current_stack_limit()) {
+        return KERNEL_MM_STATUS_NOT_MAPPED;
     }
     if (riscv_sv39_user_space_satp(&record->space, &satp) !=
             RISCV_SV39_STATUS_OK ||

@@ -143,6 +143,7 @@ for marker in \
     'BoarOS: real pthread cancellation checks ok' \
     'BoarOS: real pthread dlopen TLS checks ok' \
     'BoarOS: real pthread shared fd checks ok' \
+    'BoarOS: real pthread group limits checks ok' \
     'BoarOS: real pthread lifecycle checks ok' \
     'BoarOS: real pthread futex ABI checks ok'; do
     if [ "$(grep -cxF "$marker" "$pthread_output" || true)" -ne 1 ]; then

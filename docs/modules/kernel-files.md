@@ -19,7 +19,7 @@
 清理若暂时不能完成，来源节点由文件表保留为唯一 owner，不重复累积引用；物理页和堆释放
 遵循 fail-stop 不变量。
 
-描述符表初始有 32 个槽，按 2 倍增长，硬上限为 1024。分配总是从 `next_fd` 指示的最低可能空位向后搜索；关闭较小 fd 后会回退该提示，因此当前没有预装 stdin/stdout/stderr 时第一次成功打开返回 0。`O_CLOEXEC` 作为 descriptor flag 保存在槽上；exec 提交后批量摘除这些槽，其他 fd 和 open-file offset 保持不变。
+描述符表初始有 32 个槽，按 2 倍增长，硬上限为 1024。`RLIMIT_NOFILE` 的组级软限制约束新 fd 的编号；open、pipe、dup 和 `F_DUPFD*` 均通过该上限，降低限制不关闭已有 fd，也不阻止继续使用它们。限额保存在组长而非共享 fd 表中：即使不同组通过 `CLONE_FILES` 共用槽位，也各按自己的限额分配；每次 syscall 借用文件表时更新任务句柄的限额。分配总是从 `next_fd` 指示的最低可能空位向后搜索；关闭较小 fd 后会回退该提示，因此当前没有预装 stdin/stdout/stderr 时第一次成功打开返回 0。`O_CLOEXEC` 作为 descriptor flag 保存在槽上；exec 提交后批量摘除这些槽，其他 fd 和 open-file offset 保持不变。
 
 normal open、dup/F_DUPFD、console、pipe2 和 epoll_create1 最终都经过 `table.c` 的统一 fd 安装原语。新建 OFD 与调用者已 acquire 的共享 OFD 使用两个显式入口；两者都只消费传入 ownership，不暗中改变引用计数，并统一提交槽位、open/CLOEXEC 统计和 `next_fd`。表满或安装前失败不提交这些状态。
 

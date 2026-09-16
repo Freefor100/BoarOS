@@ -2,6 +2,7 @@
 #define BOAROS_FS_FILES_PRIVATE_H
 
 #include <kernel/files.h>
+#include <kernel/rlimit.h>
 
 #include <stdint.h>
 
@@ -13,7 +14,7 @@ enum kernel_files_status kernel_files_read_console(
     uint64_t count, int64_t *linux_result);
 
 #define KERNEL_FILES_INITIAL_CAPACITY 32U
-#define KERNEL_FILES_MAX_CAPACITY 1024U
+#define KERNEL_FILES_MAX_CAPACITY ((uint32_t)KERNEL_RLIMIT_NOFILE_CAP)
 #define KERNEL_FILES_FD_CLOEXEC UINT32_C(1)
 
 struct kernel_file_slot {

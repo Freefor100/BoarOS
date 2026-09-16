@@ -2,6 +2,7 @@
 #define BOAROS_KERNEL_TASK_H
 
 #include <kernel/pid.h>
+#include <kernel/rlimit.h>
 
 struct kernel_task;
 struct kernel_mm;
@@ -31,6 +32,16 @@ enum kernel_task_status kernel_task_tid(
 enum kernel_task_status kernel_task_tgid(
     const struct kernel_task *task,
     kernel_pid_t *tgid);
+
+enum kernel_task_status kernel_task_get_rlimit(
+    const struct kernel_task *task, uint32_t resource,
+    struct kernel_rlimit64 *limit);
+enum kernel_task_status kernel_task_set_rlimit(
+    struct kernel_task *task, uint32_t resource,
+    const struct kernel_rlimit64 *limit);
+
+/* Current user task's stack soft limit; default capacity for kernel setup. */
+uint64_t kernel_task_current_stack_limit(void);
 
 enum kernel_task_status kernel_task_ppid(
     const struct kernel_task *task,

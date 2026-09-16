@@ -45,6 +45,7 @@ struct riscv_elf_layout {
     uint64_t mmap_base;
     uint64_t stack_top;
     uint64_t stack_base;
+    uint64_t stack_soft_base;
     uint64_t stack_guard;
     uint64_t vdso;
     uint64_t stack_pointer;
@@ -435,15 +436,16 @@ static enum riscv_elf_image_status prepare_stack_layout(
     layout->string_address = layout->stack_top - total_bytes;
     layout->stack_pointer =
         (layout->string_address - table_bytes) & ~UINT64_C(15);
-    if (layout->stack_pointer < layout->stack_base ||
-        layout->stack_top - layout->stack_pointer >
-            RISCV_ELF_STACK_IMAGE_LIMIT) {
+    if (layout->stack_pointer < layout->stack_soft_base)
+        return RISCV_ELF_IMAGE_STATUS_STACK_LIMIT;
+    if (layout->stack_top - layout->stack_pointer >
+        RISCV_ELF_STACK_IMAGE_LIMIT) {
         return RISCV_ELF_IMAGE_STATUS_INVALID_ARGUMENT;
     }
     layout->committed_stack_base =
         align_down_page(layout->stack_pointer - RISCV_ELF_STACK_HEADROOM);
-    if (layout->committed_stack_base < layout->stack_base) {
-        layout->committed_stack_base = layout->stack_base;
+    if (layout->committed_stack_base < layout->stack_soft_base) {
+        layout->committed_stack_base = layout->stack_soft_base;
     }
     layout->random_size = (size_t)random_bytes;
     layout->has_random = random_bytes != 0U;
@@ -782,6 +784,7 @@ enum riscv_elf_image_status riscv_elf_image_build(
     uint64_t interpreter_maximum;
     uint64_t interpreter_alignment;
     uint64_t random_value;
+    uint64_t stack_limit;
     uint8_t stack_random[16];
     uint64_t image_ceiling;
     enum riscv_elf_image_status status;
@@ -795,6 +798,12 @@ enum riscv_elf_image_status riscv_elf_image_build(
         kernel_table->state != RISCV_SV39_STATE_ACTIVE) {
         return RISCV_ELF_IMAGE_STATUS_INVALID_ARGUMENT;
     }
+    stack_limit = request->stack_limit_valid != 0U
+                      ? request->stack_limit : RISCV_ELF_STACK_RESERVE;
+    if (stack_limit > RISCV_ELF_STACK_RESERVE)
+        stack_limit = RISCV_ELF_STACK_RESERVE;
+    /* Initial stack pages and the fault-time limit are page-granular. */
+    stack_limit &= ~BOAROS_PAGE_MASK;
     main_header = kernel_elf64_source_header(request->executable_source);
     if (main_header == 0 ||
         main_header->machine != KERNEL_ELF64_MACHINE_RISCV ||
@@ -859,6 +868,7 @@ enum riscv_elf_image_status riscv_elf_image_build(
                          RISCV_ELF_STACK_RESERVE - RISCV_ELF_STACK_GUARD;
     }
     base.stack_base = base.stack_top - RISCV_ELF_STACK_RESERVE;
+    base.stack_soft_base = base.stack_top - stack_limit;
     base.stack_guard = base.stack_base - RISCV_ELF_STACK_GUARD;
     if (base.stack_guard <= BOAROS_PAGE_SIZE + RISCV_ELF_MMAP_GAP) {
         return RISCV_ELF_IMAGE_STATUS_ADDRESS_SPACE;

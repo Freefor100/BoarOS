@@ -170,3 +170,57 @@ robust mutex、socket、statvfs、utimensat 等缺失；`stat` 与 `syscall_sign
 包装脚本内的 `pthread_cancel_points` 此次通过，但先前独立 entry 的失败不能据此
 自动关闭；脚本运行顺序和测试上下文不同，需单独复跑。九条失败仍按各自首个 syscall
 或设备依赖调查，不能归因于同步信号等待。
+
+## 路径、信号等待与资源限制后的复跑
+
+`python3 tests/program-inventory/run.py --reuse-builds --suite all --output build/next-batch-inventory-final2`
+以相同的固定 libc-test/BusyBox 二进制双侧运行 228 项。Linux 228 项满足契约；BoarOS
+211 项与 Linux 的退出状态及完整输出一致，14 项独立 entry 退出不符，3 项原脚本断言失败。
+对比 `build/readv-inventory-verified/`，静态和动态 `rlimit_open_files`、`sscanf_long`、
+`pthread_cancel_points` 共六项转为通过。`rlimit_open_files` 原来报告 `setrlimit/getrlimit`
+均为 ENOSYS，现通过；`sscanf_long` 原来报告 `getrlimit(RLIMIT_STACK)` 为 ENOSYS，
+现通过。这两组与新增 `prlimit64` 能力直接对应。`pthread_cancel_points` 旧输出是
+shm_open 取消状态断言失败；新增实现未改变 shm_open 或取消路径，因此不能把这两项
+归因给资源限制。独立四个相关 entry 在 `build/prlimit-focused/` 和
+`build/recheck-cancel-sscanf/` 中再次通过，先前异常仍无独立根因。
+
+原 libc 包装脚本仍分别完整运行 107/110 项，其中 100/103 项打印 `Pass!`，
+各有七项 `FAIL`：`socket`、`stat`、`utime`、`daemon_failure`、
+`pthread_robust_detach`、`statvfs`、`syscall_sign_extend`。脚本自身的固定退出码
+不能替代逐条判断。原 BusyBox 脚本最终复跑为 45/55 条 success，余下十条 fail；
+比旧清单稳定新增 `du` 和 `find` 两条 success。后台 sleep+kill 在同一内核的两次
+清单运行中一过一败，属于未定位的时序敏感项，不能计入稳定恢复。
+
+直接 entry 的 14 项是上述七个 libc 名称的静态和动态版本。原始输出的首个阻塞：
+`socket` 缺 socket 族；`stat` 缺 `/dev/null`，且有效 UID/GID 查询仍返回 ENOSYS；
+`utime` 缺 `utimensat/futimens`；`daemon_failure` 首先在 musl `daemon()` 的 `chdir("/")`
+遇 ENOSYS，其后还依赖 `/dev/null`；`pthread_robust_detach` 缺 robust futex owner-died；
+`statvfs` 缺文件系统统计；`syscall_sign_extend` 缺 `/dev/zero`。这些是已定位的能力或
+fixture 缺口，不是本批 `prlimit64` 的回归。原始运行清单、双侧串口与逐例镜像保存在
+`build/next-batch-inventory-final2/`；此前独立运行保留在
+`build/next-batch-inventory/`、`build/next-batch-inventory-final/` 和
+`build/next-batch-inventory-verified/`。
+上述计数不表示完整 BusyBox 或 libc 兼容。
+
+限额实现的固定依据为 `references/linux/kernel/sys.c` 的 `do_prlimit()`/
+`prlimit64`（commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`）：先复制新值、
+在目标线程组内取得旧值并提交、最后复制旧值到用户；旧值输出失败不会回滚设置。
+同一版本的 `fs/file.c` 在分配新 fd 时检查软限制，`mm/vma.c` 在栈 VMA 扩展时
+检查 `RLIMIT_STACK`。BoarOS 以预留栈 VMA + 缺页实现，因而按尚未驻留的栈页
+实施软限制；该内部策略与 Linux 的 VMA 扩展点不同，不能仅凭一次溢栈信号断言
+所有栈边界一致。`tests/diff-abi/limits.c` 在固定 Linux 与 BoarOS 上记录
+open/dup/pipe、跨 PID、fork/exec 和栈故障的可观察结果；初版 128 KiB 栈探针
+受 Linux 已扩展 VMA 范围影响不稳定，改为 1 MiB 后连续运行一致。另一个 exec
+后调高 STACK 软限制并访问 1 MiB 栈的差分探针最初发现 BoarOS 永久缩小了栈 VMA，
+导致 Linux 正常退出而 BoarOS SIGSEGV；保留 8 MiB VMA、在初始装载与缺页分别执行
+软限制后，两侧记录一致。
+将 exec 子进程的软限制改为非页对齐的 65535 字节又暴露初始预映射地址未对齐、
+导致 exec 返回错误；将可提交范围按 4 KiB 页向下取整后，同一用例继续双侧一致。
+
+真实 `test-userland-riscv` 曾在 stop/continue 复合检查偶发返回 74。测试源码中的
+子进程在 `SIGCONT` 恢复后立即退出，存在父进程等待 `WCONTINUED` 前已退出的竞争；
+这与观察到的失败相符，但当次没有逐项记录 wait 返回，故不能宣称已证实唯一根因。
+该测试要验证继续事件，现让子进程持续 yield，直到父进程观察事件并发送 `SIGTERM`，
+避免自然退出参与竞争。失败原始日志在
+`build/riscv/userland-run.scTdQg/static-userland.log`；修正后多次完整真实 U-mode
+回归通过，但这不构成对所有调度时序的证明。

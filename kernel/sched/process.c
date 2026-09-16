@@ -335,6 +335,8 @@ enum kernel_scheduler_status process_group_exec_current(void)
         task->child_user_ticks = leader->child_user_ticks;
         task->child_kernel_ticks = leader->child_kernel_ticks;
         task->group_pending = leader->group_pending;
+        task->nofile_limit = leader->nofile_limit;
+        task->stack_limit = leader->stack_limit;
         for (unsigned i = 0U; i < KERNEL_SIGNAL_COUNT; i++)
             task->group_sender[i] = leader->group_sender[i];
         for (unsigned i = 0U; i < KERNEL_SIGNAL_COUNT; i++)
@@ -580,6 +582,8 @@ enum kernel_scheduler_status riscv_process_clone_current(
     child->tid_owned = 1U;
     child->group_leader = child;
     child->group_members = 1U;
+    child->nofile_limit = parent->group_leader->nofile_limit;
+    child->stack_limit = parent->group_leader->stack_limit;
     process_group_initialize(child);
     child->publish_completion = 0U;
     child->vfork_child = vfork;
@@ -1528,6 +1532,58 @@ enum kernel_task_status kernel_task_tgid(
     return KERNEL_TASK_STATUS_OK;
 }
 
+enum kernel_task_status kernel_task_get_rlimit(
+    const struct kernel_task *task, uint32_t resource,
+    struct kernel_rlimit64 *limit)
+{
+    const struct kernel_task *leader;
+    kernel_pid_t tgid;
+
+    if (limit == 0 || (resource != KERNEL_RLIMIT_NOFILE &&
+                       resource != KERNEL_RLIMIT_STACK))
+        return KERNEL_TASK_STATUS_INVALID_ARGUMENT;
+    if (kernel_task_tgid(task, &tgid) != KERNEL_TASK_STATUS_OK)
+        return KERNEL_TASK_STATUS_STATE;
+    leader = task->group_leader;
+    *limit = resource == KERNEL_RLIMIT_NOFILE ? leader->nofile_limit :
+             leader->stack_limit;
+    return KERNEL_TASK_STATUS_OK;
+}
+
+enum kernel_task_status kernel_task_set_rlimit(
+    struct kernel_task *task, uint32_t resource,
+    const struct kernel_rlimit64 *limit)
+{
+    kernel_pid_t tgid;
+
+    if (limit == 0 || limit->current > limit->maximum ||
+        (resource == KERNEL_RLIMIT_NOFILE &&
+         limit->maximum > KERNEL_RLIMIT_NOFILE_CAP) ||
+        (resource == KERNEL_RLIMIT_STACK &&
+         limit->maximum > KERNEL_RLIMIT_STACK_CAP) ||
+        (resource != KERNEL_RLIMIT_NOFILE &&
+         resource != KERNEL_RLIMIT_STACK))
+        return KERNEL_TASK_STATUS_INVALID_ARGUMENT;
+    if (kernel_task_tgid(task, &tgid) != KERNEL_TASK_STATUS_OK)
+        return KERNEL_TASK_STATUS_STATE;
+    if (resource == KERNEL_RLIMIT_NOFILE)
+        task->group_leader->nofile_limit = *limit;
+    else task->group_leader->stack_limit = *limit;
+    return KERNEL_TASK_STATUS_OK;
+}
+
+uint64_t kernel_task_current_stack_limit(void)
+{
+    struct kernel_task *task = kernel_task_current();
+    struct kernel_rlimit64 limit;
+
+    if (task == 0 || task->arch.user_mode != 1U)
+        return KERNEL_RLIMIT_STACK_CAP;
+    if (kernel_task_get_rlimit(task, KERNEL_RLIMIT_STACK, &limit) !=
+        KERNEL_TASK_STATUS_OK) __builtin_trap();
+    return limit.current;
+}
+
 enum kernel_task_status kernel_task_ppid(
     const struct kernel_task *task,
     kernel_pid_t *ppid)
@@ -1650,6 +1706,8 @@ enum kernel_task_status kernel_task_files_borrow(
         return status;
     }
     *files = &task->files;
+    task->files.nofile_limit =
+        (uint32_t)task->group_leader->nofile_limit.current;
     return KERNEL_TASK_STATUS_OK;
 }
 

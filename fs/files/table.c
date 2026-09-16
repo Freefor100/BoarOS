@@ -38,6 +38,7 @@ static void finish_files(struct kernel_files *files,
 {
     files->heap = 0;
     files->record = 0;
+    files->nofile_limit = 0U;
     files->state = state;
 }
 
@@ -74,6 +75,7 @@ static enum kernel_files_status create_files(
     record->statistics.capacity = capacity;
     files->heap = heap;
     files->record = record;
+    files->nofile_limit = KERNEL_FILES_MAX_CAPACITY;
     files->state = KERNEL_FILES_LIVE;
     return KERNEL_FILES_STATUS_OK;
 }
@@ -105,6 +107,7 @@ enum kernel_files_status kernel_files_acquire(
     source->record->references++;
     destination->heap = source->heap;
     destination->record = source->record;
+    destination->nofile_limit = source->nofile_limit;
     destination->state = KERNEL_FILES_LIVE;
     return KERNEL_FILES_STATUS_OK;
 }
@@ -129,6 +132,7 @@ enum kernel_files_status kernel_files_fork(
         return status;
     }
     destination->record->next_fd = source->record->next_fd;
+    destination->nofile_limit = source->nofile_limit;
     for (index = 0U;
          index < source->record->statistics.capacity;
          index++) {
@@ -274,16 +278,18 @@ static enum kernel_files_status find_fd_from(
     int64_t *linux_result)
 {
     uint32_t index = minimum;
+    uint32_t upper = files->nofile_limit < KERNEL_FILES_MAX_CAPACITY
+                         ? files->nofile_limit : KERNEL_FILES_MAX_CAPACITY;
 
     *linux_result = 0;
-    while (index < KERNEL_FILES_MAX_CAPACITY) {
+    while (index < upper) {
         enum kernel_files_status status =
             ensure_slot_capacity(files, index + 1U, linux_result);
 
         if (status != KERNEL_FILES_STATUS_OK || *linux_result != 0) {
             return status;
         }
-        while (index < files->record->statistics.capacity) {
+        while (index < files->record->statistics.capacity && index < upper) {
             if (files->record->slots[index].description == 0) {
                 *fd = index;
                 return KERNEL_FILES_STATUS_OK;
@@ -790,7 +796,8 @@ enum kernel_files_status kernel_files_dup3(
         *linux_result = -KERNEL_EINVAL;
         return KERNEL_FILES_STATUS_OK;
     }
-    if (newfd < 0 || (uint64_t)newfd >= KERNEL_FILES_MAX_CAPACITY) {
+    if (newfd < 0 || (uint64_t)newfd >= files->nofile_limit ||
+        (uint64_t)newfd >= KERNEL_FILES_MAX_CAPACITY) {
         *linux_result = -KERNEL_EBADF;
         return KERNEL_FILES_STATUS_OK;
     }
@@ -838,7 +845,8 @@ enum kernel_files_status kernel_files_dup2(
         *linux_result = newfd;
         return KERNEL_FILES_STATUS_OK;
     }
-    if (newfd < 0 || (uint64_t)newfd >= KERNEL_FILES_MAX_CAPACITY) {
+    if (newfd < 0 || (uint64_t)newfd >= files->nofile_limit ||
+        (uint64_t)newfd >= KERNEL_FILES_MAX_CAPACITY) {
         /* Both dup2 and dup3 reject an out-of-range target with EBADF. */
         *linux_result = -KERNEL_EBADF;
         return KERNEL_FILES_STATUS_OK;
@@ -864,7 +872,8 @@ enum kernel_files_status kernel_files_fcntl(
         command == KERNEL_FILES_F_DUPFD_CLOEXEC) {
         uint32_t index;
 
-        if (argument >= KERNEL_FILES_MAX_CAPACITY) {
+        if (argument >= files->nofile_limit ||
+            argument >= KERNEL_FILES_MAX_CAPACITY) {
             *linux_result = -KERNEL_EINVAL;
             return KERNEL_FILES_STATUS_OK;
         }

@@ -2,7 +2,10 @@
 
 #include <kernel/errno.h>
 #include <kernel/exec.h>
+#include <kernel/mm.h>
+#include <kernel/signal.h>
 #include <kernel/task.h>
+#include <kernel/uaccess.h>
 
 #include <stddef.h>
 #include <stdint.h>
@@ -12,6 +15,87 @@
 #define LINUX_CLONE_VM UINT64_C(0x100)
 #define LINUX_CLONE_VFORK UINT64_C(0x4000)
 #define LINUX_CLONE_KNOWN_FLAGS UINT64_C(0x3ffffffff)
+
+enum kernel_syscall_status syscall_handle_prlimit64(
+    struct kernel_task *caller,
+    const struct kernel_syscall_request *request,
+    struct kernel_syscall_result *decoded)
+{
+    struct kernel_rlimit64 before;
+    struct kernel_rlimit64 replacement;
+    struct kernel_mm *mm;
+    struct kernel_task *target;
+    int64_t pid = (int64_t)(int32_t)(uint32_t)request->arguments[0];
+    uint32_t resource = (uint32_t)request->arguments[1];
+    uint64_t new_address = request->arguments[2];
+    uint64_t old_address = request->arguments[3];
+    size_t copied = 0U;
+    enum kernel_uaccess_status access_status;
+
+    decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+    if (kernel_task_mm_borrow_mutable(caller, &mm) != KERNEL_TASK_STATUS_OK)
+        return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    if (new_address != 0U) {
+        access_status = kernel_copy_from_user(mm, &replacement, new_address,
+                                              sizeof(replacement), &copied);
+        if (access_status == KERNEL_UACCESS_STATUS_FAULT) {
+            decoded->value = -KERNEL_EFAULT;
+            return KERNEL_SYSCALL_STATUS_OK;
+        }
+        if (access_status != KERNEL_UACCESS_STATUS_OK ||
+            copied != sizeof(replacement))
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    }
+    target = pid == 0 ? caller :
+             pid > 0 && pid <= INT32_MAX
+                 ? kernel_signal_find_by_tid((kernel_pid_t)pid) : 0;
+    if (target == 0) {
+        decoded->value = -KERNEL_ESRCH;
+        return KERNEL_SYSCALL_STATUS_OK;
+    }
+    if (resource >= 16U) {
+        decoded->value = -KERNEL_EINVAL;
+        return KERNEL_SYSCALL_STATUS_OK;
+    }
+    if (resource != KERNEL_RLIMIT_NOFILE &&
+        resource != KERNEL_RLIMIT_STACK) {
+        decoded->value = -KERNEL_ENOTSUP;
+        return KERNEL_SYSCALL_STATUS_OK;
+    }
+    if (kernel_task_get_rlimit(target, resource, &before) !=
+        KERNEL_TASK_STATUS_OK) return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    if (new_address != 0U) {
+        uint64_t capacity = resource == KERNEL_RLIMIT_NOFILE
+                                ? KERNEL_RLIMIT_NOFILE_CAP
+                                : KERNEL_RLIMIT_STACK_CAP;
+        if (replacement.current > replacement.maximum) {
+            decoded->value = -KERNEL_EINVAL;
+            return KERNEL_SYSCALL_STATUS_OK;
+        }
+        /* All current user tasks run with root credentials. The hard cap
+         * bounds what this kernel can actually enforce. */
+        if (replacement.maximum > capacity) {
+            decoded->value = -KERNEL_EPERM;
+            return KERNEL_SYSCALL_STATUS_OK;
+        }
+        if (kernel_task_set_rlimit(target, resource, &replacement) !=
+            KERNEL_TASK_STATUS_OK) return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    }
+    if (old_address != 0U) {
+        copied = 0U;
+        access_status = kernel_copy_to_user(mm, old_address, &before,
+                                            sizeof(before), &copied);
+        if (access_status == KERNEL_UACCESS_STATUS_FAULT) {
+            decoded->value = -KERNEL_EFAULT;
+            return KERNEL_SYSCALL_STATUS_OK;
+        }
+        if (access_status != KERNEL_UACCESS_STATUS_OK ||
+            copied != sizeof(before))
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    }
+    decoded->value = 0;
+    return KERNEL_SYSCALL_STATUS_OK;
+}
 
 enum kernel_syscall_status syscall_handle_set_tid_address(
     struct kernel_task *caller,

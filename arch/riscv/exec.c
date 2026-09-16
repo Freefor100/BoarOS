@@ -37,6 +37,8 @@ static int64_t image_linux_error(enum riscv_elf_image_status status)
         return -KERNEL_ENOMEM;
     case RISCV_ELF_IMAGE_STATUS_IO:
         return -KERNEL_EIO;
+    case RISCV_ELF_IMAGE_STATUS_STACK_LIMIT:
+        return -KERNEL_E2BIG;
     case RISCV_ELF_IMAGE_STATUS_MALFORMED:
     case RISCV_ELF_IMAGE_STATUS_WRONG_ARCH:
         return -KERNEL_ENOEXEC;

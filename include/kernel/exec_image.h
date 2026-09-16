@@ -18,6 +18,8 @@ struct kernel_exec_string {
 struct kernel_exec_image_request {
     struct kernel_elf64_source *executable_source;
     struct kernel_elf64_source *interpreter_source;
+    uint64_t stack_limit;
+    uint32_t stack_limit_valid;
     struct kernel_exec_string executable;
     const struct kernel_exec_string *arguments;
     size_t argument_count;

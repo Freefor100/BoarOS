@@ -60,7 +60,7 @@ run 边界同时包含每个装载段的首个完整页、最后一个完整文�
 
 DTB `/chosen/rng-seed` 至少 32 字节时，`kernel/random.c` 以 ChaCha20 产生独立布局熵和 16 字节 `AT_RANDOM`；QEMU `virt` 的固定 DTB 输入提供该种子。没有可信种子时仍启动，但使用确定性旧布局并省略 `AT_RANDOM`，不使用时间、地址或常量冒充熵。RISC-V 布局独立随机化 PIE/解释器 bias、mmap top-down base、8 MiB 栈 reserve 顶端、brk 起点和 vDSO 页，并逐项检查对齐、Sv39 上界和 VMA 冲突；无合法空洞返回 `ENOMEM`。
 
-栈 VMA 保留 8 MiB，底部 guard 页永不映射；初次只提交覆盖序列化参数和 64 KiB headroom 的 RW/NX 页，其余页由匿名 demand-zero fault 提交。入口栈按 psABI 16 字节对齐，依次包含 `argc`、`argv[]`、`envp[]`、auxv 和字符串。当前 auxv 提供真实 `AT_PAGESZ`、`AT_PHDR/AT_PHENT/AT_PHNUM`、`AT_BASE`、`AT_FLAGS`、`AT_ENTRY`、`AT_HWCAP=IMAFDC`、`AT_CLKTCK`、固定 root UID/GID、`AT_SECURE=0`、可用时的 `AT_RANDOM`、`AT_EXECFN` 和 `AT_NULL`。
+栈 VMA 保留 8 MiB，底部 guard 页永不映射；exec 使用线程组当前 `RLIMIT_STACK` 软限制约束初始栈和提交页，按 4 KiB 页粒度计算可提交范围，但不永久缩小 VMA，因此后续调高限额仍能扩展栈。初次只提交覆盖序列化参数和最多 64 KiB headroom 的 RW/NX 页，其余页由匿名 demand-zero fault 提交；参数无法放进软限制时返回 `E2BIG` 并保持旧映像。入口栈按 psABI 16 字节对齐，依次包含 `argc`、`argv[]`、`envp[]`、auxv 和字符串。当前 auxv 提供真实 `AT_PAGESZ`、`AT_PHDR/AT_PHENT/AT_PHNUM`、`AT_BASE`、`AT_FLAGS`、`AT_ENTRY`、`AT_HWCAP=IMAFDC`、`AT_CLKTCK`、固定 root UID/GID、`AT_SECURE=0`、可用时的 `AT_RANDOM`、`AT_EXECFN` 和 `AT_NULL`。
 
 映像建立完成后，MM 记录 source-backed VMA、每 MM 的 mmap ceiling、vDSO 地址和从最高 `PT_LOAD` 内存末端得到的 brk 起点。scheduler 在提交点允许入口页尚未驻留，只要求它属于可执行 VMA；第一次取指由专用 ELF fault backing 完成。
 

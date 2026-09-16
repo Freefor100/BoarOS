@@ -54,6 +54,7 @@
 #define LINUX_SYSCALL_MMAP 222U
 #define LINUX_SYSCALL_MPROTECT 226U
 #define LINUX_SYSCALL_WAIT4 260U
+#define LINUX_SYSCALL_PRLIMIT64 261U
 #define LINUX_SYSCALL_NEWFSTATAT 79U
 #define LINUX_SYSCALL_FSTAT 80U
 #define LINUX_SYSCALL_KILL 129U
@@ -249,6 +250,11 @@ enum kernel_syscall_status kernel_syscall_dispatch(
         }
     } else if (request->number == LINUX_SYSCALL_READLINKAT) {
         if (syscall_handle_readlinkat(caller, request, &decoded) !=
+            KERNEL_SYSCALL_STATUS_OK) {
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+        }
+    } else if (request->number == LINUX_SYSCALL_PRLIMIT64) {
+        if (syscall_handle_prlimit64(caller, request, &decoded) !=
             KERNEL_SYSCALL_STATUS_OK) {
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
         }

@@ -20,7 +20,7 @@
 
 ## 身份与资源
 
-每个用户执行线程有独立 TID、FP/整数寄存器、signal mask、线程 pending、clear-child-tid、restart 状态、私有元数据页和独立的连续物理内核栈。组长承载 TGID、进程组、父子树、组 pending、退出通知及已回卷记账。双向成员环包含组长容器；组长停止执行后仍留在环中，直到组结束或非组长 exec 接管身份。
+每个用户执行线程有独立 TID、FP/整数寄存器、signal mask、线程 pending、clear-child-tid、restart 状态、私有元数据页和独立的连续物理内核栈。组长承载 TGID、进程组、父子树、组 pending、退出通知、已回卷记账及 `RLIMIT_NOFILE`/`RLIMIT_STACK`。两项限制在组内线程间共享，普通 fork 复制，exec 保留；非组长 exec 接管组身份时一并转移。双向成员环包含组长容器；组长停止执行后仍留在环中，直到组结束或非组长 exec 接管身份。
 
 普通 fork 从调用线程复制 MM 的 COW 页表/VMA、fd 表、fs context 和 disposition；OFD 仍按现有语义共享。子进程挂在调用线程的组长父子树中，并记录创建者 TID。线程 clone 通过 MM/files/fs/disposition 引用共享已有对象，不复制页表或 fd 槽。首次需要共享 disposition 而父线程尚无表时，会按需分配表页。
 
@@ -68,6 +68,6 @@ zombie 先逻辑回收再复制 status/rusage，因此坏输出指针的 EFAULT 
 
 `make test-stack-usage` 强制重建隔离的生产对象，编译器 `-fstack-usage` 产出逐函数记录；host probe 从实际栈配置和 Trap Frame 头计算容量、guard、汇编 Frame 与余量预算，避免测试大栈或旧报告污染门禁。`tests/stack-usage.py` 拒绝超出“栈容量减 16 字节、288 字节汇编 Trap Frame、1024 字节余量”的单帧及无界动态栈；该检查不能证明完整调用链。真实 root-init、静态 musl 与动态 pthread 测试另要求已退出任务的最小实测余量至少 1024 字节，不足时必须扩大栈后重新运行。Canary 用于发现破坏，填充测量用于观察高水位；两者都不等价于未映射 guard page，也不证明未执行分支的栈界。ASID 0 的切换刷新成本、FIFO/100 Hz tick、线性 wait4 与 deadline 扫描仍存在。
 
-聚焦入口为 `make test-stack-usage`、`make test-scheduler-cases-riscv`、`make test-scheduler-riscv`、`make test-files-riscv`、`make test-signal-riscv` 和 `make test-root-init-riscv`；组合消费者复用 `make test-userland-riscv`，阶段收口使用 `make test-riscv`。各次实际通过范围以 README 和提交验证说明为准，不把实现路径存在等同于全部线程负载已验证。
+聚焦入口为 `make test-stack-usage`、`make test-scheduler-cases-riscv`、`make test-scheduler-riscv`、`make test-files-riscv`、`make test-signal-riscv` 和 `make test-root-init-riscv`；组合消费者复用 `make test-userland-riscv`，其中真实 pthread 探针从工作线程修改两项组限额、在主线程观察并恢复，还检查未实现资源不伪造成功。阶段收口使用 `make test-riscv`。各次实际通过范围以 README 和提交验证说明为准，不把实现路径存在等同于全部线程负载已验证。
 
 尚无 SMP、MAP_SHARED、PI futex、实时信号队列、sigaltstack、clone3、内核 robust-list 回收或 LoongArch context。固定语义依据见学习总结的 Linux commit 与 musl 归档。

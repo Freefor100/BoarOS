@@ -701,6 +701,15 @@ enum kernel_exec_status kernel_execve_prepare(
                            transaction->string_bytes);
     image_request.executable_source = transaction->executable_source;
     image_request.interpreter_source = transaction->interpreter_source;
+    {
+        struct kernel_rlimit64 stack_limit;
+
+        if (kernel_task_get_rlimit(task, KERNEL_RLIMIT_STACK,
+                                   &stack_limit) != KERNEL_TASK_STATUS_OK)
+            return finish_prepare_state(task, transaction);
+        image_request.stack_limit = stack_limit.current;
+        image_request.stack_limit_valid = 1U;
+    }
     image_request.executable.bytes = transaction->original_path;
     image_request.executable.length = filename_length;
     image_request.arguments = transaction->arguments;

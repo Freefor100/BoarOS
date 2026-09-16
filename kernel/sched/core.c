@@ -870,6 +870,10 @@ enum kernel_scheduler_status kernel_user_thread_create(
     thread->wait_status = 0U;
     thread->group_leader = thread;
     thread->group_members = 1U;
+    thread->nofile_limit = (struct kernel_rlimit64){
+        KERNEL_RLIMIT_NOFILE_CAP, KERNEL_RLIMIT_NOFILE_CAP};
+    thread->stack_limit = (struct kernel_rlimit64){
+        KERNEL_RLIMIT_STACK_CAP, KERNEL_RLIMIT_STACK_CAP};
     process_group_initialize(thread);
     thread->completion.tid = tid;
     thread->completion.tgid = tid;

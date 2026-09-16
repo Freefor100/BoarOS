@@ -93,6 +93,7 @@ _Static_assert(sizeof(struct kernel_linux_stat) == 128U,
 struct kernel_files {
     struct kernel_heap *heap;
     struct kernel_files_record *record;
+    uint32_t nofile_limit;
     enum kernel_files_state state;
 };
 

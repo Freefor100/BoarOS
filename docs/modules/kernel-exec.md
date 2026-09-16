@@ -58,7 +58,7 @@ RISC-V 后端固定 Sv39/4 KiB，并支持：
 -> sret 到新入口
 ```
 
-提交后不撤销新映像。TGID、cwd、files、fs context 和非 `FD_CLOEXEC` fd/OFD offset 保留；非组长执行 exec 时调用线程接管原 TGID 作为 TID，旧 TID 释放。信号 disposition 按 exec 规则重置，F/D 状态清零。旧 MM 或 source 的真实 VFS/I/O 清理错误由持久 owner 继续处理，不改写新映像已经成功的结果。
+提交后不撤销新映像。TGID、cwd、files、fs context、`RLIMIT_NOFILE`/`RLIMIT_STACK` 和非 `FD_CLOEXEC` fd/OFD offset 保留；新栈布局按保留的软限制建立。非组长执行 exec 时调用线程接管原 TGID 作为 TID，旧 TID 释放。信号 disposition 按 exec 规则重置，F/D 状态清零。旧 MM 或 source 的真实 VFS/I/O 清理错误由持久 owner 继续处理，不改写新映像已经成功的结果。
 
 ## 验证与边界
 

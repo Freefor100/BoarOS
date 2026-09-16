@@ -123,6 +123,8 @@ struct kernel_task {
     uint32_t group_exiting;
     uint32_t group_execing;
     uint32_t group_stopped;
+    struct kernel_rlimit64 nofile_limit;
+    struct kernel_rlimit64 stack_limit;
     struct kernel_wait_queue group_wait_queue;
     uint64_t group_pending;
     uint32_t group_sender[KERNEL_SIGNAL_COUNT];

@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/syscall.h>
+#include <sys/resource.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -820,6 +821,59 @@ static int run_check(const char *name, const char *marker,
     return fflush(stdout) == 0 ? 0 : 1;
 }
 
+struct group_limit_case {
+    struct rlimit nofile;
+    struct rlimit stack;
+    int result;
+};
+
+static void *group_limit_worker(void *opaque)
+{
+    struct group_limit_case *test = opaque;
+    struct rlimit nofile = test->nofile;
+    struct rlimit stack = test->stack;
+    nofile.rlim_cur--;
+    stack.rlim_cur -= 4096;
+    if (setrlimit(RLIMIT_NOFILE, &nofile) != 0 ||
+        setrlimit(RLIMIT_STACK, &stack) != 0 ||
+        getrlimit(RLIMIT_NOFILE, &nofile) != 0 ||
+        getrlimit(RLIMIT_STACK, &stack) != 0 ||
+        nofile.rlim_cur != test->nofile.rlim_cur - 1 ||
+        stack.rlim_cur != test->stack.rlim_cur - 4096)
+        test->result = 1;
+    return 0;
+}
+
+static int check_group_limits(void)
+{
+    struct group_limit_case test = {0};
+    struct rlimit observed;
+    pthread_t thread;
+    int result = 0;
+
+    if (getrlimit(RLIMIT_NOFILE, &test.nofile) != 0 ||
+        getrlimit(RLIMIT_STACK, &test.stack) != 0 ||
+        test.nofile.rlim_cur < 4 || test.stack.rlim_cur < 8192)
+        return 1;
+    if (pthread_create(&thread, 0, group_limit_worker, &test) != 0)
+        return 2;
+    if (pthread_join(thread, 0) != 0 || test.result != 0)
+        result = 3;
+    if (getrlimit(RLIMIT_NOFILE, &observed) != 0 ||
+        observed.rlim_cur != test.nofile.rlim_cur - 1)
+        result = 4;
+    if (getrlimit(RLIMIT_STACK, &observed) != 0 ||
+        observed.rlim_cur != test.stack.rlim_cur - 4096)
+        result = 5;
+    if (setrlimit(RLIMIT_NOFILE, &test.nofile) != 0 ||
+        setrlimit(RLIMIT_STACK, &test.stack) != 0)
+        return 6;
+    errno = 0;
+    if (getrlimit(RLIMIT_CORE, &observed) != -1 || errno != ENOTSUP)
+        return 7;
+    return result;
+}
+
 int main(int argc, char **argv)
 {
     if (argc == 3 && strcmp(argv[1], "execed") == 0)
@@ -839,6 +893,9 @@ int main(int argc, char **argv)
     if (run_check("shared fd",
                   "BoarOS: real pthread shared fd checks ok",
                   check_shared_fd_pin) != 0) return 5;
+    if (run_check("group limits",
+                  "BoarOS: real pthread group limits checks ok",
+                  check_group_limits) != 0) return 8;
     if (run_check("thread lifecycle",
                   "BoarOS: real pthread lifecycle checks ok",
                   check_thread_lifecycle) != 0) return 6;
