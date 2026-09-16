@@ -49,6 +49,7 @@ SCHEDULER_BOOT_TEST_KERNEL_RV := \
 SYSCALL_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-syscall-rv
 ELF64_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-elf64-rv
 ROOT_INIT_PROGRAM_RV := $(BUILD_DIR)/tests/user/root-init-rv
+ROOT_ORPHAN_PROGRAM_RV := $(BUILD_DIR)/tests/user/root-orphan-rv
 UACCESS_OOM_PROGRAM_RV := $(BUILD_DIR)/tests/user/uaccess-oom-rv
 ROOT_EXEC_STAGE2_RV := $(BUILD_DIR)/tests/user/root-exec-stage2-rv
 ROOT_EXEC_STAGE3_RV := $(BUILD_DIR)/tests/user/root-exec-stage3-rv
@@ -388,6 +389,8 @@ ELF64_TEST_OBJECTS := \
 	$(patsubst %.c,$(BUILD_DIR)/%.o,$(ELF64_TEST_C_SOURCES))
 ROOT_INIT_PROGRAM_OBJECT_RV := \
 	$(BUILD_DIR)/tests/user/root_init.o
+ROOT_ORPHAN_PROGRAM_OBJECT_RV := \
+	$(BUILD_DIR)/tests/user/root_orphan_init.o
 UACCESS_OOM_PROGRAM_OBJECT_RV := \
 	$(BUILD_DIR)/tests/user/uaccess_oom.o
 ROOT_EXEC_STAGE2_OBJECT_RV := \
@@ -702,6 +705,16 @@ $(ROOT_INIT_PROGRAM_RV): $(ROOT_INIT_PROGRAM_OBJECT_RV) \
 		-T tests/riscv/user_elf.ld -Wl,--build-id=none \
 		-Wl,--gc-sections -o $@ $(ROOT_INIT_PROGRAM_OBJECT_RV)
 
+$(ROOT_ORPHAN_PROGRAM_OBJECT_RV): tests/riscv/root_orphan_init.S
+	@mkdir -p $(dir $@)
+	$(CC) $(CPPFLAGS) $(ASFLAGS) -MMD -MP -c $< -o $@
+
+$(ROOT_ORPHAN_PROGRAM_RV): $(ROOT_ORPHAN_PROGRAM_OBJECT_RV) \
+		tests/riscv/user_elf.ld
+	$(CC) $(ARCH_FLAGS) -nostdlib -nostartfiles -static -no-pie \
+		-T tests/riscv/user_elf.ld -Wl,--build-id=none \
+		-Wl,--gc-sections -o $@ $(ROOT_ORPHAN_PROGRAM_OBJECT_RV)
+
 $(UACCESS_OOM_PROGRAM_OBJECT_RV): tests/riscv/uaccess_oom.S
 	@mkdir -p $(dir $@)
 	$(CC) $(CPPFLAGS) $(ASFLAGS) -MMD -MP -c $< -o $@
@@ -816,7 +829,8 @@ test-riscv: test-dtb-riscv test-page-riscv test-heap-riscv \
 	test-sv39-riscv test-sv39-fault-riscv \
 	test-trap-return-riscv test-timer-riscv test-boot-riscv \
 	test-high-half-trap-riscv test-no-identity-riscv \
-	test-root-init-riscv test-uaccess-oom-riscv test-icache-riscv \
+	test-root-init-riscv test-root-orphan-riscv \
+	test-uaccess-oom-riscv test-icache-riscv \
 	test-demand-page-riscv test-root-boot-cleanup-riscv \
 	test-exec-riscv test-idle-riscv
 
@@ -951,6 +965,16 @@ test-root-init-riscv: $(KERNEL_RV) $(ROOT_INIT_PROGRAM_RV) \
 		VIRTIO_MMIO_FORCE_LEGACY=false \
 		KERNEL_RV=$(KERNEL_RV) \
 		ROOT_INIT_PROGRAM_RV=$(ROOT_INIT_PROGRAM_RV) \
+		ROOT_EXEC_STAGE2_RV=$(ROOT_EXEC_STAGE2_RV) \
+		ROOT_EXEC_STAGE3_RV=$(ROOT_EXEC_STAGE3_RV) \
+		./tests/root-init-riscv.sh
+
+.PHONY: test-root-orphan-riscv
+test-root-orphan-riscv: $(KERNEL_RV) $(ROOT_ORPHAN_PROGRAM_RV) \
+		$(ROOT_EXEC_STAGE2_RV) $(ROOT_EXEC_STAGE3_RV)
+	QEMU_RISCV64=$(QEMU_RISCV64) QEMU_MEMORY=$(QEMU_MEMORY) \
+		KERNEL_RV=$(KERNEL_RV) \
+		ROOT_INIT_PROGRAM_RV=$(ROOT_ORPHAN_PROGRAM_RV) \
 		ROOT_EXEC_STAGE2_RV=$(ROOT_EXEC_STAGE2_RV) \
 		ROOT_EXEC_STAGE3_RV=$(ROOT_EXEC_STAGE3_RV) \
 		./tests/root-init-riscv.sh

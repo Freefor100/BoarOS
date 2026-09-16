@@ -466,7 +466,7 @@ enum riscv_root_boot_status riscv_root_boot_finish(
     struct kernel_heap_statistics *heap_statistics,
     uint64_t *available_pages)
 {
-    int cleanup_failed = 0;
+    int error;
 
     if (root == 0 || completion == 0 || heap_statistics == 0 ||
         available_pages == 0 || root->state != RISCV_ROOT_BOOT_LIVE ||
@@ -474,32 +474,56 @@ enum riscv_root_boot_status riscv_root_boot_finish(
         completion->tid != 1 || completion->tgid != 1) {
         return RISCV_ROOT_BOOT_STATUS_INVALID;
     }
-    if (root->cleanup_interpreter_source != 0 &&
-        kernel_elf64_source_release(&root->cleanup_interpreter_source) !=
-            KERNEL_ELF64_SOURCE_STATUS_OK) {
-        cleanup_failed = 1;
+    root->finish_failure = RISCV_ROOT_FINISH_NONE;
+    root->finish_error = 0;
+    if (root->cleanup_interpreter_source != 0) {
+        error = (int)kernel_elf64_source_release(
+            &root->cleanup_interpreter_source);
+        if (error != KERNEL_ELF64_SOURCE_STATUS_OK) {
+            root->finish_failure |= RISCV_ROOT_FINISH_INTERPRETER_SOURCE;
+            root->finish_error = error;
+        }
     }
-    if (root->cleanup_executable_source != 0 &&
-        kernel_elf64_source_release(&root->cleanup_executable_source) !=
-            KERNEL_ELF64_SOURCE_STATUS_OK) {
-        cleanup_failed = 1;
+    if (root->cleanup_executable_source != 0) {
+        error = (int)kernel_elf64_source_release(
+            &root->cleanup_executable_source);
+        if (error != KERNEL_ELF64_SOURCE_STATUS_OK) {
+            root->finish_failure |= RISCV_ROOT_FINISH_EXECUTABLE_SOURCE;
+            root->finish_error = error;
+        }
     }
-    if (cleanup_failed) {
+    if (root->finish_failure != RISCV_ROOT_FINISH_NONE) {
         return RISCV_ROOT_BOOT_STATUS_CLEANUP;
     }
-    if (kernel_vfs_unmount(&root->mount) != 0 ||
-        kernel_page_cache_destroy(&root->page_cache) !=
-            KERNEL_PAGE_CACHE_STATUS_OK ||
-        riscv_virtio_mmio_block_destroy(&root->device) !=
-            RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK) {
+    error = kernel_vfs_unmount(&root->mount);
+    if (error != 0) {
+        root->finish_failure = RISCV_ROOT_FINISH_UNMOUNT;
+        root->finish_error = error;
+        return RISCV_ROOT_BOOT_STATUS_CLEANUP;
+    }
+    error = (int)kernel_page_cache_destroy(&root->page_cache);
+    if (error != KERNEL_PAGE_CACHE_STATUS_OK) {
+        root->finish_failure = RISCV_ROOT_FINISH_PAGE_CACHE;
+        root->finish_error = error;
+        return RISCV_ROOT_BOOT_STATUS_CLEANUP;
+    }
+    error = (int)riscv_virtio_mmio_block_destroy(&root->device);
+    if (error != RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK) {
+        root->finish_failure = RISCV_ROOT_FINISH_DEVICE;
+        root->finish_error = error;
         return RISCV_ROOT_BOOT_STATUS_CLEANUP;
     }
 
     kernel_heap_get_statistics(&root->heap, heap_statistics);
     *available_pages = physical_page_available(root->heap.page_allocator);
     if (heap_statistics->live_allocations != 0U ||
-        heap_statistics->current_pages != 0U ||
-        *available_pages != root->baseline_pages) {
+        heap_statistics->current_pages != 0U) {
+        root->finish_failure |= RISCV_ROOT_FINISH_HEAP_BASELINE;
+    }
+    if (*available_pages != root->baseline_pages) {
+        root->finish_failure |= RISCV_ROOT_FINISH_PAGE_BASELINE;
+    }
+    if (root->finish_failure != RISCV_ROOT_FINISH_NONE) {
         return RISCV_ROOT_BOOT_STATUS_CLEANUP;
     }
     root->state = RISCV_ROOT_BOOT_FINISHED;

@@ -808,6 +808,7 @@ void kernel_main(unsigned long hart_id, const void *dtb)
     for (;;) {
         uintptr_t interrupt_status = riscv_interrupt_save();
         struct kernel_thread_completion completion;
+        struct kernel_thread_completion init_completion;
         int init_reaped = 0;
 
         do {
@@ -815,8 +816,8 @@ void kernel_main(unsigned long hart_id, const void *dtb)
             if (scheduler_status == KERNEL_SCHEDULER_STATUS_OK &&
                 root_started && completion.kind == KERNEL_THREAD_KIND_USER &&
                 completion.tgid == 1) {
+                init_completion = completion;
                 init_reaped = 1;
-                break;
             }
         } while (scheduler_status == KERNEL_SCHEDULER_STATUS_OK ||
                  (scheduler_status == KERNEL_SCHEDULER_STATUS_EMPTY &&
@@ -827,10 +828,30 @@ void kernel_main(unsigned long hart_id, const void *dtb)
             uint64_t available_pages;
 
             root_status = riscv_root_boot_finish(&root_boot,
-                                                  &completion,
+                                                  &init_completion,
                                                   &heap_statistics,
                                                   &available_pages);
             if (root_status != RISCV_ROOT_BOOT_STATUS_OK) {
+                if (root_status == RISCV_ROOT_BOOT_STATUS_CLEANUP) {
+                    virt_uart_puts("BoarOS: root finish failure stage=");
+                    virt_uart_put_hex(root_boot.finish_failure);
+                    virt_uart_puts(" error=");
+                    virt_uart_put_hex((unsigned long)(uint32_t)
+                                      root_boot.finish_error);
+                    if ((root_boot.finish_failure &
+                         (RISCV_ROOT_FINISH_HEAP_BASELINE |
+                          RISCV_ROOT_FINISH_PAGE_BASELINE)) != 0U) {
+                        virt_uart_puts(" heap-live=");
+                        virt_uart_put_hex(heap_statistics.live_allocations);
+                        virt_uart_puts(" heap-pages=");
+                        virt_uart_put_hex(heap_statistics.current_pages);
+                        virt_uart_puts(" available=");
+                        virt_uart_put_hex(available_pages);
+                        virt_uart_puts(" baseline=");
+                        virt_uart_put_hex(root_boot.baseline_pages);
+                    }
+                    virt_uart_putc('\n');
+                }
                 shutdown_for_root_boot_error(root_status);
             }
             struct kernel_stack_statistics stack_statistics;

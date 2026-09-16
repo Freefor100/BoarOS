@@ -20,7 +20,7 @@ VFS 文件成为精确 `read_at` 源，ELF source 一次解析 RISC-V `ET_EXEC`/
 
 PID 1 可以普通 clone 子进程并通过 wait4 回收。子进程退出时先释放 exec/files/fs/MM 重资源，再保留 PID、任务页和 wait status 成为 zombie；若真实 VFS/block I/O 清理失败则由 idle 从 exited 队列按 owner 状态继续尝试，任务仍在自身栈上时任务页也会延后回收。子进程继续派生的任务在父进程退出时重新挂到仍存活的 PID 1，因而不会因中间父进程消失而丢失可等待事件。
 
-Completion 在任务对象与 PID 被释放前快照 TID/TGID。PID 1 自身退出时，尚存子进程会成为 parentless 并由 idle 静默清理；只有 PID 1 的全部文件资源、fs context、MM、TID 和任务页都已经释放，boot idle 才收到 PID 1 completion。复合清理失败保留准确 owner 阶段，不会提前卸载仍被 OFD/fs context 借用的根 mount。
+Completion 在任务对象与 PID 被释放前快照 TID/TGID。PID 1 自身退出时，尚存子进程会成为 parentless 并由 idle 静默清理；boot idle 保存 PID 1 completion，继续排空同轮 exited 队列中被重挂的孤儿 zombie，再检查根资源基线。否则 PID 1 恰好先于孤儿 zombie 被回收时会残留一个任务元数据页。复合清理失败保留准确 owner 阶段，不会提前卸载仍被 OFD/fs context 借用的根 mount；正常结束失败日志区分 ELF source、unmount、page cache、device、heap 与物理页基线。
 
 当前没有用户空间重启或 init supervision，因此 PID 1 正常退出和故障都视为系统终止条件。根启动对象随后卸载 ext4、复位 VirtIO device、归还队列和堆页，并要求物理空闲页精确回到开始根启动前的基线、heap live/current pages 均为零，最后调用 SBI shutdown。
 
@@ -37,4 +37,4 @@ QEMU_MEMORY=16G make test-exec-riscv
 make test-idle-riscv
 ```
 
-fixture 写入真实 ext4 的静态 ELF 以及 userland runner 使用的动态 musl PIE、解释器、额外 DSO 和 TLS；镜像还包含一个 9000 字节确定性数据文件、不可执行数据文件和可执行的非 ELF 脚本。程序在 U-mode 检查初始栈、errno、exec 与父子生命周期后以状态 42 调用 `exit(93)`。runner 要求 PID 1 身份、父子状态、fd/MM 语义、完整资源基线和 SBI 关机均成立。`test-root-boot-cleanup-riscv` 在 fs context 创建后注入一次真实 ext4 block write 失败，要求 mount owner 保留，root boot 最多三次清理尝试后成功卸载；无盘测试仍要求 timer idle 持续工作。
+fixture 写入真实 ext4 的静态 ELF 以及 userland runner 使用的动态 musl PIE、解释器、额外 DSO 和 TLS；镜像还包含一个 9000 字节确定性数据文件、不可执行数据文件和可执行的非 ELF 脚本。程序在 U-mode 检查初始栈、errno、exec 与父子生命周期后以状态 42 调用 `exit(93)`。runner 要求 PID 1 身份、父子状态、fd/MM 语义、完整资源基线和 SBI 关机均成立。`make test-root-orphan-riscv` 让 PID 1 留下未等待的 zombie 子进程，验证 PID 1 completion 后继续排空退出队列。`test-root-boot-cleanup-riscv` 在 fs context 创建后注入一次真实 ext4 block write 失败，要求 mount owner 保留，root boot 最多三次清理尝试后成功卸载；无盘测试仍要求 timer idle 持续工作。

@@ -150,5 +150,11 @@ robust mutex、socket、statvfs、utimensat 等缺失；`stat` 与 `syscall_sign
 
 此前一次全量复跑的静态 libc 包装案例输出了完整 `SUITE END`，但 PID 1 退出时报告
 `root boot error status=0xb`，因此保留在 `build/readv-inventory-final/` 中并计为
-`guest-incomplete`。相同内核的单例重跑及本节完整 228 项复跑均完成资源清理；目前只确认
-这次退出清理异常未稳定复现，不将异常运行计入上述通过数或归因于具体 syscall。
+`guest-incomplete`。增加分阶段诊断后，固定内核与 fixture 的 20 次重复中第 11 次复现：
+`stage=0x40`，堆已清空，物理页比基线少一页。根因是 boot idle 收到 PID 1 completion
+就停止本轮回收；PID 1 的未等待 zombie 子进程此时已被重挂到 exited 队列尾部，
+其任务元数据页仍由队列拥有。新增真实 U-mode `/init` 探针让子进程先成为 zombie、
+父进程不调用 wait4 就退出；修复前稳定失败，排空该队列后通过。相同包装场景在修复后的
+20 次固定内核/fixture 重复中均完成资源清理。诊断重复日志保存在
+`build/root-finish-repeat/` 与 `build/root-finish-fixed-repeat/`，原异常运行仍不计入通过数；
+这不是 libc syscall 的直接失败。

@@ -41,6 +41,19 @@ enum riscv_root_boot_state {
     RISCV_ROOT_BOOT_FAILED,
 };
 
+/* Identifies the first failing owner during normal PID 1 teardown.  Source
+ * releases can both fail, so those two bits may be present together. */
+enum riscv_root_finish_failure {
+    RISCV_ROOT_FINISH_NONE = 0,
+    RISCV_ROOT_FINISH_INTERPRETER_SOURCE = 1U << 0,
+    RISCV_ROOT_FINISH_EXECUTABLE_SOURCE = 1U << 1,
+    RISCV_ROOT_FINISH_UNMOUNT = 1U << 2,
+    RISCV_ROOT_FINISH_PAGE_CACHE = 1U << 3,
+    RISCV_ROOT_FINISH_DEVICE = 1U << 4,
+    RISCV_ROOT_FINISH_HEAP_BASELINE = 1U << 5,
+    RISCV_ROOT_FINISH_PAGE_BASELINE = 1U << 6,
+};
+
 struct riscv_root_boot {
     struct kernel_heap heap;
     struct kernel_page_cache page_cache;
@@ -56,6 +69,8 @@ struct riscv_root_boot {
     struct kernel_fs_context cleanup_fs;
     uint32_t cleanup_device_owned;
     uint64_t baseline_pages;
+    uint32_t finish_failure;
+    int32_t finish_error;
     enum riscv_root_boot_status failure_status;
     enum riscv_root_boot_state state;
 };
