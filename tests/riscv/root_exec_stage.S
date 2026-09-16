@@ -1,6 +1,6 @@
     .section .text.start, "ax", @progbits
 #ifndef ROOT_FAULT_WAIT_STATUS
-#define ROOT_FAULT_WAIT_STATUS 0x8b
+#define ROOT_FAULT_WAIT_STATUS 11
 #endif
 
     .align 2
@@ -409,8 +409,7 @@ _start:
     li t2, 0x2800
     bne t1, t2, .Lfailure
 
-    # A user page fault is reported as a SIGSEGV-style wait status with the
-    # core-producing default-action bit.
+    # Report SIGSEGV without WCOREDUMP: no core file was produced.
     li a0, 17
     li a1, 0
     li a2, 0

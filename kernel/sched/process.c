@@ -1305,10 +1305,11 @@ static uint32_t user_wait_status(
         return 9U; /* SIGKILL */
     }
     if (completion->reason == KERNEL_THREAD_EXIT_SIGNAL) {
-        return ((uint32_t)completion->status & UINT32_C(0x7f)) |
-               (completion->detail != 0U ? UINT32_C(0x80) : 0U);
+        /* A core-producing default action does not mean a dump was written.
+         * BoarOS has no core writer; Linux sets bit 7 only after a dump. */
+        return (uint32_t)completion->status & UINT32_C(0x7f);
     }
-    return fault_wait_status(completion->status) | UINT32_C(0x80);
+    return fault_wait_status(completion->status);
 }
 
 static enum kernel_scheduler_status reparent_children(

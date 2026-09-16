@@ -76,7 +76,7 @@ BoarOS 普通 clone 已复制 fd 槽数组并给每个继承的 open file descri
 
 BoarOS 也采用这个边界。退出路径先切回稳定内核地址空间，再在任务自己的内核栈上释放 exec/files/fs/MM；清理完整且存在父任务时成为 zombie。任务页不能在当前仍使用它的栈上释放，所以它必须保留到父进程 wait。真实 VFS/block I/O 清理错误会把任务留在 exited 清理队列，由 idle 在可信栈上按 owner 状态继续尝试；合法页和堆释放完成即返回，分配器不变量错误进入 fatal。
 
-普通退出码在 wait status 中放在 bit 8..15；信号终止使用低 7 位，core 默认动作另置 bit 7。同步异常则转换为信号终止形态，例如非法指令对应 SIGILL、地址访问故障通常对应 SIGSEGV。标准信号现在可以在用户返回尾进入 handler，`rt_sigreturn` 恢复整数/FP frame；实时排队和备用信号栈仍未实现。
+普通退出码在 wait status 中放在 bit 8..15；信号终止使用低 7 位；bit 7 只表示实际生成 core，不能按信号默认动作设置。BoarOS 尚无 core writer，因此不设置该位。依据固定 Linux `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 `references/linux/fs/coredump.c::coredump_finish()`，该位由 `core_dumped` 控制；同架构差分揭示了此前错误设置该位的问题。同步异常则转换为信号终止形态，例如非法指令对应 SIGILL、地址访问故障通常对应 SIGSEGV。标准信号现在可以在用户返回尾进入 handler，`rt_sigreturn` 恢复整数/FP frame；实时排队和备用信号栈仍未实现。
 
 ## wait、阻塞与唤醒
 

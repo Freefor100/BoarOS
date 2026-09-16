@@ -283,9 +283,8 @@ _start:
     bne a0, s7, .Lfailure
     la t0, .Lmmap_wait_status
     lw t1, 0(t0)
-    # SIGBUS has a core-producing default action, so Linux wait status
-    # carries WCOREDUMP in addition to the terminating signal number.
-    li t2, 0x87
+    # No core file was produced: report SIGBUS without WCOREDUMP.
+    li t2, 7
     bne t1, t2, .Lfailure
 
     mv a0, s8
