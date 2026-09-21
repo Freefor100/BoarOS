@@ -56,6 +56,64 @@ static enum kernel_files_status read_pinned(
     uint64_t total = 0U;
     struct kernel_uaccess_iov_cursor cursor = {iov, iov_count, 0U, 0U};
 
+    if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_EPOLL) {
+        *linux_result = -KERNEL_EINVAL;
+        files->record->statistics.read_failures++;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    if (!kernel_open_file_readable(description)) {
+        *linux_result = -KERNEL_EBADF;
+        files->record->statistics.read_failures++;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_NULL ||
+        kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_ZERO) {
+        if (iov_count == 1U && count == 0U && iov[0].base != 0U &&
+            kernel_user_range_check(iov[0].base - 1U, 1U) !=
+                KERNEL_UACCESS_STATUS_OK) {
+            *linux_result = -KERNEL_EFAULT;
+            files->record->statistics.read_failures++;
+            return KERNEL_FILES_STATUS_OK;
+        }
+        for (size_t index = 0U; index < iov_count; index++) {
+            if (kernel_user_range_check(iov[index].base,
+                                        (size_t)iov[index].length) !=
+                KERNEL_UACCESS_STATUS_OK) {
+                files->record->statistics.read_failures++;
+                *linux_result = -KERNEL_EFAULT;
+                return KERNEL_FILES_STATUS_OK;
+            }
+        }
+    }
+    if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_NULL) {
+        *linux_result = 0;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_ZERO) {
+        const unsigned char zeros[64] = {0};
+        request = count > KERNEL_FILES_MAX_RW_COUNT
+                      ? KERNEL_FILES_MAX_RW_COUNT : count;
+        while (total < request) {
+            size_t copied = 0U;
+            size_t chunk = request - total < sizeof(zeros)
+                               ? (size_t)(request - total) : sizeof(zeros);
+            enum kernel_uaccess_status access = kernel_copy_to_user_iov(
+                mm, &cursor, zeros, chunk, &copied);
+            total += copied;
+            if (access == KERNEL_UACCESS_STATUS_FAULT) {
+                *linux_result = total ? (int64_t)total : -KERNEL_EFAULT;
+                files->record->statistics.bytes_read += total;
+                if (total == 0U) files->record->statistics.read_failures++;
+                return KERNEL_FILES_STATUS_OK;
+            }
+            if (access != KERNEL_UACCESS_STATUS_OK || copied != chunk)
+                return KERNEL_FILES_STATUS_STATE;
+        }
+        files->record->statistics.bytes_read += total;
+        *linux_result = (int64_t)total;
+        return KERNEL_FILES_STATUS_OK;
+    }
+
     if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_CONSOLE) {
         return kernel_files_read_console(files, mm, iov, iov_count, count,
                                          linux_result);
@@ -255,9 +313,7 @@ enum kernel_files_status kernel_files_readv(
         status = KERNEL_FILES_STATUS_OK;
         goto out;
     }
-    if ((kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_REGULAR ||
-         kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_PIPE) &&
-        !kernel_open_file_readable(description)) {
+    if (!kernel_open_file_readable(description)) {
         *linux_result = -KERNEL_EBADF;
         status = KERNEL_FILES_STATUS_OK;
         goto out;
@@ -338,29 +394,23 @@ out:
     return release_io_description(files, &description, status);
 }
 
-enum kernel_files_status kernel_files_pread(
+static enum kernel_files_status pread_pinned(
     struct kernel_files *files,
     struct kernel_mm *mm,
-    int64_t fd,
+    struct kernel_open_file_description *description,
     uint64_t user_buffer,
     uint64_t count,
     int64_t offset,
     int64_t *linux_result)
 {
-    struct kernel_open_file_description *description;
     uint64_t position;
     uint64_t request;
     uint64_t total = 0U;
     uint64_t file_size;
 
-    if (!kernel_files_is_live(files) || mm == 0 || linux_result == 0) {
-        return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
-    }
-    files->record->statistics.read_calls++;
-    description = kernel_files_lookup_description(files, fd);
-    if (description == 0) {
+    if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_EPOLL) {
         files->record->statistics.read_failures++;
-        *linux_result = -KERNEL_EBADF;
+        *linux_result = -KERNEL_ESPIPE;
         return KERNEL_FILES_STATUS_OK;
     }
     if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_REGULAR &&
@@ -402,6 +452,12 @@ enum kernel_files_status kernel_files_pread(
     if (count == 0U) {
         *linux_result = 0;
         return KERNEL_FILES_STATUS_OK;
+    }
+    if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_NULL ||
+        kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_ZERO) {
+        const struct kernel_uaccess_iovec iov = {user_buffer, count};
+        return read_pinned(files, mm, description, &iov, 1U, count,
+                           linux_result);
     }
     if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_REGULAR) {
         kernel_vfs_file_accessed(&description->file);
@@ -490,6 +546,28 @@ enum kernel_files_status kernel_files_pread(
     return KERNEL_FILES_STATUS_OK;
 }
 
+enum kernel_files_status kernel_files_pread(
+    struct kernel_files *files, struct kernel_mm *mm, int64_t fd,
+    uint64_t user_buffer, uint64_t count, int64_t offset,
+    int64_t *linux_result)
+{
+    struct kernel_open_file_description *description = 0;
+    enum kernel_files_status status;
+
+    if (!kernel_files_is_live(files) || mm == 0 || linux_result == 0)
+        return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
+    files->record->statistics.read_calls++;
+    status = kernel_files_pin(files, fd, &description, linux_result);
+    if (status != KERNEL_FILES_STATUS_OK) return status;
+    if (*linux_result != 0) {
+        files->record->statistics.read_failures++;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    status = pread_pinned(files, mm, description, user_buffer, count,
+                          offset, linux_result);
+    return release_io_description(files, &description, status);
+}
+
 static int description_writable(
     const struct kernel_open_file_description *description)
 {
@@ -506,7 +584,12 @@ static int description_writable(
         return access_mode != 0U;
     }
     if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_CONSOLE) {
-        return 1;
+        return description->file.private_data == 0 ||
+               access_mode == 1U || access_mode == 2U;
+    }
+    if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_NULL ||
+        kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_ZERO) {
+        return access_mode == 1U || access_mode == 2U;
     }
     return 0;
 }
@@ -515,11 +598,17 @@ static enum kernel_files_status write_request(
     struct kernel_files *files, struct kernel_mm *mm,
     struct kernel_open_file_description *description,
     const struct kernel_uaccess_iovec *iov, size_t iov_count,
-    uint64_t count, int64_t *linux_result)
+    uint64_t count, int positioned, uint64_t requested_offset,
+    int64_t *linux_result)
 {
     uint64_t total = 0U;
     unsigned char staging[KERNEL_FILES_WRITE_STAGING];
 
+    if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_NULL ||
+        kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_ZERO) {
+        *linux_result = (int64_t)count;
+        return KERNEL_FILES_STATUS_OK;
+    }
     if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_PIPE) {
         return kernel_pipe_writev(description->pipe, mm, iov, iov_count,
                                    count, description->open_flags, linux_result)
@@ -528,7 +617,8 @@ static enum kernel_files_status write_request(
     }
     if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_REGULAR) {
         int is_append = (description->open_flags & KERNEL_FILES_O_APPEND) != 0U;
-        uint64_t file_offset = kernel_open_file_offset(description);
+        uint64_t file_offset = positioned ? requested_offset :
+                               kernel_open_file_offset(description);
 
         /* ext4 modifies mtime/ctime before usercopy, including a first-byte
          * fault. Zero-length requests and earlier validation failures skip it. */
@@ -584,7 +674,7 @@ static enum kernel_files_status write_request(
                     if (written > copied) {
                         return KERNEL_FILES_STATUS_STATE;
                     }
-                    if (written != 0U) {
+                    if (written != 0U && !positioned) {
                         description->offset = new_offset;
                         file_offset = new_offset;
                     }
@@ -599,7 +689,7 @@ static enum kernel_files_status write_request(
                     }
                     if (written != 0U) {
                         file_offset += (uint64_t)written;
-                        description->offset = file_offset;
+                        if (!positioned) description->offset = file_offset;
                     }
                 }
                 total += (uint64_t)written;
@@ -672,6 +762,19 @@ static void account_write(struct kernel_files *files, int64_t result)
     }
 }
 
+static int memory_device_empty_range_fault(
+    const struct kernel_open_file_description *description,
+    uint64_t user_buffer, uint64_t count)
+{
+    enum kernel_open_file_kind kind = kernel_open_file_kind(description);
+
+    return (kind == KERNEL_OPEN_FILE_KIND_NULL ||
+            kind == KERNEL_OPEN_FILE_KIND_ZERO) &&
+           count == 0U && user_buffer != 0U &&
+           kernel_user_range_check(user_buffer - 1U, 1U) !=
+               KERNEL_UACCESS_STATUS_OK;
+}
+
 enum kernel_files_status kernel_files_write(
     struct kernel_files *files, struct kernel_mm *mm, int64_t fd,
     uint64_t user_buffer, uint64_t count, int64_t *linux_result)
@@ -693,6 +796,12 @@ enum kernel_files_status kernel_files_write(
         account_write(files, *linux_result);
         return KERNEL_FILES_STATUS_OK;
     }
+    if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_EPOLL) {
+        *linux_result = -KERNEL_EINVAL;
+        account_write(files, *linux_result);
+        return release_io_description(files, &description,
+                                      KERNEL_FILES_STATUS_OK);
+    }
     if (!description_writable(description)) {
         *linux_result = -KERNEL_EBADF;
         account_write(files, *linux_result);
@@ -703,16 +812,72 @@ enum kernel_files_status kernel_files_write(
         count = KERNEL_FILES_MAX_RW_COUNT;
     }
     if (kernel_user_range_check(user_buffer, (size_t)count) !=
-        KERNEL_UACCESS_STATUS_OK) {
+            KERNEL_UACCESS_STATUS_OK ||
+        memory_device_empty_range_fault(description, user_buffer, count)) {
         *linux_result = -KERNEL_EFAULT;
         account_write(files, *linux_result);
         return release_io_description(files, &description,
                                       KERNEL_FILES_STATUS_OK);
     }
-    status = write_request(files, mm, description, &iov, 1U, count, linux_result);
+    status = write_request(files, mm, description, &iov, 1U, count,
+                           0, 0U, linux_result);
     if (status == KERNEL_FILES_STATUS_OK) {
         account_write(files, *linux_result);
     }
+    return release_io_description(files, &description, status);
+}
+
+enum kernel_files_status kernel_files_pwrite(
+    struct kernel_files *files, struct kernel_mm *mm, int64_t fd,
+    uint64_t user_buffer, uint64_t count, int64_t offset,
+    int64_t *linux_result)
+{
+    struct kernel_uaccess_iovec iov = {user_buffer, count};
+    struct kernel_open_file_description *description = 0;
+    enum kernel_files_status status;
+    enum kernel_open_file_kind kind;
+
+    if (!kernel_files_is_live(files) || mm == 0 || linux_result == 0)
+        return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
+    files->record->statistics.write_calls++;
+    status = kernel_files_pin(files, fd, &description, linux_result);
+    if (status != KERNEL_FILES_STATUS_OK) return status;
+    if (*linux_result != 0) {
+        *linux_result = -KERNEL_EBADF;
+        account_write(files, *linux_result);
+        return KERNEL_FILES_STATUS_OK;
+    }
+    kind = kernel_open_file_kind(description);
+    if (kind == KERNEL_OPEN_FILE_KIND_EPOLL)
+        *linux_result = -KERNEL_ESPIPE;
+    else if (!description_writable(description))
+        *linux_result = -KERNEL_EBADF;
+    else if (offset < 0)
+        *linux_result = -KERNEL_EINVAL;
+    else if (kind == KERNEL_OPEN_FILE_KIND_CONSOLE ||
+             kind == KERNEL_OPEN_FILE_KIND_PIPE)
+        *linux_result = -KERNEL_ESPIPE;
+    else if (kind == KERNEL_OPEN_FILE_KIND_DIRECTORY)
+        *linux_result = -KERNEL_EISDIR;
+    else
+        *linux_result = 0;
+    if (*linux_result != 0) {
+        account_write(files, *linux_result);
+        return release_io_description(files, &description,
+                                      KERNEL_FILES_STATUS_OK);
+    }
+    if (count > KERNEL_FILES_MAX_RW_COUNT) count = KERNEL_FILES_MAX_RW_COUNT;
+    if (kernel_user_range_check(user_buffer, (size_t)count) !=
+            KERNEL_UACCESS_STATUS_OK ||
+        memory_device_empty_range_fault(description, user_buffer, count)) {
+        *linux_result = -KERNEL_EFAULT;
+        account_write(files, *linux_result);
+        return release_io_description(files, &description,
+                                      KERNEL_FILES_STATUS_OK);
+    }
+    status = write_request(files, mm, description, &iov, 1U, count,
+                           1, (uint64_t)offset, linux_result);
+    if (status == KERNEL_FILES_STATUS_OK) account_write(files, *linux_result);
     return release_io_description(files, &description, status);
 }
 
@@ -740,6 +905,12 @@ enum kernel_files_status kernel_files_writev(
         *linux_result = -KERNEL_EBADF;
         account_write(files, *linux_result);
         return KERNEL_FILES_STATUS_OK;
+    }
+    if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_EPOLL) {
+        *linux_result = -KERNEL_EINVAL;
+        account_write(files, *linux_result);
+        return release_io_description(files, &description,
+                                      KERNEL_FILES_STATUS_OK);
     }
     if (!description_writable(description)) {
         *linux_result = -KERNEL_EBADF;
@@ -782,7 +953,9 @@ enum kernel_files_status kernel_files_writev(
             goto out;
         }
         if (kernel_user_range_check(iov[index].base, iov[index].length) !=
-            KERNEL_UACCESS_STATUS_OK) {
+                KERNEL_UACCESS_STATUS_OK ||
+            memory_device_empty_range_fault(description, iov[index].base,
+                                            iov[index].length)) {
             *linux_result = -KERNEL_EFAULT;
             goto out;
         }
@@ -792,7 +965,7 @@ enum kernel_files_status kernel_files_writev(
         total = KERNEL_FILES_MAX_RW_COUNT;
     }
     status = write_request(files, mm, description, iov, iovcnt, total,
-                           linux_result);
+                           0, 0U, linux_result);
 out:
     if (iov != local &&
         kernel_files_release_allocation(files, iov) ==
@@ -828,6 +1001,16 @@ enum kernel_files_status kernel_files_lseek(
             KERNEL_OPEN_FILE_KIND_CONSOLE ||
         kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_PIPE) {
         *linux_result = -KERNEL_ESPIPE;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_NULL ||
+        kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_ZERO) {
+        (void)kernel_open_file_seek(description, 0U);
+        *linux_result = 0;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_EPOLL) {
+        *linux_result = (int64_t)kernel_open_file_offset(description);
         return KERNEL_FILES_STATUS_OK;
     }
     current = (int64_t)kernel_open_file_offset(description);

@@ -17,6 +17,19 @@
 #define LINUX_O_LARGEFILE UINT64_C(00100000)
 #define LINUX_O_CLOEXEC UINT64_C(02000000)
 
+enum kernel_files_status kernel_files_ioctl(
+    struct kernel_files *files, int64_t fd,
+    uint64_t command, uint64_t argument, int64_t *linux_result)
+{
+    (void)command;
+    (void)argument;
+    if (!kernel_files_is_live(files) || linux_result == 0)
+        return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
+    *linux_result = kernel_files_lookup_description(files, fd) == 0
+                        ? -KERNEL_EBADF : -KERNEL_ENOTTY;
+    return KERNEL_FILES_STATUS_OK;
+}
+
 static int empty_files(const struct kernel_files *files)
 {
     return files->state == KERNEL_FILES_EMPTY && files->heap == 0 &&

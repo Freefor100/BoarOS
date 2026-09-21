@@ -151,7 +151,7 @@ def main():
         metadata['status'] = 'inventoried'
         metadata['execution'] = result
         print(json.dumps(result, indent=2))
-        if args.require_pass and (result.get('status') != 'complete' or any(status != 'pass' for status in result.get('counts', {}))):
+        if args.require_pass and not suites.strict_result_passes(result, args.case_ids):
             return 1
         return 0
     except Exception as error:

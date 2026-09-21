@@ -137,7 +137,10 @@ def fixture(directory, program):
     run_logged(['mkfs.ext4', '-q', '-F', '-b', '4096', '-d', str(tree), str(disk)], directory / 'mkfs.log')
     # debugfs works without host root privileges; Linux opens this console as init stdio.
     commands = directory / 'fixture.debugfs'
-    commands.write_text('cd /dev\nmknod console c 5 1\nset_inode_field console mode 020600\n')
+    commands.write_text('cd /dev\n'
+                        'mknod console c 5 1\nset_inode_field console mode 020600\n'
+                        'mknod null c 1 3\nset_inode_field null mode 020666\n'
+                        'mknod zero c 1 5\nset_inode_field zero mode 020666\n')
     run_logged(['debugfs', '-w', '-f', str(commands), str(disk)], directory / 'debugfs.log')
     return disk
 

@@ -252,6 +252,17 @@ def build_fixture(manifest, destination, driver):
     return {'path': str(disk), 'sha256': digest(disk), 'bytes': size, 'files': identities}
 
 
+def strict_result_passes(state, case_ids=None):
+    """Check the requested execution set without promoting unselected cases."""
+    if state.get('status') not in ('complete', 'partial'):
+        return False
+    results = state.get('results', {})
+    selected = results.keys() if case_ids is None else set(case_ids)
+    return bool(selected) and all(
+        case_id in results and results[case_id].get('completed') and
+        results[case_id].get('status') == 'pass' for case_id in selected)
+
+
 def run_suite(manifest, output_dir, driver_elf, linux_kernel, boaros_kernel, *,
               case_ids=None, resume=True, default_timeout=10, boot_timeout=15,
               qemu='qemu-system-riscv64', output_validator=None):
@@ -306,6 +317,7 @@ def run_suite(manifest, output_dir, driver_elf, linux_kernel, boaros_kernel, *,
     else:
         state = {'identity_sha256': key, 'identity': identity, 'status': 'preparing',
                  'results': {case['id']: {'case': case, 'status': 'not-run'} for case in cases}}
+    state['selection'] = sorted(selected)
     save_json(destination / 'manifest.json', manifest)
     save_json(path, state)
     try:

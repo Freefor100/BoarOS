@@ -72,6 +72,11 @@ run_debugfs "set_inode_field /data ctime_extra 1332"
 run_debugfs "write $small_fixture /allocated"
 long_name=$(awk 'BEGIN { for (i = 0; i < 255; i++) printf "n" }')
 run_debugfs "write $fixture /$long_name"
+run_debugfs "mknod test-null c 1 3"
+run_debugfs "mknod test-null-alias c 1 3"
+run_debugfs "mknod test-zero c 1 5"
+run_debugfs "mknod test-console c 5 1"
+run_debugfs "mknod test-unknown c 1 15"
 
 if ! timeout -k 2s 20s "$qemu" \
     -machine virt \

@@ -215,7 +215,9 @@ enum kernel_files_status kernel_files_openat(
         *linux_result = -KERNEL_EEXIST;
         return KERNEL_FILES_STATUS_OK;
     }
-    if (kernel_vfs_mount_is_readonly(mount)) {
+    if (kernel_vfs_mount_is_readonly(mount) &&
+        (kernel_open_file_mode(description) & KERNEL_VFS_S_IFMT) ==
+            KERNEL_VFS_S_IFREG) {
         uint64_t access_mode = flags & LINUX_O_ACCMODE;
         if (access_mode == LINUX_O_WRONLY || access_mode == LINUX_O_RDWR ||
             (flags & LINUX_O_TRUNC) != 0U) {
@@ -273,6 +275,36 @@ enum kernel_files_status kernel_files_openat(
             }
         }
         description->kind = KERNEL_OPEN_FILE_KIND_REGULAR;
+    } else if ((kernel_open_file_mode(description) & KERNEL_VFS_S_IFMT) ==
+               KERNEL_VFS_S_IFCHR) {
+        struct kernel_vfs_stat stat;
+        int stat_result = kernel_vfs_fstat(&description->file, &stat);
+
+        if (stat_result == 0 && (flags & LINUX_O_DIRECTORY) != 0U)
+            stat_result = -KERNEL_ENOTDIR;
+        if (stat_result == 0) {
+            switch (stat.rdev) {
+            case UINT64_C(0x103):
+                description->kind = KERNEL_OPEN_FILE_KIND_NULL;
+                break;
+            case UINT64_C(0x105):
+                description->kind = KERNEL_OPEN_FILE_KIND_ZERO;
+                break;
+            case UINT64_C(0x501):
+                description->kind = KERNEL_OPEN_FILE_KIND_CONSOLE;
+                break;
+            default:
+                stat_result = -KERNEL_ENXIO;
+                break;
+            }
+        }
+        if (stat_result != 0) {
+            files->record->statistics.open_failures++;
+            kernel_files_queue_description(files, description);
+            (void)kernel_files_drain_file_cleanup(files);
+            *linux_result = stat_result;
+            return KERNEL_FILES_STATUS_OK;
+        }
     } else {
         files->record->statistics.open_failures++;
         kernel_files_queue_description(files, description);
@@ -447,13 +479,15 @@ static int fill_linux_stat(
     enum kernel_open_file_kind kind = kernel_open_file_kind(description);
 
     memset(stat, 0, sizeof(*stat));
-    if (kind == KERNEL_OPEN_FILE_KIND_CONSOLE) {
+    if (kind == KERNEL_OPEN_FILE_KIND_CONSOLE &&
+        description->file.private_data == 0) {
         stat->st_mode = KERNEL_VFS_S_IFCHR | UINT32_C(0000600);
         stat->st_rdev = UINT64_C(0x501);
     } else if (kind == KERNEL_OPEN_FILE_KIND_PIPE) {
         stat->st_mode = KERNEL_VFS_S_IFIFO | UINT32_C(0000600);
     } else if (kind == KERNEL_OPEN_FILE_KIND_EPOLL) {
-        /* epoll is an anonymous synthetic object, not a VFS inode. */
+        /* Linux anon_inode_getfile supplies mode 0600 without type bits. */
+        stat->st_mode = UINT32_C(0000600);
     } else {
         struct kernel_vfs_stat vfs_stat;
         int result = kernel_vfs_fstat(&description->file, &vfs_stat);

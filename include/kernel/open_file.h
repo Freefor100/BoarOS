@@ -29,6 +29,8 @@ enum kernel_open_file_kind {
     KERNEL_OPEN_FILE_KIND_CONSOLE,
     KERNEL_OPEN_FILE_KIND_PIPE,
     KERNEL_OPEN_FILE_KIND_EPOLL,
+    KERNEL_OPEN_FILE_KIND_NULL,
+    KERNEL_OPEN_FILE_KIND_ZERO,
 };
 
 /* VFS errors are returned through linux_result when status is OK. */

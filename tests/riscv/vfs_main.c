@@ -14,6 +14,7 @@
 
 #ifndef VFS_EXPECT_RECOVERY
 #include <kernel/open_file.h>
+#include <ext4.h>
 #include <ext4_errno.h>
 #endif
 
@@ -80,8 +81,13 @@ static void fail_vfs(unsigned long case_id,
 #ifndef VFS_EXPECT_RECOVERY
 static uint32_t fail_orphan_free_calls;
 static uint32_t orphan_free_calls;
+static uint32_t fail_fclose_calls;
+static uint32_t failed_fclose_calls;
+static uint32_t retried_fclose_calls;
+static ext4_file *failed_fclose_files[4];
 
 int __real_ext4_orphan_free(const char *path, uint32_t inode);
+int __real_ext4_fclose(ext4_file *file);
 
 int __wrap_ext4_orphan_free(const char *path, uint32_t inode)
 {
@@ -91,6 +97,28 @@ int __wrap_ext4_orphan_free(const char *path, uint32_t inode)
         return EIO;
     }
     return __real_ext4_orphan_free(path, inode);
+}
+
+int __wrap_ext4_fclose(ext4_file *file)
+{
+    if (fail_fclose_calls != 0U) {
+        fail_fclose_calls--;
+        if (failed_fclose_calls <
+            sizeof(failed_fclose_files) / sizeof(failed_fclose_files[0]))
+            failed_fclose_files[failed_fclose_calls] = file;
+        failed_fclose_calls++;
+        return EIO;
+    }
+    for (size_t index = 0U;
+         index < sizeof(failed_fclose_files) / sizeof(failed_fclose_files[0]);
+         index++) {
+        if (failed_fclose_files[index] == file) {
+            failed_fclose_files[index] = 0;
+            retried_fclose_calls++;
+            break;
+        }
+    }
+    return __real_ext4_fclose(file);
 }
 
 static int bytes_equal(const unsigned char *bytes,
@@ -115,6 +143,10 @@ static void run_orphan_cleanup_regression(struct kernel_vfs_mount *mount,
     struct kernel_vfs_file unopened = {0};
     struct kernel_vfs_file missing = {0};
     struct kernel_vfs_file orphan_stat_file = {0};
+    struct kernel_vfs_path *root_path = 0;
+    struct kernel_vfs_path *named_path = 0;
+    struct kernel_vfs_path *missing_path = 0;
+    struct kernel_vfs_path *replacement_path = 0;
     struct kernel_vfs_stat orphan_stat;
     int linux_result = -1;
 
@@ -162,13 +194,152 @@ static void run_orphan_cleanup_regression(struct kernel_vfs_mount *mount,
     }
     if (kernel_vfs_create(mount, "/orphan-stat", 0640U,
                           &orphan_stat_file) != 0 ||
+        kernel_vfs_path_root(mount, heap, &root_path) != 0 ||
+        kernel_vfs_path_lookup(root_path, "orphan-stat", 11U,
+                               &named_path) != 0 ||
         kernel_vfs_unlink(mount, "/orphan-stat") != 0 ||
+        kernel_vfs_path_inode(named_path) !=
+            kernel_vfs_file_inode(&orphan_stat_file) ||
+        kernel_vfs_path_lookup(root_path, "orphan-stat", 11U,
+                               &missing_path) != -KERNEL_ENOENT ||
+        missing_path != 0 ||
         kernel_vfs_fstat(&orphan_stat_file, &orphan_stat) != 0 ||
         orphan_stat.nlink != 0U || orphan_stat.dev != mount->id ||
         (orphan_stat.mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFREG ||
+        kernel_vfs_path_release(&named_path) != 0 ||
+        kernel_vfs_path_release(&root_path) != 0 ||
         kernel_vfs_close(&orphan_stat_file) != 0) {
         fail_vfs(28U, 0, orphan_stat.nlink);
     }
+    if (kernel_vfs_mkdir(mount, "/held-directory", 0755U) != 0 ||
+        kernel_vfs_path_root(mount, heap, &root_path) != 0 ||
+        kernel_vfs_path_lookup(root_path, "held-directory", 14U,
+                               &named_path) != 0 ||
+        kernel_vfs_rmdir(mount, "/held-directory") != 0 ||
+        kernel_vfs_path_stat(named_path, &orphan_stat) != 0 ||
+        orphan_stat.nlink != 0U ||
+        kernel_vfs_path_lookup(root_path, "held-directory", 14U,
+                               &missing_path) != -KERNEL_ENOENT ||
+        kernel_vfs_mkdir(mount, "/held-directory", 0755U) != 0 ||
+        kernel_vfs_path_lookup(root_path, "held-directory", 14U,
+                               &replacement_path) != 0 ||
+        kernel_vfs_path_inode(replacement_path) ==
+            kernel_vfs_path_inode(named_path) ||
+        kernel_vfs_path_release(&replacement_path) != 0 ||
+        kernel_vfs_path_release(&named_path) != 0 ||
+        kernel_vfs_path_release(&root_path) != 0) {
+        fail_vfs(29U, 0, orphan_stat.nlink);
+    }
+}
+
+static void run_path_resolution_regression(struct kernel_vfs_mount *mount,
+                                           struct kernel_heap *heap)
+{
+    struct kernel_vfs_file file = {0};
+    struct kernel_vfs_path *root = 0;
+    struct kernel_vfs_path *too_long = 0;
+    struct kernel_vfs_stat stat;
+    char long_name[257];
+
+    if (kernel_vfs_mkdir(mount, "/path-test-dir", 0755U) != 0 ||
+        kernel_vfs_symlink(mount, "../init", "/path-test-dir/relative") != 0 ||
+        kernel_vfs_symlink(mount, "/init", "/path-test-dir/absolute") != 0 ||
+        kernel_vfs_open(mount, "/path-test-dir/./relative", &file) != 0 ||
+        kernel_vfs_close(&file) != 0 ||
+        kernel_vfs_open(mount, "/path-test-dir/../path-test-dir/absolute",
+                        &file) != 0 ||
+        kernel_vfs_close(&file) != 0 ||
+        kernel_vfs_open(mount, "/path-test-dir/relative/", &file) !=
+            -KERNEL_ENOTDIR ||
+        kernel_vfs_stat_path(mount, "/path-test-dir/relative", 0,
+                             &stat) != 0 ||
+        (stat.mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFLNK)
+        fail_vfs(30U, 0, -1);
+
+    if (kernel_vfs_symlink(mount, "created", "/path-test-dir/dangling") != 0 ||
+        kernel_vfs_create(mount, "/path-test-dir/dangling", 0600U,
+                          &file) != 0 ||
+        kernel_vfs_close(&file) != 0 ||
+        kernel_vfs_open(mount, "/path-test-dir/created", &file) != 0 ||
+        kernel_vfs_close(&file) != 0 ||
+        kernel_vfs_symlink(mount, "loop-b", "/path-test-dir/loop-a") != 0 ||
+        kernel_vfs_symlink(mount, "loop-a", "/path-test-dir/loop-b") != 0 ||
+        kernel_vfs_open(mount, "/path-test-dir/loop-a", &file) !=
+            -KERNEL_ELOOP)
+        fail_vfs(31U, 0, -1);
+    if (kernel_vfs_mkdir(mount, "/path-test-trailing/", 0755U) != 0 ||
+        kernel_vfs_stat_path(mount, "/path-test-trailing/", 1, &stat) != 0 ||
+        (stat.mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFDIR ||
+        kernel_vfs_rmdir(mount, "/path-test-trailing/") != 0)
+        fail_vfs(32U, 0, -1);
+    if (kernel_vfs_mkdir(mount, "/path-test-rmdir-dot", 0755U) != 0 ||
+        kernel_vfs_rmdir(mount, "/path-test-rmdir-dot/.") !=
+            -KERNEL_EINVAL ||
+        kernel_vfs_stat_path(mount, "/path-test-rmdir-dot", 1, &stat) != 0 ||
+        kernel_vfs_symlink(mount, "/path-test-rmdir-dot",
+                           "/path-test-rmdir-link") != 0 ||
+        kernel_vfs_open_nofollow(mount, "/path-test-rmdir-link/", &file) !=
+            0 ||
+        (file.mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFDIR ||
+        kernel_vfs_close(&file) != 0 ||
+        kernel_vfs_unlink(mount, "/path-test-rmdir-link/") !=
+            -KERNEL_ENOTDIR ||
+        kernel_vfs_rmdir(mount, "/path-test-rmdir-link/") !=
+            -KERNEL_ENOTDIR ||
+        kernel_vfs_stat_path(mount, "/path-test-rmdir-dot", 1, &stat) != 0 ||
+        kernel_vfs_unlink(mount, "/path-test-rmdir-link") != 0 ||
+        kernel_vfs_rmdir(mount, "/path-test-rmdir-dot") != 0)
+        fail_vfs(33U, 0, -1);
+    for (size_t index = 0U; index < sizeof(long_name) - 1U; index++)
+        long_name[index] = 'x';
+    long_name[sizeof(long_name) - 1U] = '\0';
+    if (kernel_vfs_path_root(mount, heap, &root) != 0 ||
+        kernel_vfs_path_lookup(root, long_name, sizeof(long_name) - 1U,
+                               &too_long) != -KERNEL_ENAMETOOLONG ||
+        too_long != 0 || kernel_vfs_path_release(&root) != 0)
+        fail_vfs(34U, -KERNEL_ENAMETOOLONG, -KERNEL_EINVAL);
+    if (kernel_vfs_create(mount, "/path-test-missing/", 0600U, &file) !=
+            -KERNEL_EISDIR ||
+        file.private_data != 0 || kernel_vfs_rmdir(mount, "/") !=
+            -KERNEL_EBUSY ||
+        kernel_vfs_rmdir(mount, "///") != -KERNEL_EBUSY)
+        fail_vfs(37U, -KERNEL_EBUSY, -1);
+    if (kernel_vfs_symlink(mount, "/path-test-mkdir-target",
+                           "/path-test-mkdir-link") != 0 ||
+        kernel_vfs_mkdir(mount, "/path-test-mkdir-link/", 0755U) !=
+            -KERNEL_EEXIST ||
+        kernel_vfs_stat_path(mount, "/path-test-mkdir-target", 1, &stat) !=
+            -KERNEL_ENOENT ||
+        kernel_vfs_unlink(mount, "/path-test-mkdir-link") != 0)
+        fail_vfs(40U, -KERNEL_EEXIST, -1);
+}
+
+static void run_path_cleanup_regression(struct kernel_vfs_mount *mount,
+                                        struct kernel_heap *heap)
+{
+    struct kernel_vfs_file file = {0};
+    struct kernel_vfs_file alias = {0};
+    struct kernel_vfs_path *root = 0;
+    struct kernel_vfs_path *child = 0;
+
+    if (kernel_vfs_create(mount, "/path-cleanup", 0600U, &file) != 0 ||
+        kernel_vfs_close(&file) != 0 ||
+        kernel_vfs_path_root(mount, heap, &root) != 0 ||
+        kernel_vfs_path_lookup(root, "path-cleanup", 12U, &child) != 0)
+        fail_vfs(35U, 0, -1);
+    fail_fclose_calls = 1U;
+    if (kernel_vfs_path_release(&child) != 0 || child != 0 ||
+        fail_fclose_calls != 0U || failed_fclose_calls != 1U ||
+        kernel_vfs_path_release(&root) != 0 || root != 0)
+        fail_vfs(36U, 0, -1);
+    if (kernel_vfs_create(mount, "/path-merge-cleanup", 0600U, &file) != 0)
+        fail_vfs(38U, 0, -1);
+    fail_fclose_calls = 1U;
+    if (kernel_vfs_open(mount, "/path-merge-cleanup", &alias) !=
+            -KERNEL_EIO ||
+        alias.private_data != 0 || fail_fclose_calls != 0U ||
+        failed_fclose_calls != 2U || kernel_vfs_close(&file) != 0)
+        fail_vfs(39U, -KERNEL_EIO, -1);
 }
 #endif
 
@@ -428,8 +599,10 @@ static void run_vfs_test(const void *dtb)
         fail_vfs(11U, 0, result);
     }
     run_orphan_cleanup_regression(&mount, &heap);
+    run_path_resolution_regression(&mount, &heap);
+    run_path_cleanup_regression(&mount, &heap);
     result = kernel_vfs_unmount(&mount);
-    if (result != 0 || orphan_free_calls != 5U) {
+    if (result != 0 || retried_fclose_calls != failed_fclose_calls) {
         fail_vfs(12U, 0, result);
     }
 

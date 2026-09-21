@@ -16,52 +16,44 @@ make test-program-inventory-host test-diff-abi-host
 python3 tests/program-inventory/run.py --reuse-builds --require-pass --output build/program-check
 ```
 
-双方运行同一 ELF 与同源独立 ext4 副本。`--require-pass` 使任意失败/未完成返回非零；默认仅要求清单完整生成。Linux 自己失败标为 `reference-not-pass`，需排查参考环境，不能归罪 BoarOS。原脚本内部逐项断言也必须成立，不能只看 shell 退出码；libc runtest 原本固定返回 1，直接 entry 则预期 0。
+双方运行同一 ELF 与同源独立 ext4 副本。指定 `--case --require-pass` 时，只有本次选择集合必须全部完成并通过；未选项目保留已有结果或 `not-run`。未指定集合的严格模式要求全量完成并通过。Linux 自己失败标为 `reference-not-pass`，需排查参考环境，不能归罪 BoarOS。原脚本内部逐项断言也必须成立，不能只看 shell 退出码；libc runtest 原本固定返回 1，直接 entry 则预期 0。
 
 ## 当前基线与阻塞
 
-最近全量基线为 `7971eedbd3ca879f6528082d9e023ac42fadd417`，命令：
+最近全量证据在 `build/p1bc-full-final3/`，命令：
 
 ```sh
-python3 tests/program-inventory/run.py --reuse-builds --suite all --output build/next-batch-inventory-final2
+python3 tests/program-inventory/run.py --reuse-builds --suite all --output build/p1bc-full-final3
 ```
 
-本轮文档整理核对了该目录 `runs/suite.json`：`status=complete`，211 pass、14 nonzero-exit、3 upstream-failure；这是已有运行记录，不是本轮重新跑过全量。
+该目录 `runs/suite.json` 为 `status=complete`，228 项全部完成：215 pass、10 nonzero-exit、3 upstream-failure。相对历史 `7971eedbd3ca879f6528082d9e023ac42fadd417` 的 211/14/3，静态/动态 `stat` 与 `syscall_sign_extend` 共四项新增通过，没有已有通过项回退。
 
 | 范围 | Linux | BoarOS |
 |---|---:|---:|
-| 顶层案例 | 228 项满足契约 | 211 项退出/完整输出双侧一致；14 项直接失败；3 项包装失败 |
-| libc 静态 / 动态直接 entry | 107 / 110 全通过 | 100 / 103 通过；失败是相同七个名称 |
-| 原 libc 静态 / 动态脚本 | 全部逐项断言通过 | 完整运行 107 / 110 项，各七项 FAIL |
-| 原 BusyBox 脚本 | 55/55 success | 45/55 success；后台 sleep+kill 曾一过一败 |
+| 顶层案例 | 228 项满足契约 | 215 项退出/完整输出双侧一致；10 项直接失败；3 项包装失败 |
+| libc 静态 / 动态直接 entry | 107 / 110 全通过 | 102 / 105 通过；失败是相同五个名称 |
+| 原 libc 静态 / 动态脚本 | 全部逐项断言通过 | 完整运行 107 / 110 项，各五项 FAIL |
+| 原 BusyBox 脚本 | 55/55 success | 46/55 success；后台 sleep+kill 已 success，其余九项仍失败 |
 
-包装脚本与直接 entry 重复覆盖，不能把 228 项或 17 个失败当成独立缺陷数。原始 stdout/stderr、wait status、串口、内核/程序/fixture 哈希及命令均在上述证据目录。BusyBox ELF SHA-256 为 `f2cda5fcdff6d41c8a553ac658e8aa55b6a48aa40898cb123a19f7865f3773ac`。
+包装脚本与直接 entry 重复覆盖，不能把 228 项或 13 个顶层失败当成独立缺陷数。原始 stdout/stderr、wait status、串口、逐案例 fixture 哈希及命令均在证据目录。关键身份为：BoarOS `kernel-rv` SHA-256 `89da483f28a2f560a16e6222019df42b2883f864c096d1b54462e755861afd18`，Linux Image `7ca338ec75e681cc68c5d946b3ae633fc0088fd78569b7847528105a9de6c8ec`，清单入口 `run.py` `4e59b9dafba47d47978e82ef221350cd0cd469162496a020c5c9ccdf12756f3f`，guest runner `024c3f5c068defdc8505dec6bf4c381d227972d7aafaea6e0f3110bc24390ca7`，suite driver `83fca2c634085c2b81db212a72ea26221de3d746d832b06d1d6051115fd7b550`，完整执行身份 `a0b9820664f40dec3856d440680fe53fd033b61eacfad41a875eb56adef298e6`。QEMU 命令和每个镜像身份由同一 JSON 保存。BusyBox ELF 为 `f2cda5fcdff6d41c8a553ac658e8aa55b6a48aa40898cb123a19f7865f3773ac`，动态 loader/libc 为 `02bcde064da5bc0cb8f4368acc4a539f3c39d14e73ae30970bea04a521a51cf1`。
 
-| 直接失败（均有静态/动态版本） | 基线首个有证据的阻塞 | 对应 TODO |
+| 直接失败（均有静态/动态版本） | 当前首个有证据的阻塞 | 对应 TODO |
 |---|---|---|
-| stat | `/dev/null`；有效 UID/GID 查询 ENOSYS | P1a/P1c；查询完成后仍需设备 |
-| syscall_sign_extend | `/dev/zero` | P1c |
 | utime | `utimensat/futimens` | P1e |
 | statvfs | 文件系统统计 | P1f |
-| daemon_failure | `chdir("/")` ENOSYS，之后还需 `/dev/null` | P1d/P1c；后续会话依赖需继续观察 |
+| daemon_failure | `chdir("/")` ENOSYS | P1d |
 | pthread_robust_detach | robust futex owner-died | P2a |
 | socket | socket 族与传输链 | N |
 
-`pthread_cancel_points` 直接 entry 在基线和聚焦复跑中通过，但旧 shm_open 取消断言异常尚无独立根因，不能归功于无关的 prlimit 改动。后台 sleep+kill 也未证明稳定恢复；重复性调查仍在 P0。
+`pthread_cancel_points` 直接 entry 在当前全量和聚焦复跑中通过，但旧 shm_open 取消断言异常尚无独立根因，继续保持未关闭状态。
 
-## 本轮聚焦验证（不替换全量基线）
+## P1b/P1c 聚焦验证
 
-UID/GID 查询先由单测复现四项失败，同一 ELF 差分显示 Linux 返回 0、BoarOS 返回 ENOSYS；实现后新增查询和 fork/exec 检查通过，全部 185 条差分一致。原始失败保存在 `build/diff-abi/identity-before/`，修复后在 `build/diff-abi/run/`。这只完成不可变 root 查询，未解除设备或权限缺口。
+设备实现前的失败记录保存在先前清单与聚焦差分目录；实现后，真实用户程序可按 ext4 字符节点的 `rdev` 打开 `/dev/null`、`/dev/zero`、`/dev/console`，未知设备号返回 `ENXIO`。同一 ELF 的 250 条 Linux 差分全部一致，覆盖零长度、坏指针、跨页部分 fault、向量/定位 I/O、访问模式、seek、stat/rdev、poll/epoll 和 ioctl。Linux 契约核对固定 `references/linux` commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 `fs/namei.c`、`fs/char_dev.c`、`drivers/char/mem.c`、`fs/eventpoll.c` 与 `fs/read_write.c`。
 
-随后用 `run.py --reuse-builds`，各三轮选择 `--case libc.static.pthread_cancel_points --case libc.dynamic.pthread_cancel_points --case busybox.official`，输出到 `build/review-timing-1`、`-2`、`-3`。三轮 kernel-rv SHA-256 均为 `6cf79ff99de3aec1dfe8bd6949ca8dd0133e8e9ac7061e1b46ff39b88cce49a2`，每轮保留各自 fixture 哈希、双方原始输出和 wait status；只运行这三项，其余 225 项明确 not-run。
+路径测试覆盖绝对/相对符号链接、`.`/`..`、循环、尾斜线、最终分量跟随策略、同设备不同名称、删除后旧对象存活、同名重建取得新 inode、目录引用和 mount busy。关闭故障注入验证最后一个路径引用和重复节点合并失败时，真实 `ext4_file *` 由所属 mount 的 cleanup 队列接管并在卸载时重试；fd/OFD 测试覆盖 dup/fork 共享、阻塞 pin、close 后 fd 复用与资源回到基线。
 
-| 观测 | 三轮结果 |
-|---|---|
-| 静态 / 动态取消 entry | 双方均退出 0、输出一致；旧偶发异常仍未找到独立根因 |
-| 原 BusyBox 脚本 | Linux 每轮 55/55；BoarOS 每轮 45/55，完整脚本仍为 upstream-failure |
-| 后台 sleep+kill | Linux 每轮 success；BoarOS 每轮先报 `/dev/null` 打开失败，再报 kill 的 No such process |
-
-本地 `references/oscomp-testsuits` 固定 commit `b5ec6ef8497e1818cbdec3b54bb722f036e57972` 的 `busybox/shell/ash.c:forkchild()` 在无 job-control 的 `FORK_BG` 路径先关闭 stdin、打开 `/dev/null`，失败会抛出 shell 错误。它为上述日志提供直接解释：后台任务在进入 sleep 前就可能退出，与父进程 kill 形成竞争。当前证明了设备前置阻塞，尚未证明修复设备后没有其他时序问题；P1c 后要重跑，不能把旧偶尔 success 当作 sleep 正常运行。
+`build/p1bc-repeat/` 对原 BusyBox 包装器和独立握手各重复 20 次。原包装器整体仍因九项无关能力缺口判为 upstream-failure，但其中后台 sleep+kill 子项 20/20 success。独立探针先由文件握手确认子进程已经 `exec sleep`，再执行 kill/wait；Linux 与 BoarOS 均 20/20 退出 0 并输出 `stage-ok`。BoarOS 有 12 次额外打印 shell 的 `Terminated` stderr，故全输出比较记录为 8 pass、12 output-mismatch；这不改变子进程进入目标阶段、被信号终止和正确回收的结论，也不用于关闭上述历史取消异常。
 
 ## 可复用的调试结论
 
@@ -99,7 +91,9 @@ UID/GID 查询先由单测复现四项失败，同一 ELF 差分显示 Linux 返
 | `readv-inventory-final`、`root-finish-repeat`、`root-finish-fixed-repeat` | root finish 原始失败、复现与 20 次修复验证 |
 | `signal-wait-wrapper` | rt_sigtimedwait 后原包装脚本完整记录 |
 | `prlimit-focused`、`recheck-cancel-sscanf` | 限额相关 entry 与取消复跑，不能据此关闭旧取消异常 |
-| `next-batch-inventory*` | 路径/信号/资源限制阶段；`final2` 为上述最近全量 |
+| `next-batch-inventory*` | 路径/信号/资源限制阶段；`final2` 为历史 `7971eedb` 全量 |
+| `p1bc-full-final3` | P1b/P1c 后 228 项全量、身份、逐案例镜像和双侧日志 |
+| `p1bc-repeat` | 原 BusyBox 包装器与同步 sleep+kill 各 20 轮 |
 | `riscv/userland-run.scTdQg/static-userland.log` | stop/continue 原始失败 |
 
 所有 Linux 源码结论均指本页开头的固定 commit。运行产物不纳入 Git；缺失旧目录时不得把文字记录当作本轮重跑结果。
