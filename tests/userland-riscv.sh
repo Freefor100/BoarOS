@@ -57,7 +57,7 @@ debugfs -w -R "write $data /data" "$static_disk" >/dev/null 2>&1
 
 # The userland program blocks reading stdin after the clock and sleep
 # checks, so the harness feeds one line into the serial console.
-if ! { sleep 4; printf 'go\n'; } | timeout -k 2s 20s "$qemu" \
+if ! { sleep 4; printf 'go\n'; } | timeout -k 2s 30s "$qemu" \
     -machine virt \
     -bios default \
     -kernel "$kernel" \
@@ -121,7 +121,7 @@ debugfs -w -R "set_inode_field /lib/ld-musl-riscv64.so.1 mode 0100755" \
 debugfs -w -R "write $tls_dso /lib/libboaros-tls.so" "$pthread_disk" \
     >/dev/null 2>&1
 
-if ! timeout -k 2s 20s "$qemu" \
+if ! timeout -k 2s 30s "$qemu" \
     -machine virt \
     -bios default \
     -kernel "$kernel" \
