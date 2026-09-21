@@ -17,6 +17,34 @@ def stream(status=0, timed_out=0, out='68690a', err=''):
 
 
 class ObservationTests(unittest.TestCase):
+    def test_strict_result_uses_only_selected_cases(self):
+        state = {'status': 'partial', 'results': {
+            'selected': {'status': 'pass', 'completed': True},
+            'other': {'status': 'not-run'}}}
+        self.assertTrue(suites.strict_result_passes(state, ['selected']))
+        self.assertFalse(suites.strict_result_passes(state, None))
+        state['results']['other'] = {'status': 'nonzero-exit',
+                                     'completed': True}
+        self.assertTrue(suites.strict_result_passes(state, ['selected']))
+        self.assertFalse(suites.strict_result_passes(state,
+                                                    ['selected', 'other']))
+        self.assertFalse(suites.strict_result_passes(state, ['unknown']))
+        for status in ('output-mismatch', 'reference-not-pass', 'timeout',
+                       'runner-error', 'not-run'):
+            state['results']['selected'] = {'status': status,
+                                            'completed': status != 'not-run'}
+            self.assertFalse(suites.strict_result_passes(state, ['selected']))
+        state['results']['selected'] = {'status': 'pass', 'completed': True}
+        state['status'] = 'interrupted'
+        self.assertFalse(suites.strict_result_passes(state, ['selected']))
+
+    def test_unknown_selection_is_rejected_before_guest_setup(self):
+        with tempfile.TemporaryDirectory() as output:
+            with self.assertRaisesRegex(ValueError, 'unknown requested case id'):
+                suites.run_suite({'cases': [{'id': 'known', 'argv': ['/true']}]},
+                                 output, '/tmp/driver', '/tmp/linux',
+                                 '/tmp/boaros', case_ids=['unknown'])
+
     def test_reference_environment_requires_all_facilities(self):
         mounts = ('proc', 'sysfs', 'shm', 'mqueue')
         names = mounts + ('shm-dir', 'mqueue-dir', 'lo')

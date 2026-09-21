@@ -286,6 +286,10 @@ enum kernel_open_file_kind kernel_open_file_kind(
         return KERNEL_OPEN_FILE_KIND_PIPE;
     case KERNEL_OPEN_FILE_KIND_EPOLL:
         return KERNEL_OPEN_FILE_KIND_EPOLL;
+    case KERNEL_OPEN_FILE_KIND_NULL:
+        return KERNEL_OPEN_FILE_KIND_NULL;
+    case KERNEL_OPEN_FILE_KIND_ZERO:
+        return KERNEL_OPEN_FILE_KIND_ZERO;
     default:
         return KERNEL_OPEN_FILE_KIND_REGULAR;
     }
@@ -344,7 +348,8 @@ enum kernel_open_file_status kernel_open_file_release(
         kernel_epoll_notify_file_release(file);
     }
     if (!file->vfs_closed) {
-        if (file->kind == KERNEL_OPEN_FILE_KIND_CONSOLE) {
+        if (file->kind == KERNEL_OPEN_FILE_KIND_CONSOLE &&
+            file->file.private_data == 0) {
             file->vfs_closed = 1U;
         } else if (file->kind == KERNEL_OPEN_FILE_KIND_PIPE) {
             if (file->pipe_endpoint_closed == 0U) {
@@ -449,11 +454,14 @@ int kernel_open_file_readable(
     switch (file->kind) {
     case KERNEL_OPEN_FILE_KIND_REGULAR:
     case KERNEL_OPEN_FILE_KIND_DIRECTORY:
+    case KERNEL_OPEN_FILE_KIND_NULL:
+    case KERNEL_OPEN_FILE_KIND_ZERO:
         return access_mode == 0U || access_mode == 2U;
     case KERNEL_OPEN_FILE_KIND_PIPE:
         return access_mode == 0U;
     case KERNEL_OPEN_FILE_KIND_CONSOLE:
-        return 1;
+        return file->file.private_data == 0 ||
+               access_mode == 0U || access_mode == 2U;
     default:
         return 0;
     }
@@ -556,6 +564,8 @@ uint32_t kernel_open_file_poll(
         return kernel_console_poll(requested_events, out_queue);
     case KERNEL_OPEN_FILE_KIND_REGULAR:
     case KERNEL_OPEN_FILE_KIND_DIRECTORY:
+    case KERNEL_OPEN_FILE_KIND_NULL:
+    case KERNEL_OPEN_FILE_KIND_ZERO:
         return KERNEL_POLLIN | KERNEL_POLLOUT | KERNEL_POLLRDNORM | KERNEL_POLLWRNORM;
     case KERNEL_OPEN_FILE_KIND_EPOLL:
         return kernel_epoll_poll(file->epoll, requested_events, out_queue);

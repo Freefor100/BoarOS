@@ -641,6 +641,15 @@ int ext4_dir_mk(const char *path);
  * @return  Standard error code.*/
 int ext4_dir_open(ext4_dir *dir, const char *path);
 int ext4_dir_open_file(ext4_file *file, const char *path);
+int ext4_chrdev_open_file(ext4_file *file, const char *path);
+int ext4_fopen_inode(ext4_file *file, const char *mount_point,
+                     uint32_t inode_number);
+int ext4_lookup_child(const char *mount_point, uint32_t parent_inode,
+                      const char *name, uint32_t name_length,
+                      uint32_t *child_inode, uint32_t *child_mode);
+int ext4_readlink_inode(const char *mount_point, uint32_t inode_number,
+                        char *buffer, size_t capacity, size_t *bytes_read);
+int ext4_fdir_unlink_dentry(const char *path, uint32_t *out_inode);
 
 /**@brief   Directory close.
  *

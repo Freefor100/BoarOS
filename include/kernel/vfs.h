@@ -46,6 +46,27 @@ struct kernel_vfs_stat {
 };
 
 struct kernel_page_cache;
+struct kernel_vfs_path;
+
+/* An owned path identity; root and cwd may name the same object while each
+ * holding an independent reference. */
+int kernel_vfs_path_root(struct kernel_vfs_mount *mount,
+                         struct kernel_heap *heap,
+                         struct kernel_vfs_path **owner);
+int kernel_vfs_path_acquire(struct kernel_vfs_path *path);
+int kernel_vfs_path_lookup(struct kernel_vfs_path *parent,
+                           const char *name, size_t name_length,
+                           struct kernel_vfs_path **owner);
+int kernel_vfs_path_resolve(struct kernel_vfs_path *start,
+                            struct kernel_vfs_path *root,
+                            const char *path, int follow_final,
+                            struct kernel_vfs_path **owner);
+uint64_t kernel_vfs_path_inode(const struct kernel_vfs_path *path);
+int kernel_vfs_path_stat(const struct kernel_vfs_path *path,
+                         struct kernel_vfs_stat *stat);
+int kernel_vfs_path_release(struct kernel_vfs_path **owner);
+struct kernel_vfs_mount *kernel_vfs_path_mount(
+    const struct kernel_vfs_path *path);
 
 struct kernel_vfs_file {
     void *private_data;

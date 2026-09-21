@@ -532,7 +532,7 @@ $(BLOCK_TEST_KERNEL_RV): $(BLOCK_TEST_OBJECTS) arch/riscv/linker.ld
 		-o $@ $(BLOCK_TEST_OBJECTS)
 
 $(VFS_TEST_KERNEL_RV): $(VFS_TEST_OBJECTS) arch/riscv/linker.ld
-	$(CC) $(LDFLAGS) -Wl,--wrap=ext4_orphan_free \
+	$(CC) $(LDFLAGS) -Wl,--wrap=ext4_orphan_free -Wl,--wrap=ext4_fclose \
 		-Wl,-Map,$(BUILD_DIR)/tests/kernel-vfs-rv.map \
 		-o $@ $(VFS_TEST_OBJECTS)
 

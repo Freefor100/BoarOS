@@ -434,6 +434,7 @@ int ext4_dir_dx_init(struct ext4_inode_ref *dir, struct ext4_inode_ref *parent)
 
 	/* Fill the whole block with empty entry */
 	struct ext4_dir_en *be = (void *)new_block.data;
+	ext4_dir_en_set_inode(be, 0);
 
 	if (ext4_sb_feature_ro_com(sb, EXT4_FRO_COM_METADATA_CSUM)) {
 		uint16_t len = block_size - sizeof(struct ext4_dir_entry_tail);
@@ -445,8 +446,6 @@ int ext4_dir_dx_init(struct ext4_inode_ref *dir, struct ext4_inode_ref *parent)
 	} else {
 		ext4_dir_en_set_entry_len(be, block_size);
 	}
-
-	ext4_dir_en_set_inode(be, 0);
 
 	ext4_trans_set_block_dirty(new_block.buf);
 	rc = ext4_block_set(dir->fs->bdev, &new_block);

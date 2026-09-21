@@ -47,6 +47,10 @@ enum kernel_syscall_status syscall_handle_pread64(
     struct kernel_task *caller,
     const struct kernel_syscall_request *request,
     struct kernel_syscall_result *decoded);
+enum kernel_syscall_status syscall_handle_pwrite64(
+    struct kernel_task *caller,
+    const struct kernel_syscall_request *request,
+    struct kernel_syscall_result *decoded);
 
 enum kernel_syscall_status syscall_handle_write(
     struct kernel_task *caller,
@@ -79,6 +83,11 @@ enum kernel_syscall_status syscall_handle_dup3(
     struct kernel_syscall_result *decoded);
 
 enum kernel_syscall_status syscall_handle_fcntl(
+    struct kernel_task *caller,
+    const struct kernel_syscall_request *request,
+    struct kernel_syscall_result *decoded);
+
+enum kernel_syscall_status syscall_handle_ioctl(
     struct kernel_task *caller,
     const struct kernel_syscall_request *request,
     struct kernel_syscall_result *decoded);

@@ -15,6 +15,7 @@
 #define LINUX_SYSCALL_DUP 23U
 #define LINUX_SYSCALL_DUP3 24U
 #define LINUX_SYSCALL_FCNTL 25U
+#define LINUX_SYSCALL_IOCTL 29U
 #define LINUX_SYSCALL_MKDIRAT 34U
 #define LINUX_SYSCALL_UNLINKAT 35U
 #define LINUX_SYSCALL_SYMLINKAT 36U
@@ -29,6 +30,7 @@
 #define LINUX_SYSCALL_READV 65U
 #define LINUX_SYSCALL_WRITEV 66U
 #define LINUX_SYSCALL_PREAD64 67U
+#define LINUX_SYSCALL_PWRITE64 68U
 #define LINUX_SYSCALL_PSELECT6 72U
 #define LINUX_SYSCALL_PPOLL 73U
 #define LINUX_SYSCALL_READLINKAT 78U
@@ -177,6 +179,11 @@ enum kernel_syscall_status kernel_syscall_dispatch(
             KERNEL_SYSCALL_STATUS_OK) {
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
         }
+    } else if (request->number == LINUX_SYSCALL_IOCTL) {
+        if (syscall_handle_ioctl(caller, request, &decoded) !=
+            KERNEL_SYSCALL_STATUS_OK) {
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+        }
     } else if (request->number == LINUX_SYSCALL_PIPE2) {
         if (syscall_handle_pipe2(caller, request, &decoded) !=
             KERNEL_SYSCALL_STATUS_OK) {
@@ -224,6 +231,11 @@ enum kernel_syscall_status kernel_syscall_dispatch(
         }
     } else if (request->number == LINUX_SYSCALL_PREAD64) {
         if (syscall_handle_pread64(caller, request, &decoded) !=
+            KERNEL_SYSCALL_STATUS_OK) {
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+        }
+    } else if (request->number == LINUX_SYSCALL_PWRITE64) {
+        if (syscall_handle_pwrite64(caller, request, &decoded) !=
             KERNEL_SYSCALL_STATUS_OK) {
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
         }

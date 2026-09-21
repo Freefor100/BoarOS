@@ -22,7 +22,7 @@ show_output()
     tail -n 120 "$output" >&2
 }
 
-for tool in truncate mkfs.ext4 debugfs od cp tr awk; do
+for tool in truncate mkfs.ext4 debugfs e2fsck od cp tr awk; do
     if ! command -v "$tool" >/dev/null 2>&1; then
         echo "missing VFS test tool: $tool" >&2
         exit 1
@@ -75,6 +75,12 @@ fi
 if grep -qF 'BoarOS: VFS test failed' "$output"; then
     show_output
     echo "VFS ext4 test kernel reported a failed case" >&2
+    exit 1
+fi
+
+if ! e2fsck -fn "$disk" >"$work_dir/fsck.log" 2>&1; then
+    cat "$work_dir/fsck.log" >&2
+    echo "VFS ext4 test left an inconsistent filesystem" >&2
     exit 1
 fi
 

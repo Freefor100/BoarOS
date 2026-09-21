@@ -16,14 +16,12 @@
 - [x] **P1a root 身份查询**：`getuid/geteuid/getgid/getegid` 符合现有不可变 root 模型；四项单测先失败，同一 ELF 差分先观察 ENOSYS，修复后全部 185 条一致，含残留参数和 fork/exec。凭据变更/权限检查仍属于 P2e。
 - [x] **P0b 首轮时序复跑**：三轮静态/动态 `pthread_cancel_points` 双侧通过；BusyBox 后台 sleep+kill 每轮失败，日志与固定 ash 源码确认 `/dev/null` 是后台子进程前置依赖。证据见 `build/review-timing-{1,2,3}/`，未关闭旧取消异常。
 
-### 下一批推进顺序
+### 后续推进顺序
 
 | 顺序 | 任务 | 开始条件 / 独立成果 |
 |---|---|---|
-| 1 | P0c 时序根因、P0d 证据维护 | 现有 runner 即可用；先还原真实首个失败 |
-| 2 | P1b 路径/OFD/设备边界 | 先提交候选比较和最小垂直切片，由人确认路线 |
-| 3 | P1c 设备、P1d cwd/dirfd | 复用 P1b；分别用设备打开和目录身份验收 |
-| 4 | P1e 时间、P1f 统计 | 现在可调查 ext4 接口；完整 fd/dirfd 语义依赖路径链 |
+| 1 | P1d cwd/dirfd | 复用已完成的 P1b 稳定路径身份；补用户接口与目录 fd 起点 |
+| 2 | P1e 时间、P1f 统计 | 现在可调查 ext4 接口；完整 fd/dirfd 语义依赖路径链 |
 | 并行候选 | P2a robust-list、P4a 共享匿名设计 | 各自先确认退出/后备对象所有权，不等整个 P1 完成 |
 | 持续支线 | P5a glibc 试跑、L0/L1 第二架构入口 | 可现在固定输入或调查边界，不以全量清单全绿为前提 |
 | 后续 | P3 同步/锁、N socket、P4 文件共享、P6 SMP | 按下述具体依赖进入，不按测试名称排接口 |
@@ -48,21 +46,21 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 
 ## P0：固定证据与时序问题
 
-**入口**：`tests/program-inventory/{inputs.json,run.py,suites.py,reports.py}`、`tests/diff-abi/`、`.github/workflows/ci.yml`、[程序清单](learning/user-program-inventory.md)。已有 228 项基线为 211 一致、14 直接 entry 退出不符、3 包装失败；静态/动态和脚本重叠不重复计算缺陷。
+**入口**：`tests/program-inventory/{inputs.json,run.py,suites.py,reports.py}`、`tests/diff-abi/`、`.github/workflows/ci.yml`、[程序清单](learning/user-program-inventory.md)。最近 228 项记录为 215 一致、10 个直接 entry 退出不符、3 个包装失败；静态/动态和脚本重叠不重复计算缺陷。
 
 ### P0c 时序根因闭环
 
 - [ ] 固定 kernel/ELF/loader/fixture/runner/QEMU 身份与次数，分别复跑静态、动态取消 entry 和原脚本；保存双侧 stdout/stderr、真实 wait status、超时和第一个失败。先区分 reference-not-pass、setup-error、脚本顺序依赖。
 - [ ] 取消异常缩成可独立运行的 shm_open、取消登记、阻塞、join/clear_tid 序列；确认取消点前后状态，不让错误诊断中的 write 再次隐藏原错误。用同步事件安排顺序，不靠随意 sleep 假定先后。
-- [ ] P1c 后验证后台子进程实际进入 sleep，再验证 kill/回收；将 `/dev/null` 打开失败与退出竞争排除后，才判断是否存在 scheduler/signal 缺陷。对照原 BusyBox 脚本和独立 shell 命令。
+- [x] P1c 后以同步握手确认独立后台子进程进入目标阶段，再执行 kill/回收，固定重复 20 轮均成功；原 BusyBox 包装器中的 sleep+kill 子项也为 20/20，包装器其他缺口继续单列，未据此关闭历史取消异常。
 - [ ] 若定位到支持范围内的错误，先加入能证伪旧实现的最小回归，再修所属模块；记录失败前和修复后的重复次数。一次转绿不能关闭未知根因。
 
 ### P0d 持续证据与清单维护
 
-- [ ] 每个能力提交保留内核 commit 或工作树产物 SHA-256、Linux、BusyBox/libc-test、UAPI/编译器、QEMU、镜像及驱动身份；旧 a14ff9d6 或首次完整运行计数不再冒充当前能力。
-- [ ] 七类直接失败按设备/身份、cwd、时间设置、文件系统统计、robust、socket 聚类；后续失败必须回到原始日志/最小复现，不按非零退出码猜 syscall。
-- [ ] 已有硬回归严格通过；能力清单如实保存缺口。全量严格验收复用 `--require-pass`，不重建状态系统或跳过失败；限定集合的严格判定见本节下一项。新能力完成后重跑相关静态/动态 entry 和原包装器，再决定是否需要全量。
-- [ ] 修正限定集合的严格判定：当前 `--case` 保留未选项目为 not-run，而 `run.py --require-pass` 会据这些项目返回失败；需要明确“所选集合全过”与“全量全部执行”的区别，保留未选状态，并用 runner 测试保护所选失败/未完成仍非零。当前聚焦结果应逐项检查，不能仅看默认命令退出码。
+- [x] 本轮证据保留工作树内核、ELF/loader、fixture、runner、QEMU 与固定 Linux/BusyBox/libc-test 身份；旧基线只保留历史定位用途。
+- [x] 原七类直接失败按设备/身份、cwd、时间设置、文件系统统计、robust、socket 聚类；设备两类已关闭，剩余五类保留原始日志与最小复现归属，不按非零退出码猜 syscall。
+- [x] 已有硬回归严格通过；能力清单如实保存缺口。全量严格验收复用 `--require-pass`，不重建状态系统或跳过失败；相关静态/动态 entry、原包装器与 228 项清单均已重跑。
+- [x] 限定集合的 `--require-pass` 只严格判定本次 selection，未选项目保持历史状态或 `not-run`；未知 ID、所选失败/未完成、中断、参考侧失败与全量严格模式均有 runner 回归。
 
 **验收**：每个新增任务都有可证伪输入、有效 Linux 参考和归属机制；历史原始失败保留，未运行项目不计通过。不要求 P0 达到 228 项全绿。
 
@@ -70,21 +68,21 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 
 **入口**：[文件模块](modules/kernel-files.md)、[VFS/ext4](modules/vfs-ext4.md)；`include/kernel/{vfs.h,open_file.h,fs_context.h}`、`fs/{vfs.c,open_file.c,fs_context.c}`、`fs/files/{path.c,io.c,table.c,poll.c,epoll.c}`、`kernel/syscall/{file.c,dispatch.c}`。
 
-### P1b 最小对象与操作边界（路线待确认）
+### P1b 最小对象与操作边界（最小 mount/路径对象路线已完成）
 
-- [ ] 明确文件身份（挂载实例+inode）、目录路径身份、OFD 的 offset/flags/引用、inode 元数据和后端操作。画清 open→dup/fork→阻塞 pin→close→末引用回收，不为尚无消费者的层添加抽象。
-- [ ] 比较文末 VFS 候选；先用 ext4 加一个真实设备消费者验证边界，再推广。lwext4 类型继续留在适配器内，task/syscall 不感知它；普通文件、pipe、epoll 的原操作语义保留。
-- [ ] 路径/目录对象持有真实引用；明确 mount、inode、目录项、打开对象的 owner，处理 unlink/rename 后存活和卸载忙。不能用会被删除或复用的路径字符串/裸指针替代稳定身份。
-- [ ] 为分配失败、后端打开失败、发布前回滚、被阻塞操作与 close/dup 交错建立回归。`close` 先摘 fd 和统计，只处理选定 OFD；历史 I/O cleanup 不改变本次有效 close 的结果。
+- [x] 文件身份使用 mount+inode，路径对象另持父目录项；OFD 持共享 flags/offset/引用，fd 槽持访问与 CLOEXEC。open→pin/dup/fork→close→末引用回收均有聚焦回归。
+- [x] ext4 适配器提供按目录 inode 查找、按 inode 打开和读链接；字符节点按 `rdev` 选择后端，lwext4 类型未泄露到 task/syscall。普通文件、pipe、epoll 保留统一分派下的各自语义。
+- [x] root/cwd、普通文件、目录和字符节点均持真实引用；unlink/rmdir 后旧对象存活，同名重建获得新 inode，外部引用使卸载返回忙。rename 仍归 P1g。
+- [x] 发布流程按路径→后端→OFD→fd 逐级取得 owner；分配/打开/fd 满与 close/dup/fork/阻塞 pin 有失败和回收检查。ext4 close 失败转交 mount cleanup node，非法释放继续 fatal。
 
 **交付**：一个可复用的 ext4/设备纵向入口及所有权说明；拟新增 `fs/path_walk.c`、`fs/mount.c` 等仅在职责确定时拆分，不要求一次重做 Linux dcache/RCU。
 
 ### P1c 真实设备文件
 
-- [ ] 通过统一路径和 OFD 后端打开 `/dev/null`、`/dev/zero`、`/dev/console`；身份取自设备节点/挂载，不在 syscall 中比较固定路径，不只给进程注入初始 fd。
-- [ ] null 读 EOF、写入按实际设备契约消费；zero 向用户缓冲区填充零值字节并返回实际交付字节数；console 复用 UART 等待/信号/非阻塞边界。用户 fault、零长度、向量与部分 I/O 逐项对照固定 Linux，不能从普通文件复制错误处理顺序。
-- [ ] 核对设备类型、`st_rdev`/stat、seek、ioctl、poll/epoll 支持范围和 errno；覆盖独立 open、dup/fork、关闭 fd 但阻塞 pin 存活、退出和 OOM 回收。
-- [ ] 原 `stat`、`syscall_sign_extend` 的静态/动态 entry 复跑；随后重跑后台 shell 与 daemon，继续报告剩余 cwd/会话依赖，不以设备完成宣称全部环境可用。
+- [x] 统一路径/OFD 后端可打开 `/dev/null`、`/dev/zero`、`/dev/console`；身份来自 ext4 字符节点与 `rdev`，未知设备号返回 `ENXIO`，初始标准 fd 复用 console 实现。
+- [x] null/zero/console 的读写、非阻塞、信号打断、零长度、坏指针、跨页部分 fault、向量与定位 I/O 均由真实 U-mode 或固定 Linux 差分验证。
+- [x] 设备 `st_rdev`、seek、未知 ioctl、poll/epoll、访问模式与 `O_TRUNC` 已核对；OFD pin、dup/fork/close/退出及分配失败回到资源基线。
+- [x] 原静态/动态 `stat`、`syscall_sign_extend` 已通过；后台 sleep+kill 同步重复 20 轮成功。daemon 仍因 cwd 接口缺失而失败，未归入设备完成。
 
 ### P1d cwd 与目录 fd
 
@@ -404,7 +402,7 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 
 | 取舍 / 当前证据 | 可行候选与正确性、演进、复杂度、成本 |
 |---|---|
-| P1b VFS：fs context 借用单根 mount、cwd 字符串；OFD 已独立 | ① 先让 ext4 目录具有稳定 handle、扩展 OFD 操作，迁移小，多挂载仍需补路径身份；② 同时引入最小 mount+路径对象/后端操作，直接支撑设备/目录消费者，但引用和回滚改动更广。两者都须保持 rename/unlink 后身份。倾向②的最小垂直切片。 |
+| P1b VFS：原 fs context 借用单根 mount、cwd 字符串；OFD 已独立 | 已选择并完成②：最小 mount+路径对象/后端操作。路径持有 mount、inode 与父链引用，ext4 字符节点按 `rdev` 分派；多挂载和 rename 仍留后续。 |
 | P4a 共享匿名：当前是私有 fault/COW | ① 急切分配并引用共享页，能满足 fork 可见性但改变 lazy/OOM 成本；② 引用后备对象按索引惰性发布，保留 lazy 并连接文件/shared futex，增加发布/回收协议。倾向②；shadow 链只在真实需求出现时另评估。 |
 | P3b 持久化：块层无 flush，写盘后失效缓存 | ① mount 范围提交元数据并设备 flush，较易闭环但会提交无关文件；② 每文件 dirty/error 和同步，隔离更好、利于共享页，状态/故障验证较复杂。都须真实 flush 与错误传播；倾向先①再按文件消费者细化。 |
 | P3d 恢复：需 recovery 的 ext4 被拒绝 | ① 继续明确无恢复承诺、拒绝脏日志，成本小但不能交付崩溃恢复；② 启用并验证 lwext4 journal/replay，扩大恢复能力但需事务/flush/故障矩阵。按应用的持久性目标选择，不能只打开配置。 |
@@ -438,7 +436,7 @@ make test-program-inventory-host test-diff-abi-host
 make inventory-userland-riscv
 ```
 
-`inventory-userland-riscv` 默认成功只说明清单生成成功。全量 228 项仍有明确缺口，严格模式失败不是自动产生的新回归；当前 `--case` 与 `--require-pass` 组合还受 P0d 所述 not-run 判定阻塞，不能把未执行项目写成通过。完整 Harness 缺 `kernel-la` 或其他能力时保留阻塞原因。
+`inventory-userland-riscv` 默认成功只说明清单生成成功。全量 228 项仍有明确缺口，严格模式失败不是自动产生的新回归；`--case` 与 `--require-pass` 只严格判定本次选择集合，未选项目保留历史结果或 `not-run`，选择集合写入状态供恢复报告解释。完整 Harness 缺 `kernel-la` 或其他能力时保留阻塞原因。
 
 ## 范围与交付边界
 

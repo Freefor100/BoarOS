@@ -2574,6 +2574,7 @@ static void run_epoll_operations(struct kernel_files *files,
 {
     struct kernel_files_statistics before;
     struct kernel_files_statistics after;
+    struct kernel_linux_stat stat;
     struct kernel_open_file_description *first_description;
     int32_t pipe_fds[2];
     int64_t result = INT64_MIN;
@@ -2589,6 +2590,13 @@ static void run_epoll_operations(struct kernel_files *files,
             KERNEL_FILES_STATUS_OK ||
         result != 0) {
         fail_files(200U, 0, result);
+    }
+    if (kernel_files_fstat(files, mm, 0, TEST_USER_BUFFER, &result) !=
+            KERNEL_FILES_STATUS_OK ||
+        result != 0 ||
+        !read_user_bytes(mm, TEST_USER_BUFFER, &stat, sizeof(stat)) ||
+        stat.st_mode != UINT32_C(0000600) || stat.st_nlink != 1U) {
+        fail_files(241U, 0000600, stat.st_mode);
     }
     kernel_files_get_statistics(files, &after);
     if (after.current_open_fds != before.current_open_fds + 1U ||
@@ -2779,6 +2787,86 @@ static void run_epoll_operations(struct kernel_files *files,
 static void run_files_test(const void *dtb) __attribute__((unused));
 #endif
 
+static void run_device_open_test(struct kernel_files *files,
+                                 struct kernel_fs_context *fs,
+                                 struct kernel_mm *mm)
+{
+    int64_t fd;
+    int64_t result;
+    unsigned char zeros[8];
+
+    if (!write_user_bytes(mm, TEST_USER_PATH, "/test-null", 11U) ||
+        kernel_files_openat(files, fs, mm, TEST_AT_FDCWD, TEST_USER_PATH,
+                            2U, 0U, &fd) != KERNEL_FILES_STATUS_OK ||
+        fd < 0 ||
+        kernel_files_read(files, mm, fd, TEST_USER_BUFFER, 8U, &result) !=
+            KERNEL_FILES_STATUS_OK || result != 0 ||
+        kernel_files_write(files, mm, fd, UINT64_C(0x30000), 8U, &result) !=
+            KERNEL_FILES_STATUS_OK || result != 8 ||
+        kernel_files_lseek(files, fd, 123, KERNEL_FILES_SEEK_SET, &result) !=
+            KERNEL_FILES_STATUS_OK || result != 0 ||
+        kernel_files_close(files, fd, &result) != KERNEL_FILES_STATUS_OK ||
+        result != 0) {
+        fail_files(510U, 0, result);
+    }
+    if (!write_user_bytes(mm, TEST_USER_PATH, "/test-zero", 11U) ||
+        kernel_files_openat(files, fs, mm, TEST_AT_FDCWD, TEST_USER_PATH,
+                            0U, 0U, &fd) != KERNEL_FILES_STATUS_OK ||
+        fd < 0 ||
+        kernel_files_read(files, mm, fd, TEST_USER_BUFFER, sizeof(zeros),
+                          &result) != KERNEL_FILES_STATUS_OK ||
+        result != (int64_t)sizeof(zeros) ||
+        !read_user_bytes(mm, TEST_USER_BUFFER, zeros, sizeof(zeros)) ||
+        memcmp(zeros, "\0\0\0\0\0\0\0\0", sizeof(zeros)) != 0 ||
+        kernel_files_close(files, fd, &result) != KERNEL_FILES_STATUS_OK ||
+        result != 0) {
+        fail_files(511U, 0, result);
+    }
+    if (!write_user_bytes(mm, TEST_USER_PATH, "/test-null-alias", 17U) ||
+        kernel_files_openat(files, fs, mm, TEST_AT_FDCWD, TEST_USER_PATH,
+                            2U, 0U, &fd) != KERNEL_FILES_STATUS_OK ||
+        fd < 0 ||
+        kernel_files_read(files, mm, fd, TEST_USER_BUFFER, 1U, &result) !=
+            KERNEL_FILES_STATUS_OK || result != 0 ||
+        kernel_files_close(files, fd, &result) != KERNEL_FILES_STATUS_OK ||
+        result != 0 ||
+        !write_user_bytes(mm, TEST_USER_PATH, "/test-console", 14U) ||
+        kernel_files_openat(files, fs, mm, TEST_AT_FDCWD, TEST_USER_PATH,
+                            1U, 0U, &fd) != KERNEL_FILES_STATUS_OK ||
+        fd < 0 ||
+        kernel_files_close(files, fd, &result) != KERNEL_FILES_STATUS_OK ||
+        result != 0) {
+        fail_files(514U, 0, result);
+    }
+    if (!write_user_bytes(mm, TEST_USER_PATH, "/test-unknown", 14U) ||
+        kernel_files_openat(files, fs, mm, TEST_AT_FDCWD, TEST_USER_PATH,
+                            0U, 0U, &result) != KERNEL_FILES_STATUS_OK ||
+        result != -KERNEL_ENXIO) {
+        fail_files(512U, -KERNEL_ENXIO, result);
+    }
+}
+
+static void run_path_identity_test(struct kernel_vfs_mount *mount,
+                                   struct kernel_heap *heap)
+{
+    struct kernel_vfs_path *root = 0;
+    struct kernel_vfs_path *child = 0;
+    struct kernel_vfs_path *resolved = 0;
+    struct kernel_vfs_stat stat;
+
+    if (kernel_vfs_path_root(mount, heap, &root) != 0 ||
+        kernel_vfs_path_lookup(root, "data", 4U, &child) != 0 ||
+        kernel_vfs_stat_path(mount, "/data", 1, &stat) != 0 ||
+        kernel_vfs_path_inode(child) != stat.ino ||
+        kernel_vfs_path_resolve(root, root, "/./data", 1, &resolved) != 0 ||
+        kernel_vfs_path_inode(resolved) != stat.ino ||
+        kernel_vfs_path_release(&resolved) != 0 ||
+        kernel_vfs_path_release(&child) != 0 ||
+        kernel_vfs_path_release(&root) != 0) {
+        fail_files(513U, 0, -1);
+    }
+}
+
 static void run_files_test(const void *dtb)
 {
     struct dtb_boot_info info;
@@ -2859,6 +2947,7 @@ static void run_files_test(const void *dtb)
         fail_files(4U, 0, -1);
     }
     use_test_satp = 1;
+    run_path_identity_test(&mount, &heap);
 
     run_shared_handle_operations(&files, &fs, &mm);
     run_fork_operations(&files, &fs, &mm);
@@ -2885,6 +2974,7 @@ static void run_files_test(const void *dtb)
     run_close_cleanup_isolation(&files);
     run_console_operations(&files, &fs, &mm);
     run_seek_stat_operations(&files, &fs, &mm);
+    run_device_open_test(&files, &fs, &mm);
 
     if (kernel_files_release(&files) != KERNEL_FILES_STATUS_OK) {
         fail_files(58U, KERNEL_FILES_STATUS_OK,
@@ -2945,8 +3035,9 @@ static void run_files_test(const void *dtb)
 
     use_test_satp = 0;
     if (kernel_files_release(&files) != KERNEL_FILES_STATUS_OK ||
-        kernel_fs_context_release(&fs) != KERNEL_FS_CONTEXT_STATUS_OK ||
         kernel_mm_release(&mm) != KERNEL_MM_STATUS_OK ||
+        kernel_vfs_unmount(&mount) != -KERNEL_EBUSY ||
+        kernel_fs_context_release(&fs) != KERNEL_FS_CONTEXT_STATUS_OK ||
         kernel_vfs_unmount(&mount) != 0 ||
         kernel_page_cache_destroy(&page_cache) !=
             KERNEL_PAGE_CACHE_STATUS_OK ||

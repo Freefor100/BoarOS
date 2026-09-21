@@ -65,6 +65,21 @@ void abi_link_cases(void)
     abi_record("link.intermediate", ret, -1, -1, 0,
                buffer, ret > 0 ? (usize)ret : 0);
     close_link_fd(fd);
+    fd = abi_open("/dir-alias/", 00400000);
+    abi_record("link.trailing-directory-nofollow", fd < 0 ? fd : 0,
+               -1, -1, 0, 0, 0);
+    close_link_fd(fd);
+    abi_require(SC3(36, "/dir", -100, "/unlink-dir-link") == 0);
+    ret = SC3(35, -100, "/unlink-dir-link/", 0);
+    abi_record("link.unlink-symlink-trailing", ret, -1, -1, 0, 0, 0);
+    abi_require(SC3(36, "/mkdir-target", -100, "/mkdir-dangling") == 0);
+    ret = SC3(34, -100, "/mkdir-dangling/", 0755);
+    abi_record("link.mkdir-dangling-trailing", ret, -1, -1, 0, 0, 0);
+    ret = SC4(79, -100, "/mkdir-target", &stat, 0);
+    abi_record("link.mkdir-target-missing", ret, -1, -1, 0, 0, 0);
+    abi_require(SC3(36, "/dir", -100, "/symlink-dir-link") == 0);
+    ret = SC3(36, "/data", -100, "/symlink-dir-link/");
+    abi_record("link.symlink-existing-trailing", ret, -1, -1, 0, 0, 0);
 
     abi_require(SC3(36, "/loop-b", -100, "/loop-a") == 0);
     abi_require(SC3(36, "/loop-a", -100, "/loop-b") == 0);
@@ -102,4 +117,24 @@ void abi_link_cases(void)
     abi_record("link.parent-child-removed", ret, -1, -1, 0, 0, 0);
     ret = SC4(78, -100, "/data", buffer, sizeof(buffer));
     abi_record("link.readlink-regular", ret, -1, -1, 0, 0, 0);
+
+    abi_require(SC3(34, -100, "/rmdir-dot", 0755) == 0);
+    ret = SC3(35, -100, "/rmdir-dot/.", 0x200);
+    abi_record("link.rmdir-dot", ret, -1, -1, 0, 0, 0);
+    ret = SC4(79, -100, "/rmdir-dot", &stat, 0);
+    abi_record("link.rmdir-dot-survives", ret, -1, -1, 0, 0, 0);
+    abi_require(SC3(34, -100, "/rmdir-target", 0755) == 0);
+    abi_require(SC3(36, "/rmdir-target", -100, "/rmdir-link") == 0);
+    ret = SC3(35, -100, "/rmdir-link/", 0x200);
+    abi_record("link.rmdir-symlink-trailing", ret, -1, -1, 0, 0, 0);
+    ret = SC4(79, -100, "/rmdir-target", &stat, 0);
+    abi_record("link.rmdir-target-survives", ret, -1, -1, 0, 0, 0);
+    fd = abi_open("/missing-create/", 0x42);
+    abi_record("link.create-missing-trailing", fd < 0 ? fd : 0,
+               -1, -1, 0, 0, 0);
+    close_link_fd(fd);
+    abi_record("link.rmdir-root", SC3(35, -100, "/", 0x200),
+               -1, -1, 0, 0, 0);
+    abi_record("link.rmdir-root-slashes", SC3(35, -100, "///", 0x200),
+               -1, -1, 0, 0, 0);
 }

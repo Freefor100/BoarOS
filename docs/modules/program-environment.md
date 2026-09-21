@@ -62,7 +62,7 @@ host 测试保护源版本拒绝、头文件身份变化、配置功能不被裁
 `make inventory-userland-riscv` 调用 `run.py` 构建上述完整 BusyBox 和
 `libc_build.py` 的固定 libc-test，再经 `suites.run_suite()` 逐例启动两侧 QEMU。
 `--reuse-builds` 显式复用已核验的 revision 和 ELF/DSO 校验值；默认重新构建。
-`--case`、`--suite` 缩小运行集合；`--require-pass` 使程序失败也返回非零。
+`--case`、`--suite` 缩小运行集合；`--require-pass` 对本次所选集合要求每项完成且通过，未选项保持历史结果或 `not-run`。未指定 `--case` 时全量 228 项均需完成且通过。执行状态保存本次 `selection`，恢复运行可改变集合而不把未选项伪装成通过；runner 中断、环境错误、参考侧失败与未知案例仍为失败。
 `--output` 指定证据目录，默认 `build/program-inventory-full`。
 
 suite identity 包含程序/驱动/内核/执行器/校验器身份、QEMU 与磁盘工具身份和超时配置。

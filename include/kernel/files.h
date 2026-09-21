@@ -199,6 +199,16 @@ enum kernel_files_status kernel_files_write(
     uint64_t count,
     int64_t *linux_result);
 
+/* pwrite64 writes without changing the shared open-file description offset. */
+enum kernel_files_status kernel_files_pwrite(
+    struct kernel_files *files,
+    struct kernel_mm *mm,
+    int64_t fd,
+    uint64_t user_buffer,
+    uint64_t count,
+    int64_t offset,
+    int64_t *linux_result);
+
 struct kernel_uaccess_iovec {
     uint64_t base;
     uint64_t length;
@@ -286,6 +296,13 @@ enum kernel_files_status kernel_files_dup2(
     int64_t *linux_result);
 
 enum kernel_files_status kernel_files_fcntl(
+    struct kernel_files *files,
+    int64_t fd,
+    uint64_t command,
+    uint64_t argument,
+    int64_t *linux_result);
+
+enum kernel_files_status kernel_files_ioctl(
     struct kernel_files *files,
     int64_t fd,
     uint64_t command,
