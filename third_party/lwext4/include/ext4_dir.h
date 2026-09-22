@@ -184,6 +184,9 @@ static inline void ext4_dir_en_set_inode_type(struct ext4_sblock *sb,
 bool ext4_dir_csum_verify(struct ext4_inode_ref *inode_ref,
 			  struct ext4_dir_en *dirent);
 
+/* Validate every directory block before reporting it empty. */
+int ext4_dir_check_empty(struct ext4_inode_ref *dir, bool *empty);
+
 /**@brief Initialize directory iterator.
  * Set position to the first valid entry from the required position.
  * @param it        Pointer to iterator to be initialized

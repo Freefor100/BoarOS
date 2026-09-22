@@ -37,6 +37,7 @@
     (LINUX_WNOHANG | LINUX_WUNTRACED | LINUX_WCONTINUED | \
      LINUX___WNOTHREAD | LINUX___WALL | LINUX___WCLONE)
 #define LINUX_CLONE_VM UINT64_C(0x100)
+#define LINUX_CLONE_FS UINT64_C(0x200)
 #define LINUX_CLONE_VFORK UINT64_C(0x4000)
 #define LINUX_CLONE_THREAD UINT64_C(0x10000)
 #define LINUX_CLONE_SETTLS UINT64_C(0x80000)
@@ -550,7 +551,7 @@ enum kernel_scheduler_status riscv_process_clone_current(
                     ? KERNEL_SCHEDULER_STATUS_OK
                     : KERNEL_SCHEDULER_STATUS_INVALID_STATE);
         }
-        fs_status = thread_clone
+        fs_status = (flags & LINUX_CLONE_FS) != 0U
             ? kernel_fs_context_acquire(&child->fs, &parent->fs)
             : kernel_fs_context_fork(&child->fs, &parent->fs);
         if (fs_status != KERNEL_FS_CONTEXT_STATUS_OK) {

@@ -591,6 +591,14 @@ static unsigned long run_process_decode_cases(void)
         result_changed(&result, KERNEL_SYSCALL_ACTION_CLONE, 0)) {
         failures++;
     }
+    request.arguments[0] = UINT64_C(0x211);
+    if (kernel_syscall_dispatch(caller, &request, &result) !=
+            KERNEL_SYSCALL_STATUS_OK ||
+        result_changed(&result, KERNEL_SYSCALL_ACTION_CLONE, 0)) failures++;
+    request.arguments[0] = UINT64_C(0x4311);
+    if (kernel_syscall_dispatch(caller, &request, &result) !=
+            KERNEL_SYSCALL_STATUS_OK ||
+        result_changed(&result, KERNEL_SYSCALL_ACTION_CLONE, 0)) failures++;
     request.arguments[0] = 0x111U;
     if (kernel_syscall_dispatch(caller, &request, &result) !=
             KERNEL_SYSCALL_STATUS_OK ||

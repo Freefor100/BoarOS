@@ -44,7 +44,6 @@ static int transaction_resources_empty(
     const struct kernel_exec_transaction *transaction)
 {
     return transaction->original_path == 0 &&
-           transaction->resolved_path == 0 &&
            transaction->string_bytes == 0 &&
            transaction->arguments == 0 &&
            transaction->environment == 0 &&
@@ -122,10 +121,6 @@ enum kernel_exec_status kernel_exec_transaction_cleanup(
     }
     if (!release_allocation(transaction,
                             (void **)&transaction->string_bytes)) {
-        failed = 1;
-    }
-    if (!release_allocation(transaction,
-                            (void **)&transaction->resolved_path)) {
         failed = 1;
     }
     if (!release_allocation(transaction,
@@ -455,7 +450,6 @@ enum kernel_exec_status kernel_execve_prepare(
     struct kernel_files *files;
     const struct kernel_fs_context *fs;
     struct kernel_exec_transaction *transaction;
-    struct kernel_vfs_mount *mount;
     const char *interpreter_path;
     size_t interpreter_length;
     struct kernel_exec_image_request image_request;
@@ -531,42 +525,11 @@ enum kernel_exec_status kernel_execve_prepare(
     if (access_status != KERNEL_UACCESS_STATUS_OK) {
         return finish_prepare_state(task, transaction);
     }
-    heap_status = kernel_heap_allocate(transaction->heap,
-                                       KERNEL_FS_PATH_MAX,
-                                       (void **)&transaction->resolved_path);
-    if (heap_status != KERNEL_HEAP_STATUS_OK) {
-        return heap_status == KERNEL_HEAP_STATUS_EMPTY
-                   ? finish_prepare_failure(task,
-                                            transaction,
-                                            -KERNEL_ENOMEM,
-                                            linux_result)
-                   : finish_prepare_state(task, transaction);
-    }
-    if (kernel_fs_context_resolve_kernel_path(
-            fs,
-            KERNEL_FS_AT_FDCWD,
-            transaction->original_path,
-            filename_length,
-            transaction->resolved_path,
-            KERNEL_FS_PATH_MAX,
-            &mount,
-            &path_result) != KERNEL_FS_CONTEXT_STATUS_OK) {
+    if (kernel_open_file_create_at(transaction->heap,
+            kernel_fs_context_cwd(fs), kernel_fs_context_root(fs),
+            transaction->original_path, KERNEL_OPEN_PATH_EXECUTABLE, 0,
+            &transaction->executable_file, &path_result) != KERNEL_OPEN_FILE_STATUS_OK)
         return finish_prepare_state(task, transaction);
-    }
-    if (path_result != 0) {
-        return finish_prepare_failure(task,
-                                      transaction,
-                                      path_result,
-                                      linux_result);
-    }
-    if (kernel_open_file_create_executable(transaction->heap,
-                                           mount,
-                                           transaction->resolved_path,
-                                           &transaction->executable_file,
-                                           &path_result) !=
-            KERNEL_OPEN_FILE_STATUS_OK) {
-        return finish_prepare_state(task, transaction);
-    }
     if (path_result != 0) {
         return finish_prepare_failure(task,
                                       transaction,
@@ -604,31 +567,11 @@ enum kernel_exec_status kernel_execve_prepare(
         transaction->executable_source,
         &interpreter_length);
     if (interpreter_path != 0) {
-        if (kernel_fs_context_resolve_kernel_path(
-                fs,
-                KERNEL_FS_AT_FDCWD,
-                interpreter_path,
-                interpreter_length,
-                transaction->resolved_path,
-                KERNEL_FS_PATH_MAX,
-                &mount,
-                &path_result) != KERNEL_FS_CONTEXT_STATUS_OK) {
+        if (kernel_open_file_create_at(transaction->heap,
+                kernel_fs_context_cwd(fs), kernel_fs_context_root(fs),
+                interpreter_path, KERNEL_OPEN_PATH_EXECUTABLE, 0,
+                &transaction->interpreter_file, &path_result) != KERNEL_OPEN_FILE_STATUS_OK)
             return finish_prepare_state(task, transaction);
-        }
-        if (path_result != 0) {
-            return finish_prepare_failure(task,
-                                          transaction,
-                                          path_result,
-                                          linux_result);
-        }
-        if (kernel_open_file_create_executable(transaction->heap,
-                                               mount,
-                                               transaction->resolved_path,
-                                               &transaction->interpreter_file,
-                                               &path_result) !=
-                KERNEL_OPEN_FILE_STATUS_OK) {
-            return finish_prepare_state(task, transaction);
-        }
         if (path_result != 0) {
             return finish_prepare_failure(task,
                                           transaction,

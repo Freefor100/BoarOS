@@ -120,6 +120,22 @@ enum kernel_files_status kernel_files_move(
 int kernel_files_is_live(const struct kernel_files *files);
 
 /* Normal Linux ABI results, including negative errno, use linux_result. */
+enum kernel_files_status kernel_files_chdir(
+    struct kernel_files *files, const struct kernel_fs_context *fs,
+    struct kernel_mm *mm, uint64_t user_path, int64_t *linux_result);
+enum kernel_files_status kernel_files_fchdir(
+    struct kernel_files *files, const struct kernel_fs_context *fs,
+    int64_t fd, int64_t *linux_result);
+enum kernel_files_status kernel_files_getcwd(
+    struct kernel_files *files, const struct kernel_fs_context *fs,
+    struct kernel_mm *mm, uint64_t user_buffer, uint64_t size,
+    int64_t *linux_result);
+enum kernel_files_status kernel_files_renameat(
+    struct kernel_files *files, const struct kernel_fs_context *fs,
+    struct kernel_mm *mm, int64_t old_dirfd, uint64_t old_user_path,
+    int64_t new_dirfd, uint64_t new_user_path, uint32_t flags,
+    int64_t *linux_result);
+
 enum kernel_files_status kernel_files_openat(
     struct kernel_files *files,
     const struct kernel_fs_context *fs,

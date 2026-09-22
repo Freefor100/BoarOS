@@ -9,6 +9,11 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#define LINUX_SYSCALL_GETCWD 17U
+#define LINUX_SYSCALL_RENAMEAT 38U
+#define LINUX_SYSCALL_CHDIR 49U
+#define LINUX_SYSCALL_FCHDIR 50U
+#define LINUX_SYSCALL_RENAMEAT2 276U
 #define LINUX_SYSCALL_EPOLL_CREATE1 20U
 #define LINUX_SYSCALL_EPOLL_CTL 21U
 #define LINUX_SYSCALL_EPOLL_PWAIT 22U
@@ -191,6 +196,19 @@ enum kernel_syscall_status kernel_syscall_dispatch(
             KERNEL_SYSCALL_STATUS_OK) {
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
         }
+    } else if (request->number == LINUX_SYSCALL_GETCWD) {
+        if (syscall_handle_getcwd(caller, request, &decoded) != KERNEL_SYSCALL_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    } else if (request->number == LINUX_SYSCALL_CHDIR ||
+               request->number == LINUX_SYSCALL_FCHDIR) {
+        if (syscall_handle_chdir(caller, request, &decoded,
+                request->number == LINUX_SYSCALL_FCHDIR) != KERNEL_SYSCALL_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    } else if (request->number == LINUX_SYSCALL_RENAMEAT ||
+               request->number == LINUX_SYSCALL_RENAMEAT2) {
+        if (syscall_handle_renameat(caller, request, &decoded,
+                request->number == LINUX_SYSCALL_RENAMEAT2) != KERNEL_SYSCALL_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     } else if (request->number == LINUX_SYSCALL_MKDIRAT) {
         if (syscall_handle_mkdirat(caller, request, &decoded) !=
             KERNEL_SYSCALL_STATUS_OK) {

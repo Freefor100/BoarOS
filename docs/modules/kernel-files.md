@@ -9,7 +9,7 @@
 - `kernel_files` 是进程可见的 fd 槽数组；槽保存 descriptor flags 和指向 open file description 的指针。
 - `kernel_open_file_description` 拥有一个 VFS file、当前 offset 和清理状态。分别打开同一路径会得到独立 description，因此 offset 互不影响。
 - pipe description 不拥有 VFS file，而是各自持有同一个 `struct kernel_pipe` 的读/写 endpoint；pipe 对象拥有连续 64 KiB 数据区、16 个固定页片段的有效范围、读写端引用和等待队列。
-- `kernel_fs_context` 持有 root 和 cwd 的独立路径引用；普通 fork 复制两份引用，`CLONE_FS` 共享 context record，exec 保留。用户 cwd 接口尚未开放，当前 cwd 固定 `/`。
+- `kernel_fs_context` 持有 root 和 cwd 的独立路径引用；普通 fork 复制两份引用，`CLONE_FS` 共享 context record，exec 保留。`chdir/fchdir/getcwd` 操作共享活目录项；exec 从当前目录对象解析相对路径。
 
 `kernel_files_pin()` 为 fd 指向的 open file description 增加一个独立引用。file-private mmap
 用它把文件生命周期从 fd 槽中分离：映射成功后 MM 消耗该引用，之后即使所有 fd 都关闭，
@@ -31,7 +31,7 @@ normal open、dup/F_DUPFD、console、pipe2 和 epoll_create1 最终都经过 `t
 
 `kernel_files_openat()` 接收用户路径、dirfd、flags 和 mode，普通 Linux 结果通过 `linux_result` 返回，内核对象损坏或清理所有权异常则使用 `kernel_files_status` 报告。路径先复制到一张 4096 字节临时堆缓冲区：找不到 NUL 返回 `-ENAMETOOLONG`，不可读用户页返回 `-EFAULT`，空路径返回 `-ENOENT`。
 
-绝对路径忽略 dirfd，直接使用根 mount；相对路径只支持 `AT_FDCWD`，与当前 cwd 拼接，其他 dirfd 返回 `-EBADF`。VFS 在 mount 内逐分量处理 `.`、`..`、相对/绝对符号链接目标、尾斜杠和最多 40 次链接展开；open/exec/stat 跟随最终链接，`O_NOFOLLOW` 只在最终分量为链接时返回 `-ELOOP`，`O_CREAT|O_EXCL` 对它返回 `-EEXIST`。`symlinkat/readlinkat` 和 `AT_SYMLINK_NOFOLLOW` 访问链接本身；创建和删除仅解析父路径。当前仍没有目录 fd、`chdir`、mount namespace 或逐分量权限检查。
+绝对路径忽略 dirfd，从 root 对象开始；相对路径从 cwd 或目录 fd 持有的目录项开始。无效 fd 返回 `-EBADF`，非目录 fd 返回 `-ENOTDIR`。VFS 在 mount 内逐分量处理 `.`、`..`、相对/绝对符号链接目标、尾斜杠和最多 40 次链接展开；open/exec/stat 跟随最终链接，`O_NOFOLLOW` 只在最终分量为链接时返回 `-ELOOP`，`O_CREAT|O_EXCL` 对它返回 `-EEXIST`。`symlinkat/readlinkat` 和 `AT_SYMLINK_NOFOLLOW` 访问链接本身；创建和删除仅解析父路径。当前仍没有 mount namespace 或逐分量权限检查。
 
 支持普通文件与目录的打开，以及新建文件，严格遵循 Linux 解析与权限控制流：
 - 标志支持：`O_RDONLY`、`O_WRONLY`、`O_RDWR`、`O_CREAT`、`O_EXCL`、`O_TRUNC`、`O_APPEND`、`O_NONBLOCK`、`O_LARGEFILE`、`O_CLOEXEC`、`O_DIRECTORY` 和 `O_NOFOLLOW`。regular file 与 directory 接受并在 OFD status flags 中保留 `O_NONBLOCK`，`F_GETFL/F_SETFL` 可观察和切换该位；普通文件 I/O 不因此伪造 pipe 风格的 `EAGAIN`。
@@ -43,6 +43,10 @@ normal open、dup/F_DUPFD、console、pipe2 和 epoll_create1 最终都经过 `t
 - 打开成功后按 VFS mode 把描述符分类为 regular、directory 或 console；directory 描述符支持 `getdents64`、`lseek` 与 `fstat`，`read` 返回 `-EISDIR`。文件不存在等路径错误由 VFS 保留为负 Linux errno；表满返回 `-EMFILE`，堆耗尽返回 `-ENOMEM`。
 
 该标志行为依据固定 Linux commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 `references/linux/include/linux/fcntl.h`、`references/linux/fs/open.c` 与 `references/linux/fs/fcntl.c`。固定 musl 1.2.5（`references/musl/musl-1.2.5.tar.gz`，SHA-256 `a9a118bbe84d8764da0ea0d28b3ab3fae8477fc7e4085d90102b8596fc7c75e4`）的 `src/dirent/opendir.c` 使用 `O_RDONLY|O_DIRECTORY|O_CLOEXEC`，不依赖 `O_NONBLOCK`；因此本改动不把 musl `opendir` 作为新增能力。
+
+`getcwd` 返回包含 NUL 的字节数；用户缓冲不足为 `ERANGE`，已断开的 cwd 为 `ENOENT`。删除目录后，其持有者仍可对 `.` 打开/统计、经 `..` 访问父目录、通过 `fchdir` 切回；不能在已删除目录中新建名字。改名会更新所有持有同一目录项的 cwd/OFD 所观察到的父链。fork 独立复制 fs record，进程形式和线程形式的 `CLONE_FS` 都共享它；切换 cwd 先取得新引用再替换，失败不改变原目录。
+
+`renameat2` 支持 flags 0 和 `RENAME_NOREPLACE`；未知或互斥组合返回 `EINVAL`，EXCHANGE/WHITEOUT 返回 `ENOTSUP`。保留 `renameat(38)` 兼容入口；固定 RV64 Linux 与 musl 使用 `renameat2(276)` 完成普通 rename，因此差分也使用该原生入口。磁盘事务完成后才发布内存目录项变化；覆盖目标的 OFD 保留原 inode 和内容。目录 `..`、两侧链接数和持久 orphan 由同一事务处理。
 
 ## `pipe2` 与 FIFO endpoint
 
@@ -76,7 +80,7 @@ open file description 的 offset 只增加实际复制到用户空间的字节�
 
 ## 目录与文件系统操作
 
-- `kernel_files_mkdirat()`：通过 fs context 解析路径后调用 `kernel_vfs_mkdir()`；只读挂载返回 `-EROFS`。
+- `kernel_files_mkdirat()`：取得 root/cwd/dirfd 起点后调用 `kernel_vfs_mkdir_at()`；只读挂载返回 `-EROFS`。
 - `kernel_files_unlinkat()`：支持文件删除与目录删除（`AT_REMOVEDIR` 标志）。普通文件调用 `kernel_vfs_unlink()`，仍打开的对象保留页缓存；目录删除调用 `kernel_vfs_rmdir()`，非空目录返回 `-ENOTEMPTY`。
 - `kernel_files_ftruncate()`：校验 fd 具备可写权限且为常规文件，调用 `kernel_vfs_ftruncate()` 调整文件大小（向下截断或向上 sparse 扩展）并精确失效该节点页缓存；backend 已改变 inode 后才返回错误时，仍先同步 node/file size 并失效缓存，再把 errno 返回用户态。只读描述符返回 `-EINVAL`，目录返回 `-EISDIR`。向下截断根据实际新大小通知稳定 node–MM 登记，撤销所有相关 MM 中越过新 EOF 的整页 PTE（包含私有 COW 与 PROT_NONE），保留 VMA 以便随后 fault/SIGBUS。非对齐尾页的文件来源后缀清零，已私有化内容保留；来源记录不依赖缓存索引或 PTE COW 位。
 
@@ -113,7 +117,7 @@ open file description 的 offset 只增加实际复制到用户空间的字节�
 
 `kernel_files_fstat()/newfstatat()` 按 riscv64 asm-generic 128 字节 `struct stat` 填充。regular file 与 directory 都先由 `kernel_vfs_fstat()` 取得同一份 filesystem-independent metadata，再转换为 Linux ABI；dev/ino/mode/nlink/uid/gid/size、512-byte `blocks`、filesystem `blksize` 和 atime/mtime/ctime 除 size 来自共享 node 的逻辑大小外，均来自当前 ext4 inode。打开后 unlink 的 file handle 仍指向活着的 inode，因此 `fstat` 可继续读取内容与 metadata，并观察到 `nlink == 0`。当前根 mount 的 `st_dev` 是稳定的 VFS 内部 mount ID 1，只用于同一挂载内的身份比较，不冒充硬件 major/minor。
 
-console、pipe 和 epoll 是不属于 filesystem inode 的合成对象，继续走各自的显式 stat 形态；console 呈现 5:1 字符设备，pipe 呈现 FIFO。`newfstatat` 支持 `AT_FDCWD`/绝对路径与 `AT_EMPTY_PATH`（直接按 fd 取描述符），真实 dirfd 的相对路径返回 `-EBADF`；目录路径可统计，`AT_SYMLINK_NOFOLLOW` 通过路径 inode 查询返回链接自身的 mode、大小和时间戳。常规文件 create/read/pread/write/writev/truncate/unlink 已更新 realtime 时间戳：读取按 relatime（含缓存命中、非零 EOF 和 user fault），写入先校验 inode maxbytes，再在 usercopy 前修改 mtime/ctime，同长度 truncate 也更新；零长度或访问模式拒绝不更新。创建/移除更新父目录 mtime/ctime，unlink 后仍打开的 inode 继续通过 live handle 更新。扩展 inode 保留纳秒与 signed epoch，旧 128-byte inode 按秒截断；只读挂载不写 atime，未初始化时钟不覆盖 fixture metadata。触发、I/O 错误 owner 和固定 Linux 依据见[文件时间戳](../learning/file-timestamps.md)。
+console、pipe 和 epoll 是不属于 filesystem inode 的合成对象，继续走各自的显式 stat 形态；console 呈现 5:1 字符设备，pipe 呈现 FIFO。`newfstatat` 支持 cwd/dirfd/绝对路径与 `AT_EMPTY_PATH`（按 fd 取对象，`AT_FDCWD` 取 cwd）；目录路径可统计，`AT_SYMLINK_NOFOLLOW` 通过路径 inode 查询返回链接自身的 mode、大小和时间戳。常规文件 create/read/pread/write/writev/truncate/unlink 已更新 realtime 时间戳：读取按 relatime（含缓存命中、非零 EOF 和 user fault），写入先校验 inode maxbytes，再在 usercopy 前修改 mtime/ctime，同长度 truncate 也更新；零长度或访问模式拒绝不更新。创建/移除更新父目录 mtime/ctime，unlink 后仍打开的 inode 继续通过 live handle 更新。扩展 inode 保留纳秒与 signed epoch，旧 128-byte inode 按秒截断；只读挂载不写 atime，未初始化时钟不覆盖 fixture metadata。触发、I/O 错误 owner 和固定 Linux 依据见[文件时间戳](../learning/file-timestamps.md)。
 
 `kernel_files_getdents64()` 只作用于目录描述符，其他类型返回 `-ENOTDIR`。每条记录按 linux_dirent64 编码（`d_reclen` 8 字节对齐，`d_type` 来自 ext4 filetype），`d_off` 是下一条记录的后端 cookie，不是条目计数；缓冲区连第一条记录都放不下返回 `-EINVAL`，用户 fault 在已完整发出的记录上返回前缀计数。
 
@@ -169,7 +173,7 @@ make test-riscv
 
 聚焦测试在真实 QEMU legacy 与 modern VirtIO/ext4 上覆盖绝对/相对路径、错误 flags、目录与缺失文件、4096 字节路径上限、最低 fd 复用、表扩容、统一 fd 安装统计、epoll 满表原子性、`O_CLOEXEC/O_NONBLOCK`、缓存命中后的跨页读取、EOF、部分 fault、fork 后 fd 表独立与 OFD offset 共享，以及 VFS orphan/I/O owner。stat 回归核对 regular/directory 的真实 inode metadata、allocated blocks、fstat/newfstatat 共同字段和 unlink-but-open 的零链接计数。它还在关闭 fd 后通过 MM backing 继续缺页，反复固定地址映射同一 OFD 并检查来源释放只发生一次，验证父子各自持有一份来源引用。生产 exec/clone 链验证普通 fd 与 offset 跨映像和父子保持、CLOEXEC fd 不可见，PID 1 的 stdio 与跨 exec 的 console 描述符由串口标记验证，并由最终资源基线证明退出清理生效。`make test-userland-riscv` 用静态和动态 musl 程序作为 PID 1 运行 stdio、readdir、read/lseek/fstat、dup、signal、pipe、pthread、TLS 和 dlopen；其中写打开普通文件的真实 `read/pread` 及其 dup 均验证 `EBADF`，是真实 U-mode 外部测例的入口。
 
-当前提供可共享的文件表与根 fs context handle，普通 clone 仍实现“复制表/复制 cwd、共享 OFD”；系统调用层是否选择共享由 clone flags 决定。当前已支持常规文件的读写（`write/writev/pwrite64/append`）、新建、删除（`unlinkat`）、截断（`ftruncate`）与目录修改（`mkdirat/rmdir`）及符号链接（`symlinkat/readlinkat`）；但仍无目录 fd（`dirfd` 相对路径）、`chdir`、后台异步写回、read-ahead、硬链接、并发读写锁或多挂载。当前单 hart 下 fd lookup 与 OFD acquire 之间不可调度；启用 SMP 前必须为共享 record 引用、槽查找/替换、统计和 OFD 引用补齐同步，不能直接复用这些无锁字段。pipe 同样是单 hart 对象。console 接收现为 tick 轮询（唤醒延迟上界一个 tick），外部中断（PLIC/SEIE）落地后替换为中断驱动。
+当前提供可共享的文件表与根 fs context handle，普通 clone 仍实现“复制表/复制 cwd、共享 OFD”；系统调用层是否选择共享由 clone flags 决定。当前已支持常规文件的读写（`write/writev/pwrite64/append`）、新建、删除（`unlinkat`）、截断（`ftruncate`）与目录修改（`mkdirat/rmdir`）及符号链接（`symlinkat/readlinkat`）；并支持 cwd/dirfd、普通/NOREPLACE rename；仍无后台异步写回、read-ahead、硬链接、并发读写锁或多挂载。当前单 hart 下 fd lookup 与 OFD acquire 之间不可调度；启用 SMP 前必须为共享 record 引用、槽查找/替换、统计和 OFD 引用补齐同步，不能直接复用这些无锁字段。pipe 同样是单 hart 对象。console 接收现为 tick 轮询（唤醒延迟上界一个 tick），外部中断（PLIC/SEIE）落地后替换为中断驱动。
 
 字符设备节点由 ext4 提供名称和 `st_rdev`，`openat` 根据设备号选择 null、zero 或 console；未知设备号返回 `ENXIO`。路径打开的 console 与初始标准 fd 复用 UART 输入等待、非阻塞和信号打断逻辑。null 读 EOF、写消费请求长度，zero 读按实际用户复制进度填零；这两者不经过普通文件页缓存和 ext4 数据 I/O。设备 OFD 同样由 fd 表安装和引用，dup/fork 共享，关闭 fd 不撤销已 pin 的 I/O。`readv/writev/pread64/pwrite64/lseek/fstat/ppoll` 的设备边界在固定 Linux 差分中验证；未知 ioctl 对有效 fd 返回 `ENOTTY`。epoll 的普通/定位 I/O、seek 与匿名 inode mode 也经同一分派入口核对。当前没有 TTY 会话、设备 mmap、devfs 或通用设备注册接口。
 

@@ -71,12 +71,50 @@ struct kernel_vfs_mount *kernel_vfs_path_mount(
 struct kernel_vfs_file {
     void *private_data;
     struct kernel_vfs_mount *mount;
+    struct kernel_vfs_path *path;
     uint64_t size;
     uint32_t mode;
     uint32_t state;
     uint32_t write_lease;
     uint32_t exec_lease;
 };
+
+/* Paths are borrowed for the duration of a call; successful opens own a path
+ * reference independently of the caller. Absolute paths start at root. */
+int kernel_vfs_path_open(struct kernel_vfs_path *path,
+                         struct kernel_vfs_file *file);
+int kernel_vfs_path_string(const struct kernel_vfs_path *path,
+                           const struct kernel_vfs_path *root,
+                           char *buffer, size_t capacity);
+int kernel_vfs_open_at(struct kernel_vfs_path *start,
+                       struct kernel_vfs_path *root, const char *path,
+                       int follow_final, struct kernel_vfs_file *file);
+int kernel_vfs_create_at(struct kernel_vfs_path *start,
+                         struct kernel_vfs_path *root, const char *path,
+                         uint32_t mode, struct kernel_vfs_file *file);
+int kernel_vfs_open_executable_at(struct kernel_vfs_path *start,
+                                  struct kernel_vfs_path *root,
+                                  const char *path, struct kernel_vfs_file *file);
+int kernel_vfs_mkdir_at(struct kernel_vfs_path *start,
+                        struct kernel_vfs_path *root, const char *path,
+                        uint32_t mode);
+int kernel_vfs_unlink_at(struct kernel_vfs_path *start,
+                         struct kernel_vfs_path *root, const char *path,
+                         int directory);
+int kernel_vfs_symlink_at(struct kernel_vfs_path *start,
+                          struct kernel_vfs_path *root, const char *target,
+                          const char *path);
+int kernel_vfs_readlink_at(struct kernel_vfs_path *start,
+                           struct kernel_vfs_path *root, const char *path,
+                           char *buffer, size_t size, size_t *bytes_read);
+int kernel_vfs_stat_at(struct kernel_vfs_path *start,
+                       struct kernel_vfs_path *root, const char *path,
+                       int follow_final, struct kernel_vfs_stat *stat);
+int kernel_vfs_rename_at(struct kernel_vfs_path *old_start,
+                         struct kernel_vfs_path *new_start,
+                         struct kernel_vfs_path *root,
+                         const char *old_path, const char *new_path,
+                         unsigned flags);
 
 /* Returns zero or a negative Linux-compatible errno value. */
 int kernel_vfs_mount_root(struct kernel_vfs_mount *mount,

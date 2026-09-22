@@ -1,3 +1,4 @@
+#include <string.h>
 #include <arch/riscv/sbi.h>
 #include <arch/riscv/virt_uart.h>
 #include <arch/riscv/virtio_mmio_block.h>
@@ -347,6 +348,135 @@ static void run_path_resolution_regression(struct kernel_vfs_mount *mount,
         fail_vfs(40U, -KERNEL_EEXIST, -1);
 }
 
+static void run_shared_path_regression(struct kernel_vfs_mount *mount,
+                                       struct kernel_heap *heap)
+{
+    struct kernel_vfs_path *root = 0, *root_alias = 0;
+    struct kernel_vfs_path *first = 0, *alias = 0, *dot = 0;
+    struct kernel_vfs_file directory = {0}, reopened = {0};
+    char name[64];
+    if (kernel_vfs_mkdir(mount, "/shared-path", 0700U) != 0 ||
+        kernel_vfs_path_root(mount, heap, &root) != 0 ||
+        kernel_vfs_path_root(mount, heap, &root_alias) != 0 ||
+        root != root_alias ||
+        kernel_vfs_path_lookup(root, "shared-path", 11U, &first) != 0 ||
+        kernel_vfs_path_lookup(root_alias, "shared-path", 11U, &alias) != 0 ||
+        first != alias ||
+        kernel_vfs_open(mount, "/shared-path", &directory) != 0 ||
+        directory.path != first ||
+        kernel_vfs_path_string(first, root, name, sizeof(name)) != 0 ||
+        strcmp(name, "/shared-path"))
+        fail_vfs(80U, 0, -1);
+    if (kernel_vfs_rmdir(mount, "/shared-path") != 0 ||
+        kernel_vfs_path_lookup(first, ".", 1U, &dot) != 0 || dot != first ||
+        kernel_vfs_path_release(&dot) != 0 ||
+        kernel_vfs_path_lookup(first, "..", 2U, &dot) != 0 || dot != root ||
+        kernel_vfs_path_release(&dot) != 0 ||
+        kernel_vfs_open_at(first, root, ".", 1, &reopened) != 0 ||
+        !kernel_vfs_files_share_node(&directory, &reopened) ||
+        kernel_vfs_path_string(first, root, name, sizeof(name)) != -KERNEL_ENOENT ||
+        kernel_vfs_close(&reopened) != 0 ||
+        kernel_vfs_close(&directory) != 0 ||
+        kernel_vfs_path_release(&alias) != 0 ||
+        kernel_vfs_path_release(&first) != 0 ||
+        kernel_vfs_path_release(&root_alias) != 0 ||
+        kernel_vfs_path_release(&root) != 0)
+        fail_vfs(81U, 0, -1);
+}
+
+static void run_rename_path_regression(struct kernel_vfs_mount *mount,
+                                       struct kernel_heap *heap)
+{
+    struct kernel_vfs_path *root = 0, *parent = 0, *child = 0, *alias = 0;
+    struct kernel_vfs_file source = {0}, target = {0}, moved = {0};
+    char name[64], data[4];
+    size_t count;
+    if (kernel_vfs_path_root(mount, heap, &root) ||
+        kernel_vfs_mkdir(mount, "/rename-parent", 0700) ||
+        kernel_vfs_mkdir(mount, "/rename-parent/child", 0700) ||
+        kernel_vfs_path_resolve(root, root, "/rename-parent", 1, &parent) ||
+        kernel_vfs_path_resolve(parent, root, "child", 1, &child) ||
+        kernel_vfs_rename_at(root, root, root, "/rename-parent", "/renamed", 0) ||
+        kernel_vfs_path_string(child, root, name, sizeof(name)) ||
+        strcmp(name, "/renamed/child") ||
+        kernel_vfs_path_resolve(root, root, "/renamed/child", 1, &alias) ||
+        alias != child || kernel_vfs_path_release(&alias))
+        fail_vfs(82U, 0, -1);
+    if (kernel_vfs_create_at(child, root, "source", 0600, &source) ||
+        kernel_vfs_create_at(root, root, "/target", 0600, &target) ||
+        kernel_vfs_pwrite(&target, 0, "old", 3, &count) || count != 3 ||
+        kernel_vfs_pwrite(&source, 0, "new", 3, &count) || count != 3 ||
+        kernel_vfs_rename_at(child, root, root, "source", "/target", 1) !=
+            -KERNEL_EEXIST ||
+        kernel_vfs_rename_at(child, root, root, "source", "/target", 0) ||
+        kernel_vfs_open(mount, "/target", &moved) ||
+        moved.path != source.path ||
+        !kernel_vfs_files_share_node(&moved, &source) ||
+        kernel_vfs_files_share_node(&moved, &target) ||
+        kernel_vfs_pread(&target, 0, data, sizeof(data), &count) || count != 3 ||
+        memcmp(data, "old", 3) ||
+        kernel_vfs_pread(&moved, 0, data, sizeof(data), &count) || count != 3 ||
+        memcmp(data, "new", 3) ||
+        kernel_vfs_path_string(target.path, root, name, sizeof(name)) !=
+            -KERNEL_ENOENT ||
+        kernel_vfs_close(&moved) || kernel_vfs_close(&target) ||
+        kernel_vfs_close(&source))
+        fail_vfs(83U, 0, -1);
+    if (kernel_vfs_rename_at(root, child, root, "/renamed", "cycle", 0) !=
+            -KERNEL_EINVAL ||
+        kernel_vfs_rename_at(root, root, root, "/target", "/another", 2) !=
+            -KERNEL_ENOTSUP ||
+        kernel_vfs_rename_at(root, root, root, "/target", "/another", 8) !=
+            -KERNEL_EINVAL ||
+        kernel_vfs_unlink(mount, "/target") ||
+        kernel_vfs_rmdir(mount, "/renamed/child") ||
+        kernel_vfs_rmdir(mount, "/renamed") ||
+        kernel_vfs_path_release(&child) || kernel_vfs_path_release(&parent) ||
+        kernel_vfs_path_release(&root))
+        fail_vfs(84U, 0, -1);
+}
+
+static void run_deep_relative_path_regression(struct kernel_vfs_mount *mount,
+                                               struct kernel_heap *heap)
+{
+    struct kernel_vfs_path *root = 0, *current = 0, *next = 0;
+    struct kernel_vfs_file file = {0};
+    char component[256];
+    memset(component, 'd', 255U);
+    component[255] = 0;
+    if (kernel_vfs_path_root(mount, heap, &root) ||
+        kernel_vfs_mkdir_at(root, root, "deep-chain", 0700) ||
+        kernel_vfs_path_lookup(root, "deep-chain", 10, &current))
+        fail_vfs(85U, 0, -1);
+    for (unsigned i = 0; i < 17; i++) {
+        int result = kernel_vfs_mkdir_at(current, root, component, 0700);
+        if (result || kernel_vfs_path_lookup(current, component, 255U, &next))
+            fail_vfs(86U, 0, result);
+        (void)kernel_vfs_path_release(&current);
+        current = next;
+        next = 0;
+    }
+    if (kernel_vfs_create_at(current, root, "leaf", 0600, &file) ||
+        kernel_vfs_close(&file) ||
+        kernel_vfs_symlink_at(current, root, "leaf", "link") ||
+        kernel_vfs_open_at(current, root, "link", 1, &file) ||
+        kernel_vfs_close(&file) ||
+        kernel_vfs_unlink_at(current, root, "link", 0) ||
+        kernel_vfs_unlink_at(current, root, "leaf", 0))
+        fail_vfs(87U, 0, -1);
+    for (unsigned i = 0; i < 17; i++) {
+        if (kernel_vfs_path_lookup(current, "..", 2U, &next) ||
+            kernel_vfs_unlink_at(next, root, component, 1))
+            fail_vfs(88U, 0, -1);
+        (void)kernel_vfs_path_release(&current);
+        current = next;
+        next = 0;
+    }
+    if (kernel_vfs_path_release(&current) ||
+        kernel_vfs_unlink_at(root, root, "deep-chain", 1) ||
+        kernel_vfs_path_release(&root)) fail_vfs(89U, 0, -1);
+}
+
 static void run_path_cleanup_regression(struct kernel_vfs_mount *mount,
                                         struct kernel_heap *heap)
 {
@@ -689,6 +819,9 @@ static void run_vfs_test(const void *dtb)
     }
     run_orphan_cleanup_regression(&mount, &heap);
     run_path_resolution_regression(&mount, &heap);
+    run_shared_path_regression(&mount, &heap);
+    run_rename_path_regression(&mount, &heap);
+    run_deep_relative_path_regression(&mount, &heap);
     run_path_cleanup_regression(&mount, &heap);
     run_writeback_regression(&mount, &page_cache);
     result = kernel_vfs_unmount(&mount);

@@ -3,6 +3,22 @@
 
 #include <kernel/syscall.h>
 
+enum kernel_syscall_status syscall_handle_chdir(
+    struct kernel_task *caller,
+    const struct kernel_syscall_request *request,
+    struct kernel_syscall_result *decoded, int by_fd);
+
+enum kernel_syscall_status syscall_handle_getcwd(
+    struct kernel_task *caller,
+    const struct kernel_syscall_request *request,
+    struct kernel_syscall_result *decoded);
+
+enum kernel_syscall_status syscall_handle_renameat(
+    struct kernel_task *caller,
+    const struct kernel_syscall_request *request,
+    struct kernel_syscall_result *decoded, int with_flags);
+
+
 enum kernel_syscall_status syscall_handle_openat(
     struct kernel_task *caller,
     const struct kernel_syscall_request *request,

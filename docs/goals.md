@@ -20,8 +20,8 @@
 
 | 顺序 | 任务 | 开始条件 / 独立成果 |
 |---|---|---|
-| 1 | P1d cwd/dirfd、P1g rename | 将路径父链提升为共享可改名目录项，补用户接口与目录 fd 起点，并接入已完成的日志和 orphan |
-| 2 | P1e 时间、P1f 统计 | 现在可调查 ext4 接口；完整 fd/dirfd 语义依赖路径链 |
+| 已完成 | P1d cwd/dirfd、P1g rename 子集 | 共享活目录项、cwd/dirfd、普通/NOREPLACE rename 已接入日志与 orphan |
+| 1 | P1e 时间、P1f 统计 | 基于已完成的活路径与 inode 接口补显式时间和真实挂载统计 |
 | 本批之后 | P2a robust-list 与取消异常 | 先闭环真实程序的退出语义，再推进 P4a 共享匿名、共享 futex 和文件映射 |
 | 持续支线 | P5a glibc 试跑、L0/L1 第二架构入口 | 可现在固定输入或调查边界，不以全量清单全绿为前提 |
 | 后续 | P3c/e 记录锁与 SQLite、N socket、P4 文件共享、P6 SMP | 按下述具体依赖进入，不按测试名称排接口 |
@@ -86,10 +86,10 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 
 ### P1d cwd 与目录 fd
 
-- [ ] 实现目录 fd 起点及 `chdir/fchdir/getcwd`；无效 fd 与非目录 fd 分开，绝对路径忽略坏 dirfd，空路径/尾斜线/过长路径和缓冲不足按固定契约返回。
-- [ ] 按分量处理 `.`/`..`、相对和绝对 symlink、循环上限与 mount 边界；保留 `symlinkat/readlinkat/O_NOFOLLOW/lstat`。不能先把整个字符串折叠再跟随 symlink。
-- [ ] fork 拥有独立 fs context，CLONE_FS 共享同一上下文，exec 保留；切换 cwd 时先取得新引用再提交，失败保持旧 cwd，退出释放准确 owner。
-- [ ] 测试不同任务/线程的 cwd 可见性、相对 symlink+`..`、打开目录后 rename 再 openat、unlink 后仍持目录句柄/getcwd 的行为。rename 完成前先建立身份契约，相应组合用例在 P1g 一起关闭。
+- [x] 实现目录 fd 起点及 `chdir/fchdir/getcwd`；无效 fd 与非目录 fd 分开，绝对路径忽略坏 dirfd，空路径/尾斜线/过长路径和缓冲不足按固定契约返回。
+- [x] 按分量处理 `.`/`..`、相对和绝对 symlink、循环上限与 mount 边界；保留 `symlinkat/readlinkat/O_NOFOLLOW/lstat`。不能先把整个字符串折叠再跟随 symlink。
+- [x] fork 拥有独立 fs context，CLONE_FS 共享同一上下文，exec 保留；切换 cwd 时先取得新引用再提交，失败保持旧 cwd，退出释放准确 owner。
+- [x] 测试不同任务/线程的 cwd 可见性、相对 symlink+`..`、打开目录后 rename 再 openat、unlink 后仍持目录句柄/getcwd 的行为。rename 完成前先建立身份契约，相应组合用例在 P1g 一起关闭。
 
 ### P1e 显式时间设置
 
@@ -107,7 +107,7 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 ### P1g 链接、rename 与权限相关文件操作
 
 - [ ] `linkat` 覆盖同 inode 身份、nlink、打开后删除、跨 mount EXDEV、目录限制与失败后原对象；符号链接跟随 flags 单独验证。
-- [ ] `renameat/renameat2` 先声明支持 flags，保证运行时命名原子性；验证文件/目录覆盖、非空目标、祖先关系、同对象、跨 mount、打开对象身份与失败回滚。不得“删旧再建新”暴露空窗。
+- [x] `renameat/renameat2` 支持普通/NOREPLACE；单事务文件/空目录覆盖、跨目录移动、祖先拒绝、同 inode、活目标及失败回滚，EXCHANGE/WHITEOUT 明确不支持。单根挂载的跨 mount 拒绝存在，真实多挂载验证归 P1h。
 - [ ] 按真实消费者接 umask、chmod/faccess 等；明确 mask 共享/复制和凭据依赖，与 P2e 权限模型一致，不能总返回允许。已有 open 未知 bits 拒绝策略另用差分核对，不能写成 Linux 通用要求。
 
 ### P1h 虚拟文件系统与多挂载
@@ -192,7 +192,7 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 - [x] 已选择并启用 ordered journal/replay；事务 before-image、flush 顺序、checksum v2/v3 和 revoke、superblock 恢复、持久 orphan_file/传统链及分批 extent/间接块回收已接入生产。
 - [x] 元数据事务提交与 checkpoint 分阶段 flush；关键日志错误 sticky，损坏或只读无法恢复时拒绝开放用户访问。已知日志提交前的资源不足可安全回滚，不能据此清除不确定 I/O 错误。
 - [x] `make test-lwext4-recovery-host` 使用 512 字节原子写、易失缓存/稳定镜像，覆盖写与 flush 失败、丢失/重排、两次恢复和 e2fsck；完整 orphan 回收矩阵为 16 种组合、4,362 次断电执行。QEMU 正常退出和未验收实板不属于该恢复证据。
-- [ ] 仍需在共享路径与 rename 阶段验收“临时文件→fsync→rename→父目录 fsync”完整应用序列；robust/socket、记录锁、SQLite、共享映射留后续。
+- [x] 真实 musl 已验收“临时文件→fsync→rename→两侧父目录 fsync”应用序列，后端 rename 另有断电/重排矩阵；robust/socket、记录锁、SQLite、共享映射留后续。
 
 ### P3e SQLite 回滚日志负载
 
@@ -405,7 +405,7 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 
 | 取舍 / 当前证据 | 可行候选与正确性、演进、复杂度、成本 |
 |---|---|
-| P1b VFS：原 fs context 借用单根 mount、cwd 字符串；OFD 已独立 | 已选择并完成②：最小 mount+路径对象/后端操作。路径持有 mount、inode 与父链引用，ext4 字符节点按 `rdev` 分派；多挂载和 rename 仍留后续。 |
+| P1b VFS：原 fs context 借用单根 mount、cwd 字符串；OFD 已独立 | 已选择并完成②：最小 mount+路径对象/后端操作。路径持有 mount、inode 与父链引用，ext4 字符节点按 `rdev` 分派；共享可改名目录项与普通/NOREPLACE rename 已完成；多挂载仍留后续。 |
 | P4a 共享匿名：当前是私有 fault/COW | ① 急切分配并引用共享页，能满足 fork 可见性但改变 lazy/OOM 成本；② 引用后备对象按索引惰性发布，保留 lazy 并连接文件/shared futex，增加发布/回收协议。倾向②；shadow 链只在真实需求出现时另评估。 |
 | P3b 持久化 | 用户已选择并交付逐 inode dirty/error、定向写回和真实 flush；共享事务可提交关联元数据，不主动全量写回无关文件。 |
 | P3d 恢复 | 用户已选择本批启用并验证 journal/replay 与持久 orphan；故障模型、限制和复现命令见 VFS 模块。 |

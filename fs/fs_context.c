@@ -151,6 +151,35 @@ enum kernel_fs_context_status kernel_fs_context_move(
     return KERNEL_FS_CONTEXT_STATUS_OK;
 }
 
+struct kernel_vfs_path *kernel_fs_context_root(const struct kernel_fs_context *fs)
+{
+    return kernel_fs_context_is_live(fs) ? fs->record->root : 0;
+}
+
+struct kernel_vfs_path *kernel_fs_context_cwd(const struct kernel_fs_context *fs)
+{
+    return kernel_fs_context_is_live(fs) ? fs->record->cwd : 0;
+}
+
+int kernel_fs_context_set_cwd(const struct kernel_fs_context *fs,
+                              struct kernel_vfs_path *path)
+{
+    struct kernel_vfs_stat stat;
+    if (!kernel_fs_context_is_live(fs) || !path) return -KERNEL_EINVAL;
+    if (kernel_vfs_path_mount(path) != kernel_vfs_path_mount(fs->record->root))
+        return -KERNEL_EXDEV;
+    int result = kernel_vfs_path_stat(path, &stat);
+    if (result) return result;
+    if ((stat.mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFDIR)
+        return -KERNEL_ENOTDIR;
+    result = kernel_vfs_path_acquire(path);
+    if (result) return result;
+    struct kernel_vfs_path *previous = fs->record->cwd;
+    fs->record->cwd = path;
+    if (kernel_vfs_path_release(&previous)) __builtin_trap();
+    return 0;
+}
+
 enum kernel_fs_context_status kernel_fs_context_resolve_user_path(
     const struct kernel_fs_context *fs,
     struct kernel_mm *mm,
@@ -205,56 +234,26 @@ enum kernel_fs_context_status kernel_fs_context_resolve_kernel_path(
     struct kernel_vfs_mount **mount,
     int *linux_result)
 {
-    size_t cwd_length;
-    size_t separator;
-    size_t index;
-
-    if (!kernel_fs_context_is_live(fs) || path == 0 || buffer == 0 ||
-        capacity != KERNEL_FS_PATH_MAX || mount == 0 ||
-        linux_result == 0) {
+    struct kernel_vfs_path *resolved = 0;
+    if (!kernel_fs_context_is_live(fs) || !path || !buffer ||
+        capacity != KERNEL_FS_PATH_MAX || !mount || !linux_result)
         return KERNEL_FS_CONTEXT_STATUS_INVALID_ARGUMENT;
-    }
-    if (path_length == 0U) {
-        *linux_result = -KERNEL_ENOENT;
-        return KERNEL_FS_CONTEXT_STATUS_OK;
-    }
-    if (path[0] == '/') {
-        if (path_length + 1U > capacity) {
-            *linux_result = -KERNEL_ENAMETOOLONG;
-            return KERNEL_FS_CONTEXT_STATUS_OK;
-        }
-        if (path != buffer) {
-            for (index = 0U; index <= path_length; index++) {
-                buffer[index] = path[index];
-            }
-        }
-        *mount = kernel_vfs_path_mount(fs->record->root);
-        *linux_result = 0;
-        return KERNEL_FS_CONTEXT_STATUS_OK;
-    }
-    if (dirfd != KERNEL_FS_AT_FDCWD) {
+    if (!path_length) *linux_result = -KERNEL_ENOENT;
+    else if (path_length >= capacity) *linux_result = -KERNEL_ENAMETOOLONG;
+    else if (path[0] != '/' && dirfd != KERNEL_FS_AT_FDCWD)
         *linux_result = -KERNEL_EBADF;
-        return KERNEL_FS_CONTEXT_STATUS_OK;
+    else {
+        *linux_result = kernel_vfs_path_resolve(fs->record->cwd,
+                            fs->record->root, path, 1, &resolved);
+        if (!*linux_result) {
+            *mount = kernel_vfs_path_mount(resolved);
+            *linux_result = kernel_vfs_path_string(resolved, fs->record->root,
+                                                   buffer, capacity);
+            if (*linux_result == -KERNEL_ERANGE)
+                *linux_result = -KERNEL_ENAMETOOLONG;
+            (void)kernel_vfs_path_release(&resolved);
+        }
     }
-
-    cwd_length = 1U;
-    separator = 0U;
-    if (cwd_length >= capacity || separator > capacity - cwd_length ||
-        path_length + 1U > capacity - cwd_length - separator) {
-        *linux_result = -KERNEL_ENAMETOOLONG;
-        return KERNEL_FS_CONTEXT_STATUS_OK;
-    }
-    for (index = path_length + 1U; index != 0U; index--) {
-        buffer[cwd_length + separator + index - 1U] = path[index - 1U];
-    }
-    for (index = 0U; index < cwd_length; index++) {
-        buffer[index] = '/';
-    }
-    if (separator != 0U) {
-        buffer[cwd_length] = '/';
-    }
-    *mount = kernel_vfs_path_mount(fs->record->root);
-    *linux_result = 0;
     return KERNEL_FS_CONTEXT_STATUS_OK;
 }
 

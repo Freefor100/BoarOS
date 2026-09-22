@@ -464,7 +464,7 @@ DEPS := \
 	test-files-riscv \
 	test-files-partial-write-riscv \
 	test-high-half-trap-riscv test-idle-riscv test-no-identity-riscv \
-	test-lwext4-host test-lwext4-recovery-host \
+	test-lwext4-host test-lwext4-recovery-host test-lwext4-rename-host \
 	test-block-riscv test-heap-riscv test-page-riscv test-vfs-riscv \
 	test-scheduler-cases-riscv test-scheduler-riscv \
 	test-boot-riscv test-references test-riscv \
@@ -484,6 +484,9 @@ test-references:
 
 test-lwext4-host:
 	./tests/lwext4-host.sh
+
+test-lwext4-rename-host:
+	sh tests/lwext4-rename-host.sh
 
 # Real volatile-storage power cuts, separate from normal QEMU shutdown tests.
 test-lwext4-recovery-host:
@@ -932,7 +935,7 @@ $(MUSL_LDSO): $(MUSL_STAMP)
 
 MUSL_GCC_FLAGS ?= $(shell $(MUSL_ROOT)/bin/musl-gcc -fno-link-libatomic -E -x c /dev/null >/dev/null 2>&1 && echo -fno-link-libatomic)
 
-$(REAL_USERLAND_RV): tests/userland/real.c tests/userland/truncate.h tests/userland/timestamps.h tests/userland/sync.h $(MUSL_STAMP)
+$(REAL_USERLAND_RV): tests/userland/real.c tests/userland/truncate.h tests/userland/timestamps.h tests/userland/sync.h tests/userland/namespace.h $(MUSL_STAMP)
 	@mkdir -p $(dir $@)
 	$(MUSL_ROOT)/bin/musl-gcc $(MUSL_GCC_FLAGS) -static -O2 \
 		-o $@ $<

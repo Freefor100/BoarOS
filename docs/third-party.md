@@ -17,3 +17,5 @@ BoarOS 采用 GPL-2.0-only；仓库根目录 `LICENSE` 保存完整许可证文�
 后续引入第三方代码时继续记录名称、上游地址、版本、SPDX 许可证、导入路径、用途和本地修改。来源或许可证不清楚时不导入；外部源码与本地适配尽量分开提交。
 
 比赛规则、公开测例、Harness、编译器、QEMU 和固件是外部构建或测试输入，不属于项目源码。影响复现时在相关文档中记录版本。
+
+- lwext4 rename 扩展提供 parent-inode/name 接口，原子维护两侧目录项、HTree checksum、`..`、链接数和覆盖 orphan；空目录检查校验记录边界与 checksum。路径分量扫描补齐 255 字节名称的分隔符边界。验证入口为 `make test-lwext4-rename-host`，未升级上游固定 commit。

@@ -101,6 +101,12 @@ int ext4_dir_dx_add_entry(struct ext4_inode_ref *parent,
 int ext4_dir_dx_reset_parent_inode(struct ext4_inode_ref *dir,
                                    uint32_t parent_inode);
 
+/* Checked root/inner index block and dot-dot access, also used by rename. */
+int ext4_dir_dx_check(struct ext4_inode_ref *dir, struct ext4_block *block);
+int ext4_dir_parent_inode(struct ext4_inode_ref *dir, uint32_t *parent);
+int ext4_dir_reparent(struct ext4_inode_ref *dir, uint32_t expected_parent,
+                     uint32_t new_parent);
+
 #ifdef __cplusplus
 }
 #endif

@@ -1369,3 +1369,98 @@ int ext4_dir_dx_reset_parent_inode(struct ext4_inode_ref *dir,
 /**
  * @}
  */
+
+int ext4_dir_dx_check(struct ext4_inode_ref *dir, struct ext4_block *block)
+{
+    uint32_t size = ext4_sb_get_block_size(&dir->fs->sb), offset;
+    struct ext4_dir_en *first = (void *)block->data;
+    uint16_t length = ext4_dir_en_get_entry_len(first);
+    if (length == 12) {
+        struct ext4_dir_idx_root *root = (void *)block->data;
+        if (root->info.reserved_zero || root->info.unused_flags ||
+            root->info.info_length != sizeof(root->info) || root->info.indirect_levels > 1 ||
+            ext4_dir_en_get_entry_len((void *)&root->dots[1]) != size - 12)
+            return EUCLEAN;
+        offset = 32;
+    } else if (length == size && !ext4_dir_en_get_inode(first) && !first->name_len)
+        offset = 8;
+    else return EUCLEAN;
+    struct ext4_dir_idx_climit *cl = (void *)(block->data + offset);
+    uint32_t count = ext4_dir_dx_climit_get_count(cl), limit = ext4_dir_dx_climit_get_limit(cl);
+    uint32_t tail = ext4_sb_feature_ro_com(&dir->fs->sb, EXT4_FRO_COM_METADATA_CSUM) ?
+                    sizeof(struct ext4_dir_idx_tail) : 0;
+    if (!count || count > limit || limit > (size - offset - tail) / 8)
+        return EUCLEAN;
+    struct ext4_dir_idx_entry *entries = (void *)cl;
+    uint64_t blocks = ext4_inode_get_size(&dir->fs->sb, dir->inode) / size;
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t child = ext4_dir_dx_entry_get_block(&entries[i]);
+        if (!child || child >= blocks) return EUCLEAN;
+    }
+    return ext4_dir_dx_csum_verify(dir, (void *)block->data) ? EOK : EUCLEAN;
+}
+
+static int ext4_dir_parent_block(struct ext4_inode_ref *dir, struct ext4_block *block,
+                                 struct ext4_dir_en **entry)
+{
+    struct ext4_sblock *sb = &dir->fs->sb;
+    if (!ext4_inode_is_type(sb, dir->inode, EXT4_INODE_MODE_DIRECTORY)) return ENOTDIR;
+    uint32_t size = ext4_sb_get_block_size(sb);
+    if (ext4_inode_get_size(sb, dir->inode) < size) return EUCLEAN;
+    ext4_fsblk_t home;
+    int r = ext4_fs_get_inode_dblk_idx(dir, 0, &home, false);
+    if (r != EOK) return r;
+    if (!home || home >= dir->fs->bdev->lg_bcnt) return EUCLEAN;
+    r = ext4_trans_block_get(dir->fs->bdev, block, home);
+    if (r != EOK) return r;
+    struct ext4_dir_en *dot = (void *)block->data;
+    struct ext4_dir_en *parent = (void *)(block->data + 12);
+    bool indexed = ext4_inode_has_flag(dir->inode, EXT4_INODE_FLAG_INDEX);
+    if (indexed) r = ext4_dir_dx_check(dir, block);
+    else if (!ext4_dir_csum_verify(dir, dot)) r = EUCLEAN;
+    uint32_t ino = ext4_dir_en_get_inode(parent);
+    uint16_t length = ext4_dir_en_get_entry_len(parent);
+    if (r == EOK && (ext4_dir_en_get_entry_len(dot) != 12 ||
+        ext4_dir_en_get_name_len(sb, dot) != 1 || dot->name[0] != '.' ||
+        ext4_dir_en_get_inode(dot) != dir->index || length < 12 || length > size - 12 ||
+        length % 4 || ext4_dir_en_get_name_len(sb, parent) != 2 ||
+        parent->name[0] != '.' || parent->name[1] != '.' ||
+        !ino || ino > ext4_get32(sb, inodes_count))) r = EUCLEAN;
+    if (r != EOK) {
+        ext4_block_set(dir->fs->bdev, block);
+        return r;
+    }
+    *entry = parent;
+    return EOK;
+}
+
+int ext4_dir_parent_inode(struct ext4_inode_ref *dir, uint32_t *parent)
+{
+    struct ext4_block block = EXT4_BLOCK_ZERO();
+    struct ext4_dir_en *entry;
+    int r = ext4_dir_parent_block(dir, &block, &entry);
+    if (r != EOK) return r;
+    uint32_t ino = ext4_dir_en_get_inode(entry);
+    r = ext4_block_set(dir->fs->bdev, &block);
+    if (r == EOK) *parent = ino;
+    return r;
+}
+
+int ext4_dir_reparent(struct ext4_inode_ref *dir, uint32_t expected_parent,
+                     uint32_t new_parent)
+{
+    struct ext4_block block = EXT4_BLOCK_ZERO();
+    struct ext4_dir_en *entry;
+    int r = ext4_dir_parent_block(dir, &block, &entry);
+    if (r != EOK) return r;
+    if (ext4_dir_en_get_inode(entry) != expected_parent) r = EUCLEAN;
+    if (r == EOK) {
+        ext4_dir_en_set_inode(entry, new_parent);
+        if (ext4_inode_has_flag(dir->inode, EXT4_INODE_FLAG_INDEX))
+            ext4_dir_set_dx_csum(dir, (void *)block.data);
+        else ext4_dir_set_csum(dir, (void *)block.data);
+        r = ext4_trans_set_block_dirty(block.buf);
+    }
+    int release = ext4_block_set(dir->fs->bdev, &block);
+    return r != EOK ? r : release;
+}
