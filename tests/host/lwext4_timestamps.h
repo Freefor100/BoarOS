@@ -51,10 +51,10 @@ static int check_timestamp_behavior(bool readonly)
             int64_t expected = seconds[n];
             uint32_t nanoseconds = extended ? 123456789U : 0U;
             controlled_time = (struct ext4_timestamp){seconds[n], 123456789};
-            if (expected < INT32_MIN) { expected = INT32_MIN; nanoseconds = 0; }
-            if (expected > maximum) {
+            if (expected <= INT32_MIN) { expected = INT32_MIN; nanoseconds = 0; }
+            if (expected >= maximum) {
                 expected = maximum;
-                nanoseconds = extended ? 999999999U : 0U;
+                nanoseconds = 0U;
             }
             if (ext4_file_touch(&file, 7U) != EOK ||
                 ext4_fraw_inode_fill(&file, &after) != EOK ||

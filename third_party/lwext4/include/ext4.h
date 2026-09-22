@@ -106,6 +106,11 @@ typedef bool (*ext4_clock_read)(struct ext4_timestamp *now);
 #define EXT4_TIME_RELATIME 8U
 int ext4_mount_setup_clock(const char *mount_point, ext4_clock_read clock);
 int ext4_file_touch(ext4_file *file, unsigned int fields);
+/* Set selected atime/mtime/ctime values by live inode identity. Array order is
+ * atime, mtime, ctime; unselected values are ignored. Only EXT4_TIME_{A,M,C}TIME
+ * bits are valid. A zero mask performs no I/O and permits times == NULL. */
+int ext4_file_set_times(ext4_file *file, unsigned fields,
+                       const struct ext4_timestamp times[3]);
 
 /*****************************DIRECTORY DESCRIPTOR***************************/
 
@@ -217,8 +222,11 @@ int ext4_recover(const char *mount_point);
 struct ext4_mount_stats {
 	uint32_t inodes_count;
 	uint32_t free_inodes_count;
-	uint64_t blocks_count;
+	uint64_t blocks_count; /* Raw filesystem blocks, including overhead. */
 	uint64_t free_blocks_count;
+	uint64_t overhead_blocks; /* Validated static metadata and internal journal. */
+	uint64_t reserved_blocks_count;
+	uint8_t uuid[16];
 
 	uint32_t block_size;
 	uint32_t block_group_count;
@@ -229,6 +237,9 @@ struct ext4_mount_stats {
 };
 
 /**@brief   Get file mount point stats.
+ * Static overhead is calculated on the first successful query and cached for
+ * this mount (online resize is not supported). Allocation counts are current
+ * in-memory superblock values. On error the caller's output is unchanged.
  *
  * @param   mount_point Mount point.
  * @param   stats Filesystem stats.

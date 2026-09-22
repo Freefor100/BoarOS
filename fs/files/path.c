@@ -72,7 +72,7 @@ static enum kernel_files_status finish_path(struct kernel_files *files,
 }
 
 /* Callers hold the file table and fs context throughout this serialized call. */
-static int select_path_start(struct kernel_files *files,
+int kernel_files_path_start(struct kernel_files *files,
                               const struct kernel_fs_context *fs,
                               int64_t dirfd, const char *path,
                               struct kernel_vfs_path **start)
@@ -104,7 +104,7 @@ static enum kernel_fs_context_status copy_path_start(
     else if (status == KERNEL_UACCESS_STATUS_TOO_LONG) *result = -KERNEL_ENAMETOOLONG;
     else if (status != KERNEL_UACCESS_STATUS_OK) return KERNEL_FS_CONTEXT_STATUS_STATE;
     else {
-        *result = select_path_start(files, fs, dirfd, buffer, start);
+        *result = kernel_files_path_start(files, fs, dirfd, buffer, start);
         if (!*result) *mount = kernel_vfs_path_mount(*start);
     }
     return KERNEL_FS_CONTEXT_STATUS_OK;
@@ -643,7 +643,7 @@ enum kernel_files_status kernel_files_fstatat(
             result = file ? fill_linux_stat(&stat, file) : -KERNEL_EBADF;
         }
     } else {
-        result = select_path_start(files, fs, dirfd, path, &start);
+        result = kernel_files_path_start(files, fs, dirfd, path, &start);
         if (!result) result = kernel_vfs_stat_at(start, kernel_fs_context_root(fs),
                     path, !(flags & KERNEL_FILES_AT_SYMLINK_NOFOLLOW), &vfs_stat);
         if (!result) fill_linux_vfs_stat(&stat, &vfs_stat);

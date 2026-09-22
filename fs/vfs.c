@@ -980,6 +980,74 @@ int kernel_vfs_mount_is_readonly(const struct kernel_vfs_mount *mount)
     return adapter->read_only != 0;
 }
 
+int kernel_vfs_mount_statfs(struct kernel_vfs_mount *mount,
+                            struct kernel_vfs_statfs *stat)
+{
+    struct ext4_mount_stats disk;
+    if (!mount || mount->state != VFS_MOUNT_STATE_LIVE ||
+        !mount->private_data || !stat) return -KERNEL_EINVAL;
+    struct lwext4_mount_adapter *adapter = mount->private_data;
+    int result = mount_error(adapter);
+    if (result) return lwext4_error(result);
+    result = ext4_mount_point_stats(LWEXT4_MOUNT_POINT, &disk);
+    if (result) return lwext4_error(result);
+    if (disk.overhead_blocks > disk.blocks_count) return -KERNEL_EUCLEAN;
+    memset(stat, 0, sizeof(*stat));
+    stat->type = UINT64_C(0xef53);
+    stat->block_size = disk.block_size;
+    stat->blocks = disk.blocks_count - disk.overhead_blocks;
+    stat->free_blocks = disk.free_blocks_count;
+    stat->available_blocks = disk.free_blocks_count > disk.reserved_blocks_count
+                          ? disk.free_blocks_count - disk.reserved_blocks_count : 0;
+    stat->inodes = disk.inodes_count;
+    stat->free_inodes = disk.free_inodes_count;
+    for (unsigned i = 0; i < 8U; i++)
+        stat->fsid |= (uint64_t)(disk.uuid[i] ^ disk.uuid[i + 8U]) << (8U * i);
+    stat->name_length = 255U;
+    stat->flags = UINT64_C(0x20) | UINT64_C(0x1000) | (adapter->read_only ? 1U : 0U);
+    return 0;
+}
+
+static int valid_utime_nsec(int64_t value)
+{
+    return (value >= 0 && value < INT64_C(1000000000)) ||
+           value == KERNEL_VFS_UTIME_NOW || value == KERNEL_VFS_UTIME_OMIT;
+}
+
+int kernel_vfs_file_set_times(struct kernel_vfs_file *file,
+                              const struct kernel_vfs_timespec times[2])
+{
+    if (!file || !file->private_data || file->state != VFS_FILE_STATE_LIVE)
+        return -KERNEL_EINVAL;
+    if (times && (!valid_utime_nsec(times[0].nanoseconds) ||
+                  !valid_utime_nsec(times[1].nanoseconds))) return -KERNEL_EINVAL;
+    if (times && times[0].nanoseconds == KERNEL_VFS_UTIME_OMIT &&
+                 times[1].nanoseconds == KERNEL_VFS_UTIME_OMIT) return 0;
+    struct kernel_vfs_node *node = file->private_data;
+    if (node->adapter->read_only) return -KERNEL_EROFS;
+    int result = mount_error(node->adapter);
+    if (result) return lwext4_error(result);
+    struct ext4_timestamp now, values[3];
+    if (!vfs_realtime(&now)) return -KERNEL_EIO;
+    unsigned fields = EXT4_TIME_CTIME;
+    values[2] = now;
+    for (unsigned i = 0; i < 2; i++) {
+        if (times && times[i].nanoseconds == KERNEL_VFS_UTIME_OMIT) continue;
+        fields |= i ? EXT4_TIME_MTIME : EXT4_TIME_ATIME;
+        values[i] = !times || times[i].nanoseconds == KERNEL_VFS_UTIME_NOW
+                  ? now : (struct ext4_timestamp){times[i].seconds,
+                                                    (uint32_t)times[i].nanoseconds};
+    }
+    return lwext4_error(ext4_file_set_times(&node->file, fields, values));
+}
+
+int kernel_vfs_path_set_times(struct kernel_vfs_path *path,
+                              const struct kernel_vfs_timespec times[2])
+{
+    if (!path || !path->references) return -KERNEL_EINVAL;
+    return kernel_vfs_file_set_times(&path->file, times);
+}
+
 static int vfs_open_raw(struct kernel_vfs_mount *mount,
                         const char *path, uint32_t inode_number,
                         uint32_t inode_mode,

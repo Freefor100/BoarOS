@@ -65,7 +65,7 @@ uint32_t ext4_sb_get_csum_seed(const struct ext4_sblock *s)
 
 uint32_t ext4_block_group_cnt(struct ext4_sblock *s)
 {
-	uint64_t blocks_count = ext4_sb_get_blocks_cnt(s);
+	uint64_t blocks_count = ext4_sb_get_blocks_cnt(s) - ext4_get32(s, first_data_block);
 	uint32_t blocks_per_group = ext4_get32(s, blocks_per_group);
 
 	uint32_t block_groups_count = (uint32_t)(blocks_count / blocks_per_group);
@@ -80,12 +80,12 @@ uint32_t ext4_blocks_in_group_cnt(struct ext4_sblock *s, uint32_t bgid)
 {
 	uint32_t block_group_count = ext4_block_group_cnt(s);
 	uint32_t blocks_per_group = ext4_get32(s, blocks_per_group);
-	uint64_t total_blocks = ext4_sb_get_blocks_cnt(s);
+	uint64_t total_blocks = ext4_sb_get_blocks_cnt(s) - ext4_get32(s, first_data_block);
 
 	if (bgid < block_group_count - 1)
 		return blocks_per_group;
 
-	return (uint32_t)(total_blocks - ((block_group_count - 1) * blocks_per_group));
+	return (uint32_t)(total_blocks - ((uint64_t)(block_group_count - 1) * blocks_per_group));
 }
 
 uint32_t ext4_inodes_in_group_cnt(struct ext4_sblock *s, uint32_t bgid)
@@ -219,6 +219,11 @@ bool ext4_sb_sparse(uint32_t group)
 
 bool ext4_sb_is_super_in_bg(struct ext4_sblock *s, uint32_t group)
 {
+	/* COMPAT_SPARSE_SUPER2 stores the two backup groups explicitly. */
+	if (!group) return true;
+	if (ext4_sb_feature_com(s, 0x0200U))
+		return group == to_le32(s->backup_bgs[0]) ||
+		       group == to_le32(s->backup_bgs[1]);
 	if (ext4_sb_feature_ro_com(s, EXT4_FRO_COM_SPARSE_SUPER) &&
 	    !ext4_sb_sparse(group))
 		return false;

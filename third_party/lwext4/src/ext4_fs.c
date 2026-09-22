@@ -505,6 +505,9 @@ static ext4_fsblk_t ext4_fs_get_descriptor_block(struct ext4_sblock *s,
 	if (!meta_bg || dsc_id < first_meta_bg)
 		return ext4_get32(s, first_data_block) + dsc_id + 1;
 
+	/* Each meta group shares its primary descriptor block in its first
+	 * group. Other groups do not each contain a primary descriptor. */
+	bgid = dsc_id * dsc_per_block;
 	if (ext4_sb_is_super_in_bg(s, bgid))
 		has_super = 1;
 
@@ -626,6 +629,79 @@ int ext4_fs_get_block_group_ref(struct ext4_fs *fs, uint32_t bgid,
 		ext4_block_set(fs->bdev, &ref->block);
 		return EUCLEAN;
 	}
+	return EOK;
+}
+
+int ext4_fs_calculate_overhead(struct ext4_fs *fs, uint64_t *blocks)
+{
+	if (!fs || !fs->bdev || !blocks) return EINVAL;
+	struct ext4_sblock *sb = &fs->sb;
+	if (fs->super_replay_required || !ext4_sb_check_geometry(sb)) return EUCLEAN;
+	if (ext4_sb_feature_ro_com(sb, EXT4_FRO_COM_BIGALLOC)) return ENOTSUP;
+	uint64_t total = ext4_sb_get_blocks_cnt(sb);
+	uint32_t first = ext4_get32(sb, first_data_block);
+	uint32_t bsize = ext4_sb_get_block_size(sb);
+	uint32_t bpg = ext4_get32(sb, blocks_per_group);
+	uint32_t ipg = ext4_get32(sb, inodes_per_group);
+	uint32_t desc = ext4_sb_get_desc_size(sb);
+	uint32_t isize = ext4_get16(sb, inode_size);
+	if (total <= first || total > fs->bdev->part_size / bsize || bsize % desc ||
+	    ipg % (bsize / isize)) return EUCLEAN;
+	uint64_t groups = (total - first - 1) / bpg + 1;
+	if (groups > UINT32_MAX ||
+	    ext4_get32(sb, inodes_count) != groups * ipg) return EUCLEAN;
+	uint64_t itable = (uint64_t)ipg * isize / bsize;
+	uint64_t overhead = first;
+	bool flex = ext4_sb_feature_incom(sb, EXT4_FINCOM_FLEX_BG);
+	for (uint32_t group = 0; group < groups; group++) {
+		uint64_t start = first + (uint64_t)group * bpg;
+		uint64_t end = total - start < bpg ? total : start + bpg;
+		uint64_t descriptor = ext4_fs_get_descriptor_block(sb, group, bsize / desc);
+		if (descriptor < first || descriptor >= total) return EUCLEAN;
+		struct ext4_block_group_ref ref;
+		int r = ext4_fs_get_block_group_ref(fs, group, &ref);
+		if (r != EOK) return r;
+		struct ext4_bgroup *bg = ref.block_group;
+		uint64_t bitmap = ext4_bg_get_block_bitmap(bg, sb);
+		uint64_t ibitmap = ext4_bg_get_inode_bitmap(bg, sb);
+		uint64_t table = ext4_bg_get_inode_table_first_block(bg, sb);
+		uint64_t low = flex ? first : start, high = flex ? total : end;
+		if (((ext4_sb_feature_ro_com(sb, EXT4_FRO_COM_METADATA_CSUM) ||
+		      ext4_sb_feature_ro_com(sb, EXT4_FRO_COM_GDT_CSUM)) &&
+		     ext4_fs_bg_checksum(sb, group, bg) != to_le16(bg->checksum)) ||
+		    !bitmap || bitmap < low || bitmap >= high ||
+		    !ibitmap || ibitmap < low || ibitmap >= high ||
+		    !table || table < low || table >= high || itable > high - table ||
+		    bitmap == ibitmap || (bitmap >= table && bitmap - table < itable) ||
+		    (ibitmap >= table && ibitmap - table < itable) ||
+		    ext4_bg_get_free_blocks_count(bg, sb) > end - start ||
+		    ext4_bg_get_free_inodes_count(bg, sb) > ipg) r = EUCLEAN;
+		int release = ext4_fs_put_block_group_ref(&ref);
+		if (r != EOK) return r;
+		if (release != EOK) return release;
+		uint64_t super = ext4_sb_is_super_in_bg(sb, group);
+		uint64_t base = super + ext4_bg_num_gdb(sb, group) +
+		    (super ? ext4_get16(sb, s_reserved_gdt_blocks) : 0);
+		uint64_t count = base + itable + 2;
+		if (base > end - start || count > total - overhead) return EUCLEAN;
+		overhead += count;
+	}
+	if (ext4_sb_feature_com(sb, EXT4_FCOM_HAS_JOURNAL)) {
+		uint32_t number = ext4_get32(sb, journal_inode_number);
+		if (!number) return ENOTSUP; /* External journals are not supported. */
+		struct ext4_inode_ref ref;
+		int r = ext4_fs_get_inode_ref(fs, number, &ref);
+		if (r != EOK) return r;
+		uint64_t size = ext4_inode_get_size(sb, ref.inode);
+		if (!ext4_inode_is_type(sb, ref.inode, EXT4_INODE_MODE_FILE) ||
+		    !ext4_inode_get_links_cnt(ref.inode) || !size || size % bsize ||
+		    size / bsize > total - overhead) r = EUCLEAN;
+		int release = ext4_fs_put_inode_ref(&ref);
+		if (r != EOK) return r;
+		if (release != EOK) return release;
+		overhead += size / bsize;
+	}
+	*blocks = overhead;
 	return EOK;
 }
 

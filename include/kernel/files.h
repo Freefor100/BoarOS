@@ -92,6 +92,17 @@ struct kernel_linux_stat {
 _Static_assert(sizeof(struct kernel_linux_stat) == 128U,
                "Linux struct stat ABI size must remain 128 bytes");
 
+/* RV64 asm-generic statfs: 120 bytes, including zeroed spare fields. */
+struct kernel_linux_statfs {
+    int64_t f_type, f_bsize;
+    uint64_t f_blocks, f_bfree, f_bavail, f_files, f_ffree;
+    int32_t f_fsid[2];
+    int64_t f_namelen, f_frsize, f_flags, f_spare[4];
+};
+_Static_assert(sizeof(struct kernel_linux_statfs) == 120U, "statfs ABI size");
+_Static_assert(offsetof(struct kernel_linux_statfs, f_fsid) == 56U, "statfs fsid ABI");
+_Static_assert(offsetof(struct kernel_linux_statfs, f_flags) == 80U, "statfs flags ABI");
+
 struct kernel_files {
     struct kernel_heap *heap;
     struct kernel_files_record *record;
@@ -120,6 +131,18 @@ enum kernel_files_status kernel_files_move(
 int kernel_files_is_live(const struct kernel_files *files);
 
 /* Normal Linux ABI results, including negative errno, use linux_result. */
+enum kernel_files_status kernel_files_utimensat(
+    struct kernel_files *files, const struct kernel_fs_context *fs,
+    struct kernel_mm *mm, int64_t dirfd, uint64_t user_path,
+    uint64_t user_times, uint32_t flags, int64_t *linux_result);
+enum kernel_files_status kernel_files_statfs(
+    struct kernel_files *files, const struct kernel_fs_context *fs,
+    struct kernel_mm *mm, uint64_t user_path, uint64_t user_buffer,
+    int64_t *linux_result);
+enum kernel_files_status kernel_files_fstatfs(
+    struct kernel_files *files, struct kernel_mm *mm, int64_t fd,
+    uint64_t user_buffer, int64_t *linux_result);
+
 enum kernel_files_status kernel_files_chdir(
     struct kernel_files *files, const struct kernel_fs_context *fs,
     struct kernel_mm *mm, uint64_t user_path, int64_t *linux_result);

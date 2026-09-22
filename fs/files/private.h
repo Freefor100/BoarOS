@@ -7,6 +7,11 @@
 #include <stdint.h>
 
 struct kernel_pipe;
+struct kernel_vfs_path;
+int kernel_files_path_start(struct kernel_files *files,
+                            const struct kernel_fs_context *fs,
+                            int64_t dirfd, const char *path,
+                            struct kernel_vfs_path **start);
 
 enum kernel_files_status kernel_files_read_console(
     struct kernel_files *files, struct kernel_mm *mm,

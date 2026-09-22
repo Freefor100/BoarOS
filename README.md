@@ -18,14 +18,14 @@ BoarOS 是从零搭建、面向 OS Comp 能力建设的 C / 少量汇编内核�
 | 进程与等待 | fork/vfork、pthread clone、线程组退出、非组长 exec、wait/zombie/reparent、FIFO 抢占、时钟与睡眠 | 合法 clone 组合仍有限；无完整会话/TTY；单 hart 关中断不等于跨核同步 |
 | futex / 信号 | WAIT/WAKE/REQUEUE、超时/重启、标准信号、用户 handler、`rt_sigtimedwait` | 无 robust-list、跨 MM 共享 key、实时信号队列和 `sigaltstack` |
 | 文件与事件 | fd/OFD 分离、dup/CLOEXEC、共享 offset、阻塞 pin、部分/向量/定位 I/O、pipe、poll/select/epoll；ext4 节点按设备号接入 null、zero、console | 无 devfs、完整 TTY、socket 后端或记录锁；设备 mmap 未支持 |
-| 路径与 ext4 | 共享活目录项、cwd 与目录 fd、可写/只读根盘、符号链接、目录枚举、稀疏文件、活 inode 时间、打开后删除、私有映射截断 | 共享目录项、cwd/dirfd、普通/NOREPLACE rename；无硬链接、EXCHANGE/WHITEOUT、多挂载 |
+| 路径与 ext4 | 共享活目录项、cwd/dirfd、普通/NOREPLACE rename、可写/只读根盘、符号链接、目录枚举、稀疏文件、显式纳秒时间、真实文件系统统计、打开后删除、私有映射截断 | 无硬链接、EXCHANGE/WHITEOUT、多挂载或完整权限 |
 | 缓存与存储 | read/write/private fault 共用文件页、inode 脏范围与定向写回、OFD 错误观察、`fsync/fdatasync/O_SYNC/O_DSYNC`；VirtIO legacy/modern flush | ordered journal/replay、持久 orphan；恢复承诺限于已验证块模型，无后台写回线程 |
 | 身份与资源 | 单用户 root 的 UID/GID 查询；线程组共享并执行 NOFILE/STACK，fork 继承、exec 保留 | 无凭据变更/完整权限；fd 硬容量 1024、栈硬容量 8 MiB；其他有效 limit 返回 `ENOTSUP` |
 | 平台与网络 | RISC-V QEMU 真实根盘 `/init` 与 musl 用户态 | 无 socket 传输链、外部中断、LoongArch、实板或多核验证 |
 
-文件层已有部分读写、OFD 生命周期、稀疏文件与私有映射截断的语义深度；显式时间设置、文件系统统计、完整 TTY 和共享文件映射仍有缺口。ext4 恢复已覆盖 512 字节原子写、未 flush 写丢失或重排的故障模型；实板持久性仍待独立验证。动态 musl 通过不代表完整 glibc 兼容。
+文件层已有部分读写、OFD 生命周期、稀疏文件与私有映射截断的语义深度；显式时间设置和真实挂载统计已接入；完整 TTY 和共享文件映射仍有缺口。ext4 恢复已覆盖 512 字节原子写、未 flush 写丢失或重排的故障模型；实板持久性仍待独立验证。动态 musl 通过不代表完整 glibc 兼容。
 
-固定 BusyBox/libc-test 的最近全量记录为 `build/p1bc-full-final3`：228 个顶层案例全部完成，215 项双侧一致、10 个直接 entry 退出不符、3 个包装脚本断言失败。相对 `7971eedb` 基线，静态/动态 `stat` 与 `syscall_sign_extend` 共四项新增通过；剩余直接失败为 `daemon_failure`、`pthread_robust_detach`、`socket`、`statvfs`、`utime` 的静态/动态版本。包装脚本与 entry 有重叠，不能当成独立缺陷探针，也不能把清单生成成功当成全部通过。证据与复现见[程序清单](docs/learning/user-program-inventory.md)。
+固定 BusyBox/libc-test 的本轮全量记录为 `build/recoverable-fs-full`：228 个顶层案例全部完成，221 项双侧一致、4 个直接 entry 退出不符、3 个包装脚本断言失败。相对此前 215/10/3，`daemon_failure`、`utime`、`statvfs` 的静态/动态共六项新增通过，没有已有通过项回退；直接失败只剩 robust 与 socket 两类。BusyBox 原脚本为 50/55 success，另有独立 pwd/cd/mv/touch 组合双侧通过。包装脚本与 entry 有重叠，清单完成不等于全部兼容。证据与复现见[程序清单](docs/learning/user-program-inventory.md)。
 
 ## 构建与验证
 
@@ -40,6 +40,7 @@ make test-stack-usage
 make test-lwext4-host
 make test-lwext4-recovery-host # 日志与 orphan 的断电/故障矩阵
 make test-lwext4-rename-host   # 原子改名、覆盖与目录移动的故障矩阵
+make test-lwext4-metadata-host # 时间设置、空间计数与几何/失败验证
 make inventory-userland-riscv  # 能力清单，不是必过门禁
 make test-references
 ```
@@ -48,7 +49,7 @@ make test-references
 
 ## 近期工作与文档
 
-[TODO 与阶段依赖](docs/goals.md)集中维护下一步、阻塞与验收：先处理真实程序暴露的设备/路径/元数据和 robust 缺口；共享匿名对象可独立设计，文件共享依赖统一文件页与同步协议。glibc 试跑、LoongArch 最小入口和网络按各自依赖推进；SMP 先验证所有权、唤醒和 TLB 回收，再谈调度策略与性能。
+[TODO 与阶段依赖](docs/goals.md)集中维护下一步、阻塞与验收：本批块同步、逐 inode 写回、journal/replay、cwd/dirfd/rename、时间与统计已落地；下一步先闭环 robust-list 与历史取消异常，再推进共享匿名对象、共享 futex 和文件共享映射。glibc 试跑、LoongArch 最小入口和网络按各自依赖推进；SMP 先验证所有权、唤醒和 TLB 回收，再谈调度策略与性能。
 
 - [文档导航](docs/README.md)：模块契约与可复用学习材料。
 - [工程原则](docs/design.md)与[贡献说明](CONTRIBUTING.md)：技术取舍、验证与提交边界。
