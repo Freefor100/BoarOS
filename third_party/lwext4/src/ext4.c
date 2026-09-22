@@ -914,7 +914,7 @@ int ext4_file_touch(ext4_file *file, unsigned int fields)
     struct ext4_inode_ref ref;
     struct ext4_mountpoint *mp;
     struct ext4_timestamp now;
-    int result, flush_result;
+    int result;
     if (!file || !file->mp || !file->mp->mounted) return EINVAL;
     mp = file->mp;
     if (mp->fs.read_only)
@@ -925,21 +925,7 @@ int ext4_file_touch(ext4_file *file, unsigned int fields)
     result = ext4_fs_get_inode_ref(&mp->fs, file->inode, &ref);
     if (result == EOK) {
         ext4_touch_inode(mp, &ref, fields);
-        if (ref.dirty) {
-            /* put_inode_ref's immediate flush does not propagate I/O errors.
-             * Keep the dirty inode mount-owned until an explicit flush has
-             * reported success; restore nesting even after a failed put. */
-            result = ext4_block_cache_write_back(mp->fs.bdev, 1);
-            if (result == EOK) {
-                result = ext4_fs_put_inode_ref(&ref);
-                flush_result = ext4_block_cache_write_back(mp->fs.bdev, 0);
-                if (result == EOK) result = flush_result;
-            } else {
-                (void)ext4_fs_put_inode_ref(&ref);
-            }
-        } else {
-            result = ext4_fs_put_inode_ref(&ref);
-        }
+        result = ext4_fs_put_inode_ref(&ref);
     }
     if (result == EOK) ext4_trans_stop(mp);
     else ext4_trans_abort(mp);
@@ -1951,9 +1937,10 @@ static int ext4_zero_allocated_eof_tail(struct ext4_inode_ref *ref,
 static int ext4_ftruncate_no_lock(ext4_file *file, uint64_t size)
 {
 	struct ext4_inode_ref ref;
+	struct ext4_writeback_scope scope;
+	bool scoped = !file->mp->fs.jbd_journal;
 	struct ext4_sblock *sb = &file->mp->fs.sb;
 	uint64_t old_size;
-	bool write_back = false;
 	int r;
 	int cleanup_r;
 
@@ -1964,15 +1951,12 @@ static int ext4_ftruncate_no_lock(ext4_file *file, uint64_t size)
 	if (r != EOK)
 		return r;
 
+	if (scoped) ext4_bcache_scope_begin(file->mp->fs.bdev->bc, &scope);
+
 	old_size = ext4_inode_get_size(sb, ref.inode);
 	file->fsize = old_size;
 	if (old_size == size)
 		goto Finish;
-
-	r = ext4_block_cache_write_back(file->mp->fs.bdev, 1);
-	if (r != EOK)
-		goto Finish;
-	write_back = true;
 
 	if (old_size < size) {
 		r = ext4_zero_allocated_eof_tail(&ref, old_size, size);
@@ -1991,23 +1975,12 @@ Finish:
 		ext4_touch_inode(file->mp, &ref, EXT4_TIME_MTIME | EXT4_TIME_CTIME);
 	}
 	file->fsize = ext4_inode_get_size(sb, ref.inode);
-	/* Same-size truncate can still dirty timestamps. Keep the final inode
-	 * put inside the bracket so its metadata error cannot be swallowed by
-	 * the block cache's immediate-flush path. */
-	if (ref.dirty && !write_back) {
-		cleanup_r = ext4_block_cache_write_back(file->mp->fs.bdev, 1);
-		if (cleanup_r == EOK)
-			write_back = true;
-		else if (r == EOK)
-			r = cleanup_r;
-	}
 	cleanup_r = ext4_fs_put_inode_ref(&ref);
 	if (r == EOK)
 		r = cleanup_r;
-	if (write_back) {
-		cleanup_r = ext4_block_cache_write_back(file->mp->fs.bdev, 0);
-		if (r == EOK)
-			r = cleanup_r;
+	if (scoped) {
+		cleanup_r = ext4_bcache_scope_end(file->mp->fs.bdev->bc, &scope);
+		if (r == EOK) r = cleanup_r;
 	}
 	return r;
 }
@@ -2214,9 +2187,10 @@ int ext4_fwrite(ext4_file *file, const void *buf, size_t size, size_t *wcnt)
 {
 	uint32_t block_size;
 	struct ext4_inode_ref ref;
+	struct ext4_writeback_scope scope;
+	bool scoped = !file->mp->fs.jbd_journal;
 	const uint8_t *u8_buf = buf;
 	uint64_t write_end;
-	bool write_back = false;
 	int r;
 	int cleanup_r;
 
@@ -2250,6 +2224,8 @@ int ext4_fwrite(ext4_file *file, const void *buf, size_t size, size_t *wcnt)
 		return r;
 	}
 
+	if (scoped) ext4_bcache_scope_begin(file->mp->fs.bdev->bc, &scope);
+
 	/*Sync file size*/
 	file->fsize = ext4_inode_get_size(sb, ref.inode);
 	block_size = ext4_sb_get_block_size(sb);
@@ -2258,11 +2234,6 @@ int ext4_fwrite(ext4_file *file, const void *buf, size_t size, size_t *wcnt)
 		r = EFBIG;
 		goto Finish;
 	}
-
-	r = ext4_block_cache_write_back(file->mp->fs.bdev, 1);
-	if (r != EOK)
-		goto Finish;
-	write_back = true;
 
 	r = ext4_zero_allocated_eof_tail(&ref, file->fsize, write_end);
 	if (r != EOK)
@@ -2310,14 +2281,13 @@ int ext4_fwrite(ext4_file *file, const void *buf, size_t size, size_t *wcnt)
 
 Finish:
 	file->fsize = ext4_inode_get_size(sb, ref.inode);
-	if (write_back) {
-		cleanup_r = ext4_block_cache_write_back(file->mp->fs.bdev, 0);
-		if (r == EOK)
-			r = cleanup_r;
-	}
 	cleanup_r = ext4_fs_put_inode_ref(&ref);
 	if (r == EOK)
 		r = cleanup_r;
+	if (scoped) {
+		cleanup_r = ext4_bcache_scope_end(file->mp->fs.bdev->bc, &scope);
+		if (r == EOK) r = cleanup_r;
+	}
 
 	if (r != EOK)
 		ext4_trans_abort(file->mp);
@@ -2475,6 +2445,23 @@ int ext4_fraw_inode_fill(const ext4_file *file, struct ext4_inode *inode)
 	memcpy(inode, inode_ref.inode, inode_size);
 	r = ext4_fs_put_inode_ref(&inode_ref);
 	EXT4_MP_UNLOCK(mp);
+	return r;
+}
+
+int ext4_file_sync_metadata(ext4_file *file)
+{
+	struct ext4_inode_ref ref;
+	int r, cleanup;
+	if (!file || !file->mp || !file->mp->mounted)
+		return EINVAL;
+	EXT4_MP_LOCK(file->mp);
+	r = ext4_fs_get_inode_ref(&file->mp->fs, file->inode, &ref);
+	if (r == EOK) {
+		r = ext4_block_flush_buf(file->mp->fs.bdev, ref.block.buf);
+		cleanup = ext4_fs_put_inode_ref(&ref);
+		if (r == EOK) r = cleanup;
+	}
+	EXT4_MP_UNLOCK(file->mp);
 	return r;
 }
 

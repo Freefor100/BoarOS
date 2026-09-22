@@ -253,3 +253,15 @@ device.console-write-readonly
 device.console-stat
 positioned.file-write
 positioned.file-read
+
+# Explicit and synchronous file writeback
+sync.fsync
+sync.fdatasync
+sync.readonly
+sync.directory
+sync.bad-fd
+sync.pipe
+sync.device
+sync.dsync-write
+sync.sync-write
+sync.internal-bit

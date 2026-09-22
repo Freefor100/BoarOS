@@ -3,6 +3,7 @@
 #include <ext4.h>
 #include <ext4_blockdev.h>
 #include <ext4_misc.h>
+#include <ext4_fs.h>
 
 #include <errno.h>
 #include <fcntl.h>
@@ -25,6 +26,9 @@ struct host_image {
 	int fd;
 	uint64_t size;
 	bool fail_next_initialization_io;
+	uint64_t fail_write_offset;
+	unsigned int fail_writes;
+	unsigned int failed_writes;
 };
 
 static int host_open(struct ext4_blockdev *bdev)
@@ -129,6 +133,13 @@ static int host_write(struct ext4_blockdev *bdev, const void *buffer,
 		return rc;
 
 	image = bdev->bdif->p_user;
+	if (image->fail_writes && image->fail_write_offset >= offset &&
+	    image->fail_write_offset < offset + length) {
+		image->fail_writes--;
+		image->failed_writes++;
+		return EIO;
+	}
+
 	while (done < length) {
 		size_t remaining = length - done;
 		size_t chunk = remaining > (size_t)SSIZE_MAX ?
@@ -748,6 +759,7 @@ close:
 }
 
 #include "lwext4_timestamps.h"
+#include "lwext4_writeback.h"
 
 int main(int argc, char **argv)
 {
@@ -839,7 +851,8 @@ int main(int argc, char **argv)
 	if (timestamp_mode || timestamp_readonly)
 		failed = check_timestamp_behavior(timestamp_readonly);
 	else if (sparse_mode)
-		failed = check_sparse_behavior(&image);
+		failed = check_writeback_errors(&image, &device) ||
+		         check_sparse_behavior(&image);
 	else if (legacy_limit_mode)
 		failed = check_legacy_address_limit();
 	else if (wide_legacy_limit_mode)

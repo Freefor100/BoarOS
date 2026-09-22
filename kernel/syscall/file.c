@@ -210,6 +210,26 @@ enum kernel_syscall_status syscall_handle_ftruncate(
     return KERNEL_SYSCALL_STATUS_OK;
 }
 
+enum kernel_syscall_status syscall_handle_fsync(
+    struct kernel_task *caller,
+    const struct kernel_syscall_request *request,
+    struct kernel_syscall_result *decoded, int datasync)
+{
+    struct kernel_files *files;
+    int64_t result;
+    enum kernel_task_status status = kernel_task_files_borrow(caller, &files);
+    if (status == KERNEL_TASK_STATUS_RESOURCE_UNAVAILABLE) {
+        result = -KERNEL_EBADF;
+    } else if (status != KERNEL_TASK_STATUS_OK ||
+        kernel_files_sync(files, (int64_t)(int32_t)request->arguments[0],
+                           datasync, &result) != KERNEL_FILES_STATUS_OK) {
+        return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    }
+    decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+    decoded->value = result;
+    return KERNEL_SYSCALL_STATUS_OK;
+}
+
 enum kernel_syscall_status syscall_handle_pipe2(
     struct kernel_task *caller,
     const struct kernel_syscall_request *request,

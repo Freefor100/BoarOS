@@ -19,7 +19,7 @@ BoarOS 是从零搭建、面向 OS Comp 能力建设的 C / 少量汇编内核�
 | futex / 信号 | WAIT/WAKE/REQUEUE、超时/重启、标准信号、用户 handler、`rt_sigtimedwait` | 无 robust-list、跨 MM 共享 key、实时信号队列和 `sigaltstack` |
 | 文件与事件 | fd/OFD 分离、dup/CLOEXEC、共享 offset、阻塞 pin、部分/向量/定位 I/O、pipe、poll/select/epoll；ext4 节点按设备号接入 null、zero、console | 无 devfs、完整 TTY、socket 后端或记录锁；设备 mmap 未支持 |
 | 路径与 ext4 | 持引用的 mount/inode/目录项路径对象，可写/只读根盘、符号链接、目录枚举、稀疏文件、活 inode 时间、打开后删除、私有映射截断 | cwd 固定 `/`；相对路径只支持 `AT_FDCWD`，无目录 fd 起点、硬链接、rename、多挂载 |
-| 缓存与存储 | read/private fault 共用文件页、哈希+LRU、同步 VirtIO legacy/modern 块读写与 flush | node 失效仍扫全 LRU；无文件 dirty/writeback、`fsync/fdatasync`，拒绝 `O_SYNC/O_DSYNC` 和需 recovery 的 ext4 |
+| 缓存与存储 | read/write/private fault 共用文件页、inode 脏范围与定向写回、OFD 错误观察、`fsync/fdatasync/O_SYNC/O_DSYNC`；VirtIO legacy/modern flush | 无后台写回线程；journal/replay 尚未接入生产，仍拒绝需 recovery 的 ext4 |
 | 身份与资源 | 单用户 root 的 UID/GID 查询；线程组共享并执行 NOFILE/STACK，fork 继承、exec 保留 | 无凭据变更/完整权限；fd 硬容量 1024、栈硬容量 8 MiB；其他有效 limit 返回 `ENOTSUP` |
 | 平台与网络 | RISC-V QEMU 真实根盘 `/init` 与 musl 用户态 | 无 socket 传输链、外部中断、LoongArch、实板或多核验证 |
 

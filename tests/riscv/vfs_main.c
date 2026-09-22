@@ -16,6 +16,7 @@
 #include <kernel/open_file.h>
 #include <ext4.h>
 #include <ext4_errno.h>
+#include "../../fs/lwext4_port.h"
 #endif
 
 #define TEST_POOL_PAGES 512U
@@ -83,6 +84,20 @@ static uint32_t fail_orphan_free_calls;
 static uint32_t orphan_free_calls;
 static uint32_t fail_fclose_calls;
 static uint32_t failed_fclose_calls;
+static struct kernel_page_cache *pressure_cache;
+static uint64_t pressure_reclaimed;
+enum kernel_heap_status __real_kernel_heap_allocate(
+    struct kernel_heap *, size_t, void **);
+enum kernel_heap_status __wrap_kernel_heap_allocate(
+    struct kernel_heap *heap, size_t size, void **out)
+{
+    if (pressure_cache != 0 && boaros_lwext4_allocation_active()) {
+        struct kernel_page_cache *cache = pressure_cache;
+        pressure_cache = 0;
+        pressure_reclaimed = kernel_page_cache_reclaim(cache, UINT64_MAX);
+    }
+    return __real_kernel_heap_allocate(heap, size, out);
+}
 static uint32_t retried_fclose_calls;
 static ext4_file *failed_fclose_files[4];
 
@@ -340,6 +355,52 @@ static void run_path_cleanup_regression(struct kernel_vfs_mount *mount,
         alias.private_data != 0 || fail_fclose_calls != 0U ||
         failed_fclose_calls != 2U || kernel_vfs_close(&file) != 0)
         fail_vfs(39U, -KERNEL_EIO, -1);
+}
+#endif
+
+#ifndef VFS_EXPECT_RECOVERY
+static void run_writeback_regression(struct kernel_vfs_mount *mount,
+                                      struct kernel_page_cache *cache)
+{
+    struct kernel_vfs_file first = {0}, second = {0}, alias = {0};
+    struct kernel_vfs_stat stat;
+    ext4_file raw;
+    uint64_t observed = 0;
+    size_t count = 0;
+    char result[8] = {0};
+    if (kernel_vfs_create(mount, "/wb-first", 0600, &first) ||
+        kernel_vfs_create(mount, "/wb-second", 0600, &second) ||
+        kernel_vfs_pwrite(&first, 0, "first", 5, &count) || count != 5 ||
+        kernel_vfs_pwrite(&second, 0, "second", 6, &count) || count != 6 ||
+        kernel_vfs_open(mount, "/wb-first", &alias) ||
+        kernel_vfs_fstat(&alias, &stat) || stat.size != 5 ||
+        kernel_vfs_pread(&alias, 0, result, sizeof(result), &count) ||
+        count != 5 || !bytes_equal((unsigned char *)result, "first", 5))
+        fail_vfs(70, 0, -1);
+    if (ext4_fopen(&raw, "/wb-first", "r") || ext4_fsize(&raw) != 0 ||
+        ext4_fclose(&raw)) fail_vfs(71, 0, -1);
+    struct kernel_vfs_file clean = {0};
+    if (kernel_vfs_open(mount, "/init", &clean) ||
+        kernel_vfs_pread(&clean, 0, result, 1, &count) || count != 1 ||
+        kernel_vfs_close(&clean)) fail_vfs(76, 0, -1);
+    /* Reclaim at a live lwext4 allocation boundary may release clean pages,
+     * but cannot reenter the backend through dirty VFS pages. */
+    pressure_cache = cache;
+    void *allocation = ext4_user_malloc(4096);
+    if (allocation == 0 || pressure_cache != 0 || pressure_reclaimed == 0 ||
+        ext4_fopen(&raw, "/wb-first", "r") || ext4_fsize(&raw) != 0 ||
+        ext4_fclose(&raw)) fail_vfs(77, 0, -1);
+    ext4_user_free(allocation);
+    if (kernel_vfs_sync(&first, 0, &observed)) fail_vfs(72, 0, -1);
+    if (ext4_fopen(&raw, "/wb-first", "r") || ext4_fsize(&raw) != 5 ||
+        ext4_fclose(&raw) || ext4_fopen(&raw, "/wb-second", "r") ||
+        ext4_fsize(&raw) != 0 || ext4_fclose(&raw)) fail_vfs(73, 0, -1);
+    if (kernel_vfs_close(&first) || kernel_vfs_close(&alias) ||
+        kernel_vfs_close(&second)) fail_vfs(74, 0, -1);
+    /* Dirty inode remains alive after the last fd, and a new open sees it. */
+    if (kernel_vfs_open(mount, "/wb-second", &second) ||
+        kernel_vfs_sync(&second, 1, &observed) ||
+        kernel_vfs_close(&second)) fail_vfs(75, 0, -1);
 }
 #endif
 
@@ -601,10 +662,21 @@ static void run_vfs_test(const void *dtb)
     run_orphan_cleanup_regression(&mount, &heap);
     run_path_resolution_regression(&mount, &heap);
     run_path_cleanup_regression(&mount, &heap);
+    run_writeback_regression(&mount, &page_cache);
     result = kernel_vfs_unmount(&mount);
     if (result != 0 || retried_fclose_calls != failed_fclose_calls) {
         fail_vfs(12U, 0, result);
     }
+
+    device.block.write = 0;
+    device.block.flush = 0;
+    device.block.cache_mode = KERNEL_BLOCK_CACHE_UNKNOWN;
+    uint64_t observed_error = 0;
+    if (kernel_vfs_mount_root(&mount, &device.block, &heap, &page_cache) ||
+        kernel_vfs_open(&mount, "/init", &file) ||
+        kernel_vfs_sync(&file, 0, &observed_error) ||
+        kernel_vfs_close(&file) || kernel_vfs_unmount(&mount))
+        fail_vfs(78U, 0, -1);
 
     riscv_virtio_mmio_block_get_statistics(&device, &statistics);
     if (statistics.requests == 0U || statistics.timeouts != 0U ||

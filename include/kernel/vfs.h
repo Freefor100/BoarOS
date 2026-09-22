@@ -136,6 +136,11 @@ int kernel_vfs_append(struct kernel_vfs_file *file,
 int kernel_vfs_ftruncate(struct kernel_vfs_file *file,
                          uint64_t size);
 
+/* Each OFD owns an error observation cursor; dup/fork share it with the OFD. */
+uint64_t kernel_vfs_error_sequence(const struct kernel_vfs_file *file);
+int kernel_vfs_sync(struct kernel_vfs_file *file, int datasync,
+                    uint64_t *observed_error);
+
 int kernel_vfs_mkdir(struct kernel_vfs_mount *mount,
                      const char *path,
                      uint32_t mode);

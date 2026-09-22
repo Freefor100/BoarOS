@@ -7,6 +7,8 @@
 #include <kernel/fs_context.h>
 #include <kernel/heap.h>
 #include <kernel/page_cache.h>
+#include <kernel/page.h>
+#include <kernel/physical_page.h>
 #include <kernel/vfs.h>
 #include <kernel/time.h>
 
@@ -140,15 +142,19 @@ struct lwext4_mount_adapter {
     uint8_t mounted;
     uint8_t heap_bound;
     uint8_t read_only;
+    uint8_t unmount_sync_pending;
 };
 
 struct kernel_vfs_node {
     struct kernel_vfs_node *next;
+    struct kernel_page_cache_entry *cache_pages;
     struct kernel_file_mapping *mappings;
     struct lwext4_mount_adapter *adapter;
     struct kernel_vfs_mount *mount;
     ext4_file file;
     uint64_t size;
+    uint64_t writeback_error_sequence;
+    int writeback_error;
     uint32_t mode;
     uint32_t references;
     uint32_t open_files;
@@ -776,6 +782,12 @@ static int cleanup_mount(struct kernel_vfs_mount *mount)
             return lwext4_error(result);
         }
         adapter->mounted = 0U;
+        adapter->unmount_sync_pending = !adapter->read_only;
+    }
+    if (adapter->unmount_sync_pending) {
+        if (kernel_block_flush(adapter->block) != KERNEL_BLOCK_STATUS_OK)
+            return -KERNEL_EIO;
+        adapter->unmount_sync_pending = 0;
     }
     if (adapter->registered) {
         result = ext4_device_unregister(LWEXT4_DEVICE_NAME);
@@ -1294,7 +1306,7 @@ int kernel_vfs_file_modified(struct kernel_vfs_file *file,
         file->private_data == 0) return -KERNEL_EINVAL;
     node = file->private_data;
     if (node->adapter->read_only) return -KERNEL_EROFS;
-    if (append) offset = ext4_fsize(&node->file);
+    if (append) offset = node->size;
     /* Linux generic/ext4 write checks reject the maximum position before
      * file_modified, even when the user buffer would fault. */
     if (offset >= node->file.fmax) return -KERNEL_EFBIG;
@@ -1313,18 +1325,37 @@ int kernel_vfs_pread(struct kernel_vfs_file *file,
         (buffer == 0 && size != 0U)) {
         return -KERNEL_EINVAL;
     }
-    return kernel_vfs_node_pread(file->private_data,
-                                 offset,
-                                 buffer,
-                                 size,
-                                 bytes_read);
+    struct kernel_vfs_node *node = file->private_data;
+    struct kernel_page_cache *cache = node->adapter->page_cache;
+    *bytes_read = 0;
+    if (offset > INT64_MAX) return -KERNEL_EOVERFLOW;
+    while (*bytes_read < size && offset < node->size) {
+        uint64_t address;
+        size_t valid, start = (size_t)(offset & (BOAROS_PAGE_SIZE - 1U));
+        void *page;
+        enum kernel_page_cache_status status = kernel_page_cache_get(
+              cache, file, offset >> BOAROS_PAGE_SHIFT, &address, &valid);
+        if (status != KERNEL_PAGE_CACHE_STATUS_OK)
+            return status == KERNEL_PAGE_CACHE_STATUS_NO_MEMORY
+                       ? -KERNEL_ENOMEM : -KERNEL_EIO;
+        if (physical_page_resolve(cache->allocator, address, &page) !=
+                PHYSICAL_PAGE_STATUS_OK || valid <= start) __builtin_trap();
+        size_t count = valid - start;
+        if (count > size - *bytes_read) count = size - *bytes_read;
+        memcpy((unsigned char *)buffer + *bytes_read,
+                (unsigned char *)page + start, count);
+        (void)physical_page_release(cache->allocator, address);
+        *bytes_read += count;
+        offset += count;
+    }
+    return 0;
 }
 
-static void reconcile_file_after_mutation(struct kernel_vfs_node *node,
-                                          struct kernel_vfs_file *file)
+static void apply_truncated_size(struct kernel_vfs_node *node,
+                                 struct kernel_vfs_file *file, uint64_t size)
 {
     uint64_t old_size = node->size;
-    node->size = ext4_fsize(&node->file);
+    node->size = size;
     file->size = node->size;
     if (node->size < old_size) {
         for (struct kernel_file_mapping *mapping = node->mappings;
@@ -1333,8 +1364,7 @@ static void reconcile_file_after_mutation(struct kernel_vfs_node *node,
         }
     }
     if (node->adapter->page_cache != 0) {
-        (void)kernel_page_cache_invalidate_node(node->adapter->page_cache,
-                                                node);
+        kernel_page_cache_truncate(node->adapter->page_cache, node, node->size);
     }
 }
 
@@ -1365,18 +1395,18 @@ int kernel_vfs_pwrite(struct kernel_vfs_file *file,
         return 0;
     }
 
-    result = ext4_fseek(&node->file, (int64_t)offset, SEEK_SET);
-    if (result != EOK) {
-        return lwext4_error(result);
-    }
-    result = ext4_fwrite(&node->file, buffer, size, &written);
-    reconcile_file_after_mutation(node, file);
+    if (offset >= node->file.fmax) return -KERNEL_EFBIG;
+    if (size > node->file.fmax - offset)
+        size = (size_t)(node->file.fmax - offset);
+    result = kernel_page_cache_write(node->adapter->page_cache, file, offset,
+                                      buffer, size, &written);
+    file->size = node->size;
     *bytes_written = written;
     if (written > size) {
         return -KERNEL_EIO;
     }
-    if (result != EOK && written == 0U) {
-        return lwext4_error(result);
+    if (result != 0 && written == 0U) {
+        return result;
     }
     return 0;
 }
@@ -1404,7 +1434,7 @@ int kernel_vfs_append(struct kernel_vfs_file *file,
     if (node->adapter == 0 || node->adapter->read_only) {
         return -KERNEL_EROFS;
     }
-    offset = ext4_fsize(&node->file);
+    offset = node->size;
     if (size == 0U) {
         if (written_offset != 0) {
             *written_offset = offset;
@@ -1412,12 +1442,7 @@ int kernel_vfs_append(struct kernel_vfs_file *file,
         *bytes_written = 0U;
         return 0;
     }
-    result = ext4_fseek(&node->file, (int64_t)offset, SEEK_SET);
-    if (result != EOK) {
-        return lwext4_error(result);
-    }
-    result = ext4_fwrite(&node->file, buffer, size, &written);
-    reconcile_file_after_mutation(node, file);
+    result = kernel_vfs_pwrite(file, offset, buffer, size, &written);
     if (written_offset != 0) {
         *written_offset = offset + (uint64_t)written;
     }
@@ -1425,8 +1450,8 @@ int kernel_vfs_append(struct kernel_vfs_file *file,
     if (written > size) {
         return -KERNEL_EIO;
     }
-    if (result != EOK && written == 0U) {
-        return lwext4_error(result);
+    if (result != 0 && written == 0U) {
+        return result;
     }
     return 0;
 }
@@ -1454,8 +1479,13 @@ int kernel_vfs_ftruncate(struct kernel_vfs_file *file,
 
     /* Even a same-size ftruncate updates mtime/ctime. Reconciliation also
      * preserves visible inode mutations when the backend reports an error. */
+    if (size > node->file.fmax) return -KERNEL_EFBIG;
+    result = kernel_page_cache_writeback_before(node->adapter->page_cache, node, size);
+    if (result != 0) return result;
+    uint64_t prior_disk_size = ext4_fsize(&node->file);
     result = ext4_ftruncate(&node->file, size);
-    reconcile_file_after_mutation(node, file);
+    if (result == EOK || ext4_fsize(&node->file) != prior_disk_size)
+        apply_truncated_size(node, file, ext4_fsize(&node->file));
     if (result != EOK) {
         return lwext4_error(result);
     }
@@ -1693,6 +1723,8 @@ int kernel_vfs_fstat(const struct kernel_vfs_file *file,
     if (result != EOK) return lwext4_error(result);
     fill_stat(file->mount, node->adapter->superblock,
               node->file.inode, &inode, stat);
+    if ((node->mode & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFREG)
+        stat->size = node->size;
     return 0;
 }
 
@@ -2231,6 +2263,79 @@ uint64_t kernel_vfs_node_size(const struct kernel_vfs_node *node)
 {
     return node != 0 && node->references != 0U && !node->closed
                ? node->size : 0U;
+}
+
+struct kernel_page_cache_entry **kernel_vfs_node_cache_pages(
+    struct kernel_vfs_node *node)
+{
+    return &node->cache_pages;
+}
+
+void kernel_vfs_node_written(struct kernel_vfs_node *node, uint64_t end)
+{
+    if (end > node->size) node->size = end;
+}
+
+int kernel_vfs_node_writeback_allowed(const struct kernel_vfs_node *node)
+{
+    return node != 0 && !boaros_lwext4_allocation_active();
+}
+
+static void record_writeback_error(struct kernel_vfs_node *node, int error)
+{
+    node->writeback_error = error;
+    node->writeback_error_sequence++;
+    if (node->writeback_error_sequence == 0) __builtin_trap();
+}
+
+int kernel_vfs_node_writeback(struct kernel_vfs_node *node, uint64_t offset,
+                              const void *buffer, size_t size, size_t *written)
+{
+    *written = 0;
+    int result = ext4_fseek(&node->file, (int64_t)offset, SEEK_SET);
+    if (result == EOK) result = ext4_fwrite(&node->file, buffer, size, written);
+    if (result == EOK && *written != size) result = EIO;
+    if (result != EOK) record_writeback_error(node, lwext4_error(result));
+    return lwext4_error(result);
+}
+
+uint64_t kernel_vfs_error_sequence(const struct kernel_vfs_file *file)
+{
+    struct kernel_vfs_node *node = kernel_vfs_file_node(file);
+    return node != 0 ? node->writeback_error_sequence : 0;
+}
+
+int kernel_vfs_sync(struct kernel_vfs_file *file, int datasync,
+                    uint64_t *observed_error)
+{
+    struct kernel_vfs_node *node = kernel_vfs_file_node(file);
+    int result;
+    (void)datasync; /* Metadata is currently submitted with each mutation. */
+    if (node == 0 || observed_error == 0) return -KERNEL_EBADF;
+    if ((node->mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFREG &&
+        (node->mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFDIR)
+        return -KERNEL_EINVAL;
+    result = 0;
+    if (node->adapter->read_only) goto observe;
+    result = kernel_page_cache_writeback(node->adapter->page_cache, node);
+    if (result == 0) {
+        result = lwext4_error(ext4_file_sync_metadata(&node->file));
+        if (result != 0) record_writeback_error(node, result);
+    }
+    if (result == 0) {
+        enum kernel_block_status status = kernel_block_flush(node->adapter->block);
+        if (status != KERNEL_BLOCK_STATUS_OK) {
+            result = status == KERNEL_BLOCK_STATUS_UNSUPPORTED
+                         ? -KERNEL_ENOTSUP : -KERNEL_EIO;
+            record_writeback_error(node, result);
+        }
+    }
+observe:
+    if (*observed_error != node->writeback_error_sequence) {
+        if (result == 0) result = node->writeback_error;
+        *observed_error = node->writeback_error_sequence;
+    }
+    return result;
 }
 
 const struct kernel_vfs_mount *kernel_vfs_node_mount(

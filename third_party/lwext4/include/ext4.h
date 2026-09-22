@@ -439,6 +439,10 @@ int ext4_raw_inode_fill(const char *path, uint32_t *ret_ino,
  */
 int ext4_fraw_inode_fill(const ext4_file *file, struct ext4_inode *inode);
 
+/* Submit the held inode's metadata buffer, without draining unrelated files.
+ * Caller must have submitted data first and issue the device barrier after. */
+int ext4_file_sync_metadata(ext4_file *file);
+
 /**@brief Check if inode exists.
  *
  * @param path    Parh to file/dir/link.

@@ -267,9 +267,58 @@ int ext4_bcache_alloc(struct ext4_bcache *bc, struct ext4_block *b,
 	return EOK;
 }
 
+void ext4_bcache_scope_begin(struct ext4_bcache *bc,
+                             struct ext4_writeback_scope *scope)
+{
+	scope->head = NULL;
+	scope->previous = bc->writeback_scope;
+	/* Nested modifications belong to the outer operation's submit set. */
+	if (!bc->writeback_scope) bc->writeback_scope = scope;
+	bc->bdev->cache_write_back++;
+}
+
+void ext4_bcache_scope_track(struct ext4_buf *buf)
+{
+	struct ext4_writeback_scope *scope = buf->bc->writeback_scope;
+	if (!scope || buf->writeback_scope) return;
+	buf->writeback_scope = scope;
+	buf->writeback_next = scope->head;
+	scope->head = buf;
+	/* Every caller marks dirty while holding a buffer reference. Keeping
+	 * another reference prevents shake from publishing a half allocation. */
+	ext4_bcache_inc_ref(buf);
+}
+
+int ext4_bcache_scope_end(struct ext4_bcache *bc,
+                          struct ext4_writeback_scope *scope)
+{
+	int result = EOK;
+	struct ext4_buf *buf = scope->head;
+	if (!scope->previous) bc->writeback_scope = NULL;
+	while (buf) {
+		struct ext4_buf *next = buf->writeback_next;
+		struct ext4_block block = {.lb_id = buf->lba, .buf = buf, .data = buf->data};
+		if (bc->bdev->cache_write_back == 1) {
+			int r = ext4_block_flush_buf(bc->bdev, buf);
+			if (result == EOK) result = r;
+		}
+		buf->writeback_scope = NULL;
+		buf->writeback_next = NULL;
+		/* Retain write-back mode while dropping the scope's pins: a failed
+		 * buffer transfers to the mount dirty list without an implicit retry. */
+		int r = ext4_bcache_free(bc, &block);
+		if (result == EOK) result = r;
+		buf = next;
+	}
+	bc->bdev->cache_write_back--;
+	scope->head = NULL;
+	return result;
+}
+
 int ext4_bcache_free(struct ext4_bcache *bc, struct ext4_block *b)
 {
 	struct ext4_buf *buf = b->buf;
+	int result = EOK;
 
 	ext4_assert(bc && b);
 
@@ -296,14 +345,18 @@ int ext4_bcache_free(struct ext4_bcache *bc, struct ext4_block *b)
 			    !ext4_bcache_test_flag(buf, BC_TMP))
 				ext4_bcache_insert_dirty_node(bc, buf);
 			else {
-				ext4_block_flush_buf(bc->bdev, buf);
-				ext4_bcache_clear_flag(buf, BC_FLUSH);
+				result = ext4_block_flush_buf(bc->bdev, buf);
+				if (result == EOK)
+					ext4_bcache_clear_flag(buf, BC_FLUSH);
+				else
+					ext4_bcache_insert_dirty_node(bc, buf);
 			}
 		}
 
 		/* The buffer is invalidated...drop it. */
-		if (!ext4_bcache_test_flag(buf, BC_UPTODATE) ||
-		    ext4_bcache_test_flag(buf, BC_TMP))
+		if (result == EOK &&
+		    (!ext4_bcache_test_flag(buf, BC_UPTODATE) ||
+		     ext4_bcache_test_flag(buf, BC_TMP)))
 			ext4_bcache_drop_buf(bc, buf);
 
 	}
@@ -311,7 +364,7 @@ int ext4_bcache_free(struct ext4_bcache *bc, struct ext4_block *b)
 	b->lb_id = 0;
 	b->data = 0;
 
-	return EOK;
+	return result;
 }
 
 bool ext4_bcache_is_full(struct ext4_bcache *bc)

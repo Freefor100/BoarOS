@@ -55,6 +55,7 @@ static enum kernel_open_file_status create_open_file(
     }
     file->heap = heap;
     file->references = 1U;
+    file->observed_writeback_error = kernel_vfs_error_sequence(&file->file);
     *owner = file;
     *linux_result = 0;
     return KERNEL_OPEN_FILE_STATUS_OK;

@@ -44,16 +44,12 @@ unlink 更新子 inode ctime。truncate 在活 inode 修改后更新 mtime/ctime
 
 ## I/O 失败与持久化
 
-`ext4_fs_put_inode_ref()` 标记 inode 所属 metadata block 为 dirty；上游 `ext4_bcache_free()`
-的即时 flush 分支忽略 `ext4_block_flush_buf()` 的 errno。新的 live timestamp touch 只在字段
-确实改变时暂时开启 cache write-back，释放 inode 引用后恢复原嵌套深度并显式 flush，取得真实
-错误。零更新、无时钟和只读访问不为本次 touch 新增 flush。truncate 的最后 inode put 同样位于 write-back bracket 内；同长度 truncate 新产生的 timestamp dirty state 也经显式 flush 返回错误。
+`ext4_fs_put_inode_ref()` 标记 inode 所属 metadata block 为 dirty；已修复上游 `ext4_bcache_free()` 即时 flush 忽略 errno 的问题，失败缓冲保留在 mount dirty list，引用 owner 完成转移后向调用层返回真实错误。touch 直接释放目标 inode 引用即可取得提交结果，不再用全量 cache write-back drain；零更新、无时钟和只读访问不为本次 touch 新增 flush。truncate 和普通写入在建立完整内存分配关系前固定本次修改的缓冲，收尾只提交本次集合，防止位图 I/O 失败中断在块尚无 inode owner 的位置。
 
 写侧 touch 错误在数据提交之前返回；读侧 atime 错误按 Linux 规则不改变 read 返回值。
 flush 失败后的 dirty block 由 mount block cache 持有，后续显式 cache flush/unmount 可恢复；
 不把已经释放的 inode 临时引用或 fd 当成重试 owner。内存 inode 已更新不等于磁盘已持久化。
-创建/链接等原 lwext4 metadata 路径仍保留其既有错误传播约束，本改动不声称统一修复了所有
-上游即时 flush 分支。
+创建/链接的事务原子性仍需 journal 集成验证；即时错误传播不等于已有崩溃恢复。
 
 ## 验证
 

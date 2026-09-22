@@ -117,7 +117,7 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 - [ ] 多挂载覆盖路径跨越、根和 `..`、挂载点被引用、卸载忙、跨挂载文件操作和失败回滚；设备/内存/磁盘文件各自错误保持所属 owner。
 - [ ] eventfd/timerfd 只在真实消费者提出需求后接统一 OFD，就绪、非阻塞、poll/epoll 和退出回收一起验收；signalfd 另依赖 P2c 队列。
 
-**验证与退出**：先扩展 `tests/riscv/files_cases.c` 等现有聚焦入口；拟新增 `tests/userland/path_devices.c`、`tests/diff-abi/path_devices.c`、`tests/diff-abi/file_metadata.c`，接入现有 runner 而非另造测试框架。`make test-files-riscv test-vfs-riscv test-lwext4-host` → `test-userland-riscv`/`test-diff-abi-riscv`。设备、cwd、时间、统计分别解除对应真实程序阻塞，旧 ext4/pipe/epoll/COW/回收不退步；daemon 新出现的 setsid 依赖交给 P2d。
+**验证与退出**：先扩展 `tests/riscv/files_main.c` 等现有聚焦入口；拟新增 `tests/userland/path_devices.c`、`tests/diff-abi/path_devices.c`、`tests/diff-abi/file_metadata.c`，接入现有 runner 而非另造测试框架。`make test-files-riscv test-vfs-riscv test-lwext4-host` → `test-userland-riscv`/`test-diff-abi-riscv`。设备、cwd、时间、统计分别解除对应真实程序阻塞，旧 ext4/pipe/epoll/COW/回收不退步；daemon 新出现的 setsid 依赖交给 P2d。
 
 ## P2：线程、futex、信号与资源
 
@@ -174,10 +174,10 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 - [ ] 定义请求/描述符/bounce buffer 的 owner；超时/reset 后必须确认 DMA 不再访问，才能释放或复用请求内存。不可恢复设备错误由所属设备/mount 保留明确状态。
 - [ ] 无 flush 能力时依据设备真实缓存契约返回结果；不能忽略能力并承诺不可满足的持久性。测试正常完成、拒绝/失败、超时与 reset 回收。
 
-### P3b fsync、fdatasync 与目录同步（粒度待确认）
+### P3b fsync、fdatasync 与目录同步（已选逐 inode 路线）
 
 - [ ] 明确调用覆盖的文件数据、必要元数据、目录项和设备缓存；从 syscall/OFD 接到 ext4 提交与块 flush，顺序和成功承诺可解释。目录 fsync 单独验收。
-- [ ] 比较 mount 范围同步与每文件 dirty/error 状态，选择先能正确闭环的粒度；不要求先做异步写回，但不能把完成语义留给“以后再补”。
+- [x] 已选择并实现 inode 缓存页索引、脏范围/修改代次、定向写回及 OFD 错误观察；独立 open 与 dup、关闭后脏 owner、O_SYNC/O_DSYNC、真实 musl 和 260 条 Linux 差分验证。journal/事务依赖的生产集成仍属 P3d。
 - [ ] 定义延迟错误属于哪个 mount/文件，以及后续哪些调用观察它；用户错误、真实写/flush 错误和内核不变量分开。关闭先摘 fd，不让历史 cleanup 改变当前有效 close 结果。
 - [ ] 同步链建立后才接 `O_SYNC/O_DSYNC`；覆盖普通/部分写、metadata 必要性、无效 fd、只读/设备及重复同步。新进程/重启看到已承诺内容只是正常路径证据，不能单独证明崩溃一致性。
 
@@ -187,7 +187,7 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 - [ ] 按固定契约验证独立 open、dup、fork、exec、任意相关 fd close、线程组退出的保留/释放；尤其不能把进程锁简单挂成随单个 OFD 生灭。
 - [ ] 冲突时真实阻塞或返回规定错误，信号打断、取消、等待者退出/OOM 都释放队列引用；两个进程争用同一文件必须观察到冲突，而非分别在私有锁表成功。
 
-### P3d ext4 journal 与恢复（路线待确认）
+### P3d ext4 journal 与恢复（已选本批交付）
 
 - [ ] 比较继续明确拒绝需 recovery 的镜像、与启用并验证 lwext4 日志/replay 的成本和承诺；开启配置项本身不算支持。
 - [ ] 要发布崩溃恢复承诺时，定义事务开始/提交、数据/元数据/日志/flush 顺序及错误后的 mount 状态；重挂载能 replay，损坏不能当正常空盘。

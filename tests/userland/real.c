@@ -28,6 +28,7 @@
 #include "truncate.h"
 
 #include "timestamps.h"
+#include "sync.h"
 
 __attribute__((section(".rodata.unlink_test_far"), aligned(4096)))
 const char unlink_far_page[8192] = "UNLINK_DEMAND_FAULT_PAGE_PAYLOAD";
@@ -2235,7 +2236,8 @@ static int check_filesystem_rw(void)
     }
     struct stat ust_orig;
     memset(&ust_orig, 0, sizeof(ust_orig));
-    if (fstat(ufd, &ust_orig) != 0 || ust_orig.st_size != 6 ||
+    /* Establish allocated storage before checking its orphan lifetime. */
+    if (fsync(ufd) != 0 || fstat(ufd, &ust_orig) != 0 || ust_orig.st_size != 6 ||
         ust_orig.st_nlink != 1 || ust_orig.st_blocks <= 0) {
         close(ufd);
         return 81;
@@ -3071,6 +3073,12 @@ int main(int argc, char **argv)
         fprintf(stderr, "poll/select check failed: %d errno=%d\n",
                 poll_result, errno);
         return 82;
+    }
+
+    int sync_result = check_file_sync();
+    if (sync_result != 0) {
+        fprintf(stderr, "file sync check failed: %d errno=%d\n", sync_result, errno);
+        return 85;
     }
 
     int epoll_result = check_epoll();
