@@ -369,17 +369,7 @@ int ext4_dir_add_entry(struct ext4_inode_ref *parent, const char *name,
 	    (ext4_inode_has_flag(parent->inode, EXT4_INODE_FLAG_INDEX))) {
 		r = ext4_dir_dx_add_entry(parent, child, name, name_len);
 
-		/* Check if index is not corrupted */
-		if (r != EXT4_ERR_BAD_DX_DIR) {
-			if (r != EOK)
-				return r;
-
-			return EOK;
-		}
-
-		/* Needed to clear dir index flag if corrupted */
-		ext4_inode_clear_flag(parent->inode, EXT4_INODE_FLAG_INDEX);
-		parent->dirty = true;
+		return r == EXT4_ERR_BAD_DX_DIR ? EUCLEAN : r;
 	}
 #endif
 
@@ -409,6 +399,8 @@ int ext4_dir_add_entry(struct ext4_inode_ref *parent, const char *name,
 				 "Block: %" PRIu32"\n",
 				 parent->index,
 				 iblock);
+			ext4_block_set(fs->bdev, &block);
+			return EUCLEAN;
 		}
 
 		/* If adding is successful, function can finish */
@@ -477,17 +469,7 @@ int ext4_dir_find_entry(struct ext4_dir_search_result *result,
 	if ((ext4_sb_feature_com(sb, EXT4_FCOM_DIR_INDEX)) &&
 	    (ext4_inode_has_flag(parent->inode, EXT4_INODE_FLAG_INDEX))) {
 		r = ext4_dir_dx_find_entry(result, parent, name_len, name);
-		/* Check if index is not corrupted */
-		if (r != EXT4_ERR_BAD_DX_DIR) {
-			if (r != EOK)
-				return r;
-
-			return EOK;
-		}
-
-		/* Needed to clear dir index flag if corrupted */
-		ext4_inode_clear_flag(parent->inode, EXT4_INODE_FLAG_INDEX);
-		parent->dirty = true;
+		return r == EXT4_ERR_BAD_DX_DIR ? EUCLEAN : r;
 	}
 #endif
 
@@ -519,6 +501,8 @@ int ext4_dir_find_entry(struct ext4_dir_search_result *result,
 				 "Block: %" PRIu32"\n",
 				 parent->index,
 				 iblock);
+			ext4_block_set(parent->fs->bdev, &b);
+			return EUCLEAN;
 		}
 
 		/* Try to find entry in block */

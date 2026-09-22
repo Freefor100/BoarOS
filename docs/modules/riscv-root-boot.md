@@ -37,4 +37,4 @@ QEMU_MEMORY=16G make test-exec-riscv
 make test-idle-riscv
 ```
 
-fixture 写入真实 ext4 的静态 ELF 以及 userland runner 使用的动态 musl PIE、解释器、额外 DSO 和 TLS；镜像还包含一个 9000 字节确定性数据文件、不可执行数据文件和可执行的非 ELF 脚本。程序在 U-mode 检查初始栈、errno、exec 与父子生命周期后以状态 42 调用 `exit(93)`。runner 要求 PID 1 身份、父子状态、fd/MM 语义、完整资源基线和 SBI 关机均成立。`make test-root-orphan-riscv` 让 PID 1 留下未等待的 zombie 子进程，验证 PID 1 completion 后继续排空退出队列。`test-root-boot-cleanup-riscv` 在 fs context 创建后注入一次真实 ext4 block write 失败，要求 mount owner 保留，root boot 最多三次清理尝试后成功卸载；无盘测试仍要求 timer idle 持续工作。
+fixture 写入真实 ext4 的静态 ELF 以及 userland runner 使用的动态 musl PIE、解释器、额外 DSO 和 TLS；镜像还包含一个 9000 字节确定性数据文件、不可执行数据文件和可执行的非 ELF 脚本。程序在 U-mode 检查初始栈、errno、exec 与父子生命周期后以状态 42 调用 `exit(93)`。runner 要求 PID 1 身份、父子状态、fd/MM 语义、完整资源基线和 SBI 关机均成立。`make test-root-orphan-riscv` 让 PID 1 留下未等待的 zombie 子进程，验证 PID 1 completion 后继续排空退出队列。`test-root-boot-cleanup-riscv` 先让 fs context 创建失败，再在卸载日志时注入真实块写错误；三次清理调用必须保持相同 mount/cache/device owner、停止进一步写入，并最终报告 `CLEANUP`。关键日志错误不会因一次底层故障已消失就恢复为可写。无盘测试仍要求 timer idle 持续工作。

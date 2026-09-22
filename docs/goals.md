@@ -8,7 +8,7 @@
 
 `[x]` 表示该条具体交付已有验证，不表示整个阶段完成；`[ ]` 表示尚未完成。下文新增文件/测试均标为“拟新增”，名称可以随已确认方案调整，不预建空目录、空接口或成功存根。源码入口用于定位，不要求一次修改整组文件。
 
-每个可提交任务按“触发条件与契约 → 真实 owner → 最小失败输入 → 修复 → 正常/失败/回收证据”执行。架构、ABI、所有权、依赖或结构性性能取舍先比较真实候选，由维护者确认；已确认范围内的小修继续完成。阶段转换、push、发布与比赛提交另由维护者决定。
+每个可提交任务按“触发条件与契约 → 真实 owner → 最小失败输入 → 修复 → 正常/失败/回收证据”执行。架构、ABI、所有权、依赖或结构性性能取舍先比较真实候选，由维护者确认；已确认范围内的小修继续完成。本批用户已授权按块同步→逐 inode 写回→journal/replay→cwd/dirfd/rename→时间与统计的顺序逐阶段实施；push、发布与比赛提交仍由维护者决定。
 
 ### 已落地的首批工作
 
@@ -20,11 +20,11 @@
 
 | 顺序 | 任务 | 开始条件 / 独立成果 |
 |---|---|---|
-| 1 | P1d cwd/dirfd | 复用已完成的 P1b 稳定路径身份；补用户接口与目录 fd 起点 |
+| 1 | P1d cwd/dirfd、P1g rename | 将路径父链提升为共享可改名目录项，补用户接口与目录 fd 起点，并接入已完成的日志和 orphan |
 | 2 | P1e 时间、P1f 统计 | 现在可调查 ext4 接口；完整 fd/dirfd 语义依赖路径链 |
-| 并行候选 | P2a robust-list、P4a 共享匿名设计 | 各自先确认退出/后备对象所有权，不等整个 P1 完成 |
+| 本批之后 | P2a robust-list 与取消异常 | 先闭环真实程序的退出语义，再推进 P4a 共享匿名、共享 futex 和文件映射 |
 | 持续支线 | P5a glibc 试跑、L0/L1 第二架构入口 | 可现在固定输入或调查边界，不以全量清单全绿为前提 |
-| 后续 | P3 同步/锁、N socket、P4 文件共享、P6 SMP | 按下述具体依赖进入，不按测试名称排接口 |
+| 后续 | P3c/e 记录锁与 SQLite、N socket、P4 文件共享、P6 SMP | 按下述具体依赖进入，不按测试名称排接口 |
 
 ### 主要依赖
 
@@ -166,20 +166,20 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 
 **依赖与入口**：文件/目录同步依赖稳定 VFS/OFD，块层可先做；`include/kernel/block.h`、`kernel/block.c`、`arch/riscv/virtio_mmio_block.c`、`fs/{vfs.c,page_cache.c}`、`fs/files/io.c`、`kernel/syscall/file.c`、`fs/lwext4_config/generated/ext4_config.h`。涉及 lwext4 变更时维护来源、许可证与本地 patch 记录。
 
-### P3a 块设备 flush
+### P3a 块设备 flush（已完成）
 
 - [x] 块层已有缓存模式与 flush 回调；VirtIO legacy/modern 在 writeback/writethrough 四种组合通过真实请求测试。`make test-block-host` 验证能力拒绝、错误传播和可复用的易失缓存/稳定镜像故障模型；这不表示 journal 或文件系统恢复完成。
 
-- [ ] 对照固定设备资料定义能力描述、缓存属性和 flush 请求：协商支持、提交、完成、I/O 错误、超时和只读边界；两种 VirtIO MMIO transport 都验证，不能把内存 fence 当介质同步。
-- [ ] 定义请求/描述符/bounce buffer 的 owner；超时/reset 后必须确认 DMA 不再访问，才能释放或复用请求内存。不可恢复设备错误由所属设备/mount 保留明确状态。
-- [ ] 无 flush 能力时依据设备真实缓存契约返回结果；不能忽略能力并承诺不可满足的持久性。测试正常完成、拒绝/失败、超时与 reset 回收。
+- [x] 对照固定设备资料定义能力描述、缓存属性和 flush 请求：协商支持、提交、完成、I/O 错误、超时和只读边界；两种 VirtIO MMIO transport 都验证，不能把内存 fence 当介质同步。
+- [x] 定义请求/描述符/bounce buffer 的 owner；超时/reset 后必须确认 DMA 不再访问，才能释放或复用请求内存。不可恢复设备错误由所属设备/mount 保留明确状态。
+- [x] 无 flush 能力时依据设备真实缓存契约返回结果；不能忽略能力并承诺不可满足的持久性。测试正常完成、拒绝/失败、超时与 reset 回收。
 
 ### P3b fsync、fdatasync 与目录同步（已选逐 inode 路线）
 
-- [ ] 明确调用覆盖的文件数据、必要元数据、目录项和设备缓存；从 syscall/OFD 接到 ext4 提交与块 flush，顺序和成功承诺可解释。目录 fsync 单独验收。
-- [x] 已选择并实现 inode 缓存页索引、脏范围/修改代次、定向写回及 OFD 错误观察；独立 open 与 dup、关闭后脏 owner、O_SYNC/O_DSYNC、真实 musl 和 260 条 Linux 差分验证。journal/事务依赖的生产集成仍属 P3d。
-- [ ] 定义延迟错误属于哪个 mount/文件，以及后续哪些调用观察它；用户错误、真实写/flush 错误和内核不变量分开。关闭先摘 fd，不让历史 cleanup 改变当前有效 close 结果。
-- [ ] 同步链建立后才接 `O_SYNC/O_DSYNC`；覆盖普通/部分写、metadata 必要性、无效 fd、只读/设备及重复同步。新进程/重启看到已承诺内容只是正常路径证据，不能单独证明崩溃一致性。
+- [x] 明确调用覆盖的文件数据、必要元数据、目录项和设备缓存；从 syscall/OFD 接到 ext4 提交与块 flush，顺序和成功承诺可解释。目录 fsync 单独验收。
+- [x] 已选择并实现 inode 缓存页索引、脏范围/修改代次、定向写回及 OFD 错误观察；独立 open 与 dup、关闭后脏 owner、O_SYNC/O_DSYNC、真实 musl 和 260 条 Linux 差分验证。journal 事务依赖已接入 P3d。
+- [x] 定义延迟错误属于哪个 mount/文件，以及后续哪些调用观察它；用户错误、真实写/flush 错误和内核不变量分开。关闭先摘 fd，不让历史 cleanup 改变当前有效 close 结果。
+- [x] 同步链建立后才接 `O_SYNC/O_DSYNC`；覆盖普通/部分写、metadata 必要性、无效 fd、只读/设备及重复同步。新进程/重启看到已承诺内容只是正常路径证据，不能单独证明崩溃一致性。
 
 ### P3c 记录锁
 
@@ -189,9 +189,10 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 
 ### P3d ext4 journal 与恢复（已选本批交付）
 
-- [ ] 比较继续明确拒绝需 recovery 的镜像、与启用并验证 lwext4 日志/replay 的成本和承诺；开启配置项本身不算支持。
-- [ ] 要发布崩溃恢复承诺时，定义事务开始/提交、数据/元数据/日志/flush 顺序及错误后的 mount 状态；重挂载能 replay，损坏不能当正常空盘。
-- [ ] 在明确的虚拟设备模型中注入块写与 flush 失败、按提交边界强制终止，重新挂载并跑 e2fsck；保留每个故障点输入、日志和镜像。不把 QEMU 正常关机当断电，也不推广到未验证真实硬盘。
+- [x] 已选择并启用 ordered journal/replay；事务 before-image、flush 顺序、checksum v2/v3 和 revoke、superblock 恢复、持久 orphan_file/传统链及分批 extent/间接块回收已接入生产。
+- [x] 元数据事务提交与 checkpoint 分阶段 flush；关键日志错误 sticky，损坏或只读无法恢复时拒绝开放用户访问。已知日志提交前的资源不足可安全回滚，不能据此清除不确定 I/O 错误。
+- [x] `make test-lwext4-recovery-host` 使用 512 字节原子写、易失缓存/稳定镜像，覆盖写与 flush 失败、丢失/重排、两次恢复和 e2fsck；完整 orphan 回收矩阵为 16 种组合、4,362 次断电执行。QEMU 正常退出和未验收实板不属于该恢复证据。
+- [ ] 仍需在共享路径与 rename 阶段验收“临时文件→fsync→rename→父目录 fsync”完整应用序列；robust/socket、记录锁、SQLite、共享映射留后续。
 
 ### P3e SQLite 回滚日志负载
 
@@ -214,7 +215,7 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 
 ### P4b 共享文件页与权威数据源
 
-- [ ] 同挂载/inode/文件 offset 的独立 open/mmap 指向同一文件页；普通 read/write 与映射读写三向可见。既有“写盘后失效缓存”不能维护仍活跃的共享 PTE。
+- [ ] 同挂载/inode/文件 offset 的独立 open/mmap 指向同一文件页；普通 read/write 与映射读写三向可见。普通 read/write/private fault 已统一缓存；仍需建立 MAP_SHARED 可写 PTE 的脏标记和回写协议。
 - [ ] 定义 clean/dirty/writeback/error、写回中再次修改、pin/映射引用和回收资格；文件页 identity 不随 fd 关闭或路径删除而改变。
 - [ ] 两个独立 MM、两个独立 open、多个 VA 别名组合验收；MAP_PRIVATE 写不得污染共享页，共享页修改及普通写的可见性按固定 Linux 声明范围核对。
 - [ ] 写回失败由仍存活的文件/mount owner 保存并传播；页被映射/pin 时不能按普通无引用缓存驱逐。并发 miss/锁外 I/O 的跨核发布在 P6d 验收。
@@ -406,8 +407,8 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 |---|---|
 | P1b VFS：原 fs context 借用单根 mount、cwd 字符串；OFD 已独立 | 已选择并完成②：最小 mount+路径对象/后端操作。路径持有 mount、inode 与父链引用，ext4 字符节点按 `rdev` 分派；多挂载和 rename 仍留后续。 |
 | P4a 共享匿名：当前是私有 fault/COW | ① 急切分配并引用共享页，能满足 fork 可见性但改变 lazy/OOM 成本；② 引用后备对象按索引惰性发布，保留 lazy 并连接文件/shared futex，增加发布/回收协议。倾向②；shadow 链只在真实需求出现时另评估。 |
-| P3b 持久化：块层无 flush，写盘后失效缓存 | ① mount 范围提交元数据并设备 flush，较易闭环但会提交无关文件；② 每文件 dirty/error 和同步，隔离更好、利于共享页，状态/故障验证较复杂。都须真实 flush 与错误传播；倾向先①再按文件消费者细化。 |
-| P3d 恢复：需 recovery 的 ext4 被拒绝 | ① 继续明确无恢复承诺、拒绝脏日志，成本小但不能交付崩溃恢复；② 启用并验证 lwext4 journal/replay，扩大恢复能力但需事务/flush/故障矩阵。按应用的持久性目标选择，不能只打开配置。 |
+| P3b 持久化 | 用户已选择并交付逐 inode dirty/error、定向写回和真实 flush；共享事务可提交关联元数据，不主动全量写回无关文件。 |
+| P3d 恢复 | 用户已选择本批启用并验证 journal/replay 与持久 orphan；故障模型、限制和复现命令见 VFS 模块。 |
 | P6 SMP：当前 SIE 串行化，缺远端 TLB 确认 | ① 进程态对象先用粗粒度可睡眠锁、IRQ/队列另设短锁，验证较少但并行有限；② MM/OFD/cache/队列对象锁直接演进，锁顺序/取消成本更高。先盘点消费者和睡眠边界再选，临时启动大锁有退出条件。 |
 | P6g 栈 guard：连续物理栈、canary/高水位 | ① 独立虚拟栈区映射已有页，便于未映射 guard，但需页表与回收接口；② 调整内核现有映射形成受保护栈区域，初始接口可能更少，但别名/大页拆分与 direct-map 消费者成本须实测。先验证真实越界保护范围再选。 |
 | N1 协议栈：无 socket/传输链 | ① 自写明确范围的 C 协议子集，owner 易控制但协议/互操作验证成本高；② 适配成熟 C 栈，可复用协议实现，但缓冲/定时器/并发模型、许可与长期更新成本需核对。socket ABI 由 BoarOS 持有，先比较实际消费者。 |

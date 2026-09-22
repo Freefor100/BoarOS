@@ -98,7 +98,12 @@ if [ -n "$root_boot_error_status" ]; then
         echo "root-boot cleanup did not exercise the ext4 block-write failure" >&2
         exit 1
     fi
-    echo "RISC-V root-boot cleanup retried ext4 block I/O"
+    if [ "$(grep -cxF 'BoarOS: root cleanup retained failed journal owner' "$output" || true)" -ne 3 ]; then
+        tail -n 120 "$output" >&2
+        echo "root-boot cleanup did not retain the failed journal owner" >&2
+        exit 1
+    fi
+    echo "RISC-V root-boot cleanup retained failed journal ownership"
     exit 0
 fi
 

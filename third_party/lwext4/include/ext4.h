@@ -87,6 +87,9 @@ typedef struct ext4_file {
 
 	/**@brief   Actual file position.*/
 	uint64_t fpos;
+
+	/* Last completed journal dependency in this mounted session. */
+	uint32_t sync_tid;
 } ext4_file;
 
 /* BoarOS adapter: optional realtime source and live-inode timestamp updates.
@@ -191,6 +194,16 @@ int ext4_journal_start(const char *mount_point);
  *
  * @return  Standard error code. */
 int ext4_journal_stop(const char *mount_point);
+
+/* Group modifications into one journal transaction. Calls nest; a failed
+ * inner transaction poisons the outer transaction, which restores its in-memory
+ * state when its last level ends. The caller serializes access to this mount.
+ * These explicit grouping APIs require an active journal. After an outer
+ * abort, reopen file handles modified within that group before reusing their
+ * cached size/position. Passing zero to abort reports ECANCELED. */
+int ext4_transaction_begin(const char *mount_point);
+int ext4_transaction_end(const char *mount_point);
+int ext4_transaction_abort(const char *mount_point, int error);
 
 /**@brief   Journal recovery.
  * @warning Must be called after @ref ext4_mount.
@@ -312,6 +325,8 @@ int ext4_funlink_dentry(const char *path, uint32_t *out_inode, bool *out_is_orph
  *
  * @return  Standard error code. */
 int ext4_orphan_free(const char *path, uint32_t inode);
+/* Replay must finish first; recovery completes before opening the mount. */
+int ext4_orphan_recover(const char *mount_point);
 
 /**@brief   Create a hardlink for a file.
  *

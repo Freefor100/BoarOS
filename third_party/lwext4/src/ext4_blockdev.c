@@ -85,6 +85,17 @@ static int ext4_bdif_bwrite(struct ext4_blockdev *bdev, const void *buf,
 	return r;
 }
 
+int ext4_blockdev_flush(struct ext4_blockdev *bdev)
+{
+	int r;
+	if (!bdev->bdif->flush)
+		return ENOTSUP;
+	ext4_bdif_lock(bdev);
+	r = bdev->bdif->flush(bdev);
+	ext4_bdif_unlock(bdev);
+	return r;
+}
+
 int ext4_block_init(struct ext4_blockdev *bdev)
 {
 	int rc;

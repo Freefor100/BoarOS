@@ -72,6 +72,15 @@ int ext4_trans_block_get(struct ext4_blockdev *bdev,
 		   struct ext4_block *b,
 		   uint64_t lba);
 
+/* Ordered file-data access: reserve a pin and rollback image before mutation,
+ * then mark modified. Commit writes only these buffers to their home blocks
+ * and flushes them before writing metadata to the journal. */
+int ext4_trans_data_get(struct ext4_blockdev *bdev, struct ext4_block *b,
+			uint64_t lba);
+int ext4_trans_data_get_noread(struct ext4_blockdev *bdev, struct ext4_block *b,
+			       uint64_t lba);
+int ext4_trans_set_data_dirty(struct ext4_buf *buf);
+
 /**@brief  Try to add block to be revoked to the current transaction.
  * @param  bdev block device descriptor
  * @param  lba logical block address

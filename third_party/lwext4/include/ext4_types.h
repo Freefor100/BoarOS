@@ -248,6 +248,7 @@ _Static_assert(sizeof(struct ext4_sblock) == EXT4_SUPERBLOCK_SIZE,
 #define EXT4_FCOM_DIR_PREALLOC 0x0001
 #define EXT4_FCOM_IMAGIC_INODES 0x0002
 #define EXT4_FCOM_HAS_JOURNAL 0x0004
+#define EXT4_FCOM_ORPHAN_FILE 0x1000
 #define EXT4_FCOM_EXT_ATTR 0x0008
 #define EXT4_FCOM_RESIZE_INODE 0x0010
 #define EXT4_FCOM_DIR_INDEX 0x0020
@@ -265,6 +266,7 @@ _Static_assert(sizeof(struct ext4_sblock) == EXT4_SUPERBLOCK_SIZE,
 #define EXT4_FRO_COM_QUOTA 0x0100
 #define EXT4_FRO_COM_BIGALLOC 0x0200
 #define EXT4_FRO_COM_METADATA_CSUM 0x0400
+#define EXT4_FRO_COM_ORPHAN_PRESENT 0x10000
 
 /*
  * Incompatible features
@@ -319,7 +321,7 @@ _Static_assert(sizeof(struct ext4_sblock) == EXT4_SUPERBLOCK_SIZE,
 
 #define EXT4_SUPPORTED_FRO_COM                             \
 	(EXT4_FRO_COM_SPARSE_SUPER |                       \
-	 EXT4_FRO_COM_METADATA_CSUM |                      \
+	 EXT4_FRO_COM_METADATA_CSUM | EXT4_FRO_COM_ORPHAN_PRESENT | \
 	 EXT4_FRO_COM_LARGE_FILE | EXT4_FRO_COM_GDT_CSUM | \
 	 EXT4_FRO_COM_DIR_NLINK |                          \
 	 EXT4_FRO_COM_EXTRA_ISIZE | EXT4_FRO_COM_HUGE_FILE)

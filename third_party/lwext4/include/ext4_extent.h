@@ -49,6 +49,8 @@ extern "C" {
 #include <ext4_inode.h>
 
 void ext4_extent_tree_init(struct ext4_inode_ref *inode_ref);
+int ext4_extent_last_block(struct ext4_inode_ref *inode_ref,
+			   ext4_lblk_t *last, bool *found);
 
 
 int ext4_extent_get_blocks(struct ext4_inode_ref *inode_ref, ext4_lblk_t iblock,

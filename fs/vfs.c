@@ -15,6 +15,9 @@
 #include <ext4.h>
 #include <ext4_blockdev.h>
 #include <ext4_inode.h>
+#include <ext4_fs.h>
+#include <ext4_journal.h>
+#include <ext4_orphan.h>
 #include <ext4_misc.h>
 #include <ext4_super.h>
 #include <ext4_types.h>
@@ -143,7 +146,37 @@ struct lwext4_mount_adapter {
     uint8_t heap_bound;
     uint8_t read_only;
     uint8_t unmount_sync_pending;
+    uint8_t recovery_pending;
+    int mount_error;
 };
+
+static int mount_error(const struct lwext4_mount_adapter *adapter)
+{
+    if (adapter->mount_error) return adapter->mount_error;
+    struct ext4_fs *fs = adapter->device.fs;
+    return fs && fs->jbd_journal ? fs->jbd_journal->error : EOK;
+}
+
+/* Resource exhaustion before commit remains recoverable. Keep the actual
+ * mount/cache owner and resume preparation before trying to tear it down. */
+static int prepare_journal_mount(struct lwext4_mount_adapter *adapter)
+{
+    struct ext4_fs *fs = adapter->device.fs;
+    int result = EOK;
+    if (!fs->jbd_journal) {
+        if (fs->jbd_fs)
+            result = ext4_journal_stop(LWEXT4_MOUNT_POINT);
+        if (result == EOK) result = ext4_recover(LWEXT4_MOUNT_POINT);
+        if (result == EOK) result = ext4_orphan_validate(fs);
+        if (result == EOK) result = ext4_journal_start(LWEXT4_MOUNT_POINT);
+    }
+    if (result == EOK) result = ext4_orphan_recover(LWEXT4_MOUNT_POINT);
+    if (result == EOK)
+        adapter->recovery_pending = 0U;
+    else if (result != ENOMEM && result != ENOSPC)
+        adapter->mount_error = result;
+    return result;
+}
 
 struct kernel_vfs_node {
     struct kernel_vfs_node *next;
@@ -663,6 +696,17 @@ static int block_close(struct ext4_blockdev *device)
     return block_open(device);
 }
 
+static int block_flush(struct ext4_blockdev *device)
+{
+    struct lwext4_mount_adapter *adapter = device->bdif->p_user;
+    switch (kernel_block_flush(adapter->block)) {
+    case KERNEL_BLOCK_STATUS_OK: return EOK;
+    case KERNEL_BLOCK_STATUS_NO_MEMORY: return ENOMEM;
+    case KERNEL_BLOCK_STATUS_UNSUPPORTED: return ENOTSUP;
+    default: return EIO;
+    }
+}
+
 static int release_mount_storage(struct kernel_vfs_mount *mount)
 {
     struct lwext4_mount_adapter *adapter = mount->private_data;
@@ -720,6 +764,15 @@ static int cleanup_mount(struct kernel_vfs_mount *mount)
     struct lwext4_orphan **orphan_link;
     struct kernel_vfs_node **cleanup_link;
     int result;
+
+    /* An uncertain journal/recovery failure still owns its cache and log.
+     * Never mark that filesystem clean or recycle its adapter on a retry. */
+    result = mount_error(adapter);
+    if (result != EOK) return lwext4_error(result);
+    if (adapter->recovery_pending) {
+        result = prepare_journal_mount(adapter);
+        if (result != EOK) return lwext4_error(result);
+    }
 
     if (adapter->external_files != 0U) {
         return -KERNEL_EBUSY;
@@ -851,6 +904,7 @@ int kernel_vfs_mount_root(struct kernel_vfs_mount *mount,
     adapter->interface.bread = block_read;
     adapter->interface.bwrite = block_write;
     adapter->interface.close = block_close;
+    adapter->interface.flush = block_flush;
     adapter->interface.lock = 0;
     adapter->interface.unlock = 0;
     adapter->interface.ph_bsize = LWEXT4_PHYSICAL_BLOCK_SIZE;
@@ -888,9 +942,20 @@ int kernel_vfs_mount_root(struct kernel_vfs_mount *mount,
         (void)cleanup_mount(mount);
         return lwext4_error(result);
     }
-    if (ext4_sb_feature_incom(superblock, EXT4_FINCOM_RECOVER)) {
+    if (read_only && (ext4_sb_feature_incom(superblock, EXT4_FINCOM_RECOVER) ||
+        ext4_get32(superblock, last_orphan) != 0 ||
+        ext4_sb_feature_ro_com(superblock, EXT4_FRO_COM_ORPHAN_PRESENT))) {
         (void)cleanup_mount(mount);
         return -KERNEL_EUCLEAN;
+    }
+
+    if (ext4_sb_feature_com(superblock, EXT4_FCOM_HAS_JOURNAL)) {
+        adapter->recovery_pending = 1U;
+        result = prepare_journal_mount(adapter);
+        if (result != EOK) {
+            if (!mount_error(adapter)) (void)cleanup_mount(mount);
+            return lwext4_error(result);
+        }
     }
 
     adapter->superblock = superblock;
@@ -1390,6 +1455,8 @@ int kernel_vfs_pwrite(struct kernel_vfs_file *file,
     if (node->adapter == 0 || node->adapter->read_only) {
         return -KERNEL_EROFS;
     }
+    result = mount_error(node->adapter);
+    if (result != EOK) return lwext4_error(result);
     if (size == 0U) {
         *bytes_written = 0U;
         return 0;

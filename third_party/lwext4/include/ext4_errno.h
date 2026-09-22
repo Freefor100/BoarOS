@@ -50,9 +50,11 @@ extern "C" {
 #define EIO 5        /* I/O error */
 #define ENXIO 6      /* No such device or address */
 #define E2BIG 7      /* Argument list too long */
+#define EAGAIN 11    /* Try again */
 #define ENOMEM 12    /* Out of memory */
 #define EACCES 13    /* Permission denied */
 #define EFAULT 14    /* Bad address */
+#define EBUSY 16     /* Device or resource busy */
 #define EEXIST 17    /* File exists */
 #define ENODEV 19    /* No such device */
 #define ENOTDIR 20   /* Not a directory */
@@ -65,7 +67,10 @@ extern "C" {
 #define ERANGE 34    /* Math result not representable */
 #define ENOTEMPTY 39 /* Directory not empty */
 #define ENODATA 61   /* No data available */
+#define EOVERFLOW 75 /* Value too large */
 #define ENOTSUP 95   /* Not supported */
+#define EUCLEAN 117  /* Structure needs cleaning */
+#define ECANCELED 125 /* Operation canceled */
 #endif
 
 #ifndef ENODATA

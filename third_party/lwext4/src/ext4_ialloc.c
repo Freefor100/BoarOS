@@ -130,12 +130,12 @@ void ext4_ialloc_set_bitmap_csum(struct ext4_sblock *sb, struct ext4_bgroup *bg,
 
 }
 
-#if CONFIG_META_CSUM_ENABLE
-static bool
-ext4_ialloc_verify_bitmap_csum(struct ext4_sblock *sb, struct ext4_bgroup *bg,
+bool
+ext4_ialloc_verify_bitmap_csum(struct ext4_sblock *sb __unused,
+			       struct ext4_bgroup *bg __unused,
 			       void *bitmap __unused)
 {
-
+#if CONFIG_META_CSUM_ENABLE
 	int desc_size = ext4_sb_get_desc_size(sb);
 	uint32_t csum = ext4_ialloc_bitmap_csum(sb, bitmap);
 	uint16_t lo_csum = to_le16(csum & 0xFFFF),
@@ -151,11 +151,9 @@ ext4_ialloc_verify_bitmap_csum(struct ext4_sblock *sb, struct ext4_bgroup *bg,
 		if (bg->inode_bitmap_csum_hi != hi_csum)
 			return false;
 
+#endif
 	return true;
 }
-#else
-#define ext4_ialloc_verify_bitmap_csum(...) true
-#endif
 
 int ext4_ialloc_free_inode(struct ext4_fs *fs, uint32_t index, bool is_dir)
 {
@@ -177,14 +175,19 @@ int ext4_ialloc_free_inode(struct ext4_fs *fs, uint32_t index, bool is_dir)
 
 	struct ext4_block b;
 	rc = ext4_trans_block_get(fs->bdev, &b, bitmap_block_addr);
-	if (rc != EOK)
+	if (rc != EOK) {
+		ext4_fs_put_block_group_ref(&bg_ref);
 		return rc;
+	}
 
 	if (!ext4_ialloc_verify_bitmap_csum(sb, bg, b.data)) {
 		ext4_dbg(DEBUG_IALLOC,
 			DBG_WARN "Bitmap checksum failed."
 			"Group: %" PRIu32"\n",
 			bg_ref.index);
+		ext4_block_set(bg_ref.fs->bdev, &b);
+		ext4_fs_put_block_group_ref(&bg_ref);
+		return EUCLEAN;
 	}
 
 	/* Free i-node in the bitmap */
@@ -251,7 +254,7 @@ int ext4_ialloc_alloc_inode(struct ext4_fs *fs, uint32_t *idx, bool is_dir)
 
 		/* Load block group to check */
 		struct ext4_block_group_ref bg_ref;
-		int rc = ext4_fs_get_block_group_ref(fs, bgid, &bg_ref);
+		int rc = ext4_fs_get_block_group_ref_alloc(fs, bgid, &bg_ref);
 		if (rc != EOK)
 			return rc;
 
@@ -278,6 +281,9 @@ int ext4_ialloc_alloc_inode(struct ext4_fs *fs, uint32_t *idx, bool is_dir)
 					DBG_WARN "Bitmap checksum failed."
 					"Group: %" PRIu32"\n",
 					bg_ref.index);
+				ext4_block_set(bg_ref.fs->bdev, &b);
+				ext4_fs_put_block_group_ref(&bg_ref);
+				return EUCLEAN;
 			}
 
 			/* Try to allocate i-node in the bitmap */
