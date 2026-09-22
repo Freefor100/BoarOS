@@ -29,6 +29,14 @@ struct kernel_vfs_timespec {
     int64_t nanoseconds;
 };
 
+#define KERNEL_VFS_UTIME_NOW INT64_C(1073741823)
+#define KERNEL_VFS_UTIME_OMIT INT64_C(1073741822)
+
+struct kernel_vfs_statfs {
+    uint64_t type, block_size, blocks, free_blocks, available_blocks;
+    uint64_t inodes, free_inodes, fsid, name_length, flags;
+};
+
 struct kernel_vfs_stat {
     uint64_t dev;
     uint64_t ino;
@@ -64,6 +72,8 @@ int kernel_vfs_path_resolve(struct kernel_vfs_path *start,
 uint64_t kernel_vfs_path_inode(const struct kernel_vfs_path *path);
 int kernel_vfs_path_stat(const struct kernel_vfs_path *path,
                          struct kernel_vfs_stat *stat);
+int kernel_vfs_path_set_times(struct kernel_vfs_path *path,
+                              const struct kernel_vfs_timespec times[2]);
 int kernel_vfs_path_release(struct kernel_vfs_path **owner);
 struct kernel_vfs_mount *kernel_vfs_path_mount(
     const struct kernel_vfs_path *path);
@@ -125,6 +135,10 @@ int kernel_vfs_mount_root(struct kernel_vfs_mount *mount,
 int kernel_vfs_unmount(struct kernel_vfs_mount *mount);
 
 int kernel_vfs_mount_is_readonly(const struct kernel_vfs_mount *mount);
+int kernel_vfs_mount_statfs(struct kernel_vfs_mount *mount,
+                            struct kernel_vfs_statfs *stat);
+int kernel_vfs_file_set_times(struct kernel_vfs_file *file,
+                              const struct kernel_vfs_timespec times[2]);
 
 int kernel_vfs_open(struct kernel_vfs_mount *mount,
                     const char *path,

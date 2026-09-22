@@ -87,6 +87,9 @@ struct ext4_inode_ref {
 	bool dirty;
 };
 
+/* Read-only geometry/GDT/journal validation; output changes only on success. */
+int ext4_fs_calculate_overhead(struct ext4_fs *fs, uint64_t *blocks);
+
 
 /**@brief Convert block address to relative index in block group.
  * @param s Superblock pointer

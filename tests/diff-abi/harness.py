@@ -10,7 +10,7 @@ import re
 import shutil
 import subprocess
 import sys
-from timestamps import normalize_timestamps
+from timestamps import normalize_timestamps, normalize_utimens
 
 ROOT = Path(__file__).resolve().parents[2]
 HERE = Path(__file__).resolve().parent
@@ -51,6 +51,8 @@ def normalize(text, expected):
             raise ValueError(f'inconsistent return/errno: {name}')
         if name.startswith('time.'):
             data = normalize_timestamps(data)
+        elif name.startswith('utime.'):
+            data = normalize_utimens(data, ret)
         records.append((name, ret, errno, size, offset, status, data))
     if [record[0] for record in records] != expected:
         raise ValueError('missing, duplicated, unknown, or reordered case result')

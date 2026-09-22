@@ -9,6 +9,9 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#define LINUX_SYSCALL_STATFS 43U
+#define LINUX_SYSCALL_FSTATFS 44U
+#define LINUX_SYSCALL_UTIMENSAT 88U
 #define LINUX_SYSCALL_GETCWD 17U
 #define LINUX_SYSCALL_RENAMEAT 38U
 #define LINUX_SYSCALL_CHDIR 49U
@@ -196,6 +199,14 @@ enum kernel_syscall_status kernel_syscall_dispatch(
             KERNEL_SYSCALL_STATUS_OK) {
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
         }
+    } else if (request->number == LINUX_SYSCALL_UTIMENSAT) {
+        if (syscall_handle_utimensat(caller, request, &decoded) != KERNEL_SYSCALL_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    } else if (request->number == LINUX_SYSCALL_STATFS ||
+               request->number == LINUX_SYSCALL_FSTATFS) {
+        if (syscall_handle_statfs(caller, request, &decoded,
+                request->number == LINUX_SYSCALL_FSTATFS) != KERNEL_SYSCALL_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     } else if (request->number == LINUX_SYSCALL_GETCWD) {
         if (syscall_handle_getcwd(caller, request, &decoded) != KERNEL_SYSCALL_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;

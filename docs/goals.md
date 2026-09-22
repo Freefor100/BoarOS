@@ -16,12 +16,14 @@
 - [x] **P1a root 身份查询**：`getuid/geteuid/getgid/getegid` 符合现有不可变 root 模型；四项单测先失败，同一 ELF 差分先观察 ENOSYS，修复后全部 185 条一致，含残留参数和 fork/exec。凭据变更/权限检查仍属于 P2e。
 - [x] **P0b 首轮时序复跑**：三轮静态/动态 `pthread_cancel_points` 双侧通过；BusyBox 后台 sleep+kill 每轮失败，日志与固定 ash 源码确认 `/dev/null` 是后台子进程前置依赖。证据见 `build/review-timing-{1,2,3}/`，未关闭旧取消异常。
 
+本批最终证据：`build/recoverable-fs-host-final.log`（含 journal/orphan/rename 断电与 metadata 故障）、`build/recoverable-fs-regression-final.log`（RISC-V 全套、真实 musl/pthread、320 条差分、1000 个函数栈界、工具自测）、`build/recoverable-fs-full/runs/suite.json`（228 项实际重跑，无旧通过项回退）。恢复承诺仍限于已验证块模型。
+
 ### 后续推进顺序
 
 | 顺序 | 任务 | 开始条件 / 独立成果 |
 |---|---|---|
 | 已完成 | P1d cwd/dirfd、P1g rename 子集 | 共享活目录项、cwd/dirfd、普通/NOREPLACE rename 已接入日志与 orphan |
-| 1 | P1e 时间、P1f 统计 | 基于已完成的活路径与 inode 接口补显式时间和真实挂载统计 |
+| 已完成 | P1e 时间、P1f 统计 | utimensat/futimens、真实 statfs、原始静态/动态 entry 与 BusyBox pwd/cd/mv/touch 已通过 |
 | 本批之后 | P2a robust-list 与取消异常 | 先闭环真实程序的退出语义，再推进 P4a 共享匿名、共享 futex 和文件映射 |
 | 持续支线 | P5a glibc 试跑、L0/L1 第二架构入口 | 可现在固定输入或调查边界，不以全量清单全绿为前提 |
 | 后续 | P3c/e 记录锁与 SQLite、N socket、P4 文件共享、P6 SMP | 按下述具体依赖进入，不按测试名称排接口 |
@@ -46,7 +48,7 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 
 ## P0：固定证据与时序问题
 
-**入口**：`tests/program-inventory/{inputs.json,run.py,suites.py,reports.py}`、`tests/diff-abi/`、`.github/workflows/ci.yml`、[程序清单](learning/user-program-inventory.md)。最近 228 项记录为 215 一致、10 个直接 entry 退出不符、3 个包装失败；静态/动态和脚本重叠不重复计算缺陷。
+**入口**：`tests/program-inventory/{inputs.json,run.py,suites.py,reports.py}`、`tests/diff-abi/`、`.github/workflows/ci.yml`、[程序清单](learning/user-program-inventory.md)。2026-09-22 最近 228 项记录为 221 一致、4 个直接 entry 退出不符、3 个包装失败；静态/动态和脚本重叠不重复计算缺陷。
 
 ### P0c 时序根因闭环
 
@@ -58,7 +60,7 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 ### P0d 持续证据与清单维护
 
 - [x] 本轮证据保留工作树内核、ELF/loader、fixture、runner、QEMU 与固定 Linux/BusyBox/libc-test 身份；旧基线只保留历史定位用途。
-- [x] 原七类直接失败按设备/身份、cwd、时间设置、文件系统统计、robust、socket 聚类；设备两类已关闭，剩余五类保留原始日志与最小复现归属，不按非零退出码猜 syscall。
+- [x] 原七类直接失败按设备/身份、cwd、时间设置、文件系统统计、robust、socket 聚类；设备、cwd、显式时间和统计已关闭；直接 entry 只剩 robust/socket，保留原始日志与最小复现归属，不按非零退出码猜 syscall。
 - [x] 已有硬回归严格通过；能力清单如实保存缺口。全量严格验收复用 `--require-pass`，不重建状态系统或跳过失败；相关静态/动态 entry、原包装器与 228 项清单均已重跑。
 - [x] 限定集合的 `--require-pass` 只严格判定本次 selection，未选项目保持历史状态或 `not-run`；未知 ID、所选失败/未完成、中断、参考侧失败与全量严格模式均有 runner 回归。
 
@@ -66,13 +68,13 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 
 ## P1：路径、设备与文件元数据
 
-**入口**：[文件模块](modules/kernel-files.md)、[VFS/ext4](modules/vfs-ext4.md)；`include/kernel/{vfs.h,open_file.h,fs_context.h}`、`fs/{vfs.c,open_file.c,fs_context.c}`、`fs/files/{path.c,io.c,table.c,poll.c,epoll.c}`、`kernel/syscall/{file.c,dispatch.c}`。
+**入口**：[文件模块](modules/kernel-files.md)、[VFS/ext4](modules/vfs-ext4.md)；`include/kernel/{vfs.h,open_file.h,fs_context.h}`、`fs/{vfs.c,open_file.c,fs_context.c}`、`fs/files/{path.c,metadata.c,io.c,table.c,poll.c,epoll.c}`、`kernel/syscall/{file.c,dispatch.c}`。
 
 ### P1b 最小对象与操作边界（最小 mount/路径对象路线已完成）
 
 - [x] 文件身份使用 mount+inode，路径对象另持父目录项；OFD 持共享 flags/offset/引用，fd 槽持访问与 CLOEXEC。open→pin/dup/fork→close→末引用回收均有聚焦回归。
 - [x] ext4 适配器提供按目录 inode 查找、按 inode 打开和读链接；字符节点按 `rdev` 选择后端，lwext4 类型未泄露到 task/syscall。普通文件、pipe、epoll 保留统一分派下的各自语义。
-- [x] root/cwd、普通文件、目录和字符节点均持真实引用；unlink/rmdir 后旧对象存活，同名重建获得新 inode，外部引用使卸载返回忙。rename 仍归 P1g。
+- [x] root/cwd、普通文件、目录和字符节点均持真实引用；unlink/rmdir 后旧对象存活，同名重建获得新 inode，外部引用使卸载返回忙。rename 子集已由 P1g 交付。
 - [x] 发布流程按路径→后端→OFD→fd 逐级取得 owner；分配/打开/fd 满与 close/dup/fork/阻塞 pin 有失败和回收检查。ext4 close 失败转交 mount cleanup node，非法释放继续 fatal。
 
 **交付**：一个可复用的 ext4/设备纵向入口及所有权说明；拟新增 `fs/path_walk.c`、`fs/mount.c` 等仅在职责确定时拆分，不要求一次重做 Linux dcache/RCU。
@@ -82,7 +84,7 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 - [x] 统一路径/OFD 后端可打开 `/dev/null`、`/dev/zero`、`/dev/console`；身份来自 ext4 字符节点与 `rdev`，未知设备号返回 `ENXIO`，初始标准 fd 复用 console 实现。
 - [x] null/zero/console 的读写、非阻塞、信号打断、零长度、坏指针、跨页部分 fault、向量与定位 I/O 均由真实 U-mode 或固定 Linux 差分验证。
 - [x] 设备 `st_rdev`、seek、未知 ioctl、poll/epoll、访问模式与 `O_TRUNC` 已核对；OFD pin、dup/fork/close/退出及分配失败回到资源基线。
-- [x] 原静态/动态 `stat`、`syscall_sign_extend` 已通过；后台 sleep+kill 同步重复 20 轮成功。daemon 仍因 cwd 接口缺失而失败，未归入设备完成。
+- [x] 原静态/动态 `stat`、`syscall_sign_extend` 已通过；后台 sleep+kill 同步重复 20 轮成功。daemon 的 cwd 阻塞后由 P1d 解除，P1e/f 收口时静态/动态原始 entry 均已通过；完整 session/TTY 仍归 P2d。
 
 ### P1d cwd 与目录 fd
 
@@ -93,16 +95,16 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 
 ### P1e 显式时间设置
 
-- [ ] 在活 inode 上实现 `utimensat` 与 libc `futimens` 所需入口；复用已有 realtime、relatime 和纳秒编码，不建立旁路时间戳缓存。
-- [ ] 对照固定 Linux 的 NOW/OMIT、空 times、非法纳秒、两项 OMIT、路径/nofollow、fd/dirfd 和权限检查顺序；保留未修改字段，ctime 的变化也必须符合契约。
-- [ ] 覆盖只读挂载、坏指针/跨页导入、无效 fd、不存在路径及真实写失败；明确元数据已变更后 I/O 错误的归属，不伪造回滚或错误成功。
-- [ ] 受控时钟测试与真实 Linux 差分共同验证；重跑原 `utime` 静态/动态及 BusyBox touch，保持 create/read/write/truncate/unlink 时间回归。
+- [x] 在活 inode 上实现 `utimensat` 与 libc `futimens` 所需入口；复用已有 realtime、relatime 和纳秒编码，不建立旁路时间戳缓存。
+- [x] 对照固定 Linux 的 NOW/OMIT、空 times、非法纳秒、两项 OMIT、路径/nofollow、fd/dirfd 和权限检查顺序；保留未修改字段，ctime 的变化也必须符合契约。
+- [x] 覆盖只读挂载、坏指针/跨页导入、无效 fd、不存在路径及真实写失败；明确元数据已变更后 I/O 错误的归属，不伪造回滚或错误成功。
+- [x] 受控时钟测试与真实 Linux 差分共同验证；重跑原 `utime` 静态/动态及 BusyBox touch，保持 create/read/write/truncate/unlink 时间回归。
 
 ### P1f 文件系统统计
 
-- [ ] 从挂载和真实 ext4 superblock/分配状态提供 `statfs/fstatfs`；核对目标架构结构、块大小、块/inode 总量与空闲量、名称限制和只读标志，不返回固定容量数字。
-- [ ] 以 mount 为统计 owner，fd 查询不依赖旧路径重查；定义与正在进行的分配/释放及失败 I/O 的一致性范围。
-- [ ] 对比文件分配/截断/删除前后计数，覆盖 sparse hole 不等于已分配块、只读、坏 fd/用户指针和卸载；重跑原 `statvfs` 两种 entry。
+- [x] 从挂载和真实 ext4 superblock/分配状态提供 `statfs/fstatfs`；核对目标架构结构、块大小、块/inode 总量与空闲量、名称限制和只读标志，不返回固定容量数字。
+- [x] 以 mount 为统计 owner，fd 查询不依赖旧路径重查；定义与正在进行的分配/释放及失败 I/O 的一致性范围。
+- [x] 对比文件分配/截断/删除前后计数，覆盖 sparse hole 不等于已分配块、只读、坏 fd/用户指针和卸载；重跑原 `statvfs` 两种 entry。
 
 ### P1g 链接、rename 与权限相关文件操作
 
@@ -117,7 +119,7 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 - [ ] 多挂载覆盖路径跨越、根和 `..`、挂载点被引用、卸载忙、跨挂载文件操作和失败回滚；设备/内存/磁盘文件各自错误保持所属 owner。
 - [ ] eventfd/timerfd 只在真实消费者提出需求后接统一 OFD，就绪、非阻塞、poll/epoll 和退出回收一起验收；signalfd 另依赖 P2c 队列。
 
-**验证与退出**：先扩展 `tests/riscv/files_main.c` 等现有聚焦入口；拟新增 `tests/userland/path_devices.c`、`tests/diff-abi/path_devices.c`、`tests/diff-abi/file_metadata.c`，接入现有 runner 而非另造测试框架。`make test-files-riscv test-vfs-riscv test-lwext4-host` → `test-userland-riscv`/`test-diff-abi-riscv`。设备、cwd、时间、统计分别解除对应真实程序阻塞，旧 ext4/pipe/epoll/COW/回收不退步；daemon 新出现的 setsid 依赖交给 P2d。
+**验证与退出**：先扩展 `tests/riscv/files_main.c` 等现有聚焦入口；当前入口为 `tests/userland/{namespace.h,metadata.h}` 与 `tests/diff-abi/{devices,namespace,metadata}.c`，均接入现有 runner。`make test-files-riscv test-vfs-riscv test-lwext4-host` → `test-userland-riscv`/`test-diff-abi-riscv`。设备、cwd、时间、统计分别解除对应真实程序阻塞，旧 ext4/pipe/epoll/COW/回收不退步；daemon 新出现的 setsid 依赖交给 P2d。
 
 ## P2：线程、futex、信号与资源
 
@@ -168,7 +170,7 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 
 ### P3a 块设备 flush（已完成）
 
-- [x] 块层已有缓存模式与 flush 回调；VirtIO legacy/modern 在 writeback/writethrough 四种组合通过真实请求测试。`make test-block-host` 验证能力拒绝、错误传播和可复用的易失缓存/稳定镜像故障模型；这不表示 journal 或文件系统恢复完成。
+- [x] 块层已有缓存模式与 flush 回调；VirtIO legacy/modern 在 writeback/writethrough 四种组合通过真实请求测试。`make test-block-host` 验证能力拒绝、错误传播和可复用的易失缓存/稳定镜像故障模型；journal 与文件系统恢复证据另见 P3d。
 
 - [x] 对照固定设备资料定义能力描述、缓存属性和 flush 请求：协商支持、提交、完成、I/O 错误、超时和只读边界；两种 VirtIO MMIO transport 都验证，不能把内存 fence 当介质同步。
 - [x] 定义请求/描述符/bounce buffer 的 owner；超时/reset 后必须确认 DMA 不再访问，才能释放或复用请求内存。不可恢复设备错误由所属设备/mount 保留明确状态。

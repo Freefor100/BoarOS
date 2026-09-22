@@ -47,22 +47,24 @@ unlink 更新子 inode ctime。truncate 在活 inode 修改后更新 mtime/ctime
 `ext4_fs_put_inode_ref()` 标记 inode 所属 metadata block 为 dirty；已修复上游 `ext4_bcache_free()` 即时 flush 忽略 errno 的问题，失败缓冲保留在 mount dirty list，引用 owner 完成转移后向调用层返回真实错误。touch 直接释放目标 inode 引用即可取得提交结果，不再用全量 cache write-back drain；零更新、无时钟和只读访问不为本次 touch 新增 flush。truncate 和普通写入在建立完整内存分配关系前固定本次修改的缓冲，收尾只提交本次集合，防止位图 I/O 失败中断在块尚无 inode owner 的位置。
 
 写侧 touch 错误在数据提交之前返回；读侧 atime 错误按 Linux 规则不改变 read 返回值。
-flush 失败后的 dirty block 由 mount block cache 持有，后续显式 cache flush/unmount 可恢复；
-不把已经释放的 inode 临时引用或 fd 当成重试 owner。内存 inode 已更新不等于磁盘已持久化。
-创建/链接的事务原子性仍需 journal 集成验证；即时错误传播不等于已有崩溃恢复。
+关键 journal/metadata write 或 flush 失败由 mount 保留错误及缓冲 owner，停止后续修改和成功同步承诺；不能清除错误后用卸载重试宣称恢复。只有提交前且尚未改变持久状态的准备失败才安全回滚。重启按 journal/replay 和持久 orphan 恢复，创建/链接/rename 已纳入事务断电验证，见 [VFS 模块](../modules/vfs-ext4.md)。
+
+## 显式设置与检查顺序
+
+固定 Linux 同一 commit 的 `fs/utimes.c` 先复制 times，再对两项 OMIT 直接返回；其他请求先解析目标，再由 `vfs_utimes` 验证纳秒和只读。NULL pathname 与非 AT_FDCWD 是 fd 形式，空字符串/AT_EMPTY_PATH 是路径形式；两者的 flags 与错误顺序不同。`fs/inode.c:timestamp_truncate` 在 seconds 小于等于最小值或大于等于最大值时清零纳秒。VFS 只采样一次 realtime，保证 NOW 与 ctime 相等，OMIT 字段与父目录不变；后端按 inode 更新，删除名字不影响 fd 形式。
+
+musl 的 `futimens` 调用 utimensat(fd,NULL,times,0)。其 `statfs/fstatfs` 包装会先清零用户输出结构，所以验证坏输出指针必须调用 raw syscall，不能把 libc 自身用户态 fault 当作内核 errno。依据为固定 musl 1.2.5 的 `src/stat/{futimens,statvfs}.c`（来源及 SHA-256 见 `references/sources.tsv`）。
 
 ## 验证
 
 ```sh
 make test-files-partial-write-riscv
-make test-lwext4-host
+make test-lwext4-host test-lwext4-metadata-host
 make test-userland-riscv
 make test-diff-abi-riscv
 ```
 
-聚焦文件测试向真实块写回调注入一次 I/O 错误：修改 touch 返回 `-EIO`、数据/offset/size 不推进，
-mount 的 dirty inode 随后实际重新写出并可读回；同时验证零长度写不消费注入的错误。
-该测试在修复前实测返回 1，修复后返回 `-EIO`；同长度 truncate 的 metadata 错误测试则从错误返回 0 修复为 `-EIO`。
+聚焦测试区分用户缓存写入进度与后续同步错误；journal 元数据错误不会被有效 fd 的历史 close 清理覆盖。host 显式时间故障测试验证准备 OOM 保持旧值、实际 write/flush 错误保留 sticky mount、重复重启恢复，并确认只改时间不主动写回无关 inode 数据。
 
 host 测试使用真实 128/256-byte inode ext4 镜像和控制时钟，覆盖未初始化时钟、只读挂载、
 relatime 相等/抑制/满 24 小时、负 epoch、2038/2106 边界、上限截断及纳秒编码；镜像最后经
@@ -73,4 +75,4 @@ relatime 相等/抑制/满 24 小时、负 epoch、2038/2106 边界、上限截�
 原始观察保留全部时间字段及操作前后 CLOCK_REALTIME，不把时间戳归零后比较。
 Linux `current_time()` 可以取 coarse clock，所以操作区间在一次 50ms 等待前开始，
 比较实际变更字段是否落在完整区间内，以及字段相等/relatime 条件是否一致。
-当前未覆盖 mmap 本身的 atime、utimensat、noatime/lazytime 可配置挂载或 SMP 时间更新锁。
+显式 utimensat 差分另保留请求值、NOW/OMIT、纳秒、范围端点、fd/dirfd/nofollow、坏指针与错误优先级。当前未覆盖 mmap 本身的 atime、noatime/lazytime 可配置挂载或 SMP 时间更新锁。

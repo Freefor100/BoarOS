@@ -17,6 +17,8 @@
 #include <sys/mman.h>
 #include <sys/select.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
+#include <sys/vfs.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
 #include <sys/uio.h>
@@ -30,6 +32,7 @@
 #include "timestamps.h"
 #include "sync.h"
 #include "namespace.h"
+#include "metadata.h"
 
 __attribute__((section(".rodata.unlink_test_far"), aligned(4096)))
 const char unlink_far_page[8192] = "UNLINK_DEMAND_FAULT_PAGE_PAYLOAD";
@@ -3084,6 +3087,12 @@ int main(int argc, char **argv)
         return 82;
     }
 
+    int metadata_result = check_explicit_metadata();
+    if (metadata_result) {
+        fprintf(stderr, "metadata check failed: %d errno=%d\n", metadata_result, errno);
+        return 121;
+    }
+    puts("BoarOS: real userland metadata checks ok");
     int namespace_result = check_namespace();
     if (namespace_result) {
         fprintf(stderr, "namespace check failed: %d errno=%d\n", namespace_result, errno);

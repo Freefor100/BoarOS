@@ -108,6 +108,8 @@ struct ext4_mountpoint {
 	int transaction_error;
 	bool transaction_aborted;
 	bool journal_stopped;
+	bool overhead_valid;
+	uint64_t overhead_blocks;
 };
 
 static int ext4_result(int result, int cleanup)
@@ -339,12 +341,12 @@ static void ext4_time_store(struct ext4_inode_ref *ref, size_t base_offset,
     bool extended = ext4_time_has_extra(ref, extra_offset);
     int64_t maximum = extended ? INT64_C(15032385535) : INT32_MAX;
     uint32_t base, extra;
-    if (time.seconds < INT32_MIN) {
+    if (time.seconds <= INT32_MIN) {
         time.seconds = INT32_MIN;
         time.nanoseconds = 0;
-    } else if (time.seconds > maximum) {
+    } else if (time.seconds >= maximum) {
         time.seconds = maximum;
-        time.nanoseconds = 999999999U;
+        time.nanoseconds = 0;
     }
     if (!extended) time.nanoseconds = 0;
     if (!ext4_time_compare(time, ext4_time_load(ref, base_offset, extra_offset)))
@@ -559,6 +561,7 @@ int ext4_mount(const char *dev_name, const char *mount_point,
 			s_mp[i].transaction_error = EOK;
 			s_mp[i].transaction_aborted = false;
 			s_mp[i].journal_stopped = false;
+			s_mp[i].overhead_valid = false;
 			mp = &s_mp[i];
 			break;
 		}
@@ -953,16 +956,34 @@ int ext4_transaction_abort(const char *mount_point, int error)
 int ext4_mount_point_stats(const char *mount_point,
 			   struct ext4_mount_stats *stats)
 {
+	if (!mount_point || !stats) return EINVAL;
 	struct ext4_mountpoint *mp = ext4_get_mount(mount_point);
 
 	if (!mp)
 		return ENOENT;
 
 	EXT4_MP_LOCK(mp);
+	int r = mp->fs.super_replay_required ? EUCLEAN : EOK;
+	if (r == EOK && mp->fs.jbd_journal) r = mp->fs.jbd_journal->error;
+	if (r == EOK && !mp->overhead_valid) {
+		r = ext4_fs_calculate_overhead(&mp->fs, &mp->overhead_blocks);
+		if (r == EOK) mp->overhead_valid = true;
+	}
+	uint64_t total = ext4_sb_get_blocks_cnt(&mp->fs.sb);
+	uint64_t free = ext4_sb_get_free_blocks_cnt(&mp->fs.sb);
+	uint64_t reserved = ((uint64_t)ext4_get32(&mp->fs.sb, reserved_blocks_count_hi) << 32) |
+	                    ext4_get32(&mp->fs.sb, reserved_blocks_count_lo);
+	if (r == EOK && (mp->overhead_blocks > total || free > total - mp->overhead_blocks ||
+	    reserved > total || ext4_get32(&mp->fs.sb, free_inodes_count) >
+	                        ext4_get32(&mp->fs.sb, inodes_count))) r = EUCLEAN;
+	if (r != EOK) { EXT4_MP_UNLOCK(mp); return r; }
 	stats->inodes_count = ext4_get32(&mp->fs.sb, inodes_count);
 	stats->free_inodes_count = ext4_get32(&mp->fs.sb, free_inodes_count);
 	stats->blocks_count = ext4_sb_get_blocks_cnt(&mp->fs.sb);
 	stats->free_blocks_count = ext4_sb_get_free_blocks_cnt(&mp->fs.sb);
+	stats->overhead_blocks = mp->overhead_blocks;
+	stats->reserved_blocks_count = reserved;
+	memcpy(stats->uuid, mp->fs.sb.uuid, sizeof(stats->uuid));
 	stats->block_size = ext4_sb_get_block_size(&mp->fs.sb);
 
 	stats->block_group_count = ext4_block_group_cnt(&mp->fs.sb);
@@ -1025,6 +1046,51 @@ int ext4_file_touch(ext4_file *file, unsigned int fields)
     ext4_file_completed(file, result);
     EXT4_MP_UNLOCK(mp);
     return result;
+}
+
+int ext4_file_set_times(ext4_file *file, unsigned fields,
+                       const struct ext4_timestamp times[3])
+{
+    static const size_t base[3] = {
+        offsetof(struct ext4_inode, access_time),
+        offsetof(struct ext4_inode, modification_time),
+        offsetof(struct ext4_inode, change_inode_time)
+    };
+    static const size_t extra[3] = {
+        offsetof(struct ext4_inode, atime_extra),
+        offsetof(struct ext4_inode, mtime_extra),
+        offsetof(struct ext4_inode, ctime_extra)
+    };
+    if (!file || !file->mp || !file->mp->mounted) return EINVAL;
+    struct ext4_mountpoint *mp = file->mp;
+    struct ext4_inode_ref ref;
+    int r = EOK;
+    EXT4_MP_LOCK(mp);
+    if (fields & ~(EXT4_TIME_ATIME | EXT4_TIME_MTIME | EXT4_TIME_CTIME) ||
+        (fields && !times)) { r = EINVAL; goto Unlock; }
+    for (unsigned i = 0; i < 3; i++) {
+        if ((fields & (1U << i)) && times[i].nanoseconds >= 1000000000U) {
+            r = EINVAL;
+            goto Unlock;
+        }
+    }
+    if (!fields) goto Unlock;
+    if (mp->fs.read_only) { r = EROFS; goto Unlock; }
+    r = ext4_trans_start(mp);
+    if (r != EOK) goto Unlock;
+    r = ext4_fs_get_inode_ref(&mp->fs, file->inode, &ref);
+    if (r == EOK) {
+        for (unsigned i = 0; i < 3; i++)
+            if (fields & (1U << i)) ext4_time_store(&ref, base[i], extra[i], times[i]);
+        r = ext4_fs_put_inode_ref(&ref);
+    }
+    r = ext4_trans_finish(mp, r);
+    ext4_file_completed(file, r);
+Unlock:
+    if (r != EOK && mp->fs.curr_trans && !mp->fs.curr_trans->error)
+        mp->fs.curr_trans->error = r;
+    EXT4_MP_UNLOCK(mp);
+    return r;
 }
 
 /********************************FILE OPERATIONS*****************************/

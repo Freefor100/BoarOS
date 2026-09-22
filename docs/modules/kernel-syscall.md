@@ -35,6 +35,7 @@ enum kernel_syscall_status kernel_syscall_dispatch(
 | epoll_create1/ctl/pwait（20–22）、dup/dup3/fcntl（23–25） | [文件模块](kernel-files.md)：OFD 共享、就绪与生命周期 |
 | getcwd（17）、mkdirat/unlinkat/symlinkat（34–36）、renameat/renameat2（38/276）、chdir/fchdir（49/50）、openat/close（56/57）、readlinkat（78） | [文件模块](kernel-files.md)：路径、flags、dirfd 与错误 |
 | ftruncate（46）、pipe2（59）、getdents64/lseek（61/62）、read/write/readv/writev/pread64（63–67） | [文件模块](kernel-files.md)：部分成功、offset、pin、稀疏文件、pipe 与目录 cookie |
+| statfs/fstatfs（43/44）、utimensat（88） | [文件模块](kernel-files.md)：挂载统计、显式纳秒时间与 fd/nofollow |
 | pselect6/ppoll（72/73）、newfstatat/fstat（79/80） | [文件模块](kernel-files.md)：集合/信号屏蔽、stat 编码和元数据 |
 
 - `clock_gettime` 编号 113、`clock_getres` 编号 114、`gettimeofday` 编号 169、`clock_nanosleep` 编号 115 与 `nanosleep` 编号 101 构成时间族，语义见[内核时间模块](kernel-time.md)。

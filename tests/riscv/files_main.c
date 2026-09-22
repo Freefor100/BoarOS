@@ -851,6 +851,43 @@ static void run_fork_operations(struct kernel_files *parent_files,
     }
 }
 
+static void run_metadata_readonly_operations(struct kernel_files *files,
+                                             const struct kernel_fs_context *fs,
+                                             struct kernel_mm *mm)
+{
+    struct kernel_vfs_timespec times[2] = {{-1, KERNEL_VFS_UTIME_OMIT},
+                                         {-1, KERNEL_VFS_UTIME_OMIT}};
+    struct kernel_linux_statfs stat;
+    int64_t result = -1;
+    if (!write_user_bytes(mm, TEST_USER_BUFFER, times, sizeof(times)) ||
+        kernel_files_utimensat(files, fs, mm, -1, 0, TEST_USER_BUFFER, 123,
+                               &result) != KERNEL_FILES_STATUS_OK || result)
+        fail_files(550U, 0, result);
+    times[0].nanoseconds = 1000000000;
+    times[1].nanoseconds = 1;
+    if (!write_user_bytes(mm, TEST_USER_BUFFER, times, sizeof(times)) ||
+        !write_user_bytes(mm, TEST_USER_PATH, "/data", 6) ||
+        kernel_files_utimensat(files, fs, mm, -1, TEST_USER_PATH, TEST_USER_BUFFER,
+                               0, &result) != KERNEL_FILES_STATUS_OK || result != -KERNEL_EINVAL)
+        fail_files(551U, -KERNEL_EINVAL, result);
+    times[0].nanoseconds = 123;
+    if (!write_user_bytes(mm, TEST_USER_BUFFER, times, sizeof(times)) ||
+        kernel_files_utimensat(files, fs, mm, -1, TEST_USER_PATH, TEST_USER_BUFFER,
+                               0, &result) != KERNEL_FILES_STATUS_OK || result != -KERNEL_EROFS ||
+        kernel_files_utimensat(files, fs, mm, -1, 0, TEST_USER_BUFFER,
+                               0, &result) != KERNEL_FILES_STATUS_OK || result != -KERNEL_EBADF ||
+        kernel_files_utimensat(files, fs, mm, TEST_AT_FDCWD, 0, 0,
+                               0, &result) != KERNEL_FILES_STATUS_OK || result != -KERNEL_EFAULT)
+        fail_files(552U, -KERNEL_EFAULT, result);
+    if (kernel_files_statfs(files, fs, mm, TEST_USER_PATH, TEST_USER_BUFFER,
+                            &result) != KERNEL_FILES_STATUS_OK || result ||
+        !read_user_bytes(mm, TEST_USER_BUFFER, &stat, sizeof(stat)) ||
+        stat.f_type != 0xef53 || stat.f_bsize != 1024 ||
+        stat.f_blocks == 0 || stat.f_bfree > stat.f_blocks ||
+        stat.f_bavail > stat.f_bfree || !(stat.f_flags & 1) || stat.f_namelen != 255)
+        fail_files(553U, 0, result);
+}
+
 static void run_cwd_operations(struct kernel_files *files,
                                const struct kernel_fs_context *fs,
                                struct kernel_mm *mm)
@@ -2986,6 +3023,7 @@ static void run_files_test(const void *dtb)
     use_test_satp = 1;
     run_path_identity_test(&mount, &heap);
 
+    run_metadata_readonly_operations(&files, &fs, &mm);
     run_cwd_operations(&files, &fs, &mm);
     run_shared_handle_operations(&files, &fs, &mm);
     run_fork_operations(&files, &fs, &mm);

@@ -65,5 +65,44 @@ class TimestampTests(unittest.TestCase):
         fresh = packet(before=(91, 0, 90, 0, 90, 0), after=(101, 0, 90, 0, 90, 0))
         self.assertNotEqual(normalize_timestamps(stale), normalize_timestamps(fresh))
 
+
+
+class UtimensTests(unittest.TestCase):
+    @staticmethod
+    def packet(requested=(5, 9, 0, 1073741823), after=(5, 9, 101, 0, 101, 0),
+               before=(90, 0, 90, 0, 90, 0), parent_after=(70, 0) * 3):
+        return struct.pack('<32q', *((100, 0, 102, 0) + requested + before + after +
+                                    (70, 0) * 3 + parent_after)).hex()
+
+    def test_explicit_now_and_clock_coupling(self):
+        from timestamps import normalize_utimens
+        normalize_utimens(self.packet(), 0)
+        for after in ((5, 8, 101, 0, 101, 0), (5, 9, 103, 0, 101, 0),
+                      (5, 9, 101, 1, 101, 0)):
+            with self.assertRaises(ValueError):
+                normalize_utimens(self.packet(after=after), 0)
+
+    def test_failed_or_omitted_fields_cannot_change(self):
+        from timestamps import normalize_utimens
+        old = (90, 0) * 3
+        normalize_utimens(self.packet(after=old), -22)
+        with self.assertRaises(ValueError):
+            normalize_utimens(self.packet(), -22)
+        omitted = (0, 1073741822) * 2
+        normalize_utimens(self.packet(requested=omitted, after=old), 0)
+        with self.assertRaises(ValueError):
+            normalize_utimens(self.packet(requested=omitted), 0)
+        with self.assertRaises(ValueError):
+            normalize_utimens(self.packet(parent_after=(71, 0) * 3), 0)
+
+    def test_clamped_extrema_have_zero_nanoseconds(self):
+        from timestamps import normalize_utimens
+        requested = (-9223372036854775808, 99, 9223372036854775807, 99)
+        normalize_utimens(self.packet(requested=requested,
+            after=(-2147483648, 0, 15032385535, 0, 101, 0)), 0)
+        with self.assertRaises(ValueError):
+            normalize_utimens(self.packet(requested=requested,
+                after=(-2147483648, 0, 15032385535, 999999999, 101, 0)), 0)
+
 if __name__ == '__main__':
     unittest.main()
