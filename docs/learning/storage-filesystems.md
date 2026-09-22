@@ -30,7 +30,7 @@ ELF header、program header 和各个 `PT_LOAD` 位于文件不同偏移。接�
 
 Linux 进程看到的整数 fd 只是文件描述符表的索引。槽内的 descriptor flags（典型例子是 `FD_CLOEXEC`）属于 fd；真正的打开文件描述（open file description）保存文件位置、打开状态和底层文件引用。`dup` 产生两个 fd 指向同一打开文件描述，所以共享 offset；两次 `open` 同一路径则产生两个描述，offset 独立。`fork` 通常复制 fd 表引用而共享打开文件描述，`CLONE_FILES` 才共享整张 fd 表。Exec 不替换文件表，只关闭标记了 `FD_CLOEXEC` 的槽，因此其他 open-file offset 要继续累积。把 offset 直接放进 fd 槽虽然早期简单，却会阻碍这些既定 Linux 语义。
 
-路径解析需要另一组进程状态：根目录、当前工作目录和用于相对路径的目录 fd。Linux `openat` 对绝对路径忽略 dirfd；相对路径的 `AT_FDCWD` 表示从 cwd 开始，其他值必须引用有效目录 fd。BoarOS 当前只有单根 mount、cwd `/` 和 `AT_FDCWD`，但把 fs context 与 fd table 分开，是为了让以后 `CLONE_FS` 与 `CLONE_FILES` 独立控制共享关系，而不是把两类资源固化为同一个对象。
+路径解析需要另一组进程状态：根目录、当前工作目录和用于相对路径的目录 fd。Linux `openat` 对绝对路径忽略 dirfd；相对路径的 `AT_FDCWD` 表示从 cwd 开始，其他值必须引用有效目录 fd。BoarOS 当前只有单根 mount；cwd、目录 fd 和 root 各持活目录项引用。fs context 与 fd table 分开，使 `CLONE_FS` 的 cwd 共享与文件表共享保持独立。
 
 Linux `read` 的返回值不仅取决于磁盘读取结果，还取决于数据实际交付用户空间的程度。若第一字节就无法写入用户 buffer，应返回 `-EFAULT` 且不推进文件位置；若已经复制一段连续前缀，之后 fault 或 I/O 出错，通常返回已复制长度并只推进这部分。用内核 staging buffer 时，不能把“已从文件系统读入”误当成“已交付用户”：open-file offset 必须按 usercopy 成功字节提交。零长度读仍先要求 fd 有效，但不应解引用用户地址。
 
@@ -155,3 +155,13 @@ PID 1 是用户空间生命周期的根。Linux 通常在 init 退出时 panic�
 压力回收和卸载均需先写回脏页；显式 orphan 最后使用者退出后可以直接丢弃缓存，因为该数据已不再有用户 owner。写回时 lwext4 分配可能触发内存压力，必须防止递归回收正在遍历的缓存项。当前用 inode 索引、页面固定与缓存级 writeback 重入保护守住这一生命周期，不增加后台线程。物理分配计数仍读真实 inode；需要验证磁盘块生命周期的用例先 fsync，不能继续假定每次 write 必然触盘。
 
 对非 journal 后端，取消全量 write-back drain 时仍需保留分配过程的提交边界。位图位先设置、inode mapping 后建立；若允许中间 bitmap put 因设备 EIO 返回，会留下没有 inode owner 的分配位。当前操作范围以缓冲内链和引用固定本次修改，待文件操作完成内存所有权关系后提交该集合，并在失败时将缓冲交回 mount dirty list。host 测试注入最终 inode-table、块 bitmap 和无关文件数据块的错误，重试/截断/卸载后由 e2fsck 检查计数与所有权。这是非 journal 正常错误路径保障，不是事务掉电原子性的替代。
+
+## cwd、目录 fd 与 rename 的身份边界
+
+依据固定 Linux `references/linux` commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 `fs/namei.c:filename_renameat2`、`fs/open.c:chdir/fchdir`、`fs/d_path.c:getcwd` 和 `kernel/fork.c:copy_fs`，路径引用代表活对象，名字只是其当前连接。删除目录不会撤销已有目录 fd/cwd；getcwd 需要仍然连接的父链，`.`/`..` 则从持有对象继续解析。rename 覆盖另一个打开文件时，目标的旧 inode 必须继续存活，不能把旧 fd 绑定到源文件。
+
+原临时父链不足以表达父目录改名，因而提升为挂载内共享的活目录项。引用图采用弱注册链和强 parent/node 引用；路径内的 inode handle 不持自身路径，OFD 另持一个路径引用。重命名先预分配新名、取得新 parent 引用，磁盘事务成功后再发布内存变化；后端无法安全提交时，内存身份保持原样，真实日志错误仍由 mount 保存。
+
+PATH_MAX 限制一次输入和符号链接展开，不限制 dirfd 的祖先总长。保留路径形式的 lwext4 修改入口时，需要动态分配完整祖先名缓冲；固定 4096 字节桥接会错误拒绝深目录中的短相对操作。255 字节名称的分隔符位于索引 255，后端扫描必须检查该位置；否则 inode rename 能生成路径接口无法再修改的目录。VFS 深链测试保护这两个边界。
+
+rename 的特殊末分量也有检查顺序：先解析两侧父目录，再处理旧 `.`/`..`/root 的 EBUSY；新特殊分量在 NOREPLACE 下为 EEXIST。先按字符串直接返回 EBUSY 会遮蔽父路径的 ENOENT/ENOTDIR。固定 RV64 Linux 未开启旧 renameat(38)，musl 使用 renameat2(276) 的 flags=0；同 ELF 差分必须采用该原生 ABI，不把测试入口的 ENOSYS 当成改名语义差异。

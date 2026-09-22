@@ -61,6 +61,49 @@ static enum kernel_open_file_status create_open_file(
     return KERNEL_OPEN_FILE_STATUS_OK;
 }
 
+enum kernel_open_file_status kernel_open_file_create_at(
+    struct kernel_heap *heap, struct kernel_vfs_path *start,
+    struct kernel_vfs_path *root, const char *path,
+    enum kernel_open_file_path_operation operation, uint32_t mode,
+    struct kernel_open_file_description **owner, int *linux_result)
+{
+    struct kernel_open_file_description *file;
+    if (!heap || !start || !root || !path || !owner || *owner || !linux_result)
+        return KERNEL_OPEN_FILE_STATUS_INVALID_ARGUMENT;
+    enum kernel_heap_status allocation = kernel_heap_allocate_zeroed(heap,
+                                         1U, sizeof(*file), (void **)&file);
+    if (allocation != KERNEL_HEAP_STATUS_OK) {
+        if (allocation != KERNEL_HEAP_STATUS_EMPTY) return KERNEL_OPEN_FILE_STATUS_STATE;
+        *linux_result = -KERNEL_ENOMEM;
+        return KERNEL_OPEN_FILE_STATUS_OK;
+    }
+    int result;
+    switch (operation) {
+    case KERNEL_OPEN_PATH_CREATE:
+        result = kernel_vfs_create_at(start, root, path, mode, &file->file);
+        break;
+    case KERNEL_OPEN_PATH_EXECUTABLE:
+        result = kernel_vfs_open_executable_at(start, root, path, &file->file);
+        break;
+    case KERNEL_OPEN_PATH_FOLLOW:
+    case KERNEL_OPEN_PATH_NOFOLLOW:
+        result = kernel_vfs_open_at(start, root, path,
+                    operation == KERNEL_OPEN_PATH_FOLLOW, &file->file);
+        break;
+    default: result = -KERNEL_EINVAL; break;
+    }
+    if (result) {
+        if (kernel_heap_release(heap, file) != KERNEL_HEAP_STATUS_OK) __builtin_trap();
+    } else {
+        file->heap = heap;
+        file->references = 1U;
+        file->observed_writeback_error = kernel_vfs_error_sequence(&file->file);
+        *owner = file;
+    }
+    *linux_result = result;
+    return KERNEL_OPEN_FILE_STATUS_OK;
+}
+
 enum kernel_open_file_status kernel_open_file_create(
     struct kernel_heap *heap,
     struct kernel_vfs_mount *mount,

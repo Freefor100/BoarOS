@@ -851,6 +851,45 @@ static void run_fork_operations(struct kernel_files *parent_files,
     }
 }
 
+static void run_cwd_operations(struct kernel_files *files,
+                               const struct kernel_fs_context *fs,
+                               struct kernel_mm *mm)
+{
+    struct kernel_fs_context copied = {0}, shared = {0};
+    int64_t result = -1;
+    char cwd[32];
+    if (!write_user_bytes(mm, TEST_USER_PATH, "/lost+found", 12U) ||
+        kernel_fs_context_fork(&copied, fs) != KERNEL_FS_CONTEXT_STATUS_OK ||
+        kernel_fs_context_acquire(&shared, fs) != KERNEL_FS_CONTEXT_STATUS_OK ||
+        kernel_files_chdir(files, &shared, mm, TEST_USER_PATH, &result) !=
+            KERNEL_FILES_STATUS_OK || result ||
+        kernel_files_getcwd(files, fs, mm, TEST_USER_BUFFER, sizeof(cwd), &result) !=
+            KERNEL_FILES_STATUS_OK || result != 12 ||
+        !read_user_bytes(mm, TEST_USER_BUFFER, cwd, 12) ||
+        strcmp(cwd, "/lost+found") ||
+        kernel_files_getcwd(files, &copied, mm, TEST_USER_BUFFER, sizeof(cwd), &result) !=
+            KERNEL_FILES_STATUS_OK || result != 2 ||
+        !read_user_bytes(mm, TEST_USER_BUFFER, cwd, 2) || strcmp(cwd, "/"))
+        fail_files(540U, 0, result);
+    expect_open(files, fs, mm, TEST_AT_FDCWD, "../data", 0U, 0, 541U);
+    expect_open(files, fs, mm, 0, "data", 0U, -KERNEL_ENOTDIR, 542U);
+    if (kernel_files_close(files, 0, &result) != KERNEL_FILES_STATUS_OK || result)
+        fail_files(543U, 0, result);
+    expect_open(files, fs, mm, TEST_AT_FDCWD, ".", TEST_O_DIRECTORY, 0, 544U);
+    expect_open(files, fs, mm, 0, "../data", 0U, 1, 545U);
+    if (kernel_files_close(files, 1, &result) != KERNEL_FILES_STATUS_OK || result ||
+        kernel_files_getcwd(files, fs, mm, TEST_USER_BUFFER, 1, &result) !=
+            KERNEL_FILES_STATUS_OK || result != -KERNEL_ERANGE ||
+        kernel_files_fchdir(files, &copied, 0, &result) != KERNEL_FILES_STATUS_OK || result ||
+        kernel_files_getcwd(files, &copied, mm, TEST_USER_BUFFER, sizeof(cwd), &result) !=
+            KERNEL_FILES_STATUS_OK || result != 12 ||
+        kernel_fs_context_set_cwd(fs, kernel_fs_context_root(fs)) ||
+        kernel_files_close(files, 0, &result) != KERNEL_FILES_STATUS_OK || result ||
+        kernel_fs_context_release(&copied) != KERNEL_FS_CONTEXT_STATUS_OK ||
+        kernel_fs_context_release(&shared) != KERNEL_FS_CONTEXT_STATUS_OK)
+        fail_files(546U, 0, result);
+}
+
 static void run_shared_handle_operations(
     struct kernel_files *files,
     const struct kernel_fs_context *fs,
@@ -1652,7 +1691,9 @@ static void run_seek_stat_operations(struct kernel_files *files,
                              stat_buffer,
                              KERNEL_FILES_AT_EMPTY_PATH,
                              &result) != KERNEL_FILES_STATUS_OK ||
-        result != -KERNEL_EBADF ||
+        result != 0 ||
+        !read_user_bytes(mm, stat_buffer, &stat, sizeof(stat)) ||
+        (stat.st_mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFDIR ||
         kernel_files_fstatat(files,
                              fs,
                              mm,
@@ -2945,6 +2986,7 @@ static void run_files_test(const void *dtb)
     use_test_satp = 1;
     run_path_identity_test(&mount, &heap);
 
+    run_cwd_operations(&files, &fs, &mm);
     run_shared_handle_operations(&files, &fs, &mm);
     run_fork_operations(&files, &fs, &mm);
     if (kernel_files_release(&files) != KERNEL_FILES_STATUS_OK) {

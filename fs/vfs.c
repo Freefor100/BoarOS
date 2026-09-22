@@ -56,67 +56,6 @@ static int path_to_backend_name(const struct kernel_vfs_path *path,
                                 const char *missing_name,
                                 char *buffer, size_t capacity);
 
-static int resolve_path(struct kernel_vfs_mount *mount,
-                        struct kernel_heap *heap,
-                        const char *input,
-                        int follow_final,
-                        int allow_missing_final,
-                        int allow_missing_trailing,
-                        int follow_trailing_final,
-                        char **work_owner,
-                        uint32_t *final_mode)
-{
-    struct kernel_vfs_path *root = 0;
-    struct kernel_vfs_path *resolved = 0;
-    struct kernel_vfs_stat stat;
-    char missing_name[256] = {0};
-    enum kernel_heap_status allocation;
-    int result;
-
-    if (mount == 0 || mount->state != VFS_MOUNT_STATE_LIVE ||
-        mount->private_data == 0 || heap == 0 || input == 0 ||
-        input[0] != '/' || work_owner == 0 || *work_owner != 0 ||
-        final_mode == 0)
-        return -KERNEL_EINVAL;
-    allocation = kernel_heap_allocate(heap, 3U * KERNEL_FS_PATH_MAX,
-                                       (void **)work_owner);
-    if (allocation != KERNEL_HEAP_STATUS_OK) {
-        if (allocation != KERNEL_HEAP_STATUS_EMPTY) __builtin_trap();
-        return -KERNEL_ENOMEM;
-    }
-    result = kernel_vfs_path_root(mount, heap, &root);
-    if (result == 0)
-        result = resolve_object(root, root, input, follow_final,
-                                allow_missing_final,
-                                allow_missing_trailing,
-                                follow_trailing_final, &resolved,
-                                missing_name);
-    if (result == 0 && missing_name[0] == '\0') {
-        result = kernel_vfs_path_stat(resolved, &stat);
-        if (result == 0) *final_mode = stat.mode;
-    } else if (result == 0) {
-        *final_mode = 0U;
-    }
-    if (result == 0)
-        result = path_to_backend_name(resolved, missing_name,
-                     *work_owner + KERNEL_FS_PATH_MAX, KERNEL_FS_PATH_MAX);
-    if (resolved != 0 && kernel_vfs_path_release(&resolved) != 0 &&
-        result == 0) result = -KERNEL_EIO;
-    if (root != 0 && kernel_vfs_path_release(&root) != 0 &&
-        result == 0) result = -KERNEL_EIO;
-    if (result != 0) {
-        if (kernel_heap_release(heap, *work_owner) != KERNEL_HEAP_STATUS_OK)
-            __builtin_trap();
-        *work_owner = 0;
-    }
-    return result;
-}
-
-static const char *resolved_path(const char *work)
-{
-    return work + KERNEL_FS_PATH_MAX;
-}
-
 static void release_path(struct kernel_heap *heap, char *work)
 {
     if (kernel_heap_release(heap, work) != KERNEL_HEAP_STATUS_OK)
@@ -140,6 +79,7 @@ struct lwext4_mount_adapter {
     struct kernel_vfs_node *nodes;
     struct kernel_vfs_node *cleanup_nodes;
     struct lwext4_orphan *orphans;
+    struct kernel_vfs_path *paths; /* Weak registry; live callers own references. */
     uint32_t external_files;
     uint8_t registered;
     uint8_t mounted;
@@ -202,9 +142,31 @@ struct kernel_vfs_path {
     struct kernel_vfs_file file;
     struct kernel_heap *heap;
     struct kernel_vfs_path *parent;
+    struct kernel_vfs_path *next;
+    struct kernel_vfs_path **previous;
     uint32_t references;
-    char name[1];
+    uint8_t detached;
+    char *name;
+    char initial_name[];
 };
+
+static void register_path(struct kernel_vfs_path *path)
+{
+    struct lwext4_mount_adapter *adapter = path->file.mount->private_data;
+    path->next = adapter->paths;
+    path->previous = &adapter->paths;
+    if (path->next) path->next->previous = &path->next;
+    adapter->paths = path;
+}
+
+static void unregister_path(struct kernel_vfs_path *path)
+{
+    if (!path->previous || *path->previous != path) __builtin_trap();
+    *path->previous = path->next;
+    if (path->next) path->next->previous = path->previous;
+    path->next = 0;
+    path->previous = 0;
+}
 
 static int path_to_backend_name(const struct kernel_vfs_path *path,
                                 const char *missing_name,
@@ -228,6 +190,9 @@ static int path_to_backend_name(const struct kernel_vfs_path *path,
         buffer[--position] = '/';
     }
     while (cursor->parent != 0) {
+        if (cursor->detached ||
+            ((struct kernel_vfs_node *)cursor->file.private_data)->unlinked)
+            return -KERNEL_ENOENT;
         length = strlen(cursor->name);
         if (length == 0U || length >= position)
             return -KERNEL_ENAMETOOLONG;
@@ -281,8 +246,6 @@ int kernel_vfs_path_lookup(struct kernel_vfs_path *parent,
     if (name_length > 255U) return -KERNEL_ENAMETOOLONG;
     if ((parent->file.mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFDIR)
         return -KERNEL_ENOTDIR;
-    if (((struct kernel_vfs_node *)parent->file.private_data)->unlinked)
-        return -KERNEL_ENOENT;
     if (name_length == 1U && name[0] == '.') {
         result = kernel_vfs_path_acquire(parent);
         if (result == 0) *owner = parent;
@@ -295,17 +258,34 @@ int kernel_vfs_path_lookup(struct kernel_vfs_path *parent,
         if (result == 0) *owner = ancestor;
         return result;
     }
+    if (((struct kernel_vfs_node *)parent->file.private_data)->unlinked)
+        return -KERNEL_ENOENT;
     for (size_t i = 0; i < name_length; i++)
         if (name[i] == '/' || name[i] == '\0') return -KERNEL_EINVAL;
     mount = parent->file.mount;
     if (mount == 0 || mount->private_data == 0) return -KERNEL_EINVAL;
     adapter = mount->private_data;
+    result = mount_error(adapter);
+    if (result != EOK) return lwext4_error(result);
     result = ext4_lookup_child(LWEXT4_MOUNT_POINT,
                                (uint32_t)kernel_vfs_path_inode(parent),
                                name, (uint32_t)name_length, &inode, &mode);
     if (result != EOK) return lwext4_error(result);
+    for (child = adapter->paths; child != 0; child = child->next) {
+        if (!child->detached && child->parent == parent &&
+            strlen(child->name) == name_length &&
+            !memcmp(child->name, name, name_length)) {
+            if (kernel_vfs_path_inode(child) != inode) {
+                child->detached = 1U;
+                continue;
+            }
+            result = kernel_vfs_path_acquire(child);
+            if (result == 0) *owner = child;
+            return result;
+        }
+    }
     allocation = kernel_heap_allocate_zeroed(adapter->heap, 1U,
-                    sizeof(*child) + name_length, (void **)&child);
+                    sizeof(*child) + name_length + 1U, (void **)&child);
     if (allocation != KERNEL_HEAP_STATUS_OK)
         return allocation == KERNEL_HEAP_STATUS_EMPTY ? -KERNEL_ENOMEM
                                                       : -KERNEL_EIO;
@@ -327,8 +307,10 @@ int kernel_vfs_path_lookup(struct kernel_vfs_path *parent,
             KERNEL_HEAP_STATUS_OK) __builtin_trap();
         return result;
     }
+    child->name = child->initial_name;
     memcpy(child->name, name, name_length);
     child->name[name_length] = '\0';
+    register_path(child);
     *owner = child;
     return 0;
 }
@@ -488,9 +470,18 @@ int kernel_vfs_path_root(struct kernel_vfs_mount *mount,
     uint32_t mode;
     int result;
 
-    if (mount == 0 || heap == 0 || owner == 0 || *owner != 0)
+    if (mount == 0 || mount->private_data == 0 ||
+        heap == 0 || owner == 0 || *owner != 0)
         return -KERNEL_EINVAL;
-    allocation = kernel_heap_allocate_zeroed(heap, 1U, sizeof(*path),
+    struct lwext4_mount_adapter *adapter = mount->private_data;
+    for (path = adapter->paths; path != 0; path = path->next) {
+        if (path->parent == 0) {
+            result = kernel_vfs_path_acquire(path);
+            if (result == 0) *owner = path;
+            return result;
+        }
+    }
+    allocation = kernel_heap_allocate_zeroed(heap, 1U, sizeof(*path) + 2U,
                                               (void **)&path);
     if (allocation != KERNEL_HEAP_STATUS_OK)
         return allocation == KERNEL_HEAP_STATUS_EMPTY ? -KERNEL_ENOMEM
@@ -506,7 +497,9 @@ int kernel_vfs_path_root(struct kernel_vfs_mount *mount,
     }
     path->heap = heap;
     path->references = 1U;
+    path->name = path->initial_name;
     path->name[0] = '/';
+    register_path(path);
     *owner = path;
     return 0;
 }
@@ -541,9 +534,12 @@ int kernel_vfs_path_release(struct kernel_vfs_path **owner)
         /* Real backend close failures transfer to the mount cleanup list in
          * kernel_vfs_node_release.  Any remaining close error is an ownership
          * invariant violation, not a retryable path-release result. */
+        unregister_path(path);
         if (kernel_vfs_close(&path->file) != 0) __builtin_trap();
         parent = path->parent;
         path->references = 0U;
+        if (path->name != path->initial_name)
+            (void)kernel_heap_release(path->heap, path->name);
         if (kernel_heap_release(path->heap, path) !=
             KERNEL_HEAP_STATUS_OK) __builtin_trap();
         path = parent;
@@ -1057,7 +1053,7 @@ static int vfs_open_raw(struct kernel_vfs_mount *mount,
     for (existing = adapter->nodes;
          existing != 0;
          existing = existing->next) {
-        if (existing->file.inode == node->file.inode && !existing->unlinked) {
+        if (existing->file.inode == node->file.inode && !existing->orphan_freed) {
             break;
         }
     }
@@ -1110,34 +1106,65 @@ static int vfs_open_inode_raw(struct kernel_vfs_mount *mount,
     return vfs_open_raw(mount, 0, inode, mode, file);
 }
 
+int kernel_vfs_path_string(const struct kernel_vfs_path *path,
+                           const struct kernel_vfs_path *root,
+                           char *buffer, size_t capacity)
+{
+    if (!path || !root || path->file.mount != root->file.mount)
+        return -KERNEL_EINVAL;
+    /* This stage has one mount and no chroot; refuse a foreign root. */
+    if (root->parent) return -KERNEL_EINVAL;
+    if (capacity < 2U) return -KERNEL_ERANGE;
+    int result = path_to_backend_name(path, 0, buffer, capacity);
+    return result == -KERNEL_ENAMETOOLONG ? -KERNEL_ERANGE : result;
+}
+
+int kernel_vfs_path_open(struct kernel_vfs_path *path,
+                         struct kernel_vfs_file *file)
+{
+    if (!path || !file || file->path) return -KERNEL_EINVAL;
+    int result = kernel_vfs_path_acquire(path);
+    if (result) return result;
+    result = vfs_open_inode_raw(path->file.mount,
+              (uint32_t)kernel_vfs_path_inode(path), path->file.mode, file);
+    if (result) (void)kernel_vfs_path_release(&path);
+    else file->path = path;
+    return result;
+}
+
+int kernel_vfs_open_at(struct kernel_vfs_path *start,
+                       struct kernel_vfs_path *root, const char *path,
+                       int follow_final, struct kernel_vfs_file *file)
+{
+    struct kernel_vfs_path *resolved = 0;
+    int result = kernel_vfs_path_resolve(start, root, path, follow_final,
+                                        &resolved);
+    if (!result) {
+        result = (resolved->file.mode & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFLNK
+                     ? -KERNEL_ELOOP : kernel_vfs_path_open(resolved, file);
+        (void)kernel_vfs_path_release(&resolved);
+    }
+    return result;
+}
+
+static int mount_root_path(struct kernel_vfs_mount *mount,
+                            struct kernel_vfs_path **root)
+{
+    if (!mount || !mount->private_data) return -KERNEL_EINVAL;
+    return kernel_vfs_path_root(mount,
+               ((struct lwext4_mount_adapter *)mount->private_data)->heap, root);
+}
+
 static int vfs_open_resolved(struct kernel_vfs_mount *mount,
                              const char *path,
                              struct kernel_vfs_file *file,
                              int follow_final)
 {
-    struct lwext4_mount_adapter *adapter;
     struct kernel_vfs_path *root = 0;
-    struct kernel_vfs_path *resolved = 0;
-    int result;
-
-    if (mount == 0 || mount->private_data == 0) return -KERNEL_EINVAL;
-    adapter = mount->private_data;
-    result = kernel_vfs_path_root(mount, adapter->heap, &root);
-    if (result != 0) return result;
-    result = kernel_vfs_path_resolve(root, root, path, follow_final,
-                                     &resolved);
-    if (result == 0) {
-        if ((resolved->file.mode & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFLNK)
-            result = -KERNEL_ELOOP;
-        else
-            result = vfs_open_inode_raw(mount,
-                     (uint32_t)kernel_vfs_path_inode(resolved),
-                     resolved->file.mode, file);
-        if (kernel_vfs_path_release(&resolved) != 0 && result == 0)
-            result = -KERNEL_EIO;
-    }
-    if (kernel_vfs_path_release(&root) != 0 && result == 0)
-        result = -KERNEL_EIO;
+    int result = mount_root_path(mount, &root);
+    if (result) return result;
+    result = kernel_vfs_open_at(root, root, path, follow_final, file);
+    (void)kernel_vfs_path_release(&root);
     return result;
 }
 
@@ -1185,16 +1212,18 @@ static int vfs_create_raw(struct kernel_vfs_mount *mount,
                    -KERNEL_ENOMEM : -KERNEL_EIO;
     }
 
-    result = ext4_fopen2(&node->file, path, O_CREAT | O_RDWR);
-    if (result != EOK) {
-        (void)kernel_heap_release(adapter->heap, node);
-        return lwext4_error(result);
+    result = ext4_transaction_begin(LWEXT4_MOUNT_POINT);
+    if (result == EOK) {
+        result = ext4_fopen2(&node->file, path, O_CREAT | O_RDWR);
+        if (result == EOK)
+            result = ext4_mode_set(path, (mode & 07777U) | KERNEL_VFS_S_IFREG);
+        if (result == EOK) result = ext4_transaction_end(LWEXT4_MOUNT_POINT);
+        else (void)ext4_transaction_abort(LWEXT4_MOUNT_POINT, result);
     }
-    result = ext4_mode_set(path, (mode & 07777U) | KERNEL_VFS_S_IFREG);
     if (result != EOK) {
-        int close_result = ext4_fclose(&node->file);
-        (void)ext4_fremove(path);
-        if (close_result != EOK) {
+        /* This unopened owner has no data or mapping; the mount owns any
+         * uncertain journal state. An aborted create must not unlink by name. */
+        if (node->file.mp && ext4_fclose(&node->file) != EOK) {
             node->adapter = adapter;
             node->next = adapter->cleanup_nodes;
             adapter->cleanup_nodes = node;
@@ -1207,7 +1236,7 @@ static int vfs_create_raw(struct kernel_vfs_mount *mount,
     for (existing = adapter->nodes;
          existing != 0;
          existing = existing->next) {
-        if (existing->file.inode == node->file.inode && !existing->unlinked) {
+        if (existing->file.inode == node->file.inode && !existing->orphan_freed) {
             break;
         }
     }
@@ -1264,42 +1293,117 @@ static int vfs_create_raw(struct kernel_vfs_mount *mount,
     return 0;
 }
 
-int kernel_vfs_create(struct kernel_vfs_mount *mount,
-                      const char *path,
-                      uint32_t mode,
-                      struct kernel_vfs_file *file)
+/* Keep the resolved identity alive until namespace mutation has committed. */
+static int mutation_path(struct kernel_vfs_path *start,
+                          struct kernel_vfs_path *root, const char *input,
+                          int follow, int missing, int trailing,
+                          int follow_trailing, struct kernel_vfs_path **path,
+                          char missing_name[256], char **backend)
 {
-    struct lwext4_mount_adapter *adapter;
-    char *work = 0;
-    uint32_t found_mode;
-    int result;
-
-    if (mount == 0 || mount->private_data == 0) return -KERNEL_EINVAL;
-    adapter = mount->private_data;
-    result = resolve_path(mount, adapter->heap, path, 1, 1, 0, 1,
-                          &work, &found_mode);
-    if (result != 0) {
-        size_t length = path != 0 ? strlen(path) : 0U;
-        if (result == -KERNEL_ENOENT && length > 1U &&
-            path[length - 1U] == '/')
-            return -KERNEL_EISDIR;
-        return result;
+    if (!start || !root || !input) return -KERNEL_EINVAL;
+    struct kernel_heap *heap = start->heap;
+    int result = resolve_object(start, root, input, follow, missing, trailing,
+                                follow_trailing, path, missing_name);
+    if (result) return result;
+    /* PATH_MAX constrains the supplied path, not a dirfd's ancestry. The
+     * pathname-only backend bridge needs the full current ancestor chain. */
+    size_t capacity = 2U;
+    for (const struct kernel_vfs_path *cursor = *path; cursor->parent;
+         cursor = cursor->parent) {
+        if (cursor->detached ||
+            ((struct kernel_vfs_node *)cursor->file.private_data)->unlinked) {
+            result = -KERNEL_ENOENT;
+            goto Finish;
+        }
+        size_t length = strlen(cursor->name) + 1U;
+        if (length > SIZE_MAX - capacity) { result = -KERNEL_ENOMEM; goto Finish; }
+        capacity += length;
     }
-    if (found_mode != 0U) {
-        result = -KERNEL_EEXIST;
-    } else {
-        result = vfs_create_raw(mount, resolved_path(work), mode, file);
+    size_t length = strlen(missing_name) + 1U;
+    if (length > SIZE_MAX - capacity) { result = -KERNEL_ENOMEM; goto Finish; }
+    capacity += length;
+    enum kernel_heap_status status = kernel_heap_allocate(heap, capacity,
+                                                           (void **)backend);
+    if (status != KERNEL_HEAP_STATUS_OK) {
+        result = status == KERNEL_HEAP_STATUS_EMPTY ? -KERNEL_ENOMEM : -KERNEL_EIO;
+        goto Finish;
     }
-    release_path(adapter->heap, work);
+    result = path_to_backend_name(*path, missing_name, *backend, capacity);
+Finish:
+    if (result) {
+        (void)kernel_vfs_path_release(path);
+        if (*backend) release_path(heap, *backend);
+        *backend = 0;
+    }
     return result;
 }
 
-int kernel_vfs_open_executable(struct kernel_vfs_mount *mount,
-                               const char *path,
-                               struct kernel_vfs_file *file)
+int kernel_vfs_create_at(struct kernel_vfs_path *start,
+                         struct kernel_vfs_path *root, const char *input,
+                         uint32_t mode, struct kernel_vfs_file *file)
 {
-    int result = kernel_vfs_open(mount, path, file);
+    struct kernel_vfs_path *parent = 0, *child = 0;
+    char name[256] = {0};
+    char *backend = 0;
+    if (!start || !file || file->state || file->private_data || file->path)
+        return -KERNEL_EINVAL;
+    int result = mutation_path(start, root, input, 1, 1, 0, 1,
+                                &parent, name, &backend);
+    if (result) {
+        size_t length = input ? strlen(input) : 0U;
+        return result == -KERNEL_ENOENT && length && input[length - 1U] == '/'
+                   ? -KERNEL_EISDIR : result;
+    }
+    if (!name[0]) { result = -KERNEL_EEXIST; goto Finish; }
+    enum kernel_heap_status allocation = kernel_heap_allocate_zeroed(
+        start->heap, 1U, sizeof(*child) + strlen(name) + 1U, (void **)&child);
+    if (allocation != KERNEL_HEAP_STATUS_OK) {
+        result = allocation == KERNEL_HEAP_STATUS_EMPTY ? -KERNEL_ENOMEM
+                                                        : -KERNEL_EIO;
+        goto Finish;
+    }
+    /* Reserve the path and its parent reference before creating disk state. */
+    child->heap = start->heap;
+    child->parent = parent;
+    parent = 0;
+    child->references = 1U;
+    child->name = child->initial_name;
+    memcpy(child->name, name, strlen(name) + 1U);
+    result = vfs_create_raw(start->file.mount, backend, mode, file);
+    if (!result) {
+        struct kernel_vfs_node *node = file->private_data;
+        struct lwext4_mount_adapter *adapter = file->mount->private_data;
+        child->file = *file;
+        node->references++;
+        node->open_files++;
+        adapter->external_files++;
+        file->path = child;
+        register_path(child);
+        child = 0;
+    }
+Finish:
+    if (child) {
+        (void)kernel_vfs_path_release(&child->parent);
+        release_path(child->heap, (char *)child);
+    }
+    if (parent) (void)kernel_vfs_path_release(&parent);
+    release_path(start->heap, backend);
+    return result;
+}
 
+int kernel_vfs_create(struct kernel_vfs_mount *mount, const char *path,
+                      uint32_t mode, struct kernel_vfs_file *file)
+{
+    struct kernel_vfs_path *root = 0;
+    int result = mount_root_path(mount, &root);
+    if (result) return result;
+    result = kernel_vfs_create_at(root, root, path, mode, file);
+    (void)kernel_vfs_path_release(&root);
+    return result;
+}
+
+static int finish_executable_open(struct kernel_vfs_file *file, int result)
+{
     if (result == -KERNEL_EISDIR) {
         return -KERNEL_EACCES;
     }
@@ -1325,6 +1429,20 @@ int kernel_vfs_open_executable(struct kernel_vfs_mount *mount,
     node->exec_users++;
     file->exec_lease = 1U;
     return 0;
+}
+
+int kernel_vfs_open_executable(struct kernel_vfs_mount *mount,
+                               const char *path, struct kernel_vfs_file *file)
+{
+    return finish_executable_open(file, kernel_vfs_open(mount, path, file));
+}
+
+int kernel_vfs_open_executable_at(struct kernel_vfs_path *start,
+                                  struct kernel_vfs_path *root,
+                                  const char *path, struct kernel_vfs_file *file)
+{
+    return finish_executable_open(file, kernel_vfs_open_at(start, root, path,
+                                                           1, file));
 }
 
 int kernel_vfs_file_acquire_write(struct kernel_vfs_file *file)
@@ -1631,6 +1749,8 @@ int kernel_vfs_close(struct kernel_vfs_file *file)
         return -KERNEL_EINVAL;
     }
     node = file->private_data;
+    if (file->path && kernel_vfs_path_release(&file->path) != 0)
+        __builtin_trap();
     if (file->write_lease != 0U) {
         if (node->write_openers > 0U) {
             node->write_openers--;
@@ -1795,27 +1915,27 @@ int kernel_vfs_fstat(const struct kernel_vfs_file *file,
     return 0;
 }
 
-int kernel_vfs_stat_path(struct kernel_vfs_mount *mount,
-                         const char *path,
-                         int follow_final,
-                         struct kernel_vfs_stat *stat)
+int kernel_vfs_stat_at(struct kernel_vfs_path *start,
+                       struct kernel_vfs_path *root, const char *path,
+                       int follow_final, struct kernel_vfs_stat *stat)
 {
-    struct kernel_vfs_path *root = 0;
     struct kernel_vfs_path *resolved = 0;
-    int result;
-
-    if (mount == 0 || mount->private_data == 0 || stat == 0)
-        return -KERNEL_EINVAL;
-    result = kernel_vfs_path_root(mount,
-                 ((struct lwext4_mount_adapter *)mount->private_data)->heap,
-                 &root);
-    if (result != 0) return result;
-    result = kernel_vfs_path_resolve(root, root, path, follow_final,
-                                     &resolved);
-    if (result == 0) {
-        result = kernel_vfs_fstat(&resolved->file, stat);
+    int result = kernel_vfs_path_resolve(start, root, path, follow_final,
+                                         &resolved);
+    if (!result) {
+        result = kernel_vfs_path_stat(resolved, stat);
         (void)kernel_vfs_path_release(&resolved);
     }
+    return result;
+}
+
+int kernel_vfs_stat_path(struct kernel_vfs_mount *mount, const char *path,
+                         int follow_final, struct kernel_vfs_stat *stat)
+{
+    struct kernel_vfs_path *root = 0;
+    int result = mount_root_path(mount, &root);
+    if (result) return result;
+    result = kernel_vfs_stat_at(root, root, path, follow_final, stat);
     (void)kernel_vfs_path_release(&root);
     return result;
 }
@@ -1836,15 +1956,14 @@ static int vfs_mkdir_raw(struct kernel_vfs_mount *mount,
         return -KERNEL_EROFS;
     }
 
+    result = ext4_transaction_begin(LWEXT4_MOUNT_POINT);
+    if (result != EOK) return lwext4_error(result);
     result = ext4_dir_mk(path);
-    if (result != EOK) {
-        return lwext4_error(result);
-    }
-    result = ext4_mode_set(path, (mode & 07777U) | KERNEL_VFS_S_IFDIR);
-    if (result != EOK) {
-        (void)ext4_dir_rm(path);
-        return lwext4_error(result);
-    }
+    if (result == EOK)
+        result = ext4_mode_set(path, (mode & 07777U) | KERNEL_VFS_S_IFDIR);
+    if (result == EOK) result = ext4_transaction_end(LWEXT4_MOUNT_POINT);
+    else (void)ext4_transaction_abort(LWEXT4_MOUNT_POINT, result);
+    if (result != EOK) return lwext4_error(result);
     return 0;
 }
 
@@ -1904,31 +2023,6 @@ static int vfs_unlink_raw(struct kernel_vfs_mount *mount,
     return 0;
 }
 
-static int check_directory_empty(const char *path)
-{
-    ext4_dir directory;
-    const ext4_direntry *entry;
-    int result;
-
-    result = ext4_dir_open(&directory, path);
-    if (result != EOK) {
-        return lwext4_error(result);
-    }
-    while ((entry = ext4_dir_entry_next(&directory)) != 0) {
-        if (entry->name_length == 1U && entry->name[0] == '.') {
-            continue;
-        }
-        if (entry->name_length == 2U && entry->name[0] == '.' &&
-            entry->name[1] == '.') {
-            continue;
-        }
-        (void)ext4_dir_close(&directory);
-        return -KERNEL_ENOTEMPTY;
-    }
-    (void)ext4_dir_close(&directory);
-    return 0;
-}
-
 static int vfs_rmdir_raw(struct kernel_vfs_mount *mount,
                          const char *path)
 {
@@ -1955,10 +2049,6 @@ static int vfs_rmdir_raw(struct kernel_vfs_mount *mount,
         return -KERNEL_ENOTDIR;
     }
 
-    result = check_directory_empty(path);
-    if (result != 0) {
-        return result;
-    }
     result = reserve_orphan(adapter, &orphan);
     if (result != 0) return result;
     result = ext4_fdir_unlink_dentry(path, &inode);
@@ -1986,114 +2076,125 @@ static int vfs_rmdir_raw(struct kernel_vfs_mount *mount,
     return 0;
 }
 
-int kernel_vfs_mkdir(struct kernel_vfs_mount *mount,
-                     const char *path,
+int kernel_vfs_mkdir_at(struct kernel_vfs_path *start,
+                        struct kernel_vfs_path *root, const char *input,
+                        uint32_t mode)
+{
+    struct kernel_vfs_path *path = 0;
+    char name[256] = {0}, *backend = 0;
+    int result = mutation_path(start, root, input, 0, 1, 1, 2,
+                                &path, name, &backend);
+    if (result) return result;
+    result = !name[0] ? -KERNEL_EEXIST :
+                 vfs_mkdir_raw(start->file.mount, backend, mode);
+    (void)kernel_vfs_path_release(&path);
+    release_path(start->heap, backend);
+    return result;
+}
+
+int kernel_vfs_mkdir(struct kernel_vfs_mount *mount, const char *path,
                      uint32_t mode)
 {
-    struct lwext4_mount_adapter *adapter;
-    char *work = 0;
-    uint32_t found_mode;
-    int result;
-
-    if (mount == 0 || mount->private_data == 0) return -KERNEL_EINVAL;
-    adapter = mount->private_data;
-    result = resolve_path(mount, adapter->heap, path, 0, 1, 1, 2,
-                          &work, &found_mode);
-    if (result != 0) return result;
-    result = found_mode != 0U ? -KERNEL_EEXIST :
-        vfs_mkdir_raw(mount, resolved_path(work), mode);
-    release_path(adapter->heap, work);
+    struct kernel_vfs_path *root = 0;
+    int result = mount_root_path(mount, &root);
+    if (result) return result;
+    result = kernel_vfs_mkdir_at(root, root, path, mode);
+    (void)kernel_vfs_path_release(&root);
     return result;
 }
 
-int kernel_vfs_unlink(struct kernel_vfs_mount *mount,
-                      const char *path)
+static int special_last_component(const char *path)
 {
-    struct lwext4_mount_adapter *adapter;
-    char *work = 0;
-    uint32_t mode;
-    int result;
-
-    if (mount == 0 || mount->private_data == 0) return -KERNEL_EINVAL;
-    adapter = mount->private_data;
-    result = resolve_path(mount, adapter->heap, path, 0, 0, 0, 0,
-                          &work, &mode);
-    if (result != 0) return result;
-    result = vfs_unlink_raw(mount, resolved_path(work));
-    release_path(adapter->heap, work);
-    return result;
-}
-
-int kernel_vfs_rmdir(struct kernel_vfs_mount *mount,
-                     const char *path)
-{
-    struct lwext4_mount_adapter *adapter;
-    char *work = 0;
-    uint32_t mode;
-    int result;
-
-    size_t end;
-    size_t begin;
-
-    if (mount == 0 || mount->private_data == 0 || path == 0)
-        return -KERNEL_EINVAL;
-    end = strlen(path);
-    while (end > 0U && path[end - 1U] == '/') end--;
-    if (end == 0U && path[0] == '/') return -KERNEL_EBUSY;
+    if (!path) return 0;
+    size_t end = strlen(path), begin;
+    while (end && path[end - 1U] == '/') end--;
+    if (!end && path[0] == '/') return 3;
     begin = end;
-    while (begin > 0U && path[begin - 1U] != '/') begin--;
-    if (end - begin == 1U && path[begin] == '.') return -KERNEL_EINVAL;
+    while (begin && path[begin - 1U] != '/') begin--;
+    if (end - begin == 1U && path[begin] == '.') return 1;
     if (end - begin == 2U && path[begin] == '.' && path[begin + 1U] == '.')
-        return -KERNEL_ENOTEMPTY;
-    adapter = mount->private_data;
-    result = resolve_path(mount, adapter->heap, path, 0, 0, 0, 0,
-                          &work, &mode);
-    if (result != 0) return result;
-    result = vfs_rmdir_raw(mount, resolved_path(work));
-    release_path(adapter->heap, work);
-    return result;
+        return 2;
+    return 0;
 }
 
-int kernel_vfs_symlink(struct kernel_vfs_mount *mount,
-                       const char *target,
-                       const char *path)
+int kernel_vfs_unlink_at(struct kernel_vfs_path *start,
+                         struct kernel_vfs_path *root, const char *input,
+                         int directory)
 {
-    struct lwext4_mount_adapter *adapter;
-    char *work = 0;
-    uint32_t mode;
-    int result;
-
-    if (mount == 0 || mount->private_data == 0 || target == 0 ||
-        target[0] == '\0') return -KERNEL_EINVAL;
-    adapter = mount->private_data;
-    if (adapter->read_only) return -KERNEL_EROFS;
-    result = resolve_path(mount, adapter->heap, path, 0, 1, 0, 2,
-                          &work, &mode);
-    if (result != 0) return result;
-    result = mode != 0U ? -KERNEL_EEXIST :
-        lwext4_error(ext4_fsymlink(target, resolved_path(work)));
-    release_path(adapter->heap, work);
+    struct kernel_vfs_path *path = 0;
+    char name[256] = {0}, *backend = 0;
+    int special = special_last_component(input);
+    if (directory && special) return special == 1 ? -KERNEL_EINVAL :
+                          special == 2 ? -KERNEL_ENOTEMPTY : -KERNEL_EBUSY;
+    int result = mutation_path(start, root, input, 0, 0, 0, 0,
+                                &path, name, &backend);
+    if (result) return result;
+    result = directory ? vfs_rmdir_raw(start->file.mount, backend)
+                       : vfs_unlink_raw(start->file.mount, backend);
+    if (!result) path->detached = 1U;
+    (void)kernel_vfs_path_release(&path);
+    release_path(start->heap, backend);
     return result;
 }
 
-int kernel_vfs_readlink(struct kernel_vfs_mount *mount,
-                        const char *path,
-                        char *buffer,
-                        size_t size,
-                        size_t *bytes_read)
+static int unlink_root(struct kernel_vfs_mount *mount, const char *path,
+                        int directory)
 {
     struct kernel_vfs_path *root = 0;
-    struct kernel_vfs_path *resolved = 0;
-    int result;
+    int result = mount_root_path(mount, &root);
+    if (result) return result;
+    result = kernel_vfs_unlink_at(root, root, path, directory);
+    (void)kernel_vfs_path_release(&root);
+    return result;
+}
 
-    if (mount == 0 || mount->private_data == 0 || buffer == 0 ||
-        bytes_read == 0 || size == 0U) return -KERNEL_EINVAL;
-    result = kernel_vfs_path_root(mount,
-                 ((struct lwext4_mount_adapter *)mount->private_data)->heap,
-                 &root);
-    if (result != 0) return result;
-    result = kernel_vfs_path_resolve(root, root, path, 0, &resolved);
-    if (result == 0) {
+int kernel_vfs_unlink(struct kernel_vfs_mount *mount, const char *path)
+{
+    return unlink_root(mount, path, 0);
+}
+
+int kernel_vfs_rmdir(struct kernel_vfs_mount *mount, const char *path)
+{
+    return unlink_root(mount, path, 1);
+}
+
+int kernel_vfs_symlink_at(struct kernel_vfs_path *start,
+                          struct kernel_vfs_path *root, const char *target,
+                          const char *input)
+{
+    struct kernel_vfs_path *path = 0;
+    char name[256] = {0}, *backend = 0;
+    if (!start || !target || !target[0]) return -KERNEL_EINVAL;
+    if (kernel_vfs_mount_is_readonly(start->file.mount)) return -KERNEL_EROFS;
+    int result = mutation_path(start, root, input, 0, 1, 0, 2,
+                                &path, name, &backend);
+    if (result) return result;
+    result = !name[0] ? -KERNEL_EEXIST :
+                        lwext4_error(ext4_fsymlink(target, backend));
+    (void)kernel_vfs_path_release(&path);
+    release_path(start->heap, backend);
+    return result;
+}
+
+int kernel_vfs_symlink(struct kernel_vfs_mount *mount, const char *target,
+                       const char *path)
+{
+    struct kernel_vfs_path *root = 0;
+    int result = mount_root_path(mount, &root);
+    if (result) return result;
+    result = kernel_vfs_symlink_at(root, root, target, path);
+    (void)kernel_vfs_path_release(&root);
+    return result;
+}
+
+int kernel_vfs_readlink_at(struct kernel_vfs_path *start,
+                           struct kernel_vfs_path *root, const char *path,
+                           char *buffer, size_t size, size_t *bytes_read)
+{
+    struct kernel_vfs_path *resolved = 0;
+    if (!buffer || !bytes_read || !size) return -KERNEL_EINVAL;
+    int result = kernel_vfs_path_resolve(start, root, path, 0, &resolved);
+    if (!result) {
         if ((resolved->file.mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFLNK)
             result = -KERNEL_EINVAL;
         else
@@ -2102,7 +2203,135 @@ int kernel_vfs_readlink(struct kernel_vfs_mount *mount,
                      size, bytes_read));
         (void)kernel_vfs_path_release(&resolved);
     }
+    return result;
+}
+
+int kernel_vfs_readlink(struct kernel_vfs_mount *mount, const char *path,
+                        char *buffer, size_t size, size_t *bytes_read)
+{
+    struct kernel_vfs_path *root = 0;
+    int result = mount_root_path(mount, &root);
+    if (result) return result;
+    result = kernel_vfs_readlink_at(root, root, path, buffer, size, bytes_read);
     (void)kernel_vfs_path_release(&root);
+    return result;
+}
+
+static int rename_parent(struct kernel_vfs_path *start,
+                          struct kernel_vfs_path *root, const char *input,
+                          struct kernel_vfs_path **parent, char name[256],
+                          int *special, int *trailing)
+{
+    if (!input[0]) return -KERNEL_ENOENT;
+    size_t length = strlen(input), end = length, begin;
+    if (length >= KERNEL_FS_PATH_MAX) return -KERNEL_ENAMETOOLONG;
+    *trailing = input[length - 1U] == '/';
+    while (end && input[end - 1U] == '/') end--;
+    begin = end;
+    while (begin && input[begin - 1U] != '/') begin--;
+    if (end - begin > 255U) return -KERNEL_ENAMETOOLONG;
+    memcpy(name, input + begin, end - begin);
+    name[end - begin] = 0;
+    *special = special_last_component(input);
+    if (!begin) {
+        struct kernel_vfs_path *base = end ? start : root;
+        int result = kernel_vfs_path_acquire(base);
+        if (!result) *parent = base;
+        return result;
+    }
+    char *prefix;
+    enum kernel_heap_status allocation = kernel_heap_allocate(start->heap,
+                                                   begin + 1U, (void **)&prefix);
+    if (allocation != KERNEL_HEAP_STATUS_OK)
+        return allocation == KERNEL_HEAP_STATUS_EMPTY ? -KERNEL_ENOMEM : -KERNEL_EIO;
+    memcpy(prefix, input, begin);
+    prefix[begin] = 0;
+    int result = kernel_vfs_path_resolve(start, root, prefix, 1, parent);
+    release_path(start->heap, prefix);
+    return result;
+}
+
+int kernel_vfs_rename_at(struct kernel_vfs_path *old_start,
+                         struct kernel_vfs_path *new_start,
+                         struct kernel_vfs_path *root,
+                         const char *old_input, const char *new_input,
+                         unsigned flags)
+{
+    struct kernel_vfs_path *source = 0, *target = 0, *new_parent = 0;
+    struct kernel_vfs_path *source_parent = 0;
+    char missing[256] = {0}, old_component[256];
+    char *new_name = 0;
+    struct ext4_rename_result renamed = {0};
+    int old_special, new_special, old_trailing, new_trailing;
+    int result;
+    if ((flags & ~7U) || ((flags & 2U) && (flags & 5U))) return -KERNEL_EINVAL;
+    if (flags & 6U) return -KERNEL_ENOTSUP;
+    if (!old_start || !new_start || !root || !old_input || !new_input)
+        return -KERNEL_EINVAL;
+    if (old_start->file.mount != new_start->file.mount ||
+        root->file.mount != old_start->file.mount) return -KERNEL_EXDEV;
+    struct lwext4_mount_adapter *adapter = root->file.mount->private_data;
+    result = rename_parent(old_start, root, old_input, &source_parent,
+                             old_component, &old_special, &old_trailing);
+    if (result) goto Finish;
+    result = rename_parent(new_start, root, new_input, &new_parent,
+                             missing, &new_special, &new_trailing);
+    if (result) goto Finish;
+    if (old_special) { result = -KERNEL_EBUSY; goto Finish; }
+    if (new_special) { result = flags & 1U ? -KERNEL_EEXIST : -KERNEL_EBUSY; goto Finish; }
+    if (adapter->read_only) { result = -KERNEL_EROFS; goto Finish; }
+    result = kernel_vfs_path_lookup(source_parent, old_component,
+                                    strlen(old_component), &source);
+    if (result) goto Finish;
+    result = kernel_vfs_path_lookup(new_parent, missing, strlen(missing), &target);
+    if (result && result != -KERNEL_ENOENT) goto Finish;
+    if ((flags & 1U) && target) { result = -KERNEL_EEXIST; goto Finish; }
+    if ((old_trailing || new_trailing) &&
+        (source->file.mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFDIR) {
+        result = -KERNEL_ENOTDIR;
+        goto Finish;
+    }
+    if (((struct kernel_vfs_node *)new_parent->file.private_data)->unlinked) {
+        result = -KERNEL_ENOENT;
+        goto Finish;
+    }
+    enum kernel_heap_status allocation = kernel_heap_allocate(adapter->heap,
+                                  strlen(missing) + 1U, (void **)&new_name);
+    if (allocation != KERNEL_HEAP_STATUS_OK) {
+        result = allocation == KERNEL_HEAP_STATUS_EMPTY ? -KERNEL_ENOMEM
+                                                        : -KERNEL_EIO;
+        goto Finish;
+    }
+    memcpy(new_name, missing, strlen(missing) + 1U);
+    /* The single-hart VFS is entered with scheduling/interrupts serialized.
+     * All references and storage are reserved before disk mutation; this call
+     * cannot yield between the transaction and publishing dentry identity. */
+    result = lwext4_error(ext4_rename_child(LWEXT4_MOUNT_POINT,
+                 (uint32_t)kernel_vfs_path_inode(source->parent), source->name,
+                 (uint32_t)strlen(source->name),
+                 (uint32_t)kernel_vfs_path_inode(new_parent), new_name,
+                 (uint32_t)strlen(new_name), flags, &renamed));
+    if (result || !renamed.changed) goto Finish;
+    if (target) {
+        struct kernel_vfs_node *node = target->file.private_data;
+        if (renamed.replaced_inode != node->file.inode) __builtin_trap();
+        target->detached = 1U;
+        if (renamed.replaced_last_link) node->unlinked = 1U;
+    } else if (renamed.replaced_inode) __builtin_trap();
+    struct kernel_vfs_path *old_parent = source->parent;
+    char *old_name = source->name;
+    source->parent = new_parent;
+    source->name = new_name;
+    new_parent = 0;
+    new_name = 0;
+    if (old_name != source->initial_name) release_path(adapter->heap, old_name);
+    (void)kernel_vfs_path_release(&old_parent);
+Finish:
+    if (new_name) release_path(adapter->heap, new_name);
+    if (new_parent) (void)kernel_vfs_path_release(&new_parent);
+    if (target) (void)kernel_vfs_path_release(&target);
+    if (source) (void)kernel_vfs_path_release(&source);
+    if (source_parent) (void)kernel_vfs_path_release(&source_parent);
     return result;
 }
 
@@ -2136,7 +2365,7 @@ int kernel_vfs_dir_entry(struct kernel_vfs_file *file,
                          char *name,
                          size_t name_size)
 {
-    const struct kernel_vfs_node *node;
+    struct kernel_vfs_node *node;
     ext4_dir directory;
     uint64_t entry_offset;
     uint64_t start;
@@ -2152,6 +2381,12 @@ int kernel_vfs_dir_entry(struct kernel_vfs_file *file,
     if ((node->mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFDIR) {
         return -KERNEL_ENOTDIR;
     }
+    struct kernel_vfs_stat current;
+    result = kernel_vfs_fstat(file, &current);
+    if (result) return result;
+    node->size = current.size;
+    node->file.fsize = current.size;
+    file->size = current.size;
     *next_position = position;
     if (position >= node->size) {
         *next_position = node->size;

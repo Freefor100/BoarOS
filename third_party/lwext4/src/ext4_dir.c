@@ -515,10 +515,9 @@ int ext4_dir_find_entry(struct ext4_dir_search_result *result,
 		}
 
 		/* Entry not found - put block and continue to the next block */
-
-		r = ext4_block_set(parent->fs->bdev, &b);
-		if (r != EOK)
-			return r;
+		int release = ext4_block_set(parent->fs->bdev, &b);
+		if (r != ENOENT) return r;
+		if (release != EOK) return release;
 	}
 
 	return ENOENT;
@@ -663,9 +662,10 @@ int ext4_dir_find_in_block(struct ext4_block *block, struct ext4_sblock *sb,
 
 	/* Walk through the block and check entries */
 	while ((uint8_t *)de < addr_limit) {
-		/* Termination condition */
-		if ((uint8_t *)de + name_len > addr_limit)
-			break;
+		if ((size_t)(addr_limit - (uint8_t *)de) < 8) return EUCLEAN;
+		uint16_t de_len = ext4_dir_en_get_entry_len(de);
+		if (de_len < 8 || de_len % 4 || de_len > (size_t)(addr_limit - (uint8_t *)de) ||
+		    ext4_dir_en_get_name_len(sb, de) > de_len - 8) return EUCLEAN;
 
 		/* Valid entry - check it */
 		if (ext4_dir_en_get_inode(de) != 0) {
@@ -679,12 +679,6 @@ int ext4_dir_find_in_block(struct ext4_block *block, struct ext4_sblock *sb,
 				}
 			}
 		}
-
-		uint16_t de_len = ext4_dir_en_get_entry_len(de);
-
-		/* Corrupted entry */
-		if (de_len == 0)
-			return EINVAL;
 
 		/* Jump to next entry */
 		de = (struct ext4_dir_en *)((uint8_t *)de + de_len);
@@ -706,3 +700,54 @@ int ext4_dir_destroy_result(struct ext4_inode_ref *parent,
 /**
  * @}
  */
+
+int ext4_dir_check_empty(struct ext4_inode_ref *dir, bool *empty)
+{
+    struct ext4_sblock *sb = &dir->fs->sb;
+    uint32_t parent, size = ext4_sb_get_block_size(sb);
+    int r = ext4_dir_parent_inode(dir, &parent);
+    if (r != EOK) return r;
+    uint64_t length = ext4_inode_get_size(sb, dir->inode);
+    if (length % size || length / size > UINT32_MAX) return EUCLEAN;
+    bool indexed = ext4_inode_has_flag(dir->inode, EXT4_INODE_FLAG_INDEX);
+    for (uint32_t i = 0; i < length / size; i++) {
+        ext4_fsblk_t home;
+        r = ext4_fs_get_inode_dblk_idx(dir, i, &home, false);
+        if (r != EOK) return r;
+        if (!home || home >= dir->fs->bdev->lg_bcnt) return EUCLEAN;
+        struct ext4_block block = EXT4_BLOCK_ZERO();
+        r = ext4_trans_block_get(dir->fs->bdev, &block, home);
+        if (r != EOK) return r;
+        struct ext4_dir_en *first = (void *)block.data;
+        bool index_block = indexed && (i == 0 ||
+            (!ext4_dir_en_get_inode(first) && !first->name_len &&
+             ext4_dir_en_get_entry_len(first) == size));
+        bool found = false;
+        if (index_block) r = ext4_dir_dx_check(dir, &block);
+        else {
+            if (!ext4_dir_csum_verify(dir, first)) r = EUCLEAN;
+            for (uint32_t pos = 0; r == EOK && pos < size; ) {
+                struct ext4_dir_en *entry = (void *)(block.data + pos);
+                if (size - pos < 8) { r = EUCLEAN; break; }
+                uint32_t n = ext4_dir_en_get_entry_len(entry);
+                uint32_t namesz = ext4_dir_en_get_name_len(sb, entry);
+                if (n < 8 || n % 4 || n > size - pos || namesz > n - 8) {
+                    r = EUCLEAN; break;
+                }
+                if (ext4_dir_en_get_inode(entry)) {
+                    bool dot = i == 0 && pos == 0 && namesz == 1 && entry->name[0] == '.';
+                    bool dotdot = i == 0 && pos == 12 && namesz == 2 &&
+                                  entry->name[0] == '.' && entry->name[1] == '.';
+                    if (!dot && !dotdot) found = true;
+                }
+                pos += n;
+            }
+        }
+        int release = ext4_block_set(dir->fs->bdev, &block);
+        if (r == EOK) r = release;
+        if (r != EOK) return r;
+        if (found) { *empty = false; return EOK; }
+    }
+    *empty = true;
+    return EOK;
+}

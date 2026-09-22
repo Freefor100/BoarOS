@@ -33,7 +33,7 @@ enum kernel_syscall_status kernel_syscall_dispatch(
 | 调用族（RISC-V 编号） | 契约归属 |
 |---|---|
 | epoll_create1/ctl/pwait（20–22）、dup/dup3/fcntl（23–25） | [文件模块](kernel-files.md)：OFD 共享、就绪与生命周期 |
-| mkdirat/unlinkat/symlinkat（34–36）、openat/close（56/57）、readlinkat（78） | [文件模块](kernel-files.md)：路径、flags、dirfd 与错误 |
+| getcwd（17）、mkdirat/unlinkat/symlinkat（34–36）、renameat/renameat2（38/276）、chdir/fchdir（49/50）、openat/close（56/57）、readlinkat（78） | [文件模块](kernel-files.md)：路径、flags、dirfd 与错误 |
 | ftruncate（46）、pipe2（59）、getdents64/lseek（61/62）、read/write/readv/writev/pread64（63–67） | [文件模块](kernel-files.md)：部分成功、offset、pin、稀疏文件、pipe 与目录 cookie |
 | pselect6/ppoll（72/73）、newfstatat/fstat（79/80） | [文件模块](kernel-files.md)：集合/信号屏蔽、stat 编码和元数据 |
 

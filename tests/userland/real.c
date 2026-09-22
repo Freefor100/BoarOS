@@ -29,6 +29,7 @@
 
 #include "timestamps.h"
 #include "sync.h"
+#include "namespace.h"
 
 __attribute__((section(".rodata.unlink_test_far"), aligned(4096)))
 const char unlink_far_page[8192] = "UNLINK_DEMAND_FAULT_PAGE_PAYLOAD";
@@ -2492,6 +2493,14 @@ static int check_filesystem_rw(void)
 
 int main(int argc, char **argv)
 {
+    if (argc > 2 && !strcmp(argv[1], "namespace_exec")) {
+        char cwd[128];
+        return !getcwd(cwd, sizeof(cwd)) || strcmp(cwd, argv[2]);
+    }
+    if (argc > 1 && !strcmp(argv[1], "namespace_exec_deleted")) {
+        char cwd[128];
+        return getcwd(cwd, sizeof(cwd)) != 0 || errno != ENOENT;
+    }
     if (argc > 1 && strcmp(argv[1], "child_exit") == 0) {
         return 42;
     }
@@ -3075,6 +3084,12 @@ int main(int argc, char **argv)
         return 82;
     }
 
+    int namespace_result = check_namespace();
+    if (namespace_result) {
+        fprintf(stderr, "namespace check failed: %d errno=%d\n", namespace_result, errno);
+        return 120;
+    }
+    puts("BoarOS: real userland namespace checks ok");
     int sync_result = check_file_sync();
     if (sync_result != 0) {
         fprintf(stderr, "file sync check failed: %d errno=%d\n", sync_result, errno);

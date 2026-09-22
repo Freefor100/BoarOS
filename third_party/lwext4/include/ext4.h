@@ -308,6 +308,23 @@ int ext4_cache_flush(const char *path);
  * @return  Standard error code. */
 int ext4_fremove(const char *path);
 
+struct ext4_rename_result {
+	uint32_t replaced_inode;
+	bool replaced_last_link;
+	bool changed;
+};
+
+/* Rename one directory entry without resolving an absolute pathname. Flags
+ * are 0 or 1 (NOREPLACE). Requires an active journal and serialized namespace
+ * access. A replaced inode keeps its contents; its last link is transferred
+ * to the persistent orphan owner until the caller releases live references.
+ * Results are published only on success. Within an outer transaction they
+ * remain provisional until that transaction commits. */
+int ext4_rename_child(const char *mount_point,
+	uint32_t old_parent, const char *old_name, uint32_t old_len,
+	uint32_t new_parent, const char *new_name, uint32_t new_len,
+	unsigned flags, struct ext4_rename_result *result);
+
 /**@brief   Remove directory entry by path and decrement inode links count,
  *          without truncating blocks or freeing inode bitmap.
  *

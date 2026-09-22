@@ -85,3 +85,5 @@ make test-diff-abi-riscv
 Linux commit。较长请求的上游 RISC-V usercopy 进展问题留作独立 reference
 调查。SIGBUS 对照显式禁用 Linux core dump，仍严格比较整个 wait status，
 不能把没有生成 core 的退出伪装为 `WCOREDUMP`。
+
+路径组合探针 `tests/diff-abi/namespace.c` 覆盖 cwd/dirfd、父目录改名、跨目录移动、NOREPLACE/特殊末分量、活覆盖目标、删除 cwd 与目录同步；连同已有用例为 297 条记录。普通 rename 使用固定 RV64 Linux 原生 `renameat2(276, flags=0)`，旧 38 号兼容入口不作为 Linux 对照。
