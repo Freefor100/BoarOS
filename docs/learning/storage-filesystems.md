@@ -16,7 +16,7 @@ DMA 的地址是设备可见地址，不等于任意内核虚拟地址。QEMU `v
 
 首个存储消费者发生在单 hart 启动期，尚无外部中断控制器、等待队列与阻塞调度。一个 outstanding request 加有界轮询能形成真实 I/O 闭环，并把过渡复杂性限制在设备后端。其缺点是等待期间 CPU 忙等且不能并行 I/O；建立 IRQ 和 sleep/wake 后，应替换完成方式而保留块设备和 VFS 语义。
 
-当前 ext4 既可挂载为只读，也可在块设备提供写回调时挂载为读写；同步轮询只解决首个单 hart 消费者的 I/O 边界。写路径增加了介质更新、页缓存失效和真实清理错误，不能把它们简化成分配器重试。ext3/4 若带 `needs_recovery`，最近的元数据事务可能只在 journal 中；没有 JBD2 replay 的实现必须拒绝挂载。metadata checksum 还要求根据 incompat feature 在 superblock checksum seed 与 UUID 派生 seed 之间正确选择，不能因镜像“能列目录”就认定所有元数据校验正确。
+当前 ext4 既可挂载为只读，也可在块设备提供写回调时挂载为读写；同步轮询只解决首个单 hart 消费者的 I/O 边界。写路径增加了介质更新、页缓存失效和真实清理错误，不能把它们简化成分配器重试。ext3/4 若带 `needs_recovery`，最近的元数据事务可能只在 journal 中；BoarOS 在发布挂载前完成 JBD2 replay 与 orphan 回收，只读介质不能恢复时拒绝挂载。metadata checksum 还要求根据 incompat feature 在 superblock checksum seed 与 UUID 派生 seed 之间正确选择，不能因镜像“能列目录”就认定所有元数据校验正确。
 
 BoarOS 引入固定 lwext4 源码快照，自有 block/VFS 接口保持在外层。这样避免从零实现 ext4 inode、extent、目录索引和 checksum 的高风险，同时不让第三方结构成为未来进程 ABI。代价是需要维护 freestanding libc/allocator adapter，并承担组合后的 GPL 许可证约束。
 
@@ -79,10 +79,10 @@ write-first 且缓存未命中，直接把文件内容读入私有页可避免�
 
 内存压力回收必须避免无界递归。BoarOS 的物理分配器只注册一个缓存回收器：第一次分配失败
 时请求 LRU 释放目标页数并重试一次，回调期间抑制再次进入回收器。只读挂载的缓存页没有脏页，
-可以直接丢弃；可写挂载在 write/truncate 后先完成同步介质更新，再精确失效对应 node 的缓存页，
-真实 I/O 错误由 VFS/mount owner 保留。
+可以直接丢弃；可写挂载的脏页只有定向写回成功后才能驱逐。写回固定页面并禁止递归压力回收，
+真实 I/O 错误由脏页、inode 与 VFS/mount owner 保留。
 
-页缓存失效不等于驻留映射失效：从 cache 哈希/LRU 摘除一页只释放缓存 owner，用户页表仍可通过独立物理页引用命中原 PTE。文件向下截断时，Linux 还必须撤销页起点位于新 EOF 之外的已驻留映射（包括该范围内的 private COW 页），让后续访问重新 fault 并按新 size 判定；这不表示包含新 EOF 的 partial page 会被整体撤销。固定 Linux `references/linux` commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 `mm/truncate.c::truncate_pagecache()` 因此以 `round_up(newsize, PAGE_SIZE)` 为 unmap 起点，在截断 page cache 前后各调用一次 `unmap_mapping_range(..., even_cows=1)`，具体映射遍历见 `mm/memory.c::unmap_mapping_range()`。BoarOS 当前没有从 VFS node 到所有 MM/VMA/PTE 的反向登记，这个 truncate-to-resident-mapping invalidation 必须在建立清晰 owner、锁序和 TLB 失效协议后另行实现。
+页缓存失效不等于驻留映射失效：从 cache 哈希/LRU 摘除一页只释放缓存 owner，用户页表仍可通过独立物理页引用命中原 PTE。文件向下截断时，Linux 还必须撤销页起点位于新 EOF 之外的已驻留映射（包括该范围内的 private COW 页），让后续访问重新 fault 并按新 size 判定；这不表示包含新 EOF 的 partial page 会被整体撤销。固定 Linux `references/linux` commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 `mm/truncate.c::truncate_pagecache()` 因此以 `round_up(newsize, PAGE_SIZE)` 为 unmap 起点，在截断 page cache 前后各调用一次 `unmap_mapping_range(..., even_cows=1)`，具体映射遍历见 `mm/memory.c::unmap_mapping_range()`。BoarOS 已由 MM 持有稳定的 node–MM 登记，截断据此撤销越界驻留映射并处理尾页；当前验证范围为单 hart，SMP 仍需独立的锁序和跨核 TLB 确认。
 
 ## 可写文件系统与介质写入演进
 
@@ -94,16 +94,34 @@ write-first 且缓存未命中，直接把文件内容读入私有页可避免�
    - 特性协商与只读降级：QEMU 或虚拟化平台在指定 `readonly=on` 时会提供 `VIRTIO_BLK_F_RO`（bit 5）。驱动在探测阶段读取 low 32-bit 特性，若包含只读标志则回写确认该特性，并将 `block.write` 置空（0）。上层 VFS 通过 `kernel_vfs_mount_is_readonly()` 感知该状态，避免在只读介质上尝试写回超级块/日志导致挂载失败（如错误码 5/EIO）。
 
 2. **lwext4 写路径与 POSIX 语义修正**：
-   - 普通文件创建调用 `ext4_fopen2`。普通写调用 `kernel_vfs_pwrite`（`ext4_fseek` + `ext4_fwrite`）；追加写入由 `kernel_vfs_append` 在底层原子解析当前 EOF 并写入，确保多 OFD 或与 `lseek` 组合时，写入点严格原子重定位到文件尾并推进 offset。
-   - 写入错误不能覆盖已经提交的正进度：backend 的 byte count、errno 与 live inode size 是一个结果整体。VFS 在 backend 返回后先刷新 node/file size 并失效页缓存；byte count 为正时向 syscall 层交付该前缀，OFD 只推进相同字节数，只有 byte count 为零时才交付 errno。truncate 没有正字节返回值，但 backend 可能先改变 inode 再在收尾阶段报错，因此错误路径也必须刷新 size 和失效缓存后再返回 errno。该边界依据固定 Linux `references/linux` commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 `mm/filemap.c::generic_perform_write()`（零进度才返回 `status`，正进度推进 `ki_pos` 并返回 `written`）以及 `fs/read_write.c::new_sync_write()`（只按正返回提交 open-file position）。
-   - 文件大小截断通过 `kernel_vfs_ftruncate` 调用 sparse-capable `ext4_ftruncate`：向下截断释放末尾块；向上截断只清零已分配旧 EOF 块中即将暴露的尾部并更新 inode size，不分配完整中间 gap。越过 EOF 的普通写同样只分配与调用者数据相交的精确逻辑块；新块必须在 mapping 可长期保留前整块初始化，初始化失败仅撤销本次 exact block。unwritten extent 的 zero conversion 会留下 dirty cache buffer，因此 caller 部分写不能随后绕过缓存做 direct I/O，否则收尾 flush 会用旧 zero buffer 覆盖 caller bytes；当前数据修改走同一 cache buffer，mapped direct read 前先 flush 对应数据块。未映射读取由文件层直接合成零，不能让物理块号 0 进入 block I/O。maxbytes 必须按 inode mapping 而不是只按 superblock 或完整间接树容量计算：extent inode 的 walker sentinel 给出 `EXT_MAX_BLOCKS * block_size`；legacy inode 取指针树容量、`EXT_MAX_BLOCKS` 个可安全计数的逻辑块与 inode `i_blocks` 容量（含间接块开销）的交集。这保留 `0xffffffff` 作为哨兵/块计数上限，最后可用逻辑块是 `0xfffffffe`；8 KiB legacy 文件的 exact maxbytes 因此是 `35184372080640`，首个禁用字节是 `35184372080641`，而 2^45 处不再因 `ext4_lblk_t` 缩窄回绕到块 0。该上限在尾部清零和 offset 缩窄前检查。该语义参照固定 Linux `references/linux` commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 `fs/attr.c::inode_newsize_ok()`、`fs/read_write.c::generic_file_llseek_size()`、`fs/ext4/super.c::ext4_max_bitmap_size()` 和 `fs/ext4/ext4.h::EXT4_MAX_LOGICAL_BLOCK`；具体 lwext4 适配基于 `third_party/lwext4/` 固定上游 commit `58bcf89a121b72d4fb66334f1693d3b30e4cb9c5`。
+   - 普通文件创建调用 `ext4_fopen2`。普通写通过 `kernel_vfs_pwrite` 修改共享文件页，定向写回才调用 `ext4_fseek` + `ext4_fwrite`；追加写入由 `kernel_vfs_append` 在共享 node 上取得逻辑 EOF 并写入，确保多 OFD 或与 `lseek` 组合时，写入点严格原子重定位到文件尾并推进 offset。
+   - 写入错误不能覆盖已经提交的正进度：backend 的 byte count、errno 与 live inode size 是一个结果整体。VFS 用缓存已接受的进度维护逻辑大小，失败写回保留脏页；byte count 为正时向 syscall 层交付该前缀，OFD 只推进相同字节数，只有 byte count 为零时才交付 errno。truncate 没有正字节返回值，但 backend 可能先改变 inode 再在收尾阶段报错，因此错误路径也必须刷新 size 和失效缓存后再返回 errno。该边界依据固定 Linux `references/linux` commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 `mm/filemap.c::generic_perform_write()`（零进度才返回 `status`，正进度推进 `ki_pos` 并返回 `written`）以及 `fs/read_write.c::new_sync_write()`（只按正返回提交 open-file position）。
+   - 文件大小截断通过 `kernel_vfs_ftruncate` 调用 sparse-capable `ext4_ftruncate`：向下截断释放末尾块；向上截断只清零已分配旧 EOF 块中即将暴露的尾部并更新 inode size，不分配完整中间 gap。越过 EOF 的普通写同样只分配与调用者数据相交的精确逻辑块；新块必须在 mapping 可长期保留前整块初始化，初始化失败仅撤销本次 exact block。unwritten extent 的 zero conversion 会留下 dirty cache buffer，因此 caller 部分写不能随后绕过缓存做 direct I/O，否则收尾 flush 会用旧 zero buffer 覆盖 caller bytes；当前数据修改走同一 cache buffer；活动事务内的读也使用缓存，事务外 mapped direct read 前先 flush 对应数据块。未映射读取由文件层直接合成零，不能让物理块号 0 进入 block I/O。maxbytes 必须按 inode mapping 而不是只按 superblock 或完整间接树容量计算：extent inode 的 walker sentinel 给出 `EXT_MAX_BLOCKS * block_size`；legacy inode 取指针树容量、`EXT_MAX_BLOCKS` 个可安全计数的逻辑块与 inode `i_blocks` 容量（含间接块开销）的交集。这保留 `0xffffffff` 作为哨兵/块计数上限，最后可用逻辑块是 `0xfffffffe`；8 KiB legacy 文件的 exact maxbytes 因此是 `35184372080640`，首个禁用字节是 `35184372080641`，而 2^45 处不再因 `ext4_lblk_t` 缩窄回绕到块 0。该上限在尾部清零和 offset 缩窄前检查。该语义参照固定 Linux `references/linux` commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 `fs/attr.c::inode_newsize_ok()`、`fs/read_write.c::generic_file_llseek_size()`、`fs/ext4/super.c::ext4_max_bitmap_size()` 和 `fs/ext4/ext4.h::EXT4_MAX_LOGICAL_BLOCK`；具体 lwext4 适配基于 `third_party/lwext4/` 固定上游 commit `58bcf89a121b72d4fb66334f1693d3b30e4cb9c5`。
    - 可执行映像互斥（`ETXTBSY`）：VFS node 维护 `write_openers` 与 `exec_users` 计数器。打开已在运行的可执行二进制请求写权限（或带 `O_TRUNC`）返回 `-ETXTBSY`（错误码 26）；已被写打开的文件被 `execve` 装载时同样返回 `-ETXTBSY`。写租约与执行租约在 `kernel_vfs_close` 时对称释放。
    - 目录与删除语义：lwext4 的 `ext4_dir_rm` 默认递归删除，VFS 适配层在 `kernel_vfs_rmdir` 中将判空逻辑封装进独立函数 `check_directory_empty`，遍历目录项（跳过 `.` 和 `..`），存在子条目时准确返回 `-ENOTEMPTY`，并在进入递归删除前及时退出该函数，避免 312 字节的 `ext4_dir` 局部栈帧堆叠在递归删除调用链上。对于文件删除，实现真正的 Linux `unlink`-but-open 语义：`kernel_vfs_unlink` 调用 `ext4_funlink_dentry` 从目录中摘除 dentry，使路径查找立即返回 `-ENOENT`。若文件仍被打开或作为源可执行文件映射运行（`node->open_files > 0 || node->exec_users > 0`），标记 `node->unlinked = 1`，保留底层 inode 块数据供已有描述符正常 `read/write/fstat` 与缺页加载；只有当所有打开描述符和执行租约释放时，才由 `kernel_vfs_try_release_orphan` 显式临时 pin 节点、排空页缓存后在顶层栈帧执行一次 `ext4_orphan_free`。通用的 `kernel_vfs_node_release` 仅回收内核对象内存，不隐式销毁磁盘 inode，防止深度递归栈击穿与 double free。
    - 任务内核栈深约束：早期 BoarOS 的 4 KiB 任务页与元数据共用，执行栈仅约 2.5 KiB；当前已分离为独立 8 KiB 连续物理栈，仍需控制深调用链。用户态系统调用进入内核时，288 字节的 RISC-V trap frame 已经占用任务内核栈；在该 trap frame 存续期间，VFS/lwext4 的深层调用继续消耗同一任务栈预算，而 S-mode trap 入口会清除 `sstatus.SIE`，因此这里不依赖“定时器在深层 syscall 内再次嵌套”的模型。应避免在栈上直接实例化 312 字节的 `ext4_dir` 或额外的 264 字节 `ext4_direntry`；目录文件句柄打开采用专有的 `ext4_dir_open_file` 直连 `node->file`，目录项遍历直接复用 `directory.de`，并在 `unlink` 前消除重复的路径属性查找（`ext4_mode_get`）。若深层文件系统路径耗尽剩余栈空间并破坏 canary，该损坏可能在系统调用返回后、后续正常定时器中断触发 scheduler validation 时才被检测到。
 
 3. **页缓存失效（Page Cache Invalidation）**：
-   - 当文件被 `write` 或 `ftruncate` 改变时，`kernel_page_cache_invalidate_node()` 从哈希表与 LRU 链中精确摘除该 node 关联的所有物理页项并释放页引用，确保后续的 `read` 或缺页重新从磁盘介质加载最新数据。
+   - 普通 `write` 原地修改统一文件页，read 与私有读缺页立即可见；private COW 页保持独立。向下截断只丢弃越过新 EOF 的页面，并通知关联 MM 撤销越界映射、处理尾页。inode 页链使这些操作只遍历目标文件的缓存页。
    - 当执行文件删除（`unlink`）时，若目标文件未被打开，立即通过 `ext4_orphan_free` 截断释放并使缓存失效；若目标文件仍被打开，页缓存继续为现有描述符与缺页服务，直至最后一次 `close` 释放孤儿 inode 时同步调用 `kernel_page_cache_invalidate_node()`。unlink 前会为无现存 node 的路径预留 mount orphan 记录；`ext4_orphan_free` 的真实 I/O 错误由 mount 保留唯一 owner，路径不会复现，重试成功后才完成卸载。
+
+## 日志顺序、回滚与持久 orphan
+
+本轮依据为 `references/linux` commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 `fs/jbd2/{commit,checkpoint,recovery}.c`、`fs/ext4/{orphan,extents,indirect,mballoc}.c` 和 `Documentation/filesystems/ext4/{journal,orphan}.rst`；设备依据是 `references/qemu` v11.1.0、commit `84f07211cc5b4fc6a371559bf8a5de4fb068e648` 的 `hw/block/virtio-blk.c`。lwext4 本地改动基于 `58bcf89a121b72d4fb66334f1693d3b30e4cb9c5`，实现接口见 [VFS 模块](../modules/vfs-ext4.md)。
+
+ordered journal 的关键是不同持久化阶段之间的屏障：数据 → flush → 日志内容 → flush → commit → flush → checkpoint → flush → 日志起点 → flush → 回收。只提交 commit 而提前复用日志空间，或者先把分配位图写回原位置，都可能使重启看到无法恢复的状态。逐文件同步不能以清空整个挂载的脏数据代替；只将当前文件关联的数据加入 ordered 集合，元数据可以由共同事务提交。
+
+事务 abort 也有内存契约。调用者修改缓冲前就必须取得 journal 引用和 before-image，不能修改完才分配日志记录：后一种做法在 OOM 时已无法知道哪些内容需要恢复。abort 必须恢复仍被外层持有的同一缓冲内容，并恢复 superblock 计数；只让下一次读取重新载盘不足以保护活引用。外层事务结束后 handle 才记录 committed transaction id，嵌套错误由最外层保留和传播。
+
+“数据先于 commit”还不够：如果先写 ordered data，再分配日志缓冲，后续 ENOMEM 会把 size 回滚到旧值，却留下已清零的原数据尾部。嵌套 shrink→grow 的逐分配失败探针发现了这个反例。现在先在内存准备完整日志及 commit 缓冲并预留空间，再进行数据 I/O；失败可以在尚未覆写数据时回滚。每个 descriptor 都必须有 LAST_TAG，不能只给整笔事务最后一个 descriptor 设置，否则较大事务能提交却无法重放。
+
+512 字节原子写不保证 1 KiB superblock 的完整性。主 superblock 若在 checkpoint 时被撕裂，checksum 会先于常规 replay 失败。这里把 superblock 作为日志元数据，并允许几何边界仍合法的镜像只进入受限恢复；没有完整且校验正确的 superblock redo 就拒绝挂载。日志起止的恢复位同样进入事务，不能在丢弃日志后直接改写主 superblock。回放不能为损坏内容重算 checksum 后假装它有效。
+
+orphan 记录表达的是“还有工作未完成”，不是运行时打开引用。unlink 在同一事务持久化零链接与 orphan；截断先持久化目标 size 和 orphan，再分批释放实际映射。重启不能只从 size 推算旧尾部，因为 size 已缩小、块仍存在。extent 的最高映射和间接块右侧路径给出下一批工作，最后才移除 orphan 并释放无链接 inode。已删除 inode 的 `i_dtime` 需要非零删除标记，不能将链指针清零后直接释放而留下 e2fsck 错误。
+
+稀疏映射也揭示了分配 hint 的边界：根据逻辑块差值外推的物理目标可能超出设备，必须先归一化到有效块组；固定 Linux `fs/ext4/mballoc.c` 对 goal 也做范围校验。hint 影响位置选择，不能使原本合法的稀疏写被当成非法块组。测试分别核对数据块和可达索引块，`i_blocks` 不能简单等于保留数据块数。
+
+`make test-lwext4-recovery-host` 将低层日志、ordered data、公共事务和完整 orphan 回收分开检验。公共事务逐个注入分配失败，完整回收包含 16 种组合、4,362 次断电执行；每次恢复两遍并运行 `e2fsck -fn`。故障后保留的是稳定镜像，未 flush 写被丢弃，另测最后一个扇区先持久化。普通数据原地覆盖不具备整文件原子性；这组证据也不外推到尚未验收的实板缓存或原子写粒度。
 
 ## 根设备与 PID 1
 

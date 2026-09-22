@@ -55,6 +55,8 @@ extern "C" {
 
 struct ext4_fs {
 	bool read_only;
+	bool super_replay_required;
+	bool journaled_session;
 
 	struct ext4_blockdev *bdev;
 	struct ext4_sblock sb;
@@ -157,6 +159,9 @@ int ext4_fs_check_features(struct ext4_fs *fs, bool *read_only);
  */
 int ext4_fs_get_block_group_ref(struct ext4_fs *fs, uint32_t bgid,
 				struct ext4_block_group_ref *ref);
+/* Allocation-only variant: may initialize uninitialized group bitmaps. */
+int ext4_fs_get_block_group_ref_alloc(struct ext4_fs *fs, uint32_t bgid,
+				      struct ext4_block_group_ref *ref);
 
 /**@brief Put reference to block group.
  * @param ref Pointer for reference to be put back

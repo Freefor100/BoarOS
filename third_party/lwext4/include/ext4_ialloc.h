@@ -57,6 +57,9 @@ extern "C" {
 void ext4_ialloc_set_bitmap_csum(struct ext4_sblock *sb, struct ext4_bgroup *bg,
 				 void *bitmap);
 
+bool ext4_ialloc_verify_bitmap_csum(struct ext4_sblock *sb,
+                                  struct ext4_bgroup *bg, void *bitmap);
+
 /**@brief Free i-node number and modify filesystem data structers.
  * @param fs     Filesystem, where the i-node is located
  * @param index  Index of i-node to be release

@@ -3118,6 +3118,82 @@ static void check_usercopy_write(struct kernel_files *files,
     }
 }
 
+/* This fixture runs only after the ordinary files/MM/mount/device owners have
+ * been released and the allocator has returned to its baseline. A failed log
+ * must retain its mount until recovery; keep this final fixture's stack owners
+ * alive through shutdown instead of pretending that sticky EIO can be drained. */
+static void finish_sticky_metadata_test(const struct dtb_memory_range *mmio,
+                                        uint64_t timebase_frequency,
+                                        struct physical_page_allocator *allocator,
+                                        struct kernel_heap *heap)
+    __attribute__((noreturn));
+
+static void finish_sticky_metadata_test(const struct dtb_memory_range *mmio,
+                                        uint64_t timebase_frequency,
+                                        struct physical_page_allocator *allocator,
+                                        struct kernel_heap *heap)
+{
+    struct kernel_page_cache cache = {0};
+    struct riscv_virtio_mmio_block device = {0};
+    struct kernel_vfs_mount mount = {0};
+    struct kernel_vfs_file file = {0};
+    size_t written = 0U;
+    uint64_t observed_error;
+
+    if (kernel_page_cache_init(&cache, heap, allocator) !=
+            KERNEL_PAGE_CACHE_STATUS_OK ||
+        riscv_virtio_mmio_block_init(&device,
+            (volatile void *)(uintptr_t)mmio->base, mmio->size, allocator,
+            dma_physical_address, timebase_frequency) !=
+            RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK ||
+        kernel_vfs_mount_root(&mount, &device.block, heap, &cache) != 0 ||
+        kernel_vfs_create(&mount, "/journal-error", 0600U, &file) != 0 ||
+        ext4_mount_setup_clock("/", timestamp_test_clock) != EOK ||
+        kernel_vfs_file_modified(&file, 0U, 0) != 0) {
+        fail_files(420U, 0, -1);
+    }
+    observed_error = kernel_vfs_error_sequence(&file);
+    if (kernel_vfs_sync(&file, 0, &observed_error) != 0)
+        fail_files(421U, 0, -1);
+
+    time_original_write = device.block.write;
+    device.block.write = timestamp_test_write;
+    time_write_failures = 1U;
+    if (kernel_vfs_pwrite(&file, 0U, "x", 0U, &written) != 0 ||
+        written != 0U || time_write_failures != 1U)
+        fail_files(422U, 0, written);
+    unsigned int before_failure = time_write_calls;
+    int result = kernel_vfs_file_modified(&file, 0U, 0);
+    if (result != -KERNEL_EIO || time_write_failures != 0U ||
+        time_write_calls <= before_failure || kernel_vfs_file_size(&file) != 0U)
+        fail_files(423U, -KERNEL_EIO, result);
+    /* Remove the device fault: subsequent errors must come from the journal's
+     * retained failure, not from repeated fault injection. */
+    device.block.write = time_original_write;
+
+    for (unsigned int attempt = 0U; attempt < 2U; attempt++) {
+        result = kernel_vfs_sync(&file, attempt != 0U, &observed_error);
+        if (result != -KERNEL_EIO) fail_files(424U, -KERNEL_EIO, result);
+        written = 0U;
+        result = kernel_vfs_pwrite(&file, 0U, "x", 1U, &written);
+        if (result != -KERNEL_EIO || written != 0U ||
+            kernel_vfs_file_size(&file) != 0U)
+            fail_files(425U, -KERNEL_EIO, result);
+        result = kernel_vfs_ftruncate(&file, 1U);
+        if (result != -KERNEL_EIO || kernel_vfs_file_size(&file) != 0U)
+            fail_files(426U, -KERNEL_EIO, result);
+    }
+    if (kernel_vfs_close(&file) != 0) fail_files(427U, 0, -1);
+    void *owner = mount.private_data;
+    for (unsigned int attempt = 0U; attempt < 2U; attempt++) {
+        result = kernel_vfs_unmount(&mount);
+        if (result != -KERNEL_EIO || owner == 0 || mount.private_data != owner)
+            fail_files(428U, -KERNEL_EIO, result);
+    }
+    virt_uart_puts("BoarOS: process files partial write tests passed\n");
+    sbi_shutdown();
+}
+
 static void run_partial_write_test(const void *dtb)
 {
     static const char path[] = "/partial";
@@ -3391,51 +3467,17 @@ static void run_partial_write_test(const void *dtb)
     }
     device.block.flush = sync_original_flush;
 
-    /* A real block failure while writing timestamp metadata must abort
-     * before data, while the dirty inode remains owned by the mount cache. */
-    uint64_t prior_offset = kernel_open_file_offset(description);
-    uint64_t prior_size = kernel_open_file_size(description);
+    /* Successful metadata submission still updates the observed timestamp. */
     if (kernel_files_sync(&files, 0, 0, &result) != KERNEL_FILES_STATUS_OK ||
         result != 0 ||
         ext4_mount_setup_clock("/", timestamp_test_clock) != EOK ||
-        kernel_vfs_file_modified(&description->file, prior_offset, 0) != 0) {
-        fail_files(400U, 0, -1);
-    }
-    time_original_write = device.block.write;
-    device.block.write = timestamp_test_write;
-    time_write_failures = 1U;
-    if (kernel_files_write(&files, &mm, 0, TEST_USER_BUFFER, 0U, &result) !=
-            KERNEL_FILES_STATUS_OK || result != 0 || time_write_failures != 1U) {
-        fail_files(401U, 0, result);
-    }
-    if (kernel_files_write(&files, &mm, 0, TEST_USER_BUFFER, 1U, &result) !=
-            KERNEL_FILES_STATUS_OK || result != -KERNEL_EIO ||
-        time_write_failures != 0U ||
-        kernel_open_file_offset(description) != prior_offset ||
-        kernel_open_file_size(description) != prior_size) {
-        fail_files(402U, -KERNEL_EIO, result);
-    }
-    unsigned int before_flush = time_write_calls;
-    if (kernel_files_sync(&files, 0, 0, &result) != KERNEL_FILES_STATUS_OK ||
-        result != 0 || time_write_calls <= before_flush ||
+        kernel_vfs_file_modified(&description->file,
+                                 kernel_open_file_offset(description), 0) != 0 ||
         kernel_vfs_fstat(&description->file, &vfs_stat) != 0 ||
         vfs_stat.mtime.seconds != INT64_C(1780000000) ||
         vfs_stat.mtime.nanoseconds != time_clock_nanoseconds) {
-        fail_files(403U, 0, -1);
+        fail_files(400U, 0, -1);
     }
-    time_write_failures = 1U;
-    if (kernel_files_ftruncate(&files, 0, prior_size, &result) !=
-            KERNEL_FILES_STATUS_OK || result != -KERNEL_EIO ||
-        time_write_failures != 0U ||
-        kernel_open_file_offset(description) != prior_offset ||
-        kernel_open_file_size(description) != prior_size) {
-        fail_files(405U, -KERNEL_EIO, result);
-    }
-    before_flush = time_write_calls;
-    if (ext4_cache_flush("/") != EOK || time_write_calls <= before_flush) {
-        fail_files(406U, 0, -1);
-    }
-    device.block.write = time_original_write;
     if (ext4_mount_setup_clock("/", 0) != EOK) fail_files(404U, 0, -1);
 
     use_test_satp = 0;
@@ -3452,6 +3494,8 @@ static void run_partial_write_test(const void *dtb)
         physical_page_available(&allocator) != baseline) {
         fail_files(314U, baseline, physical_page_available(&allocator));
     }
+    finish_sticky_metadata_test(&info.virtio_mmio[index],
+                                info.timebase_frequency, &allocator, &heap);
 }
 #endif
 
@@ -3461,7 +3505,6 @@ void kernel_main(unsigned long hart_id, const void *dtb)
 
 #ifdef FILES_PARTIAL_WRITE_TEST
     run_partial_write_test(dtb);
-    virt_uart_puts("BoarOS: process files partial write tests passed\n");
 #else
     run_files_test(dtb);
     virt_uart_puts("BoarOS: process files tests passed\n");

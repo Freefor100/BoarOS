@@ -68,6 +68,7 @@ struct revoke_entry {
 
 /**@brief  Valid journal replay information.*/
 struct recover_info {
+	int error;
 	/**@brief  Starting transaction id.*/
 	uint32_t start_trans_id;
 
@@ -79,6 +80,7 @@ struct recover_info {
 
 	/**@brief  No of transactions went through.*/
 	uint32_t trans_cnt;
+	bool super_replayed;
 
 	/**@brief  RB-Tree storing revoke entries.*/
 	RB_HEAD(jbd_revoke, revoke_entry) revoke_root;
@@ -159,6 +161,34 @@ static int jbd_has_csum(struct jbd_sb *jbd_sb)
 		return 3;
 
 	return 0;
+}
+
+/* This implementation uses ordered synchronous commits. Async commit and
+ * the legacy whole-transaction CRC32 format need their own recovery protocol. */
+static int jbd_check_features(struct jbd_fs *jbd_fs)
+{
+	struct jbd_sb *sb = &jbd_fs->sb;
+	uint32_t supported = JBD_FEATURE_INCOMPAT_REVOKE |
+		JBD_FEATURE_INCOMPAT_64BIT | JBD_FEATURE_INCOMPAT_CSUM_V2 |
+		JBD_FEATURE_INCOMPAT_CSUM_V3;
+	uint32_t features = jbd_get32(sb, feature_incompat);
+	if ((features & ~supported) || jbd_get32(sb, feature_compat) ||
+	    jbd_get32(sb, feature_ro_compat))
+		return ENOTSUP;
+	if ((features & JBD_FEATURE_INCOMPAT_CSUM_V2) &&
+	    (features & JBD_FEATURE_INCOMPAT_CSUM_V3))
+		return EINVAL;
+	if (jbd_has_csum(sb) && (!CONFIG_META_CSUM_ENABLE ||
+	    sb->checksum_type != JBD_CRC32C_CHKSUM))
+		return ENOTSUP;
+	if (jbd_get32(sb, blocksize) != jbd_fs->inode_ref.fs->bdev->lg_bsize ||
+	    !jbd_get32(sb, first) ||
+	    jbd_get32(sb, first) >= jbd_get32(sb, maxlen) ||
+	    (jbd_get32(sb, start) &&
+	     (jbd_get32(sb, start) < jbd_get32(sb, first) ||
+	      jbd_get32(sb, start) >= jbd_get32(sb, maxlen))))
+		return EINVAL;
+	return EOK;
 }
 
 #if CONFIG_META_CSUM_ENABLE
@@ -300,7 +330,7 @@ static void jbd_commit_csum_set(struct jbd_fs *jbd_fs,
 
 	header->chksum_type = 0;
 	header->chksum_size = 0;
-	header->chksum[0] = jbd_commit_csum(jbd_fs, header);
+	header->chksum[0] = to_be32(jbd_commit_csum(jbd_fs, header));
 }
 
 #if CONFIG_META_CSUM_ENABLE
@@ -309,9 +339,12 @@ static bool jbd_verify_commit_csum(struct jbd_fs *jbd_fs,
 {
 	if (!jbd_has_csum(&jbd_fs->sb))
 		return true;
-
-	return header->chksum[0] == to_be32(jbd_commit_csum(jbd_fs,
-					    header));
+	uint32_t saved = header->chksum[0];
+	header->chksum[0] = 0;
+	uint32_t sum = ext4_crc32c(EXT4_CRC32_INIT, jbd_fs->sb.uuid, UUID_SIZE);
+	sum = ext4_crc32c(sum, header, jbd_get32(&jbd_fs->sb, blocksize));
+	header->chksum[0] = saved;
+	return saved == to_be32(sum);
 }
 #else
 #define jbd_verify_commit_csum(...) true
@@ -334,6 +367,7 @@ static uint32_t jbd_block_csum(struct jbd_fs *jbd_fs, const void *buf,
 		checksum = ext4_crc32c(EXT4_CRC32_INIT, jbd_fs->sb.uuid,
 				       sizeof(jbd_fs->sb.uuid));
 		/* Then calculate crc32c checksum against sequence no. */
+		sequence = to_be32(sequence);
 		checksum = ext4_crc32c(checksum, &sequence,
 				sizeof(uint32_t));
 		/* Calculate crc32c checksum against tho whole block */
@@ -361,7 +395,7 @@ static void jbd_block_tag_csum_set(struct jbd_fs *jbd_fs, void *__tag,
 
 	if (ver == 2) {
 		struct jbd_block_tag *tag = __tag;
-		tag->checksum = (uint16_t)to_be32(checksum);
+		tag->checksum = to_be16((uint16_t)checksum);
 	} else {
 		struct jbd_block_tag3 *tag = __tag;
 		tag->checksum = to_be32(checksum);
@@ -454,6 +488,8 @@ int jbd_get_fs(struct ext4_fs *fs,
 	/* FIXME: detection on existance ofbkejournal bdev is
 	 *        missing.*/
 	journal_ino = ext4_get32(&fs->sb, journal_inode_number);
+	if (!journal_ino)
+		return ENOTSUP;
 
 	rc = ext4_fs_get_inode_ref(fs,
 				   journal_ino,
@@ -470,8 +506,10 @@ int jbd_get_fs(struct ext4_fs *fs,
 		goto Error;
 	}
 
-	if (rc == EOK)
-		jbd_fs->bdev = fs->bdev;
+	rc = jbd_check_features(jbd_fs);
+	if (rc != EOK)
+		goto Error;
+	jbd_fs->bdev = fs->bdev;
 
 	return rc;
 Error:
@@ -488,9 +526,9 @@ int jbd_put_fs(struct jbd_fs *jbd_fs)
 {
 	int rc = EOK;
 	rc = jbd_write_sb(jbd_fs);
-
-	ext4_fs_put_inode_ref(&jbd_fs->inode_ref);
-	return rc;
+	if (rc != EOK)
+		return rc;
+	return ext4_fs_put_inode_ref(&jbd_fs->inode_ref);
 }
 
 /**@brief  Data block lookup helper.
@@ -545,31 +583,6 @@ static int jbd_block_get(struct jbd_fs *jbd_fs,
 	return rc;
 }
 
-/**@brief   jbd block get function (through cache, don't read).
- * @param   jbd_fs jbd filesystem
- * @param   block block descriptor
- * @param   fblock jbd logical block address
- * @return  standard error code*/
-static int jbd_block_get_noread(struct jbd_fs *jbd_fs,
-			 struct ext4_block *block,
-			 ext4_fsblk_t fblock)
-{
-	/* TODO: journal device. */
-	int rc;
-	struct ext4_blockdev *bdev = jbd_fs->bdev;
-	ext4_lblk_t iblock = (ext4_lblk_t)fblock;
-	rc = jbd_inode_bmap(jbd_fs, iblock,
-			    &fblock);
-	if (rc != EOK)
-		return rc;
-
-	rc = ext4_block_get_noread(bdev, block, fblock);
-	if (rc == EOK)
-		ext4_bcache_set_flag(block->buf, BC_FLUSH);
-
-	return rc;
-}
-
 /**@brief   jbd block set procedure (through cache).
  * @param   jbd_fs jbd filesystem
  * @param   block block descriptor
@@ -578,7 +591,86 @@ static int jbd_block_set(struct jbd_fs *jbd_fs,
 		  struct ext4_block *block)
 {
 	struct ext4_blockdev *bdev = jbd_fs->bdev;
-	return ext4_block_set(bdev, block);
+	int r = ext4_block_flush_buf(bdev, block->buf);
+	/* A failed temporary log write is not a pending home write. The
+	 * transaction owner retains the source and will report the failure. */
+	if (r != EOK)
+		ext4_bcache_clear_dirty(block->buf);
+	int release = ext4_block_set(bdev, block);
+	return r != EOK ? r : release;
+}
+
+/* Reserve all log buffers, mappings and transaction space before touching
+ * ordered data. Otherwise a later ENOMEM could roll back inode size while
+ * leaving already-written data outside the aborted size change visible. */
+struct jbd_log_block {
+	struct ext4_block block;
+	TAILQ_ENTRY(jbd_log_block) node;
+};
+
+static int jbd_prepare_block_get(struct jbd_trans *trans,
+				 struct ext4_block *block, ext4_fsblk_t index)
+{
+	struct jbd_fs *fs = trans->journal->jbd_fs;
+	struct jbd_log_block *log = ext4_calloc(1,
+				 sizeof(*log) + trans->journal->block_size);
+	if (!log) return ENOMEM;
+	int r = jbd_inode_bmap(fs, (ext4_lblk_t)index, &log->block.lb_id);
+	if (r != EOK) {
+		ext4_free(log);
+		return r;
+	}
+	/* These temporary write images have a transaction owner, not a place
+	 * in the home-block LRU. Reserving a large log must not evict unrelated
+	 * dirty file data merely to obtain temporary serialization buffers. */
+	log->block.data = (void *)(log + 1);
+	TAILQ_INSERT_TAIL(&trans->log_queue, log, node);
+	*block = log->block;
+	return EOK;
+}
+
+static int jbd_prepare_block_set(struct jbd_trans *trans __unused,
+				 struct ext4_block *block)
+{
+	/* The queue retains the sole reference; the builder relinquishes its
+	 * borrowed descriptor without triggering an early log write. */
+	*block = (struct ext4_block)EXT4_BLOCK_ZERO();
+	return EOK;
+}
+
+static void jbd_release_prepared(struct jbd_trans *trans)
+{
+	struct jbd_log_block *log;
+	while ((log = TAILQ_FIRST(&trans->log_queue))) {
+		TAILQ_REMOVE(&trans->log_queue, log, node);
+		ext4_free(log);
+	}
+}
+
+static int jbd_write_prepared(struct jbd_trans *trans, bool *submitted)
+{
+	struct jbd_fs *fs = trans->journal->jbd_fs;
+	struct jbd_log_block *log;
+	int r;
+	/* The last prepared block is the commit; preceding records need their
+	 * own durability barrier before it may be submitted. */
+	while ((log = TAILQ_FIRST(&trans->log_queue)) &&
+	       TAILQ_NEXT(log, node)) {
+		TAILQ_REMOVE(&trans->log_queue, log, node);
+		r = ext4_blocks_set_direct(fs->bdev, log->block.data,
+					   log->block.lb_id, 1);
+		ext4_free(log);
+		if (r != EOK) return r;
+	}
+	if (!log) return EINVAL;
+	r = ext4_blockdev_flush(fs->bdev);
+	if (r != EOK) return r;
+	TAILQ_REMOVE(&trans->log_queue, log, node);
+	*submitted = true;
+	r = ext4_blocks_set_direct(fs->bdev, log->block.data,
+				   log->block.lb_id, 1);
+	ext4_free(log);
+	return r != EOK ? r : ext4_blockdev_flush(fs->bdev);
 }
 
 /**@brief  helper functions to calculate
@@ -664,6 +756,7 @@ jbd_extract_block_tag(struct jbd_fs *jbd_fs,
 				     JBD_FEATURE_INCOMPAT_CSUM_V3)) {
 		struct jbd_block_tag3 *tag = __tag;
 		tag_info->block = jbd_get32(tag, blocknr);
+		tag_info->checksum = jbd_get32(tag, checksum);
 		if (JBD_HAS_INCOMPAT_FEATURE(&jbd_fs->sb,
 					     JBD_FEATURE_INCOMPAT_64BIT))
 			 tag_info->block |=
@@ -689,6 +782,7 @@ jbd_extract_block_tag(struct jbd_fs *jbd_fs,
 	} else {
 		struct jbd_block_tag *tag = __tag;
 		tag_info->block = jbd_get32(tag, blocknr);
+		tag_info->checksum = jbd_get16(tag, checksum);
 		if (JBD_HAS_INCOMPAT_FEATURE(&jbd_fs->sb,
 					     JBD_FEATURE_INCOMPAT_64BIT))
 			 tag_info->block |=
@@ -712,6 +806,15 @@ jbd_extract_block_tag(struct jbd_fs *jbd_fs,
 			tag_info->last_tag = true;
 
 	}
+	uint32_t flags = jbd_has_csum(&jbd_fs->sb) == 3 ?
+		jbd_get32((struct jbd_block_tag3 *)__tag, flags) :
+		jbd_get16((struct jbd_block_tag *)__tag, flags);
+	if (flags & ~(JBD_FLAG_ESCAPE | JBD_FLAG_SAME_UUID |
+		      JBD_FLAG_DELETED | JBD_FLAG_LAST_TAG))
+		return EUCLEAN;
+	if (tag_info->block >= jbd_fs->bdev->lg_bcnt ||
+	    (tag_info->uuid_exist && memcmp(tag_info->uuid, jbd_fs->sb.uuid, UUID_SIZE)))
+		return EUCLEAN;
 	return EOK;
 }
 
@@ -768,7 +871,7 @@ jbd_write_block_tag(struct jbd_fs *jbd_fs,
 
 	} else {
 		struct jbd_block_tag *tag = __tag;
-		memset(tag, 0, sizeof(struct jbd_block_tag));
+		memset(tag, 0, tag_bytes);
 		jbd_set32(tag, blocknr, (uint32_t)tag_info->block);
 		if (JBD_HAS_INCOMPAT_FEATURE(&jbd_fs->sb,
 					     JBD_FEATURE_INCOMPAT_64BIT))
@@ -808,7 +911,7 @@ jbd_write_block_tag(struct jbd_fs *jbd_fs,
  * @param  func callback routine to indicate that
  *         a block tag is found
  * @param  arg additional argument to be passed to func */
-static void
+static int
 jbd_iterate_block_table(struct jbd_fs *jbd_fs,
 			void *__tag_start,
 			int32_t tag_tbl_size,
@@ -818,6 +921,7 @@ jbd_iterate_block_table(struct jbd_fs *jbd_fs,
 			void *arg)
 {
 	char *tag_start, *tag_ptr;
+	uint32_t tags = 0;
 	int tag_bytes = jbd_tag_bytes(jbd_fs);
 	tag_start = __tag_start;
 	tag_ptr = tag_start;
@@ -829,7 +933,7 @@ jbd_iterate_block_table(struct jbd_fs *jbd_fs,
 				     JBD_FEATURE_INCOMPAT_CSUM_V3))
 		tag_tbl_size -= sizeof(struct jbd_block_tail);
 
-	while (tag_tbl_size) {
+	while (tag_tbl_size > 0) {
 		struct tag_info tag_info;
 		int rc = jbd_extract_block_tag(jbd_fs,
 				      tag_ptr,
@@ -837,22 +941,26 @@ jbd_iterate_block_table(struct jbd_fs *jbd_fs,
 				      tag_tbl_size,
 				      &tag_info);
 		if (rc != EOK)
-			break;
+			return EUCLEAN;
+
+		if (++tags >= jbd_get32(&jbd_fs->sb, maxlen) - jbd_get32(&jbd_fs->sb, first))
+			return EUCLEAN;
 
 		if (func)
 			func(jbd_fs, &tag_info, arg);
 
 		/* Stop the iteration when we reach the last tag. */
 		if (tag_info.last_tag)
-			break;
+			return EOK;
 
 		tag_ptr += tag_info.tag_bytes;
 		tag_tbl_size -= tag_info.tag_bytes;
 	}
+	return EUCLEAN; /* No complete LAST_TAG within the descriptor payload. */
 }
 
 static void jbd_display_block_tags(struct jbd_fs *jbd_fs,
-				   struct tag_info *tag_info,
+				   struct tag_info *tag_info __unused,
 				   void *arg)
 {
 	uint32_t *iblock = arg;
@@ -877,75 +985,72 @@ jbd_revoke_entry_lookup(struct recover_info *info, ext4_fsblk_t block)
  * @param  jbd_fs jbd filesystem
  * @param  tag_info tag_info of the logged block.*/
 static void jbd_replay_block_tags(struct jbd_fs *jbd_fs,
-				  struct tag_info *tag_info,
-				  void *__arg)
+				  struct tag_info *tag_info, void *__arg)
 {
-	int r;
 	struct replay_arg *arg = __arg;
 	struct recover_info *info = arg->info;
-	uint32_t *this_block = arg->this_block;
-	struct revoke_entry *revoke_entry;
-	struct ext4_block journal_block, ext4_block;
 	struct ext4_fs *fs = jbd_fs->inode_ref.fs;
-
-	(*this_block)++;
-	wrap(&jbd_fs->sb, *this_block);
-
-	/* We replay this block only if the current transaction id
-	 * is equal or greater than that in revoke entry.*/
-	revoke_entry = jbd_revoke_entry_lookup(info, tag_info->block);
-	if (revoke_entry &&
-	    trans_id_diff(arg->this_trans_id, revoke_entry->trans_id) <= 0)
+	struct ext4_block log = EXT4_BLOCK_ZERO();
+	int r;
+	(*arg->this_block)++;
+	wrap(&jbd_fs->sb, *arg->this_block);
+	if (info->error)
 		return;
-
-	ext4_dbg(DEBUG_JBD,
-		 "Replaying block in block_tag: %" PRIu64 "\n",
-		 tag_info->block);
-
-	r = jbd_block_get(jbd_fs, &journal_block, *this_block);
-	if (r != EOK)
+	struct revoke_entry *revoke = jbd_revoke_entry_lookup(info, tag_info->block);
+	if (revoke && trans_id_diff(arg->this_trans_id, revoke->trans_id) <= 0)
 		return;
-
-	/* We need special treatment for ext4 superblock. */
-	if (tag_info->block) {
-		r = ext4_block_get_noread(fs->bdev, &ext4_block, tag_info->block);
-		if (r != EOK) {
-			jbd_block_set(jbd_fs, &journal_block);
+	r = jbd_block_get(jbd_fs, &log, *arg->this_block);
+	if (r != EOK) {
+		info->error = r;
+		return;
+	}
+	if (jbd_has_csum(&jbd_fs->sb)) {
+		uint32_t csum = jbd_block_csum(jbd_fs, log.data, 0, arg->this_trans_id);
+		if (jbd_has_csum(&jbd_fs->sb) == 2)
+			csum = (uint16_t)csum;
+		if (csum != tag_info->checksum) {
+			jbd_block_set(jbd_fs, &log);
+			info->error = EIO;
 			return;
 		}
-
-		memcpy(ext4_block.data,
-			journal_block.data,
-			jbd_get32(&jbd_fs->sb, blocksize));
-
-		if (tag_info->is_escape)
-			((struct jbd_bhdr *)ext4_block.data)->magic =
-					to_be32(JBD_MAGIC_NUMBER);
-
-		ext4_bcache_set_dirty(ext4_block.buf);
-		ext4_block_set(fs->bdev, &ext4_block);
-	} else {
-		uint16_t mount_count, state;
-		mount_count = ext4_get16(&fs->sb, mount_count);
-		state = ext4_get16(&fs->sb, state);
-
-		memcpy(&fs->sb,
-			journal_block.data + EXT4_SUPERBLOCK_OFFSET,
-			EXT4_SUPERBLOCK_SIZE);
-
-		/* Mark system as mounted */
-		ext4_set16(&fs->sb, state, state);
-		r = ext4_sb_write(fs->bdev, &fs->sb);
-		if (r != EOK)
-			return;
-
-		/*Update mount count*/
-		ext4_set16(&fs->sb, mount_count, mount_count);
 	}
-
-	jbd_block_set(jbd_fs, &journal_block);
-	
-	return;
+	if (tag_info->is_escape)
+		((struct jbd_bhdr *)log.data)->magic = to_be32(JBD_MAGIC_NUMBER);
+	uint32_t block_size = jbd_get32(&jbd_fs->sb, blocksize);
+	bool is_super = tag_info->block == EXT4_SUPERBLOCK_OFFSET / block_size;
+	if (is_super) {
+		struct ext4_sblock *super = (void *)(log.data +
+			EXT4_SUPERBLOCK_OFFSET % block_size);
+		/* Never manufacture a good checksum for a corrupt logged image.
+		 * Bootstrap geometry and journal identity cannot change in replay. */
+		if (!ext4_sb_check(super) || ext4_sb_get_block_size(super) != block_size ||
+		    memcmp(super->uuid, fs->sb.uuid, UUID_SIZE)) {
+			jbd_block_set(jbd_fs, &log);
+			info->error = EUCLEAN;
+			return;
+		}
+	}
+	r = ext4_blocks_set_direct(fs->bdev, log.data, tag_info->block, 1);
+	if (r == EOK && is_super) {
+		memcpy(&fs->sb, log.data + EXT4_SUPERBLOCK_OFFSET % block_size,
+		       EXT4_SUPERBLOCK_SIZE);
+		info->super_replayed = true;
+	}
+	if (r == EOK) {
+		/* Recovery precedes normal operations, but inode 8 and mount
+		 * metadata can already be cached. Refresh those live buffers too. */
+		struct ext4_block cached = EXT4_BLOCK_ZERO();
+		struct ext4_buf *buf = ext4_bcache_find_get(fs->bdev->bc, &cached,
+							  tag_info->block);
+		if (buf) {
+			memcpy(buf->data, log.data, block_size);
+			ext4_bcache_clear_dirty(buf);
+			ext4_bcache_set_flag(buf, BC_UPTODATE);
+			r = ext4_block_set(fs->bdev, &cached);
+		}
+	}
+	int release = jbd_block_set(jbd_fs, &log);
+	info->error = r != EOK ? r : release;
 }
 
 /**@brief  Add block address to revoke tree, along with
@@ -967,7 +1072,10 @@ static void jbd_add_revoke_block_tags(struct recover_info *info,
 	}
 
 	revoke_entry = jbd_alloc_revoke_entry();
-	ext4_assert(revoke_entry);
+	if (!revoke_entry) {
+		info->error = ENOMEM;
+		return;
+	}
 	revoke_entry->block = block;
 	revoke_entry->trans_id = info->this_trans_id;
 	RB_INSERT(jbd_revoke, &info->revoke_root, revoke_entry);
@@ -995,7 +1103,7 @@ static void jbd_destroy_revoke_tree(struct recover_info *info)
  * @param  jbd_fs jbd filesystem
  * @param  header revoke block header
  * @param  info  journal replay info*/
-static void jbd_build_revoke_tree(struct jbd_fs *jbd_fs,
+static int jbd_build_revoke_tree(struct jbd_fs *jbd_fs,
 				  struct jbd_bhdr *header,
 				  struct recover_info *info)
 {
@@ -1009,9 +1117,16 @@ static void jbd_build_revoke_tree(struct jbd_fs *jbd_fs,
 				     JBD_FEATURE_INCOMPAT_64BIT))
 		record_len = 8;
 
-	nr_entries = (jbd_get32(revoke_hdr, count) -
-			sizeof(struct jbd_revoke_header)) /
-			record_len;
+	uint32_t count = jbd_get32(revoke_hdr, count);
+	uint32_t payload = jbd_get32(&jbd_fs->sb, blocksize);
+	if (jbd_has_csum(&jbd_fs->sb))
+		payload -= sizeof(struct jbd_revoke_tail);
+	if (count < sizeof(*revoke_hdr) || count > payload ||
+	    (count - sizeof(*revoke_hdr)) % record_len)
+		return EUCLEAN;
+	nr_entries = (count - sizeof(*revoke_hdr)) / record_len;
+	if (!info)
+		return EOK; /* SCAN validates geometry without building the tree. */
 
 	blocks_entry = (char *)(revoke_hdr + 1);
 
@@ -1027,13 +1142,14 @@ static void jbd_build_revoke_tree(struct jbd_fs *jbd_fs,
 		}
 		blocks_entry += record_len;
 	}
+	return info->error;
 }
 
-static void jbd_debug_descriptor_block(struct jbd_fs *jbd_fs,
+static int jbd_debug_descriptor_block(struct jbd_fs *jbd_fs,
 				       struct jbd_bhdr *header,
 				       uint32_t *iblock)
 {
-	jbd_iterate_block_table(jbd_fs,
+	return jbd_iterate_block_table(jbd_fs,
 				header + 1,
 				jbd_get32(&jbd_fs->sb, blocksize) -
 					sizeof(struct jbd_bhdr),
@@ -1041,11 +1157,11 @@ static void jbd_debug_descriptor_block(struct jbd_fs *jbd_fs,
 				iblock);
 }
 
-static void jbd_replay_descriptor_block(struct jbd_fs *jbd_fs,
+static int jbd_replay_descriptor_block(struct jbd_fs *jbd_fs,
 					struct jbd_bhdr *header,
 					struct replay_arg *arg)
 {
-	jbd_iterate_block_table(jbd_fs,
+	return jbd_iterate_block_table(jbd_fs,
 				header + 1,
 				jbd_get32(&jbd_fs->sb, blocksize) -
 					sizeof(struct jbd_bhdr),
@@ -1058,154 +1174,120 @@ static void jbd_replay_descriptor_block(struct jbd_fs *jbd_fs,
  * @param  info  journal replay info
  * @param  action action needed to be taken
  * @return standard error code*/
+/* Linux fs/jbd2/recovery.c at f4cdf7ca9a1f defers a metadata
+ * checksum mismatch during SCAN until a matching commit distinguishes a
+ * committed corruption from interrupted or stale log contents. */
 static int jbd_iterate_log(struct jbd_fs *jbd_fs,
-			   struct recover_info *info,
-			   int action)
+			   struct recover_info *info, int action)
 {
-	int r = EOK;
-	bool log_end = false;
 	struct jbd_sb *sb = &jbd_fs->sb;
-	uint32_t start_trans_id, this_trans_id;
-	uint32_t start_block, this_block;
-
-	/* We start iterating valid blocks in the whole journal.*/
-	start_trans_id = this_trans_id = jbd_get32(sb, sequence);
-	start_block = this_block = jbd_get32(sb, start);
+	uint32_t id = jbd_get32(sb, sequence);
+	uint32_t first_id = id;
+	uint32_t position = jbd_get32(sb, start);
+	uint32_t capacity = jbd_get32(sb, maxlen) - jbd_get32(sb, first);
+	uint32_t remaining = capacity;
+	uint64_t last_commit_time = 0;
+	bool suspect_metadata = false;
+	bool ended = false;
 	if (action == ACTION_SCAN)
 		info->trans_cnt = 0;
 	else if (!info->trans_cnt)
-		log_end = true;
-
-	ext4_dbg(DEBUG_JBD, "Start of journal at trans id: %" PRIu32 "\n",
-			    start_trans_id);
-
-	while (!log_end) {
-		struct ext4_block block;
-		struct jbd_bhdr *header;
-		/* If we are not scanning for the last
-		 * valid transaction in the journal,
-		 * we will stop when we reach the end of
-		 * the journal.*/
-		if (action != ACTION_SCAN)
-			if (trans_id_diff(this_trans_id, info->last_trans_id) > 0) {
-				log_end = true;
-				continue;
-			}
-
-		r = jbd_block_get(jbd_fs, &block, this_block);
-		if (r != EOK)
+		return EOK;
+	while (remaining && !ended) {
+		if (action != ACTION_SCAN && trans_id_diff(id, info->last_trans_id) > 0)
 			break;
-
-		header = (struct jbd_bhdr *)block.data;
-		/* This block does not have a valid magic number,
-		 * so we have reached the end of the journal.*/
-		if (jbd_get32(header, magic) != JBD_MAGIC_NUMBER) {
-			jbd_block_set(jbd_fs, &block);
-			log_end = true;
-			continue;
-		}
-
-		/* If the transaction id we found is not expected,
-		 * we may have reached the end of the journal.
-		 *
-		 * If we are not scanning the journal, something
-		 * bad might have taken place. :-( */
-		if (jbd_get32(header, sequence) != this_trans_id) {
-			if (action != ACTION_SCAN)
-				r = EIO;
-
-			jbd_block_set(jbd_fs, &block);
-			log_end = true;
-			continue;
-		}
-
-		switch (jbd_get32(header, blocktype)) {
+		struct ext4_block block = EXT4_BLOCK_ZERO();
+		uint32_t at = position;
+		int r = jbd_block_get(jbd_fs, &block, position);
+		if (r != EOK)
+			return r;
+		struct jbd_bhdr *header = (void *)block.data;
+		if (jbd_get32(header, magic) != JBD_MAGIC_NUMBER ||
+		    jbd_get32(header, sequence) != id) {
+			ended = true;
+		} else switch (jbd_get32(header, blocktype)) {
 		case JBD_DESCRIPTOR_BLOCK:
 			if (!jbd_verify_meta_csum(jbd_fs, header)) {
-				ext4_dbg(DEBUG_JBD,
-					DBG_WARN "Descriptor block checksum failed."
-						"Journal block: %" PRIu32"\n",
-						this_block);
-				log_end = true;
-				break;
+				if (action != ACTION_SCAN) { r = EIO; break; }
+				suspect_metadata = true;
 			}
-			ext4_dbg(DEBUG_JBD, "Descriptor block: %" PRIu32", "
-					    "trans_id: %" PRIu32"\n",
-					    this_block, this_trans_id);
 			if (action == ACTION_RECOVER) {
-				struct replay_arg replay_arg;
-				replay_arg.info = info;
-				replay_arg.this_block = &this_block;
-				replay_arg.this_trans_id = this_trans_id;
-
-				jbd_replay_descriptor_block(jbd_fs,
-						header, &replay_arg);
+				struct replay_arg arg = { info, &position, id };
+				r = jbd_replay_descriptor_block(jbd_fs, header, &arg);
 			} else
-				jbd_debug_descriptor_block(jbd_fs,
-						header, &this_block);
-
+				r = jbd_debug_descriptor_block(jbd_fs, header, &position);
 			break;
-		case JBD_COMMIT_BLOCK:
-			if (!jbd_verify_commit_csum(jbd_fs,
-					(struct jbd_commit_header *)header)) {
-				ext4_dbg(DEBUG_JBD,
-					DBG_WARN "Commit block checksum failed."
-						"Journal block: %" PRIu32"\n",
-						this_block);
-				log_end = true;
+		case JBD_REVOKE_BLOCK:
+			/* Check lengths before accessing entries, including in SCAN. */
+			r = jbd_build_revoke_tree(jbd_fs, header, NULL);
+			if (r != EOK)
+				break;
+			if (!jbd_verify_meta_csum(jbd_fs, header)) {
+				if (action != ACTION_SCAN) { r = EIO; break; }
+				suspect_metadata = true;
+			}
+			if (action == ACTION_REVOKE) {
+				info->this_trans_id = id;
+				r = jbd_build_revoke_tree(jbd_fs, header, info);
+			}
+			break;
+		case JBD_COMMIT_BLOCK: {
+			struct jbd_commit_header *commit = (void *)header;
+			uint64_t time = to_be64(commit->commit_sec);
+			if (suspect_metadata) {
+				if (time >= last_commit_time)
+					r = EIO;
+				else
+					ended = true;
 				break;
 			}
-			ext4_dbg(DEBUG_JBD, "Commit block: %" PRIu32", "
-					    "trans_id: %" PRIu32"\n",
-					    this_block, this_trans_id);
-			/*
-			 * This is the end of a transaction,
-			 * we may now proceed to the next transaction.
-			 */
-			this_trans_id++;
+			bool valid = jbd_verify_commit_csum(jbd_fs, commit);
+			if (!valid) {
+				/* Linux accepts an intact commit header when the unused
+				 * padding sectors did not reach disk. */
+				void *partial = ext4_calloc(1, jbd_get32(sb, blocksize));
+				if (!partial) { r = ENOMEM; break; }
+				memcpy(partial, commit, sizeof(*commit));
+				valid = jbd_verify_commit_csum(jbd_fs, partial);
+				ext4_free(partial);
+			}
+			if (!valid) {
+				if (time < last_commit_time)
+					ended = true;
+				else
+					r = EIO;
+				break;
+			}
+			last_commit_time = time;
+			id++;
 			if (action == ACTION_SCAN)
 				info->trans_cnt++;
 			break;
-		case JBD_REVOKE_BLOCK:
-			if (!jbd_verify_meta_csum(jbd_fs, header)) {
-				ext4_dbg(DEBUG_JBD,
-					DBG_WARN "Revoke block checksum failed."
-						"Journal block: %" PRIu32"\n",
-						this_block);
-				log_end = true;
-				break;
-			}
-			ext4_dbg(DEBUG_JBD, "Revoke block: %" PRIu32", "
-					    "trans_id: %" PRIu32"\n",
-					    this_block, this_trans_id);
-			if (action == ACTION_REVOKE) {
-				info->this_trans_id = this_trans_id;
-				jbd_build_revoke_tree(jbd_fs,
-						header, info);
-			}
-			break;
+		}
 		default:
-			log_end = true;
+			ended = true;
 			break;
 		}
-		jbd_block_set(jbd_fs, &block);
-		this_block++;
-		wrap(sb, this_block);
-		if (this_block == start_block)
-			log_end = true;
-
+		int release = jbd_block_set(jbd_fs, &block);
+		if (r != EOK || info->error || release != EOK)
+			return r != EOK ? r : info->error ? info->error : release;
+		uint32_t skipped = position >= at ? position - at : capacity - (at - position);
+		if (skipped >= remaining) {
+			ended = true;
+			break;
+		}
+		remaining -= skipped + 1;
+		position++;
+		wrap(sb, position);
 	}
-	ext4_dbg(DEBUG_JBD, "End of journal.\n");
-	if (r == EOK && action == ACTION_SCAN) {
-		/* We have finished scanning the journal. */
-		info->start_trans_id = start_trans_id;
-		if (trans_id_diff(this_trans_id, start_trans_id) > 0)
-			info->last_trans_id = this_trans_id - 1;
-		else
-			info->last_trans_id = this_trans_id;
+	if (action == ACTION_SCAN) {
+		info->start_trans_id = first_id;
+		info->last_trans_id = info->trans_cnt ? id - 1 : first_id;
+	} else if (id != info->last_trans_id + 1) {
+		/* A later pass must reach exactly the end proven by SCAN. */
+		return EIO;
 	}
-
-	return r;
+	return EOK;
 }
 
 /**@brief  Replay journal.
@@ -1214,40 +1296,40 @@ static int jbd_iterate_log(struct jbd_fs *jbd_fs,
 int jbd_recover(struct jbd_fs *jbd_fs)
 {
 	int r;
-	struct recover_info info;
-	struct jbd_sb *sb = &jbd_fs->sb;
-	if (!sb->start)
-		return EOK;
-
+	struct recover_info info = {0};
+	struct ext4_fs *fs = jbd_fs->inode_ref.fs;
+	r = jbd_check_features(jbd_fs);
+	if (r != EOK)
+		return r;
+	if (!jbd_fs->sb.start)
+		return fs->super_replay_required ? EUCLEAN : EOK;
+	if (fs->read_only)
+		return EROFS;
+	if (!jbd_fs->bdev->bdif->flush)
+		return ENOTSUP;
 	RB_INIT(&info.revoke_root);
-
 	r = jbd_iterate_log(jbd_fs, &info, ACTION_SCAN);
-	if (r != EOK)
-		return r;
-
-	r = jbd_iterate_log(jbd_fs, &info, ACTION_REVOKE);
-	if (r != EOK)
-		return r;
-
-	r = jbd_iterate_log(jbd_fs, &info, ACTION_RECOVER);
+	if (r == EOK)
+		r = jbd_iterate_log(jbd_fs, &info, ACTION_REVOKE);
+	if (r == EOK)
+		r = jbd_iterate_log(jbd_fs, &info, ACTION_RECOVER);
+	if (r == EOK && fs->super_replay_required && !info.super_replayed)
+		r = EUCLEAN;
+	/* Never discard recovery information before all home writes persist. */
+	if (r == EOK)
+		r = ext4_blockdev_flush(jbd_fs->bdev);
 	if (r == EOK) {
-		/* If we successfully replay the journal,
-		 * clear EXT4_FINCOM_RECOVER flag on the
-		 * ext4 superblock, and set the start of
-		 * journal to 0.*/
-		uint32_t features_incompatible =
-			ext4_get32(&jbd_fs->inode_ref.fs->sb,
-				   features_incompatible);
+		fs->super_replay_required = false;
 		jbd_set32(&jbd_fs->sb, start, 0);
-		jbd_set32(&jbd_fs->sb, sequence, info.last_trans_id);
-		features_incompatible &= ~EXT4_FINCOM_RECOVER;
-		ext4_set32(&jbd_fs->inode_ref.fs->sb,
-			   features_incompatible,
-			   features_incompatible);
+		jbd_set32(&jbd_fs->sb, sequence, info.last_trans_id + 1);
 		jbd_fs->dirty = true;
-		r = ext4_sb_write(jbd_fs->bdev,
-				  &jbd_fs->inode_ref.fs->sb);
+		r = jbd_write_sb(jbd_fs);
+		if (r == EOK)
+			r = ext4_blockdev_flush(jbd_fs->bdev);
 	}
+	/* RECOVER is changed only by the journalled start/stop superblock
+	 * transactions. A direct write here, after discarding the log, could
+	 * tear the 1024-byte primary across physical 512-byte sectors. */
 	jbd_destroy_revoke_tree(&info);
 	return r;
 }
@@ -1260,6 +1342,50 @@ static void jbd_journal_write_sb(struct jbd_journal *journal)
 	jbd_fs->dirty = true;
 }
 
+/* Publish mount state through the same durable log/checkpoint protocol as
+ * ordinary metadata. A torn primary always retains a complete replay image. */
+static int jbd_journal_update_super(struct jbd_journal *journal, bool active)
+{
+	struct ext4_fs *fs = journal->jbd_fs->inode_ref.fs;
+	struct ext4_sblock before = fs->sb;
+	struct ext4_block block = EXT4_BLOCK_ZERO();
+	struct jbd_trans *trans = jbd_journal_new_trans(journal);
+	if (!trans)
+		return journal->error ? journal->error : ENOMEM;
+	int r = ext4_block_get(fs->bdev, &block,
+		EXT4_SUPERBLOCK_OFFSET / journal->block_size);
+	if (r == EOK)
+		r = jbd_trans_get_write_access(trans, &block);
+	if (r == EOK) {
+		uint32_t features = ext4_get32(&fs->sb, features_incompatible);
+		ext4_set32(&fs->sb, features_incompatible, active ?
+			features | EXT4_FINCOM_RECOVER : features & ~EXT4_FINCOM_RECOVER);
+		if (active)
+			ext4_set16(&fs->sb, mount_count,
+				ext4_get16(&fs->sb, mount_count) + 1);
+		ext4_sb_set_csum(&fs->sb);
+		memcpy(block.data + EXT4_SUPERBLOCK_OFFSET % journal->block_size,
+		       &fs->sb, sizeof(fs->sb));
+		r = jbd_trans_set_block_dirty(trans, &block);
+	}
+	if (block.data) {
+		fs->bdev->cache_write_back++;
+		int release = ext4_block_set(fs->bdev, &block);
+		fs->bdev->cache_write_back--;
+		if (r == EOK)
+			r = release;
+	}
+	if (r != EOK) {
+		jbd_journal_free_trans(journal, trans, true);
+		fs->sb = before;
+		return r;
+	}
+	r = jbd_journal_commit_trans(journal, trans);
+	if (r != EOK && !journal->error)
+		fs->sb = before;
+	return r;
+}
+
 /**@brief  Start accessing the journal.
  * @param  jbd_fs jbd filesystem
  * @param  journal current journal session
@@ -1268,18 +1394,17 @@ int jbd_journal_start(struct jbd_fs *jbd_fs,
 		      struct jbd_journal *journal)
 {
 	int r;
-	uint32_t features_incompatible =
-			ext4_get32(&jbd_fs->inode_ref.fs->sb,
-				   features_incompatible);
-	features_incompatible |= EXT4_FINCOM_RECOVER;
-	ext4_set32(&jbd_fs->inode_ref.fs->sb,
-			features_incompatible,
-			features_incompatible);
-	r = ext4_sb_write(jbd_fs->bdev,
-			&jbd_fs->inode_ref.fs->sb);
+	struct ext4_fs *fs = jbd_fs->inode_ref.fs;
+	memset(journal, 0, sizeof(*journal));
+	if (fs->read_only)
+		return EROFS;
+	r = jbd_check_features(jbd_fs);
 	if (r != EOK)
 		return r;
-
+	if (jbd_fs->sb.start || fs->super_replay_required)
+		return EUCLEAN;
+	if (!jbd_fs->bdev->bdif->flush)
+		return ENOTSUP;
 	journal->first = jbd_get32(&jbd_fs->sb, first);
 	journal->start = journal->first;
 	journal->last = journal->first;
@@ -1290,19 +1415,41 @@ int jbd_journal_start(struct jbd_fs *jbd_fs,
 	 */
 	journal->trans_id = jbd_get32(&jbd_fs->sb, sequence) + 1;
 	journal->alloc_trans_id = journal->trans_id;
+	journal->committed_id = journal->trans_id - 1;
 
 	journal->block_size = jbd_get32(&jbd_fs->sb, blocksize);
 
 	TAILQ_INIT(&journal->cp_queue);
 	RB_INIT(&journal->block_rec_root);
 	journal->jbd_fs = jbd_fs;
+	/* From this point the mount owns a live journal, including on failure. */
+	jbd_fs->bdev->journal = journal;
+	fs->journaled_session = true;
 	jbd_journal_write_sb(journal);
 	r = jbd_write_sb(jbd_fs);
-	if (r != EOK)
+	if (r == EOK)
+		r = ext4_blockdev_flush(jbd_fs->bdev);
+	if (r != EOK) {
+		journal->error = r;
 		return r;
-
-	jbd_fs->bdev->journal = journal;
-	return EOK;
+	}
+	r = jbd_journal_update_super(journal, true);
+	if (r == EOK)
+		r = jbd_journal_purge_cp_trans(journal, true, false);
+	else if (!journal->error) {
+		/* A resource failure submitted no commit. Close the empty log so
+		 * a later start can retry without an artificial recovery owner. */
+		journal->start = 0;
+		jbd_journal_write_sb(journal);
+		int cleanup = jbd_write_sb(jbd_fs);
+		if (cleanup == EOK)
+			cleanup = ext4_blockdev_flush(jbd_fs->bdev);
+		if (cleanup != EOK)
+			r = journal->error = cleanup;
+		else
+			jbd_fs->bdev->journal = NULL;
+	}
+	return r;
 }
 
 static void jbd_trans_end_write(struct ext4_bcache *bc __unused,
@@ -1312,102 +1459,96 @@ static void jbd_trans_end_write(struct ext4_bcache *bc __unused,
 
 /*
  * This routine is only suitable to committed transactions. */
-static void jbd_journal_flush_trans(struct jbd_trans *trans)
+static int jbd_journal_flush_trans(struct jbd_trans *trans)
 {
-	struct jbd_buf *jbd_buf, *tmp;
 	struct jbd_journal *journal = trans->journal;
-	struct ext4_fs *fs = journal->jbd_fs->inode_ref.fs;
-	void *tmp_data = ext4_malloc(journal->block_size);
-	ext4_assert(tmp_data);
-
-	TAILQ_FOREACH_SAFE(jbd_buf, &trans->buf_queue, buf_node,
-			tmp) {
-		struct ext4_buf *buf;
-		struct ext4_block block;
-		/* The buffer is not yet flushed. */
-		buf = ext4_bcache_find_get(fs->bdev->bc, &block,
-					   jbd_buf->block_rec->lba);
-		if (!(buf && ext4_bcache_test_flag(buf, BC_UPTODATE) &&
-		      jbd_buf->block_rec->trans == trans)) {
-			int r;
-			struct ext4_block jbd_block = EXT4_BLOCK_ZERO();
-			r = jbd_block_get(journal->jbd_fs,
-						&jbd_block,
-						jbd_buf->jbd_lba);
-			ext4_assert(r == EOK);
-			memcpy(tmp_data, jbd_block.data,
-					journal->block_size);
-			ext4_block_set(fs->bdev, &jbd_block);
-			r = ext4_blocks_set_direct(fs->bdev, tmp_data,
-					jbd_buf->block_rec->lba, 1);
-			jbd_trans_end_write(fs->bdev->bc, buf, r, jbd_buf);
-		} else
-			ext4_block_flush_buf(fs->bdev, buf);
-
-		if (buf)
-			ext4_block_set(fs->bdev, &block);
+	struct ext4_blockdev *bdev = journal->jbd_fs->bdev;
+	while (!TAILQ_EMPTY(&trans->buf_queue)) {
+		struct jbd_buf *jb = TAILQ_FIRST(&trans->buf_queue);
+		struct ext4_block block = EXT4_BLOCK_ZERO();
+		struct ext4_buf *buf = ext4_bcache_find_get(bdev->bc, &block,
+							jb->block_rec->lba);
+		int r;
+		if (buf && ext4_bcache_test_flag(buf, BC_UPTODATE) &&
+		    jb->block_rec->trans == trans) {
+			r = ext4_block_flush_buf(bdev, buf);
+		} else {
+			struct ext4_block log = EXT4_BLOCK_ZERO();
+			r = jbd_block_get(journal->jbd_fs, &log, jb->jbd_lba);
+			if (r == EOK) {
+				/* Restore the escaped magic before writing the home block. */
+				if (jb->escaped)
+					((struct jbd_bhdr *)log.data)->magic = to_be32(JBD_MAGIC_NUMBER);
+				r = ext4_blocks_set_direct(bdev, log.data, jb->block_rec->lba, 1);
+				int release = jbd_block_set(journal->jbd_fs, &log);
+				if (r == EOK)
+					r = release;
+			}
+			jbd_trans_end_write(bdev->bc, buf, r, jb);
+		}
+		if (buf) {
+			/* Avoid a second, implicit home write on the error path. */
+			bdev->cache_write_back++;
+			int release = ext4_block_set(bdev, &block);
+			bdev->cache_write_back--;
+			if (r == EOK)
+				r = release;
+		}
+		if (r != EOK)
+			return r;
 	}
-
-	ext4_free(tmp_data);
+	return EOK;
 }
 
-static void
-jbd_journal_skip_pure_revoke(struct jbd_journal *journal,
-			     struct jbd_trans *trans)
-{
-	journal->start = trans->start_iblock +
-		trans->alloc_blocks;
-	wrap(&journal->jbd_fs->sb, journal->start);
-	journal->trans_id = trans->trans_id + 1;
-	jbd_journal_free_trans(journal,
-			trans, false);
-	jbd_journal_write_sb(journal);
-}
-
-void
-jbd_journal_purge_cp_trans(struct jbd_journal *journal,
-			   bool flush,
-			   bool once)
+int jbd_journal_purge_cp_trans(struct jbd_journal *journal,
+			      bool flush, bool once)
 {
 	struct jbd_trans *trans;
+	int r;
+	if (journal->error)
+		return journal->error;
 	while ((trans = TAILQ_FIRST(&journal->cp_queue))) {
-		if (!trans->data_cnt) {
-			TAILQ_REMOVE(&journal->cp_queue,
-					trans,
-					trans_node);
-			jbd_journal_skip_pure_revoke(journal, trans);
-		} else {
-			if (trans->data_cnt ==
-					trans->written_cnt) {
-				journal->start =
-					trans->start_iblock +
-					trans->alloc_blocks;
-				wrap(&journal->jbd_fs->sb,
-						journal->start);
-				journal->trans_id =
-					trans->trans_id + 1;
-				TAILQ_REMOVE(&journal->cp_queue,
-						trans,
-						trans_node);
-				jbd_journal_free_trans(journal,
-						trans,
-						false);
-				jbd_journal_write_sb(journal);
-			} else if (!flush) {
-				journal->start =
-					trans->start_iblock;
-				wrap(&journal->jbd_fs->sb,
-						journal->start);
-				journal->trans_id =
-					trans->trans_id;
-				jbd_journal_write_sb(journal);
+		if (trans->written_cnt != trans->data_cnt) {
+			if (!flush)
 				break;
-			} else
-				jbd_journal_flush_trans(trans);
+			r = jbd_journal_flush_trans(trans);
+			if (r != EOK)
+				goto Error;
 		}
+		/* Completed writes are still volatile until this barrier. */
+		r = ext4_blockdev_flush(journal->jbd_fs->bdev);
+		if (r != EOK)
+			goto Error;
+		uint32_t old_start = journal->start, old_id = journal->trans_id;
+		journal->start = trans->start_iblock + trans->alloc_blocks;
+		wrap(&journal->jbd_fs->sb, journal->start);
+		journal->trans_id = trans->trans_id + 1;
+		jbd_journal_write_sb(journal);
+		r = jbd_write_sb(journal->jbd_fs);
+		if (r == EOK)
+			r = ext4_blockdev_flush(journal->jbd_fs->bdev);
+		if (r != EOK) {
+			journal->start = old_start;
+			journal->trans_id = old_id;
+			jbd_journal_write_sb(journal);
+			goto Error;
+		}
+		TAILQ_REMOVE(&journal->cp_queue, trans, trans_node);
+		jbd_journal_free_trans(journal, trans, false);
 		if (once)
 			break;
 	}
+	return EOK;
+Error:
+	journal->error = r;
+	return r;
+}
+
+int jbd_journal_sync(struct jbd_journal *journal, uint32_t trans_id)
+{
+	if (journal->error)
+		return journal->error;
+	return trans_id_diff(trans_id, journal->committed_id) > 0 ? EAGAIN : EOK;
 }
 
 /**@brief  Stop accessing the journal.
@@ -1417,35 +1558,26 @@ int jbd_journal_stop(struct jbd_journal *journal)
 {
 	int r;
 	struct jbd_fs *jbd_fs = journal->jbd_fs;
-	uint32_t features_incompatible;
-
-	/* Make sure that journalled content have reached
-	 * the disk.*/
-	jbd_journal_purge_cp_trans(journal, true, false);
-
-	/* There should be no block record in this journal
-	 * session. */
-	if (!RB_EMPTY(&journal->block_rec_root))
-		ext4_dbg(DEBUG_JBD,
-			 DBG_WARN "There are still block records "
-			 	  "in this journal session!\n");
-
-	features_incompatible =
-		ext4_get32(&jbd_fs->inode_ref.fs->sb,
-			   features_incompatible);
-	features_incompatible &= ~EXT4_FINCOM_RECOVER;
-	ext4_set32(&jbd_fs->inode_ref.fs->sb,
-			features_incompatible,
-			features_incompatible);
-	r = ext4_sb_write(jbd_fs->bdev,
-			&jbd_fs->inode_ref.fs->sb);
+	if (jbd_fs->inode_ref.fs->read_only)
+		return EROFS;
+	if (journal->error)
+		return journal->error;
+	r = jbd_journal_update_super(journal, false);
+	if (r != EOK)
+		return r;
+	/* The clean primary is stable before its recovery image is reclaimed. */
+	r = jbd_journal_purge_cp_trans(journal, true, false);
 	if (r != EOK)
 		return r;
 
 	journal->start = 0;
-	journal->trans_id = 0;
 	jbd_journal_write_sb(journal);
-	return jbd_write_sb(journal->jbd_fs);
+	r = jbd_write_sb(journal->jbd_fs);
+	if (r == EOK)
+		r = ext4_blockdev_flush(jbd_fs->bdev);
+	if (r != EOK)
+		journal->error = r;
+	return r;
 }
 
 /**@brief  Allocate a block in the journal.
@@ -1455,20 +1587,19 @@ int jbd_journal_stop(struct jbd_journal *journal)
 static uint32_t jbd_journal_alloc_block(struct jbd_journal *journal,
 					struct jbd_trans *trans)
 {
-	uint32_t start_block;
-
-	start_block = journal->last++;
-	trans->alloc_blocks++;
-	wrap(&journal->jbd_fs->sb, journal->last);
-	
-	/* If there is no space left, flush just one journalled
-	 * transaction.*/
-	if (journal->last == journal->start) {
-		jbd_journal_purge_cp_trans(journal, true, true);
-		ext4_assert(journal->last != journal->start);
+	uint32_t next = journal->last + 1;
+	wrap(&journal->jbd_fs->sb, next);
+	if (next == journal->start) {
+		int r = jbd_journal_purge_cp_trans(journal, true, true);
+		if (r != EOK || next == journal->start) {
+			trans->error = r != EOK ? r : ENOSPC;
+			return 0;
+		}
 	}
-
-	return start_block;
+	uint32_t block = journal->last;
+	journal->last = next;
+	trans->alloc_blocks++;
+	return block;
 }
 
 static struct jbd_block_rec *
@@ -1556,14 +1687,18 @@ jbd_trans_finish_callback(struct jbd_journal *journal,
 		if (jbd_buf) {
 			if (!revoke) {
 				int r;
-				r = ext4_block_get_noread(fs->bdev,
-							&block,
-							block_rec->lba);
-				ext4_assert(r == EOK);
-				r = jbd_block_get(journal->jbd_fs,
-							&jbd_block,
-							jbd_buf->jbd_lba);
-				ext4_assert(r == EOK);
+				r = ext4_block_get_noread(fs->bdev, &block, block_rec->lba);
+				if (r == EOK)
+					r = jbd_block_get(journal->jbd_fs, &jbd_block, jbd_buf->jbd_lba);
+				if (r != EOK) {
+					/* The earlier committed transaction still owns its
+					 * log record even when rollback cannot read it. */
+					journal->error = r;
+					jbd_trans_change_ownership(block_rec, jbd_buf->trans);
+					if (block.lb_id)
+						ext4_block_set(fs->bdev, &block);
+					return;
+				}
 				memcpy(block.data, jbd_block.data,
 						journal->block_size);
 
@@ -1604,6 +1739,111 @@ jbd_trans_remove_block_rec(struct jbd_journal *journal,
 	}
 }
 
+static struct jbd_data *jbd_trans_find_data(struct jbd_trans *trans,
+					 ext4_fsblk_t lba)
+{
+	struct jbd_data *data;
+	TAILQ_FOREACH(data, &trans->data_queue, node)
+		if (data->block.lb_id == lba)
+			return data;
+	return NULL;
+}
+
+int jbd_trans_get_data_access(struct jbd_trans *trans,
+			      struct ext4_block *block)
+{
+	struct jbd_journal *journal = trans->journal;
+	struct ext4_blockdev *bdev = journal->jbd_fs->bdev;
+	if (journal->error || trans->error)
+		return journal->error ? journal->error : trans->error;
+	if (jbd_trans_find_data(trans, block->lb_id))
+		return EOK;
+	struct jbd_data *data = ext4_calloc(1, sizeof(*data));
+	if (!data)
+		return ENOMEM;
+	data->before = ext4_malloc(journal->block_size);
+	if (!data->before) {
+		ext4_free(data);
+		return ENOMEM;
+	}
+	/* Reallocated metadata may still belong to an older committed log.
+	 * Checkpoint that old image before mutation and revoke it in this commit,
+	 * so replay cannot overwrite this block's new file-data incarnation. */
+	struct jbd_block_rec *rec = jbd_trans_block_rec_lookup(journal, block->lb_id);
+	int r = EOK;
+	if (rec) {
+		if (rec->trans == trans)
+			r = EINVAL; /* A block cannot be metadata and file data together. */
+		else {
+			r = jbd_trans_revoke_block(trans, block->lb_id);
+			if (r == EOK)
+				r = ext4_block_flush_buf(bdev, block->buf);
+		}
+	}
+	if (r != EOK) {
+		ext4_free(data->before);
+		ext4_free(data);
+		return r;
+	}
+	data->block = *block;
+	memcpy(data->before, block->data, journal->block_size);
+	data->was_dirty = ext4_bcache_test_flag(block->buf, BC_DIRTY);
+	ext4_bcache_inc_ref(block->buf);
+	TAILQ_INSERT_TAIL(&trans->data_queue, data, node);
+	return EOK;
+}
+
+int jbd_trans_set_data_dirty(struct jbd_trans *trans,
+			     struct ext4_block *block)
+{
+	if (trans->journal->error || trans->error)
+		return trans->journal->error ? trans->journal->error : trans->error;
+	struct jbd_data *data = jbd_trans_find_data(trans, block->lb_id);
+	if (!data)
+		return EINVAL;
+	data->modified = true;
+	ext4_bcache_set_dirty(block->buf);
+	return EOK;
+}
+
+static void jbd_trans_release_data(struct jbd_trans *trans, bool abort)
+{
+	struct ext4_blockdev *bdev = trans->journal->jbd_fs->bdev;
+	struct jbd_data *data, *next;
+	bdev->cache_write_back++;
+	TAILQ_FOREACH_SAFE(data, &trans->data_queue, node, next) {
+		if (abort || !data->modified) {
+			memcpy(data->block.data, data->before, trans->journal->block_size);
+			ext4_bcache_set_flag(data->block.buf, BC_UPTODATE);
+			if (data->was_dirty)
+				ext4_bcache_set_dirty(data->block.buf);
+			else
+				ext4_bcache_clear_dirty(data->block.buf);
+		}
+		ext4_block_set(bdev, &data->block);
+		TAILQ_REMOVE(&trans->data_queue, data, node);
+		ext4_free(data->before);
+		ext4_free(data);
+	}
+	bdev->cache_write_back--;
+}
+
+static int jbd_trans_write_data(struct jbd_trans *trans)
+{
+	struct ext4_blockdev *bdev = trans->journal->jbd_fs->bdev;
+	struct jbd_data *data;
+	bool modified = false;
+	TAILQ_FOREACH(data, &trans->data_queue, node) {
+		if (!data->modified)
+			continue;
+		modified = true;
+		int r = ext4_block_flush_buf(bdev, data->block.buf);
+		if (r != EOK)
+			return r;
+	}
+	return modified ? ext4_blockdev_flush(bdev) : EOK;
+}
+
 /**@brief  Add block to a transaction and mark it dirty.
  * @param  trans transaction
  * @param  block block descriptor
@@ -1611,6 +1851,10 @@ jbd_trans_remove_block_rec(struct jbd_journal *journal,
 int jbd_trans_set_block_dirty(struct jbd_trans *trans,
 			      struct ext4_block *block)
 {
+	if (trans->journal->error)
+		return trans->journal->error;
+	if (jbd_trans_find_data(trans, block->lb_id))
+		return EINVAL;
 	struct jbd_buf *jbd_buf;
 	struct jbd_revoke_rec *rec, tmp_rec = {
 		.lba = block->lb_id
@@ -1619,8 +1863,11 @@ int jbd_trans_set_block_dirty(struct jbd_trans *trans,
 
 	if (block->buf->end_write == jbd_trans_end_write) {
 		jbd_buf = block->buf->end_write_arg;
-		if (jbd_buf && jbd_buf->trans == trans)
+		if (jbd_buf && jbd_buf->trans == trans) {
+			jbd_buf->modified = true;
+			ext4_bcache_set_dirty(block->buf);
 			return EOK;
+		}
 	}
 	jbd_buf = ext4_calloc(1, sizeof(struct jbd_buf));
 	if (!jbd_buf)
@@ -1639,6 +1886,7 @@ int jbd_trans_set_block_dirty(struct jbd_trans *trans,
 	jbd_buf->block_rec = block_rec;
 	jbd_buf->trans = trans;
 	jbd_buf->block = *block;
+	jbd_buf->modified = true;
 	ext4_bcache_inc_ref(block->buf);
 
 	/* If the content reach the disk, notify us
@@ -1660,6 +1908,56 @@ int jbd_trans_set_block_dirty(struct jbd_trans *trans,
 	}
 
 	return EOK;
+}
+
+int jbd_trans_get_write_access(struct jbd_trans *trans,
+			       struct ext4_block *block)
+{
+	struct jbd_buf *jb = block->buf->end_write_arg;
+	if (trans->journal->error)
+		return trans->journal->error;
+	if (trans->error)
+		return trans->error;
+	if (block->buf->end_write == jbd_trans_end_write &&
+	    jb && jb->trans == trans)
+		return EOK;
+	void *before = ext4_malloc(trans->journal->block_size);
+	if (!before)
+		return ENOMEM;
+	memcpy(before, block->data, trans->journal->block_size);
+	bool dirty = ext4_bcache_test_flag(block->buf, BC_DIRTY);
+	int r = jbd_trans_set_block_dirty(trans, block);
+	if (r != EOK) {
+		ext4_free(before);
+		return r;
+	}
+	jb = block->buf->end_write_arg;
+	jb->before = before;
+	jb->was_dirty = dirty;
+	jb->modified = false;
+	if (!dirty)
+		ext4_bcache_clear_flag(block->buf, BC_DIRTY);
+	return EOK;
+}
+
+/* The caller has already removed this access from dirty_buf_queue. Restore
+ * existing references in place and return the earlier committed owner. This
+ * path performs no I/O and cannot fail after a successful reservation. */
+static void jbd_trans_restore_access(struct jbd_buf *jb)
+{
+	struct ext4_buf *buf = jb->block.buf;
+	struct jbd_buf *previous =
+		TAILQ_LAST(&jb->block_rec->dirty_buf_queue, jbd_buf_dirty);
+	memcpy(buf->data, jb->before, jb->trans->journal->block_size);
+	ext4_bcache_set_flag(buf, BC_UPTODATE);
+	if (jb->was_dirty)
+		ext4_bcache_set_dirty(buf);
+	else
+		ext4_bcache_clear_flag(buf, BC_DIRTY);
+	buf->end_write = previous ? jbd_trans_end_write : NULL;
+	buf->end_write_arg = previous;
+	if (previous)
+		jbd_trans_change_ownership(jb->block_rec, previous->trans);
 }
 
 /**@brief  Add block to be revoked to a transaction
@@ -1708,10 +2006,10 @@ int jbd_trans_try_revoke_block(struct jbd_trans *trans,
 			/* If there are still unwritten buffers. */
 			if (TAILQ_FIRST(&block_rec->dirty_buf_queue) !=
 			    jbd_buf)
-				jbd_trans_revoke_block(trans, lba);
+				return jbd_trans_revoke_block(trans, lba);
 
 		} else
-			jbd_trans_revoke_block(trans, lba);
+			return jbd_trans_revoke_block(trans, lba);
 	}
 
 	return EOK;
@@ -1729,10 +2027,12 @@ void jbd_journal_free_trans(struct jbd_journal *journal,
 	struct jbd_revoke_rec *rec, *tmp2;
 	struct jbd_block_rec *block_rec, *tmp3;
 	struct ext4_fs *fs = journal->jbd_fs->inode_ref.fs;
+	jbd_release_prepared(trans);
+	jbd_trans_release_data(trans, abort);
 	TAILQ_FOREACH_SAFE(jbd_buf, &trans->buf_queue, buf_node,
 			  tmp) {
 		block_rec = jbd_buf->block_rec;
-		if (abort) {
+		if (abort && !jbd_buf->before) {
 			jbd_buf->block.buf->end_write = NULL;
 			jbd_buf->block.buf->end_write_arg = NULL;
 			ext4_bcache_clear_dirty(jbd_buf->block.buf);
@@ -1742,12 +2042,18 @@ void jbd_journal_free_trans(struct jbd_journal *journal,
 		TAILQ_REMOVE(&jbd_buf->block_rec->dirty_buf_queue,
 			jbd_buf,
 			dirty_buf_node);
-		jbd_trans_finish_callback(journal,
+		if (abort && jbd_buf->before) {
+			jbd_trans_restore_access(jbd_buf);
+			fs->bdev->cache_write_back++;
+			ext4_block_set(fs->bdev, &jbd_buf->block);
+			fs->bdev->cache_write_back--;
+		} else jbd_trans_finish_callback(journal,
 				trans,
 				block_rec,
 				abort,
 				false);
 		TAILQ_REMOVE(&trans->buf_queue, jbd_buf, buf_node);
+		ext4_free(jbd_buf->before);
 		ext4_free(jbd_buf);
 	}
 	RB_FOREACH_SAFE(rec, jbd_revoke_tree, &trans->revoke_root,
@@ -1766,7 +2072,7 @@ void jbd_journal_free_trans(struct jbd_journal *journal,
 /**@brief  Write commit block for a transaction
  * @param  trans transaction
  * @return standard error code*/
-static int jbd_trans_write_commit_block(struct jbd_trans *trans)
+static int jbd_trans_prepare_commit_block(struct jbd_trans *trans)
 {
 	int rc;
 	struct ext4_block block;
@@ -1775,11 +2081,14 @@ static int jbd_trans_write_commit_block(struct jbd_trans *trans)
 	struct jbd_journal *journal = trans->journal;
 
 	commit_iblock = jbd_journal_alloc_block(journal, trans);
+	if (!commit_iblock)
+		return trans->error;
 
-	rc = jbd_block_get_noread(journal->jbd_fs, &block, commit_iblock);
+	rc = jbd_prepare_block_get(trans, &block, commit_iblock);
 	if (rc != EOK)
 		return rc;
 
+	memset(block.data, 0, journal->block_size);
 	header = (struct jbd_commit_header *)block.data;
 	jbd_set32(&header->header, magic, JBD_MAGIC_NUMBER);
 	jbd_set32(&header->header, blocktype, JBD_COMMIT_BLOCK);
@@ -1792,9 +2101,7 @@ static int jbd_trans_write_commit_block(struct jbd_trans *trans)
 		jbd_set32(header, chksum[0], trans->data_csum);
 	}
 	jbd_commit_csum_set(journal->jbd_fs, header);
-	ext4_bcache_set_dirty(block.buf);
-	ext4_bcache_set_flag(block.buf, BC_TMP);
-	rc = jbd_block_set(journal->jbd_fs, &block);
+	rc = jbd_prepare_block_set(trans, &block);
 	return rc;
 }
 
@@ -1818,37 +2125,29 @@ static int jbd_journal_prepare(struct jbd_journal *journal,
 	struct jbd_bhdr *bhdr = NULL;
 	void *data;
 
-	/* Try to remove any non-dirty buffers from the tail of
-	 * buf_queue. */
-	TAILQ_FOREACH_REVERSE_SAFE(jbd_buf, &trans->buf_queue,
-			jbd_trans_buf, buf_node, tmp) {
-		struct jbd_revoke_rec tmp_rec = {
-			.lba = jbd_buf->block_rec->lba
-		};
-		/* We stop the iteration when we find a dirty buffer. */
-		if (ext4_bcache_test_flag(jbd_buf->block.buf,
-					BC_DIRTY))
-			break;
-	
+	/* Reads reserve rollback ownership but do not become log records. */
+	TAILQ_FOREACH_SAFE(jbd_buf, &trans->buf_queue, buf_node, tmp) {
+		if (jbd_buf->modified &&
+		    ext4_bcache_test_flag(jbd_buf->block.buf, BC_DIRTY))
+			continue;
+		struct jbd_revoke_rec key = { .lba = jbd_buf->block_rec->lba };
 		TAILQ_REMOVE(&jbd_buf->block_rec->dirty_buf_queue,
-			jbd_buf,
-			dirty_buf_node);
-
-		jbd_buf->block.buf->end_write = NULL;
-		jbd_buf->block.buf->end_write_arg = NULL;
-		jbd_trans_finish_callback(journal,
-				trans,
-				jbd_buf->block_rec,
-				true,
-				RB_FIND(jbd_revoke_tree,
-					&trans->revoke_root,
-					&tmp_rec));
-		jbd_trans_remove_block_rec(journal,
-					jbd_buf->block_rec, trans);
+			     jbd_buf, dirty_buf_node);
+		if (jbd_buf->before) {
+			jbd_trans_restore_access(jbd_buf);
+		} else {
+			jbd_buf->block.buf->end_write = NULL;
+			jbd_buf->block.buf->end_write_arg = NULL;
+			jbd_trans_finish_callback(journal, trans, jbd_buf->block_rec,
+				true, RB_FIND(jbd_revoke_tree, &trans->revoke_root, &key));
+		}
+		jbd_trans_remove_block_rec(journal, jbd_buf->block_rec, trans);
 		trans->data_cnt--;
-
+		fs->bdev->cache_write_back++;
 		ext4_block_set(fs->bdev, &jbd_buf->block);
+		fs->bdev->cache_write_back--;
 		TAILQ_REMOVE(&trans->buf_queue, jbd_buf, buf_node);
+		ext4_free(jbd_buf->before);
 		ext4_free(jbd_buf);
 	}
 
@@ -1856,40 +2155,7 @@ static int jbd_journal_prepare(struct jbd_journal *journal,
 		struct tag_info tag_info;
 		bool uuid_exist = false;
 		bool is_escape = false;
-		struct jbd_revoke_rec tmp_rec = {
-			.lba = jbd_buf->block_rec->lba
-		};
-		if (!ext4_bcache_test_flag(jbd_buf->block.buf,
-					   BC_DIRTY)) {
-			TAILQ_REMOVE(&jbd_buf->block_rec->dirty_buf_queue,
-					jbd_buf,
-					dirty_buf_node);
 
-			jbd_buf->block.buf->end_write = NULL;
-			jbd_buf->block.buf->end_write_arg = NULL;
-
-			/* The buffer has not been modified, just release
-			 * that jbd_buf. */
-			jbd_trans_finish_callback(journal,
-					trans,
-					jbd_buf->block_rec,
-					true,
-					RB_FIND(jbd_revoke_tree,
-						&trans->revoke_root,
-						&tmp_rec));
-			jbd_trans_remove_block_rec(journal,
-					jbd_buf->block_rec, trans);
-			trans->data_cnt--;
-
-			ext4_block_set(fs->bdev, &jbd_buf->block);
-			TAILQ_REMOVE(&trans->buf_queue, jbd_buf, buf_node);
-			ext4_free(jbd_buf);
-			continue;
-		}
-		checksum = jbd_block_csum(journal->jbd_fs,
-					  jbd_buf->block.data,
-					  checksum,
-					  trans->trans_id);
 		if (((struct jbd_bhdr *)jbd_buf->block.data)->magic ==
 				to_be32(JBD_MAGIC_NUMBER))
 			is_escape = true;
@@ -1897,10 +2163,15 @@ static int jbd_journal_prepare(struct jbd_journal *journal,
 again:
 		if (!desc_iblock) {
 			desc_iblock = jbd_journal_alloc_block(journal, trans);
-			rc = jbd_block_get_noread(journal->jbd_fs, &desc_block, desc_iblock);
+			if (!desc_iblock) {
+				rc = trans->error;
+				break;
+			}
+			rc = jbd_prepare_block_get(trans, &desc_block, desc_iblock);
 			if (rc != EOK)
 				break;
 
+			memset(desc_block.data, 0, journal->block_size);
 			bhdr = (struct jbd_bhdr *)desc_block.data;
 			jbd_set32(bhdr, magic, JBD_MAGIC_NUMBER);
 			jbd_set32(bhdr, blocktype, JBD_DESCRIPTOR_BLOCK);
@@ -1918,17 +2189,25 @@ again:
 			if (!trans->start_iblock)
 				trans->start_iblock = desc_iblock;
 
-			ext4_bcache_set_dirty(desc_block.buf);
-			ext4_bcache_set_flag(desc_block.buf, BC_TMP);
 		}
 		tag_info.block = jbd_buf->block.lb_id;
 		tag_info.uuid_exist = uuid_exist;
 		tag_info.is_escape = is_escape;
-		if (i == trans->data_cnt - 1)
+		/* LAST terminates every descriptor, not just the transaction.
+		 * Account for the first tag's UUID before checking next-tag space. */
+		int tag_bytes = jbd_tag_bytes(journal->jbd_fs);
+		if (i == trans->data_cnt - 1 ||
+		    tag_tbl_size - tag_bytes - (uuid_exist ? UUID_SIZE : 0) < tag_bytes)
 			tag_info.last_tag = true;
 		else
 			tag_info.last_tag = false;
 
+		uint32_t saved_magic = ((struct jbd_bhdr *)jbd_buf->block.data)->magic;
+		if (is_escape)
+			((struct jbd_bhdr *)jbd_buf->block.data)->magic = 0;
+		checksum = jbd_block_csum(journal->jbd_fs, jbd_buf->block.data,
+					 checksum, trans->trans_id);
+		((struct jbd_bhdr *)jbd_buf->block.data)->magic = saved_magic;
 		tag_info.checksum = checksum;
 
 		if (uuid_exist)
@@ -1942,7 +2221,7 @@ again:
 		if (rc != EOK) {
 			jbd_meta_csum_set(journal->jbd_fs, bhdr);
 			desc_iblock = 0;
-			rc = jbd_block_set(journal->jbd_fs, &desc_block);
+			rc = jbd_prepare_block_set(trans, &desc_block);
 			if (rc != EOK)
 				break;
 
@@ -1950,11 +2229,16 @@ again:
 		}
 
 		data_iblock = jbd_journal_alloc_block(journal, trans);
-		rc = jbd_block_get_noread(journal->jbd_fs, &data_block, data_iblock);
+		if (!data_iblock) {
+			rc = trans->error;
+			jbd_prepare_block_set(trans, &desc_block);
+			desc_iblock = 0;
+			break;
+		}
+		rc = jbd_prepare_block_get(trans, &data_block, data_iblock);
 		if (rc != EOK) {
 			desc_iblock = 0;
-			ext4_bcache_clear_dirty(desc_block.buf);
-			jbd_block_set(journal->jbd_fs, &desc_block);
+			jbd_prepare_block_set(trans, &desc_block);
 			break;
 		}
 
@@ -1964,16 +2248,14 @@ again:
 		if (is_escape)
 			((struct jbd_bhdr *)data)->magic = 0;
 
-		ext4_bcache_set_dirty(data_block.buf);
-		ext4_bcache_set_flag(data_block.buf, BC_TMP);
-		rc = jbd_block_set(journal->jbd_fs, &data_block);
+		rc = jbd_prepare_block_set(trans, &data_block);
 		if (rc != EOK) {
 			desc_iblock = 0;
-			ext4_bcache_clear_dirty(desc_block.buf);
-			jbd_block_set(journal->jbd_fs, &desc_block);
+			jbd_prepare_block_set(trans, &desc_block);
 			break;
 		}
 		jbd_buf->jbd_lba = data_iblock;
+		jbd_buf->escaped = is_escape;
 
 		tag_ptr += tag_info.tag_bytes;
 		tag_tbl_size -= tag_info.tag_bytes;
@@ -1984,7 +2266,7 @@ again:
 		jbd_meta_csum_set(journal->jbd_fs,
 				(struct jbd_bhdr *)bhdr);
 		trans->data_csum = checksum;
-		rc = jbd_block_set(journal->jbd_fs, &desc_block);
+		rc = jbd_prepare_block_set(trans, &desc_block);
 	}
 
 	return rc;
@@ -2006,6 +2288,8 @@ jbd_journal_prepare_revoke(struct jbd_journal *journal,
 	struct jbd_revoke_rec *rec, *tmp;
 	struct jbd_revoke_header *header = NULL;
 	int32_t record_len = 4;
+	uint32_t checksum_size = jbd_has_csum(&journal->jbd_fs->sb) ?
+		sizeof(struct jbd_revoke_tail) : 0;
 	struct jbd_bhdr *bhdr = NULL;
 
 	if (JBD_HAS_INCOMPAT_FEATURE(&journal->jbd_fs->sb,
@@ -2017,11 +2301,16 @@ jbd_journal_prepare_revoke(struct jbd_journal *journal,
 again:
 		if (!desc_iblock) {
 			desc_iblock = jbd_journal_alloc_block(journal, trans);
-			rc = jbd_block_get_noread(journal->jbd_fs, &desc_block,
+			if (!desc_iblock) {
+				rc = trans->error;
+				break;
+			}
+			rc = jbd_prepare_block_get(trans, &desc_block,
 						  desc_iblock);
 			if (rc != EOK)
 				break;
 
+			memset(desc_block.data, 0, journal->block_size);
 			bhdr = (struct jbd_bhdr *)desc_block.data;
 			jbd_set32(bhdr, magic, JBD_MAGIC_NUMBER);
 			jbd_set32(bhdr, blocktype, JBD_REVOKE_BLOCK);
@@ -2038,18 +2327,16 @@ again:
 			if (!trans->start_iblock)
 				trans->start_iblock = desc_iblock;
 
-			ext4_bcache_set_dirty(desc_block.buf);
-			ext4_bcache_set_flag(desc_block.buf, BC_TMP);
 		}
 
 		if (tag_tbl_size < record_len) {
 			jbd_set32(header, count,
-				  journal->block_size - tag_tbl_size);
+				  journal->block_size - tag_tbl_size - checksum_size);
 			jbd_meta_csum_set(journal->jbd_fs, bhdr);
 			bhdr = NULL;
 			desc_iblock = 0;
 			header = NULL;
-			rc = jbd_block_set(journal->jbd_fs, &desc_block);
+			rc = jbd_prepare_block_set(trans, &desc_block);
 			if (rc != EOK)
 				break;
 
@@ -2072,10 +2359,10 @@ again:
 	if (rc == EOK && desc_iblock) {
 		if (header != NULL)
 			jbd_set32(header, count,
-				  journal->block_size - tag_tbl_size);
+				  journal->block_size - tag_tbl_size - checksum_size);
 
 		jbd_meta_csum_set(journal->jbd_fs, bhdr);
-		rc = jbd_block_set(journal->jbd_fs, &desc_block);
+		rc = jbd_prepare_block_set(trans, &desc_block);
 	}
 
 	return rc;
@@ -2084,15 +2371,19 @@ again:
 /**@brief  Put references of block descriptors in a transaction.
  * @param  journal current journal session
  * @param  trans transaction*/
-void jbd_journal_cp_trans(struct jbd_journal *journal, struct jbd_trans *trans)
+static void jbd_journal_cp_trans(struct jbd_journal *journal, struct jbd_trans *trans)
 {
 	struct jbd_buf *jbd_buf, *tmp;
 	struct ext4_fs *fs = journal->jbd_fs->inode_ref.fs;
+	fs->bdev->cache_write_back++;
 	TAILQ_FOREACH_SAFE(jbd_buf, &trans->buf_queue, buf_node,
 			tmp) {
 		struct ext4_block block = jbd_buf->block;
+		ext4_free(jbd_buf->before);
+		jbd_buf->before = NULL;
 		ext4_block_set(fs->bdev, &block);
 	}
+	fs->bdev->cache_write_back--;
 }
 
 /**@brief  Update the start block of the journal when
@@ -2106,10 +2397,11 @@ static void jbd_trans_end_write(struct ext4_bcache *bc __unused,
 	struct jbd_trans *trans = jbd_buf->trans;
 	struct jbd_block_rec *block_rec = jbd_buf->block_rec;
 	struct jbd_journal *journal = trans->journal;
-	bool first_in_queue =
-		trans == TAILQ_FIRST(&journal->cp_queue);
-	if (res != EOK)
+	if (res != EOK) {
 		trans->error = res;
+		journal->error = res;
+		return;
+	}
 
 	TAILQ_REMOVE(&trans->buf_queue, jbd_buf, buf_node);
 	TAILQ_REMOVE(&block_rec->dirty_buf_queue,
@@ -2127,28 +2419,11 @@ static void jbd_trans_end_write(struct ext4_bcache *bc __unused,
 		buf->end_write_arg = NULL;
 	}
 
+	ext4_free(jbd_buf->before);
 	ext4_free(jbd_buf);
 
 	trans->written_cnt++;
-	if (trans->written_cnt == trans->data_cnt) {
-		/* If it is the first transaction on checkpoint queue,
-		 * we will shift the start of the journal to the next
-		 * transaction, and remove subsequent written
-		 * transactions from checkpoint queue until we find
-		 * an unwritten one. */
-		if (first_in_queue) {
-			journal->start = trans->start_iblock +
-				trans->alloc_blocks;
-			wrap(&journal->jbd_fs->sb, journal->start);
-			journal->trans_id = trans->trans_id + 1;
-			TAILQ_REMOVE(&journal->cp_queue, trans, trans_node);
-			jbd_journal_free_trans(journal, trans, false);
 
-			jbd_journal_purge_cp_trans(journal, false, false);
-			jbd_journal_write_sb(journal);
-			jbd_write_sb(journal->jbd_fs);
-		}
-	}
 }
 
 /**@brief  Commit a transaction to the journal immediately.
@@ -2159,8 +2434,22 @@ static int __jbd_journal_commit_trans(struct jbd_journal *journal,
 				      struct jbd_trans *trans)
 {
 	int rc = EOK;
-	uint32_t last = journal->last;
 	struct jbd_revoke_rec *rec, *tmp;
+	uint32_t old_last = journal->last;
+	bool commit_submitted = false;
+	if (journal->error) {
+		/* A failed commit remains journal-owned even if a caller repeats
+		 * the request; never free the pinned recovery owner here. */
+		rc = journal->error;
+		if (journal->failed_trans != trans)
+			jbd_journal_free_trans(journal, trans, true);
+		return rc;
+	}
+	rc = trans->error;
+	if (rc != EOK) {
+		jbd_journal_free_trans(journal, trans, true);
+		return rc;
+	}
 
 	trans->trans_id = journal->alloc_trans_id;
 	rc = jbd_journal_prepare(journal, trans);
@@ -2176,14 +2465,25 @@ static int __jbd_journal_commit_trans(struct jbd_journal *journal,
 		/* Since there are no entries in both buffer list
 		 * and revoke entry list, we do not consider trans as
 		 * complete transaction and just return EOK.*/
-		jbd_journal_free_trans(journal, trans, false);
-		goto Finish;
+		rc = jbd_trans_write_data(trans);
+		jbd_journal_free_trans(journal, trans, rc != EOK);
+		return rc;
 	}
 
-	rc = jbd_trans_write_commit_block(trans);
+	rc = jbd_trans_prepare_commit_block(trans);
 	if (rc != EOK)
 		goto Finish;
+	rc = jbd_trans_write_data(trans);
+	if (rc != EOK) {
+		journal->last = old_last;
+		jbd_journal_free_trans(journal, trans, true);
+		return rc;
+	}
 
+	rc = jbd_write_prepared(trans, &commit_submitted);
+	if (rc != EOK)
+		goto Finish;
+	journal->committed_id = trans->trans_id;
 	journal->alloc_trans_id++;
 
 	/* Complete the checkpoint of buffers which are revoked. */
@@ -2215,41 +2515,26 @@ static int __jbd_journal_commit_trans(struct jbd_journal *journal,
 		}
 	}
 
-	if (TAILQ_EMPTY(&journal->cp_queue)) {
-		/*
-		 * This transaction is going to be the first object in the
-		 * checkpoint queue.
-		 * When the first transaction in checkpoint queue is completely
-		 * written to disk, we shift the tail of the log to right.
-		 */
-		if (trans->data_cnt) {
-			journal->start = trans->start_iblock;
-			wrap(&journal->jbd_fs->sb, journal->start);
-			journal->trans_id = trans->trans_id;
-			jbd_journal_write_sb(journal);
-			jbd_write_sb(journal->jbd_fs);
-			TAILQ_INSERT_TAIL(&journal->cp_queue, trans,
-					trans_node);
-			jbd_journal_cp_trans(journal, trans);
-		} else {
-			journal->start = trans->start_iblock +
-				trans->alloc_blocks;
-			wrap(&journal->jbd_fs->sb, journal->start);
-			journal->trans_id = trans->trans_id + 1;
-			jbd_journal_write_sb(journal);
-			jbd_journal_free_trans(journal, trans, false);
-		}
-	} else {
-		/* No need to do anything to the JBD superblock. */
-		TAILQ_INSERT_TAIL(&journal->cp_queue, trans,
-				trans_node);
-		if (trans->data_cnt)
-			jbd_journal_cp_trans(journal, trans);
-	}
+	TAILQ_INSERT_TAIL(&journal->cp_queue, trans, trans_node);
+	jbd_trans_release_data(trans, false);
+	jbd_journal_cp_trans(journal, trans);
+	return journal->error;
 Finish:
-	if (rc != EOK && rc != ENOSPC) {
-		journal->last = last;
+	jbd_release_prepared(trans);
+	if ((rc == ENOMEM || rc == ENOSPC) && !journal->error &&
+	    !commit_submitted) {
+		/* No commit block was submitted for an allocation failure. The
+		 * incomplete suffix can be reused; completed checkpoints may have
+		 * advanced start meanwhile and must not be rolled back. */
+		journal->last = old_last;
 		jbd_journal_free_trans(journal, trans, true);
+		return rc;
+	}
+	if (rc != EOK) {
+		/* Never recycle possibly committed log blocks after uncertain I/O.
+		 * The journal owns this pinned transaction until recovery/remount. */
+		journal->error = rc;
+		journal->failed_trans = trans;
 	}
 	return rc;
 }
@@ -2261,6 +2546,8 @@ struct jbd_trans *
 jbd_journal_new_trans(struct jbd_journal *journal)
 {
 	struct jbd_trans *trans = NULL;
+	if (journal->error)
+		return NULL;
 	trans = ext4_calloc(1, sizeof(struct jbd_trans));
 	if (!trans)
 		return NULL;
@@ -2271,6 +2558,8 @@ jbd_journal_new_trans(struct jbd_journal *journal)
 	trans->data_csum = EXT4_CRC32_INIT;
 	trans->error = EOK;
 	TAILQ_INIT(&trans->buf_queue);
+	TAILQ_INIT(&trans->data_queue);
+	TAILQ_INIT(&trans->log_queue);
 	return trans;
 }
 

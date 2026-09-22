@@ -508,11 +508,11 @@ static ext4_fsblk_t ext4_new_meta_blocks(struct ext4_inode_ref *inode_ref,
 	return block;
 }
 
-static void ext4_ext_free_blocks(struct ext4_inode_ref *inode_ref,
+static int ext4_ext_free_blocks(struct ext4_inode_ref *inode_ref,
 				 ext4_fsblk_t block, uint32_t count,
 				 uint32_t flags __unused)
 {
-	ext4_balloc_free_blocks(inode_ref, block, count);
+	return ext4_balloc_free_blocks(inode_ref, block, count);
 }
 
 static uint16_t ext4_ext_space_block(struct ext4_inode_ref *inode_ref)
@@ -694,7 +694,7 @@ static int ext4_ext_dirty(struct ext4_inode_ref *inode_ref,
 			  struct ext4_extent_path *path)
 {
 	if (path->block.lb_id)
-		ext4_trans_set_block_dirty(path->block.buf);
+		return ext4_trans_set_block_dirty(path->block.buf);
 	else
 		inode_ref->dirty = true;
 
@@ -749,6 +749,12 @@ static int ext4_ext_check(struct ext4_inode_ref *inode_ref,
 		error_msg = "invalid eh_max";
 		goto corrupted;
 	}
+	if (to_le16(eh->max_entries_count) >
+	    (ext4_sb_get_block_size(sb) - sizeof(*eh)) /
+		 sizeof(struct ext4_extent)) {
+		error_msg = "eh_max exceeds block";
+		goto corrupted;
+	}
 	if (to_le16(eh->entries_count) > to_le16(eh->max_entries_count)) {
 		error_msg = "invalid eh_entries";
 		goto corrupted;
@@ -762,6 +768,7 @@ static int ext4_ext_check(struct ext4_inode_ref *inode_ref,
 				 DBG_WARN "Extent block checksum failed."
 					  "Blocknr: %" PRIu64 "\n",
 				 pblk);
+			return EUCLEAN;
 		}
 	}
 
@@ -866,6 +873,14 @@ static int ext4_find_extent(struct ext4_inode_ref *inode_ref, ext4_lblk_t block,
 
 	eh = ext_inode_hdr(inode_ref->inode);
 	depth = ext_depth(inode_ref->inode);
+	if (to_le16(eh->magic) != EXT4_EXTENT_MAGIC || depth > 5 ||
+	    to_le16(eh->max_entries_count) >
+	      (sizeof(inode_ref->inode->blocks) - sizeof(*eh)) /
+		 sizeof(struct ext4_extent) ||
+	    !to_le16(eh->max_entries_count) ||
+	    to_le16(eh->entries_count) > to_le16(eh->max_entries_count) ||
+	    (depth && !to_le16(eh->entries_count)))
+		return EUCLEAN;
 
 	if (path) {
 		ext4_ext_drop_refs(inode_ref, path, 0);
@@ -937,6 +952,28 @@ err:
 	if (orig_path)
 		*orig_path = NULL;
 	return ret;
+}
+
+/* Find the highest allocated logical block without scanning sparse holes. */
+int ext4_extent_last_block(struct ext4_inode_ref *inode_ref,
+                           ext4_lblk_t *last, bool *found)
+{
+    struct ext4_extent_path *path = NULL;
+    int r = ext4_find_extent(inode_ref, EXT_MAX_BLOCKS, &path, 0);
+    if (r != EOK) return r;
+    int depth = ext_depth(inode_ref->inode);
+    struct ext4_extent *extent = path[depth].extent;
+    *found = extent != NULL;
+    if (extent) {
+        uint64_t end = (uint64_t)to_le32(extent->first_block) +
+                       ext4_ext_get_actual_len(extent);
+        if (!ext4_ext_get_actual_len(extent) || !end || end - 1 > EXT_MAX_BLOCKS)
+            r = EUCLEAN;
+        else *last = (ext4_lblk_t)(end - 1);
+    }
+    ext4_ext_drop_refs(inode_ref, path, 0);
+    ext4_free(path);
+    return r;
 }
 
 static void ext4_ext_init_header(struct ext4_inode_ref *inode_ref,
@@ -1514,7 +1551,7 @@ out:
 	return ret;
 }
 
-static void ext4_ext_remove_blocks(struct ext4_inode_ref *inode_ref,
+static int ext4_ext_remove_blocks(struct ext4_inode_ref *inode_ref,
 				   struct ext4_extent *ex, ext4_lblk_t from,
 				   ext4_lblk_t to)
 {
@@ -1527,7 +1564,7 @@ static void ext4_ext_remove_blocks(struct ext4_inode_ref *inode_ref,
 		 "Freeing %" PRIu32 " at %" PRIu64 ", %" PRIu32 "\n", from,
 		 start, len);
 
-	ext4_ext_free_blocks(inode_ref, start, len, 0);
+	return ext4_ext_free_blocks(inode_ref, start, len, 0);
 }
 
 static int ext4_ext_remove_idx(struct ext4_inode_ref *inode_ref,
@@ -1554,7 +1591,8 @@ static int ext4_ext_remove_idx(struct ext4_inode_ref *inode_ref,
 
 	ext4_dbg(DEBUG_EXTENT, "IDX: Freeing %" PRIu32 " at %" PRIu64 ", %d\n",
 		 to_le32(path[i].index->first_block), leaf, 1);
-	ext4_ext_free_blocks(inode_ref, leaf, 1, 0);
+	err = ext4_ext_free_blocks(inode_ref, leaf, 1, 0);
+	if (err != EOK) return err;
 
 	/*
 	 * We may need to correct the paths after the first extents/indexes in
@@ -1628,7 +1666,8 @@ static int ext4_ext_remove_leaf(struct ext4_inode_ref *inode_ref,
 			}
 		}
 
-		ext4_ext_remove_blocks(inode_ref, ex, start, start + len - 1);
+		int r = ext4_ext_remove_blocks(inode_ref, ex, start, start + len - 1);
+		if (r != EOK) return r;
 		/*
 		 * Set the first block of the extent if it is presented.
 		 */
@@ -1803,8 +1842,9 @@ int ext4_extent_remove_space(struct ext4_inode_ref *inode_ref, ext4_lblk_t from,
 			if (leaf_to > to)
 				leaf_to = to;
 
-			ext4_ext_remove_leaf(inode_ref, path, leaf_from,
-					     leaf_to);
+			ret = ext4_ext_remove_leaf(inode_ref, path, leaf_from,
+					           leaf_to);
+			if (ret != EOK) goto out;
 			ext4_ext_drop_refs(inode_ref, path + i, 0);
 			i--;
 			continue;

@@ -43,6 +43,19 @@
 
 #include <ext4_fs.h>
 #include <ext4_journal.h>
+#include <ext4_trans.h>
+
+static int trans_error(struct ext4_blockdev *bdev, int r)
+{
+#if CONFIG_JOURNALING_ENABLE
+	if (r && bdev->fs && bdev->fs->curr_trans &&
+	    !bdev->fs->curr_trans->error)
+		bdev->fs->curr_trans->error = r;
+#else
+	(void)bdev;
+#endif
+	return r;
+}
 
 int ext4_trans_set_block_dirty(struct ext4_buf *buf)
 {
@@ -55,9 +68,12 @@ int ext4_trans_set_block_dirty(struct ext4_buf *buf)
 		.buf = buf
 	};
 
-	if (fs->jbd_journal && fs->curr_trans) {
+	if (fs && fs->jbd_journal && fs->jbd_journal->error)
+		return trans_error(buf->bc->bdev, fs->jbd_journal->error);
+	if (fs && fs->jbd_journal && fs->curr_trans) {
 		struct jbd_trans *trans = fs->curr_trans;
-		return jbd_trans_set_block_dirty(trans, &block);
+		return trans_error(buf->bc->bdev,
+			jbd_trans_set_block_dirty(trans, &block));
 	}
 #endif
 	ext4_bcache_set_dirty(buf);
@@ -68,6 +84,12 @@ int ext4_trans_block_get_noread(struct ext4_blockdev *bdev,
 			  struct ext4_block *b,
 			  uint64_t lba)
 {
+#if CONFIG_JOURNALING_ENABLE
+	/* Rollback must also restore any existing held reference. Read the old
+	 * block before handing writable storage to a transaction. */
+	if (bdev->fs && bdev->fs->curr_trans)
+		return ext4_trans_block_get(bdev, b, lba);
+#endif
 	int r = ext4_block_get_noread(bdev, b, lba);
 	if (r != EOK)
 		return r;
@@ -81,9 +103,68 @@ int ext4_trans_block_get(struct ext4_blockdev *bdev,
 {
 	int r = ext4_block_get(bdev, b, lba);
 	if (r != EOK)
-		return r;
+		return trans_error(bdev, r);
 
-	return r;
+#if CONFIG_JOURNALING_ENABLE
+	if (bdev->fs && bdev->fs->jbd_journal && bdev->fs->curr_trans) {
+		r = jbd_trans_get_write_access(bdev->fs->curr_trans, b);
+		if (r != EOK) {
+			bdev->cache_write_back++;
+			ext4_block_set(bdev, b);
+			bdev->cache_write_back--;
+			return trans_error(bdev, r);
+		}
+	}
+#endif
+
+	return trans_error(bdev, r);
+}
+
+int ext4_trans_data_get(struct ext4_blockdev *bdev, struct ext4_block *b,
+			uint64_t lba)
+{
+	int r = ext4_block_get(bdev, b, lba);
+	if (r != EOK)
+		return trans_error(bdev, r);
+#if CONFIG_JOURNALING_ENABLE
+	if (bdev->fs && bdev->fs->jbd_journal && bdev->fs->curr_trans) {
+		r = jbd_trans_get_data_access(bdev->fs->curr_trans, b);
+		if (r != EOK) {
+			bdev->cache_write_back++;
+			ext4_block_set(bdev, b);
+			bdev->cache_write_back--;
+		}
+	}
+#endif
+	return trans_error(bdev, r);
+}
+
+int ext4_trans_data_get_noread(struct ext4_blockdev *bdev, struct ext4_block *b,
+			       uint64_t lba)
+{
+#if CONFIG_JOURNALING_ENABLE
+	if (bdev->fs && bdev->fs->jbd_journal && bdev->fs->curr_trans)
+		return ext4_trans_data_get(bdev, b, lba);
+#endif
+	return trans_error(bdev, ext4_block_get_noread(bdev, b, lba));
+}
+
+int ext4_trans_set_data_dirty(struct ext4_buf *buf)
+{
+#if CONFIG_JOURNALING_ENABLE
+	struct ext4_fs *fs = buf->bc->bdev->fs;
+	if (fs && fs->jbd_journal && fs->jbd_journal->error)
+		return trans_error(buf->bc->bdev, fs->jbd_journal->error);
+	if (fs && fs->jbd_journal && fs->curr_trans) {
+		struct ext4_block block = {
+			.lb_id = buf->lba, .data = buf->data, .buf = buf
+		};
+		return trans_error(buf->bc->bdev,
+			jbd_trans_set_data_dirty(fs->curr_trans, &block));
+	}
+#endif
+	ext4_bcache_set_dirty(buf);
+	return EOK;
 }
 
 int ext4_trans_try_revoke_block(struct ext4_blockdev *bdev __unused,
@@ -99,7 +180,7 @@ int ext4_trans_try_revoke_block(struct ext4_blockdev *bdev __unused,
 		r = ext4_block_flush_lba(fs->bdev, lba);
 	}
 #endif
-	return r;
+	return trans_error(bdev, r);
 }
 
 /**

@@ -276,10 +276,6 @@ ext4_dir_dx_get_climit(struct ext4_inode_ref *inode_ref,
 	return (struct ext4_dir_idx_climit *)(((char *)dirent) + count_offset);
 }
 
-/*
- * BIG FAT NOTES:
- *       Currently we do not verify the checksum of HTree node.
- */
 static bool ext4_dir_dx_csum_verify(struct ext4_inode_ref *inode_ref,
 				    struct ext4_dir_en *de)
 {
@@ -292,15 +288,16 @@ static bool ext4_dir_dx_csum_verify(struct ext4_inode_ref *inode_ref,
 		climit = ext4_dir_dx_get_climit(inode_ref, de, &coff);
 		if (!climit) {
 			/* Directory seems corrupted. */
-			return true;
+			return false;
 		}
 		struct ext4_dir_idx_tail *t;
 		limit = ext4_dir_dx_climit_get_limit(climit);
 		cnt = ext4_dir_dx_climit_get_count(climit);
-		if (coff + (limit * sizeof(struct ext4_dir_idx_entry)) >
+		if (!cnt || cnt > limit ||
+		    coff + (limit * sizeof(struct ext4_dir_idx_entry)) >
 		    (block_size - sizeof(struct ext4_dir_idx_tail))) {
 			/* There is no space to hold the checksum */
-			return true;
+			return false;
 		}
 		t = (void *)(((struct ext4_dir_idx_entry *)climit) + limit);
 
@@ -553,8 +550,12 @@ static int ext4_dir_dx_get_leaf(struct ext4_hash_info *hinfo,
 	int r;
 
 	struct ext4_dir_idx_block *tmp_dx_blk = dx_blocks;
-	struct ext4_block *tmp_blk = root_block;
+	struct ext4_block *tmp_blk = &tmp_dx_blk->b;
 	struct ext4_sblock *sb = &inode_ref->fs->sb;
+	/* Publish each acquired reference immediately so either caller can
+	 * release the complete path on a failed descent. */
+	*tmp_blk = *root_block;
+	*dx_block = tmp_dx_blk;
 
 	block_size = ext4_sb_get_block_size(sb);
 	root = (struct ext4_dir_idx_root *)root_block->data;
@@ -583,7 +584,6 @@ static int ext4_dir_dx_get_leaf(struct ext4_hash_info *hinfo,
 		at = p - 1;
 
 		/* Write results */
-		memcpy(&tmp_dx_blk->b, tmp_blk, sizeof(struct ext4_block));
 		tmp_dx_blk->entries = entries;
 		tmp_dx_blk->position = at;
 
@@ -602,9 +602,12 @@ static int ext4_dir_dx_get_leaf(struct ext4_hash_info *hinfo,
 		if (r != EOK)
 			return r;
 
+		tmp_blk = &(tmp_dx_blk + 1)->b;
 		r = ext4_trans_block_get(inode_ref->fs->bdev, tmp_blk, fblk);
 		if (r != EOK)
 			return r;
+		++tmp_dx_blk;
+		*dx_block = tmp_dx_blk;
 
 		entries = ((struct ext4_dir_idx_node *)tmp_blk->data)->entries;
 		limit = ext4_dir_dx_climit_get_limit((void *)entries);
@@ -615,21 +618,11 @@ static int ext4_dir_dx_get_leaf(struct ext4_hash_info *hinfo,
 
 		entry_space = entry_space / sizeof(struct ext4_dir_idx_entry);
 
-		if (limit != entry_space) {
-			ext4_block_set(inode_ref->fs->bdev, tmp_blk);
+		if (limit != entry_space)
 			return EXT4_ERR_BAD_DX_DIR;
-		}
 
-		if (!ext4_dir_dx_csum_verify(inode_ref, (void *)tmp_blk->data)) {
-			ext4_dbg(DEBUG_DIR_IDX,
-					DBG_WARN "HTree checksum failed."
-					"Inode: %" PRIu32", "
-					"Block: %" PRIu32"\n",
-					inode_ref->index,
-					n_blk);
-		}
-
-		++tmp_dx_blk;
+		if (!ext4_dir_dx_csum_verify(inode_ref, (void *)tmp_blk->data))
+			return EUCLEAN;
 	}
 
 	/* Unreachable */
@@ -689,20 +682,18 @@ static int ext4_dir_dx_next_block(struct ext4_inode_ref *inode_ref,
 			return r;
 
 		if (!ext4_dir_dx_csum_verify(inode_ref, (void *)b.data)) {
-			ext4_dbg(DEBUG_DIR_IDX,
-					DBG_WARN "HTree checksum failed."
-					"Inode: %" PRIu32", "
-					"Block: %" PRIu32"\n",
-					inode_ref->index,
-					blk);
+			ext4_block_set(inode_ref->fs->bdev, &b);
+			return EUCLEAN;
 		}
 
 		p++;
 
 		/* Don't forget to put old block (prevent memory leak) */
 		r = ext4_block_set(inode_ref->fs->bdev, &p->b);
-		if (r != EOK)
+		if (r != EOK) {
+			ext4_block_set(inode_ref->fs->bdev, &b);
 			return r;
+		}
 
 		memcpy(&p->b, &b, sizeof(b));
 		p->entries = ((struct ext4_dir_idx_node *)b.data)->entries;
@@ -732,12 +723,8 @@ int ext4_dir_dx_find_entry(struct ext4_dir_search_result *result,
 		return rc;
 
 	if (!ext4_dir_dx_csum_verify(inode_ref, (void *)root_block.data)) {
-		ext4_dbg(DEBUG_DIR_IDX,
-			 DBG_WARN "HTree root checksum failed."
-			 "Inode: %" PRIu32", "
-			 "Block: %" PRIu32"\n",
-			 inode_ref->index,
-			 (uint32_t)0);
+		ext4_block_set(fs->bdev, &root_block);
+		return EUCLEAN;
 	}
 
 	/* Initialize hash info (compute hash value) */
@@ -758,10 +745,8 @@ int ext4_dir_dx_find_entry(struct ext4_dir_search_result *result,
 
 	rc = ext4_dir_dx_get_leaf(&hinfo, inode_ref, &root_block, &dx_block,
 				  dx_blocks);
-	if (rc != EOK) {
-		ext4_block_set(fs->bdev, &root_block);
-		return EXT4_ERR_BAD_DX_DIR;
-	}
+	if (rc != EOK)
+		goto cleanup;
 
 	do {
 		/* Load leaf block */
@@ -780,12 +765,9 @@ int ext4_dir_dx_find_entry(struct ext4_dir_search_result *result,
 			goto cleanup;
 
 		if (!ext4_dir_csum_verify(inode_ref, (void *)b.data)) {
-			ext4_dbg(DEBUG_DIR_IDX,
-				 DBG_WARN "HTree leaf block checksum failed."
-				 "Inode: %" PRIu32", "
-				 "Block: %" PRIu32"\n",
-				 inode_ref->index,
-				 leaf_blk_idx);
+			ext4_block_set(fs->bdev, &b);
+			rc = EUCLEAN;
+			goto cleanup;
 		}
 
 		/* Linear search inside block */
@@ -801,8 +783,10 @@ int ext4_dir_dx_find_entry(struct ext4_dir_search_result *result,
 
 		/* Not found, leave untouched */
 		rc2 = ext4_block_set(fs->bdev, &b);
-		if (rc2 != EOK)
+		if (rc2 != EOK) {
+			rc = rc2;
 			goto cleanup;
+		}
 
 		if (rc != ENOENT)
 			goto cleanup;
@@ -810,7 +794,7 @@ int ext4_dir_dx_find_entry(struct ext4_dir_search_result *result,
 		/* check if the next block could be checked */
 		rc = ext4_dir_dx_next_block(inode_ref, hinfo.hash, dx_block,
 					    &dx_blocks[0]);
-		if (rc < 0)
+		if (rc != EOK && rc != ENOENT)
 			goto cleanup;
 	} while (rc == ENOENT);
 
@@ -1248,12 +1232,8 @@ int ext4_dir_dx_add_entry(struct ext4_inode_ref *parent,
 		return r;
 
 	if (!ext4_dir_dx_csum_verify(parent, (void*)root_blk.data)) {
-		ext4_dbg(DEBUG_DIR_IDX,
-			 DBG_WARN "HTree root checksum failed."
-			 "Inode: %" PRIu32", "
-			 "Block: %" PRIu32"\n",
-			 parent->index,
-			 (uint32_t)0);
+		ext4_block_set(fs->bdev, &root_blk);
+		return EUCLEAN;
 	}
 
 	/* Initialize hinfo structure (mainly compute hash) */
@@ -1273,10 +1253,8 @@ int ext4_dir_dx_add_entry(struct ext4_inode_ref *parent,
 	struct ext4_dir_idx_block *dx_it;
 
 	r = ext4_dir_dx_get_leaf(&hinfo, parent, &root_blk, &dx_blk, dx_blks);
-	if (r != EOK) {
-		r = EXT4_ERR_BAD_DX_DIR;
+	if (r != EOK)
 		goto release_index;
-	}
 
 	/* Try to insert to existing data block */
 	uint32_t leaf_block_idx = ext4_dir_dx_entry_get_block(dx_blk->position);
@@ -1292,7 +1270,7 @@ int ext4_dir_dx_add_entry(struct ext4_inode_ref *parent,
 	 */
 	r = ext4_dir_dx_split_index(parent, dx_blks, dx_blk, &dx_blk);
 	if (r != EOK)
-		goto release_target_index;
+		goto release_index;
 
 	struct ext4_block target_block;
 	r = ext4_trans_block_get(fs->bdev, &target_block, leaf_block_addr);
@@ -1300,28 +1278,22 @@ int ext4_dir_dx_add_entry(struct ext4_inode_ref *parent,
 		goto release_index;
 
 	if (!ext4_dir_csum_verify(parent,(void *)target_block.data)) {
-		ext4_dbg(DEBUG_DIR_IDX,
-				DBG_WARN "HTree leaf block checksum failed."
-				"Inode: %" PRIu32", "
-				"Block: %" PRIu32"\n",
-				parent->index,
-				leaf_block_idx);
+		r = EUCLEAN;
+		goto release_target_index;
 	}
 
 	/* Check if insert operation passed */
 	r = ext4_dir_try_insert_entry(&fs->sb, parent, &target_block, child,
 					name, name_len);
-	if (r == EOK)
+	if (r != ENOSPC)
 		goto release_target_index;
 
 	/* Split entries to two blocks (includes sorting by hash value) */
 	struct ext4_block new_block;
 	r = ext4_dir_dx_split_data(parent, &hinfo, &target_block, dx_blk,
 				    &new_block);
-	if (r != EOK) {
-		rc2 = r;
+	if (r != EOK)
 		goto release_target_index;
-	}
 
 	/* Where to save new entry */
 	uint32_t blk_hash = ext4_dir_dx_entry_get_hash(dx_blk->position + 1);
@@ -1333,9 +1305,9 @@ int ext4_dir_dx_add_entry(struct ext4_inode_ref *parent,
 						child, name, name_len);
 
 	/* Cleanup */
-	r = ext4_block_set(fs->bdev, &new_block);
-	if (r != EOK)
-		return r;
+	rc2 = ext4_block_set(fs->bdev, &new_block);
+	if (r == EOK)
+		r = rc2;
 
 /* Cleanup operations */
 
@@ -1343,8 +1315,8 @@ release_target_index:
 	rc2 = r;
 
 	r = ext4_block_set(fs->bdev, &target_block);
-	if (r != EOK)
-		return r;
+	if (rc2 != EOK)
+		r = rc2;
 
 release_index:
 	if (r != EOK)
@@ -1354,8 +1326,8 @@ release_index:
 
 	while (dx_it <= dx_blk) {
 		r = ext4_block_set(fs->bdev, &dx_it->b);
-		if (r != EOK)
-			return r;
+		if (rc2 == EOK)
+			rc2 = r;
 
 		dx_it++;
 	}
@@ -1378,12 +1350,8 @@ int ext4_dir_dx_reset_parent_inode(struct ext4_inode_ref *dir,
 		return rc;
 
 	if (!ext4_dir_dx_csum_verify(dir, (void *)block.data)) {
-		ext4_dbg(DEBUG_DIR_IDX,
-			 DBG_WARN "HTree root checksum failed."
-			 "Inode: %" PRIu32", "
-			 "Block: %" PRIu32"\n",
-			 dir->index,
-			 (uint32_t)0);
+		ext4_block_set(dir->fs->bdev, &block);
+		return EUCLEAN;
 	}
 
 	/* Initialize pointers to data structures */

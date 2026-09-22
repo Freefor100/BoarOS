@@ -183,6 +183,9 @@ int ext4_balloc_free_block(struct ext4_inode_ref *inode_ref, ext4_fsblk_t baddr)
 			DBG_WARN "Bitmap checksum failed."
 			"Group: %" PRIu32"\n",
 			bg_ref.index);
+		ext4_block_set(bg_ref.fs->bdev, &bitmap_block);
+		ext4_fs_put_block_group_ref(&bg_ref);
+		return EUCLEAN;
 	}
 
 	/* Modify bitmap */
@@ -284,6 +287,9 @@ int ext4_balloc_free_blocks(struct ext4_inode_ref *inode_ref,
 				DBG_WARN "Bitmap checksum failed."
 				"Group: %" PRIu32"\n",
 				bg_ref.index);
+			ext4_block_set(bg_ref.fs->bdev, &blk);
+			ext4_fs_put_block_group_ref(&bg_ref);
+			return EUCLEAN;
 		}
 		uint32_t free_cnt;
 		free_cnt = ext4_sb_get_block_size(sb) * 8 - idx_in_bg_first;
@@ -360,6 +366,11 @@ int ext4_balloc_alloc_block(struct ext4_inode_ref *inode_ref,
 	uint64_t free_blocks;
 	int r;
 	struct ext4_sblock *sb = &inode_ref->fs->sb;
+	/* An extrapolated locality hint is not a mapped block. Sparse logical
+	 * offsets may exceed the entire device; fall back to the inode's group. */
+	if (goal < ext4_get32(sb, first_data_block) ||
+	    goal >= ext4_sb_get_blocks_cnt(sb))
+		goal = ext4_fs_inode_to_goal_block(inode_ref);
 
 	/* Load block group number for goal and relative index */
 	uint32_t bg_id = ext4_balloc_get_bgid_of_block(sb, goal);
@@ -369,7 +380,7 @@ int ext4_balloc_alloc_block(struct ext4_inode_ref *inode_ref,
 	struct ext4_block_group_ref bg_ref;
 
 	/* Load block group reference */
-	r = ext4_fs_get_block_group_ref(inode_ref->fs, bg_id, &bg_ref);
+	r = ext4_fs_get_block_group_ref_alloc(inode_ref->fs, bg_id, &bg_ref);
 	if (r != EOK)
 		return r;
 
@@ -405,6 +416,9 @@ int ext4_balloc_alloc_block(struct ext4_inode_ref *inode_ref,
 			DBG_WARN "Bitmap checksum failed."
 			"Group: %" PRIu32"\n",
 			bg_ref.index);
+		ext4_block_set(bg_ref.fs->bdev, &b);
+		ext4_fs_put_block_group_ref(&bg_ref);
+		return EUCLEAN;
 	}
 
 	/* Check if goal is free */
@@ -483,7 +497,7 @@ goal_failed:
 	uint32_t count = block_group_count;
 
 	while (count > 0) {
-		r = ext4_fs_get_block_group_ref(inode_ref->fs, bgid, &bg_ref);
+		r = ext4_fs_get_block_group_ref_alloc(inode_ref->fs, bgid, &bg_ref);
 		if (r != EOK)
 			return r;
 
@@ -507,6 +521,9 @@ goal_failed:
 				DBG_WARN "Bitmap checksum failed."
 				"Group: %" PRIu32"\n",
 				bg_ref.index);
+			ext4_block_set(bg_ref.fs->bdev, &b);
+			ext4_fs_put_block_group_ref(&bg_ref);
+			return EUCLEAN;
 		}
 
 		/* Compute indexes */
@@ -597,7 +614,7 @@ int ext4_balloc_try_alloc_block(struct ext4_inode_ref *inode_ref,
 
 	/* Load block group reference */
 	struct ext4_block_group_ref bg_ref;
-	rc = ext4_fs_get_block_group_ref(fs, block_group, &bg_ref);
+	rc = ext4_fs_get_block_group_ref_alloc(fs, block_group, &bg_ref);
 	if (rc != EOK)
 		return rc;
 
@@ -617,6 +634,9 @@ int ext4_balloc_try_alloc_block(struct ext4_inode_ref *inode_ref,
 			DBG_WARN "Bitmap checksum failed."
 			"Group: %" PRIu32"\n",
 			bg_ref.index);
+		ext4_block_set(bg_ref.fs->bdev, &b);
+		ext4_fs_put_block_group_ref(&bg_ref);
+		return EUCLEAN;
 	}
 
 	/* Check if block is free */

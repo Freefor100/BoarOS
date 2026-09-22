@@ -73,6 +73,11 @@ int ext4_fs_init(struct ext4_fs *fs, struct ext4_blockdev *bdev,
 	ext4_assert(fs && bdev);
 
 	fs->bdev = bdev;
+	fs->curr_trans = NULL;
+	fs->jbd_journal = NULL;
+	fs->jbd_fs = NULL;
+	fs->super_replay_required = false;
+	fs->journaled_session = false;
 
 	fs->read_only = read_only;
 
@@ -80,19 +85,30 @@ int ext4_fs_init(struct ext4_fs *fs, struct ext4_blockdev *bdev,
 	if (r != EOK)
 		return r;
 
-	if (!ext4_sb_check(&fs->sb))
-		return ENOTSUP;
+	if (!ext4_sb_check_geometry(&fs->sb))
+		return EUCLEAN;
+	if (!ext4_sb_check(&fs->sb)) {
+		/* A checkpoint can tear a 1 KiB superblock across atomic sectors.
+		 * Its immutable geometry is checked here; recovery must supply a
+		 * fully checksummed committed superblock before any user access. */
+		if (read_only || !ext4_sb_feature_com(&fs->sb, EXT4_FCOM_HAS_JOURNAL))
+			return EUCLEAN;
+		fs->super_replay_required = true;
+	}
 
 	bsize = ext4_sb_get_block_size(&fs->sb);
 	if (bsize > EXT4_MAX_BLOCK_SIZE)
 		return ENXIO;
+	if (ext4_sb_get_blocks_cnt(&fs->sb) > bdev->part_size / bsize)
+		return EUCLEAN;
 
 	r = ext4_fs_check_features(fs, &read_only);
 	if (r != EOK)
 		return r;
 
-	if (read_only)
-		fs->read_only = read_only;
+	/* Do not silently mount a requested writable filesystem read-only. */
+	if (read_only && !fs->read_only)
+		return EROFS;
 
 	/* Compute limits for indirect block levels */
 	uint32_t blocks_id = bsize / sizeof(uint32_t);
@@ -115,14 +131,17 @@ int ext4_fs_init(struct ext4_fs *fs, struct ext4_blockdev *bdev,
 
 
 	if (!fs->read_only) {
-		/* Mark system as mounted */
-		ext4_set16(&fs->sb, state, EXT4_SUPERBLOCK_STATE_ERROR_FS);
-		r = ext4_sb_write(fs->bdev, &fs->sb);
-		if (r != EOK)
-			return r;
-
-		/*Update mount count*/
-		ext4_set16(&fs->sb, mount_count, ext4_get16(&fs->sb, mount_count) + 1);
+		/* Recovery must see the original disk superblock. The journal start
+		 * barrier records RECOVER only after its format has been checked. */
+		if (!ext4_sb_feature_com(&fs->sb, EXT4_FCOM_HAS_JOURNAL)) {
+			ext4_set16(&fs->sb, mount_count,
+				ext4_get16(&fs->sb, mount_count) + 1);
+			ext4_set16(&fs->sb, state,
+				ext4_get16(&fs->sb, state) & ~EXT4_SUPERBLOCK_STATE_VALID_FS);
+			r = ext4_sb_write(fs->bdev, &fs->sb);
+			if (r != EOK)
+				return r;
+		}
 	}
 
 	return r;
@@ -131,6 +150,9 @@ int ext4_fs_init(struct ext4_fs *fs, struct ext4_blockdev *bdev,
 int ext4_fs_fini(struct ext4_fs *fs)
 {
 	ext4_assert(fs);
+	if (fs->super_replay_required) return EUCLEAN;
+	/* Journal stop commits and checkpoints the final superblock itself. */
+	if (fs->journaled_session || fs->read_only) return EOK;
 
 	/*Set superblock state*/
 	ext4_set16(&fs->sb, state, EXT4_SUPERBLOCK_STATE_VALID_FS);
@@ -574,6 +596,8 @@ static bool ext4_fs_verify_bg_csum(struct ext4_sblock *sb,
 int ext4_fs_get_block_group_ref(struct ext4_fs *fs, uint32_t bgid,
 				struct ext4_block_group_ref *ref)
 {
+	if (bgid >= ext4_block_group_cnt(&fs->sb))
+		return EUCLEAN;
 	/* Compute number of descriptors, that fits in one data block */
 	uint32_t block_size = ext4_sb_get_block_size(&fs->sb);
 	uint32_t dsc_cnt = block_size / ext4_sb_get_desc_size(&fs->sb);
@@ -599,7 +623,23 @@ int ext4_fs_get_block_group_ref(struct ext4_fs *fs, uint32_t bgid,
 			 DBG_WARN "Block group descriptor checksum failed."
 			 "Block group index: %" PRIu32"\n",
 			 bgid);
+		ext4_block_set(fs->bdev, &ref->block);
+		return EUCLEAN;
 	}
+	return EOK;
+}
+
+/* Lookup and validation never initialize disk structures. Only allocation
+ * enters this path, after the caller has established its transaction. */
+int ext4_fs_get_block_group_ref_alloc(struct ext4_fs *fs, uint32_t bgid,
+				      struct ext4_block_group_ref *ref)
+{
+	if (fs->read_only)
+		return EROFS;
+	int rc = ext4_fs_get_block_group_ref(fs, bgid, ref);
+	if (rc != EOK)
+		return rc;
+	struct ext4_bgroup *bg = ref->block_group;
 
 	if (ext4_bg_has_flag(bg, EXT4_BLOCK_GROUP_BLOCK_UNINIT)) {
 		rc = ext4_fs_init_block_bitmap(ref);
@@ -724,6 +764,8 @@ __ext4_fs_get_inode_ref(struct ext4_fs *fs, uint32_t index,
 			struct ext4_inode_ref *ref,
 			bool initialized)
 {
+	if (index == 0 || index > ext4_get32(&fs->sb, inodes_count))
+		return EUCLEAN;
 	/* Compute number of i-nodes, that fits in one data block */
 	uint32_t inodes_per_group = ext4_get32(&fs->sb, inodes_per_group);
 
@@ -781,6 +823,8 @@ __ext4_fs_get_inode_ref(struct ext4_fs *fs, uint32_t index,
 			DBG_WARN "Inode checksum failed."
 			"Inode: %" PRIu32"\n",
 			ref->index);
+		ext4_block_set(fs->bdev, &ref->block);
+		return EUCLEAN;
 	}
 
 	return EOK;
@@ -1268,7 +1312,8 @@ int ext4_fs_truncate_inode(struct ext4_inode_ref *inode_ref, uint64_t new_size)
 ext4_fsblk_t ext4_fs_inode_to_goal_block(struct ext4_inode_ref *inode_ref)
 {
 	uint32_t grp_inodes = ext4_get32(&inode_ref->fs->sb, inodes_per_group);
-	return (inode_ref->index - 1) / grp_inodes;
+	return ext4_fs_first_bg_block_no(&inode_ref->fs->sb,
+				       (inode_ref->index - 1) / grp_inodes);
 }
 
 /**@brief Compute 'goal' for allocation algorithm (For blockmap).

@@ -25,7 +25,7 @@
 struct host_image {
 	int fd;
 	uint64_t size;
-	bool fail_next_initialization_io;
+	struct ext4_blockdev *device;
 	uint64_t fail_write_offset;
 	unsigned int fail_writes;
 	unsigned int failed_writes;
@@ -42,6 +42,7 @@ static int host_open(struct ext4_blockdev *bdev)
 	if (image == NULL || image->fd < 0)
 		return EINVAL;
 
+	image->device = bdev;
 	return EOK;
 }
 
@@ -91,10 +92,6 @@ static int host_read(struct ext4_blockdev *bdev, void *buffer,
 		return rc;
 
 	image = bdev->bdif->p_user;
-	if (image->fail_next_initialization_io && count == 1) {
-		image->fail_next_initialization_io = false;
-		return EIO;
-	}
 	while (done < length) {
 		size_t remaining = length - done;
 		size_t chunk = remaining > (size_t)SSIZE_MAX ?
@@ -166,6 +163,14 @@ static int host_close(struct ext4_blockdev *bdev)
 		return EINVAL;
 
 	return EOK;
+}
+
+static int host_flush(struct ext4_blockdev *bdev)
+{
+	int rc = host_open(bdev);
+	if (rc != EOK) return rc;
+	struct host_image *image = bdev->bdif->p_user;
+	return fdatasync(image->fd) == 0 ? EOK : EIO;
 }
 
 static int report_error(const char *operation, int rc)
@@ -547,47 +552,39 @@ close:
 	return failed;
 }
 
-static int check_failed_block_initialization(struct host_image *image)
+static int check_failed_data_write(struct host_image *image)
 {
-	struct ext4_inode inode;
-	ext4_file file = {0};
-	size_t count = 0;
-	int failed = 0;
-	int rc;
-
-	rc = ext4_fopen2(&file, "/failed-initialization",
-			 O_CREAT | O_RDWR | O_TRUNC);
-	if (rc != EOK)
-		return report_error("create failed-initialization file", rc);
-	if (ext4_fseek(&file, 73, SEEK_SET) != EOK) {
-		failed = report_error("seek failed-initialization file", EIO);
-		goto close;
-	}
-
-	image->fail_next_initialization_io = true;
-	rc = ext4_fwrite(&file, "X", 1, &count);
-	if (rc != EIO || count != 0 || ext4_fsize(&file) != 0) {
-		fprintf(stderr,
-			"initialization failure result mismatch: rc=%d count=%zu size=%" PRIu64 "\n",
-			rc, count, ext4_fsize(&file));
-		failed = 1;
-	}
-	rc = ext4_fraw_inode_fill(&file, &inode);
-	if (rc != EOK || to_le32(inode.blocks_count_lo) != 0) {
-		fprintf(stderr,
-			"initialization failure left an allocated mapping: rc=%d blocks=%" PRIu32 "\n",
-			rc, to_le32(inode.blocks_count_lo));
-		failed = 1;
-	}
-
-close:
-	image->fail_next_initialization_io = false;
-	rc = ext4_fclose(&file);
-	if (rc != EOK) {
-		report_error("close failed-initialization file", rc);
-		failed = 1;
-	}
-	return failed;
+    ext4_file file = {0};
+    struct ext4_inode_ref inode;
+    ext4_fsblk_t data_block;
+    size_t count = 0;
+    int r = ext4_fopen2(&file, "/failed-write", O_CREAT | O_RDWR | O_TRUNC);
+    if (r != EOK) return report_error("create write-failure file", r);
+    r = ext4_fwrite(&file, "S", 1, &count);
+    if (r != EOK) return report_error("seed write-failure file", r);
+    r = ext4_fs_get_inode_ref(image->device->fs, file.inode, &inode);
+    if (r != EOK) return report_error("load write-failure inode", r);
+    r = ext4_fs_get_inode_dblk_idx(&inode, 0, &data_block, false);
+    ext4_fs_put_inode_ref(&inode);
+    if (r != EOK || !data_block) return report_error("locate data block", EIO);
+    image->fail_write_offset = data_block * image->device->lg_bsize;
+    image->fail_writes = 1;
+    ext4_fseek(&file, 73, SEEK_SET);
+    r = ext4_fwrite(&file, "X", 1, &count);
+    /* Buffered progress remains visible and owned when its submission fails. */
+    if (r != EIO || count != 1 || ext4_fsize(&file) != 74 || image->fail_writes)
+        return report_error("report data submission failure", EIO);
+    ext4_fseek(&file, 73, SEEK_SET);
+    r = ext4_fwrite(&file, "X", 1, &count);
+    if (r != EOK || count != 1) return report_error("retry data submission", r);
+    unsigned char data[74];
+    ext4_fseek(&file, 0, SEEK_SET);
+    r = ext4_fread(&file, data, sizeof(data), &count);
+    if (r != EOK || count != sizeof(data) || data[0] != 'S' || data[73] != 'X' ||
+        !all_zero(data + 1, 72)) return report_error("preserve accepted data", EIO);
+    r = ext4_fclose(&file);
+    if (r == EOK) r = ext4_fremove("/failed-write");
+    return r == EOK ? 0 : report_error("release write-failure file", r);
 }
 
 static int check_preexisting_unwritten_extent(void)
@@ -647,7 +644,7 @@ static int check_sparse_behavior(struct host_image *image)
 	int rc;
 
 	failed = check_sparse_address_limit();
-	if (check_failed_block_initialization(image) != 0)
+	if (check_failed_data_write(image) != 0)
 		failed = 1;
 	if (check_preexisting_unwritten_extent() != 0)
 		failed = 1;
@@ -825,6 +822,7 @@ int main(int argc, char **argv)
 	interface.bread = host_read;
 	interface.bwrite = host_write;
 	interface.close = host_close;
+	interface.flush = host_flush;
 	interface.ph_bsize = PHYSICAL_SECTOR_SIZE;
 	interface.ph_bcnt = image.size / PHYSICAL_SECTOR_SIZE;
 	interface.ph_bbuf = physical_buffer;

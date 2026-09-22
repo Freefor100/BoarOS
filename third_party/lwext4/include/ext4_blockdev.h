@@ -100,6 +100,9 @@ struct ext4_blockdev_iface {
 
 	/**@brief   User data pointer*/
 	void* p_user;
+
+	/** Persist all prior writes. Required for journal durability. */
+	int (*flush)(struct ext4_blockdev *bdev);
 };
 
 /**@brief   Definition of the simple block device.*/
@@ -156,6 +159,9 @@ struct ext4_blockdev {
  * @param   bdev block device descriptor
  * @return  standard error code*/
 int ext4_block_init(struct ext4_blockdev *bdev);
+
+/** Device persistence barrier; ENOTSUP if the backend has no contract. */
+int ext4_blockdev_flush(struct ext4_blockdev *bdev);
 
 /**@brief   Binds a bcache to block device.
  * @param   bdev block device descriptor

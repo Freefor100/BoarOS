@@ -91,8 +91,11 @@ LWEXT4_SOURCES := \
 	third_party/lwext4/src/ext4_hash.c \
 	third_party/lwext4/src/ext4_ialloc.c \
 	third_party/lwext4/src/ext4_inode.c \
+	third_party/lwext4/src/ext4_journal.c \
+	third_party/lwext4/src/ext4_orphan.c \
 	third_party/lwext4/src/ext4_super.c \
-	third_party/lwext4/src/ext4_trans.c
+	third_party/lwext4/src/ext4_trans.c \
+	third_party/lwext4/src/ext4_truncate.c
 
 C_SOURCES := \
 	arch/riscv/context.c \
@@ -461,7 +464,7 @@ DEPS := \
 	test-files-riscv \
 	test-files-partial-write-riscv \
 	test-high-half-trap-riscv test-idle-riscv test-no-identity-riscv \
-	test-lwext4-host \
+	test-lwext4-host test-lwext4-recovery-host \
 	test-block-riscv test-heap-riscv test-page-riscv test-vfs-riscv \
 	test-scheduler-cases-riscv test-scheduler-riscv \
 	test-boot-riscv test-references test-riscv \
@@ -481,6 +484,15 @@ test-references:
 
 test-lwext4-host:
 	./tests/lwext4-host.sh
+
+# Real volatile-storage power cuts, separate from normal QEMU shutdown tests.
+test-lwext4-recovery-host:
+	sh tests/lwext4-journal-host.sh
+	sh tests/lwext4-ordered-host.sh
+	sh tests/lwext4-orphan-host.sh
+	sh tests/lwext4-truncate-host.sh
+	sh tests/lwext4-recovery-host.sh
+	sh tests/lwext4-reclaim-host.sh
 
 $(KERNEL_RV): $(OBJECTS) arch/riscv/linker.ld
 	$(CC) $(LDFLAGS) -Wl,-Map,$(BUILD_DIR)/kernel-rv.map \
@@ -533,6 +545,7 @@ $(BLOCK_TEST_KERNEL_RV): $(BLOCK_TEST_OBJECTS) arch/riscv/linker.ld
 
 $(VFS_TEST_KERNEL_RV): $(VFS_TEST_OBJECTS) arch/riscv/linker.ld
 	$(CC) $(LDFLAGS) -Wl,--wrap=ext4_orphan_free -Wl,--wrap=ext4_fclose -Wl,--wrap=kernel_heap_allocate \
+		-Wl,--wrap=ext4_journal_start -Wl,--wrap=ext4_user_calloc \
 		-Wl,-Map,$(BUILD_DIR)/tests/kernel-vfs-rv.map \
 		-o $@ $(VFS_TEST_OBJECTS)
 
@@ -771,6 +784,7 @@ $(ROOT_BOOT_CLEANUP_TEST_KERNEL_RV): $(OBJECTS) \
 		$(ROOT_BOOT_CLEANUP_TEST_OBJECT_RV) arch/riscv/linker.ld
 	$(CC) $(LDFLAGS) -Wl,--wrap=kernel_fs_context_create \
 		-Wl,--wrap=kernel_block_write_at \
+		-Wl,--wrap=riscv_root_boot_cleanup \
 		-Wl,-Map,$(BUILD_DIR)/tests/kernel-root-boot-cleanup-rv.map \
 		-o $@ $(OBJECTS) $(ROOT_BOOT_CLEANUP_TEST_OBJECT_RV)
 
@@ -1014,7 +1028,7 @@ test-root-boot-cleanup-riscv: $(ROOT_BOOT_CLEANUP_TEST_KERNEL_RV) \
 		ROOT_INIT_PROGRAM_RV=$(ROOT_INIT_PROGRAM_RV) \
 		ROOT_EXEC_STAGE2_RV=$(ROOT_EXEC_STAGE2_RV) \
 		ROOT_EXEC_STAGE3_RV=$(ROOT_EXEC_STAGE3_RV) \
-		ROOT_BOOT_ERROR_STATUS=0x9 \
+		ROOT_BOOT_ERROR_STATUS=0xb \
 		./tests/root-init-riscv.sh
 
 test-user-riscv: $(USER_TEST_KERNEL_RV)

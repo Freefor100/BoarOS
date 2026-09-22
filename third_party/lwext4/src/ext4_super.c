@@ -122,7 +122,7 @@ static bool ext4_sb_verify_csum(struct ext4_sblock *s)
 	return s->checksum == to_le32(ext4_sb_csum(s));
 }
 
-static void ext4_sb_set_csum(struct ext4_sblock *s)
+void ext4_sb_set_csum(struct ext4_sblock *s)
 {
 	if (!ext4_sb_feature_ro_com(s, EXT4_FRO_COM_METADATA_CSUM))
 		return;
@@ -143,9 +143,21 @@ int ext4_sb_read(struct ext4_blockdev *bdev, struct ext4_sblock *s)
 				    EXT4_SUPERBLOCK_SIZE);
 }
 
-bool ext4_sb_check(struct ext4_sblock *s)
+bool ext4_sb_check_geometry(struct ext4_sblock *s)
 {
 	if (ext4_get16(s, magic) != EXT4_SUPERBLOCK_MAGIC)
+		return false;
+	if (ext4_get32(s, log_block_size) > 6)
+		return false;
+	uint32_t block_size = ext4_sb_get_block_size(s);
+	uint16_t inode_size = ext4_get16(s, inode_size);
+	if (inode_size < 128 || inode_size > block_size ||
+	    (inode_size & (inode_size - 1)))
+		return false;
+	if (ext4_get32(s, blocks_per_group) > block_size * 8 ||
+	    ext4_get32(s, inodes_per_group) > block_size * 8)
+		return false;
+	if (ext4_get32(s, first_data_block) != (block_size == 1024 ? 1U : 0U))
 		return false;
 
 	if (ext4_get32(s, inodes_count) == 0)
@@ -172,10 +184,12 @@ bool ext4_sb_check(struct ext4_sblock *s)
 	if (ext4_sb_get_desc_size(s) > EXT4_MAX_BLOCK_GROUP_DESCRIPTOR_SIZE)
 		return false;
 
-	if (!ext4_sb_verify_csum(s))
-		return false;
-
 	return true;
+}
+
+bool ext4_sb_check(struct ext4_sblock *s)
+{
+	return ext4_sb_check_geometry(s) && ext4_sb_verify_csum(s);
 }
 
 static inline int is_power_of(uint32_t a, uint32_t b)

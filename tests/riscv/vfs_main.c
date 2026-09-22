@@ -86,6 +86,24 @@ static uint32_t fail_fclose_calls;
 static uint32_t failed_fclose_calls;
 static struct kernel_page_cache *pressure_cache;
 static uint64_t pressure_reclaimed;
+static int fail_journal_start_allocation;
+static int fail_journal_calloc;
+int __real_ext4_journal_start(const char *mount);
+void *__real_ext4_user_calloc(size_t count, size_t size);
+int __wrap_ext4_journal_start(const char *mount)
+{
+    fail_journal_calloc = fail_journal_start_allocation;
+    fail_journal_start_allocation = 0;
+    return __real_ext4_journal_start(mount);
+}
+void *__wrap_ext4_user_calloc(size_t count, size_t size)
+{
+    if (fail_journal_calloc) {
+        fail_journal_calloc = 0;
+        return 0;
+    }
+    return __real_ext4_user_calloc(count, size);
+}
 enum kernel_heap_status __real_kernel_heap_allocate(
     struct kernel_heap *, size_t, void **);
 enum kernel_heap_status __wrap_kernel_heap_allocate(
@@ -484,6 +502,16 @@ static void run_vfs_test(const void *dtb)
         fail_vfs(4U, 1, 0);
     }
 
+#ifndef VFS_EXPECT_RECOVERY
+    /* A journal-start allocation failure is known to precede commit. The
+     * mount must remain cleanable, then permit a fresh successful mount. */
+    fail_journal_start_allocation = 1;
+    result = kernel_vfs_mount_root(&mount, &device.block, &heap, &page_cache);
+    if (result != -KERNEL_ENOMEM ||
+        (mount.private_data != 0 && kernel_vfs_unmount(&mount) != 0) ||
+        mount.private_data != 0)
+        fail_vfs(79U, -KERNEL_ENOMEM, result);
+#endif
     result = kernel_vfs_mount_root(&mount,
                                     &device.block,
                                     &heap,

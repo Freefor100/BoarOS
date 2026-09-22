@@ -6,7 +6,7 @@
 
 `include/kernel/block.h` 定义同步块设备（支持读与可选写），`include/kernel/vfs.h` 定义不透明 mount/file 对象以及根挂载、open/create、pread/pwrite、ftruncate、mkdir、unlink、rmdir、close、unmount、`kernel_vfs_fstat()` 与 `kernel_vfs_mount_is_readonly()` 查询。VFS 对外返回负 Linux errno；lwext4 的结构、全局设备名和正值 errno 不泄漏到调用者。当前只有一个根挂载与一个 lwext4 heap binding；进程 fd/open-file-description 位于独立的[文件资源层](kernel-files.md)，VFS 本身没有 mount namespace 或并发访问协议。
 
-`kernel_vfs_mount_root()` 根据传入块设备是否提供 `write` 回调自动决定只读还是读写挂载：若底层设备 `write == 0`，以只读挂载且拒绝任何修改；若底层设备可写，则以读写模式挂载。若磁盘镜像需要 recovery（`needs_recovery` incompat feature），则返回 `-EUCLEAN`。
+`kernel_vfs_mount_root()` 根据传入块设备是否提供 `write` 回调决定只读还是读写挂载。读写 journal 挂载先 replay、校验 orphan 记录、启动日志并回收遗留 orphan，完成后才发布根路径。只读介质不能完成恢复时明确拒绝；未知必需特性、损坏日志或元数据也不能作为干净镜像继续访问。
 
 `kernel_vfs_file_read_source()` 把保持打开的文件导出为带 `size/context/read_at` 的精确随机读源。回调只有填满整个范围才返回零；EOF 以内的短读转成 `-EIO`。ELF parser 因而能复用内存和 VFS 来源，而不依赖文件系统类型。
 
@@ -30,13 +30,19 @@ miss 路径先分配并清零页，再通过 node 的无 offset 副作用 `pread
 
 缓存销毁和 mount 卸载有严格顺序：先释放所有进程 MM 和临时读者，再写回并 purge 该 mount 的缓存项、关闭最后的 node，之后才允许 lwext4 unmount 与设备 flush；缓存最后注销 reclaimer 并释放哈希表。物理页和堆对象的合法释放完成即返回，分配器不变量错误进入 fatal；只有真实 ext4/block I/O 清理错误保留 mount owner。
 
-`kernel_vfs_sync()` 只主动提交目标 inode 的脏页和 inode 元数据缓冲，再执行块设备 flush；不会用 `ext4_cache_flush("/")` 排空无关文件数据。独立 open 各持错误观察位置，dup/fork 共用 OFD 的位置。`fsync/fdatasync` 支持普通文件与目录，当前 metadata 在修改时提交，两者均执行完整 inode 元数据同步。同步成功意味着提交的写已通过设备持久化屏障；**journal 生产集成完成前，不承诺断电过程中任意命名修改的原子性或恢复能力**。`O_SYNC/O_DSYNC` 对已接受的写入前缀执行相同同步，失败返回 errno，但已接受字节与 offset 保留。
+`kernel_vfs_sync()` 只主动提交目标 inode 的脏页和必要元数据事务，再执行块设备 flush；不会用 `ext4_cache_flush("/")` 排空无关文件数据。独立 open 各持错误观察位置，dup/fork 共用 OFD 的位置。`fsync/fdatasync` 支持普通文件与目录；当前 metadata 在修改时提交，handle 记录已提交事务号，两者均等待完整 inode 元数据依赖。共享事务可能连带提交其他元数据。`O_SYNC/O_DSYNC` 对已接受的写入前缀执行相同同步，失败返回 errno，但已接受字节与 offset 保留。journal 的关键写入、checkpoint 或屏障失败使 mount 持续拒绝修改和同步；OFD 错误游标不能清除该错误。
 
 ## lwext4 配置和生命周期
 
-内核编译 lwext4 读写路径需要的源码，关闭 journaling、xattr、debug/assert 和 mkfs，并把 malloc/calloc/realloc/free 绑定到当前内核堆。根设备是 raw whole-disk ext4，物理块大小固定为 512 字节；当前不解析分区表。
+内核编译 lwext4 journal/replay、orphan 和分批截断路径，关闭 xattr、debug/assert 和 mkfs，并把 malloc/calloc/realloc/free 绑定到当前内核堆。根设备是 raw whole-disk ext4，物理块大小固定为 512 字节；当前不解析分区表。
 
-挂载后额外检查 superblock `needs_recovery` incompat feature。发现该位返回 `-EUCLEAN` 并完整撤销挂载。
+事务接口 `ext4_transaction_begin/end/abort` 支持同一 mount 的嵌套修改；外层提交前保留 metadata 和数据缓冲的 before-image 与引用。明确发生在日志提交前的 OOM、空间不足或关联数据 I/O 失败可回滚内存并重试；已可能影响日志持久状态的错误由 mount 保留，不能清除后继续。外层 abort 后，调用者须重新打开在内层修改过的 lwext4 handle；VFS 的普通操作各自完成事务，不持有跨 syscall 的开放事务。
+
+每次提交先预留全部日志空间、映射与缓冲，再依次完成关联文件数据及 flush、日志内容及 flush、commit 记录及 flush。预留失败不写当前事务的数据；预留缓冲由事务持有至提交或回滚，内存成本随本次 metadata 日志大小增长。checkpoint 把已提交内容写回原位置并 flush，再持久化日志起点，最后释放日志空间和缓冲 owner。数据不写入 metadata 日志。主 superblock 的分配计数、恢复位和校验和也属于事务；挂载/卸载不在日志之外直接覆盖它。512 字节原子扇区模型下若 superblock 校验失败，只允许根据合法几何信息进入受限恢复，必须重放有效 superblock 日志后才能访问文件。
+
+`ext4_orphan.c` 支持传统 `last_orphan/i_dtime` 链和 `orphan_file`，校验范围、重复记录、循环、分配状态和 checksum。unlink 将最后一个链接摘除与持久 orphan 记录放在同一事务；缩小文件先提交最终 size 与 orphan，再由 `ext4_truncate.c` 每事务最多释放 32 个尾部数据块及已空的索引路径。恢复根据实际映射找到尾部，支持稀疏 extent 和三级间接块，不依赖已缩小的 size 推测待回收块。最后删除 orphan 记录与释放无链接 inode 同事务完成，重复恢复可继续前次进度。仍被打开的无链接 inode 在正常运行期间保留，重启才回收。
+
+支持有界的 JBD2 checksum v2/v3、32/64-bit revoke；异步 commit、未知必需特性和旧 CRC32 journal 格式明确拒绝。已提交事务的损坏不能当作未提交尾部丢弃。只读脏日志、恢复 I/O 错误或损坏均拒绝开放用户访问。失败的日志/挂载 owner 保留到重启；普通合法内存释放不建立重试链。挂载准备阶段的 ENOMEM/ENOSPC 与关键 I/O 错误分开：资源不足保留可恢复的准备状态，后续 cleanup 可继续恢复并卸载，不能永久锁住 heap binding。
 已有路径先逐分量取得目录项和 inode 身份，再用 `ext4_fopen_inode` 按 inode 打开普通文件、目录或字符节点；新建仍由 `ext4_fopen2` 提交。目录 handle 不在内核任务栈上分配完整 `ext4_dir` 结构。
 普通文件随机写入与追加先进入页缓存；append 以共享 node 的逻辑 EOF 为起点并推进实际接收字节。定向写回通过 `ext4_fseek` + `ext4_fwrite` 提交脏范围。lwext4 的 `SEEK_SET` 允许定位到 EOF 后，磁盘逻辑块只在写回时按数据范围分配；新分配的部分块先清零，旧 EOF 块尾清零，完整中间 hole 保持未映射。底层部分写失败不缩小缓存已经接收的逻辑长度，整段脏范围由页缓存保留供重试。`st_blocks` 报实际已分配存储，不由逻辑大小猜测；检查磁盘块生命周期的测试需先同步。
 
@@ -73,6 +79,7 @@ cookie 可以交给 `lseek`/`telldir`/`seekdir` 恢复。OFD 持有位置，所�
 
 ```sh
 make test-lwext4-host
+make test-lwext4-recovery-host
 make test-vfs-riscv
 make test-files-riscv
 make test-files-partial-write-riscv
@@ -80,7 +87,9 @@ make test-exec-riscv
 make test-root-init-riscv
 ```
 
-宿主测试保留两种 lwext4 metadata checksum seed 只读探针，并在独立可写的 1 KiB-block extent、1 KiB legacy 与 8 KiB legacy (`^extent,^64bit`) 镜像上验证 aligned/unaligned hole、同块 gap、sparse truncate、allocated-block 上界、各自 exact maxbytes 以及大块 legacy 逻辑号不回绕，卸载后分别运行 `e2fsck -fn`。QEMU 测试建立真实 ext4 镜像，验证 `/init` mode、目录预检、随机偏移、EOF、越过 EOF 写入、sparse truncate、`-ENOENT`、open-file `-EBUSY`、dirty-journal `-EUCLEAN`、缓存 miss/hit/LRU/pin、压力回收、mount purge、raw inode metadata 和全部页回收；VFS runner 注入一次 orphan free 失败，覆盖仍有打开 fd 与无现存 node 两条路径，确认路径不复现、mount 只保留一个 owner、重试后可卸载。文件资源测试核对 fstat/newfstatat metadata、unlink-but-open 的 `nlink == 0`，并证明不同 fd 与 mmap 共用 node/cache 而保持各自 offset；生产测试由静态和动态 musl 入口通过 VFS read source 读取真实根盘。
+恢复测试使用 `tests/host/block_fault.c` 的易失缓存与稳定镜像，逐个写入/flush 边界丢失未同步写，并另测最后一个 512 字节扇区先落盘。journal、ordered data、公共事务、持久 orphan 记录及实际回收分别测试；1 KiB/4 KiB、extent/legacy、orphan_file/传统链覆盖两次重启、分配和链接计数、空间回收及 `e2fsck -fn`。公共事务还逐个注入内存分配失败，验证命名状态完整回滚。此承诺限于该块模型；QEMU 正常退出和实板行为不能代替断电证据。普通数据原地覆盖不承诺整文件写入原子性，成功同步保证已提交字节持久；rename 的组合应用序列在路径阶段另行验收。
+
+宿主测试保留两种 lwext4 metadata checksum seed 只读探针，并在独立可写的 1 KiB-block extent、1 KiB legacy 与 8 KiB legacy (`^extent,^64bit`) 镜像上验证 aligned/unaligned hole、同块 gap、sparse truncate、allocated-block 上界、各自 exact maxbytes 以及大块 legacy 逻辑号不回绕，卸载后分别运行 `e2fsck -fn`。QEMU 测试建立真实 ext4 镜像，验证 `/init` mode、目录预检、随机偏移、EOF、越过 EOF 写入、sparse truncate、`-ENOENT`、open-file `-EBUSY`、只读 dirty-journal `-EUCLEAN`、缓存 miss/hit/LRU/pin、压力回收、mount purge、raw inode metadata 和全部页回收；VFS runner 注入一次 orphan free 失败，覆盖仍有打开 fd 与无现存 node 两条路径，确认路径不复现、mount 只保留一个 owner、重试后可卸载。文件资源测试核对 fstat/newfstatat metadata、unlink-but-open 的 `nlink == 0`，并证明不同 fd 与 mmap 共用 node/cache 而保持各自 offset；生产测试由静态和动态 musl 入口通过 VFS read source 读取真实根盘。
 
 向下截断通过稳定 node–MM 登记通知相关地址空间，依据后端实际大小撤销越界整页
 （含 private COW），并按驻留来源区分尾页清零与私有修改保留。通知不分配内存，
