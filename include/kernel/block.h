@@ -17,6 +17,14 @@ enum kernel_block_status {
 
 struct kernel_block_device;
 
+enum kernel_block_cache_mode {
+    KERNEL_BLOCK_CACHE_UNKNOWN = 0,
+    KERNEL_BLOCK_CACHE_WRITETHROUGH,
+    KERNEL_BLOCK_CACHE_WRITEBACK,
+};
+
+typedef enum kernel_block_status (*kernel_block_flush_fn)(void *context);
+
 typedef enum kernel_block_status (*kernel_block_read_fn)(
     void *context,
     uint64_t offset,
@@ -35,7 +43,13 @@ struct kernel_block_device {
     kernel_block_write_fn write;
     uint64_t capacity_bytes;
     uint32_t logical_block_size;
+    kernel_block_flush_fn flush;
+    enum kernel_block_cache_mode cache_mode;
 };
+
+/* Complete all prior writes at the device's persistence boundary. A missing
+ * callback is sufficient only for a declared write-through device. */
+enum kernel_block_status kernel_block_flush(struct kernel_block_device *device);
 
 enum kernel_block_status kernel_block_read_at(
     struct kernel_block_device *device,

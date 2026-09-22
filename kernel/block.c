@@ -3,6 +3,18 @@
 #include <stddef.h>
 #include <stdint.h>
 
+enum kernel_block_status kernel_block_flush(struct kernel_block_device *device)
+{
+    if (device == 0 || device->logical_block_size == 0U) {
+        return KERNEL_BLOCK_STATUS_INVALID;
+    }
+    if (device->flush != 0) {
+        return device->flush(device->context);
+    }
+    return device->cache_mode == KERNEL_BLOCK_CACHE_WRITETHROUGH
+               ? KERNEL_BLOCK_STATUS_OK : KERNEL_BLOCK_STATUS_UNSUPPORTED;
+}
+
 enum kernel_block_status kernel_block_read_at(
     struct kernel_block_device *device,
     uint64_t offset,

@@ -43,6 +43,7 @@ create_disks()
 run_case()
 {
     mode=$1
+    cache=$2
     create_disks "$mode"
     output="$output_dir/block-$mode.log"
     set -- "$qemu" \
@@ -57,8 +58,8 @@ run_case()
         set -- "$@" -global virtio-mmio.force-legacy=false
     fi
     set -- "$@" \
-        -drive file="$disk_rw",if=none,format=raw,readonly=off,id=x0 \
-        -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
+        -drive file="$disk_rw",if=none,format=raw,readonly=off,cache="$cache",id=x0 \
+        -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0,config-wce=off \
         -drive file="$disk_ro",if=none,format=raw,readonly=on,id=x1 \
         -device virtio-blk-device,drive=x1,bus=virtio-mmio-bus.1
     if ! timeout -k 2s 10s "$@" </dev/null >"$output" 2>&1; then
@@ -76,9 +77,16 @@ run_case()
         echo "$mode VirtIO block test kernel reported a failed case" >&2
         exit 1
     fi
+    if ! grep -qxF "BoarOS: block cache $cache" "$output"; then
+        show_output
+        echo "incorrect negotiated cache mode: $mode $cache" >&2
+        exit 1
+    fi
 }
 
-run_case legacy
-run_case modern
+run_case legacy writeback
+run_case modern writeback
+run_case legacy writethrough
+run_case modern writethrough
 
 echo "RISC-V VirtIO block tests passed"

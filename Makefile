@@ -1092,6 +1092,14 @@ test-allocator-release-host:
 
 include tests/diff-abi/Makefile.inc
 
+.PHONY: test-block-host
+test-block-host:
+	mkdir -p build/host
+	cc -std=c11 -Wall -Wextra -Werror -idirafter include tests/host/block_flush.c kernel/block.c -o build/host/block-flush
+	build/host/block-flush
+	cc -std=c11 -Wall -Wextra -Werror -idirafter include tests/host/block_fault_test.c tests/host/block_fault.c kernel/block.c -o build/host/block-fault
+	build/host/block-fault
+
 # Rebuild only production code in isolation: stale .su files and boot-only
 # test fixture frames cannot silently satisfy or distort this gate.
 .PHONY: test-stack-usage

@@ -12,6 +12,8 @@ DMA 的地址是设备可见地址，不等于任意内核虚拟地址。QEMU `v
 
 ## 为什么当前是同步 I/O
 
+设备 flush 与块缓存排空是两层边界。新增块 flush 依据固定 Linux `references/linux/drivers/block/virtio_blk.c`（`f4cdf7ca9a1fdcca413157df19753f388a5a224e`）与 QEMU `references/qemu/hw/block/virtio-blk.c`（v11.1.0，`84f07211cc5b4fc6a371559bf8a5de4fb068e648`）：不协商 CONFIG_WCE 时，FLUSH feature 决定 writeback，缺失则为 write-through。协商 FLUSH 后必须真实提交该请求；内存 fence、read-after-write、QEMU 正常退出均不能替代介质持久化证据。host 故障模型把易失状态与稳定镜像分开，允许未同步扇区丢失/重排；后续 journal 测试应复用这个模型，而非仅终止普通 QEMU 后检查恰好仍在宿主页缓存中的数据。
+
 首个存储消费者发生在单 hart 启动期，尚无外部中断控制器、等待队列与阻塞调度。一个 outstanding request 加有界轮询能形成真实 I/O 闭环，并把过渡复杂性限制在设备后端。其缺点是等待期间 CPU 忙等且不能并行 I/O；建立 IRQ 和 sleep/wake 后，应替换完成方式而保留块设备和 VFS 语义。
 
 当前 ext4 既可挂载为只读，也可在块设备提供写回调时挂载为读写；同步轮询只解决首个单 hart 消费者的 I/O 边界。写路径增加了介质更新、页缓存失效和真实清理错误，不能把它们简化成分配器重试。ext3/4 若带 `needs_recovery`，最近的元数据事务可能只在 journal 中；没有 JBD2 replay 的实现必须拒绝挂载。metadata checksum 还要求根据 incompat feature 在 superblock checksum seed 与 UUID 派生 seed 之间正确选择，不能因镜像“能列目录”就认定所有元数据校验正确。
