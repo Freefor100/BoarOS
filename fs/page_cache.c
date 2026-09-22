@@ -1,6 +1,7 @@
 #include "vfs_internal.h"
 
 #include <kernel/heap.h>
+#include <kernel/errno.h>
 #include <kernel/page.h>
 #include <kernel/page_cache.h>
 #include <kernel/physical_page.h>
@@ -8,6 +9,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 #define PAGE_CACHE_INITIAL_CAPACITY 16U
 #define PAGE_CACHE_TOMBSTONE \
@@ -17,10 +19,15 @@ struct kernel_page_cache_entry {
     struct kernel_page_cache_entry *lru_previous;
     struct kernel_page_cache_entry *lru_next;
     struct kernel_page_cache_entry *cleanup_next;
+    struct kernel_page_cache_entry *node_next;
+    struct kernel_page_cache_entry **node_previous;
     struct kernel_vfs_node *node;
     uint64_t page_index;
     uint64_t physical_address;
-    size_t valid_bytes;
+    size_t dirty_begin;
+    size_t dirty_end;
+    uint64_t generation;
+    uint8_t writeback;
     uint8_t page_references_owned;
 };
 
@@ -33,6 +40,7 @@ struct kernel_page_cache_record {
     size_t capacity;
     size_t occupied;
     size_t tombstones;
+    unsigned int writeback_active;
 };
 
 static int cache_live(const struct kernel_page_cache *cache)
@@ -259,6 +267,11 @@ static void remove_entry(struct kernel_page_cache *cache,
         record->tombstones++;
     }
     lru_remove(record, entry);
+    *entry->node_previous = entry->node_next;
+    if (entry->node_next != 0)
+        entry->node_next->node_previous = entry->node_previous;
+    entry->node_previous = 0;
+    entry->node_next = 0;
     entry->cleanup_next = record->cleanup_entries;
     record->cleanup_entries = entry;
     record->statistics.current_pages--;
@@ -346,6 +359,15 @@ static enum kernel_page_cache_status lookup_entry(
     return KERNEL_PAGE_CACHE_STATUS_OK;
 }
 
+static size_t entry_valid_bytes(const struct kernel_page_cache_entry *entry)
+{
+    uint64_t size = kernel_vfs_node_size(entry->node);
+    uint64_t start = entry->page_index << BOAROS_PAGE_SHIFT;
+    if (start >= size) return 0;
+    return size - start < BOAROS_PAGE_SIZE ? (size_t)(size - start)
+                                          : BOAROS_PAGE_SIZE;
+}
+
 enum kernel_page_cache_status kernel_page_cache_lookup(
     struct kernel_page_cache *cache,
     const struct kernel_vfs_file *file,
@@ -371,16 +393,17 @@ enum kernel_page_cache_status kernel_page_cache_lookup(
     lru_touch(cache->record, entry);
     cache->record->statistics.hits++;
     *physical_address = entry->physical_address;
-    *valid_bytes = entry->valid_bytes;
+    *valid_bytes = entry_valid_bytes(entry);
     return KERNEL_PAGE_CACHE_STATUS_OK;
 }
 
-enum kernel_page_cache_status kernel_page_cache_get(
+static enum kernel_page_cache_status get_page(
     struct kernel_page_cache *cache,
     const struct kernel_vfs_file *file,
     uint64_t page_index,
     uint64_t *physical_address,
-    size_t *valid_bytes)
+    size_t *valid_bytes,
+    int for_write)
 {
     struct kernel_page_cache_entry *entry;
     struct kernel_vfs_node *node;
@@ -408,7 +431,7 @@ enum kernel_page_cache_status kernel_page_cache_get(
         return KERNEL_PAGE_CACHE_STATUS_INVALID_ARGUMENT;
     }
     offset = page_index << BOAROS_PAGE_SHIFT;
-    if (offset >= kernel_vfs_node_size(node)) {
+    if (!for_write && offset >= kernel_vfs_node_size(node)) {
         return KERNEL_PAGE_CACHE_STATUS_OUT_OF_RANGE;
     }
     cache->record->statistics.misses++;
@@ -459,7 +482,6 @@ enum kernel_page_cache_status kernel_page_cache_get(
     }
     entry->page_references_owned = 2U;
     entry->page_index = page_index;
-    entry->valid_bytes = bytes_read;
     bucket = find_bucket(cache->record, node, page_index, &found);
     if (found) {
         return abandon_entry(cache,
@@ -472,6 +494,11 @@ enum kernel_page_cache_status kernel_page_cache_get(
     }
     cache->record->buckets[bucket] = entry;
     cache->record->occupied++;
+    entry->node_next = *kernel_vfs_node_cache_pages(node);
+    entry->node_previous = kernel_vfs_node_cache_pages(node);
+    if (entry->node_next != 0)
+        entry->node_next->node_previous = &entry->node_next;
+    *entry->node_previous = entry;
     lru_insert_head(cache->record, entry);
     cache->record->statistics.insertions++;
     cache->record->statistics.current_pages++;
@@ -481,8 +508,154 @@ enum kernel_page_cache_status kernel_page_cache_get(
             cache->record->statistics.current_pages;
     }
     *physical_address = entry->physical_address;
-    *valid_bytes = entry->valid_bytes;
+    *valid_bytes = entry_valid_bytes(entry);
     return KERNEL_PAGE_CACHE_STATUS_OK;
+}
+
+enum kernel_page_cache_status kernel_page_cache_get(
+    struct kernel_page_cache *cache, const struct kernel_vfs_file *file,
+    uint64_t page_index, uint64_t *physical_address, size_t *valid_bytes)
+{
+    return get_page(cache, file, page_index, physical_address, valid_bytes, 0);
+}
+
+int kernel_page_cache_write(struct kernel_page_cache *cache,
+                             struct kernel_vfs_file *file, uint64_t offset,
+                             const void *buffer, size_t size, size_t *written)
+{
+    const unsigned char *source = buffer;
+    *written = 0;
+    while (*written < size) {
+        uint64_t address;
+        size_t valid, start = (size_t)(offset & (BOAROS_PAGE_SIZE - 1U));
+        size_t count = BOAROS_PAGE_SIZE - start;
+        struct kernel_page_cache_entry *entry;
+        void *page;
+        enum kernel_page_cache_status status;
+        if (count > size - *written) count = size - *written;
+        status = get_page(cache, file, offset >> BOAROS_PAGE_SHIFT,
+                           &address, &valid, 1);
+        if (status != KERNEL_PAGE_CACHE_STATUS_OK)
+            return status == KERNEL_PAGE_CACHE_STATUS_NO_MEMORY
+                       ? -KERNEL_ENOMEM : -KERNEL_EIO;
+        if (lookup_entry(cache, file, offset >> BOAROS_PAGE_SHIFT, &entry) !=
+                KERNEL_PAGE_CACHE_STATUS_OK ||
+            physical_page_resolve(cache->allocator, address, &page) !=
+                PHYSICAL_PAGE_STATUS_OK) __builtin_trap();
+        memcpy((unsigned char *)page + start, source + *written, count);
+        if (entry->dirty_end == 0 || start < entry->dirty_begin)
+            entry->dirty_begin = start;
+        if (start + count > entry->dirty_end) entry->dirty_end = start + count;
+        entry->generation++;
+        offset += count;
+        *written += count;
+        kernel_vfs_node_written(entry->node, offset);
+        (void)physical_page_release(cache->allocator, address);
+    }
+    return 0;
+}
+
+static int writeback_entry(struct kernel_page_cache *cache,
+                           struct kernel_page_cache_entry *entry, uint64_t limit)
+{
+    void *page;
+    size_t written = 0, begin, end;
+    uint64_t generation;
+    int result;
+    if (entry->dirty_end == 0) return 0;
+    uint64_t start = entry->page_index << BOAROS_PAGE_SHIFT;
+    if (limit <= start || limit - start <= entry->dirty_begin) return 0;
+    /* A bcache miss may allocate while an outer ext4 read owns fpos and
+     * buffer lookup state. Reclamation there can free clean pages only. */
+    if (entry->writeback || !kernel_vfs_node_writeback_allowed(entry->node))
+        return -KERNEL_EBUSY;
+    entry->writeback = 1;
+    cache->record->writeback_active++;
+    begin = entry->dirty_begin;
+    end = entry->dirty_end;
+    if (end > limit - start) end = (size_t)(limit - start);
+    generation = entry->generation;
+    if (physical_page_acquire(cache->allocator, entry->physical_address) !=
+            PHYSICAL_PAGE_STATUS_OK ||
+        physical_page_resolve(cache->allocator, entry->physical_address,
+                               &page) != PHYSICAL_PAGE_STATUS_OK)
+        __builtin_trap();
+    result = kernel_vfs_node_writeback(entry->node,
+                    (entry->page_index << BOAROS_PAGE_SHIFT) + begin,
+                    (unsigned char *)page + begin, end - begin, &written);
+    if (written > end - begin) __builtin_trap();
+    if (result == 0 && written != end - begin) result = -KERNEL_EIO;
+    if (result == 0 && generation == entry->generation) {
+        entry->dirty_begin = end;
+        if (end == entry->dirty_end) {
+            entry->dirty_begin = 0;
+            entry->dirty_end = 0;
+        }
+    }
+    (void)physical_page_release(cache->allocator, entry->physical_address);
+    entry->writeback = 0;
+    cache->record->writeback_active--;
+    return result;
+}
+
+int kernel_page_cache_writeback_before(struct kernel_page_cache *cache,
+    struct kernel_vfs_node *node, uint64_t end)
+{
+    struct kernel_page_cache_entry *entry;
+    if (!cache_live(cache) || node == 0) return -KERNEL_EINVAL;
+    /* No mount-wide scan: each inode owns its cache index. I/O can allocate
+     * and reclaim, so protect the entire traversal from recursive eviction. */
+    for (entry = *kernel_vfs_node_cache_pages(node); entry != 0;
+         entry = entry->node_next) {
+        if (physical_page_acquire(cache->allocator, entry->physical_address) !=
+            PHYSICAL_PAGE_STATUS_OK) __builtin_trap();
+    }
+    int result = 0;
+    for (entry = *kernel_vfs_node_cache_pages(node); entry != 0;
+         entry = entry->node_next) {
+        if (result == 0) result = writeback_entry(cache, entry, end);
+    }
+    for (entry = *kernel_vfs_node_cache_pages(node); entry != 0;
+         entry = entry->node_next)
+        (void)physical_page_release(cache->allocator, entry->physical_address);
+    return result;
+}
+
+int kernel_page_cache_writeback(struct kernel_page_cache *cache,
+                                 struct kernel_vfs_node *node)
+{
+    return kernel_page_cache_writeback_before(cache, node, UINT64_MAX);
+}
+
+void kernel_page_cache_truncate(struct kernel_page_cache *cache,
+    struct kernel_vfs_node *node, uint64_t size)
+{
+    struct kernel_page_cache_entry *entry = *kernel_vfs_node_cache_pages(node);
+    uint64_t released = 0;
+    while (entry != 0) {
+        struct kernel_page_cache_entry *next = entry->node_next;
+        uint64_t start = entry->page_index << BOAROS_PAGE_SHIFT;
+        if (entry->writeback) __builtin_trap();
+        if (start >= size) {
+            remove_entry(cache, entry);
+        } else if (size - start < BOAROS_PAGE_SIZE) {
+            size_t tail = (size_t)(size - start);
+            void *page;
+            if (physical_page_resolve(cache->allocator, entry->physical_address,
+                                       &page) != PHYSICAL_PAGE_STATUS_OK)
+                __builtin_trap();
+            zero_bytes((unsigned char *)page + tail, BOAROS_PAGE_SIZE - tail);
+            if (entry->dirty_end > tail) entry->dirty_end = tail;
+            if (entry->dirty_begin >= entry->dirty_end) {
+                entry->dirty_begin = 0;
+                entry->dirty_end = 0;
+            }
+            entry->generation++;
+        }
+        entry = next;
+    }
+    (void)drain_entries(cache, &released);
+    cache->record->statistics.pages_reclaimed += released;
 }
 
 uint64_t kernel_page_cache_reclaim(struct kernel_page_cache *cache,
@@ -494,7 +667,8 @@ uint64_t kernel_page_cache_reclaim(struct kernel_page_cache *cache,
     uint64_t scanned = 0U;
     uint64_t scan_limit;
 
-    if (!cache_live(cache) || target_pages == 0U) {
+    if (!cache_live(cache) || target_pages == 0U ||
+        cache->record->writeback_active != 0U) {
         return 0U;
     }
     cache->record->statistics.reclaim_calls++;
@@ -510,7 +684,8 @@ uint64_t kernel_page_cache_reclaim(struct kernel_page_cache *cache,
                                            entry->physical_address,
                                            &references) ==
                 PHYSICAL_PAGE_STATUS_OK &&
-            references == 1U) {
+            references == 1U && !entry->writeback &&
+            writeback_entry(cache, entry, UINT64_MAX) == 0) {
             remove_entry(cache, entry);
             (void)drain_entries(cache, &released);
             reclaimed = released;
@@ -540,6 +715,8 @@ enum kernel_page_cache_status kernel_page_cache_purge_mount(
         if (kernel_vfs_node_mount(entry->node) == mount) {
             uint32_t references;
 
+            if (writeback_entry(cache, entry, UINT64_MAX) != 0)
+                return KERNEL_PAGE_CACHE_STATUS_IO;
             if (physical_page_reference_count(cache->allocator,
                                                entry->physical_address,
                                                &references) !=
@@ -563,7 +740,7 @@ enum kernel_page_cache_status kernel_page_cache_purge_mount(
 
 enum kernel_page_cache_status kernel_page_cache_invalidate_node(
     struct kernel_page_cache *cache,
-    const struct kernel_vfs_node *node)
+    struct kernel_vfs_node *node)
 {
     struct kernel_page_cache_entry *entry;
     uint64_t released = 0U;
@@ -571,14 +748,12 @@ enum kernel_page_cache_status kernel_page_cache_invalidate_node(
     if (!cache_live(cache) || node == 0) {
         return KERNEL_PAGE_CACHE_STATUS_INVALID_ARGUMENT;
     }
-    entry = cache->record->lru_tail;
+    entry = *kernel_vfs_node_cache_pages(node);
     while (entry != 0) {
-        struct kernel_page_cache_entry *previous = entry->lru_previous;
-
-        if (entry->node == node) {
-            remove_entry(cache, entry);
-        }
-        entry = previous;
+        struct kernel_page_cache_entry *next = entry->node_next;
+        if (entry->writeback) __builtin_trap();
+        remove_entry(cache, entry);
+        entry = next;
     }
     if (!drain_entries(cache, &released)) {
         cache->record->statistics.pages_reclaimed += released;
@@ -615,6 +790,9 @@ enum kernel_page_cache_status kernel_page_cache_destroy(
              entry != 0;
              entry = entry->lru_previous) {
             uint32_t references;
+
+            if (writeback_entry(cache, entry, UINT64_MAX) != 0)
+                return KERNEL_PAGE_CACHE_STATUS_IO;
 
             if (physical_page_reference_count(cache->allocator,
                                                entry->physical_address,

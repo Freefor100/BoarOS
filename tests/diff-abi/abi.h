@@ -38,5 +38,6 @@ void abi_link_cases(void);
 void abi_signal_wait_cases(void);
 void abi_limit_cases(void);
 void abi_device_cases(void);
+void abi_sync_cases(void);
 void abi_limit_exec_probe(void) __attribute__((noreturn));
 #endif

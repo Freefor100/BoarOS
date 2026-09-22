@@ -69,15 +69,15 @@ open file description 的 offset 只增加实际复制到用户空间的字节�
 `write` 与 `writev` 支持 console、pipe 以及具备写权限（`O_WRONLY/O_RDWR`）的常规文件：
 - console 经 `kernel_console_putc` 逐字节输出并返回完整计数；用户 fault 与部分复制按前缀保持返回。console 的 `read` 阻塞等待真实 UART 输入。
 - pipe 的 `write/writev` 汇总后沿用 pipe 单次写空间、原子性、阻塞、EPIPE/SIGPIPE 和片段提交规则。
-- regular 文件写入通过 `kernel_vfs_pwrite()` 执行底层介质写入，并调用节点页缓存失效确保缓存一致性。若描述符设置了 `O_APPEND`，写入前通过 `kernel_vfs_append()` 原子解析当前 EOF 并写入，成功后将 OFD offset 更新至新文件末尾。未以写权限打开的描述符或目录描述符调用 write 返回 `-EBADF`。
-- regular 文件 usercopy 跨入不可读或未映射页时，仍把已复制的连续前缀交给 backend；返回值和 OFD offset 只计入实际写入量。零进度用户 fault 返回 `-EFAULT`；若提交此前缀的 backend 在零进度时返回错误，保留 backend errno。fault 一旦发生即结束整个请求，不继续后续 iovec；`STATE` 仍作为内核状态错误传播。该前缀提交原则对应固定 Linux `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 [`mm/filemap.c`](../../references/linux/mm/filemap.c) 中 `generic_perform_write()`：usercopy 的 copied 与 `write_end()` 实际接受量分开，位置只按后者推进。
-- backend 已提交正字节前缀后才报告错误时，`write/writev` 返回该前缀，OFD offset 只增加该正字节数；只有零进度才把 errno 返回用户态。VFS 在结果判定前同步 live inode/node/file size 并使旧页缓存失效，因此 `fstat`、后续读取和共享 node 的描述符不会观察到旧长度或旧内容。
+- regular 文件的 `kernel_vfs_pwrite/append()` 将已复制字节接收到共享 inode 页缓存；部分 usercopy 只发布成功复制的前缀，并推进对应 offset/逻辑大小。writeback 错误由 inode 保留，不能事后撤销已经接收的字节。
+- `kernel_files_sync()` pin 选定 OFD，同步目标 inode 的数据/元数据与设备缓存；独立 open 各持错误序列观察位置，dup/fork 共享同一 OFD 的位置。普通文件和目录支持 fsync/fdatasync；pipe、字符设备、epoll 返回 EINVAL，无效 fd 返回 EBADF。
+- `O_SYNC/O_DSYNC` 在普通写的成功前缀之后执行同步。同步失败返回 errno，OFD offset 与已接受内容保持；这与 Linux `generic_write_sync()` 的顺序一致。当前 fdatasync 同样提交 inode 元数据；没有后台写回线程。
 - `writev` 先快照完整用户 iovec 数组，校验长度和范围，再与 write 共用写入核心；`iovcnt` 上限 1024。
 
 ## 目录与文件系统操作
 
 - `kernel_files_mkdirat()`：通过 fs context 解析路径后调用 `kernel_vfs_mkdir()`；只读挂载返回 `-EROFS`。
-- `kernel_files_unlinkat()`：支持文件删除与目录删除（`AT_REMOVEDIR` 标志）。普通文件调用 `kernel_vfs_unlink()` 并使挂载存活节点页缓存失效；目录删除调用 `kernel_vfs_rmdir()`，非空目录返回 `-ENOTEMPTY`。
+- `kernel_files_unlinkat()`：支持文件删除与目录删除（`AT_REMOVEDIR` 标志）。普通文件调用 `kernel_vfs_unlink()`，仍打开的对象保留页缓存；目录删除调用 `kernel_vfs_rmdir()`，非空目录返回 `-ENOTEMPTY`。
 - `kernel_files_ftruncate()`：校验 fd 具备可写权限且为常规文件，调用 `kernel_vfs_ftruncate()` 调整文件大小（向下截断或向上 sparse 扩展）并精确失效该节点页缓存；backend 已改变 inode 后才返回错误时，仍先同步 node/file size 并失效缓存，再把 errno 返回用户态。只读描述符返回 `-EINVAL`，目录返回 `-EISDIR`。向下截断根据实际新大小通知稳定 node–MM 登记，撤销所有相关 MM 中越过新 EOF 的整页 PTE（包含私有 COW 与 PROT_NONE），保留 VMA 以便随后 fault/SIGBUS。非对齐尾页的文件来源后缀清零，已私有化内容保留；来源记录不依赖缓存索引或 PTE COW 位。
 
 `read/readv` 与 `write/writev` 在 fd lookup 后立即取得独立 OFD 引用，并在本次操作的全部复制、等待和唤醒处理结束后释放。共享表中的另一个线程即使在操作睡眠期间 close 并复用同一 fd 号，本次操作仍使用 lookup 时的 OFD；对于 pipe，这份引用也让原读/写 endpoint 在 in-flight I/O 结束前保持逻辑存活，避免提前产生 EOF/EPIPE 或释放等待队列。末次操作引用触发的底层 cleanup 失败会转交给共享文件表的原有 cleanup 链。该语义基线对应固定 Linux `f4cdf7ca9a1f` 中 [`fs/file.c`](../../references/linux/fs/file.c) 的 `fdget()`/`fdput()` 生命周期。
@@ -111,7 +111,7 @@ open file description 的 offset 只增加实际复制到用户空间的字节�
 
 `kernel_files_lseek()` 支持 `SEEK_SET/CUR/END` 的有符号运算与溢出检查，负结果返回 `-EINVAL` 且不移动 offset，越过 EOF 的定位成功；console 返回 `-ESPIPE`。目录也支持 `lseek`，其 offset 兼作 `getdents64` 的条目 cookie。
 
-`kernel_files_fstat()/newfstatat()` 按 riscv64 asm-generic 128 字节 `struct stat` 填充。regular file 与 directory 都先由 `kernel_vfs_fstat()` 取得同一份 filesystem-independent metadata，再转换为 Linux ABI；dev/ino/mode/nlink/uid/gid/size、512-byte `blocks`、filesystem `blksize` 和 atime/mtime/ctime 均来自当前 ext4 inode。打开后 unlink 的 file handle 仍指向活着的 inode，因此 `fstat` 可继续读取内容与 metadata，并观察到 `nlink == 0`。当前根 mount 的 `st_dev` 是稳定的 VFS 内部 mount ID 1，只用于同一挂载内的身份比较，不冒充硬件 major/minor。
+`kernel_files_fstat()/newfstatat()` 按 riscv64 asm-generic 128 字节 `struct stat` 填充。regular file 与 directory 都先由 `kernel_vfs_fstat()` 取得同一份 filesystem-independent metadata，再转换为 Linux ABI；dev/ino/mode/nlink/uid/gid/size、512-byte `blocks`、filesystem `blksize` 和 atime/mtime/ctime 除 size 来自共享 node 的逻辑大小外，均来自当前 ext4 inode。打开后 unlink 的 file handle 仍指向活着的 inode，因此 `fstat` 可继续读取内容与 metadata，并观察到 `nlink == 0`。当前根 mount 的 `st_dev` 是稳定的 VFS 内部 mount ID 1，只用于同一挂载内的身份比较，不冒充硬件 major/minor。
 
 console、pipe 和 epoll 是不属于 filesystem inode 的合成对象，继续走各自的显式 stat 形态；console 呈现 5:1 字符设备，pipe 呈现 FIFO。`newfstatat` 支持 `AT_FDCWD`/绝对路径与 `AT_EMPTY_PATH`（直接按 fd 取描述符），真实 dirfd 的相对路径返回 `-EBADF`；目录路径可统计，`AT_SYMLINK_NOFOLLOW` 通过路径 inode 查询返回链接自身的 mode、大小和时间戳。常规文件 create/read/pread/write/writev/truncate/unlink 已更新 realtime 时间戳：读取按 relatime（含缓存命中、非零 EOF 和 user fault），写入先校验 inode maxbytes，再在 usercopy 前修改 mtime/ctime，同长度 truncate 也更新；零长度或访问模式拒绝不更新。创建/移除更新父目录 mtime/ctime，unlink 后仍打开的 inode 继续通过 live handle 更新。扩展 inode 保留纳秒与 signed epoch，旧 128-byte inode 按秒截断；只读挂载不写 atime，未初始化时钟不覆盖 fixture metadata。触发、I/O 错误 owner 和固定 Linux 依据见[文件时间戳](../learning/file-timestamps.md)。
 
@@ -163,13 +163,13 @@ make test-root-init-riscv
 make test-riscv
 ```
 
-`make test-files-partial-write-riscv` 覆盖跨入未映射页前可读 0、1、32、63、64、65 字节的普通写、append 和 writev（含已有进度及后续可读 iovec），核对返回值、offset、文件长度、内容和字节统计；真实 ext4 后端注入短写、带前缀错误与零进度错误，验证只提交实际写入量。`make test-userland-riscv` 以 `mmap/mprotect(PROT_NONE)` 对同组边界执行真实 musl 系统调用并核对内容和 metadata。
+`make test-files-partial-write-riscv` 覆盖跨入未映射页前可读 0、1、32、63、64、65 字节的普通写、append 和 writev（含已有进度及后续可读 iovec），核对返回值、offset、文件长度、内容和字节统计；真实 ext4 后端注入带前缀的写回错误，验证缓存内容与逻辑大小保留、重试完整写回，以及独立 open/dup 的错误观察。另注入设备 flush 错误，验证 O_SYNC/O_DSYNC 返回错误后 offset 与内容保留。`make test-userland-riscv` 以 `mmap/mprotect(PROT_NONE)` 对同组边界执行真实 musl 系统调用并核对内容和 metadata。
 
 `make test-diff-abi-riscv` 用相同 raw-syscall ELF 比较固定 RISC-V Linux 和 BoarOS 的 readv 参数顺序、0/1/32/63/64/65 字节可写前缀、1024/1025 项、跨文件页/共享 OFD、pipe 片段故障后重读、尾片段合并、环回以及 poll 可写边界；保留原始串口与规范化差异。`make test-files-riscv` 注入 UART 三字节批次并核对 console readv 跨两个向量分散，同时注入长向量分配失败，核对 `ENOMEM`、OFD 释放和调用统计；`make test-userland-riscv` 以真实 musl 验证两个 pipe 读者及 readv 的 EINTR/SA_RESTART。固定 libc-test 的静态/动态 `ungetc` 和完整 BusyBox 的 `od/hexdump` 另以真实程序套件逐例比较完整输出。
 
 聚焦测试在真实 QEMU legacy 与 modern VirtIO/ext4 上覆盖绝对/相对路径、错误 flags、目录与缺失文件、4096 字节路径上限、最低 fd 复用、表扩容、统一 fd 安装统计、epoll 满表原子性、`O_CLOEXEC/O_NONBLOCK`、缓存命中后的跨页读取、EOF、部分 fault、fork 后 fd 表独立与 OFD offset 共享，以及 VFS orphan/I/O owner。stat 回归核对 regular/directory 的真实 inode metadata、allocated blocks、fstat/newfstatat 共同字段和 unlink-but-open 的零链接计数。它还在关闭 fd 后通过 MM backing 继续缺页，反复固定地址映射同一 OFD 并检查来源释放只发生一次，验证父子各自持有一份来源引用。生产 exec/clone 链验证普通 fd 与 offset 跨映像和父子保持、CLOEXEC fd 不可见，PID 1 的 stdio 与跨 exec 的 console 描述符由串口标记验证，并由最终资源基线证明退出清理生效。`make test-userland-riscv` 用静态和动态 musl 程序作为 PID 1 运行 stdio、readdir、read/lseek/fstat、dup、signal、pipe、pthread、TLS 和 dlopen；其中写打开普通文件的真实 `read/pread` 及其 dup 均验证 `EBADF`，是真实 U-mode 外部测例的入口。
 
-当前提供可共享的文件表与根 fs context handle，普通 clone 仍实现“复制表/复制 cwd、共享 OFD”；系统调用层是否选择共享由 clone flags 决定。当前已支持常规文件的读写（`write/writev/pwrite64/append`）、新建、删除（`unlinkat`）、截断（`ftruncate`）与目录修改（`mkdirat/rmdir`）及符号链接（`symlinkat/readlinkat`）；但仍无目录 fd（`dirfd` 相对路径）、`chdir`、异步脏页写回（writeback）、read-ahead、硬链接、并发读写锁或多挂载。当前单 hart 下 fd lookup 与 OFD acquire 之间不可调度；启用 SMP 前必须为共享 record 引用、槽查找/替换、统计和 OFD 引用补齐同步，不能直接复用这些无锁字段。pipe 同样是单 hart 对象。console 接收现为 tick 轮询（唤醒延迟上界一个 tick），外部中断（PLIC/SEIE）落地后替换为中断驱动。
+当前提供可共享的文件表与根 fs context handle，普通 clone 仍实现“复制表/复制 cwd、共享 OFD”；系统调用层是否选择共享由 clone flags 决定。当前已支持常规文件的读写（`write/writev/pwrite64/append`）、新建、删除（`unlinkat`）、截断（`ftruncate`）与目录修改（`mkdirat/rmdir`）及符号链接（`symlinkat/readlinkat`）；但仍无目录 fd（`dirfd` 相对路径）、`chdir`、后台异步写回、read-ahead、硬链接、并发读写锁或多挂载。当前单 hart 下 fd lookup 与 OFD acquire 之间不可调度；启用 SMP 前必须为共享 record 引用、槽查找/替换、统计和 OFD 引用补齐同步，不能直接复用这些无锁字段。pipe 同样是单 hart 对象。console 接收现为 tick 轮询（唤醒延迟上界一个 tick），外部中断（PLIC/SEIE）落地后替换为中断驱动。
 
 字符设备节点由 ext4 提供名称和 `st_rdev`，`openat` 根据设备号选择 null、zero 或 console；未知设备号返回 `ENXIO`。路径打开的 console 与初始标准 fd 复用 UART 输入等待、非阻塞和信号打断逻辑。null 读 EOF、写消费请求长度，zero 读按实际用户复制进度填零；这两者不经过普通文件页缓存和 ext4 数据 I/O。设备 OFD 同样由 fd 表安装和引用，dup/fork 共享，关闭 fd 不撤销已 pin 的 I/O。`readv/writev/pread64/pwrite64/lseek/fstat/ppoll` 的设备边界在固定 Linux 差分中验证；未知 ioctl 对有效 fd 返回 `ENOTTY`。epoll 的普通/定位 I/O、seek 与匿名 inode mode 也经同一分派入口核对。当前没有 TTY 会话、设备 mmap、devfs 或通用设备注册接口。
 

@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 struct kernel_page_cache;
+struct kernel_page_cache_entry;
 struct kernel_vfs_file;
 struct kernel_vfs_mount;
 struct kernel_vfs_node;
@@ -20,6 +21,13 @@ int kernel_vfs_node_pread(struct kernel_vfs_node *node,
                           void *buffer,
                           size_t size,
                           size_t *bytes_read);
+
+struct kernel_page_cache_entry **kernel_vfs_node_cache_pages(
+    struct kernel_vfs_node *node);
+int kernel_vfs_node_writeback_allowed(const struct kernel_vfs_node *node);
+void kernel_vfs_node_written(struct kernel_vfs_node *node, uint64_t end);
+int kernel_vfs_node_writeback(struct kernel_vfs_node *node, uint64_t offset,
+                              const void *buffer, size_t size, size_t *written);
 
 uint64_t kernel_vfs_node_size(const struct kernel_vfs_node *node);
 const struct kernel_vfs_mount *kernel_vfs_node_mount(

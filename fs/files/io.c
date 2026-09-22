@@ -43,6 +43,24 @@ static enum kernel_files_status release_io_description(
     return KERNEL_FILES_STATUS_STATE;
 }
 
+enum kernel_files_status kernel_files_sync(struct kernel_files *files,
+    int64_t fd, int datasync, int64_t *linux_result)
+{
+    struct kernel_open_file_description *description = 0;
+    if (!kernel_files_is_live(files) || linux_result == 0)
+        return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
+    enum kernel_files_status status = kernel_files_pin(files, fd, &description,
+                                                       linux_result);
+    if (status != KERNEL_FILES_STATUS_OK || *linux_result != 0) return status;
+    enum kernel_open_file_kind kind = kernel_open_file_kind(description);
+    *linux_result = kind == KERNEL_OPEN_FILE_KIND_REGULAR ||
+                    kind == KERNEL_OPEN_FILE_KIND_DIRECTORY
+        ? kernel_vfs_sync(&description->file, datasync,
+                            &description->observed_writeback_error)
+        : -KERNEL_EINVAL;
+    return release_io_description(files, &description, KERNEL_FILES_STATUS_OK);
+}
+
 static enum kernel_files_status read_pinned(
     struct kernel_files *files,
     struct kernel_mm *mm,
@@ -594,7 +612,7 @@ static int description_writable(
     return 0;
 }
 
-static enum kernel_files_status write_request(
+static enum kernel_files_status buffered_write_request(
     struct kernel_files *files, struct kernel_mm *mm,
     struct kernel_open_file_description *description,
     const struct kernel_uaccess_iovec *iov, size_t iov_count,
@@ -751,6 +769,30 @@ static enum kernel_files_status write_request(
     }
     *linux_result = (int64_t)total;
     return KERNEL_FILES_STATUS_OK;
+}
+
+static enum kernel_files_status write_request(
+    struct kernel_files *files, struct kernel_mm *mm,
+    struct kernel_open_file_description *description,
+    const struct kernel_uaccess_iovec *iov, size_t iov_count,
+    uint64_t count, int positioned, uint64_t requested_offset,
+    int64_t *linux_result)
+{
+    enum kernel_files_status status = buffered_write_request(files, mm,
+        description, iov, iov_count, count, positioned, requested_offset,
+        linux_result);
+    if (status == KERNEL_FILES_STATUS_OK && *linux_result > 0 &&
+        kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_REGULAR &&
+        (description->open_flags & KERNEL_FILES_O_DSYNC) != 0U) {
+        int datasync = (description->open_flags & KERNEL_FILES_O_SYNC) !=
+                        KERNEL_FILES_O_SYNC;
+        int error = kernel_vfs_sync(&description->file, datasync,
+                                     &description->observed_writeback_error);
+        /* generic_write_sync returns the error after accepted bytes have
+         * advanced the OFD offset, including a prefix before usercopy fault. */
+        if (error != 0) *linux_result = error;
+    }
+    return status;
 }
 
 static void account_write(struct kernel_files *files, int64_t result)

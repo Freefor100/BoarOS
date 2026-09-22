@@ -64,9 +64,15 @@ struct ext4_block {
 };
 
 struct ext4_bcache;
+struct ext4_writeback_scope {
+	struct ext4_buf *head;
+	struct ext4_writeback_scope *previous;
+};
 
 /**@brief   Single block descriptor*/
 struct ext4_buf {
+	struct ext4_writeback_scope *writeback_scope;
+	struct ext4_buf *writeback_next;
 	/**@brief   Flags*/
 	int flags;
 
@@ -116,6 +122,7 @@ struct ext4_buf {
 
 /**@brief   Block cache descriptor*/
 struct ext4_bcache {
+	struct ext4_writeback_scope *writeback_scope;
 
 	/**@brief   Item count in block cache*/
 	uint32_t cnt;
@@ -173,7 +180,14 @@ enum bcache_state_bits {
 #define ext4_bcache_test_flag(buf, b)    \
 	(((buf)->flags & (1 << (b))) >> (b))
 
+void ext4_bcache_scope_track(struct ext4_buf *buf);
+void ext4_bcache_scope_begin(struct ext4_bcache *bc,
+                             struct ext4_writeback_scope *scope);
+int ext4_bcache_scope_end(struct ext4_bcache *bc,
+                          struct ext4_writeback_scope *scope);
+
 static inline void ext4_bcache_set_dirty(struct ext4_buf *buf) {
+	ext4_bcache_scope_track(buf);
 	ext4_bcache_set_flag(buf, BC_UPTODATE);
 	ext4_bcache_set_flag(buf, BC_DIRTY);
 }

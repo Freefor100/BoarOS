@@ -59,6 +59,8 @@ struct kernel_files_statistics {
 #define KERNEL_FILES_F_SETFL UINT64_C(4)
 #define KERNEL_FILES_F_DUPFD_CLOEXEC UINT64_C(1030)
 #define KERNEL_FILES_O_APPEND UINT64_C(00002000)
+#define KERNEL_FILES_O_DSYNC UINT64_C(00010000)
+#define KERNEL_FILES_O_SYNC UINT64_C(04010000)
 #define KERNEL_FILES_O_NONBLOCK UINT64_C(00004000)
 #define KERNEL_FILES_O_LARGEFILE UINT64_C(00100000)
 #define KERNEL_FILES_O_CLOEXEC UINT64_C(02000000)
@@ -248,6 +250,9 @@ enum kernel_files_status kernel_files_ftruncate(
     int64_t fd,
     uint64_t length,
     int64_t *linux_result);
+
+enum kernel_files_status kernel_files_sync(struct kernel_files *files,
+    int64_t fd, int datasync, int64_t *linux_result);
 
 enum kernel_files_status kernel_files_fstat(
     struct kernel_files *files,

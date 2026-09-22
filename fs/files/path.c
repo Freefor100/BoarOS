@@ -38,13 +38,13 @@ static int validate_open_flags(uint64_t flags, uint32_t *fd_flags)
     const uint64_t write_flags = LINUX_O_CREAT | LINUX_O_TRUNC |
                                  LINUX_O_APPEND | LINUX_O_EXCL;
     const uint64_t unsupported_flags =
-        LINUX_O_DSYNC | LINUX_O_DIRECT |
-        LINUX_O_NOATIME | LINUX_O_SYNC | LINUX_O_PATH |
+        LINUX_O_DIRECT |
+        LINUX_O_NOATIME | LINUX_O_PATH |
         (LINUX_O_TMPFILE & ~LINUX_O_DIRECTORY);
     const uint64_t known_flags = LINUX_O_ACCMODE | write_flags |
         unsupported_flags | LINUX_O_NONBLOCK | LINUX_O_DIRECTORY |
         LINUX_O_NOFOLLOW |
-        LINUX_O_LARGEFILE | LINUX_O_CLOEXEC;
+        LINUX_O_LARGEFILE | LINUX_O_CLOEXEC | LINUX_O_SYNC;
     uint64_t access_mode = flags & LINUX_O_ACCMODE;
 
     if (access_mode == 3U || (flags & ~known_flags) != 0U) {
@@ -313,6 +313,9 @@ enum kernel_files_status kernel_files_openat(
         return KERNEL_FILES_STATUS_OK;
     }
 
+    /* Linux treats the internal __O_SYNC bit as implying O_DSYNC. */
+    if ((flags & (LINUX_O_SYNC & ~LINUX_O_DSYNC)) != 0U)
+        flags |= LINUX_O_DSYNC;
     description->open_flags = (uint32_t)flags;
     files_status = kernel_files_install_new_owned_at(files,
                                                      fd,

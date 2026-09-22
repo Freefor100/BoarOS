@@ -6,6 +6,7 @@
 
 struct kernel_heap;
 struct kernel_page_cache_record;
+struct kernel_page_cache_entry;
 struct kernel_vfs_file;
 struct kernel_vfs_mount;
 struct kernel_vfs_node;
@@ -68,6 +69,18 @@ enum kernel_page_cache_status kernel_page_cache_lookup(
     uint64_t *physical_address,
     size_t *valid_bytes);
 
+/* Buffered writes own their dirty pages until writeback or explicit discard.
+ * These operations return zero or a negative errno, retaining partial progress. */
+int kernel_page_cache_write(struct kernel_page_cache *cache,
+                             struct kernel_vfs_file *file, uint64_t offset,
+                             const void *buffer, size_t size, size_t *written);
+int kernel_page_cache_writeback(struct kernel_page_cache *cache,
+                                 struct kernel_vfs_node *node);
+int kernel_page_cache_writeback_before(struct kernel_page_cache *cache,
+    struct kernel_vfs_node *node, uint64_t end);
+void kernel_page_cache_truncate(struct kernel_page_cache *cache,
+    struct kernel_vfs_node *node, uint64_t size);
+
 uint64_t kernel_page_cache_reclaim(struct kernel_page_cache *cache,
                                    uint64_t target_pages);
 
@@ -77,7 +90,7 @@ enum kernel_page_cache_status kernel_page_cache_purge_mount(
 
 enum kernel_page_cache_status kernel_page_cache_invalidate_node(
     struct kernel_page_cache *cache,
-    const struct kernel_vfs_node *node);
+    struct kernel_vfs_node *node);
 
 void kernel_page_cache_get_statistics(
     const struct kernel_page_cache *cache,

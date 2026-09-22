@@ -108,12 +108,21 @@ static uint64_t test_satp;
 #ifdef FILES_PARTIAL_WRITE_TEST
 static int inject_partial_write_error;
 static int inject_truncate_error;
-static int inject_usercopy_write_mode;
-static unsigned int usercopy_write_skip;
 static kernel_block_write_fn time_original_write;
+static kernel_block_flush_fn sync_original_flush;
+static unsigned int sync_flush_failures;
 static unsigned int time_write_failures;
 static unsigned int time_write_calls;
 static uint32_t time_clock_nanoseconds;
+
+static enum kernel_block_status sync_test_flush(void *context)
+{
+    if (sync_flush_failures != 0U) {
+        sync_flush_failures--;
+        return KERNEL_BLOCK_STATUS_IO;
+    }
+    return sync_original_flush(context);
+}
 
 static bool timestamp_test_clock(struct ext4_timestamp *now)
 {
@@ -172,19 +181,6 @@ int __wrap_ext4_fwrite(ext4_file *file,
     size_t committed = 0U;
     int result;
 
-    if (inject_usercopy_write_mode != 0) {
-        if (usercopy_write_skip != 0U) {
-            usercopy_write_skip--;
-        } else {
-            int mode = inject_usercopy_write_mode;
-            size_t limit = mode == 3 ? 0U : (size < 5U ? size : 5U);
-
-            inject_usercopy_write_mode = 0;
-            result = __real_ext4_fwrite(file, buffer, limit, &committed);
-            *bytes_written = committed;
-            return result == EOK && mode != 1 ? EIO : result;
-        }
-    }
     if (!inject_partial_write_error) {
         return __real_ext4_fwrite(file, buffer, size, bytes_written);
     }
@@ -3055,8 +3051,7 @@ static void run_files_test(const void *dtb)
  * A readable final iovec detects accidentally continuing after the fault. */
 static void check_usercopy_write(struct kernel_files *files,
                                  struct kernel_mm *mm, size_t prefix,
-                                 int vector, int append, size_t prior,
-                                 int backend_mode)
+                                 int vector, int append, size_t prior)
 {
     const uint64_t boundary = TEST_USER_BUFFER + 3U * BOAROS_PAGE_SIZE;
     struct kernel_uaccess_iovec vectors[3];
@@ -3065,16 +3060,13 @@ static void check_usercopy_write(struct kernel_files *files,
     struct kernel_vfs_stat stat;
     struct kernel_files_statistics before, after;
     unsigned char payload[80], expected[90], observed[90];
-    size_t accepted = backend_mode == 3 ? 0U :
-        backend_mode != 0 && prefix > 5U ? 5U : prefix;
-    size_t progress = prior + accepted;
+    size_t progress = prior + prefix;
     size_t start = append ? 3U : 1U;
     size_t end = progress != 0U ? start + progress : 1U;
     size_t size = progress != 0U && start + progress > 3U ?
         start + progress : 3U;
     int64_t result;
-    int64_t wanted = progress != 0U ? (int64_t)progress :
-        backend_mode == 3 && prefix != 0U ? -KERNEL_EIO : -KERNEL_EFAULT;
+    int64_t wanted = progress != 0U ? (int64_t)progress : -KERNEL_EFAULT;
 
     memset(payload, 'P', sizeof(payload));
     memset(expected, 'P', sizeof(expected));
@@ -3107,15 +3099,12 @@ static void check_usercopy_write(struct kernel_files *files,
         fail_files(321U, 1, 0);
     }
     kernel_files_get_statistics(files, &before);
-    inject_usercopy_write_mode = backend_mode;
-    usercopy_write_skip = prior != 0U ? 1U : 0U;
     if ((vector ? kernel_files_writev(files, mm, 0, TEST_USER_PATH, 3U, &result)
                 : kernel_files_write(files, mm, 0, boundary - prefix,
                                       prefix + 1U, &result)) !=
             KERNEL_FILES_STATUS_OK || result != wanted) {
         fail_files(322U + prefix, wanted, result);
     }
-    inject_usercopy_write_mode = 0;
     kernel_files_get_statistics(files, &after);
     if (kernel_open_file_offset(description) != end ||
         kernel_vfs_fstat(&description->file, &stat) != 0 || stat.size != size ||
@@ -3219,6 +3208,9 @@ static void run_partial_write_test(const void *dtb)
     }
     use_test_satp = 1;
 
+    if (kernel_files_sync(&files, -1, 0, &result) != KERNEL_FILES_STATUS_OK ||
+        result != -KERNEL_EBADF) fail_files(299U, -KERNEL_EBADF, result);
+
     if (!write_user_bytes(&mm, TEST_USER_PATH, path, sizeof(path)) ||
         kernel_files_openat(&files, &fs, &mm, TEST_AT_FDCWD,
                             TEST_USER_PATH, TEST_O_CREAT | 2U, 0600U,
@@ -3266,126 +3258,70 @@ static void run_partial_write_test(const void *dtb)
         fail_files(302U, 1, 0);
     }
 
+    /* Buffered progress is independent of a later partial backend failure.
+     * Different open descriptions observe that failure independently; dup
+     * shares the first description's observation cursor. */
+    if (!write_user_bytes(&mm, TEST_USER_PATH + 128U, path, sizeof(path)) ||
+        kernel_files_openat(&files, &fs, &mm, TEST_AT_FDCWD,
+             TEST_USER_PATH + 128U, 2U, 0, &result) != KERNEL_FILES_STATUS_OK ||
+        result != 1 || kernel_files_dup(&files, 0, &result) !=
+             KERNEL_FILES_STATUS_OK || result != 2)
+        fail_files(303U, 2, result);
     inject_partial_write_error = 1;
     if (kernel_files_writev(&files, &mm, 0, TEST_USER_PATH, 2U, &result) !=
-            KERNEL_FILES_STATUS_OK ||
-        result != 5) {
-        fail_files(303U, 5, result);
-    }
-    if (inject_partial_write_error != 0 ||
-        kernel_open_file_offset(description) != 13U ||
-        description->file.size != 13U ||
-        kernel_vfs_file_size(&description->file) != 13U ||
-        kernel_open_file_size(description) != 13U ||
-        kernel_vfs_node_size(kernel_vfs_file_node(&description->file)) !=
-            13U ||
+            KERNEL_FILES_STATUS_OK || result != 12 ||
+        inject_partial_write_error != 1 ||
+        kernel_open_file_offset(description) != 20U ||
         kernel_vfs_fstat(&description->file, &vfs_stat) != 0 ||
-        vfs_stat.size != 13U ||
-        kernel_files_fstat(&files, &mm, 0, stat_buffer, &result) !=
-            KERNEL_FILES_STATUS_OK ||
+        vfs_stat.size != 20U)
+        fail_files(304U, 12, result);
+    if (kernel_files_sync(&files, 0, 0, &result) != KERNEL_FILES_STATUS_OK ||
+        result != -KERNEL_EIO || inject_partial_write_error != 0 ||
+        kernel_open_file_size(description) != 20U)
+        fail_files(305U, -KERNEL_EIO, result);
+    if (kernel_files_openat(&files, &fs, &mm, TEST_AT_FDCWD,
+             TEST_USER_PATH + 128U, 2U, 0, &result) != KERNEL_FILES_STATUS_OK ||
+        result != 3 ||
+        kernel_files_sync(&files, 2, 1, &result) != KERNEL_FILES_STATUS_OK ||
         result != 0 ||
-        !read_user_bytes(&mm, stat_buffer, &linux_stat,
-                         sizeof(linux_stat)) ||
-        linux_stat.st_size != 13) {
-        fail_files(304U, 13, result);
-    }
-    if (kernel_open_file_lookup_page(description, 0U, &cached_page,
-                                     &valid_bytes) !=
-            KERNEL_PAGE_CACHE_STATUS_NOT_FOUND ||
-        kernel_files_pread(&files, &mm, 0, TEST_USER_BUFFER,
-                           5U, 8, &result) != KERNEL_FILES_STATUS_OK ||
-        result != 5 ||
-        !read_user_bytes(&mm, TEST_USER_BUFFER, observed, 5U) ||
-        memcmp(observed, payload, 5U) != 0 ||
-        kernel_files_pread(&files, &mm, 0, TEST_USER_BUFFER,
-                           1U, 13, &result) != KERNEL_FILES_STATUS_OK ||
-        result != 0) {
-        fail_files(305U, 5, result);
-    }
-    kernel_files_get_statistics(&files, &statistics);
-    if (statistics.write_calls != 2U ||
-        statistics.write_failures != 0U ||
-        statistics.bytes_written != 8U) {
-        fail_files(306U, 8, statistics.bytes_written);
-    }
+        kernel_files_sync(&files, 1, 0, &result) != KERNEL_FILES_STATUS_OK ||
+        result != -KERNEL_EIO)
+        fail_files(306U, -KERNEL_EIO, result);
+    if (kernel_files_sync(&files, 1, 1, &result) != KERNEL_FILES_STATUS_OK ||
+        result != 0 ||
+        kernel_files_sync(&files, 3, 0, &result) != KERNEL_FILES_STATUS_OK ||
+        result != 0 ||
+        kernel_files_pread(&files, &mm, 0, TEST_USER_BUFFER, 8U, 8, &result) !=
+            KERNEL_FILES_STATUS_OK || result != 8 ||
+        !read_user_bytes(&mm, TEST_USER_BUFFER, observed, 8U) ||
+        memcmp(observed, payload, 8U) != 0)
+        fail_files(307U, 8, result);
+    for (int fd = 1; fd < 4; fd++)
+        if (kernel_files_close(&files, fd, &result) != KERNEL_FILES_STATUS_OK ||
+            result != 0) fail_files(308U, 0, result);
 
     if (kernel_files_fcntl(&files, 0, KERNEL_FILES_F_SETFL,
-                           KERNEL_FILES_O_APPEND, &result) !=
-            KERNEL_FILES_STATUS_OK ||
-        result != 0 ||
-        kernel_files_lseek(&files, 0, 1, KERNEL_FILES_SEEK_SET, &result) !=
-            KERNEL_FILES_STATUS_OK ||
-        result != 1 ||
-        !write_user_bytes(&mm, TEST_USER_BUFFER, payload,
-                          sizeof(payload) - 1U) ||
-        !write_user_bytes(&mm,
-                          TEST_USER_BUFFER + sizeof(payload) - 1U,
-                          tail,
-                          sizeof(tail) - 1U)) {
-        fail_files(307U, 1, result);
-    }
-    iov[0].base = TEST_USER_BUFFER;
-    iov[0].length = sizeof(payload) - 1U;
-    iov[1].base = TEST_USER_BUFFER + sizeof(payload) - 1U;
-    iov[1].length = sizeof(tail) - 1U;
-    if (!write_user_bytes(&mm, TEST_USER_PATH, iov, sizeof(iov))) {
-        fail_files(307U, 1, 0);
-    }
-    inject_partial_write_error = 1;
-    if (kernel_files_writev(&files, &mm, 0, TEST_USER_PATH, 2U, &result) !=
-            KERNEL_FILES_STATUS_OK ||
-        result != 5) {
-        fail_files(308U, 5, result);
-    }
-    if (kernel_open_file_offset(description) != 18U ||
-        description->file.size != 18U ||
-        kernel_vfs_file_size(&description->file) != 18U ||
-        kernel_open_file_size(description) != 18U ||
-        kernel_vfs_node_size(kernel_vfs_file_node(&description->file)) !=
-            18U ||
+                          KERNEL_FILES_O_APPEND, &result) !=
+            KERNEL_FILES_STATUS_OK || result != 0 ||
+        !write_user_bytes(&mm, TEST_USER_BUFFER, payload, 8U) ||
+        kernel_files_write(&files, &mm, 0, TEST_USER_BUFFER, 8U, &result) !=
+            KERNEL_FILES_STATUS_OK || result != 8 ||
+        kernel_open_file_offset(description) != 28U ||
         kernel_vfs_fstat(&description->file, &vfs_stat) != 0 ||
-        vfs_stat.size != 18U ||
-        kernel_files_fstat(&files, &mm, 0, stat_buffer, &result) !=
-            KERNEL_FILES_STATUS_OK ||
-        result != 0 ||
-        !read_user_bytes(&mm, stat_buffer, &linux_stat,
-                         sizeof(linux_stat)) ||
-        linux_stat.st_size != 18 ||
-        kernel_open_file_lookup_page(description, 0U, &cached_page,
-                                     &valid_bytes) !=
-            KERNEL_PAGE_CACHE_STATUS_NOT_FOUND ||
-        kernel_files_pread(&files, &mm, 0, TEST_USER_BUFFER,
-                           5U, 13, &result) != KERNEL_FILES_STATUS_OK ||
-        result != 5 ||
-        !read_user_bytes(&mm, TEST_USER_BUFFER, observed, 5U) ||
-        memcmp(observed, payload, 5U) != 0 ||
-        kernel_files_pread(&files, &mm, 0, TEST_USER_BUFFER,
-                           1U, 18, &result) != KERNEL_FILES_STATUS_OK ||
-        result != 0) {
-        fail_files(309U, 18, result);
-    }
+        vfs_stat.size != 28U)
+        fail_files(309U, 8, result);
     kernel_files_get_statistics(&files, &statistics);
-    if (statistics.write_calls != 3U ||
-        statistics.write_failures != 0U ||
-        statistics.bytes_written != 13U) {
-        fail_files(310U, 13, statistics.bytes_written);
-    }
+    if (statistics.write_calls != 3U || statistics.write_failures != 0U ||
+        statistics.bytes_written != 23U)
+        fail_files(310U, 23, statistics.bytes_written);
 
-    if (kernel_open_file_lookup_page(description, 0U, &cached_page,
-                                     &valid_bytes) !=
-            KERNEL_PAGE_CACHE_STATUS_OK ||
-        physical_page_release(&allocator, cached_page) !=
-            PHYSICAL_PAGE_STATUS_OK) {
-        fail_files(311U, KERNEL_PAGE_CACHE_STATUS_OK,
-                   KERNEL_PAGE_CACHE_STATUS_STATE);
-    }
     inject_truncate_error = 1;
     if (kernel_files_ftruncate(&files, 0, 2U, &result) !=
             KERNEL_FILES_STATUS_OK ||
         result != -KERNEL_EIO || inject_truncate_error != 0) {
         fail_files(312U, -KERNEL_EIO, result);
     }
-    if (kernel_open_file_offset(description) != 18U ||
+    if (kernel_open_file_offset(description) != 28U ||
         description->file.size != 2U ||
         kernel_vfs_file_size(&description->file) != 2U ||
         kernel_open_file_size(description) != 2U ||
@@ -3398,9 +3334,10 @@ static void run_partial_write_test(const void *dtb)
         !read_user_bytes(&mm, stat_buffer, &linux_stat,
                          sizeof(linux_stat)) ||
         linux_stat.st_size != 2 ||
-        kernel_open_file_lookup_page(description, 0U, &cached_page,
-                                     &valid_bytes) !=
-            KERNEL_PAGE_CACHE_STATUS_NOT_FOUND ||
+        kernel_files_pread(&files, &mm, 0, TEST_USER_BUFFER,
+                           2U, 0, &result) != KERNEL_FILES_STATUS_OK ||
+        result != 2 || !read_user_bytes(&mm, TEST_USER_BUFFER, observed, 2U) ||
+        memcmp(observed, "ol", 2U) != 0 ||
         kernel_files_pread(&files, &mm, 0, TEST_USER_BUFFER,
                            1U, 2, &result) != KERNEL_FILES_STATUS_OK ||
         result != 0) {
@@ -3410,23 +3347,57 @@ static void run_partial_write_test(const void *dtb)
     static const size_t prefixes[] = {0U, 1U, 32U, 63U, 64U, 65U};
     for (size_t n = 0U; n < sizeof(prefixes) / sizeof(prefixes[0]); n++) {
         for (int append = 0; append < 2; append++) {
-            check_usercopy_write(&files, &mm, prefixes[n], 0, append, 0U, 0);
-            check_usercopy_write(&files, &mm, prefixes[n], 1, append, 0U, 0);
-            check_usercopy_write(&files, &mm, prefixes[n], 1, append, 7U, 0);
+            check_usercopy_write(&files, &mm, prefixes[n], 0, append, 0U);
+            check_usercopy_write(&files, &mm, prefixes[n], 1, append, 0U);
+            check_usercopy_write(&files, &mm, prefixes[n], 1, append, 7U);
         }
     }
-    for (int mode = 1; mode <= 3; mode++) {
-        for (int append = 0; append < 2; append++) {
-            check_usercopy_write(&files, &mm, 32U, 0, append, 0U, mode);
-            check_usercopy_write(&files, &mm, 32U, 1, append, 7U, mode);
-        }
+    /* Truncating away dirty data must not need space to write that data. */
+    if (kernel_files_write(&files, &mm, 0, TEST_USER_BUFFER, 8U, &result) !=
+            KERNEL_FILES_STATUS_OK || result != 8)
+        fail_files(413U, 8, result);
+    inject_partial_write_error = 1;
+    if (kernel_files_ftruncate(&files, 0, 0, &result) != KERNEL_FILES_STATUS_OK ||
+        result != 0 || inject_partial_write_error != 1 ||
+        kernel_open_file_size(description) != 0)
+        fail_files(414U, 0, result);
+    inject_partial_write_error = 0;
+
+    /* Synchronous write errors leave the accepted bytes and offset visible. */
+    sync_original_flush = device.block.flush;
+    device.block.flush = sync_test_flush;
+    const uint64_t sync_flags[] = {KERNEL_FILES_O_DSYNC, KERNEL_FILES_O_SYNC};
+    for (size_t n = 0; n < 2; n++) {
+        if (!write_user_bytes(&mm, TEST_USER_PATH, "/sync-file", 11U) ||
+            kernel_files_openat(&files, &fs, &mm, TEST_AT_FDCWD,
+                 TEST_USER_PATH, TEST_O_CREAT | 2U | sync_flags[n], 0600U,
+                 &result) != KERNEL_FILES_STATUS_OK || result != 1 ||
+            !write_user_bytes(&mm, TEST_USER_BUFFER, "sync", 4U))
+            fail_files(410U, 1, result);
+        sync_flush_failures = 1;
+        if (kernel_files_write(&files, &mm, 1, TEST_USER_BUFFER, 4U, &result) !=
+                KERNEL_FILES_STATUS_OK || result != -KERNEL_EIO ||
+            sync_flush_failures != 0U ||
+            kernel_open_file_offset(kernel_files_lookup_description(&files, 1)) != 4U ||
+            kernel_files_pread(&files, &mm, 1, TEST_USER_BUFFER, 4U, 0,
+                               &result) != KERNEL_FILES_STATUS_OK || result != 4 ||
+            !read_user_bytes(&mm, TEST_USER_BUFFER, observed, 4U) ||
+            memcmp(observed, "sync", 4U) != 0)
+            fail_files(411U, 4, result);
+        if (kernel_files_sync(&files, 1, 1, &result) != KERNEL_FILES_STATUS_OK ||
+            result != 0 || kernel_files_close(&files, 1, &result) !=
+                KERNEL_FILES_STATUS_OK || result != 0)
+            fail_files(412U, 0, result);
     }
+    device.block.flush = sync_original_flush;
 
     /* A real block failure while writing timestamp metadata must abort
      * before data, while the dirty inode remains owned by the mount cache. */
     uint64_t prior_offset = kernel_open_file_offset(description);
     uint64_t prior_size = kernel_open_file_size(description);
-    if (ext4_mount_setup_clock("/", timestamp_test_clock) != EOK ||
+    if (kernel_files_sync(&files, 0, 0, &result) != KERNEL_FILES_STATUS_OK ||
+        result != 0 ||
+        ext4_mount_setup_clock("/", timestamp_test_clock) != EOK ||
         kernel_vfs_file_modified(&description->file, prior_offset, 0) != 0) {
         fail_files(400U, 0, -1);
     }
@@ -3445,7 +3416,8 @@ static void run_partial_write_test(const void *dtb)
         fail_files(402U, -KERNEL_EIO, result);
     }
     unsigned int before_flush = time_write_calls;
-    if (ext4_cache_flush("/") != EOK || time_write_calls <= before_flush ||
+    if (kernel_files_sync(&files, 0, 0, &result) != KERNEL_FILES_STATUS_OK ||
+        result != 0 || time_write_calls <= before_flush ||
         kernel_vfs_fstat(&description->file, &vfs_stat) != 0 ||
         vfs_stat.mtime.seconds != INT64_C(1780000000) ||
         vfs_stat.mtime.nanoseconds != time_clock_nanoseconds) {

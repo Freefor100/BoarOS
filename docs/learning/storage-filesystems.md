@@ -129,3 +129,11 @@ PID 1 是用户空间生命周期的根。Linux 通常在 init 退出时 panic�
 - [VirtIO 1.3](https://docs.oasis-open.org/virtio/virtio/v1.3/virtio-v1.3.html)：modern transport、设备状态、feature negotiation、split virtqueue 和 virtio-blk。
 - `references/qemu/hw/virtio/virtio-mmio.c` 与 `references/qemu/hw/block/virtio-blk.c`：QEMU VirtIO MMIO 和块设备行为参照。
 - `third_party/lwext4/` 与上游文档：ext4 数据结构和当前库实现。
+
+## 缓存接收进度与同步错误
+
+逐文件写回依据固定 Linux `references/linux` commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 `mm/filemap.c::file_check_and_advance_wb_err()`、`include/linux/fs.h::generic_write_sync()` 与 `fs/sync.c`：缓存接收、设备写回、持久化屏障是三个不同事件。写回失败不能把已被读取者观察的逻辑大小回滚为磁盘 handle 的 size；失败范围仍由缓存页拥有。共享 OFD 的 dup/fork 共用错误观察位置，独立 open 则各观察一次自己打开之后的错误。同步写在前缀已推进 offset 后失败，返回 errno 也不能撤销该进度。
+
+压力回收和卸载均需先写回脏页；显式 orphan 最后使用者退出后可以直接丢弃缓存，因为该数据已不再有用户 owner。写回时 lwext4 分配可能触发内存压力，必须防止递归回收正在遍历的缓存项。当前用 inode 索引、页面固定与缓存级 writeback 重入保护守住这一生命周期，不增加后台线程。物理分配计数仍读真实 inode；需要验证磁盘块生命周期的用例先 fsync，不能继续假定每次 write 必然触盘。
+
+对非 journal 后端，取消全量 write-back drain 时仍需保留分配过程的提交边界。位图位先设置、inode mapping 后建立；若允许中间 bitmap put 因设备 EIO 返回，会留下没有 inode owner 的分配位。当前操作范围以缓冲内链和引用固定本次修改，待文件操作完成内存所有权关系后提交该集合，并在失败时将缓冲交回 mount dirty list。host 测试注入最终 inode-table、块 bitmap 和无关文件数据块的错误，重试/截断/卸载后由 e2fsck 检查计数与所有权。这是非 journal 正常错误路径保障，不是事务掉电原子性的替代。
