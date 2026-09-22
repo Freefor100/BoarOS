@@ -48,9 +48,11 @@
     (UINT32_C(1) << VIRTIO_FEATURE_VERSION_1_LOW_BIT)
 
 #define VIRTIO_BLOCK_FEATURE_RO (UINT32_C(1) << 5)
+#define VIRTIO_BLOCK_FEATURE_FLUSH (UINT32_C(1) << 9)
 
 #define VIRTIO_BLOCK_REQUEST_IN 0U
 #define VIRTIO_BLOCK_REQUEST_OUT 1U
+#define VIRTIO_BLOCK_REQUEST_FLUSH 4U
 #define VIRTIO_BLOCK_STATUS_OK 0U
 #define VIRTIO_BLOCK_STATUS_IO_ERROR 1U
 #define VIRTIO_BLOCK_STATUS_UNSUPPORTED 2U
@@ -230,6 +232,11 @@ static void device_reset(struct riscv_virtio_mmio_block *device)
 {
     mmio_write32(device, VIRTIO_MMIO_STATUS_OFFSET, 0U);
     memory_barrier();
+    /* QEMU's MMIO reset is synchronous. Do not return a borrowed DMA buffer
+     * or release a queue if the transport violates that reset contract. */
+    if (mmio_read32(device, VIRTIO_MMIO_STATUS_OFFSET) != 0U) {
+        __builtin_trap();
+    }
 }
 
 static enum riscv_virtio_mmio_block_status init_failure(
@@ -282,6 +289,14 @@ static enum riscv_virtio_mmio_block_status negotiate_features(
     if ((device_features_low & VIRTIO_BLOCK_FEATURE_RO) != 0U) {
         driver_features_low |= VIRTIO_BLOCK_FEATURE_RO;
         device->read_only = 1U;
+    }
+    /* CONFIG_WCE is deliberately not negotiated: FLUSH then describes the
+     * writeback mode, and absence of FLUSH means write-through (Linux virtblk
+     * uses the same fallback). No configuration write can change that mode. */
+    device->block.cache_mode = KERNEL_BLOCK_CACHE_WRITETHROUGH;
+    if ((device_features_low & VIRTIO_BLOCK_FEATURE_FLUSH) != 0U) {
+        driver_features_low |= VIRTIO_BLOCK_FEATURE_FLUSH;
+        device->block.cache_mode = KERNEL_BLOCK_CACHE_WRITEBACK;
     }
 
     if (legacy_transport(device)) {
@@ -382,8 +397,11 @@ static enum kernel_block_status submit_request(
     uint64_t start;
     struct virtq_used_element element;
 
-    if (!device_live(device) || data_length == 0U ||
-        data_length % VIRTIO_BLOCK_SECTOR_SIZE != 0U) {
+    int flushing = type == VIRTIO_BLOCK_REQUEST_FLUSH;
+    if (!device_live(device) ||
+        (flushing ? data_length != 0U :
+                    (data_length == 0U ||
+                     data_length % VIRTIO_BLOCK_SECTOR_SIZE != 0U))) {
         return KERNEL_BLOCK_STATUS_STATE;
     }
 
@@ -396,7 +414,7 @@ static enum kernel_block_status submit_request(
                              request_header_offset(device);
     descriptors[0].length = sizeof(*header);
     descriptors[0].flags = VIRTQ_DESC_NEXT;
-    descriptors[0].next = 1U;
+    descriptors[0].next = flushing ? 2U : 1U;
     descriptors[1].address = data_address;
     descriptors[1].length = data_length;
     descriptors[1].flags = (type == VIRTIO_BLOCK_REQUEST_IN ? VIRTQ_DESC_WRITE : 0U) |
@@ -438,14 +456,18 @@ static enum kernel_block_status submit_request(
     }
 
     device->statistics.requests++;
-    if (type == VIRTIO_BLOCK_REQUEST_IN) {
+    if (flushing) {
+        device->statistics.flush_requests++;
+    } else if (type == VIRTIO_BLOCK_REQUEST_IN) {
         device->statistics.sectors_read +=
             data_length / VIRTIO_BLOCK_SECTOR_SIZE;
     } else {
         device->statistics.sectors_written +=
             data_length / VIRTIO_BLOCK_SECTOR_SIZE;
     }
-    if (bounce) {
+    if (flushing) {
+        /* Flush has no data descriptor or sector accounting. */
+    } else if (bounce) {
         device->statistics.bounce_requests++;
     } else {
         device->statistics.direct_requests++;
@@ -462,6 +484,15 @@ static enum kernel_block_status submit_request(
         return KERNEL_BLOCK_STATUS_IO;
     }
     return fail_live_device(device, KERNEL_BLOCK_STATUS_IO);
+}
+
+static enum kernel_block_status virtio_block_flush(void *context)
+{
+    struct riscv_virtio_mmio_block *device = context;
+    if (!device_live(device)) return KERNEL_BLOCK_STATUS_STATE;
+    if (device->block.cache_mode == KERNEL_BLOCK_CACHE_WRITETHROUGH)
+        return KERNEL_BLOCK_STATUS_OK;
+    return submit_request(device, VIRTIO_BLOCK_REQUEST_FLUSH, 0, 0, 0, 0);
 }
 
 static enum kernel_block_status virtio_block_read(void *context,
@@ -795,6 +826,7 @@ enum riscv_virtio_mmio_block_status riscv_virtio_mmio_block_init(
     result.block.context = device;
     result.block.read = virtio_block_read;
     result.block.write = result.read_only != 0U ? 0 : virtio_block_write;
+    result.block.flush = virtio_block_flush;
     result.block.capacity_bytes =
         capacity_sectors * VIRTIO_BLOCK_SECTOR_SIZE;
     result.block.logical_block_size = VIRTIO_BLOCK_SECTOR_SIZE;
@@ -826,6 +858,8 @@ enum riscv_virtio_mmio_block_status riscv_virtio_mmio_block_destroy(
     device->block.context = 0;
     device->block.read = 0;
     device->block.write = 0;
+    device->block.flush = 0;
+    device->block.cache_mode = KERNEL_BLOCK_CACHE_UNKNOWN;
     device->block.capacity_bytes = 0U;
     device->block.logical_block_size = 0U;
     device->queue_memory = 0;

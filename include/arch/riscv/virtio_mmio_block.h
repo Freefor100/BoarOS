@@ -29,6 +29,7 @@ struct riscv_virtio_mmio_block_statistics {
     uint64_t sectors_written;
     uint64_t timeouts;
     uint64_t io_errors;
+    uint64_t flush_requests;
 };
 
 struct riscv_virtio_mmio_block {

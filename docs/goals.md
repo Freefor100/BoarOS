@@ -168,6 +168,8 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 
 ### P3a 块设备 flush
 
+- [x] 块层已有缓存模式与 flush 回调；VirtIO legacy/modern 在 writeback/writethrough 四种组合通过真实请求测试。`make test-block-host` 验证能力拒绝、错误传播和可复用的易失缓存/稳定镜像故障模型；这不表示 journal 或文件系统恢复完成。
+
 - [ ] 对照固定设备资料定义能力描述、缓存属性和 flush 请求：协商支持、提交、完成、I/O 错误、超时和只读边界；两种 VirtIO MMIO transport 都验证，不能把内存 fence 当介质同步。
 - [ ] 定义请求/描述符/bounce buffer 的 owner；超时/reset 后必须确认 DMA 不再访问，才能释放或复用请求内存。不可恢复设备错误由所属设备/mount 保留明确状态。
 - [ ] 无 flush 能力时依据设备真实缓存契约返回结果；不能忽略能力并承诺不可满足的持久性。测试正常完成、拒绝/失败、超时与 reset 回收。

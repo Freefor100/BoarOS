@@ -334,17 +334,31 @@ static void test_real_virtio_block(const void *dtb)
         fail_block(36U, KERNEL_BLOCK_STATUS_INVALID, block_status);
     }
 
+    block_status = kernel_block_flush(&rw_dev->block);
+    if (block_status != KERNEL_BLOCK_STATUS_OK ||
+        rw_dev->block.cache_mode == KERNEL_BLOCK_CACHE_UNKNOWN) {
+        fail_block(42U, KERNEL_BLOCK_STATUS_OK, block_status);
+    }
+    block_status = kernel_block_flush(&ro_dev->block);
+    if (block_status != KERNEL_BLOCK_STATUS_OK) {
+        fail_block(43U, KERNEL_BLOCK_STATUS_OK, block_status);
+    }
+
     /* Statistics check */
     riscv_virtio_mmio_block_get_statistics(rw_dev, &statistics);
     if (statistics.direct_requests == 0U ||
         statistics.bounce_requests == 0U ||
-        statistics.requests != statistics.direct_requests + statistics.bounce_requests ||
+        statistics.requests != statistics.direct_requests + statistics.bounce_requests + statistics.flush_requests ||
+        statistics.flush_requests !=
+            (rw_dev->block.cache_mode == KERNEL_BLOCK_CACHE_WRITEBACK ? 1U : 0U) ||
         statistics.sectors_written == 0U ||
         statistics.sectors_read == 0U ||
         statistics.timeouts != 0U ||
         statistics.io_errors != 0U) {
         fail_block(37U, 1U, (unsigned long)statistics.requests);
     }
+    virt_uart_puts(rw_dev->block.cache_mode == KERNEL_BLOCK_CACHE_WRITEBACK
+        ? "BoarOS: block cache writeback\n" : "BoarOS: block cache writethrough\n");
 
     /* Cleanup */
     if (physical_page_release(&allocator, buffer_address) !=
