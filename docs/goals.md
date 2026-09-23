@@ -18,13 +18,16 @@
 
 本批最终证据：`build/recoverable-fs-host-final.log`（含 journal/orphan/rename 断电与 metadata 故障）、`build/recoverable-fs-regression-final.log`（RISC-V 全套、真实 musl/pthread、320 条差分、1000 个函数栈界、工具自测）、`build/recoverable-fs-full/runs/suite.json`（228 项实际重跑，无旧通过项回退）。恢复承诺仍限于已验证块模型。
 
+robust-list 阶段证据：`build/robust-focused-first/`（静态/动态真实 entry）、`build/diff-abi/run/`（启用 futex 的固定 Linux 与 BoarOS 同一 ELF 329 条一致）、`build/robust-riscv-stack.log`（RISC-V 全套与栈检查）、`build/robust-full-20260923/runs/suite.json`（223 pass/2 direct/3 wrapper，无旧通过项回退）。`build/cancel-repeat-20260923/` 记录静态/动态取消 entry 各 30 次双侧通过，历史异常根因仍未确定。
+
 ### 后续推进顺序
 
 | 顺序 | 任务 | 开始条件 / 独立成果 |
 |---|---|---|
 | 已完成 | P1d cwd/dirfd、P1g rename 子集 | 共享活目录项、cwd/dirfd、普通/NOREPLACE rename 已接入日志与 orphan |
 | 已完成 | P1e 时间、P1f 统计 | utimensat/futimens、真实 statfs、原始静态/动态 entry 与 BusyBox pwd/cd/mv/touch 已通过 |
-| 本批之后 | P2a robust-list 与取消异常 | 先闭环真实程序的退出语义，再推进 P4a 共享匿名、共享 futex 和文件映射 |
+| 已完成 | P2a 同 MM 非 PI robust-list | raw `exit`、exec、musl、差分及全量清单已验收；PI 与跨 MM key 仍后置 |
+| 下一阶段 | P4a 共享匿名与 P4d 跨 MM futex 设计；P0c 取消异常调查持续 | 历史取消异常本轮 30 轮/版本未复现，不能伪称已找到根因 |
 | 持续支线 | P5a glibc 试跑、L0/L1 第二架构入口 | 可现在固定输入或调查边界，不以全量清单全绿为前提 |
 | 后续 | P3c/e 记录锁与 SQLite、N socket、P4 文件共享、P6 SMP | 按下述具体依赖进入，不按测试名称排接口 |
 
@@ -48,11 +51,12 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 
 ## P0：固定证据与时序问题
 
-**入口**：`tests/program-inventory/{inputs.json,run.py,suites.py,reports.py}`、`tests/diff-abi/`、`.github/workflows/ci.yml`、[程序清单](learning/user-program-inventory.md)。2026-09-22 最近 228 项记录为 221 一致、4 个直接 entry 退出不符、3 个包装失败；静态/动态和脚本重叠不重复计算缺陷。
+**入口**：`tests/program-inventory/{inputs.json,run.py,suites.py,reports.py}`、`tests/diff-abi/`、`.github/workflows/ci.yml`、[程序清单](learning/user-program-inventory.md)。2026-09-23 最近 228 项记录为 223 一致、2 个直接 entry 退出不符、3 个包装失败；静态/动态和脚本重叠不重复计算缺陷。
 
 ### P0c 时序根因闭环
 
 - [ ] 固定 kernel/ELF/loader/fixture/runner/QEMU 身份与次数，分别复跑静态、动态取消 entry 和原脚本；保存双侧 stdout/stderr、真实 wait status、超时和第一个失败。先区分 reference-not-pass、setup-error、脚本顺序依赖。
+- [x] 在固定构建输入上重复运行静态/动态取消直接 entry 各 30 次：Linux 与 BoarOS 均 30/30 通过，原始逐次证据和身份在 `build/cancel-repeat-20260923/`；未复现不等于旧异常已定位，原脚本复跑和最小因果序列继续保留在上条待办。
 - [ ] 取消异常缩成可独立运行的 shm_open、取消登记、阻塞、join/clear_tid 序列；确认取消点前后状态，不让错误诊断中的 write 再次隐藏原错误。用同步事件安排顺序，不靠随意 sleep 假定先后。
 - [x] P1c 后以同步握手确认独立后台子进程进入目标阶段，再执行 kill/回收，固定重复 20 轮均成功；原 BusyBox 包装器中的 sleep+kill 子项也为 20/20，包装器其他缺口继续单列，未据此关闭历史取消异常。
 - [ ] 若定位到支持范围内的错误，先加入能证伪旧实现的最小回归，再修所属模块；记录失败前和修复后的重复次数。一次转绿不能关闭未知根因。
@@ -60,7 +64,7 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 ### P0d 持续证据与清单维护
 
 - [x] 本轮证据保留工作树内核、ELF/loader、fixture、runner、QEMU 与固定 Linux/BusyBox/libc-test 身份；旧基线只保留历史定位用途。
-- [x] 原七类直接失败按设备/身份、cwd、时间设置、文件系统统计、robust、socket 聚类；设备、cwd、显式时间和统计已关闭；直接 entry 只剩 robust/socket，保留原始日志与最小复现归属，不按非零退出码猜 syscall。
+- [x] 原七类直接失败按设备/身份、cwd、时间设置、文件系统统计、robust、socket 聚类；设备、cwd、显式时间、统计和 robust 已关闭；直接 entry 只剩 socket，保留原始日志与最小复现归属，不按非零退出码猜 syscall。
 - [x] 已有硬回归严格通过；能力清单如实保存缺口。全量严格验收复用 `--require-pass`，不重建状态系统或跳过失败；相关静态/动态 entry、原包装器与 228 项清单均已重跑。
 - [x] 限定集合的 `--require-pass` 只严格判定本次 selection，未选项目保持历史状态或 `not-run`；未知 ID、所选失败/未完成、中断、参考侧失败与全量严格模式均有 runner 回归。
 
@@ -125,12 +129,12 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 
 **依赖与入口**：可与 P1 独立推进；[调度模块](modules/kernel-scheduler.md)、[信号模块](modules/kernel-signal.md)、[时间模块](modules/kernel-time.md)；`kernel/sched/{process.c,futex.c,signal.c,wait.c,private.h}`、`kernel/syscall/{process.c,signal.c,time.c}`、`arch/riscv/signal.c`、`include/kernel/task.h`。不重写已有 pthread/普通 futex。
 
-### P2a robust-list 退出协议（所有权待确认）
+### P2a robust-list 退出协议（同步所有权路线已完成）
 
-- [ ] 增加 `set_robust_list/get_robust_list` 和每线程注册信息；核对 ABI 长度、目标线程权限、用户地址、返回值与 fork/exec 生命周期，注册不等于内核永久信任用户链。
-- [ ] 在退出线程 MM 仍有效、页/栈仍有 owner 时有界遍历；处理链头、futex offset、正在进行的 pending 操作、owner TID 与 `FUTEX_OWNER_DIED`，按协议唤醒等待者。普通退出、致命信号、exit_group 和 exec 清退线程均纳入调用链审查。
-- [ ] 坏指针、页被撤销、循环/超长链、重复 pending、非本线程 owner 等场景不导致无限遍历、跨界写或已释放页访问。写清与 clear_child_tid、资源释放的先后契约，不锁定无关私有调用顺序。
-- [ ] 用未特改 musl 验证 owner 死亡后的 `EOWNERDEAD`、consistent 恢复及不可恢复状态；分别验证持锁线程正常退出/终止、detach/join、OOM 与坏链。用户态互斥量协议由 libc 和内核一起完成，不能内核直接伪造测试返回。
+- [x] 增加 `set_robust_list/get_robust_list` 和每线程注册信息；RV64 长度、存活目标 TID、当前 root 凭据、输出故障顺序、坏地址注册与 fork/exec 生命周期有真实 U-mode 和固定 Linux 差分。
+- [x] 同步清理发生在退出线程旧 MM 与原 TID 有效时；有界处理链、signed offset、pending、owner-died 和唤醒。普通退出、致命信号、exit_group 和 exec 清退成员共用退出调用链；存活 exec 线程使用换号前 TID。
+- [x] 坏指针、循环链、非 owner、PI 标记、COW 与 OOM 的用户访问失败均有真实路径验证；2048 项上界和先读下一链接防止无限遍历及已释放页访问。robust 清理先于 clear_child_tid 和 MM 释放。
+- [x] 未特改 musl 静态/动态 `pthread_robust_detach`、真实 pthread owner-died/consistent/不可恢复状态与原始 `SYS_exit` 探针均通过；PI 与跨 MM 共享语义不计入 P2a。
 
 ### P2b 等待、取消与 futex 扩展
 
@@ -162,7 +166,7 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 - [ ] 按需求增加 AS/DATA/FSIZE/CPU，分别说明记账 owner、生效点、越限 errno/信号和恢复；AS 是虚拟区间而非驻留页，VMA 合并/切分/mmap/brk/mremap 与 lazy allocation 保持一致。
 - [ ] 先核对固定 Linux 对 RSS/LOCKS 的非执行语义、NPROC 的真实 UID 和特权例外，再决定支持范围；不机械地对每个历史枚举加限额，也不把有效但未支持资源成功空返回。
 
-**验证与退出**：扩展现有 `tests/diff-abi/limits.c`；拟新增 `tests/userland/robust_futex.c`、`tests/userland/signal_stress.c`、`tests/diff-abi/futex_signal.c`。聚焦 `make test-scheduler-cases-riscv test-signal-riscv test-syscall-riscv`，再跑真实 pthread/U-mode、差分与 `test-riscv`。robust 静态/动态 entry 真正通过；旧取消异常有独立复现/结论，不以全部当前 pthread 通过冒充共享 futex 或 SMP 完成。
+**验证与退出**：robust 已由 `tests/userland/pthread.c` 的原始退出/真实 mutex 消费者、`tests/riscv/uaccess_oom.S`、`tests/diff-abi/robust.c` 和静态/动态原 entry 验收；聚焦 `make test-scheduler-cases-riscv test-signal-riscv test-syscall-riscv`、`test-userland-riscv`、329 条差分、`test-riscv` 与栈检查均通过。拟新增 `tests/userland/signal_stress.c`、`tests/diff-abi/futex_signal.c` 仍属后续；旧取消异常继续 P0c，不以全部当前 pthread 通过冒充共享 futex 或 SMP 完成。
 
 ## P3：同步持久化、文件锁与 SQLite
 
