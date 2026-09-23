@@ -2,6 +2,7 @@
 
 #include <kernel/errno.h>
 #include <kernel/exec.h>
+#include <kernel/futex.h>
 #include <kernel/mm.h>
 #include <kernel/signal.h>
 #include <kernel/task.h>
@@ -111,6 +112,66 @@ enum kernel_syscall_status syscall_handle_set_tid_address(
     }
     decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
     decoded->value = tid;
+    return KERNEL_SYSCALL_STATUS_OK;
+}
+
+enum kernel_syscall_status syscall_handle_set_robust_list(
+    struct kernel_task *caller,
+    const struct kernel_syscall_request *request,
+    struct kernel_syscall_result *decoded)
+{
+    decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+    if (request->arguments[1] != 3U * sizeof(uint64_t)) {
+        decoded->value = -KERNEL_EINVAL;
+        return KERNEL_SYSCALL_STATUS_OK;
+    }
+    kernel_futex_set_robust_list(caller, request->arguments[0]);
+    decoded->value = 0;
+    return KERNEL_SYSCALL_STATUS_OK;
+}
+
+enum kernel_syscall_status syscall_handle_get_robust_list(
+    struct kernel_task *caller,
+    const struct kernel_syscall_request *request,
+    struct kernel_syscall_result *decoded)
+{
+    int32_t pid = (int32_t)(uint32_t)request->arguments[0];
+    struct kernel_task *target = pid == 0 ? caller :
+                                 pid > 0 ? kernel_signal_find_by_tid(pid) : 0;
+    struct kernel_mm *mm;
+    uint64_t length = 3U * sizeof(uint64_t);
+    uint64_t head;
+    size_t copied = 0U;
+    enum kernel_uaccess_status access;
+
+    decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+    if (target == 0) {
+        decoded->value = -KERNEL_ESRCH;
+        return KERNEL_SYSCALL_STATUS_OK;
+    }
+    if (kernel_task_mm_borrow_mutable(caller, &mm) != KERNEL_TASK_STATUS_OK)
+        return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    head = kernel_futex_get_robust_list(target);
+    access = kernel_copy_to_user(mm, request->arguments[2], &length,
+                                 sizeof(length), &copied);
+    if (access == KERNEL_UACCESS_STATUS_FAULT ||
+        (access == KERNEL_UACCESS_STATUS_OK && copied != sizeof(length))) {
+        decoded->value = -KERNEL_EFAULT;
+        return KERNEL_SYSCALL_STATUS_OK;
+    }
+    if (access != KERNEL_UACCESS_STATUS_OK)
+        return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    copied = 0U;
+    access = kernel_copy_to_user(mm, request->arguments[1], &head,
+                                 sizeof(head), &copied);
+    if (access == KERNEL_UACCESS_STATUS_FAULT ||
+        (access == KERNEL_UACCESS_STATUS_OK && copied != sizeof(head))) {
+        decoded->value = -KERNEL_EFAULT;
+        return KERNEL_SYSCALL_STATUS_OK;
+    }
+    if (access != KERNEL_UACCESS_STATUS_OK)
+        return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    decoded->value = 0;
     return KERNEL_SYSCALL_STATUS_OK;
 }
 

@@ -175,6 +175,15 @@ signal.wait-child-delivery
 signal.wait-info-fault
 signal.wait-info-consumed
 signal.wait-interrupted
+robust.set-bad-size
+robust.set
+robust.get-self
+robust.get-missing
+robust.get-head-fault
+robust.get-length-fault
+robust.fork-reset
+robust.unregister
+robust.get-unregistered
 limit.nofile-invalid-range
 limit.nofile-oldfault
 limit.nofile-set

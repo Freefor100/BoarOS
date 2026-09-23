@@ -25,6 +25,13 @@ _start:
     beqz a0, .Lnext
     li t0, -14
     bne a0, t0, .Lfailure
+    # The failed page is still a legal registered robust-list address.
+    # Exit must tolerate another user fault while memory is exhausted.
+    mv a0, s0
+    li a1, 24
+    li a7, 99
+    ecall
+    bnez a0, .Lfailure
     li a0, 42
     li a7, 93
     ecall

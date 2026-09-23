@@ -2,9 +2,11 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <pthread.h>
 #include <sched.h>
 #include <signal.h>
+#include <sys/mman.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -672,6 +674,20 @@ static void *exec_worker(void *opaque)
     char *expected = opaque;
     char *argv[] = { "/init", "execed", expected, 0 };
     char *envp[] = { 0 };
+    unsigned long robust_head[3] = {0};
+    void *observed = 0;
+    size_t length = 0;
+
+    robust_head[0] = (unsigned long)robust_head;
+    if (syscall(SYS_set_robust_list, robust_head,
+                sizeof(robust_head)) != 0)
+        _exit(88);
+    errno = 0;
+    if (execve("/missing-robust-exec", argv, envp) != -1 ||
+        errno != ENOENT ||
+        syscall(SYS_get_robust_list, 0, &observed, &length) != 0 ||
+        observed != robust_head || length != sizeof(robust_head))
+        _exit(89);
 
     execve(argv[0], argv, envp);
     _exit(90);
@@ -798,13 +814,337 @@ static int check_raw_futex(void)
     return 0;
 }
 
+struct robust_list_head_probe {
+    void *next;
+    long futex_offset;
+    void *pending;
+};
+
+struct robust_entry_probe {
+    void *next;
+    uint32_t word;
+};
+
+enum robust_probe_mode {
+    ROBUST_LIST_OWNER,
+    ROBUST_PENDING_OWNER,
+    ROBUST_OTHER_OWNER,
+    ROBUST_CIRCULAR,
+    ROBUST_BAD_HEAD,
+    ROBUST_WAIT_OWNER,
+    ROBUST_COW,
+    ROBUST_PI_MARKER,
+    ROBUST_PENDING_UNLOCK_WAKE,
+    ROBUST_BAD_OFFSET,
+};
+
+struct robust_exit_probe {
+    struct robust_list_head_probe head;
+    struct robust_entry_probe entry;
+    int registration_error;
+    volatile long tid;
+    volatile int go;
+    int mode;
+};
+
+static volatile int robust_cow_go;
+
+static void *robust_release_after_delay(void *opaque)
+{
+    struct robust_exit_probe *probe = opaque;
+    struct timespec delay = {.tv_nsec = 20000000L};
+
+    nanosleep(&delay, 0);
+    probe->go = 1;
+    return 0;
+}
+
+static void *robust_raw_exit_worker(void *opaque)
+{
+    struct robust_exit_probe *probe = opaque;
+    long tid = syscall(SYS_gettid);
+
+    probe->head.next = probe->mode == ROBUST_PENDING_OWNER ||
+                        probe->mode == ROBUST_PENDING_UNLOCK_WAKE ?
+                           (void *)&probe->head :
+                       probe->mode == ROBUST_PI_MARKER ?
+                           (void *)((uintptr_t)&probe->entry | 1U) :
+                           (void *)&probe->entry;
+    probe->head.futex_offset = probe->mode == ROBUST_BAD_OFFSET ? LONG_MAX :
+                                (long)sizeof(probe->entry.next);
+    probe->head.pending = probe->mode == ROBUST_PENDING_OWNER ||
+                          probe->mode == ROBUST_PENDING_UNLOCK_WAKE ?
+                              (void *)&probe->entry : 0;
+    probe->entry.next = probe->mode == ROBUST_CIRCULAR ?
+                                             (void *)&probe->entry :
+                                             (void *)&probe->head;
+    probe->entry.word = probe->mode == ROBUST_PENDING_UNLOCK_WAKE ? 0U :
+                        (probe->mode == ROBUST_OTHER_OWNER ? 777U :
+                                                               (uint32_t)tid) |
+                            UINT32_C(0x80000000);
+    if (syscall(SYS_set_robust_list,
+                probe->mode == ROBUST_BAD_HEAD ? (void *)(uintptr_t)8U :
+                                   (void *)&probe->head,
+                sizeof(probe->head)) != 0)
+        probe->registration_error = errno;
+    probe->tid = tid;
+    while ((probe->mode == ROBUST_WAIT_OWNER ||
+            probe->mode == ROBUST_PENDING_UNLOCK_WAKE) && !probe->go)
+        sched_yield();
+    while (probe->mode == ROBUST_COW && !robust_cow_go) sched_yield();
+    syscall(SYS_exit, 0);
+    __builtin_unreachable();
+}
+
+static int robust_raw_exit_case(int mode, int *wait_result)
+{
+    struct robust_exit_probe local = {0};
+    struct robust_exit_probe *probe = &local;
+    pthread_t thread;
+
+    if (mode == ROBUST_COW) {
+        probe = mmap(0, 4096, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (probe == MAP_FAILED) return 1;
+        robust_cow_go = 0;
+    }
+    probe->mode = mode;
+    if (pthread_create(&thread, 0, robust_raw_exit_worker, probe) != 0)
+        return 1;
+    for (int tries = 0; tries < 10000 && probe->tid == 0; tries++)
+        sched_yield();
+    if (probe->tid == 0) return 2;
+    if (mode == ROBUST_COW) {
+        pid_t child = fork();
+        if (child < 0) return 6;
+        if (child == 0) _exit(0);
+        if (wait_status(child, 0) != 0) return 7;
+        robust_cow_go = 1;
+    }
+    if (mode == ROBUST_WAIT_OWNER) {
+        struct timespec timeout = {.tv_sec = 1};
+        uint32_t expected = probe->entry.word;
+        long result;
+
+        probe->go = 1;
+        result = syscall(SYS_futex, &probe->entry.word, FUTEX_WAIT,
+                         expected, &timeout, 0, 0);
+        if (wait_result != 0)
+            *wait_result = result == 0 ? 1 :
+                           result == -1 && errno == EAGAIN ? 0 : -1;
+    }
+    if (mode == ROBUST_PENDING_UNLOCK_WAKE) {
+        struct timespec timeout = {.tv_sec = 1};
+        pthread_t releaser;
+        long result;
+
+        if (pthread_create(&releaser, 0, robust_release_after_delay,
+                           probe) != 0) return 9;
+        result = syscall(SYS_futex, &probe->entry.word, FUTEX_WAIT,
+                         0, &timeout, 0, 0);
+        if (pthread_join(releaser, 0) != 0) return 10;
+        if (wait_result != 0) *wait_result = result == 0 ? 1 : -1;
+    }
+    for (int tries = 0; tries < 10000; tries++) {
+        errno = 0;
+        if (syscall(SYS_tgkill, getpid(), probe->tid, 0) == -1 &&
+            errno == ESRCH)
+            break;
+        if (tries == 9999) return 3;
+        sched_yield();
+    }
+    if (probe->registration_error != 0)
+        return 4;
+    if (probe->entry.word !=
+        (mode == ROBUST_PENDING_UNLOCK_WAKE ? 0U :
+         mode == ROBUST_OTHER_OWNER ? UINT32_C(0x80000309) :
+         mode == ROBUST_BAD_HEAD || mode == ROBUST_PI_MARKER ||
+         mode == ROBUST_BAD_OFFSET ?
+             ((uint32_t)probe->tid | UINT32_C(0x80000000)) :
+                     UINT32_C(0xc0000000)))
+        return 5;
+    if (mode == ROBUST_COW && munmap(probe, 4096) != 0) return 8;
+    return 0;
+}
+
+static int check_robust_raw_exit(void)
+{
+    int woken = 0;
+
+    for (int mode = ROBUST_LIST_OWNER; mode <= ROBUST_BAD_HEAD; mode++) {
+        int result = robust_raw_exit_case(mode, 0);
+        if (result != 0) return 10 * mode + result;
+    }
+    if (robust_raw_exit_case(ROBUST_COW, 0) != 0) return 80;
+    if (robust_raw_exit_case(ROBUST_PI_MARKER, 0) != 0) return 81;
+    if (robust_raw_exit_case(ROBUST_BAD_OFFSET, 0) != 0) return 83;
+    {
+        int woken_pending = -1;
+        if (robust_raw_exit_case(ROBUST_PENDING_UNLOCK_WAKE,
+                                 &woken_pending) != 0 ||
+            woken_pending != 1) return 82;
+    }
+    for (int tries = 0; tries < 4; tries++) {
+        int observed = -1;
+        int result = robust_raw_exit_case(ROBUST_WAIT_OWNER, &observed);
+        if (result != 0 || observed < 0) return 60 + result;
+        woken += observed;
+    }
+    return woken != 0 ? 0 : 70;
+}
+
+static int check_robust_registration(void)
+{
+    struct robust_list_head_probe head = {0};
+    void *observed = (void *)(uintptr_t)1U;
+    size_t length = 0U;
+    long tid = syscall(SYS_gettid);
+
+    errno = 0;
+    if (syscall(SYS_set_robust_list, &head, sizeof(head)) != 0)
+        return 1;
+    if (syscall(SYS_get_robust_list, 0, &observed, &length) != 0 ||
+        observed != &head || length != sizeof(head))
+        return 2;
+    observed = 0;
+    if (syscall(SYS_get_robust_list, tid, &observed, &length) != 0 ||
+        observed != &head || length != sizeof(head))
+        return 6;
+    observed = (void *)(uintptr_t)1U;
+    errno = 0;
+    if (syscall(SYS_get_robust_list, -1, &observed, &length) != -1 ||
+        errno != ESRCH || observed != (void *)(uintptr_t)1U)
+        return 7;
+    length = 0U;
+    errno = 0;
+    if (syscall(SYS_get_robust_list, 0, (void *)(uintptr_t)8U,
+                &length) != -1 || errno != EFAULT ||
+        length != sizeof(head))
+        return 8;
+    observed = (void *)(uintptr_t)1U;
+    errno = 0;
+    if (syscall(SYS_get_robust_list, 0, &observed,
+                (void *)(uintptr_t)8U) != -1 || errno != EFAULT ||
+        observed != (void *)(uintptr_t)1U)
+        return 9;
+    errno = 0;
+    if (syscall(SYS_set_robust_list, &head, sizeof(head) - 1U) != -1 ||
+        errno != EINVAL)
+        return 3;
+    if (syscall(SYS_set_robust_list, 0, sizeof(head)) != 0)
+        return 4;
+    observed = (void *)(uintptr_t)1U;
+    if (syscall(SYS_get_robust_list, 0, &observed, &length) != 0 ||
+        observed != 0 || length != sizeof(head))
+        return 5;
+    if (syscall(SYS_set_robust_list, (void *)(uintptr_t)8U,
+                sizeof(head)) != 0)
+        return 10;
+    if (syscall(SYS_get_robust_list, 0, &observed, &length) != 0 ||
+        observed != (void *)(uintptr_t)8U)
+        return 11;
+    if (syscall(SYS_set_robust_list, 0, sizeof(head)) != 0)
+        return 12;
+    return 0;
+}
+
+struct robust_remote_probe {
+    struct robust_list_head_probe head;
+    volatile long tid;
+    volatile int go;
+    int error;
+};
+
+static void *robust_remote_worker(void *opaque)
+{
+    struct robust_remote_probe *probe = opaque;
+
+    probe->head.next = &probe->head;
+    if (syscall(SYS_set_robust_list, &probe->head,
+                sizeof(probe->head)) != 0)
+        probe->error = errno;
+    probe->tid = syscall(SYS_gettid);
+    while (!probe->go) sched_yield();
+    return 0;
+}
+
+static int check_robust_remote_query(void)
+{
+    struct robust_remote_probe probe = {0};
+    pthread_t thread;
+    void *observed = 0;
+    size_t length = 0;
+
+    if (pthread_create(&thread, 0, robust_remote_worker, &probe) != 0)
+        return 1;
+    for (int tries = 0; tries < 10000 && probe.tid == 0; tries++)
+        sched_yield();
+    if (probe.tid == 0 || probe.error != 0) return 2;
+    if (syscall(SYS_get_robust_list, probe.tid,
+                &observed, &length) != 0 ||
+        observed != &probe.head || length != sizeof(probe.head))
+        return 3;
+    probe.go = 1;
+    if (pthread_join(thread, 0) != 0) return 4;
+    errno = 0;
+    if (syscall(SYS_get_robust_list, probe.tid,
+                &observed, &length) != -1 || errno != ESRCH)
+        return 5;
+    return 0;
+}
+
+static void *robust_mutex_owner(void *opaque)
+{
+    pthread_mutex_t *mutex = opaque;
+
+    return pthread_mutex_lock(mutex) == 0 ? 0 : (void *)1;
+}
+
+static int check_robust_mutex_protocol(void)
+{
+    pthread_mutexattr_t attr;
+    pthread_mutex_t mutex;
+    pthread_t thread;
+    void *result = (void *)1;
+
+    if (pthread_mutexattr_init(&attr) != 0 ||
+        pthread_mutexattr_setrobust(&attr, PTHREAD_MUTEX_ROBUST) != 0 ||
+        pthread_mutex_init(&mutex, &attr) != 0)
+        return 1;
+    if (pthread_create(&thread, 0, robust_mutex_owner, &mutex) != 0 ||
+        pthread_join(thread, &result) != 0 || result != 0)
+        return 2;
+    if (pthread_mutex_lock(&mutex) != EOWNERDEAD ||
+        pthread_mutex_consistent(&mutex) != 0 ||
+        pthread_mutex_unlock(&mutex) != 0 ||
+        pthread_mutex_lock(&mutex) != 0 ||
+        pthread_mutex_unlock(&mutex) != 0)
+        return 3;
+    if (pthread_create(&thread, 0, robust_mutex_owner, &mutex) != 0 ||
+        pthread_join(thread, &result) != 0 || result != 0)
+        return 4;
+    if (pthread_mutex_lock(&mutex) != EOWNERDEAD ||
+        pthread_mutex_unlock(&mutex) != 0 ||
+        pthread_mutex_lock(&mutex) != ENOTRECOVERABLE)
+        return 5;
+    if (pthread_mutex_destroy(&mutex) != 0 ||
+        pthread_mutexattr_destroy(&attr) != 0)
+        return 6;
+    return 0;
+}
+
 static int execed_mode(const char *expected)
 {
     char *end = 0;
     long pid = strtol(expected, &end, 10);
+    void *robust_head = (void *)(uintptr_t)1U;
+    size_t robust_length = 0;
 
     if (expected[0] == 0 || end == 0 || *end != 0 || pid <= 0 ||
         getpid() != pid || syscall(SYS_gettid) != pid) return 22;
+    if (syscall(SYS_get_robust_list, 0, &robust_head,
+                &robust_length) != 0 || robust_head != 0 ||
+        robust_length != 3U * sizeof(long)) return 24;
     return 23;
 }
 
@@ -902,5 +1242,17 @@ int main(int argc, char **argv)
     if (run_check("raw futex",
                   "BoarOS: real pthread futex ABI checks ok",
                   check_raw_futex) != 0) return 7;
+    if (run_check("robust registration",
+                  "BoarOS: real pthread robust registration checks ok",
+                  check_robust_registration) != 0) return 9;
+    if (run_check("robust remote query",
+                  "BoarOS: real pthread robust remote query checks ok",
+                  check_robust_remote_query) != 0) return 11;
+    if (run_check("robust mutex protocol",
+                  "BoarOS: real pthread robust mutex protocol checks ok",
+                  check_robust_mutex_protocol) != 0) return 12;
+    if (run_check("robust raw exit",
+                  "BoarOS: real pthread robust raw exit checks ok",
+                  check_robust_raw_exit) != 0) return 10;
     return 42;
 }

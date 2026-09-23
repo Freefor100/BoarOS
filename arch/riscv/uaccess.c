@@ -177,6 +177,29 @@ enum kernel_uaccess_status kernel_copy_from_user(
     return KERNEL_UACCESS_STATUS_OK;
 }
 
+enum kernel_uaccess_status kernel_user_cmpxchg_u32(
+    struct kernel_mm *mm, uint64_t user_address,
+    uint32_t expected, uint32_t desired, uint32_t *observed)
+{
+    unsigned char *page;
+    uint32_t current = expected;
+    enum kernel_uaccess_status status;
+
+    if (mm == 0 || observed == 0)
+        return KERNEL_UACCESS_STATUS_INVALID_ARGUMENT;
+    if ((user_address & 3U) != 0U ||
+        kernel_user_range_check(user_address, sizeof(uint32_t)) !=
+            KERNEL_UACCESS_STATUS_OK)
+        return KERNEL_UACCESS_STATUS_FAULT;
+    status = resolve_user_page(mm, user_address, KERNEL_MM_WRITE, &page);
+    if (status != KERNEL_UACCESS_STATUS_OK) return status;
+    (void)__atomic_compare_exchange_n(
+        (uint32_t *)(void *)(page + (user_address & BOAROS_PAGE_MASK)),
+        &current, desired, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    *observed = current;
+    return KERNEL_UACCESS_STATUS_OK;
+}
+
 enum kernel_uaccess_status kernel_copy_string_from_user(
     struct kernel_mm *mm,
     char *kernel_destination,

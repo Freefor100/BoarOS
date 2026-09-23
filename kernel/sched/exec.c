@@ -8,6 +8,7 @@
 #include <arch/riscv/thread.h>
 #include <arch/riscv/trap.h>
 #include <kernel/exec.h>
+#include <kernel/futex.h>
 #include <kernel/files.h>
 #include <kernel/heap.h>
 #include <kernel/mm.h>
@@ -37,6 +38,7 @@ enum kernel_scheduler_status kernel_scheduler_exec_commit(void)
     enum kernel_files_status files_status;
     enum kernel_mm_status mm_status;
     enum kernel_scheduler_status status;
+    kernel_pid_t old_tid;
     int entry_present = 0;
 
     if (scheduler.initialized != KERNEL_SCHEDULER_INITIALIZED) {
@@ -50,6 +52,7 @@ enum kernel_scheduler_status kernel_scheduler_exec_commit(void)
         return status;
     }
     thread = scheduler.current;
+    old_tid = thread->tid;
     transaction = thread->exec_transaction;
     if (thread == &scheduler.idle || thread->arch.user_mode != 1U ||
         transaction == 0 ||
@@ -110,6 +113,10 @@ enum kernel_scheduler_status kernel_scheduler_exec_commit(void)
     if (riscv_sv39_switch_satp(new_satp) != RISCV_SV39_STATUS_OK) {
         return KERNEL_SCHEDULER_STATUS_ADDRESS_SPACE;
     }
+    /* The prepared image is committed, but the old MM remains owned by
+     * this task until the transaction takes it. Use the TID from before
+     * a non-leader exec adopted the group leader's identity. */
+    kernel_futex_release_robust(thread, old_tid);
     transaction->retired_mm = thread->mm;
     thread->mm = transaction->image.mm;
     finish_mm_move(&transaction->image.mm);

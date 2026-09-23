@@ -1389,6 +1389,7 @@ static void kernel_thread_finish(
 
     if (!current->group_exiting) current->completion = *completion;
     if (current->arch.user_mode == 1U) {
+        kernel_futex_release_robust(current, current->tid);
         kernel_futex_clear_tid(current);
         if (riscv_sv39_switch_satp(scheduler.kernel_satp) !=
             RISCV_SV39_STATUS_OK) {

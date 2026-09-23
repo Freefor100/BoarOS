@@ -30,6 +30,10 @@ REQUEUE 先唤醒指定数量，再将剩余指定数量移动到另一个 key�
 
 ## 验证与成本
 
+robust-list 的注册只保存用户地址，不能视作链内容可信或永久可访问。固定 Linux `kernel/futex/syscalls.c` 接受长度为 24 字节的 RV64 链头并允许注销；`kernel/futex/core.c` 在退出时限制遍历 2048 项，先读下一链接，再对 owner TID 匹配的 32 位字原子设置 `OWNER_DIED`，保留 `WAITERS` 并唤醒。`list_op_pending` 还覆盖解锁与唤醒之间死亡的窗口。`kernel/fork.c` 在普通退出及成功 exec 的 MM release 前调用 futex 清理。BoarOS 非组长 exec 会采用原组长 TID，因此清理时必须使用换号前保存的 TID。上述路径均依据本页末尾固定 Linux commit。
+
+musl 1.2.5 的普通 `pthread_exit` 自己遍历 robust mutex 并处理 owner 死亡，detached 线程还会在释放用户栈前注销链头；仅让 libc-test 的 `pthread_robust_detach` 通过不能证明内核清理。真实 U-mode 测试另用原始 `SYS_exit` 绕开 libc 退出清理，检验 owner-died、pending、唤醒、坏链、PI 标记和 fork COW。该阶段的 key 仍只识别同一 MM；跨 MM 共享后备对象与 PI 协议须另行设计。
+
 pthread 成功创建并不证明线程组完整：还应检查 join/TLS、竞争等待、超时和取消，以及组长先退、非组长 exec、阻塞成员终止和最终资源回收。模块验证负责 key 匹配和状态边界，真实 libc 消费者负责组合 ABI；两者不是互相替代关系。
 
 BoarOS 使用 256 个桶和每队列 FIFO 成员链。普通唤醒不扫描全局 blocked 链，futex 唤醒仍需检查目标桶中的碰撞 waiter。deadline 到期目前仍扫描全局 blocked 链。线程 clone 共享 MM/files/fs，避免复制页表和 fd 槽；首次建立共享 disposition 时，原本尚未分配的信号表仍需要分配，不能宣称所有 clone 都只分配一个页。QEMU 运行时间不构成真实硬件性能结论。

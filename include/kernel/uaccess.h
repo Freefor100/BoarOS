@@ -32,6 +32,11 @@ enum kernel_uaccess_status kernel_copy_from_user(
     size_t size,
     size_t *bytes_copied);
 
+/* Atomically update an aligned user futex word after resolving write/COW. */
+enum kernel_uaccess_status kernel_user_cmpxchg_u32(
+    struct kernel_mm *mm, uint64_t user_address,
+    uint32_t expected, uint32_t desired, uint32_t *observed);
+
 /* On success, string_length excludes the terminating NUL byte. */
 enum kernel_uaccess_status kernel_copy_string_from_user(
     struct kernel_mm *mm,

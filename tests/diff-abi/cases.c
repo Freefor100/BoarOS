@@ -188,6 +188,7 @@ void abi_main(const unsigned long *initial_stack)
     abi_timestamp_cases(); abi_readv_cases();
     abi_link_cases();
     abi_signal_wait_cases();
+    abi_robust_cases();
     abi_limit_cases();
     identity_cases();
     abi_device_cases();
