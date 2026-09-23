@@ -20,31 +20,30 @@ python3 tests/program-inventory/run.py --reuse-builds --require-pass --output bu
 
 ## 当前基线与阻塞
 
-2026-09-22 全量证据在 `build/recoverable-fs-full/`，命令：
+2026-09-23 全量证据在 `build/robust-full-20260923/`，命令：
 
 ```sh
-python3 tests/program-inventory/run.py --reuse-builds --suite all --output build/recoverable-fs-full
+python3 tests/program-inventory/run.py --reuse-builds --suite all --output build/robust-full-20260923
 ```
 
-该目录 `runs/suite.json` 为 `status=complete`，228 项全部完成：221 pass、4 nonzero-exit、3 upstream-failure。相对此前 `build/p1bc-full-final3` 的 215/10/3，`daemon_failure`、`utime`、`statvfs` 静态/动态共六项新增通过，没有已有通过项回退。本次内核来自已完成块 flush、逐 inode 写回、journal/replay、持久 orphan、cwd/dirfd/rename 及显式元数据阶段的工作树。
+该目录 `runs/suite.json` 为 `status=complete`，228 项全部完成：223 pass、2 nonzero-exit、3 upstream-failure。相对此前 `build/recoverable-fs-full` 的 221/4/3，`pthread_robust_detach` 静态/动态新增通过，没有已有通过项回退。本次内核增加同 MM 非 PI robust-list 注册、退出清理和成功 exec 生命周期。
 
 | 范围 | Linux | BoarOS |
 |---|---:|---:|
-| 顶层案例 | 228 项满足契约 | 221 项退出/完整输出双侧一致；4 项直接失败；3 项包装失败 |
-| libc 静态 / 动态直接 entry | 107 / 110 全通过 | 105 / 108 通过；失败为 socket、pthread_robust_detach |
-| 原 libc 静态 / 动态脚本 | 全部逐项断言通过 | 完整运行 107 / 110 项，各两项 FAIL，与直接 entry 相同 |
+| 顶层案例 | 228 项满足契约 | 223 项退出/完整输出双侧一致；2 项直接失败；3 项包装失败 |
+| libc 静态 / 动态直接 entry | 107 / 110 全通过 | 106 / 109 通过；失败均为 socket |
+| 原 libc 静态 / 动态脚本 | 全部逐项断言通过 | 完整运行 107 / 110 项，各一项 FAIL，与 socket 直接 entry 相同 |
 | 原 BusyBox 脚本 | 55/55 success | 50/55 success；df、dmesg、which ls、free、hwclock 仍失败 |
 
-包装脚本与直接 entry 重复覆盖，不能把 228 项或 7 个顶层失败当成独立缺陷数。原始 stdout/stderr、wait status、串口、逐案例 fixture 哈希及命令均在证据目录。关键身份为：BoarOS `kernel-rv` SHA-256 `2a63bfe423fd4bea069eb2ccef072e3f6864dd2da945efef158732f8acef27ae`，Linux Image `7ca338ec75e681cc68c5d946b3ae633fc0088fd78569b7847528105a9de6c8ec`，清单入口 `run.py` `4e59b9dafba47d47978e82ef221350cd0cd469162496a020c5c9ccdf12756f3f`，guest runner `024c3f5c068defdc8505dec6bf4c381d227972d7aafaea6e0f3110bc24390ca7`，suite driver `83fca2c634085c2b81db212a72ea26221de3d746d832b06d1d6051115fd7b550`，完整执行身份 `e55b2e298a6279b446f2075b7e89d51daf239c8f9b87bae9593d27edfde35e76`。QEMU 命令和每个镜像身份由同一 JSON 保存。BusyBox ELF 为 `f2cda5fcdff6d41c8a553ac658e8aa55b6a48aa40898cb123a19f7865f3773ac`，动态 loader/libc 为 `02bcde064da5bc0cb8f4368acc4a539f3c39d14e73ae30970bea04a521a51cf1`。
+包装脚本与直接 entry 重复覆盖，不能把 228 项或 5 个顶层失败当成独立缺陷数。原始 stdout/stderr、wait status、串口、逐案例 fixture 哈希及命令均在证据目录。关键身份为：BoarOS `kernel-rv` SHA-256 `2f11ef7c8612f1cdac9788881ad7850a8e3249635c247afea4bb89358519edba`，Linux Image `7ca338ec75e681cc68c5d946b3ae633fc0088fd78569b7847528105a9de6c8ec`，清单入口 `run.py` `4e59b9dafba47d47978e82ef221350cd0cd469162496a020c5c9ccdf12756f3f`，suite driver `83fca2c634085c2b81db212a72ea26221de3d746d832b06d1d6051115fd7b550`，完整执行身份 `fdd83381d85179252ee7976a5a3078dec1947d59bcd20ca2b5778419abc8f682`。QEMU 命令、每个镜像及用户 ELF 身份由同一 JSON 保存。
 
 | 直接失败（均有静态/动态版本） | 当前首个有证据的阻塞 | 对应 TODO |
 |---|---|---|
-| pthread_robust_detach | robust futex owner-died | P2a |
 | socket | socket 族与传输链 | N |
 
 `build/recoverable-metadata-focused` 另以 `--require-pass` 严格验收上述六个新增通过的 entry。`tests/program-inventory/filesystem.sh` 通过同一 `suites.run_suite()` 和未修改 BusyBox 验证 pwd、cd、指定时间 touch、文件/目录 mv 及改名后继续访问，双侧完整输出一致；manifest 与命令在 `build/recoverable-busybox-final/`。BusyBox `df` 仍失败不能解释成 statfs 未实现：独立 statvfs 与真实计数验证已通过，挂载枚举等消费者依赖继续按实际失败调查，不据命令名称补存根。
 
-`pthread_cancel_points` 直接 entry 在当前全量和聚焦复跑中通过，但旧 shm_open 取消断言异常尚无独立根因，继续保持未关闭状态。
+`pthread_cancel_points` 直接 entry 在当前全量和聚焦复跑中通过。`build/cancel-repeat-20260923/` 进一步以同一固定内核、Linux Image、用户输入和 runner 对静态/动态 entry 各重复 30 次：两侧每次均通过，逐次 `inventory.json`、stdout/stderr、wait status、QEMU 命令与身份均保留。每轮生成的 fixture 路径不同，因此逐轮 manifest/execution 哈希不同；输入和内核 SHA-256 一致。旧 shm_open 取消断言异常没有复现，也没有独立根因，继续保持未关闭状态；本次没有据未复现修改取消路径。
 
 ## P1b/P1c 聚焦验证
 
@@ -92,7 +91,8 @@ python3 tests/program-inventory/run.py --reuse-builds --suite all --output build
 | `prlimit-focused`、`recheck-cancel-sscanf` | 限额相关 entry 与取消复跑，不能据此关闭旧取消异常 |
 | `next-batch-inventory*` | 路径/信号/资源限制阶段；`final2` 为历史 `7971eedb` 全量 |
 | `p1bc-full-final3` | P1b/P1c 后历史 215/10/3 全量、身份和双侧日志 |
-| `recoverable-fs-full`、`recoverable-metadata-focused`、`recoverable-busybox-final` | 本批最终全量、六个严格 entry 及 BusyBox 组合 |
+| `recoverable-fs-full`、`recoverable-metadata-focused`、`recoverable-busybox-final` | 文件系统阶段 221/4/3 全量、六个严格 entry 及 BusyBox 组合 |
+| `robust-full-20260923`、`robust-focused-first`、`cancel-repeat-20260923` | robust 阶段 223/2/3 全量、两项真实 entry 与静态/动态取消各 30 次复跑 |
 | `p1bc-repeat` | 原 BusyBox 包装器与同步 sleep+kill 各 20 轮 |
 | `riscv/userland-run.scTdQg/static-userland.log` | stop/continue 原始失败 |
 
