@@ -10,7 +10,7 @@
 | `kernel/sched/process.c` | clone、线程组/父子树、wait、退出、回收与记账 |
 | `kernel/sched/exec.c` | 已准备映像的提交与旧资源清理 |
 | `kernel/sched/wait.c` | 全局 blocked 链、每队列 FIFO、超时和信号唤醒 |
-| `kernel/sched/futex.c` | 256 桶 WAIT/WAKE/REQUEUE、clear-child-tid 唤醒 |
+| `kernel/sched/futex.c` | 256 桶 WAIT/WAKE/REQUEUE、robust-list 退出清理、clear-child-tid 唤醒 |
 | `kernel/sched/signal.c` | 组/线程 pending、disposition、stop/continue 和重启 |
 | `arch/riscv/process.c` | clone 寄存器、FP/TLS 继承与 exec 寄存器清零 |
 | `arch/riscv/context.c`、`context_switch.S` | psABI context 和 SIE 临界区 |
@@ -20,7 +20,7 @@
 
 ## 身份与资源
 
-每个用户执行线程有独立 TID、FP/整数寄存器、signal mask、线程 pending、clear-child-tid、restart 状态、私有元数据页和独立的连续物理内核栈。组长承载 TGID、进程组、父子树、组 pending、退出通知、已回卷记账及 `RLIMIT_NOFILE`/`RLIMIT_STACK`。两项限制在组内线程间共享，普通 fork 复制，exec 保留；非组长 exec 接管组身份时一并转移。双向成员环包含组长容器；组长停止执行后仍留在环中，直到组结束或非组长 exec 接管身份。
+每个用户执行线程有独立 TID、FP/整数寄存器、signal mask、线程 pending、clear-child-tid、robust-list 注册地址、restart 状态、私有元数据页和独立的连续物理内核栈。组长承载 TGID、进程组、父子树、组 pending、退出通知、已回卷记账及 `RLIMIT_NOFILE`/`RLIMIT_STACK`。两项限制在组内线程间共享，普通 fork 复制，exec 保留；非组长 exec 接管组身份时一并转移。双向成员环包含组长容器；组长停止执行后仍留在环中，直到组结束或非组长 exec 接管身份。
 
 普通 fork 从调用线程复制 MM 的 COW 页表/VMA、fd 表、fs context 和 disposition；OFD 仍按现有语义共享。子进程挂在调用线程的组长父子树中，并记录创建者 TID。线程 clone 通过 MM/files/fs/disposition 引用共享已有对象，不复制页表或 fd 槽。首次需要共享 disposition 而父线程尚无表时，会按需分配表页。
 
@@ -40,11 +40,15 @@ vfork 共享 MM，复制 files；fs 默认复制，显式 CLONE_FS 时共享。�
 
 WAIT 在关中断内读取用户字、比较 expected、登记并阻塞。futex key 为 MM record 身份和四字节对齐地址；哈希碰撞需二次匹配，REQUEUE 保留 FIFO，返回唤醒数与迁移数之和。值不匹配为 EAGAIN，非法地址为 EFAULT，非法参数为 EINVAL，超时为 ETIMEDOUT。无超时 WAIT 的 signal 唤醒走 generic restart：用户 handler 没有 SA_RESTART 时返回 EINTR，带 SA_RESTART 时 sigreturn 后重新执行并再次比较用户字。带超时 WAIT 使用独立 tagged restart state 保存用户地址、expected、operation 和首次调用计算的 monotonic absolute deadline；用户 handler 无论 flags 均看到 EINTR，没有 handler 的 stop/continue 路径经 restart_syscall 继续剩余 deadline。未支持命令为 ENOSYS。用户访问层状态损坏不能转换成普通用户错误。
 
-没有 MAP_SHARED 时，非 private futex 仅保证同一 MM 内语义，不提供跨 MM 共享 backing key。PI/bitset/wake-op 和 robust-list 回收尚未实现。
+`set_robust_list` 只核对 RV64 链头长度 24 字节并保存线程私有地址，允许空指针注销，不在注册时预读用户链。`get_robust_list` 支持当前线程及存活目标 TID；当前所有用户线程均为 root，查询其他线程按这一固定凭据模型可访问，输出先写长度再写指针。普通 clone/fork 不继承注册，失败 exec 保留，成功 exec 清理旧链并重置。链头与节点是可变用户内存，退出时才有界读取，不作为内核对象持有引用。
+
+退出清理在原 MM 与原 TID 有效时同步完成，早于 clear-child-tid 和资源释放。成功的非组长 exec 在身份接管前保存旧 TID，切换到已验证新页表后、退休旧 MM 前清理；可返回的 exec 失败不清理旧链。遍历最多 2048 项，下一链接先于字更新读取；pending 项不会因已在链上而处理两次。owner 等于退出 TID 时通过可处理缺页/COW 的 32 位原子比较交换保留 WAITERS 并置 OWNER_DIED，必要时唤醒一个 waiter；pending 的非 owner 解锁窗口按 Linux 规则补唤醒。坏地址、错位、超长链和内存不足只结束该次尽力清理，不把用户错误升级为内核 fatal 或保留无 owner 的重试状态。
+
+没有 MAP_SHARED 时，非 private futex 仅保证同一 MM 内语义，不提供跨 MM 共享 backing key。PI 标记项不按普通 robust 字更新；PI/bitset/wake-op、跨 MM 共享 futex 仍未实现。单 hart 的 SIE 临界区不构成 SMP 锁协议。
 
 ## 退出与 exec
 
-exit 只退出当前线程，exit_group 和默认致命信号结束全组。退出先执行 clear-child-tid 清零/唤醒，再释放 exec/files/fs/MM 等资源。任务仍在自己的内核栈上时不释放栈；切回可信 idle 栈后，先检查 canary、记录高水位并释放栈，再继续处理元数据和其他资源。
+exit 只退出当前线程，exit_group 和默认致命信号结束全组。退出先完成本线程的 robust-list 清理，再执行 clear-child-tid 清零/唤醒，最后释放 exec/files/fs/MM 等资源。任务仍在自己的内核栈上时不释放栈；切回可信 idle 栈后，先检查 canary、记录高水位并释放栈，再继续处理元数据和其他资源。
 
 组长先退出进入 GROUP_DEAD，保留进程容器；普通成员资源清理成功后从组环移除并回卷时间。最后一个成员结束后，组长才成为唯一进程退出对象，向父进程产生一次 zombie/SIGCHLD。SIGCHLD 显式忽略或 NOCLDWAIT 的自动回收仍遵循信号模块契约。
 
@@ -70,4 +74,4 @@ zombie 先逻辑回收再复制 status/rusage，因此坏输出指针的 EFAULT 
 
 聚焦入口为 `make test-stack-usage`、`make test-scheduler-cases-riscv`、`make test-scheduler-riscv`、`make test-files-riscv`、`make test-signal-riscv` 和 `make test-root-init-riscv`；组合消费者复用 `make test-userland-riscv`，其中真实 pthread 探针从工作线程修改两项组限额、在主线程观察并恢复，还检查未实现资源不伪造成功。阶段收口使用 `make test-riscv`。各次实际通过范围以 README 和提交验证说明为准，不把实现路径存在等同于全部线程负载已验证。
 
-尚无 SMP、MAP_SHARED、PI futex、实时信号队列、sigaltstack、clone3、内核 robust-list 回收或 LoongArch context。固定语义依据见学习总结的 Linux commit 与 musl 归档。
+尚无 SMP、MAP_SHARED、PI futex、跨 MM 共享 futex、实时信号队列、sigaltstack、clone3 或 LoongArch context。固定语义依据见学习总结的 Linux commit 与 musl 归档。

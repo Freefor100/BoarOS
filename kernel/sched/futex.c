@@ -7,6 +7,10 @@
 
 #define FUTEX_BUCKETS 256U
 #define FUTEX_PRIVATE 128U
+#define FUTEX_WAITERS UINT32_C(0x80000000)
+#define FUTEX_OWNER_DIED UINT32_C(0x40000000)
+#define FUTEX_TID_MASK UINT32_C(0x3fffffff)
+#define ROBUST_LIST_LIMIT 2048U
 
 static struct kernel_wait_queue buckets[FUTEX_BUCKETS];
 
@@ -195,4 +199,109 @@ void kernel_futex_clear_tid(struct kernel_task *task)
     if (address == 0U || task->mm.state != KERNEL_MM_LIVE) return;
     (void)kernel_copy_to_user(&task->mm, address, &zero, sizeof(zero), &copied);
     (void)futex_wake(task->mm.record_page_address, address, 1U, 0U, 0U);
+}
+
+void kernel_futex_set_robust_list(struct kernel_task *task, uint64_t head)
+{
+    task->robust_list_head = head;
+}
+
+uint64_t kernel_futex_get_robust_list(const struct kernel_task *task)
+{
+    return task->robust_list_head;
+}
+
+static int robust_read_u64(struct kernel_mm *mm, uint64_t address,
+                           uint64_t *value)
+{
+    size_t copied = 0U;
+
+    return kernel_copy_from_user(mm, value, address, sizeof(*value),
+                                 &copied) == KERNEL_UACCESS_STATUS_OK &&
+           copied == sizeof(*value);
+}
+
+static int robust_word_address(uint64_t entry, int64_t offset,
+                               uint64_t *address)
+{
+    __int128 sum = (__int128)entry + (__int128)offset;
+
+    if (sum < 0 || sum > UINT64_MAX) return 0;
+    *address = (uint64_t)sum;
+    return (*address & 3U) == 0U &&
+           kernel_user_range_check(*address, sizeof(uint32_t)) ==
+               KERNEL_UACCESS_STATUS_OK;
+}
+
+static int robust_release_word(struct kernel_task *task, uint64_t entry,
+                               int64_t offset, uint32_t owner_tid,
+                               int pending)
+{
+    uint64_t address;
+    uint32_t value, observed;
+    size_t copied = 0U;
+
+    if (!robust_word_address(entry, offset, &address)) return 0;
+    for (unsigned attempt = 0U; attempt < 32U; attempt++) {
+        copied = 0U;
+        if (kernel_copy_from_user(&task->mm, &value, address,
+                                  sizeof(value), &copied) !=
+                KERNEL_UACCESS_STATUS_OK ||
+            copied != sizeof(value)) return 0;
+        if ((value & FUTEX_TID_MASK) != owner_tid) {
+            if (pending &&
+                ((value & FUTEX_TID_MASK) == 0U ||
+                 (value & FUTEX_WAITERS) == 0U))
+                (void)futex_wake(task->mm.record_page_address, address,
+                                 1U, 0U, 0U);
+            return 1;
+        }
+        if (kernel_user_cmpxchg_u32(
+                &task->mm, address, value,
+                (value & FUTEX_WAITERS) | FUTEX_OWNER_DIED,
+                &observed) != KERNEL_UACCESS_STATUS_OK)
+            return 0;
+        if (observed != value) continue;
+        if ((value & FUTEX_WAITERS) != 0U)
+            (void)futex_wake(task->mm.record_page_address, address,
+                             1U, 0U, 0U);
+        return 1;
+    }
+    return 0;
+}
+
+void kernel_futex_release_robust(struct kernel_task *task, int32_t owner_tid)
+{
+    uint64_t head = task->robust_list_head;
+    uint64_t next, pending, offset_bits;
+    uint64_t entry, pending_entry;
+    uint32_t limit = ROBUST_LIST_LIMIT;
+
+    task->robust_list_head = 0U;
+    if (head == 0U || task->mm.state != KERNEL_MM_LIVE ||
+        kernel_user_range_check(head, 3U * sizeof(uint64_t)) !=
+            KERNEL_UACCESS_STATUS_OK)
+        return;
+    if (!robust_read_u64(&task->mm, head, &entry) ||
+        !robust_read_u64(&task->mm, head + sizeof(uint64_t),
+                         &offset_bits) ||
+        !robust_read_u64(&task->mm, head + 2U * sizeof(uint64_t),
+                         &pending))
+        return;
+    pending_entry = pending & ~UINT64_C(1);
+    while ((entry & ~UINT64_C(1)) != head && limit-- != 0U) {
+        uint64_t current = entry & ~UINT64_C(1);
+
+        /* Read the next link before a word update can wake another thread. */
+        if (!robust_read_u64(&task->mm, current, &next)) return;
+        if (current != pending_entry && (entry & 1U) == 0U &&
+            !robust_release_word(task, current, (int64_t)offset_bits,
+                                 (uint32_t)owner_tid, 0))
+            return;
+        entry = next;
+    }
+    if (pending_entry != 0U && (pending & 1U) == 0U)
+        (void)robust_release_word(task, pending_entry,
+                                  (int64_t)offset_bits,
+                                  (uint32_t)owner_tid, 1);
 }

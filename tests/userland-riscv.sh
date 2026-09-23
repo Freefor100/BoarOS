@@ -147,7 +147,11 @@ for marker in \
     'BoarOS: real pthread shared fd checks ok' \
     'BoarOS: real pthread group limits checks ok' \
     'BoarOS: real pthread lifecycle checks ok' \
-    'BoarOS: real pthread futex ABI checks ok'; do
+    'BoarOS: real pthread futex ABI checks ok' \
+    'BoarOS: real pthread robust registration checks ok' \
+    'BoarOS: real pthread robust remote query checks ok' \
+    'BoarOS: real pthread robust mutex protocol checks ok' \
+    'BoarOS: real pthread robust raw exit checks ok'; do
     if [ "$(grep -cxF "$marker" "$pthread_output" || true)" -ne 1 ]; then
         tail -n 160 "$pthread_output" >&2
         echo "pthread userland marker missing or duplicated: $marker" >&2

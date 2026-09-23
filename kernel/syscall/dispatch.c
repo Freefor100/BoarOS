@@ -47,6 +47,8 @@
 #define LINUX_SYSCALL_EXIT 93U
 #define LINUX_SYSCALL_EXIT_GROUP 94U
 #define LINUX_SYSCALL_SET_TID_ADDRESS 96U
+#define LINUX_SYSCALL_SET_ROBUST_LIST 99U
+#define LINUX_SYSCALL_GET_ROBUST_LIST 100U
 #define LINUX_SYSCALL_UNAME 160U
 #define LINUX_SYSCALL_GETPID 172U
 #define LINUX_SYSCALL_GETPPID 173U
@@ -351,6 +353,14 @@ enum kernel_syscall_status kernel_syscall_dispatch(
             KERNEL_SYSCALL_STATUS_OK) {
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
         }
+    } else if (request->number == LINUX_SYSCALL_SET_ROBUST_LIST) {
+        if (syscall_handle_set_robust_list(caller, request, &decoded) !=
+            KERNEL_SYSCALL_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    } else if (request->number == LINUX_SYSCALL_GET_ROBUST_LIST) {
+        if (syscall_handle_get_robust_list(caller, request, &decoded) !=
+            KERNEL_SYSCALL_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     } else if (request->number == LINUX_SYSCALL_KILL ||
                request->number == LINUX_SYSCALL_TKILL ||
                request->number == LINUX_SYSCALL_TGKILL) {

@@ -179,6 +179,16 @@ enum kernel_syscall_status syscall_handle_set_tid_address(
     uint64_t address,
     struct kernel_syscall_result *decoded);
 
+enum kernel_syscall_status syscall_handle_set_robust_list(
+    struct kernel_task *caller,
+    const struct kernel_syscall_request *request,
+    struct kernel_syscall_result *decoded);
+
+enum kernel_syscall_status syscall_handle_get_robust_list(
+    struct kernel_task *caller,
+    const struct kernel_syscall_request *request,
+    struct kernel_syscall_result *decoded);
+
 enum kernel_syscall_status syscall_handle_execve(
     struct kernel_task *caller,
     const struct kernel_syscall_request *request,
