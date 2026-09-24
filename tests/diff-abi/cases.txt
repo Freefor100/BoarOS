@@ -17,6 +17,10 @@ sparse.pread
 sparse.mmap
 sparse.sigbus
 shared-anon.fork
+futex.shared-wake
+futex.shared-requeue
+futex.shared-bad-wake
+futex.shared-protected-wake
 write.0
 write.1
 write.32

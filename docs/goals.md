@@ -22,15 +22,18 @@ robust-list 阶段证据：`build/robust-focused-first/`（静态/动态真实 e
 
 P4a 共享匿名阶段证据：`build/p4a-vma-final.log`（含 fork 当下的受保护页、真正 fixed 覆盖、OOM 与回收）、`build/p4a-userland-final.log`（真实 musl）、`build/p4a-diff-final.log`（固定 Linux 同一 ELF 330 条一致）、`build/p4a-riscv-final.log` 与 `build/p4a-stack-final.log`（RISC-V 全套与栈检查）、`build/p4a-full-20260925/runs/suite.json`（228 项 223/2/3，逐项状态与 robust 阶段相同）。
 
+P4d 共享匿名 futex 证据：`build/p4d-userland-final.log`（跨 MM 唤醒、隔离、同桶/跨桶 requeue，以及两个 MM 最后映射撤销后由等待者独持对象至超时）、`build/p4d-diff-final.log`（固定 Linux 同一 ELF 334 条一致）、`build/p4d-riscv-final.log` 与 `build/p4d-stack-final.log`（RISC-V 全套与栈检查）、`build/p4d-full-20260925/runs/suite.json`（228 项 223/2/3，逐项状态与 P4a 相同）。不同 VA 别名和跨 MM 信号交错仍待验证。
+
 ### 后续推进顺序
 
 | 顺序 | 任务 | 开始条件 / 独立成果 |
 |---|---|---|
 | 已完成 | P1d cwd/dirfd、P1g rename 子集 | 共享活目录项、cwd/dirfd、普通/NOREPLACE rename 已接入日志与 orphan |
 | 已完成 | P1e 时间、P1f 统计 | utimensat/futimens、真实 statfs、原始静态/动态 entry 与 BusyBox pwd/cd/mv/touch 已通过 |
-| 已完成 | P2a 同 MM 非 PI robust-list | raw `exit`、exec、musl、差分及全量清单已验收；PI 与跨 MM key 仍后置 |
+| 已完成 | P2a 同 MM 非 PI robust-list | raw `exit`、exec、musl、差分及全量清单已验收；PI 仍后置，共享匿名跨 MM key 见 P4d |
 | 已完成 | P4a 共享匿名对象 | 专用稀疏对象、fork 双向可见、失败回滚和固定 Linux 差分已验证；不包括共享文件页或跨 MM futex |
-| 下一阶段 | P4d 跨 MM futex 设计；P0c 取消异常调查持续 | 历史取消异常本轮 30 轮/版本未复现，不能伪称已找到根因 |
+| 已接入 | P4d 共享匿名 futex | 跨 MM WAIT/WAKE/REQUEUE、共享对象 pin 和私有 MM 单调身份号已实现；不同 VA 别名与共享文件后备仍待其映射接口 |
+| 下一阶段 | P4b/P4c 共享文件页及写回；P0c 取消异常调查持续 | 历史取消异常本轮 30 轮/版本未复现，不能伪称已找到根因 |
 | 持续支线 | P5a glibc 试跑、L0/L1 第二架构入口 | 可现在固定输入或调查边界，不以全量清单全绿为前提 |
 | 后续 | P3c/e 记录锁与 SQLite、N socket、P4 文件共享、P6 SMP | 按下述具体依赖进入，不按测试名称排接口 |
 
@@ -144,7 +147,7 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 - [ ] 写出比较、登记、睡眠、超时、signal、wake、requeue、clear_tid、组终止的状态转换与唯一队列 owner；保证 compare-and-block 不可分割，无漏唤醒/重复摘链。
 - [ ] 按实际调用补 `WAIT_BITSET/WAKE_BITSET`、`CMP_REQUEUE/WAKE_OP`；每个 operation 单独核对参数宽度、bitset、比较失败、relative/absolute 和 CLOCK_REALTIME，未知/未支持操作不算完成。PI futex 后置。
 - [ ] 保持无超时 WAIT 的 SA_RESTART、带超时 WAIT 的 EINTR 与无 handler restart 保持原 deadline；测试信号在登记前后到达、超时与 wake 交错、重启前用户字变化、哈希碰撞和同桶 requeue。
-- [ ] 取消/exec/exit_group 让阻塞线程沿原栈释放 pin 的 OFD、等待节点及 MM 引用；不能直接删除仍执行的内核栈。跨 MM key 留给 P4d，单 hart 关中断仅是当前实现条件。
+- [ ] 取消/exec/exit_group 让阻塞线程沿原栈释放 pin 的 OFD、等待节点及 MM 引用；不能直接删除仍执行的内核栈。共享匿名跨 MM key 已接入 P4d，单 hart 关中断仅是当前实现条件。
 
 ### P2c 替代栈与实时信号
 
@@ -237,9 +240,9 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 
 ### P4d 共享 futex
 
-- [ ] private key 保留 MM+虚拟地址；shared key 从稳定后备身份+字偏移派生，不依赖可变化的物理页地址。处理合法对齐、坏页和不支持的后备类型。
-- [ ] WAIT 登记、WAKE 和 REQUEUE 全过程持有所需对象引用；unmap/关闭 fd/最后映射消失与等待者退出不会悬空或重用旧 key。
-- [ ] 同一对象不同 MM/VA 能正确唤醒；不同对象同 VA 不串扰；哈希冲突、同桶/跨桶 requeue、超时/信号与对象释放均验证。单 hart 先通过，跨核原子比较/登记属于 P6。
+- [x] private key 使用单调且不复用的 MM 身份号与虚拟地址；共享匿名 key 由稳定对象身份与连续字节偏移派生，不依赖物理页地址。非 private 操作解析用户映射并在坏页返回 EFAULT；共享文件映射及其 futex 仍待 P4b。
+- [x] WAIT 登记、WAKE 和 REQUEUE 持有共享匿名对象引用；unmap/最后映射消失与等待者恢复不会悬空或重用旧 key。fd 后备尚未接入。
+- [ ] 跨 fork 的独立 MM 共享唤醒、不同对象同 VA 隔离、共享→私有 requeue、同对象不同偏移的同桶/跨桶迁移，以及最后映射撤销后的等待超时已有真实 U-mode 验证；基础唤醒、requeue 和坏地址另有固定 Linux 差分。不同 VA 别名需 mremap 或共享文件映射提供构造路径，跨 MM 信号交错仍需聚焦验证。单 hart 先通过，跨核原子比较/登记属于 P6。
 
 ### P4e mremap、madvise 与 WAL
 
@@ -247,7 +250,7 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 - [ ] madvise 按真实消费者逐项增加；DONTNEED 区分 private/shared/file，已丢弃的私有内容不能再次读出，错误不能成功空返回。
 - [ ] SQLite 普通多进程 WAL 验证共享索引、锁、并发连接、异常终止和恢复；保留 P3 回滚日志基线，失败精确分到共享页/锁/同步。
 
-**验证与退出**：P4a 已由 `test-vma-riscv`、真实 U-mode 的 `tests/userland/shared_mapping.h`、`tests/diff-abi/shared_mapping.c` 验证，最终完整回归结果见提交记录。P4d 的共享 futex 聚焦测试待新增；共享文件页、共享 futex 分别收口，不合成一个笼统的“MAP_SHARED 已支持”。
+**验证与退出**：P4a 已由 `test-vma-riscv`、真实 U-mode 的 `tests/userland/shared_mapping.h`、`tests/diff-abi/shared_mapping.c` 验证。P4d 基础路径由 `tests/userland/shared_futex.h`、`tests/diff-abi/futex_shared.c` 与 `tests/riscv/mm_cases.c` 验证；不同 VA 别名及交错矩阵仍按上一条跟踪。共享文件页、共享 futex 分别收口，不合成一个笼统的“MAP_SHARED 已支持”。
 
 ## P5：glibc、exec 与单核真实工具链
 

@@ -24,7 +24,11 @@ futex 是“用户态原子变量 + 内核等待队列”，不是每次加锁�
 
 WAIT 必须原子地完成“比较用户字与 expected → 登记 waiter → 阻塞”。若比较与登记之间允许另一个线程修改用户字并执行 WAKE，唤醒可能落在空队列上，随后登记的线程就会错过通知。单 hart 的 BoarOS 通过关闭中断覆盖该区间；未来 SMP 必须在同一哈希桶锁保护下重新完成比较与登记，关本地中断并不能阻止其他 hart。
 
-每个 waiter 的身份由 MM 和四字节对齐用户地址组成，哈希仅用于定位桶，命中后仍须比较完整 key。不同 MM 的相同虚拟地址不是同一个私有 futex。当前没有共享映射，所以非 private 操作也只保证同一 MM 内语义；跨 MM 共享 futex 需要共享 backing 的身份，不能简单删掉 key 中的 MM。
+private waiter 使用单调分配且不复用的 MM 身份号和四字节对齐用户地址；共享匿名 waiter 使用后备对象身份和对象内连续字节偏移。哈希仅用于定位桶，命中后仍须比较完整 key。不同 MM 的相同虚拟地址不会串扰，fork 后不同 MM 的同一共享对象可以互相唤醒。等待者持有共享对象引用到等待调用恢复；requeue 为迁移者取得目标引用并释放源引用，避免最后一个映射消失后旧对象地址重用。单 hart 关中断串行化解析、比较与登记，SMP 仍须独立锁协议。
+
+选择单调 MM 身份号，是因为 shared→private requeue 可以把等待者迁移到发起方的私有 key；发起方 MM 若随后释放，单用 MM record 页地址会在物理页复用后让旧等待者撞上新 MM。让等待者长期持有该 MM 会延长整个地址空间生命周期。64 位单调号在耗尽时拒绝创建新 MM，不回卷复用；共享匿名对象则由现有引用保护其地址身份。此取舍只针对单 hart 生命周期，并未建立跨核同步。
+
+真实 U-mode 探针先用 fork 的独立 MM 验证共享唤醒，再覆盖共享→私有 requeue、同一对象内不同偏移迁移及不同对象同 VA 的隔离。最后由辅助线程撤销等待方的映射，发起方也撤销最后映射；等待者直到超时才释放对象引用。固定 Linux 同一 ELF 的基础共享 futex 差分记录为 334 条一致。现有用户映射接口不能把一个共享匿名对象另映射到不同 VA，所以那一类别名仍需后续 mremap 或共享文件映射验收。
 
 REQUEUE 先唤醒指定数量，再将剩余指定数量移动到另一个 key；迁移不等于唤醒。条件变量可以借此避免广播时所有线程同时抢同一 mutex。源 key 与目标 key 可能哈希到同一桶，遍历必须以原队尾为边界，不能反复处理刚追加的节点。
 
@@ -32,7 +36,7 @@ REQUEUE 先唤醒指定数量，再将剩余指定数量移动到另一个 key�
 
 robust-list 的注册只保存用户地址，不能视作链内容可信或永久可访问。固定 Linux `kernel/futex/syscalls.c` 接受长度为 24 字节的 RV64 链头并允许注销；`kernel/futex/core.c` 在退出时限制遍历 2048 项，先读下一链接，再对 owner TID 匹配的 32 位字原子设置 `OWNER_DIED`，保留 `WAITERS` 并唤醒。`list_op_pending` 还覆盖解锁与唤醒之间死亡的窗口。`kernel/fork.c` 在普通退出及成功 exec 的 MM release 前调用 futex 清理。BoarOS 非组长 exec 会采用原组长 TID，因此清理时必须使用换号前保存的 TID。上述路径均依据本页末尾固定 Linux commit。
 
-musl 1.2.5 的普通 `pthread_exit` 自己遍历 robust mutex 并处理 owner 死亡，detached 线程还会在释放用户栈前注销链头；仅让 libc-test 的 `pthread_robust_detach` 通过不能证明内核清理。真实 U-mode 测试另用原始 `SYS_exit` 绕开 libc 退出清理，检验 owner-died、pending、唤醒、坏链、PI 标记和 fork COW。该阶段的 key 仍只识别同一 MM；跨 MM 共享后备对象与 PI 协议须另行设计。
+musl 1.2.5 的普通 `pthread_exit` 自己遍历 robust mutex 并处理 owner 死亡，detached 线程还会在释放用户栈前注销链头；仅让 libc-test 的 `pthread_robust_detach` 通过不能证明内核清理。真实 U-mode 测试另用原始 `SYS_exit` 绕开 libc 退出清理，检验 owner-died、pending、唤醒、坏链、PI 标记和 fork COW。跨 MM 共享匿名 futex 的 key 已接入普通 WAIT/WAKE/REQUEUE；PI 协议与共享文件后备仍须另行设计。
 
 pthread 成功创建并不证明线程组完整：还应检查 join/TLS、竞争等待、超时和取消，以及组长先退、非组长 exec、阻塞成员终止和最终资源回收。模块验证负责 key 匹配和状态边界，真实 libc 消费者负责组合 ABI；两者不是互相替代关系。
 

@@ -22,9 +22,7 @@ static int check_shared_anonymous_mapping(void)
              MAP_SHARED | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
              -1, 0) != MAP_FAILED || errno != EEXIST ||
         pages[0] != 0x11) return 9;
-    errno = 0;
-    if (syscall(SYS_futex, pages, 1, 1, 0, 0, 0) != -1 ||
-        errno != ENOTSUP) return 7;
+    if (syscall(SYS_futex, pages, 1, 1, 0, 0, 0) != 0) return 7;
     if (pipe(child_to_parent) != 0 || pipe(parent_to_child) != 0)
         return 2;
     child = fork();

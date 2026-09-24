@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <poll.h>
+#include <pthread.h>
 #include <sys/epoll.h>
 #include <sys/mman.h>
 #include <sys/select.h>
@@ -34,6 +35,7 @@
 #include "namespace.h"
 #include "metadata.h"
 #include "shared_mapping.h"
+#include "shared_futex.h"
 
 __attribute__((section(".rodata.unlink_test_far"), aligned(4096)))
 const char unlink_far_page[8192] = "UNLINK_DEMAND_FAULT_PAGE_PAYLOAD";
@@ -2584,6 +2586,22 @@ int main(int argc, char **argv)
         return 122;
     }
     puts("BoarOS: real userland shared anonymous mapping checks ok");
+
+    int shared_futex_result = check_shared_futex_requeue();
+    if (shared_futex_result == 0)
+        shared_futex_result = check_shared_futex_wake();
+    if (shared_futex_result == 0)
+        shared_futex_result = check_shared_futex_requeue_offsets();
+    if (shared_futex_result == 0)
+        shared_futex_result = check_shared_futex_last_mapping();
+    if (shared_futex_result == 0)
+        shared_futex_result = check_shared_futex_isolation();
+    if (shared_futex_result != 0) {
+        fprintf(stderr, "shared futex failed: %d errno=%d\n",
+                shared_futex_result, errno);
+        return 123;
+    }
+    puts("BoarOS: real userland shared futex checks ok");
 
     if (check_file_timestamps() != 0) {
         return 68;

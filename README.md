@@ -16,7 +16,7 @@ BoarOS 是从零搭建、面向 OS Comp 能力建设的 C / 少量汇编内核�
 | 虚拟内存 | VMA、按需匿名页、`MAP_SHARED|MAP_ANONYMOUS` 后备对象、文件私有映射、fork COW、权限和 fixed replace、跨 MM 截断撤映射 | 无共享文件映射、`msync/mremap` 或匿名共享页 swap 回收 |
 | ELF / exec | 按需 ELF、PIE、`PT_INTERP`、初始栈/auxv、musl DSO/TLS、失败保持旧映像 | glibc 未独立验证；无 shebang、`getrandom` |
 | 进程与等待 | fork/vfork、pthread clone、线程组退出、非组长 exec、wait/zombie/reparent、FIFO 抢占、时钟与睡眠 | 合法 clone 组合仍有限；无完整会话/TTY；单 hart 关中断不等于跨核同步 |
-| futex / 信号 | WAIT/WAKE/REQUEUE、超时/重启、同 MM 非 PI robust-list 退出清理、标准信号、用户 handler、`rt_sigtimedwait` | 共享匿名地址的非 private futex 暂返回 `ENOTSUP`；无跨 MM 共享 key、PI futex、实时信号队列和 `sigaltstack` |
+| futex / 信号 | WAIT/WAKE/REQUEUE、超时/重启、跨 MM 共享匿名 futex、同 MM 非 PI robust-list 退出清理、标准信号、用户 handler、`rt_sigtimedwait` | 无共享文件 futex、PI futex、实时信号队列和 `sigaltstack`；单 hart 验证范围 |
 | 文件与事件 | fd/OFD 分离、dup/CLOEXEC、共享 offset、阻塞 pin、部分/向量/定位 I/O、pipe、poll/select/epoll；ext4 节点按设备号接入 null、zero、console | 无 devfs、完整 TTY、socket 后端或记录锁；设备 mmap 未支持 |
 | 路径与 ext4 | 共享活目录项、cwd/dirfd、普通/NOREPLACE rename、可写/只读根盘、符号链接、目录枚举、稀疏文件、显式纳秒时间、真实文件系统统计、打开后删除、私有映射截断 | 无硬链接、EXCHANGE/WHITEOUT、多挂载或完整权限 |
 | 缓存与存储 | read/write/private fault 共用文件页、inode 脏范围与定向写回、OFD 错误观察、`fsync/fdatasync/O_SYNC/O_DSYNC`；VirtIO legacy/modern flush | ordered journal/replay、持久 orphan；恢复承诺限于已验证块模型，无后台写回线程 |
@@ -25,7 +25,7 @@ BoarOS 是从零搭建、面向 OS Comp 能力建设的 C / 少量汇编内核�
 
 文件层已有部分读写、OFD 生命周期、稀疏文件与私有映射截断的语义深度；显式时间设置和真实挂载统计已接入；共享匿名映射可跨 fork 读写，完整 TTY 和共享文件映射仍有缺口。ext4 恢复已覆盖 512 字节原子写、未 flush 写丢失或重排的故障模型；实板持久性仍待独立验证。动态 musl 通过不代表完整 glibc 兼容。
 
-固定 BusyBox/libc-test 的最新全量记录为 `build/p4a-full-20260925`：228 个顶层案例全部完成，223 项双侧一致、2 个直接 entry 退出不符、3 个包装脚本断言失败；与 robust 阶段逐项状态一致，无旧通过项回退。直接失败仍是 socket 静态/动态。BusyBox 原脚本为 50/55 success，另有独立 pwd/cd/mv/touch 组合双侧通过。包装脚本与 entry 有重叠，清单完成不等于全部兼容。证据与复现见[程序清单](docs/learning/user-program-inventory.md)。
+固定 BusyBox/libc-test 的最新全量记录为 `build/p4d-full-20260925`：228 个顶层案例全部完成，223 项双侧一致、2 个直接 entry 退出不符、3 个包装脚本断言失败；与 P4a 阶段逐项状态一致，无旧通过项回退。直接失败仍是 socket 静态/动态。BusyBox 原脚本为 50/55 success，另有独立 pwd/cd/mv/touch 组合双侧通过。包装脚本与 entry 有重叠，清单完成不等于全部兼容。证据与复现见[程序清单](docs/learning/user-program-inventory.md)。
 
 ## 构建与验证
 
@@ -49,7 +49,7 @@ make test-references
 
 ## 近期工作与文档
 
-[TODO 与阶段依赖](docs/goals.md)集中维护下一步、阻塞与验收：块同步、逐 inode 写回、journal/replay、cwd/dirfd/rename、时间与统计、同 MM 非 PI robust-list 及共享匿名对象已落地；历史取消异常在固定输入重复运行中未复现，根因仍未确定。下一阶段先接入跨 MM futex key，再分别设计共享文件页与写回。glibc 试跑、LoongArch 最小入口和网络按各自依赖推进；SMP 先验证所有权、唤醒和 TLB 回收，再谈调度策略与性能。
+[TODO 与阶段依赖](docs/goals.md)集中维护下一步、阻塞与验收：块同步、逐 inode 写回、journal/replay、cwd/dirfd/rename、时间与统计、同 MM 非 PI robust-list、共享匿名对象及其跨 MM futex 已落地；历史取消异常在固定输入重复运行中未复现，根因仍未确定。下一阶段分别设计共享文件页与写回。glibc 试跑、LoongArch 最小入口和网络按各自依赖推进；SMP 先验证所有权、唤醒和 TLB 回收，再谈调度策略与性能。
 
 - [文档导航](docs/README.md)：模块契约与可复用学习材料。
 - [工程原则](docs/design.md)与[贡献说明](CONTRIBUTING.md)：技术取舍、验证与提交边界。

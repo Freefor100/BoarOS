@@ -43,5 +43,6 @@ void abi_namespace_cases(void);
 void abi_metadata_cases(void);
 void abi_robust_cases(void);
 void abi_shared_mapping_cases(void);
+void abi_futex_shared_cases(void);
 void abi_limit_exec_probe(void) __attribute__((noreturn));
 #endif
