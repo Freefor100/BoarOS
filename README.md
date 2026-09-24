@@ -25,7 +25,7 @@ BoarOS 是从零搭建、面向 OS Comp 能力建设的 C / 少量汇编内核�
 
 文件层已有部分读写、OFD 生命周期、稀疏文件与私有映射截断的语义深度；显式时间设置和真实挂载统计已接入；共享匿名映射可跨 fork 读写，完整 TTY 和共享文件映射仍有缺口。ext4 恢复已覆盖 512 字节原子写、未 flush 写丢失或重排的故障模型；实板持久性仍待独立验证。动态 musl 通过不代表完整 glibc 兼容。
 
-固定 BusyBox/libc-test 的最新全量记录为 `build/p4d-full-20260925`：228 个顶层案例全部完成，223 项双侧一致、2 个直接 entry 退出不符、3 个包装脚本断言失败；与 P4a 阶段逐项状态一致，无旧通过项回退。直接失败仍是 socket 静态/动态。BusyBox 原脚本为 50/55 success，另有独立 pwd/cd/mv/touch 组合双侧通过。包装脚本与 entry 有重叠，清单完成不等于全部兼容。证据与复现见[程序清单](docs/learning/user-program-inventory.md)。
+最近一次固定 BusyBox/libc-test 全量验证（输入与身份见[程序清单](docs/learning/user-program-inventory.md)）：228 个顶层案例全部完成，223 项双侧一致、2 个直接 entry 退出不符、3 个包装脚本断言失败；与 P4a 阶段逐项状态一致，无旧通过项回退。直接失败仍是 socket 静态/动态。BusyBox 原脚本为 50/55 success，另有独立 pwd/cd/mv/touch 组合双侧通过。包装脚本与 entry 有重叠，清单完成不等于全部兼容。
 
 ## 构建与验证
 
@@ -46,6 +46,8 @@ make test-references
 ```
 
 聚焦测试只在对应[模块文档](docs/README.md)维护。`make run-riscv` 不附根盘，启动后停留 timer-idle，需人工退出；`make debug-riscv` 以 `-S -s` 等待 GDB。完整比赛 Harness 当前因缺少 `kernel-la` 等能力阻塞，不算已通过。
+
+`build/` 是可清理的本地产物目录。完整程序清单默认只保留失败案例磁盘、每轮基础 fixture、结果 JSON 和日志；历史通过案例的磁盘可用 `python3 tests/program-inventory/prune_images.py build` 预览并加 `--apply` 清理。需要保留新执行案例的全部磁盘以调试时给清单入口传 `--keep-pass-images`。
 
 ## 近期工作与文档
 

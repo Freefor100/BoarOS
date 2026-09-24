@@ -63,7 +63,7 @@ host 测试保护源版本拒绝、头文件身份变化、配置功能不被裁
 `libc_build.py` 的固定 libc-test，再经 `suites.run_suite()` 逐例启动两侧 QEMU。
 `--reuse-builds` 显式复用已核验的 revision 和 ELF/DSO 校验值；默认重新构建。
 `--case`、`--suite` 缩小运行集合；`--require-pass` 对本次所选集合要求每项完成且通过，未选项保持历史结果或 `not-run`。未指定 `--case` 时全量 228 项均需完成且通过。执行状态保存本次 `selection`，恢复运行可改变集合而不把未选项伪装成通过；runner 中断、环境错误、参考侧失败与未知案例仍为失败。
-`--output` 指定证据目录，默认 `build/program-inventory-full`。
+`--output` 指定证据目录，默认 `build/program-inventory-full`。默认在每个案例结果、日志、输出及其目录完成 `fsync` 后删除已通过案例的三份可重建磁盘；失败案例磁盘和 suite 基础 fixture 保留。诊断时可用 `--keep-pass-images` 保留新执行案例的全部磁盘。旧目录先用 `python3 tests/program-inventory/prune_images.py build` 预览，再加 `--apply` 清理通过案例镜像。
 
 suite identity 包含程序/驱动/内核/执行器/校验器身份、QEMU 与磁盘工具身份和超时配置。
 镜像由同一 fixture 独立复制；每例持久化结果后才继续。中断留下显式未运行项；恢复前核对完整
@@ -76,6 +76,6 @@ Linux 环境准备失败使该例成为无效参考；BoarOS 缺能力的诊断�
 
 `reports.py` 校验上游 BusyBox/libc 脚本的完整有序断言，shell 退出码不足以证明通过。
 只有参考有效且双方退出状态、完整原始输出一致才记为 `pass`。suite 的 `complete` 仅表示
-manifest 所有项目完成；清单本身不是必过测试。原始命令、日志、输出、磁盘和失败项都保留，不能因
+manifest 所有项目完成；清单本身不是必过测试。原始命令、日志、输出及失败案例磁盘保留；通过案例的磁盘可从固定输入和基础 fixture 重建。不能因
 环境或参考失败把 BoarOS 标为通过。具体固定输入及证据边界见
 [真实程序清单](../learning/user-program-inventory.md)。

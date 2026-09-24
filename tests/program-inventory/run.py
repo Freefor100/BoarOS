@@ -83,6 +83,8 @@ def main():
     parser.add_argument('--suite', choices=('all', 'busybox', 'libc'), default='all')
     parser.add_argument('--case', action='append', dest='case_ids')
     parser.add_argument('--reuse-builds', action='store_true', help='verify and reuse existing program builds')
+    parser.add_argument('--keep-pass-images', action='store_true',
+                        help='retain per-case disks even for completed passing cases')
     parser.add_argument('--build-only', action='store_true')
     parser.add_argument('--jobs', type=int, default=2)
     parser.add_argument('--timeout', type=float, default=10)
@@ -147,7 +149,8 @@ def main():
                         driver_sha256=sha(driver), boaros_sha256=sha(ROOT / 'kernel-rv'))
         result = suites.run_suite(manifest, destination / 'runs', driver, image, ROOT / 'kernel-rv',
                                  case_ids=args.case_ids, default_timeout=args.timeout,
-                                 output_validator=validate_output)
+                                 output_validator=validate_output,
+                                 keep_pass_images=args.keep_pass_images)
         metadata['status'] = 'inventoried'
         metadata['execution'] = result
         print(json.dumps(result, indent=2))

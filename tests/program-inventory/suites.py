@@ -263,9 +263,61 @@ def strict_result_passes(state, case_ids=None):
         results[case_id].get('status') == 'pass' for case_id in selected)
 
 
+def prune_pass_images(directory, result, *, dry_run=False):
+    """Discard reproducible per-case disks only after durable pass evidence."""
+    if not result.get('completed') or result.get('status') != 'pass':
+        return 0
+    directory = Path(directory)
+    case_id = result['case']['id']
+    cases_dir = directory.parent
+    suite_dir = cases_dir.parent
+    if (case_id in {'.', '..'} or not ID.fullmatch(case_id) or
+            directory.name != case_id or cases_dir.name != 'cases' or
+            directory.is_symlink() or cases_dir.is_symlink() or
+            suite_dir.is_symlink() or not directory.is_dir()):
+        raise ValueError('unsafe case image directory')
+    record = directory / 'result.json'
+    suite_record = suite_dir / 'suite.json'
+    for evidence in (record, suite_record):
+        if evidence.is_symlink() or not evidence.is_file():
+            raise ValueError('pass evidence is missing: ' + str(evidence))
+    saved = json.loads(record.read_text())
+    suite = json.loads(suite_record.read_text())
+    if (saved != result or suite.get('results', {}).get(case_id) != result):
+        raise ValueError('pass evidence does not match: ' + str(record))
+    evidence_files = [record, suite_record]
+    for name in ('case.json', 'case', 'case.debugfs',
+                 'fixture.log', 'linux.log', 'boaros.log',
+                 'linux.stdout', 'linux.stderr',
+                 'boaros.stdout', 'boaros.stderr'):
+        evidence = directory / name
+        if evidence.is_symlink() or not evidence.is_file():
+            raise ValueError('pass evidence is missing: ' + str(evidence))
+        evidence_files.append(evidence)
+    images = [directory / name for name in ('fixture.img', 'linux.img', 'boaros.img')]
+    for image in images:
+        if image.is_symlink() or (image.exists() and not image.is_file()):
+            raise ValueError('unsafe case image: ' + str(image))
+    bytes_removed = sum(image.stat().st_blocks * 512 for image in images if image.exists())
+    if not dry_run:
+        for path in (*evidence_files, directory, cases_dir, suite_dir):
+            flags = os.O_RDONLY | os.O_NOFOLLOW
+            if path.is_dir():
+                flags |= os.O_DIRECTORY
+            descriptor = os.open(path, flags)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        for image in images:
+            image.unlink(missing_ok=True)
+    return bytes_removed
+
+
 def run_suite(manifest, output_dir, driver_elf, linux_kernel, boaros_kernel, *,
               case_ids=None, resume=True, default_timeout=10, boot_timeout=15,
-              qemu='qemu-system-riscv64', output_validator=None):
+              qemu='qemu-system-riscv64', output_validator=None,
+              keep_pass_images=True):
     """Run all selected cases serially; persist each result before continuing.
 
     A driver or guest failure affects its case only. No result is called pass
@@ -335,6 +387,8 @@ def run_suite(manifest, output_dir, driver_elf, linux_kernel, boaros_kernel, *,
                 continue
             previous = state['results'][case_id]
             if resume and previous.get('completed'):
+                if not keep_pass_images:
+                    prune_pass_images(destination / 'cases' / case_id, previous)
                 continue
             directory = destination / 'cases' / case_id
             directory.mkdir(parents=True, exist_ok=True)
@@ -396,6 +450,8 @@ def run_suite(manifest, output_dir, driver_elf, linux_kernel, boaros_kernel, *,
             result['completed'] = True
             save_json(directory / 'result.json', result)
             save_json(path, state)
+            if not keep_pass_images:
+                prune_pass_images(directory, result)
         state['status'] = 'complete' if all(row.get('completed') for row in state['results'].values()) else 'partial'
         state['counts'] = {status: sum(row['status'] == status for row in state['results'].values())
                            for status in sorted({row['status'] for row in state['results'].values()})}
