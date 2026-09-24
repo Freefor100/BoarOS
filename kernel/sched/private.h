@@ -24,6 +24,20 @@
 #define KERNEL_PID_LIMIT 32768U
 
 struct kernel_exec_transaction;
+struct kernel_shared_anon;
+
+enum kernel_futex_key_kind {
+    KERNEL_FUTEX_KEY_PRIVATE = 0,
+    KERNEL_FUTEX_KEY_SHARED_ANON,
+};
+
+/* A queued task owns shared_object until its wait call resumes. */
+struct kernel_futex_key {
+    uint64_t identity;
+    uint64_t offset;
+    struct kernel_shared_anon *shared_object;
+    enum kernel_futex_key_kind kind;
+};
 
 enum kernel_thread_state {
     KERNEL_THREAD_STATE_IDLE = 0,
@@ -132,8 +146,7 @@ struct kernel_task {
     int8_t group_signal_code[KERNEL_SIGNAL_COUNT];
     struct kernel_wait_node default_wait_node;
     struct kernel_task *blocked_previous;
-    uint64_t futex_mm;
-    uint64_t futex_address;
+    struct kernel_futex_key futex_key;
     uint64_t signal_pending;
     uint64_t signal_blocked;
     uint64_t signal_wait_mask;

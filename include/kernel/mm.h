@@ -108,6 +108,10 @@ enum kernel_mm_status kernel_mm_vma_lookup(
     uint64_t virtual_address,
     struct kernel_vma *vma);
 
+/* Unique for the lifetime of the kernel, including after MM page reuse. */
+enum kernel_mm_status kernel_mm_futex_id(
+    const struct kernel_mm *mm, uint64_t *identity);
+
 /* Initializes the exact Linux program break for a newly loaded image. */
 enum kernel_mm_status kernel_mm_brk_initialize(
     struct kernel_mm *mm,

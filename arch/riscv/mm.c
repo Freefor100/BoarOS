@@ -14,6 +14,9 @@
 
 #define RISCV_KERNEL_MM_RECORD_MAGIC UINT64_C(0x424f41524d4d5243)
 
+/* Single-hart allocation; zero is permanently reserved as exhaustion. */
+static uint64_t next_futex_mm_id = 1U;
+
 enum riscv_kernel_mm_record_stage {
     RISCV_KERNEL_MM_RECORD_LIVE = 0,
     RISCV_KERNEL_MM_RECORD_VMAS_CLEANUP,
@@ -53,6 +56,7 @@ struct riscv_kernel_mm_elf_source {
 
 struct riscv_kernel_mm_record {
     uint64_t magic;
+    uint64_t futex_id;
     uint32_t references;
     enum riscv_kernel_mm_record_stage stage;
     uint64_t start_brk;
@@ -130,6 +134,7 @@ static enum kernel_mm_status resolve_record(
              RISCV_KERNEL_MM_RECORD_ELF_SOURCES_CLEANUP) &&
         (*record)->space.state == RISCV_SV39_USER_SPACE_EMPTY;
     if ((*record)->magic != RISCV_KERNEL_MM_RECORD_MAGIC ||
+        (*record)->futex_id == 0U ||
         (*record)->references == 0U ||
         (*record)->stage > RISCV_KERNEL_MM_RECORD_ONLY_CLEANUP ||
         (*record)->brk_initialized > 1U ||
@@ -195,6 +200,7 @@ enum kernel_mm_status riscv_kernel_mm_create(
         space->allocator == 0) {
         return KERNEL_MM_STATUS_STATE;
     }
+    if (next_futex_mm_id == 0U) return KERNEL_MM_STATUS_NO_MEMORY;
     allocator = space->allocator;
     page_status = physical_page_allocate(allocator,
                                          &record_page_address);
@@ -216,6 +222,7 @@ enum kernel_mm_status riscv_kernel_mm_create(
     clear_page(pointer);
     record = pointer;
     record->magic = RISCV_KERNEL_MM_RECORD_MAGIC;
+    record->futex_id = next_futex_mm_id++;
     record->references = 1U;
     record->stage = RISCV_KERNEL_MM_RECORD_LIVE;
     if (riscv_sv39_user_space_move(&record->space, space) !=
@@ -742,6 +749,7 @@ enum kernel_mm_status kernel_mm_fork(
         return status == KERNEL_MM_STATUS_OK ? KERNEL_MM_STATUS_STATE
                                              : status;
     }
+    if (next_futex_mm_id == 0U) return KERNEL_MM_STATUS_NO_MEMORY;
     page_status = physical_page_allocate(source->allocator,
                                          &record_page_address);
     if (page_status == PHYSICAL_PAGE_STATUS_EMPTY) {
@@ -761,6 +769,7 @@ enum kernel_mm_status kernel_mm_fork(
     clear_page(pointer);
     destination_record = pointer;
     destination_record->magic = RISCV_KERNEL_MM_RECORD_MAGIC;
+    destination_record->futex_id = next_futex_mm_id++;
     destination_record->references = 1U;
     destination_record->stage = RISCV_KERNEL_MM_RECORD_LIVE;
     destination_record->vma_heap = source_record->vma_heap;
@@ -1191,6 +1200,23 @@ enum kernel_mm_status kernel_mm_vma_lookup(
     return status_from_vma(kernel_vma_set_lookup(record->vmas,
                                                  virtual_address,
                                                  vma));
+}
+
+enum kernel_mm_status kernel_mm_futex_id(
+    const struct kernel_mm *mm, uint64_t *identity)
+{
+    struct riscv_kernel_mm_record *record;
+    enum kernel_mm_status status;
+
+    if (mm == 0 || identity == 0) return KERNEL_MM_STATUS_INVALID_ARGUMENT;
+    if (mm->state != KERNEL_MM_LIVE) return KERNEL_MM_STATUS_STATE;
+    status = resolve_record(mm, &record);
+    if (status != KERNEL_MM_STATUS_OK ||
+        record->stage != RISCV_KERNEL_MM_RECORD_LIVE)
+        return status == KERNEL_MM_STATUS_OK ? KERNEL_MM_STATUS_STATE
+                                             : status;
+    *identity = record->futex_id;
+    return KERNEL_MM_STATUS_OK;
 }
 
 enum kernel_mm_status kernel_mm_brk_initialize(

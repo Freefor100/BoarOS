@@ -3,6 +3,7 @@
 #include <kernel/errno.h>
 #include <kernel/futex.h>
 #include <kernel/mm.h>
+#include <kernel/shared_anon.h>
 #include <kernel/time.h>
 #include <kernel/uaccess.h>
 
@@ -15,31 +16,107 @@
 
 static struct kernel_wait_queue buckets[FUTEX_BUCKETS];
 
-static int shared_anon_futex_unsupported(struct kernel_task *task,
-                                          uint64_t address,
-                                          uint32_t operation)
+static void futex_key_release(struct kernel_futex_key *key)
 {
-    struct kernel_vma vma;
-
-    return (operation & FUTEX_PRIVATE) == 0U &&
-           kernel_mm_vma_lookup(&task->mm, address, &vma) ==
-               KERNEL_MM_STATUS_OK &&
-           vma.kind == KERNEL_VMA_KIND_ANON_SHARED;
+    if (key->kind == KERNEL_FUTEX_KEY_SHARED_ANON)
+        kernel_shared_anon_release(&key->shared_object);
+    *key = (struct kernel_futex_key){0};
 }
 
-static struct kernel_wait_queue *futex_bucket(uint64_t mm, uint64_t address)
+static int64_t futex_key_acquire(
+    struct kernel_task *task, uint64_t address, uint32_t operation,
+    struct kernel_futex_key *key, enum kernel_scheduler_status *status)
 {
-    uint64_t hash = (mm >> 12) ^ (address >> 2) ^ (address >> 12);
+    struct kernel_vma vma;
+    enum kernel_mm_status mm_status;
+    enum kernel_uaccess_status access;
+    uint64_t mm_id;
+    uint32_t ignored;
+    size_t copied = 0U;
+
+    *key = (struct kernel_futex_key){0};
+    if ((operation & FUTEX_PRIVATE) == 0U) {
+        /* Linux resolves a non-private key through the user mapping, even
+         * for WAKE. This also rejects inaccessible or stale addresses. */
+        access = kernel_copy_from_user(&task->mm, &ignored, address,
+                                       sizeof(ignored), &copied);
+        if (access == KERNEL_UACCESS_STATUS_FAULT ||
+            (access == KERNEL_UACCESS_STATUS_OK && copied != sizeof(ignored)))
+            return -KERNEL_EFAULT;
+        if (access != KERNEL_UACCESS_STATUS_OK) {
+            *status = KERNEL_SCHEDULER_STATUS_INVALID_STATE;
+            return 0;
+        }
+        mm_status = kernel_mm_vma_lookup(&task->mm, address, &vma);
+        if (mm_status == KERNEL_MM_STATUS_NOT_MAPPED)
+            return -KERNEL_EFAULT;
+        if (mm_status != KERNEL_MM_STATUS_OK) {
+            *status = KERNEL_SCHEDULER_STATUS_INVALID_STATE;
+            return 0;
+        }
+        if (vma.kind == KERNEL_VMA_KIND_ANON_SHARED) {
+            struct kernel_shared_anon *object = vma.backing;
+
+            if (object == 0 ||
+                kernel_shared_anon_acquire(object) != KERNEL_SHARED_ANON_OK) {
+                *status = KERNEL_SCHEDULER_STATUS_INVALID_STATE;
+                return 0;
+            }
+            key->identity = (uint64_t)(uintptr_t)object;
+            key->offset = vma.backing_offset + address - vma.start;
+            key->shared_object = object;
+            key->kind = KERNEL_FUTEX_KEY_SHARED_ANON;
+            return 0;
+        }
+    }
+    mm_status = kernel_mm_futex_id(&task->mm, &mm_id);
+    if (mm_status != KERNEL_MM_STATUS_OK) {
+        *status = KERNEL_SCHEDULER_STATUS_INVALID_STATE;
+        return 0;
+    }
+    key->identity = mm_id;
+    key->offset = address;
+    key->kind = KERNEL_FUTEX_KEY_PRIVATE;
+    return 0;
+}
+
+static int futex_key_equal(const struct kernel_futex_key *left,
+                           const struct kernel_futex_key *right)
+{
+    return left->kind == right->kind &&
+           left->identity == right->identity &&
+           left->offset == right->offset;
+}
+
+static struct kernel_wait_queue *futex_bucket(
+    const struct kernel_futex_key *key)
+{
+    uint64_t hash = (key->identity >> 4U) ^ key->identity ^
+                    (key->offset >> 2U) ^ (key->offset >> 12U) ^
+                    (uint64_t)key->kind;
     struct kernel_wait_queue *queue = &buckets[hash & (FUTEX_BUCKETS - 1U)];
 
     if (queue->initialized == 0U) kernel_wait_queue_init(queue);
     return queue;
 }
 
-static int64_t futex_wake(uint64_t mm, uint64_t address, uint32_t count,
-                          uint32_t requeue, uint64_t address2)
+static void futex_key_requeue(struct kernel_task *task,
+                              const struct kernel_futex_key *target)
 {
-    struct kernel_wait_queue *queue = futex_bucket(mm, address);
+    struct kernel_futex_key old = task->futex_key;
+
+    if (target->kind == KERNEL_FUTEX_KEY_SHARED_ANON &&
+        kernel_shared_anon_acquire(target->shared_object) !=
+            KERNEL_SHARED_ANON_OK) __builtin_trap();
+    task->futex_key = *target;
+    futex_key_release(&old);
+}
+
+static int64_t futex_wake(const struct kernel_futex_key *source,
+                          uint32_t count, uint32_t requeue,
+                          const struct kernel_futex_key *target)
+{
+    struct kernel_wait_queue *queue = futex_bucket(source);
     struct kernel_wait_node *node = queue->head;
     struct kernel_wait_node *last = queue->tail;
     uint32_t woken = 0U, moved = 0U;
@@ -48,14 +125,14 @@ static int64_t futex_wake(uint64_t mm, uint64_t address, uint32_t count,
         struct kernel_wait_node *next = node->next;
         struct kernel_task *task = node->task;
 
-        if (task != 0 && task->futex_mm == mm && task->futex_address == address) {
+        if (task != 0 && futex_key_equal(&task->futex_key, source)) {
             if (woken < count) {
                 blocked_unlink(task);
                 scheduler_wake_task(task, KERNEL_WAIT_WOKEN);
                 woken++;
             } else {
-                scheduler_wait_requeue(task, futex_bucket(mm, address2));
-                task->futex_address = address2;
+                futex_key_requeue(task, target);
+                scheduler_wait_requeue(task, futex_bucket(target));
                 moved++;
             }
         }
@@ -70,8 +147,10 @@ static int64_t futex_wait_until(struct kernel_task *task, uint64_t address,
                                 int has_timeout, uint64_t deadline_ns,
                                 enum kernel_scheduler_status *status)
 {
+    struct kernel_futex_key key;
     uint32_t actual;
     uint64_t deadline = 0U;
+    int64_t result;
     int expired = 0;
     size_t copied = 0U;
     enum kernel_wait_wake_reason reason;
@@ -87,26 +166,32 @@ static int64_t futex_wait_until(struct kernel_task *task, uint64_t address,
             return 0;
         }
     }
+    result = futex_key_acquire(task, address, operation, &key, status);
+    if (*status != KERNEL_SCHEDULER_STATUS_OK || result != 0)
+        return result;
     access = kernel_copy_from_user(&task->mm, &actual, address,
                                    sizeof(actual), &copied);
     if (access != KERNEL_UACCESS_STATUS_OK &&
         access != KERNEL_UACCESS_STATUS_FAULT) {
+        futex_key_release(&key);
         *status = KERNEL_SCHEDULER_STATUS_INVALID_STATE;
         return 0;
     }
-    if (access != KERNEL_UACCESS_STATUS_OK || copied != sizeof(actual))
+    if (access != KERNEL_UACCESS_STATUS_OK || copied != sizeof(actual)) {
+        futex_key_release(&key);
         return -KERNEL_EFAULT;
-    if (actual != value) return -KERNEL_EAGAIN;
-    if (expired) return -KERNEL_ETIMEDOUT;
+    }
+    if (actual != value || expired) {
+        futex_key_release(&key);
+        return actual != value ? -KERNEL_EAGAIN : -KERNEL_ETIMEDOUT;
+    }
 
     /* SIE stays clear from comparison through enqueue and context switch.
      * No other user thread can change the word between these operations. */
-    task->futex_mm = task->mm.record_page_address;
-    task->futex_address = address;
+    task->futex_key = key;
     *status = kernel_scheduler_block_current(
-        futex_bucket(task->futex_mm, address), deadline, 1, &reason);
-    task->futex_mm = 0U;
-    task->futex_address = 0U;
+        futex_bucket(&key), deadline, 1, &reason);
+    futex_key_release(&task->futex_key);
     if (*status != KERNEL_SCHEDULER_STATUS_OK) return 0;
     if (reason == KERNEL_WAIT_TIMEOUT) return -KERNEL_ETIMEDOUT;
     if (reason == KERNEL_WAIT_SIGNALLED) {
@@ -124,8 +209,10 @@ int64_t kernel_futex(struct kernel_task *task, uint64_t address,
                      uint64_t timeout_or_count, uint64_t address2,
                      enum kernel_scheduler_status *status)
 {
+    struct kernel_futex_key source, target;
     uint32_t command = operation & ~FUTEX_PRIVATE;
     uint64_t deadline_ns = 0U;
+    int64_t result;
     size_t copied = 0U;
     enum kernel_uaccess_status access;
 
@@ -139,8 +226,6 @@ int64_t kernel_futex(struct kernel_task *task, uint64_t address,
     if ((address & 3U) != 0U) return -KERNEL_EINVAL;
     if (kernel_user_range_check(address, sizeof(uint32_t)) !=
         KERNEL_UACCESS_STATUS_OK) return -KERNEL_EFAULT;
-    if (shared_anon_futex_unsupported(task, address, operation))
-        return -KERNEL_ENOTSUP;
     if (command == 1U || command == 3U) {
         if ((int32_t)value < 0) return -KERNEL_EINVAL;
         if (command == 3U && ((address2 & 3U) != 0U ||
@@ -149,12 +234,23 @@ int64_t kernel_futex(struct kernel_task *task, uint64_t address,
         if (command == 3U && kernel_user_range_check(address2,
             sizeof(uint32_t)) != KERNEL_UACCESS_STATUS_OK)
             return -KERNEL_EFAULT;
-        if (command == 3U &&
-            shared_anon_futex_unsupported(task, address2, operation))
-            return -KERNEL_ENOTSUP;
-        return futex_wake(task->mm.record_page_address, address, value,
-                          command == 3U ? (uint32_t)timeout_or_count : 0U,
-                          address2);
+        result = futex_key_acquire(task, address, operation, &source, status);
+        if (*status != KERNEL_SCHEDULER_STATUS_OK || result != 0)
+            return result;
+        if (command == 3U) {
+            result = futex_key_acquire(task, address2, operation,
+                                       &target, status);
+            if (*status != KERNEL_SCHEDULER_STATUS_OK || result != 0) {
+                futex_key_release(&source);
+                return result;
+            }
+        }
+        result = futex_wake(&source, value,
+                            command == 3U ? (uint32_t)timeout_or_count : 0U,
+                            command == 3U ? &target : 0);
+        if (command == 3U) futex_key_release(&target);
+        futex_key_release(&source);
+        return result;
     }
     if (timeout_or_count != 0U) {
         struct { int64_t seconds, nanoseconds; } duration;
@@ -203,10 +299,23 @@ int64_t kernel_futex_restart_timed(
         *status = KERNEL_SCHEDULER_STATUS_INVALID_STATE;
         return 0;
     }
-    if (shared_anon_futex_unsupported(task, address, operation))
-        return -KERNEL_ENOTSUP;
     return futex_wait_until(task, address, operation, value, 1,
                             deadline_ns, status);
+}
+
+static void futex_wake_user(struct kernel_task *task, uint64_t address)
+{
+    struct kernel_futex_key key;
+    enum kernel_scheduler_status status = KERNEL_SCHEDULER_STATUS_OK;
+
+    if ((address & 3U) != 0U ||
+        kernel_user_range_check(address, sizeof(uint32_t)) !=
+            KERNEL_UACCESS_STATUS_OK ||
+        futex_key_acquire(task, address, 0U, &key, &status) != 0 ||
+        status != KERNEL_SCHEDULER_STATUS_OK)
+        return;
+    (void)futex_wake(&key, 1U, 0U, 0);
+    futex_key_release(&key);
 }
 
 void kernel_futex_clear_tid(struct kernel_task *task)
@@ -218,7 +327,7 @@ void kernel_futex_clear_tid(struct kernel_task *task)
     task->clear_tid_address = 0U;
     if (address == 0U || task->mm.state != KERNEL_MM_LIVE) return;
     (void)kernel_copy_to_user(&task->mm, address, &zero, sizeof(zero), &copied);
-    (void)futex_wake(task->mm.record_page_address, address, 1U, 0U, 0U);
+    futex_wake_user(task, address);
 }
 
 void kernel_futex_set_robust_list(struct kernel_task *task, uint64_t head)
@@ -272,8 +381,7 @@ static int robust_release_word(struct kernel_task *task, uint64_t entry,
             if (pending &&
                 ((value & FUTEX_TID_MASK) == 0U ||
                  (value & FUTEX_WAITERS) == 0U))
-                (void)futex_wake(task->mm.record_page_address, address,
-                                 1U, 0U, 0U);
+                futex_wake_user(task, address);
             return 1;
         }
         if (kernel_user_cmpxchg_u32(
@@ -283,8 +391,7 @@ static int robust_release_word(struct kernel_task *task, uint64_t entry,
             return 0;
         if (observed != value) continue;
         if ((value & FUTEX_WAITERS) != 0U)
-            (void)futex_wake(task->mm.record_page_address, address,
-                             1U, 0U, 0U);
+            futex_wake_user(task, address);
         return 1;
     }
     return 0;

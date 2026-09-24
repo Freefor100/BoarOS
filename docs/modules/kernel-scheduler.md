@@ -38,13 +38,13 @@ vfork 共享 MM，复制 files；fs 默认复制，显式 CLONE_FS 时共享。�
 
 所有 BLOCKED 任务在全局双向 blocked 链上，并可加入一个等待队列 FIFO。队列 wake-one 取队首，wake-all 唤醒全部；摘除 blocked 和 queue 成员均为 O(1)。deadline 使用原始 time ticks，0 表示无限；tick 仍扫描 blocked 链处理到期。
 
-WAIT 在关中断内读取用户字、比较 expected、登记并阻塞。futex key 为 MM record 身份和四字节对齐地址；哈希碰撞需二次匹配，REQUEUE 保留 FIFO，返回唤醒数与迁移数之和。值不匹配为 EAGAIN，非法地址为 EFAULT，非法参数为 EINVAL，超时为 ETIMEDOUT。无超时 WAIT 的 signal 唤醒走 generic restart：用户 handler 没有 SA_RESTART 时返回 EINTR，带 SA_RESTART 时 sigreturn 后重新执行并再次比较用户字。带超时 WAIT 使用独立 tagged restart state 保存用户地址、expected、operation 和首次调用计算的 monotonic absolute deadline；用户 handler 无论 flags 均看到 EINTR，没有 handler 的 stop/continue 路径经 restart_syscall 继续剩余 deadline。未支持命令为 ENOSYS。用户访问层状态损坏不能转换成普通用户错误。
+WAIT 在关中断内读取用户字、比较 expected、登记并阻塞。private key 使用不复用的 MM 身份号与四字节对齐地址；共享匿名 key 使用后备对象身份与连续字节偏移，等待者持有对象引用直到原等待调用恢复。非 private 操作先从用户映射读取并解析后备，坏页在 WAKE 中也返回 EFAULT。哈希碰撞需二次匹配，REQUEUE 将目标 key 的引用交给迁移的等待者、保留 FIFO，返回唤醒数与迁移数之和。值不匹配为 EAGAIN，非法地址为 EFAULT，非法参数为 EINVAL，超时为 ETIMEDOUT。无超时 WAIT 的 signal 唤醒走 generic restart：用户 handler 没有 SA_RESTART 时返回 EINTR，带 SA_RESTART 时 sigreturn 后重新执行并再次比较用户字。带超时 WAIT 使用独立 tagged restart state 保存用户地址、expected、operation 和首次调用计算的 monotonic absolute deadline；用户 handler 无论 flags 均看到 EINTR，没有 handler 的 stop/continue 路径经 restart_syscall 继续剩余 deadline。未支持命令为 ENOSYS。用户访问层状态损坏不能转换成普通用户错误。
 
 `set_robust_list` 只核对 RV64 链头长度 24 字节并保存线程私有地址，允许空指针注销，不在注册时预读用户链。`get_robust_list` 支持当前线程及存活目标 TID；当前所有用户线程均为 root，查询其他线程按这一固定凭据模型可访问，输出先写长度再写指针。普通 clone/fork 不继承注册，失败 exec 保留，成功 exec 清理旧链并重置。链头与节点是可变用户内存，退出时才有界读取，不作为内核对象持有引用。
 
 退出清理在原 MM 与原 TID 有效时同步完成，早于 clear-child-tid 和资源释放。成功的非组长 exec 在身份接管前保存旧 TID，切换到已验证新页表后、退休旧 MM 前清理；可返回的 exec 失败不清理旧链。遍历最多 2048 项，下一链接先于字更新读取；pending 项不会因已在链上而处理两次。owner 等于退出 TID 时通过可处理缺页/COW 的 32 位原子比较交换保留 WAITERS 并置 OWNER_DIED，必要时唤醒一个 waiter；pending 的非 owner 解锁窗口按 Linux 规则补唤醒。坏地址、错位、超长链和内存不足只结束该次尽力清理，不把用户错误升级为内核 fatal 或保留无 owner 的重试状态。
 
-共享匿名地址上的非 private futex 调用目前返回 `ENOTSUP`，不进入只有 MM+虚拟地址身份的等待队列；带 `FUTEX_PRIVATE_FLAG` 的操作仍只在同一 MM 内匹配。PI 标记项不按普通 robust 字更新；PI/bitset/wake-op、跨 MM 共享 futex 仍未实现。单 hart 的 SIE 临界区不构成 SMP 锁协议。
+带 `FUTEX_PRIVATE_FLAG` 的操作仍只在同一 MM 内匹配；未置该标记的共享匿名映射可跨 fork 的独立 MM 唤醒或 requeue。其他已支持的私有映射仍使用 MM key。共享文件映射和对应 futex 尚未实现。PI 标记项不按普通 robust 字更新；PI/bitset/wake-op 仍未实现。单 hart 的 SIE 临界区不构成 SMP 锁协议。
 
 ## 退出与 exec
 
@@ -72,6 +72,6 @@ zombie 先逻辑回收再复制 status/rusage，因此坏输出指针的 EFAULT 
 
 `make test-stack-usage` 强制重建隔离的生产对象，编译器 `-fstack-usage` 产出逐函数记录；host probe 从实际栈配置和 Trap Frame 头计算容量、guard、汇编 Frame 与余量预算，避免测试大栈或旧报告污染门禁。`tests/stack-usage.py` 拒绝超出“栈容量减 16 字节、288 字节汇编 Trap Frame、1024 字节余量”的单帧及无界动态栈；该检查不能证明完整调用链。真实 root-init、静态 musl 与动态 pthread 测试另要求已退出任务的最小实测余量至少 1024 字节，不足时必须扩大栈后重新运行。Canary 用于发现破坏，填充测量用于观察高水位；两者都不等价于未映射 guard page，也不证明未执行分支的栈界。ASID 0 的切换刷新成本、FIFO/100 Hz tick、线性 wait4 与 deadline 扫描仍存在。
 
-聚焦入口为 `make test-stack-usage`、`make test-scheduler-cases-riscv`、`make test-scheduler-riscv`、`make test-files-riscv`、`make test-signal-riscv` 和 `make test-root-init-riscv`；组合消费者复用 `make test-userland-riscv`，其中真实 pthread 探针从工作线程修改两项组限额、在主线程观察并恢复，还检查未实现资源不伪造成功。阶段收口使用 `make test-riscv`。各次实际通过范围以 README 和提交验证说明为准，不把实现路径存在等同于全部线程负载已验证。
+聚焦入口为 `make test-stack-usage`、`make test-scheduler-cases-riscv`、`make test-scheduler-riscv`、`make test-files-riscv`、`make test-signal-riscv` 和 `make test-root-init-riscv`；组合消费者复用 `make test-userland-riscv`，其中共享匿名 futex 探针覆盖跨 fork 唤醒、requeue、对象隔离、最后映射撤销与超时，真实 pthread 探针从工作线程修改两项组限额、在主线程观察并恢复，还检查未实现资源不伪造成功。`make test-diff-abi-riscv` 将基础共享 futex 操作与固定 Linux 的同一 ELF 比较。阶段收口使用 `make test-riscv`。各次实际通过范围以 README 和提交验证说明为准，不把实现路径存在等同于全部线程负载已验证。
 
-尚无 SMP、共享文件映射、PI futex、跨 MM 共享 futex、实时信号队列、sigaltstack、clone3 或 LoongArch context。固定语义依据见学习总结的 Linux commit 与 musl 归档。
+尚无 SMP、共享文件映射及其 futex、PI futex、实时信号队列、sigaltstack、clone3 或 LoongArch context。固定语义依据见学习总结的 Linux commit 与 musl 归档。

@@ -77,6 +77,7 @@ for marker in \
     'BoarOS: real userland stdio ok' \
     'BoarOS: real userland file checks ok' \
     'BoarOS: real userland shared anonymous mapping checks ok' \
+    'BoarOS: real userland shared futex checks ok' \
     'BoarOS: real userland fs rw checks ok' \
     'BoarOS: real userland namespace checks ok' \
     'BoarOS: real userland metadata checks ok' \

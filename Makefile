@@ -943,7 +943,7 @@ $(MUSL_LDSO): $(MUSL_STAMP)
 
 MUSL_GCC_FLAGS ?= $(shell $(MUSL_ROOT)/bin/musl-gcc -fno-link-libatomic -E -x c /dev/null >/dev/null 2>&1 && echo -fno-link-libatomic)
 
-$(REAL_USERLAND_RV): tests/userland/real.c tests/userland/truncate.h tests/userland/timestamps.h tests/userland/sync.h tests/userland/namespace.h tests/userland/metadata.h tests/userland/shared_mapping.h $(MUSL_STAMP)
+$(REAL_USERLAND_RV): tests/userland/real.c tests/userland/truncate.h tests/userland/timestamps.h tests/userland/sync.h tests/userland/namespace.h tests/userland/metadata.h tests/userland/shared_mapping.h tests/userland/shared_futex.h $(MUSL_STAMP)
 	@mkdir -p $(dir $@)
 	$(MUSL_ROOT)/bin/musl-gcc $(MUSL_GCC_FLAGS) -static -O2 \
 		-o $@ $<

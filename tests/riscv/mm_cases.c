@@ -205,6 +205,7 @@ static unsigned long run_shared_mm_references(void)
     struct kernel_mm_mapping mapping;
     uint64_t baseline;
     uint64_t after_create;
+    uint64_t owner_id = 0U, shared_id = 0U;
 
     if (!setup(&allocator, &kernel_table, &baseline) ||
         !create_space(&allocator, &kernel_table, &space) ||
@@ -214,7 +215,11 @@ static unsigned long run_shared_mm_references(void)
     after_create = physical_page_available(&allocator);
     if (owner.state != KERNEL_MM_LIVE ||
         space.state != RISCV_SV39_USER_SPACE_MOVED ||
+        kernel_mm_futex_id(&owner, &owner_id) != KERNEL_MM_STATUS_OK ||
+        owner_id == 0U ||
         kernel_mm_acquire(&shared, &owner) != KERNEL_MM_STATUS_OK ||
+        kernel_mm_futex_id(&shared, &shared_id) != KERNEL_MM_STATUS_OK ||
+        shared_id != owner_id ||
         shared.state != KERNEL_MM_LIVE ||
         physical_page_available(&allocator) != after_create) {
         return 2U;
@@ -253,6 +258,7 @@ static unsigned long run_forked_mm(void)
     unsigned char *parent_stack_page;
     unsigned char *child_stack_page;
     uint64_t baseline;
+    uint64_t parent_id = 0U, child_id = 0U;
 
     if (!setup(&allocator, &kernel_table, &baseline) ||
         !create_space(&allocator, &kernel_table, &space) ||
@@ -274,6 +280,10 @@ static unsigned long run_forked_mm(void)
     if (child.state != KERNEL_MM_LIVE) {
         return 7U;
     }
+    if (kernel_mm_futex_id(&parent, &parent_id) != KERNEL_MM_STATUS_OK ||
+        kernel_mm_futex_id(&child, &child_id) != KERNEL_MM_STATUS_OK ||
+        parent_id == 0U || child_id == 0U || parent_id == child_id)
+        return 12U;
     if (kernel_mm_lookup(&parent, TEST_TEXT_ADDRESS, &parent_text) !=
         KERNEL_MM_STATUS_OK) {
         return 8U;
