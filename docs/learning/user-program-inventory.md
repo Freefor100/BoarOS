@@ -2,6 +2,8 @@
 
 本文保存最近全量证据与可复用根因。待办统一在 [goals](../goals.md)，构建/执行器契约在[程序环境模块](../modules/program-environment.md)。清单生成成功只表示运行完成，不等于程序兼容或比赛成绩。
 
+`build/` 是未纳入 Git 的本地缓存，不是必须永久保留的资料库。本页的 `suite.json`、运行日志和身份哈希用于核对当时的结论；已通过案例的 `fixture.img`、`linux.img`、`boaros.img` 可以删除；新运行默认保留失败案例镜像和每轮基础 fixture，过时失败快照的镜像也可在对应日志与 JSON 核对后单独清理。旧轮次用 `python3 tests/program-inventory/prune_images.py build` 预览、加 `--apply` 执行；删除后 JSON 中的旧磁盘路径只是执行记录，不能直接打开。
+
 ## 固定输入与复现
 
 - BusyBox 1.33.1：`references/oscomp-testsuits` commit `b5ec6ef8497e1818cbdec3b54bb722f036e57972` 的原配置，保留全部 398 applet。
@@ -35,7 +37,7 @@ python3 tests/program-inventory/run.py --output build/p4d-full-20260925
 | 原 libc 静态 / 动态脚本 | 全部逐项断言通过 | 完整运行 107 / 110 项，各一项 FAIL，与 socket 直接 entry 相同 |
 | 原 BusyBox 脚本 | 55/55 success | 50/55 success；df、dmesg、which ls、free、hwclock 仍失败 |
 
-包装脚本与直接 entry 重复覆盖，不能把 228 项或 5 个顶层失败当成独立缺陷数。原始 stdout/stderr、wait status、串口、逐案例 fixture 哈希及命令均在证据目录。关键身份为：BoarOS `kernel-rv` SHA-256 `48779733d5fedb7419755e4e8244b4d2fd433832fb5dc97cd5585a0b9130b619`，Linux Image `7ca338ec75e681cc68c5d946b3ae633fc0088fd78569b7847528105a9de6c8ec`，清单入口 `run.py` `4e59b9dafba47d47978e82ef221350cd0cd469162496a020c5c9ccdf12756f3f`，suite driver `83fca2c634085c2b81db212a72ea26221de3d746d832b06d1d6051115fd7b550`。完整执行身份、QEMU 命令、每个镜像及用户 ELF 身份由同一 JSON 保存。
+包装脚本与直接 entry 重复覆盖，不能把 228 项或 5 个顶层失败当成独立缺陷数。原始 stdout/stderr、wait status、串口、逐案例 fixture 哈希及命令均在证据目录；通过案例的临时磁盘不属于需保留的证据。关键身份为：BoarOS `kernel-rv` SHA-256 `48779733d5fedb7419755e4e8244b4d2fd433832fb5dc97cd5585a0b9130b619`，Linux Image `7ca338ec75e681cc68c5d946b3ae633fc0088fd78569b7847528105a9de6c8ec`，清单入口 `run.py` `4e59b9dafba47d47978e82ef221350cd0cd469162496a020c5c9ccdf12756f3f`，suite driver `83fca2c634085c2b81db212a72ea26221de3d746d832b06d1d6051115fd7b550`。完整执行身份、QEMU 命令与用户 ELF 身份由同一 JSON 保存；镜像路径在清理后仅是历史记录。
 
 | 直接失败（均有静态/动态版本） | 当前首个有证据的阻塞 | 对应 TODO |
 |---|---|---|

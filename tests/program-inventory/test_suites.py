@@ -1,9 +1,11 @@
 """Observation integrity for isolated real-program guests."""
 import importlib.util
+import json
 from pathlib import Path
 import unittest
 import subprocess
 import tempfile
+from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location('suites', Path(__file__).with_name('suites.py'))
 suites = importlib.util.module_from_spec(spec)
@@ -96,6 +98,84 @@ class ObservationTests(unittest.TestCase):
         self.assertEqual(result['status'], 'pass')
         different = suites.parse_observation(stream(out='62'), 'sample')
         self.assertEqual(suites.compare_observations(good, different, 0)['status'], 'output-mismatch')
+
+
+class ImageRetentionTests(unittest.TestCase):
+    def test_completed_pass_prunes_only_case_images_after_evidence_is_saved(self):
+        with tempfile.TemporaryDirectory() as output:
+            suite_dir = Path(output) / 'runs'
+            case_dir = suite_dir / 'cases' / 'sample'
+            case_dir.mkdir(parents=True)
+            row = {'case': {'id': 'sample'}, 'status': 'pass', 'completed': True}
+            (case_dir / 'result.json').write_text(json.dumps(row))
+            (suite_dir / 'suite.json').write_text(json.dumps({'results': {'sample': row}}))
+            for name in ('case.json', 'case', 'case.debugfs',
+                         'fixture.log', 'linux.log', 'boaros.log',
+                         'linux.stdout', 'linux.stderr',
+                         'boaros.stdout', 'boaros.stderr'):
+                (case_dir / name).write_text('evidence')
+            for name in ('fixture.img', 'linux.img', 'boaros.img'):
+                (case_dir / name).write_bytes(b'image')
+            self.assertGreater(suites.prune_pass_images(case_dir, row, dry_run=True), 0)
+            self.assertTrue((case_dir / 'fixture.img').exists())
+            self.assertGreater(suites.prune_pass_images(case_dir, row), 0)
+            self.assertTrue((case_dir / 'result.json').exists())
+            self.assertTrue((case_dir / 'linux.log').exists())
+            self.assertFalse((case_dir / 'fixture.img').exists())
+            self.assertFalse((case_dir / 'linux.img').exists())
+            self.assertFalse((case_dir / 'boaros.img').exists())
+            self.assertEqual(suites.prune_pass_images(case_dir, row), 0)
+
+    def test_failure_or_missing_evidence_keeps_images(self):
+        with tempfile.TemporaryDirectory() as output:
+            suite_dir = Path(output) / 'runs'
+            case_dir = suite_dir / 'cases' / 'sample'
+            case_dir.mkdir(parents=True)
+            image = case_dir / 'fixture.img'
+            image.write_bytes(b'image')
+            row = {'case': {'id': 'sample'}, 'status': 'nonzero-exit',
+                   'completed': True}
+            self.assertEqual(suites.prune_pass_images(case_dir, row), 0)
+            self.assertTrue(image.exists())
+            row['status'] = 'pass'
+            (case_dir / 'result.json').write_text(json.dumps(row))
+            (suite_dir / 'suite.json').write_text(json.dumps({'results': {'sample': row}}))
+            with self.assertRaisesRegex(ValueError, 'evidence'):
+                suites.prune_pass_images(case_dir, row)
+            self.assertTrue(image.exists())
+
+    def test_rejects_dotdot_and_symlinked_cases_parent(self):
+        with tempfile.TemporaryDirectory() as output:
+            root = Path(output)
+            suite_dir = root / 'runs'
+            suite_dir.mkdir()
+            (suite_dir / 'cases').symlink_to(root / 'external', target_is_directory=True)
+            row = {'case': {'id': 'sample'}, 'status': 'pass', 'completed': True}
+            with self.assertRaisesRegex(ValueError, 'unsafe'):
+                suites.prune_pass_images(suite_dir / 'cases' / 'sample', row)
+            row['case']['id'] = '..'
+            with self.assertRaisesRegex(ValueError, 'unsafe'):
+                suites.prune_pass_images(suite_dir / 'cases' / '..', row)
+
+    def test_sync_failure_preserves_pass_images(self):
+        with tempfile.TemporaryDirectory() as output:
+            suite_dir = Path(output) / 'runs'
+            case_dir = suite_dir / 'cases' / 'sample'
+            case_dir.mkdir(parents=True)
+            row = {'case': {'id': 'sample'}, 'status': 'pass', 'completed': True}
+            (case_dir / 'result.json').write_text(json.dumps(row))
+            (suite_dir / 'suite.json').write_text(json.dumps({'results': {'sample': row}}))
+            for name in ('case.json', 'case', 'case.debugfs',
+                         'fixture.log', 'linux.log', 'boaros.log',
+                         'linux.stdout', 'linux.stderr',
+                         'boaros.stdout', 'boaros.stderr'):
+                (case_dir / name).write_text('evidence')
+            image = case_dir / 'fixture.img'
+            image.write_bytes(b'image')
+            with patch.object(suites.os, 'fsync', side_effect=OSError('sync failed')):
+                with self.assertRaisesRegex(OSError, 'sync failed'):
+                    suites.prune_pass_images(case_dir, row)
+            self.assertTrue(image.exists())
 
 
 class DriverTests(unittest.TestCase):
