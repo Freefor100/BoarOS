@@ -1107,6 +1107,10 @@ test-no-identity-riscv: $(NO_IDENTITY_TEST_KERNEL_RV)
 clean:
 	$(RM) -r -- $(BUILD_DIR) $(KERNEL_RV)
 
+.PHONY: prune-build
+prune-build:
+	python3 tests/prune-build.py --apply
+
 -include $(DEPS)
 
 .PHONY: test-allocator-release-host

@@ -106,7 +106,7 @@ make test-root-init-riscv
 
 聚焦验证：`make test-vfs-riscv test-files-riscv test-lwext4-rename-host`，组合验证为 `make test-userland-riscv test-diff-abi-riscv`。rename host 矩阵包含 1/4 KiB、linear/HTree、orphan_file/传统链、覆盖/插入/目录扩展，逐点 OOM 和断电后重复恢复及 `e2fsck -fn`；VFS 测试另覆盖改名后对象共享、活覆盖目标、删除 cwd、17 层 255 字节目录名的相对修改。
 
-本阶段验证记录：`build/namespace-host-final.log`（32 组、620 次断电/重排、3004 个分配失败点）与 `build/namespace-final-regression.log`（RISC-V 全套、真实 musl/pthread、297 条 Linux 差分、988 个函数栈界；最大单函数 1952 字节）。
+本阶段历史验证记录曾位于 `build/namespace-host-final.log`（32 组、620 次断电/重排、3004 个分配失败点）与 `build/namespace-final-regression.log`（RISC-V 全套、真实 musl/pthread、297 条 Linux 差分、988 个函数栈界；最大单函数 1952 字节）；日志已按本地构建清理策略删除。
 
 ## 显式元数据与统计
 
@@ -116,4 +116,4 @@ make test-root-init-riscv
 
 `make test-lwext4-metadata-host` 覆盖 1/4 KiB 块、128/256 字节 inode、60 个 OOM 点、写与 flush 失败的 sticky owner、可重试读失败、损坏拒绝、无关脏数据不写回、稀疏/截断/删除计数、META_BG/sparse_super2/GDT_CSUM/无 journal 和精确组边界，并运行 `e2fsck -fn`。用户层契约与固定资料见[文件模块](kernel-files.md)和[时间学习记录](../learning/file-timestamps.md)。
 
-元数据收口验证：`build/recoverable-fs-host-final.log` 的全部 host/断电矩阵通过；`build/recoverable-fs-regression-final.log` 的 RISC-V 全套、真实 musl/pthread、320 条固定 Linux 差分、1000 个函数栈界及工具自测通过。最大单函数仍为 kernel_main 的 1952 字节，assembly trap 288、保留 1024；这不是实板性能或 SMP 验证。
+元数据收口历史验证：当时 `build/recoverable-fs-host-final.log` 的全部 host/断电矩阵通过；`build/recoverable-fs-regression-final.log` 的 RISC-V 全套、真实 musl/pthread、320 条固定 Linux 差分、1000 个函数栈界及工具自测通过。日志已清理；最大单函数当时为 kernel_main 的 1952 字节，assembly trap 288、保留 1024。这不是实板性能或 SMP 验证。

@@ -38,9 +38,9 @@ Linux 7.2 UAPI 已移除 CBQ 定义，而固定 BusyBox 的 `tc` 仍引用这些
 无 smoke 回退。`environment.json` 记录源码、工具及生成头的 SHA；只有身份与头文件树
 均匹配才复用，重建旧 UAPI 时重新提取校验过的 archive。
 
-`full-busybox/` 保存 `source.tar`、原配置、`competition.config`、configure/build
-日志、产物及 `build.json`。Linux 与 BusyBox 的源码许可证仍保留在各自提取树中；
-校验后的 archive 保存在 `references/linux-uapi/linux-6.6.tar.xz`；解包源码和构建产物位于忽略的 `build/`，不复制进内核源树。
+构建期间 `full-busybox/` 保存 `source.tar`、原配置、`competition.config`、configure/build
+日志、产物及 `build.json`；清理后只保留跨轮复用的源码构建树、配置、产物和身份文件。Linux 与 BusyBox 的源码许可证仍保留在各自固定来源或构建树中；
+校验后的 archive 保存在 `references/linux-uapi/linux-6.6.tar.xz`；临时解包源码和构建产物位于忽略的 `build/`，不复制进内核源树。
 
 ## 验证
 
@@ -63,7 +63,7 @@ host 测试保护源版本拒绝、头文件身份变化、配置功能不被裁
 `libc_build.py` 的固定 libc-test，再经 `suites.run_suite()` 逐例启动两侧 QEMU。
 `--reuse-builds` 显式复用已核验的 revision 和 ELF/DSO 校验值；默认重新构建。
 `--case`、`--suite` 缩小运行集合；`--require-pass` 对本次所选集合要求每项完成且通过，未选项保持历史结果或 `not-run`。未指定 `--case` 时全量 228 项均需完成且通过。执行状态保存本次 `selection`，恢复运行可改变集合而不把未选项伪装成通过；runner 中断、环境错误、参考侧失败与未知案例仍为失败。
-`--output` 指定证据目录，默认 `build/program-inventory-full`。默认在每个案例结果、日志、输出及其目录完成 `fsync` 后删除已通过案例的三份可重建磁盘；失败案例磁盘和 suite 基础 fixture 保留。诊断时可用 `--keep-pass-images` 保留新执行案例的全部磁盘。旧目录先用 `python3 tests/program-inventory/prune_images.py build` 预览，再加 `--apply` 清理通过案例镜像。
+`--output` 指定本次核对目录，默认 `build/program-inventory-full`。运行期间默认在每个案例结果、日志、输出及其目录完成 `fsync` 后删除已通过案例的三份可重建磁盘；失败案例磁盘和 suite 基础 fixture 暂存，以便当轮诊断。诊断时可用 `--keep-pass-images` 保留新执行案例的全部磁盘。核对后用 `python3 tests/prune-build.py` 预览、`make prune-build` 清理整个一次性运行目录和旧缓存。
 
 suite identity 包含程序/驱动/内核/执行器/校验器身份、QEMU 与磁盘工具身份和超时配置。
 镜像由同一 fixture 独立复制；每例持久化结果后才继续。中断留下显式未运行项；恢复前核对完整
