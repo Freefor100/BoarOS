@@ -20,6 +20,8 @@
 
 robust-list 阶段证据：`build/robust-focused-first/`（静态/动态真实 entry）、`build/diff-abi/run/`（启用 futex 的固定 Linux 与 BoarOS 同一 ELF 329 条一致）、`build/robust-riscv-stack.log`（RISC-V 全套与栈检查）、`build/robust-full-20260923/runs/suite.json`（223 pass/2 direct/3 wrapper，无旧通过项回退）。`build/cancel-repeat-20260923/` 记录静态/动态取消 entry 各 30 次双侧通过，历史异常根因仍未确定。
 
+P4a 共享匿名阶段证据：`build/p4a-vma-final.log`（含 fork 当下的受保护页、真正 fixed 覆盖、OOM 与回收）、`build/p4a-userland-final.log`（真实 musl）、`build/p4a-diff-final.log`（固定 Linux 同一 ELF 330 条一致）、`build/p4a-riscv-final.log` 与 `build/p4a-stack-final.log`（RISC-V 全套与栈检查）、`build/p4a-full-20260925/runs/suite.json`（228 项 223/2/3，逐项状态与 robust 阶段相同）。
+
 ### 后续推进顺序
 
 | 顺序 | 任务 | 开始条件 / 独立成果 |
@@ -27,7 +29,8 @@ robust-list 阶段证据：`build/robust-focused-first/`（静态/动态真实 e
 | 已完成 | P1d cwd/dirfd、P1g rename 子集 | 共享活目录项、cwd/dirfd、普通/NOREPLACE rename 已接入日志与 orphan |
 | 已完成 | P1e 时间、P1f 统计 | utimensat/futimens、真实 statfs、原始静态/动态 entry 与 BusyBox pwd/cd/mv/touch 已通过 |
 | 已完成 | P2a 同 MM 非 PI robust-list | raw `exit`、exec、musl、差分及全量清单已验收；PI 与跨 MM key 仍后置 |
-| 下一阶段 | P4a 共享匿名与 P4d 跨 MM futex 设计；P0c 取消异常调查持续 | 历史取消异常本轮 30 轮/版本未复现，不能伪称已找到根因 |
+| 已完成 | P4a 共享匿名对象 | 专用稀疏对象、fork 双向可见、失败回滚和固定 Linux 差分已验证；不包括共享文件页或跨 MM futex |
+| 下一阶段 | P4d 跨 MM futex 设计；P0c 取消异常调查持续 | 历史取消异常本轮 30 轮/版本未复现，不能伪称已找到根因 |
 | 持续支线 | P5a glibc 试跑、L0/L1 第二架构入口 | 可现在固定输入或调查边界，不以全量清单全绿为前提 |
 | 后续 | P3c/e 记录锁与 SQLite、N socket、P4 文件共享、P6 SMP | 按下述具体依赖进入，不按测试名称排接口 |
 
@@ -39,7 +42,7 @@ P0 证据 ─┬─ P1 路径/文件/设备 ─┬─ P3 同步/锁/SQLite 回�
          ├─ P2 robust/信号/线程/资源
          └─ L LoongArch 最小入口 → 双架构与实板
 
-P4a 共享匿名可独立设计/实施
+P4a 共享匿名对象已完成，提供稳定后备身份
 P1 文件身份 + P3 写回/错误协议 → P4b/c 共享文件页与 msync
 P4 后备身份 + P2 等待协议 → P4d 跨 MM futex → SQLite 多进程 WAL
 P1–P4 按真实依赖 → P5 glibc/单核编译完整交付（试跑可提前）
@@ -210,14 +213,14 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 
 ## P4：共享后备对象、文件页与跨 MM futex
 
-**依赖与入口**：[MM](modules/kernel-mm.md)、[VMA](modules/kernel-vma.md)、[VFS](modules/vfs-ext4.md)；`include/kernel/{mm.h,vma.h,file_mapping.h}`、`mm/vma.c`、`arch/riscv/mm.c`、`fs/{page_cache.c,vfs.c}`、`kernel/syscall/memory.c`、`kernel/sched/futex.c`。拟新增 `include/kernel/vm_object.h`、`mm/vm_object.c`，是否拆分由后备路线确认；不预建通用插件框架。
+**依赖与入口**：[MM](modules/kernel-mm.md)、[VMA](modules/kernel-vma.md)、[VFS](modules/vfs-ext4.md)；`include/kernel/{mm.h,vma.h,file_mapping.h,shared_anon.h}`、`mm/{vma.c,shared_anon.c}`、`arch/riscv/mm.c`、`fs/{page_cache.c,vfs.c}`、`kernel/syscall/memory.c`、`kernel/sched/futex.c`。P4a 使用专用共享匿名对象；文件页及共享 futex 复用稳定身份所需的接口按各自契约扩展，不预建通用插件框架。
 
-### P4a 共享匿名对象（路线待确认，可先做）
+### P4a 共享匿名对象（已完成）
 
-- [ ] mmap 时建立可引用身份，即使尚无驻留物理页；fork 共享后备对象，按对象+页索引发布页。只复制现存 PTE 无法满足未来首次 fault，不是有效方案。
-- [ ] 明确 VMA 引用、offset、对象页、PTE 页引用的 owner；切分/合并/fixed replace/munmap/fork 后身份与 offset 连续，最后映射消失时页和对象完整回收。
-- [ ] 三组核心顺序各自验收：fork 前已驻留、fork 后子先缺页、fork 后父先缺页。用 pipe 同步双方读写并检查双向可见，不能只检查已经驻留的一页。
-- [ ] 覆盖 PROT_NONE/恢复、部分 unmap、替换、父/子先退出与 OOM；中途失败不发布半构造页、不遗留孤立引用，private COW 继续隔离。
+- [x] mmap 时建立可引用身份，即使尚无驻留物理页；fork 共享后备对象，按对象+页索引发布页。已驻留页保留共享 PTE 权限，私有页继续 COW。
+- [x] VMA 借用对象并保存连续 offset，MM registry 持对象引用；对象页槽与每个 PTE 分别持物理页引用。切分、合并、fixed replace、munmap 和 fork 后身份与 offset 连续，末引用回收页槽。
+- [x] fork 前已驻留、fork 后子先缺页、fork 后父先缺页均用同步握手验收双向可见；固定 Linux 差分加入同一 ELF 的三页共享案例。
+- [x] 覆盖 PROT_NONE/恢复、部分 unmap、替换、父/子先退出与 fault/PTE 分配 OOM；中途失败回滚新页槽，引用计数回到基线。
 
 ### P4b 共享文件页与权威数据源
 
@@ -244,7 +247,7 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 - [ ] madvise 按真实消费者逐项增加；DONTNEED 区分 private/shared/file，已丢弃的私有内容不能再次读出，错误不能成功空返回。
 - [ ] SQLite 普通多进程 WAL 验证共享索引、锁、并发连接、异常终止和恢复；保留 P3 回滚日志基线，失败精确分到共享页/锁/同步。
 
-**验证与退出**：`test-vma-riscv`、`test-mmap-riscv`、`test-files-riscv` 后进入 U-mode/差分；拟新增 `tests/userland/shared_mapping.c`、`tests/userland/shared_futex.c`、`tests/diff-abi/shared_mapping.c`。共享匿名、共享文件、共享 futex 三组分别收口，不合成一个笼统的“MAP_SHARED 已支持”。
+**验证与退出**：P4a 已由 `test-vma-riscv`、真实 U-mode 的 `tests/userland/shared_mapping.h`、`tests/diff-abi/shared_mapping.c` 验证，最终完整回归结果见提交记录。P4d 的共享 futex 聚焦测试待新增；共享文件页、共享 futex 分别收口，不合成一个笼统的“MAP_SHARED 已支持”。
 
 ## P5：glibc、exec 与单核真实工具链
 
@@ -412,7 +415,7 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 | 取舍 / 当前证据 | 可行候选与正确性、演进、复杂度、成本 |
 |---|---|
 | P1b VFS：原 fs context 借用单根 mount、cwd 字符串；OFD 已独立 | 已选择并完成②：最小 mount+路径对象/后端操作。路径持有 mount、inode 与父链引用，ext4 字符节点按 `rdev` 分派；共享可改名目录项与普通/NOREPLACE rename 已完成；多挂载仍留后续。 |
-| P4a 共享匿名：当前是私有 fault/COW | ① 急切分配并引用共享页，能满足 fork 可见性但改变 lazy/OOM 成本；② 引用后备对象按索引惰性发布，保留 lazy 并连接文件/shared futex，增加发布/回收协议。倾向②；shadow 链只在真实需求出现时另评估。 |
+| P4a 共享匿名 | 已选择并交付②：专用对象按索引惰性发布页，保持稀疏分配并提供稳定身份；急切分配会改变 lazy/OOM 成本。共享文件页与跨 MM futex 各自继续设计。 |
 | P3b 持久化 | 用户已选择并交付逐 inode dirty/error、定向写回和真实 flush；共享事务可提交关联元数据，不主动全量写回无关文件。 |
 | P3d 恢复 | 用户已选择本批启用并验证 journal/replay 与持久 orphan；故障模型、限制和复现命令见 VFS 模块。 |
 | P6 SMP：当前 SIE 串行化，缺远端 TLB 确认 | ① 进程态对象先用粗粒度可睡眠锁、IRQ/队列另设短锁，验证较少但并行有限；② MM/OFD/cache/队列对象锁直接演进，锁顺序/取消成本更高。先盘点消费者和睡眠边界再选，临时启动大锁有退出条件。 |

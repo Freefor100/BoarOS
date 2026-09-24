@@ -25,6 +25,7 @@ enum kernel_vma_kind {
     KERNEL_VMA_KIND_ANONYMOUS = 0,
     KERNEL_VMA_KIND_FILE_PRIVATE,
     KERNEL_VMA_KIND_ELF_PRIVATE,
+    KERNEL_VMA_KIND_ANON_SHARED,
 };
 
 enum kernel_vma_role {
@@ -41,6 +42,7 @@ enum kernel_vma_fault_policy {
     KERNEL_VMA_FAULT_DEMAND_ZERO,
     KERNEL_VMA_FAULT_FILE_PRIVATE,
     KERNEL_VMA_FAULT_ELF,
+    KERNEL_VMA_FAULT_ANON_SHARED,
 };
 
 /* A value copy; callers must not retain backing as a standalone owner. */

@@ -994,6 +994,241 @@ unsigned long run_all_vma_cases(void)
     return 0U;
 }
 
+unsigned long run_shared_anon_cases(void)
+{
+    struct physical_page_allocator allocator;
+    struct riscv_sv39_page_table kernel_table = {0};
+    struct kernel_heap heap = {0};
+    struct kernel_mm parent = {0}, child = {0};
+    struct kernel_mm_mapping mapping;
+    struct kernel_heap_statistics statistics;
+    uint64_t baseline, parent_satp, child_satp;
+    uint64_t address = UINT64_MAX, replacement = UINT64_MAX;
+    uint64_t parent_page, child_page;
+    size_t copied;
+    unsigned char value, observed;
+    uint32_t references;
+    uint32_t held_count = 0U;
+
+    if (!setup(&allocator, &kernel_table, &heap, &baseline) ||
+        !create_mm(&allocator, &kernel_table, &parent) ||
+        kernel_mm_vma_enable(&parent, &heap) != KERNEL_MM_STATUS_OK ||
+        kernel_mm_brk_initialize(&parent, VMA_TEST_HEAP_BASE,
+                                 VMA_TEST_HEAP_LIMIT) != KERNEL_MM_STATUS_OK ||
+        riscv_kernel_mm_satp(&parent, &parent_satp) != KERNEL_MM_STATUS_OK)
+        return 1U;
+    use_test_satp = 1;
+    test_satp = parent_satp;
+    if (kernel_mm_mmap_anonymous(&parent, 0U, 3U * BOAROS_PAGE_SIZE,
+                                 KERNEL_MM_READ | KERNEL_MM_WRITE,
+                                 KERNEL_MM_MAP_SHARED, &address) !=
+            KERNEL_MM_STATUS_OK ||
+        kernel_mm_lookup(&parent, address, &mapping) !=
+            KERNEL_MM_STATUS_NOT_MAPPED)
+        return 2U;
+    value = 0x21U;
+    if (kernel_copy_to_user(&parent, address, &value, 1U, &copied) !=
+            KERNEL_UACCESS_STATUS_OK || copied != 1U ||
+        kernel_mm_lookup(&parent, address, &mapping) != KERNEL_MM_STATUS_OK ||
+        (mapping.permissions & KERNEL_MM_WRITE) == 0U)
+        return 3U;
+    parent_page = mapping.physical_address & ~BOAROS_PAGE_MASK;
+    if (physical_page_reference_count(&allocator, parent_page,
+                                      &references) != PHYSICAL_PAGE_STATUS_OK ||
+        references != 2U ||
+        kernel_mm_mprotect(&parent, address, BOAROS_PAGE_SIZE, 0U) !=
+            KERNEL_MM_STATUS_OK ||
+        kernel_mm_lookup(&parent, address, &mapping) !=
+            KERNEL_MM_STATUS_NOT_MAPPED ||
+        kernel_mm_fork(&child, &parent) != KERNEL_MM_STATUS_OK ||
+        riscv_kernel_mm_satp(&child, &child_satp) != KERNEL_MM_STATUS_OK)
+        return 4U;
+    test_satp = child_satp;
+    if (kernel_mm_lookup(&child, address, &mapping) !=
+            KERNEL_MM_STATUS_NOT_MAPPED ||
+        kernel_mm_mprotect(&child, address, BOAROS_PAGE_SIZE,
+                           KERNEL_MM_READ | KERNEL_MM_WRITE) !=
+            KERNEL_MM_STATUS_OK ||
+        kernel_mm_lookup(&child, address, &mapping) != KERNEL_MM_STATUS_OK ||
+        (mapping.permissions & KERNEL_MM_WRITE) == 0U ||
+        (mapping.physical_address & ~BOAROS_PAGE_MASK) != parent_page)
+        return 4U;
+    test_satp = parent_satp;
+    if (kernel_mm_mprotect(&parent, address, BOAROS_PAGE_SIZE,
+                           KERNEL_MM_READ | KERNEL_MM_WRITE) !=
+            KERNEL_MM_STATUS_OK ||
+        kernel_mm_lookup(&parent, address, &mapping) != KERNEL_MM_STATUS_OK ||
+        (mapping.permissions & KERNEL_MM_WRITE) == 0U ||
+        (mapping.physical_address & ~BOAROS_PAGE_MASK) != parent_page)
+        return 4U;
+    test_satp = child_satp;
+    value = 0x32U;
+    if (kernel_copy_to_user(&child, address, &value, 1U, &copied) !=
+            KERNEL_UACCESS_STATUS_OK || copied != 1U)
+        return 5U;
+    value = 0x43U;
+    if (kernel_copy_to_user(&child, address + 2U * BOAROS_PAGE_SIZE,
+                            &value, 1U, &copied) != KERNEL_UACCESS_STATUS_OK ||
+        kernel_mm_lookup(&child, address + 2U * BOAROS_PAGE_SIZE,
+                         &mapping) != KERNEL_MM_STATUS_OK)
+        return 6U;
+    child_page = mapping.physical_address & ~BOAROS_PAGE_MASK;
+    test_satp = parent_satp;
+    if (kernel_copy_from_user(&parent, &observed, address, 1U, &copied) !=
+            KERNEL_UACCESS_STATUS_OK || observed != 0x32U ||
+        kernel_copy_from_user(&parent, &observed,
+                              address + 2U * BOAROS_PAGE_SIZE,
+                              1U, &copied) != KERNEL_UACCESS_STATUS_OK ||
+        observed != 0x43U ||
+        kernel_mm_lookup(&parent, address + 2U * BOAROS_PAGE_SIZE,
+                         &mapping) != KERNEL_MM_STATUS_OK ||
+        (mapping.physical_address & ~BOAROS_PAGE_MASK) != child_page)
+        return 7U;
+    value = 0x54U;
+    if (kernel_copy_to_user(&parent, address + BOAROS_PAGE_SIZE,
+                            &value, 1U, &copied) != KERNEL_UACCESS_STATUS_OK)
+        return 8U;
+    test_satp = child_satp;
+    if (kernel_mm_mprotect(&child, address + BOAROS_PAGE_SIZE,
+                           BOAROS_PAGE_SIZE, KERNEL_MM_READ) !=
+            KERNEL_MM_STATUS_OK ||
+        kernel_copy_from_user(&child, &observed,
+                              address + BOAROS_PAGE_SIZE,
+                              1U, &copied) != KERNEL_UACCESS_STATUS_OK ||
+        observed != value ||
+        kernel_mm_mprotect(&child, address, BOAROS_PAGE_SIZE, 0U) !=
+            KERNEL_MM_STATUS_OK ||
+        kernel_mm_lookup(&child, address, &mapping) !=
+            KERNEL_MM_STATUS_NOT_MAPPED ||
+        kernel_mm_mprotect(&child, address, BOAROS_PAGE_SIZE,
+                           KERNEL_MM_READ | KERNEL_MM_WRITE) !=
+            KERNEL_MM_STATUS_OK ||
+        kernel_mm_lookup(&child, address, &mapping) != KERNEL_MM_STATUS_OK ||
+        (mapping.permissions & KERNEL_MM_WRITE) == 0U ||
+        (mapping.physical_address & ~BOAROS_PAGE_MASK) != parent_page)
+        return 9U;
+    value = 0x65U;
+    if (kernel_copy_to_user(&child, address, &value, 1U, &copied) !=
+            KERNEL_UACCESS_STATUS_OK) return 10U;
+    test_satp = parent_satp;
+    if (kernel_copy_from_user(&parent, &observed, address, 1U, &copied) !=
+            KERNEL_UACCESS_STATUS_OK || observed != value ||
+        kernel_mm_mmap_anonymous(&parent, address, BOAROS_PAGE_SIZE,
+                                 KERNEL_MM_READ | KERNEL_MM_WRITE,
+                                 KERNEL_MM_MAP_FIXED | KERNEL_MM_MAP_SHARED,
+                                 &replacement) != KERNEL_MM_STATUS_OK ||
+        replacement != address ||
+        kernel_copy_from_user(&parent, &observed, address, 1U, &copied) !=
+            KERNEL_UACCESS_STATUS_OK || observed != 0U)
+        return 11U;
+    value = 0x76U;
+    if (kernel_copy_to_user(&parent, address, &value, 1U, &copied) !=
+            KERNEL_UACCESS_STATUS_OK) return 12U;
+    test_satp = child_satp;
+    if (kernel_copy_from_user(&child, &observed, address, 1U, &copied) !=
+            KERNEL_UACCESS_STATUS_OK || observed != 0x65U)
+        return 13U;
+    test_satp = parent_satp;
+    if (kernel_mm_munmap(&parent, address + BOAROS_PAGE_SIZE,
+                         2U * BOAROS_PAGE_SIZE) != KERNEL_MM_STATUS_OK)
+        return 14U;
+    test_satp = child_satp;
+    if (kernel_copy_from_user(&child, &observed, address, 1U, &copied) !=
+            KERNEL_UACCESS_STATUS_OK || observed != 0x65U)
+        return 14U;
+    test_satp = parent_satp;
+    if (kernel_mm_release(&child) != KERNEL_MM_STATUS_OK ||
+        kernel_mm_munmap(&parent, address, BOAROS_PAGE_SIZE) !=
+            KERNEL_MM_STATUS_OK)
+        return 14U;
+    if (kernel_mm_mmap_anonymous(&parent, 0U, BOAROS_PAGE_SIZE,
+                                 KERNEL_MM_READ | KERNEL_MM_WRITE,
+                                 KERNEL_MM_MAP_SHARED, &address) !=
+            KERNEL_MM_STATUS_OK)
+        return 15U;
+    while (held_count < VMA_TEST_PAGE_COUNT &&
+           physical_page_allocate(&allocator, &held_pages[held_count]) ==
+               PHYSICAL_PAGE_STATUS_OK) held_count++;
+    if (kernel_mm_resolve_user_fault(&parent, address, KERNEL_MM_WRITE) !=
+            KERNEL_MM_STATUS_NO_MEMORY ||
+        kernel_mm_lookup(&parent, address, &mapping) !=
+            KERNEL_MM_STATUS_NOT_MAPPED)
+        return 16U;
+    for (uint32_t i = 0U; i < held_count; i++)
+        if (physical_page_release(&allocator, held_pages[i]) !=
+            PHYSICAL_PAGE_STATUS_OK) return 17U;
+    if (kernel_mm_munmap(&parent, address, BOAROS_PAGE_SIZE) !=
+            KERNEL_MM_STATUS_OK) return 18U;
+    if (kernel_mm_mmap_anonymous(&parent, UINT64_C(0x800000),
+                                 (UINT64_C(1) << 21U) + BOAROS_PAGE_SIZE,
+                                 KERNEL_MM_READ | KERNEL_MM_WRITE,
+                                 KERNEL_MM_MAP_SHARED |
+                                     KERNEL_MM_MAP_FIXED_NOREPLACE,
+                                 &address) !=
+            KERNEL_MM_STATUS_OK)
+        return 21U;
+    value = 0x87U;
+    if (kernel_copy_to_user(&parent, address, &value, 1U, &copied) !=
+            KERNEL_UACCESS_STATUS_OK)
+        return 22U;
+    held_count = 0U;
+    while (physical_page_available(&allocator) > 1U &&
+           held_count < VMA_TEST_PAGE_COUNT) {
+        if (physical_page_allocate(&allocator, &held_pages[held_count]) !=
+            PHYSICAL_PAGE_STATUS_OK) return 23U;
+        held_count++;
+    }
+    if (physical_page_available(&allocator) != 1U) return 40U;
+    {
+        enum kernel_mm_status fault_status = kernel_mm_resolve_user_fault(
+            &parent, address + (UINT64_C(1) << 21U), KERNEL_MM_WRITE);
+        if (fault_status != KERNEL_MM_STATUS_NO_MEMORY)
+            return 50U + fault_status;
+    }
+    if (physical_page_available(&allocator) != 1U) return 42U;
+    if (kernel_mm_lookup(&parent, address + (UINT64_C(1) << 21U),
+                         &mapping) != KERNEL_MM_STATUS_NOT_MAPPED)
+        return 43U;
+    for (uint32_t i = 0U; i < held_count; i++)
+        if (physical_page_release(&allocator, held_pages[i]) !=
+            PHYSICAL_PAGE_STATUS_OK) return 25U;
+    if (kernel_copy_from_user(&parent, &observed,
+                              address + (UINT64_C(1) << 21U),
+                              1U, &copied) != KERNEL_UACCESS_STATUS_OK ||
+        observed != 0U ||
+        kernel_mm_munmap(&parent, address,
+                         (UINT64_C(1) << 21U) + BOAROS_PAGE_SIZE) !=
+            KERNEL_MM_STATUS_OK)
+        return 26U;
+    child = (struct kernel_mm){0};
+    if (kernel_mm_mmap_anonymous(&parent, 0U, BOAROS_PAGE_SIZE,
+                                 KERNEL_MM_READ | KERNEL_MM_WRITE,
+                                 KERNEL_MM_MAP_SHARED, &address) !=
+            KERNEL_MM_STATUS_OK ||
+        kernel_mm_fork(&child, &parent) != KERNEL_MM_STATUS_OK ||
+        riscv_kernel_mm_satp(&child, &child_satp) != KERNEL_MM_STATUS_OK)
+        return 27U;
+    use_test_satp = 0;
+    if (kernel_mm_release(&parent) != KERNEL_MM_STATUS_OK)
+        return 19U;
+    use_test_satp = 1;
+    test_satp = child_satp;
+    value = 0x98U;
+    if (kernel_copy_to_user(&child, address, &value, 1U, &copied) !=
+            KERNEL_UACCESS_STATUS_OK ||
+        kernel_copy_from_user(&child, &observed, address, 1U, &copied) !=
+            KERNEL_UACCESS_STATUS_OK || observed != value)
+        return 28U;
+    use_test_satp = 0;
+    if (kernel_mm_release(&child) != KERNEL_MM_STATUS_OK)
+        return 29U;
+    kernel_heap_get_statistics(&heap, &statistics);
+    return statistics.live_allocations == 0U &&
+                   statistics.current_pages == 0U &&
+                   physical_page_available(&allocator) == baseline
+               ? 0U : 20U;
+}
+
 static uint64_t read_cycle(void)
 {
     uint64_t cycles;

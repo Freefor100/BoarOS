@@ -1,4 +1,5 @@
 #include <kernel/heap.h>
+#include <kernel/page.h>
 #include <kernel/vma.h>
 
 #include <stddef.h>
@@ -27,17 +28,18 @@ static int vma_valid(const struct kernel_vma *vma)
 {
     if (vma == 0 || vma->start >= vma->end ||
         vma->kind < KERNEL_VMA_KIND_ANONYMOUS ||
-        vma->kind > KERNEL_VMA_KIND_ELF_PRIVATE ||
+        vma->kind > KERNEL_VMA_KIND_ANON_SHARED ||
         vma->role < KERNEL_VMA_ROLE_NONE ||
         vma->role > KERNEL_VMA_ROLE_MMAP ||
         vma->fault_policy < KERNEL_VMA_FAULT_RESIDENT_REQUIRED ||
-        vma->fault_policy > KERNEL_VMA_FAULT_ELF) {
+        vma->fault_policy > KERNEL_VMA_FAULT_ANON_SHARED) {
         return 0;
     }
     if (vma->kind == KERNEL_VMA_KIND_ANONYMOUS &&
         (vma->backing_offset != 0U || vma->backing != 0 ||
          vma->fault_policy == KERNEL_VMA_FAULT_FILE_PRIVATE ||
-         vma->fault_policy == KERNEL_VMA_FAULT_ELF)) {
+         vma->fault_policy == KERNEL_VMA_FAULT_ELF ||
+         vma->fault_policy == KERNEL_VMA_FAULT_ANON_SHARED)) {
         return 0;
     }
     if ((vma->kind == KERNEL_VMA_KIND_FILE_PRIVATE &&
@@ -47,7 +49,14 @@ static int vma_valid(const struct kernel_vma *vma)
         (vma->kind == KERNEL_VMA_KIND_ELF_PRIVATE &&
          (vma->backing == 0 ||
           vma->fault_policy != KERNEL_VMA_FAULT_ELF ||
-          vma->backing_offset > UINT64_MAX - (vma->end - vma->start)))) {
+         vma->backing_offset > UINT64_MAX - (vma->end - vma->start)))) {
+        return 0;
+    }
+    if (vma->kind == KERNEL_VMA_KIND_ANON_SHARED &&
+        (vma->backing == 0 ||
+         vma->fault_policy != KERNEL_VMA_FAULT_ANON_SHARED ||
+         (vma->backing_offset & BOAROS_PAGE_MASK) != 0U ||
+         vma->backing_offset > UINT64_MAX - (vma->end - vma->start))) {
         return 0;
     }
     return 1;

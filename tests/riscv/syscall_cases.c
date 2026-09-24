@@ -971,6 +971,15 @@ static unsigned long run_memory_mapping_cases(void)
         failures++;
     }
     request.arguments[3] = UINT64_C(0x21);
+    mmap_mm_status = KERNEL_MM_STATUS_OK;
+    if (kernel_syscall_dispatch(caller, &request, &result) !=
+            KERNEL_SYSCALL_STATUS_OK ||
+        result_changed(&result, KERNEL_SYSCALL_ACTION_RETURN,
+                       INT64_C(0x3f000)) ||
+        mmap_mm_flags != KERNEL_MM_MAP_SHARED) {
+        failures++;
+    }
+    request.arguments[3] = UINT64_C(0x1);
     if (kernel_syscall_dispatch(caller, &request, &result) !=
             KERNEL_SYSCALL_STATUS_OK ||
         result_changed(&result, KERNEL_SYSCALL_ACTION_RETURN, -95)) {

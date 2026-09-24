@@ -184,7 +184,8 @@ void abi_main(const unsigned long *initial_stack)
             abi_exit(root_identity() ? 0 : 92);
     }
     text("ABI BEGIN 1"); flush();
-    mode_cases(); sparse_cases(); partial_cases(); abi_truncate_cases();
+    mode_cases(); sparse_cases(); abi_shared_mapping_cases();
+    partial_cases(); abi_truncate_cases();
     abi_timestamp_cases(); abi_readv_cases();
     abi_link_cases();
     abi_signal_wait_cases();

@@ -91,7 +91,7 @@ direct-map/allocator/owner invariant 破坏并直接 fatal；没有可恢复 pro
 
 `riscv_sv39_user_protect_owned_range()` 原地改变已有 owner 的权限。非零权限重建同一 PPN 的 U-mode leaf；切换到 `PROT_NONE` 时使用 RSW bit 9 建立 `V=0` 的 protected PTE，并用 bit 8 继续区分 COW。protected owner 保留内容及 exclusive/COW 属性并可恢复，不能与 unmap 的瞬时 invalid PTE 混用。恢复执行权限前先执行 `FENCE.I`，任何实际 PTE 变化后执行本地全局 `SFENCE.VMA`。fork 为 active/protected owner 增加物理页引用并在父子页表保持相同 COW 关系；unmap 和 destroy 都释放自己持有的一份引用。
 
-`riscv_sv39_user_space_fork()` 使用“两阶段子构造—父提交”。它先建立完整子树、逐页 acquire 并记录需要把父可写页转成 COW 的位置；任何分配/acquire 失败只销毁子 owner，父页表保持原样。子空间全部成功后，提交阶段不再分配，只修改父 PTE、更新计数并执行全局本地 `SFENCE.VMA`。这保证普通 fork 的失败原子性，同时把页面内容复制推迟到父或子真正写入时。
+`riscv_sv39_user_space_fork()` 使用“两阶段子构造—父提交”。它先建立完整子树、逐页 acquire；MM 的 VMA 分类回调使共享匿名 leaf 保持原权限和物理身份，其他 leaf 转成 COW。任何分配/acquire 失败只销毁子 owner，父页表保持原样。子空间全部成功后，提交阶段不再分配，只修改父进程的私有 PTE、更新计数并执行全局本地 `SFENCE.VMA`。这保证普通 fork 的失败原子性，同时把私有页面内容复制推迟到父或子真正写入时。
 
 RISC-V ELF 映像构造器是当前用户映射接口的真实调用方。它先完成格式、范围、段重叠和页级 W^X 预检，再登记 source-backed VMA；完整文件页在首次 fault 时共享 page cache 并以 COW 发布，文件/BSS 边界页和纯 BSS 页按需私有分配、精确填充与清零。RW/NX 用户栈预留 Sv39 低半区顶端 8 MiB，初次只映射覆盖初始参数栈并额外向下留出 64 KiB 的后缀；其余 reserve 在真实 U-mode load/store page fault 时按 4 KiB 分配零页。预留区下方一页永久没有 VMA/PTE，作为边界 guard。
 
@@ -112,4 +112,4 @@ make test-riscv
 
 聚焦建表测试除启动 PTE、规模和失败语义外，还检查用户根高半区借用、U 页权限、零页/COW 映射、fork 父提交失败原子性、复制与末引用原地恢复、owned-range 参数失败不变、实际撤销/释放、跨页离线填充、用户地址半开区间、数值为 0 的合法用户根地址、lookup、move、活动根销毁拒绝、后序回收、OOM 回滚、`satp` 编码和失败输出不变。VMA/mmap 用例覆盖 protected COW 保持、fixed replace 和 unmap 的 PTE—fence—release 顺序；真实 U-mode mmap 还覆盖匿名和 ext4 文件私有映射、EOF/SIGBUS。非法释放由 allocator fatal-path 测试覆盖。
 
-当前未实现 1 GiB 叶子、`MAP_SHARED` 写共享、ASID 分配和 SMP TLB shootdown。按需提交用于匿名栈、`brk` heap、private-anonymous mmap 和只读普通文件的 private mapping，用户映射固定为 4 KiB；运行期改权/撤销/COW 在单 hart 的不可调度区执行，截断撤销支持非当前 MM，尚无跨 hart 同步协议。direct map 只映射 DTB 报告的第一段 RAM，不包含 MMIO，也不放宽内核 text/rodata 的别名权限。
+当前未实现 1 GiB 叶子、共享文件映射、ASID 分配和 SMP TLB shootdown。按需提交用于匿名栈、`brk` heap、私有/共享匿名 mmap 和普通文件的 private mapping，用户映射固定为 4 KiB；运行期改权/撤销/COW 在单 hart 的不可调度区执行，截断撤销支持非当前 MM，尚无跨 hart 同步协议。direct map 只映射 DTB 报告的第一段 RAM，不包含 MMIO，也不放宽内核 text/rodata 的别名权限。

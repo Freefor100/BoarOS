@@ -125,7 +125,9 @@ RISC-V 创建先分配并解析记录页，最后才把 LIVE Sv39 空间移入�
 
 ## 匿名与文件私有映射
 
-`kernel_mm_mmap_anonymous()` 当前实现 anonymous-private demand-zero 映射。非 fixed 请求优先使用空闲的页对齐 hint，否则在每个 MM 的随机 mmap ceiling 以下、栈 guard 之外 top-down 选址；`FIXED_NOREPLACE` 只检查冲突，`FIXED` 则撤销旧页和 VMA 后替换。长度向上按 4 KiB 对齐，返回地址只在成功时写入。RISC-V 的 W&&!R PTE 编码保留，因此仅写保护被规范化为 RW。
+`kernel_mm_mmap_anonymous()` 实现 private demand-zero 与 `MAP_SHARED|MAP_ANONYMOUS`。非 fixed 请求优先使用空闲的页对齐 hint，否则在每个 MM 的随机 mmap ceiling 以下、栈 guard 之外 top-down 选址；`FIXED_NOREPLACE` 只检查冲突，`FIXED` 则撤销旧页和 VMA 后替换。长度向上按 4 KiB 对齐，返回地址只在成功时写入。RISC-V 的 W&&!R PTE 编码保留，因此仅写保护被规范化为 RW。
+
+共享匿名 mmap 在提交 VMA 前建立独立对象；MM registry 对每个仍使用的对象持一份引用，VMA 只借用并保存连续字节偏移。对象以稀疏页索引保存已产生的零页，每个页槽持一个物理引用，每个 PTE 另持一个。fork 先为子 MM 取得对象引用，再克隆页表；已驻留共享页在父子保持可写共享，未驻留页由任一方按对象和索引首次发布。`PROT_NONE`/恢复保留共享属性，不借用 COW 标记。撤映射、fixed replace 与 MM 销毁在最后使用它的 VMA 消失时释放本 MM 的对象引用；对象末引用释放所有页槽。仍有对象引用时，局部撤映射不截断对象内容；首版没有 swap 回收。
 
 `kernel_mm_validate_file_private_mapping()` 复用真实映射的规范化、范围、选址和 fixed-noreplace 冲突检查，但不分配来源节点、不编辑 VMA，也不预留返回的区间；当前单 hart syscall 在该检查与真实提交之间不会调度。`kernel_mm_mmap_file_private()` 接收调用者已经 pin 的可读普通文件 OFD、页对齐文件偏移和同一组选址/权限参数。syscall 层先完成无副作用校验，使零长度、非法 fixed 地址、offset 溢出和既有映射冲突保持原 errno 优先级；校验通过后才拒绝访问模式为 `O_WRONLY` 的 OFD 并返回 `-EACCES`，同时释放本次临时 pin。该可读要求不随请求的 `PROT_*` 组合改变。成功时 MM 消耗 pin，失败时仍由调用者持有。MM 对每个不同 OFD 只建一个来源节点，并由该节点持有一份来源引用；重复 mmap 不累积历史引用，VMA backing 借用同一对象。VMA 提交后若来源已存在，只递减一个由调用者刚取得且必然不是末引用的临时 pin；新来源则直接转移 pin，因此系统调用不会出现“返回错误但映射已生效”。关闭 fd 不影响映射；fork 为子 MM 建立独立来源节点并取得一份引用。`munmap`/fixed replace 在提交 VMA 后的冷路径释放已经没有 VMA 使用的来源节点，真实 VFS/OFD 清理错误由其 owner 状态向上转交。页故障查到 VMA 后直接取得 backing，不在 fault 热路径遍历 fd 表或来源链。
 
@@ -145,11 +147,11 @@ scheduler 的 U-mode 硬件页故障和当前任务的 uaccess 都可进入该�
 
 ## fork 与 COW
 
-`kernel_mm_fork()` 先克隆所有会分配的 VMA 和文件来源 metadata，最后才调用 Sv39 两阶段 fork。子页表先取得每个 active/`PROT_NONE` 4 KiB 页的物理引用并以 COW 形态建立；全部构造成功后再把父进程原可写叶子去掉 W 并标记 COW，随后刷新父地址空间 TLB。metadata 或子页表构造失败时父 PTE 不变；父提交阶段不再分配。无效或已撤销的页不进入子地址空间，内核高半区仍只借用稳定映射。
+`kernel_mm_fork()` 先克隆所有会分配的 VMA、共享匿名对象引用和文件来源 metadata，最后才调用 Sv39 两阶段 fork。子页表先取得每个 active/`PROT_NONE` 4 KiB 页的物理引用；共享匿名页保持原权限，其他页以 COW 形态建立。全部构造成功后再把父进程私有可写叶子去掉 W 并标记 COW，随后刷新父地址空间 TLB。metadata 或子页表构造失败时父 PTE 不变；父提交阶段不再分配。无效或已撤销的页不进入子地址空间，内核高半区仍只借用稳定映射。
 
 写 fault 只接受软件明确标记的 present COW 页，不能把真正只读页误当成可写。若物理引用数大于 1，就分配并复制新页、把当前 PTE 改回 VMA 权限并释放旧引用；若只剩一个引用，则原地恢复写权限而不复制。`mprotect(PROT_NONE)` 使用不同 RSW 编码保存 exclusive/COW 属性，恢复后仍能正确决定是否复制。uaccess 写入也进入同一 resolver，因此内核代用户写内存不会绕过 COW。
 
-创建失败时，目标句柄要么仍为 EMPTY，要么仍持有尚未发布的完整 owner；分配器释放不失败，调用者不按释放错误建立重试状态。Fork 仍需遍历已提交页和构造子页表，时间与驻留页数线性，但不再在 fork 时复制每页内容或预留同量数据内存；额外数据页成本只落在之后真正写入的页。当前 clone 仍在单 hart 关中断临界区内完成 walker 和 metadata 分配，大地址空间的最坏中断延迟尚需开发板测量。SMP 时还必须用 MM 锁、原子页引用和远端 TLB shootdown 保护父提交与并发 fault/unmap。
+创建失败时，目标句柄要么仍为 EMPTY，要么仍持有尚未发布的完整 owner；分配器释放不失败，调用者不按释放错误建立重试状态。Fork 仍需遍历已提交页并构造子页表；共享页分类在子构造和父提交时对每个驻留页查询 VMA，成本为 `O(P log V)`（P 为驻留页数，V 为 VMA 数），另有 metadata 和页表遍历，但不在 fork 时复制每页内容或预留同量数据内存。额外数据页成本只落在之后真正写入的页。当前 clone 仍在单 hart 关中断临界区内完成 walker 和 metadata 分配，大地址空间的最坏中断延迟尚需开发板测量。SMP 时还必须用 MM 锁、原子页引用和远端 TLB shootdown 保护父提交与并发 fault/unmap。
 
 ## 末引用回收
 
@@ -188,9 +190,9 @@ make test-user-riscv
 make test-riscv
 ```
 
-MM 聚焦测试覆盖创建失败原子性、共享引用、移动、COW fork 的父子共享/写隔离/末引用原地恢复、`PROT_NONE` COW 属性，以及正常页表回收和物理页基线；同一 target 还运行独立 fatal kernel，注入一次页表 backing 无法解析并确认只产生一个 fatal 结果、不会返回 retry/success 路径。文件测试覆盖 cache hit/miss、write-first、尾页补零、整页越 EOF、fd 关闭后 fault、fork 后 OFD 来源和最终回收。syscall 聚焦测试验证校验错误先于不可读 OFD 的 `EACCES`，两类拒绝都释放临时 pin 且不进入 MM 提交；`test-userland-riscv` 用真实 musl mmap 覆盖零长度、非法 fixed 地址、原 fd 与 dup。`test-mmap-riscv` 与真实 ext4 `/init` 从 U-mode 完成匿名/文件私有 mmap、COW、SIGBUS、mprotect/munmap 生命周期。
+MM 聚焦测试覆盖创建失败原子性、共享引用、移动、COW fork 的父子共享/写隔离/末引用原地恢复、`PROT_NONE` COW 属性，以及正常页表回收和物理页基线；VMA 聚焦测试另覆盖共享匿名页的 fork 前驻留、双方首次 fault 顺序、权限拆分、部分撤映射、替换、退出和 OOM 回滚。同一 MM target 还运行独立 fatal kernel，注入一次页表 backing 无法解析并确认只产生一个 fatal 结果、不会返回 retry/success 路径。文件测试覆盖 cache hit/miss、write-first、尾页补零、整页越 EOF、fd 关闭后 fault、fork 后 OFD 来源和最终回收。syscall 聚焦测试验证校验错误先于不可读 OFD 的 `EACCES`，两类拒绝都释放临时 pin 且不进入 MM 提交；`test-userland-riscv` 用真实 musl mmap 覆盖匿名共享的双向可见、fd 忽略、fixed 冲突，以及原有私有 mmap。`test-mmap-riscv` 与真实 ext4 `/init` 从 U-mode 完成匿名/文件私有 mmap、COW、SIGBUS、mprotect/munmap 生命周期。
 
-当前只有 RISC-V 后端；映射仍由 Sv39/4 KiB 用户页实现。普通 fork 使用独立 MM+COW，线程 clone/vfork 共享同一 MM record；匿名映射和 ELF image 使用每 MM 的 ASLR mmap ceiling（无可信种子时确定性降级），但没有 commit accounting。栈软限制约束后续未驻留栈页的填充，已存在的 PTE 保留；新 exec 在固定容量 VMA 内按当前软限制建立初始栈。可读普通文件支持 MAP_PRIVATE，尚无 MAP_SHARED、写回或 truncate 并发；brk 尚未接入 RLIMIT_DATA。文件表和信号表不属于 MM。futex 当前以 MM 身份与用户地址为 key，共享文件映射落地前不提供跨 MM futex 语义。
+当前只有 RISC-V 后端；映射仍由 Sv39/4 KiB 用户页实现。普通 fork 使用独立 MM，私有页 COW、共享匿名页共享；线程 clone/vfork 共享同一 MM record。匿名映射和 ELF image 使用每 MM 的 ASLR mmap ceiling（无可信种子时确定性降级），但没有 commit accounting。栈软限制约束后续未驻留栈页的填充，已存在的 PTE 保留；新 exec 在固定容量 VMA 内按当前软限制建立初始栈。可读普通文件支持 MAP_PRIVATE，尚无共享文件映射或 `msync`；brk 尚未接入 RLIMIT_DATA。文件表和信号表不属于 MM。futex 当前以 MM 身份与用户地址为 key，尚无跨 MM 共享 futex 语义。
 
 ## 驻留文件映射与截断
 

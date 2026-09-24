@@ -162,15 +162,18 @@ enum riscv_sv39_status riscv_sv39_user_space_satp(
     uint64_t *satp);
 
 /*
- * Build child tables that share every owned user page with source through
- * copy-on-write.  The destination borrows the same kernel root entries as
- * source.  Parent leaves are committed to COW only after child construction;
+ * Build child tables that share owned user pages. shared_leaf identifies
+ * pages whose writes must remain shared; all other pages use copy-on-write.
+ * The destination borrows the same kernel root entries as source. Parent
+ * private leaves are committed to COW only after child construction;
  * after initialization, failure may leave destination as a LIVE owner for
  * the caller to destroy.
  */
 enum riscv_sv39_status riscv_sv39_user_space_fork(
     struct riscv_sv39_user_space *destination,
-    struct riscv_sv39_user_space *source);
+    struct riscv_sv39_user_space *source,
+    int (*shared_leaf)(void *context, uint64_t virtual_address),
+    void *context);
 
 /* Resolves only a present COW leaf; other mappings return NOT_MAPPED. */
 enum riscv_sv39_status riscv_sv39_user_resolve_cow(

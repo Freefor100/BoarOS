@@ -16,6 +16,7 @@ sparse.write
 sparse.pread
 sparse.mmap
 sparse.sigbus
+shared-anon.fork
 write.0
 write.1
 write.32

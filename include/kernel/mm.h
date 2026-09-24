@@ -17,6 +17,7 @@ struct kernel_elf64_source;
 /* Architecture-neutral placement policy used by anonymous mmap. */
 #define KERNEL_MM_MAP_FIXED (UINT32_C(1) << 0U)
 #define KERNEL_MM_MAP_FIXED_NOREPLACE (UINT32_C(1) << 1U)
+#define KERNEL_MM_MAP_SHARED (UINT32_C(1) << 2U)
 
 enum kernel_mm_status {
     KERNEL_MM_STATUS_OK = 0,

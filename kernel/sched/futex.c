@@ -2,6 +2,7 @@
 
 #include <kernel/errno.h>
 #include <kernel/futex.h>
+#include <kernel/mm.h>
 #include <kernel/time.h>
 #include <kernel/uaccess.h>
 
@@ -13,6 +14,18 @@
 #define ROBUST_LIST_LIMIT 2048U
 
 static struct kernel_wait_queue buckets[FUTEX_BUCKETS];
+
+static int shared_anon_futex_unsupported(struct kernel_task *task,
+                                          uint64_t address,
+                                          uint32_t operation)
+{
+    struct kernel_vma vma;
+
+    return (operation & FUTEX_PRIVATE) == 0U &&
+           kernel_mm_vma_lookup(&task->mm, address, &vma) ==
+               KERNEL_MM_STATUS_OK &&
+           vma.kind == KERNEL_VMA_KIND_ANON_SHARED;
+}
 
 static struct kernel_wait_queue *futex_bucket(uint64_t mm, uint64_t address)
 {
@@ -126,6 +139,8 @@ int64_t kernel_futex(struct kernel_task *task, uint64_t address,
     if ((address & 3U) != 0U) return -KERNEL_EINVAL;
     if (kernel_user_range_check(address, sizeof(uint32_t)) !=
         KERNEL_UACCESS_STATUS_OK) return -KERNEL_EFAULT;
+    if (shared_anon_futex_unsupported(task, address, operation))
+        return -KERNEL_ENOTSUP;
     if (command == 1U || command == 3U) {
         if ((int32_t)value < 0) return -KERNEL_EINVAL;
         if (command == 3U && ((address2 & 3U) != 0U ||
@@ -134,6 +149,9 @@ int64_t kernel_futex(struct kernel_task *task, uint64_t address,
         if (command == 3U && kernel_user_range_check(address2,
             sizeof(uint32_t)) != KERNEL_UACCESS_STATUS_OK)
             return -KERNEL_EFAULT;
+        if (command == 3U &&
+            shared_anon_futex_unsupported(task, address2, operation))
+            return -KERNEL_ENOTSUP;
         return futex_wake(task->mm.record_page_address, address, value,
                           command == 3U ? (uint32_t)timeout_or_count : 0U,
                           address2);
@@ -185,6 +203,8 @@ int64_t kernel_futex_restart_timed(
         *status = KERNEL_SCHEDULER_STATUS_INVALID_STATE;
         return 0;
     }
+    if (shared_anon_futex_unsupported(task, address, operation))
+        return -KERNEL_ENOTSUP;
     return futex_wait_until(task, address, operation, value, 1,
                             deadline_ns, status);
 }
