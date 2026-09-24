@@ -33,6 +33,7 @@
 #include "sync.h"
 #include "namespace.h"
 #include "metadata.h"
+#include "shared_mapping.h"
 
 __attribute__((section(".rodata.unlink_test_far"), aligned(4096)))
 const char unlink_far_page[8192] = "UNLINK_DEMAND_FAULT_PAGE_PAYLOAD";
@@ -2575,6 +2576,14 @@ int main(int argc, char **argv)
         return 9;
     }
     close(fd);
+
+    int shared_mapping_result = check_shared_anonymous_mapping();
+    if (shared_mapping_result != 0) {
+        fprintf(stderr, "shared anonymous mapping failed: %d errno=%d\n",
+                shared_mapping_result, errno);
+        return 122;
+    }
+    puts("BoarOS: real userland shared anonymous mapping checks ok");
 
     if (check_file_timestamps() != 0) {
         return 68;

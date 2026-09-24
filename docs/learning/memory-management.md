@@ -262,6 +262,8 @@ demand-zero 把未触碰的栈/heap 页物理内存和清零成本推迟到首�
 
 `mmap` 分配的是虚拟地址区间，不等于立刻分配每个物理页。anonymous-private mapping 没有文件 backing；首次读取应看到零，首次写入只影响本进程。普通地址参数只是 hint，内核可以在冲突时另选空洞；`MAP_FIXED_NOREPLACE` 要求精确地址且冲突失败，`MAP_FIXED` 则要求精确地址并破坏性替换旧映射。BoarOS 当前先尝试对齐 hint，再从每个 MM 独立的随机或无种子确定性 mmap ceiling 以下 top-down 选择空洞。`MAP_STACK` 暂不改变 VMA 增长模型，`MAP_NORESERVE` 在没有 commit accounting 时与普通匿名映射等价。
 
+共享匿名映射需要一个早于物理页存在的身份。只在 fork 时复制已有 PTE，会让 fork 后父子分别首次 fault 的页变成两个私有零页；mmap 时急切分配全部页虽能避免该问题，却破坏稀疏映射和按需分配。已选路线在 mmap 时建立专用可引用对象，fault 按对象加页索引发布稀疏页槽；VMA 的对象偏移随拆分调整，MM 对对象持引用，页槽与每个 PTE 各持物理页引用。fork 先取得对象引用再构造子页表，共享页保留原权限，私有页仍走 COW。对象仍活时局部 unmap 不截断其内容；最后引用消失才回收全部页，首版没有 swap。未来共享 futex key 可用对象身份和字节偏移，文件共享页的脏写回仍需独立设计。语义参考为本地 `references/linux/mm/mmap.c` 与 `references/linux/mm/shmem.c`，固定 Linux commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`。
+
 file-private mapping 把页对齐文件 offset 与虚拟区间对应，读页可以和 page cache 共享，写入必须通过 COW 与文件和其他映射隔离。包含 EOF 的尾页先保留有效文件字节并把页内余部补零，下一整个页才产生 `SIGBUS`。fd 是可关闭的进程槽，不能承担映射生命周期；MM 对同一 OFD 只持有一个来源引用，直到最后一个相关 VMA 被 munmap、fixed replace 或 MM 销毁；重复映射不增加历史引用，fork 子 MM 取得自己的一份。
 
 `munmap` 的 Linux 语义允许区间包含洞：已经映射的部分被撤销，原本未映射的部分不构成错误。`mprotect` 不同，它要求整个非空区间都有 VMA，遇到洞返回 `ENOMEM`。两者都可能在起止边界拆分 VMA；若先改 PTE 后才发现 descriptor 扩容失败，会出现硬件状态已经提交而逻辑状态无法提交的问题。BoarOS 因此先校验并预留确实需要的 descriptor 容量，再修改页表/TLB，最后用不分配的 commit 完成拆分、删除、改权和相邻合并。
@@ -271,11 +273,11 @@ RISC-V 叶子 PTE 的 `V=1` 才可供硬件翻译，但 `V=0` 时 RSW 两位仍�
 ```text
 active exclusive: V=1，RSW=00，PPN 和 R/W/X/U 供硬件使用
 active COW:       V=1，RSW=01，去掉 W，共享 PPN 等待写 fault
-protected excl.:  V=0，RSW=10，PPN/内容仍属于 PROT_NONE 映射
-protected COW:    V=0，RSW=11，同时保留 PROT_NONE 与共享属性
+protected non-COW: V=0，RSW=10，PPN/内容仍属于 PROT_NONE 映射；共享匿名页也使用此形态
+protected COW:     V=0，RSW=11，保留 PROT_NONE 与私有页的延迟复制属性
 ```
 
-`PROT_NONE` 使用 RSW bit 9 的 protected PTE，保留 resident 页内容和 exclusive/COW 属性；它与 unmap 的瞬时 invalid PTE 不同，后者只存在于“失效 PTE → `SFENCE.VMA` → 释放页”窗口，函数返回前会被清零。Fork 先让子页表取得所有物理引用，最后才无分配地提交父 COW PTE；失败时父权限不变。RISC-V 规范保留 W=1、R=0 的叶子编码，项目因此把仅写请求规范化为 RW。增加执行权限前还需要 `FENCE.I` 让先前数据写入对后续取指可见，改 PTE 后再 `SFENCE.VMA` 失效旧地址翻译。
+`PROT_NONE` 使用 RSW bit 9 的 protected PTE，保留 resident 页内容和是否待私有 COW 的属性；它与 unmap 的瞬时 invalid PTE 不同，后者只存在于“失效 PTE → `SFENCE.VMA` → 释放页”窗口，函数返回前会被清零。Fork 先让子页表取得所有物理引用，最后才无分配地把父进程的私有页转成 COW；失败时父权限不变。共享匿名页是否保持共享由 VMA 决定，不另占 RSW 位。RISC-V 规范保留 W=1、R=0 的叶子编码，项目因此把仅写请求规范化为 RW。增加执行权限前还需要 `FENCE.I` 让先前数据写入对后续取指可见，改 PTE 后再 `SFENCE.VMA` 失效旧地址翻译。
 
 VMA 属于 MM 而不是 task 或单张页表。fork 必须复制其逻辑布局，文件 VMA 还要求子 MM 取得独立 OFD 来源引用。最后一个 MM owner 必须按 VMA metadata、文件来源、驻留页引用/页表的顺序释放，才能避免 metadata 指向已经丢失的状态。页和堆释放遵循 fail-stop 契约；文件来源的真实 VFS/I/O 错误才由对应 owner 延后处理。
 

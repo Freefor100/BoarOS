@@ -2,6 +2,7 @@
 #include <arch/riscv/virt_uart.h>
 
 unsigned long run_all_vma_cases(void);
+unsigned long run_shared_anon_cases(void);
 unsigned long run_vma_lookup_baseline(unsigned long cycles[3]);
 
 void kernel_main(unsigned long hart_id, const void *dtb)
@@ -12,6 +13,10 @@ void kernel_main(unsigned long hart_id, const void *dtb)
     (void)hart_id;
     (void)dtb;
     result = run_all_vma_cases();
+    if (result == 0U) {
+        result = run_shared_anon_cases();
+        if (result != 0U) result += 0x500U;
+    }
     if (result == 0U) {
         result = run_vma_lookup_baseline(cycles);
         if (result != 0U) {

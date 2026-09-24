@@ -20,13 +20,13 @@ python3 tests/program-inventory/run.py --reuse-builds --require-pass --output bu
 
 ## 当前基线与阻塞
 
-2026-09-23 全量证据在 `build/robust-full-20260923/`，命令：
+2026-09-25 最新全量证据在 `build/p4a-full-20260925/`，命令：
 
 ```sh
-python3 tests/program-inventory/run.py --reuse-builds --suite all --output build/robust-full-20260923
+python3 tests/program-inventory/run.py --output build/p4a-full-20260925
 ```
 
-该目录 `runs/suite.json` 为 `status=complete`，228 项全部完成：223 pass、2 nonzero-exit、3 upstream-failure。相对此前 `build/recoverable-fs-full` 的 221/4/3，`pthread_robust_detach` 静态/动态新增通过，没有已有通过项回退。本次内核增加同 MM 非 PI robust-list 注册、退出清理和成功 exec 生命周期。
+该目录 `runs/suite.json` 为 `status=complete`，228 项全部完成：223 pass、2 nonzero-exit、3 upstream-failure。与 `build/robust-full-20260923/` 逐案例状态相同，没有已有通过项回退。本次内核增加共享匿名后备对象，未改变原清单覆盖的 socket 与包装脚本缺口。此前 robust 阶段相对 `build/recoverable-fs-full` 的 221/4/3，让 `pthread_robust_detach` 静态/动态新增通过。
 
 | 范围 | Linux | BoarOS |
 |---|---:|---:|
@@ -35,7 +35,7 @@ python3 tests/program-inventory/run.py --reuse-builds --suite all --output build
 | 原 libc 静态 / 动态脚本 | 全部逐项断言通过 | 完整运行 107 / 110 项，各一项 FAIL，与 socket 直接 entry 相同 |
 | 原 BusyBox 脚本 | 55/55 success | 50/55 success；df、dmesg、which ls、free、hwclock 仍失败 |
 
-包装脚本与直接 entry 重复覆盖，不能把 228 项或 5 个顶层失败当成独立缺陷数。原始 stdout/stderr、wait status、串口、逐案例 fixture 哈希及命令均在证据目录。关键身份为：BoarOS `kernel-rv` SHA-256 `2f11ef7c8612f1cdac9788881ad7850a8e3249635c247afea4bb89358519edba`，Linux Image `7ca338ec75e681cc68c5d946b3ae633fc0088fd78569b7847528105a9de6c8ec`，清单入口 `run.py` `4e59b9dafba47d47978e82ef221350cd0cd469162496a020c5c9ccdf12756f3f`，suite driver `83fca2c634085c2b81db212a72ea26221de3d746d832b06d1d6051115fd7b550`，完整执行身份 `fdd83381d85179252ee7976a5a3078dec1947d59bcd20ca2b5778419abc8f682`。QEMU 命令、每个镜像及用户 ELF 身份由同一 JSON 保存。
+包装脚本与直接 entry 重复覆盖，不能把 228 项或 5 个顶层失败当成独立缺陷数。原始 stdout/stderr、wait status、串口、逐案例 fixture 哈希及命令均在证据目录。关键身份为：BoarOS `kernel-rv` SHA-256 `236818c71923cb08d8835df5933daf10ad28b1289aa556b89ec1dd35bffce1c1`，Linux Image `7ca338ec75e681cc68c5d946b3ae633fc0088fd78569b7847528105a9de6c8ec`，清单入口 `run.py` `4e59b9dafba47d47978e82ef221350cd0cd469162496a020c5c9ccdf12756f3f`，suite driver `83fca2c634085c2b81db212a72ea26221de3d746d832b06d1d6051115fd7b550`。完整执行身份、QEMU 命令、每个镜像及用户 ELF 身份由同一 JSON 保存。
 
 | 直接失败（均有静态/动态版本） | 当前首个有证据的阻塞 | 对应 TODO |
 |---|---|---|
@@ -93,6 +93,7 @@ python3 tests/program-inventory/run.py --reuse-builds --suite all --output build
 | `p1bc-full-final3` | P1b/P1c 后历史 215/10/3 全量、身份和双侧日志 |
 | `recoverable-fs-full`、`recoverable-metadata-focused`、`recoverable-busybox-final` | 文件系统阶段 221/4/3 全量、六个严格 entry 及 BusyBox 组合 |
 | `robust-full-20260923`、`robust-focused-first`、`cancel-repeat-20260923` | robust 阶段 223/2/3 全量、两项真实 entry 与静态/动态取消各 30 次复跑 |
+| `p4a-full-20260925` | 共享匿名阶段 223/2/3 全量，逐案例状态与 robust 阶段相同 |
 | `p1bc-repeat` | 原 BusyBox 包装器与同步 sleep+kill 各 20 轮 |
 | `riscv/userland-run.scTdQg/static-userland.log` | stop/continue 原始失败 |
 

@@ -1703,7 +1703,8 @@ static enum riscv_sv39_status share_user_leaf(
     struct riscv_sv39_user_space *destination,
     struct riscv_sv39_user_space *source,
     uint64_t virtual_address,
-    uint64_t source_entry)
+    uint64_t source_entry,
+    int shared)
 {
     uint64_t address = entry_address(source_entry);
     uint64_t *leaf;
@@ -1716,6 +1717,19 @@ static enum riscv_sv39_status share_user_leaf(
     if (physical_page_acquire(source->allocator, address) !=
         PHYSICAL_PAGE_STATUS_OK) {
         return RISCV_SV39_STATUS_STATE;
+    }
+    if (shared != 0) {
+        if (present_cow_entry(source_entry) ||
+            protected_cow_entry(source_entry)) {
+            (void)physical_page_release(source->allocator, address);
+            return RISCV_SV39_STATUS_STATE;
+        }
+        *leaf = source_entry;
+        if (valid_protected_entry(source_entry))
+            destination->protected_pages++;
+        else
+            destination->leaf_pages++;
+        return RISCV_SV39_STATUS_OK;
     }
     if (destination->cow_pages == UINT32_MAX) {
         (void)physical_page_release(source->allocator, address);
@@ -1735,7 +1749,9 @@ static enum riscv_sv39_status share_user_leaf(
 }
 
 static enum riscv_sv39_status commit_parent_cow(
-    struct riscv_sv39_user_space *source)
+    struct riscv_sv39_user_space *source,
+    int (*shared_leaf)(void *context, uint64_t virtual_address),
+    void *context)
 {
     uint64_t *root;
     uint64_t *level1;
@@ -1780,6 +1796,15 @@ static enum riscv_sv39_status commit_parent_cow(
                  level0_index < BOAROS_PAGE_SIZE / sizeof(*level0);
                  level0_index++) {
                 uint64_t entry = level0[level0_index];
+                uint64_t virtual_address =
+                    ((uint64_t)root_index << 30U) |
+                    ((uint64_t)level1_index << 21U) |
+                    ((uint64_t)level0_index << BOAROS_PAGE_SHIFT);
+
+                if (entry == 0U) continue;
+                if (shared_leaf != 0 &&
+                    shared_leaf(context, virtual_address) != 0)
+                    continue;
 
                 if (valid_user_leaf_entry(entry) &&
                     !present_cow_entry(entry)) {
@@ -1802,7 +1827,9 @@ static enum riscv_sv39_status commit_parent_cow(
 
 enum riscv_sv39_status riscv_sv39_user_space_fork(
     struct riscv_sv39_user_space *destination,
-    struct riscv_sv39_user_space *source)
+    struct riscv_sv39_user_space *source,
+    int (*shared_leaf)(void *context, uint64_t virtual_address),
+    void *context)
 {
     uint64_t *root;
     uint64_t *level1;
@@ -1879,14 +1906,16 @@ enum riscv_sv39_status riscv_sv39_user_space_fork(
                 status = share_user_leaf(destination,
                                          source,
                                          virtual_address,
-                                         level0[level0_index]);
+                                         level0[level0_index],
+                                         shared_leaf != 0 &&
+                                         shared_leaf(context, virtual_address));
                 if (status != RISCV_SV39_STATUS_OK) {
                     return status;
                 }
             }
         }
     }
-    return commit_parent_cow(source);
+    return commit_parent_cow(source, shared_leaf, context);
 }
 
 enum riscv_sv39_status riscv_sv39_user_space_move(

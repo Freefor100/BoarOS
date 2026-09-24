@@ -14,6 +14,7 @@
 #define LINUX_PROT_WRITE UINT64_C(0x2)
 #define LINUX_PROT_EXEC UINT64_C(0x4)
 #define LINUX_MAP_PRIVATE UINT64_C(0x2)
+#define LINUX_MAP_SHARED UINT64_C(0x1)
 #define LINUX_MAP_TYPE_MASK UINT64_C(0x3)
 #define LINUX_MAP_FIXED UINT64_C(0x10)
 #define LINUX_MAP_ANONYMOUS UINT64_C(0x20)
@@ -101,7 +102,9 @@ enum kernel_syscall_status syscall_handle_mmap(
         decoded->value = -KERNEL_EINVAL;
         return KERNEL_SYSCALL_STATUS_OK;
     }
-    if ((flags & LINUX_MAP_TYPE_MASK) != LINUX_MAP_PRIVATE ||
+    if (((flags & LINUX_MAP_TYPE_MASK) != LINUX_MAP_PRIVATE &&
+         ((flags & LINUX_MAP_TYPE_MASK) != LINUX_MAP_SHARED ||
+          (flags & LINUX_MAP_ANONYMOUS) == 0U)) ||
         (flags & LINUX_MAP_POPULATE) != 0U) {
         decoded->value = -KERNEL_ENOTSUP;
         return KERNEL_SYSCALL_STATUS_OK;
@@ -111,6 +114,8 @@ enum kernel_syscall_status syscall_handle_mmap(
     } else if ((flags & LINUX_MAP_FIXED_NOREPLACE) != 0U) {
         mm_flags = KERNEL_MM_MAP_FIXED_NOREPLACE;
     }
+    if ((flags & LINUX_MAP_TYPE_MASK) == LINUX_MAP_SHARED)
+        mm_flags |= KERNEL_MM_MAP_SHARED;
     if (kernel_task_mm_borrow_mutable(caller, &mm) !=
         KERNEL_TASK_STATUS_OK) {
         return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
