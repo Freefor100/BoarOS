@@ -33,4 +33,4 @@
 | 文件 / 事件 | [存储](learning/storage-filesystems.md)、[时间戳](learning/file-timestamps.md)、[I/O 多路复用](learning/io-multiplexing.md)、[epoll](learning/epoll-subsystem.md) |
 | 真实程序 | [最近全量基线、阻塞与根因](learning/user-program-inventory.md) |
 
-每个可独立验证的阶段收口时检查 README、模块、learning 三类文档：有新事实才更新，旧结论直接替换，细节用链接引用。运行产物留在忽略的 `build/`；临时 plan/spec 与会话材料不入库。
+每个可独立验证的阶段收口时检查 README、模块、learning 三类文档：有新事实才更新，旧结论直接替换，细节用链接引用。运行产物仅在核对期间暂存于忽略的 `build/`，随后用 `make prune-build` 清理一次性目录与日志；临时 plan/spec 与会话材料不入库。

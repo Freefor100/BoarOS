@@ -2,19 +2,19 @@
 
 本文保存最近全量证据与可复用根因。待办统一在 [goals](../goals.md)，构建/执行器契约在[程序环境模块](../modules/program-environment.md)。清单生成成功只表示运行完成，不等于程序兼容或比赛成绩。
 
-`build/` 是未纳入 Git 的本地缓存，不是必须永久保留的资料库。本页的 `suite.json`、运行日志和身份哈希用于核对当时的结论；已通过案例的 `fixture.img`、`linux.img`、`boaros.img` 可以删除；新运行默认保留失败案例镜像和每轮基础 fixture，过时失败快照的镜像也可在对应日志与 JSON 核对后单独清理。旧轮次用 `python3 tests/program-inventory/prune_images.py build` 预览、加 `--apply` 执行；删除后 JSON 中的旧磁盘路径只是执行记录，不能直接打开。
+`build/` 是未纳入 Git 的可重建产物目录，不是永久证据库。本页所列旧 `build/` 路径是当时的运行位置，2026-09-25 已清理，不能直接打开；可复用的结论、固定输入、身份和复现命令记录在 Git 中。运行器在执行期间会保存 JSON、日志和镜像，核对后用 `python3 tests/prune-build.py` 预览、`make prune-build` 清理整个一次性运行目录，只留下可跨轮复用的编译缓存。
 
 ## 固定输入与复现
 
 - BusyBox 1.33.1：`references/oscomp-testsuits` commit `b5ec6ef8497e1818cbdec3b54bb722f036e57972` 的原配置，保留全部 398 applet。
 - libc-test：同一 Git 对象库中的 `8b58dd16d26d30f7c74d48d5832d870d3051b703`（选定时分支 `pre-2025`），原始 `make disk` 生成 107 个静态、110 个动态 entry；musl 1.2.5，解释器 `/lib/ld-musl-riscv64.so.1`，未修改上游 C 源码。
 - 运行 Linux：`references/linux` commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`，程序清单使用独立 `tests/program-inventory/linux.config`。BusyBox 构建单用 Linux 6.6 UAPI，原因及 SHA-256 见程序环境模块；不混用运行内核版本。
-- 来源唯一清单为 `references/sources.tsv`，执行选择为 `tests/program-inventory/inputs.json`；上游源码、产物和运行日志留在忽略的 `build/`。
+- 来源唯一清单为 `references/sources.tsv`，执行选择为 `tests/program-inventory/inputs.json`；上游源码按清单恢复，运行日志只在核对期间暂存于忽略的 `build/`。
 
 ```sh
 make inventory-userland-riscv
 make test-program-inventory-host test-diff-abi-host
-# 使用新的输出目录，避免覆盖旧证据；--case 可重复指定：
+# 使用新的输出目录，避免覆盖正在核对的结果；--case 可重复指定：
 python3 tests/program-inventory/run.py --reuse-builds --require-pass --output build/program-check
 ```
 
@@ -22,7 +22,7 @@ python3 tests/program-inventory/run.py --reuse-builds --require-pass --output bu
 
 ## 当前基线与阻塞
 
-2026-09-25 最新全量证据在 `build/p4d-full-20260925/`，命令：
+2026-09-25 最近一次全量运行使用 `build/p4d-full-20260925/`，目录已清理；复现命令：
 
 ```sh
 python3 tests/program-inventory/run.py --output build/p4d-full-20260925
@@ -37,7 +37,7 @@ python3 tests/program-inventory/run.py --output build/p4d-full-20260925
 | 原 libc 静态 / 动态脚本 | 全部逐项断言通过 | 完整运行 107 / 110 项，各一项 FAIL，与 socket 直接 entry 相同 |
 | 原 BusyBox 脚本 | 55/55 success | 50/55 success；df、dmesg、which ls、free、hwclock 仍失败 |
 
-包装脚本与直接 entry 重复覆盖，不能把 228 项或 5 个顶层失败当成独立缺陷数。原始 stdout/stderr、wait status、串口、逐案例 fixture 哈希及命令均在证据目录；通过案例的临时磁盘不属于需保留的证据。关键身份为：BoarOS `kernel-rv` SHA-256 `48779733d5fedb7419755e4e8244b4d2fd433832fb5dc97cd5585a0b9130b619`，Linux Image `7ca338ec75e681cc68c5d946b3ae633fc0088fd78569b7847528105a9de6c8ec`，清单入口 `run.py` `4e59b9dafba47d47978e82ef221350cd0cd469162496a020c5c9ccdf12756f3f`，suite driver `83fca2c634085c2b81db212a72ea26221de3d746d832b06d1d6051115fd7b550`。完整执行身份、QEMU 命令与用户 ELF 身份由同一 JSON 保存；镜像路径在清理后仅是历史记录。
+包装脚本与直接 entry 重复覆盖，不能把 228 项或 5 个顶层失败当成独立缺陷数。原始 stdout/stderr、wait status、串口、逐案例 fixture 哈希及命令曾用于核对，旧运行目录已清理。关键身份为：BoarOS `kernel-rv` SHA-256 `48779733d5fedb7419755e4e8244b4d2fd433832fb5dc97cd5585a0b9130b619`，Linux Image `7ca338ec75e681cc68c5d946b3ae633fc0088fd78569b7847528105a9de6c8ec`，清单入口 `run.py` `4e59b9dafba47d47978e82ef221350cd0cd469162496a020c5c9ccdf12756f3f`，suite driver `83fca2c634085c2b81db212a72ea26221de3d746d832b06d1d6051115fd7b550`。完整执行身份、QEMU 命令与用户 ELF 身份当时由同一 JSON 保存；清理后的路径仅是历史记录。
 
 | 直接失败（均有静态/动态版本） | 当前首个有证据的阻塞 | 对应 TODO |
 |---|---|---|
@@ -45,7 +45,7 @@ python3 tests/program-inventory/run.py --output build/p4d-full-20260925
 
 `build/recoverable-metadata-focused` 另以 `--require-pass` 严格验收上述六个新增通过的 entry。`tests/program-inventory/filesystem.sh` 通过同一 `suites.run_suite()` 和未修改 BusyBox 验证 pwd、cd、指定时间 touch、文件/目录 mv 及改名后继续访问，双侧完整输出一致；manifest 与命令在 `build/recoverable-busybox-final/`。BusyBox `df` 仍失败不能解释成 statfs 未实现：独立 statvfs 与真实计数验证已通过，挂载枚举等消费者依赖继续按实际失败调查，不据命令名称补存根。
 
-`pthread_cancel_points` 直接 entry 在当前全量和聚焦复跑中通过。`build/cancel-repeat-20260923/` 进一步以同一固定内核、Linux Image、用户输入和 runner 对静态/动态 entry 各重复 30 次：两侧每次均通过，逐次 `inventory.json`、stdout/stderr、wait status、QEMU 命令与身份均保留。每轮生成的 fixture 路径不同，因此逐轮 manifest/execution 哈希不同；输入和内核 SHA-256 一致。旧 shm_open 取消断言异常没有复现，也没有独立根因，继续保持未关闭状态；本次没有据未复现修改取消路径。
+`pthread_cancel_points` 直接 entry 在当前全量和聚焦复跑中通过。`build/cancel-repeat-20260923/` 进一步以同一固定内核、Linux Image、用户输入和 runner 对静态/动态 entry 各重复 30 次：两侧每次均通过，逐次 `inventory.json`、stdout/stderr、wait status、QEMU 命令与身份在核对后已清理。每轮生成的 fixture 路径不同，因此逐轮 manifest/execution 哈希不同；输入和内核 SHA-256 一致。旧 shm_open 取消断言异常没有复现，也没有独立根因，继续保持未关闭状态；本次没有据未复现修改取消路径。
 
 ## P1b/P1c 聚焦验证
 

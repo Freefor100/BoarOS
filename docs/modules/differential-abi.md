@@ -59,11 +59,10 @@ make test-diff-abi-riscv
 和 Linux Image SHA-256。`LINUX_CC` 可选择以 `gcc` 结尾的交叉编译器，
 `DIFF_JOBS` 控制 Linux 构建并行数。
 
-`build/diff-abi/run/` 保存双方 raw logs、normalized records、`results.diff` 和
+运行期间 `build/diff-abi/run/` 保存双方 raw logs、normalized records、`results.diff` 和
 包含内核、程序、fixture 哈希、工具版本及完整 QEMU 命令的 `metadata.json`。
 启动 Linux 构建前即快照 BoarOS 内核、测试 ELF 和案例清单，哈希及运行均使用
-该快照，避免并行构建改变输入。成功时删除运行镜像，失败保留三份初始/运行镜像。每次运行替换此目录，需要长期
-保存的证据应在下一次运行前自行复制。CI 使用独立 job、精确 Linux cache key，
+该快照，避免并行构建改变输入。成功时删除运行镜像，失败保留三份初始/运行镜像。每次运行替换此目录；核对结果应记录固定输入和结论，本地核对完成后用 `make prune-build` 清理该目录。CI 使用独立 job、精确 Linux cache key，
 始终上传日志，失败时另传镜像。
 
 宿主协议测试包含刻意错误返回值/errno、数据、size、offset、signal，缺失/重复

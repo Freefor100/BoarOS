@@ -47,7 +47,7 @@ make test-references
 
 聚焦测试只在对应[模块文档](docs/README.md)维护。`make run-riscv` 不附根盘，启动后停留 timer-idle，需人工退出；`make debug-riscv` 以 `-S -s` 等待 GDB。完整比赛 Harness 当前因缺少 `kernel-la` 等能力阻塞，不算已通过。
 
-`build/` 是可清理的本地产物目录。完整程序清单默认只保留失败案例磁盘、每轮基础 fixture、结果 JSON 和日志；历史通过案例的磁盘可用 `python3 tests/program-inventory/prune_images.py build` 预览并加 `--apply` 清理。需要保留新执行案例的全部磁盘以调试时给清单入口传 `--keep-pass-images`。
+`build/` 是可重建的本地产物目录，不是验证档案。仅长期保留内核/用户程序编译结果、工具链、当前配置的 Linux 构建缓存等可跨轮复用的产物；一次性运行目录、磁盘镜像、日志和旧构建缓存应在核对结果后清理。`python3 tests/prune-build.py` 预览，`make prune-build` 执行清理；`make clean` 连可复用的内核构建产物也删除。需要临时保留案例镜像以调试时，可给清单入口传 `--keep-pass-images`，调试结束后仍应清理。
 
 ## 近期工作与文档
 
