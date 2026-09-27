@@ -30,10 +30,17 @@ P4b/c 与普通 WAL 阶段证据：`make test-diff-abi-riscv` 在固定 Linux/Bo
 
 WAL 断电与共享页故障阶段证据：`make test-sqlite-wal-recovery-riscv` 在固定 Linux/BoarOS 同一 ELF 上完成 EXTRA/FULL、hot、已确认提交和写/flush 错误传播；`make test-sqlite-wal-recovery-matrix-riscv` 对 42 个事务 NBD 事件覆盖 126 个断电组合、26 个写失败和 16 个 flush 失败位置，每次两次恢复及 ext4 检查均通过。输入身份由 runner 输出：内核 SHA-256 `b1191d2737dda760a0f4ec1bc0c5ddaa1c36fe668be3584a0a3cbb02598d8f49`、恢复 ELF `179be6d2e5ab52c908d4e0547225e7999d9e404ffd05c12f404e9f170fdca5e0`、NBD 服务 `b838e11a094c0c34114dbca310a8a75c158a442b3130dfc440c7da6a43092e6f`、QEMU 11.1.1、SQLite archive SHA-256 `1e71ddf93849c6a6ecf58b827c0692073d2dd7ee40196158068f7b29f422e87d`；本地固定 QEMU v11.1.0 commit `84f07211cc5b4fc6a371559bf8a5de4fb068e648`。`make test-files-partial-write-riscv` 增加写回失败后再次标脏、写回进行中经第二个 VA 别名写入并再次同步落盘、共享 fork 元数据 OOM 扫描及固定替换失败仍保留别名/owner 的检查。`make test-diff-abi-riscv` 为 396 条一致；普通 WAL、files、userland、RISC-V 全套、栈、NBD host、lwext4 recovery、DELETE 正常与抽样矩阵和固定资料检查通过。228 项清单再次为 223/2/3，五个旧失败 ID 不变，suite identity SHA-256 `08bf67905816d479d251c9a55bf985b46dd5ef37c4f588207201d7c0e741ab82`；重建命令和完整来源见[程序清单](learning/user-program-inventory.md)。跨 hart 真实并发与实板持久性仍未验收。
 
+### 单核规模能力
+
+UDP 大包 read/readv 的内部 256 字节截断已修复；普通文件/TCP 请求使用有任务 owner 的页级缓冲。驻留文件页新增动态地址哈希，首次写/写回 rearm 使用单页改权及地址级本地失效。成本门禁为 `make test-scale-riscv`，复现与成本定义见[单核规模回归](learning/single-hart-scale.md)。
+
+PR 增加规模测试、SQLite DELETE/WAL 和离线 GCC；完整恢复矩阵每周一北京时间 02:00 或手动触发。glibc 的固定本机工具/runtime 哈希仍是本地严格收口门禁；可移植固定输入供应尚待单独交付。可睡眠 I/O 的 IRQ、完成/超时/reset、DMA 停止与 VFS/页缓存 owner 协议是下一独立阶段；本轮不推进共享文件 futex、更多 socket ABI、批量事务或 SMP。
+
 ### 后续推进顺序
 
 | 顺序 | 任务 | 开始条件 / 独立成果 |
 |---|---|---|
+| 下一独立阶段 | 单 hart 可睡眠 I/O | 先确定 IRQ、完成/超时/reset、DMA 停止与 VFS/页缓存的跨层 owner 协议，再移除同步块 I/O 忙等；不提前扩展到 SMP |
 | 已完成 | P1d cwd/dirfd、P1g rename 子集 | 共享活目录项、cwd/dirfd、普通/NOREPLACE rename 已接入日志与 orphan |
 | 已完成 | P1e 时间、P1f 统计 | utimensat/futimens、真实 statfs、原始静态/动态 entry 与 BusyBox pwd/cd/mv/touch 已通过 |
 | 已完成 | P2a 同 MM 非 PI robust-list | raw `exit`、exec、musl、差分及全量清单已验收；PI 仍后置，共享匿名跨 MM key 见 P4d |
@@ -154,7 +161,8 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 ### P2b 等待、取消与 futex 扩展
 
 - [ ] 写出比较、登记、睡眠、超时、signal、wake、requeue、clear_tid、组终止的状态转换与唯一队列 owner；保证 compare-and-block 不可分割，无漏唤醒/重复摘链。
-- [ ] 按实际调用补 `WAIT_BITSET/WAKE_BITSET`、`CMP_REQUEUE/WAKE_OP`；每个 operation 单独核对参数宽度、bitset、比较失败、relative/absolute 和 CLOCK_REALTIME，未知/未支持操作不算完成。PI futex 后置。
+- [x] `WAIT_BITSET/WAKE_BITSET`、掩码与绝对超时已由 glibc/差分验收。
+- [ ] 按实际调用补 `CMP_REQUEUE/WAKE_OP`；每个 operation 单独核对参数宽度、bitset、比较失败、relative/absolute 和 CLOCK_REALTIME，未知/未支持操作不算完成。PI futex 后置。
 - [ ] 保持无超时 WAIT 的 SA_RESTART、带超时 WAIT 的 EINTR 与无 handler restart 保持原 deadline；测试信号在登记前后到达、超时与 wake 交错、重启前用户字变化、哈希碰撞和同桶 requeue。
 - [ ] 取消/exec/exit_group 让阻塞线程沿原栈释放 pin 的 OFD、等待节点及 MM 引用；不能直接删除仍执行的内核栈。共享匿名跨 MM key 已接入 P4d，单 hart 关中断仅是当前实现条件。
 

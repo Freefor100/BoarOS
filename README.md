@@ -29,9 +29,9 @@ BoarOS 是从零搭建、面向 OS Comp 能力建设的 C / 少量汇编内核�
 
 客体内固定 Alpine v3.22 RV64 GCC 14.2.0-r6 已在同一离线镜像上完成预处理、编译、汇编、静态链接和运行；固定 Linux 与 BoarOS 的五阶段状态、产物哈希和输出一致。范围是固定的小型 C 负载，其他项目和 Rust 尚未验收。
 
-2026-09-27 最近一次固定 BusyBox/libc-test 全量验证（输入与身份见[程序清单](docs/learning/user-program-inventory.md)）：228 个顶层案例全部完成，227 项双侧通过，仅 `busybox.official` 包装脚本失败；原 socket 静态/动态直接入口和 libc 官方静态/动态脚本均已转绿，旧 223 个通过项没有回退。BusyBox 原脚本为 51/55 success，仍缺 df、dmesg、free、hwclock；另有独立 pwd/cd/mv/touch 组合双侧通过。包装脚本与 entry 有重叠，清单完成不等于全部兼容。
+2026-09-27 最近一次固定 BusyBox/libc-test 全量验证（输入与身份见[程序清单](docs/learning/user-program-inventory.md)）：228 个顶层案例全部完成，227 项双侧通过，仅 `busybox.official` 包装脚本失败；原 socket 静态/动态直接入口和 libc 官方静态/动态脚本均已转绿，既有 227 个通过项没有回退。BusyBox 原脚本为 51/55 success，仍缺 df、dmesg、free、hwclock；另有独立 pwd/cd/mv/touch 组合双侧通过。包装脚本与 entry 有重叠，清单完成不等于全部兼容。
 
-网络切片及并发、错误顺序修复累计 72 条 socket Linux/BoarOS 差分通过，整合后完整差分为 502/502，包含零长度 UDP datagram 的 read/readv。网络对象、池界限与尚未覆盖的接口见[网络模块](docs/modules/kernel-network.md)。
+网络切片及大包/跨页 fault、TCP 规模验证累计 118 条 socket 差分通过，完整差分为 548/548；最新整合结果见[单核规模回归](docs/learning/single-hart-scale.md)。UDP read/readv 按用户容量接收完整报文，文件/TCP 使用请求页级缓冲。网络对象、池界限与尚未覆盖的接口见[网络模块](docs/modules/kernel-network.md)。
 
 ## 构建与验证
 
@@ -43,6 +43,7 @@ make test-riscv                 # 通用模块、架构与真实根启动
 make test-userland-riscv        # 静态 musl、动态 pthread / TLS
 make test-glibc-riscv           # 固定 glibc 2.44 静态/动态/PIE、TLS、pthread
 make test-diff-abi-riscv        # 同一 ELF 对照固定 Linux
+make test-scale-riscv           # I/O 分块、用户页解析、驻留查找与单页改权成本
 make test-lwip-host             # loopback、UDP 池耗尽/重用、TCP 定时回收
 make test-record-lock-host      # 区间树随机模型、所有权与分配失败
 make test-record-lock-riscv     # 同 ELF 的 Linux/BoarOS 线程、fork、fd 复用、退出

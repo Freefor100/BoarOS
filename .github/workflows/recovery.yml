@@ -1,0 +1,57 @@
+name: Storage recovery matrices
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Monday 02:00 Asia/Shanghai.
+    - cron: '0 18 * * 0'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: recovery-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  recovery:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install build and recovery dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential gcc-riscv64-unknown-elf \
+            binutils-riscv64-unknown-elf gcc-riscv64-linux-gnu binutils-riscv64-linux-gnu \
+            qemu-system-misc opensbi e2fsprogs flex bison bc libssl-dev libelf-dev \
+            python3 git curl unzip
+      - name: Restore pinned application sources
+        run: |
+          mkdir -p build
+          awk -F '\t' '$2 == "musl/musl-1.2.5.tar.gz" || $2 == "sqlite/sqlite-amalgamation-3530400.zip"' references/sources.tsv > build/recovery-references.tsv
+          test "$(wc -l < build/recovery-references.tsv)" -eq 2
+          sh references/fetch.sh --manifest build/recovery-references.tsv --root references
+      - name: Compute Linux cache identity
+        id: linux
+        run: echo "key=$(python3 tests/diff-abi/harness.py --cache-key)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v5
+        with:
+          path: build/diff-abi/linux/${{ steps.linux.outputs.key }}
+          key: diff-abi-linux-${{ runner.os }}-${{ steps.linux.outputs.key }}
+      - name: Run Linux reference and both full recovery matrices
+        shell: bash
+        run: |
+          make test-sqlite-recovery-riscv test-sqlite-wal-recovery-riscv \
+            test-sqlite-recovery-matrix-riscv test-sqlite-wal-recovery-matrix-riscv \
+            2>&1 | tee build/recovery-matrices.log
+      - name: Upload recovery observations and failure artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: storage-recovery
+          path: |
+            build/recovery-matrices.log
+            build/riscv/sqlite-recovery-run.*/**/*
+          if-no-files-found: warn
+          retention-days: 7

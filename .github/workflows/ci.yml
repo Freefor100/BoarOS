@@ -75,6 +75,9 @@ jobs:
       - name: Run RISC-V kernel tests
         run: make test-riscv
 
+      - name: Check I/O and mapped-file scale bounds
+        run: make test-scale-riscv
+
       - name: Run real userland tests
         run: make test-userland-riscv
 
@@ -96,7 +99,9 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: riscv-test-logs
-          path: build/riscv/**/*.log
+          path: |
+            build/riscv/**/*.log
+            build/scale-run.*/boot.log
           if-no-files-found: ignore
       - name: Upload failed RISC-V filesystem images
         if: failure()
@@ -120,7 +125,7 @@ jobs:
           sudo apt-get install -y build-essential gcc-riscv64-unknown-elf \
             binutils-riscv64-unknown-elf gcc-riscv64-linux-gnu \
             binutils-riscv64-linux-gnu qemu-system-misc opensbi e2fsprogs \
-            flex bison bc libssl-dev libelf-dev python3 git curl
+            flex bison bc libssl-dev libelf-dev python3 git curl unzip libarchive-tools zstd
       - name: Fetch pinned musl source for ELF regression
         run: |
           mkdir -p references/musl
@@ -148,6 +153,14 @@ jobs:
         run: make test-diff-abi-riscv
       - name: Check ELF file tail and BSS on both kernels
         run: make test-elf-tail-riscv
+      - name: Restore pinned SQLite input
+        run: |
+          mkdir -p build
+          awk -F '\t' '$2 == "sqlite/sqlite-amalgamation-3530400.zip"' references/sources.tsv > build/sqlite-references.tsv
+          test -s build/sqlite-references.tsv
+          sh references/fetch.sh --manifest build/sqlite-references.tsv --root references
+      - name: Check SQLite and native compiler applications
+        run: make test-sqlite-rollback-riscv test-sqlite-wal-riscv test-offline-c-riscv
       - name: Upload logs and normalized observations
         if: always()
         uses: actions/upload-artifact@v7
@@ -165,6 +178,9 @@ jobs:
             build/elf-tail-riscv/**/suite.json
             build/elf-tail-riscv/**/result.json
             build/elf-tail-riscv/**/*.log
+            build/riscv/sqlite*/**/*.log
+            build/riscv/offline-c-run.*/**/*
+            build/riscv/sqlite*/**/*.json
           include-hidden-files: true
           if-no-files-found: warn
       - name: Upload failed filesystem images
@@ -175,5 +191,7 @@ jobs:
           path: |
             build/diff-abi/run/*.img
             build/elf-tail-riscv/**/*.img
+            build/riscv/sqlite*/**/*.img
+            build/riscv/offline-c-run.*/**/*.img
           if-no-files-found: ignore
           retention-days: 7

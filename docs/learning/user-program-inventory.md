@@ -22,6 +22,8 @@ python3 tests/program-inventory/run.py --reuse-builds --require-pass --output bu
 
 ## 当前基线与阻塞
 
+2026-09-27 单 hart 规模改动后再次完成全量 228 项，227 pass、1 `busybox.official` upstream-failure；既有通过项无回退。最终内核、suite identity、恢复验证和重建命令见[单核规模回归](single-hart-scale.md)。以下保留各阶段输入和阻塞的历史演进。
+
 2026-09-25 全量运行使用 `build/p4d-full-20260925/`，目录已清理；复现命令：
 
 ```sh
