@@ -28,7 +28,7 @@ make test-sqlite-recovery-riscv
 make test-sqlite-recovery-matrix-riscv
 ```
 
-聚焦模型测试覆盖随机区间操作、AVL 高度/最大终点、owner 索引及分配失败原子性。固定 Linux 差分同一 ELF 覆盖锁范围和错误、关闭、dup/exec/CLOEXEC、unlink、等待、信号重启与死锁；另一个静态 musl 同 ELF 入口覆盖 pthread、fork、阻塞期间 fd 复用和组退出。SQLite 正常运行的两个进程通过 `exec` 建立独立 SQLite 进程内状态；直接在已有 SQLite 连接上 fork 后继续使用该连接会复制 Unix VFS 的进程内 inode 锁缓存，不能用作独立进程争用证据。故障矩阵通过客体串口握手与宿主 SIGUSR1 启用编号，排除启动和关机写入，只枚举事务内写/flush 请求。`build/` 中的镜像和日志是一次性证据，核对后用 `make prune-build` 清理；长期依据是固定输入、结果和上述重建命令。
+聚焦模型测试覆盖随机区间操作、AVL 高度/最大终点、owner 索引及分配失败原子性。固定 Linux 差分同一 ELF 覆盖锁范围和错误、关闭、dup/exec/CLOEXEC、unlink、等待、信号重启与死锁；另一个静态 musl 同 ELF 入口覆盖 pthread、fork、阻塞期间 fd 复用和组退出。SQLite 正常运行的两个进程通过 `exec` 建立独立 SQLite 进程内状态；直接在已有 SQLite 连接上 fork 后继续使用该连接会复制 Unix VFS 的进程内 inode 锁缓存，不能用作独立进程争用证据。故障矩阵通过客体串口握手与 NBD `arm` 命令确认启用编号，收到 `control=arm` 后再放行客体，排除启动和关机写入，只枚举事务内写/flush 请求。原 SIGUSR1 无确认协议存在计数边界竞态，修复与重新验收见[可睡眠存储](sleepable-storage.md)。`build/` 中的镜像和日志是一次性证据，核对后用 `make prune-build` 清理；长期依据是固定输入、结果和上述重建命令。
 
 2026-09-27 的最终矩阵输入 SHA-256：`kernel-rv` 为 `64c0a0f474af11da8824530d080e25d44493ba2f7542bfa40d68bbcf9f398084`，静态 SQLite 恢复 ELF 为 `bada7676800a46d9f15e1e2801ab1fa8a542a82b1f0b7f95a5530ac434957553`，宿主 NBD 服务为 `b838e11a094c0c34114dbca310a8a75c158a442b3130dfc440c7da6a43092e6f`；运行用 QEMU 为 11.1.1。小事务共 147 个 NBD 事件（100 次写、47 次 flush）；`make test-sqlite-recovery-matrix-riscv` 完成 441 个断电位置/策略组合、100 个写失败和 47 个 flush 失败，共 588 个故障场景，均通过两次恢复、整事务数据与 ext4 检查。`make test-sqlite-recovery-riscv` 另以同一 ELF 在固定 Linux 运行 setup/mutate/recover，其 Image SHA-256 为 `16a93ddb1d451898b93fff14de0cc076bcf1b10dad54c19a3e179a6cd81103b1`；EXTRA/FULL 正常运行、热日志、已确认提交和 FULL 错误传播均通过。
 

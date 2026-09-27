@@ -1,7 +1,6 @@
 """Exercise fixed-newstyle/simple NBD and the stable/volatile fault contract."""
 
 import os
-import signal
 import socket
 import struct
 import subprocess
@@ -27,7 +26,7 @@ def exact(sock, count):
 class Session:
     def __init__(self, binary, image, socket_path, *options):
         self.process = subprocess.Popen(
-            [binary, image, socket_path, *options], stderr=subprocess.PIPE
+            [binary, image, socket_path, *options], stderr=subprocess.PIPE, stdin=subprocess.PIPE
         )
         for _ in range(100):
             try:
@@ -78,6 +77,8 @@ class Session:
         if not cut:
             self.command(2)
         self.socket.close()
+        # Keep the control pipe open until NBD disconnect has been consumed.
+        self.process.wait(timeout=5)
         stderr = self.process.communicate(timeout=5)[1].decode()
         assert self.process.returncode == 0, stderr
         return stderr
@@ -88,6 +89,27 @@ def main(binary):
         image = str(Path(directory) / "disk.img")
         address = str(Path(directory) / "disk.sock")
         Path(image).write_bytes(b"\0" * 8192)
+        gated = Session(binary, image, address, "--control-stdin")
+        gated.process.stdin.write(b"hold\n")
+        gated.process.stdin.flush()
+        assert gated.process.stderr.readline() == b"control=hold\n"
+        for cookie, offset in ((1, 0), (2, 512)):
+            gated.socket.sendall(struct.pack(">IHHQQI", 0x25609513, 0, 0, cookie, offset, 512))
+            line = gated.process.stderr.readline()
+            assert line.startswith(f"held={cookie} command=0 offset={offset} ".encode()), line
+        gated.process.stdin.write(b"release 2\n")
+        gated.process.stdin.flush()
+        assert struct.unpack(">IIQ", exact(gated.socket, 16)) == (0x67446698, 0, 2)
+        assert exact(gated.socket, 512) == b"\0" * 512
+        assert gated.process.stderr.readline() == b"released=2\n"
+        assert gated.process.stderr.readline() == b"control=release 2\n"
+        gated.process.stdin.write(b"drain\n")
+        gated.process.stdin.flush()
+        assert struct.unpack(">IIQ", exact(gated.socket, 16)) == (0x67446698, 0, 1)
+        assert exact(gated.socket, 512) == b"\0" * 512
+        assert gated.process.stderr.readline() == b"released=1\n"
+        assert gated.process.stderr.readline() == b"control=drain\n"
+        gated.close()
         first, second = b"A" * 512, b"B" * 512
         session = Session(binary, image, address)
         assert session.command(1, data=first) == (0, b"")
@@ -124,14 +146,19 @@ def main(binary):
             Path(image).write_bytes(b"\0" * 8192)
             first = b"A" * 512
         session = Session(binary, image, address, "--arm-on-signal",
-                          "--cut-after=1", "--persist=none")
+                          "--control-stdin", "--cut-after=1", "--persist=none")
         assert session.command(1, data=first) == (0, b"")
-        session.process.send_signal(signal.SIGUSR1)
+        assert session.process.stderr.readline().startswith(b"event=0 type=WRITE")
+        # Arming must acknowledge the reset while the NBD stream is idle;
+        # releasing the guest before ACK can omit its first write.
+        session.process.stdin.write(b"arm\n")
+        session.process.stdin.flush()
+        assert session.process.stderr.readline() == b"armed=1\n"
+        assert session.process.stderr.readline() == b"control=arm\n"
         session.socket.sendall(struct.pack(">IHHQQI", 0x25609513, 0, 1,
                                            2, 0, 512) + second)
         log = session.close(cut=True)
-        assert "event=0 type=WRITE" in log
-        assert "armed=1" in log and "cut=1 policy=none" in log
+        assert "event=1 type=WRITE" in log and "cut=1 policy=none" in log
         assert Path(image).read_bytes()[:512] == b"\0" * 512
         print("NBD protocol, flush, errors and cut policies passed")
 

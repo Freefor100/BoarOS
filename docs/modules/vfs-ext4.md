@@ -135,6 +135,6 @@ make test-root-init-riscv
 
 写回固定本次页快照、脏范围与 generation；等待期间映射的新修改属于下一代，旧完成不清除它。范围写回在首次等待前固定并 pin 精确页集合，不能重新遍历变化中的链表配对释放。truncate/失效/最后 orphan close 取得 inode 写锁并复查 owner，排除 loading/writeback；最后 close 不在活动写回上强行失效。
 
-用户复制在 inode/缓存内容/后端锁之外，文件写先复制到请求页再进入存储。持锁分配、堆和 MM 元数据操作只允许非阻塞干净页回收；脏页回收在外层取得 inode try-read 后执行，完成后复查页引用与别名。干净页回收的最后 node 引用转交 mount 清理链，不递归进入需要睡眠的后端释放；卸载清理该 owner。
+用户复制在 inode/缓存内容/后端锁之外，文件写先复制到请求页再进入存储。持锁分配、堆和 MM 元数据操作只允许非阻塞干净页回收；脏页回收在外层取得 inode try-read 后执行，完成后复查页引用与别名。干净页回收立即释放正常 node 元数据：固定版本 `ext4_fclose` 只清理私有 handle，不取后端锁或执行 I/O。只有未完成 orphan 或真实关闭错误交给 mount 清理链，不让健康节点滞留至卸载。
 
 验证入口：`make test-io-sleep-riscv test-files-riscv test-files-partial-write-riscv test-lwext4-recovery-host`。设备握手、同页合并、快照、并发插入缓存页、最后 close/写回及完整恢复的证据见[可睡眠存储](../learning/sleepable-storage.md)。

@@ -2680,7 +2680,7 @@ void kernel_file_mapping_unregister(struct kernel_file_mapping *mapping)
     mapping->previous = 0;
 }
 
-static int release_node(struct kernel_vfs_node **owner, int may_sleep)
+int kernel_vfs_node_release(struct kernel_vfs_node **owner)
 {
     struct kernel_vfs_node *node;
     struct kernel_vfs_node **link;
@@ -2709,13 +2709,15 @@ static int release_node(struct kernel_vfs_node **owner, int may_sleep)
         }
         *link = node->next;
         node->next = 0;
-        if (!may_sleep || (node->unlinked && !node->orphan_freed)) {
+        if (node->unlinked && !node->orphan_freed) {
             node->next = node->adapter->cleanup_nodes;
             node->adapter->cleanup_nodes = node;
             *owner = 0;
             return 0;
         }
     }
+    /* ext4_fclose only clears this private handle: no I/O or backend gate.
+     * Clean eviction must release metadata immediately, even under allocation. */
     if (!node->closed) {
         result = ext4_fclose(&node->file);
         if (result != EOK) {
@@ -2731,10 +2733,6 @@ static int release_node(struct kernel_vfs_node **owner, int may_sleep)
     return 0;
 }
 
-int kernel_vfs_node_release(struct kernel_vfs_node **owner)
-{ return release_node(owner, 1); }
-int kernel_vfs_node_release_deferred(struct kernel_vfs_node **owner)
-{ return release_node(owner, 0); }
 
 int kernel_vfs_node_pread(struct kernel_vfs_node *node,
                           uint64_t offset,

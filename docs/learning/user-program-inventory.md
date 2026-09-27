@@ -22,6 +22,8 @@ python3 tests/program-inventory/run.py --reuse-builds --require-pass --output bu
 
 ## 当前基线与阻塞
 
+2026-09-28 单 hart 可睡眠 I/O 后，最终内核再次完成 228 项，227 pass、1 `busybox.official` upstream-failure，无既有通过项回退。内核 SHA-256 `5565ddce40a9ade4fac4f7a2191aa5b136b3cc456e92873ab6ef4be3abe9d8cb`，suite identity `257434c6cf372651fdb520d5599198a484ffa8fe005d04e9bf8289cc454aeedd`；命令和其余输入见[可睡眠存储](sleepable-storage.md)。
+
 2026-09-27 单 hart 规模改动后再次完成全量 228 项，227 pass、1 `busybox.official` upstream-failure；既有通过项无回退。最终内核、suite identity、恢复验证和重建命令见[单核规模回归](single-hart-scale.md)。以下保留各阶段输入和阻塞的历史演进。
 
 2026-09-25 全量运行使用 `build/p4d-full-20260925/`，目录已清理；复现命令：

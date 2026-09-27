@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <inttypes.h>
 #include <signal.h>
+#include <poll.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -23,6 +24,7 @@ struct options {
     uint64_t fail_flush;
     const char *persist;
     int arm_on_signal;
+    int control_stdin;
 };
 
 static volatile sig_atomic_t arm_requested;
@@ -156,24 +158,92 @@ static int persist_cut(struct fault_block *disk, const char *policy)
     return fault_block_crash(disk);
 }
 
-static int transmit(int fd, struct fault_block *disk,
-                    const struct options *options)
+/* Response gating is independent of disk execution. Tests release named
+ * completions in any order, while FLUSH still changes stable storage in order. */
+struct pending_reply {
+    struct pending_reply *next;
+    uint64_t id;
+    size_t size;
+    unsigned char bytes[];
+};
+struct response_gate {
+    struct pending_reply *head;
+    uint64_t sequence;
+    int hold;
+    char input[80];
+    size_t used;
+};
+static void arm_faults(struct fault_block *disk, const struct options *options,
+                       uint64_t *event, int *armed)
+{
+    arm_requested = 0;
+    *armed = 1;
+    *event = 0;
+    disk->writes = disk->flushes = 0;
+    disk->fail_write = options->fail_write;
+    disk->fail_flush = options->fail_flush;
+    fputs("armed=1\n", stderr);
+    fflush(stderr);
+}
+static int gate_control(int fd, struct response_gate *gate,
+                        struct fault_block *disk, const struct options *options,
+                        uint64_t *event, int *armed)
+{
+    char ch;
+    if (read(STDIN_FILENO, &ch, 1) != 1) return -1;
+    if (ch != '\n') {
+        if (gate->used + 1 >= sizeof(gate->input)) return -1;
+        gate->input[gate->used++] = ch;
+        return 0;
+    }
+    gate->input[gate->used] = 0;
+    gate->used = 0;
+    int drain = !strcmp(gate->input, "drain");
+    uint64_t id = 0;
+    char tail;
+    if (!strcmp(gate->input, "arm")) arm_faults(disk, options, event, armed);
+    else if (!strcmp(gate->input, "hold")) gate->hold = 1;
+    else if (drain || sscanf(gate->input, "release %" SCNu64 "%c", &id, &tail) == 1) {
+        int found = drain;
+        struct pending_reply **link = &gate->head;
+        while (*link) {
+            struct pending_reply *reply = *link;
+            if (drain || reply->id == id) {
+                if (transfer(fd, reply->bytes, reply->size, 1)) return -1;
+                *link = reply->next;
+                fprintf(stderr, "released=%" PRIu64 "\n", reply->id);
+                free(reply);
+                found = 1;
+                if (!drain) break;
+            } else link = &reply->next;
+        }
+        if (!found) return -1;
+        if (drain) gate->hold = 0;
+    } else return -1;
+    fprintf(stderr, "control=%s\n", gate->input);
+    fflush(stderr);
+    return 0;
+}
+static int gated_transmit(int fd, struct fault_block *disk,
+                    const struct options *options, struct response_gate *gate)
+
 {
     unsigned char request[28], response[16], data[MAX_REQUEST];
     uint64_t event = 0;
     int armed = !options->arm_on_signal;
     for (;;) {
-        if (transfer(fd, request, sizeof(request), 0)) return 0;
-        if (arm_requested) {
-            arm_requested = 0;
-            armed = 1;
-            event = 0;
-            disk->writes = disk->flushes = 0;
-            disk->fail_write = options->fail_write;
-            disk->fail_flush = options->fail_flush;
-            fputs("armed=1\n", stderr);
-            fflush(stderr);
+        if (options->control_stdin) {
+            struct pollfd events[2] = {{fd, POLLIN, 0}, {STDIN_FILENO, POLLIN, 0}};
+            int ready = poll(events, 2, -1);
+            if (ready < 0 && errno == EINTR) continue;
+            if (ready < 0) return -1;
+            if (events[1].revents) {
+                if (gate_control(fd, gate, disk, options, &event, &armed)) return -1;
+                continue;
+            }
         }
+        if (transfer(fd, request, sizeof(request), 0)) return 0;
+        if (arm_requested) arm_faults(disk, options, &event, &armed);
         if (be32(request) != UINT32_C(0x25609513)) return -1;
         uint16_t flags = be16(request + 4), command = be16(request + 6);
         uint64_t offset = be64(request + 16);
@@ -215,10 +285,39 @@ static int transmit(int fd, struct fault_block *disk,
         put32(response, UINT32_C(0x67446698));
         put32(response + 4, error);
         memcpy(response + 8, request + 8, 8);
+        if (gate->hold) {
+            size_t payload = command == NBD_CMD_READ && !error ? size : 0;
+            struct pending_reply *reply = malloc(sizeof(*reply) + sizeof(response) + payload);
+            if (!reply) return -1;
+            reply->id = ++gate->sequence;
+            reply->size = sizeof(response) + payload;
+            memcpy(reply->bytes, response, sizeof(response));
+            if (payload) memcpy(reply->bytes + sizeof(response), data, payload);
+            reply->next = 0;
+            struct pending_reply **link = &gate->head;
+            while (*link) link = &(*link)->next;
+            *link = reply;
+            fprintf(stderr, "held=%" PRIu64 " command=%u offset=%" PRIu64 " size=%u\n",
+                    reply->id, command, offset, size);
+            fflush(stderr);
+            continue;
+        }
         if (transfer(fd, response, sizeof(response), 1) ||
             (command == NBD_CMD_READ && !error &&
              transfer(fd, data, size, 1))) return -1;
     }
+}
+
+static int transmit(int fd, struct fault_block *disk, const struct options *options)
+{
+    struct response_gate gate = {0};
+    int result = gated_transmit(fd, disk, options, &gate);
+    while (gate.head) {
+        struct pending_reply *reply = gate.head;
+        gate.head = reply->next;
+        free(reply);
+    }
+    return result;
 }
 
 static int parse_u64(const char *text, uint64_t *result)
@@ -235,7 +334,7 @@ int main(int argc, char **argv)
     if (argc < 3) {
         fprintf(stderr, "usage: %s IMAGE SOCKET [--fail-write=N] "
                 "[--fail-flush=N] [--cut-after=N] "
-                "[--persist=none|all|odd|even|reverse] [--arm-on-signal]\n",
+                "[--persist=none|all|odd|even|reverse] [--arm-on-signal] [--control-stdin]\n",
                 argv[0]);
         return 2;
     }
@@ -250,6 +349,7 @@ int main(int argc, char **argv)
             options.persist = argv[i] + 10;
         else if (!strcmp(argv[i], "--arm-on-signal"))
             options.arm_on_signal = 1;
+        else if (!strcmp(argv[i], "--control-stdin")) options.control_stdin = 1;
         else return 2;
     }
     signal(SIGPIPE, SIG_IGN);

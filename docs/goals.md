@@ -34,13 +34,13 @@ WAL 断电与共享页故障阶段证据：`make test-sqlite-wal-recovery-riscv`
 
 UDP 大包 read/readv 的内部 256 字节截断已修复；普通文件/TCP 请求使用有任务 owner 的页级缓冲。驻留文件页新增动态地址哈希，首次写/写回 rearm 使用单页改权及地址级本地失效。成本门禁为 `make test-scale-riscv`，复现与成本定义见[单核规模回归](learning/single-hart-scale.md)。
 
-PR 增加规模测试、SQLite DELETE/WAL 和离线 GCC；完整恢复矩阵每周一北京时间 02:00 或手动触发。glibc 的固定本机工具/runtime 哈希仍是本地严格收口门禁；可移植固定输入供应尚待单独交付。可睡眠 I/O 的 IRQ、完成/超时/reset、DMA 停止与 VFS/页缓存 owner 协议是下一独立阶段；本轮不推进共享文件 futex、更多 socket ABI、批量事务或 SMP。
+PR 增加规模测试、SQLite DELETE/WAL 和离线 GCC；完整恢复矩阵每周一北京时间 02:00 或手动触发。glibc 的固定本机工具/runtime 哈希仍是本地严格收口门禁；可移植固定输入供应尚待单独交付。单 hart 可睡眠 I/O 已接入 IRQ、完成/超时/reset、DMA 停止与 VFS/页缓存 owner 协议，交付证据见[可睡眠存储](learning/sleepable-storage.md)。本轮不推进共享文件 futex、更多 socket ABI、批量事务或 SMP。
 
 ### 后续推进顺序
 
 | 顺序 | 任务 | 开始条件 / 独立成果 |
 |---|---|---|
-| 下一独立阶段 | 单 hart 可睡眠 I/O | 先确定 IRQ、完成/超时/reset、DMA 停止与 VFS/页缓存的跨层 owner 协议，再移除同步块 I/O 忙等；不提前扩展到 SMP |
+| 已接入 | 单 hart 可睡眠 I/O | 任务 owner 同步、PLIC/八槽 VirtIO、共享后端读与单写事务、缓存快照/缺页重验证；运行期禁止回退轮询，范围仍限 QEMU 单 hart |
 | 已完成 | P1d cwd/dirfd、P1g rename 子集 | 共享活目录项、cwd/dirfd、普通/NOREPLACE rename 已接入日志与 orphan |
 | 已完成 | P1e 时间、P1f 统计 | utimensat/futimens、真实 statfs、原始静态/动态 entry 与 BusyBox pwd/cd/mv/touch 已通过 |
 | 已完成 | P2a 同 MM 非 PI robust-list | raw `exit`、exec、musl、差分及全量清单已验收；PI 仍后置，共享匿名跨 MM key 见 P4d |

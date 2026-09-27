@@ -7,7 +7,6 @@ import json
 import os
 import re
 import shutil
-import signal
 import subprocess
 import tempfile
 import time
@@ -100,8 +99,9 @@ def nbd_boot(args, image, directory, name, *, options=(), marker=None,
     with open(backend_log, "w") as backend_output, \
          open(guest_log, "w") as guest_output:
         backend = subprocess.Popen([str(args.server), str(image), str(socket),
-                                    *options], stdout=backend_output,
-                                   stderr=subprocess.STDOUT)
+                                    *options, *(["--control-stdin"] if gate else [])],
+                                   stdin=subprocess.PIPE if gate else subprocess.DEVNULL,
+                                   stdout=backend_output, stderr=subprocess.STDOUT)
         guest = None
         try:
             for _ in range(200):
@@ -120,7 +120,9 @@ def nbd_boot(args, image, directory, name, *, options=(), marker=None,
             if gate:
                 wait_for_marker(guest, guest_log,
                                 "BoarOS: SQLite mutation armed")
-                backend.send_signal(signal.SIGUSR1)
+                backend.stdin.write(b"arm\n")
+                backend.stdin.flush()
+                wait_for_marker(backend, backend_log, "control=arm")
                 guest.stdin.write(b"g")
                 guest.stdin.flush()
             if marker:

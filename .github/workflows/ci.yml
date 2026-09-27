@@ -78,6 +78,9 @@ jobs:
       - name: Check I/O and mapped-file scale bounds
         run: make test-scale-riscv
 
+      - name: Check sleepable storage concurrency
+        run: make test-io-sleep-riscv
+
       - name: Run real userland tests
         run: make test-userland-riscv
 
@@ -102,13 +105,16 @@ jobs:
           path: |
             build/riscv/**/*.log
             build/scale-run.*/boot.log
+            build/io-sleep-run.*/*.log
           if-no-files-found: ignore
       - name: Upload failed RISC-V filesystem images
         if: failure()
         uses: actions/upload-artifact@v7
         with:
           name: riscv-failed-images
-          path: build/riscv/**/*.img
+          path: |
+            build/riscv/**/*.img
+            build/io-sleep-run.*/root.img
           if-no-files-found: ignore
           retention-days: 7
 

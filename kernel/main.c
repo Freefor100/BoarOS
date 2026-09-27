@@ -2,6 +2,7 @@
 #include <arch/riscv/direct_map.h>
 #include <arch/riscv/memory_layout.h>
 #include <arch/riscv/root_boot.h>
+#include <arch/riscv/plic.h>
 #include <arch/riscv/sbi.h>
 #include <arch/riscv/sv39.h>
 #include <arch/riscv/timer.h>
@@ -39,6 +40,9 @@ static struct riscv_sv39_page_table kernel_page_table;
 static struct physical_page_allocator transition_page_allocator;
 static struct riscv_sv39_page_table transition_page_table;
 static struct riscv_root_boot root_boot;
+static struct dtb_irq_info boot_irq;
+static int root_started;
+static uint64_t cleanup_retry_ticks;
 static unsigned char
     transition_table_pages[RISCV_TRANSITION_TABLE_PAGE_COUNT *
                            BOAROS_PAGE_SIZE]
@@ -489,6 +493,8 @@ static enum riscv_sv39_status build_kernel_page_table(
     if (status != RISCV_SV39_STATUS_OK) {
         return status;
     }
+    status = map_mmio_alias(&kernel_page_table, boot_irq.plic.base, boot_irq.plic.size);
+    if (status != RISCV_SV39_STATUS_OK) return status;
     for (index = 0U; index < info->virtio_mmio_count; index++) {
         status = map_mmio_alias(&kernel_page_table,
                                 info->virtio_mmio[index].base,
@@ -612,6 +618,103 @@ static uint64_t current_stvec(void)
     return value;
 }
 
+static int __attribute__((noinline)) boot_storage_present(const struct dtb_boot_info *info)
+{
+    for (uint32_t i = 0; i < info->virtio_mmio_count; i++) {
+        volatile uint32_t *registers = (void *)(uintptr_t)(RISCV_KERNEL_MMIO_BASE + info->virtio_mmio[i].base);
+        if (info->virtio_mmio[i].size >= 12 && registers[0] == UINT32_C(0x74726976) && registers[2] == 2)
+            return 1;
+    }
+    return 0;
+}
+
+static void storage_cleanup_worker(void *argument)
+{
+    (void)argument;
+    (void)riscv_interrupt_save();
+    kernel_scheduler_register_cleanup();
+    enum kernel_scheduler_status scheduler_status;
+    enum riscv_root_boot_status root_status;
+    for (;;) {
+        uintptr_t interrupt_status = riscv_interrupt_save();
+        struct kernel_thread_completion completion;
+        struct kernel_thread_completion init_completion;
+        int init_reaped = 0;
+
+        do {
+            scheduler_status = kernel_scheduler_reap_one(&completion);
+            if (scheduler_status == KERNEL_SCHEDULER_STATUS_OK &&
+                root_started && completion.kind == KERNEL_THREAD_KIND_USER &&
+                completion.tgid == 1) {
+                init_completion = completion;
+                init_reaped = 1;
+            }
+        } while (scheduler_status == KERNEL_SCHEDULER_STATUS_OK ||
+                 (scheduler_status == KERNEL_SCHEDULER_STATUS_EMPTY &&
+                  kernel_scheduler_reap_pending()));
+        riscv_interrupt_restore(interrupt_status);
+        if (init_reaped) {
+            struct kernel_heap_statistics heap_statistics;
+            uint64_t available_pages;
+
+            root_status = riscv_root_boot_finish(&root_boot,
+                                                  &init_completion,
+                                                  &heap_statistics,
+                                                  &available_pages);
+            if (root_status != RISCV_ROOT_BOOT_STATUS_OK) {
+                if (root_status == RISCV_ROOT_BOOT_STATUS_CLEANUP) {
+                    virt_uart_puts("BoarOS: root finish failure stage=");
+                    virt_uart_put_hex(root_boot.finish_failure);
+                    virt_uart_puts(" error=");
+                    virt_uart_put_hex((unsigned long)(uint32_t)
+                                      root_boot.finish_error);
+                    if ((root_boot.finish_failure &
+                         (RISCV_ROOT_FINISH_HEAP_BASELINE |
+                          RISCV_ROOT_FINISH_PAGE_BASELINE)) != 0U) {
+                        virt_uart_puts(" heap-live=");
+                        virt_uart_put_hex(heap_statistics.live_allocations);
+                        virt_uart_puts(" heap-pages=");
+                        virt_uart_put_hex(heap_statistics.current_pages);
+                        virt_uart_puts(" available=");
+                        virt_uart_put_hex(available_pages);
+                        virt_uart_puts(" baseline=");
+                        virt_uart_put_hex(root_boot.baseline_pages);
+                    }
+                    virt_uart_putc('\n');
+                }
+                shutdown_for_root_boot_error(root_status);
+            }
+            struct kernel_stack_statistics stack_statistics;
+            kernel_scheduler_stack_statistics(&stack_statistics);
+            virt_uart_puts("BoarOS: task stacks released=");
+            virt_uart_put_hex((unsigned long)stack_statistics.stacks_released);
+            virt_uart_puts(" min-free=");
+            virt_uart_put_hex((unsigned long)stack_statistics.minimum_free_bytes);
+            virt_uart_puts(" max-used=");
+            virt_uart_put_hex((unsigned long)stack_statistics.maximum_used_bytes);
+            virt_uart_putc('\n');
+            virt_uart_puts("BoarOS: PID 1 exited status=");
+            virt_uart_put_hex((unsigned long)completion.status);
+            virt_uart_puts(" pages=");
+            virt_uart_put_hex((unsigned long)available_pages);
+            virt_uart_puts(" heap-live=");
+            virt_uart_put_hex(
+                (unsigned long)heap_statistics.live_allocations);
+            virt_uart_puts("; shutting down\n");
+            sbi_shutdown();
+        }
+        if (scheduler_status != KERNEL_SCHEDULER_STATUS_EMPTY &&
+            scheduler_status != KERNEL_SCHEDULER_STATUS_RESOURCE_CLEANUP) {
+            shutdown_for_scheduler_error(scheduler_status);
+        }
+        int cleanup_retry =
+            scheduler_status == KERNEL_SCHEDULER_STATUS_RESOURCE_CLEANUP;
+        interrupt_status = riscv_interrupt_save();
+        kernel_scheduler_wait_cleanup(cleanup_retry ? riscv_time_read() + cleanup_retry_ticks : 0);
+        riscv_interrupt_restore(interrupt_status);
+    }
+}
+
 void kernel_main(unsigned long hart_id, const void *dtb)
 {
     struct dtb_boot_info info;
@@ -625,11 +728,13 @@ void kernel_main(unsigned long hart_id, const void *dtb)
     enum kernel_scheduler_status scheduler_status;
     enum riscv_root_boot_status root_status;
     uint64_t boot_realtime_ns = 0;
-    int root_started = 0;
 
     if (dtb_status != DTB_STATUS_OK) {
         shutdown_for_dtb_error(dtb_status);
     }
+    if (dtb_read_irq_info(dtb, hart_id, &boot_irq) != DTB_STATUS_OK)
+        shutdown_for_dtb_error(DTB_STATUS_UNSUPPORTED);
+    cleanup_retry_ticks = info.timebase_frequency / KERNEL_TICKS_PER_SECOND;
     (void)kernel_random_initialize(info.rng_seed, info.rng_seed_size);
 
     memory_status = boot_memory_build(
@@ -693,12 +798,24 @@ void kernel_main(unsigned long hart_id, const void *dtb)
         shutdown_for_scheduler_error(scheduler_status);
     }
 
+    if (boot_storage_present(&info)) {
+        scheduler_status = kernel_thread_create(storage_cleanup_worker, 0);
+        if (scheduler_status != KERNEL_SCHEDULER_STATUS_OK) shutdown_for_scheduler_error(scheduler_status);
+    }
+    if (!riscv_plic_init((void *)(uintptr_t)(RISCV_KERNEL_MMIO_BASE + boot_irq.plic.base),
+                         boot_irq.plic.size, boot_irq.context, boot_irq.source_count)) __builtin_trap();
+
     root_status = riscv_root_boot_start(&root_boot,
                                         &info,
                                         &page_allocator,
                                         &kernel_page_table);
     if (root_status == RISCV_ROOT_BOOT_STATUS_OK) {
         root_started = 1;
+        uint32_t source = 0;
+        uint64_t base = (uintptr_t)root_boot.device.mmio - RISCV_KERNEL_MMIO_BASE;
+        for (uint32_t i = 0; i < boot_irq.route_count; i++)
+            if (boot_irq.routes[i].base == base) source = boot_irq.routes[i].source;
+        if (!riscv_virtio_mmio_block_enable_irq(&root_boot.device, source)) __builtin_trap();
         virt_uart_puts("BoarOS: root /init started pid=0x1\n");
     } else if (root_status != RISCV_ROOT_BOOT_STATUS_NO_DEVICE) {
         uint32_t cleanup_attempts = 0U;
@@ -806,88 +923,15 @@ void kernel_main(unsigned long hart_id, const void *dtb)
     virt_uart_putc('\n');
 
     for (;;) {
-        uintptr_t interrupt_status = riscv_interrupt_save();
-        struct kernel_thread_completion completion;
-        struct kernel_thread_completion init_completion;
-        int init_reaped = 0;
-
-        do {
-            scheduler_status = kernel_scheduler_reap_one(&completion);
-            if (scheduler_status == KERNEL_SCHEDULER_STATUS_OK &&
-                root_started && completion.kind == KERNEL_THREAD_KIND_USER &&
-                completion.tgid == 1) {
-                init_completion = completion;
-                init_reaped = 1;
-            }
-        } while (scheduler_status == KERNEL_SCHEDULER_STATUS_OK ||
-                 (scheduler_status == KERNEL_SCHEDULER_STATUS_EMPTY &&
-                  kernel_scheduler_reap_pending()));
-        riscv_interrupt_restore(interrupt_status);
-        if (init_reaped) {
-            struct kernel_heap_statistics heap_statistics;
-            uint64_t available_pages;
-
-            root_status = riscv_root_boot_finish(&root_boot,
-                                                  &init_completion,
-                                                  &heap_statistics,
-                                                  &available_pages);
-            if (root_status != RISCV_ROOT_BOOT_STATUS_OK) {
-                if (root_status == RISCV_ROOT_BOOT_STATUS_CLEANUP) {
-                    virt_uart_puts("BoarOS: root finish failure stage=");
-                    virt_uart_put_hex(root_boot.finish_failure);
-                    virt_uart_puts(" error=");
-                    virt_uart_put_hex((unsigned long)(uint32_t)
-                                      root_boot.finish_error);
-                    if ((root_boot.finish_failure &
-                         (RISCV_ROOT_FINISH_HEAP_BASELINE |
-                          RISCV_ROOT_FINISH_PAGE_BASELINE)) != 0U) {
-                        virt_uart_puts(" heap-live=");
-                        virt_uart_put_hex(heap_statistics.live_allocations);
-                        virt_uart_puts(" heap-pages=");
-                        virt_uart_put_hex(heap_statistics.current_pages);
-                        virt_uart_puts(" available=");
-                        virt_uart_put_hex(available_pages);
-                        virt_uart_puts(" baseline=");
-                        virt_uart_put_hex(root_boot.baseline_pages);
-                    }
-                    virt_uart_putc('\n');
-                }
-                shutdown_for_root_boot_error(root_status);
-            }
-            struct kernel_stack_statistics stack_statistics;
-            kernel_scheduler_stack_statistics(&stack_statistics);
-            virt_uart_puts("BoarOS: task stacks released=");
-            virt_uart_put_hex((unsigned long)stack_statistics.stacks_released);
-            virt_uart_puts(" min-free=");
-            virt_uart_put_hex((unsigned long)stack_statistics.minimum_free_bytes);
-            virt_uart_puts(" max-used=");
-            virt_uart_put_hex((unsigned long)stack_statistics.maximum_used_bytes);
-            virt_uart_putc('\n');
-            virt_uart_puts("BoarOS: PID 1 exited status=");
-            virt_uart_put_hex((unsigned long)completion.status);
-            virt_uart_puts(" pages=");
-            virt_uart_put_hex((unsigned long)available_pages);
-            virt_uart_puts(" heap-live=");
-            virt_uart_put_hex(
-                (unsigned long)heap_statistics.live_allocations);
-            virt_uart_puts("; shutting down\n");
-            sbi_shutdown();
+        uintptr_t irq = riscv_interrupt_save();
+        if (!root_started) {
+            struct kernel_thread_completion completion;
+            while (kernel_scheduler_reap_one(&completion) == KERNEL_SCHEDULER_STATUS_OK) { }
         }
-        if (scheduler_status != KERNEL_SCHEDULER_STATUS_EMPTY &&
-            scheduler_status != KERNEL_SCHEDULER_STATUS_RESOURCE_CLEANUP) {
-            shutdown_for_scheduler_error(scheduler_status);
-        }
-        int cleanup_retry =
-            scheduler_status == KERNEL_SCHEDULER_STATUS_RESOURCE_CLEANUP;
-        interrupt_status = riscv_interrupt_save();
         scheduler_status = kernel_scheduler_yield_current();
-        riscv_interrupt_restore(interrupt_status);
-        if (scheduler_status != KERNEL_SCHEDULER_STATUS_OK)
-            shutdown_for_scheduler_error(scheduler_status);
-        interrupt_status = riscv_interrupt_save();
-        int cleanup_pending = kernel_scheduler_reap_pending();
-        riscv_interrupt_restore(interrupt_status);
-        if (cleanup_pending && !cleanup_retry) continue;
+        if (scheduler_status != KERNEL_SCHEDULER_STATUS_OK) shutdown_for_scheduler_error(scheduler_status);
+        riscv_interrupt_restore(irq | RISCV_SSTATUS_SIE);
         asm volatile("wfi");
     }
+
 }

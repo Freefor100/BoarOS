@@ -15,7 +15,7 @@
 | `kernel/physical_page.c` | 对齐可用区间并建立单页物理分配器 |
 | `arch/riscv/direct_map.c` | 校验 direct-map 范围并转换物理/虚拟地址 |
 | `arch/riscv/sv39.c` | 建立 2 MiB/4 KiB 叶子并启用 Sv39 |
-| `kernel/main.c` | 建立启动内存布局、物理页分配器和启动地址空间，协调 root、timer 与 idle reaper |
+| `kernel/main.c` | 建立启动内存布局、物理页分配器和启动地址空间，协调 root、PLIC、timer 与可调度 cleanup task |
 | `arch/riscv/root_boot.c` | 从 DTB 发现的根块设备挂载 ext4、装载 `/init` 并收口 PID 1 生命周期 |
 | `arch/riscv/virt_uart.c` | QEMU `virt` NS16550A 轮询输出，以及最终页表生效后的高半区 MMIO 基址切换 |
 | `arch/riscv/sbi.c` | 通过 SBI Base/TIME/SRST 探测扩展、设置 timer 和请求关机 |
@@ -38,7 +38,7 @@
 
 ## 当前限制
 
-当前代码只处理单 hart、QEMU `virt` UART、固定高半区内核 VMA、最终 high/direct RAM 映射、S/U-mode 整数 Trap Frame、第一段 DTB RAM、SBI timer/100 Hz tick、FIFO 内核/用户任务，以及 raw whole-disk ext4（按设备能力读写或只读）。生产 ELF 入口支持 source-backed `ET_EXEC`/`ET_DYN`/非递归 `PT_INTERP` 的 RISC-V 映像构造；真实静态与动态 musl 入口、额外 DSO 和 TLS 已验证，更多动态 libc/DSO 负载仍待补齐。QEMU ELF 的物理装载地址仍固定为 `0x80200000`；VisionFive 2 的装载地址、固件入口和存储后端必须在板级适配时单独提供，不能直接沿用平台常量。外部中断、完整 Linux 文件 ABI、完整 Linux 进程/线程语义、SMP 或 LoongArch64 尚未实现。
+当前代码只处理单 hart、QEMU `virt` UART、固定高半区内核 VMA、最终 high/direct RAM 映射、S/U-mode 整数 Trap Frame、第一段 DTB RAM、SBI timer/100 Hz tick、FIFO 内核/用户任务，以及 raw whole-disk ext4（按设备能力读写或只读）。生产 ELF 入口支持 source-backed `ET_EXEC`/`ET_DYN`/非递归 `PT_INTERP` 的 RISC-V 映像构造；真实静态与动态 musl 入口、额外 DSO 和 TLS 已验证，更多动态 libc/DSO 负载仍待补齐。QEMU ELF 的物理装载地址仍固定为 `0x80200000`；VisionFive 2 的装载地址、固件入口和存储后端必须在板级适配时单独提供，不能直接沿用平台常量。完整 Linux 文件 ABI、完整 Linux 进程/线程语义、SMP 或 LoongArch64 尚未实现。
 
 ## 验证入口
 

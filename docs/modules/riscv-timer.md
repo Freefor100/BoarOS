@@ -90,4 +90,4 @@ make test-riscv
 
 合成 DTB 覆盖缺失、错误位置、错误长度、零值、重复属性和失败输出不变。timer cases 覆盖全部启动状态，以及恰好到期、周期内迟到、跨周期迟到、无效输出和 `UINT64_MAX` 回绕。真实 QEMU 测试使用实际 DTB、`time` CSR、OpenSBI TIME 和 Trap Frame 返回路径，至少两次返回 `wfi` 后由测试链接包装在第三个累计 tick 关机。无根盘的正常 `kernel-rv` 持续 idle；挂载生产根盘时，timer 调度 PID 1，退出后由根生命周期主动关机。
 
-当前限制为单 hart、固定 100 Hz 周期策略和 SBI TIME 后端。Scheduler 当前把每个非零 elapsed 事件作为一次时间片到期，并保证一次 trap 最多切换一次；deadline 到期与 console 轮询在每次 tick 各做一次 O(阻塞数) 走链。尚无 tickless、Sstc 直写、外部中断（console 接收现为 tick 轮询，延迟上界一个 tick）、IPI、per-hart timer 或 LoongArch timer。正常 tick 和调度不写 UART；日志只出现在初始化和错误路径。
+当前限制为单 hart、固定 100 Hz 周期策略和 SBI TIME 后端。Scheduler 当前把每个非零 elapsed 事件作为一次时间片到期，并保证一次 trap 最多切换一次；deadline 到期与 console 轮询在每次 tick 各做一次 O(阻塞数) 走链。尚无 tickless、Sstc 直写、console 外部中断（接收现为 tick 轮询，延迟上界一个 tick；块设备已使用 PLIC IRQ）、IPI、per-hart timer 或 LoongArch timer。正常 tick 和调度不写 UART；日志只出现在初始化和错误路径。

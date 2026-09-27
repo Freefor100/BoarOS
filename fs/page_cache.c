@@ -217,7 +217,7 @@ static int cleanup_entry(struct kernel_page_cache *cache,
     }
     entry->physical_address = 0U;
     if (entry->node != 0 &&
-        kernel_vfs_node_release_deferred(&entry->node) != 0) {
+        kernel_vfs_node_release(&entry->node) != 0) {
         return 0;
     }
     (void)kernel_heap_release(cache->heap, entry);

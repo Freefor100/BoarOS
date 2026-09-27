@@ -1365,3 +1365,11 @@ $(BUILD_DIR)/tests/kernel-scale-rv: $(SCALE_OBJECTS) arch/riscv/linker.ld
 .PHONY: test-scale-riscv
 test-scale-riscv: $(BUILD_DIR)/tests/kernel-scale-rv
 	python3 tests/scale-riscv.py --kernel $< --qemu $(QEMU_RISCV64)
+
+IO_SLEEP_OBJECTS := $(TEST_RUNTIME_OBJECTS) $(BUILD_DIR)/kernel/dtb.o $(BUILD_DIR)/tests/riscv/io_sleep_main.o
+-include $(BUILD_DIR)/tests/riscv/io_sleep_main.d
+$(BUILD_DIR)/tests/kernel-io-sleep-rv: $(IO_SLEEP_OBJECTS) arch/riscv/linker.ld
+	$(CC) $(LDFLAGS) -Wl,--wrap=kernel_vfs_node_pread -Wl,--wrap=kernel_vfs_node_writeback -o $@ $(IO_SLEEP_OBJECTS)
+.PHONY: test-io-sleep-riscv
+test-io-sleep-riscv: $(BUILD_DIR)/tests/kernel-io-sleep-rv build/host/nbd-fault
+	python3 tests/io-sleep-riscv.py --kernel $< --qemu $(QEMU_RISCV64)
