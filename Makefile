@@ -1219,3 +1219,17 @@ test-sqlite-rollback-riscv: $(SQLITE_ROLLBACK_RV) $(SQLITE_CLI_STATIC_RV) $(SQLI
 	SQLITE_CLI_INIT_RV=$(SQLITE_CLI_INIT_RV) MUSL_LDSO=$(MUSL_LDSO) \
 	QEMU_RISCV64=$(QEMU_RISCV64) \
 		./tests/sqlite-rollback-riscv.sh
+
+build/host/nbd-fault: tests/host/nbd_fault.c tests/host/block_fault.c tests/host/block_fault.h kernel/block.c
+	@mkdir -p $(dir $@)
+	cc -std=c11 -Wall -Wextra -Werror -idirafter include tests/host/nbd_fault.c tests/host/block_fault.c kernel/block.c -o $@
+
+.PHONY: test-nbd-host
+test-nbd-host: build/host/nbd-fault
+	PYTHONDONTWRITEBYTECODE=1 python3 tests/host/nbd_fault_test.py $<
+
+.PHONY: test-sqlite-nbd-riscv
+test-sqlite-nbd-riscv: $(SQLITE_ROLLBACK_RV) $(KERNEL_RV) build/host/nbd-fault
+	SQLITE_ROLLBACK_RV=$(SQLITE_ROLLBACK_RV) KERNEL_RV=$(KERNEL_RV) \
+	NBD_FAULT_SERVER=build/host/nbd-fault QEMU_RISCV64=$(QEMU_RISCV64) \
+		./tests/sqlite-nbd-riscv.sh
