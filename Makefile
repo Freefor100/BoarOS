@@ -987,23 +987,22 @@ $(OFFLINE_C_RV): tests/workloads/toolchain/offline_c.c $(MUSL_STAMP)
 	@mkdir -p $(dir $@)
 	$(MUSL_ROOT)/bin/musl-gcc $(MUSL_GCC_FLAGS) -static -O2 -o $@ $<
 
-.PHONY: test-offline-c-baseline-riscv test-offline-c-riscv
+.PHONY: prepare-offline-c-toolchain test-offline-c-baseline-riscv test-offline-c-riscv
+prepare-offline-c-toolchain:
+	python3 tests/workloads/toolchain/prepare_alpine.py
+
 test-offline-c-baseline-riscv: $(OFFLINE_C_RV) $(KERNEL_RV)
 	PYTHONDONTWRITEBYTECODE=1 python3 tests/offline-c-riscv.py \
 		--kernel $(KERNEL_RV) --program $(OFFLINE_C_RV) \
 		$(if $(OFFLINE_C_LINUX_KERNEL),--linux-kernel $(OFFLINE_C_LINUX_KERNEL)) \
 		--qemu $(QEMU_RISCV64) --expect-first-failure preprocess:exec:2
 
-test-offline-c-riscv: $(OFFLINE_C_RV) $(KERNEL_RV)
-	@test -n "$(OFFLINE_C_TOOLCHAIN_TREE)" || { \
-		echo 'set OFFLINE_C_TOOLCHAIN_TREE to a pinned native RV64 toolchain root' >&2; \
-		exit 2; \
-	}
+test-offline-c-riscv: $(OFFLINE_C_RV) $(KERNEL_RV) prepare-offline-c-toolchain
 	PYTHONDONTWRITEBYTECODE=1 python3 tests/offline-c-riscv.py \
 		--kernel $(KERNEL_RV) --program $(OFFLINE_C_RV) \
 		$(if $(OFFLINE_C_LINUX_KERNEL),--linux-kernel $(OFFLINE_C_LINUX_KERNEL)) \
 		--qemu $(QEMU_RISCV64) \
-		--toolchain-tree $(OFFLINE_C_TOOLCHAIN_TREE)
+		--toolchain-tree build/offline-c/alpine-tree
 
 .PHONY: test-sqlite-rollback-riscv
 test-sqlite-rollback-riscv: $(SQLITE_ROLLBACK_RV) $(SQLITE_CLI_STATIC_RV) $(SQLITE_CLI_DYNAMIC_RV) $(SQLITE_CLI_INIT_RV) $(MUSL_LDSO) $(KERNEL_RV)

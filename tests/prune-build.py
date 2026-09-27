@@ -9,7 +9,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 BUILD = ROOT / 'build'
-KEEP_TOP = {'riscv', 'diff-abi', 'program-environment', 'program-libc', 'host', 'tools'}
+KEEP_TOP = {'riscv', 'diff-abi', 'program-environment', 'program-libc', 'host', 'tools', 'offline-c'}
 KEEP_ROOT_FILES = {'elf-tail-rv', 'elf-tail-dynamic-rv', 'elf-tail-norelro-rv'}
 
 
@@ -60,6 +60,11 @@ def candidates():
     if libc.is_dir():
         result.extend(path for path in libc.iterdir()
                       if path.name == 'upstream.tar' or path.suffix == '.log')
+
+    offline_c = BUILD / 'offline-c'
+    if offline_c.is_dir():
+        result.extend(path for path in offline_c.iterdir()
+                      if path.name in {'trace.img', 'apks'} or path.suffix == '.log')
 
     environment = BUILD / 'program-environment'
     if environment.is_dir():

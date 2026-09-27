@@ -23,3 +23,29 @@ QEMU 为 11.1.1。两侧的第一失败均为 `preprocess:exec:2`，其余四阶
 跳过，`stages.tsv` SHA-256 同为
 `bc6803c7bab4a798c61cd77da971f93f99cb0cb5c57d3706f9f0aa9779bd2728`。
 重建入口：`make test-offline-c-baseline-riscv`。这不是 C 编译通过的证据。
+
+2026-09-27 的固定 Alpine GCC 14.2.0-r6 路线（15 个 riscv64 APK 的完整
+URL、SHA-256 和许可见 `references/sources.tsv`、
+`docs/modules/program-environment.md`）暴露两个通用 ABI 缺口：GCC 的 cc1
+以 `O_NOCTTY` 打开 `/work/program.c`，BoarOS 原先在 flag 校验阶段返回
+`EINVAL`；随后四个编译阶段与 Linux 的产物已逐字节一致，但 GCC 对链接
+产物调用 `fchmodat`，原先 `ENOSYS` 使最后 `execve` 返回 `EACCES`。
+按固定 Linux `references/linux/fs/open.c` commit
+`f4cdf7ca9a1fdcca413157df19753f388a5a224e` 与 raw 差分，BoarOS
+接纳 `O_NOCTTY`，在 fs context 中保存 umask，并通过 lwext4 活 inode
+handle 事务实现 `fchmod/fchmodat`。路径专用 setter 不可行：已 unlink 的
+fd 仍须修改原 inode；直接越过 lwext4 改 raw inode 又会绕开 journal、
+ctime 和错误 owner。固定 Linux 的 `fchmod(pipefd)` 也成功，但 pipe
+合成 inode mode/fstat 尚未实现；此点不在本次编译器负载覆盖内。
+
+重建：`make prepare-offline-c-toolchain`，随后
+`make test-offline-c-riscv OFFLINE_C_LINUX_KERNEL=<固定 Image>`；不提供
+Image 时按固定 Linux 来源构建。严格运行的五阶段退出码两侧全为 0，
+`.i/.s/.o/ELF/output.txt` 的 SHA-256 各自双侧相同；生成 ELF 为
+`9eb903417c06855766559ca00af19529ee85aa8a35973c2840de6ec6655e2697`，
+stdout SHA-256 为
+`a3f7bf4004ee05dee3c87923426f96984cb656d08bc17301a18c78910448c37f`。
+Alpine 展开树 SHA-256 为
+`ce84a7bb9fc7c97552121b37238622bbefbd4a3672600b57374e25230c582a07`；
+固定 Linux Image SHA-256 为
+`7ca338ec75e681cc68c5d946b3ae633fc0088fd78569b7847528105a9de6c8ec`。

@@ -67,15 +67,39 @@ musl `/init`。它从 `/work/tools.conf` 读取客体内编译器、汇编器绝
 两个独立镜像提取 `.i`、`.s`、`.o`、ELF 和程序输出，逐项比较 SHA-256、
 最终输出及文件系统检查。版本字符串和目标文件存在本身不构成成功。
 
-`make test-offline-c-baseline-riscv` 是**诊断模式**：目前没有客体原生编译器，
+`make test-offline-c-baseline-riscv` 是**诊断模式**：该镜像故意不安装客体编译器，
 同一 ELF 在两侧均应准确停在 `preprocess:exec:2`。它通过只说明探针可定位
-首个失败，不说明离线编译已可用。`make test-offline-c-riscv
-OFFLINE_C_TOOLCHAIN_TREE=/absolute/path` 是**严格模式**，要求五阶段全部退出
-0、产物齐全且哈希双侧一致、运行输出逐字节匹配；缺少固定编译器输入即失败。
+首个失败，不说明离线编译已可用。`make test-offline-c-riscv` 是**严格模式**，
+先验证并解包固定 Alpine v3.22 riscv64 APK 闭包到忽略的
+`build/offline-c/alpine-tree/`，再要求五阶段全部退出 0、产物齐全且哈希
+双侧一致、运行输出逐字节匹配；缺少固定编译器输入即失败。
 `OFFLINE_C_LINUX_KERNEL` 可指向由固定 Linux commit
 `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 构建且有 `identity.json`
-的缓存 Image；不指定时 runner 按固定资料构建。原生编译器来源、依赖和许可
-仍待路线确认，不把宿主交叉 GCC 当成客体编译器。
+的缓存 Image；不指定时 runner 按固定资料构建。`make prepare-offline-c-toolchain`
+单独重建编译器树。`references/sources.tsv` 对以下 15 个 APK 固定逐项完整 URL
+和 SHA-256，访问日期为 2026-09-27；准备脚本逐项校验 archive 哈希、
+`.PKGINFO` 的名称/版本/架构/许可和缓存树内容，不修改上游包。
+
+| APK 包名 | 固定版本 | `.PKGINFO` 许可 |
+|---|---|---|
+| binutils | 2.44-r3 | GPL-2.0-or-later AND LGPL-2.1-or-later AND BSD-3-Clause |
+| gcc | 14.2.0-r6 | GPL-2.0-or-later AND LGPL-2.1-or-later |
+| gmp | 6.3.0-r3 | LGPL-3.0-or-later OR GPL-2.0-or-later |
+| isl26 | 0.26-r1 | MIT |
+| jansson | 2.14.1-r0 | MIT |
+| libatomic | 14.2.0-r6 | GPL-2.0-or-later AND LGPL-2.1-or-later |
+| libgcc | 14.2.0-r6 | GPL-2.0-or-later AND LGPL-2.1-or-later |
+| libgomp | 14.2.0-r6 | GPL-2.0-or-later AND LGPL-2.1-or-later |
+| libstdc++ | 14.2.0-r6 | GPL-2.0-or-later AND LGPL-2.1-or-later |
+| mpc1 | 1.3.1-r1 | LGPL-3.0-or-later |
+| mpfr4 | 4.2.1_p1-r0 | LGPL-3.0-or-later |
+| musl | 1.2.5-r12 | MIT |
+| musl-dev | 1.2.5-r12 | MIT |
+| zlib | 1.3.2-r0 | Zlib |
+| zstd-libs | 1.5.7-r0 | BSD-3-Clause OR GPL-2.0-or-later |
+
+它只证明此固定 C 源码、静态链接与单核环境的客体离线编译闭环；其他 C
+项目、C++、Rust 或持续本机自举仍需独立验证。
 
 ## SQLite 日志与 NBD 故障入口
 

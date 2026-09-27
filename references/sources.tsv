@@ -24,3 +24,19 @@ file	glibc/glibc-2.44.tar.xz	https://ftp.gnu.org/gnu/glibc/glibc-2.44.tar.xz	-	3
 # SQLite 3.53.4 official amalgamation; accessed 2026-09-27.
 file	sqlite/sqlite-amalgamation-3530400.zip	https://www.sqlite.org/2026/sqlite-amalgamation-3530400.zip	-	1e71ddf93849c6a6ecf58b827c0692073d2dd7ee40196158068f7b29f422e87d
 file	linux-uapi/linux-6.6.tar.xz	https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.6.tar.xz	-	d926a06c63dd8ac7df3f86ee1ffc2ce2a3b81a2d168484e76b5b389aba8e56d0
+# Alpine v3.22 main/riscv64 native GCC 14.2.0-r6 and complete APK dependency closure; accessed 2026-09-27.
+file	alpine/v3.22/main/riscv64/binutils-2.44-r3.apk	https://dl-cdn.alpinelinux.org/alpine/v3.22/main/riscv64/binutils-2.44-r3.apk	-	48f109b58fe0472f63bdd84afdf189ddbf48607cba5904ef417f9c41f04f09be
+file	alpine/v3.22/main/riscv64/gcc-14.2.0-r6.apk	https://dl-cdn.alpinelinux.org/alpine/v3.22/main/riscv64/gcc-14.2.0-r6.apk	-	456c6a14a2e04e5e5dd88f9025df6d1eac10db56ff970517ba4c6048061686b7
+file	alpine/v3.22/main/riscv64/gmp-6.3.0-r3.apk	https://dl-cdn.alpinelinux.org/alpine/v3.22/main/riscv64/gmp-6.3.0-r3.apk	-	f35fb4c3b62da58a5788a7a82aa116f9f30f8d91f73375c26fc437be2ae630b1
+file	alpine/v3.22/main/riscv64/isl26-0.26-r1.apk	https://dl-cdn.alpinelinux.org/alpine/v3.22/main/riscv64/isl26-0.26-r1.apk	-	c3bfee11aa54e89edc85e7d729a773a61d4b37c1a12f6996c13a4a5fbf35c689
+file	alpine/v3.22/main/riscv64/jansson-2.14.1-r0.apk	https://dl-cdn.alpinelinux.org/alpine/v3.22/main/riscv64/jansson-2.14.1-r0.apk	-	673443b255a06ccb53861f4ebc8f831e5e35c8a553071503cd7ec9161bd7227d
+file	alpine/v3.22/main/riscv64/libatomic-14.2.0-r6.apk	https://dl-cdn.alpinelinux.org/alpine/v3.22/main/riscv64/libatomic-14.2.0-r6.apk	-	90543de7a16cd24dfb54e864d897f02f83ca83035949486840ac5e296bb2fc40
+file	alpine/v3.22/main/riscv64/libgcc-14.2.0-r6.apk	https://dl-cdn.alpinelinux.org/alpine/v3.22/main/riscv64/libgcc-14.2.0-r6.apk	-	3962255abb95c10d1400883daf823cab3d04779ea8886a8e44d61c98caa8ee55
+file	alpine/v3.22/main/riscv64/libgomp-14.2.0-r6.apk	https://dl-cdn.alpinelinux.org/alpine/v3.22/main/riscv64/libgomp-14.2.0-r6.apk	-	073df85fc3bbc2716db08ce8054bf26169ed3665092990baac01025e34ff4282
+file	alpine/v3.22/main/riscv64/libstdc++-14.2.0-r6.apk	https://dl-cdn.alpinelinux.org/alpine/v3.22/main/riscv64/libstdc++-14.2.0-r6.apk	-	01f39aabb27a201645ac274c3e54019c6a5f1f8658d814edbaca79c6c96a595f
+file	alpine/v3.22/main/riscv64/mpc1-1.3.1-r1.apk	https://dl-cdn.alpinelinux.org/alpine/v3.22/main/riscv64/mpc1-1.3.1-r1.apk	-	eb6fe6b0bab6c7fa673da2fc31e1cb8e414f3b196a7e2bfd621b51fd89145080
+file	alpine/v3.22/main/riscv64/mpfr4-4.2.1_p1-r0.apk	https://dl-cdn.alpinelinux.org/alpine/v3.22/main/riscv64/mpfr4-4.2.1_p1-r0.apk	-	8a9098015e675d500b6024d5d51869ed3a96f4769a386a53afde3fafba39dc27
+file	alpine/v3.22/main/riscv64/musl-1.2.5-r12.apk	https://dl-cdn.alpinelinux.org/alpine/v3.22/main/riscv64/musl-1.2.5-r12.apk	-	6814d9cbaad929d14181ef4fbd1d65c7749df43746269b9bdb75551ba32a79db
+file	alpine/v3.22/main/riscv64/musl-dev-1.2.5-r12.apk	https://dl-cdn.alpinelinux.org/alpine/v3.22/main/riscv64/musl-dev-1.2.5-r12.apk	-	cd16b9d772e93fe5b8a2b87b5182b5be786be7b86be5bf63af65f3537762fd20
+file	alpine/v3.22/main/riscv64/zlib-1.3.2-r0.apk	https://dl-cdn.alpinelinux.org/alpine/v3.22/main/riscv64/zlib-1.3.2-r0.apk	-	9a2761a457312f4aa1312c94d3ca8789c2f1dd51d34d992e400851c8181a6887
+file	alpine/v3.22/main/riscv64/zstd-libs-1.5.7-r0.apk	https://dl-cdn.alpinelinux.org/alpine/v3.22/main/riscv64/zstd-libs-1.5.7-r0.apk	-	28bb837f617870a996009130c938ad12075f942738cfcd1390251720c78f0b8d

@@ -38,6 +38,15 @@ SQLite 3.53.4 官方 amalgamation 保存于 `sqlite/sqlite-amalgamation-3530400.
 2026-09-27 从官方发布页取得并校验 SHA-256；测试构建直接从固定压缩包解包，
 不修改上游源码。
 
+Alpine v3.22 `main/riscv64` 的 GCC 14.2.0-r6、binutils、musl 开发文件和
+其余 12 个运行依赖 APK 保存于 `alpine/v3.22/main/riscv64/`。`sources.tsv`
+逐包固定官方 URL、SHA-256 与 2026-09-27 访问日期；包内 `.PKGINFO`
+的版本、架构和许可表达式由
+`tests/workloads/toolchain/prepare_alpine.py` 核对。`make
+prepare-offline-c-toolchain` 将原包原样解到忽略的
+`build/offline-c/alpine-tree/`，并验证树哈希，不修改上游文件。完整包名、
+版本与许可见[程序环境模块](../docs/modules/program-environment.md)。
+
 musl 以校验过的 `musl/musl-1.2.5.tar.gz` 保存，不在 `references/` 另建源码快照。列出和读取
 单个成员可直接使用：
 
