@@ -217,17 +217,19 @@ enum kernel_syscall_status syscall_handle_restart_syscall(
     uint64_t futex_deadline_ns;
     uint32_t futex_operation;
     uint32_t futex_expected;
+    uint32_t futex_bitset;
 
     decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
     if (kernel_signal_futex_timed_restart(caller, &futex_address,
                                            &futex_operation,
                                            &futex_expected,
-                                           &futex_deadline_ns)) {
+                                           &futex_deadline_ns,
+                                           &futex_bitset)) {
         enum kernel_scheduler_status futex_status;
 
         decoded->value = kernel_futex_restart_timed(
             caller, futex_address, futex_operation, futex_expected,
-            futex_deadline_ns, &futex_status);
+            futex_deadline_ns, futex_bitset, &futex_status);
         if (futex_status != KERNEL_SCHEDULER_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
         if (decoded->value != -KERNEL_ERESTARTSYS)

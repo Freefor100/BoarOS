@@ -46,6 +46,14 @@ tar -tzf references/musl/musl-1.2.5.tar.gz
 tar -xOf references/musl/musl-1.2.5.tar.gz musl-1.2.5/src/dirent/seekdir.c
 ```
 
+glibc 2.44 官方源码以 `glibc/glibc-2.44.tar.xz` 保存，SHA-256
+`37f600f2bef3c5e8300147059568b2a2e40a7ad6ccc65ce942556d49429cc667`，
+2026-09-27 从 GNU FTP 取得。`nptl/pthread_join_common.c` 与
+`nptl/futex-internal.c` 是 bitset 等待的固定依据；`COPYING.LIB` 和
+`LICENSES` 记录许可证。实际 RV64 loader/libc 是测试宿主已安装、由
+`tests/userland/glibc/inputs.json` 逐文件 SHA-256 固定的二进制；源码
+归档不充当这些二进制的可重复构建证明。
+
 确需整树阅读时解包到仓库外的临时目录或已忽略的 `build/`，结束后删除。不要 `git add -f`
 恢复出的仓库、PDF、压缩包或解包树，也不要把手工下载的网页副本留在仓库其他位置成为未跟踪
 快照；要长期固定的新输入应加入 `sources.tsv`，由恢复器校验。

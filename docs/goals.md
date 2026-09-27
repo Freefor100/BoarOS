@@ -275,9 +275,9 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 
 ### P5a glibc 独立矩阵
 
-- [ ] 固定 glibc loader/libc、相应 ELF、构建/运行环境与许可证/哈希；不修改二进制绕过内核缺失，不把 musl 结果套用为 glibc 结果。
-- [ ] 静态、动态、PIE、额外 DSO、初始 TLS、dlopen TLS、pthread、信号及其组合分项验证；保留装载、main 之前、运行时和退出阶段的首个失败。
-- [ ] 明确内核和用户动态链接器的职责；PT_INTERP 能装载不等于 glibc 运行时全支持，加载后失败也不一律归因于动态链接。
+- [x] 固定 glibc 2.44 官方源码参考、宿主 RV64 loader/libc、相应 ELF、构建/运行环境与许可证/哈希；不修改二进制绕过内核缺失，不把 musl 结果套用为 glibc 结果。宿主二进制由逐文件 SHA 固定，尚未提供从官方源码逐位重建的工具链证明。
+- [x] 基础矩阵双侧验证静态、动态、PIE、静态 PIE、额外 DSO、初始 TLS、dlopen TLS、pthread、信号及其组合；保留装载/main 之前、运行时和退出阶段的首个失败。更广 glibc 应用仍待试跑。
+- [x] 已区分内核 PT_INTERP 装载和用户动态链接器/运行时职责；首次 pthread_join 失败经固定 Linux 差分定位到 futex bitset，而非动态重定位。
 
 ### P5b shebang 与 exec 组合
 
@@ -296,7 +296,7 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 - [ ] 再固定 rustc/cargo、依赖锁定和离线最小项目，成功后扩大完整项目。先 `-j1` 建立正确性，不要求 SMP，也不把网络下载失败混入内核 ABI。
 - [ ] 每个新失败最小化、对照固定 Linux，再修通用机制；保留可恢复的成功输入和失败样本，不能为构建脚本改写预期输出。
 
-**验证与退出**：现有 `test-exec-riscv`、`test-elf-tail-riscv`、`test-userland-riscv`；拟新增 `tests/userland/exec_scripts.c`、`tests/userland/glibc/`、`tests/workloads/toolchain/`。未特改动态 glibc 与离线最小 C/Rust 构建分别有闭环；不能把剩余运行失败合并成一个“动态链接未支持”。
+**验证与退出**：现有 `test-exec-riscv`、`test-elf-tail-riscv`、`test-userland-riscv`，新增 `test-glibc-riscv`、futex bitset 固定 Linux 差分和 `tests/workloads/toolchain/` 的离线编译诊断探针；`tests/userland/exec_scripts.c` 仍待后续能力建设。未特改动态 glibc 的基础矩阵已有闭环，离线最小 C/Rust 构建尚未完成；不能把剩余运行失败合并成一个“动态链接未支持”。
 
 ## P6：SMP、TLB 与中断/I/O 并发
 

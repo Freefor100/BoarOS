@@ -65,7 +65,8 @@ RISC-V 后端固定 Sv39/4 KiB，并支持：
 ```sh
 make test-exec-riscv
 make test-root-init-riscv
+make test-glibc-riscv
 make test-riscv
 ```
 
-动态 ET_DYN/解释器的生产构造已经接入；真实 userland runner 已验证动态 musl PIE、解释器、额外 DSO、初始 TLS 和运行中 dlopen TLS。musl/glibc 更广重定位矩阵、多线程 exec、shebang、`execveat`、凭据变化、写入文件的一致性和 LoongArch 后端仍未完成。128 KiB 是当前序列化初始栈镜像限制，不是完整 Linux `ARG_MAX` 策略。
+动态 ET_DYN/解释器的生产构造已经接入；真实 userland runner 已验证动态 musl PIE、解释器、额外 DSO、初始 TLS 和运行中 dlopen TLS。固定 glibc 2.44 的静态、动态、PIE、静态 PIE 与 pthread/TLS/信号组合另由 `test-glibc-riscv` 双侧验证。更广重定位矩阵、多线程 exec、shebang、`execveat`、凭据变化、写入文件的一致性和 LoongArch 后端仍未完成。128 KiB 是当前序列化初始栈镜像限制，不是完整 Linux `ARG_MAX` 策略。

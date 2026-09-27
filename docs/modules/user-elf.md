@@ -77,4 +77,4 @@ make test-root-init-riscv
 make test-riscv
 ```
 
-真实根启动 fixture 验证 source-backed 静态入口；动态 musl PIE、解释器、额外 DSO、初始 TLS 和线程运行期间的 dlopen TLS 已通过生产入口验证，消费者复用 userland runner。重定位与 TLS 分配由用户态动态链接器/libc 完成，不是待添加的内核 ELF 算法。glibc 与真实开发板 I-cache/熵源仍需单独验证；musl 成功不代表所有动态运行时已经兼容。LoongArch 后续复用通用 ELF 解析并提供 16 KiB/三级页表映像后端。
+真实根启动 fixture 验证 source-backed 静态入口；动态 musl PIE、解释器、额外 DSO、初始 TLS 和线程运行期间的 dlopen TLS 已通过生产入口验证，消费者复用 userland runner。固定 glibc 2.44 的静态/动态/PIE 与 pthread、dlopen TLS、信号子集由 `make test-glibc-riscv` 对照固定 Linux 验证。重定位与 TLS 分配由用户态动态链接器/libc 完成，不是待添加的内核 ELF 算法。更广 glibc 应用与真实开发板 I-cache/熵源仍需单独验证。LoongArch 后续复用通用 ELF 解析并提供 16 KiB/三级页表映像后端。

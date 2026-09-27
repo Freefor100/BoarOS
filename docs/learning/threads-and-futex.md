@@ -22,13 +22,15 @@ futex 是“用户态原子变量 + 内核等待队列”，不是每次加锁�
 
 固定 Linux `kernel/futex/waitwake.c` 中，无超时 WAIT 的 signal 结果是 `-ERESTARTSYS`；带超时 WAIT 则把用户地址、expected、flags 和首次换算出的 absolute time 写入 `restart_block`，返回 `-ERESTART_RESTARTBLOCK`。RISC-V signal 返回路径只让前者受 handler 的 `SA_RESTART` 控制；后者一旦实际执行用户 handler 就改为 EINTR，只有没有 handler 的路径切换到 `restart_syscall`。因此 timed WAIT 不能简单套用 generic restart，也不能在重启时重新解析原 relative timeout。
 
+glibc 2.44 的 `pthread_join` 在 fixed source `nptl/pthread_join_common.c` 调用 `__futex_abstimed_wait_cancelable64`；`nptl/futex-internal.c` 以 `FUTEX_WAIT_BITSET | FUTEX_CLOCK_REALTIME` 发出 raw syscall，即使未传 timeout 也使用 bitset 命令。BoarOS 曾让 `pthread_create` 成功，却在 `pthread_join` 返 ENOSYS 后由 glibc 报 futex fatal。只让 `FUTEX_BITSET_MATCH_ANY` 伪装成普通 WAIT 会错误处理其他非零掩码、绝对截止时刻和 WAKE_BITSET；在既有 per-task futex key 模型内，等待者另存掩码、REQUEUE 保持掩码，WAKE_BITSET 仅按相交位唤醒。固定 Linux `kernel/futex/syscalls.c` 与 `waitwake.c` 是错误顺序、掩码和绝对时钟依据。当前 BoarOS 没有修改 realtime 的 syscall，启动偏移不变；未来支持调时时，已经阻塞的 realtime wait 不能继续依赖这一固定偏移假设。
+
 WAIT 必须原子地完成“比较用户字与 expected → 登记 waiter → 阻塞”。若比较与登记之间允许另一个线程修改用户字并执行 WAKE，唤醒可能落在空队列上，随后登记的线程就会错过通知。单 hart 的 BoarOS 通过关闭中断覆盖该区间；未来 SMP 必须在同一哈希桶锁保护下重新完成比较与登记，关本地中断并不能阻止其他 hart。
 
 private waiter 使用单调分配且不复用的 MM 身份号和四字节对齐用户地址；共享匿名 waiter 使用后备对象身份和对象内连续字节偏移。哈希仅用于定位桶，命中后仍须比较完整 key。不同 MM 的相同虚拟地址不会串扰，fork 后不同 MM 的同一共享对象可以互相唤醒。等待者持有共享对象引用到等待调用恢复；requeue 为迁移者取得目标引用并释放源引用，避免最后一个映射消失后旧对象地址重用。单 hart 关中断串行化解析、比较与登记，SMP 仍须独立锁协议。
 
 选择单调 MM 身份号，是因为 shared→private requeue 可以把等待者迁移到发起方的私有 key；发起方 MM 若随后释放，单用 MM record 页地址会在物理页复用后让旧等待者撞上新 MM。让等待者长期持有该 MM 会延长整个地址空间生命周期。64 位单调号在耗尽时拒绝创建新 MM，不回卷复用；共享匿名对象则由现有引用保护其地址身份。此取舍只针对单 hart 生命周期，并未建立跨核同步。
 
-真实 U-mode 探针先用 fork 的独立 MM 验证共享唤醒，再覆盖共享→私有 requeue、同一对象内不同偏移迁移及不同对象同 VA 的隔离。最后由辅助线程撤销等待方的映射，发起方也撤销最后映射；等待者直到超时才释放对象引用。固定 Linux 同一 ELF 的基础共享 futex 差分记录为 334 条一致。现有用户映射接口不能把一个共享匿名对象另映射到不同 VA，所以那一类别名仍需后续 mremap 或共享文件映射验收。
+真实 U-mode 探针先用 fork 的独立 MM 验证共享唤醒，再覆盖共享→私有 requeue、同一对象内不同偏移迁移及不同对象同 VA 的隔离。最后由辅助线程撤销等待方的映射，发起方也撤销最后映射；等待者直到超时才释放对象引用。固定 Linux 同一 ELF 的差分入口同时覆盖基础共享 futex 与 bitset 参数、时钟和掩码交错。现有用户映射接口不能把一个共享匿名对象另映射到不同 VA，所以那一类别名仍需后续 mremap 或共享文件映射验收。
 
 REQUEUE 先唤醒指定数量，再将剩余指定数量移动到另一个 key；迁移不等于唤醒。条件变量可以借此避免广播时所有线程同时抢同一 mutex。源 key 与目标 key 可能哈希到同一桶，遍历必须以原队尾为边界，不能反复处理刚追加的节点。
 
@@ -48,3 +50,4 @@ BoarOS 使用 256 个桶和每队列 FIFO 成员链。普通唤醒不扫描全�
 
 - `references/linux/kernel/fork.c`、`kernel/exit.c`、`fs/exec.c`、`kernel/signal.c`、`kernel/futex/`：Linux commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`。
 - `references/musl/musl-1.2.5.tar.gz` 内 `src/thread/`、`src/ldso/` 与 `ldso/dynlink.c`：musl 1.2.5，SHA-256 `a9a118bbe84d8764da0ea0d28b3ab3fae8477fc7e4085d90102b8596fc7c75e4`。
+- `references/glibc/glibc-2.44.tar.xz` 内 `nptl/pthread_join_common.c`、`nptl/futex-internal.c`：glibc 2.44，SHA-256 `37f600f2bef3c5e8300147059568b2a2e40a7ad6ccc65ce942556d49429cc667`。固定 RV64 loader/libc 二进制身份见 `tests/userland/glibc/inputs.json`。

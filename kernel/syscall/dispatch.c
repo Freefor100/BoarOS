@@ -350,7 +350,9 @@ enum kernel_syscall_status kernel_syscall_dispatch(
                                       (uint32_t)request->arguments[1],
                                       (uint32_t)request->arguments[2],
                                       request->arguments[3],
-                                      request->arguments[4], &futex_status);
+                                      request->arguments[4],
+                                      (uint32_t)request->arguments[5],
+                                      &futex_status);
         if (futex_status != KERNEL_SCHEDULER_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     } else if (request->number == LINUX_SYSCALL_SET_TID_ADDRESS) {

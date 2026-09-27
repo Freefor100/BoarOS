@@ -23,6 +23,8 @@
 #define FUTEX_WAKE 1
 #define FUTEX_PRIVATE_FLAG 128
 #define FUTEX_WAIT_BITSET 9
+#define FUTEX_WAKE_BITSET 10
+#define FUTEX_CLOCK_REALTIME 256
 #define FUTEX_WAIT_PRIVATE (FUTEX_WAIT | FUTEX_PRIVATE_FLAG)
 #define FUTEX_WAIT_BITSET_PRIVATE (FUTEX_WAIT_BITSET | FUTEX_PRIVATE_FLAG)
 #define FUTEX_BITSET_MATCH_ANY UINT32_MAX
@@ -227,6 +229,48 @@ static int check_timed_futex_stop_restart(void)
             elapsed_ns > INT64_C(400000000)) return 5;
     }
     return 0;
+}
+
+static int check_bitset_stop_restart(void)
+{
+    struct timespec delay = { .tv_sec = 0, .tv_nsec = 60000000L };
+    struct timespec stopped = { .tv_sec = 0, .tv_nsec = 100000000L };
+    struct timespec settled = { .tv_sec = 0, .tv_nsec = 20000000L };
+    struct timespec deadline;
+    int *word = mmap(0, 4096, PROT_READ | PROT_WRITE,
+                     MAP_ANONYMOUS | MAP_SHARED, -1, 0);
+    int status = 0;
+    pid_t controller;
+
+    if (word == MAP_FAILED) return 1;
+    if (clock_gettime(CLOCK_REALTIME, &deadline) != 0) return 2;
+    deadline.tv_nsec += 500000000L;
+    deadline.tv_sec += deadline.tv_nsec / 1000000000L;
+    deadline.tv_nsec %= 1000000000L;
+    controller = fork();
+    if (controller < 0) return 3;
+    if (controller == 0) {
+        pid_t parent = getppid();
+        long unmatched, matched;
+
+        if (nanosleep(&delay, 0) != 0 || kill(parent, SIGSTOP) != 0 ||
+            nanosleep(&stopped, 0) != 0 || kill(parent, SIGCONT) != 0 ||
+            nanosleep(&settled, 0) != 0) _exit(1);
+        unmatched = syscall(SYS_futex, word, FUTEX_WAKE_BITSET,
+                            1, 0, 0, 1);
+        matched = syscall(SYS_futex, word, FUTEX_WAKE_BITSET,
+                          1, 0, 0, 2);
+        _exit(unmatched == 0 && matched == 1 ? 0 : 2);
+    }
+    errno = 0;
+    long result = syscall(SYS_futex, word,
+                          FUTEX_WAIT_BITSET | FUTEX_CLOCK_REALTIME,
+                          0, &deadline, 0, 2);
+    int saved_errno = errno;
+    if (waitpid(controller, &status, 0) != controller ||
+        !WIFEXITED(status) || WEXITSTATUS(status) != 0 ||
+        munmap(word, 4096) != 0) return 4;
+    return result == 0 && saved_errno == 0 ? 0 : 5;
 }
 
 static _Thread_local int executable_tls = 101;
@@ -781,8 +825,8 @@ static int check_raw_futex(void)
         { (void *)(uintptr_t)8, FUTEX_WAIT_PRIVATE, 0, 0, 0, EFAULT },
         { (char *)&word + 1, FUTEX_WAIT_PRIVATE, 1, 0, 0, EINVAL },
         { &word, FUTEX_WAIT_PRIVATE, 1, &zero, 0, ETIMEDOUT },
-        { &word, FUTEX_WAIT_BITSET_PRIVATE, 1, 0,
-          FUTEX_BITSET_MATCH_ANY, ENOSYS },
+        { &word, FUTEX_WAIT_BITSET_PRIVATE, 1, &zero,
+          FUTEX_BITSET_MATCH_ANY, ETIMEDOUT },
     };
 
     for (size_t i = 0; i < ARRAY_SIZE(cases); i++) {
@@ -811,6 +855,7 @@ static int check_raw_futex(void)
     if (check_timed_futex_stop_restart() != 0) return 15;
     if (check_futex_wake_signal_boundary() != 0) return 16;
     if (check_futex_timeout_signal_boundary() != 0) return 17;
+    if (check_bitset_stop_restart() != 0) return 18;
     return 0;
 }
 

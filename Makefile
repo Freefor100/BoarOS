@@ -1060,6 +1060,11 @@ test-userland-riscv: $(REAL_USERLAND_RV) $(PTHREAD_USERLAND_RV) \
 		PTHREAD_TLS_DSO_RV=$(PTHREAD_TLS_DSO_RV) MUSL_LDSO=$(MUSL_LDSO) \
 		./tests/userland-riscv.sh
 
+.PHONY: test-glibc-riscv
+test-glibc-riscv: $(KERNEL_RV)
+	PYTHONDONTWRITEBYTECODE=1 python3 tests/userland/glibc/run.py \
+		--kernel $(KERNEL_RV) --qemu $(QEMU_RISCV64)
+
 test-brk-riscv: test-sv39-riscv test-vma-riscv \
 		test-elf64-riscv test-syscall-riscv \
 		test-root-init-riscv

@@ -70,6 +70,7 @@ struct kernel_syscall_restart_state {
             uint64_t deadline_ns;
             uint32_t operation;
             uint32_t expected;
+            uint32_t bitset;
         } futex_timed;
     } value;
 };
@@ -147,6 +148,7 @@ struct kernel_task {
     struct kernel_wait_node default_wait_node;
     struct kernel_task *blocked_previous;
     struct kernel_futex_key futex_key;
+    uint32_t futex_bitset;
     uint64_t signal_pending;
     uint64_t signal_blocked;
     uint64_t signal_wait_mask;

@@ -91,6 +91,14 @@ SQLite 大事务需要 Unix VFS 探测临时目录。固定 `build/riscv/sqlite/
 
 `tests/host/nbd_fault.c` 经 Unix socket 给 QEMU 提供 fixed-newstyle、simple replies 的 READ/WRITE/FLUSH/DISC，只宣告 `HAS_FLAGS|SEND_FLUSH`。`tests/host/block_fault.c` 是 512 字节原子写、易失可见内容、稳定镜像的真实故障模型；只有成功 FLUSH 承诺此前事件持久化。`make test-nbd-host` 检查握手、读写、写/flush 失败和丢失、部分保存、反序保存。`make test-sqlite-recovery-matrix-riscv` 使用串口与宿主信号握手，仅对 SQLite 事务内的 NBD 事件编号，逐个注入写/flush 错误和断电位置；断电先冻结服务，再杀 QEMU，从同一稳定初态恢复。2026-09-27 的 DELETE 小事务有 100 次写和 47 次 flush；441 个断电组合与逐位置 147 个写/flush 失败均通过。QEMU 基线为本地 `references/qemu/` commit `84f07211cc5b4fc6a371559bf8a5de4fb068e648`，执行环境为 QEMU 11.1.1。这些入口使用隔离镜像，成功后清理一次性目录；未确认提交只允许完整旧值或完整新值，已确认提交必须保留新值。不证明实板持久性。
 
+## glibc 2.44 独立矩阵
+
+`tests/userland/glibc/inputs.json` 固定宿主 RV64 GNU 工具链的 GCC、assembler、linker，以及未经修改的 `/usr/riscv64-linux-gnu/lib/ld-linux-riscv64-lp64d.so.1` 和 `libc.so.6` 的绝对路径与 SHA-256。loader 为 `f7c08812fe4e07dab8c3895ec3134a9c6695bfd1ece495530b280c1edfc11edb`，libc 为 `4103e7ae1d355639a116bd5393fd9ba03c6a3cd78b8e08bafd3fe9642c6fe9f5`；libc 内版本字符串为 2.44。身份不符即失败，不以另一个宿主 glibc 代跑。固定源码参考为 `references/glibc/glibc-2.44.tar.xz`，SHA-256 `37f600f2bef3c5e8300147059568b2a2e40a7ad6ccc65ce942556d49429cc667`；官方 URL 和 2026-09-27 访问日期见 `references/sources.tsv`。源码归档用于 ABI/许可证分析，不代表已证明宿主二进制从该归档逐位重建。
+
+`make test-glibc-riscv` 编译同一源的静态 ET_EXEC、动态 ET_EXEC、动态 PIE、静态 PIE 和动态 pthread PIE，以及独立 TLS DSO；各 ELF 保留 GNU 编译器默认启动对象和 glibc，不修改二进制绕开内核。runner 将同一 ELF、loader/libc/DSO 分别放入 Linux 和 BoarOS 的隔离 ext4 镜像，使用固定 Linux commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`。它按 constructor/main、运行时、`atexit` 和 BoarOS 资源回收逐段判定失败。组合探针覆盖初始 TLS、`dlopen` 后主线程与新线程的独立 TLS、`pthread_create/join`、信号 handler 和退出；输出身份保存于 `build/riscv/glibc/identity.json`，成功后的运行镜像自动清理。构建命令为 `make test-glibc-riscv`。这只是固定版本上的已列举 ABI 子集，完整 glibc 应用及离线客体内编译仍待独立验证。
+
+glibc 2.44 的 `pthread_join` 通过 `FUTEX_WAIT_BITSET | FUTEX_CLOCK_REALTIME` 等待线程退出；初始试跑在 BoarOS 返回 ENOSYS，glibc 因意外 futex 错误退出。`tests/diff-abi/futex_shared.c` 的同一 ELF 现在对照固定 Linux 检查 bitset 零值、绝对时钟、用户 fault、按掩码唤醒与 requeue；`tests/userland/pthread.c` 进一步检查 stop/continue 重启保留掩码与原截止时刻。当前内核 realtime offset 启动后不变，可一次换算为 monotonic；引入调时 syscall 时需重新处理阻塞中的 realtime deadline。
+
 ## 双侧执行与失败所有权
 
 `make inventory-userland-riscv` 调用 `run.py` 构建上述完整 BusyBox 和

@@ -196,6 +196,7 @@ void abi_main(const unsigned long *initial_stack)
     abi_shared_file_truncate_cases();
     abi_access_cases();
     abi_futex_shared_cases();
+    abi_futex_bitset_cases();
     abi_file_lock_cases();
     partial_cases(); abi_truncate_cases();
     abi_timestamp_cases(); abi_readv_cases();

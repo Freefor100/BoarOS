@@ -9,6 +9,10 @@
 
 #define FUTEX_BUCKETS 256U
 #define FUTEX_PRIVATE 128U
+#define FUTEX_CLOCK_REALTIME 256U
+#define FUTEX_WAIT_BITSET 9U
+#define FUTEX_WAKE_BITSET 10U
+#define FUTEX_BITSET_MATCH_ANY UINT32_MAX
 #define FUTEX_WAITERS UINT32_C(0x80000000)
 #define FUTEX_OWNER_DIED UINT32_C(0x40000000)
 #define FUTEX_TID_MASK UINT32_C(0x3fffffff)
@@ -114,7 +118,8 @@ static void futex_key_requeue(struct kernel_task *task,
 
 static int64_t futex_wake(const struct kernel_futex_key *source,
                           uint32_t count, uint32_t requeue,
-                          const struct kernel_futex_key *target)
+                          const struct kernel_futex_key *target,
+                          uint32_t bitset)
 {
     struct kernel_wait_queue *queue = futex_bucket(source);
     struct kernel_wait_node *node = queue->head;
@@ -126,11 +131,11 @@ static int64_t futex_wake(const struct kernel_futex_key *source,
         struct kernel_task *task = node->task;
 
         if (task != 0 && futex_key_equal(&task->futex_key, source)) {
-            if (woken < count) {
+            if (woken < count && (task->futex_bitset & bitset) != 0U) {
                 blocked_unlink(task);
                 scheduler_wake_task(task, KERNEL_WAIT_WOKEN);
                 woken++;
-            } else {
+            } else if (moved < requeue) {
                 futex_key_requeue(task, target);
                 scheduler_wait_requeue(task, futex_bucket(target));
                 moved++;
@@ -145,6 +150,7 @@ static int64_t futex_wake(const struct kernel_futex_key *source,
 static int64_t futex_wait_until(struct kernel_task *task, uint64_t address,
                                 uint32_t operation, uint32_t value,
                                 int has_timeout, uint64_t deadline_ns,
+                                uint32_t bitset,
                                 enum kernel_scheduler_status *status)
 {
     struct kernel_futex_key key;
@@ -189,15 +195,18 @@ static int64_t futex_wait_until(struct kernel_task *task, uint64_t address,
     /* SIE stays clear from comparison through enqueue and context switch.
      * No other user thread can change the word between these operations. */
     task->futex_key = key;
+    task->futex_bitset = bitset;
     *status = kernel_scheduler_block_current(
         futex_bucket(&key), deadline, 1, &reason);
     futex_key_release(&task->futex_key);
+    task->futex_bitset = 0U;
     if (*status != KERNEL_SCHEDULER_STATUS_OK) return 0;
     if (reason == KERNEL_WAIT_TIMEOUT) return -KERNEL_ETIMEDOUT;
     if (reason == KERNEL_WAIT_SIGNALLED) {
         if (has_timeout) {
             kernel_signal_note_futex_timed_restart(task, address, operation,
-                                                   value, deadline_ns);
+                                                   value, deadline_ns,
+                                                   bitset);
         }
         return -KERNEL_ERESTARTSYS;
     }
@@ -207,10 +216,11 @@ static int64_t futex_wait_until(struct kernel_task *task, uint64_t address,
 int64_t kernel_futex(struct kernel_task *task, uint64_t address,
                      uint32_t operation, uint32_t value,
                      uint64_t timeout_or_count, uint64_t address2,
+                     uint32_t bitset,
                      enum kernel_scheduler_status *status)
 {
     struct kernel_futex_key source, target;
-    uint32_t command = operation & ~FUTEX_PRIVATE;
+    uint32_t command = operation & ~(FUTEX_PRIVATE | FUTEX_CLOCK_REALTIME);
     uint64_t deadline_ns = 0U;
     int64_t result;
     size_t copied = 0U;
@@ -221,12 +231,53 @@ int64_t kernel_futex(struct kernel_task *task, uint64_t address,
         *status = KERNEL_SCHEDULER_STATUS_INVALID_STATE;
         return 0;
     }
-    if (command != 0U && command != 1U && command != 3U)
+    if (command != 0U && command != 1U && command != 3U &&
+        command != FUTEX_WAIT_BITSET && command != FUTEX_WAKE_BITSET)
         return -KERNEL_ENOSYS;
+    if ((command == 0U || command == FUTEX_WAIT_BITSET) &&
+        timeout_or_count != 0U) {
+        struct { int64_t seconds, nanoseconds; } duration;
+        uint64_t now;
+        __uint128_t nanoseconds;
+
+        access = kernel_copy_from_user(&task->mm, &duration,
+                                        timeout_or_count, sizeof(duration),
+                                        &copied);
+        if (access != KERNEL_UACCESS_STATUS_OK &&
+            access != KERNEL_UACCESS_STATUS_FAULT) {
+            *status = KERNEL_SCHEDULER_STATUS_INVALID_STATE;
+            return 0;
+        }
+        if (access != KERNEL_UACCESS_STATUS_OK || copied != sizeof(duration))
+            return -KERNEL_EFAULT;
+        if (duration.seconds < 0 || duration.nanoseconds < 0 ||
+            duration.nanoseconds >= 1000000000) return -KERNEL_EINVAL;
+        nanoseconds = (__uint128_t)(uint64_t)duration.seconds * 1000000000U +
+                (uint64_t)duration.nanoseconds;
+        if (nanoseconds > INT64_MAX) nanoseconds = INT64_MAX;
+        if (command == FUTEX_WAIT_BITSET) {
+            uint64_t absolute = (uint64_t)nanoseconds;
+
+            if ((operation & FUTEX_CLOCK_REALTIME) != 0U) {
+                uint64_t offset = kernel_time_boot_realtime_offset();
+                deadline_ns = absolute <= offset ? 0U : absolute - offset;
+            } else deadline_ns = absolute;
+        } else {
+            now = kernel_time_monotonic_ns();
+            deadline_ns = now >= INT64_MAX ||
+                          nanoseconds > (uint64_t)INT64_MAX - now
+                              ? INT64_MAX
+                              : now + (uint64_t)nanoseconds;
+        }
+    }
+    if ((operation & FUTEX_CLOCK_REALTIME) != 0U &&
+        command != FUTEX_WAIT_BITSET) return -KERNEL_ENOSYS;
+    if ((command == FUTEX_WAIT_BITSET || command == FUTEX_WAKE_BITSET) &&
+        bitset == 0U) return -KERNEL_EINVAL;
     if ((address & 3U) != 0U) return -KERNEL_EINVAL;
     if (kernel_user_range_check(address, sizeof(uint32_t)) !=
         KERNEL_UACCESS_STATUS_OK) return -KERNEL_EFAULT;
-    if (command == 1U || command == 3U) {
+    if (command == 1U || command == 3U || command == FUTEX_WAKE_BITSET) {
         if ((int32_t)value < 0) return -KERNEL_EINVAL;
         if (command == 3U && ((address2 & 3U) != 0U ||
             address == address2 || timeout_or_count > INT32_MAX))
@@ -247,60 +298,43 @@ int64_t kernel_futex(struct kernel_task *task, uint64_t address,
         }
         result = futex_wake(&source, value,
                             command == 3U ? (uint32_t)timeout_or_count : 0U,
-                            command == 3U ? &target : 0);
+                            command == 3U ? &target : 0,
+                            command == FUTEX_WAKE_BITSET
+                                ? bitset : FUTEX_BITSET_MATCH_ANY);
         if (command == 3U) futex_key_release(&target);
         futex_key_release(&source);
         return result;
     }
-    if (timeout_or_count != 0U) {
-        struct { int64_t seconds, nanoseconds; } duration;
-        uint64_t now;
-        __uint128_t delta;
-
-        access = kernel_copy_from_user(&task->mm, &duration,
-                                        timeout_or_count, sizeof(duration),
-                                        &copied);
-        if (access != KERNEL_UACCESS_STATUS_OK &&
-            access != KERNEL_UACCESS_STATUS_FAULT) {
-            *status = KERNEL_SCHEDULER_STATUS_INVALID_STATE;
-            return 0;
-        }
-        if (access != KERNEL_UACCESS_STATUS_OK || copied != sizeof(duration))
-            return -KERNEL_EFAULT;
-        if (duration.seconds < 0 || duration.nanoseconds < 0 ||
-            duration.nanoseconds >= 1000000000) return -KERNEL_EINVAL;
-        delta = (__uint128_t)(uint64_t)duration.seconds * 1000000000U +
-                (uint64_t)duration.nanoseconds;
-        now = kernel_time_monotonic_ns();
-        deadline_ns = now >= INT64_MAX ||
-                      delta > (uint64_t)INT64_MAX - now
-                          ? INT64_MAX
-                          : now + (uint64_t)delta;
-    }
     return futex_wait_until(task, address, operation, value,
-                            timeout_or_count != 0U, deadline_ns, status);
+                            timeout_or_count != 0U, deadline_ns,
+                            command == FUTEX_WAIT_BITSET
+                                ? bitset : FUTEX_BITSET_MATCH_ANY,
+                            status);
 }
 
 int64_t kernel_futex_restart_timed(
     struct kernel_task *task, uint64_t address, uint32_t operation,
-    uint32_t value, uint64_t deadline_ns,
+    uint32_t value, uint64_t deadline_ns, uint32_t bitset,
     enum kernel_scheduler_status *status)
 {
-    uint32_t command = operation & ~FUTEX_PRIVATE;
+    uint32_t command = operation & ~(FUTEX_PRIVATE | FUTEX_CLOCK_REALTIME);
 
     *status = KERNEL_SCHEDULER_STATUS_OK;
     if (task != scheduler.current || riscv_interrupt_is_enabled()) {
         *status = KERNEL_SCHEDULER_STATUS_INVALID_STATE;
         return 0;
     }
-    if (command != 0U || (address & 3U) != 0U ||
+    if ((command != 0U && command != FUTEX_WAIT_BITSET) ||
+        ((operation & FUTEX_CLOCK_REALTIME) != 0U &&
+         command != FUTEX_WAIT_BITSET) || bitset == 0U ||
+        (address & 3U) != 0U ||
         kernel_user_range_check(address, sizeof(uint32_t)) !=
             KERNEL_UACCESS_STATUS_OK) {
         *status = KERNEL_SCHEDULER_STATUS_INVALID_STATE;
         return 0;
     }
     return futex_wait_until(task, address, operation, value, 1,
-                            deadline_ns, status);
+                            deadline_ns, bitset, status);
 }
 
 static void futex_wake_user(struct kernel_task *task, uint64_t address)
@@ -314,7 +348,7 @@ static void futex_wake_user(struct kernel_task *task, uint64_t address)
         futex_key_acquire(task, address, 0U, &key, &status) != 0 ||
         status != KERNEL_SCHEDULER_STATUS_OK)
         return;
-    (void)futex_wake(&key, 1U, 0U, 0);
+    (void)futex_wake(&key, 1U, 0U, 0, FUTEX_BITSET_MATCH_ANY);
     futex_key_release(&key);
 }
 

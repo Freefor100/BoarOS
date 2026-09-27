@@ -86,7 +86,8 @@ int kernel_signal_futex_timed_restart(const struct kernel_task *task,
                                       uint64_t *address,
                                       uint32_t *operation,
                                       uint32_t *expected,
-                                      uint64_t *deadline_ns);
+                                      uint64_t *deadline_ns,
+                                      uint32_t *bitset);
 enum kernel_signal_status kernel_signal_suspend(struct kernel_task *task,
                                                 uint64_t mask);
 enum kernel_signal_status kernel_signal_set_temporary_mask(
@@ -113,7 +114,8 @@ void kernel_signal_note_futex_timed_restart(struct kernel_task *task,
                                             uint64_t address,
                                             uint32_t operation,
                                             uint32_t expected,
-                                            uint64_t deadline_ns);
+                                            uint64_t deadline_ns,
+                                            uint32_t bitset);
 
 /* Sends a process-directed signal to the target's thread group. */
 enum kernel_signal_status kernel_signal_send(struct kernel_task *target,

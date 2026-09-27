@@ -71,7 +71,8 @@ void kernel_signal_note_futex_timed_restart(struct kernel_task *task,
                                             uint64_t address,
                                             uint32_t operation,
                                             uint32_t expected,
-                                            uint64_t deadline_ns)
+                                            uint64_t deadline_ns,
+                                            uint32_t bitset)
 {
     if (task != 0 && task != &scheduler.idle &&
         task->magic == KERNEL_THREAD_MAGIC && task->arch.user_mode == 1U) {
@@ -82,6 +83,7 @@ void kernel_signal_note_futex_timed_restart(struct kernel_task *task,
                 .deadline_ns = deadline_ns,
                 .operation = operation,
                 .expected = expected,
+                .bitset = bitset,
             },
         };
     }
@@ -1102,7 +1104,8 @@ int kernel_signal_futex_timed_restart(const struct kernel_task *task,
                                       uint64_t *address,
                                       uint32_t *operation,
                                       uint32_t *expected,
-                                      uint64_t *deadline_ns)
+                                      uint64_t *deadline_ns,
+                                      uint32_t *bitset)
 {
     if (task->syscall_restart.kind != KERNEL_SYSCALL_RESTART_FUTEX_TIMED)
         return 0;
@@ -1110,6 +1113,7 @@ int kernel_signal_futex_timed_restart(const struct kernel_task *task,
     *operation = task->syscall_restart.value.futex_timed.operation;
     *expected = task->syscall_restart.value.futex_timed.expected;
     *deadline_ns = task->syscall_restart.value.futex_timed.deadline_ns;
+    *bitset = task->syscall_restart.value.futex_timed.bitset;
     return 1;
 }
 

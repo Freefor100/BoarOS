@@ -23,3 +23,5 @@ BoarOS 采用 GPL-2.0-only；仓库根目录 `LICENSE` 保存完整许可证文�
 - 显式时间扩展提供 `ext4_file_set_times` 位掩码事务接口，沿用 inode 真实字段、错误 owner 和同步依赖；时间范围端点按 Linux 清零纳秒。统计扩展返回校验后的 metadata/journal overhead、保留块及 UUID，静态开销按 mount 缓存，动态分配数读真实 superblock。修正 first_data_block 组边界、META_BG 主描述符定位和 sparse_super2 备份组判断；`make test-lwext4-metadata-host` 验证几何、OOM、I/O、损坏和 e2fsck。
 
 SQLite 3.53.4 作为固定外部测试构建输入使用：官方 amalgamation 压缩包保存在被忽略的 `references/sqlite/`，来源和 SHA-256 由 `references/sources.tsv` 固定；构建时在 `build/riscv/sqlite/` 解包，未把 SQLite 源码导入 Git，也未对上游源码作本地修改。其发布声明为 public domain；用途是验证原生 Unix VFS、记录锁与回滚日志持久性，见[程序环境](modules/program-environment.md)。
+
+glibc 2.44 作为外部测试输入使用：官方源码归档保存在被忽略的 `references/glibc/`，来源和 SHA-256 由 `references/sources.tsv` 固定；RV64 loader/libc 直接取自宿主 GNU 交叉工具链，并由 `tests/userland/glibc/inputs.json` 的 SHA-256 固定，未导入 Git 或修改。相关源码按 LGPL-2.1-or-later 发布，归档含 `COPYING.LIB` 和 `LICENSES`；本仓库新增的探针只测试其原生启动、TLS、pthread、信号与退出路径，见[程序环境](modules/program-environment.md)。

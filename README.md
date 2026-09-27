@@ -14,7 +14,7 @@ BoarOS 是从零搭建、面向 OS Comp 能力建设的 C / 少量汇编内核�
 |---|---|---|
 | 启动与内存 | OpenSBI、DTB、高半区/direct map、buddy/slab、连续页和引用回收 | 无 SMP；任务栈有 canary/高水位，没有未映射 guard page |
 | 虚拟内存 | VMA、按需匿名页、共享匿名与共享文件映射、文件私有 COW、共享文件首次写追踪、`msync`、跨 MM 截断撤映射 | 无 `mremap`、共享文件 futex、匿名共享页 swap 回收或 SMP 页表同步 |
-| ELF / exec | 按需 ELF、PIE、`PT_INTERP`、初始栈/auxv、musl DSO/TLS、失败保持旧映像 | glibc 未独立验证；无 shebang、`getrandom` |
+| ELF / exec | 按需 ELF、PIE、`PT_INTERP`、初始栈/auxv、musl DSO/TLS、固定 glibc 2.44 启动/TLS/pthread 子集、失败保持旧映像 | 无 shebang、`getrandom`；glibc 应用覆盖尚有限 |
 | 进程与等待 | fork/vfork、pthread clone、线程组退出、非组长 exec、wait/zombie/reparent、FIFO 抢占、时钟与睡眠 | 合法 clone 组合仍有限；无完整会话/TTY；单 hart 关中断不等于跨核同步 |
 | futex / 信号 | WAIT/WAKE/REQUEUE、超时/重启、跨 MM 共享匿名 futex、同 MM 非 PI robust-list 退出清理、标准信号、用户 handler、`rt_sigtimedwait` | 无共享文件 futex、PI futex、实时信号队列和 `sigaltstack`；单 hart 验证范围 |
 | 文件与事件 | fd/OFD 分离、dup/CLOEXEC、共享 offset、阻塞 pin、部分/向量/定位 I/O、pipe、poll/select/epoll；传统与 OFD 记录锁；ext4 节点按设备号接入 null、zero、console | 无 devfs、完整 TTY 或 socket 后端；设备 mmap 未支持 |
@@ -23,7 +23,7 @@ BoarOS 是从零搭建、面向 OS Comp 能力建设的 C / 少量汇编内核�
 | 身份与资源 | 单用户 root 的 UID/GID 查询；线程组共享并执行 NOFILE/STACK，fork 继承、exec 保留 | 无凭据变更/完整权限；fd 硬容量 1024、栈硬容量 8 MiB；其他有效 limit 返回 `ENOTSUP` |
 | 平台与网络 | RISC-V QEMU 真实根盘 `/init` 与 musl 用户态 | 无 socket 传输链、外部中断、LoongArch、实板或多核验证 |
 
-文件层已有部分读写、OFD 生命周期、稀疏文件与映射截断的语义深度；显式时间设置和真实挂载统计已接入；共享匿名映射与共享文件页可跨 MM 读写，完整 TTY 仍有缺口。ext4 恢复已覆盖 512 字节原子写、未 flush 写丢失或重排的故障模型；实板持久性仍待独立验证。动态 musl 通过不代表完整 glibc 兼容。
+文件层已有部分读写、OFD 生命周期、稀疏文件与映射截断的语义深度；显式时间设置和真实挂载统计已接入；共享匿名映射与共享文件页可跨 MM 读写，完整 TTY 仍有缺口。ext4 恢复已覆盖 512 字节原子写、未 flush 写丢失或重排的故障模型；实板持久性仍待独立验证。固定 glibc 2.44 的五种 ELF 形态与 TLS/pthread/信号组合已双侧验证，完整 glibc 应用兼容尚未证明。
 
 固定 SQLite 3.53.4 的原生 Unix VFS 已在单 hart 上运行静态/动态 CLI、多进程 DELETE 回滚日志和普通多进程 WAL；WAL 工作负载用同一 ELF 在固定 Linux 与 BoarOS 验证 writer 竞争、未提交进程退出及第二次启动后的完整性。DELETE 与 WAL 的 EXTRA/FULL 恢复各有 NBD 断电/故障矩阵；实板持久性未验证。
 
@@ -39,6 +39,7 @@ BoarOS 是从零搭建、面向 OS Comp 能力建设的 C / 少量汇编内核�
 make all                       # kernel-rv
 make test-riscv                 # 通用模块、架构与真实根启动
 make test-userland-riscv        # 静态 musl、动态 pthread / TLS
+make test-glibc-riscv           # 固定 glibc 2.44 静态/动态/PIE、TLS、pthread
 make test-diff-abi-riscv        # 同一 ELF 对照固定 Linux
 make test-record-lock-host      # 区间树随机模型、所有权与分配失败
 make test-record-lock-riscv     # 同 ELF 的 Linux/BoarOS 线程、fork、fd 复用、退出
@@ -66,7 +67,7 @@ make test-references
 
 ## 近期工作与文档
 
-[TODO 与阶段依赖](docs/goals.md)集中维护下一步、阻塞与验收：块同步、逐 inode 写回、journal/replay、cwd/dirfd/rename、时间与统计、同 MM 非 PI robust-list、共享匿名对象及其跨 MM futex 已落地；记录锁、SQLite 回滚日志、共享文件映射、`msync` 和普通多进程 WAL 各有验证入口。历史取消异常在固定输入重复运行中未复现，根因仍未确定。WAL 断电矩阵和共享文件页的写回/分配故障交错已验收；跨 hart 的真实并发写回、不同 VA 的共享 futex、`mremap`/`madvise` 仍按各自依赖推进；glibc、LoongArch 和网络另行推进。SMP 先验证所有权、唤醒和 TLB 回收，再谈调度策略与性能。
+[TODO 与阶段依赖](docs/goals.md)集中维护下一步、阻塞与验收：块同步、逐 inode 写回、journal/replay、cwd/dirfd/rename、时间与统计、同 MM 非 PI robust-list、共享匿名对象及其跨 MM futex 已落地；记录锁、SQLite 回滚日志、共享文件映射、`msync` 和普通多进程 WAL 各有验证入口。历史取消异常在固定输入重复运行中未复现，根因仍未确定。WAL 断电矩阵和共享文件页的写回/分配故障交错已验收；跨 hart 的真实并发写回、不同 VA 的共享 futex、`mremap`/`madvise` 仍按各自依赖推进。glibc 独立基础矩阵已建立，离线客体内编译、LoongArch 和网络另行推进。SMP 先验证所有权、唤醒和 TLB 回收，再谈调度策略与性能。
 
 - [文档导航](docs/README.md)：模块契约与可复用学习材料。
 - [工程原则](docs/design.md)与[贡献说明](CONTRIBUTING.md)：技术取舍、验证与提交边界。
