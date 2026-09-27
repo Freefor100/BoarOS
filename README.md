@@ -17,11 +17,11 @@ BoarOS 是从零搭建、面向 OS Comp 能力建设的 C / 少量汇编内核�
 | ELF / exec | 按需 ELF、PIE、`PT_INTERP`、初始栈/auxv、musl DSO/TLS、固定 glibc 2.44 启动/TLS/pthread 子集、失败保持旧映像 | 无 shebang、`getrandom`；glibc 应用覆盖尚有限 |
 | 进程与等待 | fork/vfork、pthread clone、线程组退出、非组长 exec、wait/zombie/reparent、FIFO 抢占、时钟与睡眠 | 合法 clone 组合仍有限；无完整会话/TTY；单 hart 关中断不等于跨核同步 |
 | futex / 信号 | WAIT/WAKE/REQUEUE、超时/重启、跨 MM 共享匿名 futex、同 MM 非 PI robust-list 退出清理、标准信号、用户 handler、`rt_sigtimedwait` | 无共享文件 futex、PI futex、实时信号队列和 `sigaltstack`；单 hart 验证范围 |
-| 文件与事件 | fd/OFD 分离、dup/CLOEXEC、共享 offset、阻塞 pin、部分/向量/定位 I/O、pipe、poll/select/epoll；传统与 OFD 记录锁；ext4 节点按设备号接入 null、zero、console | 无 devfs、完整 TTY 或 socket 后端；设备 mmap 未支持 |
+| 文件与事件 | fd/OFD 分离、dup/CLOEXEC、共享 offset、阻塞 pin、部分/向量/定位 I/O、pipe、poll/select/epoll；传统与 OFD 记录锁；socket OFD 与读写/就绪；ext4 节点按设备号接入 null、zero、console | 无 devfs、完整 TTY；设备 mmap 未支持 |
 | 路径与 ext4 | 共享活目录项、cwd/dirfd、普通/NOREPLACE rename、可写/只读根盘、符号链接、目录枚举、稀疏文件、显式纳秒时间、真实文件系统统计、打开后删除、私有映射截断 | 无硬链接、EXCHANGE/WHITEOUT、多挂载或完整权限 |
 | 缓存与存储 | read/write/private fault 共用文件页、inode 脏范围与定向写回、OFD 错误观察、`fsync/fdatasync/O_SYNC/O_DSYNC`；VirtIO legacy/modern flush | ordered journal/replay、持久 orphan；恢复承诺限于已验证块模型，无后台写回线程 |
 | 身份与资源 | 单用户 root 的 UID/GID 查询；线程组共享并执行 NOFILE/STACK，fork 继承、exec 保留 | 无凭据变更/完整权限；fd 硬容量 1024、栈硬容量 8 MiB；其他有效 limit 返回 `ENOTSUP` |
-| 平台与网络 | RISC-V QEMU 真实根盘 `/init` 与 musl 用户态 | 无 socket 传输链、外部中断、LoongArch、实板或多核验证 |
+| 平台与网络 | RISC-V QEMU 真实根盘 `/init` 与 musl 用户态；单 hart IPv4 UDP/TCP loopback，固定 lwIP 2.2.1 raw API | 无 AF_UNIX、真实网卡链路、外部中断、LoongArch、实板或多核验证 |
 
 文件层已有部分读写、OFD 生命周期、稀疏文件与映射截断的语义深度；显式时间设置和真实挂载统计已接入；共享匿名映射与共享文件页可跨 MM 读写，完整 TTY 仍有缺口。ext4 恢复已覆盖 512 字节原子写、未 flush 写丢失或重排的故障模型；实板持久性仍待独立验证。固定 glibc 2.44 的五种 ELF 形态与 TLS/pthread/信号组合已双侧验证，完整 glibc 应用兼容尚未证明。
 
@@ -30,6 +30,8 @@ BoarOS 是从零搭建、面向 OS Comp 能力建设的 C / 少量汇编内核�
 客体内固定 Alpine v3.22 RV64 GCC 14.2.0-r6 已在同一离线镜像上完成预处理、编译、汇编、静态链接和运行；固定 Linux 与 BoarOS 的五阶段状态、产物哈希和输出一致。范围是固定的小型 C 负载，其他项目和 Rust 尚未验收。
 
 2026-09-27 最近一次固定 BusyBox/libc-test 全量验证（输入与身份见[程序清单](docs/learning/user-program-inventory.md)）：228 个顶层案例全部完成，223 项双侧一致、2 个直接 entry 退出不符、3 个包装脚本断言失败；离线编译整合后仍是原 socket 静态/动态和原包装器五项，无旧通过项回退。BusyBox 原脚本为 50/55 success，另有独立 pwd/cd/mv/touch 组合双侧通过。包装脚本与 entry 有重叠，清单完成不等于全部兼容。
+
+在该全量基线之后，首个网络切片的 35 条 socket Linux/BoarOS 差分及未修改 libc-test 静态、动态 socket 直接 entry 已聚焦通过；全量 228 项仍需在合并后的内核上重跑，故上段保留最后一次全量统计。网络对象、池界限与尚未覆盖的接口见[网络模块](docs/modules/kernel-network.md)。
 
 ## 构建与验证
 
@@ -41,6 +43,7 @@ make test-riscv                 # 通用模块、架构与真实根启动
 make test-userland-riscv        # 静态 musl、动态 pthread / TLS
 make test-glibc-riscv           # 固定 glibc 2.44 静态/动态/PIE、TLS、pthread
 make test-diff-abi-riscv        # 同一 ELF 对照固定 Linux
+make test-lwip-host             # loopback、UDP 池耗尽/重用、TCP 定时回收
 make test-record-lock-host      # 区间树随机模型、所有权与分配失败
 make test-record-lock-riscv     # 同 ELF 的 Linux/BoarOS 线程、fork、fd 复用、退出
 make test-nbd-host              # NBD 协议、易失/稳定镜像与断电策略

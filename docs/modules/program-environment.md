@@ -102,6 +102,18 @@ musl `/init`。它从 `/work/tools.conf` 读取客体内编译器、汇编器绝
 
 它只证明此固定 C 源码、静态链接与单核环境的客体离线编译闭环；其他 C
 项目、C++、Rust 或持续本机自举仍需独立验证。
+原版 libc-test `functional/socket.c` 的静态和动态 entry 可单独验收：
+
+```sh
+python3 tests/program-inventory/run.py --suite libc \
+  --case libc.static.socket --case libc.dynamic.socket \
+  --require-pass --output build/socket-program-check
+```
+
+此入口使用固定 `references/oscomp-testsuits` commit
+`8b58dd16d26d30f7c74d48d5832d870d3051b703` 的未修改源码，
+同一 ELF 分别在固定 Linux 与 BoarOS 的独立镜像执行，并要求原始输出、退出状态与
+环境准备同时通过。复用已核验的构建缓存时可加 `--reuse-builds`。
 
 ## SQLite 日志与 NBD 故障入口
 

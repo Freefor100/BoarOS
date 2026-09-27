@@ -352,19 +352,19 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 
 ## N：socket 与网络支线
 
-**依赖与入口**：P1 的 OFD/后端边界可用于单 hart 网络，不等待 SMP/编译全绿。现有 `fs/files/{poll.c,epoll.c}` 接就绪；拟新增 `net/`、socket OFD 后端和 `kernel/syscall/socket.c`，在接口与栈选型后才物化。
+**依赖与入口**：P1 的 OFD/后端边界已用于单 hart IPv4 loopback。`net/socket.c` 持有 endpoint、数据队列和等待，`fs/files/socket.c` 持有 fd/OFD 提交，`kernel/syscall/socket.c` 导入 Linux ABI，现有 poll/epoll 使用 socket 就绪。固定输入与验收见[网络模块](modules/kernel-network.md)。
 
-### N1 对象与协议栈选型（待确认）
+### N1 对象与协议栈选型（路线已确认，首个切片完成）
 
-- [ ] 先定义 socket/OFD、endpoint、缓冲、等待者、close/shutdown 的 owner，及阻塞/非阻塞、用户复制、负 errno 的 ABI 边界；协议栈不能隐式决定这些语义。
-- [ ] 比较自写有界协议子集与成熟 C 栈适配：实际协议能力、缓冲生命周期、可睡眠性、并发、内存成本、许可证/维护/可测试性；固定版本与实际消费者，不为跟随其他项目改变内核语言。
+- [x] BoarOS 持有 fd/OFD、socket、请求 pin、队列和等待；协议回调由最后真实 OFD 引用销毁时解绑。首切片实现 IPv4 UDP/TCP loopback、阻塞/非阻塞与读写/就绪；shutdown 等余项继续 N2。
+- [x] 已比较自写协议子集、成熟 C 栈与宿主转发，确认 BoarOS ABI owner + 固定 lwIP 2.2.1 raw API、NO_SYS 事件驱动。协议/pbuf 使用有界静态池，socket/OFD/请求使用 kernel_heap；来源、所有权和成本理由见[学习记录](learning/network-ownership.md)。
 
 ### N2 本地与 loopback 链路
 
-- [ ] AF_UNIX/socketpair 与 AF_INET loopback TCP/UDP 按真实调用优先推进；原 socket entry 的实际协议从源码/日志确认，不能只凭测试名猜。
+- [ ] AF_INET loopback UDP/TCP 的首个真实消费者已通过；AF_UNIX/socketpair 和网卡侧路径仍待实现。原 socket entry 的实际调用已由固定源码 `src/functional/socket.c` 和日志确认。
 - [ ] bind/connect/listen/accept、send/recv、非阻塞 EAGAIN、半关闭、EOF、失败连接、poll/epoll 和信号打断逐项验收；失败连接不能假装建立 endpoint。
 - [ ] sendmsg/recvmsg 与 SCM_RIGHTS 明确被传 fd 的 OFD 引用、用户复制失败和消息未接收/对端退出时回收；不能只传可被关闭复用的整数 fd。
-- [ ] 原静态/动态 socket entry 闭环，进程退出后端口、缓冲、fd 和等待节点回到基线。`/proc/net` 文本不是网络实现。
+- [x] 原静态/动态 socket 直接 entry 在固定 Linux 与 BoarOS 同一 ELF 双侧通过；PID 1 关机 `heap-live=0`。UDP 池耗尽、释放和重用及 TCP 200 秒协议定时回收由 host 测试保护。完整 228 项清单待合并后重跑，不以此推出 AF_UNIX 或真实网卡完成。
 
 ### N3 网卡与真实服务
 
@@ -446,7 +446,7 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 | P3d 恢复 | 用户已选择本批启用并验证 journal/replay 与持久 orphan；故障模型、限制和复现命令见 VFS 模块。 |
 | P6 SMP：当前 SIE 串行化，缺远端 TLB 确认 | ① 进程态对象先用粗粒度可睡眠锁、IRQ/队列另设短锁，验证较少但并行有限；② MM/OFD/cache/队列对象锁直接演进，锁顺序/取消成本更高。先盘点消费者和睡眠边界再选，临时启动大锁有退出条件。 |
 | P6g 栈 guard：连续物理栈、canary/高水位 | ① 独立虚拟栈区映射已有页，便于未映射 guard，但需页表与回收接口；② 调整内核现有映射形成受保护栈区域，初始接口可能更少，但别名/大页拆分与 direct-map 消费者成本须实测。先验证真实越界保护范围再选。 |
-| N1 协议栈：无 socket/传输链 | ① 自写明确范围的 C 协议子集，owner 易控制但协议/互操作验证成本高；② 适配成熟 C 栈，可复用协议实现，但缓冲/定时器/并发模型、许可与长期更新成本需核对。socket ABI 由 BoarOS 持有，先比较实际消费者。 |
+| N1 协议栈与分配 owner | 已确认 BoarOS 持有 fd/OFD、ABI、等待与缓冲队列，固定官方 lwIP 2.2.1 raw API/NO_SYS；协议和 pbuf 静态有界池，socket/OFD/请求由 kernel_heap 持有。先验收单 hart IPv4 loopback，网卡与 AF_UNIX 继续 N2/N3。 |
 
 调度暂保留简单 FIFO：先完成唯一运行、唤醒和 TLB 回收，再凭公平性/负载证据比较策略。第二架构按连续小里程碑推进；不等待 RV “全部完成”，也不复制整套通用内核。
 
