@@ -219,3 +219,9 @@ make test-riscv
 字符设备节点由 ext4 提供名称和 `st_rdev`，`openat` 根据设备号选择 null、zero 或 console；未知设备号返回 `ENXIO`。路径打开的 console 与初始标准 fd 复用 UART 输入等待、非阻塞和信号打断逻辑。null 读 EOF、写消费请求长度，zero 读按实际用户复制进度填零；这两者不经过普通文件页缓存和 ext4 数据 I/O。设备 OFD 同样由 fd 表安装和引用，dup/fork 共享，关闭 fd 不撤销已 pin 的 I/O。`readv/writev/pread64/pwrite64/lseek/fstat/ppoll` 的设备边界在固定 Linux 差分中验证；未知 ioctl 对有效 fd 返回 `ENOTTY`。epoll 的普通/定位 I/O、seek 与匿名 inode mode 也经同一分派入口核对。当前没有 TTY 会话、设备 mmap、devfs 或通用设备注册接口。
 
 设备号与操作依据固定 Linux commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 [`fs/char_dev.c`](../../references/linux/fs/char_dev.c)、[`drivers/char/mem.c`](../../references/linux/drivers/char/mem.c)、[`fs/eventpoll.c`](../../references/linux/fs/eventpoll.c) 与 [`fs/read_write.c`](../../references/linux/fs/read_write.c)。
+
+## 可睡眠文件调用
+
+共享 OFD 的普通读写、seek 和目录游标受 offset mutex 保护；定位 I/O 不取得 offset 锁。调用在可能等待前 pin OFD，元数据与目录操作同样适用；路径起点获得独立 path 引用，不借用可能被 close/chdir 替换的对象。open 先预留 fd，再执行可睡眠解析/创建；失败取消预留，fork 不复制未安装槽，dup3 对正在预留的目标返回 EBUSY。dup 替换在安装新 OFD 前不执行会睡眠的最后释放。延后清理链先摘下本轮集合，再执行可能等待的关闭并重新挂入仍有真实 owner 的失败项，避免并发 drain 覆盖新项。
+
+文件写先完成请求缓冲的用户复制，再进入 inode/后端锁；读持引用取得数据，解除存储锁后复制到用户。与用户缺页重入、共享 offset、close 后 fd 复用相关的门禁为 files、partial-write、真实 userland 和差分测试。

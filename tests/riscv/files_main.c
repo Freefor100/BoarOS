@@ -81,6 +81,26 @@ char __wrap_virt_uart_getc(void)
     return __real_virt_uart_getc();
 }
 #endif
+static struct kernel_mm *unmap_during_fault;
+static uint64_t unmap_fault_address;
+static int complete_peer_fault;
+enum kernel_page_cache_status __real_kernel_open_file_get_page(
+    struct kernel_open_file_description *, uint64_t, uint64_t *, size_t *);
+enum kernel_page_cache_status __wrap_kernel_open_file_get_page(
+    struct kernel_open_file_description *file, uint64_t index, uint64_t *address, size_t *valid)
+{
+    enum kernel_page_cache_status status = __real_kernel_open_file_get_page(file, index, address, valid);
+    if (unmap_during_fault && status == KERNEL_PAGE_CACHE_STATUS_OK) {
+        struct kernel_mm *mm = unmap_during_fault;
+        unmap_during_fault = 0;
+        enum kernel_mm_status changed = complete_peer_fault
+            ? kernel_mm_resolve_user_fault(mm, unmap_fault_address, KERNEL_MM_READ)
+            : kernel_mm_munmap(mm, unmap_fault_address, BOAROS_PAGE_SIZE);
+        if (changed != KERNEL_MM_STATUS_OK) __builtin_trap();
+    }
+    return status;
+}
+
 static unsigned fail_physical_allocation;
 enum physical_page_status __real_physical_page_allocate(
     struct physical_page_allocator *, uint64_t *);
@@ -1259,6 +1279,31 @@ static void run_mmap_operations(struct kernel_files *files,
             (unsigned char)('A' + (BOAROS_PAGE_SIZE % 26U))) {
         fail_files(66U, KERNEL_MM_STATUS_OK, -1);
     }
+    /* Model another CLONE_VM task unmapping while the cold page load sleeps. */
+    struct kernel_vma fault_vma;
+    if (kernel_mm_vma_lookup(&child, second_address, &fault_vma) != KERNEL_MM_STATUS_OK ||
+        kernel_open_file_acquire(fault_vma.backing) != KERNEL_OPEN_FILE_STATUS_OK)
+        fail_files(350U, 0, -1);
+    first_pin = fault_vma.backing;
+    if (kernel_mm_mmap_file_private(&child, &first_pin, TEST_MMAP_FIRST + 0x100000,
+            BOAROS_PAGE_SIZE, 0, KERNEL_MM_READ, KERNEL_MM_MAP_FIXED_NOREPLACE,
+            &unmap_fault_address) != KERNEL_MM_STATUS_OK)
+        fail_files(351U, 0, -1);
+    unmap_during_fault = &child;
+    enum kernel_mm_status raced = kernel_mm_resolve_user_fault(&child, unmap_fault_address, KERNEL_MM_READ);
+    if (unmap_during_fault || raced != KERNEL_MM_STATUS_NOT_MAPPED ||
+        kernel_mm_lookup(&child, unmap_fault_address, &first_mapping) != KERNEL_MM_STATUS_NOT_MAPPED)
+        fail_files(352U, KERNEL_MM_STATUS_NOT_MAPPED, raced);
+    if (kernel_open_file_acquire(fault_vma.backing) != KERNEL_OPEN_FILE_STATUS_OK) __builtin_trap();
+    first_pin = fault_vma.backing;
+    if (kernel_mm_mmap_file_private(&child, &first_pin, unmap_fault_address,
+            BOAROS_PAGE_SIZE, 0, KERNEL_MM_READ, KERNEL_MM_MAP_FIXED_NOREPLACE,
+            &unmap_fault_address) != KERNEL_MM_STATUS_OK) __builtin_trap();
+    complete_peer_fault = 1;
+    unmap_during_fault = &child;
+    raced = kernel_mm_resolve_user_fault(&child, unmap_fault_address, KERNEL_MM_READ);
+    complete_peer_fault = 0;
+    if (raced != KERNEL_MM_STATUS_OK) fail_files(353U, KERNEL_MM_STATUS_OK, raced);
     test_satp = test_satp ^ UINT64_C(1);
     if (kernel_mm_release(&child) != KERNEL_MM_STATUS_OK) {
         fail_files(67U, KERNEL_MM_STATUS_OK, -1);

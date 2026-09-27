@@ -9,6 +9,17 @@
 struct kernel_pipe;
 struct kernel_record_lock;
 struct kernel_vfs_path;
+struct kernel_files_pin_guard {
+    struct kernel_files *files;
+    struct kernel_open_file_description *description;
+};
+void kernel_files_pin_guard_release(struct kernel_files_pin_guard *guard);
+struct kernel_open_file_description *kernel_files_hold_fd(
+    struct kernel_files *files, int64_t fd, struct kernel_files_pin_guard *guard);
+#define KERNEL_FILES_PIN_SCOPE(name) struct kernel_files_pin_guard name __attribute__((cleanup(kernel_files_pin_guard_release))) = {0}
+void kernel_files_path_guard_release(struct kernel_vfs_path **path);
+#define KERNEL_FILES_PATH_SCOPE(name) struct kernel_vfs_path *name __attribute__((cleanup(kernel_files_path_guard_release))) = 0
+
 int kernel_files_path_start(struct kernel_files *files,
                             const struct kernel_fs_context *fs,
                             int64_t dirfd, const char *path,
@@ -22,6 +33,9 @@ enum kernel_files_status kernel_files_read_console(
 #define KERNEL_FILES_INITIAL_CAPACITY 32U
 #define KERNEL_FILES_MAX_CAPACITY ((uint32_t)KERNEL_RLIMIT_NOFILE_CAP)
 #define KERNEL_FILES_FD_CLOEXEC UINT32_C(1)
+#define KERNEL_FILES_FD_RESERVED UINT32_C(2)
+struct kernel_files_fd_reservation { struct kernel_files *files; uint32_t fd; };
+void kernel_files_cancel_reservation(struct kernel_files_fd_reservation *reservation);
 
 struct kernel_file_slot {
     struct kernel_open_file_description *description;

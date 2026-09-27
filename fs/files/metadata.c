@@ -32,8 +32,10 @@ static int metadata_path(struct kernel_files *files,
     }
     int result = kernel_files_path_start(files, fs, dirfd, name, &start);
     if (result) return result;
-    return kernel_vfs_path_resolve(start, kernel_fs_context_root(fs), name,
+    result = kernel_vfs_path_resolve(start, kernel_fs_context_root(fs), name,
                     !(flags & KERNEL_FILES_AT_SYMLINK_NOFOLLOW), path);
+    (void)kernel_vfs_path_release(&start);
+    return result;
 }
 
 static enum kernel_files_status copy_metadata_path(
@@ -67,6 +69,7 @@ enum kernel_files_status kernel_files_utimensat(
     struct kernel_mm *mm, int64_t dirfd, uint64_t user_path,
     uint64_t user_times, uint32_t flags, int64_t *linux_result)
 {
+    KERNEL_FILES_PIN_SCOPE(pin_guard);
     struct kernel_vfs_timespec times[2];
     struct kernel_vfs_path *path = 0;
     int result;
@@ -91,7 +94,7 @@ enum kernel_files_status kernel_files_utimensat(
     if (!user_path && dirfd != KERNEL_FS_AT_FDCWD) {
         struct kernel_open_file_description *file;
         if (flags) result = -KERNEL_EINVAL;
-        else if (!(file = kernel_files_lookup_description(files, dirfd))) result = -KERNEL_EBADF;
+        else if (!(file = kernel_files_hold_fd(files, dirfd, &pin_guard))) result = -KERNEL_EBADF;
         else if (!file->file.private_data) result = -KERNEL_ENOTSUP;
         else result = kernel_vfs_file_set_times(&file->file, user_times ? times : 0);
     } else {
@@ -113,10 +116,11 @@ enum kernel_files_status kernel_files_fchmod(
     struct kernel_files *files, int64_t fd, uint32_t mode,
     int64_t *linux_result)
 {
+    KERNEL_FILES_PIN_SCOPE(pin_guard);
     if (!kernel_files_is_live(files) || !linux_result)
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
     struct kernel_open_file_description *description =
-        kernel_files_lookup_description(files, fd);
+        kernel_files_hold_fd(files, fd, &pin_guard);
     if (!description) *linux_result = -KERNEL_EBADF;
     else if (!description->file.private_data) *linux_result = -KERNEL_ENOTSUP;
     else *linux_result = kernel_vfs_file_set_mode(&description->file, mode);
@@ -193,9 +197,10 @@ enum kernel_files_status kernel_files_fstatfs(
     struct kernel_files *files, struct kernel_mm *mm, int64_t fd,
     uint64_t user_buffer, int64_t *linux_result)
 {
+    KERNEL_FILES_PIN_SCOPE(pin_guard);
     if (!kernel_files_is_live(files) || !mm || !linux_result)
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
-    struct kernel_open_file_description *file = kernel_files_lookup_description(files, fd);
+    struct kernel_open_file_description *file = kernel_files_hold_fd(files, fd, &pin_guard);
     if (!file) { *linux_result = -KERNEL_EBADF; return KERNEL_FILES_STATUS_OK; }
     return copy_statfs(mm, file->file.mount, user_buffer, linux_result);
 }

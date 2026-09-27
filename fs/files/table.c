@@ -147,7 +147,7 @@ enum kernel_files_status kernel_files_fork(
     if (status != KERNEL_FILES_STATUS_OK) {
         return status;
     }
-    destination->record->next_fd = source->record->next_fd;
+    destination->record->next_fd = 0;
     destination->nofile_limit = source->nofile_limit;
     for (index = 0U;
          index < source->record->statistics.capacity;
@@ -167,7 +167,7 @@ enum kernel_files_status kernel_files_fork(
                 destination->record->statistics.close_on_exec_fds++;
             }
         }
-        destination->record->slots[index] = source->record->slots[index];
+        if (description) destination->record->slots[index] = source->record->slots[index];
     }
     if (index == source->record->statistics.capacity) {
         destination->record->statistics.peak_open_fds =
@@ -224,25 +224,28 @@ static enum kernel_files_status cleanup_description(
 enum kernel_files_status kernel_files_drain_file_cleanup(
     struct kernel_files *files)
 {
-    struct kernel_open_file_description **link =
-        &files->record->cleanup_files;
-    int failed = 0;
-
-    while (*link != 0) {
-        struct kernel_open_file_description *description = *link;
-        struct kernel_open_file_description *next =
-            description->cleanup_next;
-
-        if (cleanup_description(files, description) !=
-            KERNEL_FILES_STATUS_OK) {
-            link = &description->cleanup_next;
-            failed = 1;
-        } else {
-            *link = next;
+    struct kernel_open_file_description *pending = files->record->cleanup_files;
+    struct kernel_open_file_description *failed = 0;
+    files->record->cleanup_files = 0;
+    while (pending) {
+        struct kernel_open_file_description *description = pending;
+        pending = description->cleanup_next;
+        description->cleanup_next = 0;
+        enum kernel_files_status status = cleanup_description(files, description);
+        if (status != KERNEL_FILES_STATUS_OK) {
+            if (status != KERNEL_FILES_STATUS_CLEANUP_REQUIRED) __builtin_trap();
+            description->cleanup_next = failed;
+            failed = description;
         }
     }
-    return failed ? KERNEL_FILES_STATUS_CLEANUP_REQUIRED
-                  : KERNEL_FILES_STATUS_OK;
+    int error = failed != 0;
+    while (failed) {
+        struct kernel_open_file_description *description = failed;
+        failed = description->cleanup_next;
+        description->cleanup_next = 0;
+        kernel_files_queue_description(files, description);
+    }
+    return error ? KERNEL_FILES_STATUS_CLEANUP_REQUIRED : KERNEL_FILES_STATUS_OK;
 }
 
 static enum kernel_files_status ensure_slot_capacity(
@@ -306,7 +309,7 @@ static enum kernel_files_status find_fd_from(
             return status;
         }
         while (index < files->record->statistics.capacity && index < upper) {
-            if (files->record->slots[index].description == 0) {
+            if (files->record->slots[index].description == 0 && files->record->slots[index].flags == 0) {
                 *fd = index;
                 return KERNEL_FILES_STATUS_OK;
             }
@@ -400,6 +403,40 @@ void kernel_files_queue_description(
 {
     description->cleanup_next = files->record->cleanup_files;
     files->record->cleanup_files = description;
+}
+
+void kernel_files_cancel_reservation(struct kernel_files_fd_reservation *reservation)
+{
+    if (!reservation->files) return;
+    struct kernel_files_record *record = reservation->files->record;
+    if (record->slots[reservation->fd].description ||
+        record->slots[reservation->fd].flags != KERNEL_FILES_FD_RESERVED) __builtin_trap();
+    record->slots[reservation->fd].flags = 0;
+    if (reservation->fd < record->next_fd) record->next_fd = reservation->fd;
+    reservation->files = 0;
+}
+
+void kernel_files_pin_guard_release(struct kernel_files_pin_guard *guard)
+{
+    if (!guard->description) return;
+    enum kernel_open_file_status status = kernel_open_file_release(&guard->description);
+    if (status == KERNEL_OPEN_FILE_STATUS_CLEANUP_REQUIRED && guard->description) {
+        kernel_files_queue_description(guard->files, guard->description);
+        guard->description = 0;
+    } else if (status != KERNEL_OPEN_FILE_STATUS_OK) __builtin_trap();
+}
+struct kernel_open_file_description *kernel_files_hold_fd(
+    struct kernel_files *files, int64_t fd, struct kernel_files_pin_guard *guard)
+{
+    if (guard->description) __builtin_trap();
+    struct kernel_open_file_description *description = kernel_files_lookup_description(files, fd);
+    if (description && kernel_open_file_acquire(description) != KERNEL_OPEN_FILE_STATUS_OK) __builtin_trap();
+    *guard = (struct kernel_files_pin_guard){files, description};
+    return description;
+}
+void kernel_files_path_guard_release(struct kernel_vfs_path **path)
+{
+    if (*path && kernel_vfs_path_release(path) != 0) __builtin_trap();
 }
 
 struct kernel_open_file_description *kernel_files_lookup_description(
@@ -839,6 +876,12 @@ enum kernel_files_status kernel_files_dup3(
     if (*linux_result != 0) {
         return KERNEL_FILES_STATUS_OK;
     }
+    if (files->record->slots[newfd].flags & KERNEL_FILES_FD_RESERVED) {
+        *linux_result = -KERNEL_EBUSY;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    KERNEL_FILES_PIN_SCOPE(replaced);
+    (void)kernel_files_hold_fd(files, newfd, &replaced);
     if (kernel_files_lookup_description(files, newfd) != 0 &&
         detach_fd(files, (uint32_t)newfd) != KERNEL_FILES_STATUS_OK) {
         return KERNEL_FILES_STATUS_STATE;

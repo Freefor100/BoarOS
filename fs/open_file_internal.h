@@ -3,6 +3,7 @@
 
 #include <kernel/open_file.h>
 #include <kernel/vfs.h>
+#include <kernel/sync.h>
 
 struct kernel_epoll;
 struct kernel_epoll_item;
@@ -12,6 +13,7 @@ struct kernel_open_file_description {
     struct kernel_vfs_file file;
     struct kernel_open_file_description *cleanup_next;
     struct kernel_heap *heap;
+    struct kernel_mutex offset_lock;
     uint64_t offset;
     uint64_t observed_writeback_error;
     uint32_t open_flags;

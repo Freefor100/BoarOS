@@ -4,6 +4,8 @@
 #include <stdint.h>
 
 struct kernel_vfs_node;
+struct kernel_lock_guard;
+void kernel_vfs_node_lock(struct kernel_vfs_node *node, struct kernel_lock_guard *guard, int write);
 
 /* MM owns this stable record and keeps its node alive through its OFDs.
  * Register/unregister/notify run in the single-hart non-scheduling region.

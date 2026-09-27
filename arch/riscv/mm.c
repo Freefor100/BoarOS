@@ -7,6 +7,7 @@
 #include <kernel/page.h>
 #include <kernel/shared_anon.h>
 #include <kernel/task.h>
+#include <kernel/sync.h>
 #include <kernel/vma.h>
 #include <kernel/vfs.h>
 
@@ -29,7 +30,21 @@ enum riscv_kernel_mm_record_stage {
 struct riscv_kernel_mm_file_source {
     struct riscv_kernel_mm_file_source *next;
     struct kernel_open_file_description *file;
+    uint32_t faults;
+    int draining;
 };
+
+struct fault_page_pin { struct physical_page_allocator *allocator; uint64_t address; };
+static void release_fault_page(struct fault_page_pin *pin)
+{
+    if (physical_page_release(pin->allocator, pin->address) != PHYSICAL_PAGE_STATUS_OK) __builtin_trap();
+}
+
+static void unpin_fault_source(struct riscv_kernel_mm_file_source **source)
+{
+    if (!(*source)->faults) __builtin_trap();
+    (*source)->faults--;
+}
 
 struct riscv_kernel_mm_shared_anon {
     struct riscv_kernel_mm_shared_anon *next;
@@ -56,7 +71,15 @@ struct riscv_file_resident {
 struct riscv_kernel_mm_elf_source {
     struct riscv_kernel_mm_elf_source *next;
     struct kernel_elf64_source *source;
+    uint32_t faults;
+    int draining;
 };
+
+static void unpin_elf_fault_source(struct riscv_kernel_mm_elf_source **source)
+{
+    if (!(*source)->faults) __builtin_trap();
+    (*source)->faults--;
+}
 
 struct riscv_kernel_mm_record {
     uint64_t magic;
@@ -196,6 +219,7 @@ enum kernel_mm_status riscv_kernel_mm_create(
     struct kernel_mm *mm,
     struct riscv_sv39_user_space *space)
 {
+    KERNEL_NO_RECLAIM_IO;
     struct physical_page_allocator *allocator;
     struct riscv_kernel_mm_record *record;
     uint64_t record_page_address;
@@ -254,6 +278,7 @@ enum kernel_mm_status kernel_mm_acquire(
     struct kernel_mm *destination,
     const struct kernel_mm *source)
 {
+    KERNEL_NO_RECLAIM_IO;
     struct riscv_kernel_mm_record *record;
     enum kernel_mm_status status;
 
@@ -325,7 +350,7 @@ static struct riscv_kernel_mm_file_source *find_file_source(
     for (source = record->file_sources;
          source != 0;
          source = source->next) {
-        if (source->file == file) {
+        if (!source->draining && source->file == file) {
             return source;
         }
     }
@@ -559,9 +584,13 @@ static enum kernel_mm_status drain_file_sources(
 
     while (*link != 0) {
         struct riscv_kernel_mm_file_source *source = *link;
-        struct riscv_kernel_mm_file_source *next = source->next;
         int in_use = 0;
 
+        if (source->faults || source->draining) {
+            if (!unused_only) __builtin_trap();
+            link = &source->next;
+            continue;
+        }
         if (source->file != 0) {
             if (unused_only != 0) {
                 if (record->vmas == 0 ||
@@ -578,16 +607,21 @@ static enum kernel_mm_status drain_file_sources(
             }
             struct kernel_open_file_description *owner = source->file;
 
-            if (kernel_open_file_release(&owner) !=
-                KERNEL_OPEN_FILE_STATUS_OK) {
+            source->draining = 1;
+            enum kernel_open_file_status released = kernel_open_file_release(&owner);
+            source->draining = 0;
+            if (released != KERNEL_OPEN_FILE_STATUS_OK) {
                 failed = 1;
                 link = &source->next;
                 continue;
             }
             source->file = 0;
         }
+        link = &record->file_sources;
+        while (*link && *link != source) link = &(*link)->next;
+        if (*link != source) __builtin_trap();
+        *link = source->next;
         (void)kernel_heap_release(record->vma_heap, source);
-        *link = next;
     }
     return failed != 0 ? KERNEL_MM_STATUS_CLEANUP_REQUIRED
                        : KERNEL_MM_STATUS_OK;
@@ -600,7 +634,7 @@ static struct riscv_kernel_mm_elf_source *find_elf_source(
     struct riscv_kernel_mm_elf_source *entry;
 
     for (entry = record->elf_sources; entry != 0; entry = entry->next) {
-        if (entry->source == source) {
+        if (!entry->draining && entry->source == source) {
             return entry;
         }
     }
@@ -616,9 +650,13 @@ static enum kernel_mm_status drain_elf_sources(
 
     while (*link != 0) {
         struct riscv_kernel_mm_elf_source *entry = *link;
-        struct riscv_kernel_mm_elf_source *next = entry->next;
         int in_use = 0;
 
+        if (entry->faults || entry->draining) {
+            if (!unused_only) __builtin_trap();
+            link = &entry->next;
+            continue;
+        }
         if (entry->source != 0) {
             if (unused_only != 0) {
                 if (record->vmas == 0 ||
@@ -635,8 +673,9 @@ static enum kernel_mm_status drain_elf_sources(
             }
             {
                 struct kernel_elf64_source *owner = entry->source;
-                enum kernel_elf64_source_status source_status =
-                    kernel_elf64_source_release(&owner);
+                entry->draining = 1;
+                enum kernel_elf64_source_status source_status = kernel_elf64_source_release(&owner);
+                entry->draining = 0;
 
                 if (source_status != KERNEL_ELF64_SOURCE_STATUS_OK) {
                     failed = 1;
@@ -646,8 +685,11 @@ static enum kernel_mm_status drain_elf_sources(
                 entry->source = 0;
             }
         }
+        link = &record->elf_sources;
+        while (*link && *link != entry) link = &(*link)->next;
+        if (*link != entry) __builtin_trap();
+        *link = entry->next;
         (void)kernel_heap_release(record->vma_heap, entry);
-        *link = next;
     }
     return failed != 0 ? KERNEL_MM_STATUS_CLEANUP_REQUIRED
                        : KERNEL_MM_STATUS_OK;
@@ -835,6 +877,7 @@ enum kernel_mm_status kernel_mm_fork(
     struct kernel_mm *destination,
     struct kernel_mm *source)
 {
+    KERNEL_NO_RECLAIM_IO;
     struct riscv_kernel_mm_record *source_record;
     struct riscv_kernel_mm_record *destination_record;
     uint64_t record_page_address;
@@ -1021,6 +1064,7 @@ enum kernel_mm_status kernel_mm_move(
     struct kernel_mm *destination,
     struct kernel_mm *source)
 {
+    KERNEL_NO_RECLAIM_IO;
     if (destination == 0 || source == 0 || destination == source) {
         return KERNEL_MM_STATUS_INVALID_ARGUMENT;
     }
@@ -1037,6 +1081,7 @@ enum kernel_mm_status kernel_mm_lookup(
     uint64_t virtual_address,
     struct kernel_mm_mapping *mapping)
 {
+    KERNEL_NO_RECLAIM_IO;
     struct riscv_kernel_mm_record *record;
     struct riscv_sv39_mapping riscv_mapping;
     enum kernel_mm_status status;
@@ -1086,6 +1131,7 @@ enum kernel_mm_status kernel_mm_vma_enable(
     struct kernel_mm *mm,
     struct kernel_heap *heap)
 {
+    KERNEL_NO_RECLAIM_IO;
     struct riscv_kernel_mm_record *record;
     enum kernel_mm_status status;
 
@@ -1117,6 +1163,7 @@ enum kernel_mm_status kernel_mm_vma_insert_anon(
     enum kernel_vma_role role,
     enum kernel_vma_fault_policy fault_policy)
 {
+    KERNEL_NO_RECLAIM_IO;
     struct riscv_kernel_mm_record *record;
     struct kernel_vma vma;
     enum kernel_mm_status status;
@@ -1169,6 +1216,7 @@ enum kernel_mm_status kernel_mm_map_elf_source(
     struct kernel_elf64_source *source,
     uint64_t load_bias)
 {
+    KERNEL_NO_RECLAIM_IO;
     struct riscv_kernel_mm_record *record;
     struct riscv_kernel_mm_elf_source *source_owner = 0;
     uint32_t run_count;
@@ -1300,6 +1348,7 @@ enum kernel_mm_status kernel_mm_vma_lookup(
     uint64_t virtual_address,
     struct kernel_vma *vma)
 {
+    KERNEL_NO_RECLAIM_IO;
     struct riscv_kernel_mm_record *record;
     enum kernel_mm_status status;
 
@@ -1324,6 +1373,7 @@ enum kernel_mm_status kernel_mm_vma_lookup(
 enum kernel_mm_status kernel_mm_futex_id(
     const struct kernel_mm *mm, uint64_t *identity)
 {
+    KERNEL_NO_RECLAIM_IO;
     struct riscv_kernel_mm_record *record;
     enum kernel_mm_status status;
 
@@ -1343,6 +1393,7 @@ enum kernel_mm_status kernel_mm_brk_initialize(
     uint64_t start,
     uint64_t limit)
 {
+    KERNEL_NO_RECLAIM_IO;
     struct riscv_kernel_mm_record *record;
     enum kernel_mm_status status;
 
@@ -1376,6 +1427,7 @@ enum kernel_mm_status kernel_mm_mmap_base_initialize(
     struct kernel_mm *mm,
     uint64_t base)
 {
+    KERNEL_NO_RECLAIM_IO;
     struct riscv_kernel_mm_record *record;
     enum kernel_mm_status status;
 
@@ -1399,6 +1451,7 @@ enum kernel_mm_status kernel_mm_vdso_set_address(
     struct kernel_mm *mm,
     uint64_t address)
 {
+    KERNEL_NO_RECLAIM_IO;
     struct riscv_kernel_mm_record *record;
     enum kernel_mm_status status;
 
@@ -1419,6 +1472,7 @@ enum kernel_mm_status kernel_mm_vdso_address(
     const struct kernel_mm *mm,
     uint64_t *address)
 {
+    KERNEL_NO_RECLAIM_IO;
     struct riscv_kernel_mm_record *record;
     enum kernel_mm_status status;
 
@@ -1547,6 +1601,7 @@ enum kernel_mm_status kernel_mm_mmap_anonymous(
     uint32_t flags,
     uint64_t *address)
 {
+    KERNEL_NO_RECLAIM_IO;
     struct riscv_kernel_mm_record *record;
     struct kernel_vma vma;
     struct kernel_vma_edit edit;
@@ -1850,6 +1905,7 @@ enum kernel_mm_status kernel_mm_validate_file_private_mapping(
     uint32_t permissions,
     uint32_t flags)
 {
+    KERNEL_NO_RECLAIM_IO;
     struct riscv_file_mapping_plan plan;
 
     return prepare_file_mapping(mm,
@@ -1871,6 +1927,7 @@ enum kernel_mm_status kernel_mm_mmap_file_private(
     uint32_t flags,
     uint64_t *address)
 {
+    KERNEL_NO_RECLAIM_IO;
     struct riscv_file_mapping_plan plan;
     struct riscv_kernel_mm_record *record;
     struct riscv_kernel_mm_file_source *prepared = 0;
@@ -1984,6 +2041,7 @@ enum kernel_mm_status kernel_mm_munmap(
     uint64_t address,
     uint64_t length)
 {
+    KERNEL_NO_RECLAIM_IO;
     struct riscv_kernel_mm_record *record;
     struct kernel_vma_edit edit;
     uint64_t aligned_length;
@@ -2034,6 +2092,7 @@ enum kernel_mm_status kernel_mm_mprotect(
     uint64_t length,
     uint32_t permissions)
 {
+    KERNEL_NO_RECLAIM_IO;
     struct riscv_kernel_mm_record *record;
     struct kernel_vma_edit edit;
     uint64_t aligned_length;
@@ -2141,6 +2200,7 @@ enum kernel_mm_status kernel_mm_brk(
     uint64_t requested,
     uint64_t *result)
 {
+    KERNEL_NO_RECLAIM_IO;
     struct riscv_kernel_mm_record *record;
     struct kernel_vma_edit edit;
     uint64_t old_page_end;
@@ -2488,7 +2548,7 @@ static enum kernel_mm_status map_elf_source_page(
     struct riscv_kernel_mm_record *record,
     const struct kernel_vma *vma,
     uint64_t page_address,
-    uint32_t access)
+    uint32_t access, int *retry)
 {
     uint64_t source_offset;
     uint64_t physical_address;
@@ -2502,6 +2562,11 @@ static enum kernel_mm_status map_elf_source_page(
                              (page_address - vma->start)) {
         return KERNEL_MM_STATUS_ADDRESS_SPACE;
     }
+    struct riscv_kernel_mm_elf_source *source __attribute__((cleanup(unpin_elf_fault_source))) =
+        find_elf_source(record, vma->backing);
+    if (!source || source->faults == UINT32_MAX) __builtin_trap();
+    source->faults++;
+    uint64_t version = kernel_vma_set_generation(record->vmas);
     source_offset = vma->backing_offset + (page_address - vma->start);
     source_status = kernel_elf64_source_page(
         vma->backing,
@@ -2520,6 +2585,12 @@ static enum kernel_mm_status map_elf_source_page(
         return source_status == KERNEL_ELF64_SOURCE_STATUS_IO
                    ? KERNEL_MM_STATUS_BUS_FAULT
                    : KERNEL_MM_STATUS_ADDRESS_SPACE;
+    }
+    struct riscv_sv39_mapping existing;
+    if (version != kernel_vma_set_generation(record->vmas) ||
+        riscv_sv39_user_lookup(&record->space, page_address, &existing) != RISCV_SV39_STATUS_NOT_MAPPED) {
+        *retry = 1;
+        return discard_file_page(&record->space, physical_address, KERNEL_MM_STATUS_OK);
     }
     if (shared != 0) {
         sv39_status = riscv_sv39_user_map_cow_page(
@@ -2566,10 +2637,10 @@ static enum kernel_mm_status map_elf_source_page(
     return status;
 }
 
-enum kernel_mm_status kernel_mm_resolve_user_fault(
+static enum kernel_mm_status resolve_user_fault_once(
     struct kernel_mm *mm,
     uint64_t virtual_address,
-    uint32_t access)
+    uint32_t access, int *retry, int resumed)
 {
     struct riscv_kernel_mm_record *record;
     struct riscv_sv39_mapping mapping;
@@ -2628,6 +2699,13 @@ enum kernel_mm_status kernel_mm_resolve_user_fault(
                                          virtual_address,
                                          &mapping);
     if (sv39_status == RISCV_SV39_STATUS_OK) {
+        uint32_t requested = access == KERNEL_MM_READ ? RISCV_SV39_READ :
+                             access == KERNEL_MM_WRITE ? RISCV_SV39_WRITE : RISCV_SV39_EXECUTE;
+        if (resumed && (mapping.permissions & requested)) {
+            flush_user_page(virtual_address & ~BOAROS_PAGE_MASK, vma.permissions);
+            return KERNEL_MM_STATUS_OK;
+        }
+
         if (access == KERNEL_MM_WRITE &&
             (mapping.permissions & RISCV_SV39_WRITE) == 0U) {
             if (vma.kind == KERNEL_VMA_KIND_FILE_SHARED) {
@@ -2690,6 +2768,17 @@ enum kernel_mm_status kernel_mm_resolve_user_fault(
         (vma.fault_policy == KERNEL_VMA_FAULT_FILE_PRIVATE ||
          vma.fault_policy == KERNEL_VMA_FAULT_FILE_SHARED) &&
         vma.backing != 0) {
+        uint64_t version = kernel_vma_set_generation(record->vmas);
+        struct riscv_kernel_mm_file_source *source __attribute__((cleanup(unpin_fault_source))) =
+            find_file_source(record, vma.backing);
+        if (!source || source->faults == UINT32_MAX) __builtin_trap();
+        source->faults++;
+        KERNEL_LOCK_SCOPE(node_guard);
+        kernel_vfs_node_lock(kernel_open_file_node(vma.backing), &node_guard, 0);
+        if (version != kernel_vma_set_generation(record->vmas)) {
+            *retry = 1;
+            return KERNEL_MM_STATUS_OK;
+        }
         if (vma.backing_offset >
             UINT64_MAX - (page_address - vma.start)) {
             return KERNEL_MM_STATUS_ADDRESS_SPACE;
@@ -2699,6 +2788,19 @@ enum kernel_mm_status kernel_mm_resolve_user_fault(
         file_size = kernel_open_file_size(vma.backing);
         if (file_page_offset >= file_size) {
             return KERNEL_MM_STATUS_BUS_FAULT;
+        }
+        /* Disk I/O owns the source and inode, but no MM mutation lock. */
+        uint64_t prefetched;
+        size_t valid;
+        enum kernel_page_cache_status loaded = kernel_open_file_get_page(vma.backing,
+            file_page_offset >> BOAROS_PAGE_SHIFT, &prefetched, &valid);
+        if (loaded != KERNEL_PAGE_CACHE_STATUS_OK)
+            return loaded == KERNEL_PAGE_CACHE_STATUS_NO_MEMORY ? KERNEL_MM_STATUS_NO_MEMORY : KERNEL_MM_STATUS_BUS_FAULT;
+        struct fault_page_pin pin __attribute__((cleanup(release_fault_page))) = {mm->allocator, prefetched};
+        if (version != kernel_vma_set_generation(record->vmas) ||
+            riscv_sv39_user_lookup(&record->space, page_address, &mapping) != RISCV_SV39_STATUS_NOT_MAPPED) {
+            *retry = 1;
+            return KERNEL_MM_STATUS_OK;
         }
         status = reserve_file_residents(record, record->resident_count + 1);
         if (status != KERNEL_MM_STATUS_OK) return status;
@@ -2750,7 +2852,7 @@ enum kernel_mm_status kernel_mm_resolve_user_fault(
         return map_elf_source_page(record,
                                    &vma,
                                    page_address,
-                                   access);
+                                   access, retry);
     }
     if (vma.kind == KERNEL_VMA_KIND_ANON_SHARED &&
         vma.fault_policy == KERNEL_VMA_FAULT_ANON_SHARED &&
@@ -2803,10 +2905,24 @@ enum kernel_mm_status kernel_mm_resolve_user_fault(
     return KERNEL_MM_STATUS_ADDRESS_SPACE;
 }
 
+enum kernel_mm_status kernel_mm_resolve_user_fault(
+    struct kernel_mm *mm, uint64_t address, uint32_t access)
+{
+    KERNEL_NO_RECLAIM_IO;
+    int resumed = 0;
+    for (;;) {
+        int retry = 0;
+        enum kernel_mm_status result = resolve_user_fault_once(mm, address, access, &retry, resumed);
+        if (!retry) return result;
+        resumed = 1;
+    }
+}
+
 enum kernel_mm_status riscv_kernel_mm_satp(
     const struct kernel_mm *mm,
     uint64_t *satp)
 {
+    KERNEL_NO_RECLAIM_IO;
     struct riscv_kernel_mm_record *record;
     enum kernel_mm_status status;
 
@@ -2830,6 +2946,7 @@ enum kernel_mm_status riscv_kernel_mm_satp(
 
 enum kernel_mm_status kernel_mm_release(struct kernel_mm *mm)
 {
+    KERNEL_NO_RECLAIM_IO;
     struct riscv_kernel_mm_record *record;
     enum kernel_mm_status status;
     enum riscv_sv39_status sv39_status;

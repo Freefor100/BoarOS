@@ -651,6 +651,7 @@ $(UACCESS_TEST_KERNEL_RV): $(UACCESS_TEST_OBJECTS) \
 
 $(FILES_TEST_KERNEL_RV): $(FILES_TEST_OBJECTS) arch/riscv/linker.ld
 	$(CC) $(LDFLAGS) \
+		-Wl,--wrap=kernel_open_file_get_page \
 		-Wl,--wrap=kernel_open_file_release \
 		-Wl,--wrap=kernel_heap_allocate \
 		-Wl,--wrap=kernel_heap_allocate_zeroed \
@@ -664,6 +665,7 @@ $(FILES_TEST_KERNEL_RV): $(FILES_TEST_OBJECTS) arch/riscv/linker.ld
 $(FILES_PARTIAL_WRITE_TEST_KERNEL_RV): \
 		$(FILES_PARTIAL_WRITE_TEST_OBJECTS) arch/riscv/linker.ld
 	$(CC) $(LDFLAGS) \
+		-Wl,--wrap=kernel_open_file_get_page \
 		-Wl,--wrap=kernel_open_file_release \
 		-Wl,--wrap=kernel_heap_allocate_zeroed \
 		-Wl,--wrap=physical_page_allocate \

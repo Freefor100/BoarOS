@@ -24,6 +24,12 @@ static int set_valid(const struct kernel_vma_set *set)
              set->count <= set->capacity));
 }
 
+uint64_t kernel_vma_set_generation(const struct kernel_vma_set *set)
+{
+    if (!set_valid(set)) __builtin_trap();
+    return set->generation;
+}
+
 static int vma_valid(const struct kernel_vma *vma)
 {
     if (vma == 0 || vma->start >= vma->end ||

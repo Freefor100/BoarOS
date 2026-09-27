@@ -1,6 +1,8 @@
 #include "vfs_internal.h"
 
 #include <kernel/heap.h>
+#include <kernel/sync.h>
+#include <arch/riscv/context.h>
 #include <kernel/errno.h>
 #include <kernel/page.h>
 #include <kernel/page_cache.h>
@@ -28,6 +30,10 @@ struct kernel_page_cache_entry {
     size_t dirty_end;
     uint64_t generation;
     uint8_t writeback;
+    uint8_t loading;
+    uint32_t users;
+    enum kernel_page_cache_status load_error;
+    struct kernel_wait_queue ready;
     uint8_t page_references_owned;
     struct kernel_page_cache_alias *aliases;
 };
@@ -211,7 +217,7 @@ static int cleanup_entry(struct kernel_page_cache *cache,
     }
     entry->physical_address = 0U;
     if (entry->node != 0 &&
-        kernel_vfs_node_release(&entry->node) != 0) {
+        kernel_vfs_node_release_deferred(&entry->node) != 0) {
         return 0;
     }
     (void)kernel_heap_release(cache->heap, entry);
@@ -257,7 +263,7 @@ static int drain_entries(struct kernel_page_cache *cache,
 static void remove_entry(struct kernel_page_cache *cache,
                          struct kernel_page_cache_entry *entry)
 {
-    if (entry->aliases != 0) __builtin_trap();
+    if (entry->aliases != 0 || entry->loading || entry->users) __builtin_trap();
     struct kernel_page_cache_record *record = cache->record;
     int found;
     size_t bucket = find_bucket(record,
@@ -281,6 +287,9 @@ static void remove_entry(struct kernel_page_cache *cache,
     record->statistics.current_pages--;
     record->statistics.evictions++;
 }
+
+static uint32_t *reclaim_depth(void)
+{ return &kernel_io_context_current()->reclaim_depth; }
 
 static uint64_t reclaim_callback(void *context, uint64_t target_pages)
 {
@@ -335,6 +344,7 @@ enum kernel_page_cache_status kernel_page_cache_init(
         *cache = (struct kernel_page_cache){0};
         return KERNEL_PAGE_CACHE_STATUS_STATE;
     }
+    allocator->reclaim_depth = reclaim_depth;
     return KERNEL_PAGE_CACHE_STATUS_OK;
 }
 
@@ -457,6 +467,21 @@ enum kernel_page_cache_status kernel_page_cache_lookup(
     if (status != KERNEL_PAGE_CACHE_STATUS_OK) {
         return status;
     }
+    uintptr_t irq = riscv_interrupt_save();
+    entry->users++;
+    while (entry->loading) {
+        enum kernel_wait_wake_reason reason;
+        if (kernel_scheduler_block_current(&entry->ready, 0, 0, &reason) != KERNEL_SCHEDULER_STATUS_OK)
+            __builtin_trap();
+    }
+    status = entry->load_error;
+    entry->users--;
+    if (status != KERNEL_PAGE_CACHE_STATUS_OK) {
+        if (!entry->users) { remove_entry(cache, entry); uint64_t released = 0; (void)drain_entries(cache, &released); }
+        riscv_interrupt_restore(irq);
+        return status;
+    }
+    riscv_interrupt_restore(irq);
     if (physical_page_acquire(cache->allocator,
                               entry->physical_address) !=
         PHYSICAL_PAGE_STATUS_OK) {
@@ -530,36 +555,21 @@ static enum kernel_page_cache_status get_page(
                              KERNEL_PAGE_CACHE_STATUS_STATE);
     }
     zero_bytes(page, BOAROS_PAGE_SIZE);
-    if (kernel_vfs_node_pread(node,
-                              offset,
-                              page,
-                              BOAROS_PAGE_SIZE,
-                              &bytes_read) != 0) {
-        return abandon_entry(cache,
-                             entry,
-                             KERNEL_PAGE_CACHE_STATUS_IO);
-    }
     if (kernel_vfs_node_acquire(node) != 0) {
         return abandon_entry(cache,
                              entry,
                              KERNEL_PAGE_CACHE_STATUS_STATE);
     }
     entry->node = node;
-    if (physical_page_acquire(cache->allocator,
-                              entry->physical_address) !=
-        PHYSICAL_PAGE_STATUS_OK) {
-        return abandon_entry(cache,
-                             entry,
-                             KERNEL_PAGE_CACHE_STATUS_STATE);
-    }
-    entry->page_references_owned = 2U;
     entry->page_index = page_index;
     bucket = find_bucket(cache->record, node, page_index, &found);
     if (found) {
-        return abandon_entry(cache,
-                             entry,
-                             KERNEL_PAGE_CACHE_STATUS_STATE);
+        (void)abandon_entry(cache, entry, KERNEL_PAGE_CACHE_STATUS_OK);
+        return kernel_page_cache_lookup(cache, file, page_index, physical_address, valid_bytes);
     }
+    kernel_wait_queue_init(&entry->ready);
+    entry->loading = 1;
+    entry->users = 1;
     entry->page_references_owned = 1U;
     if (cache->record->buckets[bucket] == PAGE_CACHE_TOMBSTONE) {
         cache->record->tombstones--;
@@ -579,6 +589,23 @@ static enum kernel_page_cache_status get_page(
         cache->record->statistics.peak_pages =
             cache->record->statistics.current_pages;
     }
+    int read_error = kernel_vfs_node_pread(node, offset, page, BOAROS_PAGE_SIZE, &bytes_read);
+    uintptr_t irq = riscv_interrupt_save();
+    entry->load_error = read_error == -KERNEL_ENOMEM ? KERNEL_PAGE_CACHE_STATUS_NO_MEMORY :
+                        read_error ? KERNEL_PAGE_CACHE_STATUS_IO : KERNEL_PAGE_CACHE_STATUS_OK;
+    entry->loading = 0;
+    entry->users--;
+    if (entry->ready.head && kernel_wait_queue_wake_all(&entry->ready) != KERNEL_SCHEDULER_STATUS_OK)
+        __builtin_trap();
+    if (read_error) {
+        enum kernel_page_cache_status failed = entry->load_error;
+        if (!entry->users) { remove_entry(cache, entry); uint64_t released = 0; (void)drain_entries(cache, &released); }
+        riscv_interrupt_restore(irq);
+        return failed;
+    }
+    if (physical_page_acquire(cache->allocator, entry->physical_address) != PHYSICAL_PAGE_STATUS_OK)
+        __builtin_trap();
+    riscv_interrupt_restore(irq);
     *physical_address = entry->physical_address;
     *valid_bytes = entry_valid_bytes(entry);
     return KERNEL_PAGE_CACHE_STATUS_OK;
@@ -588,6 +615,10 @@ enum kernel_page_cache_status kernel_page_cache_get(
     struct kernel_page_cache *cache, const struct kernel_vfs_file *file,
     uint64_t page_index, uint64_t *physical_address, size_t *valid_bytes)
 {
+    struct kernel_vfs_node *node = kernel_vfs_file_node(file);
+    if (!node) return KERNEL_PAGE_CACHE_STATUS_INVALID_ARGUMENT;
+    KERNEL_LOCK_SCOPE(node_guard);
+    kernel_vfs_node_lock(node, &node_guard, 0);
     return get_page(cache, file, page_index, physical_address, valid_bytes, 0);
 }
 
@@ -638,30 +669,52 @@ static int writeback_entry(struct kernel_page_cache *cache,
     size_t written = 0, begin, end;
     uint64_t generation;
     int result;
+    uintptr_t wait_irq = riscv_interrupt_save();
+    while (entry->writeback) {
+        enum kernel_wait_wake_reason reason;
+        if (kernel_scheduler_block_current(&entry->ready, 0, 0, &reason) != KERNEL_SCHEDULER_STATUS_OK)
+            __builtin_trap();
+    }
+    riscv_interrupt_restore(wait_irq);
     if (entry->dirty_end == 0) return 0;
     uint64_t start = entry->page_index << BOAROS_PAGE_SHIFT;
     if (limit <= start || limit - start <= entry->dirty_begin) return 0;
     /* A bcache miss may allocate while an outer ext4 read owns fpos and
      * buffer lookup state. Reclamation there can free clean pages only. */
-    if (entry->writeback || !kernel_vfs_node_writeback_allowed(entry->node))
+    if (entry->loading || !kernel_vfs_node_writeback_allowed(entry->node))
         return -KERNEL_EBUSY;
-    for (struct kernel_page_cache_alias *alias = entry->aliases;
-         alias != 0; alias = alias->next)
-        alias->rearm(alias->owner, alias->virtual_address);
     entry->writeback = 1;
     cache->record->writeback_active++;
+    if (physical_page_acquire(cache->allocator, entry->physical_address) != PHYSICAL_PAGE_STATUS_OK ||
+        physical_page_resolve(cache->allocator, entry->physical_address, &page) != PHYSICAL_PAGE_STATUS_OK)
+        __builtin_trap();
+    uint64_t snapshot_address;
+    void *snapshot;
+    enum physical_page_status allocated = physical_page_allocate(cache->allocator, &snapshot_address);
+    if (allocated != PHYSICAL_PAGE_STATUS_OK) {
+        if (allocated != PHYSICAL_PAGE_STATUS_EMPTY) __builtin_trap();
+        (void)physical_page_release(cache->allocator, entry->physical_address);
+        entry->writeback = 0; cache->record->writeback_active--;
+        uintptr_t irq = riscv_interrupt_save();
+        if (entry->ready.head) (void)kernel_wait_queue_wake_all(&entry->ready);
+        riscv_interrupt_restore(irq);
+        return -KERNEL_ENOMEM;
+    }
+    if (physical_page_resolve(cache->allocator, snapshot_address, &snapshot) != PHYSICAL_PAGE_STATUS_OK)
+        __builtin_trap();
+    uintptr_t irq = riscv_interrupt_save();
+    for (struct kernel_page_cache_alias *alias = entry->aliases; alias; alias = alias->next)
+        alias->rearm(alias->owner, alias->virtual_address);
     begin = entry->dirty_begin;
     end = entry->dirty_end;
     if (end > limit - start) end = (size_t)(limit - start);
     generation = entry->generation;
-    if (physical_page_acquire(cache->allocator, entry->physical_address) !=
-            PHYSICAL_PAGE_STATUS_OK ||
-        physical_page_resolve(cache->allocator, entry->physical_address,
-                               &page) != PHYSICAL_PAGE_STATUS_OK)
-        __builtin_trap();
+    memcpy(snapshot, page, BOAROS_PAGE_SIZE);
+    riscv_interrupt_restore(irq);
     result = kernel_vfs_node_writeback(entry->node,
                     (entry->page_index << BOAROS_PAGE_SHIFT) + begin,
-                    (unsigned char *)page + begin, end - begin, &written);
+                    (unsigned char *)snapshot + begin, end - begin, &written);
+    (void)physical_page_release(cache->allocator, snapshot_address);
     if (written > end - begin) __builtin_trap();
     if (result == 0 && written != end - begin) result = -KERNEL_EIO;
     if (result == 0 && generation == entry->generation) {
@@ -674,70 +727,57 @@ static int writeback_entry(struct kernel_page_cache *cache,
     (void)physical_page_release(cache->allocator, entry->physical_address);
     entry->writeback = 0;
     cache->record->writeback_active--;
+    irq = riscv_interrupt_save();
+    if (entry->ready.head) (void)kernel_wait_queue_wake_all(&entry->ready);
+    riscv_interrupt_restore(irq);
     return result;
-}
-
-int kernel_page_cache_writeback_before(struct kernel_page_cache *cache,
-    struct kernel_vfs_node *node, uint64_t end)
-{
-    struct kernel_page_cache_entry *entry;
-    if (!cache_live(cache) || node == 0) return -KERNEL_EINVAL;
-    /* No mount-wide scan: each inode owns its cache index. I/O can allocate
-     * and reclaim, so protect the entire traversal from recursive eviction. */
-    for (entry = *kernel_vfs_node_cache_pages(node); entry != 0;
-         entry = entry->node_next) {
-        if (physical_page_acquire(cache->allocator, entry->physical_address) !=
-            PHYSICAL_PAGE_STATUS_OK) __builtin_trap();
-    }
-    int result = 0;
-    for (entry = *kernel_vfs_node_cache_pages(node); entry != 0;
-         entry = entry->node_next) {
-        if (result == 0) result = writeback_entry(cache, entry, end);
-    }
-    for (entry = *kernel_vfs_node_cache_pages(node); entry != 0;
-         entry = entry->node_next)
-        (void)physical_page_release(cache->allocator, entry->physical_address);
-    return result;
-}
-
-int kernel_page_cache_writeback(struct kernel_page_cache *cache,
-                                 struct kernel_vfs_node *node)
-{
-    return kernel_page_cache_writeback_before(cache, node, UINT64_MAX);
 }
 
 int kernel_page_cache_writeback_range(struct kernel_page_cache *cache,
     struct kernel_vfs_node *node, uint64_t start, uint64_t end)
 {
-    struct kernel_page_cache_entry *entry;
+    if (!cache_live(cache) || !node || start >= end) return -KERNEL_EINVAL;
+    KERNEL_LOCK_SCOPE(node_guard);
+    kernel_vfs_node_lock(node, &node_guard, 0);
+    size_t capacity = 0, count = 0;
+    for (struct kernel_page_cache_entry *entry = *kernel_vfs_node_cache_pages(node);
+         entry; entry = entry->node_next) {
+        uint64_t page_start = entry->page_index << BOAROS_PAGE_SHIFT;
+        if (entry->dirty_end && page_start < end && page_start + BOAROS_PAGE_SIZE > start) capacity++;
+    }
+    if (!capacity) return 0;
+    if (capacity > SIZE_MAX / sizeof(struct kernel_page_cache_entry *)) return -KERNEL_ENOMEM;
+    struct kernel_page_cache_entry **selected;
+    enum kernel_heap_status allocated = kernel_heap_allocate(cache->heap,
+        capacity * sizeof(*selected), (void **)&selected);
+    if (allocated != KERNEL_HEAP_STATUS_OK) {
+        if (allocated != KERNEL_HEAP_STATUS_EMPTY) __builtin_trap();
+        return -KERNEL_ENOMEM;
+    }
+    /* Capture and pin the exact set before the first I/O sleep. A cold read
+     * may insert another page while writeback owns the shared inode lock. */
+    for (struct kernel_page_cache_entry *entry = *kernel_vfs_node_cache_pages(node);
+         entry; entry = entry->node_next) {
+        uint64_t page_start = entry->page_index << BOAROS_PAGE_SHIFT;
+        if (!entry->dirty_end || page_start >= end || page_start + BOAROS_PAGE_SIZE <= start) continue;
+        if (count == capacity || physical_page_acquire(cache->allocator, entry->physical_address) != PHYSICAL_PAGE_STATUS_OK)
+            __builtin_trap();
+        selected[count++] = entry;
+    }
     int result = 0;
-    if (!cache_live(cache) || node == 0 || start >= end)
-        return -KERNEL_EINVAL;
-    /* Pin selected entries across block I/O, which may reclaim clean pages. */
-    for (entry = *kernel_vfs_node_cache_pages(node); entry != 0;
-         entry = entry->node_next) {
-        uint64_t page_start = entry->page_index << BOAROS_PAGE_SHIFT;
-        if (page_start < end && page_start + BOAROS_PAGE_SIZE > start) {
-            if (physical_page_acquire(cache->allocator,
-                                      entry->physical_address) !=
-                PHYSICAL_PAGE_STATUS_OK) __builtin_trap();
-        }
-    }
-    for (entry = *kernel_vfs_node_cache_pages(node); entry != 0;
-         entry = entry->node_next) {
-        uint64_t page_start = entry->page_index << BOAROS_PAGE_SHIFT;
-        if (page_start < end && page_start + BOAROS_PAGE_SIZE > start &&
-            result == 0) result = writeback_entry(cache, entry, end);
-    }
-    for (entry = *kernel_vfs_node_cache_pages(node); entry != 0;
-         entry = entry->node_next) {
-        uint64_t page_start = entry->page_index << BOAROS_PAGE_SHIFT;
-        if (page_start < end && page_start + BOAROS_PAGE_SIZE > start)
-            (void)physical_page_release(cache->allocator,
-                                        entry->physical_address);
-    }
+    for (size_t i = 0; i < count && !result; i++) result = writeback_entry(cache, selected[i], end);
+    for (size_t i = 0; i < count; i++)
+        if (physical_page_release(cache->allocator, selected[i]->physical_address) != PHYSICAL_PAGE_STATUS_OK) __builtin_trap();
+    (void)kernel_heap_release(cache->heap, selected);
     return result;
 }
+
+int kernel_page_cache_writeback_before(struct kernel_page_cache *cache,
+    struct kernel_vfs_node *node, uint64_t end)
+{ return end ? kernel_page_cache_writeback_range(cache, node, 0, end) : 0; }
+
+int kernel_page_cache_writeback(struct kernel_page_cache *cache, struct kernel_vfs_node *node)
+{ return kernel_page_cache_writeback_range(cache, node, 0, UINT64_MAX); }
 
 void kernel_page_cache_resize(struct kernel_page_cache *cache,
     struct kernel_vfs_node *node, uint64_t old_size, uint64_t size)
@@ -815,11 +855,22 @@ uint64_t kernel_page_cache_reclaim(struct kernel_page_cache *cache,
                                            entry->physical_address,
                                            &references) ==
                 PHYSICAL_PAGE_STATUS_OK &&
-            references == 1U && !entry->writeback &&
-            writeback_entry(cache, entry, UINT64_MAX) == 0) {
-            remove_entry(cache, entry);
-            (void)drain_entries(cache, &released);
-            reclaimed = released;
+            references == 1U && !entry->loading && !entry->users && !entry->writeback &&
+            (!entry->dirty_end || !kernel_io_context_current()->locks)) {
+            KERNEL_LOCK_SCOPE(reclaim_guard);
+            int dirty = entry->dirty_end != 0;
+            if (!dirty || kernel_vfs_node_try_read(entry->node, &reclaim_guard)) {
+                if (writeback_entry(cache, entry, UINT64_MAX) == 0 &&
+                    physical_page_reference_count(cache->allocator, entry->physical_address, &references) == PHYSICAL_PAGE_STATUS_OK &&
+                    references == 1 && !entry->aliases) {
+                    remove_entry(cache, entry);
+                    if (reclaim_guard.lock) kernel_lock_release(&reclaim_guard);
+                    (void)drain_entries(cache, &released);
+                    reclaimed = released;
+                }
+                /* An I/O sleep can invalidate unrelated LRU links. */
+                if (dirty) previous = cache->record->lru_tail;
+            }
         }
         entry = previous;
     }

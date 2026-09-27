@@ -66,6 +66,7 @@ static enum kernel_open_file_status create_open_file(
     }
     file->heap = heap;
     file->references = 1U;
+    kernel_mutex_init(&file->offset_lock, 10, (uintptr_t)file);
     file->observed_writeback_error = kernel_vfs_error_sequence(&file->file);
     *owner = file;
     *linux_result = 0;
@@ -108,6 +109,7 @@ enum kernel_open_file_status kernel_open_file_create_at(
     } else {
         file->heap = heap;
         file->references = 1U;
+    kernel_mutex_init(&file->offset_lock, 10, (uintptr_t)file);
         file->observed_writeback_error = kernel_vfs_error_sequence(&file->file);
         *owner = file;
     }
@@ -172,6 +174,7 @@ enum kernel_open_file_status kernel_open_file_create_mode(
     }
     file->heap = heap;
     file->references = 1U;
+    kernel_mutex_init(&file->offset_lock, 10, (uintptr_t)file);
     file->kind = KERNEL_OPEN_FILE_KIND_REGULAR;
     *owner = file;
     *linux_result = 0;
@@ -214,6 +217,7 @@ enum kernel_open_file_status kernel_open_file_create_executable(
     }
     file->heap = heap;
     file->references = 1U;
+    kernel_mutex_init(&file->offset_lock, 10, (uintptr_t)file);
     *owner = file;
     *linux_result = 0;
     return KERNEL_OPEN_FILE_STATUS_OK;
@@ -241,6 +245,7 @@ enum kernel_open_file_status kernel_open_file_create_console(
     }
     file->heap = heap;
     file->references = 1U;
+    kernel_mutex_init(&file->offset_lock, 10, (uintptr_t)file);
     file->kind = KERNEL_OPEN_FILE_KIND_CONSOLE;
     *owner = file;
     return KERNEL_OPEN_FILE_STATUS_OK;
@@ -282,6 +287,7 @@ enum kernel_open_file_status kernel_open_file_create_pipe(
                    : KERNEL_OPEN_FILE_STATUS_STATE;
     }
     file->references = 1U;
+    kernel_mutex_init(&file->offset_lock, 10, (uintptr_t)file);
     file->kind = KERNEL_OPEN_FILE_KIND_PIPE;
     file->file.mode = KERNEL_VFS_S_IFIFO | UINT32_C(0000600);
     file->open_flags = (uint32_t)flags |
@@ -317,6 +323,7 @@ enum kernel_open_file_status kernel_open_file_create_epoll(
     }
     file->heap = heap;
     file->references = 1U;
+    kernel_mutex_init(&file->offset_lock, 10, (uintptr_t)file);
     file->kind = KERNEL_OPEN_FILE_KIND_EPOLL;
     file->epoll = epoll;
     file->open_flags = flags;
@@ -342,6 +349,7 @@ enum kernel_open_file_status kernel_open_file_create_socket(
         return KERNEL_OPEN_FILE_STATUS_STATE;
     file->heap = heap;
     file->references = 1U;
+    kernel_mutex_init(&file->offset_lock, 10, (uintptr_t)file);
     file->kind = KERNEL_OPEN_FILE_KIND_SOCKET;
     file->file.mode = KERNEL_VFS_S_IFSOCK | UINT32_C(0000600);
     file->open_flags = flags;

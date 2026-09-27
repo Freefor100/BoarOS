@@ -133,6 +133,9 @@ static enum kernel_files_status read_pinned(
     uint64_t count,
     int64_t *linux_result)
 {
+    KERNEL_LOCK_SCOPE(offset_guard);
+    if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_REGULAR)
+        kernel_mutex_lock(&description->offset_lock, &offset_guard);
     uint64_t request;
     uint64_t total = 0U;
     struct kernel_uaccess_iov_cursor cursor = {iov, iov_count, 0U, 0U};
@@ -960,6 +963,9 @@ static enum kernel_files_status write_request(
     uint64_t count, int positioned, uint64_t requested_offset,
     int64_t *linux_result)
 {
+    KERNEL_LOCK_SCOPE(offset_guard);
+    if (!positioned && kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_REGULAR)
+        kernel_mutex_lock(&description->offset_lock, &offset_guard);
     struct kernel_task_io_buffer buffer = {0};
     unsigned char small[KERNEL_FILES_WRITE_STAGING];
     unsigned char *staging = small;
@@ -1219,25 +1225,13 @@ out:
     return release_io_description(files, &description, status);
 }
 
-enum kernel_files_status kernel_files_lseek(
-    struct kernel_files *files,
-    int64_t fd,
-    int64_t offset,
-    uint64_t whence,
-    int64_t *linux_result)
+static enum kernel_files_status lseek_pinned(
+    struct kernel_open_file_description *description, int64_t offset,
+    uint64_t whence, int64_t *linux_result)
 {
-    struct kernel_open_file_description *description;
-    int64_t current;
-    int64_t target;
-
-    if (!kernel_files_is_live(files) || linux_result == 0) {
-        return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
-    }
-    description = kernel_files_lookup_description(files, fd);
-    if (description == 0) {
-        *linux_result = -KERNEL_EBADF;
-        return KERNEL_FILES_STATUS_OK;
-    }
+    int64_t current, target;
+    KERNEL_LOCK_SCOPE(offset_guard);
+    kernel_mutex_lock(&description->offset_lock, &offset_guard);
     if (kernel_open_file_kind(description) ==
             KERNEL_OPEN_FILE_KIND_CONSOLE ||
         kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_PIPE ||
@@ -1291,6 +1285,19 @@ enum kernel_files_status kernel_files_lseek(
     }
     *linux_result = target;
     return KERNEL_FILES_STATUS_OK;
+}
+
+enum kernel_files_status kernel_files_lseek(
+    struct kernel_files *files, int64_t fd, int64_t offset,
+    uint64_t whence, int64_t *linux_result)
+{
+    struct kernel_open_file_description *description = 0;
+    if (!kernel_files_is_live(files) || !linux_result)
+        return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
+    enum kernel_files_status status = kernel_files_pin(files, fd, &description, linux_result);
+    if (status != KERNEL_FILES_STATUS_OK || *linux_result) return status;
+    status = lseek_pinned(description, offset, whence, linux_result);
+    return release_io_description(files, &description, status);
 }
 
 enum kernel_files_status kernel_files_ftruncate(
@@ -1355,7 +1362,8 @@ enum kernel_files_status kernel_files_getdents(
     if (!kernel_files_is_live(files) || mm == 0 || linux_result == 0) {
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
     }
-    description = kernel_files_lookup_description(files, fd);
+    KERNEL_FILES_PIN_SCOPE(pin_guard);
+    description = kernel_files_hold_fd(files, fd, &pin_guard);
     if (description == 0) {
         *linux_result = -KERNEL_EBADF;
         return KERNEL_FILES_STATUS_OK;
@@ -1378,6 +1386,8 @@ enum kernel_files_status kernel_files_getdents(
                   ? KERNEL_FILES_MAX_RW_COUNT
                   : count;
 
+    KERNEL_LOCK_SCOPE(offset_guard);
+    kernel_mutex_lock(&description->offset_lock, &offset_guard);
     /* The descriptor offset is the backend cookie for the next record. */
     position = kernel_open_file_offset(description);
     while (total < request) {
