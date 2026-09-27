@@ -109,6 +109,38 @@ enum kernel_files_status kernel_files_utimensat(
     return KERNEL_FILES_STATUS_OK;
 }
 
+enum kernel_files_status kernel_files_fchmod(
+    struct kernel_files *files, int64_t fd, uint32_t mode,
+    int64_t *linux_result)
+{
+    if (!kernel_files_is_live(files) || !linux_result)
+        return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
+    struct kernel_open_file_description *description =
+        kernel_files_lookup_description(files, fd);
+    if (!description) *linux_result = -KERNEL_EBADF;
+    else if (!description->file.private_data) *linux_result = -KERNEL_ENOTSUP;
+    else *linux_result = kernel_vfs_file_set_mode(&description->file, mode);
+    return KERNEL_FILES_STATUS_OK;
+}
+
+enum kernel_files_status kernel_files_fchmodat(
+    struct kernel_files *files, const struct kernel_fs_context *fs,
+    struct kernel_mm *mm, int64_t dirfd, uint64_t user_path,
+    uint32_t mode, int64_t *linux_result)
+{
+    struct kernel_vfs_path *path = 0;
+    int result;
+    if (!kernel_files_is_live(files) || !kernel_fs_context_is_live(fs) ||
+        !mm || !linux_result) return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
+    enum kernel_files_status status = copy_metadata_path(files, fs, mm,
+                                 dirfd, user_path, 0U, &path, &result);
+    if (status != KERNEL_FILES_STATUS_OK) return status;
+    if (!result) result = kernel_vfs_path_set_mode(path, mode);
+    if (path) (void)kernel_vfs_path_release(&path);
+    *linux_result = result;
+    return KERNEL_FILES_STATUS_OK;
+}
+
 static enum kernel_files_status copy_statfs(struct kernel_mm *mm,
     struct kernel_vfs_mount *mount, uint64_t user_buffer, int64_t *linux_result)
 {

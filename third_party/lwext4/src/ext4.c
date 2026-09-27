@@ -1093,6 +1093,34 @@ Unlock:
     return r;
 }
 
+int ext4_file_set_mode(ext4_file *file, uint32_t mode)
+{
+    if (!file || !file->mp || !file->mp->mounted) return EINVAL;
+    struct ext4_mountpoint *mp = file->mp;
+    struct ext4_inode_ref ref;
+    int r = EOK;
+    EXT4_MP_LOCK(mp);
+    if (mp->fs.read_only) { r = EROFS; goto Unlock; }
+    r = ext4_trans_start(mp);
+    if (r != EOK) goto Unlock;
+    r = ext4_fs_get_inode_ref(&mp->fs, file->inode, &ref);
+    if (r == EOK) {
+        uint32_t previous = ext4_inode_get_mode(&mp->fs.sb, ref.inode);
+        ext4_inode_set_mode(&mp->fs.sb, ref.inode,
+                            (previous & ~0xfffU) | (mode & 0xfffU));
+        ref.dirty = true;
+        ext4_touch_inode(mp, &ref, EXT4_TIME_CTIME);
+        r = ext4_fs_put_inode_ref(&ref);
+    }
+    r = ext4_trans_finish(mp, r);
+    ext4_file_completed(file, r);
+Unlock:
+    if (r != EOK && mp->fs.curr_trans && !mp->fs.curr_trans->error)
+        mp->fs.curr_trans->error = r;
+    EXT4_MP_UNLOCK(mp);
+    return r;
+}
+
 /********************************FILE OPERATIONS*****************************/
 
 static int ext4_path_check(const char *path, bool *is_goal)

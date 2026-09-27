@@ -19,6 +19,7 @@
 #define LINUX_O_RDWR UINT64_C(00000002)
 #define LINUX_O_CREAT UINT64_C(00000100)
 #define LINUX_O_EXCL UINT64_C(00000200)
+#define LINUX_O_NOCTTY UINT64_C(00000400)
 #define LINUX_O_TRUNC UINT64_C(00001000)
 #define LINUX_O_APPEND UINT64_C(00002000)
 #define LINUX_O_NONBLOCK UINT64_C(00004000)
@@ -41,7 +42,7 @@ static int validate_open_flags(uint64_t flags, uint32_t *fd_flags)
         LINUX_O_DIRECT |
         LINUX_O_NOATIME | LINUX_O_PATH |
         (LINUX_O_TMPFILE & ~LINUX_O_DIRECTORY);
-    const uint64_t known_flags = LINUX_O_ACCMODE | write_flags |
+    const uint64_t known_flags = LINUX_O_ACCMODE | write_flags | LINUX_O_NOCTTY |
         unsupported_flags | LINUX_O_NONBLOCK | LINUX_O_DIRECTORY |
         LINUX_O_NOFOLLOW |
         LINUX_O_LARGEFILE | LINUX_O_CLOEXEC | LINUX_O_SYNC;
@@ -211,7 +212,8 @@ enum kernel_files_status kernel_files_openat(
         created = 1;
         open_status = kernel_open_file_create_at(files->heap, start,
                     kernel_fs_context_root(fs), path, KERNEL_OPEN_PATH_CREATE,
-                    (uint32_t)mode, &description, &result);
+                    (uint32_t)(mode & ~kernel_fs_context_umask(fs)),
+                    &description, &result);
     }
     if (finish_path(files, path) != KERNEL_FILES_STATUS_OK) {
         if (description != 0) {
@@ -761,7 +763,8 @@ enum kernel_files_status kernel_files_mkdirat(
         *linux_result = result;
         return KERNEL_FILES_STATUS_OK;
     }
-    result = kernel_vfs_mkdir_at(start, kernel_fs_context_root(fs), path, mode);
+    result = kernel_vfs_mkdir_at(start, kernel_fs_context_root(fs), path,
+                                 mode & ~kernel_fs_context_umask(fs));
     if (finish_path(files, path) != KERNEL_FILES_STATUS_OK) {
         return KERNEL_FILES_STATUS_STATE;
     }

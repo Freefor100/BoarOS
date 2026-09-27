@@ -150,6 +150,20 @@ fd-slot OFD references -> files table -> fs context
 
 ## 显式时间与文件系统统计
 
+`umask` 属于 fs context：初值 `0022`，`CLONE_FS` 共享，普通 fork 复制；
+`openat(O_CREAT)` 与 `mkdirat` 在创建时用当前掩码削去权限位，打开已有文件
+不改权限。`fchmodat` 解析路径并跟随末端符号链接，`fchmod` 用 fd 持有的
+活 inode，故 unlink 后仍可修改；两者保留文件类型位、更新 ctime，
+只读挂载返回 `EROFS`。当前仍是不可变 root 凭据模型，没有所有者变更。
+pipe/匿名 epoll 等没有 VFS inode 的描述符目前返回 `ENOTSUP`；固定 Linux
+`fchmod(pipefd)` 可成功并修改其匿名 inode mode，这个独立合成 inode 元数据
+契约尚未实现。`O_PATH` 尚在 `openat` 边界明确返回 `ENOTSUP`，不会形成可传给
+`fchmod` 的有效描述符。
+`O_NOCTTY` 在当前字符设备模型中接受为合法 open flag；尚无控制终端会话，
+因此该 flag 不产生 TTY 状态变更。固定 Linux
+`references/linux/fs/open.c`（commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`）
+和 raw `tests/diff-abi/access.c`、`mode.c` 核对 errno、权限与 fork/共享边界。
+
 `utimensat` 的 times 先完整复制，两项 `UTIME_OMIT` 随即成功，不解析路径、fd 或 flags。其他请求先检查 flags 并取得目标，再检查纳秒，最后检查只读挂载；不存在路径与坏 fd 优先于非法纳秒。NULL pathname 且 dirfd 不是 `AT_FDCWD` 是 musl `futimens` 使用的 fd 形式，只接受 flags=0；空字符串配 `AT_EMPTY_PATH` 支持 fd 与 cwd。`AT_SYMLINK_NOFOLLOW` 修改链接自身，默认跟随链接。NULL times 或 `UTIME_NOW` 使用本次同一个 realtime 值，`UTIME_OMIT` 保留字段，实际修改同时更新 ctime，不修改父目录时间。fd 无须写访问模式；权限仍限于当前不可变 root 模型。
 
 `statfs/fstatfs` 输出 RV64 asm-generic 的 120 字节布局，输出前取得真实 mount 统计；路径/fd 错误优先于输出指针 fault。fd 直接使用其持有的 mount，unlink 后仍可查询；没有文件系统 mount 的 pipe/匿名 epoll/初始 console 返回 `ENOTSUP`，不伪装成根盘。统计不触发文件数据写回，空闲块只计实际磁盘分配；容量扣除真实 ext4 元数据及内部 journal 开销，bavail 扣除 superblock 保留块。BoarOS 没有 Linux 的紧急 extent 保留池，因此不额外扣除不存在的池。只读和 relatime 标志来自实际挂载契约。

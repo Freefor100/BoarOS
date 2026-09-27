@@ -14,6 +14,13 @@
 
 挂载为 lwext4 注册可选 realtime 时钟；尚未初始化时钟的纯模块环境保留原时间。`kernel_vfs_file_accessed()` 按活 inode 执行 relatime（包含页缓存命中的 read/pread），`kernel_vfs_file_modified()` 在非零写请求复制前更新时间并传播 metadata flush 错误。create、目录链接/删除和 truncate 在拥有 inode 引用的后端更新相应时间；同尺寸 truncate 也走后端，unlink 后仍打开的文件不依赖路径。时间字段编码、操作时机与失败 owner 的依据见[时间戳学习记录](../learning/file-timestamps.md)。
 
+`kernel_vfs_file_set_mode()` 通过持有的 inode handle 事务修改低 12 个权限位，
+保留类型和其余位并更新 ctime；路径入口复用同一 handle。后端
+`ext4_file_set_mode()` 不用 pathname，因此 fd 已 unlink 时仍可修改原 inode，
+挂载只读或已有日志错误先返回真实错误。活 node 的 mode 缓存同步更新，
+exec 权限检查可立即观察修改。该接口沿用现有
+`ext4_file_set_times()` 的事务、sync_tid 和错误所有权边界。
+
 ## 文件节点与页缓存
 
 VFS 以挂载实例与 ext4 inode 为活节点身份，普通文件、目录和字符节点都持有引用计数 node；路径对象另持有父目录项身份和一份活 inode 引用。独立 open file description 各自保存 offset，但同一 inode 指向共享 node。文件大小通过 `kernel_vfs_file_size()` 实时查询所属 node 的实时大小，确保写入或截断后各共享描述符观察到一致的文件长度。

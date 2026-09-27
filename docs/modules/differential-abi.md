@@ -22,6 +22,7 @@ Linux 原有源码许可证见 `references/linux/COPYING`，构建产物位于�
 - `links.c`、`signals.c`、`limits.c`：覆盖符号链接解析和元数据、同步信号等待、NOFILE 对 open/dup/pipe/fcntl 的实际约束、降低限制后保留旧 fd、跨 PID 访问、fork/exec 继承、STACK fault，以及 `prlimit64` 参数错误和设置后旧值输出故障。exec 子进程仍执行同一 `/init` ELF，由启动栈中的专用参数进入查询分支，不另造参考程序。
 - `robust.c`：9 条 raw syscall 记录覆盖注册长度、当前线程查询、缺失 TID、输出故障顺序、fork 不继承和注销；内核退出写字与唤醒另由真实 U-mode 探针保护。
 - `file_locks.c`：同一 ELF 核对传统与 OFD 锁的区间边界、权限与坏指针、负长度/EOF、互相冲突、dup/exec/CLOEXEC、unlink 后的 inode 身份、阻塞唤醒、信号打断/重启和有限死锁检测。Linux profile 显式启用 `CONFIG_FILE_LOCKING`；否则最小配置的参考内核并不具备记录锁，不能将其 `EACCES` 当成目标 ABI。
+- `access.c`、`mode.c`：raw `O_NOCTTY` 对普通文件/字符设备的 open 结果，`umask` 的创建掩码、fork/`CLONE_FS` 身份，`fchmodat/fchmod` 的路径/fd 错误、ctime、执行权限与 unlink 后活 inode。
 - `cases.c` 另覆盖 root UID/GID 四项无参数查询（寄存器留有无效地址仍须忽略）及 fork/exec 后身份；与固定 Linux PID 1 root 环境比较。
 - `harness.py`：构建 Linux、制作镜像、运行两个系统、校验完整协议并做严格 diff。
 - `linux.config`：以 `allnoconfig` 为基础，启用 virt、MMU、ELF、串口、VirtIO

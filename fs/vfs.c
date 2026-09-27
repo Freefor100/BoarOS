@@ -1050,6 +1050,28 @@ int kernel_vfs_path_set_times(struct kernel_vfs_path *path,
     return kernel_vfs_file_set_times(&path->file, times);
 }
 
+int kernel_vfs_file_set_mode(struct kernel_vfs_file *file, uint32_t mode)
+{
+    if (!file || !file->private_data || file->state != VFS_FILE_STATE_LIVE)
+        return -KERNEL_EINVAL;
+    struct kernel_vfs_node *node = file->private_data;
+    if (node->adapter->read_only) return -KERNEL_EROFS;
+    int result = mount_error(node->adapter);
+    if (result) return lwext4_error(result);
+    result = lwext4_error(ext4_file_set_mode(&node->file, mode & 07777U));
+    if (!result) {
+        node->mode = (node->mode & ~07777U) | (mode & 07777U);
+        file->mode = node->mode;
+    }
+    return result;
+}
+
+int kernel_vfs_path_set_mode(struct kernel_vfs_path *path, uint32_t mode)
+{
+    if (!path || !path->references) return -KERNEL_EINVAL;
+    return kernel_vfs_file_set_mode(&path->file, mode);
+}
+
 static int vfs_open_raw(struct kernel_vfs_mount *mount,
                         const char *path, uint32_t inode_number,
                         uint32_t inode_mode,

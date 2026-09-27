@@ -74,6 +74,7 @@ int kernel_vfs_path_stat(const struct kernel_vfs_path *path,
                          struct kernel_vfs_stat *stat);
 int kernel_vfs_path_set_times(struct kernel_vfs_path *path,
                               const struct kernel_vfs_timespec times[2]);
+int kernel_vfs_path_set_mode(struct kernel_vfs_path *path, uint32_t mode);
 int kernel_vfs_path_release(struct kernel_vfs_path **owner);
 struct kernel_vfs_mount *kernel_vfs_path_mount(
     const struct kernel_vfs_path *path);
@@ -139,6 +140,7 @@ int kernel_vfs_mount_statfs(struct kernel_vfs_mount *mount,
                             struct kernel_vfs_statfs *stat);
 int kernel_vfs_file_set_times(struct kernel_vfs_file *file,
                               const struct kernel_vfs_timespec times[2]);
+int kernel_vfs_file_set_mode(struct kernel_vfs_file *file, uint32_t mode);
 
 int kernel_vfs_open(struct kernel_vfs_mount *mount,
                     const char *path,

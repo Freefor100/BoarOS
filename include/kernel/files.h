@@ -141,6 +141,13 @@ enum kernel_files_status kernel_files_utimensat(
     struct kernel_files *files, const struct kernel_fs_context *fs,
     struct kernel_mm *mm, int64_t dirfd, uint64_t user_path,
     uint64_t user_times, uint32_t flags, int64_t *linux_result);
+enum kernel_files_status kernel_files_fchmod(
+    struct kernel_files *files, int64_t fd, uint32_t mode,
+    int64_t *linux_result);
+enum kernel_files_status kernel_files_fchmodat(
+    struct kernel_files *files, const struct kernel_fs_context *fs,
+    struct kernel_mm *mm, int64_t dirfd, uint64_t user_path,
+    uint32_t mode, int64_t *linux_result);
 enum kernel_files_status kernel_files_statfs(
     struct kernel_files *files, const struct kernel_fs_context *fs,
     struct kernel_mm *mm, uint64_t user_path, uint64_t user_buffer,

@@ -62,7 +62,7 @@ static void times_test(struct ext4_fs *fs, bool readonly)
     t[0].nanoseconds=1000000000;CHECK(ext4_file_set_times(&f,1,t)==EINVAL);t[0].nanoseconds=123456789;
     CHECK(ext4_fraw_inode_fill(&f,&after)==EOK && !memcmp(&before,&after,sizeof(before)));
     CHECK(disk.writes==writes);
-    if (readonly) { CHECK(ext4_file_set_times(&f,7,t)==EROFS);CHECK(disk.writes==writes);CHECK(ext4_fclose(&f)==EOK);return; }
+    if (readonly) { CHECK(ext4_file_set_times(&f,7,t)==EROFS);CHECK(ext4_file_set_mode(&f,0751)==EROFS);CHECK(disk.writes==writes);CHECK(ext4_fclose(&f)==EOK);return; }
     CHECK(ext4_file_set_times(&f,7,t)==EOK);
     for(unsigned i=0;i<3;i++)expect_time(&f,i,t[i],extended);
     CHECK(f.sync_tid==fs->jbd_journal->committed_id && f.sync_tid);
@@ -86,6 +86,10 @@ static void times_test(struct ext4_fs *fs, bool readonly)
     CHECK(ext4_funlink_dentry("/file",&unlinked,&orphan)==EOK && orphan && unlinked==f.inode);
     CHECK(ext4_file_set_times(&f,1,t)==EOK);expect_time(&f,0,t[0],extended);
     CHECK(ext4_fraw_inode_fill(&f,&after)==EOK && !ext4_inode_get_links_cnt(&after));
+    CHECK(ext4_file_set_mode(&f,0751)==EOK);
+    CHECK(ext4_fraw_inode_fill(&f,&after)==EOK &&
+          (ext4_inode_get_mode(&fs->sb,&after)&0177777)==0100751 &&
+          !ext4_inode_get_links_cnt(&after));
     CHECK(ext4_fclose(&f)==EOK);CHECK(ext4_orphan_free("/",unlinked)==EOK);
 }
 static void stats_test(struct ext4_fs *fs,uint64_t expected)

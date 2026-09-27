@@ -11,6 +11,7 @@
 struct kernel_fs_context_record {
     struct kernel_vfs_path *root;
     struct kernel_vfs_path *cwd;
+    uint32_t umask;
     uint32_t references;
 };
 
@@ -42,7 +43,8 @@ static enum kernel_fs_context_status create_context(
     struct kernel_vfs_path *root,
     struct kernel_vfs_path *cwd,
     struct kernel_vfs_mount *root_mount,
-    struct kernel_heap *heap)
+    struct kernel_heap *heap,
+    uint32_t umask)
 {
     struct kernel_fs_context_record *record;
     enum kernel_heap_status heap_status;
@@ -79,6 +81,7 @@ static enum kernel_fs_context_status create_context(
     }
     record->root = root;
     record->cwd = cwd;
+    record->umask = umask;
     record->references = 1U;
     fs->heap = heap;
     fs->record = record;
@@ -97,7 +100,7 @@ enum kernel_fs_context_status kernel_fs_context_create(
     if (!empty_context(fs)) {
         return KERNEL_FS_CONTEXT_STATUS_STATE;
     }
-    return create_context(fs, 0, 0, root_mount, heap);
+    return create_context(fs, 0, 0, root_mount, heap, 0022U);
 }
 
 enum kernel_fs_context_status kernel_fs_context_acquire(
@@ -131,7 +134,7 @@ enum kernel_fs_context_status kernel_fs_context_fork(
     }
     return create_context(destination, source->record->root,
                           source->record->cwd, 0,
-                          source->heap);
+                          source->heap, source->record->umask);
 }
 
 enum kernel_fs_context_status kernel_fs_context_move(
@@ -159,6 +162,20 @@ struct kernel_vfs_path *kernel_fs_context_root(const struct kernel_fs_context *f
 struct kernel_vfs_path *kernel_fs_context_cwd(const struct kernel_fs_context *fs)
 {
     return kernel_fs_context_is_live(fs) ? fs->record->cwd : 0;
+}
+
+uint32_t kernel_fs_context_umask(const struct kernel_fs_context *fs)
+{
+    return kernel_fs_context_is_live(fs) ? fs->record->umask : 0U;
+}
+
+int kernel_fs_context_exchange_umask(const struct kernel_fs_context *fs,
+                                    uint32_t requested, uint32_t *previous)
+{
+    if (!kernel_fs_context_is_live(fs) || previous == 0) return -KERNEL_EINVAL;
+    *previous = fs->record->umask;
+    fs->record->umask = requested & 0777U;
+    return 0;
 }
 
 int kernel_fs_context_set_cwd(const struct kernel_fs_context *fs,

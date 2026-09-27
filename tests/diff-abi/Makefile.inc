@@ -1,5 +1,5 @@
 DIFF_ABI_RV := build/diff-abi/cases-rv
-DIFF_ABI_SOURCES := tests/diff-abi/cases.c tests/diff-abi/start.S tests/diff-abi/truncate.c tests/diff-abi/timestamps.c tests/diff-abi/readv.c tests/diff-abi/links.c tests/diff-abi/signals.c tests/diff-abi/limits.c tests/diff-abi/devices.c tests/diff-abi/sync.c tests/diff-abi/namespace.c tests/diff-abi/metadata.c tests/diff-abi/robust.c tests/diff-abi/shared_mapping.c tests/diff-abi/futex_shared.c tests/diff-abi/file_locks.c tests/diff-abi/access.c
+DIFF_ABI_SOURCES := tests/diff-abi/cases.c tests/diff-abi/start.S tests/diff-abi/truncate.c tests/diff-abi/timestamps.c tests/diff-abi/readv.c tests/diff-abi/links.c tests/diff-abi/signals.c tests/diff-abi/limits.c tests/diff-abi/devices.c tests/diff-abi/sync.c tests/diff-abi/namespace.c tests/diff-abi/metadata.c tests/diff-abi/robust.c tests/diff-abi/shared_mapping.c tests/diff-abi/futex_shared.c tests/diff-abi/file_locks.c tests/diff-abi/access.c tests/diff-abi/mode.c
 
 $(DIFF_ABI_RV): $(DIFF_ABI_SOURCES) tests/diff-abi/abi.h tests/riscv/user_elf.ld
 	@mkdir -p $(@D)
@@ -18,4 +18,5 @@ build-diff-abi-linux:
 
 test-diff-abi-riscv: test-diff-abi-host $(KERNEL_RV) $(DIFF_ABI_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) python3 tests/diff-abi/harness.py \
-		--kernel $(KERNEL_RV) --program $(DIFF_ABI_RV)
+		--kernel $(KERNEL_RV) --program $(DIFF_ABI_RV) \
+		$(if $(DIFF_ABI_LINUX_KERNEL),--linux-kernel $(DIFF_ABI_LINUX_KERNEL))

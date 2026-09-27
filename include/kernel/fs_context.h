@@ -58,6 +58,9 @@ int kernel_fs_context_is_live(const struct kernel_fs_context *fs);
 /* Borrowed identities remain live while this context is held. */
 struct kernel_vfs_path *kernel_fs_context_root(const struct kernel_fs_context *fs);
 struct kernel_vfs_path *kernel_fs_context_cwd(const struct kernel_fs_context *fs);
+uint32_t kernel_fs_context_umask(const struct kernel_fs_context *fs);
+int kernel_fs_context_exchange_umask(const struct kernel_fs_context *fs,
+                                    uint32_t requested, uint32_t *previous);
 int kernel_fs_context_set_cwd(const struct kernel_fs_context *fs,
                               struct kernel_vfs_path *path);
 

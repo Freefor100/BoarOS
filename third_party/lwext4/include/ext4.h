@@ -111,6 +111,9 @@ int ext4_file_touch(ext4_file *file, unsigned int fields);
  * bits are valid. A zero mask performs no I/O and permits times == NULL. */
 int ext4_file_set_times(ext4_file *file, unsigned fields,
                        const struct ext4_timestamp times[3]);
+/* Preserve inode identity after unlink; update permission bits and ctime in one
+ * transaction, with the same file error owner as other metadata mutations. */
+int ext4_file_set_mode(ext4_file *file, uint32_t mode);
 
 /*****************************DIRECTORY DESCRIPTOR***************************/
 

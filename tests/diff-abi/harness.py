@@ -126,6 +126,21 @@ def linux_build(config=None):
     return image, saved
 
 
+def fixed_linux_image(argument):
+    if argument is None:
+        return linux_build()
+    image = Path(argument).resolve(strict=True)
+    for ancestor in image.parents:
+        metadata = ancestor / 'identity.json'
+        if metadata.is_file():
+            saved = json.loads(metadata.read_text())
+            if (saved['inputs']['source'] != list(source_info()) or
+                    saved['image_sha256'] != digest(image)):
+                raise RuntimeError('Linux image does not match fixed build identity')
+            return image, saved
+    raise RuntimeError('Linux image has no fixed-build identity.json')
+
+
 def fixture(directory, program):
     tree = directory / 'fixture'
     tree.mkdir()
@@ -164,7 +179,7 @@ def run(args):
         metadata.update(boaros_sha256=digest(kernel_snapshot),
                         program_sha256=digest(program_snapshot),
                         case_manifest_sha256=digest(manifest_snapshot))
-        image, linux_metadata = linux_build()
+        image, linux_metadata = fixed_linux_image(getattr(args, 'linux_kernel', None))
         metadata['linux'] = linux_metadata
         qemu = os.environ.get('QEMU_RISCV64', 'qemu-system-riscv64')
         metadata['qemu'] = output([qemu, '--version'])
@@ -221,6 +236,8 @@ def main():
     parser.add_argument('--linux-config', type=Path,
                         help='Linux configuration for cache-key/build-linux')
     parser.add_argument('--kernel', type=Path, default=ROOT / 'kernel-rv')
+    parser.add_argument('--linux-kernel', type=Path,
+                        help='verified fixed Linux Image cache')
     parser.add_argument('--program', type=Path, default=BUILD / 'cases-rv')
     parser.add_argument('--timeout', type=float, default=60)
     args = parser.parse_args()

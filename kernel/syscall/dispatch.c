@@ -12,6 +12,8 @@
 #define LINUX_SYSCALL_STATFS 43U
 #define LINUX_SYSCALL_FSTATFS 44U
 #define LINUX_SYSCALL_UTIMENSAT 88U
+#define LINUX_SYSCALL_FCHMOD 52U
+#define LINUX_SYSCALL_FCHMODAT 53U
 #define LINUX_SYSCALL_GETCWD 17U
 #define LINUX_SYSCALL_RENAMEAT 38U
 #define LINUX_SYSCALL_CHDIR 49U
@@ -57,6 +59,7 @@
 #define LINUX_SYSCALL_GETGID 176U
 #define LINUX_SYSCALL_GETEGID 177U
 #define LINUX_SYSCALL_GETTID 178U
+#define LINUX_SYSCALL_UMASK 166U
 #define LINUX_SYSCALL_BRK 214U
 #define LINUX_SYSCALL_SCHED_YIELD 124U
 #define LINUX_SYSCALL_CLOCK_GETTIME 113U
@@ -205,6 +208,16 @@ enum kernel_syscall_status kernel_syscall_dispatch(
         }
     } else if (request->number == LINUX_SYSCALL_UTIMENSAT) {
         if (syscall_handle_utimensat(caller, request, &decoded) != KERNEL_SYSCALL_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    } else if (request->number == LINUX_SYSCALL_UMASK) {
+        if (syscall_handle_umask(caller, request, &decoded) !=
+            KERNEL_SYSCALL_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    } else if (request->number == LINUX_SYSCALL_FCHMOD ||
+               request->number == LINUX_SYSCALL_FCHMODAT) {
+        if (syscall_handle_chmod(caller, request, &decoded,
+                request->number == LINUX_SYSCALL_FCHMOD) !=
+            KERNEL_SYSCALL_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     } else if (request->number == LINUX_SYSCALL_STATFS ||
                request->number == LINUX_SYSCALL_FSTATFS) {
