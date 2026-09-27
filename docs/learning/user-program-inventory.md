@@ -22,7 +22,7 @@ python3 tests/program-inventory/run.py --reuse-builds --require-pass --output bu
 
 ## 当前基线与阻塞
 
-2026-09-25 最近一次全量运行使用 `build/p4d-full-20260925/`，目录已清理；复现命令：
+2026-09-25 全量运行使用 `build/p4d-full-20260925/`，目录已清理；复现命令：
 
 ```sh
 python3 tests/program-inventory/run.py --output build/p4d-full-20260925
@@ -39,20 +39,21 @@ python3 tests/program-inventory/run.py --output build/p4d-full-20260925
 2026-09-27 glibc/futex bitset 阶段通过 `python3 tests/program-inventory/run.py --reuse-builds --output build/glibc-futex-inventory` 再次全量运行，`status=complete`：223 pass、2 nonzero-exit、3 upstream-failure；仍是上述五个失败 ID，无旧通过项回退。BoarOS 内核 SHA-256 为 `ebc11763ddac2661df3af45cca96ca322abeba0623e5cb9919a9051392db4574`，固定 Linux Image 为 `7ca338ec75e681cc68c5d946b3ae633fc0088fd78569b7847528105a9de6c8ec`，suite identity SHA-256 为 `5419a733de0e8e5095f53876f261a5a17c0c9f49b6f445dc0953e6fcef48c9c9`。同一阶段的 `make test-glibc-riscv test-diff-abi-riscv test-userland-riscv test-sqlite-wal-riscv test-riscv test-stack-usage` 通过，固定 Linux 差分扩至 408 条；`make test-sqlite-wal-recovery-riscv test-offline-c-baseline-riscv` 也在整合后的内核上通过。glibc 基础矩阵通过不改变既有 socket 缺口，也不代表离线编译已完成。
 
 2026-09-27 离线 C 编译整合后通过 `python3 tests/program-inventory/run.py --reuse-builds --output build/offline-gcc-inventory` 重跑全部 228 项，`status=complete`：223 pass、2 nonzero-exit、3 upstream-failure；失败仍是上述五项，没有旧通过项回退。BoarOS 内核 SHA-256 为 `9f848c4b74aa8415c0869616abfccd456e26742e1959d717b7f59f57f50164c4`，固定 Linux Image SHA-256 为 `16a93ddb1d451898b93fff14de0cc076bcf1b10dad54c19a3e179a6cd81103b1`，suite identity SHA-256 为 `f3540ed6f317d7ca605780c938e4dbd6b66f76af56836e128234018f7c9329a4`。`make test-diff-abi-riscv` 的 430 条记录双侧一致；`make test-offline-c-riscv` 在同一内核上完成固定 Alpine GCC 的五阶段客体内编译，产物哈希见[离线工具链记录](offline-toolchain-probe.md)。镜像与逐项日志核对后按 `make prune-build` 清理。
-2026-09-27 IPv4 loopback 首切片在全量基线之后单独重跑原版 `libc.static.socket` 与 `libc.dynamic.socket`：固定 Linux 与 BoarOS 四次执行均 `pass`，原始输出与 wait status 一致。聚焦 suite identity SHA-256 `cd6490b7cbab34d77f08407a0295461a68f4e83e0e48f011c27ddc874bcbc51e`；BoarOS 内核 `bb09a7969d92cdc3a0f996af17832452c1728931f31f215d6b58c382b183845e`，固定 Linux Image `7ca338ec75e681cc68c5d946b3ae633fc0088fd78569b7847528105a9de6c8ec`，未修改静态/动态入口 ELF 分别为 `d7669dcc49c75a9e1eb1c2d5896a4def35bd5d880025d9386b4eba1285781def`、`f092124714fc1fa6f57d353150e1c0896833ab72fd6d012761914bd0f7816d1b`。聚焦运行只读复用主 checkout 已核验构建输入，命令等价于[程序环境模块](../modules/program-environment.md)的 `--suite libc --case` 双入口；合并后仍需重跑 228 项全量清单，不能用这两个通过直接改写上段全量统计。
+
+2026-09-27 IPv4 loopback 首切片在全量基线之后单独重跑原版 `libc.static.socket` 与 `libc.dynamic.socket`：固定 Linux 与 BoarOS 四次执行均 `pass`，原始输出与 wait status 一致。聚焦 suite identity SHA-256 `cd6490b7cbab34d77f08407a0295461a68f4e83e0e48f011c27ddc874bcbc51e`；BoarOS 内核 `bb09a7969d92cdc3a0f996af17832452c1728931f31f215d6b58c382b183845e`，固定 Linux Image `7ca338ec75e681cc68c5d946b3ae633fc0088fd78569b7847528105a9de6c8ec`，未修改静态/动态入口 ELF 分别为 `d7669dcc49c75a9e1eb1c2d5896a4def35bd5d880025d9386b4eba1285781def`、`f092124714fc1fa6f57d353150e1c0896833ab72fd6d012761914bd0f7816d1b`。聚焦运行只读复用主 checkout 已核验构建输入，命令等价于[程序环境模块](../modules/program-environment.md)的 `--suite libc --case` 双入口；后续整合全量结果如下。
+
+2026-09-27 IPv4 loopback、审查修复与离线编译整合后执行 `python3 tests/program-inventory/run.py --reuse-builds --output build/socket-final-inventory`，`runs/suite.json` 为 `status=complete`：228 项中 227 pass、1 upstream-failure。仅 `busybox.official` 仍失败；原 `libc.static.socket`、`libc.dynamic.socket`、`libc.official.static`、`libc.official.dynamic` 均转绿，旧 223 个通过项未回退。BoarOS 内核 SHA-256 `012e24e42718f8850301d3855a96e6975ea20d685951a60e32731fddb60824ef`，固定 Linux Image SHA-256 `7ca338ec75e681cc68c5d946b3ae633fc0088fd78569b7847528105a9de6c8ec`，suite identity SHA-256 `044fdf1d02bcda873688cf3a38bd6c51ce289384db7f4681b8555effbc0440e2`。同一最终内核的 `make test-diff-abi-riscv` 为 502/502 条一致，`make test-lwip-host test-userland-riscv test-files-riscv test-syscall-riscv test-stack-usage test-riscv test-glibc-riscv test-sqlite-wal-riscv test-sqlite-wal-recovery-riscv test-offline-c-riscv` 通过。BusyBox 原脚本双侧分别为 55/55 与 51/55 success，BoarOS 未通过 df、dmesg、free、hwclock；旧记录中的 `which ls` 已转绿。核对时从本次 `suite.json` 读取完整输入、逐项状态与 QEMU 命令；镜像和日志核对后运行 `make prune-build`。
 
 | 范围 | Linux | BoarOS |
 |---|---:|---:|
-| 顶层案例 | 228 项满足契约 | 223 项退出/完整输出双侧一致；2 项直接失败；3 项包装失败 |
-| libc 静态 / 动态直接 entry | 107 / 110 全通过 | 106 / 109 通过；失败均为 socket |
-| 原 libc 静态 / 动态脚本 | 全部逐项断言通过 | 完整运行 107 / 110 项，各一项 FAIL，与 socket 直接 entry 相同 |
-| 原 BusyBox 脚本 | 55/55 success | 50/55 success；df、dmesg、which ls、free、hwclock 仍失败 |
+| 顶层案例 | 228 项满足契约 | 227 项通过；1 项 BusyBox 包装失败 |
+| libc 静态 / 动态直接 entry | 107 / 110 全通过 | 107 / 110 全通过 |
+| 原 libc 静态 / 动态脚本 | 全部逐项断言通过 | 全部逐项断言通过 |
+| 原 BusyBox 脚本 | 55/55 success | 51/55 success；df、dmesg、free、hwclock 仍失败 |
 
-包装脚本与直接 entry 重复覆盖，不能把 228 项或 5 个顶层失败当成独立缺陷数。原始 stdout/stderr、wait status、串口、逐案例 fixture 哈希及命令曾用于核对，旧运行目录已清理。关键身份为：BoarOS `kernel-rv` SHA-256 `48779733d5fedb7419755e4e8244b4d2fd433832fb5dc97cd5585a0b9130b619`，Linux Image `7ca338ec75e681cc68c5d946b3ae633fc0088fd78569b7847528105a9de6c8ec`，清单入口 `run.py` `4e59b9dafba47d47978e82ef221350cd0cd469162496a020c5c9ccdf12756f3f`，suite driver `83fca2c634085c2b81db212a72ea26221de3d746d832b06d1d6051115fd7b550`。完整执行身份、QEMU 命令与用户 ELF 身份当时由同一 JSON 保存；清理后的路径仅是历史记录。
+包装脚本与直接 entry 重复覆盖，228 个顶层案例不是 228 个独立能力。当前唯一未通过项是 BusyBox 原脚本，其中四条子命令断言失败。早期基线的内核 `kernel-rv` SHA-256 为 `48779733d5fedb7419755e4e8244b4d2fd433832fb5dc97cd5585a0b9130b619`，固定 Linux Image 为 `7ca338ec75e681cc68c5d946b3ae633fc0088fd78569b7847528105a9de6c8ec`；这些旧身份仅供历史定位。最终整合身份与重建命令见上段。
 
-| 直接失败（均有静态/动态版本） | 当前首个有证据的阻塞 | 对应 TODO |
-|---|---|---|
-| socket | socket 族与传输链 | N |
+当前已无清单中的直接 entry 失败；剩余 BusyBox 包装器的 mount/proc/sysfs/mqueue 等环境与子命令缺口见[目标清单](../goals.md)。
 
 `build/recoverable-metadata-focused` 另以 `--require-pass` 严格验收上述六个新增通过的 entry。`tests/program-inventory/filesystem.sh` 通过同一 `suites.run_suite()` 和未修改 BusyBox 验证 pwd、cd、指定时间 touch、文件/目录 mv 及改名后继续访问，双侧完整输出一致；manifest 与命令在 `build/recoverable-busybox-final/`。BusyBox `df` 仍失败不能解释成 statfs 未实现：独立 statvfs 与真实计数验证已通过，挂载枚举等消费者依赖继续按实际失败调查，不据命令名称补存根。
 

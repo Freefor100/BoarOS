@@ -43,7 +43,7 @@ WAL 断电与共享页故障阶段证据：`make test-sqlite-wal-recovery-riscv`
 | 已接入 | P4e 普通多进程 WAL | 固定 SQLite Unix VFS 的独立进程竞争、退出、重开、两次启动和 NBD 断电/故障矩阵已验收；实板持久性未覆盖 |
 | 持续支线 | P5a glibc 试跑、L0/L1 第二架构入口 | 可现在固定输入或调查边界，不以全量清单全绿为前提 |
 | 已接入 | P3c/e 记录锁与 SQLite DELETE 回滚日志 | 真实 U-mode、固定 Linux、NBD 断电/故障入口分开验收；不宣称实板持久性 |
-| 后续 | P0c 时序根因、N socket、P4 余项、P6 SMP | 按下述具体依赖进入，不按测试名称排接口 |
+| 后续 | P0c 时序根因、N2 AF_UNIX/设备网络、P4 余项、P6 SMP | 按下述具体依赖进入，不按测试名称排接口 |
 
 ### 主要依赖
 
@@ -66,7 +66,7 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 
 ## P0：固定证据与时序问题
 
-**入口**：`tests/program-inventory/{inputs.json,run.py,suites.py,reports.py}`、`tests/diff-abi/`、`.github/workflows/ci.yml`、[程序清单](learning/user-program-inventory.md)。2026-09-23 最近 228 项记录为 223 一致、2 个直接 entry 退出不符、3 个包装失败；静态/动态和脚本重叠不重复计算缺陷。
+**入口**：`tests/program-inventory/{inputs.json,run.py,suites.py,reports.py}`、`tests/diff-abi/`、`.github/workflows/ci.yml`、[程序清单](learning/user-program-inventory.md)。2026-09-23 基线的 228 项为 223 pass、2 个直接 entry 退出不符、3 个包装失败；2026-09-27 整合内核为 227 pass、1 个 BusyBox 包装失败。静态/动态和脚本重叠不重复计算缺陷。
 
 ### P0c 时序根因闭环
 
@@ -79,7 +79,7 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 ### P0d 持续证据与清单维护
 
 - [x] 本轮证据保留工作树内核、ELF/loader、fixture、runner、QEMU 与固定 Linux/BusyBox/libc-test 身份；旧基线只保留历史定位用途。
-- [x] 原七类直接失败按设备/身份、cwd、时间设置、文件系统统计、robust、socket 聚类；设备、cwd、显式时间、统计和 robust 已关闭。最后一次全量清单中的 socket 静态/动态直接 entry 已在后续固定双侧聚焦运行中通过；全量统计待整合内核复测，不按非零退出码猜 syscall。
+- [x] 原七类直接失败按设备/身份、cwd、时间设置、文件系统统计、robust、socket 聚类；设备、cwd、显式时间、统计、robust 与 socket 静态/动态直接 entry 已关闭。整合内核的 228 项清单为 227 pass、1 upstream-failure，余下 BusyBox 官方包装脚本；不按非零退出码猜 syscall。
 - [x] 已有硬回归严格通过；能力清单如实保存缺口。全量严格验收复用 `--require-pass`，不重建状态系统或跳过失败；相关静态/动态 entry、原包装器与 228 项清单均已重跑。
 - [x] 限定集合的 `--require-pass` 只严格判定本次 selection，未选项目保持历史状态或 `not-run`；未知 ID、所选失败/未完成、中断、参考侧失败与全量严格模式均有 runner 回归。
 
@@ -364,7 +364,7 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 - [ ] AF_INET loopback UDP/TCP 的首个真实消费者已通过；AF_UNIX/socketpair 和网卡侧路径仍待实现。原 socket entry 的实际调用已由固定源码 `src/functional/socket.c` 和日志确认。
 - [ ] bind/connect/listen/accept、send/recv、非阻塞 EAGAIN、半关闭、EOF、失败连接、poll/epoll 和信号打断逐项验收；失败连接不能假装建立 endpoint。
 - [ ] sendmsg/recvmsg 与 SCM_RIGHTS 明确被传 fd 的 OFD 引用、用户复制失败和消息未接收/对端退出时回收；不能只传可被关闭复用的整数 fd。
-- [x] 原静态/动态 socket 直接 entry 在固定 Linux 与 BoarOS 同一 ELF 双侧通过；PID 1 关机 `heap-live=0`。UDP 池耗尽、释放和重用、TCP segment 池耗尽后 `ERR_MEM`、TCP 200 秒协议定时回收由 host 测试保护；真实 pthread U-mode 覆盖零长度 UDP datagram、共享 OFD 双读、close/fd 复用、线程组强制退出、全局池压力下的 POLLOUT 抑制及释放后进展。完整 228 项清单待合并后重跑，不以此推出 AF_UNIX 或真实网卡完成。
+- [x] 原静态/动态 socket 直接 entry 在固定 Linux 与 BoarOS 同一 ELF 双侧通过；PID 1 关机 `heap-live=0`。UDP 池耗尽、释放和重用、TCP segment 池耗尽后 `ERR_MEM`、TCP 200 秒协议定时回收由 host 测试保护；真实 pthread U-mode 覆盖零长度 UDP datagram、共享 OFD 双读、close/fd 复用、线程组强制退出、全局池压力下的 POLLOUT 抑制及释放后进展。整合内核全量 228 项为 227 pass、1 BusyBox 包装失败，不以此推出 AF_UNIX 或真实网卡完成。
 
 ### N3 网卡与真实服务
 
