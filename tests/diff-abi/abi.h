@@ -24,6 +24,8 @@ long abi_call(long nr, long a, long b, long c, long d, long e, long f);
 #define SC2(n,a,b) CALL(n,a,b,0,0,0,0)
 #define SC3(n,a,b,c) CALL(n,a,b,c,0,0,0)
 #define SC4(n,a,b,c,d) CALL(n,a,b,c,d,0,0)
+#define SC5(n,a,b,c,d,e) CALL(n,a,b,c,d,e,0)
+#define SC6(n,a,b,c,d,e,f) CALL(n,a,b,c,d,e,f)
 long abi_open(const char *path, long flags);
 long abi_size(long fd);
 long abi_offset(long fd);
@@ -50,6 +52,7 @@ void abi_futex_bitset_cases(void);
 void abi_file_lock_cases(void);
 void abi_access_cases(void);
 void abi_mode_cases(void);
+void abi_socket_cases(void);
 void abi_file_lock_exec_probe(unsigned mode) __attribute__((noreturn));
 void abi_limit_exec_probe(void) __attribute__((noreturn));
 #endif

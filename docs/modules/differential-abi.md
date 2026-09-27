@@ -24,10 +24,11 @@ Linux 原有源码许可证见 `references/linux/COPYING`，构建产物位于�
 - `file_locks.c`：同一 ELF 核对传统与 OFD 锁的区间边界、权限与坏指针、负长度/EOF、互相冲突、dup/exec/CLOEXEC、unlink 后的 inode 身份、阻塞唤醒、信号打断/重启和有限死锁检测。Linux profile 显式启用 `CONFIG_FILE_LOCKING`；否则最小配置的参考内核并不具备记录锁，不能将其 `EACCES` 当成目标 ABI。
 - `access.c`、`mode.c`：raw `O_NOCTTY` 对普通文件/字符设备的 open 结果，`umask` 的创建掩码、fork/`CLONE_FS` 身份，`fchmodat/fchmod` 的路径/fd 错误、ctime、执行权限与 unlink 后活 inode。
   `mode.c` 比较 ctime 是否变化：镜像旧时间来自宿主，而固定 Linux 客体时钟可从 epoch 起步，不能把数值递增当作 chmod 契约。
+- `socket.c`：20 条 raw syscall 记录使用真实 loopback ioctl 握手，对照 IPv4 UDP 的 bind/getsockname、接收超时、sendto/recvfrom 数据和来源，以及 TCP 的 CLOEXEC/NONBLOCK、listen、非阻塞 connect、ppoll 就绪和 accept。端口由内核分配；只检查身份和语义，不比较随机端口。固定 Linux 参考启用 `CONFIG_NET`/`CONFIG_INET`。BoarOS 尚无 socket 后端时，这 20 条预期失败；此前 396 条仍应一致。原 libc-test 静态/动态 socket entry 是另一条真实程序组合验证。
 - `cases.c` 另覆盖 root UID/GID 四项无参数查询（寄存器留有无效地址仍须忽略）及 fork/exec 后身份；与固定 Linux PID 1 root 环境比较。
 - `harness.py`：构建 Linux、制作镜像、运行两个系统、校验完整协议并做严格 diff。
 - `linux.config`：以 `allnoconfig` 为基础，启用 virt、MMU、ELF、串口、VirtIO
-  MMIO/block、ext4、futex 和关机所需能力；Linux 自己解析依赖。futex 在首次 robust 差分前显式启用，避免固定 Linux 因精简配置返回 `ENOSYS`。
+  MMIO/block、ext4、futex、IPv4 网络和关机所需能力；Linux 自己解析依赖。futex 在首次 robust 差分前显式启用，避免固定 Linux 因精简配置返回 `ENOSYS`。
 
 每条记录含 ID、返回值、errno、文件 size、OFD offset、子进程 wait status 和
 完整观测数据的十六进制值。fd 与 mmap 地址只有其成功身份规范为 0；错误返回、
