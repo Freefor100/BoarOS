@@ -38,6 +38,8 @@ python3 tests/program-inventory/run.py --output build/p4d-full-20260925
 
 2026-09-27 glibc/futex bitset 阶段通过 `python3 tests/program-inventory/run.py --reuse-builds --output build/glibc-futex-inventory` 再次全量运行，`status=complete`：223 pass、2 nonzero-exit、3 upstream-failure；仍是上述五个失败 ID，无旧通过项回退。BoarOS 内核 SHA-256 为 `ebc11763ddac2661df3af45cca96ca322abeba0623e5cb9919a9051392db4574`，固定 Linux Image 为 `7ca338ec75e681cc68c5d946b3ae633fc0088fd78569b7847528105a9de6c8ec`，suite identity SHA-256 为 `5419a733de0e8e5095f53876f261a5a17c0c9f49b6f445dc0953e6fcef48c9c9`。同一阶段的 `make test-glibc-riscv test-diff-abi-riscv test-userland-riscv test-sqlite-wal-riscv test-riscv test-stack-usage` 通过，固定 Linux 差分扩至 408 条；`make test-sqlite-wal-recovery-riscv test-offline-c-baseline-riscv` 也在整合后的内核上通过。glibc 基础矩阵通过不改变既有 socket 缺口，也不代表离线编译已完成。
 
+2026-09-27 离线 C 编译整合后通过 `python3 tests/program-inventory/run.py --reuse-builds --output build/offline-gcc-inventory` 重跑全部 228 项，`status=complete`：223 pass、2 nonzero-exit、3 upstream-failure；失败仍是上述五项，没有旧通过项回退。BoarOS 内核 SHA-256 为 `9f848c4b74aa8415c0869616abfccd456e26742e1959d717b7f59f57f50164c4`，固定 Linux Image SHA-256 为 `16a93ddb1d451898b93fff14de0cc076bcf1b10dad54c19a3e179a6cd81103b1`，suite identity SHA-256 为 `f3540ed6f317d7ca605780c938e4dbd6b66f76af56836e128234018f7c9329a4`。`make test-diff-abi-riscv` 的 430 条记录双侧一致；`make test-offline-c-riscv` 在同一内核上完成固定 Alpine GCC 的五阶段客体内编译，产物哈希见[离线工具链记录](offline-toolchain-probe.md)。镜像与逐项日志核对后按 `make prune-build` 清理。
+
 | 范围 | Linux | BoarOS |
 |---|---:|---:|
 | 顶层案例 | 228 项满足契约 | 223 项退出/完整输出双侧一致；2 项直接失败；3 项包装失败 |

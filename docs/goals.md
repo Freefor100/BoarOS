@@ -129,7 +129,7 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 
 - [ ] `linkat` 覆盖同 inode 身份、nlink、打开后删除、跨 mount EXDEV、目录限制与失败后原对象；符号链接跟随 flags 单独验证。
 - [x] `renameat/renameat2` 支持普通/NOREPLACE；单事务文件/空目录覆盖、跨目录移动、祖先拒绝、同 inode、活目标及失败回滚，EXCHANGE/WHITEOUT 明确不支持。单根挂载的跨 mount 拒绝存在，真实多挂载验证归 P1h。
-- [ ] 按真实消费者接 umask、chmod/faccess 等；明确 mask 共享/复制和凭据依赖，与 P2e 权限模型一致，不能总返回允许。已有 open 未知 bits 拒绝策略另用差分核对，不能写成 Linux 通用要求。
+- [ ] `umask` 已按 fs context 的 fork 复制与 `CLONE_FS` 共享实现，真实 inode 的 `fchmod/fchmodat` 已覆盖；继续按消费者补 `faccessat` 的权限模型、合成 inode 的 chmod 与凭据依赖，与 P2e 保持一致，不能总返回允许。已有 open 未知 bits 拒绝策略另用差分核对，不能写成 Linux 通用要求。
 
 ### P1h 虚拟文件系统与多挂载
 
@@ -299,7 +299,9 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 - [ ] 再固定 rustc/cargo、依赖锁定和离线最小项目，成功后扩大完整项目。先 `-j1` 建立正确性，不要求 SMP，也不把网络下载失败混入内核 ABI。
 - [ ] 每个新失败最小化、对照固定 Linux，再修通用机制；保留可恢复的成功输入和失败样本，不能为构建脚本改写预期输出。
 
-**验证与退出**：现有 `test-exec-riscv`、`test-elf-tail-riscv`、`test-userland-riscv`，新增 `test-glibc-riscv`、futex bitset 固定 Linux 差分和 `tests/workloads/toolchain/` 的离线编译诊断探针；`tests/userland/exec_scripts.c` 仍待后续能力建设。未特改动态 glibc 的基础矩阵已有闭环，离线最小 C/Rust 构建尚未完成；不能把剩余运行失败合并成一个“动态链接未支持”。
+**验证与退出**：现有 `test-exec-riscv`、`test-elf-tail-riscv`、`test-userland-riscv`，新增 `test-glibc-riscv`、futex bitset 固定 Linux 差分和 `make test-offline-c-riscv` 的客体原生五阶段编译验收；`tests/userland/exec_scripts.c` 仍待后续能力建设。未特改动态 glibc 的基础矩阵和固定小型 C 程序的离线构建已有闭环；Rust 与更大项目尚未验收，不能把剩余运行失败合并成一个“动态链接未支持”。
+
+整合后 `make test-diff-abi-riscv test-files-riscv test-userland-riscv test-lwext4-metadata-host test-references test-offline-c-riscv test-glibc-riscv test-sqlite-wal-riscv test-sqlite-wal-recovery-riscv test-riscv test-offline-c-baseline-riscv test-stack-usage` 通过；固定 Linux 差分为 430 条。228 项清单通过 `python3 tests/program-inventory/run.py --reuse-builds --output build/offline-gcc-inventory` 全量重跑仍为 223/2/3，五个旧失败 ID 不变。内核 SHA-256 为 `9f848c4b74aa8415c0869616abfccd456e26742e1959d717b7f59f57f50164c4`，清单身份 SHA-256 为 `f3540ed6f317d7ca605780c938e4dbd6b66f76af56836e128234018f7c9329a4`；固定 Linux Image SHA-256 为 `16a93ddb1d451898b93fff14de0cc076bcf1b10dad54c19a3e179a6cd81103b1`。
 
 ## P6：SMP、TLB 与中断/I/O 并发
 

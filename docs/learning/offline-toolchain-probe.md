@@ -54,3 +54,13 @@ Alpine 展开树 SHA-256 为
 `ce84a7bb9fc7c97552121b37238622bbefbd4a3672600b57374e25230c582a07`；
 固定 Linux Image SHA-256 为
 `7ca338ec75e681cc68c5d946b3ae633fc0088fd78569b7847528105a9de6c8ec`。
+
+主分支整合 glibc/futex 后的重建再次通过 `make test-offline-c-riscv`：
+BoarOS `kernel-rv` SHA-256 为
+`9f848c4b74aa8415c0869616abfccd456e26742e1959d717b7f59f57f50164c4`，
+固定 Linux Image SHA-256 为
+`16a93ddb1d451898b93fff14de0cc076bcf1b10dad54c19a3e179a6cd81103b1`，
+驱动 SHA-256 为 `7810210bfc8cc50c65923650633c84e7aea69b1dce24ce6a0ff14f1f04fa7713`，
+输入 C 源 SHA-256 为 `5f3226afadc0a75dc9a9692baa7428fca406c00c65711b786b0994d94caf5beb`。
+五阶段均为 `exit:0`；产物哈希仍与上段一致。固定 Linux 异常退出产生的
+orphan 文件在审核后清理，最终 `e2fsck -fn` 完全干净。
