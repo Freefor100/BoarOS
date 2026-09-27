@@ -57,6 +57,26 @@ host 测试保护源版本拒绝、头文件身份变化、配置功能不被裁
 真实构建还编译含 musl、Linux 和 RISC-V `asm` 头的静态 probe；完整 BusyBox
 产物必须交由 inventory 的 Linux/BoarOS 运行步骤继续验证。
 
+## 客体内离线 C 编译探针
+
+`tests/workloads/toolchain/offline_c.c` 是固定 Linux 与 BoarOS 共用的静态
+musl `/init`。它从 `/work/tools.conf` 读取客体内编译器、汇编器绝对路径，
+依次执行 `-E` 预处理、`-S` 编译、`as` 汇编、静态链接以及运行新 ELF。
+每步把退出码、信号或 `execve` errno 写入 `/work/stages.tsv`，失败后不执行
+依赖它的后续阶段。产物和目录均 `fsync`；宿主先重放 ext4 journal，再从
+两个独立镜像提取 `.i`、`.s`、`.o`、ELF 和程序输出，逐项比较 SHA-256、
+最终输出及文件系统检查。版本字符串和目标文件存在本身不构成成功。
+
+`make test-offline-c-baseline-riscv` 是**诊断模式**：目前没有客体原生编译器，
+同一 ELF 在两侧均应准确停在 `preprocess:exec:2`。它通过只说明探针可定位
+首个失败，不说明离线编译已可用。`make test-offline-c-riscv
+OFFLINE_C_TOOLCHAIN_TREE=/absolute/path` 是**严格模式**，要求五阶段全部退出
+0、产物齐全且哈希双侧一致、运行输出逐字节匹配；缺少固定编译器输入即失败。
+`OFFLINE_C_LINUX_KERNEL` 可指向由固定 Linux commit
+`f4cdf7ca9a1fdcca413157df19753f388a5a224e` 构建且有 `identity.json`
+的缓存 Image；不指定时 runner 按固定资料构建。原生编译器来源、依赖和许可
+仍待路线确认，不把宿主交叉 GCC 当成客体编译器。
+
 ## SQLite 日志与 NBD 故障入口
 
 `references/sqlite/sqlite-amalgamation-3530400.zip` 是官方 SQLite 3.53.4 amalgamation，`references/sources.tsv` 固定下载 URL、2026-09-27 访问日期及 SHA-256 `1e71ddf93849c6a6ecf58b827c0692073d2dd7ee40196158068f7b29f422e87d`。构建直接解包到 `build/riscv/sqlite/`，不修改上游源码；复用 musl 1.2.5 工具链，保留线程支持、WAL 编译能力及原生 Unix VFS。回滚负载实际检查版本、`THREADSAFE=1`、VFS 名和 `journal_mode=DELETE`、`locking_mode=NORMAL`、`mmap_size=0`、`synchronous=EXTRA/FULL` 返回值。静态与动态 CLI 的可执行文件由同一固定源码编译。

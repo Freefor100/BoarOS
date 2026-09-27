@@ -935,6 +935,7 @@ SQLITE_CLI_INIT_RV := $(BUILD_DIR)/tests/user/sqlite-cli-init-rv
 SQLITE_RECOVERY_RV := $(BUILD_DIR)/tests/user/sqlite-recovery-rv
 SQLITE_WAL_RV := $(BUILD_DIR)/tests/user/sqlite-wal-rv
 LOCK_LIFECYCLE_RV := $(BUILD_DIR)/tests/user/record-lock-lifecycle-rv
+OFFLINE_C_RV := $(BUILD_DIR)/tests/user/offline-c-rv
 
 $(SQLITE_SOURCE): $(SQLITE_ARCHIVE)
 	@mkdir -p $(BUILD_DIR)/sqlite
@@ -981,6 +982,28 @@ test-sqlite-wal-riscv: $(SQLITE_WAL_RV) $(KERNEL_RV)
 $(LOCK_LIFECYCLE_RV): tests/workloads/locks/lifecycle.c $(MUSL_STAMP)
 	@mkdir -p $(dir $@)
 	$(MUSL_ROOT)/bin/musl-gcc $(MUSL_GCC_FLAGS) -static -O2 -pthread -o $@ $<
+
+$(OFFLINE_C_RV): tests/workloads/toolchain/offline_c.c $(MUSL_STAMP)
+	@mkdir -p $(dir $@)
+	$(MUSL_ROOT)/bin/musl-gcc $(MUSL_GCC_FLAGS) -static -O2 -o $@ $<
+
+.PHONY: test-offline-c-baseline-riscv test-offline-c-riscv
+test-offline-c-baseline-riscv: $(OFFLINE_C_RV) $(KERNEL_RV)
+	PYTHONDONTWRITEBYTECODE=1 python3 tests/offline-c-riscv.py \
+		--kernel $(KERNEL_RV) --program $(OFFLINE_C_RV) \
+		$(if $(OFFLINE_C_LINUX_KERNEL),--linux-kernel $(OFFLINE_C_LINUX_KERNEL)) \
+		--qemu $(QEMU_RISCV64) --expect-first-failure preprocess:exec:2
+
+test-offline-c-riscv: $(OFFLINE_C_RV) $(KERNEL_RV)
+	@test -n "$(OFFLINE_C_TOOLCHAIN_TREE)" || { \
+		echo 'set OFFLINE_C_TOOLCHAIN_TREE to a pinned native RV64 toolchain root' >&2; \
+		exit 2; \
+	}
+	PYTHONDONTWRITEBYTECODE=1 python3 tests/offline-c-riscv.py \
+		--kernel $(KERNEL_RV) --program $(OFFLINE_C_RV) \
+		$(if $(OFFLINE_C_LINUX_KERNEL),--linux-kernel $(OFFLINE_C_LINUX_KERNEL)) \
+		--qemu $(QEMU_RISCV64) \
+		--toolchain-tree $(OFFLINE_C_TOOLCHAIN_TREE)
 
 .PHONY: test-sqlite-rollback-riscv
 test-sqlite-rollback-riscv: $(SQLITE_ROLLBACK_RV) $(SQLITE_CLI_STATIC_RV) $(SQLITE_CLI_DYNAMIC_RV) $(SQLITE_CLI_INIT_RV) $(MUSL_LDSO) $(KERNEL_RV)

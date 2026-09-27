@@ -27,6 +27,8 @@ BoarOS 是从零搭建、面向 OS Comp 能力建设的 C / 少量汇编内核�
 
 固定 SQLite 3.53.4 的原生 Unix VFS 已在单 hart 上运行静态/动态 CLI、多进程 DELETE 回滚日志和普通多进程 WAL；WAL 工作负载用同一 ELF 在固定 Linux 与 BoarOS 验证 writer 竞争、未提交进程退出及第二次启动后的完整性。DELETE 与 WAL 的 EXTRA/FULL 恢复各有 NBD 断电/故障矩阵；实板持久性未验证。
 
+客体内离线 C 编译已有逐阶段双侧诊断入口；原生 RV64 编译器及其依赖尚未纳管，当前固定 Linux 与 BoarOS 都在预处理阶段得到 `ENOENT`，不算编译闭环。
+
 2026-09-27 最近一次固定 BusyBox/libc-test 全量验证（输入与身份见[程序清单](docs/learning/user-program-inventory.md)）：228 个顶层案例全部完成，223 项双侧一致、2 个直接 entry 退出不符、3 个包装脚本断言失败；失败仍是原 socket 静态/动态和原包装器五项，无旧通过项回退。BusyBox 原脚本为 50/55 success，另有独立 pwd/cd/mv/touch 组合双侧通过。包装脚本与 entry 有重叠，清单完成不等于全部兼容。
 
 ## 构建与验证
@@ -48,6 +50,7 @@ make test-sqlite-recovery-matrix-riscv # 小事务逐事件故障矩阵
 make test-sqlite-wal-riscv      # 固定 Linux/BoarOS 双侧多进程 WAL 与重启
 make test-sqlite-wal-recovery-riscv # 固定 Linux/BoarOS 的 WAL 正常与错误恢复
 make test-sqlite-wal-recovery-matrix-riscv # WAL 逐事件断电/写/flush 故障矩阵
+make test-offline-c-baseline-riscv # 双侧定位缺少客体原生编译器的第一失败
 make test-stack-usage
 make test-lwext4-host
 make test-lwext4-recovery-host # 日志与 orphan 的断电/故障矩阵
