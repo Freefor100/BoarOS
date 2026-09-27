@@ -925,6 +925,58 @@ MUSL_TARBALL := references/musl/musl-1.2.5.tar.gz
 MUSL_ROOT := $(BUILD_DIR)/musl-root
 MUSL_STAMP := $(MUSL_ROOT)/.shared-built
 MUSL_LDSO := $(MUSL_ROOT)/lib/ld-musl-riscv64.so.1
+SQLITE_ARCHIVE := references/sqlite/sqlite-amalgamation-3530400.zip
+SQLITE_SOURCE := $(BUILD_DIR)/sqlite/sqlite-amalgamation-3530400/sqlite3.c
+SQLITE_ROLLBACK_RV := $(BUILD_DIR)/tests/user/sqlite-rollback-rv
+SQLITE_CLI_STATIC_RV := $(BUILD_DIR)/tests/user/sqlite3-static-rv
+SQLITE_CLI_DYNAMIC_RV := $(BUILD_DIR)/tests/user/sqlite3-dynamic-rv
+SQLITE_CLI_INIT_RV := $(BUILD_DIR)/tests/user/sqlite-cli-init-rv
+SQLITE_RECOVERY_RV := $(BUILD_DIR)/tests/user/sqlite-recovery-rv
+LOCK_LIFECYCLE_RV := $(BUILD_DIR)/tests/user/record-lock-lifecycle-rv
+
+$(SQLITE_SOURCE): $(SQLITE_ARCHIVE)
+	@mkdir -p $(BUILD_DIR)/sqlite
+	unzip -oq $< -d $(BUILD_DIR)/sqlite
+	@test -f $@ && test -f $(dir $@)/shell.c
+	@touch $@ $(dir $@)/shell.c
+
+$(SQLITE_ROLLBACK_RV): tests/workloads/sqlite/rollback.c $(SQLITE_SOURCE) $(MUSL_STAMP)
+	@mkdir -p $(dir $@)
+	$(MUSL_ROOT)/bin/musl-gcc $(MUSL_GCC_FLAGS) -static -O2 -pthread \
+		-I$(dir $(SQLITE_SOURCE)) -o $@ $< $(SQLITE_SOURCE) -ldl
+
+$(SQLITE_CLI_STATIC_RV): $(SQLITE_SOURCE) $(MUSL_STAMP)
+	@mkdir -p $(dir $@)
+	$(MUSL_ROOT)/bin/musl-gcc $(MUSL_GCC_FLAGS) -static -O2 -pthread \
+		-o $@ $(dir $(SQLITE_SOURCE))/shell.c $(SQLITE_SOURCE) -ldl
+
+$(SQLITE_CLI_DYNAMIC_RV): $(SQLITE_SOURCE) $(MUSL_STAMP)
+	@mkdir -p $(dir $@)
+	$(MUSL_ROOT)/bin/musl-gcc $(MUSL_GCC_FLAGS) -fPIE -pie -O2 -pthread \
+		-Wl,--dynamic-linker=/lib/ld-musl-riscv64.so.1 \
+		-o $@ $(dir $(SQLITE_SOURCE))/shell.c $(SQLITE_SOURCE) -ldl
+
+$(SQLITE_CLI_INIT_RV): tests/workloads/sqlite/cli_init.c $(MUSL_STAMP)
+	@mkdir -p $(dir $@)
+	$(MUSL_ROOT)/bin/musl-gcc $(MUSL_GCC_FLAGS) -static -O2 -o $@ $<
+
+$(SQLITE_RECOVERY_RV): tests/workloads/sqlite/recovery.c $(SQLITE_SOURCE) $(MUSL_STAMP)
+	@mkdir -p $(dir $@)
+	$(MUSL_ROOT)/bin/musl-gcc $(MUSL_GCC_FLAGS) -static -O2 -pthread \
+		-I$(dir $(SQLITE_SOURCE)) -o $@ $< $(SQLITE_SOURCE) -ldl
+
+$(LOCK_LIFECYCLE_RV): tests/workloads/locks/lifecycle.c $(MUSL_STAMP)
+	@mkdir -p $(dir $@)
+	$(MUSL_ROOT)/bin/musl-gcc $(MUSL_GCC_FLAGS) -static -O2 -pthread -o $@ $<
+
+.PHONY: test-sqlite-rollback-riscv
+test-sqlite-rollback-riscv: $(SQLITE_ROLLBACK_RV) $(SQLITE_CLI_STATIC_RV) $(SQLITE_CLI_DYNAMIC_RV) $(SQLITE_CLI_INIT_RV) $(MUSL_LDSO) $(KERNEL_RV)
+	SQLITE_ROLLBACK_RV=$(SQLITE_ROLLBACK_RV) \
+	SQLITE_CLI_STATIC_RV=$(SQLITE_CLI_STATIC_RV) \
+	SQLITE_CLI_DYNAMIC_RV=$(SQLITE_CLI_DYNAMIC_RV) \
+	SQLITE_CLI_INIT_RV=$(SQLITE_CLI_INIT_RV) MUSL_LDSO=$(MUSL_LDSO) \
+	QEMU_RISCV64=$(QEMU_RISCV64) \
+		./tests/sqlite-rollback-riscv.sh
 REAL_USERLAND_RV := $(BUILD_DIR)/tests/user/real-userland-rv
 PTHREAD_USERLAND_RV := $(BUILD_DIR)/tests/user/pthread-userland-rv
 PTHREAD_TLS_DSO_RV := $(BUILD_DIR)/tests/user/libboaros-tls.so
@@ -1133,6 +1185,44 @@ test-block-host:
 	cc -std=c11 -Wall -Wextra -Werror -idirafter include tests/host/block_fault_test.c tests/host/block_fault.c kernel/block.c -o build/host/block-fault
 	build/host/block-fault
 
+.PHONY: test-record-lock-host
+test-record-lock-host:
+	mkdir -p build/host
+	cc -std=c11 -Wall -Wextra -Werror -idirafter include tests/host/record_lock_test.c -o build/host/record-lock
+	build/host/record-lock
+
+build/host/nbd-fault: tests/host/nbd_fault.c tests/host/block_fault.c tests/host/block_fault.h kernel/block.c
+	@mkdir -p $(dir $@)
+	cc -std=c11 -Wall -Wextra -Werror -idirafter include tests/host/nbd_fault.c tests/host/block_fault.c kernel/block.c -o $@
+
+.PHONY: test-nbd-host
+test-nbd-host: build/host/nbd-fault
+	PYTHONDONTWRITEBYTECODE=1 python3 tests/host/nbd_fault_test.py $<
+
+.PHONY: test-sqlite-nbd-riscv
+test-sqlite-nbd-riscv: $(SQLITE_ROLLBACK_RV) $(KERNEL_RV) build/host/nbd-fault
+	SQLITE_ROLLBACK_RV=$(SQLITE_ROLLBACK_RV) KERNEL_RV=$(KERNEL_RV) \
+	NBD_FAULT_SERVER=build/host/nbd-fault QEMU_RISCV64=$(QEMU_RISCV64) \
+		./tests/sqlite-nbd-riscv.sh
+
+.PHONY: test-sqlite-recovery-riscv
+test-sqlite-recovery-riscv: $(SQLITE_RECOVERY_RV) $(KERNEL_RV) build/host/nbd-fault
+	PYTHONDONTWRITEBYTECODE=1 python3 tests/sqlite-recovery-riscv.py \
+		--kernel $(KERNEL_RV) --program $(SQLITE_RECOVERY_RV) \
+		--server build/host/nbd-fault --qemu $(QEMU_RISCV64) --linux
+
+.PHONY: test-record-lock-riscv
+test-record-lock-riscv: $(LOCK_LIFECYCLE_RV) $(KERNEL_RV)
+	PYTHONDONTWRITEBYTECODE=1 python3 tests/record-lock-riscv.py \
+		--kernel $(KERNEL_RV) --program $(LOCK_LIFECYCLE_RV) \
+		--qemu $(QEMU_RISCV64)
+
+.PHONY: test-sqlite-recovery-matrix-riscv
+test-sqlite-recovery-matrix-riscv: $(SQLITE_RECOVERY_RV) $(KERNEL_RV) build/host/nbd-fault
+	PYTHONDONTWRITEBYTECODE=1 python3 tests/sqlite-recovery-riscv.py \
+		--kernel $(KERNEL_RV) --program $(SQLITE_RECOVERY_RV) \
+		--server build/host/nbd-fault --qemu $(QEMU_RISCV64) --matrix full
+
 # Rebuild only production code in isolation: stale .su files and boot-only
 # test fixture frames cannot silently satisfy or distort this gate.
 .PHONY: test-stack-usage
@@ -1158,78 +1248,3 @@ include tests/program-inventory/Makefile.inc
 .PHONY: test-elf-tail-riscv
 test-elf-tail-riscv: $(KERNEL_RV) $(MUSL_STAMP)
 	python3 tests/elf-tail-riscv.py
-
-.PHONY: test-record-lock-host
-test-record-lock-host:
-	mkdir -p build/host
-	cc -std=c11 -Wall -Wextra -Werror -idirafter include tests/host/record_lock_test.c -o build/host/record-lock
-	build/host/record-lock
-
-
-LOCK_LIFECYCLE_RV := $(BUILD_DIR)/tests/user/record-lock-lifecycle-rv
-
-$(LOCK_LIFECYCLE_RV): tests/workloads/locks/lifecycle.c $(MUSL_STAMP)
-	@mkdir -p $(dir $@)
-	$(MUSL_ROOT)/bin/musl-gcc $(MUSL_GCC_FLAGS) -static -O2 -pthread -o $@ $<
-
-.PHONY: test-record-lock-riscv
-test-record-lock-riscv: $(LOCK_LIFECYCLE_RV) $(KERNEL_RV)
-	PYTHONDONTWRITEBYTECODE=1 python3 tests/record-lock-riscv.py \
-		--kernel $(KERNEL_RV) --program $(LOCK_LIFECYCLE_RV) \
-		--qemu $(QEMU_RISCV64)
-
-
-SQLITE_ARCHIVE := references/sqlite/sqlite-amalgamation-3530400.zip
-SQLITE_SOURCE := $(BUILD_DIR)/sqlite/sqlite-amalgamation-3530400/sqlite3.c
-SQLITE_ROLLBACK_RV := $(BUILD_DIR)/tests/user/sqlite-rollback-rv
-SQLITE_CLI_STATIC_RV := $(BUILD_DIR)/tests/user/sqlite3-static-rv
-SQLITE_CLI_DYNAMIC_RV := $(BUILD_DIR)/tests/user/sqlite3-dynamic-rv
-SQLITE_CLI_INIT_RV := $(BUILD_DIR)/tests/user/sqlite-cli-init-rv
-$(SQLITE_SOURCE): $(SQLITE_ARCHIVE)
-	@mkdir -p $(BUILD_DIR)/sqlite
-	unzip -oq $< -d $(BUILD_DIR)/sqlite
-	@test -f $@ && test -f $(dir $@)/shell.c
-	@touch $@ $(dir $@)/shell.c
-
-$(SQLITE_ROLLBACK_RV): tests/workloads/sqlite/rollback.c $(SQLITE_SOURCE) $(MUSL_STAMP)
-	@mkdir -p $(dir $@)
-	$(MUSL_ROOT)/bin/musl-gcc $(MUSL_GCC_FLAGS) -static -O2 -pthread \
-		-I$(dir $(SQLITE_SOURCE)) -o $@ $< $(SQLITE_SOURCE) -ldl
-
-$(SQLITE_CLI_STATIC_RV): $(SQLITE_SOURCE) $(MUSL_STAMP)
-	@mkdir -p $(dir $@)
-	$(MUSL_ROOT)/bin/musl-gcc $(MUSL_GCC_FLAGS) -static -O2 -pthread \
-		-o $@ $(dir $(SQLITE_SOURCE))/shell.c $(SQLITE_SOURCE) -ldl
-
-$(SQLITE_CLI_DYNAMIC_RV): $(SQLITE_SOURCE) $(MUSL_STAMP)
-	@mkdir -p $(dir $@)
-	$(MUSL_ROOT)/bin/musl-gcc $(MUSL_GCC_FLAGS) -fPIE -pie -O2 -pthread \
-		-Wl,--dynamic-linker=/lib/ld-musl-riscv64.so.1 \
-		-o $@ $(dir $(SQLITE_SOURCE))/shell.c $(SQLITE_SOURCE) -ldl
-
-$(SQLITE_CLI_INIT_RV): tests/workloads/sqlite/cli_init.c $(MUSL_STAMP)
-	@mkdir -p $(dir $@)
-	$(MUSL_ROOT)/bin/musl-gcc $(MUSL_GCC_FLAGS) -static -O2 -o $@ $<
-
-.PHONY: test-sqlite-rollback-riscv
-test-sqlite-rollback-riscv: $(SQLITE_ROLLBACK_RV) $(SQLITE_CLI_STATIC_RV) $(SQLITE_CLI_DYNAMIC_RV) $(SQLITE_CLI_INIT_RV) $(MUSL_LDSO) $(KERNEL_RV)
-	SQLITE_ROLLBACK_RV=$(SQLITE_ROLLBACK_RV) \
-	SQLITE_CLI_STATIC_RV=$(SQLITE_CLI_STATIC_RV) \
-	SQLITE_CLI_DYNAMIC_RV=$(SQLITE_CLI_DYNAMIC_RV) \
-	SQLITE_CLI_INIT_RV=$(SQLITE_CLI_INIT_RV) MUSL_LDSO=$(MUSL_LDSO) \
-	QEMU_RISCV64=$(QEMU_RISCV64) \
-		./tests/sqlite-rollback-riscv.sh
-
-build/host/nbd-fault: tests/host/nbd_fault.c tests/host/block_fault.c tests/host/block_fault.h kernel/block.c
-	@mkdir -p $(dir $@)
-	cc -std=c11 -Wall -Wextra -Werror -idirafter include tests/host/nbd_fault.c tests/host/block_fault.c kernel/block.c -o $@
-
-.PHONY: test-nbd-host
-test-nbd-host: build/host/nbd-fault
-	PYTHONDONTWRITEBYTECODE=1 python3 tests/host/nbd_fault_test.py $<
-
-.PHONY: test-sqlite-nbd-riscv
-test-sqlite-nbd-riscv: $(SQLITE_ROLLBACK_RV) $(KERNEL_RV) build/host/nbd-fault
-	SQLITE_ROLLBACK_RV=$(SQLITE_ROLLBACK_RV) KERNEL_RV=$(KERNEL_RV) \
-	NBD_FAULT_SERVER=build/host/nbd-fault QEMU_RISCV64=$(QEMU_RISCV64) \
-		./tests/sqlite-nbd-riscv.sh

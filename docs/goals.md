@@ -35,9 +35,10 @@ P4d 共享匿名 futex 证据：`build/p4d-userland-final.log`（跨 MM 唤醒�
 | 已完成 | P2a 同 MM 非 PI robust-list | raw `exit`、exec、musl、差分及全量清单已验收；PI 仍后置，共享匿名跨 MM key 见 P4d |
 | 已完成 | P4a 共享匿名对象 | 专用稀疏对象、fork 双向可见、失败回滚和固定 Linux 差分已验证；不包括共享文件页或跨 MM futex |
 | 已接入 | P4d 共享匿名 futex | 跨 MM WAIT/WAKE/REQUEUE、共享对象 pin 和私有 MM 单调身份号已实现；不同 VA 别名与共享文件后备仍待其映射接口 |
-| 下一阶段 | P4b/P4c 共享文件页及写回；P0c 取消异常调查持续 | 历史取消异常本轮 30 轮/版本未复现，不能伪称已找到根因 |
+| 下一阶段 | P4b/P4c 共享文件页、脏页追踪、`msync`；P0c 取消异常调查持续 | SQLite 普通多进程 WAL 在文件共享映射后单独验收；历史取消异常本轮 30 轮/版本未复现 |
 | 持续支线 | P5a glibc 试跑、L0/L1 第二架构入口 | 可现在固定输入或调查边界，不以全量清单全绿为前提 |
-| 后续 | P3c/e 记录锁与 SQLite、N socket、P4 文件共享、P6 SMP | 按下述具体依赖进入，不按测试名称排接口 |
+| 已接入 | P3c/e 记录锁与 SQLite DELETE 回滚日志 | 真实 U-mode、固定 Linux、NBD 断电/故障入口分开验收；不宣称 WAL 或实板持久性 |
+| 后续 | N socket、P4 文件共享与普通多进程 WAL、P6 SMP | 按下述具体依赖进入，不按测试名称排接口 |
 
 ### 主要依赖
 
@@ -49,7 +50,8 @@ P0 证据 ─┬─ P1 路径/文件/设备 ─┬─ P3 同步/锁/SQLite 回�
 
 P4a 共享匿名对象已完成，提供稳定后备身份
 P1 文件身份 + P3 写回/错误协议 → P4b/c 共享文件页与 msync
-P4 后备身份 + P2 等待协议 → P4d 跨 MM futex → SQLite 多进程 WAL
+P4 文件共享页 + P3 锁/同步 → SQLite 普通多进程 WAL
+P4d 共享 futex 扩展独立推进，不作 WAL 统一前置条件
 P1–P4 按真实依赖 → P5 glibc/单核编译完整交付（试跑可提前）
 P2/P4 单 hart 契约 + IPI/IRQ 入口 → P6 SMP 正确性
 P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
@@ -197,24 +199,24 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 
 ### P3c 记录锁
 
-- [ ] 定义 fcntl 传统进程关联锁与 OFD 锁的 owner、范围、合并/拆分、查询和冲突；不能把已有 F_DUPFD/F_SETFL 支持当作记录锁。
-- [ ] 按固定契约验证独立 open、dup、fork、exec、任意相关 fd close、线程组退出的保留/释放；尤其不能把进程锁简单挂成随单个 OFD 生灭。
-- [ ] 冲突时真实阻塞或返回规定错误，信号打断、取消、等待者退出/OOM 都释放队列引用；两个进程争用同一文件必须观察到冲突，而非分别在私有锁表成功。
+- [x] 传统锁按共享 `kernel_files_record`，OFD 锁按打开文件对象；inode 增广 AVL 与 owner 索引支持六个命令、负长度/EOF、合并/拆分和跨类型冲突。独立区间模型核对随机操作、树不变量、稀疏/重叠规模及 OOM 不变性。
+- [x] 固定 Linux 同 ELF 覆盖独立 open、dup/覆盖、fork、exec/CLOEXEC、任意相关 fd close、unlink、pthread 共享 owner、等待时 fd 关闭复用及组退出；末引用与清理 owner 仍由原文件层负责。
+- [x] 阻塞、唤醒、信号打断/`SA_RESTART` 和有限传统锁死锁检测与固定 Linux 差分一致；等待请求 pin 与组强制退出的静态 musl 负载回到资源基线。OFD 不承诺死锁检测；所有结果限于单 hart。
 
 ### P3d ext4 journal 与恢复（已选本批交付）
 
 - [x] 已选择并启用 ordered journal/replay；事务 before-image、flush 顺序、checksum v2/v3 和 revoke、superblock 恢复、持久 orphan_file/传统链及分批 extent/间接块回收已接入生产。
 - [x] 元数据事务提交与 checkpoint 分阶段 flush；关键日志错误 sticky，损坏或只读无法恢复时拒绝开放用户访问。已知日志提交前的资源不足可安全回滚，不能据此清除不确定 I/O 错误。
 - [x] `make test-lwext4-recovery-host` 使用 512 字节原子写、易失缓存/稳定镜像，覆盖写与 flush 失败、丢失/重排、两次恢复和 e2fsck；完整 orphan 回收矩阵为 16 种组合、4,362 次断电执行。QEMU 正常退出和未验收实板不属于该恢复证据。
-- [x] 真实 musl 已验收“临时文件→fsync→rename→两侧父目录 fsync”应用序列，后端 rename 另有断电/重排矩阵；robust/socket、记录锁、SQLite、共享映射留后续。
+- [x] 真实 musl 已验收“临时文件→fsync→rename→两侧父目录 fsync”应用序列，后端 rename 另有断电/重排矩阵；记录锁与 SQLite DELETE 见 P3c/e，socket 与共享文件映射仍后续。
 
 ### P3e SQLite 回滚日志负载
 
-- [ ] 固定未特改 SQLite 版本、构建选项和输入；先回滚日志模式、`mmap_size=0`，记录它实际调用的 VFS 锁/同步接口，缺口回到上述机制。
-- [ ] 建表、提交/回滚、多个连接、writer 冲突、关闭重开和 integrity_check 全部验证；保留数据库/日志、退出码及可重复命令，不只比较 SELECT 输出。
-- [ ] 正常重开和故障恢复分别记录；成功同步后的约定数据在新进程/新启动可见，错误确实返回。多进程 WAL 留到 P4，不通过绕过共享内存需求冒充支持。
+- [x] 官方 SQLite 3.53.4 amalgamation 固定 URL/SHA-256，原生 Unix VFS 和线程/WAL 编译能力保留；启动核对版本、`THREADSAFE=1`、`DELETE/NORMAL/mmap_size=0` 与 EXTRA/FULL 实际 PRAGMA 值。
+- [x] 静态/动态 CLI、建表、提交/回滚、多连接及独立进程 writer 冲突、未提交事务的进程直接退出与同次启动 hot journal 恢复、关闭重开和 `integrity_check` 在真实 U-mode 通过；同一恢复 ELF 的 setup/mutate/recover 也在固定 Linux 执行。
+- [x] NBD 服务在宿主协议测试和 QEMU 接入通过；EXTRA/FULL 正常事务、FULL 写/flush 错误传播、热日志和已确认提交后的两次重启恢复通过，逐字节检查整事务与 ext4。小事务逐事件矩阵完成 441 次断电、100 次写失败、47 次 flush 失败；普通多进程 WAL 留到 P4 文件共享映射后验证，不以共享文件 futex 为统一前置。
 
-**验证与退出**：先 `test-block-riscv`/`test-lwext4-host`/`test-vfs-riscv`，再生产 U-mode 与 Linux 差分；拟新增块 flush 故障测试、`tests/userland/file_sync.c`、`tests/diff-abi/file_locks.c`、`tests/workloads/sqlite/`。退出时同步、锁、正常重开与恢复各自有结果，回滚日志可先单独交付。
+**验证与退出**：`make test-record-lock-host test-record-lock-riscv test-diff-abi-riscv test-nbd-host test-sqlite-rollback-riscv test-sqlite-nbd-riscv test-sqlite-recovery-riscv test-sqlite-recovery-matrix-riscv` 分别覆盖模块、Linux 差分、正常运行与恢复；既有 files/userland/lwext4/栈/RISC-V 全套与 228 项清单已重跑，清单仍为 223/2/3 且失败 ID 不变。WAL 与实板持久性不计入本阶段。
 
 ## P4：共享后备对象、文件页与跨 MM futex
 

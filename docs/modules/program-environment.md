@@ -57,6 +57,14 @@ host 测试保护源版本拒绝、头文件身份变化、配置功能不被裁
 真实构建还编译含 musl、Linux 和 RISC-V `asm` 头的静态 probe；完整 BusyBox
 产物必须交由 inventory 的 Linux/BoarOS 运行步骤继续验证。
 
+## SQLite 回滚日志与 NBD 故障入口
+
+`references/sqlite/sqlite-amalgamation-3530400.zip` 是官方 SQLite 3.53.4 amalgamation，`references/sources.tsv` 固定下载 URL、2026-09-27 访问日期及 SHA-256 `1e71ddf93849c6a6ecf58b827c0692073d2dd7ee40196158068f7b29f422e87d`。构建直接解包到 `build/riscv/sqlite/`，不修改上游源码；复用 musl 1.2.5 工具链，保留线程支持、WAL 编译能力及原生 Unix VFS。测试实际检查版本、`THREADSAFE=1`、VFS 名和 `journal_mode=DELETE`、`locking_mode=NORMAL`、`mmap_size=0`、`synchronous=EXTRA/FULL` 返回值。静态与动态 CLI 的可执行文件由同一固定源码编译，正式负载只使用回滚日志模式。
+
+`make test-sqlite-rollback-riscv` 在真实 U-mode 覆盖建表、提交/回滚、独立进程 writer 冲突、未提交大事务进程直接退出后的同次启动 hot journal 恢复、关闭重开，以及两种 CLI 对同盘数据库的 `integrity_check`。`make test-sqlite-nbd-riscv` 把同一负载接入宿主 C NBD 服务。`make test-sqlite-recovery-riscv` 以同一静态 ELF 在固定 Linux `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 与 BoarOS 执行 setup/mutate/recover；BoarOS 的 `EXTRA`、`FULL`、热日志与已确认提交路径经 NBD 重启两次，并用 `e2fsck -fn` 核对 ext4。小缓存 24 行事务制造 journal spill；恢复程序逐字节检查每行值、整事务状态和 `integrity_check`。
+
+`tests/host/nbd_fault.c` 经 Unix socket 给 QEMU 提供 fixed-newstyle、simple replies 的 READ/WRITE/FLUSH/DISC，只宣告 `HAS_FLAGS|SEND_FLUSH`。`tests/host/block_fault.c` 是 512 字节原子写、易失可见内容、稳定镜像的真实故障模型；只有成功 FLUSH 承诺此前事件持久化。`make test-nbd-host` 检查握手、读写、写/flush 失败和丢失、部分保存、反序保存。`make test-sqlite-recovery-matrix-riscv` 使用串口与宿主信号握手，仅对 SQLite 事务内的 NBD 事件编号，逐个注入写/flush 错误和断电位置；断电先冻结服务，再杀 QEMU，从同一稳定初态恢复。2026-09-27 的小事务有 100 次写和 47 次 flush；441 个断电组合与逐位置 147 个写/flush 失败均通过。QEMU 基线为本地 `references/qemu/` commit `84f07211cc5b4fc6a371559bf8a5de4fb068e648`，执行环境为 QEMU 11.1.1。这些入口使用隔离镜像，成功后清理一次性目录；未确认提交只允许完整旧值或完整新值，已确认提交必须保留新值。测试不证明实板持久性或 WAL。
+
 ## 双侧执行与失败所有权
 
 `make inventory-userland-riscv` 调用 `run.py` 构建上述完整 BusyBox 和

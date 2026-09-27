@@ -37,7 +37,10 @@ def candidates():
     if riscv.is_dir():
         result.extend(path for path in riscv.iterdir()
                       if path.name in {'artifacts', 'musl-src', 'truncate-probe'}
-                      or path.name.startswith('userland-run.'))
+                      or path.name.startswith(('userland-run.', 'record-lock-run.',
+                                                'sqlite-run.',
+                                                'sqlite-nbd-run.',
+                                                'sqlite-recovery-run.')))
 
     diff = BUILD / 'diff-abi'
     if diff.is_dir():

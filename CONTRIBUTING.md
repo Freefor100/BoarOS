@@ -42,6 +42,8 @@ AI 对设计或代码有实质贡献时根据当时的Agent添加例如：
 Co-authored-by: GPT-5.6 Sol <codex@openai.com>
 Co-authored-by: GPT-5.6 Luna <codex@openai.com>
 Co-authored-by: GPT-6 Astra <codex@openai.com>
+Co-authored-by: GPT-6 Sol <codex@openai.com>
+Co-authored-by: GPT-6 Luna <codex@openai.com>
 Co-authored-by: GLM 5.3 <noreply@z.ai>
 Co-authored-by: DeepSeek V4 Flash <noreply@deepseek.com>
 Assisted-by: Google Antigravity

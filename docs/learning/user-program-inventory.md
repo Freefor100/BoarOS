@@ -30,6 +30,8 @@ python3 tests/program-inventory/run.py --output build/p4d-full-20260925
 
 该目录 `runs/suite.json` 为 `status=complete`，228 项全部完成：223 pass、2 nonzero-exit、3 upstream-failure。与 `build/p4a-full-20260925/` 逐案例状态相同，没有已有通过项回退。本次内核增加跨 MM 共享匿名 futex，未改变原清单覆盖的 socket 与包装脚本缺口。此前 robust 阶段相对 `build/recoverable-fs-full` 的 221/4/3，让 `pthread_robust_detach` 静态/动态新增通过。
 
+2026-09-27 记录锁与 SQLite 回滚日志阶段执行 `make inventory-userland-riscv`，`build/program-inventory-full/runs/suite.json` 再次为 `status=complete`，228 项中 223 pass、2 nonzero-exit、3 upstream-failure。五个失败 ID 精确为 `libc.static.socket`、`libc.dynamic.socket`、`libc.official.static`、`libc.official.dynamic`、`busybox.official`，与上次相同；其余 223 项均 pass，因此无旧通过项回退。该次 BoarOS 内核 SHA-256 为 `64c0a0f474af11da8824530d080e25d44493ba2f7542bfa40d68bbcf9f398084`，固定 Linux Image 为 `7ca338ec75e681cc68c5d946b3ae633fc0088fd78569b7847528105a9de6c8ec`，suite identity SHA-256 为 `723ad726ff2dfbf57c7a6f0641ad908a5b372349b1e6ef0b3ec3311f4d8f2631`。镜像与逐项日志在核对后按 `make prune-build` 清理，命令和身份留在此处重建。
+
 | 范围 | Linux | BoarOS |
 |---|---:|---:|
 | 顶层案例 | 228 项满足契约 | 223 项退出/完整输出双侧一致；2 项直接失败；3 项包装失败 |
