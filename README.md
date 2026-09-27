@@ -71,7 +71,7 @@ make test-references
 
 ## 近期工作与文档
 
-[TODO 与阶段依赖](docs/goals.md)集中维护下一步、阻塞与验收：块同步、逐 inode 写回、journal/replay、cwd/dirfd/rename、时间与统计、同 MM 非 PI robust-list、共享匿名对象及其跨 MM futex 已落地；记录锁、SQLite 回滚日志、共享文件映射、`msync` 和普通多进程 WAL 各有验证入口。历史取消异常在固定输入重复运行中未复现，根因仍未确定。WAL 断电矩阵和共享文件页的写回/分配故障交错已验收；跨 hart 的真实并发写回、不同 VA 的共享 futex、`mremap`/`madvise` 仍按各自依赖推进。glibc 独立基础矩阵和固定小型 C 程序的客体内离线编译已建立，LoongArch、网络与更大项目另行推进。SMP 先验证所有权、唤醒和 TLB 回收，再谈调度策略与性能。
+[TODO 与阶段依赖](docs/goals.md)集中维护下一步、阻塞与验收：块同步、逐 inode 写回、journal/replay、cwd/dirfd/rename、时间与统计、同 MM 非 PI robust-list、共享匿名对象及其跨 MM futex 已落地；记录锁、SQLite 回滚日志、共享文件映射、`msync` 和普通多进程 WAL 各有验证入口。历史取消异常在固定输入重复运行中未复现，根因仍未确定。WAL 断电矩阵和共享文件页的写回/分配故障交错已验收；跨 hart 的真实并发写回、不同 VA 的共享 futex、`mremap`/`madvise` 仍按各自依赖推进。glibc 独立基础矩阵、固定小型 C 程序的客体内离线编译和 IPv4 loopback 首切片已建立；AF_UNIX、网卡、LoongArch 与更大项目另行推进。SMP 先验证所有权、唤醒和 TLB 回收，再谈调度策略与性能。
 
 - [文档导航](docs/README.md)：模块契约与可复用学习材料。
 - [工程原则](docs/design.md)与[贡献说明](CONTRIBUTING.md)：技术取舍、验证与提交边界。
