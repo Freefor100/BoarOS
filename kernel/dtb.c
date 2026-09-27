@@ -1069,3 +1069,139 @@ enum dtb_status dtb_read_boot_info(const void *dtb,
 
     return DTB_STATUS_INVALID;
 }
+
+/* IRQ discovery follows validated FDT structure, in two passes so provider
+ * phandles need not precede consumers. Keep only the selected hart's intc. */
+struct irq_node {
+    struct dtb_discovery_node bus;
+    const unsigned char *extended;
+    uint32_t extended_length, phandle, parent, source, ndev, intcells;
+    int cpu, intc, plic, virtio;
+};
+static enum dtb_status irq_discover(const unsigned char *blob, uint64_t hart,
+                                   struct dtb_irq_info *out)
+{
+    struct irq_node stack[DTB_DISCOVERY_MAX_DEPTH];
+    const unsigned char *structure = blob + read_be32(blob + FDT_HEADER_STRUCT_OFFSET);
+    const unsigned char *strings = blob + read_be32(blob + FDT_HEADER_STRINGS_OFFSET);
+    uint32_t cpu_intc = 0, plic_phandle = 0;
+    int context_found = 0;
+    *out = (struct dtb_irq_info){0};
+    for (unsigned pass = 0; pass < 2; pass++) {
+        uint32_t pos = 0, depth = 0;
+        for (;;) {
+            uint32_t token = read_be32(structure + pos); pos += 4;
+            if (token == FDT_BEGIN_NODE) {
+                uint32_t len = 0;
+                while (structure[pos + len]) len++;
+                pos = (pos + len + 4) & ~3U;
+                struct irq_node *n = &stack[depth];
+                *n = (struct irq_node){0};
+                n->bus.enabled = depth ? stack[depth - 1].bus.enabled : 1;
+                n->parent = depth ? stack[depth - 1].parent : 0;
+                n->bus.child_address_cells = 2; n->bus.child_size_cells = 1;
+                depth++;
+            } else if (token == FDT_PROP) {
+                uint32_t len = read_be32(structure + pos);
+                const unsigned char *name = strings + read_be32(structure + pos + 4);
+                uint32_t nl = 0; while (name[nl]) nl++;
+                const unsigned char *v = structure + pos + 8;
+                pos += 8 + ((len + 3) & ~3U);
+                struct irq_node *n = &stack[depth - 1];
+#define IRQ_PROP(key) bytes_equal_string(name, nl, key)
+                if (IRQ_PROP("#address-cells")) n->bus.child_address_cells = read_be32(v);
+                else if (IRQ_PROP("#size-cells")) n->bus.child_size_cells = read_be32(v);
+                else if (IRQ_PROP("ranges")) { n->bus.ranges_seen = 1; n->bus.ranges = v; n->bus.ranges_length = len; }
+                else if (IRQ_PROP("reg")) { n->bus.reg = v; n->bus.reg_length = len; }
+                else if (IRQ_PROP("status")) {
+                    int enabled;
+                    if (!status_is_available(v, len, &enabled)) return DTB_STATUS_INVALID;
+                    n->bus.enabled = enabled && (depth == 1 || stack[depth - 2].bus.enabled);
+                } else if (IRQ_PROP("device_type")) n->cpu = len == 4 && bytes_equal_string(v, 3, "cpu");
+                else if (IRQ_PROP("compatible")) {
+                    int a, b;
+                    if (!string_list_contains(v, len, "riscv,plic0", &a) ||
+                        !string_list_contains(v, len, "sifive,plic-1.0.0", &b)) return DTB_STATUS_INVALID;
+                    n->plic = a || b;
+                    if (!string_list_contains(v, len, "riscv,cpu-intc", &n->intc) ||
+                        !string_list_contains(v, len, "virtio,mmio", &n->virtio)) return DTB_STATUS_INVALID;
+                } else if (IRQ_PROP("interrupts-extended")) {
+                    n->extended = v; n->extended_length = len;
+                } else if (IRQ_PROP("phandle") || IRQ_PROP("linux,phandle") || IRQ_PROP("interrupt-parent") ||
+                           IRQ_PROP("interrupts") || IRQ_PROP("riscv,ndev") || IRQ_PROP("#interrupt-cells")) {
+                    if (len != 4) return DTB_STATUS_UNSUPPORTED;
+                    uint32_t value = read_be32(v);
+                    if (IRQ_PROP("phandle") || IRQ_PROP("linux,phandle")) {
+                        if (!value || (n->phandle && n->phandle != value)) return DTB_STATUS_INVALID;
+                        n->phandle = value;
+                    } else if (IRQ_PROP("interrupt-parent")) n->parent = value;
+                    else if (IRQ_PROP("interrupts")) n->source = value;
+                    else if (IRQ_PROP("riscv,ndev")) n->ndev = value;
+                    else n->intcells = value;
+                }
+#undef IRQ_PROP
+            } else if (token == FDT_END_NODE) {
+                struct irq_node *n = &stack[depth - 1];
+                if (n->bus.enabled && n->intc && depth >= 3 && stack[depth - 2].cpu) {
+                    struct dtb_discovery_node *cpu = &stack[depth - 2].bus;
+                    uint32_t ac = stack[depth - 3].bus.child_address_cells;
+                    if (ac == 0 || ac > 2 || cpu->reg_length != 4 * ac || n->intcells != 1)
+                        return DTB_STATUS_UNSUPPORTED;
+                    if (read_cells(cpu->reg, ac) == hart && pass == 0) {
+                        if (cpu_intc || !n->phandle) return DTB_STATUS_INVALID;
+                        cpu_intc = n->phandle;
+                    }
+                }
+                if (n->bus.enabled && (n->plic || n->virtio)) {
+                    if (depth < 2) return DTB_STATUS_INVALID;
+                    uint32_t ac = stack[depth - 2].bus.child_address_cells;
+                    uint32_t sc = stack[depth - 2].bus.child_size_cells;
+                    if (!ac || ac > 2 || !sc || sc > 2 || n->bus.reg_length != 4 * (ac + sc))
+                        return DTB_STATUS_UNSUPPORTED;
+                    uint64_t address = read_cells(n->bus.reg, ac);
+                    uint64_t size = read_cells(n->bus.reg + 4 * ac, sc);
+                    if (!size || address > UINT64_MAX - size) return DTB_STATUS_INVALID;
+                    for (uint32_t i = depth - 2; i > 0; i--) {
+                        enum dtb_status status = translate_bus_address(&stack[i].bus,
+                            stack[i - 1].bus.child_address_cells, address, size, &address);
+                        if (status != DTB_STATUS_OK) return status;
+                    }
+                    if (n->plic) {
+                        if (!n->phandle || !n->ndev || n->intcells != 1 || n->extended_length % 8)
+                            return DTB_STATUS_INVALID;
+                        if (!pass) {
+                            if (plic_phandle) return DTB_STATUS_UNSUPPORTED;
+                            plic_phandle = n->phandle;
+                            out->plic = (struct dtb_memory_range){address, size};
+                            out->source_count = n->ndev;
+                        } else for (uint32_t i = 0; i < n->extended_length; i += 8) {
+                            if (read_be32(n->extended + i) == cpu_intc &&
+                                read_be32(n->extended + i + 4) == 9) {
+                                if (context_found) return DTB_STATUS_INVALID;
+                                out->context = i / 8; context_found = 1;
+                            }
+                        }
+                    } else if (pass) {
+                        if (n->parent != plic_phandle || !n->source || n->source > out->source_count)
+                            return DTB_STATUS_UNSUPPORTED;
+                        if (out->route_count == DTB_MAX_VIRTIO_MMIO_RANGES) return DTB_STATUS_UNSUPPORTED;
+                        out->routes[out->route_count].base = address;
+                        out->routes[out->route_count++].source = n->source;
+                    }
+                }
+                depth--;
+            } else if (token == FDT_END) break;
+        }
+        if (!cpu_intc || !plic_phandle) return DTB_STATUS_NOT_FOUND;
+    }
+    return context_found ? DTB_STATUS_OK : DTB_STATUS_NOT_FOUND;
+}
+enum dtb_status dtb_read_irq_info(const void *dtb, uint64_t boot_hart,
+                                  struct dtb_irq_info *info)
+{
+    struct dtb_boot_info validated;
+    if (!info) return DTB_STATUS_INVALID;
+    enum dtb_status status = dtb_read_boot_info(dtb, &validated);
+    if (status != DTB_STATUS_OK) return status;
+    return irq_discover(dtb, boot_hart, info);
+}

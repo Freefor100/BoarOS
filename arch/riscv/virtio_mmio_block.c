@@ -1,5 +1,9 @@
 #include <arch/riscv/virtio_mmio_block.h>
 #include <kernel/page.h>
+#include <kernel/sync.h>
+#include <arch/riscv/context.h>
+#include <arch/riscv/plic.h>
+#include <arch/riscv/virt_uart.h>
 
 #include <stddef.h>
 #include <stdint.h>
@@ -60,21 +64,14 @@
 
 #define VIRTQ_DESC_NEXT UINT16_C(1)
 #define VIRTQ_DESC_WRITE UINT16_C(2)
-#define VIRTIO_QUEUE_SIZE 8U
+#define VIRTIO_QUEUE_SIZE 32U
+#define REQUEST_SLOTS 8U
+#define REQUEST_STRIDE 768U
 
 #define VIRTIO_QUEUE_DESC_OFFSET 0U
-#define VIRTIO_QUEUE_AVAIL_OFFSET 128U
-#define VIRTIO_QUEUE_USED_OFFSET 160U
-#define VIRTIO_REQUEST_HEADER_OFFSET 256U
-#define VIRTIO_REQUEST_STATUS_OFFSET 272U
-#define VIRTIO_BOUNCE_OFFSET 512U
-
+#define VIRTIO_REQUEST_HEADER_OFFSET 1024U
 #define VIRTIO_LEGACY_QUEUE_USED_OFFSET BOAROS_PAGE_SIZE
 #define VIRTIO_LEGACY_REQUEST_HEADER_OFFSET (2U * BOAROS_PAGE_SIZE)
-#define VIRTIO_LEGACY_REQUEST_STATUS_OFFSET \
-    (VIRTIO_LEGACY_REQUEST_HEADER_OFFSET + 16U)
-#define VIRTIO_LEGACY_BOUNCE_OFFSET (VIRTIO_LEGACY_REQUEST_HEADER_OFFSET + \
-                                    BOAROS_PAGE_SIZE / 8U)
 #define VIRTIO_LEGACY_QUEUE_ALLOCATION_ORDER 2U
 #define VIRTIO_LEGACY_QUEUE_ALIGNMENT BOAROS_PAGE_SIZE
 
@@ -117,45 +114,41 @@ struct virtio_block_request_header {
 
 _Static_assert(sizeof(struct virtq_descriptor) == 16U,
                "VirtIO descriptor layout must match the specification");
-_Static_assert(VIRTIO_BOUNCE_OFFSET + VIRTIO_BLOCK_SECTOR_SIZE <=
-                   BOAROS_PAGE_SIZE,
-               "VirtIO queue and bounce buffer must fit in one page");
-_Static_assert(VIRTIO_LEGACY_BOUNCE_OFFSET + VIRTIO_BLOCK_SECTOR_SIZE <=
-                   ((size_t)BOAROS_PAGE_SIZE
-                    << VIRTIO_LEGACY_QUEUE_ALLOCATION_ORDER),
-               "legacy VirtIO queue and bounce buffer must fit its allocation");
+struct block_request {
+    struct virtio_block_request_header header;
+    volatile unsigned char status;
+    unsigned state; /* 0 free, 1 reserved, 2 submitted, 3 completed */
+    enum kernel_block_status result;
+    struct kernel_io_context *owner;
+    struct kernel_wait_queue done;
+    unsigned char bounce[VIRTIO_BLOCK_SECTOR_SIZE];
+};
+_Static_assert(sizeof(struct block_request) <= REQUEST_STRIDE, "request slot overflow");
+_Static_assert(VIRTIO_REQUEST_HEADER_OFFSET + REQUEST_SLOTS * REQUEST_STRIDE <= 8192, "modern queue overflow");
+_Static_assert(VIRTIO_LEGACY_REQUEST_HEADER_OFFSET + REQUEST_SLOTS * REQUEST_STRIDE <= 16384, "legacy queue overflow");
 
 static int legacy_transport(const struct riscv_virtio_mmio_block *device)
 {
     return device->transport_version == VIRTIO_MMIO_VERSION_LEGACY;
 }
 
-static uint32_t queue_used_offset(
-    const struct riscv_virtio_mmio_block *device)
+static uint32_t queue_avail_offset(const struct riscv_virtio_mmio_block *device)
+{ return device->queue_size * sizeof(struct virtq_descriptor); }
+static uint32_t queue_used_offset(const struct riscv_virtio_mmio_block *device)
 {
-    return legacy_transport(device) ? VIRTIO_LEGACY_QUEUE_USED_OFFSET
-                                    : VIRTIO_QUEUE_USED_OFFSET;
+    return legacy_transport(device) ? VIRTIO_LEGACY_QUEUE_USED_OFFSET :
+        (queue_avail_offset(device) + 6 + 2 * device->queue_size + 15) & ~15U;
 }
-
-static uint32_t request_header_offset(
-    const struct riscv_virtio_mmio_block *device)
-{
-    return legacy_transport(device) ? VIRTIO_LEGACY_REQUEST_HEADER_OFFSET
-                                    : VIRTIO_REQUEST_HEADER_OFFSET;
-}
-
-static uint32_t request_status_offset(
-    const struct riscv_virtio_mmio_block *device)
-{
-    return legacy_transport(device) ? VIRTIO_LEGACY_REQUEST_STATUS_OFFSET
-                                    : VIRTIO_REQUEST_STATUS_OFFSET;
-}
-
-static uint32_t bounce_offset(const struct riscv_virtio_mmio_block *device)
-{
-    return legacy_transport(device) ? VIRTIO_LEGACY_BOUNCE_OFFSET
-                                    : VIRTIO_BOUNCE_OFFSET;
-}
+static uint32_t request_header_offset(const struct riscv_virtio_mmio_block *device)
+{ return legacy_transport(device) ? VIRTIO_LEGACY_REQUEST_HEADER_OFFSET : VIRTIO_REQUEST_HEADER_OFFSET; }
+static unsigned slot_count(const struct riscv_virtio_mmio_block *device)
+{ unsigned n = device->queue_size / 3; return n < REQUEST_SLOTS ? n : REQUEST_SLOTS; }
+static struct block_request *request_at(struct riscv_virtio_mmio_block *device, unsigned index)
+{ return (void *)((unsigned char *)device->queue_memory + request_header_offset(device) + index * REQUEST_STRIDE); }
+static uint64_t request_physical(struct riscv_virtio_mmio_block *device, struct block_request *request)
+{ return device->queue_physical_address + ((unsigned char *)request - (unsigned char *)device->queue_memory); }
+static uint32_t bounce_offset(struct riscv_virtio_mmio_block *device, struct block_request *request)
+{ return (unsigned char *)request->bounce - (unsigned char *)device->queue_memory; }
 
 static int device_live(const struct riscv_virtio_mmio_block *device)
 {
@@ -358,149 +351,167 @@ static uint64_t read_capacity(struct riscv_virtio_mmio_block *device)
     return 0U;
 }
 
-static enum kernel_block_status fail_live_device(
-    struct riscv_virtio_mmio_block *device,
-    enum kernel_block_status status)
+static void wake(struct kernel_wait_queue *queue)
 {
-    device_reset(device);
-    device->state = RISCV_VIRTIO_BLOCK_STATE_FAILED;
-    return status;
+    if (queue->head && kernel_wait_queue_wake_all(queue) != KERNEL_SCHEDULER_STATUS_OK)
+        __builtin_trap();
 }
-
-static enum kernel_block_status submit_request(
-    struct riscv_virtio_mmio_block *device,
-    uint32_t type,
-    uint64_t sector,
-    uint64_t data_address,
-    uint32_t data_length,
-    int bounce)
+static void fail_device(struct riscv_virtio_mmio_block *device, enum kernel_block_status result)
 {
-    struct virtq_descriptor *descriptors =
-        (struct virtq_descriptor *)((unsigned char *)device->queue_memory +
-                                    VIRTIO_QUEUE_DESC_OFFSET);
-    volatile struct virtq_available *available =
-        (volatile struct virtq_available *)(
-            (unsigned char *)device->queue_memory +
-            VIRTIO_QUEUE_AVAIL_OFFSET);
-    volatile struct virtq_used *used =
-        (volatile struct virtq_used *)(
-            (unsigned char *)device->queue_memory +
-            queue_used_offset(device));
-    struct virtio_block_request_header *header =
-        (struct virtio_block_request_header *)(
-            (unsigned char *)device->queue_memory +
-            request_header_offset(device));
-    volatile unsigned char *request_status =
-        (volatile unsigned char *)device->queue_memory +
-        request_status_offset(device);
-    uint16_t available_index;
-    uint64_t start;
-    struct virtq_used_element element;
-
-    int flushing = type == VIRTIO_BLOCK_REQUEST_FLUSH;
-    if (!device_live(device) ||
-        (flushing ? data_length != 0U :
-                    (data_length == 0U ||
-                     data_length % VIRTIO_BLOCK_SECTOR_SIZE != 0U))) {
-        return KERNEL_BLOCK_STATUS_STATE;
-    }
-
-    header->type = type;
-    header->reserved = 0U;
-    header->sector = sector;
-    *request_status = UINT8_MAX;
-
-    descriptors[0].address = device->queue_physical_address +
-                             request_header_offset(device);
-    descriptors[0].length = sizeof(*header);
-    descriptors[0].flags = VIRTQ_DESC_NEXT;
-    descriptors[0].next = flushing ? 2U : 1U;
-    descriptors[1].address = data_address;
-    descriptors[1].length = data_length;
-    descriptors[1].flags = (type == VIRTIO_BLOCK_REQUEST_IN ? VIRTQ_DESC_WRITE : 0U) |
-                           VIRTQ_DESC_NEXT;
-    descriptors[1].next = 2U;
-    descriptors[2].address = device->queue_physical_address +
-                             request_status_offset(device);
-    descriptors[2].length = 1U;
-    descriptors[2].flags = VIRTQ_DESC_WRITE;
-    descriptors[2].next = 0U;
-
-    available_index = available->index;
-    available->ring[available_index % device->queue_size] = 0U;
-    memory_barrier();
-    available->index = (uint16_t)(available_index + 1U);
-    memory_barrier();
-    mmio_write32(device, VIRTIO_MMIO_QUEUE_NOTIFY_OFFSET, 0U);
-
-    start = time_now();
-    while (used->index == device->last_used_index) {
-        if (time_now() - start >= device->timeout_ticks) {
-            device->statistics.timeouts++;
-            return fail_live_device(device, KERNEL_BLOCK_STATUS_TIMEOUT);
+    device->state = RISCV_VIRTIO_BLOCK_STATE_FAILED;
+    if (result == KERNEL_BLOCK_STATUS_TIMEOUT) virt_uart_puts("BoarOS: block timeout; resetting device\n");
+    device_reset(device); /* No DMA owner is released before reset acknowledgement. */
+    for (unsigned i = 0; i < slot_count(device); i++) {
+        struct block_request *r = request_at(device, i);
+        if (r->state == 2) {
+            r->result = result; r->state = 3;
+            if (!device->inflight) __builtin_trap();
+            device->inflight--;
+            if (r->done.head) device->statistics.wakes++;
+            wake(&r->done);
         }
     }
-    memory_barrier();
-
-    element = used->ring[device->last_used_index % device->queue_size];
-    device->last_used_index++;
-    if (mmio_read32(device, VIRTIO_MMIO_INTERRUPT_STATUS_OFFSET) != 0U) {
-        mmio_write32(device,
-                     VIRTIO_MMIO_INTERRUPT_ACK_OFFSET,
-                     mmio_read32(device,
-                                 VIRTIO_MMIO_INTERRUPT_STATUS_OFFSET));
-    }
-    if (element.id != 0U || element.length < 1U) {
-        device->statistics.io_errors++;
-        return fail_live_device(device, KERNEL_BLOCK_STATUS_IO);
-    }
-
-    device->statistics.requests++;
-    if (flushing) {
-        device->statistics.flush_requests++;
-    } else if (type == VIRTIO_BLOCK_REQUEST_IN) {
-        device->statistics.sectors_read +=
-            data_length / VIRTIO_BLOCK_SECTOR_SIZE;
-    } else {
-        device->statistics.sectors_written +=
-            data_length / VIRTIO_BLOCK_SECTOR_SIZE;
-    }
-    if (flushing) {
-        /* Flush has no data descriptor or sector accounting. */
-    } else if (bounce) {
-        device->statistics.bounce_requests++;
-    } else {
-        device->statistics.direct_requests++;
-    }
-
-    if (*request_status == VIRTIO_BLOCK_STATUS_OK) {
-        return KERNEL_BLOCK_STATUS_OK;
-    }
-    device->statistics.io_errors++;
-    if (*request_status == VIRTIO_BLOCK_STATUS_UNSUPPORTED) {
-        return KERNEL_BLOCK_STATUS_UNSUPPORTED;
-    }
-    if (*request_status == VIRTIO_BLOCK_STATUS_IO_ERROR) {
-        return KERNEL_BLOCK_STATUS_IO;
-    }
-    return fail_live_device(device, KERNEL_BLOCK_STATUS_IO);
+    wake(&device->available);
 }
-
+static void collect_used(struct riscv_virtio_mmio_block *device)
+{
+    volatile struct virtq_used *used = (void *)((unsigned char *)device->queue_memory + queue_used_offset(device));
+    uint16_t count = (uint16_t)(used->index - device->last_used_index);
+    memory_barrier();
+    if (count > slot_count(device)) { fail_device(device, KERNEL_BLOCK_STATUS_IO); return; }
+    while (count--) {
+        struct virtq_used_element item = used->ring[device->last_used_index++ % device->queue_size];
+        if (item.id % 3 || item.id / 3 >= slot_count(device) || !item.length) {
+            fail_device(device, KERNEL_BLOCK_STATUS_IO); return;
+        }
+        struct block_request *r = request_at(device, item.id / 3);
+        if (r->state != 2) { fail_device(device, KERNEL_BLOCK_STATUS_IO); return; }
+        r->result = r->status == VIRTIO_BLOCK_STATUS_OK ? KERNEL_BLOCK_STATUS_OK :
+            r->status == VIRTIO_BLOCK_STATUS_UNSUPPORTED ? KERNEL_BLOCK_STATUS_UNSUPPORTED : KERNEL_BLOCK_STATUS_IO;
+        if (r->status > VIRTIO_BLOCK_STATUS_UNSUPPORTED) { fail_device(device, KERNEL_BLOCK_STATUS_IO); return; }
+        r->state = 3;
+        if (!device->inflight) __builtin_trap();
+        device->inflight--;
+        if (r->result != KERNEL_BLOCK_STATUS_OK) device->statistics.io_errors++;
+        if (r->done.head) device->statistics.wakes++;
+        wake(&r->done);
+    }
+    uint32_t pending = mmio_read32(device, VIRTIO_MMIO_INTERRUPT_STATUS_OFFSET);
+    if (pending) mmio_write32(device, VIRTIO_MMIO_INTERRUPT_ACK_OFFSET, pending);
+}
+static void block_irq(void *owner)
+{
+    struct riscv_virtio_mmio_block *device = owner;
+    device->statistics.interrupts++;
+    if (device_live(device)) collect_used(device);
+    else mmio_write32(device, VIRTIO_MMIO_INTERRUPT_ACK_OFFSET,
+                      mmio_read32(device, VIRTIO_MMIO_INTERRUPT_STATUS_OFFSET));
+}
+int riscv_virtio_mmio_block_enable_irq(struct riscv_virtio_mmio_block *device, uint32_t source)
+{
+    if (!device_live(device) || device->active || device->irq_source ||
+        !riscv_plic_register(source, block_irq, device)) return 0;
+    device->irq_source = source;
+    return 1;
+}
+static struct block_request *reserve_request(struct riscv_virtio_mmio_block *device, int barrier)
+{
+    uintptr_t irq = riscv_interrupt_save();
+    if (device->irq_source && (!kernel_scheduler_can_sleep() || riscv_plic_in_interrupt())) __builtin_trap();
+    if (barrier) device->barrier_waiters++;
+    for (;;) {
+        if (!device_live(device)) break;
+        if (!device->barrier && (barrier ? !device->active : !device->barrier_waiters)) {
+            for (unsigned i = 0; i < slot_count(device); i++) {
+                struct block_request *r = request_at(device, i);
+                if (!r->state) {
+                    r->state = 1;
+                    r->owner = kernel_io_context_current();
+                    device->active++;
+                    if (barrier) { device->barrier_waiters--; device->barrier = 1; }
+                    riscv_interrupt_restore(irq); return r;
+                }
+            }
+        }
+        if (!device->irq_source) __builtin_trap();
+        enum kernel_wait_wake_reason reason;
+        device->statistics.queue_waits++;
+        if (kernel_scheduler_block_current(&device->available, 0, 0, &reason) != KERNEL_SCHEDULER_STATUS_OK)
+            __builtin_trap();
+    }
+    if (barrier) device->barrier_waiters--;
+    riscv_interrupt_restore(irq); return 0;
+}
+static void release_request(struct riscv_virtio_mmio_block *device, struct block_request *r, int barrier)
+{
+    uintptr_t irq = riscv_interrupt_save();
+    if (r->state != 1 || r->owner != kernel_io_context_current() || !device->active || r->done.head) __builtin_trap();
+    r->state = 0; r->owner = 0; device->active--;
+    if (barrier) device->barrier = 0;
+    wake(&device->available);
+    riscv_interrupt_restore(irq);
+}
+static enum kernel_block_status submit_request(struct riscv_virtio_mmio_block *device,
+    struct block_request *r, uint32_t type, uint64_t sector,
+    uint64_t data_address, uint32_t data_length, int bounce)
+{
+    uintptr_t irq = riscv_interrupt_save();
+    if (!device_live(device)) { riscv_interrupt_restore(irq); return KERNEL_BLOCK_STATUS_IO; }
+    if (r->state != 1 || r->owner != kernel_io_context_current()) __builtin_trap();
+    unsigned head = ((unsigned char *)r - (unsigned char *)request_at(device, 0)) / REQUEST_STRIDE * 3;
+    struct virtq_descriptor *d = device->queue_memory;
+    volatile struct virtq_available *available = (void *)((unsigned char *)device->queue_memory + queue_avail_offset(device));
+    int flushing = type == VIRTIO_BLOCK_REQUEST_FLUSH;
+    r->header = (struct virtio_block_request_header){type, 0, sector};
+    r->status = UINT8_MAX; r->state = 2;
+    device->statistics.requests++;
+    device->inflight++;
+    if (device->inflight > device->statistics.max_inflight) device->statistics.max_inflight = device->inflight;
+    uint64_t physical = request_physical(device, r);
+    d[head] = (struct virtq_descriptor){physical, sizeof(r->header), VIRTQ_DESC_NEXT, head + (flushing ? 2 : 1)};
+    d[head + 1] = (struct virtq_descriptor){data_address, data_length,
+        VIRTQ_DESC_NEXT | (type == VIRTIO_BLOCK_REQUEST_IN ? VIRTQ_DESC_WRITE : 0), head + 2};
+    d[head + 2] = (struct virtq_descriptor){physical + offsetof(struct block_request, status), 1, VIRTQ_DESC_WRITE, 0};
+    available->ring[available->index % device->queue_size] = head;
+    memory_barrier(); available->index++; memory_barrier();
+    mmio_write32(device, VIRTIO_MMIO_QUEUE_NOTIFY_OFFSET, 0);
+    uint64_t deadline = time_now() + device->timeout_ticks;
+    while (r->state == 2) {
+        if ((int64_t)(time_now() - deadline) >= 0) { device->statistics.timeouts++; fail_device(device, KERNEL_BLOCK_STATUS_TIMEOUT); break; }
+        if (device->irq_source) {
+            enum kernel_wait_wake_reason reason;
+            device->statistics.sleeps++;
+            if (kernel_scheduler_block_current(&r->done, deadline, 0, &reason) != KERNEL_SCHEDULER_STATUS_OK)
+                __builtin_trap();
+        } else collect_used(device);
+    }
+    enum kernel_block_status result = r->result;
+    r->state = 1;
+    if (flushing) device->statistics.flush_requests++;
+    else {
+        if (type == VIRTIO_BLOCK_REQUEST_IN) device->statistics.sectors_read += data_length / 512;
+        else device->statistics.sectors_written += data_length / 512;
+        if (bounce) device->statistics.bounce_requests++; else device->statistics.direct_requests++;
+    }
+    riscv_interrupt_restore(irq);
+    return result;
+}
 static enum kernel_block_status virtio_block_flush(void *context)
 {
     struct riscv_virtio_mmio_block *device = context;
-    if (!device_live(device)) return KERNEL_BLOCK_STATUS_STATE;
-    if (device->block.cache_mode == KERNEL_BLOCK_CACHE_WRITETHROUGH)
-        return KERNEL_BLOCK_STATUS_OK;
-    return submit_request(device, VIRTIO_BLOCK_REQUEST_FLUSH, 0, 0, 0, 0);
+    if (!device_live(device)) return KERNEL_BLOCK_STATUS_IO;
+    struct block_request *r = reserve_request(device, 1);
+    if (!r) return KERNEL_BLOCK_STATUS_IO;
+    enum kernel_block_status result = device->block.cache_mode == KERNEL_BLOCK_CACHE_WRITETHROUGH
+        ? KERNEL_BLOCK_STATUS_OK : submit_request(device, r, VIRTIO_BLOCK_REQUEST_FLUSH, 0, 0, 0, 0);
+    release_request(device, r, 1); return result;
 }
 
-static enum kernel_block_status virtio_block_read(void *context,
+static enum kernel_block_status transfer_read(struct riscv_virtio_mmio_block *device, struct block_request *r,
                                                   uint64_t offset,
                                                   void *buffer,
                                                   size_t size)
 {
-    struct riscv_virtio_mmio_block *device = context;
     unsigned char *output = buffer;
 
     if (!device_live(device)) {
@@ -530,7 +541,7 @@ static enum kernel_block_status virtio_block_read(void *context,
             }
             if (direct_size != 0U) {
                 enum kernel_block_status status = submit_request(
-                    device,
+                    device, r,
                     VIRTIO_BLOCK_REQUEST_IN,
                     sector,
                     data_address,
@@ -548,18 +559,18 @@ static enum kernel_block_status virtio_block_read(void *context,
         }
         {
             unsigned char *bounce =
-                (unsigned char *)device->queue_memory + bounce_offset(device);
+                (unsigned char *)device->queue_memory + bounce_offset(device, r);
             size_t copied = VIRTIO_BLOCK_SECTOR_SIZE - sector_offset;
             enum kernel_block_status status;
 
             if (copied > size) {
                 copied = size;
             }
-            status = submit_request(device,
+            status = submit_request(device, r,
                                     VIRTIO_BLOCK_REQUEST_IN,
                                     sector,
                                     device->queue_physical_address +
-                                        bounce_offset(device),
+                                        bounce_offset(device, r),
                                     VIRTIO_BLOCK_SECTOR_SIZE,
                                     1);
             if (status != KERNEL_BLOCK_STATUS_OK) {
@@ -575,12 +586,11 @@ static enum kernel_block_status virtio_block_read(void *context,
     return KERNEL_BLOCK_STATUS_OK;
 }
 
-static enum kernel_block_status virtio_block_write(void *context,
+static enum kernel_block_status transfer_write(struct riscv_virtio_mmio_block *device, struct block_request *r,
                                                    uint64_t offset,
                                                    const void *buffer,
                                                    size_t size)
 {
-    struct riscv_virtio_mmio_block *device = context;
     const unsigned char *input = buffer;
 
     if (!device_live(device)) {
@@ -613,7 +623,7 @@ static enum kernel_block_status virtio_block_write(void *context,
             }
             if (direct_size != 0U) {
                 enum kernel_block_status status = submit_request(
-                    device,
+                    device, r,
                     VIRTIO_BLOCK_REQUEST_OUT,
                     sector,
                     data_address,
@@ -631,7 +641,7 @@ static enum kernel_block_status virtio_block_write(void *context,
         }
         {
             unsigned char *bounce =
-                (unsigned char *)device->queue_memory + bounce_offset(device);
+                (unsigned char *)device->queue_memory + bounce_offset(device, r);
             size_t copied = VIRTIO_BLOCK_SECTOR_SIZE - sector_offset;
             enum kernel_block_status status;
 
@@ -639,11 +649,11 @@ static enum kernel_block_status virtio_block_write(void *context,
                 copied = size;
             }
             if (sector_offset != 0U || copied < VIRTIO_BLOCK_SECTOR_SIZE) {
-                status = submit_request(device,
+                status = submit_request(device, r,
                                         VIRTIO_BLOCK_REQUEST_IN,
                                         sector,
                                         device->queue_physical_address +
-                                            bounce_offset(device),
+                                            bounce_offset(device, r),
                                         VIRTIO_BLOCK_SECTOR_SIZE,
                                         1);
                 if (status != KERNEL_BLOCK_STATUS_OK) {
@@ -651,11 +661,11 @@ static enum kernel_block_status virtio_block_write(void *context,
                 }
             }
             bytes_copy(bounce + sector_offset, input, copied);
-            status = submit_request(device,
+            status = submit_request(device, r,
                                     VIRTIO_BLOCK_REQUEST_OUT,
                                     sector,
                                     device->queue_physical_address +
-                                        bounce_offset(device),
+                                        bounce_offset(device, r),
                                     VIRTIO_BLOCK_SECTOR_SIZE,
                                     1);
             if (status != KERNEL_BLOCK_STATUS_OK) {
@@ -668,6 +678,23 @@ static enum kernel_block_status virtio_block_write(void *context,
     }
 
     return KERNEL_BLOCK_STATUS_OK;
+}
+
+static enum kernel_block_status virtio_block_read(void *context, uint64_t offset, void *buffer, size_t size)
+{
+    struct riscv_virtio_mmio_block *device = context;
+    struct block_request *r = reserve_request(device, 0);
+    if (!r) return KERNEL_BLOCK_STATUS_IO;
+    enum kernel_block_status result = transfer_read(device, r, offset, buffer, size);
+    release_request(device, r, 0); return result;
+}
+static enum kernel_block_status virtio_block_write(void *context, uint64_t offset, const void *buffer, size_t size)
+{
+    struct riscv_virtio_mmio_block *device = context;
+    struct block_request *r = reserve_request(device, 0);
+    if (!r) return KERNEL_BLOCK_STATUS_IO;
+    enum kernel_block_status result = transfer_write(device, r, offset, buffer, size);
+    release_request(device, r, 0); return result;
 }
 
 enum riscv_virtio_mmio_block_status riscv_virtio_mmio_block_init(
@@ -715,7 +742,7 @@ enum riscv_virtio_mmio_block_status riscv_virtio_mmio_block_init(
     result.transport_version = version;
     result.queue_allocation_order =
         legacy_transport(&result) ? VIRTIO_LEGACY_QUEUE_ALLOCATION_ORDER
-                                  : 0U;
+                                  : 1U;
 
     status = negotiate_features(&result);
     if (status != RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK) {
@@ -724,7 +751,7 @@ enum riscv_virtio_mmio_block_status riscv_virtio_mmio_block_init(
 
     mmio_write32(&result, VIRTIO_MMIO_QUEUE_SEL_OFFSET, 0U);
     queue_max = mmio_read32(&result, VIRTIO_MMIO_QUEUE_NUM_MAX_OFFSET);
-    if (queue_max < VIRTIO_QUEUE_SIZE ||
+    if (queue_max < 4 ||
         (!legacy_transport(&result) &&
          mmio_read32(&result, VIRTIO_MMIO_QUEUE_READY_OFFSET) != 0U)) {
         return init_failure(&result,
@@ -734,6 +761,7 @@ enum riscv_virtio_mmio_block_status riscv_virtio_mmio_block_init(
                             0);
     }
     result.queue_size = VIRTIO_QUEUE_SIZE;
+    while (result.queue_size > queue_max) result.queue_size /= 2;
 
     page_status = physical_page_allocate_order(page_allocator,
                                                 result.queue_allocation_order,
@@ -794,7 +822,7 @@ enum riscv_virtio_mmio_block_status riscv_virtio_mmio_block_init(
                             VIRTIO_MMIO_QUEUE_DRIVER_LOW_OFFSET,
                             VIRTIO_MMIO_QUEUE_DRIVER_HIGH_OFFSET,
                             result.queue_physical_address +
-                                VIRTIO_QUEUE_AVAIL_OFFSET);
+                                queue_avail_offset(&result));
         write_queue_address(&result,
                             VIRTIO_MMIO_QUEUE_DEVICE_LOW_OFFSET,
                             VIRTIO_MMIO_QUEUE_DEVICE_HIGH_OFFSET,
@@ -830,6 +858,8 @@ enum riscv_virtio_mmio_block_status riscv_virtio_mmio_block_init(
     result.block.capacity_bytes =
         capacity_sectors * VIRTIO_BLOCK_SECTOR_SIZE;
     result.block.logical_block_size = VIRTIO_BLOCK_SECTOR_SIZE;
+    kernel_wait_queue_init(&result.available);
+    for (unsigned i = 0; i < slot_count(&result); i++) kernel_wait_queue_init(&request_at(&result, i)->done);
     result.state = RISCV_VIRTIO_BLOCK_STATE_LIVE;
     *device = result;
     device->block.context = device;
@@ -847,7 +877,9 @@ enum riscv_virtio_mmio_block_status riscv_virtio_mmio_block_destroy(
         return RISCV_VIRTIO_MMIO_BLOCK_STATUS_STATE;
     }
 
+    if (device->active || device->available.head) return RISCV_VIRTIO_MMIO_BLOCK_STATUS_STATE;
     device_reset(device);
+    if (device->irq_source) { riscv_plic_unregister(device->irq_source, device); device->irq_source = 0; }
     page_status = physical_page_release_order(device->page_allocator,
                                               device->queue_physical_address,
                                               device->queue_allocation_order);

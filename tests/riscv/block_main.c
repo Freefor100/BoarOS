@@ -1,4 +1,7 @@
 #include <arch/riscv/sbi.h>
+#include <arch/riscv/context.h>
+#include <arch/riscv/plic.h>
+#include <kernel/scheduler.h>
 #include <arch/riscv/virt_uart.h>
 #include <arch/riscv/virtio_mmio_block.h>
 #include <kernel/block.h>
@@ -114,6 +117,51 @@ static void test_rejects_invalid_or_non_block_mmio(void)
     if (status != RISCV_VIRTIO_MMIO_BLOCK_STATUS_NOT_BLOCK) {
         fail_block(3U, RISCV_VIRTIO_MMIO_BLOCK_STATUS_NOT_BLOCK, status);
     }
+}
+
+extern unsigned char __boot_stack_bottom[], __boot_stack_top[];
+static struct riscv_virtio_mmio_block *irq_device;
+static unsigned char *irq_buffers;
+static unsigned irq_done;
+static void irq_read_worker(void *argument)
+{
+    uintptr_t index = (uintptr_t)argument;
+    if (kernel_block_read_at(&irq_device->block, 512,
+        irq_buffers + index * 512, 512) != KERNEL_BLOCK_STATUS_OK ||
+        !bytes_equal(irq_buffers + index * 512, "BoarOS-direct-sector-one", 23))
+        fail_block(42, 0, index);
+    irq_done++;
+}
+static void test_irq_reads(const void *dtb, struct physical_page_allocator *allocator,
+                            struct riscv_virtio_mmio_block *device, unsigned char *buffer)
+{
+    struct dtb_irq_info irq;
+    if (dtb_read_irq_info(dtb, 0, &irq) != DTB_STATUS_OK ||
+        !riscv_plic_init((void *)(uintptr_t)irq.plic.base, irq.plic.size, irq.context, irq.source_count))
+        fail_block(43, 0, 1);
+    uint32_t source = 0;
+    for (unsigned i = 0; i < irq.route_count; i++)
+        if (irq.routes[i].base == (uintptr_t)device->mmio) source = irq.routes[i].source;
+    if (kernel_scheduler_init(allocator, (uintptr_t)__boot_stack_bottom,
+         (uintptr_t)__boot_stack_top) != KERNEL_SCHEDULER_STATUS_OK ||
+        !riscv_virtio_mmio_block_enable_irq(device, source)) fail_block(44, 0, 1);
+    irq_device = device; irq_buffers = buffer;
+    for (uintptr_t i = 0; i < 2; i++)
+        if (kernel_thread_create(irq_read_worker, (void *)i) != KERNEL_SCHEDULER_STATUS_OK)
+            fail_block(45, 0, 1);
+    unsigned reaped = 0;
+    while (reaped < 2) {
+        uintptr_t saved = riscv_interrupt_save();
+        if (kernel_scheduler_yield_current() != KERNEL_SCHEDULER_STATUS_OK) fail_block(46, 0, 1);
+        struct kernel_thread_completion completion;
+        if (kernel_scheduler_reap_one(&completion) == KERNEL_SCHEDULER_STATUS_OK) reaped++;
+        riscv_interrupt_restore(saved | RISCV_SSTATUS_SIE);
+    }
+    (void)riscv_interrupt_save();
+    struct riscv_virtio_mmio_block_statistics stats;
+    riscv_virtio_mmio_block_get_statistics(device, &stats);
+    if (irq_done != 2 || !stats.interrupts || !stats.sleeps || stats.runtime_polls)
+        fail_block(47, 2, irq_done);
 }
 
 static void test_real_virtio_block(const void *dtb)
@@ -359,6 +407,8 @@ static void test_real_virtio_block(const void *dtb)
     }
     virt_uart_puts(rw_dev->block.cache_mode == KERNEL_BLOCK_CACHE_WRITEBACK
         ? "BoarOS: block cache writeback\n" : "BoarOS: block cache writethrough\n");
+
+    test_irq_reads(dtb, &allocator, rw_dev, buffer);
 
     /* Cleanup */
     if (physical_page_release(&allocator, buffer_address) !=

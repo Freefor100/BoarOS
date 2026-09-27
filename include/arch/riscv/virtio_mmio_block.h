@@ -3,6 +3,7 @@
 
 #include <kernel/block.h>
 #include <kernel/physical_page.h>
+#include <kernel/scheduler.h>
 
 #include <stdint.h>
 
@@ -30,6 +31,7 @@ struct riscv_virtio_mmio_block_statistics {
     uint64_t timeouts;
     uint64_t io_errors;
     uint64_t flush_requests;
+    uint64_t interrupts, sleeps, wakes, queue_waits, runtime_polls, max_inflight;
 };
 
 struct riscv_virtio_mmio_block {
@@ -47,6 +49,8 @@ struct riscv_virtio_mmio_block {
     uint32_t queue_allocation_order;
     uint32_t state;
     uint32_t read_only;
+    uint32_t irq_source, active, inflight, barrier_waiters, barrier;
+    struct kernel_wait_queue available;
     struct riscv_virtio_mmio_block_statistics statistics;
 };
 
@@ -57,6 +61,8 @@ enum riscv_virtio_mmio_block_status riscv_virtio_mmio_block_init(
     struct physical_page_allocator *page_allocator,
     riscv_virtio_dma_address_fn dma_address,
     uint32_t timebase_frequency);
+
+int riscv_virtio_mmio_block_enable_irq(struct riscv_virtio_mmio_block *device, uint32_t source);
 
 enum riscv_virtio_mmio_block_status riscv_virtio_mmio_block_destroy(
     struct riscv_virtio_mmio_block *device);

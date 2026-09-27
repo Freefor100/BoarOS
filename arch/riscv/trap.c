@@ -1,3 +1,4 @@
+#include <arch/riscv/plic.h>
 #include <arch/riscv/process.h>
 #include <arch/riscv/sbi.h>
 #include <arch/riscv/timer.h>
@@ -113,6 +114,11 @@ static int user_page_fault_access(uint64_t scause, uint32_t *access)
 void riscv_trap_dispatch(struct riscv_trap_frame *frame)
 {
     int from_user = (frame->sstatus & RISCV_SSTATUS_SPP) == 0U;
+
+    if (frame->scause == (RISCV_SCAUSE_INTERRUPT | 9U)) {
+        riscv_plic_dispatch();
+        return;
+    }
 
     if (frame->scause ==
         (RISCV_SCAUSE_INTERRUPT | RISCV_SCAUSE_SUPERVISOR_TIMER)) {

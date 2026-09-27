@@ -136,6 +136,7 @@ C_SOURCES := \
 	arch/riscv/virt_rtc.c \
 	arch/riscv/virt_uart.c \
 	arch/riscv/virtio_mmio_block.c \
+	arch/riscv/plic.c \
 	fs/lwext4_port.c \
 	fs/files/table.c \
 	fs/files/locks.c \
@@ -211,6 +212,7 @@ TEST_RUNTIME_C_SOURCES := \
 	arch/riscv/virt_rtc.c \
 	arch/riscv/virt_uart.c \
 	arch/riscv/virtio_mmio_block.c \
+	arch/riscv/plic.c \
 	fs/files/table.c \
 	fs/files/locks.c \
 	fs/files/io.c \

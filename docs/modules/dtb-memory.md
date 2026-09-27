@@ -52,3 +52,5 @@ make test-riscv
 聚焦测试覆盖一或两个 cell、多 tuple、两类静态保留区、timebase 正常/缺失/错误位置/错误长度/零值/重复、VirtIO compatible list、status、嵌套 ranges、排序/重叠/容量/深度，以及布局的裁剪、合并、耗尽和溢出。完整启动测试在 QEMU `virt` 的 512 MiB、1 GiB 与 16 GiB 配置下验证真实 OpenSBI DTB、10 MHz timebase、原始 RAM 大小和非空启动布局。
 
 本模块仍不处理多 RAM bank、动态 reserved-memory、NUMA、热插拔或 CMA；页边界收缩和单页分配由[物理页分配模块](physical-pages.md)承担。
+
+`dtb_read_irq_info(dtb, boot_hart, ...)` 从固定 DTB 图解析 PLIC reg/ranges、CPU interrupt-controller phandle 与 `interrupts-extended` 的 supervisor context，并关联 VirtIO `interrupt-parent` 和 source。PLIC MMIO 进入最终高半区映射，交由 `arch/riscv/plic.c` claim/dispatch/complete；找不到启动 hart 的 S context 或路由越界时明确失败，不使用固定 IRQ/context 常数。见 `make test-dtb-riscv test-block-riscv test-io-sleep-riscv`。

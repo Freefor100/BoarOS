@@ -1032,8 +1032,18 @@ static void test_reports_too_many_virtio_mmio_devices(void)
 
 void kernel_main(unsigned long hart_id, const void *dtb)
 {
-    (void)hart_id;
-    (void)dtb;
+    struct dtb_irq_info irq;
+    if (dtb_read_irq_info(dtb, hart_id, &irq) != DTB_STATUS_OK ||
+        !irq.plic.size || !irq.source_count || !irq.route_count) {
+        virt_uart_puts("DTB IRQ discovery failed\n"); sbi_shutdown();
+    }
+    for (unsigned i = 0; i < irq.route_count; i++)
+        if (!irq.routes[i].source || irq.routes[i].source > irq.source_count) {
+            virt_uart_puts("DTB IRQ source invalid\n"); sbi_shutdown();
+        }
+    if (dtb_read_irq_info(dtb, UINT64_MAX, &irq) != DTB_STATUS_NOT_FOUND) {
+        virt_uart_puts("DTB missing hart accepted\n"); sbi_shutdown();
+    }
 
     test_default_cells();
     test_one_cell_range();
