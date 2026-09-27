@@ -103,6 +103,10 @@ enum kernel_syscall_status syscall_handle_newfstatat(
     struct kernel_task *caller,
     const struct kernel_syscall_request *request,
     struct kernel_syscall_result *decoded);
+enum kernel_syscall_status syscall_handle_faccessat(
+    struct kernel_task *caller,
+    const struct kernel_syscall_request *request,
+    struct kernel_syscall_result *decoded);
 
 enum kernel_syscall_status syscall_handle_dup(
     struct kernel_task *caller,

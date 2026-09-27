@@ -25,7 +25,7 @@ BoarOS 是从零搭建、面向 OS Comp 能力建设的 C / 少量汇编内核�
 
 文件层已有部分读写、OFD 生命周期、稀疏文件与映射截断的语义深度；显式时间设置和真实挂载统计已接入；共享匿名映射与共享文件页可跨 MM 读写，完整 TTY 仍有缺口。ext4 恢复已覆盖 512 字节原子写、未 flush 写丢失或重排的故障模型；实板持久性仍待独立验证。动态 musl 通过不代表完整 glibc 兼容。
 
-固定 SQLite 3.53.4 的原生 Unix VFS 已在单 hart 上运行静态/动态 CLI、多进程 DELETE 回滚日志和普通多进程 WAL；WAL 工作负载用同一 ELF 在固定 Linux 与 BoarOS 验证 writer 竞争、未提交进程退出及第二次启动后的完整性。回滚日志的 EXTRA/FULL 故障恢复有独立 NBD 验收；WAL 尚无存储断电矩阵，实板持久性未验证。
+固定 SQLite 3.53.4 的原生 Unix VFS 已在单 hart 上运行静态/动态 CLI、多进程 DELETE 回滚日志和普通多进程 WAL；WAL 工作负载用同一 ELF 在固定 Linux 与 BoarOS 验证 writer 竞争、未提交进程退出及第二次启动后的完整性。DELETE 与 WAL 的 EXTRA/FULL 恢复各有 NBD 断电/故障矩阵；实板持久性未验证。
 
 2026-09-27 最近一次固定 BusyBox/libc-test 全量验证（输入与身份见[程序清单](docs/learning/user-program-inventory.md)）：228 个顶层案例全部完成，223 项双侧一致、2 个直接 entry 退出不符、3 个包装脚本断言失败；失败仍是原 socket 静态/动态和原包装器五项，无旧通过项回退。BusyBox 原脚本为 50/55 success，另有独立 pwd/cd/mv/touch 组合双侧通过。包装脚本与 entry 有重叠，清单完成不等于全部兼容。
 
@@ -46,6 +46,8 @@ make test-sqlite-nbd-riscv      # QEMU 通过 Unix NBD 跑同一负载
 make test-sqlite-recovery-riscv # 固定 Linux/BoarOS 与 NBD 热日志恢复
 make test-sqlite-recovery-matrix-riscv # 小事务逐事件故障矩阵
 make test-sqlite-wal-riscv      # 固定 Linux/BoarOS 双侧多进程 WAL 与重启
+make test-sqlite-wal-recovery-riscv # 固定 Linux/BoarOS 的 WAL 正常与错误恢复
+make test-sqlite-wal-recovery-matrix-riscv # WAL 逐事件断电/写/flush 故障矩阵
 make test-stack-usage
 make test-lwext4-host
 make test-lwext4-recovery-host # 日志与 orphan 的断电/故障矩阵
@@ -61,7 +63,7 @@ make test-references
 
 ## 近期工作与文档
 
-[TODO 与阶段依赖](docs/goals.md)集中维护下一步、阻塞与验收：块同步、逐 inode 写回、journal/replay、cwd/dirfd/rename、时间与统计、同 MM 非 PI robust-list、共享匿名对象及其跨 MM futex 已落地；记录锁、SQLite 回滚日志、共享文件映射、`msync` 和普通多进程 WAL 各有验证入口。历史取消异常在固定输入重复运行中未复现，根因仍未确定。共享文件页的错误注入与 WAL 断电恢复矩阵、不同 VA 的共享 futex、`mremap`/`madvise` 仍按各自依赖推进；glibc、LoongArch 和网络另行推进。SMP 先验证所有权、唤醒和 TLB 回收，再谈调度策略与性能。
+[TODO 与阶段依赖](docs/goals.md)集中维护下一步、阻塞与验收：块同步、逐 inode 写回、journal/replay、cwd/dirfd/rename、时间与统计、同 MM 非 PI robust-list、共享匿名对象及其跨 MM futex 已落地；记录锁、SQLite 回滚日志、共享文件映射、`msync` 和普通多进程 WAL 各有验证入口。历史取消异常在固定输入重复运行中未复现，根因仍未确定。WAL 断电矩阵和共享文件页的首批写回/分配故障交错已验收；写回进行中的并发修改、不同 VA 的共享 futex、`mremap`/`madvise` 仍按各自依赖推进；glibc、LoongArch 和网络另行推进。SMP 先验证所有权、唤醒和 TLB 回收，再谈调度策略与性能。
 
 - [文档导航](docs/README.md)：模块契约与可复用学习材料。
 - [工程原则](docs/design.md)与[贡献说明](CONTRIBUTING.md)：技术取舍、验证与提交边界。

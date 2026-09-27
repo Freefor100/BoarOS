@@ -1236,6 +1236,17 @@ test-sqlite-recovery-matrix-riscv: $(SQLITE_RECOVERY_RV) $(KERNEL_RV) build/host
 		--kernel $(KERNEL_RV) --program $(SQLITE_RECOVERY_RV) \
 		--server build/host/nbd-fault --qemu $(QEMU_RISCV64) --matrix full
 
+.PHONY: test-sqlite-wal-recovery-riscv test-sqlite-wal-recovery-matrix-riscv
+test-sqlite-wal-recovery-riscv: $(SQLITE_RECOVERY_RV) $(KERNEL_RV) build/host/nbd-fault
+	PYTHONDONTWRITEBYTECODE=1 python3 tests/sqlite-recovery-riscv.py \
+		--kernel $(KERNEL_RV) --program $(SQLITE_RECOVERY_RV) \
+		--server build/host/nbd-fault --qemu $(QEMU_RISCV64) --linux --journal wal
+
+test-sqlite-wal-recovery-matrix-riscv: $(SQLITE_RECOVERY_RV) $(KERNEL_RV) build/host/nbd-fault
+	PYTHONDONTWRITEBYTECODE=1 python3 tests/sqlite-recovery-riscv.py \
+		--kernel $(KERNEL_RV) --program $(SQLITE_RECOVERY_RV) \
+		--server build/host/nbd-fault --qemu $(QEMU_RISCV64) --journal wal --matrix full
+
 # Rebuild only production code in isolation: stale .su files and boot-only
 # test fixture frames cannot silently satisfy or distort this gate.
 .PHONY: test-stack-usage

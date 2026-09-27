@@ -3356,6 +3356,10 @@ static void run_partial_write_test(const void *dtb)
         kernel_mm_vma_enable(&mm, &heap) != KERNEL_MM_STATUS_OK ||
         kernel_mm_brk_initialize(&mm, UINT64_C(0x1000000),
                                  TEST_MMAP_LIMIT) != KERNEL_MM_STATUS_OK ||
+        kernel_mm_vma_insert_anon(&mm, TEST_USER_BUFFER,
+            TEST_USER_BUFFER + 3U * BOAROS_PAGE_SIZE,
+            KERNEL_MM_READ | KERNEL_MM_WRITE, KERNEL_VMA_ROLE_STACK,
+            KERNEL_VMA_FAULT_RESIDENT_REQUIRED) != KERNEL_MM_STATUS_OK ||
         kernel_fs_context_create(&fs, &mount, &heap) !=
             KERNEL_FS_CONTEXT_STATUS_OK ||
         kernel_files_create(&files, &heap) != KERNEL_FILES_STATUS_OK ||
@@ -3571,10 +3575,71 @@ static void run_partial_write_test(const void *dtb)
     sync_flush_failures = 1U;
     if (kernel_mm_msync(&mm, shared_address, BOAROS_PAGE_SIZE, 4U) !=
             -KERNEL_EIO || sync_flush_failures != 0U ||
-        kernel_mm_msync(&mm, shared_address, BOAROS_PAGE_SIZE, 4U) != 0 ||
-        kernel_mm_munmap(&mm, shared_address, BOAROS_PAGE_SIZE) !=
-            KERNEL_MM_STATUS_OK)
+        kernel_mm_msync(&mm, shared_address, BOAROS_PAGE_SIZE, 4U) != 0)
         fail_files(430U, 0, -1);
+    /* The successful retry must re-protect the alias. A later write to the
+     * same PTE needs a new dirty generation and must survive cache eviction. */
+    mapped_value = 'N';
+    unsigned char persisted_value = 0;
+    size_t mapped_copied = 0;
+    if (kernel_copy_to_user(&mm, shared_address, &mapped_value, 1U,
+                            &mapped_copied) != KERNEL_UACCESS_STATUS_OK ||
+        mapped_copied != 1U ||
+        kernel_mm_msync(&mm, shared_address, BOAROS_PAGE_SIZE, 4U) != 0)
+        fail_files(433U, 0, -1);
+    /* Fork failure must neither untrack the resident shared alias nor
+     * convert the parent's file page into a private COW page. */
+    for (unsigned failure = 1U; ; failure++) {
+        struct kernel_mm trial = {0};
+        if (failure > 64U) fail_files(434U, 0, failure);
+        fail_metadata_allocation = failure;
+        enum kernel_mm_status fork_status = kernel_mm_fork(&trial, &mm);
+        fail_metadata_allocation = 0U;
+        if (fork_status == KERNEL_MM_STATUS_OK) {
+            if (kernel_mm_release(&trial) != KERNEL_MM_STATUS_OK)
+                fail_files(434U, 0, -1);
+            break;
+        }
+        if (fork_status != KERNEL_MM_STATUS_NO_MEMORY ||
+            !read_user_byte(&mm, shared_address, &persisted_value) ||
+            persisted_value != 'N')
+            fail_files(434U, KERNEL_MM_STATUS_NO_MEMORY, fork_status);
+    }
+    /* A failed fixed replacement must leave the resident file alias, its
+     * cache link and its source owner available for the next writeback. */
+    fail_metadata_allocation = 1U;
+    uint64_t replacement_address = UINT64_MAX;
+    enum kernel_mm_status replace_status = kernel_mm_mmap_anonymous(
+        &mm, shared_address, BOAROS_PAGE_SIZE,
+        KERNEL_MM_READ | KERNEL_MM_WRITE,
+        KERNEL_MM_MAP_FIXED | KERNEL_MM_MAP_SHARED,
+        &replacement_address);
+    fail_metadata_allocation = 0U;
+    struct kernel_vma retained_vma;
+    if (replace_status != KERNEL_MM_STATUS_NO_MEMORY ||
+        replacement_address != UINT64_MAX)
+        fail_files(435U, KERNEL_MM_STATUS_NO_MEMORY, replace_status);
+    if (kernel_mm_vma_lookup(&mm, shared_address, &retained_vma) !=
+            KERNEL_MM_STATUS_OK ||
+        retained_vma.kind != KERNEL_VMA_KIND_FILE_SHARED ||
+        !read_user_byte(&mm, shared_address, &persisted_value) ||
+        persisted_value != 'N')
+        fail_files(436U, 'N', persisted_value);
+    if (kernel_mm_munmap(&mm, shared_address, BOAROS_PAGE_SIZE) !=
+            KERNEL_MM_STATUS_OK)
+        fail_files(437U, 0, -1);
+    enum kernel_page_cache_status invalidate_status =
+        kernel_page_cache_invalidate_node(&page_cache,
+            kernel_vfs_file_node(&description->file));
+    if (invalidate_status != KERNEL_PAGE_CACHE_STATUS_OK)
+        fail_files(438U, KERNEL_PAGE_CACHE_STATUS_OK, invalidate_status);
+    enum kernel_files_status read_status = kernel_files_pread(
+        &files, &mm, 0, TEST_USER_BUFFER, 1U, 0, &result);
+    if (read_status != KERNEL_FILES_STATUS_OK || result != 1)
+        fail_files(439U, 1, result);
+    if (!read_user_bytes(&mm, TEST_USER_BUFFER, &persisted_value, 1U) ||
+        persisted_value != 'N')
+        fail_files(440U, 'N', persisted_value);
     device.block.flush = sync_original_flush;
 
     if (kernel_files_pin(&files, 0, &mapping_pin, &result) !=

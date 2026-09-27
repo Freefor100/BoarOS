@@ -32,6 +32,14 @@ shared-file.truncate-sigbus
 shared-file.grow-tail
 shared-file.write-grow-gap
 shared-file.open-trunc-sigbus
+access.root-write
+access.file-read
+access.file-exec
+access.relative-write
+access.absolute-bad-dirfd
+access.missing
+access.bad-mode
+access.bad-pointer
 futex.shared-wake
 futex.shared-requeue
 futex.shared-bad-wake

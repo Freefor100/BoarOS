@@ -428,4 +428,8 @@ PAGE_SIZE) 撤销映射且 even_cows=1；`truncate_inode_partial_folio()` 只清
 
 `MAP_SHARED` 文件页必须与普通 `read/write` 使用同一 inode 缓存数据源。直接让共享 PTE 长期可写会绕过缓存的 dirty 标记；只扫描 Sv39 D 位又把写回正确性绑定到硬件位、TLB 重置与所有别名的页表遍历。BoarOS 在单 hart 阶段选择每个缓存页维护 MM 所拥有的别名反向索引：首次写故障先标脏再开放本 PTE，写回前只重新保护该页的别名。成本是每个驻留共享 PTE 一条记录、写回前遍历该页别名；避免每次写回扫整个 inode 的所有 MM。缓存只借用别名链接，MM 的 OFD 来源与 PTE 物理引用维持生命周期，撤映射时无分配摘链，避免缓存与 MM 互相强引用。
 
-固定 Linux `references/linux/mm/mmap.c`（commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`）规定共享可写映射需写权限，`O_RDONLY` 建立的共享映射不保留之后升级为可写的资格；`references/linux/mm/filemap.c::filemap_page_mkwrite` 在写 fault 时将页标脏。`references/linux/mm/msync.c` 在参数、对齐与空洞检查后，只对共享文件 VMA 的 `MS_SYNC` 执行范围 fsync，`MS_ASYNC` 不提交 I/O。BoarOS 用同一 ELF 的固定 Linux 差分核对这些用户可见边界，并用 SQLite 3.53.4 普通多进程 WAL 在独立 MM 中验证共享索引；这仍不是 WAL 存储断电或 SMP TLB 协议的证据。
+固定 Linux `references/linux/mm/mmap.c`（commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`）规定共享可写映射需写权限，`O_RDONLY` 建立的共享映射不保留之后升级为可写的资格；`references/linux/mm/filemap.c::filemap_page_mkwrite` 在写 fault 时将页标脏。`references/linux/mm/msync.c` 在参数、对齐与空洞检查后，只对共享文件 VMA 的 `MS_SYNC` 执行范围 fsync，`MS_ASYNC` 不提交 I/O。BoarOS 用同一 ELF 的固定 Linux 差分核对这些用户可见边界，并用 SQLite 3.53.4 普通多进程 WAL 在独立 MM 中验证共享索引。
+
+写回失败后只检查下一次 `msync` 成功仍不够：如果写回前重新保护别名遗漏，下一次对同一 PTE 的 store 可能绕过首次写标脏。`tests/riscv/files_main.c` 用真实 `kernel_copy_to_user` 触发 store fault，按 flush EIO→重试→再次写→`msync`→撤映射→驱逐缓存→重读顺序检查稳定数据。直接解析物理页写测试数据会绕开 PTE，不能验证这条路径。聚焦测试还扫描共享文件映射 fork 的 metadata 分配失败，并让匿名共享固定替换在分配失败时保留原 VMA/别名；完整释放回到物理页基线。写回进行中再次修改、跨核 TLB 同步仍未验证。
+
+WAL 持久性另用固定 SQLite 3.53.4 archive `references/sqlite/sqlite-amalgamation-3530400.zip`（SHA-256 `1e71ddf93849c6a6ecf58b827c0692073d2dd7ee40196158068f7b29f422e87d`）与本地 `references/qemu/` v11.1.0 commit `84f07211cc5b4fc6a371559bf8a5de4fb068e648` 对应的 NBD flush 模型验证。42 个事务内事件逐点断电，分别丢弃、保存奇数或逆序保存未 flush 扇区，另逐点失败 26 次写和 16 次 flush；每次从稳定镜像两次恢复并检查整事务和 ext4。这个证据限于单 hart、QEMU 11.1.1 的隔离镜像，不能推出实板掉电承诺。

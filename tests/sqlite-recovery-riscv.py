@@ -76,6 +76,8 @@ def direct_boot(args, image, output, marker, linux=False):
     if (result.returncode or marker not in content or
             (not linux and "PID 1 exited status=0x2a" not in content)):
         raise AssertionError(f"direct boot failed: {output}\n{content[-5000:]}")
+    if args.journal == "wal" and "BoarOS: SQLite journal=wal" not in content:
+        raise AssertionError(f"WAL mode not confirmed: {output}\n{content[-5000:]}")
     return content
 
 
@@ -157,6 +159,9 @@ def nbd_boot(args, image, directory, name, *, options=(), marker=None,
                 backend.wait()
     guest_text = guest_log.read_text(errors="replace")
     backend_text = backend_log.read_text(errors="replace")
+    if args.journal == "wal" and "BoarOS: SQLite journal=wal" not in guest_text:
+        raise AssertionError(f"WAL mode not confirmed: {guest_log}\n"
+                             + guest_text[-3000:])
     if cut:
         assert "cut=" in backend_text, backend_text[-3000:]
     elif marker is None:
@@ -188,6 +193,8 @@ def main():
                         default=ROOT / "build/host/nbd-fault")
     parser.add_argument("--qemu", default="qemu-system-riscv64")
     parser.add_argument("--matrix", choices=("sample", "full"))
+    parser.add_argument("--journal", choices=("delete", "wal"),
+                        default="delete")
     parser.add_argument("--linux", action="store_true",
                         help="run the same ELF under fixed Linux too")
     args = parser.parse_args()
@@ -213,8 +220,13 @@ def main():
             "qemu": command(args.qemu, "--version").stdout.splitlines()[0],
             "sqlite_archive_sha256": sha256(ROOT /
                 "references/sqlite/sqlite-amalgamation-3530400.zip"),
-            "rebuild": "make test-sqlite-recovery-matrix-riscv" if args.matrix
-                       else "make test-sqlite-recovery-riscv",
+            "journal": args.journal,
+            "rebuild": ("make test-sqlite-wal-recovery-matrix-riscv"
+                        if args.journal == "wal" and args.matrix else
+                        "make test-sqlite-wal-recovery-riscv"
+                        if args.journal == "wal" else
+                        "make test-sqlite-recovery-matrix-riscv"
+                        if args.matrix else "make test-sqlite-recovery-riscv"),
         }
         if args.linux:
             identity["linux_kernel_sha256"] = sha256(args.linux_kernel)
@@ -231,7 +243,8 @@ def main():
                             "set_inode_field console mode 020600\n")
         command("debugfs", "-w", "-f", str(commands), str(base))
         for name, value in (("phase", "S"), ("sync", "E"),
-                            ("size", "2")):
+                            ("size", "2"),
+                            ("journal", "W" if args.journal == "wal" else "D")):
             source = directory / name
             source.write_text(value)
             put_file(base, source, "/" + name)
@@ -291,7 +304,8 @@ def main():
             command("mkfs.ext4", "-q", "-F", "-b", "4096", str(small))
             put_file(small, args.program, "/init", executable=True)
             for control, value in (("phase", "S"), ("sync", "E"),
-                                   ("size", "1")):
+                                   ("size", "1"),
+                                   ("journal", "W" if args.journal == "wal" else "D")):
                 source = directory / control
                 source.write_text(value)
                 put_file(small, source, "/" + control)

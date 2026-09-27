@@ -10,7 +10,8 @@ enum { VALUE_SIZE = 3000 };
 
 static void fail(sqlite3 *db, int result, const char *step)
 {
-    fprintf(stderr, "SQLite recovery %s: %d %s\n", step, result,
+    fprintf(stderr, "SQLite recovery %s: %d/%d %s\n", step, result,
+            db ? sqlite3_extended_errcode(db) : 0,
             db ? sqlite3_errmsg(db) : "no database");
     exit(1);
 }
@@ -122,6 +123,7 @@ static void verify(sqlite3 *db, int rows)
 int main(void)
 {
     char phase = control("/phase"), sync = control("/sync");
+    char journal = control("/journal");
     int rows = control("/size") == '1' ? 1 : 24;
     sqlite3 *db = 0;
     if (sqlite3_libversion_number() != 3053004 ||
@@ -133,7 +135,13 @@ int main(void)
     }
     require(db, sqlite3_open_v2("/recovery.db", &db,
               SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, 0), "open");
-    answer(db, "PRAGMA journal_mode=DELETE", "delete");
+    if (journal == 'W') {
+        answer(db, "PRAGMA journal_mode=WAL", "wal");
+        puts("BoarOS: SQLite journal=wal");
+        fflush(stdout);
+    } else if (journal == 'D') {
+        answer(db, "PRAGMA journal_mode=DELETE", "delete");
+    } else return 1;
     answer(db, "PRAGMA locking_mode=NORMAL", "normal");
     answer(db, "PRAGMA mmap_size=0", "0");
     statement(db, sync == 'F' ? "PRAGMA synchronous=FULL" :

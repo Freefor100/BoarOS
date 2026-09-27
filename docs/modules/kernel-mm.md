@@ -135,6 +135,8 @@ RISC-V 创建先分配并解析记录页，最后才把 LIVE Sv39 空间移入�
 
 `FILE_SHARED` 的每个驻留 PTE 持缓存物理页引用，MM 持对应 OFD 来源引用；同一 inode 页在独立 open、独立 MM 和多个 VA 中维持同一数据源。MM 分配驻留记录后安装只读共享 PTE，再把记录挂入缓存页的反向索引；失败撤销 PTE，未发布的记录由 MM 回收。写故障在缓存项标记当前有效字节脏、推进 generation 后将本 PTE 升为可写。缓存写回前按反向索引重新保护别名，写回中再次写入会重新故障并改变 generation，旧写回不能清除新脏状态。MM 拥有记录，缓存借用链接，PTE 持物理页；fork 预留子记录并在页表共享成功后挂入索引，munmap/fixed replace/退出无分配地摘除。只读 fd 建立的共享 VMA 保存不可升级的写资格，`mprotect` 请求写返回 `EACCES`，合法权限变化重新建立首次写追踪。
 
+`make test-files-partial-write-riscv` 对共享映射注入 flush EIO、重试后再次写 fault、同步后驱逐并重读稳定数据；还扫描 fork metadata 分配失败、固定地址替换分配失败时保留原映射、别名和 OFD，最后检查页资源基线。该测试没有模拟同步写回进行中的第二个 hart 写入；SMP 发布与 TLB 协议仍由 P6 验证。
+
 `kernel_mm_msync()` 按固定 Linux `references/linux/mm/msync.c`（commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`）检查 flags、对齐和范围；长度零成功，空洞在处理已映射片段后返回 `ENOMEM`。`MS_SYNC` 对共享文件 VMA 的对应 inode 范围写回，再同步元数据并传递块 flush，错误沿 inode/OFD 序列传播；`MS_ASYNC` 不提交 I/O。映射保持 OFD/node 引用，所以关闭 fd 或 unlink 后仍能同步。
 
 ELF image 使用独立的 `kernel_elf64_source`，不把 `PT_LOAD` 当作普通 file-private mmap。source 在 exec 时一次解析 program headers，并将页区间规范化为 `ELF_PRIVATE` VMA 的 `backing_offset`。完整文件页可以共享 page cache；文件/BSS 边界页、多个段贡献页和 BSS 页由 fault 路径私有分配、清零并精确填充。source 引用由 MM 记录，重复映射不增加历史引用，fork 子 MM 获取独立引用，最后一个相关 VMA 消失才 release。可执行页发布后执行本地 `SFENCE.VMA` 和必要 `FENCE.I`，覆盖先读后取指。source 的 OFD/I/O 清理错误仍由 source owner 保留，堆和物理页释放不建立重试状态。

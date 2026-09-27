@@ -47,6 +47,7 @@ void abi_shared_file_mapping_cases(void);
 void abi_shared_file_truncate_cases(void);
 void abi_futex_shared_cases(void);
 void abi_file_lock_cases(void);
+void abi_access_cases(void);
 void abi_file_lock_exec_probe(unsigned mode) __attribute__((noreturn));
 void abi_limit_exec_probe(void) __attribute__((noreturn));
 #endif

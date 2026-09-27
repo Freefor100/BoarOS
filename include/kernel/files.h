@@ -317,6 +317,16 @@ enum kernel_files_status kernel_files_fstatat(
     uint64_t flags,
     int64_t *linux_result);
 
+/* faccessat uses the current immutable root identity for mode checks. */
+enum kernel_files_status kernel_files_faccessat(
+    struct kernel_files *files,
+    const struct kernel_fs_context *fs,
+    struct kernel_mm *mm,
+    int64_t dirfd,
+    uint64_t user_path,
+    uint64_t mode,
+    int64_t *linux_result);
+
 enum kernel_files_status kernel_files_getdents(
     struct kernel_files *files,
     struct kernel_mm *mm,
