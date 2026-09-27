@@ -28,7 +28,7 @@ P4d 共享匿名 futex 证据：`build/p4d-userland-final.log`（跨 MM 唤醒�
 
 P4b/c 与普通 WAL 阶段证据：`make test-diff-abi-riscv` 在固定 Linux/BoarOS 同一 ELF 的 388 条记录一致，覆盖共享别名、mprotect、fork、截断/O_TRUNC SIGBUS、尾页扩展与 `msync`；`make test-files-partial-write-riscv` 覆盖共享 fault 元数据 OOM 回滚与 `msync` flush EIO 重试；`make test-sqlite-wal-riscv` 在两侧以固定 SQLite Unix VFS 验证独立进程 writer 竞争、未提交退出与第二次启动。既有 SQLite DELETE 回滚日志的 441 次断电、100 次写失败和 47 次 flush 失败矩阵、RISC-V 全套、userland、lwext4 恢复与栈检查通过。228 项清单仍为 223/2/3，五个旧失败 ID 不变；输入身份和重建命令见[程序清单](learning/user-program-inventory.md)。共享文件故障交错与 WAL 存储断电矩阵未完成。
 
-WAL 断电与共享页故障阶段证据：`make test-sqlite-wal-recovery-riscv` 在固定 Linux/BoarOS 同一 ELF 上完成 EXTRA/FULL、hot、已确认提交和写/flush 错误传播；`make test-sqlite-wal-recovery-matrix-riscv` 对 42 个事务 NBD 事件覆盖 126 个断电组合、26 个写失败和 16 个 flush 失败位置，每次两次恢复及 ext4 检查均通过。输入身份由 runner 输出：内核 SHA-256 `b1191d2737dda760a0f4ec1bc0c5ddaa1c36fe668be3584a0a3cbb02598d8f49`、恢复 ELF `179be6d2e5ab52c908d4e0547225e7999d9e404ffd05c12f404e9f170fdca5e0`、NBD 服务 `b838e11a094c0c34114dbca310a8a75c158a442b3130dfc440c7da6a43092e6f`、QEMU 11.1.1、SQLite archive SHA-256 `1e71ddf93849c6a6ecf58b827c0692073d2dd7ee40196158068f7b29f422e87d`；本地固定 QEMU v11.1.0 commit `84f07211cc5b4fc6a371559bf8a5de4fb068e648`。`make test-files-partial-write-riscv` 增加写回失败后再次标脏并落盘、共享 fork 元数据 OOM 扫描及固定替换失败仍保留别名/owner 的检查。`make test-diff-abi-riscv` 为 396 条一致；普通 WAL、files、userland、RISC-V 全套、栈、NBD host、lwext4 recovery、DELETE 正常与抽样矩阵和固定资料检查通过。228 项清单再次为 223/2/3，五个旧失败 ID 不变，suite identity SHA-256 `08bf67905816d479d251c9a55bf985b46dd5ef37c4f588207201d7c0e741ab82`；重建命令和完整来源见[程序清单](learning/user-program-inventory.md)。写回进行中再次修改及实板持久性仍未验收。
+WAL 断电与共享页故障阶段证据：`make test-sqlite-wal-recovery-riscv` 在固定 Linux/BoarOS 同一 ELF 上完成 EXTRA/FULL、hot、已确认提交和写/flush 错误传播；`make test-sqlite-wal-recovery-matrix-riscv` 对 42 个事务 NBD 事件覆盖 126 个断电组合、26 个写失败和 16 个 flush 失败位置，每次两次恢复及 ext4 检查均通过。输入身份由 runner 输出：内核 SHA-256 `b1191d2737dda760a0f4ec1bc0c5ddaa1c36fe668be3584a0a3cbb02598d8f49`、恢复 ELF `179be6d2e5ab52c908d4e0547225e7999d9e404ffd05c12f404e9f170fdca5e0`、NBD 服务 `b838e11a094c0c34114dbca310a8a75c158a442b3130dfc440c7da6a43092e6f`、QEMU 11.1.1、SQLite archive SHA-256 `1e71ddf93849c6a6ecf58b827c0692073d2dd7ee40196158068f7b29f422e87d`；本地固定 QEMU v11.1.0 commit `84f07211cc5b4fc6a371559bf8a5de4fb068e648`。`make test-files-partial-write-riscv` 增加写回失败后再次标脏、写回进行中经第二个 VA 别名写入并再次同步落盘、共享 fork 元数据 OOM 扫描及固定替换失败仍保留别名/owner 的检查。`make test-diff-abi-riscv` 为 396 条一致；普通 WAL、files、userland、RISC-V 全套、栈、NBD host、lwext4 recovery、DELETE 正常与抽样矩阵和固定资料检查通过。228 项清单再次为 223/2/3，五个旧失败 ID 不变，suite identity SHA-256 `08bf67905816d479d251c9a55bf985b46dd5ef37c4f588207201d7c0e741ab82`；重建命令和完整来源见[程序清单](learning/user-program-inventory.md)。跨 hart 真实并发与实板持久性仍未验收。
 
 ### 后续推进顺序
 
@@ -38,7 +38,7 @@ WAL 断电与共享页故障阶段证据：`make test-sqlite-wal-recovery-riscv`
 | 已完成 | P1e 时间、P1f 统计 | utimensat/futimens、真实 statfs、原始静态/动态 entry 与 BusyBox pwd/cd/mv/touch 已通过 |
 | 已完成 | P2a 同 MM 非 PI robust-list | raw `exit`、exec、musl、差分及全量清单已验收；PI 仍后置，共享匿名跨 MM key 见 P4d |
 | 已完成 | P4a 共享匿名对象 | 专用稀疏对象、fork 双向可见、失败回滚和固定 Linux 差分已验证 |
-| 已接入 | P4b/P4c 共享文件页、脏页追踪、`msync` | inode 缓存页反向索引、首次写追踪、按范围同步、首批错误交错与 Linux 差分已接入；写回进行中修改、截断全矩阵和 SMP 发布仍待验证 |
+| 已接入 | P4b/P4c 共享文件页、脏页追踪、`msync` | inode 缓存页反向索引、首次写追踪、按范围同步、确定性写回交错与 Linux 差分已接入；截断全矩阵和 SMP 发布仍待验证 |
 | 已接入 | P4d 共享匿名 futex | 跨 MM WAIT/WAKE/REQUEUE、共享对象 pin 和私有 MM 单调身份号已实现；不同 VA 别名与共享文件后备 key 仍待实现 |
 | 已接入 | P4e 普通多进程 WAL | 固定 SQLite Unix VFS 的独立进程竞争、退出、重开、两次启动和 NBD 断电/故障矩阵已验收；实板持久性未覆盖 |
 | 持续支线 | P5a glibc 试跑、L0/L1 第二架构入口 | 可现在固定输入或调查边界，不以全量清单全绿为前提 |
@@ -239,7 +239,8 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 - [x] 同挂载/inode/文件 offset 的独立 open/mmap 指向同一文件页；普通 read/write 与映射读写三向可见。MAP_SHARED 首次写故障标记 inode 缓存脏页，写回前经页别名反向索引重新保护 PTE，generation 防止写回中重写被误清。
 - [x] 缓存页保留 clean/dirty/writeback 与 generation 状态；驻留共享 PTE 持物理引用并在缓存页中登记别名，回收不得驱逐仍映射的页。fd 关闭与路径删除不改变 inode 页身份。
 - [x] `msync` flush EIO 后可重试；成功写回重新保护共享别名，之后再写能重新标脏，驱逐缓存并重读仍是新值。共享 fork metadata OOM 与固定替换分配失败保留原别名，结束时引用回到基线。
-- [ ] 写回进行中再次修改及多别名回收资格的交错矩阵仍需单独验证；单 hart 同步写回期间不能把事后再次写入冒充并发写入。
+- [x] 测试专用 ext4 回调在旧值写入后、generation 比较前，通过另一个驻留共享 VA 写入新值；再次 `msync` 和驱逐重读证明新脏数据未被旧写回清除，两个别名及最终 OFD 回到基线。
+- [ ] 第二个 hart 的真实并发写入、跨核 TLB 与多别名回收资格仍由 P6 验证；单 hart 的确定性重入不替代它。
 - [x] 固定 Linux 同一 ELF 差分覆盖独立 open、多个 VA 别名、fork 后独立 MM、MAP_PRIVATE 隔离、共享页与普通读写可见性；SQLite WAL 子进程另经独立 open/mmap 使用共享索引。
 - [x] 注入 `msync` flush 失败返回 EIO，真实 OFD/mount 保留可重试状态；持映射/临时 pin 的缓存页不按无引用页驱逐。
 - [ ] 并发 miss/锁外 I/O 的跨核发布在 P6d 验收。

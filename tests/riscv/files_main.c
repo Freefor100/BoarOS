@@ -114,6 +114,11 @@ static unsigned int sync_flush_failures;
 static unsigned int time_write_failures;
 static unsigned int time_write_calls;
 static uint32_t time_clock_nanoseconds;
+static struct kernel_mm *writeback_redirty_mm;
+static uint64_t writeback_redirty_address;
+static enum kernel_uaccess_status writeback_redirty_status;
+static size_t writeback_redirty_copied;
+static unsigned int writeback_redirty_seen;
 
 static enum kernel_block_status sync_test_flush(void *context)
 {
@@ -182,7 +187,18 @@ int __wrap_ext4_fwrite(ext4_file *file,
     int result;
 
     if (!inject_partial_write_error) {
-        return __real_ext4_fwrite(file, buffer, size, bytes_written);
+        result = __real_ext4_fwrite(file, buffer, size, bytes_written);
+        if (writeback_redirty_mm != 0 && result == EOK &&
+            bytes_written != 0 && *bytes_written == size) {
+            struct kernel_mm *mm = writeback_redirty_mm;
+            unsigned char value = 'O';
+            writeback_redirty_mm = 0;
+            writeback_redirty_seen++;
+            writeback_redirty_status = kernel_copy_to_user(
+                mm, writeback_redirty_address, &value, 1U,
+                &writeback_redirty_copied);
+        }
+        return result;
     }
     inject_partial_write_error = 0;
     if (size < 5U) {
@@ -3577,16 +3593,41 @@ static void run_partial_write_test(const void *dtb)
             -KERNEL_EIO || sync_flush_failures != 0U ||
         kernel_mm_msync(&mm, shared_address, BOAROS_PAGE_SIZE, 4U) != 0)
         fail_files(430U, 0, -1);
-    /* The successful retry must re-protect the alias. A later write to the
-     * same PTE needs a new dirty generation and must survive cache eviction. */
+    uint64_t peer_address = 0;
+    if (kernel_files_pin(&files, 0, &mapping_pin, &result) !=
+            KERNEL_FILES_STATUS_OK || result != 0 ||
+        kernel_mm_mmap_file_private(&mm, &mapping_pin, TEST_MMAP_SECOND,
+            BOAROS_PAGE_SIZE, 0, KERNEL_MM_READ | KERNEL_MM_WRITE,
+            KERNEL_MM_MAP_FIXED_NOREPLACE | KERNEL_MM_MAP_SHARED,
+            &peer_address) != KERNEL_MM_STATUS_OK ||
+        mapping_pin != 0 || peer_address != TEST_MMAP_SECOND ||
+        kernel_mm_resolve_user_fault(&mm, peer_address,
+                                     KERNEL_MM_READ) != KERNEL_MM_STATUS_OK)
+        fail_files(442U, 0, result);
+    /* The successful retry must re-protect aliases. A later write to the
+     * first PTE needs a new dirty generation and must survive cache eviction. */
     mapped_value = 'N';
     unsigned char persisted_value = 0;
     size_t mapped_copied = 0;
     if (kernel_copy_to_user(&mm, shared_address, &mapped_value, 1U,
                             &mapped_copied) != KERNEL_UACCESS_STATUS_OK ||
-        mapped_copied != 1U ||
-        kernel_mm_msync(&mm, shared_address, BOAROS_PAGE_SIZE, 4U) != 0)
+        mapped_copied != 1U)
         fail_files(433U, 0, -1);
+    /* The ext4 write callback runs after the old contents were copied to
+     * the device, but before page-cache writeback compares generations. */
+    writeback_redirty_mm = &mm;
+    writeback_redirty_address = peer_address;
+    writeback_redirty_copied = 0U;
+    writeback_redirty_seen = 0U;
+    if (kernel_mm_msync(&mm, shared_address, BOAROS_PAGE_SIZE, 4U) != 0 ||
+        writeback_redirty_mm != 0 || writeback_redirty_seen != 1U ||
+        writeback_redirty_status != KERNEL_UACCESS_STATUS_OK ||
+        writeback_redirty_copied != 1U ||
+        kernel_mm_msync(&mm, shared_address, BOAROS_PAGE_SIZE, 4U) != 0)
+        fail_files(441U, 0, -1);
+    if (kernel_mm_munmap(&mm, peer_address, BOAROS_PAGE_SIZE) !=
+            KERNEL_MM_STATUS_OK)
+        fail_files(443U, 0, -1);
     /* Fork failure must neither untrack the resident shared alias nor
      * convert the parent's file page into a private COW page. */
     for (unsigned failure = 1U; ; failure++) {
@@ -3602,7 +3643,7 @@ static void run_partial_write_test(const void *dtb)
         }
         if (fork_status != KERNEL_MM_STATUS_NO_MEMORY ||
             !read_user_byte(&mm, shared_address, &persisted_value) ||
-            persisted_value != 'N')
+            persisted_value != 'O')
             fail_files(434U, KERNEL_MM_STATUS_NO_MEMORY, fork_status);
     }
     /* A failed fixed replacement must leave the resident file alias, its
@@ -3623,8 +3664,8 @@ static void run_partial_write_test(const void *dtb)
             KERNEL_MM_STATUS_OK ||
         retained_vma.kind != KERNEL_VMA_KIND_FILE_SHARED ||
         !read_user_byte(&mm, shared_address, &persisted_value) ||
-        persisted_value != 'N')
-        fail_files(436U, 'N', persisted_value);
+        persisted_value != 'O')
+        fail_files(436U, 'O', persisted_value);
     if (kernel_mm_munmap(&mm, shared_address, BOAROS_PAGE_SIZE) !=
             KERNEL_MM_STATUS_OK)
         fail_files(437U, 0, -1);
@@ -3638,8 +3679,8 @@ static void run_partial_write_test(const void *dtb)
     if (read_status != KERNEL_FILES_STATUS_OK || result != 1)
         fail_files(439U, 1, result);
     if (!read_user_bytes(&mm, TEST_USER_BUFFER, &persisted_value, 1U) ||
-        persisted_value != 'N')
-        fail_files(440U, 'N', persisted_value);
+        persisted_value != 'O')
+        fail_files(440U, 'O', persisted_value);
     device.block.flush = sync_original_flush;
 
     if (kernel_files_pin(&files, 0, &mapping_pin, &result) !=

@@ -135,7 +135,7 @@ RISC-V 创建先分配并解析记录页，最后才把 LIVE Sv39 空间移入�
 
 `FILE_SHARED` 的每个驻留 PTE 持缓存物理页引用，MM 持对应 OFD 来源引用；同一 inode 页在独立 open、独立 MM 和多个 VA 中维持同一数据源。MM 分配驻留记录后安装只读共享 PTE，再把记录挂入缓存页的反向索引；失败撤销 PTE，未发布的记录由 MM 回收。写故障在缓存项标记当前有效字节脏、推进 generation 后将本 PTE 升为可写。缓存写回前按反向索引重新保护别名，写回中再次写入会重新故障并改变 generation，旧写回不能清除新脏状态。MM 拥有记录，缓存借用链接，PTE 持物理页；fork 预留子记录并在页表共享成功后挂入索引，munmap/fixed replace/退出无分配地摘除。只读 fd 建立的共享 VMA 保存不可升级的写资格，`mprotect` 请求写返回 `EACCES`，合法权限变化重新建立首次写追踪。
 
-`make test-files-partial-write-riscv` 对共享映射注入 flush EIO、重试后再次写 fault、同步后驱逐并重读稳定数据；还扫描 fork metadata 分配失败、固定地址替换分配失败时保留原映射、别名和 OFD，最后检查页资源基线。该测试没有模拟同步写回进行中的第二个 hart 写入；SMP 发布与 TLB 协议仍由 P6 验证。
+`make test-files-partial-write-riscv` 对共享映射注入 flush EIO、重试后再次写 fault；在 ext4 写回已复制旧值、页缓存比较 generation 前，通过第二个驻留 VA 别名触发真实用户写 fault，下一次同步与驱逐重读必须看到新值。测试还扫描 fork metadata 分配失败、固定地址替换分配失败时保留原映射、别名和 OFD，最后检查页资源基线。该确定性交错仍在单 hart 上运行，第二个 hart 的真实并发、跨核 TLB 与发布协议由 P6 验证。
 
 `kernel_mm_msync()` 按固定 Linux `references/linux/mm/msync.c`（commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`）检查 flags、对齐和范围；长度零成功，空洞在处理已映射片段后返回 `ENOMEM`。`MS_SYNC` 对共享文件 VMA 的对应 inode 范围写回，再同步元数据并传递块 flush，错误沿 inode/OFD 序列传播；`MS_ASYNC` 不提交 I/O。映射保持 OFD/node 引用，所以关闭 fd 或 unlink 后仍能同步。
 
