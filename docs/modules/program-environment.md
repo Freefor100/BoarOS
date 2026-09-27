@@ -59,11 +59,13 @@ host 测试保护源版本拒绝、头文件身份变化、配置功能不被裁
 
 ## SQLite 回滚日志与 NBD 故障入口
 
-`references/sqlite/sqlite-amalgamation-3530400.zip` 是官方 SQLite 3.53.4 amalgamation，`references/sources.tsv` 固定下载 URL、2026-09-27 访问日期及 SHA-256 `1e71ddf93849c6a6ecf58b827c0692073d2dd7ee40196158068f7b29f422e87d`。构建直接解包到 `build/riscv/sqlite/`，不修改上游源码；复用 musl 1.2.5 工具链，保留线程支持、WAL 编译能力及原生 Unix VFS。测试实际检查版本、`THREADSAFE=1`、VFS 名和 `journal_mode=DELETE`、`locking_mode=NORMAL`、`mmap_size=0`、`synchronous=EXTRA/FULL` 返回值。静态与动态 CLI 的可执行文件由同一固定源码编译，正式负载只使用回滚日志模式。
+`references/sqlite/sqlite-amalgamation-3530400.zip` 是官方 SQLite 3.53.4 amalgamation，`references/sources.tsv` 固定下载 URL、2026-09-27 访问日期及 SHA-256 `1e71ddf93849c6a6ecf58b827c0692073d2dd7ee40196158068f7b29f422e87d`。构建直接解包到 `build/riscv/sqlite/`，不修改上游源码；复用 musl 1.2.5 工具链，保留线程支持、WAL 编译能力及原生 Unix VFS。回滚负载实际检查版本、`THREADSAFE=1`、VFS 名和 `journal_mode=DELETE`、`locking_mode=NORMAL`、`mmap_size=0`、`synchronous=EXTRA/FULL` 返回值。静态与动态 CLI 的可执行文件由同一固定源码编译。
 
 `make test-sqlite-rollback-riscv` 在真实 U-mode 覆盖建表、提交/回滚、独立进程 writer 冲突、未提交大事务进程直接退出后的同次启动 hot journal 恢复、关闭重开，以及两种 CLI 对同盘数据库的 `integrity_check`。`make test-sqlite-nbd-riscv` 把同一负载接入宿主 C NBD 服务。`make test-sqlite-recovery-riscv` 以同一静态 ELF 在固定 Linux `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 与 BoarOS 执行 setup/mutate/recover；BoarOS 的 `EXTRA`、`FULL`、热日志与已确认提交路径经 NBD 重启两次，并用 `e2fsck -fn` 核对 ext4。小缓存 24 行事务制造 journal spill；恢复程序逐字节检查每行值、整事务状态和 `integrity_check`。
 
-`tests/host/nbd_fault.c` 经 Unix socket 给 QEMU 提供 fixed-newstyle、simple replies 的 READ/WRITE/FLUSH/DISC，只宣告 `HAS_FLAGS|SEND_FLUSH`。`tests/host/block_fault.c` 是 512 字节原子写、易失可见内容、稳定镜像的真实故障模型；只有成功 FLUSH 承诺此前事件持久化。`make test-nbd-host` 检查握手、读写、写/flush 失败和丢失、部分保存、反序保存。`make test-sqlite-recovery-matrix-riscv` 使用串口与宿主信号握手，仅对 SQLite 事务内的 NBD 事件编号，逐个注入写/flush 错误和断电位置；断电先冻结服务，再杀 QEMU，从同一稳定初态恢复。2026-09-27 的小事务有 100 次写和 47 次 flush；441 个断电组合与逐位置 147 个写/flush 失败均通过。QEMU 基线为本地 `references/qemu/` commit `84f07211cc5b4fc6a371559bf8a5de4fb068e648`，执行环境为 QEMU 11.1.1。这些入口使用隔离镜像，成功后清理一次性目录；未确认提交只允许完整旧值或完整新值，已确认提交必须保留新值。测试不证明实板持久性或 WAL。
+`make test-sqlite-wal-riscv` 用同一静态 ELF、官方 Unix VFS、`journal_mode=WAL`、`locking_mode=NORMAL`、`mmap_size=0` 和 `synchronous=FULL` 分别在上述固定 Linux 与 BoarOS 启动两次。首次启动核对版本与 PRAGMA、独立进程 writer 竞争、先后提交及另一进程持有未提交事务直接退出；关闭重开与第二次启动都检查三条已提交记录、未提交记录缺席和 `integrity_check`。该入口证明普通多进程 WAL 的组合 ABI，不替代 NBD 断电故障矩阵或实板持久性验证。
+
+`tests/host/nbd_fault.c` 经 Unix socket 给 QEMU 提供 fixed-newstyle、simple replies 的 READ/WRITE/FLUSH/DISC，只宣告 `HAS_FLAGS|SEND_FLUSH`。`tests/host/block_fault.c` 是 512 字节原子写、易失可见内容、稳定镜像的真实故障模型；只有成功 FLUSH 承诺此前事件持久化。`make test-nbd-host` 检查握手、读写、写/flush 失败和丢失、部分保存、反序保存。`make test-sqlite-recovery-matrix-riscv` 使用串口与宿主信号握手，仅对 SQLite 事务内的 NBD 事件编号，逐个注入写/flush 错误和断电位置；断电先冻结服务，再杀 QEMU，从同一稳定初态恢复。2026-09-27 的小事务有 100 次写和 47 次 flush；441 个断电组合与逐位置 147 个写/flush 失败均通过。QEMU 基线为本地 `references/qemu/` commit `84f07211cc5b4fc6a371559bf8a5de4fb068e648`，执行环境为 QEMU 11.1.1。这些入口使用隔离镜像，成功后清理一次性目录；未确认提交只允许完整旧值或完整新值，已确认提交必须保留新值。这组 DELETE 回滚日志测试不证明实板持久性或 WAL 断电恢复。
 
 ## 双侧执行与失败所有权
 

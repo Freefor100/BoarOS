@@ -26,6 +26,8 @@ P4a 共享匿名阶段证据：`build/p4a-vma-final.log`（含 fork 当下的受
 
 P4d 共享匿名 futex 证据：`build/p4d-userland-final.log`（跨 MM 唤醒、隔离、同桶/跨桶 requeue，以及两个 MM 最后映射撤销后由等待者独持对象至超时）、`build/p4d-diff-final.log`（固定 Linux 同一 ELF 334 条一致）、`build/p4d-riscv-final.log` 与 `build/p4d-stack-final.log`（RISC-V 全套与栈检查）、`build/p4d-full-20260925/runs/suite.json`（228 项 223/2/3，逐项状态与 P4a 相同）。不同 VA 别名和跨 MM 信号交错仍待验证。
 
+P4b/c 与普通 WAL 阶段证据：`make test-diff-abi-riscv` 在固定 Linux/BoarOS 同一 ELF 的 388 条记录一致，覆盖共享别名、mprotect、fork、截断/O_TRUNC SIGBUS、尾页扩展与 `msync`；`make test-files-partial-write-riscv` 覆盖共享 fault 元数据 OOM 回滚与 `msync` flush EIO 重试；`make test-sqlite-wal-riscv` 在两侧以固定 SQLite Unix VFS 验证独立进程 writer 竞争、未提交退出与第二次启动。既有 SQLite DELETE 回滚日志的 441 次断电、100 次写失败和 47 次 flush 失败矩阵、RISC-V 全套、userland、lwext4 恢复与栈检查通过。228 项清单仍为 223/2/3，五个旧失败 ID 不变；输入身份和重建命令见[程序清单](learning/user-program-inventory.md)。共享文件故障交错与 WAL 存储断电矩阵未完成。
+
 ### 后续推进顺序
 
 | 顺序 | 任务 | 开始条件 / 独立成果 |
@@ -33,12 +35,13 @@ P4d 共享匿名 futex 证据：`build/p4d-userland-final.log`（跨 MM 唤醒�
 | 已完成 | P1d cwd/dirfd、P1g rename 子集 | 共享活目录项、cwd/dirfd、普通/NOREPLACE rename 已接入日志与 orphan |
 | 已完成 | P1e 时间、P1f 统计 | utimensat/futimens、真实 statfs、原始静态/动态 entry 与 BusyBox pwd/cd/mv/touch 已通过 |
 | 已完成 | P2a 同 MM 非 PI robust-list | raw `exit`、exec、musl、差分及全量清单已验收；PI 仍后置，共享匿名跨 MM key 见 P4d |
-| 已完成 | P4a 共享匿名对象 | 专用稀疏对象、fork 双向可见、失败回滚和固定 Linux 差分已验证；不包括共享文件页或跨 MM futex |
-| 已接入 | P4d 共享匿名 futex | 跨 MM WAIT/WAKE/REQUEUE、共享对象 pin 和私有 MM 单调身份号已实现；不同 VA 别名与共享文件后备仍待其映射接口 |
-| 下一阶段 | P4b/P4c 共享文件页、脏页追踪、`msync`；P0c 取消异常调查持续 | SQLite 普通多进程 WAL 在文件共享映射后单独验收；历史取消异常本轮 30 轮/版本未复现 |
+| 已完成 | P4a 共享匿名对象 | 专用稀疏对象、fork 双向可见、失败回滚和固定 Linux 差分已验证 |
+| 已接入 | P4b/P4c 共享文件页、脏页追踪、`msync` | inode 缓存页反向索引、首次写追踪、按范围同步与 Linux 差分已接入；错误交错、截断全矩阵和 SMP 发布仍待验证 |
+| 已接入 | P4d 共享匿名 futex | 跨 MM WAIT/WAKE/REQUEUE、共享对象 pin 和私有 MM 单调身份号已实现；不同 VA 别名与共享文件后备 key 仍待实现 |
+| 已接入 | P4e 普通多进程 WAL | 固定 SQLite Unix VFS 的独立进程竞争、退出、重开和两次启动已验收；存储断电矩阵未覆盖 |
 | 持续支线 | P5a glibc 试跑、L0/L1 第二架构入口 | 可现在固定输入或调查边界，不以全量清单全绿为前提 |
-| 已接入 | P3c/e 记录锁与 SQLite DELETE 回滚日志 | 真实 U-mode、固定 Linux、NBD 断电/故障入口分开验收；不宣称 WAL 或实板持久性 |
-| 后续 | N socket、P4 文件共享与普通多进程 WAL、P6 SMP | 按下述具体依赖进入，不按测试名称排接口 |
+| 已接入 | P3c/e 记录锁与 SQLite DELETE 回滚日志 | 真实 U-mode、固定 Linux、NBD 断电/故障入口分开验收；不宣称实板持久性 |
+| 后续 | P0c 时序根因、N socket、P4 余项、P6 SMP | 按下述具体依赖进入，不按测试名称排接口 |
 
 ### 主要依赖
 
@@ -214,7 +217,7 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 
 - [x] 官方 SQLite 3.53.4 amalgamation 固定 URL/SHA-256，原生 Unix VFS 和线程/WAL 编译能力保留；启动核对版本、`THREADSAFE=1`、`DELETE/NORMAL/mmap_size=0` 与 EXTRA/FULL 实际 PRAGMA 值。
 - [x] 静态/动态 CLI、建表、提交/回滚、多连接及独立进程 writer 冲突、未提交事务的进程直接退出与同次启动 hot journal 恢复、关闭重开和 `integrity_check` 在真实 U-mode 通过；同一恢复 ELF 的 setup/mutate/recover 也在固定 Linux 执行。
-- [x] NBD 服务在宿主协议测试和 QEMU 接入通过；EXTRA/FULL 正常事务、FULL 写/flush 错误传播、热日志和已确认提交后的两次重启恢复通过，逐字节检查整事务与 ext4。小事务逐事件矩阵完成 441 次断电、100 次写失败、47 次 flush 失败；普通多进程 WAL 留到 P4 文件共享映射后验证，不以共享文件 futex 为统一前置。
+- [x] NBD 服务在宿主协议测试和 QEMU 接入通过；EXTRA/FULL 正常事务、FULL 写/flush 错误传播、热日志和已确认提交后的两次重启恢复通过，逐字节检查整事务与 ext4。小事务逐事件矩阵完成 441 次断电、100 次写失败、47 次 flush 失败；普通多进程 WAL 后续在 P4 另行验证，不以共享文件 futex 为统一前置。
 
 **验证与退出**：`make test-record-lock-host test-record-lock-riscv test-diff-abi-riscv test-nbd-host test-sqlite-rollback-riscv test-sqlite-nbd-riscv test-sqlite-recovery-riscv test-sqlite-recovery-matrix-riscv` 分别覆盖模块、Linux 差分、正常运行与恢复；既有 files/userland/lwext4/栈/RISC-V 全套与 228 项清单已重跑，清单仍为 223/2/3 且失败 ID 不变。WAL 与实板持久性不计入本阶段。
 
@@ -231,30 +234,34 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 
 ### P4b 共享文件页与权威数据源
 
-- [ ] 同挂载/inode/文件 offset 的独立 open/mmap 指向同一文件页；普通 read/write 与映射读写三向可见。普通 read/write/private fault 已统一缓存；仍需建立 MAP_SHARED 可写 PTE 的脏标记和回写协议。
-- [ ] 定义 clean/dirty/writeback/error、写回中再次修改、pin/映射引用和回收资格；文件页 identity 不随 fd 关闭或路径删除而改变。
-- [ ] 两个独立 MM、两个独立 open、多个 VA 别名组合验收；MAP_PRIVATE 写不得污染共享页，共享页修改及普通写的可见性按固定 Linux 声明范围核对。
-- [ ] 写回失败由仍存活的文件/mount owner 保存并传播；页被映射/pin 时不能按普通无引用缓存驱逐。并发 miss/锁外 I/O 的跨核发布在 P6d 验收。
+- [x] 同挂载/inode/文件 offset 的独立 open/mmap 指向同一文件页；普通 read/write 与映射读写三向可见。MAP_SHARED 首次写故障标记 inode 缓存脏页，写回前经页别名反向索引重新保护 PTE，generation 防止写回中重写被误清。
+- [x] 缓存页保留 clean/dirty/writeback 与 generation 状态；驻留共享 PTE 持物理引用并在缓存页中登记别名，回收不得驱逐仍映射的页。fd 关闭与路径删除不改变 inode 页身份。
+- [ ] 写回中再次修改、错误传播与回收资格的故障交错矩阵仍需单独验证。
+- [x] 固定 Linux 同一 ELF 差分覆盖独立 open、多个 VA 别名、fork 后独立 MM、MAP_PRIVATE 隔离、共享页与普通读写可见性；SQLite WAL 子进程另经独立 open/mmap 使用共享索引。
+- [x] 注入 `msync` flush 失败返回 EIO，真实 OFD/mount 保留可重试状态；持映射/临时 pin 的缓存页不按无引用页驱逐。
+- [ ] 并发 miss/锁外 I/O 的跨核发布在 P6d 验收。
 
 ### P4c 截断与 msync
 
-- [ ] 对跨 MM 的 EOF 越界整页撤映射并产生规定 fault；非对齐尾页、私有修改、先缩后扩、O_TRUNC 分开测试，保持已有 private COW/PROT_NONE 截断回归。
-- [ ] 关闭 fd 后映射仍活、unlink 后仍能访问、退出/固定替换中途失败均持有正确文件/对象引用；不能借用已经回收的 OFD/node。
-- [ ] `msync(MS_SYNC)` 走真实 dirty→写回→同步与错误传播，不能只失效缓存；其他 flags/地址/区间边界按固定契约支持或明确拒绝。
+- [x] 已驻留页跨 fork 后在另一 MM 中截断仍撤映射，越 EOF 再访问产生 SIGBUS；`O_TRUNC`、非对齐尾页、先缩后扩与普通写跨 EOF 空隙由固定 Linux 差分验证。
+- [ ] 私有修改及截断故障交错仍需补充聚焦验收，并保持已有 private COW/PROT_NONE 截断回归。
+- [x] 关闭 fd 后映射仍活、unlink 后仍能访问，由持有 OFD 的 MM 来源维持 node 生命周期。
+- [ ] 退出/固定替换中途失败的共享文件别名与 OFD 回收仍需故障注入验收。
+- [x] `msync(MS_SYNC)` 走真实 dirty→写回→同步与错误传播，不能只失效缓存；`MS_ASYNC`、`MS_INVALIDATE`、对齐、空区间、空洞和互斥 flags 经固定 Linux 同一 ELF 差分，注入 flush EIO 后可重试。
 
 ### P4d 共享 futex
 
-- [x] private key 使用单调且不复用的 MM 身份号与虚拟地址；共享匿名 key 由稳定对象身份与连续字节偏移派生，不依赖物理页地址。非 private 操作解析用户映射并在坏页返回 EFAULT；共享文件映射及其 futex 仍待 P4b。
+- [x] private key 使用单调且不复用的 MM 身份号与虚拟地址；共享匿名 key 由稳定对象身份与连续字节偏移派生，不依赖物理页地址。非 private 操作解析用户映射并在坏页返回 EFAULT；共享文件 futex key 仍待实现。
 - [x] WAIT 登记、WAKE 和 REQUEUE 持有共享匿名对象引用；unmap/最后映射消失与等待者恢复不会悬空或重用旧 key。fd 后备尚未接入。
-- [ ] 跨 fork 的独立 MM 共享唤醒、不同对象同 VA 隔离、共享→私有 requeue、同对象不同偏移的同桶/跨桶迁移，以及最后映射撤销后的等待超时已有真实 U-mode 验证；基础唤醒、requeue 和坏地址另有固定 Linux 差分。不同 VA 别名需 mremap 或共享文件映射提供构造路径，跨 MM 信号交错仍需聚焦验证。单 hart 先通过，跨核原子比较/登记属于 P6。
+- [ ] 跨 fork 的独立 MM 共享唤醒、不同对象同 VA 隔离、共享→私有 requeue、同对象不同偏移的同桶/跨桶迁移，以及最后映射撤销后的等待超时已有真实 U-mode 验证；基础唤醒、requeue 和坏地址另有固定 Linux 差分。共享文件映射现已提供不同 VA 别名的构造路径，但共享文件 futex key 和跨 MM 信号交错仍需聚焦验证。单 hart 先通过，跨核原子比较/登记属于 P6。
 
 ### P4e mremap、madvise 与 WAL
 
 - [ ] 对象生命周期稳定后实现 mremap，覆盖移动/增长/收缩、旧/新地址失败原子性、共享身份和 AS/DATA 记账；不复制成意外私有对象。
 - [ ] madvise 按真实消费者逐项增加；DONTNEED 区分 private/shared/file，已丢弃的私有内容不能再次读出，错误不能成功空返回。
-- [ ] SQLite 普通多进程 WAL 验证共享索引、锁、并发连接、异常终止和恢复；保留 P3 回滚日志基线，失败精确分到共享页/锁/同步。
+- [x] SQLite 普通多进程 WAL 使用固定 3.53.4 原生 Unix VFS，在同一 ELF 的固定 Linux/BoarOS 双侧运行独立进程 writer 竞争、已提交/未提交事务、进程直接退出、重开与第二次启动恢复及 `integrity_check`；P3 回滚日志基线继续保留。WAL 的存储断电矩阵仍须单独验证。
 
-**验证与退出**：P4a 已由 `test-vma-riscv`、真实 U-mode 的 `tests/userland/shared_mapping.h`、`tests/diff-abi/shared_mapping.c` 验证。P4d 基础路径由 `tests/userland/shared_futex.h`、`tests/diff-abi/futex_shared.c` 与 `tests/riscv/mm_cases.c` 验证；不同 VA 别名及交错矩阵仍按上一条跟踪。共享文件页、共享 futex 分别收口，不合成一个笼统的“MAP_SHARED 已支持”。
+**验证与退出**：P4a 已由 `test-vma-riscv`、真实 U-mode 的 `tests/userland/shared_mapping.h`、`tests/diff-abi/shared_mapping.c` 验证。P4b/P4c 的共享页别名、权限、fork、截断尾页、unlink、`msync` 参数及普通写扩展由 `make test-diff-abi-riscv` 双侧验证；普通 WAL 与重启由 `make test-sqlite-wal-riscv` 验证。P4d 基础路径由 `tests/userland/shared_futex.h`、`tests/diff-abi/futex_shared.c` 与 `tests/riscv/mm_cases.c` 验证；不同 VA 别名及交错矩阵仍按上一条跟踪。共享文件页的错误注入与 WAL 断电矩阵未收口；共享文件 futex 分开跟踪。
 
 ## P5：glibc、exec 与单核真实工具链
 

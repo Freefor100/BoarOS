@@ -32,6 +32,8 @@ python3 tests/program-inventory/run.py --output build/p4d-full-20260925
 
 2026-09-27 记录锁与 SQLite 回滚日志阶段执行 `make inventory-userland-riscv`，`build/program-inventory-full/runs/suite.json` 再次为 `status=complete`，228 项中 223 pass、2 nonzero-exit、3 upstream-failure。五个失败 ID 精确为 `libc.static.socket`、`libc.dynamic.socket`、`libc.official.static`、`libc.official.dynamic`、`busybox.official`，与上次相同；其余 223 项均 pass，因此无旧通过项回退。该次 BoarOS 内核 SHA-256 为 `64c0a0f474af11da8824530d080e25d44493ba2f7542bfa40d68bbcf9f398084`，固定 Linux Image 为 `7ca338ec75e681cc68c5d946b3ae633fc0088fd78569b7847528105a9de6c8ec`，suite identity SHA-256 为 `723ad726ff2dfbf57c7a6f0641ad908a5b372349b1e6ef0b3ec3311f4d8f2631`。镜像与逐项日志在核对后按 `make prune-build` 清理，命令和身份留在此处重建。
 
+2026-09-27 共享文件映射、`msync` 与普通 WAL 阶段通过 `python3 tests/program-inventory/run.py --reuse-builds --output build/p4bc-wal-20260927` 重跑 228 项，`status=complete`：223 pass、2 nonzero-exit、3 upstream-failure；失败 ID 与上段完全相同，无旧通过项回退。BoarOS 内核 SHA-256 为 `456c9a3ec7f3a7ab372ec53d364899100975fabf1fb6fec4e69582c3a50f0783`，固定 Linux Image 为 `7ca338ec75e681cc68c5d946b3ae633fc0088fd78569b7847528105a9de6c8ec`，suite identity SHA-256 为 `2ba9c58221458f62b56de468b8fca6c17489ea39e5d0333bb2e21e1d6acc619c`。另用 `make test-diff-abi-riscv test-sqlite-wal-riscv` 重建 388 条固定 Linux 差分与同一 ELF 双侧 WAL 两次启动；WAL ELF SHA-256 `93ce05060ea2f64cf11c5aed00e2b5a8315eda609fec8267119a88df0b5ca6fe`，官方 SQLite 3.53.4 archive SHA-256 `1e71ddf93849c6a6ecf58b827c0692073d2dd7ee40196158068f7b29f422e87d`，实际 QEMU 为 11.1.1。WAL 存储断电矩阵尚未运行，不能由回滚日志 NBD 结果推断其持久性。完整逐项输入哈希和执行命令在运行时由 `suite.json` 生成，核对后按 `make prune-build` 清理。
+
 | 范围 | Linux | BoarOS |
 |---|---:|---:|
 | 顶层案例 | 228 项满足契约 | 223 项退出/完整输出双侧一致；2 项直接失败；3 项包装失败 |

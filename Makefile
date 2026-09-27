@@ -933,6 +933,7 @@ SQLITE_CLI_STATIC_RV := $(BUILD_DIR)/tests/user/sqlite3-static-rv
 SQLITE_CLI_DYNAMIC_RV := $(BUILD_DIR)/tests/user/sqlite3-dynamic-rv
 SQLITE_CLI_INIT_RV := $(BUILD_DIR)/tests/user/sqlite-cli-init-rv
 SQLITE_RECOVERY_RV := $(BUILD_DIR)/tests/user/sqlite-recovery-rv
+SQLITE_WAL_RV := $(BUILD_DIR)/tests/user/sqlite-wal-rv
 LOCK_LIFECYCLE_RV := $(BUILD_DIR)/tests/user/record-lock-lifecycle-rv
 
 $(SQLITE_SOURCE): $(SQLITE_ARCHIVE)
@@ -965,6 +966,17 @@ $(SQLITE_RECOVERY_RV): tests/workloads/sqlite/recovery.c $(SQLITE_SOURCE) $(MUSL
 	@mkdir -p $(dir $@)
 	$(MUSL_ROOT)/bin/musl-gcc $(MUSL_GCC_FLAGS) -static -O2 -pthread \
 		-I$(dir $(SQLITE_SOURCE)) -o $@ $< $(SQLITE_SOURCE) -ldl
+
+$(SQLITE_WAL_RV): tests/workloads/sqlite/wal.c $(SQLITE_SOURCE) $(MUSL_STAMP)
+	@mkdir -p $(dir $@)
+	$(MUSL_ROOT)/bin/musl-gcc $(MUSL_GCC_FLAGS) -static -O2 -pthread \
+		-I$(dir $(SQLITE_SOURCE)) -o $@ $< $(SQLITE_SOURCE) -ldl
+
+.PHONY: test-sqlite-wal-riscv
+test-sqlite-wal-riscv: $(SQLITE_WAL_RV) $(KERNEL_RV)
+	PYTHONDONTWRITEBYTECODE=1 python3 tests/sqlite-wal-riscv.py \
+		--kernel $(KERNEL_RV) --program $(SQLITE_WAL_RV) \
+		--qemu $(QEMU_RISCV64)
 
 $(LOCK_LIFECYCLE_RV): tests/workloads/locks/lifecycle.c $(MUSL_STAMP)
 	@mkdir -p $(dir $@)
