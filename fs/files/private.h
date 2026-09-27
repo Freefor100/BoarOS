@@ -7,6 +7,7 @@
 #include <stdint.h>
 
 struct kernel_pipe;
+struct kernel_record_lock;
 struct kernel_vfs_path;
 int kernel_files_path_start(struct kernel_files *files,
                             const struct kernel_fs_context *fs,
@@ -30,6 +31,7 @@ struct kernel_file_slot {
 struct kernel_files_record {
     struct kernel_file_slot *slots;
     struct kernel_open_file_description *cleanup_files;
+    struct kernel_record_lock *record_locks;
     struct kernel_files_statistics statistics;
     uint32_t references;
     uint32_t next_fd;

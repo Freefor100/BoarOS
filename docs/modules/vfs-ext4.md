@@ -18,6 +18,8 @@
 
 VFS 以挂载实例与 ext4 inode 为活节点身份，普通文件、目录和字符节点都持有引用计数 node；路径对象另持有父目录项身份和一份活 inode 引用。独立 open file description 各自保存 offset，但同一 inode 指向共享 node。文件大小通过 `kernel_vfs_file_size()` 实时查询所属 node 的实时大小，确保写入或截断后各共享描述符观察到一致的文件长度。
 
+活 node 还嵌入记录锁区间树与等待队列，因此独立 open 必须在同一 inode 上冲突；unlink 后仍打开的旧 inode 保持原锁身份，同名重建使用新 inode 和新锁状态。末节点释放要求树与等待队列都为空；锁 owner、close/退出释放与阻塞 pin 契约见[文件资源模块](kernel-files.md)。该状态属于单 hart 临界区，不代表已经具备跨核并发锁。
+
 根启动建立一个挂载共享的 4 KiB 页缓存，键为 `(node, page_index)`：开放寻址哈希提供平均常数时间查找，双向 LRU 维护回收次序。缓存项持有 node 引用和一份物理页引用；命中时再给调用者一份临时引用，因此 `read`、不同 fd 和 file-private mmap 可以安全共享同一页。
 
 普通写把已复制的字节写入同一缓存页并更新 node 的逻辑大小；不同 fd、VFS pread、ELF 读源与私有映射缺页立即看到该内容。缓存项按 inode 另建双向链表，写回和显式失效只遍历该 inode 的页面，成本为 O(目标 inode 缓存页数)。每项保留脏范围、修改代次与 writeback 状态；写回固定页面，只有完整提交且代次未变才清脏。失败保留缓存页/node owner，并记录 inode 的错误序列。lwext4 非 journal 写入/截断用操作范围固定本次修改的缓冲，建立完整的分配所有权后才提交该集合；不会全量 drain 历史 dirty list。底层最后引用的 flush 错误显式返回，失败缓冲仍在 mount dirty list。最后一个 fd 关闭不释放仍有脏页的 inode。

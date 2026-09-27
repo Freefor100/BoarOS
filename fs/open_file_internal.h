@@ -6,6 +6,7 @@
 
 struct kernel_epoll;
 struct kernel_epoll_item;
+struct kernel_record_lock;
 
 struct kernel_open_file_description {
     struct kernel_vfs_file file;
@@ -22,6 +23,7 @@ struct kernel_open_file_description {
     uint8_t pipe_endpoint_closed;
     struct kernel_epoll *epoll;
     struct kernel_epoll_item *ep_items;
+    struct kernel_record_lock *record_locks;
 };
 
 enum kernel_open_file_status kernel_open_file_create_pipe(

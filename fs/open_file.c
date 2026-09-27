@@ -1,4 +1,5 @@
 #include "open_file_internal.h"
+#include "record_lock.h"
 #include "pipe_internal.h"
 #include "vfs_internal.h"
 #include "files/epoll_internal.h"
@@ -15,6 +16,15 @@
 
 static int open_file_live(
     const struct kernel_open_file_description *file);
+
+static void release_record_locks(struct kernel_open_file_description *file)
+{
+    if (!file->record_locks) return;
+    struct kernel_vfs_node *node = kernel_open_file_node(file);
+    if (!node) __builtin_trap();
+    kernel_record_lock_release(kernel_vfs_node_record_locks(node),
+                               &file->record_locks, file->heap);
+}
 
 static enum kernel_open_file_status create_open_file(
     struct kernel_heap *heap,
@@ -386,6 +396,7 @@ enum kernel_open_file_status kernel_open_file_release(
         return KERNEL_OPEN_FILE_STATUS_OK;
     }
     if (file->references == 1U) {
+        release_record_locks(file);
         file->references = 0U;
     }
     if (file->ep_items != 0) {
@@ -446,6 +457,7 @@ enum kernel_open_file_status kernel_open_file_detach(
     if (file->kind == KERNEL_OPEN_FILE_KIND_PIPE && file->references == 1U) {
         return kernel_open_file_release(owner);
     }
+    if (file->references == 1U) release_record_locks(file);
     file->references--;
     if (file->references != 0U) {
         *owner = 0;

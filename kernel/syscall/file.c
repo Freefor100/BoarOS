@@ -588,6 +588,7 @@ enum kernel_syscall_status syscall_handle_fcntl(
     struct kernel_syscall_result *decoded)
 {
     struct kernel_files *files;
+    struct kernel_mm *mm;
     int64_t linux_result;
     enum kernel_task_status task_status;
 
@@ -597,8 +598,21 @@ enum kernel_syscall_status syscall_handle_fcntl(
         decoded->value = -KERNEL_EBADF;
         return KERNEL_SYSCALL_STATUS_OK;
     }
-    if (task_status != KERNEL_TASK_STATUS_OK ||
-        kernel_files_fcntl(files,
+    if (task_status != KERNEL_TASK_STATUS_OK) {
+        return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    }
+    if (request->arguments[1] == KERNEL_FILES_F_GETLK ||
+        request->arguments[1] == KERNEL_FILES_F_SETLK ||
+        request->arguments[1] == KERNEL_FILES_F_SETLKW ||
+        request->arguments[1] == KERNEL_FILES_F_OFD_GETLK ||
+        request->arguments[1] == KERNEL_FILES_F_OFD_SETLK ||
+        request->arguments[1] == KERNEL_FILES_F_OFD_SETLKW) {
+        if (kernel_task_mm_borrow_mutable(caller, &mm) != KERNEL_TASK_STATUS_OK ||
+            kernel_files_fcntl_lock(files, mm, caller,
+                        (int64_t)request->arguments[0], request->arguments[1],
+                        request->arguments[2], &linux_result) != KERNEL_FILES_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    } else if (kernel_files_fcntl(files,
                            (int64_t)request->arguments[0],
                            request->arguments[1],
                            request->arguments[2],

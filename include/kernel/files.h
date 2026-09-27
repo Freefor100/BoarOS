@@ -57,6 +57,12 @@ struct kernel_files_statistics {
 #define KERNEL_FILES_F_SETFD UINT64_C(2)
 #define KERNEL_FILES_F_GETFL UINT64_C(3)
 #define KERNEL_FILES_F_SETFL UINT64_C(4)
+#define KERNEL_FILES_F_GETLK UINT64_C(5)
+#define KERNEL_FILES_F_SETLK UINT64_C(6)
+#define KERNEL_FILES_F_SETLKW UINT64_C(7)
+#define KERNEL_FILES_F_OFD_GETLK UINT64_C(36)
+#define KERNEL_FILES_F_OFD_SETLK UINT64_C(37)
+#define KERNEL_FILES_F_OFD_SETLKW UINT64_C(38)
 #define KERNEL_FILES_F_DUPFD_CLOEXEC UINT64_C(1030)
 #define KERNEL_FILES_O_APPEND UINT64_C(00002000)
 #define KERNEL_FILES_O_DSYNC UINT64_C(00010000)
@@ -345,6 +351,11 @@ enum kernel_files_status kernel_files_fcntl(
     uint64_t command,
     uint64_t argument,
     int64_t *linux_result);
+
+enum kernel_files_status kernel_files_fcntl_lock(
+    struct kernel_files *files, struct kernel_mm *mm,
+    struct kernel_task *task, int64_t fd, uint64_t command,
+    uint64_t user_flock, int64_t *linux_result);
 
 enum kernel_files_status kernel_files_ioctl(
     struct kernel_files *files,

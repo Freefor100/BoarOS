@@ -115,6 +115,7 @@ C_SOURCES := \
 	arch/riscv/virtio_mmio_block.c \
 	fs/lwext4_port.c \
 	fs/files/table.c \
+	fs/files/locks.c \
 	fs/files/io.c \
 	fs/files/path.c \
 	fs/files/metadata.c \
@@ -124,6 +125,7 @@ C_SOURCES := \
 	fs/fs_context.c \
 	fs/open_file.c \
 	fs/pipe.c \
+	fs/record_lock.c \
 	fs/page_cache.c \
 	fs/vfs.c \
 	kernel/boot_memory.c \
@@ -182,6 +184,7 @@ TEST_RUNTIME_C_SOURCES := \
 	arch/riscv/virt_uart.c \
 	arch/riscv/virtio_mmio_block.c \
 	fs/files/table.c \
+	fs/files/locks.c \
 	fs/files/io.c \
 	fs/files/path.c \
 	fs/files/metadata.c \
@@ -192,6 +195,7 @@ TEST_RUNTIME_C_SOURCES := \
 	fs/lwext4_port.c \
 	fs/open_file.c \
 	fs/pipe.c \
+	fs/record_lock.c \
 	fs/page_cache.c \
 	fs/vfs.c \
 	kernel/block.c \
@@ -1160,3 +1164,16 @@ test-record-lock-host:
 	mkdir -p build/host
 	cc -std=c11 -Wall -Wextra -Werror -idirafter include tests/host/record_lock_test.c -o build/host/record-lock
 	build/host/record-lock
+
+
+LOCK_LIFECYCLE_RV := $(BUILD_DIR)/tests/user/record-lock-lifecycle-rv
+
+$(LOCK_LIFECYCLE_RV): tests/workloads/locks/lifecycle.c $(MUSL_STAMP)
+	@mkdir -p $(dir $@)
+	$(MUSL_ROOT)/bin/musl-gcc $(MUSL_GCC_FLAGS) -static -O2 -pthread -o $@ $<
+
+.PHONY: test-record-lock-riscv
+test-record-lock-riscv: $(LOCK_LIFECYCLE_RV) $(KERNEL_RV)
+	PYTHONDONTWRITEBYTECODE=1 python3 tests/record-lock-riscv.py \
+		--kernel $(KERNEL_RV) --program $(LOCK_LIFECYCLE_RV) \
+		--qemu $(QEMU_RISCV64)

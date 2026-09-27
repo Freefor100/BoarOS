@@ -1,5 +1,6 @@
 #include "lwext4_port.h"
 #include "vfs_internal.h"
+#include "record_lock.h"
 
 #include <kernel/block.h>
 #include <kernel/errno.h>
@@ -122,6 +123,7 @@ struct kernel_vfs_node {
     struct kernel_vfs_node *next;
     struct kernel_page_cache_entry *cache_pages;
     struct kernel_file_mapping *mappings;
+    struct kernel_record_lock_state record_locks;
     struct lwext4_mount_adapter *adapter;
     struct kernel_vfs_mount *mount;
     ext4_file file;
@@ -1148,6 +1150,7 @@ static int vfs_open_raw(struct kernel_vfs_mount *mount,
         node->size = ext4_fsize(&node->file);
         node->mode = mode;
         node->references = 1U;
+        kernel_record_lock_state_init(&node->record_locks);
         node->open_files = 1U;
         node->write_openers = 0U;
         node->exec_users = 0U;
@@ -1342,6 +1345,7 @@ static int vfs_create_raw(struct kernel_vfs_mount *mount,
         node->size = ext4_fsize(&node->file);
         node->mode = (mode & 07777U) | KERNEL_VFS_S_IFREG;
         node->references = 1U;
+        kernel_record_lock_state_init(&node->record_locks);
         node->open_files = 1U;
         node->write_openers = 0U;
         node->exec_users = 0U;
@@ -2509,6 +2513,12 @@ struct kernel_vfs_node *kernel_vfs_file_node(
     return file->private_data;
 }
 
+struct kernel_record_lock_state *kernel_vfs_node_record_locks(
+    struct kernel_vfs_node *node)
+{
+    return node ? &node->record_locks : 0;
+}
+
 int kernel_vfs_node_acquire(struct kernel_vfs_node *node)
 {
     if (node == 0 || node->references == 0U || node->closed ||
@@ -2557,6 +2567,8 @@ int kernel_vfs_node_release(struct kernel_vfs_node **owner)
     }
     if (node->references == 1U) {
         if (node->mappings != 0) __builtin_trap();
+        if (!kernel_record_lock_state_empty(&node->record_locks))
+            __builtin_trap();
         node->references = 0U;
         link = &node->adapter->nodes;
         while (*link != 0 && *link != node) {

@@ -9,9 +9,12 @@ struct kernel_page_cache_entry;
 struct kernel_vfs_file;
 struct kernel_vfs_mount;
 struct kernel_vfs_node;
+struct kernel_record_lock_state;
 
 struct kernel_vfs_node *kernel_vfs_file_node(
     const struct kernel_vfs_file *file);
+struct kernel_record_lock_state *kernel_vfs_node_record_locks(
+    struct kernel_vfs_node *node);
 
 int kernel_vfs_node_acquire(struct kernel_vfs_node *node);
 int kernel_vfs_node_release(struct kernel_vfs_node **owner);

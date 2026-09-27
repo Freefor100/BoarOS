@@ -1,6 +1,8 @@
 #include "private.h"
 #include "../open_file_internal.h"
 #include "../pipe_internal.h"
+#include "../record_lock.h"
+#include "../vfs_internal.h"
 
 #include <kernel/errno.h>
 #include <kernel/heap.h>
@@ -485,6 +487,11 @@ static enum kernel_files_status detach_fd(struct kernel_files *files,
         return KERNEL_FILES_STATUS_STATE;
     }
     description = slot->description;
+    struct kernel_vfs_node *node = kernel_open_file_node(description);
+    if (node && files->record->record_locks)
+        kernel_record_lock_release(kernel_vfs_node_record_locks(node),
+                                   &files->record->record_locks,
+                                   files->heap);
     status = kernel_open_file_detach(&description);
     if (status == KERNEL_OPEN_FILE_STATUS_CLEANUP_REQUIRED) {
         if (description == 0) {
@@ -535,6 +542,11 @@ static enum kernel_files_status close_fd(struct kernel_files *files,
         files->record->next_fd = fd;
     }
 
+    struct kernel_vfs_node *node = kernel_open_file_node(description);
+    if (node && files->record->record_locks)
+        kernel_record_lock_release(kernel_vfs_node_record_locks(node),
+                                   &files->record->record_locks,
+                                   files->heap);
     open_status = kernel_open_file_detach(&description);
     if (open_status == KERNEL_OPEN_FILE_STATUS_OK) {
         return KERNEL_FILES_STATUS_OK;

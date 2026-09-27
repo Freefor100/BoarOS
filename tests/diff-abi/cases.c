@@ -182,10 +182,18 @@ void abi_main(const unsigned long *initial_stack)
                argument[index] == identity_marker[index]) ++index;
         if (!identity_marker[index] && !argument[index])
             abi_exit(root_identity() ? 0 : 92);
+        static const char lock_marker[] = "lock-exec-";
+        index = 0;
+        while (lock_marker[index] &&
+               argument[index] == lock_marker[index]) ++index;
+        if (!lock_marker[index] && argument[index] >= '0' &&
+            argument[index] <= '3' && !argument[index + 1])
+            abi_file_lock_exec_probe((unsigned)(argument[index] - '0'));
     }
     text("ABI BEGIN 1"); flush();
     mode_cases(); sparse_cases(); abi_shared_mapping_cases();
     abi_futex_shared_cases();
+    abi_file_lock_cases();
     partial_cases(); abi_truncate_cases();
     abi_timestamp_cases(); abi_readv_cases();
     abi_link_cases();

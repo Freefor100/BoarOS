@@ -27,6 +27,16 @@ normal open、dup/F_DUPFD、console、pipe2 和 epoll_create1 最终都经过 `t
 
 `kernel_files_acquire()` 让另一个 handle 共享整张 fd 表及其 cleanup owner，`kernel_fs_context_acquire()` 同样共享 cwd/root context；两者只增加 record 引用，不复制槽、cwd 或 OFD。任一非末 handle release 只清空自身 handle，既不关闭 fd，也不释放 cwd；最后一个 handle 才处理仍由 VFS/I/O 持有的清理 owner。普通 fork 接口仍保持“独立表/独立 cwd、共享 OFD”。固定 Linux `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 [`kernel/fork.c`](../../references/linux/kernel/fork.c)、[`fs/file.c`](../../references/linux/fs/file.c) 与 [`fs/fs_struct.c`](../../references/linux/fs/fs_struct.c)分别提供 `CLONE_FILES`/`CLONE_FS` record 引用和末引用清理基线。
 
+## 传统与 OFD 记录锁
+
+`fs/record_lock.c` 为每个活 VFS inode 维护按有符号闭区间排序、带子树最大终点的 AVL 树和等待队列；每个锁节点同时挂在 owner 的侵入式索引上。长度为零延伸到 `INT64_MAX`，负长度向文件前方锁定，锁可以超过 EOF。`fs/files/locks.c` 导入 RV64 `struct flock` 并分派 `F_GETLK/F_SETLK/F_SETLKW` 与 `F_OFD_GETLK/F_OFD_SETLK/F_OFD_SETLKW`；标量 `fcntl` 命令仍走原入口。区间转换、读写权限、`l_pid`、坏指针和溢出错误按固定 Linux `references/linux/fs/locks.c`，commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 核对。
+
+传统锁 owner 是共享的 `kernel_files_record`，所以普通 fork 的新表不继承它，同表线程共享；该 owner 关闭同 inode 的任意 fd 就定向释放它在该 inode 的全部传统锁。OFD 锁 owner 是打开文件对象，dup/fork 共用且在最后真实引用消失时释放。两类 owner 身份不同，但相同 inode、范围和读写类型之间真实检查冲突。锁节点不反向引用 owner；VFS inode 在树或等待队列非空时不得释放。close、dup 覆盖、CLOEXEC、退出都在摘除 fd 的既有生命周期中释放对应锁，不把 OFD 锁留给历史 I/O cleanup。
+
+写入前预留分拆和替换所需节点；`ENOLCK` 不改动已有锁集合。解锁、关闭释放和唤醒不分配。阻塞请求 pin OFD，持有转换后的稳定范围，登记与冲突检查在单 hart 关中断临界区内完成；唤醒后重新检查 fd/冲突，信号使用既有 `ERESTARTSYS` 协议。传统锁沿固定 Linux 的十步边界进行有限等待链死锁检查，OFD 锁不承诺该检测。该模块仍只按单 hart 验证，SMP 前需要为 inode 树、owner 索引、等待链与文件引用建立跨核同步。
+
+聚焦入口为 `make test-record-lock-host`（随机独立区间模型、AVL 不变量和 OOM 原子性）、`make test-files-riscv` 及 `make test-diff-abi-riscv`。后者在固定 Linux 启用 `CONFIG_FILE_LOCKING` 后比较真实阻塞、信号重启、死锁、dup/exec/CLOEXEC 与 unlink。`make test-record-lock-riscv` 用同一个静态 musl ELF 在固定 Linux 与 BoarOS 核对 pthread 共享 owner、fork、不相关 fd close、等待期间 fd 复用和阻塞线程所在组强制退出；SQLite 原生 Unix VFS 的多进程争用另由 `make test-sqlite-rollback-riscv` 验证。
+
 ## `openat` 与路径边界
 
 `kernel_files_openat()` 接收用户路径、dirfd、flags 和 mode，普通 Linux 结果通过 `linux_result` 返回，内核对象损坏或清理所有权异常则使用 `kernel_files_status` 报告。路径先复制到一张 4096 字节临时堆缓冲区：找不到 NUL 返回 `-ENAMETOOLONG`，不可读用户页返回 `-EFAULT`，空路径返回 `-ENOENT`。
