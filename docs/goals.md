@@ -279,6 +279,8 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 - [x] 基础矩阵双侧验证静态、动态、PIE、静态 PIE、额外 DSO、初始 TLS、dlopen TLS、pthread、信号及其组合；保留装载/main 之前、运行时和退出阶段的首个失败。更广 glibc 应用仍待试跑。
 - [x] 已区分内核 PT_INTERP 装载和用户动态链接器/运行时职责；首次 pthread_join 失败经固定 Linux 差分定位到 futex bitset，而非动态重定位。
 
+整合后 `make test-glibc-riscv test-diff-abi-riscv test-userland-riscv test-sqlite-wal-riscv test-riscv test-stack-usage` 通过，固定 Linux 差分为 408 条一致。228 项清单按 `python3 tests/program-inventory/run.py --reuse-builds --output build/glibc-futex-inventory` 全量重跑仍为 223/2/3，五个旧失败 ID 不变；内核 SHA-256 `ebc11763ddac2661df3af45cca96ca322abeba0623e5cb9919a9051392db4574`，suite identity SHA-256 `5419a733de0e8e5095f53876f261a5a17c0c9f49b6f445dc0953e6fcef48c9c9`。输入和重建命令见[程序清单](learning/user-program-inventory.md)。
+
 ### P5b shebang 与 exec 组合
 
 - [ ] 解释器路径、可选参数、argv 重组和 envp 保持，循环/递归深度及 E2BIG/ENOEXEC 等错误按固定 Linux 验收；失败保持旧映像、fd/cwd/身份和可继续执行状态。

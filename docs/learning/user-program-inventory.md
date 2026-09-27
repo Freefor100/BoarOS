@@ -36,6 +36,8 @@ python3 tests/program-inventory/run.py --output build/p4d-full-20260925
 
 2026-09-27 WAL 断电与共享页故障阶段通过 `python3 tests/program-inventory/run.py --reuse-builds --output build/wal-fault-inventory` 再次全量运行，`status=complete`：223 pass、2 nonzero-exit、3 upstream-failure；失败 ID 仍是 `libc.static.socket`、`libc.dynamic.socket`、`libc.official.static`、`libc.official.dynamic`、`busybox.official`，无旧通过项回退。BoarOS 内核 SHA-256 为 `b1191d2737dda760a0f4ec1bc0c5ddaa1c36fe668be3584a0a3cbb02598d8f49`，固定 Linux Image 为 `7ca338ec75e681cc68c5d946b3ae633fc0088fd78569b7847528105a9de6c8ec`，suite identity SHA-256 为 `08bf67905816d479d251c9a55bf985b46dd5ef37c4f588207201d7c0e741ab82`。同一阶段另以 `make test-diff-abi-riscv test-sqlite-wal-riscv test-sqlite-wal-recovery-riscv test-sqlite-wal-recovery-matrix-riscv test-files-partial-write-riscv` 重建 396 条差分、普通 WAL 和逐事件存储故障证据；具体 NBD 输入身份与边界见[目标清单](../goals.md)。
 
+2026-09-27 glibc/futex bitset 阶段通过 `python3 tests/program-inventory/run.py --reuse-builds --output build/glibc-futex-inventory` 再次全量运行，`status=complete`：223 pass、2 nonzero-exit、3 upstream-failure；仍是上述五个失败 ID，无旧通过项回退。BoarOS 内核 SHA-256 为 `ebc11763ddac2661df3af45cca96ca322abeba0623e5cb9919a9051392db4574`，固定 Linux Image 为 `7ca338ec75e681cc68c5d946b3ae633fc0088fd78569b7847528105a9de6c8ec`，suite identity SHA-256 为 `5419a733de0e8e5095f53876f261a5a17c0c9f49b6f445dc0953e6fcef48c9c9`。同一阶段的 `make test-glibc-riscv test-diff-abi-riscv test-userland-riscv test-sqlite-wal-riscv test-riscv test-stack-usage` 通过，固定 Linux 差分扩至 408 条；`make test-sqlite-wal-recovery-riscv test-offline-c-baseline-riscv` 也在整合后的内核上通过。glibc 基础矩阵通过不改变既有 socket 缺口，也不代表离线编译已完成。
+
 | 范围 | Linux | BoarOS |
 |---|---:|---:|
 | 顶层案例 | 228 项满足契约 | 223 项退出/完整输出双侧一致；2 项直接失败；3 项包装失败 |
