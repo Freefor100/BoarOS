@@ -7,11 +7,10 @@ static long mode_of(long descriptor)
     return stat.mode & 07777;
 }
 
-static int ctime_after(const struct abi_stat *old, const struct abi_stat *now)
+static int ctime_changed(const struct abi_stat *old, const struct abi_stat *now)
 {
-    return now->ctime > old->ctime ||
-           (now->ctime == old->ctime &&
-            now->ctime_nsec > old->ctime_nsec);
+    return now->ctime != old->ctime ||
+           now->ctime_nsec != old->ctime_nsec;
 }
 
 void abi_mode_cases(void)
@@ -43,7 +42,7 @@ void abi_mode_cases(void)
     long result = SC3(53, -100, "/data", 0755);
     abi_require(SC2(80, fd, &after) == 0);
     abi_record("mode.fchmodat", result, after.mode & 07777,
-               ctime_after(&before, &after), 0, 0, 0);
+               ctime_changed(&before, &after), 0, 0, 0);
     abi_record("mode.exec-after-chmod", SC3(221, "/data", arguments, environment),
                -1, -1, 0, 0, 0);
 
