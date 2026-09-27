@@ -13,6 +13,7 @@
 #include <kernel/scheduler.h>
 #include <kernel/signal.h>
 #include <kernel/task.h>
+#include <kernel/sync.h>
 
 #include <stdint.h>
 
@@ -122,6 +123,7 @@ struct kernel_task {
     struct kernel_syscall_restart_state syscall_restart;
     struct kernel_socket_read_request *socket_read_request;
     struct kernel_task_io_buffer *io_buffer;
+    struct kernel_io_context io_context;
     uint64_t user_ticks;
     uint64_t kernel_ticks;
     uint64_t child_user_ticks;
@@ -179,6 +181,8 @@ struct kernel_scheduler {
     uint64_t pid_bitmap[KERNEL_PID_BITMAP_WORDS(KERNEL_PID_LIMIT)];
     struct kernel_task idle;
     struct kernel_task *current;
+    struct kernel_task *cleanup_task;
+    struct kernel_wait_queue cleanup_queue;
     struct kernel_task *ready_head;
     struct kernel_task *ready_tail;
     struct kernel_task *exited_head;

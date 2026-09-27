@@ -602,6 +602,8 @@ enum kernel_scheduler_status kernel_scheduler_init(
     scheduler.idle.completion.status = 0U;
     scheduler.idle.completion.detail = 0U;
     scheduler.current = &scheduler.idle;
+    scheduler.cleanup_task = 0;
+    kernel_wait_queue_init(&scheduler.cleanup_queue);
     scheduler.ready_head = 0;
     scheduler.ready_tail = 0;
     scheduler.exited_head = 0;
@@ -934,7 +936,7 @@ enum kernel_scheduler_status kernel_scheduler_on_tick(
     }
 
     previous = scheduler.current;
-    next = previous != &scheduler.idle && kernel_scheduler_reap_pending()
+    next = !scheduler.cleanup_task && previous != &scheduler.idle && kernel_scheduler_reap_pending()
                ? &scheduler.idle : scheduler.ready_head;
     if (next == 0) return KERNEL_SCHEDULER_STATUS_OK;
     status = activate_thread_address_space(next);

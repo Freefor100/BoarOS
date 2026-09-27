@@ -1,3 +1,4 @@
+#include <kernel/sync.h>
 #include <kernel/heap.h>
 
 #include <stddef.h>
@@ -497,6 +498,7 @@ enum kernel_heap_status kernel_heap_allocate(
     size_t size,
     void **pointer)
 {
+    KERNEL_NO_RECLAIM_IO;
     uint32_t class_index;
     void *result = 0;
     enum kernel_heap_status status;
@@ -707,6 +709,7 @@ enum kernel_heap_status kernel_heap_resize(
     size_t new_size,
     void **new_pointer)
 {
+    KERNEL_NO_RECLAIM_IO;
     uint64_t physical_address;
     uint32_t order;
     size_t capacity;

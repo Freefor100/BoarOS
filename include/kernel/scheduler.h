@@ -60,6 +60,10 @@ struct kernel_stack_statistics {
     uint64_t maximum_used_bytes;
 };
 void kernel_scheduler_stack_statistics(struct kernel_stack_statistics *statistics);
+/* One registered kernel task owns potentially sleeping exit cleanup. */
+void kernel_scheduler_register_cleanup(void);
+void kernel_scheduler_wait_cleanup(uint64_t retry_deadline);
+int kernel_scheduler_can_sleep(void);
 
 enum kernel_scheduler_status kernel_scheduler_init(
     struct physical_page_allocator *allocator,

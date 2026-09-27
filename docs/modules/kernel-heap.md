@@ -32,3 +32,5 @@ make test-page-riscv
 测试覆盖对齐、全部 size class、精确页数、大对象 order、复用、zeroing、溢出、耗尽、resize 数据保留、double free、空 slab 回收和统计。生产根启动还在 PID 1 退出后要求 `live_allocations=0`、`current_pages=0` 且物理空闲页回到启动基线。
 
 当前检查能约束分配次数和占页峰值，但 QEMU 启动时间不能替代目标开发板上的 cache miss、锁争用和周期基线。SMP 或长期文件负载出现后再在相同对象分布下比较全局锁、per-CPU cache 与不同 size class，现阶段不据功能测试宣称吞吐优势。
+
+堆 allocate/resize 与 MM 元数据变更使用任务 `allocation_depth` 限制回收：可回收干净且无外部引用的页，不允许在分配器内部发起脏页 I/O。物理分配器递归检测使用任务 `reclaim_depth`，一个任务睡眠不把其他任务误判为自身递归。脏页回收只在外层无锁处执行；不足返回真实 EMPTY/ENOMEM，不构造重试锁链。

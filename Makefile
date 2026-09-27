@@ -168,6 +168,7 @@ C_SOURCES := \
 	kernel/sched/process.c \
 	kernel/sched/signal.c \
 	kernel/sched/wait.c \
+	kernel/sched/sync.c \
 	kernel/sched/futex.c \
 	kernel/syscall/dispatch.c \
 	kernel/syscall/file.c \
@@ -239,6 +240,7 @@ TEST_RUNTIME_C_SOURCES := \
 	kernel/sched/process.c \
 	kernel/sched/signal.c \
 	kernel/sched/wait.c \
+	kernel/sched/sync.c \
 	kernel/sched/futex.c \
 	kernel/syscall/dispatch.c \
 	kernel/syscall/file.c \

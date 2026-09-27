@@ -9,6 +9,7 @@
 | `kernel/sched/core.c` | 创建、ready FIFO、tick 抢占、资源借用校验 |
 | `kernel/sched/process.c` | clone、线程组/父子树、wait、退出、回收与记账 |
 | `kernel/sched/exec.c` | 已准备映像的提交与旧资源清理 |
+| `kernel/sched/sync.c` | 任务 owner 的 mutex/RWlock、锁序与写者优先 |
 | `kernel/sched/wait.c` | 全局 blocked 链、每队列 FIFO、超时和信号唤醒 |
 | `kernel/sched/futex.c` | 256 桶 WAIT/WAKE/REQUEUE、robust-list 退出清理、clear-child-tid 唤醒 |
 | `kernel/sched/signal.c` | 组/线程 pending、disposition、stop/continue 和重启 |
@@ -50,7 +51,7 @@ WAIT 的超时为相对 monotonic；WAIT_BITSET 的超时为绝对 monotonic 或
 
 ## 退出与 exec
 
-exit 只退出当前线程，exit_group 和默认致命信号结束全组。退出先完成本线程的 robust-list 清理，再执行 clear-child-tid 清零/唤醒，最后释放 exec/files/fs/MM 等资源。任务仍在自己的内核栈上时不释放栈；切回可信 idle 栈后，先检查 canary、记录高水位并释放栈，再继续处理元数据和其他资源。
+exit 只退出当前线程，exit_group 和默认致命信号结束全组。退出先完成本线程的 robust-list 清理，再执行 clear-child-tid 清零/唤醒，最后释放 exec/files/fs/MM 等资源。任务仍在自己的内核栈上时不释放栈；切回可信清理上下文后检查 canary、高水位并回收旧栈；运行期需要存储的资源释放由可调度内核清理任务执行。
 
 组长先退出进入 GROUP_DEAD，保留进程容器；普通成员资源清理成功后从组环移除并回卷时间。最后一个成员结束后，组长才成为唯一进程退出对象，向父进程产生一次 zombie/SIGCHLD。SIGCHLD 显式忽略或 NOCLDWAIT 的自动回收仍遵循信号模块契约。
 
@@ -79,3 +80,11 @@ zombie 先逻辑回收再复制 status/rusage，因此坏输出指针的 EFAULT 
 尚无 SMP、共享文件 futex、PI futex、实时信号队列、sigaltstack、clone3 或 LoongArch context。固定语义依据见学习总结的 Linux commit 与 musl 归档。
 
 活动普通文件/TCP I/O 的单页暂存登记在任务的 `io_buffer`。任务资源清理在 socket read reservation 之后、MM/文件表和任务栈释放之前回收它；正常调用完成先解除登记。页释放错误遵循物理分配器 fatal 不变量，不进入历史 cleanup 重试链。
+
+## 存储等待与清理任务
+
+`kernel/sync.h` 的 mutex/RWlock guard 记录任务 io_context owner 与锁序，非法释放、递归误用、逆序及读转写触发 fatal；写者排队阻止新读者进入。只有队列/引用/状态发布使用短关中断区，持锁跨设备等待允许其他任务运行。分配器回收深度及 lwext4 重入深度属于任务上下文。
+
+存储等待以 `interruptible=0` 登记：pending 信号与组退出不能拆除 DMA owner；设备完成或 reset 后原调用栈先释放资源，再在用户返回边界处理退出。指定的 cleanup task 排空已退出任务和 root-boot 收尾，阻塞时正常调度；idle/IRQ 不进入运行期可睡眠存储。无块设备的纯模块 fixture 可继续由 idle 回收不含存储的任务。清理结束检查任务锁/backend 状态均为空。
+
+`make test-scheduler-riscv test-io-sleep-riscv test-userland-riscv` 分别保护写者优先、设备等待/唤醒与真实任务组合行为。

@@ -278,6 +278,7 @@ static void exited_append(struct kernel_task *thread)
         scheduler.exited_tail->next = thread;
     }
     scheduler.exited_tail = thread;
+    if (scheduler.cleanup_queue.head) (void)kernel_wait_queue_wake_all(&scheduler.cleanup_queue);
 }
 
 enum kernel_scheduler_status process_group_exec_current(void)
@@ -967,6 +968,27 @@ static enum kernel_scheduler_status cleanup_user_task_resources(
 static uint32_t user_wait_status(const struct kernel_thread_completion *completion);
 static enum kernel_scheduler_status reparent_children(struct kernel_task *parent);
 
+int kernel_scheduler_can_sleep(void)
+{
+    return scheduler.initialized == KERNEL_SCHEDULER_INITIALIZED &&
+           scheduler.current && scheduler.current != &scheduler.idle;
+}
+void kernel_scheduler_register_cleanup(void)
+{
+    if (riscv_interrupt_is_enabled() || !kernel_scheduler_can_sleep() ||
+        scheduler.current->arch.user_mode || scheduler.cleanup_task) __builtin_trap();
+    scheduler.cleanup_task = scheduler.current;
+}
+void kernel_scheduler_wait_cleanup(uint64_t retry_deadline)
+{
+    if (riscv_interrupt_is_enabled() || scheduler.current != scheduler.cleanup_task) __builtin_trap();
+    if (!scheduler.exited_head || retry_deadline) {
+        enum kernel_wait_wake_reason reason;
+        if (kernel_scheduler_block_current(&scheduler.cleanup_queue, retry_deadline, 0, &reason) != KERNEL_SCHEDULER_STATUS_OK)
+            __builtin_trap();
+    }
+}
+
 int kernel_scheduler_reap_pending(void)
 {
     return scheduler.exited_head != 0;
@@ -997,7 +1019,7 @@ enum kernel_scheduler_status kernel_scheduler_reap_one(
     if (status != KERNEL_SCHEDULER_STATUS_OK) {
         return status;
     }
-    if (scheduler.current != &scheduler.idle) {
+    if (scheduler.current != (scheduler.cleanup_task ? scheduler.cleanup_task : &scheduler.idle)) {
         return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
     }
     status = validate_queues();
@@ -1019,8 +1041,10 @@ enum kernel_scheduler_status kernel_scheduler_reap_one(
         thread->publish_completion > 1U) {
         return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
     }
-    /* Execution is finished and current is idle. Release this owner even
-     * when later VFS cleanup must retain the metadata for an I/O retry. */
+    /* Request handles may live on the old stack; release them before it. */
+    if (thread->io_context.locks || thread->io_context.backend_depth) __builtin_trap();
+    if (thread->socket_read_request) kernel_socket_abort_read(thread->socket_read_request);
+    if (thread->io_buffer) kernel_task_io_buffer_release(thread->io_buffer);
     status = release_task_stack(thread);
     if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
     result = thread->completion;
@@ -1060,6 +1084,8 @@ enum kernel_scheduler_status kernel_scheduler_reap_one(
         if (status != KERNEL_SCHEDULER_STATUS_OK) {
             return status;
         }
+        /* Cleanup can sleep while other exits append behind this task. */
+        next = thread->next;
         if (thread->group_leader == thread && thread->group_members > 1U) {
             struct kernel_task *child;
             for (child = thread->first_child; child != 0;
@@ -1451,7 +1477,7 @@ static void kernel_thread_finish(
             switch_to_fatal_idle(
                 KERNEL_SCHEDULER_STATUS_ADDRESS_SPACE);
         }
-        cleanup_status = cleanup_user_task_resources(current);
+        if (!scheduler.cleanup_task) cleanup_status = cleanup_user_task_resources(current);
         current->wait_status = user_wait_status(&current->completion);
     }
     (void)cleanup_status;

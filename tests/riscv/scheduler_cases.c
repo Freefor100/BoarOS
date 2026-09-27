@@ -9,6 +9,7 @@
 #include <kernel/pid.h>
 #include <kernel/scheduler.h>
 #include <kernel/task.h>
+#include <kernel/sync.h>
 #include "../../kernel/sched/private.h"
 
 #include <stdint.h>
@@ -22,7 +23,7 @@ extern unsigned char __boot_stack_top[];
 /* One buddy metadata page plus enough alignment slack for two tasks. */
 #define TEST_PAGE_COUNT (2U + TEST_THREAD_COUNT * TEST_TASK_PAGES)
 
-static unsigned char page_pool[BOAROS_PAGE_SIZE * TEST_PAGE_COUNT]
+static unsigned char page_pool[BOAROS_PAGE_SIZE * (TEST_PAGE_COUNT + 2U * TEST_TASK_PAGES)]
     __attribute__((aligned(BOAROS_PAGE_SIZE)));
 static unsigned long access_calls_before_failure;
 static unsigned long fail_access_count;
@@ -875,6 +876,56 @@ static unsigned long run_stack_contract_cases(
     return failures + stack_contract_failures;
 }
 
+static struct kernel_rwlock io_lock;
+static unsigned sync_order, sync_failures;
+static void sync_reader(void *arg)
+{
+    struct kernel_lock_guard guard = {0};
+    unsigned id = (uintptr_t)arg;
+    kernel_rwlock_read(&io_lock, &guard);
+    sync_order = sync_order * 10 + id;
+    if (id == 1) {
+        uintptr_t irq = riscv_interrupt_save();
+        if (kernel_scheduler_yield_current() != KERNEL_SCHEDULER_STATUS_OK)
+            sync_failures++;
+        if (sync_order != 1) sync_failures++;
+        riscv_interrupt_restore(irq);
+    }
+    kernel_lock_release(&guard);
+}
+static void sync_writer(void *arg)
+{
+    (void)arg;
+    struct kernel_lock_guard guard = {0};
+    kernel_rwlock_write(&io_lock, &guard);
+    sync_order = sync_order * 10 + 2;
+    kernel_lock_release(&guard);
+}
+static unsigned run_sync_cases(struct physical_page_allocator *allocator)
+{
+    struct boot_memory_layout layout = {0};
+    layout.usable_count = 1;
+    layout.usable[0].base = TEST_PHYSICAL_BASE;
+    layout.usable[0].size = sizeof(page_pool);
+    if (physical_page_allocator_init(allocator, &layout) != PHYSICAL_PAGE_STATUS_OK ||
+        physical_page_allocator_bind_access(allocator, scheduler_page_access) != PHYSICAL_PAGE_STATUS_OK ||
+        physical_page_allocator_finalize(allocator) != PHYSICAL_PAGE_STATUS_OK) return 1;
+    uint64_t available = physical_page_available(allocator);
+    struct kernel_thread_completion completion;
+    kernel_rwlock_init(&io_lock, 1, 0);
+    if (kernel_thread_create(sync_reader, (void *)1) != KERNEL_SCHEDULER_STATUS_OK ||
+        kernel_thread_create(sync_writer, 0) != KERNEL_SCHEDULER_STATUS_OK ||
+        kernel_thread_create(sync_reader, (void *)3) != KERNEL_SCHEDULER_STATUS_OK)
+        return 1;
+    for (unsigned i = 0; i < 3; i++) {
+        if (kernel_scheduler_on_tick(1) != KERNEL_SCHEDULER_STATUS_OK) sync_failures++;
+        if (kernel_scheduler_reap_one(&completion) != KERNEL_SCHEDULER_STATUS_OK)
+            sync_failures++;
+    }
+    return sync_failures + (sync_order != 123) +
+           (physical_page_available(allocator) != available);
+}
+
 void kernel_main(unsigned long hart_id, const void *dtb)
 {
     struct boot_memory_layout layout;
@@ -887,7 +938,7 @@ void kernel_main(unsigned long hart_id, const void *dtb)
 
     layout.usable_count = 1U;
     layout.usable[0].base = TEST_PHYSICAL_BASE;
-    layout.usable[0].size = sizeof(page_pool);
+    layout.usable[0].size = BOAROS_PAGE_SIZE * TEST_PAGE_COUNT;
     page_status = physical_page_allocator_init(&allocator, &layout);
     if (page_status == PHYSICAL_PAGE_STATUS_OK) {
         page_status = physical_page_allocator_bind_access(
@@ -912,6 +963,7 @@ void kernel_main(unsigned long hart_id, const void *dtb)
     failures += run_accounting_cases(&allocator);
     failures += run_fpu_cases();
     failures += run_stack_contract_cases(&allocator);
+    failures += run_sync_cases(&allocator);
 
     virt_uart_puts("BoarOS: scheduler cases failures=");
     virt_uart_put_hex(failures);

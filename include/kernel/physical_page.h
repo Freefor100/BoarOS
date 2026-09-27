@@ -37,7 +37,8 @@ struct physical_page_allocator {
     uint32_t range_count;
     uint32_t initialized;
     uint32_t finalized;
-    uint32_t reclaiming;
+    uint32_t reclaiming; /* Active callbacks, including suspended tasks. */
+    uint32_t *(*reclaim_depth)(void);
     physical_page_access_fn access;
     physical_page_reclaim_fn reclaimer;
     void *reclaimer_context;

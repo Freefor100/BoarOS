@@ -204,6 +204,7 @@ enum physical_page_status physical_page_allocator_init(
     result.initialized = 0U;
     result.finalized = 0U;
     result.reclaiming = 0U;
+    result.reclaim_depth = 0;
     result.access = 0;
     result.reclaimer = 0;
     result.reclaimer_context = 0;
@@ -1005,11 +1006,16 @@ enum physical_page_status physical_page_allocate_order(
     if (status == PHYSICAL_PAGE_STATUS_EMPTY &&
         allocator_initialized(allocator) &&
         physical_page_allocator_is_finalized(allocator) &&
-        allocator->reclaimer != 0 && allocator->reclaiming == 0U) {
-        allocator->reclaiming = 1U;
+        allocator->reclaimer != 0) {
+        uint32_t *depth = allocator->reclaim_depth ? allocator->reclaim_depth() : &allocator->reclaiming;
+        if (*depth) return status;
+        if (depth != &allocator->reclaiming) *depth = 1U;
+        if (allocator->reclaiming == UINT32_MAX) __builtin_trap();
+        allocator->reclaiming++;
         (void)allocator->reclaimer(allocator->reclaimer_context,
                                    order_page_count(order));
-        allocator->reclaiming = 0U;
+        allocator->reclaiming--;
+        if (depth != &allocator->reclaiming) *depth = 0U;
         status = physical_page_allocate_order_once(allocator,
                                                    order,
                                                    address);
@@ -1337,6 +1343,7 @@ enum physical_page_status physical_page_allocator_clear_reclaimer(
     }
 
     allocator->reclaimer = 0;
+    allocator->reclaim_depth = 0;
     allocator->reclaimer_context = 0;
     return PHYSICAL_PAGE_STATUS_OK;
 }

@@ -1,4 +1,5 @@
 #include <kernel/heap.h>
+#include <kernel/sync.h>
 #include <kernel/page.h>
 #include <kernel/physical_page.h>
 #include <assert.h>
@@ -12,6 +13,9 @@ static unsigned char pool[256 * BOAROS_PAGE_SIZE]
     __attribute__((aligned(BOAROS_PAGE_SIZE)));
 static struct physical_page_allocator allocator;
 static struct kernel_heap heap;
+/* This standalone allocator fixture has one synchronous execution context. */
+static struct kernel_io_context io_context;
+struct kernel_io_context *kernel_io_context_current(void) { return &io_context; }
 
 #define TEST_SLAB_BITMAP_WORDS 4U
 #define TEST_PAGE_STATE_FREE_HEAD 3U
