@@ -22,6 +22,7 @@ struct kernel_open_file_description {
     uint8_t pipe_endpoint;
     uint8_t pipe_endpoint_closed;
     struct kernel_epoll *epoll;
+    struct kernel_socket *socket;
     struct kernel_epoll_item *ep_items;
     struct kernel_record_lock *record_locks;
 };

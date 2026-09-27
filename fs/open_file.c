@@ -9,6 +9,7 @@
 #include <kernel/heap.h>
 #include <kernel/open_file.h>
 #include <kernel/page_cache.h>
+#include <kernel/socket.h>
 #include <kernel/vfs.h>
 
 #include <stddef.h>
@@ -325,6 +326,37 @@ enum kernel_open_file_status kernel_open_file_create_epoll(
     return KERNEL_OPEN_FILE_STATUS_OK;
 }
 
+enum kernel_open_file_status kernel_open_file_create_socket(
+    struct kernel_heap *heap, struct kernel_socket *socket,
+    uint32_t flags, struct kernel_open_file_description **owner)
+{
+    struct kernel_open_file_description *file = 0;
+    enum kernel_heap_status heap_status;
+    if (heap == 0 || socket == 0 || owner == 0 || *owner != 0)
+        return KERNEL_OPEN_FILE_STATUS_INVALID_ARGUMENT;
+    heap_status = kernel_heap_allocate_zeroed(heap, 1U, sizeof(*file),
+                                              (void **)&file);
+    if (heap_status == KERNEL_HEAP_STATUS_EMPTY)
+        return KERNEL_OPEN_FILE_STATUS_NO_MEMORY;
+    if (heap_status != KERNEL_HEAP_STATUS_OK)
+        return KERNEL_OPEN_FILE_STATUS_STATE;
+    file->heap = heap;
+    file->references = 1U;
+    file->kind = KERNEL_OPEN_FILE_KIND_SOCKET;
+    file->file.mode = KERNEL_VFS_S_IFSOCK | UINT32_C(0000600);
+    file->open_flags = flags;
+    file->socket = socket;
+    *owner = file;
+    return KERNEL_OPEN_FILE_STATUS_OK;
+}
+
+struct kernel_socket *kernel_open_file_socket(
+    struct kernel_open_file_description *file)
+{
+    return open_file_live(file) && file->kind == KERNEL_OPEN_FILE_KIND_SOCKET
+               ? file->socket : 0;
+}
+
 enum kernel_open_file_kind kernel_open_file_kind(
     const struct kernel_open_file_description *file)
 {
@@ -344,6 +376,8 @@ enum kernel_open_file_kind kernel_open_file_kind(
         return KERNEL_OPEN_FILE_KIND_NULL;
     case KERNEL_OPEN_FILE_KIND_ZERO:
         return KERNEL_OPEN_FILE_KIND_ZERO;
+    case KERNEL_OPEN_FILE_KIND_SOCKET:
+        return KERNEL_OPEN_FILE_KIND_SOCKET;
     default:
         return KERNEL_OPEN_FILE_KIND_REGULAR;
     }
@@ -359,6 +393,7 @@ int kernel_open_file_supports_epoll(
     case KERNEL_OPEN_FILE_KIND_PIPE:
     case KERNEL_OPEN_FILE_KIND_CONSOLE:
     case KERNEL_OPEN_FILE_KIND_EPOLL:
+    case KERNEL_OPEN_FILE_KIND_SOCKET:
         return 1;
     default:
         return 0;
@@ -430,6 +465,10 @@ enum kernel_open_file_status kernel_open_file_release(
                 file->epoll = 0;
             }
             file->vfs_closed = 1U;
+        } else if (file->kind == KERNEL_OPEN_FILE_KIND_SOCKET) {
+            kernel_socket_destroy(file->socket);
+            file->socket = 0;
+            file->vfs_closed = 1U;
         } else if (kernel_vfs_close(&file->file) != 0) {
             return KERNEL_OPEN_FILE_STATUS_CLEANUP_REQUIRED;
         } else {
@@ -454,7 +493,9 @@ enum kernel_open_file_status kernel_open_file_detach(
         return KERNEL_OPEN_FILE_STATUS_STATE;
     }
     /* A pipe endpoint's last live owner closes it immediately. */
-    if (file->kind == KERNEL_OPEN_FILE_KIND_PIPE && file->references == 1U) {
+    if ((file->kind == KERNEL_OPEN_FILE_KIND_PIPE ||
+         file->kind == KERNEL_OPEN_FILE_KIND_SOCKET) &&
+        file->references == 1U) {
         return kernel_open_file_release(owner);
     }
     if (file->references == 1U) release_record_locks(file);
@@ -515,6 +556,8 @@ int kernel_open_file_readable(
         return access_mode == 0U || access_mode == 2U;
     case KERNEL_OPEN_FILE_KIND_PIPE:
         return access_mode == 0U;
+    case KERNEL_OPEN_FILE_KIND_SOCKET:
+        return 1;
     case KERNEL_OPEN_FILE_KIND_CONSOLE:
         return file->file.private_data == 0 ||
                access_mode == 0U || access_mode == 2U;
@@ -655,6 +698,8 @@ uint32_t kernel_open_file_poll(
         return KERNEL_POLLIN | KERNEL_POLLOUT | KERNEL_POLLRDNORM | KERNEL_POLLWRNORM;
     case KERNEL_OPEN_FILE_KIND_EPOLL:
         return kernel_epoll_poll(file->epoll, requested_events, out_queue);
+    case KERNEL_OPEN_FILE_KIND_SOCKET:
+        return kernel_socket_poll(file->socket, out_queue);
     default:
         return KERNEL_POLLNVAL;
     }

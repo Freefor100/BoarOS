@@ -1,0 +1,47 @@
+#ifndef BOAROS_KERNEL_SOCKET_H
+#define BOAROS_KERNEL_SOCKET_H
+
+#include <stdint.h>
+
+struct kernel_heap;
+struct kernel_mm;
+struct kernel_socket;
+struct kernel_wait_queue;
+
+/* IPv4 addresses use the Linux sockaddr_in/network-byte-order representation. */
+int kernel_socket_create(struct kernel_heap *heap, int type,
+                         struct kernel_socket **owner);
+void kernel_socket_destroy(struct kernel_socket *socket);
+int kernel_socket_bind(struct kernel_socket *socket, uint32_t address,
+                       uint16_t port);
+int kernel_socket_getname(struct kernel_socket *socket, uint32_t *address,
+                          uint16_t *port);
+int kernel_socket_getpeer(struct kernel_socket *socket, uint32_t *address,
+                          uint16_t *port);
+int kernel_socket_listen(struct kernel_socket *socket, int backlog);
+int kernel_socket_connect(struct kernel_socket *socket, uint32_t address,
+                          uint16_t port, int nonblocking);
+int kernel_socket_connection_result(struct kernel_socket *socket);
+int kernel_socket_accept(struct kernel_socket *socket,
+                         struct kernel_socket **owner);
+int kernel_socket_sendto(struct kernel_socket *socket, struct kernel_mm *mm,
+                         uint64_t user_data, uint64_t size, uint32_t address,
+                         uint16_t port);
+int kernel_socket_recvfrom(struct kernel_socket *socket, struct kernel_mm *mm,
+                           uint64_t user_data, uint64_t size,
+                           uint32_t *address, uint16_t *port);
+int kernel_socket_read_buffer(struct kernel_socket *socket, void *buffer,
+                              uint32_t capacity);
+int kernel_socket_write_buffer(struct kernel_socket *socket,
+                               const void *buffer, uint32_t size);
+void kernel_socket_set_receive_timeout(struct kernel_socket *socket,
+                                       uint64_t nanoseconds);
+uint64_t kernel_socket_receive_timeout(const struct kernel_socket *socket);
+uint32_t kernel_socket_poll(struct kernel_socket *socket,
+                            struct kernel_wait_queue **queue);
+struct kernel_wait_queue *kernel_socket_wait_queue(struct kernel_socket *socket);
+uint64_t kernel_socket_next_timer_deadline(void);
+int kernel_socket_loopback_flags(const char name[16], uint16_t *flags);
+int kernel_socket_set_loopback_flags(const char name[16], uint16_t flags);
+
+#endif

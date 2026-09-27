@@ -97,6 +97,29 @@ LWEXT4_SOURCES := \
 	third_party/lwext4/src/ext4_trans.c \
 	third_party/lwext4/src/ext4_truncate.c
 
+LWIP_CPPFLAGS := -Inet/lwip_port/include -Ithird_party/lwip/src/include
+LWIP_SOURCES := \
+	third_party/lwip/src/core/def.c \
+	third_party/lwip/src/core/inet_chksum.c \
+	third_party/lwip/src/core/init.c \
+	third_party/lwip/src/core/ip.c \
+	third_party/lwip/src/core/mem.c \
+	third_party/lwip/src/core/memp.c \
+	third_party/lwip/src/core/netif.c \
+	third_party/lwip/src/core/pbuf.c \
+	third_party/lwip/src/core/stats.c \
+	third_party/lwip/src/core/sys.c \
+	third_party/lwip/src/core/tcp.c \
+	third_party/lwip/src/core/tcp_in.c \
+	third_party/lwip/src/core/tcp_out.c \
+	third_party/lwip/src/core/timeouts.c \
+	third_party/lwip/src/core/udp.c \
+	third_party/lwip/src/core/ipv4/icmp.c \
+	third_party/lwip/src/core/ipv4/ip4.c \
+	third_party/lwip/src/core/ipv4/ip4_addr.c \
+	third_party/lwip/src/core/ipv4/ip4_frag.c \
+	net/lwip_port/port.c
+
 C_SOURCES := \
 	arch/riscv/context.c \
 	arch/riscv/direct_map.c \
@@ -122,6 +145,7 @@ C_SOURCES := \
 	fs/files/console.c \
 	fs/files/poll.c \
 	fs/files/epoll.c \
+	fs/files/socket.c \
 	fs/fs_context.c \
 	fs/open_file.c \
 	fs/pipe.c \
@@ -150,16 +174,19 @@ C_SOURCES := \
 	kernel/syscall/memory.c \
 	kernel/syscall/process.c \
 	kernel/syscall/signal.c \
+	kernel/syscall/socket.c \
 	kernel/syscall/time.c \
 	arch/riscv/signal.c \
 	kernel/tick.c \
 	kernel/time.c \
+	net/socket.c \
 	lib/qsort.c \
 	lib/string.c \
 	mm/vma.c \
 	mm/shared_anon.c \
 	mm/heap.c \
-	$(LWEXT4_SOURCES)
+	$(LWEXT4_SOURCES) \
+	$(LWIP_SOURCES)
 ASM_SOURCES := \
 	arch/riscv/boot.S \
 	arch/riscv/context_switch.S \
@@ -191,6 +218,7 @@ TEST_RUNTIME_C_SOURCES := \
 	fs/files/console.c \
 	fs/files/poll.c \
 	fs/files/epoll.c \
+	fs/files/socket.c \
 	fs/fs_context.c \
 	fs/lwext4_port.c \
 	fs/open_file.c \
@@ -217,16 +245,19 @@ TEST_RUNTIME_C_SOURCES := \
 	kernel/syscall/memory.c \
 	kernel/syscall/process.c \
 	kernel/syscall/signal.c \
+	kernel/syscall/socket.c \
 	kernel/syscall/time.c \
 	arch/riscv/signal.c \
 	kernel/tick.c \
 	kernel/time.c \
+	net/socket.c \
 	lib/qsort.c \
 	lib/string.c \
 	mm/vma.c \
 	mm/shared_anon.c \
 	mm/heap.c \
-	$(LWEXT4_SOURCES)
+	$(LWEXT4_SOURCES) \
+	$(LWIP_SOURCES)
 TEST_RUNTIME_ASM_SOURCES := \
 	arch/riscv/boot.S \
 	arch/riscv/context_switch.S \
@@ -830,6 +861,10 @@ $(BUILD_DIR)/%.o: %.c
 $(BUILD_DIR)/fs/lwext4_port.o $(BUILD_DIR)/fs/vfs.o: \
 	CPPFLAGS += $(LWEXT4_CPPFLAGS)
 
+$(BUILD_DIR)/third_party/lwip/src/core/%.o \
+$(BUILD_DIR)/net/lwip_port/%.o \
+$(BUILD_DIR)/net/socket.o: CPPFLAGS += $(LWIP_CPPFLAGS)
+
 $(BUILD_DIR)/third_party/lwext4/src/%.o: \
 		third_party/lwext4/src/%.c
 	@mkdir -p $(dir $@)
@@ -1210,6 +1245,18 @@ prune-build:
 -include $(DEPS)
 
 .PHONY: test-allocator-release-host
+build/host/lwip-port: tests/host/lwip_port_test.c \
+		net/lwip_port/port.c $(filter third_party/lwip/%,$(LWIP_SOURCES))
+	@mkdir -p $(dir $@)
+	cc -std=c11 -Wall -Wextra -Werror -Inet/lwip_port/include \
+		-Ithird_party/lwip/src/include -idirafter include \
+		tests/host/lwip_port_test.c net/lwip_port/port.c \
+		$(filter third_party/lwip/%,$(LWIP_SOURCES)) -o $@
+
+.PHONY: test-lwip-host
+test-lwip-host: build/host/lwip-port
+	$<
+
 test-allocator-release-host:
 	mkdir -p build/host
 	cc -std=c11 -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=12 -Iinclude tests/host/allocator_release.c kernel/physical_page.c mm/heap.c -o build/host/allocator-release

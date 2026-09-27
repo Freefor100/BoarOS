@@ -60,6 +60,15 @@
 #define LINUX_SYSCALL_GETEGID 177U
 #define LINUX_SYSCALL_GETTID 178U
 #define LINUX_SYSCALL_UMASK 166U
+#define LINUX_SYSCALL_SOCKET 198U
+#define LINUX_SYSCALL_BIND 200U
+#define LINUX_SYSCALL_LISTEN 201U
+#define LINUX_SYSCALL_ACCEPT 202U
+#define LINUX_SYSCALL_CONNECT 203U
+#define LINUX_SYSCALL_GETSOCKNAME 204U
+#define LINUX_SYSCALL_SENDTO 206U
+#define LINUX_SYSCALL_RECVFROM 207U
+#define LINUX_SYSCALL_SETSOCKOPT 208U
 #define LINUX_SYSCALL_BRK 214U
 #define LINUX_SYSCALL_SCHED_YIELD 124U
 #define LINUX_SYSCALL_CLOCK_GETTIME 113U
@@ -166,7 +175,27 @@ enum kernel_syscall_status kernel_syscall_dispatch(
         return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     }
 
-    if (request->number == LINUX_SYSCALL_EPOLL_CREATE1) {
+    if (request->number == LINUX_SYSCALL_SOCKET) {
+        if (syscall_handle_socket(caller, request, &decoded) !=
+            KERNEL_SYSCALL_STATUS_OK) {
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+        }
+    } else if (request->number == LINUX_SYSCALL_BIND) {
+        if (syscall_handle_bind(caller, request, &decoded) !=
+            KERNEL_SYSCALL_STATUS_OK) {
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+        }
+    } else if (request->number == LINUX_SYSCALL_LISTEN ||
+               request->number == LINUX_SYSCALL_ACCEPT ||
+               request->number == LINUX_SYSCALL_CONNECT ||
+               request->number == LINUX_SYSCALL_GETSOCKNAME ||
+               request->number == LINUX_SYSCALL_SENDTO ||
+               request->number == LINUX_SYSCALL_RECVFROM ||
+               request->number == LINUX_SYSCALL_SETSOCKOPT) {
+        if (syscall_handle_socket_operation(caller, request, &decoded) !=
+            KERNEL_SYSCALL_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    } else if (request->number == LINUX_SYSCALL_EPOLL_CREATE1) {
         if (syscall_handle_epoll_create1(caller, request, &decoded) !=
             KERNEL_SYSCALL_STATUS_OK) {
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;

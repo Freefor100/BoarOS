@@ -75,6 +75,8 @@ socket.udp-client-create
 socket.udp-sendto
 socket.udp-recvfrom
 socket.udp-peer
+socket.udp-write-unconnected
+socket.udp-read
 socket.tcp-cloexec-create
 socket.tcp-cloexec-flag
 socket.tcp-bind
@@ -86,6 +88,15 @@ socket.tcp-connect
 socket.tcp-listener-readable
 socket.tcp-accept
 socket.tcp-peer
+socket.tcp-write
+socket.tcp-read
+socket.tcp-writev
+socket.tcp-readv
+socket.tcp-pread
+socket.tcp-pwrite
+socket.tcp-lseek
+socket.tcp-fstat
+socket.tcp-blocked-accept
 futex.shared-wake
 futex.shared-requeue
 futex.shared-bad-wake

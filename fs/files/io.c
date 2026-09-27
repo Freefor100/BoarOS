@@ -10,12 +10,19 @@
 #include <kernel/open_file.h>
 #include <kernel/page.h>
 #include <kernel/page_cache.h>
+#include <kernel/scheduler.h>
+#include <kernel/signal.h>
+#include <kernel/socket.h>
+#include <kernel/task.h>
+#include <kernel/time.h>
 #include <kernel/uaccess.h>
 #include <kernel/vfs.h>
 
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
+
+#include <arch/riscv/context.h>
 
 #define KERNEL_FILES_MAX_RW_COUNT \
     ((uint64_t)INT32_MAX & ~(uint64_t)BOAROS_PAGE_MASK)
@@ -41,6 +48,61 @@ static enum kernel_files_status release_io_description(
                    : KERNEL_FILES_STATUS_CLEANUP_REQUIRED;
     }
     return KERNEL_FILES_STATUS_STATE;
+}
+
+static int socket_wait_ready(struct kernel_open_file_description *description,
+                             uint32_t events, uint64_t timeout_ns)
+{
+    struct kernel_socket *socket = kernel_open_file_socket(description);
+    uint64_t deadline = 0;
+    uint64_t target_ns = 0;
+    uintptr_t saved;
+    if ((kernel_socket_poll(socket, 0) & events) != 0U) return 0;
+    if ((description->open_flags & KERNEL_FILES_O_NONBLOCK) != 0U)
+        return -KERNEL_EAGAIN;
+    if (timeout_ns != 0U) {
+        uint64_t now = kernel_time_monotonic_ns();
+        uint64_t target = UINT64_MAX - now < timeout_ns
+                              ? UINT64_MAX : now + timeout_ns;
+        target_ns = target;
+        enum kernel_time_status status =
+            kernel_time_deadline_from_monotonic(target, &deadline);
+        if (status == KERNEL_TIME_STATUS_DEADLINE_PASSED)
+            return -KERNEL_EAGAIN;
+        if (status != KERNEL_TIME_STATUS_OK) return -KERNEL_EIO;
+    }
+    saved = riscv_interrupt_save();
+    while ((kernel_socket_poll(socket, 0) &
+            (events | KERNEL_POLLERR | KERNEL_POLLHUP)) == 0U) {
+        enum kernel_wait_wake_reason reason;
+        uint64_t sleep_deadline = deadline;
+        uint64_t protocol_deadline = kernel_socket_next_timer_deadline();
+        if (protocol_deadline != 0U &&
+            (sleep_deadline == 0U || protocol_deadline < sleep_deadline))
+            sleep_deadline = protocol_deadline;
+        if (kernel_scheduler_block_current(kernel_socket_wait_queue(socket),
+                                            sleep_deadline, 1, &reason) !=
+            KERNEL_SCHEDULER_STATUS_OK) {
+            riscv_interrupt_restore(saved);
+            return -KERNEL_EIO;
+        }
+        if (reason == KERNEL_WAIT_TIMEOUT) {
+            if (target_ns != 0U &&
+                kernel_time_monotonic_ns() >= target_ns) {
+                riscv_interrupt_restore(saved);
+                return -KERNEL_EAGAIN;
+            }
+            continue;
+        }
+        if (reason == KERNEL_WAIT_SIGNALLED) {
+            riscv_interrupt_restore(saved);
+            if (timeout_ns != 0U) return -KERNEL_EINTR;
+            kernel_signal_note_syscall_restart(kernel_task_current());
+            return -KERNEL_ERESTARTSYS;
+        }
+    }
+    riscv_interrupt_restore(saved);
+    return 0;
 }
 
 enum kernel_files_status kernel_files_sync(struct kernel_files *files,
@@ -82,6 +144,50 @@ static enum kernel_files_status read_pinned(
     if (!kernel_open_file_readable(description)) {
         *linux_result = -KERNEL_EBADF;
         files->record->statistics.read_failures++;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_SOCKET) {
+        uint8_t staging[256];
+        size_t copied = 0U;
+        int received;
+        for (size_t index = 0; index < iov_count; index++) {
+            if (kernel_user_range_check(iov[index].base,
+                                        (size_t)iov[index].length) !=
+                KERNEL_UACCESS_STATUS_OK) {
+                *linux_result = -KERNEL_EFAULT;
+                files->record->statistics.read_failures++;
+                return KERNEL_FILES_STATUS_OK;
+            }
+        }
+        if (count == 0U) {
+            *linux_result = 0;
+            return KERNEL_FILES_STATUS_OK;
+        }
+        for (;;) {
+            received = kernel_socket_read_buffer(
+                kernel_open_file_socket(description), staging,
+                count < sizeof(staging) ? (uint32_t)count : sizeof(staging));
+            if (received != -KERNEL_EAGAIN) break;
+            int waited = socket_wait_ready(description, KERNEL_POLLIN,
+                kernel_socket_receive_timeout(
+                    kernel_open_file_socket(description)));
+            if (waited != 0) {
+                received = waited;
+                break;
+            }
+        }
+        if (received > 0) {
+            enum kernel_uaccess_status access = kernel_copy_to_user_iov(
+                mm, &cursor, staging, (size_t)received, &copied);
+            if (access == KERNEL_UACCESS_STATUS_FAULT)
+                received = copied != 0U ? (int)copied : -KERNEL_EFAULT;
+            else if (access != KERNEL_UACCESS_STATUS_OK ||
+                     copied != (size_t)received)
+                return KERNEL_FILES_STATUS_STATE;
+        }
+        *linux_result = received;
+        if (received < 0) files->record->statistics.read_failures++;
+        else files->record->statistics.bytes_read += (uint64_t)received;
         return KERNEL_FILES_STATUS_OK;
     }
     if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_NULL ||
@@ -450,7 +556,8 @@ static enum kernel_files_status pread_pinned(
     }
     if (kernel_open_file_kind(description) ==
             KERNEL_OPEN_FILE_KIND_CONSOLE ||
-        kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_PIPE) {
+        kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_PIPE ||
+        kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_SOCKET) {
         files->record->statistics.read_failures++;
         *linux_result = -KERNEL_ESPIPE;
         return KERNEL_FILES_STATUS_OK;
@@ -601,6 +708,9 @@ static int description_writable(
     if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_PIPE) {
         return access_mode != 0U;
     }
+    if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_SOCKET) {
+        return access_mode == 2U;
+    }
     if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_CONSOLE) {
         return description->file.private_data == 0 ||
                access_mode == 1U || access_mode == 2U;
@@ -632,6 +742,51 @@ static enum kernel_files_status buffered_write_request(
                                    count, description->open_flags, linux_result)
                        == KERNEL_PIPE_STATUS_OK
                    ? KERNEL_FILES_STATUS_OK : KERNEL_FILES_STATUS_STATE;
+    }
+    if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_SOCKET) {
+        struct kernel_socket *socket = kernel_open_file_socket(description);
+        for (size_t index = 0U; index < iov_count && total < count; index++) {
+            uint64_t offset = 0U;
+            while (offset < iov[index].length && total < count) {
+                size_t chunk = iov[index].length - offset;
+                size_t copied = 0U;
+                int sent;
+                enum kernel_uaccess_status access;
+                if (chunk > sizeof(staging)) chunk = sizeof(staging);
+                if (chunk > count - total) chunk = (size_t)(count - total);
+                access = kernel_copy_from_user(mm, staging,
+                    iov[index].base + offset, chunk, &copied);
+                if (access == KERNEL_UACCESS_STATUS_FAULT && copied == 0U) {
+                    *linux_result = total != 0U ? (int64_t)total
+                                                 : -KERNEL_EFAULT;
+                    return KERNEL_FILES_STATUS_OK;
+                }
+                if (access != KERNEL_UACCESS_STATUS_OK &&
+                    access != KERNEL_UACCESS_STATUS_FAULT)
+                    return KERNEL_FILES_STATUS_STATE;
+                sent = kernel_socket_write_buffer(socket, staging,
+                                                    (uint32_t)copied);
+                if (sent == -KERNEL_EAGAIN && total == 0U) {
+                    int waited = socket_wait_ready(description,
+                                                    KERNEL_POLLOUT, 0U);
+                    if (waited == 0) continue;
+                    sent = waited;
+                }
+                if (sent < 0) {
+                    *linux_result = total != 0U ? (int64_t)total : sent;
+                    return KERNEL_FILES_STATUS_OK;
+                }
+                total += (uint64_t)sent;
+                offset += (uint64_t)sent;
+                if ((size_t)sent < copied ||
+                    access == KERNEL_UACCESS_STATUS_FAULT) {
+                    *linux_result = (int64_t)total;
+                    return KERNEL_FILES_STATUS_OK;
+                }
+            }
+        }
+        *linux_result = (int64_t)total;
+        return KERNEL_FILES_STATUS_OK;
     }
     if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_REGULAR) {
         int is_append = (description->open_flags & KERNEL_FILES_O_APPEND) != 0U;
@@ -890,7 +1045,8 @@ enum kernel_files_status kernel_files_pwrite(
         return KERNEL_FILES_STATUS_OK;
     }
     kind = kernel_open_file_kind(description);
-    if (kind == KERNEL_OPEN_FILE_KIND_EPOLL)
+    if (kind == KERNEL_OPEN_FILE_KIND_EPOLL ||
+        kind == KERNEL_OPEN_FILE_KIND_SOCKET)
         *linux_result = -KERNEL_ESPIPE;
     else if (!description_writable(description))
         *linux_result = -KERNEL_EBADF;
@@ -1041,7 +1197,8 @@ enum kernel_files_status kernel_files_lseek(
     }
     if (kernel_open_file_kind(description) ==
             KERNEL_OPEN_FILE_KIND_CONSOLE ||
-        kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_PIPE) {
+        kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_PIPE ||
+        kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_SOCKET) {
         *linux_result = -KERNEL_ESPIPE;
         return KERNEL_FILES_STATUS_OK;
     }

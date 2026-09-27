@@ -10,6 +10,7 @@ struct kernel_heap;
 struct kernel_open_file_description;
 struct kernel_vfs_mount;
 struct kernel_vfs_node;
+struct kernel_socket;
 
 /* Borrowed identity, valid while the regular-file OFD is owned. */
 struct kernel_vfs_node *kernel_open_file_node(
@@ -31,6 +32,7 @@ enum kernel_open_file_kind {
     KERNEL_OPEN_FILE_KIND_EPOLL,
     KERNEL_OPEN_FILE_KIND_NULL,
     KERNEL_OPEN_FILE_KIND_ZERO,
+    KERNEL_OPEN_FILE_KIND_SOCKET,
 };
 
 /* VFS errors are returned through linux_result when status is OK. */
@@ -80,6 +82,13 @@ enum kernel_open_file_status kernel_open_file_create_executable(
 enum kernel_open_file_status kernel_open_file_create_console(
     struct kernel_heap *heap,
     struct kernel_open_file_description **owner);
+
+enum kernel_open_file_status kernel_open_file_create_socket(
+    struct kernel_heap *heap, struct kernel_socket *socket,
+    uint32_t flags, struct kernel_open_file_description **owner);
+
+struct kernel_socket *kernel_open_file_socket(
+    struct kernel_open_file_description *file);
 
 enum kernel_open_file_kind kernel_open_file_kind(
     const struct kernel_open_file_description *file);

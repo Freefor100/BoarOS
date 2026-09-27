@@ -3,6 +3,8 @@
 
 #include <stddef.h>
 
+int atoi(const char *text);
+
 void qsort(void *base,
            size_t count,
            size_t size,

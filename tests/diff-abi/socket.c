@@ -139,6 +139,15 @@ void abi_socket_cases(void)
            : (peer_length == sizeof(udp_peer) &&
               udp_peer.family == LINUX_AF_INET && udp_peer.port != 0 &&
               udp_peer.address == UINT32_C(0x0100007f)));
+    record("socket.udp-write-unconnected",
+           udp_client < 0 ? udp_client : SC3(64, udp_client, "u", 1));
+    send = udp_client < 0 ? udp_client
+           : SC6(206, udp_client, "y", 1, 0, &udp_address,
+                 sizeof(udp_address));
+    payload = 0;
+    received = send == 1 ? SC3(63, udp_server, &payload, 1) : send;
+    abi_record("socket.udp-read", received, -1, -1, 0,
+               received == 1 ? &payload : 0, received == 1 ? 1 : 0);
     close_socket(udp_client);
     close_socket(udp_server);
 
@@ -201,7 +210,106 @@ void abi_socket_cases(void)
            : (peer_length == sizeof(tcp_peer) &&
               tcp_peer.family == LINUX_AF_INET && tcp_peer.port != 0 &&
               tcp_peer.address == UINT32_C(0x0100007f)));
+    long tcp_written = accepted < 0 ? accepted
+                       : SC3(64, tcp_client, "z", 1);
+    record("socket.tcp-write", tcp_written);
+    payload = 0;
+    long tcp_read = tcp_written == 1 ? SC3(63, accepted, &payload, 1)
+                                      : tcp_written;
+    abi_record("socket.tcp-read", tcp_read, -1, -1, 0,
+               tcp_read == 1 ? &payload : 0, tcp_read == 1 ? 1 : 0);
+    struct abi_iovec outgoing[2] = {{"a", 1}, {"b", 1}};
+    long vector_written = tcp_read == 1
+                          ? SC3(66, tcp_client, outgoing, 2) : tcp_read;
+    record("socket.tcp-writev", vector_written);
+    char first = 0, second = 0;
+    struct abi_iovec incoming[2] = {{&first, 1}, {&second, 1}};
+    long vector_read = vector_written == 2
+                       ? SC3(65, accepted, incoming, 2) : vector_written;
+    if (vector_read == 1) {
+        char remaining = 0;
+        long rest = SC3(63, accepted, &remaining, 1);
+        if (rest == 1) {
+            second = remaining;
+            vector_read++;
+        } else {
+            vector_read = rest;
+        }
+    }
+    record("socket.tcp-readv", vector_read == 2 &&
+           first == 'a' && second == 'b');
+    record("socket.tcp-pread", accepted < 0 ? accepted
+           : SC4(67, accepted, &payload, 1, 0));
+    record("socket.tcp-pwrite", accepted < 0 ? accepted
+           : SC4(68, accepted, &payload, 1, 0));
+    record("socket.tcp-lseek", accepted < 0 ? accepted
+           : SC3(62, accepted, 0, 0));
+    struct abi_stat socket_stat;
+    long stat_result = accepted < 0 ? accepted
+                       : SC2(80, accepted, &socket_stat);
+    record("socket.tcp-fstat", stat_result < 0 ? stat_result
+           : ((socket_stat.mode & 0170000U) == 0140000U));
     close_socket(accepted);
     close_socket(tcp_client);
     close_socket(tcp_server);
+
+    /* The server must already be waiting when a nonblocking client sends SYN.
+     * The client then performs no socket operation before checking completion. */
+    struct socket_address blocked_address = {.family = LINUX_AF_INET};
+    long blocked_server = SC3(198, LINUX_AF_INET, LINUX_SOCK_STREAM,
+                               LINUX_IPPROTO_TCP);
+    abi_require(blocked_server >= 0 &&
+                SC3(200, blocked_server, &blocked_address,
+                    sizeof(blocked_address)) == 0);
+    address_length = sizeof(blocked_address);
+    abi_require(SC3(204, blocked_server, &blocked_address,
+                    &address_length) == 0 &&
+                SC2(201, blocked_server, 1) == 0);
+    int ready_pipe[2], done_pipe[2];
+    abi_require(SC2(59, ready_pipe, 0) == 0 &&
+                SC2(59, done_pipe, 0) == 0);
+    long child = CALL(220, 17, 0, 0, 0, 0, 0);
+    abi_require(child >= 0);
+    if (child == 0) {
+        char marker = 'r';
+        char outcome;
+        SC1(57, ready_pipe[0]);
+        SC1(57, done_pipe[0]);
+        abi_require(SC3(64, ready_pipe[1], &marker, 1) == 1);
+        long accepted_fd = SC3(202, blocked_server, 0, 0);
+        outcome = accepted_fd >= 0 ? 0 : 1;
+        if (accepted_fd >= 0) SC1(57, accepted_fd);
+        abi_require(SC3(64, done_pipe[1], &outcome, 1) == 1);
+        abi_exit(outcome);
+    }
+    SC1(57, ready_pipe[1]);
+    SC1(57, done_pipe[1]);
+    char marker;
+    abi_require(SC3(63, ready_pipe[0], &marker, 1) == 1 && marker == 'r');
+    struct socket_pollfd done_fd = {.fd = done_pipe[0], .events = LINUX_POLLIN};
+    struct socket_timespec before_connect = {.nanoseconds = 100000000};
+    abi_require(SC5(73, &done_fd, 1, &before_connect, 0, 0) == 0);
+    long blocked_client = SC3(198, LINUX_AF_INET,
+                              LINUX_SOCK_STREAM | LINUX_SOCK_NONBLOCK,
+                              LINUX_IPPROTO_TCP);
+    abi_require(blocked_client >= 0);
+    blocked_address.address = UINT32_C(0x0100007f);
+    connected = SC3(203, blocked_client, &blocked_address,
+                    sizeof(blocked_address));
+    abi_require(connected == 0 || connected == -LINUX_EINPROGRESS);
+    struct socket_timespec after_connect = {.seconds = 2};
+    long completed = SC5(73, &done_fd, 1, &after_connect, 0, 0);
+    char outcome = 1;
+    int status = 0;
+    if (completed == 1)
+        abi_require(SC3(63, done_pipe[0], &outcome, 1) == 1);
+    else
+        SC2(129, child, 9);
+    abi_require(SC4(260, child, &status, 0, 0) == child);
+    record("socket.tcp-blocked-accept",
+           completed == 1 && outcome == 0 && status == 0);
+    close_socket(blocked_client);
+    close_socket(blocked_server);
+    SC1(57, ready_pipe[0]);
+    SC1(57, done_pipe[0]);
 }

@@ -524,6 +524,8 @@ static int fill_linux_stat(
     } else if (kind == KERNEL_OPEN_FILE_KIND_EPOLL) {
         /* Linux anon_inode_getfile supplies mode 0600 without type bits. */
         stat->st_mode = UINT32_C(0000600);
+    } else if (kind == KERNEL_OPEN_FILE_KIND_SOCKET) {
+        stat->st_mode = KERNEL_VFS_S_IFSOCK | UINT32_C(0000600);
     } else {
         struct kernel_vfs_stat vfs_stat;
         int result = kernel_vfs_fstat(&description->file, &vfs_stat);

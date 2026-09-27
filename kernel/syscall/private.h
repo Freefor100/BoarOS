@@ -3,6 +3,21 @@
 
 #include <kernel/syscall.h>
 
+enum kernel_syscall_status syscall_handle_socket(
+    struct kernel_task *caller,
+    const struct kernel_syscall_request *request,
+    struct kernel_syscall_result *decoded);
+
+enum kernel_syscall_status syscall_handle_bind(
+    struct kernel_task *caller,
+    const struct kernel_syscall_request *request,
+    struct kernel_syscall_result *decoded);
+
+enum kernel_syscall_status syscall_handle_socket_operation(
+    struct kernel_task *caller,
+    const struct kernel_syscall_request *request,
+    struct kernel_syscall_result *decoded);
+
 enum kernel_syscall_status syscall_handle_utimensat(
     struct kernel_task *caller,
     const struct kernel_syscall_request *request,

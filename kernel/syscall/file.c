@@ -3,7 +3,9 @@
 #include <kernel/errno.h>
 #include <kernel/files.h>
 #include <kernel/fs_context.h>
+#include <kernel/open_file.h>
 #include <kernel/task.h>
+#include <kernel/socket.h>
 #include <kernel/uaccess.h>
 
 #include <stddef.h>
@@ -715,6 +717,8 @@ enum kernel_syscall_status syscall_handle_ioctl(
     struct kernel_syscall_result *decoded)
 {
     struct kernel_files *files;
+    struct kernel_open_file_description *file = 0;
+    struct kernel_mm *mm;
     int64_t linux_result;
     enum kernel_task_status task_status = kernel_task_files_borrow(caller, &files);
 
@@ -723,7 +727,54 @@ enum kernel_syscall_status syscall_handle_ioctl(
         decoded->value = -KERNEL_EBADF;
         return KERNEL_SYSCALL_STATUS_OK;
     }
-    if (task_status != KERNEL_TASK_STATUS_OK ||
+    if (task_status != KERNEL_TASK_STATUS_OK)
+        return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    if (request->arguments[1] == UINT64_C(0x8913) ||
+        request->arguments[1] == UINT64_C(0x8914)) {
+        struct {
+            char name[16];
+            uint16_t flags;
+            uint8_t padding[22];
+        } interface;
+        size_t copied = 0;
+        if (kernel_files_pin(files, (int32_t)request->arguments[0],
+                             &file, &linux_result) != KERNEL_FILES_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+        if (linux_result == 0 && kernel_open_file_socket(file) == 0)
+            linux_result = -KERNEL_ENOTTY;
+        if (linux_result == 0 &&
+            kernel_task_mm_borrow_mutable(caller, &mm) != KERNEL_TASK_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+        if (linux_result == 0 &&
+            (kernel_copy_from_user(mm, &interface, request->arguments[2],
+                                   sizeof(interface), &copied) !=
+                 KERNEL_UACCESS_STATUS_OK || copied != sizeof(interface)))
+            linux_result = -KERNEL_EFAULT;
+        if (linux_result == 0) {
+            if (request->arguments[1] == UINT64_C(0x8913)) {
+                linux_result = kernel_socket_loopback_flags(interface.name,
+                                                              &interface.flags);
+                if (linux_result == 0) {
+                    copied = 0;
+                    if (kernel_copy_to_user(mm, request->arguments[2],
+                                            &interface, sizeof(interface),
+                                            &copied) != KERNEL_UACCESS_STATUS_OK ||
+                        copied != sizeof(interface))
+                        linux_result = -KERNEL_EFAULT;
+                }
+            } else {
+                linux_result = kernel_socket_set_loopback_flags(
+                    interface.name, interface.flags);
+            }
+        }
+        if (file != 0 && kernel_open_file_release(&file) !=
+                             KERNEL_OPEN_FILE_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+        decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+        decoded->value = linux_result;
+        return KERNEL_SYSCALL_STATUS_OK;
+    }
+    if (
         kernel_files_ioctl(files, (int64_t)request->arguments[0],
                            request->arguments[1], request->arguments[2],
                            &linux_result) != KERNEL_FILES_STATUS_OK)
