@@ -14,6 +14,7 @@
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <sys/uio.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -749,6 +750,22 @@ static int check_shared_socket_pin(void)
     int receiver = bind_loopback_udp(&address);
     int sender = socket(AF_INET, SOCK_DGRAM, 0);
     if (receiver < 0 || sender < 0) return 1;
+    char empty_followup = 0;
+    if (sendto(sender, "", 0, 0, (struct sockaddr *)&address,
+               sizeof(address)) != 0 ||
+        read(receiver, &empty_followup, 1) != 0 ||
+        sendto(sender, "r", 1, 0, (struct sockaddr *)&address,
+               sizeof(address)) != 1 ||
+        read(receiver, &empty_followup, 1) != 1 ||
+        empty_followup != 'r') return 10;
+    struct iovec empty_vector = {&empty_followup, 1};
+    if (sendto(sender, "", 0, 0, (struct sockaddr *)&address,
+               sizeof(address)) != 0 ||
+        readv(receiver, &empty_vector, 1) != 0 ||
+        sendto(sender, "s", 1, 0, (struct sockaddr *)&address,
+               sizeof(address)) != 1 ||
+        read(receiver, &empty_followup, 1) != 1 ||
+        empty_followup != 's') return 11;
     for (int index = 0; index < 2; index++) {
         readers[index].read_fd = receiver;
         if (pthread_create(&threads[index], 0, blocked_reader,

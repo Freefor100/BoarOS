@@ -85,6 +85,14 @@ socket.udp-recvfrom
 socket.udp-peer
 socket.udp-write-unconnected
 socket.udp-read
+socket.udp-send-empty-for-read
+socket.udp-read-empty
+socket.udp-send-after-empty-read
+socket.udp-read-after-empty
+socket.udp-send-empty-for-readv
+socket.udp-readv-empty
+socket.udp-send-after-empty-readv
+socket.udp-read-after-empty-readv
 socket.udp-recvfrom-copy-fault
 socket.udp-after-copy-fault
 socket.udp-empty-bad-range

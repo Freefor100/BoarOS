@@ -12,7 +12,9 @@
 
 单 hart 下，登记/检查就绪与睡眠用已有关中断临界区。socket syscall 与轮询入口推进 lwIP loopback 队列和协议定时器；非阻塞 connect 发出 SYN 后立即推进一次，保证已经睡眠的另一进程 accept 能被唤醒，而不依赖客户端下一次系统调用。阻塞 connect 等到握手结果，阻塞接收以 socket 队列或协议定时器唤醒；通用 poll/ppoll 和 epoll/epoll_pwait 在监听 socket 时也把最近协议定时器纳入睡眠期限，包含混合普通 fd 和无限等待。信号沿既有 syscall restart 协议，带接收超时的中断返回 `EINTR`。待 accept 子连接在对端 reset 后从队列摘除；未 listen 的 stream 和 datagram accept 立即返回类型对应错误，监听 socket 的 `SO_RCVTIMEO` 约束阻塞 accept。
 
-普通 socket read/readv 把队首数据暂存到内核栈后登记任务级 read reservation，并把 syscall 的 OFD pin 暂交给 reservation；用户复制完整成功才提交 TCP 消费，复制 fault 保留整段 TCP 数据，UDP fault 丢弃该 datagram。reservation 期间同一 socket 的 read/recvfrom 不得越过队首；同一 OFD 的第二线程等待其释放。正常返回恢复原 pin，强制退出在文件表释放前取消 reservation 并释放 pin。固定 Linux 的坏指针和跨页 read/readv 返回 `EFAULT`，后续 read 可读回完整 TCP 数据。`recvfrom` 的缓冲区范围在等待空 UDP socket 前检查，负的 `socklen_t` 返回 `EINVAL`；accept/recvfrom 的地址输出错误发生在协议 dequeue 后，与固定 Linux 顺序一致。
+普通 socket read/readv 把队首数据暂存到内核栈后登记任务级 read reservation，并把 syscall 的 OFD pin 暂交给 reservation；用户复制完整成功才提交 TCP 消费，复制 fault 保留整段 TCP 数据，UDP fault 丢弃该 datagram。零长度 UDP datagram 即使返回 0 也必须完成 reservation、消费队首并恢复 pin；TCP EOF 返回 0 时没有 reservation。reservation 期间同一 socket 的 read/recvfrom 不得越过队首；同一 OFD 的第二线程等待其释放。正常返回恢复原 pin，强制退出在文件表释放前取消 reservation 并释放 pin。固定 Linux 的坏指针和跨页 read/readv 返回 `EFAULT`，后续 read 可读回完整 TCP 数据。`recvfrom` 的缓冲区范围在等待空 UDP socket 前检查，负的 `socklen_t` 返回 `EINVAL`；accept/recvfrom 的地址输出错误发生在协议 dequeue 后，与固定 Linux 顺序一致。
+
+sendto 和 recvfrom 的暂存 pbuf/packet 在 syscall 栈中持有，并在正常或 fault 返回时释放。现有线程组强制退出只标记/唤醒等待中的线程：它先沿保存的 syscall 栈返回，后在 user-return 处理终止；因此不会跳过这两个局部 cleanup。将来若增加可直接抛弃内核调用栈的非局部退出，必须重新审计这些 owner。
 
 TCP `POLLOUT` 同时要求发送缓冲和队列空间。`tcp_write` 还可能因全局 segment/pbuf 池满而返回 `ERR_MEM`，此时 socket 撤下可写事件并登记有界重试期限；ACK、成功写、错误或销毁解除登记。等待者取最近的 lwIP 协议和写重试期限，池释放后即使没有 ACK 也能继续，而不会因虚假的 `POLLOUT` 在单 hart 上空转。`F_SETFL(F_GETFL|O_NONBLOCK)` 接受已有 access mode 位，只更新可变状态位。
 
@@ -28,6 +30,6 @@ python3 tests/program-inventory/run.py --suite libc \
   --require-pass --output build/socket-program-check
 ```
 
-host 入口实测 UDP loopback、PCB 16 个用尽后第 17 个失败、全部释放和再分配，另在 `sndbuf>0` 时耗尽全局 TCP segment 池触发真实 `tcp_write ERR_MEM`，以及 TCP 握手/关闭后推进 200 秒协议计时、池用量回到基线。当前 64 条 socket 差分记录覆盖两进程握手、读/向量读 fault 保留、UDP fault 丢弃、负地址长度、accept 超时、F_SETFL access mode、ppoll/epoll 的协议定时器和混合 fd；本分支 460 条 Linux/BoarOS 记录一致。真实 pthread U-mode 另覆盖共享 socket 双读、阻塞读时 close/fd 复用、双读线程组 SIGKILL、全局池压力下错误可写事件及释放后写入进展，关机检查 `heap-live=0`。线程组 SIGKILL 测试可控地覆盖等待和竞争路径，但公开 ABI 无法精确钉住 staging 到 usercopy 的极短窗口。原版 libc-test `functional/socket.c` 的静态、动态直接 entry 用未改源码和同一 ELF 在双方通过；全量 228 项清单尚须在合并内核上重跑。
+host 入口实测 UDP loopback、PCB 16 个用尽后第 17 个失败、全部释放和再分配，另在 `sndbuf>0` 时耗尽全局 TCP segment 池触发真实 `tcp_write ERR_MEM`，以及 TCP 握手/关闭后推进 200 秒协议计时、池用量回到基线。当前 72 条 socket 差分记录覆盖两进程握手、零长度 UDP read/readv 及后续数据、读/向量读 fault 保留、UDP fault 丢弃、负地址长度、accept 超时、F_SETFL access mode、ppoll/epoll 的协议定时器和混合 fd；本分支 468 条 Linux/BoarOS 记录一致。真实 pthread U-mode 另覆盖零长度 datagram、共享 socket 双读、阻塞读时 close/fd 复用、双读线程组 SIGKILL、全局池压力下错误可写事件及释放后写入进展，关机检查 `heap-live=0`。线程组 SIGKILL 测试可控地覆盖等待和竞争路径，但公开 ABI 无法精确钉住 staging 到 usercopy 的极短窗口。原版 libc-test `functional/socket.c` 的静态、动态直接 entry 用未改源码和同一 ELF 在双方通过；全量 228 项清单尚须在合并内核上重跑。
 
 Linux ABI 依据本地 `references/linux/net/socket.c`、`net/ipv4/af_inet.c`、`fs/read_write.c`，commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`；测试构建来自 `references/oscomp-testsuits` commit `8b58dd16d26d30f7c74d48d5832d870d3051b703`。核对后运行 `make prune-build` 清理日志和镜像。

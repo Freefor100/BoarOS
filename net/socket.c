@@ -676,7 +676,9 @@ void kernel_socket_finish_read(struct kernel_socket_read_request *request,
         socket->packets_head != request->packet) __builtin_trap();
     packet = socket->packets_head;
     available = packet->payload->tot_len - packet->consumed;
-    if (bytes == 0U || bytes > available) __builtin_trap();
+    if (bytes > available ||
+        (socket->type == SOCKET_STREAM && bytes == 0U))
+        __builtin_trap();
     /* TCP advances only after the complete staged copy succeeds. A fault in
      * this skb leaves its bytes queued, even when usercopy wrote a prefix.
      * UDP drops the datagram on copy fault, matching udp_recvmsg. */

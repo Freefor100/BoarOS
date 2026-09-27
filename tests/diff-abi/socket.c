@@ -178,6 +178,25 @@ void abi_socket_cases(void)
     received = send == 1 ? SC3(63, udp_server, &payload, 1) : send;
     abi_record("socket.udp-read", received, -1, -1, 0,
                received == 1 ? &payload : 0, received == 1 ? 1 : 0);
+    record("socket.udp-send-empty-for-read",
+           SC6(206, udp_client, "", 0, 0, &udp_address,
+               sizeof(udp_address)));
+    record("socket.udp-read-empty", SC3(63, udp_server, &payload, 1));
+    record("socket.udp-send-after-empty-read",
+           SC6(206, udp_client, "r", 1, 0, &udp_address,
+               sizeof(udp_address)));
+    record("socket.udp-read-after-empty", SC3(63, udp_server, &payload, 1));
+    record("socket.udp-send-empty-for-readv",
+           SC6(206, udp_client, "", 0, 0, &udp_address,
+               sizeof(udp_address)));
+    struct abi_iovec empty_vector = {&payload, 1};
+    record("socket.udp-readv-empty",
+           SC3(65, udp_server, &empty_vector, 1));
+    record("socket.udp-send-after-empty-readv",
+           SC6(206, udp_client, "s", 1, 0, &udp_address,
+               sizeof(udp_address)));
+    record("socket.udp-read-after-empty-readv",
+           SC3(63, udp_server, &payload, 1));
     long udp_fault_map = CALL(222, 0, 8192, 3, 0x22, -1, 0);
     abi_require(udp_fault_map >= 0 &&
                 SC3(226, udp_fault_map + 4096, 4096, 0) == 0);

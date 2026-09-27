@@ -196,6 +196,11 @@ static enum kernel_files_status read_pinned(
                                       access == KERNEL_UACCESS_STATUS_FAULT);
             if (access == KERNEL_UACCESS_STATUS_FAULT)
                 received = -KERNEL_EFAULT;
+        } else if (read_request.socket != 0) {
+            /* A zero-length UDP datagram still owns a staged reservation and
+             * consumes one queued packet. TCP EOF has no reservation. */
+            if (received != 0) return KERNEL_FILES_STATUS_STATE;
+            kernel_socket_finish_read(&read_request, 0);
         }
         *linux_result = received;
         if (received < 0) files->record->statistics.read_failures++;
