@@ -3,6 +3,7 @@ full	os2026	https://gitlab.eduxiji.net/csc1/csc-os/os2026	-	d9a3cf1fbe597f135849
 full	oscomp-testsuits	https://github.com/oscomp/testsuits-for-oskernel.git	-	b5ec6ef8497e1818cbdec3b54bb722f036e57972
 full	oscomp-autotest	https://github.com/oscomp/autotest-for-oskernel.git	-	d1bb3a3c4b27274e196a2648518525c1a304e339
 snapshot	linux	https://github.com/torvalds/linux.git	f4cdf7ca9a1fdcca413157df19753f388a5a224e	f4cdf7ca9a1fdcca413157df19753f388a5a224e
+snapshot	lwip	https://github.com/lwip-tcpip/lwip.git	refs/tags/STABLE-2_2_1_RELEASE	77dcd25a72509eb83f72b033d219b1d40cd8eb95
 snapshot	qemu	https://gitlab.com/qemu-project/qemu.git	refs/tags/v11.1.0	84f07211cc5b4fc6a371559bf8a5de4fb068e648
 snapshot	opensbi	https://github.com/riscv-software-src/opensbi.git	refs/tags/v1.8.1	74434f255873d74e56cc50aa762d1caf24c099f8
 snapshot	loongarch-documentation	https://github.com/loongson/LoongArch-Documentation.git	e0d6592229d9e00e512bd28b688a7f20b171714f	e0d6592229d9e00e512bd28b688a7f20b171714f

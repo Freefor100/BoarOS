@@ -1,0 +1,2 @@
+# Preserve the pinned upstream lwIP snapshot byte-for-byte.
+third_party/lwip/** whitespace=-trailing-space,-blank-at-eof

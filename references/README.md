@@ -47,6 +47,11 @@ prepare-offline-c-toolchain` 将原包原样解到忽略的
 `build/offline-c/alpine-tree/`，并验证树哈希，不修改上游文件。完整包名、
 版本与许可见[程序环境模块](../docs/modules/program-environment.md)。
 
+lwIP 网络栈固定为 `lwip/` 的 `STABLE-2_2_1_RELEASE`，peeled commit
+`77dcd25a72509eb83f72b033d219b1d40cd8eb95`。生产构建使用仓库内
+`third_party/lwip/` 的 `src/core`、`src/include` 与 `COPYING` 原样导入；
+`references/lwip/` 用于核对导入内容和上游语义，不作为构建时的隐藏依赖。
+
 musl 以校验过的 `musl/musl-1.2.5.tar.gz` 保存，不在 `references/` 另建源码快照。列出和读取
 单个成员可直接使用：
 

@@ -1,5 +1,14 @@
 # 第三方代码
 
+## lwIP
+
+- 上游地址：<https://github.com/lwip-tcpip/lwip>（Savannah 上游的官方镜像）。
+- 固定版本：`STABLE-2_2_1_RELEASE`，peeled commit `77dcd25a72509eb83f72b033d219b1d40cd8eb95`；`references/sources.tsv` 固定恢复身份，2026-09-27 核对。
+- 导入路径：`third_party/lwip/`，保留 `src/core/`、`src/include/` 和 `COPYING`；未导入 socket/netconn API 实现、应用、PPP 和网卡驱动源码。
+- 许可证：BSD-3-Clause，原有版权和许可声明保留在每个源码文件及 `COPYING`。
+- 用途：向 BoarOS 自有 socket fd/OFD 与 Linux ABI 层提供单 hart IPv4 UDP/TCP 协议核心；本阶段先用 NO_SYS raw API 和 loopback，网卡后端另行验证。
+- 本地修改：导入的上游文件未修改；BoarOS 的 lwIP 配置、端口和 socket 所有权适配位于 `net/` 与 `fs/`，不以 lwIP 的 socket fd 空间代替 BoarOS 文件表。
+
 ## lwext4
 
 - 上游地址：<https://github.com/gkostka/lwext4>
