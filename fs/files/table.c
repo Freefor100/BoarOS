@@ -15,6 +15,7 @@
 #include <string.h>
 
 #define LINUX_O_APPEND UINT64_C(00002000)
+#define LINUX_O_ACCMODE UINT64_C(00000003)
 #define LINUX_O_NONBLOCK UINT64_C(00004000)
 #define LINUX_O_LARGEFILE UINT64_C(00100000)
 #define LINUX_O_CLOEXEC UINT64_C(02000000)
@@ -958,7 +959,7 @@ enum kernel_files_status kernel_files_fcntl(
          * targets.  It is an accepted, non-modifiable status bit; only
          * APPEND and NONBLOCK are changed here.
          */
-        if ((argument & ~(LINUX_O_APPEND | LINUX_O_NONBLOCK |
+        if ((argument & ~(LINUX_O_ACCMODE | LINUX_O_APPEND | LINUX_O_NONBLOCK |
                           LINUX_O_LARGEFILE)) != 0U) {
             *linux_result = -KERNEL_EINVAL;
             return KERNEL_FILES_STATUS_OK;

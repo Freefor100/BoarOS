@@ -120,6 +120,7 @@ struct kernel_task {
     uint32_t wake_reason;
     uint32_t wait_interruptible;
     struct kernel_syscall_restart_state syscall_restart;
+    struct kernel_socket_read_request *socket_read_request;
     uint64_t user_ticks;
     uint64_t kernel_ticks;
     uint64_t child_user_ticks;

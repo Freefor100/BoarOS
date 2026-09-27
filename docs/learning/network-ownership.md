@@ -7,3 +7,7 @@
 `NO_SYS` 没有独立网络线程。若服务端已睡在 accept，客户端非阻塞 connect 返回后不再调用 socket，SYN 若只留在 lwIP loopback 队列，服务端会永久睡眠。因此发起 connect 的系统调用必须推进一次 loopback，轮询与定时等待也推进协议。两进程握手测试固定顺序，排除了同进程立即 accept 偶然泵送队列的伪通过。另一条生命周期边界是 TCP `tcp_close` 在已连接状态可能暂保留 FIN/TIME_WAIT PCB；销毁 OFD 前必须先解绑指向 BoarOS 堆对象的回调，host 测试随后推进 200 秒计时并检查静态池回到基线。待 accept 子连接的 reset 也必须在 dequeue 前剔除。
 
 固定参考是本地 `references/lwip/` 和导入的 `third_party/lwip/` 同一 commit；移植只在 `net/lwip_port/`，不修改上游 core。重建入口与当前能力边界见[网络模块](../modules/kernel-network.md)。外部网卡、AF_UNIX、半关闭和 SMP 的 owner/同步仍需要单独验证。
+
+后续固定 Linux read/readv 差分暴露两个消费边界：TCP 的用户复制跨页 fault 返回 `EFAULT`，下一次读取仍得到完整那段数据；UDP 的 recvfrom 复制 fault 则丢弃整个 datagram。先从 lwIP 队列摘数据再做可 fault 的用户复制会丢 TCP 字节；只 peek 后不保留身份又允许共享 OFD 的第二线程在复制时改动队首。解决办法是把队首 reservation 登记在任务和 socket，并暂移 OFD pin。提交或取消时验证同一 packet；强制退出在文件表清理前取消，避免被抛弃的内核调用栈留下悬空 reservation 或永久 pin。固定 Linux 依据为 `references/linux/net/ipv4/tcp.c`、`net/ipv4/udp.c`、`net/socket.c`，commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`。
+
+另一个边界是 lwIP `tcp_write` 在 `sndbuf>0` 时仍可能因 `snd_queuelen` 或全局 `MEMP_TCP_SEG`/pbuf 用尽而返回 `ERR_MEM`。只用 `sndbuf` 宣告 `POLLOUT` 会让阻塞 write 在同一 hart 上反复得到 `EAGAIN` 并立即再醒。固定 lwIP `third_party/lwip/src/core/tcp_out.c` 的检查和 host 池耗尽测试证明了触发条件；BoarOS 在真实失败时撤下可写事件，将 bounded retry 纳入 poll/epoll 与 socket 等待期限，ACK 和池释放均可促成后续写入。真实 pthread U-mode 用 UDP 接收队列占满静态 lwIP 内存，验证非阻塞 TCP write 得到 `EAGAIN` 后 `poll(POLLOUT,0)` 不虚报，释放队列后 2 秒内可写并完成写入。这个测试在旧只看 `sndbuf` 的实现上会于立即 POLLOUT 检查失败。

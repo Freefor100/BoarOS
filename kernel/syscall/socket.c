@@ -99,13 +99,15 @@ static int copy_address_out(struct kernel_mm *mm, uint64_t user_address,
         .port = network_port(port),
         .address = address,
     };
-    uint32_t length;
+    int32_t length;
     size_t copied = 0;
     if (kernel_copy_from_user(mm, &length, user_length, sizeof(length),
                               &copied) != KERNEL_UACCESS_STATUS_OK ||
         copied != sizeof(length)) return -KERNEL_EFAULT;
+    if (length < 0) return -KERNEL_EINVAL;
     copied = 0;
-    size_t written = length < sizeof(local) ? length : sizeof(local);
+    size_t written = (size_t)length < sizeof(local)
+                         ? (size_t)length : sizeof(local);
     if (written != 0 &&
         (kernel_copy_to_user(mm, user_address, &local, written, &copied) !=
              KERNEL_UACCESS_STATUS_OK || copied != written))
@@ -281,6 +283,13 @@ enum kernel_syscall_status syscall_handle_socket_operation(
     int op = (int)request->number;
 
     decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+    /* import_ubuf precedes fd lookup and the UDP receive wait on Linux. */
+    if (op == 207 && kernel_user_range_check(
+            request->arguments[1], (size_t)request->arguments[2]) !=
+            KERNEL_UACCESS_STATUS_OK) {
+        decoded->value = -KERNEL_EFAULT;
+        return KERNEL_SYSCALL_STATUS_OK;
+    }
     if (borrow_socket(caller, (int32_t)request->arguments[0],
                       &files, &file, &result) != KERNEL_SYSCALL_STATUS_OK)
         return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
@@ -377,7 +386,10 @@ enum kernel_syscall_status syscall_handle_socket_operation(
         break;
     }
     case 202: /* accept */
-        result = wait_ready(caller, file, KERNEL_POLLIN, 0U);
+        result = kernel_socket_accept_check(socket);
+        if (result != 0) break;
+        result = wait_ready(caller, file, KERNEL_POLLIN,
+                            kernel_socket_receive_timeout(socket));
         if (result != 0) break;
         if (kernel_files_socket_accept(files, file, 0U, &peer_address,
                                        &peer_port, &result) !=

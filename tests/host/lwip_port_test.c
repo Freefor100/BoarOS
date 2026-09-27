@@ -2,6 +2,7 @@
 
 #include "lwip/init.h"
 #include "lwip/ip_addr.h"
+#include "lwip/memp.h"
 #include "lwip/netif.h"
 #include "lwip/pbuf.h"
 #include "lwip/stats.h"
@@ -85,6 +86,8 @@ int main(void)
     u16_t tcp_before;
     u16_t listen_before;
     u16_t segment_before;
+    void *held_segments[MEMP_NUM_TCP_SEG];
+    unsigned int held_count = 0;
 
     lwip_init();
     udp_before = lwip_stats.memp[MEMP_UDP_PCB]->used;
@@ -162,6 +165,24 @@ int main(void)
     netif_poll_all();
     if (tcp_connected != 1U || tcp_accepted == 0) {
         return 13;
+    }
+    /* A different connection can exhaust the global segment pool while this
+     * connected writer still has sndbuf. This is the ERR_MEM path that must
+     * not appear as POLLOUT until a retry can make progress. */
+    while (held_count < MEMP_NUM_TCP_SEG &&
+           (held_segments[held_count] = memp_malloc(MEMP_TCP_SEG)) != 0) {
+        held_count++;
+    }
+    if (held_count == 0U || tcp_sndbuf(tcp_client) == 0U ||
+        tcp_write(tcp_client, "x", 1U, TCP_WRITE_FLAG_COPY) != ERR_MEM) {
+        return 16;
+    }
+    for (unsigned int i = 0; i < held_count; i++) {
+        memp_free(MEMP_TCP_SEG, held_segments[i]);
+    }
+    if (tcp_write(tcp_client, "x", 1U, TCP_WRITE_FLAG_COPY) != ERR_OK ||
+        tcp_output(tcp_client) != ERR_OK) {
+        return 17;
     }
     if (tcp_close(tcp_accepted) != ERR_OK ||
         tcp_close(tcp_client) != ERR_OK ||

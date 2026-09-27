@@ -1,12 +1,19 @@
 #define _GNU_SOURCE
+#include <arpa/inet.h>
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <net/if.h>
+#include <netinet/in.h>
+#include <poll.h>
 #include <pthread.h>
 #include <sched.h>
 #include <signal.h>
 #include <sys/mman.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <sys/time.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -702,6 +709,207 @@ static int check_shared_fd_pin(void)
     return 0;
 }
 
+static int bind_loopback_udp(struct sockaddr_in *address)
+{
+    struct ifreq interface = {0};
+    socklen_t length = sizeof(*address);
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) return -1;
+    memcpy(interface.ifr_name, "lo", 3);
+    if (ioctl(fd, SIOCGIFFLAGS, &interface) != 0) return -1;
+    if ((interface.ifr_flags & IFF_UP) == 0) {
+        interface.ifr_flags |= IFF_UP;
+        if (ioctl(fd, SIOCSIFFLAGS, &interface) != 0) return -1;
+    }
+    *address = (struct sockaddr_in){
+        .sin_family = AF_INET,
+        .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+    };
+    if (bind(fd, (const struct sockaddr *)address, sizeof(*address)) != 0 ||
+        getsockname(fd, (struct sockaddr *)address, &length) != 0 ||
+        length != sizeof(*address) || address->sin_port == 0)
+        return -1;
+    struct timeval timeout = {.tv_sec = 2};
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout,
+                   sizeof(timeout)) != 0) return -1;
+    return fd;
+}
+
+static int check_shared_socket_pin(void)
+{
+    struct sockaddr_in address;
+    struct fd_case readers[2] = {
+        {.mutex = PTHREAD_MUTEX_INITIALIZER,
+         .condition = PTHREAD_COND_INITIALIZER},
+        {.mutex = PTHREAD_MUTEX_INITIALIZER,
+         .condition = PTHREAD_COND_INITIALIZER},
+    };
+    pthread_t threads[2];
+    struct timespec pause_time = {.tv_nsec = 10000000L};
+    int receiver = bind_loopback_udp(&address);
+    int sender = socket(AF_INET, SOCK_DGRAM, 0);
+    if (receiver < 0 || sender < 0) return 1;
+    for (int index = 0; index < 2; index++) {
+        readers[index].read_fd = receiver;
+        if (pthread_create(&threads[index], 0, blocked_reader,
+                           &readers[index]) != 0) return 2;
+    }
+    for (int index = 0; index < 2; index++) {
+        pthread_mutex_lock(&readers[index].mutex);
+        while (!readers[index].ready)
+            pthread_cond_wait(&readers[index].condition,
+                              &readers[index].mutex);
+        pthread_mutex_unlock(&readers[index].mutex);
+    }
+    nanosleep(&pause_time, 0);
+    if (sendto(sender, "A", 1, 0, (struct sockaddr *)&address,
+               sizeof(address)) != 1 ||
+        sendto(sender, "B", 1, 0, (struct sockaddr *)&address,
+               sizeof(address)) != 1) return 3;
+    if (pthread_join(threads[0], 0) != 0 ||
+        pthread_join(threads[1], 0) != 0 ||
+        readers[0].result != 1 || readers[1].result != 1 ||
+        readers[0].byte == readers[1].byte ||
+        (readers[0].byte != 'A' && readers[0].byte != 'B') ||
+        (readers[1].byte != 'A' && readers[1].byte != 'B')) return 4;
+
+    readers[0] = (struct fd_case){
+        .mutex = PTHREAD_MUTEX_INITIALIZER,
+        .condition = PTHREAD_COND_INITIALIZER,
+        .read_fd = receiver,
+    };
+    if (pthread_create(&threads[0], 0, blocked_reader, &readers[0]) != 0)
+        return 5;
+    pthread_mutex_lock(&readers[0].mutex);
+    while (!readers[0].ready)
+        pthread_cond_wait(&readers[0].condition, &readers[0].mutex);
+    pthread_mutex_unlock(&readers[0].mutex);
+    nanosleep(&pause_time, 0);
+    if (close(receiver) != 0) return 6;
+    int reused = socket(AF_INET, SOCK_DGRAM, 0);
+    if (reused != receiver) return 7;
+    if (sendto(sender, "C", 1, 0, (struct sockaddr *)&address,
+               sizeof(address)) != 1 ||
+        pthread_join(threads[0], 0) != 0 ||
+        readers[0].result != 1 || readers[0].byte != 'C') return 8;
+    if (close(reused) != 0 || close(sender) != 0) return 9;
+    return 0;
+}
+
+static int check_socket_group_exit(void)
+{
+    int sender = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sender < 0) return 1;
+    for (int round = 0; round < 8; round++) {
+        int handshake[2];
+        if (pipe(handshake) != 0) return 2;
+        pid_t child = fork();
+        if (child < 0) return 3;
+        if (child == 0) {
+            struct sockaddr_in address;
+            struct fd_case readers[2] = {
+                {.mutex = PTHREAD_MUTEX_INITIALIZER,
+                 .condition = PTHREAD_COND_INITIALIZER},
+                {.mutex = PTHREAD_MUTEX_INITIALIZER,
+                 .condition = PTHREAD_COND_INITIALIZER},
+            };
+            pthread_t threads[2];
+            close(handshake[0]);
+            int receiver = bind_loopback_udp(&address);
+            if (receiver < 0) _exit(11);
+            for (int index = 0; index < 2; index++) {
+                readers[index].read_fd = receiver;
+                if (pthread_create(&threads[index], 0, blocked_reader,
+                                   &readers[index]) != 0) _exit(12);
+            }
+            for (int index = 0; index < 2; index++) {
+                pthread_mutex_lock(&readers[index].mutex);
+                while (!readers[index].ready)
+                    pthread_cond_wait(&readers[index].condition,
+                                      &readers[index].mutex);
+                pthread_mutex_unlock(&readers[index].mutex);
+            }
+            if (write(handshake[1], &address, sizeof(address)) !=
+                sizeof(address)) _exit(13);
+            for (;;) pause();
+        }
+        close(handshake[1]);
+        struct sockaddr_in address;
+        if (read(handshake[0], &address, sizeof(address)) !=
+            sizeof(address)) return 4;
+        close(handshake[0]);
+        struct timespec pause_time = {.tv_nsec = 10000000L};
+        nanosleep(&pause_time, 0);
+        if (sendto(sender, "X", 1, 0, (struct sockaddr *)&address,
+                   sizeof(address)) != 1 ||
+            sendto(sender, "Y", 1, 0, (struct sockaddr *)&address,
+                   sizeof(address)) != 1 ||
+            kill(child, SIGKILL) != 0) return 5;
+        int status = 0;
+        if (waitpid(child, &status, 0) != child ||
+            !WIFSIGNALED(status) || WTERMSIG(status) != SIGKILL)
+            return 6;
+    }
+    return close(sender) == 0 ? 0 : 7;
+}
+
+static int check_socket_pool_pressure(void)
+{
+    struct sockaddr_in tcp_address = {
+        .sin_family = AF_INET,
+        .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+    };
+    socklen_t length = sizeof(tcp_address);
+    int listener = socket(AF_INET, SOCK_STREAM, 0);
+    if (listener < 0 ||
+        bind(listener, (struct sockaddr *)&tcp_address,
+             sizeof(tcp_address)) != 0 ||
+        getsockname(listener, (struct sockaddr *)&tcp_address,
+                    &length) != 0 ||
+        listen(listener, 1) != 0) return 1;
+    int client = socket(AF_INET, SOCK_STREAM, 0);
+    if (client < 0 || connect(client, (struct sockaddr *)&tcp_address,
+                              sizeof(tcp_address)) != 0) return 2;
+    int accepted = accept(listener, 0, 0);
+    if (accepted < 0) return 3;
+    int flags = fcntl(client, F_GETFL);
+    if (flags < 0 || fcntl(client, F_SETFL, flags | O_NONBLOCK) != 0)
+        return 4;
+
+    struct sockaddr_in udp_address;
+    int receiver = bind_loopback_udp(&udp_address);
+    int sender = socket(AF_INET, SOCK_DGRAM, 0);
+    if (receiver < 0 || sender < 0) return 5;
+    int exhausted = 0;
+    for (int attempts = 0; attempts < 8192; attempts++) {
+        if (sendto(sender, "p", 1, 0, (struct sockaddr *)&udp_address,
+                   sizeof(udp_address)) == 1) continue;
+        if (errno != ENOMEM) return 6;
+        exhausted = 1;
+        break;
+    }
+    if (!exhausted) return 7;
+    struct pollfd ready = {.fd = client, .events = POLLOUT};
+    if (poll(&ready, 1, 0) != 1 || !(ready.revents & POLLOUT))
+        return 8;
+    char large[8192] = {0};
+    errno = 0;
+    if (write(client, large, sizeof(large)) != -1 || errno != EAGAIN)
+        return 9;
+    ready.revents = 0;
+    if (poll(&ready, 1, 0) != 0 || (ready.revents & POLLOUT))
+        return 10;
+    if (close(receiver) != 0) return 11;
+    ready.revents = 0;
+    if (poll(&ready, 1, 2000) != 1 || !(ready.revents & POLLOUT))
+        return 12;
+    if (fcntl(client, F_SETFL, flags) != 0 || write(client, "v", 1) != 1)
+        return 13;
+    if (close(sender) != 0 || close(client) != 0 ||
+        close(accepted) != 0 || close(listener) != 0) return 14;
+    return 0;
+}
+
 static int leader_pipe_fd;
 
 static void *last_thread_worker(void *opaque)
@@ -1278,6 +1486,15 @@ int main(int argc, char **argv)
     if (run_check("shared fd",
                   "BoarOS: real pthread shared fd checks ok",
                   check_shared_fd_pin) != 0) return 5;
+    if (run_check("shared socket",
+                  "BoarOS: real pthread shared socket checks ok",
+                  check_shared_socket_pin) != 0) return 13;
+    if (run_check("socket group exit",
+                  "BoarOS: real pthread socket group exit checks ok",
+                  check_socket_group_exit) != 0) return 14;
+    if (run_check("socket pool pressure",
+                  "BoarOS: real pthread socket pool pressure checks ok",
+                  check_socket_pool_pressure) != 0) return 15;
     if (run_check("group limits",
                   "BoarOS: real pthread group limits checks ok",
                   check_group_limits) != 0) return 8;

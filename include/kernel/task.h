@@ -8,6 +8,7 @@ struct kernel_task;
 struct kernel_mm;
 struct kernel_files;
 struct kernel_fs_context;
+struct kernel_socket_read_request;
 
 enum kernel_task_status {
     KERNEL_TASK_STATUS_OK = 0,
@@ -18,6 +19,10 @@ enum kernel_task_status {
 
 /* Returns the scheduler current task, or null before scheduler publication. */
 struct kernel_task *kernel_task_current(void);
+enum kernel_task_status kernel_task_socket_read_register(
+    struct kernel_task *task, struct kernel_socket_read_request *request);
+enum kernel_task_status kernel_task_socket_read_clear(
+    struct kernel_task *task, struct kernel_socket_read_request *request);
 
 /* Records the set_tid_address clear pointer and returns the caller tid. */
 enum kernel_task_status kernel_task_set_tid_address(

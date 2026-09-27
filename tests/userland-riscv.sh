@@ -147,6 +147,9 @@ for marker in \
     'BoarOS: real pthread cancellation checks ok' \
     'BoarOS: real pthread dlopen TLS checks ok' \
     'BoarOS: real pthread shared fd checks ok' \
+    'BoarOS: real pthread shared socket checks ok' \
+    'BoarOS: real pthread socket group exit checks ok' \
+    'BoarOS: real pthread socket pool pressure checks ok' \
     'BoarOS: real pthread group limits checks ok' \
     'BoarOS: real pthread lifecycle checks ok' \
     'BoarOS: real pthread futex ABI checks ok' \

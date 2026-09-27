@@ -127,6 +127,7 @@ static enum kernel_files_status read_pinned(
     struct kernel_files *files,
     struct kernel_mm *mm,
     struct kernel_open_file_description *description,
+    struct kernel_open_file_description **description_owner,
     const struct kernel_uaccess_iovec *iov,
     size_t iov_count,
     uint64_t count,
@@ -148,6 +149,7 @@ static enum kernel_files_status read_pinned(
     }
     if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_SOCKET) {
         uint8_t staging[256];
+        struct kernel_socket_read_request read_request = {0};
         size_t copied = 0U;
         int received;
         for (size_t index = 0; index < iov_count; index++) {
@@ -165,7 +167,8 @@ static enum kernel_files_status read_pinned(
         }
         for (;;) {
             received = kernel_socket_read_buffer(
-                kernel_open_file_socket(description), staging,
+                kernel_open_file_socket(description), kernel_task_current(),
+                &read_request, description_owner, staging,
                 count < sizeof(staging) ? (uint32_t)count : sizeof(staging));
             if (received != -KERNEL_EAGAIN) break;
             int waited = socket_wait_ready(description, KERNEL_POLLIN,
@@ -179,11 +182,20 @@ static enum kernel_files_status read_pinned(
         if (received > 0) {
             enum kernel_uaccess_status access = kernel_copy_to_user_iov(
                 mm, &cursor, staging, (size_t)received, &copied);
-            if (access == KERNEL_UACCESS_STATUS_FAULT)
-                received = copied != 0U ? (int)copied : -KERNEL_EFAULT;
-            else if (access != KERNEL_UACCESS_STATUS_OK ||
-                     copied != (size_t)received)
+            if (access != KERNEL_UACCESS_STATUS_OK &&
+                access != KERNEL_UACCESS_STATUS_FAULT) {
+                kernel_socket_finish_read(&read_request, 1);
                 return KERNEL_FILES_STATUS_STATE;
+            }
+            if (access == KERNEL_UACCESS_STATUS_OK &&
+                     copied != (size_t)received) {
+                kernel_socket_finish_read(&read_request, 1);
+                return KERNEL_FILES_STATUS_STATE;
+            }
+            kernel_socket_finish_read(&read_request,
+                                      access == KERNEL_UACCESS_STATUS_FAULT);
+            if (access == KERNEL_UACCESS_STATUS_FAULT)
+                received = -KERNEL_EFAULT;
         }
         *linux_result = received;
         if (received < 0) files->record->statistics.read_failures++;
@@ -398,7 +410,7 @@ enum kernel_files_status kernel_files_read(
         files->record->statistics.read_failures++;
         return KERNEL_FILES_STATUS_OK;
     }
-    status = read_pinned(files, mm, description, &iov, 1U, count,
+    status = read_pinned(files, mm, description, &description, &iov, 1U, count,
                          linux_result);
     return release_io_description(files, &description, status);
 }
@@ -502,7 +514,8 @@ enum kernel_files_status kernel_files_readv(
         status = KERNEL_FILES_STATUS_OK;
         goto out;
     }
-    status = read_pinned(files, mm, description, iov, (size_t)iovcnt,
+    status = read_pinned(files, mm, description, &description,
+                         iov, (size_t)iovcnt,
                          total, linux_result);
     dispatched = 1;
 out:
@@ -581,7 +594,7 @@ static enum kernel_files_status pread_pinned(
     if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_NULL ||
         kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_ZERO) {
         const struct kernel_uaccess_iovec iov = {user_buffer, count};
-        return read_pinned(files, mm, description, &iov, 1U, count,
+        return read_pinned(files, mm, description, 0, &iov, 1U, count,
                            linux_result);
     }
     if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_REGULAR) {

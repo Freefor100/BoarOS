@@ -31,7 +31,7 @@ BoarOS 是从零搭建、面向 OS Comp 能力建设的 C / 少量汇编内核�
 
 2026-09-27 最近一次固定 BusyBox/libc-test 全量验证（输入与身份见[程序清单](docs/learning/user-program-inventory.md)）：228 个顶层案例全部完成，223 项双侧一致、2 个直接 entry 退出不符、3 个包装脚本断言失败；离线编译整合后仍是原 socket 静态/动态和原包装器五项，无旧通过项回退。BusyBox 原脚本为 50/55 success，另有独立 pwd/cd/mv/touch 组合双侧通过。包装脚本与 entry 有重叠，清单完成不等于全部兼容。
 
-在该全量基线之后，首个网络切片的 35 条 socket Linux/BoarOS 差分及未修改 libc-test 静态、动态 socket 直接 entry 已聚焦通过；全量 228 项仍需在合并后的内核上重跑，故上段保留最后一次全量统计。网络对象、池界限与尚未覆盖的接口见[网络模块](docs/modules/kernel-network.md)。
+在该全量基线之后，网络切片及并发、错误顺序修复累计 64 条 socket Linux/BoarOS 差分已通过，未修改 libc-test 静态、动态 socket 直接 entry 也已聚焦通过；全量 228 项仍需在合并后的内核上重跑，故上段保留最后一次全量统计。网络对象、池界限与尚未覆盖的接口见[网络模块](docs/modules/kernel-network.md)。
 
 ## 构建与验证
 

@@ -16,6 +16,7 @@
 #include <kernel/physical_page.h>
 #include <kernel/pid.h>
 #include <kernel/scheduler.h>
+#include <kernel/socket.h>
 #include <kernel/signal.h>
 #include <kernel/task.h>
 #include <kernel/uaccess.h>
@@ -1196,6 +1197,9 @@ static enum kernel_scheduler_status cleanup_user_task_resources(
     enum kernel_files_status files_status;
     enum kernel_fs_context_status fs_status;
 
+    if (thread->socket_read_request != 0)
+        kernel_socket_abort_read(thread->socket_read_request);
+
     signal_status = thread->group_leader == thread && thread->group_members > 1U
         ? KERNEL_SIGNAL_STATUS_OK : kernel_signal_release_table(thread);
     if (signal_status != KERNEL_SIGNAL_STATUS_OK) {
@@ -1269,6 +1273,24 @@ static enum kernel_scheduler_status cleanup_user_task_resources(
              thread->mm.state == KERNEL_MM_EMPTY))
                ? KERNEL_SCHEDULER_STATUS_OK
                : KERNEL_SCHEDULER_STATUS_INVALID_STATE;
+}
+
+enum kernel_task_status kernel_task_socket_read_register(
+    struct kernel_task *task, struct kernel_socket_read_request *request)
+{
+    if (task == 0 || request == 0 || task->socket_read_request != 0 ||
+        task != kernel_task_current()) return KERNEL_TASK_STATUS_STATE;
+    task->socket_read_request = request;
+    return KERNEL_TASK_STATUS_OK;
+}
+
+enum kernel_task_status kernel_task_socket_read_clear(
+    struct kernel_task *task, struct kernel_socket_read_request *request)
+{
+    if (task == 0 || request == 0 || task->socket_read_request != request)
+        return KERNEL_TASK_STATUS_STATE;
+    task->socket_read_request = 0;
+    return KERNEL_TASK_STATUS_OK;
 }
 
 static uint32_t fault_wait_status(uint64_t scause)
