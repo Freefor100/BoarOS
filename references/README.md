@@ -34,6 +34,10 @@ git -C references/linux sparse-checkout list
 时让 Git 从清单 origin 补取该对象，不切换 HEAD。只有固定 commit 本身不含所需主题，或对象确实
 无法恢复时，才查 Linux 官方文档或上游仓库，并明确它不是当前固定基线。
 
+SQLite 3.53.4 官方 amalgamation 保存于 `sqlite/sqlite-amalgamation-3530400.zip`，
+2026-09-27 从官方发布页取得并校验 SHA-256；测试构建直接从固定压缩包解包，
+不修改上游源码。
+
 musl 以校验过的 `musl/musl-1.2.5.tar.gz` 保存，不在 `references/` 另建源码快照。列出和读取
 单个成员可直接使用：
 

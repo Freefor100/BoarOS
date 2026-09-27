@@ -1177,3 +1177,45 @@ test-record-lock-riscv: $(LOCK_LIFECYCLE_RV) $(KERNEL_RV)
 	PYTHONDONTWRITEBYTECODE=1 python3 tests/record-lock-riscv.py \
 		--kernel $(KERNEL_RV) --program $(LOCK_LIFECYCLE_RV) \
 		--qemu $(QEMU_RISCV64)
+
+
+SQLITE_ARCHIVE := references/sqlite/sqlite-amalgamation-3530400.zip
+SQLITE_SOURCE := $(BUILD_DIR)/sqlite/sqlite-amalgamation-3530400/sqlite3.c
+SQLITE_ROLLBACK_RV := $(BUILD_DIR)/tests/user/sqlite-rollback-rv
+SQLITE_CLI_STATIC_RV := $(BUILD_DIR)/tests/user/sqlite3-static-rv
+SQLITE_CLI_DYNAMIC_RV := $(BUILD_DIR)/tests/user/sqlite3-dynamic-rv
+SQLITE_CLI_INIT_RV := $(BUILD_DIR)/tests/user/sqlite-cli-init-rv
+$(SQLITE_SOURCE): $(SQLITE_ARCHIVE)
+	@mkdir -p $(BUILD_DIR)/sqlite
+	unzip -oq $< -d $(BUILD_DIR)/sqlite
+	@test -f $@ && test -f $(dir $@)/shell.c
+	@touch $@ $(dir $@)/shell.c
+
+$(SQLITE_ROLLBACK_RV): tests/workloads/sqlite/rollback.c $(SQLITE_SOURCE) $(MUSL_STAMP)
+	@mkdir -p $(dir $@)
+	$(MUSL_ROOT)/bin/musl-gcc $(MUSL_GCC_FLAGS) -static -O2 -pthread \
+		-I$(dir $(SQLITE_SOURCE)) -o $@ $< $(SQLITE_SOURCE) -ldl
+
+$(SQLITE_CLI_STATIC_RV): $(SQLITE_SOURCE) $(MUSL_STAMP)
+	@mkdir -p $(dir $@)
+	$(MUSL_ROOT)/bin/musl-gcc $(MUSL_GCC_FLAGS) -static -O2 -pthread \
+		-o $@ $(dir $(SQLITE_SOURCE))/shell.c $(SQLITE_SOURCE) -ldl
+
+$(SQLITE_CLI_DYNAMIC_RV): $(SQLITE_SOURCE) $(MUSL_STAMP)
+	@mkdir -p $(dir $@)
+	$(MUSL_ROOT)/bin/musl-gcc $(MUSL_GCC_FLAGS) -fPIE -pie -O2 -pthread \
+		-Wl,--dynamic-linker=/lib/ld-musl-riscv64.so.1 \
+		-o $@ $(dir $(SQLITE_SOURCE))/shell.c $(SQLITE_SOURCE) -ldl
+
+$(SQLITE_CLI_INIT_RV): tests/workloads/sqlite/cli_init.c $(MUSL_STAMP)
+	@mkdir -p $(dir $@)
+	$(MUSL_ROOT)/bin/musl-gcc $(MUSL_GCC_FLAGS) -static -O2 -o $@ $<
+
+.PHONY: test-sqlite-rollback-riscv
+test-sqlite-rollback-riscv: $(SQLITE_ROLLBACK_RV) $(SQLITE_CLI_STATIC_RV) $(SQLITE_CLI_DYNAMIC_RV) $(SQLITE_CLI_INIT_RV) $(MUSL_LDSO) $(KERNEL_RV)
+	SQLITE_ROLLBACK_RV=$(SQLITE_ROLLBACK_RV) \
+	SQLITE_CLI_STATIC_RV=$(SQLITE_CLI_STATIC_RV) \
+	SQLITE_CLI_DYNAMIC_RV=$(SQLITE_CLI_DYNAMIC_RV) \
+	SQLITE_CLI_INIT_RV=$(SQLITE_CLI_INIT_RV) MUSL_LDSO=$(MUSL_LDSO) \
+	QEMU_RISCV64=$(QEMU_RISCV64) \
+		./tests/sqlite-rollback-riscv.sh
