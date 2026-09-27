@@ -6,7 +6,7 @@ trap 'result=$?; if [ "$result" -eq 0 ]; then rm -rf "$work"; else echo "test ar
 trap 'exit 1' HUP INT TERM
 ${HOST_CC:-cc} -std=gnu11 -O1 -g -Wall -Wextra -Werror \
     -Wno-unused-but-set-variable -Wno-stringop-truncation \
-    -DCONFIG_USE_DEFAULT_CFG=1 -DCONFIG_USE_USER_MALLOC=1 ${RECOVERY_TEST_CFLAGS:-} \
+    -DCONFIG_USE_DEFAULT_CFG=1 -DCONFIG_USE_USER_MALLOC=1 -DCONFIG_DEBUG_ASSERT=0 ${RECOVERY_TEST_CFLAGS:-} \
     -include "$root/tests/host/lwext4_memory.h" \
     -I"$root/third_party/lwext4/include" -idirafter "$root/include" \
     "$root"/third_party/lwext4/src/*.c "$root/tests/host/lwext4_recovery.c" \
@@ -14,6 +14,8 @@ ${HOST_CC:-cc} -std=gnu11 -O1 -g -Wall -Wextra -Werror \
 for blocksize in 1024 4096; do
     truncate -s 32M "$work/base.img"
     mkfs.ext4 -q -F -b "$blocksize" "$work/base.img"
+    cp "$work/base.img" "$work/owner.img"
+    timeout 30 "$work/probe" "$work/owner.img" owner-check
     cp "$work/base.img" "$work/regrow.img"
     timeout 30 "$work/probe" "$work/regrow.img" shrink-regrow
     e2fsck -fn "$work/regrow.img" > "$work/fsck.log" 2>&1 || { cat "$work/fsck.log"; exit 1; }

@@ -12,12 +12,25 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
+#include <sys/resource.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "%d: %s (allocation %u, event %u)\n", __LINE__, #x, fail_allocation, event); exit(1); } } while (0)
 static struct fault_block disk;
 static unsigned event, cut;
 static int reorder;
 static unsigned allocations, fail_allocation;
+static unsigned lock_depth, check_storage_owner;
+static uintptr_t owner_identity = 1;
+static void storage_lock(void) { lock_depth++; }
+static void storage_unlock(void) { CHECK(lock_depth); lock_depth--; }
+static uintptr_t storage_owner(void) { CHECK(lock_depth); return owner_identity; }
+static struct ext4_lock storage_locks = {
+    .lock = storage_lock, .unlock = storage_unlock,
+    .read_lock = storage_lock, .owner = storage_owner,
+};
 void *ext4_user_malloc(size_t size)
 { return ++allocations == fail_allocation ? NULL : malloc(size); }
 void *ext4_user_calloc(size_t count, size_t size)
@@ -38,7 +51,7 @@ static int dev_open(struct ext4_blockdev *b) { (void)b; return EOK; }
 static int dev_read(struct ext4_blockdev *b, void *p, uint64_t n, uint32_t c)
 { (void)b; return kernel_block_read_at(&disk.device, n * 512, p, (size_t)c * 512) == KERNEL_BLOCK_STATUS_OK ? EOK : EIO; }
 static int dev_write(struct ext4_blockdev *b, const void *p, uint64_t n, uint32_t c)
-{ (void)b; int r = kernel_block_write_at(&disk.device, n * 512, p, (size_t)c * 512) == KERNEL_BLOCK_STATUS_OK ? EOK : EIO; boundary(); return r; }
+{ (void)b; if (check_storage_owner) CHECK(lock_depth); int r = kernel_block_write_at(&disk.device, n * 512, p, (size_t)c * 512) == KERNEL_BLOCK_STATUS_OK ? EOK : EIO; boundary(); return r; }
 static int dev_flush(struct ext4_blockdev *b)
 { (void)b; int r = kernel_block_flush(&disk.device) == KERNEL_BLOCK_STATUS_OK ? EOK : EIO; boundary(); return r; }
 
@@ -83,7 +96,9 @@ static void shrink_regrow(struct ext4_fs *fs)
         if (writing) CHECK(memcmp(bytes + end - 3, "new", 3) == 0);
         if (unlinked) {
             uint32_t pending;
+            storage_lock();
             CHECK(ext4_orphan_peek(fs, &pending) == EOK && pending == ino);
+            storage_unlock();
         }
         CHECK(ext4_fclose(&file) == EOK);
         if (unlinked) CHECK(ext4_orphan_free("/", ino) == EOK);
@@ -178,7 +193,9 @@ static void grouped_remove(struct ext4_blockdev *dev)
             CHECK(ext4_transaction_end("/") == EOK);
             CHECK(ext4_fopen(&file, "/remove", "r") == ENOENT);
             uint32_t pending;
+            storage_lock();
             CHECK(ext4_orphan_peek(fs, &pending) == EOK && pending == ino);
+            storage_unlock();
             if (scenario == 2) CHECK(ext4_orphan_recover("/") == EOK);
             else {
                 CHECK(ext4_umount("/") == EOK);
@@ -258,8 +275,30 @@ int main(int argc, char **argv)
         CHECK(dev_flush(&dev) == EOK);
         return 0;
     }
+    CHECK(ext4_mount_setup_locks("/", &storage_locks) == EOK);
     CHECK(ext4_journal_start("/") == EOK);
     event = 0;
+    if (!strcmp(argv[2], "owner-check")) {
+        CHECK(ext4_transaction_begin("/") == EOK);
+        for (unsigned begin = 0; begin < 2; begin++) {
+            pid_t child = fork();
+            CHECK(child >= 0);
+            if (!child) {
+                struct rlimit limit = {0, 0};
+                CHECK(setrlimit(RLIMIT_CORE, &limit) == 0);
+                owner_identity = 2;
+                if (begin) (void)ext4_transaction_begin("/");
+                else (void)ext4_transaction_end("/");
+                _Exit(0);
+            }
+            int status;
+            CHECK(waitpid(child, &status, 0) == child && WIFSIGNALED(status) && WTERMSIG(status) == SIGILL);
+        }
+        CHECK(ext4_transaction_end("/") == EOK && lock_depth == 0);
+        CHECK(ext4_umount("/") == EOK);
+        puts("PASS: transaction owner is enforced with debug assertions disabled");
+        return 0;
+    }
     if (!strcmp(argv[2], "group-remove")) {
         grouped_remove(&dev);
         CHECK(ext4_umount("/") == EOK);
@@ -267,7 +306,10 @@ int main(int argc, char **argv)
         return 0;
     }
     if (!strcmp(argv[2], "shrink-regrow")) {
+        check_storage_owner = 1;
         shrink_regrow(dev.fs);
+        check_storage_owner = 0;
+        CHECK(lock_depth == 0);
         CHECK(ext4_umount("/") == EOK);
         puts("PASS: pending shrink, nested growth/write, live unlink ownership");
         return 0;

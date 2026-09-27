@@ -204,6 +204,12 @@ static int check_fixture(const char *path, const char *expected)
 		failed = report_error("open fixture", rc);
 		goto cleanup;
 	}
+	rc = ext4_fpread(&file, 0, actual, expected_length, &read_count);
+	if (rc != EOK || file.fpos != 0 || read_count != expected_length ||
+	    memcmp(actual, expected, expected_length)) {
+		failed = report_error("positioned read isolation", rc ? rc : EIO);
+		goto close;
+	}
 	rc = ext4_fread(&file, actual, expected_length, &read_count);
 	if (rc != EOK) {
 		failed = report_error("read fixture", rc);

@@ -100,6 +100,9 @@ struct ext4_blockdev_iface {
 
 	/**@brief   User data pointer*/
 	void* p_user;
+	void (*wait_read)(void *key);
+	void (*wake_read)(void *key);
+	int (*read_context)(void);
 
 	/** Persist all prior writes. Required for journal durability. */
 	int (*flush)(struct ext4_blockdev *bdev);

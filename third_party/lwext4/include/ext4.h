@@ -63,6 +63,8 @@ struct ext4_lock {
 
 	/**@brief   Unlock access to mount point.*/
 	void (*unlock)(void);
+	void (*read_lock)(void);
+	uintptr_t (*owner)(void);
 };
 
 /********************************FILE DESCRIPTOR*****************************/
@@ -429,6 +431,8 @@ int ext4_ftruncate(ext4_file *file, uint64_t size);
  *
  * @return  Standard error code.*/
 int ext4_fread(ext4_file *file, void *buf, size_t size, size_t *rcnt);
+/* Positioned data read; mount read lock excludes every writer. */
+int ext4_fpread(const ext4_file *file, uint64_t offset, void *buf, size_t size, size_t *rcnt);
 
 /**@brief   Write data to file.
  *

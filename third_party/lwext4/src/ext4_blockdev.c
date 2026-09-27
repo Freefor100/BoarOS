@@ -209,6 +209,7 @@ int ext4_block_cache_shake(struct ext4_blockdev *bdev)
 		buf = ext4_buf_lowest_lru(bdev->bc);
 		ext4_assert(buf);
 		if (ext4_bcache_test_flag(buf, BC_DIRTY)) {
+			if (bdev->bdif->read_context && bdev->bdif->read_context()) break;
 			r = ext4_block_flush_buf(bdev, buf);
 			if (r != EOK)
 				break;
@@ -259,13 +260,28 @@ int ext4_block_get(struct ext4_blockdev *bdev, struct ext4_block *b,
 	if (r != EOK)
 		return r;
 
+	while (b->buf->loading) {
+		if (!bdev->bdif->wait_read) {
+			ext4_bcache_free(bdev->bc, b);
+			return EBUSY;
+		}
+		bdev->bdif->wait_read(b->buf);
+	}
+	if (b->buf->load_error) {
+		r = b->buf->load_error; ext4_bcache_free(bdev->bc, b); return r;
+	}
 	if (ext4_bcache_test_flag(b->buf, BC_UPTODATE)) {
 		/* Data in the cache is up-to-date.
 		 * Reading from physical device is not required */
 		return EOK;
 	}
 
+	b->buf->loading = true;
 	r = ext4_blocks_get_direct(bdev, b->data, lba, 1);
+	b->buf->load_error = r;
+	if (r == EOK) ext4_bcache_set_flag(b->buf, BC_UPTODATE);
+	b->buf->loading = false;
+	if (bdev->bdif->wake_read) bdev->bdif->wake_read(b->buf);
 	if (r != EOK) {
 		ext4_bcache_free(bdev->bc, b);
 		b->lb_id = 0;

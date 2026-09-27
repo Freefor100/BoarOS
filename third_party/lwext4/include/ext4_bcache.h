@@ -75,6 +75,8 @@ struct ext4_buf {
 	struct ext4_buf *writeback_next;
 	/**@brief   Flags*/
 	int flags;
+	bool loading;
+	int load_error;
 
 	/**@brief   Logical block address*/
 	uint64_t lba;

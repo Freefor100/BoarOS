@@ -341,9 +341,10 @@ int ext4_bcache_free(struct ext4_bcache *bc, struct ext4_block *b)
 		/* This buffer is ready to be flushed. */
 		if (ext4_bcache_test_flag(buf, BC_DIRTY) &&
 		    ext4_bcache_test_flag(buf, BC_UPTODATE)) {
-			if (bc->bdev->cache_write_back &&
+			if ((bc->bdev->bdif->read_context && bc->bdev->bdif->read_context()) ||
+			    (bc->bdev->cache_write_back &&
 			    !ext4_bcache_test_flag(buf, BC_FLUSH) &&
-			    !ext4_bcache_test_flag(buf, BC_TMP))
+			    !ext4_bcache_test_flag(buf, BC_TMP)))
 				ext4_bcache_insert_dirty_node(bc, buf);
 			else {
 				result = ext4_block_flush_buf(bc->bdev, buf);
