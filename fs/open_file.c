@@ -523,6 +523,14 @@ int kernel_open_file_readable(
     }
 }
 
+int kernel_open_file_writable(
+    const struct kernel_open_file_description *file)
+{
+    if (!open_file_live(file)) return 0;
+    return (file->open_flags & 3U) == 1U ||
+           (file->open_flags & 3U) == 2U;
+}
+
 uint64_t kernel_open_file_offset(
     const struct kernel_open_file_description *file)
 {
@@ -587,6 +595,20 @@ enum kernel_page_cache_status kernel_open_file_lookup_page(
         valid_bytes);
 }
 
+enum kernel_page_cache_status kernel_open_file_alias_attach(
+    struct kernel_open_file_description *file, uint64_t page_index,
+    uint64_t physical_address, struct kernel_page_cache_alias *alias,
+    void *owner, uint64_t virtual_address,
+    void (*rearm)(void *owner, uint64_t virtual_address))
+{
+    if (!open_file_live(file) || file->file.mount == 0 ||
+        file->file.mount->private_data == 0)
+        return KERNEL_PAGE_CACHE_STATUS_INVALID_ARGUMENT;
+    return kernel_page_cache_alias_attach(
+        kernel_vfs_file_page_cache(&file->file), &file->file, page_index,
+        physical_address, alias, owner, virtual_address, rearm);
+}
+
 int kernel_open_file_pread(struct kernel_open_file_description *file,
                            uint64_t offset,
                            void *buffer,
@@ -600,6 +622,14 @@ int kernel_open_file_pread(struct kernel_open_file_description *file,
                                   size,
                                   bytes_read)
                : -KERNEL_EINVAL;
+}
+
+int kernel_open_file_sync_range(struct kernel_open_file_description *file,
+    uint64_t start, uint64_t end)
+{
+    if (!open_file_live(file)) return -KERNEL_EBADF;
+    return kernel_vfs_sync_range(&file->file, start, end,
+                                 &file->observed_writeback_error);
 }
 
 uint32_t kernel_open_file_poll(

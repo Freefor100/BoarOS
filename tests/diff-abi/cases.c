@@ -192,6 +192,8 @@ void abi_main(const unsigned long *initial_stack)
     }
     text("ABI BEGIN 1"); flush();
     mode_cases(); sparse_cases(); abi_shared_mapping_cases();
+    abi_shared_file_mapping_cases();
+    abi_shared_file_truncate_cases();
     abi_futex_shared_cases();
     abi_file_lock_cases();
     partial_cases(); abi_truncate_cases();

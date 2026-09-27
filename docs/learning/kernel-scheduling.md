@@ -92,7 +92,7 @@ RISC-V psABI 要求函数入口栈保持 16 字节对齐。线程初始栈顶必
 | 静态 musl | 40 | 5904 B | 2272 B |
 | 动态 pthread | 34 | 6208 B | 1968 B |
 
-这些数值来自 `make test-root-init-riscv test-userland-riscv` 的退出报告。`make test-stack-usage` 强制重建的生产报告覆盖 804 个函数，最大单帧为 boot/idle 上的 `kernel_main` 1920 字节，没有无界动态栈。该门禁使用实际头文件导出的 288 字节汇编 Frame 与 1024 字节余量预算；共享映射、更多驱动或更深调用链接入后应重新测量。
+这些数值来自 `make test-root-init-riscv test-userland-riscv` 的退出报告。`make test-stack-usage` 强制重建的生产报告覆盖 1046 个函数，最大单帧为 boot/idle 上的 `kernel_main` 1952 字节，没有无界动态栈。该门禁使用实际头文件导出的 288 字节汇编 Frame 与 1024 字节余量预算；更多驱动或更深调用链接入后应重新测量。
 
 Canary 只能发现越过栈底后的部分破坏，不能像未映射 guard page 那样在第一次越界访问时立即 fault；它也不是任意内存破坏的恢复机制。
 

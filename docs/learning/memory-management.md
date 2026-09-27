@@ -423,3 +423,9 @@ PAGE_SIZE) 撤销映射且 even_cows=1；`truncate_inode_partial_folio()` 只清
 猜测。物理 COW 分配失败还必须撤销首次写 fault 临时装入的 PTE；否则元数据已
 回滚却遗留硬件映射，后续截断遗漏或 COW 重试触发不变量错误。聚焦故障注入已
 覆盖这一失败窗口，正常差分通过不能代替它。
+
+## 共享文件页的写入归属
+
+`MAP_SHARED` 文件页必须与普通 `read/write` 使用同一 inode 缓存数据源。直接让共享 PTE 长期可写会绕过缓存的 dirty 标记；只扫描 Sv39 D 位又把写回正确性绑定到硬件位、TLB 重置与所有别名的页表遍历。BoarOS 在单 hart 阶段选择每个缓存页维护 MM 所拥有的别名反向索引：首次写故障先标脏再开放本 PTE，写回前只重新保护该页的别名。成本是每个驻留共享 PTE 一条记录、写回前遍历该页别名；避免每次写回扫整个 inode 的所有 MM。缓存只借用别名链接，MM 的 OFD 来源与 PTE 物理引用维持生命周期，撤映射时无分配摘链，避免缓存与 MM 互相强引用。
+
+固定 Linux `references/linux/mm/mmap.c`（commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`）规定共享可写映射需写权限，`O_RDONLY` 建立的共享映射不保留之后升级为可写的资格；`references/linux/mm/filemap.c::filemap_page_mkwrite` 在写 fault 时将页标脏。`references/linux/mm/msync.c` 在参数、对齐与空洞检查后，只对共享文件 VMA 的 `MS_SYNC` 执行范围 fsync，`MS_ASYNC` 不提交 I/O。BoarOS 用同一 ELF 的固定 Linux 差分核对这些用户可见边界，并用 SQLite 3.53.4 普通多进程 WAL 在独立 MM 中验证共享索引；这仍不是 WAL 存储断电或 SMP TLB 协议的证据。

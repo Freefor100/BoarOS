@@ -70,6 +70,7 @@
 #define LINUX_SYSCALL_CLONE 220U
 #define LINUX_SYSCALL_EXECVE 221U
 #define LINUX_SYSCALL_MMAP 222U
+#define LINUX_SYSCALL_MSYNC 227U
 #define LINUX_SYSCALL_MPROTECT 226U
 #define LINUX_SYSCALL_WAIT4 260U
 #define LINUX_SYSCALL_PRLIMIT64 261U
@@ -461,6 +462,11 @@ enum kernel_syscall_status kernel_syscall_dispatch(
         }
     } else if (request->number == LINUX_SYSCALL_MMAP) {
         if (syscall_handle_mmap(caller, request, &decoded) !=
+            KERNEL_SYSCALL_STATUS_OK) {
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+        }
+    } else if (request->number == LINUX_SYSCALL_MSYNC) {
+        if (syscall_handle_msync(caller, request, &decoded) !=
             KERNEL_SYSCALL_STATUS_OK) {
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
         }

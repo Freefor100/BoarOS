@@ -29,6 +29,7 @@ struct kernel_page_cache_entry {
     uint64_t generation;
     uint8_t writeback;
     uint8_t page_references_owned;
+    struct kernel_page_cache_alias *aliases;
 };
 
 struct kernel_page_cache_record {
@@ -42,6 +43,8 @@ struct kernel_page_cache_record {
     size_t tombstones;
     unsigned int writeback_active;
 };
+
+static size_t entry_valid_bytes(const struct kernel_page_cache_entry *entry);
 
 static int cache_live(const struct kernel_page_cache *cache)
 {
@@ -254,6 +257,7 @@ static int drain_entries(struct kernel_page_cache *cache,
 static void remove_entry(struct kernel_page_cache *cache,
                          struct kernel_page_cache_entry *entry)
 {
+    if (entry->aliases != 0) __builtin_trap();
     struct kernel_page_cache_record *record = cache->record;
     int found;
     size_t bucket = find_bucket(record,
@@ -357,6 +361,74 @@ static enum kernel_page_cache_status lookup_entry(
     }
     *entry_out = cache->record->buckets[bucket];
     return KERNEL_PAGE_CACHE_STATUS_OK;
+}
+
+static void link_alias(struct kernel_page_cache_entry *entry,
+                       struct kernel_page_cache_alias *alias)
+{
+    alias->entry = entry;
+    alias->next = entry->aliases;
+    alias->previous = &entry->aliases;
+    if (alias->next != 0) alias->next->previous = &alias->next;
+    entry->aliases = alias;
+}
+
+enum kernel_page_cache_status kernel_page_cache_alias_attach(
+    struct kernel_page_cache *cache, const struct kernel_vfs_file *file,
+    uint64_t page_index, uint64_t physical_address,
+    struct kernel_page_cache_alias *alias, void *owner,
+    uint64_t virtual_address,
+    void (*rearm)(void *owner, uint64_t virtual_address))
+{
+    struct kernel_page_cache_entry *entry;
+    enum kernel_page_cache_status status;
+    if (alias == 0 || alias->previous != 0 || owner == 0 || rearm == 0)
+        return KERNEL_PAGE_CACHE_STATUS_INVALID_ARGUMENT;
+    status = lookup_entry(cache, file, page_index, &entry);
+    if (status != KERNEL_PAGE_CACHE_STATUS_OK) return status;
+    if (entry->physical_address != physical_address) __builtin_trap();
+    alias->owner = owner;
+    alias->virtual_address = virtual_address;
+    alias->rearm = rearm;
+    link_alias(entry, alias);
+    return KERNEL_PAGE_CACHE_STATUS_OK;
+}
+
+void kernel_page_cache_alias_clone(struct kernel_page_cache_alias *target,
+    const struct kernel_page_cache_alias *source, void *owner)
+{
+    if (target == 0 || source == 0 || source->previous == 0 ||
+        target->previous != 0 || owner == 0) __builtin_trap();
+    target->owner = owner;
+    target->virtual_address = source->virtual_address;
+    target->rearm = source->rearm;
+    link_alias(source->entry, target);
+}
+
+void kernel_page_cache_alias_detach(struct kernel_page_cache_alias *alias)
+{
+    if (alias == 0 || alias->previous == 0) __builtin_trap();
+    *alias->previous = alias->next;
+    if (alias->next != 0) alias->next->previous = alias->previous;
+    alias->entry = 0;
+    alias->next = 0;
+    alias->previous = 0;
+    alias->owner = 0;
+    alias->rearm = 0;
+}
+
+void kernel_page_cache_alias_mark_dirty(struct kernel_page_cache_alias *alias)
+{
+    struct kernel_page_cache_entry *entry;
+    size_t end;
+    if (alias == 0 || alias->previous == 0 || alias->entry == 0)
+        __builtin_trap();
+    entry = alias->entry;
+    end = entry_valid_bytes(entry);
+    if (end == 0) __builtin_trap();
+    entry->dirty_begin = 0;
+    if (entry->dirty_end < end) entry->dirty_end = end;
+    entry->generation++;
 }
 
 static size_t entry_valid_bytes(const struct kernel_page_cache_entry *entry)
@@ -542,6 +614,10 @@ int kernel_page_cache_write(struct kernel_page_cache *cache,
                 KERNEL_PAGE_CACHE_STATUS_OK ||
             physical_page_resolve(cache->allocator, address, &page) !=
                 PHYSICAL_PAGE_STATUS_OK) __builtin_trap();
+        uint64_t old_size = kernel_vfs_node_size(entry->node);
+        if (offset + count > old_size)
+            kernel_page_cache_resize(cache, entry->node,
+                                      old_size, offset + count);
         memcpy((unsigned char *)page + start, source + *written, count);
         if (entry->dirty_end == 0 || start < entry->dirty_begin)
             entry->dirty_begin = start;
@@ -569,6 +645,9 @@ static int writeback_entry(struct kernel_page_cache *cache,
      * buffer lookup state. Reclamation there can free clean pages only. */
     if (entry->writeback || !kernel_vfs_node_writeback_allowed(entry->node))
         return -KERNEL_EBUSY;
+    for (struct kernel_page_cache_alias *alias = entry->aliases;
+         alias != 0; alias = alias->next)
+        alias->rearm(alias->owner, alias->virtual_address);
     entry->writeback = 1;
     cache->record->writeback_active++;
     begin = entry->dirty_begin;
@@ -627,20 +706,57 @@ int kernel_page_cache_writeback(struct kernel_page_cache *cache,
     return kernel_page_cache_writeback_before(cache, node, UINT64_MAX);
 }
 
-void kernel_page_cache_truncate(struct kernel_page_cache *cache,
-    struct kernel_vfs_node *node, uint64_t size)
+int kernel_page_cache_writeback_range(struct kernel_page_cache *cache,
+    struct kernel_vfs_node *node, uint64_t start, uint64_t end)
+{
+    struct kernel_page_cache_entry *entry;
+    int result = 0;
+    if (!cache_live(cache) || node == 0 || start >= end)
+        return -KERNEL_EINVAL;
+    /* Pin selected entries across block I/O, which may reclaim clean pages. */
+    for (entry = *kernel_vfs_node_cache_pages(node); entry != 0;
+         entry = entry->node_next) {
+        uint64_t page_start = entry->page_index << BOAROS_PAGE_SHIFT;
+        if (page_start < end && page_start + BOAROS_PAGE_SIZE > start) {
+            if (physical_page_acquire(cache->allocator,
+                                      entry->physical_address) !=
+                PHYSICAL_PAGE_STATUS_OK) __builtin_trap();
+        }
+    }
+    for (entry = *kernel_vfs_node_cache_pages(node); entry != 0;
+         entry = entry->node_next) {
+        uint64_t page_start = entry->page_index << BOAROS_PAGE_SHIFT;
+        if (page_start < end && page_start + BOAROS_PAGE_SIZE > start &&
+            result == 0) result = writeback_entry(cache, entry, end);
+    }
+    for (entry = *kernel_vfs_node_cache_pages(node); entry != 0;
+         entry = entry->node_next) {
+        uint64_t page_start = entry->page_index << BOAROS_PAGE_SHIFT;
+        if (page_start < end && page_start + BOAROS_PAGE_SIZE > start)
+            (void)physical_page_release(cache->allocator,
+                                        entry->physical_address);
+    }
+    return result;
+}
+
+void kernel_page_cache_resize(struct kernel_page_cache *cache,
+    struct kernel_vfs_node *node, uint64_t old_size, uint64_t size)
 {
     struct kernel_page_cache_entry *entry = *kernel_vfs_node_cache_pages(node);
     uint64_t released = 0;
     while (entry != 0) {
         struct kernel_page_cache_entry *next = entry->node_next;
         uint64_t start = entry->page_index << BOAROS_PAGE_SHIFT;
-        if (entry->writeback) __builtin_trap();
-        if (start >= size) {
+        if (size < old_size && entry->writeback) __builtin_trap();
+        if (size < old_size && start >= size) {
             remove_entry(cache, entry);
-        } else if (size - start < BOAROS_PAGE_SIZE) {
+        } else if (size < old_size && start < size &&
+                   size - start < BOAROS_PAGE_SIZE) {
             size_t tail = (size_t)(size - start);
             void *page;
+            for (struct kernel_page_cache_alias *alias = entry->aliases;
+                 alias != 0; alias = alias->next)
+                alias->rearm(alias->owner, alias->virtual_address);
             if (physical_page_resolve(cache->allocator, entry->physical_address,
                                        &page) != PHYSICAL_PAGE_STATUS_OK)
                 __builtin_trap();
@@ -650,6 +766,21 @@ void kernel_page_cache_truncate(struct kernel_page_cache *cache,
                 entry->dirty_begin = 0;
                 entry->dirty_end = 0;
             }
+            entry->generation++;
+        } else if (size > old_size && old_size > start &&
+                   old_size - start < BOAROS_PAGE_SIZE) {
+            size_t old_tail = (size_t)(old_size - start);
+            size_t new_tail = size - start < BOAROS_PAGE_SIZE
+                ? (size_t)(size - start) : BOAROS_PAGE_SIZE;
+            void *page;
+            for (struct kernel_page_cache_alias *alias = entry->aliases;
+                 alias != 0; alias = alias->next)
+                alias->rearm(alias->owner, alias->virtual_address);
+            if (physical_page_resolve(cache->allocator, entry->physical_address,
+                                      &page) != PHYSICAL_PAGE_STATUS_OK)
+                __builtin_trap();
+            zero_bytes((unsigned char *)page + old_tail,
+                       new_tail - old_tail);
             entry->generation++;
         }
         entry = next;

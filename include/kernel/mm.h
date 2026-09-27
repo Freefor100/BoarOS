@@ -30,6 +30,7 @@ enum kernel_mm_status {
     KERNEL_MM_STATUS_STATE,
     KERNEL_MM_STATUS_CONFLICT,
     KERNEL_MM_STATUS_BUS_FAULT,
+    KERNEL_MM_STATUS_ACCESS,
 };
 
 enum kernel_mm_state {
@@ -166,6 +167,8 @@ enum kernel_mm_status kernel_mm_mmap_file_private(
     uint32_t flags,
     uint64_t *address);
 
+/* KERNEL_MM_MAP_SHARED selects an inode-cache backed shared file VMA. */
+
 /* Linux range semantics: munmap tolerates holes; mprotect requires coverage. */
 enum kernel_mm_status kernel_mm_munmap(
     struct kernel_mm *mm,
@@ -177,6 +180,10 @@ enum kernel_mm_status kernel_mm_mprotect(
     uint64_t address,
     uint64_t length,
     uint32_t permissions);
+
+/* Linux msync flags; returns zero or a negative Linux errno. */
+int kernel_mm_msync(struct kernel_mm *mm, uint64_t address,
+                    uint64_t length, uint32_t flags);
 
 /*
  * Resolve one hardware user fault in the MM active on this hart.  access must

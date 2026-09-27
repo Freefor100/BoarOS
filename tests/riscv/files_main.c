@@ -3547,6 +3547,58 @@ static void run_partial_write_test(const void *dtb)
     }
     device.block.flush = sync_original_flush;
 
+    /* msync keeps the inode's writeback error owner while the mapping pins
+     * its OFD. A second sync observes successful retry after a failed flush. */
+    struct kernel_open_file_description *mapping_pin = 0;
+    uint64_t shared_address = 0;
+    unsigned char mapped_value = 'M';
+    if (!write_user_bytes(&mm, TEST_USER_BUFFER, &mapped_value, 1U) ||
+        kernel_files_pwrite(&files, &mm, 0, TEST_USER_BUFFER, 1U, 0,
+                            &result) != KERNEL_FILES_STATUS_OK ||
+        result != 1 ||
+        kernel_files_pin(&files, 0, &mapping_pin, &result) !=
+            KERNEL_FILES_STATUS_OK || result != 0 ||
+        kernel_mm_mmap_file_private(&mm, &mapping_pin, TEST_MMAP_FIRST,
+            BOAROS_PAGE_SIZE, 0, KERNEL_MM_READ | KERNEL_MM_WRITE,
+            KERNEL_MM_MAP_FIXED_NOREPLACE | KERNEL_MM_MAP_SHARED,
+            &shared_address) != KERNEL_MM_STATUS_OK ||
+        mapping_pin != 0 || shared_address != TEST_MMAP_FIRST ||
+        kernel_mm_resolve_user_fault(&mm, shared_address,
+                                     KERNEL_MM_WRITE) != KERNEL_MM_STATUS_OK ||
+        !write_user_bytes(&mm, shared_address, &mapped_value, 1U))
+        fail_files(429U, 0, result);
+    device.block.flush = sync_test_flush;
+    sync_flush_failures = 1U;
+    if (kernel_mm_msync(&mm, shared_address, BOAROS_PAGE_SIZE, 4U) !=
+            -KERNEL_EIO || sync_flush_failures != 0U ||
+        kernel_mm_msync(&mm, shared_address, BOAROS_PAGE_SIZE, 4U) != 0 ||
+        kernel_mm_munmap(&mm, shared_address, BOAROS_PAGE_SIZE) !=
+            KERNEL_MM_STATUS_OK)
+        fail_files(430U, 0, -1);
+    device.block.flush = sync_original_flush;
+
+    if (kernel_files_pin(&files, 0, &mapping_pin, &result) !=
+            KERNEL_FILES_STATUS_OK || result != 0 ||
+        kernel_mm_mmap_file_private(&mm, &mapping_pin, TEST_MMAP_SECOND,
+            BOAROS_PAGE_SIZE, 0, KERNEL_MM_READ,
+            KERNEL_MM_MAP_FIXED_NOREPLACE | KERNEL_MM_MAP_SHARED,
+            &shared_address) != KERNEL_MM_STATUS_OK ||
+        mapping_pin != 0 || shared_address != TEST_MMAP_SECOND)
+        fail_files(431U, 0, result);
+    fail_metadata_allocation = 1U;
+    enum kernel_mm_status shared_fault = kernel_mm_resolve_user_fault(
+        &mm, shared_address, KERNEL_MM_READ);
+    fail_metadata_allocation = 0U;
+    struct kernel_mm_mapping shared_mapping;
+    if (shared_fault != KERNEL_MM_STATUS_NO_MEMORY ||
+        kernel_mm_lookup(&mm, shared_address, &shared_mapping) !=
+            KERNEL_MM_STATUS_NOT_MAPPED ||
+        kernel_mm_resolve_user_fault(&mm, shared_address,
+                                     KERNEL_MM_READ) != KERNEL_MM_STATUS_OK ||
+        kernel_mm_munmap(&mm, shared_address, BOAROS_PAGE_SIZE) !=
+            KERNEL_MM_STATUS_OK)
+        fail_files(432U, KERNEL_MM_STATUS_NO_MEMORY, shared_fault);
+
     /* Successful metadata submission still updates the observed timestamp. */
     if (kernel_files_sync(&files, 0, 0, &result) != KERNEL_FILES_STATUS_OK ||
         result != 0 ||

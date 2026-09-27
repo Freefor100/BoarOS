@@ -698,6 +698,7 @@ $(SYSCALL_TEST_KERNEL_RV): $(SYSCALL_TEST_OBJECTS) arch/riscv/linker.ld
 	-Wl,--wrap=kernel_files_fcntl \
 	-Wl,--wrap=kernel_open_file_kind \
 	-Wl,--wrap=kernel_open_file_readable \
+	-Wl,--wrap=kernel_open_file_writable \
 	-Wl,--wrap=kernel_open_file_release \
 	-Wl,-Map,$(BUILD_DIR)/tests/kernel-syscall-rv.map \
 		-o $@ $(SYSCALL_TEST_OBJECTS)

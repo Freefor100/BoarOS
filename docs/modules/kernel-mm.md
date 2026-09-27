@@ -123,15 +123,19 @@ RISC-V 创建先分配并解析记录页，最后才把 LIVE Sv39 空间移入�
 
 跨页增长只把新增 `[old_page_end, new_page_end)` 登记为 RW anonymous `DEMAND_ZERO` heap VMA，不提前分配数据页。首次 U-mode load/store 复用普通匿名 fault 路径分配零页。跨页缩小通过通用区间编辑撤销目标范围，因此能容忍用户先用 `munmap` 打洞、用 `mprotect` 分段或用 fixed mmap 替换局部区域；它不再依赖一个从 break 起点连续延伸的阶段性 heap VMA。缩小先让范围内用户 PTE 失效并刷新本 hart TLB，再无分配地提交 VMA 删除和精确 break；物理页释放完成后该操作才返回。
 
-## 匿名与文件私有映射
+## 匿名与文件映射
 
 `kernel_mm_mmap_anonymous()` 实现 private demand-zero 与 `MAP_SHARED|MAP_ANONYMOUS`。非 fixed 请求优先使用空闲的页对齐 hint，否则在每个 MM 的随机 mmap ceiling 以下、栈 guard 之外 top-down 选址；`FIXED_NOREPLACE` 只检查冲突，`FIXED` 则撤销旧页和 VMA 后替换。长度向上按 4 KiB 对齐，返回地址只在成功时写入。RISC-V 的 W&&!R PTE 编码保留，因此仅写保护被规范化为 RW。
 
 共享匿名 mmap 在提交 VMA 前建立独立对象；MM registry 对每个仍使用的对象持一份引用，VMA 只借用并保存连续字节偏移。对象以稀疏页索引保存已产生的零页，每个页槽持一个物理引用，每个 PTE 另持一个。fork 先为子 MM 取得对象引用，再克隆页表；已驻留共享页在父子保持可写共享，未驻留页由任一方按对象和索引首次发布。`PROT_NONE`/恢复保留共享属性，不借用 COW 标记。撤映射、fixed replace 与 MM 销毁在最后使用它的 VMA 消失时释放本 MM 的对象引用；对象末引用释放所有页槽。仍有对象引用时，局部撤映射不截断对象内容；首版没有 swap 回收。
 
-`kernel_mm_validate_file_private_mapping()` 复用真实映射的规范化、范围、选址和 fixed-noreplace 冲突检查，但不分配来源节点、不编辑 VMA，也不预留返回的区间；当前单 hart syscall 在该检查与真实提交之间不会调度。`kernel_mm_mmap_file_private()` 接收调用者已经 pin 的可读普通文件 OFD、页对齐文件偏移和同一组选址/权限参数。syscall 层先完成无副作用校验，使零长度、非法 fixed 地址、offset 溢出和既有映射冲突保持原 errno 优先级；校验通过后才拒绝访问模式为 `O_WRONLY` 的 OFD 并返回 `-EACCES`，同时释放本次临时 pin。该可读要求不随请求的 `PROT_*` 组合改变。成功时 MM 消耗 pin，失败时仍由调用者持有。MM 对每个不同 OFD 只建一个来源节点，并由该节点持有一份来源引用；重复 mmap 不累积历史引用，VMA backing 借用同一对象。VMA 提交后若来源已存在，只递减一个由调用者刚取得且必然不是末引用的临时 pin；新来源则直接转移 pin，因此系统调用不会出现“返回错误但映射已生效”。关闭 fd 不影响映射；fork 为子 MM 建立独立来源节点并取得一份引用。`munmap`/fixed replace 在提交 VMA 后的冷路径释放已经没有 VMA 使用的来源节点，真实 VFS/OFD 清理错误由其 owner 状态向上转交。页故障查到 VMA 后直接取得 backing，不在 fault 热路径遍历 fd 表或来源链。
+`kernel_mm_validate_file_private_mapping()` 复用真实映射的规范化、范围、选址和 fixed-noreplace 冲突检查，但不分配来源节点、不编辑 VMA，也不预留返回的区间；当前单 hart syscall 在该检查与真实提交之间不会调度。`kernel_mm_mmap_file_private()` 接收调用者已经 pin 的可读普通文件 OFD、页对齐文件偏移和同一组选址/权限参数；传入 `KERNEL_MM_MAP_SHARED` 时建立 `FILE_SHARED` VMA。syscall 层先完成无副作用校验，使零长度、非法 fixed 地址、offset 溢出和既有映射冲突保持原 errno 优先级；校验通过后才检查 OFD 可读性，以及共享可写映射的 OFD 写权限，不符返回 `-EACCES` 并释放本次临时 pin。成功时 MM 消耗 pin，失败时仍由调用者持有。MM 对每个不同 OFD 只建一个来源节点，并由该节点持有一份来源引用；重复 mmap 不累积历史引用，VMA backing 借用同一对象。VMA 提交后若来源已存在，只递减一个由调用者刚取得且必然不是末引用的临时 pin；新来源则直接转移 pin，因此系统调用不会出现“返回错误但映射已生效”。关闭 fd 不影响映射；fork 为子 MM 建立独立来源节点并取得一份引用。`munmap`/fixed replace 在提交 VMA 后的冷路径释放已经没有 VMA 使用的来源节点，真实 VFS/OFD 清理错误由其 owner 状态向上转交。页故障查到 VMA 后直接取得 backing，不在 fault 热路径遍历 fd 表或来源链。
 
-文件 VMA 不预分配数据页。read/execute 首次缺页从挂载页缓存取得共享页并建立 COW PTE；首次写若缓存已命中则复制缓存页，未命中则直接把文件内容读入新私有页，避免先创建缓存页再立即复制。缓存命中的写时 COW 例程自身完成该页的 `SFENCE.VMA`/必要 `FENCE.I`，外层缺页路径不重复刷新；其他新填充页由外层统一刷新。文件最后一页的有效内容之后补零；故障页起点已经不小于文件大小时返回 `BUS_FAULT`。可写根上的 write/truncate 会先完成介质更新再精确失效 node 页缓存；只读根则由块设备能力拒绝修改，因此两种挂载都使用创建时 OFD 持有的稳定 node/size。
+文件 VMA 不预分配数据页。`FILE_PRIVATE` read/execute 首次缺页从挂载页缓存取得共享页并建立 COW PTE；首次写若缓存已命中则复制缓存页，未命中则直接把文件内容读入新私有页。缓存命中的写时 COW 例程自身完成该页的 `SFENCE.VMA`/必要 `FENCE.I`，外层缺页路径不重复刷新；其他新填充页由外层统一刷新。文件最后一页的有效内容之后补零；故障页起点已经不小于文件大小时返回 `BUS_FAULT`。普通 read/write 与后续私有缺页共用 inode 页缓存；已私有化的 COW 页继续隔离。
+
+`FILE_SHARED` 的每个驻留 PTE 持缓存物理页引用，MM 持对应 OFD 来源引用；同一 inode 页在独立 open、独立 MM 和多个 VA 中维持同一数据源。MM 分配驻留记录后安装只读共享 PTE，再把记录挂入缓存页的反向索引；失败撤销 PTE，未发布的记录由 MM 回收。写故障在缓存项标记当前有效字节脏、推进 generation 后将本 PTE 升为可写。缓存写回前按反向索引重新保护别名，写回中再次写入会重新故障并改变 generation，旧写回不能清除新脏状态。MM 拥有记录，缓存借用链接，PTE 持物理页；fork 预留子记录并在页表共享成功后挂入索引，munmap/fixed replace/退出无分配地摘除。只读 fd 建立的共享 VMA 保存不可升级的写资格，`mprotect` 请求写返回 `EACCES`，合法权限变化重新建立首次写追踪。
+
+`kernel_mm_msync()` 按固定 Linux `references/linux/mm/msync.c`（commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`）检查 flags、对齐和范围；长度零成功，空洞在处理已映射片段后返回 `ENOMEM`。`MS_SYNC` 对共享文件 VMA 的对应 inode 范围写回，再同步元数据并传递块 flush，错误沿 inode/OFD 序列传播；`MS_ASYNC` 不提交 I/O。映射保持 OFD/node 引用，所以关闭 fd 或 unlink 后仍能同步。
 
 ELF image 使用独立的 `kernel_elf64_source`，不把 `PT_LOAD` 当作普通 file-private mmap。source 在 exec 时一次解析 program headers，并将页区间规范化为 `ELF_PRIVATE` VMA 的 `backing_offset`。完整文件页可以共享 page cache；文件/BSS 边界页、多个段贡献页和 BSS 页由 fault 路径私有分配、清零并精确填充。source 引用由 MM 记录，重复映射不增加历史引用，fork 子 MM 获取独立引用，最后一个相关 VMA 消失才 release。可执行页发布后执行本地 `SFENCE.VMA` 和必要 `FENCE.I`，覆盖先读后取指。source 的 OFD/I/O 清理错误仍由 source owner 保留，堆和物理页释放不建立重试状态。
 
@@ -187,12 +191,14 @@ make test-brk-riscv
 make test-mmap-riscv
 make test-demand-page-riscv
 make test-user-riscv
+make test-diff-abi-riscv
+make test-sqlite-wal-riscv
 make test-riscv
 ```
 
-MM 聚焦测试覆盖创建失败原子性、共享引用、移动、COW fork 的父子共享/写隔离/末引用原地恢复、`PROT_NONE` COW 属性，以及正常页表回收和物理页基线；VMA 聚焦测试另覆盖共享匿名页的 fork 前驻留、双方首次 fault 顺序、权限拆分、部分撤映射、替换、退出和 OOM 回滚。同一 MM target 还运行独立 fatal kernel，注入一次页表 backing 无法解析并确认只产生一个 fatal 结果、不会返回 retry/success 路径。文件测试覆盖 cache hit/miss、write-first、尾页补零、整页越 EOF、fd 关闭后 fault、fork 后 OFD 来源和最终回收。syscall 聚焦测试验证校验错误先于不可读 OFD 的 `EACCES`，两类拒绝都释放临时 pin 且不进入 MM 提交；`test-userland-riscv` 用真实 musl mmap 覆盖匿名共享的双向可见、fd 忽略、fixed 冲突，以及原有私有 mmap。`test-mmap-riscv` 与真实 ext4 `/init` 从 U-mode 完成匿名/文件私有 mmap、COW、SIGBUS、mprotect/munmap 生命周期。
+MM 聚焦测试覆盖创建失败原子性、共享引用、移动、COW fork 的父子共享/写隔离/末引用原地恢复、`PROT_NONE` COW 属性，以及正常页表回收和物理页基线；VMA 聚焦测试另覆盖共享匿名页的 fork 前驻留、双方首次 fault 顺序、权限拆分、部分撤映射、替换、退出和 OOM 回滚。同一 MM target 还运行独立 fatal kernel，注入一次页表 backing 无法解析并确认只产生一个 fatal 结果、不会返回 retry/success 路径。文件测试覆盖 cache hit/miss、write-first、尾页补零、整页越 EOF、fd 关闭后 fault、fork 后 OFD 来源和最终回收。syscall 聚焦测试验证校验错误先于不可读 OFD 的 `EACCES`，两类拒绝都释放临时 pin 且不进入 MM 提交；`test-userland-riscv` 用真实 musl mmap 覆盖匿名共享的双向可见、fd 忽略、fixed 冲突，以及原有私有 mmap。`test-mmap-riscv` 与真实 ext4 `/init` 从 U-mode 完成匿名/文件私有 mmap、COW、SIGBUS、mprotect/munmap 生命周期；`test-diff-abi-riscv` 与 `test-sqlite-wal-riscv` 另验证文件共享 mmap、`msync` 和独立进程 WAL。
 
-当前只有 RISC-V 后端；映射仍由 Sv39/4 KiB 用户页实现。普通 fork 使用独立 MM，私有页 COW、共享匿名页共享；线程 clone/vfork 共享同一 MM record。匿名映射和 ELF image 使用每 MM 的 ASLR mmap ceiling（无可信种子时确定性降级），但没有 commit accounting。栈软限制约束后续未驻留栈页的填充，已存在的 PTE 保留；新 exec 在固定容量 VMA 内按当前软限制建立初始栈。可读普通文件支持 MAP_PRIVATE，尚无共享文件映射或 `msync`；brk 尚未接入 RLIMIT_DATA。文件表和信号表不属于 MM。private futex 使用 MM 创建时分配的单调身份号与用户地址，避免 MM record 页回收后重用身份；共享匿名 futex 使用后备对象与连续字节偏移，等待者持有对象引用。共享文件 futex 尚无后备 key。
+当前只有 RISC-V 后端；映射仍由 Sv39/4 KiB 用户页实现。普通 fork 使用独立 MM，私有页 COW、共享匿名与共享文件页保持共享；线程 clone/vfork 共享同一 MM record。匿名映射和 ELF image 使用每 MM 的 ASLR mmap ceiling（无可信种子时确定性降级），但没有 commit accounting。栈软限制约束后续未驻留栈页的填充，已存在的 PTE 保留；新 exec 在固定容量 VMA 内按当前软限制建立初始栈。可读普通文件支持 MAP_PRIVATE/MAP_SHARED 与 `msync`；brk 尚未接入 RLIMIT_DATA。文件表和信号表不属于 MM。private futex 使用 MM 创建时分配的单调身份号与用户地址，避免 MM record 页回收后重用身份；共享匿名 futex 使用后备对象与连续字节偏移，等待者持有对象引用。共享文件 futex 尚无后备 key。
 
 ## 驻留文件映射与截断
 

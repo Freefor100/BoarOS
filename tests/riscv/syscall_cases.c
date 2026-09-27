@@ -56,6 +56,7 @@ static uint64_t fcntl_argument = UINT64_MAX;
 static enum kernel_open_file_kind pinned_kind =
     KERNEL_OPEN_FILE_KIND_REGULAR;
 static int pinned_readable = 1;
+static int pinned_writable = 1;
 static enum kernel_mm_status file_mmap_validation_status =
     KERNEL_MM_STATUS_OK;
 static enum kernel_mm_status file_mmap_status = KERNEL_MM_STATUS_OK;
@@ -422,6 +423,15 @@ int __wrap_kernel_open_file_readable(
     return file ==
                (const struct kernel_open_file_description *)(uintptr_t)4U
                ? pinned_readable
+               : 0;
+}
+
+int __wrap_kernel_open_file_writable(
+    const struct kernel_open_file_description *file)
+{
+    return file ==
+               (const struct kernel_open_file_description *)(uintptr_t)4U
+               ? pinned_writable
                : 0;
 }
 
@@ -980,11 +990,16 @@ static unsigned long run_memory_mapping_cases(void)
         failures++;
     }
     request.arguments[3] = UINT64_C(0x1);
+    request.arguments[4] = 7U;
+    mmap_mm_result = UINT64_C(0x41000);
     if (kernel_syscall_dispatch(caller, &request, &result) !=
             KERNEL_SYSCALL_STATUS_OK ||
-        result_changed(&result, KERNEL_SYSCALL_ACTION_RETURN, -95)) {
+        result_changed(&result, KERNEL_SYSCALL_ACTION_RETURN,
+                       INT64_C(0x41000)) ||
+        mmap_mm_flags != KERNEL_MM_MAP_SHARED) {
         failures++;
     }
+    request.arguments[4] = UINT64_MAX;
     request.arguments[3] = UINT64_C(0x80000022);
     if (kernel_syscall_dispatch(caller, &request, &result) !=
             KERNEL_SYSCALL_STATUS_OK ||
@@ -1091,9 +1106,13 @@ static unsigned long run_memory_mapping_cases(void)
     }
     request.arguments[5] = 0U;
     request.arguments[3] = 1U;
+    file_mmap_status = KERNEL_MM_STATUS_OK;
+    mmap_mm_result = UINT64_C(0x88000);
     if (kernel_syscall_dispatch(caller, &request, &result) !=
             KERNEL_SYSCALL_STATUS_OK ||
-        result_changed(&result, KERNEL_SYSCALL_ACTION_RETURN, -95)) {
+        result_changed(&result, KERNEL_SYSCALL_ACTION_RETURN,
+                       INT64_C(0x88000)) ||
+        mmap_mm_flags != KERNEL_MM_MAP_SHARED) {
         failures++;
     }
 

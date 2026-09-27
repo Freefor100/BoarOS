@@ -103,8 +103,7 @@ enum kernel_syscall_status syscall_handle_mmap(
         return KERNEL_SYSCALL_STATUS_OK;
     }
     if (((flags & LINUX_MAP_TYPE_MASK) != LINUX_MAP_PRIVATE &&
-         ((flags & LINUX_MAP_TYPE_MASK) != LINUX_MAP_SHARED ||
-          (flags & LINUX_MAP_ANONYMOUS) == 0U)) ||
+         (flags & LINUX_MAP_TYPE_MASK) != LINUX_MAP_SHARED) ||
         (flags & LINUX_MAP_POPULATE) != 0U) {
         decoded->value = -KERNEL_ENOTSUP;
         return KERNEL_SYSCALL_STATUS_OK;
@@ -147,7 +146,7 @@ enum kernel_syscall_status syscall_handle_mmap(
         }
         if (kernel_open_file_kind(file) !=
             KERNEL_OPEN_FILE_KIND_REGULAR) {
-            /* Only regular files back the private-mapping page-cache path. */
+            /* Only regular files have an inode page-cache mapping. */
             if (kernel_open_file_release(&file) !=
                 KERNEL_OPEN_FILE_STATUS_OK) {
                 return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
@@ -167,7 +166,10 @@ enum kernel_syscall_status syscall_handle_mmap(
                 KERNEL_OPEN_FILE_STATUS_OK) {
                 return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
             }
-        } else if (!kernel_open_file_readable(file)) {
+        } else if (!kernel_open_file_readable(file) ||
+                   ((flags & LINUX_MAP_TYPE_MASK) == LINUX_MAP_SHARED &&
+                    (protections & LINUX_PROT_WRITE) != 0U &&
+                    !kernel_open_file_writable(file))) {
             if (kernel_open_file_release(&file) !=
                 KERNEL_OPEN_FILE_STATUS_OK) {
                 return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
@@ -256,10 +258,13 @@ enum kernel_syscall_status syscall_handle_mprotect(
     if (status != KERNEL_MM_STATUS_OK &&
         status != KERNEL_MM_STATUS_INVALID_ARGUMENT &&
         status != KERNEL_MM_STATUS_NOT_MAPPED &&
-        status != KERNEL_MM_STATUS_NO_MEMORY) {
+        status != KERNEL_MM_STATUS_NO_MEMORY &&
+        status != KERNEL_MM_STATUS_ACCESS) {
         return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     }
-    if (status == KERNEL_MM_STATUS_NOT_MAPPED ||
+    if (status == KERNEL_MM_STATUS_ACCESS) {
+        decoded->value = -KERNEL_EACCES;
+    } else if (status == KERNEL_MM_STATUS_NOT_MAPPED ||
         status == KERNEL_MM_STATUS_NO_MEMORY) {
         decoded->value = -KERNEL_ENOMEM;
     } else {
@@ -267,5 +272,19 @@ enum kernel_syscall_status syscall_handle_mprotect(
                              ? 0
                              : -KERNEL_EINVAL;
     }
+    return KERNEL_SYSCALL_STATUS_OK;
+}
+
+enum kernel_syscall_status syscall_handle_msync(
+    struct kernel_task *caller,
+    const struct kernel_syscall_request *request,
+    struct kernel_syscall_result *decoded)
+{
+    struct kernel_mm *mm;
+    if (kernel_task_mm_borrow_mutable(caller, &mm) !=
+        KERNEL_TASK_STATUS_OK) return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+    decoded->value = kernel_mm_msync(mm, request->arguments[0],
+        request->arguments[1], (uint32_t)request->arguments[2]);
     return KERNEL_SYSCALL_STATUS_OK;
 }

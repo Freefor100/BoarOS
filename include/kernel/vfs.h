@@ -192,6 +192,8 @@ int kernel_vfs_ftruncate(struct kernel_vfs_file *file,
 uint64_t kernel_vfs_error_sequence(const struct kernel_vfs_file *file);
 int kernel_vfs_sync(struct kernel_vfs_file *file, int datasync,
                     uint64_t *observed_error);
+int kernel_vfs_sync_range(struct kernel_vfs_file *file,
+    uint64_t start, uint64_t end, uint64_t *observed_error);
 
 int kernel_vfs_mkdir(struct kernel_vfs_mount *mount,
                      const char *path,

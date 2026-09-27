@@ -18,6 +18,7 @@ enum kernel_vma_status {
     KERNEL_VMA_STATUS_NO_MEMORY,
     KERNEL_VMA_STATUS_CONFLICT,
     KERNEL_VMA_STATUS_NOT_FOUND,
+    KERNEL_VMA_STATUS_ACCESS,
     KERNEL_VMA_STATUS_STATE,
 };
 
@@ -26,6 +27,7 @@ enum kernel_vma_kind {
     KERNEL_VMA_KIND_FILE_PRIVATE,
     KERNEL_VMA_KIND_ELF_PRIVATE,
     KERNEL_VMA_KIND_ANON_SHARED,
+    KERNEL_VMA_KIND_FILE_SHARED,
 };
 
 enum kernel_vma_role {
@@ -43,6 +45,7 @@ enum kernel_vma_fault_policy {
     KERNEL_VMA_FAULT_FILE_PRIVATE,
     KERNEL_VMA_FAULT_ELF,
     KERNEL_VMA_FAULT_ANON_SHARED,
+    KERNEL_VMA_FAULT_FILE_SHARED,
 };
 
 /* A value copy; callers must not retain backing as a standalone owner. */
@@ -55,6 +58,7 @@ struct kernel_vma {
     enum kernel_vma_role role;
     enum kernel_vma_fault_policy fault_policy;
     void *backing;
+    uint8_t file_shared_may_write;
 };
 
 /*
@@ -94,6 +98,11 @@ enum kernel_vma_status kernel_vma_set_insert(
 enum kernel_vma_status kernel_vma_set_lookup(
     const struct kernel_vma_set *set,
     uint64_t virtual_address,
+    struct kernel_vma *vma);
+
+/* First VMA whose start is at or after address. */
+enum kernel_vma_status kernel_vma_set_next(
+    const struct kernel_vma_set *set, uint64_t address,
     struct kernel_vma *vma);
 
 enum kernel_vma_status kernel_vma_set_find_topdown_gap(

@@ -28,11 +28,11 @@ static int vma_valid(const struct kernel_vma *vma)
 {
     if (vma == 0 || vma->start >= vma->end ||
         vma->kind < KERNEL_VMA_KIND_ANONYMOUS ||
-        vma->kind > KERNEL_VMA_KIND_ANON_SHARED ||
+        vma->kind > KERNEL_VMA_KIND_FILE_SHARED ||
         vma->role < KERNEL_VMA_ROLE_NONE ||
         vma->role > KERNEL_VMA_ROLE_MMAP ||
         vma->fault_policy < KERNEL_VMA_FAULT_RESIDENT_REQUIRED ||
-        vma->fault_policy > KERNEL_VMA_FAULT_ANON_SHARED) {
+        vma->fault_policy > KERNEL_VMA_FAULT_FILE_SHARED) {
         return 0;
     }
     if (vma->kind == KERNEL_VMA_KIND_ANONYMOUS &&
@@ -59,6 +59,13 @@ static int vma_valid(const struct kernel_vma *vma)
          vma->backing_offset > UINT64_MAX - (vma->end - vma->start))) {
         return 0;
     }
+    if (vma->kind == KERNEL_VMA_KIND_FILE_SHARED &&
+        (vma->backing == 0 ||
+         vma->fault_policy != KERNEL_VMA_FAULT_FILE_SHARED ||
+         vma->backing_offset > UINT64_MAX - (vma->end - vma->start) ||
+         vma->file_shared_may_write > 1U ||
+         ((vma->permissions & 2U) != 0U &&
+          !vma->file_shared_may_write))) return 0;
     return 1;
 }
 
@@ -71,7 +78,8 @@ static int can_merge(const struct kernel_vma *left,
         left->permissions != right->permissions ||
         left->kind != right->kind || left->role != right->role ||
         left->fault_policy != right->fault_policy ||
-        left->backing != right->backing) {
+        left->backing != right->backing ||
+        left->file_shared_may_write != right->file_shared_may_write) {
         return 0;
     }
     if (left->kind == KERNEL_VMA_KIND_ANONYMOUS) {
@@ -98,6 +106,19 @@ static uint32_t lower_bound(const struct kernel_vma_set *set,
         }
     }
     return low;
+}
+
+enum kernel_vma_status kernel_vma_set_next(
+    const struct kernel_vma_set *set, uint64_t address,
+    struct kernel_vma *vma)
+{
+    uint32_t index;
+    if (!set_valid(set) || vma == 0)
+        return KERNEL_VMA_STATUS_INVALID_ARGUMENT;
+    index = lower_bound(set, address);
+    if (index == set->count) return KERNEL_VMA_STATUS_NOT_FOUND;
+    *vma = set->entries[index];
+    return KERNEL_VMA_STATUS_OK;
 }
 
 static enum kernel_vma_status reserve_entries(struct kernel_vma_set *set,
@@ -556,6 +577,15 @@ enum kernel_vma_status kernel_vma_set_prepare_protect(
     }
     if (!range_is_covered(set, start, end)) {
         return KERNEL_VMA_STATUS_NOT_FOUND;
+    }
+    if ((permissions & 2U) != 0U) {
+        for (uint32_t index = 0U; index < set->count; index++) {
+            const struct kernel_vma *entry = &set->entries[index];
+            if (entry->end <= start || entry->start >= end) continue;
+            if (entry->kind == KERNEL_VMA_KIND_FILE_SHARED &&
+                !entry->file_shared_may_write)
+                return KERNEL_VMA_STATUS_ACCESS;
+        }
     }
     if (set->generation == UINT64_MAX) {
         return KERNEL_VMA_STATUS_STATE;

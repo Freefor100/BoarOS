@@ -103,6 +103,8 @@ uint32_t kernel_open_file_flags(
 /* Access mode is OFD state and therefore survives descriptor duplication. */
 int kernel_open_file_readable(
     const struct kernel_open_file_description *file);
+int kernel_open_file_writable(
+    const struct kernel_open_file_description *file);
 uint64_t kernel_open_file_offset(
     const struct kernel_open_file_description *file);
 
@@ -127,11 +129,19 @@ enum kernel_page_cache_status kernel_open_file_lookup_page(
     uint64_t *physical_address,
     size_t *valid_bytes);
 
+enum kernel_page_cache_status kernel_open_file_alias_attach(
+    struct kernel_open_file_description *file, uint64_t page_index,
+    uint64_t physical_address, struct kernel_page_cache_alias *alias,
+    void *owner, uint64_t virtual_address,
+    void (*rearm)(void *owner, uint64_t virtual_address));
+
 int kernel_open_file_pread(struct kernel_open_file_description *file,
                            uint64_t offset,
                            void *buffer,
                            size_t size,
                            size_t *bytes_read);
+int kernel_open_file_sync_range(struct kernel_open_file_description *file,
+    uint64_t start, uint64_t end);
 
 #define KERNEL_POLLIN 0x0001U
 #define KERNEL_POLLPRI 0x0002U

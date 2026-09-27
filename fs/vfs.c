@@ -1619,7 +1619,8 @@ static void apply_truncated_size(struct kernel_vfs_node *node,
         }
     }
     if (node->adapter->page_cache != 0) {
-        kernel_page_cache_truncate(node->adapter->page_cache, node, node->size);
+        kernel_page_cache_resize(node->adapter->page_cache, node,
+                                  old_size, node->size);
     }
 }
 
@@ -2687,19 +2688,22 @@ uint64_t kernel_vfs_error_sequence(const struct kernel_vfs_file *file)
     return node != 0 ? node->writeback_error_sequence : 0;
 }
 
-int kernel_vfs_sync(struct kernel_vfs_file *file, int datasync,
-                    uint64_t *observed_error)
+int kernel_vfs_sync_range(struct kernel_vfs_file *file,
+    uint64_t start, uint64_t end, uint64_t *observed_error)
 {
     struct kernel_vfs_node *node = kernel_vfs_file_node(file);
     int result;
-    (void)datasync; /* Metadata is currently submitted with each mutation. */
     if (node == 0 || observed_error == 0) return -KERNEL_EBADF;
+    if (start >= end) return -KERNEL_EINVAL;
     if ((node->mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFREG &&
         (node->mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFDIR)
         return -KERNEL_EINVAL;
     result = 0;
     if (node->adapter->read_only) goto observe;
-    result = kernel_page_cache_writeback(node->adapter->page_cache, node);
+    result = start == 0U && end == UINT64_MAX
+        ? kernel_page_cache_writeback(node->adapter->page_cache, node)
+        : kernel_page_cache_writeback_range(node->adapter->page_cache,
+                                            node, start, end);
     if (result == 0) {
         result = lwext4_error(ext4_file_sync_metadata(&node->file));
         if (result != 0) record_writeback_error(node, result);
@@ -2718,6 +2722,13 @@ observe:
         *observed_error = node->writeback_error_sequence;
     }
     return result;
+}
+
+int kernel_vfs_sync(struct kernel_vfs_file *file, int datasync,
+                    uint64_t *observed_error)
+{
+    (void)datasync; /* Metadata is currently submitted with each mutation. */
+    return kernel_vfs_sync_range(file, 0U, UINT64_MAX, observed_error);
 }
 
 const struct kernel_vfs_mount *kernel_vfs_node_mount(
