@@ -615,11 +615,11 @@ int kernel_socket_recvfrom(struct kernel_socket *socket, struct kernel_mm *mm,
     return user_fault ? -KERNEL_EFAULT : (int)done;
 }
 
-int kernel_socket_read_buffer(struct kernel_socket *socket,
+int kernel_socket_reserve_read(struct kernel_socket *socket,
                               struct kernel_task *task,
                               struct kernel_socket_read_request *request,
                               struct kernel_open_file_description **pin_owner,
-                              void *buffer, uint32_t capacity)
+                              uint32_t capacity)
 {
     struct socket_packet *packet;
     uint32_t available;
@@ -647,13 +647,11 @@ int kernel_socket_read_buffer(struct kernel_socket *socket,
     }
     available = packet->payload->tot_len - packet->consumed;
     length = capacity < available ? capacity : available;
-    if (pbuf_copy_partial(packet->payload, buffer, (u16_t)length,
-                          packet->consumed) != length)
-        __builtin_trap();
     request->socket = socket;
     request->task = task;
     request->packet = packet;
     request->bytes = length;
+    request->datagram = socket->type == SOCKET_DGRAM;
     request->pin = *pin_owner;
     request->pin_owner = pin_owner;
     *pin_owner = 0;
@@ -662,6 +660,17 @@ int kernel_socket_read_buffer(struct kernel_socket *socket,
     socket->read_request = request;
     riscv_interrupt_restore(old_status);
     return (int)length;
+}
+
+void kernel_socket_copy_read(const struct kernel_socket_read_request *request,
+                             uint32_t offset, void *buffer, uint32_t length)
+{
+    const struct socket_packet *packet = request->packet;
+    if (request->socket == 0 || request->socket->read_request != request ||
+        offset > request->bytes || length > request->bytes - offset ||
+        pbuf_copy_partial(packet->payload, buffer, (u16_t)length,
+                          packet->consumed + offset) != length)
+        __builtin_trap();
 }
 
 void kernel_socket_finish_read(struct kernel_socket_read_request *request,
@@ -738,6 +747,12 @@ void kernel_socket_abort_read(struct kernel_socket_read_request *request)
         __builtin_trap();
 }
 
+static struct kernel_socket_statistics socket_statistics;
+void kernel_socket_get_statistics(struct kernel_socket_statistics *statistics)
+{
+    *statistics = socket_statistics;
+}
+
 int kernel_socket_write_buffer(struct kernel_socket *socket,
                                const void *buffer, uint32_t size)
 {
@@ -755,8 +770,10 @@ int kernel_socket_write_buffer(struct kernel_socket *socket,
         riscv_interrupt_restore(old_status);
         return -KERNEL_EAGAIN;
     }
+    socket_statistics.tcp_write_calls++;
     error = tcp_write(socket->tcp, buffer, (u16_t)length, TCP_WRITE_FLAG_COPY);
     if (error == ERR_OK) {
+        socket_statistics.tcp_written_bytes += length;
         write_retry_disarm(socket);
         /* tcp_write owns the copied bytes even if immediate output defers. */
         (void)tcp_output(socket->tcp);

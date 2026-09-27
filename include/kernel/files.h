@@ -40,6 +40,7 @@ struct kernel_files_statistics {
     uint64_t bytes_read;
     uint64_t bytes_written;
     uint64_t read_chunks;
+    uint64_t write_chunks;
     uint32_t current_open_fds;
     uint32_t peak_open_fds;
     uint32_t close_on_exec_fds;

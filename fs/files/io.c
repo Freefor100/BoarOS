@@ -148,14 +148,13 @@ static enum kernel_files_status read_pinned(
         return KERNEL_FILES_STATUS_OK;
     }
     if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_SOCKET) {
-        uint8_t staging[256];
+        struct kernel_task_io_buffer buffer = {0};
         struct kernel_socket_read_request read_request = {0};
-        size_t copied = 0U;
-        int received;
+        int received = 0;
+        enum kernel_files_status result = KERNEL_FILES_STATUS_OK;
         for (size_t index = 0; index < iov_count; index++) {
-            if (kernel_user_range_check(iov[index].base,
-                                        (size_t)iov[index].length) !=
-                KERNEL_UACCESS_STATUS_OK) {
+            if (kernel_user_range_check(iov[index].base, (size_t)iov[index].length)
+                    != KERNEL_UACCESS_STATUS_OK) {
                 *linux_result = -KERNEL_EFAULT;
                 files->record->statistics.read_failures++;
                 return KERNEL_FILES_STATUS_OK;
@@ -165,47 +164,53 @@ static enum kernel_files_status read_pinned(
             *linux_result = 0;
             return KERNEL_FILES_STATUS_OK;
         }
-        for (;;) {
-            received = kernel_socket_read_buffer(
+        if (kernel_task_io_buffer_acquire(&buffer, mm->allocator) !=
+                KERNEL_TASK_STATUS_OK) {
+            *linux_result = -KERNEL_ENOMEM;
+            files->record->statistics.read_failures++;
+            return KERNEL_FILES_STATUS_OK;
+        }
+        while (total < count) {
+            uint64_t remaining = count - total;
+            received = kernel_socket_reserve_read(
                 kernel_open_file_socket(description), kernel_task_current(),
-                &read_request, description_owner, staging,
-                count < sizeof(staging) ? (uint32_t)count : sizeof(staging));
-            if (received != -KERNEL_EAGAIN) break;
-            int waited = socket_wait_ready(description, KERNEL_POLLIN,
-                kernel_socket_receive_timeout(
-                    kernel_open_file_socket(description)));
-            if (waited != 0) {
+                &read_request, description_owner,
+                remaining > UINT32_MAX ? UINT32_MAX : (uint32_t)remaining);
+            if (received == -KERNEL_EAGAIN && total == 0U) {
+                int waited = socket_wait_ready(description, KERNEL_POLLIN,
+                    kernel_socket_receive_timeout(kernel_open_file_socket(description)));
+                if (waited == 0) continue;
                 received = waited;
-                break;
             }
+            if (received < 0 || read_request.socket == 0) break;
+            int datagram = read_request.datagram;
+            uint32_t done = 0;
+            int fault = 0;
+            while (done < (uint32_t)received) {
+                size_t chunk = (uint32_t)received - done, copied = 0;
+                if (chunk > BOAROS_PAGE_SIZE) chunk = BOAROS_PAGE_SIZE;
+                kernel_socket_copy_read(&read_request, done, buffer.data, chunk);
+                enum kernel_uaccess_status access = kernel_copy_to_user_iov(
+                    mm, &cursor, buffer.data, chunk, &copied);
+                files->record->statistics.read_chunks++;
+                if (access != KERNEL_UACCESS_STATUS_OK || copied != chunk) {
+                    fault = 1;
+                    if (access != KERNEL_UACCESS_STATUS_FAULT)
+                        result = KERNEL_FILES_STATUS_STATE;
+                    break;
+                }
+                done += (uint32_t)chunk;
+            }
+            kernel_socket_finish_read(&read_request, fault);
+            if (fault) { received = -KERNEL_EFAULT; break; }
+            total += (uint32_t)received;
+            if (datagram) break;
         }
-        if (received > 0) {
-            enum kernel_uaccess_status access = kernel_copy_to_user_iov(
-                mm, &cursor, staging, (size_t)received, &copied);
-            if (access != KERNEL_UACCESS_STATUS_OK &&
-                access != KERNEL_UACCESS_STATUS_FAULT) {
-                kernel_socket_finish_read(&read_request, 1);
-                return KERNEL_FILES_STATUS_STATE;
-            }
-            if (access == KERNEL_UACCESS_STATUS_OK &&
-                     copied != (size_t)received) {
-                kernel_socket_finish_read(&read_request, 1);
-                return KERNEL_FILES_STATUS_STATE;
-            }
-            kernel_socket_finish_read(&read_request,
-                                      access == KERNEL_UACCESS_STATUS_FAULT);
-            if (access == KERNEL_UACCESS_STATUS_FAULT)
-                received = -KERNEL_EFAULT;
-        } else if (read_request.socket != 0) {
-            /* A zero-length UDP datagram still owns a staged reservation and
-             * consumes one queued packet. TCP EOF has no reservation. */
-            if (received != 0) return KERNEL_FILES_STATUS_STATE;
-            kernel_socket_finish_read(&read_request, 0);
-        }
-        *linux_result = received;
-        if (received < 0) files->record->statistics.read_failures++;
-        else files->record->statistics.bytes_read += (uint64_t)received;
-        return KERNEL_FILES_STATUS_OK;
+        kernel_task_io_buffer_release(&buffer);
+        *linux_result = total != 0U ? (int64_t)total : received;
+        if (*linux_result < 0) files->record->statistics.read_failures++;
+        else files->record->statistics.bytes_read += total;
+        return result;
     }
     if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_NULL ||
         kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_ZERO) {
@@ -745,10 +750,9 @@ static enum kernel_files_status buffered_write_request(
     struct kernel_open_file_description *description,
     const struct kernel_uaccess_iovec *iov, size_t iov_count,
     uint64_t count, int positioned, uint64_t requested_offset,
-    int64_t *linux_result)
+    int64_t *linux_result, unsigned char *staging, size_t capacity)
 {
     uint64_t total = 0U;
-    unsigned char staging[KERNEL_FILES_WRITE_STAGING];
 
     if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_NULL ||
         kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_ZERO) {
@@ -770,8 +774,12 @@ static enum kernel_files_status buffered_write_request(
                 size_t copied = 0U;
                 int sent;
                 enum kernel_uaccess_status access;
-                if (chunk > sizeof(staging)) chunk = sizeof(staging);
+                if (chunk > capacity) chunk = capacity;
+                size_t page_left = BOAROS_PAGE_SIZE -
+                    ((iov[index].base + offset) & BOAROS_PAGE_MASK);
+                if (chunk > page_left) chunk = page_left;
                 if (chunk > count - total) chunk = (size_t)(count - total);
+                files->record->statistics.write_chunks++;
                 access = kernel_copy_from_user(mm, staging,
                     iov[index].base + offset, chunk, &copied);
                 if (access == KERNEL_UACCESS_STATUS_FAULT && copied == 0U) {
@@ -834,9 +842,10 @@ static enum kernel_files_status buffered_write_request(
                 if ((uint64_t)chunk > count - total) {
                     chunk = (size_t)(count - total);
                 }
-                if (chunk > sizeof(staging)) {
-                    chunk = sizeof(staging);
+                if (chunk > capacity) {
+                    chunk = capacity;
                 }
+                files->record->statistics.write_chunks++;
                 status = kernel_copy_from_user(mm, staging,
                                                 iov[index].base + offset,
                                                 chunk, &copied);
@@ -917,8 +926,8 @@ static enum kernel_files_status buffered_write_request(
             if (chunk > count - total) {
                 chunk = count - total;
             }
-            if (chunk > sizeof(staging)) {
-                chunk = sizeof(staging);
+            if (chunk > capacity) {
+                chunk = capacity;
             }
             status = kernel_copy_from_user(mm, staging,
                                             iov[index].base + offset,
@@ -951,9 +960,25 @@ static enum kernel_files_status write_request(
     uint64_t count, int positioned, uint64_t requested_offset,
     int64_t *linux_result)
 {
+    struct kernel_task_io_buffer buffer = {0};
+    unsigned char small[KERNEL_FILES_WRITE_STAGING];
+    unsigned char *staging = small;
+    size_t capacity = sizeof(small);
+    enum kernel_open_file_kind kind = kernel_open_file_kind(description);
+    if (count != 0U && (kind == KERNEL_OPEN_FILE_KIND_REGULAR ||
+                        kind == KERNEL_OPEN_FILE_KIND_SOCKET)) {
+        if (kernel_task_io_buffer_acquire(&buffer, mm->allocator) !=
+                KERNEL_TASK_STATUS_OK) {
+            *linux_result = -KERNEL_ENOMEM;
+            return KERNEL_FILES_STATUS_OK;
+        }
+        staging = buffer.data;
+        capacity = BOAROS_PAGE_SIZE;
+    }
     enum kernel_files_status status = buffered_write_request(files, mm,
         description, iov, iov_count, count, positioned, requested_offset,
-        linux_result);
+        linux_result, staging, capacity);
+    if (buffer.allocator != 0) kernel_task_io_buffer_release(&buffer);
     if (status == KERNEL_FILES_STATUS_OK && *linux_result > 0 &&
         kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_REGULAR &&
         (description->open_flags & KERNEL_FILES_O_DSYNC) != 0U) {

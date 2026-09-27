@@ -7,6 +7,9 @@
 #include <stddef.h>
 #include <stdint.h>
 
+static uint64_t page_resolutions;
+uint64_t kernel_uaccess_page_resolutions(void) { return page_resolutions; }
+
 enum kernel_uaccess_status kernel_user_range_check(
     uint64_t user_address,
     size_t size)
@@ -31,6 +34,7 @@ static enum kernel_uaccess_status resolve_user_page(
     void *pointer;
     enum kernel_mm_status mm_status;
 
+    page_resolutions++;
     mm_status = kernel_mm_lookup(mm, user_address, &mapping);
     if (mm_status == KERNEL_MM_STATUS_NOT_MAPPED ||
         (mm_status == KERNEL_MM_STATUS_OK &&

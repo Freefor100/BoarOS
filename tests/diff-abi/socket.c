@@ -86,8 +86,178 @@ static long enable_loopback(long fd)
     return SC3(29, fd, LINUX_SIOCSIFFLAGS, &interface);
 }
 
+/* Internal staging must not truncate a datagram. A following marker also
+ * proves that a short receive consumes exactly one packet. */
+static void udp_scale_cases(void)
+{
+    static unsigned char input[8192], output[8192];
+    static const unsigned lengths[] = {0, 255, 256, 257, 1500, 4096, 8192};
+    static const char *names[] = {
+        "socket.udp-scale.read.full.0",
+        "socket.udp-scale.read.full.255",
+        "socket.udp-scale.read.full.256",
+        "socket.udp-scale.read.full.257",
+        "socket.udp-scale.read.full.1500",
+        "socket.udp-scale.read.full.4096",
+        "socket.udp-scale.read.full.8192",
+        "socket.udp-scale.read.short.0",
+        "socket.udp-scale.read.short.255",
+        "socket.udp-scale.read.short.256",
+        "socket.udp-scale.read.short.257",
+        "socket.udp-scale.read.short.1500",
+        "socket.udp-scale.read.short.4096",
+        "socket.udp-scale.read.short.8192",
+        "socket.udp-scale.readv.full.0",
+        "socket.udp-scale.readv.full.255",
+        "socket.udp-scale.readv.full.256",
+        "socket.udp-scale.readv.full.257",
+        "socket.udp-scale.readv.full.1500",
+        "socket.udp-scale.readv.full.4096",
+        "socket.udp-scale.readv.full.8192",
+        "socket.udp-scale.readv.short.0",
+        "socket.udp-scale.readv.short.255",
+        "socket.udp-scale.readv.short.256",
+        "socket.udp-scale.readv.short.257",
+        "socket.udp-scale.readv.short.1500",
+        "socket.udp-scale.readv.short.4096",
+        "socket.udp-scale.readv.short.8192",
+        "socket.udp-scale.recvfrom.full.0",
+        "socket.udp-scale.recvfrom.full.255",
+        "socket.udp-scale.recvfrom.full.256",
+        "socket.udp-scale.recvfrom.full.257",
+        "socket.udp-scale.recvfrom.full.1500",
+        "socket.udp-scale.recvfrom.full.4096",
+        "socket.udp-scale.recvfrom.full.8192",
+        "socket.udp-scale.recvfrom.short.0",
+        "socket.udp-scale.recvfrom.short.255",
+        "socket.udp-scale.recvfrom.short.256",
+        "socket.udp-scale.recvfrom.short.257",
+        "socket.udp-scale.recvfrom.short.1500",
+        "socket.udp-scale.recvfrom.short.4096",
+        "socket.udp-scale.recvfrom.short.8192",
+    };
+    long fd = SC3(198, LINUX_AF_INET,
+                  LINUX_SOCK_DGRAM | LINUX_SOCK_NONBLOCK, LINUX_IPPROTO_UDP);
+    abi_require(fd >= 0 && enable_loopback(fd) == 0);
+    struct socket_address address = {.family = LINUX_AF_INET};
+    abi_require(SC3(200, fd, &address, sizeof(address)) == 0);
+    uint32_t size = sizeof(address);
+    abi_require(SC3(204, fd, &address, &size) == 0);
+    address.address = 0x0100007fU;
+    for (unsigned i = 0; i < sizeof(input); i++) input[i] = (unsigned char)(i * 17 + 3);
+    unsigned index = 0;
+    for (unsigned mode = 0; mode < 3; mode++) {
+        for (unsigned small = 0; small < 2; small++) {
+            for (unsigned n = 0; n < sizeof(lengths) / sizeof(lengths[0]); n++) {
+                unsigned length = lengths[n], capacity = small ? 127 : sizeof(output);
+                abi_require(SC6(206, fd, input, length, 0, &address, sizeof(address)) == length);
+                abi_require(SC6(206, fd, "!", 1, 0, &address, sizeof(address)) == 1);
+                struct abi_iovec iov[] = {{output, 113}, {output + 113, 0},
+                                         {output + 113, capacity - 113}};
+                long got = mode == 0 ? SC3(63, fd, output, capacity)
+                         : mode == 1 ? SC3(65, fd, iov, 3)
+                         : SC6(207, fd, output, capacity, 0, 0, 0);
+                unsigned good = got >= 0;
+                for (long i = 0; i < got; i++) if (output[i] != input[i]) good = 0;
+                unsigned char tail = 0;
+                long next = SC6(207, fd, &tail, 1, 0, 0, 0);
+                abi_record(names[index++], got, good, next, tail == '!', 0, 0);
+            }
+        }
+    }
+    close_socket(fd);
+}
+
+static void udp_large_fault_cases(void)
+{
+    static unsigned char payload[8192];
+    long memory = SC6(222, 0, 8192, 3, 0x22, -1, 0);
+    abi_require(memory > 0 && SC3(226, memory + 4096, 4096, 0) == 0);
+    long fd = SC3(198, LINUX_AF_INET, LINUX_SOCK_DGRAM | LINUX_SOCK_NONBLOCK, 0);
+    struct socket_address address = {.family = LINUX_AF_INET};
+    uint32_t size = sizeof(address);
+    abi_require(fd >= 0 && SC3(200, fd, &address, size) == 0 &&
+                SC3(204, fd, &address, &size) == 0);
+    address.address = 0x0100007fU;
+    for (unsigned mode = 0; mode < 2; mode++) {
+        abi_require(SC6(206, fd, payload, sizeof(payload), 0, &address, size) == sizeof(payload));
+        abi_require(SC6(206, fd, "!", 1, 0, &address, size) == 1);
+        struct abi_iovec iov[] = {{(void *)memory, 1001}, {(void *)(memory + 1001), 7191}};
+        long got = mode ? SC3(65, fd, iov, 2) : SC3(63, fd, memory, 8192);
+        unsigned char marker = 0;
+        long next = SC6(207, fd, &marker, 1, 0, 0, 0);
+        abi_record(mode ? "socket.udp-large-fault.readv" : "socket.udp-large-fault.read",
+                   got, next, marker == '!', 0, 0, 0);
+    }
+    close_socket(fd);
+    abi_require(SC2(215, memory, 8192) == 0);
+}
+
+static void tcp_scale_cases(void)
+{
+    static unsigned char input[8193], output[8193];
+    struct socket_address address = {.family = LINUX_AF_INET};
+    uint32_t size = sizeof(address);
+    long listener = SC3(198, LINUX_AF_INET, LINUX_SOCK_STREAM, 0);
+    abi_require(listener >= 0 && SC3(200, listener, &address, size) == 0 &&
+                SC3(204, listener, &address, &size) == 0 && SC2(201, listener, 1) == 0);
+    address.address = 0x0100007fU;
+    long client = SC3(198, LINUX_AF_INET, LINUX_SOCK_STREAM, 0);
+    abi_require(client >= 0 && SC3(203, client, &address, size) == 0);
+    long server = SC3(202, listener, 0, 0);
+    abi_require(server >= 0);
+    for (unsigned i = 0; i < sizeof(input); i++) input[i] = (unsigned char)(i * 13 + 7);
+    int good = 1, batched = 0;
+    for (unsigned batch = 0; batch < 128; batch++) {
+        unsigned sent = 0, received = 0;
+        struct abi_iovec iov[] = {{input + 1, 997}, {input + 998, 0}, {input + 998, 7195}};
+        long result = batch & 1 ? SC3(66, client, iov, 3) : SC3(64, client, input + 1, 8192);
+        abi_require(result > 0 && result <= 8192);
+        sent = (unsigned)result;
+        while (sent < 8192) {
+            result = SC3(64, client, input + 1 + sent, 8192 - sent);
+            abi_require(result > 0 && result <= 8192 - sent);
+            sent += (unsigned)result;
+        }
+        while (received < 8192) {
+            result = SC3(63, server, output + 1 + received, 8192 - received);
+            abi_require(result > 0 && result <= 8192 - received);
+            if (result > 256) batched = 1;
+            received += (unsigned)result;
+        }
+        for (unsigned i = 1; i <= 8192; i++) if (input[i] != output[i]) good = 0;
+    }
+    abi_record("socket.tcp-scale.mebibyte", good, batched, -1, 0, 0, 0);
+    /* TCP packet coalescing differs across kernels: assert conservation of
+     * committed bytes, not one particular skb/pbuf segmentation. */
+    long memory = SC6(222, 0, 8192, 3, 0x22, -1, 0);
+    abi_require(memory > 0 && SC3(226, memory + 4096, 4096, 0) == 0);
+    abi_require(SC3(64, client, input, 2048) == 2048 &&
+                SC3(64, client, input + 2048, 2048) == 2048);
+    long prefix = SC3(63, server, memory + 1024, 4096);
+    abi_require(prefix == -14 || (prefix > 0 && prefix <= 3072));
+    unsigned committed = prefix > 0 ? (unsigned)prefix : 0;
+    good = 1;
+    for (unsigned i = 0; i < committed; i++)
+        if (((unsigned char *)memory)[1024 + i] != input[i]) good = 0;
+    unsigned remaining = 4096 - committed, done = 0;
+    while (done < remaining) {
+        long got = SC3(63, server, output + done, remaining - done);
+        abi_require(got > 0 && got <= remaining - done);
+        done += (unsigned)got;
+    }
+    for (unsigned i = 0; i < remaining; i++)
+        if (output[i] != input[committed + i]) good = 0;
+    abi_record("socket.tcp-scale.fault-conservation", good, -1, -1, 0, 0, 0);
+    abi_require(SC2(215, memory, 8192) == 0);
+    close_socket(server); close_socket(client); close_socket(listener);
+}
+
 void abi_socket_cases(void)
 {
+    udp_scale_cases();
+    udp_large_fault_cases();
+    tcp_scale_cases();
     record("socket.bad-type-flags",
            SC3(198, LINUX_AF_INET,
                LINUX_SOCK_STREAM | 0x01000000, LINUX_IPPROTO_TCP));

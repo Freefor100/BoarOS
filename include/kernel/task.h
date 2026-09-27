@@ -10,6 +10,15 @@ struct kernel_files;
 struct kernel_fs_context;
 struct kernel_socket_read_request;
 
+struct physical_page_allocator;
+/* One scratch page owned by a live I/O invocation, including forced exit. */
+struct kernel_task_io_buffer {
+    struct kernel_task *task;
+    struct physical_page_allocator *allocator;
+    uint64_t physical_address;
+    void *data;
+};
+
 enum kernel_task_status {
     KERNEL_TASK_STATUS_OK = 0,
     KERNEL_TASK_STATUS_INVALID_ARGUMENT,
@@ -23,6 +32,10 @@ enum kernel_task_status kernel_task_socket_read_register(
     struct kernel_task *task, struct kernel_socket_read_request *request);
 enum kernel_task_status kernel_task_socket_read_clear(
     struct kernel_task *task, struct kernel_socket_read_request *request);
+
+enum kernel_task_status kernel_task_io_buffer_acquire(
+    struct kernel_task_io_buffer *buffer, struct physical_page_allocator *allocator);
+void kernel_task_io_buffer_release(struct kernel_task_io_buffer *buffer);
 
 /* Records the set_tid_address clear pointer and returns the caller tid. */
 enum kernel_task_status kernel_task_set_tid_address(

@@ -46,7 +46,7 @@ WAIT 的超时为相对 monotonic；WAIT_BITSET 的超时为绝对 monotonic 或
 
 退出清理在原 MM 与原 TID 有效时同步完成，早于 clear-child-tid 和资源释放。成功的非组长 exec 在身份接管前保存旧 TID，切换到已验证新页表后、退休旧 MM 前清理；可返回的 exec 失败不清理旧链。遍历最多 2048 项，下一链接先于字更新读取；pending 项不会因已在链上而处理两次。owner 等于退出 TID 时通过可处理缺页/COW 的 32 位原子比较交换保留 WAITERS 并置 OWNER_DIED，必要时唤醒一个 waiter；pending 的非 owner 解锁窗口按 Linux 规则补唤醒。坏地址、错位、超长链和内存不足只结束该次尽力清理，不把用户错误升级为内核 fatal 或保留无 owner 的重试状态。
 
-带 `FUTEX_PRIVATE_FLAG` 的操作仍只在同一 MM 内匹配；未置该标记的共享匿名映射可跨 fork 的独立 MM 唤醒或 requeue。其他已支持的私有映射仍使用 MM key。共享文件映射和对应 futex 尚未实现。PI 标记项不按普通 robust 字更新；PI、WAKE_OP 和 futex2 仍未实现。单 hart 的 SIE 临界区不构成 SMP 锁协议。
+带 `FUTEX_PRIVATE_FLAG` 的操作仍只在同一 MM 内匹配；未置该标记的共享匿名映射可跨 fork 的独立 MM 唤醒或 requeue。其他已支持的私有映射仍使用 MM key。共享文件映射已实现，其 futex 尚无跨 MM 后备 key。PI 标记项不按普通 robust 字更新；PI、WAKE_OP 和 futex2 仍未实现。单 hart 的 SIE 临界区不构成 SMP 锁协议。
 
 ## 退出与 exec
 
@@ -76,4 +76,6 @@ zombie 先逻辑回收再复制 status/rusage，因此坏输出指针的 EFAULT 
 
 聚焦入口为 `make test-stack-usage`、`make test-scheduler-cases-riscv`、`make test-scheduler-riscv`、`make test-files-riscv` 和 `make test-signal-riscv`；`make test-userland-riscv` 验证真实 pthread、共享匿名 futex、bitset 绝对 realtime 等待在 stop/continue 后保留掩码和截止时刻。`make test-diff-abi-riscv` 用同一 ELF 对照固定 Linux 的零掩码、超时、错误、按掩码唤醒和 requeue；`make test-glibc-riscv` 验证 glibc 2.44 的 `pthread_join` 消费路径。阶段收口使用 `make test-riscv`。各次实际通过范围以 README 和提交验证说明为准，不把实现路径存在等同于全部线程负载已验证。
 
-尚无 SMP、共享文件映射及其 futex、PI futex、实时信号队列、sigaltstack、clone3 或 LoongArch context。固定语义依据见学习总结的 Linux commit 与 musl 归档。
+尚无 SMP、共享文件 futex、PI futex、实时信号队列、sigaltstack、clone3 或 LoongArch context。固定语义依据见学习总结的 Linux commit 与 musl 归档。
+
+活动普通文件/TCP I/O 的单页暂存登记在任务的 `io_buffer`。任务资源清理在 socket read reservation 之后、MM/文件表和任务栈释放之前回收它；正常调用完成先解除登记。页释放错误遵循物理分配器 fatal 不变量，不进入历史 cleanup 重试链。

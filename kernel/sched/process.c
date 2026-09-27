@@ -1199,6 +1199,8 @@ static enum kernel_scheduler_status cleanup_user_task_resources(
 
     if (thread->socket_read_request != 0)
         kernel_socket_abort_read(thread->socket_read_request);
+    if (thread->io_buffer != 0)
+        kernel_task_io_buffer_release(thread->io_buffer);
 
     signal_status = thread->group_leader == thread && thread->group_members > 1U
         ? KERNEL_SIGNAL_STATUS_OK : kernel_signal_release_table(thread);
@@ -1273,6 +1275,37 @@ static enum kernel_scheduler_status cleanup_user_task_resources(
              thread->mm.state == KERNEL_MM_EMPTY))
                ? KERNEL_SCHEDULER_STATUS_OK
                : KERNEL_SCHEDULER_STATUS_INVALID_STATE;
+}
+
+enum kernel_task_status kernel_task_io_buffer_acquire(
+    struct kernel_task_io_buffer *buffer, struct physical_page_allocator *allocator)
+{
+    struct kernel_task *task = kernel_task_current();
+    if (buffer == 0 || buffer->allocator != 0 || allocator == 0 ||
+        (task != 0 && task->io_buffer != 0)) __builtin_trap();
+    uint64_t physical;
+    enum physical_page_status status = physical_page_allocate(allocator, &physical);
+    if (status == PHYSICAL_PAGE_STATUS_EMPTY)
+        return KERNEL_TASK_STATUS_RESOURCE_UNAVAILABLE;
+    if (status != PHYSICAL_PAGE_STATUS_OK) __builtin_trap();
+    void *data;
+    if (physical_page_resolve(allocator, physical, &data) !=
+        PHYSICAL_PAGE_STATUS_OK) __builtin_trap();
+    *buffer = (struct kernel_task_io_buffer){task, allocator, physical, data};
+    if (task != 0) task->io_buffer = buffer;
+    return KERNEL_TASK_STATUS_OK;
+}
+
+void kernel_task_io_buffer_release(struct kernel_task_io_buffer *buffer)
+{
+    if (buffer == 0 || buffer->allocator == 0) __builtin_trap();
+    if (buffer->task != 0) {
+        if (buffer->task->io_buffer != buffer) __builtin_trap();
+        buffer->task->io_buffer = 0;
+    }
+    if (physical_page_release(buffer->allocator, buffer->physical_address) !=
+        PHYSICAL_PAGE_STATUS_OK) __builtin_trap();
+    *buffer = (struct kernel_task_io_buffer){0};
 }
 
 enum kernel_task_status kernel_task_socket_read_register(

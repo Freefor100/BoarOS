@@ -6,6 +6,9 @@
 
 struct kernel_mm;
 
+/* Single-hart diagnostic count of user-page resolution attempts. */
+uint64_t kernel_uaccess_page_resolutions(void);
+
 enum kernel_uaccess_status {
     KERNEL_UACCESS_STATUS_OK = 0,
     KERNEL_UACCESS_STATUS_INVALID_ARGUMENT,

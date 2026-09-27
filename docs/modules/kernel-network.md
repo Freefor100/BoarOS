@@ -12,7 +12,11 @@
 
 单 hart 下，登记/检查就绪与睡眠用已有关中断临界区。socket syscall 与轮询入口推进 lwIP loopback 队列和协议定时器；非阻塞 connect 发出 SYN 后立即推进一次，保证已经睡眠的另一进程 accept 能被唤醒，而不依赖客户端下一次系统调用。阻塞 connect 等到握手结果，阻塞接收以 socket 队列或协议定时器唤醒；通用 poll/ppoll 和 epoll/epoll_pwait 在监听 socket 时也把最近协议定时器纳入睡眠期限，包含混合普通 fd 和无限等待。信号沿既有 syscall restart 协议，带接收超时的中断返回 `EINTR`。待 accept 子连接在对端 reset 后从队列摘除；未 listen 的 stream 和 datagram accept 立即返回类型对应错误，监听 socket 的 `SO_RCVTIMEO` 约束阻塞 accept。
 
-普通 socket read/readv 把队首数据暂存到内核栈后登记任务级 read reservation，并把 syscall 的 OFD pin 暂交给 reservation；用户复制完整成功才提交 TCP 消费，复制 fault 保留整段 TCP 数据，UDP fault 丢弃该 datagram。零长度 UDP datagram 即使返回 0 也必须完成 reservation、消费队首并恢复 pin；TCP EOF 返回 0 时没有 reservation。reservation 期间同一 socket 的 read/recvfrom 不得越过队首；同一 OFD 的第二线程等待其释放。正常返回恢复原 pin，强制退出在文件表释放前取消 reservation 并释放 pin。固定 Linux 的坏指针和跨页 read/readv 返回 `EFAULT`，后续 read 可读回完整 TCP 数据。`recvfrom` 的缓冲区范围在等待空 UDP socket 前检查，负的 `socklen_t` 返回 `EINVAL`；accept/recvfrom 的地址输出错误发生在协议 dequeue 后，与固定 Linux 顺序一致。
+普通 socket read/readv 使用“预留队首片段→按偏移复制→提交/取消”。用户容量决定 UDP 的截断长度，一个报文可经请求持有的 4 KiB 页反复复制，最终只消费一次；不能以内部暂存容量截断报文。零长度 datagram 也必须完成 reservation；TCP EOF 没有 reservation。TCP 在用户容量内继续读取已排队片段，取得进展后不等待新数据。每段完整复制后才消费；当前段 fault 保留整段，返回先前已提交的字节数，没有先前进展则 EFAULT。UDP fault 丢弃当前 datagram。read reservation 独占队首，第二个 read/recvfrom 不得越过它。
+
+请求 scratch 页由 `kernel_task_io_buffer` 持有，按需分配并登记在当前任务；分配失败返回 ENOMEM，不预留或消费队首。正常返回解除登记并释放物理页，强制退出先取消 read reservation／释放其 OFD pin，再释放 scratch，之后才释放任务文件表和栈。没有用户任务的模块测试沿正常返回路径回收。socket 普通 write/writev 同样使用请求页，按用户页和协议剩余空间提交；不再每 64 字节调用 tcp_write。`kernel_socket_get_statistics` 提供单 hart 累计 tcp_write 调用及成功复制字节数，`kernel_uaccess_page_resolutions` 记录用户页解析尝试。计数没有新增用户 ABI。
+
+`recvfrom` 的缓冲区范围在等待空 UDP socket 前检查，负 socklen_t 返回 EINVAL；accept/recvfrom 的地址输出错误发生在协议 dequeue 后，与固定 Linux 顺序一致。
 
 sendto 和 recvfrom 的暂存 pbuf/packet 在 syscall 栈中持有，并在正常或 fault 返回时释放。现有线程组强制退出只标记/唤醒等待中的线程：它先沿保存的 syscall 栈返回，后在 user-return 处理终止；因此不会跳过这两个局部 cleanup。将来若增加可直接抛弃内核调用栈的非局部退出，必须重新审计这些 owner。
 
@@ -24,12 +28,15 @@ TCP `POLLOUT` 同时要求发送缓冲和队列空间。`tcp_write` 还可能因
 
 ```sh
 make test-lwip-host
+make test-scale-riscv
 make test-syscall-riscv test-userland-riscv test-diff-abi-riscv test-stack-usage
 python3 tests/program-inventory/run.py --suite libc \
   --case libc.static.socket --case libc.dynamic.socket \
   --require-pass --output build/socket-program-check
 ```
 
-host 入口实测 UDP loopback、PCB 16 个用尽后第 17 个失败、全部释放和再分配，另在 `sndbuf>0` 时耗尽全局 TCP segment 池触发真实 `tcp_write ERR_MEM`，以及 TCP 握手/关闭后推进 200 秒协议计时、池用量回到基线。当前 72 条 socket 差分记录覆盖两进程握手、零长度 UDP read/readv 及后续数据、读/向量读 fault 保留、UDP fault 丢弃、负地址长度、accept 超时、F_SETFL access mode、ppoll/epoll 的协议定时器和混合 fd；整合内核的 502 条 Linux/BoarOS 记录一致。真实 pthread U-mode 另覆盖零长度 datagram、共享 socket 双读、阻塞读时 close/fd 复用、双读线程组 SIGKILL、全局池压力下错误可写事件及释放后写入进展，关机检查 `heap-live=0`。线程组 SIGKILL 测试可控地覆盖等待和竞争路径，但公开 ABI 无法精确钉住 staging 到 usercopy 的极短窗口。原版 libc-test `functional/socket.c` 的静态、动态直接 entry 用未改源码和同一 ELF 在双方通过；整合内核全量 228 项为 227 pass、1 BusyBox 包装失败，见[程序清单](../learning/user-program-inventory.md)。
+host 入口实测 UDP loopback、PCB 16 个用尽后第 17 个失败、全部释放和再分配，另在 `sndbuf>0` 时耗尽全局 TCP segment 池触发真实 `tcp_write ERR_MEM`，以及 TCP 握手/关闭后推进 200 秒协议计时、池用量回到基线。当前 118 条 socket 差分记录覆盖两进程握手、零长度 UDP read/readv 及后续数据、读/向量读 fault 保留、UDP fault 丢弃、负地址长度、accept 超时、F_SETFL access mode、ppoll/epoll 的协议定时器和混合 fd；整合内核的 548 条 Linux/BoarOS 记录一致。真实 pthread U-mode 另覆盖零长度 datagram、共享 socket 双读、阻塞读时 close/fd 复用、双读线程组 SIGKILL、全局池压力下错误可写事件及释放后写入进展，关机检查 `heap-live=0`。线程组 SIGKILL 测试可控地覆盖等待和竞争路径，但公开 ABI 无法精确钉住 staging 到 usercopy 的极短窗口。原版 libc-test `functional/socket.c` 的静态、动态直接 entry 用未改源码和同一 ELF 在双方通过；整合内核全量 228 项为 227 pass、1 BusyBox 包装失败，见[程序清单](../learning/user-program-inventory.md)。
 
 Linux ABI 依据本地 `references/linux/net/socket.c`、`net/ipv4/af_inet.c`、`fs/read_write.c`，commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`；测试构建来自 `references/oscomp-testsuits` commit `8b58dd16d26d30f7c74d48d5832d870d3051b703`。核对后运行 `make prune-build` 清理日志和镜像。
+
+规模回归补充 0/255/256/257/1500/4096/8192 字节 UDP 的三种入口、完整与不足容量、空 iovec、后继报文和跨页 fault；TCP 用错位缓冲与向量写累计传输 1 MiB，检查内容、非 256 字节接收和跨片段 fault 的字节守恒。不同内核允许不同 TCP 分段，测试不把一个特定短读长度当作协议契约。既有真实 pthread 继续覆盖共享读、fd 复用、SIGKILL 和发送池背压。成本与边界见[单核规模回归](../learning/single-hart-scale.md)。

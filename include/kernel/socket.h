@@ -17,9 +17,16 @@ struct kernel_socket_read_request {
     struct kernel_task *task;
     void *packet;
     uint32_t bytes;
+    int datagram;
     struct kernel_open_file_description *pin;
     struct kernel_open_file_description **pin_owner;
 };
+
+struct kernel_socket_statistics {
+    uint64_t tcp_write_calls;
+    uint64_t tcp_written_bytes;
+};
+void kernel_socket_get_statistics(struct kernel_socket_statistics *statistics);
 
 /* IPv4 addresses use the Linux sockaddr_in/network-byte-order representation. */
 int kernel_socket_create(struct kernel_heap *heap, int type,
@@ -44,11 +51,13 @@ int kernel_socket_sendto(struct kernel_socket *socket, struct kernel_mm *mm,
 int kernel_socket_recvfrom(struct kernel_socket *socket, struct kernel_mm *mm,
                            uint64_t user_data, uint64_t size,
                            uint32_t *address, uint16_t *port);
-int kernel_socket_read_buffer(struct kernel_socket *socket,
+int kernel_socket_reserve_read(struct kernel_socket *socket,
                               struct kernel_task *task,
                               struct kernel_socket_read_request *request,
                               struct kernel_open_file_description **pin_owner,
-                              void *buffer, uint32_t capacity);
+                              uint32_t capacity);
+void kernel_socket_copy_read(const struct kernel_socket_read_request *request,
+                             uint32_t offset, void *buffer, uint32_t length);
 void kernel_socket_finish_read(struct kernel_socket_read_request *request,
                                int user_fault);
 void kernel_socket_abort_read(struct kernel_socket_read_request *request);
