@@ -62,6 +62,10 @@ mode.fchmod-reset
 mode.fchmod-unlinked
 mode.umask-fork
 mode.umask-shared-fs
+socket.bad-type-flags
+socket.bad-protocol
+socket.bad-family
+socket.bind-bad-fd-and-pointer
 socket.udp-create
 socket.lo-up
 socket.udp-bind

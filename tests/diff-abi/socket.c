@@ -85,6 +85,15 @@ static long enable_loopback(long fd)
 
 void abi_socket_cases(void)
 {
+    record("socket.bad-type-flags",
+           SC3(198, LINUX_AF_INET,
+               LINUX_SOCK_STREAM | 0x01000000, LINUX_IPPROTO_TCP));
+    record("socket.bad-protocol",
+           SC3(198, LINUX_AF_INET, LINUX_SOCK_STREAM,
+               LINUX_IPPROTO_UDP));
+    record("socket.bad-family", SC3(198, 9999, LINUX_SOCK_DGRAM, 0));
+    record("socket.bind-bad-fd-and-pointer", SC3(200, -1, 1, 16));
+
     struct socket_address udp_address = {.family = LINUX_AF_INET};
     long udp_server = SC3(198, LINUX_AF_INET, LINUX_SOCK_DGRAM,
                           LINUX_IPPROTO_UDP);
