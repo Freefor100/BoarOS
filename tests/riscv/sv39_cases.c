@@ -572,6 +572,8 @@ static int test_user_space_lifecycle(void)
         riscv_sv39_user_space_satp(&source, 0) !=
             RISCV_SV39_STATUS_INVALID ||
         source.table_pages != 1U || source.leaf_pages != 0U ||
+        source.protect_visits != 0 || source.protect_address_flushes != 0 ||
+        source.protect_global_flushes != 0 ||
         user_root[0] != 0U || user_root[255] != 0U ||
         user_root[256] != kernel_high_entry ||
         user_root[511] != kernel_root[511]) {
@@ -617,6 +619,19 @@ static int test_user_space_lifecycle(void)
         source.table_pages != 3U || source.leaf_pages != 1U) {
         return 49;
     }
+
+    /* The fast path must reject corrupted aggregate ownership before editing. */
+    source.protected_pages = UINT32_MAX;
+    enum riscv_sv39_status invalid_protect = riscv_sv39_user_protect_owned_page(
+        &source, code_va, RISCV_SV39_READ);
+    source.protected_pages = 0;
+    if (invalid_protect != RISCV_SV39_STATUS_STATE ||
+        riscv_sv39_user_lookup(&source, code_va, &mapping) != RISCV_SV39_STATUS_OK ||
+        (mapping.permissions & RISCV_SV39_EXECUTE) == 0) return 80;
+    source.cow_pages = 2;
+    invalid_protect = riscv_sv39_user_protect_owned_page(&source, code_va, RISCV_SV39_READ);
+    source.cow_pages = 0;
+    if (invalid_protect != RISCV_SV39_STATUS_STATE) return 81;
 
     if (physical_page_allocate(&allocator, &conflict_page) !=
             PHYSICAL_PAGE_STATUS_OK) {

@@ -56,6 +56,9 @@ struct riscv_sv39_user_space {
     uint32_t cow_pages;
     uint64_t cow_copies;
     uint64_t cow_in_place;
+    uint64_t protect_visits;
+    uint64_t protect_address_flushes;
+    uint64_t protect_global_flushes;
     enum riscv_sv39_user_space_state state;
 };
 
@@ -142,6 +145,10 @@ enum riscv_sv39_status riscv_sv39_user_unmap_owned_range(
  * each physical page owned behind an invalid software PTE (PROT_NONE).
  * Missing leaves are unchanged; present leaves retain content.
  */
+/* Same ownership/PROT_NONE contract, with a single page walk and local VA flush. */
+enum riscv_sv39_status riscv_sv39_user_protect_owned_page(
+    struct riscv_sv39_user_space *space, uint64_t address, uint32_t permissions);
+
 enum riscv_sv39_status riscv_sv39_user_protect_owned_range(
     struct riscv_sv39_user_space *space,
     uint64_t start,

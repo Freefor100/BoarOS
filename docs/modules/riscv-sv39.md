@@ -89,7 +89,7 @@ direct-map/allocator/owner invariant 破坏并直接 fatal；没有可恢复 pro
 
 运行期不回收变空的 Level 0/Level 1 表，它们保留到 MM 销毁，以避免在 shrink 提交中增加中间表的额外遍历。连续高水位每 2 MiB 至多保留一张 4 KiB Level 0 表，约为虚拟跨度的 0.2%；极稀疏触页时相对实际驻留数据的比例会更高。
 
-`riscv_sv39_user_protect_owned_range()` 原地改变已有 owner 的权限。非零权限重建同一 PPN 的 U-mode leaf；切换到 `PROT_NONE` 时使用 RSW bit 9 建立 `V=0` 的 protected PTE，并用 bit 8 继续区分 COW。protected owner 保留内容及 exclusive/COW 属性并可恢复，不能与 unmap 的瞬时 invalid PTE 混用。恢复执行权限前先执行 `FENCE.I`，任何实际 PTE 变化后执行本地全局 `SFENCE.VMA`。fork 为 active/protected owner 增加物理页引用并在父子页表保持相同 COW 关系；unmap 和 destroy 都释放自己持有的一份引用。
+`riscv_sv39_user_protect_owned_range()` 原地改变已有 owner 的权限。非零权限重建同一 PPN 的 U-mode leaf；切换到 `PROT_NONE` 时使用 RSW bit 9 建立 `V=0` 的 protected PTE，并用 bit 8 继续区分 COW。protected owner 保留内容及 exclusive/COW 属性并可恢复，不能与 unmap 的瞬时 invalid PTE 混用。恢复执行权限前先执行 `FENCE.I`。单页范围及共享页 rearm 使用 `riscv_sv39_user_protect_owned_page`：直接走三级页表，先验证 PTE、物理页与所有权计数，再修改并执行本地 `SFENCE.VMA va, zero`；多页范围仍执行本地全局失效。非当前 MM 继续依赖 ASID 0 切根时的全局失效，未引入延迟失效或 SMP 保证。fork 为 active/protected owner 增加物理页引用并在父子页表保持相同 COW 关系；unmap 和 destroy 都释放自己持有的一份引用。
 
 `riscv_sv39_user_space_fork()` 使用“两阶段子构造—父提交”。它先建立完整子树、逐页 acquire；MM 的 VMA 分类回调使共享匿名 leaf 保持原权限和物理身份，其他 leaf 转成 COW。任何分配/acquire 失败只销毁子 owner，父页表保持原样。子空间全部成功后，提交阶段不再分配，只修改父进程的私有 PTE、更新计数并执行全局本地 `SFENCE.VMA`。这保证普通 fork 的失败原子性，同时把私有页面内容复制推迟到父或子真正写入时。
 

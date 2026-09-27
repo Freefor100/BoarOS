@@ -210,7 +210,7 @@ MM record 拥有按 VFS node 去重的稳定关联记录，以及每个驻留文
 VMA/PTE 修改前预留关联；失败不消耗调用者 OFD。末个 VMA 消失或销毁时先解除关联，
 再释放 OFD。不得登记可移动的 VMA 数组元素或 MM handle 地址。
 
-首次文件 fault 在发布 PTE 前预留驻留记录；COW 成功后更新私有标志及物理地址。
+首次文件 fault 在发布 PTE/alias 前预留驻留记录和地址哈希容量；COW 成功后更新私有标志及物理地址。
 缓存命中的 write-first fault 若 COW 物理分配失败，必须撤销临时 cache PTE 后返回，
 不能留下无来源记录的 PTE。fork 后私有页面即使再次带 COW 标志，仍保持私有来源。
 munmap/fixed replace 清除对应驻留记录，mprotect/PROT_NONE 保留来源。
@@ -221,8 +221,9 @@ VFS 向下截断按实际 live size（包括部分生效后报错）同步通知
 相同的 PTE 失效、全局本 hart SFENCE.VMA、物理引用释放顺序；尾页代码修改执行
 FENCE.I。当前单 hart syscall 不可调度区保证登记和通知稳定，不代表 SMP 协议。
 
-关联只扫描相关 MM；每个 MM 的驻留记录为链表，COW 查找 O(驻留文件页数)，截断
-每页 VMA 查找 O(log VMA 数)。元数据随驻留规模增长；不在 tick 热路径扫描。
+关联只扫描相关 MM；每个 MM 以动态虚拟页地址哈希查询驻留记录，保留链表负责遍历。哈希碰撞比较完整地址，装载因子不超过 1，按二倍扩容；分配成功后无分配地重建并替换桶，失败保留旧索引。fork 提前准备全部桶，unmap/fixed replace/截断同步摘除索引与链表；最后 MM 释放桶。查找为平均常数成本，截断仍遍历驻留链，每页 VMA 查找 O(log VMA 数)。元数据随驻留规模增长；不在 tick 热路径扫描。
 `test-files-riscv` 扫描准备阶段分配失败与 fork 回滚，并注入缓存命中后的 COW
 物理分配失败；`test-userland-riscv` 与 `test-diff-abi-riscv` 验证真实驻留/COW、
 PROT_NONE、非当前 MM、尾页、关闭 fd、unlink、O_TRUNC 与重新增长。
+
+`riscv_kernel_mm_get_statistics` 提供驻留查找探测、改权页表访问及地址/全局失效计数。`make test-scale-riscv` 在 16/64 MiB 文件全部读驻留后按置换顺序首次写入，验证探测增长不超过 6 倍，并注入前 128 页准备阶段的元数据分配失败。首次写开放权限和写回 rearm 使用单页 PTE 操作；引用与脏代次协议保持不变。

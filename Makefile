@@ -1346,3 +1346,16 @@ include tests/program-inventory/Makefile.inc
 .PHONY: test-elf-tail-riscv
 test-elf-tail-riscv: $(KERNEL_RV) $(MUSL_STAMP)
 	python3 tests/elf-tail-riscv.py
+
+SCALE_OBJECTS := $(TEST_RUNTIME_OBJECTS) \
+    $(patsubst %.c,$(BUILD_DIR)/%.o,$(VFS_TEST_SUPPORT_C_SOURCES)) \
+    $(BUILD_DIR)/tests/riscv/scale_main.o
+-include $(BUILD_DIR)/tests/riscv/scale_main.d
+$(BUILD_DIR)/tests/kernel-scale-rv: $(SCALE_OBJECTS) arch/riscv/linker.ld
+	$(CC) $(LDFLAGS) -Wl,--wrap=riscv_sv39_current_satp \
+		-Wl,--wrap=physical_page_allocate -Wl,--wrap=kernel_heap_allocate_zeroed \
+		-Wl,--wrap=kernel_wait_queue_wake_all \
+		-o $@ $(SCALE_OBJECTS)
+.PHONY: test-scale-riscv
+test-scale-riscv: $(BUILD_DIR)/tests/kernel-scale-rv
+	python3 tests/scale-riscv.py --kernel $< --qemu $(QEMU_RISCV64)
