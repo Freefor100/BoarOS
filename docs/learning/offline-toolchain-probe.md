@@ -9,10 +9,15 @@
 
 固定 Linux 在 `/init` 退出后以 panic 结束客体，不走正常卸载。即便客体
 对新产物及其父目录调用了 `fsync`，ext4 的目录项仍可能只在 journal 中；
-直接用 `debugfs` 读原始镜像会误报文件不存在。宿主检查前需先用
+直接用 `debugfs` 读原始镜像会误报文件不存在。宿主检查前先用
 `e2fsck -E journal_only -y` 重放，再用 `e2fsck -fn` 核对，且只对该次运行
-的镜像做此操作。该步骤模拟下一次挂载所见内容，不把 fsck 的普通修复
-当成程序成功。
+的镜像做此操作。GCC 的临时文件在异常退出时还可能留在 ext4 orphan file：
+`journal_only` 不做 orphan 清理，固定 Linux `references/linux/fs/ext4/orphan.c`
+commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 则在下次读写挂载时
+调用 `ext4_orphan_cleanup()`。runner 仅当 fsck 输出**只有** orphan inode
+及其空闲块/inode 计数问题时允许一次显式修复，检查修复输出只含这些变化，
+再执行 `e2fsck -fn` 要求完全干净；其他修复一律失败并保留镜像。这样模拟
+下次挂载可见内容，不把 fsck 的任意修复当成程序成功。
 
 2026-09-27 的无编译器诊断基线：固定 Linux
 `references/linux` commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`

@@ -65,7 +65,9 @@ musl `/init`。它从 `/work/tools.conf` 读取客体内编译器、汇编器绝
 每步把退出码、信号或 `execve` errno 写入 `/work/stages.tsv`，失败后不执行
 依赖它的后续阶段。产物和目录均 `fsync`；宿主先重放 ext4 journal，再从
 两个独立镜像提取 `.i`、`.s`、`.o`、ELF 和程序输出，逐项比较 SHA-256、
-最终输出及文件系统检查。版本字符串和目标文件存在本身不构成成功。
+最终输出及文件系统检查。异常退出留下的 ext4 orphan 仅在严格核对修复项后
+按下次挂载语义清理；其他 fsck 修复仍使测试失败，细节见
+[离线工具链学习记录](../learning/offline-toolchain-probe.md)。版本字符串和目标文件存在本身不构成成功。
 
 `make test-offline-c-baseline-riscv` 是**诊断模式**：该镜像故意不安装客体编译器，
 同一 ELF 在两侧均应准确停在 `preprocess:exec:2`。它通过只说明探针可定位

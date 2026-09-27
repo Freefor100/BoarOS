@@ -128,6 +128,34 @@ def boot(args, kernel, disk, output, linux):
         raise AssertionError(f"guest resource cleanup incomplete: {output}")
 
 
+def orphan_cleanup_only(output, repaired):
+    """Accept only ext4 crash-orphan cleanup, never unrelated fsck repairs."""
+    answer = "yes" if repaired else "no"
+    seen_marker = seen_orphan = seen_verdict = seen_summary = False
+    for line in output.splitlines():
+        if not line:
+            continue
+        if line.startswith("e2fsck ") or re.fullmatch(r"Pass [1-5](?:A)?: .*", line):
+            continue
+        if line == ("Inodes that were part of a corrupted orphan linked list "
+                    f"found.  Fix? {answer}"):
+            seen_marker = True
+        elif re.fullmatch(r"Inode \d+ was part of the orphaned inode list.  "
+                          + (r"FIXED\." if repaired else r"IGNORED\."), line):
+            seen_orphan = True
+        elif line == f"Fix? {answer}" or re.fullmatch(
+                r"Free (?:blocks|inodes) count wrong \(\d+, counted=\d+\)\.", line):
+            continue
+        elif (repaired and "***** FILE SYSTEM WAS MODIFIED *****" in line) or \
+                (not repaired and "********** WARNING: Filesystem still has errors **********" in line):
+            seen_verdict = True
+        elif re.fullmatch(r".+: \d+/\d+ files .* \d+/\d+ blocks", line):
+            seen_summary = True
+        else:
+            return False
+    return seen_marker and seen_orphan and seen_verdict and seen_summary
+
+
 def replay_and_check(directory, name, disk):
     # Linux PID 1 exit stops QEMU without unmounting ext4. A new boot would
     # replay the journal before seeing the fsynced stage files; mirror that
@@ -141,9 +169,23 @@ def replay_and_check(directory, name, disk):
     check = subprocess.run(["e2fsck", "-fn", str(disk)],
                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                            text=True)
+    (directory / (name + "-fsck-before.log")).write_text(check.stdout)
+    if check.returncode:
+        if not orphan_cleanup_only(check.stdout, repaired=False):
+            raise AssertionError(f"{name}: ext4 check failed: {check.stdout}")
+        repair = subprocess.run(["e2fsck", "-fy", str(disk)],
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True)
+        (directory / (name + "-orphan-repair.log")).write_text(repair.stdout)
+        if repair.returncode not in (0, 1) or not orphan_cleanup_only(
+                repair.stdout, repaired=True):
+            raise AssertionError(f"{name}: unexpected ext4 repair: {repair.stdout}")
+        check = subprocess.run(["e2fsck", "-fn", str(disk)],
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                               text=True)
     (directory / (name + "-fsck.log")).write_text(check.stdout)
     if check.returncode:
-        raise AssertionError(f"{name}: ext4 check failed: {check.stdout}")
+        raise AssertionError(f"{name}: ext4 remains inconsistent: {check.stdout}")
 
 
 def extract(disk, guest, destination):
