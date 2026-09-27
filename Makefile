@@ -1154,3 +1154,9 @@ include tests/program-inventory/Makefile.inc
 .PHONY: test-elf-tail-riscv
 test-elf-tail-riscv: $(KERNEL_RV) $(MUSL_STAMP)
 	python3 tests/elf-tail-riscv.py
+
+.PHONY: test-record-lock-host
+test-record-lock-host:
+	mkdir -p build/host
+	cc -std=c11 -Wall -Wextra -Werror -idirafter include tests/host/record_lock_test.c -o build/host/record-lock
+	build/host/record-lock
