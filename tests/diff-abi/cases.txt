@@ -574,6 +574,8 @@ exec.script-five
 exec.script-six
 exec.script-depth-format
 exec.script-depth-missing
+exec.script-empty-arg-eof
+exec.script-empty-arg-nul
 mknod.null
 mknod.exists
 mknod.stat

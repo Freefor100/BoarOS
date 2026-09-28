@@ -8,6 +8,11 @@ void abi_script_probe(const unsigned long *sp)
 {
     if (sp[0] < 2) return;
     const char **a = (void *)(sp + 1);
+    if (equal(a[1], "/script-empty-arg") ||
+        (sp[0] >= 3 && equal(a[2], "/script-empty-arg"))) {
+        abi_exit(sp[0] == 4 && equal(a[0], "/init") && !a[1][0] &&
+                 equal(a[3], "tail") ? 0 : 90);
+    }
     if (!equal(a[1], "script-probe with spaces") &&
         !equal(a[1], "script-probe nested")) return;
     const char **env = a + sp[0] + 1;
@@ -73,6 +78,22 @@ void abi_script_cases(void)
     for (int i = 0; i < 3; i++) {
         put("/depth6", last[i], 0755);
         abi_record(depth_ids[i], SC3(221, argv[0], argv, env), -1, -1, 0, 0, 0);
+    }
+
+    for (int embedded = 0; embedded < 2; embedded++) {
+        put("/script-empty-arg", "#!/init ", 0755);
+        if (embedded) {
+            const char text[] = "#!/init \0ignored\n";
+            long fd = abi_open("/script-empty-arg", 1 | 512);
+            abi_require(fd >= 0 && SC3(64, fd, text, sizeof(text) - 1) == sizeof(text) - 1);
+            abi_require(SC1(57, fd) == 0);
+        }
+        const char *args[] = {"ignored", "tail", 0};
+        child = SC5(220, 17, 0, 0, 0, 0);
+        abi_require(child >= 0);
+        if (!child) { SC3(221, "/script-empty-arg", args, env); abi_exit(91); }
+        abi_require(SC4(260, child, &status, 0, 0) == child);
+        abi_record(embedded ? "exec.script-empty-arg-nul" : "exec.script-empty-arg-eof", 0, -1, -1, status, 0, 0);
     }
 
 }

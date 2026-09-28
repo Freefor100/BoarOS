@@ -471,8 +471,8 @@ static enum exec_capture_status expand_scripts(
         }
         if (header[0] != '#' || header[1] != '!') return EXEC_CAPTURE_OK;
         size_t end = 0;
-        while (end < sizeof(header) && header[end] != '\n') end++;
-        if (end == sizeof(header)) {
+        while (end < sizeof(header) && header[end] && header[end] != '\n') end++;
+        if (end == sizeof(header) || header[end] != '\n') {
             size_t name = 2;
             while (name < sizeof(header) && (header[name] == ' ' || header[name] == '\t')) name++;
             size_t stop = name;
@@ -493,11 +493,12 @@ static enum exec_capture_status expand_scripts(
         }
         char *arg = name;
         while (*arg && *arg != ' ' && *arg != '\t') arg++;
-        if (*arg) {
+        int has_argument = *arg != 0;
+        if (has_argument) {
             *arg++ = 0;
             while (*arg == ' ' || *arg == '\t') arg++;
         }
-        size_t extra = *arg ? 3U : 2U;
+        size_t extra = has_argument ? 3U : 2U;
         discard_arg_zero(transaction);
         for (size_t i = 0; i < extra; i++) {
             enum exec_capture_status status = reserve_vector_slot(transaction,
@@ -508,7 +509,7 @@ static enum exec_capture_status expand_scripts(
         memmove(transaction->arguments + extra, transaction->arguments,
                 transaction->argument_count * sizeof(*transaction->arguments));
         transaction->argument_count += extra;
-        const char *values[3] = {name, *arg ? arg : script_path, script_path};
+        const char *values[3] = {name, has_argument ? arg : script_path, script_path};
         for (size_t i = 0; i < extra; i++) {
             enum exec_capture_status status = append_kernel_string(transaction,
                 values[i], &transaction->arguments[i], error);
