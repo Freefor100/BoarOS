@@ -49,6 +49,7 @@ SCHEDULER_BOOT_TEST_KERNEL_RV := \
 SYSCALL_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-syscall-rv
 ELF64_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-elf64-rv
 ROOT_INIT_PROGRAM_RV := $(BUILD_DIR)/tests/user/root-init-rv
+ELF_RWX_PROGRAM_RV := $(BUILD_DIR)/tests/user/elf-rwx-rv
 ROOT_ORPHAN_PROGRAM_RV := $(BUILD_DIR)/tests/user/root-orphan-rv
 UACCESS_OOM_PROGRAM_RV := $(BUILD_DIR)/tests/user/uaccess-oom-rv
 ROOT_EXEC_STAGE2_RV := $(BUILD_DIR)/tests/user/root-exec-stage2-rv
@@ -896,7 +897,8 @@ test-riscv: test-dtb-riscv test-page-riscv test-heap-riscv \
 	test-files-partial-write-riscv \
 	test-context-riscv test-scheduler-cases-riscv \
 	test-scheduler-riscv test-syscall-riscv test-signal-riscv \
-	test-elf64-riscv test-user-riscv test-user-fatal-riscv \
+	test-elf64-riscv test-elf-rwx-riscv \
+	test-user-riscv test-user-fatal-riscv \
 	test-mm-riscv test-vma-riscv test-uaccess-riscv \
 	test-sv39-riscv test-sv39-fault-riscv \
 	test-trap-return-riscv test-timer-riscv test-boot-riscv \
@@ -1352,6 +1354,16 @@ include tests/program-inventory/Makefile.inc
 .PHONY: test-elf-tail-riscv
 test-elf-tail-riscv: $(KERNEL_RV) $(MUSL_STAMP)
 	python3 tests/elf-tail-riscv.py
+
+$(ELF_RWX_PROGRAM_RV): tests/riscv/elf_rwx_main.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -nostdlib -static -no-pie -Wl,--build-id=none \
+		-Wl,-e,_start -Wl,-N -Wl,-Ttext=0x10000 -o $@ $<
+
+.PHONY: test-elf-rwx-riscv
+test-elf-rwx-riscv: $(KERNEL_RV) $(ELF_RWX_PROGRAM_RV)
+	KERNEL_RV=$(KERNEL_RV) ELF_RWX_PROGRAM_RV=$(ELF_RWX_PROGRAM_RV) \
+		QEMU_RISCV64=$(QEMU_RISCV64) ./tests/elf-rwx-riscv.sh
 
 SCALE_OBJECTS := $(TEST_RUNTIME_OBJECTS) \
     $(patsubst %.c,$(BUILD_DIR)/%.o,$(VFS_TEST_SUPPORT_C_SOURCES)) \

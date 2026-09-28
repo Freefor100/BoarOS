@@ -16,6 +16,8 @@
 #define LINUX_CLONE_VM UINT64_C(0x100)
 #define LINUX_CLONE_FS UINT64_C(0x200)
 #define LINUX_CLONE_VFORK UINT64_C(0x4000)
+#define LINUX_CLONE_CHILD_CLEARTID UINT64_C(0x200000)
+#define LINUX_CLONE_CHILD_SETTID UINT64_C(0x1000000)
 #define LINUX_CLONE_KNOWN_FLAGS UINT64_C(0x3ffffffff)
 
 enum kernel_syscall_status syscall_handle_prlimit64(
@@ -235,7 +237,9 @@ void syscall_decode_clone(const struct kernel_syscall_request *request,
         decoded->value = -KERNEL_EINVAL;
         return;
     }
-    uint64_t process_flags = flags & ~LINUX_CLONE_FS;
+    /* A fork child owns its private child-TID store and exit clear. */
+    uint64_t process_flags = flags & ~(LINUX_CLONE_FS |
+        LINUX_CLONE_CHILD_SETTID | LINUX_CLONE_CHILD_CLEARTID);
     if (process_flags != LINUX_SIGCHLD &&
         process_flags != (LINUX_SIGCHLD | LINUX_CLONE_VM | LINUX_CLONE_VFORK)) {
         decoded->value = -KERNEL_ENOTSUP;

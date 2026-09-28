@@ -264,10 +264,6 @@ static int validate_program_headers(
         if (!align_up(end, source->page_size, &page_end)) {
             return 0;
         }
-        if ((header->flags & KERNEL_ELF64_FLAG_WRITE) != 0U &&
-            (header->flags & KERNEL_ELF64_FLAG_EXECUTE) != 0U) {
-            return 0;
-        }
         low = header->virtual_address < low ? header->virtual_address : low;
         high = page_end > high ? page_end : high;
         load_count++;
