@@ -359,10 +359,12 @@ void kernel_futex_release_mm(struct kernel_task *task)
     size_t copied;
 
     task->clear_tid_address = 0U;
-    uint32_t remaining = kernel_mm_remove_user(&task->mm);
-    if (address == 0U || remaining == 0U) return;
-    (void)kernel_copy_to_user(&task->mm, address, &zero, sizeof(zero), &copied);
-    futex_wake_user(task, address);
+    if (address != 0U && kernel_mm_user_count(&task->mm) > 1U) {
+        (void)kernel_copy_to_user(&task->mm, address, &zero, sizeof(zero), &copied);
+        futex_wake_user(task, address);
+    }
+    /* 用户复制可能睡眠；返回前仍是 MM 使用者，不能让另一退出者误判为独占。 */
+    (void)kernel_mm_remove_user(&task->mm);
 }
 
 void kernel_futex_set_robust_list(struct kernel_task *task, uint64_t head)

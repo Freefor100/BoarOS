@@ -2,6 +2,9 @@
 #include <arch/riscv/mm.h>
 #include <kernel/boot_memory.h>
 #include <kernel/mm.h>
+#include <kernel/futex.h>
+#include <kernel/uaccess.h>
+#include "../../kernel/sched/private.h"
 #include <kernel/page.h>
 #include <kernel/physical_page.h>
 
@@ -487,9 +490,57 @@ static unsigned long run_invalid_cases(void)
     return 0U;
 }
 
+static struct kernel_task releasing_a, releasing_b;
+static int interleave_clear;
+enum kernel_uaccess_status __real_kernel_copy_to_user(
+    struct kernel_mm *, uint64_t, const void *, size_t, size_t *);
+enum kernel_uaccess_status __wrap_kernel_copy_to_user(
+    struct kernel_mm *mm, uint64_t address, const void *source,
+    size_t size, size_t *copied)
+{
+    if (interleave_clear && mm == &releasing_a.mm) {
+        interleave_clear = 0;
+        /* 模拟 A 的缺页复制挂起时，B 完成退出；不依赖设备响应快慢。 */
+        kernel_futex_release_mm(&releasing_b);
+    }
+    return __real_kernel_copy_to_user(mm, address, source, size, copied);
+}
+
+static unsigned long run_interleaved_mm_release(void)
+{
+    struct physical_page_allocator allocator;
+    struct riscv_sv39_page_table table = {0};
+    struct riscv_sv39_user_space space = {0};
+    uint64_t baseline;
+    uint32_t words[2] = {73, 74};
+    size_t copied;
+    if (!setup(&allocator, &table, &baseline) ||
+        !create_space(&allocator, &table, &space) ||
+        riscv_kernel_mm_create(&releasing_a.mm, &space) != KERNEL_MM_STATUS_OK ||
+        kernel_mm_acquire(&releasing_b.mm, &releasing_a.mm) != KERNEL_MM_STATUS_OK)
+        return 1;
+    kernel_mm_add_user(&releasing_a.mm);
+    kernel_mm_add_user(&releasing_b.mm);
+    releasing_a.clear_tid_address = TEST_STACK_ADDRESS;
+    releasing_b.clear_tid_address = TEST_STACK_ADDRESS + 4;
+    if (kernel_copy_to_user(&releasing_a.mm, TEST_STACK_ADDRESS, words, sizeof(words), &copied)
+            != KERNEL_UACCESS_STATUS_OK) return 2;
+    interleave_clear = 1;
+    kernel_futex_release_mm(&releasing_a);
+    if (interleave_clear || kernel_copy_from_user(&releasing_a.mm, words,
+            TEST_STACK_ADDRESS, sizeof(words), &copied) != KERNEL_UACCESS_STATUS_OK ||
+        words[0] || words[1]) return 3;
+    if (kernel_mm_release(&releasing_a.mm) != KERNEL_MM_STATUS_OK ||
+        kernel_mm_release(&releasing_b.mm) != KERNEL_MM_STATUS_OK ||
+        physical_page_available(&allocator) != baseline) return 4;
+    return 0;
+}
+
 unsigned long run_all_mm_cases(void)
 {
-    unsigned long result = run_invalid_cases();
+    unsigned long result = run_interleaved_mm_release();
+    if (result) return 0x600 + result;
+    result = run_invalid_cases();
 
     if (result != 0U) {
         return UINT64_C(0x100) + result;
