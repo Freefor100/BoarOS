@@ -24,6 +24,9 @@ runner 从原盘建立可丢弃副本，只增加自己的启动脚本。原测�
 每组在自己的 libc 根目录执行原 `*_testcode.sh`，分别设置 `LD_LIBRARY_PATH`，
 避免同时搜索两套 libc。musl 的普通/sf 加载器名指向镜像自带 libc；
 glibc 加载器指向其真实文件。proc 内容来自真实内核对象，没有假随机设备或测试输出。
+原镜像两侧的 `hello` 辅助脚本都写死执行 `/code/lmbench_src/bin/build/lmbench_all`；
+进入 lmbench 组前，用户态只将该路径链接到当前 libc 目录下镜像自带的真实二进制，
+不改动 `hello` 或组脚本。
 
 默认顺序为 basic、busybox、cyclictest、iozone、iperf、libcbench、libctest、
 lmbench、ltp、lua、netperf，每组先 glibc 后 musl。无逐组超时、重启或失败后宿主拼接。
@@ -66,6 +69,29 @@ runner 读取固定 Harness `kernel/judge/config.json`。其中 `qemu.timeout=36
 ## 2026-09-28 proc 挂载限时诊断
 
 在新 proc 挂载配置上先用 `python3 -B tests/oscomp/run.py --output build/oscomp-proc-diagnostic-20260928 --diagnostic-timeout 120` 做**限时诊断**：一次启动在总预算 120 秒处终止，停在 glibc iozone，后续组未到达。原 judge 在本次诊断给 busybox 两侧各 52 项、总整数 104；这不是正式分数。启动脚本成功挂载真实 proc，`ps` 列出进程；原脚本将 df/free 标 success，但 df 只有表头，glibc free 出现溢出的使用量、musl free 全零，内容不能当作正确统计。该次内核 SHA-256 `0bf2dcab32a4bd7d4adf57c99a6d503cfe47593f8f9ffd87f48c937d33b3430f`，脚本 SHA-256 `3b4d48bbadd33596f700b590183bcb992ae28647bbd844e9c7094159cdd2a880`，串口 SHA-256 `a62a42d2144af5380bf281cdbd5d19e7e18ae1219cb05bd06e78021594809047`；运行时脚本和本文尚未提交，报告明示工作区脏状态。正式预算必须在提交后另开一次启动，不能拼接诊断结果。
+
+## 2026-09-28 proc 挂载首轮正式评分
+
+干净的 `d0b6530fdd2e6a4f4461dd835bac5f0a25ac5dde` 在单次 3600 秒 RV
+运行中由原 postwork 得 **663 分**；QEMU 因总预算终止。22 项原 judge 分数按
+glibc/musl 顺序分别为：basic 0/0、busybox 52/52、cyclictest 0/0、
+iozone 0/0、iperf 0/0、libcbench 37.455975479567265/30.566004736104、
+libctest 175/215、lmbench 50.79791483884551/50.870992196784016、
+ltp 0/0、lua 0/0、netperf 0/0。glibc LTP 执行到第 107 个案例
+`cgroup_fj_proc` 后无新串口输出，标为超时；musl LTP 与两侧 Lua/netperf
+未到达，不可视作已执行失败。原 libctest 此次已启动且有通过及失败案例，
+旧的“脚本 not found”前置阻塞已解除。
+
+首轮启动环境尚未满足原镜像 `hello` 的绝对 `/code/.../lmbench_all` 路径：
+lmbench 期间反复打印该目标不存在，却仍产生计时分数。原盘 `/glibc/hello`
+和 `/musl/hello` 内容相同；后继提交仅按 libc 建立指向镜像二进制的链接，
+因此首轮分数保留为有明确环境缺口的历史运行，不能与后继运行拼接。
+本次内核 SHA-256 `0bf2dcab32a4bd7d4adf57c99a6d503cfe47593f8f9ffd87f48c937d33b3430f`，
+启动脚本 SHA-256 `3b4d48bbadd33596f700b590183bcb992ae28647bbd844e9c7094159cdd2a880`，
+串口 SHA-256 `82ca550dff6c73427c8579d10fd60e49cebb5e5b85c7984973218444f50e5e70`。
+固定输入及 QEMU 配置同下述旧基线身份；启动时工作区干净。重建命令为
+`python3 -B tests/oscomp/run.py --output build/oscomp-proc-formal-20260928`，
+需检出首轮提交而不是使用当前已修正的启动脚本。
 
 ## 2026-09-28 单次启动旧基线
 

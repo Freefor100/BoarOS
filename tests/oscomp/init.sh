@@ -19,6 +19,10 @@ for group in basic busybox cyclictest iozone iperf libcbench libctest lmbench lt
             cd /$libc
             export PATH=/bin:/$libc:/$libc/ltp/testcases/bin:.
             export LD_LIBRARY_PATH=/$libc/lib
+            if [ "$group" = lmbench ]; then
+                $BB mkdir -p /code/lmbench_src/bin/build
+                $BB ln -sf /$libc/lmbench_all /code/lmbench_src/bin/build/lmbench_all
+            fi
             echo "BOAROS-EVAL ENTER $group-$libc"
             set +e
             /$libc/busybox sh ./${group}_testcode.sh
