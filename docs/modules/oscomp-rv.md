@@ -18,11 +18,12 @@ e2fsprogs、Python 3.11+、jinja2、pytz，原 judge 使用宿主 Python。
 runner 从原盘建立可丢弃副本，只增加自己的启动脚本。原测试脚本、二进制、权限及
 判断逻辑均保留。内核没有比赛路径或调度特判。
 
-启动脚本通过原 BusyBox 创建 `/bin /lib /tmp /dev`、工具与加载器符号链接，
-通过 mknodat 创建 null/zero/console。`/tmp` 是 ext4 目录，不是 tmpfs。
+启动脚本通过原 BusyBox 创建 `/bin /lib /tmp /dev /proc`、工具与加载器符号链接，
+通过 mknodat 创建 null/zero/console，将标准 fd 重新绑定到真实 console 节点，
+再挂载内核 procfs。`/tmp` 是 ext4 目录，不是 tmpfs。
 每组在自己的 libc 根目录执行原 `*_testcode.sh`，分别设置 `LD_LIBRARY_PATH`，
 避免同时搜索两套 libc。musl 的普通/sf 加载器名指向镜像自带 libc；
-glibc 加载器指向其真实文件。没有假 `/proc`、随机设备或测试输出。
+glibc 加载器指向其真实文件。proc 内容来自真实内核对象，没有假随机设备或测试输出。
 
 默认顺序为 basic、busybox、cyclictest、iozone、iperf、libcbench、libctest、
 lmbench、ltp、lua、netperf，每组先 glibc 后 musl。无逐组超时、重启或失败后宿主拼接。
@@ -62,7 +63,11 @@ runner 读取固定 Harness `kernel/judge/config.json`。其中 `qemu.timeout=36
 清理。原始 `.img/.img.xz` 在 references，不属于清理范围。通用新缺陷先最小复现，
 回 main 修复并验收，再 merge 回本分支重新构建运行。
 
-## 2026-09-28 单次启动基线
+## 2026-09-28 proc 挂载限时诊断
+
+在新 proc 挂载配置上先用 `python3 -B tests/oscomp/run.py --output build/oscomp-proc-diagnostic-20260928 --diagnostic-timeout 120` 做**限时诊断**：一次启动在总预算 120 秒处终止，停在 glibc iozone，后续组未到达。原 judge 在本次诊断给 busybox 两侧各 52 项、总整数 104；这不是正式分数。启动脚本成功挂载真实 proc，`ps` 列出进程；原脚本将 df/free 标 success，但 df 只有表头，glibc free 出现溢出的使用量、musl free 全零，内容不能当作正确统计。该次内核 SHA-256 `0bf2dcab32a4bd7d4adf57c99a6d503cfe47593f8f9ffd87f48c937d33b3430f`，脚本 SHA-256 `3b4d48bbadd33596f700b590183bcb992ae28647bbd844e9c7094159cdd2a880`，串口 SHA-256 `a62a42d2144af5380bf281cdbd5d19e7e18ae1219cb05bd06e78021594809047`；运行时脚本和本文尚未提交，报告明示工作区脏状态。正式预算必须在提交后另开一次启动，不能拼接诊断结果。
+
+## 2026-09-28 单次启动旧基线
 
 **原 postwork 整数分数 267，未取整合计 267.2644974509601。** 这是固定 Harness
 的 RV 投影，不是双架构总成绩，也不是满分 267。一次启动自北京时间 13:33:40
