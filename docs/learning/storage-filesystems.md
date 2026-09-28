@@ -10,6 +10,29 @@ VirtIO 也分 transport 与 device type。MMIO 或 PCI transport 规定寄存器
 
 DMA 的地址是设备可见地址，不等于任意内核虚拟地址。QEMU `virt` 当前无 IOMMU、RAM 有固定 direct map，因此可把 direct-map VA 转回 PA；真实开发板还必须核对 DMA 可达位宽、cache coherency、内存屏障和 IOMMU。对齐的最终目标缓冲区可以 direct DMA；非整扇区范围需要 bounce，避免设备覆盖调用者未请求的前后字节。
 
+## 通用对象与 ext4 适配分离
+
+2026-09-28 从 `ba7e6d8` 开始拆分。固定 Linux
+`references/linux/include/linux/{fs.h,path.h}`（`f4cdf7ca9a1fdcca413157df19753f388a5a224e`）
+区分文件系统实例、inode、路径和打开文件；BoarOS 将通用引用、锁、缓存关联与
+映射登记留在 VFS，lwext4 handle、日志错误和 orphan 留在私有后端。先让
+原 ext4 路径继续工作，再接新文件系统，以便把回归定位到对象拆分或挂载行为。
+
+一次实际失败发生在后端操作表：物理地址运行的 VFS 模块测试跳入高半区回调地址，
+首次 open 触发 instruction access fault。静态指针初始化使用链接地址，而当前
+测试尚未启用 Sv39。挂载前逐项初始化回调，使其按当前执行地址生成；volatile
+表项写防止编译器又改成常量表复制。生产高半区入口和分页前测试都必须覆盖，
+不能通过删除物理地址测试隐藏问题。
+
+重建入口为 `make test-vfs-riscv test-files-riscv test-mm-riscv test-exec-riscv
+ test-record-lock-riscv test-scale-riscv test-io-sleep-riscv`；VFS runner 同时覆盖
+恢复和只读/可写根盘，规模与睡眠 I/O 继续保护原成本和并发门槛。
+本次另通过 `make test-riscv test-stack-usage`、SQLite DELETE/WAL、
+`test-lwext4-recovery-host` 与 `test-lwext4-rename-host`。既有 583 条 ABI
+记录仍与固定 Linux 一致；新增 3 条 proc 探针分别得到 ENOSYS、ENOENT、
+ENOSYS，尚未转绿，不计入已支持能力。SQLite 逐事件完整恢复矩阵仍待本轮收口。
+此阶段的通过不代表 mount syscall、procfs 或对象链接已完成。
+
 ## 为什么当前是同步 I/O
 
 设备 flush 与块缓存排空是两层边界。新增块 flush 依据固定 Linux `references/linux/drivers/block/virtio_blk.c`（`f4cdf7ca9a1fdcca413157df19753f388a5a224e`）与 QEMU `references/qemu/hw/block/virtio-blk.c`（v11.1.0，`84f07211cc5b4fc6a371559bf8a5de4fb068e648`）：不协商 CONFIG_WCE 时，FLUSH feature 决定 writeback，缺失则为 write-through。协商 FLUSH 后必须真实提交该请求；内存 fence、read-after-write、QEMU 正常退出均不能替代介质持久化证据。host 故障模型把易失状态与稳定镜像分开，允许未同步扇区丢失/重排；后续 journal 测试应复用这个模型，而非仅终止普通 QEMU 后检查恰好仍在宿主页缓存中的数据。

@@ -75,7 +75,7 @@ make test-references
 
 [开发路线](docs/goals.md)统一记录本轮任务、分支交接和后续依赖。通用兼容性在 `main`，比赛环境与运行入口在 `oscomp-rv-compat`；后者单向合入已验收主线。只跑 RV 的原 judge 评分不等于双架构比赛交付，也不能把逐组诊断分数拼成正式总分。
 
-后续先设计通用 VFS 后端与 mount/path 生命周期，再接真实设备/procfs、tmpfs 和多挂载。随机数、会话与调度按调用链推进；netperf、iozone 先定位。SMP、LoongArch、实板和更大工具链按新基线另行排期。
+本轮按已确认的统一 VFS 对象路线，分阶段拆分 ext4 后端、实现挂载路径和真实 procfs；tmpfs 与多挂载完善随后推进。随机数、会话与调度按调用链推进；netperf、iozone 先定位。SMP、LoongArch、实板和更大工具链按新基线另行排期。
 
 - [文档导航](docs/README.md)：模块契约与可复用学习材料。
 - [工程原则](docs/design.md)与[贡献说明](CONTRIBUTING.md)：技术取舍、验证与提交边界。

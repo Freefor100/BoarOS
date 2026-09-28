@@ -6,6 +6,19 @@
 
 `include/kernel/block.h` 定义同步块设备（支持读与可选写），`include/kernel/vfs.h` 定义不透明 mount/file 对象以及根挂载、open/create、pread/pwrite、ftruncate、mkdir、unlink、rmdir、close、unmount、`kernel_vfs_fstat()` 与 `kernel_vfs_mount_is_readonly()` 查询。VFS 对外返回负 Linux errno；lwext4 的结构、全局设备名和正值 errno 不泄漏到调用者。当前只有一个根挂载与一个 lwext4 heap binding；进程 fd/open-file-description 位于独立的[文件资源层](kernel-files.md)，VFS 本身没有 mount namespace；命名空间修改使用可睡眠 mutex，inode、OFD 与后端各自同步。
 
+`fs/vfs_objects.h` 定义通用实例、inode 节点、路径与后端操作表；
+`fs/vfs.c` 管理路径身份、引用、执行/写租约、记录锁、缓存及映射登记。
+`fs/ext4_backend.c` 持有 lwext4 handle、块适配、事务、orphan 与 mount 错误，
+通用层不再包含 lwext4 头文件。实例内按后端 inode 标识合并活 node，
+不同实例不共享节点；后端准备私有 handle 后交给 `kernel_vfs_publish_node()`，
+由通用层发布或复用已有节点。后端包装对象把通用 node 放在首部，末引用由
+实例所属堆释放；`close_node` 只释放私有 handle，不等待 I/O，确保分配压力下
+干净页回收不会递归进入存储等待。orphan、日志或块 I/O 错误仍由 ext4 实例持有。
+
+此拆分尚未启用其他文件系统或跨挂载路径；现有单根限制仍成立。
+普通文件继续使用同一页缓存与 inode 同步，pipe/socket/epoll 维持文件层独立 owner。
+后端操作表在挂载前逐项初始化，支持分页前物理地址测试与高半区生产入口。
+
 `kernel_vfs_mount_root()` 根据传入块设备是否提供 `write` 回调决定只读还是读写挂载。读写 journal 挂载先 replay、校验 orphan 记录、启动日志并回收遗留 orphan，完成后才发布根路径。只读介质不能完成恢复时明确拒绝；未知必需特性、损坏日志或元数据也不能作为干净镜像继续访问。
 
 `kernel_vfs_file_read_source()` 把保持打开的文件导出为带 `size/context/read_at` 的精确随机读源。回调只有填满整个范围才返回零；EOF 以内的短读转成 `-EIO`。ELF parser 因而能复用内存和 VFS 来源，而不依赖文件系统类型。
@@ -23,7 +36,7 @@ exec 权限检查可立即观察修改。该接口沿用现有
 
 ## 文件节点与页缓存
 
-VFS 以挂载实例与 ext4 inode 为活节点身份，普通文件、目录和字符节点都持有引用计数 node；路径对象另持有父目录项身份和一份活 inode 引用。独立 open file description 各自保存 offset，但同一 inode 指向共享 node。文件大小通过 `kernel_vfs_file_size()` 实时查询所属 node 的实时大小，确保写入或截断后各共享描述符观察到一致的文件长度。
+VFS 以文件系统实例与后端 inode 标识为活节点身份，普通文件、目录和字符节点都持有引用计数 node；路径对象另持有父目录项身份和一份活 inode 引用。独立 open file description 各自保存 offset，但同一 inode 指向共享 node。文件大小通过 `kernel_vfs_file_size()` 实时查询所属 node 的实时大小，确保写入或截断后各共享描述符观察到一致的文件长度。
 
 活 node 还嵌入记录锁区间树与等待队列，因此独立 open 必须在同一 inode 上冲突；unlink 后仍打开的旧 inode 保持原锁身份，同名重建使用新 inode 和新锁状态。末节点释放要求树与等待队列都为空；锁 owner、close/退出释放与阻塞 pin 契约见[文件资源模块](kernel-files.md)。该状态属于单 hart 临界区，不代表已经具备跨核并发锁。
 
