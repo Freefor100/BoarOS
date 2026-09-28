@@ -183,6 +183,12 @@ void abi_main(const unsigned long *initial_stack)
                argument[index] == identity_marker[index]) ++index;
         if (!identity_marker[index] && !argument[index])
             abi_exit(root_identity() ? 0 : 92);
+        static const char proc_marker[] = "proc-exec-probe";
+        index = 0;
+        while (proc_marker[index] &&
+               argument[index] == proc_marker[index]) ++index;
+        if (!proc_marker[index] && !argument[index])
+            abi_proc_exec_probe();
         static const char lock_marker[] = "lock-exec-";
         index = 0;
         while (lock_marker[index] &&

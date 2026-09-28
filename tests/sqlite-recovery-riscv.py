@@ -328,16 +328,34 @@ def main():
             print(f"small transaction: {events} events ({writes} writes, "
                   f"{flushes} flushes)", flush=True)
             if args.matrix == "full":
-                cuts = range(1, events + 1)
                 write_faults = range(1, writes + 1)
                 flush_faults = range(1, flushes + 1)
             else:
-                cuts = sorted({1, 2, events // 4, events // 2,
-                               3 * events // 4, events})
                 write_faults = sorted({1, max(1, writes // 2), writes})
                 flush_faults = sorted({1, max(1, flushes // 2), flushes})
-            for position in cuts:
-                for policy in ("none", "odd", "reverse"):
+            # 同一持久化策略决定稳定盘初态，切点上限不能借用默认探针。
+            for policy in ("none", "odd", "reverse"):
+                policy_probe = directory / f"small-probe-{policy}.img"
+                shutil.copyfile(small, policy_probe)
+                set_control(policy_probe, small_phase, "G")
+                _, policy_log = nbd_boot(
+                    args, policy_probe, directory, f"small-probe-{policy}",
+                    options=(f"--persist={policy}", "--arm-on-signal"),
+                    gate=True, marker="BoarOS: SQLite commit confirmed")
+                policy_probe.unlink()
+                assert "armed=1\n" in policy_log
+                policy_log = policy_log.split("armed=1\n", 1)[1]
+                policy_events = (policy_log.count("type=WRITE") +
+                                 policy_log.count("type=FLUSH"))
+                print(f"{policy} cut transaction: {policy_events} events",
+                      flush=True)
+                if args.matrix == "full":
+                    cuts = range(1, policy_events + 1)
+                else:
+                    cuts = sorted({1, 2, policy_events // 4,
+                                   policy_events // 2,
+                                   3 * policy_events // 4, policy_events})
+                for position in cuts:
                     name = f"cut-{position}-{policy}"
                     image = directory / f"{name}.img"
                     shutil.copyfile(small, image)

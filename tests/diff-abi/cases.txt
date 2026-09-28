@@ -647,6 +647,17 @@ proc.fd-epoll-link
 proc.fd-epoll-mode
 proc.fd-epoll-follow-stat
 proc.fd-epoll-reopen
+proc.thread-live
+proc.thread-after-exit
+proc.group-held-status
+proc.group-leader-status
+proc.group-leader-exe
+proc.group-leader-cwd
+proc.group-leader-fd
+proc.nonleader-exec-wait
+proc.nonleader-exec-pid
+proc.nonleader-exec-status
+proc.nonleader-exec-exe
 proc.zombie-stat
 proc.reaped-old-stat
 proc.reused-old-stat

@@ -1,5 +1,19 @@
 #include "abi.h"
 
+#define PROC_CLONE_THREAD 0x10f00
+#define PROC_CHILD_SETTID 0x1000000
+#define PROC_CHILD_CLEARTID 0x200000
+extern long abi_clone_entry(long flags, void *stack, int *tid,
+                            void (*fn)(void *), void *arg);
+static unsigned char proc_thread_stack[16384] __attribute__((aligned(16)));
+static volatile int proc_thread_tid;
+static volatile int proc_thread_ready;
+static volatile int proc_thread_release;
+struct proc_exec_result {
+    long pid, tid, status_result, threads, exe_result;
+    char exe[64];
+};
+
 static void proc_child_path(char *path, long pid)
 {
     const char prefix[] = "/proc-probe/";
@@ -79,6 +93,213 @@ static void proc_fd_follow_stat(const char *case_name, const char *path,
                followed.ino == original.ino &&
                followed.rdev == original.rdev;
     abi_record(case_name, result, same ? 0 : -1, -1, 0, 0, 0);
+}
+
+static long proc_status_fd_fields(long fd, char *state, long *threads)
+{
+    char data[4096];
+    long length = SC3(63, fd, data, sizeof(data));
+    if (length < 0) return length;
+    *state = 0;
+    *threads = 0;
+    const char state_key[] = "State:\t";
+    const char threads_key[] = "Threads:\t";
+    for (long i = 0; i < length; i++) {
+        if (i + (long)sizeof(state_key) < length) {
+            unsigned j = 0;
+            while (j < sizeof(state_key) - 1U &&
+                   data[i + j] == state_key[j]) j++;
+            if (j == sizeof(state_key) - 1U)
+                *state = data[i + j];
+        }
+        if (i + (long)sizeof(threads_key) < length) {
+            unsigned j = 0;
+            while (j < sizeof(threads_key) - 1U &&
+                   data[i + j] == threads_key[j]) j++;
+            if (j == sizeof(threads_key) - 1U) {
+                long count = 0;
+                for (long at = i + j; at < length &&
+                     data[at] >= '0' && data[at] <= '9'; at++)
+                    count = count * 10 + data[at] - '0';
+                *threads = count;
+            }
+        }
+    }
+    return 0;
+}
+
+static long proc_status_fields(const char *path, char *state, long *threads)
+{
+    long fd = abi_open(path, 0);
+    if (fd < 0) return fd;
+    long result = proc_status_fd_fields(fd, state, threads);
+    abi_require(SC1(57, fd) == 0);
+    return result;
+}
+
+static void proc_live_thread(void *unused)
+{
+    (void)unused;
+    __atomic_store_n(&proc_thread_ready, 1, __ATOMIC_RELEASE);
+    while (!__atomic_load_n(&proc_thread_release, __ATOMIC_ACQUIRE))
+        SC0(124);
+}
+
+static void proc_group_thread(void *argument)
+{
+    volatile int *control = argument;
+    __atomic_store_n(&control[0], 1, __ATOMIC_RELEASE);
+    while (!__atomic_load_n(&control[1], __ATOMIC_ACQUIRE))
+        SC0(124);
+}
+
+void abi_proc_exec_probe(void)
+{
+    struct proc_exec_result result = {0};
+    char state = 0;
+    result.pid = SC0(172);
+    result.tid = SC0(178);
+    result.status_result = proc_status_fields("/proc-probe/self/status",
+                                              &state, &result.threads);
+    result.exe_result = SC4(78, -100, "/proc-probe/self/exe",
+                            result.exe, sizeof(result.exe));
+    long fd = abi_open("/proc-exec-result", 1 | 64 | 512);
+    if (fd < 0) abi_exit(95);
+    if (SC3(64, fd, &result, sizeof(result)) != sizeof(result)) abi_exit(96);
+    abi_require(SC1(57, fd) == 0);
+    abi_exit(0);
+}
+
+static void proc_exec_thread(void *unused)
+{
+    (void)unused;
+    const char *argv[] = {"/init", "proc-exec-probe", 0};
+    const char *env[] = {0};
+    SC3(221, argv[0], argv, env);
+    abi_exit(97);
+}
+
+static void proc_nonleader_exec_cases(void)
+{
+    long child = CALL(220, 17, 0, 0, 0, 0, 0);
+    abi_require(child >= 0);
+    if (!child) {
+        long member = abi_clone_entry(PROC_CLONE_THREAD,
+                                      proc_thread_stack + sizeof(proc_thread_stack),
+                                      0, proc_exec_thread, 0);
+        abi_require(member > 0);
+        for (;;) SC0(124);
+    }
+    int status = 0;
+    abi_require(SC4(260, child, &status, 0, 0) == child);
+    abi_record("proc.nonleader-exec-wait", 0, -1, -1, status, 0, 0);
+    long fd = abi_open("/proc-exec-result", 0);
+    abi_require(fd >= 0);
+    struct proc_exec_result result;
+    abi_require(SC3(63, fd, &result, sizeof(result)) == sizeof(result));
+    abi_require(SC1(57, fd) == 0);
+    abi_record("proc.nonleader-exec-pid", result.pid == child ? 0 : -1,
+               result.tid == child ? 0 : -1, -1, 0, 0, 0);
+    abi_record("proc.nonleader-exec-status", result.status_result,
+               result.threads, -1, 0, 0, 0);
+    abi_record("proc.nonleader-exec-exe", result.exe_result, -1, -1, 0,
+               result.exe, result.exe_result > 0 ? (usize)result.exe_result : 0);
+    abi_require(SC3(35, -100, "/proc-exec-result", 0) == 0);
+}
+
+static void proc_thread_cases(void)
+{
+    proc_thread_tid = 73;
+    proc_thread_ready = 0;
+    proc_thread_release = 0;
+    long member = abi_clone_entry(PROC_CLONE_THREAD | PROC_CHILD_SETTID |
+                                  PROC_CHILD_CLEARTID,
+                                  proc_thread_stack + sizeof(proc_thread_stack),
+                                  (int *)&proc_thread_tid, proc_live_thread, 0);
+    abi_require(member > 0);
+    for (unsigned attempt = 0; !proc_thread_ready && attempt < 10000U;
+         attempt++) SC0(124);
+    abi_require(proc_thread_ready);
+    char state = 0;
+    long threads = 0;
+    long result = proc_status_fields("/proc-probe/self/status", &state,
+                                     &threads);
+    abi_record("proc.thread-live", result, threads, -1, 0, 0, 0);
+    proc_thread_release = 1;
+    for (unsigned attempt = 0; proc_thread_tid && attempt < 10000U;
+         attempt++) SC0(124);
+    abi_require(!proc_thread_tid);
+    result = proc_status_fields("/proc-probe/self/status", &state, &threads);
+    abi_record("proc.thread-after-exit", result, threads, -1, 0, 0, 0);
+
+    volatile int *control = (void *)CALL(222, 0, 4096, 3, 0x21, -1, 0);
+    abi_require((long)control > 0);
+    control[0] = 0; /* member entered */
+    control[1] = 0; /* member may exit */
+    control[2] = -1; /* leader clear_child_tid */
+    control[3] = 73;
+    control[4] = 0; /* parent opened status before leader exits */
+    long child = CALL(220, 17, 0, 0, 0, 0, 0);
+    abi_require(child >= 0);
+    if (!child) {
+        control[2] = (int)SC0(178);
+        abi_require(SC1(96, &control[2]) == control[2]);
+        long tid = abi_clone_entry(PROC_CLONE_THREAD |
+                                   PROC_CHILD_CLEARTID,
+                                   proc_thread_stack + sizeof(proc_thread_stack),
+                                   (int *)&control[3], proc_group_thread,
+                                   (void *)control);
+        abi_require(tid > 0);
+        while (!__atomic_load_n(&control[4], __ATOMIC_ACQUIRE)) SC0(124);
+        abi_exit(0);
+    }
+    for (unsigned attempt = 0; !control[0] && attempt < 10000U;
+         attempt++) SC0(124);
+    abi_require(control[0]);
+    char path[64];
+    proc_child_path(path, child);
+    unsigned path_length = 0;
+    while (path[path_length]) path_length++;
+    const char status_suffix[] = "/status";
+    for (unsigned i = 0; i < sizeof(status_suffix); i++)
+        path[path_length + i] = status_suffix[i];
+    long held_status = abi_open(path, 0);
+    abi_require(held_status >= 0);
+    __atomic_store_n(&control[4], 1, __ATOMIC_RELEASE);
+    for (unsigned attempt = 0; control[2] && attempt < 10000U;
+         attempt++) SC0(124);
+    abi_require(!control[2]);
+    result = proc_status_fd_fields(held_status, &state, &threads);
+    abi_record("proc.group-held-status", result, threads, -1, 0,
+               &state, 1);
+    abi_require(SC1(57, held_status) == 0);
+    result = proc_status_fields(path, &state, &threads);
+    abi_record("proc.group-leader-status", result, threads, -1, 0,
+               &state, 1);
+    const char exe_suffix[] = "/exe";
+    for (unsigned i = 0; i < sizeof(exe_suffix); i++)
+        path[path_length + i] = exe_suffix[i];
+    char link[64];
+    result = SC4(78, -100, path, link, sizeof(link));
+    abi_record("proc.group-leader-exe", result, -1, -1, 0,
+               link, result > 0 ? (usize)result : 0);
+    const char cwd_suffix[] = "/cwd";
+    for (unsigned i = 0; i < sizeof(cwd_suffix); i++)
+        path[path_length + i] = cwd_suffix[i];
+    result = SC4(78, -100, path, link, sizeof(link));
+    abi_record("proc.group-leader-cwd", result, -1, -1, 0,
+               link, result > 0 ? (usize)result : 0);
+    const char fd_suffix[] = "/fd/0";
+    for (unsigned i = 0; i < sizeof(fd_suffix); i++)
+        path[path_length + i] = fd_suffix[i];
+    result = SC4(78, -100, path, link, sizeof(link));
+    abi_record("proc.group-leader-fd", result, -1, -1, 0,
+               link, result > 0 ? (usize)result : 0);
+    __atomic_store_n(&control[1], 1, __ATOMIC_RELEASE);
+    int status = 0;
+    abi_require(SC4(260, child, &status, 0, 0) == child);
+    abi_require(status == 0);
+    abi_require(SC2(215, control, 4096) == 0);
 }
 
 /* Missing mount dispatch must not masquerade as a procfs consumer failure. */
@@ -383,6 +604,8 @@ void abi_proc_cases(void)
                -1, -1, 0, 0, 0);
     if (reopened >= 0) abi_require(SC1(57, reopened) == 0);
     abi_require(SC1(57, epoll_fd) == 0);
+    proc_thread_cases();
+    proc_nonleader_exec_cases();
     long child = CALL(220, 17, 0, 0, 0, 0, 0);
     abi_require(child >= 0);
     if (!child) abi_exit(0);

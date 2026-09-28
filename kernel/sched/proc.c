@@ -64,8 +64,15 @@ static struct kernel_task *find_member(kernel_pid_t pid, uint64_t identity)
     for (struct kernel_task *leader = root; leader;
          leader = next_process(leader, root))
         if (leader->tid == pid && leader->proc_identity == identity)
-            return representative(leader);
+            return representative(leader) ? leader : 0;
     return 0;
+}
+
+static struct kernel_task *find_resource_owner(kernel_pid_t pid,
+                                                uint64_t identity)
+{
+    struct kernel_task *leader = find_member(pid, identity);
+    return leader && !leader->proc_exiting ? leader : 0;
 }
 
 void kernel_proc_task_note_block_read(void)
@@ -100,6 +107,12 @@ int kernel_proc_process_snapshot(kernel_pid_t pid, uint64_t identity,
         return -KERNEL_ENOENT;
     }
     struct kernel_task *leader = task->group_leader;
+    uint32_t threads = leader->group_members;
+    struct kernel_task *member = leader->group_next;
+    while (member != leader) {
+        if (member->proc_exiting && threads) threads--;
+        member = member->group_next;
+    }
     *result = (struct kernel_proc_process_snapshot){
         .pid = pid,
         .ppid = leader->parent && leader->parent->group_leader
@@ -108,25 +121,28 @@ int kernel_proc_process_snapshot(kernel_pid_t pid, uint64_t identity,
         .session_id = leader->session_id,
         .identity = identity,
         .start_ticks = leader->proc_start_ticks,
-        .state = task->state == KERNEL_THREAD_STATE_RUNNING ||
+        .state = task->proc_exiting ||
+                 task->state == KERNEL_THREAD_STATE_EXITED ||
+                 task->state == KERNEL_THREAD_STATE_GROUP_DEAD ||
+                 task->state == KERNEL_THREAD_STATE_ZOMBIE ? 'Z' :
+                 task->state == KERNEL_THREAD_STATE_RUNNING ||
                  task->state == KERNEL_THREAD_STATE_READY ? 'R' :
-                 task->state == KERNEL_THREAD_STATE_STOPPED ? 'T' :
-                 task->state == KERNEL_THREAD_STATE_ZOMBIE ? 'Z' : 'S',
+                 task->state == KERNEL_THREAD_STATE_STOPPED ? 'T' : 'S',
         .child_minor_faults = leader->child_minor_faults,
         .child_major_faults = leader->child_major_faults,
-        .threads = leader->group_members,
+        .threads = threads,
     };
     memcpy(result->comm, leader->comm, sizeof(result->comm));
     kernel_task_cpu_ticks(task, &result->user_ticks,
         &result->kernel_ticks, &result->child_user_ticks,
         &result->child_kernel_ticks);
-    struct kernel_task *member = leader;
+    member = leader;
     do {
         result->minor_faults += member->minor_faults;
         result->major_faults += member->major_faults;
         member = member->group_next;
     } while (member != leader);
-    if (task->mm.state == KERNEL_MM_LIVE) {
+    if (!task->proc_exiting && task->mm.state == KERNEL_MM_LIVE) {
         struct kernel_mm_proc_memory memory;
         if (kernel_mm_proc_memory_snapshot(&task->mm, &memory) !=
             KERNEL_MM_STATUS_OK) {
@@ -148,7 +164,7 @@ int kernel_proc_process_path_acquire(kernel_pid_t pid, uint64_t identity,
     if (pid <= 0 || !identity || !owner || *owner)
         return -KERNEL_EINVAL;
     uintptr_t irq = riscv_interrupt_save();
-    struct kernel_task *task = find_member(pid, identity);
+    struct kernel_task *task = find_resource_owner(pid, identity);
     if (!task) {
         riscv_interrupt_restore(irq);
         return -KERNEL_ENOENT;
@@ -180,7 +196,7 @@ int kernel_proc_next_fd(kernel_pid_t pid, uint64_t identity,
     if (pid <= 0 || !identity || !fd || after < -1)
         return -KERNEL_EINVAL;
     uintptr_t irq = riscv_interrupt_save();
-    struct kernel_task *task = find_member(pid, identity);
+    struct kernel_task *task = find_resource_owner(pid, identity);
     int result = task && kernel_files_is_live(&task->files)
         ? kernel_files_next_open_fd(&task->files, after, fd)
         : -KERNEL_ENOENT;
@@ -194,7 +210,7 @@ int kernel_proc_fd_access_snapshot(kernel_pid_t pid, uint64_t identity,
     if (pid <= 0 || !identity || fd < 0 || !readable || !writable)
         return -KERNEL_EINVAL;
     uintptr_t irq = riscv_interrupt_save();
-    struct kernel_task *task = find_member(pid, identity);
+    struct kernel_task *task = find_resource_owner(pid, identity);
     struct kernel_open_file_description *file = task &&
         kernel_files_is_live(&task->files)
         ? kernel_files_fd_borrow(&task->files, fd) : 0;
@@ -217,7 +233,7 @@ int kernel_proc_fd_path_acquire(kernel_pid_t pid, uint64_t identity,
     if (pid <= 0 || !identity || fd < 0 || !owner || *owner)
         return -KERNEL_EINVAL;
     uintptr_t irq = riscv_interrupt_save();
-    struct kernel_task *task = find_member(pid, identity);
+    struct kernel_task *task = find_resource_owner(pid, identity);
     struct kernel_open_file_description *file = task &&
         kernel_files_is_live(&task->files)
         ? kernel_files_fd_borrow(&task->files, fd) : 0;
@@ -238,7 +254,7 @@ int kernel_proc_fd_pseudo_snapshot(kernel_pid_t pid, uint64_t identity,
     if (pid <= 0 || !identity || fd < 0 || !snapshot)
         return -KERNEL_EINVAL;
     uintptr_t irq = riscv_interrupt_save();
-    struct kernel_task *task = find_member(pid, identity);
+    struct kernel_task *task = find_resource_owner(pid, identity);
     struct kernel_open_file_description *file = task &&
         kernel_files_is_live(&task->files)
         ? kernel_files_fd_borrow(&task->files, fd) : 0;
@@ -258,7 +274,7 @@ int kernel_proc_fd_pseudo_stat(kernel_pid_t pid, uint64_t identity,
     if (pid <= 0 || !identity || fd < 0 || !stat)
         return -KERNEL_EINVAL;
     uintptr_t irq = riscv_interrupt_save();
-    struct kernel_task *task = find_member(pid, identity);
+    struct kernel_task *task = find_resource_owner(pid, identity);
     struct kernel_open_file_description *file = task &&
         kernel_files_is_live(&task->files)
         ? kernel_files_fd_borrow(&task->files, fd) : 0;
@@ -278,7 +294,7 @@ int kernel_proc_fd_reopen_link(kernel_pid_t pid, uint64_t identity,
         return -KERNEL_EINVAL;
     struct kernel_open_file_pipe_pin pin = {0};
     uintptr_t irq = riscv_interrupt_save();
-    struct kernel_task *task = find_member(pid, identity);
+    struct kernel_task *task = find_resource_owner(pid, identity);
     struct kernel_open_file_description *file = task &&
         kernel_files_is_live(&task->files)
         ? kernel_files_fd_borrow(&task->files, fd) : 0;

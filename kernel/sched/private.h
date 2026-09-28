@@ -150,6 +150,7 @@ struct kernel_task {
     struct kernel_task *group_previous;
     kernel_pid_t child_creator_tid;
     uint32_t terminate_requested;
+    uint32_t proc_exiting;
     uint32_t group_exiting;
     uint32_t group_execing;
     uint32_t group_stopped;
