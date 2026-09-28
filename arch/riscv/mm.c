@@ -4,6 +4,7 @@
 #include <kernel/file_mapping.h>
 #include <kernel/heap.h>
 #include <kernel/open_file.h>
+#include <kernel/proc_task.h>
 #include <kernel/page.h>
 #include <kernel/shared_anon.h>
 #include <kernel/task.h>
@@ -1377,6 +1378,23 @@ enum kernel_mm_status kernel_mm_executable_path_acquire(
     struct kernel_vfs_path *path = kernel_open_file_path(record->executable_file);
     if (!path || kernel_vfs_path_acquire(path)) return KERNEL_MM_STATUS_STATE;
     *owner = path;
+    return KERNEL_MM_STATUS_OK;
+}
+
+enum kernel_mm_status kernel_mm_proc_memory_snapshot(
+    const struct kernel_mm *mm, struct kernel_mm_proc_memory *snapshot)
+{
+    if (!snapshot) return KERNEL_MM_STATUS_INVALID_ARGUMENT;
+    struct riscv_kernel_mm_record *record;
+    enum kernel_mm_status status = resolve_record(mm, &record);
+    if (status != KERNEL_MM_STATUS_OK) return status;
+    if (record->stage != RISCV_KERNEL_MM_RECORD_LIVE || !record->vmas)
+        return KERNEL_MM_STATUS_STATE;
+    *snapshot = (struct kernel_mm_proc_memory){
+        .virtual_bytes = kernel_vma_set_total_bytes(record->vmas),
+        .resident_pages = (uint64_t)record->space.leaf_pages +
+                          record->space.protected_pages,
+    };
     return KERNEL_MM_STATUS_OK;
 }
 
@@ -2974,11 +2992,22 @@ enum kernel_mm_status kernel_mm_resolve_user_fault(
     struct kernel_mm *mm, uint64_t address, uint32_t access)
 {
     KERNEL_NO_RECLAIM_IO;
+    struct kernel_task *task = kernel_task_current();
+    const struct kernel_mm *task_mm = 0;
+    if (!mm || !task || kernel_task_mm_borrow(task, &task_mm) !=
+                     KERNEL_TASK_STATUS_OK ||
+        task_mm->record_page_address != mm->record_page_address) task = 0;
+    uint64_t block_reads = task ? kernel_proc_task_block_reads(task) : 0U;
     int resumed = 0;
     for (;;) {
         int retry = 0;
         enum kernel_mm_status result = resolve_user_fault_once(mm, address, access, &retry, resumed);
-        if (!retry) return result;
+        if (!retry) {
+            if (result == KERNEL_MM_STATUS_OK && task)
+                kernel_proc_task_note_fault(task,
+                    kernel_proc_task_block_reads(task) != block_reads);
+            return result;
+        }
         resumed = 1;
     }
 }

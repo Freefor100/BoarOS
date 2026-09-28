@@ -875,6 +875,7 @@ enum kernel_scheduler_status kernel_user_thread_create(
     thread->tid = tid;
     thread->proc_identity = scheduler.next_proc_identity++;
     thread->proc_start_ticks = kernel_tick_count();
+    thread->session_id = tid;
     thread->process_group = tid;
     thread->tid_owned = 1U;
     thread->publish_completion = 1U;

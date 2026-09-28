@@ -340,6 +340,11 @@ enum kernel_scheduler_status process_group_exec_current(void)
         task->kernel_ticks += leader->kernel_ticks;
         task->child_user_ticks = leader->child_user_ticks;
         task->child_kernel_ticks = leader->child_kernel_ticks;
+        task->minor_faults += leader->minor_faults;
+        task->major_faults += leader->major_faults;
+        task->child_minor_faults = leader->child_minor_faults;
+        task->child_major_faults = leader->child_major_faults;
+        task->session_id = leader->session_id;
         task->group_pending = leader->group_pending;
         task->nofile_limit = leader->nofile_limit;
         task->stack_limit = leader->stack_limit;
@@ -589,6 +594,7 @@ enum kernel_scheduler_status riscv_process_clone_current(
     child->tid = tid;
     child->proc_identity = scheduler.next_proc_identity++;
     child->proc_start_ticks = kernel_tick_count();
+    child->session_id = parent->session_id;
     memcpy(child->comm, parent->comm, sizeof(child->comm));
     child->process_group = parent->process_group;
     child->tid_owned = 1U;
@@ -728,6 +734,10 @@ static enum kernel_scheduler_status reap_waited_child(
     }
     parent->group_leader->child_user_ticks += user_ticks;
     parent->group_leader->child_kernel_ticks += kernel_ticks;
+    parent->group_leader->child_minor_faults +=
+        child->minor_faults + child->child_minor_faults;
+    parent->group_leader->child_major_faults +=
+        child->major_faults + child->child_major_faults;
     child_remove(parent->group_leader, child);
     if (scheduler.init_task == child) {
         scheduler.init_task = 0;
@@ -1120,6 +1130,8 @@ enum kernel_scheduler_status kernel_scheduler_reap_one(
                     child->child_creator_tid = child_reaper_tid(leader, thread);
             leader->user_ticks += thread->user_ticks;
             leader->kernel_ticks += thread->kernel_ticks;
+            leader->minor_faults += thread->minor_faults;
+            leader->major_faults += thread->major_faults;
             thread->group_previous->group_next = thread->group_next;
             thread->group_next->group_previous = thread->group_previous;
             leader->group_members--;

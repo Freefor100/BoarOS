@@ -76,6 +76,18 @@ Linux 一致，当时总计 614 条；fd、进程文本和挂载列表尚待后�
 形态三项差分通过，总计 617 条。先钉住挂载根和覆盖路径，再脱离短关中断区
 构造文本，避免格式化或分配阻塞挂载操作，也防止并发卸载释放快照对象。
 
+进程统计依据固定 Linux `references/linux/fs/proc/array.c::do_task_stat()`、
+`references/linux/fs/proc/task_mmu.c::task_vsize()` 与
+`references/linux/fs/proc/base.c::proc_pid_permission()`，commit 同上。
+`references/oscomp-testsuits/busybox/libbb/procps.c` 在固定清单提交中会解析
+stat 至第 24 字段 RSS；因此首批只发布有真实来源的前 24 字段与部分 status
+键，未统计的尾字段不补零。旧内核的 stat/status 均为 `ENOENT`；固定 Linux
+差分增加了格式、zombie 及旧目录回收后的 errno，当前 623 条通过。旧目录
+继续 lookup 在 Linux 的权限入口返回 `ESRCH`，而从 proc 根目录按已回收 PID
+重新 lookup 是 `ENOENT`，两者不能合并。fault major 目前按同一次解析发起
+的 VirtIO 读请求归因；另一个任务装载同页时等待者的 major 分类仍需改进，
+不能把这批字段描述为完整 Linux proc 实现。
+
 字符设备层采用 `st_rdev` 到内建 read/write/poll 操作的登记表，而不是在路径
 或每个 I/O 调用中重复识别设备名。`/dev` 仍可由 ext4 提供目录项；OFD 钉住
 选定后端，close 与 fd 复用不改变已开始的 I/O。固定 Linux

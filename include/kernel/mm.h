@@ -110,6 +110,13 @@ enum kernel_mm_status kernel_mm_set_executable(
 enum kernel_mm_status kernel_mm_executable_path_acquire(
     const struct kernel_mm *mm, struct kernel_vfs_path **owner);
 
+struct kernel_mm_proc_memory {
+    uint64_t virtual_bytes;
+    uint64_t resident_pages;
+};
+enum kernel_mm_status kernel_mm_proc_memory_snapshot(
+    const struct kernel_mm *mm, struct kernel_mm_proc_memory *snapshot);
+
 /* Returns NOT_MAPPED for a valid address outside all VMAs. */
 enum kernel_mm_status kernel_mm_vma_lookup(
     const struct kernel_mm *mm,

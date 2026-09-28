@@ -1,5 +1,17 @@
 #include "abi.h"
 
+static void proc_child_path(char *path, long pid)
+{
+    const char prefix[] = "/proc-probe/";
+    unsigned i = 0;
+    while (i < sizeof(prefix) - 1U) { path[i] = prefix[i]; i++; }
+    char reverse[24];
+    unsigned used = 0;
+    do { reverse[used++] = '0' + pid % 10; pid /= 10; } while (pid);
+    while (used) path[i++] = reverse[--used];
+    path[i] = '\0';
+}
+
 /* Missing mount dispatch must not masquerade as a procfs consumer failure. */
 void abi_proc_cases(void)
 {
@@ -95,6 +107,84 @@ void abi_proc_cases(void)
     }
     abi_record("proc.mounts-has-proc", has_proc ? 0 : -1,
                -1, -1, 0, 0, 0);
+    long stat_fd = abi_open("/proc-probe/self/stat", 0);
+    abi_record("proc.stat-open", stat_fd < 0 ? stat_fd : 0,
+               -1, -1, 0, 0, 0);
+    int stat_shape = 0;
+    if (stat_fd >= 0) {
+        char record[1024];
+        long got = SC3(63, stat_fd, record, sizeof(record));
+        if (got > 0 && got < (long)sizeof(record) && record[got - 1] == '\n') {
+            long close = -1;
+            for (long i = 0; i < got; i++) if (record[i] == ')') close = i;
+            int fields = 2;
+            if (close > 0 && record[close + 1] == ' ') {
+                for (long i = close + 2; i < got; i++)
+                    if (record[i] != ' ' && record[i] != '\n' &&
+                        record[i - 1] == ' ') fields++;
+                stat_shape = fields >= 24;
+            }
+        }
+        abi_require(SC1(57, stat_fd) == 0);
+    }
+    abi_record("proc.stat-fields", stat_shape ? 0 : -1,
+               -1, -1, 0, 0, 0);
+    long status_fd = abi_open("/proc-probe/self/status", 0);
+    abi_record("proc.status-open", status_fd < 0 ? status_fd : 0,
+               -1, -1, 0, 0, 0);
+    int status_shape = 0;
+    if (status_fd >= 0) {
+        char record[2048];
+        long got = SC3(63, status_fd, record, sizeof(record));
+        int name = 0, state = 0, pid = 0, rss = 0;
+        for (long i = 0; i + 7 < got; i++) {
+            if (record[i] == 'N' && record[i + 1] == 'a' &&
+                record[i + 2] == 'm' && record[i + 3] == 'e' &&
+                record[i + 4] == ':') name = 1;
+            if (record[i] == 'S' && record[i + 1] == 't' &&
+                record[i + 2] == 'a' && record[i + 3] == 't' &&
+                record[i + 4] == 'e' && record[i + 5] == ':') state = 1;
+            if (record[i] == 'P' && record[i + 1] == 'i' &&
+                record[i + 2] == 'd' && record[i + 3] == ':') pid = 1;
+            if (record[i] == 'V' && record[i + 1] == 'm' &&
+                record[i + 2] == 'R' && record[i + 3] == 'S' &&
+                record[i + 4] == 'S' && record[i + 5] == ':') rss = 1;
+        }
+        status_shape = name && state && pid && rss;
+        abi_require(SC1(57, status_fd) == 0);
+    }
+    abi_record("proc.status-fields", status_shape ? 0 : -1,
+               -1, -1, 0, 0, 0);
+    long child = CALL(220, 17, 0, 0, 0, 0, 0);
+    abi_require(child >= 0);
+    if (!child) abi_exit(0);
+    char child_path[48];
+    proc_child_path(child_path, child);
+    long child_dir = abi_open(child_path, 0);
+    abi_require(child_dir >= 0);
+    int zombie = 0;
+    for (unsigned attempt = 0; attempt < 10000U; attempt++) {
+        long child_stat = SC4(56, child_dir, "stat", 0, 0);
+        if (child_stat >= 0) {
+            char text[256];
+            long got = SC3(63, child_stat, text, sizeof(text));
+            for (long i = 0; i + 3 < got; i++)
+                if (text[i] == ')' && text[i + 1] == ' ' &&
+                    text[i + 2] == 'Z') zombie = 1;
+            abi_require(SC1(57, child_stat) == 0);
+        }
+        if (zombie) break;
+        SC0(124);
+    }
+    abi_record("proc.zombie-stat", zombie ? 0 : -1,
+               -1, -1, 0, 0, 0);
+    int child_status = 0;
+    abi_require(SC4(260, child, &child_status, 0, 0) == child);
+    long old_stat = SC4(56, child_dir, "stat", 0, 0);
+    abi_record("proc.reaped-old-stat", old_stat < 0 ? old_stat : 0,
+               -1, -1, 0, 0, 0);
+    if (old_stat >= 0) abi_require(SC1(57, old_stat) == 0);
+    abi_require(SC1(57, child_dir) == 0);
     if (fd >= 0) {
         char header[9] = {0};
         abi_record("proc.meminfo-read", SC3(63, fd, header, sizeof(header)),

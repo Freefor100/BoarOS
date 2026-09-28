@@ -143,6 +143,8 @@ ELF image 使用独立的 `kernel_elf64_source`，不把 `PT_LOAD` 当作普通 
 
 MM 还单独持有主 ELF 的执行 OFD，供 `/proc/<pid>/exe` 查询。它在新映像全部构造成功后取得，exec 失败不改变旧 MM；线程共享同一 MM，fork 子 MM 另取引用，末次 MM 清理在 ELF source 仍持有 OFD 时先释放该引用。`PT_INTERP` 只决定实际入口，不改变 exe 所指主文件；查询返回带引用的路径，调用者不能在任务退出后借用 MM 指针。
 
+`kernel_mm_proc_memory_snapshot()` 无分配读取 VMA 集合在成功编辑时更新的覆盖字节数，以及 Sv39 有效/受保护页计数，供 proc 的 VmSize/VmRSS 使用。受保护页仍拥有物理页，故计入驻留；未发生缺页的虚拟映射只计入 VmSize。数值是瞬时 MM 统计，不把页缓存全局占用误计为该进程 RSS。
+
 `kernel_mm_munmap()` 采用 Linux 洞语义：输入范围中没有 VMA 或只覆盖部分 VMA 仍可成功；resident、`PROT_NONE` 和待释放页都由 Sv39 owner 状态处理。`kernel_mm_mprotect()` 要求整个范围无洞覆盖，先准备 VMA 拆分容量，再原地修改已有 PTE 权限，最后提交 metadata；长度 0 对齐地址直接成功。`PROT_NONE` 不释放物理页，恢复权限后仍看到原内容。
 
 ## 硬件用户缺页解析

@@ -606,6 +606,12 @@ proc.root-link
 proc.mounts-link
 proc.mounts-open
 proc.mounts-has-proc
+proc.stat-open
+proc.stat-fields
+proc.status-open
+proc.status-fields
+proc.zombie-stat
+proc.reaped-old-stat
 proc.meminfo-read
 proc.meminfo-rewind
 proc.meminfo-readv

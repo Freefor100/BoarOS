@@ -129,8 +129,14 @@ struct kernel_task {
     uint64_t kernel_ticks;
     uint64_t child_user_ticks;
     uint64_t child_kernel_ticks;
+    uint64_t minor_faults;
+    uint64_t major_faults;
+    uint64_t child_minor_faults;
+    uint64_t child_major_faults;
+    uint64_t block_reads;
     uint64_t proc_identity;
     uint64_t proc_start_ticks;
+    kernel_pid_t session_id;
     char comm[16];
     struct kernel_wait_queue child_exit_queue;
     struct kernel_wait_queue vfork_done_queue;

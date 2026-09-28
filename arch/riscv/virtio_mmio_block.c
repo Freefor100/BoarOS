@@ -1,6 +1,7 @@
 #include <arch/riscv/virtio_mmio_block.h>
 #include <kernel/page.h>
 #include <kernel/sync.h>
+#include <kernel/proc_task.h>
 #include <arch/riscv/context.h>
 #include <arch/riscv/plic.h>
 #include <arch/riscv/virt_uart.h>
@@ -474,6 +475,7 @@ static enum kernel_block_status submit_request(struct riscv_virtio_mmio_block *d
     d[head + 2] = (struct virtq_descriptor){physical + offsetof(struct block_request, status), 1, VIRTQ_DESC_WRITE, 0};
     available->ring[available->index % device->queue_size] = head;
     memory_barrier(); available->index++; memory_barrier();
+    if (type == VIRTIO_BLOCK_REQUEST_IN) kernel_proc_task_note_block_read();
     mmio_write32(device, VIRTIO_MMIO_QUEUE_NOTIFY_OFFSET, 0);
     uint64_t deadline = time_now() + device->timeout_ticks;
     while (r->state == 2) {

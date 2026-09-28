@@ -6,6 +6,8 @@
 struct kernel_heap;
 struct kernel_vma_set;
 uint64_t kernel_vma_set_generation(const struct kernel_vma_set *set);
+/* Sum of currently mapped virtual bytes; updated with each committed edit. */
+uint64_t kernel_vma_set_total_bytes(const struct kernel_vma_set *set);
 
 enum kernel_vma_edit_kind {
     KERNEL_VMA_EDIT_REMOVE = 0,

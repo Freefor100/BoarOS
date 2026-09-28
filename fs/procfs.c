@@ -27,6 +27,8 @@
 #define PROC_PID_CWD_KIND 3U
 #define PROC_PID_ROOT_KIND 4U
 #define PROC_PID_MOUNTS_KIND 5U
+#define PROC_PID_STAT_KIND 6U
+#define PROC_PID_STATUS_KIND 7U
 #define PROC_SUPER_MAGIC UINT64_C(0x9fa0)
 
 struct procfs_mount {
@@ -87,7 +89,7 @@ static int proc_lookup(struct kernel_vfs_instance *instance, uint64_t parent,
         uint64_t identity;
         kernel_pid_t pid = proc_inode_pid(parent);
         if (kernel_proc_process_identity(pid, &identity) ||
-            identity != proc_inode_identity(parent)) return -KERNEL_ENOENT;
+            identity != proc_inode_identity(parent)) return -KERNEL_ESRCH;
         uint8_t kind;
         if (length == 3U && !memcmp(name, "exe", length))
             kind = PROC_PID_EXE_KIND;
@@ -97,9 +99,13 @@ static int proc_lookup(struct kernel_vfs_instance *instance, uint64_t parent,
             kind = PROC_PID_ROOT_KIND;
         else if (length == 6U && !memcmp(name, "mounts", length))
             kind = PROC_PID_MOUNTS_KIND;
+        else if (length == 4U && !memcmp(name, "stat", length))
+            kind = PROC_PID_STAT_KIND;
+        else if (length == 6U && !memcmp(name, "status", length))
+            kind = PROC_PID_STATUS_KIND;
         else return -KERNEL_ENOENT;
         *inode = proc_pid_inode(pid, identity, kind);
-        *mode = kind == PROC_PID_MOUNTS_KIND
+        *mode = kind >= PROC_PID_MOUNTS_KIND
                     ? KERNEL_VFS_S_IFREG | 0444U
                     : KERNEL_VFS_S_IFLNK | 0777U;
         return 0;
@@ -160,7 +166,9 @@ static int proc_open(struct kernel_vfs_mount *mount, const char *path,
           proc_inode_kind(inode) != PROC_PID_EXE_KIND &&
           proc_inode_kind(inode) != PROC_PID_CWD_KIND &&
           proc_inode_kind(inode) != PROC_PID_ROOT_KIND &&
-          proc_inode_kind(inode) != PROC_PID_MOUNTS_KIND)) ||
+          proc_inode_kind(inode) != PROC_PID_MOUNTS_KIND &&
+          proc_inode_kind(inode) != PROC_PID_STAT_KIND &&
+          proc_inode_kind(inode) != PROC_PID_STATUS_KIND)) ||
         (inode == PROC_ROOT_INODE &&
          (mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFDIR) ||
         ((inode == PROC_SELF_INODE || inode == PROC_MOUNTS_INODE) &&
@@ -169,7 +177,7 @@ static int proc_open(struct kernel_vfs_mount *mount, const char *path,
          (mode & KERNEL_VFS_S_IFMT) !=
             (proc_inode_kind(inode) == PROC_PID_DIR_KIND
                 ? KERNEL_VFS_S_IFDIR :
-             proc_inode_kind(inode) == PROC_PID_MOUNTS_KIND
+             proc_inode_kind(inode) >= PROC_PID_MOUNTS_KIND
                 ? KERNEL_VFS_S_IFREG : KERNEL_VFS_S_IFLNK)) ||
         ((inode == PROC_MEMINFO_INODE || inode == PROC_UPTIME_INODE) &&
          (mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFREG))
@@ -234,12 +242,14 @@ static int proc_dir_entry(struct kernel_vfs_file *file, uint64_t position,
         if (kernel_proc_process_identity(proc_inode_pid(directory),
                                          &identity) ||
             identity != proc_inode_identity(directory)) return -KERNEL_ENOENT;
-        if (position > 5U) return -KERNEL_ENOENT;
+        if (position > 7U) return -KERNEL_ENOENT;
         const char *entry = position == 0U ? "." :
                             position == 1U ? ".." :
                             position == 2U ? "exe" :
                             position == 3U ? "cwd" :
-                            position == 4U ? "root" : "mounts";
+                            position == 4U ? "root" :
+                            position == 5U ? "mounts" :
+                            position == 6U ? "stat" : "status";
         if (name_size < strlen(entry) + 1U) return -KERNEL_ERANGE;
         strcpy(name, entry);
         *next_position = position + 1U;
@@ -249,8 +259,10 @@ static int proc_dir_entry(struct kernel_vfs_file *file, uint64_t position,
                      position == 2U ? PROC_PID_EXE_KIND :
                      position == 3U ? PROC_PID_CWD_KIND :
                      position == 4U ? PROC_PID_ROOT_KIND :
-                                      PROC_PID_MOUNTS_KIND);
-        *type = position < 2U ? 4U : position == 5U ? 8U : 10U;
+                     position == 5U ? PROC_PID_MOUNTS_KIND :
+                     position == 6U ? PROC_PID_STAT_KIND :
+                                      PROC_PID_STATUS_KIND);
+        *type = position < 2U ? 4U : position >= 5U ? 8U : 10U;
         return 0;
     }
     const char *entry_name;
@@ -558,9 +570,115 @@ Finish:
     return result;
 }
 
+static size_t append_number_line(char *buffer, const char *label,
+                                 uint64_t number, const char *unit)
+{
+    size_t used = strlen(label);
+    memcpy(buffer, label, used);
+    used += decimal(buffer + used, number);
+    size_t suffix = strlen(unit);
+    memcpy(buffer + used, unit, suffix);
+    return used + suffix;
+}
+
+static int proc_process_snapshot(struct kernel_vfs_node *node,
+                                 struct kernel_heap *heap,
+                                 char **buffer, size_t *length)
+{
+    struct kernel_proc_process_snapshot process;
+    int result = kernel_proc_process_snapshot(proc_inode_pid(node->inode),
+        proc_inode_identity(node->inode), &process);
+    if (result) return result;
+    char *data = 0;
+    enum kernel_heap_status allocation = kernel_heap_allocate(heap, 1024U,
+                                                              (void **)&data);
+    if (allocation != KERNEL_HEAP_STATUS_OK)
+        return allocation == KERNEL_HEAP_STATUS_EMPTY ? -KERNEL_ENOMEM
+                                                      : -KERNEL_EIO;
+    size_t used = 0U;
+    if (proc_inode_kind(node->inode) == PROC_PID_STAT_KIND) {
+        used = decimal(data, (uint32_t)process.pid);
+        data[used++] = ' ';
+        data[used++] = '(';
+        size_t name = strlen(process.comm);
+        memcpy(data + used, process.comm, name);
+        used += name;
+        data[used++] = ')';
+        data[used++] = ' ';
+        data[used++] = process.state;
+        const uint64_t prefix[] = {
+            (uint32_t)process.ppid, (uint32_t)process.process_group,
+            (uint32_t)process.session_id, 0U,
+        };
+        for (size_t i = 0U; i < sizeof(prefix) / sizeof(prefix[0]); i++) {
+            data[used++] = ' ';
+            used += decimal(data + used, prefix[i]);
+        }
+        memcpy(data + used, " -1", 3U);
+        used += 3U;
+        const uint64_t fields[] = {
+            0U, process.minor_faults, process.child_minor_faults,
+            process.major_faults, process.child_major_faults,
+            process.user_ticks, process.kernel_ticks,
+            process.child_user_ticks, process.child_kernel_ticks,
+            20U, 0U, process.threads, 0U, process.start_ticks,
+            process.virtual_bytes, process.resident_pages,
+        };
+        for (size_t i = 0U; i < sizeof(fields) / sizeof(fields[0]); i++) {
+            data[used++] = ' ';
+            used += decimal(data + used, fields[i]);
+        }
+        data[used++] = '\n';
+    } else {
+        static const char name_prefix[] = "Name:\t";
+        memcpy(data, name_prefix, sizeof(name_prefix) - 1U);
+        used = sizeof(name_prefix) - 1U;
+        size_t name = strlen(process.comm);
+        memcpy(data + used, process.comm, name);
+        used += name;
+        data[used++] = '\n';
+        static const char state_prefix[] = "State:\t";
+        memcpy(data + used, state_prefix, sizeof(state_prefix) - 1U);
+        used += sizeof(state_prefix) - 1U;
+        data[used++] = process.state;
+        const char *state_name = process.state == 'R' ? " (running)\n" :
+                                 process.state == 'Z' ? " (zombie)\n" :
+                                 process.state == 'T' ? " (stopped)\n" :
+                                                        " (sleeping)\n";
+        size_t state_length = strlen(state_name);
+        memcpy(data + used, state_name, state_length);
+        used += state_length;
+        used += append_number_line(data + used, "Tgid:\t",
+                                   (uint32_t)process.pid, "\n");
+        used += append_number_line(data + used, "Pid:\t",
+                                   (uint32_t)process.pid, "\n");
+        used += append_number_line(data + used, "PPid:\t",
+                                   (uint32_t)process.ppid, "\n");
+        used += append_number_line(data + used, "Threads:\t",
+                                   process.threads, "\n");
+        used += append_number_line(data + used, "VmSize:\t",
+                                   process.virtual_bytes / 1024U, " kB\n");
+        used += append_number_line(data + used, "VmRSS:\t",
+                                   process.resident_pages *
+                                      (BOAROS_PAGE_SIZE / 1024U), " kB\n");
+        static const char identity[] =
+            "Uid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\n";
+        memcpy(data + used, identity, sizeof(identity) - 1U);
+        used += sizeof(identity) - 1U;
+    }
+    if (used >= 1024U) __builtin_trap();
+    data[used] = '\0';
+    *buffer = data;
+    *length = used;
+    return 0;
+}
+
 static int proc_snapshot(struct kernel_vfs_node *node, struct kernel_heap *heap,
                          char **buffer, size_t *length)
 {
+    if (proc_inode_kind(node->inode) == PROC_PID_STAT_KIND ||
+        proc_inode_kind(node->inode) == PROC_PID_STATUS_KIND)
+        return proc_process_snapshot(node, heap, buffer, length);
     if (proc_inode_kind(node->inode) == PROC_PID_MOUNTS_KIND) {
         uint64_t identity = 0U;
         if (kernel_proc_process_identity(proc_inode_pid(node->inode),
