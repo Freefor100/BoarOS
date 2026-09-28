@@ -39,6 +39,11 @@ child-TID、脚本执行、可配置 PID 1、必要字符节点入口和可重�
 整合收口运行 RISC-V 全套、完整 ABI 差分、真实 userland、glibc 和栈检查；
 涉及 VFS 时追加 ext4、SQLite DELETE/WAL 及相关恢复回归。
 
+2026-09-28 通用代码收口于 `29125b6`：RISC-V 全套、583 条 ABI 差分、
+真实 userland、glibc、栈检查及 PID 1 配置交替重建通过；mknodat 阶段另通过
+VFS/files、lwext4 恢复、SQLite DELETE/WAL 与热日志/确认提交恢复。
+本轮未重跑 228 项清单或逐事件完整恢复矩阵，历史证据不冒充本轮结果。
+
 评测入口与配置可版本化；RV/LA 原始镜像与压缩包长期保存在
 `references/oscomp-autotest/`，只运行 RV。镜像副本、串口、评分 JSON、临时探针不提交。
 正式报告逐项列出 11 组 × 2 libc 的分数、未到达/超时/失败，附内核提交/脏状态、
