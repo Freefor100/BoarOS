@@ -293,7 +293,7 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 
 ### P5b shebang 与 exec 组合
 
-- [ ] 解释器路径、可选参数、argv 重组和 envp 保持，循环/递归深度及 E2BIG/ENOEXEC 等错误按固定 Linux 验收；失败保持旧映像、fd/cwd/身份和可继续执行状态。
+- [x] main 已交付 shebang 的解释器路径、单个可选参数、argv/envp、嵌套与错误边界。固定 Linux 开启 BINFMT_SCRIPT 后先复现四组差异；9 条脚本记录纳入完整 565 条差分，exec、musl、glibc 和栈检查通过。契约见[exec](modules/kernel-exec.md)，根因见[ELF 学习](learning/elf-loading.md#shebang-与-shell-回退2026-09-28)。原镜像 BusyBox 回退由评测环境继续验证。
 - [ ] 保留 PT_PHDR/auxv、段重叠/对齐、文件尾页+BSS、PIE/解释器布局回归；与线程组 exec、信号、CLOEXEC 和文本写互斥组合验证，不在内核代替动态链接器重定位。
 
 ### P5c 随机数与系统环境

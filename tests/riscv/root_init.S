@@ -652,12 +652,13 @@ _start:
     ecall
     li t0, -13
     bne a0, t0, .Lfailure
+    # The script is valid; its /bin/sh interpreter is absent.
     la a0, .Lscript_path
     li a1, 0
     li a2, 0
     li a7, 221
     ecall
-    li t0, -8
+    li t0, -2
     bne a0, t0, .Lfailure
     la a0, .Lstage2_path
     la a1, .Lfault_argv

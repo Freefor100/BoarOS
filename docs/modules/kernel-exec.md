@@ -21,9 +21,10 @@
 清理上次仍有 owner 的事务
 -> 捕获 filename 并解析 cwd
 -> 打开 regular executable OFD
+-> 捕获 argv/envp 内核快照
+-> 按 #! 转换解释器与 argv，最多五次
 -> 建立一次解析的主 ELF source
 -> 若有 PT_INTERP，解析并打开唯一解释器 source
--> 捕获 argv/envp 内核快照
 -> 构造新 MM、source-backed VMA、栈和 auxv
 -> 发布 PREPARED
 ```
@@ -49,7 +50,8 @@ RISC-V 后端固定 Sv39/4 KiB，并支持：
 提交前 scheduler 验证当前 task、新 MM 的 `satp`、入口可执行 VMA/PTE、栈 RW PTE 和 SP 对齐。线程组 exec 先终止其他成员并等待其调用栈与资源清理完成；非组长调用者接管原 TGID 和父子树位置。竞争 exec 的未提交事务由退出路径清理。随后：
 
 ```text
-切换 new satp
+旧 MM 上完成 robust-list、清 TID 并注销活跃 MM 使用者
+-> 切换 new satp
 -> 将 old MM 移入待清理 owner
 -> 安装新 MM 和缓存 satp
 -> 清零并重建 Trap Frame
@@ -69,4 +71,17 @@ make test-glibc-riscv
 make test-riscv
 ```
 
-动态 ET_DYN/解释器的生产构造已经接入；真实 userland runner 已验证动态 musl PIE、解释器、额外 DSO、初始 TLS 和运行中 dlopen TLS。固定 glibc 2.44 的静态、动态、PIE、静态 PIE 与 pthread/TLS/信号组合另由 `test-glibc-riscv` 双侧验证。更广重定位矩阵、多线程 exec、shebang、`execveat`、凭据变化、写入文件的一致性和 LoongArch 后端仍未完成。128 KiB 是当前序列化初始栈镜像限制，不是完整 Linux `ARG_MAX` 策略。
+动态 ET_DYN/解释器的生产构造已经接入；真实 userland runner 已验证动态 musl PIE、解释器、额外 DSO、初始 TLS 和运行中 dlopen TLS。固定 glibc 2.44 的静态、动态、PIE、静态 PIE 与 pthread/TLS/信号组合另由 `test-glibc-riscv` 双侧验证。更广重定位矩阵、`execveat`、凭据变化、写入文件的一致性和 LoongArch 后端仍未完成。128 KiB 是当前序列化初始栈镜像限制，不是完整 Linux `ARG_MAX` 策略。
+
+## 脚本执行
+
+`#!` 首行读取窗口为 256 字节，空格/tab 分隔解释器路径，剩余去尾空格/tab的内容
+作为一个可选参数。没有换行时解释器路径必须完整；允许截断可选参数。
+每次转换删除旧 argv[0]，前置解释器、可选参数和当前脚本路径；保留 envp，
+`AT_EXECFN` 保留最初用户路径。最多五次转换，超过返回 ELOOP；打开解释器保留
+ENOENT/EACCES 等错误，无 shebang 文本仍返回 ENOEXEC，由用户 shell 决定回退。
+
+脚本 OFD 在打开下一解释器前释放，释放失败仍由 exec 事务持有；字符串与向量仍使用
+原有总长度限制，重组时回收被丢弃 argv[0] 的序列化空间。失败不替换 MM、cwd 或 fd。
+聚焦命令为 `make test-diff-abi-riscv test-exec-riscv`；后者的缺失 `/bin/sh`
+fixture 现在验证 ENOENT。BusyBox 的回退与动态加载器搜索必须另用真实 shell 验证。
