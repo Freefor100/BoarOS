@@ -66,6 +66,57 @@ runner 读取固定 Harness `kernel/judge/config.json`。其中 `qemu.timeout=36
 清理。原始 `.img/.img.xz` 在 references，不属于清理范围。通用新缺陷先最小复现，
 回 main 修复并验收，再 merge 回本分支重新构建运行。
 
+## 2026-09-29 单次启动 RV 正式基线
+
+干净的 `f730e70b9fd9d4d4cd1b38bde9ce4ef211e5059a` 合入已验收主线后，以
+`python3 -B tests/oscomp/run.py --output build/oscomp-proc-final-20260929`
+从原 RV 镜像的可丢弃副本启动一次。原解析器、22 个 judge 和 postwork 未改动，
+**RV 投影整数分数为 662**，不是双架构成绩。QEMU 11.1.1 运行 3600.0037 秒后
+达到原配置的 3600 秒总预算；没有逐组重启或拼接诊断成绩。
+
+| 组 | glibc 原分数 | musl 原分数 | 实际范围 |
+|---|---:|---:|---|
+| basic | 0 | 0 | 两侧脚本结束；原 `run-all.sh` 权限阻塞仍在 |
+| busybox | 52 | 52 | 两侧脚本结束；部分子项失败 |
+| cyclictest | 0 | 0 | 两侧脚本结束；调度接口等内部子项失败 |
+| iozone | 0 | 0 | 两侧脚本结束；吞吐子项 `shmget` 仍失败 |
+| iperf | 0 | 0 | 两侧脚本结束；随机设备/daemon 路径仍有缺口 |
+| libcbench | 37.3857471247465 | 30.541587541110484 | 两侧结束并计时 |
+| libctest | 174 | 215 | 两侧原脚本结束，含通过及失败项 |
+| lmbench | 50.6529945999422 | 50.82701976762104 | 两侧结束；旧 `/code/.../lmbench_all` 缺失报错为 0 |
+| ltp | 0 | 0 | glibc 运行到第 107 个案例时超时；musl 未到达 |
+| lua | 0 | 0 | 两侧未到达 |
+| netperf | 0 | 0 | 两侧未到达 |
+
+glibc LTP 中有 53 次 `tst_memutils.c:94` 读取 `/proc/meminfo` 转换失败。
+从原 `sdcard-rv.img` 提取的 `/glibc/ltp/testcases/bin/abort01` SHA-256 为
+`f6b658f4e37b187a10022a3202af1458cbb1344e8edccd075c1312e066ceabb7`；
+其符号 `tst_available_mem` 在固定二进制中先可选读取 `MemAvailable`，失败后
+于源码行 93、94 必需读取 `MemFree`、`Cached`。当前 proc 只提供前者，故
+本次行 94 的直接缺口是 `Cached`；后续应从真实文件页/内存统计定义该字段，
+不能用假零通过检查。`cgroup_fj_function.sh` 另报 `setpgid` 未实现及控制器缺失；
+随后 `cgroup_fj_proc` 无新串口输出直到总预算结束，其等待根因尚未定位。
+这些 LTP 故障不能统称为 procfs 失败，也不说明未到达的组有实现缺陷。
+
+上次 663 分与本次 662 分的离散子项差异是 glibc `libctest static utime`
+由通过变为失败；动态 `utime` 两次都失败。原测试在 `UTIME_NOW` 后要求
+`fstat` 时间不早于 `time(0)`，本次未满足，时间/文件元数据边界待同一 ELF
+最小复现。libcbench/lmbench 浮点分数也有运行波动；一分差异不能直接归于
+本次 proc 改动。两侧 lmbench 完成原脚本，没有旧绝对路径错误，但仍不等于
+全部内部功能正确。
+
+运行身份：内核 SHA-256
+`4b95738eb76c2b1d0577658377667c94233116f0282e48e42db5e4eb25da0a9b`，
+PID 1 配置 `532c958496d1e18bc72623b0eef3905d67b1c7b31a574b25eefb47342034d44a`，
+启动脚本 `1bd689861a5d5125a68038e1218f44e078be8e97bf528975bafbeb8f393440d8`，
+Harness 配置 `082a086816477687be6cd175ae0eee3cbaf466892fc2ff509dfeeff3cebf3813`，
+串口 `d9ec545b0d0ab9a40c7e3b21f07b244a0bab27b4ce6a668c7b4c8a437151604e`。
+原 RV 镜像 SHA-256 为
+`f419468678d342133546add2f8459ea09aeba987ba968e28753d6ee656996b8b`；
+LA 及两份压缩包也由 [inputs.json](../../tests/oscomp/inputs.json) 校验但未运行。
+QEMU 参数、22 项状态、原 judge 明细与启动时空的 Git 脏状态由上述命令的
+`report.json`/`judge.json` 重建；清理后不把旧 `build/` 路径当永久证据。
+
 ## 2026-09-28 proc 挂载限时诊断
 
 在新 proc 挂载配置上先用 `python3 -B tests/oscomp/run.py --output build/oscomp-proc-diagnostic-20260928 --diagnostic-timeout 120` 做**限时诊断**：一次启动在总预算 120 秒处终止，停在 glibc iozone，后续组未到达。原 judge 在本次诊断给 busybox 两侧各 52 项、总整数 104；这不是正式分数。启动脚本成功挂载真实 proc，`ps` 列出进程；原脚本将 df/free 标 success，但 df 只有表头，glibc free 出现溢出的使用量、musl free 全零，内容不能当作正确统计。该次内核 SHA-256 `0bf2dcab32a4bd7d4adf57c99a6d503cfe47593f8f9ffd87f48c937d33b3430f`，脚本 SHA-256 `3b4d48bbadd33596f700b590183bcb992ae28647bbd844e9c7094159cdd2a880`，串口 SHA-256 `a62a42d2144af5380bf281cdbd5d19e7e18ae1219cb05bd06e78021594809047`；运行时脚本和本文尚未提交，报告明示工作区脏状态。正式预算必须在提交后另开一次启动，不能拼接诊断结果。
