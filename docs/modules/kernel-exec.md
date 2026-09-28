@@ -85,3 +85,5 @@ ENOENT/EACCES 等错误，无 shebang 文本仍返回 ENOEXEC，由用户 shell 
 原有总长度限制，重组时回收被丢弃 argv[0] 的序列化空间。失败不替换 MM、cwd 或 fd。
 聚焦命令为 `make test-diff-abi-riscv test-exec-riscv`；后者的缺失 `/bin/sh`
 fixture 现在验证 ENOENT。BusyBox 的回退与动态加载器搜索必须另用真实 shell 验证。
+
+深度检查发生在再次分派格式处理器之前；最后允许的脚本层仍先报告自身的 ENOEXEC 或解释器 ENOENT，不能用 ELOOP 提前掩盖这些错误。差分 `exec.script-five/six/depth-*` 覆盖边界。

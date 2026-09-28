@@ -570,6 +570,10 @@ exec.script-noexec
 exec.script-empty
 exec.text-enoexec
 exec.script-long
+exec.script-five
+exec.script-six
+exec.script-depth-format
+exec.script-depth-missing
 mknod.null
 mknod.exists
 mknod.stat

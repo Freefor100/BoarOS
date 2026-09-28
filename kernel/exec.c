@@ -457,6 +457,11 @@ static enum exec_capture_status expand_scripts(
     char header[256], next_path[256];
     const char *script_path = transaction->original_path;
     for (unsigned depth = 0;; depth++) {
+        /* 最后一次 handler 仍可返回格式/路径错误；仅在再次分派前拒绝。 */
+        if (depth > 5) {
+            *error = -KERNEL_ELOOP;
+            return EXEC_CAPTURE_LINUX_ERROR;
+        }
         size_t read = 0;
         memset(header, 0, sizeof(header));
         if (kernel_open_file_pread(transaction->executable_file, 0, header,
@@ -465,10 +470,6 @@ static enum exec_capture_status expand_scripts(
             return EXEC_CAPTURE_LINUX_ERROR;
         }
         if (header[0] != '#' || header[1] != '!') return EXEC_CAPTURE_OK;
-        if (depth >= 5) {
-            *error = -KERNEL_ELOOP;
-            return EXEC_CAPTURE_LINUX_ERROR;
-        }
         size_t end = 0;
         while (end < sizeof(header) && header[end] != '\n') end++;
         if (end == sizeof(header)) {

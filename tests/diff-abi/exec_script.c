@@ -54,4 +54,25 @@ void abi_script_cases(void)
         const char *argv[] = {paths[i], 0};
         abi_record(ids[i], SC3(221, paths[i], argv, env), -1, -1, 0, 0, 0);
     }
+    for (int i = 1; i <= 4; i++) {
+        char path[] = "/depth1", text[] = "#!/depth2\n";
+        path[6] = '0' + i; text[8] = '1' + i;
+        put(path, text, 0755);
+    }
+    put("/depth5", "#!/init identity-exec-probe\n", 0755);
+    const char *argv[] = {"/depth1", 0};
+    long child = SC5(220, 17, 0, 0, 0, 0);
+    abi_require(child >= 0);
+    if (!child) { SC3(221, argv[0], argv, env); abi_exit(91); }
+    int status;
+    abi_require(SC4(260, child, &status, 0, 0) == child);
+    abi_record("exec.script-five", 0, -1, -1, status, 0, 0);
+    put("/depth5", "#!/depth6\n", 0755);
+    const char *last[] = {"#!/init identity-exec-probe\n", "#! \n", "#!/absent-depth\n"};
+    const char *depth_ids[] = {"exec.script-six", "exec.script-depth-format", "exec.script-depth-missing"};
+    for (int i = 0; i < 3; i++) {
+        put("/depth6", last[i], 0755);
+        abi_record(depth_ids[i], SC3(221, argv[0], argv, env), -1, -1, 0, 0, 0);
+    }
+
 }
