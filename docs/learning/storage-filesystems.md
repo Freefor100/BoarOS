@@ -67,7 +67,14 @@ BoarOS 返回 `ENOENT/ENOTDIR`。VFS 的普通符号链接按文本重查不能�
 单调代次编进 inode，避免旧路径在 PID 复用后转向新任务。MM 明确持有
 主 ELF OFD，动态解释器不能覆盖它，fork 与末次清理遵守原 source owner
 顺序。`tests/diff-abi/proc.c` 的 self/exe/cwd/root 和 uptime 形态与固定
-Linux 一致，当前总计 614 条；fd、进程文本和挂载列表仍待后续阶段验证。
+Linux 一致，当时总计 614 条；fd、进程文本和挂载列表尚待后续阶段验证。
+
+挂载列表的固定依据是 `references/linux/fs/proc_namespace.c::show_vfsmnt()`
+（`f4cdf7ca9a1fdcca413157df19753f388a5a224e`）。旧 BoarOS 的
+`/proc/mounts` 链接和 `/proc/self/mounts` 均为 `ENOENT`；加入从当前共享挂载
+树取得的实例、挂载点和只读状态后，固定 Linux 的链接文本、打开与 proc 行
+形态三项差分通过，总计 617 条。先钉住挂载根和覆盖路径，再脱离短关中断区
+构造文本，避免格式化或分配阻塞挂载操作，也防止并发卸载释放快照对象。
 
 字符设备层采用 `st_rdev` 到内建 read/write/poll 操作的登记表，而不是在路径
 或每个 I/O 调用中重复识别设备名。`/dev` 仍可由 ext4 提供目录项；OFD 钉住

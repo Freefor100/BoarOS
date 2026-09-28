@@ -66,6 +66,35 @@ void abi_proc_cases(void)
                         object_link, sizeof(object_link));
     abi_record("proc.root-link", object_length, -1, -1, 0,
                object_link, object_length > 0 ? (usize)object_length : 0);
+    char mounts_link[32] = {0};
+    long mounts_length = SC4(78, -100, "/proc-probe/mounts",
+                             mounts_link, sizeof(mounts_link));
+    abi_record("proc.mounts-link", mounts_length, -1, -1, 0,
+               mounts_link, mounts_length > 0 ? (usize)mounts_length : 0);
+    long mounts_fd = abi_open("/proc-probe/self/mounts", 0);
+    abi_record("proc.mounts-open", mounts_fd < 0 ? mounts_fd : 0,
+               -1, -1, 0, 0, 0);
+    int has_proc = 0;
+    if (mounts_fd >= 0) {
+        char mounts[4096];
+        long got = SC3(63, mounts_fd, mounts, sizeof(mounts) - 1U);
+        if (got > 0 && got < (long)sizeof(mounts)) {
+            mounts[got] = '\0';
+            const char *needle = " /proc-probe proc ";
+            for (long i = 0; i + 18 <= got; i++) {
+                int equal = 1;
+                for (long j = 0; j < 18; j++)
+                    if (mounts[i + j] != needle[j]) equal = 0;
+                if (equal) {
+                    has_proc = 1;
+                    break;
+                }
+            }
+        }
+        abi_require(SC1(57, mounts_fd) == 0);
+    }
+    abi_record("proc.mounts-has-proc", has_proc ? 0 : -1,
+               -1, -1, 0, 0, 0);
     if (fd >= 0) {
         char header[9] = {0};
         abi_record("proc.meminfo-read", SC3(63, fd, header, sizeof(header)),

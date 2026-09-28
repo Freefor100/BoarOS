@@ -603,6 +603,9 @@ proc.exe-open
 proc.exe-magic
 proc.cwd-link
 proc.root-link
+proc.mounts-link
+proc.mounts-open
+proc.mounts-has-proc
 proc.meminfo-read
 proc.meminfo-rewind
 proc.meminfo-readv

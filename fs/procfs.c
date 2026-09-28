@@ -21,10 +21,12 @@
 #define PROC_MEMINFO_INODE UINT64_C(2)
 #define PROC_UPTIME_INODE UINT64_C(3)
 #define PROC_SELF_INODE UINT64_C(4)
+#define PROC_MOUNTS_INODE UINT64_C(5)
 #define PROC_PID_DIR_KIND 1U
 #define PROC_PID_EXE_KIND 2U
 #define PROC_PID_CWD_KIND 3U
 #define PROC_PID_ROOT_KIND 4U
+#define PROC_PID_MOUNTS_KIND 5U
 #define PROC_SUPER_MAGIC UINT64_C(0x9fa0)
 
 struct procfs_mount {
@@ -93,9 +95,13 @@ static int proc_lookup(struct kernel_vfs_instance *instance, uint64_t parent,
             kind = PROC_PID_CWD_KIND;
         else if (length == 4U && !memcmp(name, "root", length))
             kind = PROC_PID_ROOT_KIND;
+        else if (length == 6U && !memcmp(name, "mounts", length))
+            kind = PROC_PID_MOUNTS_KIND;
         else return -KERNEL_ENOENT;
         *inode = proc_pid_inode(pid, identity, kind);
-        *mode = KERNEL_VFS_S_IFLNK | 0777U;
+        *mode = kind == PROC_PID_MOUNTS_KIND
+                    ? KERNEL_VFS_S_IFREG | 0444U
+                    : KERNEL_VFS_S_IFLNK | 0777U;
         return 0;
     }
     if (length == 7U && !memcmp(name, "meminfo", length)) {
@@ -110,6 +116,11 @@ static int proc_lookup(struct kernel_vfs_instance *instance, uint64_t parent,
     }
     if (length == 4U && !memcmp(name, "self", length)) {
         *inode = PROC_SELF_INODE;
+        *mode = KERNEL_VFS_S_IFLNK | 0777U;
+        return 0;
+    }
+    if (length == 6U && !memcmp(name, "mounts", length)) {
+        *inode = PROC_MOUNTS_INODE;
         *mode = KERNEL_VFS_S_IFLNK | 0777U;
         return 0;
     }
@@ -144,18 +155,22 @@ static int proc_open(struct kernel_vfs_mount *mount, const char *path,
     (void)path;
     if ((inode != PROC_ROOT_INODE && inode != PROC_MEMINFO_INODE &&
          inode != PROC_UPTIME_INODE && inode != PROC_SELF_INODE &&
+         inode != PROC_MOUNTS_INODE &&
          (proc_inode_kind(inode) != PROC_PID_DIR_KIND &&
           proc_inode_kind(inode) != PROC_PID_EXE_KIND &&
           proc_inode_kind(inode) != PROC_PID_CWD_KIND &&
-          proc_inode_kind(inode) != PROC_PID_ROOT_KIND)) ||
+          proc_inode_kind(inode) != PROC_PID_ROOT_KIND &&
+          proc_inode_kind(inode) != PROC_PID_MOUNTS_KIND)) ||
         (inode == PROC_ROOT_INODE &&
          (mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFDIR) ||
-        (inode == PROC_SELF_INODE &&
+        ((inode == PROC_SELF_INODE || inode == PROC_MOUNTS_INODE) &&
          (mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFLNK) ||
         (inode >= (UINT64_C(1) << 24U) &&
          (mode & KERNEL_VFS_S_IFMT) !=
             (proc_inode_kind(inode) == PROC_PID_DIR_KIND
-                ? KERNEL_VFS_S_IFDIR : KERNEL_VFS_S_IFLNK)) ||
+                ? KERNEL_VFS_S_IFDIR :
+             proc_inode_kind(inode) == PROC_PID_MOUNTS_KIND
+                ? KERNEL_VFS_S_IFREG : KERNEL_VFS_S_IFLNK)) ||
         ((inode == PROC_MEMINFO_INODE || inode == PROC_UPTIME_INODE) &&
          (mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFREG))
         return -KERNEL_EINVAL;
@@ -219,11 +234,12 @@ static int proc_dir_entry(struct kernel_vfs_file *file, uint64_t position,
         if (kernel_proc_process_identity(proc_inode_pid(directory),
                                          &identity) ||
             identity != proc_inode_identity(directory)) return -KERNEL_ENOENT;
-        if (position > 4U) return -KERNEL_ENOENT;
+        if (position > 5U) return -KERNEL_ENOENT;
         const char *entry = position == 0U ? "." :
                             position == 1U ? ".." :
                             position == 2U ? "exe" :
-                            position == 3U ? "cwd" : "root";
+                            position == 3U ? "cwd" :
+                            position == 4U ? "root" : "mounts";
         if (name_size < strlen(entry) + 1U) return -KERNEL_ERANGE;
         strcpy(name, entry);
         *next_position = position + 1U;
@@ -232,8 +248,9 @@ static int proc_dir_entry(struct kernel_vfs_file *file, uint64_t position,
                  proc_pid_inode(proc_inode_pid(directory), identity,
                      position == 2U ? PROC_PID_EXE_KIND :
                      position == 3U ? PROC_PID_CWD_KIND :
-                                      PROC_PID_ROOT_KIND);
-        *type = position < 2U ? 4U : 10U;
+                     position == 4U ? PROC_PID_ROOT_KIND :
+                                      PROC_PID_MOUNTS_KIND);
+        *type = position < 2U ? 4U : position == 5U ? 8U : 10U;
         return 0;
     }
     const char *entry_name;
@@ -242,16 +259,17 @@ static int proc_dir_entry(struct kernel_vfs_file *file, uint64_t position,
     else if (position == 2U) entry_name = "meminfo";
     else if (position == 3U) entry_name = "uptime";
     else if (position == 4U) entry_name = "self";
-    else if (position >= 5U) {
+    else if (position == 5U) entry_name = "mounts";
+    else if (position >= 6U) {
         kernel_pid_t pid;
         uint64_t identity;
-        if (position - 5U >= INT32_MAX ||
-            kernel_proc_next_process((kernel_pid_t)(position - 5U),
+        if (position - 6U >= INT32_MAX ||
+            kernel_proc_next_process((kernel_pid_t)(position - 6U),
                                       &pid, &identity)) return -KERNEL_ENOENT;
         size_t length = decimal(name, (uint32_t)pid);
         if (name_size <= length) return -KERNEL_ERANGE;
         name[length] = '\0';
-        *next_position = 5U + (uint32_t)pid;
+        *next_position = 6U + (uint32_t)pid;
         *inode = proc_pid_inode(pid, identity, PROC_PID_DIR_KIND);
         *type = 4U;
         return 0;
@@ -262,8 +280,10 @@ static int proc_dir_entry(struct kernel_vfs_file *file, uint64_t position,
     *next_position = position + 1U;
     *inode = position == 2U ? PROC_MEMINFO_INODE :
              position == 3U ? PROC_UPTIME_INODE :
-             position == 4U ? PROC_SELF_INODE : PROC_ROOT_INODE;
-    *type = position == 4U ? 10U : position >= 2U ? 8U : 4U;
+             position == 4U ? PROC_SELF_INODE :
+             position == 5U ? PROC_MOUNTS_INODE : PROC_ROOT_INODE;
+    *type = position == 4U || position == 5U ? 10U :
+            position >= 2U ? 8U : 4U;
     return 0;
 }
 
@@ -279,6 +299,14 @@ static int proc_readlink(struct kernel_vfs_node *node, char *buffer,
         size_t length = decimal(digits, (uint32_t)tgid);
         if (length > size) length = size;
         memcpy(buffer, digits, length);
+        *count = length;
+        return 0;
+    }
+    if (node->inode == PROC_MOUNTS_INODE) {
+        static const char target[] = "self/mounts";
+        size_t length = sizeof(target) - 1U;
+        if (length > size) length = size;
+        memcpy(buffer, target, length);
         *count = length;
         return 0;
     }
@@ -324,7 +352,8 @@ Finish:
 static int proc_follow_link(struct kernel_vfs_node *node,
                             struct kernel_vfs_path **owner)
 {
-    if (node->inode == PROC_SELF_INODE) return -KERNEL_ENOTSUP;
+    if (node->inode == PROC_SELF_INODE ||
+        node->inode == PROC_MOUNTS_INODE) return -KERNEL_ENOTSUP;
     uint8_t kind = proc_inode_kind(node->inode);
     enum kernel_proc_path_kind path_kind = kind == PROC_PID_EXE_KIND
         ? KERNEL_PROC_PATH_EXE : kind == PROC_PID_CWD_KIND
@@ -365,9 +394,180 @@ static size_t append_hundredths(char *buffer, uint64_t value)
     return length;
 }
 
+struct proc_mount_entry {
+    struct kernel_vfs_path *path;
+    struct kernel_vfs_path *mount_root;
+    uint8_t is_proc;
+    uint8_t read_only;
+};
+
+static struct kernel_vfs_mount *next_mount(struct kernel_vfs_mount *mount,
+                                           struct kernel_vfs_mount *top)
+{
+    if (mount->first_child) return mount->first_child;
+    while (mount != top) {
+        if (mount->next_sibling) return mount->next_sibling;
+        mount = mount->parent;
+    }
+    return 0;
+}
+
+static void release_mount_entries(struct kernel_heap *heap,
+                                   struct proc_mount_entry **owner,
+                                   size_t count)
+{
+    if (!*owner) return;
+    for (size_t i = 0U; i < count; i++) {
+        if ((*owner)[i].path && kernel_vfs_path_release(&(*owner)[i].path))
+            __builtin_trap();
+        if ((*owner)[i].mount_root &&
+            kernel_vfs_path_release(&(*owner)[i].mount_root))
+            __builtin_trap();
+    }
+    if (kernel_heap_release(heap, *owner) != KERNEL_HEAP_STATUS_OK)
+        __builtin_trap();
+    *owner = 0;
+}
+
+static size_t append_escaped(char *buffer, const char *source)
+{
+    size_t used = 0U;
+    for (; *source; source++) {
+        unsigned char c = (unsigned char)*source;
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\\' || c == '#') {
+            buffer[used++] = '\\';
+            buffer[used++] = (char)('0' + ((c >> 6U) & 7U));
+            buffer[used++] = (char)('0' + ((c >> 3U) & 7U));
+            buffer[used++] = (char)('0' + (c & 7U));
+        } else buffer[used++] = (char)c;
+    }
+    return used;
+}
+
+static int proc_mounts_snapshot(struct kernel_vfs_node *node,
+                                struct kernel_heap *heap,
+                                char **buffer, size_t *length)
+{
+    const struct kernel_fs_context *fs = 0;
+    if (kernel_task_fs_context_borrow(kernel_task_current(), &fs) !=
+        KERNEL_TASK_STATUS_OK) return -KERNEL_ENOENT;
+    struct kernel_vfs_path *root_path = kernel_fs_context_root(fs);
+    if (!root_path) return -KERNEL_ENOENT;
+    struct kernel_vfs_mount *top = node->mount;
+    while (top->parent) top = top->parent;
+    struct proc_mount_entry *entries = 0;
+    size_t captured = 0U;
+    int result = -KERNEL_EAGAIN;
+    for (unsigned attempt = 0U; attempt < 3U; attempt++) {
+        size_t count = 0U;
+        uintptr_t irq = riscv_interrupt_save();
+        for (struct kernel_vfs_mount *it = top; it;
+             it = next_mount(it, top)) count++;
+        riscv_interrupt_restore(irq);
+        if (!count || count > SIZE_MAX / sizeof(*entries) ||
+            count > SIZE_MAX / (4U * KERNEL_FS_PATH_MAX + 80U))
+            return -KERNEL_EOVERFLOW;
+        enum kernel_heap_status allocation = kernel_heap_allocate_zeroed(
+            heap, count, sizeof(*entries), (void **)&entries);
+        if (allocation != KERNEL_HEAP_STATUS_OK)
+            return allocation == KERNEL_HEAP_STATUS_EMPTY ? -KERNEL_ENOMEM
+                                                          : -KERNEL_EIO;
+        irq = riscv_interrupt_save();
+        int changed = 0;
+        for (struct kernel_vfs_mount *it = top; it;
+             it = next_mount(it, top)) {
+            if (captured == count) { changed = 1; break; }
+            struct kernel_vfs_path *path = it == top ? root_path
+                                                     : it->covered_path;
+            struct kernel_vfs_path *mount_root = it == top ? root_path
+                                                           : it->root_path;
+            if (!path || !mount_root || kernel_vfs_path_acquire(path)) {
+                changed = 1;
+                break;
+            }
+            if (kernel_vfs_path_acquire(mount_root)) {
+                (void)kernel_vfs_path_release(&path);
+                changed = 1;
+                break;
+            }
+            entries[captured].path = path;
+            entries[captured].mount_root = mount_root;
+            entries[captured].is_proc = kernel_procfs_is_mount(it);
+            entries[captured].read_only =
+                ((struct kernel_vfs_instance *)it->private_data)->read_only;
+            captured++;
+        }
+        riscv_interrupt_restore(irq);
+        if (!changed) break;
+        release_mount_entries(heap, &entries, captured);
+        captured = 0U;
+        if (attempt == 2U) return result;
+    }
+    size_t capacity = captured * (4U * KERNEL_FS_PATH_MAX + 80U);
+    char *data = 0, *path_text = 0;
+    enum kernel_heap_status allocation = kernel_heap_allocate(heap, capacity,
+                                                              (void **)&data);
+    if (allocation != KERNEL_HEAP_STATUS_OK) {
+        result = allocation == KERNEL_HEAP_STATUS_EMPTY ? -KERNEL_ENOMEM
+                                                        : -KERNEL_EIO;
+        goto Finish;
+    }
+    allocation = kernel_heap_allocate(heap, KERNEL_FS_PATH_MAX,
+                                       (void **)&path_text);
+    if (allocation != KERNEL_HEAP_STATUS_OK) {
+        result = allocation == KERNEL_HEAP_STATUS_EMPTY ? -KERNEL_ENOMEM
+                                                        : -KERNEL_EIO;
+        goto Finish;
+    }
+    size_t used = 0U;
+    for (size_t i = 0U; i < captured; i++) {
+        result = kernel_vfs_path_string(entries[i].path, root_path,
+                                        path_text, KERNEL_FS_PATH_MAX);
+        if (result == -KERNEL_ENOENT) { result = 0; continue; }
+        if (result) goto Finish;
+        const char *source = entries[i].is_proc ? "proc" : "rootfs";
+        const char *kind = entries[i].is_proc ? "proc" : "ext4";
+        size_t needed = strlen(source) + 1U + 4U * strlen(path_text) +
+                        1U + strlen(kind) + 9U;
+        if (needed > capacity - used) { result = -KERNEL_EOVERFLOW; goto Finish; }
+        size_t part = strlen(source);
+        memcpy(data + used, source, part);
+        used += part;
+        data[used++] = ' ';
+        used += append_escaped(data + used, path_text);
+        data[used++] = ' ';
+        part = strlen(kind);
+        memcpy(data + used, kind, part);
+        used += part;
+        const char *suffix = entries[i].read_only ? " ro 0 0\n" :
+                                                    " rw 0 0\n";
+        memcpy(data + used, suffix, 8U);
+        used += 8U;
+    }
+    data[used] = '\0';
+    *buffer = data;
+    *length = used;
+    data = 0;
+    result = 0;
+Finish:
+    if (path_text && kernel_heap_release(heap, path_text) !=
+                         KERNEL_HEAP_STATUS_OK) __builtin_trap();
+    if (data && kernel_heap_release(heap, data) != KERNEL_HEAP_STATUS_OK)
+        __builtin_trap();
+    release_mount_entries(heap, &entries, captured);
+    return result;
+}
+
 static int proc_snapshot(struct kernel_vfs_node *node, struct kernel_heap *heap,
                          char **buffer, size_t *length)
 {
+    if (proc_inode_kind(node->inode) == PROC_PID_MOUNTS_KIND) {
+        uint64_t identity = 0U;
+        if (kernel_proc_process_identity(proc_inode_pid(node->inode),
+                                         &identity) ||
+            identity != proc_inode_identity(node->inode)) return -KERNEL_ENOENT;
+        return proc_mounts_snapshot(node, heap, buffer, length);
+    }
     if (node->inode != PROC_MEMINFO_INODE &&
         node->inode != PROC_UPTIME_INODE) return -KERNEL_EINVAL;
     char *data = 0;
