@@ -2257,6 +2257,51 @@ static int vfs_rmdir_raw(struct kernel_vfs_mount *mount,
     return 0;
 }
 
+int kernel_vfs_mknod_at(struct kernel_vfs_path *start,
+                        struct kernel_vfs_path *root, const char *input,
+                        uint32_t mode, uint32_t device)
+{
+    if (!start || !start->file.mount || !start->file.mount->private_data)
+        return -KERNEL_EINVAL;
+    uint32_t type = mode & KERNEL_VFS_S_IFMT;
+    if (type == KERNEL_VFS_S_IFDIR) return -KERNEL_EPERM;
+    if (type == 0060000U || type == KERNEL_VFS_S_IFIFO || type == KERNEL_VFS_S_IFSOCK)
+        return -KERNEL_ENOTSUP;
+    if (type != 0 && type != KERNEL_VFS_S_IFREG && type != KERNEL_VFS_S_IFCHR)
+        return -KERNEL_EINVAL;
+    if (!type) type = KERNEL_VFS_S_IFREG;
+    KERNEL_LOCK_SCOPE(namespace_guard);
+    kernel_vfs_namespace_lock(start->file.mount, &namespace_guard);
+    if (kernel_vfs_mount_is_readonly(start->file.mount)) return -KERNEL_EROFS;
+    struct kernel_vfs_path *path = 0;
+    char name[256] = {0}, *backend = 0;
+    int result = mutation_path(start, root, input, 0, 1, 0, 2,
+                                &path, name, &backend);
+    if (result) return result;
+    if (!name[0]) {
+        result = -KERNEL_EEXIST;
+    } else {
+        int status = ext4_transaction_begin(LWEXT4_MOUNT_POINT);
+        if (status == EOK) {
+            if (type == KERNEL_VFS_S_IFCHR) {
+                status = ext4_mknod(backend, EXT4_DE_CHRDEV, device);
+            } else {
+                ext4_file file;
+                status = ext4_fopen2(&file, backend, O_CREAT | O_EXCL | O_RDWR);
+                if (status == EOK) status = ext4_fclose(&file);
+            }
+            if (status == EOK) status = ext4_mode_set(backend, type | (mode & 07777U));
+            /* 创建与 mode 同属一个写事务；失败由 mount 的日志 owner 接管。 */
+            if (status == EOK) status = ext4_transaction_end(LWEXT4_MOUNT_POINT);
+            else (void)ext4_transaction_abort(LWEXT4_MOUNT_POINT, status);
+        }
+        result = lwext4_error(status);
+    }
+    (void)kernel_vfs_path_release(&path);
+    release_path(start->heap, backend);
+    return result;
+}
+
 int kernel_vfs_mkdir_at(struct kernel_vfs_path *start,
                         struct kernel_vfs_path *root, const char *input,
                         uint32_t mode)

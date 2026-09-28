@@ -210,6 +210,15 @@ enum kernel_files_status kernel_files_mkdirat(
     uint64_t user_path,
     uint32_t mode,
     int64_t *linux_result);
+enum kernel_files_status kernel_files_mknodat(
+    struct kernel_files *files,
+    const struct kernel_fs_context *fs,
+    struct kernel_mm *mm,
+    int64_t dirfd,
+    uint64_t user_path,
+    uint32_t mode,
+    uint32_t device,
+    int64_t *linux_result);
 
 enum kernel_files_status kernel_files_unlinkat(
     struct kernel_files *files,

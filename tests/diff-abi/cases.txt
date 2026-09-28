@@ -570,3 +570,15 @@ exec.script-noexec
 exec.script-empty
 exec.text-enoexec
 exec.script-long
+mknod.null
+mknod.exists
+mknod.stat
+mknod.null-write
+mknod.zero-dirfd
+mknod.zero-read
+mknod.regular
+mknod.directory
+mknod.invalid-type
+mknod.bad-pointer
+mknod.missing-parent
+mknod.bad-dirfd

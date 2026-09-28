@@ -17,7 +17,7 @@ BoarOS 是从零搭建、面向 OS Comp 能力建设的 C / 少量汇编内核�
 | ELF / exec | shebang、按需 ELF、PIE、`PT_INTERP`、初始栈/auxv、musl DSO/TLS、固定 glibc 2.44 启动/TLS/pthread 子集、失败保持旧映像 | 无 `execveat`、`getrandom`；glibc 应用覆盖尚有限 |
 | 进程与等待 | fork/vfork、child-TID 生命周期差分、pthread clone、线程组退出、非组长 exec、wait/zombie/reparent、FIFO 抢占、时钟与睡眠 | 合法 clone 组合仍有限；无完整会话/TTY；单 hart 关中断不等于跨核同步 |
 | futex / 信号 | WAIT/WAKE/REQUEUE、超时/重启、跨 MM 共享匿名 futex、同 MM 非 PI robust-list 退出清理、标准信号、用户 handler、`rt_sigtimedwait` | 无共享文件 futex、PI futex、实时信号队列和 `sigaltstack`；单 hart 验证范围 |
-| 文件与事件 | fd/OFD 分离、dup/CLOEXEC、共享 offset、阻塞 pin、部分/向量/定位 I/O、pipe、poll/select/epoll；传统与 OFD 记录锁；socket OFD 与读写/就绪；ext4 节点按设备号接入 null、zero、console | 无 devfs、完整 TTY；设备 mmap 未支持 |
+| 文件与事件 | fd/OFD 分离、dup/CLOEXEC、共享 offset、阻塞 pin、部分/向量/定位 I/O、pipe、poll/select/epoll；传统与 OFD 记录锁；socket OFD 与读写/就绪；mknodat 字符节点按设备号接入 null、zero、console | 无 devfs、完整 TTY；设备 mmap 未支持 |
 | 路径与 ext4 | 共享活目录项、cwd/dirfd、普通/NOREPLACE rename、可写/只读根盘、符号链接、目录枚举、稀疏文件、显式纳秒时间、真实文件系统统计、打开后删除、私有映射截断 | 无硬链接、EXCHANGE/WHITEOUT、多挂载或完整权限 |
 | 缓存与存储 | read/write/private fault 共用文件页、inode 脏范围与定向写回、OFD 错误观察、`fsync/fdatasync/O_SYNC/O_DSYNC`；VirtIO legacy/modern IRQ、8 请求队列与 flush 屏障 | ordered journal/replay、持久 orphan；恢复承诺限于已验证块模型，无后台写回线程 |
 | 身份与资源 | 单用户 root 的 UID/GID 查询；线程组共享并执行 NOFILE/STACK，fork 继承、exec 保留 | 无凭据变更/完整权限；fd 硬容量 1024、栈硬容量 8 MiB；其他有效 limit 返回 `ENOTSUP` |
@@ -33,7 +33,7 @@ BoarOS 是从零搭建、面向 OS Comp 能力建设的 C / 少量汇编内核�
 
 2026-09-28 最近一次固定 BusyBox/libc-test 全量验证（输入与身份见[程序清单](docs/learning/user-program-inventory.md)）：228 个顶层案例全部完成，227 项双侧通过，仅 `busybox.official` 包装脚本失败；原 socket 静态/动态直接入口和 libc 官方静态/动态脚本均已转绿，既有 227 个通过项没有回退。BusyBox 原脚本为 51/55 success，仍缺 df、dmesg、free、hwclock；另有独立 pwd/cd/mv/touch 组合双侧通过。包装脚本与 entry 有重叠，清单完成不等于全部兼容。
 
-网络切片及大包/跨页 fault、TCP 规模验证累计 118 条 socket 差分通过，child-TID 与脚本补强后完整差分为 565/565；最新整合结果见[单核规模回归](docs/learning/single-hart-scale.md)。UDP read/readv 按用户容量接收完整报文，文件/TCP 使用请求页级缓冲。网络对象、池界限与尚未覆盖的接口见[网络模块](docs/modules/kernel-network.md)。
+网络切片及大包/跨页 fault、TCP 规模验证累计 118 条 socket 差分通过，child-TID、脚本和节点创建补强后完整差分为 577/577；最新整合结果见[单核规模回归](docs/learning/single-hart-scale.md)。UDP read/readv 按用户容量接收完整报文，文件/TCP 使用请求页级缓冲。网络对象、池界限与尚未覆盖的接口见[网络模块](docs/modules/kernel-network.md)。
 
 ## 构建与验证
 
