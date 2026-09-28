@@ -56,7 +56,7 @@ struct test_utsname {
 static const struct test_utsname expected_utsname = {
     .sysname = "Linux",
     .nodename = "boaros",
-    .release = "0.1.0-boaros-dev",
+    .release = "4.15.0",
     .version = "#1 BoarOS",
     .machine = "riscv64",
     .domainname = "(none)",

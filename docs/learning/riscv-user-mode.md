@@ -64,7 +64,7 @@ BoarOS 当前逐基页调用 `kernel_mm_lookup()`，按复制方向检查 `USER|
 
 软件遍历是当前正确性路径，不是 syscall ABI 的组成部分。公共 uaccess 接口只表达 MM、用户地址、内核缓冲区、长度和已复制前缀；将来可以在 RISC-V 内部为当前活动 MM 增加 SUM+异常表快路径，在 LoongArch 使用其架构机制，而 `uname`、VFS 和错误码语义保持不变。SMP、COW 或运行期 unmap 出现后，还必须用 MM 读锁或页固定保证“查到映射”和“完成复制”之间的物理页生命周期。
 
-`uname.sysname` 报告 `Linux`，表示内核选择 Linux 用户 ABI personality，不表示内部实现来自 Linux 源码。`release` 是操作系统自身的发行标识，不是 syscall、文件系统或并发能力的位图；但现实程序可能把它当成内核能力的近似信号，所以借用一个尚未达到的 Linux 版本会误导用户态兼容路径。BoarOS 当前报告自身开发版本 `0.1.0-boaros-dev`，以后随项目发布状态升级；Linux ABI 兼容程度由明确的行为测试和兼容性矩阵表达，不由 release 字符串代替。机器字段由架构构建选择为 `riscv64`，以后 LoongArch 使用 `loongarch64`。这些字符串与 390 字节结构布局都属于用户可观察 ABI；主机名和 UTS namespace 可在以后改成受锁保护的动态快照。
+`uname.sysname` 报告 `Linux`，表示内核选择 Linux 用户 ABI personality，不表示内部实现来自 Linux 源码。旧 glibc 静态程序会在进入 main 前按 `release` 字段检查最低内核版本；为运行要求 Linux 4.15.0 的程序，BoarOS 当前报告 `4.15.0`。该字段只是兼容性选择，不证明 BoarOS 实现了 Linux 4.15 的全部 syscall、文件系统或并发语义；实际能力仍以行为测试和兼容性矩阵为准。机器字段由架构构建选择为 `riscv64`，以后 LoongArch 使用 `loongarch64`。这些字符串与 390 字节结构布局都属于用户可观察 ABI；主机名和 UTS namespace 可在以后改成受锁保护的动态快照。
 
 ## 用户故障与内核故障必须分开
 
