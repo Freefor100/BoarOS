@@ -19,11 +19,28 @@
 #define KERNEL_VFS_S_IXGRP UINT32_C(0000010)
 #define KERNEL_VFS_S_IXOTH UINT32_C(0000001)
 
+struct kernel_vfs_path;
+struct kernel_open_file_description;
 struct kernel_vfs_mount {
     void *private_data;
     uint64_t id;
     uint32_t state;
+    /* Attached mounts own a root path and the covered path in their parent. */
+    struct kernel_vfs_path *root_path;
+    struct kernel_vfs_path *covered_path;
+    struct kernel_vfs_mount *parent;
+    struct kernel_vfs_mount *first_child;
+    struct kernel_vfs_mount *next_sibling;
+    struct kernel_vfs_mount *previous_sibling;
+    uint32_t child_mounts;
 };
+
+/* Attachment transfers owned root/covered-path references to the tree.
+ * Detach accepts the single caller-owned root used to name the mount. */
+int kernel_vfs_mount_attach(struct kernel_vfs_mount *mount,
+                            struct kernel_vfs_path *covered);
+int kernel_vfs_mount_detach(struct kernel_vfs_mount *mount,
+                            const struct kernel_vfs_path *named_root);
 
 struct kernel_vfs_timespec {
     int64_t seconds;
@@ -98,9 +115,18 @@ int kernel_vfs_path_open(struct kernel_vfs_path *path,
 int kernel_vfs_path_string(const struct kernel_vfs_path *path,
                            const struct kernel_vfs_path *root,
                            char *buffer, size_t capacity);
+int kernel_vfs_path_link_string(const struct kernel_vfs_path *path,
+                                const struct kernel_vfs_path *root,
+                                char *buffer, size_t capacity);
+/* Borrowed last component; caller keeps the path reference. */
+const char *kernel_vfs_path_name(const struct kernel_vfs_path *path);
 int kernel_vfs_open_at(struct kernel_vfs_path *start,
                        struct kernel_vfs_path *root, const char *path,
                        int follow_final, struct kernel_vfs_file *file);
+/* Only special final links handle this; ENOTSUP means ordinary resolution. */
+int kernel_vfs_reopen_link_at(struct kernel_vfs_path *start,
+    struct kernel_vfs_path *root, const char *path, struct kernel_heap *heap,
+    uint32_t flags, struct kernel_open_file_description **owner);
 int kernel_vfs_create_at(struct kernel_vfs_path *start,
                          struct kernel_vfs_path *root, const char *path,
                          uint32_t mode, struct kernel_vfs_file *file);
@@ -237,7 +263,7 @@ int kernel_vfs_stat_path(struct kernel_vfs_mount *mount,
                          struct kernel_vfs_stat *stat);
 
 /* Underlying ext4 inode number; zero when unavailable. */
-uint32_t kernel_vfs_file_inode(const struct kernel_vfs_file *file);
+uint64_t kernel_vfs_file_inode(const struct kernel_vfs_file *file);
 
 /* Returns the current file size in bytes from the live VFS node. */
 uint64_t kernel_vfs_file_size(const struct kernel_vfs_file *file);

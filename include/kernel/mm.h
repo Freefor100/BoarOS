@@ -7,6 +7,7 @@
 #include <stdint.h>
 
 struct kernel_open_file_description;
+struct kernel_vfs_path;
 struct kernel_elf64_source;
 
 #define KERNEL_MM_READ (UINT32_C(1) << 0U)
@@ -102,6 +103,19 @@ enum kernel_mm_status kernel_mm_map_elf_source(
     struct kernel_mm *mm,
     struct kernel_elf64_source *source,
     uint64_t load_bias);
+
+/* The main executable is a distinct MM owner, independent of PT_INTERP. */
+enum kernel_mm_status kernel_mm_set_executable(
+    struct kernel_mm *mm, struct kernel_open_file_description *file);
+enum kernel_mm_status kernel_mm_executable_path_acquire(
+    const struct kernel_mm *mm, struct kernel_vfs_path **owner);
+
+struct kernel_mm_proc_memory {
+    uint64_t virtual_bytes;
+    uint64_t resident_pages;
+};
+enum kernel_mm_status kernel_mm_proc_memory_snapshot(
+    const struct kernel_mm *mm, struct kernel_mm_proc_memory *snapshot);
 
 /* Returns NOT_MAPPED for a valid address outside all VMAs. */
 enum kernel_mm_status kernel_mm_vma_lookup(

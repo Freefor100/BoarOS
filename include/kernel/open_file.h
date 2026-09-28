@@ -10,10 +10,13 @@ struct kernel_heap;
 struct kernel_open_file_description;
 struct kernel_vfs_mount;
 struct kernel_vfs_node;
+struct kernel_vfs_stat;
 struct kernel_socket;
 
 /* Borrowed identity, valid while the regular-file OFD is owned. */
 struct kernel_vfs_node *kernel_open_file_node(
+    const struct kernel_open_file_description *description);
+struct kernel_vfs_path *kernel_open_file_path(
     const struct kernel_open_file_description *description);
 
 enum kernel_open_file_status {
@@ -33,6 +36,7 @@ enum kernel_open_file_kind {
     KERNEL_OPEN_FILE_KIND_NULL,
     KERNEL_OPEN_FILE_KIND_ZERO,
     KERNEL_OPEN_FILE_KIND_SOCKET,
+    KERNEL_OPEN_FILE_KIND_GENERATED,
 };
 
 /* VFS errors are returned through linux_result when status is OK. */
@@ -92,6 +96,27 @@ struct kernel_socket *kernel_open_file_socket(
 
 enum kernel_open_file_kind kernel_open_file_kind(
     const struct kernel_open_file_description *file);
+
+/* Stable within an open pseudo object; zero for path-backed descriptions. */
+uint64_t kernel_open_file_pseudo_identity(
+    const struct kernel_open_file_description *file);
+
+/* Snapshot metadata of a pathless object while its OFD is borrowed/pinned. */
+int kernel_open_file_pseudo_stat(
+    const struct kernel_open_file_description *file,
+    struct kernel_vfs_stat *stat);
+
+struct kernel_pipe;
+struct kernel_open_file_pipe_pin {
+    struct kernel_pipe *pipe;
+    uint8_t endpoint;
+};
+/* Pin under the fd-table guard; finish outside it, including on failure. */
+int kernel_open_file_pipe_pin(const struct kernel_open_file_description *source,
+    uint32_t flags, struct kernel_open_file_pipe_pin *pin);
+int kernel_open_file_pipe_finish(struct kernel_heap *heap,
+    struct kernel_open_file_pipe_pin *pin, uint32_t flags,
+    struct kernel_open_file_description **owner);
 
 int kernel_open_file_supports_epoll(
     const struct kernel_open_file_description *file);

@@ -10,6 +10,149 @@ VirtIO 也分 transport 与 device type。MMIO 或 PCI transport 规定寄存器
 
 DMA 的地址是设备可见地址，不等于任意内核虚拟地址。QEMU `virt` 当前无 IOMMU、RAM 有固定 direct map，因此可把 direct-map VA 转回 PA；真实开发板还必须核对 DMA 可达位宽、cache coherency、内存屏障和 IOMMU。对齐的最终目标缓冲区可以 direct DMA；非整扇区范围需要 bounce，避免设备覆盖调用者未请求的前后字节。
 
+## 通用对象与 ext4 适配分离
+
+2026-09-28 从 `ba7e6d8` 开始拆分。固定 Linux
+`references/linux/include/linux/{fs.h,path.h}`（`f4cdf7ca9a1fdcca413157df19753f388a5a224e`）
+区分文件系统实例、inode、路径和打开文件；BoarOS 将通用引用、锁、缓存关联与
+映射登记留在 VFS，lwext4 handle、日志错误和 orphan 留在私有后端。先让
+原 ext4 路径继续工作，再接新文件系统，以便把回归定位到对象拆分或挂载行为。
+
+一次实际失败发生在后端操作表：物理地址运行的 VFS 模块测试跳入高半区回调地址，
+首次 open 触发 instruction access fault。静态指针初始化使用链接地址，而当前
+测试尚未启用 Sv39。挂载前逐项初始化回调，使其按当前执行地址生成；volatile
+表项写防止编译器又改成常量表复制。生产高半区入口和分页前测试都必须覆盖，
+不能通过删除物理地址测试隐藏问题。
+
+重建入口为 `make test-vfs-riscv test-files-riscv test-mm-riscv test-exec-riscv
+ test-record-lock-riscv test-scale-riscv test-io-sleep-riscv`；VFS runner 同时覆盖
+恢复和只读/可写根盘，规模与睡眠 I/O 继续保护原成本和并发门槛。
+前一阶段另通过 `make test-riscv test-stack-usage`、SQLite DELETE/WAL、
+`test-lwext4-recovery-host` 与 `test-lwext4-rename-host`。既有 583 条 ABI
+记录仍与固定 Linux 一致；新增 3 条 proc 探针分别得到 ENOSYS、ENOENT、
+ENOSYS，尚未转绿，不计入已支持能力。SQLite 逐事件完整恢复矩阵仍待本轮收口。
+该阶段的通过只建立后端拆分，不代表 mount syscall 或 procfs 已完成。
+
+随后在内部挂载路径上，固定 Linux
+`references/linux/fs/namei.c:2195` 的 `follow_dotdot` 与
+`references/linux/fs/namespace.c:1590` 的忙挂载判断（同一固定 commit）
+用于核对 `..` 返回父挂载及活引用阻止卸载。一次挂载同时持有根路径与被遮蔽
+路径；同点再次挂载落在当前可见根路径上，卸载顶层后恢复下一层。路径查找
+只在单个实例上持命名空间锁；解析到另一实例时释放旧锁，修改时重新锁定
+目标实例并核对待创建名称，避免跨实例的锁次序倒置及并发创建误成功。
+`make test-vfs-riscv` 的内存后端测试覆盖 64 位 inode 碰撞、嵌套/覆盖、
+`..`、cwd、忙卸载和挂载失败回滚；这不是 procfs 用户态验收。
+
+在此基础上接入用户态 proc 挂载与首个真实生成文件。固定 Linux
+`references/linux/fs/namespace.c` 的 `path_mount()`/`path_umount()` 和
+`references/linux/fs/proc/meminfo.c`（commit
+`f4cdf7ca9a1fdcca413157df19753f388a5a224e`）用于核对挂载忙引用及
+`meminfo` 的生成式读取边界。`tests/diff-abi/proc.c` 对照真实 RV U-mode，
+普通/只读静默挂载、同点覆盖、cwd/打开文件忙卸载、`MemTotal:` 短读、
+readv、pread、EOF、写入错误与 seek 回零/SEEK_END 均与固定 Linux 一致；连同既有记录共 603 条。
+`make test-riscv test-stack-usage` 通过，最大编译器栈界仍为 2368 字节。
+这里只证明当前挂载和 `meminfo` 范围，不能外推 `/proc/self`、进程目录
+或比赛消费者。
+早期 VFS 模块测试尚在物理地址执行，静态回调表中的高半区函数指针会在
+首次 proc 根查询时产生取指故障；proc 回调与 ext4 一样在挂载时逐项按当前
+执行域填写。退出路径还须自叶向根释放 proc 子挂载，否则 PID 1 即使已
+释放全部 fd，根 ext4 卸载仍因子挂载返回 `EBUSY`；聚焦测试覆盖两层
+覆盖挂载的末尾清理。
+
+进程 proc 入口先在同一固定 Linux 上证伪旧实现：`/proc/self` 链接和
+`exe/cwd/root` 在 Linux 分别返回当前 TGID、主 ELF 路径和对象目录，旧
+BoarOS 返回 `ENOENT/ENOTDIR`。VFS 的普通符号链接按文本重查不能保持
+已删除执行文件或 cwd 的身份，因此新增可选的后端对象链接跟随入口，直接
+返回带引用的目标路径；readlink 仍单独生成展示文本。进程数字目录把
+单调代次编进 inode，避免旧路径在 PID 复用后转向新任务。MM 明确持有
+主 ELF OFD，动态解释器不能覆盖它，fork 与末次清理遵守原 source owner
+顺序。`tests/diff-abi/proc.c` 的 self/exe/cwd/root 和 uptime 形态与固定
+Linux 一致，当时总计 614 条；fd、进程文本和挂载列表尚待后续阶段验证。
+
+挂载列表的固定依据是 `references/linux/fs/proc_namespace.c::show_vfsmnt()`
+（`f4cdf7ca9a1fdcca413157df19753f388a5a224e`）。旧 BoarOS 的
+`/proc/mounts` 链接和 `/proc/self/mounts` 均为 `ENOENT`；加入从当前共享挂载
+树取得的实例、挂载点和只读状态后，固定 Linux 的链接文本、打开与 proc 行
+形态三项差分通过，总计 617 条。先钉住挂载根和覆盖路径，再脱离短关中断区
+构造文本，避免格式化或分配阻塞挂载操作，也防止并发卸载释放快照对象。
+
+进程统计依据固定 Linux `references/linux/fs/proc/array.c::do_task_stat()`、
+`references/linux/fs/proc/task_mmu.c::task_vsize()` 与
+`references/linux/fs/proc/base.c::proc_pid_permission()`，commit 同上。
+`references/oscomp-testsuits/busybox/libbb/procps.c` 在固定清单提交中会解析
+stat 至第 24 字段 RSS；因此首批只发布有真实来源的前 24 字段与部分 status
+键，未统计的尾字段不补零。旧内核的 stat/status 均为 `ENOENT`；固定 Linux
+差分增加了格式、zombie 及旧目录回收后的 errno，当前 623 条通过。旧目录
+继续 lookup 在 Linux 的权限入口返回 `ESRCH`，而从 proc 根目录按已回收 PID
+重新 lookup 是 `ENOENT`，两者不能合并。fault major 目前按同一次解析发起
+的 VirtIO 读请求归因；另一个任务装载同页时等待者的 major 分类仍需改进，
+不能把这批字段描述为完整 Linux proc 实现。
+
+fd 链接与目录枚举依据固定 Linux `references/linux/fs/proc/fd.c` 的
+`proc_fd_link()`、`proc_readfd_common()`、`tid_fd_update_inode()`，以及
+`references/linux/fs/readdir.c` 的返回契约（同一固定 commit）。旧基线
+`2b0ff4a` 的 `/proc/self/fd` 为 `ENOENT`；补入链接后又发现 procfs 的
+`dir_entry` 把一条有效目录项返回为零，通用 `getdents64` 因而把整目录视为
+EOF。这是此前 BusyBox `ps` 虽报 success 却只打印表头的根因。修正有效项后，
+又用第二次 `getdents64` 对照发现目录终点误报 `ENOENT`；按“正值找到、
+零 EOF”并保持游标不变后，根目录和 fd 目录才完整枚举。普通文件重开得到独立
+offset；pipe 重开得到新的读、写或读写 endpoint owner，原 fd 关闭后继续
+传输；socket/epoll 的 `readlink` 有真实对象类型，重开为 `ENXIO`。fd 关闭、
+编号复用和链接权限位也按当前槽验证。`tests/diff-abi/proc.c` 用同一 RV ELF
+对照后共 652 条记录一致；`make test-files-riscv test-vfs-riscv
+test-stack-usage` 通过。初始无路径 console 与伪对象跟随式 stat 仍未验收。
+审查 inode 编码时还发现当前 PID 分配器允许编号 32768，必须为 PID 保留完整
+16 位；将 15 位截断会把该编号错误编码为零，因此 fd 扩展使用 16 位 PID、
+10 位 fd、4 位种类和 34 位单调代次，并在构造时检查边界。
+
+随后用固定 Linux 同一 RV ELF 对照 `/proc/self/fd/N` 的跟随式
+`newfstatat`：普通文件已有目标路径，pipe 返回 `ENOENT`、socket/epoll
+返回 `ENXIO`，而 Linux 三者均返回与原 fd 的 `fstat` 一致的类型、inode
+与设备号。单纯读取 `pipe:[N]` 或 `anon_inode:[eventpoll]` 的展示文字无法
+恢复目标身份，因此 VFS 只在最终路径跟随失败时调用后端 `stat_link`；proc
+在短关中断区里读取当前 fd 槽的伪对象快照，不持锁复制用户内存。原始失败
+与修复后的 658 条一致记录由 `make test-diff-abi-riscv` 重建；缺少设备
+节点时的无路径 console 链接仍是独立限制。
+
+固定差分根盘已由 `tests/diff-abi/harness.py` 预置 5:1 `/dev/console`。
+同一 RV ELF 上 Linux 的 `/proc/self/fd/0` 链接为 `/dev/console`，而旧
+BoarOS 初始化三个无路径 console OFD，返回 `ENOENT`。根启动在文件表
+安装标准 fd 前先核对根盘字符节点及设备号，再经 VFS 打开，保留目录项
+引用；仅节点不存在时退回原无路径 UART，真实设备错误不被吞掉。链接由
+同一个 proc fd 路径引用机制自然显示，不新增路径特判。660 条差分一致；
+缺少节点的根启动 fixture 继续验证 UART 兜底。
+
+对象生命周期随后由同一 RV ELF 再验证：先打开旧 PID 目录，回收子进程后
+创建下一子进程，旧目录不能跟到新的分配代次；unlink 当前主 ELF 后，
+`/proc/self/exe` 展示 `(deleted)`，但跟随链接仍能读取原 ELF magic。
+生成式 meminfo 的跨页用户 fault 只提交已复制的 8 字节，下一次读取从
+该 offset 续读；起点就 fault 时返回 `EFAULT` 且 offset 不动。固定 Linux
+与 BoarOS 共 668 条差分一致。线程组退出、非组长 exec 与读取时并发变化
+仍没有由这组测试覆盖，不能把这些结果外推为完整 procfs 生命周期验收。
+
+原始固定 BusyBox 包装脚本以 SHA-256
+`f2cda5fcdff6d41c8a553ac658e8aa55b6a48aa40898cb123a19f7865f3773ac`
+复跑，入口为 `python3 tests/program-inventory/run.py --suite busybox
+--case busybox.official --reuse-builds --timeout 90 --output build/proc-busybox-fd-consumer`。
+这次固定 Linux 55/55 子项 success，BoarOS 53/55，`dmesg` 和 `hwclock`
+失败；这是程序清单诊断，不是比赛 judge 分数。修正目录枚举后 BoarOS `ps`
+真正列出 PID 1–4；此前仅有表头，不能把退出零当成可用。`df` 仍仅有表头：
+固定 BusyBox 配置启用 `FEATURE_SKIP_ROOTFS`，会跳过 BoarOS 挂载表中的
+`rootfs`，而 proc 的零块数行也不会显示。`free` 输出全零，因为该 applet
+先调用当前尚未提供的 `sysinfo`；仅有真实 `/proc/meminfo` 不足以完成它。
+这两项消费缺口已转入路线，不能将脚本中的 success 标签当作内容正确。
+
+字符设备层采用 `st_rdev` 到内建 read/write/poll 操作的登记表，而不是在路径
+或每个 I/O 调用中重复识别设备名。`/dev` 仍可由 ext4 提供目录项；OFD 钉住
+选定后端，close 与 fd 复用不改变已开始的 I/O。固定 Linux
+`references/linux/drivers/char/mem.c`、`references/linux/fs/char_dev.c`
+（同一 commit）的 null/zero 及字符设备号语义，与
+`tests/diff-abi/devices.c` 的真实 RV U-mode 对照。`make test-files-riscv`
+和 `make test-diff-abi-riscv` 通过，后者为 605 条记录，新增 console
+`O_NONBLOCK` 读取在两侧均返回 `EAGAIN`。增加差分用例时必须同步
+`tests/diff-abi/cases.txt`：一次两侧均完整输出 `ABI END 605`，但清单仍为
+603 条，解析器正确拒绝了不匹配的运行；这并非内核阻塞。
+
 ## 为什么当前是同步 I/O
 
 设备 flush 与块缓存排空是两层边界。新增块 flush 依据固定 Linux `references/linux/drivers/block/virtio_blk.c`（`f4cdf7ca9a1fdcca413157df19753f388a5a224e`）与 QEMU `references/qemu/hw/block/virtio-blk.c`（v11.1.0，`84f07211cc5b4fc6a371559bf8a5de4fb068e648`）：不协商 CONFIG_WCE 时，FLUSH feature 决定 writeback，缺失则为 write-through。协商 FLUSH 后必须真实提交该请求；内存 fence、read-after-write、QEMU 正常退出均不能替代介质持久化证据。host 故障模型把易失状态与稳定镜像分开，允许未同步扇区丢失/重排；后续 journal 测试应复用这个模型，而非仅终止普通 QEMU 后检查恰好仍在宿主页缓存中的数据。

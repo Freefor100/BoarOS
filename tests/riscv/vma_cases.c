@@ -1278,6 +1278,8 @@ unsigned long run_vma_lookup_baseline(uint64_t cycles[3])
             }
             inserted++;
         }
+        if (kernel_vma_set_total_bytes(set) !=
+            (uint64_t)counts[sample] * BOAROS_PAGE_SIZE) return 5U;
         for (iteration = 0U; iteration < 256U; iteration++) {
             uint32_t index = iteration & (counts[sample] - 1U);
             uint64_t address = RISCV_SV39_PAGE_SIZE_4K +

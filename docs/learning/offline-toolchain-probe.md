@@ -64,3 +64,6 @@ BoarOS `kernel-rv` SHA-256 为
 输入 C 源 SHA-256 为 `5f3226afadc0a75dc9a9692baa7428fca406c00c65711b786b0994d94caf5beb`。
 五阶段均为 `exit:0`；产物哈希仍与上段一致。固定 Linux 异常退出产生的
 orphan 文件在审核后清理，最终 `e2fsck -fn` 完全干净。
+
+2026-09-28 通用 VFS/procfs 阶段复验 `make test-offline-c-riscv`：
+BoarOS 内核 SHA-256 `1a0dc5b9dc338e01d9fc7b10c689edaaa761f75952bc8fce90f2f4a4c1478167`，固定 Linux Image SHA-256 `09aef347ca137306aa97c9b7a87ec464bae1097011ce15f08b91529e114f8b5c`，Alpine 展开树 SHA-256 `ce84a7bb9fc7c97552121b37238622bbefbd4a3672600b57374e25230c582a07`。预处理、编译、汇编、链接、运行五阶段两侧均 `exit:0`；生成 ELF 与输出 SHA-256 保持上述固定值，未出现回退。

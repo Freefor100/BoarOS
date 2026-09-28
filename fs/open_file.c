@@ -2,8 +2,10 @@
 #include "record_lock.h"
 #include "pipe_internal.h"
 #include "vfs_internal.h"
+#include "char_device_internal.h"
 #include "files/epoll_internal.h"
 
+#include <arch/riscv/context.h>
 #include <kernel/console.h>
 #include <kernel/errno.h>
 #include <kernel/heap.h>
@@ -17,6 +19,14 @@
 
 static int open_file_live(
     const struct kernel_open_file_description *file);
+
+static uint64_t next_socket_proc_identity = 1U;
+
+struct kernel_vfs_path *kernel_open_file_path(
+    const struct kernel_open_file_description *description)
+{
+    return open_file_live(description) ? description->file.path : 0;
+}
 
 static void release_record_locks(struct kernel_open_file_description *file)
 {
@@ -67,6 +77,8 @@ static enum kernel_open_file_status create_open_file(
     file->heap = heap;
     file->references = 1U;
     kernel_mutex_init(&file->offset_lock, 10, (uintptr_t)file);
+    if (kernel_vfs_file_generated(&file->file))
+        file->kind = KERNEL_OPEN_FILE_KIND_GENERATED;
     file->observed_writeback_error = kernel_vfs_error_sequence(&file->file);
     *owner = file;
     *linux_result = 0;
@@ -109,7 +121,9 @@ enum kernel_open_file_status kernel_open_file_create_at(
     } else {
         file->heap = heap;
         file->references = 1U;
-    kernel_mutex_init(&file->offset_lock, 10, (uintptr_t)file);
+        kernel_mutex_init(&file->offset_lock, 10, (uintptr_t)file);
+        if (kernel_vfs_file_generated(&file->file))
+            file->kind = KERNEL_OPEN_FILE_KIND_GENERATED;
         file->observed_writeback_error = kernel_vfs_error_sequence(&file->file);
         *owner = file;
     }
@@ -247,6 +261,8 @@ enum kernel_open_file_status kernel_open_file_create_console(
     file->references = 1U;
     kernel_mutex_init(&file->offset_lock, 10, (uintptr_t)file);
     file->kind = KERNEL_OPEN_FILE_KIND_CONSOLE;
+    file->device = kernel_char_device_lookup(UINT64_C(0x501));
+    if (!file->device) __builtin_trap();
     *owner = file;
     return KERNEL_OPEN_FILE_STATUS_OK;
 }
@@ -264,7 +280,8 @@ enum kernel_open_file_status kernel_open_file_create_pipe(
 
     if (heap == 0 || pipe == 0 || owner == 0 || *owner != 0 ||
         (endpoint != KERNEL_PIPE_ENDPOINT_READ &&
-         endpoint != KERNEL_PIPE_ENDPOINT_WRITE)) {
+         endpoint != KERNEL_PIPE_ENDPOINT_WRITE &&
+         endpoint != KERNEL_PIPE_ENDPOINT_BOTH)) {
         return KERNEL_OPEN_FILE_STATUS_INVALID_ARGUMENT;
     }
     heap_status = kernel_heap_allocate_zeroed(heap,
@@ -291,7 +308,8 @@ enum kernel_open_file_status kernel_open_file_create_pipe(
     file->kind = KERNEL_OPEN_FILE_KIND_PIPE;
     file->file.mode = KERNEL_VFS_S_IFIFO | UINT32_C(0000600);
     file->open_flags = (uint32_t)flags |
-                       (endpoint == KERNEL_PIPE_ENDPOINT_WRITE ? 1U : 0U);
+                       (endpoint == KERNEL_PIPE_ENDPOINT_WRITE ? 1U :
+                        endpoint == KERNEL_PIPE_ENDPOINT_BOTH ? 2U : 0U);
     file->pipe = pipe;
     file->pipe_endpoint = (uint8_t)endpoint;
     file->vfs_closed = 0U;
@@ -354,8 +372,86 @@ enum kernel_open_file_status kernel_open_file_create_socket(
     file->file.mode = KERNEL_VFS_S_IFSOCK | UINT32_C(0000600);
     file->open_flags = flags;
     file->socket = socket;
+    uintptr_t irq = riscv_interrupt_save();
+    if (!next_socket_proc_identity) __builtin_trap();
+    file->proc_identity = next_socket_proc_identity++;
+    riscv_interrupt_restore(irq);
     *owner = file;
     return KERNEL_OPEN_FILE_STATUS_OK;
+}
+
+uint64_t kernel_open_file_pseudo_identity(
+    const struct kernel_open_file_description *file)
+{
+    if (!open_file_live(file)) return 0U;
+    if (file->kind == KERNEL_OPEN_FILE_KIND_PIPE)
+        return kernel_pipe_proc_identity(file->pipe);
+    if (file->kind == KERNEL_OPEN_FILE_KIND_SOCKET)
+        return file->proc_identity;
+    return 0U;
+}
+
+int kernel_open_file_pseudo_stat(
+    const struct kernel_open_file_description *file,
+    struct kernel_vfs_stat *stat)
+{
+    if (!open_file_live(file) || !stat || kernel_open_file_path(file))
+        return -KERNEL_ENOTSUP;
+    uint32_t mode;
+    uint64_t rdev = 0U;
+    if (file->kind == KERNEL_OPEN_FILE_KIND_PIPE)
+        mode = KERNEL_VFS_S_IFIFO | 0600U;
+    else if (file->kind == KERNEL_OPEN_FILE_KIND_SOCKET)
+        mode = KERNEL_VFS_S_IFSOCK | 0600U;
+    else if (file->kind == KERNEL_OPEN_FILE_KIND_EPOLL)
+        mode = 0600U;
+    else if (file->kind == KERNEL_OPEN_FILE_KIND_CONSOLE) {
+        mode = KERNEL_VFS_S_IFCHR | 0600U;
+        rdev = UINT64_C(0x501);
+    } else return -KERNEL_ENOTSUP;
+    *stat = (struct kernel_vfs_stat){
+        .mode = mode,
+        .nlink = 1U,
+        .rdev = rdev,
+        .size = kernel_open_file_size(file),
+        .blksize = BOAROS_PAGE_SIZE,
+    };
+    return 0;
+}
+
+int kernel_open_file_pipe_pin(
+    const struct kernel_open_file_description *source, uint32_t flags,
+    struct kernel_open_file_pipe_pin *pin)
+{
+    if (!open_file_live(source) || !pin || pin->pipe ||
+        source->kind != KERNEL_OPEN_FILE_KIND_PIPE) return -KERNEL_EINVAL;
+    unsigned mode = flags & 3U;
+    if (mode > 2U) return -KERNEL_EINVAL;
+    uint32_t endpoint = mode == 0U ? KERNEL_PIPE_ENDPOINT_READ :
+                        mode == 1U ? KERNEL_PIPE_ENDPOINT_WRITE :
+                                     KERNEL_PIPE_ENDPOINT_BOTH;
+    if (kernel_pipe_acquire_endpoint(source->pipe, endpoint) !=
+        KERNEL_PIPE_STATUS_OK) return -KERNEL_EIO;
+    pin->pipe = source->pipe;
+    pin->endpoint = (uint8_t)endpoint;
+    return 0;
+}
+
+int kernel_open_file_pipe_finish(struct kernel_heap *heap,
+    struct kernel_open_file_pipe_pin *pin, uint32_t flags,
+    struct kernel_open_file_description **owner)
+{
+    if (!heap || !pin || !pin->pipe || !owner || *owner)
+        return -KERNEL_EINVAL;
+    enum kernel_open_file_status status = kernel_open_file_create_pipe(heap,
+        pin->pipe, pin->endpoint, flags, owner);
+    if (kernel_pipe_release_endpoint(pin->pipe, pin->endpoint) !=
+        KERNEL_PIPE_STATUS_OK) __builtin_trap();
+    pin->pipe = 0;
+    pin->endpoint = 0U;
+    return status == KERNEL_OPEN_FILE_STATUS_OK ? 0 :
+           status == KERNEL_OPEN_FILE_STATUS_NO_MEMORY ? -KERNEL_ENOMEM :
+                                                          -KERNEL_EIO;
 }
 
 struct kernel_socket *kernel_open_file_socket(
@@ -386,6 +482,8 @@ enum kernel_open_file_kind kernel_open_file_kind(
         return KERNEL_OPEN_FILE_KIND_ZERO;
     case KERNEL_OPEN_FILE_KIND_SOCKET:
         return KERNEL_OPEN_FILE_KIND_SOCKET;
+    case KERNEL_OPEN_FILE_KIND_GENERATED:
+        return KERNEL_OPEN_FILE_KIND_GENERATED;
     default:
         return KERNEL_OPEN_FILE_KIND_REGULAR;
     }
@@ -445,6 +543,7 @@ enum kernel_open_file_status kernel_open_file_release(
     if (file->ep_items != 0) {
         kernel_epoll_notify_file_release(file);
     }
+    if (file->generated_ready) kernel_open_file_reset_generated(file);
     if (!file->vfs_closed) {
         if (file->kind == KERNEL_OPEN_FILE_KIND_CONSOLE &&
             file->file.private_data == 0) {
@@ -532,7 +631,36 @@ struct kernel_vfs_node *kernel_open_file_node(
 uint64_t kernel_open_file_size(
     const struct kernel_open_file_description *file)
 {
+    if (open_file_live(file) && file->kind == KERNEL_OPEN_FILE_KIND_GENERATED)
+        return file->generated_ready ? file->generated_length : 0U;
     return open_file_live(file) ? kernel_vfs_file_size(&file->file) : 0U;
+}
+
+int kernel_open_file_generate(struct kernel_open_file_description *file)
+{
+    if (!open_file_live(file) || file->kind != KERNEL_OPEN_FILE_KIND_GENERATED)
+        return -KERNEL_EINVAL;
+    if (file->generated_ready) return 0;
+    int result = kernel_vfs_file_snapshot(&file->file, file->heap,
+                                           &file->generated_data,
+                                           &file->generated_length);
+    if (result) {
+        if (file->generated_data) kernel_open_file_reset_generated(file);
+        return result;
+    }
+    file->generated_ready = 1U;
+    return 0;
+}
+
+void kernel_open_file_reset_generated(struct kernel_open_file_description *file)
+{
+    if (!file || file->kind != KERNEL_OPEN_FILE_KIND_GENERATED) __builtin_trap();
+    if (file->generated_data &&
+        kernel_heap_release(file->heap, file->generated_data) !=
+            KERNEL_HEAP_STATUS_OK) __builtin_trap();
+    file->generated_data = 0;
+    file->generated_length = 0U;
+    file->generated_ready = 0U;
 }
 
 uint32_t kernel_open_file_mode(
@@ -558,12 +686,13 @@ int kernel_open_file_readable(
     access_mode = file->open_flags & 3U;
     switch (file->kind) {
     case KERNEL_OPEN_FILE_KIND_REGULAR:
+    case KERNEL_OPEN_FILE_KIND_GENERATED:
     case KERNEL_OPEN_FILE_KIND_DIRECTORY:
     case KERNEL_OPEN_FILE_KIND_NULL:
     case KERNEL_OPEN_FILE_KIND_ZERO:
         return access_mode == 0U || access_mode == 2U;
     case KERNEL_OPEN_FILE_KIND_PIPE:
-        return access_mode == 0U;
+        return access_mode == 0U || access_mode == 2U;
     case KERNEL_OPEN_FILE_KIND_SOCKET:
         return 1;
     case KERNEL_OPEN_FILE_KIND_CONSOLE:
@@ -694,15 +823,13 @@ uint32_t kernel_open_file_poll(
     if (!open_file_live(file)) {
         return KERNEL_POLLNVAL;
     }
+    if (file->device) return file->device->poll(requested_events, out_queue);
     switch (file->kind) {
     case KERNEL_OPEN_FILE_KIND_PIPE:
         return kernel_pipe_poll(file->pipe, file->pipe_endpoint, out_queue);
-    case KERNEL_OPEN_FILE_KIND_CONSOLE:
-        return kernel_console_poll(requested_events, out_queue);
     case KERNEL_OPEN_FILE_KIND_REGULAR:
+    case KERNEL_OPEN_FILE_KIND_GENERATED:
     case KERNEL_OPEN_FILE_KIND_DIRECTORY:
-    case KERNEL_OPEN_FILE_KIND_NULL:
-    case KERNEL_OPEN_FILE_KIND_ZERO:
         return KERNEL_POLLIN | KERNEL_POLLOUT | KERNEL_POLLRDNORM | KERNEL_POLLWRNORM;
     case KERNEL_OPEN_FILE_KIND_EPOLL:
         return kernel_epoll_poll(file->epoll, requested_events, out_queue);

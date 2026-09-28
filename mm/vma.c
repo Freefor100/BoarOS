@@ -13,6 +13,7 @@ struct kernel_vma_set {
     uint32_t count;
     uint32_t capacity;
     uint64_t generation;
+    uint64_t total_bytes;
 };
 
 static int set_valid(const struct kernel_vma_set *set)
@@ -28,6 +29,23 @@ uint64_t kernel_vma_set_generation(const struct kernel_vma_set *set)
 {
     if (!set_valid(set)) __builtin_trap();
     return set->generation;
+}
+
+uint64_t kernel_vma_set_total_bytes(const struct kernel_vma_set *set)
+{
+    if (!set_valid(set)) __builtin_trap();
+    return set->total_bytes;
+}
+
+static void recount_bytes(struct kernel_vma_set *set)
+{
+    uint64_t total = 0U;
+    for (uint32_t i = 0U; i < set->count; i++) {
+        uint64_t length = set->entries[i].end - set->entries[i].start;
+        if (length > UINT64_MAX - total) __builtin_trap();
+        total += length;
+    }
+    set->total_bytes = total;
 }
 
 static int vma_valid(const struct kernel_vma *vma)
@@ -329,6 +347,7 @@ enum kernel_vma_status kernel_vma_set_clone(
             working->entries[index] = source->entries[index];
         }
         working->count = source->count;
+        working->total_bytes = source->total_bytes;
         *destination = working;
         return KERNEL_VMA_STATUS_OK;
     }
@@ -349,6 +368,7 @@ enum kernel_vma_status kernel_vma_set_destroy(struct kernel_vma_set **set)
         working->entries = 0;
         working->count = 0U;
         working->capacity = 0U;
+        working->total_bytes = 0U;
     }
     (void)kernel_heap_release(working->heap, working);
     *set = 0;
@@ -369,6 +389,7 @@ enum kernel_vma_status kernel_vma_set_insert(
     }
     status = insert_entry(set, vma);
     if (status == KERNEL_VMA_STATUS_OK) {
+        recount_bytes(set);
         set->generation++;
     }
     return status;
@@ -661,6 +682,7 @@ enum kernel_vma_status kernel_vma_set_commit_edit(
         }
     }
     merge_all(set);
+    recount_bytes(set);
     set->generation++;
     return KERNEL_VMA_STATUS_OK;
 }
@@ -710,6 +732,7 @@ enum kernel_vma_status kernel_vma_set_trim_end(
     } else {
         set->entries[index].end = new_end;
     }
+    recount_bytes(set);
     set->generation++;
     return KERNEL_VMA_STATUS_OK;
 }

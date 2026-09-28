@@ -149,11 +149,14 @@ C_SOURCES := \
 	fs/files/epoll.c \
 	fs/files/socket.c \
 	fs/fs_context.c \
+	fs/char_device.c \
 	fs/open_file.c \
 	fs/pipe.c \
 	fs/record_lock.c \
 	fs/page_cache.c \
 	fs/vfs.c \
+	fs/procfs.c \
+	fs/ext4_backend.c \
 	kernel/boot_memory.c \
 	kernel/block.c \
 	kernel/dtb.c \
@@ -168,12 +171,14 @@ C_SOURCES := \
 	kernel/sched/core.c \
 	kernel/sched/exec.c \
 	kernel/sched/process.c \
+	kernel/sched/proc.c \
 	kernel/sched/signal.c \
 	kernel/sched/wait.c \
 	kernel/sched/sync.c \
 	kernel/sched/futex.c \
 	kernel/syscall/dispatch.c \
 	kernel/syscall/file.c \
+	kernel/syscall/mount.c \
 	kernel/syscall/memory.c \
 	kernel/syscall/process.c \
 	kernel/syscall/signal.c \
@@ -224,12 +229,15 @@ TEST_RUNTIME_C_SOURCES := \
 	fs/files/epoll.c \
 	fs/files/socket.c \
 	fs/fs_context.c \
+	fs/char_device.c \
 	fs/lwext4_port.c \
 	fs/open_file.c \
 	fs/pipe.c \
 	fs/record_lock.c \
 	fs/page_cache.c \
 	fs/vfs.c \
+	fs/procfs.c \
+	fs/ext4_backend.c \
 	kernel/block.c \
 	kernel/elf64.c \
 	kernel/elf64_source.c \
@@ -241,12 +249,14 @@ TEST_RUNTIME_C_SOURCES := \
 	kernel/sched/core.c \
 	kernel/sched/exec.c \
 	kernel/sched/process.c \
+	kernel/sched/proc.c \
 	kernel/sched/signal.c \
 	kernel/sched/wait.c \
 	kernel/sched/sync.c \
 	kernel/sched/futex.c \
 	kernel/syscall/dispatch.c \
 	kernel/syscall/file.c \
+	kernel/syscall/mount.c \
 	kernel/syscall/memory.c \
 	kernel/syscall/process.c \
 	kernel/syscall/signal.c \
@@ -879,7 +889,7 @@ $(BUILD_DIR)/%.o: %.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c $< -o $@
 
-$(BUILD_DIR)/fs/lwext4_port.o $(BUILD_DIR)/fs/vfs.o: \
+$(BUILD_DIR)/fs/lwext4_port.o $(BUILD_DIR)/fs/ext4_backend.o: \
 	CPPFLAGS += $(LWEXT4_CPPFLAGS)
 
 $(BUILD_DIR)/third_party/lwip/src/core/%.o \

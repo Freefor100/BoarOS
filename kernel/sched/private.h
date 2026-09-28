@@ -129,6 +129,15 @@ struct kernel_task {
     uint64_t kernel_ticks;
     uint64_t child_user_ticks;
     uint64_t child_kernel_ticks;
+    uint64_t minor_faults;
+    uint64_t major_faults;
+    uint64_t child_minor_faults;
+    uint64_t child_major_faults;
+    uint64_t block_reads;
+    uint64_t proc_identity;
+    uint64_t proc_start_ticks;
+    kernel_pid_t session_id;
+    char comm[16];
     struct kernel_wait_queue child_exit_queue;
     struct kernel_wait_queue vfork_done_queue;
     uint32_t vfork_child;
@@ -177,6 +186,8 @@ struct kernel_scheduler {
     uint32_t initialized;
     uint32_t idle_context_saved;
     uint64_t kernel_satp;
+    uint64_t idle_ticks;
+    uint64_t next_proc_identity;
     struct physical_page_allocator *allocator;
     struct kernel_pid_allocator pid_allocator;
     uint64_t pid_bitmap[KERNEL_PID_BITMAP_WORDS(KERNEL_PID_LIMIT)];
@@ -199,6 +210,8 @@ struct kernel_scheduler {
 };
 
 extern struct kernel_scheduler scheduler;
+
+void kernel_proc_task_update_comm(struct kernel_task *task);
 
 void scheduler_wake_task(struct kernel_task *thread, uint32_t reason);
 void scheduler_wait_requeue(struct kernel_task *task,

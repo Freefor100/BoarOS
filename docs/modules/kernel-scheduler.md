@@ -8,6 +8,7 @@
 |---|---|
 | `kernel/sched/core.c` | 创建、ready FIFO、tick 抢占、资源借用校验 |
 | `kernel/sched/process.c` | clone、线程组/父子树、wait、退出、回收与记账 |
+| `kernel/sched/proc.c` | PID 代次、进程快照、对象路径与缺页/磁盘读取统计 |
 | `kernel/sched/exec.c` | 已准备映像的提交与旧资源清理 |
 | `kernel/sched/sync.c` | 任务 owner 的 mutex/RWlock、锁序与写者优先 |
 | `kernel/sched/wait.c` | 全局 blocked 链、每队列 FIFO、超时和信号唤醒 |

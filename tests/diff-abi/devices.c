@@ -155,6 +155,14 @@ void abi_device_cases(void)
     abi_record("device.console-stat", result, -1, -1, 0,
                &stat.rdev, sizeof(stat.rdev));
     abi_require(SC1(57, fd) == 0);
+    fd = abi_open("/dev/console", 0x800);
+    abi_record("device.console-open-nonblock", fd < 0 ? fd : 0,
+               -1, -1, 0, 0, 0);
+    if (fd >= 0) {
+        abi_record("device.console-read-nonblock", SC3(63, fd, buffer, 1),
+                   -1, -1, 0, 0, 0);
+        abi_require(SC1(57, fd) == 0);
+    }
 
     fd = abi_open("/positioned", 0x242);
     abi_require(fd >= 0 && SC3(64, fd, "abc", 3) == 3 &&

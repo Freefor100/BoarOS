@@ -8,6 +8,7 @@
 struct kernel_epoll;
 struct kernel_epoll_item;
 struct kernel_record_lock;
+struct kernel_char_device;
 
 struct kernel_open_file_description {
     struct kernel_vfs_file file;
@@ -16,6 +17,7 @@ struct kernel_open_file_description {
     struct kernel_mutex offset_lock;
     uint64_t offset;
     uint64_t observed_writeback_error;
+    uint64_t proc_identity;
     uint32_t open_flags;
     uint32_t references;
     uint8_t kind;
@@ -27,7 +29,15 @@ struct kernel_open_file_description {
     struct kernel_socket *socket;
     struct kernel_epoll_item *ep_items;
     struct kernel_record_lock *record_locks;
+    const struct kernel_char_device *device;
+    char *generated_data;
+    size_t generated_length;
+    uint8_t generated_ready;
 };
+
+/* Caller holds offset_lock for a shared OFD snapshot. */
+int kernel_open_file_generate(struct kernel_open_file_description *file);
+void kernel_open_file_reset_generated(struct kernel_open_file_description *file);
 
 enum kernel_open_file_status kernel_open_file_create_pipe(
     struct kernel_heap *heap,

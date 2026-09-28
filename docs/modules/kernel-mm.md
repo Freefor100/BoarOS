@@ -141,6 +141,10 @@ RISC-V 创建先分配并解析记录页，最后才把 LIVE Sv39 空间移入�
 
 ELF image 使用独立的 `kernel_elf64_source`，不把 `PT_LOAD` 当作普通 file-private mmap。source 在 exec 时一次解析 program headers，并将页区间规范化为 `ELF_PRIVATE` VMA 的 `backing_offset`。完整文件页可以共享 page cache；文件/BSS 边界页、多个段贡献页和 BSS 页由 fault 路径私有分配、清零并精确填充。source 引用由 MM 记录，重复映射不增加历史引用，fork 子 MM 获取独立引用，最后一个相关 VMA 消失才 release。可执行页发布后执行本地 `SFENCE.VMA` 和必要 `FENCE.I`，覆盖先读后取指。source 的 OFD/I/O 清理错误仍由 source owner 保留，堆和物理页释放不建立重试状态。
 
+MM 还单独持有主 ELF 的执行 OFD，供 `/proc/<pid>/exe` 查询。它在新映像全部构造成功后取得，exec 失败不改变旧 MM；线程共享同一 MM，fork 子 MM 另取引用，末次 MM 清理在 ELF source 仍持有 OFD 时先释放该引用。`PT_INTERP` 只决定实际入口，不改变 exe 所指主文件；查询返回带引用的路径，调用者不能在任务退出后借用 MM 指针。
+
+`kernel_mm_proc_memory_snapshot()` 无分配读取 VMA 集合在成功编辑时更新的覆盖字节数，以及 Sv39 有效/受保护页计数，供 proc 的 VmSize/VmRSS 使用。受保护页仍拥有物理页，故计入驻留；未发生缺页的虚拟映射只计入 VmSize。数值是瞬时 MM 统计，不把页缓存全局占用误计为该进程 RSS。
+
 `kernel_mm_munmap()` 采用 Linux 洞语义：输入范围中没有 VMA 或只覆盖部分 VMA 仍可成功；resident、`PROT_NONE` 和待释放页都由 Sv39 owner 状态处理。`kernel_mm_mprotect()` 要求整个范围无洞覆盖，先准备 VMA 拆分容量，再原地修改已有 PTE 权限，最后提交 metadata；长度 0 对齐地址直接成功。`PROT_NONE` 不释放物理页，恢复权限后仍看到原内容。
 
 ## 硬件用户缺页解析

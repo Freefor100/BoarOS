@@ -15,6 +15,7 @@
 #include <kernel/pid.h>
 #include <kernel/scheduler.h>
 #include <kernel/task.h>
+#include <kernel/tick.h>
 #include <kernel/uaccess.h>
 #include <kernel/vma.h>
 
@@ -570,6 +571,7 @@ enum kernel_scheduler_status kernel_scheduler_init(
     }
 
     scheduler.allocator = allocator;
+    scheduler.next_proc_identity = 1U;
     scheduler.kernel_satp = kernel_satp;
     scheduler.idle.arch.kernel_sp = idle_stack_high;
     scheduler.idle.arch.user_sp = 0U;
@@ -856,6 +858,11 @@ enum kernel_scheduler_status kernel_user_thread_create(
             KERNEL_SCHEDULER_STATUS_INVALID_STATE);
         goto restore_interrupts;
     }
+    if (scheduler.next_proc_identity > (UINT64_MAX >> 30U)) {
+        status = release_task_storage(thread,
+                                      KERNEL_SCHEDULER_STATUS_NO_MEMORY);
+        goto restore_interrupts;
+    }
     pid_status = kernel_pid_allocate(&scheduler.pid_allocator, &tid);
     if (pid_status != KERNEL_PID_STATUS_OK) {
         status = release_task_storage(
@@ -866,6 +873,9 @@ enum kernel_scheduler_status kernel_user_thread_create(
         goto restore_interrupts;
     }
     thread->tid = tid;
+    thread->proc_identity = scheduler.next_proc_identity++;
+    thread->proc_start_ticks = kernel_tick_count();
+    thread->session_id = tid;
     thread->process_group = tid;
     thread->tid_owned = 1U;
     thread->publish_completion = 1U;
@@ -886,6 +896,7 @@ enum kernel_scheduler_status kernel_user_thread_create(
             KERNEL_SCHEDULER_STATUS_INVALID_STATE);
         goto restore_interrupts;
     }
+    kernel_proc_task_update_comm(thread);
     if (files != 0) {
         if (kernel_files_move(&thread->files, files) !=
                 KERNEL_FILES_STATUS_OK ||
@@ -1002,7 +1013,11 @@ void kernel_scheduler_charge_ticks(uint64_t elapsed_ticks, int from_user)
 {
     struct kernel_task *current = scheduler.current;
 
-    if (current == 0 || current == &scheduler.idle ||
+    if (current == &scheduler.idle) {
+        scheduler.idle_ticks += elapsed_ticks;
+        return;
+    }
+    if (current == 0 ||
         current->magic != KERNEL_THREAD_MAGIC) {
         return;
     }
@@ -1011,4 +1026,9 @@ void kernel_scheduler_charge_ticks(uint64_t elapsed_ticks, int from_user)
     } else {
         current->kernel_ticks += elapsed_ticks;
     }
+}
+
+uint64_t kernel_scheduler_idle_ticks(void)
+{
+    return scheduler.idle_ticks;
 }

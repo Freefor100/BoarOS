@@ -3,6 +3,7 @@
 #include "../pipe_internal.h"
 #include "../record_lock.h"
 #include "../vfs_internal.h"
+#include "../char_device_internal.h"
 
 #include <kernel/errno.h>
 #include <kernel/heap.h>
@@ -47,6 +48,29 @@ int kernel_files_is_live(const struct kernel_files *files)
            files->record->slots != 0 &&
            files->record->statistics.capacity >=
                KERNEL_FILES_INITIAL_CAPACITY;
+}
+
+struct kernel_open_file_description *kernel_files_fd_borrow(
+    const struct kernel_files *files, int64_t fd)
+{
+    if (!kernel_files_is_live(files) || fd < 0 ||
+        (uint64_t)fd >= files->record->statistics.capacity) return 0;
+    return files->record->slots[fd].description;
+}
+
+int kernel_files_next_open_fd(const struct kernel_files *files, int after,
+                              int *fd)
+{
+    if (!kernel_files_is_live(files) || !fd || after < -1)
+        return -KERNEL_EINVAL;
+    for (uint32_t i = (uint32_t)(after + 1);
+         i < files->record->statistics.capacity; i++) {
+        if (files->record->slots[i].description) {
+            *fd = (int)i;
+            return 0;
+        }
+    }
+    return -KERNEL_ENOENT;
 }
 
 static void finish_files(struct kernel_files *files,
@@ -507,6 +531,56 @@ enum kernel_files_status kernel_files_open_console(
             KERNEL_OPEN_FILE_STATUS_OK) {
             return KERNEL_FILES_STATUS_STATE;
         }
+        return KERNEL_FILES_STATUS_STATE;
+    }
+    *linux_result = 0;
+    return KERNEL_FILES_STATUS_OK;
+}
+
+enum kernel_files_status kernel_files_open_boot_console(
+    struct kernel_files *files, struct kernel_vfs_path *root,
+    int64_t fd, int64_t *linux_result)
+{
+    if (!kernel_files_is_live(files) || !root || !linux_result)
+        return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
+    if (fd < 0 || (uint64_t)fd >= files->record->statistics.capacity ||
+        kernel_files_lookup_description(files, fd)) {
+        *linux_result = -KERNEL_EBADF;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    struct kernel_vfs_stat stat;
+    int result = kernel_vfs_stat_at(root, root, "/dev/console", 1, &stat);
+    if (result == -KERNEL_ENOENT)
+        return kernel_files_open_console(files, fd, linux_result);
+    if (result) {
+        *linux_result = result;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    if ((stat.mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFCHR ||
+        stat.rdev != UINT64_C(0x501)) {
+        *linux_result = -KERNEL_ENXIO;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    struct kernel_open_file_description *description = 0;
+    enum kernel_open_file_status open_status = kernel_open_file_create_at(
+        files->heap, root, root, "/dev/console", KERNEL_OPEN_PATH_FOLLOW,
+        0U, &description, &result);
+    if (open_status != KERNEL_OPEN_FILE_STATUS_OK)
+        return open_status == KERNEL_OPEN_FILE_STATUS_NO_MEMORY
+            ? KERNEL_FILES_STATUS_NO_MEMORY : KERNEL_FILES_STATUS_STATE;
+    if (result) {
+        *linux_result = result;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    /* 启动前已有根盘 inode；标准 fd 持有它，proc 链接才有真实路径身份。 */
+    description->device = kernel_char_device_lookup(stat.rdev);
+    if (!description->device) __builtin_trap();
+    description->kind = description->device->kind;
+    description->open_flags = 2U;
+    if (kernel_files_install_new_owned_at(files, (uint32_t)fd, 0U,
+                                          &description) != KERNEL_FILES_STATUS_OK) {
+        kernel_files_queue_description(files, description);
+        (void)kernel_files_drain_file_cleanup(files);
         return KERNEL_FILES_STATUS_STATE;
     }
     *linux_result = 0;

@@ -18,7 +18,7 @@ BoarOS 是从零搭建、面向 OS Comp 能力建设的 C / 少量汇编内核�
 | 进程与等待 | fork/vfork、child-TID 生命周期差分、pthread clone、线程组退出、非组长 exec、wait/zombie/reparent、FIFO 抢占、时钟与睡眠 | 合法 clone 组合仍有限；无完整会话/TTY；单 hart 关中断不等于跨核同步 |
 | futex / 信号 | WAIT/WAKE/REQUEUE、超时/重启、跨 MM 共享匿名 futex、同 MM 非 PI robust-list 退出清理、标准信号、用户 handler、`rt_sigtimedwait` | 无共享文件 futex、PI futex、实时信号队列和 `sigaltstack`；单 hart 验证范围 |
 | 文件与事件 | fd/OFD 分离、dup/CLOEXEC、共享 offset、阻塞 pin、部分/向量/定位 I/O、pipe、poll/select/epoll；传统与 OFD 记录锁；socket OFD 与读写/就绪；mknodat 字符节点按设备号接入 null、zero、console | 无 devfs、完整 TTY；设备 mmap 未支持 |
-| 路径与 ext4 | 共享活目录项、cwd/dirfd、普通/NOREPLACE rename、可写/只读根盘、符号链接、目录枚举、稀疏文件、显式纳秒时间、真实文件系统统计、打开后删除、私有映射截断 | 无硬链接、EXCHANGE/WHITEOUT、多挂载或完整权限 |
+| 路径与 ext4 | 共享活目录项、cwd/dirfd、普通/NOREPLACE rename、可写/只读根盘、符号链接、目录枚举、稀疏文件、显式纳秒时间、真实文件系统统计、打开后删除、私有映射截断；共享挂载树可用户态挂载/卸载 proc，含 meminfo、uptime、self、exe/cwd/root/fd、挂载信息与首批进程 stat/status 字段 | 无硬链接、EXCHANGE/WHITEOUT、第二个 ext4 块设备挂载或完整权限；缺少 /dev/console 节点时的初始标准 fd 没有路径链接，proc 的完整进程字段尚未完成 |
 | 缓存与存储 | read/write/private fault 共用文件页、inode 脏范围与定向写回、OFD 错误观察、`fsync/fdatasync/O_SYNC/O_DSYNC`；VirtIO legacy/modern IRQ、8 请求队列与 flush 屏障 | ordered journal/replay、持久 orphan；恢复承诺限于已验证块模型，无后台写回线程 |
 | 身份与资源 | 单用户 root 的 UID/GID 查询；线程组共享并执行 NOFILE/STACK，fork 继承、exec 保留 | 无凭据变更/完整权限；fd 硬容量 1024、栈硬容量 8 MiB；其他有效 limit 返回 `ENOTSUP` |
 | 平台与网络 | RISC-V QEMU 真实根盘可配置 PID 1（默认 `/init`） 与 musl 用户态；单 hart IPv4 UDP/TCP loopback，固定 lwIP 2.2.1 raw API | 无 AF_UNIX、真实网卡链路、LoongArch、实板或多核验证 |
@@ -75,9 +75,9 @@ make test-references
 
 [开发路线](docs/goals.md)统一记录本轮任务、分支交接和后续依赖。通用兼容性在 `main`，比赛环境与运行入口在 `oscomp-rv-compat`；后者单向合入已验收主线。只跑 RV 的原 judge 评分不等于双架构比赛交付，也不能把逐组诊断分数拼成正式总分。
 
-本分支已建立固定 3600 秒、一次启动的 [RV 原 judge 评分基线](docs/modules/oscomp-rv.md#2026-09-28-单次启动基线)。评测在 glibc LTP 耗尽预算；具体成绩、未到达组和真实环境阻塞见该报告。
+本轮按已确认的统一 VFS 对象路线，分阶段拆分 ext4 后端、实现挂载路径和真实 procfs；tmpfs 与多挂载完善随后推进。随机数、会话与调度按调用链推进；netperf、iozone 先定位。SMP、LoongArch、实板和更大工具链按新基线另行排期。
 
-后续先设计通用 VFS 后端与 mount/path 生命周期，再接真实设备/procfs、tmpfs 和多挂载。随机数、会话与调度按调用链推进；netperf、iozone 先定位。SMP、LoongArch、实板和更大工具链按新基线另行排期。
+本评测分支的固定预算 RV 原 judge 基线、22 组状态与输入身份见[RV 评测模块](docs/modules/oscomp-rv.md)；该结果仍只代表 RV 单侧。
 
 - [文档导航](docs/README.md)：模块契约与可复用学习材料。
 - [工程原则](docs/design.md)与[贡献说明](CONTRIBUTING.md)：技术取舍、验证与提交边界。

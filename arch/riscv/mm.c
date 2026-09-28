@@ -4,6 +4,7 @@
 #include <kernel/file_mapping.h>
 #include <kernel/heap.h>
 #include <kernel/open_file.h>
+#include <kernel/proc_task.h>
 #include <kernel/page.h>
 #include <kernel/shared_anon.h>
 #include <kernel/task.h>
@@ -105,6 +106,7 @@ struct riscv_kernel_mm_record {
     size_t resident_capacity;
     size_t resident_count;
     struct riscv_kernel_mm_elf_source *elf_sources;
+    struct kernel_open_file_description *executable_file;
 };
 
 static uint32_t sv39_permissions_from_mm(uint32_t permissions);
@@ -1002,6 +1004,13 @@ enum kernel_mm_status kernel_mm_fork(
     }
     if (status == KERNEL_MM_STATUS_OK)
         status = clone_elf_sources(source_record, destination_record);
+    if (status == KERNEL_MM_STATUS_OK && source_record->executable_file) {
+        if (kernel_open_file_acquire(source_record->executable_file) !=
+            KERNEL_OPEN_FILE_STATUS_OK)
+            status = KERNEL_MM_STATUS_STATE;
+        else destination_record->executable_file =
+                source_record->executable_file;
+    }
     if (status != KERNEL_MM_STATUS_OK) {
         destination_record->stage = RISCV_KERNEL_MM_RECORD_VMAS_CLEANUP;
         destination->allocator = source->allocator;
@@ -1342,6 +1351,51 @@ rollback:
         }
     }
     return status;
+}
+
+enum kernel_mm_status kernel_mm_set_executable(
+    struct kernel_mm *mm, struct kernel_open_file_description *file)
+{
+    struct riscv_kernel_mm_record *record;
+    enum kernel_mm_status status = mutable_vma_record(mm, &record);
+    if (status != KERNEL_MM_STATUS_OK) return status;
+    if (!file || record->executable_file || !kernel_open_file_path(file) ||
+        !record->elf_sources) return KERNEL_MM_STATUS_STATE;
+    if (kernel_open_file_acquire(file) != KERNEL_OPEN_FILE_STATUS_OK)
+        return KERNEL_MM_STATUS_STATE;
+    record->executable_file = file;
+    return KERNEL_MM_STATUS_OK;
+}
+
+enum kernel_mm_status kernel_mm_executable_path_acquire(
+    const struct kernel_mm *mm, struct kernel_vfs_path **owner)
+{
+    struct riscv_kernel_mm_record *record;
+    if (!owner || *owner) return KERNEL_MM_STATUS_INVALID_ARGUMENT;
+    enum kernel_mm_status status = resolve_record(mm, &record);
+    if (status != KERNEL_MM_STATUS_OK) return status;
+    if (!record->executable_file) return KERNEL_MM_STATUS_NOT_MAPPED;
+    struct kernel_vfs_path *path = kernel_open_file_path(record->executable_file);
+    if (!path || kernel_vfs_path_acquire(path)) return KERNEL_MM_STATUS_STATE;
+    *owner = path;
+    return KERNEL_MM_STATUS_OK;
+}
+
+enum kernel_mm_status kernel_mm_proc_memory_snapshot(
+    const struct kernel_mm *mm, struct kernel_mm_proc_memory *snapshot)
+{
+    if (!snapshot) return KERNEL_MM_STATUS_INVALID_ARGUMENT;
+    struct riscv_kernel_mm_record *record;
+    enum kernel_mm_status status = resolve_record(mm, &record);
+    if (status != KERNEL_MM_STATUS_OK) return status;
+    if (record->stage != RISCV_KERNEL_MM_RECORD_LIVE || !record->vmas)
+        return KERNEL_MM_STATUS_STATE;
+    *snapshot = (struct kernel_mm_proc_memory){
+        .virtual_bytes = kernel_vma_set_total_bytes(record->vmas),
+        .resident_pages = (uint64_t)record->space.leaf_pages +
+                          record->space.protected_pages,
+    };
+    return KERNEL_MM_STATUS_OK;
 }
 
 enum kernel_mm_status kernel_mm_vma_lookup(
@@ -2938,11 +2992,22 @@ enum kernel_mm_status kernel_mm_resolve_user_fault(
     struct kernel_mm *mm, uint64_t address, uint32_t access)
 {
     KERNEL_NO_RECLAIM_IO;
+    struct kernel_task *task = kernel_task_current();
+    const struct kernel_mm *task_mm = 0;
+    if (!mm || !task || kernel_task_mm_borrow(task, &task_mm) !=
+                     KERNEL_TASK_STATUS_OK ||
+        task_mm->record_page_address != mm->record_page_address) task = 0;
+    uint64_t block_reads = task ? kernel_proc_task_block_reads(task) : 0U;
     int resumed = 0;
     for (;;) {
         int retry = 0;
         enum kernel_mm_status result = resolve_user_fault_once(mm, address, access, &retry, resumed);
-        if (!retry) return result;
+        if (!retry) {
+            if (result == KERNEL_MM_STATUS_OK && task)
+                kernel_proc_task_note_fault(task,
+                    kernel_proc_task_block_reads(task) != block_reads);
+            return result;
+        }
         resumed = 1;
     }
 }
@@ -3006,7 +3071,7 @@ enum kernel_mm_status kernel_mm_release(struct kernel_mm *mm)
         }
         if (record->vmas == 0 && record->shared_anon == 0 &&
             record->file_sources == 0 &&
-            record->elf_sources == 0) {
+            record->elf_sources == 0 && record->executable_file == 0) {
             sv39_status = riscv_sv39_user_space_destroy(&record->space);
             if (sv39_status != RISCV_SV39_STATUS_OK) {
                 __builtin_trap();
@@ -3064,6 +3129,9 @@ enum kernel_mm_status kernel_mm_release(struct kernel_mm *mm)
         mm->cleanup_stage = KERNEL_MM_CLEANUP_ELF_SOURCES;
     }
     if (record->stage == RISCV_KERNEL_MM_RECORD_ELF_SOURCES_CLEANUP) {
+        if (record->executable_file &&
+            kernel_open_file_release(&record->executable_file) !=
+                KERNEL_OPEN_FILE_STATUS_OK) __builtin_trap();
         status = drain_elf_sources(record, 0);
         if (status != KERNEL_MM_STATUS_OK) {
             mm->state = KERNEL_MM_CLEANUP;

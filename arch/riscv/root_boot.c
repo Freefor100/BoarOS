@@ -11,6 +11,7 @@
 #include <kernel/fs_context.h>
 #include <kernel/mm.h>
 #include <kernel/open_file.h>
+#include <kernel/procfs.h>
 
 #include <stddef.h>
 #include <stdint.h>
@@ -122,7 +123,8 @@ enum riscv_root_boot_status riscv_root_boot_cleanup(
         root->cleanup_path = 0;
     }
     if (root->mount.private_data != 0) {
-        if (kernel_vfs_unmount(&root->mount) != 0) {
+        if (kernel_procfs_unmount_children(&root->mount) != 0 ||
+            kernel_vfs_unmount(&root->mount) != 0) {
             cleanup_failed = 1;
         }
     }
@@ -395,13 +397,10 @@ enum riscv_root_boot_status riscv_root_boot_start(
         failure = RISCV_ROOT_BOOT_STATUS_RESOURCES;
         goto fail;
     }
-    /*
-     * Bind PID 1 stdio to the console.  Bridge until a device filesystem
-     * provides /dev/console; fork already inherits the descriptors and
-     * exec only drops CLOEXEC ones.
-     */
+    /* 真实 /dev/console 节点优先；缺失时保留早期串口标准 fd。 */
     for (stdio_index = 0U; stdio_index < 3U; stdio_index++) {
-        if (kernel_files_open_console(&files,
+        if (kernel_files_open_boot_console(&files,
+                                      kernel_fs_context_root(&fs),
                                       (int64_t)stdio_index,
                                       &console_result) !=
                 KERNEL_FILES_STATUS_OK ||
@@ -489,7 +488,8 @@ enum riscv_root_boot_status riscv_root_boot_finish(
     if (root->finish_failure != RISCV_ROOT_FINISH_NONE) {
         return RISCV_ROOT_BOOT_STATUS_CLEANUP;
     }
-    error = kernel_vfs_unmount(&root->mount);
+    error = kernel_procfs_unmount_children(&root->mount);
+    if (error == 0) error = kernel_vfs_unmount(&root->mount);
     if (error != 0) {
         root->finish_failure = RISCV_ROOT_FINISH_UNMOUNT;
         root->finish_error = error;

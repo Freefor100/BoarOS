@@ -4,7 +4,7 @@
 
 ## 对象与所有权
 
-`include/kernel/files.h` 是公共接口；`fs/files/table.c` 管槽位、引用及回收，`io.c` 管读写/定位/枚举，`path.c` 管打开与 stat，`metadata.c` 管显式时间和文件系统统计，`console.c` 管输入等待和暂存，`fs/pipe.c` 管 pipe endpoint 与 ring，`include/kernel/fs_context.h` 和 `fs/fs_context.c` 管理根挂载与当前工作目录。两者都从同一内核堆分配，并随用户 task 一起被 scheduler 接管：
+`include/kernel/files.h` 是公共接口；`fs/files/table.c` 管槽位、引用及回收，`io.c` 管读写/定位/枚举，`path.c` 管打开与 stat，`metadata.c` 管显式时间和文件系统统计，`console.c` 管 UART 输入等待，`fs/char_device.c` 按设备号登记字符设备操作，`fs/pipe.c` 管 pipe endpoint 与 ring，`include/kernel/fs_context.h` 和 `fs/fs_context.c` 管理根挂载与当前工作目录。文件表与 fs context 都从同一内核堆分配，并随用户 task 一起被 scheduler 接管：
 
 - `kernel_files` 是进程可见的 fd 槽数组；槽保存 descriptor flags 和指向 open file description 的指针。
 - `kernel_open_file_description` 拥有一个 VFS file、当前 offset 和清理状态。分别打开同一路径会得到独立 description，因此 offset 互不影响。
@@ -27,6 +27,10 @@ normal open、dup/F_DUPFD、console、pipe2 和 epoll_create1 最终都经过 `t
 普通 clone 通过 `kernel_files_fork()` 新建并复制 fd 槽数组和 descriptor flags，同时增加每个 open file description 的引用。因此父子可以分别 close 或修改各自的 `FD_CLOEXEC` 槽，但同一个已打开文件的 offset 与底层 VFS file 生命周期共享。fs context 通过 `kernel_fs_context_fork()` 独立持有 root/cwd 路径引用和同一个 root mount。`dup/dup2/dup3/fcntl(F_DUPFD*)` 复用同一 OFD：`dup` 不携带 `FD_CLOEXEC`，`dup3` 只接受 `O_CLOEXEC` 且 `oldfd == newfd` 返回 `-EINVAL`；内部 `dup2` 对相同且有效的 fd 成功，不改变槽位。`dup2/dup3` 都对越界目标返回 `-EBADF`，目标槽被替换时按 close 语义摘除；`F_DUPFD/F_DUPFD_CLOEXEC` 从下界向上找第一个空槽，下界越界则返回 `-EINVAL`。固定 Linux 快照中的 [`fs/file.c`](../../references/linux/fs/file.c)、[`fs/fcntl.c`](../../references/linux/fs/fcntl.c) 与 [Linux dup 接口说明](https://man7.org/linux/man-pages/man2/dup.2.html)可用于核对这些边界。
 
 `kernel_files_acquire()` 让另一个 handle 共享整张 fd 表及其 cleanup owner，`kernel_fs_context_acquire()` 同样共享 cwd/root context；两者只增加 record 引用，不复制槽、cwd 或 OFD。任一非末 handle release 只清空自身 handle，既不关闭 fd，也不释放 cwd；最后一个 handle 才处理仍由 VFS/I/O 持有的清理 owner。普通 fork 接口仍保持“独立表/独立 cwd、共享 OFD”。固定 Linux `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 [`kernel/fork.c`](../../references/linux/kernel/fork.c)、[`fs/file.c`](../../references/linux/fs/file.c) 与 [`fs/fs_struct.c`](../../references/linux/fs/fs_struct.c)分别提供 `CLONE_FILES`/`CLONE_FS` record 引用和末引用清理基线。
+
+生成式 VFS 普通文件使用独立 OFD kind，不进入普通文件页缓存或 mmap；第一次非空读取从后端取得有 owner 的数据快照。read/readv 共享 OFD offset，pread 保留 offset，短拷贝 fault 只推进已复制字节，seek 到零重新生成，末引用释放快照。当前消费者是 [procfs](procfs.md) 的 meminfo、stat/status 与 mounts；文件元数据 size 为零不决定生成式读取 EOF。
+
+`/proc/<pid>/fd` 通过短关中断区借用目标文件表，普通文件直接取得路径引用；伪对象只复制 kind/身份，不把 OFD pin 留给可能已关闭的目标任务。重新打开 pipe 时，先在该短区预留一个 endpoint 引用，解锁后分配新 OFD，最后无论成功失败都撤销临时引用。只读、只写和读写的新 OFD 分别拥有 reader、writer 或两者；`O_RDWR` 的 poll 等待使用同时由读写状态变化唤醒的聚合队列。socket/epoll 不复制底层句柄来冒充新打开。
 
 ## 传统与 OFD 记录锁
 
@@ -128,7 +132,7 @@ open file description 的 offset 只增加实际复制到用户空间的字节�
 
 `kernel_files_fstat()/newfstatat()` 按 riscv64 asm-generic 128 字节 `struct stat` 填充。regular file 与 directory 都先由 `kernel_vfs_fstat()` 取得同一份 filesystem-independent metadata，再转换为 Linux ABI；dev/ino/mode/nlink/uid/gid/size、512-byte `blocks`、filesystem `blksize` 和 atime/mtime/ctime 除 size 来自共享 node 的逻辑大小外，均来自当前 ext4 inode。打开后 unlink 的 file handle 仍指向活着的 inode，因此 `fstat` 可继续读取内容与 metadata，并观察到 `nlink == 0`。当前根 mount 的 `st_dev` 是稳定的 VFS 内部 mount ID 1，只用于同一挂载内的身份比较，不冒充硬件 major/minor。
 
-console、pipe 和 epoll 是不属于 filesystem inode 的合成对象，继续走各自的显式 stat 形态；console 呈现 5:1 字符设备，pipe 呈现 FIFO。`newfstatat` 支持 cwd/dirfd/绝对路径与 `AT_EMPTY_PATH`（按 fd 取对象，`AT_FDCWD` 取 cwd）；目录路径可统计，`AT_SYMLINK_NOFOLLOW` 通过路径 inode 查询返回链接自身的 mode、大小和时间戳。常规文件 create/read/pread/write/writev/truncate/unlink 已更新 realtime 时间戳：读取按 relatime（含缓存命中、非零 EOF 和 user fault），写入先校验 inode maxbytes，再在 usercopy 前修改 mtime/ctime，同长度 truncate 也更新；零长度或访问模式拒绝不更新。创建/移除更新父目录 mtime/ctime，unlink 后仍打开的 inode 继续通过 live handle 更新。扩展 inode 保留纳秒与 signed epoch，旧 128-byte inode 按秒截断；只读挂载不写 atime，未初始化时钟不覆盖 fixture metadata。触发、I/O 错误 owner 和固定 Linux 依据见[文件时间戳](../learning/file-timestamps.md)。
+console、pipe 和 epoll 是不属于 filesystem inode 的合成对象，继续走各自的显式 stat 形态；console 呈现 5:1 字符设备，pipe 呈现 FIFO。`newfstatat` 支持 cwd/dirfd/绝对路径与 `AT_EMPTY_PATH`（按 fd 取对象，`AT_FDCWD` 取 cwd）；目录路径可统计，`AT_SYMLINK_NOFOLLOW` 通过路径 inode 查询返回链接自身的 mode、大小和时间戳。proc fd 的伪对象跟随式统计复用同一元数据快照。常规文件 create/read/pread/write/writev/truncate/unlink 已更新 realtime 时间戳：读取按 relatime（含缓存命中、非零 EOF 和 user fault），写入先校验 inode maxbytes，再在 usercopy 前修改 mtime/ctime，同长度 truncate 也更新；零长度或访问模式拒绝不更新。创建/移除更新父目录 mtime/ctime，unlink 后仍打开的 inode 继续通过 live handle 更新。扩展 inode 保留纳秒与 signed epoch，旧 128-byte inode 按秒截断；只读挂载不写 atime，未初始化时钟不覆盖 fixture metadata。触发、I/O 错误 owner 和固定 Linux 依据见[文件时间戳](../learning/file-timestamps.md)。
 
 `faccessat` syscall 48 复用 cwd/dirfd/绝对路径查找并跟随符号链接；非法 mode 先返回 `EINVAL`，用户路径 fault 为 `EFAULT`，不存在路径沿用查找 errno。当前不可变 root 身份仅需对普通文件执行请求保留“至少一个执行位”约束，对只读挂载的普通文件或目录写请求返回 `EROFS`；多用户凭据、ACL 与 mount `noexec` 尚未实现。边界由 `tests/diff-abi/access.c` 在同一 RV64 ELF 的固定 Linux 和 BoarOS 上核对；依据是本地 `references/linux/fs/open.c::do_faccessat`，commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`。
 
@@ -214,9 +218,9 @@ make test-riscv
 
 聚焦测试在真实 QEMU legacy 与 modern VirtIO/ext4 上覆盖绝对/相对路径、错误 flags、目录与缺失文件、4096 字节路径上限、最低 fd 复用、表扩容、统一 fd 安装统计、epoll 满表原子性、`O_CLOEXEC/O_NONBLOCK`、缓存命中后的跨页读取、EOF、部分 fault、fork 后 fd 表独立与 OFD offset 共享，以及 VFS orphan/I/O owner。stat 回归核对 regular/directory 的真实 inode metadata、allocated blocks、fstat/newfstatat 共同字段和 unlink-but-open 的零链接计数。它还在关闭 fd 后通过 MM backing 继续缺页，反复固定地址映射同一 OFD 并检查来源释放只发生一次，验证父子各自持有一份来源引用。生产 exec/clone 链验证普通 fd 与 offset 跨映像和父子保持、CLOEXEC fd 不可见，PID 1 的 stdio 与跨 exec 的 console 描述符由串口标记验证，并由最终资源基线证明退出清理生效。`make test-userland-riscv` 用静态和动态 musl 程序作为 PID 1 运行 stdio、readdir、read/lseek/fstat、dup、signal、pipe、pthread、TLS 和 dlopen；其中写打开普通文件的真实 `read/pread` 及其 dup 均验证 `EBADF`，是真实 U-mode 外部测例的入口。
 
-当前提供可共享的文件表与根 fs context handle，普通 clone 仍实现“复制表/复制 cwd、共享 OFD”；系统调用层是否选择共享由 clone flags 决定。当前已支持常规文件的读写（`write/writev/pwrite64/append`）、新建、删除（`unlinkat`）、截断（`ftruncate`）与目录修改（`mkdirat/rmdir`）及符号链接（`symlinkat/readlinkat`）；并支持 cwd/dirfd、普通/NOREPLACE rename；仍无后台异步写回、read-ahead、硬链接、并发读写锁或多挂载。当前单 hart 下 fd lookup 与 OFD acquire 之间不可调度；启用 SMP 前必须为共享 record 引用、槽查找/替换、统计和 OFD 引用补齐同步，不能直接复用这些无锁字段。pipe 同样是单 hart 对象。console 接收现为 tick 轮询（唤醒延迟上界一个 tick），外部中断（PLIC/SEIE）落地后替换为中断驱动。
+当前提供可共享的文件表与根 fs context handle，普通 clone 仍实现“复制表/复制 cwd、共享 OFD”；系统调用层是否选择共享由 clone flags 决定。当前已支持常规文件的读写（`write/writev/pwrite64/append`）、新建、删除（`unlinkat`）、截断（`ftruncate`）与目录修改（`mkdirat/rmdir`）及符号链接（`symlinkat/readlinkat`）；并支持 cwd/dirfd、普通/NOREPLACE rename；仍无后台异步写回、read-ahead、硬链接或第二个 ext4 块设备挂载。当前单 hart 下 fd lookup 与 OFD acquire 之间不可调度；启用 SMP 前必须为共享 record 引用、槽查找/替换、统计和 OFD 引用补齐同步，不能直接复用这些无锁字段。pipe 同样是单 hart 对象。console 接收现为 tick 轮询（唤醒延迟上界一个 tick），外部中断（PLIC/SEIE）落地后替换为中断驱动。
 
-字符设备节点由 ext4 提供名称和 `st_rdev`，`openat` 根据设备号选择 null、zero 或 console；未知设备号返回 `ENXIO`。路径打开的 console 与初始标准 fd 复用 UART 输入等待、非阻塞和信号打断逻辑。null 读 EOF、写消费请求长度，zero 读按实际用户复制进度填零；这两者不经过普通文件页缓存和 ext4 数据 I/O。设备 OFD 同样由 fd 表安装和引用，dup/fork 共享，关闭 fd 不撤销已 pin 的 I/O。`readv/writev/pread64/pwrite64/lseek/fstat/ppoll` 的设备边界在固定 Linux 差分中验证；未知 ioctl 对有效 fd 返回 `ENOTTY`。epoll 的普通/定位 I/O、seek 与匿名 inode mode 也经同一分派入口核对。当前没有 TTY 会话、设备 mmap、devfs 或通用设备注册接口。
+字符设备节点由 ext4 提供名称和 `st_rdev`；`openat` 只按设备号查找 `fs/char_device.c` 的内建操作表，未知设备号返回 `ENXIO`。OFD 持有选定的静态后端操作，read/write/poll 从它分派；初始标准 fd 也取得同一 console 后端。启动时优先打开根盘已有的 5:1 `/dev/console`，使标准 fd 持有真实路径；只有该节点缺失才使用无路径 UART OFD。其他查找/I/O 错误明确中止启动，不伪装为节点缺失。该表在当前执行地址域中初始化回调，兼容分页前模块测试与生产高半区。console 的 UART 输入等待支持非阻塞 `EAGAIN` 和信号打断；null 读 EOF、写消费请求长度，zero 读按实际用户复制进度填零；两者不经过普通文件页缓存和 ext4 数据 I/O。设备 OFD 由 fd 表安装和引用，dup/fork 共享，关闭 fd 不撤销已 pin 的 I/O。`readv/writev/pread64/pwrite64/lseek/fstat/ppoll` 及 console 非阻塞读取经固定 Linux 差分验证；未知 ioctl 对有效 fd 返回 `ENOTTY`。当前只登记三个静态内建设备，没有动态设备注册、TTY 会话、设备 mmap 或 devfs。
 
 设备号与操作依据固定 Linux commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 [`fs/char_dev.c`](../../references/linux/fs/char_dev.c)、[`drivers/char/mem.c`](../../references/linux/drivers/char/mem.c)、[`fs/eventpoll.c`](../../references/linux/fs/eventpoll.c) 与 [`fs/read_write.c`](../../references/linux/fs/read_write.c)。
 

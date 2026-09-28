@@ -1,5 +1,6 @@
 #include "../open_file_internal.h"
 #include "../vfs_internal.h"
+#include "../char_device_internal.h"
 #include "private.h"
 
 #include <kernel/errno.h>
@@ -135,6 +136,7 @@ enum kernel_files_status kernel_files_openat(
     enum kernel_files_status files_status;
 
     int created = 0;
+    int special_link = 0;
 
     if (!kernel_files_is_live(files) || !kernel_fs_context_is_live(fs) ||
         mm == 0 || linux_result == 0) {
@@ -190,36 +192,42 @@ enum kernel_files_status kernel_files_openat(
         *linux_result = result;
         return KERNEL_FILES_STATUS_OK;
     }
-    KERNEL_LOCK_SCOPE(namespace_guard);
-    kernel_vfs_namespace_lock(mount, &namespace_guard);
     enum kernel_open_file_path_operation operation =
         ((flags & LINUX_O_NOFOLLOW) ||
          (flags & (LINUX_O_CREAT | LINUX_O_EXCL)) == (LINUX_O_CREAT | LINUX_O_EXCL))
             ? KERNEL_OPEN_PATH_NOFOLLOW : KERNEL_OPEN_PATH_FOLLOW;
-    open_status = kernel_open_file_create_at(files->heap, start,
-                    kernel_fs_context_root(fs), path, operation, 0,
-                    &description, &result);
-    if (result == -KERNEL_ELOOP &&
-        (flags & (LINUX_O_CREAT | LINUX_O_EXCL)) ==
-            (LINUX_O_CREAT | LINUX_O_EXCL)) {
-        result = -KERNEL_EEXIST;
-    }
-    if (open_status == KERNEL_OPEN_FILE_STATUS_OK &&
-        result == -KERNEL_ENOENT &&
-        (flags & LINUX_O_CREAT) != 0U) {
-        if (kernel_vfs_mount_is_readonly(mount)) {
-            files->record->statistics.open_failures++;
-            if (finish_path(files, path) != KERNEL_FILES_STATUS_OK) {
-                return KERNEL_FILES_STATUS_STATE;
+    for (;;) {
+        created = 0;
+        open_status = kernel_open_file_create_at(files->heap, start,
+                        kernel_fs_context_root(fs), path, operation, 0,
+                        &description, &result);
+        if (open_status == KERNEL_OPEN_FILE_STATUS_OK &&
+            result == -KERNEL_ENOENT && operation == KERNEL_OPEN_PATH_FOLLOW) {
+            int link_result = kernel_vfs_reopen_link_at(start,
+                kernel_fs_context_root(fs), path, files->heap,
+                (uint32_t)flags, &description);
+            if (link_result != -KERNEL_ENOTSUP) {
+                result = link_result;
+                special_link = !result;
             }
-            *linux_result = -KERNEL_EROFS;
-            return KERNEL_FILES_STATUS_OK;
         }
+        if (result == -KERNEL_ELOOP &&
+            (flags & (LINUX_O_CREAT | LINUX_O_EXCL)) ==
+                (LINUX_O_CREAT | LINUX_O_EXCL))
+            result = -KERNEL_EEXIST;
+        if (open_status != KERNEL_OPEN_FILE_STATUS_OK ||
+            result != -KERNEL_ENOENT || !(flags & LINUX_O_CREAT))
+            break;
         created = 1;
         open_status = kernel_open_file_create_at(files->heap, start,
-                    kernel_fs_context_root(fs), path, KERNEL_OPEN_PATH_CREATE,
-                    (uint32_t)(mode & ~kernel_fs_context_umask(fs)),
-                    &description, &result);
+                        kernel_fs_context_root(fs), path, KERNEL_OPEN_PATH_CREATE,
+                        (uint32_t)(mode & ~kernel_fs_context_umask(fs)),
+                        &description, &result);
+        /* Another creator won between lookup and the target mount lock. */
+        if (open_status == KERNEL_OPEN_FILE_STATUS_OK &&
+            result == -KERNEL_EEXIST && !(flags & LINUX_O_EXCL))
+            continue;
+        break;
     }
     if (finish_path(files, path) != KERNEL_FILES_STATUS_OK) {
         if (description != 0) {
@@ -252,7 +260,17 @@ enum kernel_files_status kernel_files_openat(
         *linux_result = -KERNEL_EEXIST;
         return KERNEL_FILES_STATUS_OK;
     }
-    if (kernel_vfs_mount_is_readonly(mount) &&
+    if (special_link) {
+        if ((flags & LINUX_O_DIRECTORY) != 0U) {
+            files->record->statistics.open_failures++;
+            kernel_files_queue_description(files, description);
+            (void)kernel_files_drain_file_cleanup(files);
+            *linux_result = -KERNEL_ENOTDIR;
+            return KERNEL_FILES_STATUS_OK;
+        }
+        goto Finish_open;
+    }
+    if (kernel_vfs_mount_is_readonly(description->file.mount) &&
         (kernel_open_file_mode(description) & KERNEL_VFS_S_IFMT) ==
             KERNEL_VFS_S_IFREG) {
         uint64_t access_mode = flags & LINUX_O_ACCMODE;
@@ -289,8 +307,10 @@ enum kernel_files_status kernel_files_openat(
             *linux_result = -KERNEL_ENOTDIR;
             return KERNEL_FILES_STATUS_OK;
         }
-        if (access_mode == LINUX_O_WRONLY || access_mode == LINUX_O_RDWR ||
-            (flags & LINUX_O_TRUNC) != 0U) {
+        int generated = kernel_vfs_file_generated(&description->file);
+        if (!generated &&
+            (access_mode == LINUX_O_WRONLY || access_mode == LINUX_O_RDWR ||
+             (flags & LINUX_O_TRUNC) != 0U)) {
             int lease_result = kernel_vfs_file_acquire_write(&description->file);
             if (lease_result != 0) {
                 files->record->statistics.open_failures++;
@@ -300,7 +320,7 @@ enum kernel_files_status kernel_files_openat(
                 return KERNEL_FILES_STATUS_OK;
             }
         }
-        if (!created && (flags & LINUX_O_TRUNC) != 0U) {
+        if (!generated && !created && (flags & LINUX_O_TRUNC) != 0U) {
             int trunc_result = kernel_vfs_ftruncate(&description->file, 0U);
 
             if (trunc_result != 0) {
@@ -311,7 +331,8 @@ enum kernel_files_status kernel_files_openat(
                 return KERNEL_FILES_STATUS_OK;
             }
         }
-        description->kind = KERNEL_OPEN_FILE_KIND_REGULAR;
+        description->kind = generated
+            ? KERNEL_OPEN_FILE_KIND_GENERATED : KERNEL_OPEN_FILE_KIND_REGULAR;
     } else if ((kernel_open_file_mode(description) & KERNEL_VFS_S_IFMT) ==
                KERNEL_VFS_S_IFCHR) {
         struct kernel_vfs_stat stat;
@@ -320,20 +341,9 @@ enum kernel_files_status kernel_files_openat(
         if (stat_result == 0 && (flags & LINUX_O_DIRECTORY) != 0U)
             stat_result = -KERNEL_ENOTDIR;
         if (stat_result == 0) {
-            switch (stat.rdev) {
-            case UINT64_C(0x103):
-                description->kind = KERNEL_OPEN_FILE_KIND_NULL;
-                break;
-            case UINT64_C(0x105):
-                description->kind = KERNEL_OPEN_FILE_KIND_ZERO;
-                break;
-            case UINT64_C(0x501):
-                description->kind = KERNEL_OPEN_FILE_KIND_CONSOLE;
-                break;
-            default:
-                stat_result = -KERNEL_ENXIO;
-                break;
-            }
+            description->device = kernel_char_device_lookup(stat.rdev);
+            if (!description->device) stat_result = -KERNEL_ENXIO;
+            else description->kind = description->device->kind;
         }
         if (stat_result != 0) {
             files->record->statistics.open_failures++;
@@ -350,6 +360,7 @@ enum kernel_files_status kernel_files_openat(
         return KERNEL_FILES_STATUS_OK;
     }
 
+Finish_open:
     /* Linux treats the internal __O_SYNC bit as implying O_DSYNC. */
     if ((flags & (LINUX_O_SYNC & ~LINUX_O_DSYNC)) != 0U)
         flags |= LINUX_O_DSYNC;
@@ -518,32 +529,13 @@ static int fill_linux_stat(
     struct kernel_linux_stat *stat,
     const struct kernel_open_file_description *description)
 {
-    uint64_t size = kernel_open_file_size(description);
-    enum kernel_open_file_kind kind = kernel_open_file_kind(description);
-
     memset(stat, 0, sizeof(*stat));
-    if (kind == KERNEL_OPEN_FILE_KIND_CONSOLE &&
-        description->file.private_data == 0) {
-        stat->st_mode = KERNEL_VFS_S_IFCHR | UINT32_C(0000600);
-        stat->st_rdev = UINT64_C(0x501);
-    } else if (kind == KERNEL_OPEN_FILE_KIND_PIPE) {
-        stat->st_mode = KERNEL_VFS_S_IFIFO | UINT32_C(0000600);
-    } else if (kind == KERNEL_OPEN_FILE_KIND_EPOLL) {
-        /* Linux anon_inode_getfile supplies mode 0600 without type bits. */
-        stat->st_mode = UINT32_C(0000600);
-    } else if (kind == KERNEL_OPEN_FILE_KIND_SOCKET) {
-        stat->st_mode = KERNEL_VFS_S_IFSOCK | UINT32_C(0000600);
-    } else {
-        struct kernel_vfs_stat vfs_stat;
-        int result = kernel_vfs_fstat(&description->file, &vfs_stat);
-
-        if (result != 0) return result;
-        fill_linux_vfs_stat(stat, &vfs_stat);
-        return 0;
-    }
-    stat->st_nlink = 1U;
-    stat->st_size = (int64_t)size;
-    stat->st_blksize = (int32_t)BOAROS_PAGE_SIZE;
+    struct kernel_vfs_stat vfs_stat;
+    int result = kernel_open_file_pseudo_stat(description, &vfs_stat);
+    if (result == -KERNEL_ENOTSUP)
+        result = kernel_vfs_fstat(&description->file, &vfs_stat);
+    if (result) return result;
+    fill_linux_vfs_stat(stat, &vfs_stat);
     return 0;
 }
 
