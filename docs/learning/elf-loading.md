@@ -102,3 +102,10 @@ Auxv 的值必须来自真实机制，而不是为了让 libc 继续运行而伪
   深度检查位于下次格式分派前；覆盖五层成功、六层超限及边界错误。
 - `#!/init `（无换行）保留一个空可选参数，不能用参数首字节非零代替“参数存在”。
   换行查找遵循 strnchr 的 NUL 终止；覆盖 EOF 和嵌入 NUL。
+
+原盘 BusyBox v1.33.1 的 ash 回退还依赖 `/proc/self/exe`。固定源码
+`references/oscomp-testsuits/busybox/shell/ash.c:tryexec`（仓库 commit
+`b5ec6ef8497e1818cbdec3b54bb722f036e57972`）在 ENOEXEC 后用
+`bb_busybox_exec_path` 重启 shell，并非改用 `/bin/sh`。评测分支实测无 shebang
+文本直接执行为 127，显式 `busybox sh 文件` 为 0；内核 ENOEXEC 正确不等于此
+用户态回退环境已齐全。原盘身份和重建边界由评测分支模块记录，主线不伪造 proc 内容。
