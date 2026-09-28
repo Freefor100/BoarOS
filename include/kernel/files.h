@@ -137,6 +137,13 @@ enum kernel_files_status kernel_files_move(
 
 int kernel_files_is_live(const struct kernel_files *files);
 
+/* Borrowed descriptor inspection; caller serializes the table and pins any
+ * object it retains before releasing that protection. */
+struct kernel_open_file_description *kernel_files_fd_borrow(
+    const struct kernel_files *files, int64_t fd);
+int kernel_files_next_open_fd(const struct kernel_files *files, int after,
+                              int *fd);
+
 /* Normal Linux ABI results, including negative errno, use linux_result. */
 enum kernel_files_status kernel_files_utimensat(
     struct kernel_files *files, const struct kernel_fs_context *fs,

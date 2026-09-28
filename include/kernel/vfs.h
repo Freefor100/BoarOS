@@ -20,6 +20,7 @@
 #define KERNEL_VFS_S_IXOTH UINT32_C(0000001)
 
 struct kernel_vfs_path;
+struct kernel_open_file_description;
 struct kernel_vfs_mount {
     void *private_data;
     uint64_t id;
@@ -122,6 +123,10 @@ const char *kernel_vfs_path_name(const struct kernel_vfs_path *path);
 int kernel_vfs_open_at(struct kernel_vfs_path *start,
                        struct kernel_vfs_path *root, const char *path,
                        int follow_final, struct kernel_vfs_file *file);
+/* Only special final links handle this; ENOTSUP means ordinary resolution. */
+int kernel_vfs_reopen_link_at(struct kernel_vfs_path *start,
+    struct kernel_vfs_path *root, const char *path, struct kernel_heap *heap,
+    uint32_t flags, struct kernel_open_file_description **owner);
 int kernel_vfs_create_at(struct kernel_vfs_path *start,
                          struct kernel_vfs_path *root, const char *path,
                          uint32_t mode, struct kernel_vfs_file *file);

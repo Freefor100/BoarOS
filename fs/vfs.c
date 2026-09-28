@@ -787,6 +787,25 @@ int kernel_vfs_open_at(struct kernel_vfs_path *start,
     return result;
 }
 
+int kernel_vfs_reopen_link_at(struct kernel_vfs_path *start,
+    struct kernel_vfs_path *root, const char *path, struct kernel_heap *heap,
+    uint32_t flags, struct kernel_open_file_description **owner)
+{
+    if (!start || !root || !path || !heap || !owner || *owner)
+        return -KERNEL_EINVAL;
+    struct kernel_vfs_path *resolved = 0;
+    int result = kernel_vfs_path_resolve(start, root, path, 0, &resolved);
+    if (result) return result;
+    struct kernel_vfs_instance *instance = resolved->file.mount->private_data;
+    result = (resolved->file.mode & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFLNK &&
+             instance->ops->reopen_link
+        ? instance->ops->reopen_link(resolved->file.private_data, heap,
+                                     flags, owner)
+        : -KERNEL_ENOTSUP;
+    if (kernel_vfs_path_release(&resolved)) __builtin_trap();
+    return result;
+}
+
 static int mount_root_path(struct kernel_vfs_mount *mount,
                             struct kernel_vfs_path **root)
 {

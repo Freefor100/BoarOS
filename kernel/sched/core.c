@@ -858,7 +858,7 @@ enum kernel_scheduler_status kernel_user_thread_create(
             KERNEL_SCHEDULER_STATUS_INVALID_STATE);
         goto restore_interrupts;
     }
-    if (scheduler.next_proc_identity > (UINT64_MAX >> 24U)) {
+    if (scheduler.next_proc_identity > (UINT64_MAX >> 30U)) {
         status = release_task_storage(thread,
                                       KERNEL_SCHEDULER_STATUS_NO_MEMORY);
         goto restore_interrupts;

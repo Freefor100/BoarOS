@@ -49,6 +49,29 @@ int kernel_files_is_live(const struct kernel_files *files)
                KERNEL_FILES_INITIAL_CAPACITY;
 }
 
+struct kernel_open_file_description *kernel_files_fd_borrow(
+    const struct kernel_files *files, int64_t fd)
+{
+    if (!kernel_files_is_live(files) || fd < 0 ||
+        (uint64_t)fd >= files->record->statistics.capacity) return 0;
+    return files->record->slots[fd].description;
+}
+
+int kernel_files_next_open_fd(const struct kernel_files *files, int after,
+                              int *fd)
+{
+    if (!kernel_files_is_live(files) || !fd || after < -1)
+        return -KERNEL_EINVAL;
+    for (uint32_t i = (uint32_t)(after + 1);
+         i < files->record->statistics.capacity; i++) {
+        if (files->record->slots[i].description) {
+            *fd = (int)i;
+            return 0;
+        }
+    }
+    return -KERNEL_ENOENT;
+}
+
 static void finish_files(struct kernel_files *files,
                          enum kernel_files_state state)
 {

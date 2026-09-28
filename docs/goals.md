@@ -17,7 +17,7 @@ Linux 为 `references/linux` 的 `f4cdf7ca9a1fdcca413157df19753f388a5a224e`。
 | 通用 VFS 与 ext4 后端 | ext4 拆分已验证，生成文件待接入 | 实例/inode 身份、目录项和引用；普通缓存文件与生成文件分离；保留日志/错误 owner |
 | 挂载树与路径 | 内部路径及 proc 的用户态 mount/umount2 已验证；完整 proc 待交付 | 保持同点覆盖、根和 ..、cwd/dirfd、忙卸载/回滚；补齐 proc 进程对象后复跑真实消费者 |
 | 字符设备后端 | 已验证 | 按设备号登记 null/zero/console 操作，OFD 持有后端；/dev 仍为 ext4 目录，不冒充 devfs |
-| procfs 与对象链接 | meminfo、uptime、self、exe/cwd/root、mounts 与 stat/status 首批字段已通过差分；仍在进行 | 补 fd，验证 PID/fd 复用、字段边界与真实消费者 |
+| procfs 与对象链接 | meminfo、uptime、self、exe/cwd/root/fd、mounts 与 stat/status 首批字段已通过差分；仍在进行 | 补 magic-link 跟随式元数据、初始 console 链接及生命周期并发边界；保留真实消费者缺口 |
 | 集成与评测交接 | 待验收 | 先独立消费者诊断，再一次固定预算 RV 原 judge 评分；不拼接成绩 |
 
 进程查询区分 PID 分配代次，旧 proc 对象不能访问复用 PID 的新进程。MM 持有执行
@@ -53,7 +53,7 @@ RISC-V 全套、userland、glibc、栈及相关存储回归通过。契约见对
 |---|---|
 | libctest 包装器存在却 not found | BusyBox ENOEXEC 回退缺真实 self/exe；P1h，不能再归为内核缺 shebang |
 | LTP 缺 meminfo，最终反复读 /proc/5/stat | P1h 的真实统计/生命周期前置；不外推全部 syscall 失败 |
-| BusyBox df/ps/free 未计分 | P1h 消费者复跑，逐项确认残余依赖 |
+| BusyBox df/ps/free 未计分 | 目录枚举修正后 ps 实际列出进程；df 仍因固定 BusyBox 跳过来源名 rootfs、proc 的块数为零而只显示表头；free 调用尚无 sysinfo ABI，显示全零。P1h/P5 环境接口分别处理，不以退出 0 算内容正确 |
 | dmesg klogctl 未实现 | P5c 日志接口，必须有真实内容与权限边界 |
 | hwclock、kill 10 未计分 | P0 定位调用与目标状态；已有其他 kill 回归通过 |
 | cyclictest affinity ENOSYS、调度参数失败 | P2f 调度 ABI；完整依赖链另核实 |

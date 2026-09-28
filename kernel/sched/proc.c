@@ -2,6 +2,8 @@
 
 #include <arch/riscv/context.h>
 #include <kernel/errno.h>
+#include <kernel/files.h>
+#include <kernel/open_file.h>
 #include <kernel/proc_task.h>
 #include <kernel/fs_context.h>
 #include <kernel/task.h>
@@ -170,6 +172,108 @@ int kernel_proc_process_path_acquire(kernel_pid_t pid, uint64_t identity,
     }
     riscv_interrupt_restore(irq);
     return result;
+}
+
+int kernel_proc_next_fd(kernel_pid_t pid, uint64_t identity,
+                         int after, int *fd)
+{
+    if (pid <= 0 || !identity || !fd || after < -1)
+        return -KERNEL_EINVAL;
+    uintptr_t irq = riscv_interrupt_save();
+    struct kernel_task *task = find_member(pid, identity);
+    int result = task && kernel_files_is_live(&task->files)
+        ? kernel_files_next_open_fd(&task->files, after, fd)
+        : -KERNEL_ENOENT;
+    riscv_interrupt_restore(irq);
+    return result;
+}
+
+int kernel_proc_fd_access_snapshot(kernel_pid_t pid, uint64_t identity,
+                                   int fd, int *readable, int *writable)
+{
+    if (pid <= 0 || !identity || fd < 0 || !readable || !writable)
+        return -KERNEL_EINVAL;
+    uintptr_t irq = riscv_interrupt_save();
+    struct kernel_task *task = find_member(pid, identity);
+    struct kernel_open_file_description *file = task &&
+        kernel_files_is_live(&task->files)
+        ? kernel_files_fd_borrow(&task->files, fd) : 0;
+    if (file) {
+        if (kernel_open_file_kind(file) == KERNEL_OPEN_FILE_KIND_EPOLL) {
+            *readable = 1;
+            *writable = 1;
+        } else {
+            *readable = kernel_open_file_readable(file);
+            *writable = kernel_open_file_writable(file);
+        }
+    }
+    riscv_interrupt_restore(irq);
+    return file ? 0 : -KERNEL_ENOENT;
+}
+
+int kernel_proc_fd_path_acquire(kernel_pid_t pid, uint64_t identity,
+                                int fd, struct kernel_vfs_path **owner)
+{
+    if (pid <= 0 || !identity || fd < 0 || !owner || *owner)
+        return -KERNEL_EINVAL;
+    uintptr_t irq = riscv_interrupt_save();
+    struct kernel_task *task = find_member(pid, identity);
+    struct kernel_open_file_description *file = task &&
+        kernel_files_is_live(&task->files)
+        ? kernel_files_fd_borrow(&task->files, fd) : 0;
+    struct kernel_vfs_path *path = file ? kernel_open_file_path(file) : 0;
+    int result = -KERNEL_ENOENT;
+    if (path && !kernel_vfs_path_acquire(path)) {
+        *owner = path;
+        result = 0;
+    }
+    riscv_interrupt_restore(irq);
+    return result;
+}
+
+int kernel_proc_fd_pseudo_snapshot(kernel_pid_t pid, uint64_t identity,
+                                   int fd,
+                                   struct kernel_proc_fd_pseudo *snapshot)
+{
+    if (pid <= 0 || !identity || fd < 0 || !snapshot)
+        return -KERNEL_EINVAL;
+    uintptr_t irq = riscv_interrupt_save();
+    struct kernel_task *task = find_member(pid, identity);
+    struct kernel_open_file_description *file = task &&
+        kernel_files_is_live(&task->files)
+        ? kernel_files_fd_borrow(&task->files, fd) : 0;
+    int result = file ? -KERNEL_ENOTSUP : -KERNEL_ENOENT;
+    if (file && !kernel_open_file_path(file)) {
+        snapshot->kind = (uint8_t)kernel_open_file_kind(file);
+        snapshot->object_identity = kernel_open_file_pseudo_identity(file);
+        result = 0;
+    }
+    riscv_interrupt_restore(irq);
+    return result;
+}
+
+int kernel_proc_fd_reopen_link(kernel_pid_t pid, uint64_t identity,
+                               int fd, struct kernel_heap *heap,
+                               uint32_t flags,
+                               struct kernel_open_file_description **owner)
+{
+    if (pid <= 0 || !identity || fd < 0 || !heap || !owner || *owner)
+        return -KERNEL_EINVAL;
+    struct kernel_open_file_pipe_pin pin = {0};
+    uintptr_t irq = riscv_interrupt_save();
+    struct kernel_task *task = find_member(pid, identity);
+    struct kernel_open_file_description *file = task &&
+        kernel_files_is_live(&task->files)
+        ? kernel_files_fd_borrow(&task->files, fd) : 0;
+    int result = file ? -KERNEL_ENXIO : -KERNEL_ENOENT;
+    /* 解锁后 fd 可关闭；先钉住 pipe endpoint 再分配新 OFD。 */
+    if (file && kernel_open_file_path(file)) result = -KERNEL_ENOTSUP;
+    else if (file &&
+             kernel_open_file_kind(file) == KERNEL_OPEN_FILE_KIND_PIPE)
+        result = kernel_open_file_pipe_pin(file, flags, &pin);
+    riscv_interrupt_restore(irq);
+    if (result || !pin.pipe) return result;
+    return kernel_open_file_pipe_finish(heap, &pin, flags, owner);
 }
 
 static void consider(const struct kernel_task *task, kernel_pid_t after,

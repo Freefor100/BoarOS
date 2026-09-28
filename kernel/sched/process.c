@@ -576,7 +576,7 @@ enum kernel_scheduler_status riscv_process_clone_current(
                     : KERNEL_SCHEDULER_STATUS_INVALID_STATE);
         }
     }
-    if (scheduler.next_proc_identity > (UINT64_MAX >> 24U)) {
+    if (scheduler.next_proc_identity > (UINT64_MAX >> 30U)) {
         return finish_clone_failure(child, -KERNEL_EAGAIN, linux_result,
                                     KERNEL_SCHEDULER_STATUS_OK);
     }

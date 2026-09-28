@@ -6,6 +6,8 @@
 
 struct kernel_vfs_path;
 struct kernel_task;
+struct kernel_open_file_description;
+struct kernel_heap;
 
 enum kernel_proc_path_kind {
     KERNEL_PROC_PATH_EXE = 1,
@@ -45,6 +47,23 @@ int kernel_proc_process_snapshot(kernel_pid_t pid, uint64_t identity,
 int kernel_proc_process_path_acquire(kernel_pid_t pid, uint64_t identity,
                                      enum kernel_proc_path_kind kind, int fd,
                                      struct kernel_vfs_path **owner);
+int kernel_proc_next_fd(kernel_pid_t pid, uint64_t identity,
+                         int after, int *fd);
+int kernel_proc_fd_access_snapshot(kernel_pid_t pid, uint64_t identity,
+                                   int fd, int *readable, int *writable);
+int kernel_proc_fd_path_acquire(kernel_pid_t pid, uint64_t identity,
+                                int fd, struct kernel_vfs_path **owner);
+struct kernel_proc_fd_pseudo {
+    uint64_t object_identity;
+    uint8_t kind;
+};
+int kernel_proc_fd_pseudo_snapshot(kernel_pid_t pid, uint64_t identity,
+                                   int fd,
+                                   struct kernel_proc_fd_pseudo *snapshot);
+int kernel_proc_fd_reopen_link(kernel_pid_t pid, uint64_t identity,
+                               int fd, struct kernel_heap *heap,
+                               uint32_t flags,
+                               struct kernel_open_file_description **owner);
 
 /* Fault I/O attribution belongs to the running task, including after sleep. */
 void kernel_proc_task_note_block_read(void);

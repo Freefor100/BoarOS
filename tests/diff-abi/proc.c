@@ -12,12 +12,76 @@ static void proc_child_path(char *path, long pid)
     path[i] = '\0';
 }
 
+static void proc_fd_path(char *path, long fd)
+{
+    const char prefix[] = "/proc-probe/self/fd/";
+    unsigned i = 0;
+    while (i < sizeof(prefix) - 1U) { path[i] = prefix[i]; i++; }
+    char reverse[24];
+    unsigned used = 0;
+    do { reverse[used++] = '0' + fd % 10; fd /= 10; } while (fd);
+    while (used) path[i++] = reverse[--used];
+    path[i] = '\0';
+}
+
+static int proc_link_number(const char *text, long length,
+                            const char *prefix, unsigned prefix_length)
+{
+    if (length <= (long)prefix_length + 1 ||
+        text[length - 1] != ']') return 0;
+    for (unsigned i = 0; i < prefix_length; i++)
+        if (text[i] != prefix[i]) return 0;
+    for (long i = prefix_length; i < length - 1; i++)
+        if (text[i] < '0' || text[i] > '9') return 0;
+    return 1;
+}
+
+static int proc_directory_has(long fd, const char *wanted)
+{
+    if (fd < 0) return 0;
+    char entries[4096];
+    long got = SC3(61, fd, entries, sizeof(entries));
+    for (long at = 0; got > 0 && at + 19 < got;) {
+        unsigned short reclen = (unsigned char)entries[at + 16] |
+            ((unsigned short)(unsigned char)entries[at + 17] << 8);
+        if (reclen < 20 || at + reclen > got) break;
+        long i = 0;
+        while (at + 19 + i < at + reclen &&
+               entries[at + 19 + i] && wanted[i]) {
+            if (entries[at + 19 + i] != wanted[i]) break;
+            i++;
+        }
+        if (at + 19 + i < at + reclen &&
+            !wanted[i] && !entries[at + 19 + i]) return 1;
+        at += reclen;
+    }
+    return 0;
+}
+
+static long proc_directory_finish(long fd)
+{
+    char entries[4096];
+    if (fd < 0) return -9;
+    for (unsigned attempt = 0; attempt < 1024U; attempt++) {
+        long got = SC3(61, fd, entries, sizeof(entries));
+        if (got <= 0) return got;
+    }
+    return -1;
+}
+
 /* Missing mount dispatch must not masquerade as a procfs consumer failure. */
 void abi_proc_cases(void)
 {
     abi_require(SC3(34, -100, "/proc-probe", 0755) == 0);
     long mounted = SC5(40, "proc", "/proc-probe", "proc", 0, 0);
     abi_record("proc.mount", mounted, -1, -1, 0, 0, 0);
+    long root_directory = abi_open("/proc-probe", 0);
+    abi_record("proc.root-list",
+               proc_directory_has(root_directory, "meminfo") ? 0 : -1,
+               -1, -1, 0, 0, 0);
+    abi_record("proc.root-eof", proc_directory_finish(root_directory),
+               -1, -1, 0, 0, 0);
+    if (root_directory >= 0) abi_require(SC1(57, root_directory) == 0);
     long fd = abi_open("/proc-probe/meminfo", 0);
     abi_record("proc.meminfo-open", fd < 0 ? fd : 0, -1, -1, 0, 0, 0);
     long writable = abi_open("/proc-probe/meminfo", 1);
@@ -155,6 +219,142 @@ void abi_proc_cases(void)
     }
     abi_record("proc.status-fields", status_shape ? 0 : -1,
                -1, -1, 0, 0, 0);
+    long fd_directory = abi_open("/proc-probe/self/fd", 0);
+    abi_record("proc.fd-dir", fd_directory < 0 ? fd_directory : 0,
+               -1, -1, 0, 0, 0);
+    long object_fd = SC4(56, -100, "/proc-fd-target", 0102, 0644);
+    abi_require(object_fd >= 0);
+    abi_require(SC3(64, object_fd, "abcdef", 6) == 6);
+    abi_require(SC3(62, object_fd, 3, 0) == 3);
+    char fd_path[48];
+    proc_fd_path(fd_path, object_fd);
+    const char *wanted_fd = fd_path + sizeof("/proc-probe/self/fd/") - 1;
+    int listed = proc_directory_has(fd_directory, wanted_fd);
+    abi_record("proc.fd-list-target", listed ? 0 : -1,
+               -1, -1, 0, 0, 0);
+    abi_record("proc.fd-eof", proc_directory_finish(fd_directory),
+               -1, -1, 0, 0, 0);
+    if (fd_directory >= 0) abi_require(SC1(57, fd_directory) == 0);
+    char fd_link[64] = {0};
+    long fd_link_size = SC4(78, -100, fd_path, fd_link, sizeof(fd_link));
+    abi_record("proc.fd-link", fd_link_size, -1, -1, 0,
+               fd_link, fd_link_size > 0 ? (usize)fd_link_size : 0);
+    struct abi_stat fd_stat;
+    long fd_stat_result = SC4(79, -100, fd_path, &fd_stat, 0x100);
+    abi_record("proc.fd-link-mode", fd_stat_result,
+               fd_stat_result ? -1 : (long)(fd_stat.mode & 0777U),
+               -1, 0, 0, 0);
+    long reopened = abi_open(fd_path, 0);
+    abi_record("proc.fd-reopen", reopened < 0 ? reopened : 0,
+               -1, -1, 0, 0, 0);
+    char first = 0;
+    abi_record("proc.fd-reopen-read",
+               reopened >= 0 ? SC3(63, reopened, &first, 1) : -9,
+               -1, -1, 0, &first, 1);
+    abi_record("proc.fd-original-offset", abi_offset(object_fd),
+               -1, -1, 0, 0, 0);
+    if (reopened >= 0) abi_require(SC1(57, reopened) == 0);
+    abi_require(SC1(57, object_fd) == 0);
+    abi_record("proc.fd-closed-link",
+               SC4(78, -100, fd_path, fd_link, sizeof(fd_link)),
+               -1, -1, 0, 0, 0);
+    abi_require(SC3(35, -100, "/proc-fd-target", 0) == 0);
+    long reused = SC4(56, -100, "/proc-fd-second", 0102, 0644);
+    abi_require(reused >= 0);
+    proc_fd_path(fd_path, reused);
+    long reused_length = SC4(78, -100, fd_path, fd_link, sizeof(fd_link));
+    abi_record("proc.fd-reused-link", reused_length, -1, -1, 0,
+               fd_link, reused_length > 0 ? (usize)reused_length : 0);
+    abi_require(SC1(57, reused) == 0);
+    abi_require(SC3(35, -100, "/proc-fd-second", 0) == 0);
+    int pipe_fds[2] = {-1, -1};
+    abi_require(SC2(59, pipe_fds, 0) == 0);
+    proc_fd_path(fd_path, pipe_fds[0]);
+    fd_link_size = SC4(78, -100, fd_path, fd_link, sizeof(fd_link));
+    abi_record("proc.fd-pipe-link",
+               proc_link_number(fd_link, fd_link_size, "pipe:[", 6U)
+                    ? 0 : -1, -1, -1, 0, 0, 0);
+    fd_stat_result = SC4(79, -100, fd_path, &fd_stat, 0x100);
+    abi_record("proc.fd-pipe-mode", fd_stat_result,
+               fd_stat_result ? -1 : (long)(fd_stat.mode & 0777U),
+               -1, 0, 0, 0);
+    reopened = abi_open(fd_path, 0);
+    abi_record("proc.fd-pipe-reopen", reopened < 0 ? reopened : 0,
+               -1, -1, 0, 0, 0);
+    abi_require(SC3(64, pipe_fds[1], "P", 1) == 1);
+    char pipe_byte = 0;
+    abi_record("proc.fd-pipe-read",
+               reopened >= 0 ? SC3(63, reopened, &pipe_byte, 1) : -9,
+               -1, -1, 0, &pipe_byte, 1);
+    long both = abi_open(fd_path, 2);
+    abi_record("proc.fd-pipe-rdwr", both < 0 ? both : 0,
+               -1, -1, 0, 0, 0);
+    abi_require(SC1(57, pipe_fds[0]) == 0);
+    if (reopened >= 0) abi_require(SC3(64, pipe_fds[1], "Q", 1) == 1);
+    pipe_byte = 0;
+    abi_record("proc.fd-pipe-after-close",
+               reopened >= 0 ? SC3(63, reopened, &pipe_byte, 1) : -9,
+               -1, -1, 0, &pipe_byte, 1);
+    abi_record("proc.fd-pipe-rdwr-write",
+               both >= 0 ? SC3(64, both, "R", 1) : -9,
+               -1, -1, 0, 0, 0);
+    pipe_byte = 0;
+    abi_record("proc.fd-pipe-rdwr-read",
+               both >= 0 ? SC3(63, both, &pipe_byte, 1) : -9,
+               -1, -1, 0, &pipe_byte, 1);
+    if (both >= 0) abi_require(SC1(57, both) == 0);
+    proc_fd_path(fd_path, pipe_fds[1]);
+    long reopened_writer = abi_open(fd_path, 1);
+    abi_record("proc.fd-pipe-wr-reopen",
+               reopened_writer < 0 ? reopened_writer : 0,
+               -1, -1, 0, 0, 0);
+    abi_require(SC1(57, pipe_fds[1]) == 0);
+    abi_record("proc.fd-pipe-wr-after-close",
+               reopened_writer >= 0 ? SC3(64, reopened_writer, "T", 1) : -9,
+               -1, -1, 0, 0, 0);
+    pipe_byte = 0;
+    abi_record("proc.fd-pipe-wr-delivered",
+               reopened_writer >= 0 && reopened >= 0
+                   ? SC3(63, reopened, &pipe_byte, 1) : -9,
+               -1, -1, 0, &pipe_byte, 1);
+    if (reopened_writer >= 0)
+        abi_require(SC1(57, reopened_writer) == 0);
+    if (reopened >= 0) abi_require(SC1(57, reopened) == 0);
+    long socket_fd = SC3(198, 2, 2, 0);
+    abi_require(socket_fd >= 0);
+    proc_fd_path(fd_path, socket_fd);
+    fd_link_size = SC4(78, -100, fd_path, fd_link, sizeof(fd_link));
+    abi_record("proc.fd-socket-link",
+               proc_link_number(fd_link, fd_link_size, "socket:[", 8U)
+                    ? 0 : -1, -1, -1, 0, 0, 0);
+    fd_stat_result = SC4(79, -100, fd_path, &fd_stat, 0x100);
+    abi_record("proc.fd-socket-mode", fd_stat_result,
+               fd_stat_result ? -1 : (long)(fd_stat.mode & 0777U),
+               -1, 0, 0, 0);
+    reopened = abi_open(fd_path, 0);
+    abi_record("proc.fd-socket-reopen", reopened < 0 ? reopened : 0,
+               -1, -1, 0, 0, 0);
+    if (reopened >= 0) abi_require(SC1(57, reopened) == 0);
+    abi_require(SC1(57, socket_fd) == 0);
+    long epoll_fd = SC1(20, 0);
+    abi_require(epoll_fd >= 0);
+    proc_fd_path(fd_path, epoll_fd);
+    fd_link_size = SC4(78, -100, fd_path, fd_link, sizeof(fd_link));
+    const char epoll_link[] = "anon_inode:[eventpoll]";
+    int epoll_match = fd_link_size == (long)sizeof(epoll_link) - 1;
+    for (unsigned i = 0; epoll_match && i < sizeof(epoll_link) - 1; i++)
+        if (fd_link[i] != epoll_link[i]) epoll_match = 0;
+    abi_record("proc.fd-epoll-link", epoll_match ? 0 : -1,
+               -1, -1, 0, 0, 0);
+    fd_stat_result = SC4(79, -100, fd_path, &fd_stat, 0x100);
+    abi_record("proc.fd-epoll-mode", fd_stat_result,
+               fd_stat_result ? -1 : (long)(fd_stat.mode & 0777U),
+               -1, 0, 0, 0);
+    reopened = abi_open(fd_path, 0);
+    abi_record("proc.fd-epoll-reopen", reopened < 0 ? reopened : 0,
+               -1, -1, 0, 0, 0);
+    if (reopened >= 0) abi_require(SC1(57, reopened) == 0);
+    abi_require(SC1(57, epoll_fd) == 0);
     long child = CALL(220, 17, 0, 0, 0, 0, 0);
     abi_require(child >= 0);
     if (!child) abi_exit(0);

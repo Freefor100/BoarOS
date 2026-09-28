@@ -28,7 +28,9 @@ normal open、dup/F_DUPFD、console、pipe2 和 epoll_create1 最终都经过 `t
 
 `kernel_files_acquire()` 让另一个 handle 共享整张 fd 表及其 cleanup owner，`kernel_fs_context_acquire()` 同样共享 cwd/root context；两者只增加 record 引用，不复制槽、cwd 或 OFD。任一非末 handle release 只清空自身 handle，既不关闭 fd，也不释放 cwd；最后一个 handle 才处理仍由 VFS/I/O 持有的清理 owner。普通 fork 接口仍保持“独立表/独立 cwd、共享 OFD”。固定 Linux `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 [`kernel/fork.c`](../../references/linux/kernel/fork.c)、[`fs/file.c`](../../references/linux/fs/file.c) 与 [`fs/fs_struct.c`](../../references/linux/fs/fs_struct.c)分别提供 `CLONE_FILES`/`CLONE_FS` record 引用和末引用清理基线。
 
-生成式 VFS 普通文件使用独立 OFD kind，不进入普通文件页缓存或 mmap；第一次非空读取从后端取得有 owner 的数据快照。read/readv 共享 OFD offset，pread 保留 offset，短拷贝 fault 只推进已复制字节，seek 到零重新生成，末引用释放快照。当前消费者是 [procfs](procfs.md) 的 meminfo；文件元数据 size 为零不决定生成式读取 EOF。
+生成式 VFS 普通文件使用独立 OFD kind，不进入普通文件页缓存或 mmap；第一次非空读取从后端取得有 owner 的数据快照。read/readv 共享 OFD offset，pread 保留 offset，短拷贝 fault 只推进已复制字节，seek 到零重新生成，末引用释放快照。当前消费者是 [procfs](procfs.md) 的 meminfo、stat/status 与 mounts；文件元数据 size 为零不决定生成式读取 EOF。
+
+`/proc/<pid>/fd` 通过短关中断区借用目标文件表，普通文件直接取得路径引用；伪对象只复制 kind/身份，不把 OFD pin 留给可能已关闭的目标任务。重新打开 pipe 时，先在该短区预留一个 endpoint 引用，解锁后分配新 OFD，最后无论成功失败都撤销临时引用。只读、只写和读写的新 OFD 分别拥有 reader、writer 或两者；`O_RDWR` 的 poll 等待使用同时由读写状态变化唤醒的聚合队列。socket/epoll 不复制底层句柄来冒充新打开。
 
 ## 传统与 OFD 记录锁
 

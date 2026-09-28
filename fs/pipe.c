@@ -21,6 +21,13 @@
 #define KERNEL_PIPE_NO_BUFFER UINT64_MAX
 #define KERNEL_PIPE_SIGPIPE 13U
 
+static uint64_t next_pipe_proc_identity = 1U;
+
+uint64_t kernel_pipe_proc_identity(const struct kernel_pipe *pipe)
+{
+    return pipe ? pipe->proc_identity : 0U;
+}
+
 static enum kernel_pipe_status pipe_destroy(struct kernel_pipe *pipe)
 {
     if (pipe->buffer_physical != KERNEL_PIPE_NO_BUFFER) {
@@ -81,6 +88,11 @@ enum kernel_pipe_status kernel_pipe_create(
     pipe->buffer = buffer;
     kernel_wait_queue_init(&pipe->read_queue);
     kernel_wait_queue_init(&pipe->write_queue);
+    kernel_wait_queue_init(&pipe->both_queue);
+    uintptr_t irq = riscv_interrupt_save();
+    if (!next_pipe_proc_identity) __builtin_trap();
+    pipe->proc_identity = next_pipe_proc_identity++;
+    riscv_interrupt_restore(irq);
     *owner = pipe;
     return KERNEL_PIPE_STATUS_OK;
 }
@@ -90,21 +102,16 @@ enum kernel_pipe_status kernel_pipe_acquire_endpoint(
     uint32_t endpoint)
 {
     if (pipe == 0 || pipe->heap == 0 || pipe->buffer == 0 ||
-        (endpoint != KERNEL_PIPE_ENDPOINT_READ &&
-         endpoint != KERNEL_PIPE_ENDPOINT_WRITE)) {
+        endpoint < KERNEL_PIPE_ENDPOINT_READ ||
+        endpoint > KERNEL_PIPE_ENDPOINT_BOTH) {
         return KERNEL_PIPE_STATUS_INVALID_ARGUMENT;
     }
-    if (endpoint == KERNEL_PIPE_ENDPOINT_READ) {
-        if (pipe->readers == UINT32_MAX) {
-            return KERNEL_PIPE_STATUS_STATE;
-        }
-        pipe->readers++;
-    } else {
-        if (pipe->writers == UINT32_MAX) {
-            return KERNEL_PIPE_STATUS_STATE;
-        }
-        pipe->writers++;
-    }
+    if (((endpoint & KERNEL_PIPE_ENDPOINT_READ) &&
+         pipe->readers == UINT32_MAX) ||
+        ((endpoint & KERNEL_PIPE_ENDPOINT_WRITE) &&
+         pipe->writers == UINT32_MAX)) return KERNEL_PIPE_STATUS_STATE;
+    if (endpoint & KERNEL_PIPE_ENDPOINT_READ) pipe->readers++;
+    if (endpoint & KERNEL_PIPE_ENDPOINT_WRITE) pipe->writers++;
     return KERNEL_PIPE_STATUS_OK;
 }
 
@@ -132,29 +139,27 @@ enum kernel_pipe_status kernel_pipe_release_endpoint(
     enum kernel_pipe_status status;
 
     if (pipe == 0 || pipe->heap == 0 ||
-        (endpoint != KERNEL_PIPE_ENDPOINT_READ &&
-         endpoint != KERNEL_PIPE_ENDPOINT_WRITE)) {
+        endpoint < KERNEL_PIPE_ENDPOINT_READ ||
+        endpoint > KERNEL_PIPE_ENDPOINT_BOTH) {
         return KERNEL_PIPE_STATUS_INVALID_ARGUMENT;
     }
     saved = riscv_interrupt_save();
-    if (endpoint == KERNEL_PIPE_ENDPOINT_READ) {
-        if (pipe->readers == 0U) {
-            riscv_interrupt_restore(saved);
-            return KERNEL_PIPE_STATUS_STATE;
-        }
-        pipe->readers--;
-    } else {
-        if (pipe->writers == 0U) {
-            riscv_interrupt_restore(saved);
-            return KERNEL_PIPE_STATUS_STATE;
-        }
-        pipe->writers--;
+    if (((endpoint & KERNEL_PIPE_ENDPOINT_READ) &&
+         pipe->readers == 0U) ||
+        ((endpoint & KERNEL_PIPE_ENDPOINT_WRITE) &&
+         pipe->writers == 0U)) {
+        riscv_interrupt_restore(saved);
+        return KERNEL_PIPE_STATUS_STATE;
     }
+    if (endpoint & KERNEL_PIPE_ENDPOINT_READ) pipe->readers--;
+    if (endpoint & KERNEL_PIPE_ENDPOINT_WRITE) pipe->writers--;
     if (pipe->writers == 0U) {
         (void)kernel_wait_queue_wake_all(&pipe->read_queue);
+        (void)kernel_wait_queue_wake_all(&pipe->both_queue);
     }
     if (pipe->readers == 0U) {
         (void)kernel_wait_queue_wake_all(&pipe->write_queue);
+        (void)kernel_wait_queue_wake_all(&pipe->both_queue);
     }
     if (pipe->readers == 0U && pipe->writers == 0U) {
         status = pipe_destroy(pipe);
@@ -300,6 +305,7 @@ enum kernel_pipe_status kernel_pipe_readv(
     }
     if (committed != 0U) {
         (void)kernel_wait_queue_wake_all(&pipe->write_queue);
+        (void)kernel_wait_queue_wake_all(&pipe->both_queue);
     }
     riscv_interrupt_restore(saved);
     if (committed == 0U && fault) {
@@ -445,6 +451,7 @@ enum kernel_pipe_status kernel_pipe_writev(
         total += chunk;
         /* Any bytes produced make sleeping readers or epoll watchers eligible. */
         (void)kernel_wait_queue_wake_all(&pipe->read_queue);
+        (void)kernel_wait_queue_wake_all(&pipe->both_queue);
     }
     riscv_interrupt_restore(saved);
     *linux_result = (int64_t)total;
@@ -463,27 +470,29 @@ uint32_t kernel_pipe_poll(
         return KERNEL_POLLNVAL;
     }
 
-    if (endpoint == KERNEL_PIPE_ENDPOINT_READ) {
-        if (out_queue != 0) {
-            *out_queue = &pipe->read_queue;
-        }
+    if (out_queue != 0)
+        *out_queue = endpoint == KERNEL_PIPE_ENDPOINT_BOTH
+            ? &pipe->both_queue :
+              endpoint == KERNEL_PIPE_ENDPOINT_READ ? &pipe->read_queue :
+              endpoint == KERNEL_PIPE_ENDPOINT_WRITE ? &pipe->write_queue : 0;
+    if (endpoint & KERNEL_PIPE_ENDPOINT_READ) {
         if (pipe->bytes > 0U) {
             events |= (KERNEL_POLLIN | KERNEL_POLLRDNORM);
         }
         if (pipe->writers == 0U) {
             events |= KERNEL_POLLHUP;
         }
-    } else if (endpoint == KERNEL_PIPE_ENDPOINT_WRITE) {
-        if (out_queue != 0) {
-            *out_queue = &pipe->write_queue;
-        }
+    }
+    if (endpoint & KERNEL_PIPE_ENDPOINT_WRITE) {
         if (pipe->readers == 0U) {
             events |= KERNEL_POLLERR;
             events |= (KERNEL_POLLOUT | KERNEL_POLLWRNORM);
         } else if (pipe->slots < KERNEL_PIPE_CAPACITY / BOAROS_PAGE_SIZE) {
             events |= (KERNEL_POLLOUT | KERNEL_POLLWRNORM);
         }
-    } else {
+    }
+    if (endpoint < KERNEL_PIPE_ENDPOINT_READ ||
+        endpoint > KERNEL_PIPE_ENDPOINT_BOTH) {
         if (out_queue != 0) *out_queue = 0;
         return KERNEL_POLLNVAL;
     }

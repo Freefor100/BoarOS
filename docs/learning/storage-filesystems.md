@@ -88,6 +88,35 @@ stat 至第 24 字段 RSS；因此首批只发布有真实来源的前 24 字段
 的 VirtIO 读请求归因；另一个任务装载同页时等待者的 major 分类仍需改进，
 不能把这批字段描述为完整 Linux proc 实现。
 
+fd 链接与目录枚举依据固定 Linux `references/linux/fs/proc/fd.c` 的
+`proc_fd_link()`、`proc_readfd_common()`、`tid_fd_update_inode()`，以及
+`references/linux/fs/readdir.c` 的返回契约（同一固定 commit）。旧基线
+`2b0ff4a` 的 `/proc/self/fd` 为 `ENOENT`；补入链接后又发现 procfs 的
+`dir_entry` 把一条有效目录项返回为零，通用 `getdents64` 因而把整目录视为
+EOF。这是此前 BusyBox `ps` 虽报 success 却只打印表头的根因。修正有效项后，
+又用第二次 `getdents64` 对照发现目录终点误报 `ENOENT`；按“正值找到、
+零 EOF”并保持游标不变后，根目录和 fd 目录才完整枚举。普通文件重开得到独立
+offset；pipe 重开得到新的读、写或读写 endpoint owner，原 fd 关闭后继续
+传输；socket/epoll 的 `readlink` 有真实对象类型，重开为 `ENXIO`。fd 关闭、
+编号复用和链接权限位也按当前槽验证。`tests/diff-abi/proc.c` 用同一 RV ELF
+对照后共 652 条记录一致；`make test-files-riscv test-vfs-riscv
+test-stack-usage` 通过。初始无路径 console 与伪对象跟随式 stat 仍未验收。
+审查 inode 编码时还发现当前 PID 分配器允许编号 32768，必须为 PID 保留完整
+16 位；将 15 位截断会把该编号错误编码为零，因此 fd 扩展使用 16 位 PID、
+10 位 fd、4 位种类和 34 位单调代次，并在构造时检查边界。
+
+原始固定 BusyBox 包装脚本以 SHA-256
+`f2cda5fcdff6d41c8a553ac658e8aa55b6a48aa40898cb123a19f7865f3773ac`
+复跑，入口为 `python3 tests/program-inventory/run.py --suite busybox
+--case busybox.official --reuse-builds --timeout 90 --output build/proc-busybox-fd-consumer`。
+这次固定 Linux 55/55 子项 success，BoarOS 53/55，`dmesg` 和 `hwclock`
+失败；这是程序清单诊断，不是比赛 judge 分数。修正目录枚举后 BoarOS `ps`
+真正列出 PID 1–4；此前仅有表头，不能把退出零当成可用。`df` 仍仅有表头：
+固定 BusyBox 配置启用 `FEATURE_SKIP_ROOTFS`，会跳过 BoarOS 挂载表中的
+`rootfs`，而 proc 的零块数行也不会显示。`free` 输出全零，因为该 applet
+先调用当前尚未提供的 `sysinfo`；仅有真实 `/proc/meminfo` 不足以完成它。
+这两项消费缺口已转入路线，不能将脚本中的 success 标签当作内容正确。
+
 字符设备层采用 `st_rdev` 到内建 read/write/poll 操作的登记表，而不是在路径
 或每个 I/O 调用中重复识别设备名。`/dev` 仍可由 ext4 提供目录项；OFD 钉住
 选定后端，close 与 fd 复用不改变已开始的 I/O。固定 Linux

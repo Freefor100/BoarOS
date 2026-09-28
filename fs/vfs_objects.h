@@ -68,6 +68,8 @@ struct kernel_vfs_rename_result {
     int replaced_last_link, changed;
 };
 
+struct kernel_open_file_description;
+
 /* 回调返回负 errno；close_node 只释放私有 handle，不等待设备。
  * 后端分配的 node 必须位于同一堆对象首部，发布后由通用层回收。 */
 struct kernel_vfs_backend {
@@ -79,6 +81,9 @@ struct kernel_vfs_backend {
     /* Object links resolve to a pinned path without a pathname relookup. */
     int (*follow_link)(struct kernel_vfs_node *node,
                        struct kernel_vfs_path **owner);
+    /* A pseudo-object link may open a new description without a VFS path. */
+    int (*reopen_link)(struct kernel_vfs_node *node, struct kernel_heap *heap,
+        uint32_t flags, struct kernel_open_file_description **owner);
     /* Generated files return an owned, single-read-epoch snapshot. The OFD
      * releases it and creates a new one after seek to offset zero. */
     int (*snapshot)(struct kernel_vfs_node *node, struct kernel_heap *heap,

@@ -136,6 +136,7 @@ enum kernel_files_status kernel_files_openat(
     enum kernel_files_status files_status;
 
     int created = 0;
+    int special_link = 0;
 
     if (!kernel_files_is_live(files) || !kernel_fs_context_is_live(fs) ||
         mm == 0 || linux_result == 0) {
@@ -200,6 +201,16 @@ enum kernel_files_status kernel_files_openat(
         open_status = kernel_open_file_create_at(files->heap, start,
                         kernel_fs_context_root(fs), path, operation, 0,
                         &description, &result);
+        if (open_status == KERNEL_OPEN_FILE_STATUS_OK &&
+            result == -KERNEL_ENOENT && operation == KERNEL_OPEN_PATH_FOLLOW) {
+            int link_result = kernel_vfs_reopen_link_at(start,
+                kernel_fs_context_root(fs), path, files->heap,
+                (uint32_t)flags, &description);
+            if (link_result != -KERNEL_ENOTSUP) {
+                result = link_result;
+                special_link = !result;
+            }
+        }
         if (result == -KERNEL_ELOOP &&
             (flags & (LINUX_O_CREAT | LINUX_O_EXCL)) ==
                 (LINUX_O_CREAT | LINUX_O_EXCL))
@@ -248,6 +259,16 @@ enum kernel_files_status kernel_files_openat(
         (void)kernel_files_drain_file_cleanup(files);
         *linux_result = -KERNEL_EEXIST;
         return KERNEL_FILES_STATUS_OK;
+    }
+    if (special_link) {
+        if ((flags & LINUX_O_DIRECTORY) != 0U) {
+            files->record->statistics.open_failures++;
+            kernel_files_queue_description(files, description);
+            (void)kernel_files_drain_file_cleanup(files);
+            *linux_result = -KERNEL_ENOTDIR;
+            return KERNEL_FILES_STATUS_OK;
+        }
+        goto Finish_open;
     }
     if (kernel_vfs_mount_is_readonly(description->file.mount) &&
         (kernel_open_file_mode(description) & KERNEL_VFS_S_IFMT) ==
@@ -339,6 +360,7 @@ enum kernel_files_status kernel_files_openat(
         return KERNEL_FILES_STATUS_OK;
     }
 
+Finish_open:
     /* Linux treats the internal __O_SYNC bit as implying O_DSYNC. */
     if ((flags & (LINUX_O_SYNC & ~LINUX_O_DSYNC)) != 0U)
         flags |= LINUX_O_DSYNC;

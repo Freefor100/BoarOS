@@ -96,6 +96,22 @@ struct kernel_socket *kernel_open_file_socket(
 enum kernel_open_file_kind kernel_open_file_kind(
     const struct kernel_open_file_description *file);
 
+/* Stable within an open pseudo object; zero for path-backed descriptions. */
+uint64_t kernel_open_file_pseudo_identity(
+    const struct kernel_open_file_description *file);
+
+struct kernel_pipe;
+struct kernel_open_file_pipe_pin {
+    struct kernel_pipe *pipe;
+    uint8_t endpoint;
+};
+/* Pin under the fd-table guard; finish outside it, including on failure. */
+int kernel_open_file_pipe_pin(const struct kernel_open_file_description *source,
+    uint32_t flags, struct kernel_open_file_pipe_pin *pin);
+int kernel_open_file_pipe_finish(struct kernel_heap *heap,
+    struct kernel_open_file_pipe_pin *pin, uint32_t flags,
+    struct kernel_open_file_description **owner);
+
 int kernel_open_file_supports_epoll(
     const struct kernel_open_file_description *file);
 
