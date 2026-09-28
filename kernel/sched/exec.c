@@ -110,15 +110,17 @@ enum kernel_scheduler_status kernel_scheduler_exec_commit(void)
 
     status = process_group_exec_current();
     if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
-    if (riscv_sv39_switch_satp(new_satp) != RISCV_SV39_STATUS_OK) {
-        return KERNEL_SCHEDULER_STATUS_ADDRESS_SPACE;
-    }
     /* The prepared image is committed, but the old MM remains owned by
      * this task until the transaction takes it. Use the TID from before
      * a non-leader exec adopted the group leader's identity. */
     kernel_futex_release_robust(thread, old_tid);
+    kernel_futex_release_mm(thread);
+    if (riscv_sv39_switch_satp(new_satp) != RISCV_SV39_STATUS_OK) {
+        return KERNEL_SCHEDULER_STATUS_ADDRESS_SPACE;
+    }
     transaction->retired_mm = thread->mm;
     thread->mm = transaction->image.mm;
+    kernel_mm_add_user(&thread->mm);
     finish_mm_move(&transaction->image.mm);
     thread->arch.satp = new_satp;
     riscv_process_prepare_exec(thread,

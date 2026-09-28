@@ -183,6 +183,8 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 
 ### P2e clone、凭据与资源限制
 
+- [x] child-TID 生命周期（main）：私有 fork 的首次 SETTID、按活跃 MM 使用者判断清零、vfork 成功/失败 exec 和线程唤醒。新增 8 条同 ELF 差分，完整 556/556；MM/exec/user 聚焦通过。基线 `fa38845` 的三处差异与交接检查见[线程证据](learning/threads-and-futex.md#child-tid-生命周期差分2026-09-28)。
+
 - [ ] 逐项扩大合法 clone 组合，区分 flags 依赖错误与当前未支持组合；核对 MM/files/fs/disposition 各自复制/共享，TLS、TID 发布失败、组长先退、非组长 exec、收养和 wait 仍正确。
 - [ ] 在 P1a 查询基础上设计显式凭据：真实/有效/保存 UID/GID、补充组及权限消费者；确认复制/共享/变更/exec 所有权后再支持 set 类接口。统一替换当前 root 假设，不出现查询身份与资源访问权限脱节。
 - [ ] 保持 NOFILE/STACK：调低不关闭旧 fd、线程组共享、fork 继承、exec 保留、exec 后调高栈和非页对齐限制；用户输出 EFAULT 不回滚已生效的 prlimit 设置。

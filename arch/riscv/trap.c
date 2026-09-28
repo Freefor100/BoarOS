@@ -295,6 +295,8 @@ void riscv_trap_dispatch(struct riscv_trap_frame *frame)
 
 void riscv_trap_return_prepare(struct riscv_trap_frame *frame)
 {
+    if ((frame->sstatus & RISCV_SSTATUS_SPP) == 0U)
+        kernel_task_prepare_user_return();
     riscv_signal_prepare_user_return(frame);
 }
 
