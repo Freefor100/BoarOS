@@ -8,6 +8,7 @@
 struct kernel_epoll;
 struct kernel_epoll_item;
 struct kernel_record_lock;
+struct kernel_char_device;
 
 struct kernel_open_file_description {
     struct kernel_vfs_file file;
@@ -27,6 +28,7 @@ struct kernel_open_file_description {
     struct kernel_socket *socket;
     struct kernel_epoll_item *ep_items;
     struct kernel_record_lock *record_locks;
+    const struct kernel_char_device *device;
     char *generated_data;
     size_t generated_length;
     uint8_t generated_ready;

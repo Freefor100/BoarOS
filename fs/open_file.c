@@ -2,6 +2,7 @@
 #include "record_lock.h"
 #include "pipe_internal.h"
 #include "vfs_internal.h"
+#include "char_device_internal.h"
 #include "files/epoll_internal.h"
 
 #include <kernel/console.h>
@@ -251,6 +252,8 @@ enum kernel_open_file_status kernel_open_file_create_console(
     file->references = 1U;
     kernel_mutex_init(&file->offset_lock, 10, (uintptr_t)file);
     file->kind = KERNEL_OPEN_FILE_KIND_CONSOLE;
+    file->device = kernel_char_device_lookup(UINT64_C(0x501));
+    if (!file->device) __builtin_trap();
     *owner = file;
     return KERNEL_OPEN_FILE_STATUS_OK;
 }
@@ -731,16 +734,13 @@ uint32_t kernel_open_file_poll(
     if (!open_file_live(file)) {
         return KERNEL_POLLNVAL;
     }
+    if (file->device) return file->device->poll(requested_events, out_queue);
     switch (file->kind) {
     case KERNEL_OPEN_FILE_KIND_PIPE:
         return kernel_pipe_poll(file->pipe, file->pipe_endpoint, out_queue);
-    case KERNEL_OPEN_FILE_KIND_CONSOLE:
-        return kernel_console_poll(requested_events, out_queue);
     case KERNEL_OPEN_FILE_KIND_REGULAR:
     case KERNEL_OPEN_FILE_KIND_GENERATED:
     case KERNEL_OPEN_FILE_KIND_DIRECTORY:
-    case KERNEL_OPEN_FILE_KIND_NULL:
-    case KERNEL_OPEN_FILE_KIND_ZERO:
         return KERNEL_POLLIN | KERNEL_POLLOUT | KERNEL_POLLRDNORM | KERNEL_POLLWRNORM;
     case KERNEL_OPEN_FILE_KIND_EPOLL:
         return kernel_epoll_poll(file->epoll, requested_events, out_queue);

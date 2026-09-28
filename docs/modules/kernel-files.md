@@ -4,7 +4,7 @@
 
 ## 对象与所有权
 
-`include/kernel/files.h` 是公共接口；`fs/files/table.c` 管槽位、引用及回收，`io.c` 管读写/定位/枚举，`path.c` 管打开与 stat，`metadata.c` 管显式时间和文件系统统计，`console.c` 管输入等待和暂存，`fs/pipe.c` 管 pipe endpoint 与 ring，`include/kernel/fs_context.h` 和 `fs/fs_context.c` 管理根挂载与当前工作目录。两者都从同一内核堆分配，并随用户 task 一起被 scheduler 接管：
+`include/kernel/files.h` 是公共接口；`fs/files/table.c` 管槽位、引用及回收，`io.c` 管读写/定位/枚举，`path.c` 管打开与 stat，`metadata.c` 管显式时间和文件系统统计，`console.c` 管 UART 输入等待，`fs/char_device.c` 按设备号登记字符设备操作，`fs/pipe.c` 管 pipe endpoint 与 ring，`include/kernel/fs_context.h` 和 `fs/fs_context.c` 管理根挂载与当前工作目录。文件表与 fs context 都从同一内核堆分配，并随用户 task 一起被 scheduler 接管：
 
 - `kernel_files` 是进程可见的 fd 槽数组；槽保存 descriptor flags 和指向 open file description 的指针。
 - `kernel_open_file_description` 拥有一个 VFS file、当前 offset 和清理状态。分别打开同一路径会得到独立 description，因此 offset 互不影响。
@@ -218,7 +218,7 @@ make test-riscv
 
 当前提供可共享的文件表与根 fs context handle，普通 clone 仍实现“复制表/复制 cwd、共享 OFD”；系统调用层是否选择共享由 clone flags 决定。当前已支持常规文件的读写（`write/writev/pwrite64/append`）、新建、删除（`unlinkat`）、截断（`ftruncate`）与目录修改（`mkdirat/rmdir`）及符号链接（`symlinkat/readlinkat`）；并支持 cwd/dirfd、普通/NOREPLACE rename；仍无后台异步写回、read-ahead、硬链接或第二个 ext4 块设备挂载。当前单 hart 下 fd lookup 与 OFD acquire 之间不可调度；启用 SMP 前必须为共享 record 引用、槽查找/替换、统计和 OFD 引用补齐同步，不能直接复用这些无锁字段。pipe 同样是单 hart 对象。console 接收现为 tick 轮询（唤醒延迟上界一个 tick），外部中断（PLIC/SEIE）落地后替换为中断驱动。
 
-字符设备节点由 ext4 提供名称和 `st_rdev`，`openat` 根据设备号选择 null、zero 或 console；未知设备号返回 `ENXIO`。路径打开的 console 与初始标准 fd 复用 UART 输入等待、非阻塞和信号打断逻辑。null 读 EOF、写消费请求长度，zero 读按实际用户复制进度填零；这两者不经过普通文件页缓存和 ext4 数据 I/O。设备 OFD 同样由 fd 表安装和引用，dup/fork 共享，关闭 fd 不撤销已 pin 的 I/O。`readv/writev/pread64/pwrite64/lseek/fstat/ppoll` 的设备边界在固定 Linux 差分中验证；未知 ioctl 对有效 fd 返回 `ENOTTY`。epoll 的普通/定位 I/O、seek 与匿名 inode mode 也经同一分派入口核对。当前没有 TTY 会话、设备 mmap、devfs 或通用设备注册接口。
+字符设备节点由 ext4 提供名称和 `st_rdev`；`openat` 只按设备号查找 `fs/char_device.c` 的内建操作表，未知设备号返回 `ENXIO`。OFD 持有选定的静态后端操作，read/write/poll 从它分派；初始标准 fd 也取得同一 console 后端。该表在当前执行地址域中初始化回调，兼容分页前模块测试与生产高半区。console 的 UART 输入等待支持非阻塞 `EAGAIN` 和信号打断；null 读 EOF、写消费请求长度，zero 读按实际用户复制进度填零；两者不经过普通文件页缓存和 ext4 数据 I/O。设备 OFD 由 fd 表安装和引用，dup/fork 共享，关闭 fd 不撤销已 pin 的 I/O。`readv/writev/pread64/pwrite64/lseek/fstat/ppoll` 及 console 非阻塞读取经固定 Linux 差分验证；未知 ioctl 对有效 fd 返回 `ENOTTY`。当前只登记三个静态内建设备，没有动态设备注册、TTY 会话、设备 mmap 或 devfs。
 
 设备号与操作依据固定 Linux commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 [`fs/char_dev.c`](../../references/linux/fs/char_dev.c)、[`drivers/char/mem.c`](../../references/linux/drivers/char/mem.c)、[`fs/eventpoll.c`](../../references/linux/fs/eventpoll.c) 与 [`fs/read_write.c`](../../references/linux/fs/read_write.c)。
 

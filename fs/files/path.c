@@ -1,5 +1,6 @@
 #include "../open_file_internal.h"
 #include "../vfs_internal.h"
+#include "../char_device_internal.h"
 #include "private.h"
 
 #include <kernel/errno.h>
@@ -319,20 +320,9 @@ enum kernel_files_status kernel_files_openat(
         if (stat_result == 0 && (flags & LINUX_O_DIRECTORY) != 0U)
             stat_result = -KERNEL_ENOTDIR;
         if (stat_result == 0) {
-            switch (stat.rdev) {
-            case UINT64_C(0x103):
-                description->kind = KERNEL_OPEN_FILE_KIND_NULL;
-                break;
-            case UINT64_C(0x105):
-                description->kind = KERNEL_OPEN_FILE_KIND_ZERO;
-                break;
-            case UINT64_C(0x501):
-                description->kind = KERNEL_OPEN_FILE_KIND_CONSOLE;
-                break;
-            default:
-                stat_result = -KERNEL_ENXIO;
-                break;
-            }
+            description->device = kernel_char_device_lookup(stat.rdev);
+            if (!description->device) stat_result = -KERNEL_ENXIO;
+            else description->kind = description->device->kind;
         }
         if (stat_result != 0) {
             files->record->statistics.open_failures++;

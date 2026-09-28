@@ -149,6 +149,7 @@ C_SOURCES := \
 	fs/files/epoll.c \
 	fs/files/socket.c \
 	fs/fs_context.c \
+	fs/char_device.c \
 	fs/open_file.c \
 	fs/pipe.c \
 	fs/record_lock.c \
@@ -227,6 +228,7 @@ TEST_RUNTIME_C_SOURCES := \
 	fs/files/epoll.c \
 	fs/files/socket.c \
 	fs/fs_context.c \
+	fs/char_device.c \
 	fs/lwext4_port.c \
 	fs/open_file.c \
 	fs/pipe.c \

@@ -25,11 +25,6 @@ int kernel_files_path_start(struct kernel_files *files,
                             int64_t dirfd, const char *path,
                             struct kernel_vfs_path **start);
 
-enum kernel_files_status kernel_files_read_console(
-    struct kernel_files *files, struct kernel_mm *mm,
-    const struct kernel_uaccess_iovec *iov, size_t iov_count,
-    uint64_t count, int64_t *linux_result);
-
 #define KERNEL_FILES_INITIAL_CAPACITY 32U
 #define KERNEL_FILES_MAX_CAPACITY ((uint32_t)KERNEL_RLIMIT_NOFILE_CAP)
 #define KERNEL_FILES_FD_CLOEXEC UINT32_C(1)

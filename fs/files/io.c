@@ -1,9 +1,9 @@
 #include "private.h"
 #include "../open_file_internal.h"
 #include "../pipe_internal.h"
+#include "../char_device_internal.h"
 #include "../uaccess_iov_internal.h"
 
-#include <kernel/console.h>
 #include <kernel/errno.h>
 #include <kernel/heap.h>
 #include <kernel/mm.h>
@@ -261,9 +261,10 @@ static enum kernel_files_status read_pinned(
         else files->record->statistics.bytes_read += total;
         return result;
     }
-    if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_NULL ||
-        kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_ZERO) {
-        if (iov_count == 1U && count == 0U && iov[0].base != 0U &&
+    if (description->device) {
+        const struct kernel_char_device *device = description->device;
+        if (device->empty_range_fault && iov_count == 1U && count == 0U &&
+            iov[0].base != 0U &&
             kernel_user_range_check(iov[0].base - 1U, 1U) !=
                 KERNEL_UACCESS_STATUS_OK) {
             *linux_result = -KERNEL_EFAULT;
@@ -279,39 +280,41 @@ static enum kernel_files_status read_pinned(
                 return KERNEL_FILES_STATUS_OK;
             }
         }
-    }
-    if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_NULL) {
-        *linux_result = 0;
-        return KERNEL_FILES_STATUS_OK;
-    }
-    if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_ZERO) {
-        const unsigned char zeros[64] = {0};
+        unsigned char staging[64];
         request = count > KERNEL_FILES_MAX_RW_COUNT
                       ? KERNEL_FILES_MAX_RW_COUNT : count;
         while (total < request) {
+            size_t received = 0U;
             size_t copied = 0U;
-            size_t chunk = request - total < sizeof(zeros)
-                               ? (size_t)(request - total) : sizeof(zeros);
+            size_t chunk = request - total < sizeof(staging)
+                               ? (size_t)(request - total) : sizeof(staging);
+            int result = device->read(description->open_flags, staging,
+                                      chunk, &received);
+            if (result) {
+                *linux_result = total ? (int64_t)total : result;
+                if (!total) files->record->statistics.read_failures++;
+                files->record->statistics.bytes_read += total;
+                return KERNEL_FILES_STATUS_OK;
+            }
+            if (received > chunk) return KERNEL_FILES_STATUS_STATE;
+            if (!received) break;
             enum kernel_uaccess_status access = kernel_copy_to_user_iov(
-                mm, &cursor, zeros, chunk, &copied);
+                mm, &cursor, staging, received, &copied);
             total += copied;
+            files->record->statistics.read_chunks++;
             if (access == KERNEL_UACCESS_STATUS_FAULT) {
                 *linux_result = total ? (int64_t)total : -KERNEL_EFAULT;
                 files->record->statistics.bytes_read += total;
                 if (total == 0U) files->record->statistics.read_failures++;
                 return KERNEL_FILES_STATUS_OK;
             }
-            if (access != KERNEL_UACCESS_STATUS_OK || copied != chunk)
+            if (access != KERNEL_UACCESS_STATUS_OK || copied != received)
                 return KERNEL_FILES_STATUS_STATE;
+            if (device->read_once || received < chunk) break;
         }
         files->record->statistics.bytes_read += total;
         *linux_result = (int64_t)total;
         return KERNEL_FILES_STATUS_OK;
-    }
-
-    if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_CONSOLE) {
-        return kernel_files_read_console(files, mm, iov, iov_count, count,
-                                         linux_result);
     }
     if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_PIPE) {
         enum kernel_pipe_status pipe_status = kernel_pipe_readv(
@@ -634,8 +637,7 @@ static enum kernel_files_status pread_pinned(
         *linux_result = -KERNEL_EISDIR;
         return KERNEL_FILES_STATUS_OK;
     }
-    if (kernel_open_file_kind(description) ==
-            KERNEL_OPEN_FILE_KIND_CONSOLE ||
+    if ((description->device && !description->device->positioned) ||
         kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_PIPE ||
         kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_SOCKET) {
         files->record->statistics.read_failures++;
@@ -668,8 +670,7 @@ static enum kernel_files_status pread_pinned(
         return generated_read(files, mm, description, &cursor, capped,
                               (uint64_t)offset, 0, linux_result);
     }
-    if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_NULL ||
-        kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_ZERO) {
+    if (description->device && description->device->positioned) {
         const struct kernel_uaccess_iovec iov = {user_buffer, count};
         return read_pinned(files, mm, description, 0, &iov, 1U, count,
                            linux_result);
@@ -803,12 +804,9 @@ static int description_writable(
     if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_SOCKET) {
         return access_mode == 2U;
     }
-    if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_CONSOLE) {
-        return description->file.private_data == 0 ||
-               access_mode == 1U || access_mode == 2U;
-    }
-    if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_NULL ||
-        kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_ZERO) {
+    if (description->device) {
+        if (description->kind == KERNEL_OPEN_FILE_KIND_CONSOLE &&
+            description->file.private_data == 0) return 1;
         return access_mode == 1U || access_mode == 2U;
     }
     return 0;
@@ -823,9 +821,11 @@ static enum kernel_files_status buffered_write_request(
 {
     uint64_t total = 0U;
 
-    if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_NULL ||
-        kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_ZERO) {
-        *linux_result = (int64_t)count;
+    if (description->device && description->device->discard_writes) {
+        size_t consumed = 0U;
+        int result = description->device->write(0, (size_t)count, &consumed);
+        if (consumed > count) return KERNEL_FILES_STATUS_STATE;
+        *linux_result = result && !consumed ? result : (int64_t)consumed;
         return KERNEL_FILES_STATUS_OK;
     }
     if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_GENERATED) {
@@ -988,6 +988,7 @@ static enum kernel_files_status buffered_write_request(
         *linux_result = (int64_t)total;
         return KERNEL_FILES_STATUS_OK;
     }
+    if (!description->device) return KERNEL_FILES_STATUS_STATE;
     for (size_t index = 0U; index < iov_count && total < count; index++) {
         uint64_t offset = 0U;
 
@@ -1005,11 +1006,15 @@ static enum kernel_files_status buffered_write_request(
             status = kernel_copy_from_user(mm, staging,
                                             iov[index].base + offset,
                                             chunk, &copied);
-            for (size_t byte = 0U; byte < copied; byte++) {
-                kernel_console_putc((char)staging[byte]);
+            size_t written = 0U;
+            int result = description->device->write(staging, copied, &written);
+            if (written > copied) return KERNEL_FILES_STATUS_STATE;
+            total += written;
+            offset += written;
+            if (result || written < copied) {
+                *linux_result = total ? (int64_t)total : result;
+                return KERNEL_FILES_STATUS_OK;
             }
-            total += copied;
-            offset += copied;
             if (status == KERNEL_UACCESS_STATUS_FAULT) {
                 if (total != 0U) {
                     files->record->statistics.write_failures++;
@@ -1082,10 +1087,7 @@ static int memory_device_empty_range_fault(
     const struct kernel_open_file_description *description,
     uint64_t user_buffer, uint64_t count)
 {
-    enum kernel_open_file_kind kind = kernel_open_file_kind(description);
-
-    return (kind == KERNEL_OPEN_FILE_KIND_NULL ||
-            kind == KERNEL_OPEN_FILE_KIND_ZERO) &&
+    return description->device && description->device->empty_range_fault &&
            count == 0U && user_buffer != 0U &&
            kernel_user_range_check(user_buffer - 1U, 1U) !=
                KERNEL_UACCESS_STATUS_OK;
@@ -1171,7 +1173,7 @@ enum kernel_files_status kernel_files_pwrite(
         *linux_result = -KERNEL_EBADF;
     else if (offset < 0)
         *linux_result = -KERNEL_EINVAL;
-    else if (kind == KERNEL_OPEN_FILE_KIND_CONSOLE ||
+    else if ((description->device && !description->device->positioned) ||
              kind == KERNEL_OPEN_FILE_KIND_PIPE)
         *linux_result = -KERNEL_ESPIPE;
     else if (kind == KERNEL_OPEN_FILE_KIND_DIRECTORY)
@@ -1302,15 +1304,13 @@ static enum kernel_files_status lseek_pinned(
     int64_t current, target;
     KERNEL_LOCK_SCOPE(offset_guard);
     kernel_mutex_lock(&description->offset_lock, &offset_guard);
-    if (kernel_open_file_kind(description) ==
-            KERNEL_OPEN_FILE_KIND_CONSOLE ||
+    if ((description->device && !description->device->positioned) ||
         kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_PIPE ||
         kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_SOCKET) {
         *linux_result = -KERNEL_ESPIPE;
         return KERNEL_FILES_STATUS_OK;
     }
-    if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_NULL ||
-        kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_ZERO) {
+    if (description->device && description->device->positioned) {
         (void)kernel_open_file_seek(description, 0U);
         *linux_result = 0;
         return KERNEL_FILES_STATUS_OK;

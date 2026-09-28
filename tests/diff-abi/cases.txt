@@ -479,6 +479,8 @@ device.zero-readonly-write
 device.console-open-readonly
 device.console-write-readonly
 device.console-stat
+device.console-open-nonblock
+device.console-read-nonblock
 positioned.file-write
 positioned.file-read
 

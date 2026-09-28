@@ -59,6 +59,17 @@ readv、pread、EOF、写入错误与 seek 回零/SEEK_END 均与固定 Linux �
 释放全部 fd，根 ext4 卸载仍因子挂载返回 `EBUSY`；聚焦测试覆盖两层
 覆盖挂载的末尾清理。
 
+字符设备层采用 `st_rdev` 到内建 read/write/poll 操作的登记表，而不是在路径
+或每个 I/O 调用中重复识别设备名。`/dev` 仍可由 ext4 提供目录项；OFD 钉住
+选定后端，close 与 fd 复用不改变已开始的 I/O。固定 Linux
+`references/linux/drivers/char/mem.c`、`references/linux/fs/char_dev.c`
+（同一 commit）的 null/zero 及字符设备号语义，与
+`tests/diff-abi/devices.c` 的真实 RV U-mode 对照。`make test-files-riscv`
+和 `make test-diff-abi-riscv` 通过，后者为 605 条记录，新增 console
+`O_NONBLOCK` 读取在两侧均返回 `EAGAIN`。增加差分用例时必须同步
+`tests/diff-abi/cases.txt`：一次两侧均完整输出 `ABI END 605`，但清单仍为
+603 条，解析器正确拒绝了不匹配的运行；这并非内核阻塞。
+
 ## 为什么当前是同步 I/O
 
 设备 flush 与块缓存排空是两层边界。新增块 flush 依据固定 Linux `references/linux/drivers/block/virtio_blk.c`（`f4cdf7ca9a1fdcca413157df19753f388a5a224e`）与 QEMU `references/qemu/hw/block/virtio-blk.c`（v11.1.0，`84f07211cc5b4fc6a371559bf8a5de4fb068e648`）：不协商 CONFIG_WCE 时，FLUSH feature 决定 writeback，缺失则为 write-through。协商 FLUSH 后必须真实提交该请求；内存 fence、read-after-write、QEMU 正常退出均不能替代介质持久化证据。host 故障模型把易失状态与稳定镜像分开，允许未同步扇区丢失/重排；后续 journal 测试应复用这个模型，而非仅终止普通 QEMU 后检查恰好仍在宿主页缓存中的数据。
