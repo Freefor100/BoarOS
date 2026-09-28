@@ -140,6 +140,27 @@ BoarOS 初始化三个无路径 console OFD，返回 `ENOENT`。根启动在文�
 也经同一 RV ELF 验证，当前 679 条差分一致。此证据不覆盖持续高压 fd 复用
 或完整 Linux proc 字段。
 
+2026-09-29 固定 OSComp `pre-20250615` RV 镜像
+`references/oscomp-autotest/sdcard-rv.img`（SHA-256
+`f419468678d342133546add2f8459ea09aeba987ba968e28753d6ee656996b8b`）
+的原 LTP 首批进程案例虽然能打开 `/proc/meminfo`，仍有 53 次在
+`tst_memutils.c:94` 因转换数为零中止。用 `debugfs -R 'dump
+/glibc/ltp/testcases/bin/abort01 /tmp/boaros-ltp-abort01'` 从原镜像只读提取
+固定 ELF（SHA-256 `f6b658f4e37b187a10022a3202af1458cbb1344e8edccd075c1312e066ceabb7`）；
+其 `tst_available_mem` 先可选扫描 `MemAvailable: %llu`，再于源码行 93、94
+必需扫描 `MemFree: %ld` 与 `Cached: %ld`。`riscv64-elf-addr2line` 对该 ELF 的
+`0x18dbc`、`0x18de4` 分别指向这两行；当前 proc 仅有 `MemTotal`/`MemFree`，
+所以实际报错是缺 `Cached`，而非路径不存在。新增统计必须从真实缓存/可回收页
+取得，不能为满足格式返回固定零。评测同一启动在 LTP 第 107 个案例
+`cgroup_fj_proc` 后无新串口输出直到总预算结束；该等待尚未最小复现，不能据
+测试名指定内核修复。
+
+同轮原 glibc `libctest static utime` 一次通过、一次在 `UTIME_NOW` 后的
+`fstat` 秒数不早于 `time(0)` 断言失败；动态版两轮都失败。固定测试源码为
+`references/oscomp-testsuits` 对象 `8b58dd16d26d30f7c74d48d5832d870d3051b703`
+的 `libc-test/src/functional/utime.c`。本轮没有得到内核时间还是 ext4 时间更新的
+独立根因；应先把原同一 ELF 的失败缩成双侧复现，不因一轮分数变化直接修改时钟。
+
 原始固定 BusyBox 包装脚本以 SHA-256
 `f2cda5fcdff6d41c8a553ac658e8aa55b6a48aa40898cb123a19f7865f3773ac`
 复跑，入口为 `python3 tests/program-inventory/run.py --suite busybox
