@@ -91,8 +91,14 @@ Auxv 的值必须来自真实机制，而不是为了让 libc 继续运行而伪
 不依赖比赛磁盘。exec 准备事务统一持有脚本/解释器 OFD 和重组后的参数；
 只有新映像准备成功后才进入提交阶段。
 
-本阶段 `make test-exec-riscv test-userland-riscv test-glibc-riscv test-diff-abi-riscv test-stack-usage` 通过；差分 565 条，含 9 条脚本记录。交接基线为 child-TID 的 `ed6acfb`；评测分支合入后应使用原 BusyBox 消费脚本能力，不改上游脚本内容。
+验证入口为 `make test-exec-riscv test-userland-riscv test-glibc-riscv test-diff-abi-riscv test-stack-usage`。
+本轮完整差分 583 条，含 15 条脚本记录；对应测试和真实程序回归通过。
+交接起点为 child-TID 的 `ed6acfb`，通用交付见 main 历史；评测分支合入后
+应使用原 BusyBox 消费脚本能力，不改上游脚本内容。
 
-补充深度边界时发现：第六个脚本层的格式错误/缺失解释器应先返回 ENOEXEC/ENOENT，而不是提前 ELOOP。固定 Linux 同 ELF 先复现两处差异；检查移到下次格式分派前后，五层成功、六层超限及两类边界错误一致，完整差分 581 条。
+两类容易漏掉的 Linux 边界都先由同 ELF 差分证伪旧实现：
 
-审查发现 `#!/init `（无换行）在固定 Linux 保留一个空可选参数。不能用参数首字节非零替代“参数存在”；首行换行查找也须遵循 strnchr 的 NUL 终止。EOF/嵌入 NUL 两条同 ELF 先失败后修复，完整差分增至 583 条。
+- 第六个脚本层的格式错误/缺失解释器先返回 ENOEXEC/ENOENT，不能提前 ELOOP。
+  深度检查位于下次格式分派前；覆盖五层成功、六层超限及边界错误。
+- `#!/init `（无换行）保留一个空可选参数，不能用参数首字节非零代替“参数存在”。
+  换行查找遵循 strnchr 的 NUL 终止；覆盖 EOF 和嵌入 NUL。
