@@ -61,3 +61,80 @@ runner 读取固定 Harness `kernel/judge/config.json`。其中 `qemu.timeout=36
 评分核对后将结论、运行身份和重建命令写入本文，运行产物由 `make prune-build`
 清理。原始 `.img/.img.xz` 在 references，不属于清理范围。通用新缺陷先最小复现，
 回 main 修复并验收，再 merge 回本分支重新构建运行。
+
+## 2026-09-28 单次启动基线
+
+**原 postwork 整数分数 267，未取整合计 267.2644974509601。** 这是固定 Harness
+的 RV 投影，不是双架构总成绩，也不是满分 267。一次启动自北京时间 13:33:40
+运行 3600.007 秒，由总预算超时终止；没有逐组重启、追加时间或拼接诊断成绩。
+
+| 组 | glibc 原分数 | musl 原分数 | 本次状态 |
+|---|---:|---:|---|
+| basic | 0 | 0 | 两侧包装脚本结束，内部 run-all.sh 权限失败 |
+| busybox | 49 | 49 | 两侧结束，各 49/55 项计分 |
+| cyclictest | 0.0 | 0.0 | 两侧结束，内部子项失败 |
+| iozone | 0.0 | 0.0 | 两侧结束；自动模式有结果，计分的吞吐子项失败 |
+| iperf | 0.0 | 0.0 | 两侧结束，内部子项失败 |
+| libcbench | 37.40009732614475 | 30.679368580220913 | 两侧结束并计分 |
+| libctest | 0 | 0 | 两侧包装脚本结束，内部脚本启动失败 |
+| lmbench | 50.44911570853501 | 50.735915836059405 | 两侧结束并计分，包含内部程序错误 |
+| ltp | 0 | 0 | glibc 运行中耗尽总预算；musl 未到达 |
+| lua | 0 | 0 | 两侧未到达 |
+| netperf | 0.0 | 0.0 | 两侧未到达 |
+
+已结束组的包装脚本退出码均为 0；这不能代替组内成功判定。glibc LTP 无 END 标记，
+但原解析器会在 EOF 关闭并读取该 judge，并非把所有部分日志丢弃。原 LTP judge
+得到 105 条案例记录、分数为 0；它按 Summary 的 passed 字段计分，旧式单行 TPASS
+和退出码 0 本身不增加分数。这里保留原规则，不自行纠正或补分。LA 未运行；原
+postwork 生成的 LA 零值展示列是其默认输出，不代表进行过 LA 验证。
+
+### 运行身份与重建
+
+- 内核提交：`635a12ae6a135abff83a6ecd68c7d82f2f0622ac`。
+- 内核 SHA-256：`d53b52fa56b943f5bdc784471a362f1b4b037c8915a422cf709feb67c5f02916`。
+- Harness 配置 SHA-256：`082a086816477687be6cd175ae0eee3cbaf466892fc2ff509dfeeff3cebf3813`。
+- PID 1 配置 SHA-256：`532c958496d1e18bc72623b0eef3905d67b1c7b31a574b25eefb47342034d44a`。
+- 启动脚本 SHA-256：`1327c7efa5ac4d0c8302d8b07d9fbd65d9b22e357649c02b2725c08094ce38aa`。
+- 本次串口 SHA-256：`b605862d1758716f0bb8e9d9aa53f35903d43294543e57e038b38aac8589ba3e`。
+- 构建/启动时工作区干净；此后只合入文档收口，没有修改运行中的代码。
+- QEMU 11.1.1，RV64 virt，1 hart，1 GiB，OpenSBI default；固定输入及四个资产哈希见
+  [inputs.json](../../tests/oscomp/inputs.json)。额外磁盘为无，原镜像只在运行副本上增加启动脚本。
+- 默认/自定义 PID 1 交替测试后恢复评测配置，重新生成的二进制哈希与本次启动一致。
+
+在上述提交或代码相同的文档后继提交，执行本模块的 `run.py` 命令即可重建过程。
+运行目录在核对后清理，不能把历史 build 路径当永久证据；性能浮点分数会随宿主负载
+变化，不要求再次运行逐位相同。本次 QEMU 参数为：
+
+```sh
+qemu-system-riscv64 -machine virt -kernel kernel-rv -m 1G -nographic -smp 1 \
+  -bios default -drive file=build/oscomp-rv-baseline/root.img,if=none,format=raw,id=x0 \
+  -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 -no-reboot \
+  -device virtio-net-device,netdev=net -netdev user,id=net -rtc base=utc
+```
+
+### 已定位的阻塞与待调查现象
+
+- **basic**：原盘两套 `basic/run-all.sh` 的 mode 为 0644，包装器直接 `./run-all.sh`，
+  得到 Permission denied。保留原权限；不能将 0 分解释为所有 basic syscall 均失败。
+- **BusyBox**：两侧未计分项为 df、dmesg、ps、free、hwclock、kill 10。
+  proc/设备及日志接口缺口和具体调用结果应分别定位，不用一个泛化原因覆盖全部。
+- **cyclictest**：可见 sched_getaffinity ENOSYS、无法取得 scheduler 参数；hackbench
+  创建 fdpair 也失败。调度和相关接口仍属后续能力。
+- **iozone**：两侧自动 4 MiB 模式均完成；短预算超时不是永久卡死证据。
+  吞吐子项明确在 shmget 返回 ENOSYS（38）后结束。原 judge 只提取吞吐部分的
+  Max throughput per process，因此自动模式的成功输出不计分。慢写和异常日期
+  仍待最小复现，不据此直接选择性能或时钟修复方案。
+- **iperf**：缺少 `/dev/urandom`；glibc 服务器另报 daemon 化 ENOSYS。尚未证明
+  消除这些前置阻塞后网络测例能通过，不能直接归咎于 TCP 数据路径。
+- **libctest**：两套 run-static.sh/run-dynamic.sh 均报 not found。文件实际存在，
+  无 shebang；原 BusyBox v1.33.1 的 ENOEXEC 回退会使用 `/proc/self/exe`。
+  同原盘、同内核的独立诊断中，向可执行文本写入 `echo NO-SHEBANG-RAN` 后直接
+  执行为 127，显式 `/musl/busybox sh 文件` 为 0。这项诊断不计分；不以假 proc
+  文件或修改上游脚本绕过。固定源码依据见[ELF 学习](../learning/elf-loading.md#shebang-与-shell-回退2026-09-28)。
+- **lmbench**：虽有计分，仍有 `/tmp/hello` 启动错误；计时输出不是全部功能正确的证明。
+- **LTP**：许多案例首先缺 `/proc/meminfo`。最终进入 cgroup_fj_function.sh 后反复
+  `cut: /proc/5/stat: No such file or directory`，直至总预算结束。musl LTP、Lua 和
+  netperf 没有启动，不能根据本次 0 分判断这些程序的独立通过率。
+
+后续仍按 goals 的真实 procfs/设备与 mount 生命周期设计推进，再补 tmpfs、运行环境
+接口并重新评测；SysV IPC 待设计。这里不把原 judge 的分数直接等同于内核能力覆盖率。
