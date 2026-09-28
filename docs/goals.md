@@ -18,8 +18,8 @@ child-TID、脚本执行、可配置 PID 1、必要字符节点入口和可重�
 | 初始 ELF path/argv/envp | main，已交付 | P8b；默认 `/init`、独立配置依赖、交替重建和真实用户栈 |
 | 普通文件/字符节点 mknodat | main，已交付 | P1h；umask/dirfd/设备号与真实 null/zero 读写；其余后端不伪造 |
 | uname 4.15.0 | oscomp-rv-compat，独立提交 | 只用于旧 glibc 启动兼容，不等于完整 Linux 4.15 ABI |
-| 镜像用户态环境与原始脚本 | oscomp-rv-compat，待收口 | 原静态 BusyBox 准备目录/链接/已有设备；glibc/musl 搜索路径隔离 |
-| 可复现 RV 评分入口与报告 | oscomp-rv-compat，待收口 | 固定原盘副本、一次启动、Harness 配置总预算、原 parser/judge/postwork |
+| 镜像用户态环境与原始脚本 | oscomp-rv-compat，已接入、待评分 | 原静态 BusyBox 准备目录/链接/已有设备；glibc/musl 搜索路径隔离 |
+| 可复现 RV 评分入口与报告 | oscomp-rv-compat，已接入、待正式运行 | 固定原盘副本、一次启动、Harness 配置总预算、原 parser/judge/postwork |
 | 通用路线/模块/证据整理 | main | README 摘要，modules 契约，learning 依据，本文维护依赖 |
 
 ### 串行交接
@@ -32,6 +32,7 @@ child-TID、脚本执行、可配置 PID 1、必要字符节点入口和可重�
 不把评测分支整体合回 main，不重复 cherry-pick 同一修复，不重写既有提交。
 交接基线、契约、验证命令、已知失败和重跑要求放进对应 module/learning；
 评分运行身份只放评测报告，不另建台账。通用路线不链接仅存在于评测分支的文件。
+本分支入口与评分边界见[RV 评测模块](modules/oscomp-rv.md)。
 
 ### 本轮验收与产物
 

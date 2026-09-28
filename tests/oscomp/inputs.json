@@ -1,0 +1,12 @@
+{
+  "release": "pre-20250615",
+  "release_url": "https://github.com/oscomp/testsuits-for-oskernel/releases/tag/pre-20250615",
+  "autotest_commit": "d1bb3a3c4b27274e196a2648518525c1a304e339",
+  "autotest_url": "https://github.com/oscomp/autotest-for-oskernel.git",
+  "assets": {
+    "sdcard-rv.img": "f419468678d342133546add2f8459ea09aeba987ba968e28753d6ee656996b8b",
+    "sdcard-la.img": "1aa79d03cf41e2a80ae4ed43771101c1e67ec8db41c3c20b77792fe6b1b85b50",
+    "sdcard-rv.img.xz": "2b59aee4d26681b2d78a8faa615ac216f723a8ea157544e7867bbc8c77aac087",
+    "sdcard-la.img.xz": "3cbeae1095d788cd8255e4929bcc6dace96dbe4999b6eaec003ae6fe2cdba42b"
+  }
+}

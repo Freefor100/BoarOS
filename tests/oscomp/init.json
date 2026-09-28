@@ -1,0 +1,13 @@
+{
+  "path": "/musl/busybox",
+  "argv": [
+    "/musl/busybox",
+    "sh",
+    "/boaros-start.sh"
+  ],
+  "envp": [
+    "PATH=/musl",
+    "HOME=/",
+    "TERM=vt100"
+  ]
+}

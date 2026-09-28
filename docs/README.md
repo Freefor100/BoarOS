@@ -19,7 +19,7 @@
 | 用户映像 | [ELF](modules/user-elf.md)、[exec](modules/kernel-exec.md) |
 | 任务 / 时间 | [调度与生命周期](modules/kernel-scheduler.md)、[信号](modules/kernel-signal.md)、[时钟与睡眠](modules/kernel-time.md)、[硬件 timer](modules/riscv-timer.md) |
 | 文件 / 存储 | [fd/OFD 与路径](modules/kernel-files.md)、[VFS/ext4/页缓存](modules/vfs-ext4.md)、[VirtIO block](modules/riscv-virtio-block.md)、[网络](modules/kernel-network.md) |
-| 验证设施 | [Linux 差分](modules/differential-abi.md)、[真实程序环境](modules/program-environment.md) |
+| 验证设施 | [Linux 差分](modules/differential-abi.md)、[真实程序环境](modules/program-environment.md)、[RV 评测](modules/oscomp-rv.md) |
 
 ## 学习与证据
 
