@@ -18,8 +18,8 @@ child-TID、脚本执行、可配置 PID 1、必要字符节点入口和可重�
 | 初始 ELF path/argv/envp | main，已交付 | P8b；默认 `/init`、独立配置依赖、交替重建和真实用户栈 |
 | 普通文件/字符节点 mknodat | main，已交付 | P1h；umask/dirfd/设备号与真实 null/zero 读写；其余后端不伪造 |
 | uname 4.15.0 | oscomp-rv-compat，独立提交 | 只用于旧 glibc 启动兼容，不等于完整 Linux 4.15 ABI |
-| 镜像用户态环境与原始脚本 | oscomp-rv-compat，已接入、待评分 | 原静态 BusyBox 准备目录/链接/已有设备；glibc/musl 搜索路径隔离 |
-| 可复现 RV 评分入口与报告 | oscomp-rv-compat，已接入、待正式运行 | 固定原盘副本、一次启动、Harness 配置总预算、原 parser/judge/postwork |
+| 镜像用户态环境与原始脚本 | oscomp-rv-compat，已交付 | 原静态 BusyBox 准备目录/链接/已有设备；glibc/musl 搜索路径隔离 |
+| 可复现 RV 评分入口与报告 | oscomp-rv-compat，已交付 | 固定原盘副本、一次启动、Harness 配置总预算、原 parser/judge/postwork |
 | 通用路线/模块/证据整理 | main | README 摘要，modules 契约，learning 依据，本文维护依赖 |
 
 ### 串行交接
@@ -44,6 +44,8 @@ child-TID、脚本执行、可配置 PID 1、必要字符节点入口和可重�
 真实 userland、glibc、栈检查及 PID 1 配置交替重建通过；mknodat 阶段另通过
 VFS/files、lwext4 恢复、SQLite DELETE/WAL 与热日志/确认提交恢复。
 本轮未重跑 228 项清单或逐事件完整恢复矩阵，历史证据不冒充本轮结果。
+评测分支已完成固定 3600 秒、一次启动的 RV 原 judge/postwork 评分；
+运行身份、22 组成绩和超时/未到达范围只记录在该分支的评测模块。
 
 评测入口与配置可版本化；RV/LA 原始镜像与压缩包长期保存在
 `references/oscomp-autotest/`，只运行 RV。镜像副本、串口、评分 JSON、临时探针不提交。
@@ -60,8 +62,8 @@ VFS/files、lwext4 恢复、SQLite DELETE/WAL 与热日志/确认提交恢复。
 
 1. **P1h 虚拟文件系统基础**：先设计通用后端、mount/path 生命周期，再接设备后端与最小 procfs；信息来自真实内核对象。
 2. **P1h tmpfs 与多挂载**：页/目录/引用、空间耗尽、截断与卸载回收，扩大 mount/umount 验收。
-3. **P2/P5c 剩余环境接口**：随机数、会话、调度按真实调用链分项交付；不以固定文本或成功存根绕过需求。
-4. **N/P7 网络与性能定位**：分别缩小 netperf 地址解析与 iozone 超时；未定位现象不能直接写成机制修改任务。
+3. **P2/P5c 剩余环境接口**：随机数、会话、调度按真实调用链分项交付；SysV IPC 已暴露 shmget 缺口，接口与 owner 仍待设计；不以固定文本或成功存根绕过需求。
+4. **N/P7 网络与性能定位**：继续缩小 netperf 地址解析、iozone 写入长耗时和异常日期。完整预算下 iozone 自动模式可结束，吞吐子项被 shmget ENOSYS 阻断；不能再把短预算超时写成永久卡死。未定位现象不能直接写成机制修改任务。
 5. 在可信评分新基线上重新排序 LTP 缺口，再推进 P6 SMP、L LoongArch、实板及更大工具链。
 
 ## 已完成能力的证据入口
@@ -170,7 +172,7 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 - [x] main 已补普通文件/字符节点 mknodat，复用 null/zero/console；独立设备后端、FIFO、块节点仍待设计。见[节点创建](modules/kernel-files.md#节点创建)。
 
 - [ ] 先设计通用后端和 mount/path 生命周期，再接最小设备后端与 procfs，之后以 tmpfs/真实第二挂载验证 mount/路径身份；临时内存文件具有真实页/目录生命周期、空间耗尽和卸载回收。
-- [ ] 最小 procfs 的 uptime、meminfo、self/fd 和进程状态直接读取内核对象；枚举/读期间持有所需引用，任务或 fd 消失的竞态按契约处理，未实现项不伪造 Linux 文本。
+- [ ] 最小 procfs 的 uptime、meminfo、self/exe、self/fd 和进程状态直接读取内核对象；枚举/读期间持有所需引用，任务或 fd 消失的竞态按契约处理，未实现项不伪造 Linux 文本。
 - [ ] 多挂载覆盖路径跨越、根和 `..`、挂载点被引用、卸载忙、跨挂载文件操作和失败回滚；设备/内存/磁盘文件各自错误保持所属 owner。
 - [ ] eventfd/timerfd 只在真实消费者提出需求后接统一 OFD，就绪、非阻塞、poll/epoll 和退出回收一起验收；signalfd 另依赖 P2c 队列。
 
@@ -322,7 +324,7 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 
 ### P5b shebang 与 exec 组合
 
-- [x] main 已交付 shebang 的解释器路径、单个可选参数、argv/envp、嵌套与错误边界。固定 Linux 开启 BINFMT_SCRIPT 后先复现四组差异；含递归错误优先级和空参数边界的 15 条脚本记录纳入完整 583 条差分，exec、musl、glibc 和栈检查通过。契约见[exec](modules/kernel-exec.md)，根因见[ELF 学习](learning/elf-loading.md#shebang-与-shell-回退2026-09-28)。原镜像 BusyBox 回退由评测环境继续验证。
+- [x] main 已交付 shebang 的解释器路径、单个可选参数、argv/envp、嵌套与错误边界。固定 Linux 开启 BINFMT_SCRIPT 后先复现四组差异；含递归错误优先级和空参数边界的 15 条脚本记录纳入完整 583 条差分，exec、musl、glibc 和栈检查通过。契约见[exec](modules/kernel-exec.md)，根因见[ELF 学习](learning/elf-loading.md#shebang-与-shell-回退2026-09-28)。原镜像 BusyBox 已验证无 shebang 回退依赖自执行路径，真实 procfs 仍属 P1h 后续。
 - [ ] 保留 PT_PHDR/auxv、段重叠/对齐、文件尾页+BSS、PIE/解释器布局回归；与线程组 exec、信号、CLOEXEC 和文本写互斥组合验证，不在内核代替动态链接器重定位。
 
 ### P5c 随机数与系统环境
