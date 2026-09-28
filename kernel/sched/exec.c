@@ -121,6 +121,7 @@ enum kernel_scheduler_status kernel_scheduler_exec_commit(void)
     transaction->retired_mm = thread->mm;
     thread->mm = transaction->image.mm;
     kernel_mm_add_user(&thread->mm);
+    kernel_proc_task_update_comm(thread);
     finish_mm_move(&transaction->image.mm);
     thread->arch.satp = new_satp;
     riscv_process_prepare_exec(thread,

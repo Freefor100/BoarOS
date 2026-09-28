@@ -171,6 +171,7 @@ C_SOURCES := \
 	kernel/sched/core.c \
 	kernel/sched/exec.c \
 	kernel/sched/process.c \
+	kernel/sched/proc.c \
 	kernel/sched/signal.c \
 	kernel/sched/wait.c \
 	kernel/sched/sync.c \
@@ -248,6 +249,7 @@ TEST_RUNTIME_C_SOURCES := \
 	kernel/sched/core.c \
 	kernel/sched/exec.c \
 	kernel/sched/process.c \
+	kernel/sched/proc.c \
 	kernel/sched/signal.c \
 	kernel/sched/wait.c \
 	kernel/sched/sync.c \

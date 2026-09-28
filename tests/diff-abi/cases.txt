@@ -594,6 +594,15 @@ proc.mount
 proc.meminfo-open
 proc.meminfo-write-open
 proc.meminfo-write
+proc.uptime-open
+proc.uptime-shape
+proc.self-link
+proc.self-open
+proc.exe-link
+proc.exe-open
+proc.exe-magic
+proc.cwd-link
+proc.root-link
 proc.meminfo-read
 proc.meminfo-rewind
 proc.meminfo-readv

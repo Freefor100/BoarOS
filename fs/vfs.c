@@ -468,6 +468,23 @@ static int resolve_object(struct kernel_vfs_path *start,
             }
             struct kernel_vfs_instance *target_instance =
                 next->file.mount->private_data;
+            if (target_instance->ops->follow_link) {
+                struct kernel_vfs_path *linked = 0;
+                backend = target_instance->ops->follow_link(
+                    next->file.private_data, &linked);
+                if (backend == 0) {
+                    (void)kernel_vfs_path_release(&next);
+                    (void)kernel_vfs_path_release(&current);
+                    current = linked;
+                    if (!current) { result = -KERNEL_EIO; goto Finish; }
+                    continue;
+                }
+                if (backend != -KERNEL_ENOTSUP) {
+                    result = backend;
+                    (void)kernel_vfs_path_release(&next);
+                    goto Finish;
+                }
+            }
             backend = target_instance->ops->readlink(next->file.private_data,
                          target, KERNEL_FS_PATH_MAX - 1U, &target_length);
             (void)kernel_vfs_path_release(&next);
@@ -662,9 +679,9 @@ static int vfs_open_inode_raw(struct kernel_vfs_mount *mount,
     return vfs_open_raw(mount, 0, inode, mode, file);
 }
 
-int kernel_vfs_path_string(const struct kernel_vfs_path *path,
-                           const struct kernel_vfs_path *root,
-                           char *buffer, size_t capacity)
+static int path_string(const struct kernel_vfs_path *path,
+                       const struct kernel_vfs_path *root,
+                       char *buffer, size_t capacity, int allow_deleted)
 {
     if (!path || !path->file.mount || !path->file.mount->private_data) return -KERNEL_EINVAL;
     VFS_PATH_PIN(path_pin, path);
@@ -673,6 +690,7 @@ int kernel_vfs_path_string(const struct kernel_vfs_path *path,
     const struct kernel_vfs_path *cursor = path;
     size_t position = capacity - 1U;
     int result = 0;
+    int deleted = 0;
     buffer[position] = '\0';
     while (cursor != root) {
         if (cursor->parent == 0) {
@@ -685,8 +703,8 @@ int kernel_vfs_path_string(const struct kernel_vfs_path *path,
         }
         if (cursor->detached ||
             ((struct kernel_vfs_node *)cursor->file.private_data)->unlinked) {
-            result = -KERNEL_ENOENT;
-            break;
+            if (!allow_deleted) { result = -KERNEL_ENOENT; break; }
+            deleted = 1;
         }
         size_t length = strlen(cursor->name);
         if (!length || length >= position) {
@@ -705,9 +723,34 @@ int kernel_vfs_path_string(const struct kernel_vfs_path *path,
     if (!result) {
         if (position == capacity - 1U) buffer[--position] = '/';
         memmove(buffer, buffer + position, capacity - position);
+        if (deleted) {
+            static const char suffix[] = " (deleted)";
+            size_t length = strlen(buffer);
+            if (length + sizeof(suffix) > capacity) result = -KERNEL_ERANGE;
+            else memcpy(buffer + length, suffix, sizeof(suffix));
+        }
     }
     riscv_interrupt_restore(irq);
     return result;
+}
+
+int kernel_vfs_path_string(const struct kernel_vfs_path *path,
+                           const struct kernel_vfs_path *root,
+                           char *buffer, size_t capacity)
+{
+    return path_string(path, root, buffer, capacity, 0);
+}
+
+int kernel_vfs_path_link_string(const struct kernel_vfs_path *path,
+                                const struct kernel_vfs_path *root,
+                                char *buffer, size_t capacity)
+{
+    return path_string(path, root, buffer, capacity, 1);
+}
+
+const char *kernel_vfs_path_name(const struct kernel_vfs_path *path)
+{
+    return path && path->references ? path->name : 0;
 }
 
 int kernel_vfs_path_open(struct kernel_vfs_path *path,

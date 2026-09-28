@@ -76,6 +76,9 @@ struct kernel_vfs_backend {
     int (*lookup)(struct kernel_vfs_instance *instance, uint64_t parent,
         const char *name, size_t length, uint64_t *inode, uint32_t *mode);
     int (*readlink)(struct kernel_vfs_node *node, char *buffer, size_t size, size_t *count);
+    /* Object links resolve to a pinned path without a pathname relookup. */
+    int (*follow_link)(struct kernel_vfs_node *node,
+                       struct kernel_vfs_path **owner);
     /* Generated files return an owned, single-read-epoch snapshot. The OFD
      * releases it and creates a new one after seek to offset zero. */
     int (*snapshot)(struct kernel_vfs_node *node, struct kernel_heap *heap,

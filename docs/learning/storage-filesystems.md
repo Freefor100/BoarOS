@@ -59,6 +59,16 @@ readv、pread、EOF、写入错误与 seek 回零/SEEK_END 均与固定 Linux �
 释放全部 fd，根 ext4 卸载仍因子挂载返回 `EBUSY`；聚焦测试覆盖两层
 覆盖挂载的末尾清理。
 
+进程 proc 入口先在同一固定 Linux 上证伪旧实现：`/proc/self` 链接和
+`exe/cwd/root` 在 Linux 分别返回当前 TGID、主 ELF 路径和对象目录，旧
+BoarOS 返回 `ENOENT/ENOTDIR`。VFS 的普通符号链接按文本重查不能保持
+已删除执行文件或 cwd 的身份，因此新增可选的后端对象链接跟随入口，直接
+返回带引用的目标路径；readlink 仍单独生成展示文本。进程数字目录把
+单调代次编进 inode，避免旧路径在 PID 复用后转向新任务。MM 明确持有
+主 ELF OFD，动态解释器不能覆盖它，fork 与末次清理遵守原 source owner
+顺序。`tests/diff-abi/proc.c` 的 self/exe/cwd/root 和 uptime 形态与固定
+Linux 一致，当前总计 614 条；fd、进程文本和挂载列表仍待后续阶段验证。
+
 字符设备层采用 `st_rdev` 到内建 read/write/poll 操作的登记表，而不是在路径
 或每个 I/O 调用中重复识别设备名。`/dev` 仍可由 ext4 提供目录项；OFD 钉住
 选定后端，close 与 fd 复用不改变已开始的 I/O。固定 Linux

@@ -114,6 +114,11 @@ int kernel_vfs_path_open(struct kernel_vfs_path *path,
 int kernel_vfs_path_string(const struct kernel_vfs_path *path,
                            const struct kernel_vfs_path *root,
                            char *buffer, size_t capacity);
+int kernel_vfs_path_link_string(const struct kernel_vfs_path *path,
+                                const struct kernel_vfs_path *root,
+                                char *buffer, size_t capacity);
+/* Borrowed last component; caller keeps the path reference. */
+const char *kernel_vfs_path_name(const struct kernel_vfs_path *path);
 int kernel_vfs_open_at(struct kernel_vfs_path *start,
                        struct kernel_vfs_path *root, const char *path,
                        int follow_final, struct kernel_vfs_file *file);

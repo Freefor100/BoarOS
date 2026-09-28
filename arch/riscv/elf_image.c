@@ -1069,6 +1069,10 @@ enum riscv_elf_image_status riscv_elf_image_build(
     if (mm_status == KERNEL_MM_STATUS_OK) {
         mm_status = kernel_mm_vdso_set_address(&image->mm, layout.vdso);
     }
+    if (mm_status == KERNEL_MM_STATUS_OK) {
+        mm_status = kernel_mm_set_executable(&image->mm,
+            kernel_elf64_source_file(request->executable_source));
+    }
     if (mm_status != KERNEL_MM_STATUS_OK) {
         status = cleanup_space(&image->mm, &space);
         return status == RISCV_ELF_IMAGE_STATUS_OK

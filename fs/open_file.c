@@ -19,6 +19,12 @@
 static int open_file_live(
     const struct kernel_open_file_description *file);
 
+struct kernel_vfs_path *kernel_open_file_path(
+    const struct kernel_open_file_description *description)
+{
+    return open_file_live(description) ? description->file.path : 0;
+}
+
 static void release_record_locks(struct kernel_open_file_description *file)
 {
     if (!file->record_locks) return;
