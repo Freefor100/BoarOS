@@ -10,6 +10,7 @@ struct kernel_heap;
 struct kernel_open_file_description;
 struct kernel_vfs_mount;
 struct kernel_vfs_node;
+struct kernel_vfs_stat;
 struct kernel_socket;
 
 /* Borrowed identity, valid while the regular-file OFD is owned. */
@@ -99,6 +100,11 @@ enum kernel_open_file_kind kernel_open_file_kind(
 /* Stable within an open pseudo object; zero for path-backed descriptions. */
 uint64_t kernel_open_file_pseudo_identity(
     const struct kernel_open_file_description *file);
+
+/* Snapshot metadata of a pathless object while its OFD is borrowed/pinned. */
+int kernel_open_file_pseudo_stat(
+    const struct kernel_open_file_description *file,
+    struct kernel_vfs_stat *stat);
 
 struct kernel_pipe;
 struct kernel_open_file_pipe_pin {

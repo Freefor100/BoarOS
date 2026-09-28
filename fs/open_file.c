@@ -391,6 +391,34 @@ uint64_t kernel_open_file_pseudo_identity(
     return 0U;
 }
 
+int kernel_open_file_pseudo_stat(
+    const struct kernel_open_file_description *file,
+    struct kernel_vfs_stat *stat)
+{
+    if (!open_file_live(file) || !stat || kernel_open_file_path(file))
+        return -KERNEL_ENOTSUP;
+    uint32_t mode;
+    uint64_t rdev = 0U;
+    if (file->kind == KERNEL_OPEN_FILE_KIND_PIPE)
+        mode = KERNEL_VFS_S_IFIFO | 0600U;
+    else if (file->kind == KERNEL_OPEN_FILE_KIND_SOCKET)
+        mode = KERNEL_VFS_S_IFSOCK | 0600U;
+    else if (file->kind == KERNEL_OPEN_FILE_KIND_EPOLL)
+        mode = 0600U;
+    else if (file->kind == KERNEL_OPEN_FILE_KIND_CONSOLE) {
+        mode = KERNEL_VFS_S_IFCHR | 0600U;
+        rdev = UINT64_C(0x501);
+    } else return -KERNEL_ENOTSUP;
+    *stat = (struct kernel_vfs_stat){
+        .mode = mode,
+        .nlink = 1U,
+        .rdev = rdev,
+        .size = kernel_open_file_size(file),
+        .blksize = BOAROS_PAGE_SIZE,
+    };
+    return 0;
+}
+
 int kernel_open_file_pipe_pin(
     const struct kernel_open_file_description *source, uint32_t flags,
     struct kernel_open_file_pipe_pin *pin)

@@ -529,32 +529,13 @@ static int fill_linux_stat(
     struct kernel_linux_stat *stat,
     const struct kernel_open_file_description *description)
 {
-    uint64_t size = kernel_open_file_size(description);
-    enum kernel_open_file_kind kind = kernel_open_file_kind(description);
-
     memset(stat, 0, sizeof(*stat));
-    if (kind == KERNEL_OPEN_FILE_KIND_CONSOLE &&
-        description->file.private_data == 0) {
-        stat->st_mode = KERNEL_VFS_S_IFCHR | UINT32_C(0000600);
-        stat->st_rdev = UINT64_C(0x501);
-    } else if (kind == KERNEL_OPEN_FILE_KIND_PIPE) {
-        stat->st_mode = KERNEL_VFS_S_IFIFO | UINT32_C(0000600);
-    } else if (kind == KERNEL_OPEN_FILE_KIND_EPOLL) {
-        /* Linux anon_inode_getfile supplies mode 0600 without type bits. */
-        stat->st_mode = UINT32_C(0000600);
-    } else if (kind == KERNEL_OPEN_FILE_KIND_SOCKET) {
-        stat->st_mode = KERNEL_VFS_S_IFSOCK | UINT32_C(0000600);
-    } else {
-        struct kernel_vfs_stat vfs_stat;
-        int result = kernel_vfs_fstat(&description->file, &vfs_stat);
-
-        if (result != 0) return result;
-        fill_linux_vfs_stat(stat, &vfs_stat);
-        return 0;
-    }
-    stat->st_nlink = 1U;
-    stat->st_size = (int64_t)size;
-    stat->st_blksize = (int32_t)BOAROS_PAGE_SIZE;
+    struct kernel_vfs_stat vfs_stat;
+    int result = kernel_open_file_pseudo_stat(description, &vfs_stat);
+    if (result == -KERNEL_ENOTSUP)
+        result = kernel_vfs_fstat(&description->file, &vfs_stat);
+    if (result) return result;
+    fill_linux_vfs_stat(stat, &vfs_stat);
     return 0;
 }
 

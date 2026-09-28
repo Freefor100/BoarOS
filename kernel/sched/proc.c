@@ -252,6 +252,23 @@ int kernel_proc_fd_pseudo_snapshot(kernel_pid_t pid, uint64_t identity,
     return result;
 }
 
+int kernel_proc_fd_pseudo_stat(kernel_pid_t pid, uint64_t identity,
+                               int fd, struct kernel_vfs_stat *stat)
+{
+    if (pid <= 0 || !identity || fd < 0 || !stat)
+        return -KERNEL_EINVAL;
+    uintptr_t irq = riscv_interrupt_save();
+    struct kernel_task *task = find_member(pid, identity);
+    struct kernel_open_file_description *file = task &&
+        kernel_files_is_live(&task->files)
+        ? kernel_files_fd_borrow(&task->files, fd) : 0;
+    /* 伪对象的元数据快照不分配也不等待；解锁后不再访问 OFD。 */
+    int result = file ? kernel_open_file_pseudo_stat(file, stat)
+                      : -KERNEL_ENOENT;
+    riscv_interrupt_restore(irq);
+    return result;
+}
+
 int kernel_proc_fd_reopen_link(kernel_pid_t pid, uint64_t identity,
                                int fd, struct kernel_heap *heap,
                                uint32_t flags,

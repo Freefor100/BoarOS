@@ -84,6 +84,9 @@ struct kernel_vfs_backend {
     /* A pseudo-object link may open a new description without a VFS path. */
     int (*reopen_link)(struct kernel_vfs_node *node, struct kernel_heap *heap,
         uint32_t flags, struct kernel_open_file_description **owner);
+    /* Metadata of a pathless object named by a final symlink. */
+    int (*stat_link)(struct kernel_vfs_node *node,
+                     struct kernel_vfs_stat *stat);
     /* Generated files return an owned, single-read-epoch snapshot. The OFD
      * releases it and creates a new one after seek to offset zero. */
     int (*snapshot)(struct kernel_vfs_node *node, struct kernel_heap *heap,

@@ -17,7 +17,7 @@ Linux 为 `references/linux` 的 `f4cdf7ca9a1fdcca413157df19753f388a5a224e`。
 | 通用 VFS 与 ext4 后端 | ext4 拆分已验证，生成文件待接入 | 实例/inode 身份、目录项和引用；普通缓存文件与生成文件分离；保留日志/错误 owner |
 | 挂载树与路径 | 内部路径及 proc 的用户态 mount/umount2 已验证；完整 proc 待交付 | 保持同点覆盖、根和 ..、cwd/dirfd、忙卸载/回滚；补齐 proc 进程对象后复跑真实消费者 |
 | 字符设备后端 | 已验证 | 按设备号登记 null/zero/console 操作，OFD 持有后端；/dev 仍为 ext4 目录，不冒充 devfs |
-| procfs 与对象链接 | meminfo、uptime、self、exe/cwd/root/fd、mounts 与 stat/status 首批字段已通过差分；仍在进行 | 补 magic-link 跟随式元数据、初始 console 链接及生命周期并发边界；保留真实消费者缺口 |
+| procfs 与对象链接 | meminfo、uptime、self、exe/cwd/root/fd、mounts 与 stat/status 首批字段已通过差分；仍在进行 | 补初始 console 链接及生命周期并发边界；保留真实消费者缺口 |
 | 集成与评测交接 | 待验收 | 先独立消费者诊断，再一次固定预算 RV 原 judge 评分；不拼接成绩 |
 
 进程查询区分 PID 分配代次，旧 proc 对象不能访问复用 PID 的新进程。MM 持有执行

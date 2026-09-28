@@ -105,6 +105,15 @@ test-stack-usage` 通过。初始无路径 console 与伪对象跟随式 stat �
 16 位；将 15 位截断会把该编号错误编码为零，因此 fd 扩展使用 16 位 PID、
 10 位 fd、4 位种类和 34 位单调代次，并在构造时检查边界。
 
+随后用固定 Linux 同一 RV ELF 对照 `/proc/self/fd/N` 的跟随式
+`newfstatat`：普通文件已有目标路径，pipe 返回 `ENOENT`、socket/epoll
+返回 `ENXIO`，而 Linux 三者均返回与原 fd 的 `fstat` 一致的类型、inode
+与设备号。单纯读取 `pipe:[N]` 或 `anon_inode:[eventpoll]` 的展示文字无法
+恢复目标身份，因此 VFS 只在最终路径跟随失败时调用后端 `stat_link`；proc
+在短关中断区里读取当前 fd 槽的伪对象快照，不持锁复制用户内存。原始失败
+与修复后的 658 条一致记录由 `make test-diff-abi-riscv` 重建；初始无路径
+console 链接仍是独立限制。
+
 原始固定 BusyBox 包装脚本以 SHA-256
 `f2cda5fcdff6d41c8a553ac658e8aa55b6a48aa40898cb123a19f7865f3773ac`
 复跑，入口为 `python3 tests/program-inventory/run.py --suite busybox

@@ -8,6 +8,7 @@ struct kernel_vfs_path;
 struct kernel_task;
 struct kernel_open_file_description;
 struct kernel_heap;
+struct kernel_vfs_stat;
 
 enum kernel_proc_path_kind {
     KERNEL_PROC_PATH_EXE = 1,
@@ -64,6 +65,8 @@ int kernel_proc_fd_reopen_link(kernel_pid_t pid, uint64_t identity,
                                int fd, struct kernel_heap *heap,
                                uint32_t flags,
                                struct kernel_open_file_description **owner);
+int kernel_proc_fd_pseudo_stat(kernel_pid_t pid, uint64_t identity,
+                               int fd, struct kernel_vfs_stat *stat);
 
 /* Fault I/O attribution belongs to the running task, including after sleep. */
 void kernel_proc_task_note_block_read(void);

@@ -544,6 +544,15 @@ static int proc_reopen_link(struct kernel_vfs_node *node,
         flags, owner);
 }
 
+static int proc_stat_link(struct kernel_vfs_node *node,
+                          struct kernel_vfs_stat *stat)
+{
+    if (proc_inode_kind(node->inode) != PROC_PID_FD_LINK_KIND)
+        return -KERNEL_ENOTSUP;
+    return kernel_proc_fd_pseudo_stat(proc_inode_pid(node->inode),
+        proc_inode_identity(node->inode), proc_inode_fd(node->inode), stat);
+}
+
 static size_t decimal(char *buffer, uint64_t value)
 {
     char reverse[24];
@@ -911,6 +920,7 @@ static void initialize_backend(void)
     ops->readlink = proc_readlink;
     ops->follow_link = proc_follow_link;
     ops->reopen_link = proc_reopen_link;
+    ops->stat_link = proc_stat_link;
     ops->close_node = proc_close_node;
     ops->open = proc_open;
     ops->stat = proc_stat;

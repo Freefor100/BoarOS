@@ -1351,6 +1351,21 @@ int kernel_vfs_stat_at(struct kernel_vfs_path *start,
     if (!result) {
         result = kernel_vfs_path_stat(resolved, stat);
         (void)kernel_vfs_path_release(&resolved);
+    } else if (follow_final &&
+               (result == -KERNEL_ENOENT || result == -KERNEL_ENXIO)) {
+        int original = result;
+        /* 跟随无路径对象失败时，只重查最终链接并向其后端索取元数据。 */
+        if (!kernel_vfs_path_resolve(start, root, path, 0, &resolved)) {
+            struct kernel_vfs_instance *instance =
+                resolved->file.mount->private_data;
+            if ((resolved->file.mode & KERNEL_VFS_S_IFMT) ==
+                    KERNEL_VFS_S_IFLNK && instance->ops->stat_link)
+                result = instance->ops->stat_link(resolved->file.private_data,
+                                                  stat);
+            else result = -KERNEL_ENOTSUP;
+            (void)kernel_vfs_path_release(&resolved);
+            if (result == -KERNEL_ENOTSUP) result = original;
+        }
     }
     return result;
 }

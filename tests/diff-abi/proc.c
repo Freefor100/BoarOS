@@ -69,6 +69,18 @@ static long proc_directory_finish(long fd)
     return -1;
 }
 
+static void proc_fd_follow_stat(const char *case_name, const char *path,
+                                long descriptor)
+{
+    struct abi_stat followed, original;
+    abi_require(SC2(80, descriptor, &original) == 0);
+    long result = SC4(79, -100, path, &followed, 0);
+    int same = !result && followed.mode == original.mode &&
+               followed.ino == original.ino &&
+               followed.rdev == original.rdev;
+    abi_record(case_name, result, same ? 0 : -1, -1, 0, 0, 0);
+}
+
 /* Missing mount dispatch must not masquerade as a procfs consumer failure. */
 void abi_proc_cases(void)
 {
@@ -244,6 +256,7 @@ void abi_proc_cases(void)
     abi_record("proc.fd-link-mode", fd_stat_result,
                fd_stat_result ? -1 : (long)(fd_stat.mode & 0777U),
                -1, 0, 0, 0);
+    proc_fd_follow_stat("proc.fd-follow-stat", fd_path, object_fd);
     long reopened = abi_open(fd_path, 0);
     abi_record("proc.fd-reopen", reopened < 0 ? reopened : 0,
                -1, -1, 0, 0, 0);
@@ -258,6 +271,9 @@ void abi_proc_cases(void)
     abi_record("proc.fd-closed-link",
                SC4(78, -100, fd_path, fd_link, sizeof(fd_link)),
                -1, -1, 0, 0, 0);
+    abi_record("proc.fd-closed-follow-stat",
+               SC4(79, -100, fd_path, &fd_stat, 0),
+               -1, -1, 0, 0, 0);
     abi_require(SC3(35, -100, "/proc-fd-target", 0) == 0);
     long reused = SC4(56, -100, "/proc-fd-second", 0102, 0644);
     abi_require(reused >= 0);
@@ -265,6 +281,7 @@ void abi_proc_cases(void)
     long reused_length = SC4(78, -100, fd_path, fd_link, sizeof(fd_link));
     abi_record("proc.fd-reused-link", reused_length, -1, -1, 0,
                fd_link, reused_length > 0 ? (usize)reused_length : 0);
+    proc_fd_follow_stat("proc.fd-reused-follow-stat", fd_path, reused);
     abi_require(SC1(57, reused) == 0);
     abi_require(SC3(35, -100, "/proc-fd-second", 0) == 0);
     int pipe_fds[2] = {-1, -1};
@@ -278,6 +295,7 @@ void abi_proc_cases(void)
     abi_record("proc.fd-pipe-mode", fd_stat_result,
                fd_stat_result ? -1 : (long)(fd_stat.mode & 0777U),
                -1, 0, 0, 0);
+    proc_fd_follow_stat("proc.fd-pipe-follow-stat", fd_path, pipe_fds[0]);
     reopened = abi_open(fd_path, 0);
     abi_record("proc.fd-pipe-reopen", reopened < 0 ? reopened : 0,
                -1, -1, 0, 0, 0);
@@ -331,6 +349,7 @@ void abi_proc_cases(void)
     abi_record("proc.fd-socket-mode", fd_stat_result,
                fd_stat_result ? -1 : (long)(fd_stat.mode & 0777U),
                -1, 0, 0, 0);
+    proc_fd_follow_stat("proc.fd-socket-follow-stat", fd_path, socket_fd);
     reopened = abi_open(fd_path, 0);
     abi_record("proc.fd-socket-reopen", reopened < 0 ? reopened : 0,
                -1, -1, 0, 0, 0);
@@ -350,6 +369,7 @@ void abi_proc_cases(void)
     abi_record("proc.fd-epoll-mode", fd_stat_result,
                fd_stat_result ? -1 : (long)(fd_stat.mode & 0777U),
                -1, 0, 0, 0);
+    proc_fd_follow_stat("proc.fd-epoll-follow-stat", fd_path, epoll_fd);
     reopened = abi_open(fd_path, 0);
     abi_record("proc.fd-epoll-reopen", reopened < 0 ? reopened : 0,
                -1, -1, 0, 0, 0);
