@@ -218,5 +218,6 @@ qemu-system-riscv64 -machine virt -kernel kernel-rv -m 1G -nographic -smp 1 \
   `cut: /proc/5/stat: No such file or directory`，直至总预算结束。musl LTP、Lua 和
   netperf 没有启动，不能根据本次 0 分判断这些程序的独立通过率。
 
-后续仍按 goals 的真实 procfs/设备与 mount 生命周期设计推进，再补 tmpfs、运行环境
-接口并重新评测；SysV IPC 待设计。这里不把原 judge 的分数直接等同于内核能力覆盖率。
+以上是旧基线当时的待办。真实 procfs/设备与 mount 首批能力已在后续主线交付；
+当前未关闭的统计、tmpfs、环境接口及 SysV IPC 依赖以 [goals](../goals.md) 为准。
+原 judge 分数不能直接等同于内核能力覆盖率。
