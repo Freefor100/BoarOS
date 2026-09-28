@@ -16,6 +16,8 @@
 #define LINUX_SYSCALL_FCHMODAT 53U
 #define LINUX_SYSCALL_GETCWD 17U
 #define LINUX_SYSCALL_RENAMEAT 38U
+#define LINUX_SYSCALL_UMOUNT2 39U
+#define LINUX_SYSCALL_MOUNT 40U
 #define LINUX_SYSCALL_CHDIR 49U
 #define LINUX_SYSCALL_FCHDIR 50U
 #define LINUX_SYSCALL_RENAMEAT2 276U
@@ -236,6 +238,11 @@ enum kernel_syscall_status kernel_syscall_dispatch(
             KERNEL_SYSCALL_STATUS_OK) {
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
         }
+    } else if (request->number == LINUX_SYSCALL_MOUNT ||
+               request->number == LINUX_SYSCALL_UMOUNT2) {
+        if (syscall_handle_mount(caller, request, &decoded,
+                request->number == LINUX_SYSCALL_UMOUNT2) !=
+            KERNEL_SYSCALL_STATUS_OK) return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     } else if (request->number == LINUX_SYSCALL_UTIMENSAT) {
         if (syscall_handle_utimensat(caller, request, &decoded) != KERNEL_SYSCALL_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;

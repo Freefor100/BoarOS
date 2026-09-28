@@ -9,6 +9,7 @@
 #include <kernel/page.h>
 #include <kernel/page_cache.h>
 #include <kernel/physical_page.h>
+#include <kernel/procfs.h>
 #include <kernel/vfs.h>
 #include "../../fs/vfs_objects.h"
 
@@ -264,6 +265,30 @@ static void run_mount_tree_regression(struct kernel_vfs_mount *root_mount,
         kernel_vfs_path_release(&covered) || kernel_vfs_path_release(&root) ||
         kernel_vfs_rmdir(root_mount, "/mount-anchor"))
         fail_vfs(126U, 0, -1);
+}
+
+static void run_proc_shutdown_regression(struct kernel_vfs_mount *root_mount,
+                                         struct kernel_heap *heap)
+{
+    struct kernel_vfs_path *root = 0, *covered = 0, *first_root = 0;
+    struct kernel_vfs_mount *first = 0, *second = 0;
+    if (kernel_vfs_mkdir(root_mount, "/proc-cleanup", 0755U) ||
+        kernel_vfs_path_root(root_mount, heap, &root) ||
+        kernel_vfs_path_lookup(root, "proc-cleanup", 12U, &covered) ||
+        kernel_procfs_create(heap, 0U, &first) ||
+        kernel_vfs_mount_attach(first, covered) ||
+        kernel_vfs_path_resolve(root, root, "/proc-cleanup", 1, &first_root) ||
+        kernel_procfs_create(heap, 0U, &second) ||
+        kernel_vfs_mount_attach(second, first_root) ||
+        root_mount->child_mounts != 1U || first->child_mounts != 1U)
+        fail_vfs(129U, 0, -1);
+    if (kernel_vfs_path_release(&first_root) ||
+        kernel_vfs_path_release(&covered) ||
+        kernel_vfs_path_release(&root) ||
+        kernel_procfs_unmount_children(root_mount) ||
+        root_mount->child_mounts != 0U || root_mount->first_child != 0 ||
+        kernel_vfs_rmdir(root_mount, "/proc-cleanup"))
+        fail_vfs(130U, 0, -1);
 }
 
 static uint32_t fail_orphan_free_calls;
@@ -1012,6 +1037,7 @@ static void run_vfs_test(const void *dtb)
     run_deep_relative_path_regression(&mount, &heap);
     run_path_cleanup_regression(&mount, &heap);
     run_mount_tree_regression(&mount, &heap);
+    run_proc_shutdown_regression(&mount, &heap);
     run_writeback_regression(&mount, &page_cache);
     result = kernel_vfs_unmount(&mount);
     if (result != 0 || retried_fclose_calls != failed_fclose_calls) {

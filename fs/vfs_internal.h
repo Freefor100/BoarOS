@@ -10,6 +10,7 @@ struct kernel_page_cache_entry;
 struct kernel_vfs_file;
 struct kernel_vfs_mount;
 struct kernel_vfs_node;
+struct kernel_heap;
 struct kernel_record_lock_state;
 
 struct kernel_vfs_node *kernel_vfs_file_node(
@@ -25,6 +26,10 @@ int kernel_vfs_node_pread(struct kernel_vfs_node *node,
                           void *buffer,
                           size_t size,
                           size_t *bytes_read);
+int kernel_vfs_file_generated(const struct kernel_vfs_file *file);
+int kernel_vfs_file_snapshot(const struct kernel_vfs_file *file,
+                             struct kernel_heap *heap,
+                             char **buffer, size_t *length);
 
 struct kernel_page_cache_entry **kernel_vfs_node_cache_pages(
     struct kernel_vfs_node *node);

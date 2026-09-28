@@ -70,6 +70,8 @@ int kernel_vfs_mount_attach(struct kernel_vfs_mount *mount,
 
     if (!mount || mount->state != VFS_MOUNT_STATE_LIVE || !mount->private_data ||
         mount->root_path || mount->covered_path || !covered ||
+        mount->parent || mount->first_child || mount->next_sibling ||
+        mount->previous_sibling || mount->child_mounts ||
         covered->references == 0 || !covered->file.mount ||
         (covered->file.mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFDIR)
         return -KERNEL_EINVAL;
@@ -96,6 +98,9 @@ int kernel_vfs_mount_attach(struct kernel_vfs_mount *mount,
     mount->covered_path = covered;
     mount->root_path = new_root;
     mount->parent = parent;
+    mount->next_sibling = parent->first_child;
+    if (parent->first_child) parent->first_child->previous_sibling = mount;
+    parent->first_child = mount;
     covered->mounted_here = mount;
     riscv_interrupt_restore(irq);
     return 0;
@@ -124,11 +129,24 @@ int kernel_vfs_mount_detach(struct kernel_vfs_mount *mount,
         riscv_interrupt_restore(irq);
         return -KERNEL_EBUSY;
     }
+    if (mount->previous_sibling) {
+        if (mount->previous_sibling->next_sibling != mount) __builtin_trap();
+        mount->previous_sibling->next_sibling = mount->next_sibling;
+    } else {
+        if (mount->parent->first_child != mount) __builtin_trap();
+        mount->parent->first_child = mount->next_sibling;
+    }
+    if (mount->next_sibling) {
+        if (mount->next_sibling->previous_sibling != mount) __builtin_trap();
+        mount->next_sibling->previous_sibling = mount->previous_sibling;
+    }
     covered->mounted_here = 0;
     mount->parent->child_mounts--;
     mount->covered_path = 0;
     mount->root_path = 0;
     mount->parent = 0;
+    mount->next_sibling = 0;
+    mount->previous_sibling = 0;
     riscv_interrupt_restore(irq);
     kernel_lock_scope_release(&covered_guard);
     if (kernel_vfs_path_release(&root) || kernel_vfs_path_release(&covered))
@@ -1947,6 +1965,24 @@ int kernel_vfs_node_pread(struct kernel_vfs_node *node,
     if (!node || !node->mount || !node->mount->private_data) return -KERNEL_EINVAL;
     struct kernel_vfs_instance *instance = node->mount->private_data;
     return instance->ops->pread(node, offset, buffer, size, bytes_read);
+}
+
+int kernel_vfs_file_generated(const struct kernel_vfs_file *file)
+{
+    if (!file || !file->mount || !file->mount->private_data) return 0;
+    struct kernel_vfs_instance *instance = file->mount->private_data;
+    return instance->ops->snapshot != 0 &&
+           (file->mode & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFREG;
+}
+
+int kernel_vfs_file_snapshot(const struct kernel_vfs_file *file,
+                             struct kernel_heap *heap,
+                             char **buffer, size_t *length)
+{
+    if (!kernel_vfs_file_generated(file) || !heap || !buffer || *buffer ||
+        !length) return -KERNEL_EINVAL;
+    struct kernel_vfs_instance *instance = file->mount->private_data;
+    return instance->ops->snapshot(file->private_data, heap, buffer, length);
 }
 
 int kernel_vfs_node_writeback(struct kernel_vfs_node *node, uint64_t offset,

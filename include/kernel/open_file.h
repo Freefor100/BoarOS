@@ -33,6 +33,7 @@ enum kernel_open_file_kind {
     KERNEL_OPEN_FILE_KIND_NULL,
     KERNEL_OPEN_FILE_KIND_ZERO,
     KERNEL_OPEN_FILE_KIND_SOCKET,
+    KERNEL_OPEN_FILE_KIND_GENERATED,
 };
 
 /* VFS errors are returned through linux_result when status is OK. */

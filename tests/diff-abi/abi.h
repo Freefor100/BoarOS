@@ -34,6 +34,7 @@ void abi_record(const char *id, long ret, long size, long offset, long signal,
 void abi_require(int condition);
 void abi_exit(long code) __attribute__((noreturn));
 void abi_mknod_cases(void);
+void abi_proc_cases(void);
 void abi_script_probe(const unsigned long *sp);
 void abi_script_cases(void);
 void abi_child_tid_cases(void);

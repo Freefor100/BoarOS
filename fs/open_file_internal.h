@@ -27,7 +27,14 @@ struct kernel_open_file_description {
     struct kernel_socket *socket;
     struct kernel_epoll_item *ep_items;
     struct kernel_record_lock *record_locks;
+    char *generated_data;
+    size_t generated_length;
+    uint8_t generated_ready;
 };
+
+/* Caller holds offset_lock for a shared OFD snapshot. */
+int kernel_open_file_generate(struct kernel_open_file_description *file);
+void kernel_open_file_reset_generated(struct kernel_open_file_description *file);
 
 enum kernel_open_file_status kernel_open_file_create_pipe(
     struct kernel_heap *heap,

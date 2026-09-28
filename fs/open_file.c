@@ -67,6 +67,8 @@ static enum kernel_open_file_status create_open_file(
     file->heap = heap;
     file->references = 1U;
     kernel_mutex_init(&file->offset_lock, 10, (uintptr_t)file);
+    if (kernel_vfs_file_generated(&file->file))
+        file->kind = KERNEL_OPEN_FILE_KIND_GENERATED;
     file->observed_writeback_error = kernel_vfs_error_sequence(&file->file);
     *owner = file;
     *linux_result = 0;
@@ -109,7 +111,9 @@ enum kernel_open_file_status kernel_open_file_create_at(
     } else {
         file->heap = heap;
         file->references = 1U;
-    kernel_mutex_init(&file->offset_lock, 10, (uintptr_t)file);
+        kernel_mutex_init(&file->offset_lock, 10, (uintptr_t)file);
+        if (kernel_vfs_file_generated(&file->file))
+            file->kind = KERNEL_OPEN_FILE_KIND_GENERATED;
         file->observed_writeback_error = kernel_vfs_error_sequence(&file->file);
         *owner = file;
     }
@@ -386,6 +390,8 @@ enum kernel_open_file_kind kernel_open_file_kind(
         return KERNEL_OPEN_FILE_KIND_ZERO;
     case KERNEL_OPEN_FILE_KIND_SOCKET:
         return KERNEL_OPEN_FILE_KIND_SOCKET;
+    case KERNEL_OPEN_FILE_KIND_GENERATED:
+        return KERNEL_OPEN_FILE_KIND_GENERATED;
     default:
         return KERNEL_OPEN_FILE_KIND_REGULAR;
     }
@@ -445,6 +451,7 @@ enum kernel_open_file_status kernel_open_file_release(
     if (file->ep_items != 0) {
         kernel_epoll_notify_file_release(file);
     }
+    if (file->generated_ready) kernel_open_file_reset_generated(file);
     if (!file->vfs_closed) {
         if (file->kind == KERNEL_OPEN_FILE_KIND_CONSOLE &&
             file->file.private_data == 0) {
@@ -532,7 +539,36 @@ struct kernel_vfs_node *kernel_open_file_node(
 uint64_t kernel_open_file_size(
     const struct kernel_open_file_description *file)
 {
+    if (open_file_live(file) && file->kind == KERNEL_OPEN_FILE_KIND_GENERATED)
+        return file->generated_ready ? file->generated_length : 0U;
     return open_file_live(file) ? kernel_vfs_file_size(&file->file) : 0U;
+}
+
+int kernel_open_file_generate(struct kernel_open_file_description *file)
+{
+    if (!open_file_live(file) || file->kind != KERNEL_OPEN_FILE_KIND_GENERATED)
+        return -KERNEL_EINVAL;
+    if (file->generated_ready) return 0;
+    int result = kernel_vfs_file_snapshot(&file->file, file->heap,
+                                           &file->generated_data,
+                                           &file->generated_length);
+    if (result) {
+        if (file->generated_data) kernel_open_file_reset_generated(file);
+        return result;
+    }
+    file->generated_ready = 1U;
+    return 0;
+}
+
+void kernel_open_file_reset_generated(struct kernel_open_file_description *file)
+{
+    if (!file || file->kind != KERNEL_OPEN_FILE_KIND_GENERATED) __builtin_trap();
+    if (file->generated_data &&
+        kernel_heap_release(file->heap, file->generated_data) !=
+            KERNEL_HEAP_STATUS_OK) __builtin_trap();
+    file->generated_data = 0;
+    file->generated_length = 0U;
+    file->generated_ready = 0U;
 }
 
 uint32_t kernel_open_file_mode(
@@ -558,6 +594,7 @@ int kernel_open_file_readable(
     access_mode = file->open_flags & 3U;
     switch (file->kind) {
     case KERNEL_OPEN_FILE_KIND_REGULAR:
+    case KERNEL_OPEN_FILE_KIND_GENERATED:
     case KERNEL_OPEN_FILE_KIND_DIRECTORY:
     case KERNEL_OPEN_FILE_KIND_NULL:
     case KERNEL_OPEN_FILE_KIND_ZERO:
@@ -700,6 +737,7 @@ uint32_t kernel_open_file_poll(
     case KERNEL_OPEN_FILE_KIND_CONSOLE:
         return kernel_console_poll(requested_events, out_queue);
     case KERNEL_OPEN_FILE_KIND_REGULAR:
+    case KERNEL_OPEN_FILE_KIND_GENERATED:
     case KERNEL_OPEN_FILE_KIND_DIRECTORY:
     case KERNEL_OPEN_FILE_KIND_NULL:
     case KERNEL_OPEN_FILE_KIND_ZERO:

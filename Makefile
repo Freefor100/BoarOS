@@ -154,6 +154,7 @@ C_SOURCES := \
 	fs/record_lock.c \
 	fs/page_cache.c \
 	fs/vfs.c \
+	fs/procfs.c \
 	fs/ext4_backend.c \
 	kernel/boot_memory.c \
 	kernel/block.c \
@@ -175,6 +176,7 @@ C_SOURCES := \
 	kernel/sched/futex.c \
 	kernel/syscall/dispatch.c \
 	kernel/syscall/file.c \
+	kernel/syscall/mount.c \
 	kernel/syscall/memory.c \
 	kernel/syscall/process.c \
 	kernel/syscall/signal.c \
@@ -231,6 +233,7 @@ TEST_RUNTIME_C_SOURCES := \
 	fs/record_lock.c \
 	fs/page_cache.c \
 	fs/vfs.c \
+	fs/procfs.c \
 	fs/ext4_backend.c \
 	kernel/block.c \
 	kernel/elf64.c \
@@ -249,6 +252,7 @@ TEST_RUNTIME_C_SOURCES := \
 	kernel/sched/futex.c \
 	kernel/syscall/dispatch.c \
 	kernel/syscall/file.c \
+	kernel/syscall/mount.c \
 	kernel/syscall/memory.c \
 	kernel/syscall/process.c \
 	kernel/syscall/signal.c \

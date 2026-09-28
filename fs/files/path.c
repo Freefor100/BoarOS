@@ -285,8 +285,10 @@ enum kernel_files_status kernel_files_openat(
             *linux_result = -KERNEL_ENOTDIR;
             return KERNEL_FILES_STATUS_OK;
         }
-        if (access_mode == LINUX_O_WRONLY || access_mode == LINUX_O_RDWR ||
-            (flags & LINUX_O_TRUNC) != 0U) {
+        int generated = kernel_vfs_file_generated(&description->file);
+        if (!generated &&
+            (access_mode == LINUX_O_WRONLY || access_mode == LINUX_O_RDWR ||
+             (flags & LINUX_O_TRUNC) != 0U)) {
             int lease_result = kernel_vfs_file_acquire_write(&description->file);
             if (lease_result != 0) {
                 files->record->statistics.open_failures++;
@@ -296,7 +298,7 @@ enum kernel_files_status kernel_files_openat(
                 return KERNEL_FILES_STATUS_OK;
             }
         }
-        if (!created && (flags & LINUX_O_TRUNC) != 0U) {
+        if (!generated && !created && (flags & LINUX_O_TRUNC) != 0U) {
             int trunc_result = kernel_vfs_ftruncate(&description->file, 0U);
 
             if (trunc_result != 0) {
@@ -307,7 +309,8 @@ enum kernel_files_status kernel_files_openat(
                 return KERNEL_FILES_STATUS_OK;
             }
         }
-        description->kind = KERNEL_OPEN_FILE_KIND_REGULAR;
+        description->kind = generated
+            ? KERNEL_OPEN_FILE_KIND_GENERATED : KERNEL_OPEN_FILE_KIND_REGULAR;
     } else if ((kernel_open_file_mode(description) & KERNEL_VFS_S_IFMT) ==
                KERNEL_VFS_S_IFCHR) {
         struct kernel_vfs_stat stat;

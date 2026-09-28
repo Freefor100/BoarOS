@@ -11,6 +11,7 @@
 #include <kernel/fs_context.h>
 #include <kernel/mm.h>
 #include <kernel/open_file.h>
+#include <kernel/procfs.h>
 
 #include <stddef.h>
 #include <stdint.h>
@@ -122,7 +123,8 @@ enum riscv_root_boot_status riscv_root_boot_cleanup(
         root->cleanup_path = 0;
     }
     if (root->mount.private_data != 0) {
-        if (kernel_vfs_unmount(&root->mount) != 0) {
+        if (kernel_procfs_unmount_children(&root->mount) != 0 ||
+            kernel_vfs_unmount(&root->mount) != 0) {
             cleanup_failed = 1;
         }
     }
@@ -489,7 +491,8 @@ enum riscv_root_boot_status riscv_root_boot_finish(
     if (root->finish_failure != RISCV_ROOT_FINISH_NONE) {
         return RISCV_ROOT_BOOT_STATUS_CLEANUP;
     }
-    error = kernel_vfs_unmount(&root->mount);
+    error = kernel_procfs_unmount_children(&root->mount);
+    if (error == 0) error = kernel_vfs_unmount(&root->mount);
     if (error != 0) {
         root->finish_failure = RISCV_ROOT_FINISH_UNMOUNT;
         root->finish_error = error;

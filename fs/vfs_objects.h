@@ -76,6 +76,10 @@ struct kernel_vfs_backend {
     int (*lookup)(struct kernel_vfs_instance *instance, uint64_t parent,
         const char *name, size_t length, uint64_t *inode, uint32_t *mode);
     int (*readlink)(struct kernel_vfs_node *node, char *buffer, size_t size, size_t *count);
+    /* Generated files return an owned, single-read-epoch snapshot. The OFD
+     * releases it and creates a new one after seek to offset zero. */
+    int (*snapshot)(struct kernel_vfs_node *node, struct kernel_heap *heap,
+        char **buffer, size_t *length);
     int (*truncate)(struct kernel_vfs_node *node, uint64_t size, uint64_t *actual, int *changed);
     int (*close_node)(struct kernel_vfs_node *node);
     int (*writeback_allowed)(struct kernel_vfs_instance *instance);
@@ -132,11 +136,4 @@ struct kernel_vfs_backend {
 void kernel_vfs_record_writeback_error(struct kernel_vfs_node *node, int error);
 int kernel_vfs_publish_node(struct kernel_vfs_mount *mount, struct kernel_vfs_node *node,
     struct kernel_vfs_file *file, int creating);
-/* The caller prepares a live backend before attachment. A failed attach leaves
- * both paths owned by their original callers. Detach accepts one caller-owned
- * named_root reference, but refuses any other root, file or child owner. */
-int kernel_vfs_mount_attach(struct kernel_vfs_mount *mount,
-                            struct kernel_vfs_path *covered);
-int kernel_vfs_mount_detach(struct kernel_vfs_mount *mount,
-                            const struct kernel_vfs_path *named_root);
 #endif

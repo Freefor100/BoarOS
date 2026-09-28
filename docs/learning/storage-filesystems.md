@@ -27,11 +27,11 @@ DMA 的地址是设备可见地址，不等于任意内核虚拟地址。QEMU `v
 重建入口为 `make test-vfs-riscv test-files-riscv test-mm-riscv test-exec-riscv
  test-record-lock-riscv test-scale-riscv test-io-sleep-riscv`；VFS runner 同时覆盖
 恢复和只读/可写根盘，规模与睡眠 I/O 继续保护原成本和并发门槛。
-本次另通过 `make test-riscv test-stack-usage`、SQLite DELETE/WAL、
+前一阶段另通过 `make test-riscv test-stack-usage`、SQLite DELETE/WAL、
 `test-lwext4-recovery-host` 与 `test-lwext4-rename-host`。既有 583 条 ABI
 记录仍与固定 Linux 一致；新增 3 条 proc 探针分别得到 ENOSYS、ENOENT、
 ENOSYS，尚未转绿，不计入已支持能力。SQLite 逐事件完整恢复矩阵仍待本轮收口。
-此阶段的通过不代表 mount syscall、procfs 或对象链接已完成。
+该阶段的通过只建立后端拆分，不代表 mount syscall 或 procfs 已完成。
 
 随后在内部挂载路径上，固定 Linux
 `references/linux/fs/namei.c:2195` 的 `follow_dotdot` 与
@@ -42,6 +42,22 @@ ENOSYS，尚未转绿，不计入已支持能力。SQLite 逐事件完整恢复�
 目标实例并核对待创建名称，避免跨实例的锁次序倒置及并发创建误成功。
 `make test-vfs-riscv` 的内存后端测试覆盖 64 位 inode 碰撞、嵌套/覆盖、
 `..`、cwd、忙卸载和挂载失败回滚；这不是 procfs 用户态验收。
+
+在此基础上接入用户态 proc 挂载与首个真实生成文件。固定 Linux
+`references/linux/fs/namespace.c` 的 `path_mount()`/`path_umount()` 和
+`references/linux/fs/proc/meminfo.c`（commit
+`f4cdf7ca9a1fdcca413157df19753f388a5a224e`）用于核对挂载忙引用及
+`meminfo` 的生成式读取边界。`tests/diff-abi/proc.c` 对照真实 RV U-mode，
+普通/只读静默挂载、同点覆盖、cwd/打开文件忙卸载、`MemTotal:` 短读、
+readv、pread、EOF、写入错误与 seek 回零/SEEK_END 均与固定 Linux 一致；连同既有记录共 603 条。
+`make test-riscv test-stack-usage` 通过，最大编译器栈界仍为 2368 字节。
+这里只证明当前挂载和 `meminfo` 范围，不能外推 `/proc/self`、进程目录
+或比赛消费者。
+早期 VFS 模块测试尚在物理地址执行，静态回调表中的高半区函数指针会在
+首次 proc 根查询时产生取指故障；proc 回调与 ext4 一样在挂载时逐项按当前
+执行域填写。退出路径还须自叶向根释放 proc 子挂载，否则 PID 1 即使已
+释放全部 fd，根 ext4 卸载仍因子挂载返回 `EBUSY`；聚焦测试覆盖两层
+覆盖挂载的末尾清理。
 
 ## 为什么当前是同步 I/O
 

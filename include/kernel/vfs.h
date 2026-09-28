@@ -28,8 +28,18 @@ struct kernel_vfs_mount {
     struct kernel_vfs_path *root_path;
     struct kernel_vfs_path *covered_path;
     struct kernel_vfs_mount *parent;
+    struct kernel_vfs_mount *first_child;
+    struct kernel_vfs_mount *next_sibling;
+    struct kernel_vfs_mount *previous_sibling;
     uint32_t child_mounts;
 };
+
+/* Attachment transfers owned root/covered-path references to the tree.
+ * Detach accepts the single caller-owned root used to name the mount. */
+int kernel_vfs_mount_attach(struct kernel_vfs_mount *mount,
+                            struct kernel_vfs_path *covered);
+int kernel_vfs_mount_detach(struct kernel_vfs_mount *mount,
+                            const struct kernel_vfs_path *named_root);
 
 struct kernel_vfs_timespec {
     int64_t seconds;
