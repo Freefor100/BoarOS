@@ -45,3 +45,28 @@ WAL 断电与共享页故障阶段证据：`make test-sqlite-wal-recovery-riscv`
 主线 `5f8faec` 的内核 SHA-256 为 `1a0dc5b9dc338e01d9fc7b10c689edaaa761f75952bc8fce90f2f4a4c1478167`；静态 SQLite 恢复程序为 `179be6d2e5ab52c908d4e0547225e7999d9e404ffd05c12f404e9f170fdca5e0`，宿主 NBD 服务为 `356cbb5d10fbe590087eda1f4bc9421f3d56c39bb4f82afd289a97fa4c18bfb1`，QEMU 11.1.1。`make test-sqlite-recovery-matrix-riscv` 通过 147 个事务事件下的 441 个断电组合、100 个写失败和 47 个 flush 失败；`make test-sqlite-wal-recovery-matrix-riscv` 通过 42 个事件下的 126 个断电组合、26 个写失败和 16 个 flush 失败。每个故障镜像均按 runner 进行两次恢复、整事务数据及 ext4 检查；普通 DELETE/WAL 和多进程 WAL 冒烟也在相同内核上通过。输入来自本地固定 SQLite 3.53.4 和 QEMU 源码清单；仍只证明上述单 hart/QEMU 故障模型。
 
 同轮 `make test-lwext4-recovery-host` 再次通过低层事务和全部 16 种 orphan 组合及断电恢复；`make test-references` 通过。宿主模型独立于这次启动/proc 改动，不替代真实客体的逐事件矩阵。
+
+## 2026-09-29 恢复矩阵探针口径
+
+本轮 proc 退出修复的 WAL 完整矩阵首次在 `cut-43-none` 等待 NBD 服务结束时
+超时；客体已打印 `SQLite commit confirmed`，NBD 日志只收到 42 个事务事件，
+没有发生数据库恢复判定失败。原 runner 用默认持久化策略的预探针得到 43 次
+（27 写、16 flush），再把 43 当作 none/odd/reverse 三种策略共同的切点上限。
+隔离地从同一 `small-baseline.img` 启动三种策略、保持串口 `arm` 握手并等提交，
+均得到 42 次（26 写、16 flush）；同策略的原 cut 运行也只到 42 次。
+因此多出的第 43 切点在 none 策略下不可到达，旧等待方式直到 60 秒超时。
+现在每种策略从自己的完整事务探针生成切点，默认策略探针仍决定写/flush
+故障点，覆盖真实发生的每个请求而不把未触发的切断伪装成通过。
+
+修正后的 `tests/sqlite-recovery-riscv.py` SHA-256 为
+`f542d200cbb8bfd63abe19e45ba5152629bb006a6a599d62de5ace0c4df8c3e7`。
+`make test-sqlite-recovery-matrix-riscv` 在内核 SHA-256
+`ce3cbbcd511fa89732e3af53381d6a0c423ab8e6891accaf04d5f69205a3b65a`
+上以 148 个 DELETE 事件完成 444 个切点、101 个写失败和 47 个 flush
+失败；`make test-sqlite-wal-recovery-matrix-riscv` 以各策略 42 个 WAL
+事件完成 126 个切点、26 个写失败和 16 个 flush 失败。两者均经两次恢复、
+事务内容和 ext4 检查；恢复 ELF 与 NBD 服务分别为
+`179be6d2e5ab52c908d4e0547225e7999d9e404ffd05c12f404e9f170fdca5e0`
+和 `356cbb5d10fbe590087eda1f4bc9421f3d56c39bb4f82afd289a97fa4c18bfb1`。
+同轮宿主 lwext4 恢复、NBD 协议和固定资料校验通过；仍只覆盖本地单 hart
+QEMU/NBD 故障模型。
