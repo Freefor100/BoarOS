@@ -138,3 +138,7 @@ make test-root-init-riscv
 用户复制在 inode/缓存内容/后端锁之外，文件写先复制到请求页再进入存储。持锁分配、堆和 MM 元数据操作只允许非阻塞干净页回收；脏页回收在外层取得 inode try-read 后执行，完成后复查页引用与别名。干净页回收立即释放正常 node 元数据：固定版本 `ext4_fclose` 只清理私有 handle，不取后端锁或执行 I/O。只有未完成 orphan 或真实关闭错误交给 mount 清理链，不让健康节点滞留至卸载。
 
 验证入口：`make test-io-sleep-riscv test-files-riscv test-files-partial-write-riscv test-lwext4-recovery-host`。设备握手、同页合并、快照、并发插入缓存页、最后 close/写回及完整恢复的证据见[可睡眠存储](../learning/sleepable-storage.md)。
+
+`kernel_vfs_mknod_at` 在 namespace 锁内定位未存在的末级名字，普通文件或字符设备
+创建与 mode 设置放在同一个 lwext4 写事务内。失败回滚由原 mount/日志 owner 处理；
+该入口不实现 devfs，不增加新的设备后端。只读根返回 EROFS，创建不占用进程 fd。

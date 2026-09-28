@@ -18,7 +18,7 @@
 | 内存 | [物理页](modules/physical-pages.md)、[堆](modules/kernel-heap.md)、[Sv39](modules/riscv-sv39.md)、[MM](modules/kernel-mm.md)、[VMA](modules/kernel-vma.md)、[uaccess](modules/kernel-uaccess.md) |
 | 用户映像 | [ELF](modules/user-elf.md)、[exec](modules/kernel-exec.md) |
 | 任务 / 时间 | [调度与生命周期](modules/kernel-scheduler.md)、[信号](modules/kernel-signal.md)、[时钟与睡眠](modules/kernel-time.md)、[硬件 timer](modules/riscv-timer.md) |
-| 文件 / 存储 | [fd/OFD 与路径](modules/kernel-files.md)、[VFS/ext4/页缓存](modules/vfs-ext4.md)、[VirtIO block](modules/riscv-virtio-block.md) |
+| 文件 / 存储 | [fd/OFD 与路径](modules/kernel-files.md)、[VFS/ext4/页缓存](modules/vfs-ext4.md)、[VirtIO block](modules/riscv-virtio-block.md)、[网络](modules/kernel-network.md) |
 | 验证设施 | [Linux 差分](modules/differential-abi.md)、[真实程序环境](modules/program-environment.md) |
 
 ## 学习与证据
@@ -30,9 +30,7 @@
 | 架构基础 | [启动](learning/riscv-boot.md)、[Trap](learning/riscv-traps.md)、[用户态](learning/riscv-user-mode.md)、[时间](learning/riscv-time.md) |
 | 内存 / ELF | [内存管理](learning/memory-management.md)、[ELF 装载](learning/elf-loading.md) |
 | 进程 / 并发 | [调度](learning/kernel-scheduling.md)、[生命周期](learning/process-lifecycle.md)、[线程与 futex](learning/threads-and-futex.md) |
-| 文件 / 事件 | [存储](learning/storage-filesystems.md)、[时间戳](learning/file-timestamps.md)、[I/O 多路复用](learning/io-multiplexing.md)、[epoll](learning/epoll-subsystem.md) |
-| 真实程序 | [最近全量基线、阻塞与根因](learning/user-program-inventory.md)、[客体内编译探针](learning/offline-toolchain-probe.md) |
+| 文件 / 事件 | [存储](learning/storage-filesystems.md)、[时间戳](learning/file-timestamps.md)、[I/O 多路复用](learning/io-multiplexing.md)、[epoll](learning/epoll-subsystem.md)、[记录锁与恢复](learning/record-lock-sqlite-recovery.md)、[可睡眠存储](learning/sleepable-storage.md)、[网络 owner](learning/network-ownership.md) |
+| 真实程序 | [最近全量基线、阻塞与根因](learning/user-program-inventory.md)、[客体内编译探针](learning/offline-toolchain-probe.md)、[单核规模](learning/single-hart-scale.md) |
 
 每个可独立验证的阶段收口时检查 README、模块、learning 三类文档：有新事实才更新，旧结论直接替换，细节用链接引用。运行产物仅在核对期间暂存于忽略的 `build/`，随后用 `make prune-build` 清理一次性目录与日志；临时 plan/spec 与会话材料不入库。
-
-- [单 hart 可睡眠存储](learning/sleepable-storage.md)：跨层 owner、IRQ 队列、确定性并发握手及恢复验收。

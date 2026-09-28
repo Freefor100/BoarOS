@@ -26,6 +26,7 @@
 #define LINUX_SYSCALL_DUP3 24U
 #define LINUX_SYSCALL_FCNTL 25U
 #define LINUX_SYSCALL_IOCTL 29U
+#define LINUX_SYSCALL_MKNODAT 33U
 #define LINUX_SYSCALL_MKDIRAT 34U
 #define LINUX_SYSCALL_UNLINKAT 35U
 #define LINUX_SYSCALL_SYMLINKAT 36U
@@ -265,6 +266,9 @@ enum kernel_syscall_status kernel_syscall_dispatch(
                request->number == LINUX_SYSCALL_RENAMEAT2) {
         if (syscall_handle_renameat(caller, request, &decoded,
                 request->number == LINUX_SYSCALL_RENAMEAT2) != KERNEL_SYSCALL_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    } else if (request->number == LINUX_SYSCALL_MKNODAT) {
+        if (syscall_handle_mknodat(caller, request, &decoded) != KERNEL_SYSCALL_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     } else if (request->number == LINUX_SYSCALL_MKDIRAT) {
         if (syscall_handle_mkdirat(caller, request, &decoded) !=

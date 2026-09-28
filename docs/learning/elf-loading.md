@@ -92,3 +92,5 @@ Auxv 的值必须来自真实机制，而不是为了让 libc 继续运行而伪
 只有新映像准备成功后才进入提交阶段。
 
 本阶段 `make test-exec-riscv test-userland-riscv test-glibc-riscv test-diff-abi-riscv test-stack-usage` 通过；差分 565 条，含 9 条脚本记录。交接基线为 child-TID 的 `ed6acfb`；评测分支合入后应使用原 BusyBox 消费脚本能力，不改上游脚本内容。
+
+补充深度边界时发现：第六个脚本层的格式错误/缺失解释器应先返回 ENOEXEC/ENOENT，而不是提前 ELOOP。固定 Linux 同 ELF 先复现两处差异；检查移到下次格式分派前后，五层成功、六层超限及两类边界错误一致，完整差分 581 条。

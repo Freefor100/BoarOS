@@ -33,3 +33,9 @@ make test-sqlite-recovery-matrix-riscv
 2026-09-27 的最终矩阵输入 SHA-256：`kernel-rv` 为 `64c0a0f474af11da8824530d080e25d44493ba2f7542bfa40d68bbcf9f398084`，静态 SQLite 恢复 ELF 为 `bada7676800a46d9f15e1e2801ab1fa8a542a82b1f0b7f95a5530ac434957553`，宿主 NBD 服务为 `b838e11a094c0c34114dbca310a8a75c158a442b3130dfc440c7da6a43092e6f`；运行用 QEMU 为 11.1.1。小事务共 147 个 NBD 事件（100 次写、47 次 flush）；`make test-sqlite-recovery-matrix-riscv` 完成 441 个断电位置/策略组合、100 个写失败和 47 个 flush 失败，共 588 个故障场景，均通过两次恢复、整事务数据与 ext4 检查。`make test-sqlite-recovery-riscv` 另以同一 ELF 在固定 Linux 运行 setup/mutate/recover，其 Image SHA-256 为 `16a93ddb1d451898b93fff14de0cc076bcf1b10dad54c19a3e179a6cd81103b1`；EXTRA/FULL 正常运行、热日志、已确认提交和 FULL 错误传播均通过。
 
 该证据只覆盖 QEMU 单 hart、所述 SQLite 事务形状及模拟故障模型。普通多进程 WAL、SMP 和实板持久性均未由此证明。
+
+## 历史 WAL 矩阵身份（2026-09-27）
+
+WAL 断电与共享页故障阶段证据：`make test-sqlite-wal-recovery-riscv` 在固定 Linux/BoarOS 同一 ELF 上完成 EXTRA/FULL、hot、已确认提交和写/flush 错误传播；`make test-sqlite-wal-recovery-matrix-riscv` 对 42 个事务 NBD 事件覆盖 126 个断电组合、26 个写失败和 16 个 flush 失败位置，每次两次恢复及 ext4 检查均通过。输入身份由 runner 输出：内核 SHA-256 `b1191d2737dda760a0f4ec1bc0c5ddaa1c36fe668be3584a0a3cbb02598d8f49`、恢复 ELF `179be6d2e5ab52c908d4e0547225e7999d9e404ffd05c12f404e9f170fdca5e0`、NBD 服务 `b838e11a094c0c34114dbca310a8a75c158a442b3130dfc440c7da6a43092e6f`、QEMU 11.1.1、SQLite archive SHA-256 `1e71ddf93849c6a6ecf58b827c0692073d2dd7ee40196158068f7b29f422e87d`；本地固定 QEMU v11.1.0 commit `84f07211cc5b4fc6a371559bf8a5de4fb068e648`。`make test-files-partial-write-riscv` 增加写回失败后再次标脏、写回进行中经第二个 VA 别名写入并再次同步落盘、共享 fork 元数据 OOM 扫描及固定替换失败仍保留别名/owner 的检查。`make test-diff-abi-riscv` 为 396 条一致；普通 WAL、files、userland、RISC-V 全套、栈、NBD host、lwext4 recovery、DELETE 正常与抽样矩阵和固定资料检查通过。228 项清单再次为 223/2/3，五个旧失败 ID 不变，suite identity SHA-256 `08bf67905816d479d251c9a55bf985b46dd5ef37c4f588207201d7c0e741ab82`；重建命令和完整来源见[程序清单](user-program-inventory.md)。跨 hart 真实并发与实板持久性仍未验收。
+
+以上是该阶段历史输入，当前可睡眠存储收口结果见[可睡眠存储](sleepable-storage.md)；旧 build 路径不是永久证据。

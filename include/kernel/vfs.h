@@ -107,6 +107,9 @@ int kernel_vfs_create_at(struct kernel_vfs_path *start,
 int kernel_vfs_open_executable_at(struct kernel_vfs_path *start,
                                   struct kernel_vfs_path *root,
                                   const char *path, struct kernel_vfs_file *file);
+int kernel_vfs_mknod_at(struct kernel_vfs_path *start,
+                        struct kernel_vfs_path *root, const char *path,
+                        uint32_t mode, uint32_t device);
 int kernel_vfs_mkdir_at(struct kernel_vfs_path *start,
                         struct kernel_vfs_path *root, const char *path,
                         uint32_t mode);

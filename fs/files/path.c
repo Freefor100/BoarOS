@@ -783,6 +783,65 @@ enum kernel_files_status kernel_files_mkdirat(
     return KERNEL_FILES_STATUS_OK;
 }
 
+enum kernel_files_status kernel_files_mknodat(
+    struct kernel_files *files,
+    const struct kernel_fs_context *fs,
+    struct kernel_mm *mm,
+    int64_t dirfd,
+    uint64_t user_path,
+    uint32_t mode,
+    uint32_t device,
+    int64_t *linux_result)
+{
+    struct kernel_vfs_mount *mount;
+    KERNEL_FILES_PATH_SCOPE(start);
+    char *path;
+    int result;
+    enum kernel_heap_status heap_status;
+    enum kernel_fs_context_status fs_status;
+
+    if (!kernel_files_is_live(files) || !kernel_fs_context_is_live(fs) ||
+        mm == 0 || linux_result == 0) {
+        return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
+    }
+    heap_status = kernel_heap_allocate(files->heap,
+                                       KERNEL_FS_PATH_MAX,
+                                       (void **)&path);
+    if (heap_status == KERNEL_HEAP_STATUS_EMPTY) {
+        *linux_result = -KERNEL_ENOMEM;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    if (heap_status != KERNEL_HEAP_STATUS_OK) {
+        return KERNEL_FILES_STATUS_STATE;
+    }
+    fs_status = copy_path_start(files, fs,
+                                                    mm,
+                                                    dirfd,
+                                                    user_path,
+                                                    path,
+                                                    KERNEL_FS_PATH_MAX,
+                                                    &start, &mount,
+                                                    &result);
+    if (fs_status != KERNEL_FS_CONTEXT_STATUS_OK) {
+        (void)finish_path(files, path);
+        return KERNEL_FILES_STATUS_STATE;
+    }
+    if (result != 0) {
+        if (finish_path(files, path) != KERNEL_FILES_STATUS_OK) {
+            return KERNEL_FILES_STATUS_STATE;
+        }
+        *linux_result = result;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    result = kernel_vfs_mknod_at(start, kernel_fs_context_root(fs), path,
+                                 mode & ~kernel_fs_context_umask(fs), device);
+    if (finish_path(files, path) != KERNEL_FILES_STATUS_OK) {
+        return KERNEL_FILES_STATUS_STATE;
+    }
+    *linux_result = result;
+    return KERNEL_FILES_STATUS_OK;
+}
+
 enum kernel_files_status kernel_files_unlinkat(
     struct kernel_files *files,
     const struct kernel_fs_context *fs,

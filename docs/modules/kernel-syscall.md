@@ -74,3 +74,5 @@ enum kernel_syscall_status kernel_syscall_dispatch(
 `kernel/syscall/process.c:syscall_handle_prlimit64`；查询没有新增对象或引用 owner，
 也没有改变凭据。`test-syscall-riscv` 保护四项返回与忽略参数，
 `test-diff-abi-riscv` 保护真实 U-mode 查询及 fork/exec 继承。
+
+`mknodat(33)` 已接入普通文件和字符节点创建；支持边界与错误见[文件模块](kernel-files.md#节点创建)，不代表块设备、FIFO 或 socket 文件后端已完成。

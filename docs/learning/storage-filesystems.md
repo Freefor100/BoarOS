@@ -165,3 +165,17 @@ PID 1 是用户空间生命周期的根。Linux 通常在 init 退出时 panic�
 PATH_MAX 限制一次输入和符号链接展开，不限制 dirfd 的祖先总长。保留路径形式的 lwext4 修改入口时，需要动态分配完整祖先名缓冲；固定 4096 字节桥接会错误拒绝深目录中的短相对操作。255 字节名称的分隔符位于索引 255，后端扫描必须检查该位置；否则 inode rename 能生成路径接口无法再修改的目录。VFS 深链测试保护这两个边界。
 
 rename 的特殊末分量也有检查顺序：先解析两侧父目录，再处理旧 `.`/`..`/root 的 EBUSY；新特殊分量在 NOREPLACE 下为 EEXIST。先按字符串直接返回 EBUSY 会遮蔽父路径的 ENOENT/ENOTDIR。固定 RV64 Linux 未开启旧 renameat(38)，musl 使用 renameat2(276) 的 flags=0；同 ELF 差分必须采用该原生 ABI，不把测试入口的 ENOSYS 当成改名语义差异。
+
+## 用户态建立字符节点（2026-09-28）
+
+固定 Linux `references/linux/fs/namei.c` 的 `filename_mknodat`/`may_mknod`
+（commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`）规定类型、umask 与已存在路径语义。
+BoarOS 原先可读宿主预制的 null/zero/console inode，但没有 mknodat 入口。
+新增 `tests/diff-abi/mknod.c` 先观察 ENOSYS，再验证用户创建节点与真实设备读写；
+完整差分 577/577。基线 `0290bc0`；评测分支接收后由原 BusyBox mknod 创建节点，
+不在内核植入比赛目录，也不假造随机设备或 proc 内容。
+
+创建与权限设置同一事务，避免 mode 设置失败留下半构造节点。字符号按设备元数据
+派发；此阶段只增加创建入口，通用设备后端、块节点和命名管道仍有独立依赖。
+
+`make test-vfs-riscv test-files-riscv test-lwext4-recovery-host test-sqlite-rollback-riscv test-sqlite-wal-riscv test-sqlite-recovery-riscv` 已通过，覆盖 ext4 既有断电/恢复、SQLite DELETE/WAL 多进程及 EXTRA/FULL 错误恢复。
