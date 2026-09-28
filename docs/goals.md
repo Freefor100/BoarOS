@@ -186,7 +186,8 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 
 - [x] main 已补普通文件/字符节点 mknodat，复用 null/zero/console；独立设备后端、FIFO、块节点仍待设计。见[节点创建](modules/kernel-files.md#节点创建)。
 
-- [ ] 先设计通用后端和 mount/path 生命周期，再接最小设备后端与 procfs，之后以 tmpfs/真实第二挂载验证 mount/路径身份；临时内存文件具有真实页/目录生命周期、空间耗尽和卸载回收。
+- [x] 通用后端、mount/path 生命周期、null/zero/console 设备后端与首批真实 procfs 已分阶段交付；内部覆盖挂载遮蔽、根和 `..`、忙卸载及引用回收，真实第二盘留后续验收。
+- [ ] tmpfs 与真实第二挂载继续验证 mount/路径身份；临时内存文件须有真实页/目录生命周期、空间耗尽、截断和卸载回收。
 - [x] 最小 procfs 的 uptime、meminfo、self/exe、self/fd、进程状态及挂载信息直接读取内核对象；PID 代次、线程退出、组长存活边界和非组长 exec 经固定 Linux 差分。持续高压 fd 复用与完整 Linux 字段不在本批验收范围。
 - [ ] 为 `/proc/meminfo` 的 `Cached` 与 `MemAvailable` 定义可验证的文件页/可回收页统计来源、单位、并发快照及耗尽语义；用固定 Linux 和原 LTP 消费者复验。首批只有 `MemTotal`/`MemFree`，不能以固定零值冒充缓存状态。
 - [ ] 多挂载覆盖路径跨越、根和 `..`、挂载点被引用、卸载忙、跨挂载文件操作和失败回滚；设备/内存/磁盘文件各自错误保持所属 owner。
