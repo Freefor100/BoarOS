@@ -22,6 +22,8 @@ python3 tests/program-inventory/run.py --reuse-builds --require-pass --output bu
 
 ## 当前基线与阻塞
 
+2026-09-28 通用 VFS/procfs 阶段使用 `python3 -B tests/program-inventory/run.py --reuse-builds --output build/proc-inventory-20260928` 完整重跑 228 项：227 pass，唯一 `busybox.official` 为固定上游包装脚本失败，没有旧通过项回退。BoarOS 内核 SHA-256 `1a0dc5b9dc338e01d9fc7b10c689edaaa761f75952bc8fce90f2f4a4c1478167`，suite identity `e9798eac4bfef2bd6c510c3b7952ab1caa957418b3fb04d9ca2476f73b58da8c`；细目由 runner 的 `inventory.json`/`runs/suite.json` 重建，核对后不保留临时运行目录。原 BusyBox 55 子项脚本和 OSComp 原 judge 不是这 228 个顶层案例的同一个计分口径。
+
 2026-09-28 单 hart 可睡眠 I/O 后，最终内核再次完成 228 项，227 pass、1 `busybox.official` upstream-failure，无既有通过项回退。内核 SHA-256 `5565ddce40a9ade4fac4f7a2191aa5b136b3cc456e92873ab6ef4be3abe9d8cb`，suite identity `257434c6cf372651fdb520d5599198a484ffa8fe005d04e9bf8289cc454aeedd`；命令和其余输入见[可睡眠存储](sleepable-storage.md)。
 
 2026-09-27 单 hart 规模改动后再次完成全量 228 项，227 pass、1 `busybox.official` upstream-failure；既有通过项无回退。最终内核、suite identity、恢复验证和重建命令见[单核规模回归](single-hart-scale.md)。以下保留各阶段输入和阻塞的历史演进。

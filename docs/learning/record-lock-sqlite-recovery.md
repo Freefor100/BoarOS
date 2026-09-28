@@ -43,3 +43,5 @@ WAL 断电与共享页故障阶段证据：`make test-sqlite-wal-recovery-riscv`
 ## 通用 VFS 与 procfs 阶段复验（2026-09-28）
 
 主线 `5f8faec` 的内核 SHA-256 为 `1a0dc5b9dc338e01d9fc7b10c689edaaa761f75952bc8fce90f2f4a4c1478167`；静态 SQLite 恢复程序为 `179be6d2e5ab52c908d4e0547225e7999d9e404ffd05c12f404e9f170fdca5e0`，宿主 NBD 服务为 `356cbb5d10fbe590087eda1f4bc9421f3d56c39bb4f82afd289a97fa4c18bfb1`，QEMU 11.1.1。`make test-sqlite-recovery-matrix-riscv` 通过 147 个事务事件下的 441 个断电组合、100 个写失败和 47 个 flush 失败；`make test-sqlite-wal-recovery-matrix-riscv` 通过 42 个事件下的 126 个断电组合、26 个写失败和 16 个 flush 失败。每个故障镜像均按 runner 进行两次恢复、整事务数据及 ext4 检查；普通 DELETE/WAL 和多进程 WAL 冒烟也在相同内核上通过。输入来自本地固定 SQLite 3.53.4 和 QEMU 源码清单；仍只证明上述单 hart/QEMU 故障模型。
+
+同轮 `make test-lwext4-recovery-host` 再次通过低层事务和全部 16 种 orphan 组合及断电恢复；`make test-references` 通过。宿主模型独立于这次启动/proc 改动，不替代真实客体的逐事件矩阵。
