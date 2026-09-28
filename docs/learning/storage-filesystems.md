@@ -122,6 +122,14 @@ BoarOS 初始化三个无路径 console OFD，返回 `ENOENT`。根启动在文�
 同一个 proc fd 路径引用机制自然显示，不新增路径特判。660 条差分一致；
 缺少节点的根启动 fixture 继续验证 UART 兜底。
 
+对象生命周期随后由同一 RV ELF 再验证：先打开旧 PID 目录，回收子进程后
+创建下一子进程，旧目录不能跟到新的分配代次；unlink 当前主 ELF 后，
+`/proc/self/exe` 展示 `(deleted)`，但跟随链接仍能读取原 ELF magic。
+生成式 meminfo 的跨页用户 fault 只提交已复制的 8 字节，下一次读取从
+该 offset 续读；起点就 fault 时返回 `EFAULT` 且 offset 不动。固定 Linux
+与 BoarOS 共 668 条差分一致。线程组退出、非组长 exec 与读取时并发变化
+仍没有由这组测试覆盖，不能把这些结果外推为完整 procfs 生命周期验收。
+
 原始固定 BusyBox 包装脚本以 SHA-256
 `f2cda5fcdff6d41c8a553ac658e8aa55b6a48aa40898cb123a19f7865f3773ac`
 复跑，入口为 `python3 tests/program-inventory/run.py --suite busybox

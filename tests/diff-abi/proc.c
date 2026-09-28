@@ -412,6 +412,20 @@ void abi_proc_cases(void)
     abi_record("proc.reaped-old-stat", old_stat < 0 ? old_stat : 0,
                -1, -1, 0, 0, 0);
     if (old_stat >= 0) abi_require(SC1(57, old_stat) == 0);
+    long replacement = CALL(220, 17, 0, 0, 0, 0, 0);
+    abi_require(replacement >= 0);
+    if (!replacement) abi_exit(0);
+    old_stat = SC4(56, child_dir, "stat", 0, 0);
+    abi_record("proc.reused-old-stat", old_stat < 0 ? old_stat : 0,
+               -1, -1, 0, 0, 0);
+    if (old_stat >= 0) abi_require(SC1(57, old_stat) == 0);
+    proc_child_path(child_path, replacement);
+    long replacement_dir = abi_open(child_path, 0);
+    abi_record("proc.replacement-dir",
+               replacement_dir < 0 ? replacement_dir : 0,
+               -1, -1, 0, 0, 0);
+    if (replacement_dir >= 0) abi_require(SC1(57, replacement_dir) == 0);
+    abi_require(SC4(260, replacement, &child_status, 0, 0) == replacement);
     abi_require(SC1(57, child_dir) == 0);
     if (fd >= 0) {
         char header[9] = {0};
@@ -437,6 +451,25 @@ void abi_proc_cases(void)
         abi_require(SC3(62, fd, 1048576, 0) == 1048576);
         abi_record("proc.meminfo-eof", SC3(63, fd, header, sizeof(header)),
                    -1, -1, 0, 0, 0);
+        abi_require(SC3(62, fd, 0, 0) == 0);
+        long fault_map = CALL(222, 0, 8192, 3, 0x22, -1, 0);
+        abi_require(fault_map >= 0);
+        abi_require(SC3(226, fault_map + 4096, 4096, 0) == 0);
+        unsigned char *prefix = (void *)(fault_map + 4096 - 8);
+        long partial = SC3(63, fd, prefix, 16);
+        abi_record("proc.meminfo-fault-prefix", partial, -1,
+                   abi_offset(fd), 0, prefix, partial > 0 && partial <= 8
+                       ? (usize)partial : 0);
+        char continuation[8] = {0};
+        long continued = SC3(63, fd, continuation, sizeof(continuation));
+        abi_record("proc.meminfo-fault-next", continued, -1,
+                   abi_offset(fd), 0, continuation,
+                   continued > 0 ? 1U : 0U);
+        abi_require(SC2(215, fault_map, 8192) == 0);
+        abi_require(SC3(62, fd, 0, 0) == 0);
+        abi_record("proc.meminfo-fault-first",
+                   SC3(63, fd, (void *)-1, 4), -1,
+                   abi_offset(fd), 0, 0, 0);
         abi_record("proc.busy-unmount", SC2(39, "/proc-probe", 0),
                    -1, -1, 0, 0, 0);
         abi_require(SC1(57, fd) == 0);
@@ -457,6 +490,22 @@ void abi_proc_cases(void)
     abi_record("proc.cwd-busy-unmount", SC2(39, "/proc-probe", 0),
                -1, -1, 0, 0, 0);
     abi_require(SC1(49, "/") == 0);
+    abi_require(SC3(35, -100, "/init", 0) == 0);
+    char deleted_exe[40] = {0};
+    long deleted_length = SC4(78, -100, "/proc-probe/self/exe",
+                              deleted_exe, sizeof(deleted_exe));
+    abi_record("proc.exe-deleted-link", deleted_length, -1, -1, 0,
+               deleted_exe, deleted_length > 0 ? (usize)deleted_length : 0);
+    long deleted_fd = abi_open("/proc-probe/self/exe", 0);
+    abi_record("proc.exe-deleted-open", deleted_fd < 0 ? deleted_fd : 0,
+               -1, -1, 0, 0, 0);
+    if (deleted_fd >= 0) {
+        unsigned char magic[4] = {0};
+        abi_record("proc.exe-deleted-magic",
+                   SC3(63, deleted_fd, magic, sizeof(magic)),
+                   -1, -1, 0, magic, sizeof(magic));
+        abi_require(SC1(57, deleted_fd) == 0);
+    }
     abi_record("proc.readonly-unmount", SC2(39, "/proc-probe", 0),
                -1, -1, 0, 0, 0);
     abi_require(SC3(35, -100, "/proc-probe", 512) == 0);

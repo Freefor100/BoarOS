@@ -14,10 +14,10 @@ Linux 为 `references/linux` 的 `f4cdf7ca9a1fdcca413157df19753f388a5a224e`。
 
 | 阶段 | 状态 | 可独立验收的交付 |
 |---|---|---|
-| 通用 VFS 与 ext4 后端 | ext4 拆分已验证，生成文件待接入 | 实例/inode 身份、目录项和引用；普通缓存文件与生成文件分离；保留日志/错误 owner |
+| 通用 VFS 与 ext4 后端 | 已验证，生成式文件已接入 | 实例/inode 身份、目录项和引用；普通缓存文件与生成文件分离；保留日志/错误 owner |
 | 挂载树与路径 | 内部路径及 proc 的用户态 mount/umount2 已验证；完整 proc 待交付 | 保持同点覆盖、根和 ..、cwd/dirfd、忙卸载/回滚；补齐 proc 进程对象后复跑真实消费者 |
 | 字符设备后端 | 已验证 | 按设备号登记 null/zero/console 操作，OFD 持有后端；/dev 仍为 ext4 目录，不冒充 devfs |
-| procfs 与对象链接 | meminfo、uptime、self、exe/cwd/root/fd、mounts 与 stat/status 首批字段已通过差分；有 /dev/console 时初始 fd 链接亦通过；仍在进行 | 验证生命周期并发边界及真实消费者；缺少 /dev/console 时的启动兜底无路径链接 |
+| procfs 与对象链接 | meminfo、uptime、self、exe/cwd/root/fd、mounts 与 stat/status 首批字段已通过差分；有 /dev/console 时初始 fd 链接亦通过；仍在进行 | 已覆盖删除执行文件、旧进程目录、fd 复用及生成文件跨页 fault；待验证线程组退出和并发变化边界及真实消费者。缺少 /dev/console 时的启动兜底无路径链接 |
 | 集成与评测交接 | 待验收 | 先独立消费者诊断，再一次固定预算 RV 原 judge 评分；不拼接成绩 |
 
 进程查询区分 PID 分配代次，旧 proc 对象不能访问复用 PID 的新进程。MM 持有执行

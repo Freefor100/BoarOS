@@ -649,6 +649,8 @@ proc.fd-epoll-follow-stat
 proc.fd-epoll-reopen
 proc.zombie-stat
 proc.reaped-old-stat
+proc.reused-old-stat
+proc.replacement-dir
 proc.meminfo-read
 proc.meminfo-rewind
 proc.meminfo-readv
@@ -657,6 +659,9 @@ proc.meminfo-readv-second
 proc.meminfo-pread
 proc.meminfo-seek-end
 proc.meminfo-eof
+proc.meminfo-fault-prefix
+proc.meminfo-fault-next
+proc.meminfo-fault-first
 proc.busy-unmount
 proc.unmount
 proc.readonly-silent-mount
@@ -664,4 +669,7 @@ proc.stack-mount
 proc.stack-unmount
 proc.cwd
 proc.cwd-busy-unmount
+proc.exe-deleted-link
+proc.exe-deleted-open
+proc.exe-deleted-magic
 proc.readonly-unmount
