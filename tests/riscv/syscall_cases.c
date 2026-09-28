@@ -144,6 +144,18 @@ enum kernel_task_status __wrap_kernel_task_fs_context_borrow(
     return KERNEL_TASK_STATUS_OK;
 }
 
+enum kernel_files_status __wrap_kernel_files_mknodat(
+    struct kernel_files *files, const struct kernel_fs_context *fs,
+    struct kernel_mm *mm, int64_t dirfd, uint64_t path, uint32_t mode,
+    uint32_t device, int64_t *result)
+{
+    if (files != (void *)3 || fs != (void *)5 || mm != (void *)2 ||
+        dirfd != 5 || path != 9 || mode != 0020600 || device != 0x103)
+        return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
+    *result = -KERNEL_EEXIST;
+    return KERNEL_FILES_STATUS_OK;
+}
+
 enum kernel_files_status __wrap_kernel_files_write(
     struct kernel_files *files,
     struct kernel_mm *mm,
@@ -871,11 +883,13 @@ static unsigned long run_dup_fcntl_decode_cases(void)
 
     request.number = 33U;
     request.arguments[1] = 9U;
+    request.arguments[2] = 0020600;
+    request.arguments[3] = 0x103;
     /* asm-generic 33 is mknodat, not dup2: it must not mutate fds. */
     dup_newfd = -1;
     if (kernel_syscall_dispatch(caller, &request, &result) !=
             KERNEL_SYSCALL_STATUS_OK ||
-        result_changed(&result, KERNEL_SYSCALL_ACTION_RETURN, -KERNEL_ENOSYS) ||
+        result_changed(&result, KERNEL_SYSCALL_ACTION_RETURN, -KERNEL_EEXIST) ||
         dup_newfd != -1) {
         failures++;
     }
