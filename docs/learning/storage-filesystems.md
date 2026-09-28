@@ -33,6 +33,16 @@ DMA 的地址是设备可见地址，不等于任意内核虚拟地址。QEMU `v
 ENOSYS，尚未转绿，不计入已支持能力。SQLite 逐事件完整恢复矩阵仍待本轮收口。
 此阶段的通过不代表 mount syscall、procfs 或对象链接已完成。
 
+随后在内部挂载路径上，固定 Linux
+`references/linux/fs/namei.c:2195` 的 `follow_dotdot` 与
+`references/linux/fs/namespace.c:1590` 的忙挂载判断（同一固定 commit）
+用于核对 `..` 返回父挂载及活引用阻止卸载。一次挂载同时持有根路径与被遮蔽
+路径；同点再次挂载落在当前可见根路径上，卸载顶层后恢复下一层。路径查找
+只在单个实例上持命名空间锁；解析到另一实例时释放旧锁，修改时重新锁定
+目标实例并核对待创建名称，避免跨实例的锁次序倒置及并发创建误成功。
+`make test-vfs-riscv` 的内存后端测试覆盖 64 位 inode 碰撞、嵌套/覆盖、
+`..`、cwd、忙卸载和挂载失败回滚；这不是 procfs 用户态验收。
+
 ## 为什么当前是同步 I/O
 
 设备 flush 与块缓存排空是两层边界。新增块 flush 依据固定 Linux `references/linux/drivers/block/virtio_blk.c`（`f4cdf7ca9a1fdcca413157df19753f388a5a224e`）与 QEMU `references/qemu/hw/block/virtio-blk.c`（v11.1.0，`84f07211cc5b4fc6a371559bf8a5de4fb068e648`）：不协商 CONFIG_WCE 时，FLUSH feature 决定 writeback，缺失则为 write-through。协商 FLUSH 后必须真实提交该请求；内存 fence、read-after-write、QEMU 正常退出均不能替代介质持久化证据。host 故障模型把易失状态与稳定镜像分开，允许未同步扇区丢失/重排；后续 journal 测试应复用这个模型，而非仅终止普通 QEMU 后检查恰好仍在宿主页缓存中的数据。

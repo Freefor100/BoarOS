@@ -80,7 +80,7 @@ static int ext4_backend_set_times(struct kernel_vfs_file *file,
                               const struct kernel_vfs_timespec times[2]);
 static int ext4_backend_set_mode(struct kernel_vfs_file *file, uint32_t mode);
 static int ext4_backend_open(struct kernel_vfs_mount *mount,
-                        const char *path, uint32_t inode_number,
+                        const char *path, uint64_t inode_number,
                         uint32_t inode_mode,
                         struct kernel_vfs_file *file);
 static int ext4_backend_create(struct kernel_vfs_mount *mount,
@@ -748,7 +748,7 @@ static int ext4_backend_set_mode(struct kernel_vfs_file *file, uint32_t mode)
 }
 
 static int ext4_backend_open(struct kernel_vfs_mount *mount,
-                        const char *path, uint32_t inode_number,
+                        const char *path, uint64_t inode_number,
                         uint32_t inode_mode,
                         struct kernel_vfs_file *file)
 {
@@ -765,6 +765,7 @@ static int ext4_backend_open(struct kernel_vfs_mount *mount,
         file->private_data != 0) {
         return -KERNEL_EINVAL;
     }
+    if (inode_number > UINT32_MAX) return -KERNEL_EINVAL;
     adapter = mount->private_data;
     if (path != 0) {
         result = ext4_mode_get(path, &mode);
@@ -1233,14 +1234,19 @@ static int ext4_backend_writeback(struct kernel_vfs_node *node, uint64_t offset,
 
 static int ext4_backend_error(struct kernel_vfs_instance *instance)
 { return lwext4_error(mount_error(lwext4_instance(instance))); }
-static int ext4_backend_root(struct kernel_vfs_instance *instance, uint32_t *inode, uint32_t *mode)
+static int ext4_backend_root(struct kernel_vfs_instance *instance, uint64_t *inode, uint32_t *mode)
 { (void)instance; *inode = EXT4_INODE_ROOT_INDEX; return lwext4_error(ext4_mode_get("/", mode)); }
-static int ext4_backend_lookup(struct kernel_vfs_instance *instance, uint32_t parent,
-    const char *name, size_t length, uint32_t *inode, uint32_t *mode)
+static int ext4_backend_lookup(struct kernel_vfs_instance *instance, uint64_t parent,
+    const char *name, size_t length, uint64_t *inode, uint32_t *mode)
 {
     int error = ext4_backend_error(instance);
     if (error) return error;
-    return lwext4_error(ext4_lookup_child(LWEXT4_MOUNT_POINT, parent, name, length, inode, mode));
+    if (parent > UINT32_MAX) return -KERNEL_EINVAL;
+    uint32_t result_inode;
+    error = lwext4_error(ext4_lookup_child(LWEXT4_MOUNT_POINT, (uint32_t)parent,
+                                             name, length, &result_inode, mode));
+    if (!error) *inode = result_inode;
+    return error;
 }
 static int ext4_backend_readlink(struct kernel_vfs_node *node, char *buffer, size_t size, size_t *count)
 { return lwext4_error(ext4_readlink_inode(LWEXT4_MOUNT_POINT, node->inode, buffer, size, count)); }
@@ -1286,13 +1292,16 @@ static int ext4_backend_mknod(struct kernel_vfs_instance *instance, const char *
     return lwext4_error(status);
 }
 static int ext4_backend_rename(struct kernel_vfs_instance *instance,
-    uint32_t old_parent, const char *old_name, uint32_t new_parent,
+    uint64_t old_parent, const char *old_name, uint64_t new_parent,
     const char *new_name, unsigned flags, struct kernel_vfs_rename_result *result)
 {
     (void)instance;
+    if (old_parent > UINT32_MAX || new_parent > UINT32_MAX)
+        return -KERNEL_EINVAL;
     struct ext4_rename_result renamed = {0};
-    int status = ext4_rename_child(LWEXT4_MOUNT_POINT, old_parent, old_name,
-        strlen(old_name), new_parent, new_name, strlen(new_name), flags, &renamed);
+    int status = ext4_rename_child(LWEXT4_MOUNT_POINT, (uint32_t)old_parent,
+        old_name, strlen(old_name), (uint32_t)new_parent, new_name,
+        strlen(new_name), flags, &renamed);
     if (!status) {
         result->replaced_inode = renamed.replaced_inode;
         result->replaced_last_link = renamed.replaced_last_link;

@@ -183,8 +183,6 @@ int kernel_fs_context_set_cwd(const struct kernel_fs_context *fs,
 {
     struct kernel_vfs_stat stat;
     if (!kernel_fs_context_is_live(fs) || !path) return -KERNEL_EINVAL;
-    if (kernel_vfs_path_mount(path) != kernel_vfs_path_mount(fs->record->root))
-        return -KERNEL_EXDEV;
     int result = kernel_vfs_path_stat(path, &stat);
     if (result) return result;
     if ((stat.mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFDIR)

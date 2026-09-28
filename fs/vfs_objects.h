@@ -56,6 +56,7 @@ struct kernel_vfs_path {
     struct kernel_vfs_path *parent;
     struct kernel_vfs_path *next;
     struct kernel_vfs_path **previous;
+    struct kernel_vfs_mount *mounted_here;
     uint32_t references;
     uint8_t detached;
     char *name;
@@ -71,9 +72,9 @@ struct kernel_vfs_rename_result {
  * 后端分配的 node 必须位于同一堆对象首部，发布后由通用层回收。 */
 struct kernel_vfs_backend {
     int (*error)(struct kernel_vfs_instance *instance);
-    int (*root)(struct kernel_vfs_instance *instance, uint32_t *inode, uint32_t *mode);
-    int (*lookup)(struct kernel_vfs_instance *instance, uint32_t parent,
-        const char *name, size_t length, uint32_t *inode, uint32_t *mode);
+    int (*root)(struct kernel_vfs_instance *instance, uint64_t *inode, uint32_t *mode);
+    int (*lookup)(struct kernel_vfs_instance *instance, uint64_t parent,
+        const char *name, size_t length, uint64_t *inode, uint32_t *mode);
     int (*readlink)(struct kernel_vfs_node *node, char *buffer, size_t size, size_t *count);
     int (*truncate)(struct kernel_vfs_node *node, uint64_t size, uint64_t *actual, int *changed);
     int (*close_node)(struct kernel_vfs_node *node);
@@ -84,7 +85,7 @@ struct kernel_vfs_backend {
     int (*mknod)(struct kernel_vfs_instance *instance, const char *path,
         uint32_t type, uint32_t mode, uint32_t device);
     int (*rename)(struct kernel_vfs_instance *instance,
-        uint32_t old_parent, const char *old_name, uint32_t new_parent,
+        uint64_t old_parent, const char *old_name, uint64_t new_parent,
         const char *new_name, unsigned flags, struct kernel_vfs_rename_result *result);
     int (*unmount)(struct kernel_vfs_mount *mount);
     int (*statfs)(struct kernel_vfs_mount *mount,
@@ -93,7 +94,7 @@ struct kernel_vfs_backend {
         const struct kernel_vfs_timespec times[2]);
     int (*set_mode)(struct kernel_vfs_file *file, uint32_t mode);
     int (*open)(struct kernel_vfs_mount *mount,
-        const char *path, uint32_t inode_number,
+        const char *path, uint64_t inode_number,
         uint32_t inode_mode,
         struct kernel_vfs_file *file);
     int (*create)(struct kernel_vfs_mount *mount,
@@ -131,4 +132,11 @@ struct kernel_vfs_backend {
 void kernel_vfs_record_writeback_error(struct kernel_vfs_node *node, int error);
 int kernel_vfs_publish_node(struct kernel_vfs_mount *mount, struct kernel_vfs_node *node,
     struct kernel_vfs_file *file, int creating);
+/* The caller prepares a live backend before attachment. A failed attach leaves
+ * both paths owned by their original callers. Detach accepts one caller-owned
+ * named_root reference, but refuses any other root, file or child owner. */
+int kernel_vfs_mount_attach(struct kernel_vfs_mount *mount,
+                            struct kernel_vfs_path *covered);
+int kernel_vfs_mount_detach(struct kernel_vfs_mount *mount,
+                            const struct kernel_vfs_path *named_root);
 #endif

@@ -4,11 +4,13 @@
 #include <arch/riscv/virtio_mmio_block.h>
 #include <kernel/dtb.h>
 #include <kernel/errno.h>
+#include <kernel/fs_context.h>
 #include <kernel/heap.h>
 #include <kernel/page.h>
 #include <kernel/page_cache.h>
 #include <kernel/physical_page.h>
 #include <kernel/vfs.h>
+#include "../../fs/vfs_objects.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -81,6 +83,189 @@ static void fail_vfs(unsigned long case_id,
 }
 
 #ifndef VFS_EXPECT_RECOVERY
+static int synthetic_node_close(struct kernel_vfs_node *node)
+{
+    (void)node;
+    return 0;
+}
+
+static void run_backend_inode_identity_regression(struct kernel_heap *heap)
+{
+    static struct kernel_vfs_backend callbacks;
+    struct kernel_vfs_instance instance = {.heap = heap, .ops = &callbacks};
+    struct kernel_vfs_mount mount = {
+        .private_data = &instance, .state = VFS_MOUNT_STATE_LIVE
+    };
+    struct kernel_vfs_node *low = 0, *high = 0;
+    struct kernel_vfs_file first = {0}, second = {0};
+    volatile struct kernel_vfs_backend *active = &callbacks;
+    active->close_node = synthetic_node_close;
+    if (kernel_heap_allocate_zeroed(heap, 1U, sizeof(*low), (void **)&low) !=
+            KERNEL_HEAP_STATUS_OK ||
+        kernel_heap_allocate_zeroed(heap, 1U, sizeof(*high), (void **)&high) !=
+            KERNEL_HEAP_STATUS_OK)
+        fail_vfs(121U, 0, -KERNEL_ENOMEM);
+    low->inode = 1U;
+    high->inode = UINT64_C(0x100000001);
+    low->mode = high->mode = KERNEL_VFS_S_IFREG;
+    if (kernel_vfs_publish_node(&mount, low, &first, 0) != 0 ||
+        kernel_vfs_publish_node(&mount, high, &second, 0) != 0 ||
+        kernel_vfs_file_inode(&first) != 1U ||
+        kernel_vfs_file_inode(&second) != high->inode ||
+        kernel_vfs_file_node(&first) == kernel_vfs_file_node(&second))
+        fail_vfs(122U, high->inode, kernel_vfs_file_inode(&second));
+    if (kernel_vfs_close(&second) != 0 || kernel_vfs_close(&first) != 0 ||
+        instance.nodes != 0 || instance.external_files != 0)
+        fail_vfs(123U, 0, instance.external_files);
+}
+
+static int synthetic_root(struct kernel_vfs_instance *instance,
+                          uint64_t *inode, uint32_t *mode)
+{
+    (void)instance;
+    *inode = 2U;
+    *mode = KERNEL_VFS_S_IFDIR | 0555U;
+    return 0;
+}
+
+static int synthetic_lookup(struct kernel_vfs_instance *instance,
+                            uint64_t parent, const char *name, size_t length,
+                            uint64_t *inode, uint32_t *mode)
+{
+    (void)instance;
+    (void)parent;
+    (void)name;
+    (void)length;
+    (void)inode;
+    (void)mode;
+    return -KERNEL_ENOENT;
+}
+
+static int synthetic_open(struct kernel_vfs_mount *mount, const char *path,
+                          uint64_t inode, uint32_t mode,
+                          struct kernel_vfs_file *file)
+{
+    struct kernel_vfs_instance *instance = mount->private_data;
+    struct kernel_vfs_node *node = 0;
+    (void)path;
+    if (kernel_heap_allocate_zeroed(instance->heap, 1U, sizeof(*node),
+                                    (void **)&node) != KERNEL_HEAP_STATUS_OK)
+        return -KERNEL_ENOMEM;
+    node->inode = inode;
+    node->mode = mode;
+    return kernel_vfs_publish_node(mount, node, file, 0);
+}
+
+static int synthetic_unmount(struct kernel_vfs_mount *mount)
+{
+    struct kernel_vfs_instance *instance = mount->private_data;
+    if (instance->external_files || instance->nodes) return -KERNEL_EBUSY;
+    mount->private_data = 0;
+    mount->id = 0;
+    mount->state = VFS_MOUNT_STATE_EMPTY;
+    return 0;
+}
+
+static int synthetic_stat(const struct kernel_vfs_file *file,
+                          struct kernel_vfs_stat *stat)
+{
+    *stat = (struct kernel_vfs_stat){
+        .dev = file->mount->id,
+        .ino = kernel_vfs_file_inode(file),
+        .mode = file->mode,
+        .nlink = 1U,
+    };
+    return 0;
+}
+
+static void synthetic_mount_init(struct kernel_vfs_mount *mount,
+                                 struct kernel_vfs_instance *instance,
+                                 struct kernel_heap *heap, uint64_t id)
+{
+    static struct kernel_vfs_backend callbacks;
+    volatile struct kernel_vfs_backend *active = &callbacks;
+    active->root = synthetic_root;
+    active->lookup = synthetic_lookup;
+    active->open = synthetic_open;
+    active->close_node = synthetic_node_close;
+    active->unmount = synthetic_unmount;
+    active->stat = synthetic_stat;
+    instance->heap = heap;
+    instance->ops = &callbacks;
+    instance->read_only = 1U;
+    kernel_mutex_init(&instance->namespace_lock, 20U, (uintptr_t)instance);
+    mount->private_data = instance;
+    mount->id = id;
+    mount->state = VFS_MOUNT_STATE_LIVE;
+}
+
+static void run_mount_tree_regression(struct kernel_vfs_mount *root_mount,
+                                      struct kernel_heap *heap)
+{
+    struct kernel_vfs_instance first_instance = {0}, second_instance = {0};
+    struct kernel_vfs_mount first = {0}, second = {0};
+    struct kernel_vfs_path *root = 0, *covered = 0, *first_root = 0;
+    struct kernel_vfs_path *second_root = 0, *held_root = 0, *parent = 0;
+    struct kernel_fs_context context = {0};
+    char name[64];
+
+    synthetic_mount_init(&first, &first_instance, heap, 101U);
+    synthetic_mount_init(&second, &second_instance, heap, 102U);
+    if (kernel_vfs_mkdir(root_mount, "/mount-anchor", 0755U) ||
+        kernel_vfs_path_root(root_mount, heap, &root) ||
+        kernel_vfs_path_lookup(root, "mount-anchor", 12U, &covered) ||
+        kernel_vfs_mount_attach(&first, covered) ||
+        kernel_vfs_path_resolve(root, root, "/mount-anchor", 1, &first_root) ||
+        kernel_vfs_path_mount(first_root) != &first ||
+        kernel_vfs_path_string(first_root, root, name, sizeof(name)) ||
+        strcmp(name, "/mount-anchor") ||
+        kernel_vfs_path_lookup(first_root, "..", 2U, &parent) ||
+        parent != root)
+        fail_vfs(124U, 0, -1);
+    if (kernel_vfs_path_release(&parent) ||
+        kernel_fs_context_create(&context, root_mount, heap) !=
+            KERNEL_FS_CONTEXT_STATUS_OK ||
+        kernel_fs_context_set_cwd(&context, first_root) ||
+        kernel_vfs_path_resolve(kernel_fs_context_cwd(&context),
+                                kernel_fs_context_root(&context),
+                                "..", 1, &parent) ||
+        parent != root ||
+        kernel_vfs_path_release(&parent) ||
+        kernel_fs_context_release(&context) != KERNEL_FS_CONTEXT_STATUS_OK)
+        fail_vfs(127U, 0, -1);
+    if (kernel_vfs_symlink_at(first_root, root, "mount-anchor", "/cross-symlink") ||
+        kernel_vfs_unlink(root_mount, "/cross-symlink"))
+        fail_vfs(128U, 0, -1);
+    if (kernel_vfs_mkdir_at(root, root, "/mount-anchor/new", 0755U) !=
+            -KERNEL_EROFS ||
+        kernel_vfs_rmdir(root_mount, "/mount-anchor") != -KERNEL_EBUSY ||
+        kernel_vfs_rename_at(root, root, root, "/mount-anchor",
+                             "/renamed-anchor", 0U) != -KERNEL_EBUSY ||
+        kernel_vfs_mount_attach(&second, covered) != -KERNEL_EBUSY ||
+        second_instance.external_files != 0U ||
+        kernel_vfs_mount_attach(&second, first_root) ||
+        kernel_vfs_path_resolve(root, root, "/mount-anchor", 1, &second_root) ||
+        kernel_vfs_path_mount(second_root) != &second ||
+        kernel_vfs_path_string(second_root, root, name, sizeof(name)) ||
+        strcmp(name, "/mount-anchor") ||
+        kernel_vfs_unmount(&first) != -KERNEL_EBUSY ||
+        kernel_vfs_unmount(&second) != -KERNEL_EBUSY ||
+        kernel_vfs_mount_detach(&first, first_root) != -KERNEL_EBUSY ||
+        kernel_vfs_path_acquire(second_root))
+        fail_vfs(125U, -KERNEL_EBUSY, -1);
+    held_root = second_root;
+    if (kernel_vfs_mount_detach(&second, second_root) != -KERNEL_EBUSY)
+        fail_vfs(125U, -KERNEL_EBUSY, -1);
+    if (kernel_vfs_path_release(&held_root) ||
+        kernel_vfs_mount_detach(&second, second_root) ||
+        kernel_vfs_path_release(&second_root) || kernel_vfs_unmount(&second) ||
+        kernel_vfs_mount_detach(&first, first_root) ||
+        kernel_vfs_path_release(&first_root) || kernel_vfs_unmount(&first) ||
+        kernel_vfs_path_release(&covered) || kernel_vfs_path_release(&root) ||
+        kernel_vfs_rmdir(root_mount, "/mount-anchor"))
+        fail_vfs(126U, 0, -1);
+}
+
 static uint32_t fail_orphan_free_calls;
 static uint32_t orphan_free_calls;
 static uint32_t fail_fclose_calls;
@@ -609,6 +794,9 @@ static void run_vfs_test(const void *dtb)
         KERNEL_PAGE_CACHE_STATUS_OK) {
         fail_vfs(2U, 0, -1);
     }
+#ifndef VFS_EXPECT_RECOVERY
+    run_backend_inode_identity_regression(&heap);
+#endif
 
     for (index = 0U; index < info.virtio_mmio_count; index++) {
         enum riscv_virtio_mmio_block_status status =
@@ -823,6 +1011,7 @@ static void run_vfs_test(const void *dtb)
     run_rename_path_regression(&mount, &heap);
     run_deep_relative_path_regression(&mount, &heap);
     run_path_cleanup_regression(&mount, &heap);
+    run_mount_tree_regression(&mount, &heap);
     run_writeback_regression(&mount, &page_cache);
     result = kernel_vfs_unmount(&mount);
     if (result != 0 || retried_fclose_calls != failed_fclose_calls) {

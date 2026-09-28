@@ -19,10 +19,16 @@
 #define KERNEL_VFS_S_IXGRP UINT32_C(0000010)
 #define KERNEL_VFS_S_IXOTH UINT32_C(0000001)
 
+struct kernel_vfs_path;
 struct kernel_vfs_mount {
     void *private_data;
     uint64_t id;
     uint32_t state;
+    /* Attached mounts own a root path and the covered path in their parent. */
+    struct kernel_vfs_path *root_path;
+    struct kernel_vfs_path *covered_path;
+    struct kernel_vfs_mount *parent;
+    uint32_t child_mounts;
 };
 
 struct kernel_vfs_timespec {
@@ -237,7 +243,7 @@ int kernel_vfs_stat_path(struct kernel_vfs_mount *mount,
                          struct kernel_vfs_stat *stat);
 
 /* Underlying ext4 inode number; zero when unavailable. */
-uint32_t kernel_vfs_file_inode(const struct kernel_vfs_file *file);
+uint64_t kernel_vfs_file_inode(const struct kernel_vfs_file *file);
 
 /* Returns the current file size in bytes from the live VFS node. */
 uint64_t kernel_vfs_file_size(const struct kernel_vfs_file *file);

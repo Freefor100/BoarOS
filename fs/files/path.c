@@ -190,36 +190,32 @@ enum kernel_files_status kernel_files_openat(
         *linux_result = result;
         return KERNEL_FILES_STATUS_OK;
     }
-    KERNEL_LOCK_SCOPE(namespace_guard);
-    kernel_vfs_namespace_lock(mount, &namespace_guard);
     enum kernel_open_file_path_operation operation =
         ((flags & LINUX_O_NOFOLLOW) ||
          (flags & (LINUX_O_CREAT | LINUX_O_EXCL)) == (LINUX_O_CREAT | LINUX_O_EXCL))
             ? KERNEL_OPEN_PATH_NOFOLLOW : KERNEL_OPEN_PATH_FOLLOW;
-    open_status = kernel_open_file_create_at(files->heap, start,
-                    kernel_fs_context_root(fs), path, operation, 0,
-                    &description, &result);
-    if (result == -KERNEL_ELOOP &&
-        (flags & (LINUX_O_CREAT | LINUX_O_EXCL)) ==
-            (LINUX_O_CREAT | LINUX_O_EXCL)) {
-        result = -KERNEL_EEXIST;
-    }
-    if (open_status == KERNEL_OPEN_FILE_STATUS_OK &&
-        result == -KERNEL_ENOENT &&
-        (flags & LINUX_O_CREAT) != 0U) {
-        if (kernel_vfs_mount_is_readonly(mount)) {
-            files->record->statistics.open_failures++;
-            if (finish_path(files, path) != KERNEL_FILES_STATUS_OK) {
-                return KERNEL_FILES_STATUS_STATE;
-            }
-            *linux_result = -KERNEL_EROFS;
-            return KERNEL_FILES_STATUS_OK;
-        }
+    for (;;) {
+        created = 0;
+        open_status = kernel_open_file_create_at(files->heap, start,
+                        kernel_fs_context_root(fs), path, operation, 0,
+                        &description, &result);
+        if (result == -KERNEL_ELOOP &&
+            (flags & (LINUX_O_CREAT | LINUX_O_EXCL)) ==
+                (LINUX_O_CREAT | LINUX_O_EXCL))
+            result = -KERNEL_EEXIST;
+        if (open_status != KERNEL_OPEN_FILE_STATUS_OK ||
+            result != -KERNEL_ENOENT || !(flags & LINUX_O_CREAT))
+            break;
         created = 1;
         open_status = kernel_open_file_create_at(files->heap, start,
-                    kernel_fs_context_root(fs), path, KERNEL_OPEN_PATH_CREATE,
-                    (uint32_t)(mode & ~kernel_fs_context_umask(fs)),
-                    &description, &result);
+                        kernel_fs_context_root(fs), path, KERNEL_OPEN_PATH_CREATE,
+                        (uint32_t)(mode & ~kernel_fs_context_umask(fs)),
+                        &description, &result);
+        /* Another creator won between lookup and the target mount lock. */
+        if (open_status == KERNEL_OPEN_FILE_STATUS_OK &&
+            result == -KERNEL_EEXIST && !(flags & LINUX_O_EXCL))
+            continue;
+        break;
     }
     if (finish_path(files, path) != KERNEL_FILES_STATUS_OK) {
         if (description != 0) {
@@ -252,7 +248,7 @@ enum kernel_files_status kernel_files_openat(
         *linux_result = -KERNEL_EEXIST;
         return KERNEL_FILES_STATUS_OK;
     }
-    if (kernel_vfs_mount_is_readonly(mount) &&
+    if (kernel_vfs_mount_is_readonly(description->file.mount) &&
         (kernel_open_file_mode(description) & KERNEL_VFS_S_IFMT) ==
             KERNEL_VFS_S_IFREG) {
         uint64_t access_mode = flags & LINUX_O_ACCMODE;
