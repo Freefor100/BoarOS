@@ -6,7 +6,7 @@
 
 生成式普通文件不进入 ext4 页缓存。后端 `snapshot` 返回由 OFD 持有的堆缓冲；第一次非空读取形成快照，短读、readv 和 pread 使用它，seek 到零后释放并在下一次读取重新取值，`SEEK_END` 按固定 Linux 的 seq_file 语义返回 `EINVAL`。用户复制时不持有后端或 inode 锁；只推进已经复制的字节。OFD 末引用释放快照，mount 忙判断覆盖文件及目录引用。`fstat` 中的 size 为零是生成文件的元数据语义，不能由它推断 read EOF。
 
-`MemTotal` 和 `MemFree` 单位为 KiB，来源分别是 `physical_page_total()` 和 `physical_page_available()`；它们描述 BoarOS 管理的物理页，并不冒充尚未统计的缓存、交换或可回收页分类。固定 Linux 的 root 可以用写模式打开 `meminfo`，但写入返回 `EIO`；该行为与内容不可修改一致。未知目录项返回 `ENOENT`。首批 U-mode 对照见 `tests/diff-abi/proc.c`；内部挂载树测试见 `tests/riscv/vfs_main.c`。
+`MemTotal` 和 `MemFree` 单位为 KiB，来源分别是 `physical_page_total()` 和 `physical_page_available()`；它们描述 BoarOS 管理的物理页，并不冒充尚未统计的缓存、交换或可回收页分类。原 LTP 的 `tst_available_mem` 会先读 `MemAvailable`，再回退读 `MemFree` 与 `Cached`；当前缺少 `MemAvailable` 和 `Cached`，多个案例会在回退读取 `Cached` 时中止。新增字段前须定义真实缓存页与可回收页统计来源，不填固定零值。固定 Linux 的 root 可以用写模式打开 `meminfo`，但写入返回 `EIO`；该行为与内容不可修改一致。未知目录项返回 `ENOENT`。首批 U-mode 对照见 `tests/diff-abi/proc.c`；内部挂载树测试见 `tests/riscv/vfs_main.c`。
 
 进程树从 PID 1 的父子关系遍历，包括未回收的 zombie；仍存活的成员只决定线程组目录是否可见，数字 PID 对象的内容与 exe/cwd/root/fd 资源始终查询组长，PID 代次防止旧目录指向新任务。退出者在 clear_child_tid 唤醒前发布 `proc_exiting`，proc 线程计数排除尚未从组链摘除的退出成员；组长退出但成员仍存活时，组长状态为 Z，其资源链接返回 `ENOENT`。这个标志只影响观察，不转移 MM、文件表或任务栈的清理 owner。`stat` 当前输出前 24 个标准字段，足供固定 BusyBox `libbb/procps.c` 的基本解析；不追加尚未统计的 Linux 尾字段。`status` 当前输出 Name、State、Tgid、Pid、PPid、Threads、VmSize、VmRSS、Uid、Gid，未实现的键不伪造。进程名在 exec 提交时取主程序末尾组件，长度上限 15 字节。初始 session ID 为 PID 1，子进程继承；TTY 缺失使 tty_nr=0、tpgid=-1；尚无 nice/策略接口，默认 priority=20、nice=0。Uid/Gid 均为当前单用户 root 身份。
 
