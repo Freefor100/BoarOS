@@ -114,6 +114,7 @@ struct kernel_task {
     uint32_t tid_owned;
     uint32_t publish_completion;
     uint32_t wait_status;
+    uint64_t set_tid_address;
     uint64_t clear_tid_address;
     uint64_t robust_list_head;
     struct kernel_wait_queue *wait_queue;

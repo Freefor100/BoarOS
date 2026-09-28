@@ -93,3 +93,5 @@ Linux commit。较长请求的上游 RISC-V usercopy 进展问题留作独立 re
 路径组合探针 `tests/diff-abi/namespace.c` 覆盖 cwd/dirfd、父目录改名、跨目录移动、NOREPLACE/特殊末分量、活覆盖目标、删除 cwd 与目录同步；该阶段共 297 条，显式元数据加入后为 320 条记录。普通 rename 使用固定 RV64 Linux 原生 `renameat2(276, flags=0)`，旧 38 号兼容入口不作为 Linux 对照。
 
 显式时间用 `metadata.c` 的 `utime.*` 记录：256 字节（32 个 RV64 word），在上述时钟和 inode/父目录观测外保留两项原始请求。规范化器检查 explicit 精确值/范围截断、NOW 与 ctime 同一时刻、OMIT/失败完全不变、父目录不变。`metadata.*` 保留错误顺序、statfs 几何/UUID/标志与实际分配/截断的空闲块差量；容量值不归零。bavail 的 Linux 专有 extent 保留池不同于 BoarOS，分别用真实分配状态验证，不伪造相同储备。加入 robust syscall 后完整差分为 329 条记录。
+
+`child_tid.c` 记录 fork/vfork/thread 的 CHILD_SETTID、CHILD_CLEARTID 与成功/失败 exec；由 `start.S` 提供独立子栈 trampoline，避免 C 函数在换栈后误用父栈。当前 child-TID 阶段完整 manifest 为 556 条。

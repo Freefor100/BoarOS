@@ -361,7 +361,6 @@ enum kernel_scheduler_status process_group_exec_current(void)
         process_group_initialize(task);
     }
     task->group_execing = 0U;
-    task->clear_tid_address = 0U;
     return KERNEL_SCHEDULER_STATUS_OK;
 }
 
@@ -633,8 +632,7 @@ enum kernel_scheduler_status riscv_process_clone_current(
             (void)kernel_copy_to_user(&parent->mm, parent_tid,
                                       &tid, sizeof(tid), &copied);
         if ((flags & LINUX_CLONE_CHILD_SETTID) != 0U)
-            (void)kernel_copy_to_user(&child->mm, child_tid,
-                                      &tid, sizeof(tid), &copied);
+            child->set_tid_address = child_tid;
     }
     if (thread_clone) {
         struct kernel_task *leader = parent->group_leader;
@@ -650,6 +648,7 @@ enum kernel_scheduler_status riscv_process_clone_current(
         child->child_creator_tid = parent->tid;
         child_append(parent->group_leader, child);
     }
+    kernel_mm_add_user(&child->mm);
     child->state = KERNEL_THREAD_STATE_READY;
     ready_append(child);
     *linux_result = tid;
@@ -1471,7 +1470,7 @@ static void kernel_thread_finish(
     if (!current->group_exiting) current->completion = *completion;
     if (current->arch.user_mode == 1U) {
         kernel_futex_release_robust(current, current->tid);
-        kernel_futex_clear_tid(current);
+        kernel_futex_release_mm(current);
         if (riscv_sv39_switch_satp(scheduler.kernel_satp) !=
             RISCV_SV39_STATUS_OK) {
             switch_to_fatal_idle(
@@ -1809,4 +1808,18 @@ enum kernel_task_status kernel_task_fs_context_borrow(
     }
     *fs = &task->fs;
     return KERNEL_TASK_STATUS_OK;
+}
+
+void kernel_task_prepare_user_return(void)
+{
+    struct kernel_task *task = scheduler.current;
+    if (task == 0 || task->arch.user_mode != 1U) return;
+    uint64_t address = task->set_tid_address;
+    task->set_tid_address = 0U;
+    if (address) {
+        size_t copied;
+        /* 在子 MM 激活后处理 COW；坏地址不撤销已发布的 clone。 */
+        (void)kernel_copy_to_user(&task->mm, address, &task->tid,
+                                  sizeof(task->tid), &copied);
+    }
 }

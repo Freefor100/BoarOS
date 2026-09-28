@@ -85,6 +85,7 @@ struct riscv_kernel_mm_record {
     uint64_t magic;
     uint64_t futex_id;
     uint32_t references;
+    uint32_t users;
     enum riscv_kernel_mm_record_stage stage;
     uint64_t start_brk;
     uint64_t current_brk;
@@ -1368,6 +1369,25 @@ enum kernel_mm_status kernel_mm_vma_lookup(
     return status_from_vma(kernel_vma_set_lookup(record->vmas,
                                                  virtual_address,
                                                  vma));
+}
+
+/* 任务使用计数不包含已退出任务留给清理器的 MM 引用。 */
+void kernel_mm_add_user(struct kernel_mm *mm)
+{
+    struct riscv_kernel_mm_record *record;
+    if (resolve_record(mm, &record) != KERNEL_MM_STATUS_OK ||
+        mm->state != KERNEL_MM_LIVE || record->users == UINT32_MAX)
+        __builtin_trap();
+    record->users++;
+}
+
+uint32_t kernel_mm_remove_user(struct kernel_mm *mm)
+{
+    struct riscv_kernel_mm_record *record;
+    if (resolve_record(mm, &record) != KERNEL_MM_STATUS_OK ||
+        mm->state != KERNEL_MM_LIVE || !record->users)
+        __builtin_trap();
+    return --record->users;
 }
 
 enum kernel_mm_status kernel_mm_futex_id(

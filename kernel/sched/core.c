@@ -896,6 +896,7 @@ enum kernel_scheduler_status kernel_user_thread_create(
         }
     }
 
+    kernel_mm_add_user(&thread->mm);
     ready_append(thread);
     if (tid == 1) {
         scheduler.init_task = thread;

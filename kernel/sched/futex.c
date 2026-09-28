@@ -352,14 +352,15 @@ static void futex_wake_user(struct kernel_task *task, uint64_t address)
     futex_key_release(&key);
 }
 
-void kernel_futex_clear_tid(struct kernel_task *task)
+void kernel_futex_release_mm(struct kernel_task *task)
 {
     uint64_t address = task->clear_tid_address;
     uint32_t zero = 0U;
     size_t copied;
 
     task->clear_tid_address = 0U;
-    if (address == 0U || task->mm.state != KERNEL_MM_LIVE) return;
+    uint32_t remaining = kernel_mm_remove_user(&task->mm);
+    if (address == 0U || remaining == 0U) return;
     (void)kernel_copy_to_user(&task->mm, address, &zero, sizeof(zero), &copied);
     futex_wake_user(task, address);
 }

@@ -37,6 +37,8 @@ enum kernel_task_status kernel_task_io_buffer_acquire(
     struct kernel_task_io_buffer *buffer, struct physical_page_allocator *allocator);
 void kernel_task_io_buffer_release(struct kernel_task_io_buffer *buffer);
 
+void kernel_task_prepare_user_return(void);
+
 /* Records the set_tid_address clear pointer and returns the caller tid. */
 enum kernel_task_status kernel_task_set_tid_address(
     struct kernel_task *task,

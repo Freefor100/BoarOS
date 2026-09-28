@@ -553,3 +553,11 @@ metadata.fstatfs-bad-output
 metadata.statfs-allocation
 utime.unlinked-fd
 metadata.statfs-unlinked
+tid.fork-private
+tid.fork-shared-page
+tid.vfork-exit
+tid.vfork-exec
+tid.vfork-exec-failure
+tid.bad-address
+tid.readonly
+tid.thread-wake

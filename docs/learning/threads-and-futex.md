@@ -14,7 +14,7 @@ BoarOS 使用组长任务作为进程身份容器和父子树节点，不另建 
 
 RISC-V 的 `tp` 保存用户线程指针。动态链接器或 libc 为各线程分配 TLS，然后由 `CLONE_SETTLS` 把新线程的 `tp` 设置为对应值；内核无需执行 ELF 重定位或理解 libc 的 TLS 分配算法。整数寄存器和 FP 状态也必须完整继承。
 
-`exit` 只结束调用线程，`exit_group` 结束线程组。`CLONE_CHILD_CLEARTID` 的完成通知由内核承担：退出线程在释放 MM 前向指定用户字写零并唤醒 waiter，pthread join 才能安全确认它不再使用用户栈。不能先释放地址空间再访问该用户字，也不能把无效用户地址当成内核对象损坏。
+`exit` 只结束调用线程，`exit_group` 结束线程组。`CLONE_CHILD_CLEARTID` 的完成通知由内核承担：退出线程在释放 MM 前，仅当仍有其他任务使用同一 MM 时向指定用户字写零并唤醒 waiter，pthread join 才能安全确认它不再使用用户栈。不能先释放地址空间再访问该用户字，也不能把无效用户地址当成内核对象损坏。
 
 ## futex 的原子等待
 
@@ -51,3 +51,20 @@ BoarOS 使用 256 个桶和每队列 FIFO 成员链。普通唤醒不扫描全�
 - `references/linux/kernel/fork.c`、`kernel/exit.c`、`fs/exec.c`、`kernel/signal.c`、`kernel/futex/`：Linux commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`。
 - `references/musl/musl-1.2.5.tar.gz` 内 `src/thread/`、`src/ldso/` 与 `ldso/dynlink.c`：musl 1.2.5，SHA-256 `a9a118bbe84d8764da0ea0d28b3ab3fae8477fc7e4085d90102b8596fc7c75e4`。
 - `references/glibc/glibc-2.44.tar.xz` 内 `nptl/pthread_join_common.c`、`nptl/futex-internal.c`：glibc 2.44，SHA-256 `37f600f2bef3c5e8300147059568b2a2e40a7ad6ccc65ce942556d49429cc667`。固定 RV64 loader/libc 二进制身份见 `tests/userland/glibc/inputs.json`。
+
+## child-TID 生命周期差分（2026-09-28）
+
+通用基线 `fa38845` 只放开 process clone 的 CHILD 标志，尚未证明生命周期。
+`tests/diff-abi/child_tid.c` 对照 `references/linux/kernel/fork.c` 的
+`mm_release`（commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`），旧实现实际出现三处差异：
+父上下文写子 COW MM 导致 CHILD_SETTID 失败；独立 MM 退出错误清零共享匿名页；
+vfork 成功 exec 提前丢掉 clear 指针，没有清零旧共享 MM。
+
+修复把 CHILD_SETTID 延到子任务首次用户返回；MM 另计活跃任务，避免清理器的延迟引用
+被误算为 mm_users；成功 exec 在旧 MM 激活期间完成 robust、清 TID，再切页表，
+失败 exec 保留注册。共享物理页不等于共享 MM，坏用户地址不撤销 clone。
+
+重建：`make test-mm-riscv test-exec-riscv test-user-riscv test-diff-abi-riscv`。
+本次聚焦测试通过，完整差分 556/556（新增 8 条 tid.*）；Harness 同时检查 PID 1
+完成、堆和任务资源回收。此阶段交给评测分支后应重跑原始 clone/pthread 测例；
+比赛启动环境尚未完成，不能据此宣称评分已改善。
