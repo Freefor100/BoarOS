@@ -229,3 +229,5 @@ PROT_NONE、非当前 MM、尾页、关闭 fd、unlink、O_TRUNC 与重新增长
 `riscv_kernel_mm_get_statistics` 提供驻留查找探测、改权页表访问及地址/全局失效计数。`make test-scale-riscv` 在 16/64 MiB 文件全部读驻留后按置换顺序首次写入，验证探测增长不超过 6 倍，并注入前 128 页准备阶段的元数据分配失败。首次写开放权限和写回 rearm 使用单页 PTE 操作；引用与脏代次协议保持不变。
 
 调度器在任务发布及新映像提交时调用 `kernel_mm_add_user`，在退出或旧映像退休前调用 `kernel_mm_remove_user`。活跃使用者与 MM 资源引用分开：清理任务暂存的旧 MM 不影响 CHILD_CLEARTID 条件；fork 创建零使用者的新 MM，acquire/move 不隐式注册任务。计数下溢、溢出属于内核 owner 错误。
+
+活跃使用者在可睡眠的清 TID 复制/唤醒结束后才注销；其他任务同时退出时仍须看到正在退出但尚未完成 mm_release 的使用者。`test-mm-riscv` 通过用户复制挂起点的确定性交错检查两个用户字均清零及最终物理页归还；真实 U-mode 的生命周期另由 tid.* 差分覆盖。

@@ -639,13 +639,13 @@ $(SV39_FAULT_TEST_KERNEL_RV): $(SV39_FAULT_TEST_OBJECTS) \
 $(MM_TEST_KERNEL_RV): $(MM_TEST_OBJECTS) \
 		arch/riscv/linker.ld
 	$(CC) $(LDFLAGS) \
-		-Wl,-Map,$(BUILD_DIR)/tests/kernel-mm-rv.map \
+		-Wl,--wrap=kernel_copy_to_user -Wl,-Map,$(BUILD_DIR)/tests/kernel-mm-rv.map \
 		-o $@ $(MM_TEST_OBJECTS)
 
 $(MM_FATAL_TEST_KERNEL_RV): $(MM_FATAL_TEST_OBJECTS) \
 		arch/riscv/linker.ld
 	$(CC) $(LDFLAGS) \
-		-Wl,-Map,$(BUILD_DIR)/tests/kernel-mm-fatal-rv.map \
+		-Wl,--wrap=kernel_copy_to_user -Wl,-Map,$(BUILD_DIR)/tests/kernel-mm-fatal-rv.map \
 		-o $@ $(MM_FATAL_TEST_OBJECTS)
 
 $(VMA_TEST_KERNEL_RV): $(VMA_TEST_OBJECTS) \

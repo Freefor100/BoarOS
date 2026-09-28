@@ -111,6 +111,7 @@ enum kernel_mm_status kernel_mm_vma_lookup(
 
 /* Scheduler-owned live users, independent of deferred resource cleanup. */
 void kernel_mm_add_user(struct kernel_mm *mm);
+uint32_t kernel_mm_user_count(const struct kernel_mm *mm);
 uint32_t kernel_mm_remove_user(struct kernel_mm *mm);
 
 /* Unique for the lifetime of the kernel, including after MM page reuse. */

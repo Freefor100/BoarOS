@@ -1381,6 +1381,15 @@ void kernel_mm_add_user(struct kernel_mm *mm)
     record->users++;
 }
 
+uint32_t kernel_mm_user_count(const struct kernel_mm *mm)
+{
+    struct riscv_kernel_mm_record *record;
+    if (resolve_record(mm, &record) != KERNEL_MM_STATUS_OK ||
+        mm->state != KERNEL_MM_LIVE || !record->users)
+        __builtin_trap();
+    return record->users;
+}
+
 uint32_t kernel_mm_remove_user(struct kernel_mm *mm)
 {
     struct riscv_kernel_mm_record *record;
