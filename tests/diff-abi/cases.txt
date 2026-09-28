@@ -612,6 +612,8 @@ proc.stat-open
 proc.stat-fields
 proc.status-open
 proc.status-fields
+proc.stdio-console-link
+proc.stdio-console-follow-stat
 proc.fd-dir
 proc.fd-list-target
 proc.fd-eof

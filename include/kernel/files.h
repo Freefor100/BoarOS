@@ -11,6 +11,7 @@ struct kernel_heap;
 struct kernel_mm;
 struct kernel_open_file_description;
 struct kernel_task;
+struct kernel_vfs_path;
 
 enum kernel_files_status {
     KERNEL_FILES_STATUS_OK = 0,
@@ -306,6 +307,11 @@ enum kernel_files_status kernel_files_open_console(
     struct kernel_files *files,
     int64_t fd,
     int64_t *linux_result);
+
+/* Boot stdio prefers a real console node; only a missing node uses UART. */
+enum kernel_files_status kernel_files_open_boot_console(
+    struct kernel_files *files, struct kernel_vfs_path *root,
+    int64_t fd, int64_t *linux_result);
 
 enum kernel_files_status kernel_files_lseek(
     struct kernel_files *files,

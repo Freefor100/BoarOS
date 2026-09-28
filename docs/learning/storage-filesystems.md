@@ -111,8 +111,16 @@ test-stack-usage` 通过。初始无路径 console 与伪对象跟随式 stat �
 与设备号。单纯读取 `pipe:[N]` 或 `anon_inode:[eventpoll]` 的展示文字无法
 恢复目标身份，因此 VFS 只在最终路径跟随失败时调用后端 `stat_link`；proc
 在短关中断区里读取当前 fd 槽的伪对象快照，不持锁复制用户内存。原始失败
-与修复后的 658 条一致记录由 `make test-diff-abi-riscv` 重建；初始无路径
-console 链接仍是独立限制。
+与修复后的 658 条一致记录由 `make test-diff-abi-riscv` 重建；缺少设备
+节点时的无路径 console 链接仍是独立限制。
+
+固定差分根盘已由 `tests/diff-abi/harness.py` 预置 5:1 `/dev/console`。
+同一 RV ELF 上 Linux 的 `/proc/self/fd/0` 链接为 `/dev/console`，而旧
+BoarOS 初始化三个无路径 console OFD，返回 `ENOENT`。根启动在文件表
+安装标准 fd 前先核对根盘字符节点及设备号，再经 VFS 打开，保留目录项
+引用；仅节点不存在时退回原无路径 UART，真实设备错误不被吞掉。链接由
+同一个 proc fd 路径引用机制自然显示，不新增路径特判。660 条差分一致；
+缺少节点的根启动 fixture 继续验证 UART 兜底。
 
 原始固定 BusyBox 包装脚本以 SHA-256
 `f2cda5fcdff6d41c8a553ac658e8aa55b6a48aa40898cb123a19f7865f3773ac`

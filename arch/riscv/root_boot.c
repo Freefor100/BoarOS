@@ -397,13 +397,10 @@ enum riscv_root_boot_status riscv_root_boot_start(
         failure = RISCV_ROOT_BOOT_STATUS_RESOURCES;
         goto fail;
     }
-    /*
-     * Bind PID 1 stdio to the console.  Bridge until a device filesystem
-     * provides /dev/console; fork already inherits the descriptors and
-     * exec only drops CLOEXEC ones.
-     */
+    /* 真实 /dev/console 节点优先；缺失时保留早期串口标准 fd。 */
     for (stdio_index = 0U; stdio_index < 3U; stdio_index++) {
-        if (kernel_files_open_console(&files,
+        if (kernel_files_open_boot_console(&files,
+                                      kernel_fs_context_root(&fs),
                                       (int64_t)stdio_index,
                                       &console_result) !=
                 KERNEL_FILES_STATUS_OK ||

@@ -231,6 +231,14 @@ void abi_proc_cases(void)
     }
     abi_record("proc.status-fields", status_shape ? 0 : -1,
                -1, -1, 0, 0, 0);
+    char stdio_path[48];
+    proc_fd_path(stdio_path, 0);
+    char stdio_link[64] = {0};
+    long stdio_length = SC4(78, -100, stdio_path,
+                            stdio_link, sizeof(stdio_link));
+    abi_record("proc.stdio-console-link", stdio_length, -1, -1, 0,
+               stdio_link, stdio_length > 0 ? (usize)stdio_length : 0);
+    proc_fd_follow_stat("proc.stdio-console-follow-stat", stdio_path, 0);
     long fd_directory = abi_open("/proc-probe/self/fd", 0);
     abi_record("proc.fd-dir", fd_directory < 0 ? fd_directory : 0,
                -1, -1, 0, 0, 0);
