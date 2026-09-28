@@ -520,6 +520,19 @@ DEPS := \
 
 all: $(KERNEL_RV)
 
+INIT_CONFIG ?= config/init.json
+.PHONY: force-init-config test-init-config-riscv
+force-init-config:
+
+$(BUILD_DIR)/generated/init-config.h: force-init-config $(INIT_CONFIG) tools/init-config.py include/kernel/exec_image.h include/kernel/fs_context.h
+	python3 tools/init-config.py $(INIT_CONFIG) $@
+
+$(BUILD_DIR)/arch/riscv/root_boot.o: $(BUILD_DIR)/generated/init-config.h
+$(BUILD_DIR)/arch/riscv/root_boot.o: CPPFLAGS += -I$(BUILD_DIR)/generated
+
+test-init-config-riscv:
+	python3 tests/init-config-riscv.py
+
 references:
 	./references/fetch.sh
 

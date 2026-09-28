@@ -17,7 +17,6 @@
 #include <stdint.h>
 #include <string.h>
 
-#define KERNEL_EXEC_STRING_LIMIT UINT64_C(0x20000)
 #define KERNEL_EXEC_VECTOR_LIMIT \
     (KERNEL_EXEC_STRING_LIMIT / sizeof(uint64_t))
 #define KERNEL_EXEC_INITIAL_STRING_CAPACITY 256U

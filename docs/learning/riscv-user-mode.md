@@ -99,3 +99,10 @@ Sv39、`satp`、`sscratch`、Trap Frame 和 RISC-V syscall 寄存器约定属于
 - `references/linux/arch/riscv/include/asm/syscall.h`、`references/linux/arch/riscv/include/uapi/asm/unistd.h` 与通用 UAPI syscall 定义：RISC-V Linux 的参数寄存器、返回值和系统调用编号来源。
 - `references/linux/arch/riscv/include/asm/uaccess.h`、`references/linux/arch/riscv/lib/uaccess.S` 和 `references/linux/arch/riscv/mm/extable.c`：SUM、复制循环、异常表与 fault fixup 的 Linux 实现依据。
 - `references/linux/include/uapi/linux/utsname.h` 与 `references/linux/kernel/sys.c`：`new_utsname` 的六字段布局、`uname(160)` 复制和 `-EFAULT` 语义。
+
+## 可配置初始进程（2026-09-28）
+
+通用内核只需指定第一份 ELF 的 path/argv/envp，环境目录、设备节点及脚本调度由
+用户程序负责。`config/init.json` 保留 `/init` 默认；`make test-init-config-riscv`
+用同一缓存目录反复切换配置，验证内容依赖与真实初始栈，不依赖任何比赛路径。
+交接基线 `b6bc8f3`，接收分支应以独立配置启动镜像已有静态解释器，且合入后重新构建。

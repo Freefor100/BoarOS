@@ -1,3 +1,4 @@
+#include "init-config.h"
 #include <arch/riscv/direct_map.h>
 #include <arch/riscv/elf_image.h>
 #include <arch/riscv/exec.h>
@@ -166,13 +167,6 @@ enum riscv_root_boot_status riscv_root_boot_start(
     struct physical_page_allocator *allocator,
     const struct riscv_sv39_page_table *kernel_table)
 {
-    static const char init_path[] = "/init";
-    const struct kernel_exec_string arguments[1] = {
-        {
-            .bytes = init_path,
-            .length = sizeof(init_path) - 1U,
-        },
-    };
     struct kernel_open_file_description *file_owner = 0;
     struct kernel_open_file_description *interpreter_owner = 0;
     struct kernel_elf64_source *executable_source = 0;
@@ -372,11 +366,11 @@ enum riscv_root_boot_status riscv_root_boot_start(
     resolved_interpreter_path = 0;
     request.executable_source = executable_source;
     request.interpreter_source = interpreter_source;
-    request.executable = arguments[0];
-    request.arguments = arguments;
-    request.argument_count = 1U;
-    request.environment = 0;
-    request.environment_count = 0U;
+    request.executable = (struct kernel_exec_string){init_path, sizeof(init_path) - 1U};
+    request.arguments = init_arguments;
+    request.argument_count = INIT_ARGUMENTS_COUNT;
+    request.environment = init_environment;
+    request.environment_count = INIT_ENVIRONMENT_COUNT;
     elf_status = riscv_elf_image_build(&request,
                                        &root->heap,
                                        allocator,

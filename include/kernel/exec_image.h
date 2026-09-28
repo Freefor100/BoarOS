@@ -8,6 +8,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#define KERNEL_EXEC_STRING_LIMIT 131072U
+
 struct kernel_heap;
 
 struct kernel_exec_string {
