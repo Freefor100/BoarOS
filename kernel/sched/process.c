@@ -1489,6 +1489,8 @@ static void kernel_thread_finish(
         switch_to_fatal_idle(status);
     }
 
+    /* proc readers must see departure before clear_child_tid wakes a joiner. */
+    current->proc_exiting = 1U;
     if (!current->group_exiting) current->completion = *completion;
     if (current->arch.user_mode == 1U) {
         kernel_futex_release_robust(current, current->tid);

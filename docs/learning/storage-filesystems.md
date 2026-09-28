@@ -127,8 +127,18 @@ BoarOS 初始化三个无路径 console OFD，返回 `ENOENT`。根启动在文�
 `/proc/self/exe` 展示 `(deleted)`，但跟随链接仍能读取原 ELF magic。
 生成式 meminfo 的跨页用户 fault 只提交已复制的 8 字节，下一次读取从
 该 offset 续读；起点就 fault 时返回 `EFAULT` 且 offset 不动。固定 Linux
-与 BoarOS 共 668 条差分一致。线程组退出、非组长 exec 与读取时并发变化
-仍没有由这组测试覆盖，不能把这些结果外推为完整 procfs 生命周期验收。
+与 BoarOS 共 668 条差分一致。随后追加线程组真实 U-mode 用例：
+固定 Linux `references/linux/fs/proc/{array.c,base.c,fd.c}` 和
+`fs/proc/internal.h`（commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`）
+把数字进程对象关联到组长 task。初版 BoarOS 把存活成员当成对象本体；
+同一 ELF 对照时，组长退出后的 status 为 R、exe/cwd/fd 仍可访问，
+而 Linux 为 Z 和 `ENOENT`。另一个差异是 clear_child_tid 清零/唤醒已发布，
+可睡眠清理任务尚未把非组长成员从组链摘除，`Threads` 暂时报 2 而 Linux 报 1。
+保留原 MM/文件/栈清理顺序与 owner；退出入口先发布仅供 proc 观察的
+`proc_exiting`，按组长身份读取数字进程对象并排除正在离开的非组长成员。
+退出前已打开的 status 在退出后首次读取、非组长 exec 的 PID/主 ELF/线程数
+也经同一 RV ELF 验证，当前 679 条差分一致。此证据不覆盖持续高压 fd 复用
+或完整 Linux proc 字段。
 
 原始固定 BusyBox 包装脚本以 SHA-256
 `f2cda5fcdff6d41c8a553ac658e8aa55b6a48aa40898cb123a19f7865f3773ac`

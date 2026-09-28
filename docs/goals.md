@@ -15,10 +15,10 @@ Linux 为 `references/linux` 的 `f4cdf7ca9a1fdcca413157df19753f388a5a224e`。
 | 阶段 | 状态 | 可独立验收的交付 |
 |---|---|---|
 | 通用 VFS 与 ext4 后端 | 已验证，生成式文件已接入 | 实例/inode 身份、目录项和引用；普通缓存文件与生成文件分离；保留日志/错误 owner |
-| 挂载树与路径 | 内部路径及 proc 的用户态 mount/umount2 已验证；完整 proc 待交付 | 保持同点覆盖、根和 ..、cwd/dirfd、忙卸载/回滚；补齐 proc 进程对象后复跑真实消费者 |
+| 挂载树与路径 | 内部路径及 proc 的用户态 mount/umount2 已验证 | 保持同点覆盖、根和 ..、cwd/dirfd、忙卸载/回滚；真实第二盘与更多后端留后续阶段 |
 | 字符设备后端 | 已验证 | 按设备号登记 null/zero/console 操作，OFD 持有后端；/dev 仍为 ext4 目录，不冒充 devfs |
-| procfs 与对象链接 | meminfo、uptime、self、exe/cwd/root/fd、mounts 与 stat/status 首批字段已通过差分；有 /dev/console 时初始 fd 链接亦通过；仍在进行 | 已覆盖删除执行文件、旧进程目录、fd 复用及生成文件跨页 fault；待验证线程组退出和并发变化边界及真实消费者。缺少 /dev/console 时的启动兜底无路径链接 |
-| 集成与评测交接 | 待验收 | 先独立消费者诊断，再一次固定预算 RV 原 judge 评分；不拼接成绩 |
+| procfs 与对象链接 | 首批真实字段和对象链接已通过固定 Linux 差分 | 已覆盖删除执行文件、旧进程目录、fd 复用、生成文件跨页 fault、线程组退出及非组长 exec；持续高压 fd 复用仍待专测。缺少 /dev/console 时的启动兜底无路径链接 |
+| 集成与评测交接 | 主线回归收口中；评测分支需接收最终提交 | 先独立消费者诊断，再一次固定预算 RV 原 judge 评分；不拼接成绩 |
 
 进程查询区分 PID 分配代次，旧 proc 对象不能访问复用 PID 的新进程。MM 持有执行
 文件引用，exec 成功提交时替换；对象链接不能退化成路径字符串重查。fd 解析固定
@@ -51,8 +51,8 @@ RISC-V 全套、userland、glibc、栈及相关存储回归通过。契约见对
 
 | 观测 | 结论边界与归属 |
 |---|---|
-| libctest 包装器存在却 not found | BusyBox ENOEXEC 回退缺真实 self/exe；P1h，不能再归为内核缺 shebang |
-| LTP 缺 meminfo，最终反复读 /proc/5/stat | P1h 的真实统计/生命周期前置；不外推全部 syscall 失败 |
+| libctest 包装器存在却 not found | P1h 真实 self/exe 已解除 BusyBox ENOEXEC 回退的前置阻塞；内部失败需按 libc 与 syscall 分别复现，不能再归为内核缺 shebang |
+| LTP 缺 meminfo，最终反复读 /proc/5/stat | P1h 的真实统计/生命周期前置已解除；新运行到 cgroup 案例，控制器与 setpgid 等依赖待新基线重新排序，不外推全部 syscall 失败 |
 | BusyBox df/ps/free 未计分 | 目录枚举修正后 ps 实际列出进程；df 仍因固定 BusyBox 跳过来源名 rootfs、proc 的块数为零而只显示表头；free 调用尚无 sysinfo ABI，显示全零。P1h/P5 环境接口分别处理，不以退出 0 算内容正确 |
 | dmesg klogctl 未实现 | P5c 日志接口，必须有真实内容与权限边界 |
 | hwclock、kill 10 未计分 | P0 定位调用与目标状态；已有其他 kill 回归通过 |
@@ -61,7 +61,7 @@ RISC-V 全套、userland、glibc、栈及相关存储回归通过。契约见对
 | iperf 缺 urandom、daemon 化失败 | P5c 随机设备；P2d 先缩小 daemon 首个失败调用 |
 | iozone 吞吐 shmget ENOSYS | P4f SysV IPC；共享匿名 mmap 不等于 SysV 生命周期 |
 | iozone 自动模式能完成，慢写和日期异常 | P0/P7 分别复现时间 ABI 与写入成本；不是永久卡死证据 |
-| lmbench /tmp/hello 启动错误仍有计时 | P0/P5b 核对生成、权限、格式、解释器和 exec 结果 |
+| lmbench /tmp/hello 启动错误仍有计时 | 原镜像 hello 脚本写死 `/code/lmbench_src/bin/build/lmbench_all`，根盘缺该目录；评测分支按 libc 链接镜像自带二进制，不能把原环境缺口归为通用 exec 失败 |
 | musl LTP、Lua、netperf 未到达 | 本轮没有独立能力结论，历史诊断与新基线分开 |
 
 待定位项先交付独立复现与结论，再决定机制修改；不按分数猜测根因。
@@ -182,7 +182,7 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 - [x] main 已补普通文件/字符节点 mknodat，复用 null/zero/console；独立设备后端、FIFO、块节点仍待设计。见[节点创建](modules/kernel-files.md#节点创建)。
 
 - [ ] 先设计通用后端和 mount/path 生命周期，再接最小设备后端与 procfs，之后以 tmpfs/真实第二挂载验证 mount/路径身份；临时内存文件具有真实页/目录生命周期、空间耗尽和卸载回收。
-- [ ] 最小 procfs 的 uptime、meminfo、self/exe、self/fd 和进程状态直接读取内核对象；枚举/读期间持有所需引用，任务或 fd 消失的竞态按契约处理，未实现项不伪造 Linux 文本。
+- [x] 最小 procfs 的 uptime、meminfo、self/exe、self/fd、进程状态及挂载信息直接读取内核对象；PID 代次、线程退出、组长存活边界和非组长 exec 经固定 Linux 差分。持续高压 fd 复用与完整 Linux 字段不在本批验收范围。
 - [ ] 多挂载覆盖路径跨越、根和 `..`、挂载点被引用、卸载忙、跨挂载文件操作和失败回滚；设备/内存/磁盘文件各自错误保持所属 owner。
 - [ ] eventfd/timerfd 只在真实消费者提出需求后接统一 OFD，就绪、非阻塞、poll/epoll 和退出回收一起验收；signalfd 另依赖 P2c 队列。
 
