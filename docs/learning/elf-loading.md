@@ -76,3 +76,19 @@ Auxv 的值必须来自真实机制，而不是为了让 libc 继续运行而伪
 - [RISC-V ELF psABI](https://riscv-non-isa.github.io/riscv-elf-psabi-doc/)：RISC-V ELF、过程调用和栈对齐约定。
 - `references/oscomp-testsuits/` 的 `final-2026` 与 `pre-2025` 固定提交：比赛静态程序和动态运行库输入。
 - `references/linux/fs/binfmt_elf.c`、`fs/exec.c`：Linux ELF 装载、`PT_INTERP` 和用户初始栈的成熟实现。
+
+## shebang 与 shell 回退（2026-09-28）
+
+固定依据为 `references/linux/fs/binfmt_script.c` 和 `fs/exec.c`，commit
+`f4cdf7ca9a1fdcca413157df19753f388a5a224e`。内核只对 `#!` 进行解释器转换，
+没有 shebang 的文本返回 ENOEXEC；BusyBox ash 的文本回退属于 shell。
+不能把 libctest 包装脚本失败全部归因于缺少 shebang：官方镜像的
+`run-static.sh`/`run-dynamic.sh` 没有 shebang，还需要可用 shell、工作目录和正确运行库。
+
+本轮差分先发现精简 Linux 关闭了 BINFMT_SCRIPT，导致无意义的双侧 ENOEXEC；
+开启后旧 BoarOS 在 argv/env、嵌套、缺失解释器与递归四组实际失败。
+`tests/diff-abi/exec_script.c` 与 `make test-exec-riscv` 保存重建输入，
+不依赖比赛磁盘。exec 准备事务统一持有脚本/解释器 OFD 和重组后的参数；
+只有新映像准备成功后才进入提交阶段。
+
+本阶段 `make test-exec-riscv test-userland-riscv test-glibc-riscv test-diff-abi-riscv test-stack-usage` 通过；差分 565 条，含 9 条脚本记录。交接基线为 child-TID 的 `ed6acfb`；评测分支合入后应使用原 BusyBox 消费脚本能力，不改上游脚本内容。

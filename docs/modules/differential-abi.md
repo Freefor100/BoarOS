@@ -95,3 +95,5 @@ Linux commit。较长请求的上游 RISC-V usercopy 进展问题留作独立 re
 显式时间用 `metadata.c` 的 `utime.*` 记录：256 字节（32 个 RV64 word），在上述时钟和 inode/父目录观测外保留两项原始请求。规范化器检查 explicit 精确值/范围截断、NOW 与 ctime 同一时刻、OMIT/失败完全不变、父目录不变。`metadata.*` 保留错误顺序、statfs 几何/UUID/标志与实际分配/截断的空闲块差量；容量值不归零。bavail 的 Linux 专有 extent 保留池不同于 BoarOS，分别用真实分配状态验证，不伪造相同储备。加入 robust syscall 后完整差分为 329 条记录。
 
 `child_tid.c` 记录 fork/vfork/thread 的 CHILD_SETTID、CHILD_CLEARTID 与成功/失败 exec；由 `start.S` 提供独立子栈 trampoline，避免 C 函数在换栈后误用父栈。当前 child-TID 阶段完整 manifest 为 556 条。
+
+脚本差分要求 Linux 配置 `CONFIG_BINFMT_SCRIPT=y`；关闭时两侧 ENOEXEC 一致不能证明 shebang 正确。`exec_script.c` 检查参数、环境、嵌套、无换行与错误边界。

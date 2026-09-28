@@ -561,3 +561,12 @@ tid.vfork-exec-failure
 tid.bad-address
 tid.readonly
 tid.thread-wake
+exec.script-argv-env
+exec.script-nested
+exec.script-no-newline
+exec.script-missing
+exec.script-loop
+exec.script-noexec
+exec.script-empty
+exec.text-enoexec
+exec.script-long

@@ -15,6 +15,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 #define KERNEL_EXEC_STRING_LIMIT UINT64_C(0x20000)
 #define KERNEL_EXEC_VECTOR_LIMIT \
@@ -410,6 +411,129 @@ static void resolve_staged_strings(struct kernel_exec_string *strings,
     }
 }
 
+static enum exec_capture_status append_kernel_string(
+    struct kernel_exec_transaction *transaction, const char *value,
+    struct kernel_exec_string *result, int64_t *error)
+{
+    size_t start = transaction->string_size;
+    do {
+        enum exec_capture_status status = reserve_string_space(transaction, error);
+        if (status != EXEC_CAPTURE_OK) return status;
+        transaction->string_bytes[transaction->string_size++] = *value;
+    } while (*value++);
+    result->bytes = (const char *)(uintptr_t)(start + 1U);
+    result->length = transaction->string_size - start - 1U;
+    return EXEC_CAPTURE_OK;
+}
+
+static void discard_arg_zero(struct kernel_exec_transaction *transaction)
+{
+    struct kernel_exec_string first = transaction->arguments[0];
+    uintptr_t encoded = (uintptr_t)first.bytes;
+    transaction->argument_count--;
+    memmove(transaction->arguments, transaction->arguments + 1,
+            transaction->argument_count * sizeof(first));
+    if (encoded == 0U || encoded > KERNEL_EXEC_STRING_LIMIT) return;
+    size_t start = encoded - 1U, length = first.length + 1U;
+    memmove(transaction->string_bytes + start,
+            transaction->string_bytes + start + length,
+            transaction->string_size - start - length);
+    transaction->string_size -= length;
+    for (unsigned vector = 0; vector < 2; vector++) {
+        struct kernel_exec_string *strings = vector ? transaction->environment : transaction->arguments;
+        size_t count = vector ? transaction->environment_count : transaction->argument_count;
+        for (size_t i = 0; i < count; i++) {
+            uintptr_t offset = (uintptr_t)strings[i].bytes;
+            if (offset > encoded && offset <= KERNEL_EXEC_STRING_LIMIT)
+                strings[i].bytes = (const char *)(offset - length);
+        }
+    }
+}
+
+/* 只消费首行的 256 字节；解释器路径不得截断，可选参数保持一个 argv。 */
+static enum exec_capture_status expand_scripts(
+    struct kernel_exec_transaction *transaction, const struct kernel_fs_context *fs,
+    int64_t *error)
+{
+    char header[256], next_path[256];
+    const char *script_path = transaction->original_path;
+    for (unsigned depth = 0;; depth++) {
+        size_t read = 0;
+        memset(header, 0, sizeof(header));
+        if (kernel_open_file_pread(transaction->executable_file, 0, header,
+                                   sizeof(header), &read) != 0) {
+            *error = -KERNEL_EIO;
+            return EXEC_CAPTURE_LINUX_ERROR;
+        }
+        if (header[0] != '#' || header[1] != '!') return EXEC_CAPTURE_OK;
+        if (depth >= 5) {
+            *error = -KERNEL_ELOOP;
+            return EXEC_CAPTURE_LINUX_ERROR;
+        }
+        size_t end = 0;
+        while (end < sizeof(header) && header[end] != '\n') end++;
+        if (end == sizeof(header)) {
+            size_t name = 2;
+            while (name < sizeof(header) && (header[name] == ' ' || header[name] == '\t')) name++;
+            size_t stop = name;
+            while (stop < sizeof(header) && header[stop] && header[stop] != ' ' && header[stop] != '\t') stop++;
+            if (name == sizeof(header) || stop == sizeof(header)) {
+                *error = -KERNEL_ENOEXEC;
+                return EXEC_CAPTURE_LINUX_ERROR;
+            }
+            end = sizeof(header) - 1;
+        }
+        while (end > 2 && (header[end - 1] == ' ' || header[end - 1] == '\t')) end--;
+        header[end] = 0;
+        char *name = header + 2;
+        while (*name == ' ' || *name == '\t') name++;
+        if (!*name) {
+            *error = -KERNEL_ENOEXEC;
+            return EXEC_CAPTURE_LINUX_ERROR;
+        }
+        char *arg = name;
+        while (*arg && *arg != ' ' && *arg != '\t') arg++;
+        if (*arg) {
+            *arg++ = 0;
+            while (*arg == ' ' || *arg == '\t') arg++;
+        }
+        size_t extra = *arg ? 3U : 2U;
+        discard_arg_zero(transaction);
+        for (size_t i = 0; i < extra; i++) {
+            enum exec_capture_status status = reserve_vector_slot(transaction,
+                &transaction->arguments, transaction->argument_count + i,
+                &transaction->argument_capacity, error);
+            if (status != EXEC_CAPTURE_OK) return status;
+        }
+        memmove(transaction->arguments + extra, transaction->arguments,
+                transaction->argument_count * sizeof(*transaction->arguments));
+        transaction->argument_count += extra;
+        const char *values[3] = {name, *arg ? arg : script_path, script_path};
+        for (size_t i = 0; i < extra; i++) {
+            enum exec_capture_status status = append_kernel_string(transaction,
+                values[i], &transaction->arguments[i], error);
+            if (status != EXEC_CAPTURE_OK) return status;
+        }
+        /* 当前脚本 OFD 先释放；失败保留事务 owner，不覆盖清理对象。 */
+        if (kernel_open_file_release(&transaction->executable_file) != KERNEL_OPEN_FILE_STATUS_OK) {
+            *error = -KERNEL_EIO;
+            return EXEC_CAPTURE_LINUX_ERROR;
+        }
+        int path_result;
+        if (kernel_open_file_create_at(transaction->heap,
+                kernel_fs_context_cwd(fs), kernel_fs_context_root(fs), name,
+                KERNEL_OPEN_PATH_EXECUTABLE, 0, &transaction->executable_file,
+                &path_result) != KERNEL_OPEN_FILE_STATUS_OK)
+            return EXEC_CAPTURE_STATE;
+        if (path_result) {
+            *error = path_result;
+            return EXEC_CAPTURE_LINUX_ERROR;
+        }
+        memcpy(next_path, name, strlen(name) + 1);
+        script_path = next_path;
+    }
+}
+
 static enum kernel_exec_status finish_prepare_failure(
     struct kernel_task *task,
     struct kernel_exec_transaction *transaction,
@@ -536,6 +660,39 @@ enum kernel_exec_status kernel_execve_prepare(
                                       path_result,
                                       linux_result);
     }
+    capture_status = capture_vector(transaction,
+                                    mm,
+                                    user_argv,
+                                    1,
+                                    linux_result);
+    if (capture_status == EXEC_CAPTURE_LINUX_ERROR) {
+        return finish_prepare_failure(task,
+                                      transaction,
+                                      *linux_result,
+                                      linux_result);
+    }
+    if (capture_status != EXEC_CAPTURE_OK) {
+        return finish_prepare_state(task, transaction);
+    }
+    capture_status = capture_vector(transaction,
+                                    mm,
+                                    user_envp,
+                                    0,
+                                    linux_result);
+    if (capture_status == EXEC_CAPTURE_LINUX_ERROR) {
+        return finish_prepare_failure(task,
+                                      transaction,
+                                      *linux_result,
+                                      linux_result);
+    }
+    if (capture_status != EXEC_CAPTURE_OK) {
+        return finish_prepare_state(task, transaction);
+    }
+    capture_status = expand_scripts(transaction, fs, linux_result);
+    if (capture_status == EXEC_CAPTURE_LINUX_ERROR)
+        return finish_prepare_failure(task, transaction, *linux_result, linux_result);
+    if (capture_status != EXEC_CAPTURE_OK)
+        return finish_prepare_state(task, transaction);
     {
         enum kernel_elf64_source_status source_status =
             kernel_elf64_source_create(transaction->heap,
@@ -607,34 +764,6 @@ enum kernel_exec_status kernel_execve_prepare(
                                               linux_result);
             }
         }
-    }
-    capture_status = capture_vector(transaction,
-                                    mm,
-                                    user_argv,
-                                    1,
-                                    linux_result);
-    if (capture_status == EXEC_CAPTURE_LINUX_ERROR) {
-        return finish_prepare_failure(task,
-                                      transaction,
-                                      *linux_result,
-                                      linux_result);
-    }
-    if (capture_status != EXEC_CAPTURE_OK) {
-        return finish_prepare_state(task, transaction);
-    }
-    capture_status = capture_vector(transaction,
-                                    mm,
-                                    user_envp,
-                                    0,
-                                    linux_result);
-    if (capture_status == EXEC_CAPTURE_LINUX_ERROR) {
-        return finish_prepare_failure(task,
-                                      transaction,
-                                      *linux_result,
-                                      linux_result);
-    }
-    if (capture_status != EXEC_CAPTURE_OK) {
-        return finish_prepare_state(task, transaction);
     }
     resolve_staged_strings(transaction->arguments,
                            transaction->argument_count,
