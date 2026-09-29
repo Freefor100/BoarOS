@@ -737,6 +737,8 @@ void kernel_main(unsigned long hart_id, const void *dtb)
     boot_dtb_address = (uintptr_t)dtb;
     cleanup_retry_ticks = boot_info.timebase_frequency / KERNEL_TICKS_PER_SECOND;
     (void)kernel_random_initialize(boot_info.rng_seed, boot_info.rng_seed_size);
+    kernel_random_erase(boot_info.rng_seed, sizeof(boot_info.rng_seed));
+    boot_info.rng_seed_size = 0U;
 
     memory_status = boot_memory_build(
         &boot_info,

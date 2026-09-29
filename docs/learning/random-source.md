@@ -13,3 +13,5 @@ BLAKE2s 每次混入最多 32 字节输入与旧 32 字节 key，故混种临界
 2026-09-29 窄差分的 34 条记录全部匹配，扩展后的完整 ABI 为 831 条匹配；`make test-random-host test-virtio-rng-host` 通过。`make test-rng-riscv` 两种传输共 8 次启动覆盖就绪、缺设备、信号取消、延迟响应及在途退出，均核对页/堆/栈回收。此次组合内核 SHA-256 `19854baa6e01ab86e11b80c970746dfb0d1e776a787cd0f4c094b25f691ea216`，随机窄探针 SHA-256 `aca76267b36edc4a6507a051041ed882deea323497e67f4c38266f82300648b3`；构建输入由固定 Linux 与 Harness 元数据约束。测试随机字节本身不参与差分。完整调度阶段后仍需重跑集成与持久化矩阵。
 
 独立提交检查将暂存源码树导出到 `build/random-stage-src/` 后执行 `make -C build/random-stage-src -j4 all`，再用 `tests/rng-riscv.py --kernel build/random-stage-src/kernel-rv` 和 `tests/diff-abi/harness.py --kernel build/random-stage-src/kernel-rv` 重跑；8 次 RNG 启动与 831 条 ABI 全部通过。该独立内核 SHA-256 为 `c9d65f2fb9bfc96c1e393c61d06a937df242608b7a66e23472e686e72f49fd37`，确认不依赖尚未提交的会话和调度改动。
+
+启动混种后立即擦除 `boot_info.rng_seed` 的临时副本并将长度清零，避免初始化后继续保留无用途种子副本；不改固件拥有的原始 DTB。该收尾在独立会话基线核上重跑 8 次 RNG 生命周期启动通过，内核 SHA-256 `b87834c37520eecd114061dde95b5ba3047e4697ae3f4ae659287370100ee530`。
