@@ -5,9 +5,24 @@
 Linux 为 `references/linux` 的 `f4cdf7ca9a1fdcca413157df19753f388a5a224e`。
 历史评审是调查输入，不自动成为设计批准。
 
+## 已交付：统一内存后备对象、tmpfs、硬链接与第二磁盘
+
+从 `main@ac8b066` 演进。统一稀疏对象已迁移共享匿名与 futex key；tmpfs 普通文件
+只使用同一内存后备对象，具备页/inode 限额、空洞读、映射、删除后存活与卸载回收。
+linkat 同时接入 tmpfs/ext4；真实第二盘使用独立设备、缓存、worker、锁与错误 owner。
+动态卸载先 quiesce 和交接，再摘树；日志失败保留可达挂载及设备 claim。
+最终 783 条 ABI 差分匹配；228 项清单为 227 pass、原 BusyBox 包装器 1 项失败，
+逐项无回退。硬链接 80 组/8800 次注入、SQLite DELETE/WAL 完整矩阵及第二盘
+独立重启均有证据；故障矩阵的输入身份与最终内核分别记录。
+
+证据及重建入口见 [内存文件与多挂载](learning/memory-backed-mounts.md)、
+[tmpfs 模块](modules/tmpfs.md)、[VFS/ext4](modules/vfs-ext4.md)。本阶段沿 main
+分问题提交，不推送、不交接评测分支、不正式评分。完成条件包含真实消费者、
+故障注入实际命中、完整差分/回归与资源基线，不能由单次退出码替代。
+
 ## 已交付：通用 VFS、真实 procfs 与后台回收
 
-通用 VFS 阶段基线 `main@ba7e6d8`；本轮内存/后台回收从 `main@576c4e4` 演进。已确认统一 VFS 对象、分阶段交付：通用实例/inode/目录项与
+通用 VFS 阶段基线 `main@ba7e6d8`；上轮内存/后台回收从 `main@576c4e4` 演进。已确认统一 VFS 对象、分阶段交付：通用实例/inode/目录项与
 后端分离 → 挂载树和跨挂载路径 → null/zero/console 设备后端 → 真实 procfs。
 维持 RV64/QEMU virt/单 hart；ext4 持久化、页缓存、映射、记录锁和睡眠 I/O 不回退。
 默认 PID 1 不变，由用户态创建挂载点并挂载 proc；不包含比赛路径或输出特判。
@@ -15,12 +30,12 @@ Linux 为 `references/linux` 的 `f4cdf7ca9a1fdcca413157df19753f388a5a224e`。
 | 阶段 | 状态 | 可独立验收的交付 |
 |---|---|---|
 | 通用 VFS 与 ext4 后端 | 已验证，生成式文件已接入 | 实例/inode 身份、目录项和引用；普通缓存文件与生成文件分离；保留日志/错误 owner |
-| 挂载树与路径 | 内部路径及 proc 的用户态 mount/umount2 已验证 | 保持同点覆盖、根和 ..、cwd/dirfd、忙卸载/回滚；真实第二盘与更多后端留后续阶段 |
+| 挂载树与路径 | 内部路径及 proc 的用户态 mount/umount2 已验证 | 保持同点覆盖、根和 ..、cwd/dirfd、忙卸载/回滚；该阶段未扩展真实第二盘；本阶段已补齐 tmpfs/ext4 组合 |
 | 字符设备后端 | 已验证 | 按设备号登记 null/zero/console 操作，OFD 持有后端；/dev 仍为 ext4 目录，不冒充 devfs |
 | procfs 与对象链接 | 首批真实字段和对象链接已通过固定 Linux 差分 | 已覆盖删除执行文件、旧进程目录、fd 复用、生成文件跨页 fault、线程组退出及非组长 exec；256 轮同步 fd 关闭/复用压力已覆盖。缺少 /dev/console 时的启动兜底无路径链接 |
 | 上轮集成与评测交接 | 上轮评测分支已单向接收并完成一次固定预算 RV 原 judge 评分；本轮未交接 | 679 条 ABI 差分、228 项清单、SQLite DELETE/WAL 完整恢复矩阵等主线证据见 learning；评分身份与 22 组状态只见评测分支，不拼接成绩 |
 
-本轮新增真实内存快照、完整 RV64 sysinfo、负载、阈值写回与水位回收；683 条差分含 proc 压力。
+上轮新增真实内存快照、完整 RV64 sysinfo、负载、阈值写回与水位回收；683 条差分含 proc 压力。
 原镜像时间和 LTP 等待已独立定位；诊断不改变主线 uname，不形成正式成绩。
 
 进程查询区分 PID 分配代次，旧 proc 对象不能访问复用 PID 的新进程。MM 持有执行
@@ -34,7 +49,7 @@ Linux 为 `references/linux` 的 `f4cdf7ca9a1fdcca413157df19753f388a5a224e`。
 主线，维护 uname 4.15、启动环境和评分身份，不整体合回 main、不重复 cherry-pick。
 沿现有工作区串行交接；不 push、不发布、不提交比赛，不增加 codex/ 前缀。
 
-每阶段先固定 Linux 最小复现、模块测试和真实 U-mode，再扩大回归。本轮已运行
+每阶段先固定 Linux 最小复现、模块测试和真实 U-mode，再扩大回归。上一阶段已运行
 RISC-V 全套、683 条 ABI 差分、userland、glibc、栈、规模、睡眠 I/O，以及 ext4、
 SQLite DELETE/WAL 和完整恢复矩阵；228 项清单为 227 pass、1 个原包装脚本失败。
 交接记录归对应模块/learning，评分身份只归
@@ -76,11 +91,10 @@ RISC-V 全套、userland、glibc、栈及相关存储回归通过。契约见对
 
 已交付的 P1h 首批路线完成；其余结构性方案仍为**待设计**，写入路线不等于批准实现。
 
-1. **tmpfs 与多挂载（实施中）**：共享匿名已迁移统一内存后备对象，查页与截断接口通过聚焦及差分回归；tmpfs、硬链接和第二磁盘仍待验收。复用本轮真实统计/回收分类，先定义目录与页 owner、共享映射、截断、空间耗尽、忙卸载、跨挂载错误和回滚，再扩展真实第二盘。
-2. **会话/进程组、随机数和调度 ABI**：按 daemon、iperf、cyclictest 的首个实际失败交付；随机数先确认可信熵源，查询与设置反映真实行为。原 glibc 的 coarse clock 缺口已定位，按真实时钟来源补齐。
-3. **AF_UNIX/socketpair 与 SysV 共享内存**：分别解除 hackbench 与 iozone 吞吐子项阻塞，独立定义 endpoint/IPC owner、退出和资源限制。
-4. **持续定位**：netperf、iozone 时间/写入成本与其余 libc/LTP 先取得独立证据；未到达不计失败。chown、进程组与 cgroup 缺口已分开，不能把辅助程序的正常等待扩成完整新子系统实现。
-5. **新兼容性基线之后**：SMP 先所有权与 TLB 回收，LoongArch 先真实 U-mode；实板与更大 C/Rust 工程各立验收里程碑，先单核正确性。
+1. **会话/进程组、随机数和调度 ABI**：按 daemon、iperf、cyclictest 的首个实际失败交付；随机数先确认可信熵源，查询与设置反映真实行为。原 glibc 的 coarse clock 缺口已定位，按真实时钟来源补齐。
+2. **AF_UNIX/socketpair 与 SysV 共享内存**：分别解除 hackbench 与 iozone 吞吐子项阻塞，独立定义 endpoint/IPC owner、退出和资源限制。
+3. **持续定位**：netperf、iozone 时间/写入成本与其余 libc/LTP 先取得独立证据；未到达不计失败。chown、进程组与 cgroup 缺口已分开，不能把辅助程序的正常等待扩成完整新子系统实现。
+4. **新兼容性基线之后**：SMP 先所有权与 TLB 回收，LoongArch 先真实 U-mode；实板与更大 C/Rust 工程各立验收里程碑，先单核正确性。
 
 新子系统仍需候选比较与路线确认，上述顺序不是架构批准。保持 RV64/QEMU virt/单 hart；
 水位和 MemAvailable 不承诺任意分配成功或实板持久性。评测分支交接、push、发布和比赛提交仍由维护者决定。
@@ -191,14 +205,14 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 
 ### P1h 虚拟文件系统与多挂载
 
-- [x] main 已补普通文件/字符节点 mknodat，复用 null/zero/console；独立设备后端、FIFO、块节点仍待设计。见[节点创建](modules/kernel-files.md#节点创建)。
+- [x] main 已补普通文件/字符节点 mknodat，复用 null/zero/console；块节点已供设备识别和 ext4 挂载使用；裸块 I/O、devfs 和 FIFO 后端仍未交付。见[节点创建](modules/kernel-files.md#节点创建)。
 
-- [x] 通用后端、mount/path 生命周期、null/zero/console 设备后端与首批真实 procfs 已分阶段交付；内部覆盖挂载遮蔽、根和 `..`、忙卸载及引用回收，真实第二盘留后续验收。
-- [ ] tmpfs 与真实第二挂载继续验证 mount/路径身份；临时内存文件须有真实页/目录生命周期、空间耗尽、截断和卸载回收。
+- [x] 通用后端、mount/path 生命周期、null/zero/console 设备后端与首批真实 procfs 已分阶段交付；内部覆盖挂载遮蔽、根和 `..`、忙卸载及引用回收，真实第二盘及 tmpfs 的组合验证见本阶段 learning。
+- [x] tmpfs 与真实第二 ext4 挂载具备独立路径身份；内存文件有真实后备对象/目录生命周期、配额耗尽、截断及最后引用回收；不宣称持久化或共享文件 futex。
 - [x] 最小 procfs 的 uptime、meminfo、self/exe、self/fd、进程状态及挂载信息直接读取内核对象；PID 代次、线程退出、组长存活边界和非组长 exec 经固定 Linux 差分。本轮另补 256 轮 fd 关闭复用压力；完整 Linux 字段仍未覆盖。
 - [x] 统一内存 owner 快照提供 Cached/MemAvailable/Shmem/Buffers/Dirty/Writeback，RV64 sysinfo 接入真实任务数和负载；无 swap/slab 回收时才返回对应零值。原 BusyBox free 与 LTP 已复验。
 - [x] 阈值驱动后台写回及低/高水位回收，专用快照页、64 槽批次、有限失败、join 退出与资源回收；不加入周期清脏，fsync 错误/flush 契约保持。见物理页/VFS 模块和内存 learning。
-- [ ] 多挂载覆盖路径跨越、根和 `..`、挂载点被引用、卸载忙、跨挂载文件操作和失败回滚；设备/内存/磁盘文件各自错误保持所属 owner。
+- [x] 多挂载覆盖路径跨越、根和 `..`、挂载点被引用、卸载忙、跨挂载文件操作和失败交接；设备/内存/磁盘错误保持所属 owner。真实双盘延迟/写/flush 失败隔离已独立验证。
 - [ ] eventfd/timerfd 只在真实消费者提出需求后接统一 OFD，就绪、非阻塞、poll/epoll 和退出回收一起验收；signalfd 另依赖 P2c 队列。
 
 **验证与退出**：先扩展 `tests/riscv/files_main.c` 等现有聚焦入口；当前入口为 `tests/userland/{namespace.h,metadata.h}` 与 `tests/diff-abi/{devices,namespace,metadata}.c`，均接入现有 runner。`make test-files-riscv test-vfs-riscv test-lwext4-host` → `test-userland-riscv`/`test-diff-abi-riscv`。设备、cwd、时间、统计分别解除对应真实程序阻塞，旧 ext4/pipe/epoll/COW/回收不退步；daemon 新出现的 setsid 依赖交给 P2d。
@@ -520,7 +534,7 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 
 | 取舍 / 当前证据 | 可行候选与正确性、演进、复杂度、成本 |
 |---|---|
-| P1b VFS：原 fs context 借用单根 mount、cwd 字符串；OFD 已独立 | 已选择并完成②：最小 mount+路径对象/后端操作。路径持有 mount、inode 与父链引用，ext4 字符节点按 `rdev` 分派；共享可改名目录项与普通/NOREPLACE rename 已完成；多挂载仍留后续。 |
+| P1b VFS：原 fs context 借用单根 mount、cwd 字符串；OFD 已独立 | 已选择并完成②：最小 mount+路径对象/后端操作。路径持有 mount、inode 与父链引用，ext4 字符节点按 `rdev` 分派；共享可改名目录项、普通/NOREPLACE rename、linkat、tmpfs 与独立第二盘已完成；新后端仍需独立设计。 |
 | P4a 共享匿名 | 已选择并交付②：专用对象按索引惰性发布页，保持稀疏分配并提供稳定身份；急切分配会改变 lazy/OOM 成本。共享文件页与跨 MM futex 各自继续设计。 |
 | P3b 持久化 | 用户已选择并交付逐 inode dirty/error、定向写回和真实 flush；共享事务可提交关联元数据，不主动全量写回无关文件。 |
 | P3d 恢复 | journal/replay 与持久 orphan 已启用并验收；故障模型、限制和复现命令见 VFS 模块。 |

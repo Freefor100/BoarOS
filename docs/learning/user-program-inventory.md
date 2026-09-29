@@ -148,3 +148,21 @@ SIGKILL 后 wait 得到 9，两侧回收正常。因此该辅助程序被无控�
 
 诊断环境先安装原 BusyBox applet（独立 60 秒预算），再显式提供 shell 链接；初版 5 秒安装预算
 曾造成不完整 PATH，这不是 cgroup 的产品缺口。最终复现确认 install 正常结束后才解释子项失败。
+
+## tmpfs、硬链接与第二磁盘阶段（2026-09-29）
+
+冻结实现后运行：
+
+```sh
+python3 -B tests/program-inventory/run.py --reuse-builds --output build/multimount-frozen-inventory
+```
+
+全部 228 项执行完成，227 pass、1 upstream-failure（`busybox.official`）。
+逐项状态与本阶段前一次完整清单相同，没有把“总数相同”代替逐项检查。
+原 BusyBox 包装器缺口保持单列；另增的 tmpfs BusyBox 消费者不混入这 228 项。
+
+最终 BoarOS 内核 SHA-256：`12085cbce0ac12ab7829c95d5e7d989c60c4380e00ca56ce66ce8c7630c88f58`。
+固定 Linux 内核 SHA-256：`f6451cd276925903d9cc8c489ce96d9e1c60fd9d1edb0869c86d4930d0dac394`。
+清单执行身份 SHA-256：`5e08f6fa28aba24743c11b16c03e389d40df4e0fe84c82f3f252165a1fb58efe`。
+Linux 使用 `tests/program-inventory/linux.config`；组合消费者和恢复范围见
+[内存后备对象与多挂载验收](memory-backed-mounts.md)。这是主线诊断，不是正式评分。
