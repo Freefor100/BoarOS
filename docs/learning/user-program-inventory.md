@@ -121,3 +121,30 @@ python3 tests/program-inventory/run.py --output build/p4d-full-20260925
 | `riscv/userland-run.scTdQg/static-userland.log` | stop/continue 原始失败 |
 
 所有 Linux 源码结论均指本页开头的固定 commit。运行产物不纳入 Git；缺失旧目录时不得把文字记录当作本轮重跑结果。
+
+## 内存消费者与 LTP 等待独立诊断（2026-09-29）
+
+`python3 -B tests/program-inventory/run.py --reuse-builds --output build/writeback-final-inventory`
+重新遍历全部 228 项，227 pass、1 upstream-failure，与原包装器缺口一致。
+最终内核 SHA-256 为 `705f062ec1c99223b2672d7c321b813d98cabcaa4b8dedcd47a0c4cb85f21066`，
+清单执行身份 SHA-256 为 `a8c8ea57bd7440c80e7c0fc92a509dea18b88a617a614ed2330904bfe77b5b85`。
+原镜像诊断命令和输入 SHA-256 见[时间定位](file-timestamps.md#原-rv-镜像-utime-的独立定位2026-09-29)，
+不合并成正式成绩。原 BusyBox free 输出例如 total=523116、free=520232、buff/cache=328、
+available=509776 KiB；这来自真实 meminfo/sysinfo，退出零并非唯一验收条件。
+原 LTP abort01 越过 Cached 查询后首次停在
+`tst_tmpdir.c:287: chown(/tmp/LTP_...,-1,0) failed: ENOSYS (38)`，wait 状态为 512（exit 2）。
+
+原 `/glibc/ltp_testcode.sh` 遍历 bin 中每个普通文件并无参数执行。隔离运行
+`/bin/sh /glibc/ltp/testcases/bin/cgroup_fj_function.sh` 两侧 exit 6，缺少 subsystem 参数；
+BoarOS 还明确报 setpgid ENOSYS。另传 cpuset 时两侧 exit 32，BoarOS 首个能力阻塞为
+`Kernel does not support control groups`。进程组与控制器能力分别归后续阶段。
+
+`cgroup_fj_proc` SHA-256 为
+`f6894edfc176874ef0a9d7c395fae49473967c3977edd29023dc34a284ab8570`。
+`objdump -d --disassemble=main` 的 0x880–0x8a0 注册 SIGUSR1 handler 后进入 sigsuspend；
+随后才开始 fork/wait 循环。无参数独立运行在 Linux 和 BoarOS 均耗尽 3 秒诊断预算，
+SIGKILL 后 wait 得到 9，两侧回收正常。因此该辅助程序被无控制器/信号驱动的总 runner
+单独执行会消耗剩余预算；此次未复现内核 wait 死锁。不能据此声称完整 cgroup 或所有信号路径已兼容。
+
+诊断环境先安装原 BusyBox applet（独立 60 秒预算），再显式提供 shell 链接；初版 5 秒安装预算
+曾造成不完整 PATH，这不是 cgroup 的产品缺口。最终复现确认 install 正常结束后才解释子项失败。

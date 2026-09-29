@@ -2,6 +2,7 @@
 """Recover SQLite rollback transactions from NBD's stable image."""
 
 import argparse
+from datetime import datetime, timedelta
 import hashlib
 import json
 import os
@@ -53,10 +54,15 @@ def set_control(image, block, value):
 
 
 def qemu_command(args, image, socket=None, linux=False):
+    # 每次重启的 RTC 明确晚于前一轮 inode 时间，避免宿主时间成为隐式 fixture 输入。
+    boot = getattr(args, "rtc_boot", 0)
+    args.rtc_boot = boot + 1
+    rtc = datetime(2030, 1, 1) + timedelta(hours=boot)
     drive = (f"nbd:unix:{socket}" if socket else str(image))
     result = [args.qemu, "-machine", "virt", "-bios", "default",
             "-kernel", str(args.linux_kernel if linux else args.kernel),
             "-m", "512M", "-smp", "1",
+            "-rtc", f"base={rtc.isoformat()},clock=vm",
             "-nographic", "-no-reboot", "-drive",
             f"file={drive},if=none,format=raw,readonly=off,id=root,cache=writeback",
             "-device", "virtio-blk-device,drive=root,bus=virtio-mmio-bus.0"]
@@ -223,6 +229,8 @@ def main():
             "sqlite_archive_sha256": sha256(ROOT /
                 "references/sqlite/sqlite-amalgamation-3530400.zip"),
             "journal": args.journal,
+            "rtc": {"start": "2030-01-01T00:00:00", "step_hours": 1, "clock": "vm"},
+            "runner_sha256": sha256(Path(__file__)),
             "rebuild": ("make test-sqlite-wal-recovery-matrix-riscv"
                         if args.journal == "wal" and args.matrix else
                         "make test-sqlite-wal-recovery-riscv"

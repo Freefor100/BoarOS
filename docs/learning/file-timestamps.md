@@ -76,3 +76,40 @@ relatime 相等/抑制/满 24 小时、负 epoch、2038/2106 边界、上限截�
 Linux `current_time()` 可以取 coarse clock，所以操作区间在一次 50ms 等待前开始，
 比较实际变更字段是否落在完整区间内，以及字段相等/relatime 条件是否一致。
 显式 utimensat 差分另保留请求值、NOW/OMIT、纳秒、范围端点、fd/dirfd/nofollow、坏指针与错误优先级。当前未覆盖 mmap 本身的 atime、noatime/lazytime 可配置挂载或 SMP 时间更新锁。
+
+## 原 RV 镜像 utime 的独立定位（2026-09-29）
+
+输入为 `references/oscomp-autotest/sdcard-rv.img`，SHA-256
+`f419468678d342133546add2f8459ea09aeba987ba968e28753d6ee656996b8b`；
+`/glibc/entry-static.exe` 为 `f140123cee82e5a0a1fc48ef9d845f24be920dfac9a07e5bd31ead053d3657ef`，
+`/glibc/entry-dynamic.exe` 为 `3829971b811d2b0ab5246e3697b1d1344e65b513a16160d5242817961fbfb6a0`。
+诊断内核 SHA-256 为 `d6aa60f1c09ff3d6cd7192453b7afe4dca968a37bdc75b6d7f3244bb05c34516`。
+未修改这些 ELF。主线 uname 使旧 libc 在测试前报 kernel too old，因此诊断 runner 在 build 内
+仅替换 uname 为 4.15.0 后隔离链接；主线源码默认值与评测分支均未改变。这不是正式评分。
+
+```sh
+make all
+python3 -B tests/runtime-diagnostics.py --output build/runtime-diagnostics --compat-release 4.15.0
+```
+
+runner 用相同原 ELF 在固定 Linux 和 BoarOS 各运行静态/动态 30 次，另构建两种时间记录探针：
+musl 驱动与链接原镜像 libc 的 `tests/workloads/diagnostics/time.c`，记录 time、coarse clock、
+realtime、UTIME_NOW 和 fstat。一次最终运行 Linux 为 30/30、30/30；BoarOS 为 13/30、14/30，
+失败率随栈内容和秒边界改变，不作为固定性能或评分指标。直接 realtime→NOW→fstat 八轮均正常，
+含一次 before=1790656006.996207100、atime=1790656006.996246800、after=1790656007.014658500。
+
+原 libc `/glibc/lib/libc.so.6` SHA-256
+`81af558241962fadf1d0199171be78dd2bb1e45098b8f7f786b22881b7bab33c` 的
+`riscv64-linux-gnu-objdump -d --disassemble=time` 在 `0x85a46` 设置 clockid=5，
+调用 clock_gettime 后不检查错误就读取栈上的 seconds。BoarOS 最小失败为
+`clock_gettime(CLOCK_REALTIME_COARSE, &ts) = -1, errno=EINVAL`；原 libc 探针 time 也留下
+errno=22。根因归时间 ABI 缺少 coarse clock，不是已经实现的 UTIME_NOW 元数据时间倒退。
+当前只支持 realtime/monotonic 的契约保持不变；后续以真实 coarse 时钟来源与 getres 一起补齐，
+不能为这个程序特殊改 time 值。
+
+固定 Linux 的精简 syscall 配置未启用 POSIX_TIMERS，raw/musl coarse 调用也返回 EINVAL；
+原 glibc 经 Linux vDSO 成功，独立原 libc 探针 coarse_rc=0、time errno=0。
+这一区别由原 ELF 反汇编、双侧探针及 `references/linux/kernel/time/posix-stubs.c`、
+`lib/vdso/gettimeofday.c`（固定 commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`）共同解释，
+不能把 raw syscall 与 libc/vDSO 证据混为一谈。runner 的 JSON 记录原文件、探针、内核哈希和完整命令，
+这些可重建运行产物按 build 清理规则删除。
