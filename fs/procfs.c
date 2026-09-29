@@ -565,11 +565,11 @@ static size_t decimal(char *buffer, uint64_t value)
     return length;
 }
 
-static size_t append_kib(char *buffer, const char *label, uint64_t pages)
+static size_t append_kib(char *buffer, const char *label, uint64_t bytes)
 {
     size_t length = strlen(label);
     memcpy(buffer, label, length);
-    length += decimal(buffer + length, pages * (BOAROS_PAGE_SIZE / 1024U));
+    length += decimal(buffer + length, bytes / 1024U);
     memcpy(buffer + length, " kB\n", 4U);
     return length + 4U;
 }
@@ -866,17 +866,25 @@ static int proc_snapshot(struct kernel_vfs_node *node, struct kernel_heap *heap,
     if (node->inode != PROC_MEMINFO_INODE &&
         node->inode != PROC_UPTIME_INODE) return -KERNEL_EINVAL;
     char *data = 0;
-    enum kernel_heap_status status = kernel_heap_allocate(heap, 128U,
+    enum kernel_heap_status status = kernel_heap_allocate(heap, 512U,
                                                            (void **)&data);
     if (status != KERNEL_HEAP_STATUS_OK)
         return status == KERNEL_HEAP_STATUS_EMPTY ? -KERNEL_ENOMEM : -KERNEL_EIO;
     size_t used = 0U;
     if (node->inode == PROC_MEMINFO_INODE) {
-        struct physical_page_allocator *allocator = heap->page_allocator;
-        used = append_kib(data, "MemTotal:       ",
-                          physical_page_total(allocator));
-        used += append_kib(data + used, "MemFree:        ",
-                           physical_page_available(allocator));
+        struct kernel_memory_statistics memory;
+        uintptr_t irq = riscv_interrupt_save();
+        kernel_memory_snapshot(heap->page_allocator, &memory);
+        riscv_interrupt_restore(irq);
+        const char *names[] = {"MemTotal:       ", "MemFree:        ",
+            "MemAvailable:   ", "Buffers:        ", "Cached:         ",
+            "Shmem:          ", "Dirty:          ", "Writeback:      ",
+            "SReclaimable:   ", "SwapTotal:      ", "SwapFree:       "};
+        uint64_t bytes[] = {memory.total, memory.free, memory.available,
+            memory.buffers, memory.cached, memory.shared, memory.dirty,
+            memory.writeback, 0, 0, 0};
+        for (unsigned i = 0; i < sizeof(bytes) / sizeof(bytes[0]); i++)
+            used += append_kib(data + used, names[i], bytes[i]);
     } else {
         uint64_t uptime = kernel_time_monotonic_ns() / 10000000U;
         uint64_t idle_ticks = kernel_scheduler_idle_ticks();

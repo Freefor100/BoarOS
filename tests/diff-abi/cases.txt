@@ -594,6 +594,10 @@ proc.mount
 proc.root-list
 proc.root-eof
 proc.meminfo-open
+proc.memory-fields
+sysinfo.shape
+sysinfo.fault
+proc.fd-reuse-stress
 proc.meminfo-write-open
 proc.meminfo-write
 proc.uptime-open

@@ -52,13 +52,13 @@ enum kernel_syscall_status kernel_syscall_dispatch(
 - `munmap` 编号为 215，要求页对齐起点和非零长度，长度向上按 4 KiB 对齐；范围包含未映射洞仍成功。越界或未对齐返回 `-EINVAL`。
 - `clone` 编号为 220。支持 SIGCHLD fork/vfork 和 VM/FS/FILES/SIGHAND/THREAD 共享线程形态；进程形态接受 CHILD_SETTID、CHILD_CLEARTID 及 CLONE_FS，线程形态接受 SETTLS、PARENT_SETTID、CHILD_SETTID、CHILD_CLEARTID、SYSVSEM、DETACHED 位。RISC-V 参数顺序为 flags/stack/parent_tid/tls/child_tid。非法 flag 依赖返回 EINVAL，未支持的合法资源组合返回 ENOTSUP；资源、vfork 致命取消、发布和回滚契约见[调度模块](kernel-scheduler.md)。
 - `execve` 编号为 221，准备并提交 RISC-V `ET_EXEC`/`ET_DYN` 映像及非递归 `PT_INTERP` source；成功不返回，失败返回负 Linux errno。路径、解释器、提交点和资源保持规则见[进程映像替换模块](kernel-exec.md)。
-- `mmap` 编号为 222，当前接受 anonymous 或可读普通文件的 `MAP_PRIVATE`，以及任意 `PROT_NONE/R/W/X` 组合。普通 hint、`MAP_FIXED`、`MAP_FIXED_NOREPLACE`、`MAP_STACK` 和 `MAP_NORESERVE` 已实现；fixed-noreplace 冲突返回 `-EEXIST`，地址空间/metadata 不足返回 `-ENOMEM`。文件映射要求有效且非 `O_WRONLY` 的 fd 与页对齐 offset；零长度、非法 fixed 地址、offset 溢出与 fixed-noreplace 冲突在可读性检查前返回各自错误，不可读 OFD 才返回 `-EACCES`。两类拒绝都会释放 syscall 临时 pin 且不提交 VMA。成功后由 MM 独立持有 OFD，所以 close fd 不撤销映射；shared 和 `MAP_POPULATE` 返回 `-ENOTSUP`，未知 flag、未对齐 offset 或同时指定两种 fixed 模式返回 `-EINVAL`；anonymous fd 参数按 Linux 语义忽略。
+- `mmap` 编号为 222，当前接受 anonymous 或可读普通文件的 `MAP_PRIVATE/MAP_SHARED`，以及任意 `PROT_NONE/R/W/X` 组合。普通 hint、`MAP_FIXED`、`MAP_FIXED_NOREPLACE`、`MAP_STACK` 和 `MAP_NORESERVE` 已实现；fixed-noreplace 冲突返回 `-EEXIST`，地址空间/metadata 不足返回 `-ENOMEM`。文件映射要求有效且非 `O_WRONLY` 的 fd 与页对齐 offset；零长度、非法 fixed 地址、offset 溢出与 fixed-noreplace 冲突在可读性检查前返回各自错误，不可读 OFD 才返回 `-EACCES`。两类拒绝都会释放 syscall 临时 pin 且不提交 VMA。成功后由 MM 独立持有 OFD，所以 close fd 不撤销映射；`MAP_SHARED` 文件写权限与后续 mprotect 升级受初始 OFD 权限约束，`MAP_POPULATE` 返回 `-ENOTSUP`，未知 flag、未对齐 offset 或同时指定两种 fixed 模式返回 `-EINVAL`；anonymous fd 参数按 Linux 语义忽略。
 - `mprotect` 编号为 226，要求页对齐起点，整个非空范围必须已有 VMA；洞返回 `-ENOMEM`。长度 0 成功。`PROT_NONE` 保留 resident 内容，恢复权限后内容仍在；RISC-V 仅写请求被规范化为 RW。
 - `wait4` 编号为 260，支持 Linux pid selector、`WNOHANG`、wait flag 校验与 rusage 输出；普通退出与同步故障产生 Linux 形态 status。无匹配子进程返回 `-ECHILD`，非法 option 返回 `-EINVAL`，status/rusage 用户指针错误返回 `-EFAULT`（回收先行，子进程不可再次 wait）。
 - `prlimit64` 编号为 261，当前实现 `RLIMIT_NOFILE(7)` 与 `RLIMIT_STACK(3)` 的查询和设置；pid 0 指当前线程组，正 pid 指存活任务所属组。新值先从用户复制，设置和旧值快照完成后才向用户写回旧值，因此旧值地址故障仍保留已生效的设置。软值不得大于硬值；当前硬容量分别是 1024 个 fd 和 8 MiB 栈，超出拒绝。其他有效 resource 返回 `-ENOTSUP`，未知 resource 返回 `-EINVAL`，不返回虚假的成功。
 - `kill`/`tkill`/`tgkill` 编号为 129/130/131，按进程、线程或 TGID+TID 发送标准信号；`rt_sigsuspend`/`rt_sigaction`/`rt_sigprocmask`/`rt_sigpending` 编号为 133/134/135/136，`rt_sigreturn` 为 139，均采用 8 字节有效 signal set。公共用户返回尾负责默认动作、handler frame、stop/continue 和已登记 syscall 类别的 `SA_RESTART`；只有接入该框架的阻塞 syscall 才会在 sigreturn 后重执行，其他调用返回自身规定的 `-EINTR`，细节见[内核信号模块](kernel-signal.md)。
 - `restart_syscall` 编号为 128，当前用于 nanosleep 和带超时 FUTEX_WAIT 的绝对 deadline 重启；它不是可由用户任意伪造的通用成功存根。
-- RISC-V 使用 asm-generic syscall 编号，没有独立 dup2；musl 经 dup3 实现相应调用。编号 33 是尚未实现的 mknodat，返回 ENOSYS，不能分派为 fd 替换。
+- RISC-V 使用 asm-generic syscall 编号，没有独立 dup2；musl 经 dup3 实现相应调用。编号 33 是 mknodat，支持普通文件与字符节点创建，不能分派为 fd 替换。
 - `times` 编号为 153，填写可选的 32 字节 `tms`（`utime/stime/cutime/cstime`，单位为 scheduler tick，`CLK_TCK`=100）并返回自启动的 uptime tick 数；tms 为 NULL 时只返回 uptime。记账在 tick 边界记到被中断任务，idle 不记账；子进程记账在 wait 回收时回卷给父进程，孙辈随回收归并。
 - 其他编号产生 `RETURN`，返回 `-ENOSYS`（-38）。
 
@@ -76,3 +76,5 @@ enum kernel_syscall_status kernel_syscall_dispatch(
 `test-diff-abi-riscv` 保护真实 U-mode 查询及 fork/exec 继承。
 
 `mknodat(33)` 已接入普通文件和字符节点创建；支持边界与错误见[文件模块](kernel-files.md#节点创建)，不代表块设备、FIFO 或 socket 文件后端已完成。
+
+`sysinfo(179)` 使用 RV64 的 112 字节结构（编译期检查），先清零全部字段与填充。内存/共享/缓冲以字节返回且 `mem_unit=1`，无 swap/highmem 的字段为真实零；uptime 为 monotonic 秒向上取整，任务数与负载来自调度器。坏输出地址返回 `EFAULT`，查询不执行 I/O。`tests/diff-abi/proc.c` 验证字段边界和 fault，不要求两内核的 RAM 容量、启动时长和负载逐字相等。

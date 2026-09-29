@@ -302,6 +302,106 @@ static void proc_thread_cases(void)
     abi_require(SC2(215, control, 4096) == 0);
 }
 
+struct proc_stress_control { volatile int requested, finished, tid; long replacement; };
+static struct proc_stress_control stress;
+static void proc_reuse_writer(void *unused)
+{
+    (void)unused;
+    for (int i = 1; i <= 256; i++) {
+        while (__atomic_load_n(&stress.requested, __ATOMIC_ACQUIRE) != i) SC0(124);
+        abi_require(SC1(57, 300) == 0);
+        abi_require(SC3(24, stress.replacement, 300, 0) == 300);
+        __atomic_store_n(&stress.finished, i, __ATOMIC_RELEASE);
+    }
+}
+
+static void proc_reuse_stress(void)
+{
+    long a = abi_open("/proc-stress-a", 2 | 64 | 512);
+    long b = abi_open("/proc-stress-b", 2 | 64 | 512);
+    abi_require(a >= 0 && b >= 0 && SC3(64, a, "A", 1) == 1 && SC3(64, b, "B", 1) == 1);
+    stress = (struct proc_stress_control){.replacement = b, .tid = 7};
+    abi_require(abi_clone_entry(PROC_CLONE_THREAD | PROC_CHILD_SETTID | PROC_CHILD_CLEARTID,
+        proc_thread_stack + sizeof(proc_thread_stack), (int *)&stress.tid, proc_reuse_writer, 0) > 0);
+    for (int i = 1; i <= 256; i++) {
+        int pipefd[2] = {-1, -1};
+        if (i & 1) {
+            abi_require(SC3(24, a, 300, 0) == 300);
+        } else {
+            abi_require(SC2(59, pipefd, 0) == 0 && SC3(64, pipefd[1], "P", 1) == 1);
+            abi_require(SC3(24, pipefd[0], 300, 0) == 300 && SC1(57, pipefd[0]) == 0);
+        }
+        long held = abi_open("/proc-probe/self/fd/300", 0);
+        abi_require(held >= 0);
+        __atomic_store_n(&stress.requested, i, __ATOMIC_RELEASE);
+        char link[64];
+        long n = SC4(78, -100, "/proc-probe/self/fd/300", link, sizeof(link));
+        abi_require(n > 0 || n == -2);
+        long directory = abi_open("/proc-probe/self/fd", 65536);
+        abi_require(directory >= 0 && proc_directory_finish(directory) == 0 && SC1(57, directory) == 0);
+        while (__atomic_load_n(&stress.finished, __ATOMIC_ACQUIRE) != i) SC0(124);
+        char byte = 0;
+        abi_require(SC3(63, held, &byte, 1) == 1 && byte == ((i & 1) ? 'A' : 'P'));
+        if (i & 1) abi_require(SC3(62, a, 0, 1) == 1);
+        abi_require(SC1(57, held) == 0);
+        if (!(i & 1)) abi_require(SC1(57, pipefd[1]) == 0);
+        long fresh = abi_open("/proc-probe/self/fd/300", 0);
+        abi_require(fresh >= 0 && SC3(63, fresh, &byte, 1) == 1 && byte == 'B');
+        abi_require(SC1(57, fresh) == 0);
+    }
+    while (__atomic_load_n(&stress.tid, __ATOMIC_ACQUIRE)) SC0(124);
+    abi_require(SC1(57, 300) == 0 && SC1(57, a) == 0 && SC1(57, b) == 0);
+    abi_record("proc.fd-reuse-stress", 0, -1, -1, 0, 0, 0);
+}
+
+/* Catch missing/fictional memory fields without comparing host capacities. */
+static unsigned long memory_field(const char *text, long length, const char *key)
+{
+    for (long i = 0; i < length; i++) {
+        if (i && text[i - 1] != '\n') continue;
+        unsigned j = 0;
+        while (key[j] && i + j < length && text[i + j] == key[j]) j++;
+        if (key[j]) continue;
+        long k = i + j;
+        while (k < length && (text[k] == ' ' || text[k] == '\t')) k++;
+        if (k == length || text[k] < '0' || text[k] > '9') return ~0UL;
+        unsigned long value = 0;
+        while (k < length && text[k] >= '0' && text[k] <= '9')
+            value = value * 10 + text[k++] - '0';
+        return value;
+    }
+    return ~0UL;
+}
+
+static void proc_memory_cases(long fd)
+{
+    static char text[4096];
+    long n = SC3(63, fd, text, sizeof(text));
+    const char *keys[] = {"MemTotal:", "MemFree:", "MemAvailable:", "Cached:",
+        "Buffers:", "Shmem:", "Dirty:", "Writeback:", "SReclaimable:"};
+    int valid = n > 0;
+    unsigned long total = memory_field(text, n, keys[0]);
+    for (unsigned i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
+        unsigned long value = memory_field(text, n, keys[i]);
+        if (value == ~0UL || value > total) valid = 0;
+    }
+    abi_record("proc.memory-fields", valid && total ? 0 : -1, -1, -1, 0, 0, 0);
+    abi_require(SC3(62, fd, 0, 0) == 0);
+    struct {
+        long uptime;
+        unsigned long loads[3], totalram, freeram, sharedram, bufferram;
+        unsigned long totalswap, freeswap;
+        unsigned short procs, pad;
+        unsigned long totalhigh, freehigh;
+        unsigned mem_unit;
+    } info = {0};
+    long result = SC1(179, &info);
+    abi_record("sysinfo.shape", result == 0 && info.totalram > 0 &&
+        info.freeram <= info.totalram && info.mem_unit && info.procs &&
+        info.uptime >= 0 ? 0 : -1, -1, -1, 0, 0, 0);
+    abi_record("sysinfo.fault", SC1(179, 1), -1, -1, 0, 0, 0);
+}
+
 /* Missing mount dispatch must not masquerade as a procfs consumer failure. */
 void abi_proc_cases(void)
 {
@@ -317,6 +417,8 @@ void abi_proc_cases(void)
     if (root_directory >= 0) abi_require(SC1(57, root_directory) == 0);
     long fd = abi_open("/proc-probe/meminfo", 0);
     abi_record("proc.meminfo-open", fd < 0 ? fd : 0, -1, -1, 0, 0, 0);
+    proc_memory_cases(fd);
+    proc_reuse_stress();
     long writable = abi_open("/proc-probe/meminfo", 1);
     abi_record("proc.meminfo-write-open", writable < 0 ? writable : 0,
                -1, -1, 0, 0, 0);
