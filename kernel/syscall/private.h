@@ -325,4 +325,8 @@ enum kernel_syscall_status syscall_handle_epoll_pwait(
     const struct kernel_syscall_request *request,
     struct kernel_syscall_result *decoded);
 
+enum kernel_syscall_status syscall_handle_getrandom(
+    struct kernel_task *caller, const struct kernel_syscall_request *request,
+    struct kernel_syscall_result *decoded);
+
 #endif

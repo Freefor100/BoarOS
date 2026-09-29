@@ -155,6 +155,8 @@ def execute(programs, library, inputs, linux, kernel, qemu):
                 target_disk = case / f"{target}.img"
                 shutil.copyfile(disk, target_disk)
                 command = [qemu, "-machine", "virt", "-bios", "default",
+                       "-object", "rng-random,id=entropy,filename=/dev/urandom",
+                       "-device", "virtio-rng-device,rng=entropy,bus=virtio-mmio-bus.7",
                            "-kernel", str(image), "-m", "512M", "-smp", "1",
                            "-nographic", "-no-reboot", "-drive",
                            f"file={target_disk},if=none,format=raw,id=root",

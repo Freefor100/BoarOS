@@ -486,6 +486,10 @@ enum kernel_open_file_kind kernel_open_file_kind(
         return KERNEL_OPEN_FILE_KIND_SOCKET;
     case KERNEL_OPEN_FILE_KIND_GENERATED:
         return KERNEL_OPEN_FILE_KIND_GENERATED;
+    case KERNEL_OPEN_FILE_KIND_RANDOM:
+        return KERNEL_OPEN_FILE_KIND_RANDOM;
+    case KERNEL_OPEN_FILE_KIND_URANDOM:
+        return KERNEL_OPEN_FILE_KIND_URANDOM;
     default:
         return KERNEL_OPEN_FILE_KIND_REGULAR;
     }
@@ -502,6 +506,7 @@ int kernel_open_file_supports_epoll(
     case KERNEL_OPEN_FILE_KIND_CONSOLE:
     case KERNEL_OPEN_FILE_KIND_EPOLL:
     case KERNEL_OPEN_FILE_KIND_SOCKET:
+    case KERNEL_OPEN_FILE_KIND_RANDOM:
         return 1;
     default:
         return 0;
@@ -692,6 +697,8 @@ int kernel_open_file_readable(
     case KERNEL_OPEN_FILE_KIND_DIRECTORY:
     case KERNEL_OPEN_FILE_KIND_NULL:
     case KERNEL_OPEN_FILE_KIND_ZERO:
+    case KERNEL_OPEN_FILE_KIND_RANDOM:
+    case KERNEL_OPEN_FILE_KIND_URANDOM:
         return access_mode == 0U || access_mode == 2U;
     case KERNEL_OPEN_FILE_KIND_PIPE:
         return access_mode == 0U || access_mode == 2U;

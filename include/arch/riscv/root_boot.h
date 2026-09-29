@@ -3,6 +3,7 @@
 
 #include <arch/riscv/sv39.h>
 #include <arch/riscv/virtio_mmio_block.h>
+#include <arch/riscv/virtio_mmio_rng.h>
 #include <kernel/dtb.h>
 #include <kernel/elf64_source.h>
 #include <kernel/exec_image.h>
@@ -52,9 +53,11 @@ enum riscv_root_finish_failure {
     RISCV_ROOT_FINISH_DEVICE = 1U << 4,
     RISCV_ROOT_FINISH_HEAP_BASELINE = 1U << 5,
     RISCV_ROOT_FINISH_PAGE_BASELINE = 1U << 6,
+    RISCV_ROOT_FINISH_RNG = 1U << 7,
 };
 
 struct riscv_root_boot {
+    struct riscv_virtio_mmio_rng rng;
     struct kernel_heap heap;
     struct kernel_page_cache page_cache;
     struct riscv_virtio_mmio_block device;
@@ -79,6 +82,11 @@ struct riscv_root_boot {
 
 struct riscv_virtio_mmio_block *riscv_root_boot_device(
     struct riscv_root_boot *root, uint32_t index);
+
+/* Call after PID 1 creation and PLIC initialization. Optional device failures
+ * return success only when all DMA ownership was reclaimed. */
+int riscv_root_boot_start_rng(struct riscv_root_boot *root,
+    const struct dtb_boot_info *info, const struct dtb_irq_info *irq);
 
 /* Scheduler initialization must precede this call. */
 enum riscv_root_boot_status riscv_root_boot_start(

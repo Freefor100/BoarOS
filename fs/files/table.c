@@ -22,16 +22,24 @@
 #define LINUX_O_CLOEXEC UINT64_C(02000000)
 
 enum kernel_files_status kernel_files_ioctl(
-    struct kernel_files *files, int64_t fd,
+    struct kernel_files *files, struct kernel_mm *mm, int64_t fd,
     uint64_t command, uint64_t argument, int64_t *linux_result)
 {
-    (void)command;
-    (void)argument;
-    if (!kernel_files_is_live(files) || linux_result == 0)
+    struct kernel_open_file_description *description = 0;
+    if (!kernel_files_is_live(files) || !linux_result)
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
-    *linux_result = kernel_files_lookup_description(files, fd) == 0
-                        ? -KERNEL_EBADF : -KERNEL_ENOTTY;
-    return KERNEL_FILES_STATUS_OK;
+    enum kernel_files_status status = kernel_files_pin(files, fd, &description,
+                                                       linux_result);
+    if (status != KERNEL_FILES_STATUS_OK || *linux_result) return status;
+    *linux_result = description->device && description->device->ioctl
+        ? description->device->ioctl(mm, command, argument) : -KERNEL_ENOTTY;
+    enum kernel_open_file_status release = kernel_open_file_release(&description);
+    if (release == KERNEL_OPEN_FILE_STATUS_CLEANUP_REQUIRED && description) {
+        kernel_files_queue_description(files, description);
+        return KERNEL_FILES_STATUS_OK;
+    }
+    return release == KERNEL_OPEN_FILE_STATUS_OK ? KERNEL_FILES_STATUS_OK
+                                                : KERNEL_FILES_STATUS_STATE;
 }
 
 static int empty_files(const struct kernel_files *files)

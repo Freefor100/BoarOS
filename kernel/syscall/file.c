@@ -809,8 +809,8 @@ enum kernel_syscall_status syscall_handle_ioctl(
         decoded->value = linux_result;
         return KERNEL_SYSCALL_STATUS_OK;
     }
-    if (
-        kernel_files_ioctl(files, (int64_t)request->arguments[0],
+    if (kernel_task_mm_borrow_mutable(caller, &mm) != KERNEL_TASK_STATUS_OK ||
+        kernel_files_ioctl(files, mm, (int64_t)request->arguments[0],
                            request->arguments[1], request->arguments[2],
                            &linux_result) != KERNEL_FILES_STATUS_OK)
         return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;

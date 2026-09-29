@@ -78,3 +78,7 @@ enum kernel_syscall_status kernel_syscall_dispatch(
 `mknodat(33)` 已接入普通文件和字符节点创建；支持边界与错误见[文件模块](kernel-files.md#节点创建)，不代表块设备、FIFO 或 socket 文件后端已完成。
 
 `sysinfo(179)` 使用 RV64 的 112 字节结构（编译期检查），先清零全部字段与填充。内存/共享/缓冲以字节返回且 `mem_unit=1`，无 swap/highmem 的字段为真实零；uptime 为 monotonic 秒向上取整，任务数与负载来自调度器。坏输出地址返回 `EFAULT`，查询不执行 I/O。`tests/diff-abi/proc.c` 验证字段边界和 fault，不要求两内核的 RAM 容量、启动时长和负载逐字相等。
+
+### 随机接口
+
+`getrandom(278)` 支持 GRND_NONBLOCK、GRND_RANDOM、GRND_INSECURE；未知标志或 RANDOM 与 INSECURE 同用返回 EINVAL。普通请求在可信 RNG 未就绪时等待，NONBLOCK 返回 EAGAIN，等待被信号打断按 SA_RESTART 选择重新等待或返回 EINTR；INSECURE 明确允许初始化前输出。长度最多 `0x7ffff000`，不在持有随机状态锁时执行用户复制。就绪后的 256 字节以内请求不因 pending signal 短返回；大请求按 256 字节分段，返回已复制进度，跨用户不可访问页同样保留已复制字节，首字节 fault 返回 EFAULT。核心与设备契约见[随机源](../learning/random-source.md)。

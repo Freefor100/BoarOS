@@ -137,6 +137,7 @@ C_SOURCES := \
 	arch/riscv/virt_rtc.c \
 	arch/riscv/virt_uart.c \
 	arch/riscv/virtio_mmio_block.c \
+	arch/riscv/virtio_mmio_rng.c \
 	arch/riscv/plic.c \
 	fs/lwext4_port.c \
 	fs/files/table.c \
@@ -170,6 +171,7 @@ C_SOURCES := \
 	kernel/physical_page.c \
 	kernel/read_source.c \
 	kernel/random.c \
+	kernel/blake2s.c \
 	kernel/sched/core.c \
 	kernel/sched/exec.c \
 	kernel/sched/process.c \
@@ -186,6 +188,7 @@ C_SOURCES := \
 	kernel/syscall/signal.c \
 	kernel/syscall/socket.c \
 	kernel/syscall/time.c \
+	kernel/syscall/random.c \
 	arch/riscv/signal.c \
 	kernel/tick.c \
 	kernel/time.c \
@@ -220,6 +223,7 @@ TEST_RUNTIME_C_SOURCES := \
 	arch/riscv/virt_rtc.c \
 	arch/riscv/virt_uart.c \
 	arch/riscv/virtio_mmio_block.c \
+	arch/riscv/virtio_mmio_rng.c \
 	arch/riscv/plic.c \
 	fs/files/table.c \
 	fs/files/locks.c \
@@ -250,6 +254,7 @@ TEST_RUNTIME_C_SOURCES := \
 	kernel/physical_page.c \
 	kernel/read_source.c \
 	kernel/random.c \
+	kernel/blake2s.c \
 	kernel/sched/core.c \
 	kernel/sched/exec.c \
 	kernel/sched/process.c \
@@ -266,6 +271,7 @@ TEST_RUNTIME_C_SOURCES := \
 	kernel/syscall/signal.c \
 	kernel/syscall/socket.c \
 	kernel/syscall/time.c \
+	kernel/syscall/random.c \
 	arch/riscv/signal.c \
 	kernel/tick.c \
 	kernel/time.c \
@@ -1466,8 +1472,26 @@ test-multi-disk-io-riscv: $(KERNEL_RV) $(MULTI_DISK_IO_RV) build/host/nbd-fault
 	PYTHONDONTWRITEBYTECODE=1 python3 tests/multi-disk-io-riscv.py \
 		--kernel $(KERNEL_RV) --program $(MULTI_DISK_IO_RV) --qemu $(QEMU_RISCV64)
 
-.PHONY: test-pid-object-host
+.PHONY: test-pid-object-host test-random-host
 test-pid-object-host:
 	@mkdir -p build/host
 	cc -std=c11 -Wall -Wextra -Werror -Iinclude tests/pid-object-host.c kernel/pid.c -o build/host/pid-object-test
 	build/host/pid-object-test
+
+test-random-host:
+	PYTHONDONTWRITEBYTECODE=1 python3 tests/host/random_vectors.py
+
+RNG_USER_RV := $(BUILD_DIR)/tests/user/rng-rv
+$(RNG_USER_RV): tests/userland/rng.c $(MUSL_STAMP)
+	@mkdir -p $(@D)
+	$(MUSL_ROOT)/bin/musl-gcc $(MUSL_GCC_FLAGS) -static -O2 -Wall -Wextra -Werror -o $@ $<
+
+.PHONY: test-rng-riscv test-virtio-rng-host
+test-rng-riscv: $(KERNEL_RV) $(RNG_USER_RV)
+	python3 -B tests/rng-riscv.py --kernel $(KERNEL_RV) --program $(RNG_USER_RV) --qemu $(QEMU_RISCV64)
+
+test-virtio-rng-host:
+	@mkdir -p build/host
+	cc -std=c11 -Wall -Wextra -Werror -Itests/host/random -Iinclude \
+		tests/host/virtio_rng_test.c arch/riscv/virtio_mmio_rng.c -o build/host/virtio-rng
+	build/host/virtio-rng

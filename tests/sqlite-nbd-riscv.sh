@@ -21,6 +21,8 @@ done
 [ -S "$work/root.sock" ]
 if ! timeout -k 2s 90s "$qemu" -machine virt -bios default -kernel "$kernel" \
     -m 512M -smp 1 -nographic -no-reboot \
+    -object rng-random,id=entropy,filename=/dev/urandom \
+    -device virtio-rng-device,rng=entropy,bus=virtio-mmio-bus.7 \
     -drive file="nbd:unix:$work/root.sock",if=none,format=raw,readonly=off,id=root,cache=writeback \
     -device virtio-blk-device,drive=root,bus=virtio-mmio-bus.0 \
     </dev/null >"$work/boot.log" 2>&1; then

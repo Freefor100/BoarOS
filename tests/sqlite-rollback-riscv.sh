@@ -16,6 +16,8 @@ debugfs -w -R "write $program /init" "$work/root.img" >/dev/null 2>&1
 debugfs -w -R 'set_inode_field /init mode 0100755' "$work/root.img" >/dev/null 2>&1
 if ! timeout -k 2s 60s "$qemu" -machine virt -bios default -kernel "$kernel" \
     -m 512M -smp 1 -nographic -no-reboot \
+    -object rng-random,id=entropy,filename=/dev/urandom \
+    -device virtio-rng-device,rng=entropy,bus=virtio-mmio-bus.7 \
     -drive file="$work/root.img",if=none,format=raw,readonly=off,id=root \
     -device virtio-blk-device,drive=root,bus=virtio-mmio-bus.0 \
     </dev/null >"$work/boot.log" 2>&1; then
@@ -41,6 +43,8 @@ debugfs -w -R 'mkdir /lib' "$work/root.img" >/dev/null 2>&1
 debugfs -w -R "write $ldso /lib/ld-musl-riscv64.so.1" "$work/root.img" >/dev/null 2>&1
 if ! timeout -k 2s 60s "$qemu" -machine virt -bios default -kernel "$kernel" \
     -m 512M -smp 1 -nographic -no-reboot \
+    -object rng-random,id=entropy,filename=/dev/urandom \
+    -device virtio-rng-device,rng=entropy,bus=virtio-mmio-bus.7 \
     -drive file="$work/root.img",if=none,format=raw,readonly=off,id=root \
     -device virtio-blk-device,drive=root,bus=virtio-mmio-bus.0 \
     </dev/null >"$work/cli.log" 2>&1; then

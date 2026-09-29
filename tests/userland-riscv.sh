@@ -65,6 +65,8 @@ if ! { sleep 4; printf 'go\n'; } | timeout -k 2s 30s "$qemu" \
     -smp 1 \
     -nographic \
     -no-reboot \
+    -object rng-random,id=entropy,filename=/dev/urandom \
+    -device virtio-rng-device,rng=entropy,bus=virtio-mmio-bus.7 \
     -drive file="$static_disk",if=none,format=raw,readonly=off,id=root \
     -device virtio-blk-device,drive=root,bus=virtio-mmio-bus.0 \
     >"$static_output" 2>&1; then
@@ -134,6 +136,8 @@ if ! timeout -k 2s 30s "$qemu" \
     -smp 1 \
     -nographic \
     -no-reboot \
+    -object rng-random,id=entropy,filename=/dev/urandom \
+    -device virtio-rng-device,rng=entropy,bus=virtio-mmio-bus.7 \
     -drive file="$pthread_disk",if=none,format=raw,readonly=on,id=root \
     -device virtio-blk-device,drive=root,bus=virtio-mmio-bus.0 \
     </dev/null >"$pthread_output" 2>&1; then

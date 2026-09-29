@@ -37,6 +37,8 @@ run_boot()
     debugfs -w -R "write $work_dir/root-value /identity" "$root_disk" >/dev/null 2>&1
     if ! timeout -k 2s 45s "$qemu" -machine virt -bios default -kernel "$kernel" \
         -m "$memory" -smp 1 -nographic -no-reboot \
+    -object rng-random,id=entropy,filename=/dev/urandom \
+    -device virtio-rng-device,rng=entropy,bus=virtio-mmio-bus.7 \
         -global "virtio-mmio.force-legacy=$mode" \
         -drive "file=$root_disk,if=none,format=raw,id=root" \
         -device virtio-blk-device,drive=root,bus=virtio-mmio-bus.0 \

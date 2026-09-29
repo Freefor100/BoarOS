@@ -21,6 +21,8 @@ def sha256(path):
 
 def boot(qemu, kernel, disk, output, linux, marker, second=None):
     command = [qemu, "-machine", "virt", "-bios", "default",
+                       "-object", "rng-random,id=entropy,filename=/dev/urandom",
+                       "-device", "virtio-rng-device,rng=entropy,bus=virtio-mmio-bus.7",
                "-kernel", str(kernel), "-m", "512M", "-smp", "1",
                "-nographic", "-no-reboot",
                "-drive", f"file={disk},if=none,format=raw,id=root",

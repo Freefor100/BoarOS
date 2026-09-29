@@ -411,7 +411,9 @@ def run_suite(manifest, output_dir, driver_elf, linux_kernel, boaros_kernel, *,
             for name, kernel in kernels.items():
                 disk = directory / (name + '.img')
                 sparse_copy(fixture, disk)
-                argv = [qemu, '-machine', 'virt', '-bios', 'default', '-kernel', kernel,
+                argv = [qemu, '-machine', 'virt', '-bios', 'default',
+                       '-object', 'rng-random,id=entropy,filename=/dev/urandom',
+                       '-device', 'virtio-rng-device,rng=entropy,bus=virtio-mmio-bus.7', '-kernel', kernel,
                         '-m', '512M', '-smp', '1', '-nographic', '-no-reboot',
                         '-drive', f'file={disk},if=none,format=raw,id=root',
                         '-device', 'virtio-blk-device,drive=root,bus=virtio-mmio-bus.0']

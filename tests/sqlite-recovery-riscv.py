@@ -60,6 +60,8 @@ def qemu_command(args, image, socket=None, linux=False):
     rtc = datetime(2030, 1, 1) + timedelta(hours=boot)
     drive = (f"nbd:unix:{socket}" if socket else str(image))
     result = [args.qemu, "-machine", "virt", "-bios", "default",
+                       "-object", "rng-random,id=entropy,filename=/dev/urandom",
+                       "-device", "virtio-rng-device,rng=entropy,bus=virtio-mmio-bus.7",
             "-kernel", str(args.linux_kernel if linux else args.kernel),
             "-m", "512M", "-smp", "1",
             "-rtc", f"base={rtc.isoformat()},clock=vm",

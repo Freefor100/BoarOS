@@ -404,7 +404,7 @@ enum kernel_files_status kernel_files_fcntl_lock(
     uint64_t user_flock, int64_t *linux_result);
 
 enum kernel_files_status kernel_files_ioctl(
-    struct kernel_files *files,
+    struct kernel_files *files, struct kernel_mm *mm,
     int64_t fd,
     uint64_t command,
     uint64_t argument,

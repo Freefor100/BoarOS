@@ -59,7 +59,9 @@ def run(transport, cache, fault):
                 if any(s.poll() is not None for s in servers) or time.monotonic() > deadline:
                     raise RuntimeError('NBD startup failed')
                 time.sleep(.01)
-            command = [args.qemu, '-machine', 'virt', '-bios', 'default', '-kernel', str(kernel),
+            command = [args.qemu, '-machine', 'virt', '-bios', 'default',
+                       '-object', 'rng-random,id=entropy,filename=/dev/urandom',
+                       '-device', 'virtio-rng-device,rng=entropy,bus=virtio-mmio-bus.7', '-kernel', str(kernel),
                        '-global', 'virtio-mmio.force-legacy=' + ('true' if transport == 'legacy' else 'false'),
                        '-m', '512M', '-smp', '1', '-nographic', '-no-reboot']
             for index, (name, address) in enumerate(zip(('a', 'b'), addresses)):

@@ -192,7 +192,9 @@ def run(args):
         for name, kernel in [('linux', image), ('boaros', kernel_snapshot)]:
             target = directory / (name + '.img')
             shutil.copyfile(disk, target)
-            command = [qemu, '-machine', 'virt', '-bios', 'default', '-kernel', str(kernel),
+            command = [qemu, '-machine', 'virt', '-bios', 'default',
+                       '-object', 'rng-random,id=entropy,filename=/dev/urandom',
+                       '-device', 'virtio-rng-device,rng=entropy,bus=virtio-mmio-bus.7', '-kernel', str(kernel),
                        '-m', '512M', '-smp', '1', '-nographic', '-no-reboot',
                        '-drive', f'file={target},if=none,format=raw,id=root',
                        '-device', 'virtio-blk-device,drive=root,bus=virtio-mmio-bus.0']

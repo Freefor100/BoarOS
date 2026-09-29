@@ -6,7 +6,9 @@
 
 最终 Sv39、direct map、buddy 和 scheduler 就绪后，`arch/riscv/root_boot.c` 初始化页支持内核堆并为后续 exec 绑定同一物理分配器和内核根表，按 DTB 物理地址顺序初始化并登记所有 VirtIO MMIO version 1 legacy 或 version 2 modern virtio-blk，保留首个成功初始化的设备为根盘，按设备能力以读写或只读模式挂载 raw whole-disk ext4，并通过公共 executable-open 检查打开只读构建配置指定的 ELF。文件必须是 regular 且至少有一个 execute bit；默认请求使用 `argv[0]="/init"`、`argc=1`、`AT_EXECFN="/init"` 和空环境。
 
-VFS 文件成为精确 `read_at` 源，ELF source 一次解析 RISC-V `ET_EXEC`/`ET_DYN` 的 program headers；根启动支持非递归 `PT_INTERP`，将 `PT_LOAD` 登记为专用 source-backed VMA，页面在首次取指或访问时按需物化。随机布局从 DTB `/chosen/rng-seed` 取得可信种子；缺少种子时安全降级为确定性布局并省略 `AT_RANDOM`。根启动路径再创建借用根 mount、cwd 为 `/` 的 fs context 和空文件表，与 MM 一起原子转交 scheduler task。生产系统创建的第一个用户线程组得到 TID/TGID 1；生产 main 在根对象发布后启动页缓存 worker，再启动 timer，因此任务不会在根对象尚未发布时运行。worker 构造失败仍返回启动资源错误，不伪造后台回收成功。
+VFS 文件成为精确 `read_at` 源，ELF source 一次解析 RISC-V `ET_EXEC`/`ET_DYN` 的 program headers；根启动支持非递归 `PT_INTERP`，将 `PT_LOAD` 登记为专用 source-backed VMA，页面在首次取指或访问时按需物化。随机布局从 DTB `/chosen/rng-seed` 取得不计熵的初始材料；缺少种子时安全降级为确定性布局并省略 `AT_RANDOM`。根启动路径再创建借用根 mount、cwd 为 `/` 的 fs context 和空文件表，与 MM 一起原子转交 scheduler task。生产系统创建的第一个用户线程组得到 TID/TGID 1；生产 main 在根对象发布后启动页缓存 worker，再启动 timer，因此任务不会在根对象尚未发布时运行。worker 构造失败仍返回启动资源错误，不伪造后台回收成功。
+
+生产 main 在 PID 1 和块设备 IRQ 就绪后可选启动 [VirtIO RNG worker](riscv-virtio-rng.md)，由 root 对象持有独立 IRQ、DMA 与 join handle。它在基线采样后分配，根结束/失败清理在检查基线前先 stop/join；只有确认设备 reset 才释放 DMA。无 RNG 或已完整回滚的启动失败不阻止 PID 1；reset 未确认则保留 owner 并明确报错。RNG 是内核 joinable 线程，不能成为用户 PID 1 completion。
 
 未发布对象的失败清理由 `struct riscv_root_boot` 持久保存 file、原始 Sv39 space、MM、files、fs 与设备 owner，而不是留在 `riscv_root_boot_start()` 的栈帧中。真实 ext4/block I/O 清理若暂时失败，`start()` 返回 `RISCV_ROOT_BOOT_STATUS_CLEANUP` 且 root 进入 `RISCV_ROOT_BOOT_CLEANUP`；`riscv_root_boot_cleanup()` 只重试仍拥有的对象，生产 `kernel/main.c` 最多尝试三次，持续错误则报告并停止。物理页、VMA metadata 和堆的合法释放不产生 cleanup 状态，分配器不变量错误直接 fatal。
 

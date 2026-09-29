@@ -11,7 +11,7 @@ Linux 为 `references/linux` 的 `f4cdf7ca9a1fdcca413157df19753f388a5a224e`。
 coarse clock、VirtIO RNG 与随机接口，以及普通/FIFO/RR 和全局实时带宽控制。
 默认周期 1 秒、预算 950 毫秒；这是本项目选定参数，不代表固定 Linux 默认值。
 统一身份对象迁移已通过 scheduler/userland 和独立引用审查；coarse clock 的 14 条
-窄差分与 syscall/timer 模块通过，组合完整差分 797 条匹配。会话、随机和调度新行为仍在实现中。
+窄差分与 syscall/timer 模块通过，组合完整差分 797 条匹配。随机核心和 VirtIO RNG 已有 34 条新 ABI、两种传输的正常/缺设备/延迟/在途退出验收；组合差分 831 条匹配。会话与调度仍在集成。
 本阶段不扩展 TTY、完整凭据、PI futex、PID namespace 或 SMP；最终消费者与全量
 回归完成前，不把新增接口或编译成功当作交付。依据仍为本页固定 Linux 与 QEMU v11.1.0。
 
@@ -388,7 +388,7 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 
 ### P5c 随机数与系统环境
 
-- [ ] getrandom 区分可信熵就绪/未就绪、flags、阻塞/信号及用户 fault；确定性 ASLR 降级不能充当安全随机数成功。熵源按 QEMU/实板实际能力记录。
+- [x] getrandom 区分可信熵就绪/未就绪、flags、阻塞/信号及用户 fault；VirtIO RNG legacy/modern 从宿主安全随机后端取得至少 32 字节后置 ready。DTB/用户写入和早期 ASLR 降级不计可信熵；实板熵源未验证。见[随机数来源](learning/random-source.md)与[RNG 传输](modules/riscv-virtio-rng.md)。
 - [ ] klogctl/日志读取需真实日志 owner、缓冲和权限设计；不以空成功消除 dmesg 报错。
 - [x] sysinfo 的 RV64 完整布局、内存/负载/任务数与 EFAULT 已交付。
 - [ ] prctl 等只按真实调用链新增；版本和统计来自内核事实，未知能力返回规定错误，用户查询不能触发整机 fatal。

@@ -77,6 +77,7 @@
 #define LINUX_SYSCALL_RECVFROM 207U
 #define LINUX_SYSCALL_SETSOCKOPT 208U
 #define LINUX_SYSCALL_BRK 214U
+#define LINUX_SYSCALL_GETRANDOM 278U
 #define LINUX_SYSCALL_SCHED_YIELD 124U
 #define LINUX_SYSCALL_CLOCK_GETTIME 113U
 #define LINUX_SYSCALL_CLOCK_GETRES 114U
@@ -597,6 +598,10 @@ enum kernel_syscall_status kernel_syscall_dispatch(
     } else if (request->number == LINUX_SYSCALL_SCHED_YIELD) {
         decoded.action = KERNEL_SYSCALL_ACTION_YIELD;
         decoded.value = 0;
+    } else if (request->number == LINUX_SYSCALL_GETRANDOM) {
+        if (syscall_handle_getrandom(caller, request, &decoded) !=
+            KERNEL_SYSCALL_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     } else if (request->number == LINUX_SYSCALL_CLOCK_GETTIME) {
         if (syscall_handle_clock_gettime(caller, request, &decoded) !=
             KERNEL_SYSCALL_STATUS_OK) {

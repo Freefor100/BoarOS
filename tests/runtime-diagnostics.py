@@ -113,7 +113,9 @@ def main():
         subprocess.run(['cp', '--sparse=always', '--reflink=auto', str(fixture), str(disk)], check=True)
         with disk.open('rb') as stream:
             os.fsync(stream.fileno())
-        command = [qemu, '-machine', 'virt', '-bios', 'default', '-kernel', str(kernel),
+        command = [qemu, '-machine', 'virt', '-bios', 'default',
+                   '-object', 'rng-random,id=entropy,filename=/dev/urandom',
+                   '-device', 'virtio-rng-device,rng=entropy,bus=virtio-mmio-bus.7', '-kernel', str(kernel),
                    '-m', '512M', '-smp', '1', '-nographic', '-no-reboot',
                    '-drive', f'file={disk},if=none,format=raw,id=root',
                    '-device', 'virtio-blk-device,drive=root,bus=virtio-mmio-bus.0']

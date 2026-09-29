@@ -16,6 +16,25 @@
 #include <stddef.h>
 #include <stdint.h>
 
+int riscv_root_boot_start_rng(struct riscv_root_boot *root,
+    const struct dtb_boot_info *info, const struct dtb_irq_info *irq)
+{
+    for (uint32_t i = 0; i < info->virtio_mmio_count; i++) {
+        uint32_t source = 0;
+        for (uint32_t j = 0; j < irq->route_count; j++)
+            if (irq->routes[j].base == info->virtio_mmio[i].base)
+                source = irq->routes[j].source;
+        if (!source) continue;
+        int error = riscv_virtio_mmio_rng_start(&root->rng,
+            (void *)(uintptr_t)(RISCV_KERNEL_MMIO_BASE + info->virtio_mmio[i].base),
+            info->virtio_mmio[i].size, root->device.page_allocator,
+            info->timebase_frequency, source);
+        if (!error) return 0;
+        if (root->rng.mmio) return error;
+    }
+    return 0;
+}
+
 struct riscv_virtio_mmio_block *riscv_root_boot_device(
     struct riscv_root_boot *root, uint32_t index)
 {
@@ -102,6 +121,8 @@ enum riscv_root_boot_status riscv_root_boot_cleanup(
     if (root == 0 || root->state != RISCV_ROOT_BOOT_CLEANUP) {
         return RISCV_ROOT_BOOT_STATUS_INVALID;
     }
+    if (riscv_virtio_mmio_rng_stop(&root->rng))
+        return RISCV_ROOT_BOOT_STATUS_CLEANUP;
     if ((root->cleanup_files.state == KERNEL_FILES_LIVE ||
          root->cleanup_files.state == KERNEL_FILES_CLEANUP) &&
         kernel_files_release(&root->cleanup_files) !=
@@ -502,6 +523,12 @@ enum riscv_root_boot_status riscv_root_boot_finish(
     }
     root->finish_failure = RISCV_ROOT_FINISH_NONE;
     root->finish_error = 0;
+    error = riscv_virtio_mmio_rng_stop(&root->rng);
+    if (error) {
+        root->finish_failure = RISCV_ROOT_FINISH_RNG;
+        root->finish_error = error;
+        return RISCV_ROOT_BOOT_STATUS_CLEANUP;
+    }
     if (root->cleanup_interpreter_source != 0) {
         error = (int)kernel_elf64_source_release(
             &root->cleanup_interpreter_source);

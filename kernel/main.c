@@ -841,6 +841,8 @@ static void kernel_main_high(void)
             virt_uart_put_hex(source);
             virt_uart_puts("\n");
         }
+        if (riscv_root_boot_start_rng(&root_boot, &boot_info, &boot_irq))
+            shutdown_for_root_boot_error(RISCV_ROOT_BOOT_STATUS_CLEANUP);
         virt_uart_puts("BoarOS: root /init started pid=0x1\n");
     } else if (root_status != RISCV_ROOT_BOOT_STATUS_NO_DEVICE) {
         uint32_t cleanup_attempts = 0U;

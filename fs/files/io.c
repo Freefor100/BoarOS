@@ -317,6 +317,8 @@ static enum kernel_files_status read_pinned(
         request = count > KERNEL_FILES_MAX_RW_COUNT
                       ? KERNEL_FILES_MAX_RW_COUNT : count;
         while (total < request) {
+            if (device->interruptible_bulk && total >= 256U &&
+                kernel_signal_has_pending(kernel_task_current())) break;
             size_t received = 0U;
             size_t copied = 0U;
             size_t chunk = request - total < sizeof(staging)
@@ -1415,6 +1417,10 @@ enum kernel_files_status kernel_files_lseek(
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
     enum kernel_files_status status = kernel_files_pin(files, fd, &description, linux_result);
     if (status != KERNEL_FILES_STATUS_OK || *linux_result) return status;
+    if (whence > 4U) {
+        *linux_result = -KERNEL_EINVAL;
+        return release_io_description(files, &description, KERNEL_FILES_STATUS_OK);
+    }
     status = lseek_pinned(description, offset, whence, linux_result);
     return release_io_description(files, &description, status);
 }
