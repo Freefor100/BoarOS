@@ -22,7 +22,9 @@ sendto 和 recvfrom 的暂存 pbuf/packet 在 syscall 栈中持有，并在正�
 
 TCP `POLLOUT` 同时要求发送缓冲和队列空间。`tcp_write` 还可能因全局 segment/pbuf 池满而返回 `ERR_MEM`，此时 socket 撤下可写事件并登记有界重试期限；ACK、成功写、错误或销毁解除登记。等待者取最近的 lwIP 协议和写重试期限，池释放后即使没有 ACK 也能继续，而不会因虚假的 `POLLOUT` 在单 hart 上空转。`F_SETFL(F_GETFL|O_NONBLOCK)` 接受已有 access mode 位，只更新可变状态位。
 
-关闭活动 TCP 连接先解绑全部指向 BoarOS socket 的回调，再 `tcp_close`；协议 FIN/TIME_WAIT 可能暂占静态 PCB/segment 池，随后由定时器回收。这与内核堆对象生命周期分开。当前只验收单 hart loopback；AF_UNIX/socketpair、shutdown/半关闭、通用 sendmsg/recvmsg、更多 sockopt、外部网卡与 SMP 并发仍在 `docs/goals.md` N2/N3，不能由本切片推出。
+关闭活动 TCP 连接先解绑全部指向 BoarOS socket 的回调，再 `tcp_close`；协议 FIN/TIME_WAIT 可能暂占静态 PCB/segment 池，随后由定时器回收。这与内核堆对象生命周期分开。
+
+支持 `AF_UNIX` (domain=1) 的 `socketpair(199)` 系统调用，支持 `SOCK_STREAM` 和 `SOCK_DGRAM` 类型以及 `SOCK_CLOEXEC`、`SOCK_NONBLOCK`。`kernel_files_socketpair_create` 保证双向 OFD 的原子分配与双 fd 安装，失败时完整回滚不泄露 fd 或 OFD。两个 endpoint 在内核中互相绑定 peer；流和数据报在接收端堆上排队，每个 socket 拥有 64 KiB 独立接收缓冲配额（超出时返回 `-EAGAIN` 并在接收端读取后唤醒对端写者）。向已关闭或断开的对端写入向调用任务产生 `SIGPIPE` 并返回 `-EPIPE`；读取已关闭对端返回 0 (EOF)；`SOCK_DGRAM` 严格保留单次数据报边界并在短读时截断丢弃剩余数据。poll/ppoll/epoll 准确反映对端关闭时的 `POLLHUP`/`POLLIN` 就绪。命名 AF_UNIX 端点、SCM_RIGHTS 凭据传递、shutdown/半关闭、通用 sendmsg/recvmsg、更多 sockopt、外部网卡与 SMP 并发仍在 `docs/goals.md` N2/N3，不能由本切片推出。
 
 ## 验证
 
@@ -35,8 +37,8 @@ python3 tests/program-inventory/run.py --suite libc \
   --require-pass --output build/socket-program-check
 ```
 
-host 入口实测 UDP loopback、PCB 16 个用尽后第 17 个失败、全部释放和再分配，另在 `sndbuf>0` 时耗尽全局 TCP segment 池触发真实 `tcp_write ERR_MEM`，以及 TCP 握手/关闭后推进 200 秒协议计时、池用量回到基线。当前 118 条 socket 差分记录覆盖两进程握手、零长度 UDP read/readv 及后续数据、读/向量读 fault 保留、UDP fault 丢弃、负地址长度、accept 超时、F_SETFL access mode、ppoll/epoll 的协议定时器和混合 fd；整合内核的 548 条 Linux/BoarOS 记录一致。真实 pthread U-mode 另覆盖零长度 datagram、共享 socket 双读、阻塞读时 close/fd 复用、双读线程组 SIGKILL、全局池压力下错误可写事件及释放后写入进展，关机检查 `heap-live=0`。线程组 SIGKILL 测试可控地覆盖等待和竞争路径，但公开 ABI 无法精确钉住 staging 到 usercopy 的极短窗口。原版 libc-test `functional/socket.c` 的静态、动态直接 entry 用未改源码和同一 ELF 在双方通过；整合内核全量 228 项为 227 pass、1 BusyBox 包装失败，见[程序清单](../learning/user-program-inventory.md)。
+host 入口实测 UDP loopback、PCB 16 个用尽后第 17 个失败、全部释放和再分配，另在 `sndbuf>0` 时耗尽全局 TCP segment 池触发真实 `tcp_write ERR_MEM`，以及 TCP 握手/关闭后推进 200 秒协议计时、池用量回到基线。当前 1012 条 Linux/BoarOS 差分记录完全一致，包含 12 条新增 socketpair 差分记录，覆盖坏族、坏标志、坏协议、空指针、stream 双向读写、关闭 EOF、dgram 边界截断与 flags 校验。真实 pthread U-mode 另覆盖零长度 datagram、共享 socket 双读、阻塞读时 close/fd 复用、双读线程组 SIGKILL、全局池压力下错误可写事件及释放后写入进展。原版 hackbench 原 ELF 在 4 进程模式下传递消息并成功运行（Time: 0.014s），关机检查 `heap-live=0`。原版 libc-test `functional/socket.c` 的静态、动态直接 entry 用未改源码和同一 ELF 在双方通过；整合内核全量 228 项为 227 pass、1 BusyBox 包装失败，见[程序清单](../learning/user-program-inventory.md)。
 
 Linux ABI 依据本地 `references/linux/net/socket.c`、`net/ipv4/af_inet.c`、`fs/read_write.c`，commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`；测试构建来自 `references/oscomp-testsuits` commit `8b58dd16d26d30f7c74d48d5832d870d3051b703`。核对后运行 `make prune-build` 清理日志和镜像。
 
-规模回归补充 0/255/256/257/1500/4096/8192 字节 UDP 的三种入口、完整与不足容量、空 iovec、后继报文和跨页 fault；TCP 用错位缓冲与向量写累计传输 1 MiB，检查内容、非 256 字节接收和跨片段 fault 的字节守恒。不同内核允许不同 TCP 分段，测试不把一个特定短读长度当作协议契约。既有真实 pthread 继续覆盖共享读、fd 复用、SIGKILL 和发送池背压。成本与边界见[单核规模回归](../learning/single-hart-scale.md)。
+规模回归补充 0/255/256/257/1500/4096/8192 字节 UDP 的三种入口、完整与不足容量、空 iovec、后继报文和跨页 fault；TCP 用错位缓冲与向量写累计传输 1 MiB，检查内容、非 256 字节接收和跨片段 fault 的字节守恒；`socketpair_scale` 覆盖 STREAM 全双工读写、对端关闭 EOF、写入关闭对端返回 EPIPE 以及 DGRAM 数据报截断边界。成本与边界见[单核规模回归](../learning/single-hart-scale.md)。

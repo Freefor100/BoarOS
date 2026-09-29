@@ -2,6 +2,7 @@
 
 #include <stdint.h>
 
+#define LINUX_AF_UNIX 1
 #define LINUX_AF_INET 2
 #define LINUX_SOCK_STREAM 1
 #define LINUX_SOCK_DGRAM 2
@@ -690,4 +691,49 @@ void abi_socket_cases(void)
     close_socket(blocked_server);
     SC1(57, ready_pipe[0]);
     SC1(57, done_pipe[0]);
+
+    int sv[2] = {-1, -1};
+    record("socket.socketpair-bad-family",
+           SC4(199, LINUX_AF_INET, LINUX_SOCK_STREAM, 0, (long)sv));
+    record("socket.socketpair-bad-flags",
+           SC4(199, LINUX_AF_UNIX, LINUX_SOCK_STREAM | 0x01000000, 0, (long)sv));
+    record("socket.socketpair-bad-protocol",
+           SC4(199, LINUX_AF_UNIX, LINUX_SOCK_STREAM, 999, (long)sv));
+    record("socket.socketpair-bad-pointer",
+           SC4(199, LINUX_AF_UNIX, LINUX_SOCK_STREAM, 0, 0));
+
+    long sp_stream = SC4(199, LINUX_AF_UNIX,
+                         LINUX_SOCK_STREAM | LINUX_SOCK_CLOEXEC | LINUX_SOCK_NONBLOCK,
+                         0, (long)sv);
+    record("socket.socketpair-stream-create", sp_stream);
+    record("socket.socketpair-stream-distinct",
+           sp_stream == 0 && sv[0] >= 0 && sv[1] >= 0 && sv[0] != sv[1]);
+    long flags0 = sp_stream == 0 ? SC3(25, sv[0], LINUX_F_GETFD, 0) : sp_stream;
+    long flags1 = sp_stream == 0 ? SC3(25, sv[1], LINUX_F_GETFL, 0) : sp_stream;
+    record("socket.socketpair-stream-flags",
+           (flags0 >= 0 && (flags0 & LINUX_FD_CLOEXEC) != 0) &&
+           (flags1 >= 0 && (flags1 & LINUX_SOCK_NONBLOCK) != 0));
+
+    long written = sp_stream == 0 ? SC3(64, sv[0], "ping", 4) : sp_stream;
+    record("socket.socketpair-stream-write", written);
+    char sp_buf[16] = {0};
+    long got = written == 4 ? SC3(63, sv[1], sp_buf, sizeof(sp_buf)) : written;
+    record("socket.socketpair-stream-read",
+           got == 4 && sp_buf[0] == 'p' && sp_buf[1] == 'i' && sp_buf[2] == 'n' && sp_buf[3] == 'g');
+
+    close_socket(sv[0]);
+    got = sp_stream == 0 ? SC3(63, sv[1], sp_buf, sizeof(sp_buf)) : sp_stream;
+    record("socket.socketpair-stream-eof", got);
+    close_socket(sv[1]);
+
+    sv[0] = -1; sv[1] = -1;
+    long sp_dgram = SC4(199, LINUX_AF_UNIX, LINUX_SOCK_DGRAM, 0, (long)sv);
+    record("socket.socketpair-dgram-create", sp_dgram);
+    long w1 = sp_dgram == 0 ? SC3(64, sv[0], "first", 5) : sp_dgram;
+    long w2 = sp_dgram == 0 ? SC3(64, sv[0], "second", 6) : sp_dgram;
+    long r1 = (w1 == 5 && w2 == 6) ? SC3(63, sv[1], sp_buf, 3) : -1;
+    long r2 = (w1 == 5 && w2 == 6) ? SC3(63, sv[1], sp_buf, sizeof(sp_buf)) : -1;
+    record("socket.socketpair-dgram-boundaries", r1 == 3 && r2 == 6);
+    close_socket(sv[0]);
+    close_socket(sv[1]);
 }

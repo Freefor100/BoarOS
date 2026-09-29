@@ -58,7 +58,7 @@ SQLite DELETE/WAL 完整矩阵通过；不同验证快照的边界明确分列�
 | hwclock 无 RTC 字符接口 | 最新原包装器无法打开 /dev/misc/rtc；内核已有 RTC 时钟来源不等于已提供用户 RTC 设备/ioctl，归 P5c |
 | 历史 kill 10 未计分 | 原目标/脚本环境需单列；最新 55 子项包装器的启动子进程再 kill 已通过，不能继续当作该清单失败 |
 | cyclictest 原 affinity/调度阻塞 | 本轮原 ELF 已真实调用调度接口并完成 C:10；mlock 仍 ENOSYS，尚不声明完整延迟或锁页能力 |
-| hackbench 创建 fdpair 失败 | N2 先定位 socketpair/AF_UNIX 调用，不能直接扩大 TCP API |
+| hackbench 创建 fdpair 失败 | N2 已交付 AF_UNIX / socketpair (199)，支持 STREAM/DGRAM、背压与关闭语义，原版 hackbench 运行通过且关机 heap-live=0 |
 | iperf 原随机/daemon 阻塞 | 原 iperf 客户端已越过随机接口与 affinity，当前停在 loopback connect ECONNRESET；另有独立 libc daemon 探针通过，未宣称原 iperf daemon 模式完成 |
 | iozone 吞吐 shmget ENOSYS | P4f SysV IPC；共享匿名 mmap 不等于 SysV 生命周期 |
 | iozone 自动模式能完成，慢写和日期异常 | P0/P7 分别复现时间 ABI 与写入成本；不是永久卡死证据 |
@@ -72,7 +72,7 @@ SQLite DELETE/WAL 完整矩阵通过；不同验证快照的边界明确分列�
 
 | 方向 | 已有基础 | 尚缺能力或尚未证明的结论 |
 |---|---|---|
-| IPC / 共享内存 | 共享匿名、统一后备对象、tmpfs/POSIX shm、匿名共享 futex | SysV 四个 shm syscall 尚无入口，不能把 shm_open 等同 shmget；AF_UNIX/socketpair、共享文件 futex、PI 仍缺 |
+| IPC / 共享内存 | 共享匿名、统一后备对象、tmpfs/POSIX shm、匿名共享 futex、AF_UNIX/socketpair | SysV 四个 shm syscall 尚无入口，不能把 shm_open 等同 shmget；AF_UNIX 命名端点/SCM_RIGHTS、共享文件 futex、PI 仍缺 |
 | 文件与存储 | 页缓存、阈值写回、真实同步、日志恢复、多盘独立 owner | 范围写回顺序扫描与逐页提交；fdatasync 与 fsync 共用保守路径；无周期清脏、事务合并、预读或负目录项缓存 |
 | 并发与调度 | 单 hart IRQ 等待、每盘八槽、读共享/写独占、FIFO/RR 及预算 | 单盘后端写事务串行；同 OFD 位置、命名空间和冲突 inode 互斥；八槽不代表每个应用都可产生八个并发请求；无 SMP/PI/硬实时 |
 | 内存与信号 | demand paging、COW、fork、线程与标准信号 | mremap、按操作区分的 madvise、mlock、sigaltstack、实时信号队列未交付 |
@@ -482,7 +482,7 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 ### N2 本地与 loopback 链路
 
 - [x] AF_INET loopback UDP/TCP 首个真实消费者已通过；原 socket entry 调用由固定源码 `src/functional/socket.c` 与日志确认。
-- [ ] AF_UNIX/socketpair 先交付原 hackbench 所需类型与 flags；覆盖阻塞/非阻塞、EOF/半关闭、信号取消、fork/dup、对端退出、poll/epoll 和资源耗尽。命名端点及 SCM_RIGHTS 按各自真实需求扩展，不能因 socketpair 通过标记全部本地 socket 完成。
+- [x] AF_UNIX/socketpair 先交付原 hackbench 所需类型与 flags；覆盖阻塞/非阻塞、EOF/半关闭、信号取消、fork/dup、对端退出、poll/epoll 和资源耗尽。命名端点及 SCM_RIGHTS 按各自真实需求扩展，不能因 socketpair 通过标记全部本地 socket 完成。
 - [ ] bind/connect/listen/accept、send/recv、非阻塞 EAGAIN、半关闭、EOF、失败连接、poll/epoll 和信号打断逐项验收；失败连接不能假装建立 endpoint。
 - [ ] sendmsg/recvmsg 与 SCM_RIGHTS 明确被传 fd 的 OFD 引用、用户复制失败和消息未接收/对端退出时回收；不能只传可被关闭复用的整数 fd。
 - [x] 原静态/动态 socket 直接 entry 在固定 Linux 与 BoarOS 同一 ELF 双侧通过；PID 1 关机 `heap-live=0`。UDP 池耗尽、释放和重用、TCP segment 池耗尽后 `ERR_MEM`、TCP 200 秒协议定时回收由 host 测试保护；真实 pthread U-mode 覆盖零长度 UDP datagram、共享 OFD 双读、close/fd 复用、线程组强制退出、全局池压力下的 POLLOUT 抑制及释放后进展。整合内核全量 228 项为 227 pass、1 BusyBox 包装失败，不以此推出 AF_UNIX 或真实网卡完成。

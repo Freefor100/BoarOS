@@ -118,6 +118,66 @@ static void udp_buffer_oom(struct kernel_files *files, struct kernel_mm *mm)
           kernel_files_close(files, fd, &result) == KERNEL_FILES_STATUS_OK && result == 0, 42);
 }
 
+static void socketpair_scale(struct kernel_files *files, struct kernel_mm *mm)
+{
+    int64_t result;
+    int32_t pair[2];
+    size_t copied;
+
+    /* 1. SOCK_STREAM full-duplex */
+    check(kernel_files_socketpair_create(files, mm, 1, 0, BUFFER, &result) ==
+          KERNEL_FILES_STATUS_OK && result == 0, 80);
+    check(kernel_copy_from_user(mm, pair, BUFFER, sizeof(pair), &copied) ==
+          KERNEL_UACCESS_STATUS_OK && copied == sizeof(pair), 81);
+    check(pair[0] >= 0 && pair[1] >= 0 && pair[0] != pair[1], 82);
+
+    unsigned char test_data[100];
+    for (unsigned i = 0; i < sizeof(test_data); i++) test_data[i] = (unsigned char)(i + 0x5a);
+    check(kernel_copy_to_user(mm, BUFFER + 64, test_data, sizeof(test_data), &copied) ==
+          KERNEL_UACCESS_STATUS_OK && copied == sizeof(test_data), 83);
+    check(kernel_files_write(files, mm, pair[0], BUFFER + 64, sizeof(test_data), &result) ==
+          KERNEL_FILES_STATUS_OK && result == (int64_t)sizeof(test_data), 84);
+
+    unsigned char recv_data[100];
+    check(kernel_files_read(files, mm, pair[1], BUFFER + 256, sizeof(recv_data), &result) ==
+          KERNEL_FILES_STATUS_OK && result == (int64_t)sizeof(recv_data), 85);
+    check(kernel_copy_from_user(mm, recv_data, BUFFER + 256, sizeof(recv_data), &copied) ==
+          KERNEL_UACCESS_STATUS_OK && copied == sizeof(recv_data), 86);
+    for (unsigned i = 0; i < sizeof(recv_data); i++) check(recv_data[i] == test_data[i], 87);
+
+    /* Reverse write: pair[1] -> pair[0] */
+    check(kernel_files_write(files, mm, pair[1], BUFFER + 64, 40, &result) ==
+          KERNEL_FILES_STATUS_OK && result == 40, 88);
+    check(kernel_files_read(files, mm, pair[0], BUFFER + 256, 40, &result) ==
+          KERNEL_FILES_STATUS_OK && result == 40, 89);
+
+    /* Close pair[0]: pair[1] should observe EOF on read and EPIPE on write */
+    check(kernel_files_close(files, pair[0], &result) == KERNEL_FILES_STATUS_OK && result == 0, 90);
+    check(kernel_files_read(files, mm, pair[1], BUFFER + 256, 40, &result) ==
+          KERNEL_FILES_STATUS_OK && result == 0, 91);
+    check(kernel_files_write(files, mm, pair[1], BUFFER + 64, 40, &result) ==
+          KERNEL_FILES_STATUS_OK && result == -KERNEL_EPIPE, 92);
+    check(kernel_files_close(files, pair[1], &result) == KERNEL_FILES_STATUS_OK && result == 0, 93);
+
+    /* 2. SOCK_DGRAM message boundaries */
+    check(kernel_files_socketpair_create(files, mm, 2, 0, BUFFER, &result) ==
+          KERNEL_FILES_STATUS_OK && result == 0, 94);
+    check(kernel_copy_from_user(mm, pair, BUFFER, sizeof(pair), &copied) ==
+          KERNEL_UACCESS_STATUS_OK && copied == sizeof(pair), 95);
+    check(kernel_files_write(files, mm, pair[0], BUFFER + 64, 30, &result) ==
+          KERNEL_FILES_STATUS_OK && result == 30, 96);
+    check(kernel_files_write(files, mm, pair[0], BUFFER + 64, 40, &result) ==
+          KERNEL_FILES_STATUS_OK && result == 40, 97);
+    /* Short read truncates datagram */
+    check(kernel_files_read(files, mm, pair[1], BUFFER + 256, 10, &result) ==
+          KERNEL_FILES_STATUS_OK && result == 10, 98);
+    /* Next read gets the second datagram */
+    check(kernel_files_read(files, mm, pair[1], BUFFER + 256, 100, &result) ==
+          KERNEL_FILES_STATUS_OK && result == 40, 99);
+    check(kernel_files_close(files, pair[0], &result) == KERNEL_FILES_STATUS_OK && result == 0, 100);
+    check(kernel_files_close(files, pair[1], &result) == KERNEL_FILES_STATUS_OK && result == 0, 101);
+}
+
 static struct riscv_mm_statistics mapped_cost(struct kernel_files *files,
     struct kernel_mm *mm, int64_t fd, uint64_t bytes)
 {
@@ -266,6 +326,7 @@ void kernel_main(unsigned long hart, const void *dtb)
           result == -KERNEL_ENOMEM && fail_page == 0, 14);
     tcp_cost(&files, &mm);
     udp_buffer_oom(&files, &mm);
+    socketpair_scale(&files, &mm);
     struct riscv_mm_statistics small = mapped_cost(&files, &mm, fd, 16 * MIB);
     struct riscv_mm_statistics large = mapped_cost(&files, &mm, fd, 64 * MIB);
     check(large.resident_probes <= 6 * small.resident_probes, 25);

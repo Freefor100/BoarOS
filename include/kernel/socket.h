@@ -28,9 +28,15 @@ struct kernel_socket_statistics {
 };
 void kernel_socket_get_statistics(struct kernel_socket_statistics *statistics);
 
+#define KERNEL_SOCKET_DOMAIN_INET 0U
+#define KERNEL_SOCKET_DOMAIN_UNIX 1U
+
 /* IPv4 addresses use the Linux sockaddr_in/network-byte-order representation. */
 int kernel_socket_create(struct kernel_heap *heap, int type,
                          struct kernel_socket **owner);
+int kernel_socket_pair(struct kernel_heap *heap, int type,
+                       struct kernel_socket **owner_a,
+                       struct kernel_socket **owner_b);
 void kernel_socket_destroy(struct kernel_socket *socket);
 int kernel_socket_bind(struct kernel_socket *socket, uint32_t address,
                        uint16_t port);

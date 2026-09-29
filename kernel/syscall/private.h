@@ -23,6 +23,11 @@ enum kernel_syscall_status syscall_handle_socket_operation(
     const struct kernel_syscall_request *request,
     struct kernel_syscall_result *decoded);
 
+enum kernel_syscall_status syscall_handle_socketpair(
+    struct kernel_task *caller,
+    const struct kernel_syscall_request *request,
+    struct kernel_syscall_result *decoded);
+
 enum kernel_syscall_status syscall_handle_utimensat(
     struct kernel_task *caller,
     const struct kernel_syscall_request *request,
