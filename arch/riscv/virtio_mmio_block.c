@@ -376,6 +376,13 @@ static void fail_device(struct riscv_virtio_mmio_block *device, enum kernel_bloc
 }
 static void collect_used(struct riscv_virtio_mmio_block *device)
 {
+    uint32_t pending = mmio_read32(device, VIRTIO_MMIO_INTERRUPT_STATUS_OFFSET);
+    if (pending) {
+        /* Ack before the used-index snapshot: a later completion must leave
+         * its interrupt pending instead of being erased after the scan. */
+        mmio_write32(device, VIRTIO_MMIO_INTERRUPT_ACK_OFFSET, pending);
+        __asm__ volatile("fence iorw, iorw" ::: "memory");
+    }
     volatile struct virtq_used *used = (void *)((unsigned char *)device->queue_memory + queue_used_offset(device));
     uint16_t count = (uint16_t)(used->index - device->last_used_index);
     memory_barrier();
@@ -397,8 +404,6 @@ static void collect_used(struct riscv_virtio_mmio_block *device)
         if (r->done.head) device->statistics.wakes++;
         wake(&r->done);
     }
-    uint32_t pending = mmio_read32(device, VIRTIO_MMIO_INTERRUPT_STATUS_OFFSET);
-    if (pending) mmio_write32(device, VIRTIO_MMIO_INTERRUPT_ACK_OFFSET, pending);
 }
 static void block_irq(void *owner)
 {
@@ -479,13 +484,21 @@ static enum kernel_block_status submit_request(struct riscv_virtio_mmio_block *d
     mmio_write32(device, VIRTIO_MMIO_QUEUE_NOTIFY_OFFSET, 0);
     uint64_t deadline = time_now() + device->timeout_ticks;
     while (r->state == 2) {
+        /* During boot there is no IRQ consumer. Harvest a completion already
+         * published by the device before deciding that its deadline elapsed. */
+        if (!device->irq_source) collect_used(device);
+        if (r->state != 2) break;
         if ((int64_t)(time_now() - deadline) >= 0) { device->statistics.timeouts++; fail_device(device, KERNEL_BLOCK_STATUS_TIMEOUT); break; }
         if (device->irq_source) {
             enum kernel_wait_wake_reason reason;
             device->statistics.sleeps++;
             if (kernel_scheduler_block_current(&r->done, deadline, 0, &reason) != KERNEL_SCHEDULER_STATUS_OK)
                 __builtin_trap();
-        } else collect_used(device);
+            /* A timer may win the trap race even though DMA completed. This
+             * one final harvest is not a polling completion loop. */
+            if (reason == KERNEL_WAIT_TIMEOUT && r->state == 2 && device_live(device))
+                collect_used(device);
+        }
     }
     enum kernel_block_status result = r->result;
     r->state = 1;

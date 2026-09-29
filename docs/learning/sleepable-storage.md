@@ -33,10 +33,11 @@ lwext4 纯读使用局部游标 `ext4_fpread`；同块缓存 loading 合并，�
 - 完整 WAL 验证暴露旧故障启用的信号竞态：probe 为 43 事件，另一次仅 42，末端 cut 永远不会触发。`SIGUSR1` 与客体放行之间缺少后端确认，启用边界会漂移。增加通用 `arm` 控制命令，等待 `control=arm` 后才发客体许可；host 红测先验证旧协议无法在 NBD 空闲时确认，新协议和末端抽样通过后重跑 DELETE/WAL 完整矩阵。
 - NBD arm/hold/release/drain 是协议握手，未用固定宿主 sleep 推断完成。QEMU 可把相邻读合并为一个 NBD 请求，因此并发门槛显式关闭 request-merging；普通测试不更改内核合并行为。
 - 高半区切换后继续使用编译器保存在寄存器里的物理栈指针曾造成启动 fault。把 DTB 存储探测放入 noinline 调用，避免该指针跨地址切换存活；无盘不创建额外 cleanup task，有盘在资源基线快照前创建。
+- 2026-09-29 的 GitHub Actions [run #35](https://github.com/Freefor100/BoarOS/actions/runs/36510992587) 在 legacy 队列收到八个 NBD 写响应后停止前进，另一次离线 GCC 冷启动在块轮询阶段报一秒 timeout。旧驱动先读取 used index，处理完后才写 MMIO ACK；固定 QEMU `references/qemu/hw/virtio/virtio-mmio.c`（commit `84f07211cc5b4fc6a371559bf8a5de4fb068e648`）对 ACK 清除 ISR 位，后到的完成可能被清掉而未被收割。固定 Linux `references/linux/drivers/virtio/virtio_mmio.c`（commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`）先 ACK 再调用队列回调。现改为 ACK 后取 used index，并在轮询及期限唤醒时先收割已发布完成再判超时。复核：`make test-io-sleep-riscv test-block-riscv test-block-host test-offline-c-riscv`，以及 RISC-V、规模、userland、679 项差分、glibc、SQLite DELETE/WAL 和栈检查均通过；Ubuntu 24.04/QEMU 8.2.2 容器中 legacy 队列连续 30 次、离线 GCC 冷启动 5 次通过。两处 CI 故障均具有间歇性；这个时序缺陷明确存在，CI 上的每次故障是否均由它造成仍须新 run 验证。
 
-## 最终内核与常规验收
+## 2026-09-28 阶段验收
 
-最终生产内核 SHA-256 `5565ddce40a9ade4fac4f7a2191aa5b136b3cc456e92873ab6ef4be3abe9d8cb`；NBD 服务 `356cbb5d10fbe590087eda1f4bc9421f3d56c39bb4f82afd289a97fa4c18bfb1`。RISC-V 全套、真实 static/pthread userland、548 条 Linux 差分、glibc 五种形态、SQLite DELETE/WAL、离线 GCC 五阶段通过。编译器栈检查覆盖 1357 函数，最大 2368 字节（DTB IRQ 解析）；真实 userland 最低剩余栈为 4760/5680 字节。lwIP、record-lock、allocator-release、block、NBD、lwext4 host 与执行器 27＋18 项通过。
+该阶段生产内核 SHA-256 `5565ddce40a9ade4fac4f7a2191aa5b136b3cc456e92873ab6ef4be3abe9d8cb`；NBD 服务 `356cbb5d10fbe590087eda1f4bc9421f3d56c39bb4f82afd289a97fa4c18bfb1`。RISC-V 全套、真实 static/pthread userland、548 条 Linux 差分、glibc 五种形态、SQLite DELETE/WAL、离线 GCC 五阶段通过。编译器栈检查覆盖 1357 函数，最大 2368 字节（DTB IRQ 解析）；真实 userland 最低剩余栈为 4760/5680 字节。lwIP、record-lock、allocator-release、block、NBD、lwext4 host 与执行器 27＋18 项通过。
 
 规模成本保持：对齐 1 MiB 写入为 256 分块/256 用户页解析；16/64 MiB resident 探测为 6210/24519（3.95 倍）；单页改权各访问 3 级 PTE，地址失效逐页一次、全局失效为零。
 
