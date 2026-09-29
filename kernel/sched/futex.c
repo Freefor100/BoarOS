@@ -3,7 +3,7 @@
 #include <kernel/errno.h>
 #include <kernel/futex.h>
 #include <kernel/mm.h>
-#include <kernel/shared_anon.h>
+#include <kernel/memory_object.h>
 #include <kernel/time.h>
 #include <kernel/uaccess.h>
 
@@ -23,7 +23,7 @@ static struct kernel_wait_queue buckets[FUTEX_BUCKETS];
 static void futex_key_release(struct kernel_futex_key *key)
 {
     if (key->kind == KERNEL_FUTEX_KEY_SHARED_ANON)
-        kernel_shared_anon_release(&key->shared_object);
+        kernel_memory_object_release(&key->shared_object);
     *key = (struct kernel_futex_key){0};
 }
 
@@ -59,10 +59,10 @@ static int64_t futex_key_acquire(
             return 0;
         }
         if (vma.kind == KERNEL_VMA_KIND_ANON_SHARED) {
-            struct kernel_shared_anon *object = vma.backing;
+            struct kernel_memory_object *object = vma.backing;
 
             if (object == 0 ||
-                kernel_shared_anon_acquire(object) != KERNEL_SHARED_ANON_OK) {
+                kernel_memory_object_acquire(object) != KERNEL_MEMORY_OBJECT_OK) {
                 *status = KERNEL_SCHEDULER_STATUS_INVALID_STATE;
                 return 0;
             }
@@ -110,8 +110,8 @@ static void futex_key_requeue(struct kernel_task *task,
     struct kernel_futex_key old = task->futex_key;
 
     if (target->kind == KERNEL_FUTEX_KEY_SHARED_ANON &&
-        kernel_shared_anon_acquire(target->shared_object) !=
-            KERNEL_SHARED_ANON_OK) __builtin_trap();
+        kernel_memory_object_acquire(target->shared_object) !=
+            KERNEL_MEMORY_OBJECT_OK) __builtin_trap();
     task->futex_key = *target;
     futex_key_release(&old);
 }

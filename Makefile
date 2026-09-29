@@ -191,7 +191,7 @@ C_SOURCES := \
 	lib/qsort.c \
 	lib/string.c \
 	mm/vma.c \
-	mm/shared_anon.c \
+	mm/memory_object.c \
 	mm/heap.c \
 	$(LWEXT4_SOURCES) \
 	$(LWIP_SOURCES)
@@ -269,7 +269,7 @@ TEST_RUNTIME_C_SOURCES := \
 	lib/qsort.c \
 	lib/string.c \
 	mm/vma.c \
-	mm/shared_anon.c \
+	mm/memory_object.c \
 	mm/heap.c \
 	$(LWEXT4_SOURCES) \
 	$(LWIP_SOURCES)

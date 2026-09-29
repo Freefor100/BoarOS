@@ -2,6 +2,7 @@
 #include <arch/riscv/sv39.h>
 #include <kernel/boot_memory.h>
 #include <kernel/heap.h>
+#include <kernel/memory_object.h>
 #include <kernel/mm.h>
 #include <kernel/page.h>
 #include <kernel/physical_page.h>
@@ -994,6 +995,36 @@ unsigned long run_all_vma_cases(void)
     return 0U;
 }
 
+static unsigned long memory_object_cases(struct kernel_heap *heap,
+                                         struct physical_page_allocator *allocator)
+{
+    struct kernel_memory_object *object = 0;
+    uint64_t address = 0, found = 0;
+    int created = 0;
+    void *bytes;
+    uint64_t initial = allocator->shared_anon_pages;
+    if (kernel_memory_object_create(heap, allocator, &object) != KERNEL_MEMORY_OBJECT_OK)
+        return 40;
+    if (kernel_memory_object_find_page(object, 123, &found) != KERNEL_MEMORY_OBJECT_NOT_FOUND ||
+        allocator->shared_anon_pages != initial) return 41;
+    if (kernel_memory_object_get_page(object, 1, &address, &created) != KERNEL_MEMORY_OBJECT_OK ||
+        !created || physical_page_resolve(allocator, address, &bytes) != PHYSICAL_PAGE_STATUS_OK)
+        return 42;
+    ((unsigned char *)bytes)[16] = 7;
+    ((unsigned char *)bytes)[17] = 9;
+    if (physical_page_release(allocator, address) != PHYSICAL_PAGE_STATUS_OK) return 43;
+    kernel_memory_object_truncate(object, BOAROS_PAGE_SIZE + 17);
+    if (kernel_memory_object_find_page(object, 1, &found) != KERNEL_MEMORY_OBJECT_OK ||
+        found != address || ((unsigned char *)bytes)[16] != 7 ||
+        ((unsigned char *)bytes)[17] != 0) return 44;
+    if (physical_page_release(allocator, found) != PHYSICAL_PAGE_STATUS_OK) return 45;
+    kernel_memory_object_truncate(object, 0);
+    if (kernel_memory_object_find_page(object, 1, &found) != KERNEL_MEMORY_OBJECT_NOT_FOUND ||
+        allocator->shared_anon_pages != initial) return 46;
+    kernel_memory_object_release(&object);
+    return 0;
+}
+
 unsigned long run_shared_anon_cases(void)
 {
     struct physical_page_allocator allocator;
@@ -1017,6 +1048,8 @@ unsigned long run_shared_anon_cases(void)
                                  VMA_TEST_HEAP_LIMIT) != KERNEL_MM_STATUS_OK ||
         riscv_kernel_mm_satp(&parent, &parent_satp) != KERNEL_MM_STATUS_OK)
         return 1U;
+    unsigned long object_error = memory_object_cases(&heap, &allocator);
+    if (object_error) return object_error;
     use_test_satp = 1;
     test_satp = parent_satp;
     if (kernel_mm_mmap_anonymous(&parent, 0U, 3U * BOAROS_PAGE_SIZE,

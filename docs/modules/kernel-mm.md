@@ -235,3 +235,7 @@ PROT_NONE、非当前 MM、尾页、关闭 fd、unlink、O_TRUNC 与重新增长
 调度器在任务发布及新映像提交时调用 `kernel_mm_add_user`，在退出或旧映像退休前调用 `kernel_mm_remove_user`。活跃使用者与 MM 资源引用分开：清理任务暂存的旧 MM 不影响 CHILD_CLEARTID 条件；fork 创建零使用者的新 MM，acquire/move 不隐式注册任务。计数下溢、溢出属于内核 owner 错误。
 
 活跃使用者在可睡眠的清 TID 复制/唤醒结束后才注销；其他任务同时退出时仍须看到正在退出但尚未完成 mm_release 的使用者。`test-mm-riscv` 通过用户复制挂起点的确定性交错检查两个用户字均清零及最终物理页归还；真实 U-mode 的生命周期另由 tid.* 差分覆盖。
+
+## 统一内存后备对象
+
+共享匿名与其 futex key 使用 `kernel_memory_object` 的稳定对象身份。对象拥有每个稀疏驻留页的一份引用，get/find 成功返回额外页引用；find 遇空洞不分配。对象锁 rank 35 位于 inode 30 之后；无磁盘 I/O。truncate 摘除越界的对象页引用并清零保留尾页，调用者须先撤销受影响 PTE 并持有对象；页发布失败按先释放 PTE 临时引用、再 discard 新页的顺序回滚。tmpfs 与配额接入仍在后续阶段，不因接口迁移宣称已支持。

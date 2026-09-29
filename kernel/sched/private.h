@@ -25,7 +25,7 @@
 #define KERNEL_PID_LIMIT 32768U
 
 struct kernel_exec_transaction;
-struct kernel_shared_anon;
+struct kernel_memory_object;
 
 enum kernel_futex_key_kind {
     KERNEL_FUTEX_KEY_PRIVATE = 0,
@@ -36,7 +36,7 @@ enum kernel_futex_key_kind {
 struct kernel_futex_key {
     uint64_t identity;
     uint64_t offset;
-    struct kernel_shared_anon *shared_object;
+    struct kernel_memory_object *shared_object;
     enum kernel_futex_key_kind kind;
 };
 

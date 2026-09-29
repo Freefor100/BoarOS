@@ -111,7 +111,7 @@ recycled/tail 导入、metadata 扣除、order 对齐、强制 split 与多级 c
 
 ## 内存快照与后台压力通知
 
-`kernel_memory_snapshot()` 输出字节单位的只读快照，由 procfs 与 sysinfo 共用。调用者在当前单 hart 的关中断边界内查询；不分配、不回收、不发起 I/O。总量/空闲量来自 buddy，共享匿名量由 `mm/shared_anon.c` 在后备页发布和最终释放时维护，fork/别名/临时引用不重复计量。文件缓存按唯一 cache entry 计量，块缓冲按 ext4 bcache 已分配的 payload 计量，不把堆开销重复归入 Buffers。
+`kernel_memory_snapshot()` 输出字节单位的只读快照，由 procfs 与 sysinfo 共用。调用者在当前单 hart 的关中断边界内查询；不分配、不回收、不发起 I/O。总量/空闲量来自 buddy，共享匿名量由 `mm/memory_object.c` 在后备页发布和最终释放时维护，fork/别名/临时引用不重复计量。文件缓存按唯一 cache entry 计量，块缓冲按 ext4 bcache 已分配的 payload 计量，不把堆开销重复归入 Buffers。
 
 文件页回收资格在查询时检查物理引用、映射别名、装载/写回/用户固定及最后写回错误。失败页重新修改后仍不计入可回收预算，直到写回成功；共享匿名页没有 swap，不能回收。`MemAvailable=max(free-low,0)+reclaimable-min(reclaimable/2,low)`，最终夹在 `[0,total]`；low 至少一页。它是估算，不承诺任意高阶连续分配成功。`pressure_notify` 只合并事件；`pressure_wait` 检查任务/锁/backend/递归上下文，分配器不拥有 inode/mount 的 I/O 错误。
 

@@ -76,7 +76,7 @@ RISC-V 全套、userland、glibc、栈及相关存储回归通过。契约见对
 
 已交付的 P1h 首批路线完成；其余结构性方案仍为**待设计**，写入路线不等于批准实现。
 
-1. **tmpfs 与多挂载**：复用本轮真实统计/回收分类，先定义目录与页 owner、共享映射、截断、空间耗尽、忙卸载、跨挂载错误和回滚，再扩展真实第二盘。
+1. **tmpfs 与多挂载（实施中）**：共享匿名已迁移统一内存后备对象，查页与截断接口通过聚焦及差分回归；tmpfs、硬链接和第二磁盘仍待验收。复用本轮真实统计/回收分类，先定义目录与页 owner、共享映射、截断、空间耗尽、忙卸载、跨挂载错误和回滚，再扩展真实第二盘。
 2. **会话/进程组、随机数和调度 ABI**：按 daemon、iperf、cyclictest 的首个实际失败交付；随机数先确认可信熵源，查询与设置反映真实行为。原 glibc 的 coarse clock 缺口已定位，按真实时钟来源补齐。
 3. **AF_UNIX/socketpair 与 SysV 共享内存**：分别解除 hackbench 与 iozone 吞吐子项阻塞，独立定义 endpoint/IPC owner、退出和资源限制。
 4. **持续定位**：netperf、iozone 时间/写入成本与其余 libc/LTP 先取得独立证据；未到达不计失败。chown、进程组与 cgroup 缺口已分开，不能把辅助程序的正常等待扩成完整新子系统实现。
@@ -296,7 +296,7 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 
 ## P4：共享后备对象、文件页与跨 MM futex
 
-**依赖与入口**：[MM](modules/kernel-mm.md)、[VMA](modules/kernel-vma.md)、[VFS](modules/vfs-ext4.md)；`include/kernel/{mm.h,vma.h,file_mapping.h,shared_anon.h}`、`mm/{vma.c,shared_anon.c}`、`arch/riscv/mm.c`、`fs/{page_cache.c,vfs.c}`、`kernel/syscall/memory.c`、`kernel/sched/futex.c`。P4a 使用专用共享匿名对象；文件页及共享 futex 复用稳定身份所需的接口按各自契约扩展，不预建通用插件框架。
+**依赖与入口**：[MM](modules/kernel-mm.md)、[VMA](modules/kernel-vma.md)、[VFS](modules/vfs-ext4.md)；`include/kernel/{mm.h,vma.h,file_mapping.h,memory_object.h}`、`mm/{vma.c,memory_object.c}`、`arch/riscv/mm.c`、`fs/{page_cache.c,vfs.c}`、`kernel/syscall/memory.c`、`kernel/sched/futex.c`。P4a 已迁移统一内存后备对象；文件页及共享 futex 复用稳定身份所需的接口按各自契约扩展，不预建通用插件框架。
 
 ### P4a 共享匿名对象（已完成）
 

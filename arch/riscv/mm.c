@@ -6,7 +6,7 @@
 #include <kernel/open_file.h>
 #include <kernel/proc_task.h>
 #include <kernel/page.h>
-#include <kernel/shared_anon.h>
+#include <kernel/memory_object.h>
 #include <kernel/task.h>
 #include <kernel/sync.h>
 #include <kernel/vma.h>
@@ -49,7 +49,7 @@ static void unpin_fault_source(struct riscv_kernel_mm_file_source **source)
 
 struct riscv_kernel_mm_shared_anon {
     struct riscv_kernel_mm_shared_anon *next;
-    struct kernel_shared_anon *object;
+    struct kernel_memory_object *object;
 };
 
 struct riscv_file_mapping {
@@ -807,7 +807,7 @@ static void drain_shared_anon(struct riscv_kernel_mm_record *record,
             continue;
         }
         *link = entry->next;
-        kernel_shared_anon_release(&entry->object);
+        kernel_memory_object_release(&entry->object);
         if (kernel_heap_release(record->vma_heap, entry) !=
             KERNEL_HEAP_STATUS_OK) __builtin_trap();
     }
@@ -830,8 +830,8 @@ static enum kernel_mm_status clone_shared_anon(
             return status == KERNEL_HEAP_STATUS_EMPTY
                        ? KERNEL_MM_STATUS_NO_MEMORY
                        : KERNEL_MM_STATUS_STATE;
-        if (kernel_shared_anon_acquire(source->object) !=
-            KERNEL_SHARED_ANON_OK) {
+        if (kernel_memory_object_acquire(source->object) !=
+            KERNEL_MEMORY_OBJECT_OK) {
             (void)kernel_heap_release(destination_record->vma_heap, copy);
             return KERNEL_MM_STATUS_STATE;
         }
@@ -1688,7 +1688,7 @@ enum kernel_mm_status kernel_mm_mmap_anonymous(
     struct riscv_kernel_mm_record *record;
     struct kernel_vma vma;
     struct kernel_vma_edit edit;
-    struct kernel_shared_anon *shared_object = 0;
+    struct kernel_memory_object *shared_object = 0;
     struct riscv_kernel_mm_shared_anon *shared_entry = 0;
     uint64_t aligned_length;
     uint64_t start;
@@ -1765,19 +1765,19 @@ enum kernel_mm_status kernel_mm_mmap_anonymous(
     }
     end = start + aligned_length;
     if ((flags & KERNEL_MM_MAP_SHARED) != 0U) {
-        enum kernel_shared_anon_status shared_status =
-            kernel_shared_anon_create(record->vma_heap, mm->allocator,
+        enum kernel_memory_object_status shared_status =
+            kernel_memory_object_create(record->vma_heap, mm->allocator,
                                       &shared_object);
 
-        if (shared_status != KERNEL_SHARED_ANON_OK)
-            return shared_status == KERNEL_SHARED_ANON_NO_MEMORY
+        if (shared_status != KERNEL_MEMORY_OBJECT_OK)
+            return shared_status == KERNEL_MEMORY_OBJECT_NO_MEMORY
                        ? KERNEL_MM_STATUS_NO_MEMORY
                        : KERNEL_MM_STATUS_STATE;
         enum kernel_heap_status heap_status = kernel_heap_allocate_zeroed(
             record->vma_heap, 1U, sizeof(*shared_entry),
             (void **)&shared_entry);
         if (heap_status != KERNEL_HEAP_STATUS_OK) {
-            kernel_shared_anon_release(&shared_object);
+            kernel_memory_object_release(&shared_object);
             return heap_status == KERNEL_HEAP_STATUS_EMPTY
                        ? KERNEL_MM_STATUS_NO_MEMORY
                        : KERNEL_MM_STATUS_STATE;
@@ -1848,7 +1848,7 @@ discard_shared:
         kernel_heap_release(record->vma_heap, shared_entry) !=
             KERNEL_HEAP_STATUS_OK) __builtin_trap();
     if (shared_object != 0)
-        kernel_shared_anon_release(&shared_object);
+        kernel_memory_object_release(&shared_object);
     return status;
 }
 
@@ -2940,19 +2940,19 @@ static enum kernel_mm_status resolve_user_fault_once(
     if (vma.kind == KERNEL_VMA_KIND_ANON_SHARED &&
         vma.fault_policy == KERNEL_VMA_FAULT_ANON_SHARED &&
         vma.backing != 0) {
-        struct kernel_shared_anon *object = vma.backing;
+        struct kernel_memory_object *object = vma.backing;
         uint64_t index = (vma.backing_offset +
                           page_address - vma.start) >> BOAROS_PAGE_SHIFT;
         uint64_t physical_address;
         int created;
-        enum kernel_shared_anon_status shared_status;
+        enum kernel_memory_object_status shared_status;
 
-        shared_status = kernel_shared_anon_get_page(object, index,
+        shared_status = kernel_memory_object_get_page(object, index,
                                                    &physical_address,
                                                    &created);
-        if (shared_status == KERNEL_SHARED_ANON_NO_MEMORY)
+        if (shared_status == KERNEL_MEMORY_OBJECT_NO_MEMORY)
             return KERNEL_MM_STATUS_NO_MEMORY;
-        if (shared_status != KERNEL_SHARED_ANON_OK)
+        if (shared_status != KERNEL_MEMORY_OBJECT_OK)
             return KERNEL_MM_STATUS_STATE;
         sv39_status = riscv_sv39_user_map_owned_page(
             &record->space, page_address, physical_address,
@@ -2961,7 +2961,7 @@ static enum kernel_mm_status resolve_user_fault_once(
             if (physical_page_release(mm->allocator, physical_address) !=
                 PHYSICAL_PAGE_STATUS_OK) __builtin_trap();
             if (created != 0)
-                kernel_shared_anon_discard_new_page(object, index,
+                kernel_memory_object_discard_new_page(object, index,
                                                     physical_address);
             return sv39_status == RISCV_SV39_STATUS_NO_MEMORY
                        ? KERNEL_MM_STATUS_NO_MEMORY
