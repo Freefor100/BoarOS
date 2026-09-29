@@ -10,6 +10,7 @@
 #include <kernel/signal.h>
 #include <arch/riscv/signal.h>
 #include <kernel/syscall.h>
+#include <kernel/time.h>
 #include <kernel/task.h>
 #include <kernel/tick.h>
 
@@ -130,6 +131,7 @@ void riscv_trap_dispatch(struct riscv_trap_frame *frame)
             riscv_timer_fatal(frame, status);
         }
         kernel_tick_advance(elapsed_ticks);
+        kernel_time_update_coarse();
         kernel_scheduler_charge_ticks(elapsed_ticks, (int)from_user);
         {
             enum kernel_scheduler_status scheduler_status =

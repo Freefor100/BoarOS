@@ -27,6 +27,13 @@ uint64_t kernel_time_monotonic_ns(void);
 /* Wall-clock nanoseconds: boot reading plus monotonic. */
 uint64_t kernel_time_realtime_ns(void);
 
+/* Init and each delivered timer interrupt publish one actual counter sample.
+ * Both coarse clocks derive from that same sample; reads do not touch CSR time. */
+void kernel_time_update_coarse(void);
+uint64_t kernel_time_coarse_monotonic_ns(void);
+uint64_t kernel_time_coarse_realtime_ns(void);
+uint64_t kernel_time_coarse_resolution_ns(void);
+
 /* Converts time-counter ticks to nanoseconds (0 before init). */
 uint64_t kernel_time_ticks_to_ns(uint64_t ticks);
 

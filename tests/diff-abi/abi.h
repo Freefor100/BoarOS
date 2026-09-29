@@ -64,4 +64,5 @@ void abi_mode_cases(void);
 void abi_socket_cases(void);
 void abi_file_lock_exec_probe(unsigned mode) __attribute__((noreturn));
 void abi_limit_exec_probe(void) __attribute__((noreturn));
+void abi_coarse_cases(void);
 #endif

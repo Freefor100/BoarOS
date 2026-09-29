@@ -16,17 +16,22 @@
 
 #define LINUX_CLOCK_REALTIME 0U
 #define LINUX_CLOCK_MONOTONIC 1U
+#define LINUX_CLOCK_REALTIME_COARSE 5U
+#define LINUX_CLOCK_MONOTONIC_COARSE 6U
 #define LINUX_CLOCK_NSECS_PER_SEC UINT64_C(1000000000)
 #define LINUX_TIMER_ABSTIME UINT64_C(1)
 
-/*
- * clockid support covers the clocks the kernel can actually back:
- * CLOCK_REALTIME from the boot RTC reading plus the time counter, and
- * CLOCK_MONOTONIC from the time counter.  Everything else reports EINVAL.
- */
+static int syscall_clock_id_coarse(uint64_t clock_id)
+{
+    return clock_id == LINUX_CLOCK_REALTIME_COARSE ||
+           clock_id == LINUX_CLOCK_MONOTONIC_COARSE;
+}
+
+/* Readable clocks and sleep-capable clocks deliberately have separate checks. */
 static int syscall_clock_id_valid(uint64_t clock_id)
 {
-    return clock_id == LINUX_CLOCK_REALTIME || clock_id == LINUX_CLOCK_MONOTONIC;
+    return clock_id == LINUX_CLOCK_REALTIME || clock_id == LINUX_CLOCK_MONOTONIC ||
+           syscall_clock_id_coarse(clock_id);
 }
 
 static void syscall_split_nanoseconds(uint64_t nanoseconds,
@@ -80,9 +85,12 @@ enum kernel_syscall_status syscall_handle_clock_gettime(
         decoded->value = -KERNEL_EINVAL;
         return KERNEL_SYSCALL_STATUS_OK;
     }
-    nanoseconds = request->arguments[0] == LINUX_CLOCK_REALTIME
-                      ? kernel_time_realtime_ns()
-                      : kernel_time_monotonic_ns();
+    switch (request->arguments[0]) {
+    case LINUX_CLOCK_REALTIME: nanoseconds = kernel_time_realtime_ns(); break;
+    case LINUX_CLOCK_MONOTONIC: nanoseconds = kernel_time_monotonic_ns(); break;
+    case LINUX_CLOCK_REALTIME_COARSE: nanoseconds = kernel_time_coarse_realtime_ns(); break;
+    default: nanoseconds = kernel_time_coarse_monotonic_ns(); break;
+    }
     syscall_split_nanoseconds(nanoseconds, &seconds, &sub_nanoseconds);
     return syscall_return_time(caller,
                                 request->arguments[1],
@@ -106,11 +114,12 @@ enum kernel_syscall_status syscall_handle_clock_getres(
         decoded->value = 0;
         return KERNEL_SYSCALL_STATUS_OK;
     }
-    /* Nanosecond time-counter resolution. */
+    /* Coarse reports the actual timer period; fine keeps its existing ABI. */
     return syscall_return_time(caller,
                                 request->arguments[1],
                                 0,
-                                1,
+                                syscall_clock_id_coarse(request->arguments[0])
+                                    ? kernel_time_coarse_resolution_ns() : 1,
                                 decoded);
 }
 
@@ -325,6 +334,11 @@ enum kernel_syscall_status syscall_handle_sleep_for(
     uint64_t deadline;
     uint64_t now_ns;
 
+    if (syscall_clock_id_coarse(clock_id)) {
+        decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+        decoded->value = -KERNEL_EOPNOTSUPP;
+        return KERNEL_SYSCALL_STATUS_OK;
+    }
     if (clock_id != LINUX_CLOCK_REALTIME && clock_id != LINUX_CLOCK_MONOTONIC) {
         decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
         decoded->value = -KERNEL_EINVAL;

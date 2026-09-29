@@ -788,3 +788,17 @@ tmpfs.relatime-nanoseconds
 tmpfs.hardlink-quota-full
 tmpfs.hardlink-quota-release
 tmpfs.hardlink-unmount
+coarse.realtime.get
+coarse.realtime.res
+coarse.realtime.res-null
+coarse.realtime.bad-pointer
+coarse.realtime.sleep
+coarse.realtime.sleep-absolute
+coarse.realtime.sleep-bad-pointer
+coarse.monotonic.get
+coarse.monotonic.res
+coarse.monotonic.res-null
+coarse.monotonic.bad-pointer
+coarse.monotonic.sleep
+coarse.monotonic.sleep-absolute
+coarse.monotonic.sleep-bad-pointer
