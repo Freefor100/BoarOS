@@ -63,12 +63,9 @@ static struct kernel_task *representative(struct kernel_task *leader)
 
 static struct kernel_task *find_member(kernel_pid_t pid, uint64_t identity)
 {
-    struct kernel_task *root = scheduler.init_task;
-    for (struct kernel_task *leader = root; leader;
-         leader = next_process(leader, root))
-        if (leader->tid == pid && leader->proc_identity == identity)
-            return representative(leader) ? leader : 0;
-    return 0;
+    struct kernel_task *leader = process_find_identity(pid, KERNEL_PID_TGID);
+    return leader && process_identity_generation(leader) == identity &&
+        representative(leader) ? leader : 0;
 }
 
 static struct kernel_task *find_resource_owner(kernel_pid_t pid,
@@ -120,8 +117,8 @@ int kernel_proc_process_snapshot(kernel_pid_t pid, uint64_t identity,
         .pid = pid,
         .ppid = leader->parent && leader->parent->group_leader
             ? leader->parent->group_leader->tid : 0,
-        .process_group = leader->process_group,
-        .session_id = leader->session_id,
+        .process_group = process_identity_number(leader, KERNEL_PID_PGID),
+        .session_id = process_identity_number(leader, KERNEL_PID_SID),
         .identity = identity,
         .start_ticks = leader->proc_start_ticks,
         .state = task->proc_exiting ||
@@ -319,7 +316,7 @@ static void consider(const struct kernel_task *task, kernel_pid_t after,
     kernel_pid_t pid = task->group_leader->tid;
     if (pid > after && (*best == 0 || pid < *best)) {
         *best = pid;
-        *identity = task->group_leader->proc_identity;
+        *identity = process_identity_generation(task);
     }
 }
 

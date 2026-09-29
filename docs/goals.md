@@ -10,7 +10,8 @@ Linux 为 `references/linux` 的 `f4cdf7ca9a1fdcca413157df19753f388a5a224e`。
 从 `main@b5593ca` 演进，已确认统一 TID/TGID/PGID/SID 对象、会话/进程组、
 coarse clock、VirtIO RNG 与随机接口，以及普通/FIFO/RR 和全局实时带宽控制。
 默认周期 1 秒、预算 950 毫秒；这是本项目选定参数，不代表固定 Linux 默认值。
-coarse clock 的 14 条窄差分与 syscall/timer 模块已通过，其余机制仍在实现和审查中。
+统一身份对象迁移已通过 scheduler/userland 和独立引用审查；coarse clock 的 14 条
+窄差分与 syscall/timer 模块通过，组合完整差分 797 条匹配。会话、随机和调度新行为仍在实现中。
 本阶段不扩展 TTY、完整凭据、PI futex、PID namespace 或 SMP；最终消费者与全量
 回归完成前，不把新增接口或编译成功当作交付。依据仍为本页固定 Linux 与 QEMU v11.1.0。
 

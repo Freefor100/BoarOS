@@ -37,4 +37,44 @@ enum kernel_pid_status kernel_pid_release(
     struct kernel_pid_allocator *allocator,
     kernel_pid_t pid);
 
+/* Mutations and borrowed lookups require the caller's identity lock.  Storage
+ * is prepared before publication and retired storage is freed after mutation. */
+enum kernel_pid_role { KERNEL_PID_TID, KERNEL_PID_TGID,
+    KERNEL_PID_PGID, KERNEL_PID_SID, KERNEL_PID_ROLES };
+struct kernel_pid;
+struct kernel_pid_member {
+    struct kernel_pid *identity;
+    struct kernel_pid_member *previous, *next;
+    void *task;
+    enum kernel_pid_role role;
+};
+#define KERNEL_PID_BUCKETS 256U
+struct kernel_pid_registry {
+    struct kernel_pid_allocator *numbers;
+    struct kernel_pid *buckets[KERNEL_PID_BUCKETS];
+    struct kernel_pid *retired;
+    uint64_t next_generation;
+};
+struct kernel_pid {
+    kernel_pid_t number;
+    uint32_t references;
+    uint64_t generation;
+    struct kernel_pid_registry *registry;
+    struct kernel_pid *hash_next;
+    struct kernel_pid_member *members[KERNEL_PID_ROLES];
+};
+enum kernel_pid_status kernel_pid_publish(struct kernel_pid_registry *registry,
+                                          struct kernel_pid *prepared);
+struct kernel_pid *kernel_pid_find(struct kernel_pid_registry *registry,
+                                   kernel_pid_t number);
+void kernel_pid_get(struct kernel_pid *identity);
+void kernel_pid_put(struct kernel_pid *identity);
+void kernel_pid_attach(struct kernel_pid_member *member,
+                       struct kernel_pid *identity, enum kernel_pid_role role,
+                       void *task);
+void kernel_pid_detach(struct kernel_pid_member *member);
+void kernel_pid_transfer(struct kernel_pid_member *old,
+                         struct kernel_pid_member *replacement, void *task);
+struct kernel_pid *kernel_pid_take_retired(struct kernel_pid_registry *registry);
+
 #endif

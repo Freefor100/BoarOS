@@ -47,6 +47,99 @@
 #define LINUX_CLONE_CHILD_CLEARTID UINT64_C(0x200000)
 #define LINUX_CLONE_CHILD_SETTID UINT64_C(0x1000000)
 
+/* No allocation/yield is permitted between publication and role attachment.
+ * SIE=0 alone is not a no-sleep promise: slab preparation precedes this region. */
+void process_identity_collect(void)
+{
+    struct kernel_pid *id;
+    while ((id = kernel_pid_take_retired(&scheduler.identities)) != 0)
+        (void)kernel_heap_release(&scheduler.identity_heap, id);
+}
+
+struct kernel_pid *process_identity(const struct kernel_task *task, enum kernel_pid_role role)
+{
+    if (!task || (unsigned)role >= KERNEL_PID_ROLES) return 0;
+    if (role != KERNEL_PID_TID) task = task->group_leader;
+    return task ? task->identities[role].identity : 0;
+}
+
+kernel_pid_t process_identity_number(const struct kernel_task *task, enum kernel_pid_role role)
+{
+    struct kernel_pid *id = process_identity(task, role);
+    return id ? id->number : 0;
+}
+
+uint64_t process_identity_generation(const struct kernel_task *task)
+{
+    struct kernel_pid *id = process_identity(task, KERNEL_PID_TGID);
+    return id ? id->generation : 0;
+}
+
+struct kernel_task *process_find_identity(kernel_pid_t number, enum kernel_pid_role role)
+{
+    struct kernel_pid *id = kernel_pid_find(&scheduler.identities, number);
+    return id && id->members[role] ? id->members[role]->task : 0;
+}
+
+static void identity_sync_cache(struct kernel_task *task)
+{
+    task->tid = process_identity_number(task, KERNEL_PID_TID);
+    task->tid_owned = task->tid != 0;
+}
+
+enum kernel_pid_status process_identity_create(struct kernel_task *task,
+    struct kernel_task *parent, int thread_clone)
+{
+    struct kernel_pid *id = 0;
+    process_identity_collect();
+    if (kernel_heap_allocate_zeroed(&scheduler.identity_heap, 1, sizeof(*id),
+                                    (void **)&id) != KERNEL_HEAP_STATUS_OK)
+        return KERNEL_PID_STATUS_EXHAUSTED;
+    enum kernel_pid_status status = kernel_pid_publish(&scheduler.identities, id);
+    if (status != KERNEL_PID_STATUS_OK) {
+        (void)kernel_heap_release(&scheduler.identity_heap, id);
+        return status;
+    }
+    kernel_pid_attach(&task->identities[KERNEL_PID_TID], id, KERNEL_PID_TID, task);
+    if (!thread_clone) {
+        kernel_pid_attach(&task->identities[KERNEL_PID_TGID], id, KERNEL_PID_TGID, task);
+        kernel_pid_attach(&task->identities[KERNEL_PID_PGID],
+            parent ? process_identity(parent, KERNEL_PID_PGID) : id, KERNEL_PID_PGID, task);
+        kernel_pid_attach(&task->identities[KERNEL_PID_SID],
+            parent ? process_identity(parent, KERNEL_PID_SID) : id, KERNEL_PID_SID, task);
+    }
+    kernel_pid_put(id);
+    identity_sync_cache(task);
+    return KERNEL_PID_STATUS_OK;
+}
+
+void process_identity_release(struct kernel_task *task)
+{
+    for (unsigned role = 0; role < KERNEL_PID_ROLES; role++)
+        if (task->identities[role].identity) kernel_pid_detach(&task->identities[role]);
+    if (task->child_creator) {
+        kernel_pid_put(task->child_creator);
+        task->child_creator = 0;
+    }
+    identity_sync_cache(task);
+}
+
+static void child_creator_change(struct kernel_task *child, struct kernel_pid *creator)
+{
+    if (creator) kernel_pid_get(creator);
+    if (child->child_creator) kernel_pid_put(child->child_creator);
+    child->child_creator = creator;
+}
+
+static void identity_adopt(struct kernel_task *task, struct kernel_task *leader)
+{
+    process_identity_release(task);
+    for (unsigned role = 0; role < KERNEL_PID_ROLES; role++)
+        kernel_pid_transfer(&leader->identities[role], &task->identities[role], task);
+    identity_sync_cache(task);
+    identity_sync_cache(leader);
+}
+
 void process_group_initialize(struct kernel_task *task)
 {
     task->group_next = task;
@@ -54,7 +147,7 @@ void process_group_initialize(struct kernel_task *task)
     kernel_wait_queue_init(&task->group_wait_queue);
 }
 
-static kernel_pid_t child_reaper_tid(struct kernel_task *leader,
+static struct kernel_pid *child_reaper_identity(struct kernel_task *leader,
                                      const struct kernel_task *departing)
 {
     struct kernel_task *member = leader;
@@ -63,10 +156,10 @@ static kernel_pid_t child_reaper_tid(struct kernel_task *leader,
             member->state != KERNEL_THREAD_STATE_EXITED &&
             member->state != KERNEL_THREAD_STATE_ZOMBIE &&
             member->state != KERNEL_THREAD_STATE_GROUP_DEAD)
-            return member->tid;
+            return process_identity(member, KERNEL_PID_TID);
         member = member->group_next;
     } while (member != leader);
-    return leader->tid;
+    return process_identity(leader, KERNEL_PID_TID);
 }
 
 static void request_thread_termination(struct kernel_task *task)
@@ -310,11 +403,9 @@ enum kernel_scheduler_status process_group_exec_current(void)
             kernel_user_thread_exit(KERNEL_THREAD_EXIT_SYSCALL, 0U, 0U);
     }
     if (task != leader) {
-        kernel_pid_t old_tid = task->tid;
-        if (kernel_pid_release(&scheduler.pid_allocator, task->tid) !=
-            KERNEL_PID_STATUS_OK) return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
-        task->tid = leader->tid;
-        task->proc_identity = leader->proc_identity;
+        struct kernel_pid *old_identity = process_identity(task, KERNEL_PID_TID);
+        kernel_pid_get(old_identity);
+        identity_adopt(task, leader);
         task->proc_start_ticks = leader->proc_start_ticks;
         task->parent = leader->parent;
         task->previous_sibling = leader->previous_sibling;
@@ -332,10 +423,12 @@ enum kernel_scheduler_status process_group_exec_current(void)
         for (member = task->first_child; member != 0;
              member = member->next_sibling) {
             member->parent = task;
-            if (member->child_creator_tid == old_tid)
-                member->child_creator_tid = task->tid;
+            if (member->child_creator == old_identity)
+                child_creator_change(member, process_identity(task, KERNEL_PID_TID));
         }
-        task->child_creator_tid = leader->child_creator_tid;
+        kernel_pid_put(old_identity);
+        task->child_creator = leader->child_creator;
+        leader->child_creator = 0;
         task->user_ticks += leader->user_ticks;
         task->kernel_ticks += leader->kernel_ticks;
         task->child_user_ticks = leader->child_user_ticks;
@@ -344,7 +437,6 @@ enum kernel_scheduler_status process_group_exec_current(void)
         task->major_faults += leader->major_faults;
         task->child_minor_faults = leader->child_minor_faults;
         task->child_major_faults = leader->child_major_faults;
-        task->session_id = leader->session_id;
         task->group_pending = leader->group_pending;
         task->nofile_limit = leader->nofile_limit;
         task->stack_limit = leader->stack_limit;
@@ -357,8 +449,6 @@ enum kernel_scheduler_status process_group_exec_current(void)
         leader->parent = 0;
         leader->first_child = leader->last_child = 0;
         leader->previous_sibling = leader->next_sibling = 0;
-        leader->tid_owned = 0U;
-        leader->tid = 0;
         leader->publish_completion = 0U;
         leader->group_leader = 0;
         leader->group_members = 0U;
@@ -433,18 +523,10 @@ static enum kernel_scheduler_status finish_clone_failure(
     if (stack_status != KERNEL_SCHEDULER_STATUS_OK) return stack_status;
     cleanup_failed = release_clone_resources(thread);
 
-    if (thread->tid_owned != 0U) {
-        if (kernel_pid_release(&scheduler.pid_allocator, thread->tid) !=
-            KERNEL_PID_STATUS_OK) {
-            cleanup_failed = 1;
-        } else {
-            thread->tid = 0;
-            thread->process_group = 0;
-            thread->tid_owned = 0U;
-            thread->group_leader = 0;
-            thread->group_members = 0U;
-        }
-    }
+    process_identity_release(thread);
+    thread->group_leader = 0;
+    thread->group_members = 0U;
+    process_identity_collect();
     if (!cleanup_failed) {
         scheduler_forget_task(thread);
         (void)physical_page_release(scheduler.allocator,
@@ -577,11 +659,7 @@ enum kernel_scheduler_status riscv_process_clone_current(
                     : KERNEL_SCHEDULER_STATUS_INVALID_STATE);
         }
     }
-    if (scheduler.next_proc_identity > (UINT64_MAX >> 30U)) {
-        return finish_clone_failure(child, -KERNEL_EAGAIN, linux_result,
-                                    KERNEL_SCHEDULER_STATUS_OK);
-    }
-    pid_status = kernel_pid_allocate(&scheduler.pid_allocator, &tid);
+    pid_status = process_identity_create(child, parent, thread_clone);
     if (pid_status != KERNEL_PID_STATUS_OK) {
         return finish_clone_failure(
             child,
@@ -592,13 +670,9 @@ enum kernel_scheduler_status riscv_process_clone_current(
                 ? KERNEL_SCHEDULER_STATUS_OK
                 : KERNEL_SCHEDULER_STATUS_INVALID_STATE);
     }
-    child->tid = tid;
-    child->proc_identity = scheduler.next_proc_identity++;
+    tid = child->tid;
     child->proc_start_ticks = kernel_tick_count();
-    child->session_id = parent->session_id;
     memcpy(child->comm, parent->comm, sizeof(child->comm));
-    child->process_group = parent->process_group;
-    child->tid_owned = 1U;
     child->group_leader = child;
     child->group_members = 1U;
     child->nofile_limit = parent->group_leader->nofile_limit;
@@ -662,7 +736,7 @@ enum kernel_scheduler_status riscv_process_clone_current(
         leader->group_members++;
         child->completion.tgid = leader->tid;
     } else {
-        child->child_creator_tid = parent->tid;
+        child_creator_change(child, process_identity(parent, KERNEL_PID_TID));
         child_append(parent->group_leader, child);
     }
     kernel_mm_add_user(&child->mm);
@@ -695,12 +769,12 @@ static int wait_child_matches(const struct kernel_task *parent,
         return child->tid == pid;
     }
     if (pid == 0) {
-        return child->process_group == parent->process_group;
+        return process_identity_number(child, KERNEL_PID_PGID) == process_identity_number(parent, KERNEL_PID_PGID);
     }
     if (pid == -1) {
         return 1;
     }
-    return child->process_group == -pid;
+    return process_identity_number(child, KERNEL_PID_PGID) == -pid;
 }
 
 static enum kernel_scheduler_status reap_waited_child(
@@ -729,10 +803,7 @@ static enum kernel_scheduler_status reap_waited_child(
         child->exec_transaction != 0) {
         return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
     }
-    if (kernel_pid_release(&scheduler.pid_allocator, pid) !=
-        KERNEL_PID_STATUS_OK) {
-        return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
-    }
+    process_identity_release(child);
     parent->group_leader->child_user_ticks += user_ticks;
     parent->group_leader->child_kernel_ticks += kernel_ticks;
     parent->group_leader->child_minor_faults +=
@@ -743,9 +814,6 @@ static enum kernel_scheduler_status reap_waited_child(
     if (scheduler.init_task == child) {
         scheduler.init_task = 0;
     }
-    child->tid = 0;
-    child->process_group = 0;
-    child->tid_owned = 0U;
     child->group_leader = 0;
     child->group_members = 0U;
     child->publish_completion = 0U;
@@ -909,7 +977,7 @@ enum kernel_scheduler_status kernel_scheduler_wait4_current(
             }
             previous = child;
             if ((options & LINUX___WNOTHREAD) != 0U &&
-                child->child_creator_tid != parent->tid) continue;
+                child->child_creator != process_identity(parent, KERNEL_PID_TID)) continue;
             if ((options & LINUX___WCLONE) != 0U &&
                 (options & LINUX___WALL) == 0U) {
                 continue;
@@ -1134,8 +1202,8 @@ enum kernel_scheduler_status kernel_scheduler_reap_one(
             struct kernel_task *child;
             for (child = thread->first_child; child != 0;
                  child = child->next_sibling)
-                if (child->child_creator_tid == thread->tid)
-                    child->child_creator_tid = child_reaper_tid(thread, thread);
+                if (child->child_creator == process_identity(thread, KERNEL_PID_TID))
+                    child_creator_change(child, child_reaper_identity(thread, thread));
             /* Keep the group identity until its last member has left. */
             scheduler.exited_head = next;
             if (next == 0) scheduler.exited_tail = 0;
@@ -1151,8 +1219,8 @@ enum kernel_scheduler_status kernel_scheduler_reap_one(
              * relationship before its TID can be recycled. */
             for (child = leader->first_child; child != 0;
                  child = child->next_sibling)
-                if (child->child_creator_tid == thread->tid)
-                    child->child_creator_tid = child_reaper_tid(leader, thread);
+                if (child->child_creator == process_identity(thread, KERNEL_PID_TID))
+                    child_creator_change(child, child_reaper_identity(leader, thread));
             leader->user_ticks += thread->user_ticks;
             leader->kernel_ticks += thread->kernel_ticks;
             leader->minor_faults += thread->minor_faults;
@@ -1203,17 +1271,10 @@ enum kernel_scheduler_status kernel_scheduler_reap_one(
             return KERNEL_SCHEDULER_STATUS_EMPTY;
         }
         if (thread->tid_owned != 0U) {
-            if (kernel_pid_release(&scheduler.pid_allocator,
-                                   thread->tid) !=
-                KERNEL_PID_STATUS_OK) {
-                return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
-            }
+            process_identity_release(thread);
             if (scheduler.init_task == thread) {
                 scheduler.init_task = 0;
             }
-            thread->tid = 0;
-            thread->process_group = 0;
-            thread->tid_owned = 0U;
             thread->group_leader = 0;
             thread->group_members = 0U;
         }
@@ -1461,11 +1522,12 @@ static enum kernel_scheduler_status reparent_children(
         struct kernel_task *next = child->next_sibling;
 
         child->parent = 0;
+        child_creator_change(child, 0);
         child->previous_sibling = 0;
         child->next_sibling = 0;
         if (new_parent != 0) {
             child_append(new_parent, child);
-            child->child_creator_tid = child_reaper_tid(new_parent, 0);
+            child_creator_change(child, child_reaper_identity(new_parent, 0));
             if (child->state == KERNEL_THREAD_STATE_ZOMBIE) {
                 kernel_signal_notify_child_exit(child);
                 if (kernel_signal_child_autoreap(new_parent)) {

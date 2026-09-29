@@ -5,6 +5,7 @@
 #include <arch/riscv/fpu.h>
 #include <arch/riscv/thread.h>
 #include <kernel/files.h>
+#include <kernel/heap.h>
 #include <kernel/fs_context.h>
 #include <kernel/mm.h>
 #include <kernel/physical_page.h>
@@ -113,7 +114,7 @@ struct kernel_task {
     uint32_t state;
     uint32_t idle;
     kernel_pid_t tid;
-    kernel_pid_t process_group;
+    struct kernel_pid_member identities[KERNEL_PID_ROLES];
     uint32_t tid_owned;
     uint32_t publish_completion;
     uint32_t wait_status;
@@ -137,9 +138,7 @@ struct kernel_task {
     uint64_t child_minor_faults;
     uint64_t child_major_faults;
     uint64_t block_reads;
-    uint64_t proc_identity;
     uint64_t proc_start_ticks;
-    kernel_pid_t session_id;
     char comm[16];
     struct kernel_wait_queue child_exit_queue;
     struct kernel_wait_queue vfork_done_queue;
@@ -151,7 +150,7 @@ struct kernel_task {
     uint32_t group_members;
     struct kernel_task *group_next;
     struct kernel_task *group_previous;
-    kernel_pid_t child_creator_tid;
+    struct kernel_pid *child_creator;
     uint32_t terminate_requested;
     uint32_t proc_exiting;
     uint32_t group_exiting;
@@ -193,7 +192,8 @@ struct kernel_scheduler {
     uint64_t idle_ticks;
     struct kernel_task *all_tasks;
     uint64_t loads[3], load_ticks;
-    uint64_t next_proc_identity;
+    struct kernel_pid_registry identities;
+    struct kernel_heap identity_heap;
     struct physical_page_allocator *allocator;
     struct kernel_pid_allocator pid_allocator;
     uint64_t pid_bitmap[KERNEL_PID_BITMAP_WORDS(KERNEL_PID_LIMIT)];
@@ -222,6 +222,14 @@ void kernel_proc_task_update_comm(struct kernel_task *task);
 void scheduler_wake_task(struct kernel_task *thread, uint32_t reason);
 void scheduler_wait_requeue(struct kernel_task *task,
                             struct kernel_wait_queue *queue);
+enum kernel_pid_status process_identity_create(struct kernel_task *task,
+    struct kernel_task *parent, int thread_clone);
+void process_identity_release(struct kernel_task *task);
+void process_identity_collect(void);
+struct kernel_task *process_find_identity(kernel_pid_t number, enum kernel_pid_role role);
+struct kernel_pid *process_identity(const struct kernel_task *task, enum kernel_pid_role role);
+kernel_pid_t process_identity_number(const struct kernel_task *task, enum kernel_pid_role role);
+uint64_t process_identity_generation(const struct kernel_task *task);
 void process_group_initialize(struct kernel_task *task);
 void process_group_request_exit(struct kernel_task *task,
                                 enum kernel_thread_exit_reason reason,

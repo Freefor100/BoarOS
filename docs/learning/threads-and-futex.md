@@ -70,3 +70,20 @@ vfork 成功 exec 提前丢掉 clear 指针，没有清零旧共享 MM。
 比赛启动环境尚未完成，不能据此宣称评分已改善。
 
 整合审查补充了清 TID 缺页期间的并发退出：A 尚在复制时 B 退出，两者都应按当时 MM 使用者数清零。MM 聚焦测试在真实页/MM 上从复制入口注入 B 退出，旧注销顺序得到 0x603（B 未清零）；将注销移至复制/唤醒之后通过。该注入是确定性模块交错，并不冒称真实磁盘时序；真实 U-mode 证据仍由 tid.* 提供。
+
+## 统一进程身份对象（2026-09-29）
+
+固定依据为 `references/linux` commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`
+的 PID、exec 和退出实现。TID/TGID/PGID/SID 现在通过同一编号/代次对象的角色成员链
+维持所有权；编号在最后成员和临时引用释放前不复用。只剩 PGID/SID 引用的对象不能
+被 task lookup 当成活任务。proc 原代次契约保留，非组长 exec 转移进程角色，退出的
+组长容器保留到真正的进程结束。`__WNOTHREAD` 创建者关系也持身份引用，避免 TID 复用混淆。
+
+对象在身份修改区外准备；修改区只发布/摘链，退役对象在区外释放。当前 syscall 的
+SIE=0 本身不表示不可睡眠，禁止的是身份原子修改过程中分配、yield 或清理资源。
+编号和可编码代次空间耗尽均返回资源耗尽，非法引用/重复释放仍视为内核不变量错误。
+
+验证：`make test-pid-object-host` 覆盖角色存续、临时 pin、代次复用、角色转移、容量
+和代次耗尽回滚；独立 ASan/UBSan 运行通过。`make test-scheduler-cases-riscv test-scheduler-riscv test-userland-riscv` 通过，包含 fork/vfork、pthread 与非组长 exec。
+迁移后加 coarse clock 的完整 ABI 差分为 797 条匹配。此记录只证明身份迁移，
+会话 syscall 与孤儿组事件另外验收。

@@ -805,61 +805,14 @@ enum kernel_signal_status kernel_signal_send_task(
 
 struct kernel_task *kernel_signal_find_by_tid(kernel_pid_t tid)
 {
-    struct kernel_task *task;
-
-    if (signal_dispatchable(scheduler.current) &&
-        scheduler.current->tid == tid) {
-        return scheduler.current;
-    }
-    for (task = scheduler.ready_head; task != 0; task = task->next) {
-        if (task->tid == tid && signal_dispatchable(task)) {
-            return task;
-        }
-    }
-    for (task = scheduler.blocked_head; task != 0; task = task->next) {
-        if (task->tid == tid && signal_dispatchable(task)) {
-            return task;
-        }
-    }
-    for (task = scheduler.stopped_head; task != 0; task = task->next) {
-        if (task->tid == tid && signal_dispatchable(task)) {
-            return task;
-        }
-    }
-    return 0;
+    struct kernel_task *task = process_find_identity(tid, KERNEL_PID_TID);
+    return signal_dispatchable(task) ? task : 0;
 }
 
 static struct kernel_task *signal_group_by_tgid(kernel_pid_t tgid)
 {
-    struct kernel_task *task;
-
-    if (tgid <= 0) {
-        return 0;
-    }
-    if (signal_dispatchable(scheduler.current) &&
-        signal_group_leader(scheduler.current) != 0 &&
-        scheduler.current->group_leader->tid == tgid) {
-        return scheduler.current->group_leader;
-    }
-    for (task = scheduler.ready_head; task != 0; task = task->next) {
-        if (signal_group_leader(task) != 0 &&
-            task->group_leader->tid == tgid) {
-            return task->group_leader;
-        }
-    }
-    for (task = scheduler.blocked_head; task != 0; task = task->next) {
-        if (signal_group_leader(task) != 0 &&
-            task->group_leader->tid == tgid) {
-            return task->group_leader;
-        }
-    }
-    for (task = scheduler.stopped_head; task != 0; task = task->next) {
-        if (signal_group_leader(task) != 0 &&
-            task->group_leader->tid == tgid) {
-            return task->group_leader;
-        }
-    }
-    return 0;
+    struct kernel_task *leader = process_find_identity(tgid, KERNEL_PID_TGID);
+    return leader && signal_group_representative(leader) ? leader : 0;
 }
 
 static int signal_matches_target(const struct kernel_task *task,
@@ -877,7 +830,7 @@ static int signal_matches_target(const struct kernel_task *task,
     }
     if (pid == 0) {
         return caller_leader != 0 &&
-               leader->process_group == caller_leader->process_group;
+               process_identity_number(leader, KERNEL_PID_PGID) == process_identity_number(caller_leader, KERNEL_PID_PGID);
     }
     if (pid == -1) {
         return leader != caller_leader && leader->tid != 1;
@@ -885,7 +838,7 @@ static int signal_matches_target(const struct kernel_task *task,
     if (pid == INT32_MIN) {
         return 0;
     }
-    return leader->process_group == (kernel_pid_t)(-pid);
+    return process_identity_number(leader, KERNEL_PID_PGID) == (kernel_pid_t)(-pid);
 }
 
 uint32_t kernel_signal_resolve_targets(struct kernel_task *caller,

@@ -1465,3 +1465,9 @@ $(MULTI_DISK_IO_RV): tests/userland/multi_disk_io.c $(MUSL_STAMP)
 test-multi-disk-io-riscv: $(KERNEL_RV) $(MULTI_DISK_IO_RV) build/host/nbd-fault
 	PYTHONDONTWRITEBYTECODE=1 python3 tests/multi-disk-io-riscv.py \
 		--kernel $(KERNEL_RV) --program $(MULTI_DISK_IO_RV) --qemu $(QEMU_RISCV64)
+
+.PHONY: test-pid-object-host
+test-pid-object-host:
+	@mkdir -p build/host
+	cc -std=c11 -Wall -Wextra -Werror -Iinclude tests/pid-object-host.c kernel/pid.c -o build/host/pid-object-test
+	build/host/pid-object-test

@@ -1,4 +1,5 @@
 #include <arch/riscv/context.h>
+#include <arch/riscv/direct_map.h>
 #include <arch/riscv/fpu.h>
 #include <arch/riscv/mm.h>
 #include <arch/riscv/sv39.h>
@@ -27,6 +28,11 @@
 #include "private.h"
 
 struct kernel_scheduler scheduler;
+static int identity_heap_address(const void *pointer, uint64_t *address)
+{
+    return riscv_direct_map_va_to_pa((uint64_t)(uintptr_t)pointer, 1U, address)
+        == RISCV_DIRECT_MAP_STATUS_OK;
+}
 
 
 
@@ -193,7 +199,9 @@ static enum kernel_scheduler_status validate_thread(
             return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
         }
         if (thread->tid_owned != 0U) {
-            if (thread->tid <= 0 || thread->group_leader == 0 ||
+            if (thread->tid <= 0 ||
+                thread->tid != process_identity_number(thread, KERNEL_PID_TID) ||
+                thread->group_leader == 0 ||
                 thread->group_leader->group_leader != thread->group_leader ||
                 thread->group_leader->group_members == 0U) {
                 return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
@@ -580,7 +588,10 @@ enum kernel_scheduler_status kernel_scheduler_init(
     scheduler.load_ticks = 0;
     for (unsigned i = 0; i < 3; i++) scheduler.loads[i] = 0;
     scheduler.allocator = allocator;
-    scheduler.next_proc_identity = 1U;
+    scheduler.identities.numbers = &scheduler.pid_allocator;
+    scheduler.identities.next_generation = 1U;
+    if (kernel_heap_init(&scheduler.identity_heap, allocator, identity_heap_address)
+            != KERNEL_HEAP_STATUS_OK) return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
     scheduler.kernel_satp = kernel_satp;
     scheduler.idle.arch.kernel_sp = idle_stack_high;
     scheduler.idle.arch.user_sp = 0U;
@@ -600,7 +611,6 @@ enum kernel_scheduler_status kernel_scheduler_init(
     scheduler.idle.state = KERNEL_THREAD_STATE_IDLE;
     scheduler.idle.idle = 1U;
     scheduler.idle.tid = 0;
-    scheduler.idle.process_group = 0;
     scheduler.idle.tid_owned = 0U;
     scheduler.idle.publish_completion = 0U;
     scheduler.idle.wait_status = 0U;
@@ -679,7 +689,6 @@ enum kernel_scheduler_status kernel_thread_create_joinable(
     thread->state = KERNEL_THREAD_STATE_READY;
     thread->idle = 0U;
     thread->tid = 0;
-    thread->process_group = 0;
     thread->tid_owned = 0U;
     thread->publish_completion = join ? 0U : 1U;
     thread->wait_status = 0U;
@@ -874,12 +883,7 @@ enum kernel_scheduler_status kernel_user_thread_create(
             KERNEL_SCHEDULER_STATUS_INVALID_STATE);
         goto restore_interrupts;
     }
-    if (scheduler.next_proc_identity > (UINT64_MAX >> 30U)) {
-        status = release_task_storage(thread,
-                                      KERNEL_SCHEDULER_STATUS_NO_MEMORY);
-        goto restore_interrupts;
-    }
-    pid_status = kernel_pid_allocate(&scheduler.pid_allocator, &tid);
+    pid_status = process_identity_create(thread, 0, 0);
     if (pid_status != KERNEL_PID_STATUS_OK) {
         status = release_task_storage(
             thread,
@@ -888,12 +892,8 @@ enum kernel_scheduler_status kernel_user_thread_create(
                 : KERNEL_SCHEDULER_STATUS_INVALID_STATE);
         goto restore_interrupts;
     }
-    thread->tid = tid;
-    thread->proc_identity = scheduler.next_proc_identity++;
+    tid = thread->tid;
     thread->proc_start_ticks = kernel_tick_count();
-    thread->session_id = tid;
-    thread->process_group = tid;
-    thread->tid_owned = 1U;
     thread->publish_completion = 1U;
     thread->wait_status = 0U;
     thread->group_leader = thread;
@@ -937,6 +937,8 @@ restore_interrupts:
 
 void scheduler_forget_task(struct kernel_task *thread)
 {
+    process_identity_release(thread);
+    process_identity_collect();
     if (thread->join) {
         thread->join->task = 0;
         (void)kernel_wait_queue_wake_all(&thread->join->waiters);
