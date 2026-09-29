@@ -58,4 +58,4 @@ make prune-build
 
 PR CI 加入规模、SQLite DELETE/WAL 和离线 GCC 入口。SQLite/musl 源按固定清单恢复，Alpine 工具链由 runner 校验固定输入；缺失或校验失败不能跳过报绿。恢复 CI 独立支持手动与每周一北京时间 02:00（UTC 周日 18:00），显式 bash pipefail 保留 make 的失败状态，失败产物上传。Linux 缓存由身份键定位，runner 仍检查输入。工作流已做本地解析与对应入口验证，尚未执行托管 GitHub Actions。glibc 仍是固定本机输入的严格本地验收，可移植供应另列待办。
 
-下一独立阶段是单 hart 可睡眠 I/O 及完成、超时、reset、DMA 与跨层 owner 协议；此次不包含共享文件 futex、扩展 TCP API、范围写回索引、事务合并、后台写回、SMP 或第二架构。
+本次规模阶段当时未包含可睡眠 I/O、后台写回或多盘；这些机制现已在后续阶段交付，见[可睡眠存储](sleepable-storage.md)及[VFS/ext4](../modules/vfs-ext4.md)。范围写回索引、事务合并、共享文件 futex、SMP 和第二架构仍未交付；后续优先顺序只在[路线](../goals.md)维护。

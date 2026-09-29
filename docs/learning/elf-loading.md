@@ -53,7 +53,7 @@ Auxv 的值必须来自真实机制，而不是为了让 libc 继续运行而伪
 
 通用层只做有界 ELF64 小端字节解析，不引入通用 VM callback 框架。RISC-V 层固定 Sv39/4 KiB，接受非 PIE `ET_EXEC`、PIE/无解释器 `ET_DYN` 以及非递归 `PT_INTERP`；`PT_DYNAMIC`、`PT_TLS` 和 GNU 扩展元数据保留在 source 中，供用户态动态链接器消费。它按页预检 W^X，建立 `ELF_PRIVATE` VMA，并按 FILE/COW、COMPOSITE 或 ZERO 规则在缺页时物化 `PT_LOAD`。入口要求 2 字节对齐并位于可执行文件字节；栈固定预留低半区顶端 8 MiB，初始参数、指针和对齐合计限制为 128 KiB，初次映射再从 SP 向下多留 64 KiB，其余 reserve 由匿名 demand-zero fault 提交，底部以下保持一页永久 guard。这个拆分让未来 LoongArch64 能复用 ELF 字节解析和栈内容规则，但用 16 KiB/三级页表实现自己的地址布局和页面物化。
 
-当前接口借用一个精确 read source 和带长度的文件名/参数/环境区间。生产启动把已打开的 ext4 `/init` 转成不可变 source；用户 `execve` 则先打开路径、捕获用户字符串，再调用同一装载器。source 由 MM/VMA 持有引用，重复映射不累积历史引用，fork 后子 MM 获得自己的引用；最后一个相关 VMA 消失时释放 source。成功产出独立 LIVE 用户地址空间、入口和 SP，调用者把地址空间移入 MM；scheduler 在提交点替换旧 MM。RISC-V image 同时建立独立随机或无可信种子确定性降级的 PIE/解释器、mmap、brk、栈和 vDSO 布局，并在可用种子时把独立字节放入 `AT_RANDOM`。真实 userland runner 已验证动态 musl PIE、解释器、额外 DSO、初始 TLS 和运行中 dlopen TLS；内核仍不执行重定位或分配 TLS，更广动态 libc/DSO 矩阵与 `getrandom` 仍待补齐。
+当前接口借用一个精确 read source 和带长度的文件名/参数/环境区间。生产启动把已打开的 ext4 `/init` 转成不可变 source；用户 `execve` 则先打开路径、捕获用户字符串，再调用同一装载器。source 由 MM/VMA 持有引用，重复映射不累积历史引用，fork 后子 MM 获得自己的引用；最后一个相关 VMA 消失时释放 source。成功产出独立 LIVE 用户地址空间、入口和 SP，调用者把地址空间移入 MM；scheduler 在提交点替换旧 MM。RISC-V image 同时建立独立随机或无任何混种材料时确定性降级的 PIE/解释器、mmap、brk、栈和 vDSO 布局，并在可用种子时把独立字节放入 `AT_RANDOM`。真实 userland runner 已验证动态 musl PIE、解释器、额外 DSO、初始 TLS 和运行中 dlopen TLS；内核仍不执行重定位或分配 TLS，固定 glibc 五形态矩阵与 `getrandom` 已交付；更广动态 libc/DSO 仍需消费者证据。DTB 材料可支持早期非安全布局，但只有可信输入计数达到门槛才使 RNG ready，见[随机源](random-source.md)。
 
 分配页交给页表之前必须先完成访问、清零和所有权登记；若解析或读取失败，立即释放临时页并返回原始错误。物理页和堆释放遵循 fail-stop 契约，非法 owner、引用或 allocator metadata 进入 fatal，不把 allocator 错误扩散成 CLEANUP 状态。只有 source/OFD 的真实 VFS/I/O 清理错误保留持久 owner，且不能覆盖原本应返回给用户的 `ENOEXEC`、`E2BIG` 或 `ENOMEM`。
 

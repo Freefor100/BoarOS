@@ -10,7 +10,7 @@ BLAKE2s 每次混入最多 32 字节输入与旧 32 字节 key，故混种临界
 
 聚焦验证：`python3 tests/host/random_vectors.py` 将 BLAKE2s 与 Python hashlib 独立实现比较，覆盖空、63/64/65、127/128/129 和多块输入；同一命令还通过真实设备操作表验证未就绪 O_NONBLOCK、阻塞信号返回、poll 与 ioctl 熵计数及错误，并测试 fast key erasure、不可信混种不置 ready、31+1 字节可信初始化、ready 单向保持、无材料输出和等待错误。`tests/diff-abi/random.c` 是真实 U-mode 的 flags、长度、fault、节点读写、pread/lseek 与 poll 对照用例；已整合 ABI 清单双侧执行，host 与真实用户态证据分开。
 
-2026-09-29 窄差分的 34 条记录全部匹配，扩展后的完整 ABI 为 831 条匹配；`make test-random-host test-virtio-rng-host` 通过。`make test-rng-riscv` 两种传输共 8 次启动覆盖就绪、缺设备、信号取消、延迟响应及在途退出，均核对页/堆/栈回收。此次组合内核 SHA-256 `19854baa6e01ab86e11b80c970746dfb0d1e776a787cd0f4c094b25f691ea216`，随机窄探针 SHA-256 `aca76267b36edc4a6507a051041ed882deea323497e67f4c38266f82300648b3`；构建输入由固定 Linux 与 Harness 元数据约束。测试随机字节本身不参与差分。完整调度阶段后仍需重跑集成与持久化矩阵。
+2026-09-29 窄差分的 34 条记录全部匹配，扩展后的完整 ABI 为 831 条匹配；`make test-random-host test-virtio-rng-host` 通过。`make test-rng-riscv` 两种传输共 8 次启动覆盖就绪、缺设备、信号取消、延迟响应及在途退出，均核对页/堆/栈回收。此次组合内核 SHA-256 `19854baa6e01ab86e11b80c970746dfb0d1e776a787cd0f4c094b25f691ea216`，随机窄探针 SHA-256 `aca76267b36edc4a6507a051041ed882deea323497e67f4c38266f82300648b3`；构建输入由固定 Linux 与 Harness 元数据约束。测试随机字节本身不参与差分。这是随机接口独立阶段的证据；其后的完整调度集成已完成，最新结果与验证快照边界见[程序清单](user-program-inventory.md)及[恢复矩阵](record-lock-sqlite-recovery.md)。
 
 独立提交检查将暂存源码树导出到 `build/random-stage-src/` 后执行 `make -C build/random-stage-src -j4 all`，再用 `tests/rng-riscv.py --kernel build/random-stage-src/kernel-rv` 和 `tests/diff-abi/harness.py --kernel build/random-stage-src/kernel-rv` 重跑；8 次 RNG 启动与 831 条 ABI 全部通过。该独立内核 SHA-256 为 `c9d65f2fb9bfc96c1e393c61d06a937df242608b7a66e23472e686e72f49fd37`，确认不依赖尚未提交的会话和调度改动。
 

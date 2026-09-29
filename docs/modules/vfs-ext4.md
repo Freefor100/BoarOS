@@ -100,7 +100,7 @@ miss 路径先分配并清零页，再通过 node 的无 offset 副作用 `pread
 只读挂载下，所有上述修改操作直接返回 `-EROFS`。
 unmount 在仍有 open file 或路径引用时返回 `-EBUSY`。末节点 `ext4_fclose` 失败把 node 转移到 mount cleanup 链，卸载重试同一个 handle；测试注入路径末引用和重复 inode 合并两种 close 失败并确认都被实际重试。非法引用或释放顺序触发 fatal，合法 heap/page 释放不返回可重试状态。
 
-当前 VFS 同时服务 ELF 随机读、进程文件表和文件私有缺页，但仍不是完整 Linux VFS：没有负目录项缓存、逐分量权限检查、硬链接、周期 writeback、read-ahead 或第二个 ext4 块设备挂载。`kernel_vfs_path` 持有 mount/inode 与父目录项引用；`ext4_lookup_child` 按父目录 inode 查找。统一逐分量解析处理 `.`、`..`、相对/绝对符号链接、尾斜线和最多 40 次展开；open/stat 的尾斜线按目录查找，mkdir/unlink/rmdir/symlink 保留不跟随的最终目录项语义。创建允许缺失的最终分量，并把已解析父对象及最终名称转换为 lwext4 修改接口所需的临时路径。适配缓冲按真实祖先长度分配，用户输入/符号链接展开仍限制为 4096 字节；已存在的长父链不挤占短相对输入额度，255 字节组件可用于修改。路径对象释放不依赖原始绝对路径仍存在。该规则依据固定 Linux commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 [`fs/namei.c`](../../references/linux/fs/namei.c)。fs context 和目录 fd 直接持有解析起点；绝对路径忽略 dirfd，删除或改名不会把旧引用重定向到同名新 inode。目录支持打开与按后端 cookie 查询（`kernel_vfs_dir_entry`），会返回真实的 `.`/`..` 条目；每次查询从传入的 ext4 字节位置开始，而不是从目录起点重走，顺序枚举的条目访问为 O(N)。适配层把 lwext4 的正 errno 与 EOF 分开，再向文件资源层返回负 Linux errno。页缓存只保存普通文件内容；进程层只持有 VFS mount/file 抽象，lwext4 handle 没有泄露到 task 或 syscall ABI。
+当前 VFS 同时服务 ELF 随机读、进程文件表和文件私有缺页，但仍不是完整 Linux VFS：已支持硬链接、tmpfs 和多 ext4 挂载；仍没有负目录项缓存、逐分量权限检查、周期 writeback 或 read-ahead。`kernel_vfs_path` 持有 mount/inode 与父目录项引用；`ext4_lookup_child` 按父目录 inode 查找。统一逐分量解析处理 `.`、`..`、相对/绝对符号链接、尾斜线和最多 40 次展开；open/stat 的尾斜线按目录查找，mkdir/unlink/rmdir/symlink 保留不跟随的最终目录项语义。创建允许缺失的最终分量，并把已解析父对象及最终名称转换为 lwext4 修改接口所需的临时路径。适配缓冲按真实祖先长度分配，用户输入/符号链接展开仍限制为 4096 字节；已存在的长父链不挤占短相对输入额度，255 字节组件可用于修改。路径对象释放不依赖原始绝对路径仍存在。该规则依据固定 Linux commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 [`fs/namei.c`](../../references/linux/fs/namei.c)。fs context 和目录 fd 直接持有解析起点；绝对路径忽略 dirfd，删除或改名不会把旧引用重定向到同名新 inode。目录支持打开与按后端 cookie 查询（`kernel_vfs_dir_entry`），会返回真实的 `.`/`..` 条目；每次查询从传入的 ext4 字节位置开始，而不是从目录起点重走，顺序枚举的条目访问为 O(N)。适配层把 lwext4 的正 errno 与 EOF 分开，再向文件资源层返回负 Linux errno。页缓存只保存普通文件内容；进程层只持有 VFS mount/file 抽象，lwext4 handle 没有泄露到 task 或 syscall ABI。
 
 目录游标设计依据固定 Linux 快照 `f4cdf7ca9a1f`：[`fs/readdir.c`](../../references/linux/fs/readdir.c)
 的 `iterate_dir()` 在每次枚举前后同步 open file 的 `f_pos` 与 `dir_context.pos`，`filldir64()`
@@ -115,6 +115,29 @@ unmount 在仍有 open file 或路径引用时返回 `-EBUSY`。末节点 `ext4_
 `kernel_vfs_dir_entry()` 对任意 seek 位置向前对齐到 4 字节边界并规范化到下一个记录，因而保存的
 cookie 可以交给 `lseek`/`telldir`/`seekdir` 恢复。OFD 持有位置，所以独立 open 的游标独立，dup/fork
 共享游标；目录节点本身不保存可变遍历状态。
+
+## 当前成本边界
+
+正确性验收不等于吞吐已优化。`fs/files/io.c` 先将用户数据复制到请求缓冲，
+再写页缓存；页级 staging 已减少分块和用户页解析次数，并非零复制。
+`kernel_page_cache_writeback_range()` 遍历 inode 的缓存页链两次，分配并 pin
+本次脏页集合后顺序写回；索引改善驻留查找，不等于已有范围脏页索引或批量提交。
+`kernel_vfs_sync_range()` 依次执行数据写回、sync_metadata、flush；当前
+`kernel_vfs_sync()` 未区分 datasync，fsync/fdatasync 共用这条保守路径。
+元数据随修改提交，频繁小写与逐次同步的事务/flush 放大尚需单独计量。
+
+| 串行边界 | 当前必要契约与限制 |
+|---|---|
+| OFD offset | dup/fork 共享位置的操作互斥；独立 open 不共享同一 OFD 锁 |
+| 命名空间 | 路径解析/修改按相应挂载锁保护；部分修改适配仍需遍历祖先构造完整路径，无负目录项缓存 |
+| inode | 内容与 truncate/失效/孤儿回收相互保护；同页 miss 合并，不同页可各自等待 |
+| ext4 实例 | 纯定位读共享进入，写事务及维护操作独占；不同盘有独立锁与错误 owner |
+| 块队列 | 每设备最多八个在途槽；一次同步调用等待自己的请求，不能由八槽推断单次写回会填满队列；flush 排空此前请求并挡住后继 |
+
+每盘后台 worker 使用专用快照页，按阈值和压力触发；不是周期刷盘，也不代替
+fsync 的持久化与错误观察。全局内存快照 O(总缓存项数)、压力通知 O(实例数)。
+已验证等待期间 CPU、无关缓存及另一磁盘有进展；尚无证据把 iozone 慢写归因于
+某一把锁、flush 或扫描。成本测量与优化的候选、门禁统一见[路线](../goals.md)。
 
 ## 验证
 

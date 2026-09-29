@@ -20,7 +20,23 @@ python3 tests/program-inventory/run.py --reuse-builds --require-pass --output bu
 
 双方运行同一 ELF 与同源独立 ext4 副本。指定 `--case --require-pass` 时，只有本次选择集合必须全部完成并通过；未选项目保留已有结果或 `not-run`。未指定集合的严格模式要求全量完成并通过。Linux 自己失败标为 `reference-not-pass`，需排查参考环境，不能归罪 BoarOS。原脚本内部逐项断言也必须成立，不能只看 shell 退出码；libc runtest 原本固定返回 1，直接 entry 则预期 0。
 
-## 当前基线与阻塞
+## 当前基线与口径
+
+最近完整验收来自进程/随机/调度阶段，生产内核 SHA-256 为
+`be5ca22629c904a427241b0f92e9d561d0312952e787ab75870ec4beae0143b3`，
+suite identity 为 `aa3bda0115670de7a837a7331dd563c9d282991109d1b6f17f39ecc7a8346fcd`。
+228 个顶层案例中 227 pass，唯一 `busybox.official` 为 upstream-failure。
+此状态表示原脚本内部断言未全部成功，不能解释为“上游程序有 bug”或全系统仅余一个缺口。
+本次文档整理复核保留的 runner 输出，未重新运行程序：Linux 原脚本 55/55，
+BoarOS 53/55，失败命令精确为 `dmesg`（klogctl ENOSYS）和 `hwclock`
+（无法打开 `/dev/misc/rtc`）。脚本整体 exit 0，故必须检查内部断言。
+`free` 已通过；`df` 也通过脚本断言并列出 /dev/shm 的 tmpfs，但根盘仍被
+来源名过滤，不能把退出成功等同于全部内容兼容。历史 df/free 缺口不可照搬为当前失败列表。
+
+程序清单、1000 条 ABI、原镜像独立诊断和正式评分是四种不同口径；本轮没有新正式评分。
+后续缺口只在[路线](../goals.md)维护；本页下方保留固定身份、原始结论和复建命令。
+
+## 历史阶段记录
 
 2026-09-29 proc 线程退出生命周期修正后，以 `python3 -B tests/program-inventory/run.py --reuse-builds --output build/proc-final-inventory-20260929` 重跑全部 228 项：227 pass，唯一 `busybox.official` 仍为固定上游包装脚本失败，没有旧通过项回退。BoarOS 内核 SHA-256 `ce3cbbcd511fa89732e3af53381d6a0c423ab8e6891accaf04d5f69205a3b65a`，suite identity `fc03bfbe1bf85e5da006ad5718607bf414389905654ceed0d47eb1fbf97b8f8b`。运行身份和逐项状态由 runner 的 `inventory.json`、`runs/suite.json` 重建；它们是一次性产物，核对后清理。原 BusyBox 55 子项和 OSComp judge 使用不同口径。
 

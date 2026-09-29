@@ -8,7 +8,7 @@
 - `references/linux/drivers/block/virtio_blk.c`、`fs/read_write.c`、`fs/file.c`，commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`：FLUSH 缺失时的 write-through、定位/共享 offset 接口参考。
 - `references/riscv/riscv-privileged-20260120.pdf`，版本 20260120，SHA-256 `d0f818af6fa519d39e68f822aa795bff9f38032a2f352afdf43e91c0d480e408`：supervisor external interrupt 与本地地址空间契约。来源固定于 `references/sources.tsv`。
 
-范围仅 RV64、QEMU virt、单 hart、legacy/modern VirtIO。QEMU 同步 reset 必须读回零后才允许释放 DMA owner；异步实板 reset、SMP、多写事务、后台写回和事务合并均未实现。
+本文前半记录 2026-09-28 单 hart 可睡眠 I/O 阶段；后台写回和多磁盘随后已交付，当前契约见 [VFS/ext4](../modules/vfs-ext4.md)。范围仍限 RV64、QEMU virt、单 hart、legacy/modern VirtIO。QEMU 同步 reset 必须读回零后才允许释放 DMA owner；异步实板 reset、SMP、同实例并发写事务和事务合并尚未实现。
 
 ## 所有权与失败路径
 
