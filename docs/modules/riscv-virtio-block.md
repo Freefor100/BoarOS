@@ -38,3 +38,11 @@ make test-io-sleep-riscv
 请求、扇区与 direct/bounce 计数提供当前结构成本基线；QEMU 功能测试不能证明 VisionFive 2 上的吞吐、延迟、cache coherency 或 CPU 忙等成本。开发板接入后需要用相同镜像分别记录冷启动读量、周期、吞吐和 CPU 占用，再决定请求合并深度、队列并行度及 IRQ 唤醒优先级。
 
 `test-io-sleep-riscv` 使用 NBD 控制握手暂扣和乱序释放响应：两个不同文件冷读必须先形成两个请求，期间计算与无关缓存命中完成；八槽满队列后验证逆序完成、flush 前后顺序及超时/reset。legacy/modern × writeback/writethrough 四种配置均运行。禁用 QEMU 请求合并，避免两个相邻 guest 请求合成一个 NBD 命令掩盖门槛；不靠宿主 sleep 猜时序。失败保留 guest/server 日志和镜像。
+
+## 块设备登记与独占 owner
+
+`kernel/block.c` 提供不分配内存的设备登记、设备号查询和独占 claim。设备生命
+周期拥有登记项，挂载拥有 claim；仍被 claim 的设备不能注销。查询借用启动设备
+的生命周期，真正挂载前须取得 claim。设备号采用 Linux new_encode_dev(252,
+index*16)，仅表示整盘，不解析分区。`make test-block-host` 覆盖重复登记、同号
+冲突、错误 owner、注销与重用，原 flush/fault 合约保持。
