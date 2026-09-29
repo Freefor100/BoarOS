@@ -110,6 +110,7 @@ enum kernel_scheduler_status kernel_scheduler_exec_commit(void)
 
     status = process_group_exec_current();
     if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
+    thread->fork_no_exec = 0U;
     /* The prepared image is committed, but the old MM remains owned by
      * this task until the transaction takes it. Use the TID from before
      * a non-leader exec adopted the group leader's identity. */

@@ -35,6 +35,16 @@ TID、TGID、PGID 和 SID 共用 `kernel_pid` 对象：编号、不可回退的�
 
 同组 fd 变更立即可见。阻塞 read/write/writev 在睡眠期间持有 OFD 引用；即使其他线程 close/dup 替换槽位，也不能提前回收正在使用的端点。退出请求必须使调用栈完成清理，不能直接释放阻塞任务页。
 
+## 会话与进程组
+
+`setpgid/getpgid/getsid/setsid` 使用同一身份对象的 PGID/SID 角色。显式 `fork_no_exec` 与 `session_leader` 状态分别约束父进程改子组和会话组长，不能用 SID 数值等于 TGID 代替曾成功 setsid 的状态。父进程可在子 exec 前修改其组；成功 exec 后同会话返回 EACCES，跨会话先返回 EPERM。查询可指定非组长 TID，setpgid 指定非组长 TID 返回 EINVAL；setsid 从任一组内线程发起都作用于进程代表。普通 fork 继承组/会话但不继承会话组长标记，exec 保留该标记，非组长 exec 一并转移。
+
+组长退出或被收割不销毁仍有 PGID/SID 成员的身份。zombie 在被收割前允许查询和符合条件的 setpgid；kill 对仍存在的 zombie 进程或组成功但不向已结束线程排队。kill 的正值按 TID 查找所属进程，零/负 PGID 按角色成员查找，wait4 的零/负 PGID 按当前真实组关系选择子进程；proc stat/status 从对象获取相同组/会话信息。
+
+进程退出与跨进程 reparent 检查最后一个同会话、不同组的父关系是否消失；忽略 init 父关系和真正结束的成员。新孤儿组含已完成 group stop 的任务时，全组依次收到内核 SIGHUP、SIGCONT（SI_KERNEL），恢复停止任务。仅有 TID 的线程回收不触发进程级孤儿事件。固定 Linux `kernel/sys.c` 的 setpgid/setsid 只改角色，不主动调用孤儿 HUP/CONT 检查；`kernel/exit.c` 的调用点是 reparent_leader 和 exit_notify，本实现保持这一范围。已孤儿组的默认 TSTP/TTIN/TTOU 丢弃，SIGSTOP 仍停止；没有控制终端、前台终端组或完整凭据权限模型。
+
+`tests/diff-abi/session.c` 使用 pipe/wait4 握手与专用 exec probe，覆盖父子 exec errno、线程目标、非组长 setsid/exec、session 边界、zombie/proc、组定向 kill/wait、进程组长先收割后的组存续、退出/reparent 两条孤儿路径，以及 sigtimedwait 和 SA_SIGINFO 的内核信号来源。启动上下文不同：固定 Linux 裸 PID 1 初始 PGID/SID 为 0，BoarOS 初始身份为 1；测试先建立真实非零会话，再比较用户操作，不把启动整数差异混入会话机制断言。
+
 ## clone 与 vfork
 
 RISC-V clone 接收 flags、child_stack、parent_tid、tls、child_tid 和完整 syscall 入口寄存器。支持普通 SIGCHLD fork/vfork（均可额外指定 CLONE_FS 共享 cwd/root，或指定 CHILD_SETTID/CHILD_CLEARTID 管理子进程私有 MM 中的 TID），以及共享 VM/FS/FILES/SIGHAND/THREAD 的线程组合和 SETTLS/PARENT_SETTID/CHILD_SETTID/CHILD_CLEARTID/SYSVSEM/DETACHED 兼容位。非法依赖返回 EINVAL，尚未闭环的合法资源组合返回 ENOTSUP。SYSVSEM 位不代表已经支持 SysV semaphore。

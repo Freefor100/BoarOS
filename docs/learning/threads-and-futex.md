@@ -87,3 +87,31 @@ SIE=0 本身不表示不可睡眠，禁止的是身份原子修改过程中分�
 和代次耗尽回滚；独立 ASan/UBSan 运行通过。`make test-scheduler-cases-riscv test-scheduler-riscv test-userland-riscv` 通过，包含 fork/vfork、pthread 与非组长 exec。
 迁移后加 coarse clock 的完整 ABI 差分为 797 条匹配。此记录只证明身份迁移，
 会话 syscall 与孤儿组事件另外验收。
+
+## 会话、进程组与孤儿事件（2026-09-29）
+
+固定 `references/linux` commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的
+`kernel/sys.c` 为 setpgid/getsid/setsid 的 errno 与状态依据，`kernel/exit.c` 的
+will_become_orphaned_pgrp、reparent_leader、exit_notify 为孤儿组判定与通知依据。
+setpgid/setsid 自身只改角色；固定 Linux 不在这两个 syscall 里主动发孤儿 HUP/CONT。
+父子 exec 检查使用独立 fork_no_exec，会话组长使用独立 session_leader，避免把
+整数等于 TGID 错当成 setsid 成功记录。成员引用让 PGID/SID 在原组长被收割后继续存在；
+此时按旧编号查 task 必须失败，而存活成员的组/会话查询仍返回原身份。
+
+测试的一个易混淆点是裸 Linux PID 1 初始 PGID/SID 为 0，而 BoarOS 的初始身份为 1。
+把这个 0 再传 setpgid 会解释为目标自身，不能用于“重新加入父组”的验证。真实 ABI
+用例先由辅助进程 setsid，再 fork 待测进程，在双方都有非零组/会话的上下文中比较。
+父子 exec、停止和退出顺序由 pipe、wait4 和 proc zombie 状态握手，不用延时猜竞态。
+
+孤儿 HUP/CONT 的 siginfo 来源是 SI_KERNEL=128，原 int8 来源字段会截断；现用 int16
+保存来源，并贯通 sigtimedwait 与 SA_SIGINFO 信号帧。测试先暴露用户帧仍为 0 的差异，
+再由统一 delivery.code 修复，不能只修等待 syscall。组信号查询也必须区分“进程仍有
+身份”和“还有可运行线程”：zombie 收割前 kill 成功，发出的信号不向死线程排队。
+
+`tests/diff-abi/session.c` 的 105 条同 ELF 窄差分在固定 Linux 与 BoarOS 上匹配，
+覆盖四个 syscall、错误优先级、非组长目标/exec/setsid、PGID 成员阻止 setsid、zombie、
+proc 字段、组信号/wait 选择，以及退出/reparent/handler 三类孤儿组观察。PGID/SID
+在原组长收割后保留，SID-only 对象不作为 task 命中；临时引用和强制编号复用由阶段 A
+的 PID 对象 host 契约测试覆盖。没有因此宣称控制终端、完整凭据权限或 SMP 已支持。
+
+会话提交的独立源码树导出到 `build/session-stage-src/`，执行 `make -C build/session-stage-src -j4 all` 后，以 `python3 -B tests/diff-abi/harness.py --kernel build/session-stage-src/kernel-rv --program build/diff-abi/cases-rv` 跑完整差分，936 条全部匹配。内核 SHA-256 `96e4f211220c78a6d9d67a2c39a7505b9c1d2f5bf5fedf303a0b958d9aa3f554`，同 ELF SHA-256 `9c31cdff503d182da4a54707a181fcd54c1ed62724f85950abb3169e2a2a21e6`。该验证不包含尚在实现的 FIFO/RR 与预算机制。新增 session exec 用例必须安排在 proc 已打开执行文件 unlink 压力之前，避免测试自身先删除 `/init` 后等待一个无法 exec 的探针。

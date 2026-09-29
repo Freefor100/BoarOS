@@ -56,6 +56,7 @@ enum kernel_signal_select_result {
 struct kernel_signal_delivery {
     uint32_t signal;
     uint32_t sender;
+    int32_t code;
     uint64_t handler;
     uint64_t flags;
     uint64_t restore_mask;

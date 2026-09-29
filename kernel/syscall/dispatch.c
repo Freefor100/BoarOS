@@ -468,6 +468,22 @@ enum kernel_syscall_status kernel_syscall_dispatch(
         if (syscall_handle_set_robust_list(caller, request, &decoded) !=
             KERNEL_SYSCALL_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    } else if (request->number == 154U) {
+        if (syscall_handle_setpgid(caller, request, &decoded) !=
+            KERNEL_SYSCALL_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    } else if (request->number == 155U) {
+        if (syscall_handle_getpgid(caller, request, &decoded) !=
+            KERNEL_SYSCALL_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    } else if (request->number == 156U) {
+        if (syscall_handle_getsid(caller, request, &decoded) !=
+            KERNEL_SYSCALL_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    } else if (request->number == 157U) {
+        if (syscall_handle_setsid(caller, request, &decoded) !=
+            KERNEL_SYSCALL_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     } else if (request->number == LINUX_SYSCALL_GET_ROBUST_LIST) {
         if (syscall_handle_get_robust_list(caller, request, &decoded) !=
             KERNEL_SYSCALL_STATUS_OK)

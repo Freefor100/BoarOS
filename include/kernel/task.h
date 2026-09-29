@@ -96,4 +96,10 @@ void kernel_task_cpu_ticks(const struct kernel_task *task,
                            uint64_t *child_user_ticks,
                            uint64_t *child_kernel_ticks);
 
+/* Linux process-group/session operations; all identity changes are atomic. */
+int64_t kernel_task_setpgid(struct kernel_task *task, kernel_pid_t pid, kernel_pid_t pgid);
+int64_t kernel_task_getpgid(struct kernel_task *task, kernel_pid_t pid);
+int64_t kernel_task_getsid(struct kernel_task *task, kernel_pid_t pid);
+int64_t kernel_task_setsid(struct kernel_task *task);
+
 #endif

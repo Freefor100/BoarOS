@@ -737,7 +737,7 @@ static int signal_ignored_unblocked(const struct kernel_task *target,
 
 static enum kernel_signal_status signal_send_one(
     struct kernel_task *target, uint32_t sig, kernel_pid_t sender_tid,
-    int process_directed)
+    int process_directed, int16_t code)
 {
     struct kernel_task *leader;
     struct kernel_task *wake_target;
@@ -775,8 +775,8 @@ static enum kernel_signal_status signal_send_one(
     }
     *pending |= bit;
     senders[sig - 1U] = (uint32_t)sender_tid;
-    if (process_directed) leader->group_signal_code[sig - 1U] = 0;
-    else target->signal_code[sig - 1U] = -6;
+    if (process_directed) leader->group_signal_code[sig - 1U] = code;
+    else target->signal_code[sig - 1U] = code;
     if (wake_target != 0 && signal_wants_signal(wake_target, sig) &&
         kernel_scheduler_wake_signal(wake_target) !=
             KERNEL_SCHEDULER_STATUS_OK) {
@@ -794,13 +794,20 @@ enum kernel_signal_status kernel_signal_send(struct kernel_task *target,
     if (representative == 0) {
         return KERNEL_SIGNAL_STATUS_INVALID_ARGUMENT;
     }
-    return signal_send_one(representative, sig, sender_tid, 1);
+    return signal_send_one(representative, sig, sender_tid, 1, 0);
+}
+
+enum kernel_signal_status signal_send_kernel_group(struct kernel_task *target, uint32_t sig)
+{
+    struct kernel_task *representative = signal_group_representative(target);
+    return representative ? signal_send_one(representative, sig, 0, 1, 128)
+        : KERNEL_SIGNAL_STATUS_INVALID_ARGUMENT;
 }
 
 enum kernel_signal_status kernel_signal_send_task(
     struct kernel_task *target, uint32_t sig, kernel_pid_t sender_tid)
 {
-    return signal_send_one(target, sig, sender_tid, 0);
+    return signal_send_one(target, sig, sender_tid, 0, -6);
 }
 
 struct kernel_task *kernel_signal_find_by_tid(kernel_pid_t tid)
@@ -809,131 +816,53 @@ struct kernel_task *kernel_signal_find_by_tid(kernel_pid_t tid)
     return signal_dispatchable(task) ? task : 0;
 }
 
-static struct kernel_task *signal_group_by_tgid(kernel_pid_t tgid)
+static uint32_t signal_target_group(struct kernel_task *leader, uint32_t sig,
+                                     kernel_pid_t sender, int deliver)
 {
-    struct kernel_task *leader = process_find_identity(tgid, KERNEL_PID_TGID);
-    return leader && signal_group_representative(leader) ? leader : 0;
-}
-
-static int signal_matches_target(const struct kernel_task *task,
-                                 struct kernel_task *caller,
-                                 int64_t pid)
-{
-    struct kernel_task *leader = signal_group_leader(task);
-    struct kernel_task *caller_leader = signal_group_leader(caller);
-
-    if (leader == 0 || signal_group_representative(task) != task) {
+    if (!leader || !leader->accounted || !leader->identities[KERNEL_PID_TGID].identity)
         return 0;
-    }
-    if (pid > 0) {
-        return leader->tid == (kernel_pid_t)pid;
-    }
-    if (pid == 0) {
-        return caller_leader != 0 &&
-               process_identity_number(leader, KERNEL_PID_PGID) == process_identity_number(caller_leader, KERNEL_PID_PGID);
-    }
-    if (pid == -1) {
-        return leader != caller_leader && leader->tid != 1;
-    }
-    if (pid == INT32_MIN) {
-        return 0;
-    }
-    return process_identity_number(leader, KERNEL_PID_PGID) == (kernel_pid_t)(-pid);
+    /* zombie 仍是可查询的进程；没有可运行成员时信号成功但不入队。 */
+    if (!deliver || !signal_group_representative(leader)) return 1;
+    return kernel_signal_send(leader, sig, sender) == KERNEL_SIGNAL_STATUS_OK;
 }
 
-uint32_t kernel_signal_resolve_targets(struct kernel_task *caller,
-                                       int64_t pid)
+static uint32_t signal_target_identities(struct kernel_task *caller, int64_t pid,
+                                         uint32_t sig, kernel_pid_t sender, int deliver)
 {
-    struct kernel_task *task;
-    uint32_t found = 0U;
-
+    uint32_t count = 0;
     if (pid > 0) {
-        task = signal_group_by_tgid((kernel_pid_t)pid);
-        return task != 0 && signal_group_representative(task) != 0
-                   ? 1U : 0U;
+        struct kernel_task *target = process_find_identity((kernel_pid_t)pid, KERNEL_PID_TID);
+        return target && target->accounted ?
+            signal_target_group(target->group_leader, sig, sender, deliver) : 0;
     }
-    if (caller != 0 && caller != &scheduler.idle &&
-        signal_matches_target(caller, caller, pid)) {
-        found++;
+    if (pid == INT32_MIN) return 0;
+    if (pid != -1) {
+        struct kernel_pid *group = pid ? kernel_pid_find(&scheduler.identities, (kernel_pid_t)-pid)
+            : process_identity(caller, KERNEL_PID_PGID);
+        for (struct kernel_pid_member *link = group ? group->members[KERNEL_PID_PGID] : 0;
+             link; link = link->next)
+            count += signal_target_group(link->task, sig, sender, deliver);
+        return count;
     }
-    for (task = scheduler.ready_head; task != 0; task = task->next) {
-        if (task != caller && signal_matches_target(task, caller, pid)) {
-            found++;
+    for (unsigned bucket = 0; bucket < KERNEL_PID_BUCKETS; bucket++)
+        for (struct kernel_pid *id = scheduler.identities.buckets[bucket]; id; id = id->hash_next) {
+            struct kernel_task *leader = id->members[KERNEL_PID_TGID]
+                ? id->members[KERNEL_PID_TGID]->task : 0;
+            if (id->number > 1 && leader != caller->group_leader)
+                count += signal_target_group(leader, sig, sender, deliver);
         }
-    }
-    for (task = scheduler.blocked_head; task != 0; task = task->next) {
-        if (task != caller && signal_matches_target(task, caller, pid)) {
-            found++;
-        }
-    }
-    for (task = scheduler.stopped_head; task != 0; task = task->next) {
-        if (task != caller && signal_matches_target(task, caller, pid)) {
-            found++;
-        }
-    }
-    return found;
+    return count;
 }
 
-static struct kernel_task *signal_next_matching_group(
-    struct kernel_task *caller, int64_t pid, kernel_pid_t after)
+uint32_t kernel_signal_resolve_targets(struct kernel_task *caller, int64_t pid)
 {
-    struct kernel_task *best = 0;
-    struct kernel_task *task;
-
-#define CONSIDER_SIGNAL_TARGET(candidate)                                    \
-    do {                                                                      \
-        struct kernel_task *considered = (candidate);                         \
-        if (signal_matches_target(considered, caller, pid)) {                 \
-            struct kernel_task *leader = considered->group_leader;           \
-            if (leader->tid > after &&                                       \
-                (best == 0 || leader->tid < best->tid)) {                     \
-                best = leader;                                                \
-            }                                                                 \
-        }                                                                     \
-    } while (0)
-
-    if (signal_dispatchable(scheduler.current)) {
-        CONSIDER_SIGNAL_TARGET(scheduler.current);
-    }
-    for (task = scheduler.ready_head; task != 0; task = task->next) {
-        CONSIDER_SIGNAL_TARGET(task);
-    }
-    for (task = scheduler.blocked_head; task != 0; task = task->next) {
-        CONSIDER_SIGNAL_TARGET(task);
-    }
-    for (task = scheduler.stopped_head; task != 0; task = task->next) {
-        CONSIDER_SIGNAL_TARGET(task);
-    }
-#undef CONSIDER_SIGNAL_TARGET
-    return best;
+    return signal_target_identities(caller, pid, 0, 0, 0);
 }
 
-uint32_t kernel_signal_send_targets(struct kernel_task *caller,
-                                    int64_t pid,
-                                    uint32_t sig,
-                                    kernel_pid_t sender_tid)
+uint32_t kernel_signal_send_targets(struct kernel_task *caller, int64_t pid,
+                                    uint32_t sig, kernel_pid_t sender_tid)
 {
-    struct kernel_task *target;
-    kernel_pid_t after = 0;
-    uint32_t sent = 0U;
-
-    if (pid > 0) {
-        target = signal_group_by_tgid((kernel_pid_t)pid);
-        if (target != 0 && signal_group_representative(target) != 0 &&
-            kernel_signal_send(target, sig, sender_tid) ==
-                KERNEL_SIGNAL_STATUS_OK) {
-            sent++;
-        }
-        return sent;
-    }
-    while ((target = signal_next_matching_group(caller, pid, after)) != 0) {
-        after = target->tid;
-        if (kernel_signal_send(target, sig, sender_tid) ==
-            KERNEL_SIGNAL_STATUS_OK) {
-            sent++;
-        }
-    }
-    return sent;
+    return signal_target_identities(caller, pid, sig, sender_tid, 1);
 }
 
 uint32_t kernel_signal_send_thread(struct kernel_task *caller,
@@ -1194,6 +1123,8 @@ enum kernel_signal_select_result kernel_signal_select(
             delivery->sender = shared
                                    ? leader->group_sender[sig - 1U]
                                    : task->signal_sender[sig - 1U];
+            delivery->code = shared ? leader->group_signal_code[sig - 1U]
+                                    : task->signal_code[sig - 1U];
             delivery->handler = entry->handler;
             delivery->flags = entry->flags;
             delivery->restore_mask = task->signal_restore_mask != 0U
@@ -1221,6 +1152,7 @@ enum kernel_signal_select_result kernel_signal_select(
         case KERNEL_SIGNAL_DEFAULT_CONTINUE:
             continue;
         case KERNEL_SIGNAL_DEFAULT_STOP:
+            if (sig != SIGNAL_STOP && process_group_is_orphaned(task)) break;
             signal_stop_group(task, sig);
             continue;
         case KERNEL_SIGNAL_DEFAULT_CORE:

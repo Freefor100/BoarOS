@@ -170,6 +170,7 @@ static void identity_cases(void)
 
 void abi_main(const unsigned long *initial_stack)
 {
+    abi_session_exec_probe(initial_stack);
     abi_script_probe(initial_stack);
     if (initial_stack[0] >= 2) {
         const char *argument = (const char *)initial_stack[2];
@@ -222,6 +223,7 @@ void abi_main(const unsigned long *initial_stack)
     abi_child_tid_cases();
     abi_script_cases();
     abi_mknod_cases();
+    abi_session_cases();
     abi_proc_cases();
     abi_tmpfs_cases();
     abi_tmpfs_options_cases();

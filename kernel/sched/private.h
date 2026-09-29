@@ -155,13 +155,15 @@ struct kernel_task {
     uint32_t proc_exiting;
     uint32_t group_exiting;
     uint32_t group_execing;
+    uint32_t fork_no_exec;
+    uint32_t session_leader;
     uint32_t group_stopped;
     struct kernel_rlimit64 nofile_limit;
     struct kernel_rlimit64 stack_limit;
     struct kernel_wait_queue group_wait_queue;
     uint64_t group_pending;
     uint32_t group_sender[KERNEL_SIGNAL_COUNT];
-    int8_t group_signal_code[KERNEL_SIGNAL_COUNT];
+    int16_t group_signal_code[KERNEL_SIGNAL_COUNT];
     struct kernel_wait_node default_wait_node;
     struct kernel_task *blocked_previous;
     struct kernel_futex_key futex_key;
@@ -173,7 +175,7 @@ struct kernel_task {
     uint32_t signal_restore_mask;
     uint64_t signal_table_address;
     uint32_t signal_sender[KERNEL_SIGNAL_COUNT];
-    int8_t signal_code[KERNEL_SIGNAL_COUNT];
+    int16_t signal_code[KERNEL_SIGNAL_COUNT];
     uint32_t stop_notified;
     uint32_t continue_notified;
     struct kernel_thread_completion completion;
@@ -226,6 +228,9 @@ enum kernel_pid_status process_identity_create(struct kernel_task *task,
     struct kernel_task *parent, int thread_clone);
 void process_identity_release(struct kernel_task *task);
 void process_identity_collect(void);
+int process_group_is_orphaned(const struct kernel_task *task);
+void process_orphan_notify(struct kernel_task *task, struct kernel_task *old_parent);
+enum kernel_signal_status signal_send_kernel_group(struct kernel_task *task, uint32_t sig);
 struct kernel_task *process_find_identity(kernel_pid_t number, enum kernel_pid_role role);
 struct kernel_pid *process_identity(const struct kernel_task *task, enum kernel_pid_role role);
 kernel_pid_t process_identity_number(const struct kernel_task *task, enum kernel_pid_role role);

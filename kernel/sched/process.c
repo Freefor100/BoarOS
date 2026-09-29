@@ -81,6 +81,117 @@ struct kernel_task *process_find_identity(kernel_pid_t number, enum kernel_pid_r
     return id && id->members[role] ? id->members[role]->task : 0;
 }
 
+static struct kernel_task *session_target(struct kernel_task *caller, kernel_pid_t pid)
+{
+    struct kernel_task *target = pid ? process_find_identity(pid, KERNEL_PID_TID) : caller;
+    return target && target->accounted && target->group_leader ? target : 0;
+}
+
+static void identity_change_role(struct kernel_task *task, enum kernel_pid_role role,
+                                 struct kernel_pid *replacement)
+{
+    if (task->identities[role].identity == replacement) return;
+    kernel_pid_get(replacement);
+    kernel_pid_detach(&task->identities[role]);
+    kernel_pid_attach(&task->identities[role], replacement, role, task);
+    kernel_pid_put(replacement);
+}
+
+int64_t kernel_task_getpgid(struct kernel_task *caller, kernel_pid_t pid)
+{
+    struct kernel_task *target = session_target(caller, pid);
+    return target ? process_identity_number(target, KERNEL_PID_PGID) : -KERNEL_ESRCH;
+}
+
+int64_t kernel_task_getsid(struct kernel_task *caller, kernel_pid_t pid)
+{
+    struct kernel_task *target = session_target(caller, pid);
+    return target ? process_identity_number(target, KERNEL_PID_SID) : -KERNEL_ESRCH;
+}
+
+int64_t kernel_task_setpgid(struct kernel_task *caller, kernel_pid_t pid, kernel_pid_t pgid)
+{
+    struct kernel_task *leader = caller->group_leader;
+    if (!pid) pid = leader->tid;
+    if (!pgid) pgid = pid;
+    if (pgid < 0) return -KERNEL_EINVAL;
+    struct kernel_task *target = session_target(caller, pid);
+    if (!target) return -KERNEL_ESRCH;
+    if (target != target->group_leader) return -KERNEL_EINVAL;
+    if (target->parent == leader) {
+        if (process_identity(target, KERNEL_PID_SID) != process_identity(leader, KERNEL_PID_SID))
+            return -KERNEL_EPERM;
+        if (!target->fork_no_exec) return -KERNEL_EACCES;
+    } else if (target != leader) return -KERNEL_ESRCH;
+    if (target->session_leader) return -KERNEL_EPERM;
+    struct kernel_pid *group = process_identity(target, KERNEL_PID_TGID);
+    if (pgid != pid) {
+        group = kernel_pid_find(&scheduler.identities, pgid);
+        struct kernel_task *member = group && group->members[KERNEL_PID_PGID]
+            ? group->members[KERNEL_PID_PGID]->task : 0;
+        if (!member || process_identity(member, KERNEL_PID_SID) !=
+                       process_identity(leader, KERNEL_PID_SID)) return -KERNEL_EPERM;
+    }
+    identity_change_role(target, KERNEL_PID_PGID, group);
+    process_identity_collect();
+    return 0;
+}
+
+int64_t kernel_task_setsid(struct kernel_task *caller)
+{
+    struct kernel_task *leader = caller->group_leader;
+    struct kernel_pid *identity = process_identity(leader, KERNEL_PID_TGID);
+    if (leader->session_leader || identity->members[KERNEL_PID_PGID]) return -KERNEL_EPERM;
+    leader->session_leader = 1;
+    identity_change_role(leader, KERNEL_PID_SID, identity);
+    identity_change_role(leader, KERNEL_PID_PGID, identity);
+    process_identity_collect();
+    return identity->number;
+}
+
+static int group_orphaned(struct kernel_pid *group, const struct kernel_task *ignored)
+{
+    if (!group) return 1;
+    for (struct kernel_pid_member *link = group->members[KERNEL_PID_PGID]; link; link = link->next) {
+        struct kernel_task *member = link->task;
+        struct kernel_task *parent = member->parent;
+        if (member == ignored || !parent || parent == scheduler.init_task ||
+            (member->group_members == 1 &&
+             (member->state == KERNEL_THREAD_STATE_EXITED ||
+              member->state == KERNEL_THREAD_STATE_ZOMBIE ||
+              member->state == KERNEL_THREAD_STATE_GROUP_DEAD))) continue;
+        if (process_identity(parent, KERNEL_PID_PGID) != group &&
+            process_identity(parent, KERNEL_PID_SID) == process_identity(member, KERNEL_PID_SID))
+            return 0;
+    }
+    return 1;
+}
+
+int process_group_is_orphaned(const struct kernel_task *task)
+{
+    return group_orphaned(process_identity(task, KERNEL_PID_PGID), 0);
+}
+
+void process_orphan_notify(struct kernel_task *task, struct kernel_task *old_parent)
+{
+    /* 非组长线程回收会临时自指 group_leader；只有 TGID 成员代表进程。 */
+    if (!task->identities[KERNEL_PID_TGID].identity) return;
+    const struct kernel_task *ignored = old_parent ? 0 : task;
+    struct kernel_task *parent = old_parent ? old_parent : task->parent;
+    struct kernel_pid *group = process_identity(task, KERNEL_PID_PGID);
+    if (!parent || process_identity(parent, KERNEL_PID_PGID) == group ||
+        process_identity(parent, KERNEL_PID_SID) != process_identity(task, KERNEL_PID_SID) ||
+        !group_orphaned(group, ignored)) return;
+    int stopped = 0;
+    for (struct kernel_pid_member *link = group->members[KERNEL_PID_PGID]; link; link = link->next)
+        if (((struct kernel_task *)link->task)->group_stopped) stopped = 1;
+    if (!stopped) return;
+    /* 两轮发送确保整个组先登记 HUP，再执行 CONT 的恢复动作。 */
+    for (unsigned sig = 1; sig <= 18; sig += 17)
+        for (struct kernel_pid_member *link = group->members[KERNEL_PID_PGID]; link; link = link->next)
+            (void)signal_send_kernel_group(link->task, sig);
+}
+
 static void identity_sync_cache(struct kernel_task *task)
 {
     task->tid = process_identity_number(task, KERNEL_PID_TID);
@@ -427,6 +538,7 @@ enum kernel_scheduler_status process_group_exec_current(void)
                 child_creator_change(member, process_identity(task, KERNEL_PID_TID));
         }
         kernel_pid_put(old_identity);
+        task->session_leader = leader->session_leader;
         task->child_creator = leader->child_creator;
         leader->child_creator = 0;
         task->user_ticks += leader->user_ticks;
@@ -675,6 +787,7 @@ enum kernel_scheduler_status riscv_process_clone_current(
     memcpy(child->comm, parent->comm, sizeof(child->comm));
     child->group_leader = child;
     child->group_members = 1U;
+    child->fork_no_exec = 1U;
     child->nofile_limit = parent->group_leader->nofile_limit;
     child->stack_limit = parent->group_leader->stack_limit;
     process_group_initialize(child);
@@ -1248,6 +1361,7 @@ enum kernel_scheduler_status kernel_scheduler_reap_one(
         if (thread->group_leader == thread &&
             reparent_children(thread) != KERNEL_SCHEDULER_STATUS_OK)
             return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
+        process_orphan_notify(thread, 0);
         /* Reparenting may append orphan zombies behind this tail. */
         next = thread->next;
         if (thread->parent != 0) {
@@ -1542,6 +1656,7 @@ static enum kernel_scheduler_status reparent_children(
             child->publish_completion = 0U;
             exited_append(child);
         }
+        process_orphan_notify(child, parent);
         child = next;
     }
     return KERNEL_SCHEDULER_STATUS_OK;

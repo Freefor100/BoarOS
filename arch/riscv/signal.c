@@ -114,6 +114,7 @@ static void riscv_signal_build_frame(
     user_sp = (frame->sp - RISCV_SIGNAL_FRAME_SIZE) & ~UINT64_C(15);
     memset(&data, 0, sizeof(data));
     memcpy(data.prefix, &delivery->signal, sizeof(delivery->signal));
+    memcpy(data.prefix + 8U, &delivery->code, sizeof(delivery->code));
     memcpy(data.prefix + 16U, &delivery->sender, sizeof(delivery->sender));
     memcpy(data.prefix + RISCV_SIGNAL_INFO_SIZE + 24U,
            &disabled, sizeof(disabled));
