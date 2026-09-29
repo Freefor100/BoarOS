@@ -45,6 +45,8 @@ BoarOS 使用 GNU C11、少量 RISC-V 汇编和自有链接脚本生成 freestan
 
 `0x80200000` 是当前 QEMU/OpenSBI 路径的物理装载约定，不是 RISC-V 架构常量。VisionFive 2 的常见内核物理装载位置不同；板级接入需要独立提供装载地址和固件入口，但可以继续复用相同的 Sv39 高半区 VMA 与分页机制。
 
+2026-09-29 的 CI 启动故障还说明：只迁移汇编可见的 `ra`、`sp`、`gp` 和 `stvec` 不足以保证同一个 C 函数能跨过低/高别名切换。Ubuntu 24.04 的 `riscv64-unknown-elf-gcc 13.2.0` 生成的 `kernel_main` 在迁移前把 `boot_irq` 的低别名装入 `s3`，最终页表撤销低映射后又通过该寄存器读取，QEMU 报 `scause=0xd`、`stval=0x8025d000`；另一个工具链恰好在迁移后重新计算地址，因而掩盖了错误。修复把迁移前后拆为独立且不可内联的 C 阶段，将需要延续的启动数据放在静态状态中，由高地址阶段重新定位。复现与验收入口是 Ubuntu 24.04 工具链下的 `make test-scheduler-riscv`，并用 `riscv64-unknown-elf-objdump -dr kernel-rv` 核对切换附近的机器码。
+
 ## CPU、固件与内核怎样交接？
 
 RISC-V 定义了多个特权级：M-mode 管理机器级资源，S-mode 通常运行操作系统内核，U-mode 运行用户程序。CPU 复位后不会直接调用 C 函数，而是从平台规定的复位入口执行固件代码。
