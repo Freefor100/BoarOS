@@ -28,7 +28,7 @@ Linux 原有源码许可证见 `references/linux/COPYING`，构建产物位于�
 - `cases.c` 另覆盖 root UID/GID 四项无参数查询（寄存器留有无效地址仍须忽略）及 fork/exec 后身份；与固定 Linux PID 1 root 环境比较。
 - `harness.py`：构建 Linux、制作镜像、运行两个系统、校验完整协议并做严格 diff。
 - `linux.config`：以 `allnoconfig` 为基础，启用 virt、MMU、ELF、串口、VirtIO
-  MMIO/block、ext4、futex、IPv4 网络和关机所需能力；Linux 自己解析依赖。futex 在首次 robust 差分前显式启用，避免固定 Linux 因精简配置返回 `ENOSYS`。
+  MMIO/block、ext4、futex、IPv4 网络和关机所需能力；Linux 自己解析依赖。futex 在首次 robust 差分前显式启用，避免固定 Linux 因精简配置返回 `ENOSYS`。`CONFIG_RISCV_ISA_FALLBACK=y` 允许固定 Linux 在缺少 `riscv,isa-extensions` 的旧 QEMU 设备树上读取 `riscv,isa`；较新 QEMU 仍优先使用扩展列表。程序清单的 Linux profile 保持同一设置，保证参考侧能使用其实际提供的浮点指令。
 
 每条记录含 ID、返回值、errno、文件 size、OFD offset、子进程 wait status 和
 完整观测数据的十六进制值。fd 与 mmap 地址只有其成功身份规范为 0；错误返回、
