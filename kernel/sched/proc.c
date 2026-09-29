@@ -27,11 +27,14 @@ void kernel_proc_task_update_comm(struct kernel_task *task)
 
 static int proc_visible(const struct kernel_task *task)
 {
-    return task && task->arch.user_mode && task->tid_owned &&
-           task->group_leader && task->group_leader->tid_owned &&
-           task->group_leader->tid > 0 &&
-           task->state != KERNEL_THREAD_STATE_EXITED &&
-           task->state != KERNEL_THREAD_STATE_GROUP_DEAD;
+    if (!task || !task->arch.user_mode || !task->tid_owned ||
+        !task->group_leader || !task->group_leader->tid_owned ||
+        task->group_leader->tid <= 0 ||
+        task->state == KERNEL_THREAD_STATE_GROUP_DEAD) return 0;
+    if (task->state != KERNEL_THREAD_STATE_EXITED) return 1;
+    /* 子进程在清理期间仍占有 PID；wait 回收前不能暂时丢失数字目录。 */
+    return task == task->group_leader && task->group_members == 1U &&
+           task->parent != 0;
 }
 
 static struct kernel_task *next_process(struct kernel_task *task,
