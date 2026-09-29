@@ -41,7 +41,6 @@ struct procfs_mount {
     uint64_t flags;
 };
 
-static uint64_t next_proc_mount_id = 2U;
 
 static uint64_t proc_pid_inode_fd(kernel_pid_t pid, uint64_t identity,
                                   uint8_t kind, uint16_t fd)
@@ -956,14 +955,7 @@ int kernel_procfs_create(struct kernel_heap *heap, uint64_t flags,
     proc->instance.read_only = (flags & 1U) != 0U;
     kernel_mutex_init(&proc->instance.namespace_lock, 20U,
                       (uintptr_t)&proc->instance);
-    uintptr_t irq = riscv_interrupt_save();
-    if (next_proc_mount_id == UINT64_MAX) {
-        riscv_interrupt_restore(irq);
-        (void)kernel_heap_release(heap, proc);
-        return -KERNEL_EOVERFLOW;
-    }
-    proc->mount.id = next_proc_mount_id++;
-    riscv_interrupt_restore(irq);
+    proc->mount.id = kernel_vfs_allocate_mount_id();
     proc->mount.private_data = &proc->instance;
     proc->mount.state = VFS_MOUNT_STATE_LIVE;
     *owner = &proc->mount;

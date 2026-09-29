@@ -58,6 +58,16 @@ static void release_path(struct kernel_heap *heap, char *work)
         __builtin_trap();
 }
 
+uint64_t kernel_vfs_allocate_mount_id(void)
+{
+    static uint64_t next = 1;
+    uintptr_t irq = riscv_interrupt_save();
+    if (next == UINT64_MAX) __builtin_trap();
+    uint64_t id = next++;
+    riscv_interrupt_restore(irq);
+    return id;
+}
+
 /* A mount edge is published after both paths are pinned. The short IRQ
  * section protects the edge and reference transfer; it never waits for I/O. */
 int kernel_vfs_mount_attach(struct kernel_vfs_mount *mount,
@@ -76,6 +86,7 @@ int kernel_vfs_mount_attach(struct kernel_vfs_mount *mount,
         (covered->file.mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFDIR)
         return -KERNEL_EINVAL;
     parent = covered->file.mount;
+    if (((struct kernel_vfs_instance *)parent->private_data)->quiescing) return -KERNEL_EIO;
     if (parent == mount) return -KERNEL_EINVAL;
     result = kernel_vfs_path_root(mount,
                     ((struct kernel_vfs_instance *)mount->private_data)->heap,
@@ -104,6 +115,28 @@ int kernel_vfs_mount_attach(struct kernel_vfs_mount *mount,
     covered->mounted_here = mount;
     riscv_interrupt_restore(irq);
     return 0;
+}
+
+int kernel_vfs_mount_prepare_detach(struct kernel_vfs_mount *mount,
+    const struct kernel_vfs_path *named_root)
+{
+    if (!mount || !mount->private_data || !mount->covered_path ||
+        !mount->root_path || !mount->parent) return -KERNEL_EINVAL;
+    struct kernel_vfs_instance *instance = mount->private_data;
+    KERNEL_LOCK_SCOPE(namespace_guard);
+    kernel_vfs_namespace_lock(mount, &namespace_guard);
+    uintptr_t irq = riscv_interrupt_save();
+    uint32_t expected = named_root == mount->root_path ? 2U : 1U;
+    if (mount->covered_path->mounted_here != mount || mount->child_mounts ||
+        mount->root_path->references != expected || instance->external_files != 1U) {
+        riscv_interrupt_restore(irq);
+        return -KERNEL_EBUSY;
+    }
+    /* 先关闭新提交入口，再放锁等待 worker；失败仍由可达的挂载持有。 */
+    instance->quiescing = 1;
+    riscv_interrupt_restore(irq);
+    kernel_lock_scope_release(&namespace_guard);
+    return instance->ops->prepare_unmount ? instance->ops->prepare_unmount(mount) : 0;
 }
 
 int kernel_vfs_mount_detach(struct kernel_vfs_mount *mount,
@@ -281,6 +314,8 @@ int kernel_vfs_path_lookup(struct kernel_vfs_path *parent,
     VFS_PATH_PIN(path_pin, parent);
     KERNEL_LOCK_SCOPE(namespace_guard);
     kernel_vfs_namespace_lock(parent->file.mount, &namespace_guard);
+    if (((struct kernel_vfs_instance *)parent->file.mount->private_data)->quiescing)
+        return -KERNEL_EIO;
 
     struct kernel_vfs_path *child;
     struct kernel_vfs_mount *mount;
@@ -855,6 +890,10 @@ static int mutation_path(struct kernel_vfs_path *start,
                                 follow_trailing, path, missing_name);
     if (result) return result;
     kernel_vfs_namespace_lock((*path)->file.mount, guard);
+    if (((struct kernel_vfs_instance *)(*path)->file.mount->private_data)->quiescing) {
+        (void)kernel_vfs_path_release(path);
+        return -KERNEL_EIO;
+    }
     /* PATH_MAX constrains the supplied path, not a dirfd's ancestry. The
      * pathname-only backend bridge needs the full current ancestor chain. */
     size_t capacity = 2U;
@@ -1927,6 +1966,7 @@ int kernel_vfs_mount_statfs(struct kernel_vfs_mount *mount,
 {
     if (!mount || !mount->private_data) return -KERNEL_EINVAL;
     struct kernel_vfs_instance *instance = mount->private_data;
+    if (instance->quiescing) return -KERNEL_EIO;
     return instance->ops->statfs(mount, stat);
 }
 
@@ -1935,6 +1975,7 @@ int kernel_vfs_file_set_times(struct kernel_vfs_file *file,
 {
     if (!file || !file->mount || !file->mount->private_data) return -KERNEL_EINVAL;
     struct kernel_vfs_instance *instance = file->mount->private_data;
+    if (instance->quiescing) return -KERNEL_EIO;
     return instance->ops->set_times(file, times);
 }
 
@@ -1942,6 +1983,7 @@ int kernel_vfs_file_set_mode(struct kernel_vfs_file *file, uint32_t mode)
 {
     if (!file || !file->mount || !file->mount->private_data) return -KERNEL_EINVAL;
     struct kernel_vfs_instance *instance = file->mount->private_data;
+    if (instance->quiescing) return -KERNEL_EIO;
     return instance->ops->set_mode(file, mode);
 }
 
@@ -1952,6 +1994,7 @@ static int vfs_open_raw(struct kernel_vfs_mount *mount,
 {
     if (!mount || !mount->private_data) return -KERNEL_EINVAL;
     struct kernel_vfs_instance *instance = mount->private_data;
+    if (instance->quiescing) return -KERNEL_EIO;
     return instance->ops->open(mount, path, inode_number, inode_mode, file);
 }
 
@@ -1962,6 +2005,7 @@ static int vfs_create_raw(struct kernel_vfs_mount *mount,
 {
     if (!mount || !mount->private_data) return -KERNEL_EINVAL;
     struct kernel_vfs_instance *instance = mount->private_data;
+    if (instance->quiescing) return -KERNEL_EIO;
     return instance->ops->create(mount, path, mode, file);
 }
 
@@ -1985,6 +2029,7 @@ int kernel_vfs_fstat(const struct kernel_vfs_file *file,
 {
     if (!file || !file->mount || !file->mount->private_data) return -KERNEL_EINVAL;
     struct kernel_vfs_instance *instance = file->mount->private_data;
+    if (instance->quiescing) return -KERNEL_EIO;
     return instance->ops->stat(file, stat);
 }
 

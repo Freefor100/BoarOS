@@ -64,14 +64,14 @@
 #define EXT4_MP_LOCK(_m)                                                       \
 	do {                                                                   \
 		if ((_m)->os_locks)                                            \
-			(_m)->os_locks->lock();                                \
+			(_m)->os_locks->lock((_m)->os_locks->context);       \
 	} while (0)
 
 /**@brief   Mount point OS dependent unlock*/
 #define EXT4_MP_UNLOCK(_m)                                                     \
 	do {                                                                   \
 		if ((_m)->os_locks)                                            \
-			(_m)->os_locks->unlock();                              \
+			(_m)->os_locks->unlock((_m)->os_locks->context);     \
 	} while (0)
 
 /**@brief   Mount point descriptor.*/
@@ -79,6 +79,7 @@ struct ext4_mountpoint {
 
 	/**@brief   Mount done flag.*/
 	bool mounted;
+	bool reserved;
 
 	/**@brief   Mount point name (@ref ext4_mount)*/
 	char name[CONFIG_EXT4_MAX_MP_NAME + 1];
@@ -538,7 +539,7 @@ int ext4_mount(const char *dev_name, const char *mount_point,
 
 	size_t mp_len = strlen(mount_point);
 
-	if (mp_len > CONFIG_EXT4_MAX_MP_NAME)
+	if (!mp_len || mp_len > CONFIG_EXT4_MAX_MP_NAME)
 		return EINVAL;
 
 	if (mount_point[mp_len - 1] != '/')
@@ -555,7 +556,9 @@ int ext4_mount(const char *dev_name, const char *mount_point,
 		return ENODEV;
 
 	for (size_t i = 0; i < CONFIG_EXT4_MOUNTPOINTS_COUNT; ++i) {
-		if (!s_mp[i].mounted) {
+		if (!s_mp[i].reserved && !s_mp[i].mounted) {
+			memset(&s_mp[i], 0, sizeof(s_mp[i]));
+			s_mp[i].reserved = true;
 			strcpy(s_mp[i].name, mount_point);
 			s_mp[i].clock = NULL;
 			s_mp[i].transaction_depth = 0;
@@ -568,19 +571,19 @@ int ext4_mount(const char *dev_name, const char *mount_point,
 		}
 
 		if (!strcmp(s_mp[i].name, mount_point))
-			return EOK;
+			return s_mp[i].mounted ? EOK : EBUSY;
 	}
 
 	if (!mp)
 		return ENOMEM;
 
 	r = ext4_block_init(bd);
-	if (r != EOK)
-		return r;
+	if (r != EOK) { mp->reserved = false; return r; }
 
 	r = ext4_fs_init(&mp->fs, bd, read_only);
 	if (r != EOK) {
 		ext4_block_fini(bd);
+		mp->reserved = false;
 		return r;
 	}
 
@@ -591,11 +594,16 @@ int ext4_mount(const char *dev_name, const char *mount_point,
 	r = ext4_bcache_init_dynamic(bc, CONFIG_BLOCK_DEV_CACHE_SIZE, bsize);
 	if (r != EOK) {
 		ext4_block_fini(bd);
+		mp->reserved = false;
 		return r;
 	}
 
-	if (bsize != bc->itemsize)
+	if (bsize != bc->itemsize) {
+		ext4_bcache_fini_dynamic(bc);
+		ext4_block_fini(bd);
+		mp->reserved = false;
 		return ENOTSUP;
+	}
 
 	/*Bind block cache to block device*/
 	r = ext4_block_bind_bcache(bd, bc);
@@ -603,6 +611,7 @@ int ext4_mount(const char *dev_name, const char *mount_point,
 		ext4_bcache_cleanup(bc);
 		ext4_block_fini(bd);
 		ext4_bcache_fini_dynamic(bc);
+		mp->reserved = false;
 		return r;
 	}
 
@@ -657,6 +666,7 @@ int ext4_umount(const char *mount_point)
 	EXT4_MP_LOCK(mp);
 	int result = ext4_umount_locked(mount_point);
 	EXT4_MP_UNLOCK(mp);
+	if (result == EOK) mp->reserved = false;
 	return result;
 }
 
@@ -799,7 +809,7 @@ static int __ext4_trans_start(struct ext4_mountpoint *mp)
 	if (mp->journal_stopped) return EBUSY;
 	if (mp->transaction_error) return mp->transaction_error;
 	if (mp->transaction_depth == UINT32_MAX) return EOVERFLOW;
-	uintptr_t owner = mp->os_locks && mp->os_locks->owner ? mp->os_locks->owner() : 0;
+	uintptr_t owner = mp->os_locks && mp->os_locks->owner ? mp->os_locks->owner(mp->os_locks->context) : 0;
 	if (mp->transaction_depth && mp->transaction_owner != owner) __builtin_trap();
 	if (mp->transaction_depth == 0) {
 		mp->transaction_owner = owner;
@@ -840,7 +850,7 @@ static int __ext4_trans_finish(struct ext4_mountpoint *mp, int error)
 	int r = error;
 	if (!journal) return error;
 	if (mp->os_locks && mp->os_locks->owner &&
-	    mp->transaction_owner != mp->os_locks->owner()) __builtin_trap();
+	    mp->transaction_owner != mp->os_locks->owner(mp->os_locks->context)) __builtin_trap();
 	if (!mp->transaction_depth || !trans)
 		return journal->error ? journal->error : (error ? error : EINVAL);
 	if (!mp->transaction_error && error) mp->transaction_error = error;
@@ -1082,7 +1092,7 @@ int ext4_file_touch(ext4_file *file, unsigned int fields)
     /* A relatime cache hit is a pure read. Never upgrade the shared gate. */
     if (fields == (EXT4_TIME_ATIME | EXT4_TIME_RELATIME) &&
         mp->os_locks && mp->os_locks->read_lock) {
-        mp->os_locks->read_lock();
+        mp->os_locks->read_lock(mp->os_locks->context);
         result = ext4_fs_get_inode_ref(&mp->fs, file->inode, &ref);
         int needed = 1;
         if (result == EOK) {
@@ -1873,6 +1883,58 @@ static int ext4_rename_lookup(struct ext4_inode_ref *parent, const char *name,
 	int r = ext4_dir_find_entry(&result, parent, name, length);
 	if (r == EOK) *inode = ext4_dir_en_get_inode(result.dentry);
 	return ext4_result(r, ext4_dir_destroy_result(parent, &result));
+}
+
+int ext4_link_child(const char *mount_point, uint32_t source_inode,
+                   uint32_t parent_inode, const char *name, uint32_t length)
+{
+    if (!mount_point) return EINVAL;
+    struct ext4_mountpoint *mp = ext4_get_mount(mount_point);
+    if (!mp) return ENOENT;
+    struct ext4_fs *fs = &mp->fs;
+    struct ext4_inode_ref source = {0}, parent = {0};
+    uint32_t existing = 0;
+    int r;
+    EXT4_MP_LOCK(mp);
+    if (!source_inode || !parent_inode || !ext4_rename_name_valid(name, length)) {
+        r = EINVAL; goto Unlock;
+    }
+    if (fs->read_only) { r = EROFS; goto Unlock; }
+    if (!fs->jbd_journal) { r = ENOTSUP; goto Unlock; }
+    r = ext4_trans_start(mp);
+    if (r != EOK) goto Unlock;
+    r = ext4_fs_get_inode_ref(fs, source_inode, &source);
+    if (r != EOK) goto Put;
+    if (ext4_inode_is_type(&fs->sb, source.inode, EXT4_INODE_MODE_DIRECTORY)) {
+        r = EPERM; goto Put;
+    }
+    /* A removed inode cannot be resurrected; tmpfile is not this API. */
+    if (!ext4_inode_get_links_cnt(source.inode)) { r = ENOENT; goto Put; }
+    if (ext4_inode_get_links_cnt(source.inode) >= EXT4_LINK_MAX) { r = EMLINK; goto Put; }
+    r = ext4_fs_get_inode_ref(fs, parent_inode, &parent);
+    if (r != EOK) goto Put;
+    if (!ext4_inode_is_type(&fs->sb, parent.inode, EXT4_INODE_MODE_DIRECTORY)) {
+        r = ENOTDIR; goto Put;
+    }
+    if (!ext4_inode_get_links_cnt(parent.inode)) { r = ENOENT; goto Put; }
+    r = ext4_rename_lookup(&parent, name, length, &existing);
+    if (r == EOK) { r = EEXIST; goto Put; }
+    if (r != ENOENT) goto Put;
+    r = ext4_dir_add_entry(&parent, name, length, &source);
+    if (r != EOK) goto Put;
+    ext4_fs_inode_links_count_inc(&source);
+    source.dirty = true;
+    ext4_touch_inode(mp, &source, EXT4_TIME_CTIME);
+    ext4_touch_inode(mp, &parent, EXT4_TIME_MTIME | EXT4_TIME_CTIME);
+Put:
+    if (parent.block.data) r = ext4_result(r, ext4_fs_put_inode_ref(&parent));
+    if (source.block.data) r = ext4_result(r, ext4_fs_put_inode_ref(&source));
+    r = ext4_trans_finish(mp, r);
+Unlock:
+    if (r != EOK && fs->curr_trans && !fs->curr_trans->error)
+        fs->curr_trans->error = r;
+    EXT4_MP_UNLOCK(mp);
+    return r;
 }
 
 static int ext4_rename_ancestry(struct ext4_fs *fs, uint32_t source, uint32_t current)
@@ -2806,7 +2868,7 @@ int ext4_fpread(const ext4_file *file, uint64_t offset, void *buf, size_t size, 
 {
     if (!file || !file->mp || !rcnt || (!buf && size)) return EINVAL;
     const struct ext4_lock *locks = file->mp->os_locks;
-    if (locks && locks->read_lock) locks->read_lock();
+    if (locks && locks->read_lock) locks->read_lock(locks->context);
     else EXT4_MP_LOCK(file->mp);
     ext4_file local = *file;
     local.fpos = offset;

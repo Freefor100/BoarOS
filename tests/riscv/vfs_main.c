@@ -21,6 +21,7 @@
 #include <ext4.h>
 #include <ext4_errno.h>
 #include "../../fs/lwext4_port.h"
+#include "../../fs/ext4_backend.h"
 #endif
 
 #define TEST_POOL_PAGES 512U
@@ -292,6 +293,59 @@ static void run_proc_shutdown_regression(struct kernel_vfs_mount *root_mount,
 }
 
 static uint32_t fail_orphan_free_calls;
+static struct lwext4_mount_adapter *unmount_barrier_owner;
+static kernel_block_flush_fn unmount_original_flush;
+static unsigned unmount_barrier_failures, unmount_flush_calls;
+static enum kernel_block_status unmount_test_flush(void *context)
+{
+    unmount_flush_calls++;
+    /* 注入元数据 teardown 之后的最终持久化屏障，检查容器仍有真实 owner。 */
+    if (unmount_barrier_owner && !unmount_barrier_owner->mounted &&
+        unmount_barrier_failures) {
+        unmount_barrier_failures--;
+        return KERNEL_BLOCK_STATUS_IO;
+    }
+    return unmount_original_flush(context);
+}
+
+static void run_prepare_unmount_regression(struct kernel_vfs_mount *mount,
+                                           struct kernel_heap *heap)
+{
+    struct kernel_vfs_instance parent_instance = {0};
+    struct kernel_vfs_mount parent = {0};
+    struct kernel_vfs_path *covered = 0, *root = 0, *unavailable = 0;
+    struct lwext4_mount_adapter *adapter = mount->private_data;
+    struct kernel_block_device *block = adapter->block;
+    synthetic_mount_init(&parent, &parent_instance, heap, 103U);
+    if (kernel_vfs_path_root(&parent, heap, &covered) ||
+        kernel_vfs_mount_attach(mount, covered)) fail_vfs(131U, 0, -1);
+    root = mount->root_path;
+    if (kernel_vfs_path_acquire(root)) fail_vfs(132U, 0, -1);
+    unmount_original_flush = block->flush;
+    if (!unmount_original_flush) fail_vfs(133U, 0, -1);
+    unmount_barrier_owner = adapter;
+    unmount_barrier_failures = 1U;
+    block->flush = unmount_test_flush;
+    int result = kernel_vfs_mount_prepare_detach(mount, root);
+    if (result != -KERNEL_EIO || unmount_barrier_failures ||
+        mount->private_data != adapter || mount->root_path != root ||
+        covered->mounted_here != mount || block->claim_owner != mount ||
+        !adapter->instance.quiescing || !adapter->unmount_sync_pending ||
+        kernel_vfs_path_lookup(root, "init", 4U, &unavailable) != -KERNEL_EIO)
+        fail_vfs(134U, -KERNEL_EIO, result);
+    if (kernel_vfs_mount_prepare_detach(mount, root) ||
+        kernel_vfs_mount_detach(mount, root) || covered->mounted_here ||
+        mount->parent || !adapter->unmount_prepared || block->claim_owner != mount)
+        fail_vfs(135U, 0, -1);
+    unmount_barrier_owner = 0;
+    unsigned calls = unmount_flush_calls;
+    if (kernel_vfs_path_release(&root) || kernel_vfs_unmount(mount) ||
+        unmount_flush_calls != calls || block->claim_owner ||
+        kernel_vfs_path_release(&covered) || kernel_vfs_unmount(&parent))
+        fail_vfs(136U, 0, -1);
+    block->flush = unmount_original_flush;
+}
+
 static uint32_t orphan_free_calls;
 static uint32_t fail_fclose_calls;
 static uint32_t failed_fclose_calls;
@@ -723,6 +777,7 @@ static void run_writeback_regression(struct kernel_vfs_mount *mount,
     struct kernel_vfs_file first = {0}, second = {0}, alias = {0};
     struct kernel_vfs_stat stat;
     ext4_file raw;
+    struct lwext4_mount_adapter *adapter = mount->private_data;
     uint64_t observed = 0;
     size_t count = 0;
     char result[8] = {0};
@@ -735,7 +790,7 @@ static void run_writeback_regression(struct kernel_vfs_mount *mount,
         kernel_vfs_pread(&alias, 0, result, sizeof(result), &count) ||
         count != 5 || !bytes_equal((unsigned char *)result, "first", 5))
         fail_vfs(70, 0, -1);
-    if (ext4_fopen(&raw, "/wb-first", "r") || ext4_fsize(&raw) != 0 ||
+    if (ext4_fopen_inode(&raw, adapter->mount_point, kernel_vfs_file_inode(&first)) || ext4_fsize(&raw) != 0 ||
         ext4_fclose(&raw)) fail_vfs(71, 0, -1);
     struct kernel_vfs_file clean = {0};
     if (kernel_vfs_open(mount, "/init", &clean) ||
@@ -746,12 +801,12 @@ static void run_writeback_regression(struct kernel_vfs_mount *mount,
     pressure_cache = cache;
     void *allocation = ext4_user_malloc(4096);
     if (allocation == 0 || pressure_cache != 0 || pressure_reclaimed == 0 ||
-        ext4_fopen(&raw, "/wb-first", "r") || ext4_fsize(&raw) != 0 ||
+        ext4_fopen_inode(&raw, adapter->mount_point, kernel_vfs_file_inode(&first)) || ext4_fsize(&raw) != 0 ||
         ext4_fclose(&raw)) fail_vfs(77, 0, -1);
     ext4_user_free(allocation);
     if (kernel_vfs_sync(&first, 0, &observed)) fail_vfs(72, 0, -1);
-    if (ext4_fopen(&raw, "/wb-first", "r") || ext4_fsize(&raw) != 5 ||
-        ext4_fclose(&raw) || ext4_fopen(&raw, "/wb-second", "r") ||
+    if (ext4_fopen_inode(&raw, adapter->mount_point, kernel_vfs_file_inode(&first)) || ext4_fsize(&raw) != 5 ||
+        ext4_fclose(&raw) || ext4_fopen_inode(&raw, adapter->mount_point, kernel_vfs_file_inode(&second)) ||
         ext4_fsize(&raw) != 0 || ext4_fclose(&raw)) fail_vfs(73, 0, -1);
     if (kernel_vfs_close(&first) || kernel_vfs_close(&alias) ||
         kernel_vfs_close(&second)) fail_vfs(74, 0, -1);
@@ -1039,9 +1094,9 @@ static void run_vfs_test(const void *dtb)
     run_mount_tree_regression(&mount, &heap);
     run_proc_shutdown_regression(&mount, &heap);
     run_writeback_regression(&mount, &page_cache);
-    result = kernel_vfs_unmount(&mount);
-    if (result != 0 || retried_fclose_calls != failed_fclose_calls) {
-        fail_vfs(12U, 0, result);
+    run_prepare_unmount_regression(&mount, &heap);
+    if (retried_fclose_calls != failed_fclose_calls) {
+        fail_vfs(12U, failed_fclose_calls, retried_fclose_calls);
     }
 
     device.block.write = 0;

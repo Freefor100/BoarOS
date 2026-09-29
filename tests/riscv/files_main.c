@@ -1,3 +1,4 @@
+#include "../../fs/ext4_backend.h"
 #include <arch/riscv/mm.h>
 #include <arch/riscv/sbi.h>
 #include <arch/riscv/sv39.h>
@@ -3289,7 +3290,7 @@ static void finish_sticky_metadata_test(const struct dtb_memory_range *mmio,
             RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK ||
         kernel_vfs_mount_root(&mount, &device.block, heap, &cache) != 0 ||
         kernel_vfs_create(&mount, "/journal-error", 0600U, &file) != 0 ||
-        ext4_mount_setup_clock("/", timestamp_test_clock) != EOK ||
+        ext4_mount_setup_clock(((struct lwext4_mount_adapter *)mount.private_data)->mount_point, timestamp_test_clock) != EOK ||
         kernel_vfs_file_modified(&file, 0U, 0) != 0) {
         fail_files(420U, 0, -1);
     }
@@ -3753,7 +3754,7 @@ static void run_partial_write_test(const void *dtb)
     /* Successful metadata submission still updates the observed timestamp. */
     if (kernel_files_sync(&files, 0, 0, &result) != KERNEL_FILES_STATUS_OK ||
         result != 0 ||
-        ext4_mount_setup_clock("/", timestamp_test_clock) != EOK ||
+        ext4_mount_setup_clock(((struct lwext4_mount_adapter *)mount.private_data)->mount_point, timestamp_test_clock) != EOK ||
         kernel_vfs_file_modified(&description->file,
                                  kernel_open_file_offset(description), 0) != 0 ||
         kernel_vfs_fstat(&description->file, &vfs_stat) != 0 ||
@@ -3761,7 +3762,7 @@ static void run_partial_write_test(const void *dtb)
         vfs_stat.mtime.nanoseconds != time_clock_nanoseconds) {
         fail_files(400U, 0, -1);
     }
-    if (ext4_mount_setup_clock("/", 0) != EOK) fail_files(404U, 0, -1);
+    if (ext4_mount_setup_clock(((struct lwext4_mount_adapter *)mount.private_data)->mount_point, 0) != EOK) fail_files(404U, 0, -1);
 
     use_test_satp = 0;
     if (kernel_files_close(&files, 0, &result) != KERNEL_FILES_STATUS_OK ||

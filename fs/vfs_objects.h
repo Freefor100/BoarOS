@@ -24,6 +24,7 @@ struct kernel_vfs_instance {
     struct kernel_vfs_path *paths; /* Weak registry; live callers own references. */
     uint32_t external_files;
     uint8_t read_only;
+    uint8_t quiescing;
 };
 
 struct kernel_vfs_node {
@@ -99,9 +100,13 @@ struct kernel_vfs_backend {
     int (*symlink)(struct kernel_vfs_instance *instance, const char *target, const char *path);
     int (*mknod)(struct kernel_vfs_instance *instance, const char *path,
         uint32_t type, uint32_t mode, uint32_t device);
+    int (*link)(struct kernel_vfs_instance *instance, uint64_t source_inode,
+        uint64_t target_parent, const char *name);
     int (*rename)(struct kernel_vfs_instance *instance,
         uint64_t old_parent, const char *old_name, uint64_t new_parent,
         const char *new_name, unsigned flags, struct kernel_vfs_rename_result *result);
+    /* Failure keeps the attached root and backend owner reachable for retry. */
+    int (*prepare_unmount)(struct kernel_vfs_mount *mount);
     int (*unmount)(struct kernel_vfs_mount *mount);
     int (*statfs)(struct kernel_vfs_mount *mount,
         struct kernel_vfs_statfs *stat);

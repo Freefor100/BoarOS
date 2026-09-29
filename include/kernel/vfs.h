@@ -12,6 +12,7 @@
 #define KERNEL_VFS_S_IFREG UINT32_C(0100000)
 #define KERNEL_VFS_S_IFDIR UINT32_C(0040000)
 #define KERNEL_VFS_S_IFLNK UINT32_C(0120000)
+#define KERNEL_VFS_S_IFBLK UINT32_C(0060000)
 #define KERNEL_VFS_S_IFCHR UINT32_C(0020000)
 #define KERNEL_VFS_S_IFIFO UINT32_C(0010000)
 #define KERNEL_VFS_S_IFSOCK UINT32_C(0140000)
@@ -19,6 +20,7 @@
 #define KERNEL_VFS_S_IXGRP UINT32_C(0000010)
 #define KERNEL_VFS_S_IXOTH UINT32_C(0000001)
 
+uint64_t kernel_vfs_allocate_mount_id(void);
 struct kernel_vfs_path;
 struct kernel_open_file_description;
 struct kernel_vfs_mount {
@@ -39,6 +41,8 @@ struct kernel_vfs_mount {
  * Detach accepts the single caller-owned root used to name the mount. */
 int kernel_vfs_mount_attach(struct kernel_vfs_mount *mount,
                             struct kernel_vfs_path *covered);
+int kernel_vfs_mount_prepare_detach(struct kernel_vfs_mount *mount,
+    const struct kernel_vfs_path *named_root);
 int kernel_vfs_mount_detach(struct kernel_vfs_mount *mount,
                             const struct kernel_vfs_path *named_root);
 
@@ -158,6 +162,9 @@ int kernel_vfs_rename_at(struct kernel_vfs_path *old_start,
                          unsigned flags);
 
 /* Returns zero or a negative Linux-compatible errno value. */
+int kernel_vfs_mount_ext4(struct kernel_vfs_mount *mount,
+    struct kernel_block_device *block, struct kernel_heap *heap,
+    struct kernel_page_cache *page_cache, int read_only);
 int kernel_vfs_mount_root(struct kernel_vfs_mount *mount,
                           struct kernel_block_device *block,
                           struct kernel_heap *heap,

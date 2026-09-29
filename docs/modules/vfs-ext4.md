@@ -4,7 +4,7 @@
 
 ## 通用边界
 
-`include/kernel/block.h` 定义同步块设备（支持读与可选写），`include/kernel/vfs.h` 定义 mount/file 对象以及根挂载、open/create、pread/pwrite、ftruncate、mkdir、unlink、rmdir、close、unmount、`kernel_vfs_fstat()` 与 `kernel_vfs_mount_is_readonly()` 查询。VFS 对外返回负 Linux errno；lwext4 的结构、全局设备名和正值 errno 不泄漏到调用者。当前有一个 ext4 根实例和可由用户挂载的 proc 实例，lwext4 仍只有一个 heap binding；进程 fd/open-file-description 位于独立的[文件资源层](kernel-files.md)，所有任务共享一棵挂载树，没有 mount namespace 隔离；命名空间修改使用可睡眠 mutex，inode、OFD 与后端各自同步。
+`include/kernel/block.h` 定义同步块设备（支持读与可选写），`include/kernel/vfs.h` 定义 mount/file 对象以及根挂载、open/create、pread/pwrite、ftruncate、mkdir、unlink、rmdir、close、unmount、`kernel_vfs_fstat()` 与 `kernel_vfs_mount_is_readonly()` 查询。VFS 对外返回负 Linux errno；lwext4 的结构、全局设备名和正值 errno 不泄漏到调用者。ext4 后端支持独立实例，lwext4 共用 heap binding 按实例引用计数维护；用户态仍由挂载入口决定开放范围；进程 fd/open-file-description 位于独立的[文件资源层](kernel-files.md)，所有任务共享一棵挂载树，没有 mount namespace 隔离；命名空间修改使用可睡眠 mutex，inode、OFD 与后端各自同步。
 
 `fs/vfs_objects.h` 定义通用实例、inode 节点、路径与后端操作表；
 `fs/vfs.c` 管理路径身份、引用、执行/写租约、记录锁、缓存及映射登记。
@@ -182,3 +182,15 @@ make test-root-init-riscv
 每批最多扫描 64 个哈希槽并让出 CPU；写回跨睡眠固定 entry 和 inode，保存槽游标而不保存可能失效的 LRU 指针。每轮代次防止扩容或重新变脏导致重复处理，无进展即等待新事件。启动持有专用 4 KiB 写回快照，后端 metadata 仍可能 ENOMEM，不是完整应急池。映射重新设保护与 generation 协议保持不变，旧完成不能清除新修改。写回错误留在 inode/mount，当前失败页在成功前不计入 MemAvailable；同一轮继续处理其他对象。后台完成不替代 fsync/fdatasync 的错误观察与 flush。
 
 统计入口同时记录 worker 扫描、写回、失败、批次和实际释放量；内存快照单次 O(驻留页数)，分配通知为 O(1)。`test-io-sleep-riscv` 在 4 MiB 测试池上触发默认比例，覆盖单次 EIO 后继续进展、错误观察、再次修改仍排除失败页、2% 到 4% 回收、固定页不被驱逐、启动 OOM、暂扣在途写回时 stop/join 等待且不继续提交、退出资源基线；共享映射睡眠期间修改、孤儿关闭和设备延迟使用同一写回协议的既有聚焦测试。测试边界为单 hart，不推出 SMP 或实板持久性。
+
+## 独立 ext4 后端与卸载交接
+
+每个实例生成自己的 lwext4 设备名与内部路径，携带独立的锁回调上下文、
+页缓存和错误 owner。共享 heap 按引用计数绑定，生成配置容纳八实例，挂载槽
+在可睡眠 I/O 之前预留。内部硬链接接口固定源 inode 与目标父 inode，在同一
+日志事务提交目录项、nlink 和时间；最后链接删除才进入 orphan 生命周期。
+
+prepare_unmount 在附着 root 仍可到达时停止 worker、清缓存并完成屏障，失败
+保留树和设备 claim，成功后的最终销毁不再发 I/O。test-vfs-riscv 覆盖最终屏障
+失败重试；test-files-partial-write-riscv 保留原错误契约。test-lwext4-instances-host
+在 1 KiB/4 KiB 文件系统验证独立实例，rename/recovery host 入口覆盖日志矩阵。

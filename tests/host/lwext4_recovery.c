@@ -24,12 +24,12 @@ static int reorder;
 static unsigned allocations, fail_allocation;
 static unsigned lock_depth, check_storage_owner;
 static uintptr_t owner_identity = 1;
-static void storage_lock(void) { lock_depth++; }
-static void storage_unlock(void) { CHECK(lock_depth); lock_depth--; }
-static uintptr_t storage_owner(void) { CHECK(lock_depth); return owner_identity; }
+static void storage_lock(void *context) { CHECK(context == &lock_depth); lock_depth++; }
+static void storage_unlock(void *context) { CHECK(context == &lock_depth); CHECK(lock_depth); lock_depth--; }
+static uintptr_t storage_owner(void *context) { CHECK(context == &lock_depth); CHECK(lock_depth); return owner_identity; }
 static struct ext4_lock storage_locks = {
     .lock = storage_lock, .unlock = storage_unlock,
-    .read_lock = storage_lock, .owner = storage_owner,
+    .read_lock = storage_lock, .owner = storage_owner, .context = &lock_depth,
 };
 void *ext4_user_malloc(size_t size)
 { return ++allocations == fail_allocation ? NULL : malloc(size); }
@@ -96,9 +96,9 @@ static void shrink_regrow(struct ext4_fs *fs)
         if (writing) CHECK(memcmp(bytes + end - 3, "new", 3) == 0);
         if (unlinked) {
             uint32_t pending;
-            storage_lock();
+            storage_lock(&lock_depth);
             CHECK(ext4_orphan_peek(fs, &pending) == EOK && pending == ino);
-            storage_unlock();
+            storage_unlock(&lock_depth);
         }
         CHECK(ext4_fclose(&file) == EOK);
         if (unlinked) CHECK(ext4_orphan_free("/", ino) == EOK);
@@ -193,9 +193,9 @@ static void grouped_remove(struct ext4_blockdev *dev)
             CHECK(ext4_transaction_end("/") == EOK);
             CHECK(ext4_fopen(&file, "/remove", "r") == ENOENT);
             uint32_t pending;
-            storage_lock();
+            storage_lock(&lock_depth);
             CHECK(ext4_orphan_peek(fs, &pending) == EOK && pending == ino);
-            storage_unlock();
+            storage_unlock(&lock_depth);
             if (scenario == 2) CHECK(ext4_orphan_recover("/") == EOK);
             else {
                 CHECK(ext4_umount("/") == EOK);

@@ -552,6 +552,10 @@ test-references:
 test-lwext4-host:
 	./tests/lwext4-host.sh
 
+.PHONY: test-lwext4-instances-host
+test-lwext4-instances-host:
+	sh tests/lwext4-instances-host.sh
+
 test-lwext4-rename-host:
 	sh tests/lwext4-rename-host.sh
 

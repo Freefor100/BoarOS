@@ -32,22 +32,37 @@ for size in 1024 4096; do
             truncate -s 32M "$work/split.img"
             mkfs.ext4 -q -F -b "$size" -O "$directory,$orphan" "$work/split.img"
             timeout 30 "$work/probe" "$work/split.img" seed-split
-            for kind in file dir insert split; do
+            for kind in file dir insert split link link-split unlink-alias rename-alias last-unlink orphan-reclaim; do
                 base="$work/base.img"
-                [ "$kind" != split ] || base="$work/split.img"
+                [ "$kind" != split ] && [ "$kind" != link-split ] || base="$work/split.img"
+                case "$kind" in
+                    unlink-alias|rename-alias|last-unlink|orphan-reclaim)
+                        cp "$base" "$work/links.img"
+                        timeout 30 "$work/probe" "$work/links.img" seed-links "$kind"
+                        base="$work/links.img"
+                        ;;
+                esac
+                cp "$base" "$work/test.img"
+                set -- $(timeout 30 "$work/probe" "$work/test.img" mutate "$kind")
+                [ "$#" -eq 3 ]
+                total=$1; writes=$2; flushes=$3
+                [ "$total" -eq "$((writes + flushes))" ]
+                [ "$total" -gt 0 ] && [ "$writes" -gt 0 ] && [ "$flushes" -gt 0 ]
+                timeout 30 "$work/probe" "$work/test.img" verify "$kind"
+                check_fs "$work/test.img"
                 for fault in write flush; do
-                    for boundary in 1 2; do
+                    limit=$writes
+                    [ "$fault" != flush ] || limit=$flushes
+                    boundary=1
+                    while [ "$boundary" -le "$limit" ]; do
                         cp "$base" "$work/test.img"
                         timeout 30 "$work/probe" "$work/test.img" "io-$fault" "$kind" "$boundary"
                         timeout 30 "$work/probe" "$work/test.img" verify "$kind"
+                        timeout 30 "$work/probe" "$work/test.img" verify "$kind"
                         check_fs "$work/test.img"
-                        [ "$fault" != write ] || break
+                        boundary=$((boundary + 1))
                     done
                 done
-                cp "$base" "$work/test.img"
-                total=$(timeout 30 "$work/probe" "$work/test.img" mutate "$kind")
-                timeout 30 "$work/probe" "$work/test.img" verify "$kind"
-                check_fs "$work/test.img"
                 for order in 0 1; do
                     event=1
                     while [ "$event" -le "$total" ]; do
@@ -71,7 +86,7 @@ for size in 1024 4096; do
                     check_fs "$work/test.img"
                     allocation=$((allocation + 1))
                 done
-                printf 'PASS: %s %s %s %s: %s power cuts x2, %s allocation failures\n' "$size" "$directory" "$orphan" "$kind" "$total" "$allocations"
+                printf 'PASS: %s %s %s %s: %s power cuts x2, %s write failures, %s flush failures, %s allocation injections\n' "$size" "$directory" "$orphan" "$kind" "$total" "$writes" "$flushes" "$allocations"
             done
         done
     done

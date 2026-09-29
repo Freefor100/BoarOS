@@ -8,30 +8,38 @@
 #include <stddef.h>
 
 static struct kernel_heap *lwext4_heap;
-static struct kernel_rwlock backend;
+static unsigned heap_users;
 static struct kernel_wait_queue channels[64];
-static void backend_enter(int read)
+static void backend_enter(void *lock, int read)
 {
     struct kernel_io_context *context = kernel_io_context_current();
     if (context->backend_depth) {
-        if (!read && context->backend_read) __builtin_trap();
+        if (context->backend_guard.lock != lock || (!read && context->backend_read)) __builtin_trap();
     } else {
-        if (read) kernel_rwlock_read(&backend, &context->backend_guard);
-        else kernel_rwlock_write(&backend, &context->backend_guard);
+        if (read) kernel_rwlock_read(lock, &context->backend_guard);
+        else kernel_rwlock_write(lock, &context->backend_guard);
         context->backend_read = read;
     }
     context->backend_depth++;
 }
-static void backend_read(void) { backend_enter(1); }
-static void backend_write(void) { backend_enter(0); }
-static void backend_leave(void)
+static void backend_read(void *lock) { backend_enter(lock, 1); }
+static void backend_write(void *lock) { backend_enter(lock, 0); }
+static void backend_leave(void *lock)
 {
     struct kernel_io_context *context = kernel_io_context_current();
-    if (!context->backend_depth) __builtin_trap();
+    if (!context->backend_depth || context->backend_guard.lock != lock) __builtin_trap();
     if (!--context->backend_depth) kernel_lock_release(&context->backend_guard);
 }
-static uintptr_t backend_owner(void) { return (uintptr_t)kernel_io_context_current(); }
-struct ext4_lock boaros_lwext4_locks;
+static uintptr_t backend_owner(void *lock) { (void)lock; return (uintptr_t)kernel_io_context_current(); }
+void boaros_lwext4_lock_init(struct ext4_lock *callbacks, struct kernel_rwlock *lock)
+{
+    callbacks->lock = backend_write;
+    callbacks->unlock = backend_leave;
+    callbacks->read_lock = backend_read;
+    callbacks->owner = backend_owner;
+    callbacks->context = lock;
+    kernel_rwlock_init(lock, 40, (uintptr_t)lock);
+}
 int boaros_lwext4_read_context(void)
 {
     struct kernel_io_context *context = kernel_io_context_current();
@@ -68,22 +76,18 @@ int boaros_lwext4_heap_bind(struct kernel_heap *heap)
     }
 
     if (!lwext4_heap) {
-        boaros_lwext4_locks.lock = backend_write;
-        boaros_lwext4_locks.unlock = backend_leave;
-        boaros_lwext4_locks.read_lock = backend_read;
-        boaros_lwext4_locks.owner = backend_owner;
-        kernel_rwlock_init(&backend, 40, 0);
         for (unsigned i = 0; i < 64; i++) kernel_wait_queue_init(&channels[i]);
     }
+    if (heap_users == UINT32_MAX) __builtin_trap();
+    heap_users++;
     lwext4_heap = heap;
     return 1;
 }
 
 void boaros_lwext4_heap_unbind(struct kernel_heap *heap)
 {
-    if (lwext4_heap == heap) {
-        lwext4_heap = 0;
-    }
+    if (lwext4_heap != heap || !heap_users) __builtin_trap();
+    if (!--heap_users) lwext4_heap = 0;
 }
 
 void *ext4_user_malloc(size_t size)
