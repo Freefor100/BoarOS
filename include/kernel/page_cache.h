@@ -58,6 +58,8 @@ struct kernel_page_cache {
     enum kernel_page_cache_state state;
 };
 
+/* 一个 allocator 可注册多个独立缓存。统计/水位全局汇总，worker 与快照页各自拥有。
+ * 单 hart 调用边界与原 VFS 一致；所有实例和等待者离开后才释放聚合 owner。 */
 enum kernel_page_cache_status kernel_page_cache_init(
     struct kernel_page_cache *cache,
     struct kernel_heap *heap,

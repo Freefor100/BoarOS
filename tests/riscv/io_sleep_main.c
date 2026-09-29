@@ -28,6 +28,12 @@ static unsigned loading_probe, loads, done, write_probe, background_fail;
 static uint64_t pressure_pages[1024], failed_offset;
 static struct kernel_wait_queue held_write;
 static unsigned stop_probe, stop_entered, stop_called, stop_done;
+static struct kernel_page_cache instance_peer;
+static struct kernel_vfs_node *instance_nodes[2];
+static struct kernel_wait_queue instance_held[2];
+static unsigned instance_hold, instance_entered[2], instance_waiting, instance_wait_done;
+static unsigned instance_stop_called, instance_stop_done;
+static uint64_t instance_peer_pin;
 static uint64_t observed[2], inserted_page;
 static struct kernel_page_cache_alias alias;
 static void rearm(void *owner, uint64_t address) { (void)owner; (void)address; }
@@ -65,6 +71,13 @@ int __wrap_kernel_vfs_node_pread(struct kernel_vfs_node *node, uint64_t offset, 
 int __real_kernel_vfs_node_writeback(struct kernel_vfs_node *, uint64_t, const void *, size_t, size_t *);
 int __wrap_kernel_vfs_node_writeback(struct kernel_vfs_node *node, uint64_t offset, const void *buffer, size_t size, size_t *written)
 {
+    if (instance_hold && kernel_io_context_current()->background_reclaim) {
+        for (unsigned i = 0; i < 2; i++) if (node == instance_nodes[i] && !instance_entered[i]) {
+            instance_entered[i] = 1;
+            enum kernel_wait_wake_reason reason;
+            check(kernel_scheduler_block_current(&instance_held[i], 0, 0, &reason) == KERNEL_SCHEDULER_STATUS_OK, 180);
+        }
+    }
     if (stop_probe && kernel_io_context_current()->background_reclaim) {
         stop_probe = 0;
         stop_entered = 1;
@@ -214,6 +227,153 @@ static void stop_writeback_worker(void *unused)
     kernel_page_cache_stop_worker(&cache);
     stop_done = 1;
 }
+static void instance_yield(void)
+{
+    check(kernel_scheduler_yield_current() == KERNEL_SCHEDULER_STATUS_OK, 181);
+    riscv_interrupt_restore(RISCV_SSTATUS_SIE);
+    (void)riscv_interrupt_save();
+}
+static void instance_write(struct kernel_page_cache *c, struct kernel_vfs_file *f,
+                           unsigned pages)
+{
+    KERNEL_LOCK_SCOPE(guard);
+    kernel_vfs_node_lock(kernel_vfs_file_node(f), &guard, 1);
+    for (unsigned i = 0; i < pages; i++) {
+        size_t written;
+        check(kernel_page_cache_write(c, f, (uint64_t)i * 4096, payload, sizeof(payload),
+                                      &written) == 0 && written == sizeof(payload), 182);
+    }
+}
+static void instance_waiter(void *unused)
+{
+    (void)unused;
+    (void)riscv_interrupt_save();
+    unsigned held = 0;
+    /* 触发 low 压力，同时给真实 ext4 事务留下元数据分配空间。 */
+    uint64_t low = physical_page_total(&allocator) / 50;
+    while (physical_page_available(&allocator) > low) {
+        check(held < 1024 && physical_page_allocate(&allocator, &pressure_pages[held]) == PHYSICAL_PAGE_STATUS_OK, 183);
+        held++;
+    }
+    instance_waiting = 1;
+    allocator.pressure_wait(allocator.pressure_context);
+    instance_wait_done = 1;
+    while (held) check(physical_page_release(&allocator, pressure_pages[--held]) == PHYSICAL_PAGE_STATUS_OK, 184);
+}
+static void instance_stopper(void *unused)
+{
+    (void)unused;
+    (void)riscv_interrupt_save();
+    while (!instance_entered[1]) instance_yield();
+    instance_stop_called = 1;
+    kernel_page_cache_stop_worker(&instance_peer);
+    if (instance_peer_pin) {
+        check(physical_page_release(&allocator, instance_peer_pin) == PHYSICAL_PAGE_STATUS_OK, 206);
+        instance_peer_pin = 0;
+    }
+    check(kernel_page_cache_destroy(&instance_peer) == KERNEL_PAGE_CACHE_STATUS_OK, 185);
+    instance_stop_done = 1;
+}
+static void cache_instances_probe(void)
+{
+    struct kernel_vfs_file files[2] = {{0}, {0}};
+    struct kernel_page_cache_statistics a, b, a_after, b_after;
+    struct kernel_memory_statistics memory;
+    (void)kernel_page_cache_reclaim(&cache, UINT64_MAX);
+    kernel_page_cache_get_statistics(&cache, &a);
+    check(!a.current_pages, 186);
+    check(kernel_page_cache_init(&instance_peer, &heap, &allocator) == KERNEL_PAGE_CACHE_STATUS_OK &&
+          kernel_vfs_create(&mount, "/instance-root", 0600, &files[0]) == 0 &&
+          kernel_vfs_create(&mount, "/instance-peer", 0600, &files[1]) == 0, 187);
+    /* 两个不同 inode 各由一个 cache 拥有，后端仍是真实 ext4。 */
+    instance_write(&cache, &files[0], 2);
+    instance_write(&instance_peer, &files[1], 2);
+    kernel_memory_snapshot(&allocator, &memory);
+    uint64_t low = physical_page_total(&allocator) / 50 * 4096;
+    check(memory.cached == 4 * 4096 && memory.dirty == 4 * 4096 &&
+          !memory.writeback && memory.reclaimable == 4 * 4096 &&
+          memory.available == memory.free - low + memory.reclaimable / 2, 188);
+    check(kernel_page_cache_writeback(&cache, kernel_vfs_file_node(&files[0])) == 0 &&
+          kernel_page_cache_writeback(&instance_peer, kernel_vfs_file_node(&files[1])) == 0, 189);
+    kernel_memory_snapshot(&allocator, &memory);
+    check(memory.cached == 4 * 4096 && !memory.dirty, 190);
+    check(allocator.reclaimer(allocator.reclaimer_context, 1) == 1 &&
+          allocator.reclaimer(allocator.reclaimer_context, 1) == 1, 191);
+    kernel_page_cache_get_statistics(&cache, &a);
+    kernel_page_cache_get_statistics(&instance_peer, &b);
+    check(a.current_pages == 1 && b.current_pages == 1, 192);
+    /* 每个实例单独低于 10%，合计超过 10% 才能请求两边的 worker。 */
+    unsigned pages = (unsigned)(physical_page_total(&allocator) / 20 + 8);
+    check(pages < physical_page_total(&allocator) / 10, 193);
+    instance_write(&cache, &files[0], pages);
+    instance_write(&instance_peer, &files[1], pages);
+    kernel_memory_snapshot(&allocator, &memory);
+    check(memory.dirty == (uint64_t)pages * 2 * 4096, 194);
+    check(kernel_page_cache_start_worker(&cache) == 0 && kernel_page_cache_start_worker(&instance_peer) == 0, 195);
+    uint64_t deadline = riscv_time_read() + 10 * timebase;
+    do { instance_yield(); kernel_memory_snapshot(&allocator, &memory); }
+    while (memory.dirty > physical_page_total(&allocator) / 20 * 4096 && riscv_time_read() < deadline);
+    kernel_page_cache_get_statistics(&cache, &a_after);
+    kernel_page_cache_get_statistics(&instance_peer, &b_after);
+    check(memory.dirty <= physical_page_total(&allocator) / 20 * 4096 &&
+          a_after.worker_written > a.worker_written && b_after.worker_written > b.worker_written, 196);
+    kernel_page_cache_stop_worker(&cache);
+    kernel_page_cache_stop_worker(&instance_peer);
+    (void)kernel_page_cache_reclaim(&cache, UINT64_MAX);
+    (void)kernel_page_cache_reclaim(&instance_peer, UINT64_MAX);
+    for (unsigned pass = 0; pass < 2; pass++) {
+        if (pass) {
+            instance_peer = (struct kernel_page_cache){0};
+            check(kernel_page_cache_init(&instance_peer, &heap, &allocator) == KERNEL_PAGE_CACHE_STATUS_OK, 207);
+        }
+        instance_entered[0] = instance_entered[1] = instance_waiting = instance_wait_done = 0;
+        instance_stop_called = instance_stop_done = 0;
+        instance_write(&cache, &files[0], 1);
+        instance_write(&instance_peer, &files[1], 1);
+        if (!pass) {
+            size_t valid;
+            check(kernel_page_cache_get(&instance_peer, &files[1], 0, &instance_peer_pin, &valid) == KERNEL_PAGE_CACHE_STATUS_OK, 208);
+        }
+        instance_nodes[0] = kernel_vfs_file_node(&files[0]);
+        instance_nodes[1] = kernel_vfs_file_node(&files[1]);
+        for (unsigned i = 0; i < 2; i++) kernel_wait_queue_init(&instance_held[i]);
+        instance_hold = 1;
+        check(kernel_page_cache_start_worker(&instance_peer) == 0 && kernel_page_cache_start_worker(&cache) == 0, 197);
+        struct kernel_thread_join waiter = {0}, stopper = {0};
+        check(kernel_thread_create_joinable(instance_stopper, 0, &stopper) == KERNEL_SCHEDULER_STATUS_OK &&
+              kernel_thread_create_joinable(instance_waiter, 0, &waiter) == KERNEL_SCHEDULER_STATUS_OK, 198);
+        deadline = riscv_time_read() + 10 * timebase;
+        while ((!instance_entered[0] || !instance_entered[1] || !instance_stop_called) && riscv_time_read() < deadline)
+            instance_yield();
+        check(instance_entered[0] && instance_entered[1] && instance_waiting &&
+              instance_stop_called && !instance_stop_done && !instance_wait_done, 199);
+        kernel_memory_snapshot(&allocator, &memory);
+        check(memory.cached == 2 * 4096 && memory.writeback == 2 * 4096 && memory.dirty == 2 * 4096, 200);
+        if (!pass) {
+            /* peer 页被外部 pin，worker 完成没有释放进展；销毁 peer 时 waiter 仍等 root。 */
+            check(kernel_wait_queue_wake_all(&instance_held[1]) == KERNEL_SCHEDULER_STATUS_OK, 209);
+            deadline = riscv_time_read() + 10 * timebase;
+            while (!instance_stop_done && riscv_time_read() < deadline) instance_yield();
+            check(instance_stop_done && !instance_wait_done, 210);
+            check(kernel_wait_queue_wake_all(&instance_held[0]) == KERNEL_SCHEDULER_STATUS_OK, 211);
+        } else {
+            /* peer 正在 stop/join 且 I/O 未完成；root 的首次释放必须唤醒共同等待者。 */
+            check(kernel_wait_queue_wake_all(&instance_held[0]) == KERNEL_SCHEDULER_STATUS_OK, 201);
+            deadline = riscv_time_read() + 10 * timebase;
+            while (!instance_wait_done && riscv_time_read() < deadline) instance_yield();
+            check(instance_wait_done && !instance_stop_done, 202);
+            check(kernel_wait_queue_wake_all(&instance_held[1]) == KERNEL_SCHEDULER_STATUS_OK, 203);
+        }
+        kernel_thread_join(&waiter); kernel_thread_join(&stopper);
+        instance_hold = 0;
+        check(instance_stop_done && allocator.pressure_wait && allocator.pressure_notify, 204);
+        /* peer 注销后，真实 root worker 仍能收到压力请求并完成。 */
+        allocator.pressure_wait(allocator.pressure_context);
+        kernel_page_cache_stop_worker(&cache);
+        (void)kernel_page_cache_reclaim(&cache, UINT64_MAX);
+    }
+    check(kernel_vfs_close(&files[0]) == 0 && kernel_vfs_close(&files[1]) == 0, 205);
+}
 static void background_writeback_probe(void *unused)
 {
     (void)unused;
@@ -231,6 +391,15 @@ static void background_writeback_probe(void *unused)
     while (startup_held) check(physical_page_release(&allocator,
                 pressure_pages[--startup_held]) == PHYSICAL_PAGE_STATUS_OK, 115);
     check(kernel_page_cache_start_worker(&cache) == 0, 91);
+    struct kernel_page_cache peer = {0};
+    check(kernel_page_cache_init(&peer, &heap, &allocator) == KERNEL_PAGE_CACHE_STATUS_OK &&
+          kernel_page_cache_start_worker(&peer) == 0, 163);
+    allocator.pressure_wait(allocator.pressure_context);
+    kernel_page_cache_stop_worker(&peer);
+    check(allocator.pressure_wait && allocator.pressure_notify, 164);
+    check(kernel_page_cache_destroy(&peer) == KERNEL_PAGE_CACHE_STATUS_OK, 165);
+    check(allocator.pressure_wait && allocator.pressure_notify, 166);
+
     /* 没有候选的一轮必须返回并休眠，不能自行反复扫描。 */
     allocator.pressure_wait(allocator.pressure_context);
     struct kernel_page_cache_statistics empty_before, empty_after;
@@ -323,6 +492,7 @@ static void background_writeback_probe(void *unused)
     check(kernel_vfs_pread(&target, (uint64_t)(pages - 1) * 4096, payload, sizeof(payload), &count) == 0 &&
           count == sizeof(payload) && payload[0] == (pages - 1) % 251 + 1 && payload[4095] == payload[0], 96);
     check(kernel_vfs_close(&target) == 0, 97);
+    cache_instances_probe();
     riscv_interrupt_restore(irq);
 }
 static void cleanup_worker(void *argument)
@@ -352,6 +522,15 @@ void kernel_main(unsigned long hart, const void *dtb)
     uint64_t baseline = physical_page_available(&allocator);
     timebase = info.timebase_frequency;
     check(kernel_page_cache_init(&cache, &heap, &allocator) == KERNEL_PAGE_CACHE_STATUS_OK, 3);
+    /* 同 allocator 的第二缓存必须可独立注册、注销；不改变首缓存统计。 */
+    struct kernel_page_cache second_cache = {0};
+    check(kernel_page_cache_init(&second_cache, &heap, &allocator) == KERNEL_PAGE_CACHE_STATUS_OK, 160);
+    struct kernel_memory_statistics two_caches;
+    kernel_memory_snapshot(&allocator, &two_caches);
+    uint64_t low_bytes = (physical_page_total(&allocator) / 50) * BOAROS_PAGE_SIZE;
+    check(two_caches.available == (two_caches.free > low_bytes ? two_caches.free - low_bytes : 0), 161);
+    check(kernel_page_cache_destroy(&second_cache) == KERNEL_PAGE_CACHE_STATUS_OK, 162);
+
     int found = 0;
     for (unsigned i = 0; i < info.virtio_mmio_count; i++)
         if (riscv_virtio_mmio_block_init(&device, (void *)(uintptr_t)info.virtio_mmio[i].base,
