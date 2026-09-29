@@ -67,9 +67,9 @@ VFS 以文件系统实例与后端 inode 标识为活节点身份，普通文件
 
 缓存索引失效本身不撤销用户 PTE。向下截断另通过稳定 node–MM 登记通知相关地址空间，撤销越过新 EOF 的整页（含 private COW 与 PROT_NONE），并按驻留来源处理非对齐尾页；普通写直接修改共享缓存，不撤销 private COW 页面。VMA 保留，后续访问重新缺页并检查 live inode size。实现与单 hart 同步边界见本文末尾及[MM 模块](kernel-mm.md)。
 
-miss 路径先分配并清零页，再通过 node 的无 offset 副作用 `pread` 填充，有效字节数按 node 的逻辑大小计算，尚未写回的稀疏扩展区从清零页读取。读取整个越过 EOF 的页返回 `OUT_OF_RANGE`，尾页剩余字节保持为零。物理页分配器只有一个压力回收槽，当前由该缓存注册；分配首次耗尽时从 LRU 尾部扫描，对引用数为 1 的未固定脏页先尝试写回，成功后才驱逐，然后由分配器重试一次。被用户映射或正由 read 使用的页引用数大于 1，不会被回收。写回期间禁止递归压力回收；lwext4 分配回调内只允许回收干净 VFS 页，防止重入共享 handle 的 fpos 和 bcache 查找/分配间隙；当前没有后台线程。
+miss 路径先分配并清零页，再通过 node 的无 offset 副作用 `pread` 填充，有效字节数按 node 的逻辑大小计算，尚未写回的稀疏扩展区从清零页读取。读取整个越过 EOF 的页返回 `OUT_OF_RANGE`，尾页剩余字节保持为零。物理页分配器只有一个压力回收槽，当前由该缓存注册；分配首次耗尽时从 LRU 尾部仅回收引用数为 1 的未固定干净页，安全的普通任务可等待后台一轮后重试一次。映射/请求固定页不驱逐；lwext4、堆与 IRQ 不等待后台写回，防止重入共享 handle、后端锁和 bcache 分配。阈值 worker 的生命周期见下文。
 
-缓存销毁和 mount 卸载有严格顺序：先释放所有进程 MM 和临时读者，再写回并 purge 该 mount 的缓存项、关闭最后的 node，之后才允许 lwext4 unmount 与设备 flush；缓存最后注销 reclaimer 并释放哈希表。物理页和堆对象的合法释放完成即返回，分配器不变量错误进入 fatal；只有真实 ext4/block I/O 清理错误保留 mount owner。
+缓存销毁和 mount 卸载有严格顺序：先释放所有进程 MM 和临时读者，停止并 join worker，再写回并 purge 该 mount 的缓存项、关闭最后的 node，之后才允许 lwext4 unmount 与设备 flush；缓存最后注销 reclaimer 并释放哈希表。物理页和堆对象的合法释放完成即返回，分配器不变量错误进入 fatal；只有真实 ext4/block I/O 清理错误保留 mount owner。
 
 `kernel_vfs_sync()` 只主动提交目标 inode 的脏页和必要元数据事务，再执行块设备 flush；不会用 `ext4_cache_flush("/")` 排空无关文件数据。独立 open 各持错误观察位置，dup/fork 共用 OFD 的位置。`fsync/fdatasync` 支持普通文件与目录；当前 metadata 在修改时提交，handle 记录已提交事务号，两者均等待完整 inode 元数据依赖。共享事务可能连带提交其他元数据。`O_SYNC/O_DSYNC` 对已接受的写入前缀执行相同同步，失败返回 errno，但已接受字节与 offset 保留。journal 的关键写入、checkpoint 或屏障失败使 mount 持续拒绝修改和同步；OFD 错误游标不能清除该错误。
 
@@ -100,7 +100,7 @@ miss 路径先分配并清零页，再通过 node 的无 offset 副作用 `pread
 只读挂载下，所有上述修改操作直接返回 `-EROFS`。
 unmount 在仍有 open file 或路径引用时返回 `-EBUSY`。末节点 `ext4_fclose` 失败把 node 转移到 mount cleanup 链，卸载重试同一个 handle；测试注入路径末引用和重复 inode 合并两种 close 失败并确认都被实际重试。非法引用或释放顺序触发 fatal，合法 heap/page 释放不返回可重试状态。
 
-当前 VFS 同时服务 ELF 随机读、进程文件表和文件私有缺页，但仍不是完整 Linux VFS：没有负目录项缓存、逐分量权限检查、硬链接、后台 writeback、read-ahead 或第二个 ext4 块设备挂载。`kernel_vfs_path` 持有 mount/inode 与父目录项引用；`ext4_lookup_child` 按父目录 inode 查找。统一逐分量解析处理 `.`、`..`、相对/绝对符号链接、尾斜线和最多 40 次展开；open/stat 的尾斜线按目录查找，mkdir/unlink/rmdir/symlink 保留不跟随的最终目录项语义。创建允许缺失的最终分量，并把已解析父对象及最终名称转换为 lwext4 修改接口所需的临时路径。适配缓冲按真实祖先长度分配，用户输入/符号链接展开仍限制为 4096 字节；已存在的长父链不挤占短相对输入额度，255 字节组件可用于修改。路径对象释放不依赖原始绝对路径仍存在。该规则依据固定 Linux commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 [`fs/namei.c`](../../references/linux/fs/namei.c)。fs context 和目录 fd 直接持有解析起点；绝对路径忽略 dirfd，删除或改名不会把旧引用重定向到同名新 inode。目录支持打开与按后端 cookie 查询（`kernel_vfs_dir_entry`），会返回真实的 `.`/`..` 条目；每次查询从传入的 ext4 字节位置开始，而不是从目录起点重走，顺序枚举的条目访问为 O(N)。适配层把 lwext4 的正 errno 与 EOF 分开，再向文件资源层返回负 Linux errno。页缓存只保存普通文件内容；进程层只持有 VFS mount/file 抽象，lwext4 handle 没有泄露到 task 或 syscall ABI。
+当前 VFS 同时服务 ELF 随机读、进程文件表和文件私有缺页，但仍不是完整 Linux VFS：没有负目录项缓存、逐分量权限检查、硬链接、周期 writeback、read-ahead 或第二个 ext4 块设备挂载。`kernel_vfs_path` 持有 mount/inode 与父目录项引用；`ext4_lookup_child` 按父目录 inode 查找。统一逐分量解析处理 `.`、`..`、相对/绝对符号链接、尾斜线和最多 40 次展开；open/stat 的尾斜线按目录查找，mkdir/unlink/rmdir/symlink 保留不跟随的最终目录项语义。创建允许缺失的最终分量，并把已解析父对象及最终名称转换为 lwext4 修改接口所需的临时路径。适配缓冲按真实祖先长度分配，用户输入/符号链接展开仍限制为 4096 字节；已存在的长父链不挤占短相对输入额度，255 字节组件可用于修改。路径对象释放不依赖原始绝对路径仍存在。该规则依据固定 Linux commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 [`fs/namei.c`](../../references/linux/fs/namei.c)。fs context 和目录 fd 直接持有解析起点；绝对路径忽略 dirfd，删除或改名不会把旧引用重定向到同名新 inode。目录支持打开与按后端 cookie 查询（`kernel_vfs_dir_entry`），会返回真实的 `.`/`..` 条目；每次查询从传入的 ext4 字节位置开始，而不是从目录起点重走，顺序枚举的条目访问为 O(N)。适配层把 lwext4 的正 errno 与 EOF 分开，再向文件资源层返回负 Linux errno。页缓存只保存普通文件内容；进程层只持有 VFS mount/file 抽象，lwext4 handle 没有泄露到 task 或 syscall ABI。
 
 目录游标设计依据固定 Linux 快照 `f4cdf7ca9a1f`：[`fs/readdir.c`](../../references/linux/fs/readdir.c)
 的 `iterate_dir()` 在每次枚举前后同步 open file 的 `f_pos` 与 `dir_context.pos`，`filldir64()`
@@ -174,3 +174,11 @@ make test-root-init-riscv
 `kernel_vfs_mknod_at` 在 namespace 锁内定位未存在的末级名字，普通文件或字符设备
 创建与 mode 设置放在同一个 lwext4 写事务内。失败回滚由原 mount/日志 owner 处理；
 该入口不实现 devfs，不增加新的设备后端。只读根返回 EROFS，创建不占用进程 fd。
+
+## 后台写回与水位回收
+
+每个当前页缓存实例拥有一个 joinable worker；worker 借用 cache/record，调用者必须保持它们有效直到 stop/join 返回。生产根盘启动后创建，根盘收尾在卸载前停止并回收。空闲低/高水位为受管页 2%/4%，脏页启动/停止为 10%/5%，小配置至少一页且阈值严格有序。没有周期清脏。分配器和持锁路径只发布请求，低水位先回收无别名/额外引用的干净页，再写回合格脏页；仅脏阈值触发则保留清洁缓存。
+
+每批最多扫描 64 个哈希槽并让出 CPU；写回跨睡眠固定 entry 和 inode，保存槽游标而不保存可能失效的 LRU 指针。每轮代次防止扩容或重新变脏导致重复处理，无进展即等待新事件。启动持有专用 4 KiB 写回快照，后端 metadata 仍可能 ENOMEM，不是完整应急池。映射重新设保护与 generation 协议保持不变，旧完成不能清除新修改。写回错误留在 inode/mount，当前失败页在成功前不计入 MemAvailable；同一轮继续处理其他对象。后台完成不替代 fsync/fdatasync 的错误观察与 flush。
+
+统计入口同时记录 worker 扫描、写回、失败、批次和实际释放量；内存快照单次 O(驻留页数)，分配通知为 O(1)。`test-io-sleep-riscv` 在 4 MiB 测试池上触发默认比例，覆盖单次 EIO 后继续进展、错误观察、再次修改仍排除失败页、2% 到 4% 回收、固定页不被驱逐、启动 OOM、暂扣在途写回时 stop/join 等待且不继续提交、退出资源基线；共享映射睡眠期间修改、孤儿关闭和设备延迟使用同一写回协议的既有聚焦测试。测试边界为单 hart，不推出 SMP 或实板持久性。

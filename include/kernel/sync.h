@@ -26,6 +26,7 @@ struct kernel_io_context {
     unsigned allocation_depth;
     uint32_t reclaim_depth;
     unsigned backend_depth;
+    unsigned background_reclaim;
     int backend_read;
     struct kernel_lock_guard backend_guard;
 };

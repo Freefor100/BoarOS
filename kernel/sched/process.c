@@ -446,6 +446,7 @@ static enum kernel_scheduler_status finish_clone_failure(
         }
     }
     if (!cleanup_failed) {
+        scheduler_forget_task(thread);
         (void)physical_page_release(scheduler.allocator,
                                   thread->physical_address);
     }
@@ -748,6 +749,7 @@ static enum kernel_scheduler_status reap_waited_child(
     child->group_leader = 0;
     child->group_members = 0U;
     child->publish_completion = 0U;
+    scheduler_forget_task(child);
     (void)physical_page_release(scheduler.allocator,
                               child->physical_address);
 
@@ -1003,9 +1005,32 @@ void kernel_scheduler_wait_cleanup(uint64_t retry_deadline)
     if (riscv_interrupt_is_enabled() || scheduler.current != scheduler.cleanup_task) __builtin_trap();
     if (!scheduler.exited_head || retry_deadline) {
         enum kernel_wait_wake_reason reason;
-        if (kernel_scheduler_block_current(&scheduler.cleanup_queue, retry_deadline, 0, &reason) != KERNEL_SCHEDULER_STATUS_OK)
+        if (kernel_scheduler_block_current(&scheduler.cleanup_queue, retry_deadline, 1, &reason) != KERNEL_SCHEDULER_STATUS_OK)
             __builtin_trap();
     }
+}
+
+void kernel_thread_join(struct kernel_thread_join *join)
+{
+    uintptr_t irq = riscv_interrupt_save();
+    if (!join || join->task == scheduler.current) __builtin_trap();
+    while (join->task && join->task->state != KERNEL_THREAD_STATE_EXITED) {
+        enum kernel_wait_wake_reason reason;
+        if (kernel_scheduler_block_current(&join->waiters, 0, 0, &reason)
+                != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
+    }
+    if (join->task) {
+        struct kernel_task *task = join->task;
+        struct kernel_task **link = &scheduler.exited_head, *previous = 0;
+        while (*link && *link != task) { previous = *link; link = &(*link)->next; }
+        if (!*link || task->arch.user_mode || task->io_context.locks ||
+            task->io_context.backend_depth || task->io_buffer) __builtin_trap();
+        *link = task->next;
+        if (scheduler.exited_tail == task) scheduler.exited_tail = previous;
+        if (release_task_storage(task, KERNEL_SCHEDULER_STATUS_OK)
+                != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
+    }
+    riscv_interrupt_restore(irq);
 }
 
 int kernel_scheduler_reap_pending(void)
@@ -1069,7 +1094,7 @@ enum kernel_scheduler_status kernel_scheduler_reap_one(
     result = thread->completion;
     publish = thread->publish_completion;
     if (result.kind == KERNEL_THREAD_KIND_KERNEL) {
-        if (publish == 0U ||
+        if ((publish == 0U && !thread->join) ||
             result.reason != KERNEL_THREAD_EXIT_RETURNED ||
             result.tid != 0 || result.tgid != 0 ||
             result.status != 0U || result.detail != 0U) {
@@ -1195,6 +1220,7 @@ enum kernel_scheduler_status kernel_scheduler_reap_one(
     } else {
         return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
     }
+    scheduler_forget_task(thread);
     (void)physical_page_release(scheduler.allocator,
                               thread->physical_address);
     scheduler.exited_head = next;
@@ -1506,6 +1532,7 @@ static void kernel_thread_finish(
     (void)cleanup_status;
     current->state = KERNEL_THREAD_STATE_EXITED;
     exited_append(current);
+    if (current->join) (void)kernel_wait_queue_wake_all(&current->join->waiters);
 
     /* Resume the saved cleanup context even when users remain runnable;
      * zombie publication and group teardown must not depend on idleness. */

@@ -488,6 +488,7 @@ enum riscv_root_boot_status riscv_root_boot_finish(
     if (root->finish_failure != RISCV_ROOT_FINISH_NONE) {
         return RISCV_ROOT_BOOT_STATUS_CLEANUP;
     }
+    kernel_page_cache_stop_worker(&root->page_cache);
     error = kernel_procfs_unmount_children(&root->mount);
     if (error == 0) error = kernel_vfs_unmount(&root->mount);
     if (error != 0) {

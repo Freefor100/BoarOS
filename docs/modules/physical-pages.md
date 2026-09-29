@@ -52,7 +52,7 @@ finalized 的 order-0 页可用 `physical_page_acquire()` 增加 32 位引用，
 不变量错误并触发 fatal trap；合法 acquire/release 只改变引用和最终可用页计数。
 
 分配器还允许注册一个压力回收回调。一次 buddy 分配返回 `EMPTY` 时，若当前不在回调中，
-分配器以所需页数调用回收器并只重试一次；递归抑制防止回收器内部的堆/页分配再次进入自身。
+分配器以所需页数调用非阻塞干净页回收器；只有可睡眠且无 worker 所需锁的普通任务路径，才可等一轮后台回收，然后只重试一次；递归抑制防止回收器内部的堆/页分配再次进入自身。
 当前唯一回收器是根挂载的文件页缓存，卸载和销毁缓存前必须先从分配器注销。
 
 `physical_page_resolve()` 为持有分配页的调用者提供受检查的物理地址访问。bootstrap
@@ -75,7 +75,7 @@ finalized 分配最多检查 32 个 order；free-list head 的插入和双向摘
 与 coalesce 为 O(order)，不会扫描同 order 的其他空闲块。为了让 interior release 和
 resolve 能精确判定所有权，分配或释放 order N 块还会更新本次块内 `2^N` 条状态；
 常用 order-0 热路径只更新一个页记录，acquire/非末 release 也只修改该页引用数。
-内存充足时不会调用回收器；只有首次分配失败才扫描缓存。当前单 hart 不需要锁，SMP
+分配热路径只发布阈值唤醒，不扫描缓存或执行 I/O；首次分配失败才同步扫描干净缓存。当前单 hart 不需要锁，SMP
 接入前必须把 free-list、引用数、回收器注册和计数纳入同一同步边界。
 
 绑定前只允许顺序发放从未释放过的页；合法 bootstrap 释放完成即返回。越界、重复或
@@ -108,3 +108,11 @@ recycled/tail 导入、metadata 扣除、order 对齐、强制 split 与多级 c
 执行分配—解析—释放—再分配，并精确要求
 `total - available == Sv39 table_pages + metadata_pages`；生产 idle 测试还要求 buddy
 模式在 timer 启动前已经生效。
+
+## 内存快照与后台压力通知
+
+`kernel_memory_snapshot()` 输出字节单位的只读快照，由 procfs 与 sysinfo 共用。调用者在当前单 hart 的关中断边界内查询；不分配、不回收、不发起 I/O。总量/空闲量来自 buddy，共享匿名量由 `mm/shared_anon.c` 在后备页发布和最终释放时维护，fork/别名/临时引用不重复计量。文件缓存按唯一 cache entry 计量，块缓冲按 ext4 bcache 已分配的 payload 计量，不把堆开销重复归入 Buffers。
+
+文件页回收资格在查询时检查物理引用、映射别名、装载/写回/用户固定及最后写回错误。失败页重新修改后仍不计入可回收预算，直到写回成功；共享匿名页没有 swap，不能回收。`MemAvailable=max(free-low,0)+reclaimable-min(reclaimable/2,low)`，最终夹在 `[0,total]`；low 至少一页。它是估算，不承诺任意高阶连续分配成功。`pressure_notify` 只合并事件；`pressure_wait` 检查任务/锁/backend/递归上下文，分配器不拥有 inode/mount 的 I/O 错误。
+
+聚焦入口为 `test-page-riscv`、`test-vma-riscv`、`test-io-sleep-riscv`；包括共享后备页 fork 不重复计数、最终归零、缓存压力及 worker 启动分配失败回滚。

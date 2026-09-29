@@ -355,6 +355,11 @@ enum kernel_scheduler_status validate_queues(void)
 
 void ready_append(struct kernel_task *thread)
 {
+    if (!thread->accounted) {
+        thread->accounted = 1;
+        thread->all_next = scheduler.all_tasks;
+        scheduler.all_tasks = thread;
+    }
     thread->next = 0;
     if (scheduler.ready_tail == 0) {
         scheduler.ready_head = thread;
@@ -524,6 +529,7 @@ enum kernel_scheduler_status release_task_storage(
 {
     enum kernel_scheduler_status status = release_task_stack(thread);
     if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
+    scheduler_forget_task(thread);
     (void)physical_page_release(scheduler.allocator, thread->physical_address);
     return original_status;
 }
@@ -570,6 +576,9 @@ enum kernel_scheduler_status kernel_scheduler_init(
         return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
     }
 
+    scheduler.all_tasks = 0;
+    scheduler.load_ticks = 0;
+    for (unsigned i = 0; i < 3; i++) scheduler.loads[i] = 0;
     scheduler.allocator = allocator;
     scheduler.next_proc_identity = 1U;
     scheduler.kernel_satp = kernel_satp;
@@ -626,9 +635,11 @@ enum kernel_scheduler_status kernel_scheduler_init(
     return KERNEL_SCHEDULER_STATUS_OK;
 }
 
-enum kernel_scheduler_status kernel_thread_create(
-    void (*entry)(void *),
-    void *argument)
+enum kernel_scheduler_status kernel_thread_create(void (*entry)(void *), void *argument)
+{ return kernel_thread_create_joinable(entry, argument, 0); }
+
+enum kernel_scheduler_status kernel_thread_create_joinable(
+    void (*entry)(void *), void *argument, struct kernel_thread_join *join)
 {
     struct kernel_task *thread;
     uintptr_t old_status;
@@ -638,7 +649,7 @@ enum kernel_scheduler_status kernel_thread_create(
     if (scheduler.initialized != KERNEL_SCHEDULER_INITIALIZED) {
         return KERNEL_SCHEDULER_STATUS_NOT_INITIALIZED;
     }
-    if (entry == 0) {
+    if (entry == 0 || (join && join->task)) {
         return KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
     }
 
@@ -670,7 +681,7 @@ enum kernel_scheduler_status kernel_thread_create(
     thread->tid = 0;
     thread->process_group = 0;
     thread->tid_owned = 0U;
-    thread->publish_completion = 1U;
+    thread->publish_completion = join ? 0U : 1U;
     thread->wait_status = 0U;
     thread->group_leader = 0;
     thread->group_members = 0U;
@@ -695,6 +706,11 @@ enum kernel_scheduler_status kernel_thread_create(
         goto restore_interrupts;
     }
 
+    if (join) {
+        kernel_wait_queue_init(&join->waiters);
+        join->task = thread;
+        thread->join = join;
+    }
     ready_append(thread);
     status = KERNEL_SCHEDULER_STATUS_OK;
 
@@ -919,6 +935,52 @@ restore_interrupts:
     return status;
 }
 
+void scheduler_forget_task(struct kernel_task *thread)
+{
+    if (thread->join) {
+        thread->join->task = 0;
+        (void)kernel_wait_queue_wake_all(&thread->join->waiters);
+        thread->join = 0;
+    }
+    if (!thread->accounted) return;
+    struct kernel_task **link = &scheduler.all_tasks;
+    while (*link && *link != thread) link = &(*link)->all_next;
+    if (!*link) __builtin_trap();
+    *link = thread->all_next;
+    thread->accounted = 0;
+}
+
+void kernel_scheduler_system_statistics(uint64_t loads[3], uint16_t *tasks)
+{
+    uintptr_t irq = riscv_interrupt_save();
+    uint64_t count = 0;
+    for (struct kernel_task *t = scheduler.all_tasks; t; t = t->all_next) count++;
+    *tasks = count > UINT16_MAX ? UINT16_MAX : (uint16_t)count;
+    for (unsigned i = 0; i < 3; i++) loads[i] = scheduler.loads[i] << 5;
+    riscv_interrupt_restore(irq);
+}
+
+static void scheduler_sample_load(uint64_t elapsed)
+{
+    scheduler.load_ticks += elapsed;
+    const uint64_t period = 5 * KERNEL_TICKS_PER_SECOND + 1;
+    if (scheduler.load_ticks < period) return;
+    uint64_t active = 0;
+    for (struct kernel_task *t = scheduler.all_tasks; t; t = t->all_next)
+        if (t->state == KERNEL_THREAD_STATE_READY || t->state == KERNEL_THREAD_STATE_RUNNING ||
+            (t->state == KERNEL_THREAD_STATE_BLOCKED && !t->wait_interruptible)) active++;
+    active <<= 11;
+    static const unsigned decay[3] = {1884, 2014, 2037};
+    while (scheduler.load_ticks >= period) {
+        scheduler.load_ticks -= period;
+        for (unsigned i = 0; i < 3; i++) {
+            uint64_t load = scheduler.loads[i];
+            scheduler.loads[i] = (load * decay[i] + active * (2048 - decay[i]) +
+                                  (active >= load ? 2047 : 0)) >> 11;
+        }
+    }
+}
+
 enum kernel_scheduler_status kernel_scheduler_on_tick(
     uint64_t elapsed_ticks)
 {
@@ -947,6 +1009,7 @@ enum kernel_scheduler_status kernel_scheduler_on_tick(
         return status;
     }
 
+    scheduler_sample_load(elapsed_ticks);
     previous = scheduler.current;
     next = !scheduler.cleanup_task && previous != &scheduler.idle && kernel_scheduler_reap_pending()
                ? &scheduler.idle : scheduler.ready_head;

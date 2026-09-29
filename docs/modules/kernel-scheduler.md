@@ -91,3 +91,11 @@ zombie 先逻辑回收再复制 status/rusage，因此坏输出指针的 EFAULT 
 `make test-scheduler-riscv test-io-sleep-riscv test-userland-riscv` 分别保护写者优先、设备等待/唤醒与真实任务组合行为。
 
 `make test-diff-abi-riscv` 的 `tid.*` 使用同一 ELF 对照固定 Linux，覆盖私有 fork、共享页但独立 MM、vfork 退出/成功与失败 exec、坏地址/只读地址、线程 futex 等待。成功 exec 与退出共用旧 MM 的注销和清 TID 顺序；延迟资源清理不增加活跃使用者数。
+
+## 系统统计与可等待内核任务
+
+调度器独立登记所有已发布任务，直到最后 metadata 回收才注销；构造失败不发布。`kernel_scheduler_system_statistics()` 返回真实任务数（含尚未回收的 zombie，16 位饱和）和 16 位小数的负载。每 501 个 100 Hz tick 按固定 Linux 的 1884/2014/2037（11 位小数）更新 1/5/15 分钟指数平均。READY/RUNNING 与不可中断 BLOCKED 计入活动量；空闲 worker/cleanup 的工作队列等待标为 interruptible，不凭空形成空闲负载，实际存储与压力等待仍计入。
+
+`kernel_thread_create_joinable()` 的调用者持有 join handle；被等待线程退出不向普通 completion 队列发布业务完成。`kernel_thread_join()` 等在途调用展开到 EXITED 后，从可信调用栈摘取并释放目标栈/metadata；清理任务也可安全等待，不依赖它自己稍后执行 reap。通用 reap 同样清空并唤醒 handle。页缓存 stop 先禁止新压力提交，唤醒并 join worker，再释放专用快照页。
+
+`test-scheduler-cases-riscv` 验证任务数、活动负载、空闲等待衰减及不可中断等待增长，末引用释放回到页基线；`test-io-sleep-riscv` 覆盖 worker 构造 OOM 与退出清理。

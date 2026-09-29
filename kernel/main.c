@@ -825,6 +825,8 @@ static void kernel_main_high(void)
                                         &kernel_page_table);
     if (root_status == RISCV_ROOT_BOOT_STATUS_OK) {
         root_started = 1;
+        if (kernel_page_cache_start_worker(&root_boot.page_cache) != 0)
+            shutdown_for_root_boot_error(RISCV_ROOT_BOOT_STATUS_RESOURCES);
         uint32_t source = 0;
         uint64_t base = (uintptr_t)root_boot.device.mmio - RISCV_KERNEL_MMIO_BASE;
         for (uint32_t i = 0; i < boot_irq.route_count; i++)

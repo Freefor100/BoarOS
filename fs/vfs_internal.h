@@ -48,4 +48,6 @@ struct kernel_page_cache *kernel_vfs_file_page_cache(
 int kernel_vfs_node_try_read(struct kernel_vfs_node *node, struct kernel_lock_guard *guard);
 void kernel_vfs_namespace_lock(struct kernel_vfs_mount *mount, struct kernel_lock_guard *guard);
 void kernel_vfs_node_lock(struct kernel_vfs_node *node, struct kernel_lock_guard *guard, int write);
+void kernel_vfs_record_writeback_error(struct kernel_vfs_node *node, int error);
+
 #endif

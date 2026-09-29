@@ -6,7 +6,7 @@
 
 最终 Sv39、direct map、buddy 和 scheduler 就绪后，`arch/riscv/root_boot.c` 初始化页支持内核堆并为后续 exec 绑定同一物理分配器和内核根表，按 DTB 物理地址顺序选择首个成功初始化的 VirtIO MMIO version 1 legacy 或 version 2 modern virtio-blk，按设备能力以读写或只读模式挂载 raw whole-disk ext4，并通过公共 executable-open 检查打开只读构建配置指定的 ELF。文件必须是 regular 且至少有一个 execute bit；默认请求使用 `argv[0]="/init"`、`argc=1`、`AT_EXECFN="/init"` 和空环境。
 
-VFS 文件成为精确 `read_at` 源，ELF source 一次解析 RISC-V `ET_EXEC`/`ET_DYN` 的 program headers；根启动支持非递归 `PT_INTERP`，将 `PT_LOAD` 登记为专用 source-backed VMA，页面在首次取指或访问时按需物化。随机布局从 DTB `/chosen/rng-seed` 取得可信种子；缺少种子时安全降级为确定性布局并省略 `AT_RANDOM`。根启动路径再创建借用根 mount、cwd 为 `/` 的 fs context 和空文件表，与 MM 一起原子转交 scheduler task。生产系统创建的第一个用户线程组得到 TID/TGID 1；完成以上步骤后才启动 timer，因此任务不会在根对象尚未发布时运行。
+VFS 文件成为精确 `read_at` 源，ELF source 一次解析 RISC-V `ET_EXEC`/`ET_DYN` 的 program headers；根启动支持非递归 `PT_INTERP`，将 `PT_LOAD` 登记为专用 source-backed VMA，页面在首次取指或访问时按需物化。随机布局从 DTB `/chosen/rng-seed` 取得可信种子；缺少种子时安全降级为确定性布局并省略 `AT_RANDOM`。根启动路径再创建借用根 mount、cwd 为 `/` 的 fs context 和空文件表，与 MM 一起原子转交 scheduler task。生产系统创建的第一个用户线程组得到 TID/TGID 1；生产 main 在根对象发布后启动页缓存 worker，再启动 timer，因此任务不会在根对象尚未发布时运行。worker 构造失败仍返回启动资源错误，不伪造后台回收成功。
 
 未发布对象的失败清理由 `struct riscv_root_boot` 持久保存 file、原始 Sv39 space、MM、files、fs 与设备 owner，而不是留在 `riscv_root_boot_start()` 的栈帧中。真实 ext4/block I/O 清理若暂时失败，`start()` 返回 `RISCV_ROOT_BOOT_STATUS_CLEANUP` 且 root 进入 `RISCV_ROOT_BOOT_CLEANUP`；`riscv_root_boot_cleanup()` 只重试仍拥有的对象，生产 `kernel/main.c` 最多尝试三次，持续错误则报告并停止。物理页、VMA metadata 和堆的合法释放不产生 cleanup 状态，分配器不变量错误直接 fatal。
 
@@ -39,7 +39,7 @@ make test-idle-riscv
 
 fixture 写入真实 ext4 的静态 ELF 以及 userland runner 使用的动态 musl PIE、解释器、额外 DSO 和 TLS；镜像还包含一个 9000 字节确定性数据文件、不可执行数据文件和可执行的非 ELF 脚本。程序在 U-mode 检查初始栈、errno、exec 与父子生命周期后以状态 42 调用 `exit(93)`。runner 要求 PID 1 身份、父子状态、fd/MM 语义、完整资源基线和 SBI 关机均成立。`make test-root-orphan-riscv` 让 PID 1 留下未等待的 zombie 子进程，验证 PID 1 completion 后继续排空退出队列。`test-root-boot-cleanup-riscv` 先让 fs context 创建失败，再在卸载日志时注入真实块写错误；三次清理调用必须保持相同 mount/cache/device owner、停止进一步写入，并最终报告 `CLEANUP`。关键日志错误不会因一次底层故障已消失就恢复为可写。无盘测试仍要求 timer idle 持续工作。
 
-有块设备时，永久 cleanup task 在 root 基线快照前创建；root 启动仍处显式轮询阶段，调度用户前为根 VirtIO 注册 DTB 提供的 PLIC 路由并切换运行期睡眠。退出清理、root finish/unmount 在该任务中执行，idle 只负责调度与 wfi；无盘启动不创建额外存储清理任务。跨高半区跳转不能继续使用寄存器中保存的旧物理栈指针，DTB 存储探测在独立 noinline 调用中完成。
+有块设备时，永久 cleanup task 在 root 基线快照前创建；root 启动仍处显式轮询阶段，调度用户前为根 VirtIO 注册 DTB 提供的 PLIC 路由并切换运行期睡眠。退出清理、root finish/unmount 在该任务中执行；卸载前先停止并 join 页缓存 worker、释放其栈/快照/引用，再核对根资源基线，idle 只负责调度与 wfi；无盘启动不创建额外存储清理任务。跨高半区跳转不能继续使用寄存器中保存的旧物理栈指针，DTB 存储探测在独立 noinline 调用中完成。
 
 ## PID 1 构建配置
 

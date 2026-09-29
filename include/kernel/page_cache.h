@@ -48,6 +48,7 @@ struct kernel_page_cache_statistics {
     uint64_t pages_reclaimed;
     uint64_t current_pages;
     uint64_t peak_pages;
+    uint64_t worker_scanned, worker_written, worker_failed, worker_batches;
 };
 
 struct kernel_page_cache {
@@ -102,6 +103,9 @@ int kernel_page_cache_writeback_range(struct kernel_page_cache *cache,
     struct kernel_vfs_node *node, uint64_t start, uint64_t end);
 void kernel_page_cache_resize(struct kernel_page_cache *cache,
     struct kernel_vfs_node *node, uint64_t old_size, uint64_t new_size);
+
+int kernel_page_cache_start_worker(struct kernel_page_cache *cache);
+void kernel_page_cache_stop_worker(struct kernel_page_cache *cache);
 
 uint64_t kernel_page_cache_reclaim(struct kernel_page_cache *cache,
                                    uint64_t target_pages);

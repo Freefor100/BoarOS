@@ -131,6 +131,8 @@ void kernel_shared_anon_release(struct kernel_shared_anon **object)
                 PHYSICAL_PAGE_STATUS_OK ||
                 kernel_heap_release(owner->heap, page) !=
                 KERNEL_HEAP_STATUS_OK) __builtin_trap();
+            if (!owner->allocator->shared_anon_pages) __builtin_trap();
+            owner->allocator->shared_anon_pages--;
             page = next;
         }
     }
@@ -192,6 +194,7 @@ enum kernel_shared_anon_status kernel_shared_anon_get_page(
     page->next = object->buckets[bucket];
     object->buckets[bucket] = page;
     object->page_count++;
+    object->allocator->shared_anon_pages++;
     *physical_address = page->physical_address;
     *created = 1;
     return KERNEL_SHARED_ANON_OK;
@@ -215,6 +218,8 @@ void kernel_shared_anon_discard_new_page(
     struct kernel_shared_anon_page *page = *link;
     *link = page->next;
     object->page_count--;
+    if (!object->allocator->shared_anon_pages) __builtin_trap();
+    object->allocator->shared_anon_pages--;
     if (physical_page_release(object->allocator, physical_address) !=
             PHYSICAL_PAGE_STATUS_OK ||
         kernel_heap_release(object->heap, page) != KERNEL_HEAP_STATUS_OK)

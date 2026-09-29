@@ -15,6 +15,7 @@
 #include <kernel/time.h>
 
 #include <ext4.h>
+#include <ext4_bcache.h>
 #include <ext4_blockdev.h>
 #include <ext4_inode.h>
 #include <ext4_fs.h>
@@ -291,11 +292,22 @@ static int block_flush(struct ext4_blockdev *device)
     }
 }
 
+static uint64_t ext4_buffer_bytes(void *context)
+{
+    struct lwext4_mount_adapter *adapter = context;
+    struct ext4_bcache *bc = adapter->device.bc;
+    return adapter->mounted && bc ? (uint64_t)bc->ref_blocks * bc->itemsize : 0;
+}
+
 static int release_mount_storage(struct kernel_vfs_mount *mount)
 {
     struct lwext4_mount_adapter *adapter = mount->private_data;
     struct kernel_heap *heap = adapter->instance.heap;
 
+    if (heap->page_allocator->buffer_context == adapter) {
+        heap->page_allocator->buffer_bytes = 0;
+        heap->page_allocator->buffer_context = 0;
+    }
     if (adapter->physical_buffer != 0) {
         (void)kernel_heap_release(heap, adapter->physical_buffer);
         adapter->physical_buffer = 0;
@@ -522,6 +534,8 @@ int kernel_vfs_mount_root(struct kernel_vfs_mount *mount,
         return lwext4_error(result);
     }
     adapter->mounted = 1U;
+    heap->page_allocator->buffer_bytes = ext4_buffer_bytes;
+    heap->page_allocator->buffer_context = adapter;
     result = ext4_mount_setup_locks(LWEXT4_MOUNT_POINT, &boaros_lwext4_locks);
     if (result != EOK) { (void)cleanup_mount(mount); return lwext4_error(result); }
     result = ext4_mount_setup_clock(LWEXT4_MOUNT_POINT, vfs_realtime);

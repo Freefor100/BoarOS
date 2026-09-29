@@ -1032,6 +1032,9 @@ unsigned long run_shared_anon_cases(void)
         kernel_mm_lookup(&parent, address, &mapping) != KERNEL_MM_STATUS_OK ||
         (mapping.permissions & KERNEL_MM_WRITE) == 0U)
         return 3U;
+    struct kernel_memory_statistics memory;
+    kernel_memory_snapshot(&allocator, &memory);
+    if (memory.shared != BOAROS_PAGE_SIZE || memory.cached != memory.shared) return 30U;
     parent_page = mapping.physical_address & ~BOAROS_PAGE_MASK;
     if (physical_page_reference_count(&allocator, parent_page,
                                       &references) != PHYSICAL_PAGE_STATUS_OK ||
@@ -1043,6 +1046,8 @@ unsigned long run_shared_anon_cases(void)
         kernel_mm_fork(&child, &parent) != KERNEL_MM_STATUS_OK ||
         riscv_kernel_mm_satp(&child, &child_satp) != KERNEL_MM_STATUS_OK)
         return 4U;
+    kernel_memory_snapshot(&allocator, &memory);
+    if (memory.shared != BOAROS_PAGE_SIZE) return 31U;
     test_satp = child_satp;
     if (kernel_mm_lookup(&child, address, &mapping) !=
             KERNEL_MM_STATUS_NOT_MAPPED ||
@@ -1141,6 +1146,8 @@ unsigned long run_shared_anon_cases(void)
         kernel_mm_munmap(&parent, address, BOAROS_PAGE_SIZE) !=
             KERNEL_MM_STATUS_OK)
         return 14U;
+    kernel_memory_snapshot(&allocator, &memory);
+    if (memory.shared != 0) return 32U;
     if (kernel_mm_mmap_anonymous(&parent, 0U, BOAROS_PAGE_SIZE,
                                  KERNEL_MM_READ | KERNEL_MM_WRITE,
                                  KERNEL_MM_MAP_SHARED, &address) !=

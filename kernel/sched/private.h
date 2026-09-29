@@ -102,6 +102,9 @@ struct kernel_task {
     uintptr_t stack_low;
     uintptr_t stack_high;
     struct kernel_task *next;
+    struct kernel_task *all_next;
+    unsigned accounted;
+    struct kernel_thread_join *join;
     struct kernel_task *parent;
     struct kernel_task *first_child;
     struct kernel_task *last_child;
@@ -188,6 +191,8 @@ struct kernel_scheduler {
     uint32_t idle_context_saved;
     uint64_t kernel_satp;
     uint64_t idle_ticks;
+    struct kernel_task *all_tasks;
+    uint64_t loads[3], load_ticks;
     uint64_t next_proc_identity;
     struct physical_page_allocator *allocator;
     struct kernel_pid_allocator pid_allocator;
@@ -229,6 +234,7 @@ enum kernel_scheduler_status release_task_stack(struct kernel_task *task);
 enum kernel_scheduler_status release_task_storage(struct kernel_task *task,
     enum kernel_scheduler_status original_status);
 void ready_append(struct kernel_task *thread);
+void scheduler_forget_task(struct kernel_task *thread);
 struct kernel_task *ready_pop(void);
 void blocked_append(struct kernel_task *thread);
 void blocked_unlink(struct kernel_task *thread);
