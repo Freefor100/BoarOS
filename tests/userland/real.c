@@ -37,6 +37,7 @@
 #include "shared_mapping.h"
 #include "tmpfs.h"
 #include "shared_futex.h"
+#include "sysv_shm.h"
 
 __attribute__((section(".rodata.unlink_test_far"), aligned(4096)))
 const char unlink_far_page[8192] = "UNLINK_DEMAND_FAULT_PAGE_PAYLOAD";
@@ -2586,6 +2587,13 @@ int main(int argc, char **argv)
         return 124;
     }
     puts("BoarOS: real userland tmpfs shm checks ok");
+
+    int sysv_shm_result = check_sysv_shm();
+    if (sysv_shm_result != 0) {
+        fprintf(stderr, "sysv shm failed: stage=%d errno=%d\n", sysv_shm_result, errno);
+        return 125;
+    }
+    puts("BoarOS: real userland sysv shm checks ok");
 
     int shared_mapping_result = check_shared_anonymous_mapping();
     if (shared_mapping_result != 0) {

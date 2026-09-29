@@ -35,13 +35,20 @@ enum kernel_mm_status kernel_mm_mprotect(
 
 int kernel_mm_msync(struct kernel_mm *mm, uint64_t address,
                     uint64_t length, uint32_t flags);
+
+enum kernel_mm_status kernel_mm_shmat(
+    struct kernel_mm *mm, struct kernel_shm_segment *segment,
+    uint64_t hint, uint32_t permissions, uint32_t flags, uint64_t *address);
+
+enum kernel_mm_status kernel_mm_shmdt(
+    struct kernel_mm *mm, uint64_t address);
 ```
 
-文件 VMA 要求非空 backing、与 kind 匹配的 fault policy、页对齐 offset，并保证 `offset + VMA length` 不溢出；私有匿名 VMA 禁止 backing 和非零 offset，共享匿名 VMA 则要求非空对象、`ANON_SHARED` fault policy 和页对齐连续 offset。集合只借用 backing，MM 的独立 registry 持有 OFD 或共享匿名对象引用。`kernel_vma_set_backing_in_use()` 只用于 munmap/fixed replace/销毁后的冷清理，不进入缺页查找热路径。
+文件 VMA 要求非空 backing、与 kind 匹配的 fault policy、页对齐 offset，并保证 `offset + VMA length` 不溢出；私有匿名 VMA 禁止 backing 和非零 offset，共享匿名 VMA 则要求非空对象、`ANON_SHARED` fault policy 和页对齐连续 offset。SysV 共享内存 VMA（`KERNEL_VMA_KIND_SYSV_SHM`）持有 `kernel_memory_object` 后备与 `shm_segment` 附加引用，禁止与其他 VMA 合并，在 munmap 与 release 时自动触发段附加计数递减；详见 [SysV 共享内存模块](sysv-shm.md)。集合只借用 backing，MM 的独立 registry 持有 OFD 或共享匿名对象引用。`kernel_vma_set_backing_in_use()` 只用于 munmap/fixed replace/销毁后的冷清理，不进入缺页查找热路径。
 
 ## 排序、选址与合并
 
-集合是 MM record 通过 kernel heap 拥有的动态排序数组。按地址查找使用二分搜索；插入、拆分、删除和合并可能移动后缀。相邻 VMA 只有在权限、kind、role、fault policy、backing、共享文件可写资格以及连续后备偏移全部一致时才合并，因而不会跨越缺页策略或资源生命周期边界。
+集合是 MM record 通过 kernel heap 拥有的动态排序数组。按地址查找使用二分搜索；插入、拆分、删除和合并可能移动后缀。相邻 VMA 只有在权限、kind、role、fault policy、backing、共享文件可写资格以及连续后备偏移全部一致时才合并（SysV SHM 显式禁止合并），因而不会跨越缺页策略或资源生命周期边界。
 
 非 fixed mmap 先尝试页对齐 hint；冲突时在每个 MM 的随机 mmap ceiling 以下、避开栈 guard 和 vDSO 的用户区间内 top-down 查找空洞。无任何随机材料时 ceiling 使用确定性布局。`MAP_FIXED_NOREPLACE` 在任意重叠时返回冲突且不改输出；`MAP_FIXED` 删除范围内所有旧 VMA/PTE 后放入新的匿名或文件映射。vDSO VMA 由 ELF image 独立选择并受普通用户映射边界保护。RISC-V 不能编码 W&&!R 用户叶子，因此 MM 把仅写请求规范化为 RW；`PROT_NONE` 用零权限 VMA 表示。
 

@@ -80,6 +80,7 @@ for marker in \
     'BoarOS: real userland stdio ok' \
     'BoarOS: real userland file checks ok' \
     'BoarOS: real userland tmpfs shm checks ok' \
+    'BoarOS: real userland sysv shm checks ok' \
     'BoarOS: real userland shared anonymous mapping checks ok' \
     'BoarOS: real userland shared futex checks ok' \
     'BoarOS: real userland fs rw checks ok' \

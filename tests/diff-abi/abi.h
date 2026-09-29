@@ -71,4 +71,5 @@ void abi_session_exec_probe(const unsigned long *initial_stack);
 void abi_sched_policy_cases(void);
 void abi_rt_controls_cases(void);
 void abi_sched_stat_cases(void);
+void abi_shm_cases(void);
 #endif

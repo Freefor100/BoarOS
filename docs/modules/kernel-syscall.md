@@ -60,6 +60,7 @@ enum kernel_syscall_status kernel_syscall_dispatch(
 - `restart_syscall` 编号为 128，当前用于 nanosleep 和带超时 FUTEX_WAIT 的绝对 deadline 重启；它不是可由用户任意伪造的通用成功存根。
 - RISC-V 使用 asm-generic syscall 编号，没有独立 dup2；musl 经 dup3 实现相应调用。编号 33 是 mknodat，支持普通文件与字符节点创建，不能分派为 fd 替换。
 - `times` 编号为 153，填写可选的 32 字节 `tms`（`utime/stime/cutime/cstime`，单位为 scheduler tick，`CLK_TCK`=100）并返回自启动的 uptime tick 数；tms 为 NULL 时只返回 uptime。记账在 tick 边界记到被中断任务，idle 不记账；子进程记账在 wait 回收时回卷给父进程，孙辈随回收归并。
+- `shmget`/`shmctl`/`shmat`/`shmdt` 编号为 194/195/196/197，构成 System V 共享内存族。支持 `IPC_PRIVATE` 与命名 key，`IPC_STAT`/`IPC_SET`/`IPC_RMID` 控制命令，延迟释放与末引用清理，以及多进程跨地址附加；详见 [SysV 共享内存模块](sysv-shm.md)。
 - 其他编号产生 `RETURN`，返回 `-ENOSYS`（-38）。
 
 当前 `brk`/mmap 还没有 `RLIMIT_DATA`、VMA 数量上限、内存承诺或 overcommit accounting；`MAP_NORESERVE` 因而与普通匿名映射等价。成功增长只承诺虚拟 VMA，实际物理页耗尽发生在后续 demand fault。这是明确的兼容性限制，不由伪造的 syscall 成功或预分配全部页来掩盖。

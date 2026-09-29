@@ -12,6 +12,7 @@
 #include <kernel/mm.h>
 #include <kernel/open_file.h>
 #include <kernel/procfs.h>
+#include <kernel/shm.h>
 
 #include <stddef.h>
 #include <stdint.h>
@@ -251,6 +252,9 @@ enum riscv_root_boot_status riscv_root_boot_start(
                          allocator,
                          direct_map_heap_address) !=
         KERNEL_HEAP_STATUS_OK) {
+        return RISCV_ROOT_BOOT_STATUS_HEAP;
+    }
+    if (kernel_shm_init(&root->heap, allocator) != KERNEL_SHM_STATUS_OK) {
         return RISCV_ROOT_BOOT_STATUS_HEAP;
     }
     if (riscv_exec_init(allocator, kernel_table) !=

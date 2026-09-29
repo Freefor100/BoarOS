@@ -12,6 +12,7 @@
 #include <kernel/page.h>
 #include <kernel/page_cache.h>
 #include <kernel/socket.h>
+#include <kernel/shm.h>
 #include <kernel/scheduler.h>
 #include <kernel/uaccess.h>
 #include <kernel/vfs.h>
@@ -178,6 +179,68 @@ static void socketpair_scale(struct kernel_files *files, struct kernel_mm *mm)
     check(kernel_files_close(files, pair[1], &result) == KERNEL_FILES_STATUS_OK && result == 0, 101);
 }
 
+static void sysv_shm_scale(struct kernel_mm *mm)
+{
+    /* 1. IPC_PRIVATE segment allocation */
+    int32_t shmid1 = 0;
+    check(kernel_shm_get(0, KERNEL_IPC_PRIVATE, 8192, 0666 | KERNEL_IPC_CREAT, &shmid1) == 0 &&
+          shmid1 >= 0, 110);
+
+    /* 2. Attach segment to mm */
+    uint64_t addr1 = 0;
+    check(kernel_shm_at_mm(mm, 1, shmid1, 0, 0, &addr1) == 0 && addr1 != 0, 111);
+
+    /* 3. Write data to addr1 and read back */
+    unsigned char pattern[32];
+    for (int i = 0; i < 32; i++) pattern[i] = (unsigned char)(0xa0 + i);
+    size_t copied = 0;
+    check(kernel_copy_to_user(mm, addr1, pattern, sizeof(pattern), &copied) == KERNEL_UACCESS_STATUS_OK &&
+          copied == sizeof(pattern), 112);
+    unsigned char readback[32];
+    check(kernel_copy_from_user(mm, readback, addr1, sizeof(readback), &copied) == KERNEL_UACCESS_STATUS_OK &&
+          copied == sizeof(readback), 113);
+    for (int i = 0; i < 32; i++) check(readback[i] == pattern[i], 114);
+
+    /* 4. Attach second time at different address */
+    uint64_t addr2 = 0;
+    check(kernel_shm_at_mm(mm, 1, shmid1, 0, 0, &addr2) == 0 && addr2 != 0 && addr2 != addr1, 115);
+    unsigned char readback2[32];
+    check(kernel_copy_from_user(mm, readback2, addr2, sizeof(readback2), &copied) == KERNEL_UACCESS_STATUS_OK, 116);
+    for (int i = 0; i < 32; i++) check(readback2[i] == pattern[i], 117);
+
+    /* 5. IPC_STAT */
+    int64_t res = 0;
+    struct kernel_shmid64_ds ds = {0};
+    check(kernel_shm_ctl_mm(0, shmid1, KERNEL_IPC_STAT, (uint64_t)(uintptr_t)&ds, &res) == 0 && res == 0, 118);
+    check(ds.shm_nattch == 2 && ds.shm_segsz == 8192, 119);
+
+    /* 6. IPC_RMID (marked for deletion, active attachments remain usable) */
+    check(kernel_shm_ctl_mm(0, shmid1, KERNEL_IPC_RMID, 0, &res) == 0 && res == 0, 120);
+
+    /* Verify still accessible via existing mappings */
+    check(kernel_copy_from_user(mm, readback, addr1, sizeof(readback), &copied) == KERNEL_UACCESS_STATUS_OK &&
+          readback[0] == 0xa0, 121);
+
+    /* 7. Detach first mapping */
+    check(kernel_shm_dt_mm(mm, addr1) == 0, 122);
+    check(kernel_shm_ctl_mm(0, shmid1, KERNEL_IPC_STAT, (uint64_t)(uintptr_t)&ds, &res) == 0, 123);
+    check(ds.shm_nattch == 1, 124);
+
+    /* 8. Detach second mapping: nattch reaches 0, segment destroyed */
+    check(kernel_shm_dt_mm(mm, addr2) == 0, 125);
+    check(kernel_shm_ctl_mm(0, shmid1, KERNEL_IPC_STAT, (uint64_t)(uintptr_t)&ds, &res) == -KERNEL_EINVAL, 126);
+
+    /* 9. Test named key conflict and creation */
+    int32_t key = 0x5678;
+    int32_t shmid_named = 0;
+    check(kernel_shm_get(0, key, 4096, 0666 | KERNEL_IPC_CREAT, &shmid_named) == 0, 127);
+    int32_t shmid_dup = 0;
+    check(kernel_shm_get(0, key, 4096, 0666 | KERNEL_IPC_CREAT | KERNEL_IPC_EXCL, &shmid_dup) == -KERNEL_EEXIST, 128);
+    check(kernel_shm_get(0, key, 4096, 0, &shmid_dup) == 0 && shmid_dup == shmid_named, 129);
+    check(kernel_shm_ctl_mm(0, shmid_named, KERNEL_IPC_RMID, 0, &res) == 0, 130);
+    check(kernel_shm_get(0, key, 4096, 0, &shmid_dup) == -KERNEL_ENOENT, 131);
+}
+
 static struct riscv_mm_statistics mapped_cost(struct kernel_files *files,
     struct kernel_mm *mm, int64_t fd, uint64_t bytes)
 {
@@ -275,7 +338,8 @@ void kernel_main(unsigned long hart, const void *dtb)
               RISCV_SV39_READ | RISCV_SV39_WRITE | RISCV_SV39_EXECUTE) == RISCV_SV39_STATUS_OK &&
           riscv_sv39_map_range(&table, 0x10000000, 0x10000000, 0x200000,
               RISCV_SV39_READ | RISCV_SV39_WRITE) == RISCV_SV39_STATUS_OK &&
-          riscv_sv39_activate(&table) == RISCV_SV39_STATUS_OK, 35);
+          riscv_sv39_activate(&table) == RISCV_SV39_STATUS_OK &&
+          kernel_shm_init(&heap, &allocator) == KERNEL_SHM_STATUS_OK, 35);
     uint64_t baseline = physical_page_available(&allocator);
     check(kernel_page_cache_init(&cache, &heap, &allocator) == KERNEL_PAGE_CACHE_STATUS_OK, 3);
     int found = 0;
@@ -329,6 +393,7 @@ void kernel_main(unsigned long hart, const void *dtb)
     socketpair_scale(&files, &mm);
     struct riscv_mm_statistics small = mapped_cost(&files, &mm, fd, 16 * MIB);
     struct riscv_mm_statistics large = mapped_cost(&files, &mm, fd, 64 * MIB);
+    sysv_shm_scale(&mm);
     check(large.resident_probes <= 6 * small.resident_probes, 25);
     check(small.protect_visits <= 6 * (16 * MIB / 4096) &&
           large.protect_visits <= 6 * (64 * MIB / 4096) &&

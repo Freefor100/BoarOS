@@ -60,7 +60,7 @@ SQLite DELETE/WAL 完整矩阵通过；不同验证快照的边界明确分列�
 | cyclictest 原 affinity/调度阻塞 | 本轮原 ELF 已真实调用调度接口并完成 C:10；mlock 仍 ENOSYS，尚不声明完整延迟或锁页能力 |
 | hackbench 创建 fdpair 失败 | N2 已交付 AF_UNIX / socketpair (199)，支持 STREAM/DGRAM、背压与关闭语义，原版 hackbench 运行通过且关机 heap-live=0 |
 | iperf 原随机/daemon 阻塞 | 原 iperf 客户端已越过随机接口与 affinity，当前停在 loopback connect ECONNRESET；另有独立 libc daemon 探针通过，未宣称原 iperf daemon 模式完成 |
-| iozone 吞吐 shmget ENOSYS | P4f SysV IPC；共享匿名 mmap 不等于 SysV 生命周期 |
+| iozone 吞吐 shmget ENOSYS | P4f SysV IPC 已交付 shmget/shmat/shmdt/shmctl，支持 IPC_PRIVATE 与命名 key、RMID 延迟销毁和 fork/exit 继承与清理，原阻塞解除 |
 | iozone 自动模式能完成，慢写和日期异常 | P0/P7 分别复现时间 ABI 与写入成本；不是永久卡死证据 |
 | lmbench /tmp/hello 启动错误仍有计时 | 原镜像 hello 脚本写死 `/code/lmbench_src/bin/build/lmbench_all`，根盘缺该目录；评测分支按 libc 链接镜像自带二进制，不能把原环境缺口归为通用 exec 失败 |
 | glibc libctest static utime 一轮通过、一轮失败 | 原镜像 libc 的 time() 使用 CLOCK_REALTIME_COARSE，BoarOS 返回 EINVAL 后旧 libc 仍读取结果，导致比较不稳定；独立 realtime/UTIME_NOW/fstat 跨秒正确。本轮已补齐 coarse clock，原静态/动态 ELF 双侧各 30 次通过；作为已关闭缺口保留原因，见时间戳 learning |
@@ -72,7 +72,7 @@ SQLite DELETE/WAL 完整矩阵通过；不同验证快照的边界明确分列�
 
 | 方向 | 已有基础 | 尚缺能力或尚未证明的结论 |
 |---|---|---|
-| IPC / 共享内存 | 共享匿名、统一后备对象、tmpfs/POSIX shm、匿名共享 futex、AF_UNIX/socketpair | SysV 四个 shm syscall 尚无入口，不能把 shm_open 等同 shmget；AF_UNIX 命名端点/SCM_RIGHTS、共享文件 futex、PI 仍缺 |
+| IPC / 共享内存 | 共享匿名、统一后备对象、tmpfs/POSIX shm、匿名共享 futex、AF_UNIX/socketpair、SysV 共享内存 | SysV 信号量与消息队列尚无入口；AF_UNIX 命名端点/SCM_RIGHTS、共享文件 futex、PI 仍缺 |
 | 文件与存储 | 页缓存、阈值写回、真实同步、日志恢复、多盘独立 owner | 范围写回顺序扫描与逐页提交；fdatasync 与 fsync 共用保守路径；无周期清脏、事务合并、预读或负目录项缓存 |
 | 并发与调度 | 单 hart IRQ 等待、每盘八槽、读共享/写独占、FIFO/RR 及预算 | 单盘后端写事务串行；同 OFD 位置、命名空间和冲突 inode 互斥；八槽不代表每个应用都可产生八个并发请求；无 SMP/PI/硬实时 |
 | 内存与信号 | demand paging、COW、fork、线程与标准信号 | mremap、按操作区分的 madvise、mlock、sigaltstack、实时信号队列未交付 |
@@ -86,8 +86,8 @@ SQLite DELETE/WAL 完整矩阵通过；不同验证快照的边界明确分列�
 ## 后续开发顺序与进入条件
 
 保持用户态兼容性优先；以下是建议排期与验收边界，尚未批准任何新子系统架构。
-现有次序仍是 AF_UNIX/socketpair 与 SysV 共享内存优先。成本诊断可与它们独立进行，
-不把先做大型存储重构作为解除 shmget 阻塞的前置条件。
+AF_UNIX/socketpair 与 SysV 共享内存已在本轮分别交付并闭环验证。存储成本诊断、
+系统环境小闭环与真实消费者定位继续推进。
 
 | 阶段 | 工作与最小交付 | 进入下一步的证据 |
 |---|---|---|
@@ -380,11 +380,11 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 
 **验证与退出**：P4a 已由 `test-vma-riscv`、真实 U-mode 的 `tests/userland/shared_mapping.h`、`tests/diff-abi/shared_mapping.c` 验证。P4b/P4c 的共享页别名、权限、fork、截断尾页、unlink、`msync` 参数及普通写扩展由 `make test-diff-abi-riscv` 双侧验证；聚焦错误交错由 `make test-files-partial-write-riscv` 验证。普通 WAL 与重启由 `make test-sqlite-wal-riscv`，存储恢复由 `make test-sqlite-wal-recovery-riscv test-sqlite-wal-recovery-matrix-riscv` 验证。P4d 基础路径由 `tests/userland/shared_futex.h`、`tests/diff-abi/futex_shared.c` 与 `tests/riscv/mm_cases.c` 验证；不同 VA 别名及交错矩阵仍按上一条跟踪。共享文件 futex 分开跟踪。
 
-### P4f SysV IPC（待设计）
+### P4f SysV IPC
 
-- [ ] 当前 shmget/shmat/shmdt/shmctl 均未接入；从 iozone 的 shmget ENOSYS 抽取最小复现，核实四接口实际 flags、布局和调用序列。
-- [ ] 确认 key/id/代次、segment 与 attach 的 owner、IPC_RMID 后存活/末引用释放、fork 继承与 exec/退出分离，以及权限/限额/OOM/fault 回滚；统一后备对象只提供页存储，不能替代 IPC 生命周期。
-- [ ] 验证跨进程/不同地址、删除后已有映射、ID 反复复用、部分失败与资源基线；同 ELF Linux 差分和原 iozone 吞吐子项均有证据后收口。SysV semaphore/message queue 不自动纳入本阶段。
+- [x] 当前 shmget/shmat/shmdt/shmctl 均已接入；针对 IPC_PRIVATE 与命名 key、段大小对齐与 Linux 布局完成 194–197 系统调用接入。
+- [x] 确认 key/id/代次、segment 与 attach 的 owner、IPC_RMID 后存活/末引用释放、fork 继承与 exec/退出分离，以及权限/限额/OOM/fault 回滚；统一后备对象作为物理页后备，由 VMA 原生扩展持有 segment 引用并在 detach/exit/exec 时维护 nattch。
+- [x] 验证跨进程/不同地址、删除后已有映射、ID 反复复用、部分失败与资源基线；Linux 差分 ABI 新增 19 条全部一致（累计 1031 条），用户态多进程 fork/shmdt/IPC_RMID 与裸机 scale 测试全数通过，关机物理页完全回收。SysV semaphore/message queue 不自动纳入本阶段。
 
 ## P5：glibc、exec 与单核真实工具链
 

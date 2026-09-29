@@ -9,6 +9,7 @@
 #include <kernel/memory_object.h>
 #include <kernel/task.h>
 #include <kernel/sync.h>
+#include <kernel/shm.h>
 #include <kernel/vma.h>
 #include <kernel/vfs.h>
 
@@ -881,7 +882,8 @@ static int shared_anon_leaf(void *context, uint64_t virtual_address)
     if (status == KERNEL_VMA_STATUS_NOT_FOUND) return 0;
     if (status != KERNEL_VMA_STATUS_OK) __builtin_trap();
     return vma.kind == KERNEL_VMA_KIND_ANON_SHARED ||
-           vma.kind == KERNEL_VMA_KIND_FILE_SHARED;
+           vma.kind == KERNEL_VMA_KIND_FILE_SHARED ||
+           vma.kind == KERNEL_VMA_KIND_SYSV_SHM;
 }
 
 enum kernel_mm_status kernel_mm_fork(
@@ -961,6 +963,17 @@ enum kernel_mm_status kernel_mm_fork(
             return status == KERNEL_MM_STATUS_CLEANUP_REQUIRED
                        ? KERNEL_MM_STATUS_STATE
                        : status;
+        }
+        uint32_t count = kernel_vma_set_count(destination_record->vmas);
+        for (uint32_t i = 0; i < count; i++) {
+            struct kernel_vma entry;
+            if (kernel_vma_set_get_at(destination_record->vmas, i, &entry) ==
+                KERNEL_VMA_STATUS_OK) {
+                if (entry.kind == KERNEL_VMA_KIND_SYSV_SHM &&
+                    entry.shm_segment != 0) {
+                    kernel_shm_on_vma_fork(entry.shm_segment);
+                }
+            }
         }
     }
     status = clone_shared_anon(source_record, destination_record);
@@ -2191,6 +2204,19 @@ enum kernel_mm_status kernel_mm_munmap(
     if (status != KERNEL_MM_STATUS_OK) {
         return status;
     }
+    uint32_t count = kernel_vma_set_count(record->vmas);
+    for (uint32_t i = 0; i < count; i++) {
+        struct kernel_vma entry;
+        if (kernel_vma_set_get_at(record->vmas, i, &entry) ==
+            KERNEL_VMA_STATUS_OK) {
+            if (entry.kind == KERNEL_VMA_KIND_SYSV_SHM &&
+                entry.shm_segment != 0) {
+                if (entry.start < end && entry.end > address) {
+                    kernel_shm_on_vma_detach(entry.shm_segment);
+                }
+            }
+        }
+    }
     if (kernel_vma_set_commit_edit(record->vmas, &edit) !=
         KERNEL_VMA_STATUS_OK) {
         return KERNEL_MM_STATUS_STATE;
@@ -2199,6 +2225,232 @@ enum kernel_mm_status kernel_mm_munmap(
     (void)drain_file_sources(record, 1);
     (void)drain_elf_sources(record, 1);
     return KERNEL_MM_STATUS_OK;
+}
+
+enum kernel_mm_status kernel_mm_shmat(
+    struct kernel_mm *mm,
+    struct kernel_shm_segment *segment,
+    uint64_t hint,
+    uint32_t permissions,
+    uint32_t flags,
+    uint64_t *out_address)
+{
+    KERNEL_NO_RECLAIM_IO;
+    struct riscv_kernel_mm_record *record;
+    struct kernel_vma vma;
+    struct kernel_vma_edit edit;
+    struct riscv_kernel_mm_shared_anon *shared_entry = 0;
+    uint64_t aligned_length;
+    uint64_t start;
+    uint64_t end;
+    uint32_t normalized;
+    int overlaps;
+    enum kernel_mm_status status;
+    enum kernel_vma_status vma_status;
+
+    if (mm == 0 || segment == 0 || !segment->active || segment->memory == 0 ||
+        out_address == 0 ||
+        !normalize_user_permissions(permissions, &normalized)) {
+        return KERNEL_MM_STATUS_INVALID_ARGUMENT;
+    }
+    aligned_length = segment->aligned_size;
+    if (aligned_length == 0U) {
+        return KERNEL_MM_STATUS_INVALID_ARGUMENT;
+    }
+    status = mutable_vma_record(mm, &record);
+    if (status != KERNEL_MM_STATUS_OK) {
+        return status;
+    }
+
+    if (hint != 0U) {
+        if ((flags & KERNEL_SHM_RND) != 0U) {
+            hint &= ~BOAROS_PAGE_MASK;
+        }
+        if ((hint & BOAROS_PAGE_MASK) != 0U ||
+            hint < RISCV_SV39_PAGE_SIZE_4K ||
+            hint >= RISCV_SV39_USER_LIMIT ||
+            aligned_length > RISCV_SV39_USER_LIMIT - hint) {
+            return KERNEL_MM_STATUS_INVALID_ARGUMENT;
+        }
+        start = hint;
+        if ((flags & KERNEL_SHM_REMAP) == 0U) {
+            vma_status = kernel_vma_set_overlaps(record->vmas,
+                                                 start,
+                                                 start + aligned_length,
+                                                 &overlaps);
+            if (vma_status != KERNEL_VMA_STATUS_OK) {
+                return status_from_vma(vma_status);
+            }
+            if (overlaps != 0) {
+                return KERNEL_MM_STATUS_CONFLICT;
+            }
+        }
+    } else {
+        if ((flags & KERNEL_SHM_REMAP) != 0U) {
+            return KERNEL_MM_STATUS_INVALID_ARGUMENT;
+        }
+        if (record->mmap_base < RISCV_SV39_PAGE_SIZE_4K ||
+            aligned_length > record->mmap_base - RISCV_SV39_PAGE_SIZE_4K) {
+            return KERNEL_MM_STATUS_NO_MEMORY;
+        }
+        vma_status = kernel_vma_set_find_topdown_gap(
+            record->vmas,
+            0U,
+            RISCV_SV39_PAGE_SIZE_4K,
+            record->mmap_base,
+            aligned_length,
+            &start);
+        if (vma_status == KERNEL_VMA_STATUS_NOT_FOUND) {
+            return KERNEL_MM_STATUS_NO_MEMORY;
+        }
+        if (vma_status != KERNEL_VMA_STATUS_OK) {
+            return status_from_vma(vma_status);
+        }
+    }
+    end = start + aligned_length;
+
+    int already_tracked = 0;
+    for (struct riscv_kernel_mm_shared_anon *curr = record->shared_anon;
+         curr != 0; curr = curr->next) {
+        if (curr->object == segment->memory) {
+            already_tracked = 1;
+            break;
+        }
+    }
+    if (!already_tracked) {
+        if (kernel_memory_object_acquire(segment->memory) !=
+            KERNEL_MEMORY_OBJECT_OK) {
+            return KERNEL_MM_STATUS_STATE;
+        }
+        enum kernel_heap_status heap_status = kernel_heap_allocate_zeroed(
+            record->vma_heap, 1U, sizeof(*shared_entry),
+            (void **)&shared_entry);
+        if (heap_status != KERNEL_HEAP_STATUS_OK) {
+            kernel_memory_object_release(&segment->memory);
+            return heap_status == KERNEL_HEAP_STATUS_EMPTY
+                       ? KERNEL_MM_STATUS_NO_MEMORY
+                       : KERNEL_MM_STATUS_STATE;
+        }
+        shared_entry->object = segment->memory;
+    }
+
+    vma = (struct kernel_vma){
+        .start = start,
+        .end = end,
+        .backing_offset = 0U,
+        .permissions = normalized,
+        .kind = KERNEL_VMA_KIND_SYSV_SHM,
+        .role = KERNEL_VMA_ROLE_SYSV_SHM,
+        .fault_policy = KERNEL_VMA_FAULT_ANON_SHARED,
+        .backing = segment->memory,
+        .shm_segment = segment,
+    };
+
+    if ((flags & KERNEL_SHM_REMAP) == 0U) {
+        status = status_from_vma(kernel_vma_set_insert(record->vmas, &vma));
+        if (status == KERNEL_MM_STATUS_OK) {
+            if (shared_entry != 0) {
+                shared_entry->next = record->shared_anon;
+                record->shared_anon = shared_entry;
+            }
+            *out_address = start;
+        } else {
+            if (shared_entry != 0) {
+                kernel_memory_object_release(&segment->memory);
+                (void)kernel_heap_release(record->vma_heap, shared_entry);
+            }
+        }
+        return status;
+    }
+
+    vma_status = kernel_vma_set_prepare_replace(record->vmas,
+                                                start,
+                                                end,
+                                                &vma,
+                                                &edit);
+    if (vma_status != KERNEL_VMA_STATUS_OK) {
+        status = status_from_vma(vma_status);
+        if (shared_entry != 0) {
+            kernel_memory_object_release(&segment->memory);
+            (void)kernel_heap_release(record->vma_heap, shared_entry);
+        }
+        return status;
+    }
+    status = require_active_space(record);
+    if (status != KERNEL_MM_STATUS_OK) {
+        if (shared_entry != 0) {
+            kernel_memory_object_release(&segment->memory);
+            (void)kernel_heap_release(record->vma_heap, shared_entry);
+        }
+        return status;
+    }
+    status = unmap_space_range(record, start, end);
+    if (status != KERNEL_MM_STATUS_OK) {
+        if (shared_entry != 0) {
+            kernel_memory_object_release(&segment->memory);
+            (void)kernel_heap_release(record->vma_heap, shared_entry);
+        }
+        return status;
+    }
+    uint32_t count = kernel_vma_set_count(record->vmas);
+    for (uint32_t i = 0; i < count; i++) {
+        struct kernel_vma entry;
+        if (kernel_vma_set_get_at(record->vmas, i, &entry) ==
+            KERNEL_VMA_STATUS_OK) {
+            if (entry.kind == KERNEL_VMA_KIND_SYSV_SHM &&
+                entry.shm_segment != 0) {
+                if (entry.start < end && entry.end > start) {
+                    kernel_shm_on_vma_detach(entry.shm_segment);
+                }
+            }
+        }
+    }
+    if (kernel_vma_set_commit_edit(record->vmas, &edit) !=
+        KERNEL_VMA_STATUS_OK) {
+        if (shared_entry != 0) {
+            kernel_memory_object_release(&segment->memory);
+            (void)kernel_heap_release(record->vma_heap, shared_entry);
+        }
+        return KERNEL_MM_STATUS_STATE;
+    }
+    if (shared_entry != 0) {
+        shared_entry->next = record->shared_anon;
+        record->shared_anon = shared_entry;
+    }
+    drain_shared_anon(record, 1);
+    (void)drain_file_sources(record, 1);
+    (void)drain_elf_sources(record, 1);
+    *out_address = start;
+    return KERNEL_MM_STATUS_OK;
+}
+
+enum kernel_mm_status kernel_mm_shmdt(
+    struct kernel_mm *mm,
+    uint64_t address)
+{
+    KERNEL_NO_RECLAIM_IO;
+    struct riscv_kernel_mm_record *record;
+    struct kernel_vma vma;
+    enum kernel_mm_status status;
+    enum kernel_vma_status vma_status;
+
+    if (mm == 0 || (address & BOAROS_PAGE_MASK) != 0U ||
+        address < RISCV_SV39_PAGE_SIZE_4K ||
+        address >= RISCV_SV39_USER_LIMIT) {
+        return KERNEL_MM_STATUS_INVALID_ARGUMENT;
+    }
+    status = mutable_vma_record(mm, &record);
+    if (status != KERNEL_MM_STATUS_OK) {
+        return status;
+    }
+    vma_status = kernel_vma_set_lookup(record->vmas, address, &vma);
+    if (vma_status != KERNEL_VMA_STATUS_OK) {
+        return KERNEL_MM_STATUS_INVALID_ARGUMENT;
+    }
+    if (vma.start != address || vma.kind != KERNEL_VMA_KIND_SYSV_SHM) {
+        return KERNEL_MM_STATUS_INVALID_ARGUMENT;
+    }
+    return kernel_mm_munmap(mm, vma.start, vma.end - vma.start);
 }
 
 enum kernel_mm_status kernel_mm_mprotect(
@@ -2987,7 +3239,8 @@ static enum kernel_mm_status resolve_user_fault_once(
                                    page_address,
                                    access, retry);
     }
-    if (vma.kind == KERNEL_VMA_KIND_ANON_SHARED &&
+    if ((vma.kind == KERNEL_VMA_KIND_ANON_SHARED ||
+         vma.kind == KERNEL_VMA_KIND_SYSV_SHM) &&
         vma.fault_policy == KERNEL_VMA_FAULT_ANON_SHARED &&
         vma.backing != 0) {
         struct kernel_memory_object *object = vma.backing;
@@ -3155,6 +3408,17 @@ enum kernel_mm_status kernel_mm_release(struct kernel_mm *mm)
         record->resident_buckets = 0;
         record->resident_capacity = 0;
         if (record->vmas != 0) {
+            uint32_t count = kernel_vma_set_count(record->vmas);
+            for (uint32_t i = 0; i < count; i++) {
+                struct kernel_vma entry;
+                if (kernel_vma_set_get_at(record->vmas, i, &entry) ==
+                    KERNEL_VMA_STATUS_OK) {
+                    if (entry.kind == KERNEL_VMA_KIND_SYSV_SHM &&
+                        entry.shm_segment != 0) {
+                        kernel_shm_on_vma_detach(entry.shm_segment);
+                    }
+                }
+            }
             vma_status = kernel_vma_set_destroy(&record->vmas);
             if (vma_status != KERNEL_VMA_STATUS_OK) {
                 return KERNEL_MM_STATUS_STATE;

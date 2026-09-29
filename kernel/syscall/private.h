@@ -351,4 +351,21 @@ enum kernel_syscall_status syscall_handle_sched(
     struct kernel_task *caller, const struct kernel_syscall_request *request,
     struct kernel_syscall_result *decoded);
 
+enum kernel_syscall_status syscall_handle_shmget(
+    struct kernel_task *caller,
+    const struct kernel_syscall_request *request,
+    struct kernel_syscall_result *decoded);
+enum kernel_syscall_status syscall_handle_shmat(
+    struct kernel_task *caller,
+    const struct kernel_syscall_request *request,
+    struct kernel_syscall_result *decoded);
+enum kernel_syscall_status syscall_handle_shmdt(
+    struct kernel_task *caller,
+    const struct kernel_syscall_request *request,
+    struct kernel_syscall_result *decoded);
+enum kernel_syscall_status syscall_handle_shmctl(
+    struct kernel_task *caller,
+    const struct kernel_syscall_request *request,
+    struct kernel_syscall_result *decoded);
+
 #endif

@@ -190,6 +190,7 @@ C_SOURCES := \
 	kernel/syscall/process.c \
 	kernel/syscall/signal.c \
 	kernel/syscall/socket.c \
+	kernel/syscall/shm.c \
 	kernel/syscall/time.c \
 	kernel/syscall/random.c \
 	kernel/syscall/sched.c \
@@ -201,6 +202,7 @@ C_SOURCES := \
 	lib/string.c \
 	mm/vma.c \
 	mm/memory_object.c \
+	mm/shm.c \
 	mm/heap.c \
 	$(LWEXT4_SOURCES) \
 	$(LWIP_SOURCES)
@@ -277,6 +279,7 @@ TEST_RUNTIME_C_SOURCES := \
 	kernel/syscall/process.c \
 	kernel/syscall/signal.c \
 	kernel/syscall/socket.c \
+	kernel/syscall/shm.c \
 	kernel/syscall/time.c \
 	kernel/syscall/random.c \
 	kernel/syscall/sched.c \
@@ -288,6 +291,7 @@ TEST_RUNTIME_C_SOURCES := \
 	lib/string.c \
 	mm/vma.c \
 	mm/memory_object.c \
+	mm/shm.c \
 	mm/heap.c \
 	$(LWEXT4_SOURCES) \
 	$(LWIP_SOURCES)
@@ -1131,7 +1135,7 @@ $(MUSL_LDSO): $(MUSL_STAMP)
 
 MUSL_GCC_FLAGS ?= $(shell $(MUSL_ROOT)/bin/musl-gcc -fno-link-libatomic -E -x c /dev/null >/dev/null 2>&1 && echo -fno-link-libatomic)
 
-$(REAL_USERLAND_RV): tests/userland/real.c tests/userland/truncate.h tests/userland/timestamps.h tests/userland/sync.h tests/userland/namespace.h tests/userland/metadata.h tests/userland/shared_mapping.h tests/userland/shared_futex.h tests/userland/tmpfs.h $(MUSL_STAMP)
+$(REAL_USERLAND_RV): tests/userland/real.c tests/userland/truncate.h tests/userland/timestamps.h tests/userland/sync.h tests/userland/namespace.h tests/userland/metadata.h tests/userland/shared_mapping.h tests/userland/shared_futex.h tests/userland/tmpfs.h tests/userland/sysv_shm.h $(MUSL_STAMP)
 	@mkdir -p $(dir $@)
 	$(MUSL_ROOT)/bin/musl-gcc $(MUSL_GCC_FLAGS) -static -O2 \
 		-o $@ $<

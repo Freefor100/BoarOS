@@ -67,6 +67,10 @@
 #define LINUX_SYSCALL_GETEGID 177U
 #define LINUX_SYSCALL_GETTID 178U
 #define LINUX_SYSCALL_UMASK 166U
+#define LINUX_SYSCALL_SHMGET 194U
+#define LINUX_SYSCALL_SHMCTL 195U
+#define LINUX_SYSCALL_SHMAT 196U
+#define LINUX_SYSCALL_SHMDT 197U
 #define LINUX_SYSCALL_SOCKET 198U
 #define LINUX_SYSCALL_SOCKETPAIR 199U
 #define LINUX_SYSCALL_BIND 200U
@@ -225,6 +229,26 @@ enum kernel_syscall_status kernel_syscall_dispatch(
     if (request->number == 179U) {
         if (syscall_handle_sysinfo(caller, request->arguments[0], &decoded) != KERNEL_SYSCALL_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    } else if (request->number == LINUX_SYSCALL_SHMGET) {
+        if (syscall_handle_shmget(caller, request, &decoded) !=
+            KERNEL_SYSCALL_STATUS_OK) {
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+        }
+    } else if (request->number == LINUX_SYSCALL_SHMCTL) {
+        if (syscall_handle_shmctl(caller, request, &decoded) !=
+            KERNEL_SYSCALL_STATUS_OK) {
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+        }
+    } else if (request->number == LINUX_SYSCALL_SHMAT) {
+        if (syscall_handle_shmat(caller, request, &decoded) !=
+            KERNEL_SYSCALL_STATUS_OK) {
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+        }
+    } else if (request->number == LINUX_SYSCALL_SHMDT) {
+        if (syscall_handle_shmdt(caller, request, &decoded) !=
+            KERNEL_SYSCALL_STATUS_OK) {
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+        }
     } else if (request->number == LINUX_SYSCALL_SOCKET) {
         if (syscall_handle_socket(caller, request, &decoded) !=
             KERNEL_SYSCALL_STATUS_OK) {

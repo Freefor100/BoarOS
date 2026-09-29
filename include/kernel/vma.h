@@ -31,6 +31,7 @@ enum kernel_vma_kind {
     KERNEL_VMA_KIND_ELF_PRIVATE,
     KERNEL_VMA_KIND_ANON_SHARED,
     KERNEL_VMA_KIND_FILE_SHARED,
+    KERNEL_VMA_KIND_SYSV_SHM,
 };
 
 enum kernel_vma_role {
@@ -40,6 +41,7 @@ enum kernel_vma_role {
     KERNEL_VMA_ROLE_STACK,
     KERNEL_VMA_ROLE_HEAP,
     KERNEL_VMA_ROLE_MMAP,
+    KERNEL_VMA_ROLE_SYSV_SHM,
 };
 
 enum kernel_vma_fault_policy {
@@ -61,6 +63,7 @@ struct kernel_vma {
     enum kernel_vma_role role;
     enum kernel_vma_fault_policy fault_policy;
     void *backing;
+    void *shm_segment;
     uint8_t file_shared_may_write;
 };
 
@@ -101,6 +104,13 @@ enum kernel_vma_status kernel_vma_set_insert(
 enum kernel_vma_status kernel_vma_set_lookup(
     const struct kernel_vma_set *set,
     uint64_t virtual_address,
+    struct kernel_vma *vma);
+
+uint32_t kernel_vma_set_count(const struct kernel_vma_set *set);
+
+enum kernel_vma_status kernel_vma_set_get_at(
+    const struct kernel_vma_set *set,
+    uint32_t index,
     struct kernel_vma *vma);
 
 /* First VMA whose start is at or after address. */

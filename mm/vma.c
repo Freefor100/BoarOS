@@ -52,9 +52,9 @@ static int vma_valid(const struct kernel_vma *vma)
 {
     if (vma == 0 || vma->start >= vma->end ||
         vma->kind < KERNEL_VMA_KIND_ANONYMOUS ||
-        vma->kind > KERNEL_VMA_KIND_FILE_SHARED ||
+        vma->kind > KERNEL_VMA_KIND_SYSV_SHM ||
         vma->role < KERNEL_VMA_ROLE_NONE ||
-        vma->role > KERNEL_VMA_ROLE_MMAP ||
+        vma->role > KERNEL_VMA_ROLE_SYSV_SHM ||
         vma->fault_policy < KERNEL_VMA_FAULT_RESIDENT_REQUIRED ||
         vma->fault_policy > KERNEL_VMA_FAULT_FILE_SHARED) {
         return 0;
@@ -83,6 +83,14 @@ static int vma_valid(const struct kernel_vma *vma)
          vma->backing_offset > UINT64_MAX - (vma->end - vma->start))) {
         return 0;
     }
+    if (vma->kind == KERNEL_VMA_KIND_SYSV_SHM &&
+        (vma->backing == 0 ||
+         vma->shm_segment == 0 ||
+         vma->fault_policy != KERNEL_VMA_FAULT_ANON_SHARED ||
+         (vma->backing_offset & BOAROS_PAGE_MASK) != 0U ||
+         vma->backing_offset > UINT64_MAX - (vma->end - vma->start))) {
+        return 0;
+    }
     if (vma->kind == KERNEL_VMA_KIND_FILE_SHARED &&
         (vma->backing == 0 ||
          vma->fault_policy != KERNEL_VMA_FAULT_FILE_SHARED ||
@@ -103,7 +111,12 @@ static int can_merge(const struct kernel_vma *left,
         left->kind != right->kind || left->role != right->role ||
         left->fault_policy != right->fault_policy ||
         left->backing != right->backing ||
+        left->shm_segment != right->shm_segment ||
         left->file_shared_may_write != right->file_shared_may_write) {
+        return 0;
+    }
+    if (left->kind == KERNEL_VMA_KIND_SYSV_SHM ||
+        right->kind == KERNEL_VMA_KIND_SYSV_SHM) {
         return 0;
     }
     if (left->kind == KERNEL_VMA_KIND_ANONYMOUS) {
@@ -130,6 +143,24 @@ static uint32_t lower_bound(const struct kernel_vma_set *set,
         }
     }
     return low;
+}
+
+uint32_t kernel_vma_set_count(const struct kernel_vma_set *set)
+{
+    if (!set_valid(set)) __builtin_trap();
+    return set->count;
+}
+
+enum kernel_vma_status kernel_vma_set_get_at(
+    const struct kernel_vma_set *set,
+    uint32_t index,
+    struct kernel_vma *vma)
+{
+    if (!set_valid(set) || vma == 0)
+        return KERNEL_VMA_STATUS_INVALID_ARGUMENT;
+    if (index >= set->count) return KERNEL_VMA_STATUS_NOT_FOUND;
+    *vma = set->entries[index];
+    return KERNEL_VMA_STATUS_OK;
 }
 
 enum kernel_vma_status kernel_vma_set_next(
