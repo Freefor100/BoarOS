@@ -4,11 +4,13 @@
 import argparse
 import hashlib
 import json
+import os
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 
@@ -32,6 +34,20 @@ def sha256(path):
 def command(*arguments):
     return subprocess.run(arguments, check=True, text=True,
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+
+def copy_boot_disk(source, destination):
+    # Preserve the fixture's holes, then finish its writes before QEMU starts
+    # using the same host filesystem for the guest's first block request.
+    started = time.monotonic()
+    command("cp", "--reflink=auto", "--sparse=always", "--",
+            str(source), str(destination))
+    with destination.open("rb") as stream:
+        os.fsync(stream.fileno())
+    copied = destination.stat()
+    print(f"Offline C boot disk {destination.name}: logical={copied.st_size} "
+          f"allocated={copied.st_blocks * 512} "
+          f"copy-and-sync={time.monotonic() - started:.3f}s", flush=True)
 
 
 def linux_image(argument):
@@ -102,6 +118,8 @@ def fixture(directory, program, args):
                             "mknod zero c 1 5\n"
                             "set_inode_field zero mode 020666\n")
     command("debugfs", "-w", "-f", str(instructions), str(disk))
+    with disk.open("rb") as stream:
+        os.fsync(stream.fileno())
     return disk
 
 
@@ -254,7 +272,7 @@ def main():
         for name, kernel, linux in (("linux", linux_kernel, True),
                                     ("boaros", args.kernel.resolve(), False)):
             disk = directory / (name + ".img")
-            shutil.copyfile(fixture_disk, disk)
+            copy_boot_disk(fixture_disk, disk)
             boot(args, kernel, disk, directory / (name + ".log"), linux)
             replay_and_check(directory, name, disk)
             observations[name] = evidence(directory, name, disk)

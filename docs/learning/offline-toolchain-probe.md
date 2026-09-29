@@ -67,3 +67,5 @@ orphan 文件在审核后清理，最终 `e2fsck -fn` 完全干净。
 
 2026-09-28 通用 VFS/procfs 阶段复验 `make test-offline-c-riscv`：
 BoarOS 内核 SHA-256 `1a0dc5b9dc338e01d9fc7b10c689edaaa761f75952bc8fce90f2f4a4c1478167`，固定 Linux Image SHA-256 `09aef347ca137306aa97c9b7a87ec464bae1097011ce15f08b91529e114f8b5c`，Alpine 展开树 SHA-256 `ce84a7bb9fc7c97552121b37238622bbefbd4a3672600b57374e25230c582a07`。预处理、编译、汇编、链接、运行五阶段两侧均 `exit:0`；生成 ELF 与输出 SHA-256 保持上述固定值，未出现回退。
+
+2026-09-29 [CI run #36](https://github.com/Freefor100/BoarOS/actions/runs/36513240987) 的 SQLite DELETE/WAL 均通过，离线 GCC 却在 `/init` 执行前的根盘启动过程中报 VirtIO 一秒 timeout。失败日志只能证明设备请求超时，不能据此判定 ext4 或 SQLite 回归，也未打印出请求类型。该 fixture 逻辑大小 556598166 字节、实际分配约 248 MiB；原 `shutil.copyfile` 把每个启动副本扩成约 531 MiB，两侧启动前增加约 600 MiB 无意义的宿主写入。本地旧 QEMU 8.2.2 在 25% 和 5% CPU 配额下各 20 次根启动均通过，单纯 CPU 配额未复现 CI 的块延迟。runner 现使用保留稀疏空洞的复制并在启动前 `fsync` fixture 和副本，减少宿主回写与客体首次请求竞争；逐字节 `cmp` 已确认副本内容不变，内核一秒超时也不变。修正后的本地 QEMU 11.1.1 双侧五阶段通过，QEMU 8.2.2 上 BoarOS 单侧五阶段连续 10 次通过；该环境中的本地缓存 Linux Image 在旧 QEMU 上出现 cc1 SIGILL，不能拿它做双侧对比。远端间歇性故障是否消除仍须新 CI run 验证。
