@@ -150,6 +150,39 @@ static enum kernel_files_status generated_read(
     return KERNEL_FILES_STATUS_OK;
 }
 
+static enum kernel_files_status memory_read(
+    struct kernel_files *files, struct kernel_mm *mm,
+    struct kernel_open_file_description *description,
+    struct kernel_uaccess_iov_cursor *cursor, uint64_t count,
+    uint64_t offset, int advance, int64_t *linux_result)
+{
+    struct kernel_task_io_buffer buffer = {0};
+    uint64_t total = 0;
+    int error = 0;
+    if (offset >= kernel_open_file_size(description)) { *linux_result = 0; return KERNEL_FILES_STATUS_OK; }
+    if (kernel_task_io_buffer_acquire(&buffer, mm->allocator) != KERNEL_TASK_STATUS_OK) {
+        *linux_result = -KERNEL_ENOMEM; files->record->statistics.read_failures++;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    while (total < count) {
+        size_t chunk = count - total > BOAROS_PAGE_SIZE ? BOAROS_PAGE_SIZE : (size_t)(count - total);
+        size_t available = 0, copied = 0;
+        error = kernel_open_file_pread(description, offset + total, buffer.data, chunk, &available);
+        if (error || !available) break;
+        enum kernel_uaccess_status status = kernel_copy_to_user_iov(mm, cursor, buffer.data, available, &copied);
+        if (advance && kernel_open_file_advance(description, copied) != KERNEL_OPEN_FILE_STATUS_OK) __builtin_trap();
+        total += copied;
+        files->record->statistics.read_chunks++;
+        if (status == KERNEL_UACCESS_STATUS_FAULT) { error = -KERNEL_EFAULT; break; }
+        if (status != KERNEL_UACCESS_STATUS_OK || copied != available) __builtin_trap();
+    }
+    kernel_task_io_buffer_release(&buffer);
+    if (error) files->record->statistics.read_failures++;
+    files->record->statistics.bytes_read += total;
+    *linux_result = total ? (int64_t)total : error;
+    return KERNEL_FILES_STATUS_OK;
+}
+
 enum kernel_files_status kernel_files_sync(struct kernel_files *files,
     int64_t fd, int datasync, int64_t *linux_result)
 {
@@ -373,6 +406,9 @@ static enum kernel_files_status read_pinned(
     request = count > KERNEL_FILES_MAX_RW_COUNT
                   ? KERNEL_FILES_MAX_RW_COUNT
                   : count;
+    if (kernel_open_file_memory_backed(description))
+        return memory_read(files, mm, description, &cursor, request,
+                           kernel_open_file_offset(description), 1, linux_result);
     while (total < request) {
         uint64_t file_offset = kernel_open_file_offset(description);
         uint64_t page_index = file_offset >> BOAROS_PAGE_SHIFT;
@@ -689,6 +725,11 @@ static enum kernel_files_status pread_pinned(
     }
     if (request > file_size - position) {
         request = file_size - position;
+    }
+    if (kernel_open_file_memory_backed(description)) {
+        const struct kernel_uaccess_iovec iov = {user_buffer, request};
+        struct kernel_uaccess_iov_cursor cursor = {&iov, 1, 0, 0};
+        return memory_read(files, mm, description, &cursor, request, position, 0, linux_result);
     }
     while (total < request) {
         uint64_t page_index = position >> BOAROS_PAGE_SHIFT;

@@ -16,6 +16,29 @@
 #include <stddef.h>
 #include <stdint.h>
 
+struct riscv_virtio_mmio_block *riscv_root_boot_device(
+    struct riscv_root_boot *root, uint32_t index)
+{
+    if (!root || index >= DTB_MAX_VIRTIO_MMIO_RANGES) return 0;
+    return index == 0U ? &root->device : &root->extra_devices[index - 1U];
+}
+
+static int destroy_devices(struct riscv_root_boot *root)
+{
+    /* 先移除登记再销毁 DMA；有 mount claim 的设备必须保留。 */
+    while (root->device_count) {
+        struct riscv_virtio_mmio_block *device =
+            riscv_root_boot_device(root, root->device_count - 1U);
+        if (device->block.registered && kernel_block_unregister(&device->block))
+            return RISCV_VIRTIO_MMIO_BLOCK_STATUS_STATE;
+        int error = (int)riscv_virtio_mmio_block_destroy(device);
+        if (error != RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK) return error;
+        root->device_count--;
+    }
+    root->cleanup_device_owned = 0U;
+    return RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK;
+}
+
 static int direct_map_heap_address(const void *pointer,
                                    uint64_t *physical_address)
 {
@@ -63,7 +86,7 @@ static enum riscv_root_boot_status cleanup_start_failure(
     *path_owner = 0;
     *files = (struct kernel_files){0};
     *fs = (struct kernel_fs_context){0};
-    root->cleanup_device_owned = root->device.page_allocator != 0;
+    root->cleanup_device_owned = root->device_count != 0U;
     root->failure_status = failure;
     root->state = RISCV_ROOT_BOOT_CLEANUP;
     return riscv_root_boot_cleanup(root);
@@ -123,7 +146,8 @@ enum riscv_root_boot_status riscv_root_boot_cleanup(
         root->cleanup_path = 0;
     }
     if (root->mount.private_data != 0) {
-        if (kernel_procfs_unmount_children(&root->mount) != 0 ||
+        if (kernel_vfs_disk_cleanup_pending() != 0 ||
+            kernel_procfs_unmount_children(&root->mount) != 0 ||
             kernel_vfs_unmount(&root->mount) != 0) {
             cleanup_failed = 1;
         }
@@ -137,7 +161,7 @@ enum riscv_root_boot_status riscv_root_boot_cleanup(
             cleanup_failed = 1;
         }
         if (root->cleanup_device_owned != 0U) {
-            if (riscv_virtio_mmio_block_destroy(&root->device) !=
+            if (destroy_devices(root) !=
                 RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK) {
                 cleanup_failed = 1;
             } else {
@@ -192,11 +216,11 @@ enum riscv_root_boot_status riscv_root_boot_start(
     uint32_t index;
     uint32_t stdio_index;
     int64_t console_result;
-    int found = 0;
 
     if (root == 0 || info == 0 || allocator == 0 ||
         kernel_table == 0 || root->state != RISCV_ROOT_BOOT_EMPTY ||
-        root->device.page_allocator != 0 ||
+        root->device.page_allocator != 0 || root->device_count != 0U ||
+        info->virtio_mmio_count > DTB_MAX_VIRTIO_MMIO_RANGES ||
         root->mount.private_data != 0 ||
         root->page_cache.state != KERNEL_PAGE_CACHE_EMPTY ||
         root->page_cache.record != 0 || info->timebase_frequency == 0U) {
@@ -217,26 +241,35 @@ enum riscv_root_boot_status riscv_root_boot_start(
     for (index = 0U; index < info->virtio_mmio_count; index++) {
         if (info->virtio_mmio[index].base >
             UINT64_MAX - RISCV_KERNEL_MMIO_BASE) {
-            return RISCV_ROOT_BOOT_STATUS_DEVICE;
+            failure = RISCV_ROOT_BOOT_STATUS_DEVICE;
+            goto fail;
         }
         mmio_address = RISCV_KERNEL_MMIO_BASE +
                        info->virtio_mmio[index].base;
         device_status = riscv_virtio_mmio_block_init(
-            &root->device,
+            riscv_root_boot_device(root, root->device_count),
             (volatile void *)(uintptr_t)mmio_address,
             info->virtio_mmio[index].size,
             allocator,
             direct_map_dma_address,
             info->timebase_frequency);
         if (device_status == RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK) {
-            found = 1;
-            break;
+            struct riscv_virtio_mmio_block *device =
+                riscv_root_boot_device(root, root->device_count++);
+            root->cleanup_device_owned = 1U;
+            if (kernel_block_register(&device->block,
+                    KERNEL_BLOCK_DEVICE_NUMBER(root->device_count - 1U)) != 0) {
+                failure = RISCV_ROOT_BOOT_STATUS_DEVICE;
+                goto fail;
+            }
+            continue;
         }
         if (device_status != RISCV_VIRTIO_MMIO_BLOCK_STATUS_NOT_BLOCK) {
-            return RISCV_ROOT_BOOT_STATUS_DEVICE;
+            failure = RISCV_ROOT_BOOT_STATUS_DEVICE;
+            goto fail;
         }
     }
-    if (!found) {
+    if (root->device_count == 0U) {
         return RISCV_ROOT_BOOT_STATUS_NO_DEVICE;
     }
 
@@ -489,7 +522,8 @@ enum riscv_root_boot_status riscv_root_boot_finish(
         return RISCV_ROOT_BOOT_STATUS_CLEANUP;
     }
     kernel_page_cache_stop_worker(&root->page_cache);
-    error = kernel_procfs_unmount_children(&root->mount);
+    error = kernel_vfs_disk_cleanup_pending();
+    if (!error) error = kernel_procfs_unmount_children(&root->mount);
     if (error == 0) error = kernel_vfs_unmount(&root->mount);
     if (error != 0) {
         root->finish_failure = RISCV_ROOT_FINISH_UNMOUNT;
@@ -502,7 +536,7 @@ enum riscv_root_boot_status riscv_root_boot_finish(
         root->finish_error = error;
         return RISCV_ROOT_BOOT_STATUS_CLEANUP;
     }
-    error = (int)riscv_virtio_mmio_block_destroy(&root->device);
+    error = (int)destroy_devices(root);
     if (error != RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK) {
         root->finish_failure = RISCV_ROOT_FINISH_DEVICE;
         root->finish_error = error;

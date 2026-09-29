@@ -35,6 +35,7 @@
 #define LINUX_SYSCALL_MKDIRAT 34U
 #define LINUX_SYSCALL_UNLINKAT 35U
 #define LINUX_SYSCALL_SYMLINKAT 36U
+#define LINUX_SYSCALL_LINKAT 37U
 #define LINUX_SYSCALL_FTRUNCATE 46U
 #define LINUX_SYSCALL_OPENAT 56U
 #define LINUX_SYSCALL_CLOSE 57U
@@ -312,6 +313,9 @@ enum kernel_syscall_status kernel_syscall_dispatch(
                request->number == LINUX_SYSCALL_FCHDIR) {
         if (syscall_handle_chdir(caller, request, &decoded,
                 request->number == LINUX_SYSCALL_FCHDIR) != KERNEL_SYSCALL_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    } else if (request->number == LINUX_SYSCALL_LINKAT) {
+        if (syscall_handle_linkat(caller, request, &decoded) != KERNEL_SYSCALL_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     } else if (request->number == LINUX_SYSCALL_RENAMEAT ||
                request->number == LINUX_SYSCALL_RENAMEAT2) {

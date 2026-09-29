@@ -156,6 +156,8 @@ C_SOURCES := \
 	fs/page_cache.c \
 	fs/vfs.c \
 	fs/procfs.c \
+	fs/tmpfs.c \
+	fs/disk_mount.c \
 	fs/ext4_backend.c \
 	kernel/boot_memory.c \
 	kernel/block.c \
@@ -237,6 +239,8 @@ TEST_RUNTIME_C_SOURCES := \
 	fs/page_cache.c \
 	fs/vfs.c \
 	fs/procfs.c \
+	fs/tmpfs.c \
+	fs/disk_mount.c \
 	fs/ext4_backend.c \
 	kernel/block.c \
 	kernel/elf64.c \
@@ -1075,6 +1079,14 @@ test-offline-c-riscv: $(OFFLINE_C_RV) $(KERNEL_RV) prepare-offline-c-toolchain
 		--qemu $(QEMU_RISCV64) \
 		--toolchain-tree build/offline-c/alpine-tree
 
+.PHONY: test-offline-c-tmpfs-riscv
+test-offline-c-tmpfs-riscv: $(OFFLINE_C_RV) $(KERNEL_RV) prepare-offline-c-toolchain
+	PYTHONDONTWRITEBYTECODE=1 python3 tests/offline-c-riscv.py \
+		--kernel $(KERNEL_RV) --program $(OFFLINE_C_RV) --tmpfs \
+		$(if $(OFFLINE_C_LINUX_KERNEL),--linux-kernel $(OFFLINE_C_LINUX_KERNEL)) \
+		--qemu $(QEMU_RISCV64) \
+		--toolchain-tree build/offline-c/alpine-tree
+
 .PHONY: test-sqlite-rollback-riscv
 test-sqlite-rollback-riscv: $(SQLITE_ROLLBACK_RV) $(SQLITE_CLI_STATIC_RV) $(SQLITE_CLI_DYNAMIC_RV) $(SQLITE_CLI_INIT_RV) $(MUSL_LDSO) $(KERNEL_RV)
 	SQLITE_ROLLBACK_RV=$(SQLITE_ROLLBACK_RV) \
@@ -1105,7 +1117,7 @@ $(MUSL_LDSO): $(MUSL_STAMP)
 
 MUSL_GCC_FLAGS ?= $(shell $(MUSL_ROOT)/bin/musl-gcc -fno-link-libatomic -E -x c /dev/null >/dev/null 2>&1 && echo -fno-link-libatomic)
 
-$(REAL_USERLAND_RV): tests/userland/real.c tests/userland/truncate.h tests/userland/timestamps.h tests/userland/sync.h tests/userland/namespace.h tests/userland/metadata.h tests/userland/shared_mapping.h tests/userland/shared_futex.h $(MUSL_STAMP)
+$(REAL_USERLAND_RV): tests/userland/real.c tests/userland/truncate.h tests/userland/timestamps.h tests/userland/sync.h tests/userland/namespace.h tests/userland/metadata.h tests/userland/shared_mapping.h tests/userland/shared_futex.h tests/userland/tmpfs.h $(MUSL_STAMP)
 	@mkdir -p $(dir $@)
 	$(MUSL_ROOT)/bin/musl-gcc $(MUSL_GCC_FLAGS) -static -O2 \
 		-o $@ $<
@@ -1161,6 +1173,24 @@ test-root-init-riscv: $(KERNEL_RV) $(ROOT_INIT_PROGRAM_RV) \
 		ROOT_EXEC_STAGE2_RV=$(ROOT_EXEC_STAGE2_RV) \
 		ROOT_EXEC_STAGE3_RV=$(ROOT_EXEC_STAGE3_RV) \
 		./tests/root-init-riscv.sh
+
+MULTI_MOUNT_RV := $(BUILD_DIR)/tests/user/multi-mount-rv
+MULTI_MOUNT_READONLY_RV := $(BUILD_DIR)/tests/user/multi-mount-readonly-rv
+
+$(MULTI_MOUNT_RV): tests/userland/multi_mount.c $(MUSL_STAMP)
+	@mkdir -p $(dir $@)
+	$(MUSL_ROOT)/bin/musl-gcc $(MUSL_GCC_FLAGS) -static -O2 -Wall -Wextra -Werror -o $@ $<
+
+$(MULTI_MOUNT_READONLY_RV): tests/userland/multi_mount.c $(MUSL_STAMP)
+	@mkdir -p $(dir $@)
+	$(MUSL_ROOT)/bin/musl-gcc $(MUSL_GCC_FLAGS) -DREAD_ONLY_BOOT=1 -static -O2 -Wall -Wextra -Werror -o $@ $<
+
+.PHONY: test-root-multi-block-riscv
+test-root-multi-block-riscv: $(KERNEL_RV) $(MULTI_MOUNT_RV) $(MULTI_MOUNT_READONLY_RV)
+	QEMU_RISCV64=$(QEMU_RISCV64) QEMU_MEMORY=$(QEMU_MEMORY) \
+		KERNEL_RV=$(KERNEL_RV) MULTI_MOUNT_RV=$(MULTI_MOUNT_RV) \
+		MULTI_MOUNT_READONLY_RV=$(MULTI_MOUNT_READONLY_RV) \
+		./tests/root-multi-block-riscv.sh
 
 .PHONY: test-root-orphan-riscv
 test-root-orphan-riscv: $(KERNEL_RV) $(ROOT_ORPHAN_PROGRAM_RV) \
@@ -1415,3 +1445,23 @@ $(BUILD_DIR)/tests/kernel-io-sleep-rv: $(IO_SLEEP_OBJECTS) arch/riscv/linker.ld
 .PHONY: test-io-sleep-riscv
 test-io-sleep-riscv: $(BUILD_DIR)/tests/kernel-io-sleep-rv build/host/nbd-fault
 	python3 tests/io-sleep-riscv.py --kernel $< --qemu $(QEMU_RISCV64)
+
+SQLITE_SECOND_DISK_RV := $(BUILD_DIR)/tests/user/sqlite-second-disk-rv
+$(SQLITE_SECOND_DISK_RV): tests/workloads/sqlite/wal.c $(SQLITE_SOURCE) $(MUSL_STAMP)
+	@mkdir -p $(dir $@)
+	$(MUSL_ROOT)/bin/musl-gcc $(MUSL_GCC_FLAGS) -static -O2 -pthread \
+		-DSQLITE_SECOND_DISK -I$(dir $(SQLITE_SOURCE)) -o $@ $< $(SQLITE_SOURCE) -ldl
+.PHONY: test-sqlite-second-disk-riscv
+test-sqlite-second-disk-riscv: $(SQLITE_SECOND_DISK_RV) $(KERNEL_RV)
+	PYTHONDONTWRITEBYTECODE=1 python3 tests/sqlite-wal-riscv.py \
+		--kernel $(KERNEL_RV) --program $(SQLITE_SECOND_DISK_RV) \
+		--qemu $(QEMU_RISCV64) --second-disk
+
+MULTI_DISK_IO_RV := $(BUILD_DIR)/tests/user/multi-disk-io-rv
+$(MULTI_DISK_IO_RV): tests/userland/multi_disk_io.c $(MUSL_STAMP)
+	@mkdir -p $(dir $@)
+	$(MUSL_ROOT)/bin/musl-gcc $(MUSL_GCC_FLAGS) -static -O2 -o $@ $<
+.PHONY: test-multi-disk-io-riscv
+test-multi-disk-io-riscv: $(KERNEL_RV) $(MULTI_DISK_IO_RV) build/host/nbd-fault
+	PYTHONDONTWRITEBYTECODE=1 python3 tests/multi-disk-io-riscv.py \
+		--kernel $(KERNEL_RV) --program $(MULTI_DISK_IO_RV) --qemu $(QEMU_RISCV64)

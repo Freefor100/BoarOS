@@ -97,3 +97,9 @@ Linux commit。较长请求的上游 RISC-V usercopy 进展问题留作独立 re
 `child_tid.c` 记录 fork/vfork/thread 的 CHILD_SETTID、CHILD_CLEARTID 与成功/失败 exec；由 `start.S` 提供独立子栈 trampoline，避免 C 函数在换栈后误用父栈。当前 child-TID 阶段完整 manifest 为 556 条。
 
 脚本差分要求 Linux 配置 `CONFIG_BINFMT_SCRIPT=y`；关闭时两侧 ENOEXEC 一致不能证明 shebang 正确。`exec_script.c` 检查参数、环境、嵌套、无换行与错误边界。
+
+本轮 tmpfs 对照内核配置必须同时启用 CONFIG_SHMEM=y 与 CONFIG_TMPFS=y。
+仅启用 TMPFS 会被 Kconfig 依赖裁掉；Linux 可退回 ramfs 接受 tmpfs 挂载名称，
+却忽略配额，不能用它作为 tmpfs 参考。运行前核对生成 .config 与缓存身份。
+新增 hardlink、tmpfs 配额/空洞/映射/生命周期及选项差分；动态容量仍比较来源
+和关系，不要求两个系统的物理内存或负载相等。

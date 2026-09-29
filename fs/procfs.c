@@ -8,6 +8,7 @@
 #include <kernel/page.h>
 #include <kernel/physical_page.h>
 #include <kernel/procfs.h>
+#include <kernel/tmpfs.h>
 #include <kernel/proc_task.h>
 #include <kernel/scheduler.h>
 #include <kernel/task.h>
@@ -585,7 +586,8 @@ static size_t append_hundredths(char *buffer, uint64_t value)
 struct proc_mount_entry {
     struct kernel_vfs_path *path;
     struct kernel_vfs_path *mount_root;
-    uint8_t is_proc;
+    const char *source;
+    uint8_t is_proc, is_tmpfs;
     uint8_t read_only;
 };
 
@@ -653,7 +655,7 @@ static int proc_mounts_snapshot(struct kernel_vfs_node *node,
              it = next_mount(it, top)) count++;
         riscv_interrupt_restore(irq);
         if (!count || count > SIZE_MAX / sizeof(*entries) ||
-            count > SIZE_MAX / (4U * KERNEL_FS_PATH_MAX + 80U))
+            count > SIZE_MAX / (8U * KERNEL_FS_PATH_MAX + 80U))
             return -KERNEL_EOVERFLOW;
         enum kernel_heap_status allocation = kernel_heap_allocate_zeroed(
             heap, count, sizeof(*entries), (void **)&entries);
@@ -680,7 +682,9 @@ static int proc_mounts_snapshot(struct kernel_vfs_node *node,
             }
             entries[captured].path = path;
             entries[captured].mount_root = mount_root;
+            entries[captured].source = it->source_name;
             entries[captured].is_proc = kernel_procfs_is_mount(it);
+            entries[captured].is_tmpfs = kernel_tmpfs_is_mount(it);
             entries[captured].read_only =
                 ((struct kernel_vfs_instance *)it->private_data)->read_only;
             captured++;
@@ -691,7 +695,7 @@ static int proc_mounts_snapshot(struct kernel_vfs_node *node,
         captured = 0U;
         if (attempt == 2U) return result;
     }
-    size_t capacity = captured * (4U * KERNEL_FS_PATH_MAX + 80U);
+    size_t capacity = captured * (8U * KERNEL_FS_PATH_MAX + 80U);
     char *data = 0, *path_text = 0;
     enum kernel_heap_status allocation = kernel_heap_allocate(heap, capacity,
                                                               (void **)&data);
@@ -713,14 +717,16 @@ static int proc_mounts_snapshot(struct kernel_vfs_node *node,
                                         path_text, KERNEL_FS_PATH_MAX);
         if (result == -KERNEL_ENOENT) { result = 0; continue; }
         if (result) goto Finish;
-        const char *source = entries[i].is_proc ? "proc" : "rootfs";
-        const char *kind = entries[i].is_proc ? "proc" : "ext4";
-        size_t needed = strlen(source) + 1U + 4U * strlen(path_text) +
+        const char *source = entries[i].source ? entries[i].source :
+                             entries[i].is_proc ? "proc" :
+                             entries[i].is_tmpfs ? "tmpfs" : "rootfs";
+        const char *kind = entries[i].is_proc ? "proc" :
+                           entries[i].is_tmpfs ? "tmpfs" : "ext4";
+        size_t needed = 4U * strlen(source) + 1U + 4U * strlen(path_text) +
                         1U + strlen(kind) + 9U;
         if (needed > capacity - used) { result = -KERNEL_EOVERFLOW; goto Finish; }
-        size_t part = strlen(source);
-        memcpy(data + used, source, part);
-        used += part;
+        size_t part;
+        used += append_escaped(data + used, source);
         data[used++] = ' ';
         used += append_escaped(data + used, path_text);
         data[used++] = ' ';
@@ -975,10 +981,13 @@ int kernel_procfs_unmount_children(struct kernel_vfs_mount *root)
     while (root->first_child) {
         struct kernel_vfs_mount *leaf = root->first_child;
         while (leaf->first_child) leaf = leaf->first_child;
-        if (!kernel_procfs_is_mount(leaf)) return -KERNEL_ENOTSUP;
-        int result = kernel_vfs_mount_detach(leaf, 0);
+
+        int result = kernel_vfs_mount_prepare_detach(leaf, 0);
         if (result) return result;
-        if (kernel_vfs_unmount(leaf)) __builtin_trap();
+        result = kernel_vfs_mount_detach(leaf, 0);
+        if (result) return result;
+        result = kernel_vfs_unmount(leaf);
+        if (result) { kernel_vfs_disk_defer_cleanup(leaf); return result; }
     }
     return 0;
 }

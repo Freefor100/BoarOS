@@ -58,6 +58,8 @@ struct riscv_root_boot {
     struct kernel_heap heap;
     struct kernel_page_cache page_cache;
     struct riscv_virtio_mmio_block device;
+    struct riscv_virtio_mmio_block extra_devices[DTB_MAX_VIRTIO_MMIO_RANGES - 1U];
+    uint32_t device_count;
     struct kernel_vfs_mount mount;
     struct kernel_exec_image cleanup_image;
     struct kernel_elf64_source *cleanup_executable_source;
@@ -74,6 +76,9 @@ struct riscv_root_boot {
     enum riscv_root_boot_status failure_status;
     enum riscv_root_boot_state state;
 };
+
+struct riscv_virtio_mmio_block *riscv_root_boot_device(
+    struct riscv_root_boot *root, uint32_t index);
 
 /* Scheduler initialization must precede this call. */
 enum riscv_root_boot_status riscv_root_boot_start(

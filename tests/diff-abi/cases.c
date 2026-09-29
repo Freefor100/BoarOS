@@ -210,6 +210,7 @@ void abi_main(const unsigned long *initial_stack)
     partial_cases(); abi_truncate_cases();
     abi_timestamp_cases(); abi_readv_cases();
     abi_link_cases();
+    abi_hardlink_cases();
     abi_signal_wait_cases();
     abi_robust_cases();
     abi_limit_cases();
@@ -222,6 +223,8 @@ void abi_main(const unsigned long *initial_stack)
     abi_script_cases();
     abi_mknod_cases();
     abi_proc_cases();
+    abi_tmpfs_cases();
+    abi_tmpfs_options_cases();
     text("ABI END "); number(records); flush();
     SC0(81); /* Linux sync; unsupported on BoarOS, outside observed cases. */
     CALL(142, 0xfee1dead, 672274793, 0x4321fedc, 0, 0, 0);

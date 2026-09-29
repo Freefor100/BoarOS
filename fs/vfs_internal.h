@@ -5,6 +5,9 @@
 #include <kernel/sync.h>
 #include <stdint.h>
 
+struct kernel_vfs_file;
+struct kernel_memory_object;
+struct kernel_memory_object *kernel_vfs_file_memory(const struct kernel_vfs_file *file);
 struct kernel_page_cache;
 struct kernel_page_cache_entry;
 struct kernel_vfs_file;

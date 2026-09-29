@@ -6,11 +6,14 @@
 struct kernel_heap;
 struct physical_page_allocator;
 struct kernel_memory_object;
+struct kernel_memory_budget { uint64_t limit, used; };
+void kernel_memory_object_set_budget(struct kernel_memory_object *, struct kernel_memory_budget *);
 
 enum kernel_memory_object_status {
     KERNEL_MEMORY_OBJECT_OK = 0,
     KERNEL_MEMORY_OBJECT_NO_MEMORY,
     KERNEL_MEMORY_OBJECT_NOT_FOUND,
+    KERNEL_MEMORY_OBJECT_NO_SPACE,
     KERNEL_MEMORY_OBJECT_STATE,
 };
 
@@ -26,7 +29,8 @@ void kernel_memory_object_release(struct kernel_memory_object **object);
 enum kernel_memory_object_status kernel_memory_object_get_page(
     struct kernel_memory_object *object, uint64_t page_index,
     uint64_t *physical_address, int *created);
-/* Caller already released the failed PTE's page reference. */
+/* Caller already released its failed publication reference. Discard only the
+ * matching page with no PTE/other pin owners; an adopted page is preserved. */
 void kernel_memory_object_discard_new_page(
     struct kernel_memory_object *object, uint64_t page_index,
     uint64_t physical_address);

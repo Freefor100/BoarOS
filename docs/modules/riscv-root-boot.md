@@ -4,7 +4,7 @@
 
 ## 启动路径
 
-最终 Sv39、direct map、buddy 和 scheduler 就绪后，`arch/riscv/root_boot.c` 初始化页支持内核堆并为后续 exec 绑定同一物理分配器和内核根表，按 DTB 物理地址顺序选择首个成功初始化的 VirtIO MMIO version 1 legacy 或 version 2 modern virtio-blk，按设备能力以读写或只读模式挂载 raw whole-disk ext4，并通过公共 executable-open 检查打开只读构建配置指定的 ELF。文件必须是 regular 且至少有一个 execute bit；默认请求使用 `argv[0]="/init"`、`argc=1`、`AT_EXECFN="/init"` 和空环境。
+最终 Sv39、direct map、buddy 和 scheduler 就绪后，`arch/riscv/root_boot.c` 初始化页支持内核堆并为后续 exec 绑定同一物理分配器和内核根表，按 DTB 物理地址顺序初始化并登记所有 VirtIO MMIO version 1 legacy 或 version 2 modern virtio-blk，保留首个成功初始化的设备为根盘，按设备能力以读写或只读模式挂载 raw whole-disk ext4，并通过公共 executable-open 检查打开只读构建配置指定的 ELF。文件必须是 regular 且至少有一个 execute bit；默认请求使用 `argv[0]="/init"`、`argc=1`、`AT_EXECFN="/init"` 和空环境。
 
 VFS 文件成为精确 `read_at` 源，ELF source 一次解析 RISC-V `ET_EXEC`/`ET_DYN` 的 program headers；根启动支持非递归 `PT_INTERP`，将 `PT_LOAD` 登记为专用 source-backed VMA，页面在首次取指或访问时按需物化。随机布局从 DTB `/chosen/rng-seed` 取得可信种子；缺少种子时安全降级为确定性布局并省略 `AT_RANDOM`。根启动路径再创建借用根 mount、cwd 为 `/` 的 fs context 和空文件表，与 MM 一起原子转交 scheduler task。生产系统创建的第一个用户线程组得到 TID/TGID 1；生产 main 在根对象发布后启动页缓存 worker，再启动 timer，因此任务不会在根对象尚未发布时运行。worker 构造失败仍返回启动资源错误，不伪造后台回收成功。
 
@@ -22,7 +22,7 @@ PID 1 可以普通 clone 子进程并通过 wait4 回收。子进程退出时先
 
 Completion 在任务对象与 PID 被释放前快照 TID/TGID。PID 1 自身退出时，尚存子进程会成为 parentless 并由 cleanup task 静默清理；root cleanup task 保存 PID 1 completion，继续排空同轮 exited 队列中被重挂的孤儿 zombie，再检查根资源基线。否则 PID 1 恰好先于孤儿 zombie 被回收时会残留一个任务元数据页。复合清理失败保留准确 owner 阶段，不会提前卸载仍被 OFD/fs context 借用的根 mount；正常结束失败日志区分 ELF source、unmount、page cache、device、heap 与物理页基线。
 
-当前没有用户空间重启或 init supervision，因此 PID 1 正常退出和故障都视为系统终止条件。根启动对象随后卸载 ext4、复位 VirtIO device、归还队列和堆页，并要求物理空闲页精确回到开始根启动前的基线、heap live/current pages 均为零，最后调用 SBI shutdown。
+当前没有用户空间重启或 init supervision，因此 PID 1 正常退出和故障都视为系统终止条件。根启动对象随后卸载 ext4、逆序注销并复位所有 VirtIO block device、归还各自队列和堆页，并要求物理空闲页精确回到开始根启动前的基线、heap live/current pages 均为零，最后调用 SBI shutdown。
 
 根 mount 在 PID 1 及其后代的文件资源回收期间保持存活。当前 `/init` 先通过 Linux RISC-V `openat/read/close` 读取根上的普通文件，覆盖绝对/相对路径、独立 offset、跨页大读取、fault 后 offset 保持、EOF 和错误 errno；随后从真实根盘依次 exec 相对路径 `stage2` 和绝对路径 `/stage3`。三段映像分别验证 `brk` 初值、增长/缩小和 exec 重置；第三段还执行普通 clone/wait，验证精确 break 的父子独立性、shrink 后 heap 访问故障、重新增长零页、父子 MM 写隔离、继承 fd 的 OFD offset 共享、PPID、WNOHANG 与阻塞唤醒、进程组 selector、退出/故障 status、status EFAULT 后已回收，以及孙进程向 PID 1 reparent。PID 1 最终以状态 42 退出。
 
@@ -39,7 +39,7 @@ make test-idle-riscv
 
 fixture 写入真实 ext4 的静态 ELF 以及 userland runner 使用的动态 musl PIE、解释器、额外 DSO 和 TLS；镜像还包含一个 9000 字节确定性数据文件、不可执行数据文件和可执行的非 ELF 脚本。程序在 U-mode 检查初始栈、errno、exec 与父子生命周期后以状态 42 调用 `exit(93)`。runner 要求 PID 1 身份、父子状态、fd/MM 语义、完整资源基线和 SBI 关机均成立。`make test-root-orphan-riscv` 让 PID 1 留下未等待的 zombie 子进程，验证 PID 1 completion 后继续排空退出队列。`test-root-boot-cleanup-riscv` 先让 fs context 创建失败，再在卸载日志时注入真实块写错误；三次清理调用必须保持相同 mount/cache/device owner、停止进一步写入，并最终报告 `CLEANUP`。关键日志错误不会因一次底层故障已消失就恢复为可写。无盘测试仍要求 timer idle 持续工作。
 
-有块设备时，永久 cleanup task 在 root 基线快照前创建；root 启动仍处显式轮询阶段，调度用户前为根 VirtIO 注册 DTB 提供的 PLIC 路由并切换运行期睡眠。退出清理、root finish/unmount 在该任务中执行；卸载前先停止并 join 页缓存 worker、释放其栈/快照/引用，再核对根资源基线，idle 只负责调度与 wfi；无盘启动不创建额外存储清理任务。跨高半区跳转不能继续使用寄存器中保存的旧物理栈指针，DTB 存储探测在独立 noinline 调用中完成。
+有块设备时，永久 cleanup task 在 root 基线快照前创建；root 启动仍处显式轮询阶段，调度用户前为每个 VirtIO block device 注册 DTB 提供的独立 PLIC 路由并切换运行期睡眠。退出清理、root finish/unmount 在该任务中执行；卸载前先停止并 join 页缓存 worker、释放其栈/快照/引用，再核对根资源基线，idle 只负责调度与 wfi；无盘启动不创建额外存储清理任务。跨高半区跳转不能继续使用寄存器中保存的旧物理栈指针，DTB 存储探测在独立 noinline 调用中完成。
 
 ## PID 1 构建配置
 
@@ -56,3 +56,32 @@ NUL、路径/向量/字符串超限在构建期拒绝，最终初始栈仍由公
 `make test-init-config-riscv` 在同一构建目录交替默认/自定义/默认/自定义配置，
 真实 U-mode 验证 ELF 路径、不同 argv[0]、含空格参数、环境及 AT_EXECFN；缺失入口
 必须失败。测试结束恢复默认配置。运行产物在 `build/init-config-run`，可安全重建。
+
+## 块设备登记
+
+根启动拥有设备对象直到 PID 1 完整收尾，每个对象独立持有队列、DMA、IRQ、
+超时和统计。`riscv_root_boot_device(root, index)` 返回启动槽位；有效设备数由
+`device_count` 给出，初始化失败按已取得的 owner 逆序释放，不把已初始化的
+附加盘留在失败路径上。根盘内容无效仍直接失败，不尝试其他磁盘。
+
+块设备号采用 Linux `new_encode_dev(252, index * 16)`，首盘为 `0xfc00`，
+第二盘为 `0xfc10`；index 是 DTB 地址顺序中的成功 block device 序号。
+无分区和热插拔，设备节点的设备号在本次启动内稳定。`kernel_block_lookup()`
+借用根启动持有的设备生命周期；mount 通过 `kernel_block_claim()` 独占设备，
+不同节点别名不能绕过同一设备的 claim。卸载成功后原 owner 必须调用
+`kernel_block_release_claim()`；错误 owner 或重复释放是内部不变量错误。
+有 claim 时注销返回 `EBUSY`，因此真实卸载错误仍保留设备 owner。
+
+编码和 claim 语义依据固定 Linux
+`references/linux/include/linux/kdev_t.h` 与 `references/linux/block/bdev.c`
+（commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`）。BoarOS 不实现 Linux
+分区或同 holder 的嵌套 claim，mount 仅持有一次独占 claim。
+
+`make test-root-multi-block-riscv` 构建 `tests/userland/multi_mount.c` 的写入与
+只读校验两个 musl ELF，在 legacy 和 modern 下各执行两次真实双盘启动。
+写入阶段通过任意名字的 block 节点挂载第二盘，检查设备别名独占 claim、
+裸盘 open 拒绝、独立盘内容、hardlink/nlink、嵌套 tmpfs、跨 mount EXDEV、
+fd/mmap 阻止卸载、卸载重挂和共享映射写回。退出时保留第二盘 mount，要求
+root finish 停止其 worker、同步日志和释放全部设备并精确恢复 heap/page 基线。
+第二次启动把同一第二盘设为设备只读，读回包括 root finish 刷新的最后文件；
+每次结束以 `e2fsck -fn` 检查第二盘。两种 transport 的四次启动均已通过。

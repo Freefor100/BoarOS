@@ -44,6 +44,10 @@ enum kernel_syscall_status syscall_handle_getcwd(
     const struct kernel_syscall_request *request,
     struct kernel_syscall_result *decoded);
 
+enum kernel_syscall_status syscall_handle_linkat(
+    struct kernel_task *caller,
+    const struct kernel_syscall_request *request,
+    struct kernel_syscall_result *decoded);
 enum kernel_syscall_status syscall_handle_renameat(
     struct kernel_task *caller,
     const struct kernel_syscall_request *request,

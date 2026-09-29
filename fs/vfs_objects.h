@@ -30,6 +30,7 @@ struct kernel_vfs_instance {
 struct kernel_vfs_node {
     struct kernel_vfs_node *next;
     struct kernel_page_cache_entry *cache_pages;
+    struct kernel_memory_object *memory;
     struct kernel_file_mapping *mappings;
     struct kernel_record_lock_state record_locks;
     struct kernel_vfs_instance *instance;
@@ -146,6 +147,8 @@ struct kernel_vfs_backend {
         void *buffer,
         size_t size,
         size_t *bytes_read);
+    int (*memory_write)(struct kernel_vfs_node *node, uint64_t offset,
+        const void *buffer, size_t size, size_t *written);
     int (*writeback)(struct kernel_vfs_node *node, uint64_t offset,
         const void *buffer, size_t size, size_t *written);
 };

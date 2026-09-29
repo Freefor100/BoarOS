@@ -827,11 +827,20 @@ static void kernel_main_high(void)
         root_started = 1;
         if (kernel_page_cache_start_worker(&root_boot.page_cache) != 0)
             shutdown_for_root_boot_error(RISCV_ROOT_BOOT_STATUS_RESOURCES);
-        uint32_t source = 0;
-        uint64_t base = (uintptr_t)root_boot.device.mmio - RISCV_KERNEL_MMIO_BASE;
-        for (uint32_t i = 0; i < boot_irq.route_count; i++)
-            if (boot_irq.routes[i].base == base) source = boot_irq.routes[i].source;
-        if (!riscv_virtio_mmio_block_enable_irq(&root_boot.device, source)) __builtin_trap();
+        for (uint32_t disk = 0U; disk < root_boot.device_count; disk++) {
+            struct riscv_virtio_mmio_block *device =
+                riscv_root_boot_device(&root_boot, disk);
+            uint32_t source = 0;
+            uint64_t base = (uintptr_t)device->mmio - RISCV_KERNEL_MMIO_BASE;
+            for (uint32_t i = 0; i < boot_irq.route_count; i++)
+                if (boot_irq.routes[i].base == base) source = boot_irq.routes[i].source;
+            if (!riscv_virtio_mmio_block_enable_irq(device, source)) __builtin_trap();
+            virt_uart_puts("BoarOS: block device=");
+            virt_uart_put_hex(device->block.device_number);
+            virt_uart_puts(" irq=");
+            virt_uart_put_hex(source);
+            virt_uart_puts("\n");
+        }
         virt_uart_puts("BoarOS: root /init started pid=0x1\n");
     } else if (root_status != RISCV_ROOT_BOOT_STATUS_NO_DEVICE) {
         uint32_t cleanup_attempts = 0U;

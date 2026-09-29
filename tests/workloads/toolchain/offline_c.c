@@ -6,11 +6,89 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/wait.h>
+#include <sys/mount.h>
+#include <sys/stat.h>
+#include <sys/vfs.h>
 #include <unistd.h>
 
 static const char *const names[] = {
     "preprocess", "compile", "assemble", "link", "run"
 };
+
+static int tmpfs_work;
+
+static int copy_from(int source_directory, const char *name,
+                      const char *destination_directory)
+{
+    int input = openat(source_directory, name, O_RDONLY);
+    if (input < 0) return -1;
+    char path[256];
+    if (snprintf(path, sizeof(path), "%s/%s", destination_directory, name) >= (int)sizeof(path)) {
+        close(input); errno = ENAMETOOLONG; return -1;
+    }
+    struct stat status;
+    if (fstat(input, &status)) { close(input); return -1; }
+    int output = open(path, O_WRONLY | O_CREAT | O_EXCL, status.st_mode & 0777);
+    if (output < 0) { close(input); return -1; }
+    char buffer[8192];
+    ssize_t n;
+    while ((n = read(input, buffer, sizeof(buffer))) > 0) {
+        ssize_t offset = 0;
+        while (offset < n) {
+            ssize_t written = write(output, buffer + offset, (size_t)(n - offset));
+            if (written <= 0) { close(input); close(output); return -1; }
+            offset += written;
+        }
+    }
+    int failed = n < 0 || fsync(output);
+    if (close(input)) failed = 1;
+    if (close(output)) failed = 1;
+    return failed ? -1 : 0;
+}
+
+static int prepare_tmpfs(void)
+{
+    int source = open("/work", O_RDONLY | O_DIRECTORY);
+    if (source < 0) return -1;
+    if (mount("none", "/work", "tmpfs", 0, "size=67108864,nr_inodes=1024")) {
+        close(source); return -1;
+    }
+    /* The old directory fd owns the fixture inputs while tmpfs hides /work. */
+    int failed = copy_from(source, "program.c", "/work") ||
+                 copy_from(source, "tools.conf", "/work");
+    if (close(source)) failed = 1;
+    struct statfs filesystem;
+    if (statfs("/work", &filesystem) || filesystem.f_type != 0x01021994 ||
+        chdir("/work")) failed = 1;
+    if (!failed) puts("TOOLCHAIN tmpfs work directory active");
+    return failed ? -1 : 0;
+}
+
+static int export_tmpfs(void)
+{
+    const char *const artifacts[] = {"program.i", "program.s", "program.o",
+        "program", "output.txt", "stages.tsv"};
+    int source = open("/work", O_RDONLY | O_DIRECTORY);
+    if (source < 0) return -1;
+    for (size_t i = 0; i < sizeof(artifacts) / sizeof(artifacts[0]); i++) {
+        struct stat status;
+        if (fstatat(source, artifacts[i], &status, 0)) {
+            if (errno == ENOENT) continue;
+            close(source); return -1;
+        }
+        if (copy_from(source, artifacts[i], "/offline-evidence")) {
+            close(source); return -1;
+        }
+    }
+    if (close(source)) return -1;
+    int directory = open("/offline-evidence", O_RDONLY | O_DIRECTORY);
+    if (directory < 0) return -1;
+    int failed = fsync(directory);
+    if (close(directory)) failed = 1;
+    if (chdir("/") || umount("/work")) failed = 1;
+    if (!failed) puts("TOOLCHAIN tmpfs artifacts copied to root evidence; tmpfs is volatile");
+    return failed ? -1 : 0;
+}
 
 static int read_tools(char *compiler, size_t compiler_size,
                       char *assembler, size_t assembler_size)
@@ -107,7 +185,8 @@ static int launch(char *const arguments[], const char *output,
             close(fd);
         }
         char *const environment[] = {
-            "PATH=/usr/bin:/bin", "HOME=/", "TMPDIR=/tmp", "LC_ALL=C", 0
+            "PATH=/usr/bin:/bin", "HOME=/",
+            tmpfs_work ? "TMPDIR=/work" : "TMPDIR=/tmp", "LC_ALL=C", 0
         };
         execve(arguments[0], arguments, environment);
         int error = errno;
@@ -153,6 +232,11 @@ int main(void)
         fprintf(stderr, "TOOLCHAIN invalid /work/tools.conf errno=%d\n", errno);
         return 90;
     }
+    tmpfs_work = access("/work/tmpfs.mode", F_OK) == 0;
+    if (tmpfs_work && prepare_tmpfs()) {
+        fprintf(stderr, "TOOLCHAIN tmpfs setup failed errno=%d\n", errno);
+        return 93;
+    }
     FILE *results = fopen("/work/stages.tsv", "w");
     if (!results) return 91;
     char *preprocess[] = { compiler, "-E", "/work/program.c", "-o",
@@ -186,6 +270,10 @@ int main(void)
         record(results, names[i], kind, code);
     }
     if (fclose(results)) return 92;
+    if (tmpfs_work && export_tmpfs()) {
+        fprintf(stderr, "TOOLCHAIN tmpfs evidence copy failed errno=%d\n", errno);
+        return 94;
+    }
     puts("BoarOS: offline compiler probe finished");
     return 42;
 }

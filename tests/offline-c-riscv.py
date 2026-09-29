@@ -74,7 +74,7 @@ def tree_identity(tree):
     digest = hashlib.sha256()
     for entry in sorted(tree.rglob("*")):
         relative = entry.relative_to(tree).as_posix()
-        if relative.split("/")[0] in ("init", "work", "dev"):
+        if relative.split("/")[0] in ("init", "work", "dev", "offline-evidence"):
             raise ValueError(f"toolchain tree overlaps probe fixture: {relative}")
         digest.update(relative.encode() + b"\0")
         digest.update(f"{entry.lstat().st_mode & 0o7777:o}".encode() + b"\0")
@@ -101,6 +101,9 @@ def fixture(directory, program, args):
     shutil.copy2(SOURCE, tree / "work/program.c")
     (tree / "work/tools.conf").write_text(args.compiler + "\n" +
                                            args.assembler + "\n")
+    if args.tmpfs:
+        (tree / "work/tmpfs.mode").write_text("tmpfs\n")
+        (tree / "offline-evidence").mkdir()
     (tree / "dev").mkdir()
     (tree / "tmp").mkdir(exist_ok=True)
     disk = directory / "fixture.img"
@@ -140,6 +143,9 @@ def boot(args, kernel, disk, output, linux):
     if result.returncode or transcript.count(
             "BoarOS: offline compiler probe finished") != 1:
         raise AssertionError(f"guest did not finish: {output}\n{transcript[-4000:]}")
+    if args.tmpfs and (transcript.count("TOOLCHAIN tmpfs work directory active") != 1 or
+            transcript.count("TOOLCHAIN tmpfs artifacts copied to root evidence; tmpfs is volatile") != 1):
+        raise AssertionError(f"tmpfs setup/evidence copy not confirmed: {output}")
     if not linux and not re.search(
             r"BoarOS: PID 1 exited status=0x2a pages=0x[1-9a-f][0-9a-f]* "
             r"heap-live=0x0; shutting down", transcript):
@@ -216,12 +222,13 @@ def extract(disk, guest, destination):
     return destination.is_file()
 
 
-def evidence(directory, name, disk):
+def evidence(directory, name, disk, tmpfs=False):
     extracted = directory / (name + "-files")
     extracted.mkdir()
     hashes = {}
     for filename in ARTIFACTS:
-        if extract(disk, "/work/" + filename, extracted / filename):
+        guest_directory = "/offline-evidence/" if tmpfs else "/work/"
+        if extract(disk, guest_directory + filename, extracted / filename):
             hashes[filename] = sha256(extracted / filename)
     if "stages.tsv" not in hashes:
         raise AssertionError(f"{name}: no stage record")
@@ -244,6 +251,8 @@ def main():
     parser.add_argument("--toolchain-tree", type=Path)
     parser.add_argument("--compiler", default="/usr/bin/gcc")
     parser.add_argument("--assembler", default="/usr/bin/as")
+    parser.add_argument("--tmpfs", action="store_true",
+                        help="compile in tmpfs /work, then copy volatile results to root evidence")
     parser.add_argument("--expect-first-failure",
                         help="harness diagnostic mode, e.g. preprocess:exec:2")
     parser.add_argument("--qemu", default="qemu-system-riscv64")
@@ -262,7 +271,9 @@ def main():
         "compiler": args.compiler,
         "assembler": args.assembler,
         "qemu": command(args.qemu, "--version").stdout.splitlines()[0],
-        "rebuild": "make test-offline-c-riscv",
+        "work_filesystem": "tmpfs" if args.tmpfs else "ext4",
+        "evidence_origin": "copied from volatile tmpfs" if args.tmpfs else "ext4 work directory",
+        "rebuild": "make test-offline-c-tmpfs-riscv" if args.tmpfs else "make test-offline-c-riscv",
     }
     directory = Path(tempfile.mkdtemp(prefix="offline-c-run.",
                                       dir=ROOT / "build/riscv"))
@@ -275,7 +286,7 @@ def main():
             copy_boot_disk(fixture_disk, disk)
             boot(args, kernel, disk, directory / (name + ".log"), linux)
             replay_and_check(directory, name, disk)
-            observations[name] = evidence(directory, name, disk)
+            observations[name] = evidence(directory, name, disk, args.tmpfs)
         linux_rows, linux_hashes = observations["linux"]
         boaros_rows, boaros_hashes = observations["boaros"]
         if linux_rows != boaros_rows:

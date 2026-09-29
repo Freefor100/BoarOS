@@ -4,7 +4,7 @@
 
 ## 通用边界
 
-`include/kernel/block.h` 定义同步块设备（支持读与可选写），`include/kernel/vfs.h` 定义 mount/file 对象以及根挂载、open/create、pread/pwrite、ftruncate、mkdir、unlink、rmdir、close、unmount、`kernel_vfs_fstat()` 与 `kernel_vfs_mount_is_readonly()` 查询。VFS 对外返回负 Linux errno；lwext4 的结构、全局设备名和正值 errno 不泄漏到调用者。ext4 后端支持独立实例，lwext4 共用 heap binding 按实例引用计数维护；用户态仍由挂载入口决定开放范围；进程 fd/open-file-description 位于独立的[文件资源层](kernel-files.md)，所有任务共享一棵挂载树，没有 mount namespace 隔离；命名空间修改使用可睡眠 mutex，inode、OFD 与后端各自同步。
+`include/kernel/block.h` 定义同步块设备（支持读与可选写），`include/kernel/vfs.h` 定义 mount/file 对象以及根挂载、open/create、pread/pwrite、ftruncate、mkdir、unlink、rmdir、close、unmount、`kernel_vfs_fstat()` 与 `kernel_vfs_mount_is_readonly()` 查询。VFS 对外返回负 Linux errno；lwext4 的结构、全局设备名和正值 errno 不泄漏到调用者。当前有独立的 ext4、tmpfs 和 proc 实例；lwext4 共用 heap binding 按实例引用计数维护，每实例携带自己的锁上下文；进程 fd/open-file-description 位于独立的[文件资源层](kernel-files.md)，所有任务共享一棵挂载树，没有 mount namespace 隔离；命名空间修改使用可睡眠 mutex，inode、OFD 与后端各自同步。
 
 `fs/vfs_objects.h` 定义通用实例、inode 节点、路径与后端操作表；
 `fs/vfs.c` 管理路径身份、引用、执行/写租约、记录锁、缓存及映射登记。
@@ -34,9 +34,9 @@
 完成后端事务；记录锁、OFD 和页缓存仍按各自 owner 同步。ext4 inode 仍是
 32 位，但通用 inode 标识已扩展至 64 位；ext4 适配层拒绝越界标识。
 RISC-V VFS 测试的内存后端覆盖内部边界；用户态 `mount(2)`/`umount2(2)`
-已接入 proc。普通挂载、`MS_RDONLY`、`MS_SILENT`、同点覆盖、cwd 忙引用与
+已接入 proc、tmpfs 和块设备节点识别的 ext4。普通挂载、`MS_RDONLY`、`MS_SILENT`、同点覆盖、cwd 忙引用与
 卸载恢复均经真实 U-mode 差分；bind/remount/传播和 lazy detach 返回不支持。
-卸载目前只开放无持久化提交的 proc 后端，因而摘树之后的销毁不会发生 I/O 失败。
+卸载先检查忙引用并标记 quiescing，阻止新操作，再停 worker、完成在途 I/O 和持久化交接。失败时挂载树、设备 claim 和错误 owner 保持可达；可重试卸载。成功后才摘树、释放最后 root handle 和实例，最终释放不再产生 I/O。
 
 `kernel_vfs_mount_root()` 根据传入块设备是否提供 `write` 回调决定只读还是读写挂载。读写 journal 挂载先 replay、校验 orphan 记录、启动日志并回收遗留 orphan，完成后才发布根路径。只读介质不能完成恢复时明确拒绝；未知必需特性、损坏日志或元数据也不能作为干净镜像继续访问。
 
@@ -59,7 +59,7 @@ VFS 以文件系统实例与后端 inode 标识为活节点身份，普通文件
 
 活 node 还嵌入记录锁区间树与等待队列，因此独立 open 必须在同一 inode 上冲突；unlink 后仍打开的旧 inode 保持原锁身份，同名重建使用新 inode 和新锁状态。末节点释放要求树与等待队列都为空；锁 owner、close/退出释放与阻塞 pin 契约见[文件资源模块](kernel-files.md)。该状态属于单 hart 临界区，不代表已经具备跨核并发锁。
 
-根启动建立一个挂载共享的 4 KiB 页缓存，键为 `(node, page_index)`：开放寻址哈希提供平均常数时间查找，双向 LRU 维护回收次序。缓存项持有 node 引用和一份物理页引用；命中时再给调用者一份临时引用，因此 `read`、不同 fd 与文件私有/共享映射可以安全引用同一页。共享 PTE 另持物理引用；MM 拥有的别名记录由缓存项反向索引借用，含别名的缓存项不能失效或回收。
+每个 ext4 实例建立独立的 4 KiB 页缓存，键为 `(node, page_index)`：开放寻址哈希提供平均常数时间查找，双向 LRU 维护回收次序。缓存项持有 node 引用和一份物理页引用；命中时再给调用者一份临时引用，因此 `read`、不同 fd 与文件私有/共享映射可以安全引用同一页。共享 PTE 另持物理引用；MM 拥有的别名记录由缓存项反向索引借用，含别名的缓存项不能失效或回收。
 
 普通写把已复制的字节写入同一缓存页并更新 node 的逻辑大小；不同 fd、VFS pread、ELF 读源与映射缺页立即看到该内容。跨 EOF 的普通写先清零旧尾页中将要暴露的空隙；显式扩展亦清零新暴露字节，并重新保护共享别名，防止页仍可写时漏记脏。缓存项按 inode 另建双向链表，写回和显式失效只遍历该 inode 的页面，成本为 O(目标 inode 缓存页数)；按范围 `msync` 只提交目标文件页。每项保留脏范围、修改代次与 writeback 状态；写回前重新保护本页共享别名，再固定页面，只有完整提交且代次未变才清脏。失败保留缓存页/node owner，并记录 inode 的错误序列。lwext4 非 journal 写入/截断用操作范围固定本次修改的缓冲，建立完整的分配所有权后才提交该集合；不会全量 drain 历史 dirty list。底层最后引用的 flush 错误显式返回，失败缓冲仍在 mount dirty list。最后一个 fd 关闭不释放仍有脏页的 inode。
 
@@ -67,7 +67,7 @@ VFS 以文件系统实例与后端 inode 标识为活节点身份，普通文件
 
 缓存索引失效本身不撤销用户 PTE。向下截断另通过稳定 node–MM 登记通知相关地址空间，撤销越过新 EOF 的整页（含 private COW 与 PROT_NONE），并按驻留来源处理非对齐尾页；普通写直接修改共享缓存，不撤销 private COW 页面。VMA 保留，后续访问重新缺页并检查 live inode size。实现与单 hart 同步边界见本文末尾及[MM 模块](kernel-mm.md)。
 
-miss 路径先分配并清零页，再通过 node 的无 offset 副作用 `pread` 填充，有效字节数按 node 的逻辑大小计算，尚未写回的稀疏扩展区从清零页读取。读取整个越过 EOF 的页返回 `OUT_OF_RANGE`，尾页剩余字节保持为零。物理页分配器只有一个压力回收槽，当前由该缓存注册；分配首次耗尽时从 LRU 尾部仅回收引用数为 1 的未固定干净页，安全的普通任务可等待后台一轮后重试一次。映射/请求固定页不驱逐；lwext4、堆与 IRQ 不等待后台写回，防止重入共享 handle、后端锁和 bcache 分配。阈值 worker 的生命周期见下文。
+miss 路径先分配并清零页，再通过 node 的无 offset 副作用 `pread` 填充，有效字节数按 node 的逻辑大小计算，尚未写回的稀疏扩展区从清零页读取。读取整个越过 EOF 的页返回 `OUT_OF_RANGE`，尾页剩余字节保持为零。物理页分配器的压力入口由多缓存共同 owner 注册，按实例轮转；分配首次耗尽时从 LRU 尾部仅回收引用数为 1 的未固定干净页，安全的普通任务可等待后台一轮后重试一次。映射/请求固定页不驱逐；lwext4、堆与 IRQ 不等待后台写回，防止重入共享 handle、后端锁和 bcache 分配。阈值 worker 的生命周期见下文。
 
 缓存销毁和 mount 卸载有严格顺序：先释放所有进程 MM 和临时读者，停止并 join worker，再写回并 purge 该 mount 的缓存项、关闭最后的 node，之后才允许 lwext4 unmount 与设备 flush；缓存最后注销 reclaimer 并释放哈希表。物理页和堆对象的合法释放完成即返回，分配器不变量错误进入 fatal；只有真实 ext4/block I/O 清理错误保留 mount owner。
 
@@ -95,7 +95,7 @@ miss 路径先分配并清零页，再通过 node 的无 offset 副作用 `pread
 目录操作中，`kernel_vfs_mkdir` 调用 `ext4_dir_mk`；`kernel_vfs_unlink` 实现了真正的 Linux `unlink`-but-open 语义：
 - `kernel_vfs_unlink` 在需要时先从挂载的 orphan 记录池预留一个回收记录，再调用 `ext4_funlink_dentry` 从父目录中立即移除目标目录项；后续对原路径的 `open` 立即返回 `-ENOENT`，并在同名路径重新创建时分配独立全新 inode。没有现存 node 的文件也使用这份预留记录，因而 orphan 回收失败时由 mount 单独持有。
 - 若目标文件当前仍处于打开状态（`node->open_files > 0`），VFS 标记 `node->unlinked = 1`，旧 open 描述符（包括只读/读写 OFD 以及正在运行的源映射 ELF 可执行文件）保留底层 inode 数据与有效物理块，继续正常执行 `read/write/fstat` 与缺页加载（demand fault）；
-- 只有当最后一个打开描述符与执行租约释放（`node->open_files == 0 && node->exec_users == 0`）时，VFS 才通过专有的 `kernel_vfs_try_release_orphan` 驱动物理存储释放。该过程先持有临时节点引用并安全使页缓存失效，再在扁平调用栈上调用 `ext4_orphan_free` 截断释放底层 inode，最后标记 `node->orphan_freed = 1`。通用的 `kernel_vfs_node_release` 仅负责内存节点对象的生命周期，绝不隐式或嵌套调用 `ext4_orphan_free`，避免双重释放与页缓存回收深度嵌套额外消耗任务栈；若底层释放失败，节点转移至 `adapter->cleanup_nodes`，由 mount 保留唯一重试 owner，绝不重新指向 file。若文件在 unlink 时没有现存 node，则使用预留记录直接调用 orphan free；失败后记录留在 mount 链，路径仍保持已删除。
+- 只有当最后一个打开描述符与执行租约释放（`node->open_files == 0 && node->exec_users == 0`）时，VFS 才通过专有的 `kernel_vfs_try_release_orphan` 驱动物理存储释放。该过程先持有临时节点引用并安全使页缓存失效，再在扁平调用栈上调用 `ext4_orphan_free` 截断释放底层 inode，最后标记 `node->retired = 1`。通用的 `kernel_vfs_node_release` 仅负责内存节点对象的生命周期，绝不隐式或嵌套调用 `ext4_orphan_free`，避免双重释放与页缓存回收深度嵌套额外消耗任务栈；若底层释放失败，节点转移至 `adapter->cleanup_nodes`，由 mount 保留唯一重试 owner，绝不重新指向 file。若文件在 unlink 时没有现存 node，则使用预留记录直接调用 orphan free；失败后记录留在 mount 链，路径仍保持已删除。
 由于 lwext4 的 `ext4_dir_rm` 会递归删除非空目录，`kernel_vfs_rmdir` 通过 `ext4_fdir_unlink_dentry` 只摘目标目录项；后端 `ext4_dir_check_empty` 校验目录记录和 checksum、跳过 `.`/`..` 并拒绝非空目录。被持有的目录 inode 延至最后引用释放才回收；同名重建得到不同 inode，旧路径对象仍可查询零链接状态。目录项 checksum 在设置 inode 字段后计算，卸载后的 `e2fsck -fn` 验证磁盘结构。
 只读挂载下，所有上述修改操作直接返回 `-EROFS`。
 unmount 在仍有 open file 或路径引用时返回 `-EBUSY`。末节点 `ext4_fclose` 失败把 node 转移到 mount cleanup 链，卸载重试同一个 handle；测试注入路径末引用和重复 inode 合并两种 close 失败并确认都被实际重试。非法引用或释放顺序触发 fatal，合法 heap/page 释放不返回可重试状态。
@@ -177,20 +177,32 @@ make test-root-init-riscv
 
 ## 后台写回与水位回收
 
-每个当前页缓存实例拥有一个 joinable worker；worker 借用 cache/record，调用者必须保持它们有效直到 stop/join 返回。生产根盘启动后创建，根盘收尾在卸载前停止并回收。空闲低/高水位为受管页 2%/4%，脏页启动/停止为 10%/5%，小配置至少一页且阈值严格有序。没有周期清脏。分配器和持锁路径只发布请求，低水位先回收无别名/额外引用的干净页，再写回合格脏页；仅脏阈值触发则保留清洁缓存。
+每个当前页缓存实例拥有一个 joinable worker；worker 借用 cache/record，调用者必须保持它们有效直到 stop/join 返回。根盘运行期启动、用户磁盘挂载时创建，所属实例卸载前停止并回收。空闲低/高水位为受管页 2%/4%，脏页启动/停止为 10%/5%，小配置至少一页且阈值严格有序。没有周期清脏。分配器和持锁路径只发布请求，低水位先回收无别名/额外引用的干净页，再写回合格脏页；仅脏阈值触发则保留清洁缓存。
 
 每批最多扫描 64 个哈希槽并让出 CPU；写回跨睡眠固定 entry 和 inode，保存槽游标而不保存可能失效的 LRU 指针。每轮代次防止扩容或重新变脏导致重复处理，无进展即等待新事件。启动持有专用 4 KiB 写回快照，后端 metadata 仍可能 ENOMEM，不是完整应急池。映射重新设保护与 generation 协议保持不变，旧完成不能清除新修改。写回错误留在 inode/mount，当前失败页在成功前不计入 MemAvailable；同一轮继续处理其他对象。后台完成不替代 fsync/fdatasync 的错误观察与 flush。
 
 统计入口同时记录 worker 扫描、写回、失败、批次和实际释放量；内存快照单次 O(驻留页数)，分配通知为 O(1)。`test-io-sleep-riscv` 在 4 MiB 测试池上触发默认比例，覆盖单次 EIO 后继续进展、错误观察、再次修改仍排除失败页、2% 到 4% 回收、固定页不被驱逐、启动 OOM、暂扣在途写回时 stop/join 等待且不继续提交、退出资源基线；共享映射睡眠期间修改、孤儿关闭和设备延迟使用同一写回协议的既有聚焦测试。测试边界为单 hart，不推出 SMP 或实板持久性。
 
-## 独立 ext4 后端与卸载交接
+## 硬链接与第二磁盘
 
-每个实例生成自己的 lwext4 设备名与内部路径，携带独立的锁回调上下文、
-页缓存和错误 owner。共享 heap 按引用计数绑定，生成配置容纳八实例，挂载槽
-在可睡眠 I/O 之前预留。内部硬链接接口固定源 inode 与目标父 inode，在同一
-日志事务提交目录项、nlink 和时间；最后链接删除才进入 orphan 生命周期。
+RV64 linkat 由 files 层固定源 inode/OFD，VFS 在目标父目录锁下提交后端操作；
+flags 0、AT_SYMLINK_FOLLOW、AT_EMPTY_PATH 不重新解析 fd 的旧名字。目标已存在、
+跨挂载、目录源、只读和零链接边界按固定 Linux 差分覆盖。不同名字共享 inode、
+页与记录锁，但保留独立路径身份及独立打开的 OFD。unlink/rename 替换只在最后
+链接消失后进入 orphan 生命周期。ext4 在同一日志事务更新目录项、nlink 和时间；
+非 journal 修改仍明确不支持，不缩减原恢复契约。
 
-prepare_unmount 在附着 root 仍可到达时停止 worker、清缓存并完成屏障，失败
-保留树和设备 claim，成功后的最终销毁不再发 I/O。test-vfs-riscv 覆盖最终屏障
-失败重试；test-files-partial-write-riscv 保留原错误契约。test-lwext4-instances-host
-在 1 KiB/4 KiB 文件系统验证独立实例，rename/recovery host 入口覆盖日志矩阵。
+DTB 枚举的每块设备独立维护队列、IRQ、DMA 和超时。设备登记、文件系统实例、
+挂载树节点分别拥有生命周期；mknodat 块节点仅用于 stat、命名和 mount 的 st_rdev
+识别，裸盘 open 返回不支持。同一设备重复独占挂载为 EBUSY。lwext4 注册名及内部
+路径按实例生成，生成配置容纳八实例；root 单盘入口仍可使用。
+
+`fs/disk_mount.c` 拥有动态 mount/cache/source 名称。构造中的实例不进入可清理
+状态；真正 I/O 清理失败才移交待清理注册表。关机重试逐个认领 owner，不跨睡眠
+借用链表 next，不在同轮反复重试同一失败。没有 I/O owner 的分配失败立即回滚。
+proc mounts 保留用户给出的磁盘来源名，并正确标识 tmpfs。
+
+全局缓存快照 O(总项数)，压力通知和脏阈值判断 O(实例数)。水位仍以全局受管页
+计算，只扣一次低水位预算。安全分配失败至多等待共同一轮的首次实际释放，或所有
+参与 worker 完成，不逐盘串行等待。测试入口包括 test-io-sleep-riscv 的两个非空
+缓存、test-root-multi-block-riscv 的真实双盘与重启，以及 test-lwext4-instances-host。

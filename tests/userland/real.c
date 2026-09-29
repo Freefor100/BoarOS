@@ -35,6 +35,7 @@
 #include "namespace.h"
 #include "metadata.h"
 #include "shared_mapping.h"
+#include "tmpfs.h"
 #include "shared_futex.h"
 
 __attribute__((section(".rodata.unlink_test_far"), aligned(4096)))
@@ -2578,6 +2579,13 @@ int main(int argc, char **argv)
         return 9;
     }
     close(fd);
+
+    int tmpfs_result = check_tmpfs_shm();
+    if (tmpfs_result != 0) {
+        fprintf(stderr, "tmpfs shm failed: stage=%d errno=%d\n", tmpfs_result, errno);
+        return 124;
+    }
+    puts("BoarOS: real userland tmpfs shm checks ok");
 
     int shared_mapping_result = check_shared_anonymous_mapping();
     if (shared_mapping_result != 0) {

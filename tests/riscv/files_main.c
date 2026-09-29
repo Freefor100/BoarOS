@@ -1,4 +1,3 @@
-#include "../../fs/ext4_backend.h"
 #include <arch/riscv/mm.h>
 #include <arch/riscv/sbi.h>
 #include <arch/riscv/sv39.h>
@@ -17,11 +16,15 @@
 #include <kernel/physical_page.h>
 #include <kernel/uaccess.h>
 #include <kernel/vfs.h>
+#include <kernel/tmpfs.h>
+#include <kernel/memory_object.h>
 
 #include "../../fs/files/private.h"
 #include "../../fs/open_file_internal.h"
+#include "../../fs/vfs_internal.h"
 #ifdef FILES_PARTIAL_WRITE_TEST
 #include "../../fs/vfs_internal.h"
+#include "../../fs/ext4_backend.h"
 
 #include <ext4.h>
 #include <ext4_errno.h>
@@ -3003,6 +3006,92 @@ static void run_path_identity_test(struct kernel_vfs_mount *mount,
     }
 }
 
+static struct kernel_block_device tmpfs_disk_original;
+static unsigned tmpfs_disk_requests;
+static enum kernel_block_status tmpfs_count_read(void *context, uint64_t offset,
+    void *buffer, size_t size)
+{
+    tmpfs_disk_requests++;
+    return tmpfs_disk_original.read(context, offset, buffer, size);
+}
+static enum kernel_block_status tmpfs_count_write(void *context, uint64_t offset,
+    const void *buffer, size_t size)
+{
+    tmpfs_disk_requests++;
+    return tmpfs_disk_original.write(context, offset, buffer, size);
+}
+static enum kernel_block_status tmpfs_count_flush(void *context)
+{
+    tmpfs_disk_requests++;
+    return tmpfs_disk_original.flush(context);
+}
+
+static void run_tmpfs_fault_rollback(struct kernel_heap *heap, struct kernel_mm *mm,
+                                   struct physical_page_allocator *allocator)
+{
+    /* 每种分配器逐个失败，直到一次完整发布；只检查页面 owner 与可见映射。 */
+    for (unsigned shared = 0; shared < 2; shared++) {
+        for (unsigned physical = 0; physical < 2; physical++) {
+          for (unsigned existing = 0; existing < 2; existing++) {
+            for (unsigned ordinal = 1; ; ordinal++) {
+                if (ordinal > 32) fail_files(550U, 0, ordinal);
+                struct kernel_vfs_mount *mount = 0;
+                struct kernel_open_file_description *file = 0, *pin;
+                uint64_t address, baseline = allocator->shared_anon_pages;
+                int result = 0;
+                if (kernel_tmpfs_create(heap, 0, "size=4096", &mount) ||
+                    kernel_open_file_create_mode(heap, mount, "/fault", 0600,
+                        &file, &result) != KERNEL_OPEN_FILE_STATUS_OK ||
+                    kernel_vfs_ftruncate(&file->file, BOAROS_PAGE_SIZE) ||
+                    kernel_open_file_acquire(file) != KERNEL_OPEN_FILE_STATUS_OK)
+                    fail_files(551U, 0, result);
+                file->open_flags = 2U;
+                if (existing) {
+                    uint64_t page;
+                    size_t valid;
+                    if (kernel_open_file_get_page(file, 0, &page, &valid) != KERNEL_PAGE_CACHE_STATUS_OK ||
+                        physical_page_release(allocator, page) != PHYSICAL_PAGE_STATUS_OK)
+                        fail_files(556U, 0, -1);
+                }
+                pin = file;
+                enum kernel_mm_status mapped = kernel_mm_mmap_file_private(mm, &pin, TEST_MMAP_FIRST,
+                        BOAROS_PAGE_SIZE, 0, KERNEL_MM_READ | KERNEL_MM_WRITE,
+                        KERNEL_MM_MAP_FIXED_NOREPLACE | (shared ? KERNEL_MM_MAP_SHARED : 0),
+                        &address);
+                if (mapped != KERNEL_MM_STATUS_OK) fail_files(552U, 0, mapped);
+                if (physical) fail_physical_allocation = ordinal;
+                else fail_metadata_allocation = ordinal;
+                enum kernel_mm_status status = kernel_mm_resolve_user_fault(mm, address, KERNEL_MM_WRITE);
+                fail_physical_allocation = fail_metadata_allocation = 0;
+                struct kernel_memory_object *object = kernel_vfs_file_memory(&file->file);
+                if (status != KERNEL_MM_STATUS_OK) {
+                    struct kernel_mm_mapping mapping;
+                    if (status != KERNEL_MM_STATUS_NO_MEMORY)
+                        fail_files(553U, KERNEL_MM_STATUS_NO_MEMORY, status);
+                    if (kernel_memory_object_resident_pages(object) != existing ||
+                        allocator->shared_anon_pages != baseline + existing ||
+                        kernel_mm_lookup(mm, address, &mapping) != KERNEL_MM_STATUS_NOT_MAPPED)
+                        fail_files(557U, existing, kernel_memory_object_resident_pages(object));
+                    /* 重试也验证失败页返还了单页 quota。 */
+                    if (kernel_mm_resolve_user_fault(mm, address, KERNEL_MM_WRITE) != KERNEL_MM_STATUS_OK)
+                        fail_files(554U, 0, ordinal);
+                }
+                uint64_t observed = kernel_vfs_error_sequence(&file->file);
+                if (kernel_vfs_sync(&file->file, 0, &observed) ||
+                    kernel_vfs_sync(&file->file, 1, &observed))
+                    fail_files(558U, 0, -1);
+                if (kernel_memory_object_resident_pages(object) != 1 ||
+                    kernel_mm_munmap(mm, address, BOAROS_PAGE_SIZE) != KERNEL_MM_STATUS_OK ||
+                    kernel_open_file_release(&file) != KERNEL_OPEN_FILE_STATUS_OK ||
+                    kernel_vfs_unmount(mount) || allocator->shared_anon_pages != baseline)
+                    fail_files(555U, 0, -1);
+                if (status == KERNEL_MM_STATUS_OK) break;
+            }
+          }
+        }
+    }
+}
+
 static void run_files_test(const void *dtb)
 {
     struct dtb_boot_info info;
@@ -3083,6 +3172,16 @@ static void run_files_test(const void *dtb)
         fail_files(4U, 0, -1);
     }
     use_test_satp = 1;
+    tmpfs_disk_original = device.block;
+    tmpfs_disk_requests = 0;
+    device.block.read = tmpfs_count_read;
+    device.block.write = tmpfs_count_write;
+    device.block.flush = tmpfs_count_flush;
+    run_tmpfs_fault_rollback(&heap, &mm, &allocator);
+    device.block.read = tmpfs_disk_original.read;
+    device.block.write = tmpfs_disk_original.write;
+    device.block.flush = tmpfs_disk_original.flush;
+    if (tmpfs_disk_requests) fail_files(559U, 0, tmpfs_disk_requests);
     run_path_identity_test(&mount, &heap);
 
     run_metadata_readonly_operations(&files, &fs, &mm);

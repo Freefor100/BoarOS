@@ -1021,6 +1021,16 @@ static unsigned long memory_object_cases(struct kernel_heap *heap,
     kernel_memory_object_truncate(object, 0);
     if (kernel_memory_object_find_page(object, 1, &found) != KERNEL_MEMORY_OBJECT_NOT_FOUND ||
         allocator->shared_anon_pages != initial) return 46;
+    if (kernel_memory_object_get_page(object, 2, &address, &created) != KERNEL_MEMORY_OBJECT_OK ||
+        !created || kernel_memory_object_find_page(object, 2, &found) != KERNEL_MEMORY_OBJECT_OK ||
+        physical_page_release(allocator, address) != PHYSICAL_PAGE_STATUS_OK) return 47;
+    /* 别的映射仍持有该页时，失败创建者不得撤销对象 owner。 */
+    kernel_memory_object_discard_new_page(object, 2, address);
+    if (kernel_memory_object_resident_pages(object) != 1 ||
+        physical_page_release(allocator, found) != PHYSICAL_PAGE_STATUS_OK) return 48;
+    kernel_memory_object_discard_new_page(object, 2, address);
+    if (kernel_memory_object_resident_pages(object) != 0 ||
+        allocator->shared_anon_pages != initial) return 49;
     kernel_memory_object_release(&object);
     return 0;
 }

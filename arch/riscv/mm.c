@@ -35,10 +35,17 @@ struct riscv_kernel_mm_file_source {
     int draining;
 };
 
-struct fault_page_pin { struct physical_page_allocator *allocator; uint64_t address; };
+struct fault_page_pin {
+    struct physical_page_allocator *allocator;
+    struct kernel_open_file_description *file;
+    uint64_t address, index;
+    int created;
+};
 static void release_fault_page(struct fault_page_pin *pin)
 {
     if (physical_page_release(pin->allocator, pin->address) != PHYSICAL_PAGE_STATUS_OK) __builtin_trap();
+    if (pin->created)
+        kernel_open_file_discard_new_page(pin->file, pin->index, pin->address);
 }
 
 static void unpin_fault_source(struct riscv_kernel_mm_file_source **source)
@@ -2493,7 +2500,8 @@ static enum kernel_mm_status map_shared_file_page(
     size_t valid_bytes;
     enum kernel_page_cache_status cache_status;
     enum riscv_sv39_status sv39_status;
-    uint32_t initial = vma->permissions & ~KERNEL_MM_WRITE;
+    int memory_backed = kernel_open_file_memory_backed(file);
+    uint32_t initial = memory_backed ? vma->permissions : vma->permissions & ~KERNEL_MM_WRITE;
 
     cache_status = kernel_open_file_get_page(file, file_page_index,
                                             &physical_address, &valid_bytes);
@@ -2510,6 +2518,11 @@ static enum kernel_mm_status map_shared_file_page(
     if (sv39_status != RISCV_SV39_STATUS_OK)
         return discard_file_page(&record->space, physical_address,
                                  map_file_page_status(sv39_status));
+    if (memory_backed) {
+        if (access == KERNEL_MM_WRITE)
+            kernel_open_file_memory_modified(file);
+        return KERNEL_MM_STATUS_OK;
+    }
     cache_status = kernel_open_file_alias_attach(file, file_page_index,
         physical_address, &resident->alias, record, page_address,
         rearm_shared_file_alias);
@@ -2794,9 +2807,13 @@ static enum kernel_mm_status resolve_user_fault_once(
             if (vma.kind == KERNEL_VMA_KIND_FILE_SHARED) {
                 struct riscv_file_resident *page = find_file_resident(
                     record, virtual_address & ~BOAROS_PAGE_MASK);
-                if (page == 0 || page->alias.previous == 0)
-                    __builtin_trap();
-                kernel_page_cache_alias_mark_dirty(&page->alias);
+                if (page == 0) __builtin_trap();
+                if (kernel_open_file_memory_backed(vma.backing)) {
+                    kernel_open_file_memory_modified(vma.backing);
+                } else {
+                    if (!page->alias.previous) __builtin_trap();
+                    kernel_page_cache_alias_mark_dirty(&page->alias);
+                }
                 sv39_status = riscv_sv39_user_protect_owned_page(
                     &record->space, page->address,
                     sv39_permissions_from_mm(vma.permissions));
@@ -2875,11 +2892,18 @@ static enum kernel_mm_status resolve_user_fault_once(
         /* Disk I/O owns the source and inode, but no MM mutation lock. */
         uint64_t prefetched;
         size_t valid;
-        enum kernel_page_cache_status loaded = kernel_open_file_get_page(vma.backing,
-            file_page_offset >> BOAROS_PAGE_SHIFT, &prefetched, &valid);
+        int created = 0;
+        enum kernel_page_cache_status loaded = kernel_open_file_memory_backed(vma.backing)
+            ? kernel_open_file_get_page_for_fault(vma.backing,
+                file_page_offset >> BOAROS_PAGE_SHIFT, &prefetched, &valid, &created)
+            : kernel_open_file_get_page(vma.backing,
+                file_page_offset >> BOAROS_PAGE_SHIFT, &prefetched, &valid);
         if (loaded != KERNEL_PAGE_CACHE_STATUS_OK)
             return loaded == KERNEL_PAGE_CACHE_STATUS_NO_MEMORY ? KERNEL_MM_STATUS_NO_MEMORY : KERNEL_MM_STATUS_BUS_FAULT;
-        struct fault_page_pin pin __attribute__((cleanup(release_fault_page))) = {mm->allocator, prefetched};
+        struct fault_page_pin pin __attribute__((cleanup(release_fault_page))) = {
+            .allocator = mm->allocator, .file = vma.backing, .address = prefetched,
+            .index = file_page_offset >> BOAROS_PAGE_SHIFT, .created = created,
+        };
         if (version != kernel_vma_set_generation(record->vmas) ||
             riscv_sv39_user_lookup(&record->space, page_address, &mapping) != RISCV_SV39_STATUS_NOT_MAPPED) {
             *retry = 1;
@@ -2918,6 +2942,7 @@ static enum kernel_mm_status resolve_user_fault_once(
             resident->private = vma.kind == KERNEL_VMA_KIND_FILE_PRIVATE &&
                                 access == KERNEL_MM_WRITE;
             publish_file_resident(record, resident);
+            pin.created = 0;
         } else {
             if (resident->alias.previous != 0)
                 kernel_page_cache_alias_detach(&resident->alias);

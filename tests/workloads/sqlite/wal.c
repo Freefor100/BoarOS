@@ -5,6 +5,15 @@
 #include <string.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#ifdef SQLITE_SECOND_DISK
+#include <errno.h>
+#include <sys/mount.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
+#define DATABASE_PATH "/second/boaros.db"
+#else
+#define DATABASE_PATH "/boaros.db"
+#endif
 
 static void check(sqlite3 *db, int rc, const char *step)
 {
@@ -23,7 +32,7 @@ static void execute(sqlite3 *db, const char *sql)
 static sqlite3 *open_database(void)
 {
     sqlite3 *db = 0;
-    int rc = sqlite3_open_v2("/boaros.db", &db,
+    int rc = sqlite3_open_v2(DATABASE_PATH, &db,
         SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, 0);
     check(db, rc, "open");
     sqlite3_busy_timeout(db, 0);
@@ -86,6 +95,20 @@ static int has_items(sqlite3 *db)
 
 int main(int argc, char **argv)
 {
+#ifdef SQLITE_SECOND_DISK
+    if (argc == 1) {
+        struct stat st, root;
+        const char *device = "/dev/vdb";
+        if (mkdir("/second", 0755) && errno != EEXIST) return 1;
+        if (stat("/", &root)) return 1;
+        if (!stat(device, &st)) {
+            if (st.st_rdev == root.st_dev) device = "/dev/vda";
+        } else if (mknod(device, S_IFBLK | 0600, makedev(252, 16))) return 1;
+        if (mount(device, "/second", "ext4", 0, 0)) {
+            perror("SQLite second disk mount"); return 1;
+        }
+    }
+#endif
     if (argc == 4 && !strcmp(argv[1], "competitor")) {
         competitor(atoi(argv[2]), atoi(argv[3]));
     }
