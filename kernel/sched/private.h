@@ -12,6 +12,8 @@
 #include <kernel/stack.h>
 #include <kernel/pid.h>
 #include <kernel/scheduler.h>
+#include <kernel/sched_policy.h>
+#include <kernel/sched_runqueue.h>
 #include <kernel/signal.h>
 #include <kernel/task.h>
 #include <kernel/sync.h>
@@ -104,6 +106,8 @@ struct kernel_task {
     uintptr_t stack_high;
     struct kernel_task *next;
     struct kernel_task *all_next;
+    struct kernel_sched_policy scheduling;
+    struct kernel_sched_node ready_node;
     unsigned accounted;
     struct kernel_thread_join *join;
     struct kernel_task *parent;
@@ -203,8 +207,9 @@ struct kernel_scheduler {
     struct kernel_task *current;
     struct kernel_task *cleanup_task;
     struct kernel_wait_queue cleanup_queue;
-    struct kernel_task *ready_head;
-    struct kernel_task *ready_tail;
+    struct kernel_sched_runqueue runqueue;
+    struct kernel_rt_bandwidth rt_bandwidth;
+    unsigned need_resched;
     struct kernel_task *exited_head;
     struct kernel_task *exited_tail;
     struct kernel_task *blocked_head;
@@ -246,6 +251,14 @@ enum kernel_scheduler_status allocate_task_storage(struct kernel_task **task);
 enum kernel_scheduler_status release_task_stack(struct kernel_task *task);
 enum kernel_scheduler_status release_task_storage(struct kernel_task *task,
     enum kernel_scheduler_status original_status);
+struct kernel_task *ready_first(void);
+struct kernel_task *ready_next(const struct kernel_task *task);
+struct kernel_task *ready_best(void);
+void ready_remove(struct kernel_task *task);
+void ready_enqueue(struct kernel_task *task, int head);
+void scheduler_account_runtime(void);
+void scheduler_rearm_timer(void);
+enum kernel_scheduler_status scheduler_reschedule(int rotate_other, int voluntary);
 void ready_append(struct kernel_task *thread);
 void scheduler_forget_task(struct kernel_task *thread);
 struct kernel_task *ready_pop(void);

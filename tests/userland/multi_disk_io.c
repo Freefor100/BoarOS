@@ -2,6 +2,9 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
+#include <sched.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/mount.h>
@@ -18,6 +21,80 @@ static int verify(int fd, const char *value)
     char b[16] = {0};
     return pread(fd,b,strlen(value),0) == (ssize_t)strlen(value) && !memcmp(b,value,strlen(value));
 }
+static int set_rt_control(const char *name, const char *value)
+{
+    int fd = open(name, O_WRONLY);
+    CHECK(fd >= 0 && write(fd, value, strlen(value)) == (ssize_t)strlen(value));
+    CHECK(!close(fd));
+    return 0;
+}
+
+static int rt_load(int a, int b)
+{
+    CHECK(directory("/proc") && !mount("proc", "/proc", "proc", 0, 0));
+    CHECK(!set_rt_control("/proc/sys/kernel/sched_rt_runtime_us", "-1"));
+    CHECK(!set_rt_control("/proc/sys/kernel/sched_rt_period_us", "1000000"));
+    CHECK(!set_rt_control("/proc/sys/kernel/sched_rt_runtime_us", "950000"));
+    struct load_state { volatile uint64_t cycles; volatile unsigned stop; };
+    struct load_state *state = mmap(0, 4096, PROT_READ | PROT_WRITE,
+        MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    CHECK(state != MAP_FAILED);
+    for (unsigned round = 0; round < 2; round++) {
+        int policy = round ? SCHED_RR : SCHED_FIFO;
+        int gate[2]; CHECK(!pipe(gate));
+        state->cycles = 0; state->stop = 0;
+        pid_t child = fork(); CHECK(child >= 0);
+        if (!child) {
+            close(gate[0]);
+            struct sched_param param = {.sched_priority = 1};
+            /* Fixed musl exposes a legacy ENOSYS stub for this wrapper. */
+            if (syscall(SYS_sched_setscheduler, 0, policy, &param)) {
+                dprintf(2, "multi-disk RT scheduler failure policy=%d errno=%d\n", policy, errno);
+                _exit(70);
+            }
+            if (write(gate[1], "r", 1) != 1) _exit(71);
+            close(gate[1]);
+            /* No yield or sleep: only the default RT budget lets OTHER run. */
+            while (!state->stop) state->cycles++;
+            _exit(0);
+        }
+        CHECK(!close(gate[1]));
+        char ready; CHECK(read(gate[0], &ready, 1) == 1 && ready == 'r');
+        CHECK(!close(gate[0]) && state->cycles > 0);
+        printf("multi-disk-rt: load ready policy=%d\n", policy);
+        CHECK(token());
+        volatile uint64_t sum = 0;
+        for (unsigned i = 0; i < 100000; i++) sum += i;
+        CHECK(sum == UINT64_C(4999950000));
+        off_t offset = (off_t)round * 65536;
+        char initial[6], payload[8192], readback[8192];
+        CHECK(pread(a, initial, sizeof(initial), offset) == sizeof(initial) &&
+              !memcmp(initial, "A-COLD", sizeof(initial)));
+        CHECK(pread(b, initial, sizeof(initial), offset) == sizeof(initial) &&
+              !memcmp(initial, "B-COLD", sizeof(initial)));
+        memset(payload, 'a' + (int)round, sizeof(payload));
+        CHECK(pwrite(a, payload, sizeof(payload), offset) == sizeof(payload));
+        CHECK(!fsync(a) && pread(a, readback, sizeof(readback), offset) == sizeof(readback));
+        CHECK(!memcmp(payload, readback, sizeof(payload)));
+        memset(payload, 'b' + (int)round, sizeof(payload));
+        CHECK(pwrite(b, payload, sizeof(payload), offset) == sizeof(payload));
+        CHECK(!fsync(b) && pread(b, readback, sizeof(readback), offset) == sizeof(readback));
+        CHECK(!memcmp(payload, readback, sizeof(payload)));
+        printf("multi-disk-rt: I/O progressed policy=%d\n", policy);
+        /* Host confirms both real NBD devices completed READ/WRITE/FLUSH
+         * before allowing the continuously runnable RT child to stop. */
+        CHECK(token());
+        state->stop = 1;
+        int status;
+        CHECK(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+        printf("multi-disk-rt: child reaped policy=%d\n", policy);
+    }
+    CHECK(!munmap(state, 4096) && !close(a) && !close(b));
+    CHECK(!umount("/second") && !umount("/proc"));
+    puts("multi-disk-rt: cleanup ok");
+    return 42;
+}
+
 int main(void)
 {
     setvbuf(stdout, 0, _IONBF, 0);
@@ -28,6 +105,8 @@ int main(void)
     int a = open("/disk-a-data", phase >= 0 ? O_RDONLY : O_RDWR);
     int b = open("/second/disk-b-data",phase >= 0 ? O_RDONLY : O_RDWR);
     CHECK(a >= 0 && b >= 0);
+    int rt_mode = open("/rt-load", O_RDONLY);
+    if (rt_mode >= 0) { CHECK(!close(rt_mode)); return rt_load(a, b); }
     if (phase >= 0) {
         CHECK(verify(a,"A-FINAL"));
         CHECK(verify(b,"B-COLD") || verify(b,"B-FAULT") || verify(b,"B-FINAL"));

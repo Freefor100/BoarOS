@@ -617,25 +617,7 @@ void kernel_signal_notify_child_stop(struct kernel_task *child,
 
 static void signal_ready_unlink(struct kernel_task *task)
 {
-    struct kernel_task *previous = 0;
-    struct kernel_task *member = scheduler.ready_head;
-
-    while (member != 0 && member != task) {
-        previous = member;
-        member = member->next;
-    }
-    if (member == 0) {
-        return;
-    }
-    if (previous == 0) {
-        scheduler.ready_head = task->next;
-    } else {
-        previous->next = task->next;
-    }
-    if (scheduler.ready_tail == task) {
-        scheduler.ready_tail = previous;
-    }
-    task->next = 0;
+    if (task->ready_node.queued) ready_remove(task);
 }
 
 static void signal_resume_stopped(struct kernel_task *task)

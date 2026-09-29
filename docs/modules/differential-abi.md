@@ -44,6 +44,21 @@ Linux PID 1 在完整输出后 sync 并 reboot poweroff；同一程序在 BoarOS
 fixture 内 `/dev/console` 是由 debugfs 创建的字符设备 inode，用于 Linux init
 标准流；无需宿主 root 或 loop mount。
 
+## 进程、随机与调度阶段（2026-09-29）
+
+当前完整同 ELF 差分为 **1000 条匹配**：本阶段新增 coarse clock 14、随机接口 34、
+会话/进程组 105、RT proc 控制 36、调度策略 23 与 proc 调度字段 5 条。
+`session.c` 必须在删除 `/init` 的 proc 用例之前运行，使 exec 子进程仍有真实来源。
+`rt_controls.c` 自建独立 proc 挂载；配置用例退出前恢复预算，后续策略测试不依赖残留状态。
+Linux 配置启用 HWRNG、SYSCTL/PROC_SYSCTL；随机字节仅验证契约，不逐字比较或以不同输出证明熵。
+
+最终内核 SHA-256 `be5ca22629c904a427241b0f92e9d561d0312952e787ab75870ec4beae0143b3`，
+用户 ELF `eea74172f0571c6347005b554e73b54b2d76256af550e9b3bc5506a4f99bb306`。
+并发运行恢复矩阵和程序清单时，默认 60 秒总预算曾在第一个 session 分组后耗尽；
+同一内核/ELF 的 180 秒预算复跑输出完整 END 1000、heap-live=0 并逐条一致。
+独立 105 条 session 窄测也通过，未据超时末条记录推断内核死锁。
+复建后可用 `python3 -B tests/diff-abi/harness.py --kernel kernel-rv --program build/diff-abi/cases-rv --timeout 180` 重复本次完整验收。
+
 ## 构建、缓存与证据
 
 依赖 GNU Make、RV64 bare-metal GCC/binutils、RV64 Linux GCC/binutils、宿主 GCC、

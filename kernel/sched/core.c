@@ -17,6 +17,7 @@
 #include <kernel/scheduler.h>
 #include <kernel/task.h>
 #include <kernel/tick.h>
+#include <kernel/time.h>
 #include <kernel/uaccess.h>
 #include <kernel/vma.h>
 
@@ -288,23 +289,22 @@ enum kernel_scheduler_status validate_queues(void)
     enum kernel_scheduler_status status;
 
 
-    status = validate_queue_shape(scheduler.ready_head,
-                                  scheduler.ready_tail);
-    if (status != KERNEL_SCHEDULER_STATUS_OK) {
-        return status;
-    }
+    if (!!scheduler.runqueue.first != !!scheduler.runqueue.last ||
+        (scheduler.runqueue.first && scheduler.runqueue.first->previous) ||
+        (scheduler.runqueue.last && scheduler.runqueue.last->next))
+        return KERNEL_SCHEDULER_STATUS_QUEUE_CORRUPT;
     status = validate_queue_shape(scheduler.exited_head,
                                   scheduler.exited_tail);
     if (status != KERNEL_SCHEDULER_STATUS_OK) {
         return status;
     }
-    if (scheduler.ready_head != 0) {
-        status = validate_thread(scheduler.ready_head,
+    if (ready_first() != 0) {
+        status = validate_thread(ready_first(),
                                  KERNEL_THREAD_STATE_READY);
         if (status != KERNEL_SCHEDULER_STATUS_OK) {
             return status;
         }
-        status = validate_thread(scheduler.ready_tail,
+        status = validate_thread((struct kernel_task *)scheduler.runqueue.last->owner,
                                  KERNEL_THREAD_STATE_READY);
         if (status != KERNEL_SCHEDULER_STATUS_OK) {
             return status;
@@ -361,59 +361,22 @@ enum kernel_scheduler_status validate_queues(void)
     return KERNEL_SCHEDULER_STATUS_OK;
 }
 
-void ready_append(struct kernel_task *thread)
-{
-    if (!thread->accounted) {
-        thread->accounted = 1;
-        thread->all_next = scheduler.all_tasks;
-        scheduler.all_tasks = thread;
-    }
-    thread->next = 0;
-    if (scheduler.ready_tail == 0) {
-        scheduler.ready_head = thread;
-    } else {
-        scheduler.ready_tail->next = thread;
-    }
-    scheduler.ready_tail = thread;
-}
-
-struct kernel_task *ready_pop(void)
-{
-    struct kernel_task *thread = scheduler.ready_head;
-
-    scheduler.ready_head = thread->next;
-    if (scheduler.ready_head == 0) {
-        scheduler.ready_tail = 0;
-    }
-    thread->next = 0;
-    return thread;
-}
-
 enum kernel_scheduler_status scheduler_switch_current_away(
     struct kernel_task *previous)
 {
-    struct kernel_task *next;
-    enum kernel_scheduler_status status;
-
-    if (scheduler.ready_head == 0) {
-        if (activate_thread_address_space(&scheduler.idle) !=
-            KERNEL_SCHEDULER_STATUS_OK) {
-            return KERNEL_SCHEDULER_STATUS_ADDRESS_SPACE;
-        }
-        scheduler.current = &scheduler.idle;
-        riscv_fpu_switch(&previous->fpu, &scheduler.idle.fpu);
-        riscv_context_switch(&previous->context, &scheduler.idle.context);
-        return KERNEL_SCHEDULER_STATUS_OK;
+    scheduler_account_runtime();
+    struct kernel_task *next = ready_best();
+    if (!next) next = &scheduler.idle;
+    enum kernel_scheduler_status status = activate_thread_address_space(next);
+    if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
+    if (next != &scheduler.idle) {
+        ready_remove(next);
+        next->state = KERNEL_THREAD_STATE_RUNNING;
     }
-
-    next = scheduler.ready_head;
-    status = activate_thread_address_space(next);
-    if (status != KERNEL_SCHEDULER_STATUS_OK) {
-        return status;
-    }
-    next = ready_pop();
-    next->state = KERNEL_THREAD_STATE_RUNNING;
     scheduler.current = next;
+    scheduler.need_resched = 0;
+    scheduler_rearm_timer();
+    if (next == previous) return KERNEL_SCHEDULER_STATUS_OK;
     riscv_fpu_switch(&previous->fpu, &next->fpu);
     riscv_context_switch(&previous->context, &next->context);
     return KERNEL_SCHEDULER_STATUS_OK;
@@ -625,8 +588,9 @@ enum kernel_scheduler_status kernel_scheduler_init(
     scheduler.current = &scheduler.idle;
     scheduler.cleanup_task = 0;
     kernel_wait_queue_init(&scheduler.cleanup_queue);
-    scheduler.ready_head = 0;
-    scheduler.ready_tail = 0;
+    memset(&scheduler.runqueue, 0, sizeof(scheduler.runqueue));
+    kernel_rt_bandwidth_init(&scheduler.rt_bandwidth, kernel_time_monotonic_ns());
+    scheduler.need_resched = 0;
     scheduler.exited_head = 0;
     scheduler.exited_tail = 0;
     scheduler.blocked_head = 0;
@@ -983,95 +947,31 @@ static void scheduler_sample_load(uint64_t elapsed)
     }
 }
 
-enum kernel_scheduler_status kernel_scheduler_on_tick(
-    uint64_t elapsed_ticks)
+enum kernel_scheduler_status kernel_scheduler_on_tick(uint64_t elapsed_ticks)
 {
-    struct kernel_task *previous;
-    struct kernel_task *next;
-    enum kernel_scheduler_status status;
-
-    if (scheduler.initialized != KERNEL_SCHEDULER_INITIALIZED) {
+    if (scheduler.initialized != KERNEL_SCHEDULER_INITIALIZED)
         return KERNEL_SCHEDULER_STATUS_NOT_INITIALIZED;
-    }
-    if (elapsed_ticks == 0U) {
-        return KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
-    }
-    if (riscv_interrupt_is_enabled()) {
-        return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
-    }
-    if (scheduler.fatal_status != KERNEL_SCHEDULER_STATUS_OK) {
-        return scheduler.fatal_status;
-    }
-    status = validate_current();
-    if (status != KERNEL_SCHEDULER_STATUS_OK) {
-        return status;
-    }
+    if (riscv_interrupt_is_enabled()) return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
+    if (scheduler.fatal_status != KERNEL_SCHEDULER_STATUS_OK) return scheduler.fatal_status;
+    enum kernel_scheduler_status status = validate_current();
+    if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
     status = validate_queues();
-    if (status != KERNEL_SCHEDULER_STATUS_OK) {
-        return status;
-    }
-
-    scheduler_sample_load(elapsed_ticks);
-    previous = scheduler.current;
-    next = !scheduler.cleanup_task && previous != &scheduler.idle && kernel_scheduler_reap_pending()
-               ? &scheduler.idle : scheduler.ready_head;
-    if (next == 0) return KERNEL_SCHEDULER_STATUS_OK;
-    status = activate_thread_address_space(next);
-    if (status != KERNEL_SCHEDULER_STATUS_OK) {
-        return status;
-    }
-    if (next != &scheduler.idle) next = ready_pop();
-    if (previous->idle == 0U) {
-        previous->state = KERNEL_THREAD_STATE_READY;
-        ready_append(previous);
-    } else {
-        scheduler.idle_context_saved = 1U;
-    }
-    if (next != &scheduler.idle) next->state = KERNEL_THREAD_STATE_RUNNING;
-    scheduler.current = next;
-    riscv_fpu_switch(&previous->fpu, &next->fpu);
-    riscv_context_switch(&previous->context, &next->context);
-
-    if (scheduler.fatal_status != KERNEL_SCHEDULER_STATUS_OK) {
-        return scheduler.fatal_status;
-    }
-    return validate_current();
+    if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
+    if (elapsed_ticks) scheduler_sample_load(elapsed_ticks);
+    return scheduler_reschedule(elapsed_ticks != 0, 0);
 }
 
 enum kernel_scheduler_status kernel_scheduler_yield_current(void)
 {
-    struct kernel_task *previous;
-    enum kernel_scheduler_status status;
-
-    if (scheduler.initialized != KERNEL_SCHEDULER_INITIALIZED) {
+    if (scheduler.initialized != KERNEL_SCHEDULER_INITIALIZED)
         return KERNEL_SCHEDULER_STATUS_NOT_INITIALIZED;
-    }
-    if (riscv_interrupt_is_enabled()) {
-        return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
-    }
-    if (scheduler.fatal_status != KERNEL_SCHEDULER_STATUS_OK) {
-        return scheduler.fatal_status;
-    }
-    status = validate_current();
-    if (status != KERNEL_SCHEDULER_STATUS_OK) {
-        return status;
-    }
+    if (riscv_interrupt_is_enabled()) return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
+    if (scheduler.fatal_status != KERNEL_SCHEDULER_STATUS_OK) return scheduler.fatal_status;
+    enum kernel_scheduler_status status = validate_current();
+    if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
     status = validate_queues();
-    if (status != KERNEL_SCHEDULER_STATUS_OK) {
-        return status;
-    }
-    if (scheduler.ready_head == 0) {
-        return KERNEL_SCHEDULER_STATUS_OK;
-    }
-
-    previous = scheduler.current;
-    if (previous != &scheduler.idle) {
-        previous->state = KERNEL_THREAD_STATE_READY;
-        ready_append(previous);
-    } else {
-        scheduler.idle_context_saved = 1U;
-    }
-    return scheduler_switch_current_away(previous);
+    if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
+    return scheduler_reschedule(0, 1);
 }
 
 void kernel_scheduler_charge_ticks(uint64_t elapsed_ticks, int from_user)

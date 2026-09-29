@@ -25,7 +25,7 @@ RISC-V psABI 把 `tp` 作为固定用途寄存器，普通函数不能把它当�
 ```text
 A 普通代码
 -> timer trap 在 A 栈建立完整 Trap Frame
--> dispatcher 重设 deadline、累计 elapsed tick
+-> dispatcher 处理最早 deadline；仅真实周期事件累计 elapsed tick
 -> scheduler 把 A 放回 ready queue，选择 B
 -> switch context 保存 A 的 scheduler 调用链，恢复 B 的调用链
 -> B 从自己先前的 scheduler 调用继续
@@ -40,13 +40,13 @@ A 普通代码
 
 这个流程说明“timer handler 返回”不一定立刻回到触发本次中断的线程。context switch 先换了 C 调用链和栈，dispatcher 最终返回的是被恢复线程先前留下的 trap 调用。每个线程始终使用自己的 Trap Frame 和内核栈。
 
-## FIFO、时间片与 elapsed
+## 就绪队列、时间片与 elapsed
 
-最小 round-robin 可以用 FIFO ready queue 表示：时间片结束时，把仍可运行的普通线程放到队尾，从队首取下一个。队首/队尾指针使入队和出队都是 O(1)。idle 是没有普通线程可运行时的特殊上下文，不应进入普通队列，否则会与真实工作竞争时间片。
+最初只有普通任务的 round-robin，可用单条 FIFO ready queue 表示。当前 ready 队列按 RT 优先级排序，并保存每一级的首尾；同级时间片结束或 yield 时入本级队尾，普通 OTHER 尾追加仍为 O(1)。SCHED_FIFO 是不因 tick 同级轮转的调度策略，不能与数据结构的 FIFO 次序混同。idle 不进入普通队列；没有可运行的 OTHER 且 RT 已耗尽预算时，也必须选择 idle。
 
-BoarOS 的 timer backend 保留 deadline 相位，并可能一次报告多个迟到 tick。Scheduler 接收真实 `elapsed_ticks`，但当前一次 timer trap 最多切换一次。连续补做多次切换既不会让期间未执行的线程获得实际 CPU 时间，还会增加无意义的上下文开销。当前一个非零 elapsed 事件就耗尽一 tick 时间片；以后增加多 tick 时间片时可以在 scheduler 内部扣减，而不改变 timer 后端。
+BoarOS 的 timer backend 保留周期 deadline 相位，并可能一次报告多个迟到 tick。Scheduler 接收真实 `elapsed_ticks`，一次调度决策最多选择一次切换，不为错过的每个 tick 连续补做切换：那不能让期间未执行的线程获得实际 CPU 时间。OTHER 仍按非零 elapsed 事件轮转；RR 的 100ms 时间片和全局 RT 预算按实际运行纳秒扣除。独立预算/片尾 IRQ 可以报告 elapsed_ticks=0，此时仍调度，但不制造周期 tick 或 coarse 时间推进。
 
-一次 context switch 只保存十几个寄存器，ready 操作是 O(1)。100 Hz 表示正常情况下每个 hart 最多每 10 ms 做一次调度检查。无 READY 竞争者时只验证少量状态并原线程返回；因此当前单 hart 内核不需要为了性能提前引入复杂策略或 tickless 状态。真正的优化应基于调度延迟、切换次数、栈高水位和空闲唤醒测量。
+基础 context switch 保存 psABI 寄存器，F/D 状态另按需处理。常见同级入队、删除和选取为 O(1)，首次插入空的中间优先级至多扫描 99 个等级。100 Hz 只规定普通周期 tick；高优先级唤醒、策略改变、RR 片尾和 RT 配额截止均可在两个 tick 之间触发调度。timer 必须设置这些事件的最早 deadline，不能用“暂无竞争者”或“不做完整 tickless”省略真实预算需要的中间 IRQ。延迟与成本应通过切换次数、实际超出量、栈高水位和空闲唤醒测量。
 
 ## 状态与所有权必须一起变化
 
@@ -62,7 +62,7 @@ metadata + stack -> READY -> RUNNING -> READY
 
 队列操作不只是移动指针，还转移“谁拥有元数据与栈、谁可能仍在使用这张栈”的事实。创建只有在页访问、元数据、canary 和初始 context 全部成功后才能提交 READY；此前失败必须回滚页。RUNNING 线程返回时，当前 SP 仍在自己的页中，因此不能边退出边释放。它先进入 EXITED 并永不恢复，等 idle 已运行在静态 boot stack 上再释放执行栈。元数据页可以作为真实 I/O 清理 owner、GROUP_DEAD 或 zombie 继续存在，两种生命周期不再绑定。
 
-用户任务持有 MM 句柄，而不是直接拥有页表树。首次创建采用移动所有权：入口、用户栈权限、初始 Frame 和 TID 建立成功后，MM 才从调用者转交任务；失败时调用者仍拥有它。普通 clone 通过 `kernel_mm_fork()` 建立独立逻辑地址空间，父子物理页先以 COW 共享；`acquire` 则表达多个 owner 共享同一 MM，未来 `CLONE_VM` 可以复用这个引用边界而不伪造页表所有权。调度切换在修改队列/current 前使用任务创建时缓存的 `satp`，不会在 tick 热路径解析 MM；ASID 0 的根切换仍会全局刷新 TLB。父子/zombie/wait 的生命周期知识见[进程生命周期学习总结](process-lifecycle.md)。
+用户任务持有 MM 句柄，而不是直接拥有页表树。首次创建采用移动所有权：入口、用户栈权限、初始 Frame 和 TID 建立成功后，MM 才从调用者转交任务；失败时调用者仍拥有它。普通 clone 通过 `kernel_mm_fork()` 建立独立逻辑地址空间，父子物理页先以 COW 共享；`acquire` 则表达多个 owner 共享同一 MM，当前线程 clone 与 vfork 已通过这个引用边界实现 `CLONE_VM`，不伪造页表所有权。调度切换在修改队列/current 前使用任务创建时缓存的 `satp`，不会在 tick 热路径解析 MM；ASID 0 的根切换仍会全局刷新 TLB。父子/zombie/wait 的生命周期知识见[进程生命周期学习总结](process-lifecycle.md)。
 
 退出切换把旧寄存器写入一份永不入队的 discard context。这样退出线程没有可再次选择的 switch context，idle 回收页也不会留下悬空恢复点。若退出路径发现 `tp`、状态、边界或 canary 损坏，它不能像普通函数那样返回错误；安全做法是记录错误、切到可信 idle 栈，再由仍能返回状态的 timer 调用链执行 fatal 诊断。
 
@@ -70,11 +70,11 @@ metadata + stack -> READY -> RUNNING -> READY
 
 Linux 的 task 表示一条可独立调度的执行流。每个 task 有自己的 TID；同一线程组共享一个 TGID，组首 task 满足 `TID == TGID`。用户通常把 TGID 称为进程 PID，因此 `getpid()` 返回 TGID，`gettid()` 返回当前 task 的 TID。线程组身份与 MM 是否共享是相关但不同的选择：clone flags 可以分别控制加入线程组和共享地址空间，内核不应把“同一 MM”硬编码为“同一 PID”。
 
-BoarOS 用不透明 `kernel_task` 保存调度状态、TID、组首关系和 MM 引用，syscall dispatcher 显式接收 caller task。当前每个用户任务都是自己的组首，所以 `getpid/gettid` 数值相等；字段和 ABI 已经按最终语义分离。内核任务与 idle 没有用户可见身份，ID 0 留作内部“无 PID/TID”，用户 ID 从 1 开始。
+BoarOS 用不透明 `kernel_task` 保存调度状态、TID、组首关系和 MM 引用，syscall dispatcher 显式接收 caller task。普通 fork 建立新线程组，线程 clone 则加入已有组，故组员的 `getpid()` 返回共享 TGID，`gettid()` 返回自身 TID。非组长 exec 会接管组长身份，同时保留执行线程的调度策略。内核任务与 idle 没有用户可见身份，ID 0 留作内部“无 PID/TID”，用户 ID 从 1 开始。
 
-有界 ID 可用位图管理：一位表示一个数值是否占用，分配搜索和释放不会额外分配内存，32768 个 ID 只需 4 KiB。线性扫描最坏为 O(limit)，但循环游标使连续创建通常很快；只有进程创建/退出触碰它，不进入 timer/context switch。未来若真实并发创建使扫描或全局锁成为瓶颈，可换成分层位图或 per-CPU 缓存，而不改变 TID/TGID ABI。
+有界编号用位图管理占用，32768 个编号只需 4 KiB 位图；统一 `kernel_pid` 对象另保存代次、引用和 TID/TGID/PGID/SID 角色。分配的最坏扫描为 O(limit)，循环游标使连续创建通常很快，这类操作不进入 timer/context switch。编号可能在进程退出或收割后仍被存续进程组、会话或 creator 引用占用，不能仅凭任务死亡就归还。若未来真实并发创建使扫描或全局锁成为瓶颈，可换成分层位图或 per-CPU 缓存，而不改变身份 ABI。
 
-回收顺序必须与可观察生命周期一致：先释放 task 的 MM 引用，再归还 TID，最后释放元数据页；执行栈在可信 idle 上先行归还，不等父进程 wait。真实 VFS/block I/O 清理失败才保留 exited 节点并从准确阶段重试；合法页/堆释放完成即返回，分配器不变量错误进入 fatal。只有全部完成后才发布 completion。以后实现 `wait` 时，退出后的 zombie 元数据和父进程观察点会延长“退出”和“最终释放 PID”之间的生命周期，不能直接沿用当前立即完成记录作为完整 Linux wait 语义。
+回收顺序必须与可观察生命周期一致。执行栈在可信 idle 上先行归还，不等父进程 wait；真实 VFS/block I/O 清理失败才由原 owner 保留准确清理阶段。合法页/堆释放完成即返回，分配器不变量错误进入 fatal。线程组代表、GROUP_DEAD 与 zombie 元数据按各自生命周期保留；wait4 已实现父进程对退出状态的观察和收割。收割释放相应身份角色，但数字只有在统一对象的全部角色和临时引用消失后才可重用。早期“立即归还 TID 并只留 completion”的最小线程模型已经不能代表当前进程语义。
 
 ## 内核栈大小、对齐和保护
 
@@ -100,7 +100,7 @@ Canary 只能发现越过栈底后的部分破坏，不能像未映射 guard pag
 
 ### 代表调用链与中断叠加预算
 
-以下核对使用 `build/stack-usage/` 的生产 `-O2/-fstack-usage` 报告及同次 ELF 反汇编，ELF SHA-256 为 `2a29d7fb4238c7886631561540c6e9bf59ebf3422168542ef0d97df5cf2d90aa`。这是最终 8 KiB 构建的静态快照；修改优化选项、时间戳/文件/MM 路径或栈策略后须重建再核对。对应 `.su` 入口是 `arch/riscv/{trap,signal,uaccess,mm}.su`、`kernel/{sched/process,syscall/dispatch,syscall/file,physical_page}.su`、`fs/{files/io,vfs,open_file,page_cache,lwext4_port}.su`、`mm/heap.su` 和 `third_party/lwext4/src/{ext4,ext4_fs,ext4_extent,ext4_blockdev,ext4_bcache}.su`。
+以下核对使用 `build/stack-usage/` 的生产 `-O2/-fstack-usage` 报告及同次 ELF 反汇编，ELF SHA-256 为 `2a29d7fb4238c7886631561540c6e9bf59ebf3422168542ef0d97df5cf2d90aa`。这是 2026-09-16 扩栈阶段的静态快照，不代表当前编译产物；修改优化选项、时间戳/文件/MM 路径或栈策略后须重建再核对。对应 `.su` 入口是 `arch/riscv/{trap,signal,uaccess,mm}.su`、`kernel/{sched/process,syscall/dispatch,syscall/file,physical_page}.su`、`fs/{files/io,vfs,open_file,page_cache,lwext4_port}.su`、`mm/heap.su` 和 `third_party/lwext4/src/{ext4,ext4_fs,ext4_extent,ext4_blockdev,ext4_bcache}.su`。
 
 下列数字单位均为字节，来自编译后的帧大小，不另给已内联的 `map_private_file_page`、`map_cached_file_page`、`ext4_buf_alloc` 加一份栈。`ext4_find_extent` 与 `read_extent_tree_block` 使用对应 `.constprop` 记录；`ext4_fs_get_inode_dblk_idx_internal` 使用 `.isra` 记录。反汇编确认的零帧/尾调用不重复计数，普通兄弟调用取各自链路，不把返回后的帧相加。
 
@@ -136,10 +136,10 @@ ready/exited 队列会同时被普通线程创建路径、timer handler 和 idle
 
 - RISC-V 异步现场继续使用完整 Trap Frame，普通调度使用独立的 psABI switch context。
 - 内核 `tp` 固定为 current；用户 `tp` 独立保存，`sscratch` 只在 U-mode 保存 current，内核态保持为零。
-- 单 hart FIFO round-robin，一个 tick 时间片，一次 trap 最多切换一次。
+- 单 hart OTHER 按周期 tick 轮转；FIFO/RR 使用 1–99 实时优先级，RR 片长 100ms；实际运行时间驱动全局 RT 配额与额外 timer deadline。
 - 普通内核/用户任务分别拥有私有 4 KiB 元数据页与 8 KiB 连续物理内核栈；用户任务持有可共享 MM 引用和独立 TID/线程组身份；boot context 成为永久 idle，继续使用静态 boot stack。
 - 内核线程入口返回即退出；用户任务通过 syscall 或同步故障退出。idle 在可信栈上先释放已停止执行的任务栈，继续完成 MM/文件等清理；TID 与元数据按组关系和 wait 生命周期释放。
-- 队列临界区保存并关闭 SIE；interruptible wait 使用同一 blocked 链并由未阻塞 pending signal 返回 `SIGNALLED`，vfork 等资源生命周期等待保持不可中断。F/D 状态由 scheduler switch 的 FS Dirty 检查按需保存/恢复；不为尚未实现的 SMP、优先级或 V 状态建立占位层，MM/身份/信号字段则是 `clone/fork/exec/wait` 已确定路径的必要永久机制。
+- 队列临界区保存并关闭 SIE；interruptible wait 使用同一 blocked 链并由未阻塞 pending signal 返回 `SIGNALLED`，vfork 等资源生命周期等待保持不可中断。F/D 状态由 scheduler switch 的 FS Dirty 检查按需保存/恢复；不为尚未实现的 SMP 或 V 状态建立占位层，MM/身份/信号字段则是 `clone/fork/exec/wait` 已确定路径的必要永久机制。
 
 这些选择形成完整、可测的内核线程闭环，同时把以后可能变化的策略、栈布局和 per-hart 组织留在模块内部。RISC-V context 机制可在 QEMU `virt` 与 VisionFive 2 复用；平台 timebase 仍由 DTB 决定。LoongArch 需要自己的 switch context、CSR/中断和 16 KiB 栈页实现，不能复用 RISC-V 汇编。
 
@@ -151,14 +151,14 @@ ready/exited 队列会同时被普通线程创建路径、timer handler 和 idle
 - 给 `s0..s11` 设置独立哨兵并跨多次抢占比较，可发现错误偏移、漏保存和 32/64 位宽度错误；同时检查最终对象反汇编，验证实际链接指令而非源码文本。
 - 记录每个 worker 的 `sp/tp`、最终 idle `sp/tp` 和分配器空闲计数，能同时验证独立栈、current ABI、退出切换和页回收。
 - 用户任务测试还应跨真实 timer 抢占检查用户 `gp/sp/tp/s0..s11`；让两个任务以不同栈和身份共享正常 MM，并用另一独立根隔离故障任务，可以同时验证共享末引用、`satp` 切换和故障隔离。完成后还要核对全部 MM、叶子页、页表页、TID 和任务页归还。
-- 正常生产内核会永久 idle，有限关机逻辑应放在测试 ELF 的链接包装中；生产映像需用符号表确认不含测试 worker。
+- 内核 worker 的有限测试应使用测试入口，生产映像需用符号表确认不含测试 worker。当前生产 root 生命周期会在 PID 1 及后代退出并完成资源清理后报告结果、关机；不能再把“永久 idle”当作生产路径不变量。
 - 静态分析适合发现 C 状态路径中的空指针、未初始化、双重释放和释放后使用；汇编寄存器集合、Trap Frame/context 配合及真实抢占顺序仍需要反汇编和 QEMU 端到端测试。
 
 ## 阻塞与唤醒（当前结论）
 
-- BoarOS 的阻塞机制沿用 wait4 确立的模式：关中断内检查条件、置 BLOCKED、经 `riscv_context_switch` 切走；唤醒方把任务置 READY 并入 ready 队尾，被唤醒者从原调用点返回后必须重查条件。所有 BLOCKED 任务都在全局 blocked 链上，事件通道（wait_queue 令牌）与超时（deadline 刻度）是任务的字段而不是独立节点，唤醒按 FIFO 走链。
-- 单 hart 下丢失唤醒的唯一来源是"检查条件与阻塞之间开中断"；因此内核线程（trampoline 运行在 SIE=1）调用阻塞接口前必须用 `riscv_interrupt_save/restore` 收敛临界区，而 syscall/trap 上下文天然关中断。Linux 的 `schedule()` 把这一职责收进调度器本身并保存/恢复中断状态，等 BoarOS 引入线程和 SMP 时需要对齐这一语义。
-- 超时唤醒与事件唤醒共用一条 blocked 链：tick 处理器在抢占检查之前先扫描到期 deadline，使刚到期的任务能在同一次切换中被选中；唤醒延迟上界是一个 tick 周期。Linux 用红黑树/timer wheel 组织到期任务，等待队列按需唤醒；BoarOS 的 O(阻塞数) 走链是有意的阶段性简化，扩展路径已在模块文档声明。
+- BoarOS 的阻塞机制沿用 wait4 确立的模式：关中断内检查条件、置 BLOCKED、经 `riscv_context_switch` 切走；唤醒方把任务置 READY 并入其优先级队尾，被唤醒者从原调用点返回后必须重查条件。所有 BLOCKED 任务都在全局 blocked 链上，事件通道（wait_queue 令牌）与超时（deadline 刻度）是任务的字段而不是独立节点，唤醒按 FIFO 走链。
+- 单 hart 下，检查条件与登记阻塞之间若打开中断，事件可能提前发生并造成丢失唤醒。因此内核线程（trampoline 运行在 SIE=1）调用阻塞接口前用 `riscv_interrupt_save/restore` 收敛临界区，而 syscall/trap 入口天然关中断。当前已有用户线程；将来引入 SMP 时，还必须用锁和跨 hart 内存序保护同一条件与等待队列，单纯关闭本地中断不再足够。
+- 超时唤醒与事件唤醒共用一条 blocked 链：timer 处理器在抢占检查之前扫描到期 deadline，使刚到期的任务能参与本次选取。通用等待 deadline 仍按 O(阻塞数) 扫描，没有各自设置最早硬件期限；RT 预算与 RR 片尾已有独立 deadline。周期 tick 提供通常约一个 tick 的检测粒度，但关中断、IRQ 延迟和更高优先级任务会延后实际运行，不能宣称一个 tick 的硬上界。Linux 用红黑树/timer wheel 等结构组织到期任务，等待队列按需唤醒；当前扫描的成本与扩展边界见模块文档。
 
 ## FP 状态为什么不塞进基础 Trap Frame
 
@@ -172,3 +172,13 @@ RISC-V `sstatus.FS` 给出了 Initial/Clean/Dirty 状态，适合把少见的 F/
 - `references/riscv/riscv-privileged-20260120.pdf`：SIE、trap 进入/返回和特权 CSR。
 - `references/linux/arch/riscv/kernel/entry.S`：Linux RISC-V `__switch_to` 保存集合、`tp=current` 和 trap/current 配合。
 - `references/linux/arch/riscv/include/asm/switch_to.h`：Linux RISC-V switch 调用边界与扩展状态组织。
+
+## RT 策略与时间来源（2026-09）
+
+固定 Linux `references/linux/kernel/sched/syscalls.c`、`core.c`、`rt.c`（commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`）提供本轮策略依据：FIFO 不参与 tick 同级轮转；RR 只在片尾重装，yield/高优先级抢占保留剩余片；fork 初始化子 RR 片并消费 RESET_ON_FORK 标志；exec 保留执行线程策略。不能用 syscall 返回 success 代替真实调度，也不能把 libc 包装函数的 ENOSYS 当作内核未实现：固定 musl 的 sched_setscheduler 包装是存根，聚焦测试用 syscall 明确进入内核。
+
+RT 预算按实际运行时间而不是 elapsed_ticks 扣费。如果仍只用100Hz周期IRQ，500us/250us设置即使纯状态机正确，也会让任务连续运行到下一个10ms tick。当前 timer 保留原周期相位，另取配额、补充和RR片尾最早截止；只有真实周期 tick 推进 coarse 快照。U-mode 测试在 coarse 刚换值后启动观察，验证8ms以内普通任务获得CPU，并记录实际延迟与quota超出量。这是机制检错和延迟样本，不承诺硬实时上界，也不把宿主/QEMU墙钟倍率当作精度证据。
+
+预算耗尽时 RT 仍留在 ready 队列，但选取只允许 OTHER；没有 OTHER 必须 idle。RR 片尾和节流同时发生时仍按片尾移到同级队尾，不能让节流条件把已到期任务重新置首。变更控制参数先结算旧段，保留consumed；相同period写入保持相位，改变period才建立新窗口长度且仍保留消费。这个明确选定的全局简化模型不等同于Linux的per-CPU/cgroup RT bandwidth层级。
+
+队列曾可选100桶+bitmap、按任务链排序或保留排序双链并索引每级首尾。当前选择最后一种：已有遍历需求不用分叉，常见OTHER/同级入队与取出O(1)，只有首次插入空中间等级扫描固定99级而非任务数。后续SMP需要独立锁与迁移协议，不能把本轮单hart关中断视为通用锁。

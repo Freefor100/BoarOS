@@ -73,3 +73,13 @@ make prune-build
 ```
 
 PR CI 增加可睡眠存储并发门槛，失败保存 guest/server 日志和磁盘镜像。DELETE/WAL 完整恢复沿用每周一北京时间 02:00 与手动 workflow，固定输入校验不变；glibc 仍严格本地验收。未 push，未运行托管 GitHub Actions；本地执行上述入口验证实现。
+
+## 默认 RT 带宽下的存储进展
+
+`tests/multi-disk-io-riscv.py --rt-load` 是独立的无故障组合模式，不替代原暂扣 B、错误隔离与断电恢复矩阵。用户程序逐轮创建 FIFO、RR 的持续可运行子任务，明确设置默认 950000/1000000 微秒全局预算；子任务在循环中不 yield、不 sleep，普通父任务的计算和双盘 I/O 因而依赖普通类获得预算余量。
+
+每轮 host 在放行父任务前让两台 NBD 进入 hold。检测到每台盘的真实 READ 后立即 drain，不用固定主机 sleep 消耗设备超时；读回内容由 guest 验证。只有普通父任务确认两盘同步写入/读回、host 同时观察两盘成功 WRITE/FLUSH 后，才允许父任务停止 RT 子任务。随后验证 wait 回收、动态盘卸载、根退出的堆/页/任务栈基线；QEMU 退出后独立 dump 两盘检查字节，并运行 `e2fsck -fn`。这证明组合进展和资源回收，不把 QEMU 墙钟作为实时延迟保证，也不宣称两盘请求必定同时在途。
+
+固定 musl 1.2.5 的 `src/sched/sched_setscheduler.c` 包装器直接返回 ENOSYS；出处为 `references/musl/musl-1.2.5.tar.gz`，SHA-256 `a9a118bbe84d8764da0ea0d28b3ab3fae8477fc7e4085d90102b8596fc7c75e4`。该验收程序明确使用 `syscall(SYS_sched_setscheduler, ...)` 进入内核，避免将 libc 包装器存根误判为内核调度失败。NBD 的普通 event 日志只记录 WRITE/FLUSH，READ 的实际请求由既有 hold/drain 协议证明。
+
+本阶段最终内核 SHA-256 `be5ca22629c904a427241b0f92e9d561d0312952e787ab75870ec4beae0143b3` 与用户 ELF `99db95d4a1c4052fc3fee682922593c45c0d34d7682783eec97f0a98c909e46b` 已完整通过 legacy/modern × writeback/writethrough 四组合；每组合各执行 FIFO、RR 一轮。每次退出均释放 6 个任务栈，最小空余 4360 字节、最大使用 3816 字节，且通过双盘持久字节、fsck 和根页/堆基线检查。可重建入口为 `make test-multi-disk-rt-riscv`；独立指定内核及 ELF 时使用 `python3 -B tests/multi-disk-io-riscv.py --rt-load --kernel <kernel> --program <multi-disk-io-rv>`。这份 RT 组合结果不代替独立存储故障/恢复矩阵的证据。

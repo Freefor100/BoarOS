@@ -783,6 +783,7 @@ enum kernel_scheduler_status riscv_process_clone_current(
                 : KERNEL_SCHEDULER_STATUS_INVALID_STATE);
     }
     tid = child->tid;
+    kernel_sched_policy_fork(&child->scheduling, &parent->scheduling);
     child->proc_start_ticks = kernel_tick_count();
     memcpy(child->comm, parent->comm, sizeof(child->comm));
     child->group_leader = child;
@@ -1722,7 +1723,10 @@ static void kernel_thread_finish(
         next = ready_pop();
         next->state = KERNEL_THREAD_STATE_RUNNING;
     }
+    scheduler_account_runtime();
     scheduler.current = next;
+    scheduler.need_resched = 0;
+    scheduler_rearm_timer();
     /* The dying task's FP state is discarded, but the dispatched task
      * must still have its own image reloaded. */
     riscv_fpu_switch(0, &next->fpu);
@@ -2040,6 +2044,8 @@ enum kernel_task_status kernel_task_fs_context_borrow(
 
 void kernel_task_prepare_user_return(void)
 {
+    if (scheduler.need_resched && scheduler_reschedule(0, 0) != KERNEL_SCHEDULER_STATUS_OK)
+        __builtin_trap();
     struct kernel_task *task = scheduler.current;
     if (task == 0 || task->arch.user_mode != 1U) return;
     uint64_t address = task->set_tid_address;

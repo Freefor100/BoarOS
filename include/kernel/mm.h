@@ -113,7 +113,11 @@ enum kernel_mm_status kernel_mm_executable_path_acquire(
 struct kernel_mm_proc_memory {
     uint64_t virtual_bytes;
     uint64_t resident_pages;
+    uint64_t start_code, end_code, start_stack;
 };
+enum kernel_mm_status kernel_mm_set_exec_layout(
+    struct kernel_mm *mm, uint64_t start_code, uint64_t end_code,
+    uint64_t start_stack);
 enum kernel_mm_status kernel_mm_proc_memory_snapshot(
     const struct kernel_mm *mm, struct kernel_mm_proc_memory *snapshot);
 

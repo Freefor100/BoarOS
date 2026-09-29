@@ -2132,6 +2132,24 @@ int kernel_vfs_node_pread(struct kernel_vfs_node *node,
     return instance->ops->pread(node, offset, buffer, size, bytes_read);
 }
 
+int kernel_vfs_file_is_control(const struct kernel_vfs_file *file)
+{
+    struct kernel_vfs_node *node = kernel_vfs_file_node(file);
+    return node && node->generated_control;
+}
+
+int kernel_vfs_file_control(const struct kernel_vfs_file *file, int write,
+    uint64_t offset, char *buffer, size_t size, size_t *count)
+{
+    struct kernel_vfs_node *node = kernel_vfs_file_node(file);
+    if (!node || !node->generated_control || !count || (!buffer && size))
+        return -KERNEL_EINVAL;
+    struct kernel_vfs_instance *instance = node->instance;
+    if (instance->quiescing) return -KERNEL_EIO;
+    if (write && instance->read_only) return -KERNEL_EROFS;
+    return instance->ops->control(node, write, offset, buffer, size, count);
+}
+
 int kernel_vfs_file_generated(const struct kernel_vfs_file *file)
 {
     if (!file || !file->mount || !file->mount->private_data) return 0;

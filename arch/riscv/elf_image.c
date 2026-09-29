@@ -1073,6 +1073,26 @@ enum riscv_elf_image_status riscv_elf_image_build(
         mm_status = kernel_mm_set_executable(&image->mm,
             kernel_elf64_source_file(request->executable_source));
     }
+    if (mm_status == KERNEL_MM_STATUS_OK) {
+        uint64_t start_code = UINT64_MAX, end_code = 0U;
+        uint16_t count = kernel_elf64_source_program_header_count(
+            request->executable_source);
+        /* 固定主 ELF 的文件字节边界；解释器和后续 mprotect 不改初始布局。 */
+        for (uint16_t index = 0; index < count; index++) {
+            const struct kernel_elf64_program_header *segment =
+                kernel_elf64_source_program_header(request->executable_source,
+                                                   index);
+            if (segment->type != KERNEL_ELF64_PROGRAM_LOAD ||
+                !(segment->flags & KERNEL_ELF64_FLAG_EXECUTE)) continue;
+            uint64_t start = segment->virtual_address + layout.main_bias;
+            uint64_t end = start + segment->file_size;
+            if (start < start_code) start_code = start;
+            if (end > end_code) end_code = end;
+        }
+        mm_status = kernel_mm_set_exec_layout(&image->mm,
+            start_code == UINT64_MAX ? 0U : start_code, end_code,
+            layout.stack_pointer);
+    }
     if (mm_status != KERNEL_MM_STATUS_OK) {
         status = cleanup_space(&image->mm, &space);
         return status == RISCV_ELF_IMAGE_STATUS_OK

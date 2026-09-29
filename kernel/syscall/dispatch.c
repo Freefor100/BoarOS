@@ -439,7 +439,7 @@ enum kernel_syscall_status kernel_syscall_dispatch(
         }
     } else if (request->number == LINUX_SYSCALL_EXIT ||
                request->number == LINUX_SYSCALL_EXIT_GROUP) {
-        /* Single-member thread groups: exit_group terminates this task. */
+        /* exit_group requests termination of every live group member. */
         decoded.action = request->number == LINUX_SYSCALL_EXIT_GROUP
                              ? KERNEL_SYSCALL_ACTION_EXIT_GROUP
                              : KERNEL_SYSCALL_ACTION_EXIT;
@@ -466,6 +466,11 @@ enum kernel_syscall_status kernel_syscall_dispatch(
         }
     } else if (request->number == LINUX_SYSCALL_SET_ROBUST_LIST) {
         if (syscall_handle_set_robust_list(caller, request, &decoded) !=
+            KERNEL_SYSCALL_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    } else if ((request->number >= 118U && request->number <= 123U) ||
+               (request->number >= 125U && request->number <= 127U)) {
+        if (syscall_handle_sched(caller, request, &decoded) !=
             KERNEL_SYSCALL_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     } else if (request->number == 154U) {

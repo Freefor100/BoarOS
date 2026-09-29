@@ -246,7 +246,7 @@ static unsigned long run_idle_cases(void)
 
     failures += expect_status(KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT,
                               kernel_thread_create(0, 0));
-    failures += expect_status(KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT,
+    failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
                               kernel_scheduler_on_tick(0U));
     failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
                               kernel_scheduler_on_tick(1U));

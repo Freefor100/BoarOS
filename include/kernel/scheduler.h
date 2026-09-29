@@ -86,6 +86,9 @@ enum kernel_scheduler_status kernel_user_thread_create(
     uintptr_t stack_pointer,
     uintptr_t thread_pointer);
 
+void kernel_scheduler_rt_bandwidth_get(int64_t *period_us, int64_t *runtime_us);
+int kernel_scheduler_rt_bandwidth_set(int runtime_field, int64_t value);
+
 void kernel_scheduler_system_statistics(uint64_t loads[3], uint16_t *tasks);
 
 enum kernel_scheduler_status kernel_scheduler_on_tick(

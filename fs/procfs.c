@@ -24,6 +24,10 @@
 #define PROC_UPTIME_INODE UINT64_C(3)
 #define PROC_SELF_INODE UINT64_C(4)
 #define PROC_MOUNTS_INODE UINT64_C(5)
+#define PROC_SYS_INODE UINT64_C(6)
+#define PROC_KERNEL_INODE UINT64_C(7)
+#define PROC_RT_PERIOD_INODE UINT64_C(8)
+#define PROC_RT_RUNTIME_INODE UINT64_C(9)
 #define PROC_PID_DIR_KIND 1U
 #define PROC_PID_EXE_KIND 2U
 #define PROC_PID_CWD_KIND 3U
@@ -125,6 +129,21 @@ static int proc_lookup(struct kernel_vfs_instance *instance, uint64_t parent,
                        uint64_t *inode, uint32_t *mode)
 {
     (void)instance;
+    if (parent == PROC_SYS_INODE) {
+        if (length != 6U || memcmp(name, "kernel", 6U)) return -KERNEL_ENOENT;
+        *inode = PROC_KERNEL_INODE;
+        *mode = KERNEL_VFS_S_IFDIR | 0555U;
+        return 0;
+    }
+    if (parent == PROC_KERNEL_INODE) {
+        if (length == 18U && !memcmp(name, "sched_rt_period_us", 18U))
+            *inode = PROC_RT_PERIOD_INODE;
+        else if (length == 19U && !memcmp(name, "sched_rt_runtime_us", 19U))
+            *inode = PROC_RT_RUNTIME_INODE;
+        else return -KERNEL_ENOENT;
+        *mode = KERNEL_VFS_S_IFREG | 0644U;
+        return 0;
+    }
     if (parent != PROC_ROOT_INODE) {
         uint8_t parent_kind = proc_inode_kind(parent);
         if (parent_kind != PROC_PID_DIR_KIND &&
@@ -163,6 +182,11 @@ static int proc_lookup(struct kernel_vfs_instance *instance, uint64_t parent,
         else return -KERNEL_ENOENT;
         *inode = proc_pid_inode(pid, identity, kind);
         *mode = proc_kind_mode(kind);
+        return 0;
+    }
+    if (length == 3U && !memcmp(name, "sys", length)) {
+        *inode = PROC_SYS_INODE;
+        *mode = KERNEL_VFS_S_IFDIR | 0555U;
         return 0;
     }
     if (length == 7U && !memcmp(name, "meminfo", length)) {
@@ -216,7 +240,9 @@ static int proc_open(struct kernel_vfs_mount *mount, const char *path,
     (void)path;
     if ((inode != PROC_ROOT_INODE && inode != PROC_MEMINFO_INODE &&
          inode != PROC_UPTIME_INODE && inode != PROC_SELF_INODE &&
-         inode != PROC_MOUNTS_INODE &&
+         inode != PROC_MOUNTS_INODE && inode != PROC_SYS_INODE &&
+         inode != PROC_KERNEL_INODE && inode != PROC_RT_PERIOD_INODE &&
+         inode != PROC_RT_RUNTIME_INODE &&
          (proc_inode_kind(inode) != PROC_PID_DIR_KIND &&
           proc_inode_kind(inode) != PROC_PID_EXE_KIND &&
           proc_inode_kind(inode) != PROC_PID_CWD_KIND &&
@@ -252,6 +278,8 @@ static int proc_open(struct kernel_vfs_mount *mount, const char *path,
         instance->heap, 1U, sizeof(*node), (void **)&node);
     if (status != KERNEL_HEAP_STATUS_OK)
         return status == KERNEL_HEAP_STATUS_EMPTY ? -KERNEL_ENOMEM : -KERNEL_EIO;
+    node->generated_control = inode == PROC_RT_PERIOD_INODE ||
+                              inode == PROC_RT_RUNTIME_INODE;
     node->inode = inode;
     node->mode = mode;
     return kernel_vfs_publish_node(mount, node, file, 0);
@@ -310,6 +338,22 @@ static int proc_dir_entry(struct kernel_vfs_file *file, uint64_t position,
     /* EOF 不推进 cookie；有效项必须以正值返回。 */
     *next_position = position;
     uint64_t directory = kernel_vfs_file_inode(file);
+    if (directory == PROC_SYS_INODE || directory == PROC_KERNEL_INODE) {
+        if (position > (directory == PROC_SYS_INODE ? 2U : 3U)) return 0;
+        const char *entry = position == 0 ? "." : position == 1 ? ".." :
+            directory == PROC_SYS_INODE ? "kernel" : position == 2 ?
+            "sched_rt_period_us" : "sched_rt_runtime_us";
+        size_t length = strlen(entry) + 1U;
+        if (name_size < length) return -KERNEL_ERANGE;
+        memcpy(name, entry, length);
+        *next_position = position + 1U;
+        *inode = position == 0 ? directory : position == 1 ?
+            (directory == PROC_SYS_INODE ? PROC_ROOT_INODE : PROC_SYS_INODE) :
+            directory == PROC_SYS_INODE ? PROC_KERNEL_INODE : position == 2 ?
+            PROC_RT_PERIOD_INODE : PROC_RT_RUNTIME_INODE;
+        *type = position < 2 || directory == PROC_SYS_INODE ? 4U : 8U;
+        return 1;
+    }
     if (directory != PROC_ROOT_INODE &&
         proc_inode_kind(directory) != PROC_PID_DIR_KIND &&
         proc_inode_kind(directory) != PROC_PID_FD_DIR_KIND)
@@ -378,16 +422,17 @@ static int proc_dir_entry(struct kernel_vfs_file *file, uint64_t position,
     else if (position == 3U) entry_name = "uptime";
     else if (position == 4U) entry_name = "self";
     else if (position == 5U) entry_name = "mounts";
-    else if (position >= 6U) {
+    else if (position == 6U) entry_name = "sys";
+    else if (position >= 7U) {
         kernel_pid_t pid;
         uint64_t identity;
-        if (position - 6U >= INT32_MAX ||
-            kernel_proc_next_process((kernel_pid_t)(position - 6U),
+        if (position - 7U >= INT32_MAX ||
+            kernel_proc_next_process((kernel_pid_t)(position - 7U),
                                       &pid, &identity)) return 0;
         size_t length = decimal(name, (uint32_t)pid);
         if (name_size <= length) return -KERNEL_ERANGE;
         name[length] = '\0';
-        *next_position = 6U + (uint32_t)pid;
+        *next_position = 7U + (uint32_t)pid;
         *inode = proc_pid_inode(pid, identity, PROC_PID_DIR_KIND);
         *type = 4U;
         return 1;
@@ -399,9 +444,10 @@ static int proc_dir_entry(struct kernel_vfs_file *file, uint64_t position,
     *inode = position == 2U ? PROC_MEMINFO_INODE :
              position == 3U ? PROC_UPTIME_INODE :
              position == 4U ? PROC_SELF_INODE :
-             position == 5U ? PROC_MOUNTS_INODE : PROC_ROOT_INODE;
+             position == 5U ? PROC_MOUNTS_INODE :
+             position == 6U ? PROC_SYS_INODE : PROC_ROOT_INODE;
     *type = position == 4U || position == 5U ? 10U :
-            position >= 2U ? 8U : 4U;
+            position >= 2U && position != 6U ? 8U : 4U;
     return 1;
 }
 
@@ -563,6 +609,76 @@ static size_t decimal(char *buffer, uint64_t value)
     } while (value);
     for (size_t i = 0U; i < length; i++) buffer[i] = reverse[length - i - 1U];
     return length;
+}
+
+static int proc_space(unsigned char c)
+{
+    return c == ' ' || (c >= '\t' && c <= '\r');
+}
+
+static unsigned proc_digit(unsigned char c)
+{
+    return c >= '0' && c <= '9' ? (unsigned)(c - '0') :
+           c >= 'a' && c <= 'f' ? c - 'a' + 10U :
+           c >= 'A' && c <= 'F' ? c - 'A' + 10U : 16U;
+}
+
+static int proc_control(struct kernel_vfs_node *node, int write,
+    uint64_t offset, char *buffer, size_t size, size_t *count)
+{
+    *count = 0;
+    if (!size) return 0;
+    if (!write) {
+        if (offset) return 0;
+        int64_t period, runtime;
+        kernel_scheduler_rt_bandwidth_get(&period, &runtime);
+        int64_t value = node->inode == PROC_RT_RUNTIME_INODE ? runtime : period;
+        char text[24];
+        size_t length = 0;
+        if (value < 0) text[length++] = '-';
+        length += decimal(text + length, value < 0 ? (uint64_t)-value : (uint64_t)value);
+        text[length++] = '\n';
+        if (length > size) length = size;
+        memcpy(buffer, text, length);
+        *count = length;
+        return 0;
+    }
+    /* Linux first-position-only sysctl still copies the whole write first. */
+    if (offset) { *count = size; return 0; }
+    size_t limit = size > BOAROS_PAGE_SIZE - 1U ? BOAROS_PAGE_SIZE - 1U : size;
+    size_t position = 0;
+    while (position < limit && proc_space((unsigned char)buffer[position])) position++;
+    size_t start = position;
+    int negative = position < limit && buffer[position] == '-';
+    if (negative) position++;
+    if (position == limit || buffer[position] < '0' || buffer[position] > '9')
+        return -KERNEL_EINVAL;
+    unsigned base = 10;
+    if (buffer[position] == '0') {
+        base = 8;
+        if (position + 2U < limit &&
+            (buffer[position + 1U] == 'x' || buffer[position + 1U] == 'X') &&
+            proc_digit((unsigned char)buffer[position + 2U]) < 16U) {
+            base = 16;
+            position += 2U;
+        }
+    }
+    uint64_t value = 0;
+    while (position < limit && proc_digit((unsigned char)buffer[position]) < base) {
+        unsigned digit = proc_digit((unsigned char)buffer[position]);
+        if (value > (UINT64_MAX - digit) / base) return -KERNEL_EINVAL;
+        value = value * base + digit;
+        if (++position - start >= 21U) return -KERNEL_EINVAL;
+    }
+    if (position < limit && buffer[position] != ' ' &&
+        buffer[position] != '\t' && buffer[position] != '\n') return -KERNEL_EINVAL;
+    if (value > (negative ? UINT64_C(2147483648) : INT32_MAX)) return -KERNEL_EINVAL;
+    int result = kernel_scheduler_rt_bandwidth_set(
+        node->inode == PROC_RT_RUNTIME_INODE, negative ? -(int64_t)value : (int64_t)value);
+    if (result) return result;
+    while (position < limit && proc_space((unsigned char)buffer[position])) position++;
+    *count = size - (limit - position);
+    return 0;
 }
 
 static size_t append_kib(char *buffer, const char *label, uint64_t bytes)
@@ -803,12 +919,23 @@ static int proc_process_snapshot(struct kernel_vfs_node *node,
             process.major_faults, process.child_major_faults,
             process.user_ticks, process.kernel_ticks,
             process.child_user_ticks, process.child_kernel_ticks,
-            20U, 0U, process.threads, 0U, process.start_ticks,
+            (uint64_t)(int64_t)process.scheduling_priority,
+            0U, process.threads, 0U, process.start_ticks,
             process.virtual_bytes, process.resident_pages,
+            UINT64_MAX, process.start_code, process.end_code,
+            process.start_stack, 0U, 0U,
+            process.signal_pending, process.signal_blocked,
+            process.signal_ignored, process.signal_caught,
+            process.wait_channel_flag, 0U, 0U, 17U, 0U, process.rt_priority,
+            process.scheduling_policy,
         };
         for (size_t i = 0U; i < sizeof(fields) / sizeof(fields[0]); i++) {
             data[used++] = ' ';
-            used += decimal(data + used, fields[i]);
+            if (i == 9U && process.scheduling_priority < 0) {
+                data[used++] = '-';
+                used += decimal(data + used,
+                                (uint32_t)-process.scheduling_priority);
+            } else used += decimal(data + used, fields[i]);
         }
         data[used++] = '\n';
     } else {
@@ -940,6 +1067,7 @@ static void initialize_backend(void)
     ops->statfs = proc_statfs;
     ops->dir_entry = proc_dir_entry;
     ops->snapshot = proc_snapshot;
+    ops->control = proc_control;
     ops->accessed = proc_accessed;
     ops->unmount = proc_unmount;
 }

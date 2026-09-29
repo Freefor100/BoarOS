@@ -50,6 +50,7 @@ struct kernel_vfs_node {
     uint8_t closed;
     uint8_t unlinked;
     uint8_t retired;
+    uint8_t generated_control;
 };
 
 struct kernel_vfs_path {
@@ -93,6 +94,9 @@ struct kernel_vfs_backend {
      * releases it and creates a new one after seek to offset zero. */
     int (*snapshot)(struct kernel_vfs_node *node, struct kernel_heap *heap,
         char **buffer, size_t *length);
+    /* Controls use a complete kernel buffer; failure never commits user offset. */
+    int (*control)(struct kernel_vfs_node *node, int write, uint64_t offset,
+        char *buffer, size_t size, size_t *count);
     int (*truncate)(struct kernel_vfs_node *node, uint64_t size, uint64_t *actual, int *changed);
     int (*close_node)(struct kernel_vfs_node *node);
     int (*writeback_allowed)(struct kernel_vfs_instance *instance);

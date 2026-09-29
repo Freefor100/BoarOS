@@ -95,6 +95,7 @@ struct riscv_kernel_mm_record {
     uint32_t references;
     uint32_t users;
     enum riscv_kernel_mm_record_stage stage;
+    uint64_t start_code, end_code, start_stack;
     uint64_t start_brk;
     uint64_t current_brk;
     uint64_t brk_limit;
@@ -1048,6 +1049,9 @@ enum kernel_mm_status kernel_mm_fork(
         for (struct riscv_file_mapping *entry = destination_record->file_mappings;
              entry != 0; entry = entry->next)
             kernel_file_mapping_register(&entry->registration);
+        destination_record->start_code = source_record->start_code;
+        destination_record->end_code = source_record->end_code;
+        destination_record->start_stack = source_record->start_stack;
         destination_record->start_brk = source_record->start_brk;
         destination_record->current_brk = source_record->current_brk;
         destination_record->brk_limit = source_record->brk_limit;
@@ -1388,6 +1392,24 @@ enum kernel_mm_status kernel_mm_executable_path_acquire(
     return KERNEL_MM_STATUS_OK;
 }
 
+enum kernel_mm_status kernel_mm_set_exec_layout(
+    struct kernel_mm *mm, uint64_t start_code, uint64_t end_code,
+    uint64_t start_stack)
+{
+    struct riscv_kernel_mm_record *record;
+    enum kernel_mm_status status = resolve_record(mm, &record);
+    if (status != KERNEL_MM_STATUS_OK) return status;
+    if (record->stage != RISCV_KERNEL_MM_RECORD_LIVE)
+        return KERNEL_MM_STATUS_STATE;
+    if (start_code > end_code || end_code >= RISCV_SV39_USER_LIMIT ||
+        start_stack >= RISCV_SV39_USER_LIMIT)
+        return KERNEL_MM_STATUS_INVALID_ARGUMENT;
+    record->start_code = start_code;
+    record->end_code = end_code;
+    record->start_stack = start_stack;
+    return KERNEL_MM_STATUS_OK;
+}
+
 enum kernel_mm_status kernel_mm_proc_memory_snapshot(
     const struct kernel_mm *mm, struct kernel_mm_proc_memory *snapshot)
 {
@@ -1398,6 +1420,9 @@ enum kernel_mm_status kernel_mm_proc_memory_snapshot(
     if (record->stage != RISCV_KERNEL_MM_RECORD_LIVE || !record->vmas)
         return KERNEL_MM_STATUS_STATE;
     *snapshot = (struct kernel_mm_proc_memory){
+        .start_code = record->start_code,
+        .end_code = record->end_code,
+        .start_stack = record->start_stack,
         .virtual_bytes = kernel_vma_set_total_bytes(record->vmas),
         .resident_pages = (uint64_t)record->space.leaf_pages +
                           record->space.protected_pages,

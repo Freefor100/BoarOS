@@ -130,8 +130,28 @@ int kernel_proc_process_snapshot(kernel_pid_t pid, uint64_t identity,
                  task->state == KERNEL_THREAD_STATE_STOPPED ? 'T' : 'S',
         .child_minor_faults = leader->child_minor_faults,
         .child_major_faults = leader->child_major_faults,
+        .signal_pending = leader->signal_pending & UINT64_C(0x7fffffff),
+        .signal_blocked = leader->signal_blocked & UINT64_C(0x7fffffff),
         .threads = threads,
+        .scheduling_priority = leader->scheduling.priority
+            ? -(leader->scheduling.priority + 1) : 20,
+        .rt_priority = (uint32_t)leader->scheduling.priority,
+        .scheduling_policy = (uint32_t)leader->scheduling.policy,
     };
+    result->wait_channel_flag = threads < 2U &&
+        task->state != KERNEL_THREAD_STATE_RUNNING &&
+        task->state != KERNEL_THREAD_STATE_READY;
+    const struct kernel_signal_table *actions =
+        (const void *)(uintptr_t)leader->signal_table_address;
+    if (actions) {
+        if (actions->magic != KERNEL_SIGNAL_TABLE_MAGIC) __builtin_trap();
+        for (unsigned sig = 0; sig < 31U; sig++) {
+            if (actions->actions[sig].handler == KERNEL_SIGNAL_IGN)
+                result->signal_ignored |= UINT64_C(1) << sig;
+            else if (actions->actions[sig].handler != KERNEL_SIGNAL_DFL)
+                result->signal_caught |= UINT64_C(1) << sig;
+        }
+    }
     memcpy(result->comm, leader->comm, sizeof(result->comm));
     kernel_task_cpu_ticks(task, &result->user_ticks,
         &result->kernel_ticks, &result->child_user_ticks,
@@ -151,6 +171,9 @@ int kernel_proc_process_snapshot(kernel_pid_t pid, uint64_t identity,
         }
         result->virtual_bytes = memory.virtual_bytes;
         result->resident_pages = memory.resident_pages;
+        result->start_code = memory.start_code;
+        result->end_code = memory.end_code;
+        result->start_stack = memory.start_stack;
     }
     riscv_interrupt_restore(irq);
     return 0;

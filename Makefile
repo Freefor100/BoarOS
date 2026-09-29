@@ -173,6 +173,9 @@ C_SOURCES := \
 	kernel/random.c \
 	kernel/blake2s.c \
 	kernel/sched/core.c \
+	kernel/sched/policy.c \
+	kernel/sched/runqueue.c \
+	kernel/sched/scheduling.c \
 	kernel/sched/exec.c \
 	kernel/sched/process.c \
 	kernel/sched/proc.c \
@@ -189,6 +192,7 @@ C_SOURCES := \
 	kernel/syscall/socket.c \
 	kernel/syscall/time.c \
 	kernel/syscall/random.c \
+	kernel/syscall/sched.c \
 	arch/riscv/signal.c \
 	kernel/tick.c \
 	kernel/time.c \
@@ -256,6 +260,9 @@ TEST_RUNTIME_C_SOURCES := \
 	kernel/random.c \
 	kernel/blake2s.c \
 	kernel/sched/core.c \
+	kernel/sched/policy.c \
+	kernel/sched/runqueue.c \
+	kernel/sched/scheduling.c \
 	kernel/sched/exec.c \
 	kernel/sched/process.c \
 	kernel/sched/proc.c \
@@ -272,6 +279,7 @@ TEST_RUNTIME_C_SOURCES := \
 	kernel/syscall/socket.c \
 	kernel/syscall/time.c \
 	kernel/syscall/random.c \
+	kernel/syscall/sched.c \
 	arch/riscv/signal.c \
 	kernel/tick.c \
 	kernel/time.c \
@@ -1495,3 +1503,25 @@ test-virtio-rng-host:
 	cc -std=c11 -Wall -Wextra -Werror -Itests/host/random -Iinclude \
 		tests/host/virtio_rng_test.c arch/riscv/virtio_mmio_rng.c -o build/host/virtio-rng
 	build/host/virtio-rng
+
+.PHONY: test-sched-policy-host
+test-sched-policy-host:
+	@mkdir -p build/host
+	cc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -Iinclude \
+		tests/host/sched_policy_test.c kernel/sched/policy.c -o build/host/sched-policy
+	build/host/sched-policy
+	cc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -Iinclude \
+		tests/host/sched_runqueue_test.c kernel/sched/runqueue.c -o build/host/sched-runqueue
+	build/host/sched-runqueue
+	cc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -Itests/host/random -Iinclude \
+		tests/host/sched_syscall_test.c kernel/syscall/sched.c kernel/sched/policy.c -o build/host/sched-syscall
+	build/host/sched-syscall
+
+.PHONY: test-multi-disk-rt-riscv
+test-multi-disk-rt-riscv: $(KERNEL_RV) $(MULTI_DISK_IO_RV) build/host/nbd-fault
+	PYTHONDONTWRITEBYTECODE=1 python3 tests/multi-disk-io-riscv.py \
+		--kernel $(KERNEL_RV) --program $(MULTI_DISK_IO_RV) --qemu $(QEMU_RISCV64) --rt-load
+
+.PHONY: test-sched-bandwidth-riscv
+test-sched-bandwidth-riscv: $(KERNEL_RV) $(MUSL_STAMP)
+	KERNEL_RV=$(KERNEL_RV) QEMU_RISCV64=$(QEMU_RISCV64) sh tests/sched-bandwidth-riscv.sh

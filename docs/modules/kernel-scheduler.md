@@ -1,12 +1,14 @@
 # 内核调度、线程组与生命周期
 
-本文记录单 hart FIFO 调度、线程组资源、clone/exec/wait 和回收契约。背景见[线程组与 futex](../learning/threads-and-futex.md)，信号、文件资源、MM 的稳定边界分别见对应模块文档。
+本文记录单 hart OTHER/FIFO/RR 调度、线程组资源、clone/exec/wait 和回收契约。背景见[线程组与 futex](../learning/threads-and-futex.md)，信号、文件资源、MM 的稳定边界分别见对应模块文档。
 
 ## 实现入口
 
 | 文件 | 职责 |
 |---|---|
-| `kernel/sched/core.c` | 创建、ready FIFO、tick 抢占、资源借用校验 |
+| `kernel/sched/core.c` | 创建、切换、tick 入口、资源借用校验 |
+| `kernel/sched/policy.c`、`runqueue.c` | 纯策略/预算状态机、分级 ready 队列 |
+| `kernel/sched/scheduling.c`、`kernel/syscall/sched.c` | 实际运行时间记账、抢占、安全返回边界、策略与 CPU0 affinity ABI |
 | `kernel/sched/process.c` | clone、线程组/父子树、wait、退出、回收与记账 |
 | `kernel/pid.c` | 统一身份对象、编号/代次、引用与 TID/TGID/PGID/SID 角色成员 |
 | `kernel/sched/proc.c` | 进程快照、对象路径与缺页/磁盘读取统计 |
@@ -20,6 +22,20 @@
 | `kernel/sched/private.h` | 私有任务布局、组与队列成员关系 |
 
 公共 scheduler 头不暴露 Trap Frame；架构 clone 入口位于 `include/arch/riscv/process.h`。syscall 通过不透明 task 接口取得 TID/TGID/PPID 和资源，不直接修改调度私有字段。
+
+## 策略、就绪队列与 RT 预算
+
+OTHER 保留 100 Hz tick 轮转，内核 worker 使用 OTHER。FIFO/RR 的用户优先级为 1–99，数值越大越优先；FIFO 不因 tick 同级轮转，RR 每片 100ms，按实际在 CPU 上运行的纳秒扣除。更高优先级抢占、阻塞和 yield 不重新赠送 RR 时间片；耗尽后才重装。唤醒及策略修改标记 need_resched，在 IRQ 或返回用户态的安全边界切换。降优先级排到新级队首，升优先级排队尾，同级修改保留位置；高优先级抢占的当前任务回原级队首。
+
+ready 节点独立于 blocked/cleanup 链。全局优先级排序双链保留遍历视图，100 个等级各存 head/tail；同级插入、OTHER 尾追加、删除和选取均 O(1)，新增空的中间等级最多扫描 99 个等级，不扫描任务数。RT 被节流时只取 OTHER 队首；没有 OTHER 则 idle，不能借机运行已耗尽的 RT。
+
+全局预算默认 period=1,000,000us、runtime=950,000us，仅运行中的 FIFO/RR 扣费，阻塞及 idle 不扣。周期补充不积累旧余额；runtime=-1 禁用节流，0 不允许运行 RT。控制更新在 IRQ 临界区先结算旧配置下的实际运行，校验 period>0、runtime>=-1 且 runtime<=period（-1除外）、两值均不超过 INT_MAXus。runtime 修改不清消费；相同 period 写入不重开周期，改变 period 时从当前时刻建立新长度但保留已消费值。proc 控件见 [procfs](procfs.md)。
+
+硬件 timer 取普通 tick、RT 配额耗尽/补充和 RR 片尾中的最早期限。预算 IRQ 可以返回 elapsed_ticks=0；此时仍重新记账调度，但不推进 tick、CPU tick 统计或 coarse clock。实际运行时间由切换、策略/配置修改和 timer 入口结算，精度受关中断临界区与模拟器 IRQ 延迟限制。用户访问复制与可睡眠路径不放在调度状态锁内。
+
+sched_setparam/setscheduler/getparam/getscheduler、priority_min/max、rr_get_interval 和 CPU0 affinity 使用真实任务状态；未发布 child 不可被按 TID 查询。BATCH/IDLE/DEADLINE/EXT 的 min/max 查询按固定 Linux 返回 0，设置这些策略仍显式拒绝。RESET_ON_FORK 在子任务清除并将继承的 RT 变为 OTHER；exec 保留执行线程的策略。没有实现 nice 调度、SMP、cgroup 配额或 deadline scheduler。
+
+确定性 host 测试 `tests/host/sched_{policy,runqueue,syscall}_test.c` 覆盖预算、排队、ABI 和随机队列模型。`tests/diff-abi/sched_policy.c` 的 23 条同 ELF Linux 对照覆盖参数及真实 FIFO/yield/更高优先级抢占/RR轮转；`sched_stat.c` 另有5条策略stat和STOPPED/zombie wchan对照。`tests/sched-bandwidth-riscv.sh` 使用真实 FIFO 忙循环验证耗尽、OTHER 进展、周期恢复、同值写不补预算和 -1 切换保留消费；500us/250us 场景先等待新 coarse tick，再检查8ms以内被抢占并报告实际超出量。RR 在高优先级任务运行60ms后仍只剩约40ms，能检出错误重装100ms的实现。两个先阻塞后赋RR策略的子进程由同一pipe write唤醒，在100ms quota/300ms period下验证同时到期仍把CPU交给同级peer；旧队首重排已由该测试复现失败。该测试直接调用 SYS_sched_setscheduler，固定 musl 的同名包装函数是 ENOSYS 存根。测试用 guest monotonic 计时，不由 QEMU 墙钟速度推断调度正确性。
 
 ## 身份与资源
 
@@ -91,7 +107,7 @@ zombie 先逻辑回收再复制 status/rusage，因此坏输出指针的 EFAULT 
 
 每线程拥有独立的 4 KiB 元数据页和 8 KiB 连续物理内核栈（buddy order 1）；调度器初始化要求分配器已进入 finalized buddy 模式，栈分配、构造回滚与正常释放使用同一 order。栈底留 16 字节对齐区和 canary，剩余 8176 字节包含 Trap Frame 与 C 调用链。新栈填充固定字节，初始用户 Trap Frame 显式清零。退出后只在其他可信栈扫描未覆盖前缀；累计最小剩余空间和最大已用空间由只读统计接口提供，生产 PID 1 完成时报告。构造回滚同样释放独立栈，不让资源清理失败保留它。
 
-`make test-stack-usage` 强制重建隔离的生产对象，编译器 `-fstack-usage` 产出逐函数记录；host probe 从实际栈配置和 Trap Frame 头计算容量、guard、汇编 Frame 与余量预算，避免测试大栈或旧报告污染门禁。`tests/stack-usage.py` 拒绝超出“栈容量减 16 字节、288 字节汇编 Trap Frame、1024 字节余量”的单帧及无界动态栈；该检查不能证明完整调用链。真实 root-init、静态 musl 与动态 pthread 测试另要求已退出任务的最小实测余量至少 1024 字节，不足时必须扩大栈后重新运行。Canary 用于发现破坏，填充测量用于观察高水位；两者都不等价于未映射 guard page，也不证明未执行分支的栈界。ASID 0 的切换刷新成本、FIFO/100 Hz tick、线性 wait4 与 deadline 扫描仍存在。
+`make test-stack-usage` 强制重建隔离的生产对象，编译器 `-fstack-usage` 产出逐函数记录；host probe 从实际栈配置和 Trap Frame 头计算容量、guard、汇编 Frame 与余量预算，避免测试大栈或旧报告污染门禁。`tests/stack-usage.py` 拒绝超出“栈容量减 16 字节、288 字节汇编 Trap Frame、1024 字节余量”的单帧及无界动态栈；该检查不能证明完整调用链。真实 root-init、静态 musl 与动态 pthread 测试另要求已退出任务的最小实测余量至少 1024 字节，不足时必须扩大栈后重新运行。Canary 用于发现破坏，填充测量用于观察高水位；两者都不等价于未映射 guard page，也不证明未执行分支的栈界。ASID 0 的切换刷新成本、OTHER 的 100 Hz tick、线性 wait4 与 deadline 扫描仍存在。
 
 聚焦入口为 `make test-stack-usage`、`make test-scheduler-cases-riscv`、`make test-scheduler-riscv`、`make test-files-riscv` 和 `make test-signal-riscv`；`make test-userland-riscv` 验证真实 pthread、共享匿名 futex、bitset 绝对 realtime 等待在 stop/continue 后保留掩码和截止时刻。`make test-diff-abi-riscv` 用同一 ELF 对照固定 Linux 的零掩码、超时、错误、按掩码唤醒和 requeue；`make test-glibc-riscv` 验证 glibc 2.44 的 `pthread_join` 消费路径。阶段收口使用 `make test-riscv`。各次实际通过范围以 README 和提交验证说明为准，不把实现路径存在等同于全部线程负载已验证。
 
@@ -118,3 +134,7 @@ zombie 先逻辑回收再复制 status/rusage，因此坏输出指针的 EFAULT 
 `test-scheduler-cases-riscv` 验证任务数、活动负载、空闲等待衰减及不可中断等待增长，末引用释放回到页基线；`test-io-sleep-riscv` 覆盖 worker 构造 OOM 与退出清理。
 
 身份对象独立契约验证：`cc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -Iinclude tests/pid-object-host.c kernel/pid.c -o /tmp/boaros-pid-object-test && /tmp/boaros-pid-object-test`；覆盖角色转移、最后成员与 pin 分离、编号复用后的新代次、容量与代次耗尽回滚。调度组合验证沿用 `make test-scheduler-cases-riscv test-scheduler-riscv` 与 `make test-userland-riscv`。
+
+真实消费者的独立调用链诊断见 [session-consumers](../learning/session-consumers.md)：
+固定 BusyBox setsid/chrt/taskset、musl daemon 和原 iperf3/cyclictest，
+使用 QEMU 用户态 ecall 入口观察器，不修改原 ELF、不计分。
