@@ -15,7 +15,8 @@ BoarOS 是从零搭建、面向 OS Comp 能力建设的 C / 少量汇编内核�
 | 启动与内存 | OpenSBI、DTB、高半区/direct map、buddy/slab、连续页和引用回收 | 无 SMP；任务栈有 canary/高水位，没有未映射 guard page |
 | 虚拟内存 | VMA、按需匿名页、共享匿名与共享文件映射、文件私有 COW、共享文件首次写追踪、`msync`、跨 MM 截断撤映射 | 无 `mremap`、共享文件 futex、匿名共享页 swap 回收或 SMP 页表同步 |
 | ELF / exec | shebang、按需 ELF、PIE、`PT_INTERP`、初始栈/auxv、musl DSO/TLS、固定 glibc 2.44 启动/TLS/pthread 子集、失败保持旧映像 | 无 `execveat`；glibc 应用覆盖尚有限 |
-| 进程与等待 | 统一 TID/TGID/PGID/SID 身份对象、会话/进程组、fork/vfork、child-TID 生命周期差分、pthread clone、线程组退出、非组长 exec、wait/zombie/reparent、FIFO 抢占、时钟与睡眠 | 合法 clone 组合仍有限；无 TTY 作业控制；单 hart 关中断不等于跨核同步 |
+| 进程与等待 | 统一 TID/TGID/PGID/SID 身份对象、会话/进程组、fork/vfork、child-TID 生命周期差分、pthread clone、线程组退出、非组长 exec、wait/zombie/reparent、时钟与睡眠 | 合法 clone 组合仍有限；无 TTY 作业控制；单 hart 关中断不等于跨核同步 |
+| 调度 | OTHER tick 轮转、FIFO/RR 1–99 优先级、CPU0 affinity、RESET_ON_FORK、可配置全局实时预算及 proc 查询 | 默认 1 秒 / 950 毫秒；无 nice 权重、PI、SMP 或硬实时保证 |
 | 随机数 | ChaCha20 fast-key-erasure、BLAKE2s 混种、legacy/modern VirtIO RNG、`getrandom` 与 random/urandom 字符节点 | QEMU 宿主是信任边界；DTB/用户写入不计可信熵，缺设备时保持未就绪 |
 | futex / 信号 | WAIT/WAKE/REQUEUE、超时/重启、跨 MM 共享匿名 futex、同 MM 非 PI robust-list 退出清理、标准信号、用户 handler、`rt_sigtimedwait` | 无共享文件 futex、PI futex、实时信号队列和 `sigaltstack`；单 hart 验证范围 |
 | 文件与事件 | fd/OFD 分离、dup/CLOEXEC、共享 offset、阻塞 pin、部分/向量/定位 I/O、pipe、poll/select/epoll；传统与 OFD 记录锁；socket OFD 与读写/就绪；mknodat 字符节点按设备号接入 null、zero、console | 无 devfs、完整 TTY；设备 mmap 未支持 |
@@ -29,13 +30,13 @@ BoarOS 是从零搭建、面向 OS Comp 能力建设的 C / 少量汇编内核�
 
 文件层已有部分读写、OFD 生命周期、稀疏文件与映射截断的语义深度；显式时间设置和真实挂载统计已接入；共享匿名映射已迁移统一稀疏内存后备对象，与共享文件页均可跨 MM 读写，完整 TTY 仍有缺口。ext4 恢复已覆盖 512 字节原子写、未 flush 写丢失或重排的故障模型；实板持久性仍待独立验证。固定 glibc 2.44 的五种 ELF 形态与 TLS/pthread/信号组合已双侧验证，完整 glibc 应用兼容尚未证明。
 
-内存统计按文件页、共享匿名/tmpfs 后备页和各盘块缓冲真实 owner 计量；`sysinfo` 返回真实任务数与 1/5/15 分钟负载。原镜像 BusyBox `free` 已显示有效容量，LTP 越过缺失 `Cached` 的阻塞。已新增由真实 timer 快照支持的 coarse clock，并通过窄差分；原 `utime` 完整复跑属于本阶段后续验收。LTP cgroup 辅助程序等待已独立定位，见[路线与验收](docs/goals.md)。
+内存统计按文件页、共享匿名/tmpfs 后备页和各盘块缓冲真实 owner 计量；`sysinfo` 返回真实任务数与 1/5/15 分钟负载。原镜像 BusyBox `free` 已显示有效容量，LTP 越过缺失 `Cached` 的阻塞。已新增由真实 timer 快照支持的 coarse clock，并通过窄差分；原静态/动态 glibc `utime` 各 30 次复跑通过，诊断环境边界见[文件时间](docs/learning/file-timestamps.md)。LTP cgroup 辅助程序等待已独立定位，见[路线与验收](docs/goals.md)。
 
 固定 SQLite 3.53.4 的原生 Unix VFS 已在单 hart 上运行静态/动态 CLI、多进程 DELETE 回滚日志和普通多进程 WAL，并验证第二盘 WAL 的独立重启读回；WAL 工作负载用同一 ELF 在固定 Linux 与 BoarOS 验证 writer 竞争、未提交进程退出及第二次启动后的完整性。DELETE 与 WAL 的 EXTRA/FULL 恢复各有 NBD 断电/故障矩阵；实板持久性未验证。
 
 客体内固定 Alpine v3.22 RV64 GCC 14.2.0-r6 已在同一离线镜像上完成预处理、编译、汇编、静态链接和运行；固定 Linux 与 BoarOS 的五阶段状态、产物哈希和输出一致。同一编译流程也通过 tmpfs 工作目录；产物复制到根盘供比对，不代表 tmpfs 持久。范围是固定的小型 C 负载，其他项目和 Rust 尚未验收。
 
-固定 BusyBox/libc-test 最近一次全量清单为 228 项、227 项双侧通过，原 BusyBox 包装器仍有已知缺口；身份、日期及逐项边界见[程序清单](docs/learning/user-program-inventory.md)。通用 ABI 差分 797 条匹配，包含 tmpfs、硬链接与共享映射时间语义；成本门禁见[单核规模回归](docs/learning/single-hart-scale.md)，不以 QEMU 墙钟倍数宣称性能。
+固定 BusyBox/libc-test 最近一次全量清单为 228 项、227 项双侧通过，原 BusyBox 包装器仍有已知缺口；身份、日期及逐项边界见[程序清单](docs/learning/user-program-inventory.md)。通用 ABI 差分 1000 条匹配，包含 tmpfs、硬链接与共享映射时间语义；成本门禁见[单核规模回归](docs/learning/single-hart-scale.md)，不以 QEMU 墙钟倍数宣称性能。
 
 ## 构建与验证
 
@@ -52,6 +53,9 @@ make test-scale-riscv           # I/O 分块、用户页解析、驻留查找与
 make test-lwip-host             # loopback、UDP 池耗尽/重用、TCP 定时回收
 make test-random-host           # 密码向量、就绪与设备契约
 make test-rng-riscv             # 两种 VirtIO 传输、延迟/取消与退出回收
+make test-sched-policy-host     # 策略、队列模型与调度 ABI
+make test-sched-bandwidth-riscv # 实时预算、RR 余片、普通任务进展
+make test-multi-disk-rt-riscv   # 实时负载下双盘与清理进展
 make test-record-lock-host      # 区间树随机模型、所有权与分配失败
 make test-record-lock-riscv     # 同 ELF 的 Linux/BoarOS 线程、fork、fd 复用、退出
 make test-nbd-host              # NBD 协议、易失/稳定镜像与断电策略
@@ -86,7 +90,7 @@ make test-references
 
 [开发路线](docs/goals.md)统一记录本轮任务、分支交接和后续依赖。通用兼容性在 `main`，比赛环境与运行入口在 `oscomp-rv-compat`；后者单向合入已验收主线。只跑 RV 的原 judge 评分不等于双架构比赛交付，也不能把逐组诊断分数拼成正式总分。
 
-已按统一 VFS 对象路线分阶段拆分 ext4 后端、实现挂载路径和首批真实 procfs。真实内存快照、RV64 sysinfo、后台写回及 proc fd 复用压力已接入；统一内存后备对象、tmpfs、硬链接和真实第二 ext4 磁盘已接入，验收见[多挂载证据](docs/learning/memory-backed-mounts.md)。下一阶段设计会话/进程组、可信随机数、调度与 coarse clock，netperf、iozone 先定位。SMP、LoongArch、实板和更大工具链按新基线另行排期。
+已按统一 VFS 对象路线分阶段拆分 ext4 后端、实现挂载路径和首批真实 procfs。真实内存快照、RV64 sysinfo、后台写回及 proc fd 复用压力已接入；统一内存后备对象、tmpfs、硬链接和真实第二 ext4 磁盘已接入，验收见[多挂载证据](docs/learning/memory-backed-mounts.md)。会话/进程组、可信随机数、真实调度与 coarse clock 已完成本轮验收；后续优先独立设计 AF_UNIX/socketpair 与 SysV 共享内存，netperf、iozone 继续定位。SMP、LoongArch、实板和更大工具链按新基线另行排期。
 
 - [文档导航](docs/README.md)：模块契约与可复用学习材料。
 - [工程原则](docs/design.md)与[贡献说明](CONTRIBUTING.md)：技术取舍、验证与提交边界。

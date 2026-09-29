@@ -20,7 +20,7 @@ enum kernel_syscall_status kernel_syscall_dispatch(
 - `KERNEL_SYSCALL_ACTION_EXEC`：新映像已经准备完成；不推进旧 `sepc`，由 scheduler 切换 MM 并重建 Trap Frame。
 - `KERNEL_SYSCALL_ACTION_CLONE`：参数符合当前支持的进程/线程 clone 子集；架构 Trap 层把完整寄存器快照交给进程层构造任务。
 - `KERNEL_SYSCALL_ACTION_WAIT4`：参数保持 Linux ABI 形态，由 scheduler 完成选择、阻塞、唤醒与 zombie 回收。
-- `KERNEL_SYSCALL_ACTION_YIELD`：忽略无参数调用的残留寄存器，由 scheduler 把当前任务重新排到 ready 队尾并在存在竞争者时切换。
+- `KERNEL_SYSCALL_ACTION_YIELD`：忽略无参数调用的残留寄存器，由 scheduler 把当前任务排到其优先级队尾，再按优先级与实时预算资格重选。
 - `KERNEL_SYSCALL_ACTION_SIGNAL_RETURN`：由架构信号返回路径恢复用户现场。
 - `KERNEL_SYSCALL_ACTION_EXIT_GROUP`：终止调用任务所属线程组，各成员沿原栈清理资源。
 
@@ -39,7 +39,7 @@ enum kernel_syscall_status kernel_syscall_dispatch(
 | pselect6/ppoll（72/73）、newfstatat/fstat（79/80） | [文件模块](kernel-files.md)：集合/信号屏蔽、stat 编码和元数据 |
 
 - `clock_gettime` 编号 113、`clock_getres` 编号 114、`gettimeofday` 编号 169、`clock_nanosleep` 编号 115 与 `nanosleep` 编号 101 构成时间族，语义见[内核时间模块](kernel-time.md)。
-- `sched_yield` 编号 124 在存在 READY 竞争者时把当前任务排到 ready 队尾并切换；无竞争者时立即返回 0。调度失败属于内核不变量破坏，由 Trap 边界 fatal。
+- `sched_yield` 编号 124 把当前任务排到其优先级队尾，再按优先级与实时预算资格重选；只有较低优先级 READY 任务时 FIFO/RR 可继续当前任务，RR 保留剩余时间片。调度失败属于内核不变量破坏，由 Trap 边界 fatal。
 - `exit` 编号 93 产生线程 `EXIT`，`exit_group` 编号 94 产生全组 `EXIT_GROUP`；状态保留参数 0 的低 8 位。组退出等待成员沿原内核调用栈释放在用资源，最后产生一次进程退出通知。
 - `set_tid_address` 编号 96 记录 clear_tid 用户指针并返回调用 TID；线程退出在释放 MM 前清零并唤醒同 key 的一个 futex waiter。坏用户指针不破坏内核状态。
 - `futex` 编号 98 支持 WAIT、WAKE、REQUEUE、WAIT_BITSET、WAKE_BITSET、PRIVATE 和 WAIT_BITSET 的 CLOCK_REALTIME 标志。key、FIFO、掩码、绝对/相对超时、错误码与同 MM 边界见[调度模块](kernel-scheduler.md)；无超时等待按 SA_RESTART 选择 EINTR 或重新等待，带超时等待的用户 handler 总是看到 EINTR、无 handler restart 保持原 absolute deadline。PI、wake-op、futex2 等命令仍返回 ENOSYS，不计作能力完成。

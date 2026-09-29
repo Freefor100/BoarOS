@@ -5,15 +5,23 @@
 Linux 为 `references/linux` 的 `f4cdf7ca9a1fdcca413157df19753f388a5a224e`。
 历史评审是调查输入，不自动成为设计批准。
 
-## 实施中：进程身份、可信随机数与真实调度
+## 已交付：进程身份、可信随机数与真实调度
 
-从 `main@b5593ca` 演进，已确认统一 TID/TGID/PGID/SID 对象、会话/进程组、
-coarse clock、VirtIO RNG 与随机接口，以及普通/FIFO/RR 和全局实时带宽控制。
-默认周期 1 秒、预算 950 毫秒；这是本项目选定参数，不代表固定 Linux 默认值。
-统一身份对象迁移已通过 scheduler/userland 和独立引用审查；coarse clock 的 14 条
-窄差分与 syscall/timer 模块通过，组合完整差分 797 条匹配。随机核心和 VirtIO RNG 已有 34 条新 ABI、两种传输的正常/缺设备/延迟/在途退出验收；组合差分 831 条匹配。会话/进程组的 105 条新增差分通过，独立源码组合为 936 条匹配；调度仍在集成。
-本阶段不扩展 TTY、完整凭据、PI futex、PID namespace 或 SMP；最终消费者与全量
-回归完成前，不把新增接口或编译成功当作交付。依据仍为本页固定 Linux 与 QEMU v11.1.0。
+从 `main@b5593ca` 演进，统一 TID/TGID/PGID/SID 身份对象、会话/进程组、
+coarse clock、VirtIO RNG 与随机接口，以及 OTHER/FIFO/RR、CPU0 affinity 和
+全局实时带宽已交付。默认周期 1 秒、预算 950 毫秒是本项目选定参数。
+完整差分 **1000 条匹配**；228 项清单 **227 pass、原 BusyBox 包装器 1 项失败**，
+逐 ID 无回退。固定 BusyBox、libc daemon、原 iperf/cyclictest 的实际调用链、
+原静态/动态 utime 各 30 次双侧复跑，以及普通/实时双盘进展均有证据。
+RISC-V、userland/glibc、规模、睡眠 I/O、栈、离线 GCC ext4/tmpfs、ext4 恢复与
+SQLite DELETE/WAL 完整矩阵通过；不同验证快照的边界明确分列。
+
+证据与重建命令见[完整差分](modules/differential-abi.md)、
+[程序清单](learning/user-program-inventory.md)、[消费者](learning/session-consumers.md)、
+[调度](learning/kernel-scheduling.md)及[恢复矩阵](learning/record-lock-sqlite-recovery.md)。
+本阶段未扩展 TTY、完整凭据、PI futex、PID namespace、nice 权重或 SMP，
+不承诺硬实时；iperf 网络连接、mlock、chown 和 cgroup 缺口保留独立归属。
+固定依据为本页 Linux 和 QEMU v11.1.0；实际运行 QEMU 为 11.1.1。
 
 ## 已交付：统一内存后备对象、tmpfs、硬链接与第二磁盘
 
@@ -82,13 +90,13 @@ RISC-V 全套、userland、glibc、栈及相关存储回归通过。契约见对
 |---|---|
 | libctest 包装器存在却 not found | P1h 真实 self/exe 已解除 BusyBox ENOEXEC 回退的前置阻塞；内部失败需按 libc 与 syscall 分别复现，不能再归为内核缺 shebang |
 | LTP 缺 meminfo，最终反复读 /proc/5/stat | 真实 Cached/MemAvailable 已交付；独立原 abort01 越过内存查询，首次停在 chown ENOSYS。历史反复查询不能据此推断等待死锁 |
-| LTP 到 `cgroup_fj_proc` 后无输出 | 独立 Linux/BoarOS 均在无参数 helper 的 sigsuspend 等待，3 秒后 SIGKILL/wait 正常；原 runner 无参数枚举辅助程序会耗尽预算。function 的参数、setpgid 与控制器缺口另列，见程序清单 learning |
+| LTP 到 `cgroup_fj_proc` 后无输出 | 独立 Linux/BoarOS 均在无参数 helper 的 sigsuspend 等待，3 秒后 SIGKILL/wait 正常；原 runner 无参数枚举辅助程序会耗尽预算。function 的参数和控制器缺口另列；本轮复跑已越过 setpgid，见程序清单 learning |
 | BusyBox df/ps/free 的实际内容 | 目录枚举修正后 ps 实际列出进程；df 仍因固定 BusyBox 跳过来源名 rootfs、proc 的块数为零而只显示表头；free 已由真实 sysinfo/meminfo 提供非零容量、缓存与可用量；df 的来源策略仍单列，不以退出 0 算内容正确 |
 | dmesg klogctl 未实现 | P5c 日志接口，必须有真实内容与权限边界 |
 | hwclock、kill 10 未计分 | P0 定位调用与目标状态；已有其他 kill 回归通过 |
-| cyclictest affinity ENOSYS、调度参数失败 | P2f 调度 ABI；完整依赖链另核实 |
+| cyclictest 原 affinity/调度阻塞 | 本轮原 ELF 已真实调用调度接口并完成 C:10；mlock 仍 ENOSYS，尚不声明完整延迟或锁页能力 |
 | hackbench 创建 fdpair 失败 | N2 先定位 socketpair/AF_UNIX 调用，不能直接扩大 TCP API |
-| iperf 缺 urandom、daemon 化失败 | P5c 随机设备；P2d 先缩小 daemon 首个失败调用 |
+| iperf 原随机/daemon 阻塞 | 原 iperf 客户端已越过随机接口与 affinity，当前停在 loopback connect ECONNRESET；另有独立 libc daemon 探针通过，未宣称原 iperf daemon 模式完成 |
 | iozone 吞吐 shmget ENOSYS | P4f SysV IPC；共享匿名 mmap 不等于 SysV 生命周期 |
 | iozone 自动模式能完成，慢写和日期异常 | P0/P7 分别复现时间 ABI 与写入成本；不是永久卡死证据 |
 | lmbench /tmp/hello 启动错误仍有计时 | 原镜像 hello 脚本写死 `/code/lmbench_src/bin/build/lmbench_all`，根盘缺该目录；评测分支按 libc 链接镜像自带二进制，不能把原环境缺口归为通用 exec 失败 |
@@ -99,12 +107,11 @@ RISC-V 全套、userland、glibc、栈及相关存储回归通过。契约见对
 
 ## 后续优先顺序
 
-已交付的 P1h 首批路线完成；其余结构性方案仍为**待设计**，写入路线不等于批准实现。
+P1h、多挂载及进程/随机/调度阶段已交付；以下新子系统仍为**待设计**，写入路线不等于批准实现。
 
-1. **会话/进程组、随机数和调度 ABI**：按 daemon、iperf、cyclictest 的首个实际失败交付；随机数先确认可信熵源，查询与设置反映真实行为。原 glibc 的 coarse clock 缺口已定位，按真实时钟来源补齐。
-2. **AF_UNIX/socketpair 与 SysV 共享内存**：分别解除 hackbench 与 iozone 吞吐子项阻塞，独立定义 endpoint/IPC owner、退出和资源限制。
-3. **持续定位**：netperf、iozone 时间/写入成本与其余 libc/LTP 先取得独立证据；未到达不计失败。chown、进程组与 cgroup 缺口已分开，不能把辅助程序的正常等待扩成完整新子系统实现。
-4. **新兼容性基线之后**：SMP 先所有权与 TLB 回收，LoongArch 先真实 U-mode；实板与更大 C/Rust 工程各立验收里程碑，先单核正确性。
+1. **AF_UNIX/socketpair 与 SysV 共享内存**：分别解除 hackbench 与 iozone 吞吐子项阻塞，独立定义 endpoint/IPC owner、退出和资源限制。
+2. **持续定位**：netperf、iozone 时间/写入成本与其余 libc/LTP 先取得独立证据；未到达不计失败。chown、网络连接、锁页与 cgroup 缺口已分开，不能把辅助程序的正常等待扩成完整新子系统实现。
+3. **新兼容性基线之后**：SMP 先所有权与 TLB 回收，LoongArch 先真实 U-mode；实板与更大 C/Rust 工程各立验收里程碑，先单核正确性。
 
 新子系统仍需候选比较与路线确认，上述顺序不是架构批准。保持 RV64/QEMU virt/单 hart；
 水位和 MemAvailable 不承诺任意分配成功或实板持久性。评测分支交接、push、发布和比赛提交仍由维护者决定。
@@ -257,8 +264,8 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 
 ### P2d 会话、进程组与 TTY
 
-- [ ] 设计 session/pgrp 与线程组的身份及引用；实现 setsid/setpgid 和必要查询，覆盖组长限制、父子/exec 竞态、非法目标、组信号与等待状态。setsid 不得仅返回 getpid。
-- [ ] 验证 daemon 的 cwd/device 解除后真实会话变化、孤儿组/退出传播；SIGHUP 等行为按固定 Linux 的具体触发条件实现，不因为进程退出就无条件广播。
+- [x] 统一身份对象承担 TID/TGID/PGID/SID 角色引用；已实现 setsid/setpgid/getpgid/getsid，105 条差分覆盖组长、父子/exec、zombie、组信号与等待、身份继续存活及孤儿组。见[线程证据](learning/threads-and-futex.md)。
+- [x] 原始消费者验证 daemon 的 SID/PGID 实际变化；孤儿组按固定 Linux 的退出/收养触发 HUP/CONT，SA_SIGINFO 与 sigwait 均保留 SI_KERNEL。TTY 行为未扩展。见[消费者诊断](learning/session-consumers.md)。
 - [ ] TTY 对象出现后接控制终端、前台组、作业控制与终端信号；无 TTY 阶段不能宣称交互 shell 作业控制完整。对象末引用与关闭唤醒分别验收。
 
 ### P2e clone、凭据与资源限制
@@ -273,10 +280,11 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 
 **验证与退出**：robust 已由 `tests/userland/pthread.c` 的原始退出/真实 mutex 消费者、`tests/riscv/uaccess_oom.S`、`tests/diff-abi/robust.c` 和静态/动态原 entry 验收；聚焦 `make test-scheduler-cases-riscv test-signal-riscv test-syscall-riscv`、`test-userland-riscv`、329 条差分、`test-riscv` 与栈检查均通过。拟新增 `tests/userland/signal_stress.c`、`tests/diff-abi/futex_signal.c` 仍属后续；旧取消异常继续 P0c，不以全部当前 pthread 通过冒充共享 futex 或 SMP 完成。
 
-### P2f 单 hart 调度 ABI（待设计）
+### P2f 单 hart 调度 ABI
 
-- [ ] 对 cyclictest 的 affinity 和调度参数调用建立独立差分；区分查询、策略修改、优先级、权限及线程目标。
-- [ ] 查询反映真实单 hart 和调度状态；不能把 set 类操作做成成功存根。具体调度策略与接口范围确认后实现。
+- [x] OTHER/FIFO/RR、实时优先级、CPU0 affinity、RESET_ON_FORK 与真实查询；23 条策略差分，5 条 proc stat 差分。
+- [x] 全局实时带宽默认 1 秒 / 950 毫秒，proc 参数原子更新并保留消费；36 条控制差分，真实 U-mode 验证节流、恢复、RR 余片与同时耗尽轮转。见[调度学习](learning/kernel-scheduling.md)。
+- [ ] nice 权重、PI、SMP 和硬实时保证未交付；后续需求先独立比较方案。
 
 ## P3：同步持久化、文件锁与 SQLite
 
@@ -552,7 +560,7 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 | P6g 栈 guard：连续物理栈、canary/高水位 | ① 独立虚拟栈区映射已有页，便于未映射 guard，但需页表与回收接口；② 调整内核现有映射形成受保护栈区域，初始接口可能更少，但别名/大页拆分与 direct-map 消费者成本须实测。先验证真实越界保护范围再选。 |
 | N1 协议栈与分配 owner | 已确认 BoarOS 持有 fd/OFD、ABI、等待与缓冲队列，固定官方 lwIP 2.2.1 raw API/NO_SYS；协议和 pbuf 静态有界池，socket/OFD/请求由 kernel_heap 持有。先验收单 hart IPv4 loopback，网卡与 AF_UNIX 继续 N2/N3。 |
 
-调度暂保留简单 FIFO：先完成唯一运行、唤醒和 TLB 回收，再凭公平性/负载证据比较策略。第二架构按连续小里程碑推进；不等待 RV “全部完成”，也不复制整套通用内核。
+单 hart 已交付 OTHER/FIFO/RR 与全局实时带宽；后续调度改动以公平性/负载和实际消费者证据比较策略。第二架构按连续小里程碑推进；不等待 RV “全部完成”，也不复制整套通用内核。
 
 ## 每个任务的统一验收与现有命令
 

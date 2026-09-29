@@ -109,3 +109,33 @@ WAL 新轨迹为 42 个事件（26 写、16 flush），三种策略共 126 个�
 与 16 个 flush 失败，共 168 个故障场景。每个场景均实际触发注入，并完成两次恢复、
 事务内容与 ext4 一致性检查。上述计数来自本轮最终内核重新探测和运行，未复用旧计数
 作为覆盖证明。正常/错误入口及宿主 ext4 normal/recovery/rename/metadata 回归也通过。
+
+## 进程身份、随机与调度阶段（2026-09-29）
+
+RT/OTHER 调度与带宽实现接入后，重新运行正常、错误和完整恢复矩阵；没有沿用
+旧事件数推定本轮覆盖。矩阵内核 SHA-256 为
+`9df3c197fc0ab24b8d663c6bfcd35da515d429e1ca018cbe38d99f627cdda8a4`，
+恢复 ELF `179be6d2e5ab52c908d4e0547225e7999d9e404ffd05c12f404e9f170fdca5e0`，
+NBD 服务 `ac92fd5558bfc553f3f122c391fc32d8cbffb87fd2c6853a1149d87873d69370`，
+runner `1ceb90862df125ccd112d23b363ad4c4051a4a78cf7d1b56b5e28d3cbf37bec6`，
+Linux Image `0b8bcf38550399da08e98004d25056ccebf593077443a170021a5b28e26561f4`；
+SQLite 3.53.4 archive 与上述固定输入相同，实际 QEMU 11.1.1。固定语义参考仍为
+QEMU v11.1.0 `84f07211cc5b4fc6a371559bf8a5de4fb068e648` 与固定 Linux。
+
+DELETE 三种断电策略分别重新枚举为 148 事件（101 写、47 flush），444 个切点、
+101 个写失败、47 个 flush 失败均实际触发并通过两次恢复、事务数据与 ext4 检查；
+EXTRA/FULL、hot journal、确认提交以及写/flush 错误传播也通过。
+WAL 三种策略分别重新枚举为 42 事件（26 写、16 flush），126 个切点、
+26 个写失败、16 个 flush 失败全部实际命中，正常/错误/两次恢复检查均通过。
+
+最终生产快照为 `be5ca22629c904a427241b0f92e9d561d0312952e787ab75870ec4beae0143b3`。
+矩阵快照之后仅增加只读 proc/MM 映像统计、消费后 boot seed 副本清零，及 RR
+同时耗尽配额/时间片的同级队尾修正；上述 OTHER SQLite 工作负载没有使用 RR。
+最终快照另跑 DELETE/WAL 多进程正常矩阵、第二盘 WAL 重启、普通双盘故障隔离
+以及 FIFO/RR 双盘压力四组合；后者与新的 RR 边界探针专门覆盖最终调度修正。
+这些是不同快照的证据，不能称完整恢复矩阵执行于最终二进制。
+
+重建入口：`make test-sqlite-recovery-matrix-riscv test-sqlite-wal-recovery-matrix-riscv`；
+每次都从当前源码构建内核并重新枚举事件，不能强制期待此处历史事件数量。
+宿主 `make test-lwext4-host test-lwext4-instances-host test-lwext4-rename-host test-lwext4-metadata-host test-lwext4-recovery-host` 同轮全部通过，包含硬链接
+创建/删除/替换、1024/4096 几何、extent/indirect 与 orphan file/chain 恢复。

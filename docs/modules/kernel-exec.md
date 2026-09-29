@@ -43,7 +43,7 @@ RISC-V 后端固定 Sv39/4 KiB，并支持：
 
 `PT_LOAD` 不在 exec 时复制整段文件，而登记 `ELF_PRIVATE` VMA。完整文件页使用 page cache+COW，文件/BSS 边界和 BSS 页按需建立私有页。缺页 I/O 在用户边界产生 `SIGBUS`，物理耗尽终止本次用户操作；新建可执行页完成 `SFENCE.VMA` 和必要 `FENCE.I` 后才可取指。source 的 program headers 只解析一次，避免重新读取造成 TOCTOU。
 
-布局从 DTB `/chosen/rng-seed` 的可信 32 字节种子产生独立的 PIE/解释器 bias、mmap base、stack、brk 和 vDSO 随机量；没有种子时安全降级为确定性布局并省略 `AT_RANDOM`。初始 PC 是解释器入口（若有），`AT_ENTRY` 始终为主程序入口；初始栈保存真实 `AT_PHDR`、`AT_BASE`、`AT_ENTRY`、`AT_HWCAP`、`AT_RANDOM`（可用时）、`AT_EXECFN` 等 auxv。入口 SP 按 RISC-V psABI 16 字节对齐，scheduler 允许入口页尚未驻留，但必须属于可执行 VMA。
+布局从随机核心产生独立的 PIE/解释器 bias、mmap base、stack、brk 和 vDSO 随机量。VirtIO RNG 累计至少 32 字节可信输入才使核心就绪；只有 DTB 材料时沿用明确的非安全降级接口，不计可信熵。完全没有材料时使用确定性布局并省略 `AT_RANDOM`。初始 PC 是解释器入口（若有），`AT_ENTRY` 始终为主程序入口；初始栈保存真实 `AT_PHDR`、`AT_BASE`、`AT_ENTRY`、`AT_HWCAP`、`AT_RANDOM`（可用时）、`AT_EXECFN` 等 auxv。入口 SP 按 RISC-V psABI 16 字节对齐，scheduler 允许入口页尚未驻留，但必须属于可执行 VMA。
 
 ## 不可返回提交
 

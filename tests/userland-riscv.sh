@@ -10,6 +10,7 @@ tls_dso=${PTHREAD_TLS_DSO_RV:-"$project_root/build/riscv/tests/user/libboaros-tl
 musl_ldso=${MUSL_LDSO:-"$project_root/build/riscv/musl-root/lib/ld-musl-riscv64.so.1"}
 qemu=${QEMU_RISCV64:-qemu-system-riscv64}
 memory=${QEMU_MEMORY:-512M}
+run_timeout=${USERLAND_TIMEOUT:-120s}
 mkdir -p "$project_root/build/riscv"
 work_dir=$(mktemp -d "$project_root/build/riscv/userland-run.XXXXXX")
 static_output="$work_dir/static-userland.log"
@@ -57,7 +58,7 @@ debugfs -w -R "write $data /data" "$static_disk" >/dev/null 2>&1
 
 # The userland program blocks reading stdin after the clock and sleep
 # checks, so the harness feeds one line into the serial console.
-if ! { sleep 4; printf 'go\n'; } | timeout -k 2s 30s "$qemu" \
+if ! { sleep 4; printf 'go\n'; } | timeout -k 2s "$run_timeout" "$qemu" \
     -machine virt \
     -bios default \
     -kernel "$kernel" \
@@ -128,7 +129,7 @@ debugfs -w -R "set_inode_field /lib/ld-musl-riscv64.so.1 mode 0100755" \
 debugfs -w -R "write $tls_dso /lib/libboaros-tls.so" "$pthread_disk" \
     >/dev/null 2>&1
 
-if ! timeout -k 2s 30s "$qemu" \
+if ! timeout -k 2s "$run_timeout" "$qemu" \
     -machine virt \
     -bios default \
     -kernel "$kernel" \

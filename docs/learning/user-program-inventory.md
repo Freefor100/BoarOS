@@ -166,3 +166,44 @@ python3 -B tests/program-inventory/run.py --reuse-builds --output build/multimou
 清单执行身份 SHA-256：`5e08f6fa28aba24743c11b16c03e389d40df4e0fe84c82f3f252165a1fb58efe`。
 Linux 使用 `tests/program-inventory/linux.config`；组合消费者和恢复范围见
 [内存后备对象与多挂载验收](memory-backed-mounts.md)。这是主线诊断，不是正式评分。
+
+## 进程身份、随机与调度阶段（2026-09-29）
+
+`python3 -B tests/program-inventory/run.py --reuse-builds --output build/process-phase-inventory`
+重新执行全部 228 项，结果为 227 pass，只有 `busybox.official` 为 upstream-failure。
+核对完整 manifest 的 228 个唯一 ID 与实际结果集合相等，并逐 ID 对照前阶段记录：
+该包装器之外所有项目都为 pass，没有跳过、新增失败或用相同总数替代逐项检查。
+原包装器仍不算通过；独立 setsid/chrt/taskset/daemon、iperf/cyclictest 诊断见
+[原程序调用链](session-consumers.md)，不混入这 228 项或拼成正式评分。
+
+BoarOS 内核 SHA-256 `be5ca22629c904a427241b0f92e9d561d0312952e787ab75870ec4beae0143b3`；
+固定 Linux Image `9d6a69758e26400a14b13cd053afdb7db8c98bd797d9eb7d3ad4b1c0a108e413`；
+suite identity `aa3bda0115670de7a837a7331dd563c9d282991109d1b6f17f39ecc7a8346fcd`。
+Linux 清单配置同步启用 HWRNG 与 proc sysctl，输入仍为固定原 BusyBox/libc-test。
+最终内核另通过 RISC-V 全套、规模、睡眠 I/O 四组合、userland、glibc 五形态、
+RNG 八次生命周期启动、调度 host/U-mode、SQLite DELETE/WAL 正常与第二盘重启、
+普通双盘故障隔离与实时双盘四组合、ext4 宿主正常/错误/恢复矩阵。
+固定离线 GCC 在 ext4/tmpfs 的五阶段、产物和输出也双侧一致，工具链树仍为
+`ce84a7bb9fc7c97552121b37238622bbefbd4a3672600b57374e25230c582a07`。
+
+`tests/userland-riscv.sh` 的每次启动预算改为可配置 `USERLAND_TIMEOUT`（默认 120s）；
+旧 30s 预算在 session 独立阶段与组合阶段均出现超时，较长预算下完整标记和资源验收通过。
+保留全部输出/退出/回收断言，不把超时当成功，也不从受调试暂停影响的历史运行推算性能。
+对应重建：
+
+```sh
+make test-riscv test-scale-riscv test-io-sleep-riscv test-stack-usage \
+  test-userland-riscv test-glibc-riscv test-rng-riscv test-sched-policy-host \
+  test-sched-bandwidth-riscv test-multi-disk-io-riscv test-multi-disk-rt-riscv \
+  test-sqlite-rollback-riscv test-sqlite-wal-riscv test-sqlite-second-disk-riscv \
+  test-root-multi-block-riscv test-offline-c-riscv test-offline-c-tmpfs-riscv
+```
+
+静态栈分析覆盖 1638 个函数，最大 2368 字节；trap 288 字节、预留 1024 字节。
+调度用户探针释放 12 个任务栈、最小余量 5152 字节，退出 heap-live=0。
+
+最终 `tests/runtime-diagnostics.py --output build/process-final-runtime-diagnostics
+--compat-release 4.15.0` 独立复跑了上述 LTP 链：setpgid 的 ENOSYS 已消失；
+无 subsystem 的 function 仍 exit 6，传 cpuset 仍因没有控制器 exit 32；
+无信号驱动的 helper 两侧仍在 3 秒后 SIGKILL/wait=9。abort01 的 BoarOS
+首个失败仍为 chown ENOSYS、exit 2。隔离变体身份与原 utime 结果见[文件时间](file-timestamps.md)。

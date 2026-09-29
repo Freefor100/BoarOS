@@ -135,3 +135,21 @@ fine realtime、无 RTC 时的相对时间回退和文件 UTIME_NOW 路径均保
 验证为 `make all test-syscall-riscv test-timer-riscv` 通过；同一 ELF 的 14 条 coarse
 窄差分与固定 Linux 匹配。用户态只要求连续采样非递减，不要求读数必然重复：两次 syscall
 之间可以被调度跨过一个 tick，重复读稳定性的确定性断言放在模块的无更新区间。
+
+原 RV 镜像的静态与动态 glibc `utime` 也已在 coarse 修复后独立复跑：两侧各
+30/30 成功，原 realtime/UTIME_NOW/fstat 跨秒探针继续成功。命令：
+
+```sh
+python3 -B tests/runtime-diagnostics.py --output build/coarse-original-diagnostics --compat-release 4.15.0
+```
+
+该命令仅为原旧 glibc 创建隔离 uname 变体，主线 uname 不变；不能拼成正式评分。
+变体内核 SHA-256 为 `9bc348b313eb4f1325a90e5b41fb6dd686f16bdb5783ce413ea961aec4c9fbb9`，驱动 ELF 为
+`1bf3667a580af999dcebfc9b0ef965a24e640d0e8c77431918ed5f05429a8bfb`；原镜像及原 ELF 哈希与上节固定输入相同。
+
+进程/随机/调度整合后再次运行同一脚本，输出目录为
+`build/process-final-runtime-diagnostics`。隔离 uname 变体内核
+`185f9cd378a10801974deb5d5de00d41dac1cfbe44b4bcc138acc43f1245e39c`
+来自最终生产快照 `be5ca22629c904a427241b0f92e9d561d0312952e787ab75870ec4beae0143b3`。
+固定 Linux 与 BoarOS 的原静态/动态 utime 仍各 30/30 成功，原 libc time/coarse
+及 UTIME_NOW/fstat 跨秒记录均完成；主线 uname 保持不变。
