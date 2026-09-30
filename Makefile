@@ -1561,6 +1561,8 @@ test-cost-host:
 	build/cost/host/account-test
 	cc -std=c11 -Wall -Wextra -Werror -idirafter include -DBOAROS_COST_DIAGNOSTICS=1 tests/cost/irq_test.c kernel/cost.c -o build/cost/host/irq-test
 	build/cost/host/irq-test
+	cc -std=c11 -Wall -Wextra -Werror -idirafter include -DBOAROS_PAGE_SHIFT=12 -DBOAROS_COST_DIAGNOSTICS=1 tests/cost/page_test.c kernel/cost.c kernel/physical_page.c -o build/cost/host/page-test
+	build/cost/host/page-test
 	python3 -B tests/test-cost-report.py
 test-cost-riscv: test-cost-host
 	$(MAKE) COST_DIAGNOSTICS=1 all

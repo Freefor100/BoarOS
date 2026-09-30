@@ -1020,7 +1020,7 @@ enum physical_page_status physical_page_allocate_order(
         physical_page_allocator_is_finalized(allocator) &&
         allocator->reclaimer != 0) {
         uint32_t *depth = allocator->reclaim_depth ? allocator->reclaim_depth() : &allocator->reclaiming;
-        if (*depth) return status;
+        if (*depth) { COST_ADD(PAGE_FAILURES, 1); return status; }
         if (depth != &allocator->reclaiming) *depth = 1U;
         if (allocator->reclaiming == UINT32_MAX) __builtin_trap();
         allocator->reclaiming++;
