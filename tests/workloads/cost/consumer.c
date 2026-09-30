@@ -4,6 +4,7 @@
 #include <sys/reboot.h>
 #include <sys/sysmacros.h>
 #include <sys/wait.h>
+#include <sys/utsname.h>
 static long milliseconds(void)
 { struct timespec t; CHECK(clock_gettime(CLOCK_MONOTONIC,&t)==0);return t.tv_sec*1000+t.tv_nsec/1000000; }
 static long command_budget_ms=180000;
@@ -36,6 +37,8 @@ int main(void)
     else CHECK(errno==ENOENT);
     CHECK(command_budget_ms>=1000 && command_budget_ms<=3600000);
     printf("COST CONSUMER BUDGET %ld\n",command_budget_ms);
+    struct utsname platform;CHECK(uname(&platform)==0);
+    printf("COST PLATFORM %s %s %s\n",platform.sysname,platform.release,platform.machine);
     CHECK(mknod("/dev/null",S_IFCHR|0666,makedev(1,3))==0 || errno==EEXIST);
     CHECK(mknod("/dev/zero",S_IFCHR|0666,makedev(1,5))==0 || errno==EEXIST);
     CHECK(symlink("/musl/lib/libc.so","/lib/ld-musl-riscv64-sf.so.1")==0 || errno==EEXIST);

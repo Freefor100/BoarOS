@@ -177,6 +177,9 @@ def main():
                         validate_expected(snapshot['values'],metric_expectations.get(snapshot['name'],{}))
                 if case=='consumer':
                     record['commands']=consumer_commands(output,expected_budget_ms=args.consumer_timeout_ms)
+                    platform_lines=[line.split()[2:] for line in output.splitlines() if line.startswith('COST PLATFORM ')]
+                    if len(platform_lines)!=1 or len(platform_lines[0])!=3:raise ValueError('missing/duplicate consumer platform')
+                    record['uname']=dict(zip(('sysname','release','machine'),platform_lines[0]))
                     required={c['name'] for c in record['commands']}
                     if set(timings)!=required or (not args.off and {s['name'] for s in snapshots}!=required): raise ValueError('consumer coverage')
                 if case=='contract' and not args.off:

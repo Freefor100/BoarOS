@@ -6,6 +6,9 @@ ORIGINAL_SHA='f419468678d342133546add2f8459ea09aeba987ba968e28753d6ee656996b8b'
 ELFS={'musl':'019cd6e219263f41b3c1d62024ea9ce38e613541bf2a1d9b7e2aa6506187ecd6','glibc':'984c8ad474072011f38d52a98d422c581b2277d3e2d03f90557f45a8046c66de'}
 SCRIPTS={'musl':'0ef595da41baaa5a7fd598f2210ebf70936802938ac1db6e933a2877245efa60','glibc':'6ece77b9527b5cc79ccd69ede7e574ea1e1c0a394e46ff3ea455e7fa232a303b'}
 GROUPS=(None,(0,1),(0,2),(0,3),(0,5),(6,7),(9,10),(11,12))
+DEPENDENCIES={'/glibc/lib/libc.so.6':'81af558241962fadf1d0199171be78dd2bb1e45098b8f7f786b22881b7bab33c',
+    '/glibc/lib/ld-linux-riscv64-lp64d.so.1':'10ac4a073b52a6b05e383ae6b47be92375436174a857fd6299faea1257495eaa',
+    '/musl/lib/libc.so':'a174c80743882436816923d3afd8ca4a69ca92a89c88332ac95334052e2698bf'}
 def originals(root,work,digest):
     original=root/'references/oscomp-autotest/sdcard-rv.img'
     if digest(original)!=ORIGINAL_SHA:raise ValueError('original image changed')
@@ -56,3 +59,25 @@ def commands(output, expected_budget_ms=180000):
             sections=[line.strip() for line in raw.splitlines() if 'throughput for' in line or 'Initial write' in line or 'Re-write' in line]
             result.append(dict(command_timeout_ms=budget,reported_sections=sections,name=name,elf_sha256=ELFS[libc],argv=argv,cwd='/'+libc,timeout=timeout,wait_status=status,raw_output=raw,**classify(raw,timeout,status)))
     return result
+
+def validate_record(row, require_completion=False):
+    if (row.get('original_sha256')!=ORIGINAL_SHA or row.get('consumer_elf_sha256')!=ELFS or
+        row.get('consumer_script_sha256')!=SCRIPTS or row.get('consumer_dependencies')!=DEPENDENCIES):
+        raise ValueError('original consumer or dependency changed')
+    expected_names={f'consumer-{libc}-{i}' for libc in ELFS for i in range(8)}
+    rows=row.get('commands',[])
+    if len(rows)!=16 or {c['name'] for c in rows}!=expected_names:raise ValueError('original command coverage')
+    budget=row.get('consumer_timeout_ms',180000)
+    if not isinstance(budget,int) or not 1000<=budget<=3600000:raise ValueError('invalid frozen consumer budget')
+    for c in rows:
+        _,libc,index=c['name'].split('-'); group=GROUPS[int(index)]
+        argv=['./iozone','-a','-r','1k','-s','4m'] if group is None else ['./iozone','-t','4','-i',str(group[0]),'-i',str(group[1]),'-r','1k','-s','1m']
+        if c['argv']!=argv or c['cwd']!='/'+libc or c['elf_sha256']!=ELFS[libc] or c['command_timeout_ms']!=budget:
+            raise ValueError('original argv/ELF/cwd/budget changed')
+        actual=classify(c['raw_output'],c['timeout'],c['wait_status'])
+        if c['timeout'] not in (0,1) or any(c.get(k)!=v for k,v in actual.items()):raise ValueError('incorrect completion classification')
+        if require_completion:
+            # The fixed Linux reference independently rejects only (11,12).
+            if not actual['process_completed'] or (index!='7' and actual['outcome']!='completed'):
+                raise ValueError('original consumer did not finish: '+c['name'])
+            if index=='7' and actual['reason']!='selected_tests_unavailable':raise ValueError('reference exclusion changed')
