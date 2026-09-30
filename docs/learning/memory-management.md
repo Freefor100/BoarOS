@@ -470,3 +470,6 @@ io_context。后台预留一页快照只解除“写回自身还需一页”的�
 runner 复验通过。未修改正式时限，也不把这次诊断计为性能提升或普遍消除超时的证明。
 
 统一内存后备对象阶段将共享匿名页存储迁移到 `mm/memory_object.c`，增加不分配的稀疏查询和截断接口。VMA 聚焦测试核对空洞不增加 Shmem、尾页前缀保留/后缀清零、截断后计数恢复；`make test-vma-riscv test-mm-riscv test-diff-abi-riscv` 通过，683 条原差分保持一致。独立审查确认 MM 发布失败的 discard 顺序和对象锁边界；这只是后备对象阶段，尚非 tmpfs 验收。
+
+
+SysV attachment 与 VMA 片段必须分别建模。逻辑 attachment 保存固定 shmid、原始地址及后备 owner；同一 MM 的分裂片段与 fork 副本各贡献一个 `nattch`。prepare 阶段的临时 owner 保住段槽身份而不增加公开计数，成功 split/insert/clone 才 open，remove/replace/destroy 才 close。先 split 再关闭被移除片段，避免部分撤销期间出现假的零引用并销毁 RMID 段；`shmdt` 比较 attachment 身份，不按一个 VMA 或整个旧地址范围删除。固定依据为本地 `references/linux/ipc/shm.c` 的 `shm_open`、`shm_close`、`ksys_shmdt`，commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`。`make test-scale-riscv` 覆盖六种编辑/继承组合及逐次附加、fork OOM，结束仍检查完整页回收；`make test-diff-abi-riscv` 提供真实 RV64 片段计数和固定替换对照。

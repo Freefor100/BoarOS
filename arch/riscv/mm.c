@@ -964,17 +964,6 @@ enum kernel_mm_status kernel_mm_fork(
                        ? KERNEL_MM_STATUS_STATE
                        : status;
         }
-        uint32_t count = kernel_vma_set_count(destination_record->vmas);
-        for (uint32_t i = 0; i < count; i++) {
-            struct kernel_vma entry;
-            if (kernel_vma_set_get_at(destination_record->vmas, i, &entry) ==
-                KERNEL_VMA_STATUS_OK) {
-                if (entry.kind == KERNEL_VMA_KIND_SYSV_SHM &&
-                    entry.shm_segment != 0) {
-                    kernel_shm_on_vma_fork(entry.shm_segment);
-                }
-            }
-        }
     }
     status = clone_shared_anon(source_record, destination_record);
     if (status == KERNEL_MM_STATUS_OK)
@@ -1199,7 +1188,7 @@ enum kernel_mm_status kernel_mm_vma_insert_anon(
 {
     KERNEL_NO_RECLAIM_IO;
     struct riscv_kernel_mm_record *record;
-    struct kernel_vma vma;
+    struct kernel_vma vma = {0};
     enum kernel_mm_status status;
 
     if (mm == 0 || !valid_vma_range(start, end, permissions) ||
@@ -2204,19 +2193,6 @@ enum kernel_mm_status kernel_mm_munmap(
     if (status != KERNEL_MM_STATUS_OK) {
         return status;
     }
-    uint32_t count = kernel_vma_set_count(record->vmas);
-    for (uint32_t i = 0; i < count; i++) {
-        struct kernel_vma entry;
-        if (kernel_vma_set_get_at(record->vmas, i, &entry) ==
-            KERNEL_VMA_STATUS_OK) {
-            if (entry.kind == KERNEL_VMA_KIND_SYSV_SHM &&
-                entry.shm_segment != 0) {
-                if (entry.start < end && entry.end > address) {
-                    kernel_shm_on_vma_detach(entry.shm_segment);
-                }
-            }
-        }
-    }
     if (kernel_vma_set_commit_edit(record->vmas, &edit) !=
         KERNEL_VMA_STATUS_OK) {
         return KERNEL_MM_STATUS_STATE;
@@ -2241,6 +2217,8 @@ enum kernel_mm_status kernel_mm_shmat(
     struct kernel_vma_edit edit;
     struct riscv_kernel_mm_shared_anon *shared_entry = 0;
     struct kernel_memory_object *temporary_owner = 0;
+    struct kernel_shm_attachment *attachment
+        __attribute__((cleanup(kernel_shm_attachment_release))) = 0;
     uint64_t aligned_length;
     uint64_t start;
     uint64_t end;
@@ -2309,6 +2287,8 @@ enum kernel_mm_status kernel_mm_shmat(
         }
     }
     end = start + aligned_length;
+    if (kernel_shm_attachment_create(segment, start, end, &attachment) !=
+            KERNEL_SHM_STATUS_OK) return KERNEL_MM_STATUS_NO_MEMORY;
 
     int already_tracked = 0;
     for (struct riscv_kernel_mm_shared_anon *curr = record->shared_anon;
@@ -2347,7 +2327,7 @@ enum kernel_mm_status kernel_mm_shmat(
         .role = KERNEL_VMA_ROLE_SYSV_SHM,
         .fault_policy = KERNEL_VMA_FAULT_ANON_SHARED,
         .backing = segment->memory,
-        .shm_segment = segment,
+        .shm_attachment = attachment,
     };
 
     if ((flags & KERNEL_SHM_REMAP) == 0U) {
@@ -2396,19 +2376,6 @@ enum kernel_mm_status kernel_mm_shmat(
         }
         return status;
     }
-    uint32_t count = kernel_vma_set_count(record->vmas);
-    for (uint32_t i = 0; i < count; i++) {
-        struct kernel_vma entry;
-        if (kernel_vma_set_get_at(record->vmas, i, &entry) ==
-            KERNEL_VMA_STATUS_OK) {
-            if (entry.kind == KERNEL_VMA_KIND_SYSV_SHM &&
-                entry.shm_segment != 0) {
-                if (entry.start < end && entry.end > start) {
-                    kernel_shm_on_vma_detach(entry.shm_segment);
-                }
-            }
-        }
-    }
     if (kernel_vma_set_commit_edit(record->vmas, &edit) !=
         KERNEL_VMA_STATUS_OK) {
         if (shared_entry != 0) {
@@ -2428,33 +2395,38 @@ enum kernel_mm_status kernel_mm_shmat(
     return KERNEL_MM_STATUS_OK;
 }
 
-enum kernel_mm_status kernel_mm_shmdt(
-    struct kernel_mm *mm,
-    uint64_t address)
+enum kernel_mm_status kernel_mm_shmdt(struct kernel_mm *mm, uint64_t address)
 {
     KERNEL_NO_RECLAIM_IO;
     struct riscv_kernel_mm_record *record;
+    if (mm == 0 || (address & BOAROS_PAGE_MASK) ||
+        address < RISCV_SV39_PAGE_SIZE_4K || address >= RISCV_SV39_USER_LIMIT)
+        return KERNEL_MM_STATUS_INVALID_ARGUMENT;
+    enum kernel_mm_status status = mutable_vma_record(mm, &record);
+    if (status != KERNEL_MM_STATUS_OK) return status;
+    struct kernel_shm_attachment *attachment
+        __attribute__((cleanup(kernel_shm_attachment_release))) = 0;
     struct kernel_vma vma;
-    enum kernel_mm_status status;
-    enum kernel_vma_status vma_status;
-
-    if (mm == 0 || (address & BOAROS_PAGE_MASK) != 0U ||
-        address < RISCV_SV39_PAGE_SIZE_4K ||
-        address >= RISCV_SV39_USER_LIMIT) {
-        return KERNEL_MM_STATUS_INVALID_ARGUMENT;
+    for (uint32_t i = 0; i < kernel_vma_set_count(record->vmas); i++) {
+        if (kernel_vma_set_get_at(record->vmas, i, &vma) != KERNEL_VMA_STATUS_OK)
+            __builtin_trap();
+        if (vma.shm_attachment && vma.shm_attachment->start == address) {
+            attachment = vma.shm_attachment;
+            kernel_shm_attachment_acquire(attachment);
+            break;
+        }
     }
-    status = mutable_vma_record(mm, &record);
-    if (status != KERNEL_MM_STATUS_OK) {
-        return status;
+    if (!attachment) return KERNEL_MM_STATUS_INVALID_ARGUMENT;
+    /* 起始页可以已被撤销；仅移除同一附件片段，不吞掉洞内的新映射。 */
+    for (uint32_t i = 0; i < kernel_vma_set_count(record->vmas);) {
+        if (kernel_vma_set_get_at(record->vmas, i, &vma) != KERNEL_VMA_STATUS_OK)
+            __builtin_trap();
+        if (vma.shm_attachment != attachment) { i++; continue; }
+        status = kernel_mm_munmap(mm, vma.start, vma.end - vma.start);
+        if (status != KERNEL_MM_STATUS_OK) return status;
+        i = 0; /* 后备清理可睡眠，重取集合而不保存数组下标。 */
     }
-    vma_status = kernel_vma_set_lookup(record->vmas, address, &vma);
-    if (vma_status != KERNEL_VMA_STATUS_OK) {
-        return KERNEL_MM_STATUS_INVALID_ARGUMENT;
-    }
-    if (vma.start != address || vma.kind != KERNEL_VMA_KIND_SYSV_SHM) {
-        return KERNEL_MM_STATUS_INVALID_ARGUMENT;
-    }
-    return kernel_mm_munmap(mm, vma.start, vma.end - vma.start);
+    return KERNEL_MM_STATUS_OK;
 }
 
 enum kernel_mm_status kernel_mm_mprotect(
@@ -3412,17 +3384,6 @@ enum kernel_mm_status kernel_mm_release(struct kernel_mm *mm)
         record->resident_buckets = 0;
         record->resident_capacity = 0;
         if (record->vmas != 0) {
-            uint32_t count = kernel_vma_set_count(record->vmas);
-            for (uint32_t i = 0; i < count; i++) {
-                struct kernel_vma entry;
-                if (kernel_vma_set_get_at(record->vmas, i, &entry) ==
-                    KERNEL_VMA_STATUS_OK) {
-                    if (entry.kind == KERNEL_VMA_KIND_SYSV_SHM &&
-                        entry.shm_segment != 0) {
-                        kernel_shm_on_vma_detach(entry.shm_segment);
-                    }
-                }
-            }
             vma_status = kernel_vma_set_destroy(&record->vmas);
             if (vma_status != KERNEL_VMA_STATUS_OK) {
                 return KERNEL_MM_STATUS_STATE;

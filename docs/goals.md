@@ -385,7 +385,8 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 2026-09-30 独立 Review 的组合边界修复：
 
 - [x] R1：SHM 附加 registry OOM 回滚不消费段表 owner；scale 聚焦故障后重试及最终页回收通过。
-- [ ] R2/R6：显式 attachment、片段 open/close、固定替换与 fork/退出计数、通用权限上限；保持 prepare/commit 失败原子性。
+- [x] R2：显式 attachment 与通用 VMA 片段 open/close；覆盖分裂、起始页撤销、RMID、匿名/文件/SHM 固定替换、fork/退出与 metadata/page OOM，保持 prepare/commit 失败原子性。
+- [ ] R6：通用权限上限及只读附件不可提升；split/fork 后保留上限。
 - [x] R8：已有 key 的零大小查找与创建下限分开；已有/缺失 key、零/合法/超原段大小、CREAT/EXCL 的 20 条新增固定 Linux 差分通过。
 
 - [x] 当前 shmget/shmat/shmdt/shmctl 均已接入；针对 IPC_PRIVATE 与命名 key、段大小对齐与 Linux 布局完成 194–197 系统调用接入。

@@ -5,6 +5,7 @@
 
 struct kernel_heap;
 struct kernel_vma_set;
+struct kernel_shm_attachment;
 uint64_t kernel_vma_set_generation(const struct kernel_vma_set *set);
 /* Sum of currently mapped virtual bytes; updated with each committed edit. */
 uint64_t kernel_vma_set_total_bytes(const struct kernel_vma_set *set);
@@ -63,7 +64,7 @@ struct kernel_vma {
     enum kernel_vma_role role;
     enum kernel_vma_fault_policy fault_policy;
     void *backing;
-    void *shm_segment;
+    struct kernel_shm_attachment *shm_attachment;
     uint8_t file_shared_may_write;
 };
 

@@ -57,6 +57,7 @@ static void kernel_shm_destroy_segment_locked(struct kernel_shm_segment *seg)
     seg->size = 0;
     seg->aligned_size = 0;
     seg->nattch = 0;
+    seg->attachments = 0;
     seg->cpid = 0;
     seg->lpid = 0;
     seg->seq++;
@@ -168,6 +169,7 @@ int kernel_shm_get(struct kernel_task *caller, int32_t key, uint64_t size,
     new_seg->aligned_size = aligned_size;
     new_seg->memory = mem;
     new_seg->nattch = 0;
+    new_seg->attachments = 0;
     new_seg->atime = 0;
     new_seg->dtime = 0;
     new_seg->ctime = current_time_seconds();
@@ -235,7 +237,6 @@ int kernel_shm_at_mm(struct kernel_mm *mm, int32_t caller_pid, int32_t shmid, ui
         return -KERNEL_EINVAL;
     }
 
-    seg->nattch++;
     seg->lpid = caller_pid;
     seg->atime = current_time_seconds();
     *out_attached_addr = attached_addr;
@@ -277,35 +278,93 @@ int kernel_shm_dt(struct kernel_task *caller, uint64_t shmaddr)
     return kernel_shm_dt_mm(mm, shmaddr);
 }
 
-void kernel_shm_on_vma_detach(struct kernel_shm_segment *segment)
+static void attachment_valid(const struct kernel_shm_attachment *attachment)
 {
-    if (segment == 0) {
-        return;
-    }
+    if (!attachment || !attachment->heap || !attachment->references ||
+        !attachment->segment || !attachment->segment->active ||
+        attachment->segment->shmid != attachment->shmid ||
+        attachment->segment->memory != attachment->memory ||
+        !attachment->segment->attachments) __builtin_trap();
+}
+
+enum kernel_shm_status kernel_shm_attachment_create(
+    struct kernel_shm_segment *segment, uint64_t start, uint64_t end,
+    struct kernel_shm_attachment **owner)
+{
+    struct kernel_shm_attachment *attachment = 0;
     uintptr_t irq = riscv_interrupt_save();
-    if (segment->active) {
-        if (segment->nattch > 0U) {
-            segment->nattch--;
-        }
-        segment->dtime = current_time_seconds();
-        segment->lpid = current_tgid(0);
-        if (segment->nattch == 0U && segment->marked_for_deletion) {
+    if (!owner || *owner || !segment || !segment->active || !segment->memory ||
+        start >= end || segment->attachments == UINT32_MAX) __builtin_trap();
+    enum kernel_heap_status status = kernel_heap_allocate_zeroed(
+        shm_table.heap, 1, sizeof(*attachment), (void **)&attachment);
+    if (status != KERNEL_HEAP_STATUS_OK) {
+        riscv_interrupt_restore(irq);
+        if (status != KERNEL_HEAP_STATUS_EMPTY) __builtin_trap();
+        return KERNEL_SHM_STATUS_NO_MEMORY;
+    }
+    if (kernel_memory_object_acquire(segment->memory) != KERNEL_MEMORY_OBJECT_OK)
+        __builtin_trap();
+    *attachment = (struct kernel_shm_attachment){
+        .heap = shm_table.heap, .segment = segment, .memory = segment->memory,
+        .start = start, .end = end, .shmid = segment->shmid, .references = 1,
+    };
+    /* 预备 owner 也保住槽身份，但不伪增用户可见 nattch。 */
+    segment->attachments++;
+    *owner = attachment;
+    riscv_interrupt_restore(irq);
+    return KERNEL_SHM_STATUS_OK;
+}
+
+void kernel_shm_attachment_acquire(struct kernel_shm_attachment *attachment)
+{
+    uintptr_t irq = riscv_interrupt_save();
+    attachment_valid(attachment);
+    if (attachment->references == UINT32_MAX) __builtin_trap();
+    attachment->references++;
+    riscv_interrupt_restore(irq);
+}
+
+void kernel_shm_attachment_release(struct kernel_shm_attachment **owner)
+{
+    if (!owner || !*owner) return;
+    uintptr_t irq = riscv_interrupt_save();
+    struct kernel_shm_attachment *attachment = *owner;
+    attachment_valid(attachment);
+    *owner = 0;
+    if (--attachment->references == 0) {
+        struct kernel_shm_segment *segment = attachment->segment;
+        kernel_memory_object_release(&attachment->memory);
+        segment->attachments--;
+        if (kernel_heap_release(attachment->heap, attachment) != KERNEL_HEAP_STATUS_OK)
+            __builtin_trap();
+        if (!segment->nattch && !segment->attachments && segment->marked_for_deletion)
             kernel_shm_destroy_segment_locked(segment);
-        }
     }
     riscv_interrupt_restore(irq);
 }
 
-void kernel_shm_on_vma_fork(struct kernel_shm_segment *segment)
+void kernel_shm_attachment_open(struct kernel_shm_attachment *attachment)
 {
-    if (segment == 0) {
-        return;
-    }
     uintptr_t irq = riscv_interrupt_save();
-    if (segment->active) {
-        segment->nattch++;
-        segment->atime = current_time_seconds();
-    }
+    kernel_shm_attachment_acquire(attachment);
+    struct kernel_shm_segment *segment = attachment->segment;
+    if (segment->nattch == UINT64_MAX) __builtin_trap();
+    segment->nattch++;
+    segment->atime = current_time_seconds();
+    segment->lpid = current_tgid(0);
+    riscv_interrupt_restore(irq);
+}
+
+void kernel_shm_attachment_close(struct kernel_shm_attachment *attachment)
+{
+    uintptr_t irq = riscv_interrupt_save();
+    attachment_valid(attachment);
+    struct kernel_shm_segment *segment = attachment->segment;
+    if (!segment->nattch) __builtin_trap();
+    segment->nattch--;
+    segment->dtime = current_time_seconds();
+    segment->lpid = current_tgid(0);
+    kernel_shm_attachment_release(&attachment);
     riscv_interrupt_restore(irq);
 }
 
@@ -360,7 +419,7 @@ int kernel_shm_ctl_mm(struct kernel_mm *mm, int32_t shmid, int32_t cmd,
 
     switch (pure_cmd) {
     case KERNEL_IPC_RMID: {
-        if (seg->nattch == 0U) {
+        if (seg->nattch == 0U && seg->attachments == 0U) {
             kernel_shm_destroy_segment_locked(seg);
         } else {
             seg->marked_for_deletion = 1;

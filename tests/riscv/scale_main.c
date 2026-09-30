@@ -38,6 +38,12 @@ enum kernel_heap_status __wrap_kernel_heap_allocate_zeroed(struct kernel_heap *h
     if (fail_metadata && --fail_metadata == 0) return KERNEL_HEAP_STATUS_EMPTY;
     return __real_kernel_heap_allocate_zeroed(heap, n, size, out);
 }
+enum kernel_heap_status __real_kernel_heap_resize(struct kernel_heap *, void *, size_t, void **);
+enum kernel_heap_status __wrap_kernel_heap_resize(struct kernel_heap *heap, void *old, size_t size, void **out)
+{
+    if (fail_metadata && --fail_metadata == 0) return KERNEL_HEAP_STATUS_EMPTY;
+    return __real_kernel_heap_resize(heap, old, size, out);
+}
 uint64_t __wrap_riscv_sv39_current_satp(void) { return active_satp; }
 enum physical_page_status __real_physical_page_allocate(struct physical_page_allocator *, uint64_t *);
 enum physical_page_status __wrap_physical_page_allocate(struct physical_page_allocator *a, uint64_t *p)
@@ -179,6 +185,135 @@ static void socketpair_scale(struct kernel_files *files, struct kernel_mm *mm)
     check(kernel_files_close(files, pair[1], &result) == KERNEL_FILES_STATUS_OK && result == 0, 101);
 }
 
+static void sysv_shm_fragments(struct kernel_mm *mm)
+{
+    for (unsigned scenario = 0; scenario < 6; scenario++) {
+        int32_t id;
+        uint64_t base, replacement = 0;
+        int64_t result;
+        struct kernel_shmid64_ds ds;
+        struct kernel_vma vma;
+        check(kernel_shm_get(0, KERNEL_IPC_PRIVATE, 3 * BOAROS_PAGE_SIZE,
+                            0600, &id) == 0 &&
+              kernel_shm_at_mm(mm, 1, id, 0, 0, &base) == 0, 140);
+        if (scenario == 0) {
+            check(kernel_mm_mprotect(mm, base + BOAROS_PAGE_SIZE,
+                      BOAROS_PAGE_SIZE, KERNEL_MM_READ) == KERNEL_MM_STATUS_OK &&
+                  kernel_shm_ctl_mm(0, id, KERNEL_IPC_STAT,
+                      (uintptr_t)&ds, &result) == 0 && ds.shm_nattch == 3, 141);
+            struct kernel_mm child = {0};
+            check(kernel_mm_fork(&child, mm) == KERNEL_MM_STATUS_OK &&
+                  kernel_shm_ctl_mm(0, id, KERNEL_IPC_STAT,
+                      (uintptr_t)&ds, &result) == 0 && ds.shm_nattch == 6, 142);
+            check(kernel_mm_release(&child) == KERNEL_MM_STATUS_OK, 143);
+        } else if (scenario < 3) {
+            if (scenario == 1)
+                check(kernel_shm_ctl_mm(0, id, KERNEL_IPC_RMID, 0, &result) == 0, 144);
+            check(kernel_mm_munmap(mm, base + (scenario == 1 ? BOAROS_PAGE_SIZE : 0),
+                      BOAROS_PAGE_SIZE) == KERNEL_MM_STATUS_OK &&
+                  kernel_shm_ctl_mm(0, id, KERNEL_IPC_STAT,
+                      (uintptr_t)&ds, &result) == 0 &&
+                  ds.shm_nattch == (scenario == 1 ? 2U : 1U), 145);
+        } else if (scenario < 5) {
+            check(kernel_mm_mmap_anonymous(mm,
+                      base + (scenario == 4 ? BOAROS_PAGE_SIZE : 0),
+                      (scenario == 4 ? 1U : 3U) * BOAROS_PAGE_SIZE,
+                      KERNEL_MM_READ | KERNEL_MM_WRITE, KERNEL_MM_MAP_FIXED,
+                      &replacement) == KERNEL_MM_STATUS_OK &&
+                  kernel_shm_ctl_mm(0, id, KERNEL_IPC_STAT,
+                      (uintptr_t)&ds, &result) == 0 &&
+                  ds.shm_nattch == (scenario == 4 ? 2U : 0U), 146);
+        } else {
+            check(kernel_shm_at_mm(mm, 1, id, base + BOAROS_PAGE_SIZE,
+                      KERNEL_SHM_REMAP, &replacement) == 0 &&
+                  kernel_shm_ctl_mm(0, id, KERNEL_IPC_STAT,
+                      (uintptr_t)&ds, &result) == 0 && ds.shm_nattch == 2, 147);
+        }
+        check(kernel_shm_dt_mm(mm, base) == (scenario == 3 ? -KERNEL_EINVAL : 0), 148);
+        if (scenario == 4 || scenario == 5) {
+            check(kernel_mm_vma_lookup(mm, replacement, &vma) == KERNEL_MM_STATUS_OK &&
+                  vma.kind == (scenario == 4 ? KERNEL_VMA_KIND_ANONYMOUS :
+                                               KERNEL_VMA_KIND_SYSV_SHM), 149);
+            if (scenario == 5) check(kernel_shm_dt_mm(mm, replacement) == 0, 150);
+        }
+        if (scenario != 1) {
+            check(kernel_shm_ctl_mm(0, id, KERNEL_IPC_STAT,
+                      (uintptr_t)&ds, &result) == 0 && ds.shm_nattch == 0 &&
+                  kernel_shm_ctl_mm(0, id, KERNEL_IPC_RMID, 0, &result) == 0, 151);
+        }
+        check(kernel_shm_ctl_mm(0, id, KERNEL_IPC_STAT,
+                  (uintptr_t)&ds, &result) == -KERNEL_EINVAL, 152);
+        if (scenario == 3 || scenario == 4)
+            check(kernel_mm_munmap(mm, replacement,
+                      (scenario == 3 ? 3U : 1U) * BOAROS_PAGE_SIZE) == KERNEL_MM_STATUS_OK, 153);
+        for (unsigned page = 0; page < 4; page++)
+            check(kernel_mm_vma_lookup(mm, base + page * BOAROS_PAGE_SIZE,
+                      &vma) == KERNEL_MM_STATUS_NOT_MAPPED, 154);
+    }
+}
+
+static void sysv_shm_oom(struct kernel_mm *mm)
+{
+    for (unsigned remap = 0; remap < 2; remap++) {
+        for (unsigned ordinal = 1; ; ordinal++) {
+            check(ordinal < 32, 155);
+            int32_t id;
+            uint64_t base = 0, address = 0;
+            int64_t result;
+            struct kernel_shmid64_ds ds;
+            check(kernel_shm_get(0, KERNEL_IPC_PRIVATE, 3 * BOAROS_PAGE_SIZE,
+                                0600, &id) == 0, 156);
+            if (remap) check(kernel_mm_mmap_anonymous(mm, 0, 5 * BOAROS_PAGE_SIZE,
+                KERNEL_MM_READ | KERNEL_MM_WRITE, 0, &base) == KERNEL_MM_STATUS_OK, 157);
+            fail_metadata = ordinal;
+            int attached = kernel_shm_at_mm(mm, 1, id,
+                remap ? base + BOAROS_PAGE_SIZE : 0, remap ? KERNEL_SHM_REMAP : 0, &address);
+            fail_metadata = 0;
+            if (attached) {
+                check(attached == -KERNEL_ENOMEM && address == 0 &&
+                    kernel_shm_ctl_mm(0, id, KERNEL_IPC_STAT, (uintptr_t)&ds, &result) == 0 &&
+                    ds.shm_nattch == 0, 158);
+                if (remap) {
+                    struct kernel_vma vma;
+                    check(kernel_mm_vma_lookup(mm, base + BOAROS_PAGE_SIZE, &vma) ==
+                        KERNEL_MM_STATUS_OK && vma.kind == KERNEL_VMA_KIND_ANONYMOUS, 159);
+                }
+                check(kernel_shm_at_mm(mm, 1, id, remap ? base + BOAROS_PAGE_SIZE : 0,
+                    remap ? KERNEL_SHM_REMAP : 0, &address) == 0, 160);
+            }
+            check(kernel_shm_dt_mm(mm, address) == 0 &&
+                kernel_shm_ctl_mm(0, id, KERNEL_IPC_RMID, 0, &result) == 0, 161);
+            if (remap) check(kernel_mm_munmap(mm, base, 5 * BOAROS_PAGE_SIZE) == KERNEL_MM_STATUS_OK, 162);
+            if (!attached) break;
+        }
+    }
+    int32_t id;
+    uint64_t address;
+    int64_t result;
+    struct kernel_shmid64_ds ds;
+    check(kernel_shm_get(0, KERNEL_IPC_PRIVATE, 3 * BOAROS_PAGE_SIZE, 0600, &id) == 0 &&
+        kernel_shm_at_mm(mm, 1, id, 0, 0, &address) == 0 &&
+        kernel_mm_mprotect(mm, address + BOAROS_PAGE_SIZE, BOAROS_PAGE_SIZE,
+                          KERNEL_MM_READ) == KERNEL_MM_STATUS_OK, 163);
+    for (unsigned pages = 0; pages < 2; pages++) {
+        for (unsigned ordinal = 1; ; ordinal++) {
+            check(ordinal < 128, 164);
+            struct kernel_mm child = {0};
+            if (pages) fail_page = ordinal; else fail_metadata = ordinal;
+            enum kernel_mm_status status = kernel_mm_fork(&child, mm);
+            fail_page = fail_metadata = 0;
+            if (status == KERNEL_MM_STATUS_OK)
+                check(kernel_mm_release(&child) == KERNEL_MM_STATUS_OK, 165);
+            else check(status == KERNEL_MM_STATUS_NO_MEMORY, 166);
+            check(kernel_shm_ctl_mm(0, id, KERNEL_IPC_STAT, (uintptr_t)&ds, &result) == 0 &&
+                  ds.shm_nattch == 3, 167);
+            if (status == KERNEL_MM_STATUS_OK) break;
+        }
+    }
+    check(kernel_shm_dt_mm(mm, address) == 0 &&
+          kernel_shm_ctl_mm(0, id, KERNEL_IPC_RMID, 0, &result) == 0, 168);
+}
+
 static void sysv_shm_scale(struct kernel_mm *mm)
 {
     /* 1. IPC_PRIVATE segment allocation */
@@ -247,6 +382,8 @@ static void sysv_shm_scale(struct kernel_mm *mm)
     check(kernel_shm_get(0, key, 4096, 0, &shmid_dup) == 0 && shmid_dup == shmid_named, 129);
     check(kernel_shm_ctl_mm(0, shmid_named, KERNEL_IPC_RMID, 0, &res) == 0, 130);
     check(kernel_shm_get(0, key, 4096, 0, &shmid_dup) == -KERNEL_ENOENT, 131);
+    sysv_shm_fragments(mm);
+    sysv_shm_oom(mm);
 }
 
 static struct riscv_mm_statistics mapped_cost(struct kernel_files *files,

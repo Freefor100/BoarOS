@@ -1,6 +1,7 @@
 #include <kernel/heap.h>
 #include <kernel/page.h>
 #include <kernel/vma.h>
+#include <kernel/shm.h>
 
 #include <stddef.h>
 #include <stdint.h>
@@ -59,6 +60,8 @@ static int vma_valid(const struct kernel_vma *vma)
         vma->fault_policy > KERNEL_VMA_FAULT_FILE_SHARED) {
         return 0;
     }
+    if (vma->kind != KERNEL_VMA_KIND_SYSV_SHM && vma->shm_attachment)
+        return 0;
     if (vma->kind == KERNEL_VMA_KIND_ANONYMOUS &&
         (vma->backing_offset != 0U || vma->backing != 0 ||
          vma->fault_policy == KERNEL_VMA_FAULT_FILE_PRIVATE ||
@@ -85,7 +88,7 @@ static int vma_valid(const struct kernel_vma *vma)
     }
     if (vma->kind == KERNEL_VMA_KIND_SYSV_SHM &&
         (vma->backing == 0 ||
-         vma->shm_segment == 0 ||
+         vma->shm_attachment == 0 ||
          vma->fault_policy != KERNEL_VMA_FAULT_ANON_SHARED ||
          (vma->backing_offset & BOAROS_PAGE_MASK) != 0U ||
          vma->backing_offset > UINT64_MAX - (vma->end - vma->start))) {
@@ -111,7 +114,7 @@ static int can_merge(const struct kernel_vma *left,
         left->kind != right->kind || left->role != right->role ||
         left->fault_policy != right->fault_policy ||
         left->backing != right->backing ||
-        left->shm_segment != right->shm_segment ||
+        left->shm_attachment != right->shm_attachment ||
         left->file_shared_may_write != right->file_shared_may_write) {
         return 0;
     }
@@ -213,6 +216,8 @@ static void erase_entry(struct kernel_vma_set *set, uint32_t index)
 {
     uint32_t current;
 
+    if (set->entries[index].shm_attachment)
+        kernel_shm_attachment_close(set->entries[index].shm_attachment);
     for (current = index; current + 1U < set->count; current++) {
         set->entries[current] = set->entries[current + 1U];
     }
@@ -278,6 +283,7 @@ static enum kernel_vma_status insert_entry(struct kernel_vma_set *set,
     }
     move_entries(set, index + 1U, index, set->count - index);
     set->entries[index] = merged;
+    if (merged.shm_attachment) kernel_shm_attachment_open(merged.shm_attachment);
     set->count++;
     return KERNEL_VMA_STATUS_OK;
 }
@@ -313,6 +319,7 @@ static enum kernel_vma_status split_at(struct kernel_vma_set *set,
                  index + 1U,
                  set->count - index - 1U);
     set->entries[index + 1U] = right;
+    if (right.shm_attachment) kernel_shm_attachment_open(right.shm_attachment);
     set->count++;
     return KERNEL_VMA_STATUS_OK;
 }
@@ -376,6 +383,8 @@ enum kernel_vma_status kernel_vma_set_clone(
     if (status == KERNEL_VMA_STATUS_OK) {
         for (index = 0U; index < source->count; index++) {
             working->entries[index] = source->entries[index];
+            if (working->entries[index].shm_attachment)
+                kernel_shm_attachment_open(working->entries[index].shm_attachment);
         }
         working->count = source->count;
         working->total_bytes = source->total_bytes;
@@ -395,6 +404,9 @@ enum kernel_vma_status kernel_vma_set_destroy(struct kernel_vma_set **set)
     }
     working = *set;
     if (working->entries != 0) {
+        for (uint32_t i = 0; i < working->count; i++)
+            if (working->entries[i].shm_attachment)
+                kernel_shm_attachment_close(working->entries[i].shm_attachment);
         (void)kernel_heap_release(working->heap, working->entries);
         working->entries = 0;
         working->count = 0U;
@@ -700,6 +712,9 @@ enum kernel_vma_status kernel_vma_set_commit_edit(
             set->entries[index].permissions = edit->permissions;
         }
     } else {
+        for (index = first; index < last; index++)
+            if (set->entries[index].shm_attachment)
+                kernel_shm_attachment_close(set->entries[index].shm_attachment);
         move_entries(set,
                      first,
                      last,

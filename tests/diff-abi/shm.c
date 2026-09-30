@@ -63,6 +63,8 @@ static long sys_shmdt(const void *shmaddr)
     return SC1(197, shmaddr);
 }
 
+static void shm_fragment_cases(void);
+
 void abi_shm_cases(void)
 {
     /* 1. shmget invalid arguments */
@@ -179,4 +181,76 @@ void abi_shm_cases(void)
 
     ret = sys_shmget(named_key, 4096, 0);
     abi_record("shm.get-named-after-rmid", ret, -1, -1, 0, 0, 0);
+    shm_fragment_cases();
+}
+
+
+static void shm_fragment_cases(void)
+{
+    struct abi_shmid64_ds ds = {0};
+    long id = sys_shmget(ABI_IPC_PRIVATE, 12288, 0600);
+    long base = sys_shmat(id, 0, 0);
+    abi_require(id >= 0 && base > 0);
+    abi_record("shm.split-protect", SC3(226, base + 4096, 4096, 1), -1, -1, 0, 0, 0);
+    long ret = sys_shmctl(id, ABI_IPC_STAT, &ds);
+    abi_record("shm.split-count", ret, ds.shm_nattch, -1, 0, 0, 0);
+    long child = SC5(220, 17, 0, 0, 0, 0);
+    abi_require(child >= 0);
+    if (!child) {
+        ret = sys_shmctl(id, ABI_IPC_STAT, &ds);
+        abi_require(ret == 0);
+        *(volatile long *)base = (long)ds.shm_nattch;
+        abi_exit(0);
+    }
+    int status = -1;
+    abi_require(SC4(260, child, &status, 0, 0) == child && status == 0);
+    abi_record("shm.fork-fragment-count", 0, *(volatile long *)base, -1, 0, 0, 0);
+    ret = sys_shmctl(id, ABI_IPC_STAT, &ds);
+    abi_record("shm.exit-fragment-count", ret, ds.shm_nattch, -1, 0, 0, 0);
+    abi_record("shm.split-detach", sys_shmdt((void *)base), -1, -1, 0, 0, 0);
+    abi_record("shm.split-detach-tail", SC3(226, base + 8192, 4096, 1), -1, -1, 0, 0, 0);
+    ret = sys_shmctl(id, ABI_IPC_STAT, &ds);
+    abi_record("shm.split-detach-count", ret, ds.shm_nattch, -1, 0, 0, 0);
+    abi_require(sys_shmctl(id, ABI_IPC_RMID, 0) == 0);
+
+    id = sys_shmget(ABI_IPC_PRIVATE, 12288, 0600);
+    base = sys_shmat(id, 0, 0);
+    abi_require(id >= 0 && base > 0 && sys_shmctl(id, ABI_IPC_RMID, 0) == 0);
+    abi_record("shm.rmid-middle-unmap", SC2(215, base + 4096, 4096), -1, -1, 0, 0, 0);
+    ret = sys_shmctl(id, ABI_IPC_STAT, &ds);
+    abi_record("shm.rmid-fragment-count", ret, ret == 0 ? (long)ds.shm_nattch : -1, -1, 0, 0, 0);
+    abi_record("shm.rmid-fragment-detach", sys_shmdt((void *)base), -1, -1, 0, 0, 0);
+    abi_record("shm.rmid-fragment-destroy", sys_shmctl(id, ABI_IPC_STAT, &ds), -1, -1, 0, 0, 0);
+
+    id = sys_shmget(ABI_IPC_PRIVATE, 12288, 0600);
+    base = sys_shmat(id, 0, 0);
+    abi_require(id >= 0 && base > 0 && SC2(215, base, 4096) == 0);
+    abi_record("shm.first-page-gone-detach", sys_shmdt((void *)base), -1, -1, 0, 0, 0);
+    ret = sys_shmctl(id, ABI_IPC_STAT, &ds);
+    abi_record("shm.first-page-gone-count", ret, ds.shm_nattch, -1, 0, 0, 0);
+    abi_require(sys_shmctl(id, ABI_IPC_RMID, 0) == 0);
+
+    id = sys_shmget(ABI_IPC_PRIVATE, 12288, 0600);
+    base = sys_shmat(id, 0, 0);
+    abi_require(id >= 0 && base > 0);
+    ret = SC6(222, base + 4096, 4096, 3, 0x32, -1, 0);
+    abi_require(ret == base + 4096);
+    *(volatile unsigned char *)(base + 4096) = 0x5a;
+    abi_record("shm.fixed-middle-detach", sys_shmdt((void *)base), -1, -1, 0, 0, 0);
+    abi_record("shm.fixed-middle-survives", *(volatile unsigned char *)(base + 4096), -1, -1, 0, 0, 0);
+    ret = sys_shmctl(id, ABI_IPC_STAT, &ds);
+    abi_record("shm.fixed-middle-count", ret, ds.shm_nattch, -1, 0, 0, 0);
+    abi_require(SC2(215, base + 4096, 4096) == 0 && sys_shmctl(id, ABI_IPC_RMID, 0) == 0);
+
+    long fd = abi_open("/shm-fixed-file", 0102);
+    abi_require(fd >= 0 && SC2(46, fd, 12288) == 0);
+    id = sys_shmget(ABI_IPC_PRIVATE, 12288, 0600);
+    base = sys_shmat(id, 0, 0);
+    abi_require(id >= 0 && base > 0);
+    ret = SC6(222, base, 12288, 3, 0x12, fd, 0);
+    abi_record("shm.fixed-file-replace", ret == base ? 0 : ret, -1, -1, 0, 0, 0);
+    ret = sys_shmctl(id, ABI_IPC_STAT, &ds);
+    abi_record("shm.fixed-file-count", ret, ds.shm_nattch, -1, 0, 0, 0);
+    abi_require(sys_shmctl(id, ABI_IPC_RMID, 0) == 0 && SC2(215, base, 12288) == 0);
+    abi_require(SC1(57, fd) == 0 && SC3(35, -100, "/shm-fixed-file", 0) == 0);
 }

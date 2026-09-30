@@ -44,7 +44,7 @@ enum kernel_mm_status kernel_mm_shmdt(
     struct kernel_mm *mm, uint64_t address);
 ```
 
-文件 VMA 要求非空 backing、与 kind 匹配的 fault policy、页对齐 offset，并保证 `offset + VMA length` 不溢出；私有匿名 VMA 禁止 backing 和非零 offset，共享匿名 VMA 则要求非空对象、`ANON_SHARED` fault policy 和页对齐连续 offset。SysV 共享内存 VMA（`KERNEL_VMA_KIND_SYSV_SHM`）持有 `kernel_memory_object` 后备与 `shm_segment` 附加引用，禁止与其他 VMA 合并，在 munmap 与 release 时自动触发段附加计数递减；详见 [SysV 共享内存模块](sysv-shm.md)。集合只借用 backing，MM 的独立 registry 持有 OFD 或共享匿名对象引用。`kernel_vma_set_backing_in_use()` 只用于 munmap/fixed replace/销毁后的冷清理，不进入缺页查找热路径。
+文件 VMA 要求非空 backing、与 kind 匹配的 fault policy、页对齐 offset，并保证 `offset + VMA length` 不溢出；私有匿名 VMA 禁止 backing 和非零 offset，共享匿名 VMA 则要求非空对象、`ANON_SHARED` fault policy 和页对齐连续 offset。SysV 共享内存 VMA（`KERNEL_VMA_KIND_SYSV_SHM`）借用 `kernel_memory_object` 后备并拥有稳定 `shm_attachment` 片段引用，禁止与其他 VMA 合并，在 munmap 与 release 时自动触发段附加计数递减；详见 [SysV 共享内存模块](sysv-shm.md)。集合只借用 backing，MM 的独立 registry 持有 OFD 或共享匿名对象引用；SysV attachment 的片段引用由通用集合插入、分裂、clone、编辑提交和销毁统一维护，不再依赖架构层重叠扫描。`kernel_vma_set_backing_in_use()` 只用于 munmap/fixed replace/销毁后的冷清理，不进入缺页查找热路径。
 
 ## 排序、选址与合并
 

@@ -90,7 +90,7 @@ make test-references
 
 [开发路线](docs/goals.md)统一记录本轮任务、分支交接和后续依赖。通用兼容性在 `main`，比赛环境与运行入口在 `oscomp-rv-compat`；后者单向合入已验收主线。只跑 RV 的原 judge 评分不等于双架构比赛交付，也不能把逐组诊断分数拼成正式总分。
 
-已按统一 VFS 对象路线分阶段拆分 ext4 后端、实现挂载路径和首批真实 procfs。真实内存快照、RV64 sysinfo、后台写回及 proc fd 复用压力已接入；统一内存后备对象、tmpfs、硬链接和真实第二 ext4 磁盘已接入，验收见[多挂载证据](docs/learning/memory-backed-mounts.md)。会话/进程组、可信随机数、真实调度、coarse clock、AF_UNIX socketpair 与 SysV 共享内存已完成本轮验收；同期量化文件写入、同步、扫描和锁等待成本，再依据证据选择优化。随后分别闭环日志/RTC 用户接口，iperf、netperf、iozone 继续独立定位。SMP、LoongArch、实板和更大工具链按新基线另行排期。
+已按统一 VFS 对象路线分阶段拆分 ext4 后端、实现挂载路径和首批真实 procfs。真实内存快照、RV64 sysinfo、后台写回及 proc fd 复用压力已接入；统一内存后备对象、tmpfs、硬链接和真实第二 ext4 磁盘已接入，验收见[多挂载证据](docs/learning/memory-backed-mounts.md)。会话/进程组、可信随机数、真实调度、coarse clock、AF_UNIX socketpair 与 SysV 共享内存已完成初始验收，新增 attachment/VMA 片段生命周期及 OOM 组合回归；同期量化文件写入、同步、扫描和锁等待成本，再依据证据选择优化。随后分别闭环日志/RTC 用户接口，iperf、netperf、iozone 继续独立定位。SMP、LoongArch、实板和更大工具链按新基线另行排期。
 
 - [文档导航](docs/README.md)：模块契约与可复用学习材料。
 - [工程原则](docs/design.md)与[贡献说明](CONTRIBUTING.md)：技术取舍、验证与提交边界。

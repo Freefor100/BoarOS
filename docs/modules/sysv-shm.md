@@ -19,8 +19,8 @@
 
 1. **唯一段所有权与统一后备对象**：
    - 共享内存段使用 `struct kernel_memory_object` 提供物理页后备，与匿名共享映射基础设施完全统一，按需分配物理页。
-   - 段所有权由内核段表统一管理，VMA 持有对 `kernel_memory_object` 的后备引用与对 `struct kernel_shm_segment` 的附加引用。
-   - `shmat` 给 MM registry 新取得的内存对象引用先由局部 owner 持有，再移动给 registry；分配或映射失败只消费临时 owner，不改变段表引用。`test-scale-riscv` 在 registry 分配处注入 OOM，要求重试附加成功并最终回到资源基线。
+   - 段所有权由内核段表统一管理，MM registry 持有后备对象引用；每次逻辑附加另有 `kernel_shm_attachment` owner，持有后备引用、固定 shmid 身份和原始起止地址。VMA 片段拥有 attachment 引用。
+   - `shmat` 给 MM registry 新取得的内存对象引用先由局部 owner 持有，再移动给 registry；分配或映射失败只消费临时 owner，不改变段表引用。`test-scale-riscv` 在附加元数据分配处注入 OOM，要求重试附加成功并最终回到资源基线。
 2. **段标识符与代次序列隔离**：
    - 最大段数量由 `KERNEL_SHMMNI`（128）固定。
    - `shmid = slot_index + seq * KERNEL_SHMMNI`。
@@ -29,7 +29,7 @@
    - 调用 `shmctl(shmid, IPC_RMID, NULL)` 时：
      - 若当前附加计数 `nattch == 0`，立即释放物理页与内存对象，槽位复位。
      - 若当前 `nattch > 0`，标记 `marked_for_deletion = 1`。后续对该段的 `shmat` 拒绝附加（返回 `-EINVAL`），`shmget` 不再能按 key 查找到该段。已有附加的虚拟内存映射保持有效并可正常读写。
-     - 随 `shmdt`、`munmap`、进程 `exit` 或 `execve` 接触附加，当最后一次附加脱落且 `nattch == 0` 时，触发物理资源与段槽位的彻底释放。
+     - 随 `shmdt`、`munmap`、进程 `exit` 或 `execve` 接触附加，当最后一个片段及临时 attachment owner 消失时，触发物理资源与段槽位的彻底释放。
 4. **`IPC_STAT` 与 `SHM_DEST` 标志**：
    - 当段已被 `IPC_RMID` 标记删除但仍有附加时，`shmctl(..., IPC_STAT, ...)` 仍可成功查询，并在 `shm_perm.mode` 中反映 `SHM_DEST`（01000）标志位，符合 Linux 原生行为。
 
@@ -39,7 +39,8 @@
 
 - VMA 使用 `KERNEL_VMA_KIND_SYSV_SHM` 与 `KERNEL_VMA_FAULT_ANON_SHARED`。
 - `mm/vma.c` 的 `can_merge()` 显式禁止合并 SysV SHM VMA，确保各附加段的边界、起始地址与生命周期独立。
-- `arch/riscv/mm.c` 在 `kernel_mm_fork()` 时遍历继承的 VMA 递增 `segment->nattch`；在 `kernel_mm_munmap()` 与 `kernel_mm_release()` 时对被移除的 SysV SHM VMA 调用 `kernel_shm_on_vma_detach()` 递减 `nattch` 并触发末引用清理。
+- `mm/vma.c` 在成功插入、split、clone、remove/replace 和 destroy 时统一调用 attachment open/close；prepare 不改变引用，commit 不再分配。`nattch` 是已提交 VMA 片段数，不是每进程或每次 `shmat` 固定计一。临时 attachment owner 保住槽身份但不增加 `nattch`，所有权错误触发 fatal。
+- `shmdt` 从原始附加地址查找稳定 attachment，即使首段已撤销也能移除全部剩余片段；不会移除洞内被匿名、文件或其他 SHM 附加替换的新映射。fork 的 VMA clone 自动增引用，后续 fork OOM 经统一 destroy 回滚。
 - `shared_anon_leaf()` 将 `KERNEL_VMA_KIND_SYSV_SHM` 视作共享叶子页表项，`kernel_mm_fork()` 克隆页表时共享 PTE 而不作写保护。
 
 ## 验证与回归

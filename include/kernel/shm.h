@@ -81,6 +81,7 @@ struct kernel_shm_segment {
     uint64_t aligned_size;
     struct kernel_memory_object *memory;
     uint64_t nattch;
+    uint32_t attachments;
     int64_t atime;
     int64_t dtime;
     int64_t ctime;
@@ -93,6 +94,17 @@ struct kernel_shm_segment {
     uint32_t cgid;
     uint8_t marked_for_deletion;
     uint8_t active;
+};
+
+/* Stable logical attachment shared by its VMA fragments and fork copies.
+ * Temporary owners do not contribute to the user-visible fragment count. */
+struct kernel_shm_attachment {
+    struct kernel_heap *heap;
+    struct kernel_shm_segment *segment;
+    struct kernel_memory_object *memory;
+    uint64_t start, end;
+    int32_t shmid;
+    uint32_t references;
 };
 
 struct kernel_heap;
@@ -130,7 +142,14 @@ int kernel_shm_ctl(struct kernel_task *caller, int32_t shmid, int32_t cmd,
 int kernel_shm_ctl_mm(struct kernel_mm *mm, int32_t shmid, int32_t cmd,
                       uint64_t user_buf, int64_t *out_result);
 
-void kernel_shm_on_vma_detach(struct kernel_shm_segment *segment);
-void kernel_shm_on_vma_fork(struct kernel_shm_segment *segment);
+enum kernel_shm_status kernel_shm_attachment_create(
+    struct kernel_shm_segment *segment, uint64_t start, uint64_t end,
+    struct kernel_shm_attachment **owner);
+void kernel_shm_attachment_acquire(struct kernel_shm_attachment *attachment);
+/* Consumes the owner; accepts an empty slot for scoped cleanup. */
+void kernel_shm_attachment_release(struct kernel_shm_attachment **owner);
+/* Only committed VMA descriptors contribute to nattch. These cannot sleep. */
+void kernel_shm_attachment_open(struct kernel_shm_attachment *attachment);
+void kernel_shm_attachment_close(struct kernel_shm_attachment *attachment);
 
 #endif /* BOAROS_KERNEL_SHM_H */
