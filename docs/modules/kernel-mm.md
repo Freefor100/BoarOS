@@ -212,7 +212,7 @@ MM record 拥有按 VFS node 去重的稳定关联记录，以及每个驻留文
 身份和私有化状态。VFS 只借用关联；OFD 来源持有 node 的生命周期。共享 MM 不重复
 登记，fork 在页表共享提交前复制来源/关联/驻留元数据，成功后登记新 MM。mmap 在
 VMA/PTE 修改前预留关联；失败不消耗调用者 OFD。末个 VMA 消失或销毁时先解除关联，
-再释放 OFD。不得登记可移动的 VMA 数组元素或 MM handle 地址。
+再释放 OFD；文件 fault/msync 在途操作 pin 推迟最后来源释放，直至睡眠操作完成。真实 close 错误仍保留来源 owner。不得登记可移动的 VMA 数组元素或 MM handle 地址。
 
 首次文件 fault 在发布 PTE/alias 前预留驻留记录和地址哈希容量；COW 成功后更新私有标志及物理地址。
 缓存命中的 write-first fault 若 COW 物理分配失败，必须撤销临时 cache PTE 后返回，

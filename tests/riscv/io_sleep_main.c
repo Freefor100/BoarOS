@@ -1,4 +1,6 @@
 #include <arch/riscv/context.h>
+#include <arch/riscv/mm.h>
+#include <kernel/open_file.h>
 #include <arch/riscv/sbi.h>
 #include <arch/riscv/plic.h>
 #include <arch/riscv/timer.h>
@@ -24,6 +26,27 @@ static struct kernel_vfs_mount mount;
 static struct kernel_vfs_file file;
 static struct riscv_virtio_mmio_block device;
 static unsigned char payload[4096];
+static struct kernel_mm sync_mm;
+static uint64_t sync_satp, sync_address;
+static int sync_edit;
+static struct kernel_open_file_description *sync_source;
+static struct kernel_wait_queue sync_held;
+static struct kernel_task *sync_task;
+static unsigned sync_entered, sync_active, sync_finished, sync_released;
+static int sync_error, sync_close_error;
+uint64_t __real_riscv_sv39_current_satp(void);
+uint64_t __wrap_riscv_sv39_current_satp(void)
+{ return sync_edit ? sync_satp : __real_riscv_sv39_current_satp(); }
+int __real_kernel_open_file_sync_range(struct kernel_open_file_description *, uint64_t, uint64_t);
+int __wrap_kernel_open_file_sync_range(struct kernel_open_file_description *ofd, uint64_t start, uint64_t end)
+{
+    if (ofd == sync_source) sync_active = 1;
+    int result = __real_kernel_open_file_sync_range(ofd, start, end);
+    if (ofd == sync_source) { sync_active = 0; if (sync_error) return -5; }
+    return result;
+}
+enum kernel_open_file_status __real_kernel_open_file_release(struct kernel_open_file_description **);
+enum kernel_open_file_status __wrap_kernel_open_file_release(struct kernel_open_file_description **owner);
 static unsigned loading_probe, loads, done, write_probe, background_fail;
 static uint64_t pressure_pages[1024], failed_offset;
 static struct kernel_wait_queue held_write;
@@ -41,6 +64,85 @@ extern unsigned char __boot_stack_bottom[], __boot_stack_top[];
 static void check(int good, unsigned id)
 {
     if (!good) { virt_uart_puts("I/O sleep failed: "); virt_uart_put_hex(id); virt_uart_putc('\n'); sbi_shutdown(); }
+}
+enum kernel_open_file_status __wrap_kernel_open_file_release(struct kernel_open_file_description **owner)
+{
+    if (*owner == sync_source) {
+        check(!sync_active, 220); /* 最后映射撤销不能释放仍在 msync 中使用的 OFD。 */
+        if (sync_close_error) { sync_close_error = 0; return KERNEL_OPEN_FILE_STATUS_CLEANUP_REQUIRED; }
+        sync_released++;
+    }
+    return __real_kernel_open_file_release(owner);
+}
+static void sync_inode_holder(void *argument)
+{
+    (void)argument;
+    uintptr_t irq = riscv_interrupt_save();
+    KERNEL_LOCK_SCOPE(guard);
+    kernel_vfs_node_lock(kernel_vfs_file_node(&file), &guard, 1);
+    sync_entered = 1;
+    enum kernel_wait_wake_reason reason;
+    check(kernel_scheduler_block_current(&sync_held, 0, 0, &reason) == KERNEL_SCHEDULER_STATUS_OK, 221);
+    riscv_interrupt_restore(irq);
+}
+static void sync_mapping_worker(void *argument)
+{
+    (void)argument;
+    uintptr_t irq = riscv_interrupt_save();
+    sync_task = kernel_task_current();
+    check(kernel_mm_msync(&sync_mm, sync_address, 4096, 4) == sync_error, 222);
+    sync_finished = 1;
+    riscv_interrupt_restore(irq);
+}
+static void sync_source_probe(void *argument)
+{
+    (void)argument;
+    uintptr_t irq = riscv_interrupt_save();
+    for (unsigned round = 0; round < 2; round++) {
+        sync_entered = sync_active = sync_finished = sync_released = 0;
+        sync_error = round ? -5 : 0; sync_close_error = round;
+        sync_mm = (struct kernel_mm){0};
+        struct riscv_sv39_page_table table = {0};
+        struct riscv_sv39_user_space space = {0};
+        struct kernel_open_file_description *owner = 0;
+        int result;
+        check(riscv_sv39_page_table_init(&table, &allocator) == RISCV_SV39_STATUS_OK, 235);
+        /* 只测试 MM owner 与调度，借用空内核根；当前 hart 仍在 Bare 模式。 */
+        table.state = RISCV_SV39_STATE_ACTIVE;
+        check(riscv_sv39_user_space_init(&space, &allocator, &table) == RISCV_SV39_STATUS_OK &&
+            riscv_kernel_mm_create(&sync_mm, &space) == KERNEL_MM_STATUS_OK &&
+            kernel_mm_vma_enable(&sync_mm, &heap) == KERNEL_MM_STATUS_OK &&
+            kernel_mm_brk_initialize(&sync_mm, 0x10000000, 0x70000000) == KERNEL_MM_STATUS_OK &&
+            riscv_kernel_mm_satp(&sync_mm, &sync_satp) == KERNEL_MM_STATUS_OK &&
+            kernel_open_file_create(&heap, &mount, "/concurrent", &owner, &result) == KERNEL_OPEN_FILE_STATUS_OK && result == 0, 223);
+        sync_source = owner;
+        check(kernel_mm_mmap_file_private(&sync_mm, &owner, 0x20000000, 4096, 0,
+            KERNEL_MM_READ, KERNEL_MM_MAP_SHARED, &sync_address) == KERNEL_MM_STATUS_OK && !owner, 224);
+        kernel_wait_queue_init(&sync_held);
+        struct kernel_thread_join holder = {0}, synchronizer = {0};
+        check(kernel_thread_create_joinable(sync_inode_holder, 0, &holder) == KERNEL_SCHEDULER_STATUS_OK, 225);
+        while (!sync_entered) check(kernel_scheduler_yield_current() == KERNEL_SCHEDULER_STATUS_OK, 226);
+        check(kernel_thread_create_joinable(sync_mapping_worker, 0, &synchronizer) == KERNEL_SCHEDULER_STATUS_OK, 227);
+        while (!sync_task || sync_task->state != KERNEL_THREAD_STATE_BLOCKED)
+            check(kernel_scheduler_yield_current() == KERNEL_SCHEDULER_STATUS_OK, 228);
+        check(sync_active && !sync_finished, 229);
+        /* 被取消的同步仍拥有等待中的 OFD，不能把不可中断 I/O 当成已结束。 */
+        sync_task->terminate_requested = 1;
+        sync_edit = 1;
+        check(kernel_mm_munmap(&sync_mm, sync_address, 4096) == KERNEL_MM_STATUS_OK && !sync_released, 230);
+        sync_edit = 0;
+        kernel_wait_queue_wake_all(&sync_held);
+        kernel_thread_join(&holder);
+        kernel_thread_join(&synchronizer);
+        check(sync_finished && sync_released == (round ? 0U : 1U), 231);
+        sync_task = 0; sync_satp = 0;
+        check(kernel_mm_release(&sync_mm) == KERNEL_MM_STATUS_OK &&
+            physical_page_release(&allocator, table.root_address) == PHYSICAL_PAGE_STATUS_OK, 232);
+        check(sync_released == 1, 236);
+        sync_source = 0;
+    }
+    virt_uart_puts("I/O msync source pin passed\n");
+    riscv_interrupt_restore(irq);
 }
 static void print_counters(const char *phase, const struct riscv_virtio_mmio_block_statistics *stats)
 {
@@ -655,6 +757,14 @@ void kernel_main(unsigned long hart, const void *dtb)
     for (;;) {
         uintptr_t irq = riscv_interrupt_save();
         check(kernel_scheduler_yield_current() == KERNEL_SCHEDULER_STATUS_OK, 99);
+        struct kernel_thread_completion completion;
+        if (kernel_scheduler_reap_one(&completion) == KERNEL_SCHEDULER_STATUS_OK) break;
+        riscv_interrupt_restore(irq | RISCV_SSTATUS_SIE);
+    }
+    check(kernel_thread_create(sync_source_probe, 0) == KERNEL_SCHEDULER_STATUS_OK, 233);
+    for (;;) {
+        uintptr_t irq = riscv_interrupt_save();
+        check(kernel_scheduler_yield_current() == KERNEL_SCHEDULER_STATUS_OK, 234);
         struct kernel_thread_completion completion;
         if (kernel_scheduler_reap_one(&completion) == KERNEL_SCHEDULER_STATUS_OK) break;
         riscv_interrupt_restore(irq | RISCV_SSTATUS_SIE);

@@ -32,7 +32,7 @@ enum riscv_kernel_mm_record_stage {
 struct riscv_kernel_mm_file_source {
     struct riscv_kernel_mm_file_source *next;
     struct kernel_open_file_description *file;
-    uint32_t faults;
+    uint32_t operations;
     int draining;
 };
 
@@ -49,10 +49,10 @@ static void release_fault_page(struct fault_page_pin *pin)
         kernel_open_file_discard_new_page(pin->file, pin->index, pin->address);
 }
 
-static void unpin_fault_source(struct riscv_kernel_mm_file_source **source)
+static void unpin_file_source(struct riscv_kernel_mm_file_source **source)
 {
-    if (!(*source)->faults) __builtin_trap();
-    (*source)->faults--;
+    if (!(*source)->operations) __builtin_trap();
+    (*source)->operations--;
 }
 
 struct riscv_kernel_mm_shared_anon {
@@ -598,7 +598,7 @@ static enum kernel_mm_status drain_file_sources(
         struct riscv_kernel_mm_file_source *source = *link;
         int in_use = 0;
 
-        if (source->faults || source->draining) {
+        if (source->operations || source->draining) {
             if (!unused_only) __builtin_trap();
             link = &source->next;
             continue;
@@ -2534,8 +2534,19 @@ int kernel_mm_msync(struct kernel_mm *mm, uint64_t address,
         if ((flags & 4U) != 0U && vma.kind == KERNEL_VMA_KIND_FILE_SHARED) {
             uint64_t file_start = vma.backing_offset + cursor - vma.start;
             uint64_t file_end = file_start + segment_end - cursor;
-            int result = kernel_open_file_sync_range(vma.backing,
-                                                      file_start, file_end);
+            int result;
+            {
+                struct riscv_kernel_mm_file_source *source
+                    __attribute__((cleanup(unpin_file_source))) =
+                        find_file_source(record, vma.backing);
+                if (!source || source->operations == UINT32_MAX) __builtin_trap();
+                /* sync_range 的 inode 等待和错误游标访问都借用这个 OFD。 */
+                source->operations++;
+                result = kernel_open_file_sync_range(source->file, file_start, file_end);
+            }
+            enum kernel_mm_status drained = drain_file_sources(record, 1);
+            if (drained == KERNEL_MM_STATUS_STATE) __builtin_trap();
+            /* 真实 close 失败仍由 registry 保留；不覆盖本次同步结果。 */
             if (result != 0) return result;
         }
         cursor = segment_end;
@@ -3128,10 +3139,10 @@ static enum kernel_mm_status resolve_user_fault_once(
          vma.fault_policy == KERNEL_VMA_FAULT_FILE_SHARED) &&
         vma.backing != 0) {
         uint64_t version = kernel_vma_set_generation(record->vmas);
-        struct riscv_kernel_mm_file_source *source __attribute__((cleanup(unpin_fault_source))) =
+        struct riscv_kernel_mm_file_source *source __attribute__((cleanup(unpin_file_source))) =
             find_file_source(record, vma.backing);
-        if (!source || source->faults == UINT32_MAX) __builtin_trap();
-        source->faults++;
+        if (!source || source->operations == UINT32_MAX) __builtin_trap();
+        source->operations++;
         KERNEL_LOCK_SCOPE(node_guard);
         kernel_vfs_node_lock(kernel_open_file_node(vma.backing), &node_guard, 0);
         if (version != kernel_vma_set_generation(record->vmas)) {

@@ -90,4 +90,4 @@ make test-riscv
 
 ## 文件缺页跨 I/O 等待
 
-文件/ELF source 登记有独立在途 fault 引用。缺页先保存 VMA generation 和 source owner，在发布任何 PTE 前完成文件 I/O；返回后重新验证 VMA 版本、大小、页状态及同地址 PTE。并发 unmap/固定替换不能发布旧映射；另一线程已满足同一缺页时视为成功并执行本地失效。截断由 inode 锁与发布阶段互斥，元数据分配只做干净回收，避免发布中途递归存储等待。source 清理等待在途 fault，清理发生等待后重新定位 registry 链接，不能使用过期前驱。`tests/riscv/files_main.c` 的确定性交错覆盖 I/O 期间 unmap 和另一线程先发布同一页。
+文件 source 登记有独立在途操作 pin，覆盖缺页与 `msync`；ELF source 保留 fault pin。`msync` 在首个 inode 等待前 pin，直到范围同步与 OFD 错误游标访问完成后才 unpin，再清理未使用来源。最后映射并发撤销不释放被 pin 的 OFD，真实 close 失败留在 MM registry，遍历每段时重新查当前 VMA。缺页先保存 VMA generation 和 source owner，在发布任何 PTE 前完成文件 I/O；返回后重新验证 VMA 版本、大小、页状态及同地址 PTE。并发 unmap/固定替换不能发布旧映射；另一线程已满足同一缺页时视为成功并执行本地失效。截断由 inode 锁与发布阶段互斥，元数据分配只做干净回收，避免发布中途递归存储等待。source 清理等待在途操作，清理发生等待后重新定位 registry 链接，不能使用过期前驱。`make test-io-sleep-riscv` 的三任务交错覆盖 inode 持锁等待、最后撤映射、终止请求、同步/关闭错误及最终清理；`tests/riscv/files_main.c` 的确定性交错覆盖 I/O 期间 unmap 和另一线程先发布同一页。
