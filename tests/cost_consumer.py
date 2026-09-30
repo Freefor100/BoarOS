@@ -1,6 +1,7 @@
 """Pinned original iozone fixture and per-command results (script status is never proof)."""
 from pathlib import Path
 import re
+import math
 import subprocess
 ORIGINAL_SHA='f419468678d342133546add2f8459ea09aeba987ba968e28753d6ee656996b8b'
 ELFS={'musl':'019cd6e219263f41b3c1d62024ea9ce38e613541bf2a1d9b7e2aa6506187ecd6','glibc':'984c8ad474072011f38d52a98d422c581b2277d3e2d03f90557f45a8046c66de'}
@@ -60,6 +61,37 @@ def commands(output, expected_budget_ms=180000):
             result.append(dict(command_timeout_ms=budget,reported_sections=sections,name=name,elf_sha256=ELFS[libc],argv=argv,cwd='/'+libc,timeout=timeout,wait_status=status,raw_output=raw,**classify(raw,timeout,status)))
     return result
 
+def validate_method_results(raw, index):
+    """Verify original result fields for the methods requested by GROUPS."""
+    if index==0:
+        rows=re.findall(r'^\s*4096[ \t]+1[ \t]+([^\n]+)$',raw,re.M)
+        if len(rows)!=1:raise ValueError('missing/duplicate automatic result row')
+        values=rows[0].split()
+        if len(values)!=13 or any(not math.isfinite(float(v)) or float(v)<=0 for v in values):
+            raise ValueError('invalid automatic throughput results')
+        return
+    if index==7:return  # Fixed ELF version exclusion, not native vector acceptance.
+    requested=((),('initial writers','rewriters','readers','re-readers'),
+               ('initial writers','rewriters','random readers','random writers'),
+               ('initial writers','rewriters','reverse readers'),
+               ('initial writers','rewriters','stride readers'),
+               ('fwriters','freaders'),('pwrite writers','pread readers'))[index]
+    results={};method=None
+    for line in raw.splitlines():
+        child=re.search(r'Children see throughput for\s+4\s+(.+?)\s*=\s*(\S+)\s+kB/sec',line)
+        if child:
+            if method is not None:raise ValueError('missing per-process throughput')
+            method=child[1]
+            if method in results or not math.isfinite(float(child[2])) or float(child[2])<=0:
+                raise ValueError('duplicate/invalid method throughput')
+        maximum=re.search(r'Max throughput per process\s*=\s*(\S+)\s+kB/sec',line)
+        if maximum:
+            if method is None:raise ValueError('unpaired per-process throughput')
+            value=float(maximum[1])
+            if not math.isfinite(value) or value<=0:raise ValueError('invalid per-process throughput')
+            results[method]=value;method=None
+    if method is not None or set(results)!=set(requested):raise ValueError('requested method output incomplete')
+
 def validate_record(row, require_completion=False):
     if (row.get('original_sha256')!=ORIGINAL_SHA or row.get('consumer_elf_sha256')!=ELFS or
         row.get('consumer_script_sha256')!=SCRIPTS or row.get('consumer_dependencies')!=DEPENDENCIES):
@@ -81,3 +113,4 @@ def validate_record(row, require_completion=False):
             if not actual['process_completed'] or (index!='7' and actual['outcome']!='completed'):
                 raise ValueError('original consumer did not finish: '+c['name'])
             if index=='7' and actual['reason']!='selected_tests_unavailable':raise ValueError('reference exclusion changed')
+            validate_method_results(c['raw_output'],int(index))

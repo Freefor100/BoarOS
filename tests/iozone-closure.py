@@ -17,6 +17,10 @@ def validate(records):
     required.add(('consumer',0,'modern','writeback',False,'linux'))
     if set(groups)!=required:raise ValueError('original consumer follow-up matrix missing/extra configuration')
     if len({r['elf_sha256'] for r in records})!=1:raise ValueError('coordinator ELF differs between comparisons')
+    boaros=[r for r in records if r['platform']=='boaros']
+    if len({r['source_sha256'] for r in boaros})!=1:raise ValueError('production source differs between ON/OFF')
+    for field in ('consumer_timeout_ms','qemu_sha256','firmware_sha256','timebase_hz'):
+        if len({r[field] for r in records})!=1:raise ValueError('comparison input differs: '+field)
     for row in records:
         validate_record(row,require_completion=True)
         names={c['name'] for c in row['commands']}

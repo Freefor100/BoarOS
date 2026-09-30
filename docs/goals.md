@@ -307,6 +307,10 @@ C1 阶段证据：modern/writeback 的观测开/关各三个独立启动，36 �
 - [x] 测量代码收口运行 `make test-riscv test-userland-riscv test-glibc-riscv test-diff-abi-riscv test-scale-riscv test-io-sleep-riscv test-stack-usage`，以及 SQLite DELETE/WAL 正常与选定错误恢复。后续实际修改写回、事务或队列时再跑两种完整恢复矩阵与双盘隔离。
 - [x] 每个 C 任务独立验证/提交，使用 `Co-authored-by: GPT-6.1 Sol <codex@openai.com>`；固定输入和结论入 Git 后 `python3 -B tests/prune-build.py`、`make prune-build`。完整 Harness 的 kernel-la 阻塞继续单列；最终独立审查无新增 P1/P2，核对后已清理50个临时路径，保留cost与固定Linux可复用缓存。
 
+本次消费者续测收口另有新的全改动独立审查：实际证据与数字正确，发现两项P2门禁缺口，
+均先红测再修复，18项报告检查及新旧归档验证通过；没有剩余Critical/Important。
+默认musl/glibc/栈及兼容PID1配置交替门禁重新通过，完整长时门禁的历史范围不被冒充成这次重跑。
+
 依赖为 C0 → C1/C3/C4，C1 → C2，C2/C3/C4 → C5，全部测量 → C6。下一轮的结构优化需从报告中三个候选重新确认。
 
 - [x] 兼容分支单向合入本轮已验收 main；`68b98d8` 保留 uname 4.15.0 和原入口、原 judge，`f380c70` 再合入通用续测工具。原 iozone glibc/musl 为 21.451673/21.668778；一次原预算 RV 投影 626，总预算耗尽于 lmbench-glibc，其后七组未到达。main uname 未修改，完整评测未通过。
