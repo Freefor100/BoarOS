@@ -106,6 +106,15 @@ enum kernel_scheduler_status scheduler_reschedule(int rotate_other, int voluntar
     return scheduler_switch_current_away(current);
 }
 
+void kernel_scheduler_prepare_idle_return(void)
+{
+    if (scheduler.initialized != KERNEL_SCHEDULER_INITIALIZED ||
+        scheduler.current != &scheduler.idle || !scheduler.need_resched) return;
+    /* 仅空闲栈是 IRQ 返回的内核抢占点；启动/清理持锁期间继续延后。 */
+    if (scheduler.idle.io_context.locks || scheduler.idle.io_context.backend_depth) return;
+    if (scheduler_reschedule(0, 0) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
+}
+
 static struct kernel_task *sched_target(struct kernel_task *caller, int32_t pid)
 {
     struct kernel_task *task = pid ? process_find_identity(pid, KERNEL_PID_TID) : caller;

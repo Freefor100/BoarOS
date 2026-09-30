@@ -7,9 +7,11 @@
 
 struct kernel_io_context;
 struct kernel_lock_guard;
+struct kernel_lock_waiter;
 /* Zero storage is not initialized storage. Locks may not move while owned. */
 struct kernel_rwlock {
     struct kernel_wait_queue waiters;
+    struct kernel_lock_waiter *pending_head, *pending_tail;
     struct kernel_io_context *writer;
     uint32_t readers;
     uint32_t writers_waiting;

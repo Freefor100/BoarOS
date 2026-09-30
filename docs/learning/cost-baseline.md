@@ -458,3 +458,16 @@ python3 -B tests/oscomp/run.py
 PID1配置运行、本轮scratch及栈重建目录）。再次预览候选为零；保留cost/用户程序/固定Linux缓存，
 返回main恢复默认构建。原22个judge及身份在兼容分支Git证据中，成本归档两分支共有；
 被清理的build路径不再作为永久证据。未push、发布、比赛提交或转换阶段。
+
+### 机制优化起点：idle 返回与锁资格（2026-10-01）
+
+第三方数据已从归档复核：musl replica=2 自动窗口484.5162806s，rank40持有478.5804835s、获取等待0.0764495s；
+四进程(0,1)窗口180.9422461s，rank40等待420.4252937s，23579次阻塞/23189次重阻塞。
+这是跨任务累计，不能与窗口相加；单写者主要是锁内慢路径，多写者另有反复唤醒竞争。
+
+实际 scheduler fixture 新增 S-mode idle 安全返回及后到者抢锁测试，不依赖timer；旧实现分别报1/2个失败。
+公共 trap 返回现仅对未持I/O锁的idle立即消费need_resched；RWlock按FIFO先预留队首写者或连续读者资格再定向唤醒。
+1/8/32等待者、混合读写、资源基线以及原timer-only轮转通过：
+`make -j4 test-scheduler-cases-riscv test-scheduler-riscv`。
+依据沿用references/linux固定f4cdf7ca9a1fdcca413157df19753f388a5a224e和本地RISC-V特权规范20260120；
+本项不改变普通持锁S-mode的抢占策略，尚未测定原消费者性能收益。

@@ -226,6 +226,8 @@ enum kernel_scheduler_status kernel_scheduler_yield_current(void);
 void kernel_scheduler_charge_ticks(uint64_t elapsed_ticks, int from_user);
 /* Tick-accounted time spent in the single-hart idle task. */
 uint64_t kernel_scheduler_idle_ticks(void);
+/* IRQ return may leave idle without waiting for a timer tick. */
+void kernel_scheduler_prepare_idle_return(void);
 
 /* Resolves a hardware fault in the running user task's active MM. */
 enum kernel_mm_status kernel_scheduler_resolve_current_user_fault(
