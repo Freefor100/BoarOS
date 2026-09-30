@@ -21,7 +21,7 @@ min/median/max、每副本样本数/最大值、p50/p95/p99 桶区间和运行�
 - Linux 参考 `references/linux@f4cdf7ca9a1fdcca413157df19753f388a5a224e`，Image SHA-256 `01d60a8ae733f56aa94cf11b4805da1fe876cac09d2ef81e7e7397568ee1f668`。
 - QEMU 参考 `references/qemu` v11.1.0、commit `84f07211cc5b4fc6a371559bf8a5de4fb068e648`；实际 emulator 11.1.1，binary SHA-256 `a1cfcceb6c688f9b0a290d512211ed08cf465b92b26a04cfb032280a53625718`。
 - 实际 firmware `/usr/share/qemu/opensbi-riscv64-generic-fw_dynamic.bin` SHA-256 `894e2aef99590fc07ec6c60ab00282b8bc5d5d5bb2a1d0c6ada0c52df24274c0`；kernel/ELF/fixture/DTB/firmware/工具和完整 preboot manifest 的哈希均在归档。DTB timebase 10 MHz，tick 分辨率 100 ns。
-- 聚合及声明的桥接预留共 60947 字节；每任务诊断标量 48 字节，加原内嵌 backend guard 新增 16 字节，总计 64 字节。默认 `.text` 与 `c9b6ca6` 逐字节一致，`nm` 无 cost 符号；不要求含 DWARF 的完整 ELF 哈希相同。
+- 聚合及声明的桥接预留共 60947 字节；每任务诊断标量 48 字节，加原内嵌 backend guard 新增 16 字节，总计 64 字节。默认 `.text`（364544 字节，SHA-256 `fb3c83264024c6f7997fc79516da46efca4d1f86b7716ea1ab7ef1c0fc352c19`）与 `c9b6ca6` 逐字节一致，`nm` 无 cost 符号；不要求含 DWARF 的完整 ELF 哈希相同。
 
 ### 实际成本、重复分布与观测扰动
 
