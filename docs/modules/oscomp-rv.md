@@ -66,6 +66,74 @@ runner 读取固定 Harness `kernel/judge/config.json`。其中 `qemu.timeout=36
 清理。原始 `.img/.img.xz` 在 references，不属于清理范围。通用新缺陷先最小复现，
 回 main 修复并验收，再 merge 回本分支重新构建运行。
 
+## 2026-10-01 原消费者更新后的单次 RV 基线
+
+`68b98d8` 单向合入已验收的main（含R1–R8与成本诊断），保留本分支uname 4.15.0及原入口。
+干净源码以原1GiB/1hart/设备/网络/RTC配置启动一次，观测默认关闭，3600秒总预算，
+原22个judge与postwork均未改。**RV单侧投影626**；预算终止于lmbench-glibc，后续七组未到达。
+不是全套通过，不是双架构交付，也不能由逐组诊断成绩拼接提高分数。
+运行始于上海2026-09-30 22:37:39，结束于23:37:39；本节于10月1日收口。
+
+[固定运行身份与全部原judge明细](../learning/oscomp-rv-results.json)保存报告、22组原结果、
+内核/配置/原输入身份和原文件SHA-256。iozone逐组完成统计来自同一份串口，未补跑后拼接。
+
+| 组 | glibc 原分数 | musl 原分数 | 状态/边界 |
+|---|---:|---:|---|
+| basic | 0 | 0 | 两侧脚本结束0，原run-all.sh 0644权限阻塞保留 |
+| busybox | 52 | 52 | 两侧结束0，内部通过/失败混合 |
+| cyclictest | 4.27437648 | 4.27216413 | 两侧结束0，子项不全通过 |
+| iozone | 21.4516732 | 21.6687781 | 两侧八个完成marker，20个原judge项均有正值 |
+| iperf | 0 | 0 | 两侧结束0、原评分0，不等同网络测试通过 |
+| libcbench | 36.8952791 | 30.4107229 | 两侧结束0并计时 |
+| libctest | 178 | 215 | 两侧结束0，内部通过/失败混合 |
+| lmbench | 10.6337942 | 0 | glibc预算超时，musl未到达；部分输出仍由原judge评分 |
+| ltp | 0 | 0 | 两侧未到达 |
+| lua | 0 | 0 | 两侧未到达 |
+| netperf | 0 | 0 | 两侧未到达 |
+
+原iozone glibc **21.451673162128472**，musl **21.66877812849999**。下表为原judge选取的
+Max throughput per process，单位是原输出kB/s；不是四个进程Children总和。
+原judge对低于内嵌baseline的非零值仍给1分，超过baseline按`2-1/(result/baseline)`计分；
+因此20项正值不是性能达标。baseline原值与score逐项保存在归档，表中只展示实际吞吐。
+
+| 原judge项 | glibc kB/s | musl kB/s |
+|---|---:|---:|
+| write/read 4 initial writers | 24.11 | 15.97 |
+| write/read 4 rewriters | 20.36 | 19.74 |
+| write/read 4 readers | 17903.63 | 15123.09 |
+| write/read 4 re-readers | 68775.06 | 69893.55 |
+| random-read 4 initial writers | 20.78 | 19.01 |
+| random-read 4 rewriters | 19.99 | 18.46 |
+| random-read 4 random readers | 10856.08 | 12202.98 |
+| random-read 4 random writers | 21.90 | 20.25 |
+| read-backwards 4 initial writers | 19.68 | 17.72 |
+| read-backwards 4 rewriters | 18.92 | 22.47 |
+| read-backwards 4 reverse readers | 10875.11 | 9877.97 |
+| stride-read 4 initial writers | 20.88 | 21.99 |
+| stride-read 4 rewriters | 24.22 | 18.97 |
+| stride-read 4 stride readers | 9864.54 | 15393.12 |
+| fwrite/fread 4 fwriters | 20.63 | 20.09 |
+| fwrite/fread 4 freaders | 11186.13 | 11914.19 |
+| pwrite/pread 4 pwrite writers | 19.79 | 18.47 |
+| pwrite/pread 4 pread readers | 10866.58 | 13931.60 |
+| pwritev/preadv 4 initial writers | 18.21 | 17.22 |
+| pwritev/preadv 4 rewriters | 26.35 | 20.25 |
+
+(11,12)原ELF均提示所选测试不可用，随后回退普通initial writers/rewriters，也被原judge计分；
+不能将其当作pwritev/preadv实现验证。另一次兼容配置与固定Linux的开/关九启动续测中，
+各libc的0–6组全完成、7组同样版本排除，见[成本基线](../learning/cost-baseline.md)。
+续测为512MiB与900秒逐命令诊断预算，不能冒充本节原评测配置或补入本次总分。
+
+相较历史662，本次iozone由shmget快速失败变为真实运行，占用约45分钟，留给后续组的预算减少。
+总分下降不能据此判为整体回归或改进；本轮交付的是消费者实际完成、成本及原评分证据。
+旧LTP具体缺口仍是历史事实，本次未到达，不能写成重现或通过。
+
+内核SHA-256 `b1fd90055fe448528c74878a53a866bcbe5dff2484f9d4dc4defdb9e0ed3e632`；
+串口SHA-256 `aa6973a573c65b712a1525f6477a5f6f9563ccba0a36928d8c0e40a68f7be0a2`。
+其余输入沿用原固定release/commit，实际QEMU11.1.1；重建命令仍为本模块`run.py`，
+需使用`68b98d8`或生产源码相同的后继提交。后续main改动仅通用测量工具、宿主探针与报告，
+最终评测分支继续单向合入，未改内核持久化机制。
+
 ## 2026-09-29 单次启动 RV 正式基线
 
 干净的 `f730e70b9fd9d4d4cd1b38bde9ce4ef211e5059a` 合入已验收主线后，以
