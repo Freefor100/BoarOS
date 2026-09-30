@@ -73,6 +73,7 @@ class CostReportTest(unittest.TestCase):
         snap=parse(self.render(self.valid()),3)
         snap.update({'foreground.operations.value':7,'foreground.operations.samples':1,'foreground.operations.max':7})
         rows=[dict(case='test',cost_diagnostics=1,transport='modern',cache='writeback',replica=i,replicas=3,acceptance=True,kernel_sha256='k',elf_sha256='e',source_sha256='s',fixture_sha256=str(i),snapshots=[dict(name='test',values=snap)],timings_ns={'test':1}) for i in range(3)]
+        with self.assertRaises(ValueError):m.pack(rows,final=True)
         packed=m.pack(rows);self.assertEqual(m.unpack(packed),rows)
         del packed['records'][0]['snapshots'][0]['counters']['foreground.operations']
         with self.assertRaises(ValueError):m.unpack(packed)

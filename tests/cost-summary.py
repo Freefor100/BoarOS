@@ -8,7 +8,16 @@ from cost_report import validate_replicas
 
 def main():
     p=argparse.ArgumentParser(__doc__); p.add_argument('records',nargs='+',type=Path); args=p.parse_args()
-    groups=validate_replicas([r for path in args.records for r in json.loads(path.read_text())])
+    records=[]
+    for path in args.records:
+        document=json.loads(path.read_text())
+        if isinstance(document,dict):
+            import importlib.util
+            spec=importlib.util.spec_from_file_location('cost_evidence',Path(__file__).with_name('cost-evidence.py'))
+            evidence=importlib.util.module_from_spec(spec);spec.loader.exec_module(evidence)
+            records.extend(evidence.unpack(document))
+        else:records.extend(document)
+    groups=validate_replicas(records)
     for key,rows in groups.items():
         print('configuration:',key)
         print('kernel:',rows[0]['kernel_sha256'],'ELF:',rows[0]['elf_sha256'],'source:',rows[0]['source_sha256'])
