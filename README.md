@@ -91,7 +91,7 @@ make test-references
 
 [开发路线](docs/goals.md)统一记录本轮任务、分支交接和后续依赖。通用兼容性在 `main`，比赛环境与运行入口在 `oscomp-rv-compat`；后者单向合入已验收主线。只跑 RV 的原 judge 评分不等于双架构比赛交付，也不能把逐组诊断分数拼成正式总分。
 
-已按统一 VFS 对象路线分阶段拆分 ext4 后端、实现挂载路径和首批真实 procfs。真实内存快照、RV64 sysinfo、后台写回及 proc fd 复用压力已接入；统一内存后备对象、tmpfs、硬链接和真实第二 ext4 磁盘已接入，验收见[多挂载证据](docs/learning/memory-backed-mounts.md)。独立 Review 的 R1–R8 已修复：覆盖 SysV owner/片段/权限、msync 来源 pin、AF_UNIX 整包、同步信号与 inode 整次写/截断互斥；完整 RV64、musl/glibc、差分及 WAL 恢复矩阵通过，见[路线与验收](docs/goals.md)。默认关闭的 C0–C6 成本诊断已完成 60 次串行启动及 339 个观测窗口，完整计数、开销、unknown 与三个优化候选见[成本基线](docs/learning/cost-baseline.md)。这是 main 的成本诊断，不是评测分支评分：原旧 glibc 被 uname 启动检查挡住，原 iozone 向量组在 Linux 上也不可用，部分 musl 命令超时；实际 glibc I/O 成本和最新评测仍待兼容分支合入后复测。尚未实施结构优化。随后分别闭环日志/RTC 用户接口，iperf、netperf、iozone 继续独立定位。SMP、LoongArch、实板和更大工具链按新基线另行排期。
+已按统一 VFS 对象路线分阶段拆分 ext4 后端、实现挂载路径和首批真实 procfs。真实内存快照、RV64 sysinfo、后台写回及 proc fd 复用压力已接入；统一内存后备对象、tmpfs、硬链接和真实第二 ext4 磁盘已接入，验收见[多挂载证据](docs/learning/memory-backed-mounts.md)。独立 Review 的 R1–R8 已修复：覆盖 SysV owner/片段/权限、msync 来源 pin、AF_UNIX 整包、同步信号与 inode 整次写/截断互斥；完整 RV64、musl/glibc、差分及 WAL 恢复矩阵通过，见[路线与验收](docs/goals.md)。C0–C5 受控成本测量已验收，C6 的执行器和记录已交付，共 60 次串行启动及 339 个观测窗口；C6 原消费者实际 I/O 成本与超时归因尚未完全验收，完整计数、开销、unknown 与三个优化候选见[成本基线](docs/learning/cost-baseline.md)。这是 main 的成本诊断，不是评测分支评分：原旧 glibc 被 uname 启动检查挡住，原 iozone 向量组在 Linux 上也不可用，部分 musl 命令超时；实际 glibc I/O 成本和最新评测仍待兼容分支合入后复测。尚未实施结构优化。随后分别闭环日志/RTC 用户接口，iperf、netperf、iozone 继续独立定位。SMP、LoongArch、实板和更大工具链按新基线另行排期。
 
 - [文档导航](docs/README.md)：模块契约与可复用学习材料。
 - [工程原则](docs/design.md)与[贡献说明](CONTRIBUTING.md)：技术取舍、验证与提交边界。

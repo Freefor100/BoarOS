@@ -192,7 +192,7 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 ## 本轮：成本测量优先（2026-09-30 验收）
 
 维护者已选择先量化写入、扫描、唤醒和延迟，再决定优化。目标是得到能归因、可重建的
-成本基线，保护 R1–R8 已验收的行为；最终完成 20 配置、60 串行独立启动和 339 观测窗口，见[最终报告与归档](learning/cost-baseline.md)。C0–C5 受控负载验收通过；C6 完整记录原消费者的完成、不可用、超时和启动拒绝，未将这些阻塞算作兼容通过。尚无新的结构优化。
+成本基线，保护 R1–R8 已验收的行为；最终完成 20 配置、60 串行独立启动和 339 观测窗口，见[最终报告与归档](learning/cost-baseline.md)。C0–C5 受控负载验收通过；C6 完整记录原消费者的完成、不可用、超时和启动拒绝，但实际旧 glibc I/O 测量及超时归因未完成，C6 尚未完全验收，未将这些阻塞算作兼容通过。尚无新的结构优化。
 起点为本轮最终生产源码，内核 SHA-256
 `0c0c6a77f54160c06f284f19133b6bb6516f7c6e2d8dcb5f0864390ce1361fbb`，
 1091 条 ABI、四组合 io-sleep、scale 与 WAL 恢复证据见上文。
@@ -295,13 +295,13 @@ C1 阶段证据：modern/writeback 的观测开/关各三个独立启动，36 �
 - [x] 固定热缓存 4 KiB/64 KiB/1 MiB 复制和单页/大范围改权，配独立唤醒任务；报告 IRQ-off 最大区间、锁持有、唤醒到运行分布与切换，不按 QEMU 墙钟设性能及格线。
 - [x] `make test-cost-riscv COST_CASE=latency` 与 `make test-trap-riscv test-trap-return-riscv test-context-riscv test-user-riscv test-io-sleep-riscv test-sched-bandwidth-riscv test-stack-usage`；运行观测开/关对照。本任务不引入任意 yield 或 syscall 内开中断。
 
-### C6：真实消费者、归因与收口
+### C6：真实消费者、归因与收口（尚未完全验收）
 
 复用 `tests/runtime-diagnostics.py`、固定原镜像的 iozone 以及 C0 runner；
 最终证据归 `docs/learning/cost-baseline.md`/`cost-measurements.json`，规模/存储文档链接该结论，契约归对应模块，
 能力/后续依赖分别更新 README 与本页，不另建永久计划或原始日志档案。
 
-- [x] 固定原 iozone ELF/依赖/镜像哈希、argv、工作目录、文件规模、缓存与同步条件；先核实实际调用链，再用 C1–C5 的受控负载解释其观测，未执行或超时保留原始状态。
+- [ ] 固定原 iozone ELF/依赖/镜像哈希、argv、工作目录、文件规模、缓存与同步条件；先核实实际调用链，再用 C1–C5 的受控负载解释其观测，未执行或超时保留原始状态。输入身份与逐命令记录已完成；原旧 glibc 实际 I/O 成本及 musl 超时归因尚未完成，不能把采样完成当作该项全部验收。
 - [x] `make test-cost-riscv COST_CASE=consumer` 与最终 `make test-cost-riscv COST_CASE=all` 输出全部阶段、输入身份和观测开/关对照，三个独立启动副本均有完整结果。
 - [x] 汇总每项主成本与未解释余量，报告重复分布、观测开销和无收益结果；只有因果对照支持时，提出 2–3 个对应瓶颈的候选，由维护者选择一次优化。
 - [x] 测量代码收口运行 `make test-riscv test-userland-riscv test-glibc-riscv test-diff-abi-riscv test-scale-riscv test-io-sleep-riscv test-stack-usage`，以及 SQLite DELETE/WAL 正常与选定错误恢复。后续实际修改写回、事务或队列时再跑两种完整恢复矩阵与双盘隔离。
