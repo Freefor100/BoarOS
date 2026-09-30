@@ -16,6 +16,12 @@ riscv_trap_entry:
     addi sp, sp, -RISCV_TRAP_FRAME_SIZE
 
     sd t0, RISCV_TRAP_FRAME_T0(sp)
+#if BOAROS_COST_DIAGNOSTICS
+    sd t1, RISCV_TRAP_FRAME_T1(sp)
+    rdtime t0
+    la t1, kernel_cost_trap_timestamp
+    sd t0, 0(t1)
+#endif
     sd tp, RISCV_TRAP_FRAME_TP(sp)
     sd zero, RISCV_TRAP_FRAME_KERNEL_TP(sp)
     addi t0, sp, RISCV_TRAP_FRAME_SIZE
@@ -28,6 +34,12 @@ riscv_trap_entry:
     addi sp, sp, -RISCV_TRAP_FRAME_SIZE
 
     sd t0, RISCV_TRAP_FRAME_T0(sp)
+#if BOAROS_COST_DIAGNOSTICS
+    sd t1, RISCV_TRAP_FRAME_T1(sp)
+    rdtime t0
+    la t1, kernel_cost_trap_timestamp
+    sd t0, 0(t1)
+#endif
     ld t0, RISCV_THREAD_STATE_USER_SP(tp)
     sd t0, RISCV_TRAP_FRAME_SP(sp)
     csrr t0, sscratch
@@ -45,7 +57,9 @@ riscv_trap_entry:
     la gp, __global_pointer$
     .option pop
 
+#if !BOAROS_COST_DIAGNOSTICS
     sd t1, RISCV_TRAP_FRAME_T1(sp)
+#endif
     sd t2, RISCV_TRAP_FRAME_T2(sp)
     sd s0, RISCV_TRAP_FRAME_S0(sp)
     sd s1, RISCV_TRAP_FRAME_S1(sp)
@@ -109,6 +123,10 @@ riscv_trap_return:
     csrw sscratch, zero
 
 .Lprepare_return:
+#if BOAROS_COST_DIAGNOSTICS
+    ld a0, RISCV_TRAP_FRAME_SSTATUS(sp)
+    call kernel_cost_irq_return
+#endif
     ld t0, RISCV_TRAP_FRAME_SEPC(sp)
     addi t1, sp, RISCV_TRAP_FRAME_SEPC
     sc.d zero, t0, (t1)
@@ -119,8 +137,10 @@ riscv_trap_return:
     ld ra, RISCV_TRAP_FRAME_RA(sp)
     ld gp, RISCV_TRAP_FRAME_GP(sp)
     ld tp, RISCV_TRAP_FRAME_TP(sp)
+#if !BOAROS_COST_DIAGNOSTICS
     ld t0, RISCV_TRAP_FRAME_T0(sp)
     ld t1, RISCV_TRAP_FRAME_T1(sp)
+#endif
     ld t2, RISCV_TRAP_FRAME_T2(sp)
     ld s0, RISCV_TRAP_FRAME_S0(sp)
     ld s1, RISCV_TRAP_FRAME_S1(sp)
@@ -146,6 +166,20 @@ riscv_trap_return:
     ld t4, RISCV_TRAP_FRAME_T4(sp)
     ld t5, RISCV_TRAP_FRAME_T5(sp)
     ld t6, RISCV_TRAP_FRAME_T6(sp)
+#if BOAROS_COST_DIAGNOSTICS
+    la t0, kernel_cost_return_pending
+    ld t1, 0(t0)
+    beqz t1, .Lcost_return_saved
+    rdtime t1
+    la t0, kernel_cost_return_timestamp
+    sd t1, 0(t0)
+    la t0, kernel_cost_return_pending
+    li t1, 1
+    sd t1, 0(t0)
+.Lcost_return_saved:
+    ld t0, RISCV_TRAP_FRAME_T0(sp)
+    ld t1, RISCV_TRAP_FRAME_T1(sp)
+#endif
     ld sp, RISCV_TRAP_FRAME_SP(sp)
     sret
 

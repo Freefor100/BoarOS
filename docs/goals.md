@@ -291,9 +291,9 @@ C1 阶段证据：modern/writeback 的观测开/关各三个独立启动，36 �
 `kernel/sched/scheduling.c`、`arch/riscv/trap.c` 与 `tests/workloads/cost/write.c`。
 该任务依赖 C0 的观测契约及 C2–C4 的运行/等待区分。
 
-- [ ] 嵌套 save/restore、用户 trap、异常返回、调度睡眠/恢复、idle 分别核对观测起止；采样本身不递归取得锁、开启中断或分配，不漏掉 assembly 前后区间。
-- [ ] 固定热缓存 4 KiB/64 KiB/1 MiB 复制和单页/大范围改权，配独立唤醒任务；报告 IRQ-off 最大区间、锁持有、唤醒到运行分布与切换，不按 QEMU 墙钟设性能及格线。
-- [ ] `make test-cost-riscv COST_CASE=latency` 与 `make test-trap-riscv test-trap-return-riscv test-context-riscv test-user-riscv test-io-sleep-riscv test-sched-bandwidth-riscv test-stack-usage`；运行观测开/关对照。本任务不引入任意 yield 或 syscall 内开中断。
+- [x] 嵌套 save/restore、用户 trap、异常返回、调度睡眠/恢复、idle 分别核对观测起止；采样本身不递归取得锁、开启中断或分配，不漏掉 assembly 前后区间。
+- [x] 固定热缓存 4 KiB/64 KiB/1 MiB 复制和单页/大范围改权，配独立唤醒任务；报告 IRQ-off 最大区间、锁持有、唤醒到运行分布与切换，不按 QEMU 墙钟设性能及格线。
+- [x] `make test-cost-riscv COST_CASE=latency` 与 `make test-trap-riscv test-trap-return-riscv test-context-riscv test-user-riscv test-io-sleep-riscv test-sched-bandwidth-riscv test-stack-usage`；运行观测开/关对照。本任务不引入任意 yield 或 syscall 内开中断。
 
 ### C6：真实消费者、归因与收口
 

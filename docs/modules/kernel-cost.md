@@ -38,7 +38,7 @@ idle/cleanup 上下文单列 idle_ticks，不能解释成精确 WFI 驻留时间
 
 验证入口：`make test-cost-host`、`make test-cost-riscv COST_CASE=contract`。
 后者串行运行三个独立启动副本，在启动前保存 kernel/ELF/fixture 身份与源码内容哈希。
-目前交付 contract/write/locking/mprotect/deadline；未交付 latency/consumer 明确失败，
+目前交付 contract/write/locking/mprotect/deadline/latency；未交付 consumer 明确失败，
 `all` 不跳过缺项。独立报告读器拒绝缺项、重复、未知键、单位错误、旧 epoch、
 直方图不一致、incomplete 和 overflow。当前 Python discovery 不收集带连字符的文件，
 因此 host target 直接运行 `python3 -B tests/test-cost-report.py`，必须实际执行测试。
@@ -64,3 +64,8 @@ C2 按 rank 10/15/20/30/40/other 记录尝试、取得、阻塞、唤醒、重�
 
 C3 计数覆盖外围VMA查询/覆盖/权限/数组编辑/合并/recount、resident遍历和实际PTE/TLB，
 prepare/commit/整次改权为嵌套墙上耗时，不能相加。聚合上限包括名称、单位、索引和桥接标量预留。
+
+C5 使用hart全局标量跟踪实际SIE转换，嵌套不重起，切换不截断；采样段及明确盲区见成本基线。
+trap保存t0/t1后首采样，sret恢复其他寄存器后发布尾stamp，下一安全入口聚合。
+C save/restore、trampoline、timer启动、idle/trap/sret均接入；诊断原始临界区单列observer。
+wake_to_run只含实际wake，ready_ticks另含创建/yield等就绪。关闭后C/ASM都无新增指令。

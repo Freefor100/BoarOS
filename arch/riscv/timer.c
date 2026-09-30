@@ -1,3 +1,4 @@
+#include <kernel/cost.h>
 #include <arch/riscv/sbi.h>
 #include <arch/riscv/timer.h>
 
@@ -86,6 +87,9 @@ enum riscv_timer_status riscv_timer_start(uint32_t timebase_frequency,
     timer_state.period = period;
     timer_state.next_deadline = deadline;
     timer_state.armed = 1;
+#if BOAROS_COST_DIAGNOSTICS
+    kernel_cost_irq_enable_now();
+#endif
     asm volatile("csrs sie, %0\n"
                  "csrsi sstatus, 2"
                  :

@@ -46,10 +46,17 @@ riscv_context_switch:
     .type riscv_kernel_thread_trampoline, @function
 
 riscv_kernel_thread_trampoline:
+#if BOAROS_COST_DIAGNOSTICS
+    call kernel_cost_irq_enable_now
+#endif
     csrsi sstatus, RISCV_SSTATUS_SIE
     mv a0, s1
     jalr s0
     csrci sstatus, RISCV_SSTATUS_SIE
+#if BOAROS_COST_DIAGNOSTICS
+    rdtime a0
+    call kernel_cost_irq_disabled
+#endif
     tail kernel_thread_exit
 
     .size riscv_kernel_thread_trampoline, \

@@ -12,7 +12,7 @@ import tempfile
 from cost_report import parse, validate_expected
 ROOT=Path(__file__).resolve().parents[1]
 CASES=('contract','write','locking','mprotect','deadline','latency','consumer')
-IMPLEMENTED={'contract','write','locking','mprotect','deadline'}
+IMPLEMENTED={'contract','write','locking','mprotect','deadline','latency'}
 def digest(path):
     with Path(path).open('rb') as stream: return hashlib.file_digest(stream,'sha256').hexdigest()
 def run(command, **kwargs): return subprocess.run(command,check=True,**kwargs)
@@ -138,6 +138,10 @@ def main():
                 if not args.off:
                     for snapshot in snapshots:
                         validate_expected(snapshot['values'],metric_expectations.get(snapshot['name'],{}))
+                if case=='latency':
+                    required={f'latency-copy-{n}' for n in (4096,65536,1048576)}|{f'latency-protect-{n}' for n in (4096,1048576)}
+                    if set(timings)!=required or (not args.off and {s['name'] for s in snapshots}!=required): raise ValueError('latency coverage')
+                    if not args.off and any(s['values']['foreground.irq_off_ticks.samples']==0 or s['values']['foreground.wake_to_run.samples']==0 for s in snapshots): raise ValueError('IRQ or independent wake not measured')
                 if case=='deadline':
                     required={f'deadline-{n}-0-0' for n in (0,32,128,256)}|{f'deadline-32-{m}-0' for m in (1,2,3)}|{'deadline-0-0-1'}
                     if set(timings)!=required or (not args.off and {s['name'] for s in snapshots}!=required): raise ValueError('deadline coverage')

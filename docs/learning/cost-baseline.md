@@ -83,3 +83,27 @@ QEMU timebase为10000000Hz，到期偏差不是实板/硬实时保证。
 `make test-scheduler-cases-riscv test-io-sleep-riscv test-sched-policy-host test-sched-bandwidth-riscv`。
 
 固定blocked集合每轮最大访问数（三副本）：0→7,7,7；32→39,39,39；128→135,135,135；256→263,263,263。包含正常系统worker和控制线程，未按任务名称过滤。
+
+## C5 IRQ-off与唤醒延迟（2026-09-30）
+
+热tmpfs 4KiB/64KiB/1MiB复制和单页/1MiB改权各配一个实际blocked后独立唤醒的子任务，
+开/关各三个串行启动，内容、大小、返回值、退出和heap基线保持。每个窗口均实际采到IRQ-off及wake_to_run样本。
+下表是该阶段前台最大连续区间ticks（三副本）与客体操作时间的开/关中位比。
+
+| 窗口 | 最大连续IRQ-off ticks | 时间中位比 |
+|---|---|---:|
+| latency-copy-4096 | 4769/4504/4859 | 0.913 |
+| latency-copy-65536 | 17853/19406/5077 | 2.786 |
+| latency-copy-1048576 | 79169/75376/78680 | 1.830 |
+| latency-protect-4096 | 6065/6169/6077 | 2.997 |
+| latency-protect-1048576 | 9060/11774/11333 | 3.371 |
+
+hart区间跨任务切换，不按任务各自重置。观测自身的SIE临界区属于observer lane；
+时钟取time CSR。实际样本保留架构固定盲区：U/S入口为7/6条指令，sret尾为11条；
+C enable helper在最后rdtime后至少9条指令（含CSR），不同调用点另有编译器恢复指令。
+这些是明确未采样前后缀，区间为采样段而非硬件最长关中断上界，不能宣称实板/硬实时保证。
+结束stamp延后到最后安全寄存器恢复点，下一次进入安全C路径才聚合，避免聚合开销混入固定sret尾。
+独立假时钟测试验证嵌套、跨任务归属、控制抑制和epoch复用。
+可重建：`make test-cost-riscv COST_CASE=latency`；默认构建同ELF以
+`python3 -B tests/cost-riscv.py --case latency --off --kernel kernel-rv`对照。
+trap/trap-return/context/user、四组合io-sleep、bandwidth、stack检查通过。

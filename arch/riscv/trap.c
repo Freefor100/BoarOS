@@ -115,6 +115,9 @@ static int user_page_fault_access(uint64_t scause, uint32_t *access)
 
 void riscv_trap_dispatch(struct riscv_trap_frame *frame)
 {
+#if BOAROS_COST_DIAGNOSTICS
+    kernel_cost_irq_disabled(kernel_cost_trap_timestamp);
+#endif
     int from_user = (frame->sstatus & RISCV_SSTATUS_SPP) == 0U;
 
     if (frame->scause == (RISCV_SCAUSE_INTERRUPT | 9U)) {

@@ -32,6 +32,15 @@ struct kernel_cost_scope {
     enum kernel_cost_metric metric;
 };
 uint64_t kernel_cost_clock(void);
+void kernel_cost_irq_disabled(uint64_t ticks);
+void kernel_cost_irq_enabled(uint64_t ticks);
+void kernel_cost_irq_suppress(void);
+void kernel_cost_irq_enable_now(void);
+void kernel_cost_irq_return(uint64_t status);
+extern uint64_t kernel_cost_trap_timestamp, kernel_cost_return_timestamp;
+extern uint64_t kernel_cost_return_pending;
+void kernel_cost_irq_flush(void);
+void kernel_cost_irq_observer(uint64_t ticks);
 uint64_t kernel_cost_lock(void);
 void kernel_cost_unlock(uint64_t status);
 struct kernel_cost_task *kernel_cost_current(void);

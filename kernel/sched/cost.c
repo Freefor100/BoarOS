@@ -6,9 +6,26 @@
 #include <string.h>
 uint64_t kernel_cost_clock(void) { uint64_t t; __asm__ volatile("rdtime %0" : "=r"(t)); return t; }
 uint64_t kernel_cost_lock(void)
-{ uint64_t s; __asm__ volatile("csrrc %0, sstatus, %1" : "=r"(s) : "r"((uint64_t)2) : "memory"); return s; }
+{
+    uint64_t s; __asm__ volatile("csrrc %0, sstatus, %1" : "=r"(s) : "r"((uint64_t)2) : "memory");
+    if (s & 2) kernel_cost_irq_observer(kernel_cost_clock());
+    return s;
+}
 void kernel_cost_unlock(uint64_t s)
-{ if (s & 2) __asm__ volatile("csrsi sstatus, 2" ::: "memory"); }
+{ if (s & 2) { kernel_cost_irq_enable_now(); __asm__ volatile("csrsi sstatus, 2" ::: "memory"); } }
+uint64_t kernel_cost_trap_timestamp;
+void kernel_cost_irq_enable_now(void)
+{
+    kernel_cost_irq_flush();
+    kernel_cost_return_timestamp = kernel_cost_clock();
+    kernel_cost_return_pending = 1;
+}
+void kernel_cost_irq_return(uint64_t status)
+{
+    kernel_cost_irq_flush();
+    /* Assembly publishes the final timestamp only after all safe register restores. */
+    kernel_cost_return_pending = status & 32 ? 2 : 0;
+}
 static struct kernel_cost_task bootstrap_cost;
 struct kernel_cost_task *kernel_cost_current(void)
 {
@@ -24,6 +41,7 @@ void kernel_cost_syscall(uint64_t number, int64_t fd)
     kernel_cost_account(&task->cost);
     if ((number >= 62 && number <= 70) || number == 57)
         task->cost.suppress = kernel_files_cost_descriptor(&task->files, fd);
+    if (task->cost.suppress) kernel_cost_irq_suppress();
 }
 static int belongs(struct kernel_task *task, uint64_t owner)
 {

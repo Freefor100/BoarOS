@@ -24,6 +24,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <kernel/cost.h>
 
 struct riscv_switch_context {
     uint64_t ra;
@@ -91,12 +92,21 @@ static inline uintptr_t riscv_interrupt_save(void)
                      : "=r"(old_status)
                      : "r"(mask)
                      : "memory");
+#if BOAROS_COST_DIAGNOSTICS
+    if (old_status & RISCV_SSTATUS_SIE) {
+        uint64_t ticks; __asm__ volatile("rdtime %0" : "=r"(ticks));
+        kernel_cost_irq_disabled(ticks);
+    }
+#endif
     return old_status;
 }
 
 static inline void riscv_interrupt_restore(uintptr_t old_status)
 {
     if ((old_status & RISCV_SSTATUS_SIE) != 0U) {
+#if BOAROS_COST_DIAGNOSTICS
+        kernel_cost_irq_enable_now();
+#endif
         __asm__ volatile("csrsi sstatus, 2" ::: "memory");
     }
 }

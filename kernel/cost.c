@@ -40,6 +40,36 @@ static struct {
 enum { cost_storage = sizeof(cost) + sizeof(names) + sizeof(units) + sizeof(histograms) + sizeof(histogram_indexes) + sizeof(lanes) + 256 };
 /* Includes a reserve for bridge/IRQ scalars and formatting metadata. */
 _Static_assert(cost_storage <= 65536, "cost aggregate budget");
+static struct { struct kernel_cost_tag tag; uint64_t start; unsigned opened, suppressed; } irq;
+uint64_t kernel_cost_return_timestamp, kernel_cost_return_pending;
+void kernel_cost_irq_flush(void)
+{
+    if (kernel_cost_return_pending == 1) {
+        uint64_t ticks = kernel_cost_return_timestamp;
+        kernel_cost_return_pending = 0;
+        kernel_cost_irq_enabled(ticks);
+    }
+}
+void kernel_cost_irq_disabled(uint64_t ticks)
+{
+    kernel_cost_irq_flush();
+    if (irq.opened) return;
+    irq.opened = 1; irq.suppressed = 0; irq.start = ticks; irq.tag = kernel_cost_capture();
+}
+void kernel_cost_irq_observer(uint64_t ticks)
+{
+    kernel_cost_irq_disabled(ticks);
+    irq.tag.lane = 2;
+}
+void kernel_cost_irq_suppress(void) { irq.suppressed = 1; }
+void kernel_cost_irq_enabled(uint64_t ticks)
+{
+    struct kernel_cost_tag tag = irq.tag;
+    uint64_t start = irq.start;
+    unsigned publish = irq.opened && !irq.suppressed && ticks >= start;
+    irq.opened = 0;
+    if (publish) kernel_cost_sample_tag(tag, COST_IRQ_OFF_TICKS, ticks - start);
+}
 static void add_checked(uint64_t *to, uint64_t value)
 {
     if (UINT64_MAX - *to < value) { cost.overflow = 1; *to = UINT64_MAX; }
@@ -270,6 +300,8 @@ void kernel_cost_switch(struct kernel_cost_task *previous, struct kernel_cost_ta
     uint64_t start = next->ready_start < cost.start ? cost.start : next->ready_start;
     if (next->ready_start && now >= start)
         kernel_cost_sample_tag(kernel_cost_task_tag(next),COST_READY_TICKS,now-start);
+    if ((next->wait_flags & 2) && next->ready_start && now >= start)
+        kernel_cost_sample_tag(kernel_cost_task_tag(next), COST_WAKE_TO_RUN, now - start);
     if ((next->wait_flags & 4) && now >= next->blocked_start)
         kernel_cost_sample_tag(kernel_cost_task_tag(next), COST_DEADLINE_TO_RUN, now - next->blocked_start);
     next->blocked_start = 0;
@@ -305,6 +337,10 @@ int kernel_cost_format(char *buffer, size_t capacity)
     ATOMIC_SCOPE;
     if (cost.active || cost.pending) return -KERNEL_EBUSY;
     struct formatter f = {buffer, 0, capacity, 0};
+    field(&f, "irq_user_prefix_instructions", 7);
+    field(&f, "irq_supervisor_prefix_instructions", 6);
+    field(&f, "irq_sret_suffix_instructions", 11);
+    field(&f, "irq_c_enable_suffix_min_instructions", 9);
     field(&f, "version", 1); field(&f, "epoch", cost.epoch);
     text(&f, "state="); text(&f, cost.state == 2 ? "complete" : cost.state == 3 ? "incomplete" : "idle"); text(&f, "\n");
     text(&f, cost.fixture ? "mode=fixture\n" : "mode=user\n");

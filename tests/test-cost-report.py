@@ -3,7 +3,7 @@ from cost_report import parse, schema, percentile, validate_expected, validate_r
 
 class CostReportTest(unittest.TestCase):
     def valid(self):
-        fields = dict(version='1', epoch='3', state='complete', mode='user', owner='2',
+        fields = dict(irq_user_prefix_instructions='7',irq_supervisor_prefix_instructions='6',irq_sret_suffix_instructions='11',irq_c_enable_suffix_min_instructions='9',version='1', epoch='3', state='complete', mode='user', owner='2',
             timebase_hz='10000000', resolution_ns_numerator='1000000000',
             resolution_ns_denominator='10000000', start_ticks='100', end_ticks='200',
             storage_bytes='4096', task_bytes='40', overflow='0', inflight='0')

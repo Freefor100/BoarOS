@@ -5,7 +5,7 @@ import re
 
 ROOT = Path(__file__).resolve().parents[1]
 LANES = ('foreground', 'background', 'observer')
-HEADER = ('version epoch state mode owner timebase_hz resolution_ns_numerator '
+HEADER = ('irq_user_prefix_instructions irq_supervisor_prefix_instructions irq_sret_suffix_instructions irq_c_enable_suffix_min_instructions version epoch state mode owner timebase_hz resolution_ns_numerator '
           'resolution_ns_denominator start_ticks end_ticks storage_bytes task_bytes overflow inflight').split()
 
 def schema():
