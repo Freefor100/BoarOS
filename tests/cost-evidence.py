@@ -35,6 +35,9 @@ def validate_final(records):
             if set(row['timings_ns'])!=(set() if case=='contract' else names[case]):raise ValueError('final timing phases: '+case)
             if on and {s['name'] for s in row['snapshots']}!=names[case]:raise ValueError('final snapshot phases: '+case)
             if any(s['values']['mode']!=('fixture' if case=='io-pressure' else 'user') for s in row['snapshots']):raise ValueError('fixture/user attribution missing')
+            frozen={k:row[k] for k in row.get('input_keys',[])}
+            frozen_text=json.dumps(frozen,sort_keys=True,separators=(',',':'))+'\n'
+            if not frozen or hashlib.sha256(frozen_text.encode()).hexdigest()!=row.get('input_sha256'):raise ValueError('boot input manifest changed/missing')
             if not row.get('firmware_sha256') or not row.get('dtb_sha256') or not row.get('qemu_sha256'):raise ValueError('unfrozen boot input')
             if case=='consumer':
                 if row.get('original_sha256')!=ORIGINAL_SHA or row.get('consumer_elf_sha256')!=ELFS or row.get('consumer_script_sha256')!=SCRIPTS:raise ValueError('original consumer changed')

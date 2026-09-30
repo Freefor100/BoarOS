@@ -73,6 +73,17 @@ try:
         '-drive', f'file=nbd+unix:///?socket={address},if=none,format=raw,id=root,cache={'writethrough' if args.write_through else 'writeback'}',
         '-device', 'virtio-blk-device,drive=root,bus=virtio-mmio-bus.0,config-wce=off,request-merging=off']
     if args.cost_output:guest_command+=['-dtb',str(dtb)]
+    if args.cost_output:
+        input_record={'transport':args.transport,'cache':'writethrough' if args.write_through else 'writeback',
+            'kernel_sha256':hashlib.sha256(Path(kernel_path).read_bytes()).hexdigest(),
+            'fixture_sha256':fixture_sha256,'source_tree':source_tree,'source_sha256':source_sha256,
+            'firmware_sha256':firmware_sha256,'dtb_sha256':dtb_sha256,'argv':guest_command,
+            'qemu_version':subprocess.check_output([args.qemu,'--version'],text=True).splitlines()[0],
+            'qemu_sha256':hashlib.sha256(Path(shutil.which(args.qemu)).read_bytes()).hexdigest(),
+            'nbd_sha256':hashlib.sha256((root/'build/host/nbd-fault').read_bytes()).hexdigest()}
+        frozen=json.dumps(input_record,sort_keys=True,separators=(',',':'))+'\n'
+        (work/'input.json').write_text(frozen)
+        input_record['input_keys']=list(input_record);input_record['input_sha256']=hashlib.sha256(frozen.encode()).hexdigest()
     guest = subprocess.Popen(guest_command,
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0)
     processes.append(guest)
@@ -172,13 +183,7 @@ try:
             elif current: body.append(line)
         if current or {s['name'] for s in snapshots}!={'pressure-io','timeout-cancel'}: raise ValueError('missing fixture window')
         args.cost_output.parent.mkdir(parents=True,exist_ok=True)
-        args.cost_output.write_text(json.dumps({'transport':args.transport,'cache':'writethrough' if args.write_through else 'writeback',
-            'kernel_sha256':hashlib.sha256(Path(kernel_path).read_bytes()).hexdigest(),
-            'fixture_sha256':fixture_sha256,'source_tree':source_tree,'source_sha256':source_sha256,
-            'firmware_sha256':firmware_sha256,'dtb_sha256':dtb_sha256,'argv':guest_command,
-            'qemu_version':subprocess.check_output([args.qemu,'--version'],text=True).splitlines()[0],
-            'qemu_sha256':hashlib.sha256(Path(shutil.which(args.qemu)).read_bytes()).hexdigest(),
-            'nbd_sha256':hashlib.sha256((root/'build/host/nbd-fault').read_bytes()).hexdigest(),'snapshots':snapshots},indent=2)+'\n')
+        args.cost_output.write_text(json.dumps({**input_record,'snapshots':snapshots},indent=2)+'\n')
     if not success:
         raise RuntimeError(logs['guest'][-4000:].decode(errors='replace'))
     print(f'BoarOS: I/O sleep tests passed ({args.transport}, {'writethrough' if args.write_through else 'writeback'}); two cold reads held, CPU/cache progressed, reverse completion and FLUSH barrier and timeout/reset verified')

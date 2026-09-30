@@ -6,7 +6,7 @@ import hashlib
 import json
 import os
 import sys
-from cost_consumer import originals, commands as consumer_commands
+from cost_consumer import originals, framed_line, commands as consumer_commands
 from pathlib import Path
 import shutil
 import subprocess
@@ -110,6 +110,9 @@ def main():
                 run(probe,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
                 record['dtb_sha256']=digest(dtb); invocation+=['-dtb',str(dtb)]
                 record['argv']=invocation
+                frozen=json.dumps(record,sort_keys=True,separators=(',',':'))+'\n'
+                (folder/'input.json').write_text(frozen)
+                record['input_keys']=list(record);record['input_sha256']=hashlib.sha256(frozen.encode()).hexdigest()
                 with (folder/'boot.log').open('w') as boot_log:
                     result=subprocess.Popen(invocation,stdin=subprocess.DEVNULL,stdout=boot_log,stderr=subprocess.STDOUT,text=True)
                     try: returncode=result.wait(timeout=3600 if case=='consumer' else 180)
@@ -120,6 +123,7 @@ def main():
                     raise RuntimeError('guest failed: '+output[-4000:])
                 snapshots=[]; current=None; body=[]; expectations={}; timings={}; metric_expectations={}
                 for line in output.splitlines():
+                    if case=='consumer':line=framed_line(line)
                     if line.startswith('COST METRIC '):
                         _,_,name,metric,value=line.split()
                         metric_expectations.setdefault(name,{})['foreground.'+metric+'.value']=int(value)

@@ -23,6 +23,11 @@ def originals(root,work,digest):
         if not path.is_file():raise ValueError('missing original dependency '+source)
         deps[source]=digest(path)
     return original,dict(original_sha256=ORIGINAL_SHA,consumer_elf_sha256=ELFS,consumer_script_sha256=SCRIPTS,consumer_dependencies=deps)
+def framed_line(line):
+    # An interrupted original program may leave its last row without a newline.
+    match=re.search(r'COST RESULT consumer-(?:musl|glibc)-[0-7] [0-9]+$',line)
+    return match.group(0) if match else line
+
 def commands(output):
     result=[]
     for libc in ('musl','glibc'):

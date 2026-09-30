@@ -15,6 +15,13 @@ class CostReportTest(unittest.TestCase):
         for broken in (text.replace('COST COMMAND BEGIN consumer-musl-0\n',''),text+'COST COMMAND RESULT consumer-glibc-0 0 0\n'):
             with self.assertRaises(ValueError): commands(broken)
 
+    def test_partial_consumer_output_keeps_timing_marker(self):
+        from cost_consumer import framed_line
+        marker='COST RESULT consumer-musl-0 180051153900'
+        self.assertEqual(framed_line('            4096       1'+marker),marker)
+        self.assertEqual(framed_line(marker),marker)
+        self.assertEqual(framed_line('iozone ordinary output'),'iozone ordinary output')
+
     def valid(self):
         fields = dict(irq_user_prefix_instructions='7',irq_supervisor_prefix_instructions='6',irq_sret_suffix_instructions='11',irq_c_enable_suffix_min_instructions='9',version='1', epoch='3', state='complete', mode='user', owner='2',
             timebase_hz='10000000', resolution_ns_numerator='1000000000',
