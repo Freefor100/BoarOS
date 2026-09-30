@@ -1,0 +1,9 @@
+/* Stable version-1 keys. X(id, name, unit, histogram). */
+X(OPERATIONS, operations, count, 0)
+X(CANCELLED, cancelled, count, 0)
+X(SWITCHES, switches, count, 0)
+X(RUN_TICKS, run_ticks, ticks, 0)
+X(OBSERVER_TICKS, observer_ticks, ticks, 0)
+X(OPERATION_TICKS, operation_ticks, ticks, 1)
+X(BLOCKED_TICKS, blocked_ticks, ticks, 1)
+X(READY_TICKS, ready_ticks, ticks, 1)

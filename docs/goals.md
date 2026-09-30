@@ -192,7 +192,7 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 ## 下一阶段：成本测量优先（2026-09-30 任务计划）
 
 维护者已选择先量化写入、扫描、唤醒和延迟，再决定优化。目标是得到能归因、可重建的
-成本基线，保护 R1–R8 已验收的行为；本节是任务准备，尚未实施观测代码或新的结构优化。
+成本基线，保护 R1–R8 已验收的行为；C0 观测窗口已实施并完成三个启动副本的契约验收；C1–C6 正在推进，尚无新的结构优化。
 起点为本轮最终生产源码，内核 SHA-256
 `0c0c6a77f54160c06f284f19133b6bb6516f7c6e2d8dcb5f0864390ce1361fbb`，
 1091 条 ABI、四组合 io-sleep、scale 与 WAL 恢复证据见上文。
@@ -227,7 +227,7 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 `include/arch/riscv/virtio_mmio_block.h::riscv_virtio_mmio_block_get_statistics`、
 `include/kernel/sync.h` 和 `kernel/sched/scheduling.c::scheduler_account_runtime`。
 计划新增 `tests/cost-riscv.py`、`tests/test-cost-report.py` 与 Makefile 的 `test-cost-riscv`
-入口；这些文件/target 尚不存在。拟用默认关闭的 `COST_DIAGNOSTICS=0`；开启时由 Makefile
+入口；C0 已交付这些入口。拟用默认关闭的 `COST_DIAGNOSTICS=0`；开启时由 Makefile
 给 C/assembly 同时传递 `BOAROS_COST_DIAGNOSTICS`，不能只给 C 加标志而漏掉 trap 入口。
 诊断构建独立放 `build/cost/`，复用 `BUILD_DIR`、`KERNEL_RV` 和 `CFLAGS_EXTRA`，
 配置进入缓存身份，避免覆盖普通构建或串用缓存。
@@ -238,7 +238,7 @@ runner 的 `--case`/Makefile 的 `COST_CASE` 为 contract/write/locking/mprotect
 - [ ] runner 在启动前快照 kernel/ELF/fixture；结果包含源码 tree、配置、工具与 QEMU 哈希、负载参数、冷/热准备方式和完整退出/资源基线。丢记录、负差值、溢出、错误 owner 或缺少结束标记必须失败。
 - [ ] 先写协议/计数红测：刻意破坏一个字段、缺一个阶段或交换 owner，报告不得通过。固定小负载由数据内容、完成字节和独立包装器验证计数，不锁定私有布局或偶然调用次序。
 - [ ] 验证诊断关闭后目标代码不引用新增观测入口；开启后不分配/睡眠/修改 errno，测量记录自身占用与开销，不能用计数器开销伪造被测路径成本。
-- [ ] `python3 -B -m unittest discover -s tests -p 'test-cost-report.py'` 和 `make test-cost-riscv COST_CASE=contract`；新增观测状态不得破坏已有 MM/task 元数据页容量和栈预算。
+- [x] `python3 -B tests/test-cost-report.py` 与 `make test-cost-riscv COST_CASE=contract`（三启动，各四窗口）通过；当前 Python discovery 不收集连字符文件，直接运行防止零测试假通过。任务新增 48 字节，元数据页断言与退出栈余量保持。C2–C5 接入后继续复核总存储和栈。
 
 ### C1：写入与分配分解（P-D、存储成本）
 

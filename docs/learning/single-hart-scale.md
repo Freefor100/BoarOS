@@ -61,3 +61,21 @@ PR CI 加入规模、SQLite DELETE/WAL 和离线 GCC 入口。SQLite/musl 源按
 本次规模阶段当时未包含可睡眠 I/O、后台写回或多盘；这些机制现已在后续阶段交付，见[可睡眠存储](sleepable-storage.md)及[VFS/ext4](../modules/vfs-ext4.md)。范围写回索引、事务合并、共享文件 futex、SMP 和第二架构仍未交付；后续优先顺序只在[路线](../goals.md)维护。
 
 AF_UNIX DGRAM 的成本边界为每条消息最多 64 KiB 连续暂存与一次队列提交，不把用户页或 iovec 当作消息边界。零消息收一字节预算，截断接收和 fault 丢弃返还整包预算；否则只返还复制字节会在重复短接收后泄漏队列容量。`make test-scale-riscv` 覆盖两处分配 OOM、100 条零消息、满队列、重复截断和接收 fault；`make test-userland-riscv` 用真实 pthread 验证尚有少量 POLLOUT 空间时写者仍等待整条预算，并检查取消不发布消息。这里验证语义和内存上界，没有吞吐测量结论。
+
+## C0 窗口验收（2026-09-30）
+
+成本测量的默认关闭聚合窗口已接入，契约见[成本观测模块](../modules/kernel-cost.md)。
+以 `main@c9b6ca6` 的原默认 ELF 作红测，真实 U-mode 在缺少控制节点处 ENOENT；
+观测构建的三个独立启动副本各完成四个有效窗口，另验证控制组退出产生 incomplete。
+覆盖完整/错误命令、坏指针、重复开始、其他组结束、开始前后代已阻塞操作的在途结束、
+恢复后结束和 epoch 复用。宿主核心检查溢出、零/最高桶、取消、延后激活/结束与抑制；
+五项报告测试刻意删除/重复/交换 owner 对应 lane/破坏单位、计数与 histogram，均拒绝。
+
+可重建命令：`make test-cost-riscv COST_CASE=contract`；
+`make COST_DIAGNOSTICS=1 test-context-riscv test-trap-return-riscv`。
+本阶段默认关闭 ELF 与原生产 ELF 的 `.text` 二进制逐字节一致，text/data/bss 分别
+376832/52/502880 字节，`nm` 无 kernel_cost 或聚合存储符号；观测任务新增 48 字节，
+聚合主体 5320 字节，DTB timebase 10 MHz。固定参考继续是
+`references/linux@f4cdf7ca9a1fdcca413157df19753f388a5a224e` 与
+`references/qemu@84f07211cc5b4fc6a371559bf8a5de4fb068e648`；实际 QEMU 为 11.1.1。
+这些是接口与检错证据，C1–C6 尚未给出瓶颈或性能结论。

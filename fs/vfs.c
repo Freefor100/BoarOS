@@ -2240,3 +2240,11 @@ int kernel_vfs_publish_node(struct kernel_vfs_mount *mount,
 
 struct kernel_memory_object *kernel_vfs_file_memory(const struct kernel_vfs_file *file)
 { struct kernel_vfs_node *n = kernel_vfs_file_node(file); return n ? n->memory : 0; }
+
+#if BOAROS_COST_DIAGNOSTICS
+int kernel_vfs_file_is_cost(const struct kernel_vfs_file *file)
+{
+    struct kernel_vfs_node *node = kernel_vfs_file_node(file);
+    return node && node->generated_diagnostic;
+}
+#endif

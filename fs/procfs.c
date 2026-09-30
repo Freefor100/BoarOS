@@ -28,6 +28,8 @@
 #define PROC_KERNEL_INODE UINT64_C(7)
 #define PROC_RT_PERIOD_INODE UINT64_C(8)
 #define PROC_RT_RUNTIME_INODE UINT64_C(9)
+#define PROC_COST_INODE UINT64_C(10)
+#define PROC_COST_CONTROL_INODE UINT64_C(11)
 #define PROC_PID_DIR_KIND 1U
 #define PROC_PID_EXE_KIND 2U
 #define PROC_PID_CWD_KIND 3U
@@ -184,6 +186,14 @@ static int proc_lookup(struct kernel_vfs_instance *instance, uint64_t parent,
         *mode = proc_kind_mode(kind);
         return 0;
     }
+#if BOAROS_COST_DIAGNOSTICS
+    if ((length == 11U && !memcmp(name, "boaros_cost", length)) ||
+        (length == 19U && !memcmp(name, "boaros_cost_control", length))) {
+        *inode = length == 11U ? PROC_COST_INODE : PROC_COST_CONTROL_INODE;
+        *mode = KERNEL_VFS_S_IFREG | (length == 11U ? 0444U : 0200U);
+        return 0;
+    }
+#endif
     if (length == 3U && !memcmp(name, "sys", length)) {
         *inode = PROC_SYS_INODE;
         *mode = KERNEL_VFS_S_IFDIR | 0555U;
@@ -243,6 +253,9 @@ static int proc_open(struct kernel_vfs_mount *mount, const char *path,
          inode != PROC_MOUNTS_INODE && inode != PROC_SYS_INODE &&
          inode != PROC_KERNEL_INODE && inode != PROC_RT_PERIOD_INODE &&
          inode != PROC_RT_RUNTIME_INODE &&
+#if BOAROS_COST_DIAGNOSTICS
+         inode != PROC_COST_INODE && inode != PROC_COST_CONTROL_INODE &&
+#endif
          (proc_inode_kind(inode) != PROC_PID_DIR_KIND &&
           proc_inode_kind(inode) != PROC_PID_EXE_KIND &&
           proc_inode_kind(inode) != PROC_PID_CWD_KIND &&
@@ -280,6 +293,10 @@ static int proc_open(struct kernel_vfs_mount *mount, const char *path,
         return status == KERNEL_HEAP_STATUS_EMPTY ? -KERNEL_ENOMEM : -KERNEL_EIO;
     node->generated_control = inode == PROC_RT_PERIOD_INODE ||
                               inode == PROC_RT_RUNTIME_INODE;
+#if BOAROS_COST_DIAGNOSTICS
+    node->generated_control |= inode == PROC_COST_CONTROL_INODE;
+    node->generated_diagnostic = inode == PROC_COST_INODE || inode == PROC_COST_CONTROL_INODE;
+#endif
     node->inode = inode;
     node->mode = mode;
     return kernel_vfs_publish_node(mount, node, file, 0);
@@ -423,7 +440,14 @@ static int proc_dir_entry(struct kernel_vfs_file *file, uint64_t position,
     else if (position == 4U) entry_name = "self";
     else if (position == 5U) entry_name = "mounts";
     else if (position == 6U) entry_name = "sys";
+#if BOAROS_COST_DIAGNOSTICS
+    else if (position == 7U) entry_name = "boaros_cost";
+    else if (position == 8U) entry_name = "boaros_cost_control";
+    else if (position >= 9U) {
+        position -= 2U;
+#else
     else if (position >= 7U) {
+#endif
         kernel_pid_t pid;
         uint64_t identity;
         if (position - 7U >= INT32_MAX ||
@@ -433,6 +457,9 @@ static int proc_dir_entry(struct kernel_vfs_file *file, uint64_t position,
         if (name_size <= length) return -KERNEL_ERANGE;
         name[length] = '\0';
         *next_position = 7U + (uint32_t)pid;
+#if BOAROS_COST_DIAGNOSTICS
+        *next_position += 2U;
+#endif
         *inode = proc_pid_inode(pid, identity, PROC_PID_DIR_KIND);
         *type = 4U;
         return 1;
@@ -445,7 +472,12 @@ static int proc_dir_entry(struct kernel_vfs_file *file, uint64_t position,
              position == 3U ? PROC_UPTIME_INODE :
              position == 4U ? PROC_SELF_INODE :
              position == 5U ? PROC_MOUNTS_INODE :
-             position == 6U ? PROC_SYS_INODE : PROC_ROOT_INODE;
+             position == 6U ? PROC_SYS_INODE :
+#if BOAROS_COST_DIAGNOSTICS
+             position == 7U ? PROC_COST_INODE :
+             position == 8U ? PROC_COST_CONTROL_INODE :
+#endif
+             PROC_ROOT_INODE;
     *type = position == 4U || position == 5U ? 10U :
             position >= 2U && position != 6U ? 8U : 4U;
     return 1;
@@ -627,6 +659,14 @@ static int proc_control(struct kernel_vfs_node *node, int write,
     uint64_t offset, char *buffer, size_t size, size_t *count)
 {
     *count = 0;
+#if BOAROS_COST_DIAGNOSTICS
+    if (node->inode == PROC_COST_CONTROL_INODE) {
+        if (!write) return -KERNEL_EACCES;
+        int result = kernel_cost_control(buffer, size);
+        if (!result) *count = size;
+        return result;
+    }
+#endif
     if (!size) return 0;
     if (!write) {
         if (offset) return 0;
@@ -985,6 +1025,20 @@ static int proc_process_snapshot(struct kernel_vfs_node *node,
 static int proc_snapshot(struct kernel_vfs_node *node, struct kernel_heap *heap,
                          char **buffer, size_t *length)
 {
+#if BOAROS_COST_DIAGNOSTICS
+    if (node->inode == PROC_COST_INODE) {
+        char *data = 0;
+        size_t capacity = kernel_cost_format_capacity();
+        enum kernel_heap_status status = kernel_heap_allocate(heap, capacity, (void **)&data);
+        if (status != KERNEL_HEAP_STATUS_OK) return status == KERNEL_HEAP_STATUS_EMPTY ? -KERNEL_ENOMEM : -KERNEL_EIO;
+        uint64_t interrupts = riscv_interrupt_save();
+        int result = kernel_cost_format(data, capacity);
+        riscv_interrupt_restore(interrupts);
+        if (result < 0) { if (kernel_heap_release(heap, data) != KERNEL_HEAP_STATUS_OK) __builtin_trap(); return result; }
+        *buffer = data; *length = (size_t)result;
+        return 0;
+    }
+#endif
     if (proc_inode_kind(node->inode) == PROC_PID_STAT_KIND ||
         proc_inode_kind(node->inode) == PROC_PID_STATUS_KIND)
         return proc_process_snapshot(node, heap, buffer, length);

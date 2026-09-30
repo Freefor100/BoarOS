@@ -1,3 +1,4 @@
+#include <kernel/cost.h>
 #include <arch/riscv/plic.h>
 #include <arch/riscv/process.h>
 #include <arch/riscv/sbi.h>
@@ -312,6 +313,9 @@ void riscv_trap_return_prepare(struct riscv_trap_frame *frame)
     if ((frame->sstatus & RISCV_SSTATUS_SPP) == 0U)
         kernel_task_prepare_user_return();
     riscv_signal_prepare_user_return(frame);
+#if BOAROS_COST_DIAGNOSTICS
+    if ((frame->sstatus & RISCV_SSTATUS_SPP) == 0U) kernel_cost_user_return();
+#endif
 }
 
 void riscv_trap_bad_return(struct riscv_trap_frame *frame)

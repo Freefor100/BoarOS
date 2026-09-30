@@ -373,6 +373,9 @@ enum kernel_scheduler_status scheduler_switch_current_away(
         ready_remove(next);
         next->state = KERNEL_THREAD_STATE_RUNNING;
     }
+#if BOAROS_COST_DIAGNOSTICS
+    kernel_cost_switch(&previous->cost, &next->cost);
+#endif
     scheduler.current = next;
     scheduler.need_resched = 0;
     scheduler_rearm_timer();

@@ -1,6 +1,7 @@
 #ifndef BOAROS_FS_VFS_INTERNAL_H
 #define BOAROS_FS_VFS_INTERNAL_H
 
+#include <kernel/cost.h>
 #include <stddef.h>
 #include <kernel/sync.h>
 #include <stdint.h>
@@ -13,6 +14,9 @@ struct kernel_page_cache_entry;
 struct kernel_vfs_file;
 struct kernel_vfs_mount;
 struct kernel_vfs_node;
+#if BOAROS_COST_DIAGNOSTICS
+int kernel_vfs_file_is_cost(const struct kernel_vfs_file *file);
+#endif
 struct kernel_heap;
 struct kernel_record_lock_state;
 

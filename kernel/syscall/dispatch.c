@@ -1,5 +1,6 @@
 #include "private.h"
 
+#include <kernel/cost.h>
 #include <kernel/errno.h>
 #include <kernel/futex.h>
 #include <kernel/task.h>
@@ -226,6 +227,11 @@ enum kernel_syscall_status kernel_syscall_dispatch(
         return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     }
 
+#if BOAROS_COST_DIAGNOSTICS
+    kernel_cost_syscall(request->number, (int64_t)request->arguments[0]);
+    COST_SCOPE(syscall_cost, OPERATION_TICKS);
+    COST_ADD(OPERATIONS, 1);
+#endif
     if (request->number == 179U) {
         if (syscall_handle_sysinfo(caller, request->arguments[0], &decoded) != KERNEL_SYSCALL_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;

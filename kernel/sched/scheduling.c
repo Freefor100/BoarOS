@@ -10,6 +10,9 @@ static int is_rt(const struct kernel_task *task)
 
 void scheduler_account_runtime(void)
 {
+#if BOAROS_COST_DIAGNOSTICS
+    if (scheduler.current) kernel_cost_account(&scheduler.current->cost);
+#endif
     uint64_t now = kernel_time_monotonic_ns();
     uint64_t delta = now - scheduler.rt_bandwidth.last_account_ns;
     if (scheduler.current && scheduler.current != &scheduler.idle)

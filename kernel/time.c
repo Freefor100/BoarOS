@@ -1,3 +1,4 @@
+#include <kernel/cost.h>
 #include <arch/riscv/timer.h>
 #include <kernel/time.h>
 #include <kernel/tick.h>
@@ -42,6 +43,9 @@ enum kernel_time_status kernel_time_init(uint32_t timebase_frequency,
     __atomic_store_n(&time_coarse_monotonic_ns,
         kernel_time_ticks_to_ns(riscv_time_read()), __ATOMIC_RELAXED);
     time_initialized = 1U;
+#if BOAROS_COST_DIAGNOSTICS
+    kernel_cost_set_timebase(timebase_frequency);
+#endif
     return KERNEL_TIME_STATUS_OK;
 }
 

@@ -5,6 +5,7 @@
 #include "../uaccess_iov_internal.h"
 #include "../vfs_internal.h"
 
+#include <kernel/cost.h>
 #include <kernel/errno.h>
 #include <kernel/heap.h>
 #include <kernel/mm.h>
@@ -1694,3 +1695,11 @@ enum kernel_files_status kernel_files_getdents(
     *linux_result = (int64_t)total;
     return KERNEL_FILES_STATUS_OK;
 }
+
+#if BOAROS_COST_DIAGNOSTICS
+int kernel_files_cost_descriptor(struct kernel_files *files, int64_t fd)
+{
+    struct kernel_open_file_description *description = kernel_files_lookup_description(files, fd);
+    return description && kernel_vfs_file_is_cost(&description->file);
+}
+#endif

@@ -1,6 +1,7 @@
 #ifndef BOAROS_KERNEL_SCHED_PRIVATE_H
 #define BOAROS_KERNEL_SCHED_PRIVATE_H
 
+#include <kernel/cost.h>
 #include <arch/riscv/context.h>
 #include <arch/riscv/fpu.h>
 #include <arch/riscv/thread.h>
@@ -191,6 +192,9 @@ struct kernel_task {
     struct kernel_mm mm;
     struct kernel_exec_transaction *exec_transaction;
     struct riscv_switch_context context;
+#if BOAROS_COST_DIAGNOSTICS
+    struct kernel_cost_task cost;
+#endif
 } __attribute__((aligned(16)));
 
 struct kernel_scheduler {

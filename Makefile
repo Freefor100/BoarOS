@@ -14,8 +14,17 @@ READELF := $(CROSS_COMPILE)readelf
 QEMU_RISCV64 ?= qemu-system-riscv64
 QEMU_MEMORY ?= 1G
 
+COST_DIAGNOSTICS ?= 0
+ifneq ($(filter $(COST_DIAGNOSTICS),0 1),$(COST_DIAGNOSTICS))
+$(error COST_DIAGNOSTICS must be 0 or 1)
+endif
+ifeq ($(COST_DIAGNOSTICS),1)
+BUILD_DIR := build/cost/riscv
+KERNEL_RV := build/cost/kernel-rv
+else
 BUILD_DIR := build/riscv
 KERNEL_RV := kernel-rv
+endif
 TRAP_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-trap-rv
 TRAP_RETURN_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-trap-return-rv
 TRAP_RETURN_SIE_TEST_KERNEL_RV := \
@@ -64,7 +73,7 @@ USER_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-user-rv
 USER_FATAL_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-user-fatal-rv
 
 ARCH_FLAGS := -march=rv64imac_zicsr_zifencei -mabi=lp64 -mcmodel=medany
-CPPFLAGS := -Iinclude -DBOAROS_PAGE_SHIFT=12 \
+CPPFLAGS := -DBOAROS_COST_DIAGNOSTICS=$(COST_DIAGNOSTICS) -Iinclude -DBOAROS_PAGE_SHIFT=12 \
 	-DBOAROS_UTS_MACHINE=\"riscv64\"
 CFLAGS := $(ARCH_FLAGS) -std=gnu11 -O2 -g3 \
 	-ffreestanding -fno-builtin -fno-stack-protector -fno-pic -fno-pie \
@@ -197,6 +206,8 @@ C_SOURCES := \
 	arch/riscv/signal.c \
 	kernel/tick.c \
 	kernel/time.c \
+	kernel/cost.c \
+	kernel/sched/cost.c \
 	net/socket.c \
 	lib/qsort.c \
 	lib/string.c \
@@ -286,6 +297,8 @@ TEST_RUNTIME_C_SOURCES := \
 	arch/riscv/signal.c \
 	kernel/tick.c \
 	kernel/time.c \
+	kernel/cost.c \
+	kernel/sched/cost.c \
 	net/socket.c \
 	lib/qsort.c \
 	lib/string.c \
@@ -911,7 +924,7 @@ $(USER_FATAL_TEST_KERNEL_RV): $(USER_FATAL_TEST_OBJECTS) \
 		-Wl,-Map,$(BUILD_DIR)/tests/kernel-user-fatal-rv.map \
 		-o $@ $(USER_FATAL_TEST_OBJECTS)
 
-$(BUILD_DIR)/%.o: %.c
+$(BUILD_DIR)/%.o: %.c $(BUILD_DIR)/generated/cost-config.h
 	@mkdir -p $(dir $@)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c $< -o $@
 
@@ -929,7 +942,7 @@ $(BUILD_DIR)/third_party/lwext4/src/%.o: \
 		-Wno-unused-but-set-variable -Wno-stringop-truncation \
 		-MMD -MP -c $< -o $@
 
-$(BUILD_DIR)/%.o: %.S
+$(BUILD_DIR)/%.o: %.S $(BUILD_DIR)/generated/cost-config.h
 	@mkdir -p $(dir $@)
 	$(CC) $(CPPFLAGS) $(ASFLAGS) -MMD -MP -c $< -o $@
 
@@ -1530,3 +1543,20 @@ test-multi-disk-rt-riscv: $(KERNEL_RV) $(MULTI_DISK_IO_RV) build/host/nbd-fault
 .PHONY: test-sched-bandwidth-riscv
 test-sched-bandwidth-riscv: $(KERNEL_RV) $(MUSL_STAMP)
 	KERNEL_RV=$(KERNEL_RV) QEMU_RISCV64=$(QEMU_RISCV64) sh tests/sched-bandwidth-riscv.sh
+
+# Cost variants never reuse objects compiled with a different observation flag.
+.PHONY: force-cost-config test-cost-riscv test-cost-host
+force-cost-config:
+$(BUILD_DIR)/generated/cost-config.h: force-cost-config
+	@mkdir -p $(dir $@)
+	@printf '#define BOAROS_COST_DIAGNOSTICS %s\n' '$(COST_DIAGNOSTICS)' > $@.tmp
+	@cmp -s $@ $@.tmp && rm $@.tmp || mv $@.tmp $@
+COST_CASE ?= all
+test-cost-host:
+	@mkdir -p build/cost/host
+	cc -std=c11 -Wall -Wextra -Werror -idirafter include -DBOAROS_COST_DIAGNOSTICS=1 tests/cost/core_test.c kernel/cost.c -o build/cost/host/core-test
+	build/cost/host/core-test
+	python3 -B tests/test-cost-report.py
+test-cost-riscv: test-cost-host
+	$(MAKE) COST_DIAGNOSTICS=1 all
+	python3 -B tests/cost-riscv.py --kernel build/cost/kernel-rv --qemu $(QEMU_RISCV64) --case $(COST_CASE)

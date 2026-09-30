@@ -3,6 +3,7 @@
 
 #include "vfs_internal.h"
 #include "record_lock.h"
+#include <kernel/cost.h>
 #include <kernel/vfs.h>
 #include <kernel/heap.h>
 
@@ -52,6 +53,9 @@ struct kernel_vfs_node {
     uint8_t unlinked;
     uint8_t retired;
     uint8_t generated_control;
+#if BOAROS_COST_DIAGNOSTICS
+    uint8_t generated_diagnostic;
+#endif
 };
 
 struct kernel_vfs_path {

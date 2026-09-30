@@ -49,6 +49,7 @@ make test-userland-riscv        # 静态 musl、动态 pthread / TLS
 make test-glibc-riscv           # 固定 glibc 2.44 静态/动态/PIE、TLS、pthread
 make test-diff-abi-riscv        # 同一 ELF 对照固定 Linux
 make test-io-sleep-riscv        # 暂扣响应验证并发、计算/缓存进展、flush 与 reset
+make test-cost-riscv COST_CASE=contract # 默认关闭的诊断窗口，三个启动副本
 make test-scale-riscv           # I/O 分块、用户页解析、驻留查找与单页改权成本
 make test-lwip-host             # loopback、UDP 池耗尽/重用、TCP 定时回收
 make test-random-host           # 密码向量、就绪与设备契约

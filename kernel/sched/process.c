@@ -854,6 +854,9 @@ enum kernel_scheduler_status riscv_process_clone_current(
         child_append(parent->group_leader, child);
     }
     kernel_mm_add_user(&child->mm);
+#if BOAROS_COST_DIAGNOSTICS
+    kernel_cost_inherit(&child->cost, &parent->cost);
+#endif
     child->state = KERNEL_THREAD_STATE_READY;
     ready_append(child);
     *linux_result = tid;
@@ -1697,6 +1700,9 @@ static void kernel_thread_finish(
     }
 
     /* proc readers must see departure before clear_child_tid wakes a joiner. */
+#if BOAROS_COST_DIAGNOSTICS
+    kernel_cost_task_exit();
+#endif
     current->proc_exiting = 1U;
     if (!current->group_exiting) current->completion = *completion;
     if (current->arch.user_mode == 1U) {
@@ -1727,6 +1733,9 @@ static void kernel_thread_finish(
         next->state = KERNEL_THREAD_STATE_RUNNING;
     }
     scheduler_account_runtime();
+#if BOAROS_COST_DIAGNOSTICS
+    kernel_cost_switch(&scheduler.current->cost, &next->cost);
+#endif
     scheduler.current = next;
     scheduler.need_resched = 0;
     scheduler_rearm_timer();
