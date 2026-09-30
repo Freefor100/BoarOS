@@ -2,6 +2,24 @@ import unittest
 from cost_report import parse, schema, percentile, validate_expected, validate_replicas
 
 class CostReportTest(unittest.TestCase):
+    def test_consumer_budget_is_measured_policy_not_a_success_proxy(self):
+        from cost_consumer import commands
+        lines=['COST CONSUMER BUDGET 600000']
+        for libc in ('musl','glibc'):
+            for i in range(8):
+                name=f'consumer-{libc}-{i}'
+                lines += [f'COST COMMAND BEGIN {name}', 'iozone test complete.',
+                          f'COST RESULT {name} 123', f'COST COMMAND RESULT {name} 1 9']
+        output='\n'.join(lines)+'\n'
+        rows=commands(output,expected_budget_ms=600000)
+        self.assertEqual({r['command_timeout_ms'] for r in rows},{600000})
+        self.assertTrue(all(r['reason']=='timeout' for r in rows))
+        for invalid in (output.replace('600000','180000',1),
+                        output.replace('600000','0',1),
+                        output+'COST CONSUMER BUDGET 600000\n',
+                        output.replace(lines[0]+'\n','')):
+            with self.assertRaises(ValueError): commands(invalid,expected_budget_ms=600000)
+
     def test_summary_includes_windows_without_external_timing(self):
         import contextlib,importlib.util,io,json,tempfile
         from pathlib import Path

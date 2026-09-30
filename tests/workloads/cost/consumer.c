@@ -6,6 +6,7 @@
 #include <sys/wait.h>
 static long milliseconds(void)
 { struct timespec t; CHECK(clock_gettime(CLOCK_MONOTONIC,&t)==0);return t.tv_sec*1000+t.tv_nsec/1000000; }
+static long command_budget_ms=180000;
 static void command(unsigned libc, unsigned index)
 {
     const char *directories[]={"/musl","/glibc"};
@@ -20,7 +21,7 @@ static void command(unsigned libc, unsigned index)
         execv("./iozone",index?threads:automatic);dprintf(2,"COST EXEC ERROR %s %d\n",name,errno);_exit(127);
     }
     char c;CHECK(read(ready[0],&c,1)==1);printf("COST COMMAND BEGIN %s\n",name);fflush(stdout);cost_begin();CHECK(write(gate[1],"g",1)==1);
-    long deadline=milliseconds()+180000;int status=0,timeout=0;
+    long deadline=milliseconds()+command_budget_ms;int status=0,timeout=0;
     for(;;){pid_t r=waitpid(child,&status,WNOHANG);CHECK(r>=0);if(r==child)break;if(milliseconds()>=deadline && !timeout){timeout=1;CHECK(kill(-child,SIGKILL)==0);}struct timespec delay={0,20000000};CHECK(nanosleep(&delay,0)==0);}
     /* PID 1 also reaps orphaned workers after a cancelled process group. */
     if(timeout){for(unsigned retry=0;retry<500;retry++){int st;pid_t r=waitpid(-1,&st,WNOHANG);if(r<0 && errno==ECHILD)break;CHECK(r>=0);if(!r){struct timespec delay={0,20000000};CHECK(nanosleep(&delay,0)==0);}}}
@@ -30,6 +31,11 @@ static void command(unsigned libc, unsigned index)
 int main(void)
 {
     setvbuf(stdout,0,_IONBF,0);cost_init();mkdir("/dev",0755);mkdir("/tmp",01777);mkdir("/lib",0755);
+    FILE *policy=fopen("/cost-consumer-budget","r");
+    if(policy){char extra;CHECK(fscanf(policy,"%ld %c",&command_budget_ms,&extra)==1);CHECK(fclose(policy)==0);}
+    else CHECK(errno==ENOENT);
+    CHECK(command_budget_ms>=1000 && command_budget_ms<=3600000);
+    printf("COST CONSUMER BUDGET %ld\n",command_budget_ms);
     CHECK(mknod("/dev/null",S_IFCHR|0666,makedev(1,3))==0 || errno==EEXIST);
     CHECK(mknod("/dev/zero",S_IFCHR|0666,makedev(1,5))==0 || errno==EEXIST);
     CHECK(symlink("/musl/lib/libc.so","/lib/ld-musl-riscv64-sf.so.1")==0 || errno==EEXIST);

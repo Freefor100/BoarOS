@@ -74,6 +74,10 @@ wake_to_run只含实际wake，ready_ticks另含创建/yield等就绪。关闭后
 C6 使用固定原镜像的ELF/脚本/依赖，逐命令保存ELF、argv、cwd、真实wait status、
 诊断timeout与原stdout/stderr。解释器路径按原ELF安装，libc目录各自指定；不改ELF或uname。
 原脚本成功不作为原命令成功证据；wait=0、无timeout、原完成marker及未报告所选测试不可用四条件同时成立才记所选测试完成。另保留进程完成状态与拒绝原因。
+`--consumer-timeout-ms` 显式设置每命令客体预算（1000–3600000 ms，默认仍为180000）；
+配置写入启动前封存输入和fixture，同一协调ELF读取它并输出唯一预算header，Python核对一致性。
+宿主兜底预算按16条命令预算加120秒计算。放宽预算不会改变上述完成条件，
+新配置独立保存，不能覆盖旧180秒基线或冒充原评测3600秒总预算。
 冻结的kernel/ELF/fixture/firmware/DTB和工具/源码身份在每次启动前写入input.json并封存哈希，执行器串行互斥。
 `tests/cost-evidence.py` 压缩零指标后仍重建完整快照并核对seal，拒绝遗漏非零计数；
 持久验收再次检查epoch严格递增和直方图最大值，后台取消和回收重入OOM由独立host回归保护。

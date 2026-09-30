@@ -38,7 +38,13 @@ def classify(raw, timeout, status):
     return dict(completion_marker=marker,process_completed=process_completed,
                 requested_tests_available=available,outcome=outcome,reason=reason)
 
-def commands(output):
+def commands(output, expected_budget_ms=180000):
+    policies=re.findall(r'^COST CONSUMER BUDGET ([^\n]+)$',output,re.M)
+    if len(policies)>1:raise ValueError('duplicate consumer budget')
+    # Older sealed records used the fixed 180 s policy without a header.
+    budget=int(policies[0]) if policies else 180000
+    if not 1000<=budget<=3600000 or budget!=expected_budget_ms:
+        raise ValueError('consumer budget differs from frozen input')
     result=[]
     for libc in ('musl','glibc'):
         for index,group in enumerate(GROUPS):
@@ -48,5 +54,5 @@ def commands(output):
             timeout,status=map(int,finish[0]);raw=output.split(start,1)[1].split('COST RESULT '+name+' ',1)[0]
             argv=['./iozone','-a','-r','1k','-s','4m'] if group is None else ['./iozone','-t','4','-i',str(group[0]),'-i',str(group[1]),'-r','1k','-s','1m']
             sections=[line.strip() for line in raw.splitlines() if 'throughput for' in line or 'Initial write' in line or 'Re-write' in line]
-            result.append(dict(command_timeout_ms=180000,reported_sections=sections,name=name,elf_sha256=ELFS[libc],argv=argv,cwd='/'+libc,timeout=timeout,wait_status=status,raw_output=raw,**classify(raw,timeout,status)))
+            result.append(dict(command_timeout_ms=budget,reported_sections=sections,name=name,elf_sha256=ELFS[libc],argv=argv,cwd='/'+libc,timeout=timeout,wait_status=status,raw_output=raw,**classify(raw,timeout,status)))
     return result
