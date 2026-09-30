@@ -2,6 +2,34 @@ import unittest
 from cost_report import parse, schema, percentile, validate_expected, validate_replicas
 
 class CostReportTest(unittest.TestCase):
+    def test_summary_includes_windows_without_external_timing(self):
+        import contextlib,importlib.util,io,json,tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        spec=importlib.util.spec_from_file_location('summary','tests/cost-summary.py');m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
+        snap=parse(self.render(self.valid()),3)
+        rows=[dict(case='test',cost_diagnostics=1,transport='modern',cache='writeback',replica=i,
+                   replicas=3,acceptance=True,kernel_sha256='k',elf_sha256='e',source_sha256='s',
+                   fixture_sha256=str(i),snapshots=[dict(name='untimed',values=snap)],timings_ns={}) for i in range(3)]
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/'records.json';path.write_text(json.dumps(rows));output=io.StringIO()
+            with patch('sys.argv',['cost-summary.py',str(path)]),contextlib.redirect_stdout(output):m.main()
+        self.assertIn('untimed',output.getvalue())
+        self.assertIn('uncovered ticks:',output.getvalue())
+
+    def test_collect_fixture_inputs_preserves_frozen_identity(self):
+        import importlib.util
+        spec=importlib.util.spec_from_file_location('evidence','tests/cost-evidence.py');m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
+        raw=dict(transport='modern',cache='writeback',source_tree='tree',kernel_sha256='kernel',
+                 input_keys=['source_tree'],input_sha256='sealed',snapshots=[dict(name='pressure-io',
+                 values=dict(mode='fixture',start_ticks=5,end_ticks=8,timebase_hz=10))])
+        rows=m.collect([raw,raw,raw])
+        self.assertEqual([r['replica'] for r in rows],[0,1,2])
+        self.assertEqual(rows[0]['timings_ns'],{'pressure-io':300000000})
+        self.assertEqual(rows[0]['input_keys'],raw['input_keys'])
+        self.assertEqual(rows[0]['source_tree'],'tree')
+        self.assertNotIn('case',raw)
+
     def test_consumer_per_command_completion(self):
         from cost_consumer import commands
         lines=[]
@@ -21,6 +49,14 @@ class CostReportTest(unittest.TestCase):
         self.assertEqual(framed_line('            4096       1'+marker),marker)
         self.assertEqual(framed_line(marker),marker)
         self.assertEqual(framed_line('iozone ordinary output'),'iozone ordinary output')
+
+    def test_unavailable_selected_test_is_not_acceptance(self):
+        from cost_consumer import classify
+        result=classify('Selected test not available on the version.\niozone test complete.\n',0,0)
+        self.assertTrue(result['process_completed'])
+        self.assertFalse(result['requested_tests_available'])
+        self.assertEqual(result['outcome'],'blocked')
+        self.assertEqual(result['reason'],'selected_tests_unavailable')
 
     def valid(self):
         fields = dict(irq_user_prefix_instructions='7',irq_supervisor_prefix_instructions='6',irq_sret_suffix_instructions='11',irq_c_enable_suffix_min_instructions='9',version='1', epoch='3', state='complete', mode='user', owner='2',
@@ -82,6 +118,7 @@ class CostReportTest(unittest.TestCase):
         rows=[dict(case='test',cost_diagnostics=1,transport='modern',cache='writeback',replica=i,replicas=3,acceptance=True,kernel_sha256='k',elf_sha256='e',source_sha256='s',fixture_sha256=str(i),snapshots=[dict(name='test',values=snap)],timings_ns={'test':1}) for i in range(3)]
         with self.assertRaises(ValueError):m.pack(rows,final=True)
         packed=m.pack(rows);self.assertEqual(m.unpack(packed),rows)
+        with self.assertRaises(ValueError):m.unpack(packed,final=True)
         del packed['records'][0]['snapshots'][0]['counters']['foreground.operations']
         with self.assertRaises(ValueError):m.unpack(packed)
     def test_deadline_scanning_uses_all_blocked_members(self):

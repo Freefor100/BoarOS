@@ -8,6 +8,27 @@ from cost_report import schema,parse,validate_replicas
 
 def seal(values):
     return hashlib.sha256(json.dumps(values,sort_keys=True,separators=(',',':')).encode()).hexdigest()
+def collect(documents):
+    """Normalize runner/fixture outputs without changing the pre-boot input manifest."""
+    from cost_consumer import classify
+    rows=[]; replicas={}
+    for document in documents:
+        if isinstance(document,list):
+            for original in document:
+                row=dict(original)
+                if row.get('case')=='consumer':
+                    row['commands']=[dict(c,**classify(c['raw_output'],c['timeout'],c['wait_status'])) for c in row['commands']]
+                rows.append(row)
+        elif 'complete_matrix' in document:
+            rows.extend(unpack(document))
+        else:
+            row=dict(document); key=(row['transport'],row['cache'])
+            replica=replicas.get(key,0);replicas[key]=replica+1
+            row.update(case='io-pressure',cost_diagnostics=1,platform='boaros',two_disks=False,
+                       replica=replica,replicas=3,acceptance=True,elf_sha256=row['kernel_sha256'],
+                       tree=row['source_tree'],timings_ns={s['name']:(s['values']['end_ticks']-s['values']['start_ticks'])*1000000000//s['values']['timebase_hz'] for s in row['snapshots']})
+            rows.append(row)
+    return rows
 def validate_final(records):
     groups=validate_replicas(records)
     cases=('contract','write','locking','mprotect','deadline','latency','consumer')
@@ -28,7 +49,7 @@ def validate_final(records):
         on=groups[(case,1,'modern','writeback',False,'boaros')][0]
         off=groups[(case,0,'modern','writeback',False,'boaros')][0]
         if on['elf_sha256']!=off['elf_sha256']:raise ValueError('on/off workload ELF differs: '+case)
-    from cost_consumer import ELFS, SCRIPTS, ORIGINAL_SHA, GROUPS
+    from cost_consumer import ELFS, SCRIPTS, ORIGINAL_SHA, GROUPS, classify
     for key, rows in groups.items():
         case,on,*_=key
         for row in rows:
@@ -47,9 +68,8 @@ def validate_final(records):
                     _,libc,index=c['name'].split('-');g=GROUPS[int(index)]
                     argv=['./iozone','-a','-r','1k','-s','4m'] if g is None else ['./iozone','-t','4','-i',str(g[0]),'-i',str(g[1]),'-r','1k','-s','1m']
                     if c['argv']!=argv or c['cwd']!='/'+libc or c['elf_sha256']!=ELFS[libc]:raise ValueError('original argv/ELF/cwd changed')
-                    marker='iozone test complete.' in c['raw_output']
-                    outcome='completed' if not c['timeout'] and c['wait_status']==0 and marker else 'blocked'
-                    if c['timeout'] not in (0,1) or c['completion_marker']!=marker or c['outcome']!=outcome:raise ValueError('incorrect command completion')
+                    expected=classify(c['raw_output'],c['timeout'],c['wait_status'])
+                    if c['timeout'] not in (0,1) or any(c.get(k)!=v for k,v in expected.items()):raise ValueError('incorrect command/method completion')
     return groups
 
 def pack(records, final=False):
@@ -68,7 +88,7 @@ def pack(records, final=False):
             row['snapshots'].append(dict(name=snap['name'],header=packed,counters=counters,sha256=seal(full)))
         rows.append(row)
     return dict(version=1,complete_matrix=final,compression='all unspecified metrics and buckets are zero',metrics=metrics,records=rows)
-def unpack(document):
+def unpack(document, final=False):
     if document['version']!=1 or [tuple(x) for x in document['metrics']]!=schema():raise ValueError('evidence schema/version')
     rows=[]
     for record in document['records']:
@@ -89,13 +109,13 @@ def unpack(document):
             parse(''.join(f'{k}={v}\n' for k,v in full.items()),full['epoch'])
             row['snapshots'].append(dict(name=snap['name'],values=full))
         rows.append(row)
-    (validate_final if document.get('complete_matrix') else validate_replicas)(rows);return rows
+    (validate_final if final or document.get('complete_matrix') else validate_replicas)(rows);return rows
 
 def main():
     p=argparse.ArgumentParser(__doc__);p.add_argument('inputs',nargs='+',type=Path);p.add_argument('--output',type=Path);p.add_argument('--final',action='store_true',help='require all 60 boots and all original commands');args=p.parse_args()
     if args.output:
-        rows=[r for path in args.inputs for r in json.loads(path.read_text())];document=pack(rows,args.final);unpack(document)
+        rows=collect([json.loads(path.read_text()) for path in args.inputs]);document=pack(rows,args.final);unpack(document)
         args.output.write_text(json.dumps(document,ensure_ascii=False,separators=(',',':'))+'\n');print('verified evidence:',args.output)
     else:
-        for path in args.inputs:print(path,len(unpack(json.loads(path.read_text()))),'verified boots')
+        for path in args.inputs:print(path,len(unpack(json.loads(path.read_text()),args.final)),'verified boots')
 if __name__=='__main__':main()

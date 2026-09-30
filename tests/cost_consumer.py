@@ -28,6 +28,16 @@ def framed_line(line):
     match=re.search(r'COST RESULT consumer-(?:musl|glibc)-[0-7] [0-9]+$',line)
     return match.group(0) if match else line
 
+def classify(raw, timeout, status):
+    marker='iozone test complete.' in raw
+    available='Selected test not available on the version.' not in raw
+    process_completed=not timeout and status==0 and marker
+    outcome='completed' if process_completed and available else 'blocked'
+    reason=('selected_tests_unavailable' if not available else 'timeout' if timeout else
+            'exit_status' if status else 'no_completion_marker' if not marker else 'completed')
+    return dict(completion_marker=marker,process_completed=process_completed,
+                requested_tests_available=available,outcome=outcome,reason=reason)
+
 def commands(output):
     result=[]
     for libc in ('musl','glibc'):
@@ -37,9 +47,6 @@ def commands(output):
             if output.count(start)!=1 or len(finish)!=1:raise ValueError('missing/duplicate original command '+name)
             timeout,status=map(int,finish[0]);raw=output.split(start,1)[1].split('COST RESULT '+name+' ',1)[0]
             argv=['./iozone','-a','-r','1k','-s','4m'] if group is None else ['./iozone','-t','4','-i',str(group[0]),'-i',str(group[1]),'-r','1k','-s','1m']
-            # The original emits completion after all selected tests; nonzero/timeout remains a blocker.
-            completed='iozone test complete.' in raw
-            outcome='completed' if not timeout and status==0 and completed else 'blocked'
             sections=[line.strip() for line in raw.splitlines() if 'throughput for' in line or 'Initial write' in line or 'Re-write' in line]
-            result.append(dict(command_timeout_ms=180000,reported_sections=sections,name=name,elf_sha256=ELFS[libc],argv=argv,cwd='/'+libc,timeout=timeout,wait_status=status,completion_marker=completed,outcome=outcome,raw_output=raw))
+            result.append(dict(command_timeout_ms=180000,reported_sections=sections,name=name,elf_sha256=ELFS[libc],argv=argv,cwd='/'+libc,timeout=timeout,wait_status=status,raw_output=raw,**classify(raw,timeout,status)))
     return result
