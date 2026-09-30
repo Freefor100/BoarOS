@@ -687,7 +687,7 @@ $(MM_FATAL_TEST_KERNEL_RV): $(MM_FATAL_TEST_OBJECTS) \
 $(VMA_TEST_KERNEL_RV): $(VMA_TEST_OBJECTS) \
 		arch/riscv/linker.ld
 	$(CC) $(LDFLAGS) \
-		-Wl,--wrap=kernel_heap_resize -Wl,--wrap=kernel_heap_allocate \
+		-Wl,--wrap=kernel_heap_resize \
 		-Wl,--wrap=physical_page_allocate \
 		-Wl,--wrap=riscv_sv39_current_satp \
 		-Wl,-Map,$(BUILD_DIR)/tests/kernel-vma-rv.map \
