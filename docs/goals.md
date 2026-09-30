@@ -189,10 +189,10 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 
 下列 C0–C6 已交付成本诊断和真实消费者状态；受控成本证据不能代替消费者兼容通过或正式评测。
 
-## 本轮：成本测量优先（2026-09-30 验收）
+## 本轮：成本测量优先（2026-10-01 收口）
 
 维护者已选择先量化写入、扫描、唤醒和延迟，再决定优化。目标是得到能归因、可重建的
-成本基线，保护 R1–R8 已验收的行为；最终完成 20 配置、60 串行独立启动和 339 观测窗口，见[最终报告与归档](learning/cost-baseline.md)。C0–C5 受控负载验收通过；C6 完整记录原消费者的完成、不可用、超时和启动拒绝，但实际旧 glibc I/O 测量及超时归因未完成，C6 尚未完全验收，未将这些阻塞算作兼容通过。尚无新的结构优化。
+成本基线，保护 R1–R8 已验收的行为；最终完成 20 配置、60 串行独立启动和 339 观测窗口，见[最终报告与归档](learning/cost-baseline.md)。C0–C5 受控负载及 C6 成本测量已验收；新增兼容配置与固定 Linux 的九次启动/48 窗口独立归档，原旧 glibc/musl 各七组实际 I/O 完成，原向量组双侧版本排除。旧短预算超时由自然结束澄清，慢写和 unknown 的归因边界保留。原 judge 的 iozone 两侧取得实际成绩，完整评测仍有总预算与 kernel-la 阻塞。尚无新的结构优化。
 起点为本轮最终生产源码，内核 SHA-256
 `0c0c6a77f54160c06f284f19133b6bb6516f7c6e2d8dcb5f0864390ce1361fbb`，
 1091 条 ABI、四组合 io-sleep、scale 与 WAL 恢复证据见上文。
@@ -295,13 +295,13 @@ C1 阶段证据：modern/writeback 的观测开/关各三个独立启动，36 �
 - [x] 固定热缓存 4 KiB/64 KiB/1 MiB 复制和单页/大范围改权，配独立唤醒任务；报告 IRQ-off 最大区间、锁持有、唤醒到运行分布与切换，不按 QEMU 墙钟设性能及格线。
 - [x] `make test-cost-riscv COST_CASE=latency` 与 `make test-trap-riscv test-trap-return-riscv test-context-riscv test-user-riscv test-io-sleep-riscv test-sched-bandwidth-riscv test-stack-usage`；运行观测开/关对照。本任务不引入任意 yield 或 syscall 内开中断。
 
-### C6：真实消费者、归因与收口（尚未完全验收）
+### C6：真实消费者、归因与收口（成本测量已验收）
 
 复用 `tests/runtime-diagnostics.py`、固定原镜像的 iozone 以及 C0 runner；
-最终证据归 `docs/learning/cost-baseline.md`/`cost-measurements.json`，规模/存储文档链接该结论，契约归对应模块，
+最终证据归 `docs/learning/cost-baseline.md`/`cost-measurements.json`，新增续测独立归 `cost-consumer-followup.json`；规模/存储文档链接该结论，契约归对应模块，
 能力/后续依赖分别更新 README 与本页，不另建永久计划或原始日志档案。
 
-- [ ] 固定原 iozone ELF/依赖/镜像哈希、argv、工作目录、文件规模、缓存与同步条件；先核实实际调用链，再用 C1–C5 的受控负载解释其观测，未执行或超时保留原始状态。输入身份与逐命令记录已完成；原旧 glibc 实际 I/O 成本及 musl 超时归因尚未完成，不能把采样完成当作该项全部验收。
+- [x] 固定原 iozone ELF/依赖/镜像哈希、argv、工作目录、文件规模、缓存与同步条件；先核实实际调用链，再用 C1–C5 的受控负载解释其观测，未执行或超时保留原始状态。九次独立启动保存 144 次自然退出、126 次实际 I/O 完成和 18 次固定参考版本排除；原旧 glibc 实际 I/O 成本已取得。旧 180 秒属于预算截断，未修改负载延长后自然完成；主成本、观测约 17% 开销和 unknown 见续测报告。
 - [x] `make test-cost-riscv COST_CASE=consumer` 与最终 `make test-cost-riscv COST_CASE=all` 输出全部阶段、输入身份和观测开/关对照，三个独立启动副本均有完整结果。
 - [x] 汇总每项主成本与未解释余量，报告重复分布、观测开销和无收益结果；只有因果对照支持时，提出 2–3 个对应瓶颈的候选，由维护者选择一次优化。
 - [x] 测量代码收口运行 `make test-riscv test-userland-riscv test-glibc-riscv test-diff-abi-riscv test-scale-riscv test-io-sleep-riscv test-stack-usage`，以及 SQLite DELETE/WAL 正常与选定错误恢复。后续实际修改写回、事务或队列时再跑两种完整恢复矩阵与双盘隔离。
@@ -309,8 +309,8 @@ C1 阶段证据：modern/writeback 的观测开/关各三个独立启动，36 �
 
 依赖为 C0 → C1/C3/C4，C1 → C2，C2/C3/C4 → C5，全部测量 → C6。下一轮的结构优化需从报告中三个候选重新确认。
 
-- [ ] 兼容分支单向合入本轮已验收 main 后重跑原 glibc/musl iozone 与原 judge；`oscomp-rv-compat@3dcfe77` 已有 uname 4.15.0 适配，本轮未更新该分支，也未改 main uname。main 的原 glibc 启动拒绝不提供实际 I/O 成本。
-- [ ] 原 iozone (11,12) 所选测试在固定 Linux 也不可用，不计作向量 ABI 验收；其余 timeout 不据短预算判定永久卡死。完整 Harness 的缺少 kernel-la 阻塞保留。
+- [x] 兼容分支单向合入本轮已验收 main；`68b98d8` 保留 uname 4.15.0 和原入口、原 judge，`f380c70` 再合入通用续测工具。原 iozone glibc/musl 为 21.451673/21.668778；一次原预算 RV 投影 626，总预算耗尽于 lmbench-glibc，其后七组未到达。main uname 未修改，完整评测未通过。
+- [x] 原 iozone (11,12) 所选测试在固定 Linux 同样不可用，作为固定参考排除，不计作向量 ABI 验收；其余可用组在开/关和 Linux 各三次启动均完成。完整 Harness 缺少 kernel-la 的阻塞保留。
 日志/RTC、SysV RMID 后再 attach 的既有兼容限制和 iperf/netperf 定位保留后续队列；
 本阶段不扩展 SMP、LoongArch、deadline 索引、选择性唤醒、驻留范围索引或持久化策略。
 
