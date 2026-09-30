@@ -386,7 +386,7 @@ static void check_completion(
     if (completion_count == 2U) {
         if (completion->kind != KERNEL_THREAD_KIND_USER ||
             completion->reason != KERNEL_THREAD_EXIT_SIGNAL ||
-            completion->status != 11U || completion->detail != 0U) {
+            completion->status != 11U || completion->detail != 1U) {
             test_failures++;
         }
         return;
