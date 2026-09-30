@@ -254,6 +254,34 @@ static void tcp_scale_cases(void)
     close_socket(server); close_socket(client); close_socket(listener);
 }
 
+static void unix_datagram_cases(void)
+{
+    static unsigned char input[65536], output[65536];
+    struct { uint64_t base, length; } iov[2];
+    int sv[2];
+    abi_require(SC4(199, 1, 2 | LINUX_SOCK_NONBLOCK, 0, sv) == 0);
+    for (unsigned i = 0; i < sizeof(input); i++) input[i] = (unsigned char)(i * 17);
+    iov[0].base = (uintptr_t)input; iov[0].length = 3;
+    iov[1].base = (uintptr_t)(input + 3); iov[1].length = 8190;
+    record("socket.unix-dgram.vector-write", SC3(66, sv[0], iov, 2));
+    long read = SC3(63, sv[1], output, sizeof(output));
+    unsigned equal = read == 8193;
+    for (unsigned i = 0; i < 8193; i++) equal &= output[i] == input[i];
+    record("socket.unix-dgram.vector-read", equal);
+    while (SC3(63, sv[1], output, sizeof(output)) >= 0) {}
+    iov[1].base = 0x12345000; iov[1].length = 1;
+    record("socket.unix-dgram.fault-write", SC3(66, sv[0], iov, 2));
+    record("socket.unix-dgram.fault-no-prefix", SC3(63, sv[1], output, sizeof(output)));
+    record("socket.unix-dgram.zero-write", SC3(64, sv[0], input, 0));
+    struct socket_pollfd poll = {sv[1], 1, 0};
+    struct socket_timespec timeout = {0};
+    record("socket.unix-dgram.zero-ready", SC5(73, &poll, 1, &timeout, 0, 8));
+    record("socket.unix-dgram.zero-read", SC3(63, sv[1], output, sizeof(output)));
+    record("socket.unix-dgram.large-write", SC3(64, sv[0], input, sizeof(input)));
+    record("socket.unix-dgram.large-read", SC3(63, sv[1], output, sizeof(output)));
+    close_socket(sv[0]); close_socket(sv[1]);
+}
+
 void abi_socket_cases(void)
 {
     udp_scale_cases();
@@ -736,4 +764,5 @@ void abi_socket_cases(void)
     record("socket.socketpair-dgram-boundaries", r1 == 3 && r2 == 6);
     close_socket(sv[0]);
     close_socket(sv[1]);
+    unix_datagram_cases();
 }

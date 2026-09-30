@@ -177,7 +177,7 @@ pipe/匿名 epoll 等没有 VFS inode 的描述符目前返回 `ENOTSUP`；固�
 
 ## 请求暂存与成本
 
-普通文件与 TCP 写入按需分配一个 4 KiB 请求页，通过当前任务登记覆盖等待与退出；pipe 保持自己的 ring 协议，console 保持小块暂存。缓冲分配失败返回 ENOMEM；有效用户复制前缀仍只按后端已接受字节推进 offset，O_APPEND、定位写与同步错误观察规则不变。socket 接收 owner 见网络模块。
+普通文件与 TCP 写入按需分配一个 4 KiB 请求页，通过当前任务登记覆盖等待与退出；pipe 保持自己的 ring 协议，console 保持小块暂存。缓冲分配失败返回 ENOMEM；有效用户复制前缀仍只按后端已接受字节推进 offset，O_APPEND、定位写与同步错误观察规则不变。AF_UNIX DGRAM 使用有界整包缓冲而非页分块提交，任务登记临时发送 owner；socket 请求 owner 见网络模块。
 
 `kernel_files_statistics.write_chunks` 记录普通文件/TCP 的用户复制分块，`read_chunks` 包括 socket 的暂存复制；页解析与 TCP 协议提交有独立计数。`make test-scale-riscv` 用真实 VFS/MM/uaccess 验证对齐 1 MiB 文件写入不超过 512 分块和 512 次用户页解析，并检查内容与暂存页 OOM。当前值均为 256；它是结构成本，不是吞吐倍数。
 

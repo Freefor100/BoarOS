@@ -1418,6 +1418,45 @@ static int execed_mode(const char *expected)
     return 23;
 }
 
+static int unix_dgram_fd;
+static volatile int unix_dgram_started, unix_dgram_finished;
+static ssize_t unix_dgram_result;
+static void *unix_dgram_sender(void *argument)
+{
+    (void)argument;
+    unsigned char bytes[32] = {0x7b};
+    unix_dgram_started = 1;
+    unix_dgram_result = write(unix_dgram_fd, bytes, sizeof(bytes));
+    unix_dgram_finished = 1;
+    return 0;
+}
+static int check_unix_datagram_wait(void)
+{
+    static unsigned char bytes[65536];
+    int pair[2]; pthread_t writer;
+    if (socketpair(AF_UNIX, SOCK_DGRAM, 0, pair)) return 1;
+    unix_dgram_fd = pair[0];
+    if (write(pair[0], bytes, 65520) != 65520) return 2;
+    unix_dgram_started = unix_dgram_finished = 0;
+    if (pthread_create(&writer, 0, unix_dgram_sender, 0)) return 3;
+    while (!unix_dgram_started) sched_yield();
+    for (unsigned i = 0; i < 16; i++) sched_yield();
+    if (unix_dgram_finished) return 4;
+    if (read(pair[1], bytes, 1) != 1 || pthread_join(writer, 0) || unix_dgram_result != 32 ||
+        read(pair[1], bytes, sizeof(bytes)) != 32 || bytes[0] != 0x7b) return 5;
+    if (write(pair[0], bytes, sizeof(bytes)) != sizeof(bytes)) return 6;
+    unix_dgram_started = unix_dgram_finished = 0;
+    if (pthread_create(&writer, 0, unix_dgram_sender, 0)) return 7;
+    while (!unix_dgram_started) sched_yield();
+    for (unsigned i = 0; i < 16; i++) sched_yield();
+    void *result = 0;
+    if (pthread_cancel(writer) || pthread_join(writer, &result) || result != PTHREAD_CANCELED) return 8;
+    if (read(pair[1], bytes, 1) != 1 || fcntl(pair[1], F_SETFL, O_NONBLOCK)) return 9;
+    if (read(pair[1], bytes, 1) != -1 || errno != EAGAIN) return 10;
+    close(pair[0]); close(pair[1]);
+    return 0;
+}
+
 static int run_check(const char *name, const char *marker,
                      int (*check)(void))
 {
@@ -1512,6 +1551,8 @@ int main(int argc, char **argv)
     if (run_check("socket pool pressure",
                   "BoarOS: real pthread socket pool pressure checks ok",
                   check_socket_pool_pressure) != 0) return 15;
+    if (run_check("unix datagram wait", "BoarOS: real pthread unix datagram wait checks ok",
+                  check_unix_datagram_wait) != 0) return 16;
     if (run_check("group limits",
                   "BoarOS: real pthread group limits checks ok",
                   check_group_limits) != 0) return 8;

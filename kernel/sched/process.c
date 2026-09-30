@@ -1269,6 +1269,7 @@ enum kernel_scheduler_status kernel_scheduler_reap_one(
     }
     /* Request handles may live on the old stack; release them before it. */
     if (thread->io_context.locks || thread->io_context.backend_depth) __builtin_trap();
+    if (thread->socket_write_request) kernel_socket_abort_write(thread->socket_write_request);
     if (thread->socket_read_request) kernel_socket_abort_read(thread->socket_read_request);
     if (thread->io_buffer) kernel_task_io_buffer_release(thread->io_buffer);
     status = release_task_stack(thread);
@@ -1446,6 +1447,8 @@ static enum kernel_scheduler_status cleanup_user_task_resources(
     enum kernel_files_status files_status;
     enum kernel_fs_context_status fs_status;
 
+    if (thread->socket_write_request != 0)
+        kernel_socket_abort_write(thread->socket_write_request);
     if (thread->socket_read_request != 0)
         kernel_socket_abort_read(thread->socket_read_request);
     if (thread->io_buffer != 0)
@@ -2056,4 +2059,19 @@ void kernel_task_prepare_user_return(void)
         (void)kernel_copy_to_user(&task->mm, address, &task->tid,
                                   sizeof(task->tid), &copied);
     }
+}
+
+enum kernel_task_status kernel_task_socket_write_register(
+    struct kernel_task *task, struct kernel_socket_write_request *request)
+{
+    if (!task || task != kernel_task_current() || !request || task->socket_write_request) return KERNEL_TASK_STATUS_STATE;
+    task->socket_write_request = request;
+    return KERNEL_TASK_STATUS_OK;
+}
+enum kernel_task_status kernel_task_socket_write_clear(
+    struct kernel_task *task, struct kernel_socket_write_request *request)
+{
+    if (!task || !request || task->socket_write_request != request) return KERNEL_TASK_STATUS_STATE;
+    task->socket_write_request = 0;
+    return KERNEL_TASK_STATUS_OK;
 }

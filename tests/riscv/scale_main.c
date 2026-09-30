@@ -31,10 +31,17 @@ enum kernel_scheduler_status __wrap_kernel_wait_queue_wake_all(struct kernel_wai
     return KERNEL_SCHEDULER_STATUS_OK;
 }
 static unsigned fail_page;
-static unsigned fail_metadata;
+static unsigned fail_metadata, fail_packet;
+enum kernel_heap_status __real_kernel_heap_allocate(struct kernel_heap *, size_t, void **);
+enum kernel_heap_status __wrap_kernel_heap_allocate(struct kernel_heap *heap, size_t size, void **out)
+{
+    if (fail_packet && --fail_packet == 0) return KERNEL_HEAP_STATUS_EMPTY;
+    return __real_kernel_heap_allocate(heap, size, out);
+}
 enum kernel_heap_status __real_kernel_heap_allocate_zeroed(struct kernel_heap *, size_t, size_t, void **);
 enum kernel_heap_status __wrap_kernel_heap_allocate_zeroed(struct kernel_heap *heap, size_t n, size_t size, void **out)
 {
+    if (fail_packet && --fail_packet == 0) return KERNEL_HEAP_STATUS_EMPTY;
     if (fail_metadata && --fail_metadata == 0) return KERNEL_HEAP_STATUS_EMPTY;
     return __real_kernel_heap_allocate_zeroed(heap, n, size, out);
 }
@@ -183,6 +190,41 @@ static void socketpair_scale(struct kernel_files *files, struct kernel_mm *mm)
           KERNEL_FILES_STATUS_OK && result == 40, 99);
     check(kernel_files_close(files, pair[0], &result) == KERNEL_FILES_STATUS_OK && result == 0, 100);
     check(kernel_files_close(files, pair[1], &result) == KERNEL_FILES_STATUS_OK && result == 0, 101);
+}
+
+static void unix_datagram_budget(struct kernel_files *files, struct kernel_mm *mm)
+{
+    int64_t result;
+    int32_t pair[2]; size_t copied;
+    check(kernel_files_socketpair_create(files, mm, 2, 2048, BUFFER, &result) == KERNEL_FILES_STATUS_OK && result == 0, 180);
+    check(kernel_copy_from_user(mm, pair, BUFFER, sizeof(pair), &copied) == KERNEL_UACCESS_STATUS_OK, 181);
+    for (unsigned i = 0; i < 100; i++)
+        check(kernel_files_write(files, mm, pair[0], BUFFER, 0, &result) == KERNEL_FILES_STATUS_OK && result == 0, 182);
+    check(kernel_files_write(files, mm, pair[0], BUFFER, 65536, &result) == KERNEL_FILES_STATUS_OK && result == -KERNEL_EAGAIN, 183);
+    for (unsigned i = 0; i < 100; i++)
+        check(kernel_files_read(files, mm, pair[1], BUFFER, 1, &result) == KERNEL_FILES_STATUS_OK && result == 0, 184);
+    for (unsigned i = 0; i < 4; i++) {
+        check(kernel_files_write(files, mm, pair[0], BUFFER, 65536, &result) == KERNEL_FILES_STATUS_OK && result == 65536, 185);
+        check(kernel_files_write(files, mm, pair[0], BUFFER, 1, &result) == KERNEL_FILES_STATUS_OK && result == -KERNEL_EAGAIN, 186);
+        check(kernel_files_read(files, mm, pair[1], BUFFER, 1, &result) == KERNEL_FILES_STATUS_OK && result == 1, 187);
+    }
+    for (unsigned ordinal = 1; ordinal <= 2; ordinal++) {
+        fail_packet = ordinal;
+        check(kernel_files_write(files, mm, pair[0], BUFFER, 8, &result) == KERNEL_FILES_STATUS_OK && result == -KERNEL_ENOMEM, 192);
+        fail_packet = 0;
+        check(kernel_files_read(files, mm, pair[1], BUFFER, 8, &result) == KERNEL_FILES_STATUS_OK && result == -KERNEL_EAGAIN, 193);
+        check(kernel_files_write(files, mm, pair[0], BUFFER, 8, &result) == KERNEL_FILES_STATUS_OK && result == 8 &&
+            kernel_files_read(files, mm, pair[1], BUFFER, 8, &result) == KERNEL_FILES_STATUS_OK && result == 8, 194);
+    }
+    check(kernel_files_write(files, mm, pair[0], BUFFER, 65537, &result) == KERNEL_FILES_STATUS_OK && result == -KERNEL_EMSGSIZE, 188);
+    check(kernel_files_write(files, mm, pair[0], BUFFER + MIB + 4094, 4, &result) == KERNEL_FILES_STATUS_OK && result == -KERNEL_EFAULT, 189);
+    check(kernel_files_read(files, mm, pair[1], BUFFER, 8, &result) == KERNEL_FILES_STATUS_OK && result == -KERNEL_EAGAIN, 190);
+    check(kernel_files_write(files, mm, pair[0], BUFFER, 65536, &result) == KERNEL_FILES_STATUS_OK && result == 65536 &&
+        kernel_files_read(files, mm, pair[1], 0x12345000, 8, &result) == KERNEL_FILES_STATUS_OK && result == -KERNEL_EFAULT, 195);
+    check(kernel_files_write(files, mm, pair[0], BUFFER, 65536, &result) == KERNEL_FILES_STATUS_OK && result == 65536, 196);
+    check(kernel_files_close(files, pair[1], &result) == KERNEL_FILES_STATUS_OK && !result &&
+        kernel_files_write(files, mm, pair[0], BUFFER, 8, &result) == KERNEL_FILES_STATUS_OK && result == -KERNEL_EPIPE &&
+        kernel_files_close(files, pair[0], &result) == KERNEL_FILES_STATUS_OK && !result, 191);
 }
 
 static void sysv_shm_fragments(struct kernel_mm *mm)
@@ -536,6 +578,7 @@ void kernel_main(unsigned long hart, const void *dtb)
     tcp_cost(&files, &mm);
     udp_buffer_oom(&files, &mm);
     socketpair_scale(&files, &mm);
+    unix_datagram_budget(&files, &mm);
     struct riscv_mm_statistics small = mapped_cost(&files, &mm, fd, 16 * MIB);
     struct riscv_mm_statistics large = mapped_cost(&files, &mm, fd, 64 * MIB);
     sysv_shm_scale(&mm);

@@ -59,3 +59,5 @@ make prune-build
 PR CI 加入规模、SQLite DELETE/WAL 和离线 GCC 入口。SQLite/musl 源按固定清单恢复，Alpine 工具链由 runner 校验固定输入；缺失或校验失败不能跳过报绿。恢复 CI 独立支持手动与每周一北京时间 02:00（UTC 周日 18:00），显式 bash pipefail 保留 make 的失败状态，失败产物上传。Linux 缓存由身份键定位，runner 仍检查输入。工作流已做本地解析与对应入口验证，尚未执行托管 GitHub Actions。glibc 仍是固定本机输入的严格本地验收，可移植供应另列待办。
 
 本次规模阶段当时未包含可睡眠 I/O、后台写回或多盘；这些机制现已在后续阶段交付，见[可睡眠存储](sleepable-storage.md)及[VFS/ext4](../modules/vfs-ext4.md)。范围写回索引、事务合并、共享文件 futex、SMP 和第二架构仍未交付；后续优先顺序只在[路线](../goals.md)维护。
+
+AF_UNIX DGRAM 的成本边界为每条消息最多 64 KiB 连续暂存与一次队列提交，不把用户页或 iovec 当作消息边界。零消息收一字节预算，截断接收和 fault 丢弃返还整包预算；否则只返还复制字节会在重复短接收后泄漏队列容量。`make test-scale-riscv` 覆盖两处分配 OOM、100 条零消息、满队列、重复截断和接收 fault；`make test-userland-riscv` 用真实 pthread 验证尚有少量 POLLOUT 空间时写者仍等待整条预算，并检查取消不发布消息。这里验证语义和内存上界，没有吞吐测量结论。

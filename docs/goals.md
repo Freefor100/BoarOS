@@ -384,6 +384,7 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 
 2026-09-30 独立 Review 的组合边界修复：
 
+- [x] R4：AF_UNIX DGRAM 整包复制/提交、零消息和整包预算；差分、scale OOM/fault/容量复用与真实 pthread 整包等待/取消通过。
 - [x] R3：file-source 操作 pin 覆盖 msync 的 inode 等待与错误游标；三任务最后撤映射、终止请求、同步/关闭失败及最终清理通过四种 io-sleep 配置。
 
 - [x] R1：SHM 附加 registry OOM 回滚不消费段表 owner；scale 聚焦故障后重试及最终页回收通过。

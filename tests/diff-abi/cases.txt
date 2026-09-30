@@ -192,6 +192,15 @@ socket.socketpair-stream-read
 socket.socketpair-stream-eof
 socket.socketpair-dgram-create
 socket.socketpair-dgram-boundaries
+socket.unix-dgram.vector-write
+socket.unix-dgram.vector-read
+socket.unix-dgram.fault-write
+socket.unix-dgram.fault-no-prefix
+socket.unix-dgram.zero-write
+socket.unix-dgram.zero-ready
+socket.unix-dgram.zero-read
+socket.unix-dgram.large-write
+socket.unix-dgram.large-read
 futex.shared-wake
 futex.shared-requeue
 futex.shared-bad-wake

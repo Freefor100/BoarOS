@@ -1157,6 +1157,11 @@ static enum kernel_files_status write_request(
     uint64_t count, int positioned, uint64_t requested_offset,
     int64_t *linux_result)
 {
+    if (kernel_socket_is_unix_datagram(kernel_open_file_socket(description))) {
+        *linux_result = kernel_socket_write_datagram(&description, mm, iov,
+            iov_count, count, (description->open_flags & KERNEL_FILES_O_NONBLOCK) != 0);
+        return KERNEL_FILES_STATUS_OK;
+    }
     KERNEL_LOCK_SCOPE(offset_guard);
     if ((!positioned && kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_REGULAR) ||
         kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_GENERATED)

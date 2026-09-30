@@ -131,6 +131,7 @@ struct kernel_task {
     uint32_t wait_interruptible;
     struct kernel_syscall_restart_state syscall_restart;
     struct kernel_socket_read_request *socket_read_request;
+    struct kernel_socket_write_request *socket_write_request;
     struct kernel_task_io_buffer *io_buffer;
     struct kernel_io_context io_context;
     uint64_t user_ticks;
