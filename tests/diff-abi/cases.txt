@@ -456,6 +456,11 @@ signal.wait-child-delivery
 signal.wait-info-fault
 signal.wait-info-consumed
 signal.wait-interrupted
+signal.fault-accerr
+signal.fault-maperr
+signal.fault-bus
+signal.fault-ill
+signal.fault-trap
 robust.set-bad-size
 robust.set
 robust.get-self

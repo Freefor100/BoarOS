@@ -88,7 +88,7 @@ static const uint32_t signal_gpr_offsets[32] = {
 
 static void riscv_signal_bad_frame(void)
 {
-    kernel_user_thread_exit(KERNEL_THREAD_EXIT_SIGNAL, 11U, 1U);
+    kernel_user_group_exit(KERNEL_THREAD_EXIT_SIGNAL, 11U, 1U);
 }
 
 static void riscv_signal_build_frame(
@@ -115,7 +115,10 @@ static void riscv_signal_build_frame(
     memset(&data, 0, sizeof(data));
     memcpy(data.prefix, &delivery->signal, sizeof(delivery->signal));
     memcpy(data.prefix + 8U, &delivery->code, sizeof(delivery->code));
-    memcpy(data.prefix + 16U, &delivery->sender, sizeof(delivery->sender));
+    if (delivery->fault)
+        memcpy(data.prefix + 16U, &delivery->fault_address, sizeof(delivery->fault_address));
+    else
+        memcpy(data.prefix + 16U, &delivery->sender, sizeof(delivery->sender));
     memcpy(data.prefix + RISCV_SIGNAL_INFO_SIZE + 24U,
            &disabled, sizeof(disabled));
     memcpy(data.prefix + RISCV_SIGNAL_INFO_SIZE + 40U,

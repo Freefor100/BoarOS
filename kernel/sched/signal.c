@@ -350,6 +350,7 @@ enum kernel_signal_status kernel_signal_fork(
         child->arch.user_mode != 1U) {
         return KERNEL_SIGNAL_STATUS_INVALID_ARGUMENT;
     }
+    child->signal_fault = (struct kernel_signal_fault){0};
     child->signal_pending = 0U;
     child->signal_blocked = parent->signal_blocked;
     child->signal_wait_mask = 0U;
@@ -410,6 +411,7 @@ enum kernel_signal_status kernel_signal_share(
     table->references++;
     child->signal_table_address = parent->signal_table_address;
     child->signal_blocked = parent->signal_blocked;
+    child->signal_fault = (struct kernel_signal_fault){0};
     child->signal_pending = 0U;
     child->signal_wait_mask = 0U;
     memset(child->signal_sender, 0, sizeof(child->signal_sender));
@@ -548,6 +550,7 @@ void kernel_signal_reset_on_exec(struct kernel_task *task)
             }
         }
     }
+    task->signal_fault = (struct kernel_signal_fault){0};
     task->signal_restore_mask = 0U;
     task->signal_wait_mask = 0U;
     kernel_signal_clear_syscall_restart(task);
@@ -1059,13 +1062,31 @@ void kernel_signal_restore_temporary_mask(
     }
 }
 
+void kernel_signal_force_fault(struct kernel_task *task, uint32_t sig,
+    int32_t code, uint64_t address)
+{
+    if (task != scheduler.current || !signal_dispatchable(task) ||
+        !sig || sig > KERNEL_SIGNAL_COUNT || task->signal_fault.signal) __builtin_trap();
+    const struct kernel_signal_action *entry = signal_action_of(task, sig);
+    uint64_t mask = signal_mask(sig);
+    if ((task->signal_blocked & mask) || (entry && entry->handler == KERNEL_SIGNAL_IGN)) {
+        /* 致命同步 fault 不能被阻塞/忽略后无限重试同一指令。 */
+        struct kernel_signal_table *table = signal_table_of(task);
+        if (table) table->actions[sig - 1] = (struct kernel_signal_action){0};
+        task->signal_blocked &= ~mask;
+    }
+    task->signal_fault = (struct kernel_signal_fault){sig, code, address};
+}
+
 enum kernel_signal_select_result kernel_signal_select(
     struct kernel_task *task,
     struct kernel_signal_delivery *delivery)
 {
     for (;;) {
         struct kernel_task *leader = signal_group_leader(task);
-        uint64_t pending = task->signal_pending & ~task->signal_blocked;
+        struct kernel_signal_fault fault = task->signal_fault;
+        uint64_t pending = fault.signal ? signal_mask(fault.signal) :
+            task->signal_pending & ~task->signal_blocked;
         int shared = 0;
         uint32_t sig;
         const struct kernel_signal_action *entry;
@@ -1093,7 +1114,9 @@ enum kernel_signal_select_result kernel_signal_select(
             return KERNEL_SIGNAL_SELECT_NONE;
         }
         sig = signal_first_set(pending);
-        if (shared) {
+        if (fault.signal) {
+            task->signal_fault = (struct kernel_signal_fault){0};
+        } else if (shared) {
             leader->group_pending &= ~signal_mask(sig);
         } else {
             task->signal_pending &= ~signal_mask(sig);
@@ -1105,8 +1128,10 @@ enum kernel_signal_select_result kernel_signal_select(
             delivery->sender = shared
                                    ? leader->group_sender[sig - 1U]
                                    : task->signal_sender[sig - 1U];
-            delivery->code = shared ? leader->group_signal_code[sig - 1U]
-                                    : task->signal_code[sig - 1U];
+            delivery->code = fault.signal ? fault.code :
+                shared ? leader->group_signal_code[sig - 1U] : task->signal_code[sig - 1U];
+            delivery->fault = fault.signal != 0;
+            delivery->fault_address = fault.address;
             delivery->handler = entry->handler;
             delivery->flags = entry->flags;
             delivery->restore_mask = task->signal_restore_mask != 0U

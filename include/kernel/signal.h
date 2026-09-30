@@ -53,10 +53,21 @@ enum kernel_signal_select_result {
     KERNEL_SIGNAL_SELECT_EXIT,
 };
 
+struct kernel_signal_fault {
+    uint32_t signal;
+    int32_t code;
+    uint64_t address;
+};
+/* Current-thread synchronous exception; no allocation, delivered on user return. */
+void kernel_signal_force_fault(struct kernel_task *task, uint32_t signal,
+    int32_t code, uint64_t address);
+
 struct kernel_signal_delivery {
     uint32_t signal;
     uint32_t sender;
     int32_t code;
+    uint32_t fault;
+    uint64_t fault_address;
     uint64_t handler;
     uint64_t flags;
     uint64_t restore_mask;

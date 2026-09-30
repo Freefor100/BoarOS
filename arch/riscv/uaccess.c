@@ -46,6 +46,7 @@ static enum kernel_uaccess_status resolve_user_page(
             user_address,
             required_permissions);
         if (mm_status == KERNEL_MM_STATUS_NOT_MAPPED ||
+            mm_status == KERNEL_MM_STATUS_ACCESS ||
             mm_status == KERNEL_MM_STATUS_ADDRESS_SPACE ||
             mm_status == KERNEL_MM_STATUS_BUS_FAULT ||
             mm_status == KERNEL_MM_STATUS_NO_MEMORY) {

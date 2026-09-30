@@ -173,6 +173,7 @@ struct kernel_task {
     struct kernel_task *blocked_previous;
     struct kernel_futex_key futex_key;
     uint32_t futex_bitset;
+    struct kernel_signal_fault signal_fault;
     uint64_t signal_pending;
     uint64_t signal_blocked;
     uint64_t signal_wait_mask;

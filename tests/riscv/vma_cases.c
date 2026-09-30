@@ -487,14 +487,14 @@ unsigned long run_all_vma_cases(void)
         kernel_mm_resolve_user_fault(
             &parent,
             VMA_TEST_STACK_BASE + 2U * BOAROS_PAGE_SIZE,
-            KERNEL_MM_EXECUTE) != KERNEL_MM_STATUS_NOT_MAPPED ||
+            KERNEL_MM_EXECUTE) != KERNEL_MM_STATUS_ACCESS ||
         kernel_mm_lookup(&parent,
                          VMA_TEST_STACK_BASE + 2U * BOAROS_PAGE_SIZE,
                          &mapping) != KERNEL_MM_STATUS_NOT_MAPPED ||
         kernel_mm_resolve_user_fault(&parent,
                                      VMA_TEST_TEXT_BASE,
                                      KERNEL_MM_WRITE) !=
-            KERNEL_MM_STATUS_NOT_MAPPED ||
+            KERNEL_MM_STATUS_ACCESS ||
         kernel_mm_resolve_user_fault(&parent,
                                      VMA_TEST_TEXT_BASE,
                                      KERNEL_MM_EXECUTE) !=

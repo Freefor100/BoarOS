@@ -37,8 +37,16 @@ sigsuspend 在等待和选择 handler 时保留临时 mask，把原 mask 写入�
 
 ## 验证与当前边界
 
-当前 RV64 `-O2` 静态栈检查中，构帧函数使用 896 字节、sigreturn 使用 864 字节；构帧复用前缀/mcontext 存储，不在内核栈放置整份 1088 字节 frame。加入 tagged restart state 后任务控制块为 1552 字节；4 KiB 页扣除控制块、canary/16-byte 对齐和 288 字节 Trap Frame 后剩余 2240 字节。真实静态用户态曾在 getdents→ext4→heap 释放调用链触发 canary；getdents 改为直接填充输出记录中的文件名，去掉额外 256 字节副本，其静态栈降至 416 字节，组合回归通过。单函数统计和一次回归均不是完整栈界证明，深层缺页和失败清理链仍须沿调用链审查。
+构帧复用 prefix/mcontext 存储，不在内核栈放置整份 frame；新增故障记录内嵌在线程控制块中，不为故障交付分配内存。函数与调用链预算通过 `make test-stack-usage`、真实任务 canary 与退出时栈统计核对；单函数统计和一次回归不能证明所有深层 I/O/fault 清理链。
 
 `make test-signal-riscv` 覆盖 syscall 复制失败、状态提交与 errno；`make test-diff-abi-riscv` 以同一 RISC-V ELF 对照等待信号的参数、真实超时、线程/进程定向来源、阻塞送达、siginfo EFAULT 消费和其他 handler 打断；`make test-userland-riscv` 以真实静态 musl 验证 handler/sigreturn、libc ucontext、sigsuspend、睡眠 EINTR、vfork、SIGCHLD 回收及 pipe 等待。架构和调度边界由 `make test-riscv` 回归。
 
-当前为单 hart 线程组和位图 pending；尚无实时信号队列、sigaltstack、signalfd、控制终端语义或 SMP 同步。libc 内部信号可走线程定向路径，但不据此宣称完整实时信号排队。siginfo 当前提供 SI_USER/SI_TKILL sender 和孤儿组的 SI_KERNEL 来源，不宣称完整故障 siginfo。组 stop/continue 与致命取消不能直接释放睡眠中的任务栈；不可中断的 vfork 有独立取消握手。
+当前为单 hart 线程组和位图 pending；尚无实时信号队列、sigaltstack、signalfd、控制终端语义或 SMP 同步。libc 内部信号可走线程定向路径，但不据此宣称完整实时信号排队。siginfo 提供 SI_USER/SI_TKILL sender、孤儿组 SI_KERNEL 来源以及下述同步故障信息。组 stop/continue 与致命取消不能直接释放睡眠中的任务栈；不可中断的 vfork 有独立取消握手。
+
+## 同步故障
+
+U-mode 未映射/权限页故障分别记录 SIGSEGV/SEGV_MAPERR、SEGV_ACCERR，文件 EOF/I/O fault 记录 SIGBUS/BUS_ADRERR，`si_addr` 为故障 VA。非法指令与断点为 SIGILL/ILL_ILLOPC、SIGTRAP/TRAP_BRKPT；access/misaligned cause 按固定 Linux 映射，`si_addr` 为 PC。来源为本地 `references/linux/arch/riscv/kernel/traps.c`、`arch/riscv/mm/fault.c`、`kernel/signal.c::force_sig_info_to_task`，commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`。
+
+线程有一个独立同步故障记录，经统一用户返回路径优先选取；交付 handler 时保留故障 PC，可由 handler 修复映射后重试，或修改 ucontext 跳过指令。被阻塞或忽略的致命同步信号改为默认动作并解除阻塞；默认动作终止全组。坏 signal frame 同样终止全组。fork/exec 清除故障记录；syscall 用户复制仍返回 EFAULT，内核自身 trap 仍 fatal。
+
+`tests/userland/fault_signals.h` 验证 SEGV/BUS/ILL/TRAP siginfo、修复/上下文返回、默认组退出、阻塞/忽略和坏 frame；`tests/diff-abi/signals.c` 的 5 条真实故障对照固定 Linux，累计 1091 条差分一致。sigaltstack、ptrace、实时队列及 SMP 不在本次交付中。

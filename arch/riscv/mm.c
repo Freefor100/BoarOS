@@ -3059,7 +3059,7 @@ static enum kernel_mm_status resolve_user_fault_once(
         return status_from_vma(vma_status);
     }
     if ((vma.permissions & access) == 0U) {
-        return KERNEL_MM_STATUS_NOT_MAPPED;
+        return KERNEL_MM_STATUS_ACCESS;
     }
     sv39_status = riscv_sv39_user_lookup(&record->space,
                                          virtual_address,
