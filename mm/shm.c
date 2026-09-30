@@ -99,11 +99,6 @@ int kernel_shm_get(struct kernel_task *caller, int32_t key, uint64_t size,
     if (out_shmid == 0) {
         return -KERNEL_EFAULT;
     }
-    if (size < KERNEL_SHMMIN || size > KERNEL_SHMMAX) {
-        return -KERNEL_EINVAL;
-    }
-
-    uint64_t aligned_size = (size + BOAROS_PAGE_SIZE - 1U) & ~BOAROS_PAGE_MASK;
     int32_t caller_pid = current_tgid(caller);
 
     uintptr_t irq = riscv_interrupt_save();
@@ -135,6 +130,13 @@ int kernel_shm_get(struct kernel_task *caller, int32_t key, uint64_t size,
             return -KERNEL_ENOENT;
         }
     }
+
+    /* 已有 key 的 size=0 是查找；创建下限只约束新段。 */
+    if (size < KERNEL_SHMMIN || size > KERNEL_SHMMAX) {
+        riscv_interrupt_restore(irq);
+        return -KERNEL_EINVAL;
+    }
+    uint64_t aligned_size = (size + BOAROS_PAGE_SIZE - 1U) & ~BOAROS_PAGE_MASK;
 
     /* Allocate new slot */
     int slot_idx = -1;

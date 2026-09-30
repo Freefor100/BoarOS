@@ -35,6 +35,8 @@
 
 ## VMA 与架构集成
 
+命名 key 查找先检查已存在段、`CREAT|EXCL` 冲突及请求大小是否超过原段；`size=0` 可查找已有段。缺失 key 且无 `CREAT` 返回 `ENOENT`；只有新建段才检查 `SHMMIN/SHMMAX`。固定 ABI 依据为本地 `references/linux/ipc/shm.c` 的 `newseg`/`shm_more_checks` 与 `references/linux/ipc/util.c`，commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`。
+
 - VMA 使用 `KERNEL_VMA_KIND_SYSV_SHM` 与 `KERNEL_VMA_FAULT_ANON_SHARED`。
 - `mm/vma.c` 的 `can_merge()` 显式禁止合并 SysV SHM VMA，确保各附加段的边界、起始地址与生命周期独立。
 - `arch/riscv/mm.c` 在 `kernel_mm_fork()` 时遍历继承的 VMA 递增 `segment->nattch`；在 `kernel_mm_munmap()` 与 `kernel_mm_release()` 时对被移除的 SysV SHM VMA 调用 `kernel_shm_on_vma_detach()` 递减 `nattch` 并触发末引用清理。

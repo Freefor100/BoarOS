@@ -90,6 +90,34 @@ void abi_shm_cases(void)
     abi_record("shm.get-named-existing",
                shmid_lookup == shmid_named ? 0 : -1, -1, -1, 0, 0, 0);
 
+    const long lookup_flags[] = {0, ABI_IPC_CREAT, ABI_IPC_EXCL,
+                                ABI_IPC_CREAT | ABI_IPC_EXCL};
+    const long sizes[] = {0, 4096, 8192};
+    const char *existing_names[3][4] = {
+        {"shm.lookup-zero", "shm.lookup-zero-create", "shm.lookup-zero-excl", "shm.lookup-zero-create-excl"},
+        {"shm.lookup-size", "shm.lookup-size-create", "shm.lookup-size-excl", "shm.lookup-size-create-excl"},
+        {"shm.lookup-large", "shm.lookup-large-create", "shm.lookup-large-excl", "shm.lookup-large-create-excl"},
+    };
+    for (unsigned size_index = 0; size_index < 3; size_index++) {
+        for (unsigned flag_index = 0; flag_index < 4; flag_index++) {
+            ret = sys_shmget(named_key, sizes[size_index], lookup_flags[flag_index] | 0600);
+            abi_record(existing_names[size_index][flag_index],
+                       ret < 0 ? ret : ret == shmid_named ? 0 : -1, -1, -1, 0, 0, 0);
+        }
+    }
+    const char *missing_names[2][4] = {
+        {"shm.missing-zero", "shm.missing-zero-create", "shm.missing-zero-excl", "shm.missing-zero-create-excl"},
+        {"shm.missing-size", "shm.missing-size-create", "shm.missing-size-excl", "shm.missing-size-create-excl"},
+    };
+    for (unsigned size_index = 0; size_index < 2; size_index++) {
+        for (unsigned flag_index = 0; flag_index < 4; flag_index++) {
+            long key = named_key + 1 + size_index * 4 + flag_index;
+            ret = sys_shmget(key, sizes[size_index], lookup_flags[flag_index] | 0600);
+            abi_record(missing_names[size_index][flag_index], ret < 0 ? ret : 0, -1, -1, 0, 0, 0);
+            if (ret >= 0) abi_require(sys_shmctl(ret, ABI_IPC_RMID, 0) == 0);
+        }
+    }
+
     /* 4. shmat errors */
     ret = sys_shmat(-1, 0, 0);
     abi_record("shm.at-invalid-id", ret, -1, -1, 0, 0, 0);
