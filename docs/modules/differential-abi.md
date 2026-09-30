@@ -44,9 +44,26 @@ Linux PID 1 在完整输出后 sync 并 reboot poweroff；同一程序在 BoarOS
 fixture 内 `/dev/console` 是由 debugfs 创建的字符设备 inode，用于 Linux init
 标准流；无需宿主 root 或 loop mount。
 
+## 独立 Review 组合边界（2026-09-30）
+
+当前完整同 ELF 差分为 **1091 条匹配**。相对 Review 起点的 1031 条，
+新增 `shm.c` 的 key/size/flags 20 条、附件片段计数与固定替换 18 条、权限上限 8 条，
+`socket.c` 的跨向量整包/零消息/复制 fault/64 KiB 边界 9 条，以及 `signals.c` 的
+真实 SEGV MAPERR/ACCERR、BUS、ILL、TRAP 故障信息 5 条。
+来源 pin、OOM、取消及整次文件写竞争另由 scale、io-sleep 与真实 musl 回归保护，
+不把内部探针计入这 1091 条 ABI 记录。
+
+生产内核 SHA-256 `0c0c6a77f54160c06f284f19133b6bb6516f7c6e2d8dcb5f0864390ce1361fbb`，
+用户 ELF `b53026fb30cd2cbeb4f47f275d46b3a69832c1a2997f5a4a75b0c869cebf4668`，
+案例清单 `d730732c4add15275ccb0e9bd7cf35d398948f8af3692529f23de875e0707309`，
+Linux Image `01d60a8ae733f56aa94cf11b4805da1fe876cac09d2ef81e7e7397568ee1f668`。
+实际 QEMU 11.1.1；`make test-diff-abi-riscv` 使用正式默认预算退出 0，
+18 项宿主协议测试也通过。同一生产源码的 RV64 全套、四组合 io-sleep、scale 与
+栈检查通过，生产内核通过 musl 和 glibc 五种形态；完整比赛 Harness 因无 `kernel-la` 保持阻塞。
+
 ## 进程、随机与调度阶段（2026-09-29）
 
-当前完整同 ELF 差分为 **1000 条匹配**：本阶段新增 coarse clock 14、随机接口 34、
+该阶段完整同 ELF 差分为 **1000 条匹配**：本阶段新增 coarse clock 14、随机接口 34、
 会话/进程组 105、RT proc 控制 36、调度策略 23 与 proc 调度字段 5 条。
 `session.c` 必须在删除 `/init` 的 proc 用例之前运行，使 exec 子进程仍有真实来源。
 `rt_controls.c` 自建独立 proc 挂载；配置用例退出前恢复预算，后续策略测试不依赖残留状态。

@@ -36,7 +36,7 @@ BoarOS 是从零搭建、面向 OS Comp 能力建设的 C / 少量汇编内核�
 
 客体内固定 Alpine v3.22 RV64 GCC 14.2.0-r6 已在同一离线镜像上完成预处理、编译、汇编、静态链接和运行；固定 Linux 与 BoarOS 的五阶段状态、产物哈希和输出一致。同一编译流程也通过 tmpfs 工作目录；产物复制到根盘供比对，不代表 tmpfs 持久。范围是固定的小型 C 负载，其他项目和 Rust 尚未验收。
 
-固定 BusyBox/libc-test 最近一次全量清单为 228 项、227 项双侧通过，原 BusyBox 包装器内部 53/55 成功，dmesg 缺 klogctl、hwclock 缺 RTC 字符接口；身份、日期及逐项边界见[程序清单](docs/learning/user-program-inventory.md)。通用 ABI 差分 1000 条匹配，包含 tmpfs、硬链接与共享映射时间语义；成本门禁见[单核规模回归](docs/learning/single-hart-scale.md)，不以 QEMU 墙钟倍数宣称性能。
+固定 BusyBox/libc-test 最近一次全量清单为 228 项、227 项双侧通过，原 BusyBox 包装器内部 53/55 成功，dmesg 缺 klogctl、hwclock 缺 RTC 字符接口；身份、日期及逐项边界见[程序清单](docs/learning/user-program-inventory.md)。当前通用 ABI 差分 1091 条匹配，包含 SysV 附件片段/权限、AF_UNIX 整包及同步故障边界；成本门禁见[单核规模回归](docs/learning/single-hart-scale.md)，不以 QEMU 墙钟倍数宣称性能。
 
 ## 构建与验证
 
@@ -90,7 +90,7 @@ make test-references
 
 [开发路线](docs/goals.md)统一记录本轮任务、分支交接和后续依赖。通用兼容性在 `main`，比赛环境与运行入口在 `oscomp-rv-compat`；后者单向合入已验收主线。只跑 RV 的原 judge 评分不等于双架构比赛交付，也不能把逐组诊断分数拼成正式总分。
 
-已按统一 VFS 对象路线分阶段拆分 ext4 后端、实现挂载路径和首批真实 procfs。真实内存快照、RV64 sysinfo、后台写回及 proc fd 复用压力已接入；统一内存后备对象、tmpfs、硬链接和真实第二 ext4 磁盘已接入，验收见[多挂载证据](docs/learning/memory-backed-mounts.md)。会话/进程组、可信随机数、真实调度、coarse clock、AF_UNIX socketpair 与 SysV 共享内存已完成初始验收，新增 attachment/VMA 片段生命周期及 OOM 组合回归；同期量化文件写入、同步、扫描和锁等待成本，再依据证据选择优化。随后分别闭环日志/RTC 用户接口，iperf、netperf、iozone 继续独立定位。SMP、LoongArch、实板和更大工具链按新基线另行排期。
+已按统一 VFS 对象路线分阶段拆分 ext4 后端、实现挂载路径和首批真实 procfs。真实内存快照、RV64 sysinfo、后台写回及 proc fd 复用压力已接入；统一内存后备对象、tmpfs、硬链接和真实第二 ext4 磁盘已接入，验收见[多挂载证据](docs/learning/memory-backed-mounts.md)。独立 Review 的 R1–R8 已修复：覆盖 SysV owner/片段/权限、msync 来源 pin、AF_UNIX 整包、同步信号与 inode 整次写/截断互斥；完整 RV64、musl/glibc、差分及 WAL 恢复矩阵通过，见[路线与验收](docs/goals.md)。下一步量化文件写入、同步、扫描和锁等待成本，再依据证据选择优化。随后分别闭环日志/RTC 用户接口，iperf、netperf、iozone 继续独立定位。SMP、LoongArch、实板和更大工具链按新基线另行排期。
 
 - [文档导航](docs/README.md)：模块契约与可复用学习材料。
 - [工程原则](docs/design.md)与[贡献说明](CONTRIBUTING.md)：技术取舍、验证与提交边界。

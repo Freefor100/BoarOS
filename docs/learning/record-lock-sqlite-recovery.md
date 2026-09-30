@@ -139,3 +139,38 @@ WAL 三种策略分别重新枚举为 42 事件（26 写、16 flush），126 个
 每次都从当前源码构建内核并重新枚举事件，不能强制期待此处历史事件数量。
 宿主 `make test-lwext4-host test-lwext4-instances-host test-lwext4-rename-host test-lwext4-metadata-host test-lwext4-recovery-host` 同轮全部通过，包含硬链接
 创建/删除/替换、1024/4096 几何、extent/indirect 与 orphan file/chain 恢复。
+
+## 独立 Review 与整次写门闩阶段（2026-09-30）
+
+R7 将不同 OFD 的 write/writev/pwrite/append 与 truncate 按 inode 整次互斥；
+fault 和 writeback 不取得该门闩，同 inode 文件映射输入的冷页等待由实际调度器回归保护。
+这保证操作边界，不能据此承诺一条 write 断电原子提交。R3 的 msync 来源 pin
+亦在本轮保住睡眠期间的 MM registry owner；相关契约见[可睡眠存储](sleepable-storage.md)
+和[内存管理](memory-management.md)。
+
+最终生产内核 SHA-256 `0c0c6a77f54160c06f284f19133b6bb6516f7c6e2d8dcb5f0864390ce1361fbb`；
+WAL 多进程 ELF `93ce05060ea2f64cf11c5aed00e2b5a8315eda609fec8267119a88df0b5ca6fe`，
+恢复 ELF `179be6d2e5ab52c908d4e0547225e7999d9e404ffd05c12f404e9f170fdca5e0`，
+NBD 服务 `ac92fd5558bfc553f3f122c391fc32d8cbffb87fd2c6853a1149d87873d69370`，
+runner `1ceb90862df125ccd112d23b363ad4c4051a4a78cf7d1b56b5e28d3cbf37bec6`，
+Linux Image `01d60a8ae733f56aa94cf11b4805da1fe876cac09d2ef81e7e7397568ee1f668`。
+SQLite 固定归档仍为 `references/sqlite/sqlite-amalgamation-3530400.zip`，SHA-256
+`1e71ddf93849c6a6ecf58b827c0692073d2dd7ee40196158068f7b29f422e87d`；
+固定 Linux/QEMU 源码版本同上，实际 QEMU 11.1.1，单 hart 隔离 NBD 镜像。
+
+同 ELF 的 Linux/BoarOS WAL writer 竞争与独立重启读回通过；同恢复 ELF 的固定 Linux
+setup/mutate/recover 通过。BoarOS EXTRA/FULL、hot journal、已确认提交和写/flush
+错误传播通过。完整 WAL 矩阵重新枚举 42 个事件（26 write、16 flush），
+丢弃、保存奇数、逆序保存三种策略各 42 个切点，共 126 次；另逐点注入 26 个写失败
+和 16 个 flush 失败。168 个场景均实际命中注入，完成两次恢复、整事务内容与
+`e2fsck -fn` 检查，三个入口均退出 0。本轮没有重跑 DELETE 完整矩阵，历史证据仍按上节快照归属；
+WAL 结果不扩大到实板掉电或吞吐/延迟结论。
+
+可重建命令：
+
+```sh
+make test-files-partial-write-riscv test-userland-riscv
+make test-io-sleep-riscv test-sqlite-wal-riscv
+make test-sqlite-wal-recovery-riscv test-sqlite-wal-recovery-matrix-riscv
+make test-riscv test-glibc-riscv test-diff-abi-riscv test-scale-riscv test-stack-usage
+```

@@ -5,15 +5,32 @@
 Linux 为 `references/linux` 的 `f4cdf7ca9a1fdcca413157df19753f388a5a224e`。
 历史评审是调查输入，不自动成为设计批准。
 
-本页于 `main@959da70` 完成实现/文档审计；本次只整理文档，没有重跑完整验收。
+此前于 `main@959da70` 完成仅文档审计；下面独立 Review 小节记录新一轮实际修复与验证。
 下列“已交付”引用该阶段证据，“未实现”据当前源码，“待定位”不等于已证实内核缺陷。
+
+## 独立 Review 的组合边界（2026-09-30）
+
+核实起点为 `main@d2a548d`，Review ZIP SHA-256 为 `c462c3a48c6ed22ea83118c4117a9d113f25e455192a9224016aeb8166bb0c7f`；八个关键文件与该起点一致。旧 1031 条 ABI、VMA/scale 基线缺少本次组合边界，不能反证本次缺陷。修复后新增回归先证伪旧实现，最终 1091 条固定 RV64 Linux/BoarOS 记录一致。完整 RV64、musl、glibc 五种形态、四组合 io-sleep、scale 与栈检查通过；栈静态分析覆盖 1674 函数，最大 2368 字节。SQLite WAL/重启双侧及当前内核的 126 切点、26 写失败、16 flush 失败恢复矩阵通过，固定输入见[恢复记录](learning/record-lock-sqlite-recovery.md)。独立全改动审查未发现 Critical/Important 缺陷。
+
+完整比赛 Harness 保持阻塞、未执行：本地 `references/oscomp-autotest/kernel/run.py`（commit `d1bb3a3c4b27274e196a2648518525c1a304e339`）同时启动 `kernel-rv` 与 `kernel-la`，当前 `make all` 只有前者且后者缺失。不能以本轮 RV64 测试替代双架构验收；本轮没有 push、发布或阶段转换。
+
+2026-09-30 独立 Review 的组合边界修复：
+
+- [x] R1（`a30eb8e`）：SHM 附加 registry OOM 回滚不消费段表 owner；scale 聚焦故障后重试及最终页回收通过。
+- [x] R2（`722d35d`）：显式 attachment 与通用 VMA 片段 open/close；覆盖分裂、起始页撤销、RMID、匿名/文件/SHM 固定替换、fork/退出与 metadata/page OOM，保持 prepare/commit 失败原子性。
+- [x] R3（`aba2862`）：file-source 操作 pin 覆盖 msync 的 inode 等待与错误游标；三任务最后撤映射、终止请求、同步/关闭失败及最终清理通过四种 io-sleep 配置。
+- [x] R4（`179bb2f`）：AF_UNIX DGRAM 整包复制/提交、零消息和整包预算；差分、scale OOM/fault/容量复用与真实 pthread 整包等待/取消通过。
+- [x] R5（`15f7615`，完成断言修正 `3b55d3e`）：线程同步故障记录与统一返回交付、si_code/si_addr、阻塞/忽略强制默认；真实 U-mode 修复/上下文返回、坏帧和默认组退出及 5 条固定 Linux 故障差分通过。
+- [x] R6（`f5c6c96`）：通用 `maximum_permissions` 替代文件专用布尔量；只读附件 WRITE 升级在 PTE 修改前返回 EACCES，split/fork 保留上限，8 条新增固定 Linux 差分通过。
+- [x] R7（`1d9b814`）：rank 15 inode 写操作门闩覆盖整次 write/writev/pwrite/append/同步收尾与截断；四种 io-sleep 配置、同 inode 缺页缓冲、实际 U-mode 向量追加和 partial-write 通过。SQLite WAL/重启双侧及完整 WAL 恢复矩阵通过。
+- [x] R8（`8a005cb`）：已有 key 的零大小查找与创建下限分开；已有/缺失 key、零/合法/超原段大小、CREAT/EXCL 的 20 条新增固定 Linux 差分通过。
 
 ## 已交付：进程身份、可信随机数与真实调度
 
 从 `main@b5593ca` 演进，统一 TID/TGID/PGID/SID 身份对象、会话/进程组、
 coarse clock、VirtIO RNG 与随机接口，以及 OTHER/FIFO/RR、CPU0 affinity 和
 全局实时带宽已交付。默认周期 1 秒、预算 950 毫秒是本项目选定参数。
-完整差分 **1000 条匹配**；228 项清单 **227 pass、原 BusyBox 包装器 1 项失败**，
+该阶段完整差分 **1000 条匹配**；228 项清单 **227 pass、原 BusyBox 包装器 1 项失败**，
 逐 ID 无回退。固定 BusyBox、libc daemon、原 iperf/cyclictest 的实际调用链、
 原静态/动态 utime 各 30 次双侧复跑，以及普通/实时双盘进展均有证据。
 RISC-V、userland/glibc、规模、睡眠 I/O、栈、离线 GCC ext4/tmpfs、ext4 恢复与
@@ -36,7 +53,7 @@ SQLite DELETE/WAL 完整矩阵通过；不同验证快照的边界明确分列�
 | 通用 VFS、挂载路径、proc 代次/OFD、fd 复用压力 | [VFS](modules/vfs-ext4.md)、[procfs](modules/procfs.md) |
 | 真实内存/sysinfo、阈值写回、水位回收、可睡眠 I/O | [内存](learning/memory-management.md)、[存储](learning/sleepable-storage.md) |
 | 统一内存后备、tmpfs、硬链接、真实第二盘 | [多挂载验收](learning/memory-backed-mounts.md)、[tmpfs](modules/tmpfs.md)；该阶段为 783 条 ABI |
-| 最新进程/随机/调度与完整存储矩阵 | [消费者](learning/session-consumers.md)、[程序清单](learning/user-program-inventory.md)、[恢复](learning/record-lock-sqlite-recovery.md)；当前为 1000 条 ABI |
+| 进程/随机/调度与完整存储矩阵阶段 | [消费者](learning/session-consumers.md)、[程序清单](learning/user-program-inventory.md)、[恢复](learning/record-lock-sqlite-recovery.md)；该阶段为 1000 条 ABI |
 
 正常开发沿 main；评测分支只单向接收已验收主线，其 uname/镜像适配和正式成绩
 不合回通用实现。旧评测结果不是本轮成绩，分支交接、push、发布及正式评分由维护者决定。
@@ -81,7 +98,7 @@ SQLite DELETE/WAL 完整矩阵通过；不同验证快照的边界明确分列�
 
 `busybox.official` 是唯一未通过的顶层清单案例，但内部为 **53/55**：dmesg 与 hwclock
 失败。Linux 同脚本 55/55；shell exit 0 不代表断言通过。df 根盘展示另有内容缺口。
-这不缩减上表范围，也不表示 1000 条 ABI 覆盖所有 Linux 接口。
+这不缩减上表范围，也不表示当前 1091 条 ABI 覆盖所有 Linux 接口。
 
 ## 后续开发顺序与进入条件
 
@@ -91,8 +108,8 @@ AF_UNIX/socketpair 与 SysV 共享内存已在本轮分别交付并闭环验证�
 
 | 阶段 | 工作与最小交付 | 进入下一步的证据 |
 |---|---|---|
-| 下一轮 A：IPC 最小复现与设计 | 固定 hackbench、iozone 原 ELF/参数，分别确认 socketpair 类型和 shmget 后续 shmat/shmdt/shmctl 调用；比较 owner/限额方案后确认路线 | 原失败、Linux 同输入、所需 syscall/flags、退出路径及资源基线；未到达的调用不标失败 |
-| 下一轮 B：分问题交付 IPC | N2 的 AF_UNIX/socketpair 与 P4f 的 SysV shm 各自提交；复用 OFD/等待队列和内存后备对象，不捆绑成一个大事务 | 生命周期、fork/exec/退出、fault/OOM、并发关闭/删除、ID 复用差分；原程序真实越过旧点，完整运行或列出后续首个阻塞 |
+| 已完成：IPC 复现与路线 | 固定 hackbench、iozone 原 ELF/参数并确认调用链；AF_UNIX 复用 socket endpoint/OFD，SysV 段表复用 memory_object，路线已选定 | 原失败、所需 syscall/flags 与后续阻塞记录在 N2/P4f；不把未到达调用标失败 |
+| 已交付：IPC 与组合边界 | N2 的 AF_UNIX/socketpair 与 P4f 的 SysV shm 各自提交；本轮 R1/R2/R4/R6/R8 继续修复 owner、片段、权限和整包契约 | 生命周期、fork/exec/退出、fault/OOM、并发关闭/删除、ID 复用差分通过；原程序后续能力与本轮回归分别记证据 |
 | 同期诊断：存储成本 | 对 iozone 慢写和小写同步建立计数分解，先分离缓存接收、写回、journal/flush、扫描和锁等待 | 固定负载/容量/缓存/同步语义；因果证据达到下节门槛后才选优化，不以 QEMU 墙钟倍数定瓶颈 |
 | 随后：系统环境小闭环 | P5c 分别设计真实日志读取、RTC 字符节点；单独核实 df 根盘来源展示 | 原 BusyBox 55 子项及实际内容；dmesg 来自真实日志，hwclock 来自设备读数；不得改包装器或用空成功 |
 | 持续：真实消费者诊断 | iperf/netperf 使用受控监听端、网络配置和固定参数；iozone 日期、其余 libc/LTP 单独复现 | 区分启动环境、无监听、ABI、协议和预算；cyclictest 的 mlock、LTP 的 chown/cgroup 各自归属，不能由一次 ENOSYS 推出完整子系统范围 |
@@ -112,16 +129,16 @@ AF_UNIX/socketpair 与 SysV 共享内存已在本轮分别交付并闭环验证�
 - [ ] 根据测量选择一次可归因改动，保留无收益结果；周期清脏会改变策略，不能以“优化”名义默默加入已明确排除的功能。
 - [ ] 涉及写回/事务/队列时重跑错误 owner、退出卸载、双盘隔离与 SQLite DELETE/WAL 完整恢复矩阵；按新事件轨迹枚举，不削弱 flush 契约换成绩。
 
-### 待确认的机制候选
+### 既有 IPC 路线与待确认的存储候选
 
-| 问题 | 真实候选与比较；目前不作架构批准 |
+| 问题 | 候选比较与当前路线 |
 |---|---|
-| SysV shm 对象 | ① 专用 key/id 表与 segment owner，复用 memory_object：直接表达 RMID/attach，新增 IPC 生命周期代码；② 以内核匿名内存文件作 segment 后备：可复用文件映射/截断接口，但需证明隐藏挂载、名字和 fd 生命周期不会泄漏为 SysV 语义。两者都必须处理 ID 代次、末 attach、权限/限额及 fork/exec；不能简单返回一块匿名内存。 |
-| AF_UNIX/socketpair | ① socket endpoint 内复用现有缓冲/等待原语：易统一 poll/关闭，但必须明确 stream/datagram 差异；② 独立本地传输后端接同一 OFD：便于以后名字空间/SCM_RIGHTS，但新增 endpoint 交接接口。不能将两根 pipe 的 fd 直接冒充 socket ABI。 |
+| SysV shm 对象 | 已采用专用 key/id 表与 segment owner，复用 memory_object，并在 R2 增加稳定 attachment。匿名内存文件路线可复用文件接口，但增加隐藏挂载、名字与 fd 生命周期隔离成本，未采用。 |
+| AF_UNIX/socketpair | 已采用 socket endpoint 内的缓冲/等待原语；R4 单独维护整包 owner 与预算。独立本地传输后端便于以后名字空间/SCM_RIGHTS，但增加 endpoint 交接接口，未采用。 |
 | 存储瓶颈 | ① 若扫描占比高，增加脏页/范围索引，成本是索引内存与失效一致性；② 若小请求/屏障放大占比高，批量数据提交或事务合并，收益需覆盖错误归属与恢复复杂度；③ 若锁等待主导，缩小路径/inode/实例临界区，需新增 pin/版本复查而非单纯删锁。按数据选，不能预先三项全做。 |
 
 SysV/UNIX 固定语义入口分别为本页 Linux commit 的 `ipc/shm.c`、`ipc/util.c` 与
-`net/unix/af_unix.c`。实施前补齐对应真实 flags、异常和成本调查，再由维护者确认路线。
+`net/unix/af_unix.c`。既定路线内的小修继续验证；新的结构性存储优化仍须先测量，再由维护者确认路线。
 水位/预算不承诺任意分配成功或硬实时；push、发布、评测分支交接与正式评分仍由维护者决定。
 
 ## 已完成能力的证据入口
@@ -157,6 +174,22 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 ```
 
 箭头表示主要验收依赖，不禁止先做块 flush、试跑 SQLite/编译器或启动第二架构。网络不依赖多核编译；匿名共享不必等文件持久化；2 hart 启动不等于 SMP 已完成。
+
+## Review P-A–P-E：成本核实与测量门槛
+
+这些是源码成本结构，尚无本轮延迟/吞吐收益结论。deadline 结构、选择性唤醒和驻留范围索引重构继续等待测量与路线确认。已有 scale 的页解析/PTE 访问计数不能代替以下各层总成本。
+
+| 项目 | 当前核实 | 待测工作负载和验收门槛 |
+|---|---|---|
+| P-A deadline | `kernel/sched/wait.c::kernel_scheduler_expire_deadlines` 每 tick 遍历全部 blocked，包括无 deadline 的等待者 | 固定少量到期任务，增加无期限 blocked；计扫描节点、最大 IRQ 占用、到期偏差。保持超时/取消一致后，才比较独立定时结构。 |
+| P-B 改权 | `arch/riscv/mm.c::kernel_mm_mprotect` 仍遍历全部 file_residents；R6 权限上限检查已限定到重叠 VMA，数组编辑/合并成本仍在 | 固定单页目标，增加无关 VMA/驻留页；把 prepare/commit、resident 与 PTE 访问都计入，禁止只报告目标页计数。先获得总探测数，再选择范围索引。 |
+| P-C 唤醒 | `kernel/sched/sync.c::kernel_lock_release` 在可用时 wake_all，等待写者阻止新读者；新写门闩复用这一机制 | 独立 inode 与同 inode 混合读写，计有效唤醒、再次睡眠、切换、等待分位与最长饥饿。保持取消/超时与进展，不直接改 wake_one。 |
+| P-D 小写 | 普通文件/TCP 非零请求仍分配整页 staging；AF_UNIX DGRAM 已改整包 heap owner，有界为 64 KiB | 1/3/63/64/65/4096 字节 × 缓存冷/热，计每调用物理/heap 分配、复制字节和峰值所有权。优化后须保留 fault/OOM/退出清理与消息原子性。 |
+| P-E 延迟 | `arch/riscv/trap_entry.S` 至用户返回保持 SIE 关闭；缓存命中的大复制/扫描可能无睡眠点 | 固定大复制/改权与独立唤醒任务，计 irq-off 最大值、锁持有/等待、唤醒到运行延迟和切换。先明确重入约束，不随意开中断/yield，不承诺硬实时。 |
+
+- [ ] 补上述计数/时间观测，并保存固定 kernel/ELF/QEMU 身份、输入规模与可重建命令。
+- [ ] 在新写操作门闩下分别测同 inode 串行化和独立 inode 进展；包含同 inode 用户缓冲 fault、O_SYNC 和截断竞争，区分正确性成本与后端 I/O 成本。
+- [ ] 有测量后再比较候选，沿既有 owner、锁 rank、失败原子性和单 hart/SMP 边界验收。未经新证据不关闭这些待办。
 
 ## P0：固定证据与时序问题
 
@@ -382,20 +415,8 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 
 ### P4f SysV IPC
 
-2026-09-30 独立 Review 的组合边界修复：
-
-- [x] R5：线程同步故障记录与统一返回交付、si_code/si_addr、阻塞/忽略强制默认；真实 U-mode 修复/上下文返回、坏帧和默认组退出及 5 条固定 Linux 故障差分通过。
-- [x] R7：rank 15 inode 写操作门闩覆盖整次 write/writev/pwrite/append/同步收尾与截断；四种 io-sleep 配置、同 inode 缺页缓冲、实际 U-mode 向量追加和 partial-write 通过。SQLite WAL/重启双侧通过，完整恢复矩阵正在本轮收口。
-- [x] R4：AF_UNIX DGRAM 整包复制/提交、零消息和整包预算；差分、scale OOM/fault/容量复用与真实 pthread 整包等待/取消通过。
-- [x] R3：file-source 操作 pin 覆盖 msync 的 inode 等待与错误游标；三任务最后撤映射、终止请求、同步/关闭失败及最终清理通过四种 io-sleep 配置。
-
-- [x] R1：SHM 附加 registry OOM 回滚不消费段表 owner；scale 聚焦故障后重试及最终页回收通过。
-- [x] R2：显式 attachment 与通用 VMA 片段 open/close；覆盖分裂、起始页撤销、RMID、匿名/文件/SHM 固定替换、fork/退出与 metadata/page OOM，保持 prepare/commit 失败原子性。
-- [x] R6：通用 `maximum_permissions` 替代文件专用布尔量；只读附件 WRITE 升级在 PTE 修改前返回 EACCES，split/fork 保留上限，8 条新增固定 Linux 差分通过。
-- [x] R8：已有 key 的零大小查找与创建下限分开；已有/缺失 key、零/合法/超原段大小、CREAT/EXCL 的 20 条新增固定 Linux 差分通过。
-
 - [x] 当前 shmget/shmat/shmdt/shmctl 均已接入；针对 IPC_PRIVATE 与命名 key、段大小对齐与 Linux 布局完成 194–197 系统调用接入。
-- [x] 确认 key/id/代次、segment 与 attach 的 owner、IPC_RMID 后存活/末引用释放、fork 继承与 exec/退出分离，以及权限/限额/OOM/fault 回滚；统一后备对象作为物理页后备，由 VMA 原生扩展持有 segment 引用并在 detach/exit/exec 时维护 nattch。
+- [x] 确认 key/id/代次、segment 与 attach 的 owner、IPC_RMID 后存活/末引用释放、fork 继承与 exec/退出分离，以及权限/限额/OOM/fault 回滚；统一后备对象作为物理页后备。本轮 R2 将 VMA 裸 segment 借用改为 attachment 引用，并在通用 VMA 编辑/销毁处维护 nattch。
 - [x] 验证跨进程/不同地址、删除后已有映射、ID 反复复用、部分失败与资源基线；Linux 差分 ABI 新增 19 条全部一致（累计 1031 条），用户态多进程 fork/shmdt/IPC_RMID 与裸机 scale 测试全数通过，关机物理页完全回收。SysV semaphore/message queue 不自动纳入本阶段。
 
 ## P5：glibc、exec 与单核真实工具链

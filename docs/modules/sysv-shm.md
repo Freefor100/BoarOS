@@ -27,9 +27,9 @@
    - 段彻底销毁时对应槽位的 `seq` 计数自增，避免悬空 ID 与 ABA 别名冲突。
 3. **延迟销毁语义（`IPC_RMID`）**：
    - 调用 `shmctl(shmid, IPC_RMID, NULL)` 时：
-     - 若当前附加计数 `nattch == 0`，立即释放物理页与内存对象，槽位复位。
-     - 若当前 `nattch > 0`，标记 `marked_for_deletion = 1`。后续对该段的 `shmat` 拒绝附加（返回 `-EINVAL`），`shmget` 不再能按 key 查找到该段。已有附加的虚拟内存映射保持有效并可正常读写。
-     - 随 `shmdt`、`munmap`、进程 `exit` 或 `execve` 接触附加，当最后一个片段及临时 attachment owner 消失时，触发物理资源与段槽位的彻底释放。
+     - 若当前片段计数 `nattch == 0` 且逻辑 attachment owner 数 `attachments == 0`，立即释放物理页与内存对象，槽位复位。
+     - 否则标记 `marked_for_deletion = 1`。当前后续对该段的 `shmat` 拒绝附加（返回 `-EIDRM`），`shmget` 不再能按 key 查找到该段。已有附加的虚拟内存映射保持有效并可正常读写。Linux 允许对仍存活的 RMID 段再次附加；该基线既有限制未在本次 R1–R8 中扩展。
+     - 随 `shmdt`、`munmap`、进程 `exit` 或 `execve` 解除附加，当最后一个片段及临时 attachment owner 消失时，触发物理资源与段槽位的彻底释放。
 4. **`IPC_STAT` 与 `SHM_DEST` 标志**：
    - 当段已被 `IPC_RMID` 标记删除但仍有附加时，`shmctl(..., IPC_STAT, ...)` 仍可成功查询，并在 `shm_perm.mode` 中反映 `SHM_DEST`（01000）标志位，符合 Linux 原生行为。
 
