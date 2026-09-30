@@ -78,4 +78,7 @@ AF_UNIX DGRAM 的成本边界为每条消息最多 64 KiB 连续暂存与一次�
 聚合主体 5320 字节，DTB timebase 10 MHz。固定参考继续是
 `references/linux@f4cdf7ca9a1fdcca413157df19753f388a5a224e` 与
 `references/qemu@84f07211cc5b4fc6a371559bf8a5de4fb068e648`；实际 QEMU 为 11.1.1。
-这些是接口与检错证据，C1–C6 尚未给出瓶颈或性能结论。
+这些是该 C0 阶段的接口与检错证据，当时 C1–C6 尚未测量；最终计数、扰动和候选见下方成本基线。
+
+2026-09-30 的最终 C0–C6 测量、观测扰动、消费者阻塞及优化候选见[成本基线](cost-baseline.md)，
+完整可验证计数和原消费者输出见[测量归档](cost-measurements.json)。这是主线成本诊断，未重跑评测分支原judge。

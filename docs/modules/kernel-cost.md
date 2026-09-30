@@ -50,7 +50,7 @@ staging 累计请求容量、heap 请求字节和成功物理页。短写以实�
 缓存计 bucket probes、实际复制、范围写回的两轮遍历、完整页快照与逻辑后端接受量。
 设备按 registry 的磁盘0/1/其他聚合；请求在 submit 保存标量 epoch/lane，IRQ 完成和 reset
 使用提交身份，旧请求不能污染新窗口。原设备/MM 统计契约不变，fixture 未登记设备属于 other。
-所有真实磁盘字节为 unknown_read/unknown_write，后端逻辑数据不足以证明扇区分类。
+所有提交磁盘字节为 unknown_read/unknown_write（含之后失败的请求），不表示持久字节；后端逻辑数据不足以证明扇区分类。
 复制/解析和设备请求由 scale 的独立 wrapper/原统计交叉验证；三个副本及完整窗口由
 `tests/cost-summary.py` 再验证。C1 结果和开关开销见[成本基线](../learning/cost-baseline.md)。
 
@@ -73,8 +73,8 @@ wake_to_run只含实际wake，ready_ticks另含创建/yield等就绪。关闭后
 
 C6 使用固定原镜像的ELF/脚本/依赖，逐命令保存ELF、argv、cwd、真实wait status、
 诊断timeout与原stdout/stderr。解释器路径按原ELF安装，libc目录各自指定；不改ELF或uname。
-原脚本成功不作为原命令成功证据；wait=0且无timeout且原完成marker三条件同时成立才完成。
-冻结的kernel/ELF/fixture/firmware/DTB和工具/源码身份按每启动保存，执行器串行互斥。
+原脚本成功不作为原命令成功证据；wait=0、无timeout、原完成marker及未报告所选测试不可用四条件同时成立才记所选测试完成。另保留进程完成状态与拒绝原因。
+冻结的kernel/ELF/fixture/firmware/DTB和工具/源码身份在每次启动前写入input.json并封存哈希，执行器串行互斥。
 `tests/cost-evidence.py` 压缩零指标后仍重建完整快照并核对seal，拒绝遗漏非零计数；
 持久验收再次检查epoch严格递增和直方图最大值，后台取消和回收重入OOM由独立host回归保护。
 
@@ -86,3 +86,9 @@ C6 使用固定原镜像的ELF/脚本/依赖，逐命令保存ELF、argv、cwd�
 开放状态，后续enable不能污染已完成窗口。全局cancelled的单位是丢弃的在途scope深度，
 正常exit也可能贡献，不能解释成取消用户操作数；rank取消与原wait status分别报告。
 C4按握手确认的N+4个blocked成员检查扫描max下限，遗漏扫描或只计有期限任务都会失败。
+
+最终20配置、60启动、339窗口归档及14项报告检错通过；结论见[最终成本报告](../learning/cost-baseline.md)。
+`cost-evidence.py --final --output` 接受用户 runner 列表与 io-sleep fixture 单记录，按真实配置收集三副本，
+规范化不修改封存输入，并从原消费者输出重新核对完成分类；解包会验证完整固定矩阵和全部快照seal。
+本模块验收诊断能力和真实状态记录；main 原旧glibc的uname拒绝、部分musl超时及原向量组不可用仍是消费者缺口，
+未执行兼容分支评测，也未用glibc2.44回归代替原镜像结果。

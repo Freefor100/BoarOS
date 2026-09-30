@@ -187,12 +187,12 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 | P-D 小写 | 普通文件/TCP 非零请求仍分配整页 staging；AF_UNIX DGRAM 已改整包 heap owner，有界为 64 KiB | 1/3/63/64/65/4096 字节 × 缓存冷/热，计每调用物理/heap 分配、复制字节和峰值所有权。优化后须保留 fault/OOM/退出清理与消息原子性。 |
 | P-E 延迟 | `arch/riscv/trap_entry.S` 至用户返回保持 SIE 关闭；缓存命中的大复制/扫描可能无睡眠点 | 固定大复制/改权与独立唤醒任务，计 irq-off 最大值、锁持有/等待、唤醒到运行延迟和切换。先明确重入约束，不随意开中断/yield，不承诺硬实时。 |
 
-下列 C0–C6 将这些门槛拆为下一阶段的交付任务；测量结果尚未产生，不能据源码成本结构关闭待办。
+下列 C0–C6 已交付成本诊断和真实消费者状态；受控成本证据不能代替消费者兼容通过或正式评测。
 
-## 下一阶段：成本测量优先（2026-09-30 任务计划）
+## 本轮：成本测量优先（2026-09-30 验收）
 
 维护者已选择先量化写入、扫描、唤醒和延迟，再决定优化。目标是得到能归因、可重建的
-成本基线，保护 R1–R8 已验收的行为；C0 观测窗口已实施并完成三个启动副本的契约验收；C1 写入与开关对照已交付，C2 锁等待和四组合压力观测已交付，C3–C6 正在推进，尚无新的结构优化。
+成本基线，保护 R1–R8 已验收的行为；最终完成 20 配置、60 串行独立启动和 339 观测窗口，见[最终报告与归档](learning/cost-baseline.md)。C0–C5 受控负载验收通过；C6 完整记录原消费者的完成、不可用、超时和启动拒绝，未将这些阻塞算作兼容通过。尚无新的结构优化。
 起点为本轮最终生产源码，内核 SHA-256
 `0c0c6a77f54160c06f284f19133b6bb6516f7c6e2d8dcb5f0864390ce1361fbb`，
 1091 条 ABI、四组合 io-sleep、scale 与 WAL 恢复证据见上文。
@@ -210,7 +210,7 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 | ② 仅测试链接包装器及 NBD 外部计数 | 易复用 scale/io-sleep 故障探针，基本不改生产路径；可独立校验候选①的关键计数 | 看不到 static/inline 内部扫描和完整 trap 区间，独立生产 U-mode 的归因不完整；适合辅助检错 |
 | ③ 有界事件环记录时间线 | 能还原复杂等待与嵌套关系，便于后续并发诊断 | 增加事件格式、丢失/溢出、采样和对象代次管理，扰动及存储成本更高；本阶段不建议先建通用追踪系统 |
 
-实施前确认候选①的观测接口与 owner/生命周期；当前已确认的是测量优先的范围，
+维护者已确认并实施候选①配合候选②独立检错，接口与 owner/生命周期已验收；当前已确认的是测量优先的范围，
 不是 deadline 索引、wake_one、驻留范围树或事务合并路线。关闭观测时不添加热路径工作；
 开启时所有计数按真实操作递增，不能按测例 ID/固定输入切换语义。
 
@@ -219,26 +219,26 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 不按固定扇区号或测例输入猜测。峰值统计只记录本层实际 owner，避免把同一后备页的多个引用重复当容量。
 层间嵌套时间不能直接相加当作总时间；运行、就绪等待、I/O 阻塞、主动暂扣响应分别标记。
 计时使用客体单调时钟并记录分辨率；宿主暂停、QEMU 墙钟和调度 tick 不冒充指令执行成本。
-只测连续实际运行的 IRQ-off 区间，不能把睡眠/上下文切换累计成一次关中断持有。
+按 hart 实际 SIE 跟踪连续 IRQ-off；SIE 保持关闭的上下文切换不截断，恢复中断后的睡眠不计入。采样段的前后盲区单列，不宣称硬件上界。
 
 ### C0：观测契约、固定输入与独立检错
 
 入口为 `include/arch/riscv/mm.h::riscv_kernel_mm_get_statistics`、
 `include/arch/riscv/virtio_mmio_block.h::riscv_virtio_mmio_block_get_statistics`、
 `include/kernel/sync.h` 和 `kernel/sched/scheduling.c::scheduler_account_runtime`。
-计划新增 `tests/cost-riscv.py`、`tests/test-cost-report.py` 与 Makefile 的 `test-cost-riscv`
-入口；C0 已交付这些入口。拟用默认关闭的 `COST_DIAGNOSTICS=0`；开启时由 Makefile
+已新增 `tests/cost-riscv.py`、`tests/test-cost-report.py` 与 Makefile 的 `test-cost-riscv`
+入口；C0 已交付这些入口。使用默认关闭的 `COST_DIAGNOSTICS=0`；开启时由 Makefile
 给 C/assembly 同时传递 `BOAROS_COST_DIAGNOSTICS`，不能只给 C 加标志而漏掉 trap 入口。
 诊断构建独立放 `build/cost/`，复用 `BUILD_DIR`、`KERNEL_RV` 和 `CFLAGS_EXTRA`，
 配置进入缓存身份，避免覆盖普通构建或串用缓存。
 runner 的 `--case`/Makefile 的 `COST_CASE` 为 contract/write/locking/mprotect/deadline/latency/consumer/all；
 各任务只运行已交付的对应 case，未知或尚未实现 case 必须明确失败，最终 all 不得跳过缺项。
 
-- [ ] 定义每项指标的单位、采样范围、owner、起止点、失败/取消记账和清零条件；运行时不重置仍在途的计数。
-- [ ] runner 在启动前快照 kernel/ELF/fixture；结果包含源码 tree、配置、工具与 QEMU 哈希、负载参数、冷/热准备方式和完整退出/资源基线。丢记录、负差值、溢出、错误 owner 或缺少结束标记必须失败。
-- [ ] 先写协议/计数红测：刻意破坏一个字段、缺一个阶段或交换 owner，报告不得通过。固定小负载由数据内容、完成字节和独立包装器验证计数，不锁定私有布局或偶然调用次序。
-- [ ] 验证诊断关闭后目标代码不引用新增观测入口；开启后不分配/睡眠/修改 errno，测量记录自身占用与开销，不能用计数器开销伪造被测路径成本。
-- [x] `python3 -B tests/test-cost-report.py` 与 `make test-cost-riscv COST_CASE=contract`（三启动，各四窗口）通过；当前 Python discovery 不收集连字符文件，直接运行防止零测试假通过。任务新增 48 字节，元数据页断言与退出栈余量保持。C2–C5 接入后继续复核总存储和栈。
+- [x] 已定义每项指标的单位、采样范围、owner、起止点、失败/取消记账和清零条件；运行时不重置仍在途的计数。
+- [x] runner 在启动前快照 kernel/ELF/fixture；结果包含源码 tree、配置、工具与 QEMU 哈希、负载参数、冷/热准备方式和完整退出/资源基线。丢记录、负差值、溢出、错误 owner 或缺少结束标记必须失败。
+- [x] 先写协议/计数红测：刻意破坏一个字段、缺一个阶段或交换 owner，报告不得通过。固定小负载由数据内容、完成字节和独立包装器验证计数，不锁定私有布局或偶然调用次序。
+- [x] 验证诊断关闭后目标代码不引用新增观测入口；开启后不分配/睡眠/修改 errno，测量记录自身占用与开销，不能用计数器开销伪造被测路径成本。
+- [x] `python3 -B tests/test-cost-report.py` 与 `make test-cost-riscv COST_CASE=contract`（三启动，各四窗口）通过；当前 Python discovery 不收集连字符文件，直接运行防止零测试假通过。任务新增 48 字节，元数据页断言与退出栈余量保持。最终聚合含预留 60947 字节，任务含 backend guard 增量总64字节，默认/观测栈检查通过。
 
 ### C1：写入与分配分解（P-D、存储成本）
 
@@ -247,10 +247,10 @@ runner 的 `--case`/Makefile 的 `COST_CASE` 为 contract/write/locking/mprotect
 `fs/ext4_backend.c`、`fs/lwext4_port.c`、`arch/riscv/virtio_mmio_block.c`；
 扩展 `tests/riscv/scale_main.c`，新增真实 U-mode `tests/workloads/cost/write.c`。
 
-- [ ] 先核对 0/1/3/63/64/65/4096 字节和对齐/错位 1 MiB：记录 staging/后备页/heap 分配、用户页解析、复制、缓存探测、脏范围、快照、数据/metadata/journal/flush、队列深度与等待；区分普通文件、TCP、AF_UNIX DGRAM。
-- [ ] 用普通 write、O_SYNC、O_DSYNC、每次/每 16 次/结束时 fsync 或 fdatasync，以及共享映射+msync 分组对照；分别改变顺序/随机、覆盖/扩展、冷/热和压力条件，不把全部因素一次混成笛卡尔积。
-- [ ] 每个基准配置使用三个独立启动副本；内容、offset、大小、短写、EFAULT/EIO/OOM 和资源基线先验收，再保存计数和客体时间分布。既有 1 MiB 256 分块/页解析门槛继续独立保护。
-- [ ] 窄验证 `make test-scale-riscv test-files-partial-write-riscv`，再 `make test-cost-riscv COST_CASE=write` 与 `make test-userland-riscv`；交付各层放大比和错误路径结果，不预先宣称小写分配或 flush 是主瓶颈。
+- [x] 先核对 0/1/3/63/64/65/4096 字节和对齐/错位 1 MiB：记录 staging/后备页/heap 分配、用户页解析、复制、缓存探测、脏范围、快照、数据/metadata/journal/flush、队列深度与等待；区分普通文件、TCP、AF_UNIX DGRAM。
+- [x] 用普通 write、O_SYNC、O_DSYNC、每次/每 16 次/结束时 fsync 或 fdatasync，以及共享映射+msync 分组对照；分别改变顺序/随机、覆盖/扩展、冷/热和压力条件，不把全部因素一次混成笛卡尔积。
+- [x] 每个基准配置使用三个独立启动副本；内容、offset、大小、短写、EFAULT/EIO/OOM 和资源基线先验收，再保存计数和客体时间分布。既有 1 MiB 256 分块/页解析门槛继续独立保护。
+- [x] 窄验证 `make test-scale-riscv test-files-partial-write-riscv`，再 `make test-cost-riscv COST_CASE=write` 与 `make test-userland-riscv`；交付各层放大比和错误路径结果，不预先宣称小写分配或 flush 是主瓶颈。
 
 C1 阶段证据：modern/writeback 的观测开/关各三个独立启动，36 窗口完整，
 独立 usercopy/page-resolution/device-stat wrapper 通过，默认 scale、partial-write、musl/pthread 通过。
@@ -298,16 +298,19 @@ C1 阶段证据：modern/writeback 的观测开/关各三个独立启动，36 �
 ### C6：真实消费者、归因与收口
 
 复用 `tests/runtime-diagnostics.py`、固定原镜像的 iozone 以及 C0 runner；
-证据归 `docs/learning/single-hart-scale.md`/`sleepable-storage.md`，契约归对应模块，
+最终证据归 `docs/learning/cost-baseline.md`/`cost-measurements.json`，规模/存储文档链接该结论，契约归对应模块，
 能力/后续依赖分别更新 README 与本页，不另建永久计划或原始日志档案。
 
-- [ ] 固定原 iozone ELF/依赖/镜像哈希、argv、工作目录、文件规模、缓存与同步条件；先核实实际调用链，再用 C1–C5 的受控负载解释其观测，未执行或超时保留原始状态。
-- [ ] `make test-cost-riscv COST_CASE=consumer` 与最终 `make test-cost-riscv COST_CASE=all` 输出全部阶段、输入身份和观测开/关对照，三个独立启动副本均有完整结果。
-- [ ] 汇总每项主成本与未解释余量，报告重复分布、观测开销和无收益结果；只有因果对照支持时，提出 2–3 个对应瓶颈的候选，由维护者选择一次优化。
-- [ ] 测量代码收口运行 `make test-riscv test-userland-riscv test-glibc-riscv test-diff-abi-riscv test-scale-riscv test-io-sleep-riscv test-stack-usage`，以及 SQLite DELETE/WAL 正常/错误恢复。后续实际修改写回、事务或队列时再跑两种完整恢复矩阵与双盘隔离。
+- [x] 固定原 iozone ELF/依赖/镜像哈希、argv、工作目录、文件规模、缓存与同步条件；先核实实际调用链，再用 C1–C5 的受控负载解释其观测，未执行或超时保留原始状态。
+- [x] `make test-cost-riscv COST_CASE=consumer` 与最终 `make test-cost-riscv COST_CASE=all` 输出全部阶段、输入身份和观测开/关对照，三个独立启动副本均有完整结果。
+- [x] 汇总每项主成本与未解释余量，报告重复分布、观测开销和无收益结果；只有因果对照支持时，提出 2–3 个对应瓶颈的候选，由维护者选择一次优化。
+- [x] 测量代码收口运行 `make test-riscv test-userland-riscv test-glibc-riscv test-diff-abi-riscv test-scale-riscv test-io-sleep-riscv test-stack-usage`，以及 SQLite DELETE/WAL 正常与选定错误恢复。后续实际修改写回、事务或队列时再跑两种完整恢复矩阵与双盘隔离。
 - [ ] 每个 C 任务独立验证/提交，使用 `Co-authored-by: GPT-6.1 Sol <codex@openai.com>`；固定输入和结论入 Git 后 `python3 -B tests/prune-build.py`、`make prune-build`。完整 Harness 的 kernel-la 阻塞继续单列。
 
-依赖为 C0 → C1/C3/C4，C1 → C2，C2/C3/C4 → C5，全部测量 → C6。
+依赖为 C0 → C1/C3/C4，C1 → C2，C2/C3/C4 → C5，全部测量 → C6。下一轮的结构优化需从报告中三个候选重新确认。
+
+- [ ] 兼容分支单向合入本轮已验收 main 后重跑原 glibc/musl iozone 与原 judge；`oscomp-rv-compat@3dcfe77` 已有 uname 4.15.0 适配，本轮未更新该分支，也未改 main uname。main 的原 glibc 启动拒绝不提供实际 I/O 成本。
+- [ ] 原 iozone (11,12) 所选测试在固定 Linux 也不可用，不计作向量 ABI 验收；其余 timeout 不据短预算判定永久卡死。完整 Harness 的缺少 kernel-la 阻塞保留。
 日志/RTC、SysV RMID 后再 attach 的既有兼容限制和 iperf/netperf 定位保留后续队列；
 本阶段不扩展 SMP、LoongArch、deadline 索引、选择性唤醒、驻留范围索引或持久化策略。
 
