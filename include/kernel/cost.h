@@ -49,6 +49,7 @@ void kernel_cost_join(struct kernel_cost_task *task);
 void kernel_cost_rebase(struct kernel_cost_task *task);
 void kernel_cost_block(struct kernel_cost_task *task);
 void kernel_cost_wake(struct kernel_cost_task *task);
+void kernel_cost_timeout(struct kernel_cost_task *task, uint64_t deadline);
 void kernel_cost_ready(struct kernel_cost_task *task);
 struct kernel_cost_tag kernel_cost_task_tag(const struct kernel_cost_task *task);
 unsigned kernel_cost_rank(unsigned rank);

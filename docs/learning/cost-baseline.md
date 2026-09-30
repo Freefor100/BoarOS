@@ -69,3 +69,17 @@ PTE访问恒为6；有16/64MiB文件驻留页时 resident访问为8192/32768，P
 用原MM统计核对PTE/TLB并以页数独立核对resident扫描，OOM/fork/split契约沿用原回归。
 可重建：`make test-cost-riscv COST_CASE=mprotect`；`make COST_DIAGNOSTICS=1 test-scale-riscv`；
 `make test-vma-riscv test-scale-riscv test-diff-abi-riscv`。范围索引仍留待全部测量后选择。
+
+## C4 deadline（2026-09-30）
+
+三个启动各8窗口，正常窗口每次严格4个timeout，提前唤醒/TERM/KILL窗口为0，
+最后重新建立同期限4任务检查复用。期限在所有fork/blocked握手之后通过共享页发布，
+准备时间不会耗掉期限。每轮deadline访问保留总数/样本数/最大值，窗口包括最终排空，
+平均值会受排空过程影响；固定集合的最大值及重复分布另随最终C6报告保存。
+源码 `validate_queue_shape` 是头尾检查，诊断分别记录实际shape/thread检查次数，
+不把O(1)校验伪称全队列扫描。timer耗时止于调度切换前，deadline_to_run包括到期IRQ延迟和就绪等待。
+QEMU timebase为10000000Hz，到期偏差不是实板/硬实时保证。
+可重建：`make test-cost-riscv COST_CASE=deadline`；
+`make test-scheduler-cases-riscv test-io-sleep-riscv test-sched-policy-host test-sched-bandwidth-riscv`。
+
+固定blocked集合每轮最大访问数（三副本）：0→7,7,7；32→39,39,39；128→135,135,135；256→263,263,263。包含正常系统worker和控制线程，未按任务名称过滤。

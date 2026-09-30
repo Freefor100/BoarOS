@@ -18,7 +18,7 @@ int main(void)
     kernel_cost_switch(&background,&foreground);
     ticks=110; kernel_cost_block(&foreground);
     actor=&background; kernel_cost_switch(&foreground,&background);
-    ticks=990; kernel_cost_wake(&foreground);
+    ticks=990; kernel_cost_wake(&foreground); kernel_cost_timeout(&foreground,980);
     ticks=1000; actor=&foreground; kernel_cost_switch(&background,&foreground);
     ticks=1010; kernel_cost_account(&foreground);
     assert(kernel_cost_end(1,0)==0);
@@ -27,5 +27,6 @@ int main(void)
     assert(kernel_cost_read(1,COST_RUN_TICKS,&value)==0 && value==890);
     assert(kernel_cost_read(0,COST_BLOCKED_TICKS,&value)==0 && value==880);
     assert(kernel_cost_read(0,COST_READY_TICKS,&value)==0 && value==10);
+    assert(kernel_cost_read(0,COST_DEADLINE_TO_RUN,&value)==0 && value==20);
     puts("cost runtime excludes sleep and attributes the actual owner");
 }

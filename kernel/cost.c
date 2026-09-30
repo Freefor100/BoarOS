@@ -141,6 +141,7 @@ void kernel_cost_rebase(struct kernel_cost_task *task)
 {
     ATOMIC_SCOPE;
     task->run_start = task->ready_start = task->blocked_start = 0;
+    task->wait_flags &= (uint8_t)~7U;
     task->scope_epoch = cost.epoch;
     add_checked(&cost.inflight, task->depth);
 }
@@ -255,6 +256,12 @@ void kernel_cost_wake(struct kernel_cost_task *task)
         task->wait_flags |= 1;
     }
 }
+void kernel_cost_timeout(struct kernel_cost_task *task, uint64_t deadline)
+{
+    task->blocked_start = deadline;
+    task->wait_flags |= 4;
+    kernel_cost_add_tag(kernel_cost_task_tag(task), COST_DEADLINE_EXPIRED, 1);
+}
 void kernel_cost_switch(struct kernel_cost_task *previous, struct kernel_cost_task *next)
 {
     if (previous->run_start) kernel_cost_account(previous);
@@ -263,7 +270,10 @@ void kernel_cost_switch(struct kernel_cost_task *previous, struct kernel_cost_ta
     uint64_t start = next->ready_start < cost.start ? cost.start : next->ready_start;
     if (next->ready_start && now >= start)
         kernel_cost_sample_tag(kernel_cost_task_tag(next),COST_READY_TICKS,now-start);
-    next->ready_start = 0; next->wait_flags &= (uint8_t)~2U; next->run_start = now;
+    if ((next->wait_flags & 4) && now >= next->blocked_start)
+        kernel_cost_sample_tag(kernel_cost_task_tag(next), COST_DEADLINE_TO_RUN, now - next->blocked_start);
+    next->blocked_start = 0;
+    next->ready_start = 0; next->wait_flags &= (uint8_t)~6U; next->run_start = now;
     if (previous != next) kernel_cost_add_tag(kernel_cost_task_tag(next),COST_SWITCHES,1);
 }
 int kernel_cost_read(unsigned lane, enum kernel_cost_metric metric, uint64_t *value)

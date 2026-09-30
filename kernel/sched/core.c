@@ -62,6 +62,7 @@ static enum kernel_scheduler_status validate_queue_shape(
     const struct kernel_task *head,
     const struct kernel_task *tail)
 {
+    COST_ADD(QUEUE_SHAPE_CHECKS, 1);
     if ((head == 0) != (tail == 0)) {
         return KERNEL_SCHEDULER_STATUS_QUEUE_CORRUPT;
     }
@@ -75,6 +76,7 @@ static enum kernel_scheduler_status validate_thread(
     const struct kernel_task *thread,
     enum kernel_thread_state expected_state)
 {
+    COST_ADD(QUEUE_THREAD_CHECKS, 1);
     uintptr_t base;
     uintptr_t expected_low;
     const uint64_t *canary;
@@ -286,6 +288,7 @@ enum kernel_scheduler_status validate_queues(void)
 
 enum kernel_scheduler_status validate_queues(void)
 {
+    COST_ADD(QUEUE_VALIDATIONS, 1);
     enum kernel_scheduler_status status;
 
 

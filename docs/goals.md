@@ -281,9 +281,9 @@ C1 阶段证据：modern/writeback 的观测开/关各三个独立启动，36 �
 入口为 `kernel/sched/wait.c::kernel_scheduler_expire_deadlines`、队列校验、
 `kernel/sched/core.c`、`tests/riscv/scheduler_cases.c` 和 `tests/riscv/io_sleep_main.c`。
 
-- [ ] 固定 4 个带 deadline 的任务，另建 0/32/128/256 个无期限 blocked；分别计队列校验和 deadline 循环访问、tick 整条路径耗时、实际到期唤醒与运行偏差。
-- [ ] 覆盖同期限、提前普通唤醒、信号/取消、退出与对象复用；握手确认任务已 blocked 后再开始采样，不用宿主 sleep 推断调度状态。
-- [ ] `make test-cost-riscv COST_CASE=deadline` 与 `make test-scheduler-cases-riscv test-io-sleep-riscv test-sched-policy-host test-sched-bandwidth-riscv`；得到固定 deadline 数下的增长曲线，仍保留遍历机制至证据支持结构选择。
+- [x] 固定 4 个带 deadline 的任务，另建 0/32/128/256 个无期限 blocked；分别计队列校验和 deadline 循环访问、tick 整条路径耗时、实际到期唤醒与运行偏差。
+- [x] 覆盖同期限、提前普通唤醒、信号/取消、退出与对象复用；握手确认任务已 blocked 后再开始采样，不用宿主 sleep 推断调度状态。
+- [x] `make test-cost-riscv COST_CASE=deadline` 与 `make test-scheduler-cases-riscv test-io-sleep-riscv test-sched-policy-host test-sched-bandwidth-riscv`；得到固定 deadline 数下的增长曲线，仍保留遍历机制至证据支持结构选择。
 
 ### C5：连续关中断与唤醒到运行（P-E）
 

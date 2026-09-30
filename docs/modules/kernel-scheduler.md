@@ -143,3 +143,10 @@ zombie 先逻辑回收再复制 status/rusage，因此坏输出指针的 EFAULT 
 时间及按rank的锁等待/持有、唤醒/重阻塞；标量48字节加内嵌guard16字节不持有新owner。
 独立假时钟测试保护睡眠排除及前后台归属；13窗口三启动锁对照与四组合三启动低内存fixture
 保护原来的阻塞、取消和资源回收。测量不改变队列/公平策略。
+
+C4 另计 queue validation 次数、shape/thread检查、deadline每轮访问及最大集合大小、
+实际timeout数量、到期到下一次运行的直方图。到期时复用已有 blocked_start 标量存期限，
+调度后清除，不增加任务字节。timer计时在可能切换前收口，跨切换的暂停栈不成为诊断在途owner。
+`make test-cost-riscv COST_CASE=deadline` 固定4期限任务加0/32/128/256无期限blocked，
+pipe/proc状态双握手确认，覆盖同期限、提前信号、默认信号、取消和对象复用。
+队列shape检查目前只查头尾，计数与deadline全集合遍历分开，不将它误报成全队列扫描。

@@ -124,6 +124,10 @@ void riscv_trap_dispatch(struct riscv_trap_frame *frame)
 
     if (frame->scause ==
         (RISCV_SCAUSE_INTERRUPT | RISCV_SCAUSE_SUPERVISOR_TIMER)) {
+#if BOAROS_COST_DIAGNOSTICS
+        struct kernel_cost_tag cost_timer_tag = kernel_cost_capture();
+        uint64_t cost_timer_start = kernel_cost_clock();
+#endif
         uint64_t elapsed_ticks;
         enum riscv_timer_status status =
             riscv_timer_handle_interrupt(&elapsed_ticks);
@@ -145,6 +149,9 @@ void riscv_trap_dispatch(struct riscv_trap_frame *frame)
             }
         }
         kernel_console_poll_input();
+#if BOAROS_COST_DIAGNOSTICS
+        kernel_cost_sample_tag(cost_timer_tag, COST_TIMER_TICKS, kernel_cost_clock() - cost_timer_start);
+#endif
         {
             enum kernel_scheduler_status scheduler_status =
                 kernel_scheduler_on_tick(elapsed_ticks);
