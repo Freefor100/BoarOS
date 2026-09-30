@@ -1,16 +1,28 @@
 #include <kernel/random.h>
 
+#include <arch/riscv/context.h>
+#include <kernel/blake2s.h>
+#include <kernel/scheduler.h>
+#include <kernel/errno.h>
+#include <string.h>
 #include <stddef.h>
 #include <stdint.h>
 
 struct kernel_random_state {
     uint32_t key[8];
-    uint32_t nonce[3];
-    uint32_t counter;
     uint8_t seeded;
+    uint8_t credited;
 };
 
 static struct kernel_random_state random_state;
+static struct kernel_wait_queue ready_queue;
+
+void kernel_random_erase(void *buffer, size_t size)
+{
+    volatile uint8_t *p = buffer;
+    while (size--) *p++ = 0;
+}
+
 
 static uint32_t load32(const uint8_t *bytes)
 {
@@ -96,80 +108,101 @@ void kernel_random_chacha20_block(
     for (index = 0U; index < 16U; index++) {
         store32(output + index * 4U, working[index] + state[index]);
     }
+    kernel_random_erase(state, sizeof(state));
+    kernel_random_erase(working, sizeof(working));
 }
 
-static void rekey(const uint8_t block[64])
-{
-    uint32_t index;
 
-    for (index = 0U; index < 8U; index++) {
-        random_state.key[index] = load32(block + index * 4U);
-    }
-    random_state.counter++;
-    if (random_state.counter == 0U) {
-        random_state.nonce[0]++;
-        if (random_state.nonce[0] == 0U) {
-            random_state.nonce[1]++;
-            if (random_state.nonce[1] == 0U) {
-                random_state.nonce[2]++;
-            }
+struct kernel_wait_queue *kernel_random_wait_queue(void)
+{
+    if (ready_queue.initialized != KERNEL_WAIT_QUEUE_INITIALIZED)
+        kernel_wait_queue_init(&ready_queue);
+    return &ready_queue;
+}
+
+unsigned kernel_random_credited_bits(void) { return random_state.credited * 8U; }
+int kernel_random_ready(void) { return random_state.credited == 32U; }
+int kernel_random_available(void) { return random_state.seeded != 0U; }
+
+void kernel_random_mix(const void *data, size_t size, int trusted)
+{
+    const uint8_t *p = data;
+    uint8_t input[64];
+    if (!data) return;
+    while (size) {
+        size_t n = size > 32U ? 32U : size;
+        uintptr_t irq = riscv_interrupt_save();
+        int was_ready = kernel_random_ready();
+        memcpy(input, random_state.key, 32U);
+        memcpy(input + 32U, p, n);
+        /* 有界压缩在关中断区完成，避免 IRQ 混种被旧快照覆盖。 */
+        kernel_blake2s(input, 32U + n, (uint8_t *)random_state.key);
+        random_state.seeded = 1U;
+        if (trusted && !was_ready) {
+            size_t remaining = 32U - random_state.credited;
+            random_state.credited += (uint8_t)(n < remaining ? n : remaining);
         }
+        if (!was_ready && kernel_random_ready())
+            (void)kernel_wait_queue_wake_all(kernel_random_wait_queue());
+        riscv_interrupt_restore(irq);
+        p += n;
+        size -= n;
     }
+    kernel_random_erase(input, sizeof(input));
 }
 
-enum kernel_random_status kernel_random_initialize(
-    const uint8_t *seed,
-    size_t seed_size)
+enum kernel_random_status kernel_random_initialize(const uint8_t *seed,
+                                                   size_t seed_size)
 {
-    uint32_t index;
-
-    if (seed == 0 || seed_size < 32U) {
-        random_state.seeded = 0U;
-        return KERNEL_RANDOM_STATUS_UNAVAILABLE;
-    }
-    for (index = 0U; index < 8U; index++) {
-        random_state.key[index] = load32(seed + index * 4U);
-    }
-    random_state.nonce[0] = load32(seed) ^ UINT32_C(0xa5a5a5a5);
-    random_state.nonce[1] = load32(seed + 12U) ^ UINT32_C(0x3c6ef372);
-    random_state.nonce[2] = load32(seed + 20U) ^ UINT32_C(0x9e3779b9);
-    random_state.counter = 1U;
-    random_state.seeded = 1U;
+    if (!seed || seed_size < 32U) return KERNEL_RANDOM_STATUS_UNAVAILABLE;
+    kernel_random_mix(seed, seed_size, 0);
     return KERNEL_RANDOM_STATUS_OK;
 }
 
-int kernel_random_available(void)
+int kernel_random_wait_ready(int nonblock)
 {
-    return random_state.seeded != 0U;
+    uintptr_t irq = riscv_interrupt_save();
+    while (!kernel_random_ready()) {
+        enum kernel_wait_wake_reason reason;
+        if (nonblock) { riscv_interrupt_restore(irq); return -KERNEL_EAGAIN; }
+        if (kernel_scheduler_block_current(kernel_random_wait_queue(), 0, 1,
+                                          &reason) != KERNEL_SCHEDULER_STATUS_OK) {
+            riscv_interrupt_restore(irq); return -KERNEL_EIO;
+        }
+        if (reason == KERNEL_WAIT_SIGNALLED) {
+            riscv_interrupt_restore(irq); return -KERNEL_EINTR;
+        }
+    }
+    riscv_interrupt_restore(irq);
+    return 0;
 }
 
 enum kernel_random_status kernel_random_fill(void *buffer, size_t size)
 {
-    uint8_t *destination = buffer;
-    uint8_t nonce[12];
-    uint8_t block[64];
-    size_t offset = 0U;
-    uint32_t index;
-
-    if (buffer == 0 && size != 0U) {
-        return KERNEL_RANDOM_STATUS_INVALID_ARGUMENT;
-    }
-    if (!random_state.seeded) {
-        return size == 0U ? KERNEL_RANDOM_STATUS_OK
-                          : KERNEL_RANDOM_STATUS_UNAVAILABLE;
-    }
-    while (offset < size) {
-        store32(nonce, random_state.nonce[0]);
-        store32(nonce + 4U, random_state.nonce[1]);
-        store32(nonce + 8U, random_state.nonce[2]);
-        kernel_random_chacha20_block((const uint8_t *)random_state.key,
-                                     nonce,
-                                     random_state.counter,
-                                     block);
-        for (index = 0U; index < 64U && offset < size; index++, offset++) {
-            destination[offset] = block[index];
+    uint8_t key[32], block[64], nonce[12] = {0};
+    uint8_t *p = buffer;
+    uint32_t counter = 1U;
+    if (!buffer && size) return KERNEL_RANDOM_STATUS_INVALID_ARGUMENT;
+    if (!size) return KERNEL_RANDOM_STATUS_OK;
+    uintptr_t irq = riscv_interrupt_save();
+    memcpy(key, random_state.key, sizeof(key));
+    kernel_random_chacha20_block(key, nonce, 0U, block);
+    /* 首半块仅作为新全局 key；调用者只能看到后半块和旧 key 的独立流。 */
+    memcpy(random_state.key, block, 32U);
+    riscv_interrupt_restore(irq);
+    size_t n = size > 32U ? 32U : size;
+    memcpy(p, block + 32U, n);
+    p += n; size -= n;
+    while (size) {
+        kernel_random_chacha20_block(key, nonce, counter++, block);
+        if (!counter) {
+            for (unsigned i = 0; i < sizeof(nonce); i++)
+                if (++nonce[i]) break;
         }
-        rekey(block);
+        n = size > 64U ? 64U : size;
+        memcpy(p, block, n); p += n; size -= n;
     }
+    kernel_random_erase(key, sizeof(key));
+    kernel_random_erase(block, sizeof(block));
     return KERNEL_RANDOM_STATUS_OK;
 }

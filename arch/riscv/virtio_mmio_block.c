@@ -1,3 +1,4 @@
+#include <kernel/cost.h>
 #include <arch/riscv/virtio_mmio_block.h>
 #include <kernel/page.h>
 #include <kernel/sync.h>
@@ -123,6 +124,11 @@ struct block_request {
     struct kernel_io_context *owner;
     struct kernel_wait_queue done;
     unsigned char bounce[VIRTIO_BLOCK_SECTOR_SIZE];
+#if BOAROS_COST_DIAGNOSTICS
+    struct kernel_cost_tag cost_tag;
+    uint64_t cost_start;
+    unsigned cost_device;
+#endif
 };
 _Static_assert(sizeof(struct block_request) <= REQUEST_STRIDE, "request slot overflow");
 _Static_assert(VIRTIO_REQUEST_HEADER_OFFSET + REQUEST_SLOTS * REQUEST_STRIDE <= 8192, "modern queue overflow");
@@ -208,6 +214,7 @@ static void bytes_copy(void *destination,
     const unsigned char *input = source;
     size_t index;
 
+    COST_ADD(DEVICE_BOUNCE_COPY, size);
     for (index = 0U; index < size; index++) {
         output[index] = input[index];
     }
@@ -366,6 +373,12 @@ static void fail_device(struct riscv_virtio_mmio_block *device, enum kernel_bloc
         struct block_request *r = request_at(device, i);
         if (r->state == 2) {
             r->result = result; r->state = 3;
+#if BOAROS_COST_DIAGNOSTICS
+            enum kernel_cost_metric metric = (enum kernel_cost_metric)(COST_DEVICE0_REQUESTS + r->cost_device * 8);
+            kernel_cost_add_tag(r->cost_tag, (enum kernel_cost_metric)(metric + 1), 1);
+            kernel_cost_add_tag(r->cost_tag, (enum kernel_cost_metric)(metric + 2), 1);
+            kernel_cost_sample_tag(r->cost_tag, (enum kernel_cost_metric)(metric + 7), kernel_cost_clock() - r->cost_start);
+#endif
             if (!device->inflight) __builtin_trap();
             device->inflight--;
             if (r->done.head) device->statistics.wakes++;
@@ -376,6 +389,13 @@ static void fail_device(struct riscv_virtio_mmio_block *device, enum kernel_bloc
 }
 static void collect_used(struct riscv_virtio_mmio_block *device)
 {
+    uint32_t pending = mmio_read32(device, VIRTIO_MMIO_INTERRUPT_STATUS_OFFSET);
+    if (pending) {
+        /* Ack before the used-index snapshot: a later completion must leave
+         * its interrupt pending instead of being erased after the scan. */
+        mmio_write32(device, VIRTIO_MMIO_INTERRUPT_ACK_OFFSET, pending);
+        __asm__ volatile("fence iorw, iorw" ::: "memory");
+    }
     volatile struct virtq_used *used = (void *)((unsigned char *)device->queue_memory + queue_used_offset(device));
     uint16_t count = (uint16_t)(used->index - device->last_used_index);
     memory_barrier();
@@ -391,14 +411,18 @@ static void collect_used(struct riscv_virtio_mmio_block *device)
             r->status == VIRTIO_BLOCK_STATUS_UNSUPPORTED ? KERNEL_BLOCK_STATUS_UNSUPPORTED : KERNEL_BLOCK_STATUS_IO;
         if (r->status > VIRTIO_BLOCK_STATUS_UNSUPPORTED) { fail_device(device, KERNEL_BLOCK_STATUS_IO); return; }
         r->state = 3;
+#if BOAROS_COST_DIAGNOSTICS
+        enum kernel_cost_metric metric = (enum kernel_cost_metric)(COST_DEVICE0_REQUESTS + r->cost_device * 8);
+        kernel_cost_add_tag(r->cost_tag, (enum kernel_cost_metric)(metric + 1), 1);
+        if (r->result != KERNEL_BLOCK_STATUS_OK) kernel_cost_add_tag(r->cost_tag, (enum kernel_cost_metric)(metric + 2), 1);
+        kernel_cost_sample_tag(r->cost_tag, (enum kernel_cost_metric)(metric + 7), kernel_cost_clock() - r->cost_start);
+#endif
         if (!device->inflight) __builtin_trap();
         device->inflight--;
         if (r->result != KERNEL_BLOCK_STATUS_OK) device->statistics.io_errors++;
         if (r->done.head) device->statistics.wakes++;
         wake(&r->done);
     }
-    uint32_t pending = mmio_read32(device, VIRTIO_MMIO_INTERRUPT_STATUS_OFFSET);
-    if (pending) mmio_write32(device, VIRTIO_MMIO_INTERRUPT_ACK_OFFSET, pending);
 }
 static void block_irq(void *owner)
 {
@@ -456,6 +480,7 @@ static enum kernel_block_status submit_request(struct riscv_virtio_mmio_block *d
     struct block_request *r, uint32_t type, uint64_t sector,
     uint64_t data_address, uint32_t data_length, int bounce)
 {
+    COST_SCOPE(device_cost, OPERATION_TICKS);
     uintptr_t irq = riscv_interrupt_save();
     if (!device_live(device)) { riscv_interrupt_restore(irq); return KERNEL_BLOCK_STATUS_IO; }
     if (r->state != 1 || r->owner != kernel_io_context_current()) __builtin_trap();
@@ -467,6 +492,16 @@ static enum kernel_block_status submit_request(struct riscv_virtio_mmio_block *d
     r->status = UINT8_MAX; r->state = 2;
     device->statistics.requests++;
     device->inflight++;
+#if BOAROS_COST_DIAGNOSTICS
+    r->cost_tag = kernel_cost_capture();
+    r->cost_start = kernel_cost_clock();
+    r->cost_device = device->block.registered && device->block.device_number == KERNEL_BLOCK_DEVICE_NUMBER(0) ? 0 :
+        device->block.registered && device->block.device_number == KERNEL_BLOCK_DEVICE_NUMBER(1) ? 1 : 2;
+    enum kernel_cost_metric metric = (enum kernel_cost_metric)(COST_DEVICE0_REQUESTS + r->cost_device * 8);
+    kernel_cost_add_tag(r->cost_tag, metric, 1);
+    kernel_cost_add_tag(r->cost_tag, (enum kernel_cost_metric)(metric + 6), device->inflight);
+    kernel_cost_add_tag(r->cost_tag, (enum kernel_cost_metric)(metric + (flushing ? 3 : type == VIRTIO_BLOCK_REQUEST_IN ? 4 : 5)), flushing ? 1 : data_length);
+#endif
     if (device->inflight > device->statistics.max_inflight) device->statistics.max_inflight = device->inflight;
     uint64_t physical = request_physical(device, r);
     d[head] = (struct virtq_descriptor){physical, sizeof(r->header), VIRTQ_DESC_NEXT, head + (flushing ? 2 : 1)};
@@ -479,13 +514,21 @@ static enum kernel_block_status submit_request(struct riscv_virtio_mmio_block *d
     mmio_write32(device, VIRTIO_MMIO_QUEUE_NOTIFY_OFFSET, 0);
     uint64_t deadline = time_now() + device->timeout_ticks;
     while (r->state == 2) {
+        /* During boot there is no IRQ consumer. Harvest a completion already
+         * published by the device before deciding that its deadline elapsed. */
+        if (!device->irq_source) collect_used(device);
+        if (r->state != 2) break;
         if ((int64_t)(time_now() - deadline) >= 0) { device->statistics.timeouts++; fail_device(device, KERNEL_BLOCK_STATUS_TIMEOUT); break; }
         if (device->irq_source) {
             enum kernel_wait_wake_reason reason;
             device->statistics.sleeps++;
             if (kernel_scheduler_block_current(&r->done, deadline, 0, &reason) != KERNEL_SCHEDULER_STATUS_OK)
                 __builtin_trap();
-        } else collect_used(device);
+            /* A timer may win the trap race even though DMA completed. This
+             * one final harvest is not a polling completion loop. */
+            if (reason == KERNEL_WAIT_TIMEOUT && r->state == 2 && device_live(device))
+                collect_used(device);
+        }
     }
     enum kernel_block_status result = r->result;
     r->state = 1;

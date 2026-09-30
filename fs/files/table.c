@@ -22,16 +22,24 @@
 #define LINUX_O_CLOEXEC UINT64_C(02000000)
 
 enum kernel_files_status kernel_files_ioctl(
-    struct kernel_files *files, int64_t fd,
+    struct kernel_files *files, struct kernel_mm *mm, int64_t fd,
     uint64_t command, uint64_t argument, int64_t *linux_result)
 {
-    (void)command;
-    (void)argument;
-    if (!kernel_files_is_live(files) || linux_result == 0)
+    struct kernel_open_file_description *description = 0;
+    if (!kernel_files_is_live(files) || !linux_result)
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
-    *linux_result = kernel_files_lookup_description(files, fd) == 0
-                        ? -KERNEL_EBADF : -KERNEL_ENOTTY;
-    return KERNEL_FILES_STATUS_OK;
+    enum kernel_files_status status = kernel_files_pin(files, fd, &description,
+                                                       linux_result);
+    if (status != KERNEL_FILES_STATUS_OK || *linux_result) return status;
+    *linux_result = description->device && description->device->ioctl
+        ? description->device->ioctl(mm, command, argument) : -KERNEL_ENOTTY;
+    enum kernel_open_file_status release = kernel_open_file_release(&description);
+    if (release == KERNEL_OPEN_FILE_STATUS_CLEANUP_REQUIRED && description) {
+        kernel_files_queue_description(files, description);
+        return KERNEL_FILES_STATUS_OK;
+    }
+    return release == KERNEL_OPEN_FILE_STATUS_OK ? KERNEL_FILES_STATUS_OK
+                                                : KERNEL_FILES_STATUS_STATE;
 }
 
 static int empty_files(const struct kernel_files *files)
@@ -703,7 +711,7 @@ static enum kernel_files_status install_dup(
     return KERNEL_FILES_STATUS_OK;
 }
 
-static enum kernel_files_status find_two_free_fds(
+enum kernel_files_status kernel_files_find_two_free_fds(
     struct kernel_files *files, uint32_t *first, uint32_t *second,
     int64_t *linux_result)
 {
@@ -716,7 +724,7 @@ static enum kernel_files_status find_two_free_fds(
     return find_fd_from(files, *first + 1U, second, linux_result);
 }
 
-static enum kernel_files_status release_uninstalled_description(
+enum kernel_files_status kernel_files_release_uninstalled_description(
     struct kernel_files *files,
     struct kernel_open_file_description **owner)
 {
@@ -785,7 +793,7 @@ enum kernel_files_status kernel_files_pipe2(
                                                flags,
                                                &read_description);
     if (open_status != KERNEL_OPEN_FILE_STATUS_OK) {
-        status = release_uninstalled_description(files, &read_description);
+        status = kernel_files_release_uninstalled_description(files, &read_description);
         (void)kernel_pipe_destroy_unowned(pipe);
         if (status != KERNEL_FILES_STATUS_OK) {
             return status;
@@ -804,10 +812,10 @@ enum kernel_files_status kernel_files_pipe2(
         enum kernel_files_status write_cleanup_status;
         enum kernel_files_status read_cleanup_status;
 
-        write_cleanup_status = release_uninstalled_description(
+        write_cleanup_status = kernel_files_release_uninstalled_description(
             files,
             &write_description);
-        read_cleanup_status = release_uninstalled_description(
+        read_cleanup_status = kernel_files_release_uninstalled_description(
             files,
             &read_description);
         status = write_cleanup_status != KERNEL_FILES_STATUS_OK
@@ -820,15 +828,15 @@ enum kernel_files_status kernel_files_pipe2(
                             : -KERNEL_EIO;
         return status;
     }
-    status = find_two_free_fds(files, &read_fd, &write_fd, &result);
+    status = kernel_files_find_two_free_fds(files, &read_fd, &write_fd, &result);
     if (status != KERNEL_FILES_STATUS_OK || result != 0) {
         enum kernel_files_status cleanup_status;
 
-        cleanup_status = release_uninstalled_description(files,
+        cleanup_status = kernel_files_release_uninstalled_description(files,
                                                           &write_description);
         {
             enum kernel_files_status read_cleanup_status =
-                release_uninstalled_description(files, &read_description);
+                kernel_files_release_uninstalled_description(files, &read_description);
 
             if (cleanup_status == KERNEL_FILES_STATUS_OK) {
                 cleanup_status = read_cleanup_status;
@@ -849,8 +857,8 @@ enum kernel_files_status kernel_files_pipe2(
                                                fd_flags,
                                                &read_description);
     if (status != KERNEL_FILES_STATUS_OK) {
-        (void)release_uninstalled_description(files, &write_description);
-        (void)release_uninstalled_description(files, &read_description);
+        (void)kernel_files_release_uninstalled_description(files, &write_description);
+        (void)kernel_files_release_uninstalled_description(files, &read_description);
         return status;
     }
     status = kernel_files_install_new_owned_at(files,
@@ -859,7 +867,7 @@ enum kernel_files_status kernel_files_pipe2(
                                                &write_description);
     if (status != KERNEL_FILES_STATUS_OK) {
         (void)detach_fd(files, read_fd);
-        (void)release_uninstalled_description(files, &write_description);
+        (void)kernel_files_release_uninstalled_description(files, &write_description);
         return status;
     }
     pair[0] = (int32_t)read_fd;

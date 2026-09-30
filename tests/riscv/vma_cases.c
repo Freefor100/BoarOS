@@ -2,6 +2,7 @@
 #include <arch/riscv/sv39.h>
 #include <kernel/boot_memory.h>
 #include <kernel/heap.h>
+#include <kernel/memory_object.h>
 #include <kernel/mm.h>
 #include <kernel/page.h>
 #include <kernel/physical_page.h>
@@ -264,6 +265,7 @@ unsigned long run_all_vma_cases(void)
                                   .backing_offset = 0U,
                                   .permissions = KERNEL_MM_READ |
                                                  KERNEL_MM_EXECUTE,
+                                  .maximum_permissions = KERNEL_VMA_ALL_PERMISSIONS,
                                   .kind = KERNEL_VMA_KIND_ELF_PRIVATE,
                                   .role = KERNEL_VMA_ROLE_ELF,
                                   .fault_policy = KERNEL_VMA_FAULT_ELF,
@@ -485,14 +487,14 @@ unsigned long run_all_vma_cases(void)
         kernel_mm_resolve_user_fault(
             &parent,
             VMA_TEST_STACK_BASE + 2U * BOAROS_PAGE_SIZE,
-            KERNEL_MM_EXECUTE) != KERNEL_MM_STATUS_NOT_MAPPED ||
+            KERNEL_MM_EXECUTE) != KERNEL_MM_STATUS_ACCESS ||
         kernel_mm_lookup(&parent,
                          VMA_TEST_STACK_BASE + 2U * BOAROS_PAGE_SIZE,
                          &mapping) != KERNEL_MM_STATUS_NOT_MAPPED ||
         kernel_mm_resolve_user_fault(&parent,
                                      VMA_TEST_TEXT_BASE,
                                      KERNEL_MM_WRITE) !=
-            KERNEL_MM_STATUS_NOT_MAPPED ||
+            KERNEL_MM_STATUS_ACCESS ||
         kernel_mm_resolve_user_fault(&parent,
                                      VMA_TEST_TEXT_BASE,
                                      KERNEL_MM_EXECUTE) !=
@@ -994,6 +996,46 @@ unsigned long run_all_vma_cases(void)
     return 0U;
 }
 
+static unsigned long memory_object_cases(struct kernel_heap *heap,
+                                         struct physical_page_allocator *allocator)
+{
+    struct kernel_memory_object *object = 0;
+    uint64_t address = 0, found = 0;
+    int created = 0;
+    void *bytes;
+    uint64_t initial = allocator->shared_anon_pages;
+    if (kernel_memory_object_create(heap, allocator, &object) != KERNEL_MEMORY_OBJECT_OK)
+        return 40;
+    if (kernel_memory_object_find_page(object, 123, &found) != KERNEL_MEMORY_OBJECT_NOT_FOUND ||
+        allocator->shared_anon_pages != initial) return 41;
+    if (kernel_memory_object_get_page(object, 1, &address, &created) != KERNEL_MEMORY_OBJECT_OK ||
+        !created || physical_page_resolve(allocator, address, &bytes) != PHYSICAL_PAGE_STATUS_OK)
+        return 42;
+    ((unsigned char *)bytes)[16] = 7;
+    ((unsigned char *)bytes)[17] = 9;
+    if (physical_page_release(allocator, address) != PHYSICAL_PAGE_STATUS_OK) return 43;
+    kernel_memory_object_truncate(object, BOAROS_PAGE_SIZE + 17);
+    if (kernel_memory_object_find_page(object, 1, &found) != KERNEL_MEMORY_OBJECT_OK ||
+        found != address || ((unsigned char *)bytes)[16] != 7 ||
+        ((unsigned char *)bytes)[17] != 0) return 44;
+    if (physical_page_release(allocator, found) != PHYSICAL_PAGE_STATUS_OK) return 45;
+    kernel_memory_object_truncate(object, 0);
+    if (kernel_memory_object_find_page(object, 1, &found) != KERNEL_MEMORY_OBJECT_NOT_FOUND ||
+        allocator->shared_anon_pages != initial) return 46;
+    if (kernel_memory_object_get_page(object, 2, &address, &created) != KERNEL_MEMORY_OBJECT_OK ||
+        !created || kernel_memory_object_find_page(object, 2, &found) != KERNEL_MEMORY_OBJECT_OK ||
+        physical_page_release(allocator, address) != PHYSICAL_PAGE_STATUS_OK) return 47;
+    /* 别的映射仍持有该页时，失败创建者不得撤销对象 owner。 */
+    kernel_memory_object_discard_new_page(object, 2, address);
+    if (kernel_memory_object_resident_pages(object) != 1 ||
+        physical_page_release(allocator, found) != PHYSICAL_PAGE_STATUS_OK) return 48;
+    kernel_memory_object_discard_new_page(object, 2, address);
+    if (kernel_memory_object_resident_pages(object) != 0 ||
+        allocator->shared_anon_pages != initial) return 49;
+    kernel_memory_object_release(&object);
+    return 0;
+}
+
 unsigned long run_shared_anon_cases(void)
 {
     struct physical_page_allocator allocator;
@@ -1017,6 +1059,8 @@ unsigned long run_shared_anon_cases(void)
                                  VMA_TEST_HEAP_LIMIT) != KERNEL_MM_STATUS_OK ||
         riscv_kernel_mm_satp(&parent, &parent_satp) != KERNEL_MM_STATUS_OK)
         return 1U;
+    unsigned long object_error = memory_object_cases(&heap, &allocator);
+    if (object_error) return object_error;
     use_test_satp = 1;
     test_satp = parent_satp;
     if (kernel_mm_mmap_anonymous(&parent, 0U, 3U * BOAROS_PAGE_SIZE,
@@ -1032,6 +1076,9 @@ unsigned long run_shared_anon_cases(void)
         kernel_mm_lookup(&parent, address, &mapping) != KERNEL_MM_STATUS_OK ||
         (mapping.permissions & KERNEL_MM_WRITE) == 0U)
         return 3U;
+    struct kernel_memory_statistics memory;
+    kernel_memory_snapshot(&allocator, &memory);
+    if (memory.shared != BOAROS_PAGE_SIZE || memory.cached != memory.shared) return 30U;
     parent_page = mapping.physical_address & ~BOAROS_PAGE_MASK;
     if (physical_page_reference_count(&allocator, parent_page,
                                       &references) != PHYSICAL_PAGE_STATUS_OK ||
@@ -1043,6 +1090,8 @@ unsigned long run_shared_anon_cases(void)
         kernel_mm_fork(&child, &parent) != KERNEL_MM_STATUS_OK ||
         riscv_kernel_mm_satp(&child, &child_satp) != KERNEL_MM_STATUS_OK)
         return 4U;
+    kernel_memory_snapshot(&allocator, &memory);
+    if (memory.shared != BOAROS_PAGE_SIZE) return 31U;
     test_satp = child_satp;
     if (kernel_mm_lookup(&child, address, &mapping) !=
             KERNEL_MM_STATUS_NOT_MAPPED ||
@@ -1141,6 +1190,8 @@ unsigned long run_shared_anon_cases(void)
         kernel_mm_munmap(&parent, address, BOAROS_PAGE_SIZE) !=
             KERNEL_MM_STATUS_OK)
         return 14U;
+    kernel_memory_snapshot(&allocator, &memory);
+    if (memory.shared != 0) return 32U;
     if (kernel_mm_mmap_anonymous(&parent, 0U, BOAROS_PAGE_SIZE,
                                  KERNEL_MM_READ | KERNEL_MM_WRITE,
                                  KERNEL_MM_MAP_SHARED, &address) !=
@@ -1270,6 +1321,7 @@ unsigned long run_vma_lookup_baseline(uint64_t cycles[3])
                         .start = address,
                         .end = address + BOAROS_PAGE_SIZE,
                         .permissions = KERNEL_MM_READ,
+                        .maximum_permissions = KERNEL_VMA_ALL_PERMISSIONS,
                         .kind = KERNEL_VMA_KIND_ANONYMOUS,
                         .role = KERNEL_VMA_ROLE_MMAP,
                         .fault_policy = KERNEL_VMA_FAULT_DEMAND_ZERO,

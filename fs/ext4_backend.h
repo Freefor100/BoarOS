@@ -13,16 +13,23 @@ struct lwext4_orphan {
 struct lwext4_mount_adapter {
     struct kernel_vfs_instance instance;
     struct kernel_block_device *block;
+    struct kernel_rwlock backend_lock;
+    struct ext4_lock locks;
+    char device_name[24];
+    char mount_point[28];
+    struct lwext4_mount_adapter *next_adapter;
     struct ext4_blockdev_iface interface;
     struct ext4_blockdev device;
     unsigned char *physical_buffer;
     struct ext4_sblock *superblock;
     struct lwext4_orphan *orphans;
+    uint8_t block_claimed;
     uint8_t registered;
     uint8_t mounted;
     uint8_t heap_bound;
     uint8_t unmount_sync_pending;
     uint8_t recovery_pending;
+    uint8_t unmount_prepared;
     int mount_error;
 };
 struct lwext4_node {

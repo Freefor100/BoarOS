@@ -19,6 +19,15 @@ typedef void *(*physical_page_access_fn)(uint64_t physical_address);
 typedef uint64_t (*physical_page_reclaim_fn)(void *context,
                                              uint64_t target_pages);
 
+/* Byte capacities; references and mappings never multiply owned storage. */
+struct kernel_memory_statistics {
+    uint64_t total, free, available, cached, shared, buffers;
+    uint64_t dirty, writeback, reclaimable;
+};
+struct physical_page_allocator;
+void kernel_memory_snapshot(const struct physical_page_allocator *allocator,
+                            struct kernel_memory_statistics *out);
+
 struct physical_page_metadata;
 
 struct physical_page_range {
@@ -29,6 +38,14 @@ struct physical_page_range {
 };
 
 struct physical_page_allocator {
+    void (*pressure_notify)(void *);
+    void (*pressure_wait)(void *);
+    void *pressure_context;
+    uint64_t shared_anon_pages;
+    void (*cache_snapshot)(void *, struct kernel_memory_statistics *);
+    void *cache_context;
+    uint64_t (*buffer_bytes)(void *);
+    void *buffer_context;
     uint64_t total_pages;
     uint64_t available_pages;
     uint64_t recycled_head;

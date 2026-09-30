@@ -204,7 +204,7 @@ make test-riscv
 
 MM 聚焦测试覆盖创建失败原子性、共享引用、移动、COW fork 的父子共享/写隔离/末引用原地恢复、`PROT_NONE` COW 属性，以及正常页表回收和物理页基线；VMA 聚焦测试另覆盖共享匿名页的 fork 前驻留、双方首次 fault 顺序、权限拆分、部分撤映射、替换、退出和 OOM 回滚。同一 MM target 还运行独立 fatal kernel，注入一次页表 backing 无法解析并确认只产生一个 fatal 结果、不会返回 retry/success 路径。文件测试覆盖 cache hit/miss、write-first、尾页补零、整页越 EOF、fd 关闭后 fault、fork 后 OFD 来源和最终回收。syscall 聚焦测试验证校验错误先于不可读 OFD 的 `EACCES`，两类拒绝都释放临时 pin 且不进入 MM 提交；`test-userland-riscv` 用真实 musl mmap 覆盖匿名共享的双向可见、fd 忽略、fixed 冲突，以及原有私有 mmap。`test-mmap-riscv` 与真实 ext4 `/init` 从 U-mode 完成匿名/文件私有 mmap、COW、SIGBUS、mprotect/munmap 生命周期；`test-diff-abi-riscv` 与 `test-sqlite-wal-riscv` 另验证文件共享 mmap、`msync` 和独立进程 WAL。
 
-当前只有 RISC-V 后端；映射仍由 Sv39/4 KiB 用户页实现。普通 fork 使用独立 MM，私有页 COW、共享匿名与共享文件页保持共享；线程 clone/vfork 共享同一 MM record。匿名映射和 ELF image 使用每 MM 的 ASLR mmap ceiling（无可信种子时确定性降级），但没有 commit accounting。栈软限制约束后续未驻留栈页的填充，已存在的 PTE 保留；新 exec 在固定容量 VMA 内按当前软限制建立初始栈。可读普通文件支持 MAP_PRIVATE/MAP_SHARED 与 `msync`；brk 尚未接入 RLIMIT_DATA。文件表和信号表不属于 MM。private futex 使用 MM 创建时分配的单调身份号与用户地址，避免 MM record 页回收后重用身份；共享匿名 futex 使用后备对象与连续字节偏移，等待者持有对象引用。共享文件 futex 尚无后备 key。
+当前只有 RISC-V 后端；映射仍由 Sv39/4 KiB 用户页实现。普通 fork 使用独立 MM，私有页 COW、共享匿名与共享文件页保持共享；线程 clone/vfork 共享同一 MM record。匿名映射和 ELF image 使用每 MM 的 ASLR mmap ceiling（无任何随机材料时确定性降级；仅 DTB 混种不提供可信安全保证），但没有 commit accounting。栈软限制约束后续未驻留栈页的填充，已存在的 PTE 保留；新 exec 在固定容量 VMA 内按当前软限制建立初始栈。可读普通文件支持 MAP_PRIVATE/MAP_SHARED 与 `msync`；brk 尚未接入 RLIMIT_DATA。文件表和信号表不属于 MM。private futex 使用 MM 创建时分配的单调身份号与用户地址，避免 MM record 页回收后重用身份；共享匿名 futex 使用后备对象与连续字节偏移，等待者持有对象引用。共享文件 futex 尚无后备 key。
 
 ## 驻留文件映射与截断
 
@@ -212,7 +212,7 @@ MM record 拥有按 VFS node 去重的稳定关联记录，以及每个驻留文
 身份和私有化状态。VFS 只借用关联；OFD 来源持有 node 的生命周期。共享 MM 不重复
 登记，fork 在页表共享提交前复制来源/关联/驻留元数据，成功后登记新 MM。mmap 在
 VMA/PTE 修改前预留关联；失败不消耗调用者 OFD。末个 VMA 消失或销毁时先解除关联，
-再释放 OFD。不得登记可移动的 VMA 数组元素或 MM handle 地址。
+再释放 OFD；文件 fault/msync 在途操作 pin 推迟最后来源释放，直至睡眠操作完成。真实 close 错误仍保留来源 owner。不得登记可移动的 VMA 数组元素或 MM handle 地址。
 
 首次文件 fault 在发布 PTE/alias 前预留驻留记录和地址哈希容量；COW 成功后更新私有标志及物理地址。
 缓存命中的 write-first fault 若 COW 物理分配失败，必须撤销临时 cache PTE 后返回，
@@ -235,3 +235,16 @@ PROT_NONE、非当前 MM、尾页、关闭 fd、unlink、O_TRUNC 与重新增长
 调度器在任务发布及新映像提交时调用 `kernel_mm_add_user`，在退出或旧映像退休前调用 `kernel_mm_remove_user`。活跃使用者与 MM 资源引用分开：清理任务暂存的旧 MM 不影响 CHILD_CLEARTID 条件；fork 创建零使用者的新 MM，acquire/move 不隐式注册任务。计数下溢、溢出属于内核 owner 错误。
 
 活跃使用者在可睡眠的清 TID 复制/唤醒结束后才注销；其他任务同时退出时仍须看到正在退出但尚未完成 mm_release 的使用者。`test-mm-riscv` 通过用户复制挂起点的确定性交错检查两个用户字均清零及最终物理页归还；真实 U-mode 的生命周期另由 tid.* 差分覆盖。
+
+## 统一内存后备对象
+
+共享匿名与其 futex key 使用 `kernel_memory_object` 的稳定对象身份。对象拥有每个稀疏驻留页的一份引用，get/find 成功返回额外页引用；find 遇空洞不分配。对象锁 rank 35 位于 inode 30 之后；无磁盘 I/O。truncate 摘除越界的对象页引用并清零保留尾页，调用者须先撤销受影响 PTE 并持有对象；页发布失败按先释放 PTE 临时引用、再 discard 新页的顺序回滚。tmpfs 已接入同一对象及按实例共享的页预算；普通文件的 inode/OFD 与 MM 登记仍保留，内存数据页不进入磁盘缓存。缺页使用 get_page_for_fault 返回 created 身份，成功 resident 发布后取消回滚；失败先释放 pin，只有无其他引用且地址匹配的新页才 discard。文件配额耗尽为 BUS_FAULT，普通分配耗尽仍为 NO_MEMORY。详见 [tmpfs](tmpfs.md)。
+
+缺页解析在合法 VMA 上权限不足返回 ACCESS，地址无映射返回 NOT_MAPPED；trap 层据此提供 SEGV_ACCERR/MAPERR，uaccess 将两者统一映射为用户复制 FAULT。这个区分不把 syscall 坏指针变成异步故障信号。
+
+默认关闭的 C3 成本观测记录 VMA 查询比较、coverage/权限检查、prepare/commit 时长、
+数组移动/编辑、全集合合并/字节重计、file_residents 遍历、实际 PTE 访问和地址/全局 TLB 失效。
+计数入口在实际循环或修改点，不改变 prepare 失败原子性；单页 PTE 路径与原 MM 统计独立核对。
+`make test-cost-riscv COST_CASE=mprotect` 使用固定一页目标和16/64/256无关VMA、
+0/16/64MiB文件驻留页，三个启动副本；权限拒绝和洞窗口要求PTE访问为0。
+OOM/split/fork 由 vma/scale/ABI 组合回归继续保护。

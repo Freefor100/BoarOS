@@ -19,14 +19,20 @@ def sha256(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
-def boot(qemu, kernel, disk, output, linux, marker):
+def boot(qemu, kernel, disk, output, linux, marker, second=None):
     command = [qemu, "-machine", "virt", "-bios", "default",
+                       "-object", "rng-random,id=entropy,filename=/dev/urandom",
+                       "-device", "virtio-rng-device,rng=entropy,bus=virtio-mmio-bus.7",
                "-kernel", str(kernel), "-m", "512M", "-smp", "1",
                "-nographic", "-no-reboot",
                "-drive", f"file={disk},if=none,format=raw,id=root",
                "-device", "virtio-blk-device,drive=root,bus=virtio-mmio-bus.0"]
+    if second is not None:
+        command += ["-drive", f"file={second},if=none,format=raw,id=second",
+                    "-device", "virtio-blk-device,drive=second,bus=virtio-mmio-bus.1"]
     if linux:
-        command += ["-append", "root=/dev/vda rw rootwait console=ttyS0 "
+        root_device = "/dev/vdb" if second is not None else "/dev/vda"
+        command += ["-append", f"root={root_device} rw rootwait console=ttyS0 "
                     "init=/init loglevel=0 panic=-1"]
     with output.open("w") as log:
         result = subprocess.run(command, stdin=subprocess.DEVNULL,
@@ -44,6 +50,7 @@ def main():
     parser.add_argument("--kernel", type=Path, required=True)
     parser.add_argument("--program", type=Path, required=True)
     parser.add_argument("--qemu", default="qemu-system-riscv64")
+    parser.add_argument("--second-disk", action="store_true")
     args = parser.parse_args()
     linux_kernel, _ = harness.linux_build()
     identity = {
@@ -54,7 +61,7 @@ def main():
             "references/sqlite/sqlite-amalgamation-3530400.zip"),
         "qemu": subprocess.check_output([args.qemu, "--version"],
             text=True).splitlines()[0],
-        "rebuild": "make test-sqlite-wal-riscv",
+        "rebuild": "make test-sqlite-second-disk-riscv" if args.second_disk else "make test-sqlite-wal-riscv",
     }
     directory = Path(tempfile.mkdtemp(prefix="sqlite-wal-run.",
                                       dir=ROOT / "build/riscv"))
@@ -64,11 +71,17 @@ def main():
                                     ("boaros", args.kernel.resolve(), False)):
             target = directory / (name + ".img")
             shutil.copy2(disk, target)
+            second = None
+            if args.second_disk:
+                second = directory / (name + "-second.img")
+                with second.open("wb") as stream:
+                    stream.truncate(64 * 1024 * 1024)
+                subprocess.run(["mkfs.ext4", "-q", "-F", "-b", "4096", str(second)], check=True)
             boot(args.qemu, kernel, target, directory / (name + ".log"),
-                 linux, "BoarOS: SQLite WAL multiprocess passed")
+                 linux, "BoarOS: SQLite WAL multiprocess passed", second)
             boot(args.qemu, kernel, target,
                  directory / (name + "-reboot.log"), linux,
-                 "BoarOS: SQLite WAL reboot verified")
+                 "BoarOS: SQLite WAL reboot verified", second)
     except Exception:
         print(f"SQLite WAL artifacts retained: {directory}", file=sys.stderr)
         raise

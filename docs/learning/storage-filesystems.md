@@ -140,6 +140,8 @@ BoarOS 初始化三个无路径 console OFD，返回 `ENOENT`。根启动在文�
 也经同一 RV ELF 验证，当前 679 条差分一致。此证据不覆盖持续高压 fd 复用
 或完整 Linux proc 字段。
 
+> 本节以下保留首批 procfs 交付时的历史诊断。后续真实内存/sysinfo、256 轮 fd 压力与独立时间/LTP 定位见[内存管理](memory-management.md)、[文件时间](file-timestamps.md)及[程序清单](user-program-inventory.md)；缺 Cached/free 全零不再是当前状态。
+
 2026-09-29 固定 OSComp `pre-20250615` RV 镜像
 `references/oscomp-autotest/sdcard-rv.img`（SHA-256
 `f419468678d342133546add2f8459ea09aeba987ba968e28753d6ee656996b8b`）

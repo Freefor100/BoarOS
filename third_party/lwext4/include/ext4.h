@@ -59,12 +59,13 @@ extern "C" {
 struct ext4_lock {
 
 	/**@brief   Lock access to mount point.*/
-	void (*lock)(void);
+	void (*lock)(void *context);
 
 	/**@brief   Unlock access to mount point.*/
-	void (*unlock)(void);
-	void (*read_lock)(void);
-	uintptr_t (*owner)(void);
+	void (*unlock)(void *context);
+	void (*read_lock)(void *context);
+	uintptr_t (*owner)(void *context);
+	void *context;
 };
 
 /********************************FILE DESCRIPTOR*****************************/
@@ -367,6 +368,10 @@ int ext4_orphan_recover(const char *mount_point);
  * @param   hardlink_path Path of hardlink.
  *
  * @return  Standard error code. */
+/* Link an existing inode without resolving a potentially stale source path. */
+int ext4_link_child(const char *mount_point, uint32_t source_inode,
+                   uint32_t parent_inode, const char *name, uint32_t length);
+
 int ext4_flink(const char *path, const char *hardlink_path);
 
 /**@brief Rename file.

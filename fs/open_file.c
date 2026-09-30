@@ -11,6 +11,8 @@
 #include <kernel/heap.h>
 #include <kernel/open_file.h>
 #include <kernel/page_cache.h>
+#include <kernel/memory_object.h>
+#include <kernel/tmpfs.h>
 #include <kernel/socket.h>
 #include <kernel/vfs.h>
 
@@ -484,6 +486,10 @@ enum kernel_open_file_kind kernel_open_file_kind(
         return KERNEL_OPEN_FILE_KIND_SOCKET;
     case KERNEL_OPEN_FILE_KIND_GENERATED:
         return KERNEL_OPEN_FILE_KIND_GENERATED;
+    case KERNEL_OPEN_FILE_KIND_RANDOM:
+        return KERNEL_OPEN_FILE_KIND_RANDOM;
+    case KERNEL_OPEN_FILE_KIND_URANDOM:
+        return KERNEL_OPEN_FILE_KIND_URANDOM;
     default:
         return KERNEL_OPEN_FILE_KIND_REGULAR;
     }
@@ -500,6 +506,7 @@ int kernel_open_file_supports_epoll(
     case KERNEL_OPEN_FILE_KIND_CONSOLE:
     case KERNEL_OPEN_FILE_KIND_EPOLL:
     case KERNEL_OPEN_FILE_KIND_SOCKET:
+    case KERNEL_OPEN_FILE_KIND_RANDOM:
         return 1;
     default:
         return 0;
@@ -690,6 +697,8 @@ int kernel_open_file_readable(
     case KERNEL_OPEN_FILE_KIND_DIRECTORY:
     case KERNEL_OPEN_FILE_KIND_NULL:
     case KERNEL_OPEN_FILE_KIND_ZERO:
+    case KERNEL_OPEN_FILE_KIND_RANDOM:
+    case KERNEL_OPEN_FILE_KIND_URANDOM:
         return access_mode == 0U || access_mode == 2U;
     case KERNEL_OPEN_FILE_KIND_PIPE:
         return access_mode == 0U || access_mode == 2U;
@@ -739,6 +748,57 @@ enum kernel_open_file_status kernel_open_file_advance(
     return KERNEL_OPEN_FILE_STATUS_OK;
 }
 
+int kernel_open_file_memory_backed(struct kernel_open_file_description *file)
+{ return open_file_live(file) && kernel_vfs_file_memory(&file->file) != 0; }
+
+static enum kernel_page_cache_status memory_page(struct kernel_open_file_description *file,
+    uint64_t index, uint64_t *address, size_t *valid, int create, int *created)
+{
+    struct kernel_memory_object *object = kernel_vfs_file_memory(&file->file);
+    uint64_t size = kernel_open_file_size(file);
+    if (index > UINT64_MAX / BOAROS_PAGE_SIZE || index * BOAROS_PAGE_SIZE >= size)
+        return KERNEL_PAGE_CACHE_STATUS_OUT_OF_RANGE;
+    enum kernel_memory_object_status r = create ? kernel_memory_object_get_page(object,index,address,created)
+                                              : kernel_memory_object_find_page(object,index,address);
+    if (r == KERNEL_MEMORY_OBJECT_OK) {
+        uint64_t remaining = size - index * BOAROS_PAGE_SIZE;
+        *valid = remaining < BOAROS_PAGE_SIZE ? remaining : BOAROS_PAGE_SIZE;
+        return KERNEL_PAGE_CACHE_STATUS_OK;
+    }
+    return r == KERNEL_MEMORY_OBJECT_NOT_FOUND ? KERNEL_PAGE_CACHE_STATUS_NOT_FOUND :
+           r == KERNEL_MEMORY_OBJECT_NO_MEMORY ? KERNEL_PAGE_CACHE_STATUS_NO_MEMORY :
+           r == KERNEL_MEMORY_OBJECT_NO_SPACE ? KERNEL_PAGE_CACHE_STATUS_IO : KERNEL_PAGE_CACHE_STATUS_STATE;
+}
+
+void kernel_open_file_memory_modified(struct kernel_open_file_description *file)
+{
+    if (!kernel_open_file_memory_backed(file)) __builtin_trap();
+    uintptr_t irq = riscv_interrupt_save();
+    kernel_tmpfs_memory_modified(&file->file);
+    riscv_interrupt_restore(irq);
+}
+
+enum kernel_page_cache_status kernel_open_file_get_page_for_fault(
+    struct kernel_open_file_description *file, uint64_t index,
+    uint64_t *address, size_t *valid, int *created)
+{
+    if (!created || !address || !valid || !open_file_live(file) ||
+        !file->file.mount || !file->file.mount->private_data)
+        return KERNEL_PAGE_CACHE_STATUS_INVALID_ARGUMENT;
+    *created = 0;
+    if (kernel_open_file_memory_backed(file))
+        return memory_page(file, index, address, valid, 1, created);
+    return kernel_open_file_get_page(file, index, address, valid);
+}
+
+void kernel_open_file_discard_new_page(struct kernel_open_file_description *file,
+    uint64_t index, uint64_t address)
+{
+    struct kernel_memory_object *object = kernel_vfs_file_memory(&file->file);
+    if (!object) __builtin_trap();
+    kernel_memory_object_discard_new_page(object, index, address);
+}
+
 enum kernel_page_cache_status kernel_open_file_get_page(
     struct kernel_open_file_description *file,
     uint64_t page_index,
@@ -749,6 +809,8 @@ enum kernel_page_cache_status kernel_open_file_get_page(
         file->file.mount->private_data == 0) {
         return KERNEL_PAGE_CACHE_STATUS_INVALID_ARGUMENT;
     }
+    int created;
+    if (kernel_open_file_memory_backed(file)) return memory_page(file,page_index,physical_address,valid_bytes,1,&created);
     return kernel_page_cache_get(
         kernel_vfs_file_page_cache(&file->file),
         &file->file,
@@ -767,6 +829,7 @@ enum kernel_page_cache_status kernel_open_file_lookup_page(
         file->file.mount->private_data == 0) {
         return KERNEL_PAGE_CACHE_STATUS_INVALID_ARGUMENT;
     }
+    if (kernel_open_file_memory_backed(file)) return memory_page(file,page_index,physical_address,valid_bytes,0,0);
     return kernel_page_cache_lookup(
         kernel_vfs_file_page_cache(&file->file),
         &file->file,

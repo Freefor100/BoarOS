@@ -5,6 +5,8 @@
 
 struct kernel_heap;
 struct kernel_vma_set;
+struct kernel_shm_attachment;
+#define KERNEL_VMA_ALL_PERMISSIONS UINT32_C(7)
 uint64_t kernel_vma_set_generation(const struct kernel_vma_set *set);
 /* Sum of currently mapped virtual bytes; updated with each committed edit. */
 uint64_t kernel_vma_set_total_bytes(const struct kernel_vma_set *set);
@@ -31,6 +33,7 @@ enum kernel_vma_kind {
     KERNEL_VMA_KIND_ELF_PRIVATE,
     KERNEL_VMA_KIND_ANON_SHARED,
     KERNEL_VMA_KIND_FILE_SHARED,
+    KERNEL_VMA_KIND_SYSV_SHM,
 };
 
 enum kernel_vma_role {
@@ -40,6 +43,7 @@ enum kernel_vma_role {
     KERNEL_VMA_ROLE_STACK,
     KERNEL_VMA_ROLE_HEAP,
     KERNEL_VMA_ROLE_MMAP,
+    KERNEL_VMA_ROLE_SYSV_SHM,
 };
 
 enum kernel_vma_fault_policy {
@@ -57,11 +61,12 @@ struct kernel_vma {
     uint64_t end;
     uint64_t backing_offset;
     uint32_t permissions;
+    uint32_t maximum_permissions;
     enum kernel_vma_kind kind;
     enum kernel_vma_role role;
     enum kernel_vma_fault_policy fault_policy;
     void *backing;
-    uint8_t file_shared_may_write;
+    struct kernel_shm_attachment *shm_attachment;
 };
 
 /*
@@ -101,6 +106,13 @@ enum kernel_vma_status kernel_vma_set_insert(
 enum kernel_vma_status kernel_vma_set_lookup(
     const struct kernel_vma_set *set,
     uint64_t virtual_address,
+    struct kernel_vma *vma);
+
+uint32_t kernel_vma_set_count(const struct kernel_vma_set *set);
+
+enum kernel_vma_status kernel_vma_set_get_at(
+    const struct kernel_vma_set *set,
+    uint32_t index,
     struct kernel_vma *vma);
 
 /* First VMA whose start is at or after address. */

@@ -1,3 +1,4 @@
+#include <kernel/cost.h>
 #include <arch/riscv/mm.h>
 #include <arch/riscv/sbi.h>
 #include <arch/riscv/virt_uart.h>
@@ -12,6 +13,7 @@
 #include <kernel/page.h>
 #include <kernel/page_cache.h>
 #include <kernel/socket.h>
+#include <kernel/shm.h>
 #include <kernel/scheduler.h>
 #include <kernel/uaccess.h>
 #include <kernel/vfs.h>
@@ -22,6 +24,21 @@
 static unsigned char pool[128 * MIB] __attribute__((aligned(4096)));
 static unsigned char payload[4096];
 static uint64_t active_satp;
+#if BOAROS_COST_DIAGNOSTICS
+static uint32_t cost_frequency;
+static unsigned cost_copy_measuring;
+static uint64_t cost_copy_observed;
+#endif
+enum kernel_uaccess_status __real_kernel_copy_from_user(struct kernel_mm *, void *, uint64_t, size_t, size_t *);
+enum kernel_uaccess_status __wrap_kernel_copy_from_user(struct kernel_mm *mm, void *to, uint64_t from, size_t size, size_t *copied)
+{
+    enum kernel_uaccess_status status = __real_kernel_copy_from_user(mm, to, from, size, copied);
+#if BOAROS_COST_DIAGNOSTICS
+    if (cost_copy_measuring) cost_copy_observed += *copied;
+#endif
+    return status;
+}
+
 /* This boot fixture has no scheduled tasks. Reject any attempted blocking;
  * only an empty socket queue's notification may be ignored. */
 enum kernel_scheduler_status __wrap_kernel_wait_queue_wake_all(struct kernel_wait_queue *queue)
@@ -30,12 +47,25 @@ enum kernel_scheduler_status __wrap_kernel_wait_queue_wake_all(struct kernel_wai
     return KERNEL_SCHEDULER_STATUS_OK;
 }
 static unsigned fail_page;
-static unsigned fail_metadata;
+static unsigned fail_metadata, fail_packet;
+enum kernel_heap_status __real_kernel_heap_allocate(struct kernel_heap *, size_t, void **);
+enum kernel_heap_status __wrap_kernel_heap_allocate(struct kernel_heap *heap, size_t size, void **out)
+{
+    if (fail_packet && --fail_packet == 0) return KERNEL_HEAP_STATUS_EMPTY;
+    return __real_kernel_heap_allocate(heap, size, out);
+}
 enum kernel_heap_status __real_kernel_heap_allocate_zeroed(struct kernel_heap *, size_t, size_t, void **);
 enum kernel_heap_status __wrap_kernel_heap_allocate_zeroed(struct kernel_heap *heap, size_t n, size_t size, void **out)
 {
+    if (fail_packet && --fail_packet == 0) return KERNEL_HEAP_STATUS_EMPTY;
     if (fail_metadata && --fail_metadata == 0) return KERNEL_HEAP_STATUS_EMPTY;
     return __real_kernel_heap_allocate_zeroed(heap, n, size, out);
+}
+enum kernel_heap_status __real_kernel_heap_resize(struct kernel_heap *, void *, size_t, void **);
+enum kernel_heap_status __wrap_kernel_heap_resize(struct kernel_heap *heap, void *old, size_t size, void **out)
+{
+    if (fail_metadata && --fail_metadata == 0) return KERNEL_HEAP_STATUS_EMPTY;
+    return __real_kernel_heap_resize(heap, old, size, out);
 }
 uint64_t __wrap_riscv_sv39_current_satp(void) { return active_satp; }
 enum physical_page_status __real_physical_page_allocate(struct physical_page_allocator *, uint64_t *);
@@ -118,6 +148,302 @@ static void udp_buffer_oom(struct kernel_files *files, struct kernel_mm *mm)
           kernel_files_close(files, fd, &result) == KERNEL_FILES_STATUS_OK && result == 0, 42);
 }
 
+static void socketpair_scale(struct kernel_files *files, struct kernel_mm *mm)
+{
+    int64_t result;
+    int32_t pair[2];
+    size_t copied;
+
+    /* 1. SOCK_STREAM full-duplex */
+    check(kernel_files_socketpair_create(files, mm, 1, 0, BUFFER, &result) ==
+          KERNEL_FILES_STATUS_OK && result == 0, 80);
+    check(kernel_copy_from_user(mm, pair, BUFFER, sizeof(pair), &copied) ==
+          KERNEL_UACCESS_STATUS_OK && copied == sizeof(pair), 81);
+    check(pair[0] >= 0 && pair[1] >= 0 && pair[0] != pair[1], 82);
+
+    unsigned char test_data[100];
+    for (unsigned i = 0; i < sizeof(test_data); i++) test_data[i] = (unsigned char)(i + 0x5a);
+    check(kernel_copy_to_user(mm, BUFFER + 64, test_data, sizeof(test_data), &copied) ==
+          KERNEL_UACCESS_STATUS_OK && copied == sizeof(test_data), 83);
+    check(kernel_files_write(files, mm, pair[0], BUFFER + 64, sizeof(test_data), &result) ==
+          KERNEL_FILES_STATUS_OK && result == (int64_t)sizeof(test_data), 84);
+
+    unsigned char recv_data[100];
+    check(kernel_files_read(files, mm, pair[1], BUFFER + 256, sizeof(recv_data), &result) ==
+          KERNEL_FILES_STATUS_OK && result == (int64_t)sizeof(recv_data), 85);
+    check(kernel_copy_from_user(mm, recv_data, BUFFER + 256, sizeof(recv_data), &copied) ==
+          KERNEL_UACCESS_STATUS_OK && copied == sizeof(recv_data), 86);
+    for (unsigned i = 0; i < sizeof(recv_data); i++) check(recv_data[i] == test_data[i], 87);
+
+    /* Reverse write: pair[1] -> pair[0] */
+    check(kernel_files_write(files, mm, pair[1], BUFFER + 64, 40, &result) ==
+          KERNEL_FILES_STATUS_OK && result == 40, 88);
+    check(kernel_files_read(files, mm, pair[0], BUFFER + 256, 40, &result) ==
+          KERNEL_FILES_STATUS_OK && result == 40, 89);
+
+    /* Close pair[0]: pair[1] should observe EOF on read and EPIPE on write */
+    check(kernel_files_close(files, pair[0], &result) == KERNEL_FILES_STATUS_OK && result == 0, 90);
+    check(kernel_files_read(files, mm, pair[1], BUFFER + 256, 40, &result) ==
+          KERNEL_FILES_STATUS_OK && result == 0, 91);
+    check(kernel_files_write(files, mm, pair[1], BUFFER + 64, 40, &result) ==
+          KERNEL_FILES_STATUS_OK && result == -KERNEL_EPIPE, 92);
+    check(kernel_files_close(files, pair[1], &result) == KERNEL_FILES_STATUS_OK && result == 0, 93);
+
+    /* 2. SOCK_DGRAM message boundaries */
+    check(kernel_files_socketpair_create(files, mm, 2, 0, BUFFER, &result) ==
+          KERNEL_FILES_STATUS_OK && result == 0, 94);
+    check(kernel_copy_from_user(mm, pair, BUFFER, sizeof(pair), &copied) ==
+          KERNEL_UACCESS_STATUS_OK && copied == sizeof(pair), 95);
+    check(kernel_files_write(files, mm, pair[0], BUFFER + 64, 30, &result) ==
+          KERNEL_FILES_STATUS_OK && result == 30, 96);
+    check(kernel_files_write(files, mm, pair[0], BUFFER + 64, 40, &result) ==
+          KERNEL_FILES_STATUS_OK && result == 40, 97);
+    /* Short read truncates datagram */
+    check(kernel_files_read(files, mm, pair[1], BUFFER + 256, 10, &result) ==
+          KERNEL_FILES_STATUS_OK && result == 10, 98);
+    /* Next read gets the second datagram */
+    check(kernel_files_read(files, mm, pair[1], BUFFER + 256, 100, &result) ==
+          KERNEL_FILES_STATUS_OK && result == 40, 99);
+    check(kernel_files_close(files, pair[0], &result) == KERNEL_FILES_STATUS_OK && result == 0, 100);
+    check(kernel_files_close(files, pair[1], &result) == KERNEL_FILES_STATUS_OK && result == 0, 101);
+}
+
+static void unix_datagram_budget(struct kernel_files *files, struct kernel_mm *mm)
+{
+    int64_t result;
+    int32_t pair[2]; size_t copied;
+    check(kernel_files_socketpair_create(files, mm, 2, 2048, BUFFER, &result) == KERNEL_FILES_STATUS_OK && result == 0, 180);
+    check(kernel_copy_from_user(mm, pair, BUFFER, sizeof(pair), &copied) == KERNEL_UACCESS_STATUS_OK, 181);
+    for (unsigned i = 0; i < 100; i++)
+        check(kernel_files_write(files, mm, pair[0], BUFFER, 0, &result) == KERNEL_FILES_STATUS_OK && result == 0, 182);
+    check(kernel_files_write(files, mm, pair[0], BUFFER, 65536, &result) == KERNEL_FILES_STATUS_OK && result == -KERNEL_EAGAIN, 183);
+    for (unsigned i = 0; i < 100; i++)
+        check(kernel_files_read(files, mm, pair[1], BUFFER, 1, &result) == KERNEL_FILES_STATUS_OK && result == 0, 184);
+    for (unsigned i = 0; i < 4; i++) {
+        check(kernel_files_write(files, mm, pair[0], BUFFER, 65536, &result) == KERNEL_FILES_STATUS_OK && result == 65536, 185);
+        check(kernel_files_write(files, mm, pair[0], BUFFER, 1, &result) == KERNEL_FILES_STATUS_OK && result == -KERNEL_EAGAIN, 186);
+        check(kernel_files_read(files, mm, pair[1], BUFFER, 1, &result) == KERNEL_FILES_STATUS_OK && result == 1, 187);
+    }
+    for (unsigned ordinal = 1; ordinal <= 2; ordinal++) {
+        fail_packet = ordinal;
+        check(kernel_files_write(files, mm, pair[0], BUFFER, 8, &result) == KERNEL_FILES_STATUS_OK && result == -KERNEL_ENOMEM, 192);
+        fail_packet = 0;
+        check(kernel_files_read(files, mm, pair[1], BUFFER, 8, &result) == KERNEL_FILES_STATUS_OK && result == -KERNEL_EAGAIN, 193);
+        check(kernel_files_write(files, mm, pair[0], BUFFER, 8, &result) == KERNEL_FILES_STATUS_OK && result == 8 &&
+            kernel_files_read(files, mm, pair[1], BUFFER, 8, &result) == KERNEL_FILES_STATUS_OK && result == 8, 194);
+    }
+    check(kernel_files_write(files, mm, pair[0], BUFFER, 65537, &result) == KERNEL_FILES_STATUS_OK && result == -KERNEL_EMSGSIZE, 188);
+    check(kernel_files_write(files, mm, pair[0], BUFFER + MIB + 4094, 4, &result) == KERNEL_FILES_STATUS_OK && result == -KERNEL_EFAULT, 189);
+    check(kernel_files_read(files, mm, pair[1], BUFFER, 8, &result) == KERNEL_FILES_STATUS_OK && result == -KERNEL_EAGAIN, 190);
+    check(kernel_files_write(files, mm, pair[0], BUFFER, 65536, &result) == KERNEL_FILES_STATUS_OK && result == 65536 &&
+        kernel_files_read(files, mm, pair[1], 0x12345000, 8, &result) == KERNEL_FILES_STATUS_OK && result == -KERNEL_EFAULT, 195);
+    check(kernel_files_write(files, mm, pair[0], BUFFER, 65536, &result) == KERNEL_FILES_STATUS_OK && result == 65536, 196);
+    check(kernel_files_close(files, pair[1], &result) == KERNEL_FILES_STATUS_OK && !result &&
+        kernel_files_write(files, mm, pair[0], BUFFER, 8, &result) == KERNEL_FILES_STATUS_OK && result == -KERNEL_EPIPE &&
+        kernel_files_close(files, pair[0], &result) == KERNEL_FILES_STATUS_OK && !result, 191);
+}
+
+static void sysv_shm_fragments(struct kernel_mm *mm)
+{
+    for (unsigned scenario = 0; scenario < 6; scenario++) {
+        int32_t id;
+        uint64_t base, replacement = 0;
+        int64_t result;
+        struct kernel_shmid64_ds ds;
+        struct kernel_vma vma;
+        check(kernel_shm_get(0, KERNEL_IPC_PRIVATE, 3 * BOAROS_PAGE_SIZE,
+                            0600, &id) == 0 &&
+              kernel_shm_at_mm(mm, 1, id, 0, 0, &base) == 0, 140);
+        if (scenario == 0) {
+            check(kernel_mm_mprotect(mm, base + BOAROS_PAGE_SIZE,
+                      BOAROS_PAGE_SIZE, KERNEL_MM_READ) == KERNEL_MM_STATUS_OK &&
+                  kernel_shm_ctl_mm(0, id, KERNEL_IPC_STAT,
+                      (uintptr_t)&ds, &result) == 0 && ds.shm_nattch == 3, 141);
+            struct kernel_mm child = {0};
+            check(kernel_mm_fork(&child, mm) == KERNEL_MM_STATUS_OK &&
+                  kernel_shm_ctl_mm(0, id, KERNEL_IPC_STAT,
+                      (uintptr_t)&ds, &result) == 0 && ds.shm_nattch == 6, 142);
+            check(kernel_mm_release(&child) == KERNEL_MM_STATUS_OK, 143);
+        } else if (scenario < 3) {
+            if (scenario == 1)
+                check(kernel_shm_ctl_mm(0, id, KERNEL_IPC_RMID, 0, &result) == 0, 144);
+            check(kernel_mm_munmap(mm, base + (scenario == 1 ? BOAROS_PAGE_SIZE : 0),
+                      BOAROS_PAGE_SIZE) == KERNEL_MM_STATUS_OK &&
+                  kernel_shm_ctl_mm(0, id, KERNEL_IPC_STAT,
+                      (uintptr_t)&ds, &result) == 0 &&
+                  ds.shm_nattch == (scenario == 1 ? 2U : 1U), 145);
+        } else if (scenario < 5) {
+            check(kernel_mm_mmap_anonymous(mm,
+                      base + (scenario == 4 ? BOAROS_PAGE_SIZE : 0),
+                      (scenario == 4 ? 1U : 3U) * BOAROS_PAGE_SIZE,
+                      KERNEL_MM_READ | KERNEL_MM_WRITE, KERNEL_MM_MAP_FIXED,
+                      &replacement) == KERNEL_MM_STATUS_OK &&
+                  kernel_shm_ctl_mm(0, id, KERNEL_IPC_STAT,
+                      (uintptr_t)&ds, &result) == 0 &&
+                  ds.shm_nattch == (scenario == 4 ? 2U : 0U), 146);
+        } else {
+            check(kernel_shm_at_mm(mm, 1, id, base + BOAROS_PAGE_SIZE,
+                      KERNEL_SHM_REMAP, &replacement) == 0 &&
+                  kernel_shm_ctl_mm(0, id, KERNEL_IPC_STAT,
+                      (uintptr_t)&ds, &result) == 0 && ds.shm_nattch == 2, 147);
+        }
+        check(kernel_shm_dt_mm(mm, base) == (scenario == 3 ? -KERNEL_EINVAL : 0), 148);
+        if (scenario == 4 || scenario == 5) {
+            check(kernel_mm_vma_lookup(mm, replacement, &vma) == KERNEL_MM_STATUS_OK &&
+                  vma.kind == (scenario == 4 ? KERNEL_VMA_KIND_ANONYMOUS :
+                                               KERNEL_VMA_KIND_SYSV_SHM), 149);
+            if (scenario == 5) check(kernel_shm_dt_mm(mm, replacement) == 0, 150);
+        }
+        if (scenario != 1) {
+            check(kernel_shm_ctl_mm(0, id, KERNEL_IPC_STAT,
+                      (uintptr_t)&ds, &result) == 0 && ds.shm_nattch == 0 &&
+                  kernel_shm_ctl_mm(0, id, KERNEL_IPC_RMID, 0, &result) == 0, 151);
+        }
+        check(kernel_shm_ctl_mm(0, id, KERNEL_IPC_STAT,
+                  (uintptr_t)&ds, &result) == -KERNEL_EINVAL, 152);
+        if (scenario == 3 || scenario == 4)
+            check(kernel_mm_munmap(mm, replacement,
+                      (scenario == 3 ? 3U : 1U) * BOAROS_PAGE_SIZE) == KERNEL_MM_STATUS_OK, 153);
+        for (unsigned page = 0; page < 4; page++)
+            check(kernel_mm_vma_lookup(mm, base + page * BOAROS_PAGE_SIZE,
+                      &vma) == KERNEL_MM_STATUS_NOT_MAPPED, 154);
+    }
+}
+
+static void sysv_shm_oom(struct kernel_mm *mm)
+{
+    for (unsigned remap = 0; remap < 2; remap++) {
+        for (unsigned ordinal = 1; ; ordinal++) {
+            check(ordinal < 32, 155);
+            int32_t id;
+            uint64_t base = 0, address = 0;
+            int64_t result;
+            struct kernel_shmid64_ds ds;
+            check(kernel_shm_get(0, KERNEL_IPC_PRIVATE, 3 * BOAROS_PAGE_SIZE,
+                                0600, &id) == 0, 156);
+            if (remap) check(kernel_mm_mmap_anonymous(mm, 0, 5 * BOAROS_PAGE_SIZE,
+                KERNEL_MM_READ | KERNEL_MM_WRITE, 0, &base) == KERNEL_MM_STATUS_OK, 157);
+            fail_metadata = ordinal;
+            int attached = kernel_shm_at_mm(mm, 1, id,
+                remap ? base + BOAROS_PAGE_SIZE : 0, remap ? KERNEL_SHM_REMAP : 0, &address);
+            fail_metadata = 0;
+            if (attached) {
+                check(attached == -KERNEL_ENOMEM && address == 0 &&
+                    kernel_shm_ctl_mm(0, id, KERNEL_IPC_STAT, (uintptr_t)&ds, &result) == 0 &&
+                    ds.shm_nattch == 0, 158);
+                if (remap) {
+                    struct kernel_vma vma;
+                    check(kernel_mm_vma_lookup(mm, base + BOAROS_PAGE_SIZE, &vma) ==
+                        KERNEL_MM_STATUS_OK && vma.kind == KERNEL_VMA_KIND_ANONYMOUS, 159);
+                }
+                check(kernel_shm_at_mm(mm, 1, id, remap ? base + BOAROS_PAGE_SIZE : 0,
+                    remap ? KERNEL_SHM_REMAP : 0, &address) == 0, 160);
+            }
+            check(kernel_shm_dt_mm(mm, address) == 0 &&
+                kernel_shm_ctl_mm(0, id, KERNEL_IPC_RMID, 0, &result) == 0, 161);
+            if (remap) check(kernel_mm_munmap(mm, base, 5 * BOAROS_PAGE_SIZE) == KERNEL_MM_STATUS_OK, 162);
+            if (!attached) break;
+        }
+    }
+    int32_t id;
+    uint64_t address;
+    int64_t result;
+    struct kernel_shmid64_ds ds;
+    check(kernel_shm_get(0, KERNEL_IPC_PRIVATE, 3 * BOAROS_PAGE_SIZE, 0600, &id) == 0 &&
+        kernel_shm_at_mm(mm, 1, id, 0, 0, &address) == 0 &&
+        kernel_mm_mprotect(mm, address + BOAROS_PAGE_SIZE, BOAROS_PAGE_SIZE,
+                          KERNEL_MM_READ) == KERNEL_MM_STATUS_OK, 163);
+    for (unsigned pages = 0; pages < 2; pages++) {
+        for (unsigned ordinal = 1; ; ordinal++) {
+            check(ordinal < 128, 164);
+            struct kernel_mm child = {0};
+            if (pages) fail_page = ordinal; else fail_metadata = ordinal;
+            enum kernel_mm_status status = kernel_mm_fork(&child, mm);
+            fail_page = fail_metadata = 0;
+            if (status == KERNEL_MM_STATUS_OK)
+                check(kernel_mm_release(&child) == KERNEL_MM_STATUS_OK, 165);
+            else check(status == KERNEL_MM_STATUS_NO_MEMORY, 166);
+            check(kernel_shm_ctl_mm(0, id, KERNEL_IPC_STAT, (uintptr_t)&ds, &result) == 0 &&
+                  ds.shm_nattch == 3, 167);
+            if (status == KERNEL_MM_STATUS_OK) break;
+        }
+    }
+    check(kernel_shm_dt_mm(mm, address) == 0 &&
+          kernel_shm_ctl_mm(0, id, KERNEL_IPC_RMID, 0, &result) == 0, 168);
+}
+
+static void sysv_shm_scale(struct kernel_mm *mm)
+{
+    /* 1. IPC_PRIVATE segment allocation */
+    int32_t shmid1 = 0;
+    check(kernel_shm_get(0, KERNEL_IPC_PRIVATE, 8192, 0666 | KERNEL_IPC_CREAT, &shmid1) == 0 &&
+          shmid1 >= 0, 110);
+
+    /* 临时 registry owner 回滚不能消费段表的原 owner。 */
+    uint64_t failed_address = UINT64_C(0x55);
+    fail_metadata = 1;
+    check(kernel_shm_at_mm(mm, 1, shmid1, 0, 0, &failed_address) ==
+              -KERNEL_ENOMEM && fail_metadata == 0 &&
+          failed_address == UINT64_C(0x55), 132);
+    fail_metadata = 0;
+
+    /* 2. Attach segment to mm */
+    uint64_t addr1 = 0;
+    check(kernel_shm_at_mm(mm, 1, shmid1, 0, 0, &addr1) == 0 && addr1 != 0, 111);
+
+    /* 3. Write data to addr1 and read back */
+    unsigned char pattern[32];
+    for (int i = 0; i < 32; i++) pattern[i] = (unsigned char)(0xa0 + i);
+    size_t copied = 0;
+    check(kernel_copy_to_user(mm, addr1, pattern, sizeof(pattern), &copied) == KERNEL_UACCESS_STATUS_OK &&
+          copied == sizeof(pattern), 112);
+    unsigned char readback[32];
+    check(kernel_copy_from_user(mm, readback, addr1, sizeof(readback), &copied) == KERNEL_UACCESS_STATUS_OK &&
+          copied == sizeof(readback), 113);
+    for (int i = 0; i < 32; i++) check(readback[i] == pattern[i], 114);
+
+    /* 4. Attach second time at different address */
+    uint64_t addr2 = 0;
+    check(kernel_shm_at_mm(mm, 1, shmid1, 0, 0, &addr2) == 0 && addr2 != 0 && addr2 != addr1, 115);
+    unsigned char readback2[32];
+    check(kernel_copy_from_user(mm, readback2, addr2, sizeof(readback2), &copied) == KERNEL_UACCESS_STATUS_OK, 116);
+    for (int i = 0; i < 32; i++) check(readback2[i] == pattern[i], 117);
+
+    /* 5. IPC_STAT */
+    int64_t res = 0;
+    struct kernel_shmid64_ds ds = {0};
+    check(kernel_shm_ctl_mm(0, shmid1, KERNEL_IPC_STAT, (uint64_t)(uintptr_t)&ds, &res) == 0 && res == 0, 118);
+    check(ds.shm_nattch == 2 && ds.shm_segsz == 8192, 119);
+
+    /* 6. IPC_RMID (marked for deletion, active attachments remain usable) */
+    check(kernel_shm_ctl_mm(0, shmid1, KERNEL_IPC_RMID, 0, &res) == 0 && res == 0, 120);
+
+    /* Verify still accessible via existing mappings */
+    check(kernel_copy_from_user(mm, readback, addr1, sizeof(readback), &copied) == KERNEL_UACCESS_STATUS_OK &&
+          readback[0] == 0xa0, 121);
+
+    /* 7. Detach first mapping */
+    check(kernel_shm_dt_mm(mm, addr1) == 0, 122);
+    check(kernel_shm_ctl_mm(0, shmid1, KERNEL_IPC_STAT, (uint64_t)(uintptr_t)&ds, &res) == 0, 123);
+    check(ds.shm_nattch == 1, 124);
+
+    /* 8. Detach second mapping: nattch reaches 0, segment destroyed */
+    check(kernel_shm_dt_mm(mm, addr2) == 0, 125);
+    check(kernel_shm_ctl_mm(0, shmid1, KERNEL_IPC_STAT, (uint64_t)(uintptr_t)&ds, &res) == -KERNEL_EINVAL, 126);
+
+    /* 9. Test named key conflict and creation */
+    int32_t key = 0x5678;
+    int32_t shmid_named = 0;
+    check(kernel_shm_get(0, key, 4096, 0666 | KERNEL_IPC_CREAT, &shmid_named) == 0, 127);
+    int32_t shmid_dup = 0;
+    check(kernel_shm_get(0, key, 4096, 0666 | KERNEL_IPC_CREAT | KERNEL_IPC_EXCL, &shmid_dup) == -KERNEL_EEXIST, 128);
+    check(kernel_shm_get(0, key, 4096, 0, &shmid_dup) == 0 && shmid_dup == shmid_named, 129);
+    check(kernel_shm_ctl_mm(0, shmid_named, KERNEL_IPC_RMID, 0, &res) == 0, 130);
+    check(kernel_shm_get(0, key, 4096, 0, &shmid_dup) == -KERNEL_ENOENT, 131);
+    sysv_shm_fragments(mm);
+    sysv_shm_oom(mm);
+}
+
 static struct riscv_mm_statistics mapped_cost(struct kernel_files *files,
     struct kernel_mm *mm, int64_t fd, uint64_t bytes)
 {
@@ -155,6 +481,19 @@ static struct riscv_mm_statistics mapped_cost(struct kernel_files *files,
               after.protect_address_flushes == 0 && after.protect_global_flushes == 0, 44);
         check(kernel_mm_release(&clone) == KERNEL_MM_STATUS_OK, 45);
     }
+#if BOAROS_COST_DIAGNOSTICS
+    struct riscv_mm_statistics protect_before, protect_after;
+    riscv_kernel_mm_get_statistics(mm, &protect_before);
+    check(kernel_cost_begin(2, cost_frequency, 1, 0) == 0, 195);
+    check(kernel_mm_mprotect(mm, address, 4096, KERNEL_MM_READ) == KERNEL_MM_STATUS_OK &&
+          kernel_mm_mprotect(mm, address, 4096, KERNEL_MM_READ | KERNEL_MM_WRITE) == KERNEL_MM_STATUS_OK, 196);
+    check(kernel_cost_end(2, 0) == 0, 197);
+    uint64_t observed;
+    riscv_kernel_mm_get_statistics(mm, &protect_after);
+    check(kernel_cost_read(0, COST_MPROTECT_RESIDENT_VISITS, &observed) == 0 && observed == pages * 2, 198);
+    check(kernel_cost_read(0, COST_MPROTECT_PTE_VISITS, &observed) == 0 && observed == protect_after.protect_visits - protect_before.protect_visits, 199);
+    check(kernel_cost_read(0, COST_MPROTECT_ADDRESS_TLB, &observed) == 0 && observed == protect_after.protect_address_flushes - protect_before.protect_address_flushes, 200);
+#endif
     riscv_kernel_mm_get_statistics(mm, &before);
     for (uint64_t i = 0; i < pages; i++) {
         uint64_t index = (i * 4093) & (pages - 1);
@@ -215,7 +554,8 @@ void kernel_main(unsigned long hart, const void *dtb)
               RISCV_SV39_READ | RISCV_SV39_WRITE | RISCV_SV39_EXECUTE) == RISCV_SV39_STATUS_OK &&
           riscv_sv39_map_range(&table, 0x10000000, 0x10000000, 0x200000,
               RISCV_SV39_READ | RISCV_SV39_WRITE) == RISCV_SV39_STATUS_OK &&
-          riscv_sv39_activate(&table) == RISCV_SV39_STATUS_OK, 35);
+          riscv_sv39_activate(&table) == RISCV_SV39_STATUS_OK &&
+          kernel_shm_init(&heap, &allocator) == KERNEL_SHM_STATUS_OK, 35);
     uint64_t baseline = physical_page_available(&allocator);
     check(kernel_page_cache_init(&cache, &heap, &allocator) == KERNEL_PAGE_CACHE_STATUS_OK, 3);
     int found = 0;
@@ -249,9 +589,26 @@ void kernel_main(unsigned long hart, const void *dtb)
     struct kernel_files_statistics before, after;
     kernel_files_get_statistics(&files, &before);
     uint64_t resolutions = kernel_uaccess_page_resolutions();
+#if BOAROS_COST_DIAGNOSTICS
+    struct riscv_virtio_mmio_block_statistics device_before, device_after;
+    riscv_virtio_mmio_block_get_statistics(&device, &device_before);
+    cost_frequency = info.timebase_frequency;
+    check(kernel_cost_begin(1, info.timebase_frequency, 1, 0) == 0, 190);
+    cost_copy_measuring = 1;
+#endif
     check(kernel_files_write(&files, &mm, fd, BUFFER, MIB, &result) == KERNEL_FILES_STATUS_OK &&
           result == MIB, 9);
     resolutions = kernel_uaccess_page_resolutions() - resolutions;
+#if BOAROS_COST_DIAGNOSTICS
+    cost_copy_measuring = 0;
+    check(kernel_cost_end(1, 0) == 0, 191);
+    uint64_t metric;
+    check(kernel_cost_read(0, COST_COPY_FROM_USER, &metric) == 0 && metric == cost_copy_observed && metric == MIB, 192);
+    check(kernel_cost_read(0, COST_USER_RESOLUTIONS, &metric) == 0 && metric == resolutions, 193);
+    riscv_virtio_mmio_block_get_statistics(&device, &device_after);
+    check(kernel_cost_read(0, COST_DEVICE_OTHER_REQUESTS, &metric) == 0 && metric == device_after.requests - device_before.requests, 194);
+    number("cost wrapper copy bytes: ", cost_copy_observed);
+#endif
     kernel_files_get_statistics(&files, &after);
     number("file write chunks: ", after.write_chunks - before.write_chunks);
     number("file user-page resolutions: ", resolutions);
@@ -266,8 +623,11 @@ void kernel_main(unsigned long hart, const void *dtb)
           result == -KERNEL_ENOMEM && fail_page == 0, 14);
     tcp_cost(&files, &mm);
     udp_buffer_oom(&files, &mm);
+    socketpair_scale(&files, &mm);
+    unix_datagram_budget(&files, &mm);
     struct riscv_mm_statistics small = mapped_cost(&files, &mm, fd, 16 * MIB);
     struct riscv_mm_statistics large = mapped_cost(&files, &mm, fd, 64 * MIB);
+    sysv_shm_scale(&mm);
     check(large.resident_probes <= 6 * small.resident_probes, 25);
     check(small.protect_visits <= 6 * (16 * MIB / 4096) &&
           large.protect_visits <= 6 * (64 * MIB / 4096) &&

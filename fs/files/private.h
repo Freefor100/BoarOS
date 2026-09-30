@@ -55,6 +55,14 @@ enum kernel_files_status kernel_files_find_free_fd(
     uint32_t *fd,
     int *linux_result);
 
+enum kernel_files_status kernel_files_find_two_free_fds(
+    struct kernel_files *files, uint32_t *first, uint32_t *second,
+    int64_t *linux_result);
+
+enum kernel_files_status kernel_files_release_uninstalled_description(
+    struct kernel_files *files,
+    struct kernel_open_file_description **owner);
+
 /* Success consumes *owner into an empty fd slot.  The new-owned variant is
  * for an OFD created by the caller; the shared-acquired variant is for a
  * reference the caller already acquired.  Neither helper changes refcounts. */

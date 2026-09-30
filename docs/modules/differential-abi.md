@@ -28,7 +28,7 @@ Linux 原有源码许可证见 `references/linux/COPYING`，构建产物位于�
 - `cases.c` 另覆盖 root UID/GID 四项无参数查询（寄存器留有无效地址仍须忽略）及 fork/exec 后身份；与固定 Linux PID 1 root 环境比较。
 - `harness.py`：构建 Linux、制作镜像、运行两个系统、校验完整协议并做严格 diff。
 - `linux.config`：以 `allnoconfig` 为基础，启用 virt、MMU、ELF、串口、VirtIO
-  MMIO/block、ext4、futex、IPv4 网络和关机所需能力；Linux 自己解析依赖。futex 在首次 robust 差分前显式启用，避免固定 Linux 因精简配置返回 `ENOSYS`。
+  MMIO/block、ext4、futex、IPv4 网络和关机所需能力；Linux 自己解析依赖。futex 在首次 robust 差分前显式启用，避免固定 Linux 因精简配置返回 `ENOSYS`。`CONFIG_RISCV_ISA_FALLBACK=y` 允许固定 Linux 在缺少 `riscv,isa-extensions` 的旧 QEMU 设备树上读取 `riscv,isa`；较新 QEMU 仍优先使用扩展列表。程序清单的 Linux profile 保持同一设置，保证参考侧能使用其实际提供的浮点指令。
 
 每条记录含 ID、返回值、errno、文件 size、OFD offset、子进程 wait status 和
 完整观测数据的十六进制值。fd 与 mmap 地址只有其成功身份规范为 0；错误返回、
@@ -43,6 +43,38 @@ Linux PID 1 在完整输出后 sync 并 reboot poweroff；同一程序在 BoarOS
 调用返回后 exit(42)。这些启动/终止适配不参与案例观测，不影响文件操作路径。
 fixture 内 `/dev/console` 是由 debugfs 创建的字符设备 inode，用于 Linux init
 标准流；无需宿主 root 或 loop mount。
+
+## 独立 Review 组合边界（2026-09-30）
+
+当前完整同 ELF 差分为 **1091 条匹配**。相对 Review 起点的 1031 条，
+新增 `shm.c` 的 key/size/flags 20 条、附件片段计数与固定替换 18 条、权限上限 8 条，
+`socket.c` 的跨向量整包/零消息/复制 fault/64 KiB 边界 9 条，以及 `signals.c` 的
+真实 SEGV MAPERR/ACCERR、BUS、ILL、TRAP 故障信息 5 条。
+来源 pin、OOM、取消及整次文件写竞争另由 scale、io-sleep 与真实 musl 回归保护，
+不把内部探针计入这 1091 条 ABI 记录。
+
+生产内核 SHA-256 `0c0c6a77f54160c06f284f19133b6bb6516f7c6e2d8dcb5f0864390ce1361fbb`，
+用户 ELF `b53026fb30cd2cbeb4f47f275d46b3a69832c1a2997f5a4a75b0c869cebf4668`，
+案例清单 `d730732c4add15275ccb0e9bd7cf35d398948f8af3692529f23de875e0707309`，
+Linux Image `01d60a8ae733f56aa94cf11b4805da1fe876cac09d2ef81e7e7397568ee1f668`。
+实际 QEMU 11.1.1；`make test-diff-abi-riscv` 使用正式默认预算退出 0，
+18 项宿主协议测试也通过。同一生产源码的 RV64 全套、四组合 io-sleep、scale 与
+栈检查通过，生产内核通过 musl 和 glibc 五种形态；完整比赛 Harness 因无 `kernel-la` 保持阻塞。
+
+## 进程、随机与调度阶段（2026-09-29）
+
+该阶段完整同 ELF 差分为 **1000 条匹配**：本阶段新增 coarse clock 14、随机接口 34、
+会话/进程组 105、RT proc 控制 36、调度策略 23 与 proc 调度字段 5 条。
+`session.c` 必须在删除 `/init` 的 proc 用例之前运行，使 exec 子进程仍有真实来源。
+`rt_controls.c` 自建独立 proc 挂载；配置用例退出前恢复预算，后续策略测试不依赖残留状态。
+Linux 配置启用 HWRNG、SYSCTL/PROC_SYSCTL；随机字节仅验证契约，不逐字比较或以不同输出证明熵。
+
+最终内核 SHA-256 `be5ca22629c904a427241b0f92e9d561d0312952e787ab75870ec4beae0143b3`，
+用户 ELF `eea74172f0571c6347005b554e73b54b2d76256af550e9b3bc5506a4f99bb306`。
+并发运行恢复矩阵和程序清单时，默认 60 秒总预算曾在第一个 session 分组后耗尽；
+同一内核/ELF 的 180 秒预算复跑输出完整 END 1000、heap-live=0 并逐条一致。
+独立 105 条 session 窄测也通过，未据超时末条记录推断内核死锁。
+复建后可用 `python3 -B tests/diff-abi/harness.py --kernel kernel-rv --program build/diff-abi/cases-rv --timeout 180` 重复本次完整验收。
 
 ## 构建、缓存与证据
 
@@ -97,3 +129,9 @@ Linux commit。较长请求的上游 RISC-V usercopy 进展问题留作独立 re
 `child_tid.c` 记录 fork/vfork/thread 的 CHILD_SETTID、CHILD_CLEARTID 与成功/失败 exec；由 `start.S` 提供独立子栈 trampoline，避免 C 函数在换栈后误用父栈。当前 child-TID 阶段完整 manifest 为 556 条。
 
 脚本差分要求 Linux 配置 `CONFIG_BINFMT_SCRIPT=y`；关闭时两侧 ENOEXEC 一致不能证明 shebang 正确。`exec_script.c` 检查参数、环境、嵌套、无换行与错误边界。
+
+本轮 tmpfs 对照内核配置必须同时启用 CONFIG_SHMEM=y 与 CONFIG_TMPFS=y。
+仅启用 TMPFS 会被 Kconfig 依赖裁掉；Linux 可退回 ramfs 接受 tmpfs 挂载名称，
+却忽略配额，不能用它作为 tmpfs 参考。运行前核对生成 .config 与缓存身份。
+新增 hardlink、tmpfs 配额/空洞/映射/生命周期及选项差分；动态容量仍比较来源
+和关系，不要求两个系统的物理内存或负载相等。

@@ -5,79 +5,146 @@
 Linux 为 `references/linux` 的 `f4cdf7ca9a1fdcca413157df19753f388a5a224e`。
 历史评审是调查输入，不自动成为设计批准。
 
-## 已交付：通用 VFS、挂载基础与真实 procfs
+此前于 `main@959da70` 完成仅文档审计；下面独立 Review 小节记录新一轮实际修复与验证。
+下列“已交付”引用该阶段证据，“未实现”据当前源码，“待定位”不等于已证实内核缺陷。
 
-基线 `main@ba7e6d8`。已确认统一 VFS 对象、分阶段交付：通用实例/inode/目录项与
-后端分离 → 挂载树和跨挂载路径 → null/zero/console 设备后端 → 真实 procfs。
-维持 RV64/QEMU virt/单 hart；ext4 持久化、页缓存、映射、记录锁和睡眠 I/O 不回退。
-默认 PID 1 不变，由用户态创建挂载点并挂载 proc；不包含比赛路径或输出特判。
+## 独立 Review 的组合边界（2026-09-30）
 
-| 阶段 | 状态 | 可独立验收的交付 |
-|---|---|---|
-| 通用 VFS 与 ext4 后端 | 已验证，生成式文件已接入 | 实例/inode 身份、目录项和引用；普通缓存文件与生成文件分离；保留日志/错误 owner |
-| 挂载树与路径 | 内部路径及 proc 的用户态 mount/umount2 已验证 | 保持同点覆盖、根和 ..、cwd/dirfd、忙卸载/回滚；真实第二盘与更多后端留后续阶段 |
-| 字符设备后端 | 已验证 | 按设备号登记 null/zero/console 操作，OFD 持有后端；/dev 仍为 ext4 目录，不冒充 devfs |
-| procfs 与对象链接 | 首批真实字段和对象链接已通过固定 Linux 差分 | 已覆盖删除执行文件、旧进程目录、fd 复用、生成文件跨页 fault、线程组退出及非组长 exec；持续高压 fd 复用仍待专测。缺少 /dev/console 时的启动兜底无路径链接 |
-| 集成与评测交接 | 主线回归完成；评测分支已单向接收并完成一次固定预算 RV 原 judge 评分 | 679 条 ABI 差分、228 项清单、SQLite DELETE/WAL 完整恢复矩阵等主线证据见 learning；评分身份与 22 组状态只见评测分支，不拼接成绩 |
+核实起点为 `main@d2a548d`，Review ZIP SHA-256 为 `c462c3a48c6ed22ea83118c4117a9d113f25e455192a9224016aeb8166bb0c7f`；八个关键文件与该起点一致。旧 1031 条 ABI、VMA/scale 基线缺少本次组合边界，不能反证本次缺陷。修复后新增回归先证伪旧实现，最终 1091 条固定 RV64 Linux/BoarOS 记录一致。完整 RV64、musl、glibc 五种形态、四组合 io-sleep、scale 与栈检查通过；栈静态分析覆盖 1674 函数，最大 2368 字节。SQLite WAL/重启双侧及当前内核的 126 切点、26 写失败、16 flush 失败恢复矩阵通过，固定输入见[恢复记录](learning/record-lock-sqlite-recovery.md)。独立全改动审查未发现 Critical/Important 缺陷。
 
-进程查询区分 PID 分配代次，旧 proc 对象不能访问复用 PID 的新进程。MM 持有执行
-文件引用，exec 成功提交时替换；对象链接不能退化成路径字符串重查。fd 解析固定
-当次对象，重新打开普通文件形成独立 OFD，不能用 dup 冒充。生成文本使用 OFD
-读取状态，锁外复制到用户；统计字段来自真实计数，不用零掩盖尚未统计的能力。
+完整比赛 Harness 保持阻塞、未执行：本地 `references/oscomp-autotest/kernel/run.py`（commit `d1bb3a3c4b27274e196a2648518525c1a304e339`）同时启动 `kernel-rv` 与 `kernel-la`，当前 `make all` 只有前者且后者缺失。不能以本轮 RV64 测试替代双架构验收；本轮没有 push、发布或阶段转换。
 
-### 分支、验证与交接
+2026-09-30 独立 Review 的组合边界修复：
+
+- [x] R1（`7d89d2f`）：SHM 附加 registry OOM 回滚不消费段表 owner；scale 聚焦故障后重试及最终页回收通过。
+- [x] R2（`e5769ee`）：显式 attachment 与通用 VMA 片段 open/close；覆盖分裂、起始页撤销、RMID、匿名/文件/SHM 固定替换、fork/退出与 metadata/page OOM，保持 prepare/commit 失败原子性。
+- [x] R3（`f30f521`）：file-source 操作 pin 覆盖 msync 的 inode 等待与错误游标；三任务最后撤映射、终止请求、同步/关闭失败及最终清理通过四种 io-sleep 配置。
+- [x] R4（`5008e09`）：AF_UNIX DGRAM 整包复制/提交、零消息和整包预算；差分、scale OOM/fault/容量复用与真实 pthread 整包等待/取消通过。
+- [x] R5（`d8052ee`，完成断言修正 `c76bd0e`）：线程同步故障记录与统一返回交付、si_code/si_addr、阻塞/忽略强制默认；真实 U-mode 修复/上下文返回、坏帧和默认组退出及 5 条固定 Linux 故障差分通过。
+- [x] R6（`dad0005`）：通用 `maximum_permissions` 替代文件专用布尔量；只读附件 WRITE 升级在 PTE 修改前返回 EACCES，split/fork 保留上限，8 条新增固定 Linux 差分通过。
+- [x] R7（`dd1467c`）：rank 15 inode 写操作门闩覆盖整次 write/writev/pwrite/append/同步收尾与截断；四种 io-sleep 配置、同 inode 缺页缓冲、实际 U-mode 向量追加和 partial-write 通过。SQLite WAL/重启双侧及完整 WAL 恢复矩阵通过。
+- [x] R8（`b104889`）：已有 key 的零大小查找与创建下限分开；已有/缺失 key、零/合法/超原段大小、CREAT/EXCL 的 20 条新增固定 Linux 差分通过。
 
 通用实现、测试、模块和 learning 在 main 分阶段提交；评测分支只单向 merge 已验收
 主线，维护 uname 4.15、启动环境和评分身份，不整体合回 main、不重复 cherry-pick。
 沿现有工作区串行交接；不 push、不发布、不提交比赛，不增加 codex/ 前缀。
 本分支的启动配置、原 judge 口径和单次评分身份只见[RV 评测模块](modules/oscomp-rv.md)。
 
-每阶段先固定 Linux 最小复现、模块测试和真实 U-mode，再扩大回归。本轮已运行
-RISC-V 全套、679 条 ABI 差分、userland、glibc、栈、规模、睡眠 I/O，以及 ext4、
-SQLite DELETE/WAL 和完整恢复矩阵；228 项清单为 227 pass、1 个原包装脚本失败。
-交接记录归对应模块/learning，评分身份只归
-评测分支报告；不新增平行 plan/spec 或重复台账。阶段结束预览后执行 make prune-build。
-RV/LA 原始 .img/.img.xz 永久留在 references/oscomp-autotest/，运行副本和日志不提交。
+## 已交付：进程身份、可信随机数与真实调度
 
-### 已完成的上一轮
+从 `main@b5593ca` 演进，统一 TID/TGID/PGID/SID 身份对象、会话/进程组、
+coarse clock、VirtIO RNG 与随机接口，以及 OTHER/FIFO/RR、CPU0 affinity 和
+全局实时带宽已交付。默认周期 1 秒、预算 950 毫秒是本项目选定参数。
+该阶段完整差分 **1000 条匹配**；228 项清单 **227 pass、原 BusyBox 包装器 1 项失败**，
+逐 ID 无回退。固定 BusyBox、libc daemon、原 iperf/cyclictest 的实际调用链、
+原静态/动态 utime 各 30 次双侧复跑，以及普通/实时双盘进展均有证据。
+RISC-V、userland/glibc、规模、睡眠 I/O、栈、离线 GCC ext4/tmpfs、ext4 恢复与
+SQLite DELETE/WAL 完整矩阵通过；不同验证快照的边界明确分列。
 
-通用代码 `29125b6` 已交付 child-TID、shebang、PID 1 配置和 mknodat；583 条差分、
-RISC-V 全套、userland、glibc、栈及相关存储回归通过。契约见对应模块，脚本依据见
-[ELF 学习](learning/elf-loading.md)，线程依据见[线程与 futex](learning/threads-and-futex.md)。
-评测分支以 `635a12a` 完成一次 3600 秒 RV 评分；详细身份和成绩保留在该分支。
-上一轮未重跑 228 项清单或逐事件完整恢复矩阵，不把历史结果冒充该轮结果。
+证据与重建命令见[完整差分](modules/differential-abi.md)、
+[程序清单](learning/user-program-inventory.md)、[消费者](learning/session-consumers.md)、
+[调度](learning/kernel-scheduling.md)及[恢复矩阵](learning/record-lock-sqlite-recovery.md)。
+本阶段未扩展 TTY、完整凭据、PI futex、PID namespace、nice 权重或 SMP，
+不承诺硬实时；iperf 网络连接、mlock、chown 和 cgroup 缺口保留独立归属。
+固定依据为本页 Linux 和 QEMU v11.1.0；实际运行 QEMU 为 11.1.1。
+
+## 前置交付与历史证据入口
+
+历史数字用于识别阶段，不替代上方最新基线；逐次输入哈希、失败原因和重建命令归 learning。
+
+| 已交付基础 | 证据入口 |
+|---|---|
+| child-TID、shebang、PID 1 配置、设备节点 | [线程与 futex](learning/threads-and-futex.md)、[ELF](learning/elf-loading.md)、[根启动](modules/riscv-root-boot.md) |
+| 通用 VFS、挂载路径、proc 代次/OFD、fd 复用压力 | [VFS](modules/vfs-ext4.md)、[procfs](modules/procfs.md) |
+| 真实内存/sysinfo、阈值写回、水位回收、可睡眠 I/O | [内存](learning/memory-management.md)、[存储](learning/sleepable-storage.md) |
+| 统一内存后备、tmpfs、硬链接、真实第二盘 | [多挂载验收](learning/memory-backed-mounts.md)、[tmpfs](modules/tmpfs.md)；该阶段为 783 条 ABI |
+| 进程/随机/调度与完整存储矩阵阶段 | [消费者](learning/session-consumers.md)、[程序清单](learning/user-program-inventory.md)、[恢复](learning/record-lock-sqlite-recovery.md)；该阶段为 1000 条 ABI |
+
+正常开发沿 main；评测分支只单向接收已验收主线，其 uname/镜像适配和正式成绩
+不合回通用实现。旧评测结果不是本轮成绩，分支交接、push、发布及正式评分由维护者决定。
+仅在有新机制/证据时更新 README、模块与 learning，依赖/阻塞/优先级只在本页维护。
+阶段收口记录可重建输入与结论后预览并执行 make prune-build；原始参考镜像保留，
+运行副本、日志及临时 plan/spec 不入库。
 
 ### 直接观测的缺口与定位队列
 
-依据为上述 RV 原镜像运行与固定 autotest `d1bb3a3`。未到达不等于已测失败。
+依据为固定 autotest `d1bb3a3` 原镜像诊断及最新进程阶段独立复跑。下表明确区分已解除、仍阻塞和待定位；未到达不等于已测失败。
 
 | 观测 | 结论边界与归属 |
 |---|---|
 | libctest 包装器存在却 not found | P1h 真实 self/exe 已解除 BusyBox ENOEXEC 回退的前置阻塞；内部失败需按 libc 与 syscall 分别复现，不能再归为内核缺 shebang |
-| LTP 缺 meminfo，最终反复读 /proc/5/stat | 路径及进程对象前置已解除，但新运行 53 次在 `tst_memutils.c:94` 缺真实 `Cached` 字段；固定二进制先可选读 `MemAvailable`，再必需读 `MemFree`/`Cached`。P1h 待设计真实缓存/可用内存统计来源；不能填假零 |
-| LTP 到 `cgroup_fj_proc` 后无输出 | 同次运行第 107 个案例处耗尽总预算；此前 `cgroup_fj_function.sh` 有 setpgid ENOSYS 和控制器缺失。P0 先隔离等待/信号/进程组调用链，不能仅凭案例名指定修复 |
-| BusyBox df/ps/free 的实际内容 | 目录枚举修正后 ps 实际列出进程；df 仍因固定 BusyBox 跳过来源名 rootfs、proc 的块数为零而只显示表头；free 调用尚无 sysinfo ABI，显示全零。P1h/P5 环境接口分别处理，不以退出 0 算内容正确 |
+| LTP 缺 meminfo，最终反复读 /proc/5/stat | 真实 Cached/MemAvailable 已交付；独立原 abort01 越过内存查询，首次停在 chown ENOSYS。历史反复查询不能据此推断等待死锁 |
+| LTP 到 `cgroup_fj_proc` 后无输出 | 独立 Linux/BoarOS 均在无参数 helper 的 sigsuspend 等待，3 秒后 SIGKILL/wait 正常；原 runner 无参数枚举辅助程序会耗尽预算。function 的参数和控制器缺口另列；本轮复跑已越过 setpgid，见程序清单 learning |
+| BusyBox df/ps/free 的实际内容 | 目录枚举修正后 ps 实际列出进程；最新清单的 df 列出 /dev/shm 的 tmpfs，但仍跳过来源名 rootfs 的根盘；free 已通过并由真实 sysinfo/meminfo 提供非零容量、缓存与可用量；df 的来源策略仍单列，不以退出 0 算内容正确 |
 | dmesg klogctl 未实现 | P5c 日志接口，必须有真实内容与权限边界 |
-| hwclock、kill 10 未计分 | P0 定位调用与目标状态；已有其他 kill 回归通过 |
-| cyclictest affinity ENOSYS、调度参数失败 | P2f 调度 ABI；完整依赖链另核实 |
-| hackbench 创建 fdpair 失败 | N2 先定位 socketpair/AF_UNIX 调用，不能直接扩大 TCP API |
-| iperf 缺 urandom、daemon 化失败 | P5c 随机设备；P2d 先缩小 daemon 首个失败调用 |
-| iozone 吞吐 shmget ENOSYS | P4f SysV IPC；共享匿名 mmap 不等于 SysV 生命周期 |
+| hwclock 无 RTC 字符接口 | 最新原包装器无法打开 /dev/misc/rtc；内核已有 RTC 时钟来源不等于已提供用户 RTC 设备/ioctl，归 P5c |
+| 历史 kill 10 未计分 | 原目标/脚本环境需单列；最新 55 子项包装器的启动子进程再 kill 已通过，不能继续当作该清单失败 |
+| cyclictest 原 affinity/调度阻塞 | 本轮原 ELF 已真实调用调度接口并完成 C:10；mlock 仍 ENOSYS，尚不声明完整延迟或锁页能力 |
+| hackbench 创建 fdpair 失败 | N2 已交付 AF_UNIX / socketpair (199)，支持 STREAM/DGRAM、背压与关闭语义，原版 hackbench 运行通过且关机 heap-live=0 |
+| iperf 原随机/daemon 阻塞 | 原 iperf 客户端已越过随机接口与 affinity，当前停在 loopback connect ECONNRESET；另有独立 libc daemon 探针通过，未宣称原 iperf daemon 模式完成 |
+| iozone 吞吐 shmget ENOSYS | P4f SysV IPC 已交付 shmget/shmat/shmdt/shmctl，支持 IPC_PRIVATE 与命名 key、RMID 延迟销毁和 fork/exit 继承与清理，原阻塞解除 |
 | iozone 自动模式能完成，慢写和日期异常 | P0/P7 分别复现时间 ABI 与写入成本；不是永久卡死证据 |
 | lmbench /tmp/hello 启动错误仍有计时 | 原镜像 hello 脚本写死 `/code/lmbench_src/bin/build/lmbench_all`，根盘缺该目录；评测分支按 libc 链接镜像自带二进制，不能把原环境缺口归为通用 exec 失败 |
-| glibc libctest static utime 一轮通过、一轮失败 | 原测试在 UTIME_NOW 后要求 fstat 时间不早于 time(0)；动态版两轮均失败。P0 用同一 ELF 独立复现时间/文件元数据边界，未定位前不把一分变化归因于 proc 修复 |
+| glibc libctest static utime 一轮通过、一轮失败 | 原镜像 libc 的 time() 使用 CLOCK_REALTIME_COARSE，BoarOS 返回 EINVAL 后旧 libc 仍读取结果，导致比较不稳定；独立 realtime/UTIME_NOW/fstat 跨秒正确。本轮已补齐 coarse clock，原静态/动态 ELF 双侧各 30 次通过；作为已关闭缺口保留原因，见时间戳 learning |
 | musl LTP、Lua、netperf 未到达 | 本轮没有独立能力结论，历史诊断与新基线分开 |
 
 待定位项先交付独立复现与结论，再决定机制修改；不按分数猜测根因。
 
-## 后续优先顺序
+## 当前局限与证据边界
 
-已交付的 P1h 首批路线完成；其余结构性方案仍为**待设计**，写入路线不等于批准实现。
+| 方向 | 已有基础 | 尚缺能力或尚未证明的结论 |
+|---|---|---|
+| IPC / 共享内存 | 共享匿名、统一后备对象、tmpfs/POSIX shm、匿名共享 futex、AF_UNIX/socketpair、SysV 共享内存 | SysV 信号量与消息队列尚无入口；AF_UNIX 命名端点/SCM_RIGHTS、共享文件 futex、PI 仍缺 |
+| 文件与存储 | 页缓存、阈值写回、真实同步、日志恢复、多盘独立 owner | 范围写回顺序扫描与逐页提交；fdatasync 与 fsync 共用保守路径；无周期清脏、事务合并、预读或负目录项缓存 |
+| 并发与调度 | 单 hart IRQ 等待、每盘八槽、读共享/写独占、FIFO/RR 及预算 | 单盘后端写事务串行；同 OFD 位置、命名空间和冲突 inode 互斥；八槽不代表每个应用都可产生八个并发请求；无 SMP/PI/硬实时 |
+| 内存与信号 | demand paging、COW、fork、线程与标准信号 | mremap、按操作区分的 madvise、mlock、sigaltstack、实时信号队列未交付 |
+| 系统环境与安全 | sysinfo/proc、会话、可信虚拟熵源、固定 root 查询 | klogctl、RTC 字符接口、完整凭据/权限、TTY、内核栈 guard、实板熵源仍缺；canary 不等于 guard |
+| 网络与应用 | IPv4 loopback、原 socket entry、原 cyclictest C:10、固定离线 GCC | iperf 连接差异未归因，netperf 尚无独立结论；无真实网卡；更大 C/Rust 构建、完整 libc/LTP 未证明 |
 
-1. **P1h proc 精度收尾与 tmpfs/多挂载**：先为 `Cached`/`MemAvailable` 建立真实来源、固定 Linux 对照和原消费者复验，补高压 fd 复用证据；实现取舍待设计。随后交付 tmpfs 的页/目录/引用、空间耗尽、截断与卸载回收，扩大 mount/umount 验收。
-3. **P2/P5c 剩余环境接口**：随机数、会话、调度按真实调用链分项交付；SysV IPC 已暴露 shmget 缺口，接口与 owner 仍待设计；不以固定文本或成功存根绕过需求。
-4. **N/P7 网络与性能定位**：继续缩小 netperf 地址解析、iozone 写入长耗时和异常日期。完整预算下 iozone 自动模式可结束，吞吐子项被 shmget ENOSYS 阻断；不能再把短预算超时写成永久卡死。未定位现象不能直接写成机制修改任务。
-5. 先隔离 LTP `cgroup_fj_proc` 等待和 `utime` 时间差异，在可信评分新基线上重排其余 LTP 缺口，再推进 P6 SMP、L LoongArch、实板及更大工具链。
+`busybox.official` 是唯一未通过的顶层清单案例，但内部为 **53/55**：dmesg 与 hwclock
+失败。Linux 同脚本 55/55；shell exit 0 不代表断言通过。df 根盘展示另有内容缺口。
+这不缩减上表范围，也不表示当前 1091 条 ABI 覆盖所有 Linux 接口。
+
+## 后续开发顺序与进入条件
+
+保持用户态兼容性优先；以下是建议排期与验收边界，尚未批准任何新子系统架构。
+AF_UNIX/socketpair 与 SysV 共享内存已在本轮分别交付并闭环验证。存储成本诊断、
+系统环境小闭环与真实消费者定位继续推进。
+
+| 阶段 | 工作与最小交付 | 进入下一步的证据 |
+|---|---|---|
+| 已完成：IPC 复现与路线 | 固定 hackbench、iozone 原 ELF/参数并确认调用链；AF_UNIX 复用 socket endpoint/OFD，SysV 段表复用 memory_object，路线已选定 | 原失败、所需 syscall/flags 与后续阻塞记录在 N2/P4f；不把未到达调用标失败 |
+| 已交付：IPC 与组合边界 | N2 的 AF_UNIX/socketpair 与 P4f 的 SysV shm 各自提交；本轮 R1/R2/R4/R6/R8 继续修复 owner、片段、权限和整包契约 | 生命周期、fork/exec/退出、fault/OOM、并发关闭/删除、ID 复用差分通过；原程序后续能力与本轮回归分别记证据 |
+| 同期诊断：存储成本 | 对 iozone 慢写和小写同步建立计数分解，先分离缓存接收、写回、journal/flush、扫描和锁等待 | 固定负载/容量/缓存/同步语义；因果证据达到下节门槛后才选优化，不以 QEMU 墙钟倍数定瓶颈 |
+| 随后：系统环境小闭环 | P5c 分别设计真实日志读取、RTC 字符节点；单独核实 df 根盘来源展示 | 原 BusyBox 55 子项及实际内容；dmesg 来自真实日志，hwclock 来自设备读数；不得改包装器或用空成功 |
+| 持续：真实消费者诊断 | iperf/netperf 使用受控监听端、网络配置和固定参数；iozone 日期、其余 libc/LTP 单独复现 | 区分启动环境、无监听、ABI、协议和预算；cyclictest 的 mlock、LTP 的 chown/cgroup 各自归属，不能由一次 ENOSYS 推出完整子系统范围 |
+| 后续兼容性 | P2c 信号栈/实时队列，P4d 文件 futex、P4e mremap/madvise 与锁页需求，凭据/TTY 按消费者立项 | 先固定真实触发与所有权，特别是取消、exec、截断和限额；不因已有基础而勾选完成 |
+| 新基线之后 | SMP、LoongArch、实板、更大 C/Rust 工程各立里程碑 | SMP 先跨核 owner/TLB，LoongArch 先真实 U-mode，复杂工程先单核正确性；已有单核 I/O 不能冒充 SMP 安全 |
+
+### 存储成本调查与优化门槛
+
+当前源码入口：`fs/files/io.c`、`fs/page_cache.c`、`fs/vfs.c`、`fs/lwext4_port.c`、
+`arch/riscv/virtio_mmio_block.c`；机制/锁边界见[VFS/ext4](modules/vfs-ext4.md)。
+固定 Linux `mm/filemap.c`、`fs/fs-writeback.c`、`fs/sync.c` 仅作语义与机制对照，
+不能据 Linux 架构或 BoarOS 静态锁数量直接推定耗时比例。
+
+- [ ] 建立普通 write、O_SYNC/O_DSYNC、每次/每批 fsync/fdatasync、共享映射+msync 对照；包含小写/页写、顺序/随机、覆盖/扩展、同 inode/不同 inode、单盘/双盘、冷/热缓存与压力状态。
+- [ ] 分别计数用户复制和页解析、缓存命中/扫描/快照、实际数据/metadata 写入、事务/flush、设备请求字节与在途深度、队列等待和各层锁持有/等待；计时区分客体运行与 I/O 等待，不把宿主暂停计作内核计算。
+- [ ] 以已通过的 1 MiB 写入 256 分块/256 页解析、16→64 MiB resident 探测增长 3.95 倍作为既有成本边界；新负载另测，不外推已有数字。
+- [ ] 根据测量选择一次可归因改动，保留无收益结果；周期清脏会改变策略，不能以“优化”名义默默加入已明确排除的功能。
+- [ ] 涉及写回/事务/队列时重跑错误 owner、退出卸载、双盘隔离与 SQLite DELETE/WAL 完整恢复矩阵；按新事件轨迹枚举，不削弱 flush 契约换成绩。
+
+### 既有 IPC 路线与待确认的存储候选
+
+| 问题 | 候选比较与当前路线 |
+|---|---|
+| SysV shm 对象 | 已采用专用 key/id 表与 segment owner，复用 memory_object，并在 R2 增加稳定 attachment。匿名内存文件路线可复用文件接口，但增加隐藏挂载、名字与 fd 生命周期隔离成本，未采用。 |
+| AF_UNIX/socketpair | 已采用 socket endpoint 内的缓冲/等待原语；R4 单独维护整包 owner 与预算。独立本地传输后端便于以后名字空间/SCM_RIGHTS，但增加 endpoint 交接接口，未采用。 |
+| 存储瓶颈 | ① 若扫描占比高，增加脏页/范围索引，成本是索引内存与失效一致性；② 若小请求/屏障放大占比高，批量数据提交或事务合并，收益需覆盖错误归属与恢复复杂度；③ 若锁等待主导，缩小路径/inode/实例临界区，需新增 pin/版本复查而非单纯删锁。按数据选，不能预先三项全做。 |
+
+SysV/UNIX 固定语义入口分别为本页 Linux commit 的 `ipc/shm.c`、`ipc/util.c` 与
+`net/unix/af_unix.c`。既定路线内的小修继续验证；新的结构性存储优化仍须先测量，再由维护者确认路线。
+水位/预算不承诺任意分配成功或硬实时；push、发布、评测分支交接与正式评分仍由维护者决定。
 
 ## 已完成能力的证据入口
 
@@ -112,6 +179,145 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 ```
 
 箭头表示主要验收依赖，不禁止先做块 flush、试跑 SQLite/编译器或启动第二架构。网络不依赖多核编译；匿名共享不必等文件持久化；2 hart 启动不等于 SMP 已完成。
+
+## Review P-A–P-E：成本核实与测量门槛
+
+这些是源码成本结构，尚无本轮延迟/吞吐收益结论。deadline 结构、选择性唤醒和驻留范围索引重构继续等待测量与路线确认。已有 scale 的页解析/PTE 访问计数不能代替以下各层总成本。
+
+| 项目 | 当前核实 | 待测工作负载和验收门槛 |
+|---|---|---|
+| P-A deadline | `kernel/sched/wait.c::kernel_scheduler_expire_deadlines` 每 tick 遍历全部 blocked，包括无 deadline 的等待者 | 固定少量到期任务，增加无期限 blocked；计扫描节点、最大 IRQ 占用、到期偏差。保持超时/取消一致后，才比较独立定时结构。 |
+| P-B 改权 | `arch/riscv/mm.c::kernel_mm_mprotect` 仍遍历全部 file_residents；R6 权限上限检查已限定到重叠 VMA，数组编辑/合并成本仍在 | 固定单页目标，增加无关 VMA/驻留页；把 prepare/commit、resident 与 PTE 访问都计入，禁止只报告目标页计数。先获得总探测数，再选择范围索引。 |
+| P-C 唤醒 | `kernel/sched/sync.c::kernel_lock_release` 在可用时 wake_all，等待写者阻止新读者；新写门闩复用这一机制 | 独立 inode 与同 inode 混合读写，计有效唤醒、再次睡眠、切换、等待分位与最长饥饿。保持取消/超时与进展，不直接改 wake_one。 |
+| P-D 小写 | 普通文件/TCP 非零请求仍分配整页 staging；AF_UNIX DGRAM 已改整包 heap owner，有界为 64 KiB | 1/3/63/64/65/4096 字节 × 缓存冷/热，计每调用物理/heap 分配、复制字节和峰值所有权。优化后须保留 fault/OOM/退出清理与消息原子性。 |
+| P-E 延迟 | `arch/riscv/trap_entry.S` 至用户返回保持 SIE 关闭；缓存命中的大复制/扫描可能无睡眠点 | 固定大复制/改权与独立唤醒任务，计 irq-off 最大值、锁持有/等待、唤醒到运行延迟和切换。先明确重入约束，不随意开中断/yield，不承诺硬实时。 |
+
+下列 C0–C6 已交付成本诊断和真实消费者状态；受控成本证据不能代替消费者兼容通过或正式评测。
+
+## 本轮：成本测量优先（2026-09-30 验收）
+
+维护者已选择先量化写入、扫描、唤醒和延迟，再决定优化。目标是得到能归因、可重建的
+成本基线，保护 R1–R8 已验收的行为；最终完成 20 配置、60 串行独立启动和 339 观测窗口，见[最终报告与归档](learning/cost-baseline.md)。C0–C5 受控负载验收通过；C6 完整记录原消费者的完成、不可用、超时和启动拒绝，但实际旧 glibc I/O 测量及超时归因未完成，C6 尚未完全验收，未将这些阻塞算作兼容通过。尚无新的结构优化。
+起点为本轮最终生产源码，内核 SHA-256
+`0c0c6a77f54160c06f284f19133b6bb6516f7c6e2d8dcb5f0864390ce1361fbb`，
+1091 条 ABI、四组合 io-sleep、scale 与 WAL 恢复证据见上文。
+
+固定事实入口为 `references/linux` commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`
+的 `fs/read_write.c`、`mm/filemap.c`、`mm/mprotect.c`、`kernel/sched/`，及
+`references/qemu` v11.1.0 commit `84f07211cc5b4fc6a371559bf8a5de4fb068e648` 的 VirtIO/NBD；
+实际运行记录 QEMU 版本与哈希，不预设某台宿主的墙钟速度。
+
+### 观测方式候选与边界
+
+| 候选 | 正确性与演进 | 复杂度与观测成本 |
+|---|---|---|
+| ① 默认关闭的分层聚合统计，复用现有 MM/设备统计（推荐） | 在实际 syscall、MM、调度和存储边界计数；按 task/MM/inode/设备区分范围，切换时结算运行时间；不增加 Linux 用户 ABI | 热路径不分配、不打印、不等待；固定计数器/直方图占用可核对，必须验证默认关闭和观测开销；可逐层扩展 |
+| ② 仅测试链接包装器及 NBD 外部计数 | 易复用 scale/io-sleep 故障探针，基本不改生产路径；可独立校验候选①的关键计数 | 看不到 static/inline 内部扫描和完整 trap 区间，独立生产 U-mode 的归因不完整；适合辅助检错 |
+| ③ 有界事件环记录时间线 | 能还原复杂等待与嵌套关系，便于后续并发诊断 | 增加事件格式、丢失/溢出、采样和对象代次管理，扰动及存储成本更高；本阶段不建议先建通用追踪系统 |
+
+维护者已确认并实施候选①配合候选②独立检错，接口与 owner/生命周期已验收；当前已确认的是测量优先的范围，
+不是 deadline 索引、wake_one、驻留范围树或事务合并路线。关闭观测时不添加热路径工作；
+开启时所有计数按真实操作递增，不能按测例 ID/固定输入切换语义。
+
+输出同时记录请求字节、实际接受字节及各层复制/设备字节，错误和短写保留真实结果。
+数据/metadata/journal 分类必须有实际后端来源依据；无法唯一分类的字节列为 unknown，
+不按固定扇区号或测例输入猜测。峰值统计只记录本层实际 owner，避免把同一后备页的多个引用重复当容量。
+层间嵌套时间不能直接相加当作总时间；运行、就绪等待、I/O 阻塞、主动暂扣响应分别标记。
+计时使用客体单调时钟并记录分辨率；宿主暂停、QEMU 墙钟和调度 tick 不冒充指令执行成本。
+按 hart 实际 SIE 跟踪连续 IRQ-off；SIE 保持关闭的上下文切换不截断，恢复中断后的睡眠不计入。采样段的前后盲区单列，不宣称硬件上界。
+
+### C0：观测契约、固定输入与独立检错
+
+入口为 `include/arch/riscv/mm.h::riscv_kernel_mm_get_statistics`、
+`include/arch/riscv/virtio_mmio_block.h::riscv_virtio_mmio_block_get_statistics`、
+`include/kernel/sync.h` 和 `kernel/sched/scheduling.c::scheduler_account_runtime`。
+已新增 `tests/cost-riscv.py`、`tests/test-cost-report.py` 与 Makefile 的 `test-cost-riscv`
+入口；C0 已交付这些入口。使用默认关闭的 `COST_DIAGNOSTICS=0`；开启时由 Makefile
+给 C/assembly 同时传递 `BOAROS_COST_DIAGNOSTICS`，不能只给 C 加标志而漏掉 trap 入口。
+诊断构建独立放 `build/cost/`，复用 `BUILD_DIR`、`KERNEL_RV` 和 `CFLAGS_EXTRA`，
+配置进入缓存身份，避免覆盖普通构建或串用缓存。
+runner 的 `--case`/Makefile 的 `COST_CASE` 为 contract/write/locking/mprotect/deadline/latency/consumer/all；
+各任务只运行已交付的对应 case，未知或尚未实现 case 必须明确失败，最终 all 不得跳过缺项。
+
+- [x] 已定义每项指标的单位、采样范围、owner、起止点、失败/取消记账和清零条件；运行时不重置仍在途的计数。
+- [x] runner 在启动前快照 kernel/ELF/fixture；结果包含源码 tree、配置、工具与 QEMU 哈希、负载参数、冷/热准备方式和完整退出/资源基线。丢记录、负差值、溢出、错误 owner 或缺少结束标记必须失败。
+- [x] 先写协议/计数红测：刻意破坏一个字段、缺一个阶段或交换 owner，报告不得通过。固定小负载由数据内容、完成字节和独立包装器验证计数，不锁定私有布局或偶然调用次序。
+- [x] 验证诊断关闭后目标代码不引用新增观测入口；开启后不分配/睡眠/修改 errno，测量记录自身占用与开销，不能用计数器开销伪造被测路径成本。
+- [x] `python3 -B tests/test-cost-report.py` 与 `make test-cost-riscv COST_CASE=contract`（三启动，各四窗口）通过；当前 Python discovery 不收集连字符文件，直接运行防止零测试假通过。任务新增 48 字节，元数据页断言与退出栈余量保持。最终聚合含预留 60947 字节，任务含 backend guard 增量总64字节，默认/观测栈检查通过。
+
+### C1：写入与分配分解（P-D、存储成本）
+
+修改范围为 `fs/files/io.c::write_request`/`buffered_write_request`、
+`arch/riscv/uaccess.c`、`fs/page_cache.c::writeback_entry`/`kernel_page_cache_writeback_range`、
+`fs/ext4_backend.c`、`fs/lwext4_port.c`、`arch/riscv/virtio_mmio_block.c`；
+扩展 `tests/riscv/scale_main.c`，新增真实 U-mode `tests/workloads/cost/write.c`。
+
+- [x] 先核对 0/1/3/63/64/65/4096 字节和对齐/错位 1 MiB：记录 staging/后备页/heap 分配、用户页解析、复制、缓存探测、脏范围、快照、数据/metadata/journal/flush、队列深度与等待；区分普通文件、TCP、AF_UNIX DGRAM。
+- [x] 用普通 write、O_SYNC、O_DSYNC、每次/每 16 次/结束时 fsync 或 fdatasync，以及共享映射+msync 分组对照；分别改变顺序/随机、覆盖/扩展、冷/热和压力条件，不把全部因素一次混成笛卡尔积。
+- [x] 每个基准配置使用三个独立启动副本；内容、offset、大小、短写、EFAULT/EIO/OOM 和资源基线先验收，再保存计数和客体时间分布。既有 1 MiB 256 分块/页解析门槛继续独立保护。
+- [x] 窄验证 `make test-scale-riscv test-files-partial-write-riscv`，再 `make test-cost-riscv COST_CASE=write` 与 `make test-userland-riscv`；交付各层放大比和错误路径结果，不预先宣称小写分配或 flush 是主瓶颈。
+
+C1 阶段证据：modern/writeback 的观测开/关各三个独立启动，36 窗口完整，
+独立 usercopy/page-resolution/device-stat wrapper 通过，默认 scale、partial-write、musl/pthread 通过。
+小写 staging 放大、同步频度快照和 guest 时间分布见[成本基线](learning/cost-baseline.md)。
+压力/取消的四组合观测已随 C2 的 io-sleep fixture 补齐，尚不能由 C1 结果关闭存储成本总任务。
+
+### C2：整次写门闩、锁等待与唤醒（P-C、R7 成本）
+
+入口为 `kernel/sched/sync.c::acquire`/`kernel_lock_release`、`kernel/sched/wait.c`、
+`fs/vfs.c` 和 `tests/riscv/io_sleep_main.c`，复用 C1 的实际 U-mode 写负载。
+
+- [x] 分 rank 10/15/20/30/40 记录取得次数、等待/持有时间、阻塞次数、wake_all 唤醒数、重新阻塞、成功取得和切换；固定直方图需同时输出边界和样本数，不报虚假的精确分位数。
+- [x] 对照同 OFD、独立 OFD 同 inode、不同 inode、单盘/双盘；等待者为 1/8/32，读写混合。覆盖第二块冷页 usercopy、同 inode 映射输入、O_SYNC、截断和取消，观察独立 inode 的进展。
+- [x] 用既有暂扣/放行握手把受控 I/O 等待和缓存热写分开；核对 wake/重阻塞计数可检出无效唤醒，终止后 pin、锁和缓冲归零，最长观测等待不冒充无饥饿保证。
+- [x] `make test-cost-riscv COST_CASE=locking` 与 `make test-io-sleep-riscv test-files-partial-write-riscv test-userland-riscv` 通过 legacy/modern × writeback/writethrough；交付门闩自身等待与后端串行成本的分解，本任务不修改公平策略。
+
+### C3：单页改权的总扫描成本（P-B）
+
+入口为 `arch/riscv/mm.c::kernel_mm_mprotect`、`mm/vma.c`、
+`arch/riscv/sv39.c`、`tests/riscv/scale_main.c` 与 `tests/riscv/vma_cases.c`。
+
+- [x] 固定一页改权目标，分别增加无关 VMA 16/64/256 和文件驻留页 0/16/64 MiB；记录查询、prepare/commit、VMA 编辑/合并、file_residents 扫描、PTE 与 TLB 失效。
+- [x] 全范围失败、洞、只读 SHM/共享文件上限拒绝、split/fork、NONE 降权恢复、OOM 仍保持原契约；统计失败路径不得触发新的 PTE 修改或 owner 变化。
+- [x] `make test-cost-riscv COST_CASE=mprotect` 与 `make test-vma-riscv test-scale-riscv test-diff-abi-riscv`；报告总访问次数随无关集合增长的关系，不能用每目标页三级 PTE 访问掩盖外围扫描。
+
+### C4：deadline 遍历与到期偏差（P-A）
+
+入口为 `kernel/sched/wait.c::kernel_scheduler_expire_deadlines`、队列校验、
+`kernel/sched/core.c`、`tests/riscv/scheduler_cases.c` 和 `tests/riscv/io_sleep_main.c`。
+
+- [x] 固定 4 个带 deadline 的任务，另建 0/32/128/256 个无期限 blocked；分别计队列校验和 deadline 循环访问、tick 整条路径耗时、实际到期唤醒与运行偏差。
+- [x] 覆盖同期限、提前普通唤醒、信号/取消、退出与对象复用；握手确认任务已 blocked 后再开始采样，不用宿主 sleep 推断调度状态。
+- [x] `make test-cost-riscv COST_CASE=deadline` 与 `make test-scheduler-cases-riscv test-io-sleep-riscv test-sched-policy-host test-sched-bandwidth-riscv`；得到固定 deadline 数下的增长曲线，仍保留遍历机制至证据支持结构选择。
+
+### C5：连续关中断与唤醒到运行（P-E）
+
+入口为 `arch/riscv/trap_entry.S`、`include/arch/riscv/context.h`、
+`kernel/sched/scheduling.c`、`arch/riscv/trap.c` 与 `tests/workloads/cost/write.c`。
+该任务依赖 C0 的观测契约及 C2–C4 的运行/等待区分。
+
+- [x] 嵌套 save/restore、用户 trap、异常返回、调度睡眠/恢复、idle 分别核对观测起止；采样本身不递归取得锁、开启中断或分配，不漏掉 assembly 前后区间。
+- [x] 固定热缓存 4 KiB/64 KiB/1 MiB 复制和单页/大范围改权，配独立唤醒任务；报告 IRQ-off 最大区间、锁持有、唤醒到运行分布与切换，不按 QEMU 墙钟设性能及格线。
+- [x] `make test-cost-riscv COST_CASE=latency` 与 `make test-trap-riscv test-trap-return-riscv test-context-riscv test-user-riscv test-io-sleep-riscv test-sched-bandwidth-riscv test-stack-usage`；运行观测开/关对照。本任务不引入任意 yield 或 syscall 内开中断。
+
+### C6：真实消费者、归因与收口（尚未完全验收）
+
+复用 `tests/runtime-diagnostics.py`、固定原镜像的 iozone 以及 C0 runner；
+最终证据归 `docs/learning/cost-baseline.md`/`cost-measurements.json`，规模/存储文档链接该结论，契约归对应模块，
+能力/后续依赖分别更新 README 与本页，不另建永久计划或原始日志档案。
+
+- [ ] 固定原 iozone ELF/依赖/镜像哈希、argv、工作目录、文件规模、缓存与同步条件；先核实实际调用链，再用 C1–C5 的受控负载解释其观测，未执行或超时保留原始状态。输入身份与逐命令记录已完成；原旧 glibc 实际 I/O 成本及 musl 超时归因尚未完成，不能把采样完成当作该项全部验收。
+- [x] `make test-cost-riscv COST_CASE=consumer` 与最终 `make test-cost-riscv COST_CASE=all` 输出全部阶段、输入身份和观测开/关对照，三个独立启动副本均有完整结果。
+- [x] 汇总每项主成本与未解释余量，报告重复分布、观测开销和无收益结果；只有因果对照支持时，提出 2–3 个对应瓶颈的候选，由维护者选择一次优化。
+- [x] 测量代码收口运行 `make test-riscv test-userland-riscv test-glibc-riscv test-diff-abi-riscv test-scale-riscv test-io-sleep-riscv test-stack-usage`，以及 SQLite DELETE/WAL 正常与选定错误恢复。后续实际修改写回、事务或队列时再跑两种完整恢复矩阵与双盘隔离。
+- [x] 每个 C 任务独立验证/提交，使用 `Co-authored-by: GPT-6.1 Sol <codex@openai.com>`；固定输入和结论入 Git 后 `python3 -B tests/prune-build.py`、`make prune-build`。完整 Harness 的 kernel-la 阻塞继续单列；最终独立审查无新增 P1/P2，核对后已清理50个临时路径，保留cost与固定Linux可复用缓存。
+
+依赖为 C0 → C1/C3/C4，C1 → C2，C2/C3/C4 → C5，全部测量 → C6。下一轮的结构优化需从报告中三个候选重新确认。
+
+- [ ] 兼容分支单向合入本轮已验收 main 后重跑原 glibc/musl iozone 与原 judge；`oscomp-rv-compat@3dcfe77` 已有 uname 4.15.0 适配，本轮未更新该分支，也未改 main uname。main 的原 glibc 启动拒绝不提供实际 I/O 成本。
+- [ ] 原 iozone (11,12) 所选测试在固定 Linux 也不可用，不计作向量 ABI 验收；其余 timeout 不据短预算判定永久卡死。完整 Harness 的缺少 kernel-la 阻塞保留。
+日志/RTC、SysV RMID 后再 attach 的既有兼容限制和 iperf/netperf 定位保留后续队列；
+本阶段不扩展 SMP、LoongArch、deadline 索引、选择性唤醒、驻留范围索引或持久化策略。
 
 ## P0：固定证据与时序问题
 
@@ -169,7 +375,7 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 - [x] 受控时钟测试与真实 Linux 差分共同验证；重跑原 `utime` 静态/动态及 BusyBox touch，保持 create/read/write/truncate/unlink 时间回归。
 
 上述勾选对应程序清单的固定输入；2026-09-29 原 RV 评测镜像的 glibc `utime`
-另出现时间比较失败，已列入 P0 最小复现，不因旧清单通过而视为关闭。
+另出现时间比较失败；双侧原 ELF 与原 libc 探针已定位为 CLOCK_REALTIME_COARSE 缺失导致旧 time() 使用未初始化值。诊断已闭环，能力补齐仍待后续；详见文件时间 learning。
 
 ### P1f 文件系统统计
 
@@ -185,13 +391,14 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 
 ### P1h 虚拟文件系统与多挂载
 
-- [x] main 已补普通文件/字符节点 mknodat，复用 null/zero/console；独立设备后端、FIFO、块节点仍待设计。见[节点创建](modules/kernel-files.md#节点创建)。
+- [x] main 已补普通文件/字符节点 mknodat，复用 null/zero/console；块节点已供设备识别和 ext4 挂载使用；裸块 I/O、devfs 和 FIFO 后端仍未交付。见[节点创建](modules/kernel-files.md#节点创建)。
 
-- [x] 通用后端、mount/path 生命周期、null/zero/console 设备后端与首批真实 procfs 已分阶段交付；内部覆盖挂载遮蔽、根和 `..`、忙卸载及引用回收，真实第二盘留后续验收。
-- [ ] tmpfs 与真实第二挂载继续验证 mount/路径身份；临时内存文件须有真实页/目录生命周期、空间耗尽、截断和卸载回收。
-- [x] 最小 procfs 的 uptime、meminfo、self/exe、self/fd、进程状态及挂载信息直接读取内核对象；PID 代次、线程退出、组长存活边界和非组长 exec 经固定 Linux 差分。持续高压 fd 复用与完整 Linux 字段不在本批验收范围。
-- [ ] 为 `/proc/meminfo` 的 `Cached` 与 `MemAvailable` 定义可验证的文件页/可回收页统计来源、单位、并发快照及耗尽语义；用固定 Linux 和原 LTP 消费者复验。首批只有 `MemTotal`/`MemFree`，不能以固定零值冒充缓存状态。
-- [ ] 多挂载覆盖路径跨越、根和 `..`、挂载点被引用、卸载忙、跨挂载文件操作和失败回滚；设备/内存/磁盘文件各自错误保持所属 owner。
+- [x] 通用后端、mount/path 生命周期、null/zero/console 设备后端与首批真实 procfs 已分阶段交付；内部覆盖挂载遮蔽、根和 `..`、忙卸载及引用回收，真实第二盘及 tmpfs 的组合验证见本阶段 learning。
+- [x] tmpfs 与真实第二 ext4 挂载具备独立路径身份；内存文件有真实后备对象/目录生命周期、配额耗尽、截断及最后引用回收；不宣称持久化或共享文件 futex。
+- [x] 最小 procfs 的 uptime、meminfo、self/exe、self/fd、进程状态及挂载信息直接读取内核对象；PID 代次、线程退出、组长存活边界和非组长 exec 经固定 Linux 差分。本轮另补 256 轮 fd 关闭复用压力；完整 Linux 字段仍未覆盖。
+- [x] 统一内存 owner 快照提供 Cached/MemAvailable/Shmem/Buffers/Dirty/Writeback，RV64 sysinfo 接入真实任务数和负载；无 swap/slab 回收时才返回对应零值。原 BusyBox free 与 LTP 已复验。
+- [x] 阈值驱动后台写回及低/高水位回收，专用快照页、64 槽批次、有限失败、join 退出与资源回收；不加入周期清脏，fsync 错误/flush 契约保持。见物理页/VFS 模块和内存 learning。
+- [x] 多挂载覆盖路径跨越、根和 `..`、挂载点被引用、卸载忙、跨挂载文件操作和失败交接；设备/内存/磁盘错误保持所属 owner。真实双盘延迟/写/flush 失败隔离已独立验证。
 - [ ] eventfd/timerfd 只在真实消费者提出需求后接统一 OFD，就绪、非阻塞、poll/epoll 和退出回收一起验收；signalfd 另依赖 P2c 队列。
 
 **验证与退出**：先扩展 `tests/riscv/files_main.c` 等现有聚焦入口；当前入口为 `tests/userland/{namespace.h,metadata.h}` 与 `tests/diff-abi/{devices,namespace,metadata}.c`，均接入现有 runner。`make test-files-riscv test-vfs-riscv test-lwext4-host` → `test-userland-riscv`/`test-diff-abi-riscv`。设备、cwd、时间、统计分别解除对应真实程序阻塞，旧 ext4/pipe/epoll/COW/回收不退步；daemon 新出现的 setsid 依赖交给 P2d。
@@ -226,8 +433,8 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 
 ### P2d 会话、进程组与 TTY
 
-- [ ] 设计 session/pgrp 与线程组的身份及引用；实现 setsid/setpgid 和必要查询，覆盖组长限制、父子/exec 竞态、非法目标、组信号与等待状态。setsid 不得仅返回 getpid。
-- [ ] 验证 daemon 的 cwd/device 解除后真实会话变化、孤儿组/退出传播；SIGHUP 等行为按固定 Linux 的具体触发条件实现，不因为进程退出就无条件广播。
+- [x] 统一身份对象承担 TID/TGID/PGID/SID 角色引用；已实现 setsid/setpgid/getpgid/getsid，105 条差分覆盖组长、父子/exec、zombie、组信号与等待、身份继续存活及孤儿组。见[线程证据](learning/threads-and-futex.md)。
+- [x] 原始消费者验证 daemon 的 SID/PGID 实际变化；孤儿组按固定 Linux 的退出/收养触发 HUP/CONT，SA_SIGINFO 与 sigwait 均保留 SI_KERNEL。TTY 行为未扩展。见[消费者诊断](learning/session-consumers.md)。
 - [ ] TTY 对象出现后接控制终端、前台组、作业控制与终端信号；无 TTY 阶段不能宣称交互 shell 作业控制完整。对象末引用与关闭唤醒分别验收。
 
 ### P2e clone、凭据与资源限制
@@ -242,10 +449,11 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 
 **验证与退出**：robust 已由 `tests/userland/pthread.c` 的原始退出/真实 mutex 消费者、`tests/riscv/uaccess_oom.S`、`tests/diff-abi/robust.c` 和静态/动态原 entry 验收；聚焦 `make test-scheduler-cases-riscv test-signal-riscv test-syscall-riscv`、`test-userland-riscv`、329 条差分、`test-riscv` 与栈检查均通过。拟新增 `tests/userland/signal_stress.c`、`tests/diff-abi/futex_signal.c` 仍属后续；旧取消异常继续 P0c，不以全部当前 pthread 通过冒充共享 futex 或 SMP 完成。
 
-### P2f 单 hart 调度 ABI（待设计）
+### P2f 单 hart 调度 ABI
 
-- [ ] 对 cyclictest 的 affinity 和调度参数调用建立独立差分；区分查询、策略修改、优先级、权限及线程目标。
-- [ ] 查询反映真实单 hart 和调度状态；不能把 set 类操作做成成功存根。具体调度策略与接口范围确认后实现。
+- [x] OTHER/FIFO/RR、实时优先级、CPU0 affinity、RESET_ON_FORK 与真实查询；23 条策略差分，5 条 proc stat 差分。
+- [x] 全局实时带宽默认 1 秒 / 950 毫秒，proc 参数原子更新并保留消费；36 条控制差分，真实 U-mode 验证节流、恢复、RR 余片与同时耗尽轮转。见[调度学习](learning/kernel-scheduling.md)。
+- [ ] nice 权重、PI、SMP 和硬实时保证未交付；后续需求先独立比较方案。
 
 ## P3：同步持久化、文件锁与 SQLite
 
@@ -289,7 +497,7 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 
 ## P4：共享后备对象、文件页与跨 MM futex
 
-**依赖与入口**：[MM](modules/kernel-mm.md)、[VMA](modules/kernel-vma.md)、[VFS](modules/vfs-ext4.md)；`include/kernel/{mm.h,vma.h,file_mapping.h,shared_anon.h}`、`mm/{vma.c,shared_anon.c}`、`arch/riscv/mm.c`、`fs/{page_cache.c,vfs.c}`、`kernel/syscall/memory.c`、`kernel/sched/futex.c`。P4a 使用专用共享匿名对象；文件页及共享 futex 复用稳定身份所需的接口按各自契约扩展，不预建通用插件框架。
+**依赖与入口**：[MM](modules/kernel-mm.md)、[VMA](modules/kernel-vma.md)、[VFS](modules/vfs-ext4.md)；`include/kernel/{mm.h,vma.h,file_mapping.h,memory_object.h}`、`mm/{vma.c,memory_object.c}`、`arch/riscv/mm.c`、`fs/{page_cache.c,vfs.c}`、`kernel/syscall/memory.c`、`kernel/sched/futex.c`。P4a 已迁移统一内存后备对象；文件页及共享 futex 复用稳定身份所需的接口按各自契约扩展，不预建通用插件框架。
 
 ### P4a 共享匿名对象（已完成）
 
@@ -333,10 +541,11 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 
 **验证与退出**：P4a 已由 `test-vma-riscv`、真实 U-mode 的 `tests/userland/shared_mapping.h`、`tests/diff-abi/shared_mapping.c` 验证。P4b/P4c 的共享页别名、权限、fork、截断尾页、unlink、`msync` 参数及普通写扩展由 `make test-diff-abi-riscv` 双侧验证；聚焦错误交错由 `make test-files-partial-write-riscv` 验证。普通 WAL 与重启由 `make test-sqlite-wal-riscv`，存储恢复由 `make test-sqlite-wal-recovery-riscv test-sqlite-wal-recovery-matrix-riscv` 验证。P4d 基础路径由 `tests/userland/shared_futex.h`、`tests/diff-abi/futex_shared.c` 与 `tests/riscv/mm_cases.c` 验证；不同 VA 别名及交错矩阵仍按上一条跟踪。共享文件 futex 分开跟踪。
 
-### P4f SysV IPC（待设计）
+### P4f SysV IPC
 
-- [ ] 从 iozone 的 shmget ENOSYS 抽取最小复现，核实后续 shmat/shmdt/shmctl 需求。
-- [ ] 设计 key/id 与复用、attach 引用、IPC_RMID、fork/exec/退出、权限和耗尽。可复用共享页后备，但不能只给 shmget 分配匿名内存。
+- [x] 当前 shmget/shmat/shmdt/shmctl 均已接入；针对 IPC_PRIVATE 与命名 key、段大小对齐与 Linux 布局完成 194–197 系统调用接入。
+- [x] 确认 key/id/代次、segment 与 attach 的 owner、IPC_RMID 后存活/末引用释放、fork 继承与 exec/退出分离，以及权限/限额/OOM/fault 回滚；统一后备对象作为物理页后备。本轮 R2 将 VMA 裸 segment 借用改为 attachment 引用，并在通用 VMA 编辑/销毁处维护 nattch。
+- [x] 验证跨进程/不同地址、删除后已有映射、ID 反复复用、部分失败与资源基线；Linux 差分 ABI 新增 19 条全部一致（累计 1031 条），用户态多进程 fork/shmdt/IPC_RMID 与裸机 scale 测试全数通过，关机物理页完全回收。SysV semaphore/message queue 不自动纳入本阶段。
 
 ## P5：glibc、exec 与单核真实工具链
 
@@ -357,9 +566,11 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 
 ### P5c 随机数与系统环境
 
-- [ ] getrandom 区分可信熵就绪/未就绪、flags、阻塞/信号及用户 fault；确定性 ASLR 降级不能充当安全随机数成功。熵源按 QEMU/实板实际能力记录。
-- [ ] klogctl/日志读取需真实日志 owner、缓冲和权限设计；不以空成功消除 dmesg 报错。
-- [ ] sysinfo/prctl 等只按真实调用链新增；版本和统计来自内核事实，未知能力返回规定错误，用户查询不能触发整机 fatal。
+- [x] getrandom 区分可信熵就绪/未就绪、flags、阻塞/信号及用户 fault；VirtIO RNG legacy/modern 从宿主安全随机后端取得至少 32 字节后置 ready。DTB/用户写入和早期 ASLR 降级不计可信熵；实板熵源未验证。见[随机数来源](learning/random-source.md)与[RNG 传输](modules/riscv-virtio-rng.md)。
+- [ ] klogctl/日志读取需真实日志 owner、缓冲、覆盖/读游标、fault 和权限设计；用原 dmesg 核对实际日志，不以空成功消除报错。
+- [ ] RTC 字符设备读取及所需 ioctl 复用平台时钟来源，明确设备号、节点、无设备与错误边界；原 hwclock 必须输出真实时间，写 RTC/告警能力另行定范围。
+- [x] sysinfo 的 RV64 完整布局、内存/负载/任务数与 EFAULT 已交付。
+- [ ] prctl 等只按真实调用链新增；版本和统计来自内核事实，未知能力返回规定错误，用户查询不能触发整机 fatal。
 
 ### P5d 离线编译闭环
 
@@ -403,9 +614,9 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 
 ### P6e 请求完成与外部中断
 
-- [ ] 从同步轮询演进为请求对象+completion/等待队列，先串行实际磁盘请求也可以，但等待期间其他任务能运行；IRQ 只确认状态与唤醒。
+- [x] 单 hart 已实现 IRQ/等待队列、八槽乱序完成、队列满等待、flush 屏障及超时 reset；双盘生命周期与失败隔离已验收。这里的剩余工作是跨核保护，不是重做轮询迁移。
 - [ ] 明确提交、完成、取消、超时、reset、DMA 停止后内存可释放的 owner 转移；组退出时 I/O 尚未完成、另核关闭/复用 fd 不会回收在用对象。
-- [ ] 在单请求正确后再考虑多请求队列，覆盖乱序完成/队列满、失败唤醒、设备停止；不要把吞吐优化和基础所有权改动混成一个难以归因的提交。
+- [ ] 在既有多请求队列上验证跨核提交、IRQ 归属、乱序完成/队列满、失败唤醒与设备停止；将跨核正确性与吞吐优化分开提交。
 
 ### P6f 多核验收矩阵
 
@@ -431,7 +642,8 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 
 ### N2 本地与 loopback 链路
 
-- [ ] AF_INET loopback UDP/TCP 的首个真实消费者已通过；AF_UNIX/socketpair 和网卡侧路径仍待实现。原 socket entry 的实际调用已由固定源码 `src/functional/socket.c` 和日志确认。
+- [x] AF_INET loopback UDP/TCP 首个真实消费者已通过；原 socket entry 调用由固定源码 `src/functional/socket.c` 与日志确认。
+- [x] AF_UNIX/socketpair 先交付原 hackbench 所需类型与 flags；覆盖阻塞/非阻塞、EOF/半关闭、信号取消、fork/dup、对端退出、poll/epoll 和资源耗尽。命名端点及 SCM_RIGHTS 按各自真实需求扩展，不能因 socketpair 通过标记全部本地 socket 完成。
 - [ ] bind/connect/listen/accept、send/recv、非阻塞 EAGAIN、半关闭、EOF、失败连接、poll/epoll 和信号打断逐项验收；失败连接不能假装建立 endpoint。
 - [ ] sendmsg/recvmsg 与 SCM_RIGHTS 明确被传 fd 的 OFD 引用、用户复制失败和消息未接收/对端退出时回收；不能只传可被关闭复用的整数 fd。
 - [x] 原静态/动态 socket 直接 entry 在固定 Linux 与 BoarOS 同一 ELF 双侧通过；PID 1 关机 `heap-live=0`。UDP 池耗尽、释放和重用、TCP segment 池耗尽后 `ERR_MEM`、TCP 200 秒协议定时回收由 host 测试保护；真实 pthread U-mode 覆盖零长度 UDP datagram、共享 OFD 双读、close/fd 复用、线程组强制退出、全局池压力下的 POLLOUT 抑制及释放后进展。整合内核全量 228 项为 227 pass、1 BusyBox 包装失败，不以此推出 AF_UNIX 或真实网卡完成。
@@ -512,15 +724,15 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 
 | 取舍 / 当前证据 | 可行候选与正确性、演进、复杂度、成本 |
 |---|---|
-| P1b VFS：原 fs context 借用单根 mount、cwd 字符串；OFD 已独立 | 已选择并完成②：最小 mount+路径对象/后端操作。路径持有 mount、inode 与父链引用，ext4 字符节点按 `rdev` 分派；共享可改名目录项与普通/NOREPLACE rename 已完成；多挂载仍留后续。 |
-| P4a 共享匿名 | 已选择并交付②：专用对象按索引惰性发布页，保持稀疏分配并提供稳定身份；急切分配会改变 lazy/OOM 成本。共享文件页与跨 MM futex 各自继续设计。 |
+| P1b VFS：原 fs context 借用单根 mount、cwd 字符串；OFD 已独立 | 已选择并完成②：最小 mount+路径对象/后端操作。路径持有 mount、inode 与父链引用，ext4 字符节点按 `rdev` 分派；共享可改名目录项、普通/NOREPLACE rename、linkat、tmpfs 与独立第二盘已完成；新后端仍需独立设计。 |
+| P4a 共享匿名 | 已选择并交付②：专用对象按索引惰性发布页，保持稀疏分配并提供稳定身份；急切分配会改变 lazy/OOM 成本。后续已迁移到统一 memory_object，匿名跨 MM futex 与共享文件页已交付；共享文件 futex 仍待设计。 |
 | P3b 持久化 | 用户已选择并交付逐 inode dirty/error、定向写回和真实 flush；共享事务可提交关联元数据，不主动全量写回无关文件。 |
 | P3d 恢复 | journal/replay 与持久 orphan 已启用并验收；故障模型、限制和复现命令见 VFS 模块。 |
 | P6 SMP：当前 SIE 串行化，缺远端 TLB 确认 | ① 进程态对象先用粗粒度可睡眠锁、IRQ/队列另设短锁，验证较少但并行有限；② MM/OFD/cache/队列对象锁直接演进，锁顺序/取消成本更高。先盘点消费者和睡眠边界再选，临时启动大锁有退出条件。 |
 | P6g 栈 guard：连续物理栈、canary/高水位 | ① 独立虚拟栈区映射已有页，便于未映射 guard，但需页表与回收接口；② 调整内核现有映射形成受保护栈区域，初始接口可能更少，但别名/大页拆分与 direct-map 消费者成本须实测。先验证真实越界保护范围再选。 |
 | N1 协议栈与分配 owner | 已确认 BoarOS 持有 fd/OFD、ABI、等待与缓冲队列，固定官方 lwIP 2.2.1 raw API/NO_SYS；协议和 pbuf 静态有界池，socket/OFD/请求由 kernel_heap 持有。先验收单 hart IPv4 loopback，网卡与 AF_UNIX 继续 N2/N3。 |
 
-调度暂保留简单 FIFO：先完成唯一运行、唤醒和 TLB 回收，再凭公平性/负载证据比较策略。第二架构按连续小里程碑推进；不等待 RV “全部完成”，也不复制整套通用内核。
+单 hart 已交付 OTHER/FIFO/RR 与全局实时带宽；后续调度改动以公平性/负载和实际消费者证据比较策略。第二架构按连续小里程碑推进；不等待 RV “全部完成”，也不复制整套通用内核。
 
 ## 每个任务的统一验收与现有命令
 

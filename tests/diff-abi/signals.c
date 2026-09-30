@@ -9,6 +9,7 @@ struct wait_siginfo {
 };
 struct wait_action { unsigned long handler, flags, mask; };
 static volatile int handled_signal;
+static void signal_fault_cases(void);
 
 static void wait_handler(int signal)
 {
@@ -88,4 +89,65 @@ void abi_signal_wait_cases(void)
     abi_require(SC4(260, child, &status, 0, 0) == child && status == 0);
     abi_require(SC4(134, 12, 0, 0, 8) == 0);
     abi_require(SC4(135, 2, &old_mask, 0, 8) == 0);
+    signal_fault_cases();
+}
+
+static volatile unsigned long fault_expected_address;
+static volatile int fault_expected_signal, fault_expected_code, fault_repair_mode, fault_count;
+static void fault_info_handler(int signal, struct wait_siginfo *info, void *context)
+{
+    unsigned long *gregs = (void *)((unsigned char *)context + 176);
+    unsigned long address = *(unsigned long *)((unsigned char *)info + 16);
+    if (signal != fault_expected_signal || info->code != fault_expected_code ||
+        address != (fault_expected_address ? fault_expected_address : gregs[0])) abi_exit(91);
+    fault_count++;
+    if (fault_repair_mode == 1) {
+        if (SC3(226, address, 4096, 3)) abi_exit(92);
+    } else if (fault_repair_mode == 2) {
+        if ((unsigned long)CALL(222, address, 4096, 3, 0x32, -1, 0) != address) abi_exit(93);
+    } else gregs[0] += 4;
+}
+static void signal_fault_cases(void)
+{
+    static const char *names[] = {"signal.fault-accerr", "signal.fault-maperr",
+        "signal.fault-bus", "signal.fault-ill", "signal.fault-trap"};
+    for (unsigned scenario = 0; scenario < 5; scenario++) {
+        long child = CALL(220, 17, 0, 0, 0, 0, 0);
+        abi_require(child >= 0);
+        if (!child) {
+            fault_count = 0; fault_expected_address = 0;
+            fault_expected_signal = scenario < 2 ? 11 : scenario == 2 ? 7 : scenario == 3 ? 4 : 5;
+            fault_expected_code = scenario == 0 || scenario == 2 ? 2 : 1;
+            fault_repair_mode = scenario == 0 ? 1 : scenario == 1 ? 2 : 0;
+            struct wait_action action = {(unsigned long)fault_info_handler, 4, 0};
+            abi_require(SC4(134, fault_expected_signal, &action, 0, 8) == 0);
+            if (scenario < 2) {
+                long page = CALL(222, 0, 4096, 0, 0x22, -1, 0);
+                abi_require(page > 0);
+                fault_expected_address = page;
+                if (scenario == 1) abi_require(SC2(215, page, 4096) == 0);
+                *(volatile unsigned char *)page = 0x6b;
+                abi_require(*(volatile unsigned char *)page == 0x6b);
+            } else if (scenario == 2) {
+                long fd = SC4(56, -100, "/fault-diff", 0102 | 01000, 0600);
+                abi_require(fd >= 0);
+                long page = CALL(222, 0, 4096, 1, 2, fd, 0);
+                abi_require(page > 0);
+                fault_expected_address = page;
+                unsigned long value;
+                __asm__ volatile(".option push\n.option norvc\nld %0, 0(%1)\n.option pop"
+                    : "=r"(value) : "r"(page) : "memory");
+                (void)value;
+            } else if (scenario == 3) {
+                __asm__ volatile(".option push\n.option norvc\n.word 0\n.option pop" ::: "memory");
+            } else {
+                __asm__ volatile(".option push\n.option norvc\nebreak\n.option pop" ::: "memory");
+            }
+            abi_exit(fault_count == 1 ? 0 : 94);
+        }
+        int status = 0;
+        abi_require(SC4(260, child, &status, 0, 0) == child);
+        abi_record(names[scenario], status == 0, -1, -1, 0, 0, 0);
+    }
+    abi_require(SC3(35, -100, "/fault-diff", 0) == 0);
 }

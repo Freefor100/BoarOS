@@ -12,6 +12,7 @@
 #define KERNEL_VFS_S_IFREG UINT32_C(0100000)
 #define KERNEL_VFS_S_IFDIR UINT32_C(0040000)
 #define KERNEL_VFS_S_IFLNK UINT32_C(0120000)
+#define KERNEL_VFS_S_IFBLK UINT32_C(0060000)
 #define KERNEL_VFS_S_IFCHR UINT32_C(0020000)
 #define KERNEL_VFS_S_IFIFO UINT32_C(0010000)
 #define KERNEL_VFS_S_IFSOCK UINT32_C(0140000)
@@ -19,6 +20,7 @@
 #define KERNEL_VFS_S_IXGRP UINT32_C(0000010)
 #define KERNEL_VFS_S_IXOTH UINT32_C(0000001)
 
+uint64_t kernel_vfs_allocate_mount_id(void);
 struct kernel_vfs_path;
 struct kernel_open_file_description;
 struct kernel_vfs_mount {
@@ -33,12 +35,17 @@ struct kernel_vfs_mount {
     struct kernel_vfs_mount *next_sibling;
     struct kernel_vfs_mount *previous_sibling;
     uint32_t child_mounts;
+    const char *source_name; /* Borrowed from the mount owner. */
+    /* Optional owner release, invoked only after backend teardown succeeds. */
+    void (*release_owner)(struct kernel_vfs_mount *mount);
 };
 
 /* Attachment transfers owned root/covered-path references to the tree.
  * Detach accepts the single caller-owned root used to name the mount. */
 int kernel_vfs_mount_attach(struct kernel_vfs_mount *mount,
                             struct kernel_vfs_path *covered);
+int kernel_vfs_mount_prepare_detach(struct kernel_vfs_mount *mount,
+    const struct kernel_vfs_path *named_root);
 int kernel_vfs_mount_detach(struct kernel_vfs_mount *mount,
                             const struct kernel_vfs_path *named_root);
 
@@ -142,6 +149,10 @@ int kernel_vfs_mkdir_at(struct kernel_vfs_path *start,
 int kernel_vfs_unlink_at(struct kernel_vfs_path *start,
                          struct kernel_vfs_path *root, const char *path,
                          int directory);
+/* source is held by the caller; NULL denotes a pinned anonymous OFD. */
+int kernel_vfs_link_at(struct kernel_vfs_path *source,
+                       struct kernel_vfs_path *start,
+                       struct kernel_vfs_path *root, const char *input);
 int kernel_vfs_symlink_at(struct kernel_vfs_path *start,
                           struct kernel_vfs_path *root, const char *target,
                           const char *path);
@@ -158,6 +169,15 @@ int kernel_vfs_rename_at(struct kernel_vfs_path *old_start,
                          unsigned flags);
 
 /* Returns zero or a negative Linux-compatible errno value. */
+int kernel_vfs_mount_ext4(struct kernel_vfs_mount *mount,
+    struct kernel_block_device *block, struct kernel_heap *heap,
+    struct kernel_page_cache *page_cache, int read_only);
+int kernel_vfs_disk_create(struct kernel_heap *heap, uint64_t device_number,
+    int read_only, const char *source, struct kernel_vfs_mount **owner);
+/* Shutdown-only, after user tasks have exited: drain real I/O cleanup
+ * retained by failed, unpublished disk mounts. */
+int kernel_vfs_disk_cleanup_pending(void);
+void kernel_vfs_disk_defer_cleanup(struct kernel_vfs_mount *mount);
 int kernel_vfs_mount_root(struct kernel_vfs_mount *mount,
                           struct kernel_block_device *block,
                           struct kernel_heap *heap,
@@ -262,7 +282,7 @@ int kernel_vfs_stat_path(struct kernel_vfs_mount *mount,
                          int follow_final,
                          struct kernel_vfs_stat *stat);
 
-/* Underlying ext4 inode number; zero when unavailable. */
+/* Filesystem inode identity; zero when unavailable. */
 uint64_t kernel_vfs_file_inode(const struct kernel_vfs_file *file);
 
 /* Returns the current file size in bytes from the live VFS node. */

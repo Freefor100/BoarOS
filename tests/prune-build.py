@@ -9,7 +9,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 BUILD = ROOT / 'build'
-KEEP_TOP = {'riscv', 'diff-abi', 'program-environment', 'program-libc', 'host', 'tools', 'offline-c'}
+KEEP_TOP = {'cost', 'riscv', 'diff-abi', 'program-environment', 'program-libc', 'host', 'tools', 'offline-c'}
 KEEP_ROOT_FILES = {'elf-tail-rv', 'elf-tail-dynamic-rv', 'elf-tail-norelro-rv'}
 
 
@@ -38,7 +38,7 @@ def candidates():
         result.extend(path for path in riscv.iterdir()
                       if path.name in {'artifacts', 'musl-src', 'truncate-probe'}
                       or path.name.startswith(('userland-run.', 'record-lock-run.',
-                                                'offline-c-run.',
+                                                'offline-c-run.', 'sched-bandwidth.',
                                                 'sqlite-run.',
                                                 'sqlite-nbd-run.',
                                                 'sqlite-recovery-run.')))

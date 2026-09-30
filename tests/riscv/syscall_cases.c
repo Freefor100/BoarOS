@@ -1229,6 +1229,36 @@ static unsigned long run_time_cases(void)
         failures++;
     }
 
+    /* No timer is started here: reads must retain the initialized sample.
+     * A delayed update samples real elapsed time once, not one invented tick. */
+    uint64_t coarse = kernel_time_coarse_monotonic_ns();
+    uint64_t before = kernel_time_monotonic_ns();
+    if (coarse > before || kernel_time_coarse_realtime_ns() - coarse !=
+            UINT64_C(1577836800000000000) ||
+        kernel_time_coarse_resolution_ns() != UINT64_C(10000000)) failures++;
+    while (kernel_time_monotonic_ns() - before < UINT64_C(25000000)) { }
+    if (kernel_time_coarse_monotonic_ns() != coarse) failures++;
+    before = kernel_time_monotonic_ns();
+    kernel_time_update_coarse();
+    uint64_t sampled = kernel_time_coarse_monotonic_ns();
+    if (sampled < before || sampled > kernel_time_monotonic_ns() ||
+        sampled - coarse < UINT64_C(25000000) ||
+        kernel_time_coarse_realtime_ns() - sampled != UINT64_C(1577836800000000000))
+        failures++;
+
+    for (unsigned clock = 5; clock <= 6; clock++) {
+        request.number = 114U;
+        request.arguments[0] = clock;
+        request.arguments[1] = 0;
+        if (kernel_syscall_dispatch(caller, &request, &result) != KERNEL_SYSCALL_STATUS_OK ||
+            result_changed(&result, KERNEL_SYSCALL_ACTION_RETURN, 0)) failures++;
+        request.number = 115U;
+        request.arguments[1] = UINT64_MAX;
+        request.arguments[2] = 1;
+        if (kernel_syscall_dispatch(caller, &request, &result) != KERNEL_SYSCALL_STATUS_OK ||
+            result_changed(&result, KERNEL_SYSCALL_ACTION_RETURN, -KERNEL_EOPNOTSUPP)) failures++;
+    }
+
     request.arguments[0] = 0U;
     request.number = 124U;
     if (kernel_syscall_dispatch(caller, &request, &result) !=

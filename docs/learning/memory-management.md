@@ -433,3 +433,47 @@ PAGE_SIZE) 撤销映射且 even_cows=1；`truncate_inode_partial_folio()` 只清
 写回失败后只检查下一次 `msync` 成功仍不够：如果写回前重新保护别名遗漏，下一次对同一 PTE 的 store 可能绕过首次写标脏。`tests/riscv/files_main.c` 用真实 `kernel_copy_to_user` 触发 store fault，按 flush EIO→重试→再次写→`msync`→撤映射→驱逐缓存→重读顺序检查稳定数据。它还在测试专用 `ext4_fwrite` 包装器完成旧值写入之后、页缓存比较 generation 之前，通过另一驻留共享别名写入新值；下一次 `msync` 必须写出新值，驱逐重读也必须一致。直接解析物理页写测试数据会绕开 PTE，不能验证这条路径。聚焦测试还扫描共享文件映射 fork 的 metadata 分配失败，并让匿名共享固定替换在分配失败时保留原 VMA/别名；完整释放回到物理页基线。确定性重入证明单 hart 的 generation/别名协议，但不等于第二个 hart 的真实并发或跨核 TLB 同步。
 
 WAL 持久性另用固定 SQLite 3.53.4 archive `references/sqlite/sqlite-amalgamation-3530400.zip`（SHA-256 `1e71ddf93849c6a6ecf58b827c0692073d2dd7ee40196158068f7b29f422e87d`）与本地 `references/qemu/` v11.1.0 commit `84f07211cc5b4fc6a371559bf8a5de4fb068e648` 对应的 NBD flush 模型验证。42 个事务内事件逐点断电，分别丢弃、保存奇数或逆序保存未 flush 扇区，另逐点失败 26 次写和 16 次 flush；每次从稳定镜像两次恢复并检查整事务和 ext4。这个证据限于单 hart、QEMU 11.1.1 的隔离镜像，不能推出实板掉电承诺。
+
+## 阈值回收与只读内存估算（2026-09-29）
+
+固定语义入口为 `references/linux/` commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的
+`fs/proc/meminfo.c`、`mm/page_alloc.c:si_mem_available`、`kernel/sys.c:do_sysinfo`、
+`include/uapi/linux/sysinfo.h`、`kernel/sched/loadavg.c`、`include/linux/sched/loadavg.h`、
+`mm/page-writeback.c` 与 `fs/fs-writeback.c`。BoarOS 的 2%/4% 与 10%/5% 是首版策略，
+不是照搬 Linux zone/BDI/slab 模型，也没有周期到期写回。
+
+统计必须跟随 owner：缓存 entry 一页只计一次，MAP_SHARED 的多个 PTE 和 fork 不增加容量；
+共享匿名的后备页单独计 Shmem，并包含在 Cached 中。后者没有 swap，不参与 available。
+正在装载、写回、被引用或映射固定、无可行写回路径和最后写回失败的页均不计回收预算。
+失败页的新修改提供重试事件，却不能证明 I/O 已恢复；仅成功写回才能清除失败标记。
+Available 的缓存余量最多为低水位，实际分配还受连续性、后端 metadata 和竞态影响。
+
+分配失败栈不能直接进入脏页写回：heap/backend 持锁时容易递归申请同一资源或等待自身。
+因此同步回调只清洁驱逐，安全普通任务至多等待后台一轮，所有深度和持锁状态都来自任务
+io_context。后台预留一页快照只解除“写回自身还需一页”的循环，不承诺后端分配不会失败。
+每轮通过代次限制重复处理，每批 64 个槽让出 CPU；没有可处理对象便睡眠，不以忙循环冒充回收。
+
+专用线程 completion 不能混入普通测试/业务完成流，否则等待者可能把后台退出当作业务完成
+并提前卸载。join handle 允许 cleanup task 在可信栈直接回收退出 worker，不等待自身再次 reap。
+负载也必须区分空队列等待和真正的不可中断 I/O；前者若计为 D，空闲系统会凭空增加两个负载单位。
+
+可重建验证：`make test-page-riscv test-vma-riscv test-scheduler-cases-riscv test-io-sleep-riscv`，
+再运行 `make test-diff-abi-riscv test-riscv test-scale-riscv`。四种 transport/cache 配置验证
+脏阈值、写回 EIO 后其他页进展、水位清洁回收、固定页保护、启动快照/线程 OOM 回滚、暂扣写回时 stop/join 交接和完整释放。
+查询为 O(驻留页数)，通知为 O(1)，批次限额来自计数和代码边界；这些不是 QEMU 墙钟性能提升结论。
+
+停止协议另以暂扣 background writeback 的测试反证：移除内层批次的 stopping 检查后，
+测试在“停止后只允许当前一次写回完成”处失败（编号 124）；恢复检查后四种 I/O 配置通过。
+空队列 load 分类与失败页再次修改仍保留回收排除标记，经独立审查和聚焦用例复核。
+最终 RISC-V 全套与 683 条差分通过；真实 userland 一度在并行验收期间触及 30 秒预算，
+没有 fatal，临时 90 秒诊断中静态/pthread 合计 29.8 秒完成并回到资源基线；随后原 30 秒
+runner 复验通过。未修改正式时限，也不把这次诊断计为性能提升或普遍消除超时的证明。
+
+统一内存后备对象阶段将共享匿名页存储迁移到 `mm/memory_object.c`，增加不分配的稀疏查询和截断接口。VMA 聚焦测试核对空洞不增加 Shmem、尾页前缀保留/后缀清零、截断后计数恢复；`make test-vma-riscv test-mm-riscv test-diff-abi-riscv` 通过，683 条原差分保持一致。独立审查确认 MM 发布失败的 discard 顺序和对象锁边界；这只是后备对象阶段，尚非 tmpfs 验收。
+
+
+SysV attachment 与 VMA 片段必须分别建模。逻辑 attachment 保存固定 shmid、原始地址及后备 owner；同一 MM 的分裂片段与 fork 副本各贡献一个 `nattch`。prepare 阶段的临时 owner 保住段槽身份而不增加公开计数，成功 split/insert/clone 才 open，remove/replace/destroy 才 close。先 split 再关闭被移除片段，避免部分撤销期间出现假的零引用并销毁 RMID 段；`shmdt` 比较 attachment 身份，不按一个 VMA 或整个旧地址范围删除。固定依据为本地 `references/linux/ipc/shm.c` 的 `shm_open`、`shm_close`、`ksys_shmdt`，commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`。`make test-scale-riscv` 覆盖六种编辑/继承组合及逐次附加、fork OOM，结束仍检查完整页回收；`make test-diff-abi-riscv` 提供真实 RV64 片段计数和固定替换对照。
+
+权限上限是映射创建契约，不能由当前权限反推。初始 READ 的匿名映射仍可合法提升 WRITE，而只读 SHM 和只读 fd 的共享文件映射不可提升；降权到 NONE 也不能丢掉原来的合法上限。固定依据为 `references/linux/mm/mprotect.c` 的 VM_MAY 权限检查，以及 `references/linux/ipc/shm.c` 的 `do_shmat` 清除 VM_MAYWRITE，commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`。`make test-vma-riscv test-diff-abi-riscv` 验证只读附加、分裂、fork 和降权恢复；本阶段累计 1077 条记录一致。
+
+VMA 查询副本不能替代来源 owner。`msync` 把 OFD 的错误游标地址交给会睡眠的 VFS，即使只同步清洁页也可能先等待 inode；此时并发撤销最后 VMA 仍必须 pin 来源。BoarOS 复用缺页来源计数作为操作 pin，返回后释放 pin，再基于当前集合清理。三任务 `make test-io-sleep-riscv` 在最后撤映射时检查 release 不得早于 sync 返回，并注入同步/末次关闭错误核对 retained owner；真正的写回错误另由 `make test-files-partial-write-riscv` 验证。此证据使用实际单 hart 调度器，不等于 SMP 覆盖。

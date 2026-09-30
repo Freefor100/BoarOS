@@ -160,6 +160,11 @@ void stopped_unlink(struct kernel_task *thread)
 
 void scheduler_wake_task(struct kernel_task *thread, uint32_t reason)
 {
+#if BOAROS_COST_DIAGNOSTICS
+    kernel_cost_wake(&thread->cost);
+    if (reason == KERNEL_WAIT_TIMEOUT && thread->wakeup_deadline)
+        kernel_cost_timeout(&thread->cost, thread->wakeup_deadline);
+#endif
     scheduler_wait_requeue(thread, 0);
     thread->wakeup_deadline = 0;
     thread->wait_interruptible = 0U;
@@ -244,6 +249,8 @@ enum kernel_scheduler_status kernel_wait_queue_wake_all(
 
 enum kernel_scheduler_status kernel_scheduler_expire_deadlines(uint64_t now)
 {
+    COST_SCOPE(cost_deadline, DEADLINE_TICKS);
+    COST_ADD(DEADLINE_PASSES, 1);
     struct kernel_task *thread;
     enum kernel_scheduler_status status;
 
@@ -258,8 +265,14 @@ enum kernel_scheduler_status kernel_scheduler_expire_deadlines(uint64_t now)
         return status;
     }
 
+#if BOAROS_COST_DIAGNOSTICS
+    uint64_t cost_visits = 0;
+#endif
     thread = scheduler.blocked_head;
     while (thread != 0) {
+#if BOAROS_COST_DIAGNOSTICS
+        cost_visits++;
+#endif
         struct kernel_task *next = thread->next;
 
         if (thread->wakeup_deadline != 0U &&
@@ -269,6 +282,7 @@ enum kernel_scheduler_status kernel_scheduler_expire_deadlines(uint64_t now)
         }
         thread = next;
     }
+    COST_ADD(DEADLINE_VISITS, cost_visits);
     return KERNEL_SCHEDULER_STATUS_OK;
 }
 
@@ -313,6 +327,9 @@ enum kernel_scheduler_status kernel_scheduler_block_current(
     current->wakeup_deadline = deadline;
     current->wake_reason = (uint32_t)KERNEL_WAIT_WOKEN;
     current->wait_interruptible = (uint32_t)interruptible;
+#if BOAROS_COST_DIAGNOSTICS
+    kernel_cost_block(&current->cost);
+#endif
     current->state = KERNEL_THREAD_STATE_BLOCKED;
     blocked_append(current);
     status = scheduler_switch_current_away(current);

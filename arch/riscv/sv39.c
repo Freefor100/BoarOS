@@ -1,3 +1,4 @@
+#include <kernel/cost.h>
 #include <arch/riscv/sv39.h>
 #include <kernel/page.h>
 
@@ -949,7 +950,7 @@ static enum riscv_sv39_status resolve_existing_user_leaf(
     if (status != RISCV_SV39_STATUS_OK) {
         return status;
     }
-    if (visits != 0) (*visits)++;
+    if (visits != 0) { (*visits)++; COST_ADD(MPROTECT_PTE_VISITS, 1); }
     entry = root[(virtual_address >> 30U) & RISCV_SV39_INDEX_MASK];
     if (entry == 0U) {
         return RISCV_SV39_STATUS_NOT_MAPPED;
@@ -963,7 +964,7 @@ static enum riscv_sv39_status resolve_existing_user_leaf(
     if (status != RISCV_SV39_STATUS_OK) {
         return status;
     }
-    if (visits != 0) (*visits)++;
+    if (visits != 0) { (*visits)++; COST_ADD(MPROTECT_PTE_VISITS, 1); }
     entry = level1[(virtual_address >> 21U) & RISCV_SV39_INDEX_MASK];
     if (entry == 0U) {
         return RISCV_SV39_STATUS_NOT_MAPPED;
@@ -977,7 +978,7 @@ static enum riscv_sv39_status resolve_existing_user_leaf(
     if (status != RISCV_SV39_STATUS_OK) {
         return status;
     }
-    if (visits != 0) (*visits)++;
+    if (visits != 0) { (*visits)++; COST_ADD(MPROTECT_PTE_VISITS, 1); }
     *leaf = &level0[(virtual_address >> BOAROS_PAGE_SHIFT) &
                     RISCV_SV39_INDEX_MASK];
     return **leaf == 0U ? RISCV_SV39_STATUS_NOT_MAPPED
@@ -1462,6 +1463,7 @@ enum riscv_sv39_status riscv_sv39_user_protect_owned_page(
         *leaf = replacement;
         __asm__ volatile("sfence.vma %0, zero" :: "r"(address) : "memory");
         space->protect_address_flushes++;
+        COST_ADD(MPROTECT_ADDRESS_TLB, 1);
     }
     return RISCV_SV39_STATUS_OK;
 }
@@ -1531,6 +1533,7 @@ enum riscv_sv39_status riscv_sv39_user_protect_owned_range(
          root_index < RISCV_SV39_USER_ROOT_ENTRIES;
          root_index++) {
         space->protect_visits++;
+        COST_ADD(MPROTECT_PTE_VISITS, 1);
         root_base = (uint64_t)root_index << 30U;
         if (!user_range_overlaps(root_base,
                                  UINT64_C(1) << 30U,
@@ -1549,6 +1552,7 @@ enum riscv_sv39_status riscv_sv39_user_protect_owned_range(
              level1_index < BOAROS_PAGE_SIZE / sizeof(*level1);
              level1_index++) {
             space->protect_visits++;
+        COST_ADD(MPROTECT_PTE_VISITS, 1);
             level1_base = root_base |
                           ((uint64_t)level1_index << 21U);
             if (!user_range_overlaps(level1_base,
@@ -1569,6 +1573,7 @@ enum riscv_sv39_status riscv_sv39_user_protect_owned_range(
                  level0_index < BOAROS_PAGE_SIZE / sizeof(*level0);
                  level0_index++) {
                 space->protect_visits++;
+        COST_ADD(MPROTECT_PTE_VISITS, 1);
                 page_base = level1_base |
                             ((uint64_t)level0_index <<
                              BOAROS_PAGE_SHIFT);
@@ -1619,6 +1624,7 @@ enum riscv_sv39_status riscv_sv39_user_protect_owned_range(
     }
     if (changed != 0) {
         space->protect_global_flushes++;
+        COST_ADD(MPROTECT_GLOBAL_TLB, 1);
         __asm__ volatile("sfence.vma zero, zero" : : : "memory");
     }
     return RISCV_SV39_STATUS_OK;

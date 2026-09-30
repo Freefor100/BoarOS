@@ -9,6 +9,7 @@
 #include <kernel/fs_context.h>
 #include <kernel/heap.h>
 #include <kernel/page_cache.h>
+#include <kernel/memory_object.h>
 #include <kernel/page.h>
 #include <kernel/physical_page.h>
 #include <kernel/vfs.h>
@@ -58,6 +59,16 @@ static void release_path(struct kernel_heap *heap, char *work)
         __builtin_trap();
 }
 
+uint64_t kernel_vfs_allocate_mount_id(void)
+{
+    static uint64_t next = 1;
+    uintptr_t irq = riscv_interrupt_save();
+    if (next == UINT64_MAX) __builtin_trap();
+    uint64_t id = next++;
+    riscv_interrupt_restore(irq);
+    return id;
+}
+
 /* A mount edge is published after both paths are pinned. The short IRQ
  * section protects the edge and reference transfer; it never waits for I/O. */
 int kernel_vfs_mount_attach(struct kernel_vfs_mount *mount,
@@ -76,6 +87,7 @@ int kernel_vfs_mount_attach(struct kernel_vfs_mount *mount,
         (covered->file.mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFDIR)
         return -KERNEL_EINVAL;
     parent = covered->file.mount;
+    if (((struct kernel_vfs_instance *)parent->private_data)->quiescing) return -KERNEL_EIO;
     if (parent == mount) return -KERNEL_EINVAL;
     result = kernel_vfs_path_root(mount,
                     ((struct kernel_vfs_instance *)mount->private_data)->heap,
@@ -104,6 +116,28 @@ int kernel_vfs_mount_attach(struct kernel_vfs_mount *mount,
     covered->mounted_here = mount;
     riscv_interrupt_restore(irq);
     return 0;
+}
+
+int kernel_vfs_mount_prepare_detach(struct kernel_vfs_mount *mount,
+    const struct kernel_vfs_path *named_root)
+{
+    if (!mount || !mount->private_data || !mount->covered_path ||
+        !mount->root_path || !mount->parent) return -KERNEL_EINVAL;
+    struct kernel_vfs_instance *instance = mount->private_data;
+    KERNEL_LOCK_SCOPE(namespace_guard);
+    kernel_vfs_namespace_lock(mount, &namespace_guard);
+    uintptr_t irq = riscv_interrupt_save();
+    uint32_t expected = named_root == mount->root_path ? 2U : 1U;
+    if (mount->covered_path->mounted_here != mount || mount->child_mounts ||
+        mount->root_path->references != expected || instance->external_files != 1U) {
+        riscv_interrupt_restore(irq);
+        return -KERNEL_EBUSY;
+    }
+    /* 先关闭新提交入口，再放锁等待 worker；失败仍由可达的挂载持有。 */
+    instance->quiescing = 1;
+    riscv_interrupt_restore(irq);
+    kernel_lock_scope_release(&namespace_guard);
+    return instance->ops->prepare_unmount ? instance->ops->prepare_unmount(mount) : 0;
 }
 
 int kernel_vfs_mount_detach(struct kernel_vfs_mount *mount,
@@ -281,6 +315,8 @@ int kernel_vfs_path_lookup(struct kernel_vfs_path *parent,
     VFS_PATH_PIN(path_pin, parent);
     KERNEL_LOCK_SCOPE(namespace_guard);
     kernel_vfs_namespace_lock(parent->file.mount, &namespace_guard);
+    if (((struct kernel_vfs_instance *)parent->file.mount->private_data)->quiescing)
+        return -KERNEL_EIO;
 
     struct kernel_vfs_path *child;
     struct kernel_vfs_mount *mount;
@@ -855,6 +891,10 @@ static int mutation_path(struct kernel_vfs_path *start,
                                 follow_trailing, path, missing_name);
     if (result) return result;
     kernel_vfs_namespace_lock((*path)->file.mount, guard);
+    if (((struct kernel_vfs_instance *)(*path)->file.mount->private_data)->quiescing) {
+        (void)kernel_vfs_path_release(path);
+        return -KERNEL_EIO;
+    }
     /* PATH_MAX constrains the supplied path, not a dirfd's ancestry. The
      * pathname-only backend bridge needs the full current ancestor chain. */
     size_t capacity = 2U;
@@ -1061,6 +1101,7 @@ int kernel_vfs_pread(struct kernel_vfs_file *file,
     struct kernel_page_cache *cache = node->instance->page_cache;
     *bytes_read = 0;
     if (offset > INT64_MAX) return -KERNEL_EOVERFLOW;
+    if (node->memory) return node->instance->ops->pread(node, offset, buffer, size, bytes_read);
     while (*bytes_read < size && offset < node->size) {
         uint64_t address;
         size_t valid, start = (size_t)(offset & (BOAROS_PAGE_SIZE - 1U));
@@ -1117,6 +1158,8 @@ int kernel_vfs_pwrite(struct kernel_vfs_file *file,
         return -KERNEL_EINVAL;
     }
     node = file->private_data;
+    KERNEL_LOCK_SCOPE(operation_guard);
+    kernel_vfs_file_write_lock(file, &operation_guard);
     KERNEL_LOCK_SCOPE(node_guard);
     kernel_vfs_node_lock(node, &node_guard, 1);
     if ((node->mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFREG) {
@@ -1135,8 +1178,9 @@ int kernel_vfs_pwrite(struct kernel_vfs_file *file,
     if (offset >= node->max_size) return -KERNEL_EFBIG;
     if (size > node->max_size - offset)
         size = (size_t)(node->max_size - offset);
-    result = kernel_page_cache_write(node->instance->page_cache, file, offset,
-                                      buffer, size, &written);
+    result = node->memory
+        ? node->instance->ops->memory_write(node, offset, buffer, size, &written)
+        : kernel_page_cache_write(node->instance->page_cache, file, offset, buffer, size, &written);
     file->size = node->size;
     *bytes_written = written;
     if (written > size) {
@@ -1165,6 +1209,8 @@ int kernel_vfs_append(struct kernel_vfs_file *file,
         return -KERNEL_EINVAL;
     }
     node = file->private_data;
+    KERNEL_LOCK_SCOPE(operation_guard);
+    kernel_vfs_file_write_lock(file, &operation_guard);
     KERNEL_LOCK_SCOPE(node_guard);
     kernel_vfs_node_lock(node, &node_guard, 1);
     if ((node->mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFREG) {
@@ -1206,6 +1252,8 @@ int kernel_vfs_ftruncate(struct kernel_vfs_file *file,
         return -KERNEL_EINVAL;
     }
     node = file->private_data;
+    KERNEL_LOCK_SCOPE(operation_guard);
+    kernel_vfs_file_write_lock(file, &operation_guard);
     KERNEL_LOCK_SCOPE(node_guard);
     kernel_vfs_node_lock(node, &node_guard, 1);
     if ((node->mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFREG) {
@@ -1221,7 +1269,8 @@ int kernel_vfs_ftruncate(struct kernel_vfs_file *file,
     /* Even a same-size ftruncate updates mtime/ctime. Reconciliation also
      * preserves visible inode mutations when the backend reports an error. */
     if (size > node->max_size) return -KERNEL_EFBIG;
-    result = kernel_page_cache_writeback_before(node->instance->page_cache, node, size);
+    if (node->memory) apply_truncated_size(node, file, size);
+    result = node->memory ? 0 : kernel_page_cache_writeback_before(node->instance->page_cache, node, size);
     if (result != 0) return result;
     uint64_t actual;
     int changed;
@@ -1389,9 +1438,10 @@ int kernel_vfs_mknod_at(struct kernel_vfs_path *start,
         return -KERNEL_EINVAL;
     uint32_t type = mode & KERNEL_VFS_S_IFMT;
     if (type == KERNEL_VFS_S_IFDIR) return -KERNEL_EPERM;
-    if (type == 0060000U || type == KERNEL_VFS_S_IFIFO || type == KERNEL_VFS_S_IFSOCK)
+    if (type == KERNEL_VFS_S_IFIFO || type == KERNEL_VFS_S_IFSOCK)
         return -KERNEL_ENOTSUP;
-    if (type != 0 && type != KERNEL_VFS_S_IFREG && type != KERNEL_VFS_S_IFCHR)
+    if (type != 0 && type != KERNEL_VFS_S_IFREG && type != KERNEL_VFS_S_IFCHR &&
+        type != KERNEL_VFS_S_IFBLK)
         return -KERNEL_EINVAL;
     if (!type) type = KERNEL_VFS_S_IFREG;
     KERNEL_LOCK_SCOPE(namespace_guard);
@@ -1404,8 +1454,8 @@ int kernel_vfs_mknod_at(struct kernel_vfs_path *start,
         result = -KERNEL_EEXIST;
     } else {
         struct kernel_vfs_instance *instance = path->file.mount->private_data;
-        result = instance->read_only || !instance->ops->mknod
-                     ? -KERNEL_EROFS
+        result = instance->read_only ? -KERNEL_EROFS : !instance->ops->mknod
+                     ? -KERNEL_ENOTSUP
                      : instance->ops->mknod(instance, backend, type, mode, device);
     }
     (void)kernel_vfs_path_release(&path);
@@ -1505,6 +1555,41 @@ int kernel_vfs_unlink(struct kernel_vfs_mount *mount, const char *path)
 int kernel_vfs_rmdir(struct kernel_vfs_mount *mount, const char *path)
 {
     return unlink_root(mount, path, 1);
+}
+
+int kernel_vfs_link_at(struct kernel_vfs_path *source,
+                       struct kernel_vfs_path *start,
+                       struct kernel_vfs_path *root, const char *input)
+{
+    if (!start || !start->file.mount || !start->file.mount->private_data)
+        return -KERNEL_EINVAL;
+    KERNEL_LOCK_SCOPE(namespace_guard);
+    KERNEL_LOCK_SCOPE(inode_guard);
+    struct kernel_vfs_path *parent = 0;
+    char name[256] = {0}, *backend = 0;
+    int result = mutation_path(start, root, input, 0, 1, 0, 2,
+                                &parent, name, &backend, &namespace_guard);
+    if (result) return result;
+    struct kernel_vfs_instance *instance = parent->file.mount->private_data;
+    /* 目标存在优先于跨挂载；NULL 源表示已 pin 的无路径 pipe/socket OFD。 */
+    if (!name[0]) result = -KERNEL_EEXIST;
+    else if (instance->read_only) result = -KERNEL_EROFS;
+    else if (!source || source->file.mount != parent->file.mount)
+        result = -KERNEL_EXDEV;
+    else if ((source->file.mode & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFDIR ||
+             !instance->ops->link) result = -KERNEL_EPERM;
+    else {
+        struct kernel_vfs_node *node = source->file.private_data;
+        kernel_vfs_node_lock(node, &inode_guard, 1);
+        /* dentry 可已摘除但 inode 仍有别名；只有最后链接消失才禁止复活。 */
+        result = node->unlinked ? -KERNEL_ENOENT :
+            instance->ops->link(instance, node->inode,
+                               kernel_vfs_path_inode(parent), name);
+    }
+    kernel_lock_scope_release(&inode_guard);
+    (void)kernel_vfs_path_release(&parent);
+    release_path(start->heap, backend);
+    return result;
 }
 
 int kernel_vfs_symlink_at(struct kernel_vfs_path *start,
@@ -1854,7 +1939,7 @@ int kernel_vfs_sync_range(struct kernel_vfs_file *file,
     kernel_vfs_node_lock(node, &node_guard, 0);
     result = 0;
     if (node->instance->read_only) goto observe;
-    result = start == 0U && end == UINT64_MAX
+    result = !node->instance->page_cache ? 0 : start == 0U && end == UINT64_MAX
         ? kernel_page_cache_writeback(node->instance->page_cache, node)
         : kernel_page_cache_writeback_range(node->instance->page_cache,
                                             node, start, end);
@@ -1906,6 +1991,15 @@ struct kernel_page_cache *kernel_vfs_file_page_cache(
 int kernel_vfs_node_try_read(struct kernel_vfs_node *node, struct kernel_lock_guard *guard)
 { return kernel_rwlock_try_read(&node->io_lock, guard); }
 
+void kernel_vfs_file_write_lock(struct kernel_vfs_file *file, struct kernel_lock_guard *guard)
+{
+    if (!file || file->state != VFS_FILE_STATE_LIVE || !file->private_data) __builtin_trap();
+    struct kernel_vfs_node *node = file->private_data;
+    /* writev 外层已持有门闩，内部 pwrite/append 不递归取得同一锁。 */
+    if (kernel_lock_held(&node->write_operation.lock, 1)) return;
+    kernel_mutex_lock(&node->write_operation, guard);
+}
+
 void kernel_vfs_node_lock(struct kernel_vfs_node *node, struct kernel_lock_guard *guard, int write)
 {
     if (!node || !node->references) __builtin_trap();
@@ -1919,7 +2013,10 @@ int kernel_vfs_unmount(struct kernel_vfs_mount *mount)
     if (!mount || !mount->private_data) return -KERNEL_EINVAL;
     if (mount->covered_path || mount->child_mounts) return -KERNEL_EBUSY;
     struct kernel_vfs_instance *instance = mount->private_data;
-    return instance->ops->unmount(mount);
+    void (*release_owner)(struct kernel_vfs_mount *) = mount->release_owner;
+    int result = instance->ops->unmount(mount);
+    if (!result && release_owner) release_owner(mount);
+    return result;
 }
 
 int kernel_vfs_mount_statfs(struct kernel_vfs_mount *mount,
@@ -1927,6 +2024,7 @@ int kernel_vfs_mount_statfs(struct kernel_vfs_mount *mount,
 {
     if (!mount || !mount->private_data) return -KERNEL_EINVAL;
     struct kernel_vfs_instance *instance = mount->private_data;
+    if (instance->quiescing) return -KERNEL_EIO;
     return instance->ops->statfs(mount, stat);
 }
 
@@ -1935,6 +2033,7 @@ int kernel_vfs_file_set_times(struct kernel_vfs_file *file,
 {
     if (!file || !file->mount || !file->mount->private_data) return -KERNEL_EINVAL;
     struct kernel_vfs_instance *instance = file->mount->private_data;
+    if (instance->quiescing) return -KERNEL_EIO;
     return instance->ops->set_times(file, times);
 }
 
@@ -1942,6 +2041,7 @@ int kernel_vfs_file_set_mode(struct kernel_vfs_file *file, uint32_t mode)
 {
     if (!file || !file->mount || !file->mount->private_data) return -KERNEL_EINVAL;
     struct kernel_vfs_instance *instance = file->mount->private_data;
+    if (instance->quiescing) return -KERNEL_EIO;
     return instance->ops->set_mode(file, mode);
 }
 
@@ -1952,6 +2052,7 @@ static int vfs_open_raw(struct kernel_vfs_mount *mount,
 {
     if (!mount || !mount->private_data) return -KERNEL_EINVAL;
     struct kernel_vfs_instance *instance = mount->private_data;
+    if (instance->quiescing) return -KERNEL_EIO;
     return instance->ops->open(mount, path, inode_number, inode_mode, file);
 }
 
@@ -1962,6 +2063,7 @@ static int vfs_create_raw(struct kernel_vfs_mount *mount,
 {
     if (!mount || !mount->private_data) return -KERNEL_EINVAL;
     struct kernel_vfs_instance *instance = mount->private_data;
+    if (instance->quiescing) return -KERNEL_EIO;
     return instance->ops->create(mount, path, mode, file);
 }
 
@@ -1985,6 +2087,7 @@ int kernel_vfs_fstat(const struct kernel_vfs_file *file,
 {
     if (!file || !file->mount || !file->mount->private_data) return -KERNEL_EINVAL;
     struct kernel_vfs_instance *instance = file->mount->private_data;
+    if (instance->quiescing) return -KERNEL_EIO;
     return instance->ops->stat(file, stat);
 }
 
@@ -2044,6 +2147,24 @@ int kernel_vfs_node_pread(struct kernel_vfs_node *node,
     return instance->ops->pread(node, offset, buffer, size, bytes_read);
 }
 
+int kernel_vfs_file_is_control(const struct kernel_vfs_file *file)
+{
+    struct kernel_vfs_node *node = kernel_vfs_file_node(file);
+    return node && node->generated_control;
+}
+
+int kernel_vfs_file_control(const struct kernel_vfs_file *file, int write,
+    uint64_t offset, char *buffer, size_t size, size_t *count)
+{
+    struct kernel_vfs_node *node = kernel_vfs_file_node(file);
+    if (!node || !node->generated_control || !count || (!buffer && size))
+        return -KERNEL_EINVAL;
+    struct kernel_vfs_instance *instance = node->instance;
+    if (instance->quiescing) return -KERNEL_EIO;
+    if (write && instance->read_only) return -KERNEL_EROFS;
+    return instance->ops->control(node, write, offset, buffer, size, count);
+}
+
 int kernel_vfs_file_generated(const struct kernel_vfs_file *file)
 {
     if (!file || !file->mount || !file->mount->private_data) return 0;
@@ -2100,6 +2221,7 @@ int kernel_vfs_publish_node(struct kernel_vfs_mount *mount,
         node->mount = mount;
         node->references = 1;
         node->open_files = 1;
+        kernel_mutex_init(&node->write_operation, 15, (uintptr_t)node);
         kernel_rwlock_init(&node->io_lock, 30, (uintptr_t)node);
         kernel_record_lock_state_init(&node->record_locks);
         node->next = instance->nodes;
@@ -2115,3 +2237,14 @@ int kernel_vfs_publish_node(struct kernel_vfs_mount *mount,
     instance->external_files++;
     return 0;
 }
+
+struct kernel_memory_object *kernel_vfs_file_memory(const struct kernel_vfs_file *file)
+{ struct kernel_vfs_node *n = kernel_vfs_file_node(file); return n ? n->memory : 0; }
+
+#if BOAROS_COST_DIAGNOSTICS
+int kernel_vfs_file_is_cost(const struct kernel_vfs_file *file)
+{
+    struct kernel_vfs_node *node = kernel_vfs_file_node(file);
+    return node && node->generated_diagnostic;
+}
+#endif

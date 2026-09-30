@@ -1,6 +1,7 @@
 #ifndef BOAROS_KERNEL_SYNC_H
 #define BOAROS_KERNEL_SYNC_H
 
+#include <kernel/cost.h>
 #include <kernel/scheduler.h>
 #include <stdint.h>
 
@@ -20,12 +21,16 @@ struct kernel_lock_guard {
     struct kernel_io_context *owner;
     struct kernel_lock_guard *previous;
     int write;
+#if BOAROS_COST_DIAGNOSTICS
+    uint64_t cost_start, cost_registered;
+#endif
 };
 struct kernel_io_context {
     struct kernel_lock_guard *locks;
     unsigned allocation_depth;
     uint32_t reclaim_depth;
     unsigned backend_depth;
+    unsigned background_reclaim;
     int backend_read;
     struct kernel_lock_guard backend_guard;
 };

@@ -26,7 +26,7 @@ if ! timeout -k 2s 30s "$qemu" -machine virt -bios default \
     -kernel "$kernel" -m 512M -smp 1 -nographic -no-reboot \
     -drive file="$disk",if=none,format=raw,id=root \
     -device virtio-blk-device,drive=root,bus=virtio-mmio-bus.0 \
-    >"$output" 2>&1; then
+    </dev/null >"$output" 2>&1; then
     tail -n 30 "$output" >&2
     exit 1
 fi

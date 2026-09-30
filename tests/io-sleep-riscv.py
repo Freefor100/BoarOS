@@ -8,13 +8,19 @@ import subprocess
 import tempfile
 import time
 import sys
+import hashlib
+import json
+import fcntl
+from cost_report import parse
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--kernel', required=True)
 parser.add_argument('--qemu', default='qemu-system-riscv64')
 parser.add_argument('--transport', choices=('all', 'legacy', 'modern'), default='all')
 parser.add_argument('--write-through', action='store_true')
+parser.add_argument('--cost-output', type=Path, help='cost records destination; requires one transport, diagnostic fixture')
 args = parser.parse_args()
+if args.cost_output and args.transport=='all': parser.error('cost fixture needs explicit transport')
 if args.transport == 'all':
     for transport in ('legacy', 'modern'):
         for mode in ([], ['--write-through']):
@@ -22,6 +28,10 @@ if args.transport == 'all':
                             '--qemu', args.qemu, '--transport', transport] + mode, check=True)
     raise SystemExit(0)
 root = Path(__file__).resolve().parents[1]
+if args.cost_output:
+    (root/'build/cost').mkdir(parents=True,exist_ok=True)
+    measurement_lock=(root/'build/cost/measurement.lock').open('w')
+    fcntl.flock(measurement_lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
 work = Path(tempfile.mkdtemp(prefix='io-sleep-run.', dir=root / 'build'))
 processes = []
 logs = {'guest': bytearray(), 'server': bytearray()}
@@ -36,6 +46,18 @@ try:
         data.write_bytes(bytes((i * 19 + index) % 256 for i in range(4096)))
         subprocess.run(['debugfs', '-w', '-R', f'write {data} /cold{index}', str(disk)],
                        check=True, capture_output=True)
+    fixture_sha256=hashlib.sha256(disk.read_bytes()).hexdigest() if args.cost_output else None
+    kernel_snapshot=work/'kernel'
+    if args.cost_output:
+        shutil.copyfile(args.kernel,kernel_snapshot)
+        kernel_path=str(kernel_snapshot)
+        source_tree=subprocess.check_output(['git','write-tree'],cwd=root,text=True).strip()
+        source_sha256=hashlib.sha256(b''.join(p.encode()+b'\0'+hashlib.sha256((root/p).read_bytes()).hexdigest().encode()+b'\n' for p in sorted(subprocess.check_output(['git','ls-files','-co','--exclude-standard'],cwd=root,text=True).splitlines()) if '__pycache__' not in Path(p).parts)).hexdigest()
+        bios=work/'firmware';shutil.copyfile('/usr/share/qemu/opensbi-riscv64-generic-fw_dynamic.bin',bios)
+        dtb=work/'boot.dtb'
+        subprocess.run([args.qemu,'-machine','virt,dumpdtb='+str(dtb),'-bios',str(bios),'-kernel',kernel_path,'-m','512M','-smp','1','-nographic','-global','virtio-mmio.force-legacy='+('true' if args.transport=='legacy' else 'false'),'-drive',f'file={disk},if=none,format=raw,id=root','-device','virtio-blk-device,drive=root,bus=virtio-mmio-bus.0,config-wce=off,request-merging=off'],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        firmware_sha256=hashlib.sha256(bios.read_bytes()).hexdigest();dtb_sha256=hashlib.sha256(dtb.read_bytes()).hexdigest()
+    else: kernel_path=args.kernel
     address = work / 'nbd.sock'
     server = subprocess.Popen([str(root / 'build/host/nbd-fault'), str(disk), str(address),
                                '--control-stdin'], stdin=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
@@ -45,11 +67,24 @@ try:
         if server.poll() is not None or time.monotonic() > deadline:
             raise RuntimeError('NBD server startup failed')
         time.sleep(0.01)
-    guest = subprocess.Popen([args.qemu, '-machine', 'virt', '-bios', 'default',
+    guest_command=[args.qemu, '-machine', 'virt', '-bios', str(bios) if args.cost_output else 'default',
         '-global', 'virtio-mmio.force-legacy=' + ('true' if args.transport == 'legacy' else 'false'),
-        '-kernel', args.kernel, '-m', '512M', '-smp', '1', '-nographic', '-no-reboot',
+        '-kernel', kernel_path, '-m', '512M', '-smp', '1', '-nographic', '-no-reboot',
         '-drive', f'file=nbd+unix:///?socket={address},if=none,format=raw,id=root,cache={'writethrough' if args.write_through else 'writeback'}',
-        '-device', 'virtio-blk-device,drive=root,bus=virtio-mmio-bus.0,config-wce=off,request-merging=off'],
+        '-device', 'virtio-blk-device,drive=root,bus=virtio-mmio-bus.0,config-wce=off,request-merging=off']
+    if args.cost_output:guest_command+=['-dtb',str(dtb)]
+    if args.cost_output:
+        input_record={'transport':args.transport,'cache':'writethrough' if args.write_through else 'writeback',
+            'kernel_sha256':hashlib.sha256(Path(kernel_path).read_bytes()).hexdigest(),
+            'fixture_sha256':fixture_sha256,'source_tree':source_tree,'source_sha256':source_sha256,
+            'firmware_sha256':firmware_sha256,'dtb_sha256':dtb_sha256,'argv':guest_command,
+            'qemu_version':subprocess.check_output([args.qemu,'--version'],text=True).splitlines()[0],
+            'qemu_sha256':hashlib.sha256(Path(shutil.which(args.qemu)).read_bytes()).hexdigest(),
+            'nbd_sha256':hashlib.sha256((root/'build/host/nbd-fault').read_bytes()).hexdigest()}
+        frozen=json.dumps(input_record,sort_keys=True,separators=(',',':'))+'\n'
+        (work/'input.json').write_text(frozen)
+        input_record['input_keys']=list(input_record);input_record['input_sha256']=hashlib.sha256(frozen.encode()).hexdigest()
+    guest = subprocess.Popen(guest_command,
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0)
     processes.append(guest)
     selector = selectors.DefaultSelector()
@@ -134,6 +169,21 @@ try:
     success = (guest.returncode == 0 and server.returncode == 0 and released and queue_verified and reset_seen and
                b'BoarOS: I/O sleep tests passed' in logs['guest'] and
                b'I/O sleep failed:' not in logs['guest'])
+    if success and args.cost_output:
+        snapshots=[]; current=None; body=[]
+        for line in logs['guest'].decode().splitlines():
+            if line.startswith('COST SNAPSHOT '):
+                if current: raise ValueError('nested fixture snapshot')
+                _,_,name,epoch=line.split(); current=(name,int(epoch)); body=[]
+            elif line=='COST END':
+                if not current: raise ValueError('extra fixture end')
+                name,epoch=current; snapshot=parse('\n'.join(body),epoch)
+                if snapshot['mode']!='fixture': raise ValueError('unmarked fixture')
+                snapshots.append({'name':name,'values':snapshot}); current=None
+            elif current: body.append(line)
+        if current or {s['name'] for s in snapshots}!={'pressure-io','timeout-cancel'}: raise ValueError('missing fixture window')
+        args.cost_output.parent.mkdir(parents=True,exist_ok=True)
+        args.cost_output.write_text(json.dumps({**input_record,'snapshots':snapshots},indent=2)+'\n')
     if not success:
         raise RuntimeError(logs['guest'][-4000:].decode(errors='replace'))
     print(f'BoarOS: I/O sleep tests passed ({args.transport}, {'writethrough' if args.write_through else 'writeback'}); two cold reads held, CPU/cache progressed, reverse completion and FLUSH barrier and timeout/reset verified')

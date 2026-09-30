@@ -1,3 +1,4 @@
+#include <kernel/cost.h>
 #include <arch/riscv/plic.h>
 #include <arch/riscv/process.h>
 #include <arch/riscv/sbi.h>
@@ -10,6 +11,7 @@
 #include <kernel/signal.h>
 #include <arch/riscv/signal.h>
 #include <kernel/syscall.h>
+#include <kernel/time.h>
 #include <kernel/task.h>
 #include <kernel/tick.h>
 
@@ -113,6 +115,9 @@ static int user_page_fault_access(uint64_t scause, uint32_t *access)
 
 void riscv_trap_dispatch(struct riscv_trap_frame *frame)
 {
+#if BOAROS_COST_DIAGNOSTICS
+    kernel_cost_irq_disabled(kernel_cost_trap_timestamp);
+#endif
     int from_user = (frame->sstatus & RISCV_SSTATUS_SPP) == 0U;
 
     if (frame->scause == (RISCV_SCAUSE_INTERRUPT | 9U)) {
@@ -122,6 +127,10 @@ void riscv_trap_dispatch(struct riscv_trap_frame *frame)
 
     if (frame->scause ==
         (RISCV_SCAUSE_INTERRUPT | RISCV_SCAUSE_SUPERVISOR_TIMER)) {
+#if BOAROS_COST_DIAGNOSTICS
+        struct kernel_cost_tag cost_timer_tag = kernel_cost_capture();
+        uint64_t cost_timer_start = kernel_cost_clock();
+#endif
         uint64_t elapsed_ticks;
         enum riscv_timer_status status =
             riscv_timer_handle_interrupt(&elapsed_ticks);
@@ -129,8 +138,11 @@ void riscv_trap_dispatch(struct riscv_trap_frame *frame)
         if (status != RISCV_TIMER_STATUS_OK) {
             riscv_timer_fatal(frame, status);
         }
-        kernel_tick_advance(elapsed_ticks);
-        kernel_scheduler_charge_ticks(elapsed_ticks, (int)from_user);
+        if (elapsed_ticks) {
+            kernel_tick_advance(elapsed_ticks);
+            kernel_time_update_coarse();
+            kernel_scheduler_charge_ticks(elapsed_ticks, (int)from_user);
+        }
         {
             enum kernel_scheduler_status scheduler_status =
                 kernel_scheduler_expire_deadlines(riscv_time_read());
@@ -140,6 +152,9 @@ void riscv_trap_dispatch(struct riscv_trap_frame *frame)
             }
         }
         kernel_console_poll_input();
+#if BOAROS_COST_DIAGNOSTICS
+        kernel_cost_sample_tag(cost_timer_tag, COST_TIMER_TICKS, kernel_cost_clock() - cost_timer_start);
+#endif
         {
             enum kernel_scheduler_status scheduler_status =
                 kernel_scheduler_on_tick(elapsed_ticks);
@@ -164,15 +179,14 @@ void riscv_trap_dispatch(struct riscv_trap_frame *frame)
             if (status == KERNEL_MM_STATUS_OK) {
                 return;
             }
-            if (status == KERNEL_MM_STATUS_NOT_MAPPED) {
-                kernel_user_thread_exit(KERNEL_THREAD_EXIT_SIGNAL,
-                                        11U,
-                                        frame->stval);
+            if (status == KERNEL_MM_STATUS_NOT_MAPPED || status == KERNEL_MM_STATUS_ACCESS) {
+                kernel_signal_force_fault(kernel_task_current(), 11U,
+                    status == KERNEL_MM_STATUS_ACCESS ? 2 : 1, frame->stval);
+                return;
             }
             if (status == KERNEL_MM_STATUS_BUS_FAULT) {
-                kernel_user_thread_exit(KERNEL_THREAD_EXIT_SIGNAL,
-                                        7U,
-                                        frame->stval);
+                kernel_signal_force_fault(kernel_task_current(), 7U, 2, frame->stval);
+                return;
             }
             if (status == KERNEL_MM_STATUS_NO_MEMORY) {
                 kernel_user_thread_exit(
@@ -285,9 +299,20 @@ void riscv_trap_dispatch(struct riscv_trap_frame *frame)
 
     if (from_user &&
         (frame->scause & RISCV_SCAUSE_INTERRUPT) == 0U) {
-        kernel_user_thread_exit(KERNEL_THREAD_EXIT_USER_FAULT,
-                                frame->scause,
-                                frame->stval);
+        uint32_t signal = 4U;
+        int32_t code = 4; /* 固定 Linux do_trap_unknown: ILL_ILLTRP。 */
+        switch (frame->scause) {
+        case 0: case 4: case 6: signal = 7U; code = 1; break;
+        case 1: case 5: case 7: signal = 11U; code = 2; break;
+        case 2: signal = 4U; code = 1; break;
+        case 3: signal = 5U; code = 1; break;
+        case 18:
+            if (frame->stval == 2 || frame->stval == 3) { signal = 11U; code = 10; }
+            break;
+        case 19: signal = 7U; code = 4; break;
+        }
+        kernel_signal_force_fault(kernel_task_current(), signal, code, frame->sepc);
+        return;
     }
 
     riscv_trap_fatal(frame);
@@ -298,6 +323,9 @@ void riscv_trap_return_prepare(struct riscv_trap_frame *frame)
     if ((frame->sstatus & RISCV_SSTATUS_SPP) == 0U)
         kernel_task_prepare_user_return();
     riscv_signal_prepare_user_return(frame);
+#if BOAROS_COST_DIAGNOSTICS
+    if ((frame->sstatus & RISCV_SSTATUS_SPP) == 0U) kernel_cost_user_return();
+#endif
 }
 
 void riscv_trap_bad_return(struct riscv_trap_frame *frame)

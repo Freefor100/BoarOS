@@ -37,6 +37,8 @@ enum kernel_open_file_kind {
     KERNEL_OPEN_FILE_KIND_ZERO,
     KERNEL_OPEN_FILE_KIND_SOCKET,
     KERNEL_OPEN_FILE_KIND_GENERATED,
+    KERNEL_OPEN_FILE_KIND_RANDOM,
+    KERNEL_OPEN_FILE_KIND_URANDOM,
 };
 
 /* VFS errors are returned through linux_result when status is OK. */
@@ -151,6 +153,16 @@ enum kernel_open_file_status kernel_open_file_seek(
     struct kernel_open_file_description *file,
     uint64_t offset);
 
+int kernel_open_file_memory_backed(struct kernel_open_file_description *file);
+/* Memory shared first-write notification; source pin owns the inode lifetime. */
+void kernel_open_file_memory_modified(struct kernel_open_file_description *file);
+/* A newly materialized memory page remains rollback-owned until publication.
+ * Disk-cache pages always report created == 0 and keep their cache owner. */
+enum kernel_page_cache_status kernel_open_file_get_page_for_fault(
+    struct kernel_open_file_description *file, uint64_t page_index,
+    uint64_t *physical_address, size_t *valid_bytes, int *created);
+void kernel_open_file_discard_new_page(struct kernel_open_file_description *file,
+    uint64_t page_index, uint64_t physical_address);
 enum kernel_page_cache_status kernel_open_file_get_page(
     struct kernel_open_file_description *file,
     uint64_t page_index,

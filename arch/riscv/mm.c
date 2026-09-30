@@ -6,9 +6,10 @@
 #include <kernel/open_file.h>
 #include <kernel/proc_task.h>
 #include <kernel/page.h>
-#include <kernel/shared_anon.h>
+#include <kernel/memory_object.h>
 #include <kernel/task.h>
 #include <kernel/sync.h>
+#include <kernel/shm.h>
 #include <kernel/vma.h>
 #include <kernel/vfs.h>
 
@@ -31,25 +32,32 @@ enum riscv_kernel_mm_record_stage {
 struct riscv_kernel_mm_file_source {
     struct riscv_kernel_mm_file_source *next;
     struct kernel_open_file_description *file;
-    uint32_t faults;
+    uint32_t operations;
     int draining;
 };
 
-struct fault_page_pin { struct physical_page_allocator *allocator; uint64_t address; };
+struct fault_page_pin {
+    struct physical_page_allocator *allocator;
+    struct kernel_open_file_description *file;
+    uint64_t address, index;
+    int created;
+};
 static void release_fault_page(struct fault_page_pin *pin)
 {
     if (physical_page_release(pin->allocator, pin->address) != PHYSICAL_PAGE_STATUS_OK) __builtin_trap();
+    if (pin->created)
+        kernel_open_file_discard_new_page(pin->file, pin->index, pin->address);
 }
 
-static void unpin_fault_source(struct riscv_kernel_mm_file_source **source)
+static void unpin_file_source(struct riscv_kernel_mm_file_source **source)
 {
-    if (!(*source)->faults) __builtin_trap();
-    (*source)->faults--;
+    if (!(*source)->operations) __builtin_trap();
+    (*source)->operations--;
 }
 
 struct riscv_kernel_mm_shared_anon {
     struct riscv_kernel_mm_shared_anon *next;
-    struct kernel_shared_anon *object;
+    struct kernel_memory_object *object;
 };
 
 struct riscv_file_mapping {
@@ -88,6 +96,7 @@ struct riscv_kernel_mm_record {
     uint32_t references;
     uint32_t users;
     enum riscv_kernel_mm_record_stage stage;
+    uint64_t start_code, end_code, start_stack;
     uint64_t start_brk;
     uint64_t current_brk;
     uint64_t brk_limit;
@@ -589,7 +598,7 @@ static enum kernel_mm_status drain_file_sources(
         struct riscv_kernel_mm_file_source *source = *link;
         int in_use = 0;
 
-        if (source->faults || source->draining) {
+        if (source->operations || source->draining) {
             if (!unused_only) __builtin_trap();
             link = &source->next;
             continue;
@@ -807,7 +816,7 @@ static void drain_shared_anon(struct riscv_kernel_mm_record *record,
             continue;
         }
         *link = entry->next;
-        kernel_shared_anon_release(&entry->object);
+        kernel_memory_object_release(&entry->object);
         if (kernel_heap_release(record->vma_heap, entry) !=
             KERNEL_HEAP_STATUS_OK) __builtin_trap();
     }
@@ -830,8 +839,8 @@ static enum kernel_mm_status clone_shared_anon(
             return status == KERNEL_HEAP_STATUS_EMPTY
                        ? KERNEL_MM_STATUS_NO_MEMORY
                        : KERNEL_MM_STATUS_STATE;
-        if (kernel_shared_anon_acquire(source->object) !=
-            KERNEL_SHARED_ANON_OK) {
+        if (kernel_memory_object_acquire(source->object) !=
+            KERNEL_MEMORY_OBJECT_OK) {
             (void)kernel_heap_release(destination_record->vma_heap, copy);
             return KERNEL_MM_STATUS_STATE;
         }
@@ -873,7 +882,8 @@ static int shared_anon_leaf(void *context, uint64_t virtual_address)
     if (status == KERNEL_VMA_STATUS_NOT_FOUND) return 0;
     if (status != KERNEL_VMA_STATUS_OK) __builtin_trap();
     return vma.kind == KERNEL_VMA_KIND_ANON_SHARED ||
-           vma.kind == KERNEL_VMA_KIND_FILE_SHARED;
+           vma.kind == KERNEL_VMA_KIND_FILE_SHARED ||
+           vma.kind == KERNEL_VMA_KIND_SYSV_SHM;
 }
 
 enum kernel_mm_status kernel_mm_fork(
@@ -1041,6 +1051,9 @@ enum kernel_mm_status kernel_mm_fork(
         for (struct riscv_file_mapping *entry = destination_record->file_mappings;
              entry != 0; entry = entry->next)
             kernel_file_mapping_register(&entry->registration);
+        destination_record->start_code = source_record->start_code;
+        destination_record->end_code = source_record->end_code;
+        destination_record->start_stack = source_record->start_stack;
         destination_record->start_brk = source_record->start_brk;
         destination_record->current_brk = source_record->current_brk;
         destination_record->brk_limit = source_record->brk_limit;
@@ -1175,7 +1188,7 @@ enum kernel_mm_status kernel_mm_vma_insert_anon(
 {
     KERNEL_NO_RECLAIM_IO;
     struct riscv_kernel_mm_record *record;
-    struct kernel_vma vma;
+    struct kernel_vma vma = {0};
     enum kernel_mm_status status;
 
     if (mm == 0 || !valid_vma_range(start, end, permissions) ||
@@ -1198,6 +1211,7 @@ enum kernel_mm_status kernel_mm_vma_insert_anon(
     vma.end = end;
     vma.backing_offset = 0U;
     vma.permissions = permissions;
+    vma.maximum_permissions = KERNEL_VMA_ALL_PERMISSIONS;
     vma.kind = KERNEL_VMA_KIND_ANONYMOUS;
     vma.role = role;
     vma.fault_policy = fault_policy;
@@ -1311,6 +1325,7 @@ enum kernel_mm_status kernel_mm_map_elf_source(
             .end = load_bias + run->end,
             .backing_offset = run->start,
             .permissions = mm_permissions_from_elf_flags(run->flags),
+            .maximum_permissions = KERNEL_VMA_ALL_PERMISSIONS,
             .kind = KERNEL_VMA_KIND_ELF_PRIVATE,
             .role = KERNEL_VMA_ROLE_ELF,
             .fault_policy = KERNEL_VMA_FAULT_ELF,
@@ -1381,6 +1396,24 @@ enum kernel_mm_status kernel_mm_executable_path_acquire(
     return KERNEL_MM_STATUS_OK;
 }
 
+enum kernel_mm_status kernel_mm_set_exec_layout(
+    struct kernel_mm *mm, uint64_t start_code, uint64_t end_code,
+    uint64_t start_stack)
+{
+    struct riscv_kernel_mm_record *record;
+    enum kernel_mm_status status = resolve_record(mm, &record);
+    if (status != KERNEL_MM_STATUS_OK) return status;
+    if (record->stage != RISCV_KERNEL_MM_RECORD_LIVE)
+        return KERNEL_MM_STATUS_STATE;
+    if (start_code > end_code || end_code >= RISCV_SV39_USER_LIMIT ||
+        start_stack >= RISCV_SV39_USER_LIMIT)
+        return KERNEL_MM_STATUS_INVALID_ARGUMENT;
+    record->start_code = start_code;
+    record->end_code = end_code;
+    record->start_stack = start_stack;
+    return KERNEL_MM_STATUS_OK;
+}
+
 enum kernel_mm_status kernel_mm_proc_memory_snapshot(
     const struct kernel_mm *mm, struct kernel_mm_proc_memory *snapshot)
 {
@@ -1391,6 +1424,9 @@ enum kernel_mm_status kernel_mm_proc_memory_snapshot(
     if (record->stage != RISCV_KERNEL_MM_RECORD_LIVE || !record->vmas)
         return KERNEL_MM_STATUS_STATE;
     *snapshot = (struct kernel_mm_proc_memory){
+        .start_code = record->start_code,
+        .end_code = record->end_code,
+        .start_stack = record->start_stack,
         .virtual_bytes = kernel_vma_set_total_bytes(record->vmas),
         .resident_pages = (uint64_t)record->space.leaf_pages +
                           record->space.protected_pages,
@@ -1688,7 +1724,7 @@ enum kernel_mm_status kernel_mm_mmap_anonymous(
     struct riscv_kernel_mm_record *record;
     struct kernel_vma vma;
     struct kernel_vma_edit edit;
-    struct kernel_shared_anon *shared_object = 0;
+    struct kernel_memory_object *shared_object = 0;
     struct riscv_kernel_mm_shared_anon *shared_entry = 0;
     uint64_t aligned_length;
     uint64_t start;
@@ -1765,19 +1801,19 @@ enum kernel_mm_status kernel_mm_mmap_anonymous(
     }
     end = start + aligned_length;
     if ((flags & KERNEL_MM_MAP_SHARED) != 0U) {
-        enum kernel_shared_anon_status shared_status =
-            kernel_shared_anon_create(record->vma_heap, mm->allocator,
+        enum kernel_memory_object_status shared_status =
+            kernel_memory_object_create(record->vma_heap, mm->allocator,
                                       &shared_object);
 
-        if (shared_status != KERNEL_SHARED_ANON_OK)
-            return shared_status == KERNEL_SHARED_ANON_NO_MEMORY
+        if (shared_status != KERNEL_MEMORY_OBJECT_OK)
+            return shared_status == KERNEL_MEMORY_OBJECT_NO_MEMORY
                        ? KERNEL_MM_STATUS_NO_MEMORY
                        : KERNEL_MM_STATUS_STATE;
         enum kernel_heap_status heap_status = kernel_heap_allocate_zeroed(
             record->vma_heap, 1U, sizeof(*shared_entry),
             (void **)&shared_entry);
         if (heap_status != KERNEL_HEAP_STATUS_OK) {
-            kernel_shared_anon_release(&shared_object);
+            kernel_memory_object_release(&shared_object);
             return heap_status == KERNEL_HEAP_STATUS_EMPTY
                        ? KERNEL_MM_STATUS_NO_MEMORY
                        : KERNEL_MM_STATUS_STATE;
@@ -1789,6 +1825,7 @@ enum kernel_mm_status kernel_mm_mmap_anonymous(
         .end = end,
         .backing_offset = 0U,
         .permissions = normalized,
+        .maximum_permissions = KERNEL_VMA_ALL_PERMISSIONS,
         .kind = shared_object != 0 ? KERNEL_VMA_KIND_ANON_SHARED
                                    : KERNEL_VMA_KIND_ANONYMOUS,
         .role = KERNEL_VMA_ROLE_MMAP,
@@ -1848,7 +1885,7 @@ discard_shared:
         kernel_heap_release(record->vma_heap, shared_entry) !=
             KERNEL_HEAP_STATUS_OK) __builtin_trap();
     if (shared_object != 0)
-        kernel_shared_anon_release(&shared_object);
+        kernel_memory_object_release(&shared_object);
     return status;
 }
 
@@ -2068,9 +2105,9 @@ enum kernel_mm_status kernel_mm_mmap_file_private(
                             ? KERNEL_VMA_FAULT_FILE_SHARED
                             : KERNEL_VMA_FAULT_FILE_PRIVATE,
         .backing = *file,
-        .file_shared_may_write =
-            (flags & KERNEL_MM_MAP_SHARED) != 0U &&
-            kernel_open_file_writable(*file),
+        .maximum_permissions = KERNEL_VMA_ALL_PERMISSIONS &
+            (((flags & KERNEL_MM_MAP_SHARED) == 0U || kernel_open_file_writable(*file))
+                 ? KERNEL_VMA_ALL_PERMISSIONS : ~KERNEL_MM_WRITE),
     };
     if ((flags & KERNEL_MM_MAP_FIXED) == 0U) {
         status = status_from_vma(kernel_vma_set_insert(record->vmas,
@@ -2169,12 +2206,242 @@ enum kernel_mm_status kernel_mm_munmap(
     return KERNEL_MM_STATUS_OK;
 }
 
+enum kernel_mm_status kernel_mm_shmat(
+    struct kernel_mm *mm,
+    struct kernel_shm_segment *segment,
+    uint64_t hint,
+    uint32_t permissions,
+    uint32_t flags,
+    uint64_t *out_address)
+{
+    KERNEL_NO_RECLAIM_IO;
+    struct riscv_kernel_mm_record *record;
+    struct kernel_vma vma;
+    struct kernel_vma_edit edit;
+    struct riscv_kernel_mm_shared_anon *shared_entry = 0;
+    struct kernel_memory_object *temporary_owner = 0;
+    struct kernel_shm_attachment *attachment
+        __attribute__((cleanup(kernel_shm_attachment_release))) = 0;
+    uint64_t aligned_length;
+    uint64_t start;
+    uint64_t end;
+    uint32_t normalized;
+    int overlaps;
+    enum kernel_mm_status status;
+    enum kernel_vma_status vma_status;
+
+    if (mm == 0 || segment == 0 || !segment->active || segment->memory == 0 ||
+        out_address == 0 ||
+        !normalize_user_permissions(permissions, &normalized)) {
+        return KERNEL_MM_STATUS_INVALID_ARGUMENT;
+    }
+    aligned_length = segment->aligned_size;
+    if (aligned_length == 0U) {
+        return KERNEL_MM_STATUS_INVALID_ARGUMENT;
+    }
+    status = mutable_vma_record(mm, &record);
+    if (status != KERNEL_MM_STATUS_OK) {
+        return status;
+    }
+
+    if (hint != 0U) {
+        if ((flags & KERNEL_SHM_RND) != 0U) {
+            hint &= ~BOAROS_PAGE_MASK;
+        }
+        if ((hint & BOAROS_PAGE_MASK) != 0U ||
+            hint < RISCV_SV39_PAGE_SIZE_4K ||
+            hint >= RISCV_SV39_USER_LIMIT ||
+            aligned_length > RISCV_SV39_USER_LIMIT - hint) {
+            return KERNEL_MM_STATUS_INVALID_ARGUMENT;
+        }
+        start = hint;
+        if ((flags & KERNEL_SHM_REMAP) == 0U) {
+            vma_status = kernel_vma_set_overlaps(record->vmas,
+                                                 start,
+                                                 start + aligned_length,
+                                                 &overlaps);
+            if (vma_status != KERNEL_VMA_STATUS_OK) {
+                return status_from_vma(vma_status);
+            }
+            if (overlaps != 0) {
+                return KERNEL_MM_STATUS_CONFLICT;
+            }
+        }
+    } else {
+        if ((flags & KERNEL_SHM_REMAP) != 0U) {
+            return KERNEL_MM_STATUS_INVALID_ARGUMENT;
+        }
+        if (record->mmap_base < RISCV_SV39_PAGE_SIZE_4K ||
+            aligned_length > record->mmap_base - RISCV_SV39_PAGE_SIZE_4K) {
+            return KERNEL_MM_STATUS_NO_MEMORY;
+        }
+        vma_status = kernel_vma_set_find_topdown_gap(
+            record->vmas,
+            0U,
+            RISCV_SV39_PAGE_SIZE_4K,
+            record->mmap_base,
+            aligned_length,
+            &start);
+        if (vma_status == KERNEL_VMA_STATUS_NOT_FOUND) {
+            return KERNEL_MM_STATUS_NO_MEMORY;
+        }
+        if (vma_status != KERNEL_VMA_STATUS_OK) {
+            return status_from_vma(vma_status);
+        }
+    }
+    end = start + aligned_length;
+    if (kernel_shm_attachment_create(segment, start, end, &attachment) !=
+            KERNEL_SHM_STATUS_OK) return KERNEL_MM_STATUS_NO_MEMORY;
+
+    int already_tracked = 0;
+    for (struct riscv_kernel_mm_shared_anon *curr = record->shared_anon;
+         curr != 0; curr = curr->next) {
+        if (curr->object == segment->memory) {
+            already_tracked = 1;
+            break;
+        }
+    }
+    if (!already_tracked) {
+        if (kernel_memory_object_acquire(segment->memory) !=
+            KERNEL_MEMORY_OBJECT_OK) {
+            return KERNEL_MM_STATUS_STATE;
+        }
+        /* 新取得的引用独立回滚，不能消费段表 owner。 */
+        temporary_owner = segment->memory;
+        enum kernel_heap_status heap_status = kernel_heap_allocate_zeroed(
+            record->vma_heap, 1U, sizeof(*shared_entry),
+            (void **)&shared_entry);
+        if (heap_status != KERNEL_HEAP_STATUS_OK) {
+            kernel_memory_object_release(&temporary_owner);
+            return heap_status == KERNEL_HEAP_STATUS_EMPTY
+                       ? KERNEL_MM_STATUS_NO_MEMORY
+                       : KERNEL_MM_STATUS_STATE;
+        }
+        shared_entry->object = temporary_owner;
+        temporary_owner = 0;
+    }
+
+    vma = (struct kernel_vma){
+        .start = start,
+        .end = end,
+        .backing_offset = 0U,
+        .permissions = normalized,
+        .maximum_permissions = KERNEL_VMA_ALL_PERMISSIONS &
+            ((flags & KERNEL_SHM_RDONLY) ? ~KERNEL_MM_WRITE : KERNEL_VMA_ALL_PERMISSIONS),
+        .kind = KERNEL_VMA_KIND_SYSV_SHM,
+        .role = KERNEL_VMA_ROLE_SYSV_SHM,
+        .fault_policy = KERNEL_VMA_FAULT_ANON_SHARED,
+        .backing = segment->memory,
+        .shm_attachment = attachment,
+    };
+
+    if ((flags & KERNEL_SHM_REMAP) == 0U) {
+        status = status_from_vma(kernel_vma_set_insert(record->vmas, &vma));
+        if (status == KERNEL_MM_STATUS_OK) {
+            if (shared_entry != 0) {
+                shared_entry->next = record->shared_anon;
+                record->shared_anon = shared_entry;
+            }
+            *out_address = start;
+        } else {
+            if (shared_entry != 0) {
+                kernel_memory_object_release(&shared_entry->object);
+                (void)kernel_heap_release(record->vma_heap, shared_entry);
+            }
+        }
+        return status;
+    }
+
+    vma_status = kernel_vma_set_prepare_replace(record->vmas,
+                                                start,
+                                                end,
+                                                &vma,
+                                                &edit);
+    if (vma_status != KERNEL_VMA_STATUS_OK) {
+        status = status_from_vma(vma_status);
+        if (shared_entry != 0) {
+            kernel_memory_object_release(&shared_entry->object);
+            (void)kernel_heap_release(record->vma_heap, shared_entry);
+        }
+        return status;
+    }
+    status = require_active_space(record);
+    if (status != KERNEL_MM_STATUS_OK) {
+        if (shared_entry != 0) {
+            kernel_memory_object_release(&shared_entry->object);
+            (void)kernel_heap_release(record->vma_heap, shared_entry);
+        }
+        return status;
+    }
+    status = unmap_space_range(record, start, end);
+    if (status != KERNEL_MM_STATUS_OK) {
+        if (shared_entry != 0) {
+            kernel_memory_object_release(&shared_entry->object);
+            (void)kernel_heap_release(record->vma_heap, shared_entry);
+        }
+        return status;
+    }
+    if (kernel_vma_set_commit_edit(record->vmas, &edit) !=
+        KERNEL_VMA_STATUS_OK) {
+        if (shared_entry != 0) {
+            kernel_memory_object_release(&shared_entry->object);
+            (void)kernel_heap_release(record->vma_heap, shared_entry);
+        }
+        return KERNEL_MM_STATUS_STATE;
+    }
+    if (shared_entry != 0) {
+        shared_entry->next = record->shared_anon;
+        record->shared_anon = shared_entry;
+    }
+    drain_shared_anon(record, 1);
+    (void)drain_file_sources(record, 1);
+    (void)drain_elf_sources(record, 1);
+    *out_address = start;
+    return KERNEL_MM_STATUS_OK;
+}
+
+enum kernel_mm_status kernel_mm_shmdt(struct kernel_mm *mm, uint64_t address)
+{
+    KERNEL_NO_RECLAIM_IO;
+    struct riscv_kernel_mm_record *record;
+    if (mm == 0 || (address & BOAROS_PAGE_MASK) ||
+        address < RISCV_SV39_PAGE_SIZE_4K || address >= RISCV_SV39_USER_LIMIT)
+        return KERNEL_MM_STATUS_INVALID_ARGUMENT;
+    enum kernel_mm_status status = mutable_vma_record(mm, &record);
+    if (status != KERNEL_MM_STATUS_OK) return status;
+    struct kernel_shm_attachment *attachment
+        __attribute__((cleanup(kernel_shm_attachment_release))) = 0;
+    struct kernel_vma vma;
+    for (uint32_t i = 0; i < kernel_vma_set_count(record->vmas); i++) {
+        if (kernel_vma_set_get_at(record->vmas, i, &vma) != KERNEL_VMA_STATUS_OK)
+            __builtin_trap();
+        if (vma.shm_attachment && vma.shm_attachment->start == address) {
+            attachment = vma.shm_attachment;
+            kernel_shm_attachment_acquire(attachment);
+            break;
+        }
+    }
+    if (!attachment) return KERNEL_MM_STATUS_INVALID_ARGUMENT;
+    /* 起始页可以已被撤销；仅移除同一附件片段，不吞掉洞内的新映射。 */
+    for (uint32_t i = 0; i < kernel_vma_set_count(record->vmas);) {
+        if (kernel_vma_set_get_at(record->vmas, i, &vma) != KERNEL_VMA_STATUS_OK)
+            __builtin_trap();
+        if (vma.shm_attachment != attachment) { i++; continue; }
+        status = kernel_mm_munmap(mm, vma.start, vma.end - vma.start);
+        if (status != KERNEL_MM_STATUS_OK) return status;
+        i = 0; /* 后备清理可睡眠，重取集合而不保存数组下标。 */
+    }
+    return KERNEL_MM_STATUS_OK;
+}
+
 enum kernel_mm_status kernel_mm_mprotect(
     struct kernel_mm *mm,
     uint64_t address,
     uint64_t length,
     uint32_t permissions)
 {
+    COST_SCOPE(cost_protect, MPROTECT_TICKS);
+    COST_ADD(MPROTECT_CALLS, 1);
     KERNEL_NO_RECLAIM_IO;
     struct riscv_kernel_mm_record *record;
     struct kernel_vma_edit edit;
@@ -2227,6 +2494,7 @@ enum kernel_mm_status kernel_mm_mprotect(
         KERNEL_VMA_STATUS_OK) return KERNEL_MM_STATUS_STATE;
     for (struct riscv_file_resident *page = record->file_residents;
          page != 0; page = page->next) {
+        COST_ADD(MPROTECT_RESIDENT_VISITS, 1);
         if (page->address >= address && page->address < end &&
             page->alias.previous != 0)
             rearm_shared_file_alias(record, page->address);
@@ -2269,8 +2537,19 @@ int kernel_mm_msync(struct kernel_mm *mm, uint64_t address,
         if ((flags & 4U) != 0U && vma.kind == KERNEL_VMA_KIND_FILE_SHARED) {
             uint64_t file_start = vma.backing_offset + cursor - vma.start;
             uint64_t file_end = file_start + segment_end - cursor;
-            int result = kernel_open_file_sync_range(vma.backing,
-                                                      file_start, file_end);
+            int result;
+            {
+                struct riscv_kernel_mm_file_source *source
+                    __attribute__((cleanup(unpin_file_source))) =
+                        find_file_source(record, vma.backing);
+                if (!source || source->operations == UINT32_MAX) __builtin_trap();
+                /* sync_range 的 inode 等待和错误游标访问都借用这个 OFD。 */
+                source->operations++;
+                result = kernel_open_file_sync_range(source->file, file_start, file_end);
+            }
+            enum kernel_mm_status drained = drain_file_sources(record, 1);
+            if (drained == KERNEL_MM_STATUS_STATE) __builtin_trap();
+            /* 真实 close 失败仍由 registry 保留；不覆盖本次同步结果。 */
             if (result != 0) return result;
         }
         cursor = segment_end;
@@ -2326,6 +2605,7 @@ enum kernel_mm_status kernel_mm_brk(
                 .end = new_page_end,
                 .backing_offset = 0U,
                 .permissions = KERNEL_MM_READ | KERNEL_MM_WRITE,
+                .maximum_permissions = KERNEL_VMA_ALL_PERMISSIONS,
                 .kind = KERNEL_VMA_KIND_ANONYMOUS,
                 .role = KERNEL_VMA_ROLE_HEAP,
                 .fault_policy = KERNEL_VMA_FAULT_DEMAND_ZERO,
@@ -2493,7 +2773,8 @@ static enum kernel_mm_status map_shared_file_page(
     size_t valid_bytes;
     enum kernel_page_cache_status cache_status;
     enum riscv_sv39_status sv39_status;
-    uint32_t initial = vma->permissions & ~KERNEL_MM_WRITE;
+    int memory_backed = kernel_open_file_memory_backed(file);
+    uint32_t initial = memory_backed ? vma->permissions : vma->permissions & ~KERNEL_MM_WRITE;
 
     cache_status = kernel_open_file_get_page(file, file_page_index,
                                             &physical_address, &valid_bytes);
@@ -2510,6 +2791,11 @@ static enum kernel_mm_status map_shared_file_page(
     if (sv39_status != RISCV_SV39_STATUS_OK)
         return discard_file_page(&record->space, physical_address,
                                  map_file_page_status(sv39_status));
+    if (memory_backed) {
+        if (access == KERNEL_MM_WRITE)
+            kernel_open_file_memory_modified(file);
+        return KERNEL_MM_STATUS_OK;
+    }
     cache_status = kernel_open_file_alias_attach(file, file_page_index,
         physical_address, &resident->alias, record, page_address,
         rearm_shared_file_alias);
@@ -2776,7 +3062,7 @@ static enum kernel_mm_status resolve_user_fault_once(
         return status_from_vma(vma_status);
     }
     if ((vma.permissions & access) == 0U) {
-        return KERNEL_MM_STATUS_NOT_MAPPED;
+        return KERNEL_MM_STATUS_ACCESS;
     }
     sv39_status = riscv_sv39_user_lookup(&record->space,
                                          virtual_address,
@@ -2794,9 +3080,13 @@ static enum kernel_mm_status resolve_user_fault_once(
             if (vma.kind == KERNEL_VMA_KIND_FILE_SHARED) {
                 struct riscv_file_resident *page = find_file_resident(
                     record, virtual_address & ~BOAROS_PAGE_MASK);
-                if (page == 0 || page->alias.previous == 0)
-                    __builtin_trap();
-                kernel_page_cache_alias_mark_dirty(&page->alias);
+                if (page == 0) __builtin_trap();
+                if (kernel_open_file_memory_backed(vma.backing)) {
+                    kernel_open_file_memory_modified(vma.backing);
+                } else {
+                    if (!page->alias.previous) __builtin_trap();
+                    kernel_page_cache_alias_mark_dirty(&page->alias);
+                }
                 sv39_status = riscv_sv39_user_protect_owned_page(
                     &record->space, page->address,
                     sv39_permissions_from_mm(vma.permissions));
@@ -2852,10 +3142,10 @@ static enum kernel_mm_status resolve_user_fault_once(
          vma.fault_policy == KERNEL_VMA_FAULT_FILE_SHARED) &&
         vma.backing != 0) {
         uint64_t version = kernel_vma_set_generation(record->vmas);
-        struct riscv_kernel_mm_file_source *source __attribute__((cleanup(unpin_fault_source))) =
+        struct riscv_kernel_mm_file_source *source __attribute__((cleanup(unpin_file_source))) =
             find_file_source(record, vma.backing);
-        if (!source || source->faults == UINT32_MAX) __builtin_trap();
-        source->faults++;
+        if (!source || source->operations == UINT32_MAX) __builtin_trap();
+        source->operations++;
         KERNEL_LOCK_SCOPE(node_guard);
         kernel_vfs_node_lock(kernel_open_file_node(vma.backing), &node_guard, 0);
         if (version != kernel_vma_set_generation(record->vmas)) {
@@ -2875,11 +3165,18 @@ static enum kernel_mm_status resolve_user_fault_once(
         /* Disk I/O owns the source and inode, but no MM mutation lock. */
         uint64_t prefetched;
         size_t valid;
-        enum kernel_page_cache_status loaded = kernel_open_file_get_page(vma.backing,
-            file_page_offset >> BOAROS_PAGE_SHIFT, &prefetched, &valid);
+        int created = 0;
+        enum kernel_page_cache_status loaded = kernel_open_file_memory_backed(vma.backing)
+            ? kernel_open_file_get_page_for_fault(vma.backing,
+                file_page_offset >> BOAROS_PAGE_SHIFT, &prefetched, &valid, &created)
+            : kernel_open_file_get_page(vma.backing,
+                file_page_offset >> BOAROS_PAGE_SHIFT, &prefetched, &valid);
         if (loaded != KERNEL_PAGE_CACHE_STATUS_OK)
             return loaded == KERNEL_PAGE_CACHE_STATUS_NO_MEMORY ? KERNEL_MM_STATUS_NO_MEMORY : KERNEL_MM_STATUS_BUS_FAULT;
-        struct fault_page_pin pin __attribute__((cleanup(release_fault_page))) = {mm->allocator, prefetched};
+        struct fault_page_pin pin __attribute__((cleanup(release_fault_page))) = {
+            .allocator = mm->allocator, .file = vma.backing, .address = prefetched,
+            .index = file_page_offset >> BOAROS_PAGE_SHIFT, .created = created,
+        };
         if (version != kernel_vma_set_generation(record->vmas) ||
             riscv_sv39_user_lookup(&record->space, page_address, &mapping) != RISCV_SV39_STATUS_NOT_MAPPED) {
             *retry = 1;
@@ -2918,6 +3215,7 @@ static enum kernel_mm_status resolve_user_fault_once(
             resident->private = vma.kind == KERNEL_VMA_KIND_FILE_PRIVATE &&
                                 access == KERNEL_MM_WRITE;
             publish_file_resident(record, resident);
+            pin.created = 0;
         } else {
             if (resident->alias.previous != 0)
                 kernel_page_cache_alias_detach(&resident->alias);
@@ -2937,22 +3235,23 @@ static enum kernel_mm_status resolve_user_fault_once(
                                    page_address,
                                    access, retry);
     }
-    if (vma.kind == KERNEL_VMA_KIND_ANON_SHARED &&
+    if ((vma.kind == KERNEL_VMA_KIND_ANON_SHARED ||
+         vma.kind == KERNEL_VMA_KIND_SYSV_SHM) &&
         vma.fault_policy == KERNEL_VMA_FAULT_ANON_SHARED &&
         vma.backing != 0) {
-        struct kernel_shared_anon *object = vma.backing;
+        struct kernel_memory_object *object = vma.backing;
         uint64_t index = (vma.backing_offset +
                           page_address - vma.start) >> BOAROS_PAGE_SHIFT;
         uint64_t physical_address;
         int created;
-        enum kernel_shared_anon_status shared_status;
+        enum kernel_memory_object_status shared_status;
 
-        shared_status = kernel_shared_anon_get_page(object, index,
+        shared_status = kernel_memory_object_get_page(object, index,
                                                    &physical_address,
                                                    &created);
-        if (shared_status == KERNEL_SHARED_ANON_NO_MEMORY)
+        if (shared_status == KERNEL_MEMORY_OBJECT_NO_MEMORY)
             return KERNEL_MM_STATUS_NO_MEMORY;
-        if (shared_status != KERNEL_SHARED_ANON_OK)
+        if (shared_status != KERNEL_MEMORY_OBJECT_OK)
             return KERNEL_MM_STATUS_STATE;
         sv39_status = riscv_sv39_user_map_owned_page(
             &record->space, page_address, physical_address,
@@ -2961,7 +3260,7 @@ static enum kernel_mm_status resolve_user_fault_once(
             if (physical_page_release(mm->allocator, physical_address) !=
                 PHYSICAL_PAGE_STATUS_OK) __builtin_trap();
             if (created != 0)
-                kernel_shared_anon_discard_new_page(object, index,
+                kernel_memory_object_discard_new_page(object, index,
                                                     physical_address);
             return sv39_status == RISCV_SV39_STATUS_NO_MEMORY
                        ? KERNEL_MM_STATUS_NO_MEMORY

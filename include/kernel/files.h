@@ -53,6 +53,7 @@ struct kernel_files_statistics {
 #define KERNEL_FILES_SEEK_END UINT64_C(2)
 #define KERNEL_FILES_AT_SYMLINK_NOFOLLOW UINT64_C(0x100)
 #define KERNEL_FILES_AT_REMOVEDIR UINT64_C(0x200)
+#define KERNEL_FILES_AT_SYMLINK_FOLLOW UINT64_C(0x400)
 #define KERNEL_FILES_AT_EMPTY_PATH UINT64_C(0x1000)
 #define KERNEL_FILES_F_DUPFD UINT64_C(0)
 #define KERNEL_FILES_F_GETFD UINT64_C(1)
@@ -174,6 +175,11 @@ enum kernel_files_status kernel_files_fchdir(
 enum kernel_files_status kernel_files_getcwd(
     struct kernel_files *files, const struct kernel_fs_context *fs,
     struct kernel_mm *mm, uint64_t user_buffer, uint64_t size,
+    int64_t *linux_result);
+enum kernel_files_status kernel_files_linkat(
+    struct kernel_files *files, const struct kernel_fs_context *fs,
+    struct kernel_mm *mm, int64_t old_dirfd, uint64_t old_user_path,
+    int64_t new_dirfd, uint64_t new_user_path, uint32_t flags,
     int64_t *linux_result);
 enum kernel_files_status kernel_files_renameat(
     struct kernel_files *files, const struct kernel_fs_context *fs,
@@ -398,7 +404,7 @@ enum kernel_files_status kernel_files_fcntl_lock(
     uint64_t user_flock, int64_t *linux_result);
 
 enum kernel_files_status kernel_files_ioctl(
-    struct kernel_files *files,
+    struct kernel_files *files, struct kernel_mm *mm,
     int64_t fd,
     uint64_t command,
     uint64_t argument,
@@ -411,6 +417,14 @@ enum kernel_files_status kernel_files_close(
 
 enum kernel_files_status kernel_files_socket_create(
     struct kernel_files *files, int type, uint32_t flags,
+    int64_t *linux_result);
+
+enum kernel_files_status kernel_files_socketpair_create(
+    struct kernel_files *files,
+    struct kernel_mm *mm,
+    int type,
+    uint32_t flags,
+    uint64_t user_sv,
     int64_t *linux_result);
 
 enum kernel_files_status kernel_files_socket_accept(

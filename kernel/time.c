@@ -1,5 +1,7 @@
+#include <kernel/cost.h>
 #include <arch/riscv/timer.h>
 #include <kernel/time.h>
+#include <kernel/tick.h>
 
 #include <stdint.h>
 
@@ -17,6 +19,7 @@ static uint32_t time_initialized;
 static uint64_t time_multiplier;
 static uint64_t time_ticks_multiplier;
 static uint64_t time_boot_realtime_ns;
+static uint64_t time_coarse_monotonic_ns;
 
 enum kernel_time_status kernel_time_init(uint32_t timebase_frequency,
                                          uint64_t boot_realtime_ns)
@@ -37,7 +40,12 @@ enum kernel_time_status kernel_time_init(uint32_t timebase_frequency,
          KERNEL_TIME_NS_PER_SECOND - 1U) /
         KERNEL_TIME_NS_PER_SECOND;
     time_boot_realtime_ns = boot_realtime_ns;
+    __atomic_store_n(&time_coarse_monotonic_ns,
+        kernel_time_ticks_to_ns(riscv_time_read()), __ATOMIC_RELAXED);
     time_initialized = 1U;
+#if BOAROS_COST_DIAGNOSTICS
+    kernel_cost_set_timebase(timebase_frequency);
+#endif
     return KERNEL_TIME_STATUS_OK;
 }
 
@@ -60,6 +68,30 @@ uint64_t kernel_time_monotonic_ns(void)
 uint64_t kernel_time_realtime_ns(void)
 {
     return time_boot_realtime_ns + kernel_time_monotonic_ns();
+}
+
+void kernel_time_update_coarse(void)
+{
+    if (!time_initialized) return;
+    /* 合并 tick 只采样一次真实 counter，不按补发次数虚构时间。 */
+    __atomic_store_n(&time_coarse_monotonic_ns,
+        kernel_time_monotonic_ns(), __ATOMIC_RELAXED);
+}
+
+uint64_t kernel_time_coarse_monotonic_ns(void)
+{
+    return __atomic_load_n(&time_coarse_monotonic_ns, __ATOMIC_RELAXED);
+}
+
+uint64_t kernel_time_coarse_realtime_ns(void)
+{
+    /* RTC offset 启动后不可变；单个原子样本避免两套快照撕裂。 */
+    return time_boot_realtime_ns + kernel_time_coarse_monotonic_ns();
+}
+
+uint64_t kernel_time_coarse_resolution_ns(void)
+{
+    return KERNEL_TIME_NS_PER_SECOND / KERNEL_TICKS_PER_SECOND;
 }
 
 uint64_t kernel_time_boot_realtime_offset(void)

@@ -1,15 +1,22 @@
 #ifndef BOAROS_FS_VFS_INTERNAL_H
 #define BOAROS_FS_VFS_INTERNAL_H
 
+#include <kernel/cost.h>
 #include <stddef.h>
 #include <kernel/sync.h>
 #include <stdint.h>
 
+struct kernel_vfs_file;
+struct kernel_memory_object;
+struct kernel_memory_object *kernel_vfs_file_memory(const struct kernel_vfs_file *file);
 struct kernel_page_cache;
 struct kernel_page_cache_entry;
 struct kernel_vfs_file;
 struct kernel_vfs_mount;
 struct kernel_vfs_node;
+#if BOAROS_COST_DIAGNOSTICS
+int kernel_vfs_file_is_cost(const struct kernel_vfs_file *file);
+#endif
 struct kernel_heap;
 struct kernel_record_lock_state;
 
@@ -26,6 +33,9 @@ int kernel_vfs_node_pread(struct kernel_vfs_node *node,
                           void *buffer,
                           size_t size,
                           size_t *bytes_read);
+int kernel_vfs_file_is_control(const struct kernel_vfs_file *file);
+int kernel_vfs_file_control(const struct kernel_vfs_file *file, int write,
+    uint64_t offset, char *buffer, size_t size, size_t *count);
 int kernel_vfs_file_generated(const struct kernel_vfs_file *file);
 int kernel_vfs_file_snapshot(const struct kernel_vfs_file *file,
                              struct kernel_heap *heap,
@@ -47,5 +57,10 @@ struct kernel_page_cache *kernel_vfs_file_page_cache(
 
 int kernel_vfs_node_try_read(struct kernel_vfs_node *node, struct kernel_lock_guard *guard);
 void kernel_vfs_namespace_lock(struct kernel_vfs_mount *mount, struct kernel_lock_guard *guard);
+/* Whole syscall write/truncate gate; rank 15, before namespace/inode locks. */
+void kernel_vfs_file_write_lock(struct kernel_vfs_file *file,
+    struct kernel_lock_guard *guard);
 void kernel_vfs_node_lock(struct kernel_vfs_node *node, struct kernel_lock_guard *guard, int write);
+void kernel_vfs_record_writeback_error(struct kernel_vfs_node *node, int error);
+
 #endif

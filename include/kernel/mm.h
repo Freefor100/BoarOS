@@ -113,7 +113,11 @@ enum kernel_mm_status kernel_mm_executable_path_acquire(
 struct kernel_mm_proc_memory {
     uint64_t virtual_bytes;
     uint64_t resident_pages;
+    uint64_t start_code, end_code, start_stack;
 };
+enum kernel_mm_status kernel_mm_set_exec_layout(
+    struct kernel_mm *mm, uint64_t start_code, uint64_t end_code,
+    uint64_t start_stack);
 enum kernel_mm_status kernel_mm_proc_memory_snapshot(
     const struct kernel_mm *mm, struct kernel_mm_proc_memory *snapshot);
 
@@ -213,6 +217,20 @@ enum kernel_mm_status kernel_mm_resolve_user_fault(
     struct kernel_mm *mm,
     uint64_t virtual_address,
     uint32_t access);
+
+/* SysV shared memory attach and detach */
+struct kernel_shm_segment;
+enum kernel_mm_status kernel_mm_shmat(
+    struct kernel_mm *mm,
+    struct kernel_shm_segment *segment,
+    uint64_t hint,
+    uint32_t permissions,
+    uint32_t flags,
+    uint64_t *out_address);
+
+enum kernel_mm_status kernel_mm_shmdt(
+    struct kernel_mm *mm,
+    uint64_t address);
 
 /* Success consumes one reference; last-reference cleanup can retain VFS owners. */
 enum kernel_mm_status kernel_mm_release(struct kernel_mm *mm);

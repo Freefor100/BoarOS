@@ -82,6 +82,12 @@ musl `/init`。它从 `/work/tools.conf` 读取客体内编译器、汇编器绝
 和 SHA-256，访问日期为 2026-09-27；准备脚本逐项校验 archive 哈希、
 `.PKGINFO` 的名称/版本/架构/许可和缓存树内容，不修改上游包。
 
+runner 从同一稀疏 ext4 fixture 建立 Linux 与 BoarOS 的独立原始镜像，
+复制时保留空洞，并在 QEMU 启动前同步 fixture 与各副本。这样避免宿主
+在客体首次块请求期间回写无意义的零区；客体的一秒块超时、镜像内容、
+后续 journal 重放及产物比较规则均不变。runner 记录副本的逻辑/占用字节和
+复制同步耗时供 CI 诊断，不设墙钟性能门槛。
+
 | APK 包名 | 固定版本 | `.PKGINFO` 许可 |
 |---|---|---|
 | binutils | 2.44-r3 | GPL-2.0-or-later AND LGPL-2.1-or-later AND BSD-3-Clause |

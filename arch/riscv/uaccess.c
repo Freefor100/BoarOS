@@ -1,3 +1,4 @@
+#include <kernel/cost.h>
 #include <arch/riscv/sv39.h>
 #include <kernel/mm.h>
 #include <kernel/page.h>
@@ -35,6 +36,7 @@ static enum kernel_uaccess_status resolve_user_page(
     enum kernel_mm_status mm_status;
 
     page_resolutions++;
+    COST_ADD(USER_RESOLUTIONS, 1); COST_IO_ADD(4, 1);
     mm_status = kernel_mm_lookup(mm, user_address, &mapping);
     if (mm_status == KERNEL_MM_STATUS_NOT_MAPPED ||
         (mm_status == KERNEL_MM_STATUS_OK &&
@@ -46,6 +48,7 @@ static enum kernel_uaccess_status resolve_user_page(
             user_address,
             required_permissions);
         if (mm_status == KERNEL_MM_STATUS_NOT_MAPPED ||
+            mm_status == KERNEL_MM_STATUS_ACCESS ||
             mm_status == KERNEL_MM_STATUS_ADDRESS_SPACE ||
             mm_status == KERNEL_MM_STATUS_BUS_FAULT ||
             mm_status == KERNEL_MM_STATUS_NO_MEMORY) {
@@ -121,6 +124,7 @@ enum kernel_uaccess_status kernel_copy_to_user(
         for (index = 0U; index < chunk; index++) {
             page[offset + index] = source[copied + index];
         }
+        COST_ADD(COPY_TO_USER, chunk);
         copied += chunk;
     }
 
@@ -174,6 +178,7 @@ enum kernel_uaccess_status kernel_copy_from_user(
         for (index = 0U; index < chunk; index++) {
             destination[copied + index] = page[offset + index];
         }
+        COST_ADD(COPY_FROM_USER, chunk); COST_IO_ADD(3, chunk);
         copied += chunk;
     }
 

@@ -76,6 +76,8 @@ BoarOS 普通 clone 已复制 fd 槽数组并给每个继承的 open file descri
 
 BoarOS 也采用这个边界。退出路径先切回稳定内核地址空间，再在任务自己的内核栈上释放 exec/files/fs/MM；清理完整且存在父任务时成为 zombie。任务页不能在当前仍使用它的栈上释放，所以它必须保留到父进程 wait。真实 VFS/block I/O 清理错误会把任务留在 exited 清理队列，由 idle 在可信栈上按 owner 状态继续尝试；合法页和堆释放完成即返回，分配器不变量错误进入 fatal。
 
+2026-09-29 的差分曾偶发 `proc.replacement-dir` 返回 `ENOENT`：子进程已进入内部 `EXITED` 清理阶段，却还没由 reaper 发布为 `ZOMBIE`；proc 枚举原先排除所有 `EXITED`，使仍被父任务持有、尚未 wait 的 PID 暂时从 `/proc` 消失。数字目录的可见期应由 PID 与父子 owner 决定，不能直接套用调度状态。固定 Linux `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 `references/linux/fs/proc/base.c::proc_pid_lookup()` 按仍在 PID 表中的任务解析数字目录。当前单成员子进程在这段过渡期仍可见，资源链接则由 `proc_exiting` 拒绝访问正在清理的 MM/files；wait 释放 PID 后旧目录继续受分配代次约束。复现入口是同一 RV ELF 的 `tests/diff-abi/proc.c`，固定 Linux 与 BoarOS 逐项比较。
+
 普通退出码在 wait status 中放在 bit 8..15；信号终止使用低 7 位；bit 7 只表示实际生成 core，不能按信号默认动作设置。BoarOS 尚无 core writer，因此不设置该位。依据固定 Linux `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 `references/linux/fs/coredump.c::coredump_finish()`，该位由 `core_dumped` 控制；同架构差分揭示了此前错误设置该位的问题。同步异常则转换为信号终止形态，例如非法指令对应 SIGILL、地址访问故障通常对应 SIGSEGV。标准信号现在可以在用户返回尾进入 handler，`rt_sigreturn` 恢复整数/FP frame；实时排队和备用信号栈仍未实现。
 
 ## wait、阻塞与唤醒
@@ -152,3 +154,5 @@ QEMU 可以验证语义和结构成本，但不能替代 VisionFive 2 上的 cyc
 - `references/riscv/riscv-privileged-20260120.pdf`：RISC-V Trap 返回、页表与 TLB 同步机制。
 
 当前实现接口、不变量与测试入口见[内核调度与进程生命周期模块](../modules/kernel-scheduler.md)、[内核 MM 模块](../modules/kernel-mm.md)和[进程文件资源模块](../modules/kernel-files.md)。
+
+同步用户故障与 syscall 用户复制失败是两条契约。前者保留故障 PC，经线程故障记录与统一 signal frame 交付，handler 可修复页后重试或修改 ucontext；后者保持 EFAULT，不发送 SEGV。固定本地 `references/linux/kernel/signal.c::force_sig_info_to_task`（commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`）将被阻塞/忽略的致命同步信号恢复默认并解除阻塞，避免反复执行同一 fault 指令。用户测试中由 handler 异步读取的控制变量须 volatile，否则编译器可将修复模式写入移到故障指令之后，错误地把内核正常重试判成未恢复。`make test-userland-riscv test-diff-abi-riscv` 提供 musl 恢复/组退出与固定 Linux siginfo 对照。

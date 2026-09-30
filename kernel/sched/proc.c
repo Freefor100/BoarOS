@@ -27,11 +27,14 @@ void kernel_proc_task_update_comm(struct kernel_task *task)
 
 static int proc_visible(const struct kernel_task *task)
 {
-    return task && task->arch.user_mode && task->tid_owned &&
-           task->group_leader && task->group_leader->tid_owned &&
-           task->group_leader->tid > 0 &&
-           task->state != KERNEL_THREAD_STATE_EXITED &&
-           task->state != KERNEL_THREAD_STATE_GROUP_DEAD;
+    if (!task || !task->arch.user_mode || !task->tid_owned ||
+        !task->group_leader || !task->group_leader->tid_owned ||
+        task->group_leader->tid <= 0 ||
+        task->state == KERNEL_THREAD_STATE_GROUP_DEAD) return 0;
+    if (task->state != KERNEL_THREAD_STATE_EXITED) return 1;
+    /* 子进程在清理期间仍占有 PID；wait 回收前不能暂时丢失数字目录。 */
+    return task == task->group_leader && task->group_members == 1U &&
+           task->parent != 0;
 }
 
 static struct kernel_task *next_process(struct kernel_task *task,
@@ -60,12 +63,9 @@ static struct kernel_task *representative(struct kernel_task *leader)
 
 static struct kernel_task *find_member(kernel_pid_t pid, uint64_t identity)
 {
-    struct kernel_task *root = scheduler.init_task;
-    for (struct kernel_task *leader = root; leader;
-         leader = next_process(leader, root))
-        if (leader->tid == pid && leader->proc_identity == identity)
-            return representative(leader) ? leader : 0;
-    return 0;
+    struct kernel_task *leader = process_find_identity(pid, KERNEL_PID_TGID);
+    return leader && process_identity_generation(leader) == identity &&
+        representative(leader) ? leader : 0;
 }
 
 static struct kernel_task *find_resource_owner(kernel_pid_t pid,
@@ -117,8 +117,8 @@ int kernel_proc_process_snapshot(kernel_pid_t pid, uint64_t identity,
         .pid = pid,
         .ppid = leader->parent && leader->parent->group_leader
             ? leader->parent->group_leader->tid : 0,
-        .process_group = leader->process_group,
-        .session_id = leader->session_id,
+        .process_group = process_identity_number(leader, KERNEL_PID_PGID),
+        .session_id = process_identity_number(leader, KERNEL_PID_SID),
         .identity = identity,
         .start_ticks = leader->proc_start_ticks,
         .state = task->proc_exiting ||
@@ -130,8 +130,28 @@ int kernel_proc_process_snapshot(kernel_pid_t pid, uint64_t identity,
                  task->state == KERNEL_THREAD_STATE_STOPPED ? 'T' : 'S',
         .child_minor_faults = leader->child_minor_faults,
         .child_major_faults = leader->child_major_faults,
+        .signal_pending = leader->signal_pending & UINT64_C(0x7fffffff),
+        .signal_blocked = leader->signal_blocked & UINT64_C(0x7fffffff),
         .threads = threads,
+        .scheduling_priority = leader->scheduling.priority
+            ? -(leader->scheduling.priority + 1) : 20,
+        .rt_priority = (uint32_t)leader->scheduling.priority,
+        .scheduling_policy = (uint32_t)leader->scheduling.policy,
     };
+    result->wait_channel_flag = threads < 2U &&
+        task->state != KERNEL_THREAD_STATE_RUNNING &&
+        task->state != KERNEL_THREAD_STATE_READY;
+    const struct kernel_signal_table *actions =
+        (const void *)(uintptr_t)leader->signal_table_address;
+    if (actions) {
+        if (actions->magic != KERNEL_SIGNAL_TABLE_MAGIC) __builtin_trap();
+        for (unsigned sig = 0; sig < 31U; sig++) {
+            if (actions->actions[sig].handler == KERNEL_SIGNAL_IGN)
+                result->signal_ignored |= UINT64_C(1) << sig;
+            else if (actions->actions[sig].handler != KERNEL_SIGNAL_DFL)
+                result->signal_caught |= UINT64_C(1) << sig;
+        }
+    }
     memcpy(result->comm, leader->comm, sizeof(result->comm));
     kernel_task_cpu_ticks(task, &result->user_ticks,
         &result->kernel_ticks, &result->child_user_ticks,
@@ -151,6 +171,9 @@ int kernel_proc_process_snapshot(kernel_pid_t pid, uint64_t identity,
         }
         result->virtual_bytes = memory.virtual_bytes;
         result->resident_pages = memory.resident_pages;
+        result->start_code = memory.start_code;
+        result->end_code = memory.end_code;
+        result->start_stack = memory.start_stack;
     }
     riscv_interrupt_restore(irq);
     return 0;
@@ -316,7 +339,7 @@ static void consider(const struct kernel_task *task, kernel_pid_t after,
     kernel_pid_t pid = task->group_leader->tid;
     if (pid > after && (*best == 0 || pid < *best)) {
         *best = pid;
-        *identity = task->group_leader->proc_identity;
+        *identity = process_identity_generation(task);
     }
 }
 

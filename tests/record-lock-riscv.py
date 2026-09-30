@@ -20,6 +20,8 @@ def command(*arguments):
 
 def boot(args, kernel, disk, output, linux):
     invocation = [args.qemu, "-machine", "virt", "-bios", "default",
+                       "-object", "rng-random,id=entropy,filename=/dev/urandom",
+                       "-device", "virtio-rng-device,rng=entropy,bus=virtio-mmio-bus.7",
                   "-kernel", str(kernel), "-m", "512M", "-smp", "1",
                   "-nographic", "-no-reboot", "-drive",
                   f"file={disk},if=none,format=raw,readonly=off,id=root",

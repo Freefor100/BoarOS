@@ -86,6 +86,11 @@ enum kernel_scheduler_status kernel_user_thread_create(
     uintptr_t stack_pointer,
     uintptr_t thread_pointer);
 
+void kernel_scheduler_rt_bandwidth_get(int64_t *period_us, int64_t *runtime_us);
+int kernel_scheduler_rt_bandwidth_set(int runtime_field, int64_t value);
+
+void kernel_scheduler_system_statistics(uint64_t loads[3], uint16_t *tasks);
+
 enum kernel_scheduler_status kernel_scheduler_on_tick(
     uint64_t elapsed_ticks);
 
@@ -202,6 +207,15 @@ enum kernel_scheduler_status kernel_scheduler_wake_signal(
 enum kernel_scheduler_status kernel_scheduler_expire_deadlines(uint64_t now);
 
 /* Requeues the current task behind any ready task and switches away. */
+/* The caller owns the handle until join has reclaimed the stopped stack. */
+struct kernel_thread_join {
+    struct kernel_task *task;
+    struct kernel_wait_queue waiters;
+};
+enum kernel_scheduler_status kernel_thread_create_joinable(
+    void (*entry)(void *), void *argument, struct kernel_thread_join *join);
+void kernel_thread_join(struct kernel_thread_join *join);
+
 enum kernel_scheduler_status kernel_scheduler_yield_current(void);
 
 /*

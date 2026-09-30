@@ -41,6 +41,10 @@ static struct physical_page_allocator transition_page_allocator;
 static struct riscv_sv39_page_table transition_page_table;
 static struct riscv_root_boot root_boot;
 static struct dtb_irq_info boot_irq;
+static struct dtb_boot_info boot_info;
+static struct boot_memory_layout boot_layout;
+static unsigned long boot_hart_id;
+static uintptr_t boot_dtb_address;
 static int root_started;
 static uint64_t cleanup_retry_ticks;
 static unsigned char
@@ -715,39 +719,38 @@ static void storage_cleanup_worker(void *argument)
     }
 }
 
+static void kernel_main_high(void) __attribute__((noinline, noreturn));
+
 void kernel_main(unsigned long hart_id, const void *dtb)
 {
-    struct dtb_boot_info info;
-    struct boot_memory_layout layout;
-    enum dtb_status dtb_status = dtb_read_boot_info(dtb, &info);
+    enum dtb_status dtb_status = dtb_read_boot_info(dtb, &boot_info);
     enum boot_memory_status memory_status;
     enum physical_page_status page_status;
     enum riscv_sv39_status sv39_status;
-    enum riscv_timer_status timer_status;
-    enum kernel_time_status time_status;
-    enum kernel_scheduler_status scheduler_status;
-    enum riscv_root_boot_status root_status;
-    uint64_t boot_realtime_ns = 0;
 
     if (dtb_status != DTB_STATUS_OK) {
         shutdown_for_dtb_error(dtb_status);
     }
     if (dtb_read_irq_info(dtb, hart_id, &boot_irq) != DTB_STATUS_OK)
         shutdown_for_dtb_error(DTB_STATUS_UNSUPPORTED);
-    cleanup_retry_ticks = info.timebase_frequency / KERNEL_TICKS_PER_SECOND;
-    (void)kernel_random_initialize(info.rng_seed, info.rng_seed_size);
+    boot_hart_id = hart_id;
+    boot_dtb_address = (uintptr_t)dtb;
+    cleanup_retry_ticks = boot_info.timebase_frequency / KERNEL_TICKS_PER_SECOND;
+    (void)kernel_random_initialize(boot_info.rng_seed, boot_info.rng_seed_size);
+    kernel_random_erase(boot_info.rng_seed, sizeof(boot_info.rng_seed));
+    boot_info.rng_seed_size = 0U;
 
     memory_status = boot_memory_build(
-        &info,
+        &boot_info,
         (uint64_t)(uintptr_t)__kernel_start,
         (uint64_t)(uintptr_t)__kernel_end,
         (uint64_t)(uintptr_t)dtb,
-        &layout);
+        &boot_layout);
     if (memory_status != BOOT_MEMORY_STATUS_OK) {
         shutdown_for_boot_memory_error(memory_status);
     }
 
-    page_status = physical_page_allocator_init(&page_allocator, &layout);
+    page_status = physical_page_allocator_init(&page_allocator, &boot_layout);
     if (page_status != PHYSICAL_PAGE_STATUS_OK) {
         shutdown_for_physical_page_error(page_status);
     }
@@ -756,7 +759,7 @@ void kernel_main(unsigned long hart_id, const void *dtb)
     if (sv39_status != RISCV_SV39_STATUS_OK) {
         shutdown_for_sv39_error(sv39_status);
     }
-    sv39_status = build_kernel_page_table(&info);
+    sv39_status = build_kernel_page_table(&boot_info);
     if (sv39_status != RISCV_SV39_STATUS_OK) {
         shutdown_for_sv39_error(sv39_status);
     }
@@ -766,6 +769,19 @@ void kernel_main(unsigned long hart_id, const void *dtb)
     }
     riscv_relocate_to_high(RISCV_KERNEL_VIRTUAL_BASE -
                            (uint64_t)(uintptr_t)__kernel_start);
+    /* 切换前算出的低地址指针不能带入仅保留高地址的最终页表。 */
+    kernel_main_high();
+}
+
+static void kernel_main_high(void)
+{
+    enum riscv_sv39_status sv39_status;
+    enum physical_page_status page_status;
+    enum kernel_scheduler_status scheduler_status;
+    enum riscv_root_boot_status root_status;
+    enum riscv_timer_status timer_status;
+    enum kernel_time_status time_status;
+    uint64_t boot_realtime_ns = 0;
 
     sv39_status = riscv_sv39_activate(&kernel_page_table);
     if (sv39_status != RISCV_SV39_STATUS_OK) {
@@ -798,7 +814,7 @@ void kernel_main(unsigned long hart_id, const void *dtb)
         shutdown_for_scheduler_error(scheduler_status);
     }
 
-    if (boot_storage_present(&info)) {
+    if (boot_storage_present(&boot_info)) {
         scheduler_status = kernel_thread_create(storage_cleanup_worker, 0);
         if (scheduler_status != KERNEL_SCHEDULER_STATUS_OK) shutdown_for_scheduler_error(scheduler_status);
     }
@@ -806,16 +822,29 @@ void kernel_main(unsigned long hart_id, const void *dtb)
                          boot_irq.plic.size, boot_irq.context, boot_irq.source_count)) __builtin_trap();
 
     root_status = riscv_root_boot_start(&root_boot,
-                                        &info,
+                                        &boot_info,
                                         &page_allocator,
                                         &kernel_page_table);
     if (root_status == RISCV_ROOT_BOOT_STATUS_OK) {
         root_started = 1;
-        uint32_t source = 0;
-        uint64_t base = (uintptr_t)root_boot.device.mmio - RISCV_KERNEL_MMIO_BASE;
-        for (uint32_t i = 0; i < boot_irq.route_count; i++)
-            if (boot_irq.routes[i].base == base) source = boot_irq.routes[i].source;
-        if (!riscv_virtio_mmio_block_enable_irq(&root_boot.device, source)) __builtin_trap();
+        if (kernel_page_cache_start_worker(&root_boot.page_cache) != 0)
+            shutdown_for_root_boot_error(RISCV_ROOT_BOOT_STATUS_RESOURCES);
+        for (uint32_t disk = 0U; disk < root_boot.device_count; disk++) {
+            struct riscv_virtio_mmio_block *device =
+                riscv_root_boot_device(&root_boot, disk);
+            uint32_t source = 0;
+            uint64_t base = (uintptr_t)device->mmio - RISCV_KERNEL_MMIO_BASE;
+            for (uint32_t i = 0; i < boot_irq.route_count; i++)
+                if (boot_irq.routes[i].base == base) source = boot_irq.routes[i].source;
+            if (!riscv_virtio_mmio_block_enable_irq(device, source)) __builtin_trap();
+            virt_uart_puts("BoarOS: block device=");
+            virt_uart_put_hex(device->block.device_number);
+            virt_uart_puts(" irq=");
+            virt_uart_put_hex(source);
+            virt_uart_puts("\n");
+        }
+        if (riscv_root_boot_start_rng(&root_boot, &boot_info, &boot_irq))
+            shutdown_for_root_boot_error(RISCV_ROOT_BOOT_STATUS_CLEANUP);
         virt_uart_puts("BoarOS: root /init started pid=0x1\n");
     } else if (root_status != RISCV_ROOT_BOOT_STATUS_NO_DEVICE) {
         uint32_t cleanup_attempts = 0U;
@@ -839,33 +868,33 @@ void kernel_main(unsigned long hart_id, const void *dtb)
     virt_uart_putc('\n');
 
     virt_uart_puts("BoarOS: booted hart=");
-    virt_uart_put_hex(hart_id);
+    virt_uart_put_hex(boot_hart_id);
     virt_uart_puts(" dtb=");
-    virt_uart_put_hex((unsigned long)dtb);
+    virt_uart_put_hex((unsigned long)boot_dtb_address);
     virt_uart_putc('\n');
 
     virt_uart_puts("BoarOS: memory base=");
-    virt_uart_put_hex((unsigned long)info.memory.base);
+    virt_uart_put_hex((unsigned long)boot_info.memory.base);
     virt_uart_puts(" size=");
-    virt_uart_put_hex((unsigned long)info.memory.size);
+    virt_uart_put_hex((unsigned long)boot_info.memory.size);
     virt_uart_putc('\n');
 
     virt_uart_puts("BoarOS: memory layout reserved=");
-    virt_uart_put_hex((unsigned long)layout.reserved_count);
+    virt_uart_put_hex((unsigned long)boot_layout.reserved_count);
     virt_uart_puts(" usable=");
-    virt_uart_put_hex((unsigned long)layout.usable_count);
+    virt_uart_put_hex((unsigned long)boot_layout.usable_count);
     virt_uart_putc('\n');
 
     virt_uart_puts("BoarOS: first reserved base=");
-    virt_uart_put_hex((unsigned long)layout.reserved[0].base);
+    virt_uart_put_hex((unsigned long)boot_layout.reserved[0].base);
     virt_uart_puts(" size=");
-    virt_uart_put_hex((unsigned long)layout.reserved[0].size);
+    virt_uart_put_hex((unsigned long)boot_layout.reserved[0].size);
     virt_uart_putc('\n');
 
     virt_uart_puts("BoarOS: first usable base=");
-    virt_uart_put_hex((unsigned long)layout.usable[0].base);
+    virt_uart_put_hex((unsigned long)boot_layout.usable[0].base);
     virt_uart_puts(" size=");
-    virt_uart_put_hex((unsigned long)layout.usable[0].size);
+    virt_uart_put_hex((unsigned long)boot_layout.usable[0].size);
     virt_uart_putc('\n');
 
     virt_uart_puts("BoarOS: physical pages total=");
@@ -891,7 +920,7 @@ void kernel_main(unsigned long hart_id, const void *dtb)
         RISCV_VIRT_RTC_STATUS_OK) {
         boot_realtime_ns = 0;
     }
-    time_status = kernel_time_init(info.timebase_frequency,
+    time_status = kernel_time_init(boot_info.timebase_frequency,
                                    boot_realtime_ns);
     if (time_status != KERNEL_TIME_STATUS_OK) {
         shutdown_for_time_error(time_status);
@@ -907,18 +936,18 @@ void kernel_main(unsigned long hart_id, const void *dtb)
         __asm__ volatile("csrs sstatus, %0" ::"r"(fs_clean) : "memory");
     }
 
-    timer_status = riscv_timer_start(info.timebase_frequency,
+    timer_status = riscv_timer_start(boot_info.timebase_frequency,
                                      KERNEL_TICKS_PER_SECOND);
     if (timer_status != RISCV_TIMER_STATUS_OK) {
         shutdown_for_timer_error(timer_status);
     }
 
     virt_uart_puts("BoarOS: timer frequency=");
-    virt_uart_put_hex((unsigned long)info.timebase_frequency);
+    virt_uart_put_hex((unsigned long)boot_info.timebase_frequency);
     virt_uart_puts(" tick-hz=");
     virt_uart_put_hex(KERNEL_TICKS_PER_SECOND);
     virt_uart_puts(" period=");
-    virt_uart_put_hex((unsigned long)(info.timebase_frequency /
+    virt_uart_put_hex((unsigned long)(boot_info.timebase_frequency /
                                       KERNEL_TICKS_PER_SECOND));
     virt_uart_putc('\n');
 

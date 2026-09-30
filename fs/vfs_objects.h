@@ -3,6 +3,7 @@
 
 #include "vfs_internal.h"
 #include "record_lock.h"
+#include <kernel/cost.h>
 #include <kernel/vfs.h>
 #include <kernel/heap.h>
 
@@ -24,11 +25,13 @@ struct kernel_vfs_instance {
     struct kernel_vfs_path *paths; /* Weak registry; live callers own references. */
     uint32_t external_files;
     uint8_t read_only;
+    uint8_t quiescing;
 };
 
 struct kernel_vfs_node {
     struct kernel_vfs_node *next;
     struct kernel_page_cache_entry *cache_pages;
+    struct kernel_memory_object *memory;
     struct kernel_file_mapping *mappings;
     struct kernel_record_lock_state record_locks;
     struct kernel_vfs_instance *instance;
@@ -36,6 +39,7 @@ struct kernel_vfs_node {
     void *backend_data;
     uint64_t inode;
     uint64_t max_size;
+    struct kernel_mutex write_operation;
     struct kernel_rwlock io_lock;
     uint64_t size;
     uint64_t writeback_error_sequence;
@@ -48,6 +52,10 @@ struct kernel_vfs_node {
     uint8_t closed;
     uint8_t unlinked;
     uint8_t retired;
+    uint8_t generated_control;
+#if BOAROS_COST_DIAGNOSTICS
+    uint8_t generated_diagnostic;
+#endif
 };
 
 struct kernel_vfs_path {
@@ -91,6 +99,9 @@ struct kernel_vfs_backend {
      * releases it and creates a new one after seek to offset zero. */
     int (*snapshot)(struct kernel_vfs_node *node, struct kernel_heap *heap,
         char **buffer, size_t *length);
+    /* Controls use a complete kernel buffer; failure never commits user offset. */
+    int (*control)(struct kernel_vfs_node *node, int write, uint64_t offset,
+        char *buffer, size_t size, size_t *count);
     int (*truncate)(struct kernel_vfs_node *node, uint64_t size, uint64_t *actual, int *changed);
     int (*close_node)(struct kernel_vfs_node *node);
     int (*writeback_allowed)(struct kernel_vfs_instance *instance);
@@ -99,9 +110,13 @@ struct kernel_vfs_backend {
     int (*symlink)(struct kernel_vfs_instance *instance, const char *target, const char *path);
     int (*mknod)(struct kernel_vfs_instance *instance, const char *path,
         uint32_t type, uint32_t mode, uint32_t device);
+    int (*link)(struct kernel_vfs_instance *instance, uint64_t source_inode,
+        uint64_t target_parent, const char *name);
     int (*rename)(struct kernel_vfs_instance *instance,
         uint64_t old_parent, const char *old_name, uint64_t new_parent,
         const char *new_name, unsigned flags, struct kernel_vfs_rename_result *result);
+    /* Failure keeps the attached root and backend owner reachable for retry. */
+    int (*prepare_unmount)(struct kernel_vfs_mount *mount);
     int (*unmount)(struct kernel_vfs_mount *mount);
     int (*statfs)(struct kernel_vfs_mount *mount,
         struct kernel_vfs_statfs *stat);
@@ -141,6 +156,8 @@ struct kernel_vfs_backend {
         void *buffer,
         size_t size,
         size_t *bytes_read);
+    int (*memory_write)(struct kernel_vfs_node *node, uint64_t offset,
+        const void *buffer, size_t size, size_t *written);
     int (*writeback)(struct kernel_vfs_node *node, uint64_t offset,
         const void *buffer, size_t size, size_t *written);
 };

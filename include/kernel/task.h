@@ -9,6 +9,7 @@ struct kernel_mm;
 struct kernel_files;
 struct kernel_fs_context;
 struct kernel_socket_read_request;
+struct kernel_socket_write_request;
 
 struct physical_page_allocator;
 /* One scratch page owned by a live I/O invocation, including forced exit. */
@@ -28,6 +29,10 @@ enum kernel_task_status {
 
 /* Returns the scheduler current task, or null before scheduler publication. */
 struct kernel_task *kernel_task_current(void);
+enum kernel_task_status kernel_task_socket_write_register(
+    struct kernel_task *task, struct kernel_socket_write_request *request);
+enum kernel_task_status kernel_task_socket_write_clear(
+    struct kernel_task *task, struct kernel_socket_write_request *request);
 enum kernel_task_status kernel_task_socket_read_register(
     struct kernel_task *task, struct kernel_socket_read_request *request);
 enum kernel_task_status kernel_task_socket_read_clear(
@@ -95,5 +100,11 @@ void kernel_task_cpu_ticks(const struct kernel_task *task,
                            uint64_t *kernel_ticks,
                            uint64_t *child_user_ticks,
                            uint64_t *child_kernel_ticks);
+
+/* Linux process-group/session operations; all identity changes are atomic. */
+int64_t kernel_task_setpgid(struct kernel_task *task, kernel_pid_t pid, kernel_pid_t pgid);
+int64_t kernel_task_getpgid(struct kernel_task *task, kernel_pid_t pid);
+int64_t kernel_task_getsid(struct kernel_task *task, kernel_pid_t pid);
+int64_t kernel_task_setsid(struct kernel_task *task);
 
 #endif

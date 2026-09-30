@@ -1,16 +1,20 @@
 #ifndef BOAROS_KERNEL_SCHED_PRIVATE_H
 #define BOAROS_KERNEL_SCHED_PRIVATE_H
 
+#include <kernel/cost.h>
 #include <arch/riscv/context.h>
 #include <arch/riscv/fpu.h>
 #include <arch/riscv/thread.h>
 #include <kernel/files.h>
+#include <kernel/heap.h>
 #include <kernel/fs_context.h>
 #include <kernel/mm.h>
 #include <kernel/physical_page.h>
 #include <kernel/stack.h>
 #include <kernel/pid.h>
 #include <kernel/scheduler.h>
+#include <kernel/sched_policy.h>
+#include <kernel/sched_runqueue.h>
 #include <kernel/signal.h>
 #include <kernel/task.h>
 #include <kernel/sync.h>
@@ -25,7 +29,7 @@
 #define KERNEL_PID_LIMIT 32768U
 
 struct kernel_exec_transaction;
-struct kernel_shared_anon;
+struct kernel_memory_object;
 
 enum kernel_futex_key_kind {
     KERNEL_FUTEX_KEY_PRIVATE = 0,
@@ -36,7 +40,7 @@ enum kernel_futex_key_kind {
 struct kernel_futex_key {
     uint64_t identity;
     uint64_t offset;
-    struct kernel_shared_anon *shared_object;
+    struct kernel_memory_object *shared_object;
     enum kernel_futex_key_kind kind;
 };
 
@@ -102,6 +106,11 @@ struct kernel_task {
     uintptr_t stack_low;
     uintptr_t stack_high;
     struct kernel_task *next;
+    struct kernel_task *all_next;
+    struct kernel_sched_policy scheduling;
+    struct kernel_sched_node ready_node;
+    unsigned accounted;
+    struct kernel_thread_join *join;
     struct kernel_task *parent;
     struct kernel_task *first_child;
     struct kernel_task *last_child;
@@ -110,7 +119,7 @@ struct kernel_task {
     uint32_t state;
     uint32_t idle;
     kernel_pid_t tid;
-    kernel_pid_t process_group;
+    struct kernel_pid_member identities[KERNEL_PID_ROLES];
     uint32_t tid_owned;
     uint32_t publish_completion;
     uint32_t wait_status;
@@ -123,6 +132,7 @@ struct kernel_task {
     uint32_t wait_interruptible;
     struct kernel_syscall_restart_state syscall_restart;
     struct kernel_socket_read_request *socket_read_request;
+    struct kernel_socket_write_request *socket_write_request;
     struct kernel_task_io_buffer *io_buffer;
     struct kernel_io_context io_context;
     uint64_t user_ticks;
@@ -134,9 +144,7 @@ struct kernel_task {
     uint64_t child_minor_faults;
     uint64_t child_major_faults;
     uint64_t block_reads;
-    uint64_t proc_identity;
     uint64_t proc_start_ticks;
-    kernel_pid_t session_id;
     char comm[16];
     struct kernel_wait_queue child_exit_queue;
     struct kernel_wait_queue vfork_done_queue;
@@ -148,22 +156,25 @@ struct kernel_task {
     uint32_t group_members;
     struct kernel_task *group_next;
     struct kernel_task *group_previous;
-    kernel_pid_t child_creator_tid;
+    struct kernel_pid *child_creator;
     uint32_t terminate_requested;
     uint32_t proc_exiting;
     uint32_t group_exiting;
     uint32_t group_execing;
+    uint32_t fork_no_exec;
+    uint32_t session_leader;
     uint32_t group_stopped;
     struct kernel_rlimit64 nofile_limit;
     struct kernel_rlimit64 stack_limit;
     struct kernel_wait_queue group_wait_queue;
     uint64_t group_pending;
     uint32_t group_sender[KERNEL_SIGNAL_COUNT];
-    int8_t group_signal_code[KERNEL_SIGNAL_COUNT];
+    int16_t group_signal_code[KERNEL_SIGNAL_COUNT];
     struct kernel_wait_node default_wait_node;
     struct kernel_task *blocked_previous;
     struct kernel_futex_key futex_key;
     uint32_t futex_bitset;
+    struct kernel_signal_fault signal_fault;
     uint64_t signal_pending;
     uint64_t signal_blocked;
     uint64_t signal_wait_mask;
@@ -171,7 +182,7 @@ struct kernel_task {
     uint32_t signal_restore_mask;
     uint64_t signal_table_address;
     uint32_t signal_sender[KERNEL_SIGNAL_COUNT];
-    int8_t signal_code[KERNEL_SIGNAL_COUNT];
+    int16_t signal_code[KERNEL_SIGNAL_COUNT];
     uint32_t stop_notified;
     uint32_t continue_notified;
     struct kernel_thread_completion completion;
@@ -181,6 +192,9 @@ struct kernel_task {
     struct kernel_mm mm;
     struct kernel_exec_transaction *exec_transaction;
     struct riscv_switch_context context;
+#if BOAROS_COST_DIAGNOSTICS
+    struct kernel_cost_task cost;
+#endif
 } __attribute__((aligned(16)));
 
 struct kernel_scheduler {
@@ -188,7 +202,10 @@ struct kernel_scheduler {
     uint32_t idle_context_saved;
     uint64_t kernel_satp;
     uint64_t idle_ticks;
-    uint64_t next_proc_identity;
+    struct kernel_task *all_tasks;
+    uint64_t loads[3], load_ticks;
+    struct kernel_pid_registry identities;
+    struct kernel_heap identity_heap;
     struct physical_page_allocator *allocator;
     struct kernel_pid_allocator pid_allocator;
     uint64_t pid_bitmap[KERNEL_PID_BITMAP_WORDS(KERNEL_PID_LIMIT)];
@@ -196,8 +213,9 @@ struct kernel_scheduler {
     struct kernel_task *current;
     struct kernel_task *cleanup_task;
     struct kernel_wait_queue cleanup_queue;
-    struct kernel_task *ready_head;
-    struct kernel_task *ready_tail;
+    struct kernel_sched_runqueue runqueue;
+    struct kernel_rt_bandwidth rt_bandwidth;
+    unsigned need_resched;
     struct kernel_task *exited_head;
     struct kernel_task *exited_tail;
     struct kernel_task *blocked_head;
@@ -217,6 +235,17 @@ void kernel_proc_task_update_comm(struct kernel_task *task);
 void scheduler_wake_task(struct kernel_task *thread, uint32_t reason);
 void scheduler_wait_requeue(struct kernel_task *task,
                             struct kernel_wait_queue *queue);
+enum kernel_pid_status process_identity_create(struct kernel_task *task,
+    struct kernel_task *parent, int thread_clone);
+void process_identity_release(struct kernel_task *task);
+void process_identity_collect(void);
+int process_group_is_orphaned(const struct kernel_task *task);
+void process_orphan_notify(struct kernel_task *task, struct kernel_task *old_parent);
+enum kernel_signal_status signal_send_kernel_group(struct kernel_task *task, uint32_t sig);
+struct kernel_task *process_find_identity(kernel_pid_t number, enum kernel_pid_role role);
+struct kernel_pid *process_identity(const struct kernel_task *task, enum kernel_pid_role role);
+kernel_pid_t process_identity_number(const struct kernel_task *task, enum kernel_pid_role role);
+uint64_t process_identity_generation(const struct kernel_task *task);
 void process_group_initialize(struct kernel_task *task);
 void process_group_request_exit(struct kernel_task *task,
                                 enum kernel_thread_exit_reason reason,
@@ -228,7 +257,16 @@ enum kernel_scheduler_status allocate_task_storage(struct kernel_task **task);
 enum kernel_scheduler_status release_task_stack(struct kernel_task *task);
 enum kernel_scheduler_status release_task_storage(struct kernel_task *task,
     enum kernel_scheduler_status original_status);
+struct kernel_task *ready_first(void);
+struct kernel_task *ready_next(const struct kernel_task *task);
+struct kernel_task *ready_best(void);
+void ready_remove(struct kernel_task *task);
+void ready_enqueue(struct kernel_task *task, int head);
+void scheduler_account_runtime(void);
+void scheduler_rearm_timer(void);
+enum kernel_scheduler_status scheduler_reschedule(int rotate_other, int voluntary);
 void ready_append(struct kernel_task *thread);
+void scheduler_forget_task(struct kernel_task *thread);
 struct kernel_task *ready_pop(void);
 void blocked_append(struct kernel_task *thread);
 void blocked_unlink(struct kernel_task *thread);

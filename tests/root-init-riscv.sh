@@ -68,7 +68,9 @@ set -- "$qemu" \
     -m "$memory" \
     -smp 1 \
     -nographic \
-    -no-reboot
+    -no-reboot \
+    -object rng-random,id=entropy,filename=/dev/urandom \
+    -device virtio-rng-device,rng=entropy,bus=virtio-mmio-bus.7
 if [ -n "$virtio_mmio_force_legacy" ]; then
     set -- "$@" -global "virtio-mmio.force-legacy=$virtio_mmio_force_legacy"
 fi

@@ -45,7 +45,26 @@ struct kernel_block_device {
     uint32_t logical_block_size;
     kernel_block_flush_fn flush;
     enum kernel_block_cache_mode cache_mode;
+    /* Registry membership is owned by the device lifetime, claims by mounts. */
+    struct kernel_block_device *registry_next;
+    const void *claim_owner;
+    uint64_t device_number;
+    uint32_t registered;
 };
+
+/* Linux new_encode_dev(252, disk_index * 16); whole disks only. */
+#define KERNEL_BLOCK_DEVICE_NUMBER(index) \
+    (UINT64_C(0xfc00) | (((uint64_t)(index) * 16U) & 0xffU) | \
+     ((((uint64_t)(index) * 16U) & ~UINT64_C(0xff)) << 12))
+
+/* Return zero or negative errno. Lookup borrows the boot-owned lifetime;
+ * successful claims prevent unregister until the exact owner releases them. */
+int kernel_block_register(struct kernel_block_device *device, uint64_t number);
+int kernel_block_unregister(struct kernel_block_device *device);
+struct kernel_block_device *kernel_block_lookup(uint64_t number);
+int kernel_block_claim(struct kernel_block_device *device, const void *owner);
+void kernel_block_release_claim(struct kernel_block_device *device,
+                                const void *owner);
 
 /* Complete all prior writes at the device's persistence boundary. A missing
  * callback is sufficient only for a declared write-through device. */

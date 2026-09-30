@@ -246,7 +246,7 @@ static unsigned long run_idle_cases(void)
 
     failures += expect_status(KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT,
                               kernel_thread_create(0, 0));
-    failures += expect_status(KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT,
+    failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
                               kernel_scheduler_on_tick(0U));
     failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
                               kernel_scheduler_on_tick(1U));
@@ -480,8 +480,14 @@ static unsigned long run_accounting_cases(
 
     failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
                               kernel_thread_create(charging_worker, 0));
+    uint64_t loads[3];
+    uint16_t tasks;
+    kernel_scheduler_system_statistics(loads, &tasks);
+    if (tasks != 1) failures++;
     failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
-                              kernel_scheduler_on_tick(1U));
+                              kernel_scheduler_on_tick(501U));
+    kernel_scheduler_system_statistics(loads, &tasks);
+    if (tasks != 1 || !loads[0] || !loads[1] || !loads[2] || loads[0] <= loads[1]) failures++;
     if (charged_user != 5U || charged_kernel != 3U) {
         failures++;
     }
@@ -494,7 +500,41 @@ static unsigned long run_accounting_cases(
         failures++;
     }
 
+    kernel_scheduler_system_statistics(loads, &tasks);
+    if (tasks) failures++;
     return failures;
+}
+
+static struct kernel_wait_queue load_queue;
+static void load_waiter(void *argument)
+{
+    enum kernel_wait_wake_reason reason;
+    (void)riscv_interrupt_save();
+    if (kernel_scheduler_block_current(&load_queue, 0, (int)(uintptr_t)argument, &reason)
+            != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
+}
+static unsigned long run_load_wait_cases(struct physical_page_allocator *allocator)
+{
+    uint64_t available = physical_page_available(allocator), before[3], after[3];
+    uint16_t tasks;
+    unsigned long failures = 0;
+    struct kernel_thread_completion completion;
+    kernel_wait_queue_init(&load_queue);
+    for (unsigned interruptible = 1;; interruptible--) {
+        failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
+            kernel_thread_create(load_waiter, (void *)(uintptr_t)interruptible));
+        failures += expect_status(KERNEL_SCHEDULER_STATUS_OK, kernel_scheduler_on_tick(1));
+        kernel_scheduler_system_statistics(before, &tasks);
+        if (tasks != 1) failures++;
+        failures += expect_status(KERNEL_SCHEDULER_STATUS_OK, kernel_scheduler_on_tick(501));
+        kernel_scheduler_system_statistics(after, &tasks);
+        if (interruptible ? after[0] >= before[0] : after[0] <= before[0]) failures++;
+        failures += expect_status(KERNEL_SCHEDULER_STATUS_OK, kernel_wait_queue_wake_one(&load_queue));
+        failures += expect_status(KERNEL_SCHEDULER_STATUS_OK, kernel_scheduler_on_tick(1));
+        failures += expect_status(KERNEL_SCHEDULER_STATUS_OK, kernel_scheduler_reap_one(&completion));
+        if (!interruptible) break;
+    }
+    return failures + (available != physical_page_available(allocator));
 }
 
 static unsigned long run_wait_cases(
@@ -961,6 +1001,7 @@ void kernel_main(unsigned long hart_id, const void *dtb)
     failures += run_create_cases(&allocator);
     failures += run_wait_cases(&allocator);
     failures += run_accounting_cases(&allocator);
+    failures += run_load_wait_cases(&allocator);
     failures += run_fpu_cases();
     failures += run_stack_contract_cases(&allocator);
     failures += run_sync_cases(&allocator);

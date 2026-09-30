@@ -107,6 +107,17 @@ static unsigned long run_deadline_cases(void)
 {
     unsigned long failures = 0U;
     uint64_t output = 0xa5a5a5a5a5a5a5a5ULL;
+    uint64_t next, elapsed;
+    if (riscv_timer_event_advance(250U, 10000U, 10000U, 250U,
+                                &next, &elapsed) != RISCV_TIMER_STATUS_OK ||
+        next != 10000U || elapsed != 0U) failures++;
+    if (riscv_timer_event_advance(500U, 10000U, 10000U, 500U,
+                                &next, &elapsed) != RISCV_TIMER_STATUS_OK ||
+        next != 10000U || elapsed != 0U) failures++;
+    if (riscv_timer_event_advance(10000U, 10000U, 10000U, 500U,
+                                &next, &elapsed) != RISCV_TIMER_STATUS_OK ||
+        next != 20000U || elapsed != 1U) failures++;
+
 
     failures += expect_deadline(RISCV_TIMER_STATUS_OK,
                                 100U, 10U, 100U, 110U, 1U);
@@ -219,6 +230,11 @@ static unsigned long run_timer_state_cases(void)
     }
 
     first_deadline = wrapped_deadline;
+    uint64_t event = first_deadline - 1000U;
+    if (riscv_timer_set_scheduler_deadline(event) != RISCV_TIMER_STATUS_OK ||
+        wrapped_deadline != event) failures++;
+    if (riscv_timer_set_scheduler_deadline(0) != RISCV_TIMER_STATUS_OK ||
+        wrapped_deadline != first_deadline) failures++;
     while (((read_time() - first_deadline) >> 63) != 0U) {
         asm volatile("" ::: "memory");
     }
@@ -236,7 +252,7 @@ static unsigned long run_timer_state_cases(void)
     if (status != RISCV_TIMER_STATUS_OK || elapsed == 0U) {
         failures++;
     }
-    if (wrapped_probe_calls != 4U || wrapped_set_calls != 4U) {
+    if (wrapped_probe_calls != 4U || wrapped_set_calls != 6U) {
         failures++;
     }
 

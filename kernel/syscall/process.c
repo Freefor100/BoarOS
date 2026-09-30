@@ -250,3 +250,37 @@ void syscall_decode_clone(const struct kernel_syscall_request *request,
     decoded->action = KERNEL_SYSCALL_ACTION_CLONE;
     decoded->value = 0;
 }
+
+enum kernel_syscall_status syscall_handle_setpgid(struct kernel_task *caller,
+    const struct kernel_syscall_request *request, struct kernel_syscall_result *decoded)
+{
+    decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+    decoded->value = kernel_task_setpgid(caller, (int32_t)request->arguments[0],
+                                        (int32_t)request->arguments[1]);
+    return KERNEL_SYSCALL_STATUS_OK;
+}
+
+enum kernel_syscall_status syscall_handle_getpgid(struct kernel_task *caller,
+    const struct kernel_syscall_request *request, struct kernel_syscall_result *decoded)
+{
+    decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+    decoded->value = kernel_task_getpgid(caller, (int32_t)request->arguments[0]);
+    return KERNEL_SYSCALL_STATUS_OK;
+}
+
+enum kernel_syscall_status syscall_handle_getsid(struct kernel_task *caller,
+    const struct kernel_syscall_request *request, struct kernel_syscall_result *decoded)
+{
+    decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+    decoded->value = kernel_task_getsid(caller, (int32_t)request->arguments[0]);
+    return KERNEL_SYSCALL_STATUS_OK;
+}
+
+enum kernel_syscall_status syscall_handle_setsid(struct kernel_task *caller,
+    const struct kernel_syscall_request *request, struct kernel_syscall_result *decoded)
+{
+    (void)request;
+    decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+    decoded->value = kernel_task_setsid(caller);
+    return KERNEL_SYSCALL_STATUS_OK;
+}

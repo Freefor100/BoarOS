@@ -1,10 +1,14 @@
 #include "private.h"
 
+#include <kernel/cost.h>
 #include <kernel/errno.h>
 #include <kernel/futex.h>
 #include <kernel/task.h>
 #include <kernel/mm.h>
 #include <kernel/uaccess.h>
+#include <kernel/scheduler.h>
+#include <kernel/time.h>
+#include <arch/riscv/context.h>
 
 #include <stddef.h>
 #include <stdint.h>
@@ -32,6 +36,7 @@
 #define LINUX_SYSCALL_MKDIRAT 34U
 #define LINUX_SYSCALL_UNLINKAT 35U
 #define LINUX_SYSCALL_SYMLINKAT 36U
+#define LINUX_SYSCALL_LINKAT 37U
 #define LINUX_SYSCALL_FTRUNCATE 46U
 #define LINUX_SYSCALL_OPENAT 56U
 #define LINUX_SYSCALL_CLOSE 57U
@@ -63,7 +68,12 @@
 #define LINUX_SYSCALL_GETEGID 177U
 #define LINUX_SYSCALL_GETTID 178U
 #define LINUX_SYSCALL_UMASK 166U
+#define LINUX_SYSCALL_SHMGET 194U
+#define LINUX_SYSCALL_SHMCTL 195U
+#define LINUX_SYSCALL_SHMAT 196U
+#define LINUX_SYSCALL_SHMDT 197U
 #define LINUX_SYSCALL_SOCKET 198U
+#define LINUX_SYSCALL_SOCKETPAIR 199U
 #define LINUX_SYSCALL_BIND 200U
 #define LINUX_SYSCALL_LISTEN 201U
 #define LINUX_SYSCALL_ACCEPT 202U
@@ -73,6 +83,7 @@
 #define LINUX_SYSCALL_RECVFROM 207U
 #define LINUX_SYSCALL_SETSOCKOPT 208U
 #define LINUX_SYSCALL_BRK 214U
+#define LINUX_SYSCALL_GETRANDOM 278U
 #define LINUX_SYSCALL_SCHED_YIELD 124U
 #define LINUX_SYSCALL_CLOCK_GETTIME 113U
 #define LINUX_SYSCALL_CLOCK_GETRES 114U
@@ -165,6 +176,44 @@ static enum kernel_syscall_status syscall_handle_uname(
 }
 
 
+struct linux_sysinfo {
+    int64_t uptime;
+    uint64_t loads[3], totalram, freeram, sharedram, bufferram, totalswap, freeswap;
+    uint16_t procs, pad;
+    uint32_t alignment;
+    uint64_t totalhigh, freehigh;
+    uint32_t mem_unit, tail;
+};
+_Static_assert(sizeof(struct linux_sysinfo) == 112, "RV64 sysinfo layout");
+
+static enum kernel_syscall_status syscall_handle_sysinfo(struct kernel_task *caller,
+    uint64_t address, struct kernel_syscall_result *decoded)
+{
+    struct kernel_mm *mm;
+    if (kernel_task_mm_borrow_mutable(caller, &mm) != KERNEL_TASK_STATUS_OK)
+        return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    struct linux_sysinfo info = {0};
+    struct kernel_memory_statistics memory;
+    uintptr_t irq = riscv_interrupt_save();
+    kernel_memory_snapshot(mm->allocator, &memory);
+    kernel_scheduler_system_statistics(info.loads, &info.procs);
+    uint64_t ns = kernel_time_monotonic_ns();
+    info.uptime = ns / 1000000000 + (ns % 1000000000 != 0);
+    riscv_interrupt_restore(irq);
+    info.totalram = memory.total;
+    info.freeram = memory.free;
+    info.sharedram = memory.shared;
+    info.bufferram = memory.buffers;
+    info.mem_unit = 1;
+    size_t copied;
+    enum kernel_uaccess_status access = kernel_copy_to_user(mm, address, &info, sizeof(info), &copied);
+    if (access != KERNEL_UACCESS_STATUS_OK && access != KERNEL_UACCESS_STATUS_FAULT)
+        return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+    decoded->value = access == KERNEL_UACCESS_STATUS_FAULT ? -KERNEL_EFAULT : 0;
+    return KERNEL_SYSCALL_STATUS_OK;
+}
+
 enum kernel_syscall_status kernel_syscall_dispatch(
     struct kernel_task *caller,
     const struct kernel_syscall_request *request,
@@ -178,8 +227,41 @@ enum kernel_syscall_status kernel_syscall_dispatch(
         return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     }
 
-    if (request->number == LINUX_SYSCALL_SOCKET) {
+#if BOAROS_COST_DIAGNOSTICS
+    kernel_cost_syscall(request->number, (int64_t)request->arguments[0]);
+    COST_SCOPE(syscall_cost, OPERATION_TICKS);
+    COST_ADD(OPERATIONS, 1);
+#endif
+    if (request->number == 179U) {
+        if (syscall_handle_sysinfo(caller, request->arguments[0], &decoded) != KERNEL_SYSCALL_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    } else if (request->number == LINUX_SYSCALL_SHMGET) {
+        if (syscall_handle_shmget(caller, request, &decoded) !=
+            KERNEL_SYSCALL_STATUS_OK) {
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+        }
+    } else if (request->number == LINUX_SYSCALL_SHMCTL) {
+        if (syscall_handle_shmctl(caller, request, &decoded) !=
+            KERNEL_SYSCALL_STATUS_OK) {
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+        }
+    } else if (request->number == LINUX_SYSCALL_SHMAT) {
+        if (syscall_handle_shmat(caller, request, &decoded) !=
+            KERNEL_SYSCALL_STATUS_OK) {
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+        }
+    } else if (request->number == LINUX_SYSCALL_SHMDT) {
+        if (syscall_handle_shmdt(caller, request, &decoded) !=
+            KERNEL_SYSCALL_STATUS_OK) {
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+        }
+    } else if (request->number == LINUX_SYSCALL_SOCKET) {
         if (syscall_handle_socket(caller, request, &decoded) !=
+            KERNEL_SYSCALL_STATUS_OK) {
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+        }
+    } else if (request->number == LINUX_SYSCALL_SOCKETPAIR) {
+        if (syscall_handle_socketpair(caller, request, &decoded) !=
             KERNEL_SYSCALL_STATUS_OK) {
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
         }
@@ -268,6 +350,9 @@ enum kernel_syscall_status kernel_syscall_dispatch(
                request->number == LINUX_SYSCALL_FCHDIR) {
         if (syscall_handle_chdir(caller, request, &decoded,
                 request->number == LINUX_SYSCALL_FCHDIR) != KERNEL_SYSCALL_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    } else if (request->number == LINUX_SYSCALL_LINKAT) {
+        if (syscall_handle_linkat(caller, request, &decoded) != KERNEL_SYSCALL_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     } else if (request->number == LINUX_SYSCALL_RENAMEAT ||
                request->number == LINUX_SYSCALL_RENAMEAT2) {
@@ -390,7 +475,7 @@ enum kernel_syscall_status kernel_syscall_dispatch(
         }
     } else if (request->number == LINUX_SYSCALL_EXIT ||
                request->number == LINUX_SYSCALL_EXIT_GROUP) {
-        /* Single-member thread groups: exit_group terminates this task. */
+        /* exit_group requests termination of every live group member. */
         decoded.action = request->number == LINUX_SYSCALL_EXIT_GROUP
                              ? KERNEL_SYSCALL_ACTION_EXIT_GROUP
                              : KERNEL_SYSCALL_ACTION_EXIT;
@@ -417,6 +502,27 @@ enum kernel_syscall_status kernel_syscall_dispatch(
         }
     } else if (request->number == LINUX_SYSCALL_SET_ROBUST_LIST) {
         if (syscall_handle_set_robust_list(caller, request, &decoded) !=
+            KERNEL_SYSCALL_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    } else if ((request->number >= 118U && request->number <= 123U) ||
+               (request->number >= 125U && request->number <= 127U)) {
+        if (syscall_handle_sched(caller, request, &decoded) !=
+            KERNEL_SYSCALL_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    } else if (request->number == 154U) {
+        if (syscall_handle_setpgid(caller, request, &decoded) !=
+            KERNEL_SYSCALL_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    } else if (request->number == 155U) {
+        if (syscall_handle_getpgid(caller, request, &decoded) !=
+            KERNEL_SYSCALL_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    } else if (request->number == 156U) {
+        if (syscall_handle_getsid(caller, request, &decoded) !=
+            KERNEL_SYSCALL_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    } else if (request->number == 157U) {
+        if (syscall_handle_setsid(caller, request, &decoded) !=
             KERNEL_SYSCALL_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     } else if (request->number == LINUX_SYSCALL_GET_ROBUST_LIST) {
@@ -549,6 +655,10 @@ enum kernel_syscall_status kernel_syscall_dispatch(
     } else if (request->number == LINUX_SYSCALL_SCHED_YIELD) {
         decoded.action = KERNEL_SYSCALL_ACTION_YIELD;
         decoded.value = 0;
+    } else if (request->number == LINUX_SYSCALL_GETRANDOM) {
+        if (syscall_handle_getrandom(caller, request, &decoded) !=
+            KERNEL_SYSCALL_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     } else if (request->number == LINUX_SYSCALL_CLOCK_GETTIME) {
         if (syscall_handle_clock_gettime(caller, request, &decoded) !=
             KERNEL_SYSCALL_STATUS_OK) {

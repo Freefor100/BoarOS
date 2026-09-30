@@ -27,7 +27,7 @@
 - header 总长度、块顺序与范围、对齐、版本、reservation terminator、结构 token、字符串终止和属性填充都受边界检查。
 - 根节点缺省使用两个 address cell 和一个 size cell；显式值只能是一或二。memory 节点必须位于根节点下，并提供合法的 `device_type = "memory"` 与 `reg`。
 - `timebase-frequency` 是平台提供的原始计数频率；本模块不计算 tick period，也不假设 QEMU 或开发板频率。
-- `/chosen/rng-seed` 是启动期可信熵输入的可选 DTB 属性；本模块只保存至少 32 字节的固定快照，不把时间、地址或常量当作随机种子。随机流初始化和 `AT_RANDOM` 由内核随机模块负责。
+- `/chosen/rng-seed` 是可选的启动混种材料；本模块保存至少 32 字节的固定快照，默认不计可信熵。内核混入后清除临时快照；可信初始化由 VirtIO RNG 输入完成，早期 exec 的非安全降级与 `AT_RANDOM` 见随机模块。
 - `/reserved-memory` 必须使用与根节点相同的 cell 数并带空 `ranges`；静态子节点的每个 `reg` tuple 都会保存。动态 `size` 形式和相关节点的 `status` 语义尚未实现，读取器明确返回 unsupported。
 - 布局构建器检查所有 `base + size` 运算，要求内核区间完整位于所选 RAM 中；DTB 或设备树保留区位于 RAM 外的部分会被裁掉。
 - 保留区排序后合并重叠或相邻项，再从 RAM 中相减。结果保持字节粒度，页边界对齐由后续物理页分配器负责。

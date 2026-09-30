@@ -1,3 +1,4 @@
+#include <kernel/cost.h>
 #include <kernel/page.h>
 #include <kernel/physical_page.h>
 
@@ -195,6 +196,14 @@ enum physical_page_status physical_page_allocator_init(
         return PHYSICAL_PAGE_STATUS_INVALID;
     }
 
+    result.pressure_notify = 0;
+    result.pressure_wait = 0;
+    result.pressure_context = 0;
+    result.shared_anon_pages = 0;
+    result.cache_snapshot = 0;
+    result.cache_context = 0;
+    result.buffer_bytes = 0;
+    result.buffer_context = 0;
     result.total_pages = 0U;
     result.available_pages = 0U;
     result.recycled_head = PHYSICAL_PAGE_NONE;
@@ -1000,15 +1009,18 @@ enum physical_page_status physical_page_allocate_order(
     uint32_t order,
     uint64_t *address)
 {
+    COST_ADD(PAGE_CALLS, 1);
     enum physical_page_status status =
         physical_page_allocate_order_once(allocator, order, address);
 
+    if (allocator_initialized(allocator) && allocator->pressure_notify)
+        allocator->pressure_notify(allocator->pressure_context);
     if (status == PHYSICAL_PAGE_STATUS_EMPTY &&
         allocator_initialized(allocator) &&
         physical_page_allocator_is_finalized(allocator) &&
         allocator->reclaimer != 0) {
         uint32_t *depth = allocator->reclaim_depth ? allocator->reclaim_depth() : &allocator->reclaiming;
-        if (*depth) return status;
+        if (*depth) { COST_ADD(PAGE_FAILURES, 1); return status; }
         if (depth != &allocator->reclaiming) *depth = 1U;
         if (allocator->reclaiming == UINT32_MAX) __builtin_trap();
         allocator->reclaiming++;
@@ -1016,11 +1028,16 @@ enum physical_page_status physical_page_allocate_order(
                                    order_page_count(order));
         allocator->reclaiming--;
         if (depth != &allocator->reclaiming) *depth = 0U;
+        if (allocator->available_pages < order_page_count(order) && allocator->pressure_wait)
+            allocator->pressure_wait(allocator->pressure_context);
         status = physical_page_allocate_order_once(allocator,
                                                    order,
                                                    address);
     }
 
+    if (status == PHYSICAL_PAGE_STATUS_OK) {
+        COST_ADD(PAGE_ACCEPTED, order_page_count(order)); COST_IO_ADD(7, order_page_count(order));
+    } else COST_ADD(PAGE_FAILURES, 1);
     return status;
 }
 
@@ -1414,4 +1431,19 @@ uint64_t physical_page_metadata_pages(
     }
 
     return allocator->metadata_pages;
+}
+
+void kernel_memory_snapshot(const struct physical_page_allocator *allocator,
+                            struct kernel_memory_statistics *out)
+{
+    *out = (struct kernel_memory_statistics){0};
+    out->total = physical_page_total(allocator) * BOAROS_PAGE_SIZE;
+    out->free = physical_page_available(allocator) * BOAROS_PAGE_SIZE;
+    out->available = out->free;
+    out->shared = allocator->shared_anon_pages * BOAROS_PAGE_SIZE;
+    out->cached = out->shared;
+    if (allocator->buffer_bytes)
+        out->buffers = allocator->buffer_bytes(allocator->buffer_context);
+    if (allocator->cache_snapshot)
+        allocator->cache_snapshot(allocator->cache_context, out);
 }

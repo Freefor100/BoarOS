@@ -1,4 +1,10 @@
+#include <kernel/cost.h>
 #include <arch/riscv/context.h>
+#include <arch/riscv/mm.h>
+#include <kernel/open_file.h>
+#include <kernel/files.h>
+#include <kernel/fs_context.h>
+#include <kernel/uaccess.h>
 #include <arch/riscv/sbi.h>
 #include <arch/riscv/plic.h>
 #include <arch/riscv/timer.h>
@@ -16,7 +22,7 @@
 #include "../../kernel/sched/private.h"
 #include <string.h>
 
-static unsigned char pool[16 * 1024 * 1024] __attribute__((aligned(4096)));
+static unsigned char pool[4 * 1024 * 1024] __attribute__((aligned(4096)));
 static struct physical_page_allocator allocator;
 static struct kernel_heap heap;
 static struct kernel_page_cache cache;
@@ -24,7 +30,67 @@ static struct kernel_vfs_mount mount;
 static struct kernel_vfs_file file;
 static struct riscv_virtio_mmio_block device;
 static unsigned char payload[4096];
-static unsigned loading_probe, loads, done, write_probe;
+static struct kernel_mm sync_mm;
+static uint64_t sync_satp, sync_address;
+static int sync_edit, operation_testing;
+static struct kernel_files operation_files;
+static struct kernel_task *operation_writer_task, *operation_contender_task;
+static struct kernel_wait_queue operation_held;
+static uint64_t operation_second;
+static unsigned operation_paused, operation_done, operation_mode;
+static int64_t operation_fd[2];
+#define OP_USER UINT64_C(0x21000000)
+struct kernel_task *__real_kernel_task_current(void);
+struct kernel_task *__wrap_kernel_task_current(void)
+{ return operation_testing && sync_edit ? scheduler.current : __real_kernel_task_current(); }
+void __real_kernel_vfs_node_lock(struct kernel_vfs_node *, struct kernel_lock_guard *, int);
+void __wrap_kernel_vfs_node_lock(struct kernel_vfs_node *node, struct kernel_lock_guard *guard, int write)
+{
+    int edit = sync_edit;
+    if (operation_testing) sync_edit = 0;
+    __real_kernel_vfs_node_lock(node, guard, write);
+    sync_edit = edit;
+}
+enum kernel_page_cache_status __real_kernel_open_file_get_page(struct kernel_open_file_description *, uint64_t, uint64_t *, size_t *);
+enum kernel_page_cache_status __wrap_kernel_open_file_get_page(struct kernel_open_file_description *ofd, uint64_t index, uint64_t *page, size_t *valid)
+{
+    int edit = sync_edit;
+    if (operation_testing) sync_edit = 0;
+    enum kernel_page_cache_status result = __real_kernel_open_file_get_page(ofd, index, page, valid);
+    sync_edit = edit;
+    return result;
+}
+enum kernel_uaccess_status __real_kernel_copy_from_user(struct kernel_mm *, void *, uint64_t, size_t, size_t *);
+enum kernel_uaccess_status __wrap_kernel_copy_from_user(struct kernel_mm *mm, void *buffer, uint64_t address, size_t size, size_t *copied);
+
+static struct kernel_open_file_description *sync_source;
+static struct kernel_wait_queue sync_held;
+static struct kernel_task *sync_task;
+static unsigned sync_entered, sync_active, sync_finished, sync_released;
+static int sync_error, sync_close_error;
+uint64_t __real_riscv_sv39_current_satp(void);
+uint64_t __wrap_riscv_sv39_current_satp(void)
+{ return sync_edit ? sync_satp : __real_riscv_sv39_current_satp(); }
+int __real_kernel_open_file_sync_range(struct kernel_open_file_description *, uint64_t, uint64_t);
+int __wrap_kernel_open_file_sync_range(struct kernel_open_file_description *ofd, uint64_t start, uint64_t end)
+{
+    if (ofd == sync_source) sync_active = 1;
+    int result = __real_kernel_open_file_sync_range(ofd, start, end);
+    if (ofd == sync_source) { sync_active = 0; if (sync_error) return -5; }
+    return result;
+}
+enum kernel_open_file_status __real_kernel_open_file_release(struct kernel_open_file_description **);
+enum kernel_open_file_status __wrap_kernel_open_file_release(struct kernel_open_file_description **owner);
+static unsigned loading_probe, loads, done, write_probe, background_fail;
+static uint64_t pressure_pages[1024], failed_offset;
+static struct kernel_wait_queue held_write;
+static unsigned stop_probe, stop_entered, stop_called, stop_done;
+static struct kernel_page_cache instance_peer;
+static struct kernel_vfs_node *instance_nodes[2];
+static struct kernel_wait_queue instance_held[2];
+static unsigned instance_hold, instance_entered[2], instance_waiting, instance_wait_done;
+static unsigned instance_stop_called, instance_stop_done;
+static uint64_t instance_peer_pin;
 static uint64_t observed[2], inserted_page;
 static struct kernel_page_cache_alias alias;
 static void rearm(void *owner, uint64_t address) { (void)owner; (void)address; }
@@ -32,6 +98,215 @@ extern unsigned char __boot_stack_bottom[], __boot_stack_top[];
 static void check(int good, unsigned id)
 {
     if (!good) { virt_uart_puts("I/O sleep failed: "); virt_uart_put_hex(id); virt_uart_putc('\n'); sbi_shutdown(); }
+}
+enum kernel_open_file_status __wrap_kernel_open_file_release(struct kernel_open_file_description **owner)
+{
+    if (*owner == sync_source) {
+        check(!sync_active, 220); /* 最后映射撤销不能释放仍在 msync 中使用的 OFD。 */
+        if (sync_close_error) { sync_close_error = 0; return KERNEL_OPEN_FILE_STATUS_CLEANUP_REQUIRED; }
+        sync_released++;
+    }
+    return __real_kernel_open_file_release(owner);
+}
+static void sync_inode_holder(void *argument)
+{
+    (void)argument;
+    uintptr_t irq = riscv_interrupt_save();
+    KERNEL_LOCK_SCOPE(guard);
+    kernel_vfs_node_lock(kernel_vfs_file_node(&file), &guard, 1);
+    sync_entered = 1;
+    enum kernel_wait_wake_reason reason;
+    check(kernel_scheduler_block_current(&sync_held, 0, 0, &reason) == KERNEL_SCHEDULER_STATUS_OK, 221);
+    riscv_interrupt_restore(irq);
+}
+static void sync_mapping_worker(void *argument)
+{
+    (void)argument;
+    uintptr_t irq = riscv_interrupt_save();
+    sync_task = kernel_task_current();
+    check(kernel_mm_msync(&sync_mm, sync_address, 4096, 4) == sync_error, 222);
+    sync_finished = 1;
+    riscv_interrupt_restore(irq);
+}
+static void sync_source_probe(void *argument)
+{
+    (void)argument;
+    uintptr_t irq = riscv_interrupt_save();
+    for (unsigned round = 0; round < 2; round++) {
+        sync_entered = sync_active = sync_finished = sync_released = 0;
+        sync_error = round ? -5 : 0; sync_close_error = round;
+        sync_mm = (struct kernel_mm){0};
+        struct riscv_sv39_page_table table = {0};
+        struct riscv_sv39_user_space space = {0};
+        struct kernel_open_file_description *owner = 0;
+        int result;
+        check(riscv_sv39_page_table_init(&table, &allocator) == RISCV_SV39_STATUS_OK, 235);
+        /* 只测试 MM owner 与调度，借用空内核根；当前 hart 仍在 Bare 模式。 */
+        table.state = RISCV_SV39_STATE_ACTIVE;
+        check(riscv_sv39_user_space_init(&space, &allocator, &table) == RISCV_SV39_STATUS_OK &&
+            riscv_kernel_mm_create(&sync_mm, &space) == KERNEL_MM_STATUS_OK &&
+            kernel_mm_vma_enable(&sync_mm, &heap) == KERNEL_MM_STATUS_OK &&
+            kernel_mm_brk_initialize(&sync_mm, 0x10000000, 0x70000000) == KERNEL_MM_STATUS_OK &&
+            riscv_kernel_mm_satp(&sync_mm, &sync_satp) == KERNEL_MM_STATUS_OK &&
+            kernel_open_file_create(&heap, &mount, "/concurrent", &owner, &result) == KERNEL_OPEN_FILE_STATUS_OK && result == 0, 223);
+        sync_source = owner;
+        check(kernel_mm_mmap_file_private(&sync_mm, &owner, 0x20000000, 4096, 0,
+            KERNEL_MM_READ, KERNEL_MM_MAP_SHARED, &sync_address) == KERNEL_MM_STATUS_OK && !owner, 224);
+        kernel_wait_queue_init(&sync_held);
+        struct kernel_thread_join holder = {0}, synchronizer = {0};
+        check(kernel_thread_create_joinable(sync_inode_holder, 0, &holder) == KERNEL_SCHEDULER_STATUS_OK, 225);
+        while (!sync_entered) check(kernel_scheduler_yield_current() == KERNEL_SCHEDULER_STATUS_OK, 226);
+        check(kernel_thread_create_joinable(sync_mapping_worker, 0, &synchronizer) == KERNEL_SCHEDULER_STATUS_OK, 227);
+        while (!sync_task || sync_task->state != KERNEL_THREAD_STATE_BLOCKED)
+            check(kernel_scheduler_yield_current() == KERNEL_SCHEDULER_STATUS_OK, 228);
+        check(sync_active && !sync_finished, 229);
+        /* 被取消的同步仍拥有等待中的 OFD，不能把不可中断 I/O 当成已结束。 */
+        sync_task->terminate_requested = 1;
+        sync_edit = 1;
+        check(kernel_mm_munmap(&sync_mm, sync_address, 4096) == KERNEL_MM_STATUS_OK && !sync_released, 230);
+        sync_edit = 0;
+        kernel_wait_queue_wake_all(&sync_held);
+        kernel_thread_join(&holder);
+        kernel_thread_join(&synchronizer);
+        check(sync_finished && sync_released == (round ? 0U : 1U), 231);
+        sync_task = 0; sync_satp = 0;
+        check(kernel_mm_release(&sync_mm) == KERNEL_MM_STATUS_OK &&
+            physical_page_release(&allocator, table.root_address) == PHYSICAL_PAGE_STATUS_OK, 232);
+        check(sync_released == 1, 236);
+        sync_source = 0;
+    }
+    virt_uart_puts("I/O msync source pin passed\n");
+    riscv_interrupt_restore(irq);
+}
+enum kernel_uaccess_status __wrap_kernel_copy_from_user(struct kernel_mm *mm, void *buffer, uint64_t address, size_t size, size_t *copied)
+{
+    if (!operation_testing || mm != &sync_mm)
+        return __real_kernel_copy_from_user(mm, buffer, address, size, copied);
+    if (address == operation_second && kernel_task_current() == operation_writer_task && !operation_paused) {
+        operation_paused = 1;
+        enum kernel_wait_wake_reason reason;
+        check(kernel_scheduler_block_current(&operation_held, 0, 0, &reason) == KERNEL_SCHEDULER_STATUS_OK, 240);
+    }
+    /* 使用真实 MM/uaccess；只模型化未激活 MM 的 satp，调度和 VFS 等待仍用真实 hart。 */
+    sync_edit = 1;
+    enum kernel_uaccess_status result = __real_kernel_copy_from_user(mm, buffer, address, size, copied);
+    sync_edit = 0;
+    return result;
+}
+static void operation_writer(void *argument)
+{
+    (void)argument;
+    uintptr_t irq = riscv_interrupt_save();
+    operation_writer_task = kernel_task_current();
+    int64_t result;
+    enum kernel_files_status status = operation_mode == 1
+        ? kernel_files_pwrite(&operation_files, &sync_mm, operation_fd[0], OP_USER + 4096, 8192, 0, &result)
+        : operation_mode == 3
+        ? kernel_files_write(&operation_files, &sync_mm, operation_fd[0], OP_USER + 4096, 8192, &result)
+        : kernel_files_writev(&operation_files, &sync_mm, operation_fd[0], OP_USER + 128, 2, &result);
+    check(status == KERNEL_FILES_STATUS_OK && result == 8192, 241);
+    riscv_interrupt_restore(irq);
+}
+static void operation_contender(void *argument)
+{
+    (void)argument;
+    uintptr_t irq = riscv_interrupt_save();
+    operation_contender_task = kernel_task_current();
+    int64_t result;
+    enum kernel_files_status status = operation_mode == 2
+        ? kernel_files_ftruncate(&operation_files, operation_fd[1], 0, &result)
+        : operation_mode == 0
+        ? kernel_files_write(&operation_files, &sync_mm, operation_fd[1], OP_USER + 16384, 8192, &result)
+        : kernel_files_pwrite(&operation_files, &sync_mm, operation_fd[1], OP_USER + 16384, 8192, 0, &result);
+    check(status == KERNEL_FILES_STATUS_OK && result == (operation_mode == 2 ? 0 : 8192), 242);
+    operation_done = 1;
+    riscv_interrupt_restore(irq);
+}
+static void whole_write_probe(void *argument)
+{
+    (void)argument;
+    uintptr_t irq = riscv_interrupt_save();
+    for (operation_mode = 0; operation_mode < 4; operation_mode++) {
+        operation_testing = 1;
+        operation_paused = operation_done = 0;
+        operation_writer_task = operation_contender_task = 0;
+        kernel_wait_queue_init(&operation_held);
+        sync_mm = (struct kernel_mm){0};
+        operation_files = (struct kernel_files){0};
+        struct riscv_sv39_page_table table = {0};
+        struct riscv_sv39_user_space space = {0};
+        struct kernel_fs_context fs = {0};
+        struct kernel_vfs_file observed = {0};
+        check(riscv_sv39_page_table_init(&table, &allocator) == RISCV_SV39_STATUS_OK, 243);
+        table.state = RISCV_SV39_STATE_ACTIVE;
+        check(riscv_sv39_user_space_init(&space, &allocator, &table) == RISCV_SV39_STATUS_OK &&
+            riscv_kernel_mm_create(&sync_mm, &space) == KERNEL_MM_STATUS_OK &&
+            kernel_mm_vma_enable(&sync_mm, &heap) == KERNEL_MM_STATUS_OK &&
+            kernel_mm_brk_initialize(&sync_mm, 0x10000000, 0x70000000) == KERNEL_MM_STATUS_OK &&
+            riscv_kernel_mm_satp(&sync_mm, &sync_satp) == KERNEL_MM_STATUS_OK &&
+            kernel_files_create(&operation_files, &heap) == KERNEL_FILES_STATUS_OK &&
+            kernel_fs_context_create(&fs, &mount, &heap) == KERNEL_FS_CONTEXT_STATUS_OK, 244);
+        uint64_t address;
+        check(kernel_mm_mmap_anonymous(&sync_mm, OP_USER, 24576, KERNEL_MM_READ | KERNEL_MM_WRITE,
+            KERNEL_MM_MAP_FIXED_NOREPLACE, &address) == KERNEL_MM_STATUS_OK, 245);
+        size_t copied;
+        sync_edit = 1;
+        check(kernel_copy_to_user(&sync_mm, OP_USER, "/write-operation", 17, &copied) == KERNEL_UACCESS_STATUS_OK, 246);
+        memset(payload, 'A', sizeof(payload));
+        check(kernel_copy_to_user(&sync_mm, OP_USER + 4096, payload, 4096, &copied) == KERNEL_UACCESS_STATUS_OK &&
+            kernel_copy_to_user(&sync_mm, OP_USER + 8192, payload, 4096, &copied) == KERNEL_UACCESS_STATUS_OK, 247);
+        memset(payload, 'B', sizeof(payload));
+        check(kernel_copy_to_user(&sync_mm, OP_USER + 16384, payload, 4096, &copied) == KERNEL_UACCESS_STATUS_OK &&
+            kernel_copy_to_user(&sync_mm, OP_USER + 20480, payload, 4096, &copied) == KERNEL_UACCESS_STATUS_OK, 248);
+        sync_edit = 0;
+        int64_t result;
+        uint64_t flags = 2 | 0100 | 01000 | (operation_mode == 0 ? KERNEL_FILES_O_APPEND : 0);
+        check(kernel_files_openat(&operation_files, &fs, &sync_mm, -100, OP_USER,
+            flags | (operation_mode == 3 ? KERNEL_FILES_O_SYNC : 0), 0600, &operation_fd[0]) == KERNEL_FILES_STATUS_OK && operation_fd[0] >= 0 &&
+            kernel_files_openat(&operation_files, &fs, &sync_mm, -100, OP_USER,
+            flags & ~UINT64_C(01000), 0600, &operation_fd[1]) == KERNEL_FILES_STATUS_OK && operation_fd[1] >= 0 &&
+            kernel_vfs_open(&mount, "/write-operation", &observed) == 0, 249);
+        operation_second = OP_USER + 8192;
+        if (!operation_mode) {
+            memset(payload, 'A', sizeof(payload)); size_t written; uint64_t sequence = 0;
+            check(kernel_vfs_pwrite(&observed, 0, payload, 4096, &written) == 0 && written == 4096 &&
+                kernel_vfs_sync(&observed, 0, &sequence) == 0, 250);
+            struct kernel_open_file_description *pin = 0;
+            check(kernel_files_pin(&operation_files, operation_fd[0], &pin, &result) == KERNEL_FILES_STATUS_OK && !result &&
+                kernel_mm_mmap_file_private(&sync_mm, &pin, 0x30000000, 4096, 0, KERNEL_MM_READ,
+                    KERNEL_MM_MAP_FIXED_NOREPLACE, &operation_second) == KERNEL_MM_STATUS_OK && !pin, 251);
+            (void)kernel_page_cache_reclaim(&cache, 64);
+        }
+        struct kernel_uaccess_iovec iov[2] = {{OP_USER + 4096, 4096}, {operation_second, 4096}};
+        sync_edit = 1;
+        check(kernel_copy_to_user(&sync_mm, OP_USER + 128, iov, sizeof(iov), &copied) == KERNEL_UACCESS_STATUS_OK, 252);
+        sync_edit = 0;
+        struct kernel_thread_join writer = {0}, contender = {0};
+        check(kernel_thread_create_joinable(operation_writer, 0, &writer) == KERNEL_SCHEDULER_STATUS_OK, 253);
+        while (!operation_paused) check(kernel_scheduler_yield_current() == KERNEL_SCHEDULER_STATUS_OK, 254);
+        check(kernel_thread_create_joinable(operation_contender, 0, &contender) == KERNEL_SCHEDULER_STATUS_OK, 255);
+        while (!operation_done && (!operation_contender_task || operation_contender_task->state != KERNEL_THREAD_STATE_BLOCKED))
+            check(kernel_scheduler_yield_current() == KERNEL_SCHEDULER_STATUS_OK, 256);
+        if (operation_mode == 3) operation_writer_task->terminate_requested = 1;
+        check(kernel_wait_queue_wake_all(&operation_held) == KERNEL_SCHEDULER_STATUS_OK, 257);
+        kernel_thread_join(&writer); kernel_thread_join(&contender);
+        uint64_t size = kernel_vfs_file_size(&observed);
+        check(size == (operation_mode == 2 ? 0U : operation_mode == 0 ? 20480U : 8192U), 258);
+        for (uint64_t offset = 0; offset < size; offset += 4096) {
+            size_t read;
+            check(kernel_vfs_pread(&observed, offset, payload, 4096, &read) == 0 && read == 4096, 259);
+            unsigned char expected = operation_mode == 0 && offset < 12288 ? 'A' : 'B';
+            for (unsigned i = 0; i < 4096; i++) check(payload[i] == expected, 260);
+        }
+        operation_testing = 0; sync_edit = 0; sync_satp = 0;
+        check(kernel_files_release(&operation_files) == KERNEL_FILES_STATUS_OK &&
+            kernel_mm_release(&sync_mm) == KERNEL_MM_STATUS_OK &&
+            kernel_fs_context_release(&fs) == KERNEL_FS_CONTEXT_STATUS_OK &&
+            kernel_vfs_close(&observed) == 0 &&
+            physical_page_release(&allocator, table.root_address) == PHYSICAL_PAGE_STATUS_OK, 261);
+    }
+    virt_uart_puts("I/O whole write operation passed\n");
+    riscv_interrupt_restore(irq);
 }
 static void print_counters(const char *phase, const struct riscv_virtio_mmio_block_statistics *stats)
 {
@@ -62,6 +337,25 @@ int __wrap_kernel_vfs_node_pread(struct kernel_vfs_node *node, uint64_t offset, 
 int __real_kernel_vfs_node_writeback(struct kernel_vfs_node *, uint64_t, const void *, size_t, size_t *);
 int __wrap_kernel_vfs_node_writeback(struct kernel_vfs_node *node, uint64_t offset, const void *buffer, size_t size, size_t *written)
 {
+    if (instance_hold && kernel_io_context_current()->background_reclaim) {
+        for (unsigned i = 0; i < 2; i++) if (node == instance_nodes[i] && !instance_entered[i]) {
+            instance_entered[i] = 1;
+            enum kernel_wait_wake_reason reason;
+            check(kernel_scheduler_block_current(&instance_held[i], 0, 0, &reason) == KERNEL_SCHEDULER_STATUS_OK, 180);
+        }
+    }
+    if (stop_probe && kernel_io_context_current()->background_reclaim) {
+        stop_probe = 0;
+        stop_entered = 1;
+        enum kernel_wait_wake_reason reason;
+        check(kernel_scheduler_block_current(&held_write, 0, 0, &reason) == KERNEL_SCHEDULER_STATUS_OK, 116);
+    }
+    if (background_fail && kernel_io_context_current()->background_reclaim) {
+        background_fail = 0;
+        failed_offset = offset;
+        *written = 0;
+        return -5;
+    }
     if (write_probe) {
         unsigned char first = *(const unsigned char *)buffer;
         uintptr_t irq = riscv_interrupt_save();
@@ -179,6 +473,7 @@ static void queue_worker(void *argument)
     riscv_interrupt_restore(irq);
 }
 static unsigned timed_out;
+static uint64_t timebase;
 static void timeout_worker(void *argument)
 {
     uintptr_t irq = riscv_interrupt_save();
@@ -189,16 +484,309 @@ static void timeout_worker(void *argument)
     timed_out++;
     riscv_interrupt_restore(irq);
 }
+static void stop_writeback_worker(void *unused)
+{
+    (void)unused;
+    (void)riscv_interrupt_save();
+    while (!stop_entered) check(kernel_scheduler_yield_current() == KERNEL_SCHEDULER_STATUS_OK, 117);
+    stop_called = 1;
+    kernel_page_cache_stop_worker(&cache);
+    stop_done = 1;
+}
+static void instance_yield(void)
+{
+    check(kernel_scheduler_yield_current() == KERNEL_SCHEDULER_STATUS_OK, 181);
+    riscv_interrupt_restore(RISCV_SSTATUS_SIE);
+    (void)riscv_interrupt_save();
+}
+static void instance_write(struct kernel_page_cache *c, struct kernel_vfs_file *f,
+                           unsigned pages)
+{
+    KERNEL_LOCK_SCOPE(guard);
+    kernel_vfs_node_lock(kernel_vfs_file_node(f), &guard, 1);
+    for (unsigned i = 0; i < pages; i++) {
+        size_t written;
+        check(kernel_page_cache_write(c, f, (uint64_t)i * 4096, payload, sizeof(payload),
+                                      &written) == 0 && written == sizeof(payload), 182);
+    }
+}
+static void instance_waiter(void *unused)
+{
+    (void)unused;
+    (void)riscv_interrupt_save();
+    unsigned held = 0;
+    /* 触发 low 压力，同时给真实 ext4 事务留下元数据分配空间。 */
+    uint64_t low = physical_page_total(&allocator) / 50;
+    while (physical_page_available(&allocator) > low) {
+        check(held < 1024 && physical_page_allocate(&allocator, &pressure_pages[held]) == PHYSICAL_PAGE_STATUS_OK, 183);
+        held++;
+    }
+    instance_waiting = 1;
+    allocator.pressure_wait(allocator.pressure_context);
+    instance_wait_done = 1;
+    while (held) check(physical_page_release(&allocator, pressure_pages[--held]) == PHYSICAL_PAGE_STATUS_OK, 184);
+}
+static void instance_stopper(void *unused)
+{
+    (void)unused;
+    (void)riscv_interrupt_save();
+    while (!instance_entered[1]) instance_yield();
+    instance_stop_called = 1;
+    kernel_page_cache_stop_worker(&instance_peer);
+    if (instance_peer_pin) {
+        check(physical_page_release(&allocator, instance_peer_pin) == PHYSICAL_PAGE_STATUS_OK, 206);
+        instance_peer_pin = 0;
+    }
+    check(kernel_page_cache_destroy(&instance_peer) == KERNEL_PAGE_CACHE_STATUS_OK, 185);
+    instance_stop_done = 1;
+}
+static void cache_instances_probe(void)
+{
+    struct kernel_vfs_file files[2] = {{0}, {0}};
+    struct kernel_page_cache_statistics a, b, a_after, b_after;
+    struct kernel_memory_statistics memory;
+    (void)kernel_page_cache_reclaim(&cache, UINT64_MAX);
+    kernel_page_cache_get_statistics(&cache, &a);
+    check(!a.current_pages, 186);
+    check(kernel_page_cache_init(&instance_peer, &heap, &allocator) == KERNEL_PAGE_CACHE_STATUS_OK &&
+          kernel_vfs_create(&mount, "/instance-root", 0600, &files[0]) == 0 &&
+          kernel_vfs_create(&mount, "/instance-peer", 0600, &files[1]) == 0, 187);
+    /* 两个不同 inode 各由一个 cache 拥有，后端仍是真实 ext4。 */
+    instance_write(&cache, &files[0], 2);
+    instance_write(&instance_peer, &files[1], 2);
+    kernel_memory_snapshot(&allocator, &memory);
+    uint64_t low = physical_page_total(&allocator) / 50 * 4096;
+    check(memory.cached == 4 * 4096 && memory.dirty == 4 * 4096 &&
+          !memory.writeback && memory.reclaimable == 4 * 4096 &&
+          memory.available == memory.free - low + memory.reclaimable / 2, 188);
+    check(kernel_page_cache_writeback(&cache, kernel_vfs_file_node(&files[0])) == 0 &&
+          kernel_page_cache_writeback(&instance_peer, kernel_vfs_file_node(&files[1])) == 0, 189);
+    kernel_memory_snapshot(&allocator, &memory);
+    check(memory.cached == 4 * 4096 && !memory.dirty, 190);
+    check(allocator.reclaimer(allocator.reclaimer_context, 1) == 1 &&
+          allocator.reclaimer(allocator.reclaimer_context, 1) == 1, 191);
+    kernel_page_cache_get_statistics(&cache, &a);
+    kernel_page_cache_get_statistics(&instance_peer, &b);
+    check(a.current_pages == 1 && b.current_pages == 1, 192);
+    /* 每个实例单独低于 10%，合计超过 10% 才能请求两边的 worker。 */
+    unsigned pages = (unsigned)(physical_page_total(&allocator) / 20 + 8);
+    check(pages < physical_page_total(&allocator) / 10, 193);
+    instance_write(&cache, &files[0], pages);
+    instance_write(&instance_peer, &files[1], pages);
+    kernel_memory_snapshot(&allocator, &memory);
+    check(memory.dirty == (uint64_t)pages * 2 * 4096, 194);
+    check(kernel_page_cache_start_worker(&cache) == 0 && kernel_page_cache_start_worker(&instance_peer) == 0, 195);
+    uint64_t deadline = riscv_time_read() + 10 * timebase;
+    do { instance_yield(); kernel_memory_snapshot(&allocator, &memory); }
+    while (memory.dirty > physical_page_total(&allocator) / 20 * 4096 && riscv_time_read() < deadline);
+    kernel_page_cache_get_statistics(&cache, &a_after);
+    kernel_page_cache_get_statistics(&instance_peer, &b_after);
+    check(memory.dirty <= physical_page_total(&allocator) / 20 * 4096 &&
+          a_after.worker_written > a.worker_written && b_after.worker_written > b.worker_written, 196);
+    kernel_page_cache_stop_worker(&cache);
+    kernel_page_cache_stop_worker(&instance_peer);
+    (void)kernel_page_cache_reclaim(&cache, UINT64_MAX);
+    (void)kernel_page_cache_reclaim(&instance_peer, UINT64_MAX);
+    for (unsigned pass = 0; pass < 2; pass++) {
+        if (pass) {
+            instance_peer = (struct kernel_page_cache){0};
+            check(kernel_page_cache_init(&instance_peer, &heap, &allocator) == KERNEL_PAGE_CACHE_STATUS_OK, 207);
+        }
+        instance_entered[0] = instance_entered[1] = instance_waiting = instance_wait_done = 0;
+        instance_stop_called = instance_stop_done = 0;
+        instance_write(&cache, &files[0], 1);
+        instance_write(&instance_peer, &files[1], 1);
+        if (!pass) {
+            size_t valid;
+            check(kernel_page_cache_get(&instance_peer, &files[1], 0, &instance_peer_pin, &valid) == KERNEL_PAGE_CACHE_STATUS_OK, 208);
+        }
+        instance_nodes[0] = kernel_vfs_file_node(&files[0]);
+        instance_nodes[1] = kernel_vfs_file_node(&files[1]);
+        for (unsigned i = 0; i < 2; i++) kernel_wait_queue_init(&instance_held[i]);
+        instance_hold = 1;
+        check(kernel_page_cache_start_worker(&instance_peer) == 0 && kernel_page_cache_start_worker(&cache) == 0, 197);
+        struct kernel_thread_join waiter = {0}, stopper = {0};
+        check(kernel_thread_create_joinable(instance_stopper, 0, &stopper) == KERNEL_SCHEDULER_STATUS_OK &&
+              kernel_thread_create_joinable(instance_waiter, 0, &waiter) == KERNEL_SCHEDULER_STATUS_OK, 198);
+        deadline = riscv_time_read() + 10 * timebase;
+        while ((!instance_entered[0] || !instance_entered[1] || !instance_stop_called) && riscv_time_read() < deadline)
+            instance_yield();
+        check(instance_entered[0] && instance_entered[1] && instance_waiting &&
+              instance_stop_called && !instance_stop_done && !instance_wait_done, 199);
+        kernel_memory_snapshot(&allocator, &memory);
+        check(memory.cached == 2 * 4096 && memory.writeback == 2 * 4096 && memory.dirty == 2 * 4096, 200);
+        if (!pass) {
+            /* peer 页被外部 pin，worker 完成没有释放进展；销毁 peer 时 waiter 仍等 root。 */
+            check(kernel_wait_queue_wake_all(&instance_held[1]) == KERNEL_SCHEDULER_STATUS_OK, 209);
+            deadline = riscv_time_read() + 10 * timebase;
+            while (!instance_stop_done && riscv_time_read() < deadline) instance_yield();
+            check(instance_stop_done && !instance_wait_done, 210);
+            check(kernel_wait_queue_wake_all(&instance_held[0]) == KERNEL_SCHEDULER_STATUS_OK, 211);
+        } else {
+            /* peer 正在 stop/join 且 I/O 未完成；root 的首次释放必须唤醒共同等待者。 */
+            check(kernel_wait_queue_wake_all(&instance_held[0]) == KERNEL_SCHEDULER_STATUS_OK, 201);
+            deadline = riscv_time_read() + 10 * timebase;
+            while (!instance_wait_done && riscv_time_read() < deadline) instance_yield();
+            check(instance_wait_done && !instance_stop_done, 202);
+            check(kernel_wait_queue_wake_all(&instance_held[1]) == KERNEL_SCHEDULER_STATUS_OK, 203);
+        }
+        kernel_thread_join(&waiter); kernel_thread_join(&stopper);
+        instance_hold = 0;
+        check(instance_stop_done && allocator.pressure_wait && allocator.pressure_notify, 204);
+        /* peer 注销后，真实 root worker 仍能收到压力请求并完成。 */
+        allocator.pressure_wait(allocator.pressure_context);
+        kernel_page_cache_stop_worker(&cache);
+        (void)kernel_page_cache_reclaim(&cache, UINT64_MAX);
+    }
+    check(kernel_vfs_close(&files[0]) == 0 && kernel_vfs_close(&files[1]) == 0, 205);
+}
+static void background_writeback_probe(void *unused)
+{
+    (void)unused;
+    uintptr_t irq = riscv_interrupt_save();
+    struct kernel_vfs_file target = {0};
+    check(kernel_vfs_create(&mount, "/background", 0600, &target) == 0, 90);
+    /* 分别耗尽快照页和线程构造资源；启动失败必须完整回滚。 */
+    unsigned startup_held = 0;
+    while (startup_held < 1024 && physical_page_allocate(&allocator,
+                &pressure_pages[startup_held]) == PHYSICAL_PAGE_STATUS_OK) startup_held++;
+    check(startup_held && startup_held < 1024 && !physical_page_available(&allocator), 111);
+    check(kernel_page_cache_start_worker(&cache) == -12 && !physical_page_available(&allocator), 112);
+    check(physical_page_release(&allocator, pressure_pages[--startup_held]) == PHYSICAL_PAGE_STATUS_OK, 113);
+    check(kernel_page_cache_start_worker(&cache) == -12 && physical_page_available(&allocator) == 1, 114);
+    while (startup_held) check(physical_page_release(&allocator,
+                pressure_pages[--startup_held]) == PHYSICAL_PAGE_STATUS_OK, 115);
+    check(kernel_page_cache_start_worker(&cache) == 0, 91);
+    struct kernel_page_cache peer = {0};
+    check(kernel_page_cache_init(&peer, &heap, &allocator) == KERNEL_PAGE_CACHE_STATUS_OK &&
+          kernel_page_cache_start_worker(&peer) == 0, 163);
+    allocator.pressure_wait(allocator.pressure_context);
+    kernel_page_cache_stop_worker(&peer);
+    check(allocator.pressure_wait && allocator.pressure_notify, 164);
+    check(kernel_page_cache_destroy(&peer) == KERNEL_PAGE_CACHE_STATUS_OK, 165);
+    check(allocator.pressure_wait && allocator.pressure_notify, 166);
+
+    /* 没有候选的一轮必须返回并休眠，不能自行反复扫描。 */
+    allocator.pressure_wait(allocator.pressure_context);
+    struct kernel_page_cache_statistics empty_before, empty_after;
+    kernel_page_cache_get_statistics(&cache, &empty_before);
+    for (unsigned i = 0; i < 8; i++)
+        check(kernel_scheduler_yield_current() == KERNEL_SCHEDULER_STATUS_OK, 127);
+    kernel_page_cache_get_statistics(&cache, &empty_after);
+    check(empty_before.worker_scanned == empty_after.worker_scanned &&
+          empty_before.worker_written == empty_after.worker_written, 128);
+    background_fail = 1;
+    unsigned pages = (unsigned)(physical_page_total(&allocator) / 10 + 16);
+    for (unsigned i = 0; i < pages; i++) {
+        size_t written;
+        memset(payload, (int)(i % 251 + 1), sizeof(payload));
+        check(kernel_vfs_pwrite(&target, (uint64_t)i * sizeof(payload), payload,
+                               sizeof(payload), &written) == 0 && written == sizeof(payload), 92);
+    }
+    struct kernel_memory_statistics memory;
+    uint64_t deadline = riscv_time_read() + 10 * timebase;
+    do {
+        check(kernel_scheduler_yield_current() == KERNEL_SCHEDULER_STATUS_OK, 93);
+        kernel_memory_snapshot(&allocator, &memory);
+        riscv_interrupt_restore(irq | RISCV_SSTATUS_SIE);
+        (void)riscv_interrupt_save();
+    } while (memory.dirty > physical_page_total(&allocator) / 20 * 4096 && riscv_time_read() < deadline);
+    check(memory.dirty <= physical_page_total(&allocator) / 20 * 4096, 94);
+    struct kernel_page_cache_statistics worker_stats = {0};
+    kernel_page_cache_get_statistics(&cache, &worker_stats);
+    check(!background_fail && worker_stats.worker_failed == 1 && worker_stats.worker_written > 0, 100);
+    check(worker_stats.worker_batches > 1 &&
+          worker_stats.worker_scanned <= worker_stats.worker_batches * 64, 125);
+    struct riscv_virtio_mmio_block_statistics query_before, query_after;
+    riscv_virtio_mmio_block_get_statistics(&device, &query_before);
+    kernel_memory_snapshot(&allocator, &memory);
+    riscv_virtio_mmio_block_get_statistics(&device, &query_after);
+    check(query_before.requests == query_after.requests && memory.available <= memory.total &&
+          memory.dirty <= memory.cached && memory.writeback <= memory.cached, 126);
+    /* 改写失败页只允许重试，不能提前把它计入可回收预算。 */
+    kernel_memory_snapshot(&allocator, &memory);
+    uint64_t reclaimable_before = memory.reclaimable;
+    size_t changed;
+    check(kernel_vfs_pwrite(&target, failed_offset, "R", 1, &changed) == 0 && changed == 1, 109);
+    kernel_memory_snapshot(&allocator, &memory);
+    check(memory.reclaimable == reclaimable_before, 110);
+    uint64_t seq = 0;
+    check(kernel_vfs_sync(&target, 0, &seq) == -5, 101);
+    check(kernel_vfs_sync(&target, 0, &seq) == 0, 95);
+    unsigned held = 0;
+    uint64_t pinned;
+    size_t valid;
+    check(kernel_page_cache_get(&cache, &target, 0, &pinned, &valid) == KERNEL_PAGE_CACHE_STATUS_OK, 102);
+    while (physical_page_available(&allocator) > physical_page_total(&allocator) / 50) {
+        check(held < 1024 && physical_page_allocate(&allocator, &pressure_pages[held]) == PHYSICAL_PAGE_STATUS_OK, 103);
+        held++;
+    }
+    deadline = riscv_time_read() + 10 * timebase;
+    while (physical_page_available(&allocator) < physical_page_total(&allocator) / 25 && riscv_time_read() < deadline) {
+        check(kernel_scheduler_yield_current() == KERNEL_SCHEDULER_STATUS_OK, 104);
+        riscv_interrupt_restore(irq | RISCV_SSTATUS_SIE);
+        (void)riscv_interrupt_save();
+    }
+    check(physical_page_available(&allocator) >= physical_page_total(&allocator) / 25, 105);
+    uint32_t references;
+    check(physical_page_reference_count(&allocator, pinned, &references) == PHYSICAL_PAGE_STATUS_OK && references == 2, 106);
+    check(physical_page_release(&allocator, pinned) == PHYSICAL_PAGE_STATUS_OK, 107);
+    while (held) check(physical_page_release(&allocator, pressure_pages[--held]) == PHYSICAL_PAGE_STATUS_OK, 108);
+    kernel_page_cache_stop_worker(&cache);
+    /* 暂扣在途写回，stop 必须等待它完成且不能继续提交本批其他页。 */
+    for (unsigned i = 0; i < pages; i++) {
+        size_t n;
+        memset(payload, (int)(i % 251 + 1), sizeof(payload));
+        check(kernel_vfs_pwrite(&target, (uint64_t)i * sizeof(payload), payload,
+                               sizeof(payload), &n) == 0 && n == sizeof(payload), 118);
+    }
+    kernel_wait_queue_init(&held_write);
+    stop_probe = 1;
+    kernel_page_cache_get_statistics(&cache, &worker_stats);
+    uint64_t writes_before_stop = worker_stats.worker_written;
+    check(kernel_page_cache_start_worker(&cache) == 0, 119);
+    struct kernel_thread_join stopper = {0};
+    check(kernel_thread_create_joinable(stop_writeback_worker, 0, &stopper) == KERNEL_SCHEDULER_STATUS_OK, 120);
+    while (!stop_called) check(kernel_scheduler_yield_current() == KERNEL_SCHEDULER_STATUS_OK, 121);
+    check(stop_entered && !stop_done, 122);
+    check(kernel_wait_queue_wake_all(&held_write) == KERNEL_SCHEDULER_STATUS_OK, 123);
+    kernel_thread_join(&stopper);
+    kernel_page_cache_get_statistics(&cache, &worker_stats);
+    check(stop_done && worker_stats.worker_written == writes_before_stop + 1, 124);
+    (void)kernel_page_cache_reclaim(&cache, UINT64_MAX);
+    size_t count;
+    check(kernel_vfs_pread(&target, (uint64_t)(pages - 1) * 4096, payload, sizeof(payload), &count) == 0 &&
+          count == sizeof(payload) && payload[0] == (pages - 1) % 251 + 1 && payload[4095] == payload[0], 96);
+    check(kernel_vfs_close(&target) == 0, 97);
+    cache_instances_probe();
+    riscv_interrupt_restore(irq);
+}
 static void cleanup_worker(void *argument)
 {
     (void)argument;
     uintptr_t irq = riscv_interrupt_save();
     for (unsigned i = 0; i < 2; i++) check(kernel_vfs_close(&cold[i]) == 0, 38);
-    check(kernel_vfs_close(&file) == 0 && kernel_vfs_unmount(&mount) == 0 &&
-          kernel_page_cache_destroy(&cache) == KERNEL_PAGE_CACHE_STATUS_OK &&
-          riscv_virtio_mmio_block_destroy(&device) == RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK, 15);
+    check(kernel_vfs_close(&file) == 0, 150);
+    int unmounted = kernel_vfs_unmount(&mount);
+    if (unmounted) { virt_uart_puts("unmount result="); virt_uart_put_hex((unsigned long)unmounted); virt_uart_putc('\n'); }
+    check(unmounted == 0, 151);
+    check(kernel_page_cache_destroy(&cache) == KERNEL_PAGE_CACHE_STATUS_OK, 152);
+    check(riscv_virtio_mmio_block_destroy(&device) == RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK, 153);
     riscv_interrupt_restore(irq);
 }
+#if BOAROS_COST_DIAGNOSTICS
+static void cost_finish(const char *name, unsigned epoch)
+{
+    check(kernel_cost_end(1, 0) == 0, 212);
+    char *report;
+    check(kernel_heap_allocate(&heap, kernel_cost_format_capacity(), (void **)&report) == KERNEL_HEAP_STATUS_OK, 213);
+    check(kernel_cost_format(report, kernel_cost_format_capacity()) > 0, 214);
+    virt_uart_puts("COST SNAPSHOT "); virt_uart_puts(name); virt_uart_putc(' ');
+    virt_uart_putc((char)('0' + epoch)); virt_uart_putc('\n');
+    virt_uart_puts(report); virt_uart_puts("COST END\n");
+    check(kernel_heap_release(&heap, report) == KERNEL_HEAP_STATUS_OK, 215);
+}
+#endif
 void kernel_main(unsigned long hart, const void *dtb)
 {
     (void)hart;
@@ -211,7 +799,17 @@ void kernel_main(unsigned long hart, const void *dtb)
           physical_page_allocator_finalize(&allocator) == PHYSICAL_PAGE_STATUS_OK &&
           kernel_heap_init(&heap, &allocator, physical) == KERNEL_HEAP_STATUS_OK, 2);
     uint64_t baseline = physical_page_available(&allocator);
+    timebase = info.timebase_frequency;
     check(kernel_page_cache_init(&cache, &heap, &allocator) == KERNEL_PAGE_CACHE_STATUS_OK, 3);
+    /* 同 allocator 的第二缓存必须可独立注册、注销；不改变首缓存统计。 */
+    struct kernel_page_cache second_cache = {0};
+    check(kernel_page_cache_init(&second_cache, &heap, &allocator) == KERNEL_PAGE_CACHE_STATUS_OK, 160);
+    struct kernel_memory_statistics two_caches;
+    kernel_memory_snapshot(&allocator, &two_caches);
+    uint64_t low_bytes = (physical_page_total(&allocator) / 50) * BOAROS_PAGE_SIZE;
+    check(two_caches.available == (two_caches.free > low_bytes ? two_caches.free - low_bytes : 0), 161);
+    check(kernel_page_cache_destroy(&second_cache) == KERNEL_PAGE_CACHE_STATUS_OK, 162);
+
     int found = 0;
     for (unsigned i = 0; i < info.virtio_mmio_count; i++)
         if (riscv_virtio_mmio_block_init(&device, (void *)(uintptr_t)info.virtio_mmio[i].base,
@@ -227,6 +825,9 @@ void kernel_main(unsigned long hart, const void *dtb)
           kernel_vfs_sync(&file, 0, &sequence) == 0, 5);
     check(kernel_page_cache_reclaim(&cache, 64) != 0, 6);
     check(kernel_scheduler_init(&allocator, (uintptr_t)__boot_stack_bottom, (uintptr_t)__boot_stack_top) == KERNEL_SCHEDULER_STATUS_OK, 7);
+#if BOAROS_COST_DIAGNOSTICS
+    check(kernel_cost_begin(1, info.timebase_frequency, 1, 0) == 0, 210);
+#endif
     loading_probe = 1;
     for (uintptr_t i = 0; i < 2; i++) check(kernel_thread_create(reader, (void *)i) == KERNEL_SCHEDULER_STATUS_OK, 8);
     for (unsigned i = 0; i < 2; i++) {
@@ -332,6 +933,30 @@ void kernel_main(unsigned long hart, const void *dtb)
     riscv_virtio_mmio_block_get_statistics(&device, &stats);
     check(queue_done == 10 && stats.max_inflight == 8 && stats.queue_waits >= 2, 56);
     print_counters("queue", &stats);
+    check(kernel_thread_create(background_writeback_probe, 0) == KERNEL_SCHEDULER_STATUS_OK, 98);
+    for (;;) {
+        uintptr_t irq = riscv_interrupt_save();
+        check(kernel_scheduler_yield_current() == KERNEL_SCHEDULER_STATUS_OK, 99);
+        struct kernel_thread_completion completion;
+        if (kernel_scheduler_reap_one(&completion) == KERNEL_SCHEDULER_STATUS_OK) break;
+        riscv_interrupt_restore(irq | RISCV_SSTATUS_SIE);
+    }
+    check(kernel_thread_create(sync_source_probe, 0) == KERNEL_SCHEDULER_STATUS_OK, 233);
+    for (;;) {
+        uintptr_t irq = riscv_interrupt_save();
+        check(kernel_scheduler_yield_current() == KERNEL_SCHEDULER_STATUS_OK, 234);
+        struct kernel_thread_completion completion;
+        if (kernel_scheduler_reap_one(&completion) == KERNEL_SCHEDULER_STATUS_OK) break;
+        riscv_interrupt_restore(irq | RISCV_SSTATUS_SIE);
+    }
+    check(kernel_thread_create(whole_write_probe, 0) == KERNEL_SCHEDULER_STATUS_OK, 262);
+    for (;;) {
+        uintptr_t irq = riscv_interrupt_save();
+        check(kernel_scheduler_yield_current() == KERNEL_SCHEDULER_STATUS_OK, 263);
+        struct kernel_thread_completion completion;
+        if (kernel_scheduler_reap_one(&completion) == KERNEL_SCHEDULER_STATUS_OK) break;
+        riscv_interrupt_restore(irq | RISCV_SSTATUS_SIE);
+    }
     check(kernel_thread_create(cleanup_worker, 0) == KERNEL_SCHEDULER_STATUS_OK, 47);
     for (;;) {
         uintptr_t irq = riscv_interrupt_save();
@@ -342,12 +967,18 @@ void kernel_main(unsigned long hart, const void *dtb)
     }
 
     check(physical_page_available(&allocator) == baseline, 16);
+#if BOAROS_COST_DIAGNOSTICS
+    cost_finish("pressure-io", 1);
+#endif
     volatile void *mmio = device.mmio;
     uint64_t mmio_size = device.mmio_size;
     device = (struct riscv_virtio_mmio_block){0};
     check(riscv_virtio_mmio_block_init(&device, mmio, mmio_size, &allocator, dma,
                                       info.timebase_frequency) == RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK &&
           riscv_virtio_mmio_block_enable_irq(&device, source), 62);
+#if BOAROS_COST_DIAGNOSTICS
+    check(kernel_cost_begin(1, info.timebase_frequency, 1, 0) == 0, 211);
+#endif
     virt_uart_puts("I/O handshake: timeout\n");
     while (!virt_uart_rx_ready()) { }
     check(virt_uart_getc() == 'g', 63);
@@ -368,5 +999,8 @@ void kernel_main(unsigned long hart, const void *dtb)
     check(timed_out == 8 && stats.timeouts == 1 && !stats.runtime_polls &&
           riscv_virtio_mmio_block_destroy(&device) == RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK &&
           physical_page_available(&allocator) == baseline, 67);
+#if BOAROS_COST_DIAGNOSTICS
+    cost_finish("timeout-cancel", 2);
+#endif
     virt_uart_puts("BoarOS: I/O sleep tests passed\n"); sbi_shutdown();
 }

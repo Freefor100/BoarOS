@@ -8,7 +8,7 @@
 - `references/linux/drivers/block/virtio_blk.c`、`fs/read_write.c`、`fs/file.c`，commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`：FLUSH 缺失时的 write-through、定位/共享 offset 接口参考。
 - `references/riscv/riscv-privileged-20260120.pdf`，版本 20260120，SHA-256 `d0f818af6fa519d39e68f822aa795bff9f38032a2f352afdf43e91c0d480e408`：supervisor external interrupt 与本地地址空间契约。来源固定于 `references/sources.tsv`。
 
-范围仅 RV64、QEMU virt、单 hart、legacy/modern VirtIO。QEMU 同步 reset 必须读回零后才允许释放 DMA owner；异步实板 reset、SMP、多写事务、后台写回和事务合并均未实现。
+本文前半记录 2026-09-28 单 hart 可睡眠 I/O 阶段；后台写回和多磁盘随后已交付，当前契约见 [VFS/ext4](../modules/vfs-ext4.md)。范围仍限 RV64、QEMU virt、单 hart、legacy/modern VirtIO。QEMU 同步 reset 必须读回零后才允许释放 DMA owner；异步实板 reset、SMP、同实例并发写事务和事务合并尚未实现。
 
 ## 所有权与失败路径
 
@@ -33,10 +33,11 @@ lwext4 纯读使用局部游标 `ext4_fpread`；同块缓存 loading 合并，�
 - 完整 WAL 验证暴露旧故障启用的信号竞态：probe 为 43 事件，另一次仅 42，末端 cut 永远不会触发。`SIGUSR1` 与客体放行之间缺少后端确认，启用边界会漂移。增加通用 `arm` 控制命令，等待 `control=arm` 后才发客体许可；host 红测先验证旧协议无法在 NBD 空闲时确认，新协议和末端抽样通过后重跑 DELETE/WAL 完整矩阵。
 - NBD arm/hold/release/drain 是协议握手，未用固定宿主 sleep 推断完成。QEMU 可把相邻读合并为一个 NBD 请求，因此并发门槛显式关闭 request-merging；普通测试不更改内核合并行为。
 - 高半区切换后继续使用编译器保存在寄存器里的物理栈指针曾造成启动 fault。把 DTB 存储探测放入 noinline 调用，避免该指针跨地址切换存活；无盘不创建额外 cleanup task，有盘在资源基线快照前创建。
+- 2026-09-29 的 GitHub Actions [run #35](https://github.com/Freefor100/BoarOS/actions/runs/36510992587) 在 legacy 队列收到八个 NBD 写响应后停止前进，另一次离线 GCC 冷启动在块轮询阶段报一秒 timeout。旧驱动先读取 used index，处理完后才写 MMIO ACK；固定 QEMU `references/qemu/hw/virtio/virtio-mmio.c`（commit `84f07211cc5b4fc6a371559bf8a5de4fb068e648`）对 ACK 清除 ISR 位，后到的完成可能被清掉而未被收割。固定 Linux `references/linux/drivers/virtio/virtio_mmio.c`（commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`）先 ACK 再调用队列回调。现改为 ACK 后取 used index，并在轮询及期限唤醒时先收割已发布完成再判超时。复核：`make test-io-sleep-riscv test-block-riscv test-block-host test-offline-c-riscv`，以及 RISC-V、规模、userland、679 项差分、glibc、SQLite DELETE/WAL 和栈检查均通过；Ubuntu 24.04/QEMU 8.2.2 容器中 legacy 队列连续 30 次、离线 GCC 冷启动 5 次通过。[后续 run #36](https://github.com/Freefor100/BoarOS/actions/runs/36513240987) 的可睡眠 I/O 门槛通过，但离线 GCC 的启动轮询仍超时，证明两种故障不能合并归因；后者见[离线工具链记录](offline-toolchain-probe.md)。
 
-## 最终内核与常规验收
+## 2026-09-28 阶段验收
 
-最终生产内核 SHA-256 `5565ddce40a9ade4fac4f7a2191aa5b136b3cc456e92873ab6ef4be3abe9d8cb`；NBD 服务 `356cbb5d10fbe590087eda1f4bc9421f3d56c39bb4f82afd289a97fa4c18bfb1`。RISC-V 全套、真实 static/pthread userland、548 条 Linux 差分、glibc 五种形态、SQLite DELETE/WAL、离线 GCC 五阶段通过。编译器栈检查覆盖 1357 函数，最大 2368 字节（DTB IRQ 解析）；真实 userland 最低剩余栈为 4760/5680 字节。lwIP、record-lock、allocator-release、block、NBD、lwext4 host 与执行器 27＋18 项通过。
+该阶段生产内核 SHA-256 `5565ddce40a9ade4fac4f7a2191aa5b136b3cc456e92873ab6ef4be3abe9d8cb`；NBD 服务 `356cbb5d10fbe590087eda1f4bc9421f3d56c39bb4f82afd289a97fa4c18bfb1`。RISC-V 全套、真实 static/pthread userland、548 条 Linux 差分、glibc 五种形态、SQLite DELETE/WAL、离线 GCC 五阶段通过。编译器栈检查覆盖 1357 函数，最大 2368 字节（DTB IRQ 解析）；真实 userland 最低剩余栈为 4760/5680 字节。lwIP、record-lock、allocator-release、block、NBD、lwext4 host 与执行器 27＋18 项通过。
 
 规模成本保持：对齐 1 MiB 写入为 256 分块/256 用户页解析；16/64 MiB resident 探测为 6210/24519（3.95 倍）；单页改权各访问 3 级 PTE，地址失效逐页一次、全局失效为零。
 
@@ -72,3 +73,22 @@ make prune-build
 ```
 
 PR CI 增加可睡眠存储并发门槛，失败保存 guest/server 日志和磁盘镜像。DELETE/WAL 完整恢复沿用每周一北京时间 02:00 与手动 workflow，固定输入校验不变；glibc 仍严格本地验收。未 push，未运行托管 GitHub Actions；本地执行上述入口验证实现。
+
+## 默认 RT 带宽下的存储进展
+
+`tests/multi-disk-io-riscv.py --rt-load` 是独立的无故障组合模式，不替代原暂扣 B、错误隔离与断电恢复矩阵。用户程序逐轮创建 FIFO、RR 的持续可运行子任务，明确设置默认 950000/1000000 微秒全局预算；子任务在循环中不 yield、不 sleep，普通父任务的计算和双盘 I/O 因而依赖普通类获得预算余量。
+
+每轮 host 在放行父任务前让两台 NBD 进入 hold。检测到每台盘的真实 READ 后立即 drain，不用固定主机 sleep 消耗设备超时；读回内容由 guest 验证。只有普通父任务确认两盘同步写入/读回、host 同时观察两盘成功 WRITE/FLUSH 后，才允许父任务停止 RT 子任务。随后验证 wait 回收、动态盘卸载、根退出的堆/页/任务栈基线；QEMU 退出后独立 dump 两盘检查字节，并运行 `e2fsck -fn`。这证明组合进展和资源回收，不把 QEMU 墙钟作为实时延迟保证，也不宣称两盘请求必定同时在途。
+
+固定 musl 1.2.5 的 `src/sched/sched_setscheduler.c` 包装器直接返回 ENOSYS；出处为 `references/musl/musl-1.2.5.tar.gz`，SHA-256 `a9a118bbe84d8764da0ea0d28b3ab3fae8477fc7e4085d90102b8596fc7c75e4`。该验收程序明确使用 `syscall(SYS_sched_setscheduler, ...)` 进入内核，避免将 libc 包装器存根误判为内核调度失败。NBD 的普通 event 日志只记录 WRITE/FLUSH，READ 的实际请求由既有 hold/drain 协议证明。
+
+本阶段最终内核 SHA-256 `be5ca22629c904a427241b0f92e9d561d0312952e787ab75870ec4beae0143b3` 与用户 ELF `99db95d4a1c4052fc3fee682922593c45c0d34d7682783eec97f0a98c909e46b` 已完整通过 legacy/modern × writeback/writethrough 四组合；每组合各执行 FIFO、RR 一轮。每次退出均释放 6 个任务栈，最小空余 4360 字节、最大使用 3816 字节，且通过双盘持久字节、fsck 和根页/堆基线检查。可重建入口为 `make test-multi-disk-rt-riscv`；独立指定内核及 ELF 时使用 `python3 -B tests/multi-disk-io-riscv.py --rt-load --kernel <kernel> --program <multi-disk-io-rv>`。这份 RT 组合结果不代替独立存储故障/恢复矩阵的证据。
+
+## 整次写操作的互斥边界（2026-09-30）
+
+只保护每个存储 chunk 仍会允许不同 OFD 在 usercopy 等待时把一条追加记录拆开。BoarOS 在 OFD offset 与 namespace/inode 锁之间增加每 inode 操作门闩，覆盖整次 write/writev/pwrite 和同步收尾，truncate 亦参与。门闩不会被 fault 或 writeback 取得，用户复制不持 inode 数据锁；同 inode 的映射输入可以先缺页再进入写入。保留页级 staging、部分接受字节与所属层错误，不把互斥写成断电原子性。固定 Linux 依据为 `references/linux/mm/filemap.c::generic_file_write_iter` 与 `fs/read_write.c`，commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`。
+
+`make test-io-sleep-riscv` 使用实际调度器和 VFS/MM/uaccess，在第一块接受、第二块复制前暂停写者，再运行独立 OFD 的追加/定位写/截断；旧实现得到交错内容，门闩版本完整通过 legacy/modern × writeback/writethrough。追加的第二向量使用同 inode 尚未驻留的文件映射，并走真实冷页装载；fixture 仅模型化未激活测试 MM 的 satp，VFS/调度等待在真实 hart 上执行。另检查 O_SYNC 和等待期间的终止请求。实际 U-mode 的 `tests/userland/write_operations.h` 验证不同 OFD 的 8 KiB 向量记录和同 inode 映射输入；原 partial-write 用例继续保护短写、EFAULT/EIO 与资源基线。SQLite WAL 和重启已双侧通过，当前内核的完整恢复矩阵亦通过，固定输入和事件覆盖见[恢复记录](record-lock-sqlite-recovery.md)。操作锁包含用户复制等待，成本/公平性仍需实测。
+
+2026-09-30 的最终 C0–C6 测量、观测扰动、消费者阻塞及优化候选见[成本基线](cost-baseline.md)，
+完整可验证计数和原消费者输出见[测量归档](cost-measurements.json)。这是主线成本诊断，未重跑评测分支原judge。
