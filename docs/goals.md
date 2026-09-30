@@ -305,11 +305,13 @@ C1 阶段证据：modern/writeback 的观测开/关各三个独立启动，36 �
 - [x] `make test-cost-riscv COST_CASE=consumer` 与最终 `make test-cost-riscv COST_CASE=all` 输出全部阶段、输入身份和观测开/关对照，三个独立启动副本均有完整结果。
 - [x] 汇总每项主成本与未解释余量，报告重复分布、观测开销和无收益结果；只有因果对照支持时，提出 2–3 个对应瓶颈的候选，由维护者选择一次优化。
 - [x] 测量代码收口运行 `make test-riscv test-userland-riscv test-glibc-riscv test-diff-abi-riscv test-scale-riscv test-io-sleep-riscv test-stack-usage`，以及 SQLite DELETE/WAL 正常与选定错误恢复。后续实际修改写回、事务或队列时再跑两种完整恢复矩阵与双盘隔离。
-- [x] 每个 C 任务独立验证/提交，使用 `Co-authored-by: GPT-6.1 Sol <codex@openai.com>`；固定输入和结论入 Git 后 `python3 -B tests/prune-build.py`、`make prune-build`。完整 Harness 的 kernel-la 阻塞继续单列；最终独立审查无新增 P1/P2，核对后已清理50个临时路径，保留cost与固定Linux可复用缓存。
+- [x] 每个 C 任务独立验证/提交，使用 `Co-authored-by: GPT-6.1 Sol <codex@openai.com>`；固定输入和结论入 Git 后 `python3 -B tests/prune-build.py`、`make prune-build`。完整 Harness 的 kernel-la 阻塞继续单列；历史20配置矩阵的独立审查无新增 P1/P2，核对后清理50个临时路径；本次续测的新审查修正见下。
 
 本次消费者续测收口另有新的全改动独立审查：实际证据与数字正确，发现两项P2门禁缺口，
 均先红测再修复，18项报告检查及新旧归档验证通过；没有剩余Critical/Important。
 默认musl/glibc/栈及兼容PID1配置交替门禁重新通过，完整长时门禁的历史范围不被冒充成这次重跑。
+新证据入Git并复核后，预览并清理六个一次性运行/镜像/日志/栈目录；剩余清理候选为零，
+保留cost、用户程序及固定Linux可复用缓存，返回main并恢复默认构建。
 
 依赖为 C0 → C1/C3/C4，C1 → C2，C2/C3/C4 → C5，全部测量 → C6。下一轮的结构优化需从报告中三个候选重新确认。
 
