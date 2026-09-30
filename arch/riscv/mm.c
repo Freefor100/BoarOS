@@ -2240,6 +2240,7 @@ enum kernel_mm_status kernel_mm_shmat(
     struct kernel_vma vma;
     struct kernel_vma_edit edit;
     struct riscv_kernel_mm_shared_anon *shared_entry = 0;
+    struct kernel_memory_object *temporary_owner = 0;
     uint64_t aligned_length;
     uint64_t start;
     uint64_t end;
@@ -2322,16 +2323,19 @@ enum kernel_mm_status kernel_mm_shmat(
             KERNEL_MEMORY_OBJECT_OK) {
             return KERNEL_MM_STATUS_STATE;
         }
+        /* 新取得的引用独立回滚，不能消费段表 owner。 */
+        temporary_owner = segment->memory;
         enum kernel_heap_status heap_status = kernel_heap_allocate_zeroed(
             record->vma_heap, 1U, sizeof(*shared_entry),
             (void **)&shared_entry);
         if (heap_status != KERNEL_HEAP_STATUS_OK) {
-            kernel_memory_object_release(&segment->memory);
+            kernel_memory_object_release(&temporary_owner);
             return heap_status == KERNEL_HEAP_STATUS_EMPTY
                        ? KERNEL_MM_STATUS_NO_MEMORY
                        : KERNEL_MM_STATUS_STATE;
         }
-        shared_entry->object = segment->memory;
+        shared_entry->object = temporary_owner;
+        temporary_owner = 0;
     }
 
     vma = (struct kernel_vma){
@@ -2356,7 +2360,7 @@ enum kernel_mm_status kernel_mm_shmat(
             *out_address = start;
         } else {
             if (shared_entry != 0) {
-                kernel_memory_object_release(&segment->memory);
+                kernel_memory_object_release(&shared_entry->object);
                 (void)kernel_heap_release(record->vma_heap, shared_entry);
             }
         }
@@ -2371,7 +2375,7 @@ enum kernel_mm_status kernel_mm_shmat(
     if (vma_status != KERNEL_VMA_STATUS_OK) {
         status = status_from_vma(vma_status);
         if (shared_entry != 0) {
-            kernel_memory_object_release(&segment->memory);
+            kernel_memory_object_release(&shared_entry->object);
             (void)kernel_heap_release(record->vma_heap, shared_entry);
         }
         return status;
@@ -2379,7 +2383,7 @@ enum kernel_mm_status kernel_mm_shmat(
     status = require_active_space(record);
     if (status != KERNEL_MM_STATUS_OK) {
         if (shared_entry != 0) {
-            kernel_memory_object_release(&segment->memory);
+            kernel_memory_object_release(&shared_entry->object);
             (void)kernel_heap_release(record->vma_heap, shared_entry);
         }
         return status;
@@ -2387,7 +2391,7 @@ enum kernel_mm_status kernel_mm_shmat(
     status = unmap_space_range(record, start, end);
     if (status != KERNEL_MM_STATUS_OK) {
         if (shared_entry != 0) {
-            kernel_memory_object_release(&segment->memory);
+            kernel_memory_object_release(&shared_entry->object);
             (void)kernel_heap_release(record->vma_heap, shared_entry);
         }
         return status;
@@ -2408,7 +2412,7 @@ enum kernel_mm_status kernel_mm_shmat(
     if (kernel_vma_set_commit_edit(record->vmas, &edit) !=
         KERNEL_VMA_STATUS_OK) {
         if (shared_entry != 0) {
-            kernel_memory_object_release(&segment->memory);
+            kernel_memory_object_release(&shared_entry->object);
             (void)kernel_heap_release(record->vma_heap, shared_entry);
         }
         return KERNEL_MM_STATUS_STATE;

@@ -382,6 +382,12 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 
 ### P4f SysV IPC
 
+2026-09-30 独立 Review 的组合边界修复：
+
+- [x] R1：SHM 附加 registry OOM 回滚不消费段表 owner；scale 聚焦故障后重试及最终页回收通过。
+- [ ] R2/R6：显式 attachment、片段 open/close、固定替换与 fork/退出计数、通用权限上限；保持 prepare/commit 失败原子性。
+- [ ] R8：已有 key 的零大小查找与创建下限分开，并补固定 Linux 差分矩阵。
+
 - [x] 当前 shmget/shmat/shmdt/shmctl 均已接入；针对 IPC_PRIVATE 与命名 key、段大小对齐与 Linux 布局完成 194–197 系统调用接入。
 - [x] 确认 key/id/代次、segment 与 attach 的 owner、IPC_RMID 后存活/末引用释放、fork 继承与 exec/退出分离，以及权限/限额/OOM/fault 回滚；统一后备对象作为物理页后备，由 VMA 原生扩展持有 segment 引用并在 detach/exit/exec 时维护 nattch。
 - [x] 验证跨进程/不同地址、删除后已有映射、ID 反复复用、部分失败与资源基线；Linux 差分 ABI 新增 19 条全部一致（累计 1031 条），用户态多进程 fork/shmdt/IPC_RMID 与裸机 scale 测试全数通过，关机物理页完全回收。SysV semaphore/message queue 不自动纳入本阶段。

@@ -20,6 +20,7 @@
 1. **唯一段所有权与统一后备对象**：
    - 共享内存段使用 `struct kernel_memory_object` 提供物理页后备，与匿名共享映射基础设施完全统一，按需分配物理页。
    - 段所有权由内核段表统一管理，VMA 持有对 `kernel_memory_object` 的后备引用与对 `struct kernel_shm_segment` 的附加引用。
+   - `shmat` 给 MM registry 新取得的内存对象引用先由局部 owner 持有，再移动给 registry；分配或映射失败只消费临时 owner，不改变段表引用。`test-scale-riscv` 在 registry 分配处注入 OOM，要求重试附加成功并最终回到资源基线。
 2. **段标识符与代次序列隔离**：
    - 最大段数量由 `KERNEL_SHMMNI`（128）固定。
    - `shmid = slot_index + seq * KERNEL_SHMMNI`。

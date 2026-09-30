@@ -186,6 +186,14 @@ static void sysv_shm_scale(struct kernel_mm *mm)
     check(kernel_shm_get(0, KERNEL_IPC_PRIVATE, 8192, 0666 | KERNEL_IPC_CREAT, &shmid1) == 0 &&
           shmid1 >= 0, 110);
 
+    /* 临时 registry owner 回滚不能消费段表的原 owner。 */
+    uint64_t failed_address = UINT64_C(0x55);
+    fail_metadata = 1;
+    check(kernel_shm_at_mm(mm, 1, shmid1, 0, 0, &failed_address) ==
+              -KERNEL_ENOMEM && fail_metadata == 0 &&
+          failed_address == UINT64_C(0x55), 132);
+    fail_metadata = 0;
+
     /* 2. Attach segment to mm */
     uint64_t addr1 = 0;
     check(kernel_shm_at_mm(mm, 1, shmid1, 0, 0, &addr1) == 0 && addr1 != 0, 111);
