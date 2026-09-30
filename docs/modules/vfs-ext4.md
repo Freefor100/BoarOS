@@ -231,3 +231,9 @@ proc mounts 保留用户给出的磁盘来源名，并正确标识 tmpfs。
 缓存、test-root-multi-block-riscv 的真实双盘与重启，以及 test-lwext4-instances-host。
 
 成本观测分别记录缓存范围遍历、完整页快照和逻辑后端写回；真实扇区仍列 unknown，不由后端入口推断 data/metadata/journal，见[成本观测](kernel-cost.md)。
+
+成本隔离探针：`make test-lwext4-cost-host` 使用实际 lwext4 的公开 touch/fwrite 接口、
+独立 block_fault 设备计数和三个新生成的 journal 镜像，对比128次纯时间更新、
+4KiB热覆盖及组合操作；核对时间戳、读回内容及fsck。它测量后端请求数量，
+不经过VFS页缓存，不包含QEMU设备延迟，也不证明原iozone的CPU或总耗时占比。
+当前成本及可重建配置见[成本基线](../learning/cost-baseline.md)。
