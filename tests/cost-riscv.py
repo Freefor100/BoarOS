@@ -12,7 +12,7 @@ import tempfile
 from cost_report import parse, validate_expected
 ROOT=Path(__file__).resolve().parents[1]
 CASES=('contract','write','locking','mprotect','deadline','latency','consumer')
-IMPLEMENTED={'contract','write','locking'}
+IMPLEMENTED={'contract','write','locking','mprotect'}
 def digest(path):
     with Path(path).open('rb') as stream: return hashlib.file_digest(stream,'sha256').hexdigest()
 def run(command, **kwargs): return subprocess.run(command,check=True,**kwargs)
@@ -61,6 +61,9 @@ def main():
                 if case=='write':
                     seed=folder/'cold-data'; seed.write_bytes(bytes([0x5a])*1048576)
                     contents+=''.join(f'write {seed} /cold-{n}\n' for n in (0,1,3,63,64,65,4096))
+                if case=='mprotect':
+                    seed=folder/'resident-data'; seed.write_bytes(bytes([0x5a])*67108864)
+                    contents+=f'write {seed} /resident-data\n'
                 if case=='locking':
                     seed=folder/'lock-data'; seed.write_bytes(bytes([0x5a])*1048576)
                     contents+=''.join(f'write {seed} /lock-{name}\n' for name in ('a','b','input'))
@@ -88,9 +91,12 @@ def main():
                 output=result.stdout+result.stderr; (folder/'boot.log').write_text(output)
                 if result.returncode or result.stdout.count(f'COST PASS {case}\n')!=1 or 'cost contract failed' in output or 'cost workload failed' in output or 'PID 1 exited status=0x0' not in output or 'heap-live=0x0' not in output:
                     raise RuntimeError('guest failed: '+output[-4000:])
-                snapshots=[]; current=None; body=[]; expectations={}; timings={}
+                snapshots=[]; current=None; body=[]; expectations={}; timings={}; metric_expectations={}
                 for line in result.stdout.splitlines():
-                    if line.startswith('COST EXPECT '):
+                    if line.startswith('COST METRIC '):
+                        _,_,name,metric,value=line.split()
+                        metric_expectations.setdefault(name,{})['foreground.'+metric+'.value']=int(value)
+                    elif line.startswith('COST EXPECT '):
                         _,_,name,kind,calls,requested,accepted=line.split()
                         if name in expectations: raise ValueError('duplicate expectation')
                         expectations[name]={f'foreground.{kind}_calls.value':int(calls),
@@ -129,6 +135,12 @@ def main():
                             value=snapshot['values']
                             if value['foreground.lock15_acquired.value']==0: raise ValueError('write operation lock missing')
                             if snapshot['name'].startswith('locking-1-0-') and value['foreground.lock15_blocks.value']==0: raise ValueError('same inode contention was not exercised')
+                if not args.off:
+                    for snapshot in snapshots:
+                        validate_expected(snapshot['values'],metric_expectations.get(snapshot['name'],{}))
+                if case=='mprotect':
+                    required={f'mprotect-{n}-{r}' for n in (16,64,256) for r in (0,16,64)}|{'mprotect-failure'}
+                    if set(timings)!=required or (not args.off and {s['name'] for s in snapshots}!=required): raise ValueError('mprotect coverage')
                 record['snapshots']=snapshots; record['timings_ns']=timings; records.append(record)
                 (folder/'result.json').write_text(json.dumps(record,indent=2)+'\n')
                 # Fixture identity is kept; disposable writable copies are pruned at stage end.

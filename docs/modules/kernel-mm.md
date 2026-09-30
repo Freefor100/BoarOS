@@ -241,3 +241,10 @@ PROT_NONE、非当前 MM、尾页、关闭 fd、unlink、O_TRUNC 与重新增长
 共享匿名与其 futex key 使用 `kernel_memory_object` 的稳定对象身份。对象拥有每个稀疏驻留页的一份引用，get/find 成功返回额外页引用；find 遇空洞不分配。对象锁 rank 35 位于 inode 30 之后；无磁盘 I/O。truncate 摘除越界的对象页引用并清零保留尾页，调用者须先撤销受影响 PTE 并持有对象；页发布失败按先释放 PTE 临时引用、再 discard 新页的顺序回滚。tmpfs 已接入同一对象及按实例共享的页预算；普通文件的 inode/OFD 与 MM 登记仍保留，内存数据页不进入磁盘缓存。缺页使用 get_page_for_fault 返回 created 身份，成功 resident 发布后取消回滚；失败先释放 pin，只有无其他引用且地址匹配的新页才 discard。文件配额耗尽为 BUS_FAULT，普通分配耗尽仍为 NO_MEMORY。详见 [tmpfs](tmpfs.md)。
 
 缺页解析在合法 VMA 上权限不足返回 ACCESS，地址无映射返回 NOT_MAPPED；trap 层据此提供 SEGV_ACCERR/MAPERR，uaccess 将两者统一映射为用户复制 FAULT。这个区分不把 syscall 坏指针变成异步故障信号。
+
+默认关闭的 C3 成本观测记录 VMA 查询比较、coverage/权限检查、prepare/commit 时长、
+数组移动/编辑、全集合合并/字节重计、file_residents 遍历、实际 PTE 访问和地址/全局 TLB 失效。
+计数入口在实际循环或修改点，不改变 prepare 失败原子性；单页 PTE 路径与原 MM 统计独立核对。
+`make test-cost-riscv COST_CASE=mprotect` 使用固定一页目标和16/64/256无关VMA、
+0/16/64MiB文件驻留页，三个启动副本；权限拒绝和洞窗口要求PTE访问为0。
+OOM/split/fork 由 vma/scale/ABI 组合回归继续保护。

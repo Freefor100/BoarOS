@@ -272,9 +272,9 @@ C1 阶段证据：modern/writeback 的观测开/关各三个独立启动，36 �
 入口为 `arch/riscv/mm.c::kernel_mm_mprotect`、`mm/vma.c`、
 `arch/riscv/sv39.c`、`tests/riscv/scale_main.c` 与 `tests/riscv/vma_cases.c`。
 
-- [ ] 固定一页改权目标，分别增加无关 VMA 16/64/256 和文件驻留页 0/16/64 MiB；记录查询、prepare/commit、VMA 编辑/合并、file_residents 扫描、PTE 与 TLB 失效。
-- [ ] 全范围失败、洞、只读 SHM/共享文件上限拒绝、split/fork、NONE 降权恢复、OOM 仍保持原契约；统计失败路径不得触发新的 PTE 修改或 owner 变化。
-- [ ] `make test-cost-riscv COST_CASE=mprotect` 与 `make test-vma-riscv test-scale-riscv test-diff-abi-riscv`；报告总访问次数随无关集合增长的关系，不能用每目标页三级 PTE 访问掩盖外围扫描。
+- [x] 固定一页改权目标，分别增加无关 VMA 16/64/256 和文件驻留页 0/16/64 MiB；记录查询、prepare/commit、VMA 编辑/合并、file_residents 扫描、PTE 与 TLB 失效。
+- [x] 全范围失败、洞、只读 SHM/共享文件上限拒绝、split/fork、NONE 降权恢复、OOM 仍保持原契约；统计失败路径不得触发新的 PTE 修改或 owner 变化。
+- [x] `make test-cost-riscv COST_CASE=mprotect` 与 `make test-vma-riscv test-scale-riscv test-diff-abi-riscv`；报告总访问次数随无关集合增长的关系，不能用每目标页三级 PTE 访问掩盖外围扫描。
 
 ### C4：deadline 遍历与到期偏差（P-A）
 

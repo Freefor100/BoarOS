@@ -38,7 +38,7 @@ idle/cleanup 上下文单列 idle_ticks，不能解释成精确 WFI 驻留时间
 
 验证入口：`make test-cost-host`、`make test-cost-riscv COST_CASE=contract`。
 后者串行运行三个独立启动副本，在启动前保存 kernel/ELF/fixture 身份与源码内容哈希。
-目前交付 contract/write/locking；未交付 mprotect/deadline/latency/consumer 明确失败，
+目前交付 contract/write/locking/mprotect；未交付 deadline/latency/consumer 明确失败，
 `all` 不跳过缺项。独立报告读器拒绝缺项、重复、未知键、单位错误、旧 epoch、
 直方图不一致、incomplete 和 overflow。当前 Python discovery 不收集带连字符的文件，
 因此 host target 直接运行 `python3 -B tests/test-cost-report.py`，必须实际执行测试。
@@ -61,3 +61,6 @@ C2 按 rank 10/15/20/30/40/other 记录尝试、取得、阻塞、唤醒、重�
 名称/单位使用字符数组，避免 fixture 关闭分页后解引用高半区绝对字符串指针。
 真实 U-mode 的13个 locking窗口检查同/独立OFD、同/不同inode、1/8/32等待者及双盘，
 覆盖冷映射输入、向量追加、O_SYNC、截断和取消。四种设备配置各三次 fixture 启动验证清理。
+
+C3 计数覆盖外围VMA查询/覆盖/权限/数组编辑/合并/recount、resident遍历和实际PTE/TLB，
+prepare/commit/整次改权为嵌套墙上耗时，不能相加。聚合上限包括名称、单位、索引和桥接标量预留。

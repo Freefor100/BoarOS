@@ -58,3 +58,14 @@
 `python3 -B tests/cost-riscv.py --case locking` 和同命令追加 `--two-disks`；
 `python3 -B tests/io-sleep-riscv.py --cost-output <result.json> --transport modern --cache writeback`，
 对四配置分别重复三次。报告由 `tests/cost-summary.py` 检查完整三副本和 schema。
+
+## C3 外围扫描（2026-09-30）
+
+三个启动各10窗口，目标中间页先降权再恢复。16/64/256无关VMA下（无文件驻留）
+两次改权的 query比较为70/96/128，merge比较与recount访问均为44/140/524，
+PTE访问恒为6；有16/64MiB文件驻留页时 resident访问为8192/32768，PTE仍为6。
+这些计数在三副本相同；总成本包含外围数组移动、合并和驻留扫描，不能由PTE局部常数推断整体常数。
+权限拒绝/洞失败窗口未进入PTE修改，内容可继续写；scale在16/64MiB真实映射中
+用原MM统计核对PTE/TLB并以页数独立核对resident扫描，OOM/fork/split契约沿用原回归。
+可重建：`make test-cost-riscv COST_CASE=mprotect`；`make COST_DIAGNOSTICS=1 test-scale-riscv`；
+`make test-vma-riscv test-scale-riscv test-diff-abi-riscv`。范围索引仍留待全部测量后选择。

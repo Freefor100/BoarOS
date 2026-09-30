@@ -30,7 +30,7 @@ class CostReportTest(unittest.TestCase):
             with self.assertRaises(ValueError): parse(broken,3)
     def test_independent_expected(self):
         snapshot=parse(self.render(self.valid()),3)
-        for expected in ({'foreground.operations.value':128}, {'foreground.run_ticks.value':99}):
+        for expected in ({'foreground.operations.value':128}, {'foreground.run_ticks.value':99}, {'foreground.mprotect_resident_visits.value':8192}, {'foreground.mprotect_pte_visits.value':6}):
             with self.assertRaises(ValueError): validate_expected(snapshot, expected)
         snapshot['background.operations.value']=128
         with self.assertRaises(ValueError): validate_expected(snapshot, {'foreground.operations.value':128})

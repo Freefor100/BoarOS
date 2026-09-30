@@ -2440,6 +2440,8 @@ enum kernel_mm_status kernel_mm_mprotect(
     uint64_t length,
     uint32_t permissions)
 {
+    COST_SCOPE(cost_protect, MPROTECT_TICKS);
+    COST_ADD(MPROTECT_CALLS, 1);
     KERNEL_NO_RECLAIM_IO;
     struct riscv_kernel_mm_record *record;
     struct kernel_vma_edit edit;
@@ -2492,6 +2494,7 @@ enum kernel_mm_status kernel_mm_mprotect(
         KERNEL_VMA_STATUS_OK) return KERNEL_MM_STATUS_STATE;
     for (struct riscv_file_resident *page = record->file_residents;
          page != 0; page = page->next) {
+        COST_ADD(MPROTECT_RESIDENT_VISITS, 1);
         if (page->address >= address && page->address < end &&
             page->alias.previous != 0)
             rearm_shared_file_alias(record, page->address);

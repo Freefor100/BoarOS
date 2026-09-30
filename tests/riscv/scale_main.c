@@ -25,6 +25,7 @@ static unsigned char pool[128 * MIB] __attribute__((aligned(4096)));
 static unsigned char payload[4096];
 static uint64_t active_satp;
 #if BOAROS_COST_DIAGNOSTICS
+static uint32_t cost_frequency;
 static unsigned cost_copy_measuring;
 static uint64_t cost_copy_observed;
 #endif
@@ -480,6 +481,19 @@ static struct riscv_mm_statistics mapped_cost(struct kernel_files *files,
               after.protect_address_flushes == 0 && after.protect_global_flushes == 0, 44);
         check(kernel_mm_release(&clone) == KERNEL_MM_STATUS_OK, 45);
     }
+#if BOAROS_COST_DIAGNOSTICS
+    struct riscv_mm_statistics protect_before, protect_after;
+    riscv_kernel_mm_get_statistics(mm, &protect_before);
+    check(kernel_cost_begin(2, cost_frequency, 1, 0) == 0, 195);
+    check(kernel_mm_mprotect(mm, address, 4096, KERNEL_MM_READ) == KERNEL_MM_STATUS_OK &&
+          kernel_mm_mprotect(mm, address, 4096, KERNEL_MM_READ | KERNEL_MM_WRITE) == KERNEL_MM_STATUS_OK, 196);
+    check(kernel_cost_end(2, 0) == 0, 197);
+    uint64_t observed;
+    riscv_kernel_mm_get_statistics(mm, &protect_after);
+    check(kernel_cost_read(0, COST_MPROTECT_RESIDENT_VISITS, &observed) == 0 && observed == pages * 2, 198);
+    check(kernel_cost_read(0, COST_MPROTECT_PTE_VISITS, &observed) == 0 && observed == protect_after.protect_visits - protect_before.protect_visits, 199);
+    check(kernel_cost_read(0, COST_MPROTECT_ADDRESS_TLB, &observed) == 0 && observed == protect_after.protect_address_flushes - protect_before.protect_address_flushes, 200);
+#endif
     riscv_kernel_mm_get_statistics(mm, &before);
     for (uint64_t i = 0; i < pages; i++) {
         uint64_t index = (i * 4093) & (pages - 1);
@@ -578,6 +592,7 @@ void kernel_main(unsigned long hart, const void *dtb)
 #if BOAROS_COST_DIAGNOSTICS
     struct riscv_virtio_mmio_block_statistics device_before, device_after;
     riscv_virtio_mmio_block_get_statistics(&device, &device_before);
+    cost_frequency = info.timebase_frequency;
     check(kernel_cost_begin(1, info.timebase_frequency, 1, 0) == 0, 190);
     cost_copy_measuring = 1;
 #endif

@@ -1,3 +1,4 @@
+#include <kernel/cost.h>
 #include <kernel/heap.h>
 #include <kernel/page.h>
 #include <kernel/vma.h>
@@ -42,6 +43,7 @@ static void recount_bytes(struct kernel_vma_set *set)
 {
     uint64_t total = 0U;
     for (uint32_t i = 0U; i < set->count; i++) {
+        COST_ADD(VMA_RECOUNT, 1);
         uint64_t length = set->entries[i].end - set->entries[i].start;
         if (length > UINT64_MAX - total) __builtin_trap();
         total += length;
@@ -137,6 +139,7 @@ static uint32_t lower_bound(const struct kernel_vma_set *set,
     uint32_t high = set->count;
 
     while (low < high) {
+        COST_ADD(VMA_QUERY, 1);
         uint32_t middle = low + (high - low) / 2U;
 
         if (set->entries[middle].start < start) {
@@ -234,6 +237,7 @@ static void move_entries(struct kernel_vma_set *set,
     if (count == 0U || destination == source) {
         return;
     }
+    COST_ADD(VMA_MOVED, count);
     if (destination < source) {
         for (index = 0U; index < count; index++) {
             set->entries[destination + index] =
@@ -329,6 +333,7 @@ static void merge_all(struct kernel_vma_set *set)
     uint32_t index = 1U;
 
     while (index < set->count) {
+        COST_ADD(VMA_MERGE, 1);
         if (can_merge(&set->entries[index - 1U],
                       &set->entries[index])) {
             set->entries[index - 1U].end = set->entries[index].end;
@@ -623,6 +628,7 @@ static int range_is_covered(const struct kernel_vma_set *set,
         index--;
     }
     while (index < set->count && cursor < end) {
+        COST_ADD(VMA_COVERAGE, 1);
         if (set->entries[index].start > cursor ||
             set->entries[index].end <= cursor) {
             return 0;
@@ -640,6 +646,7 @@ enum kernel_vma_status kernel_vma_set_prepare_protect(
     uint32_t permissions,
     struct kernel_vma_edit *edit)
 {
+    COST_SCOPE(cost_prepare, VMA_PREPARE_TICKS);
     enum kernel_vma_status status;
 
     if (!set_valid(set) || start >= end || edit == 0) {
@@ -651,6 +658,7 @@ enum kernel_vma_status kernel_vma_set_prepare_protect(
     uint32_t first = lower_bound(set, start);
     if (first && set->entries[first - 1].end > start) first--;
     for (uint32_t index = first; index < set->count && set->entries[index].start < end; index++) {
+        COST_ADD(VMA_PERMISSION, 1);
         if (permissions & KERNEL_VMA_ALL_PERMISSIONS & ~set->entries[index].maximum_permissions)
             return KERNEL_VMA_STATUS_ACCESS;
     }
@@ -676,6 +684,7 @@ enum kernel_vma_status kernel_vma_set_commit_edit(
     struct kernel_vma_set *set,
     const struct kernel_vma_edit *edit)
 {
+    COST_SCOPE(cost_commit, VMA_COMMIT_TICKS);
     uint32_t first;
     uint32_t last;
     uint32_t index;
@@ -706,6 +715,7 @@ enum kernel_vma_status kernel_vma_set_commit_edit(
     last = lower_bound(set, edit->end);
     if (edit->kind == KERNEL_VMA_EDIT_PROTECT) {
         for (index = first; index < last; index++) {
+            COST_ADD(VMA_EDITED, 1);
             set->entries[index].permissions = edit->permissions;
         }
     } else {

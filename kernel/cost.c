@@ -11,7 +11,7 @@ enum { cost_histograms = 0
 #include <kernel/cost.def>
 };
 #undef X
-static const char names[][48] = {
+static const char names[][40] = {
 #define X(id, name, unit, hist) #name,
 #include <kernel/cost.def>
 #undef X
@@ -37,7 +37,9 @@ static struct {
     uint64_t epoch, owner, start, end, inflight;
     uint32_t frequency, fixture, active, pending, overflow, state;
 } cost;
-_Static_assert(sizeof(cost) + sizeof(names) + sizeof(units) + sizeof(histograms) <= 65536, "cost aggregate budget");
+enum { cost_storage = sizeof(cost) + sizeof(names) + sizeof(units) + sizeof(histograms) + sizeof(histogram_indexes) + sizeof(lanes) + 256 };
+/* Includes a reserve for bridge/IRQ scalars and formatting metadata. */
+_Static_assert(cost_storage <= 65536, "cost aggregate budget");
 static void add_checked(uint64_t *to, uint64_t value)
 {
     if (UINT64_MAX - *to < value) { cost.overflow = 1; *to = UINT64_MAX; }
@@ -299,7 +301,7 @@ int kernel_cost_format(char *buffer, size_t capacity)
     field(&f, "owner", cost.owner); field(&f, "timebase_hz", cost.frequency);
     field(&f, "resolution_ns_numerator", 1000000000); field(&f, "resolution_ns_denominator", cost.frequency);
     field(&f, "start_ticks", cost.start); field(&f, "end_ticks", cost.end);
-    field(&f, "storage_bytes", sizeof(cost)); field(&f, "task_bytes", sizeof(struct kernel_cost_task) + 16);
+    field(&f, "storage_bytes", cost_storage); field(&f, "task_bytes", sizeof(struct kernel_cost_task) + 16);
     field(&f, "overflow", cost.overflow); field(&f, "inflight", cost.inflight);
     for (unsigned lane = 0; lane < 3; ++lane) for (unsigned m = 0; m < COST_METRIC_COUNT; ++m) {
         char key[128]; size_t n = strlen(lanes[lane]); memcpy(key, lanes[lane], n); key[n++] = '.';
