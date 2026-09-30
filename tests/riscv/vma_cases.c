@@ -265,6 +265,7 @@ unsigned long run_all_vma_cases(void)
                                   .backing_offset = 0U,
                                   .permissions = KERNEL_MM_READ |
                                                  KERNEL_MM_EXECUTE,
+                                  .maximum_permissions = KERNEL_VMA_ALL_PERMISSIONS,
                                   .kind = KERNEL_VMA_KIND_ELF_PRIVATE,
                                   .role = KERNEL_VMA_ROLE_ELF,
                                   .fault_policy = KERNEL_VMA_FAULT_ELF,
@@ -1320,6 +1321,7 @@ unsigned long run_vma_lookup_baseline(uint64_t cycles[3])
                         .start = address,
                         .end = address + BOAROS_PAGE_SIZE,
                         .permissions = KERNEL_MM_READ,
+                        .maximum_permissions = KERNEL_VMA_ALL_PERMISSIONS,
                         .kind = KERNEL_VMA_KIND_ANONYMOUS,
                         .role = KERNEL_VMA_ROLE_MMAP,
                         .fault_policy = KERNEL_VMA_FAULT_DEMAND_ZERO,

@@ -1074,3 +1074,11 @@ shm.fixed-middle-survives
 shm.fixed-middle-count
 shm.fixed-file-replace
 shm.fixed-file-count
+shm.readonly-upgrade
+shm.readonly-none
+shm.readonly-restore
+shm.readonly-execute
+shm.readonly-split-upgrade
+shm.readonly-fork-ceiling
+shm.writable-down
+shm.writable-restore

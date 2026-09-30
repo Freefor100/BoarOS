@@ -1211,6 +1211,7 @@ enum kernel_mm_status kernel_mm_vma_insert_anon(
     vma.end = end;
     vma.backing_offset = 0U;
     vma.permissions = permissions;
+    vma.maximum_permissions = KERNEL_VMA_ALL_PERMISSIONS;
     vma.kind = KERNEL_VMA_KIND_ANONYMOUS;
     vma.role = role;
     vma.fault_policy = fault_policy;
@@ -1324,6 +1325,7 @@ enum kernel_mm_status kernel_mm_map_elf_source(
             .end = load_bias + run->end,
             .backing_offset = run->start,
             .permissions = mm_permissions_from_elf_flags(run->flags),
+            .maximum_permissions = KERNEL_VMA_ALL_PERMISSIONS,
             .kind = KERNEL_VMA_KIND_ELF_PRIVATE,
             .role = KERNEL_VMA_ROLE_ELF,
             .fault_policy = KERNEL_VMA_FAULT_ELF,
@@ -1823,6 +1825,7 @@ enum kernel_mm_status kernel_mm_mmap_anonymous(
         .end = end,
         .backing_offset = 0U,
         .permissions = normalized,
+        .maximum_permissions = KERNEL_VMA_ALL_PERMISSIONS,
         .kind = shared_object != 0 ? KERNEL_VMA_KIND_ANON_SHARED
                                    : KERNEL_VMA_KIND_ANONYMOUS,
         .role = KERNEL_VMA_ROLE_MMAP,
@@ -2102,9 +2105,9 @@ enum kernel_mm_status kernel_mm_mmap_file_private(
                             ? KERNEL_VMA_FAULT_FILE_SHARED
                             : KERNEL_VMA_FAULT_FILE_PRIVATE,
         .backing = *file,
-        .file_shared_may_write =
-            (flags & KERNEL_MM_MAP_SHARED) != 0U &&
-            kernel_open_file_writable(*file),
+        .maximum_permissions = KERNEL_VMA_ALL_PERMISSIONS &
+            (((flags & KERNEL_MM_MAP_SHARED) == 0U || kernel_open_file_writable(*file))
+                 ? KERNEL_VMA_ALL_PERMISSIONS : ~KERNEL_MM_WRITE),
     };
     if ((flags & KERNEL_MM_MAP_FIXED) == 0U) {
         status = status_from_vma(kernel_vma_set_insert(record->vmas,
@@ -2323,6 +2326,8 @@ enum kernel_mm_status kernel_mm_shmat(
         .end = end,
         .backing_offset = 0U,
         .permissions = normalized,
+        .maximum_permissions = KERNEL_VMA_ALL_PERMISSIONS &
+            ((flags & KERNEL_SHM_RDONLY) ? ~KERNEL_MM_WRITE : KERNEL_VMA_ALL_PERMISSIONS),
         .kind = KERNEL_VMA_KIND_SYSV_SHM,
         .role = KERNEL_VMA_ROLE_SYSV_SHM,
         .fault_policy = KERNEL_VMA_FAULT_ANON_SHARED,
@@ -2586,6 +2591,7 @@ enum kernel_mm_status kernel_mm_brk(
                 .end = new_page_end,
                 .backing_offset = 0U,
                 .permissions = KERNEL_MM_READ | KERNEL_MM_WRITE,
+                .maximum_permissions = KERNEL_VMA_ALL_PERMISSIONS,
                 .kind = KERNEL_VMA_KIND_ANONYMOUS,
                 .role = KERNEL_VMA_ROLE_HEAP,
                 .fault_policy = KERNEL_VMA_FAULT_DEMAND_ZERO,

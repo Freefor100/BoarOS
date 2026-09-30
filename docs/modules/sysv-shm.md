@@ -41,11 +41,12 @@
 - `mm/vma.c` 的 `can_merge()` 显式禁止合并 SysV SHM VMA，确保各附加段的边界、起始地址与生命周期独立。
 - `mm/vma.c` 在成功插入、split、clone、remove/replace 和 destroy 时统一调用 attachment open/close；prepare 不改变引用，commit 不再分配。`nattch` 是已提交 VMA 片段数，不是每进程或每次 `shmat` 固定计一。临时 attachment owner 保住槽身份但不增加 `nattch`，所有权错误触发 fatal。
 - `shmdt` 从原始附加地址查找稳定 attachment，即使首段已撤销也能移除全部剩余片段；不会移除洞内被匿名、文件或其他 SHM 附加替换的新映射。fork 的 VMA clone 自动增引用，后续 fork OOM 经统一 destroy 回滚。
+- `SHM_RDONLY` 的 VMA 上限为 RX，禁止经 `mprotect` 提升 WRITE；当前权限与上限分开，允许先降到 NONE 再恢复 READ。分裂和 fork 保留该限制。
 - `shared_anon_leaf()` 将 `KERNEL_VMA_KIND_SYSV_SHM` 视作共享叶子页表项，`kernel_mm_fork()` 克隆页表时共享 PTE 而不作写保护。
 
 ## 验证与回归
 
 - **裸机规模与生命周期测试**：`make test-scale-riscv` 覆盖 `IPC_PRIVATE` 分配、跨地址多 attach、读写数据比对、`IPC_STAT`、`IPC_RMID` 延迟销毁、命名 key 冲突与消除，并验证进程退出后 `physical_page_available == baseline` 零泄漏。
-- **Linux 差分 ABI 测试**：`make test-diff-abi-riscv` 中 19 个 SysV SHM 测例（`shm.*`）与参考 Linux 内核比对，1031 条记录 100% 一致。
+- **Linux 差分 ABI 测试**：`make test-diff-abi-riscv` 覆盖 key/size/flags、片段计数/替换以及只读附件改权；截至权限上限阶段，1077 条全套记录与参考 Linux 内核一致。
 - **真实 musl U-mode 测试**：`make test-userland-riscv` 在真实 musl libc 运行环境下验证跨 fork 数据传递、`shmdt`、销毁后再次 attach 拒绝等完整场景。
 - **栈预算校验**：`make test-stack-usage` 确保所有新增函数均在栈安全边界内。

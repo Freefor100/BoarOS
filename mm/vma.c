@@ -60,6 +60,9 @@ static int vma_valid(const struct kernel_vma *vma)
         vma->fault_policy > KERNEL_VMA_FAULT_FILE_SHARED) {
         return 0;
     }
+    if ((vma->maximum_permissions & ~KERNEL_VMA_ALL_PERMISSIONS) ||
+        (vma->permissions & KERNEL_VMA_ALL_PERMISSIONS & ~vma->maximum_permissions))
+        return 0;
     if (vma->kind != KERNEL_VMA_KIND_SYSV_SHM && vma->shm_attachment)
         return 0;
     if (vma->kind == KERNEL_VMA_KIND_ANONYMOUS &&
@@ -97,10 +100,7 @@ static int vma_valid(const struct kernel_vma *vma)
     if (vma->kind == KERNEL_VMA_KIND_FILE_SHARED &&
         (vma->backing == 0 ||
          vma->fault_policy != KERNEL_VMA_FAULT_FILE_SHARED ||
-         vma->backing_offset > UINT64_MAX - (vma->end - vma->start) ||
-         vma->file_shared_may_write > 1U ||
-         ((vma->permissions & 2U) != 0U &&
-          !vma->file_shared_may_write))) return 0;
+         vma->backing_offset > UINT64_MAX - (vma->end - vma->start))) return 0;
     return 1;
 }
 
@@ -115,7 +115,7 @@ static int can_merge(const struct kernel_vma *left,
         left->fault_policy != right->fault_policy ||
         left->backing != right->backing ||
         left->shm_attachment != right->shm_attachment ||
-        left->file_shared_may_write != right->file_shared_may_write) {
+        left->maximum_permissions != right->maximum_permissions) {
         return 0;
     }
     if (left->kind == KERNEL_VMA_KIND_SYSV_SHM ||
@@ -648,14 +648,11 @@ enum kernel_vma_status kernel_vma_set_prepare_protect(
     if (!range_is_covered(set, start, end)) {
         return KERNEL_VMA_STATUS_NOT_FOUND;
     }
-    if ((permissions & 2U) != 0U) {
-        for (uint32_t index = 0U; index < set->count; index++) {
-            const struct kernel_vma *entry = &set->entries[index];
-            if (entry->end <= start || entry->start >= end) continue;
-            if (entry->kind == KERNEL_VMA_KIND_FILE_SHARED &&
-                !entry->file_shared_may_write)
-                return KERNEL_VMA_STATUS_ACCESS;
-        }
+    uint32_t first = lower_bound(set, start);
+    if (first && set->entries[first - 1].end > start) first--;
+    for (uint32_t index = first; index < set->count && set->entries[index].start < end; index++) {
+        if (permissions & KERNEL_VMA_ALL_PERMISSIONS & ~set->entries[index].maximum_permissions)
+            return KERNEL_VMA_STATUS_ACCESS;
     }
     if (set->generation == UINT64_MAX) {
         return KERNEL_VMA_STATUS_STATE;

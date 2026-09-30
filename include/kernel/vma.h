@@ -6,6 +6,7 @@
 struct kernel_heap;
 struct kernel_vma_set;
 struct kernel_shm_attachment;
+#define KERNEL_VMA_ALL_PERMISSIONS UINT32_C(7)
 uint64_t kernel_vma_set_generation(const struct kernel_vma_set *set);
 /* Sum of currently mapped virtual bytes; updated with each committed edit. */
 uint64_t kernel_vma_set_total_bytes(const struct kernel_vma_set *set);
@@ -60,12 +61,12 @@ struct kernel_vma {
     uint64_t end;
     uint64_t backing_offset;
     uint32_t permissions;
+    uint32_t maximum_permissions;
     enum kernel_vma_kind kind;
     enum kernel_vma_role role;
     enum kernel_vma_fault_policy fault_policy;
     void *backing;
     struct kernel_shm_attachment *shm_attachment;
-    uint8_t file_shared_may_write;
 };
 
 /*

@@ -473,3 +473,5 @@ runner 复验通过。未修改正式时限，也不把这次诊断计为性能�
 
 
 SysV attachment 与 VMA 片段必须分别建模。逻辑 attachment 保存固定 shmid、原始地址及后备 owner；同一 MM 的分裂片段与 fork 副本各贡献一个 `nattch`。prepare 阶段的临时 owner 保住段槽身份而不增加公开计数，成功 split/insert/clone 才 open，remove/replace/destroy 才 close。先 split 再关闭被移除片段，避免部分撤销期间出现假的零引用并销毁 RMID 段；`shmdt` 比较 attachment 身份，不按一个 VMA 或整个旧地址范围删除。固定依据为本地 `references/linux/ipc/shm.c` 的 `shm_open`、`shm_close`、`ksys_shmdt`，commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`。`make test-scale-riscv` 覆盖六种编辑/继承组合及逐次附加、fork OOM，结束仍检查完整页回收；`make test-diff-abi-riscv` 提供真实 RV64 片段计数和固定替换对照。
+
+权限上限是映射创建契约，不能由当前权限反推。初始 READ 的匿名映射仍可合法提升 WRITE，而只读 SHM 和只读 fd 的共享文件映射不可提升；降权到 NONE 也不能丢掉原来的合法上限。固定依据为 `references/linux/mm/mprotect.c` 的 VM_MAY 权限检查，以及 `references/linux/ipc/shm.c` 的 `do_shmat` 清除 VM_MAYWRITE，commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`。`make test-vma-riscv test-diff-abi-riscv` 验证只读附加、分裂、fork 和降权恢复；本阶段累计 1077 条记录一致。

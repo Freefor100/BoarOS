@@ -64,6 +64,7 @@ static long sys_shmdt(const void *shmaddr)
 }
 
 static void shm_fragment_cases(void);
+static void shm_permission_cases(void);
 
 void abi_shm_cases(void)
 {
@@ -182,6 +183,7 @@ void abi_shm_cases(void)
     ret = sys_shmget(named_key, 4096, 0);
     abi_record("shm.get-named-after-rmid", ret, -1, -1, 0, 0, 0);
     shm_fragment_cases();
+    shm_permission_cases();
 }
 
 
@@ -253,4 +255,29 @@ static void shm_fragment_cases(void)
     abi_record("shm.fixed-file-count", ret, ds.shm_nattch, -1, 0, 0, 0);
     abi_require(sys_shmctl(id, ABI_IPC_RMID, 0) == 0 && SC2(215, base, 12288) == 0);
     abi_require(SC1(57, fd) == 0 && SC3(35, -100, "/shm-fixed-file", 0) == 0);
+}
+
+
+static void shm_permission_cases(void)
+{
+    long id = sys_shmget(ABI_IPC_PRIVATE, 12288, 0600);
+    long base = sys_shmat(id, 0, ABI_SHM_RDONLY);
+    abi_require(id >= 0 && base > 0);
+    abi_record("shm.readonly-upgrade", SC3(226, base, 12288, 3), -1, -1, 0, 0, 0);
+    abi_record("shm.readonly-none", SC3(226, base, 12288, 0), -1, -1, 0, 0, 0);
+    abi_record("shm.readonly-restore", SC3(226, base, 12288, 1), -1, -1, 0, 0, 0);
+    abi_record("shm.readonly-execute", SC3(226, base + 4096, 4096, 5), -1, -1, 0, 0, 0);
+    abi_record("shm.readonly-split-upgrade", SC3(226, base + 4096, 4096, 3), -1, -1, 0, 0, 0);
+    long child = SC5(220, 17, 0, 0, 0, 0);
+    abi_require(child >= 0);
+    if (!child) abi_exit(SC3(226, base + 4096, 4096, 3) == -13 ? 0 : 1);
+    int status = -1;
+    abi_require(SC4(260, child, &status, 0, 0) == child);
+    abi_record("shm.readonly-fork-ceiling", 0, status, -1, 0, 0, 0);
+    abi_require(sys_shmdt((void *)base) == 0);
+    base = sys_shmat(id, 0, 0);
+    abi_require(base > 0);
+    abi_record("shm.writable-down", SC3(226, base + 4096, 4096, 1), -1, -1, 0, 0, 0);
+    abi_record("shm.writable-restore", SC3(226, base + 4096, 4096, 3), -1, -1, 0, 0, 0);
+    abi_require(sys_shmdt((void *)base) == 0 && sys_shmctl(id, ABI_IPC_RMID, 0) == 0);
 }
