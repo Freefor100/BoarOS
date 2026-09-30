@@ -8,9 +8,10 @@
 #if BOAROS_COST_DIAGNOSTICS
 struct kernel_cost_task {
     uint64_t epoch, run_start, ready_start, blocked_start, scope_epoch;
-    uint32_t depth, suppress, operation;
+    uint32_t depth;
+    uint8_t suppress, operation, wait_rank, wait_flags;
 };
-_Static_assert(sizeof(struct kernel_cost_task) <= 64, "cost task budget");
+_Static_assert(sizeof(struct kernel_cost_task) + 16 <= 64, "cost task budget");
 enum kernel_cost_metric {
 #define X(id, name, unit, hist) COST_##id,
 #include <kernel/cost.def>
@@ -43,7 +44,14 @@ void kernel_cost_sample(enum kernel_cost_metric metric, uint64_t value);
 struct kernel_cost_scope kernel_cost_enter(enum kernel_cost_metric metric);
 void kernel_cost_leave(struct kernel_cost_scope *scope);
 void kernel_cost_cancel(struct kernel_cost_task *task);
+struct kernel_cost_tag;
 void kernel_cost_join(struct kernel_cost_task *task);
+void kernel_cost_rebase(struct kernel_cost_task *task);
+void kernel_cost_block(struct kernel_cost_task *task);
+void kernel_cost_wake(struct kernel_cost_task *task);
+void kernel_cost_ready(struct kernel_cost_task *task);
+struct kernel_cost_tag kernel_cost_task_tag(const struct kernel_cost_task *task);
+unsigned kernel_cost_rank(unsigned rank);
 int kernel_cost_begin(uint64_t owner, uint32_t frequency, int fixture, int deferred);
 int kernel_cost_end(uint64_t owner, int deferred);
 void kernel_cost_boundary(void);

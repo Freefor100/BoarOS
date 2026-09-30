@@ -15,6 +15,7 @@ void kernel_rwlock_init(struct kernel_rwlock *lock, uint32_t rank, uintptr_t key
 }
 static int acquire(struct kernel_rwlock *lock, struct kernel_lock_guard *guard, int write, int try_only)
 {
+    COST_SCOPE(acquire_cost, OPERATION_TICKS);
     uintptr_t irq = riscv_interrupt_save();
     struct kernel_io_context *owner = kernel_io_context_current();
     if (!lock || !guard || guard->lock || !lock->waiters.initialized) __builtin_trap();
@@ -25,6 +26,12 @@ static int acquire(struct kernel_rwlock *lock, struct kernel_lock_guard *guard, 
         if (outer->rank > lock->rank ||
             (outer->rank == lock->rank && outer->key >= lock->key)) __builtin_trap();
     }
+#if BOAROS_COST_DIAGNOSTICS
+    unsigned rank = kernel_cost_rank(lock->rank);
+    enum kernel_cost_metric metric = (enum kernel_cost_metric)(COST_LOCK10_ATTEMPTS + rank*8);
+    uint64_t wait_start = kernel_cost_clock();
+    kernel_cost_add(metric,1);
+#endif
     if (try_only && (lock->writer || lock->writers_waiting)) {
         riscv_interrupt_restore(irq);
         return 0;
@@ -35,6 +42,14 @@ static int acquire(struct kernel_rwlock *lock, struct kernel_lock_guard *guard, 
     }
     while (lock->writer || (write ? lock->readers != 0 : lock->writers_waiting != 0)) {
         enum kernel_wait_wake_reason reason;
+#if BOAROS_COST_DIAGNOSTICS
+        struct kernel_cost_task *task = kernel_cost_current();
+        if (task) {
+            if (task->wait_flags & 1) kernel_cost_add((enum kernel_cost_metric)(metric+4),1);
+            task->wait_flags &= (uint8_t)~1U; task->wait_rank = (uint8_t)(rank+1);
+        }
+        kernel_cost_add((enum kernel_cost_metric)(metric+2),1);
+#endif
         if (kernel_scheduler_block_current(&lock->waiters, 0, 0, &reason) !=
             KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
     }
@@ -45,7 +60,19 @@ static int acquire(struct kernel_rwlock *lock, struct kernel_lock_guard *guard, 
         if (lock->readers == UINT32_MAX) __builtin_trap();
         lock->readers++;
     }
-    *guard = (struct kernel_lock_guard){lock, owner, owner->locks, write};
+    *guard = (struct kernel_lock_guard){lock, owner, owner->locks, write
+#if BOAROS_COST_DIAGNOSTICS
+        ,0,0
+#endif
+    };
+#if BOAROS_COST_DIAGNOSTICS
+    struct kernel_cost_task *task = kernel_cost_current();
+    if (task) { task->wait_rank = 0; task->wait_flags &= (uint8_t)~1U; }
+    kernel_cost_add((enum kernel_cost_metric)(metric+1),1);
+    kernel_cost_sample((enum kernel_cost_metric)(metric+5),kernel_cost_clock()-wait_start);
+    struct kernel_cost_scope hold = kernel_cost_enter((enum kernel_cost_metric)(metric+6));
+    guard->cost_start = hold.start; guard->cost_registered = hold.actor != 0;
+#endif
     owner->locks = guard;
     riscv_interrupt_restore(irq);
     return 1;
@@ -70,6 +97,13 @@ void kernel_lock_release(struct kernel_lock_guard *guard)
         if (lock->writer || !lock->readers) __builtin_trap();
         lock->readers--;
     }
+#if BOAROS_COST_DIAGNOSTICS
+    struct kernel_cost_scope hold = {
+        .tag={guard->cost_registered ? kernel_cost_epoch() : 0,0}, .start=guard->cost_start,
+        .actor=guard->cost_registered ? kernel_cost_current() : 0,
+        .metric=(enum kernel_cost_metric)(COST_LOCK10_HOLD_TICKS+kernel_cost_rank(lock->rank)*8)};
+    kernel_cost_leave(&hold);
+#endif
     owner->locks = guard->previous;
     *guard = (struct kernel_lock_guard){0};
     if (!lock->readers && lock->waiters.head && kernel_wait_queue_wake_all(&lock->waiters) !=

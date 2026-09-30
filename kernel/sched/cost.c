@@ -11,21 +11,11 @@ void kernel_cost_unlock(uint64_t s)
 { if (s & 2) __asm__ volatile("csrsi sstatus, 2" ::: "memory"); }
 static struct kernel_cost_task bootstrap_cost;
 struct kernel_cost_task *kernel_cost_current(void)
-{ return scheduler.current ? &scheduler.current->cost : &bootstrap_cost; }
-static struct kernel_cost_tag task_tag(const struct kernel_cost_task *task)
-{ return (struct kernel_cost_tag){kernel_cost_epoch(), task->epoch == kernel_cost_epoch() ? 0 : 1}; }
-void kernel_cost_account(struct kernel_cost_task *task)
 {
-    uint64_t now = kernel_cost_clock();
-    if (task->run_start && !task->suppress)
-        kernel_cost_add_tag(task_tag(task), COST_RUN_TICKS, now - task->run_start);
-    task->run_start = now;
-}
-void kernel_cost_switch(struct kernel_cost_task *previous, struct kernel_cost_task *next)
-{
-    kernel_cost_account(previous);
-    next->run_start = kernel_cost_clock();
-    kernel_cost_add_tag(task_tag(next), COST_SWITCHES, 1);
+    if (!scheduler.current) return &bootstrap_cost;
+    if (scheduler.current->io_context.background_reclaim) scheduler.current->cost.wait_flags |= 64;
+    else scheduler.current->cost.wait_flags &= (uint8_t)~64U;
+    return &scheduler.current->cost;
 }
 void kernel_cost_syscall(uint64_t number, int64_t fd)
 {
@@ -51,10 +41,12 @@ int kernel_cost_control(const char *command, size_t size)
     uint64_t owner = process_identity_generation(task);
     if (size == 6 && !memcmp(command, "begin\n", 6)) {
         int result = kernel_cost_begin(owner, kernel_cost_timebase(), 0, 1);
-        if (!result) for (struct kernel_task *t = scheduler.all_tasks; t; t = t->all_next)
-            if (belongs(t, owner)) {
-                kernel_cost_join(&t->cost);
-            }
+        if (!result) for (struct kernel_task *t = scheduler.all_tasks; t; t = t->all_next) {
+            if (belongs(t, owner)) kernel_cost_join(&t->cost);
+            else kernel_cost_rebase(&t->cost);
+            if (t->state == KERNEL_THREAD_STATE_BLOCKED) t->cost.blocked_start = kernel_cost_clock();
+            if (t->state == KERNEL_THREAD_STATE_READY) kernel_cost_ready(&t->cost);
+        }
         return result;
     }
     if (size == 4 && !memcmp(command, "end\n", 4)) {
@@ -75,6 +67,8 @@ void kernel_cost_task_exit(void)
     struct kernel_task *task = scheduler.current;
     if (!task) return;
     kernel_cost_account(&task->cost);
+    if (task->cost.wait_rank) kernel_cost_add_tag(kernel_cost_task_tag(&task->cost),
+        (enum kernel_cost_metric)(COST_LOCK10_CANCELLED+(task->cost.wait_rank-1)*8),1);
     kernel_cost_cancel(&task->cost);
     if (task->group_leader && (task->group_leader->group_exiting ||
         task->group_leader->group_members <= 1))

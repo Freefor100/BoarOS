@@ -7,7 +7,7 @@
 
 `kernel/cost.c` 保持固定聚合，`kernel/sched/cost.c` 连接时钟、任务关系和用户返回。
 诊断存储不持有任务、MM、inode 或 OFD 引用；任务仅有标量 epoch、运行/等待时间戳、
-在途深度及控制抑制状态（当前 56 字节），原任务元数据页容量断言继续生效。
+在途深度及控制抑制状态（当前标量 48 字节，加内嵌 backend guard 的 16 字节，共 64 字节），原任务元数据页容量断言继续生效。
 热路径不分配、不打印、不睡眠；原始 CSR SIE save/restore 保护聚合，不走被观测的锁。
 
 仅观测版本提供 `/proc/boaros_cost_control`（完整 `begin\n`、`end\n`）及只读
@@ -29,7 +29,8 @@ read/write/readv/writev/定位读写在 dispatch 前识别并抑制自身计数�
 前台按成员 epoch 归属，其他工作属于后台，计数/直方图更新体另计 observer_ticks。
 operation_ticks 是包含睡眠和嵌套的墙上客体时间；run_ticks 在切换/返回时结算。
 两者不能相加；观察体 ticks 也只是包含在运行时间中的子集，未计入口/时钟读/恢复指令。
-blocked/ready 的实际路径将在 C2 接入，未接入不能由零值推断无等待。
+C2 在真实 block/wake/ready/switch 路径分别结算阻塞墙上时间、就绪等待和运行时间；
+idle/cleanup 上下文单列 idle_ticks，不能解释成精确 WFI 驻留时间。
 
 快照只在完成/中止后格式化，由生成式 OFD 持有文本；运行窗口中读取返回 EBUSY。
 短读、fault 前缀及 rewind 沿用 proc 快照契约。文本分配或容量失败返回明确错误，
@@ -37,7 +38,7 @@ blocked/ready 的实际路径将在 C2 接入，未接入不能由零值推断�
 
 验证入口：`make test-cost-host`、`make test-cost-riscv COST_CASE=contract`。
 后者串行运行三个独立启动副本，在启动前保存 kernel/ELF/fixture 身份与源码内容哈希。
-目前交付 contract/write；未交付 locking/mprotect/deadline/latency/consumer 明确失败，
+目前交付 contract/write/locking；未交付 mprotect/deadline/latency/consumer 明确失败，
 `all` 不跳过缺项。独立报告读器拒绝缺项、重复、未知键、单位错误、旧 epoch、
 直方图不一致、incomplete 和 overflow。当前 Python discovery 不收集带连字符的文件，
 因此 host target 直接运行 `python3 -B tests/test-cost-report.py`，必须实际执行测试。
@@ -52,3 +53,11 @@ staging 累计请求容量、heap 请求字节和成功物理页。短写以实�
 所有真实磁盘字节为 unknown_read/unknown_write，后端逻辑数据不足以证明扇区分类。
 复制/解析和设备请求由 scale 的独立 wrapper/原统计交叉验证；三个副本及完整窗口由
 `tests/cost-summary.py` 再验证。C1 结果和开关开销见[成本基线](../learning/cost-baseline.md)。
+
+C2 按 rank 10/15/20/30/40/other 记录尝试、取得、阻塞、唤醒、重阻塞、取消及等待/持有直方图。
+持有 scope 参与在途计量，guard 只新增开始时刻和登记标量，不持有诊断任务引用。
+独立假时钟测试区分前台运行20 ticks、后台运行890 ticks、前台睡眠880 ticks和就绪10 ticks。
+低内存 io-sleep fixture 使用相同接口输出 pressure-io/timeout-cancel，完成后才分配快照；
+名称/单位使用字符数组，避免 fixture 关闭分页后解引用高半区绝对字符串指针。
+真实 U-mode 的13个 locking窗口检查同/独立OFD、同/不同inode、1/8/32等待者及双盘，
+覆盖冷映射输入、向量追加、O_SYNC、截断和取消。四种设备配置各三次 fixture 启动验证清理。

@@ -138,3 +138,8 @@ zombie 先逻辑回收再复制 status/rusage，因此坏输出指针的 EFAULT 
 真实消费者的独立调用链诊断见 [session-consumers](../learning/session-consumers.md)：
 固定 BusyBox setsid/chrt/taskset、musl daemon 和原 iperf3/cyclictest，
 使用 QEMU 用户态 ecall 入口观察器，不修改原 ELF、不计分。
+
+默认关闭的成本观测见[成本模块](kernel-cost.md)。开启后在实际调度事件结算运行、blocked/ready
+时间及按rank的锁等待/持有、唤醒/重阻塞；标量48字节加内嵌guard16字节不持有新owner。
+独立假时钟测试保护睡眠排除及前后台归属；13窗口三启动锁对照与四组合三启动低内存fixture
+保护原来的阻塞、取消和资源回收。测量不改变队列/公平策略。

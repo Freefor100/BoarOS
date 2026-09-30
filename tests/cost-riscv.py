@@ -12,7 +12,7 @@ import tempfile
 from cost_report import parse, validate_expected
 ROOT=Path(__file__).resolve().parents[1]
 CASES=('contract','write','locking','mprotect','deadline','latency','consumer')
-IMPLEMENTED={'contract','write'}
+IMPLEMENTED={'contract','write','locking'}
 def digest(path):
     with Path(path).open('rb') as stream: return hashlib.file_digest(stream,'sha256').hexdigest()
 def run(command, **kwargs): return subprocess.run(command,check=True,**kwargs)
@@ -21,6 +21,7 @@ def main():
     parser.add_argument('--case',choices=(*CASES,'all'),default='all')
     parser.add_argument('--kernel',type=Path,default=ROOT/'build/cost/kernel-rv')
     parser.add_argument('--qemu',default='qemu-system-riscv64')
+    parser.add_argument('--two-disks',action='store_true')
     parser.add_argument('--off',action='store_true',help='run identical ELF with diagnostics disabled')
     parser.add_argument('--transport',choices=('legacy','modern'),default='modern')
     parser.add_argument('--cache',choices=('writeback','writethrough'),default='writeback')
@@ -40,7 +41,7 @@ def main():
         'diff_sha256':hashlib.sha256(subprocess.check_output(['git','diff','HEAD'],cwd=ROOT)).hexdigest(),
         'qemu_version':subprocess.check_output([args.qemu,'--version'],text=True).splitlines()[0],
         'qemu_sha256':digest(shutil.which(args.qemu)), 'cost_diagnostics':0 if args.off else 1,
-        'replicas':args.replicas,'acceptance':args.replicas==3,'transport':args.transport,'cache':args.cache}
+        'replicas':args.replicas,'acceptance':args.replicas==3,'transport':args.transport,'cache':args.cache,'two_disks':args.two_disks}
     kernel=work/'kernel'; shutil.copyfile(args.kernel,kernel); identity['kernel_sha256']=digest(kernel)
     compiler=ROOT/'build/riscv/musl-root/bin/musl-gcc'
     identity['compiler']=subprocess.check_output([str(compiler),'--version'],text=True).splitlines()[0]
@@ -60,6 +61,11 @@ def main():
                 if case=='write':
                     seed=folder/'cold-data'; seed.write_bytes(bytes([0x5a])*1048576)
                     contents+=''.join(f'write {seed} /cold-{n}\n' for n in (0,1,3,63,64,65,4096))
+                if case=='locking':
+                    seed=folder/'lock-data'; seed.write_bytes(bytes([0x5a])*1048576)
+                    contents+=''.join(f'write {seed} /lock-{name}\n' for name in ('a','b','input'))
+                if args.two_disks:
+                    flag=folder/'dual-flag'; flag.write_text('two disks\n'); contents+=f'write {flag} /cost-dual\n'
                 commands.write_text(contents)
                 run(['debugfs','-w','-f',str(commands),str(disk)],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
                 record={**identity,'case':case,'replica':replica,'elf_sha256':digest(program),'fixture_sha256':digest(disk)}
@@ -68,6 +74,15 @@ def main():
                     '-drive',f'file={disk},if=none,format=raw,id=root,cache={args.cache}',
                     '-global','virtio-mmio.force-legacy='+('true' if args.transport=='legacy' else 'false'),
                     '-device','virtio-blk-device,drive=root,bus=virtio-mmio-bus.0']
+                if args.two_disks:
+                    second=folder/'second.img'
+                    with second.open('wb') as stream: stream.truncate(256*1024*1024)
+                    run(['mkfs.ext4','-q','-F','-b','4096',str(second)])
+                    second_commands=folder/'second.commands'; second_commands.write_text(f'write {seed} /lock-b\n')
+                    run(['debugfs','-w','-f',str(second_commands),str(second)],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                    record['second_fixture_sha256']=digest(second)
+                    invocation+=['-drive',f'file={second},if=none,format=raw,id=second,cache={args.cache}',
+                        '-device','virtio-blk-device,drive=second,bus=virtio-mmio-bus.1']
                 record['argv']=invocation
                 result=subprocess.run(invocation,stdin=subprocess.DEVNULL,capture_output=True,text=True,timeout=180)
                 output=result.stdout+result.stderr; (folder/'boot.log').write_text(output)
@@ -105,6 +120,15 @@ def main():
                     required.update(f'file-sync-{method}-every-{interval}' for method in range(3) for interval in (1,16,128))
                     required.update(('dgram-64k','dgram-oversize','file-osync','file-odsync','file-random','file-extend-accept','file-extend-sync','file-fault-prefix','file-fault-first'))
                     if set(timings)!=required or (not args.off and {s['name'] for s in snapshots}!=required): raise ValueError('missing/extra workload window')
+                if case=='locking':
+                    required={f'locking-{relationship}-0-{waiters}' for relationship in range(3) for waiters in (1,8,32)}
+                    required.update(f'locking-1-{operation}-8' for operation in (1,2,3,4))
+                    if set(timings)!=required or (not args.off and {s['name'] for s in snapshots}!=required): raise ValueError('locking window coverage')
+                    if not args.off:
+                        for snapshot in snapshots:
+                            value=snapshot['values']
+                            if value['foreground.lock15_acquired.value']==0: raise ValueError('write operation lock missing')
+                            if snapshot['name'].startswith('locking-1-0-') and value['foreground.lock15_blocks.value']==0: raise ValueError('same inode contention was not exercised')
                 record['snapshots']=snapshots; record['timings_ns']=timings; records.append(record)
                 (folder/'result.json').write_text(json.dumps(record,indent=2)+'\n')
                 # Fixture identity is kept; disposable writable copies are pruned at stage end.

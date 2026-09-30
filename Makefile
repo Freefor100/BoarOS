@@ -1557,6 +1557,8 @@ test-cost-host:
 	@mkdir -p build/cost/host
 	cc -std=c11 -Wall -Wextra -Werror -idirafter include -DBOAROS_COST_DIAGNOSTICS=1 tests/cost/core_test.c kernel/cost.c -o build/cost/host/core-test
 	build/cost/host/core-test
+	cc -std=c11 -Wall -Wextra -Werror -idirafter include -DBOAROS_COST_DIAGNOSTICS=1 tests/cost/account_test.c kernel/cost.c -o build/cost/host/account-test
+	build/cost/host/account-test
 	python3 -B tests/test-cost-report.py
 test-cost-riscv: test-cost-host
 	$(MAKE) COST_DIAGNOSTICS=1 all

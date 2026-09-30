@@ -192,7 +192,7 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 ## 下一阶段：成本测量优先（2026-09-30 任务计划）
 
 维护者已选择先量化写入、扫描、唤醒和延迟，再决定优化。目标是得到能归因、可重建的
-成本基线，保护 R1–R8 已验收的行为；C0 观测窗口已实施并完成三个启动副本的契约验收；C1 写入与开关对照已交付，C2–C6 正在推进，尚无新的结构优化。
+成本基线，保护 R1–R8 已验收的行为；C0 观测窗口已实施并完成三个启动副本的契约验收；C1 写入与开关对照已交付，C2 锁等待和四组合压力观测已交付，C3–C6 正在推进，尚无新的结构优化。
 起点为本轮最终生产源码，内核 SHA-256
 `0c0c6a77f54160c06f284f19133b6bb6516f7c6e2d8dcb5f0864390ce1361fbb`，
 1091 条 ABI、四组合 io-sleep、scale 与 WAL 恢复证据见上文。
@@ -255,17 +255,17 @@ runner 的 `--case`/Makefile 的 `COST_CASE` 为 contract/write/locking/mprotect
 C1 阶段证据：modern/writeback 的观测开/关各三个独立启动，36 窗口完整，
 独立 usercopy/page-resolution/device-stat wrapper 通过，默认 scale、partial-write、musl/pthread 通过。
 小写 staging 放大、同步频度快照和 guest 时间分布见[成本基线](learning/cost-baseline.md)。
-压力/取消的四组合观测随 C2 的 io-sleep fixture 补齐，尚不能由 C1 结果关闭存储成本总任务。
+压力/取消的四组合观测已随 C2 的 io-sleep fixture 补齐，尚不能由 C1 结果关闭存储成本总任务。
 
 ### C2：整次写门闩、锁等待与唤醒（P-C、R7 成本）
 
 入口为 `kernel/sched/sync.c::acquire`/`kernel_lock_release`、`kernel/sched/wait.c`、
 `fs/vfs.c` 和 `tests/riscv/io_sleep_main.c`，复用 C1 的实际 U-mode 写负载。
 
-- [ ] 分 rank 10/15/20/30/40 记录取得次数、等待/持有时间、阻塞次数、wake_all 唤醒数、重新阻塞、成功取得和切换；固定直方图需同时输出边界和样本数，不报虚假的精确分位数。
-- [ ] 对照同 OFD、独立 OFD 同 inode、不同 inode、单盘/双盘；等待者为 1/8/32，读写混合。覆盖第二块冷页 usercopy、同 inode 映射输入、O_SYNC、截断和取消，观察独立 inode 的进展。
-- [ ] 用既有暂扣/放行握手把受控 I/O 等待和缓存热写分开；核对 wake/重阻塞计数可检出无效唤醒，终止后 pin、锁和缓冲归零，最长观测等待不冒充无饥饿保证。
-- [ ] `make test-cost-riscv COST_CASE=locking` 与 `make test-io-sleep-riscv test-files-partial-write-riscv test-userland-riscv` 通过 legacy/modern × writeback/writethrough；交付门闩自身等待与后端串行成本的分解，本任务不修改公平策略。
+- [x] 分 rank 10/15/20/30/40 记录取得次数、等待/持有时间、阻塞次数、wake_all 唤醒数、重新阻塞、成功取得和切换；固定直方图需同时输出边界和样本数，不报虚假的精确分位数。
+- [x] 对照同 OFD、独立 OFD 同 inode、不同 inode、单盘/双盘；等待者为 1/8/32，读写混合。覆盖第二块冷页 usercopy、同 inode 映射输入、O_SYNC、截断和取消，观察独立 inode 的进展。
+- [x] 用既有暂扣/放行握手把受控 I/O 等待和缓存热写分开；核对 wake/重阻塞计数可检出无效唤醒，终止后 pin、锁和缓冲归零，最长观测等待不冒充无饥饿保证。
+- [x] `make test-cost-riscv COST_CASE=locking` 与 `make test-io-sleep-riscv test-files-partial-write-riscv test-userland-riscv` 通过 legacy/modern × writeback/writethrough；交付门闩自身等待与后端串行成本的分解，本任务不修改公平策略。
 
 ### C3：单页改权的总扫描成本（P-B）
 

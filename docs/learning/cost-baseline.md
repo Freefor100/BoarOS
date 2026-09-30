@@ -34,3 +34,27 @@
 可重建：`make COST_DIAGNOSTICS=1 all`；`python3 -B tests/cost-riscv.py --case write`；`make all`；`python3 -B tests/cost-riscv.py --case write --off --kernel kernel-rv`，按此顺序串行。`python3 -B tests/cost-summary.py <on/results.json> <off/results.json>` 验证三个独立副本和完整 schema，并生成全部非零指标的 min/median/max。执行器互斥拒绝并行成本运行。原始可重建镜像/日志在核对后清理，本文件保留结论与命令。
 
 本阶段尚不选择优化；C2–C6 继续分解锁、扫描、IRQ-off 与真实消费者，再比较候选。
+
+## C2 锁等待（2026-09-30）
+
+单盘与双盘各三个独立启动，每启动13个窗口，所有任务先握手确认 blocked；
+四种 legacy/modern × writeback/writethrough 的低内存 fixture 各三次启动通过，
+每次包含 pressure-io 和 timeout-cancel 两个完成窗口，既有 owner/页/堆基线保持。
+32个等待者的计数在三个副本一致（双盘 backend rank30 的7/9/9除外）：
+
+| 对照 | rank10 阻塞 | rank15 阻塞 | rank15 重阻塞 | rank30 阻塞（单盘） |
+|---|---:|---:|---:|---:|
+| 同 OFD | 528 | 0 | 0 | 0 |
+| 独立 OFD，同 inode | 0 | 528 | 496 | 0 |
+| 不同 inode | 0 | 256 | 225 | 8 |
+
+这是该握手负载下 wake_all 的可重复重阻塞成本；不能由此推断一般吞吐、无饥饿保证或双盘收益。
+同OFD的offset串行挡在rank15之前；独立OFD可见inode整次写门闩；不同inode仍有各自门闩及
+共享后端的等待。向量追加、重叠定位写、同步尾部、截断和取消的内容、offset/大小、状态均通过。
+热路径仅增加默认关闭的观测，不改变门闩或唤醒策略。
+
+固定 kernel SHA-256：`5e9d2fb7c098c5795b98f0ae1fc8f5d0b4ed4550e2d721d5d3efff54a3ef6673`。
+可重建：`make COST_DIAGNOSTICS=1 all`；串行执行
+`python3 -B tests/cost-riscv.py --case locking` 和同命令追加 `--two-disks`；
+`python3 -B tests/io-sleep-riscv.py --cost-output <result.json> --transport modern --cache writeback`，
+对四配置分别重复三次。报告由 `tests/cost-summary.py` 检查完整三副本和 schema。

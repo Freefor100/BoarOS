@@ -68,7 +68,7 @@ def validate_replicas(records):
     """Three independent launches per immutable configuration, with complete identical windows."""
     groups={}
     for record in records:
-        key=tuple(record[k] for k in ('case','cost_diagnostics','transport','cache'))
+        key=tuple(record[k] for k in ('case','cost_diagnostics','transport','cache'))+(record.get('two_disks',False),)
         groups.setdefault(key,[]).append(record)
     if not groups: raise ValueError('empty measurement')
     for key,rows in groups.items():

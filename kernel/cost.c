@@ -11,12 +11,12 @@ enum { cost_histograms = 0
 #include <kernel/cost.def>
 };
 #undef X
-static const char *const names[] = {
+static const char names[][48] = {
 #define X(id, name, unit, hist) #name,
 #include <kernel/cost.def>
 #undef X
 };
-static const char *const units[] = {
+static const char units[][12] = {
 #define X(id, name, unit, hist) #unit,
 #include <kernel/cost.def>
 #undef X
@@ -30,7 +30,7 @@ static uint32_t timebase;
 void kernel_cost_set_timebase(uint32_t frequency) { timebase = frequency; }
 uint32_t kernel_cost_timebase(void) { return timebase; }
 static unsigned char histogram_indexes[COST_METRIC_COUNT];
-static const char *const lanes[] = {"foreground", "background", "observer"};
+static const char lanes[][11] = {"foreground", "background", "observer"};
 static struct {
     struct cost_counter counters[3][COST_METRIC_COUNT];
     uint64_t bins[3][cost_histograms][65];
@@ -44,16 +44,20 @@ static void add_checked(uint64_t *to, uint64_t value)
     else *to += value;
 }
 uint64_t kernel_cost_epoch(void) { return cost.epoch; }
-struct kernel_cost_tag kernel_cost_capture(void)
+struct kernel_cost_tag kernel_cost_task_tag(const struct kernel_cost_task *task)
 {
-    ATOMIC_SCOPE;
-    struct kernel_cost_task *task = kernel_cost_current();
     struct kernel_cost_tag tag = {0};
     if (cost.active && (!task || !task->suppress)) {
         tag.epoch = cost.epoch;
-        tag.lane = cost.fixture || (task && task->epoch == cost.epoch) ? 0 : 1;
+        tag.lane = task && (task->wait_flags & 64) ? 1 :
+            cost.fixture || (task && task->epoch == cost.epoch) ? 0 : 1;
     }
     return tag;
+}
+struct kernel_cost_tag kernel_cost_capture(void)
+{
+    ATOMIC_SCOPE;
+    return kernel_cost_task_tag(kernel_cost_current());
 }
 static unsigned histogram_index(enum kernel_cost_metric metric)
 {
@@ -131,13 +135,17 @@ struct kernel_cost_scope kernel_cost_enter(enum kernel_cost_metric metric)
     }
     return scope;
 }
-void kernel_cost_join(struct kernel_cost_task *task)
+void kernel_cost_rebase(struct kernel_cost_task *task)
 {
     ATOMIC_SCOPE;
-    task->epoch = cost.epoch;
     task->run_start = task->ready_start = task->blocked_start = 0;
     task->scope_epoch = cost.epoch;
     add_checked(&cost.inflight, task->depth);
+}
+void kernel_cost_join(struct kernel_cost_task *task)
+{
+    task->epoch = cost.epoch;
+    kernel_cost_rebase(task);
 }
 void kernel_cost_leave(struct kernel_cost_scope *scope)
 {
@@ -147,9 +155,9 @@ void kernel_cost_leave(struct kernel_cost_scope *scope)
         if (!scope->actor->depth) return; /* Cancel consumes abandoned stack scopes. */
         scope->actor->depth--;
         if (scope->actor->scope_epoch != cost.epoch) return;
-        tag = (struct kernel_cost_tag){cost.epoch, scope->actor->epoch == cost.epoch ? 0 : 1};
+        tag = kernel_cost_task_tag(scope->actor);
     }
-    if (!tag.epoch || tag.epoch != cost.epoch) return;
+    if (!cost.active || !tag.epoch || tag.epoch != cost.epoch) return;
     uint64_t start = scope->start < cost.start ? cost.start : scope->start;
     kernel_cost_sample_tag(tag, scope->metric, kernel_cost_clock() - start);
     if (!cost.inflight) __builtin_trap();
@@ -159,12 +167,12 @@ void kernel_cost_leave(struct kernel_cost_scope *scope)
 void kernel_cost_cancel(struct kernel_cost_task *task)
 {
     ATOMIC_SCOPE;
-    if (task->scope_epoch == cost.epoch && task->depth) {
+    if (cost.active && task->scope_epoch == cost.epoch && task->depth) {
         if (cost.inflight < task->depth) __builtin_trap();
         cost.inflight -= task->depth;
         kernel_cost_add_tag((struct kernel_cost_tag){cost.epoch, 0}, COST_CANCELLED, task->depth);
     }
-    task->depth = 0;
+    task->depth = 0; task->wait_rank = 0; task->wait_flags &= 128;
 }
 int kernel_cost_begin(uint64_t owner, uint32_t frequency, int fixture, int deferred)
 {
@@ -210,6 +218,52 @@ void kernel_cost_abort(uint64_t owner)
 }
 void kernel_cost_inherit(struct kernel_cost_task *child, const struct kernel_cost_task *parent)
 { memset(child, 0, sizeof(*child)); child->epoch = parent->epoch; }
+unsigned kernel_cost_rank(unsigned rank)
+{
+    return rank == 10 ? 0 : rank == 15 ? 1 : rank == 20 ? 2 :
+           rank == 30 ? 3 : rank == 40 ? 4 : 5;
+}
+void kernel_cost_account(struct kernel_cost_task *task)
+{
+    uint64_t now = kernel_cost_clock();
+    uint64_t start = task->run_start < cost.start ? cost.start : task->run_start;
+    if (task->run_start && now >= start)
+        kernel_cost_add_tag(kernel_cost_task_tag(task), task->wait_flags & 128 ? COST_IDLE_TICKS : COST_RUN_TICKS, now - start);
+    task->run_start = now;
+}
+void kernel_cost_block(struct kernel_cost_task *task)
+{
+    kernel_cost_account(task);
+    task->run_start = 0; task->blocked_start = kernel_cost_clock();
+}
+void kernel_cost_ready(struct kernel_cost_task *task)
+{
+    if (!task->ready_start) task->ready_start = kernel_cost_clock();
+}
+void kernel_cost_wake(struct kernel_cost_task *task)
+{
+    uint64_t now = kernel_cost_clock();
+    struct kernel_cost_tag tag = kernel_cost_task_tag(task);
+    uint64_t start = task->blocked_start < cost.start ? cost.start : task->blocked_start;
+    if (task->blocked_start && now >= start) kernel_cost_sample_tag(tag,COST_BLOCKED_TICKS,now-start);
+    kernel_cost_add_tag(tag,COST_WAKES,1);
+    task->blocked_start = 0; task->ready_start = now; task->wait_flags |= 2;
+    if (task->wait_rank) {
+        kernel_cost_add_tag(tag,(enum kernel_cost_metric)(COST_LOCK10_WAKES+(task->wait_rank-1)*8),1);
+        task->wait_flags |= 1;
+    }
+}
+void kernel_cost_switch(struct kernel_cost_task *previous, struct kernel_cost_task *next)
+{
+    if (previous->run_start) kernel_cost_account(previous);
+    previous->run_start = 0;
+    uint64_t now = kernel_cost_clock();
+    uint64_t start = next->ready_start < cost.start ? cost.start : next->ready_start;
+    if (next->ready_start && now >= start)
+        kernel_cost_sample_tag(kernel_cost_task_tag(next),COST_READY_TICKS,now-start);
+    next->ready_start = 0; next->wait_flags &= (uint8_t)~2U; next->run_start = now;
+    if (previous != next) kernel_cost_add_tag(kernel_cost_task_tag(next),COST_SWITCHES,1);
+}
 int kernel_cost_read(unsigned lane, enum kernel_cost_metric metric, uint64_t *value)
 {
     ATOMIC_SCOPE;
@@ -245,13 +299,13 @@ int kernel_cost_format(char *buffer, size_t capacity)
     field(&f, "owner", cost.owner); field(&f, "timebase_hz", cost.frequency);
     field(&f, "resolution_ns_numerator", 1000000000); field(&f, "resolution_ns_denominator", cost.frequency);
     field(&f, "start_ticks", cost.start); field(&f, "end_ticks", cost.end);
-    field(&f, "storage_bytes", sizeof(cost)); field(&f, "task_bytes", sizeof(struct kernel_cost_task));
+    field(&f, "storage_bytes", sizeof(cost)); field(&f, "task_bytes", sizeof(struct kernel_cost_task) + 16);
     field(&f, "overflow", cost.overflow); field(&f, "inflight", cost.inflight);
     for (unsigned lane = 0; lane < 3; ++lane) for (unsigned m = 0; m < COST_METRIC_COUNT; ++m) {
         char key[128]; size_t n = strlen(lanes[lane]); memcpy(key, lanes[lane], n); key[n++] = '.';
         size_t len = strlen(names[m]); memcpy(key + n, names[m], len); n += len; key[n++] = '.'; key[n] = 0;
         text(&f, key); text(&f, "unit="); text(&f, units[m]); text(&f, "\n");
-        const char *suffix[] = {"value", "samples", "max"};
+        const char suffix[][8] = {"value", "samples", "max"};
         uint64_t values[] = {cost.counters[lane][m].value, cost.counters[lane][m].samples, cost.counters[lane][m].maximum};
         for (unsigned j = 0; j < 3; ++j) { text(&f, key); field(&f, suffix[j], values[j]); }
         if (histograms[m]) for (unsigned b = 0; b < 65; ++b) {

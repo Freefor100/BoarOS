@@ -34,6 +34,9 @@ void ready_remove(struct kernel_task *task)
 { kernel_sched_dequeue(&scheduler.runqueue, &task->ready_node); }
 void ready_enqueue(struct kernel_task *task, int head)
 {
+#if BOAROS_COST_DIAGNOSTICS
+    kernel_cost_ready(&task->cost);
+#endif
     if (!task->accounted) {
         task->accounted = 1;
         task->all_next = scheduler.all_tasks;

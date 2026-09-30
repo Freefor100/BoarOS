@@ -160,6 +160,9 @@ void stopped_unlink(struct kernel_task *thread)
 
 void scheduler_wake_task(struct kernel_task *thread, uint32_t reason)
 {
+#if BOAROS_COST_DIAGNOSTICS
+    kernel_cost_wake(&thread->cost);
+#endif
     scheduler_wait_requeue(thread, 0);
     thread->wakeup_deadline = 0;
     thread->wait_interruptible = 0U;
@@ -313,6 +316,9 @@ enum kernel_scheduler_status kernel_scheduler_block_current(
     current->wakeup_deadline = deadline;
     current->wake_reason = (uint32_t)KERNEL_WAIT_WOKEN;
     current->wait_interruptible = (uint32_t)interruptible;
+#if BOAROS_COST_DIAGNOSTICS
+    kernel_cost_block(&current->cost);
+#endif
     current->state = KERNEL_THREAD_STATE_BLOCKED;
     blocked_append(current);
     status = scheduler_switch_current_away(current);

@@ -1,3 +1,4 @@
+#include <kernel/cost.h>
 #include <arch/riscv/context.h>
 #include <arch/riscv/mm.h>
 #include <kernel/open_file.h>
@@ -773,6 +774,19 @@ static void cleanup_worker(void *argument)
     check(riscv_virtio_mmio_block_destroy(&device) == RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK, 153);
     riscv_interrupt_restore(irq);
 }
+#if BOAROS_COST_DIAGNOSTICS
+static void cost_finish(const char *name, unsigned epoch)
+{
+    check(kernel_cost_end(1, 0) == 0, 212);
+    char *report;
+    check(kernel_heap_allocate(&heap, kernel_cost_format_capacity(), (void **)&report) == KERNEL_HEAP_STATUS_OK, 213);
+    check(kernel_cost_format(report, kernel_cost_format_capacity()) > 0, 214);
+    virt_uart_puts("COST SNAPSHOT "); virt_uart_puts(name); virt_uart_putc(' ');
+    virt_uart_putc((char)('0' + epoch)); virt_uart_putc('\n');
+    virt_uart_puts(report); virt_uart_puts("COST END\n");
+    check(kernel_heap_release(&heap, report) == KERNEL_HEAP_STATUS_OK, 215);
+}
+#endif
 void kernel_main(unsigned long hart, const void *dtb)
 {
     (void)hart;
@@ -811,6 +825,9 @@ void kernel_main(unsigned long hart, const void *dtb)
           kernel_vfs_sync(&file, 0, &sequence) == 0, 5);
     check(kernel_page_cache_reclaim(&cache, 64) != 0, 6);
     check(kernel_scheduler_init(&allocator, (uintptr_t)__boot_stack_bottom, (uintptr_t)__boot_stack_top) == KERNEL_SCHEDULER_STATUS_OK, 7);
+#if BOAROS_COST_DIAGNOSTICS
+    check(kernel_cost_begin(1, info.timebase_frequency, 1, 0) == 0, 210);
+#endif
     loading_probe = 1;
     for (uintptr_t i = 0; i < 2; i++) check(kernel_thread_create(reader, (void *)i) == KERNEL_SCHEDULER_STATUS_OK, 8);
     for (unsigned i = 0; i < 2; i++) {
@@ -950,12 +967,18 @@ void kernel_main(unsigned long hart, const void *dtb)
     }
 
     check(physical_page_available(&allocator) == baseline, 16);
+#if BOAROS_COST_DIAGNOSTICS
+    cost_finish("pressure-io", 1);
+#endif
     volatile void *mmio = device.mmio;
     uint64_t mmio_size = device.mmio_size;
     device = (struct riscv_virtio_mmio_block){0};
     check(riscv_virtio_mmio_block_init(&device, mmio, mmio_size, &allocator, dma,
                                       info.timebase_frequency) == RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK &&
           riscv_virtio_mmio_block_enable_irq(&device, source), 62);
+#if BOAROS_COST_DIAGNOSTICS
+    check(kernel_cost_begin(1, info.timebase_frequency, 1, 0) == 0, 211);
+#endif
     virt_uart_puts("I/O handshake: timeout\n");
     while (!virt_uart_rx_ready()) { }
     check(virt_uart_getc() == 'g', 63);
@@ -976,5 +999,8 @@ void kernel_main(unsigned long hart, const void *dtb)
     check(timed_out == 8 && stats.timeouts == 1 && !stats.runtime_polls &&
           riscv_virtio_mmio_block_destroy(&device) == RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK &&
           physical_page_available(&allocator) == baseline, 67);
+#if BOAROS_COST_DIAGNOSTICS
+    cost_finish("timeout-cancel", 2);
+#endif
     virt_uart_puts("BoarOS: I/O sleep tests passed\n"); sbi_shutdown();
 }
