@@ -1,5 +1,6 @@
 #include "vfs_internal.h"
 
+#include <kernel/cost.h>
 #include <kernel/heap.h>
 #include <kernel/sync.h>
 #include <arch/riscv/context.h>
@@ -122,6 +123,7 @@ static size_t find_bucket(struct kernel_page_cache_record *record,
     size_t first_tombstone = SIZE_MAX;
 
     for (;;) {
+        COST_ADD(CACHE_PROBES, 1);
         struct kernel_page_cache_entry *entry = record->buckets[index];
 
         if (entry == 0) {
@@ -819,6 +821,7 @@ int kernel_page_cache_write(struct kernel_page_cache *cache,
         if (offset + count > old_size)
             kernel_page_cache_resize(cache, entry->node,
                                       old_size, offset + count);
+        COST_ADD(CACHE_COPY, count);
         memcpy((unsigned char *)page + start, source + *written, count);
         if (!entry->dirty_end) cache->record->dirty_pages++;
         if (entry->dirty_end == 0 || start < entry->dirty_begin)
@@ -888,6 +891,8 @@ static int writeback_entry(struct kernel_page_cache *cache,
     end = entry->dirty_end;
     if (end > limit - start) end = (size_t)(limit - start);
     generation = entry->generation;
+    COST_ADD(SNAPSHOT_COPY, BOAROS_PAGE_SIZE);
+    COST_ADD(WRITEBACK_REQUESTED, end - begin);
     memcpy(snapshot, page, BOAROS_PAGE_SIZE);
     riscv_interrupt_restore(irq);
     result = kernel_vfs_node_writeback(entry->node,
@@ -895,6 +900,7 @@ static int writeback_entry(struct kernel_page_cache *cache,
                     (unsigned char *)snapshot + begin, end - begin, &written);
     if (reserved) cache->record->snapshot_busy = 0;
     else (void)physical_page_release(cache->allocator, snapshot_address);
+    COST_ADD(WRITEBACK_ACCEPTED, written);
     if (written > end - begin) __builtin_trap();
     if (result == 0 && written != end - begin) result = -KERNEL_EIO;
     if (result == 0 && generation == entry->generation) {
@@ -924,6 +930,7 @@ int kernel_page_cache_writeback_range(struct kernel_page_cache *cache,
     size_t capacity = 0, count = 0;
     for (struct kernel_page_cache_entry *entry = *kernel_vfs_node_cache_pages(node);
          entry; entry = entry->node_next) {
+        COST_ADD(WRITEBACK_VISITS, 1);
         uint64_t page_start = entry->page_index << BOAROS_PAGE_SHIFT;
         if (entry->dirty_end && page_start < end && page_start + BOAROS_PAGE_SIZE > start) capacity++;
     }
@@ -940,6 +947,7 @@ int kernel_page_cache_writeback_range(struct kernel_page_cache *cache,
      * may insert another page while writeback owns the shared inode lock. */
     for (struct kernel_page_cache_entry *entry = *kernel_vfs_node_cache_pages(node);
          entry; entry = entry->node_next) {
+        COST_ADD(WRITEBACK_VISITS, 1);
         uint64_t page_start = entry->page_index << BOAROS_PAGE_SHIFT;
         if (!entry->dirty_end || page_start >= end || page_start + BOAROS_PAGE_SIZE <= start) continue;
         if (count == capacity || physical_page_acquire(cache->allocator, entry->physical_address) != PHYSICAL_PAGE_STATUS_OK)

@@ -1158,9 +1158,16 @@ static enum kernel_files_status write_request(
     uint64_t count, int positioned, uint64_t requested_offset,
     int64_t *linux_result)
 {
+    COST_SCOPE(write_cost, OPERATION_TICKS);
+    COST_IO_SCOPE(io_cost,
+        kernel_socket_is_unix_datagram(kernel_open_file_socket(description)) ? 2 :
+        kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_REGULAR ? 0 :
+        kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_SOCKET ? 1 : 3);
+    COST_IO_ADD(0, 1); COST_IO_ADD(1, count);
     if (kernel_socket_is_unix_datagram(kernel_open_file_socket(description))) {
         *linux_result = kernel_socket_write_datagram(&description, mm, iov,
             iov_count, count, (description->open_flags & KERNEL_FILES_O_NONBLOCK) != 0);
+        COST_IO_ADD(2, *linux_result > 0 ? (uint64_t)*linux_result : 0);
         return KERNEL_FILES_STATUS_OK;
     }
     KERNEL_LOCK_SCOPE(offset_guard);
@@ -1184,10 +1191,12 @@ static enum kernel_files_status write_request(
         }
         staging = buffer.data;
         capacity = BOAROS_PAGE_SIZE;
+        COST_IO_ADD(5, BOAROS_PAGE_SIZE);
     }
     enum kernel_files_status status = buffered_write_request(files, mm,
         description, iov, iov_count, count, positioned, requested_offset,
         linux_result, staging, capacity);
+    if (status == KERNEL_FILES_STATUS_OK) COST_IO_ADD(2, *linux_result > 0 ? (uint64_t)*linux_result : 0);
     if (buffer.allocator != 0) kernel_task_io_buffer_release(&buffer);
     if (status == KERNEL_FILES_STATUS_OK && *linux_result > 0 &&
         kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_REGULAR &&

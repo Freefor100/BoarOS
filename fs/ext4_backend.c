@@ -3,6 +3,7 @@
 #include "vfs_internal.h"
 #include "record_lock.h"
 
+#include <kernel/cost.h>
 #include <kernel/block.h>
 #include <kernel/errno.h>
 #include <kernel/file_mapping.h>
@@ -1327,6 +1328,7 @@ static int ext4_backend_pread(struct kernel_vfs_node *node,
 static int ext4_backend_writeback(struct kernel_vfs_node *node, uint64_t offset,
                               const void *buffer, size_t size, size_t *written)
 {
+    COST_ADD(BACKEND_REQUESTED, size);
     *written = 0;
     struct ext4_lock *locks = &lwext4_instance(node->instance)->locks;
     locks->lock(locks->context);
@@ -1335,6 +1337,7 @@ static int ext4_backend_writeback(struct kernel_vfs_node *node, uint64_t offset,
     locks->unlock(locks->context);
     if (result == EOK && *written != size) result = EIO;
     if (result != EOK) kernel_vfs_record_writeback_error(node, lwext4_error(result));
+    COST_ADD(BACKEND_ACCEPTED, *written);
     return lwext4_error(result);
 }
 

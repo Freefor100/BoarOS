@@ -7,7 +7,7 @@
 
 `kernel/cost.c` 保持固定聚合，`kernel/sched/cost.c` 连接时钟、任务关系和用户返回。
 诊断存储不持有任务、MM、inode 或 OFD 引用；任务仅有标量 epoch、运行/等待时间戳、
-在途深度及控制抑制状态（当前 48 字节），原任务元数据页容量断言继续生效。
+在途深度及控制抑制状态（当前 56 字节），原任务元数据页容量断言继续生效。
 热路径不分配、不打印、不睡眠；原始 CSR SIE save/restore 保护聚合，不走被观测的锁。
 
 仅观测版本提供 `/proc/boaros_cost_control`（完整 `begin\n`、`end\n`）及只读
@@ -37,7 +37,18 @@ blocked/ready 的实际路径将在 C2 接入，未接入不能由零值推断�
 
 验证入口：`make test-cost-host`、`make test-cost-riscv COST_CASE=contract`。
 后者串行运行三个独立启动副本，在启动前保存 kernel/ELF/fixture 身份与源码内容哈希。
-目前交付 contract；未交付 write/locking/mprotect/deadline/latency/consumer 明确失败，
+目前交付 contract/write；未交付 locking/mprotect/deadline/latency/consumer 明确失败，
 `all` 不跳过缺项。独立报告读器拒绝缺项、重复、未知键、单位错误、旧 epoch、
 直方图不一致、incomplete 和 overflow。当前 Python discovery 不收集带连字符的文件，
 因此 host target 直接运行 `python3 -B tests/test-cost-report.py`，必须实际执行测试。
+
+C1 进一步按 file/stream/dgram/other 记录 calls、requested/accepted、实际 usercopy、页解析、
+staging 累计请求容量、heap 请求字节和成功物理页。短写以实际接受前缀为准；同步尾部失败
+不会抹掉先前接受量。全局 heap/page 指标是实际 allocator 入口和成功结果，按本层单位记录，
+不能把 heap 字节、物理页及 staging 引用容量相加当驻留峰值。
+缓存计 bucket probes、实际复制、范围写回的两轮遍历、完整页快照与逻辑后端接受量。
+设备按 registry 的磁盘0/1/其他聚合；请求在 submit 保存标量 epoch/lane，IRQ 完成和 reset
+使用提交身份，旧请求不能污染新窗口。原设备/MM 统计契约不变，fixture 未登记设备属于 other。
+所有真实磁盘字节为 unknown_read/unknown_write，后端逻辑数据不足以证明扇区分类。
+复制/解析和设备请求由 scale 的独立 wrapper/原统计交叉验证；三个副本及完整窗口由
+`tests/cost-summary.py` 再验证。C1 结果和开关开销见[成本基线](../learning/cost-baseline.md)。

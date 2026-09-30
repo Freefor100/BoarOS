@@ -192,7 +192,7 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 ## 下一阶段：成本测量优先（2026-09-30 任务计划）
 
 维护者已选择先量化写入、扫描、唤醒和延迟，再决定优化。目标是得到能归因、可重建的
-成本基线，保护 R1–R8 已验收的行为；C0 观测窗口已实施并完成三个启动副本的契约验收；C1–C6 正在推进，尚无新的结构优化。
+成本基线，保护 R1–R8 已验收的行为；C0 观测窗口已实施并完成三个启动副本的契约验收；C1 写入与开关对照已交付，C2–C6 正在推进，尚无新的结构优化。
 起点为本轮最终生产源码，内核 SHA-256
 `0c0c6a77f54160c06f284f19133b6bb6516f7c6e2d8dcb5f0864390ce1361fbb`，
 1091 条 ABI、四组合 io-sleep、scale 与 WAL 恢复证据见上文。
@@ -251,6 +251,11 @@ runner 的 `--case`/Makefile 的 `COST_CASE` 为 contract/write/locking/mprotect
 - [ ] 用普通 write、O_SYNC、O_DSYNC、每次/每 16 次/结束时 fsync 或 fdatasync，以及共享映射+msync 分组对照；分别改变顺序/随机、覆盖/扩展、冷/热和压力条件，不把全部因素一次混成笛卡尔积。
 - [ ] 每个基准配置使用三个独立启动副本；内容、offset、大小、短写、EFAULT/EIO/OOM 和资源基线先验收，再保存计数和客体时间分布。既有 1 MiB 256 分块/页解析门槛继续独立保护。
 - [ ] 窄验证 `make test-scale-riscv test-files-partial-write-riscv`，再 `make test-cost-riscv COST_CASE=write` 与 `make test-userland-riscv`；交付各层放大比和错误路径结果，不预先宣称小写分配或 flush 是主瓶颈。
+
+C1 阶段证据：modern/writeback 的观测开/关各三个独立启动，36 窗口完整，
+独立 usercopy/page-resolution/device-stat wrapper 通过，默认 scale、partial-write、musl/pthread 通过。
+小写 staging 放大、同步频度快照和 guest 时间分布见[成本基线](learning/cost-baseline.md)。
+压力/取消的四组合观测随 C2 的 io-sleep fixture 补齐，尚不能由 C1 结果关闭存储成本总任务。
 
 ### C2：整次写门闩、锁等待与唤醒（P-C、R7 成本）
 

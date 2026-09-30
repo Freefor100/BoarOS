@@ -97,6 +97,20 @@ void kernel_cost_sample_tag(struct kernel_cost_tag tag, enum kernel_cost_metric 
     add_checked(&cost.bins[tag.lane][histogram_index(metric)][bucket], 1);
     observer(start);
 }
+struct kernel_cost_io_scope kernel_cost_io_enter(unsigned operation)
+{
+    struct kernel_cost_io_scope scope = {kernel_cost_current(), 0};
+    if (scope.actor) { scope.previous = scope.actor->operation; scope.actor->operation = operation + 1; }
+    return scope;
+}
+void kernel_cost_io_leave(struct kernel_cost_io_scope *scope)
+{ if (scope->actor) scope->actor->operation = scope->previous; }
+void kernel_cost_add_io(unsigned offset, uint64_t value)
+{
+    struct kernel_cost_task *task = kernel_cost_current();
+    if (task && task->operation && task->operation <= 4)
+        kernel_cost_add((enum kernel_cost_metric)(COST_FILE_CALLS + (task->operation - 1) * 8 + offset), value);
+}
 void kernel_cost_add(enum kernel_cost_metric metric, uint64_t value)
 { kernel_cost_add_tag(kernel_cost_capture(), metric, value); }
 void kernel_cost_sample(enum kernel_cost_metric metric, uint64_t value)
@@ -196,6 +210,13 @@ void kernel_cost_abort(uint64_t owner)
 }
 void kernel_cost_inherit(struct kernel_cost_task *child, const struct kernel_cost_task *parent)
 { memset(child, 0, sizeof(*child)); child->epoch = parent->epoch; }
+int kernel_cost_read(unsigned lane, enum kernel_cost_metric metric, uint64_t *value)
+{
+    ATOMIC_SCOPE;
+    if (cost.active || cost.pending) return -KERNEL_EBUSY;
+    if (!value || lane >= 3 || (unsigned)metric >= COST_METRIC_COUNT) return -KERNEL_EINVAL;
+    *value = cost.counters[lane][metric].value; return 0;
+}
 struct formatter { char *buffer; size_t length, capacity; int error; };
 static void text(struct formatter *f, const char *s)
 {

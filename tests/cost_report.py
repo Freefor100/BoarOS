@@ -63,3 +63,29 @@ def percentile(bins, quantile):
 def validate_expected(snapshot, expected):
     for key,value in expected.items():
         if snapshot.get(key) != value: raise ValueError(f'independent expected {key}: {snapshot.get(key)} != {value}')
+
+def validate_replicas(records):
+    """Three independent launches per immutable configuration, with complete identical windows."""
+    groups={}
+    for record in records:
+        key=tuple(record[k] for k in ('case','cost_diagnostics','transport','cache'))
+        groups.setdefault(key,[]).append(record)
+    if not groups: raise ValueError('empty measurement')
+    for key,rows in groups.items():
+        if len(rows)!=3 or {r['replica'] for r in rows}!={0,1,2}: raise ValueError('three distinct boot replicas required')
+        for field in ('kernel_sha256','elf_sha256','source_sha256'):
+            if len({r[field] for r in rows})!=1: raise ValueError('changed immutable input: '+field)
+        if len({r['fixture_sha256'] for r in rows})!=3: raise ValueError('independent fixtures required')
+        if any(r['replicas']!=3 or not r['acceptance'] for r in rows): raise ValueError('pilot is not acceptance')
+        if len({tuple(sorted(r['timings_ns'])) for r in rows})!=1: raise ValueError('missing workload phase')
+        for row in rows:
+            if row['cost_diagnostics'] and not row['snapshots']: raise ValueError('missing snapshots')
+            if not row['cost_diagnostics'] and row['snapshots']: raise ValueError('unexpected diagnostic snapshots')
+            seen=set()
+            for snapshot in row['snapshots']:
+                if snapshot['name'] in seen: raise ValueError('duplicate window')
+                seen.add(snapshot['name'])
+                text=''.join(f'{k}={v}\n' for k,v in snapshot['values'].items())
+                parse(text,snapshot['values']['epoch'])
+            if row['cost_diagnostics'] and row['timings_ns'] and seen!=set(row['timings_ns']): raise ValueError('window coverage')
+    return groups

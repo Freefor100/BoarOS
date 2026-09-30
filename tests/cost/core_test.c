@@ -9,7 +9,7 @@ uint64_t kernel_cost_lock(void) { return 0; }
 void kernel_cost_unlock(uint64_t status) { (void)status; }
 uint64_t kernel_cost_clock(void) { return clock_tick; }
 struct kernel_cost_task *kernel_cost_current(void) { return &actor; }
-static char output[65536];
+static char output[1048576];
 int main(void)
 {
     assert(kernel_cost_end(9, 0) == -KERNEL_EINVAL);

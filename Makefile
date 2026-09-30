@@ -1464,6 +1464,7 @@ $(BUILD_DIR)/tests/kernel-scale-rv: $(SCALE_OBJECTS) arch/riscv/linker.ld
 	$(CC) $(LDFLAGS) -Wl,--wrap=riscv_sv39_current_satp \
 		-Wl,--wrap=physical_page_allocate -Wl,--wrap=kernel_heap_allocate_zeroed \
 		-Wl,--wrap=kernel_heap_resize -Wl,--wrap=kernel_heap_allocate \
+		-Wl,--wrap=kernel_copy_from_user \
 		-Wl,--wrap=kernel_wait_queue_wake_all \
 		-o $@ $(SCALE_OBJECTS)
 .PHONY: test-scale-riscv

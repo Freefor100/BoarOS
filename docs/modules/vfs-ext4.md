@@ -229,3 +229,5 @@ proc mounts 保留用户给出的磁盘来源名，并正确标识 tmpfs。
 计算，只扣一次低水位预算。安全分配失败至多等待共同一轮的首次实际释放，或所有
 参与 worker 完成，不逐盘串行等待。测试入口包括 test-io-sleep-riscv 的两个非空
 缓存、test-root-multi-block-riscv 的真实双盘与重启，以及 test-lwext4-instances-host。
+
+成本观测分别记录缓存范围遍历、完整页快照和逻辑后端写回；真实扇区仍列 unknown，不由后端入口推断 data/metadata/journal，见[成本观测](kernel-cost.md)。

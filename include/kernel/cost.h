@@ -8,7 +8,7 @@
 #if BOAROS_COST_DIAGNOSTICS
 struct kernel_cost_task {
     uint64_t epoch, run_start, ready_start, blocked_start, scope_epoch;
-    uint32_t depth, suppress;
+    uint32_t depth, suppress, operation;
 };
 _Static_assert(sizeof(struct kernel_cost_task) <= 64, "cost task budget");
 enum kernel_cost_metric {
@@ -17,6 +17,12 @@ enum kernel_cost_metric {
 #undef X
     COST_METRIC_COUNT
 };
+struct kernel_cost_io_scope { struct kernel_cost_task *actor; unsigned previous; };
+struct kernel_cost_io_scope kernel_cost_io_enter(unsigned operation);
+void kernel_cost_io_leave(struct kernel_cost_io_scope *scope);
+void kernel_cost_add_io(unsigned offset, uint64_t value);
+#define COST_IO_SCOPE(name, operation) struct kernel_cost_io_scope name __attribute__((cleanup(kernel_cost_io_leave))) = kernel_cost_io_enter(operation)
+#define COST_IO_ADD(offset, value) kernel_cost_add_io(offset, value)
 struct kernel_cost_tag { uint64_t epoch; unsigned lane; };
 struct kernel_cost_scope {
     struct kernel_cost_tag tag;
@@ -43,6 +49,7 @@ int kernel_cost_end(uint64_t owner, int deferred);
 void kernel_cost_boundary(void);
 void kernel_cost_abort(uint64_t owner);
 int kernel_cost_format(char *buffer, size_t capacity);
+int kernel_cost_read(unsigned lane, enum kernel_cost_metric metric, uint64_t *value);
 size_t kernel_cost_format_capacity(void);
 void kernel_cost_set_timebase(uint32_t frequency);
 uint32_t kernel_cost_timebase(void);
@@ -60,6 +67,8 @@ void kernel_cost_inherit(struct kernel_cost_task *child, const struct kernel_cos
 #define COST_SAMPLE(metric, value) kernel_cost_sample(COST_##metric, (value))
 #define COST_SCOPE(name, metric) struct kernel_cost_scope name __attribute__((cleanup(kernel_cost_leave))) = kernel_cost_enter(COST_##metric)
 #else
+#define COST_IO_SCOPE(name, operation) ((void)0)
+#define COST_IO_ADD(offset, value) ((void)0)
 #define COST_ADD(metric, value) ((void)0)
 #define COST_SAMPLE(metric, value) ((void)0)
 #define COST_SCOPE(name, metric) ((void)0)

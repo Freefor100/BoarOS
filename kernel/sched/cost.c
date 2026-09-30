@@ -9,8 +9,9 @@ uint64_t kernel_cost_lock(void)
 { uint64_t s; __asm__ volatile("csrrc %0, sstatus, %1" : "=r"(s) : "r"((uint64_t)2) : "memory"); return s; }
 void kernel_cost_unlock(uint64_t s)
 { if (s & 2) __asm__ volatile("csrsi sstatus, 2" ::: "memory"); }
+static struct kernel_cost_task bootstrap_cost;
 struct kernel_cost_task *kernel_cost_current(void)
-{ return scheduler.current ? &scheduler.current->cost : 0; }
+{ return scheduler.current ? &scheduler.current->cost : &bootstrap_cost; }
 static struct kernel_cost_tag task_tag(const struct kernel_cost_task *task)
 { return (struct kernel_cost_tag){kernel_cost_epoch(), task->epoch == kernel_cost_epoch() ? 0 : 1}; }
 void kernel_cost_account(struct kernel_cost_task *task)

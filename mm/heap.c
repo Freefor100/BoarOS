@@ -1,3 +1,4 @@
+#include <kernel/cost.h>
 #include <kernel/sync.h>
 #include <kernel/heap.h>
 
@@ -507,6 +508,7 @@ enum kernel_heap_status kernel_heap_allocate(
         return KERNEL_HEAP_STATUS_INVALID;
     }
     heap->statistics.allocation_calls++;
+    COST_ADD(HEAP_CALLS, 1); COST_ADD(HEAP_REQUESTED, size);
     if (size == 0U) {
         *pointer = 0;
         return KERNEL_HEAP_STATUS_OK;
@@ -519,10 +521,12 @@ enum kernel_heap_status kernel_heap_allocate(
     }
     if (status != KERNEL_HEAP_STATUS_OK) {
         heap->statistics.allocation_failures++;
+        COST_ADD(HEAP_FAILURES, 1);
         return status;
     }
 
     heap->statistics.live_allocations++;
+    COST_ADD(HEAP_ACCEPTED, size); COST_IO_ADD(6, size);
     *pointer = result;
     return KERNEL_HEAP_STATUS_OK;
 }

@@ -1,3 +1,4 @@
+#include <kernel/cost.h>
 #include <kernel/page.h>
 #include <kernel/physical_page.h>
 
@@ -1008,6 +1009,7 @@ enum physical_page_status physical_page_allocate_order(
     uint32_t order,
     uint64_t *address)
 {
+    COST_ADD(PAGE_CALLS, 1);
     enum physical_page_status status =
         physical_page_allocate_order_once(allocator, order, address);
 
@@ -1033,6 +1035,9 @@ enum physical_page_status physical_page_allocate_order(
                                                    address);
     }
 
+    if (status == PHYSICAL_PAGE_STATUS_OK) {
+        COST_ADD(PAGE_ACCEPTED, order_page_count(order)); COST_IO_ADD(7, order_page_count(order));
+    } else COST_ADD(PAGE_FAILURES, 1);
     return status;
 }
 

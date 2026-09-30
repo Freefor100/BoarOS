@@ -1,3 +1,4 @@
+#include <kernel/cost.h>
 #include <arch/riscv/mm.h>
 #include <arch/riscv/sbi.h>
 #include <arch/riscv/virt_uart.h>
@@ -23,6 +24,20 @@
 static unsigned char pool[128 * MIB] __attribute__((aligned(4096)));
 static unsigned char payload[4096];
 static uint64_t active_satp;
+#if BOAROS_COST_DIAGNOSTICS
+static unsigned cost_copy_measuring;
+static uint64_t cost_copy_observed;
+#endif
+enum kernel_uaccess_status __real_kernel_copy_from_user(struct kernel_mm *, void *, uint64_t, size_t, size_t *);
+enum kernel_uaccess_status __wrap_kernel_copy_from_user(struct kernel_mm *mm, void *to, uint64_t from, size_t size, size_t *copied)
+{
+    enum kernel_uaccess_status status = __real_kernel_copy_from_user(mm, to, from, size, copied);
+#if BOAROS_COST_DIAGNOSTICS
+    if (cost_copy_measuring) cost_copy_observed += *copied;
+#endif
+    return status;
+}
+
 /* This boot fixture has no scheduled tasks. Reject any attempted blocking;
  * only an empty socket queue's notification may be ignored. */
 enum kernel_scheduler_status __wrap_kernel_wait_queue_wake_all(struct kernel_wait_queue *queue)
@@ -560,9 +575,25 @@ void kernel_main(unsigned long hart, const void *dtb)
     struct kernel_files_statistics before, after;
     kernel_files_get_statistics(&files, &before);
     uint64_t resolutions = kernel_uaccess_page_resolutions();
+#if BOAROS_COST_DIAGNOSTICS
+    struct riscv_virtio_mmio_block_statistics device_before, device_after;
+    riscv_virtio_mmio_block_get_statistics(&device, &device_before);
+    check(kernel_cost_begin(1, info.timebase_frequency, 1, 0) == 0, 190);
+    cost_copy_measuring = 1;
+#endif
     check(kernel_files_write(&files, &mm, fd, BUFFER, MIB, &result) == KERNEL_FILES_STATUS_OK &&
           result == MIB, 9);
     resolutions = kernel_uaccess_page_resolutions() - resolutions;
+#if BOAROS_COST_DIAGNOSTICS
+    cost_copy_measuring = 0;
+    check(kernel_cost_end(1, 0) == 0, 191);
+    uint64_t metric;
+    check(kernel_cost_read(0, COST_COPY_FROM_USER, &metric) == 0 && metric == cost_copy_observed && metric == MIB, 192);
+    check(kernel_cost_read(0, COST_USER_RESOLUTIONS, &metric) == 0 && metric == resolutions, 193);
+    riscv_virtio_mmio_block_get_statistics(&device, &device_after);
+    check(kernel_cost_read(0, COST_DEVICE_OTHER_REQUESTS, &metric) == 0 && metric == device_after.requests - device_before.requests, 194);
+    number("cost wrapper copy bytes: ", cost_copy_observed);
+#endif
     kernel_files_get_statistics(&files, &after);
     number("file write chunks: ", after.write_chunks - before.write_chunks);
     number("file user-page resolutions: ", resolutions);

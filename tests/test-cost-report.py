@@ -1,5 +1,5 @@
 import unittest
-from cost_report import parse, schema, percentile, validate_expected
+from cost_report import parse, schema, percentile, validate_expected, validate_replicas
 
 class CostReportTest(unittest.TestCase):
     def valid(self):
@@ -34,6 +34,15 @@ class CostReportTest(unittest.TestCase):
             with self.assertRaises(ValueError): validate_expected(snapshot, expected)
         snapshot['background.operations.value']=128
         with self.assertRaises(ValueError): validate_expected(snapshot, {'foreground.operations.value':128})
+    def test_replica_completeness(self):
+        def row(i): return dict(case='write',cost_diagnostics=0,transport='modern',cache='writeback',
+            replica=i,replicas=3,acceptance=True,kernel_sha256='k',elf_sha256='e',
+            source_sha256='s',fixture_sha256=str(i),snapshots=[],timings_ns={'small':1})
+        validate_replicas([row(i) for i in range(3)])
+        for rows in ([row(0)], [row(0),row(0),row(2)], [row(0),row(1),row(2),row(3)]):
+            with self.assertRaises(ValueError): validate_replicas(rows)
+        rows=[row(i) for i in range(3)]; rows[2]['elf_sha256']='changed'
+        with self.assertRaises(ValueError): validate_replicas(rows)
     def test_bucket_intervals(self):
         bins=[0]*65; bins[0]=1; bins[5]=2; bins[64]=1
         self.assertEqual(percentile(bins, .5),(16,31))

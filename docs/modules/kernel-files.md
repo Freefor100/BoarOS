@@ -248,3 +248,5 @@ AT_SYMLINK_FOLLOW、AT_EMPTY_PATH。独立打开的硬链接有独立 OFD，记�
 只有 mmap 缺页或实际写入才消耗后备页配额。
 
 普通文件整次 write/writev/pwrite 在有界 staging 循环外取得 inode 操作门闩（rank 15），直到同步写收尾返回才释放；非定位写先取得共享 OFD offset 锁（rank 10）。truncate 与直接 VFS pwrite/append 走同一门闩，fault/read/writeback 不取得它。`make test-io-sleep-riscv` 以独立 OFD 在块间复制等待时安排追加、重叠定位写与截断，检查整次结果和最终清理；`make test-userland-riscv` 补实际同 inode 未驻留映射缓冲和多页向量追加。
+
+成本诊断版本记录真实请求/接受和 staging/usercopy，保持短写及同步尾部错误的原行为；接口与单位见[成本观测](kernel-cost.md)。
