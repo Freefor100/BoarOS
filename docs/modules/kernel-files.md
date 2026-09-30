@@ -246,3 +246,5 @@ make test-riscv
 AT_SYMLINK_FOLLOW、AT_EMPTY_PATH。独立打开的硬链接有独立 OFD，记录锁按 inode
 共享；同 OFD 的 dup/fork 共享规则不变。tmpfs read/readv/pread 用无分配空洞读路径，
 只有 mmap 缺页或实际写入才消耗后备页配额。
+
+普通文件整次 write/writev/pwrite 在有界 staging 循环外取得 inode 操作门闩（rank 15），直到同步写收尾返回才释放；非定位写先取得共享 OFD offset 锁（rank 10）。truncate 与直接 VFS pwrite/append 走同一门闩，fault/read/writeback 不取得它。`make test-io-sleep-riscv` 以独立 OFD 在块间复制等待时安排追加、重叠定位写与截断，检查整次结果和最终清理；`make test-userland-riscv` 补实际同 inode 未驻留映射缓冲和多页向量追加。

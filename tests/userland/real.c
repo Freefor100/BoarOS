@@ -39,6 +39,7 @@
 #include "shared_futex.h"
 #include "sysv_shm.h"
 #include "fault_signals.h"
+#include "write_operations.h"
 
 __attribute__((section(".rodata.unlink_test_far"), aligned(4096)))
 const char unlink_far_page[8192] = "UNLINK_DEMAND_FAULT_PAGE_PAYLOAD";
@@ -2965,6 +2966,9 @@ int main(int argc, char **argv)
         (ssize_t)(sizeof(signal_marker) - 1)) {
         return 40;
     }
+    int operation_result = check_write_operations();
+    if (operation_result) { fprintf(stderr, "write operation check failed: %d\n", operation_result); return 1; }
+    puts("BoarOS: real userland write operation checks ok");
     int fault_result = check_fault_signals();
     if (fault_result) { fprintf(stderr, "fault signal check failed: %d\n", fault_result); return 1; }
     puts("BoarOS: real userland synchronous fault checks ok");

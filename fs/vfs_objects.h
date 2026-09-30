@@ -38,6 +38,7 @@ struct kernel_vfs_node {
     void *backend_data;
     uint64_t inode;
     uint64_t max_size;
+    struct kernel_mutex write_operation;
     struct kernel_rwlock io_lock;
     uint64_t size;
     uint64_t writeback_error_sequence;

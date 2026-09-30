@@ -1158,6 +1158,8 @@ int kernel_vfs_pwrite(struct kernel_vfs_file *file,
         return -KERNEL_EINVAL;
     }
     node = file->private_data;
+    KERNEL_LOCK_SCOPE(operation_guard);
+    kernel_vfs_file_write_lock(file, &operation_guard);
     KERNEL_LOCK_SCOPE(node_guard);
     kernel_vfs_node_lock(node, &node_guard, 1);
     if ((node->mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFREG) {
@@ -1207,6 +1209,8 @@ int kernel_vfs_append(struct kernel_vfs_file *file,
         return -KERNEL_EINVAL;
     }
     node = file->private_data;
+    KERNEL_LOCK_SCOPE(operation_guard);
+    kernel_vfs_file_write_lock(file, &operation_guard);
     KERNEL_LOCK_SCOPE(node_guard);
     kernel_vfs_node_lock(node, &node_guard, 1);
     if ((node->mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFREG) {
@@ -1248,6 +1252,8 @@ int kernel_vfs_ftruncate(struct kernel_vfs_file *file,
         return -KERNEL_EINVAL;
     }
     node = file->private_data;
+    KERNEL_LOCK_SCOPE(operation_guard);
+    kernel_vfs_file_write_lock(file, &operation_guard);
     KERNEL_LOCK_SCOPE(node_guard);
     kernel_vfs_node_lock(node, &node_guard, 1);
     if ((node->mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFREG) {
@@ -1985,6 +1991,15 @@ struct kernel_page_cache *kernel_vfs_file_page_cache(
 int kernel_vfs_node_try_read(struct kernel_vfs_node *node, struct kernel_lock_guard *guard)
 { return kernel_rwlock_try_read(&node->io_lock, guard); }
 
+void kernel_vfs_file_write_lock(struct kernel_vfs_file *file, struct kernel_lock_guard *guard)
+{
+    if (!file || file->state != VFS_FILE_STATE_LIVE || !file->private_data) __builtin_trap();
+    struct kernel_vfs_node *node = file->private_data;
+    /* writev 外层已持有门闩，内部 pwrite/append 不递归取得同一锁。 */
+    if (kernel_lock_held(&node->write_operation.lock, 1)) return;
+    kernel_mutex_lock(&node->write_operation, guard);
+}
+
 void kernel_vfs_node_lock(struct kernel_vfs_node *node, struct kernel_lock_guard *guard, int write)
 {
     if (!node || !node->references) __builtin_trap();
@@ -2206,6 +2221,7 @@ int kernel_vfs_publish_node(struct kernel_vfs_mount *mount,
         node->mount = mount;
         node->references = 1;
         node->open_files = 1;
+        kernel_mutex_init(&node->write_operation, 15, (uintptr_t)node);
         kernel_rwlock_init(&node->io_lock, 30, (uintptr_t)node);
         kernel_record_lock_state_init(&node->record_locks);
         node->next = instance->nodes;

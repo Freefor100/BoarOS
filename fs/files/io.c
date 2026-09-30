@@ -1166,6 +1166,9 @@ static enum kernel_files_status write_request(
     if ((!positioned && kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_REGULAR) ||
         kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_GENERATED)
         kernel_mutex_lock(&description->offset_lock, &offset_guard);
+    KERNEL_LOCK_SCOPE(operation_guard);
+    if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_REGULAR)
+        kernel_vfs_file_write_lock(&description->file, &operation_guard);
     struct kernel_task_io_buffer buffer = {0};
     unsigned char small[KERNEL_FILES_WRITE_STAGING];
     unsigned char *staging = small;

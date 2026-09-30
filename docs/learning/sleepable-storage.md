@@ -83,3 +83,9 @@ PR CI 增加可睡眠存储并发门槛，失败保存 guest/server 日志和磁
 固定 musl 1.2.5 的 `src/sched/sched_setscheduler.c` 包装器直接返回 ENOSYS；出处为 `references/musl/musl-1.2.5.tar.gz`，SHA-256 `a9a118bbe84d8764da0ea0d28b3ab3fae8477fc7e4085d90102b8596fc7c75e4`。该验收程序明确使用 `syscall(SYS_sched_setscheduler, ...)` 进入内核，避免将 libc 包装器存根误判为内核调度失败。NBD 的普通 event 日志只记录 WRITE/FLUSH，READ 的实际请求由既有 hold/drain 协议证明。
 
 本阶段最终内核 SHA-256 `be5ca22629c904a427241b0f92e9d561d0312952e787ab75870ec4beae0143b3` 与用户 ELF `99db95d4a1c4052fc3fee682922593c45c0d34d7682783eec97f0a98c909e46b` 已完整通过 legacy/modern × writeback/writethrough 四组合；每组合各执行 FIFO、RR 一轮。每次退出均释放 6 个任务栈，最小空余 4360 字节、最大使用 3816 字节，且通过双盘持久字节、fsck 和根页/堆基线检查。可重建入口为 `make test-multi-disk-rt-riscv`；独立指定内核及 ELF 时使用 `python3 -B tests/multi-disk-io-riscv.py --rt-load --kernel <kernel> --program <multi-disk-io-rv>`。这份 RT 组合结果不代替独立存储故障/恢复矩阵的证据。
+
+## 整次写操作的互斥边界（2026-09-30）
+
+只保护每个存储 chunk 仍会允许不同 OFD 在 usercopy 等待时把一条追加记录拆开。BoarOS 在 OFD offset 与 namespace/inode 锁之间增加每 inode 操作门闩，覆盖整次 write/writev/pwrite 和同步收尾，truncate 亦参与。门闩不会被 fault 或 writeback 取得，用户复制不持 inode 数据锁；同 inode 的映射输入可以先缺页再进入写入。保留页级 staging、部分接受字节与所属层错误，不把互斥写成断电原子性。固定 Linux 依据为 `references/linux/mm/filemap.c::generic_file_write_iter` 与 `fs/read_write.c`，commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`。
+
+`make test-io-sleep-riscv` 使用实际调度器和 VFS/MM/uaccess，在第一块接受、第二块复制前暂停写者，再运行独立 OFD 的追加/定位写/截断；旧实现得到交错内容，门闩版本完整通过 legacy/modern × writeback/writethrough。追加的第二向量使用同 inode 尚未驻留的文件映射，并走真实冷页装载；fixture 仅模型化未激活测试 MM 的 satp，VFS/调度等待在真实 hart 上执行。另检查 O_SYNC 和等待期间的终止请求。实际 U-mode 的 `tests/userland/write_operations.h` 验证不同 OFD 的 8 KiB 向量记录和同 inode 映射输入；原 partial-write 用例继续保护短写、EFAULT/EIO 与资源基线。SQLite WAL 和重启已双侧通过，完整恢复矩阵另行核对后记录。操作锁包含用户复制等待，成本/公平性仍需实测。
