@@ -26,6 +26,37 @@ static int dev_write(struct ext4_blockdev *b,const void *p,uint64_t n,uint32_t c
 { (void)b; if (n <= forbidden_lba && forbidden_lba < n+c) forbidden_writes++; return kernel_block_write_at(&disk.device,n*512,p,(size_t)c*512) == KERNEL_BLOCK_STATUS_OK ? EOK : EIO; }
 static int dev_flush(struct ext4_blockdev *b)
 { (void)b; return kernel_block_flush(&disk.device) == KERNEL_BLOCK_STATUS_OK ? EOK : EIO; }
+static uint32_t cost_tick;
+static bool cost_clock(struct ext4_timestamp *now)
+{ *now=(struct ext4_timestamp){2000000000,++cost_tick};return true; }
+static void cost_test(struct ext4_fs *fs)
+{
+    CHECK(fs->jbd_journal!=NULL);
+    ext4_file f;unsigned char bytes[4096];size_t written;
+    memset(bytes,0x5a,sizeof(bytes));CHECK(ext4_fopen(&f,"/file","r+")==EOK);
+    CHECK(ext4_fwrite(&f,bytes,sizeof(bytes),&written)==EOK && written==sizeof(bytes));
+    CHECK(ext4_file_sync_metadata(&f)==EOK);
+    CHECK(ext4_mount_setup_clock("/",cost_clock)==EOK);
+    for(unsigned mode=0;mode<3;mode++) {
+        uint64_t before_writes=disk.writes,before_flushes=disk.flushes;
+        uint32_t before_tid=fs->jbd_journal->committed_id;
+        for(unsigned n=0;n<128;n++) {
+            if(mode!=1)CHECK(ext4_file_touch(&f,EXT4_TIME_MTIME|EXT4_TIME_CTIME)==EOK);
+            if(mode!=0){CHECK(ext4_fseek(&f,0,SEEK_SET)==EOK);CHECK(ext4_fwrite(&f,bytes,sizeof(bytes),&written)==EOK && written==sizeof(bytes));}
+        }
+        struct ext4_inode inode;CHECK(ext4_fraw_inode_fill(&f,&inode)==EOK);
+        CHECK(to_le32(inode.modification_time)==2000000000U);
+        CHECK((to_le32(inode.mtime_extra)>>2)==cost_tick);
+        printf("{\"mode\":\"%s\",\"operations\":128,\"logical_bytes\":%u,\"writes\":%llu,\"flushes\":%llu,\"commits\":%u}\n",
+            mode==0?"timestamp-only":mode==1?"backend-only":"timestamp-and-backend",
+            mode==0?0:128U*4096U,(unsigned long long)(disk.writes-before_writes),
+            (unsigned long long)(disk.flushes-before_flushes),fs->jbd_journal->committed_id-before_tid);
+    }
+    CHECK(ext4_fseek(&f,0,SEEK_SET)==EOK);
+    unsigned char actual[4096];size_t read_count;
+    CHECK(ext4_fread(&f,actual,sizeof(actual),&read_count)==EOK && read_count==sizeof(actual));
+    CHECK(!memcmp(actual,bytes,sizeof(actual)));CHECK(ext4_fclose(&f)==EOK);
+}
 static struct ext4_timestamp get_time(const struct ext4_inode *inode,unsigned i,bool extended)
 {
     uint32_t low[3] = {inode->access_time,inode->modification_time,inode->change_inode_time};
@@ -223,6 +254,7 @@ int main(int argc,char **argv)
         CHECK(ext4_recover("/")==EOK);CHECK(ext4_journal_start("/")==EOK);CHECK(ext4_orphan_recover("/")==EOK);
     }
     if(!strcmp(argv[2],"seed"))seed();
+    else if(!strcmp(argv[2],"cost"))cost_test(dev.fs);
     else if(!strcmp(argv[2],"times") || !strcmp(argv[2],"readonly"))times_test(dev.fs,readonly);
     else if(!strcmp(argv[2],"stats") || !strcmp(argv[2],"stats-ro")){CHECK(argc>3);stats_test(dev.fs,strtoull(argv[3],NULL,10));}
     else if(!strcmp(argv[2],"unrelated"))unrelated_data(dev.fs);

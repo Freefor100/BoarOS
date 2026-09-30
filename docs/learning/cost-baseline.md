@@ -73,6 +73,8 @@ observer_ticks 仅更新体，已包含在运行时间内，未覆盖读时钟�
 每组参数为 `./iozone -a -r 1k -s 4m`，以及
 `./iozone -t 4 -i A -i B -r 1k -s 1m`，其中 (A,B) 顺序为
 (0,1)、(0,2)、(0,3)、(0,5)、(6,7)、(9,10)、(11,12)。每命令诊断预算 180000 客体 ms；
+续测执行器支持 `--consumer-timeout-ms`，默认保持180000；新预算同时封存到启动输入、fixture和逐命令记录，
+单独保留续测证据。预算增加只能用于观察是否自然结束，不能替代退出状态和所选测试完成检查。
 超时终止整个进程组并回收，真实 wait status 和原输出不丢弃。
 
 | libc / 命令索引 | main 观测开（三启动） | main 观测关（三启动） | 固定 Linux（三启动） |
@@ -278,3 +280,24 @@ C enable helper在最后rdtime后至少9条指令（含CSR），不同调用点�
 可重建：`make test-cost-riscv COST_CASE=latency`；默认构建同ELF以
 `python3 -B tests/cost-riscv.py --case latency --off --kernel kernel-rv`对照。
 trap/trap-return/context/user、四组合io-sleep、bandwidth、stack检查通过。
+
+### 后续：时间更新与数据后端的独立隔离
+
+2026-09-30 新增 `make test-lwext4-cost-host`：实际 lwext4 源码、32MiB journal镜像、
+4KiB块、256B inode、GCC16.2.1和mke2fs1.47.4。打开并预热同一个4KiB文件后，
+按公开接口执行128次纯mtime/ctime更新、128次4KiB热覆盖及128次组合操作。
+独立block_fault在设备入口计数；三次新镜像的下列结果完全一致，时间戳、内容读回及fsck通过。
+
+| 宿主fixture路径 | 文件逻辑字节 | block写请求 | flush请求 | 新commit数 |
+|---|---:|---:|---:|---:|
+| timestamp-only | 0 | 384 | 256 | 128 |
+| backend-only | 524288 | 128 | 128 | 0 |
+| timestamp-and-backend | 524288 | 512 | 384 | 128 |
+
+这证明每次时间更新即使不写文件数据也引入提交和屏障，组合路径比数据后端单独调用多256次flush。
+`fs/files/io.c` 的非零普通文件写在用户复制前调用modified，`fs/ext4_backend.c`转入同一touch接口；
+该顺序还保护首字节EFAULT的mtime语义，不能直接删除。这里的backend-only是因果隔离对照，
+不是允许关闭用户可观察时间更新的实现候选。
+该fixture不经过VFS页缓存，既不把commit计数当稳定ABI门槛，也不据其请求比推算iozone总耗时或QEMU收益。
+原消费者仍需自己的成本窗口；磁盘unknown和未解释等待继续保留。生产写回、事务与队列没有改动，
+完整恢复矩阵门禁没有被本探针替代。

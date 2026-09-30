@@ -2,6 +2,51 @@ import unittest
 from cost_report import parse, schema, percentile, validate_expected, validate_replicas
 
 class CostReportTest(unittest.TestCase):
+    def test_original_consumer_closure_rejects_startup_failure_and_censoring(self):
+        from cost_consumer import commands,validate_record,classify,ELFS,SCRIPTS,ORIGINAL_SHA,DEPENDENCIES
+        from copy import deepcopy
+        lines=[]
+        for libc in ELFS:
+            for i in range(8):
+                name=f'consumer-{libc}-{i}'
+                lines += [f'COST COMMAND BEGIN {name}',
+                          'Selected test not available on the version.' if i==7 else '',
+                          'iozone test complete.',f'COST RESULT {name} 123',f'COST COMMAND RESULT {name} 0 0']
+        row=dict(original_sha256=ORIGINAL_SHA,consumer_elf_sha256=ELFS,consumer_script_sha256=SCRIPTS,
+                 consumer_dependencies=DEPENDENCIES,commands=commands('\n'.join(lines)+'\n'))
+        validate_record(row,True)
+        for raw,timeout,status in [('iozone test complete.',1,9),('FATAL: kernel too old',0,32512),
+                                   ('still running',0,0)]:
+            broken=deepcopy(row);c=broken['commands'][0]
+            c.update(raw_output=raw,timeout=timeout,wait_status=status,**classify(raw,timeout,status))
+            validate_record(broken,False)
+            with self.assertRaises(ValueError):validate_record(broken,True)
+        for field,value in [('timeout',1),('wait_status',32512),('raw_output','FATAL: kernel too old'),
+                            ('command_timeout_ms',600000),('argv',['./iozone','--different-workload']),
+                            ('outcome','blocked')]:
+            broken=deepcopy(row);broken['commands'][0][field]=value
+            with self.assertRaises(ValueError):validate_record(broken,True)
+        broken=deepcopy(row);broken['consumer_dependencies']['/glibc/lib/libc.so.6']='wrong'
+        with self.assertRaises(ValueError):validate_record(broken,True)
+
+    def test_consumer_budget_is_measured_policy_not_a_success_proxy(self):
+        from cost_consumer import commands
+        lines=['COST CONSUMER BUDGET 600000']
+        for libc in ('musl','glibc'):
+            for i in range(8):
+                name=f'consumer-{libc}-{i}'
+                lines += [f'COST COMMAND BEGIN {name}', 'iozone test complete.',
+                          f'COST RESULT {name} 123', f'COST COMMAND RESULT {name} 1 9']
+        output='\n'.join(lines)+'\n'
+        rows=commands(output,expected_budget_ms=600000)
+        self.assertEqual({r['command_timeout_ms'] for r in rows},{600000})
+        self.assertTrue(all(r['reason']=='timeout' for r in rows))
+        for invalid in (output.replace('600000','180000',1),
+                        output.replace('600000','0',1),
+                        output+'COST CONSUMER BUDGET 600000\n',
+                        output.replace(lines[0]+'\n','')):
+            with self.assertRaises(ValueError): commands(invalid,expected_budget_ms=600000)
+
     def test_summary_includes_windows_without_external_timing(self):
         import contextlib,importlib.util,io,json,tempfile
         from pathlib import Path
