@@ -79,6 +79,10 @@ miss 路径先分配并清零页，再通过 node 的无 offset 副作用 `pread
 
 事务接口 `ext4_transaction_begin/end/abort` 支持同一 mount 的嵌套修改；外层提交前保留 metadata 和数据缓冲的 before-image 与引用。明确发生在日志提交前的 OOM、空间不足或关联数据 I/O 失败可回滚内存并重试；已可能影响日志持久状态的错误由 mount 保留，不能清除后继续。外层 abort 后，调用者须重新打开在内层修改过的 lwext4 handle；VFS 的普通操作各自完成事务，不持有跨 syscall 的开放事务。
 
+新增的 `ext4_journal_group_enable/service/drain` 为可选运行时入口，当前只由宿主 fixture 启用，生产启动尚未启用。操作仍各自持有 before-image，成功后合入挂载点 running transaction；同块修改合并，后一次失败只回滚自身。封口把 metadata 和 ordered data 复制到预留的不可变版本，提交准备使用预留日志缓冲和挂载期固定映射；设备提交和 checkpoint 不再读取可变 bcache。未提交 owner 通过 `journal_pending` 禁止隐式 home writeback，块与 inode 的释放范围保留到 checkpoint 屏障和日志起点更新完成，分配器跳过这些范围。首脏 100 ms、64 次成功操作或 256 KiB 镜像是封口条件，事务分配与固定日志映射均计入调用方提供的挂载点预算。当前保守地在每批提交后完成 checkpoint，再发布 durable/checkpoint 序号；同步返回具有完整持久化保证，后台接入及消费者收益待后续验收。
+
+`make test-lwext4-group-host` 使用实际引擎与独立设备计数，覆盖 32 次时间修改合成一批、嵌套 abort、后操作各预留点 OOM、提交期间同块新修改、冻结后禁止新分配、1/4 KiB 文件系统的 WRITE/FLUSH 失败与重启恢复。默认同步路径的 metadata/几何/错误原子性回归继续由 `make test-lwext4-metadata-host` 保护。
+
 每次提交先预留全部日志空间、映射与缓冲，再依次完成关联文件数据及 flush、日志内容及 flush、commit 记录及 flush。预留失败不写当前事务的数据；预留缓冲由事务持有至提交或回滚，内存成本随本次 metadata 日志大小增长。checkpoint 把已提交内容写回原位置并 flush，再持久化日志起点，最后释放日志空间和缓冲 owner。数据不写入 metadata 日志。主 superblock 的分配计数、恢复位和校验和也属于事务；挂载/卸载不在日志之外直接覆盖它。512 字节原子扇区模型下若 superblock 校验失败，只允许根据合法几何信息进入受限恢复，必须重放有效 superblock 日志后才能访问文件。
 
 `ext4_orphan.c` 支持传统 `last_orphan/i_dtime` 链和 `orphan_file`，校验范围、重复记录、循环、分配状态和 checksum。unlink 将最后一个链接摘除与持久 orphan 记录放在同一事务；缩小文件先提交最终 size 与 orphan，再由 `ext4_truncate.c` 每事务最多释放 32 个尾部数据块及已空的索引路径。恢复根据实际映射找到尾部，支持稀疏 extent 和三级间接块，不依赖已缩小的 size 推测待回收块。最后删除 orphan 记录与释放无链接 inode 同事务完成，重复恢复可继续前次进度。仍被打开的无链接 inode 在正常运行期间保留，重启才回收。

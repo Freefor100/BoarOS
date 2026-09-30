@@ -52,6 +52,7 @@
 #include <ext4_crc32.h>
 #include <ext4_block_group.h>
 #include <ext4_fs.h>
+#include <ext4_journal.h>
 #include <ext4_bitmap.h>
 #include <ext4_inode.h>
 
@@ -160,7 +161,9 @@ int ext4_balloc_free_block(struct ext4_inode_ref *inode_ref, ext4_fsblk_t baddr)
 
 	/* Load block group reference */
 	struct ext4_block_group_ref bg_ref;
-	int rc = ext4_fs_get_block_group_ref(fs, bg_id, &bg_ref);
+	int rc = jbd_trans_quarantine(fs, baddr, 1, false);
+	if (rc != EOK) return rc;
+	rc = ext4_fs_get_block_group_ref(fs, bg_id, &bg_ref);
 	if (rc != EOK)
 		return rc;
 
@@ -243,7 +246,10 @@ int ext4_balloc_free_blocks(struct ext4_inode_ref *inode_ref,
 	struct ext4_fs *fs = inode_ref->fs;
 	struct ext4_sblock *sb = &fs->sb;
 
-	/* Compute indexes */
+	int quarantine = jbd_trans_quarantine(fs, first, count, false);
+    if (quarantine != EOK) return quarantine;
+
+    /* Compute indexes */
 	uint32_t bg_first = ext4_balloc_get_bgid_of_block(sb, first);
 
 	/* Compute indexes */
@@ -422,7 +428,8 @@ int ext4_balloc_alloc_block(struct ext4_inode_ref *inode_ref,
 	}
 
 	/* Check if goal is free */
-	if (ext4_bmap_is_bit_clr(b.data, idx_in_bg)) {
+	if (ext4_bmap_is_bit_clr(b.data, idx_in_bg) &&
+	    !jbd_journal_quarantined(inode_ref->fs, ext4_fs_bg_idx_to_addr(sb, idx_in_bg, bg_id), false)) {
 		ext4_bmap_bit_set(b.data, idx_in_bg);
 		ext4_balloc_set_bitmap_csum(sb, bg_ref.block_group,
 					    b.data);
@@ -446,7 +453,8 @@ int ext4_balloc_alloc_block(struct ext4_inode_ref *inode_ref,
 	/* Try to find free block near to goal */
 	uint32_t tmp_idx;
 	for (tmp_idx = idx_in_bg + 1; tmp_idx < end_idx; ++tmp_idx) {
-		if (ext4_bmap_is_bit_clr(b.data, tmp_idx)) {
+		if (ext4_bmap_is_bit_clr(b.data, tmp_idx) &&
+		    !jbd_journal_quarantined(inode_ref->fs, ext4_fs_bg_idx_to_addr(sb, tmp_idx, bg_id), false)) {
 			ext4_bmap_bit_set(b.data, tmp_idx);
 
 			ext4_balloc_set_bitmap_csum(sb, bg, b.data);
@@ -464,6 +472,8 @@ int ext4_balloc_alloc_block(struct ext4_inode_ref *inode_ref,
 
 	/* Find free bit in bitmap */
 	r = ext4_bmap_bit_find_clr(b.data, idx_in_bg, blk_in_bg, &rel_blk_idx);
+	while (r == EOK && jbd_journal_quarantined(inode_ref->fs, ext4_fs_bg_idx_to_addr(sb, rel_blk_idx, bg_id), false))
+		r = ext4_bmap_bit_find_clr(b.data, rel_blk_idx + 1, blk_in_bg, &rel_blk_idx);
 	if (r == EOK) {
 		ext4_bmap_bit_set(b.data, rel_blk_idx);
 		ext4_balloc_set_bitmap_csum(sb, bg_ref.block_group, b.data);
@@ -537,6 +547,8 @@ goal_failed:
 
 		r = ext4_bmap_bit_find_clr(b.data, idx_in_bg, blk_in_bg,
 				&rel_blk_idx);
+		while (r == EOK && jbd_journal_quarantined(inode_ref->fs, ext4_fs_bg_idx_to_addr(sb, rel_blk_idx, bgid), false))
+			r = ext4_bmap_bit_find_clr(b.data, rel_blk_idx + 1, blk_in_bg, &rel_blk_idx);
 		if (r == EOK) {
 			ext4_bmap_bit_set(b.data, rel_blk_idx);
 			ext4_balloc_set_bitmap_csum(sb, bg, b.data);
@@ -640,7 +652,8 @@ int ext4_balloc_try_alloc_block(struct ext4_inode_ref *inode_ref,
 	}
 
 	/* Check if block is free */
-	*free = ext4_bmap_is_bit_clr(b.data, index_in_group);
+	*free = ext4_bmap_is_bit_clr(b.data, index_in_group) &&
+	    !jbd_journal_quarantined(inode_ref->fs, baddr, false);
 
 	/* Allocate block if possible */
 	if (*free) {

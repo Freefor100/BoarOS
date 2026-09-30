@@ -59,6 +59,7 @@ struct jbd_buf {
 	bool modified;
 	bool was_dirty;
 	void *before;
+	void *after;
 	uint32_t jbd_lba;
 	struct ext4_block block;
 	struct jbd_trans *trans;
@@ -71,6 +72,7 @@ struct jbd_buf {
 struct jbd_data {
 	struct ext4_block block;
 	void *before;
+	void *after;
 	bool modified, was_dirty;
 	TAILQ_ENTRY(jbd_data) node;
 };
@@ -88,6 +90,13 @@ struct jbd_block_rec {
 	TAILQ_HEAD(jbd_buf_dirty, jbd_buf) dirty_buf_queue;
 };
 
+struct jbd_quarantine {
+	ext4_fsblk_t first;
+	uint32_t count;
+	bool inode;
+	LIST_ENTRY(jbd_quarantine) node;
+};
+
 struct jbd_trans {
 	uint32_t trans_id;
 
@@ -97,12 +106,20 @@ struct jbd_trans {
 	uint32_t data_csum;
 	int written_cnt;
 	int error;
+	uint64_t sequence;
+	uint64_t first_dirty_ns;
+	unsigned operations, reserved_logs;
+	bool frozen;
+	void *checkpoint_image;
+	ext4_fsblk_t checkpoint_lba;
 
 	struct jbd_journal *journal;
 
 	TAILQ_HEAD(jbd_trans_buf, jbd_buf) buf_queue;
 	TAILQ_HEAD(jbd_trans_data, jbd_data) data_queue;
 	TAILQ_HEAD(jbd_trans_log, jbd_log_block) log_queue;
+	struct jbd_trans_log log_reserve;
+	LIST_HEAD(jbd_quarantine_list, jbd_quarantine) quarantine;
 	RB_HEAD(jbd_revoke_tree, jbd_revoke_rec) revoke_root;
 	LIST_HEAD(jbd_trans_block_rec, jbd_block_rec) tbrec_list;
 	TAILQ_ENTRY(jbd_trans) trans_node;
@@ -113,6 +130,11 @@ struct jbd_journal {
 	uint32_t committed_id;
 	int error;
 	struct jbd_trans *failed_trans;
+	struct jbd_trans *running, *committing;
+	bool grouped;
+	size_t memory_used, memory_peak, memory_limit;
+	uint64_t accepted_sequence, durable_sequence, checkpoint_sequence;
+	ext4_fsblk_t *log_map;
 
 	uint32_t first;
 	uint32_t start;
@@ -174,6 +196,16 @@ jbd_journal_purge_cp_trans(struct jbd_journal *journal,
  * This does not write unrelated home buffers. Returns EAGAIN for future IDs.
  */
 int jbd_journal_sync(struct jbd_journal *journal, uint32_t trans_id);
+int jbd_journal_accept(struct jbd_journal *journal, struct jbd_trans *operation,
+	uint64_t now_ns);
+int jbd_journal_group_init(struct jbd_journal *journal, size_t limit);
+void jbd_journal_group_fini(struct jbd_journal *journal);
+int jbd_journal_freeze(struct jbd_journal *journal);
+int jbd_journal_submit(struct jbd_journal *journal);
+int jbd_journal_retire(struct jbd_journal *journal, int error);
+int jbd_trans_quarantine(struct ext4_fs *fs, ext4_fsblk_t first,
+	uint32_t count, bool inode);
+bool jbd_journal_quarantined(struct ext4_fs *fs, ext4_fsblk_t address, bool inode);
 
 #ifdef __cplusplus
 }

@@ -96,3 +96,5 @@ make test-references
 - [文档导航](docs/README.md)：模块契约与可复用学习材料。
 - [工程原则](docs/design.md)与[贡献说明](CONTRIBUTING.md)：技术取舍、验证与提交边界。
 - [固定资料](references/README.md)与[第三方代码](docs/third-party.md)：版本、来源及许可。
+
+异步日志推进：可选组提交引擎已有实际 1/4 KiB 宿主验证，覆盖操作隔离、版本交错和提交错误恢复；生产启动仍使用同步路径，后台和原版 iozone 验收完成后才切换。未报告新的性能成绩。

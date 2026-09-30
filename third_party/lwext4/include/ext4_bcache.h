@@ -75,6 +75,8 @@ struct ext4_buf {
 	struct ext4_buf *writeback_next;
 	/**@brief   Flags*/
 	int flags;
+	/* Uncommitted journal owners forbid implicit home writeback. */
+	unsigned journal_pending;
 	bool loading;
 	int load_error;
 

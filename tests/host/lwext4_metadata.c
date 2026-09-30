@@ -14,6 +14,7 @@
 static struct fault_block disk;
 static unsigned allocations, fail_allocation, reads, fail_read;
 static uint64_t forbidden_lba = UINT64_MAX, forbidden_writes;
+static void (*write_interleave)(void);
 #define CHECK(x) do { if (!(x)) { fprintf(stderr,"%d: %s (alloc=%u fail=%u)\n",__LINE__,#x,allocations,fail_allocation); exit(1); } } while (0)
 void *ext4_user_malloc(size_t n) { return ++allocations == fail_allocation ? NULL : malloc(n); }
 void *ext4_user_calloc(size_t n,size_t s) { return ++allocations == fail_allocation ? NULL : calloc(n,s); }
@@ -23,10 +24,122 @@ static int dev_open(struct ext4_blockdev *b) { (void)b; return EOK; }
 static int dev_read(struct ext4_blockdev *b,void *p,uint64_t n,uint32_t c)
 { (void)b; if (++reads == fail_read) return EIO; return kernel_block_read_at(&disk.device,n*512,p,(size_t)c*512) == KERNEL_BLOCK_STATUS_OK ? EOK : EIO; }
 static int dev_write(struct ext4_blockdev *b,const void *p,uint64_t n,uint32_t c)
-{ (void)b; if (n <= forbidden_lba && forbidden_lba < n+c) forbidden_writes++; return kernel_block_write_at(&disk.device,n*512,p,(size_t)c*512) == KERNEL_BLOCK_STATUS_OK ? EOK : EIO; }
+{ (void)b; if(write_interleave){void (*hook)(void)=write_interleave;write_interleave=NULL;hook();} if (n <= forbidden_lba && forbidden_lba < n+c) forbidden_writes++; return kernel_block_write_at(&disk.device,n*512,p,(size_t)c*512) == KERNEL_BLOCK_STATUS_OK ? EOK : EIO; }
 static int dev_flush(struct ext4_blockdev *b)
 { (void)b; return kernel_block_flush(&disk.device) == KERNEL_BLOCK_STATUS_OK ? EOK : EIO; }
 static uint32_t cost_tick;
+extern int ext4_journal_group_enable(const char *, const struct ext4_journal_runtime *, size_t) __attribute__((weak));
+extern int ext4_journal_group_service(const char *, bool) __attribute__((weak));
+extern int ext4_journal_group_drain(const char *) __attribute__((weak));
+static uint64_t group_now;
+static uint64_t group_clock(void *context) { (void)context; return group_now; }
+static ext4_file *interleave_file;
+static void group_modify_while_submitting(void)
+{
+    struct ext4_timestamp times[3]={{7777,7},{8888,8},{9999,9}};
+    unsigned char bytes[4096]; size_t count;
+    memset(bytes,0xa6,sizeof(bytes));
+    CHECK(ext4_file_set_times(interleave_file,7,times)==EOK);
+    CHECK(ext4_fseek(interleave_file,0,SEEK_SET)==EOK);
+    CHECK(ext4_fwrite(interleave_file,bytes,sizeof(bytes),&count)==EOK && count==sizeof(bytes));
+}
+static void group_test(struct ext4_fs *fs)
+{
+    CHECK(ext4_journal_group_enable && ext4_journal_group_service && ext4_journal_group_drain);
+    struct ext4_journal_runtime runtime={.now_ns=group_clock};
+    CHECK(ext4_journal_group_enable("/",&runtime,4*1024*1024)==EOK);
+    ext4_file f; CHECK(ext4_fopen(&f,"/file","r+")==EOK);
+    uint64_t writes=disk.writes, flushes=disk.flushes;
+    uint32_t tid=fs->jbd_journal->committed_id;
+    struct ext4_timestamp times[3]={{1111,1},{2222,2},{3333,3}};
+    for(unsigned i=0;i<32;i++)CHECK(ext4_file_set_times(&f,7,times)==EOK);
+    CHECK(disk.writes==writes && disk.flushes==flushes && fs->jbd_journal->committed_id==tid);
+    struct ext4_inode committed, actual;
+    CHECK(ext4_fraw_inode_fill(&f,&committed)==EOK);
+    CHECK(ext4_transaction_begin("/")==EOK);
+    times[0].seconds=9999; CHECK(ext4_file_set_times(&f,1,times)==EOK);
+    CHECK(ext4_transaction_abort("/",ECANCELED)==ECANCELED);
+    CHECK(ext4_fraw_inode_fill(&f,&actual)==EOK && !memcmp(&actual,&committed,sizeof(actual)));
+    CHECK(ext4_journal_group_service("/",false)==EOK && disk.writes==writes);
+    group_now=100000000;
+    CHECK(ext4_journal_group_service("/",false)==EOK);
+    CHECK(fs->jbd_journal->committed_id==tid+1);
+    CHECK(disk.flushes-flushes < 32*2);
+    CHECK(ext4_fraw_inode_fill(&f,&actual)==EOK && !memcmp(&actual,&committed,sizeof(actual)));
+    CHECK(ext4_file_sync_metadata(&f)==EOK);
+    /* Every private reservation failure preserves an earlier accepted change. */
+    CHECK(ext4_file_set_times(&f,7,times)==EOK);
+    CHECK(ext4_fraw_inode_fill(&f,&committed)==EOK);
+    for(unsigned point=1;point<=20;point++) {
+        fail_allocation=allocations+point;
+        int begin=ext4_transaction_begin("/");
+        int result=begin;
+        if(begin==EOK) {
+            struct ext4_timestamp changed[3]={{1234,4},{5678,5},{9012,6}};
+            result=ext4_file_set_times(&f,7,changed);
+            int abort=ext4_transaction_abort("/",ECANCELED);
+            CHECK(abort==(result==EOK?ECANCELED:result));
+        }
+        fail_allocation=0;
+        CHECK(result==EOK || result==ENOMEM);
+        CHECK(ext4_fraw_inode_fill(&f,&actual)==EOK && !memcmp(&actual,&committed,sizeof(actual)));
+        CHECK(fs->jbd_journal->memory_used<=fs->jbd_journal->memory_limit);
+    }
+    unsigned char bytes[4096], readback[4096]; size_t count;
+    memset(bytes,0x55,sizeof(bytes));
+    CHECK(ext4_fseek(&f,0,SEEK_SET)==EOK);
+    CHECK(ext4_fwrite(&f,bytes,sizeof(bytes),&count)==EOK && count==sizeof(bytes));
+    struct ext4_inode_ref ref;
+    CHECK(ext4_fs_get_inode_ref(fs,f.inode,&ref)==EOK);
+    uint64_t inode_position=ref.block.lb_id*fs->bdev->lg_bsize+(unsigned char*)ref.inode-ref.block.data;
+    ext4_fsblk_t data_block;
+    CHECK(ext4_fs_get_inode_dblk_idx(&ref,0,&data_block,true)==EOK);
+    CHECK(ext4_fs_put_inode_ref(&ref)==EOK);
+    interleave_file=&f; write_interleave=group_modify_while_submitting;
+    CHECK(ext4_journal_group_service("/",true)==EOK);
+    CHECK(!write_interleave && fs->jbd_journal->running);
+    CHECK(!memcmp(disk.visible+data_block*fs->bdev->lg_bsize,bytes,sizeof(bytes)));
+    struct ext4_inode *stable=(void*)(disk.visible+inode_position);
+    CHECK(to_le32(stable->access_time)==9999);
+    CHECK(ext4_fseek(&f,0,SEEK_SET)==EOK);
+    CHECK(ext4_fread(&f,readback,sizeof(readback),&count)==EOK && count==sizeof(readback));
+    memset(bytes,0xa6,sizeof(bytes)); CHECK(!memcmp(bytes,readback,sizeof(bytes)));
+    /* Sealing needs no new large allocation after successful acceptance. */
+    unsigned before_allocations=allocations;
+    fail_allocation=allocations+1;
+    CHECK(ext4_journal_group_service("/",true)==EOK);
+    fail_allocation=0;
+    CHECK(allocations==before_allocations);
+    CHECK(!memcmp(disk.visible+data_block*fs->bdev->lg_bsize,bytes,sizeof(bytes)));
+    CHECK(to_le32(stable->access_time)==7777);
+    CHECK(ext4_fclose(&f)==EOK); CHECK(ext4_journal_group_drain("/")==EOK);
+    printf("group operations=32 commits=%u writes=%llu flushes=%llu\n",fs->jbd_journal->committed_id-tid,(unsigned long long)(disk.writes-writes),(unsigned long long)(disk.flushes-flushes));
+}
+static void group_fault(struct ext4_fs *fs, const char *kind, unsigned point)
+{
+    struct ext4_journal_runtime runtime={.now_ns=group_clock};
+    CHECK(ext4_journal_group_enable("/",&runtime,4*1024*1024)==EOK);
+    ext4_file f; CHECK(ext4_fopen(&f,"/file","r+")==EOK);
+    struct ext4_timestamp times[3]={{1111,1},{2222,2},{3333,3}};
+    CHECK(ext4_file_set_times(&f,7,times)==EOK);
+    if(!strcmp(kind,"group-write"))disk.fail_write=disk.writes+point;
+    else disk.fail_flush=disk.flushes+point;
+    CHECK(ext4_journal_group_service("/",true)==EIO);
+    CHECK(fs->jbd_journal->error==EIO && fs->jbd_journal->committing && fs->jbd_journal->failed_trans==fs->jbd_journal->committing);
+    CHECK(ext4_file_set_times(&f,7,times)==EIO);
+    CHECK(ext4_journal_group_drain("/")==EIO);
+    CHECK(fault_block_crash(&disk)==0);
+}
+static void group_verify_recovery(struct ext4_fs *fs)
+{
+    ext4_file f;struct ext4_inode ino;
+    CHECK(ext4_fopen(&f,"/file","r")==EOK && ext4_fraw_inode_fill(&f,&ino)==EOK);
+    bool new_version=to_le32(ino.access_time)==1111;
+    CHECK(to_le32(ino.access_time)==(new_version?1111:0));
+    CHECK(to_le32(ino.modification_time)==(new_version?2222:0));
+    CHECK(to_le32(ino.change_inode_time)==(new_version?3333:0));
+    CHECK(!fs->jbd_journal->error && ext4_fclose(&f)==EOK);
+}
 static bool cost_clock(struct ext4_timestamp *now)
 { *now=(struct ext4_timestamp){2000000000,++cost_tick};return true; }
 static void cost_test(struct ext4_fs *fs)
@@ -255,6 +368,9 @@ int main(int argc,char **argv)
     }
     if(!strcmp(argv[2],"seed"))seed();
     else if(!strcmp(argv[2],"cost"))cost_test(dev.fs);
+    else if(!strcmp(argv[2],"group"))group_test(dev.fs);
+    else if(!strcmp(argv[2],"group-write") || !strcmp(argv[2],"group-flush")) {CHECK(argc==4);group_fault(dev.fs,argv[2],strtoul(argv[3],NULL,10));return 0;}
+    else if(!strcmp(argv[2],"group-recovery"))group_verify_recovery(dev.fs);
     else if(!strcmp(argv[2],"times") || !strcmp(argv[2],"readonly"))times_test(dev.fs,readonly);
     else if(!strcmp(argv[2],"stats") || !strcmp(argv[2],"stats-ro")){CHECK(argc>3);stats_test(dev.fs,strtoull(argv[3],NULL,10));}
     else if(!strcmp(argv[2],"unrelated"))unrelated_data(dev.fs);

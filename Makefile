@@ -602,6 +602,10 @@ test-lwext4-metadata-host:
 test-lwext4-cost-host:
 	sh tests/lwext4-cost-host.sh
 
+.PHONY: test-lwext4-group-host
+test-lwext4-group-host:
+	sh tests/lwext4-group-host.sh
+
 # Real volatile-storage power cuts, separate from normal QEMU shutdown tests.
 test-lwext4-recovery-host:
 	sh tests/lwext4-journal-host.sh

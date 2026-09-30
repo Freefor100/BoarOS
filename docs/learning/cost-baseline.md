@@ -471,3 +471,5 @@ PID1配置运行、本轮scratch及栈重建目录）。再次预览候选为零
 `make -j4 test-scheduler-cases-riscv test-scheduler-riscv`。
 依据沿用references/linux固定f4cdf7ca9a1fdcca413157df19753f388a5a224e和本地RISC-V特权规范20260120；
 本项不改变普通持锁S-mode的抢占策略，尚未测定原消费者性能收益。
+
+事务引擎的第一组机制证据（2026-10-01）：`make test-lwext4-group-host` 在 1 KiB 与 4 KiB journal 文件系统通过。32 次同 inode 时间更新在封口前没有设备写入，期限到达后形成 1 次 journal commit；4 KiB 情形该批为 5 次设备写入、4 次 flush。额外版本交错测试在本批第一次设备写入时加入新时间和新数据，验证本批磁盘仍得到旧版本，内存立即读到新版本，下一批才持久化新版本。提交阶段的下一次分配被强制失败仍能完成：日志映射预先固定，避免 `ext4_find_extent` 在封口后分配。各 private 预留点 OOM 不撤销前一已接受操作；每个设备 WRITE/FLUSH 错误保留 journal 的失败 owner，重启只得到完整旧或新 metadata。此处是机制证据，未替代 iozone 吞吐验收。
