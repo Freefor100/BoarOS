@@ -79,8 +79,10 @@ C6 使用固定原镜像的ELF/脚本/依赖，逐命令保存ELF、argv、cwd�
 宿主兜底预算按16条命令预算加120秒计算。放宽预算不会改变上述完成条件，
 新配置独立保存，不能覆盖旧180秒基线或冒充原评测3600秒总预算。
 `tests/iozone-closure.py` 是续测收口门禁：要求观测开/关及固定Linux各三个独立启动、
-相同协调ELF、原ELF/脚本/依赖/argv/cwd、完整封存输入和实际客体uname。
-两种libc的0–6组必须自然完成；7组必须进程正常结束并与固定Linux的版本不可用结论一致，
+相同协调ELF、开/关相同生产源码、相同预算/QEMU/firmware/timebase、
+原ELF/脚本/依赖/argv/cwd、完整封存输入和实际客体uname。
+两种libc的0–6组必须自然完成，并从原输出验证自动模式完整13列正值或线程模式所有请求方法的
+Children及Max per-process正值；只留marker、缺列/方法、重复或非有限值都失败，不信任reported_sections。7组必须进程正常结束并与固定Linux的版本不可用结论一致，
 这项排除不代表向量I/O验收。启动拒绝、超时或不完整记录不能生成通过归档；旧C6九条消费者记录已被此门禁拒绝。
 冻结的kernel/ELF/fixture/firmware/DTB和工具/源码身份在每次启动前写入input.json并封存哈希，执行器串行互斥。
 `tests/cost-evidence.py` 压缩零指标后仍重建完整快照并核对seal，拒绝遗漏非零计数；
@@ -99,7 +101,7 @@ C4按握手确认的N+4个blocked成员检查扫描max下限，遗漏扫描或�
 `cost-evidence.py --final --output` 接受用户 runner 列表与 io-sleep fixture 单记录，按真实配置收集三副本，
 规范化不修改封存输入，并从原消费者输出重新核对完成分类；解包会验证完整固定矩阵和全部快照seal。
 新增九次串行启动、48个窗口的原消费者续测见 `cost-consumer-followup.json`，由
-`tests/iozone-closure.py --verify` 独立核对，16项报告检错通过。兼容分支保留uname 4.15.0，
+`tests/iozone-closure.py --verify` 独立核对，18项报告检错通过。兼容分支保留uname 4.15.0，
 旧glibc/musl各七组可用测试全部完成，原向量组在固定Linux同样不支持；这项排除不是向量ABI通过。
 完整消费者观测开销中位16.964%，旧180秒预算不足，不能将历史取消序列与完整序列混算。
 原judge与3600秒预算另在评测分支运行；其状态和分数不能由观测窗口的complete字段推导。

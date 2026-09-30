@@ -11,7 +11,7 @@ class CostReportTest(unittest.TestCase):
                 name=f'consumer-{libc}-{i}'
                 lines += [f'COST COMMAND BEGIN {name}',
                           'Selected test not available on the version.' if i==7 else '',
-                          'iozone test complete.',f'COST RESULT {name} 123',f'COST COMMAND RESULT {name} 0 0']
+                          self.consumer_method_output(i),f'COST RESULT {name} 123',f'COST COMMAND RESULT {name} 0 0']
         row=dict(original_sha256=ORIGINAL_SHA,consumer_elf_sha256=ELFS,consumer_script_sha256=SCRIPTS,
                  consumer_dependencies=DEPENDENCIES,commands=commands('\n'.join(lines)+'\n'))
         validate_record(row,True)
@@ -28,6 +28,62 @@ class CostReportTest(unittest.TestCase):
             with self.assertRaises(ValueError):validate_record(broken,True)
         broken=deepcopy(row);broken['consumer_dependencies']['/glibc/lib/libc.so.6']='wrong'
         with self.assertRaises(ValueError):validate_record(broken,True)
+
+    @staticmethod
+    def consumer_method_output(index):
+        # Actual original report fields; completion alone is insufficient.
+        methods=((),('initial writers','rewriters','readers','re-readers'),
+                 ('initial writers','rewriters','random readers','random writers'),
+                 ('initial writers','rewriters','reverse readers'),
+                 ('initial writers','rewriters','stride readers'),
+                 ('fwriters','freaders'),('pwrite writers','pread readers'),())
+        data='4096 1 '+ ' '.join(['10']*13)+'\n' if index==0 else ''.join(
+            'Children see throughput for 4 '+m+' = 40.00 kB/sec\n'
+            'Max throughput per process = 10.00 kB/sec\n' for m in methods[index])
+        return data+'iozone test complete.\n'
+
+    def test_closure_requires_actual_requested_method_results(self):
+        from cost_consumer import validate_record,classify
+        import json
+        from copy import deepcopy
+        from pathlib import Path
+        row=json.loads(Path('docs/learning/cost-consumer-followup.json').read_text())['records'][0]
+        validate_record(row,True)
+        for index in range(7):
+            actual=row['commands'][index]['raw_output']
+            missing=actual.replace('Max throughput per process','discarded throughput per process',1)
+            if index==0:missing='iozone test complete.\n'
+            valid=self.consumer_method_output(index)
+            for raw in ('iozone test complete.\n',missing,valid+valid,
+                        valid.replace('10','0'),valid.replace('10','nan'),valid.replace('10','inf')):
+                broken=deepcopy(row);c=broken['commands'][index]
+                c.update(raw_output=raw,reported_sections=[],**classify(raw,0,0))
+                validate_record(broken,False)
+                with self.assertRaises(ValueError):validate_record(broken,True)
+        wrong=deepcopy(row);c=wrong['commands'][1]
+        raw=self.consumer_method_output(2)
+        c.update(raw_output=raw,**classify(raw,0,0))
+        with self.assertRaises(ValueError):validate_record(wrong,True)
+
+    def test_closure_rejects_different_comparison_inputs(self):
+        import importlib.util,json,hashlib
+        from copy import deepcopy
+        from pathlib import Path
+        spec=importlib.util.spec_from_file_location('closure','tests/iozone-closure.py')
+        m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
+        rows=m.evidence.unpack(json.loads(Path('docs/learning/cost-consumer-followup.json').read_text()))
+        m.validate(rows)
+        for field,value in [('source_sha256','0'*64),('consumer_timeout_ms',1000000),
+                            ('firmware_sha256','0'*64),('qemu_sha256','0'*64),('timebase_hz',20000000)]:
+            broken=deepcopy(rows)
+            for row in broken:
+                if row['platform']=='boaros' and not row['cost_diagnostics']:
+                    row[field]=value
+                    if field=='consumer_timeout_ms':
+                        for c in row['commands']:c['command_timeout_ms']=value
+                    frozen={k:row[k] for k in row['input_keys']}
+                    row['input_sha256']=hashlib.sha256((json.dumps(frozen,sort_keys=True,separators=(',',':'))+'\n').encode()).hexdigest()
+            with self.subTest(field=field),self.assertRaises(ValueError):m.validate(broken)
 
     def test_consumer_budget_is_measured_policy_not_a_success_proxy(self):
         from cost_consumer import commands
