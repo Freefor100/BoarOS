@@ -16,14 +16,14 @@ Linux 为 `references/linux` 的 `f4cdf7ca9a1fdcca413157df19753f388a5a224e`。
 
 2026-09-30 独立 Review 的组合边界修复：
 
-- [x] R1（`a30eb8e`）：SHM 附加 registry OOM 回滚不消费段表 owner；scale 聚焦故障后重试及最终页回收通过。
-- [x] R2（`722d35d`）：显式 attachment 与通用 VMA 片段 open/close；覆盖分裂、起始页撤销、RMID、匿名/文件/SHM 固定替换、fork/退出与 metadata/page OOM，保持 prepare/commit 失败原子性。
-- [x] R3（`aba2862`）：file-source 操作 pin 覆盖 msync 的 inode 等待与错误游标；三任务最后撤映射、终止请求、同步/关闭失败及最终清理通过四种 io-sleep 配置。
-- [x] R4（`179bb2f`）：AF_UNIX DGRAM 整包复制/提交、零消息和整包预算；差分、scale OOM/fault/容量复用与真实 pthread 整包等待/取消通过。
-- [x] R5（`15f7615`，完成断言修正 `3b55d3e`）：线程同步故障记录与统一返回交付、si_code/si_addr、阻塞/忽略强制默认；真实 U-mode 修复/上下文返回、坏帧和默认组退出及 5 条固定 Linux 故障差分通过。
-- [x] R6（`f5c6c96`）：通用 `maximum_permissions` 替代文件专用布尔量；只读附件 WRITE 升级在 PTE 修改前返回 EACCES，split/fork 保留上限，8 条新增固定 Linux 差分通过。
-- [x] R7（`1d9b814`）：rank 15 inode 写操作门闩覆盖整次 write/writev/pwrite/append/同步收尾与截断；四种 io-sleep 配置、同 inode 缺页缓冲、实际 U-mode 向量追加和 partial-write 通过。SQLite WAL/重启双侧及完整 WAL 恢复矩阵通过。
-- [x] R8（`8a005cb`）：已有 key 的零大小查找与创建下限分开；已有/缺失 key、零/合法/超原段大小、CREAT/EXCL 的 20 条新增固定 Linux 差分通过。
+- [x] R1（`7d89d2f`）：SHM 附加 registry OOM 回滚不消费段表 owner；scale 聚焦故障后重试及最终页回收通过。
+- [x] R2（`e5769ee`）：显式 attachment 与通用 VMA 片段 open/close；覆盖分裂、起始页撤销、RMID、匿名/文件/SHM 固定替换、fork/退出与 metadata/page OOM，保持 prepare/commit 失败原子性。
+- [x] R3（`f30f521`）：file-source 操作 pin 覆盖 msync 的 inode 等待与错误游标；三任务最后撤映射、终止请求、同步/关闭失败及最终清理通过四种 io-sleep 配置。
+- [x] R4（`5008e09`）：AF_UNIX DGRAM 整包复制/提交、零消息和整包预算；差分、scale OOM/fault/容量复用与真实 pthread 整包等待/取消通过。
+- [x] R5（`d8052ee`，完成断言修正 `c76bd0e`）：线程同步故障记录与统一返回交付、si_code/si_addr、阻塞/忽略强制默认；真实 U-mode 修复/上下文返回、坏帧和默认组退出及 5 条固定 Linux 故障差分通过。
+- [x] R6（`dad0005`）：通用 `maximum_permissions` 替代文件专用布尔量；只读附件 WRITE 升级在 PTE 修改前返回 EACCES，split/fork 保留上限，8 条新增固定 Linux 差分通过。
+- [x] R7（`dd1467c`）：rank 15 inode 写操作门闩覆盖整次 write/writev/pwrite/append/同步收尾与截断；四种 io-sleep 配置、同 inode 缺页缓冲、实际 U-mode 向量追加和 partial-write 通过。SQLite WAL/重启双侧及完整 WAL 恢复矩阵通过。
+- [x] R8（`b104889`）：已有 key 的零大小查找与创建下限分开；已有/缺失 key、零/合法/超原段大小、CREAT/EXCL 的 20 条新增固定 Linux 差分通过。
 
 ## 已交付：进程身份、可信随机数与真实调度
 
@@ -187,9 +187,124 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 | P-D 小写 | 普通文件/TCP 非零请求仍分配整页 staging；AF_UNIX DGRAM 已改整包 heap owner，有界为 64 KiB | 1/3/63/64/65/4096 字节 × 缓存冷/热，计每调用物理/heap 分配、复制字节和峰值所有权。优化后须保留 fault/OOM/退出清理与消息原子性。 |
 | P-E 延迟 | `arch/riscv/trap_entry.S` 至用户返回保持 SIE 关闭；缓存命中的大复制/扫描可能无睡眠点 | 固定大复制/改权与独立唤醒任务，计 irq-off 最大值、锁持有/等待、唤醒到运行延迟和切换。先明确重入约束，不随意开中断/yield，不承诺硬实时。 |
 
-- [ ] 补上述计数/时间观测，并保存固定 kernel/ELF/QEMU 身份、输入规模与可重建命令。
-- [ ] 在新写操作门闩下分别测同 inode 串行化和独立 inode 进展；包含同 inode 用户缓冲 fault、O_SYNC 和截断竞争，区分正确性成本与后端 I/O 成本。
-- [ ] 有测量后再比较候选，沿既有 owner、锁 rank、失败原子性和单 hart/SMP 边界验收。未经新证据不关闭这些待办。
+下列 C0–C6 将这些门槛拆为下一阶段的交付任务；测量结果尚未产生，不能据源码成本结构关闭待办。
+
+## 下一阶段：成本测量优先（2026-09-30 任务计划）
+
+维护者已选择先量化写入、扫描、唤醒和延迟，再决定优化。目标是得到能归因、可重建的
+成本基线，保护 R1–R8 已验收的行为；本节是任务准备，尚未实施观测代码或新的结构优化。
+起点为本轮最终生产源码，内核 SHA-256
+`0c0c6a77f54160c06f284f19133b6bb6516f7c6e2d8dcb5f0864390ce1361fbb`，
+1091 条 ABI、四组合 io-sleep、scale 与 WAL 恢复证据见上文。
+
+固定事实入口为 `references/linux` commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`
+的 `fs/read_write.c`、`mm/filemap.c`、`mm/mprotect.c`、`kernel/sched/`，及
+`references/qemu` v11.1.0 commit `84f07211cc5b4fc6a371559bf8a5de4fb068e648` 的 VirtIO/NBD；
+实际运行记录 QEMU 版本与哈希，不预设某台宿主的墙钟速度。
+
+### 观测方式候选与边界
+
+| 候选 | 正确性与演进 | 复杂度与观测成本 |
+|---|---|---|
+| ① 默认关闭的分层聚合统计，复用现有 MM/设备统计（推荐） | 在实际 syscall、MM、调度和存储边界计数；按 task/MM/inode/设备区分范围，切换时结算运行时间；不增加 Linux 用户 ABI | 热路径不分配、不打印、不等待；固定计数器/直方图占用可核对，必须验证默认关闭和观测开销；可逐层扩展 |
+| ② 仅测试链接包装器及 NBD 外部计数 | 易复用 scale/io-sleep 故障探针，基本不改生产路径；可独立校验候选①的关键计数 | 看不到 static/inline 内部扫描和完整 trap 区间，独立生产 U-mode 的归因不完整；适合辅助检错 |
+| ③ 有界事件环记录时间线 | 能还原复杂等待与嵌套关系，便于后续并发诊断 | 增加事件格式、丢失/溢出、采样和对象代次管理，扰动及存储成本更高；本阶段不建议先建通用追踪系统 |
+
+实施前确认候选①的观测接口与 owner/生命周期；当前已确认的是测量优先的范围，
+不是 deadline 索引、wake_one、驻留范围树或事务合并路线。关闭观测时不添加热路径工作；
+开启时所有计数按真实操作递增，不能按测例 ID/固定输入切换语义。
+
+输出同时记录请求字节、实际接受字节及各层复制/设备字节，错误和短写保留真实结果。
+数据/metadata/journal 分类必须有实际后端来源依据；无法唯一分类的字节列为 unknown，
+不按固定扇区号或测例输入猜测。峰值统计只记录本层实际 owner，避免把同一后备页的多个引用重复当容量。
+层间嵌套时间不能直接相加当作总时间；运行、就绪等待、I/O 阻塞、主动暂扣响应分别标记。
+计时使用客体单调时钟并记录分辨率；宿主暂停、QEMU 墙钟和调度 tick 不冒充指令执行成本。
+只测连续实际运行的 IRQ-off 区间，不能把睡眠/上下文切换累计成一次关中断持有。
+
+### C0：观测契约、固定输入与独立检错
+
+入口为 `include/arch/riscv/mm.h::riscv_kernel_mm_get_statistics`、
+`include/arch/riscv/virtio_mmio_block.h::riscv_virtio_mmio_block_get_statistics`、
+`include/kernel/sync.h` 和 `kernel/sched/scheduling.c::scheduler_account_runtime`。
+计划新增 `tests/cost-riscv.py`、`tests/test-cost-report.py` 与 Makefile 的 `test-cost-riscv`
+入口；这些文件/target 尚不存在。拟用默认关闭的 `COST_DIAGNOSTICS=0`；开启时由 Makefile
+给 C/assembly 同时传递 `BOAROS_COST_DIAGNOSTICS`，不能只给 C 加标志而漏掉 trap 入口。
+诊断构建独立放 `build/cost/`，复用 `BUILD_DIR`、`KERNEL_RV` 和 `CFLAGS_EXTRA`，
+配置进入缓存身份，避免覆盖普通构建或串用缓存。
+runner 的 `--case`/Makefile 的 `COST_CASE` 为 contract/write/locking/mprotect/deadline/latency/consumer/all；
+各任务只运行已交付的对应 case，未知或尚未实现 case 必须明确失败，最终 all 不得跳过缺项。
+
+- [ ] 定义每项指标的单位、采样范围、owner、起止点、失败/取消记账和清零条件；运行时不重置仍在途的计数。
+- [ ] runner 在启动前快照 kernel/ELF/fixture；结果包含源码 tree、配置、工具与 QEMU 哈希、负载参数、冷/热准备方式和完整退出/资源基线。丢记录、负差值、溢出、错误 owner 或缺少结束标记必须失败。
+- [ ] 先写协议/计数红测：刻意破坏一个字段、缺一个阶段或交换 owner，报告不得通过。固定小负载由数据内容、完成字节和独立包装器验证计数，不锁定私有布局或偶然调用次序。
+- [ ] 验证诊断关闭后目标代码不引用新增观测入口；开启后不分配/睡眠/修改 errno，测量记录自身占用与开销，不能用计数器开销伪造被测路径成本。
+- [ ] `python3 -B -m unittest discover -s tests -p 'test-cost-report.py'` 和 `make test-cost-riscv COST_CASE=contract`；新增观测状态不得破坏已有 MM/task 元数据页容量和栈预算。
+
+### C1：写入与分配分解（P-D、存储成本）
+
+修改范围为 `fs/files/io.c::write_request`/`buffered_write_request`、
+`arch/riscv/uaccess.c`、`fs/page_cache.c::writeback_entry`/`kernel_page_cache_writeback_range`、
+`fs/ext4_backend.c`、`fs/lwext4_port.c`、`arch/riscv/virtio_mmio_block.c`；
+扩展 `tests/riscv/scale_main.c`，新增真实 U-mode `tests/workloads/cost/write.c`。
+
+- [ ] 先核对 0/1/3/63/64/65/4096 字节和对齐/错位 1 MiB：记录 staging/后备页/heap 分配、用户页解析、复制、缓存探测、脏范围、快照、数据/metadata/journal/flush、队列深度与等待；区分普通文件、TCP、AF_UNIX DGRAM。
+- [ ] 用普通 write、O_SYNC、O_DSYNC、每次/每 16 次/结束时 fsync 或 fdatasync，以及共享映射+msync 分组对照；分别改变顺序/随机、覆盖/扩展、冷/热和压力条件，不把全部因素一次混成笛卡尔积。
+- [ ] 每个基准配置使用三个独立启动副本；内容、offset、大小、短写、EFAULT/EIO/OOM 和资源基线先验收，再保存计数和客体时间分布。既有 1 MiB 256 分块/页解析门槛继续独立保护。
+- [ ] 窄验证 `make test-scale-riscv test-files-partial-write-riscv`，再 `make test-cost-riscv COST_CASE=write` 与 `make test-userland-riscv`；交付各层放大比和错误路径结果，不预先宣称小写分配或 flush 是主瓶颈。
+
+### C2：整次写门闩、锁等待与唤醒（P-C、R7 成本）
+
+入口为 `kernel/sched/sync.c::acquire`/`kernel_lock_release`、`kernel/sched/wait.c`、
+`fs/vfs.c` 和 `tests/riscv/io_sleep_main.c`，复用 C1 的实际 U-mode 写负载。
+
+- [ ] 分 rank 10/15/20/30/40 记录取得次数、等待/持有时间、阻塞次数、wake_all 唤醒数、重新阻塞、成功取得和切换；固定直方图需同时输出边界和样本数，不报虚假的精确分位数。
+- [ ] 对照同 OFD、独立 OFD 同 inode、不同 inode、单盘/双盘；等待者为 1/8/32，读写混合。覆盖第二块冷页 usercopy、同 inode 映射输入、O_SYNC、截断和取消，观察独立 inode 的进展。
+- [ ] 用既有暂扣/放行握手把受控 I/O 等待和缓存热写分开；核对 wake/重阻塞计数可检出无效唤醒，终止后 pin、锁和缓冲归零，最长观测等待不冒充无饥饿保证。
+- [ ] `make test-cost-riscv COST_CASE=locking` 与 `make test-io-sleep-riscv test-files-partial-write-riscv test-userland-riscv` 通过 legacy/modern × writeback/writethrough；交付门闩自身等待与后端串行成本的分解，本任务不修改公平策略。
+
+### C3：单页改权的总扫描成本（P-B）
+
+入口为 `arch/riscv/mm.c::kernel_mm_mprotect`、`mm/vma.c`、
+`arch/riscv/sv39.c`、`tests/riscv/scale_main.c` 与 `tests/riscv/vma_cases.c`。
+
+- [ ] 固定一页改权目标，分别增加无关 VMA 16/64/256 和文件驻留页 0/16/64 MiB；记录查询、prepare/commit、VMA 编辑/合并、file_residents 扫描、PTE 与 TLB 失效。
+- [ ] 全范围失败、洞、只读 SHM/共享文件上限拒绝、split/fork、NONE 降权恢复、OOM 仍保持原契约；统计失败路径不得触发新的 PTE 修改或 owner 变化。
+- [ ] `make test-cost-riscv COST_CASE=mprotect` 与 `make test-vma-riscv test-scale-riscv test-diff-abi-riscv`；报告总访问次数随无关集合增长的关系，不能用每目标页三级 PTE 访问掩盖外围扫描。
+
+### C4：deadline 遍历与到期偏差（P-A）
+
+入口为 `kernel/sched/wait.c::kernel_scheduler_expire_deadlines`、队列校验、
+`kernel/sched/core.c`、`tests/riscv/scheduler_cases.c` 和 `tests/riscv/io_sleep_main.c`。
+
+- [ ] 固定 4 个带 deadline 的任务，另建 0/32/128/256 个无期限 blocked；分别计队列校验和 deadline 循环访问、tick 整条路径耗时、实际到期唤醒与运行偏差。
+- [ ] 覆盖同期限、提前普通唤醒、信号/取消、退出与对象复用；握手确认任务已 blocked 后再开始采样，不用宿主 sleep 推断调度状态。
+- [ ] `make test-cost-riscv COST_CASE=deadline` 与 `make test-scheduler-cases-riscv test-io-sleep-riscv test-sched-policy-host test-sched-bandwidth-riscv`；得到固定 deadline 数下的增长曲线，仍保留遍历机制至证据支持结构选择。
+
+### C5：连续关中断与唤醒到运行（P-E）
+
+入口为 `arch/riscv/trap_entry.S`、`include/arch/riscv/context.h`、
+`kernel/sched/scheduling.c`、`arch/riscv/trap.c` 与 `tests/workloads/cost/write.c`。
+该任务依赖 C0 的观测契约及 C2–C4 的运行/等待区分。
+
+- [ ] 嵌套 save/restore、用户 trap、异常返回、调度睡眠/恢复、idle 分别核对观测起止；采样本身不递归取得锁、开启中断或分配，不漏掉 assembly 前后区间。
+- [ ] 固定热缓存 4 KiB/64 KiB/1 MiB 复制和单页/大范围改权，配独立唤醒任务；报告 IRQ-off 最大区间、锁持有、唤醒到运行分布与切换，不按 QEMU 墙钟设性能及格线。
+- [ ] `make test-cost-riscv COST_CASE=latency` 与 `make test-trap-riscv test-trap-return-riscv test-context-riscv test-user-riscv test-io-sleep-riscv test-sched-bandwidth-riscv test-stack-usage`；运行观测开/关对照。本任务不引入任意 yield 或 syscall 内开中断。
+
+### C6：真实消费者、归因与收口
+
+复用 `tests/runtime-diagnostics.py`、固定原镜像的 iozone 以及 C0 runner；
+证据归 `docs/learning/single-hart-scale.md`/`sleepable-storage.md`，契约归对应模块，
+能力/后续依赖分别更新 README 与本页，不另建永久计划或原始日志档案。
+
+- [ ] 固定原 iozone ELF/依赖/镜像哈希、argv、工作目录、文件规模、缓存与同步条件；先核实实际调用链，再用 C1–C5 的受控负载解释其观测，未执行或超时保留原始状态。
+- [ ] `make test-cost-riscv COST_CASE=consumer` 与最终 `make test-cost-riscv COST_CASE=all` 输出全部阶段、输入身份和观测开/关对照，三个独立启动副本均有完整结果。
+- [ ] 汇总每项主成本与未解释余量，报告重复分布、观测开销和无收益结果；只有因果对照支持时，提出 2–3 个对应瓶颈的候选，由维护者选择一次优化。
+- [ ] 测量代码收口运行 `make test-riscv test-userland-riscv test-glibc-riscv test-diff-abi-riscv test-scale-riscv test-io-sleep-riscv test-stack-usage`，以及 SQLite DELETE/WAL 正常/错误恢复。后续实际修改写回、事务或队列时再跑两种完整恢复矩阵与双盘隔离。
+- [ ] 每个 C 任务独立验证/提交，使用 `Co-authored-by: GPT-6.1 Sol <codex@openai.com>`；固定输入和结论入 Git 后 `python3 -B tests/prune-build.py`、`make prune-build`。完整 Harness 的 kernel-la 阻塞继续单列。
+
+依赖为 C0 → C1/C3/C4，C1 → C2，C2/C3/C4 → C5，全部测量 → C6。
+日志/RTC、SysV RMID 后再 attach 的既有兼容限制和 iperf/netperf 定位保留后续队列；
+本阶段不扩展 SMP、LoongArch、deadline 索引、选择性唤醒、驻留范围索引或持久化策略。
 
 ## P0：固定证据与时序问题
 
