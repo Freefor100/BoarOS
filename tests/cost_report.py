@@ -42,14 +42,19 @@ def parse(text, epoch):
     for lane in LANES:
         for name,unit,hist in schema():
             p=lane+'.'+name+'.'; count=fields[p+'samples']; value=fields[p+'value']; maximum=fields[p+'max']
-            if (not count and (value or maximum)) or maximum > value: raise ValueError('counter consistency: '+p)
+            if (not count and (value or maximum)) or maximum > value or value > count * maximum: raise ValueError('counter consistency: '+p)
             if hist:
                 bins=[fields[p+'bucket.'+str(i)] for i in range(65)]
                 if sum(bins) != count: raise ValueError('histogram sample count: '+p)
                 low=sum(n*(0 if i==0 else 1<<(i-1)) for i,n in enumerate(bins))
-                high=sum(n*(0 if i==0 else (1<<i)-1) for i,n in enumerate(bins))
+                high=sum(n*min(maximum,0 if i==0 else (1<<i)-1) for i,n in enumerate(bins))
                 if not low <= value <= high: raise ValueError('histogram sum: '+p)
-                if count and not bins[0 if maximum==0 else maximum.bit_length()]: raise ValueError('histogram maximum: '+p)
+                if count:
+                    maximum_bucket=maximum.bit_length()
+                    highest=max(i for i,n in enumerate(bins) if n)
+                    if highest!=maximum_bucket:raise ValueError('histogram maximum: '+p)
+                    minimum=0 if highest==0 else 1<<(highest-1)
+                    if value<low-minimum+maximum:raise ValueError('maximum sample absent: '+p)
     return fields
 
 def percentile(bins, quantile):
@@ -64,11 +69,20 @@ def validate_expected(snapshot, expected):
     for key,value in expected.items():
         if snapshot.get(key) != value: raise ValueError(f'independent expected {key}: {snapshot.get(key)} != {value}')
 
+def validate_deadline(name, snapshot):
+    _, unrelated, mode, _ = name.split('-')
+    if int(mode) == 0:
+        samples=sum(snapshot[lane+'.deadline_visits.samples'] for lane in LANES[:2])
+        maximum=max(snapshot[lane+'.deadline_visits.max'] for lane in LANES[:2])
+        # Handshakes prove N+4 blocked members, without fixing system-worker count.
+        if not samples or maximum < int(unrelated)+4:
+            raise ValueError('deadline scan omitted blocked members: '+name)
+
 def validate_replicas(records):
     """Three independent launches per immutable configuration, with complete identical windows."""
     groups={}
     for record in records:
-        key=tuple(record[k] for k in ('case','cost_diagnostics','transport','cache'))+(record.get('two_disks',False),)
+        key=tuple(record[k] for k in ('case','cost_diagnostics','transport','cache'))+(record.get('two_disks',False),record.get('platform','boaros'))
         groups.setdefault(key,[]).append(record)
     if not groups: raise ValueError('empty measurement')
     for key,rows in groups.items():
@@ -81,11 +95,17 @@ def validate_replicas(records):
         for row in rows:
             if row['cost_diagnostics'] and not row['snapshots']: raise ValueError('missing snapshots')
             if not row['cost_diagnostics'] and row['snapshots']: raise ValueError('unexpected diagnostic snapshots')
-            seen=set()
+            seen=set(); previous_epoch=0
             for snapshot in row['snapshots']:
                 if snapshot['name'] in seen: raise ValueError('duplicate window')
                 seen.add(snapshot['name'])
                 text=''.join(f'{k}={v}\n' for k,v in snapshot['values'].items())
-                parse(text,snapshot['values']['epoch'])
+                parsed=parse(text,snapshot['values']['epoch'])
+                if row['case']=='deadline':validate_deadline(snapshot['name'],parsed)
+                if parsed['epoch']<=previous_epoch:raise ValueError('reused/stale boot epoch')
+                previous_epoch=parsed['epoch']
+            if row['cost_diagnostics'] and row['case'] in ('contract','write','locking','mprotect','deadline','latency','consumer','io-pressure'):
+                expected_epochs=[1,2,3,5] if row['case']=='contract' else list(range(1,len(row['snapshots'])+1))
+                if [s['values']['epoch'] for s in row['snapshots']]!=expected_epochs:raise ValueError('boot epoch sequence')
             if row['cost_diagnostics'] and row['timings_ns'] and seen!=set(row['timings_ns']): raise ValueError('window coverage')
     return groups

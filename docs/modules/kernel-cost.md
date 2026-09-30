@@ -38,8 +38,8 @@ idle/cleanup 上下文单列 idle_ticks，不能解释成精确 WFI 驻留时间
 
 验证入口：`make test-cost-host`、`make test-cost-riscv COST_CASE=contract`。
 后者串行运行三个独立启动副本，在启动前保存 kernel/ELF/fixture 身份与源码内容哈希。
-目前交付 contract/write/locking/mprotect/deadline/latency；未交付 consumer 明确失败，
-`all` 不跳过缺项。独立报告读器拒绝缺项、重复、未知键、单位错误、旧 epoch、
+目前交付 contract/write/locking/mprotect/deadline/latency/consumer，
+`all` 不跳过缺项；consumer 不将未完成命令标为完成。独立报告读器拒绝缺项、重复、未知键、单位错误、旧 epoch、
 直方图不一致、incomplete 和 overflow。当前 Python discovery 不收集带连字符的文件，
 因此 host target 直接运行 `python3 -B tests/test-cost-report.py`，必须实际执行测试。
 
@@ -60,7 +60,8 @@ C2 按 rank 10/15/20/30/40/other 记录尝试、取得、阻塞、唤醒、重�
 低内存 io-sleep fixture 使用相同接口输出 pressure-io/timeout-cancel，完成后才分配快照；
 名称/单位使用字符数组，避免 fixture 关闭分页后解引用高半区绝对字符串指针。
 真实 U-mode 的13个 locking窗口检查同/独立OFD、同/不同inode、1/8/32等待者及双盘，
-覆盖冷映射输入、向量追加、O_SYNC、截断和取消。四种设备配置各三次 fixture 启动验证清理。
+覆盖冷映射输入、向量追加、O_SYNC和截断。U-mode取消阶段在write前撤销gate等待者；
+实际写入在途取消由低内存io-sleep的operation_mode=3保护。四种设备配置各三次 fixture 启动验证清理。
 
 C3 计数覆盖外围VMA查询/覆盖/权限/数组编辑/合并/recount、resident遍历和实际PTE/TLB，
 prepare/commit/整次改权为嵌套墙上耗时，不能相加。聚合上限包括名称、单位、索引和桥接标量预留。
@@ -69,3 +70,19 @@ C5 使用hart全局标量跟踪实际SIE转换，嵌套不重起，切换不截�
 trap保存t0/t1后首采样，sret恢复其他寄存器后发布尾stamp，下一安全入口聚合。
 C save/restore、trampoline、timer启动、idle/trap/sret均接入；诊断原始临界区单列observer。
 wake_to_run只含实际wake，ready_ticks另含创建/yield等就绪。关闭后C/ASM都无新增指令。
+
+C6 使用固定原镜像的ELF/脚本/依赖，逐命令保存ELF、argv、cwd、真实wait status、
+诊断timeout与原stdout/stderr。解释器路径按原ELF安装，libc目录各自指定；不改ELF或uname。
+原脚本成功不作为原命令成功证据；wait=0且无timeout且原完成marker三条件同时成立才完成。
+冻结的kernel/ELF/fixture/firmware/DTB和工具/源码身份按每启动保存，执行器串行互斥。
+`tests/cost-evidence.py` 压缩零指标后仍重建完整快照并核对seal，拒绝遗漏非零计数；
+持久验收再次检查epoch严格递增和直方图最大值，后台取消和回收重入OOM由独立host回归保护。
+
+即时fixture begin为当前执行上下文初始化run/idle起点，end先结算最后一段；
+运行有效位与时间戳分开，时钟从0开始也不漏计。延期U-mode仍由用户返回边界启停。
+全局cancelled使用实际任务归属；回收重入导致的合法EMPTY仍计失败，不改变重入禁令。
+
+即时fixture还裁剪已开放IRQ区间的起点，并在end结算窗口内尾段；真实hart仍关闭时保留
+开放状态，后续enable不能污染已完成窗口。全局cancelled的单位是丢弃的在途scope深度，
+正常exit也可能贡献，不能解释成取消用户操作数；rank取消与原wait status分别报告。
+C4按握手确认的N+4个blocked成员检查扫描max下限，遗漏扫描或只计有期限任务都会失败。

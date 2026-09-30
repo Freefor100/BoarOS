@@ -10,6 +10,7 @@ import time
 import sys
 import hashlib
 import json
+import fcntl
 from cost_report import parse
 
 parser = argparse.ArgumentParser()
@@ -27,6 +28,10 @@ if args.transport == 'all':
                             '--qemu', args.qemu, '--transport', transport] + mode, check=True)
     raise SystemExit(0)
 root = Path(__file__).resolve().parents[1]
+if args.cost_output:
+    (root/'build/cost').mkdir(parents=True,exist_ok=True)
+    measurement_lock=(root/'build/cost/measurement.lock').open('w')
+    fcntl.flock(measurement_lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
 work = Path(tempfile.mkdtemp(prefix='io-sleep-run.', dir=root / 'build'))
 processes = []
 logs = {'guest': bytearray(), 'server': bytearray()}
@@ -47,6 +52,11 @@ try:
         shutil.copyfile(args.kernel,kernel_snapshot)
         kernel_path=str(kernel_snapshot)
         source_tree=subprocess.check_output(['git','write-tree'],cwd=root,text=True).strip()
+        source_sha256=hashlib.sha256(b''.join(p.encode()+b'\0'+hashlib.sha256((root/p).read_bytes()).hexdigest().encode()+b'\n' for p in sorted(subprocess.check_output(['git','ls-files','-co','--exclude-standard'],cwd=root,text=True).splitlines()) if '__pycache__' not in Path(p).parts)).hexdigest()
+        bios=work/'firmware';shutil.copyfile('/usr/share/qemu/opensbi-riscv64-generic-fw_dynamic.bin',bios)
+        dtb=work/'boot.dtb'
+        subprocess.run([args.qemu,'-machine','virt,dumpdtb='+str(dtb),'-bios',str(bios),'-kernel',kernel_path,'-m','512M','-smp','1','-nographic','-global','virtio-mmio.force-legacy='+('true' if args.transport=='legacy' else 'false'),'-drive',f'file={disk},if=none,format=raw,id=root','-device','virtio-blk-device,drive=root,bus=virtio-mmio-bus.0,config-wce=off,request-merging=off'],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        firmware_sha256=hashlib.sha256(bios.read_bytes()).hexdigest();dtb_sha256=hashlib.sha256(dtb.read_bytes()).hexdigest()
     else: kernel_path=args.kernel
     address = work / 'nbd.sock'
     server = subprocess.Popen([str(root / 'build/host/nbd-fault'), str(disk), str(address),
@@ -57,11 +67,13 @@ try:
         if server.poll() is not None or time.monotonic() > deadline:
             raise RuntimeError('NBD server startup failed')
         time.sleep(0.01)
-    guest = subprocess.Popen([args.qemu, '-machine', 'virt', '-bios', 'default',
+    guest_command=[args.qemu, '-machine', 'virt', '-bios', str(bios) if args.cost_output else 'default',
         '-global', 'virtio-mmio.force-legacy=' + ('true' if args.transport == 'legacy' else 'false'),
         '-kernel', kernel_path, '-m', '512M', '-smp', '1', '-nographic', '-no-reboot',
         '-drive', f'file=nbd+unix:///?socket={address},if=none,format=raw,id=root,cache={'writethrough' if args.write_through else 'writeback'}',
-        '-device', 'virtio-blk-device,drive=root,bus=virtio-mmio-bus.0,config-wce=off,request-merging=off'],
+        '-device', 'virtio-blk-device,drive=root,bus=virtio-mmio-bus.0,config-wce=off,request-merging=off']
+    if args.cost_output:guest_command+=['-dtb',str(dtb)]
+    guest = subprocess.Popen(guest_command,
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0)
     processes.append(guest)
     selector = selectors.DefaultSelector()
@@ -162,7 +174,8 @@ try:
         args.cost_output.parent.mkdir(parents=True,exist_ok=True)
         args.cost_output.write_text(json.dumps({'transport':args.transport,'cache':'writethrough' if args.write_through else 'writeback',
             'kernel_sha256':hashlib.sha256(Path(kernel_path).read_bytes()).hexdigest(),
-            'fixture_sha256':fixture_sha256,'source_tree':source_tree,
+            'fixture_sha256':fixture_sha256,'source_tree':source_tree,'source_sha256':source_sha256,
+            'firmware_sha256':firmware_sha256,'dtb_sha256':dtb_sha256,'argv':guest_command,
             'qemu_version':subprocess.check_output([args.qemu,'--version'],text=True).splitlines()[0],
             'qemu_sha256':hashlib.sha256(Path(shutil.which(args.qemu)).read_bytes()).hexdigest(),
             'nbd_sha256':hashlib.sha256((root/'build/host/nbd-fault').read_bytes()).hexdigest(),'snapshots':snapshots},indent=2)+'\n')

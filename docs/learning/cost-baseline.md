@@ -50,13 +50,15 @@
 
 这是该握手负载下 wake_all 的可重复重阻塞成本；不能由此推断一般吞吐、无饥饿保证或双盘收益。
 同OFD的offset串行挡在rank15之前；独立OFD可见inode整次写门闩；不同inode仍有各自门闩及
-共享后端的等待。向量追加、重叠定位写、同步尾部、截断和取消的内容、offset/大小、状态均通过。
+共享后端的等待。向量追加、重叠定位写、同步尾部和截断的内容、offset/大小、状态均通过；
+U-mode取消窗口终止尚未放行的gate waiter，真正写中取消与延后terminate由四组合压力fixture提供。
 热路径仅增加默认关闭的观测，不改变门闩或唤醒策略。
 
 固定 kernel SHA-256：`5e9d2fb7c098c5795b98f0ae1fc8f5d0b4ed4550e2d721d5d3efff54a3ef6673`。
 可重建：`make COST_DIAGNOSTICS=1 all`；串行执行
 `python3 -B tests/cost-riscv.py --case locking` 和同命令追加 `--two-disks`；
-`python3 -B tests/io-sleep-riscv.py --cost-output <result.json> --transport modern --cache writeback`，
+`python3 -B tests/io-sleep-riscv.py --kernel build/cost/riscv/tests/kernel-io-sleep-rv --cost-output <result.json> --transport modern`
+（writethrough追加 `--write-through`），
 对四配置分别重复三次。报告由 `tests/cost-summary.py` 检查完整三副本和 schema。
 
 ## C3 外围扫描（2026-09-30）

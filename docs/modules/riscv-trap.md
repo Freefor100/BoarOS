@@ -81,3 +81,10 @@ make test-riscv
 `test-demand-page-riscv` 让磁盘加载的 PID 1 越过初始栈提交区，分别由 load/store page fault 建立两个匿名零页并重试原指令；测试版内核还在子进程的 load page fault 注入 `NO_MEMORY`，要求父进程得到 wait status 9，全部后代与 PID 1 随后正常回收。普通 RX/guard 故障回归证明按需处理没有放宽 VMA 权限或 guard 边界。
 
 `test-timer-riscv` 使用实际 QEMU DTB、OpenSBI TIME 和 cause 5，让生产 dispatcher 至少两次经完整 Trap Frame 路径返回 `wfi`。`test-scheduler-riscv` 让两个不主动让出的内核线程只靠 timer 在各自 Frame/栈之间切换。`test-trap-riscv` 保留低地址未处理 breakpoint 的 fatal 契约；`test-high-half-trap-riscv` 验证最终 Sv39 高半区的 SSIP 恢复和 fatal 路径。
+
+默认关闭的成本观测在保存t0/t1后取trap入口stamp，在sret尾发布结束stamp；
+按实际SIE状态跟踪hart连续区间，跨切换保持。固定入口/尾盲区及C调用点限制见
+[成本基线](../learning/cost-baseline.md)，不改变trap frame布局和用户返回契约。
+
+C disable 的 `csrrc` 到采样之间还有分支及编译器指令前缀；C enable 的9条尾部仅为固定最小值，
+调用者恢复指令也未采样。采样跨度加已知盲区不能作为完整硬件IRQ-off上界。
