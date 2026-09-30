@@ -78,7 +78,7 @@ void kernel_cost_user_return(void)
     struct kernel_cost_task *task = kernel_cost_current();
     if (task) kernel_cost_account(task);
     kernel_cost_boundary();
-    if (task) { task->suppress = 0; task->run_start = kernel_cost_clock(); }
+    if (task) { task->suppress = 0; task->run_start = kernel_cost_clock(); task->wait_flags |= 8; }
 }
 void kernel_cost_task_exit(void)
 {

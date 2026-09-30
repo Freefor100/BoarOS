@@ -28,5 +28,9 @@ int main(void)
     assert(kernel_cost_read(0,COST_BLOCKED_TICKS,&value)==0 && value==880);
     assert(kernel_cost_read(0,COST_READY_TICKS,&value)==0 && value==10);
     assert(kernel_cost_read(0,COST_DEADLINE_TO_RUN,&value)==0 && value==20);
+    foreground = (struct kernel_cost_task){0};actor=&foreground;
+    ticks=0;assert(kernel_cost_begin(1,10000000,1,0)==0);
+    ticks=100;assert(kernel_cost_end(1,0)==0);
+    assert(kernel_cost_read(0,COST_RUN_TICKS,&value)==0 && value==100);
     puts("cost runtime excludes sleep and attributes the actual owner");
 }

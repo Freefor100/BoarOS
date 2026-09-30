@@ -171,7 +171,7 @@ void kernel_cost_rebase(struct kernel_cost_task *task)
 {
     ATOMIC_SCOPE;
     task->run_start = task->ready_start = task->blocked_start = 0;
-    task->wait_flags &= (uint8_t)~7U;
+    task->wait_flags &= (uint8_t)~15U;
     task->scope_epoch = cost.epoch;
     add_checked(&cost.inflight, task->depth);
 }
@@ -203,7 +203,7 @@ void kernel_cost_cancel(struct kernel_cost_task *task)
     if (cost.active && task->scope_epoch == cost.epoch && task->depth) {
         if (cost.inflight < task->depth) __builtin_trap();
         cost.inflight -= task->depth;
-        kernel_cost_add_tag((struct kernel_cost_tag){cost.epoch, 0}, COST_CANCELLED, task->depth);
+        kernel_cost_add_tag(kernel_cost_task_tag(task), COST_CANCELLED, task->depth);
     }
     task->depth = 0; task->wait_rank = 0; task->wait_flags &= 128;
 }
@@ -221,7 +221,20 @@ int kernel_cost_begin(uint64_t owner, uint32_t frequency, int fixture, int defer
     cost.fixture = !!fixture; cost.state = 1;
     cost.pending = deferred ? 1 : 0;
     cost.active = !deferred;
-    if (cost.active) cost.start = kernel_cost_clock();
+    if (cost.active) {
+        cost.start = kernel_cost_clock();
+        if (fixture) {
+            struct kernel_cost_task *task = kernel_cost_current();
+            if (task) { kernel_cost_join(task); task->run_start = cost.start; task->wait_flags |= 8; }
+            /* 裁剪原有关闭区间，首段只能归属于本窗口。 */
+            if (irq.opened) {
+                unsigned observer_lane = irq.tag.lane == 2;
+                irq.start = cost.start; irq.tag = kernel_cost_task_tag(task);
+                if (observer_lane) irq.tag.lane = 2;
+                irq.suppressed = 0;
+            }
+        }
+    }
     return 0;
 }
 int kernel_cost_end(uint64_t owner, int deferred)
@@ -229,7 +242,15 @@ int kernel_cost_end(uint64_t owner, int deferred)
     ATOMIC_SCOPE;
     if (!cost.active || cost.pending) return -KERNEL_EINVAL;
     if (owner != cost.owner) return -KERNEL_EPERM;
+    if (cost.fixture) { struct kernel_cost_task *task = kernel_cost_current(); if (task) kernel_cost_account(task); }
     if (cost.inflight) return -KERNEL_EBUSY;
+    if (cost.fixture && !deferred && irq.opened) {
+        uint64_t now = kernel_cost_clock();
+        if (!irq.suppressed && now >= irq.start)
+            kernel_cost_sample_tag(irq.tag, COST_IRQ_OFF_TICKS, now - irq.start);
+        /* 结算窗口尾部，不把真实仍关闭的 hart 伪装成已 enable。 */
+        irq.start = now; irq.tag.epoch = 0;
+    }
     cost.active = 0;
     if (deferred) cost.pending = 2;
     else { cost.end = kernel_cost_clock(); cost.state = 2; }
@@ -260,14 +281,14 @@ void kernel_cost_account(struct kernel_cost_task *task)
 {
     uint64_t now = kernel_cost_clock();
     uint64_t start = task->run_start < cost.start ? cost.start : task->run_start;
-    if (task->run_start && now >= start)
+    if ((task->run_start || (task->wait_flags & 8)) && now >= start)
         kernel_cost_add_tag(kernel_cost_task_tag(task), task->wait_flags & 128 ? COST_IDLE_TICKS : COST_RUN_TICKS, now - start);
-    task->run_start = now;
+    task->run_start = now; task->wait_flags |= 8;
 }
 void kernel_cost_block(struct kernel_cost_task *task)
 {
     kernel_cost_account(task);
-    task->run_start = 0; task->blocked_start = kernel_cost_clock();
+    task->run_start = 0; task->wait_flags &= (uint8_t)~8U; task->blocked_start = kernel_cost_clock();
 }
 void kernel_cost_ready(struct kernel_cost_task *task)
 {
@@ -294,8 +315,8 @@ void kernel_cost_timeout(struct kernel_cost_task *task, uint64_t deadline)
 }
 void kernel_cost_switch(struct kernel_cost_task *previous, struct kernel_cost_task *next)
 {
-    if (previous->run_start) kernel_cost_account(previous);
-    previous->run_start = 0;
+    if (previous->run_start || (previous->wait_flags & 8)) kernel_cost_account(previous);
+    previous->run_start = 0; previous->wait_flags &= (uint8_t)~8U;
     uint64_t now = kernel_cost_clock();
     uint64_t start = next->ready_start < cost.start ? cost.start : next->ready_start;
     if (next->ready_start && now >= start)
@@ -305,7 +326,7 @@ void kernel_cost_switch(struct kernel_cost_task *previous, struct kernel_cost_ta
     if ((next->wait_flags & 4) && now >= next->blocked_start)
         kernel_cost_sample_tag(kernel_cost_task_tag(next), COST_DEADLINE_TO_RUN, now - next->blocked_start);
     next->blocked_start = 0;
-    next->ready_start = 0; next->wait_flags &= (uint8_t)~6U; next->run_start = now;
+    next->ready_start = 0; next->wait_flags &= (uint8_t)~6U; next->run_start = now; next->wait_flags |= 8;
     if (previous != next) kernel_cost_add_tag(kernel_cost_task_tag(next),COST_SWITCHES,1);
 }
 int kernel_cost_read(unsigned lane, enum kernel_cost_metric metric, uint64_t *value)

@@ -67,5 +67,17 @@ int main(void)
     assert(kernel_cost_format(output, sizeof(output)) > 0);
     assert(strstr(output, "foreground.operations.value=1\n"));
     assert(kernel_cost_format(output, 10) == -KERNEL_EOVERFLOW);
+    for (unsigned background = 0; background < 2; background++) {
+        assert(kernel_cost_begin(9, 10000000, 0, 0) == 0);
+        actor.epoch = background ? kernel_cost_epoch() : 0;
+        actor.wait_flags = background ? 64 : 0;
+        scope = kernel_cost_enter(COST_OPERATION_TICKS);
+        kernel_cost_cancel(&actor);
+        assert(kernel_cost_end(9, 0) == 0);
+        uint64_t value;
+        assert(kernel_cost_read(0, COST_CANCELLED, &value) == 0 && value == 0);
+        assert(kernel_cost_read(1, COST_CANCELLED, &value) == 0 && value == 1);
+        kernel_cost_leave(&scope);
+    }
     puts("cost core contract passed");
 }
