@@ -15,8 +15,10 @@
 #include <kernel/socket.h>
 #include <kernel/shm.h>
 #include <kernel/scheduler.h>
+#include <kernel/time.h>
 #include <kernel/uaccess.h>
 #include <kernel/vfs.h>
+#include <string.h>
 
 #define USER UINT64_C(0x10000)
 #define BUFFER UINT64_C(0x100000)
@@ -48,15 +50,18 @@ enum kernel_scheduler_status __wrap_kernel_wait_queue_wake_all(struct kernel_wai
 }
 static unsigned fail_page;
 static unsigned fail_metadata, fail_packet;
+static unsigned timer_probe, timer_heap_calls;
 enum kernel_heap_status __real_kernel_heap_allocate(struct kernel_heap *, size_t, void **);
 enum kernel_heap_status __wrap_kernel_heap_allocate(struct kernel_heap *heap, size_t size, void **out)
 {
+    if (timer_probe) timer_heap_calls++;
     if (fail_packet && --fail_packet == 0) return KERNEL_HEAP_STATUS_EMPTY;
     return __real_kernel_heap_allocate(heap, size, out);
 }
 enum kernel_heap_status __real_kernel_heap_allocate_zeroed(struct kernel_heap *, size_t, size_t, void **);
 enum kernel_heap_status __wrap_kernel_heap_allocate_zeroed(struct kernel_heap *heap, size_t n, size_t size, void **out)
 {
+    if (timer_probe) timer_heap_calls++;
     if (fail_packet && --fail_packet == 0) return KERNEL_HEAP_STATUS_EMPTY;
     if (fail_metadata && --fail_metadata == 0) return KERNEL_HEAP_STATUS_EMPTY;
     return __real_kernel_heap_allocate_zeroed(heap, n, size, out);
@@ -117,7 +122,26 @@ static void tcp_cost(struct kernel_files *files, struct kernel_mm *mm)
     number("TCP user-page resolutions: ", resolutions);
     check(after.tcp_write_calls - before.tcp_write_calls <= 8 && resolutions <= 8 &&
           after.tcp_written_bytes - before.tcp_written_bytes == 8192, 33);
-    kernel_socket_destroy(accepted);
+    struct kernel_open_file_description *reader=0;
+    check(kernel_open_file_create_socket(files->heap,accepted,0,&reader)==KERNEL_OPEN_FILE_STATUS_OK, 201);
+    uint32_t consumed=0;
+    while(consumed<8192){
+        struct kernel_socket_read_request request={0};
+        int got=kernel_socket_reserve_read(accepted,0,&request,&reader,sizeof(payload));
+        check(got>0,202);kernel_socket_finish_read(&request,0);consumed+=(uint32_t)got;
+    }
+    /* 强制协议保留一次未接纳的 pbuf；IRQ 重试不能重入被中断的堆分配。 */
+    fail_packet=1;
+    check(kernel_socket_write_buffer(client_socket,"retry",5,0)==5 && fail_packet==0,203);
+    uint64_t deadline=kernel_time_monotonic_ns()+UINT64_C(300000000);
+    timer_probe=1;
+    do{kernel_socket_expire_timers();}while(kernel_time_monotonic_ns()<deadline);
+    timer_probe=0;check(timer_heap_calls==0,204);
+    struct kernel_socket_read_request request={0};
+    check(kernel_socket_reserve_read(accepted,0,&request,&reader,sizeof(payload))==5,205);
+    char retry[5];kernel_socket_copy_read(&request,0,retry,5);check(!memcmp(retry,"retry",5),206);
+    kernel_socket_finish_read(&request,0);
+    check(kernel_open_file_release(&reader)==KERNEL_OPEN_FILE_STATUS_OK,207);
     check(kernel_open_file_release(&client) == KERNEL_OPEN_FILE_STATUS_OK &&
           kernel_open_file_release(&listener) == KERNEL_OPEN_FILE_STATUS_OK &&
           kernel_files_close(files, client_fd, &result) == KERNEL_FILES_STATUS_OK && result == 0 &&
@@ -540,6 +564,7 @@ void kernel_main(unsigned long hart, const void *dtb)
     struct kernel_files files = {0};
     struct kernel_fs_context fs = {0};
     check(dtb_read_boot_info(dtb, &info) == DTB_STATUS_OK, 1);
+    check(kernel_time_init(info.timebase_frequency,0)==KERNEL_TIME_STATUS_OK,208);
     layout.usable_count = 1;
     layout.usable[0].base = (uintptr_t)pool; layout.usable[0].size = sizeof(pool);
     check(physical_page_allocator_init(&allocator, &layout) == PHYSICAL_PAGE_STATUS_OK &&

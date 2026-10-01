@@ -14,6 +14,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <sys/mman.h>
 #include <sys/wait.h>
 #include <sys/syscall.h>
 #include <time.h>
@@ -127,6 +128,8 @@ static void options(void)
     struct sockaddr_in peer;length=sizeof(peer);CHECK(getpeername(udp,(void *)&peer,&length)==0 && peer.sin_port==a4.sin_port);
     struct sockaddr disconnect={.sa_family=AF_UNSPEC};CHECK(connect(udp,&disconnect,sizeof(disconnect))==0);
     CHECK(getpeername(udp,(void *)&peer,&length)==-1 && errno==ENOTCONN);
+    length=sizeof(peer);CHECK(getsockname(udp,(void *)&peer,&length)==0 && peer.sin_port==0 && peer.sin_addr.s_addr==a4.sin_addr.s_addr);
+    a4.sin_port=0;CHECK(bind(udp,(void *)&a4,sizeof(a4))==0);
     CHECK(close(udp)==0);
     puts("NETWORK PASS options: real options, V6ONLY port isolation and UDP peer");
 }
@@ -182,6 +185,11 @@ static void data_and_shutdown(void)
     CHECK(read(client,data,sizeof(data))==2 && !memcmp(data,"ok",2));
     int child_status;CHECK(waitpid(reader,&child_status,0)==reader && child_status==0);
     int duplicate=dup(client);CHECK(duplicate>=0);
+    CHECK(write(server,"abc",3)==3);memset(data,'z',sizeof(data));
+    CHECK(recv(client,data,3,MSG_TRUNC)==3 && data[0]=='z' && data[2]=='z');
+    CHECK(recv(client,data,sizeof(data),MSG_DONTWAIT)==-1 && errno==EAGAIN);
+    void *guard=mmap(NULL,4096,PROT_NONE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);CHECK(guard!=MAP_FAILED);
+    CHECK(write(server,"abc",3)==3 && recv(client,guard,3,MSG_TRUNC)==3 && munmap(guard,4096)==0);
     CHECK(send(client,"before FIN",10,0)==10 && shutdown(duplicate,SHUT_WR)==0);
     CHECK(recv(server,data,sizeof(data),0)==10 && !memcmp(data,"before FIN",10));
     CHECK(recv(server,data,sizeof(data),0)==0);
@@ -253,8 +261,8 @@ int main(void)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
     addresses();
-    options();
     data_and_shutdown();
+    options();
     reset_and_accept_rollback();
     puts("NETWORK PASS contract");
     return 0;

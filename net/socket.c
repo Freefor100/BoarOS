@@ -20,6 +20,7 @@
 #include "lwip/sys.h"
 #include "lwip/stats.h"
 #include "lwip/tcp.h"
+#include "lwip/priv/tcp_priv.h"
 #include "lwip/timeouts.h"
 #include "lwip/udp.h"
 
@@ -82,6 +83,8 @@ struct kernel_socket {
     struct kernel_socket_address saved_peer;
     ip_addr_t udp_bind_ip;
     uint8_t explicit_bind;
+    uint8_t explicit_port;
+    uint8_t receive_retry;
     uint8_t write_blocked;
     uint32_t write_retry_ms;
 };
@@ -133,6 +136,7 @@ static int address_import(const struct kernel_socket *socket,
 
 static struct kernel_socket *inet_sockets;
 static uint8_t socket_initialized;
+static uint8_t socket_timer_irq;
 static struct kernel_socket *write_retry_head;
 
 /* Called with interrupts disabled: the list itself owns no socket reference.
@@ -196,7 +200,7 @@ static void retire_timewait(void)
         tcp_arg(socket->tcp, 0); tcp_err(socket->tcp, 0);
         tcp_recv(socket->tcp, 0); tcp_sent(socket->tcp, 0); tcp_poll(socket->tcp, 0, 0);
         socket->tcp->connected = 0;
-        socket->tcp = 0; socket->peer_closed = 1;
+        socket->tcp = 0; socket->peer_closed = 1;socket->receive_retry=0;
         write_retry_disarm(socket); wake_socket(socket);
     }
 }
@@ -205,6 +209,10 @@ static void poll_loopback(void)
 {
     uintptr_t old_status = riscv_interrupt_save();
     if (socket_initialized) {
+        for (struct kernel_socket *socket=inet_sockets;socket!=0;socket=socket->inet_next) {
+            if (socket->receive_retry && socket->tcp && socket->tcp->refused_data)
+                (void)tcp_process_refused_data(socket->tcp);
+        }
         sys_check_timeouts();
         netif_poll_all(); retire_timewait();
     }
@@ -214,7 +222,9 @@ static void poll_loopback(void)
 void kernel_socket_expire_timers(void)
 {
     /* IRQ 只推进有界协议定时器；收包/accept 和用户复制仍在调用上下文。 */
-    if (socket_initialized) { retire_timewait(); sys_check_timeouts(); }
+    if (socket_initialized) {
+        retire_timewait();socket_timer_irq=1;sys_check_timeouts();socket_timer_irq=0;
+    }
 }
 
 uint64_t kernel_socket_next_timer_deadline(void)
@@ -360,6 +370,10 @@ static err_t tcp_data_received(void *context, struct tcp_pcb *pcb,
         wake_socket(socket);
         return ERR_OK;
     }
+    /* 拒收重试仍由协议持有 pbuf；IRQ 不重入被中断的全局堆操作。 */
+    if (socket_timer_irq) {
+        socket->receive_retry=1;wake_socket(socket);return ERR_MEM;
+    }
     if (error != ERR_OK) return error;
     if (payload->tot_len > socket->rx_limit ||
         socket->rx_bytes > socket->rx_limit - payload->tot_len) return ERR_MEM;
@@ -369,6 +383,7 @@ static err_t tcp_data_received(void *context, struct tcp_pcb *pcb,
     if (status != KERNEL_HEAP_STATUS_OK) __builtin_trap();
     packet->payload = payload;
     socket->rx_bytes += payload->tot_len;
+    socket->receive_retry=0;
     if (socket->packets_tail != 0) socket->packets_tail->next = packet;
     else socket->packets_head = packet;
     socket->packets_tail = packet;
@@ -390,6 +405,7 @@ static void tcp_failed(void *context, err_t error)
 {
     struct kernel_socket *socket = context;
     write_retry_disarm(socket);
+    socket->receive_retry=0;
     if (error == ERR_CLSD) {
         socket->tcp = 0; socket->peer_closed = 1; wake_socket(socket); return;
     }
@@ -650,6 +666,7 @@ int kernel_socket_bind(struct kernel_socket *socket,
         : tcp_bind(socket->tcp, &local, address->port);
     if (error == ERR_OK) {
         socket->explicit_bind = 1;
+        socket->explicit_port = address->port != 0;
         if (socket->udp != 0) ip_addr_copy(socket->udp_bind_ip, socket->udp->local_ip);
         if (IP_IS_V6(&local) && !ip_addr_isany(&local)) socket->v6only = 1;
     }
@@ -735,8 +752,8 @@ int kernel_socket_connect(struct kernel_socket *socket,
                 ip_addr_set_zero(&socket->udp->local_ip);
                 IP_SET_TYPE(&socket->udp->local_ip, socket->family == KERNEL_SOCKET_AF_INET ? IPADDR_TYPE_V4 :
                              socket->v6only ? IPADDR_TYPE_V6 : IPADDR_TYPE_ANY);
-                socket->udp->local_port = 0;
             }
+            if (!socket->explicit_port) socket->udp->local_port = 0;
             error = ERR_OK;
         } else {
             int result = address_import(socket, address, &remote, 0);
@@ -1205,6 +1222,12 @@ out:
     clear_write_request(&request);
     *pin_owner = request.pin;
     return result;
+}
+
+int kernel_socket_discard_receive(const struct kernel_socket *socket, uint32_t flags)
+{
+    return socket && socket->domain == KERNEL_SOCKET_DOMAIN_INET &&
+           socket->type == SOCKET_STREAM && (flags & KERNEL_SOCKET_MSG_TRUNC);
 }
 
 static struct kernel_socket_statistics socket_statistics;

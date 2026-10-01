@@ -51,7 +51,7 @@ IPV6_V6ONLY。SO_ERROR 读取清除待观察错误，连接阶段 RST 返回 ECO
 固定 RV64 最小值分别为 4608/2304；不预分配。接收队列和 TCP 发送接受量执行
 预算，lwIP 窗口和全局池仍可更紧。UDP connect 设置/重置默认对端并由协议过滤。
 监听启用官方 backlog 计量：待 accept child 保留资格，accept/abort 归还。
-原版应用、发送入口、半关闭及超时等待的完整组合仍在后续数据阶段验收。
+原版应用与完整组合的实测结论见学习记录；旧 glibc 使用兼容配置。
 
 ## 流发送、整包与半关闭
 
@@ -79,6 +79,13 @@ reset 排队 child 在下次检查摘除。监听器的预算、超时和选项�
 同时设置实际 PCB。TIME_WAIT 在移交协议池前摘除所有堆回调；LAST_ACK 的
 ERR_CLSD 解除 PCB 借用。timer IRQ 推进协议期限，不处理新收包/accept，防止
 最后 OFD 关闭后定时回收依赖另一个用户 syscall。
+
+IRQ 推进时，TCP 非空 refused-data 回调只保留协议 pbuf、登记重试并唤醒，
+不申请内核堆。调用上下文显式重试这些数据，不能仅期待下一次 timer 恰好从
+syscall 运行。FIN、错误和池回收不分配堆，继续在期限到达时推进。scale 的
+独立堆包装器强制首次接收 OOM，证明 IRQ 重试零堆调用且随后内容完整接纳。
+UDP 分别记录显式地址与非零端口绑定，AF_UNSPEC 断开释放自动端口；TCP
+MSG_TRUNC 沿 reservation 消费而跳过 scratch/usercopy，UDP 和 UNIX 保持各自语义。
 
 UDP 排队同时受每 socket 配额与共享协议堆约束。队列不能耗尽给下一条最大报文
 及 TCP 控制所需的余量；过载按 UDP 语义丢包并归还 pbuf。五条不限速 UDP 原负载

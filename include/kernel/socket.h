@@ -33,6 +33,7 @@ struct kernel_socket_write_request {
     struct kernel_open_file_description **pin_owner;
 };
 int kernel_socket_is_datagram(const struct kernel_socket *socket);
+int kernel_socket_discard_receive(const struct kernel_socket *socket, uint32_t flags);
 int kernel_socket_write_datagram(struct kernel_open_file_description **pin_owner,
     struct kernel_mm *mm, const struct kernel_uaccess_iovec *iov,
     size_t iov_count, uint64_t count, uint32_t flags,
