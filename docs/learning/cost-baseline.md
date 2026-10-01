@@ -822,3 +822,237 @@ SQLite 切点有两项原假设随异步流水线失效：一次探针的事件�
 此前成功同步的证明。三种持久化策略探针共同决定故障序号覆盖上界，未到达不冒充
 注入成功。NBD 独立检查证明控制断电保留已 flush 的 A、丢弃未 flush 的 B。
 这一处只修测试模型，生产持久化协议没有为切点或程序名建立特判；最终矩阵结果在下节汇总。
+
+### S9 存储流水线验收（2026-10-01）
+
+**S6–S8 实现和最终正确性门禁通过，性能目标未完成。** 相对匹配的 S5 基线，十格
+代表写入的 Parent 中位值只有 0.98–1.88 倍，自动模式程序加 fsync 收尾只减少
+23.09%/22.04%，musl 普通读 Parent 回退17.05%。固定字节热读门槛通过。
+这些是实际失败的验收目标，`goals.md` 的 S9 保留未关闭状态；不能用堆分配改善、队列
+达到八槽或原 judge 得分略升代替消费者收益达标。
+
+本轮追加到既有 [消费者归档](cost-consumer-followup.json) 的 `storage_pipeline`，保留
+旧 `records` 与 `journal_optimization`。新记录保存逐命令 ELF、argv、cwd、wait status、
+原输出、三个副本所有 Parent/Children/Max/Min/Avg/Min xfer 值，以及分离的计时、输入
+manifest、诊断快照 seal 和恢复摘要。运行目录清理后，以 Git 中这些记录和重建命令为证。
+它是存储定点验收，`complete_cost_matrix=false`，没有重跑 C0–C6。
+
+#### 实现改变了什么
+
+| 根因 / 实现入口 | 新机制与 owner | 独立证明与实际边界 |
+|---|---|---|
+| 重复准备，`ext4_journal.c` 的 image/pool、`jbd_trans_set_block_dirty` | 操作继续持私有 undo；组中已有 LBA 复用 after/log/checkpoint 资源；完整块载荷与描述符分开，空闲池和 pinned home 均计入硬预算 | 旧热修改分配探针失败，新实现两种块尺寸及 OOM/abort/跨组版本通过；不共享正在变化的提交源 |
+| 阈值等待，`__ext4_trans_start`、`jbd_journal_operation_room` | 操作数阈值只封口；最多两组 sealed、一组 committing；sealed/durable/checkpoint 等待分开，实际预算/日志/复用依赖才触发回收等待 | 第65次操作在旧提交暂扣时进入新组；FIFO 满与真正容量不足仍有背压 |
+| 同步与回收耦合，`jbd_journal_select/submit/retire/checkpoint` | commit 屏障后发布 durable；已提交版本、日志 credit、quarantine 归 mount，连续 checkpoint 和持久起点更新后才释放 | checkpoint 暂扣时同步可返回，随后断电恢复；同 LBA FIFO、环绕及错误 owner 通过。没有 sealed 任务时 worker 仍立即选 checkpoint |
+| 串行 I/O，`kernel_block_write_batch`、VirtIO batch、`ext4_backend.c` adapter | 同阶段最多八 span；逻辑调用 owner 包含未发布项，DMA owner 到完成/reset 才释放；FLUSH 等整个先前调用，重复 LBA/同扇区 RMW 保序 | 四组合实际八槽、零 runtime polling；错误停止补发并排空 DMA。八槽是最大已发布深度，不表示所有读/屏障均可并发 |
+| 热读无更新时间仍独占，backend accessed | 先取得 inode/backend 共享资格查询；确需 touch 时释放共享资格，独占重查 | 同 inode 共享读者握手证伪旧独占路径；立即可见时间、旧时间更新、fault 和 clock 不可用契约通过 |
+
+相关提交为 `991e01c`（操作准备）、`29ccd35`（sealed/durable/checkpoint）、`88a2c83`
+（块/VirtIO）、`34645e2`（冻结阶段与热读）。主分支保留 BoarOS uname；原旧 glibc
+消费者在 `oscomp-rv-compat` 的 Linux 4.15 配置运行。`b0791b2`、`6f73187` 修正 WT
+控制握手和恢复/输出判读，`12d35b0` 修正诊断结束等待；它们没有放松生产持久化边界。
+
+#### 关闭观测的真实消费者
+
+三个串行独立启动，modern/writeback、512MiB、单 hart；原 musl/glibc ELF 各八组原
+参数。48 次命令中42次可用方法真实完成，六次 `(11,12)` 为原 ELF 版本排除，固定
+Linux 同样不支持。退出0后的 fallback 输出不算向量方法实现。所有可用输出、wait
+status 和最终资源检查通过，每个启动 PID1 status=0、heap-live=0。
+
+以下均为三次中位数，原单位 kB/s，五项从四进程原参数的对应方法取值。Parent 是本轮
+验收字段；Max 为 judge 字段，另列，完整 Children/Min/Avg 与副本分布保留在归档。
+
+| libc / 方法 | S5 Parent | 新 Parent | 比值 | 新 Max | 固定 Linux Parent |
+|---|---:|---:|---:|---:|---:|
+| musl initial writers | 653.40 | 1120.96 | 1.716 | 1093.22 | 50643.58 |
+| musl rewriters | 1405.70 | 1825.41 | 1.299 | 1025.41 | 42335.42 |
+| musl random writers | 881.68 | 990.79 | 1.124 | 1167.69 | 64562.04 |
+| musl fwriters | 1308.78 | 1612.10 | 1.232 | 1104.07 | 84465.80 |
+| musl pwrite writers | 929.05 | 1134.04 | 1.221 | 1121.06 | 49721.97 |
+| glibc initial writers | 1139.19 | 1114.03 | 0.978 | 1106.33 | 46211.72 |
+| glibc rewriters | 1461.45 | 1731.86 | 1.185 | 1165.99 | 47610.77 |
+| glibc random writers | 657.74 | 1233.90 | 1.876 | 967.09 | 65260.79 |
+| glibc fwriters | 1272.70 | 1587.51 | 1.247 | 990.87 | 78761.66 |
+| glibc pwrite writers | 680.68 | 749.63 | 1.101 | 1662.81 | 66448.99 |
+
+十格均未达到5倍；当前 Parent 仍只有对应 Linux 的1.13%–4.31%，即慢约23–89倍。
+这是同原 ELF/参数的结果，不能与旧报告用 Max 算的差距混用。原多进程方法各任务实际
+进展不相同，Min xfer 与分布必须同时读；原输出没有逐方法精确总字节，不据此伪造
+各任务完整传输量。ON 的 accepted bytes 另有来源明确的计数。
+
+自动模式程序加 fsync 收尾，三个副本及中位如下，单位秒：
+
+| libc | 新程序耗时三个副本 | 新收尾三个副本 | S5 合计中位 | 新合计中位 | 减少 |
+|---|---|---|---:|---:|---:|
+| musl | 12.720923 / 12.543040 / 12.646482 | .022154 / .023874 / .021759 | 16.471709 | 12.668241 | 23.09% |
+| glibc | 14.317967 / 14.620540 / 14.146449 | .021196 / .020401 / .019895 | 18.392868 | 14.339163 | 22.04% |
+
+**这里的收尾是剩余普通文件与目录 fsync 的 durable 目标，并非完整 checkpoint 排空
+计时。** 最终卸载确实排空全部事务/版本并核对资源，但没有单独计时。程序本身已大于
+旧基线一半的8.236/9.196秒，加入未测的完整排空只会更长，所以减半目标确定失败。
+固定 Linux 既有完整自动窗口中位 .734494/.988815秒，没有独立程序/收尾拆分，保持缺项。
+
+固定4MiB自动读/重读的中位：musl 85958→85516、86008→85778 kB/s；glibc
+85778→84535、86164→84532 kB/s，回退0.27%–1.89%，通过5%门槛。
+四进程 Parent 读项则须另看：
+
+| 方法 | musl S5 → 新 Parent kB/s（变化） | glibc S5 → 新 Parent kB/s（变化） |
+|---|---|---|
+| readers | 37874.64 → 31418.54（-17.05%） | 37657.32 → 39097.50（+3.82%） |
+| re-readers | 56424.77 → 56628.03（+.36%） | 56981.63 → 56379.38（-1.06%） |
+| random readers | 30325.78 → 33295.48（+9.79%） | 36848.78 → 33218.50（-9.85%） |
+| reverse readers | 32378.30 → 36845.05（+13.80%） | 32736.50 → 32924.40（+.57%） |
+| stride readers | 33425.26 → 36931.07（+10.49%） | 33088.43 → 33324.49（+.71%） |
+| freaders | 50793.66 → 50695.04（-.19%） | 64629.07 → 64724.03（+.15%） |
+| pread readers | 37707.40 → 42995.71（+14.02%） | 38446.78 → 43491.28（+13.12%） |
+
+musl readers 的三个 OFF 副本 Min xfer 均5KiB，旧值722/743/729KiB；新 Min 吞吐
+144–153kB/s，旧16–17千kB/s，Max反而23581.93→30538.17（约+29.5%）。这是实际
+任务分布问题，不能用提高的 Max 消去失败；固定字节热读通过，也不能把它概括为整个
+缓存读路径退化。ON 同组 Min xfer=613KiB、Parent=20755.56，分布受到观测改变。
+目前没有唯一定位该 OFF 分布改变的因果，不声称缓存淘汰、共享查询或某个调度算法
+已经被证明为根因。这个读项仍是明确的收口缺口。
+
+#### 成本下降在哪里，为什么没有五倍
+
+一个定点 ON 启动仅选择两种 libc 的自动和四进程 `(0,1)`。这四个原窗口各自合法
+结束，原程序真实完成；随后第一项短同步的 body 完成但 `end` 因后台 checkpoint scope
+仍在途返回 EBUSY，整次启动 status=1。因此归档明确标为失败尾部的部分窗口，绝不
+把该 boot 或该同步窗口称为通过。只补跑受影响的四项同步，没有重跑已完成消费者。
+
+下面自动 ON 对照使用相同原 ELF/参数及固定 QEMU，均接受24MiB。它是一次观测样本，
+用于机制归因，消费者成绩仍取上述三次 OFF。
+
+| 自动成本 | musl S5 → 新 | glibc S5 → 新 | 含义 |
+|---|---|---|---|
+| 堆请求次数 | 522085 → 46048 | 522392 → 46328 | 约减少91%；操作准备复用有效 |
+| 累计堆请求字节 | 1491285061 → 85326877 | 1491429923 → 85476795 | 分配周转量，不是内存峰值/RSS |
+| page allocator 次数 | 391277 → 54761 | 391432 → 54874 | 4KiB载荷不再因头部扩为两页，仍含其他页分配 |
+| 元数据/data 封口组数 | 510 → 510 | 510 → 510 | 64操作/100ms组节奏未改变 |
+| 设备请求 | 28004 → 26630 | 27970 → 26613 | 只减少约5%，并非八槽就能消除请求固定成本 |
+| FLUSH | 2123 → 1547 | 2123 → 1547 | 减少27.13%，必要阶段屏障仍保留 |
+| 最大已发布在途 | 2 → 8 | 2 → 8 | 阶段内部并行有效，屏障之间仍串行 |
+| 事务预算峰值 B | 2318336 → 1042944 | 2320768 → 1112768 | 含版本、日志、pin与池；不是全系统内存峰值 |
+| 全任务 run 秒 | 10.617077 → 6.863059 | 10.696610 → 7.209142 | 运行时间在切换处结算，含观测函数体 |
+| unknown read B | 73371648 → 71282688 | 73371648 → 71352320 | 缺少可证明来源，不改标为 data/metadata |
+
+新 musl 自动仍有24576次1KiB文件写、96MiB staging请求、85708次用户页解析、154169次
+缓存探测、29732次写回访问、20975616B快照复制；glibc用户页解析59146、缓存探测110829。
+这些前台工作没有被事务池或设备批量消除。它们说明下一步应看操作粒度和查询/复制，
+但没有独立计时证明每项占整段耗时的百分比，不能据此把全部余量塞进某一项。
+
+新 journal-superblock写909312B，即222个4KiB checkpoint批次。结合阶段源码与
+20MiB ordered-data，可解释1547 FLUSH为 `2×510 + 83 + 2×222`；83是由固定阶段
+协议及计数推得，非独立的“带数据组”新指标。musl写放大约1.250、glibc1.244，相对
+旧1.297已不高；余下慢写主要方向是频繁请求/屏障、前台固定工作和等待，而非大量
+额外写字节。组数仍510，是分配减少约九成但消费者只改善一部分的关键差别。
+
+musl/glibc sealed 等待各186次、durable各8次、checkpoint各37次；旧schema没有这些
+字段，保留 unknown，不写成旧0。前台 rank40 持有从旧musl8.376秒降为6.027/6.190秒，
+等待 .567/.556秒，block5013/4998次、reblock0次。持有耗时包含睡眠，不是纯CPU。
+四写者新窗口19.472/19.389秒，前台 rank40 等待7.582/6.169秒，block3982/3465次、
+reblock均0；accepted bytes 为8296448/7384064，旧8244224/6404096，比较请求总量时
+必须考虑工作量变化。S4定向交接消除了旧广播重阻塞，此处没有证据需要换整个调度策略。
+
+新后台 commit阶段8.658/10.075秒、checkpoint阶段1.533/1.553秒；旧 submit阶段
+11.289/13.132秒包含checkpoint。不能只拿新commit与旧submit算收益。两个新worker
+阶段可以合计比较旧整个worker阶段，锁/设备/CPU嵌套时间不能再加上去。
+musl窗口15.092秒中 run6.863 + idle-context8.050，余量 .179秒；glibc16.737秒中
+run7.209 + idle-context9.343，余量 .185秒。idle-context含切换与清理，不等同精确WFI；
+多任务blocked/ready时间也不能叠加到窗口分母。
+
+原请求完成→运行恢复最大为自动10.087/10.006ms、四写者17.039/21.693ms，仍有tick
+量级长尾。批量减少实际唤醒次数；当前只对真正 `cost_woken` 的owner建立 ready/resume
+样本，自动分别21218/21221个，设备请求26630/26613个。不能与旧所有请求样本的平均值
+直接算延迟倍数，也不能把残余性能全归于此。实际IRQ-off和直方图保留在快照。
+
+单个ON自动窗口比OFF程序中位长约19.1%/16.9%，其中观测函数体 .521/.523秒已包含
+在run，不能重复加计。ON与OFF协调器版本不同、ON只有一个启动，以上是构建差异而非
+精确纯采样开销。旧40.9倍mprotect扰动也不能套到此处。诊断继续默认关闭，当前固定
+聚合及声明预留65405B、每任务标量64B，由快照及64KiB/64B静态断言核对。
+
+#### 同步边界、诊断关闭与原专项
+
+补跑的同步窗口为128次4KiB覆盖，各512KiB，读回通过。程序计时在首次 `end` 前停止；
+仅该consumer wrapper在EBUSY时睡眠重试至scope退出，单独输出 `COST CLOSING`。
+内核 `end` 的在途拒绝契约不变，其他成本case不启用重试。关闭耗时12.618/8.842/
+8.031/10.429ms（2/1/1/1次EBUSY）不计入body，却属于快照覆盖范围。
+`state=complete`表示窗口已合法关闭、所有在途scope结束，**不表示整个文件系统已经
+checkpoint干净**；OFF只表示关闭新增诊断，并非关闭异步日志或关闭持久化。
+
+| 模式 | 新ON秒 / kB/s | S5 OFF秒 | 固定 Linux OFF秒 | 新commit耗时 p50/p95/p99桶区间 |
+|---|---|---:|---:|---|
+| O_SYNC | 2.057874 / 248.80 | 1.867245 | 2.325198 | 均[6.5536,13.1071]ms |
+| O_DSYNC | 3.037613 / 168.55 | 2.978155 | .381675 | 均[13.1072,26.2143]ms |
+| pwrite+每次fsync | 3.462733 / 147.86 | 3.480250 | 2.282966 | 均[13.1072,26.2143]ms |
+| pwrite+每次fdatasync | 3.367452 / 152.04 | 3.435701 | .388959 | 均[13.1072,26.2143]ms |
+
+新数据是ON单样本，旧/Linux是OFF，不能声称匹配的同步加速；桶区间是128次后台commit
+scope（含I/O等待），不是逐syscall延迟分位。最大10.657/24.600/23.159/23.432ms。
+四项各128组/commit，FLUSH642/642/640/642。`jbd_journal_select` 在没有下一组sealed
+时马上checkpoint，因此单个热同步负载仍付出大部分五阶段屏障成本；新返回边界正确，
+却没有自动带来组间重叠收益。data-only同步与固定Linux仍有约八倍单样本耗时差，包含
+观测差异；不通过跳过必要屏障获取成绩。
+
+一次1GiB原配置、原脚本八组、原judge：269.309秒（S5为293.532秒，减少8.25%），
+musl **25.027128** 分（旧24.849956，+.713%），glibc **25.316408** 分
+（旧25.179081，+.545%）。代表写方法的原judge项仍各1分，分数提升主要来自读项。
+这是实际原配置，不与512MiB modern/writeback负载混为一谈；脚本16次自然完成，14次
+可用、2次版本排除，最终status0/heap-live0。只运行iozone，不是完整Harness总分，
+其他未选组的judge占位不表示那些组通过；缺 `kernel-la` 的完整双架构阻塞继续存在。
+
+#### 最终正确性与重建身份
+
+最终候选集中通过完整lwext4 journal/ordered-data/orphan/truncate/reclaim恢复矩阵，
+SQLite DELETE/WAL全切点/丢失/重排/错误、双盘错误隔离与第二盘WAL重启；每个切点恢复
+两次并fsck。DELETE三策略切点83/76/79，共238；WAL27/27/30，共84，总计322。
+WRITE/FLUSH序号共115次尝试，其中106次实际注入、9次序号未出现而转为提交后断电，
+分别记录，不能把115都称作注入。DELETE最后46–56 WRITE序号只补此前包络未覆盖的
+尾部，未重复此前切点和故障。完整RV64、真实musl、glibc2.44五形态、固定Linux1091
+条ABI、scale、四组合io-sleep通过。栈1729函数、最大单帧2368B、trap288B、保留1024B。
+
+默认main内核SHA-256 `75682369a7aed056d0f85f70413d8c31d577322707e57a0bd2d2dc629eb9dac6`；
+compat三次OFF `59127e3bed48093b3c6428bcaae28c1ab5c80acdaa2f54c1a48165b062726d41`，
+ON `34181d4505ebc5675198c43e0c75443d722fbeb1e4d73ccc1b214fe7d79a2b05`；
+原专项 `6e72791ecbf7e9d03255eabbbfbf7906f049609e2d173c5ea6c97f360d09d199`。
+三个OFF的冻结S5协调器 `f120168ecde33e94db083df703300ca9e8b0e215a6c4911417b5339af14aaf49`；
+ON原四窗口协调器 `b8cdfec28afccaf60d8e9ebf0e9bd1755d0be0881265b058c8111c224e453f05`，
+修正同步结束的协调器 `6e3327235eef8340bcc4b2f688bd5657911547e66fd1f0d02c0439168d2fdd40`。
+生产源码位于compat `8fe3431617d61b8d514d98270abd832b49c4da10`，tree
+`47088b8fbe34daa89dc1b5fae471542f68cf7a38`；同步追加只含两个wrapper文件diff，原专项
+kernel_dirty同样来自未编入生产内核的wrapper差异，不能改写为“运行时clean tree”。
+
+原镜像 `f419468678d342133546add2f8459ea09aeba987ba968e28753d6ee656996b8b`；
+musl ELF `019cd6e219263f41b3c1d62024ea9ce38e613541bf2a1d9b7e2aa6506187ecd6`，
+glibc ELF `984c8ad474072011f38d52a98d422c581b2277d3e2d03f90557f45a8046c66de`。
+实际QEMU11.1.1 `a1cfcceb6c688f9b0a290d512211ed08cf465b92b26a04cfb032280a53625718`，
+OpenSBI `894e2aef99590fc07ec6c60ab00282b8bc5d5d5bb2a1d0c6ada0c52df24274c0`，
+DTB timebase10MHz，时间分辨率100ns。它与机制参考QEMU v11.1.0相区别。
+固定Linux/RISC-V/QEMU/oscomp参考沿用上一节的本地路径和commit/文档SHA。
+最终NBD故障模型 `22a8c979a85a153c28c7b7fdeac7aa73f06d440b44c5e90cda7590db8dd452ab`；
+每次启动的fixture、DTB、工具、source/diff身份在归档中。默认与诊断、512MiB与1GiB的
+kernel/DTB身份不同，是各自配置结果，不强行要求同一哈希。
+
+可重建命令如下。原消费者/原专项在对应compat实现运行；通用恢复/ABI使用main。
+冻结OFF协调器从 `18167bd` 的 consumer.c/common.h 用 runner 的static/O2/pthread
+参数重建，保留源basename consumer.c并核对上述SHA，不用新同步wrapper替换旧协调器。
+
+```sh
+make -j4 COST_DIAGNOSTICS=0 all
+python3 -B tests/cost-riscv.py --case consumer --off --kernel kernel-rv --replicas 3 --consumer-timeout-ms 900000 --coordinator-elf /tmp/frozen-s5/consumer.elf
+make -j4 COST_DIAGNOSTICS=1 all
+python3 -B tests/cost-riscv.py --case consumer --replicas 1 --consumer-timeout-ms 900000 --consumer-commands musl:0,musl:1,glibc:0,glibc:1
+python3 -B tests/cost-riscv.py --case consumer --replicas 1 --consumer-sync-only
+make -j4 COST_DIAGNOSTICS=0 all
+python3 -B tests/oscomp/run.py --groups iozone --output build/oscomp-iozone-s8
+make test-lwext4-group-host test-journal-group-riscv test-journal-idle-negative-riscv
+make test-lwext4-recovery-host test-sqlite-recovery-matrix-riscv test-sqlite-wal-recovery-matrix-riscv
+make test-multi-disk-io-riscv test-sqlite-second-disk-riscv
+make test-riscv test-userland-riscv test-glibc-riscv test-diff-abi-riscv test-scale-riscv test-io-sleep-riscv test-stack-usage
+```
+
+以上命令是重建入口，本轮通过且没有相关改动的测试不再重复。三个OFF的各方法字段、
+单个ON和同步样本的限制、失败尾部与缺项一并保留。本轮只进行一次最终diff/owner/文档
+核对，提交后单向merge到compat，不反向引入比赛profile。后续resident/deadline/IRQ-off、
+usercopy、缓存/网络、SMP方向保存在唯一 `goals.md`；新的批次政策、timestamp接入和读
+分布修复须调查后另选路线，不将候选或未测收益写成实现。无push、发布或阶段转换。

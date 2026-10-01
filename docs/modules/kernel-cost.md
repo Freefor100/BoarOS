@@ -115,7 +115,7 @@ C4按握手确认的N+4个blocked成员检查扫描max下限，遗漏扫描或�
 
 原版消费者定点归因可用 `--consumer-commands musl:0,musl:1,glibc:0,glibc:1`；部分集合的验收范围仅为该集合，不能替代完整八组。逐命令程序时间和排空时间分开保存；窗口关闭前包装器同步当前工作目录中的普通文件与目录。事务内存指标的 max 是按堆容量和 home buffer 保守计费的峰值，value 是每批峰值样本之和，不能当瞬时驻留量。
 
-设备请求保留观测标量的完成观察时刻，harvest 且已有等待者时记录同一请求从完成观察到 wake 返回、到原 submit 调用恢复的 ticks。`io_complete_to_ready` 是 wake 返回后的上界，`io_complete_to_resume` 包含 ready 等待与恢复后的少量记账；正常完成但设备返回错误的请求也可采样，错误另有计数，没有完成观察的 reset 路径不采样。它们不保存任务引用；关闭构建无这些字段。固定聚合预算现在为 64901 B，每任务仍为 64 B。
+设备请求保留观测标量的完成观察时刻，实际唤醒 owner 后记录同一请求从完成观察到 wake 返回、到原 submit 调用恢复的 ticks。`io_complete_to_ready` 是 wake 返回后的上界，`io_complete_to_resume` 包含 ready 等待与恢复后的少量记账；正常完成但设备返回错误的请求也可采样，错误另有计数，没有完成观察的 reset 路径不采样。batch 会合并唤醒，未实际 wake 的请求不在关联延迟子集中，不能与旧所有请求样本直接比较平均值。它们不保存任务引用；关闭构建无这些字段。S7 增加 checkpoint 耗时及三种等待原因后，固定聚合与声明预留为 65405 B，每任务仍为 64 B，均由快照输出和编译期断言核对。
 
 定点消费者启动可追加 `--consumer-sync`：同一启动中使用当前静态 musl 协调器执行四组固定 4KiB 热覆盖写，各 128 次，分别 O_SYNC/O_DSYNC/每次 fsync/每次 fdatasync，另核对读回内容。`--consumer-sync-only --linux --replicas 1` 只执行这些受控同步参考，不能称为原版 iozone 或完整消费者验收。原版八组 argv 不受该选项影响；同步窗口独立命名，计入本次新增窗口范围。
 
