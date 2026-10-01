@@ -17,6 +17,7 @@
 /* RV64 Linux UAPI values; see fixed references/linux/net/socket.c. */
 #define LINUX_AF_UNIX 1
 #define LINUX_AF_INET 2
+#define LINUX_AF_INET6 10
 #define LINUX_AF_MAX 46
 #define LINUX_SOCK_STREAM 1
 #define LINUX_SOCK_DGRAM 2
@@ -35,6 +36,15 @@ struct linux_sockaddr_in {
     uint32_t address;
     uint8_t zero[8];
 };
+
+struct linux_sockaddr_in6 {
+    uint16_t family;
+    uint16_t port;
+    uint32_t flowinfo;
+    uint8_t address[16];
+    uint32_t scope;
+};
+_Static_assert(sizeof(struct linux_sockaddr_in6) == 28U, "RV64 sockaddr_in6 size");
 
 struct linux_timeval {
     int64_t seconds;
@@ -80,44 +90,67 @@ static enum kernel_syscall_status release_socket(
 }
 
 static int copy_address_in(struct kernel_mm *mm, uint64_t user,
-                           uint64_t length, struct linux_sockaddr_in *address)
+                           uint64_t length, struct kernel_socket_address *address)
 {
+    uint16_t family;
     size_t copied = 0;
-    if (length < sizeof(*address)) return -KERNEL_EINVAL;
-    if (kernel_copy_from_user(mm, address, user, sizeof(*address), &copied) !=
-            KERNEL_UACCESS_STATUS_OK || copied != sizeof(*address))
-        return -KERNEL_EFAULT;
-    if (address->family != LINUX_AF_INET) return -KERNEL_EAFNOSUPPORT;
+    if (length < sizeof(family)) return -KERNEL_EINVAL;
+    if (kernel_copy_from_user(mm, &family, user, sizeof(family), &copied) !=
+            KERNEL_UACCESS_STATUS_OK || copied != sizeof(family)) return -KERNEL_EFAULT;
+    *address = (struct kernel_socket_address){.family = family};
+    if (family == LINUX_AF_INET) {
+        struct linux_sockaddr_in local;
+        if (length < sizeof(local)) return -KERNEL_EINVAL;
+        if (kernel_copy_from_user(mm, &local, user, sizeof(local), &copied) !=
+                KERNEL_UACCESS_STATUS_OK || copied != sizeof(local)) return -KERNEL_EFAULT;
+        __builtin_memcpy(address->bytes, &local.address, 4);
+        address->port = network_port(local.port);
+    } else if (family == LINUX_AF_INET6) {
+        struct linux_sockaddr_in6 local = {0};
+        if (length < 24U) return -KERNEL_EINVAL;
+        size_t size = length < sizeof(local) ? (size_t)length : sizeof(local);
+        if (kernel_copy_from_user(mm, &local, user, size, &copied) !=
+                KERNEL_UACCESS_STATUS_OK || copied != size) return -KERNEL_EFAULT;
+        __builtin_memcpy(address->bytes, local.address, 16);
+        address->scope = local.scope;
+        address->port = network_port(local.port);
+    } else return -KERNEL_EAFNOSUPPORT;
     return 0;
 }
 
 static int copy_address_out(struct kernel_mm *mm, uint64_t user_address,
-                            uint64_t user_length, uint32_t address,
-                            uint16_t port)
+                            uint64_t user_length,
+                            const struct kernel_socket_address *address)
 {
-    struct linux_sockaddr_in local = {
-        .family = LINUX_AF_INET,
-        .port = network_port(port),
-        .address = address,
-    };
+    union {
+        struct linux_sockaddr_in v4;
+        struct linux_sockaddr_in6 v6;
+    } local = {0};
+    size_t size;
+    if (address->family == LINUX_AF_INET6) {
+        local.v6.family = LINUX_AF_INET6;
+        local.v6.port = network_port(address->port);
+        local.v6.scope = address->scope;
+        __builtin_memcpy(local.v6.address, address->bytes, 16);
+        size = sizeof(local.v6);
+    } else {
+        local.v4.family = LINUX_AF_INET;
+        local.v4.port = network_port(address->port);
+        __builtin_memcpy(&local.v4.address, address->bytes, 4);
+        size = sizeof(local.v4);
+    }
     int32_t length;
     size_t copied = 0;
-    if (kernel_copy_from_user(mm, &length, user_length, sizeof(length),
-                              &copied) != KERNEL_UACCESS_STATUS_OK ||
-        copied != sizeof(length)) return -KERNEL_EFAULT;
+    if (kernel_copy_from_user(mm, &length, user_length, sizeof(length), &copied) !=
+            KERNEL_UACCESS_STATUS_OK || copied != sizeof(length)) return -KERNEL_EFAULT;
     if (length < 0) return -KERNEL_EINVAL;
-    copied = 0;
-    size_t written = (size_t)length < sizeof(local)
-                         ? (size_t)length : sizeof(local);
+    size_t written = (size_t)length < size ? (size_t)length : size;
     if (written != 0 &&
         (kernel_copy_to_user(mm, user_address, &local, written, &copied) !=
-             KERNEL_UACCESS_STATUS_OK || copied != written))
-        return -KERNEL_EFAULT;
-    length = sizeof(local);
-    copied = 0;
-    if (kernel_copy_to_user(mm, user_length, &length, sizeof(length),
-                            &copied) != KERNEL_UACCESS_STATUS_OK ||
-        copied != sizeof(length)) return -KERNEL_EFAULT;
+             KERNEL_UACCESS_STATUS_OK || copied != written)) return -KERNEL_EFAULT;
+    length = (int32_t)size;
+    if (kernel_copy_to_user(mm, user_length, &length, sizeof(length), &copied) !=
+            KERNEL_UACCESS_STATUS_OK || copied != sizeof(length)) return -KERNEL_EFAULT;
     return 0;
 }
 
@@ -205,7 +238,7 @@ enum kernel_syscall_status syscall_handle_socket(
         decoded->value = -KERNEL_EINVAL;
         return KERNEL_SYSCALL_STATUS_OK;
     }
-    if (family != LINUX_AF_INET) {
+    if (family != LINUX_AF_INET && family != LINUX_AF_INET6) {
         decoded->value = -KERNEL_EAFNOSUPPORT;
         return KERNEL_SYSCALL_STATUS_OK;
     }
@@ -228,7 +261,7 @@ enum kernel_syscall_status syscall_handle_socket(
         return KERNEL_SYSCALL_STATUS_OK;
     }
     if (task_status != KERNEL_TASK_STATUS_OK ||
-        kernel_files_socket_create(files, base_type,
+        kernel_files_socket_create(files, family, base_type,
                                    (uint32_t)type, &decoded->value) !=
             KERNEL_FILES_STATUS_OK)
         return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
@@ -305,7 +338,7 @@ enum kernel_syscall_status syscall_handle_bind(
     struct kernel_files *files;
     struct kernel_open_file_description *file = 0;
     struct kernel_mm *mm;
-    struct linux_sockaddr_in address;
+    struct kernel_socket_address address;
     int64_t linux_result = 0;
     decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
     if (borrow_socket(caller, (int32_t)request->arguments[0],
@@ -322,8 +355,7 @@ enum kernel_syscall_status syscall_handle_bind(
                                    request->arguments[2], &address);
     if (linux_result == 0)
         linux_result = kernel_socket_bind(kernel_open_file_socket(file),
-                                          address.address,
-                                          network_port(address.port));
+                                          &address);
     if (release_socket(&file) != KERNEL_SYSCALL_STATUS_OK)
         return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     decoded->value = linux_result;
@@ -339,9 +371,8 @@ enum kernel_syscall_status syscall_handle_socket_operation(
     struct kernel_open_file_description *file = 0;
     struct kernel_socket *socket;
     struct kernel_mm *mm;
-    struct linux_sockaddr_in address;
-    uint32_t peer_address = 0;
-    uint16_t peer_port = 0;
+    struct kernel_socket_address address;
+    struct kernel_socket_address peer_address = {0};
     int64_t result = 0;
     int op = (int)request->number;
 
@@ -369,18 +400,16 @@ enum kernel_syscall_status syscall_handle_socket_operation(
         result = kernel_socket_listen(socket, (int32_t)request->arguments[1]);
         break;
     case 204: /* getsockname */
-        result = kernel_socket_getname(socket, &peer_address, &peer_port);
+        result = kernel_socket_getname(socket, &peer_address);
         if (result == 0)
             result = copy_address_out(mm, request->arguments[1],
-                                      request->arguments[2], peer_address,
-                                      peer_port);
+                                      request->arguments[2], &peer_address);
         break;
     case 203: /* connect */
         result = copy_address_in(mm, request->arguments[1],
                                  request->arguments[2], &address);
         if (result == 0)
-            result = kernel_socket_connect(socket, address.address,
-                     network_port(address.port),
+            result = kernel_socket_connect(socket, &address,
                      (kernel_open_file_flags(file) & LINUX_SOCK_NONBLOCK) != 0U);
         if (result == -KERNEL_EINPROGRESS &&
             (kernel_open_file_flags(file) & LINUX_SOCK_NONBLOCK) == 0U) {
@@ -399,7 +428,7 @@ enum kernel_syscall_status syscall_handle_socket_operation(
         if (result == 0)
             result = kernel_socket_sendto(socket, mm,
                      request->arguments[1], request->arguments[2],
-                     address.address, network_port(address.port));
+                     &address);
         break;
     case 207: /* recvfrom */
         if (request->arguments[3] != 0U) {
@@ -410,10 +439,10 @@ enum kernel_syscall_status syscall_handle_socket_operation(
                             kernel_socket_receive_timeout(socket));
         if (result == 0)
             result = kernel_socket_recvfrom(socket, mm, request->arguments[1],
-                     request->arguments[2], &peer_address, &peer_port);
+                     request->arguments[2], &peer_address);
         if (result >= 0 && request->arguments[4] != 0U) {
             int address_result = copy_address_out(mm, request->arguments[4],
-                request->arguments[5], peer_address, peer_port);
+                request->arguments[5], &peer_address);
             if (address_result != 0) result = address_result;
         }
         break;
@@ -454,13 +483,12 @@ enum kernel_syscall_status syscall_handle_socket_operation(
         result = wait_ready(caller, file, KERNEL_POLLIN,
                             kernel_socket_receive_timeout(socket));
         if (result != 0) break;
-        if (kernel_files_socket_accept(files, file, 0U, &peer_address,
-                                       &peer_port, &result) !=
+        if (kernel_files_socket_accept(files, file, 0U, &peer_address, &result) !=
             KERNEL_FILES_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
         if (result >= 0 && request->arguments[1] != 0U) {
             int address_result = copy_address_out(mm, request->arguments[1],
-                request->arguments[2], peer_address, peer_port);
+                request->arguments[2], &peer_address);
             if (address_result != 0) {
                 int64_t close_result;
                 if (kernel_files_close(files, result, &close_result) !=

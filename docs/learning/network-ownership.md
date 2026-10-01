@@ -13,3 +13,17 @@
 另一个边界是 lwIP `tcp_write` 在 `sndbuf>0` 时仍可能因 `snd_queuelen` 或全局 `MEMP_TCP_SEG`/pbuf 用尽而返回 `ERR_MEM`。只用 `sndbuf` 宣告 `POLLOUT` 会让阻塞 write 在同一 hart 上反复得到 `EAGAIN` 并立即再醒。固定 lwIP `third_party/lwip/src/core/tcp_out.c` 的检查和 host 池耗尽测试证明了触发条件；BoarOS 在真实失败时撤下可写事件，将 bounded retry 纳入 poll/epoll 与 socket 等待期限，ACK 和池释放均可促成后续写入。真实 pthread U-mode 用 UDP 接收队列占满静态 lwIP 内存，验证非阻塞 TCP write 得到 `EAGAIN` 后 `poll(POLLOUT,0)` 不虚报，释放队列后 2 秒内可写并完成写入。这个测试在旧只看 `sndbuf` 的实现上会于立即 POLLOUT 检查失败。
 
 零长度 UDP datagram 揭示另一种 owner 漏洞：`read_buffer` 已登记 reservation 并移走 OFD pin，却返回 0；调用方原来只在正字节数时 finish，导致返回后 socket 指向失效的栈请求。固定 Linux 的普通 read/readv 对空 datagram 都返回 0 且消费它；同 ELF 红测在 BoarOS 第一笔空包之后 fatal，修复后继续读取下一包并检查用户态关机 `heap-live=0`。由 `request.socket` 是否登记而非返回字节数决定是否 finish；TCP EOF 没有登记。强制退出 owner 也需按真实控制流判定：`kernel/sched/process.c::request_thread_termination` 只置位并唤醒，保存的 syscall 栈继续返回，`kernel/sched/signal.c::kernel_signal_select` 在 user-return 才终止；`kernel_socket_sendto/recvfrom` 的栈局部 pbuf/packet 在这条路径仍可清理。若以后引入绕过 syscall unwind 的非局部退出，需重审它们。
+
+2026-10-01 开始原版网络应用阶段。iperf 3.13 的 `netannounce` 在没有显式
+地址族和监听地址时主动选择 IPv6；`IPV6_V6ONLY=0` 用于接受 IPv4 客户端。
+只补 IPv4 会停在服务端 socket 创建，不能完成原脚本。以前无服务器的客户端
+试跑不能作为已建立连接 reset 的证据。调用依据为本地
+`references/oscomp-testsuits` 的 `iperf/src/net.c`（固定 pre-2025 输入）和
+`references/linux/net/ipv6/`；精确版本在既有来源清单。
+
+地址阶段沿官方 lwIP 2.2.1 loopif 启用 IPv6，把地址转换限制在 syscall 边界。
+`tests/workloads/network/contract.c` 同 ELF 验证 ::1 的 UDP、TCP 和 IPv4 到
+IPv6 通配监听的映射 accept。旧实现先在 IPv6 socket 创建以 EAFNOSUPPORT
+失败，修复后双方完成内容交换；协议静态池由 host 回归核对，socket 堆由
+真实关机零占用核对。重建：`make test-lwip-host test-network-riscv`。
+选项、端口冲突、半关闭和原版应用完整流程尚待后续阶段，不能据此宣称完成。

@@ -46,32 +46,41 @@ void kernel_socket_get_statistics(struct kernel_socket_statistics *statistics);
 #define KERNEL_SOCKET_DOMAIN_INET 0U
 #define KERNEL_SOCKET_DOMAIN_UNIX 1U
 
-/* IPv4 addresses use the Linux sockaddr_in/network-byte-order representation. */
-int kernel_socket_create(struct kernel_heap *heap, int type,
+#define KERNEL_SOCKET_AF_INET 2U
+#define KERNEL_SOCKET_AF_INET6 10U
+
+/* 地址字节为网络序，端口为宿主序；Linux 布局只在 syscall 边界出现。 */
+struct kernel_socket_address {
+    uint8_t bytes[16];
+    uint32_t scope;
+    uint16_t family;
+    uint16_t port;
+};
+int kernel_socket_create(struct kernel_heap *heap, int family, int type,
                          struct kernel_socket **owner);
 int kernel_socket_pair(struct kernel_heap *heap, int type,
                        struct kernel_socket **owner_a,
                        struct kernel_socket **owner_b);
 void kernel_socket_destroy(struct kernel_socket *socket);
-int kernel_socket_bind(struct kernel_socket *socket, uint32_t address,
-                       uint16_t port);
-int kernel_socket_getname(struct kernel_socket *socket, uint32_t *address,
-                          uint16_t *port);
-int kernel_socket_getpeer(struct kernel_socket *socket, uint32_t *address,
-                          uint16_t *port);
+int kernel_socket_bind(struct kernel_socket *socket,
+                       const struct kernel_socket_address *address);
+int kernel_socket_getname(struct kernel_socket *socket,
+                          struct kernel_socket_address *address);
+int kernel_socket_getpeer(struct kernel_socket *socket,
+                          struct kernel_socket_address *address);
 int kernel_socket_listen(struct kernel_socket *socket, int backlog);
-int kernel_socket_connect(struct kernel_socket *socket, uint32_t address,
-                          uint16_t port, int nonblocking);
+int kernel_socket_connect(struct kernel_socket *socket,
+                          const struct kernel_socket_address *address, int nonblocking);
 int kernel_socket_connection_result(struct kernel_socket *socket);
 int kernel_socket_accept(struct kernel_socket *socket,
                          struct kernel_socket **owner);
 int kernel_socket_accept_check(const struct kernel_socket *socket);
 int kernel_socket_sendto(struct kernel_socket *socket, struct kernel_mm *mm,
-                         uint64_t user_data, uint64_t size, uint32_t address,
-                         uint16_t port);
+                         uint64_t user_data, uint64_t size,
+                         const struct kernel_socket_address *address);
 int kernel_socket_recvfrom(struct kernel_socket *socket, struct kernel_mm *mm,
                            uint64_t user_data, uint64_t size,
-                           uint32_t *address, uint16_t *port);
+                           struct kernel_socket_address *address);
 int kernel_socket_reserve_read(struct kernel_socket *socket,
                               struct kernel_task *task,
                               struct kernel_socket_read_request *request,

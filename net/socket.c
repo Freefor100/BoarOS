@@ -35,8 +35,7 @@ struct socket_packet {
     struct pbuf *payload;
     void *data;
     uint32_t length;
-    uint32_t address;
-    uint16_t port;
+    struct kernel_socket_address address;
     uint16_t consumed;
 };
 
@@ -63,6 +62,8 @@ struct kernel_socket {
     int error;
     uint8_t type;
     uint8_t domain;
+    uint8_t family;
+    uint8_t v6only;
     uint8_t listening;
     uint8_t connecting;
     uint8_t connected;
@@ -70,6 +71,49 @@ struct kernel_socket {
     uint8_t write_blocked;
     uint32_t write_retry_ms;
 };
+
+static void address_export(const struct kernel_socket *socket,
+                           const ip_addr_t *ip, uint16_t port,
+                           struct kernel_socket_address *address)
+{
+    *address = (struct kernel_socket_address){.family = socket->family, .port = port};
+    if (IP_IS_V6(ip)) {
+        __builtin_memcpy(address->bytes, ip_2_ip6(ip)->addr, 16);
+        address->scope = ip6_addr_zone(ip_2_ip6(ip));
+    } else if (socket->family == KERNEL_SOCKET_AF_INET6 && !ip_addr_isany(ip)) {
+        address->bytes[10] = address->bytes[11] = 0xff;
+        __builtin_memcpy(address->bytes + 12, &ip_2_ip4(ip)->addr, 4);
+    } else {
+        __builtin_memcpy(address->bytes, &ip_2_ip4(ip)->addr, 4);
+    }
+}
+
+static int address_import(const struct kernel_socket *socket,
+                          const struct kernel_socket_address *address,
+                          ip_addr_t *ip, int binding)
+{
+    if (address->family != socket->family) return -KERNEL_EAFNOSUPPORT;
+    ip_addr_set_zero(ip);
+    if (address->family == KERNEL_SOCKET_AF_INET) {
+        IP_SET_TYPE(ip, IPADDR_TYPE_V4);
+        __builtin_memcpy(&ip_2_ip4(ip)->addr, address->bytes, 4);
+    } else {
+        static const uint8_t mapped[12] = {0,0,0,0,0,0,0,0,0,0,0xff,0xff};
+        if (__builtin_memcmp(address->bytes, mapped, 12) == 0) {
+            if (socket->v6only) return -KERNEL_ENETUNREACH;
+            IP_SET_TYPE(ip, IPADDR_TYPE_V4);
+            __builtin_memcpy(&ip_2_ip4(ip)->addr, address->bytes + 12, 4);
+        } else {
+            IP_SET_TYPE(ip, IPADDR_TYPE_V6);
+            __builtin_memcpy(ip_2_ip6(ip)->addr, address->bytes, 16);
+            if (address->scope > 255U) return -KERNEL_ENODEV;
+            ip6_addr_set_zone(ip_2_ip6(ip), (u8_t)address->scope);
+            if (binding && !socket->v6only && ip_addr_isany(ip))
+                IP_SET_TYPE(ip, IPADDR_TYPE_ANY);
+        }
+    }
+    return 0;
+}
 
 static uint8_t socket_initialized;
 static struct kernel_socket *write_retry_head;
@@ -203,8 +247,7 @@ static void udp_received(void *context, struct udp_pcb *pcb,
     }
     if (status != KERNEL_HEAP_STATUS_OK) __builtin_trap();
     packet->payload = payload;
-    packet->address = ip4_addr_get_u32(ip_2_ip4(peer));
-    packet->port = port;
+    address_export(socket, peer, port, &packet->address);
     if (socket->packets_tail != 0) {
         socket->packets_tail->next = packet;
     } else {
@@ -300,6 +343,9 @@ static err_t socket_tcp_accepted(void *context, struct tcp_pcb *pcb,
     }
     if (status != KERNEL_HEAP_STATUS_OK) __builtin_trap();
     child->heap = listener->heap;
+    child->family = listener->family;
+    child->v6only = listener->v6only;
+    child->rx_limit = listener->rx_limit;
     child->type = SOCKET_STREAM;
     child->tcp = pcb;
     child->connected = 1U;
@@ -319,14 +365,15 @@ static err_t socket_tcp_accepted(void *context, struct tcp_pcb *pcb,
     return ERR_OK;
 }
 
-int kernel_socket_create(struct kernel_heap *heap, int type,
+int kernel_socket_create(struct kernel_heap *heap, int family, int type,
                          struct kernel_socket **owner)
 {
     struct kernel_socket *socket = 0;
     uintptr_t old_status;
 
     if (heap == 0 || owner == 0 || *owner != 0 ||
-        (type != SOCKET_DGRAM && type != SOCKET_STREAM)) {
+        (type != SOCKET_DGRAM && type != SOCKET_STREAM) ||
+        (family != KERNEL_SOCKET_AF_INET && family != KERNEL_SOCKET_AF_INET6)) {
         return -KERNEL_EINVAL;
     }
     enum kernel_heap_status status =
@@ -343,14 +390,17 @@ int kernel_socket_create(struct kernel_heap *heap, int type,
     }
     socket->heap = heap;
     socket->type = (uint8_t)type;
+    socket->family = (uint8_t)family;
     socket->domain = KERNEL_SOCKET_DOMAIN_INET;
     socket->rx_limit = 65536U;
     kernel_wait_queue_init(&socket->wait);
     if (type == SOCKET_DGRAM) {
-        socket->udp = udp_new();
+        socket->udp = udp_new_ip_type(family == KERNEL_SOCKET_AF_INET ?
+                                      IPADDR_TYPE_V4 : IPADDR_TYPE_ANY);
         if (socket->udp != 0) udp_recv(socket->udp, udp_received, socket);
     } else {
-        socket->tcp = tcp_new();
+        socket->tcp = tcp_new_ip_type(family == KERNEL_SOCKET_AF_INET ?
+                                      IPADDR_TYPE_V4 : IPADDR_TYPE_ANY);
         if (socket->tcp != 0) {
             tcp_arg(socket->tcp, socket);
             tcp_err(socket->tcp, tcp_failed);
@@ -471,52 +521,45 @@ void kernel_socket_destroy(struct kernel_socket *socket)
         __builtin_trap();
 }
 
-int kernel_socket_bind(struct kernel_socket *socket, uint32_t address,
-                       uint16_t port)
+int kernel_socket_bind(struct kernel_socket *socket,
+                       const struct kernel_socket_address *address)
 {
     ip_addr_t local;
-    err_t error;
+    int result = address_import(socket, address, &local, 1);
+    if (result != 0) return result;
     uintptr_t old_status = riscv_interrupt_save();
-    ip4_addr_set_u32(ip_2_ip4(&local), address);
-    if (socket->type == SOCKET_DGRAM) {
-        error = udp_bind(socket->udp, &local, port);
-    } else {
-        error = tcp_bind(socket->tcp, &local, port);
-    }
+    err_t error = socket->type == SOCKET_DGRAM
+        ? udp_bind(socket->udp, &local, address->port)
+        : tcp_bind(socket->tcp, &local, address->port);
     riscv_interrupt_restore(old_status);
     return lwip_error(error);
 }
 
-int kernel_socket_getname(struct kernel_socket *socket, uint32_t *address,
-                          uint16_t *port)
+int kernel_socket_getname(struct kernel_socket *socket,
+                          struct kernel_socket_address *address)
 {
-    if (socket == 0 || address == 0 || port == 0) return -KERNEL_EINVAL;
+    if (socket == 0 || address == 0) return -KERNEL_EINVAL;
     if (socket->type == SOCKET_DGRAM) {
-        *address = ip4_addr_get_u32(ip_2_ip4(&socket->udp->local_ip));
-        *port = socket->udp->local_port;
+        address_export(socket, &socket->udp->local_ip, socket->udp->local_port, address);
     } else {
-        if (socket->tcp == 0) return socket->error != 0 ? socket->error
-                                                         : -KERNEL_ENOTCONN;
+        if (socket->tcp == 0) return socket->error != 0 ? socket->error : -KERNEL_ENOTCONN;
         if (socket->listening) {
             struct tcp_pcb_listen *pcb = (struct tcp_pcb_listen *)socket->tcp;
-            *address = ip4_addr_get_u32(ip_2_ip4(&pcb->local_ip));
-            *port = pcb->local_port;
+            address_export(socket, &pcb->local_ip, pcb->local_port, address);
         } else {
-            *address = ip4_addr_get_u32(ip_2_ip4(&socket->tcp->local_ip));
-            *port = socket->tcp->local_port;
+            address_export(socket, &socket->tcp->local_ip, socket->tcp->local_port, address);
         }
     }
     return 0;
 }
 
-int kernel_socket_getpeer(struct kernel_socket *socket, uint32_t *address,
-                          uint16_t *port)
+int kernel_socket_getpeer(struct kernel_socket *socket,
+                          struct kernel_socket_address *address)
 {
-    if (socket == 0 || address == 0 || port == 0) return -KERNEL_EINVAL;
+    if (socket == 0 || address == 0) return -KERNEL_EINVAL;
     if (socket->type != SOCKET_STREAM || !socket->connected ||
         socket->tcp == 0) return -KERNEL_ENOTCONN;
-    *address = ip4_addr_get_u32(ip_2_ip4(&socket->tcp->remote_ip));
-    *port = socket->tcp->remote_port;
+    address_export(socket, &socket->tcp->remote_ip, socket->tcp->remote_port, address);
     return 0;
 }
 
@@ -541,8 +584,8 @@ int kernel_socket_listen(struct kernel_socket *socket, int backlog)
     return replacement != 0 ? 0 : lwip_error(error);
 }
 
-int kernel_socket_connect(struct kernel_socket *socket, uint32_t address,
-                          uint16_t port, int nonblocking)
+int kernel_socket_connect(struct kernel_socket *socket,
+                          const struct kernel_socket_address *address, int nonblocking)
 {
     ip_addr_t remote;
     err_t error;
@@ -553,9 +596,10 @@ int kernel_socket_connect(struct kernel_socket *socket, uint32_t address,
     if (socket->listening) return -KERNEL_EINVAL;
     if (socket->connected) return -KERNEL_EISCONN;
     if (socket->connecting) return -KERNEL_EALREADY;
-    ip4_addr_set_u32(ip_2_ip4(&remote), address);
+    int result = address_import(socket, address, &remote, 0);
+    if (result != 0) return result;
     old_status = riscv_interrupt_save();
-    error = tcp_connect(socket->tcp, &remote, port, tcp_connected);
+    error = tcp_connect(socket->tcp, &remote, address->port, tcp_connected);
     if (error == ERR_OK) socket->connecting = 1U;
     riscv_interrupt_restore(old_status);
     if (error != ERR_OK) return lwip_error(error);
@@ -604,8 +648,8 @@ int kernel_socket_accept_check(const struct kernel_socket *socket)
 }
 
 int kernel_socket_sendto(struct kernel_socket *socket, struct kernel_mm *mm,
-                         uint64_t user_data, uint64_t size, uint32_t address,
-                         uint16_t port)
+                         uint64_t user_data, uint64_t size,
+                         const struct kernel_socket_address *address)
 {
     struct pbuf *payload;
     ip_addr_t remote;
@@ -614,6 +658,8 @@ int kernel_socket_sendto(struct kernel_socket *socket, struct kernel_mm *mm,
     uintptr_t old_status;
     if (socket->type != SOCKET_DGRAM) return -KERNEL_EOPNOTSUPP;
     if (size > UDP_MAX_PAYLOAD) return -KERNEL_EMSGSIZE;
+    int result = address_import(socket, address, &remote, 0);
+    if (result != 0) return result;
     old_status = riscv_interrupt_save();
     payload = pbuf_alloc(PBUF_TRANSPORT, (u16_t)size, PBUF_RAM);
     riscv_interrupt_restore(old_status);
@@ -625,9 +671,8 @@ int kernel_socket_sendto(struct kernel_socket *socket, struct kernel_mm *mm,
         pbuf_free(payload);
         return -KERNEL_EFAULT;
     }
-    ip4_addr_set_u32(ip_2_ip4(&remote), address);
     old_status = riscv_interrupt_save();
-    error = udp_sendto(socket->udp, payload, &remote, port);
+    error = udp_sendto(socket->udp, payload, &remote, address->port);
     pbuf_free(payload);
     if (error == ERR_OK) netif_poll_all();
     riscv_interrupt_restore(old_status);
@@ -636,7 +681,7 @@ int kernel_socket_sendto(struct kernel_socket *socket, struct kernel_mm *mm,
 
 int kernel_socket_recvfrom(struct kernel_socket *socket, struct kernel_mm *mm,
                            uint64_t user_data, uint64_t size,
-                           uint32_t *address, uint16_t *port)
+                           struct kernel_socket_address *address)
 {
     struct socket_packet *packet;
     uint8_t chunk[256];
@@ -678,7 +723,6 @@ int kernel_socket_recvfrom(struct kernel_socket *socket, struct kernel_mm *mm,
         done += length;
     }
     *address = packet->address;
-    *port = packet->port;
     old_status = riscv_interrupt_save();
     pbuf_free(packet->payload);
     riscv_interrupt_restore(old_status);

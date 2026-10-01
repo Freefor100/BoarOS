@@ -5,7 +5,11 @@
 #define SYS_LIGHTWEIGHT_PROT 0
 #define LWIP_TIMERS 1
 #define LWIP_IPV4 1
-#define LWIP_IPV6 0
+#define LWIP_IPV6 1
+#define LWIP_IPV6_MLD 0
+#define LWIP_IPV6_AUTOCONFIG 0
+#define LWIP_IPV6_REASS 0
+#define LWIP_IPV6_FRAG 0
 #define LWIP_TCP 1
 #define LWIP_UDP 1
 #define LWIP_RAW 0

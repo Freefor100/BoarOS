@@ -93,17 +93,18 @@ static void tcp_cost(struct kernel_files *files, struct kernel_mm *mm)
     int64_t listener_fd, client_fd, result;
     struct kernel_open_file_description *listener = 0, *client = 0;
     struct kernel_socket *accepted = 0;
-    uint32_t address; uint16_t port;
-    check(kernel_files_socket_create(files, 1, 0, &listener_fd) == KERNEL_FILES_STATUS_OK && listener_fd >= 0 &&
-          kernel_files_socket_create(files, 1, 00004000, &client_fd) == KERNEL_FILES_STATUS_OK && client_fd >= 0 &&
+    struct kernel_socket_address address = {.family = KERNEL_SOCKET_AF_INET};
+    check(kernel_files_socket_create(files, 2, 1, 0, &listener_fd) == KERNEL_FILES_STATUS_OK && listener_fd >= 0 &&
+          kernel_files_socket_create(files, 2, 1, 00004000, &client_fd) == KERNEL_FILES_STATUS_OK && client_fd >= 0 &&
           kernel_files_pin(files, listener_fd, &listener, &result) == KERNEL_FILES_STATUS_OK && result == 0 &&
           kernel_files_pin(files, client_fd, &client, &result) == KERNEL_FILES_STATUS_OK && result == 0, 30);
     struct kernel_socket *server_socket = kernel_open_file_socket(listener);
     struct kernel_socket *client_socket = kernel_open_file_socket(client);
-    check(kernel_socket_bind(server_socket, 0, 0) == 0 &&
-          kernel_socket_getname(server_socket, &address, &port) == 0 &&
+    struct kernel_socket_address remote = {.family = KERNEL_SOCKET_AF_INET, .bytes = {127,0,0,1}};
+    check(kernel_socket_bind(server_socket, &address) == 0 &&
+          kernel_socket_getname(server_socket, &address) == 0 &&
           kernel_socket_listen(server_socket, 1) == 0 &&
-          kernel_socket_connect(client_socket, 0x0100007fU, port, 0) == 0 &&
+          (remote.port = address.port, kernel_socket_connect(client_socket, &remote, 0)) == 0 &&
           kernel_socket_accept(server_socket, &accepted) == 0, 31);
     struct kernel_socket_statistics before, after;
     kernel_socket_get_statistics(&before);
@@ -127,17 +128,17 @@ static void udp_buffer_oom(struct kernel_files *files, struct kernel_mm *mm)
 {
     int64_t fd, result;
     struct kernel_open_file_description *pin = 0;
-    check(kernel_files_socket_create(files, 2, 00004000, &fd) == KERNEL_FILES_STATUS_OK && fd >= 0 &&
+    check(kernel_files_socket_create(files, 2, 2, 00004000, &fd) == KERNEL_FILES_STATUS_OK && fd >= 0 &&
           kernel_files_pin(files, fd, &pin, &result) == KERNEL_FILES_STATUS_OK && result == 0, 36);
     struct kernel_socket *socket = kernel_open_file_socket(pin);
-    uint32_t address; uint16_t port;
-    check(kernel_socket_bind(socket, 0, 0) == 0 && kernel_socket_getname(socket, &address, &port) == 0 &&
-          kernel_socket_sendto(socket, mm, BUFFER, 8192, 0x0100007fU, port) == 8192, 37);
+    struct kernel_socket_address address = {.family = KERNEL_SOCKET_AF_INET};
+    check(kernel_socket_bind(socket, &address) == 0 && kernel_socket_getname(socket, &address) == 0 &&
+          (address.bytes[0] = 127, address.bytes[3] = 1, kernel_socket_sendto(socket, mm, BUFFER, 8192, &address)) == 8192, 37);
     fail_page = 1;
     check(kernel_files_read(files, mm, fd, BUFFER, 8192, &result) == KERNEL_FILES_STATUS_OK &&
           result == -KERNEL_ENOMEM && fail_page == 0, 38);
     /* Failure must leave the complete datagram owned by the socket queue. */
-    check(kernel_socket_recvfrom(socket, mm, BUFFER, 8192, &address, &port) == 8192, 39);
+    check(kernel_socket_recvfrom(socket, mm, BUFFER, 8192, &address) == 8192, 39);
     for (unsigned page = 0; page < 2; page++) {
         size_t copied;
         check(kernel_copy_from_user(mm, payload, BUFFER + page * 4096, sizeof(payload), &copied) ==
