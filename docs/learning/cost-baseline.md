@@ -759,3 +759,11 @@ resident/deadline索引、安全分段、usercopy/分配、缓存政策、网络
 `fs/inode.c`、`fs/jbd2/{transaction,commit,checkpoint}.c`、`mm/mprotect.c`，
 `references/qemu@84f07211cc5b4fc6a371559bf8a5de4fb068e648`（v11.1.0），以及
 `references/riscv` 特权规范20260120。实际运行QEMU版本/哈希另记，不混作源码版本。
+
+S6 操作准备（2026-10-01）：块载荷和 owner 分开；同运行组已有块不再重复准备 after、
+checkpoint 和日志载荷，只保留私有 undo。控制记录及镜像进入有界池，池和首个版本
+pin 的 home buffer 均纳入预算。`make test-lwext4-group-host` 在 1KiB/4KiB 块中
+先用旧实现证伪热修改无新载荷分配，再验证新实现、嵌套 abort、冻结时同块新修改、
+近满盘及 WRITE/FLUSH 错误恢复；`make test-lwext4-metadata-host` 保留 legacy OOM
+和格式几何覆盖。ASan/UBSan 的 4KiB 组测试通过。该阶段没有改变提交和同步边界，
+封口等待及 durable/checkpoint 分离仍待 S7；尚无生产吞吐改善声明。

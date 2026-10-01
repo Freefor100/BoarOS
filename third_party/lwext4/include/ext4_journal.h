@@ -54,12 +54,20 @@ struct jbd_fs {
 	bool dirty;
 };
 
+/* 块载荷独立分配，控制记录不会把一个整块申请推到下一阶。 */
+struct jbd_image {
+	void *data;
+	struct jbd_journal *journal;
+	struct jbd_image *next;
+	bool active;
+};
+
 struct jbd_buf {
 	bool escaped;
 	bool modified;
 	bool was_dirty;
-	void *before;
-	void *after;
+	struct jbd_image *before;
+	struct jbd_image *after;
 	uint32_t jbd_lba;
 	struct ext4_block block;
 	struct jbd_trans *trans;
@@ -71,8 +79,8 @@ struct jbd_buf {
 /* File payload belongs to the transaction but is never a log record. */
 struct jbd_data {
 	struct ext4_block block;
-	void *before;
-	void *after;
+	struct jbd_image *before;
+	struct jbd_image *after;
 	bool modified, was_dirty;
 	TAILQ_ENTRY(jbd_data) node;
 };
@@ -110,7 +118,7 @@ struct jbd_trans {
 	uint64_t first_dirty_ns;
 	unsigned operations, reserved_logs;
 	bool frozen;
-	void *checkpoint_image;
+	struct jbd_image *checkpoint_image;
 	ext4_fsblk_t checkpoint_lba;
 
 	struct jbd_journal *journal;
@@ -133,6 +141,10 @@ struct jbd_journal {
 	struct jbd_trans *running, *committing;
 	bool grouped;
 	size_t memory_used, memory_peak, memory_limit;
+	size_t memory_cached;
+	struct jbd_image *image_cache;
+	void *allocation_cache[6];
+	bool cache_disabled;
 	uint64_t accepted_sequence, durable_sequence, checkpoint_sequence;
 	ext4_fsblk_t *log_map;
 

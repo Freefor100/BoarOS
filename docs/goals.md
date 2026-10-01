@@ -16,7 +16,7 @@ Linux 为 `references/linux` 的 `f4cdf7ca9a1fdcca413157df19753f388a5a224e`。
 
 | 阶段 | 交付与状态 |
 |---|---|
-| S6 操作准备与封口 | [ ] 独立 undo、组级增量 credit、块载荷与 owner 分离及有界空闲池；64 操作/256KiB/100ms 只触发封口，真实容量/日志/复用依赖才等待 |
+| S6 操作准备与封口 | [ ] 已验证独立 undo、同块组级增量 credit、块载荷与 owner 分离及有界空闲池；仍需落实阈值仅封口及实际容量等待 |
 | S7 提交与 checkpoint | [ ] 两组待提交 FIFO、一组提交中及待 checkpoint FIFO；commit 屏障后发布 durable，checkpoint 连续完成并持久更新起点后释放日志和 quarantine |
 | S8 批量 I/O 与热读 | [ ] 最多八 span 的可选块批量接口、VirtIO 发布/收割与逻辑调用 owner；relatime 无更新共享查询，更新时独占重查 |
 | S9 消费者与收口 | [ ] 一次最终恢复/扩大回归；三次关闭观测原消费者、一次定点观测及一次 1GiB 原专项；main 单向合入 oscomp-rv-compat |

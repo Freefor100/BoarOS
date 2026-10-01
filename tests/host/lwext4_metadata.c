@@ -13,11 +13,13 @@
 
 static struct fault_block disk;
 static unsigned allocations, fail_allocation, reads, fail_read;
+static size_t payload_threshold;
+static unsigned payload_allocations;
 static uint64_t forbidden_lba = UINT64_MAX, forbidden_writes;
 static void (*write_interleave)(void);
 #define CHECK(x) do { if (!(x)) { fprintf(stderr,"%d: %s (alloc=%u fail=%u)\n",__LINE__,#x,allocations,fail_allocation); exit(1); } } while (0)
-void *ext4_user_malloc(size_t n) { return ++allocations == fail_allocation ? NULL : malloc(n); }
-void *ext4_user_calloc(size_t n,size_t s) { return ++allocations == fail_allocation ? NULL : calloc(n,s); }
+void *ext4_user_malloc(size_t n) { if(payload_threshold && n>=payload_threshold)payload_allocations++; return ++allocations == fail_allocation ? NULL : malloc(n); }
+void *ext4_user_calloc(size_t n,size_t s) { if(payload_threshold && n*s>=payload_threshold)payload_allocations++; return ++allocations == fail_allocation ? NULL : calloc(n,s); }
 void *ext4_user_realloc(void *p,size_t n) { return ++allocations == fail_allocation ? NULL : realloc(p,n); }
 void ext4_user_free(void *p) { free(p); }
 static int dev_open(struct ext4_blockdev *b) { (void)b; return EOK; }
@@ -53,7 +55,16 @@ static void group_test(struct ext4_fs *fs)
     uint64_t writes=disk.writes, flushes=disk.flushes;
     uint32_t tid=fs->jbd_journal->committed_id;
     struct ext4_timestamp times[3]={{1111,1},{2222,2},{3333,3}};
-    for(unsigned i=0;i<32;i++)CHECK(ext4_file_set_times(&f,7,times)==EOK);
+    payload_threshold=fs->bdev->lg_bsize;
+    for(unsigned i=0;i<4;i++)CHECK(ext4_file_set_times(&f,7,times)==EOK);
+    unsigned warmed_payloads=payload_allocations;
+    for(unsigned i=4;i<32;i++) {
+        times[0].nanoseconds=i;
+        CHECK(ext4_file_set_times(&f,7,times)==EOK);
+    }
+    /* Repeated edits of one running block must reuse reserved payloads.
+     * A fresh block/undo allocation per warm edit fails this cost contract. */
+    CHECK(payload_allocations==warmed_payloads);
     CHECK(disk.writes==writes && disk.flushes==flushes && fs->jbd_journal->committed_id==tid);
     struct ext4_inode committed, actual;
     CHECK(ext4_fraw_inode_fill(&f,&committed)==EOK);
