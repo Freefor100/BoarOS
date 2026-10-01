@@ -19,10 +19,11 @@ BoarOS 是从零搭建、面向 OS Comp 能力建设的 C / 少量汇编内核�
 | 调度 | OTHER tick 轮转、FIFO/RR 1–99 优先级、CPU0 affinity、RESET_ON_FORK、可配置全局实时预算及 proc 查询 | 默认 1 秒 / 950 毫秒；无 nice 权重、PI、SMP 或硬实时保证 |
 | 随机数 | ChaCha20 fast-key-erasure、BLAKE2s 混种、legacy/modern VirtIO RNG、`getrandom` 与 random/urandom 字符节点 | QEMU 宿主是信任边界；DTB/用户写入不计可信熵，缺设备时保持未就绪 |
 | futex / 信号 | WAIT/WAKE/REQUEUE、超时/重启、跨 MM 共享匿名 futex、同 MM 非 PI robust-list 退出清理、标准信号、用户 handler、同步 SEGV/BUS/ILL/TRAP 故障信息与恢复、`rt_sigtimedwait` | 无共享文件 futex、PI futex、实时信号队列和 `sigaltstack`；单 hart 验证范围 |
-| 文件与事件 | fd/OFD 分离、dup/CLOEXEC、共享 offset、阻塞 pin、部分/向量/定位 I/O、pipe、poll/select/epoll；传统与 OFD 记录锁；socket OFD 与读写/就绪；mknodat 字符节点按设备号接入 null、zero、console | 无 devfs、完整 TTY；设备 mmap 未支持 |
+| 文件与事件 | fd/OFD 分离、dup/CLOEXEC、共享 offset、阻塞 pin、部分/向量/定位 I/O、pipe、poll/select/epoll；传统与 OFD 记录锁；socket OFD 与读写/就绪；mknodat 字符节点按设备号接入 null、zero、console、RTC | 无 devfs、完整 TTY；设备 mmap 未支持 |
 | 路径与 ext4 | 共享活目录项、cwd/dirfd、普通/NOREPLACE rename、可写/只读根盘、符号链接、目录枚举、稀疏文件、显式纳秒时间、真实文件系统统计、打开后删除、私有映射截断；共享挂载树可用户态挂载/卸载 proc、tmpfs 和第二 ext4 盘，通用 linkat 硬链接，含 meminfo、uptime、self、exe/cwd/root/fd、挂载信息与首批进程 stat/status 字段 | 无 EXCHANGE/WHITEOUT 或完整权限；缺少 /dev/console 节点时的初始标准 fd 没有路径链接，meminfo 已提供真实缓存/共享/脏页/可用量，完整进程字段尚未完成 |
 | 内存文件 | 统一稀疏内存后备对象、tmpfs 页/inode 配额、硬链接、共享/私有映射，musl POSIX 共享内存、SysV 共享内存和 tmpfs 工作目录的离线 GCC | 无 swap、SysV 信号量/消息队列、共享文件 futex；tmpfs 不持久化 |
 | 缓存与存储 | read/write/private fault 共用文件页、inode 脏范围与定向写回、OFD 错误观察、`fsync/fdatasync/O_SYNC/O_DSYNC`；VirtIO legacy/modern 多设备独立 IRQ/队列、每实例页缓存/worker、八 span 批量发布与 flush 屏障 | ordered journal/replay、durable commit 与后续 checkpoint、持久 orphan；恢复承诺限于已验证块模型，已接入阈值驱动后台写回与 2%/4% 空闲水位回收，无周期清脏 |
+| 内核日志 | 从启动保存16KiB真实内核日志、完整klogctl 0–10、消费式阻塞读、清空及console级别控制 | 当前不可变root权限模型；用户console输出与日志分离，无/dev/kmsg接口 |
 | 身份与资源 | 单用户 root 的 UID/GID 查询；线程组共享并执行 NOFILE/STACK，fork 继承、exec 保留 | 无凭据变更/完整权限；fd 硬容量 1024、栈硬容量 8 MiB；其他有效 limit 返回 `ENOTSUP` |
 | 平台与网络 | RISC-V QEMU 真实根盘可配置 PID 1（默认 `/init`） 与 musl 用户态；单 hart IPv4 UDP/TCP loopback，固定 lwIP 2.2.1 raw API，AF_UNIX socketpair | 无命名 AF_UNIX 端点、真实网卡链路、LoongArch、实板或多核验证 |
 
@@ -36,7 +37,7 @@ BoarOS 是从零搭建、面向 OS Comp 能力建设的 C / 少量汇编内核�
 
 客体内固定 Alpine v3.22 RV64 GCC 14.2.0-r6 已在同一离线镜像上完成预处理、编译、汇编、静态链接和运行；固定 Linux 与 BoarOS 的五阶段状态、产物哈希和输出一致。同一编译流程也通过 tmpfs 工作目录；产物复制到根盘供比对，不代表 tmpfs 持久。范围是固定的小型 C 负载，其他项目和 Rust 尚未验收。
 
-固定 BusyBox/libc-test 最近一次全量清单为 228 项、227 项双侧通过，原 BusyBox 包装器内部 53/55 成功，dmesg 缺 klogctl、hwclock 缺 RTC 字符接口；身份、日期及逐项边界见[程序清单](docs/learning/user-program-inventory.md)。当前通用 ABI 差分 1091 条匹配，包含 SysV 附件片段/权限、AF_UNIX 整包及同步故障边界；成本门禁见[单核规模回归](docs/learning/single-hart-scale.md)，不以 QEMU 墙钟倍数宣称性能。
+固定BusyBox/libc-test最近完整清单仍为228项、227项双侧通过的历史结果；本轮聚焦原BusyBox包装器，55/55子项成功，dmesg/RTC及df根盘内容另做真实核对。当前ABI差分1118条匹配，包含新增日志/RTC边界；完整清单和本轮选择集合分别见[程序清单](docs/learning/user-program-inventory.md)。成本门禁见[单核规模回归](docs/learning/single-hart-scale.md)。
 
 ## 构建与验证
 
@@ -76,6 +77,8 @@ make test-offline-c-tmpfs-riscv # tmpfs 工作目录的同 ELF 离线 GCC
 make test-busybox-tmpfs-riscv # 固定 BusyBox 在 tmpfs 上执行文件操作
 make test-stack-usage
 make test-lwext4-host
+make test-environment-riscv      # 实际日志/RTC/OFD生命周期
+make test-lwext4-cache-host # 命中先于回收、引用与失败owner
 make test-lwext4-recovery-host # 日志与 orphan 的断电/故障矩阵
 make test-lwext4-rename-host   # 改名、硬链接与最后链接回收的故障矩阵
 make test-lwext4-metadata-host # 时间设置、空间计数与几何/失败验证
@@ -91,7 +94,7 @@ make test-references
 
 [开发路线](docs/goals.md)统一记录本轮任务、分支交接和后续依赖。通用兼容性在 `main`，比赛环境与运行入口在 `oscomp-rv-compat`；后者单向合入已验收主线。只跑 RV 的原 judge 评分不等于双架构比赛交付，也不能把逐组诊断分数拼成正式总分。
 
-已按统一 VFS 对象路线分阶段拆分 ext4 后端、实现挂载路径和首批真实 procfs。真实内存快照、RV64 sysinfo、后台写回及 proc fd 复用压力已接入；统一内存后备对象、tmpfs、硬链接和真实第二 ext4 磁盘已接入，验收见[多挂载证据](docs/learning/memory-backed-mounts.md)。独立 Review 的 R1–R8 已修复：覆盖 SysV owner/片段/权限、msync 来源 pin、AF_UNIX 整包、同步信号与 inode 整次写/截断互斥；完整 RV64、musl/glibc、差分及 WAL 恢复矩阵通过，见[路线与验收](docs/goals.md)。C0–C6 成本测量已收口：历史 60 次启动/339 窗口另补兼容分支与固定 Linux 的 9 次启动/48 窗口，原 musl/旧 glibc 各七组实际 I/O 完成，向量组因原 ELF 不支持在双侧排除。完整消费者的观测开销中位约 17%，大量提交/屏障与等待有证据，磁盘来源 unknown 仍保留，见[成本基线](docs/learning/cost-baseline.md)。评测分支已单向合入主线；原 judge 的 iozone 两侧得 21.4517/21.6688，RV 单侧总分 626，但总预算在 lmbench 耗尽、七组未到达，完整 Harness 缺 kernel-la；不等于全套评测通过。main 保留自身 uname，旧 glibc 结果属于评测兼容配置。异步日志与组提交、idle 安全 IRQ 返回和 FIFO 锁资格交接已验收，十格原版写吞吐均超过 10 倍门槛；日志/RTC、iperf/netperf 继续独立定位。SMP、LoongArch、实板和更大工具链按新基线另行排期。
+已按统一 VFS 对象路线分阶段拆分 ext4 后端、实现挂载路径和首批真实 procfs。真实内存快照、RV64 sysinfo、后台写回及 proc fd 复用压力已接入；统一内存后备对象、tmpfs、硬链接和真实第二 ext4 磁盘已接入，验收见[多挂载证据](docs/learning/memory-backed-mounts.md)。独立 Review 的 R1–R8 已修复：覆盖 SysV owner/片段/权限、msync 来源 pin、AF_UNIX 整包、同步信号与 inode 整次写/截断互斥；完整 RV64、musl/glibc、差分及 WAL 恢复矩阵通过，见[路线与验收](docs/goals.md)。C0–C6 成本测量已收口：历史 60 次启动/339 窗口另补兼容分支与固定 Linux 的 9 次启动/48 窗口，原 musl/旧 glibc 各七组实际 I/O 完成，向量组因原 ELF 不支持在双侧排除。完整消费者的观测开销中位约 17%，大量提交/屏障与等待有证据，磁盘来源 unknown 仍保留，见[成本基线](docs/learning/cost-baseline.md)。评测分支已单向合入主线；原 judge 的 iozone 两侧得 21.4517/21.6688，RV 单侧总分 626，但总预算在 lmbench 耗尽、七组未到达，完整 Harness 缺 kernel-la；不等于全套评测通过。main 保留自身 uname，旧 glibc 结果属于评测兼容配置。异步日志与组提交、idle 安全 IRQ 返回和 FIFO 锁资格交接已验收，该轮十格原版写吞吐实测改善25.29–54.00倍；日志/RTC已在本轮补齐，下一应用主线是iperf/netperf完整loopback流程。SMP、LoongArch、实板和更大工具链按新基线另行排期。
 
 本评测分支的固定预算 RV 原 judge 基线、22 组状态与输入身份见[RV 评测模块](docs/modules/oscomp-rv.md)；该结果仍只代表 RV 单侧。
 
@@ -101,4 +104,6 @@ make test-references
 
 异步日志与组提交已启用并验收：操作私有 undo、挂载点 running group、不可变提交版本与 joinable worker 保持 ordered/log/commit/checkpoint 屏障；完整 lwext4、SQLite DELETE/WAL 恢复和双盘隔离通过。关闭观测的原版 iozone 三次启动，musl/glibc 五项写入共十格中位吞吐提升 25.29–54.00 倍，自动模式降至 16.450/18.372 秒，均达到该轮目标。原 1GiB iozone 专项得 24.8500/25.1791；它不是完整 Harness。重读 Max 下降36%–38%，Parent 提高12%–13%，不能由最快子进程推导整体读退化。热写同步、前台版本准备及未分类读请求仍有成本，见[机制与性能验收](docs/learning/cost-baseline.md#异步日志与组提交验收2026-10-01)。
 
-S6–S8 存储流水线已落地：有界资源复用、封口与容量等待分离、durable commit 与 checkpoint 分离、八 span 批量 I/O 及热读共享 relatime 查询。最终恢复与系统回归通过，但 S9 收益目标未完成：匹配 S5 的十格 Parent 写吞吐为0.98–1.88倍，自动模式程序加同步收尾下降约22%–23%，未达到五倍/减半；固定4MiB热读回退低于2%，musl 四进程普通读 Parent 回退17.05%。原1GiB iozone 专项为25.0271/25.3164，不代表完整 Harness。分配调用下降约91%，提交仍510组，说明前台与小事务固定成本仍须处理；完整分析、未关闭项及后续方向见[本轮验收](docs/learning/cost-baseline.md#s9-存储流水线验收2026-10-01)与[路线](docs/goals.md)。
+S6–S8 存储流水线已落地：有界资源复用、封口与容量等待分离、durable commit 与 checkpoint 分离、八 span 批量 I/O 及热读共享 relatime 查询。最终恢复与系统回归通过，但 S9 收益目标未完成：匹配 S5 的十格 Parent 写吞吐为0.98–1.88倍，自动模式程序加同步收尾下降约22%–23%，未达到当时的性能预期；固定4MiB热读回退低于2%，musl 四进程普通读 Parent 回退17.05%。原1GiB iozone 专项为25.0271/25.3164，不代表完整 Harness。分配调用下降约91%，提交仍510组，说明前台与小事务固定成本仍须处理；完整分析、未关闭项及后续方向见[本轮验收](docs/learning/cost-baseline.md#s9-存储流水线验收2026-10-01)与[路线](docs/goals.md)。
+
+块缓存已修正先回收再查询的命中破坏：生产目标8块不变，八块热工作集宿主预热后800次访问的额外设备读从800降为0。匹配旧/新三个关闭观测启动，自动程序加durable中位改善7.76%/6.99%，四进程普通读Parent改善14.08%/1.20%；glibc四进程整条命令增加0.73%，如实保留。定点读请求下降约68%，日志组/屏障仍510/1547，热读固定工作量0设备请求但存在前台成本；原停止规则不能用来证明调度饥饿，完整分布、资源与观测扰动见[纠错分析](docs/learning/cost-baseline.md#缓存查询顺序纠错2026-10-01)。日志/RTC/根盘真实内容、BusyBox55/55与1118 ABI已验收；完整228项本轮未重跑。后续主线统一见[开发路线](docs/goals.md)，固定吞吐倍数不作为开发准入条件。

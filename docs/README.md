@@ -7,7 +7,7 @@
 | [设计原则](design.md) | 长期工程选择；协作/提交规则见 [AGENTS](../AGENTS.md)、[CONTRIBUTING](../CONTRIBUTING.md) |
 | [工具链](toolchain.md)、[固定资料](../references/README.md)、[第三方](third-party.md) | 环境、版本、来源和许可 |
 
-优先阅读：[当前局限与后续计划](goals.md#当前局限与证据边界)、
+优先阅读：[当前局限与后续计划](goals.md#当前应用阻塞与能力边界)、
 [最新清单口径](learning/user-program-inventory.md#当前基线与口径)、
 [存储成本与串行边界](modules/vfs-ext4.md#当前成本边界)。
 旧日期段落是当时的验证记录，当前能力以模块契约和最新基线为准。
@@ -19,7 +19,7 @@
 | 子系统 | 模块 |
 |---|---|
 | 启动 / 平台 | [启动](modules/riscv-boot.md)、[DTB](modules/dtb-memory.md)、[根启动](modules/riscv-root-boot.md) |
-| Trap / 执行 | [Trap](modules/riscv-trap.md)、[浮点](modules/riscv-fpu.md)、[syscall](modules/kernel-syscall.md) |
+| Trap / 执行 | [Trap](modules/riscv-trap.md)、[浮点](modules/riscv-fpu.md)、[syscall](modules/kernel-syscall.md)、[内核日志](modules/kernel-log.md) |
 | 内存 | [物理页](modules/physical-pages.md)、[堆](modules/kernel-heap.md)、[Sv39](modules/riscv-sv39.md)、[MM](modules/kernel-mm.md)、[VMA](modules/kernel-vma.md)、[uaccess](modules/kernel-uaccess.md) |
 | 用户映像 | [ELF](modules/user-elf.md)、[exec](modules/kernel-exec.md) |
 | 任务 / 时间 | [调度与生命周期](modules/kernel-scheduler.md)、[信号](modules/kernel-signal.md)、[时钟与睡眠](modules/kernel-time.md)、[硬件 timer](modules/riscv-timer.md)、[VirtIO RNG](modules/riscv-virtio-rng.md) |

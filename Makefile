@@ -160,6 +160,7 @@ C_SOURCES := \
 	fs/files/socket.c \
 	fs/fs_context.c \
 	fs/char_device.c \
+	fs/rtc_device.c \
 	fs/open_file.c \
 	fs/pipe.c \
 	fs/record_lock.c \
@@ -180,6 +181,7 @@ C_SOURCES := \
 	kernel/physical_page.c \
 	kernel/read_source.c \
 	kernel/random.c \
+	kernel/log.c \
 	kernel/blake2s.c \
 	kernel/sched/core.c \
 	kernel/sched/policy.c \
@@ -202,6 +204,7 @@ C_SOURCES := \
 	kernel/syscall/shm.c \
 	kernel/syscall/time.c \
 	kernel/syscall/random.c \
+	kernel/syscall/log.c \
 	kernel/syscall/sched.c \
 	arch/riscv/signal.c \
 	kernel/tick.c \
@@ -222,6 +225,11 @@ ASM_SOURCES := \
 	arch/riscv/context_switch.S \
 	arch/riscv/fpu.S \
 	arch/riscv/trap_entry.S
+ifeq ($(ROOT_DRAIN_FIXTURE),1)
+C_SOURCES += tests/riscv/root_drain_fixture.c
+LDFLAGS += -Wl,--wrap=kernel_vfs_unmount
+endif
+
 OBJECTS := \
 	$(patsubst %.c,$(BUILD_DIR)/%.o,$(C_SOURCES)) \
 	$(patsubst %.S,$(BUILD_DIR)/%.o,$(ASM_SOURCES))
@@ -253,6 +261,7 @@ TEST_RUNTIME_C_SOURCES := \
 	fs/files/socket.c \
 	fs/fs_context.c \
 	fs/char_device.c \
+	fs/rtc_device.c \
 	fs/lwext4_port.c \
 	fs/open_file.c \
 	fs/pipe.c \
@@ -271,6 +280,7 @@ TEST_RUNTIME_C_SOURCES := \
 	kernel/physical_page.c \
 	kernel/read_source.c \
 	kernel/random.c \
+	kernel/log.c \
 	kernel/blake2s.c \
 	kernel/sched/core.c \
 	kernel/sched/policy.c \
@@ -293,6 +303,7 @@ TEST_RUNTIME_C_SOURCES := \
 	kernel/syscall/shm.c \
 	kernel/syscall/time.c \
 	kernel/syscall/random.c \
+	kernel/syscall/log.c \
 	kernel/syscall/sched.c \
 	arch/riscv/signal.c \
 	kernel/tick.c \
@@ -601,6 +612,10 @@ test-lwext4-metadata-host:
 .PHONY: test-lwext4-cost-host
 test-lwext4-cost-host:
 	sh tests/lwext4-cost-host.sh
+
+.PHONY: test-lwext4-cache-host
+test-lwext4-cache-host:
+	sh tests/lwext4-cache-host.sh
 
 .PHONY: test-lwext4-group-host
 test-lwext4-group-host:
@@ -1589,3 +1604,19 @@ test-cost-host:
 test-cost-riscv: test-cost-host
 	$(MAKE) COST_DIAGNOSTICS=1 all
 	python3 -B tests/cost-riscv.py --kernel build/cost/kernel-rv --qemu $(QEMU_RISCV64) --case $(COST_CASE)
+
+.PHONY: test-log-host
+test-log-host:
+	@mkdir -p build/host
+	cc -D_GNU_SOURCE -std=c11 -Wall -Wextra -Werror -Itests/host/random -idirafter include tests/host/kernel_log.c kernel/log.c -o build/host/log-test
+	build/host/log-test
+
+.PHONY: test-environment-riscv
+test-environment-riscv: $(KERNEL_RV)
+	KERNEL_RV=$(KERNEL_RV) QEMU_RISCV64=$(QEMU_RISCV64) sh tests/environment-riscv.sh
+
+.PHONY: test-rtc-host
+test-rtc-host:
+	@mkdir -p build/host
+	cc -std=c11 -Wall -Wextra -Werror -Itests/host/random -idirafter include tests/host/rtc_device.c fs/rtc_device.c -o build/host/rtc-test
+	build/host/rtc-test

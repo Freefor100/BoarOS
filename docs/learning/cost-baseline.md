@@ -1125,3 +1125,149 @@ IRQ-off也会推迟完成观察。应分清CPU策略、锁资格交接与设备�
 `qemu-options.hx` writeback/flush说明及 `hw/block/virtio-blk.c`。
 当前BoarOS策略与安全边界见 `kernel/sched/{policy,runqueue,scheduling}.c`、
 `docs/modules/kernel-scheduler.md`，故障模型见 `tests/host/{nbd_fault,block_fault}.c`。
+
+## 缓存查询顺序纠错（2026-10-01）
+
+main@6dce5a1 的 `ext4_block_get_noread`先shake再allocator查命中；实际源码宿主回归
+在8热块预热后800次读取产生800次设备读。只把已有块取得放到shake前，生产目标8不变，
+新增读降到0。7热块/700次、8引用+1热块/100次、64目标+8引用+1热块/100次分别也为0。
+峰值驻留7/8/9/9，说明引用块使软目标可超限；容量扩大不是本次收益来源。
+内容、dirty EIO保留、journal_pending、loading引用交接、descriptor/payload OOM、
+加载失败重试、共享只读回收和睡眠后allocator重查均验收，最终分配归零。
+
+可重建：`make test-lwext4-cache-host test-lwext4-metadata-host test-lwext4-group-host test-lwext4-recovery-host`。
+宿主窄测试先在旧实现证伪再运行补丁；相关日志、ordered-data、orphan、truncate、
+lost/reordered-sector恢复通过。本结论是缓存局部因果，不由0次额外读推导iozone倍数；
+实际消费者与固定工作量的端到端结果如下；不设置固定收益倍数作为开发准入条件。
+
+### 匹配消费者、来源与剩余成本
+
+本次只运行原musl/glibc的自动模式和四进程(0,1)，原ELF、loader、argv未修改。
+modern/writeback、512MiB、单hart、10MHz timebase；实际QEMU11.1.1，SHA256
+`a1cfcceb6c688f9b0a290d512211ed08cf465b92b26a04cfb032280a53625718`。
+新的协调器及五个8MiB固定读文件改变了S9的前置状态和命令序列，因此补匹配旧版
+`oscomp-rv-compat@56b96bd68e3dd079813170866956feb237740515`，没有直接套用S9全序列数字。
+新内核从`main@dd84294`源码归档、仅应用兼容分支既有uname 4.15.0差异构建，main身份不变。
+两个版本复用同一协调ELF
+`62b8e123f3345b032d79e0c639bb78a2d18488337f3befff51a25f3bda42e7c6`；实际哈希以JSON为准。
+
+| 原命令 | 旧程序中位/秒 | 新程序中位/秒 | 旧/新durable收尾中位/ms | 旧/新程序+durable中位/秒 |
+|---|---:|---:|---:|---:|
+| musl自动 | 12.566647 | 11.591761 | 22.336 / 21.139 | 12.589848 / 11.612493 |
+| glibc自动 | 14.449294 | 13.437821 | 21.048 / 20.208 | 14.469866 / 13.458073 |
+| musl四进程(0,1) | 17.580117 | 17.313809 | 20.881 / 20.572 | 17.601739 / 17.334462 |
+| glibc四进程(0,1) | 17.806252 | 17.938502 | 23.354 / 19.877 | 17.827957 / 17.958379 |
+
+每版本三个串行独立启动，12/12命令均有完成标志和wait status 0。自动模式程序+durable
+改善7.76%/6.99%；四进程整条命令musl改善1.52%、glibc增加0.73%，不能隐藏这项未改善。
+四个命令之后，fixture内部根卸载的剩余checkpoint及清理中位为旧39.815ms、新44.257ms；
+全部副本为旧[41.565,39.815,39.742]、新[45.761,40.443,44.257]ms。
+这个区间完成最终根盘卸载，不是整个程序生命周期内checkpoint总耗时，worker停止发生在它之前。
+不得把每条命令约20ms的fsync收尾说成完整checkpoint排空，也不能用这个卸载差值证明某一后台阶段回退。
+
+| 四进程条目，Parent中位kB/s | musl旧→新 | glibc旧→新 |
+|---|---:|---:|
+| initial writers | 1227.30→1368.73（+11.52%） | 1084.01→1247.38（+15.07%） |
+| rewriters | 1791.87→1844.92（+2.96%） | 1744.64→1865.64（+6.94%） |
+| readers | 31825.30→36306.37（+14.08%） | 42890.98→43404.22（+1.20%） |
+| re-readers | 57099.65→57796.05（+1.22%） | 56979.20→58018.45（+1.82%） |
+
+Max、Children、Min、Avg、最少传输量、三副本分布和原输出全部保留在既有
+`cost-consumer-followup.json.performance_correction`，不能用Max替代Parent。
+本轮不重跑八组评分或C0–C6；历史Linux/S9比较保留当时输入边界，
+没有把这组缩减序列写成新的完整Linux性能差距或比赛分数。
+
+匹配旧、新各一个ON启动，均运行相同四命令及其后的固定读负载，用于归因而非重复分布。
+新聚合存储65483B、每任务64B，最长指标名29字符，32字节存储编译断言成立；旧表182项、新表195项
+分别保存完整注册表和snapshot seal，历史记录没有补造新指标。
+
+| 自动窗口 | 全部请求旧→新 | 读请求旧→新 | 新file/metadata/prepare/unknown读请求 | 组/FLUSH/checkpoint批次，旧=新 |
+|---|---:|---:|---:|---:|
+| musl | 26616→14701 | 17399→5484（-68.48%） | 109 / 159 / 4097 / 1119 | 510 / 1547 / 222 |
+| glibc | 26572→14751 | 17389→5568（-67.98%） | 178 / 166 / 4097 / 1127 | 510 / 1547 / 222 |
+
+新musl读取22,462,464字节，其中prepare 16,781,312、unknown 4,583,424字节；
+glibc读取22,806,528字节，其中prepare相同、unknown 4,616,192字节。分类在实际VirtIO发布处计数，
+scope由`ext4_fread_body`、已知inode/extent查询、journal块取得及部分块修改恢复嵌套来源。
+prepare说明事务/journal或读改写准备路径，不能单凭这个标签判定都是可删除的读取；unknown继续保留。
+原自动负载的读请求明显减少，而组数、日志屏障、checkpoint批次完全不变，解释了端到端收益
+远小于读请求下降：修复消除缓存浪费，未消除持久化阶段和前台固定工作。
+新musl窗口约14.119秒，foreground运行5.584秒、background运行0.667秒、idle-context7.742秒；
+这些是观测开启后的运行记账，不能当关闭观测时的精确占比，也不能把多任务blocked/ready或嵌套锁时间直接相加。
+rank40重阻塞在所有八个新窗口仍为0；本轮没有再改FIFO交接、调度或持久化机制。
+
+QEMU实际读LBA包装器另核对整个启动：读请求53952→27830，重复相同范围42286→16164，
+不同范围均11666。范围覆盖初始化和snapshot阶段，不能冒充某个窗口重复率；各范围及trace SHA在归档中。
+宿主验证持引用、驻留和8/64容量；没有为了统计引用数在内核热路径增加全缓存扫描。
+新ON原命令程序+durable相对新OFF中位扰动为musl自动21.58%、glibc自动14.49%、
+musl四进程9.16%、glibc四进程7.41%（以归档数值重算）；观察时间只用于因果解释，不作吞吐成绩。
+
+### 固定工作量解释进展，保留停止规则边界
+
+`tests/workloads/cost/readers.c`四任务先打开独立OFD并握手，统一放行；每个读8MiB、每次1KiB，
+全部完成才结束。16个逐任务结果均为8,388,608字节、校验754,974,720、wait status 0；同inode和
+不同inode，冷/热四个窗口分开，数值不持task/inode/OFD引用。
+
+| 固定工作量，OFF单启动诊断 | 旧秒 | 新秒 |
+|---|---:|---:|
+| 同inode冷读 | 0.881577 | 0.940423 |
+| 同inode预热 | 0.401022 | 0.398099 |
+| 不同inode冷读 | 1.197780 | 1.217403 |
+| 不同inode预热 | 0.408731 | 0.427537 |
+
+这是相同reader ELF的窄诊断，只有各一次启动，不能把约6.7%的同inode冷读差值或其他小幅变化
+当成三副本性能结论。新OFF同inode冷读开始延迟0.66–2.57ms、任务执行区间0.914–0.928秒；
+热读开始延迟最大约28ms，四任务均完成。ON热读两个窗口均0设备请求、0 miss、65536 hit；
+32768次1KiB读依然查询/复制，foreground运行约1.19/1.15秒，累计ready约3.56/3.51秒，
+后者跨任务重叠。最大ready约30.2ms与OTHER的10ms轮转量级一致，不是永久饥饿证据。
+热读rank40 blocks/reblocks为0；冷读blocks分别27/51，reblocks仍0。等待指标仍包含无争用取得的固定成本。
+新ON热读总时间约1.22/1.19秒，约为新OFF的3.07/2.79倍，明确展示本负载的观测扰动；
+不能用它替代关闭观测速度。同inode冷读有2048个文件块读、不同inode有8192个，loading等待各3次，
+与共享一次加载和独立四份数据工作量吻合；相关加载/回收和受控设备/锁/取消行为由本轮io-sleep回归保护。
+
+固定原源码：`references/oscomp-testsuits`的
+`8b58dd16d26d30f7c74d48d5832d870d3051b703:iozone/iozone.c`，Version 3.506；
+`thread_read_test`约15957行检查共享stop_flag，约16153行在第一个任务完成后（未指定-x）设置它。
+原参数没有-x。因此一个读者完成会停止其余读者，原musl三副本的最少读传输量在旧、新均为5KiB。
+Parent除以父进程耗时，Children累加子吞吐，Max只取最快任务；它们测量的并非四任务各自完成相同数据。
+这证明5KiB本身不等于调度饥饿，且固定工作量中慢任务有实际进展。历史S9 Parent回退17.05%继续保留；
+停止规则、启动顺序和后台竞争共同影响原分布，尚未证明该历史差值唯一由哪个因素造成，不能改写成已消失。
+本轮没有新证据支持更换调度策略；该有限诊断收口后，由下一条真实应用选择性能机制。
+
+### 用户环境与交付范围
+
+完整klogctl0–10、实际16KiB日志、消费/清空/阻塞/fault和控制台过滤，以及Goldfish只读RTC
+与OFD独占、实际根盘来源已交付。原BusyBox包装器55/55、wait0；另一个内容用例验证dmesg
+-r/-c/-n、hwclock实际时间、df根盘与同客体statfs的容量/使用/类型。不把日志、时间、PID或
+不同磁盘用量的原始字节差异当作语义失败：原输出不改，包装器按全部逐项命令和退出契约判定，
+其余默认字节比较不变。完整228项程序清单本轮未重跑，未借分类忽略未实现功能或提高通过率。
+环境证据在同一个JSON的environment_completion；新增27条环境ABI使总数1091→1118，
+固定Linux同一ELF全部匹配。两侧真实内容、wait status、原始ABI和输入身份保留。
+
+最终相关lwext4元数据/组提交/恢复、完整RV64、真实musl/glibc、四组合io-sleep、SQLite DELETE/WAL
+正常与重启恢复通过；没有改事务、写回或队列顺序，所以不再次扩大到已验收的大型故障矩阵。
+栈检查1738函数、最大静态帧2368B，真实U-mode退出栈/heap检查通过。它们保护能力和所有权，
+性能结论依靠上面的匹配工作量、成本与完整完成时间。
+测量共10个启动：旧/新OFF各3、旧/新定点ON各1、旧/新固定读OFF各1；解析器修正只重解析
+已有成功日志，没有为修正UART前缀、卸载记录或历史JSON指标表示重跑消费者。
+
+重建主要入口：
+
+```sh
+make test-lwext4-cache-host test-lwext4-metadata-host test-lwext4-group-host test-lwext4-recovery-host
+make test-log-host test-rtc-host test-environment-riscv
+make test-riscv test-userland-riscv test-glibc-riscv test-stack-usage
+make test-io-sleep-riscv test-sqlite-rollback-riscv test-sqlite-recovery-riscv test-sqlite-wal-riscv test-sqlite-wal-recovery-riscv
+make test-diff-abi-riscv
+# 兼容分支；OFF/ON独立构建目录，普通构建不含fixture
+make COST_DIAGNOSTICS=0 ROOT_DRAIN_FIXTURE=1 BUILD_DIR=build/cost/correction-compat-off/riscv KERNEL_RV=build/cost/correction-compat-off/kernel-rv all
+python3 -B tests/cost-riscv.py --case consumer --consumer-commands musl:0,musl:1,glibc:0,glibc:1 --replicas 3 --off --consumer-timeout-ms 900000 --kernel build/cost/correction-compat-off/kernel-rv --root-drain-fixture
+make COST_DIAGNOSTICS=1 ROOT_DRAIN_FIXTURE=1 BUILD_DIR=build/cost/correction-compat-on/riscv KERNEL_RV=build/cost/correction-compat-on/kernel-rv all
+python3 -B tests/cost-riscv.py --case consumer --consumer-commands musl:0,musl:1,glibc:0,glibc:1 --consumer-readers --replicas 1 --consumer-timeout-ms 900000 --kernel build/cost/correction-compat-on/kernel-rv --root-drain-fixture --trace-read-lbas
+```
+
+精确复建还须按归档的coordinator ELF/原ELF/firmware/fixture/kernel配置和身份核对；
+使用`--coordinator-elf`冻结协调器、`--kernel-identity`核对外部旧版/兼容预览构建。
+窗口snapshot可按每记录metric_schema补零解压后交给cost_report.parse检查seal、epoch、完整和溢出。
+完整Harness仍缺kernel-la。当前路线已收敛到下一项loopback iperf/netperf流程；
+事务准备、checkpoint、usercopy或索引仅在应用证据触发时选择，不新增固定吞吐门槛或平行计划。

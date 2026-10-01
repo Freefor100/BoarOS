@@ -128,3 +128,31 @@ C4按握手确认的N+4个blocked成员检查扫描max下限，遗漏扫描或�
 v1 `values` 与 SHA256，仍可直接送入 `cost_report.parse` 核对 epoch、完成状态、单位和溢出；
 历史根记录及 seal 保持原样，`iozone-closure.py --verify` 继续只核对历史九启动。
 各次身份、原输出、比较值和开销限制见[验收分析](../learning/cost-baseline.md#异步日志与组提交验收2026-10-01)。
+
+缓存纠错观测另计块缓存hit/miss/eviction/load_wait；hit表示取得已有缓冲引用，
+不保证内容已经有效，因此loading命中仍可等待。设备READ在实际发布处只按可证明的
+file_read/metadata_read/prepare_read归因，不能证明的仍为unknown。来源scope嵌套恢复，
+不改变既有OUT的data/journal/checkpoint/super分类。名称容量32字节，逐项编译断言；
+新增13个无直方图聚合后存储65483字节，任务仍64字节；历史182项schema继续可读。
+`--case readers`是统一起跑、每任务8MiB/1KiB的同/不同inode冷/热读诊断，
+全部工作者完成且内容/状态核对后结束，记录标量时间和字节，不保留对象引用。
+
+`--consumer-readers`在所选原消费者之后追加四个固定工作量窗口。同一协调ELF可用
+`--coordinator-elf`复用；consumer/readers镜像均预置五个8MiB文件，改变了原S9前置状态，
+因此只与相同前置文件、命令集合和协调ELF的旧版对照比较。独立readers记录逐任务
+统一放行、实际开始/完成时间、字节、校验值及成功退出；原程序停止规则另由固定源码解释。
+
+`ROOT_DRAIN_FIXTURE=1`仅用于独立构建目录，通过链接wrap测量内核卸载调用，默认构建
+无此钩子。boot先卸载子挂载、最后根挂载；保留全部成功记录，最后一项报告根盘剩余
+checkpoint与卸载清理时间。它不是全程checkpoint总耗时，也不包括调用前已停止worker的
+时间，不增加用户syscall。`--kernel-identity`核对外部构建二进制与源码身份；
+`--trace-read-lbas`保存QEMU实际读范围，范围是整个启动（含初始化/格式化读取），不能
+冒充窗口内重复读。`--resume-from`仅重解析身份匹配的完整旧日志，继续未执行副本，
+保留原输入seal；不会重新执行已完成程序来修正解析问题。
+
+本轮匹配旧/新各3个OFF、各1个定点ON及各1个固定读OFF共10启动，16快照存于既有
+`cost-consumer-followup.json.performance_correction`。每记录metric_schema及seal明确区分
+旧182/新195项；新schema热路径观测会明显扰动固定热读，成绩采用OFF。旧版外部构建的
+JSON指标表先规范化为受支持注册表，再做完整字段/epoch/溢出验证；不接受任意删项。
+程序、应用durable收尾、剩余内部卸载各自报告；有限收益和未唯一归因的历史分布保留，
+不把这10启动扩写为原八组全套或完整成本矩阵。

@@ -11,7 +11,10 @@ enum { cost_histograms = 0
 #include <kernel/cost.def>
 };
 #undef X
-static const char names[][40] = {
+#define X(id, name, unit, hist) _Static_assert(sizeof(#name) <= 32, "cost metric name budget");
+#include <kernel/cost.def>
+#undef X
+static const char names[][32] = {
 #define X(id, name, unit, hist) #name,
 #include <kernel/cost.def>
 #undef X
@@ -150,7 +153,7 @@ void kernel_cost_add_io(unsigned offset, uint64_t value)
 struct kernel_cost_io_scope kernel_cost_phase_enter(unsigned phase)
 {
     struct kernel_cost_io_scope scope = {kernel_cost_current(), 0};
-    if (phase > 4) __builtin_trap();
+    if (phase > 7) __builtin_trap();
     if (scope.actor) { scope.previous = scope.actor->operation; scope.actor->operation = (scope.actor->operation & 15) | (phase << 4); }
     return scope;
 }

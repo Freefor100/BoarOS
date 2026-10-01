@@ -11,6 +11,7 @@
 /* BoarOS modification, 2026-08-27: use metadata checksum seeds. */
 
 #include <ext4_config.h>
+#include <kernel/cost.h>
 #include <ext4_types.h>
 #include <ext4_misc.h>
 #include <ext4_errno.h>
@@ -786,6 +787,7 @@ static int read_extent_tree_block(struct ext4_inode_ref *inode_ref,
 				  struct ext4_block *bh,
 				  uint32_t flags __unused)
 {
+	COST_PHASE_SCOPE(read_source, 6);
 	int err;
 
 	err = ext4_trans_block_get(inode_ref->fs->bdev, bh, pblk);

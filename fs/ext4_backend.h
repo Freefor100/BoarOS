@@ -20,6 +20,7 @@ struct lwext4_mount_adapter {
     uint8_t journal_started, journal_requested, journal_force, journal_stopping;
     char device_name[24];
     char mount_point[28];
+    char root_source[48];
     struct lwext4_mount_adapter *next_adapter;
     struct ext4_blockdev_iface interface;
     struct ext4_blockdev device;

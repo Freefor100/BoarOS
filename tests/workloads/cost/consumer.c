@@ -7,6 +7,8 @@
 #include <sys/wait.h>
 #include <sys/utsname.h>
 #include <dirent.h>
+#define COST_READERS_EMBED 1
+#include "readers.c"
 static unsigned command_selection=65535;
 static unsigned long long nanoseconds(void)
 { struct timespec t; CHECK(clock_gettime(CLOCK_MONOTONIC,&t)==0);return (unsigned long long)t.tv_sec*1000000000ULL+t.tv_nsec; }
@@ -97,5 +99,6 @@ int main(void)
     for(unsigned libc=0;libc<2;libc++)for(unsigned group=0;group<8;group++)
         if(command_selection&(1U<<(libc*8+group)))command(libc,group);
     if(probe)sync_probes();
+    if(access("/cost-consumer-readers",F_OK)==0)cost_readers();
     puts("COST PASS consumer");fflush(NULL);if(access("/cost-linux",F_OK)==0)reboot(RB_POWER_OFF);return 0;
 }

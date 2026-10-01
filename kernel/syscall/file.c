@@ -764,8 +764,8 @@ enum kernel_syscall_status syscall_handle_ioctl(
     }
     if (task_status != KERNEL_TASK_STATUS_OK)
         return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
-    if (request->arguments[1] == UINT64_C(0x8913) ||
-        request->arguments[1] == UINT64_C(0x8914)) {
+    if ((uint32_t)request->arguments[1] == UINT64_C(0x8913) ||
+        (uint32_t)request->arguments[1] == UINT64_C(0x8914)) {
         struct {
             char name[16];
             uint16_t flags;
@@ -786,7 +786,7 @@ enum kernel_syscall_status syscall_handle_ioctl(
                  KERNEL_UACCESS_STATUS_OK || copied != sizeof(interface)))
             linux_result = -KERNEL_EFAULT;
         if (linux_result == 0) {
-            if (request->arguments[1] == UINT64_C(0x8913)) {
+            if ((uint32_t)request->arguments[1] == UINT64_C(0x8913)) {
                 linux_result = kernel_socket_loopback_flags(interface.name,
                                                               &interface.flags);
                 if (linux_result == 0) {
@@ -811,7 +811,7 @@ enum kernel_syscall_status syscall_handle_ioctl(
     }
     if (kernel_task_mm_borrow_mutable(caller, &mm) != KERNEL_TASK_STATUS_OK ||
         kernel_files_ioctl(files, mm, (int64_t)request->arguments[0],
-                           request->arguments[1], request->arguments[2],
+                           (uint32_t)request->arguments[1], request->arguments[2],
                            &linux_result) != KERNEL_FILES_STATUS_OK)
         return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     decoded->action = KERNEL_SYSCALL_ACTION_RETURN;

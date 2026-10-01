@@ -39,6 +39,7 @@ enum kernel_open_file_kind {
     KERNEL_OPEN_FILE_KIND_GENERATED,
     KERNEL_OPEN_FILE_KIND_RANDOM,
     KERNEL_OPEN_FILE_KIND_URANDOM,
+    KERNEL_OPEN_FILE_KIND_RTC,
 };
 
 /* VFS errors are returned through linux_result when status is OK. */

@@ -37,7 +37,10 @@ def run_logged(command, logfile, timeout=None):
 
 
 def normalize(text, expected):
-    lines = [line for line in text.replace('\r\n', '\n').splitlines() if line.startswith('ABI ')]
+    # Idle IRQs may insert complete user records after a partial boot banner.
+    # Keep the entire reserved ABI suffix; payload/identity/order stay strict.
+    lines = [line[line.index('ABI '):]
+             for line in text.replace('\r\n', '\n').splitlines() if 'ABI ' in line]
     if not lines or lines[0] != 'ABI BEGIN 1' or lines[-1] != f'ABI END {len(expected)}':
         raise ValueError('missing, malformed, or incomplete ABI stream')
     records = []
@@ -157,7 +160,8 @@ def fixture(directory, program):
     commands.write_text('cd /dev\n'
                         'mknod console c 5 1\nset_inode_field console mode 020600\n'
                         'mknod null c 1 3\nset_inode_field null mode 020666\n'
-                        'mknod zero c 1 5\nset_inode_field zero mode 020666\n')
+                        'mknod zero c 1 5\nset_inode_field zero mode 020666\n'
+                        'mknod rtc0 c 10 135\nset_inode_field rtc0 mode 020600\n')
     run_logged(['debugfs', '-w', '-f', str(commands), str(disk)], directory / 'debugfs.log')
     return disk
 

@@ -43,6 +43,7 @@
 #include <ext4_blockdev.h>
 #include <ext4_fs.h>
 #include <ext4_journal.h>
+#include <kernel/cost.h>
 
 #include <string.h>
 #include <stdlib.h>
@@ -217,6 +218,7 @@ int ext4_block_cache_shake(struct ext4_blockdev *bdev)
 
 		}
 
+		COST_ADD(BLOCK_CACHE_EVICTIONS, 1);
 		ext4_bcache_drop_buf(bdev->bc, buf);
 	}
 	bdev->bc->dont_shake = false;
@@ -239,11 +241,18 @@ int ext4_block_get_noread(struct ext4_blockdev *bdev, struct ext4_block *b,
 
 	b->lb_id = lba;
 
-	/*If cache is full we have to (flush and) drop it anyway :(*/
+	/* 命中先取得引用：无需新分配的访问不能因回收而淘汰自身。 */
+	if (ext4_bcache_find_get(bdev->bc, b, lba)) {
+		COST_ADD(BLOCK_CACHE_HITS, 1);
+		return EOK;
+	}
+	COST_ADD(BLOCK_CACHE_MISSES, 1);
+
 	r = ext4_block_cache_shake(bdev);
 	if (r != EOK)
 		return r;
 
+	/* 回收可能等待I/O；allocator重查期间被其他任务加载的同一块。 */
 	r = ext4_bcache_alloc(bdev->bc, b, &is_new);
 	if (r != EOK)
 		return r;
@@ -266,6 +275,7 @@ int ext4_block_get(struct ext4_blockdev *bdev, struct ext4_block *b,
 			ext4_bcache_free(bdev->bc, b);
 			return EBUSY;
 		}
+		COST_ADD(BLOCK_CACHE_LOAD_WAITS, 1);
 		bdev->bdif->wait_read(b->buf);
 	}
 	if (b->buf->load_error) {

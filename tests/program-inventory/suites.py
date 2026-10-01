@@ -51,8 +51,10 @@ def parse_observation(raw, case_id):
     result = {'complete': False, 'stdout_hex': '', 'stderr_hex': '',
               'wait_status': None, 'exit_code': None, 'signal': None,
               'exec_errno': None, 'setup_errno': None, 'timed_out': False, 'environment': {}, 'errors': []}
-    lines = [line for line in raw.replace('\r\n', '\n').splitlines()
-             if line == 'SUITE' or line.startswith('SUITE ')]
+    # The first user record may follow an interrupted UART boot banner.
+    lines = [line[line.index('SUITE '):] if 'SUITE ' in line else line
+             for line in raw.replace('\r\n', '\n').splitlines()
+             if line == 'SUITE' or 'SUITE ' in line]
     if not lines or lines[0] != f'SUITE BEGIN 1 {case_id}':
         result['errors'].append('missing or malformed begin record')
     if not lines or lines[-1] != f'SUITE END {case_id}':
@@ -113,18 +115,26 @@ def observation_status(observed, expected_exit=0):
     return 'pass'
 
 
-def compare_observations(reference, observed, expected_exit=0):
+def compare_observations(reference, observed, expected_exit=0, comparison="bytes"):
+    if comparison not in {"bytes", "contract"}:
+        raise ValueError("unknown output comparison")
+    equal = all(reference[key] == observed[key] for key in ("stdout_hex", "stderr_hex"))
     linux_status = observation_status(reference, expected_exit)
     boaros_status = observation_status(observed, expected_exit)
     if linux_status != 'pass':
         status = 'reference-not-pass'
     elif boaros_status != 'pass':
         status = boaros_status
-    elif any(reference[key] != observed[key] for key in ('stdout_hex', 'stderr_hex', 'wait_status')):
+    elif comparison == 'contract' and (not reference.get('contract') or not observed.get('contract') or
+            reference['contract']['records'] != observed['contract']['records'] or
+            reference['wait_status'] != observed['wait_status']):
+        status = 'output-mismatch'
+    elif comparison == 'bytes' and (not equal or reference['wait_status'] != observed['wait_status']):
         status = 'output-mismatch'
     else:
         status = 'pass'
-    return {'status': status, 'linux_status': linux_status, 'boaros_status': boaros_status}
+    return {'status': status, 'linux_status': linux_status, 'boaros_status': boaros_status,
+            'comparison': comparison, 'raw_output_equal': equal}
 
 
 def case_configuration(case, manifest, default_timeout=10):
@@ -187,7 +197,7 @@ def build_fixture(manifest, destination, driver):
     if tree.exists():
         tree.rename(destination / ('fixture-tree.incomplete-' + str(time.time_ns())))
     tree.mkdir()
-    directories = ['/tmp', '/proc', '/sys', '/dev', '/dev/shm', '/dev/mqueue', '/lib', '/bin', '/usr/bin']
+    directories = ['/tmp', '/proc', '/sys', '/dev', '/dev/shm', '/dev/mqueue', '/dev/misc', '/dev/block', '/lib', '/bin', '/usr/bin']
     directories += manifest.get('directories', [])
     for entry in directories:
         entry = {'path': entry} if isinstance(entry, str) else entry
@@ -241,10 +251,12 @@ def build_fixture(manifest, destination, driver):
         raise RuntimeError('mkfs failed; see ' + str(destination / 'mkfs.log'))
     commands = destination / 'devices.debugfs'
     devices = [('console', 5, 1), ('tty', 5, 0), ('null', 1, 3), ('zero', 1, 5),
-               ('random', 1, 8), ('urandom', 1, 9)]
+               ('random', 1, 8), ('urandom', 1, 9), ('rtc0', 10, 135),
+               ('rtc', 10, 135), ('misc/rtc', 10, 135)]
     commands.write_text('cd /dev\n' + ''.join(
-        f'mknod {name} c {major} {minor}\nset_inode_field {name} mode 020666\n'
-        for name, major, minor in devices) + ''.join(f'stat {name}\n' for name, _, _ in devices))
+        f'cd /dev/{str(Path(name).parent) if Path(name).parent != Path(".") else ""}\nmknod {Path(name).name} c {major} {minor}\nset_inode_field {Path(name).name} mode 020666\n'
+        for name, major, minor in devices) + ''.join(f'stat /dev/{name}\n' for name, _, _ in devices) +
+                        'cd /dev/block\nmknod 252:0 b 252 0\nset_inode_field 252:0 mode 060660\nstat 252:0\n')
     if logged(['debugfs', '-w', '-f', commands, disk], destination / 'devices.log') != 0:
         raise RuntimeError('device fixture creation failed')
     if (destination / 'devices.log').read_text().count('Type: character special') != len(devices):
@@ -448,7 +460,7 @@ def run_suite(manifest, output_dir, driver_elf, linux_kernel, boaros_kernel, *,
                 result['guests'][name] = observed
                 save_json(directory / 'result.json', result)
                 save_json(path, state)
-            result.update(compare_observations(result['guests']['linux'], result['guests']['boaros'], case.get('expected_exit', 0)))
+            result.update(compare_observations(result['guests']['linux'], result['guests']['boaros'], case.get('expected_exit', 0), case.get('comparison', 'bytes')))
             result['completed'] = True
             save_json(directory / 'result.json', result)
             save_json(path, state)

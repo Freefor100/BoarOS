@@ -22,19 +22,38 @@ python3 tests/program-inventory/run.py --reuse-builds --require-pass --output bu
 
 ## 当前基线与口径
 
-最近完整验收来自进程/随机/调度阶段，生产内核 SHA-256 为
-`be5ca22629c904a427241b0f92e9d561d0312952e787ab75870ec4beae0143b3`，
-suite identity 为 `aa3bda0115670de7a837a7331dd563c9d282991109d1b6f17f39ecc7a8346fcd`。
-228 个顶层案例中 227 pass，唯一 `busybox.official` 为 upstream-failure。
-此状态表示原脚本内部断言未全部成功，不能解释为“上游程序有 bug”或全系统仅余一个缺口。
-本次文档整理复核保留的 runner 输出，未重新运行程序：Linux 原脚本 55/55，
-BoarOS 53/55，失败命令精确为 `dmesg`（klogctl ENOSYS）和 `hwclock`
-（无法打开 `/dev/misc/rtc`）。脚本整体 exit 0，故必须检查内部断言。
-`free` 已通过；`df` 也通过脚本断言并列出 /dev/shm 的 tmpfs，但根盘仍被
-来源名过滤，不能把退出成功等同于全部内容兼容。历史 df/free 缺口不可照搬为当前失败列表。
+最近的完整228项历史清单来自进程/随机/调度阶段，227 pass和原BusyBox53/55的身份
+仍在下方历史记录。本轮没有重跑228项；只运行原BusyBox包装器和环境内容工作流。
+原脚本两侧55/55子项成功、wait=0，dmesg保存真实启动消息，hwclock输出真实UTC。
+新增内容脚本检查-r/-c/-n的作用、清空后无消息，以及df根盘总量/使用量/可用量与
+同一客体statfs一致，Linux/BoarOS均退出0。BoarOS根来源为`/dev/block/252:0`，
+节点由公共镜像生成器建立。环境探针另验证console不会回灌日志、RTC与realtime
+一致、OFD独占/dup/fork/CLOEXEC和坏指针；新增27条使固定LinuxABI扩为1118。
 
-程序清单、1000 条 ABI、原镜像独立诊断和正式评分是四种不同口径；本轮没有新正式评分。
-后续缺口只在[路线](../goals.md)维护；本页下方保留固定身份、原始结论和复建命令。
+原包装器含日期、日志、PID与容量等动态内容，整份stdout跨系统不要求字节相同。
+清单显式选择contract比较：所有55条原断言、顺序、命令与wait status仍必须成立，
+原stdout/stderr和raw_output_equal=false保留；其他案例默认仍逐字节比较。
+环境内容脚本使用稳定的阶段标记，两侧输出逐字节一致。一次解析器失败来自启动
+UART半行插在SUITE/ABI标记之前，重新核对同一原日志完整记录后通过，未重启重复测试。
+
+重建：`make test-environment-riscv test-log-host test-rtc-host`；
+`python3 -B tests/program-inventory/run.py --suite busybox --case busybox.official --case busybox.environment --reuse-builds --require-pass --output build/environment-check`。
+输入依旧为本页固定BusyBox源码/原包装器和Linux commit；实际QEMU11.1.1、512MiB、
+单hart。逐条原结果、原输出、fixture/ELF/内核身份及ABI重核依据归档在既有
+[消费者证据](cost-consumer-followup.json)的environment_completion，不依赖被清理的build日志。
+
+| 分类 | 证据与判断边界 |
+|---|---|
+| 镜像/环境缺口 | setup/exec_errno、缺文件/节点/工具；修复环境后再判断程序，保留旧原因 |
+| 辅助程序 | 固定Linux同样等待，且上游/反汇编证明须控制器或信号驱动；cgroup_fj_proc见下方证据，wait=9不改成成功 |
+| 未实现能力 | 有明确ENOSYS/ENOTSUP及代码路径，区分凭据、TTY、sysfs/网卡等独立缺口 |
+| 未到达 | not-run或总预算已耗尽；不称作该程序失败，也不称作通过 |
+| 预算超时 | 保存预算、实际阶段、取消和wait状态；超时不证明死锁 |
+| 程序错误/契约失败 | 非零、signal或原内部断言失败，先核对固定Linux及程序调用条件 |
+| 性能回退 | 同身份工作量及正确完成后的分布变化；Max提高不能抵消Parent/慢任务变化 |
+
+程序清单、ABI差分、原镜像诊断与正式评分仍是不同口径；本轮不产生正式评分。
+后续主线只在[路线](../goals.md)维护，本页不积累开发任务。
 
 ## 历史阶段记录
 
@@ -77,7 +96,7 @@ python3 tests/program-inventory/run.py --output build/p4d-full-20260925
 
 包装脚本与直接 entry 重复覆盖，228 个顶层案例不是 228 个独立能力。当前唯一未通过项是 BusyBox 原脚本，其中四条子命令断言失败。早期基线的内核 `kernel-rv` SHA-256 为 `48779733d5fedb7419755e4e8244b4d2fd433832fb5dc97cd5585a0b9130b619`，固定 Linux Image 为 `7ca338ec75e681cc68c5d946b3ae633fc0088fd78569b7847528105a9de6c8ec`；这些旧身份仅供历史定位。最终整合身份与重建命令见上段。
 
-当前已无清单中的直接 entry 失败；剩余 BusyBox 包装器的 mount/proc/sysfs/mqueue 等环境与子命令缺口见[目标清单](../goals.md)。
+当时已无清单中的直接 entry 失败；该历史阶段的 BusyBox 包装器环境与子命令缺口见[目标清单](../goals.md)。
 
 `build/recoverable-metadata-focused` 另以 `--require-pass` 严格验收上述六个新增通过的 entry。`tests/program-inventory/filesystem.sh` 通过同一 `suites.run_suite()` 和未修改 BusyBox 验证 pwd、cd、指定时间 touch、文件/目录 mv 及改名后继续访问，双侧完整输出一致；manifest 与命令在 `build/recoverable-busybox-final/`。BusyBox `df` 仍失败不能解释成 statfs 未实现：独立 statvfs 与真实计数验证已通过，挂载枚举等消费者依赖继续按实际失败调查，不据命令名称补存根。
 

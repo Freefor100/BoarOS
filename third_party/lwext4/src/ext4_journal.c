@@ -744,6 +744,7 @@ static int jbd_block_get(struct jbd_fs *jbd_fs,
 		  struct ext4_block *block,
 		  ext4_fsblk_t fblock)
 {
+	COST_PHASE_SCOPE(read_source, 7);
 	/* TODO: journal device. */
 	int rc;
 	struct ext4_blockdev *bdev = jbd_fs->bdev;
@@ -1633,6 +1634,7 @@ static void jbd_journal_write_sb(struct jbd_journal *journal)
  * ordinary metadata. A torn primary always retains a complete replay image. */
 static int jbd_journal_update_super(struct jbd_journal *journal, bool active)
 {
+	COST_PHASE_SCOPE(read_source, 6);
 	struct ext4_fs *fs = journal->jbd_fs->inode_ref.fs;
 	struct ext4_sblock before = fs->sb;
 	struct ext4_block block = EXT4_BLOCK_ZERO();

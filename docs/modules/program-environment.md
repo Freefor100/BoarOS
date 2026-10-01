@@ -165,3 +165,9 @@ Linux 环境准备失败使该例成为无效参考；BoarOS 缺能力的诊断�
 manifest 所有项目完成；清单本身不是必过测试。原始命令、日志、输出及失败案例磁盘保留；通过案例的磁盘可从固定输入和基础 fixture 重建。不能因
 环境或参考失败把 BoarOS 标为通过。具体固定输入及证据边界见
 [真实程序清单](../learning/user-program-inventory.md)。
+
+公共镜像提供RTC的10:135别名和根块节点252:0。原BusyBox包装器显式按全部逐项
+contract和wait status比较，保留原输出及raw_output_equal；日期、内核日志、PID和容量
+随系统变化，不能据字节不同虚构程序失败。其他案例默认字节比较不变。独立
+`busybox.environment`核对日志-r/-c/-n、真实RTC内容和df/statfs同客体一致性。
+分类证据及后续应用边界见[程序清单](../learning/user-program-inventory.md#当前基线与口径)。
