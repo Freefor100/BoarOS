@@ -807,6 +807,27 @@ Finish:
 }
 
 __unused
+static bool ext4_space_waits_checkpoint(struct ext4_mountpoint *mp)
+{
+	struct jbd_journal *journal = mp->fs.jbd_journal;
+	struct jbd_trans *groups[] = {journal->running, journal->committing};
+	uint64_t blocks = 0, inodes = 0;
+	for (unsigned i = 0; i < 2; i++) {
+		if (!groups[i]) continue;
+		struct jbd_quarantine *range;
+		LIST_FOREACH(range, &groups[i]->quarantine, node) {
+			if (range->inode) inodes += range->count;
+			else blocks += range->count;
+		}
+	}
+	/* Free bitmap entries owned by an older checkpoint are not allocatable.
+	 * Wait before starting a private operation, while releasing the backend
+	 * lock is still safe. Leave headroom for the bounded 32-block batch. */
+	return (blocks && ext4_sb_get_free_blocks_cnt(&mp->fs.sb) <= blocks + 32) ||
+		(inodes && ext4_get32(&mp->fs.sb, free_inodes_count) <= inodes + 1);
+}
+
+__unused
 static int __ext4_trans_start(struct ext4_mountpoint *mp)
 {
 	struct jbd_journal *journal = mp->fs.jbd_journal;
@@ -820,7 +841,8 @@ static int __ext4_trans_start(struct ext4_mountpoint *mp)
 	if (mp->transaction_depth == 0) {
 		if (journal->grouped && mp->journal_runtime.wait &&
 		    (journal->memory_used > journal->memory_limit / 2 ||
-		     (journal->running && journal->running->operations >= 64))) {
+		     (journal->running && journal->running->operations >= 64) ||
+		     ext4_space_waits_checkpoint(mp))) {
 			if (mp->journal_runtime.request) mp->journal_runtime.request(mp->journal_runtime.context);
 			int wait = mp->journal_runtime.wait(mp->journal_runtime.context, journal->accepted_sequence, true);
 			if (wait != EOK) return wait;

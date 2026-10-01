@@ -146,6 +146,53 @@ static void group_verify_recovery(struct ext4_fs *fs)
     CHECK(to_le32(ino.change_inode_time)==(new_version?3333:0));
     CHECK(!fs->jbd_journal->error && ext4_fclose(&f)==EOK);
 }
+static struct ext4_fs *space_fs;
+static ext4_file space_other;
+static unsigned space_waited, space_interleaved;
+static int space_wait(void *context, uint64_t sequence, bool checkpoint)
+{
+    (void)context;
+    if (space_fs->jbd_journal->committing) {
+        CHECK(checkpoint && sequence==space_fs->jbd_journal->accepted_sequence);
+        space_waited++;
+        /* A host fixture cannot suspend this C stack. Return a retry reason;
+         * the RV64 adapter uses the same boundary to sleep on progress. */
+        return EAGAIN;
+    }
+    return ext4_journal_group_service("/",true);
+}
+static void space_during_checkpoint(void)
+{
+    struct jbd_trans *committing=space_fs->jbd_journal->committing;
+    if (!committing || LIST_EMPTY(&committing->quarantine)) {
+        write_interleave=space_during_checkpoint;
+        return;
+    }
+    unsigned char bytes[4096]={0};size_t count=99;
+    CHECK(ext4_fpwrite(&space_other,0,bytes,sizeof(bytes),&count)==EAGAIN && count==0);
+    space_interleaved++;
+}
+static void group_space(struct ext4_fs *fs)
+{
+    space_fs=fs;
+    struct ext4_journal_runtime runtime={.now_ns=group_clock,.wait=space_wait};
+    CHECK(ext4_journal_group_enable("/",&runtime,4*1024*1024)==EOK);
+    ext4_file fill;CHECK(ext4_fopen(&space_other,"/space-other","w+")==EOK);
+    CHECK(ext4_fopen(&fill,"/space-fill","w+")==EOK);
+    unsigned char bytes[4096];memset(bytes,0x72,sizeof(bytes));size_t count;
+    for(;;){int r=ext4_fwrite(&fill,bytes,sizeof(bytes),&count);
+        if(r==ENOSPC){CHECK(count==0);break;}
+        CHECK(r==EOK && count==sizeof(bytes));}
+    CHECK(ext4_file_sync_metadata(&fill)==EOK && fill.fsize>65536);
+    CHECK(ext4_sb_get_free_blocks_cnt(&fs->sb)<32);
+    write_interleave=space_during_checkpoint;
+    CHECK(ext4_ftruncate(&fill,fill.fsize-65536)==EOK);
+    CHECK(space_waited==1 && space_interleaved==1 && !write_interleave);
+    CHECK(ext4_fpwrite(&space_other,0,bytes,sizeof(bytes),&count)==EOK && count==sizeof(bytes));
+    CHECK(ext4_file_sync_metadata(&space_other)==EOK);
+    CHECK(ext4_fclose(&fill)==EOK && ext4_fclose(&space_other)==EOK);
+    printf("group space: pending checkpoint waited; allocation retried successfully\n");
+}
 static bool cost_clock(struct ext4_timestamp *now)
 { *now=(struct ext4_timestamp){2000000000,++cost_tick};return true; }
 static void cost_test(struct ext4_fs *fs)
@@ -375,6 +422,7 @@ int main(int argc,char **argv)
     if(!strcmp(argv[2],"seed"))seed();
     else if(!strcmp(argv[2],"cost"))cost_test(dev.fs);
     else if(!strcmp(argv[2],"group"))group_test(dev.fs);
+    else if(!strcmp(argv[2],"group-space"))group_space(dev.fs);
     else if(!strcmp(argv[2],"group-write") || !strcmp(argv[2],"group-flush")) {CHECK(argc==4);group_fault(dev.fs,argv[2],strtoul(argv[3],NULL,10));return 0;}
     else if(!strcmp(argv[2],"group-recovery"))group_verify_recovery(dev.fs);
     else if(!strcmp(argv[2],"times") || !strcmp(argv[2],"readonly"))times_test(dev.fs,readonly);

@@ -18,6 +18,11 @@ for block in 1024 4096; do
     cp "$work/disk.img" "$work/base.img"
     "$work/probe" "$work/disk.img" group
     e2fsck -fn "$work/disk.img" > "$work/fsck.log" 2>&1 || { cat "$work/fsck.log" >&2; exit 1; }
+    if [ "$block" = 4096 ]; then
+        cp "$work/base.img" "$work/space.img"
+        "$work/probe" "$work/space.img" group-space
+        e2fsck -fn "$work/space.img" > "$work/fsck.log" 2>&1 || { cat "$work/fsck.log" >&2; exit 1; }
+    fi
     for kind in group-write group-flush; do
         last=5
         [ "$kind" != group-flush ] || last=4
