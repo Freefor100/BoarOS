@@ -82,6 +82,45 @@ enum kernel_block_status kernel_block_write_at(
     return device->write(device->context, offset, buffer, size);
 }
 
+enum kernel_block_status kernel_block_write_batch(
+    struct kernel_block_device *device,
+    const struct kernel_block_span *spans,
+    size_t count)
+{
+    if (!device || !device->logical_block_size)
+        return KERNEL_BLOCK_STATUS_INVALID;
+    if (!device->write && !device->write_batch)
+        return KERNEL_BLOCK_STATUS_UNSUPPORTED;
+    if (count > KERNEL_BLOCK_BATCH_MAX || (count && !spans))
+        return KERNEL_BLOCK_STATUS_INVALID;
+    int nonempty = 0;
+    for (size_t i = 0; i < count; i++) {
+        const struct kernel_block_span *span = &spans[i];
+        if (span->offset > device->capacity_bytes ||
+            (uint64_t)span->size > device->capacity_bytes - span->offset)
+            return KERNEL_BLOCK_STATUS_OUT_OF_RANGE;
+        if (!span->size) continue;
+        if (!span->buffer || span->size - 1 > UINTPTR_MAX - (uintptr_t)span->buffer)
+            return KERNEL_BLOCK_STATUS_INVALID;
+        nonempty = 1;
+        for (size_t j = 0; j < i; j++) {
+            if (spans[j].size && span->offset < spans[j].offset + spans[j].size &&
+                spans[j].offset < span->offset + span->size)
+                return KERNEL_BLOCK_STATUS_INVALID;
+        }
+    }
+    if (!nonempty) return KERNEL_BLOCK_STATUS_OK;
+    if (device->write_batch)
+        return device->write_batch(device->context, spans, count);
+    for (size_t i = 0; i < count; i++) {
+        if (!spans[i].size) continue;
+        enum kernel_block_status result = device->write(device->context,
+            spans[i].offset, spans[i].buffer, spans[i].size);
+        if (result != KERNEL_BLOCK_STATUS_OK) return result;
+    }
+    return KERNEL_BLOCK_STATUS_OK;
+}
+
 static struct kernel_block_device *registered_devices;
 
 int kernel_block_register(struct kernel_block_device *device, uint64_t number)

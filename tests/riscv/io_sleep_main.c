@@ -474,6 +474,110 @@ static void queue_worker(void *argument)
 }
 static unsigned timed_out;
 static uint64_t timebase;
+static unsigned batch_mode, batch_fillers, batch_done, batch_finished, batch_flushed;
+static struct kernel_task *batch_task;
+static uint64_t batch_errors;
+static void batch_filler(void *argument)
+{
+    uintptr_t irq = riscv_interrupt_save();
+    unsigned char sector[512];
+    memset(sector, (int)(uintptr_t)argument + 1, sizeof(sector));
+    check(kernel_block_write_at(&device.block, 126 * 1024 * 1024 + (uintptr_t)argument * 4096,
+                               sector, sizeof(sector)) == KERNEL_BLOCK_STATUS_OK, 270);
+    batch_done++;
+    riscv_interrupt_restore(irq);
+}
+static void batch_writer(void *unused)
+{
+    (void)unused;
+    uintptr_t irq = riscv_interrupt_save();
+    unsigned char sectors[8][512];
+    struct kernel_block_span spans[8];
+    batch_task = kernel_task_current();
+    for (unsigned i = 0; i < 8; i++) {
+        memset(sectors[i], (int)i + 32, sizeof(sectors[i]));
+        spans[i] = (struct kernel_block_span){(uint64_t)(122 + batch_mode) * 1024 * 1024 + i * 4096,
+                                             sectors[i], sizeof(sectors[i])};
+    }
+    check(kernel_block_write_batch(&device.block, spans, 8) ==
+          (batch_mode == 2 ? KERNEL_BLOCK_STATUS_IO : KERNEL_BLOCK_STATUS_OK), 271);
+    batch_finished = 1; batch_done++;
+    riscv_interrupt_restore(irq);
+}
+static void batch_barrier(void *unused)
+{
+    (void)unused;
+    uintptr_t irq = riscv_interrupt_save();
+    check(kernel_block_flush(&device.block) == KERNEL_BLOCK_STATUS_OK && batch_finished, 272);
+    batch_flushed = 1; batch_done++;
+    riscv_interrupt_restore(irq);
+}
+static void batch_readback(void *unused)
+{
+    (void)unused;
+    uintptr_t irq = riscv_interrupt_save();
+    unsigned char sector[512];
+    for (unsigned i = 0; i < 8; i++) {
+        check(kernel_block_read_at(&device.block,
+            (uint64_t)(122 + batch_mode) * 1024 * 1024 + i * 4096, sector, sizeof(sector)) ==
+            KERNEL_BLOCK_STATUS_OK && batch_flushed, 273);
+        unsigned expected = batch_mode == 2 && i ? 0 : i + 32;
+        for (unsigned j = 0; j < sizeof(sector); j++) check(sector[j] == expected, 274);
+    }
+    batch_done++;
+    riscv_interrupt_restore(irq);
+}
+static void batch_cancel_probe(void *unused)
+{
+    (void)unused;
+    uintptr_t irq = riscv_interrupt_save();
+    while (!batch_task || (batch_mode == 2 && (device.statistics.io_errors == batch_errors ||
+                                              batch_task->state == KERNEL_THREAD_STATE_READY))) {
+        check(kernel_scheduler_yield_current() == KERNEL_SCHEDULER_STATUS_OK, 275);
+        riscv_interrupt_restore(RISCV_SSTATUS_SIE);
+        (void)riscv_interrupt_save();
+    }
+    check(!batch_finished && batch_task->state == KERNEL_THREAD_STATE_BLOCKED, 276);
+    batch_task->terminate_requested = 1;
+    check(kernel_scheduler_wake_signal(batch_task) == KERNEL_SCHEDULER_STATUS_OK &&
+          batch_task->state == KERNEL_THREAD_STATE_BLOCKED, 277);
+    virt_uart_puts("I/O handshake: batch-pending\n");
+    batch_done++;
+    riscv_interrupt_restore(irq);
+}
+static void test_batch(unsigned mode)
+{
+    batch_mode = mode; batch_fillers = mode == 0 ? 0 : mode == 1 ? 2 : 6;
+    batch_done = batch_finished = batch_flushed = 0; batch_task = 0;
+    batch_errors = device.statistics.io_errors;
+    uint64_t before = device.statistics.requests;
+    virt_uart_puts(mode == 0 ? "I/O handshake: batch\n" :
+                   mode == 1 ? "I/O handshake: batch-partial\n" : "I/O handshake: batch-error\n");
+    while (!virt_uart_rx_ready()) { }
+    check(virt_uart_getc() == 'g', 278);
+    for (uintptr_t i = 0; i < batch_fillers; i++)
+        check(kernel_thread_create(batch_filler, (void *)i) == KERNEL_SCHEDULER_STATUS_OK, 279);
+    check(kernel_thread_create(batch_writer, 0) == KERNEL_SCHEDULER_STATUS_OK &&
+          kernel_thread_create(batch_barrier, 0) == KERNEL_SCHEDULER_STATUS_OK &&
+          kernel_thread_create(batch_readback, 0) == KERNEL_SCHEDULER_STATUS_OK &&
+          kernel_thread_create(batch_cancel_probe, 0) == KERNEL_SCHEDULER_STATUS_OK, 280);
+    unsigned reaped = 0;
+    while (reaped < batch_fillers + 4) {
+        uintptr_t irq = riscv_interrupt_save();
+        check(kernel_scheduler_yield_current() == KERNEL_SCHEDULER_STATUS_OK, 281);
+        struct kernel_thread_completion completion;
+        if (kernel_scheduler_reap_one(&completion) == KERNEL_SCHEDULER_STATUS_OK) reaped++;
+        riscv_interrupt_restore(irq | RISCV_SSTATUS_SIE);
+    }
+    (void)riscv_interrupt_save();
+    unsigned requests = mode == 2 ? 16 : batch_fillers + 16;
+    requests += device.block.cache_mode == KERNEL_BLOCK_CACHE_WRITEBACK;
+    check(batch_done == batch_fillers + 4 && device.statistics.requests - before == requests &&
+          !device.active && !device.inflight && !device.barrier, 282);
+    struct riscv_virtio_mmio_block_statistics stats;
+    riscv_virtio_mmio_block_get_statistics(&device, &stats);
+    print_counters(mode == 0 ? "batch" : mode == 1 ? "batch-partial" : "batch-error", &stats);
+}
 static void timeout_worker(void *argument)
 {
     uintptr_t irq = riscv_interrupt_save();
@@ -481,6 +585,22 @@ static void timeout_worker(void *argument)
     check(kernel_block_read_at(&device.block, 121 * 1024 * 1024 + (uintptr_t)argument * 4096,
                               sector, sizeof(sector)) == KERNEL_BLOCK_STATUS_TIMEOUT, 60);
     check(kernel_block_read_at(&device.block, 0, sector, sizeof(sector)) == KERNEL_BLOCK_STATUS_IO, 61);
+    timed_out++;
+    riscv_interrupt_restore(irq);
+}
+static void timeout_batch_worker(void *unused)
+{
+    (void)unused;
+    uintptr_t irq = riscv_interrupt_save();
+    unsigned char sectors[8][512];
+    struct kernel_block_span spans[8];
+    for (unsigned i = 0; i < 8; i++) {
+        memset(sectors[i], (int)i + 1, sizeof(sectors[i]));
+        spans[i] = (struct kernel_block_span){121 * 1024 * 1024 + 65536 + i * 4096,
+                                            sectors[i], sizeof(sectors[i])};
+    }
+    check(kernel_block_write_batch(&device.block, spans, 8) == KERNEL_BLOCK_STATUS_TIMEOUT, 283);
+    check(kernel_block_write_batch(&device.block, spans, 8) == KERNEL_BLOCK_STATUS_IO, 284);
     timed_out++;
     riscv_interrupt_restore(irq);
 }
@@ -933,6 +1053,7 @@ void kernel_main(unsigned long hart, const void *dtb)
     riscv_virtio_mmio_block_get_statistics(&device, &stats);
     check(queue_done == 10 && stats.max_inflight == 8 && stats.queue_waits >= 2, 56);
     print_counters("queue", &stats);
+    for (unsigned mode = 0; mode < 3; mode++) test_batch(mode);
     check(kernel_thread_create(background_writeback_probe, 0) == KERNEL_SCHEDULER_STATUS_OK, 98);
     for (;;) {
         uintptr_t irq = riscv_interrupt_save();
@@ -984,9 +1105,10 @@ void kernel_main(unsigned long hart, const void *dtb)
     check(virt_uart_getc() == 'g', 63);
     check(kernel_time_init(info.timebase_frequency, 0) == KERNEL_TIME_STATUS_OK &&
           riscv_timer_start(info.timebase_frequency, 100) == RISCV_TIMER_STATUS_OK, 64);
-    for (uintptr_t i = 0; i < 8; i++) check(kernel_thread_create(timeout_worker, (void *)i) == KERNEL_SCHEDULER_STATUS_OK, 65);
+    for (uintptr_t i = 0; i < 4; i++) check(kernel_thread_create(timeout_worker, (void *)i) == KERNEL_SCHEDULER_STATUS_OK, 65);
+    check(kernel_thread_create(timeout_batch_worker, 0) == KERNEL_SCHEDULER_STATUS_OK, 285);
     reaped = 0;
-    while (reaped < 8) {
+    while (reaped < 5) {
         uintptr_t irq = riscv_interrupt_save();
         check(kernel_scheduler_yield_current() == KERNEL_SCHEDULER_STATUS_OK, 66);
         struct kernel_thread_completion completion;
@@ -996,7 +1118,7 @@ void kernel_main(unsigned long hart, const void *dtb)
     (void)riscv_interrupt_save();
     riscv_virtio_mmio_block_get_statistics(&device, &stats);
     print_counters("timeout", &stats);
-    check(timed_out == 8 && stats.timeouts == 1 && !stats.runtime_polls &&
+    check(timed_out == 5 && stats.timeouts == 1 && !stats.runtime_polls &&
           riscv_virtio_mmio_block_destroy(&device) == RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK &&
           physical_page_available(&allocator) == baseline, 67);
 #if BOAROS_COST_DIAGNOSTICS

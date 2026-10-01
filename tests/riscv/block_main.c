@@ -71,6 +71,47 @@ static int bytes_equal(const unsigned char *bytes,
     return 1;
 }
 
+static void test_write_batch(struct riscv_virtio_mmio_block *rw,
+                              struct riscv_virtio_mmio_block *ro,
+                              unsigned char *buffer)
+{
+    struct kernel_block_span spans[8];
+    for (unsigned i = 0; i < 8; i++) {
+        for (unsigned j = 0; j < 512; j++) buffer[i * 512 + j] = (unsigned char)(i + 1);
+        spans[i] = (struct kernel_block_span){4096 + i * 1024, buffer + i * 512, 512};
+    }
+    enum kernel_block_status result = kernel_block_write_batch(&ro->block, spans, 8);
+    if (result != KERNEL_BLOCK_STATUS_UNSUPPORTED || ro->block.write_batch)
+        fail_block(60, KERNEL_BLOCK_STATUS_UNSUPPORTED, result);
+    result = kernel_block_write_batch(&rw->block, spans, 8);
+    if (result != KERNEL_BLOCK_STATUS_OK) fail_block(61, KERNEL_BLOCK_STATUS_OK, result);
+    struct riscv_virtio_mmio_block_statistics stats;
+    riscv_virtio_mmio_block_get_statistics(rw, &stats);
+    if (stats.max_inflight != 8) fail_block(62, 8, stats.max_inflight);
+    for (unsigned i = 0; i < 8; i++) {
+        result = kernel_block_read_at(&rw->block, spans[i].offset, buffer, 512);
+        if (result != KERNEL_BLOCK_STATUS_OK) fail_block(63, KERNEL_BLOCK_STATUS_OK, result);
+        for (unsigned j = 0; j < 512; j++)
+            if (buffer[j] != i + 1) fail_block(64, i + 1, buffer[j]);
+    }
+    const char first[] = "a", second[] = "bc", crossing[] = "de";
+    const char sector[] = "fg";
+    spans[0] = (struct kernel_block_span){200 * 512 + 1, first, 1};
+    spans[1] = (struct kernel_block_span){200 * 512 + 2, second, 2};
+    spans[2] = (struct kernel_block_span){201 * 512 - 1, crossing, 2};
+    spans[3] = (struct kernel_block_span){202 * 512, sector, 2};
+    spans[4] = (struct kernel_block_span){rw->block.capacity_bytes, 0, 0};
+    result = kernel_block_write_batch(&rw->block, spans, 5);
+    if (result != KERNEL_BLOCK_STATUS_OK) fail_block(65, KERNEL_BLOCK_STATUS_OK, result);
+    result = kernel_block_read_at(&rw->block, 200 * 512, buffer, 3 * 512);
+    if (result != KERNEL_BLOCK_STATUS_OK || buffer[0] || buffer[1] != 'a' ||
+        buffer[2] != 'b' || buffer[3] != 'c' || buffer[4] ||
+        buffer[511] != 'd' || buffer[512] != 'e' || buffer[513] ||
+        buffer[1024] != 'f' || buffer[1025] != 'g' || buffer[1026])
+        fail_block(66, KERNEL_BLOCK_STATUS_OK, result);
+    virt_uart_puts("BoarOS: block batch direct and adjacent RMW passed\n");
+}
+
 static void test_rejects_invalid_or_non_block_mmio(void)
 {
     uint32_t registers[0x200U / sizeof(uint32_t)] = {0U};
@@ -381,6 +422,8 @@ static void test_real_virtio_block(const void *dtb)
     if (block_status != KERNEL_BLOCK_STATUS_INVALID) {
         fail_block(36U, KERNEL_BLOCK_STATUS_INVALID, block_status);
     }
+
+    test_write_batch(rw_dev, ro_dev, buffer);
 
     block_status = kernel_block_flush(&rw_dev->block);
     if (block_status != KERNEL_BLOCK_STATUS_OK ||
