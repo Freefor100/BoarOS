@@ -89,14 +89,20 @@ def pack(records, final=False):
         rows.append(row)
     return dict(version=1,complete_matrix=final,compression='all unspecified metrics and buckets are zero',metrics=metrics,records=rows)
 def unpack(document, final=False):
-    if document['version']!=1 or [tuple(x) for x in document['metrics']]!=schema():raise ValueError('evidence schema/version')
+    metrics=[tuple(x) for x in document['metrics']]
+    current=schema()
+    # The original v1 registry ended here. Accept that complete historical
+    # registry, not arbitrary shortened schemas, after adding journal metrics.
+    legacy=current[:next(i+1 for i,x in enumerate(current) if x[0]=='wake_to_run')]
+    if document['version']!=1 or metrics not in (current,legacy):raise ValueError('evidence schema/version')
     rows=[]
     for record in document['records']:
         row={k:v for k,v in record.items() if k!='snapshots'};row['snapshots']=[]
+        if metrics!=current:row['metric_schema']=metrics
         for snap in record['snapshots']:
             full=dict(snap['header']);used=set()
             for lane in ('foreground','background','observer'):
-                for name,unit,hist in schema():
+                for name,unit,hist in metrics:
                     key=lane+'.'+name;used.add(key);prefix=key+'.';value=snap['counters'].get(key,[0,0,0,{}] if hist else [0,0,0])
                     if len(value)!=(4 if hist else 3):raise ValueError('counter shape')
                     full[prefix+'unit']=unit
@@ -106,7 +112,7 @@ def unpack(document, final=False):
                         for i in range(65):full[prefix+'bucket.'+str(i)]=value[3].get(str(i),0)
             if set(snap['counters'])-used:raise ValueError('unknown counter')
             if seal(full)!=snap['sha256']:raise ValueError('evidence lost/changed counters')
-            parse(''.join(f'{k}={v}\n' for k,v in full.items()),full['epoch'])
+            parse(''.join(f'{k}={v}\n' for k,v in full.items()),full['epoch'],metrics)
             row['snapshots'].append(dict(name=snap['name'],values=full))
         rows.append(row)
     (validate_final if final or document.get('complete_matrix') else validate_replicas)(rows);return rows

@@ -12,7 +12,11 @@ def schema():
     return [(name,unit,int(hist)) for name,unit,hist in re.findall(
         r'^X\(\w+, (\w+), (\w+), ([01])\)$', (ROOT/'include/kernel/cost.def').read_text(), re.M)]
 
-def parse(text, epoch):
+def parse(text, epoch, metrics=None):
+    metrics=schema() if metrics is None else metrics
+    current=schema()
+    legacy=current[:next(i+1 for i,x in enumerate(current) if x[0]=='wake_to_run')]
+    if list(metrics) not in (current,legacy):raise ValueError('unsupported metric registry')
     fields={}
     for line in text.splitlines():
         if not line or line.count('=') != 1: raise ValueError('malformed record')
@@ -22,7 +26,7 @@ def parse(text, epoch):
     expected=set(HEADER)
     strings={'state','mode'}
     for lane in LANES:
-        for name,unit,hist in schema():
+        for name,unit,hist in metrics:
             prefix=lane+'.'+name+'.'
             expected.update(prefix+s for s in ('unit','value','samples','max'))
             strings.add(prefix+'unit')
@@ -40,7 +44,7 @@ def parse(text, epoch):
     if not fields['owner'] or not fields['timebase_hz'] or fields['end_ticks'] < fields['start_ticks']: raise ValueError('invalid timing/owner')
     if fields['resolution_ns_numerator'] != 1000000000 or fields['resolution_ns_denominator'] != fields['timebase_hz']: raise ValueError('clock resolution')
     for lane in LANES:
-        for name,unit,hist in schema():
+        for name,unit,hist in metrics:
             p=lane+'.'+name+'.'; count=fields[p+'samples']; value=fields[p+'value']; maximum=fields[p+'max']
             if (not count and (value or maximum)) or maximum > value or value > count * maximum: raise ValueError('counter consistency: '+p)
             if hist:
@@ -100,7 +104,7 @@ def validate_replicas(records):
                 if snapshot['name'] in seen: raise ValueError('duplicate window')
                 seen.add(snapshot['name'])
                 text=''.join(f'{k}={v}\n' for k,v in snapshot['values'].items())
-                parsed=parse(text,snapshot['values']['epoch'])
+                parsed=parse(text,snapshot['values']['epoch'],row.get('metric_schema'))
                 if row['case']=='deadline':validate_deadline(snapshot['name'],parsed)
                 if parsed['epoch']<=previous_epoch:raise ValueError('reused/stale boot epoch')
                 previous_epoch=parsed['epoch']
