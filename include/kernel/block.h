@@ -37,10 +37,22 @@ typedef enum kernel_block_status (*kernel_block_write_fn)(
     const void *buffer,
     size_t size);
 
+#define KERNEL_BLOCK_BATCH_MAX 8U
+
+struct kernel_block_span {
+    uint64_t offset;
+    const void *buffer;
+    size_t size;
+};
+
+typedef enum kernel_block_status (*kernel_block_write_batch_fn)(
+    void *context, const struct kernel_block_span *spans, size_t count);
+
 struct kernel_block_device {
     void *context;
     kernel_block_read_fn read;
     kernel_block_write_fn write;
+    kernel_block_write_batch_fn write_batch;
     uint64_t capacity_bytes;
     uint32_t logical_block_size;
     kernel_block_flush_fn flush;
@@ -81,5 +93,15 @@ enum kernel_block_status kernel_block_write_at(
     uint64_t offset,
     const void *buffer,
     size_t size);
+
+/* Synchronous, non-transactional batch of at most eight disjoint byte ranges.
+ * Preflight every span before I/O. Empty spans permit a null buffer but their
+ * offset must be in capacity; count zero needs no spans. A missing callback
+ * falls back in input order and stops on the first failed write. All buffers
+ * remain borrowed until every published DMA completes or reset stops it. */
+enum kernel_block_status kernel_block_write_batch(
+    struct kernel_block_device *device,
+    const struct kernel_block_span *spans,
+    size_t count);
 
 #endif

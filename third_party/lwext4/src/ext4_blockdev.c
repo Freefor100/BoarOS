@@ -334,6 +334,42 @@ int ext4_blocks_set_direct(struct ext4_blockdev *bdev, const void *buf,
 	return ext4_bdif_bwrite(bdev, buf, pba, pb_cnt * cnt);
 }
 
+int ext4_blocks_set_batch(struct ext4_blockdev *bdev,
+	const struct ext4_block_span *spans, unsigned count)
+{
+	if (!bdev || !bdev->bdif || count > EXT4_BLOCK_BATCH_MAX ||
+	    (count && !spans) || !bdev->bdif->ph_bsize || !bdev->lg_bsize ||
+	    bdev->lg_bsize % bdev->bdif->ph_bsize) return EINVAL;
+	struct ext4_block_span physical[EXT4_BLOCK_BATCH_MAX];
+	uint32_t ratio = bdev->lg_bsize / bdev->bdif->ph_bsize;
+	for (unsigned i = 0; i < count; i++) {
+		if (!spans[i].data || !spans[i].count || spans[i].block > bdev->lg_bcnt ||
+		    spans[i].count > bdev->lg_bcnt - spans[i].block ||
+		    spans[i].count > UINT32_MAX / ratio ||
+		    spans[i].block > (UINT64_MAX - bdev->part_offset) / bdev->lg_bsize)
+			return EINVAL;
+		for (unsigned j = 0; j < i; j++)
+			if (spans[i].block < spans[j].block + spans[j].count &&
+			    spans[j].block < spans[i].block + spans[i].count) return EINVAL;
+		physical[i] = (struct ext4_block_span){spans[i].data,
+			(spans[i].block * bdev->lg_bsize + bdev->part_offset) / bdev->bdif->ph_bsize,
+			spans[i].count * ratio};
+	}
+	if (!count) return EOK;
+	if (!bdev->bdif->bwrite_batch) {
+		for (unsigned i = 0; i < count; i++) {
+			int r = ext4_bdif_bwrite(bdev, physical[i].data, physical[i].block, physical[i].count);
+			if (r != EOK) return r;
+		}
+		return EOK;
+	}
+	ext4_bdif_lock(bdev);
+	int r = bdev->bdif->bwrite_batch(bdev, physical, count);
+	bdev->bdif->bwrite_ctr += count;
+	ext4_bdif_unlock(bdev);
+	return r;
+}
+
 int ext4_block_writebytes(struct ext4_blockdev *bdev, uint64_t off,
 			  const void *buf, uint32_t len)
 {

@@ -87,6 +87,8 @@ static int block_write(struct ext4_blockdev *device,
                        const void *buffer,
                        uint64_t block,
                        uint32_t count);
+static int block_write_batch(struct ext4_blockdev *device,
+                            const struct ext4_block_span *spans, unsigned count);
 static int block_close(struct ext4_blockdev *device);
 static int block_flush(struct ext4_blockdev *device);
 static int release_mount_storage(struct kernel_vfs_mount *mount);
@@ -321,6 +323,27 @@ static int block_close(struct ext4_blockdev *device)
     return block_open(device);
 }
 
+static int block_write_batch(struct ext4_blockdev *device,
+                            const struct ext4_block_span *spans, unsigned count)
+{
+    struct lwext4_mount_adapter *adapter = device->bdif->p_user;
+    if (count > KERNEL_BLOCK_BATCH_MAX || (count && !spans)) return EINVAL;
+    struct kernel_block_span physical[KERNEL_BLOCK_BATCH_MAX];
+    for (unsigned i = 0; i < count; i++) {
+        if (spans[i].block > UINT64_MAX / LWEXT4_PHYSICAL_BLOCK_SIZE ||
+            (uint64_t)spans[i].count * LWEXT4_PHYSICAL_BLOCK_SIZE > SIZE_MAX) return EINVAL;
+        physical[i] = (struct kernel_block_span){spans[i].block * LWEXT4_PHYSICAL_BLOCK_SIZE,
+            spans[i].data, (size_t)spans[i].count * LWEXT4_PHYSICAL_BLOCK_SIZE};
+    }
+    switch (kernel_block_write_batch(adapter->block, physical, count)) {
+    case KERNEL_BLOCK_STATUS_OK: return EOK;
+    case KERNEL_BLOCK_STATUS_NO_MEMORY: return ENOMEM;
+    case KERNEL_BLOCK_STATUS_UNSUPPORTED: return EROFS;
+    case KERNEL_BLOCK_STATUS_INVALID: return EINVAL;
+    default: return EIO;
+    }
+}
+
 static int block_flush(struct ext4_blockdev *device)
 {
     struct lwext4_mount_adapter *adapter = device->bdif->p_user;
@@ -534,8 +557,17 @@ static void journal_request(void *context)
     riscv_interrupt_restore(irq);
 }
 
-static int journal_wait(void *context, uint64_t sequence, bool checkpoint)
+static uint64_t journal_reached(const struct jbd_journal *journal, enum ext4_journal_wait kind)
 {
+    return kind == EXT4_JOURNAL_WAIT_SEALED ? journal->sealed_sequence :
+        kind == EXT4_JOURNAL_WAIT_DURABLE ? journal->durable_sequence : journal->checkpoint_sequence;
+}
+
+static int journal_wait(void *context, uint64_t sequence, enum ext4_journal_wait kind)
+{
+    if (kind == EXT4_JOURNAL_WAIT_SEALED) { COST_ADD(JOURNAL_WAIT_SEALED, 1); }
+    else if (kind == EXT4_JOURNAL_WAIT_DURABLE) { COST_ADD(JOURNAL_WAIT_DURABLE, 1); }
+    else { COST_ADD(JOURNAL_WAIT_CHECKPOINT, 1); }
     struct lwext4_mount_adapter *adapter = context;
     adapter->journal_force = 1;
     journal_request(adapter);
@@ -548,12 +580,14 @@ static int journal_wait(void *context, uint64_t sequence, bool checkpoint)
             if (result == EOK) result = progress.error;
             break;
         }
-        if ((checkpoint ? progress.checkpoint : progress.durable) >= sequence) break;
+        uint64_t reached = kind == EXT4_JOURNAL_WAIT_SEALED ? progress.sealed :
+            kind == EXT4_JOURNAL_WAIT_DURABLE ? progress.durable : progress.checkpoint;
+        if (reached >= sequence) break;
         uintptr_t irq = riscv_interrupt_save();
         /* Only the worker advances completion, and it cannot run between the
          * disabled-IRQ predicate and queue insertion on this single hart. */
         struct jbd_journal *journal = adapter->device.fs->jbd_journal;
-        if (!journal->error && (checkpoint ? journal->checkpoint_sequence : journal->durable_sequence) < sequence) {
+        if (!journal->error && journal_reached(journal, kind) < sequence) {
             enum kernel_wait_wake_reason reason;
             if (kernel_scheduler_block_current(&adapter->journal_progress, 0, 0, &reason) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
         }
@@ -581,9 +615,8 @@ static void journal_worker(void *context)
         struct ext4_journal_progress progress;
         if (ext4_journal_group_progress(adapter->mount_point, &progress) != EOK) __builtin_trap();
         uint64_t deadline = 0;
-        if (!result && progress.deadline_ns) {
-            if (progress.ready || kernel_time_deadline_from_monotonic(progress.deadline_ns, &deadline) == KERNEL_TIME_STATUS_DEADLINE_PASSED) continue;
-        }
+        if (!result && (progress.ready || (progress.deadline_ns &&
+            kernel_time_deadline_from_monotonic(progress.deadline_ns, &deadline) == KERNEL_TIME_STATUS_DEADLINE_PASSED))) continue;
         irq = riscv_interrupt_save();
         if (!adapter->journal_requested && !adapter->journal_stopping) {
             enum kernel_wait_wake_reason reason;
@@ -689,6 +722,7 @@ int kernel_vfs_mount_ext4(struct kernel_vfs_mount *mount,
     adapter->interface.open = block_open;
     adapter->interface.bread = block_read;
     adapter->interface.bwrite = block_write;
+    adapter->interface.bwrite_batch = block_write_batch;
     adapter->interface.close = block_close;
     adapter->interface.flush = block_flush;
     adapter->interface.lock = 0;
@@ -1095,14 +1129,16 @@ static int ext4_backend_create(struct kernel_vfs_mount *mount,
 
 static void ext4_backend_accessed(struct kernel_vfs_file *file)
 {
-    struct kernel_vfs_node *node;
-    if (file == 0 || file->state != VFS_FILE_STATE_LIVE ||
-        file->private_data == 0) return;
-    node = file->private_data;
+    if (!file || file->state != VFS_FILE_STATE_LIVE || !file->private_data) return;
+    struct kernel_vfs_node *node = file->private_data;
     KERNEL_LOCK_SCOPE(node_guard);
+    kernel_vfs_node_lock(node, &node_guard, 0);
+    bool needed;
+    if (ext4_file_relatime_needed(lwext4_node_file(node), &needed) != EOK || !needed) return;
+    /* 共享查询后先释放资格；独占更新重查当前 inode，避免升级死锁。 */
+    kernel_lock_release(&node_guard);
     kernel_vfs_node_lock(node, &node_guard, 1);
-    /* Linux touch_atime does not change a read's result on metadata I/O
-     * failure. The mount's dirty block cache continues to own that state. */
+    /* Linux touch_atime does not change a read result on metadata failure. */
     (void)ext4_file_touch(lwext4_node_file(node), EXT4_TIME_ATIME | EXT4_TIME_RELATIME);
 }
 

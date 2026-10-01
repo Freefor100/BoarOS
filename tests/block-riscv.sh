@@ -84,9 +84,18 @@ run_case()
     fi
 }
 
-run_case legacy writeback
-run_case modern writeback
-run_case legacy writethrough
-run_case modern writethrough
+case ${BLOCK_TEST_TRANSPORT:-all} in
+    all) transports='legacy modern' ;;
+    legacy|modern) transports=$BLOCK_TEST_TRANSPORT ;;
+    *) echo 'invalid BLOCK_TEST_TRANSPORT' >&2; exit 2 ;;
+esac
+case ${BLOCK_TEST_CACHE:-all} in
+    all) caches='writeback writethrough' ;;
+    writeback|writethrough) caches=$BLOCK_TEST_CACHE ;;
+    *) echo 'invalid BLOCK_TEST_CACHE' >&2; exit 2 ;;
+esac
+for transport in $transports; do
+    for cache in $caches; do run_case "$transport" "$cache"; done
+done
 
 echo "RISC-V VirtIO block tests passed"

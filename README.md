@@ -22,7 +22,7 @@ BoarOS 是从零搭建、面向 OS Comp 能力建设的 C / 少量汇编内核�
 | 文件与事件 | fd/OFD 分离、dup/CLOEXEC、共享 offset、阻塞 pin、部分/向量/定位 I/O、pipe、poll/select/epoll；传统与 OFD 记录锁；socket OFD 与读写/就绪；mknodat 字符节点按设备号接入 null、zero、console | 无 devfs、完整 TTY；设备 mmap 未支持 |
 | 路径与 ext4 | 共享活目录项、cwd/dirfd、普通/NOREPLACE rename、可写/只读根盘、符号链接、目录枚举、稀疏文件、显式纳秒时间、真实文件系统统计、打开后删除、私有映射截断；共享挂载树可用户态挂载/卸载 proc、tmpfs 和第二 ext4 盘，通用 linkat 硬链接，含 meminfo、uptime、self、exe/cwd/root/fd、挂载信息与首批进程 stat/status 字段 | 无 EXCHANGE/WHITEOUT 或完整权限；缺少 /dev/console 节点时的初始标准 fd 没有路径链接，meminfo 已提供真实缓存/共享/脏页/可用量，完整进程字段尚未完成 |
 | 内存文件 | 统一稀疏内存后备对象、tmpfs 页/inode 配额、硬链接、共享/私有映射，musl POSIX 共享内存、SysV 共享内存和 tmpfs 工作目录的离线 GCC | 无 swap、SysV 信号量/消息队列、共享文件 futex；tmpfs 不持久化 |
-| 缓存与存储 | read/write/private fault 共用文件页、inode 脏范围与定向写回、OFD 错误观察、`fsync/fdatasync/O_SYNC/O_DSYNC`；VirtIO legacy/modern 多设备独立 IRQ/队列、每实例页缓存/worker 与 flush 屏障 | ordered journal/replay、持久 orphan；恢复承诺限于已验证块模型，已接入阈值驱动后台写回与 2%/4% 空闲水位回收，无周期清脏 |
+| 缓存与存储 | read/write/private fault 共用文件页、inode 脏范围与定向写回、OFD 错误观察、`fsync/fdatasync/O_SYNC/O_DSYNC`；VirtIO legacy/modern 多设备独立 IRQ/队列、每实例页缓存/worker、八 span 批量发布与 flush 屏障 | ordered journal/replay、durable commit 与后续 checkpoint、持久 orphan；恢复承诺限于已验证块模型，已接入阈值驱动后台写回与 2%/4% 空闲水位回收，无周期清脏 |
 | 身份与资源 | 单用户 root 的 UID/GID 查询；线程组共享并执行 NOFILE/STACK，fork 继承、exec 保留 | 无凭据变更/完整权限；fd 硬容量 1024、栈硬容量 8 MiB；其他有效 limit 返回 `ENOTSUP` |
 | 平台与网络 | RISC-V QEMU 真实根盘可配置 PID 1（默认 `/init`） 与 musl 用户态；单 hart IPv4 UDP/TCP loopback，固定 lwIP 2.2.1 raw API，AF_UNIX socketpair | 无命名 AF_UNIX 端点、真实网卡链路、LoongArch、实板或多核验证 |
 
@@ -99,4 +99,6 @@ make test-references
 - [工程原则](docs/design.md)与[贡献说明](CONTRIBUTING.md)：技术取舍、验证与提交边界。
 - [固定资料](references/README.md)与[第三方代码](docs/third-party.md)：版本、来源及许可。
 
-异步日志与组提交已启用并验收：操作私有 undo、挂载点 running group、不可变提交版本与 joinable worker 保持 ordered/log/commit/checkpoint 屏障；完整 lwext4、SQLite DELETE/WAL 恢复和双盘隔离通过。关闭观测的原版 iozone 三次启动，musl/glibc 五项写入共十格中位吞吐提升 25.29–54.00 倍，自动模式降至 16.450/18.372 秒，均达到本轮目标。原 1GiB iozone 专项得 24.8500/25.1791；它不是完整 Harness。re-readers 回退 36%–38%、热写 fdatasync 与 Linux 的差距及未分类读请求仍明确保留，见[机制与性能验收](docs/learning/cost-baseline.md#异步日志与组提交验收2026-10-01)。
+异步日志与组提交已启用并验收：操作私有 undo、挂载点 running group、不可变提交版本与 joinable worker 保持 ordered/log/commit/checkpoint 屏障；完整 lwext4、SQLite DELETE/WAL 恢复和双盘隔离通过。关闭观测的原版 iozone 三次启动，musl/glibc 五项写入共十格中位吞吐提升 25.29–54.00 倍，自动模式降至 16.450/18.372 秒，均达到该轮目标。原 1GiB iozone 专项得 24.8500/25.1791；它不是完整 Harness。重读 Max 下降36%–38%，Parent 提高12%–13%，不能由最快子进程推导整体读退化。热写同步、前台版本准备及未分类读请求仍有成本，见[机制与性能验收](docs/learning/cost-baseline.md#异步日志与组提交验收2026-10-01)。
+
+下一轮已选择完整存储流水线：有界资源复用、封口与空间等待分离、durable commit 与 checkpoint 分离及批量 I/O；当前实施中，尚无新的性能收益声明。非 I/O 的 resident/deadline 扫描、长 IRQ-off、缓存和网络方向按证据另行推进，见[路线](docs/goals.md)与[性能全景](docs/learning/cost-baseline.md#性能全景与存储流水线2026-10-01)。

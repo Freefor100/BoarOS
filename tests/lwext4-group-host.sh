@@ -16,6 +16,16 @@ for block in 1024 4096; do
     mkfs.ext4 -q -F -b "$block" -I 256 "$work/disk.img"
     "$work/probe" "$work/disk.img" seed
     cp "$work/disk.img" "$work/base.img"
+    cp "$work/base.img" "$work/pipeline.img"
+    "$work/probe" "$work/pipeline.img" group-ring
+    e2fsck -fn "$work/pipeline.img" > "$work/fsck.log" 2>&1 || { cat "$work/fsck.log" >&2; exit 1; }
+    cp "$work/base.img" "$work/pipeline.img"
+    "$work/probe" "$work/pipeline.img" group-pipeline
+    e2fsck -fn "$work/pipeline.img" > "$work/fsck.log" 2>&1 || { cat "$work/fsck.log" >&2; exit 1; }
+    cp "$work/base.img" "$work/pipeline.img"
+    "$work/probe" "$work/pipeline.img" group-commit-crash
+    "$work/probe" "$work/pipeline.img" group-recovery
+    e2fsck -fn "$work/pipeline.img" > "$work/fsck.log" 2>&1 || { cat "$work/fsck.log" >&2; exit 1; }
     "$work/probe" "$work/disk.img" group
     e2fsck -fn "$work/disk.img" > "$work/fsck.log" 2>&1 || { cat "$work/fsck.log" >&2; exit 1; }
     if [ "$block" = 4096 ]; then

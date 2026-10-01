@@ -484,7 +484,7 @@ PID1配置运行、本轮scratch及栈重建目录）。再次预览候选为零
 
 本轮从 `main@7628662` 实现完整操作隔离、挂载点异步组提交、FIFO 锁资格交接及 idle IRQ 返回修复。
 **十格写吞吐均超过 10 倍、两种 libc 自动模式均少于旧耗时的一半，性能目标达到。**
-这不表示所有性能改善：re-readers 回退 36%–38%，热写 fdatasync 明显落后于固定 Linux，
+这不表示所有指标改善：re-readers 的 Max 下降36%–38%，Parent 则提高12%–13%；热写 fdatasync 明显落后于固定 Linux，
 累计分配/清零和提交 I/O 仍是大成本。以下新证据与上文历史 C0–C6、九启动旧基线分开；
 上文“尚未实施/待验收”描述的是当时阶段，不代表当前机制。
 
@@ -548,10 +548,12 @@ pwrite writers 取 `(9,10)`；不把别的组里同名字段混入。下面按�
 
 读项 `(0,1)` 的中位为：musl readers 10889.22→23581.93（2.17×），
 glibc 17700.65→62151.33（3.51×）；分别只有 Linux 的 6.23%/16.28%。
-**re-readers 回退**：musl 65331.82→41799.64（-36.02%），
-glibc 68381.61→42229.14（-38.24%）。当前快照覆盖整条命令的写、读、重读和协调阶段，
-不能唯一分辨新后台提交竞争、读锁资格公平性或缓存状态对重读的贡献。
-这是未定位完的性能缺陷；没有用整体耗时大幅下降掩盖它，也没有追加重复启动猜因果。
+**re-readers 字段变化**：Max 的 musl 65331.82→41799.64（-36.02%），
+glibc 68381.61→42229.14（-38.24%）；Parent 的 musl 50211.21→56424.77（+12.37%），
+glibc 50339.61→56981.63（+13.19%）。Children 速率和分别下降21.23%/23.57%。
+Max 是最快子进程，Children 使用各自计时，Parent 使用实际总量及父进程计时，不能互换。
+当前快照覆盖写、读、重读和协调，不能唯一分辨后台竞争、资格公平性或缓存状态的贡献；
+保留分布变化，但修正之前将单一 Max 称为整体读回退的结论。
 
 #### 机制改变如何解释收益
 
@@ -645,13 +647,13 @@ musl 自动前台运行 9.778s、后台 .839s；窗口21.249s，所有任务 run
 未解释余量 .208s（约 .98%）。idle accounting 不等同于精确 WFI 驻留；blocked/ready跨任务区间不能加到分母。
 unknown_read 仍为73371648B，约占该窗口总磁盘字节69.2%，没有证明它全部属于文件数据或 metadata。
 
-两个优先优化候选及一项必须定位的回退，均留待人选择下一轮路线：
+以下是 S5 收口时的候选；随后已选择完整存储流水线，见末节：
 
 | 候选 | 依据与可能收益 | 正确性/复杂度/演进约束 |
 |---|---|---|
 | 复用 running version 与有界日志 credit/缓冲 | 私有小操作分配量增加；可降低 allocator/清零周转 | 仍须保留本次 undo、OOM原子性和冻结版本；可逐层验证，不能直接共享可变提交源 |
 | 将 durable commit 与后续 checkpoint 推进分离，缩短 data-only 等待 | hot fdatasync 落后8.83倍，当前每批立即checkpoint；可减少同步关键路径 | 需保持环形日志空间、版本checkpoint、quarantine和错误owner；复杂度更高，必须再次跑恢复矩阵，不能只删flush |
-| 定位 re-readers 回退后再决定读锁/后台节奏/缓存措施 | 两种libc三启动均回退36%–38%，whole-command不能独立归因 | 只需能区分读阶段的窄对照，不能重新铺C矩阵或直接改resident/deadline索引；当前无确定首因 |
+| 区分 re-readers 字段与读锁/后台节奏/缓存措施 | Max下降36%–38%而Parent提高12%–13%，whole-command不能独立归因 | 只需能区分读阶段的窄对照，不能重新铺C矩阵或直接改resident/deadline索引；当前无确定首因 |
 
 #### 验证含义、失败修正与分支交付
 
@@ -706,3 +708,117 @@ make test-riscv test-userland-riscv test-glibc-riscv test-diff-abi-riscv test-sc
 以及 `references/oscomp-autotest@d1bb3a3c4b27274e196a2648518525c1a304e339`。
 证据提交后使用仓库prune清理运行副本、日志及临时探针，保留可复用构建/工具/固定Linux缓存；
 build路径是历史运行身份，不再作为永久证据。没有实板、硬实时或完整双架构成绩。
+
+### 性能全景与存储流水线（2026-10-01）
+
+内核性能分为真实工作吞吐/程序耗时、单次和尾部延迟、CPU固定成本、并发公平性、内存/规模
+以及持久化/恢复。普通 write 的成功表示接受字节，fsync 才等待相应持久化；缓存接受、程序
+结束与最终排空分别报告。Max 为最快子进程，Children 使用各子进程的计时分母，Parent 为
+实际传输总量除以父进程计时，不能把三者互换或由 Max 推导整个内核的速度。
+
+inode 保存文件身份、大小、权限、时间及块位置；文件字节与这些元数据属于不同层。操作
+undo 隔离本次尚未成功的修改，磁盘 journal 则保护多块元数据的恢复。ordered-data 先写
+数据并屏障，再写 metadata log 并屏障，最后 commit 并屏障；commit 成功表示该版本可以
+在重启时重放。checkpoint 随后把已提交版本写回原位置，持久更新日志起点，才释放日志
+空间和禁止复用的块/inode。SQLite WAL 管数据库事务，ext4 journal 管文件系统结构，不能
+互相代替。设备 WRITE 完成不一律表示掉电安全；FLUSH 必须遵守声明的设备契约。
+
+`main@c53eadf` 的具体问题：`__ext4_trans_start` 把64操作阈值与内存/复用压力一起
+送入 checkpoint 等待；私有操作反复准备 before/after/checkpoint/log 后才合并；
+`jbd_journal_submit` 逐块同步，retire 同时推进 durable/checkpoint。旧定点 musl 窗口
+510组仅83组含ordered-data，2123 FLUSH中2040来自每组固定四个屏障。这证明固定成本
+仍高，不表示所有427个metadata组都由timestamp产生，也不表示日志和屏障应被删除。
+
+重新读取已有 `cost-consumer-followup.json` 的原输出，重读三启动中位如下；没有新增启动：
+
+| libc / 字段 | S5之前 | S5之后 | 变化 |
+|---|---:|---:|---:|
+| musl Max kB/s | 65331.82 | 41799.64 | -36.02% |
+| musl Parent kB/s | 50211.21 | 56424.77 | +12.37% |
+| musl Children kB/s | 149653.59 | 117885.30 | -21.23% |
+| glibc Max kB/s | 68381.61 | 42229.14 | -38.24% |
+| glibc Parent kB/s | 50339.61 | 56981.63 | +13.19% |
+| glibc Children kB/s | 157791.75 | 120596.66 | -23.57% |
+
+原始S5关闭观测记录位于归档 `journal_optimization.original_off`，旧记录位于
+`records` 中 platform=boaros、cost_diagnostics=0 的三个副本。Parent改善与Max/Children下降同时成立，任务分配、后台
+竞争和协调成本需分开；热读relatime无更新仍取得inode独占锁是可省的固定操作，尚无
+它占整个读耗时的独占百分比。
+
+维护者已选择完整存储流水线：S6复用组级预留/版本，保留操作undo；S7分离sealed、
+durable和checkpoint；S8同阶段最多八span发布及热读共享检查；S9集中验收。事务
+预算仍为min(4MiB,RAM/32)，含空闲池，空闲池最多min(256KiB,预算/4)。这段记录
+已确认路线，实施状态以 `docs/goals.md` 为准；没有新增收益或恢复通过声明。
+
+非I/O成本按证据另行推进：单页两次mprotect仍访问64MiB驻留的32768项，期限检查随
+无期限blocked从7增至263项，大复制存在毫秒级IRQ-off采样；ready常见操作已O(1)。
+resident/deadline索引、安全分段、usercopy/分配、缓存政策、网络兼容和SMP分别验收。
+观测构建的时间不能直接当生产延迟，尤其逐resident计时曾带来40.9倍扰动。
+
+固定依据为 `references/linux@f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的
+`fs/inode.c`、`fs/jbd2/{transaction,commit,checkpoint}.c`、`mm/mprotect.c`，
+`references/qemu@84f07211cc5b4fc6a371559bf8a5de4fb068e648`（v11.1.0），以及
+`references/riscv` 特权规范20260120。实际运行QEMU版本/哈希另记，不混作源码版本。
+
+S6 操作准备（2026-10-01）：块载荷和 owner 分开；同运行组已有块不再重复准备 after、
+checkpoint 和日志载荷，只保留私有 undo。控制记录及镜像进入有界池，池和首个版本
+pin 的 home buffer 均纳入预算。`make test-lwext4-group-host` 在 1KiB/4KiB 块中
+先用旧实现证伪热修改无新载荷分配，再验证新实现、嵌套 abort、冻结时同块新修改、
+近满盘及 WRITE/FLUSH 错误恢复；`make test-lwext4-metadata-host` 保留 legacy OOM
+和格式几何覆盖。ASan/UBSan 的 4KiB 组测试通过。该阶段没有改变提交和同步边界，
+封口等待及 durable/checkpoint 分离仍待 S7；尚无生产吞吐改善声明。
+
+S7 提交边界（2026-10-01）：65 次真实时间修改在无 I/O 进展时开新运行组；设备提交
+暂扣的宿主回调继续封口两个后续组，FIFO 满时返回 fixture 的 sealed 等待原因，
+没有把操作数阈值转成 checkpoint 等待。内部回调改用明确枚举，进度包含 accepted、
+sealed、durable、checkpoint；同步捕获的 seal 目标持续到达成，避免一次唤醒丢掉目标。
+commit 屏障后推进 durable，释放已持久 ordered-data 的镜像及日志输出载荷，metadata
+版本与日志 credit/quarantine 仍归挂载点；checkpoint 按 FIFO 以最多八组连续批次
+写 home、flush、持久更新日志起点，再回收。
+
+`make test-lwext4-group-host` 先以旧实现的 durable=checkpoint 证伪边界，现验证
+同块跨组、暂扣提交、sealed 容量、无 checkpoint 的 fsync、其后断电重放、环形日志
+绕回、近满盘、错误 owner 和最终 fsck。两种块尺寸通过；ASan/UBSan pipeline 通过。
+`make test-journal-group-riscv` 默认与 COST_DIAGNOSTICS=1 的真实 IRQ、低内存、期限、
+同步、truncate/unlink 和卸载通过。观测新增等待原因与 checkpoint 汇总耗时，继续
+由 64KiB 编译期断言约束；无直方图的计时 scope 保存总量/样本/max，cost core 验证
+其汇总值。这里是机制验收；尚未重新声明完整恢复矩阵或新 iozone 目标达成。
+
+
+S8 阶段接入（2026-10-01）：`kernel_block_write_batch`/可选设备回调最多八个 span，
+整批预检容量、指针和重叠；VirtIO 将发布与等待分开，一次逻辑调用保留未发布及已发布
+owner，FLUSH 等整个已入场调用完成。同扇区 RMW 按序，错误停止补发并排空已发布 DMA。
+`make test-block-host test-block-riscv` 及 modern/writeback 的 NBD io-sleep 窄验证
+通过，覆盖八项同时发布、外部槽释放时补发、逆序完成、错误排空、FLUSH 与 timeout/reset。
+原串行回退在同 fixture 中最大在途仅1，实际新路径达到8。
+
+冻结日志、ordered-data、checkpoint 通过 lwext4 的可选批量入口传递到该接口；每个
+阶段仍排空和屏障，重复 LBA 先完成旧版本。`make test-journal-group-riscv` 实际存储
+路径达到八个在途；热读 fixture 在另一个读者持 inode 共享锁时调用 accessed，旧独占
+路径反证失败，新共享查询完成。需要更新时间时释放共享锁、独占重查，clock 不可用
+仍为原来的无更新时间行为。测试也显式将时间设为旧值后核对立即可见的更新：序号
+标识组，组内操作可以共享序号，不能要求每次 touch 都增加组号。
+
+idle IRQ fixture 在 reader 发布前明确关闭 SIE，强制请求进入 block 后由 idle 观察
+待处理 IRQ；避免正常 IRQ 在 publish/wait 之间已收割造成测试假失败。
+`make test-journal-idle-negative-riscv` 仍在禁用 timer 的同交错中证伪缺少 idle 返回
+调度钩子。该阶段结果是机制证据，S9 前不据此宣称五倍吞吐或完整恢复通过。
+
+
+S9 验收执行器边界（2026-10-01）：glibc 2.44 五种 ELF 的实际标记/退出/资源检查通过；
+更快的 idle IRQ 运行允许 /init 输出插入未结束的 UART 启动行，现有 glibc 检查改为
+保留完整 GLIBC 标记及顺序，不要求恰好位于行首。内核 uname/ABI 没有因此改动。
+默认完整 RV64、真实 musl、1091 条 ABI、scale 已通过；栈检查1729函数，最大单帧
+2368B、trap288B、保留1024B。四组合 io-sleep 均达到8槽和0 runtime polling；WT 的
+NBD WRITE 回复之后还可能经 QEMU FUA 模拟执行 FLUSH，所以暂扣回复 fixture 在 WT
+按波次放行，WB 仍严格证明外部槽释放后可补发。详见 VirtIO 模块及 b0791b2。
+
+SQLite 切点有两项原假设随异步流水线失效：一次探针的事件上限不能保证另一次启动
+有同样数量的请求；关闭 NBD 连接会把断电变成可被运行中 guest 处理的 I/O 错误。
+旧结果中的切断后“commit confirmed”不是断电前 ACK，不能据此要求或宣称新内容
+已持久。新按序号切点先冻结执行/回复，控制器收到切点即停止 guest；如果已完成提交
+并且后续请求不再出现，则用显式控制命令丢弃易失版本，记录为提交后断电，必须恢复新
+内容。WRITE/FLUSH 故障另行记录实际注入与未到达序号；I/O 错误后的应用标记不当成
+此前成功同步的证明。三种持久化策略探针共同决定故障序号覆盖上界，未到达不冒充
+注入成功。NBD 独立检查证明控制断电保留已 flush 的 A、丢弃未 flush 的 B。
+这一处只修测试模型，生产持久化协议没有为切点或程序名建立特判；最终矩阵结果在下节汇总。

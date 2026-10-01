@@ -121,7 +121,9 @@ def fixture(directory, program, library, inputs):
 
 def check_observation(name, target, log, expected, returncode):
     raw = log.read_text(errors="replace").replace("\r\n", "\n")
-    markers = [line for line in raw.splitlines() if line.startswith("GLIBC ")]
+    # Idle IRQ dispatch can run /init while the UART boot line is unfinished.
+    # Keep whole marker lines and their order without requiring a UART prefix.
+    markers = re.findall(r"GLIBC [^\r\n]*", raw)
     if markers != expected:
         if "GLIBC MAIN" not in markers:
             stage = "loader/pre-main"

@@ -12,11 +12,16 @@ def schema():
     return [(name,unit,int(hist)) for name,unit,hist in re.findall(
         r'^X\(\w+, (\w+), (\w+), ([01])\)$', (ROOT/'include/kernel/cost.def').read_text(), re.M)]
 
+def supported_schemas():
+    current=schema()
+    pipeline={'journal_checkpoint_ticks','journal_wait_sealed','journal_wait_durable','journal_wait_checkpoint'}
+    journal=[metric for metric in current if metric[0] not in pipeline]
+    original=current[:next(i+1 for i,x in enumerate(current) if x[0]=='wake_to_run')]
+    return current,journal,original
+
 def parse(text, epoch, metrics=None):
     metrics=schema() if metrics is None else metrics
-    current=schema()
-    legacy=current[:next(i+1 for i,x in enumerate(current) if x[0]=='wake_to_run')]
-    if list(metrics) not in (current,legacy):raise ValueError('unsupported metric registry')
+    if list(metrics) not in supported_schemas():raise ValueError('unsupported metric registry')
     fields={}
     for line in text.splitlines():
         if not line or line.count('=') != 1: raise ValueError('malformed record')

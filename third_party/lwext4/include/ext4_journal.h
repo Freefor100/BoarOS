@@ -54,12 +54,20 @@ struct jbd_fs {
 	bool dirty;
 };
 
+/* 块载荷独立分配，控制记录不会把一个整块申请推到下一阶。 */
+struct jbd_image {
+	void *data;
+	struct jbd_journal *journal;
+	struct jbd_image *next;
+	bool active;
+};
+
 struct jbd_buf {
 	bool escaped;
 	bool modified;
 	bool was_dirty;
-	void *before;
-	void *after;
+	struct jbd_image *before;
+	struct jbd_image *after;
 	uint32_t jbd_lba;
 	struct ext4_block block;
 	struct jbd_trans *trans;
@@ -71,8 +79,8 @@ struct jbd_buf {
 /* File payload belongs to the transaction but is never a log record. */
 struct jbd_data {
 	struct ext4_block block;
-	void *before;
-	void *after;
+	struct jbd_image *before;
+	struct jbd_image *after;
 	bool modified, was_dirty;
 	TAILQ_ENTRY(jbd_data) node;
 };
@@ -110,7 +118,7 @@ struct jbd_trans {
 	uint64_t first_dirty_ns;
 	unsigned operations, reserved_logs;
 	bool frozen;
-	void *checkpoint_image;
+	struct jbd_image *checkpoint_image;
 	ext4_fsblk_t checkpoint_lba;
 
 	struct jbd_journal *journal;
@@ -131,9 +139,18 @@ struct jbd_journal {
 	int error;
 	struct jbd_trans *failed_trans;
 	struct jbd_trans *running, *committing;
+	struct jbd_trans *checkpointing, *checkpoint_last;
+	TAILQ_HEAD(jbd_sealed_queue, jbd_trans) sealed_queue;
+	unsigned sealed_count, checkpoint_count, log_reserved;
+	bool checkpoint_requested;
 	bool grouped;
 	size_t memory_used, memory_peak, memory_limit;
-	uint64_t accepted_sequence, durable_sequence, checkpoint_sequence;
+	size_t memory_cached;
+	struct jbd_image *image_cache;
+	void *allocation_cache[6];
+	bool cache_disabled;
+	uint64_t accepted_sequence, sealed_sequence, durable_sequence, checkpoint_sequence;
+	uint64_t seal_target;
 	ext4_fsblk_t *log_map;
 
 	uint32_t first;
@@ -203,6 +220,12 @@ void jbd_journal_group_fini(struct jbd_journal *journal);
 int jbd_journal_freeze(struct jbd_journal *journal);
 int jbd_journal_submit(struct jbd_journal *journal);
 int jbd_journal_retire(struct jbd_journal *journal, int error);
+/* Select a worker phase under the modification lock, then submit immutable
+ * owners outside it. Commit and checkpoint completion are distinct. */
+bool jbd_journal_select(struct jbd_journal *journal);
+int jbd_journal_checkpoint(struct jbd_journal *journal);
+bool jbd_journal_operation_room(struct jbd_journal *journal, size_t payloads);
+uint64_t jbd_journal_reclaim_target(struct jbd_journal *journal);
 int jbd_trans_quarantine(struct ext4_fs *fs, ext4_fsblk_t first,
 	uint32_t count, bool inode);
 bool jbd_journal_quarantined(struct ext4_fs *fs, ext4_fsblk_t address, bool inode);

@@ -60,7 +60,8 @@ try:
     else: kernel_path=args.kernel
     address = work / 'nbd.sock'
     server = subprocess.Popen([str(root / 'build/host/nbd-fault'), str(disk), str(address),
-                               '--control-stdin'], stdin=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
+                               '--control-stdin', '--arm-on-signal', '--fail-write=8'],
+                              stdin=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
     processes.append(server)
     deadline = time.monotonic() + 10
     while not address.exists():
@@ -99,6 +100,11 @@ try:
     queue_verified = False
     timeout_held = []
     reset_seen = False
+    batch_writes = []
+    batch_pending = False
+    batch_released = 0
+    batch_verified = set()
+    batch_deadline = None
     deadline = time.monotonic() + 120
     while selector.get_map() and time.monotonic() < deadline:
         for key, _ in selector.select(1):
@@ -115,6 +121,8 @@ try:
                 line, _, rest = pending[label].partition(b'\n')
                 pending[label] = bytearray(rest)
                 line = line.rstrip(b'\r')
+                if label == 'guest' and line.startswith(b'I/O sleep failed:'):
+                    raise RuntimeError(line.decode())
                 if label == 'guest' and line.startswith(b'I/O counters:'):
                     print(line.decode(), flush=True)
                 elif label == 'guest' and line == b'I/O handshake: ready':
@@ -124,7 +132,27 @@ try:
                     server.stdin.write(b'hold\n')
                 elif label == 'guest' and line == b'I/O handshake: timeout':
                     phase = 'timeout'
+                    batch_deadline = None
                     server.stdin.write(b'hold\n')
+                elif label == 'guest' and line in (b'I/O handshake: batch', b'I/O handshake: batch-partial',
+                                                   b'I/O handshake: batch-error'):
+                    phase = line.decode().split(': ')[1]
+                    batch_writes = []
+                    batch_pending = False
+                    batch_released = 0
+                    batch_deadline = time.monotonic() + 15
+                    if phase == 'batch-error': server.stdin.write(b'arm\n')
+                    server.stdin.write(b'hold\n')
+                elif label == 'guest' and line == b'I/O handshake: batch-pending':
+                    assert phase.startswith('batch')
+                    batch_pending = True
+                    if phase == 'batch-error':
+                        # An error response cannot release the batch's other
+                        # outstanding DMA or let its unpublished spans proceed.
+                        assert len(batch_writes) == 8, batch_writes
+                        server.stdin.write(b'drain\n')
+                        batch_verified.add(phase)
+                        batch_deadline = None
                 elif label == 'guest' and line == b'BoarOS: block timeout; resetting device':
                     assert phase == 'timeout' and len(timeout_held) == 8, timeout_held
                     reset_seen = True
@@ -137,6 +165,25 @@ try:
                         held.append(identity)
                     elif phase == 'timeout':
                         timeout_held.append(identity)
+                    elif phase.startswith('batch'):
+                        command = int(line.split()[1].split(b'=')[1])
+                        expected_writes = 10 if phase == 'batch-partial' else 8
+                        if command == 1:
+                            batch_writes.append(identity)
+                            assert len(batch_writes) <= expected_writes, batch_writes
+                            if phase == 'batch-error' and len(batch_writes) == 8:
+                                # Six outside writers leave two slots for the
+                                # batch. The second batch write fails first.
+                                server.stdin.write(f'release {identity}\n'.encode())
+                        elif command == 3:
+                            assert args.write_through or (batch_pending and
+                                len(batch_writes) == expected_writes and batch_released == expected_writes), batch_writes
+                            server.stdin.write(f'release {identity}\n'.encode())
+                        else:
+                            assert command == 0 and batch_pending and len(batch_writes) == expected_writes, batch_writes
+                            server.stdin.write(f'release {identity}\ndrain\n'.encode())
+                            batch_verified.add(phase)
+                            batch_deadline = None
                     else:
                         command = int(line.split()[1].split(b'=')[1])
                         queued.append((identity, command))
@@ -162,11 +209,30 @@ try:
                 if len(held) >= 2 and progress and not released:
                     server.stdin.write(f'release {held[1]}\ndrain\n'.encode())
                     released = True
+                if phase in ('batch', 'batch-partial') and batch_pending:
+                    if phase == 'batch-partial' and args.write_through:
+                        # Without NBD FUA, WRITE replies still require backend
+                        # FLUSH. Release the first wave, then each new WRITE.
+                        threshold = 8 if batch_released == 0 else batch_released + 1
+                    else:
+                        threshold = 8 if batch_released == 0 else 9 if batch_released == 2 else 10
+                    if len(batch_writes) >= threshold and batch_released < threshold:
+                        limit = threshold
+                        if phase == 'batch-partial' and not args.write_through and batch_released == 0:
+                            # In writeback, require an outside-owner refill
+                            # while all six initial batch replies remain held.
+                            limit = 2
+                        for held_id in reversed(batch_writes[batch_released:limit]):
+                            server.stdin.write(f'release {held_id}\n'.encode())
+                        batch_released = limit
+        if batch_deadline and time.monotonic() > batch_deadline:
+            raise RuntimeError(f'{phase}: batch publication or barrier stalled; writes={batch_writes}')
         if guest.poll() is not None:
             break
     guest.wait(timeout=5)
     server.wait(timeout=5)
     success = (guest.returncode == 0 and server.returncode == 0 and released and queue_verified and reset_seen and
+               batch_verified == {'batch', 'batch-partial', 'batch-error'} and
                b'BoarOS: I/O sleep tests passed' in logs['guest'] and
                b'I/O sleep failed:' not in logs['guest'])
     if success and args.cost_output:
@@ -186,7 +252,7 @@ try:
         args.cost_output.write_text(json.dumps({**input_record,'snapshots':snapshots},indent=2)+'\n')
     if not success:
         raise RuntimeError(logs['guest'][-4000:].decode(errors='replace'))
-    print(f'BoarOS: I/O sleep tests passed ({args.transport}, {'writethrough' if args.write_through else 'writeback'}); two cold reads held, CPU/cache progressed, reverse completion and FLUSH barrier and timeout/reset verified')
+    print(f'BoarOS: I/O sleep tests passed ({args.transport}, {'writethrough' if args.write_through else 'writeback'}); two cold reads held, CPU/cache progressed, eight-span batch and partial-slot refill and error drain and FLUSH barrier and timeout/reset verified')
 finally:
     for process in processes:
         if process.poll() is None:

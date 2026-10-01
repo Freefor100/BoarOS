@@ -199,7 +199,9 @@ void kernel_cost_leave(struct kernel_cost_scope *scope)
     }
     if (!cost.active || !tag.epoch || tag.epoch != cost.epoch) return;
     uint64_t start = scope->start < cost.start ? cost.start : scope->start;
-    kernel_cost_sample_tag(tag, scope->metric, kernel_cost_clock() - start);
+    uint64_t elapsed = kernel_cost_clock() - start;
+    if (histograms[scope->metric]) kernel_cost_sample_tag(tag, scope->metric, elapsed);
+    else kernel_cost_add_tag(tag, scope->metric, elapsed);
     if (!cost.inflight) __builtin_trap();
     cost.inflight--;
     scope->tag.epoch = 0;

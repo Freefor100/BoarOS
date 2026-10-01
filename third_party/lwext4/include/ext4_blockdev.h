@@ -46,6 +46,13 @@ extern "C" {
 #include <stdbool.h>
 #include <stdint.h>
 
+#define EXT4_BLOCK_BATCH_MAX 8U
+struct ext4_block_span {
+	const void *data;
+	uint64_t block;
+	uint32_t count;
+};
+
 struct ext4_blockdev_iface {
 	/**@brief   Open device function
 	 * @param   bdev block device.*/
@@ -65,6 +72,9 @@ struct ext4_blockdev_iface {
 	 * @param   blk_cnt block count*/
 	int (*bwrite)(struct ext4_blockdev *bdev, const void *buf,
 		      uint64_t blk_id, uint32_t blk_cnt);
+	/* Physical spans; borrows every payload until all published I/O stops. */
+	int (*bwrite_batch)(struct ext4_blockdev *bdev,
+		const struct ext4_block_span *spans, unsigned count);
 
 	/**@brief   Close device function.
 	 * @param   bdev block device.*/
@@ -165,6 +175,9 @@ int ext4_block_init(struct ext4_blockdev *bdev);
 
 /** Device persistence barrier; ENOTSUP if the backend has no contract. */
 int ext4_blockdev_flush(struct ext4_blockdev *bdev);
+/* Logical block spans, at most eight non-overlapping ranges. */
+int ext4_blocks_set_batch(struct ext4_blockdev *bdev,
+	const struct ext4_block_span *spans, unsigned count);
 
 /**@brief   Binds a bcache to block device.
  * @param   bdev block device descriptor

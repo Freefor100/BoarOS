@@ -137,23 +137,34 @@ def nbd_boot(args, image, directory, name, *, options=(), marker=None,
                 wait_for_marker(guest, guest_log, marker)
                 guest.kill()
                 guest.wait(timeout=5)
-            elif cut:
-                backend.wait(timeout=60)
-                guest.kill()
-                guest.wait(timeout=5)
-            elif gate and expect_failure:
+            elif cut or (gate and expect_failure):
                 start = time.monotonic()
-                while time.monotonic() - start < 60:
-                    if guest.poll() is not None:
-                        break
-                    if ("BoarOS: SQLite commit confirmed" in
-                            guest_log.read_text(errors="replace")):
+                quiet_since = start
+                previous = None
+                while backend.poll() is None and guest.poll() is None:
+                    text = backend_log.read_text(errors="replace")
+                    if cut and re.search(r"(?m)^cut=", text):
                         guest.kill()
                         guest.wait(timeout=5)
                         break
+                    if text != previous:
+                        previous, quiet_since = text, time.monotonic()
+                    committed = "BoarOS: SQLite commit confirmed" in guest_log.read_text(errors="replace")
+                    faulted = "result=5" in text
+                    # Commit can return before checkpoint, and group merging
+                    # changes later event ordinals. An unreachable ordinal is
+                    # a distinct post-commit power cut, never a claimed fault.
+                    if (committed or faulted) and time.monotonic() - quiet_since >= 0.2:
+                        backend.stdin.write(b"cut\n")
+                        backend.stdin.flush()
+                        backend.wait(timeout=10)
+                        break
+                    if time.monotonic() - start >= 60:
+                        raise AssertionError("mutation neither progressed nor reached commit/fault")
                     time.sleep(0.02)
-                else:
-                    raise AssertionError("faulted guest neither exited nor committed")
+                if guest.poll() is None:
+                    guest.kill()
+                guest.wait(timeout=5)
             else:
                 code = guest.wait(timeout=90)
                 if code:
@@ -176,7 +187,9 @@ def nbd_boot(args, image, directory, name, *, options=(), marker=None,
         assert "cut=" in backend_text, backend_text[-3000:]
     elif marker is None:
         if expect_failure:
-            assert "result=5" in backend_text, backend_text[-3000:]
+            assert "result=5" in backend_text or (
+                "BoarOS: SQLite commit confirmed" in guest_text and
+                "cause=control" in backend_text), backend_text[-3000:]
         else:
             assert "PID 1 exited status=0x2a" in guest_text, guest_text[-3000:]
     return guest_text, backend_text
@@ -337,12 +350,6 @@ def main():
             flushes = event_log.count("type=FLUSH")
             print(f"small transaction: {events} events ({writes} writes, "
                   f"{flushes} flushes)", flush=True)
-            if args.matrix == "full":
-                write_faults = range(1, writes + 1)
-                flush_faults = range(1, flushes + 1)
-            else:
-                write_faults = sorted({1, max(1, writes // 2), writes})
-                flush_faults = sorted({1, max(1, flushes // 2), flushes})
             # 同一持久化策略决定稳定盘初态，切点上限不能借用默认探针。
             for policy in ("none", "odd", "reverse"):
                 policy_probe = directory / f"small-probe-{policy}.img"
@@ -357,6 +364,8 @@ def main():
                 policy_log = policy_log.split("armed=1\n", 1)[1]
                 policy_events = (policy_log.count("type=WRITE") +
                                  policy_log.count("type=FLUSH"))
+                writes = max(writes, policy_log.count("type=WRITE"))
+                flushes = max(flushes, policy_log.count("type=FLUSH"))
                 print(f"{policy} cut transaction: {policy_events} events",
                       flush=True)
                 if args.matrix == "full":
@@ -370,14 +379,23 @@ def main():
                     image = directory / f"{name}.img"
                     shutil.copyfile(small, image)
                     set_control(image, small_phase, "G")
-                    nbd_boot(args, image, directory, name, cut=True,
+                    guest, _ = nbd_boot(args, image, directory, name, cut=True,
                              gate=True,
                              options=(f"--cut-after={position}",
                                       f"--persist={policy}",
                                       "--arm-on-signal"))
-                    recover_twice(args, image, directory, small_phase, name)
+                    committed = "BoarOS: SQLite commit confirmed" in guest
+                    recover_twice(args, image, directory, small_phase, name,
+                                  "new" if committed else None)
                     image.unlink()
-                    print(name, flush=True)
+                    print(name + (": post-commit" if committed else ": in-flight"), flush=True)
+            if args.matrix == "full":
+                write_faults = range(1, writes + 1)
+                flush_faults = range(1, flushes + 1)
+            else:
+                write_faults = sorted({1, max(1, writes // 2), writes})
+                flush_faults = sorted({1, max(1, flushes // 2), flushes})
+            print(f"fault envelope: {writes} WRITE/{flushes} FLUSH ordinals", flush=True)
             for kind, fault_positions in (("write", write_faults),
                                           ("flush", flush_faults)):
                 for position in fault_positions:
@@ -385,13 +403,16 @@ def main():
                     image = directory / f"{name}.img"
                     shutil.copyfile(small, image)
                     set_control(image, small_phase, "G")
-                    nbd_boot(args, image, directory, name,
+                    guest, events = nbd_boot(args, image, directory, name,
                              options=(f"--fail-{kind}={position}",
                                       "--arm-on-signal"),
                              gate=True, expect_failure=True)
-                    recover_twice(args, image, directory, small_phase, name)
+                    committed = "BoarOS: SQLite commit confirmed" in guest
+                    recover_twice(args, image, directory, small_phase, name,
+                                  "new" if committed and "result=5" not in events else None)
                     image.unlink()
-                    print(name, flush=True)
+                    print(name + (": injected" if "result=5" in events else
+                          ": ordinal not reached, post-commit cut"), flush=True)
         print("SQLite EXTRA/FULL, hot journal, confirmed commit recovery passed")
     except Exception:
         print(f"SQLite recovery artifacts retained: {directory}", flush=True)
