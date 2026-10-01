@@ -1,5 +1,6 @@
 #include <arch/riscv/virt_uart.h>
 #include <kernel/console.h>
+#include <kernel/log.h>
 
 #define UART_THR 0UL
 #define UART_RBR 0UL
@@ -19,12 +20,17 @@ void virt_uart_use_kernel_mapping(void)
     uart_mmio_base = VIRT_UART_MMIO_KERNEL_BASE;
 }
 
-void virt_uart_putc(char character)
+static void uart_raw_putc(char character)
 {
     while ((*uart_register(UART_LSR) & UART_LSR_THR_EMPTY) == 0U) {
     }
 
     *uart_register(UART_THR) = (unsigned char)character;
+}
+
+void virt_uart_putc(char character)
+{
+    if (kernel_log_putc(6, character)) uart_raw_putc(character);
 }
 
 void virt_uart_puts(const char *text)
@@ -66,5 +72,5 @@ char virt_uart_getc(void)
 
 void kernel_console_putc(char character)
 {
-    virt_uart_putc(character);
+    uart_raw_putc(character);
 }

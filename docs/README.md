@@ -19,7 +19,7 @@
 | 子系统 | 模块 |
 |---|---|
 | 启动 / 平台 | [启动](modules/riscv-boot.md)、[DTB](modules/dtb-memory.md)、[根启动](modules/riscv-root-boot.md) |
-| Trap / 执行 | [Trap](modules/riscv-trap.md)、[浮点](modules/riscv-fpu.md)、[syscall](modules/kernel-syscall.md) |
+| Trap / 执行 | [Trap](modules/riscv-trap.md)、[浮点](modules/riscv-fpu.md)、[syscall](modules/kernel-syscall.md)、[内核日志](modules/kernel-log.md) |
 | 内存 | [物理页](modules/physical-pages.md)、[堆](modules/kernel-heap.md)、[Sv39](modules/riscv-sv39.md)、[MM](modules/kernel-mm.md)、[VMA](modules/kernel-vma.md)、[uaccess](modules/kernel-uaccess.md) |
 | 用户映像 | [ELF](modules/user-elf.md)、[exec](modules/kernel-exec.md) |
 | 任务 / 时间 | [调度与生命周期](modules/kernel-scheduler.md)、[信号](modules/kernel-signal.md)、[时钟与睡眠](modules/kernel-time.md)、[硬件 timer](modules/riscv-timer.md)、[VirtIO RNG](modules/riscv-virtio-rng.md) |

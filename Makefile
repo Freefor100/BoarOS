@@ -180,6 +180,7 @@ C_SOURCES := \
 	kernel/physical_page.c \
 	kernel/read_source.c \
 	kernel/random.c \
+	kernel/log.c \
 	kernel/blake2s.c \
 	kernel/sched/core.c \
 	kernel/sched/policy.c \
@@ -202,6 +203,7 @@ C_SOURCES := \
 	kernel/syscall/shm.c \
 	kernel/syscall/time.c \
 	kernel/syscall/random.c \
+	kernel/syscall/log.c \
 	kernel/syscall/sched.c \
 	arch/riscv/signal.c \
 	kernel/tick.c \
@@ -271,6 +273,7 @@ TEST_RUNTIME_C_SOURCES := \
 	kernel/physical_page.c \
 	kernel/read_source.c \
 	kernel/random.c \
+	kernel/log.c \
 	kernel/blake2s.c \
 	kernel/sched/core.c \
 	kernel/sched/policy.c \
@@ -293,6 +296,7 @@ TEST_RUNTIME_C_SOURCES := \
 	kernel/syscall/shm.c \
 	kernel/syscall/time.c \
 	kernel/syscall/random.c \
+	kernel/syscall/log.c \
 	kernel/syscall/sched.c \
 	arch/riscv/signal.c \
 	kernel/tick.c \
@@ -1593,3 +1597,9 @@ test-cost-host:
 test-cost-riscv: test-cost-host
 	$(MAKE) COST_DIAGNOSTICS=1 all
 	python3 -B tests/cost-riscv.py --kernel build/cost/kernel-rv --qemu $(QEMU_RISCV64) --case $(COST_CASE)
+
+.PHONY: test-log-host
+test-log-host:
+	@mkdir -p build/host
+	cc -D_GNU_SOURCE -std=c11 -Wall -Wextra -Werror -Itests/host/random -idirafter include tests/host/kernel_log.c kernel/log.c -o build/host/log-test
+	build/host/log-test
