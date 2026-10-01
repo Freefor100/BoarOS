@@ -1,3 +1,4 @@
+#define COST_END_WAIT_ASYNC 1
 #include "common.h"
 #include <signal.h>
 #include <sched.h>

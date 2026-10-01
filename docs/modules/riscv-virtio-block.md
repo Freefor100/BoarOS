@@ -57,3 +57,5 @@ writethrough 的响应波次依据固定 QEMU v11.1.0（`references/qemu`，comm
 RT 组合进展由 `make test-multi-disk-rt-riscv`（调用 `tests/multi-disk-io-riscv.py --rt-load`）单独验证：默认全局 RT 预算下，持续 FIFO/RR 子任务存在时，普通父任务与两台真实 NBD 的 READ/WRITE/FLUSH 均可完成，随后检查子任务、动态挂载、根页/堆/栈回收和两盘持久字节。该模式使用同一个 `tests/userland/multi_disk_io.c` 的显式 `/rt-load` fixture 分支，原错误隔离模式不变；详见[可睡眠存储](../learning/sleepable-storage.md#默认-rt-带宽下的存储进展)。
 
 成本诊断的请求带提交时标量 epoch/lane，正常 IRQ 和 timeout/reset 均按该身份记账；registry 磁盘归属与 unknown 字节见[成本观测](kernel-cost.md)，现有设备统计保持原契约。
+
+2026-10-01 最终四组合 io-sleep 与真实日志/消费者路径均达到最大八个已发布请求，运行期轮询为零；这不表示串行读或阶段间 FLUSH 也能保持八槽并行。消费者定点诊断的 ready/resume 关联只覆盖实际唤醒 owner 的请求，batch 会合并唤醒，不能把这一子集与旧所有请求样本直接比较平均延迟。存储流水线的恢复通过、Parent 收益未达标与完整输入身份见[最终验收](../learning/cost-baseline.md#s9-存储流水线验收2026-10-01)。
