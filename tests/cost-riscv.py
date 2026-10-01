@@ -35,12 +35,14 @@ def main():
     parser.add_argument('--consumer-commands',default='all',help='all or comma-separated libc:index (0..7); partial selection is targeted attribution')
     parser.add_argument('--consumer-sync',action='store_true',help='append four 128-write hot 4KiB synchronous probes in the same boot')
     parser.add_argument('--consumer-sync-only',action='store_true',help='controlled synchronous reference, no original iozone commands')
+    parser.add_argument('--coordinator-elf',type=Path,help='reuse a previously frozen consumer coordinator for matched ON/OFF comparisons')
     args=parser.parse_args()
     names=[f'consumer-{libc}-{i}' for libc in ('musl','glibc') for i in range(8)]
     selected=names if args.consumer_commands=='all' else [f'consumer-{v.replace(":","-")}' for v in args.consumer_commands.split(',')]
     if args.consumer_sync_only:args.consumer_sync=True;selected=[]
     if (not selected and not args.consumer_sync_only) or len(set(selected))!=len(selected) or not set(selected)<=set(names):parser.error('invalid consumer command selection')
     if args.consumer_sync and args.case!='consumer':parser.error('synchronous probes require --case consumer')
+    if args.coordinator_elf and (args.case!='consumer' or args.consumer_sync):parser.error('frozen coordinator requires original consumer commands without new probes')
     if args.consumer_commands!='all' and args.case!='consumer':parser.error('consumer selection requires --case consumer')
     if not 1000<=args.consumer_timeout_ms<=3600000:parser.error('consumer timeout must be 1000..3600000 ms')
     linux_identity=None
@@ -79,7 +81,8 @@ def main():
     try:
         for case in cases:
             program=work/(case+'.elf')
-            run([str(compiler),'-fno-link-libatomic','-static','-O2','-pthread','-Wall','-Wextra','-Werror',
+            if args.coordinator_elf:shutil.copyfile(args.coordinator_elf,program)
+            else:run([str(compiler),'-fno-link-libatomic','-static','-O2','-pthread','-Wall','-Wextra','-Werror',
                 str(ROOT/'tests/workloads/cost'/f'{case}.c'),'-o',str(program)])
             for replica in range(args.replicas):
                 folder=work/f'{case}-{replica}'; folder.mkdir()
