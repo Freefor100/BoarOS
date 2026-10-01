@@ -53,8 +53,12 @@ def busybox_manifest(build, directory, inputs):
     commands_data = (directory / 'busybox_cmd.txt').read_bytes()
     if not commands_data.endswith(b'\n'):
         raise ValueError('upstream command list lacks final newline; review shell read semantics')
+    content_script=HERE / 'environment-check.sh'
+    files.append({'source':str(content_script),'destination':'/environment-check.sh','sha256':sha(content_script),'mode':'755'})
+    cases.append({'id':'busybox.environment','argv':['/busybox','sh','/environment-check.sh'],'expected_exit':0})
     cases.append({'id': 'busybox.official',
         'argv': ['/busybox', 'sh', '/busybox_testcode.sh'], 'expected_exit': 0,
+        'comparison': 'contract',  # Real clock, logs, PID and filesystem capacity vary by guest.
         'timeout': 90, 'output_contract': {'kind': 'busybox-script',
             'expected_records': len(commands_data.splitlines()),
             'commands': [re.sub(r'\\(.)', r'\1', line.strip(' \t'))

@@ -18,7 +18,7 @@
 | A3 并发读进展 | [ ] 原四进程(0,1)配握手开始、各8MiB/1KiB请求的同/不同inode固定工作量；区分启动、ready、锁/设备等待及停止规则，修复有因果证据的局部错误 |
 | B1 内核日志（P5c） | [x] 16KiB真实日志环与完整klogctl 0–10，RV64 syscall116；内核/用户控制台分离，阻塞/游标/清空/fault/权限和实际级别控制 |
 | B2 RTC和根盘（P5c/P1f） | [x] Goldfish RTC_RD_TIME、10:135节点及OFD独占生命周期；实际根设备来源和镜像节点，原hwclock/df真实内容 |
-| B3 程序分类（P0d） | [ ] 环境、辅助程序、未实现/未到达、预算、程序错误与性能回退分列；保留原脚本/ELF/argv和wait status，原BusyBox55/55及内容验收 |
+| B3 程序分类（P0d） | [x] 环境、辅助程序、未实现/未到达、预算、程序错误与性能回退分列；保留原脚本/ELF/argv和wait status，原BusyBox55/55及内容验收 |
 
 A1完成后运行相关lwext4、真实加载等待/回收、四组合io-sleep及SQLite DELETE/WAL
 正常/重启。进一步触及事务、写回或队列顺序才升级完整故障恢复矩阵和双盘隔离。
@@ -73,7 +73,7 @@ S9最终默认内核SHA为`75682369a7aed056d0f85f70413d8c31d577322707e57a0bd2d2d
 
 | 问题 | 当前边界/归属 |
 |---|---|
-| 原BusyBox53/55 | dmesg缺klogctl、hwclock缺RTC字符接口；df跳过来源rootfs的根盘，分别归B1/B2 |
+| 原BusyBox55/55 | 本轮日志/RTC/根设备补全；原脚本及独立内容检查通过。完整228项没有在本轮重跑 |
 | iperf/netperf | 原iperf越过随机/affinity后connect ECONNRESET；netperf未有独立完整结论，归下一阶段N2 |
 | LTP/helper | abort01到chown ENOSYS；cgroup_fj_proc无参数在Linux/BoarOS都等待，不是调度死锁；helper身份由固定上游调用规则确认 |
 | 用户内存/信号 | mremap、按操作madvise、mlock、sigaltstack、实时信号队列、共享文件/PI futex待真实应用需求触发 |
