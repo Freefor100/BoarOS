@@ -135,10 +135,11 @@ void kernel_main(unsigned long hart,const void *dtb)
         riscv_interrupt_restore(irq|RISCV_SSTATUS_SIE);
     }
 #if BOAROS_COST_DIAGNOSTICS
-    uint64_t groups, data_writes;
+    uint64_t groups, data_writes, resumes;
     check(kernel_cost_end(1,0)==0 &&
         kernel_cost_read(1,COST_JOURNAL_GROUPS,&groups)==0 && groups>0 &&
-        kernel_cost_read(1,COST_DEVICE_OTHER_DATA_WRITE,&data_writes)==0 && data_writes>0,41);
+        kernel_cost_read(1,COST_DEVICE_OTHER_DATA_WRITE,&data_writes)==0 && data_writes>0 &&
+        kernel_cost_read(1,COST_IO_COMPLETE_TO_RESUME,&resumes)==0 && resumes>0,41);
 #endif
     virt_uart_puts("BoarOS: journal group tests passed\n");sbi_shutdown();
 }

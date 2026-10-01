@@ -243,3 +243,5 @@ proc mounts 保留用户给出的磁盘来源名，并正确标识 tmpfs。
 当前成本及可重建配置见[成本基线](../learning/cost-baseline.md)。
 
 `make test-journal-group-riscv` 在实际 IRQ 块 I/O 下验证 128 页内容、预算、100ms 期限、full/data 同步、truncate、unlink-but-open、最终卸载；观测构建亦检查后台来源明确的数据请求。`make test-journal-idle-negative-riscv` 禁用公共 idle 返回钩子，验证无 timer 的同一设备 IRQ 无法在 enable-to-wfi 返回边界运行等待者；正常构建该边界通过。`orphan_file` 的 slot 更新必须通过 `ext4_trans_block_get` 在修改前保留 undo/version，不能直接 get 后补记 dirty。
+
+异步准备事务会改变故障执行器握手后的 I/O 前缀，SQLite 恢复 fixture 在 `mutation armed` 前同步根目录，排空 loader/control/SQLite 准备元数据，再开始本次数据库变更的故障计数。页缓存短写/重脏注入拦截实际 `ext4_fpwrite` 入口，避免链接器无法拦截同 translation unit 的内部调用。

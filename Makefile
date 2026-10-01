@@ -755,7 +755,7 @@ $(FILES_PARTIAL_WRITE_TEST_KERNEL_RV): \
 		-Wl,--wrap=kernel_heap_allocate_zeroed \
 		-Wl,--wrap=physical_page_allocate \
 		-Wl,--wrap=riscv_sv39_current_satp \
-		-Wl,--wrap=ext4_fwrite \
+		-Wl,--wrap=ext4_fpwrite \
 		-Wl,--wrap=ext4_ftruncate \
 		-Wl,-Map,$(BUILD_DIR)/tests/kernel-files-partial-write-rv.map \
 		-o $@ $(FILES_PARTIAL_WRITE_TEST_OBJECTS)
