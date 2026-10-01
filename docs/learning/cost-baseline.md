@@ -1056,3 +1056,72 @@ make test-riscv test-userland-riscv test-glibc-riscv test-diff-abi-riscv test-sc
 核对，提交后单向merge到compat，不反向引入比赛profile。后续resident/deadline/IRQ-off、
 usercopy、缓存/网络、SMP方向保存在唯一 `goals.md`；新的批次政策、timestamp接入和读
 分布修复须调查后另选路线，不将候选或未测收益写成实现。无push、发布或阶段转换。
+
+### 引入历史与端到端优化视角（2026-10-01）
+
+这里的日志是文件系统 journal：记录元数据事务的恢复依据。串口/printk 是另一种诊断
+输出；本轮性能成绩关闭新增成本诊断，日志提交不会向串口打印每个块。持久化表示指定
+结果已越过声明的易失缓存边界，能在该故障模型的非正常停止后恢复；它不是保存在普通
+RAM，也不是每次write都必须等待。普通write接受、文件系统结构恢复、应用事务完整、
+显式fsync持久化是不同承诺。ordered journal保护元数据组合；没有同步的应用内容可
+丢失，不能从journal存在推导整个应用事务原子性。
+
+正常QEMU性能运行不会反复断电。恢复测试才主动冻结执行/回复并停止guest、丢弃未
+flush的易失版本。拔电、硬复位、内核崩溃都可能导致来不及排空的非正常停止；仅一个
+用户进程退出并不意味着整个机器断电。杀掉QEMU进程也不自动清空宿主页缓存，因此
+不能拿“重启后恰好还能读到”替代持久化证明。普通镜像路径还经过QEMU、宿主页缓存
+和物理设备；固定QEMU的writeback文档明确允许写完成时数据仍在宿主页缓存，guest
+必须正确flush。故障fixture用显式stable/volatile owner建模，不是评估掉电发生概率。
+
+首次机制接入通过Git pickaxe及父后源码核对如下。它们解释代码来源，不是逐提交性能
+差额：没有在本轮重跑所有历史版本，也不把某一提交的全部变化都归到该机制。
+
+| 提交 / 日期 | 当时的机制 | 对成本的影响与当前状态 |
+|---|---|---|
+| `a14ff9d` / 2026-09-16 | live mtime/ctime、relatime及write前modified；touch调用事务start/stop | 时间语义是必要能力；journal启用后，此路径成为小写触发metadata事务的重要来源 |
+| `cf01b11` / 2026-09-22 | 启用ordered journal、真实FLUSH、orphan恢复；外层finish直接commit事务 | 是逐操作同步日志昂贵路径的关键启用点。恢复能力增加，批量/异步尚未接入；后续S0–S5已解除逐次提交 |
+| `9081a11` / 2026-09-28 | task-owned可睡眠RWlock，释放时wake_all | 支持真实睡眠并发，但争用会广播后重阻塞；`90c4c9a`已改FIFO预留交接并修idle IRQ返回 |
+| `8589145`、`08debbd` / 2026-10-01 | 私有操作版本合并、mount worker；64操作阈值与checkpoint等待合并，durable/checkpoint同处推进 | 大幅减少逐写持久化，但留下重复准备和过保守等待；`991e01c`、`29ccd35`已修 |
+| `29ccd35`、`34645e2` / 2026-10-01 | 分离commit/checkpoint、阶段批量接入；worker在sealed为空时立即checkpoint | 新等待边界正确；单个同步写者仍常形成128组及约640个FLUSH，尚未获得明显端到端同步改善 |
+
+时间路径的源码语义成立，不意味着所有510组都能归为timestamp；unknown读仍须保持
+unknown。保留日志能力与减少过早/过频持久化并不矛盾：优化对象是触发粒度、重复准备、
+版本所有权、排队和完成边界。Linux同样有journal，BoarOS当前23–89倍Parent写差距
+不能只归因于“Linux没有恢复功能”。
+
+当前CPU调度为OTHER的100Hz轮转（普通周期约10ms）；FIFO/RR为1–99实时优先级，
+RR按实际CPU时间扣100ms片，默认RT全局预算每1s最多950ms。journal worker属于OTHER。
+ready常见操作O(1)，deadline仍扫描blocked。高优先级或idle唤醒标记need_resched；
+同优先级OTHER唤醒通常仍依赖轮转/安全切换点。普通持锁S-mode没有任意抢占，长
+IRQ-off也会推迟完成观察。应分清CPU策略、锁资格交接与设备请求发布三种决定。
+调度优化可能缩短ready等待、改善公平性及流水线空档，但不会让缺少的syscall自行
+出现，也不能消去规定的持久化屏障。是否改善I/O必须看同请求的完成→ready→运行链。
+
+程序效率的最终评价以同语义、同工作量下的完成时间、资源及最慢任务进展为准。局部
+成本下降不等于同倍程序加速：若30%的串行关键路径改善10倍，其他不变，总加速只有
+`1/(0.7+0.3/10)=1.37`。本轮分配减少约91%、自动耗时减少约22%–23%正说明要同时
+观察局部与整体；恢复验证限制比较时承担的正确性承诺，不代替性能收益。
+
+| 观测角度 | 要记录的量 | 能区分的原因 / 后续使用边界 |
+|---|---|---|
+| 端到端与阶段 | 启动/加载、实际工作、等待、程序返回、durable收尾、完整checkpoint排空 | 找真实关键路径；完整checkpoint计时是本轮缺项，不能用fsync替代 |
+| CPU有效工作 | user/kernel/worker运行、复制/清零/分配、热点调用与每字节成本 | CPU满可能是计算、轮询或重复工作；宿主QEMU CPU占用不等于guest应用CPU占用 |
+| 阻塞与就绪 | 锁、设备、日志credit、sealed、checkpoint、回收等待及ready到run | blocked与ready必须分开；跨任务等待可重叠，不直接相加为程序耗时 |
+| 设备与请求 | 请求数/尺寸/来源、FLUSH、实际深度分布、无在途时段及完成关联 | 最大深度8不表示长期并行；submit→观察含IRQ延迟，不直接当纯设备服务时间 |
+| 并发与依赖 | 同/不同inode、每任务字节/进展、锁资格与持有、worker重叠 | 识别本可并行的串行边界及队头阻塞，避免平均/Max掩盖最慢任务 |
+| 缓存与内存 | 冷/热命中、缺页、扫描、实际峰值、回收进展、脏数据债务 | 区分有效复用、过大工作集和只把工作延期；累计分配量不是峰值 |
+| 工作量与算法 | 每有用字节的解析/探测/分配/扫描，以及随无关对象增长的访问数 | 找消除工作的机会；resident/deadline已有规模证据，尚无全系统独占占比 |
+| 异步流水线 | 接受与完成速率、各队列驻留、背压、完整排空及错误传播 | 前台返回更快须配合有界积压与最终完成；只搬到后台不自动提升总处理能力 |
+
+上述表是分析方法，未宣称全部观测已实现。现有聚合、任务运行/等待、rank/设备指标及
+部分I/O关联可以先用于一条代表工作流；缺少调用热点、完整排空和逐任务阶段关联。
+下一次补证据应选择能区分候选机制的少量请求/事件，受现有预算及开销约束，避免再铺
+全矩阵。跨guest CSR与宿主时钟的事件只能在建立关联/校准后比较，不能直接相减。
+结构选择仍维护在goals，不借背景说明默许新调度策略、缓存政策或持久化语义变化。
+
+固定依据：`references/linux@f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的
+`Documentation/filesystems/ext4/journal.rst`、`fs/ext4/fsync.c`；
+`references/qemu@84f07211cc5b4fc6a371559bf8a5de4fb068e648`（v11.1.0）的
+`qemu-options.hx` writeback/flush说明及 `hw/block/virtio-blk.c`。
+当前BoarOS策略与安全边界见 `kernel/sched/{policy,runqueue,scheduling}.c`、
+`docs/modules/kernel-scheduler.md`，故障模型见 `tests/host/{nbd_fault,block_fault}.c`。
