@@ -172,6 +172,7 @@ static void initialize_devices(void)
 
 const struct kernel_char_device *kernel_char_device_lookup(uint64_t rdev)
 {
+    if (rdev == kernel_rtc_device.rdev) return &kernel_rtc_device;
     initialize_devices();
     for (size_t i = 0U; i < sizeof(devices) / sizeof(devices[0]); i++)
         if (devices[i].rdev == rdev) return &devices[i];

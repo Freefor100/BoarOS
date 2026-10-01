@@ -12,6 +12,7 @@ GOOD = 'ABI BEGIN 1\nABI result 0 0 3 1 0 616263\nABI END 1\n'
 
 class ProtocolTests(unittest.TestCase):
     def test_only_boot_noise_and_crlf_are_ignored(self):
+        self.assertEqual(normalize('BoarOS: frequency=0x' + GOOD.replace('ABI result', '989680ABI result'), ['result']), normalize(GOOD, ['result']))
         self.assertEqual(normalize('boot\r\n' + GOOD.replace('\n', '\r\n'), ['result']), normalize(GOOD, ['result']))
 
     def test_missing_duplicate_and_malformed_records_fail(self):

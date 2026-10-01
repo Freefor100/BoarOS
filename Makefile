@@ -160,6 +160,7 @@ C_SOURCES := \
 	fs/files/socket.c \
 	fs/fs_context.c \
 	fs/char_device.c \
+	fs/rtc_device.c \
 	fs/open_file.c \
 	fs/pipe.c \
 	fs/record_lock.c \
@@ -255,6 +256,7 @@ TEST_RUNTIME_C_SOURCES := \
 	fs/files/socket.c \
 	fs/fs_context.c \
 	fs/char_device.c \
+	fs/rtc_device.c \
 	fs/lwext4_port.c \
 	fs/open_file.c \
 	fs/pipe.c \
@@ -1603,3 +1605,13 @@ test-log-host:
 	@mkdir -p build/host
 	cc -D_GNU_SOURCE -std=c11 -Wall -Wextra -Werror -Itests/host/random -idirafter include tests/host/kernel_log.c kernel/log.c -o build/host/log-test
 	build/host/log-test
+
+.PHONY: test-environment-riscv
+test-environment-riscv: $(KERNEL_RV)
+	KERNEL_RV=$(KERNEL_RV) QEMU_RISCV64=$(QEMU_RISCV64) sh tests/environment-riscv.sh
+
+.PHONY: test-rtc-host
+test-rtc-host:
+	@mkdir -p build/host
+	cc -std=c11 -Wall -Wextra -Werror -Itests/host/random -idirafter include tests/host/rtc_device.c fs/rtc_device.c -o build/host/rtc-test
+	build/host/rtc-test

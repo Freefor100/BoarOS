@@ -490,6 +490,8 @@ enum kernel_open_file_kind kernel_open_file_kind(
         return KERNEL_OPEN_FILE_KIND_RANDOM;
     case KERNEL_OPEN_FILE_KIND_URANDOM:
         return KERNEL_OPEN_FILE_KIND_URANDOM;
+    case KERNEL_OPEN_FILE_KIND_RTC:
+        return KERNEL_OPEN_FILE_KIND_RTC;
     default:
         return KERNEL_OPEN_FILE_KIND_REGULAR;
     }
@@ -546,6 +548,10 @@ enum kernel_open_file_status kernel_open_file_release(
     if (file->references == 1U) {
         release_record_locks(file);
         file->references = 0U;
+    }
+    if (file->device_opened) {
+        file->device_opened = 0;
+        file->device->release();
     }
     if (file->ep_items != 0) {
         kernel_epoll_notify_file_release(file);
@@ -612,7 +618,13 @@ enum kernel_open_file_status kernel_open_file_detach(
         file->references == 1U) {
         return kernel_open_file_release(owner);
     }
-    if (file->references == 1U) release_record_locks(file);
+    if (file->references == 1U) {
+        release_record_locks(file);
+        if (file->device_opened) {
+            file->device_opened = 0;
+            file->device->release();
+        }
+    }
     file->references--;
     if (file->references != 0U) {
         *owner = 0;

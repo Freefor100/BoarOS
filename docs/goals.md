@@ -17,7 +17,7 @@
 | A2 读取来源 | [ ] 必要的命中/回收/加载等待计数，实际设备发布处按可证明的 file/metadata/prepare 分类，unknown 保留；默认关闭，聚合≤64KiB、每任务≤64B |
 | A3 并发读进展 | [ ] 原四进程(0,1)配握手开始、各8MiB/1KiB请求的同/不同inode固定工作量；区分启动、ready、锁/设备等待及停止规则，修复有因果证据的局部错误 |
 | B1 内核日志（P5c） | [x] 16KiB真实日志环与完整klogctl 0–10，RV64 syscall116；内核/用户控制台分离，阻塞/游标/清空/fault/权限和实际级别控制 |
-| B2 RTC和根盘（P5c/P1f） | [ ] Goldfish RTC_RD_TIME、10:135节点及OFD独占生命周期；实际根设备来源和镜像节点，原hwclock/df真实内容 |
+| B2 RTC和根盘（P5c/P1f） | [x] Goldfish RTC_RD_TIME、10:135节点及OFD独占生命周期；实际根设备来源和镜像节点，原hwclock/df真实内容 |
 | B3 程序分类（P0d） | [ ] 环境、辅助程序、未实现/未到达、预算、程序错误与性能回退分列；保留原脚本/ELF/argv和wait status，原BusyBox55/55及内容验收 |
 
 A1完成后运行相关lwext4、真实加载等待/回收、四组合io-sleep及SQLite DELETE/WAL
@@ -330,7 +330,7 @@ S9最终默认内核SHA为`75682369a7aed056d0f85f70413d8c31d577322707e57a0bd2d2d
 
 - [x] getrandom 区分可信熵就绪/未就绪、flags、阻塞/信号及用户 fault；VirtIO RNG legacy/modern 从宿主安全随机后端取得至少 32 字节后置 ready。DTB/用户写入和早期 ASLR 降级不计可信熵；实板熵源未验证。见[随机数来源](learning/random-source.md)与[RNG 传输](modules/riscv-virtio-rng.md)。
 - [x] 完整klogctl 0–10、16KiB真实环、覆盖/消费/清空/阻塞/fault/权限及实际console过滤已交付，原dmesg及-r/-c/-n验收；见[日志模块](modules/kernel-log.md)。
-- [ ] RTC 字符设备读取及所需 ioctl 复用平台时钟来源，明确设备号、节点、无设备与错误边界；原 hwclock 必须输出真实时间，写 RTC/告警能力另行定范围。
+- [x] Goldfish只读RTC_RD_TIME与10:135别名、OFD独占及exec/退出释放已交付，hwclock真实UTC、root设备来源/df内容已验收；写RTC/告警/事件读取保留缺口。
 - [x] sysinfo 的 RV64 完整布局、内存/负载/任务数与 EFAULT 已交付。
 - [ ] prctl 等只按真实调用链新增；版本和统计来自内核事实，未知能力返回规定错误，用户查询不能触发整机 fatal。
 

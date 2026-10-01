@@ -220,7 +220,7 @@ make test-riscv
 
 当前提供可共享的文件表与根 fs context handle，普通 clone 仍实现“复制表/复制 cwd、共享 OFD”；系统调用层是否选择共享由 clone flags 决定。当前已支持常规文件的读写（`write/writev/pwrite64/append`）、新建、删除（`unlinkat`）、截断（`ftruncate`）与目录修改（`mkdirat/rmdir`）及符号链接（`symlinkat/readlinkat`）；并支持 cwd/dirfd、普通/NOREPLACE rename；已有阈值驱动后台写回，仍无周期清脏或 read-ahead；linkat 硬链接、tmpfs 和独立第二 ext4 盘已接入，块节点用于挂载识别，裸设备 OFD 明确不支持。当前单 hart 下 fd lookup 与 OFD acquire 之间不可调度；启用 SMP 前必须为共享 record 引用、槽查找/替换、统计和 OFD 引用补齐同步，不能直接复用这些无锁字段。pipe 同样是单 hart 对象。console 接收仍为 tick 轮询；通常按 tick 检测，IRQ 延迟与调度可继续推迟执行，不构成一个 tick 的硬上界。PLIC 已用于块设备/RNG，UART 接收尚未迁移为中断驱动。
 
-字符设备节点由 ext4 提供名称和 `st_rdev`；`openat` 只按设备号查找 `fs/char_device.c` 的内建操作表，未知设备号返回 `ENXIO`。OFD 持有选定的静态后端操作，read/write/poll 从它分派；初始标准 fd 也取得同一 console 后端。启动时优先打开根盘已有的 5:1 `/dev/console`，使标准 fd 持有真实路径；只有该节点缺失才使用无路径 UART OFD。其他查找/I/O 错误明确中止启动，不伪装为节点缺失。该表在当前执行地址域中初始化回调，兼容分页前模块测试与生产高半区。console 的 UART 输入等待支持非阻塞 `EAGAIN` 和信号打断；null 读 EOF、写消费请求长度，zero 读按实际用户复制进度填零；两者不经过普通文件页缓存和 ext4 数据 I/O。设备 OFD 由 fd 表安装和引用，dup/fork 共享，关闭 fd 不撤销已 pin 的 I/O。`readv/writev/pread64/pwrite64/lseek/fstat/ppoll` 及 console 非阻塞读取经固定 Linux 差分验证；未知 ioctl 对有效 fd 返回 `ENOTTY`。另登记 1:8 random 和 1:9 urandom：random 读取等待可信源初始化，遵循固定 Linux 的 random_read_iter，O_NONBLOCK 在未就绪时返回 EAGAIN；urandom 允许未初始化的不安全流。random poll 未就绪报告可写，就绪报告可读；urandom 始终可读写。用户写入经 BLAKE2s 混种但不计可信熵。随机 ioctl 的 RNDGETENTCNT 返回已计入可信字节数乘 8（最多 256），坏输出地址返回 EFAULT；未知请求返回 EINVAL，尚未实现的特权注熵、清池与重播种请求明确返回 ENOTSUP，不声称增加熵成功。random 支持 epoll，urandom 遵循固定 Linux 无 poll 回调的 EPERM 边界。节点仍由用户态 mknodat 建立。当前登记五个静态内建设备，没有动态设备注册、TTY 会话、设备 mmap 或 devfs。
+字符设备节点由 ext4 提供名称和 `st_rdev`；`openat` 只按设备号查找 `fs/char_device.c` 的内建操作表，未知设备号返回 `ENXIO`。OFD 持有选定的静态后端操作，read/write/poll 从它分派；初始标准 fd 也取得同一 console 后端。启动时优先打开根盘已有的 5:1 `/dev/console`，使标准 fd 持有真实路径；只有该节点缺失才使用无路径 UART OFD。其他查找/I/O 错误明确中止启动，不伪装为节点缺失。该表在当前执行地址域中初始化回调，兼容分页前模块测试与生产高半区。console 的 UART 输入等待支持非阻塞 `EAGAIN` 和信号打断；null 读 EOF、写消费请求长度，zero 读按实际用户复制进度填零；两者不经过普通文件页缓存和 ext4 数据 I/O。设备 OFD 由 fd 表安装和引用，dup/fork 共享，关闭 fd 不撤销已 pin 的 I/O。`readv/writev/pread64/pwrite64/lseek/fstat/ppoll` 及 console 非阻塞读取经固定 Linux 差分验证；未知 ioctl 对有效 fd 返回 `ENOTTY`。另登记 1:8 random 和 1:9 urandom：random 读取等待可信源初始化，遵循固定 Linux 的 random_read_iter，O_NONBLOCK 在未就绪时返回 EAGAIN；urandom 允许未初始化的不安全流。random poll 未就绪报告可写，就绪报告可读；urandom 始终可读写。用户写入经 BLAKE2s 混种但不计可信熵。随机 ioctl 的 RNDGETENTCNT 返回已计入可信字节数乘 8（最多 256），坏输出地址返回 EFAULT；未知请求返回 EINVAL，尚未实现的特权注熵、清池与重播种请求明确返回 ENOTSUP，不声称增加熵成功。random 支持 epoll，urandom 遵循固定 Linux 无 poll 回调的 EPERM 边界。节点仍由用户态 mknodat 建立。当前登记六个静态内建设备，没有动态设备注册、TTY 会话、设备 mmap 或 devfs。
 
 设备号与操作依据固定 Linux commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 [`fs/char_dev.c`](../../references/linux/fs/char_dev.c)、[`drivers/char/mem.c`](../../references/linux/drivers/char/mem.c)、[`fs/eventpoll.c`](../../references/linux/fs/eventpoll.c) 与 [`fs/read_write.c`](../../references/linux/fs/read_write.c)。
 
@@ -235,7 +235,7 @@ make test-riscv
 `mknodat(33)` 复用 dirfd/cwd/root 路径快照，应用进程 umask 后调用 VFS。
 当前交付普通文件（类型 0 或 S_IFREG）、字符设备（S_IFCHR）与块设备节点（S_IFBLK）；目录返回 EPERM，
 非法类型 EINVAL，FIFO/socket 节点尚未闭环，返回 ENOTSUP。块节点仅用于 stat、命名和 mount 的 st_rdev 识别，裸盘 open 不支持。设备号取 Linux
-32 位编码；任意字符设备号可存储，打开时既有 null/zero/console/random/urandom 后端可用，
+32 位编码；任意字符设备号可存储，打开时既有 null/zero/console/random/urandom 及RTC后端可用，
 未知号返回 ENXIO。不以路径名识别设备。
 
 用户路径复制在存储锁外完成；路径引用和临时堆缓冲在所有结果分支回收。已有节点
@@ -250,3 +250,19 @@ AT_SYMLINK_FOLLOW、AT_EMPTY_PATH。独立打开的硬链接有独立 OFD，记�
 普通文件整次 write/writev/pwrite 在有界 staging 循环外取得 inode 操作门闩（rank 15），直到同步写收尾返回才释放；非定位写先取得共享 OFD offset 锁（rank 10）。truncate 与直接 VFS pwrite/append 走同一门闩，fault/read/writeback 不取得它。`make test-io-sleep-riscv` 以独立 OFD 在块间复制等待时安排追加、重叠定位写与截断，检查整次结果和最终清理；`make test-userland-riscv` 补实际同 inode 未驻留映射缓冲和多页向量追加。
 
 成本诊断版本记录真实请求/接受和 staging/usercopy，保持短写及同步尾部错误的原行为；接口与单位见[成本观测](kernel-cost.md)。
+
+## 仅读RTC与OFD设备资格
+
+Goldfish RTC按st_rdev=10:135选择，/dev/rtc0、/dev/rtc和/dev/misc/rtc是同一设备身份，
+不是路径特判。`RTC_RD_TIME(0x80247009)`复制Linux九整数布局的UTC日历，秒值直接来自
+`riscv_virt_rtc_read_ns`；无设备/不合理读数返回ENODEV。`ioctl`命令在syscall边界截为
+unsigned32位，与Linux相同，兼容musl传来的符号扩展。未知命令ENOTTY，设置时间、
+告警/事件等已知但未交付操作ENOTSUP，普通事件read/write同样明确不支持。
+
+可选char open/release回调把设备资格归OFD。RTC独占打开，dup/fork/请求pin增加同一OFD
+引用，不重新打开；最后真实引用脱离即释放资格，VFS后续清理错误不会继续霸占RTC。
+失败打开不发布资格；CLOEXEC、退出和最终关闭沿统一文件引用路径处理。
+验证：`make test-rtc-host test-environment-riscv`与固定Linux环境ABI记录，含闰日、
+2100世纪例外、dup/fork/exec、坏指针、符号扩展请求与失败后重开。依据固定Linux
+`include/uapi/linux/rtc.h`、`drivers/rtc/dev.c`及`Documentation/admin-guide/devices.txt`，
+commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`；平台设备协议保持Goldfish原契约。

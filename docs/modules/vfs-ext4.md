@@ -258,3 +258,8 @@ proc mounts 保留用户给出的磁盘来源名，并正确标识 tmpfs。
 沿原owner处理。共享后端读取不刷脏回收。生产目标保持8块（4KiB时32KiB），是回收目标，
 不是引用块驻留上限。`make test-lwext4-cache-host`保护循环热块、固定引用、加载/回收/OOM
 失败与最终释放；真实I/O等待和恢复仍由io-sleep、journal及SQLite回归保护。
+
+根挂载从已登记块设备的device_number生成`/dev/block/<major>:<minor>`来源（boot首盘252:0）。
+字符串在mount adapter内由mount持有，不借用启动栈；卸载清空来源指针后释放adapter。
+动态挂载仍由自己的source owner管理。公共程序镜像创建相应块节点，proc mount快照
+沿现有转义规则输出，原df根盘行与statfs容量/空闲/类型另做内容核对。

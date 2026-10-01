@@ -390,6 +390,7 @@ static int release_mount_storage(struct kernel_vfs_mount *mount)
     if (adapter->block_claimed) kernel_block_release_claim(adapter->block, mount);
     (void)kernel_heap_release(heap, adapter);
     mount->private_data = 0;
+    mount->source_name = 0;
     mount->id = 0U;
     mount->state = VFS_MOUNT_STATE_EMPTY;
     return 0;
@@ -796,7 +797,24 @@ int kernel_vfs_mount_root(struct kernel_vfs_mount *mount,
                           struct kernel_heap *heap,
                           struct kernel_page_cache *page_cache)
 {
-    return kernel_vfs_mount_ext4(mount, block, heap, page_cache, 0);
+    int result = kernel_vfs_mount_ext4(mount, block, heap, page_cache, 0);
+    if (!result && block->registered) {
+        struct lwext4_mount_adapter *adapter = mount->private_data;
+        uint64_t number = block->device_number;
+        unsigned major = (number >> 8) & 4095;
+        unsigned minor = (number & 255) | ((number >> 12) & 0xffffff00U);
+        char *out = adapter->root_source;
+        memcpy(out, "/dev/block/", 11); out += 11;
+        unsigned values[2] = {major, minor};
+        for (unsigned i = 0; i < 2; i++) {
+            char reverse[10]; unsigned n = 0, value = values[i];
+            do { reverse[n++] = '0' + value % 10; value /= 10; } while (value);
+            while (n) *out++ = reverse[--n];
+            if (!i) *out++ = ':';
+        }
+        *out = 0; mount->source_name = adapter->root_source;
+    }
+    return result;
 }
 
 static int valid_utime_nsec(int64_t value)

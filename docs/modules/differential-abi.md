@@ -135,3 +135,9 @@ Linux commit。较长请求的上游 RISC-V usercopy 进展问题留作独立 re
 却忽略配额，不能用它作为 tmpfs 参考。运行前核对生成 .config 与缓存身份。
 新增 hardlink、tmpfs 配额/空洞/映射/生命周期及选项差分；动态容量仍比较来源
 和关系，不要求两个系统的物理内存或负载相等。
+
+环境补全增加27条，合计1118：完整klogctl控制/错误边界和RTC读取、日历布局、
+独占/dup重开、fault及ioctl请求号的32位截断。RTC日历检验范围，不比较两个启动的
+实际秒值。固定Linux profile启用Goldfish RTC与HCTOSYS，Linux用其真实devtmpfs节点。
+启动UART可能在保留的ABI前缀前插入内核半行；normalizer只截掉前缀之前的串口文本，
+仍严格核对完整payload、全部ID、顺序、计数、errno及最终回收。

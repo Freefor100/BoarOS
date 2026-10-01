@@ -19,7 +19,7 @@ BoarOS 是从零搭建、面向 OS Comp 能力建设的 C / 少量汇编内核�
 | 调度 | OTHER tick 轮转、FIFO/RR 1–99 优先级、CPU0 affinity、RESET_ON_FORK、可配置全局实时预算及 proc 查询 | 默认 1 秒 / 950 毫秒；无 nice 权重、PI、SMP 或硬实时保证 |
 | 随机数 | ChaCha20 fast-key-erasure、BLAKE2s 混种、legacy/modern VirtIO RNG、`getrandom` 与 random/urandom 字符节点 | QEMU 宿主是信任边界；DTB/用户写入不计可信熵，缺设备时保持未就绪 |
 | futex / 信号 | WAIT/WAKE/REQUEUE、超时/重启、跨 MM 共享匿名 futex、同 MM 非 PI robust-list 退出清理、标准信号、用户 handler、同步 SEGV/BUS/ILL/TRAP 故障信息与恢复、`rt_sigtimedwait` | 无共享文件 futex、PI futex、实时信号队列和 `sigaltstack`；单 hart 验证范围 |
-| 文件与事件 | fd/OFD 分离、dup/CLOEXEC、共享 offset、阻塞 pin、部分/向量/定位 I/O、pipe、poll/select/epoll；传统与 OFD 记录锁；socket OFD 与读写/就绪；mknodat 字符节点按设备号接入 null、zero、console | 无 devfs、完整 TTY；设备 mmap 未支持 |
+| 文件与事件 | fd/OFD 分离、dup/CLOEXEC、共享 offset、阻塞 pin、部分/向量/定位 I/O、pipe、poll/select/epoll；传统与 OFD 记录锁；socket OFD 与读写/就绪；mknodat 字符节点按设备号接入 null、zero、console、RTC | 无 devfs、完整 TTY；设备 mmap 未支持 |
 | 路径与 ext4 | 共享活目录项、cwd/dirfd、普通/NOREPLACE rename、可写/只读根盘、符号链接、目录枚举、稀疏文件、显式纳秒时间、真实文件系统统计、打开后删除、私有映射截断；共享挂载树可用户态挂载/卸载 proc、tmpfs 和第二 ext4 盘，通用 linkat 硬链接，含 meminfo、uptime、self、exe/cwd/root/fd、挂载信息与首批进程 stat/status 字段 | 无 EXCHANGE/WHITEOUT 或完整权限；缺少 /dev/console 节点时的初始标准 fd 没有路径链接，meminfo 已提供真实缓存/共享/脏页/可用量，完整进程字段尚未完成 |
 | 内存文件 | 统一稀疏内存后备对象、tmpfs 页/inode 配额、硬链接、共享/私有映射，musl POSIX 共享内存、SysV 共享内存和 tmpfs 工作目录的离线 GCC | 无 swap、SysV 信号量/消息队列、共享文件 futex；tmpfs 不持久化 |
 | 缓存与存储 | read/write/private fault 共用文件页、inode 脏范围与定向写回、OFD 错误观察、`fsync/fdatasync/O_SYNC/O_DSYNC`；VirtIO legacy/modern 多设备独立 IRQ/队列、每实例页缓存/worker、八 span 批量发布与 flush 屏障 | ordered journal/replay、durable commit 与后续 checkpoint、持久 orphan；恢复承诺限于已验证块模型，已接入阈值驱动后台写回与 2%/4% 空闲水位回收，无周期清脏 |
@@ -37,7 +37,7 @@ BoarOS 是从零搭建、面向 OS Comp 能力建设的 C / 少量汇编内核�
 
 客体内固定 Alpine v3.22 RV64 GCC 14.2.0-r6 已在同一离线镜像上完成预处理、编译、汇编、静态链接和运行；固定 Linux 与 BoarOS 的五阶段状态、产物哈希和输出一致。同一编译流程也通过 tmpfs 工作目录；产物复制到根盘供比对，不代表 tmpfs 持久。范围是固定的小型 C 负载，其他项目和 Rust 尚未验收。
 
-固定 BusyBox/libc-test 最近一次全量清单为 228 项、227 项双侧通过，原 BusyBox 包装器内部 53/55 成功，dmesg 缺 klogctl、hwclock 缺 RTC 字符接口；身份、日期及逐项边界见[程序清单](docs/learning/user-program-inventory.md)。当前通用 ABI 差分 1091 条匹配，包含 SysV 附件片段/权限、AF_UNIX 整包及同步故障边界；成本门禁见[单核规模回归](docs/learning/single-hart-scale.md)，不以 QEMU 墙钟倍数宣称性能。
+固定 BusyBox/libc-test 最近一次全量清单为 228 项、227 项双侧通过，原 BusyBox 包装器内部 53/55 成功，dmesg 缺 klogctl、hwclock 缺 RTC 字符接口；身份、日期及逐项边界见[程序清单](docs/learning/user-program-inventory.md)。当前通用 ABI 差分 1118 条匹配，包含 SysV 附件片段/权限、AF_UNIX 整包及同步故障边界；成本门禁见[单核规模回归](docs/learning/single-hart-scale.md)，不以 QEMU 墙钟倍数宣称性能。
 
 ## 构建与验证
 

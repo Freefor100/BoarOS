@@ -17,6 +17,8 @@ struct kernel_char_device {
     uint8_t positioned;
     uint8_t empty_range_fault;
     uint8_t interruptible_bulk;
+    int (*open)(void);
+    void (*release)(void);
     int (*read)(uint32_t flags, void *buffer, size_t size, size_t *bytes_read);
     int (*write)(const void *buffer, size_t size, size_t *bytes_written);
     int (*ioctl)(struct kernel_mm *mm, uint64_t command, uint64_t argument);
@@ -25,5 +27,6 @@ struct kernel_char_device {
 };
 
 const struct kernel_char_device *kernel_char_device_lookup(uint64_t rdev);
+extern const struct kernel_char_device kernel_rtc_device;
 
 #endif
