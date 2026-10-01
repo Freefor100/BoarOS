@@ -18,16 +18,23 @@ import harness
 def digest(path):
     with Path(path).open('rb') as stream:return hashlib.file_digest(stream,'sha256').hexdigest()
 
-def consumer_results(raw,suite):
+def consumer_results(raw,suite,script=False):
     results=[]
-    pattern=r'^NETWORK COMMAND BEGIN name=(\S+) argv=(.*?)\n(.*?)^NETWORK COMMAND END name=\1 wait=(\d+) timeout=(\d+) elapsed_ms=(\d+)$'
+    pattern=(r'^====== (?:iperf|netperf) (\S+) begin ======\n(.*?)^====== (?:iperf|netperf) \1 end: (success|fail) ======$'
+        if script else r'^NETWORK COMMAND BEGIN name=(\S+) argv=(.*?)\n(.*?)^NETWORK COMMAND END name=\1 wait=(\d+) timeout=(\d+) elapsed_ms=(\d+)$')
     for match in re.finditer(pattern,raw,re.M|re.S):
-        name,argv,output,status,timeout,elapsed=match.groups()
-        row={'name':name,'argv':argv.split(),'wait_status':int(status),'timeout':bool(int(timeout)),
-             'elapsed_ms':int(elapsed),'output':output,'metrics':[]}
+        if script:
+            name,output,status=match.groups()
+            row={'name':name,'script_substatus':status,'argv':None,'wait_status':None,
+                'timeout':None,'elapsed_ms':None,'output':output,'metrics':[]}
+            valid=status=='success'
+        else:
+            name,argv,output,status,timeout,elapsed=match.groups()
+            row={'name':name,'argv':argv.split(),'wait_status':int(status),'timeout':bool(int(timeout)),
+                 'elapsed_ms':int(elapsed),'output':output,'metrics':[]}
+            valid=int(status)==0 and int(timeout)==0
         context=re.findall(r'^NETWORK INPUT libc=(\S+) suite=(\S+)',raw[:match.start()],re.M)
         row['libc'],row['suite']=context[-1]
-        valid=int(status)==0 and int(timeout)==0
         if row['suite']=='iperf':
             receivers=re.findall(r'^\[\s*(\d+)\]\s+([\d.]+)-([\d.]+)\s+sec\s+([\d.]+)\s+(\w*Bytes)\s+([\d.]+)\s+(\w*bits/sec).*?receiver\s*$',output,re.M)
             for connection,start,end,amount,unit,rate,rate_unit in receivers:
@@ -39,6 +46,12 @@ def consumer_results(raw,suite):
             valid=valid and len({m['connection'] for m in row['metrics']})==expected and all(
                 m['elapsed_s']>=1.5 and m['received_bytes_rounded']>0 and m['throughput']>0 for m in row['metrics'])
             row['tcp_info_verified']=False
+            loss={int(c):(int(lost),int(total),float(percent)) for c,lost,total,percent in re.findall(
+                r'^\[\s*(\d+)\].*?\s(\d+)/(\d+)\s+\(([\d.]+)%\)\s+receiver\s*$',output,re.M)}
+            for metric in row['metrics']:
+                if metric['connection'] in loss:
+                    lost,total,percent=loss[metric['connection']]
+                    metric.update(lost_datagrams=lost,total_datagrams=total,loss_percent_rounded=percent)
         else:
             numbers=[]
             for line in output.splitlines():
@@ -146,8 +159,8 @@ def main():
             records=[line for line in raw.splitlines() if line.startswith('NETWORK ')]
             if args.case=='script':
                 count=6 if suite=='iperf' else 5
-                subitems=re.findall(r'====== (?:iperf|netperf) (\S+) end: (success|fail) ======',raw)
-                passed=passed and len(subitems)==count and all(status=='success' for _,status in subitems)
+                subitems=consumer_results(raw,suite,script=True)
+                passed=passed and len(subitems)==count and all(row['valid'] for row in subitems)
             else:
                 subitems=consumer_results(raw,suite)
                 expected=6 if combined else (6 if suite=='iperf' else 5) if args.case=='all' else (2 if suite=='iperf' and args.case=='representative' else 1)
