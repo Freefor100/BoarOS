@@ -61,7 +61,7 @@ normal open、dup/F_DUPFD、console、pipe2 和 epoll_create1 最终都经过 `t
 
 `getcwd` 返回包含 NUL 的字节数；用户缓冲不足为 `ERANGE`，已断开的 cwd 为 `ENOENT`。删除目录后，其持有者仍可对 `.` 打开/统计、经 `..` 访问父目录、通过 `fchdir` 切回；不能在已删除目录中新建名字。改名会更新所有持有同一目录项的 cwd/OFD 所观察到的父链。fork 独立复制 fs record，进程形式和线程形式的 `CLONE_FS` 都共享它；切换 cwd 先取得新引用再替换，失败不改变原目录。
 
-`renameat2` 支持 flags 0 和 `RENAME_NOREPLACE`；未知或互斥组合返回 `EINVAL`，EXCHANGE/WHITEOUT 返回 `ENOTSUP`。保留 `renameat(38)` 兼容入口；固定 RV64 Linux 与 musl 使用 `renameat2(276)` 完成普通 rename，因此差分也使用该原生入口。磁盘事务完成后才发布内存目录项变化；覆盖目标的 OFD 保留原 inode 和内容。目录 `..`、两侧链接数和持久 orphan 由同一事务处理。
+`renameat2` 支持 flags 0 和 `RENAME_NOREPLACE`；未知或互斥组合返回 `EINVAL`，EXCHANGE/WHITEOUT 返回 `ENOTSUP`。保留 `renameat(38)` 兼容入口；固定 RV64 Linux 与 musl 使用 `renameat2(276)` 完成普通 rename，因此差分也使用该原生入口。后端操作事务成功接受后发布内存目录项变化，异步 journal mount 的持久化由组提交及目录同步保证；覆盖目标的 OFD 保留原 inode 和内容。目录 `..`、两侧链接数和持久 orphan 由同一事务处理。
 
 ## `pipe2` 与 FIFO endpoint
 
@@ -90,7 +90,7 @@ open file description 的 offset 只增加实际复制到用户空间的字节�
 - pipe 的 `write/writev` 汇总后沿用 pipe 单次写空间、原子性、阻塞、EPIPE/SIGPIPE 和片段提交规则。
 - regular 文件的 `kernel_vfs_pwrite/append()` 将已复制字节接收到共享 inode 页缓存；部分 usercopy 只发布成功复制的前缀，并推进对应 offset/逻辑大小。writeback 错误由 inode 保留，不能事后撤销已经接收的字节。
 - `kernel_files_sync()` pin 选定 OFD，同步目标 inode 的数据/元数据与设备缓存；独立 open 各持错误序列观察位置，dup/fork 共享同一 OFD 的位置。普通文件和目录支持 fsync/fdatasync；pipe、字符设备、epoll 返回 EINVAL，无效 fd 返回 EBADF。
-- `O_SYNC/O_DSYNC` 在普通写的成功前缀之后执行同步。同步失败返回 errno，OFD offset 与已接受内容保持；这与 Linux `generic_write_sync()` 的顺序一致。当前 fdatasync 同样提交 inode 元数据；后台阈值清脏不替代同步错误观察与 flush。
+- `O_SYNC/O_DSYNC` 在普通写的成功前缀之后执行同步。同步失败返回 errno，OFD offset 与已接受内容保持；这与 Linux `generic_write_sync()` 的顺序一致。full/data 模式分别捕获完整/数据依赖序号，fdatasync 可以顺带持久化同组时间元数据；当前在 checkpoint 后推进 durable，后台阈值清脏和组提交不替代同步错误观察与屏障。
 - `writev` 先快照完整用户 iovec 数组，校验长度和范围，再与 write 共用写入核心；`iovcnt` 上限 1024。
 
 ## 目录与文件系统操作

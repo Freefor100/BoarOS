@@ -479,3 +479,230 @@ PID1配置运行、本轮scratch及栈重建目录）。再次预览候选为零
 消费者执行器支持 `--consumer-commands musl:0,musl:1,glibc:0,glibc:1`，仅运行自动模式和四进程 `(0,1)`，结果明确标为 targeted attribution；省略该参数仍执行两种 libc 的全部八组原参数。原程序 argv/ELF 不变。包装器保存逐命令 `program_ns` 与 `drain_ns`：前者至 wait 返回，后者包含工作目录中现存普通文件与目录的 fsync，诊断窗口包含这两段。卸载或删除对象的排空可能已包含在程序段中，不能把 drain 单独等同于全部持久化成本。历史封存记录没有拆分字段，仍保留原口径，不改写历史数据。
 
 运行时门禁（2026-10-01）：lwext4 的 metadata/数据与 orphan 完整断电恢复矩阵通过；SQLite DELETE 的 97 事件（70 WRITE/27 FLUSH）与 WAL 的 35 事件（25 WRITE/10 FLUSH），分别遍历 none/odd/reverse 全切点及各 WRITE/FLUSH 错误，恢复两次并 e2fsck。故障注入前增加准备事务排空，修正原探针 110/实际 97 的切点漂移，未删屏障。双盘 held-B/live-A、B WRITE/FLUSH sticky error 和冷启动内容，以及第二盘 SQLite WAL 通过。完整 RV64、真实 musl 与 glibc 2.44、1091 ABI、scale、四组合 io-sleep、1706 函数栈检查通过；短写注入迁移到实际 fpwrite 入口后通过。末次低空间进展修正再跑受影响 group host/RV64，旧代码因果对照失败，新代码及 fsck 通过。
+
+### 异步日志与组提交验收（2026-10-01）
+
+本轮从 `main@7628662` 实现完整操作隔离、挂载点异步组提交、FIFO 锁资格交接及 idle IRQ 返回修复。
+**十格写吞吐均超过 10 倍、两种 libc 自动模式均少于旧耗时的一半，性能目标达到。**
+这不表示所有性能改善：re-readers 回退 36%–38%，热写 fdatasync 明显落后于固定 Linux，
+累计分配/清零和提交 I/O 仍是大成本。以下新证据与上文历史 C0–C6、九启动旧基线分开；
+上文“尚未实施/待验收”描述的是当时阶段，不代表当前机制。
+
+#### 实际执行范围与口径
+
+性能测量完成七次成功的串行独立启动：三次关闭观测的原版全八组、一次开启观测的四条定点命令、
+BoarOS/Linux 各一次短同步参考、一次原 1GiB iozone 专项。没有重跑 C0–C6 全矩阵。
+三次关闭启动共 48 条原命令；定点启动四条；专项 16 条。68 条中 60 条可用方法组合完成，
+八条 `(11,12)` 组合因固定原 ELF 不支持而排除（原程序仍退出 0，并输出回退写入结果）。
+不是将“退出 0”当作请求方法完成：自动模式核对完整 13 列正吞吐，其他方法核对原 Children/Max 配对字段、
+无取消、真实 wait status 和完成标记。原参数没有追加 `-v`；内容正确性由真实 U-mode 写回/组提交、
+受控同步读回及 SQLite 恢复保证，不声称原 iozone 对所有字节另做了校验。
+
+512MiB 参考配置为单 hart、VirtIO modern/writeback、10MHz timebase、逐命令预算 900000ms。
+三启动关闭观测的 source base 为 `18167bd9b9cc87a96949fefb524f5025e18a8f93`，
+内核 SHA-256 `af55ff4a924dbc14a4f343403e528f5e3ac71ec3c80503052dc46a20f009486a`。
+定点观测 base 为 `999cf486ee853413e49f60b89d02e24637a5ed21`，
+内核 SHA-256 `28c74077a5251eadac52fa87f350a3227f0ef28d517724d4ac147096210a9213`。
+两者生产源码（arch/fs/include/kernel/lib/mm/net/third_party/Makefile）无差异；测试工具和文档有变化，
+不能声称整个 source hash 一致。ON/OFF 复用相同协调 ELF，SHA-256
+`f120168ecde33e94db083df703300ca9e8b0e215a6c4911417b5339af14aaf49`。
+原镜像 SHA-256 `f419468678d342133546add2f8459ea09aeba987ba968e28753d6ee656996b8b`，
+原 musl/glibc iozone SHA-256 分别为
+`019cd6e219263f41b3c1d62024ea9ce38e613541bf2a1d9b7e2aa6506187ecd6` /
+`984c8ad474072011f38d52a98d422c581b2277d3e2d03f90557f45a8046c66de`。
+实际 QEMU 11.1.1 SHA-256 为 `a1cfcceb6c688f9b0a290d512211ed08cf465b92b26a04cfb032280a53625718`。
+所有启动的 fixture、DTB、firmware、工具、uname、argv/cwd、wait status 和原输出在
+[现有消费者归档](cost-consumer-followup.json) 的 `journal_optimization`；旧九启动及其 seal 未改。
+
+#### 原版吞吐与耗时
+
+单位为原输出 **Max throughput per process 的 kB/s**，不是四子进程之和。
+initial/rewriters 取 `(0,1)`，random writers 取 `(0,2)`，fwriters 取 `(6,7)`，
+pwrite writers 取 `(9,10)`；不把别的组里同名字段混入。下面按三个启动的中位数比较。
+
+| libc / 方法 | 旧中位 | 新三启动分布 | 新中位 | 改善 | 固定 Linux 中位 |
+|---|---:|---|---:|---:|---:|
+| musl initial writers | 19.98 | 1078.85 / 1065.70 / 1111.92 | 1078.85 | 54.00× | 148746.70 |
+| musl rewriters | 23.18 | 586.29 / 633.22 / 551.74 | 586.29 | 25.29× | 294337.47 |
+| musl random writers | 27.08 | 773.18 / 636.35 / 870.05 | 773.18 | 28.55× | 102259.89 |
+| musl fwriters | 21.76 | 614.25 / 646.26 / 644.56 | 644.56 | 29.62× | 125015.27 |
+| musl pwrite writers | 21.37 | 1004.35 / 753.87 / 671.60 | 753.87 | 35.28× | 117285.53 |
+| glibc initial writers | 20.11 | 1008.61 / 591.74 / 635.78 | 635.78 | 31.62× | 103996.26 |
+| glibc rewriters | 19.68 | 919.68 / 1014.91 / 651.77 | 919.68 | 46.73× | 289265.53 |
+| glibc random writers | 26.43 | 1127.12 / 1008.04 / 1011.84 | 1011.84 | 38.28× | 95253.54 |
+| glibc fwriters | 22.67 | 989.51 / 718.98 / 631.46 | 718.98 | 31.72× | 119263.92 |
+| glibc pwrite writers | 21.58 | 998.91 / 996.85 / 739.11 | 996.85 | 46.19× | 129811.74 |
+
+写吞吐仍只有固定 Linux 的约 0.20%–1.06%，尚未接近 Linux。
+自动模式为原 `./iozone -a -r 1k -s 4m`：
+
+| libc | 旧三启动秒数（中位） | 新程序秒数（中位） | 程序后 drain 秒数 | 耗时下降 |
+|---|---|---|---|---:|
+| musl | 415.066 / 413.694 / 419.714（415.066） | 16.345 / 16.642 / 16.450（16.450） | .020937 / .021678 / .021518 | 96.04% |
+| glibc | 400.408 / 409.248 / 409.308（409.248） | 18.372 / 18.528 / 18.040（18.372） | .020848 / .022165 / .019652 | 95.51% |
+
+程序时间至 wait 返回；drain 为之后工作目录中现存普通文件和目录的 fsync。
+原程序的同步、删除及 close 所触发排空已在程序时间内，不能把约 21ms 的 drain 称为全部持久化成本。
+两侧八组程序时间之和分别为 musl 143.125/143.512/143.921s、glibc 146.882/146.204/147.315s；
+旧八组约 1433–1461s。它们包含原 iozone 的协调等待，不是纯设备吞吐。
+
+读项 `(0,1)` 的中位为：musl readers 10889.22→23581.93（2.17×），
+glibc 17700.65→62151.33（3.51×）；分别只有 Linux 的 6.23%/16.28%。
+**re-readers 回退**：musl 65331.82→41799.64（-36.02%），
+glibc 68381.61→42229.14（-38.24%）。当前快照覆盖整条命令的写、读、重读和协调阶段，
+不能唯一分辨新后台提交竞争、读锁资格公平性或缓存状态对重读的贡献。
+这是未定位完的性能缺陷；没有用整体耗时大幅下降掩盖它，也没有追加重复启动猜因果。
+
+#### 机制改变如何解释收益
+
+旧 `ext4_file_touch()` 外层事务立即提交，非零普通小写先更新时间，128 次纯 touch 即产生
+128 次 commit / 256 次 flush。新 `__ext4_trans_finish()` 成功后调用
+`jbd_journal_accept()`，只把操作的修改、预留和 owner 合入 mount running group。
+查询仍读当前内存状态；before-image 仅属于本次操作，后一个 OOM/abort 不撤销前一个成功修改。
+`jbd_journal_freeze()` 在 rank40 下复制不可变 metadata/data 版本并准备日志；
+`ext4_journal_group_service()` 释放全部后端锁深度后，由 worker 在
+`jbd_journal_submit()` 执行 ordered data/flush → log/flush → commit/flush → checkpoint/flush → log起点/flush。
+worker 不取 OFD offset、rank15 写门闩或 inode 数据锁。新运行组可继续修改共享 bcache；
+提交只读冻结版本，`journal_pending` 禁止未提交 home buffer 隐式写回。
+free-block/inode quarantine 到 checkpoint 完成才解除，近满盘先等待旧 owner 释放再开启 private 操作。
+不是删除持久化屏障或启用磁盘 JBD2 ASYNC_COMMIT 特性。
+
+以下旧值为旧 ON 三启动中位，新值为 **一个**定点 ON 启动；请求/字节对所有 actor 求和，
+rank40 只列前台累计。旧 write 来源没有分类，以下旧 write 为 unknown_write。
+
+| 窗口 | 请求旧→新 | flush 旧→新 | 写字节/接受字节旧→新 | rank40 持有秒旧→新 | 前台 blocks/reblocks 旧→新 |
+|---|---|---|---|---|---|
+| musl 自动 | 229097→28004 | 96907→2123 | 14.883→1.297 | 478.580→8.376 | 0/0→4105/0 |
+| glibc 自动 | 247112→27970 | 105881→2123 | 15.065→1.291 | 470.915→8.402 | 0/0→4062/0 |
+| musl 四写者 | 93564→9845 | 38333→900 | 18.836→1.799 | 172.842→4.208 | 24993/24494→4734/0 |
+| glibc 四写者 | 91993→7254 | 37626→727 | 18.934→1.925 | 169.054→3.308 | 24179/23804→3137/0 |
+
+自动接受字节同为 25165824（24MiB）。原四写者在首个子任务完成后停止其他子任务，
+新旧接受字节不同，故用归一化放大；不能把所有绝对请求下降都归给合并。
+musl 自动的新写字节 32636928 由实际 worker phase 分类：data 20975616、journal 6742016、
+checkpoint metadata 2830336、journal superblock 2088960；unknown_write 为零。
+29740 次前台接受、29231 次加入既有组、510 次封口，约 98.29% 操作进入已有组；
+窗口开始前已有组可能在窗口内封口，accepted−merged 与 groups 不要求逐窗口相等。
+2123 次 flush = 510×4 + 83 次非空 ordered-data 屏障；剩余组仅含 metadata。
+
+锁原 `wake_all` 让新到者可抢先、旧等待者重阻塞；新 release 先把 writer/read cohort
+资格赋给 FIFO 队首，再 wake_one。未运行的获得者也挡住新来任务和 try_read。
+四写者的重阻塞降为零支持这一机制，不只是缩短 I/O。自动模式现在有后台竞争，
+musl 前台 rank40 获取等待由 .07645s 增为 .47966s，后台等待 3.098s；
+主要改善是锁内慢 I/O 移出及批量持久化，不能宣称所有等待一律下降。
+hold 包含已预留但任务尚未运行的时间；各任务累计及嵌套时间不能相加当窗口总时间。
+
+idle 修复只在公共安全 IRQ 返回点、当前为 idle 且无持锁时消费 need_resched。
+真实设备测试禁用 timer，并强制中断已在 enable-SIE 与后续等待之间发生；正常路径即时运行等待者，
+linker wrap 仅关闭该钩子的同源对照失败。这证明旧路径的因果缺口。
+原消费者的同请求完成观察→wake 返回/submit 调用恢复：
+
+| 窗口 | 平均到 ready 上界 µs | 平均到恢复 µs | 最大到恢复 ms |
+|---|---:|---:|---:|
+| musl 自动 | 3.906 | 48.218 | 9.932 |
+| glibc 自动 | 3.772 | 39.840 | 9.929 |
+| musl 四写者 | 4.081 | 176.623 | 20.188 |
+| glibc 四写者 | 4.041 | 213.064 | 22.583 |
+
+完成时刻是 IRQ/harvest 观察，不是硬件内部完成；ready 在 wake 返回后采样，是上界。
+旧版本无同请求关联指标，不能据此给出旧→新的延迟倍数，也不能把总体收益全部分给 idle 修复。
+定点四写者前台连续 IRQ-off 最大 18.631/22.389ms，普通持锁 S-mode 不任意抢占，仍有长尾。
+
+#### 持久化、开销与剩余成本
+
+每次热写同步参考为同一当前静态 musl 协调器、4KiB 覆盖×128（512KiB），每种模式单启动样本，
+读回内容通过。协调 ELF SHA-256 `b8cdfec28afccaf60d8e9ebf0e9bd1755d0be0881265b058c8111c224e453f05`。
+它不是原版 iozone 或旧 glibc 成绩，不具有三启动统计意义。
+
+| 模式 | BoarOS 秒 / kB/s | 固定 Linux 秒 / kB/s |
+|---|---|---|
+| O_SYNC | 1.867 / 274.20 | 2.325 / 220.20 |
+| O_DSYNC | 2.978 / 171.92 | .382 / 1341.46 |
+| pwrite+每次fsync | 3.480 / 147.12 | 2.283 / 224.27 |
+| pwrite+每次fdatasync | 3.436 / 149.02 | .389 / 1316.33 |
+
+full/data 模式现在分别捕获 sync_sequence/data_sequence，纯时间更新不推进 data 目标。
+但已在 running group 的时间 metadata 可随同数据一起提交；durable_sequence 与 checkpoint_sequence
+仍在 `jbd_journal_retire()` 一同推进。这具有保守同步正确性，却让 hot O_DSYNC/fdatasync
+承担日志和 checkpoint，含数据的组最多五个屏障，Linux 不必为同样热数据等时间 metadata checkpoint。
+此处代码解释结构性成本方向，关闭观测的同步窗口没有逐 phase 时间，不能声称每个屏障的精确贡献。
+O_SYNC 单样本较快不证明 BoarOS 同步总体优于 Linux；fdatasync 吞吐约落后 8.83 倍。
+
+定点 ON/OFF 程序时间比：musl 自动 +28.94%、glibc 自动 +27.21%、四写者 +10.58%/+7.80%。
+四写者还包含完成字节变化和启动波动；只有一个 ON 样本，报告的是观测构建差异，不是精确纯采样开销。
+自动模式 observer 函数体累计 .762/.741s 是 CPU 开销下界，已包含在 run_ticks，不能重复相加。
+固定聚合统计 64901B（小于64KiB），每任务标量64B；关闭构建没有新增诊断字段/热路径/proc节点，
+事务预算本身的普通资源计费当然仍存在。
+
+musl 自动：事务计费峰值 2318336B，最大其他窗口 2320768B，均低于 4MiB。
+这是按堆实际容量及 pinned home buffer 保守计费，不是 RSS。
+522085 次堆请求、累计请求 1491285061B（旧为407323次/680781393B）也不是驻留峰值；
+`jbd_journal_new_trans`、`jbd_trans_set_block_dirty`/数据 version 和 `jbd_reserve_logs`
+每个小操作建立私有 checkpoint/undo/after/log owner，再由 accept 合并释放，产生分配、清零和复制周转。
+后台 submit 累计 11.289/13.132s，设备 submit→完成观察后台累计 10.376/12.426s，
+其中包含设备、IRQ屏蔽及处理时间，不是纯磁盘服务。它们互相嵌套，不能相加。
+musl 自动前台运行 9.778s、后台 .839s；窗口21.249s，所有任务 run10.617s + idle context10.424s，
+未解释余量 .208s（约 .98%）。idle accounting 不等同于精确 WFI 驻留；blocked/ready跨任务区间不能加到分母。
+unknown_read 仍为73371648B，约占该窗口总磁盘字节69.2%，没有证明它全部属于文件数据或 metadata。
+
+两个优先优化候选及一项必须定位的回退，均留待人选择下一轮路线：
+
+| 候选 | 依据与可能收益 | 正确性/复杂度/演进约束 |
+|---|---|---|
+| 复用 running version 与有界日志 credit/缓冲 | 私有小操作分配量增加；可降低 allocator/清零周转 | 仍须保留本次 undo、OOM原子性和冻结版本；可逐层验证，不能直接共享可变提交源 |
+| 将 durable commit 与后续 checkpoint 推进分离，缩短 data-only 等待 | hot fdatasync 落后8.83倍，当前每批立即checkpoint；可减少同步关键路径 | 需保持环形日志空间、版本checkpoint、quarantine和错误owner；复杂度更高，必须再次跑恢复矩阵，不能只删flush |
+| 定位 re-readers 回退后再决定读锁/后台节奏/缓存措施 | 两种libc三启动均回退36%–38%，whole-command不能独立归因 | 只需能区分读阶段的窄对照，不能重新铺C矩阵或直接改resident/deadline索引；当前无确定首因 |
+
+#### 验证含义、失败修正与分支交付
+
+实际窄验证保护接受前 rollback、接受后 mount owner、同块跨批版本与重用、WRITE/FLUSH失败和用户可见时间语义；
+真实组提交 fixture覆盖128页、100ms期限、同步、truncate、unlink-but-open、卸载worker join和fsck。
+测试期间修正了实际发现的 orphan_file slot 缺少事务取块、fixture 8KiB大数组溢出、
+近满盘 quarantine 进展等待；分别用事务取块、静态测试缓冲和 private 操作前等待解决，未扩大内核栈。
+观测首次尝试把非直方图 memory_peak 送入 sample 接口触发诊断拒绝，已按该指标契约改为聚合 add；
+该失败启动不计入有效性能结果。SQLite切点探针首次在准备事务未排空时漂移，先隔离准备再完整通过；
+短写注入原 fwrite wrapper 无法拦截新同TU内部 fpwrite，迁移到真实公开入口后原短写契约通过。
+这些失败和修正是验证过程，不是删去失败输出或把超时当通过；已在归档保留相关日志摘要与哈希。
+
+最终恢复：lwext4 metadata/data、traditional orphan/orphan_file、extent/indirect 的全断电/重排/错误矩阵；
+SQLite DELETE 97事件（70WRITE/27FLUSH）及 WAL35（25WRITE/10FLUSH），none/odd/reverse全切点和全部
+WRITE/FLUSH故障、恢复两次及fsck；双盘错误owner隔离及第二盘SQLite WAL均通过。
+默认完整RV64、真实musl与glibc2.44五种ELF形态、固定Linux1091条ABI、scale、四组合io-sleep和栈通过。
+最后的近满盘修正只重跑影响的group host/RV64及旧机制因果对照；最终增量栈检查1706函数、
+最大单帧2368B、Trap Frame288B、保留1024B，不重复无关总矩阵。
+这些分别证明持久化/错误组合、架构与真实ABI、进展/资源和实际消费者收益，不能互相替代。
+观测 `state=complete` 只证明本窗口合法结束、无在途观测scope；OFF指无新增采样。
+程序完成和所请求方法完成另外核对；历史预算timeout指包装器取消，unavailable指原ELF拒绝方法。
+新三启动可用方法无timeout；未支持向量组不归因于新的内核回归。
+
+common实现在main分根因提交：`90c4c9a` idle/FIFO、`8589145`版本隔离、`08debbd`worker/同步、
+`4f46685`程序与drain计时、`29e0f46`请求关联与恢复隔离、`b064226`低空间等待。
+最终候选单向合入compat；短同步probe、冻结协调器复用与历史schema读取只选择通用工具取回main，
+不整体合回评测分支。main保留自身uname，旧glibc与原评分在compat的uname4.15.0配置运行。
+本轮没有为main伪造评测uname，也没有宣称裸main可直接启动原旧glibc。
+原1GiB专项正常293.532s，musl/glibc24.84996/25.17908分（旧21.66878/21.45167）；
+逐judge及原串口只见compat既有`oscomp-rv-results.json`，未选其他组/LA，完整Harness缺kernel-la。
+最终只做一次汇总diff、所有权与文档核对，无反复独立审查循环；不push、发布或阶段转换。
+
+重建在对应兼容代码身份下执行（测量结果允许正常宿主波动，不要求浮点逐位相同）：
+
+```sh
+make -j4 all
+python3 -B tests/cost-riscv.py --case consumer --off --kernel kernel-rv --replicas 3 --consumer-timeout-ms 900000
+make -j4 COST_DIAGNOSTICS=1 all
+python3 -B tests/cost-riscv.py --case consumer --replicas 1 --consumer-timeout-ms 900000 --consumer-commands musl:0,musl:1,glibc:0,glibc:1 --coordinator-elf <本次OFF输出目录>/consumer.elf
+python3 -B tests/cost-riscv.py --case consumer --off --kernel kernel-rv --replicas 1 --consumer-sync-only
+python3 -B tests/cost-riscv.py --case consumer --linux --replicas 1 --consumer-sync-only
+python3 -B tests/oscomp/run.py --groups iozone --output build/oscomp-iozone
+make test-lwext4-group-host test-journal-group-riscv test-journal-idle-negative-riscv
+make test-lwext4-recovery-host test-sqlite-recovery-matrix-riscv test-sqlite-wal-recovery-matrix-riscv
+make test-multi-disk-io-riscv test-sqlite-second-disk-riscv
+make test-riscv test-userland-riscv test-glibc-riscv test-diff-abi-riscv test-scale-riscv test-io-sleep-riscv test-stack-usage
+```
+
+固定依据仍为 `references/linux@f4cdf7ca9a1fdcca413157df19753f388a5a224e`、
+`references/qemu@84f07211cc5b4fc6a371559bf8a5de4fb068e648`（v11.1.0）、
+本地RISC-V特权规范20260120，SHA-256 `d0f818af6fa519d39e68f822aa795bff9f38032a2f352afdf43e91c0d480e408`，
+以及 `references/oscomp-autotest@d1bb3a3c4b27274e196a2648518525c1a304e339`。
+证据提交后使用仓库prune清理运行副本、日志及临时探针，保留可复用构建/工具/固定Linux缓存；
+build路径是历史运行身份，不再作为永久证据。没有实板、硬实时或完整双架构成绩。

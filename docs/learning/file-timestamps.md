@@ -44,10 +44,15 @@ unlink 更新子 inode ctime。truncate 在活 inode 修改后更新 mtime/ctime
 
 ## I/O 失败与持久化
 
-`ext4_fs_put_inode_ref()` 标记 inode 所属 metadata block 为 dirty；已修复上游 `ext4_bcache_free()` 即时 flush 忽略 errno 的问题，失败缓冲保留在 mount dirty list，引用 owner 完成转移后向调用层返回真实错误。touch 直接释放目标 inode 引用即可取得提交结果，不再用全量 cache write-back drain；零更新、无时钟和只读访问不为本次 touch 新增 flush。truncate 和普通写入在建立完整内存分配关系前固定本次修改的缓冲，收尾只提交本次集合，防止位图 I/O 失败中断在块尚无 inode owner 的位置。
+`ext4_fs_put_inode_ref()` 标记 inode 所属 metadata block 为 dirty；早期即时路径修复了上游 `ext4_bcache_free()` 忽略 flush errno 的问题，失败缓冲保留在 mount dirty list。2026-10-01 生产 journal mount 改为操作私有 undo 与挂载点组提交：touch 完成操作接受后即可返回，时间从当前内存立即可见；零更新、无时钟和只读访问不新增时间操作。资源/日志预留在接受前完成，提交只使用独立冻结版本，未提交 home buffer 禁止隐式写回；truncate 与普通写不能在块尚无 owner 时发布成功。未启用组引擎的宿主/无 journal 路径继续保持各自明确契约。
 
-写侧 touch 错误在数据提交之前返回；读侧 atime 错误按 Linux 规则不改变 read 返回值。
+写侧 touch 的准备错误或已知 mount 错误在数据提交之前返回；接受后后台 I/O 错误由 journal/mount 保留，并在同步调用中观察。读侧 atime 错误按 Linux 规则不改变 read 返回值。
 关键 journal/metadata write 或 flush 失败由 mount 保留错误及缓冲 owner，停止后续修改和成功同步承诺；不能清除错误后用卸载重试宣称恢复。只有提交前且尚未改变持久状态的准备失败才安全回滚。重启按 journal/replay 和持久 orphan 恢复，创建/链接/rename 已纳入事务断电验证，见 [VFS 模块](../modules/vfs-ext4.md)。
+
+时间更新加入已有 running group 消除了逐次时间事务提交，但没有改变非零首字节 EFAULT、
+stat即时可见或relatime条件。同步 full/data 分别捕获序号，纯时间修改不推进 data 目标；
+已在同组中的时间 metadata 可顺带持久化。原消费者的收益、同步成本和恢复证据见
+[异步日志验收](cost-baseline.md#异步日志与组提交验收2026-10-01)。
 
 ## 显式设置与检查顺序
 

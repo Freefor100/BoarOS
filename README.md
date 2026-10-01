@@ -91,10 +91,10 @@ make test-references
 
 [开发路线](docs/goals.md)统一记录本轮任务、分支交接和后续依赖。通用兼容性在 `main`，比赛环境与运行入口在 `oscomp-rv-compat`；后者单向合入已验收主线。只跑 RV 的原 judge 评分不等于双架构比赛交付，也不能把逐组诊断分数拼成正式总分。
 
-已按统一 VFS 对象路线分阶段拆分 ext4 后端、实现挂载路径和首批真实 procfs。真实内存快照、RV64 sysinfo、后台写回及 proc fd 复用压力已接入；统一内存后备对象、tmpfs、硬链接和真实第二 ext4 磁盘已接入，验收见[多挂载证据](docs/learning/memory-backed-mounts.md)。独立 Review 的 R1–R8 已修复：覆盖 SysV owner/片段/权限、msync 来源 pin、AF_UNIX 整包、同步信号与 inode 整次写/截断互斥；完整 RV64、musl/glibc、差分及 WAL 恢复矩阵通过，见[路线与验收](docs/goals.md)。C0–C6 成本测量已收口：历史 60 次启动/339 窗口另补兼容分支与固定 Linux 的 9 次启动/48 窗口，原 musl/旧 glibc 各七组实际 I/O 完成，向量组因原 ELF 不支持在双侧排除。完整消费者的观测开销中位约 17%，大量提交/屏障与等待有证据，磁盘来源 unknown 仍保留，见[成本基线](docs/learning/cost-baseline.md)。评测分支已单向合入主线；原 judge 的 iozone 两侧得 21.4517/21.6688，RV 单侧总分 626，但总预算在 lmbench 耗尽、七组未到达，完整 Harness 缺 kernel-la；不等于全套评测通过。main 保留自身 uname，旧 glibc 结果属于评测兼容配置。异步日志与组提交优化正在推进：idle 的安全 IRQ 返回与 FIFO 锁资格交接已通过聚焦验证，日志机制及 10 倍 iozone 收益仍待验收；日志/RTC、iperf/netperf 继续独立定位。SMP、LoongArch、实板和更大工具链按新基线另行排期。
+已按统一 VFS 对象路线分阶段拆分 ext4 后端、实现挂载路径和首批真实 procfs。真实内存快照、RV64 sysinfo、后台写回及 proc fd 复用压力已接入；统一内存后备对象、tmpfs、硬链接和真实第二 ext4 磁盘已接入，验收见[多挂载证据](docs/learning/memory-backed-mounts.md)。独立 Review 的 R1–R8 已修复：覆盖 SysV owner/片段/权限、msync 来源 pin、AF_UNIX 整包、同步信号与 inode 整次写/截断互斥；完整 RV64、musl/glibc、差分及 WAL 恢复矩阵通过，见[路线与验收](docs/goals.md)。C0–C6 成本测量已收口：历史 60 次启动/339 窗口另补兼容分支与固定 Linux 的 9 次启动/48 窗口，原 musl/旧 glibc 各七组实际 I/O 完成，向量组因原 ELF 不支持在双侧排除。完整消费者的观测开销中位约 17%，大量提交/屏障与等待有证据，磁盘来源 unknown 仍保留，见[成本基线](docs/learning/cost-baseline.md)。评测分支已单向合入主线；原 judge 的 iozone 两侧得 21.4517/21.6688，RV 单侧总分 626，但总预算在 lmbench 耗尽、七组未到达，完整 Harness 缺 kernel-la；不等于全套评测通过。main 保留自身 uname，旧 glibc 结果属于评测兼容配置。异步日志与组提交、idle 安全 IRQ 返回和 FIFO 锁资格交接已验收，十格原版写吞吐均超过 10 倍门槛；日志/RTC、iperf/netperf 继续独立定位。SMP、LoongArch、实板和更大工具链按新基线另行排期。
 
 - [文档导航](docs/README.md)：模块契约与可复用学习材料。
 - [工程原则](docs/design.md)与[贡献说明](CONTRIBUTING.md)：技术取舍、验证与提交边界。
 - [固定资料](references/README.md)与[第三方代码](docs/third-party.md)：版本、来源及许可。
 
-异步日志推进：可选组提交引擎已有实际 1/4 KiB 宿主验证，覆盖操作隔离、版本交错和提交错误恢复；后台线程已接入生产启动，真实 RV64 同步与卸载、SQLite DELETE/WAL 正常及重启验证通过；完整恢复矩阵与原版 iozone 最终验收仍在推进。未报告新的性能成绩。
+异步日志与组提交已启用并验收：操作私有 undo、挂载点 running group、不可变提交版本与 joinable worker 保持 ordered/log/commit/checkpoint 屏障；完整 lwext4、SQLite DELETE/WAL 恢复和双盘隔离通过。关闭观测的原版 iozone 三次启动，musl/glibc 五项写入共十格中位吞吐提升 25.29–54.00 倍，自动模式降至 16.450/18.372 秒，均达到本轮目标。原 1GiB iozone 专项得 24.8500/25.1791；它不是完整 Harness。re-readers 回退 36%–38%、热写 fdatasync 与 Linux 的差距及未分类读请求仍明确保留，见[机制与性能验收](docs/learning/cost-baseline.md#异步日志与组提交验收2026-10-01)。
