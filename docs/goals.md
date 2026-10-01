@@ -18,7 +18,7 @@ Linux 为 `references/linux` 的 `f4cdf7ca9a1fdcca413157df19753f388a5a224e`。
 |---|---|
 | S6 操作准备与封口 | [x] 独立 undo、同块增量 credit、块载荷/owner 分离与有界池；65 次操作及提交暂扣时可开新组，FIFO 满等 sealed，真实预算/日志/复用不足等 checkpoint |
 | S7 提交与 checkpoint | [x] 两组冻结 FIFO、一组提交中及 checkpoint FIFO；commit 后发布 durable，连续 checkpoint 批次持久更新起点后释放日志/quarantine；宿主环绕/断电与 RV64 窄验证通过，最终恢复矩阵在 S9 |
-| S8 批量 I/O 与热读 | [ ] 最多八 span 的可选块批量接口、VirtIO 发布/收割与逻辑调用 owner；relatime 无更新共享查询，更新时独占重查 |
+| S8 批量 I/O 与热读 | [x] 最多八 span 的可选块批量接口、VirtIO 发布/收割与逻辑调用 owner；relatime 无更新共享查询，更新时独占重查 |
 | S9 消费者与收口 | [ ] 一次最终恢复/扩大回归；三次关闭观测原消费者、一次定点观测及一次 1GiB 原专项；main 单向合入 oscomp-rv-compat |
 
 事务硬预算仍为 `min(4MiB, RAM/32)`，空闲池上限 `min(256KiB, 预算/4)`，计入预算。
@@ -143,7 +143,7 @@ SQLite DELETE/WAL 完整矩阵通过；不同验证快照的边界明确分列�
 | 方向 | 已有基础 | 尚缺能力或尚未证明的结论 |
 |---|---|---|
 | IPC / 共享内存 | 共享匿名、统一后备对象、tmpfs/POSIX shm、匿名共享 futex、AF_UNIX/socketpair、SysV 共享内存 | SysV 信号量与消息队列尚无入口；AF_UNIX 命名端点/SCM_RIGHTS、共享文件 futex、PI 仍缺 |
-| 文件与存储 | 页缓存、阈值写回、真实同步、日志恢复、多盘独立 owner；异步日志组提交与 full/data 目标序号 | 范围写回仍顺序扫描；无周期页缓存清脏、预读或负目录项缓存；S6/S7 已复用预留并分离同步完成，批量发布与热读仍在 S8 实施 |
+| 文件与存储 | 页缓存、阈值写回、真实同步、日志恢复、多盘独立 owner；异步日志组提交与 full/data 目标序号 | 范围写回仍顺序扫描；无周期页缓存清脏、预读或负目录项缓存；S6–S8 已复用预留、分离同步完成、接入有界批量发布与共享 relatime 查询；最终恢复和性能目标在 S9 验收 |
 | 并发与调度 | 单 hart IRQ 等待、每盘八槽、读共享/写独占、FIFO/RR 及预算 | 单盘后端写事务串行；同 OFD 位置、命名空间和冲突 inode 互斥；八槽不代表每个应用都可产生八个并发请求；无 SMP/PI/硬实时 |
 | 内存与信号 | demand paging、COW、fork、线程与标准信号 | mremap、按操作区分的 madvise、mlock、sigaltstack、实时信号队列未交付 |
 | 系统环境与安全 | sysinfo/proc、会话、可信虚拟熵源、固定 root 查询 | klogctl、RTC 字符接口、完整凭据/权限、TTY、内核栈 guard、实板熵源仍缺；canary 不等于 guard |

@@ -13,6 +13,7 @@
 #include <kernel/scheduler.h>
 #include <kernel/time.h>
 #include <kernel/vfs.h>
+#include <kernel/file_mapping.h>
 #include "../../fs/ext4_backend.h"
 #include <ext4_fs.h>
 #include <ext4_journal.h>
@@ -28,6 +29,9 @@ static unsigned completed;
 static unsigned char bytes[4096], actual[4096];
 static volatile unsigned irq_completed;
 static unsigned char irq_bytes[512];
+static struct kernel_vfs_file *hot_file;
+static unsigned hot_read_done;
+static struct kernel_wait_queue hot_read_completion;
 extern unsigned char __boot_stack_bottom[], __boot_stack_top[];
 static void check(int good, unsigned id)
 {
@@ -39,8 +43,21 @@ static int dma(const void *pointer, uint64_t size, uint64_t *address) { (void)si
 static void irq_only_reader(void *argument)
 {
     (void)argument;
+    /* Keep publish-to-block atomic in this fixture so the idle caller, rather
+     * than the reader's ordinary IRQ boundary, observes the pending IRQ. */
+    uintptr_t irq=riscv_interrupt_save();
     check(kernel_block_read_at(&device.block,0,irq_bytes,sizeof(irq_bytes))==KERNEL_BLOCK_STATUS_OK,10);
     irq_completed=1;
+    riscv_interrupt_restore(irq);
+}
+static void hot_read_access(void *argument)
+{
+    (void)argument;
+    kernel_vfs_file_accessed(hot_file);
+    uintptr_t irq=riscv_interrupt_save();
+    hot_read_done=1;
+    check(kernel_wait_queue_wake_one(&hot_read_completion)==KERNEL_SCHEDULER_STATUS_OK,47);
+    riscv_interrupt_restore(irq);
 }
 /* Used only by the counterfactual fixture: suppress the public idle return
  * hook while preserving the same actual device interrupt and sleeping task. */
@@ -72,12 +89,35 @@ static void exercise(void *argument)
         virt_uart_put_hex(journal->accepted_sequence);virt_uart_putc(' ');virt_uart_put_hex(journal->durable_sequence);virt_uart_putc(' ');virt_uart_put_hex(journal->checkpoint_sequence);virt_uart_putc('\n');}
     check(synced==0,23);
     check(journal->durable_sequence==journal->accepted_sequence && journal->memory_peak<=journal->memory_limit,24);
+    struct riscv_virtio_mmio_block_statistics statistics;
+    riscv_virtio_mmio_block_get_statistics(&device,&statistics);
+    check(statistics.max_inflight==8,42);
+    kernel_vfs_file_accessed(&file);
+    hot_file=&file;
+    kernel_wait_queue_init(&hot_read_completion);
+    struct kernel_thread_join reader={0};
+    {
+        KERNEL_LOCK_SCOPE(shared);
+        kernel_vfs_node_lock(kernel_vfs_file_node(&file),&shared,0);
+        check(kernel_thread_create_joinable(hot_read_access,NULL,&reader)==KERNEL_SCHEDULER_STATUS_OK,43);
+        uint64_t limit;
+        enum kernel_wait_wake_reason reason;
+        check(kernel_time_deadline_from_monotonic(kernel_time_monotonic_ns()+1000000000,&limit)==KERNEL_TIME_STATUS_OK,44);
+        while(!hot_read_done && riscv_time_read()<limit)
+            check(kernel_scheduler_block_current(&hot_read_completion,limit,0,&reason)==KERNEL_SCHEDULER_STATUS_OK,44);
+        check(hot_read_done,45);
+    }
+    kernel_thread_join(&reader);
     for(unsigned page=0;page<128;page++) {
         memset(bytes,(int)(page+1),sizeof(bytes));
         check(kernel_vfs_pread(&file,(uint64_t)page*sizeof(bytes),actual,sizeof(actual),&count)==0 && count==sizeof(actual) && !memcmp(bytes,actual,sizeof(bytes)),25);
     }
+    const struct kernel_vfs_timespec old_times[2]={{1,0},{1,0}};
+    check(kernel_vfs_file_set_times(&file,old_times)==0,46);
     uint64_t before=journal->accepted_sequence;
-    check(kernel_vfs_file_modified(&file, 0, 1)==0 && journal->accepted_sequence>before,26);
+    struct kernel_vfs_stat stat={0};
+    check(kernel_vfs_file_modified(&file, 0, 1)==0 && kernel_vfs_fstat(&file,&stat)==0 &&
+        stat.mtime.seconds!=1 && journal->accepted_sequence>=before && journal->running,26);
     uint64_t deadline;
     check(kernel_time_deadline_from_monotonic(kernel_time_monotonic_ns()+200000000,&deadline)==KERNEL_TIME_STATUS_OK,27);
     enum kernel_wait_wake_reason reason;

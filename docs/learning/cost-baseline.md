@@ -783,3 +783,23 @@ commit 屏障后推进 durable，释放已持久 ordered-data 的镜像及日志
 同步、truncate/unlink 和卸载通过。观测新增等待原因与 checkpoint 汇总耗时，继续
 由 64KiB 编译期断言约束；无直方图的计时 scope 保存总量/样本/max，cost core 验证
 其汇总值。这里是机制验收；尚未重新声明完整恢复矩阵或新 iozone 目标达成。
+
+
+S8 阶段接入（2026-10-01）：`kernel_block_write_batch`/可选设备回调最多八个 span，
+整批预检容量、指针和重叠；VirtIO 将发布与等待分开，一次逻辑调用保留未发布及已发布
+owner，FLUSH 等整个已入场调用完成。同扇区 RMW 按序，错误停止补发并排空已发布 DMA。
+`make test-block-host test-block-riscv` 及 modern/writeback 的 NBD io-sleep 窄验证
+通过，覆盖八项同时发布、外部槽释放时补发、逆序完成、错误排空、FLUSH 与 timeout/reset。
+原串行回退在同 fixture 中最大在途仅1，实际新路径达到8。
+
+冻结日志、ordered-data、checkpoint 通过 lwext4 的可选批量入口传递到该接口；每个
+阶段仍排空和屏障，重复 LBA 先完成旧版本。`make test-journal-group-riscv` 实际存储
+路径达到八个在途；热读 fixture 在另一个读者持 inode 共享锁时调用 accessed，旧独占
+路径反证失败，新共享查询完成。需要更新时间时释放共享锁、独占重查，clock 不可用
+仍为原来的无更新时间行为。测试也显式将时间设为旧值后核对立即可见的更新：序号
+标识组，组内操作可以共享序号，不能要求每次 touch 都增加组号。
+
+idle IRQ fixture 在 reader 发布前明确关闭 SIE，强制请求进入 block 后由 idle 观察
+待处理 IRQ；避免正常 IRQ 在 publish/wait 之间已收割造成测试假失败。
+`make test-journal-idle-negative-riscv` 仍在禁用 timer 的同交错中证伪缺少 idle 返回
+调度钩子。该阶段结果是机制证据，S9 前不据此宣称五倍吞吐或完整恢复通过。

@@ -1242,35 +1242,47 @@ int ext4_mount_setup_clock(const char *mount_point, ext4_clock_read clock)
     return EOK;
 }
 
+int ext4_file_relatime_needed(ext4_file *file, bool *needed)
+{
+    if (!file || !file->mp || !file->mp->mounted || !needed) return EINVAL;
+    struct ext4_mountpoint *mp = file->mp;
+    struct ext4_timestamp now;
+    *needed = false;
+    if (mp->fs.read_only || !mp->clock || !mp->clock(&now)) return EOK;
+    if (mp->os_locks && mp->os_locks->read_lock)
+        mp->os_locks->read_lock(mp->os_locks->context);
+    else EXT4_MP_LOCK(mp);
+    struct ext4_inode_ref ref;
+    int result = ext4_fs_get_inode_ref(&mp->fs, file->inode, &ref);
+    if (result == EOK) {
+        struct ext4_timestamp atime = ext4_time_load(&ref,
+            offsetof(struct ext4_inode, access_time), offsetof(struct ext4_inode, atime_extra));
+        struct ext4_timestamp mtime = ext4_time_load(&ref,
+            offsetof(struct ext4_inode, modification_time), offsetof(struct ext4_inode, mtime_extra));
+        struct ext4_timestamp ctime = ext4_time_load(&ref,
+            offsetof(struct ext4_inode, change_inode_time), offsetof(struct ext4_inode, ctime_extra));
+        *needed = !(ext4_time_compare(mtime, atime) < 0 &&
+            ext4_time_compare(ctime, atime) < 0 && now.seconds - atime.seconds < 86400);
+        result = ext4_fs_put_inode_ref(&ref);
+    }
+    EXT4_MP_UNLOCK(mp);
+    return result;
+}
+
 int ext4_file_touch(ext4_file *file, unsigned int fields)
 {
     struct ext4_inode_ref ref;
     struct ext4_mountpoint *mp;
-    struct ext4_timestamp now;
     int result;
     if (!file || !file->mp || !file->mp->mounted) return EINVAL;
     mp = file->mp;
     if (mp->fs.read_only)
         return fields & (EXT4_TIME_MTIME | EXT4_TIME_CTIME) ? EROFS : EOK;
+    struct ext4_timestamp now;
     if (!mp->clock || !mp->clock(&now)) return EOK;
-    /* A relatime cache hit is a pure read. Never upgrade the shared gate. */
-    if (fields == (EXT4_TIME_ATIME | EXT4_TIME_RELATIME) &&
-        mp->os_locks && mp->os_locks->read_lock) {
-        mp->os_locks->read_lock(mp->os_locks->context);
-        result = ext4_fs_get_inode_ref(&mp->fs, file->inode, &ref);
-        int needed = 1;
-        if (result == EOK) {
-            struct ext4_timestamp atime = ext4_time_load(&ref,
-                offsetof(struct ext4_inode, access_time), offsetof(struct ext4_inode, atime_extra));
-            struct ext4_timestamp mtime = ext4_time_load(&ref,
-                offsetof(struct ext4_inode, modification_time), offsetof(struct ext4_inode, mtime_extra));
-            struct ext4_timestamp ctime = ext4_time_load(&ref,
-                offsetof(struct ext4_inode, change_inode_time), offsetof(struct ext4_inode, ctime_extra));
-            needed = !(ext4_time_compare(mtime, atime) < 0 &&
-                       ext4_time_compare(ctime, atime) < 0 && now.seconds - atime.seconds < 86400);
-            result = ext4_fs_put_inode_ref(&ref);
-        }
-        EXT4_MP_UNLOCK(mp);
+    if (fields == (EXT4_TIME_ATIME | EXT4_TIME_RELATIME)) {
+        bool needed;
+        result = ext4_file_relatime_needed(file, &needed);
         if (result != EOK || !needed) return result;
     }
     EXT4_MP_LOCK(mp);
@@ -1278,6 +1290,8 @@ int ext4_file_touch(ext4_file *file, unsigned int fields)
     if (result != EOK) { EXT4_MP_UNLOCK(mp); return result; }
     result = ext4_fs_get_inode_ref(&mp->fs, file->inode, &ref);
     if (result == EOK) {
+        /* Shared query grants no upgrade; ext4_touch_inode rechecks current
+         * inode times under the exclusive gate after any competing edit. */
         ext4_touch_inode(mp, &ref, fields);
         result = ext4_fs_put_inode_ref(&ref);
     }

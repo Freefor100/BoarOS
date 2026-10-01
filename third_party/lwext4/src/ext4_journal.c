@@ -892,22 +892,49 @@ static void jbd_release_prepared(struct jbd_trans *trans)
 	trans->reserved_logs = 0;
 }
 
+struct jbd_io_batch {
+	struct ext4_block_span spans[EXT4_BLOCK_BATCH_MAX];
+	unsigned count;
+};
+static int jbd_batch_flush(struct ext4_blockdev *bdev, struct jbd_io_batch *batch)
+{
+	int r = ext4_blocks_set_batch(bdev, batch->spans, batch->count);
+	batch->count = 0;
+	return r;
+}
+static int jbd_batch_add(struct ext4_blockdev *bdev, struct jbd_io_batch *batch,
+	const void *data, ext4_fsblk_t block)
+{
+	bool conflict = batch->count == EXT4_BLOCK_BATCH_MAX;
+	for (unsigned i = 0; i < batch->count; i++)
+		if (batch->spans[i].block == block) conflict = true;
+	/* 同 LBA 的旧版本必须完成后才能发布下一版，不能乱序覆盖 home。 */
+	if (conflict) {
+		int r = jbd_batch_flush(bdev, batch);
+		if (r != EOK) return r;
+	}
+	batch->spans[batch->count++] = (struct ext4_block_span){data, block, 1};
+	return EOK;
+}
+
 static int jbd_write_prepared(struct jbd_trans *trans, bool *submitted)
 {
 	struct jbd_fs *fs = trans->journal->jbd_fs;
 	struct jbd_log_block *log;
 	int r;
 	if (trans->frozen) {
+		struct jbd_io_batch batch = {0};
 		/* The submitter borrows immutable images; it changes no allocator,
 		 * cache, queue or accounting state while the mount lock is released. */
 		TAILQ_FOREACH(log, &trans->log_queue, node) {
 			if (!TAILQ_NEXT(log, node)) {
+				r = jbd_batch_flush(fs->bdev, &batch);
+				if (r != EOK) return r;
 				r = ext4_blockdev_flush(fs->bdev);
 				if (r != EOK) return r;
 				*submitted = true;
-			}
-			r = ext4_blocks_set_direct(fs->bdev, log->block.data,
-				log->block.lb_id, 1);
+				r = ext4_blocks_set_direct(fs->bdev, log->block.data, log->block.lb_id, 1);
+			} else r = jbd_batch_add(fs->bdev, &batch, log->block.data, log->block.lb_id);
 			if (r != EOK) return r;
 		}
 		return ext4_blockdev_flush(fs->bdev);
@@ -3061,10 +3088,13 @@ int jbd_journal_submit(struct jbd_journal *journal)
 	bool submitted = false;
 	{
 	COST_PHASE_SCOPE(ordered_phase, 1);
+	struct jbd_io_batch batch = {0};
 	TAILQ_FOREACH(data, &trans->data_queue, node) {
-		r = ext4_blocks_set_direct(bdev, data->after->data, data->block.lb_id, 1);
+		r = jbd_batch_add(bdev, &batch, data->after->data, data->block.lb_id);
 		if (r != EOK) return r;
 	}
+	r = jbd_batch_flush(bdev, &batch);
+	if (r != EOK) return r;
 	if (!TAILQ_EMPTY(&trans->data_queue)) r = ext4_blockdev_flush(bdev);
 	}
 	if (r == EOK) { COST_PHASE_SCOPE(log_phase, 2); r = jbd_write_prepared(trans, &submitted); }
@@ -3106,15 +3136,18 @@ int jbd_journal_checkpoint(struct jbd_journal *journal)
 	int r = EOK;
 	{
 	COST_PHASE_SCOPE(home_phase, 3);
+	struct jbd_io_batch batch = {0};
 	for (;;) {
 		struct jbd_buf *jb;
 		TAILQ_FOREACH(jb, &trans->buf_queue, buf_node) {
-			r = ext4_blocks_set_direct(bdev, jb->after->data, jb->block.lb_id, 1);
+			r = jbd_batch_add(bdev, &batch, jb->after->data, jb->block.lb_id);
 			if (r != EOK) return r;
 		}
 		if (trans == journal->checkpoint_last) break;
 		trans = TAILQ_NEXT(trans, trans_node);
 	}
+	r = jbd_batch_flush(bdev, &batch);
+	if (r != EOK) return r;
 	r = ext4_blockdev_flush(bdev);
 	}
 	COST_PHASE_SCOPE(checkpoint_phase, 4);
@@ -3193,9 +3226,10 @@ bool jbd_journal_operation_room(struct jbd_journal *journal, size_t payloads)
 	size_t images = journal->running ? 4 : 6;
 	if (images < payloads) images = payloads;
 	size_t per_image = jbd_image_charge(journal) + 256;
-	if (images > SIZE_MAX / per_image) return false;
+	size_t fixed = jbd_allocation_charge(sizeof(struct jbd_trans)) + 4 * 256;
+	if (images > (SIZE_MAX - fixed) / per_image) return false;
 	size_t minimum = images * per_image +
-		jbd_allocation_charge(sizeof(struct jbd_trans)) + 4 * 256;
+		fixed;
 	return jbd_budget_room(journal, minimum) &&
 		jbd_log_free_blocks(journal) >= journal->log_reserved + (journal->running ? 2 : 3);
 }

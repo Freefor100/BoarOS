@@ -138,6 +138,9 @@ typedef bool (*ext4_clock_read)(struct ext4_timestamp *now);
 #define EXT4_TIME_RELATIME 8U
 int ext4_mount_setup_clock(const char *mount_point, ext4_clock_read clock);
 int ext4_file_touch(ext4_file *file, unsigned int fields);
+/* Pure relatime query under a shared mount gate. A true result grants no
+ * mutation right: reacquire exclusive ownership and recheck before updating. */
+int ext4_file_relatime_needed(ext4_file *file, bool *needed);
 /* Set selected atime/mtime/ctime values by live inode identity. Array order is
  * atime, mtime, ctime; unselected values are ignored. Only EXT4_TIME_{A,M,C}TIME
  * bits are valid. A zero mask performs no I/O and permits times == NULL. */

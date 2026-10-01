@@ -4,7 +4,7 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
-from cost_report import schema,parse,validate_replicas
+from cost_report import schema,supported_schemas,parse,validate_replicas
 
 def seal(values):
     return hashlib.sha256(json.dumps(values,sort_keys=True,separators=(',',':')).encode()).hexdigest()
@@ -91,10 +91,8 @@ def pack(records, final=False):
 def unpack(document, final=False):
     metrics=[tuple(x) for x in document['metrics']]
     current=schema()
-    # The original v1 registry ended here. Accept that complete historical
-    # registry, not arbitrary shortened schemas, after adding journal metrics.
-    legacy=current[:next(i+1 for i,x in enumerate(current) if x[0]=='wake_to_run')]
-    if document['version']!=1 or metrics not in (current,legacy):raise ValueError('evidence schema/version')
+    # Retain only the complete registries used by the C0 and S5 archives.
+    if document['version']!=1 or metrics not in supported_schemas():raise ValueError('evidence schema/version')
     rows=[]
     for record in document['records']:
         row={k:v for k,v in record.items() if k!='snapshots'};row['snapshots']=[]
