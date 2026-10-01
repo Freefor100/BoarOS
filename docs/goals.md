@@ -4,7 +4,7 @@
 `[x]` 只表示具体交付已验收；历史测量、输入身份和可重建命令归现有 learning。
 固定 Linux 位于 `references/linux`，精确版本与其他资料由 `references/sources.tsv` 管理。评审是调查输入，不自动成为实现或验收证据。
 
-## 当前轮：原版网络应用与 IPv6 双栈 loopback（2026-10-01）
+## 当前轮：原版网络应用与 IPv6 双栈 loopback（2026-10-02）
 
 本轮交付原 iperf 3.13、netperf 2.7.0 的完整本地网络流程；保留两种 libc 的
 原 ELF、脚本和参数，共 22 个客户端子项。不设置吞吐倍数或评分准入条件。
@@ -16,14 +16,14 @@
 | N2a 地址与双栈 | [x] 统一地址对象、::1、映射地址、双栈监听、V6ONLY、端口冲突与地址输出 |
 | N2b 连接与选项 | [x] 已接入 getpeername/getsockopt、预算和选项、UDP 对端/解除及 SYN 拒绝；来源过滤、收发等待已同 ELF 验证 |
 | N2c 数据与生命周期 | [x] 原 netperf 所需 ITIMER_REAL 已补齐并同 ELF 验证； send/recv、整包与用户 fault、半关闭、backlog、就绪、取消和协议回收 |
-| N2d 原版应用 | [ ] 原 iperf 六项、netperf 五项各两种 libc；真实传输、逐连接进展、结果交换和退出 |
-| N2e 结果与收口 | [ ] 固定内容负载、三次串行关闭观测的代表负载、一次归因；集中系统/ABI/栈验收 |
+| N2d 原版应用 | [x] 两种 libc 22 项受控原 ELF 完成；原 netperf 脚本5/5，iperf连续脚本竞态单列，未冒充全部通过 |
+| N2e 结果与收口 | [x] 内容负载、修正版三个关闭观测启动、一次有效定点归因及独立协议排空；1166 ABI、系统、scale与栈验收 |
 
 继续固定 lwIP 2.2.1 raw API、NO_SYS 和单 hart；协议对象用有界池，socket/OFD
 和请求 owner 沿现有堆与 pin。半关闭和取消不能提前释放真实 owner。每方向缓冲
 预算默认及上限 64 KiB，按需使用；未知选项明确报错，不用零值成功伪造统计。
 
-窄测试先证伪旧行为，最终集中一次 RV64、真实 musl/glibc、1118 条基线加新增
+窄测试先证伪旧行为，最终集中一次 RV64、真实 musl/glibc、1166 条
 ABI、socket scale 和栈检查；已通过且未受新修改影响的不重复运行。不运行
 iozone、C0–C6 或存储恢复矩阵。原脚本退出 0 不代替逐项实际传输；参考侧和
 启动时序失败单列。网络按时长运行，比较传输量、事务和进展，不用固定时长
@@ -60,7 +60,7 @@ iozone、C0–C6 或存储恢复矩阵。原脚本退出 0 不代替逐项实际
 | C0–C6成本测量 | 已收口的窗口/输入/开销/unknown与原消费者结果见[成本基线](learning/cost-baseline.md)、既有JSON归档；不重复保留测量待办 |
 | S0–S5异步日志与交接 | 私有undo、running/frozen组、mount worker、idle IRQ和FIFO资格已交付；原五项写吞吐实测改善25.29–54.00倍，属于历史测量而非新准入条件 |
 | S6–S8存储流水线 | 增量预留/有界池、sealed/durable/checkpoint分离、八span批量和共享relatime已实现及恢复验收；见[S9报告](learning/cost-baseline.md#s9-存储流水线验收2026-10-01) |
-| S9消费者收口 | 测量/归档与正确性验收完成；原性能预期未达：Parent写0.98–1.88倍，自动程序+fsync收尾12.668/14.339秒，改善23.09%/22.04%；musl读Parent回退17.05%转A3，完整checkpoint未单独计时转本轮fixture |
+| S9消费者收口 | 测量/归档与正确性验收完成；原性能预期未达：Parent写0.98–1.88倍，自动程序+fsync收尾12.668/14.339秒，改善23.09%/22.04%；musl读Parent当时回退17.05%；后续A＋B已解释进展分布并单独测量根卸载余量 |
 | 挂载/共享/数据库/工具链 | 统一后备、tmpfs、多盘、SysV shm、SQLite DELETE/WAL及固定小型离线GCC已交付；[多挂载](learning/memory-backed-mounts.md)、[恢复](learning/record-lock-sqlite-recovery.md)、[工具环境](modules/program-environment.md) |
 
 S9完整恢复/双盘/RV64/libc/1091 ABI/scale/四组合io-sleep/栈通过。原1GiB专项
@@ -75,8 +75,8 @@ glibc四进程整命令仍增加0.73%。剩余prepare读取、1547 FLUSH和前�
 
 | 问题 | 当前边界/归属 |
 |---|---|
-| 原BusyBox55/55 | 本轮日志/RTC/根设备补全；原脚本及独立内容检查通过。完整228项没有在本轮重跑 |
-| iperf/netperf | 旧客户端没有服务器，不代表正常连接回归；默认 IPv6 双栈及选项/半关闭缺口由本轮 N2 交付 |
+| 原BusyBox55/55 | 此前日志/RTC/根设备补全已验收；完整228项没有在本轮网络工作中重跑 |
+| iperf/netperf | 22项受控原ELF完成；原iperf连续脚本的listener重建竞态在Linux也存在，原脚本结果和受控验收分别报告 |
 | LTP/helper | abort01到chown ENOSYS；cgroup_fj_proc无参数在Linux/BoarOS都等待，不是调度死锁；helper身份由固定上游调用规则确认 |
 | 用户内存/信号 | mremap、按操作madvise、mlock、sigaltstack、实时信号队列、共享文件/PI futex待真实应用需求触发 |
 | 系统与平台 | 固定root查询不等于完整凭据/权限；无完整TTY、真实网卡、SMP/实板、kernel-la，不声明完整Linux兼容或硬实时 |
@@ -401,16 +401,18 @@ glibc四进程整命令仍增加0.73%。剩余prepare读取、1547 FLUSH和前�
 
 ### N1 对象与协议栈选型（路线已确认，首个切片完成）
 
-- [x] BoarOS 持有 fd/OFD、socket、请求 pin、队列和等待；协议回调由最后真实 OFD 引用销毁时解绑。首切片实现 IPv4 UDP/TCP loopback、阻塞/非阻塞与读写/就绪；shutdown 等余项继续 N2。
+- [x] BoarOS 持有 fd/OFD、socket、请求 pin、队列和等待；协议回调由最后真实 OFD 引用销毁时解绑。首切片实现 IPv4 UDP/TCP loopback、阻塞/非阻塞与读写/就绪；IPv6、选项和半关闭在 N2 补齐。
 - [x] 已比较自写协议子集、成熟 C 栈与宿主转发，确认 BoarOS ABI owner + 固定 lwIP 2.2.1 raw API、NO_SYS 事件驱动。协议/pbuf 使用有界静态池，socket/OFD/请求使用 kernel_heap；来源、所有权和成本理由见[学习记录](learning/network-ownership.md)。
 
-### N2 本地与 loopback 链路
+### N2 本地与 loopback 链路（已交付）
 
-- [x] AF_INET loopback UDP/TCP 首个真实消费者已通过；原 socket entry 调用由固定源码 `src/functional/socket.c` 与日志确认。
-- [x] AF_UNIX/socketpair 先交付原 hackbench 所需类型与 flags；覆盖阻塞/非阻塞、EOF、信号取消、fork/dup、对端退出、poll/epoll 和资源耗尽。命名端点及 SCM_RIGHTS 按各自真实需求扩展，不能因 socketpair 通过标记全部本地 socket 完成。
-- [ ] bind/connect/listen/accept、send/recv、非阻塞 EAGAIN、半关闭、EOF、失败连接、poll/epoll 和信号打断逐项验收；失败连接不能假装建立 endpoint。
-- [ ] sendmsg/recvmsg 与 SCM_RIGHTS 明确被传 fd 的 OFD 引用、用户复制失败和消息未接收/对端退出时回收；不能只传可被关闭复用的整数 fd。
-- [x] 原静态/动态 socket 直接 entry 在固定 Linux 与 BoarOS 同一 ELF 双侧通过；PID 1 关机 `heap-live=0`。UDP 池耗尽、释放和重用、TCP segment 池耗尽后 `ERR_MEM`、TCP 200 秒协议定时回收由 host 测试保护；真实 pthread U-mode 覆盖零长度 UDP datagram、共享 OFD 双读、close/fd 复用、线程组强制退出、全局池压力下的 POLLOUT 抑制及释放后进展。整合内核全量 228 项为 227 pass、1 BusyBox 包装失败，不以此推出 AF_UNIX 或真实网卡完成。
+IPv4/IPv6、双栈监听、连接选项、UDP 默认对端、向量消息、半关闭、错误消费、
+backlog 和期限回收已交付。真实用户态保护用户复制、共享 OFD、取消和资源耗尽，
+1166 条 ABI 与固定 Linux 一致。原 iperf/netperf 的22项受控结果、连续脚本的
+实际失败和代表负载分布见[网络记录](learning/network-ownership.md#原版网络应用交付2026-10-02)。
+命名 AF_UNIX 与 SCM_RIGHTS 未实施，按真实需求另行设计；普通 sendmsg/recvmsg
+通过不能推出 ancillary 或 fd 传递完成。后续仅由本文当前队列选择，不重复列出
+已完成接口任务。
 
 ### N3 网卡与真实服务
 
@@ -493,7 +495,7 @@ glibc四进程整命令仍增加0.73%。剩余prepare读取、1547 FLUSH和前�
 | P3d 恢复 | journal/replay 与持久 orphan 已启用并验收；故障模型、限制和复现命令见 VFS 模块。 |
 | P6 SMP：当前 SIE 串行化，缺远端 TLB 确认 | ① 进程态对象先用粗粒度可睡眠锁、IRQ/队列另设短锁，验证较少但并行有限；② MM/OFD/cache/队列对象锁直接演进，锁顺序/取消成本更高。先盘点消费者和睡眠边界再选，临时启动大锁有退出条件。 |
 | P6g 栈 guard：连续物理栈、canary/高水位 | ① 独立虚拟栈区映射已有页，便于未映射 guard，但需页表与回收接口；② 调整内核现有映射形成受保护栈区域，初始接口可能更少，但别名/大页拆分与 direct-map 消费者成本须实测。先验证真实越界保护范围再选。 |
-| N1 协议栈与分配 owner | 已确认 BoarOS 持有 fd/OFD、ABI、等待与缓冲队列，固定官方 lwIP 2.2.1 raw API/NO_SYS；协议和 pbuf 静态有界池，socket/OFD/请求由 kernel_heap 持有。先验收单 hart IPv4 loopback，网卡与 AF_UNIX 继续 N2/N3。 |
+| N1 协议栈与分配 owner | 已确认 BoarOS 持有 fd/OFD、ABI、等待与缓冲队列，固定官方 lwIP 2.2.1 raw API/NO_SYS；协议和 pbuf 静态有界池，socket/OFD/请求由 kernel_heap 持有。IPv4/IPv6双栈loopback和socketpair已验收；真实网卡继续N3，命名AF_UNIX按需设计。 |
 
 单 hart 已交付 OTHER/FIFO/RR 与全局实时带宽；后续调度改动以公平性/负载和实际消费者证据比较策略。第二架构按连续小里程碑推进；不等待 RV “全部完成”，也不复制整套通用内核。
 

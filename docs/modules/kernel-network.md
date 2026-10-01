@@ -4,7 +4,7 @@
 
 `kernel/syscall/socket.c` 导入 RV64 Linux socket 参数和用户指针，`fs/files/socket.c` 把 socket 作为普通 fd/OFD 安装并在失败时回滚，`net/socket.c` 持有 endpoint、数据包、待 accept 队列及等待队列。`fs/open_file.c` 在最后一个真实 OFD 引用消失时销毁 socket；dup、fork 和 syscall 期间的 pin 共享同一 endpoint，close/exec/退出均沿既有 fd 生命周期回收。`fs/files/io.c` 把普通 read/write/readv/writev 接到 socket 队列，pread/pwrite/lseek 返回 `ESPIPE`，`fstat` 标识 `S_IFSOCK`，poll/select/epoll 读取 socket 就绪和等待队列。
 
-协议实现是原样导入的官方 lwIP `STABLE-2_2_1_RELEASE` raw API，peeled commit `77dcd25a72509eb83f72b033d219b1d40cd8eb95`，位于 `third_party/lwip/`；固定资料和许可证见 `references/README.md`、`references/sources.tsv` 与 `third_party/lwip/COPYING`。本地移植层是 `net/lwip_port/`，启用 `NO_SYS=1`、IPv4/IPv6、TCP/UDP 和 loopback。当前没有网卡 netif。lwIP 协议、segment 和 pbuf 使用静态有界池（UDP PCB 16、TCP active 32、listen 16、segment 128、pbuf 64）；BoarOS socket、接收/accept 队列节点及 OFD 使用 kernel_heap。PCB 池耗尽映射 `ENOMEM`，创建失败不留下 OFD；分配器 `STATE` 和错误释放是 fatal 不变量。
+协议实现是原样导入的官方 lwIP `STABLE-2_2_1_RELEASE` raw API，位于 `third_party/lwip/`；固定资料和许可证见 `references/README.md`、`references/sources.tsv` 与 `third_party/lwip/COPYING`。本地移植层是 `net/lwip_port/`，启用 `NO_SYS=1`、IPv4/IPv6、TCP/UDP 和 loopback。当前没有网卡 netif。lwIP 协议、segment 和 pbuf 使用静态有界池（UDP PCB 16、TCP active 32、listen 16、segment 128、pbuf 64）；BoarOS socket、接收/accept 队列节点及 OFD 使用 kernel_heap。PCB 池耗尽映射 `ENOMEM`，创建失败不留下 OFD；分配器 `STATE` 和错误释放是 fatal 不变量。
 
 ## 已验收 ABI 与等待
 
@@ -18,7 +18,9 @@
 
 `recvfrom` 的缓冲区范围在等待空 UDP socket 前检查，负 socklen_t 返回 EINVAL；accept/recvfrom 的地址输出错误发生在协议 dequeue 后，与固定 Linux 顺序一致。
 
-sendto 和 recvfrom 的暂存 pbuf/packet 在 syscall 栈中持有，并在正常或 fault 返回时释放。现有线程组强制退出只标记/唤醒等待中的线程：它先沿保存的 syscall 栈返回，后在 user-return 处理终止；因此不会跳过这两个局部 cleanup。将来若增加可直接抛弃内核调用栈的非局部退出，必须重新审计这些 owner。
+生产收发入口沿完整临时包或队首reservation持有请求与OFD pin。线程组强制退出
+先标记/唤醒，保存的syscall栈返回后才在user-return处理终止；正常和取消路径
+均须平衡临时owner。以后若允许直接抛弃内核调用栈，必须重新审计这条契约。
 
 TCP `POLLOUT` 同时要求发送缓冲和队列空间。`tcp_write` 还可能因全局 segment/pbuf 池满而返回 `ERR_MEM`，此时 socket 撤下可写事件并登记有界重试期限；ACK、成功写、错误或销毁解除登记。等待者取最近的 lwIP 协议和写重试期限，池释放后即使没有 ACK 也能继续，而不会因虚假的 `POLLOUT` 在单 hart 上空转。`F_SETFL(F_GETFL|O_NONBLOCK)` 接受已有 access mode 位，只更新可变状态位。
 
@@ -38,9 +40,9 @@ python3 tests/program-inventory/run.py --suite libc \
   --require-pass --output build/socket-program-check
 ```
 
-host 入口实测 UDP loopback、PCB 16 个用尽后第 17 个失败、全部释放和再分配，另在 `sndbuf>0` 时耗尽全局 TCP segment 池触发真实 `tcp_write ERR_MEM`，以及 TCP 握手/关闭后推进 200 秒协议计时、池用量回到基线。此前 1012 条 Linux/BoarOS 差分记录完全一致，包含 12 条新增 socketpair 差分记录，覆盖坏族、坏标志、坏协议、空指针、stream 双向读写、关闭 EOF、dgram 边界截断与 flags 校验。真实 pthread U-mode 另覆盖零长度 datagram、共享 socket 双读、阻塞读时 close/fd 复用、双读线程组 SIGKILL、全局池压力下错误可写事件及释放后写入进展。原版 hackbench 原 ELF 在 4 进程模式下传递消息并成功运行（Time: 0.014s），关机检查 `heap-live=0`。原版 libc-test `functional/socket.c` 的静态、动态直接 entry 用未改源码和同一 ELF 在双方通过；整合内核全量 228 项为 227 pass、1 BusyBox 包装失败，见[程序清单](../learning/user-program-inventory.md)。
+host 入口实测 UDP loopback、PCB 16 个用尽后第 17 个失败、全部释放和再分配，另在 `sndbuf>0` 时耗尽全局 TCP segment 池触发真实 `tcp_write ERR_MEM`，以及 TCP 握手/关闭后推进 200 秒协议计时、池用量回到基线。此前的 Linux/BoarOS 差分记录完全一致，包含 12 条新增 socketpair 差分记录，覆盖坏族、坏标志、坏协议、空指针、stream 双向读写、关闭 EOF、dgram 边界截断与 flags 校验。真实 pthread U-mode 另覆盖零长度 datagram、共享 socket 双读、阻塞读时 close/fd 复用、双读线程组 SIGKILL、全局池压力下错误可写事件及释放后写入进展。原版 hackbench 原 ELF 在 4 进程模式下传递消息并成功运行（Time: 0.014s），关机检查 `heap-live=0`。原版 libc-test `functional/socket.c` 的静态、动态直接 entry 用未改源码和同一 ELF 在双方通过；整合内核全量 228 项为 227 pass、1 BusyBox 包装失败，见[程序清单](../learning/user-program-inventory.md)。
 
-Linux ABI 依据本地 `references/linux/net/socket.c`、`net/ipv4/af_inet.c`、`fs/read_write.c`，commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`；测试构建来自 `references/oscomp-testsuits` commit `8b58dd16d26d30f7c74d48d5832d870d3051b703`。核对后运行 `make prune-build` 清理日志和镜像。
+Linux ABI 依据本地 `references/linux/net/socket.c`、`net/ipv4/af_inet.c`、`fs/read_write.c`，固定 Linux v7.2；测试输入来自 `references/oscomp-testsuits` 固定 pre-2025 版本，精确身份在来源清单和机器归档。核对后运行 `make prune-build` 清理日志和镜像。
 
 规模回归补充 0/255/256/257/1500/4096/8192 字节 UDP 的三种入口、完整与不足容量、空 iovec、后继报文和跨页 fault；TCP 用错位缓冲与向量写累计传输 1 MiB，检查内容、非 256 字节接收和跨片段 fault 的字节守恒；`socketpair_scale`/`unix_datagram_budget` 及真实 pthread 补充 AF_UNIX 向量/跨页、零长度、64 KiB 上限、整包 OOM、满队列阻塞/非阻塞、fault 无前缀、截断/接收 fault 后预算复用与取消；固定 Linux 差分累计 1086 条一致。`socketpair_scale` 覆盖 STREAM 全双工读写、对端关闭 EOF、写入关闭对端返回 EPIPE 以及 DGRAM 数据报截断边界。成本与边界见[单核规模回归](../learning/single-hart-scale.md)。
 
@@ -97,3 +99,30 @@ UDP 排队同时受每 socket 配额与共享协议堆约束。队列不能耗�
 `--workload content`，包括 16 MiB、五连接各 8 MiB、IPv6 UDP 一万次 64 字节
 请求响应。原 ELF 执行入口为 `tests/network-consumers.py`，按原客户端参数、真实
 服务端 ready、逐项有效时间/接收量及 wait status 判定；原脚本退出零不替代传输。
+
+
+## 原版应用与诊断入口
+
+原 ELF 输入来自公共镜像，版本为 iperf 3.13、netperf 2.7.0。执行器保存实际
+argv、工作目录、接收端结果、wait status、时间及机器输入身份。旧 glibc 必须
+在 oscomp-rv-compat 运行；main 不改 uname。原脚本与每项新服务端的受控流程
+分开验收，listener ready 使用实际输出握手，客户端参数保持原值。
+
+```sh
+python3 -B tests/network-consumers.py --libc both --suite both --case all
+python3 -B tests/network-consumers.py --only boaros --libc both --suite both --case script
+python3 -B tests/network-consumers.py --only boaros --libc both --suite both --case representative --repeat 3
+make COST_DIAGNOSTICS=1 all
+python3 -B tests/network-consumers.py --only boaros --libc both --suite both --case representative --kernel build/cost/kernel-rv --observe
+```
+
+只有 COST 构建提供只读 `/proc/boaros_net_stats`，复用现有协议统计，不保存对象
+引用。TCP写入调用/字节为64位，lwIP包/错误计数为16位，会环绕，不能当作大流量
+窗口的完整总包数；pool用量和高水位是即时值。窗口仍使用已有 cost v1 schema，
+聚合63938字节、每任务64字节，默认构建没有新增诊断节点。观测影响吞吐，关闭
+观测的三次分布才是性能结果。当前1166条ABI、完整RV64、真实musl/glibc 2.44、
+socket scale和栈检查通过；修复后的用户态契约覆盖reset、accept输出fault、
+TCP MSG_TRUNC、UDP自动端口释放，IRQ重试由独立heap包装器保护。
+
+结果与限制见[网络记录](../learning/network-ownership.md#原版网络应用交付2026-10-02)。
+没有真实网卡、命名AF_UNIX、SCM_RIGHTS或TCP_INFO；相关应用字段不作为已验证统计。
