@@ -37,7 +37,7 @@ BoarOS 是从零搭建、面向 OS Comp 能力建设的 C / 少量汇编内核�
 
 客体内固定 Alpine v3.22 RV64 GCC 14.2.0-r6 已在同一离线镜像上完成预处理、编译、汇编、静态链接和运行；固定 Linux 与 BoarOS 的五阶段状态、产物哈希和输出一致。同一编译流程也通过 tmpfs 工作目录；产物复制到根盘供比对，不代表 tmpfs 持久。范围是固定的小型 C 负载，其他项目和 Rust 尚未验收。
 
-固定BusyBox/libc-test最近完整清单仍为228项、227项双侧通过的历史结果；本轮聚焦原BusyBox包装器，55/55子项成功，dmesg/RTC及df根盘内容另做真实核对。当前ABI差分1118条匹配，包含新增日志/RTC边界；完整清单和本轮选择集合分别见[程序清单](docs/learning/user-program-inventory.md)。成本门禁见[单核规模回归](docs/learning/single-hart-scale.md)。
+固定BusyBox/libc-test最近完整清单仍为228项、227项双侧通过的历史结果；此前环境补全验收原BusyBox包装器，55/55子项成功，dmesg/RTC及df根盘内容另做真实核对。当前ABI差分1166条匹配，包含日志/RTC及新增网络/计时器边界；完整清单和本轮选择集合分别见[程序清单](docs/learning/user-program-inventory.md)。成本门禁见[单核规模回归](docs/learning/single-hart-scale.md)。
 
 ## 构建与验证
 
@@ -94,7 +94,7 @@ make test-references
 
 [开发路线](docs/goals.md)统一记录本轮任务、分支交接和后续依赖。通用兼容性在 `main`，比赛环境与运行入口在 `oscomp-rv-compat`；后者单向合入已验收主线。只跑 RV 的原 judge 评分不等于双架构比赛交付，也不能把逐组诊断分数拼成正式总分。
 
-已按统一 VFS 对象路线分阶段拆分 ext4 后端、实现挂载路径和首批真实 procfs。真实内存快照、RV64 sysinfo、后台写回及 proc fd 复用压力已接入；统一内存后备对象、tmpfs、硬链接和真实第二 ext4 磁盘已接入，验收见[多挂载证据](docs/learning/memory-backed-mounts.md)。独立 Review 的 R1–R8 已修复：覆盖 SysV owner/片段/权限、msync 来源 pin、AF_UNIX 整包、同步信号与 inode 整次写/截断互斥；完整 RV64、musl/glibc、差分及 WAL 恢复矩阵通过，见[路线与验收](docs/goals.md)。C0–C6 成本测量已收口：历史 60 次启动/339 窗口另补兼容分支与固定 Linux 的 9 次启动/48 窗口，原 musl/旧 glibc 各七组实际 I/O 完成，向量组因原 ELF 不支持在双侧排除。完整消费者的观测开销中位约 17%，大量提交/屏障与等待有证据，磁盘来源 unknown 仍保留，见[成本基线](docs/learning/cost-baseline.md)。评测分支已单向合入主线；原 judge 的 iozone 两侧得 21.4517/21.6688，RV 单侧总分 626，但总预算在 lmbench 耗尽、七组未到达，完整 Harness 缺 kernel-la；不等于全套评测通过。main 保留自身 uname，旧 glibc 结果属于评测兼容配置。异步日志与组提交、idle 安全 IRQ 返回和 FIFO 锁资格交接已验收，该轮十格原版写吞吐实测改善25.29–54.00倍；日志/RTC已在本轮补齐，下一应用主线是iperf/netperf完整loopback流程。SMP、LoongArch、实板和更大工具链按新基线另行排期。
+已按统一 VFS 对象路线分阶段拆分 ext4 后端、实现挂载路径和首批真实 procfs。真实内存快照、RV64 sysinfo、后台写回及 proc fd 复用压力已接入；统一内存后备对象、tmpfs、硬链接和真实第二 ext4 磁盘已接入，验收见[多挂载证据](docs/learning/memory-backed-mounts.md)。独立 Review 的 R1–R8 已修复：覆盖 SysV owner/片段/权限、msync 来源 pin、AF_UNIX 整包、同步信号与 inode 整次写/截断互斥；完整 RV64、musl/glibc、差分及 WAL 恢复矩阵通过，见[路线与验收](docs/goals.md)。C0–C6 成本测量已收口：历史 60 次启动/339 窗口另补兼容分支与固定 Linux 的 9 次启动/48 窗口，原 musl/旧 glibc 各七组实际 I/O 完成，向量组因原 ELF 不支持在双侧排除。完整消费者的观测开销中位约 17%，大量提交/屏障与等待有证据，磁盘来源 unknown 仍保留，见[成本基线](docs/learning/cost-baseline.md)。评测分支已单向合入主线；原 judge 的 iozone 两侧得 21.4517/21.6688，RV 单侧总分 626，但总预算在 lmbench 耗尽、七组未到达，完整 Harness 缺 kernel-la；不等于全套评测通过。main 保留自身 uname，旧 glibc 结果属于评测兼容配置。异步日志与组提交、idle 安全 IRQ 返回和 FIFO 锁资格交接已验收，该轮十格原版写吞吐实测改善25.29–54.00倍；日志/RTC已补齐，原iperf/netperf完整loopback及IPv6双栈已交付。SMP、LoongArch、实板和更大工具链按新基线另行排期。
 
 本评测分支的固定预算 RV 原 judge 基线、22 组状态与输入身份见[RV 评测模块](docs/modules/oscomp-rv.md)；该结果仍只代表 RV 单侧。
 
@@ -106,4 +106,6 @@ make test-references
 
 S6–S8 存储流水线已落地：有界资源复用、封口与容量等待分离、durable commit 与 checkpoint 分离、八 span 批量 I/O 及热读共享 relatime 查询。最终恢复与系统回归通过，但 S9 收益目标未完成：匹配 S5 的十格 Parent 写吞吐为0.98–1.88倍，自动模式程序加同步收尾下降约22%–23%，未达到当时的性能预期；固定4MiB热读回退低于2%，musl 四进程普通读 Parent 回退17.05%。原1GiB iozone 专项为25.0271/25.3164，不代表完整 Harness。分配调用下降约91%，提交仍510组，说明前台与小事务固定成本仍须处理；完整分析、未关闭项及后续方向见[本轮验收](docs/learning/cost-baseline.md#s9-存储流水线验收2026-10-01)与[路线](docs/goals.md)。
 
-块缓存已修正先回收再查询的命中破坏：生产目标8块不变，八块热工作集宿主预热后800次访问的额外设备读从800降为0。匹配旧/新三个关闭观测启动，自动程序加durable中位改善7.76%/6.99%，四进程普通读Parent改善14.08%/1.20%；glibc四进程整条命令增加0.73%，如实保留。定点读请求下降约68%，日志组/屏障仍510/1547，热读固定工作量0设备请求但存在前台成本；原停止规则不能用来证明调度饥饿，完整分布、资源与观测扰动见[纠错分析](docs/learning/cost-baseline.md#缓存查询顺序纠错2026-10-01)。日志/RTC/根盘真实内容、BusyBox55/55与1118 ABI已验收；完整228项本轮未重跑。后续主线统一见[开发路线](docs/goals.md)，固定吞吐倍数不作为开发准入条件。
+块缓存已修正先回收再查询的命中破坏：生产目标8块不变，八块热工作集宿主预热后800次访问的额外设备读从800降为0。匹配旧/新三个关闭观测启动，自动程序加durable中位改善7.76%/6.99%，四进程普通读Parent改善14.08%/1.20%；glibc四进程整条命令增加0.73%，如实保留。定点读请求下降约68%，日志组/屏障仍510/1547，热读固定工作量0设备请求但存在前台成本；原停止规则不能用来证明调度饥饿，完整分布、资源与观测扰动见[纠错分析](docs/learning/cost-baseline.md#缓存查询顺序纠错2026-10-01)。日志/RTC/根盘真实内容及BusyBox55/55此前已验收，当前ABI累计1166条；完整228项本轮未重跑。后续主线统一见[开发路线](docs/goals.md)，固定吞吐倍数不作为开发准入条件。
+
+原 iperf 3.13、netperf 2.7.0 的两种 libc 共22个受控子项完成实际传输、结果交换和退出，单连接16MiB、五连接各8MiB及UDP一万次请求响应另有内容核对。旧glibc属于兼容分支配置。原连续iperf脚本仍有listener重建竞态，不能将受控完成写成原脚本全部通过；netperf原脚本两侧5/5。关闭观测三次启动的TCP接收吞吐中位为musl单/五连接242/352.6 Mbit/s、glibc261/346.7 Mbit/s；UDP_RR为6443/6612事务每秒。限制、丢包与成本解释见[网络应用结果](docs/learning/network-ownership.md#原版网络应用交付2026-10-02)。下一阶段是VirtIO-net与宿主双向应用，尚未实施。
