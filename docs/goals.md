@@ -17,10 +17,10 @@ Linux 为 `references/linux` 的 `f4cdf7ca9a1fdcca413157df19753f388a5a224e`。
 
 | 阶段 | 状态与依赖 |
 |---|---|
-| S0 根因复现 | idle 安全返回和后到者抢锁已由旧实现的 1/2 个失败证伪；事务隔离测试待接入 |
-| S1 操作隔离与冻结版本 | 待实现；操作失败仅回滚自身，成功返回的操作由 mount 持有 |
-| S2 后台组提交/checkpoint | 依赖 S1；日志 credit、预算、期限与不可变 I/O owner |
-| S3 同步及生命周期 | 依赖 S2；full/data 序号、压力、错误、unlink/truncate/卸载与双盘 |
+| S0 根因复现 | idle 安全返回和后到者抢锁已由旧实现的 1/2 个失败证伪；事务隔离/版本交错与真实无 timer IRQ 因果对照已通过 |
+| S1 操作隔离与冻结版本 | 1/4 KiB 实际引擎、后操作 OOM、冻结后零分配与版本交错通过；mount 保留已接受修改 |
+| S2 后台组提交/checkpoint | 已接入每 mount joinable worker、期限/批次、容量预算和不可变 checkpoint；真实 RV64 窄验证通过 |
+| S3 同步及生命周期 | full/data、后端锁释放等待、unlink/truncate/卸载已接入；SQLite DELETE/WAL 正常与重启通过；完整恢复和双盘门禁待验收 |
 | S4 idle IRQ 与 FIFO 交接 | 聚焦实现通过 test-scheduler-cases-riscv（1/8/32 等待者）及 test-scheduler-riscv；扩大验证留给最终候选 |
 | S5 原消费者与收益 | 依赖 S1–S4；3 次关闭观测全原参数、1 次定点观测、1 次 1GiB iozone 专项；尚无新性能结论 |
 

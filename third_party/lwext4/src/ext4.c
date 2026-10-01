@@ -1733,6 +1733,7 @@ static int ext4_generic_open2(ext4_file *f, const char *path, int flags,
 		f->fpos = 0;
 		f->sync_tid = mp->fs.jbd_journal ? mp->fs.jbd_journal->committed_id : 0;
 		f->sync_sequence = mp->fs.jbd_journal ? mp->fs.jbd_journal->accepted_sequence : 0;
+		f->data_sequence = f->sync_sequence;
 
 		if (f->flags & O_APPEND)
 			f->fpos = f->fsize;
@@ -1776,6 +1777,7 @@ static int ext4_generic_open(ext4_file *f, const char *path, const char *flags,
 	    !mp->transaction_depth)
 		r = ext4_reclaim_orphan(mp, f->inode, false);
 	ext4_file_completed(f, r);
+	if (r == EOK) f->data_sequence = f->sync_sequence;
 	return r;
 }
 
@@ -2585,6 +2587,7 @@ int ext4_fopen2(ext4_file *file, const char *path, int flags)
 	    !mp->transaction_depth)
 		r = ext4_reclaim_orphan(mp, file->inode, false);
 	ext4_file_completed(file, r);
+	if (r == EOK) file->data_sequence = file->sync_sequence;
 	EXT4_MP_UNLOCK(mp);
 	return r;
 }
@@ -2599,6 +2602,7 @@ int ext4_fclose(ext4_file *file)
 	file->fpos = file->fsize = file->fmax = 0;
 	file->sync_tid = 0;
 	file->sync_sequence = 0;
+	file->data_sequence = 0;
 
 	return EOK;
 }
@@ -2766,6 +2770,7 @@ int ext4_ftruncate(ext4_file *f, uint64_t size)
 	if (r == EOK && f->mp->fs.jbd_journal && !f->mp->transaction_depth)
 		r = ext4_reclaim_orphan(f->mp, f->inode, false);
 	ext4_file_completed(f, r);
+	if (r == EOK) f->data_sequence = f->sync_sequence;
 
 	EXT4_MP_UNLOCK(f->mp);
 	return r;
@@ -3115,6 +3120,7 @@ Finish:
 		if (wcnt) *wcnt = 0;
 	}
 	ext4_file_completed(file, r);
+	if (r == EOK) file->data_sequence = file->sync_sequence;
 
 	EXT4_MP_UNLOCK(file->mp);
 	return r;
@@ -3131,6 +3137,7 @@ int ext4_fpwrite(ext4_file *file, uint64_t offset, const void *buffer, size_t si
 		file->fsize = local.fsize;
 		file->sync_tid = local.sync_tid;
 		if (file->sync_sequence < local.sync_sequence) file->sync_sequence = local.sync_sequence;
+		if (file->data_sequence < local.data_sequence) file->data_sequence = local.data_sequence;
 	}
 	EXT4_MP_UNLOCK(file->mp);
 	return r;
@@ -3284,7 +3291,7 @@ int ext4_fraw_inode_fill(const ext4_file *file, struct ext4_inode *inode)
 	return r;
 }
 
-int ext4_file_sync_metadata(ext4_file *file)
+int ext4_file_sync_metadata_mode(ext4_file *file, bool data_only)
 {
 	struct ext4_inode_ref ref;
 	int r, cleanup;
@@ -3295,9 +3302,14 @@ int ext4_file_sync_metadata(ext4_file *file)
 	if (file->mp->fs.jbd_journal) {
 		struct jbd_journal *journal = file->mp->fs.jbd_journal;
 		r = file->mp->transaction_depth ? EBUSY : journal->error;
-		if (r == EOK && journal->grouped && journal->durable_sequence < file->sync_sequence) {
+		/* Namespace operations can dirty this inode through another handle.
+         * Full sync captures the current mount dependency once; newer work
+         * cannot advance its target while it sleeps. */
+        if (!data_only && journal->grouped) file->sync_sequence = journal->accepted_sequence;
+        uint64_t target = data_only ? file->data_sequence : file->sync_sequence;
+        if (r == EOK && journal->grouped && journal->durable_sequence < target) {
 			if (file->mp->journal_runtime.request) file->mp->journal_runtime.request(file->mp->journal_runtime.context);
-			if (file->mp->journal_runtime.wait) r = file->mp->journal_runtime.wait(file->mp->journal_runtime.context, file->sync_sequence, false);
+			if (file->mp->journal_runtime.wait) r = file->mp->journal_runtime.wait(file->mp->journal_runtime.context, target, false);
 			else { EXT4_MP_UNLOCK(file->mp); return ext4_journal_group_service(file->mp->name, true); }
 		} else if (r == EOK && !journal->grouped) r = jbd_journal_sync(journal, file->sync_tid);
 		EXT4_MP_UNLOCK(file->mp);
@@ -3313,6 +3325,9 @@ int ext4_file_sync_metadata(ext4_file *file)
 	EXT4_MP_UNLOCK(file->mp);
 	return r;
 }
+
+int ext4_file_sync_metadata(ext4_file *file)
+{ return ext4_file_sync_metadata_mode(file, false); }
 
 int ext4_inode_exist(const char *path, int type)
 {
@@ -4366,6 +4381,7 @@ int ext4_fopen_inode(ext4_file *file, const char *mount_point,
         file->fpos = 0;
         file->sync_tid = mp->fs.jbd_journal ? mp->fs.jbd_journal->committed_id : 0;
         file->sync_sequence = mp->fs.jbd_journal ? mp->fs.jbd_journal->accepted_sequence : 0;
+        file->data_sequence = file->sync_sequence;
         file->fsize = ext4_inode_get_size(&mp->fs.sb, ref.inode);
         file->fmax = ext4_inode_max_size(&mp->fs, ref.inode);
         result = ext4_fs_put_inode_ref(&ref);

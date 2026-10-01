@@ -136,7 +136,7 @@ void kernel_cost_sample_tag(struct kernel_cost_tag tag, enum kernel_cost_metric 
 struct kernel_cost_io_scope kernel_cost_io_enter(unsigned operation)
 {
     struct kernel_cost_io_scope scope = {kernel_cost_current(), 0};
-    if (scope.actor) { scope.previous = scope.actor->operation; scope.actor->operation = operation + 1; }
+    if (scope.actor) { scope.previous = scope.actor->operation; scope.actor->operation = (scope.actor->operation & 240) | (operation + 1); }
     return scope;
 }
 void kernel_cost_io_leave(struct kernel_cost_io_scope *scope)
@@ -144,8 +144,15 @@ void kernel_cost_io_leave(struct kernel_cost_io_scope *scope)
 void kernel_cost_add_io(unsigned offset, uint64_t value)
 {
     struct kernel_cost_task *task = kernel_cost_current();
-    if (task && task->operation && task->operation <= 4)
-        kernel_cost_add((enum kernel_cost_metric)(COST_FILE_CALLS + (task->operation - 1) * 8 + offset), value);
+    if (task && (task->operation & 15) && (task->operation & 15) <= 4)
+        kernel_cost_add((enum kernel_cost_metric)(COST_FILE_CALLS + ((task->operation & 15) - 1) * 8 + offset), value);
+}
+struct kernel_cost_io_scope kernel_cost_phase_enter(unsigned phase)
+{
+    struct kernel_cost_io_scope scope = {kernel_cost_current(), 0};
+    if (phase > 4) __builtin_trap();
+    if (scope.actor) { scope.previous = scope.actor->operation; scope.actor->operation = (scope.actor->operation & 15) | (phase << 4); }
+    return scope;
 }
 void kernel_cost_add(enum kernel_cost_metric metric, uint64_t value)
 { kernel_cost_add_tag(kernel_cost_capture(), metric, value); }

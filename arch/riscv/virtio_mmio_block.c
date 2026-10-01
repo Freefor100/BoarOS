@@ -500,7 +500,10 @@ static enum kernel_block_status submit_request(struct riscv_virtio_mmio_block *d
     enum kernel_cost_metric metric = (enum kernel_cost_metric)(COST_DEVICE0_REQUESTS + r->cost_device * 8);
     kernel_cost_add_tag(r->cost_tag, metric, 1);
     kernel_cost_add_tag(r->cost_tag, (enum kernel_cost_metric)(metric + 6), device->inflight);
-    kernel_cost_add_tag(r->cost_tag, (enum kernel_cost_metric)(metric + (flushing ? 3 : type == VIRTIO_BLOCK_REQUEST_IN ? 4 : 5)), flushing ? 1 : data_length);
+    unsigned phase = kernel_cost_current()->operation >> 4;
+    if (!flushing && type == VIRTIO_BLOCK_REQUEST_OUT && phase) {
+        kernel_cost_add_tag(r->cost_tag, (enum kernel_cost_metric)(COST_DEVICE0_DATA_WRITE + r->cost_device * 4 + phase - 1), data_length);
+    } else kernel_cost_add_tag(r->cost_tag, (enum kernel_cost_metric)(metric + (flushing ? 3 : type == VIRTIO_BLOCK_REQUEST_IN ? 4 : 5)), flushing ? 1 : data_length);
 #endif
     if (device->inflight > device->statistics.max_inflight) device->statistics.max_inflight = device->inflight;
     uint64_t physical = request_physical(device, r);

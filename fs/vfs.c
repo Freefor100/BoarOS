@@ -1925,8 +1925,8 @@ uint64_t kernel_vfs_error_sequence(const struct kernel_vfs_file *file)
     return node != 0 ? node->writeback_error_sequence : 0;
 }
 
-int kernel_vfs_sync_range(struct kernel_vfs_file *file,
-    uint64_t start, uint64_t end, uint64_t *observed_error)
+static int vfs_sync_range_mode(struct kernel_vfs_file *file,
+    uint64_t start, uint64_t end, uint64_t *observed_error, int data_only)
 {
     struct kernel_vfs_node *node = kernel_vfs_file_node(file);
     int result;
@@ -1944,12 +1944,8 @@ int kernel_vfs_sync_range(struct kernel_vfs_file *file,
         : kernel_page_cache_writeback_range(node->instance->page_cache,
                                             node, start, end);
     if (result == 0) {
-        result = node->instance->ops->sync_metadata(node);
+        result = node->instance->ops->sync_metadata(node, data_only && (node->mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFDIR);
         if (result != 0) kernel_vfs_record_writeback_error(node, result);
-    }
-    if (result == 0) {
-        result = node->instance->ops->flush(node->instance);
-        if (result) kernel_vfs_record_writeback_error(node, result);
     }
 observe:
     if (*observed_error != node->writeback_error_sequence) {
@@ -1962,9 +1958,12 @@ observe:
 int kernel_vfs_sync(struct kernel_vfs_file *file, int datasync,
                     uint64_t *observed_error)
 {
-    (void)datasync; /* Metadata is currently submitted with each mutation. */
-    return kernel_vfs_sync_range(file, 0U, UINT64_MAX, observed_error);
+    return vfs_sync_range_mode(file, 0U, UINT64_MAX, observed_error, datasync);
 }
+
+int kernel_vfs_sync_range(struct kernel_vfs_file *file, uint64_t start,
+    uint64_t end, uint64_t *observed_error)
+{ return vfs_sync_range_mode(file, start, end, observed_error, 0); }
 
 const struct kernel_vfs_mount *kernel_vfs_node_mount(
     const struct kernel_vfs_node *node)

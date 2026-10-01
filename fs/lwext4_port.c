@@ -31,6 +31,22 @@ static void backend_leave(void *lock)
     if (!--context->backend_depth) kernel_lock_release(&context->backend_guard);
 }
 static uintptr_t backend_owner(void *lock) { (void)lock; return (uintptr_t)kernel_io_context_current(); }
+unsigned boaros_lwext4_pause(void)
+{
+    struct kernel_io_context *context = kernel_io_context_current();
+    unsigned depth = context->backend_depth;
+    if (!depth || context->backend_read) __builtin_trap();
+    context->backend_depth = 0;
+    kernel_lock_release(&context->backend_guard);
+    return depth;
+}
+void boaros_lwext4_resume(void *lock, unsigned depth)
+{
+    struct kernel_io_context *context = kernel_io_context_current();
+    if (!depth || context->backend_depth) __builtin_trap();
+    backend_write(lock);
+    context->backend_depth = depth;
+}
 void boaros_lwext4_lock_init(struct ext4_lock *callbacks, struct kernel_rwlock *lock)
 {
     callbacks->lock = backend_write;

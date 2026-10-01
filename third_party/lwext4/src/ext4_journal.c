@@ -50,6 +50,7 @@
 
 #include <string.h>
 #include <stdlib.h>
+#include <kernel/cost.h>
 
 /* Every transaction allocation is charged before publication. Recovery uses
  * its own temporary allocations, outside the mounted transaction budget. */
@@ -57,20 +58,35 @@ union jbd_allocation {
     struct { struct jbd_journal *journal; size_t bytes; } owner;
     long double alignment;
 };
-static void *jbd_alloc(struct jbd_journal *journal, size_t bytes)
+static void *jbd_alloc_charged(struct jbd_journal *journal, size_t bytes, size_t extra)
 {
     if (bytes > SIZE_MAX - sizeof(union jbd_allocation)) return NULL;
     bytes += sizeof(union jbd_allocation);
-    if (journal->memory_limit && (bytes > journal->memory_limit ||
-        journal->memory_used > journal->memory_limit - bytes)) return NULL;
+    /* BoarOS heap slots and large page runs round to powers of two. Charge
+     * that capacity, plus pinned home storage, before requesting ownership. */
+    size_t charge = 16;
+    while (charge < bytes) { if (charge > SIZE_MAX / 2) return NULL; charge *= 2; }
+    if (extra > SIZE_MAX - charge) return NULL;
+    charge += extra;
+    if (journal->memory_limit && (charge > journal->memory_limit ||
+        journal->memory_used > journal->memory_limit - charge)) return NULL;
     union jbd_allocation *allocation = ext4_calloc(1, bytes);
     if (!allocation) return NULL;
     allocation->owner.journal = journal;
-    allocation->owner.bytes = bytes;
-    journal->memory_used += bytes;
+    allocation->owner.bytes = charge;
+    journal->memory_used += charge;
     if (journal->memory_peak < journal->memory_used)
         journal->memory_peak = journal->memory_used;
     return allocation + 1;
+}
+static void *jbd_alloc(struct jbd_journal *journal, size_t bytes)
+{ return jbd_alloc_charged(journal, bytes, 0); }
+static void *jbd_version(struct jbd_journal *journal)
+{
+    size_t cache_header = 16;
+    while (cache_header < sizeof(struct ext4_buf)) cache_header *= 2;
+    return jbd_alloc_charged(journal, journal->block_size,
+        journal->block_size + cache_header);
 }
 static void jbd_free(void *pointer)
 {
@@ -1833,7 +1849,7 @@ int jbd_trans_get_data_access(struct jbd_trans *trans,
 	if (!data)
 		return ENOMEM;
 	data->before = jbd_alloc(journal, journal->block_size);
-	if (journal->grouped) data->after = jbd_alloc(journal, journal->block_size);
+	if (journal->grouped) data->after = jbd_version(journal);
 	if (!data->before || (journal->grouped && !data->after)) {
 		jbd_free(data->before);
 		jbd_free(data->after);
@@ -2017,7 +2033,7 @@ int jbd_trans_get_write_access(struct jbd_trans *trans,
 	}
 	jb = block->buf->end_write_arg;
 	if (trans->journal->grouped) {
-		jb->after = jbd_alloc(trans->journal, trans->journal->block_size);
+		jb->after = jbd_version(trans->journal);
 		if (jb->after) block->buf->journal_pending++;
 		r = jb->after ? jbd_reserve_logs(trans, 2) : ENOMEM;
 		if (r != EOK) {
@@ -2738,6 +2754,7 @@ int jbd_journal_accept(struct jbd_journal *journal, struct jbd_trans *operation,
 		running->first_dirty_ns = now_ns;
 		journal->running = running;
 	} else {
+		COST_ADD(JOURNAL_MERGED, 1);
 		struct jbd_buf *jb, *next;
 		TAILQ_FOREACH_SAFE(jb, &operation->buf_queue, buf_node, next) {
 			struct jbd_buf *old = NULL, *candidate;
@@ -2800,6 +2817,7 @@ int jbd_journal_accept(struct jbd_journal *journal, struct jbd_trans *operation,
 		running->reserved_logs--; jbd_free(log);
 	}
 	running->operations++;
+	COST_ADD(JOURNAL_ACCEPTED, 1);
 	return EOK;
 }
 
@@ -2820,6 +2838,8 @@ int jbd_journal_freeze(struct jbd_journal *journal)
 		data->block.data = data->after;
 	}
 	trans->frozen = true;
+	COST_ADD(JOURNAL_GROUPS, 1);
+	COST_ADD(JOURNAL_MEMORY_PEAK, journal->memory_peak);
 	trans->trans_id = journal->alloc_trans_id;
 	trans->start_iblock = journal->last;
 	int r = jbd_journal_prepare(journal, trans);
@@ -2844,24 +2864,32 @@ int jbd_journal_freeze(struct jbd_journal *journal)
  * reserved and sealed before the operation that owns them returned success. */
 int jbd_journal_submit(struct jbd_journal *journal)
 {
+	COST_SCOPE(submit_cost, JOURNAL_SUBMIT_TICKS);
 	struct jbd_trans *trans = journal->committing;
 	if (!trans) return EOK;
 	struct ext4_blockdev *bdev = journal->jbd_fs->bdev;
 	struct jbd_data *data;
 	int r = EOK;
 	bool submitted = false;
+	{
+	COST_PHASE_SCOPE(ordered_phase, 1);
 	TAILQ_FOREACH(data, &trans->data_queue, node) {
 		r = ext4_blocks_set_direct(bdev, data->after, data->block.lb_id, 1);
 		if (r != EOK) return r;
 	}
 	if (!TAILQ_EMPTY(&trans->data_queue)) r = ext4_blockdev_flush(bdev);
-	if (r == EOK) r = jbd_write_prepared(trans, &submitted);
+	}
+	if (r == EOK) { COST_PHASE_SCOPE(log_phase, 2); r = jbd_write_prepared(trans, &submitted); }
 	struct jbd_buf *jb;
+	{
+	COST_PHASE_SCOPE(home_phase, 3);
 	if (r == EOK) TAILQ_FOREACH(jb, &trans->buf_queue, buf_node) {
 		r = ext4_blocks_set_direct(bdev, jb->after, jb->block.lb_id, 1);
 		if (r != EOK) break;
 	}
 	if (r == EOK) r = ext4_blockdev_flush(bdev);
+	}
+	COST_PHASE_SCOPE(checkpoint_phase, 4);
 	if (r == EOK) r = ext4_blocks_set_direct(bdev, trans->checkpoint_image, trans->checkpoint_lba, 1);
 	return r != EOK ? r : ext4_blockdev_flush(bdev);
 }

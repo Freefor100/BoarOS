@@ -829,6 +829,8 @@ static void kernel_main_high(void)
         root_started = 1;
         if (kernel_page_cache_start_worker(&root_boot.page_cache) != 0)
             shutdown_for_root_boot_error(RISCV_ROOT_BOOT_STATUS_RESOURCES);
+        if (kernel_vfs_start_journal_worker(&root_boot.mount) != 0)
+            shutdown_for_root_boot_error(RISCV_ROOT_BOOT_STATUS_RESOURCES);
         for (uint32_t disk = 0U; disk < root_boot.device_count; disk++) {
             struct riscv_virtio_mmio_block *device =
                 riscv_root_boot_device(&root_boot, disk);

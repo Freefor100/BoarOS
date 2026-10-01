@@ -116,6 +116,7 @@ typedef struct ext4_file {
 	/* Last completed journal dependency in this mounted session. */
 	uint32_t sync_tid;
 	uint64_t sync_sequence;
+	uint64_t data_sequence;
 } ext4_file;
 
 /* BoarOS adapter: optional realtime source and live-inode timestamp updates.
@@ -141,6 +142,7 @@ int ext4_file_set_times(ext4_file *file, unsigned fields,
  * transaction, with the same file error owner as other metadata mutations. */
 int ext4_file_set_mode(ext4_file *file, uint32_t mode);
 int ext4_fpwrite(ext4_file *file, uint64_t offset, const void *buffer, size_t size, size_t *written);
+int ext4_file_sync_metadata_mode(ext4_file *file, bool data_only);
 
 /*****************************DIRECTORY DESCRIPTOR***************************/
 

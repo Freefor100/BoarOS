@@ -31,6 +31,7 @@ static uint32_t cost_tick;
 extern int ext4_journal_group_enable(const char *, const struct ext4_journal_runtime *, size_t) __attribute__((weak));
 extern int ext4_journal_group_service(const char *, bool) __attribute__((weak));
 extern int ext4_journal_group_drain(const char *) __attribute__((weak));
+extern int ext4_file_sync_metadata_mode(ext4_file *, bool) __attribute__((weak));
 static uint64_t group_now;
 static uint64_t group_clock(void *context) { (void)context; return group_now; }
 static ext4_file *interleave_file;
@@ -67,6 +68,11 @@ static void group_test(struct ext4_fs *fs)
     CHECK(disk.flushes-flushes < 32*2);
     CHECK(ext4_fraw_inode_fill(&f,&actual)==EOK && !memcmp(&actual,&committed,sizeof(actual)));
     CHECK(ext4_file_sync_metadata(&f)==EOK);
+    CHECK(ext4_file_sync_metadata_mode);
+    CHECK(ext4_file_set_times(&f,7,times)==EOK);
+    uint64_t before_data_sync=disk.flushes;
+    CHECK(ext4_file_sync_metadata_mode(&f,true)==EOK && disk.flushes==before_data_sync);
+    CHECK(ext4_file_sync_metadata_mode(&f,false)==EOK && disk.flushes>before_data_sync);
     /* Every private reservation failure preserves an earlier accepted change. */
     CHECK(ext4_file_set_times(&f,7,times)==EOK);
     CHECK(ext4_fraw_inode_fill(&f,&committed)==EOK);
