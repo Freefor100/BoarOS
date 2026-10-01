@@ -25,7 +25,7 @@ BoarOS 是从零搭建、面向 OS Comp 能力建设的 C / 少量汇编内核�
 | 缓存与存储 | read/write/private fault 共用文件页、inode 脏范围与定向写回、OFD 错误观察、`fsync/fdatasync/O_SYNC/O_DSYNC`；VirtIO legacy/modern 多设备独立 IRQ/队列、每实例页缓存/worker、八 span 批量发布与 flush 屏障 | ordered journal/replay、durable commit 与后续 checkpoint、持久 orphan；恢复承诺限于已验证块模型，已接入阈值驱动后台写回与 2%/4% 空闲水位回收，无周期清脏 |
 | 内核日志 | 从启动保存16KiB真实内核日志、完整klogctl 0–10、消费式阻塞读、清空及console级别控制 | 当前不可变root权限模型；用户console输出与日志分离，无/dev/kmsg接口 |
 | 身份与资源 | 单用户 root 的 UID/GID 查询；线程组共享并执行 NOFILE/STACK，fork 继承、exec 保留 | 无凭据变更/完整权限；fd 硬容量 1024、栈硬容量 8 MiB；其他有效 limit 返回 `ENOTSUP` |
-| 平台与网络 | RISC-V QEMU 真实根盘可配置 PID 1（默认 `/init`） 与 musl 用户态；单 hart IPv4/IPv6 UDP/TCP loopback与双栈监听，固定 lwIP 2.2.1 raw API，AF_UNIX socketpair | 无命名 AF_UNIX 端点、真实网卡链路、LoongArch、实板或多核验证 |
+| 平台与网络 | RISC-V QEMU 真实根盘可配置 PID 1（默认 `/init`） 与 musl 用户态；单 hart IPv4/IPv6 UDP/TCP loopback、双栈监听、连接选项、半关闭与向量消息，固定 lwIP 2.2.1 raw API，AF_UNIX socketpair | 无命名 AF_UNIX 端点、真实网卡链路、LoongArch、实板或多核验证 |
 
 单 hart 存储等待已由运行期 IRQ 唤醒：两个不同文件冷读可同时在途，等待期间计算与无关缓存命中继续执行；OFD、inode、后端事务与退出清理各自保留 owner。八槽乱序完成、flush 屏障和一秒超时 reset 在 legacy/modern、writeback/writethrough 四种组合验收，见[可睡眠存储](docs/learning/sleepable-storage.md)。
 

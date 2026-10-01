@@ -14,8 +14,8 @@
 | 任务 | 交付与状态 |
 |---|---|
 | N2a 地址与双栈 | [x] 统一地址对象、::1、映射地址、双栈监听、V6ONLY、端口冲突与地址输出 |
-| N2b 连接与选项 | [ ] 已接入 getpeername/getsockopt、预算和选项、UDP 对端/解除及 SYN 拒绝；来源过滤与收发等待组合待数据阶段 |
-| N2c 数据与生命周期 | [ ] 原 netperf 所需 ITIMER_REAL 已补齐并同 ELF 验证； send/recv、整包与用户 fault、半关闭、backlog、就绪、取消和协议回收 |
+| N2b 连接与选项 | [x] 已接入 getpeername/getsockopt、预算和选项、UDP 对端/解除及 SYN 拒绝；来源过滤、收发等待已同 ELF 验证 |
+| N2c 数据与生命周期 | [x] 原 netperf 所需 ITIMER_REAL 已补齐并同 ELF 验证； send/recv、整包与用户 fault、半关闭、backlog、就绪、取消和协议回收 |
 | N2d 原版应用 | [ ] 原 iperf 六项、netperf 五项各两种 libc；真实传输、逐连接进展、结果交换和退出 |
 | N2e 结果与收口 | [ ] 固定内容负载、三次串行关闭观测的代表负载、一次归因；集中系统/ABI/栈验收 |
 

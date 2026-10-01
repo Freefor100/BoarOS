@@ -5,6 +5,7 @@
 #include <stddef.h>
 
 struct kernel_uaccess_iovec;
+struct kernel_socket_address;
 struct kernel_heap;
 struct kernel_mm;
 struct kernel_socket;
@@ -31,10 +32,11 @@ struct kernel_socket_write_request {
     struct kernel_open_file_description *pin;
     struct kernel_open_file_description **pin_owner;
 };
-int kernel_socket_is_unix_datagram(const struct kernel_socket *socket);
+int kernel_socket_is_datagram(const struct kernel_socket *socket);
 int kernel_socket_write_datagram(struct kernel_open_file_description **pin_owner,
     struct kernel_mm *mm, const struct kernel_uaccess_iovec *iov,
-    size_t iov_count, uint64_t count, int nonblocking);
+    size_t iov_count, uint64_t count, uint32_t flags,
+    const struct kernel_socket_address *destination);
 void kernel_socket_abort_write(struct kernel_socket_write_request *request);
 
 struct kernel_socket_statistics {
@@ -42,6 +44,10 @@ struct kernel_socket_statistics {
     uint64_t tcp_written_bytes;
 };
 void kernel_socket_get_statistics(struct kernel_socket_statistics *statistics);
+#if BOAROS_COST_DIAGNOSTICS
+#define KERNEL_SOCKET_PROTOCOL_VALUES 16U
+void kernel_socket_protocol_snapshot(uint64_t values[KERNEL_SOCKET_PROTOCOL_VALUES]);
+#endif
 
 #define KERNEL_SOCKET_DOMAIN_INET 0U
 #define KERNEL_SOCKET_DOMAIN_UNIX 1U
@@ -86,13 +92,21 @@ int kernel_socket_reserve_read(struct kernel_socket *socket,
                               struct kernel_socket_read_request *request,
                               struct kernel_open_file_description **pin_owner,
                               uint32_t capacity);
+void kernel_socket_read_info(const struct kernel_socket_read_request *request,
+                             struct kernel_socket_address *address, uint32_t *length);
 void kernel_socket_copy_read(const struct kernel_socket_read_request *request,
                              uint32_t offset, void *buffer, uint32_t length);
 void kernel_socket_finish_read(struct kernel_socket_read_request *request,
                                int user_fault);
 void kernel_socket_abort_read(struct kernel_socket_read_request *request);
 int kernel_socket_write_buffer(struct kernel_socket *socket,
-                               const void *buffer, uint32_t size);
+                               const void *buffer, uint32_t size, uint32_t flags);
+#define KERNEL_SOCKET_MSG_DONTWAIT 0x40U
+#define KERNEL_SOCKET_MSG_NOSIGNAL 0x4000U
+#define KERNEL_SOCKET_MSG_TRUNC 0x20U
+#define KERNEL_SOCKET_IO_MESSAGE 0x80000000U
+int kernel_socket_shutdown(struct kernel_socket *socket, int how);
+
 enum kernel_socket_option {
     KERNEL_SOCKET_REUSEADDR, KERNEL_SOCKET_KEEPALIVE,
     KERNEL_SOCKET_SNDBUF, KERNEL_SOCKET_RCVBUF,
@@ -112,6 +126,7 @@ uint32_t kernel_socket_poll(struct kernel_socket *socket,
                             struct kernel_wait_queue **queue);
 struct kernel_wait_queue *kernel_socket_wait_queue(struct kernel_socket *socket);
 uint64_t kernel_socket_next_timer_deadline(void);
+void kernel_socket_expire_timers(void);
 int kernel_socket_loopback_flags(const char name[16], uint16_t *flags);
 int kernel_socket_set_loopback_flags(const char name[16], uint16_t flags);
 

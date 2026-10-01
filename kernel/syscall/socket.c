@@ -2,6 +2,7 @@
 
 #include <kernel/errno.h>
 #include <kernel/files.h>
+#include <kernel/heap.h>
 #include <kernel/open_file.h>
 #include <kernel/scheduler.h>
 #include <kernel/signal.h>
@@ -13,6 +14,7 @@
 #include <arch/riscv/context.h>
 
 #include <stdint.h>
+#include <stddef.h>
 
 /* RV64 Linux UAPI values; see fixed references/linux/net/socket.c. */
 #define LINUX_AF_UNIX 1
@@ -46,6 +48,16 @@ struct linux_sockaddr_in6 {
     uint32_t scope;
 };
 _Static_assert(sizeof(struct linux_sockaddr_in6) == 28U, "RV64 sockaddr_in6 size");
+
+struct linux_msghdr {
+    uint64_t name;
+    int32_t name_length;
+    uint32_t padding;
+    uint64_t iov, iov_count, control, control_length;
+    int32_t flags;
+    uint32_t tail_padding;
+};
+_Static_assert(sizeof(struct linux_msghdr) == 56, "RV64 msghdr size");
 
 struct linux_timeval {
     int64_t seconds;
@@ -128,7 +140,9 @@ static int copy_address_out(struct kernel_mm *mm, uint64_t user_address,
         struct linux_sockaddr_in6 v6;
     } local = {0};
     size_t size;
-    if (address->family == LINUX_AF_INET6) {
+    if (address->family == LINUX_AF_UNIX) {
+        local.v4.family = LINUX_AF_UNIX; size = 2;
+    } else if (address->family == LINUX_AF_INET6) {
         local.v6.family = LINUX_AF_INET6;
         local.v6.port = network_port(address->port);
         local.v6.scope = address->scope;
@@ -234,7 +248,7 @@ static int sockopt(struct kernel_socket *socket, struct kernel_mm *mm,
 
 static int wait_ready(struct kernel_task *caller,
                       struct kernel_open_file_description *file,
-                      uint32_t event, uint64_t timeout_ns)
+                      uint32_t event, uint64_t timeout_ns, uint32_t flags)
 {
     struct kernel_socket *socket = kernel_open_file_socket(file);
     uint64_t deadline = 0;
@@ -261,7 +275,8 @@ static int wait_ready(struct kernel_task *caller,
         if (protocol_deadline != 0U &&
             (sleep_deadline == 0U || protocol_deadline < sleep_deadline))
             sleep_deadline = protocol_deadline;
-        if ((kernel_open_file_flags(file) & LINUX_SOCK_NONBLOCK) != 0U) {
+        if ((kernel_open_file_flags(file) & LINUX_SOCK_NONBLOCK) != 0U ||
+            (flags & KERNEL_SOCKET_MSG_DONTWAIT) != 0U) {
             riscv_interrupt_restore(saved);
             return -KERNEL_EAGAIN;
         }
@@ -440,6 +455,85 @@ enum kernel_syscall_status syscall_handle_bind(
     return KERNEL_SYSCALL_STATUS_OK;
 }
 
+static enum kernel_files_status socket_message(
+    struct kernel_files *files, struct kernel_mm *mm,
+    struct kernel_open_file_description **file,
+    const struct kernel_syscall_request *request, int64_t *result)
+{
+    struct linux_msghdr header;
+    struct kernel_uaccess_iovec local[8], *iov = local;
+    size_t copied = 0;
+    int writing = request->number == 211;
+    uint32_t flags = (uint32_t)request->arguments[2];
+    uint32_t allowed = KERNEL_SOCKET_MSG_DONTWAIT |
+        (writing ? KERNEL_SOCKET_MSG_NOSIGNAL : KERNEL_SOCKET_MSG_TRUNC);
+    enum kernel_files_status status = KERNEL_FILES_STATUS_OK;
+    *result = -KERNEL_EFAULT;
+    if (kernel_copy_from_user(mm, &header, request->arguments[1], sizeof(header), &copied) !=
+            KERNEL_UACCESS_STATUS_OK || copied != sizeof(header)) return status;
+    if (flags & ~allowed) { *result = -KERNEL_EOPNOTSUPP; return status; }
+    if (header.name_length < 0) { *result = -KERNEL_EINVAL; return status; }
+    if (header.iov_count > 1024) { *result = -KERNEL_EMSGSIZE; return status; }
+    if (writing && header.control_length != 0) { *result = -KERNEL_EOPNOTSUPP; return status; }
+    if (header.iov_count > 8) {
+        enum kernel_heap_status allocation = kernel_heap_allocate(files->heap,
+            (size_t)header.iov_count * sizeof(*iov), (void **)&iov);
+        if (allocation == KERNEL_HEAP_STATUS_EMPTY) { *result = -KERNEL_ENOMEM; return status; }
+        if (allocation != KERNEL_HEAP_STATUS_OK) __builtin_trap();
+    }
+    uint64_t count = 0;
+    if (header.iov_count != 0 &&
+        (kernel_copy_from_user(mm, iov, header.iov, (size_t)header.iov_count * sizeof(*iov), &copied) !=
+         KERNEL_UACCESS_STATUS_OK || copied != header.iov_count * sizeof(*iov))) goto out;
+    for (size_t i = 0; i < header.iov_count; i++) {
+        if (iov[i].length > INT64_MAX - count) { *result = -KERNEL_EINVAL; goto out; }
+        count += iov[i].length;
+    }
+    struct kernel_socket *socket = kernel_open_file_socket(*file);
+    struct kernel_socket_address address = {0};
+    const struct kernel_socket_address *destination = 0;
+    if (writing && header.name != 0) {
+        *result = copy_address_in(mm, header.name, (uint32_t)header.name_length, &address);
+        if (*result != 0) goto out;
+        destination = &address;
+    }
+    if (writing && kernel_socket_is_datagram(socket)) {
+        if (kernel_open_file_flags(*file) & LINUX_SOCK_NONBLOCK) flags |= KERNEL_SOCKET_MSG_DONTWAIT;
+        *result = kernel_socket_write_datagram(file, mm, iov, (size_t)header.iov_count, count, flags, destination);
+    } else {
+        uint32_t message_size = 0;
+        status = kernel_files_socket_iov_io(files, mm, file, iov, (size_t)header.iov_count,
+            count, flags | KERNEL_SOCKET_IO_MESSAGE, writing, &address, &message_size, result);
+        if (status != KERNEL_FILES_STATUS_OK || writing || *result < 0) goto out;
+        header.flags = message_size > count ? KERNEL_SOCKET_MSG_TRUNC : 0;
+        if ((flags & KERNEL_SOCKET_MSG_TRUNC) && kernel_socket_is_datagram(socket)) *result = message_size;
+        if (header.name != 0 && (!kernel_socket_is_datagram(socket) || address.family != 0)) {
+            if (!kernel_socket_is_datagram(socket)) {
+                int peer = kernel_socket_getpeer(socket, &address);
+                if (peer != 0) { *result = peer; goto out; }
+            }
+            int address_result = copy_address_out(mm, header.name,
+                request->arguments[1] + offsetof(struct linux_msghdr, name_length), &address);
+            if (address_result != 0) { *result = address_result; goto out; }
+        } else {
+            header.name_length = 0;
+            if (kernel_copy_to_user(mm, request->arguments[1] + offsetof(struct linux_msghdr, name_length),
+                &header.name_length, sizeof(header.name_length), &copied) != KERNEL_UACCESS_STATUS_OK ||
+                copied != sizeof(header.name_length)) { *result = -KERNEL_EFAULT; goto out; }
+        }
+        header.control_length = 0;
+        if (kernel_copy_to_user(mm, request->arguments[1] + offsetof(struct linux_msghdr, control_length),
+            &header.control_length, sizeof(header.control_length), &copied) != KERNEL_UACCESS_STATUS_OK ||
+            copied != sizeof(header.control_length) ||
+            kernel_copy_to_user(mm, request->arguments[1] + offsetof(struct linux_msghdr, flags),
+            &header.flags, sizeof(header.flags), &copied) != KERNEL_UACCESS_STATUS_OK ||
+            copied != sizeof(header.flags)) *result = -KERNEL_EFAULT;
+    }
+out:
+    if (iov != local && kernel_heap_release(files->heap, iov) != KERNEL_HEAP_STATUS_OK) __builtin_trap();
+    return status;
+}
+
 enum kernel_syscall_status syscall_handle_socket_operation(
     struct kernel_task *caller,
     const struct kernel_syscall_request *request,
@@ -494,47 +588,66 @@ enum kernel_syscall_status syscall_handle_socket_operation(
         if (result == -KERNEL_EINPROGRESS &&
             (kernel_open_file_flags(file) & LINUX_SOCK_NONBLOCK) == 0U) {
             result = wait_ready(caller, file, KERNEL_POLLOUT | KERNEL_POLLERR,
-                                0U);
+                                kernel_socket_send_timeout(socket), 0U);
             if (result == 0) result = kernel_socket_connection_result(socket);
         }
         break;
-    case 206: /* sendto */
-        if (request->arguments[3] != 0U) {
-            result = -KERNEL_EOPNOTSUPP;
-            break;
+    case 206: { /* sendto / send */
+        uint32_t flags = (uint32_t)request->arguments[3];
+        if (flags & ~(KERNEL_SOCKET_MSG_DONTWAIT | KERNEL_SOCKET_MSG_NOSIGNAL)) { result = -KERNEL_EOPNOTSUPP; break; }
+        const struct kernel_socket_address *destination = 0;
+        if (request->arguments[4] != 0) {
+            result = copy_address_in(mm, request->arguments[4], request->arguments[5], &address);
+            if (result != 0) break;
+            destination = &address;
         }
-        result = copy_address_in(mm, request->arguments[4],
-                                 request->arguments[5], &address);
-        if (result == 0)
-            result = kernel_socket_sendto(socket, mm,
-                     request->arguments[1], request->arguments[2],
-                     &address);
+        if (kernel_socket_is_datagram(socket)) {
+            const struct kernel_uaccess_iovec iov = {request->arguments[1], request->arguments[2]};
+            if (kernel_open_file_flags(file) & LINUX_SOCK_NONBLOCK) flags |= KERNEL_SOCKET_MSG_DONTWAIT;
+            result = kernel_socket_write_datagram(&file, mm, &iov, 1, iov.length, flags, destination);
+        } else if (kernel_files_socket_io(files, mm, &file, request->arguments[1],
+                    request->arguments[2], flags, 1, &result) != KERNEL_FILES_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
         break;
-    case 207: /* recvfrom */
-        if (request->arguments[3] != 0U) {
-            result = -KERNEL_EOPNOTSUPP;
-            break;
+    }
+    case 207: { /* recvfrom / recv */
+        uint32_t flags = (uint32_t)request->arguments[3];
+        if (flags & ~(KERNEL_SOCKET_MSG_DONTWAIT | KERNEL_SOCKET_MSG_TRUNC)) { result = -KERNEL_EOPNOTSUPP; break; }
+        const struct kernel_uaccess_iovec iov = {request->arguments[1],request->arguments[2]};
+        uint32_t message_size = 0;
+        if (kernel_files_socket_iov_io(files,mm,&file,&iov,1,iov.length,
+                flags | KERNEL_SOCKET_IO_MESSAGE,0,&peer_address,&message_size,&result) != KERNEL_FILES_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+        if (result >= 0) {
+            if ((flags & KERNEL_SOCKET_MSG_TRUNC) && kernel_socket_is_datagram(socket)) result = message_size;
+            if (!kernel_socket_is_datagram(socket) && request->arguments[4] != 0) {
+                int peer_result = kernel_socket_getpeer(socket, &peer_address);
+                if (peer_result != 0) result = peer_result;
+            }
         }
-        result = wait_ready(caller, file, KERNEL_POLLIN,
-                            kernel_socket_receive_timeout(socket));
-        if (result == 0)
-            result = kernel_socket_recvfrom(socket, mm, request->arguments[1],
-                     request->arguments[2], &peer_address);
-        if (result >= 0 && request->arguments[4] != 0U) {
-            int address_result = copy_address_out(mm, request->arguments[4],
-                request->arguments[5], &peer_address);
+        if (result >= 0 && request->arguments[4] != 0) {
+            int address_result = copy_address_out(mm, request->arguments[4], request->arguments[5], &peer_address);
             if (address_result != 0) result = address_result;
         }
         break;
+    }
     case 208: /* setsockopt */
     case 209: /* getsockopt */
         result = sockopt(socket, mm, request, op == 209);
+        break;
+    case 211: /* sendmsg */
+    case 212: /* recvmsg */
+        if (socket_message(files, mm, &file, request, &result) != KERNEL_FILES_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+        break;
+    case 210: /* shutdown */
+        result = kernel_socket_shutdown(socket, (int32_t)request->arguments[1]);
         break;
     case 202: /* accept */
         result = kernel_socket_accept_check(socket);
         if (result != 0) break;
         result = wait_ready(caller, file, KERNEL_POLLIN,
-                            kernel_socket_receive_timeout(socket));
+                            kernel_socket_receive_timeout(socket), 0U);
         if (result != 0) break;
         if (kernel_files_socket_accept(files, file, 0U, &peer_address, &result) !=
             KERNEL_FILES_STATUS_OK)

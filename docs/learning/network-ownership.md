@@ -6,7 +6,7 @@
 
 `NO_SYS` 没有独立网络线程。若服务端已睡在 accept，客户端非阻塞 connect 返回后不再调用 socket，SYN 若只留在 lwIP loopback 队列，服务端会永久睡眠。因此发起 connect 的系统调用必须推进一次 loopback，轮询与定时等待也推进协议。两进程握手测试固定顺序，排除了同进程立即 accept 偶然泵送队列的伪通过。另一条生命周期边界是 TCP `tcp_close` 在已连接状态可能暂保留 FIN/TIME_WAIT PCB；销毁 OFD 前必须先解绑指向 BoarOS 堆对象的回调，host 测试随后推进 200 秒计时并检查静态池回到基线。待 accept 子连接的 reset 也必须在 dequeue 前剔除。
 
-固定参考是本地 `references/lwip/` 和导入的 `third_party/lwip/` 同一 commit；移植只在 `net/lwip_port/`，不修改上游 core。重建入口与当前能力边界见[网络模块](../modules/kernel-network.md)。外部网卡、AF_UNIX、半关闭和 SMP 的 owner/同步仍需要单独验证。
+固定参考是本地 `references/lwip/` 和导入的 `third_party/lwip/` 同一 commit；移植只在 `net/lwip_port/`，不修改上游 core。重建入口与当前能力边界见[网络模块](../modules/kernel-network.md)。外部网卡、命名 AF_UNIX 和 SMP 的 owner/同步仍需要单独验证。
 
 后续固定 Linux read/readv 差分暴露两个消费边界：TCP 的用户复制跨页 fault 返回 `EFAULT`，下一次读取仍得到完整那段数据；UDP 的 recvfrom 复制 fault 则丢弃整个 datagram。先从 lwIP 队列摘数据再做可 fault 的用户复制会丢 TCP 字节；只 peek 后不保留身份又允许共享 OFD 的第二线程在复制时改动队首。解决办法是把队首 reservation 登记在任务和 socket，并暂移 OFD pin。提交或取消时验证同一 packet；强制退出在文件表清理前取消，避免被抛弃的内核调用栈留下悬空 reservation 或永久 pin。固定 Linux 依据为 `references/linux/net/ipv4/tcp.c`、`net/ipv4/udp.c`、`net/socket.c`，commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`。
 
@@ -40,3 +40,16 @@ setitimer 设置 SIGALRM，旧内核返回 ENOSYS，发送循环因此没有结�
 服务器下的 syscall 观察确认了设置定时器后持续发送的路径。补真实 ITIMER_REAL
 后负载能自行进入结果交换；不能把原程序被超时杀掉当作网络链路完成。定时器
 属于线程组，fork/exec/退出及信号消费的协议见[时间模块](../modules/kernel-time.md)。
+
+阻塞发送的实质差异由原 netperf 暴露：内核在已经发送一个前缀后遇到 EAGAIN，
+立即返回短写。原程序将这种短写当作计时结束，TCP_STREAM 退出 0 但有效时间
+只有 0.00 秒。固定 Linux 小预算、一次 64 KiB 的发送会继续等待并完整接收。
+BoarOS 改为等待剩余空间，保留真正 fault/信号/超时与非阻塞短写。修复后原
+TCP_STREAM 持续约一秒并交换接收结果；这说明有效工作成立，不只是流程退出。
+
+另一种边界是原 iperf 的 listener 重建：空控制探测连接会结束一轮，再建立
+listener；连续原脚本也可能撞到这个间隙，Linux 同样会拒绝/reset。受控执行器
+为每项启动新服务端，用官方 --forceflush 在 listen 后发布的 banner 握手，不
+制造探测连接；客户端 argv 与原脚本一致。原脚本另留真实子项状态，不能用这条
+受控流程掩盖其启动竞态。服务端输出与客户端输出分开，长运行服务端的主动
+终止信号、wait status 和后代回收单独记录。

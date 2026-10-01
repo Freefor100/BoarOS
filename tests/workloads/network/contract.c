@@ -6,12 +6,17 @@
 #include <netinet/tcp.h>
 #include <limits.h>
 #include <sys/time.h>
+#include <sys/uio.h>
+#include <signal.h>
 #include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
+#include <sys/syscall.h>
+#include <time.h>
 #include <unistd.h>
 
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "network:%d: %s errno=%d\n", __LINE__, #x, errno); exit(1); } } while (0)
@@ -109,6 +114,11 @@ static void options(void)
     struct pollfd ready={.fd=refused,.events=POLLOUT};CHECK(poll(&ready,1,2000)==1 && (ready.revents&POLLERR));
     CHECK(get_int(refused,SOL_SOCKET,SO_ERROR)==ECONNREFUSED);
     CHECK(get_int(refused,SOL_SOCKET,SO_ERROR)==0);
+    char byte;
+    int after_error=recv(refused,&byte,1,MSG_DONTWAIT);
+    printf("NETWORK refusal observed recv=%d errno=%d\n",after_error,errno);
+    CHECK(after_error==0);
+    CHECK(send(refused,"x",1,MSG_NOSIGNAL)==-1 && errno==EPIPE);
     CHECK(close(refused)==0 && close(unused)==0);
     int udp=socket(AF_INET,SOCK_DGRAM|SOCK_NONBLOCK,0);CHECK(udp>=0);
     a4.sin_addr.s_addr=htonl(INADDR_LOOPBACK);a4.sin_port=0;
@@ -120,11 +130,132 @@ static void options(void)
     CHECK(close(udp)==0);
     puts("NETWORK PASS options: real options, V6ONLY port isolation and UDP peer");
 }
+static void data_and_shutdown(void)
+{
+    int udp=socket(AF_INET,SOCK_DGRAM,0), outsider=socket(AF_INET,SOCK_DGRAM,0);CHECK(udp>=0 && outsider>=0);
+    struct sockaddr_in address={.sin_family=AF_INET,.sin_addr={htonl(INADDR_LOOPBACK)}};
+    CHECK(bind(udp,(void *)&address,sizeof(address))==0);socklen_t length=sizeof(address);
+    CHECK(getsockname(udp,(void *)&address,&length)==0 && connect(udp,(void *)&address,sizeof(address))==0);
+    CHECK(sendto(outsider,"wrong",5,0,(void *)&address,sizeof(address))==5);
+    CHECK(write(udp,"connected",9)==9);
+    char data[32];CHECK(recv(udp,data,sizeof(data),0)==9 && !memcmp(data,"connected",9));
+    CHECK(recv(udp,data,sizeof(data),MSG_DONTWAIT)==-1 && errno==EAGAIN);
+    CHECK((fcntl(udp,F_GETFL)&O_NONBLOCK)==0);
+    struct iovec vector[]={{"one",3},{"two",3}};
+    CHECK(writev(udp,vector,2)==6 && recv(udp,data,sizeof(data),0)==6 && !memcmp(data,"onetwo",6));
+    CHECK(send(udp,"",0,0)==0 && recv(udp,data,sizeof(data),0)==0);
+    struct msghdr message={.msg_iov=vector,.msg_iovlen=2};
+    CHECK(sendmsg(udp,&message,0)==6);
+    struct iovec output={data,sizeof(data)};struct sockaddr_in source;
+    message=(struct msghdr){.msg_iov=&output,.msg_iovlen=1,.msg_name=&source,.msg_namelen=sizeof(source)};
+    CHECK(recvmsg(udp,&message,0)==6 && !memcmp(data,"onetwo",6) && message.msg_namelen==sizeof(source) && message.msg_flags==0);
+    CHECK(sendmsg(udp,&(struct msghdr){.msg_iov=vector,.msg_iovlen=2},0)==6);
+    output.iov_len=3;message.msg_flags=0;CHECK(recvmsg(udp,&message,0)==3 && (message.msg_flags&MSG_TRUNC));
+    CHECK(send(udp,"queued",6,0)==6 && shutdown(udp,SHUT_RD)==0);
+    CHECK(recv(udp,data,sizeof(data),0)==6 && recv(udp,data,sizeof(data),0)==0);
+    CHECK(close(udp)==0 && close(outsider)==0);
+    int route=socket(AF_INET,SOCK_DGRAM,0);CHECK(route>=0);
+    struct sockaddr_in wildcard={.sin_family=AF_INET};
+    CHECK(bind(route,(void *)&wildcard,sizeof(wildcard))==0);
+    CHECK(connect(route,(void *)&address,sizeof(address))==0);
+    length=sizeof(wildcard);CHECK(getsockname(route,(void *)&wildcard,&length)==0 && wildcard.sin_addr.s_addr==htonl(INADDR_LOOPBACK));
+    CHECK(close(route)==0);
+    int listener=socket(AF_INET,SOCK_STREAM,0);CHECK(listener>=0);address.sin_port=0;
+    CHECK(bind(listener,(void *)&address,sizeof(address))==0 && listen(listener,4)==0);
+    length=sizeof(address);CHECK(getsockname(listener,(void *)&address,&length)==0);
+    int client=socket(AF_INET,SOCK_STREAM,0);CHECK(client>=0 && connect(client,(void *)&address,sizeof(address))==0);
+    int server=accept(listener,NULL,NULL);CHECK(server>=0);
+    int minimal=0;CHECK(setsockopt(client,SOL_SOCKET,SO_SNDBUF,&minimal,sizeof(minimal))==0);
+    pid_t reader=fork();CHECK(reader>=0);
+    if(!reader) {
+        CHECK(close(client)==0 && close(listener)==0);
+        unsigned total=0;char chunk[1024];
+        while(total<65536) {
+            ssize_t got=read(server,chunk,sizeof(chunk));CHECK(got>0);
+            for(ssize_t j=0;j<got;j++)CHECK(chunk[j]=='b');
+            total+=(unsigned)got;
+        }
+        CHECK(write(server,"ok",2)==2 && close(server)==0);_exit(0);
+    }
+    char *bulk=malloc(65536);CHECK(bulk!=NULL);memset(bulk,'b',65536);
+    CHECK(send(client,bulk,65536,MSG_NOSIGNAL)==65536);free(bulk);
+    CHECK(read(client,data,sizeof(data))==2 && !memcmp(data,"ok",2));
+    int child_status;CHECK(waitpid(reader,&child_status,0)==reader && child_status==0);
+    int duplicate=dup(client);CHECK(duplicate>=0);
+    CHECK(send(client,"before FIN",10,0)==10 && shutdown(duplicate,SHUT_WR)==0);
+    CHECK(recv(server,data,sizeof(data),0)==10 && !memcmp(data,"before FIN",10));
+    CHECK(recv(server,data,sizeof(data),0)==0);
+    struct pollfd ready={.fd=server,.events=POLLIN|POLLOUT|POLLRDHUP};
+    CHECK(poll(&ready,1,2000)==1 && (ready.revents&POLLRDHUP) && (ready.revents&POLLOUT));
+    CHECK(send(server,"reply",5,0)==5 && recv(client,data,sizeof(data),0)==5 && !memcmp(data,"reply",5));
+    CHECK(send(client,"bad",3,MSG_NOSIGNAL)==-1 && errno==EPIPE);
+    CHECK(shutdown(server,SHUT_WR)==0 && recv(client,data,sizeof(data),0)==0);
+    CHECK(shutdown(client,99)==-1 && errno==EINVAL);
+    CHECK(close(client)==0 && close(duplicate)==0 && close(server)==0 && close(listener)==0);
+    int pair[2];CHECK(socketpair(AF_UNIX,SOCK_STREAM,0,pair)==0);
+    CHECK(write(pair[0],"queued",6)==6 && shutdown(pair[0],SHUT_WR)==0);
+    CHECK(read(pair[1],data,sizeof(data))==6 && read(pair[1],data,sizeof(data))==0);
+    CHECK(send(pair[0],"bad",3,MSG_NOSIGNAL)==-1 && errno==EPIPE);
+    CHECK(write(pair[1],"response",8)==8 && read(pair[0],data,sizeof(data))==8);
+    CHECK(shutdown(pair[0],SHUT_RD)==0);
+    signal(SIGPIPE,SIG_IGN);CHECK(write(pair[1],"bad",3)==-1 && errno==EPIPE);
+    CHECK(close(pair[0])==0 && close(pair[1])==0);
+    CHECK(socketpair(AF_UNIX,SOCK_DGRAM,0,pair)==0);
+    int budget=4096;CHECK(setsockopt(pair[0],SOL_SOCKET,SO_SNDBUF,&budget,sizeof(budget))==0);
+    char packet[1000];memset(packet,1,sizeof(packet));unsigned filled=0;
+    while(send(pair[0],packet,sizeof(packet),MSG_DONTWAIT)==sizeof(packet))CHECK(++filled<512);
+    CHECK(errno==EAGAIN && filled>0);
+    struct timeval timeout={0,20000};CHECK(setsockopt(pair[0],SOL_SOCKET,SO_SNDTIMEO,&timeout,sizeof(timeout))==0);
+    struct timespec before,after;CHECK(clock_gettime(CLOCK_MONOTONIC,&before)==0);
+    CHECK(send(pair[0],packet,sizeof(packet),0)==-1 && errno==EAGAIN);
+    CHECK(clock_gettime(CLOCK_MONOTONIC,&after)==0);
+    long long elapsed=(after.tv_sec-before.tv_sec)*1000000000LL+after.tv_nsec-before.tv_nsec;
+    CHECK(elapsed>=15000000 && elapsed<2000000000);
+    CHECK(recv(pair[1],packet,sizeof(packet),0)==sizeof(packet));
+    CHECK(send(pair[0],packet,sizeof(packet),0)==sizeof(packet));
+    CHECK(close(pair[0])==0 && close(pair[1])==0);
+    puts("NETWORK PASS data: connected UDP boundaries/filter and shared-OFD half-close");
+}
+static void reset_and_accept_rollback(void)
+{
+    int listener=socket(AF_INET,SOCK_STREAM|SOCK_NONBLOCK,0);CHECK(listener>=0);
+    struct sockaddr_in address={.sin_family=AF_INET,.sin_addr={htonl(INADDR_LOOPBACK)}};
+    CHECK(bind(listener,(void *)&address,sizeof(address))==0 && listen(listener,1)==0);
+    socklen_t length=sizeof(address);CHECK(getsockname(listener,(void *)&address,&length)==0);
+    for(unsigned round=0;round<2;round++){
+        int client=socket(AF_INET,SOCK_STREAM,0);CHECK(client>=0);
+        CHECK(connect(client,(void *)&address,sizeof(address))==0);
+        struct pollfd ready={.fd=listener,.events=POLLIN};CHECK(poll(&ready,1,2000)==1);
+        if(!round){
+            CHECK(accept(listener,(void *)1,&length)==-1 && errno==EFAULT);
+            CHECK(accept(listener,NULL,NULL)==-1 && errno==EAGAIN);
+        }else{
+            int server=accept(listener,NULL,NULL);CHECK(server>=0);
+            CHECK(write(client,"unread",6)==6);
+            ready=(struct pollfd){.fd=server,.events=POLLIN};CHECK(poll(&ready,1,2000)==1);
+            CHECK(close(server)==0);
+            ready=(struct pollfd){.fd=client,.events=POLLERR};CHECK(poll(&ready,1,2000)==1 && (ready.revents&POLLERR));
+            CHECK(get_int(client,SOL_SOCKET,SO_ERROR)==ECONNRESET);
+            CHECK(get_int(client,SOL_SOCKET,SO_ERROR)==0);
+            char byte;CHECK(recv(client,&byte,1,MSG_DONTWAIT)==0);
+            CHECK(send(client,"bad",3,MSG_NOSIGNAL)==-1 && errno==EPIPE);
+        }
+        CHECK(close(client)==0);
+    }
+    CHECK(close(listener)==0);
+    int stats=open("/proc/boaros_net_stats",O_RDONLY);
+    if(stats>=0){char buffer[1024];ssize_t got=read(stats,buffer,sizeof(buffer)-1);CHECK(got>0);
+        buffer[got]=0;CHECK(strstr(buffer,"counter_bits=16\n") && strstr(buffer,"tcp_write_calls="));CHECK(close(stats)==0);}
+    else CHECK(errno==ENOENT);
+    puts("NETWORK PASS lifecycle: reset differs from SYN refusal; failed accept releases backlog");
+}
 int main(void)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
     addresses();
     options();
+    data_and_shutdown();
+    reset_and_accept_rollback();
     puts("NETWORK PASS contract");
     return 0;
 }

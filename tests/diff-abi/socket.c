@@ -282,6 +282,73 @@ static void unix_datagram_cases(void)
     close_socket(sv[0]); close_socket(sv[1]);
 }
 
+static void network_application_cases(void)
+{
+    struct { uint16_t family, port; uint32_t flow; uint8_t address[16]; uint32_t scope; } address6 = {.family=10};
+    long fd=SC3(198,10,LINUX_SOCK_STREAM,0);record("network.ipv6-create",socket_result(fd));abi_require(fd>=0);
+    int value=0, length=4;
+    long result=SC5(209,fd,41,26,&value,&length);
+    record("network.v6only-default",result==0 && value==0 && length==4);
+    value=1;record("network.v6only-set",SC5(208,fd,41,26,&value,4));
+    address6.address[15]=1;address6.scope=999;
+    record("network.ipv6-bind-loopback-scope",SC3(200,fd,&address6,sizeof(address6)));
+    record("network.v6only-bound-reject",SC5(208,fd,41,26,&value,4));
+    length=sizeof(address6);record("network.ipv6-name",SC3(204,fd,&address6,&length)==0 && length==28 && address6.scope==0);
+    close_socket(fd);
+    fd=SC3(198,LINUX_AF_INET,LINUX_SOCK_DGRAM,0);abi_require(fd>=0);
+    record("network.option-bad-pointer",SC5(208,fd,1,7,1,4));
+    record("network.option-short",SC5(208,fd,1,7,&value,3));
+    length=-1;record("network.option-negative-output",SC5(209,fd,1,3,&value,&length));
+    length=4;record("network.option-unknown",SC5(209,fd,1,0x7fffffff,&value,&length));
+    length=2;value=0x55555555;result=SC5(209,fd,1,3,&value,&length);
+    record("network.option-truncated",result==0 && length==2 && (unsigned)value==0x55550002U);
+    value=16384;result=SC5(208,fd,1,7,&value,4);length=4;value=0;
+    record("network.send-budget",result==0 && SC5(209,fd,1,7,&value,&length)==0 && value==32768);
+    value=16384;result=SC5(208,fd,1,8,&value,4);length=4;value=0;
+    record("network.receive-budget",result==0 && SC5(209,fd,1,8,&value,&length)==0 && value==32768);
+    struct socket_address address={.family=LINUX_AF_INET,.address=0x0100007fU};
+    abi_require(SC3(200,fd,&address,sizeof(address))==0);length=sizeof(address);
+    abi_require(SC3(204,fd,&address,&length)==0);
+    record("network.udp-connect",SC3(203,fd,&address,sizeof(address)));
+    struct socket_address peer={0};length=sizeof(peer);
+    record("network.udp-peer",SC3(205,fd,&peer,&length)==0 && peer.address==address.address && peer.port==address.port);
+    char data[16]={0};long original_flags=SC3(25,fd,LINUX_F_GETFL,0);
+    record("network.udp-per-call-nonblocking",SC6(207,fd,data,sizeof(data),0x40,0,0));
+    record("network.udp-ofd-flags",SC3(25,fd,LINUX_F_GETFL,0)==original_flags);
+    struct abi_iovec vector[]={{"one",3},{"two",3}};
+    result=SC3(66,fd,vector,2);long got=SC6(207,fd,data,sizeof(data),0,0,0);
+    record("network.udp-connected-vector",result==6 && got==6 && data[0]=='o' && data[3]=='t');
+    struct { void *name; int32_t name_length; uint32_t padding;
+        struct abi_iovec *iov; uint64_t iov_count; void *control; uint64_t control_length;
+        int32_t flags; uint32_t padding2; } message={.iov=vector,.iov_count=2};
+    record("network.sendmsg-fault",SC3(211,fd,1,0));
+    message.iov_count=1025;record("network.sendmsg-iov-limit",SC3(211,fd,&message,0));
+    message.iov_count=2;record("network.sendmsg-vector",SC3(211,fd,&message,0));
+    struct abi_iovec output={data,3};
+    message.iov=&output;message.iov_count=1;message.name=&peer;message.name_length=sizeof(peer);
+    result=SC3(212,fd,&message,0);
+    record("network.recvmsg-truncated",result==3 && message.flags==0x20 && message.name_length==16 && data[0]=='o');
+    message.iov=vector;message.iov_count=2;message.name=0;message.name_length=0;
+    abi_require(SC3(211,fd,&message,0)==6);
+    message.iov=&output;message.iov_count=1;message.flags=0;
+    record("network.recvmsg-trunc-return",SC3(212,fd,&message,0x20));
+    message.iov=0;message.iov_count=0;
+    abi_require(SC6(206,fd,"empty receive",13,0,0,0)==13);
+    record("network.recvmsg-empty-iov",SC3(212,fd,&message,0));
+    record("network.recvmsg-empty-iov-consumed",SC3(212,fd,&message,0x40));
+    record("network.udp-shutdown-read",SC2(210,fd,0));
+    record("network.udp-shutdown-eof",SC6(207,fd,data,sizeof(data),0,0,0));
+    close_socket(fd);
+    int pair[2];abi_require(SC4(199,1,1,0,pair)==0);
+    record("network.unix-send",SC6(206,pair[0],"queued",6,0,0,0));
+    record("network.unix-shutdown-write",SC2(210,pair[0],1));
+    record("network.unix-receive-before-eof",SC6(207,pair[1],data,sizeof(data),0,0,0));
+    record("network.unix-halfclose-eof",SC6(207,pair[1],data,sizeof(data),0,0,0));
+    record("network.unix-nosignal",SC6(206,pair[0],"bad",3,0x4000,0,0));
+    record("network.unix-shutdown-bad-how",SC2(210,pair[0],3));
+    close_socket(pair[0]);close_socket(pair[1]);
+}
+
 void abi_socket_cases(void)
 {
     udp_scale_cases();
@@ -765,4 +832,5 @@ void abi_socket_cases(void)
     close_socket(sv[0]);
     close_socket(sv[1]);
     unix_datagram_cases();
+    network_application_cases();
 }
