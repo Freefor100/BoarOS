@@ -48,7 +48,11 @@ python3 -B tests/io-sleep-riscv.py --kernel build/riscv/tests/kernel-io-sleep-rv
 
 `test-io-sleep-riscv` 使用 NBD 控制握手暂扣和乱序释放响应：两个不同文件冷读必须先形成两个请求，期间计算与无关缓存命中完成；八槽满队列后验证逆序完成、flush 前后顺序及超时/reset。legacy/modern × writeback/writethrough 四种配置均运行。禁用 QEMU 请求合并，避免两个相邻 guest 请求合成一个 NBD 命令掩盖门槛；不靠宿主 sleep 猜时序。失败保留 guest/server 日志和镜像。
 
-batch 因果用例先要求同一个调用在任何响应释放前发布八项；再用两个外部 writer 占槽，保持本批六个响应全部暂扣，释放外部响应后要求出现至少一项补发，随后逆序释放本批已发布项并验证最后尾项出现在 FLUSH 前。错误用例使第二个已发布 batch 写先失败，保留另一个 DMA，验证取消仍不能提前返回，再释放该 DMA 并回读确认未发布项未写入；正常单写与 batch 混合的八槽超时由 reset 收口，队列页和任务栈最终回收。运行期轮询计数仍为零。
+batch 因果用例先要求同一个调用在任何响应释放前发布八项。随后用两个外部 writer 占槽：writeback 保持本批六个响应全部暂扣，释放外部响应后要求出现至少一项补发，再逆序释放本批已发布项并验证最后尾项出现在 guest FLUSH 前；writethrough 逆序释放首批八项，随后逐项释放两条补发请求，检查完整批次、屏障和持久字节，但不单独要求外部槽先于本批槽完成。
+
+writethrough 的响应波次依据固定 QEMU v11.1.0（`references/qemu`，commit `84f07211cc5b4fc6a371559bf8a5de4fb068e648`）：`block/block-backend.c` 的 `blk_co_do_pwritev_part()` 在写缓存关闭时加 FUA，`block/io.c` 的 `bdrv_driver_pwritev()` 在 backend 不支持 FUA 时以 `bdrv_co_flush()` 模拟。当前 NBD fixture 仅声明 SEND_FLUSH，故外部 WRITE 回复不是外部 VirtIO 写完成的充分握手；这些 backend FLUSH 回复即时释放。
+
+错误用例使第二个已发布 batch 写先失败，保留另一个 DMA，验证取消仍不能提前返回，再释放该 DMA 并回读确认未发布项未写入；正常单写与 batch 混合的八槽超时由 reset 收口，队列页和任务栈最终回收。运行期轮询计数仍为零。
 
 RT 组合进展由 `make test-multi-disk-rt-riscv`（调用 `tests/multi-disk-io-riscv.py --rt-load`）单独验证：默认全局 RT 预算下，持续 FIFO/RR 子任务存在时，普通父任务与两台真实 NBD 的 READ/WRITE/FLUSH 均可完成，随后检查子任务、动态挂载、根页/堆/栈回收和两盘持久字节。该模式使用同一个 `tests/userland/multi_disk_io.c` 的显式 `/rt-load` fixture 分支，原错误隔离模式不变；详见[可睡眠存储](../learning/sleepable-storage.md#默认-rt-带宽下的存储进展)。
 

@@ -210,12 +210,18 @@ try:
                     server.stdin.write(f'release {held[1]}\ndrain\n'.encode())
                     released = True
                 if phase in ('batch', 'batch-partial') and batch_pending:
-                    threshold = 8 if batch_released == 0 else 9 if batch_released == 2 else 10
+                    if phase == 'batch-partial' and args.write_through:
+                        # Without NBD FUA, WRITE replies still require backend
+                        # FLUSH. Release the first wave, then each new WRITE.
+                        threshold = 8 if batch_released == 0 else batch_released + 1
+                    else:
+                        threshold = 8 if batch_released == 0 else 9 if batch_released == 2 else 10
                     if len(batch_writes) >= threshold and batch_released < threshold:
-                        # Release outside owners first. Require a refill while
-                        # all six initial batch replies are still held, then
-                        # reverse the seven batch replies and permit the tail.
-                        limit = 2 if phase == 'batch-partial' and batch_released == 0 else threshold
+                        limit = threshold
+                        if phase == 'batch-partial' and not args.write_through and batch_released == 0:
+                            # In writeback, require an outside-owner refill
+                            # while all six initial batch replies remain held.
+                            limit = 2
                         for held_id in reversed(batch_writes[batch_released:limit]):
                             server.stdin.write(f'release {held_id}\n'.encode())
                         batch_released = limit
