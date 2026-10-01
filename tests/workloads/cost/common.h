@@ -29,7 +29,24 @@ static void cost_begin(void)
 static void cost_end(const char *name, const char *kind, unsigned calls, unsigned long long requested, unsigned long long accepted)
 {
     struct timespec stop; CHECK(clock_gettime(CLOCK_MONOTONIC,&stop)==0);
-    if (cost_control>=0) CHECK(write(cost_control,"end\n",4)==4);
+    if (cost_control>=0) {
+#ifdef COST_END_WAIT_ASYNC
+        unsigned retries=0;
+        struct timespec closed=stop;
+        while (write(cost_control,"end\n",4)!=4) {
+            CHECK(errno==EBUSY);
+            CHECK(clock_gettime(CLOCK_MONOTONIC,&closed)==0);
+            CHECK(closed.tv_sec-stop.tv_sec<10);
+            struct timespec delay={0,1000000};CHECK(nanosleep(&delay,0)==0);
+            retries++;
+        }
+        CHECK(clock_gettime(CLOCK_MONOTONIC,&closed)==0);
+        unsigned long long closing=(closed.tv_sec-stop.tv_sec)*1000000000ULL+closed.tv_nsec-stop.tv_nsec;
+        printf("COST CLOSING %s %llu %u\n",name,closing,retries);
+#else
+        CHECK(write(cost_control,"end\n",4)==4);
+#endif
+    }
     unsigned long long ns=(stop.tv_sec-window_start.tv_sec)*1000000000ULL+stop.tv_nsec-window_start.tv_nsec;
     printf("COST RESULT %s %llu\n",name,ns);
     if (kind) printf("COST EXPECT %s %s %u %llu %llu\n",name,kind,calls,requested,accepted);

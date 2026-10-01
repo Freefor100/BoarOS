@@ -17,6 +17,12 @@ read/write/readv/writev/定位读写在 dispatch 前识别并抑制自身计数�
 控制组退出中止窗口并标 incomplete。完整用户复制先于控制发布，坏指针 EFAULT。
 控制节点使用同 OFD offset 串行机制，但完整命令不受当前 offset 限制。
 
+consumer 包装器允许同步已达到 durable、后台 checkpoint 尚在途的窗口：被测操作
+结束时先记录 `COST RESULT` 的时间边界；`end` 返回 EBUSY 时在用户态有界等待重试，
+最多十秒，并另报 `COST CLOSING name ns retries`。关闭等待属于快照覆盖区间，
+不能并入原操作延迟，也不能把原操作已成功解释成 checkpoint 已排空。其他受控
+case 的严格结束检查不变；内核的 EBUSY/inflight/complete 契约不放宽。
+
 窗口身份是递增 epoch，owner 是进程身份代次。开始覆盖控制线程组和当前后代；
 后续 fork/clone 继承 epoch，exec 保留。开始前已阻塞的成员操作重新登记在途数量，
 结束不得越过它；取消消耗本任务尚未离开的 scope，未回到的栈不成为永久诊断 owner。
