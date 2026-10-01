@@ -7,6 +7,7 @@
 #include <kernel/scheduler.h>
 #include <kernel/signal.h>
 #include <kernel/task.h>
+#include <kernel/time.h>
 #include <kernel/uaccess.h>
 
 #include <stddef.h>
@@ -17,6 +18,81 @@
 #define SIGNAL_CONTINUE 18U
 #define SIGNAL_STOP 19U
 #define LINUX_WAIT_STOPPED 0x7fU
+
+static struct kernel_task *real_timers;
+static void real_timer_remove(struct kernel_task *leader)
+{
+    if (!leader->real_timer_active) return;
+    struct kernel_task **link = &real_timers;
+    while (*link != leader) {
+        if (!*link) __builtin_trap();
+        link = &(*link)->real_timer_next;
+    }
+    *link = leader->real_timer_next;
+    leader->real_timer_next = 0;
+    leader->real_timer_active = 0;
+}
+
+static void real_timer_insert(struct kernel_task *leader)
+{
+    struct kernel_task **link = &real_timers;
+    while (*link && (*link)->real_timer_deadline <= leader->real_timer_deadline)
+        link = &(*link)->real_timer_next;
+    leader->real_timer_next = *link;
+    *link = leader;
+    leader->real_timer_active = 1;
+}
+
+static void real_timer_rearm(struct kernel_task *leader)
+{
+    if (!leader || leader->real_timer_active || !leader->real_timer_interval) return;
+    uint64_t now = kernel_time_monotonic_ns();
+    uint64_t deadline = leader->real_timer_deadline;
+    uint64_t interval = leader->real_timer_interval;
+    /* 在 SIGALRM 消费时转到下一期限；阻塞信号不会产生密集 timer 噪声。 */
+    uint64_t advance = deadline <= now ? (now - deadline) / interval + 1 : 0;
+    deadline = advance > (UINT64_MAX - deadline) / interval ? UINT64_MAX : deadline + advance * interval;
+    leader->real_timer_deadline = deadline;
+    real_timer_insert(leader);
+}
+
+void kernel_signal_timer_get(struct kernel_task *task, uint64_t *remaining, uint64_t *interval)
+{
+    struct kernel_task *leader = task->group_leader;
+    uint64_t now = kernel_time_monotonic_ns();
+    *remaining = leader->real_timer_active ?
+        (leader->real_timer_deadline > now ? leader->real_timer_deadline - now : 1000) : 0;
+    *interval = leader->real_timer_interval;
+}
+
+void kernel_signal_timer_cancel(struct kernel_task *leader)
+{
+    real_timer_remove(leader);
+    leader->real_timer_deadline = leader->real_timer_interval = 0;
+}
+
+void kernel_signal_timer_set(struct kernel_task *task, uint64_t value, uint64_t interval,
+    uint64_t *old_remaining, uint64_t *old_interval)
+{
+    kernel_signal_timer_get(task, old_remaining, old_interval);
+    struct kernel_task *leader = task->group_leader;
+    kernel_signal_timer_cancel(leader);
+    if (!value) return;
+    uint64_t now = kernel_time_monotonic_ns();
+    leader->real_timer_deadline = value > UINT64_MAX - now ? UINT64_MAX : now + value;
+    leader->real_timer_interval = interval;
+    real_timer_insert(leader);
+}
+
+void kernel_signal_timer_adopt(struct kernel_task *task, struct kernel_task *old_leader)
+{
+    uint32_t active = old_leader->real_timer_active;
+    real_timer_remove(old_leader);
+    task->real_timer_deadline = old_leader->real_timer_deadline;
+    task->real_timer_interval = old_leader->real_timer_interval;
+    old_leader->real_timer_deadline = old_leader->real_timer_interval = 0;
+    if (active) real_timer_insert(task);
+}
 
 #define SIGNAL_MASK_KILL_STOP KERNEL_SIGNAL_UNBLOCKABLE_MASK
 #define SIGNAL_MASK_STOP \
@@ -519,6 +595,7 @@ enum kernel_signal_status kernel_signal_wait_take(
     sig = signal_first_set(matching);
     if (shared) {
         leader->group_pending &= ~signal_mask(sig);
+        if (sig == 14U) real_timer_rearm(leader);
         info->sender = leader->group_sender[sig - 1U];
         info->code = leader->group_signal_code[sig - 1U];
     } else {
@@ -787,6 +864,18 @@ enum kernel_signal_status signal_send_kernel_group(struct kernel_task *target, u
     struct kernel_task *representative = signal_group_representative(target);
     return representative ? signal_send_one(representative, sig, 0, 1, 128)
         : KERNEL_SIGNAL_STATUS_INVALID_ARGUMENT;
+}
+
+void kernel_signal_timer_expire(void)
+{
+    uint64_t now = kernel_time_monotonic_ns();
+    while (real_timers && real_timers->real_timer_deadline <= now) {
+        struct kernel_task *leader = real_timers;
+        real_timer_remove(leader);
+        if (signal_group_representative(leader) &&
+            signal_send_kernel_group(leader, 14U) != KERNEL_SIGNAL_STATUS_OK)
+            __builtin_trap();
+    }
 }
 
 enum kernel_signal_status kernel_signal_send_task(
@@ -1118,6 +1207,7 @@ enum kernel_signal_select_result kernel_signal_select(
             task->signal_fault = (struct kernel_signal_fault){0};
         } else if (shared) {
             leader->group_pending &= ~signal_mask(sig);
+            if (sig == 14U) real_timer_rearm(leader);
         } else {
             task->signal_pending &= ~signal_mask(sig);
         }

@@ -283,6 +283,7 @@ enum kernel_scheduler_status kernel_scheduler_expire_deadlines(uint64_t now)
         thread = next;
     }
     COST_ADD(DEADLINE_VISITS, cost_visits);
+    kernel_signal_timer_expire();
     return KERNEL_SCHEDULER_STATUS_OK;
 }
 

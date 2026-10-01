@@ -45,3 +45,24 @@ syscall 层的 `clock_gettime(113)`、`clock_getres(114)` 支持 `CLOCK_REALTIME
 当前限制：无 NTP/阶跃调整、无 CPU-time clockid；timekeeper只在启动采样RTC，此后由CSR换算推进，用户RTC_RD_TIME仍读取设备当前值；无 SMP timekeeper 写入协议。
 
 Goldfish的真实墙钟另由10:135 RTC字符后端提供只读RTC_RD_TIME；UTC转换、OFD独占和限制见[文件设备](kernel-files.md#仅读rtc与ofd设备资格)。这没有增加RTC写入或clock_settime能力。
+
+## 应用 alarm 与进程组实时时间定时器
+
+原 netperf 2.7.0 用 libc `alarm()` 结束定时发送。RV64 libc 经 `setitimer(103)`
+实现它；缺少这个接口会让 UDP_STREAM 一直发送，不能用外部超时替代程序完成。
+`getitimer(102)` / `setitimer(103)` 已接入 ITIMER_REAL：相对单调时间到期后发送
+进程定向 SIGALRM（SI_KERNEL），一次性或周期性。周期在信号被消费时重设，
+阻塞的标准信号只保留一笔 pending，不累积每个周期的事件。
+
+定时状态归线程组身份，不是设置它的线程。只有已启用的定时器进入期限有序的
+非持引用链；timer interrupt 只检查到期项。fork 不继承，exec 保留；非组长 exec
+转移状态与链资格，组长线程退出而其他成员存活时仍可交付，最后成员退出时摘链。
+查询/变更在短 IRQ 临界区完成，用户复制在外侧。Linux 先安装新值再复制旧值，
+因此旧值输出 EFAULT 不回滚新 alarm；NULL 新值按固定 Linux 取消。时间取整与
+100 Hz timer delivery 的界限如上，不宣称高精度到期交付。
+
+依据本地 `references/linux/kernel/time/itimer.c`（Linux 7.2，版本见来源清单）。
+ITIMER_VIRTUAL / ITIMER_PROF 的 CPU 时间定时器仍返回 ENOSYS；未知 which 返回
+EINVAL。重建 `python3 -B tests/network-riscv.py --workload timer`：同 ELF 对照
+Linux，核对阻塞 read 的 EINTR、周期、坏参数/指针、fork、线程组长退出及非组长
+exec 后的交付和最终物理页/堆回收。

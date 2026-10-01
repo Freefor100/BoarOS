@@ -21,13 +21,14 @@ def digest(path):
 def main():
     parser=argparse.ArgumentParser(__doc__)
     parser.add_argument('--only',choices=('linux','boaros'))
+    parser.add_argument('--workload',choices=('contract','timer'),default='contract')
     parser.add_argument('--kernel',type=Path,default=ROOT/'kernel-rv')
     args=parser.parse_args()
     work=ROOT/'build/network'/('contract-'+str(time.time_ns()))
     work.mkdir(parents=True)
     program=work/'init'
     subprocess.run([str(ROOT/'build/riscv/musl-root/bin/musl-gcc'),'-fno-link-libatomic','-static','-O2','-Wall','-Wextra','-Werror',
-                    str(ROOT/'tests/workloads/network/contract.c'),'-o',str(program)],check=True)
+                    str(ROOT/f'tests/workloads/network/{args.workload}.c'),'-o',str(program)],check=True)
     image=harness.fixture(work,program)
     metadata={'program_sha256':digest(program),'fixture_sha256':digest(image),'runs':{}}
     variants=[]
@@ -45,10 +46,10 @@ def main():
                  '-device','virtio-blk-device,drive=root,bus=virtio-mmio-bus.0']
         if name=='linux':command+=['-append','root=/dev/vda rw rootwait console=ttyS0 init=/init loglevel=0 panic=-1']
         log=work/(name+'.log')
-        try:harness.run_logged(command,log,30)
+        try:harness.run_logged(command,log,60)
         except (RuntimeError,TimeoutError):pass
         raw=log.read_text(errors='replace')
-        passed='NETWORK PASS contract' in raw
+        passed=f'NETWORK PASS {args.workload}' in raw
         if name=='boaros':passed=passed and 'heap-live=0x0; shutting down' in raw and 'exited status=0x0 ' in raw
         metadata['runs'][name]={'passed':passed,'kernel_sha256':digest(snapshot),'command':command}
         print(name, 'PASS' if passed else 'FAIL',work)

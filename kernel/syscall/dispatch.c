@@ -91,6 +91,8 @@
 #define LINUX_SYSCALL_CLOCK_GETTIME 113U
 #define LINUX_SYSCALL_CLOCK_GETRES 114U
 #define LINUX_SYSCALL_NANOSLEEP 101U
+#define LINUX_SYSCALL_GETITIMER 102U
+#define LINUX_SYSCALL_SETITIMER 103U
 #define LINUX_SYSCALL_CLOCK_NANOSLEEP 115U
 #define LINUX_SYSCALL_GETTIMEOFDAY 169U
 #define LINUX_SYSCALL_TIMES 153U
@@ -342,6 +344,9 @@ enum kernel_syscall_status kernel_syscall_dispatch(
         if (syscall_handle_chmod(caller, request, &decoded,
                 request->number == LINUX_SYSCALL_FCHMOD) !=
             KERNEL_SYSCALL_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    } else if (request->number == LINUX_SYSCALL_GETITIMER || request->number == LINUX_SYSCALL_SETITIMER) {
+        if (syscall_handle_itimer(caller, request, &decoded) != KERNEL_SYSCALL_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     } else if (request->number == LINUX_SYSCALL_STATFS ||
                request->number == LINUX_SYSCALL_FSTATFS) {

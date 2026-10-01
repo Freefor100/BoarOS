@@ -7,6 +7,13 @@
 
 struct kernel_task;
 
+void kernel_signal_timer_get(struct kernel_task *task, uint64_t *remaining, uint64_t *interval);
+void kernel_signal_timer_set(struct kernel_task *task, uint64_t value, uint64_t interval,
+    uint64_t *old_remaining, uint64_t *old_interval);
+void kernel_signal_timer_expire(void);
+void kernel_signal_timer_cancel(struct kernel_task *leader);
+void kernel_signal_timer_adopt(struct kernel_task *task, struct kernel_task *old_leader);
+
 struct kernel_signal_wait_info {
     uint32_t signal;
     uint32_t sender;

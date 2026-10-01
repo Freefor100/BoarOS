@@ -34,3 +34,9 @@ BoarOS 用不持引用的 endpoint 列表检查真实地址交集，生命周期
 补丁没有修改 lwIP core。V6ONLY 两族隔离、UDP 默认对端/解除及 SYN 拒绝的
 SO_ERROR 清除，均由相同用户态回归验证。TCP_MAXSEG 来自协议 PCB，未知
 TCP_INFO 继续报不支持，不能当成已提供统计。
+
+原 netperf 的 UDP_STREAM 暴露了网络之外的直接依赖：libc alarm 经 RV64
+setitimer 设置 SIGALRM，旧内核返回 ENOSYS，发送循环因此没有结束信号。有效
+服务器下的 syscall 观察确认了设置定时器后持续发送的路径。补真实 ITIMER_REAL
+后负载能自行进入结果交换；不能把原程序被超时杀掉当作网络链路完成。定时器
+属于线程组，fork/exec/退出及信号消费的协议见[时间模块](../modules/kernel-time.md)。
