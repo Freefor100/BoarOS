@@ -1,392 +1,85 @@
 # 开发路线与验收
 
-本文是唯一开发路线入口，保留 P/N/L 编号便于引用。`[x]` 只表示具体交付已验收，
-不代表整个子系统或 Linux 兼容完成。固定依据由 `references/sources.tsv` 管理；
-Linux 为 `references/linux` 的 `f4cdf7ca9a1fdcca413157df19753f388a5a224e`。
-历史评审是调查输入，不自动成为设计批准。
+本文是唯一开发路线入口。P/N/L 编号保留为能力与依赖索引，不是机械执行顺序。
+`[x]` 只表示具体交付已验收；历史测量、输入身份和可重建命令归现有 learning。
+固定 Linux 为 `references/linux@f4cdf7ca9a1fdcca413157df19753f388a5a224e`，
+其他资料由 `references/sources.tsv` 管理。评审是调查输入，不自动成为实现或验收证据。
 
-此前于 `main@959da70` 完成仅文档审计；下面独立 Review 小节记录新一轮实际修复与验证。
-下列“已交付”引用该阶段证据，“未实现”据当前源码，“待定位”不等于已证实内核缺陷。
+## 当前轮：性能纠错与用户环境补全（2026-10-01）
 
-## 存储流水线与性能演进（2026-10-01，实现及回归完成，收益未达标）
+从 `main@6dce5a197dc8` 推进已确认的 A+B 路线。当前轮不设置固定吞吐倍数，
+不把 iozone 分数或接近 Linux 作为功能开发的前置条件。每项优化交付可复现机制、
+成本变化、真实程序的完成效率/响应及正确性和资源代价；内部计数下降不单独代表收口。
 
-维护者已选择完成存储流水线，沿 `main@c53eadf` 推进。保留 ordered-data/log/commit
-和恢复契约，解决前台重复准备、操作数阈值等待完整 checkpoint、同步完成与 checkpoint
-耦合及逐块 I/O。S6–S8 实现与最终正确性回归已完成，S9 测量已完成但性能门槛未通过；旧 S0–S5 的验收记录保留。
-
-| 阶段 | 交付与状态 |
+| 任务 | 交付与状态 |
 |---|---|
-| S6 操作准备与封口 | [x] 独立 undo、同块增量 credit、块载荷/owner 分离与有界池；65 次操作及提交暂扣时可开新组，FIFO 满等 sealed，真实预算/日志/复用不足等 checkpoint |
-| S7 提交与 checkpoint | [x] 两组冻结 FIFO、一组提交中及 checkpoint FIFO；commit 后发布 durable，连续 checkpoint 批次持久更新起点后释放日志/quarantine；宿主环绕/断电、真实 RV64 及最终 lwext4/SQLite 恢复矩阵通过 |
-| S8 批量 I/O 与热读 | [x] 最多八 span 的可选块批量接口、VirtIO 发布/收割与逻辑调用 owner；relatime 无更新共享查询，更新时独占重查 |
-| S9 消费者与收口 | [ ] 执行与归档完成：三次 OFF 原消费者、四个完整 ON 原窗口及仅补跑的四个短同步窗口、一次1GiB专项；main 已单向合入兼容分支。十格写入五倍、自动耗时减半及 musl 普通读不回退门槛未通过，保留为未关闭目标 |
+| A1 缓存查询顺序 | [ ] 固定生产目标8块，先命中并取得引用、未命中才回收；保留 allocator 重查、dirty/loading/journal owner 和错误规则；宿主回归及8/64独立容量对照 |
+| A2 读取来源 | [ ] 必要的命中/回收/加载等待计数，实际设备发布处按可证明的 file/metadata/prepare 分类，unknown 保留；默认关闭，聚合≤64KiB、每任务≤64B |
+| A3 并发读进展 | [ ] 原四进程(0,1)配握手开始、各8MiB/1KiB请求的同/不同inode固定工作量；区分启动、ready、锁/设备等待及停止规则，修复有因果证据的局部错误 |
+| B1 内核日志（P5c） | [ ] 16KiB真实日志环与完整klogctl 0–10，RV64 syscall116；内核/用户控制台分离，阻塞/游标/清空/fault/权限和实际级别控制 |
+| B2 RTC和根盘（P5c/P1f） | [ ] Goldfish RTC_RD_TIME、10:135节点及OFD独占生命周期；实际根设备来源和镜像节点，原hwclock/df真实内容 |
+| B3 程序分类（P0d） | [ ] 环境、辅助程序、未实现/未到达、预算、程序错误与性能回退分列；保留原脚本/ELF/argv和wait status，原BusyBox55/55及内容验收 |
 
-事务硬预算仍为 `min(4MiB, RAM/32)`，空闲池上限 `min(256KiB, 预算/4)`，计入预算。
-普通写、错误/短写、时间语义、版本所有权、msync pin、close/退出和卸载契约保持。
-内部等待明确区分 sealed/durable/checkpoint；不将计数阈值当真实空间耗尽。
+A1完成后运行相关lwext4、真实加载等待/回收、四组合io-sleep及SQLite DELETE/WAL
+正常/重启。进一步触及事务、写回或队列顺序才升级完整故障恢复矩阵和双盘隔离。
+最终候选集中一次RV64、真实musl/glibc、现有1091及新增ABI、栈检查；相关失败或新改动
+只重跑影响范围。性能只测两种libc自动模式与(0,1)：三个串行OFF启动、一个定点ON启动，
+复用匹配S9基线；身份不匹配才补对应旧对照。程序、durable收尾、fixture完整checkpoint
+排空分别计时，不新增用户syscall。不重跑C0–C6或八组专项。
 
-验收以匹配的 S5 基线为准：五项写方法的十格 Parent 中位吞吐目标≥5倍，自动模式
-程序完成加最终排空至少减半；固定字节热读不得退化超过5%，原消费者 Parent 读项不得
-退化超过10%。同时报告 Max、Children、实际传输量、同步延迟、排空、内存峰值和剩余成本。
-默认关闭观测，聚合≤64KiB、每任务诊断标量≤64B；不重跑 C0–C6。
-最终机制变化要求完整 lwext4/SQLite DELETE/WAL 恢复矩阵、双盘隔离、RV64、真实
-musl/glibc、1091 ABI、scale、四组合 io-sleep 和栈检查；失败后只重跑受影响范围。
-完整 Harness 缺 `kernel-la` 仍阻塞，不 push、发布或转换阶段。
+通用实现沿main逐问题提交，使用`Co-authored-by: GPT-6.1 Sol <codex@openai.com>`；
+最终候选单向合入oscomp-rv-compat，旧glibc属于兼容配置。结果入Git后预览/执行
+`make prune-build`，保留可复用缓存；不push、发布或阶段转换。完整Harness仍缺kernel-la。
 
-最终默认内核 `75682369a7aed056d0f85f70413d8c31d577322707e57a0bd2d2dc629eb9dac6` 的
-完整 lwext4、SQLite DELETE/WAL 恢复、双盘隔离、RV64、真实 musl/glibc、1091 ABI、scale、
-四组合 io-sleep 与栈检查通过。SQLite DELETE/WAL 共322个切点，每个恢复两次并检查文件系统；
-错误序号的106次实际注入与9次未到达分别记录。栈检查1729函数，最大2368B。
-关闭观测十格 Parent 为旧值0.98–1.88倍；自动程序加 fsync 收尾中位12.668/14.339秒，
-比旧16.472/18.393秒下降23.09%/22.04%。该收尾是 durable 目标，完整 checkpoint 排空
-由最终卸载保证，未单独计时；仅程序耗时已超过减半门槛，因此不能称目标达到。
-原专项25.0271/25.3164；观测自身、真实同步边界、原字段分布与限制见[验收](learning/cost-baseline.md#s9-存储流水线验收2026-10-01)。
+## 下一阶段：完整loopback网络应用（N2）
 
-收口待办仍须先调查再确认路线：musl `(0,1)` 普通读 Parent 回退17.05%，三个 OFF 副本
-最少工作量均为5KiB，Max反而提高；尚未唯一定位这一分布变化的因果，不以最快任务掩盖回退。
-自动模式提交仍510组，前台仍24576次1KiB写、96MiB staging请求、154169次缓存探测；
-更少分配和更深队列不足以达到五倍。新的时间更新接入、staging/usercopy、读来源或批次
-政策改造需另选路线；本轮不改变64操作/100ms边界，也不把未经测量的候选标为收益。
+本轮之后优先定位原iperf的ECONNRESET，打通监听、连接、accept、阻塞/非阻塞传输、
+关闭和事件通知，再运行原iperf/netperf实际工作流程，最后考虑真实网卡（N3）。
+中等规模离线C工程（P5d）和交互式shell/TTY/凭据（P2d/P2e）是后续应用候选，
+由实际调用缺口牵引，不提前铺开所有syscall。LoongArch是双架构交付独立依赖（L），
+不等待RV64性能达到某个数字；SMP（P6）单独处理跨核owner、锁、IPI/TLB和回收。
 
-后续顺序为 resident 范围索引 → 只含有期限任务的 deadline 索引 → 长 IRQ-off 的安全
-分段/抢占边界 → usercopy/分配固定成本 → 缓存政策和真实网络应用 → SMP/实板与多核编译。
-每项先按真实应用和已有计数确定价值，再确认具体结构；本轮不实现这些重构。
-性能术语、已确认成本和统计边界见[性能全景](learning/cost-baseline.md#性能全景与存储流水线2026-10-01)。
+## 按证据触发的性能候选
 
-## 异步日志与 I/O 优化（2026-10-01，已验收）
-
-已选择完整异步日志、跨调用组提交和提交线程，保持 ordered-data/log/commit 屏障及恢复正确性。
-默认 100ms 首次脏化期限、64 操作或 256KiB 软批次边界；每挂载点事务内存上限 min(4MiB, RAM/32)。
-原版 musl/glibc 五项代表写入共十格须各达到旧中位吞吐的 10 倍，自动模式耗时至少减半。
-通用修改在 main，最终单向 merge 到 oscomp-rv-compat；不改 main uname，不 push。
-
-| 阶段 | 状态与依赖 |
+| 触发证据 | 候选与必要代价 |
 |---|---|
-| S0 根因复现 | idle 安全返回和后到者抢锁已由旧实现的 1/2 个失败证伪；事务隔离/版本交错与真实无 timer IRQ 因果对照已通过 |
-| S1 操作隔离与冻结版本 | 1/4 KiB 实际引擎、后操作 OOM、冻结后零分配与版本交错通过；mount 保留已接受修改 |
-| S2 后台组提交/checkpoint | 已接入每 mount joinable worker、期限/批次、容量预算和不可变 checkpoint；真实 RV64 窄验证通过 |
-| S3 同步及生命周期 | full/data、后端锁释放等待、unlink/truncate/卸载已接入；SQLite DELETE/WAL 正常与重启通过；lwext4 与 SQLite DELETE/WAL 完整恢复及双盘隔离通过；近满盘等待另有因果对照 |
-| S4 idle IRQ 与 FIFO 交接 | 聚焦实现通过 test-scheduler-cases-riscv（1/8/32 等待者）及 test-scheduler-riscv；完整 RV64、musl/glibc、1091 ABI、scale、四组合 io-sleep 与栈检查通过 |
-| S5 原消费者与收益 | 三次关闭观测原版八组均执行，各 libc 七组可用方法完成；十格写吞吐中位改善 25.29–54.00 倍、自动耗时下降 95.51%–96.04%；一次定点归因、两次短同步参考及一次 1GiB 原专项完成，读回退和同步差距单列 |
+| 重复读取/未命中仍支配目标应用阶段 | 回收预算、必要预读或可省读取；核对内存峰值、压力和脏数据一致性 |
+| 每组有效修改少且操作数主导封口 | 重复修改合并/组预算；核对脏数据年龄、内存/日志空间和同步尾延迟 |
+| checkpoint阻塞提交或最终排空成本显著 | 有界批次和调度；核对积压、日志环绕、低内存、卸载及完整恢复 |
+| 固定热缓存负载运行成本高 | staging复用、重复解析/复制/查询；保留EFAULT前缀、取消和页生命周期 |
+| 真实大映射/多等待者负载规模退化 | resident范围索引、deadline索引或安全长操作边界；核对维护成本、OOM和取消 |
 
-最终候选一次执行实际持久化机制所需的恢复矩阵与扩大回归。既有成本矩阵不重跑，完成的检查仅在相关修改或失败后重跑。
+每次选择一个有独立证据的机制，不把这张候选表当成新排期，不换调度器来解释尚未归因的分布。
 
-完整结论、各次输入、分布和重建命令见[机制与性能验收](learning/cost-baseline.md#异步日志与组提交验收2026-10-01)。
-本轮性能目标达到；重新核对重读原字段，Max 中位下降36%–38%，Parent 则提高12%–13%，不能称整体读退化；
-热写 O_DSYNC/fdatasync 仍明显落后于固定 Linux，版本预留仍有大量分配/清零。
-这些是 S5 收口时保留的成本；随后已选择上文 S6–S9 路线。完整 Harness 因缺 kernel-la 继续阻塞。
+## 已交付与历史证据
 
-## 独立 Review 的组合边界（2026-09-30）
-
-核实起点为 `main@d2a548d`，Review ZIP SHA-256 为 `c462c3a48c6ed22ea83118c4117a9d113f25e455192a9224016aeb8166bb0c7f`；八个关键文件与该起点一致。旧 1031 条 ABI、VMA/scale 基线缺少本次组合边界，不能反证本次缺陷。修复后新增回归先证伪旧实现，最终 1091 条固定 RV64 Linux/BoarOS 记录一致。完整 RV64、musl、glibc 五种形态、四组合 io-sleep、scale 与栈检查通过；栈静态分析覆盖 1674 函数，最大 2368 字节。SQLite WAL/重启双侧及当前内核的 126 切点、26 写失败、16 flush 失败恢复矩阵通过，固定输入见[恢复记录](learning/record-lock-sqlite-recovery.md)。独立全改动审查未发现 Critical/Important 缺陷。
-
-完整比赛 Harness 保持阻塞、未执行：本地 `references/oscomp-autotest/kernel/run.py`（commit `d1bb3a3c4b27274e196a2648518525c1a304e339`）同时启动 `kernel-rv` 与 `kernel-la`，当前 `make all` 只有前者且后者缺失。不能以本轮 RV64 测试替代双架构验收；本轮没有 push、发布或阶段转换。
-
-2026-09-30 独立 Review 的组合边界修复：
-
-- [x] R1（`7d89d2f`）：SHM 附加 registry OOM 回滚不消费段表 owner；scale 聚焦故障后重试及最终页回收通过。
-- [x] R2（`e5769ee`）：显式 attachment 与通用 VMA 片段 open/close；覆盖分裂、起始页撤销、RMID、匿名/文件/SHM 固定替换、fork/退出与 metadata/page OOM，保持 prepare/commit 失败原子性。
-- [x] R3（`f30f521`）：file-source 操作 pin 覆盖 msync 的 inode 等待与错误游标；三任务最后撤映射、终止请求、同步/关闭失败及最终清理通过四种 io-sleep 配置。
-- [x] R4（`5008e09`）：AF_UNIX DGRAM 整包复制/提交、零消息和整包预算；差分、scale OOM/fault/容量复用与真实 pthread 整包等待/取消通过。
-- [x] R5（`d8052ee`，完成断言修正 `c76bd0e`）：线程同步故障记录与统一返回交付、si_code/si_addr、阻塞/忽略强制默认；真实 U-mode 修复/上下文返回、坏帧和默认组退出及 5 条固定 Linux 故障差分通过。
-- [x] R6（`dad0005`）：通用 `maximum_permissions` 替代文件专用布尔量；只读附件 WRITE 升级在 PTE 修改前返回 EACCES，split/fork 保留上限，8 条新增固定 Linux 差分通过。
-- [x] R7（`dd1467c`）：rank 15 inode 写操作门闩覆盖整次 write/writev/pwrite/append/同步收尾与截断；四种 io-sleep 配置、同 inode 缺页缓冲、实际 U-mode 向量追加和 partial-write 通过。SQLite WAL/重启双侧及完整 WAL 恢复矩阵通过。
-- [x] R8（`b104889`）：已有 key 的零大小查找与创建下限分开；已有/缺失 key、零/合法/超原段大小、CREAT/EXCL 的 20 条新增固定 Linux 差分通过。
-
-## 已交付：进程身份、可信随机数与真实调度
-
-从 `main@b5593ca` 演进，统一 TID/TGID/PGID/SID 身份对象、会话/进程组、
-coarse clock、VirtIO RNG 与随机接口，以及 OTHER/FIFO/RR、CPU0 affinity 和
-全局实时带宽已交付。默认周期 1 秒、预算 950 毫秒是本项目选定参数。
-该阶段完整差分 **1000 条匹配**；228 项清单 **227 pass、原 BusyBox 包装器 1 项失败**，
-逐 ID 无回退。固定 BusyBox、libc daemon、原 iperf/cyclictest 的实际调用链、
-原静态/动态 utime 各 30 次双侧复跑，以及普通/实时双盘进展均有证据。
-RISC-V、userland/glibc、规模、睡眠 I/O、栈、离线 GCC ext4/tmpfs、ext4 恢复与
-SQLite DELETE/WAL 完整矩阵通过；不同验证快照的边界明确分列。
-
-证据与重建命令见[完整差分](modules/differential-abi.md)、
-[程序清单](learning/user-program-inventory.md)、[消费者](learning/session-consumers.md)、
-[调度](learning/kernel-scheduling.md)及[恢复矩阵](learning/record-lock-sqlite-recovery.md)。
-本阶段未扩展 TTY、完整凭据、PI futex、PID namespace、nice 权重或 SMP，
-不承诺硬实时；iperf 网络连接、mlock、chown 和 cgroup 缺口保留独立归属。
-固定依据为本页 Linux 和 QEMU v11.1.0；实际运行 QEMU 为 11.1.1。
-
-## 前置交付与历史证据入口
-
-历史数字用于识别阶段，不替代上方最新基线；逐次输入哈希、失败原因和重建命令归 learning。
-
-| 已交付基础 | 证据入口 |
+| 阶段/能力 | 事实与证据入口 |
 |---|---|
-| child-TID、shebang、PID 1 配置、设备节点 | [线程与 futex](learning/threads-and-futex.md)、[ELF](learning/elf-loading.md)、[根启动](modules/riscv-root-boot.md) |
-| 通用 VFS、挂载路径、proc 代次/OFD、fd 复用压力 | [VFS](modules/vfs-ext4.md)、[procfs](modules/procfs.md) |
-| 真实内存/sysinfo、阈值写回、水位回收、可睡眠 I/O | [内存](learning/memory-management.md)、[存储](learning/sleepable-storage.md) |
-| 统一内存后备、tmpfs、硬链接、真实第二盘 | [多挂载验收](learning/memory-backed-mounts.md)、[tmpfs](modules/tmpfs.md)；该阶段为 783 条 ABI |
-| 进程/随机/调度与完整存储矩阵阶段 | [消费者](learning/session-consumers.md)、[程序清单](learning/user-program-inventory.md)、[恢复](learning/record-lock-sqlite-recovery.md)；该阶段为 1000 条 ABI |
+| R1–R8组合边界 | SHM owner/attachment/权限、msync pin、整包DGRAM、同步故障与整次写门闩已交付；1091 ABI及RV64/真实libc/恢复证据见[组合边界](learning/cost-baseline.md)、对应模块和Git提交 |
+| 进程身份、随机、调度 | TID/TGID/PGID/SID、coarse clock、可信VirtIO RNG、OTHER/FIFO/RR与实时预算已交付；见[消费者](learning/session-consumers.md)、[调度](learning/kernel-scheduling.md) |
+| C0–C6成本测量 | 已收口的窗口/输入/开销/unknown与原消费者结果见[成本基线](learning/cost-baseline.md)、既有JSON归档；不重复保留测量待办 |
+| S0–S5异步日志与交接 | 私有undo、running/frozen组、mount worker、idle IRQ和FIFO资格已交付；原五项写吞吐实测改善25.29–54.00倍，属于历史测量而非新准入条件 |
+| S6–S8存储流水线 | 增量预留/有界池、sealed/durable/checkpoint分离、八span批量和共享relatime已实现及恢复验收；见[S9报告](learning/cost-baseline.md#s9-存储流水线验收2026-10-01) |
+| S9消费者收口 | 测量/归档与正确性验收完成；原性能预期未达：Parent写0.98–1.88倍，自动程序+fsync收尾12.668/14.339秒，改善23.09%/22.04%；musl读Parent回退17.05%转A3，完整checkpoint未单独计时转本轮fixture |
+| 挂载/共享/数据库/工具链 | 统一后备、tmpfs、多盘、SysV shm、SQLite DELETE/WAL及固定小型离线GCC已交付；[多挂载](learning/memory-backed-mounts.md)、[恢复](learning/record-lock-sqlite-recovery.md)、[工具环境](modules/program-environment.md) |
 
-正常开发沿 main；评测分支只单向接收已验收主线，其 uname/镜像适配和正式成绩
-不合回通用实现。旧评测结果不是本轮成绩，分支交接、push、发布及正式评分由维护者决定。
-仅在有新机制/证据时更新 README、模块与 learning，依赖/阻塞/优先级只在本页维护。
-阶段收口记录可重建输入与结论后预览并执行 make prune-build；原始参考镜像保留，
-运行副本、日志及临时 plan/spec 不入库。
+S9最终默认内核SHA为`75682369a7aed056d0f85f70413d8c31d577322707e57a0bd2d2dc629eb9dac6`；
+该轮完整恢复/双盘/RV64/libc/1091 ABI/scale/四组合io-sleep/栈通过。原1GiB专项
+25.0271/25.3164不是完整Harness。mtime事务已组提交，后端重阻塞已为零，不能继续当作
+尚未实现的下一轮任务。当前缓存顺序缺陷在未改HEAD宿主复现为0/800/100/0新增读；
+修复结果和真实负载收益仍待本轮验收，外部评审数字不替代本项目证据。
 
-### 直接观测的缺口与定位队列
+## 当前应用阻塞与能力边界
 
-依据为固定 autotest `d1bb3a3` 原镜像诊断及最新进程阶段独立复跑。下表明确区分已解除、仍阻塞和待定位；未到达不等于已测失败。
-
-| 观测 | 结论边界与归属 |
+| 问题 | 当前边界/归属 |
 |---|---|
-| libctest 包装器存在却 not found | P1h 真实 self/exe 已解除 BusyBox ENOEXEC 回退的前置阻塞；内部失败需按 libc 与 syscall 分别复现，不能再归为内核缺 shebang |
-| LTP 缺 meminfo，最终反复读 /proc/5/stat | 真实 Cached/MemAvailable 已交付；独立原 abort01 越过内存查询，首次停在 chown ENOSYS。历史反复查询不能据此推断等待死锁 |
-| LTP 到 `cgroup_fj_proc` 后无输出 | 独立 Linux/BoarOS 均在无参数 helper 的 sigsuspend 等待，3 秒后 SIGKILL/wait 正常；原 runner 无参数枚举辅助程序会耗尽预算。function 的参数和控制器缺口另列；本轮复跑已越过 setpgid，见程序清单 learning |
-| BusyBox df/ps/free 的实际内容 | 目录枚举修正后 ps 实际列出进程；最新清单的 df 列出 /dev/shm 的 tmpfs，但仍跳过来源名 rootfs 的根盘；free 已通过并由真实 sysinfo/meminfo 提供非零容量、缓存与可用量；df 的来源策略仍单列，不以退出 0 算内容正确 |
-| dmesg klogctl 未实现 | P5c 日志接口，必须有真实内容与权限边界 |
-| hwclock 无 RTC 字符接口 | 最新原包装器无法打开 /dev/misc/rtc；内核已有 RTC 时钟来源不等于已提供用户 RTC 设备/ioctl，归 P5c |
-| 历史 kill 10 未计分 | 原目标/脚本环境需单列；最新 55 子项包装器的启动子进程再 kill 已通过，不能继续当作该清单失败 |
-| cyclictest 原 affinity/调度阻塞 | 本轮原 ELF 已真实调用调度接口并完成 C:10；mlock 仍 ENOSYS，尚不声明完整延迟或锁页能力 |
-| hackbench 创建 fdpair 失败 | N2 已交付 AF_UNIX / socketpair (199)，支持 STREAM/DGRAM、背压与关闭语义，原版 hackbench 运行通过且关机 heap-live=0 |
-| iperf 原随机/daemon 阻塞 | 原 iperf 客户端已越过随机接口与 affinity，当前停在 loopback connect ECONNRESET；另有独立 libc daemon 探针通过，未宣称原 iperf daemon 模式完成 |
-| iozone 吞吐 shmget ENOSYS | P4f SysV IPC 已交付 shmget/shmat/shmdt/shmctl，支持 IPC_PRIVATE 与命名 key、RMID 延迟销毁和 fork/exit 继承与清理，原阻塞解除 |
-| iozone 自动模式能完成，慢写和日期异常 | P0/P7 分别复现时间 ABI 与写入成本；不是永久卡死证据 |
-| lmbench /tmp/hello 启动错误仍有计时 | 原镜像 hello 脚本写死 `/code/lmbench_src/bin/build/lmbench_all`，根盘缺该目录；评测分支按 libc 链接镜像自带二进制，不能把原环境缺口归为通用 exec 失败 |
-| glibc libctest static utime 一轮通过、一轮失败 | 原镜像 libc 的 time() 使用 CLOCK_REALTIME_COARSE，BoarOS 返回 EINVAL 后旧 libc 仍读取结果，导致比较不稳定；独立 realtime/UTIME_NOW/fstat 跨秒正确。本轮已补齐 coarse clock，原静态/动态 ELF 双侧各 30 次通过；作为已关闭缺口保留原因，见时间戳 learning |
-| musl LTP、Lua、netperf 未到达 | 本轮没有独立能力结论，历史诊断与新基线分开 |
+| 原BusyBox53/55 | dmesg缺klogctl、hwclock缺RTC字符接口；df跳过来源rootfs的根盘，分别归B1/B2 |
+| iperf/netperf | 原iperf越过随机/affinity后connect ECONNRESET；netperf未有独立完整结论，归下一阶段N2 |
+| LTP/helper | abort01到chown ENOSYS；cgroup_fj_proc无参数在Linux/BoarOS都等待，不是调度死锁；helper身份由固定上游调用规则确认 |
+| 用户内存/信号 | mremap、按操作madvise、mlock、sigaltstack、实时信号队列、共享文件/PI futex待真实应用需求触发 |
+| 系统与平台 | 固定root查询不等于完整凭据/权限；无完整TTY、真实网卡、SMP/实板、kernel-la，不声明完整Linux兼容或硬实时 |
 
-待定位项先交付独立复现与结论，再决定机制修改；不按分数猜测根因。
-
-## 当前局限与证据边界
-
-| 方向 | 已有基础 | 尚缺能力或尚未证明的结论 |
-|---|---|---|
-| IPC / 共享内存 | 共享匿名、统一后备对象、tmpfs/POSIX shm、匿名共享 futex、AF_UNIX/socketpair、SysV 共享内存 | SysV 信号量与消息队列尚无入口；AF_UNIX 命名端点/SCM_RIGHTS、共享文件 futex、PI 仍缺 |
-| 文件与存储 | 页缓存、阈值写回、真实同步、日志恢复、多盘独立 owner；S6–S8 增量预留、独立 durable/checkpoint、八项批量与共享 relatime 查询，最终恢复通过 | 范围写回仍顺序扫描；无周期页缓存清脏、预读或负目录项缓存；S9 五倍/减半目标未达到，musl普通读 Parent 回退17.05%尚未关闭 |
-| 并发与调度 | 单 hart IRQ 等待、每盘八槽、读共享/写独占、FIFO/RR 及预算 | 单盘后端写事务串行；同 OFD 位置、命名空间和冲突 inode 互斥；八槽不代表每个应用都可产生八个并发请求；无 SMP/PI/硬实时 |
-| 内存与信号 | demand paging、COW、fork、线程与标准信号 | mremap、按操作区分的 madvise、mlock、sigaltstack、实时信号队列未交付 |
-| 系统环境与安全 | sysinfo/proc、会话、可信虚拟熵源、固定 root 查询 | klogctl、RTC 字符接口、完整凭据/权限、TTY、内核栈 guard、实板熵源仍缺；canary 不等于 guard |
-| 网络与应用 | IPv4 loopback、原 socket entry、原 cyclictest C:10、固定离线 GCC | iperf 连接差异未归因，netperf 尚无独立结论；无真实网卡；更大 C/Rust 构建、完整 libc/LTP 未证明 |
-
-`busybox.official` 是唯一未通过的顶层清单案例，但内部为 **53/55**：dmesg 与 hwclock
-失败。Linux 同脚本 55/55；shell exit 0 不代表断言通过。df 根盘展示另有内容缺口。
-这不缩减上表范围，也不表示当前 1091 条 ABI 覆盖所有 Linux 接口。
-
-## 后续开发顺序与进入条件
-
-保持用户态兼容性优先；以下是建议排期与验收边界，尚未批准任何新子系统架构。
-AF_UNIX/socketpair 与 SysV 共享内存已在本轮分别交付并闭环验证。存储成本诊断、
-系统环境小闭环与真实消费者定位继续推进。
-
-| 阶段 | 工作与最小交付 | 进入下一步的证据 |
-|---|---|---|
-| 已完成：IPC 复现与路线 | 固定 hackbench、iozone 原 ELF/参数并确认调用链；AF_UNIX 复用 socket endpoint/OFD，SysV 段表复用 memory_object，路线已选定 | 原失败、所需 syscall/flags 与后续阻塞记录在 N2/P4f；不把未到达调用标失败 |
-| 已交付：IPC 与组合边界 | N2 的 AF_UNIX/socketpair 与 P4f 的 SysV shm 各自提交；本轮 R1/R2/R4/R6/R8 继续修复 owner、片段、权限和整包契约 | 生命周期、fork/exec/退出、fault/OOM、并发关闭/删除、ID 复用差分通过；原程序后续能力与本轮回归分别记证据 |
-| 同期诊断：存储成本 | 对 iozone 慢写和小写同步建立计数分解，先分离缓存接收、写回、journal/flush、扫描和锁等待 | 固定负载/容量/缓存/同步语义；因果证据达到下节门槛后才选优化，不以 QEMU 墙钟倍数定瓶颈 |
-| 随后：系统环境小闭环 | P5c 分别设计真实日志读取、RTC 字符节点；单独核实 df 根盘来源展示 | 原 BusyBox 55 子项及实际内容；dmesg 来自真实日志，hwclock 来自设备读数；不得改包装器或用空成功 |
-| 持续：真实消费者诊断 | iperf/netperf 使用受控监听端、网络配置和固定参数；iozone 日期、其余 libc/LTP 单独复现 | 区分启动环境、无监听、ABI、协议和预算；cyclictest 的 mlock、LTP 的 chown/cgroup 各自归属，不能由一次 ENOSYS 推出完整子系统范围 |
-| 后续兼容性 | P2c 信号栈/实时队列，P4d 文件 futex、P4e mremap/madvise 与锁页需求，凭据/TTY 按消费者立项 | 先固定真实触发与所有权，特别是取消、exec、截断和限额；不因已有基础而勾选完成 |
-| 新基线之后 | SMP、LoongArch、实板、更大 C/Rust 工程各立里程碑 | SMP 先跨核 owner/TLB，LoongArch 先真实 U-mode，复杂工程先单核正确性；已有单核 I/O 不能冒充 SMP 安全 |
-
-### 存储成本调查与优化门槛
-
-当前源码入口：`fs/files/io.c`、`fs/page_cache.c`、`fs/vfs.c`、`fs/lwext4_port.c`、
-`arch/riscv/virtio_mmio_block.c`；机制/锁边界见[VFS/ext4](modules/vfs-ext4.md)。
-固定 Linux `mm/filemap.c`、`fs/fs-writeback.c`、`fs/sync.c` 仅作语义与机制对照，
-不能据 Linux 架构或 BoarOS 静态锁数量直接推定耗时比例。
-
-- [ ] 建立普通 write、O_SYNC/O_DSYNC、每次/每批 fsync/fdatasync、共享映射+msync 对照；包含小写/页写、顺序/随机、覆盖/扩展、同 inode/不同 inode、单盘/双盘、冷/热缓存与压力状态。
-- [ ] 分别计数用户复制和页解析、缓存命中/扫描/快照、实际数据/metadata 写入、事务/flush、设备请求字节与在途深度、队列等待和各层锁持有/等待；计时区分客体运行与 I/O 等待，不把宿主暂停计作内核计算。
-- [ ] 以已通过的 1 MiB 写入 256 分块/256 页解析、16→64 MiB resident 探测增长 3.95 倍作为既有成本边界；新负载另测，不外推已有数字。
-- [ ] 根据测量选择一次可归因改动，保留无收益结果；周期清脏会改变策略，不能以“优化”名义默默加入已明确排除的功能。
-- [ ] 涉及写回/事务/队列时重跑错误 owner、退出卸载、双盘隔离与 SQLite DELETE/WAL 完整恢复矩阵；按新事件轨迹枚举，不削弱 flush 契约换成绩。
-
-### 既有 IPC 路线与待确认的存储候选
-
-| 问题 | 候选比较与当前路线 |
-|---|---|
-| SysV shm 对象 | 已采用专用 key/id 表与 segment owner，复用 memory_object，并在 R2 增加稳定 attachment。匿名内存文件路线可复用文件接口，但增加隐藏挂载、名字与 fd 生命周期隔离成本，未采用。 |
-| AF_UNIX/socketpair | 已采用 socket endpoint 内的缓冲/等待原语；R4 单独维护整包 owner 与预算。独立本地传输后端便于以后名字空间/SCM_RIGHTS，但增加 endpoint 交接接口，未采用。 |
-| 存储瓶颈 | ① 若扫描占比高，增加脏页/范围索引，成本是索引内存与失效一致性；② 若小请求/屏障放大占比高，批量数据提交或事务合并，收益需覆盖错误归属与恢复复杂度；③ 若锁等待主导，缩小路径/inode/实例临界区，需新增 pin/版本复查而非单纯删锁。按数据选，不能预先三项全做。 |
-
-SysV/UNIX 固定语义入口分别为本页 Linux commit 的 `ipc/shm.c`、`ipc/util.c` 与
-`net/unix/af_unix.c`。既定路线内的小修继续验证；新的结构性存储优化仍须先测量，再由维护者确认路线。
-水位/预算不承诺任意分配成功或硬实时；push、发布、评测分支交接与正式评分仍由维护者决定。
-
-## 已完成能力的证据入口
-
-P0a 文档职责、P1a root 查询、P1b–g 持久存储/路径/时间/统计已经落地；
-P0b 时序复跑已完成，但历史取消异常根因仍未关闭，见[程序清单](learning/user-program-inventory.md)。
-P2a robust-list 与 P4a/d 共享匿名/futex 见[线程证据](learning/threads-and-futex.md)；
-P3/P4 记录锁、共享文件、DELETE/WAL 见[恢复证据](learning/record-lock-sqlite-recovery.md)
-和[内存管理](learning/memory-management.md)。完整历史身份保留在 learning，
-下列旧 build 路径仅表示历史运行位置，不能作为唯一证据。
-
-### 单核规模能力
-
-UDP 大包 read/readv 的内部 256 字节截断已修复；普通文件/TCP 请求使用有任务 owner 的页级缓冲。驻留文件页新增动态地址哈希，首次写/写回 rearm 使用单页改权及地址级本地失效。成本门禁为 `make test-scale-riscv`，复现与成本定义见[单核规模回归](learning/single-hart-scale.md)。
-
-PR 增加规模测试、SQLite DELETE/WAL 和离线 GCC；完整恢复矩阵每周一北京时间 02:00 或手动触发。glibc 的固定本机工具/runtime 哈希仍是本地严格收口门禁；可移植固定输入供应尚待单独交付。单 hart 可睡眠 I/O 已接入 IRQ、完成/超时/reset、DMA 停止与 VFS/页缓存 owner 协议，交付证据见[可睡眠存储](learning/sleepable-storage.md)。本轮不推进共享文件 futex、更多 socket ABI、批量事务或 SMP。
-
-### 主要依赖
-
-```text
-P0 证据 ─┬─ P1 路径/文件/设备 ─┬─ P3 同步/锁/SQLite 回滚日志
-         │                     └─ N socket/loopback/设备网络
-         ├─ P2 robust/信号/线程/资源
-         └─ L LoongArch 最小入口 → 双架构与实板
-
-P4a 共享匿名对象已完成，提供稳定后备身份
-P1 文件身份 + P3 写回/错误协议 → P4b/c 共享文件页与 msync
-P4 文件共享页 + P3 锁/同步 → SQLite 普通多进程 WAL
-P4d 共享 futex 扩展独立推进，不作 WAL 统一前置条件
-P1–P4 按真实依赖 → P5 glibc/单核编译完整交付（试跑可提前）
-P2/P4 单 hart 契约 + IPI/IRQ 入口 → P6 SMP 正确性
-P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
-```
-
-箭头表示主要验收依赖，不禁止先做块 flush、试跑 SQLite/编译器或启动第二架构。网络不依赖多核编译；匿名共享不必等文件持久化；2 hart 启动不等于 SMP 已完成。
-
-## Review P-A–P-E：成本核实与测量门槛
-
-这些是独立 Review 当时的源码成本结构；随后 C0–C6 已测量，S4 已修复锁交接，S6–S8 已实施存储流水线。deadline 和驻留范围索引仍等待具体路线确认。已有 scale 的页解析/PTE 访问计数不能代替以下各层总成本。
-
-| 项目 | 当前核实 | 待测工作负载和验收门槛 |
-|---|---|---|
-| P-A deadline | `kernel/sched/wait.c::kernel_scheduler_expire_deadlines` 每 tick 遍历全部 blocked，包括无 deadline 的等待者 | 固定少量到期任务，增加无期限 blocked；计扫描节点、最大 IRQ 占用、到期偏差。保持超时/取消一致后，才比较独立定时结构。 |
-| P-B 改权 | `arch/riscv/mm.c::kernel_mm_mprotect` 仍遍历全部 file_residents；R6 权限上限检查已限定到重叠 VMA，数组编辑/合并成本仍在 | 固定单页目标，增加无关 VMA/驻留页；把 prepare/commit、resident 与 PTE 访问都计入，禁止只报告目标页计数。先获得总探测数，再选择范围索引。 |
-| P-C 唤醒 | S4 已改 FIFO 资格交接与定向唤醒，新到者不能抢走预留资格；四写者重阻塞降为零 | 已验收的交接保留；继续区分 inode 门闩、后端竞争和实际任务分布，不将剩余写入差距笼统归因于调度算法。 |
-| P-D 小写 | 普通文件/TCP 非零请求仍分配整页 staging；AF_UNIX DGRAM 已改整包 heap owner，有界为 64 KiB | 1/3/63/64/65/4096 字节 × 缓存冷/热，计每调用物理/heap 分配、复制字节和峰值所有权。优化后须保留 fault/OOM/退出清理与消息原子性。 |
-| P-E 延迟 | `arch/riscv/trap_entry.S` 至用户返回保持 SIE 关闭；缓存命中的大复制/扫描可能无睡眠点 | 固定大复制/改权与独立唤醒任务，计 irq-off 最大值、锁持有/等待、唤醒到运行延迟和切换。先明确重入约束，不随意开中断/yield，不承诺硬实时。 |
-
-下列 C0–C6 已交付成本诊断和真实消费者状态；受控成本证据不能代替消费者兼容通过或正式评测。
-
-## 本轮：成本测量优先（2026-10-01 收口）
-
-维护者已选择先量化写入、扫描、唤醒和延迟，再决定优化。目标是得到能归因、可重建的
-成本基线，保护 R1–R8 已验收的行为；最终完成 20 配置、60 串行独立启动和 339 观测窗口，见[最终报告与归档](learning/cost-baseline.md)。C0–C5 受控负载及 C6 成本测量已验收；新增兼容配置与固定 Linux 的九次启动/48 窗口独立归档，原旧 glibc/musl 各七组实际 I/O 完成，原向量组双侧版本排除。旧短预算超时由自然结束澄清，慢写和 unknown 的归因边界保留。原 judge 的 iozone 两侧取得实际成绩，完整评测仍有总预算与 kernel-la 阻塞。C0–C6 阶段只测量；后续结构优化及其实际收益以上方 S0–S9 为准。
-起点为本轮最终生产源码，内核 SHA-256
-`0c0c6a77f54160c06f284f19133b6bb6516f7c6e2d8dcb5f0864390ce1361fbb`，
-1091 条 ABI、四组合 io-sleep、scale 与 WAL 恢复证据见上文。
-
-固定事实入口为 `references/linux` commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`
-的 `fs/read_write.c`、`mm/filemap.c`、`mm/mprotect.c`、`kernel/sched/`，及
-`references/qemu` v11.1.0 commit `84f07211cc5b4fc6a371559bf8a5de4fb068e648` 的 VirtIO/NBD；
-实际运行记录 QEMU 版本与哈希，不预设某台宿主的墙钟速度。
-
-### 观测方式候选与边界
-
-| 候选 | 正确性与演进 | 复杂度与观测成本 |
-|---|---|---|
-| ① 默认关闭的分层聚合统计，复用现有 MM/设备统计（推荐） | 在实际 syscall、MM、调度和存储边界计数；按 task/MM/inode/设备区分范围，切换时结算运行时间；不增加 Linux 用户 ABI | 热路径不分配、不打印、不等待；固定计数器/直方图占用可核对，必须验证默认关闭和观测开销；可逐层扩展 |
-| ② 仅测试链接包装器及 NBD 外部计数 | 易复用 scale/io-sleep 故障探针，基本不改生产路径；可独立校验候选①的关键计数 | 看不到 static/inline 内部扫描和完整 trap 区间，独立生产 U-mode 的归因不完整；适合辅助检错 |
-| ③ 有界事件环记录时间线 | 能还原复杂等待与嵌套关系，便于后续并发诊断 | 增加事件格式、丢失/溢出、采样和对象代次管理，扰动及存储成本更高；本阶段不建议先建通用追踪系统 |
-
-维护者已确认并实施候选①配合候选②独立检错，接口与 owner/生命周期已验收；当前已确认的是测量优先的范围，
-不是 deadline 索引、wake_one、驻留范围树或事务合并路线。关闭观测时不添加热路径工作；
-开启时所有计数按真实操作递增，不能按测例 ID/固定输入切换语义。
-
-输出同时记录请求字节、实际接受字节及各层复制/设备字节，错误和短写保留真实结果。
-数据/metadata/journal 分类必须有实际后端来源依据；无法唯一分类的字节列为 unknown，
-不按固定扇区号或测例输入猜测。峰值统计只记录本层实际 owner，避免把同一后备页的多个引用重复当容量。
-层间嵌套时间不能直接相加当作总时间；运行、就绪等待、I/O 阻塞、主动暂扣响应分别标记。
-计时使用客体单调时钟并记录分辨率；宿主暂停、QEMU 墙钟和调度 tick 不冒充指令执行成本。
-按 hart 实际 SIE 跟踪连续 IRQ-off；SIE 保持关闭的上下文切换不截断，恢复中断后的睡眠不计入。采样段的前后盲区单列，不宣称硬件上界。
-
-### C0：观测契约、固定输入与独立检错
-
-入口为 `include/arch/riscv/mm.h::riscv_kernel_mm_get_statistics`、
-`include/arch/riscv/virtio_mmio_block.h::riscv_virtio_mmio_block_get_statistics`、
-`include/kernel/sync.h` 和 `kernel/sched/scheduling.c::scheduler_account_runtime`。
-已新增 `tests/cost-riscv.py`、`tests/test-cost-report.py` 与 Makefile 的 `test-cost-riscv`
-入口；C0 已交付这些入口。使用默认关闭的 `COST_DIAGNOSTICS=0`；开启时由 Makefile
-给 C/assembly 同时传递 `BOAROS_COST_DIAGNOSTICS`，不能只给 C 加标志而漏掉 trap 入口。
-诊断构建独立放 `build/cost/`，复用 `BUILD_DIR`、`KERNEL_RV` 和 `CFLAGS_EXTRA`，
-配置进入缓存身份，避免覆盖普通构建或串用缓存。
-runner 的 `--case`/Makefile 的 `COST_CASE` 为 contract/write/locking/mprotect/deadline/latency/consumer/all；
-各任务只运行已交付的对应 case，未知或尚未实现 case 必须明确失败，最终 all 不得跳过缺项。
-
-- [x] 已定义每项指标的单位、采样范围、owner、起止点、失败/取消记账和清零条件；运行时不重置仍在途的计数。
-- [x] runner 在启动前快照 kernel/ELF/fixture；结果包含源码 tree、配置、工具与 QEMU 哈希、负载参数、冷/热准备方式和完整退出/资源基线。丢记录、负差值、溢出、错误 owner 或缺少结束标记必须失败。
-- [x] 先写协议/计数红测：刻意破坏一个字段、缺一个阶段或交换 owner，报告不得通过。固定小负载由数据内容、完成字节和独立包装器验证计数，不锁定私有布局或偶然调用次序。
-- [x] 验证诊断关闭后目标代码不引用新增观测入口；开启后不分配/睡眠/修改 errno，测量记录自身占用与开销，不能用计数器开销伪造被测路径成本。
-- [x] `python3 -B tests/test-cost-report.py` 与 `make test-cost-riscv COST_CASE=contract`（三启动，各四窗口）通过；当前 Python discovery 不收集连字符文件，直接运行防止零测试假通过。任务新增 48 字节，元数据页断言与退出栈余量保持。最终聚合含预留 60947 字节，任务含 backend guard 增量总64字节，默认/观测栈检查通过。
-
-### C1：写入与分配分解（P-D、存储成本）
-
-修改范围为 `fs/files/io.c::write_request`/`buffered_write_request`、
-`arch/riscv/uaccess.c`、`fs/page_cache.c::writeback_entry`/`kernel_page_cache_writeback_range`、
-`fs/ext4_backend.c`、`fs/lwext4_port.c`、`arch/riscv/virtio_mmio_block.c`；
-扩展 `tests/riscv/scale_main.c`，新增真实 U-mode `tests/workloads/cost/write.c`。
-
-- [x] 先核对 0/1/3/63/64/65/4096 字节和对齐/错位 1 MiB：记录 staging/后备页/heap 分配、用户页解析、复制、缓存探测、脏范围、快照、数据/metadata/journal/flush、队列深度与等待；区分普通文件、TCP、AF_UNIX DGRAM。
-- [x] 用普通 write、O_SYNC、O_DSYNC、每次/每 16 次/结束时 fsync 或 fdatasync，以及共享映射+msync 分组对照；分别改变顺序/随机、覆盖/扩展、冷/热和压力条件，不把全部因素一次混成笛卡尔积。
-- [x] 每个基准配置使用三个独立启动副本；内容、offset、大小、短写、EFAULT/EIO/OOM 和资源基线先验收，再保存计数和客体时间分布。既有 1 MiB 256 分块/页解析门槛继续独立保护。
-- [x] 窄验证 `make test-scale-riscv test-files-partial-write-riscv`，再 `make test-cost-riscv COST_CASE=write` 与 `make test-userland-riscv`；交付各层放大比和错误路径结果，不预先宣称小写分配或 flush 是主瓶颈。
-
-C1 阶段证据：modern/writeback 的观测开/关各三个独立启动，36 窗口完整，
-独立 usercopy/page-resolution/device-stat wrapper 通过，默认 scale、partial-write、musl/pthread 通过。
-小写 staging 放大、同步频度快照和 guest 时间分布见[成本基线](learning/cost-baseline.md)。
-压力/取消的四组合观测已随 C2 的 io-sleep fixture 补齐，尚不能由 C1 结果关闭存储成本总任务。
-
-### C2：整次写门闩、锁等待与唤醒（P-C、R7 成本）
-
-入口为 `kernel/sched/sync.c::acquire`/`kernel_lock_release`、`kernel/sched/wait.c`、
-`fs/vfs.c` 和 `tests/riscv/io_sleep_main.c`，复用 C1 的实际 U-mode 写负载。
-
-- [x] 分 rank 10/15/20/30/40 记录取得次数、等待/持有时间、阻塞次数、wake_all 唤醒数、重新阻塞、成功取得和切换；固定直方图需同时输出边界和样本数，不报虚假的精确分位数。
-- [x] 对照同 OFD、独立 OFD 同 inode、不同 inode、单盘/双盘；等待者为 1/8/32，读写混合。覆盖第二块冷页 usercopy、同 inode 映射输入、O_SYNC、截断和取消，观察独立 inode 的进展。
-- [x] 用既有暂扣/放行握手把受控 I/O 等待和缓存热写分开；核对 wake/重阻塞计数可检出无效唤醒，终止后 pin、锁和缓冲归零，最长观测等待不冒充无饥饿保证。
-- [x] `make test-cost-riscv COST_CASE=locking` 与 `make test-io-sleep-riscv test-files-partial-write-riscv test-userland-riscv` 通过 legacy/modern × writeback/writethrough；交付门闩自身等待与后端串行成本的分解，本任务不修改公平策略。
-
-### C3：单页改权的总扫描成本（P-B）
-
-入口为 `arch/riscv/mm.c::kernel_mm_mprotect`、`mm/vma.c`、
-`arch/riscv/sv39.c`、`tests/riscv/scale_main.c` 与 `tests/riscv/vma_cases.c`。
-
-- [x] 固定一页改权目标，分别增加无关 VMA 16/64/256 和文件驻留页 0/16/64 MiB；记录查询、prepare/commit、VMA 编辑/合并、file_residents 扫描、PTE 与 TLB 失效。
-- [x] 全范围失败、洞、只读 SHM/共享文件上限拒绝、split/fork、NONE 降权恢复、OOM 仍保持原契约；统计失败路径不得触发新的 PTE 修改或 owner 变化。
-- [x] `make test-cost-riscv COST_CASE=mprotect` 与 `make test-vma-riscv test-scale-riscv test-diff-abi-riscv`；报告总访问次数随无关集合增长的关系，不能用每目标页三级 PTE 访问掩盖外围扫描。
-
-### C4：deadline 遍历与到期偏差（P-A）
-
-入口为 `kernel/sched/wait.c::kernel_scheduler_expire_deadlines`、队列校验、
-`kernel/sched/core.c`、`tests/riscv/scheduler_cases.c` 和 `tests/riscv/io_sleep_main.c`。
-
-- [x] 固定 4 个带 deadline 的任务，另建 0/32/128/256 个无期限 blocked；分别计队列校验和 deadline 循环访问、tick 整条路径耗时、实际到期唤醒与运行偏差。
-- [x] 覆盖同期限、提前普通唤醒、信号/取消、退出与对象复用；握手确认任务已 blocked 后再开始采样，不用宿主 sleep 推断调度状态。
-- [x] `make test-cost-riscv COST_CASE=deadline` 与 `make test-scheduler-cases-riscv test-io-sleep-riscv test-sched-policy-host test-sched-bandwidth-riscv`；得到固定 deadline 数下的增长曲线，仍保留遍历机制至证据支持结构选择。
-
-### C5：连续关中断与唤醒到运行（P-E）
-
-入口为 `arch/riscv/trap_entry.S`、`include/arch/riscv/context.h`、
-`kernel/sched/scheduling.c`、`arch/riscv/trap.c` 与 `tests/workloads/cost/write.c`。
-该任务依赖 C0 的观测契约及 C2–C4 的运行/等待区分。
-
-- [x] 嵌套 save/restore、用户 trap、异常返回、调度睡眠/恢复、idle 分别核对观测起止；采样本身不递归取得锁、开启中断或分配，不漏掉 assembly 前后区间。
-- [x] 固定热缓存 4 KiB/64 KiB/1 MiB 复制和单页/大范围改权，配独立唤醒任务；报告 IRQ-off 最大区间、锁持有、唤醒到运行分布与切换，不按 QEMU 墙钟设性能及格线。
-- [x] `make test-cost-riscv COST_CASE=latency` 与 `make test-trap-riscv test-trap-return-riscv test-context-riscv test-user-riscv test-io-sleep-riscv test-sched-bandwidth-riscv test-stack-usage`；运行观测开/关对照。本任务不引入任意 yield 或 syscall 内开中断。
-
-### C6：真实消费者、归因与收口（成本测量已验收）
-
-复用 `tests/runtime-diagnostics.py`、固定原镜像的 iozone 以及 C0 runner；
-最终证据归 `docs/learning/cost-baseline.md`/`cost-measurements.json`，新增续测独立归 `cost-consumer-followup.json`；规模/存储文档链接该结论，契约归对应模块，
-能力/后续依赖分别更新 README 与本页，不另建永久计划或原始日志档案。
-
-- [x] 固定原 iozone ELF/依赖/镜像哈希、argv、工作目录、文件规模、缓存与同步条件；先核实实际调用链，再用 C1–C5 的受控负载解释其观测，未执行或超时保留原始状态。九次独立启动保存 144 次自然退出、126 次实际 I/O 完成和 18 次固定参考版本排除；原旧 glibc 实际 I/O 成本已取得。旧 180 秒属于预算截断，未修改负载延长后自然完成；主成本、观测约 17% 开销和 unknown 见续测报告。
-- [x] `make test-cost-riscv COST_CASE=consumer` 与最终 `make test-cost-riscv COST_CASE=all` 输出全部阶段、输入身份和观测开/关对照，三个独立启动副本均有完整结果。
-- [x] 汇总每项主成本与未解释余量，报告重复分布、观测开销和无收益结果；只有因果对照支持时，提出 2–3 个对应瓶颈的候选，由维护者选择一次优化。
-- [x] 测量代码收口运行 `make test-riscv test-userland-riscv test-glibc-riscv test-diff-abi-riscv test-scale-riscv test-io-sleep-riscv test-stack-usage`，以及 SQLite DELETE/WAL 正常与选定错误恢复。后续实际修改写回、事务或队列时再跑两种完整恢复矩阵与双盘隔离。
-- [x] 每个 C 任务独立验证/提交，使用 `Co-authored-by: GPT-6.1 Sol <codex@openai.com>`；固定输入和结论入 Git 后 `python3 -B tests/prune-build.py`、`make prune-build`。完整 Harness 的 kernel-la 阻塞继续单列；历史20配置矩阵的独立审查无新增 P1/P2，核对后清理50个临时路径；本次续测的新审查修正见下。
-
-本次消费者续测收口另有新的全改动独立审查：实际证据与数字正确，发现两项P2门禁缺口，
-均先红测再修复，18项报告检查及新旧归档验证通过；没有剩余Critical/Important。
-默认musl/glibc/栈及兼容PID1配置交替门禁重新通过，完整长时门禁的历史范围不被冒充成这次重跑。
-新证据入Git并复核后，预览并清理六个一次性运行/镜像/日志/栈目录；剩余清理候选为零，
-保留cost、用户程序及固定Linux可复用缓存，返回main并恢复默认构建。
-
-依赖为 C0 → C1/C3/C4，C1 → C2，C2/C3/C4 → C5，全部测量 → C6。下一轮的结构优化需从报告中三个候选重新确认。
-
-- [x] 兼容分支单向合入本轮已验收 main；`68b98d8` 保留 uname 4.15.0 和原入口、原 judge，`f380c70` 再合入通用续测工具。原 iozone glibc/musl 为 21.451673/21.668778；一次原预算 RV 投影 626，总预算耗尽于 lmbench-glibc，其后七组未到达。main uname 未修改，完整评测未通过。
-- [x] 原 iozone (11,12) 所选测试在固定 Linux 同样不可用，作为固定参考排除，不计作向量 ABI 验收；其余可用组在开/关和 Linux 各三次启动均完成。完整 Harness 缺少 kernel-la 的阻塞保留。
-日志/RTC、SysV RMID 后再 attach 的既有兼容限制和 iperf/netperf 定位保留后续队列；
-本阶段不扩展 SMP、LoongArch、deadline 索引、选择性唤醒、驻留范围索引或持久化策略。
+下面P/N/L小节保留稳定能力编号、契约、依赖和已有验证入口；只以上面的当前队列决定近期实施。
 
 ## P0：固定证据与时序问题
 
@@ -767,9 +460,8 @@ C1 阶段证据：modern/writeback 的观测开/关各三个独立启动，36 �
 
 ### P7b 测量驱动的优化候选
 
-- [ ] 收集 fault/major fault、重复读取、缓存命中、全 LRU node 失效扫描、inode 查找、写回流量、块请求大小/队列深度、堆锁、调度/唤醒、TLB 同步与栈高水位。
-- [ ] 有证据后比较 node 缓存页索引、inode 哈希、批量 I/O/预读、锁外 I/O、每核缓存、deadline 结构、ASID/批量 shootdown 与调度公平性；精确失效不代表查找成本已优化，也不能未经测量宣称它是主瓶颈。
-- [ ] 每次只改变可归因机制，写清内存/复制/锁/延迟成本与回退；保留负收益。性能改动仍须满足 ABI、owner、并发与资源耗尽回归。
+候选统一维护在上方“按证据触发的性能候选”，此处不另列执行顺序。
+多核扩展仍依赖P6正确性，不用增加hart掩盖已确认的单核浪费。
 
 ## P8：系统交付与现场复现
 
