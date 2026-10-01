@@ -33,10 +33,14 @@ def main():
     parser.add_argument('--consumer-timeout-ms',type=int,default=180000,
                         help='explicit per-command guest budget, 1000..3600000 ms; completion checks remain mandatory')
     parser.add_argument('--consumer-commands',default='all',help='all or comma-separated libc:index (0..7); partial selection is targeted attribution')
+    parser.add_argument('--consumer-sync',action='store_true',help='append four 128-write hot 4KiB synchronous probes in the same boot')
+    parser.add_argument('--consumer-sync-only',action='store_true',help='controlled synchronous reference, no original iozone commands')
     args=parser.parse_args()
     names=[f'consumer-{libc}-{i}' for libc in ('musl','glibc') for i in range(8)]
     selected=names if args.consumer_commands=='all' else [f'consumer-{v.replace(":","-")}' for v in args.consumer_commands.split(',')]
-    if not selected or len(set(selected))!=len(selected) or not set(selected)<=set(names):parser.error('invalid consumer command selection')
+    if args.consumer_sync_only:args.consumer_sync=True;selected=[]
+    if (not selected and not args.consumer_sync_only) or len(set(selected))!=len(selected) or not set(selected)<=set(names):parser.error('invalid consumer command selection')
+    if args.consumer_sync and args.case!='consumer':parser.error('synchronous probes require --case consumer')
     if args.consumer_commands!='all' and args.case!='consumer':parser.error('consumer selection requires --case consumer')
     if not 1000<=args.consumer_timeout_ms<=3600000:parser.error('consumer timeout must be 1000..3600000 ms')
     linux_identity=None
@@ -67,6 +71,7 @@ def main():
         identity['consumer_timeout_ms']=args.consumer_timeout_ms
         identity['consumer_command_names']=selected
         identity['scope']='complete original command set' if len(selected)==16 else 'targeted attribution'
+        identity['consumer_sync_probes']=args.consumer_sync
         if len(selected)!=16:identity['acceptance']=False
     compiler=ROOT/'build/riscv/musl-root/bin/musl-gcc'
     identity['compiler']=subprocess.check_output([str(compiler),'--version'],text=True).splitlines()[0]
@@ -91,6 +96,8 @@ def main():
                     contents+=f'write {policy} /cost-consumer-budget\n'
                     selection=folder/'consumer-selection';selection.write_text(str(sum(1<<names.index(n) for n in selected))+'\n')
                     contents+=f'write {selection} /cost-consumer-selection\n'
+                    if args.consumer_sync:
+                        flag=folder/'sync-probe';flag.write_text('controlled hot 4KiB sync\n');contents+=f'write {flag} /cost-consumer-sync\n'
                 if args.linux:
                     flag=folder/'linux-flag'; flag.write_text('fixed Linux reference\n'); contents+=f'write {flag} /cost-linux\n'
                 if case=='write':
@@ -191,6 +198,7 @@ def main():
                     if len(platform_lines)!=1 or len(platform_lines[0])!=3:raise ValueError('missing/duplicate consumer platform')
                     record['uname']=dict(zip(('sysname','release','machine'),platform_lines[0]))
                     required={c['name'] for c in record['commands']}
+                    if args.consumer_sync:required|={f'consumer-sync-{i}' for i in range(4)}
                     if set(timings)!=required or (not args.off and {s['name'] for s in snapshots}!=required): raise ValueError('consumer coverage')
                 if case=='contract' and not args.off:
                     if {s['name'] for s in snapshots}!={'contract','reuse','inflight','after-abort'} or [s['values']['epoch'] for s in snapshots]!=[1,2,3,5]: raise ValueError('contract epoch/coverage')

@@ -24,6 +24,25 @@ static void drain_directory(void)
 static long milliseconds(void)
 { struct timespec t; CHECK(clock_gettime(CLOCK_MONOTONIC,&t)==0);return t.tv_sec*1000+t.tv_nsec/1000000; }
 static long command_budget_ms=180000;
+static void sync_probes(void)
+{
+    char bytes[4096], actual[4096];memset(bytes,0x3c,sizeof(bytes));
+    for(unsigned mode=0;mode<4;mode++){
+        int flags=O_CREAT|O_TRUNC|O_RDWR|(mode==0?O_SYNC:mode==1?O_DSYNC:0);
+        int fd=open("/consumer-sync",flags,0600);CHECK(fd>=0);
+        CHECK(pwrite(fd,bytes,sizeof(bytes),0)==sizeof(bytes) && fsync(fd)==0);
+        char name[48];snprintf(name,sizeof(name),"consumer-sync-%u",mode);
+        cost_begin();
+        for(unsigned i=0;i<128;i++){
+            CHECK(pwrite(fd,bytes,sizeof(bytes),0)==sizeof(bytes));
+            if(mode==2)CHECK(fsync(fd)==0);
+            if(mode==3)CHECK(fdatasync(fd)==0);
+        }
+        cost_end(name,"file",128,128ULL*sizeof(bytes),128ULL*sizeof(bytes));
+        CHECK(pread(fd,actual,sizeof(actual),0)==sizeof(actual) && !memcmp(bytes,actual,sizeof(bytes)));
+        CHECK(close(fd)==0 && unlink("/consumer-sync")==0);
+    }
+}
 static void command(unsigned libc, unsigned index)
 {
     const char *directories[]={"/musl","/glibc"};
@@ -63,7 +82,9 @@ int main(void)
     policy=fopen("/cost-consumer-selection","r");
     if(policy){char extra;CHECK(fscanf(policy,"%u %c",&command_selection,&extra)==1);CHECK(fclose(policy)==0);}
     else CHECK(errno==ENOENT);
-    CHECK(command_selection>0 && command_selection<=65535);
+    CHECK(command_selection<=65535);
+    int probe=access("/cost-consumer-sync",F_OK)==0;
+    CHECK(command_selection || probe);
     printf("COST CONSUMER SELECTION %u\n",command_selection);
     struct utsname platform;CHECK(uname(&platform)==0);
     printf("COST PLATFORM %s %s %s\n",platform.sysname,platform.release,platform.machine);
@@ -74,5 +95,6 @@ int main(void)
     setenv("LD_LIBRARY_PATH","/glibc/lib",1);
     for(unsigned libc=0;libc<2;libc++)for(unsigned group=0;group<8;group++)
         if(command_selection&(1U<<(libc*8+group)))command(libc,group);
+    if(probe)sync_probes();
     puts("COST PASS consumer");fflush(NULL);if(access("/cost-linux",F_OK)==0)reboot(RB_POWER_OFF);return 0;
 }
