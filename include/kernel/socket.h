@@ -93,6 +93,18 @@ void kernel_socket_finish_read(struct kernel_socket_read_request *request,
 void kernel_socket_abort_read(struct kernel_socket_read_request *request);
 int kernel_socket_write_buffer(struct kernel_socket *socket,
                                const void *buffer, uint32_t size);
+enum kernel_socket_option {
+    KERNEL_SOCKET_REUSEADDR, KERNEL_SOCKET_KEEPALIVE,
+    KERNEL_SOCKET_SNDBUF, KERNEL_SOCKET_RCVBUF,
+    KERNEL_SOCKET_TYPE, KERNEL_SOCKET_ERROR, KERNEL_SOCKET_ACCEPTCONN,
+    KERNEL_SOCKET_NODELAY, KERNEL_SOCKET_MAXSEG, KERNEL_SOCKET_V6ONLY,
+};
+int kernel_socket_set_option(struct kernel_socket *socket,
+                             enum kernel_socket_option option, int value);
+int kernel_socket_get_option(struct kernel_socket *socket,
+                             enum kernel_socket_option option, int *value);
+void kernel_socket_set_send_timeout(struct kernel_socket *socket, uint64_t nanoseconds);
+uint64_t kernel_socket_send_timeout(const struct kernel_socket *socket);
 void kernel_socket_set_receive_timeout(struct kernel_socket *socket,
                                        uint64_t nanoseconds);
 uint64_t kernel_socket_receive_timeout(const struct kernel_socket *socket);

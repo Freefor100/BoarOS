@@ -79,9 +79,11 @@
 #define LINUX_SYSCALL_ACCEPT 202U
 #define LINUX_SYSCALL_CONNECT 203U
 #define LINUX_SYSCALL_GETSOCKNAME 204U
+#define LINUX_SYSCALL_GETPEERNAME 205U
 #define LINUX_SYSCALL_SENDTO 206U
 #define LINUX_SYSCALL_RECVFROM 207U
 #define LINUX_SYSCALL_SETSOCKOPT 208U
+#define LINUX_SYSCALL_GETSOCKOPT 209U
 #define LINUX_SYSCALL_BRK 214U
 #define LINUX_SYSCALL_SYSLOG 116U
 #define LINUX_SYSCALL_GETRANDOM 278U
@@ -275,9 +277,11 @@ enum kernel_syscall_status kernel_syscall_dispatch(
                request->number == LINUX_SYSCALL_ACCEPT ||
                request->number == LINUX_SYSCALL_CONNECT ||
                request->number == LINUX_SYSCALL_GETSOCKNAME ||
+               request->number == LINUX_SYSCALL_GETPEERNAME ||
                request->number == LINUX_SYSCALL_SENDTO ||
                request->number == LINUX_SYSCALL_RECVFROM ||
-               request->number == LINUX_SYSCALL_SETSOCKOPT) {
+               request->number == LINUX_SYSCALL_SETSOCKOPT ||
+               request->number == LINUX_SYSCALL_GETSOCKOPT) {
         if (syscall_handle_socket_operation(caller, request, &decoded) !=
             KERNEL_SYSCALL_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;

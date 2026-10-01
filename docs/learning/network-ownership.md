@@ -27,3 +27,10 @@ IPv6 通配监听的映射 accept。旧实现先在 IPv6 socket 创建以 EAFNOS
 失败，修复后双方完成内容交换；协议静态池由 host 回归核对，socket 堆由
 真实关机零占用核对。重建：`make test-lwip-host test-network-riscv`。
 选项、端口冲突、半关闭和原版应用完整流程尚待后续阶段，不能据此宣称完成。
+
+双栈端口回归进一步发现 lwIP TCP bind 源码留下 ANY 与纯 IPv6 交集的 TODO：
+IPv6 双栈通配已占端口时，::1 的另一次 bind 居然成功。固定 Linux 拒绝该操作。
+BoarOS 用不持引用的 endpoint 列表检查真实地址交集，生命周期仍由 OFD 决定，
+补丁没有修改 lwIP core。V6ONLY 两族隔离、UDP 默认对端/解除及 SYN 拒绝的
+SO_ERROR 清除，均由相同用户态回归验证。TCP_MAXSEG 来自协议 PCB，未知
+TCP_INFO 继续报不支持，不能当成已提供统计。

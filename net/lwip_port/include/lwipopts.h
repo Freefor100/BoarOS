@@ -11,6 +11,9 @@
 #define LWIP_IPV6_REASS 0
 #define LWIP_IPV6_FRAG 0
 #define LWIP_TCP 1
+#define SO_REUSE 1
+#define TCP_LISTEN_BACKLOG 1
+#define LWIP_TCP_KEEPALIVE 1
 #define LWIP_UDP 1
 #define LWIP_RAW 0
 #define LWIP_NETCONN 0

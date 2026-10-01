@@ -29,6 +29,7 @@
 #define LINUX_IPPROTO_UDP 17
 #define LINUX_SOL_SOCKET 1
 #define LINUX_SO_RCVTIMEO 20
+#define LINUX_SO_SNDTIMEO 21
 
 struct linux_sockaddr_in {
     uint16_t family;
@@ -114,7 +115,7 @@ static int copy_address_in(struct kernel_mm *mm, uint64_t user,
         __builtin_memcpy(address->bytes, local.address, 16);
         address->scope = local.scope;
         address->port = network_port(local.port);
-    } else return -KERNEL_EAFNOSUPPORT;
+    } else if (family != 0) return -KERNEL_EAFNOSUPPORT;
     return 0;
 }
 
@@ -150,6 +151,83 @@ static int copy_address_out(struct kernel_mm *mm, uint64_t user_address,
              KERNEL_UACCESS_STATUS_OK || copied != written)) return -KERNEL_EFAULT;
     length = (int32_t)size;
     if (kernel_copy_to_user(mm, user_length, &length, sizeof(length), &copied) !=
+            KERNEL_UACCESS_STATUS_OK || copied != sizeof(length)) return -KERNEL_EFAULT;
+    return 0;
+}
+
+static int socket_option(int level, int name, enum kernel_socket_option *option)
+{
+    if (level == LINUX_SOL_SOCKET) {
+        switch (name) {
+        case 2: *option = KERNEL_SOCKET_REUSEADDR; return 0;
+        case 3: *option = KERNEL_SOCKET_TYPE; return 0;
+        case 4: *option = KERNEL_SOCKET_ERROR; return 0;
+        case 7: *option = KERNEL_SOCKET_SNDBUF; return 0;
+        case 8: *option = KERNEL_SOCKET_RCVBUF; return 0;
+        case 9: *option = KERNEL_SOCKET_KEEPALIVE; return 0;
+        case 30: *option = KERNEL_SOCKET_ACCEPTCONN; return 0;
+        }
+    } else if (level == LINUX_IPPROTO_TCP) {
+        if (name == 1) { *option = KERNEL_SOCKET_NODELAY; return 0; }
+        if (name == 2) { *option = KERNEL_SOCKET_MAXSEG; return 0; }
+    } else if (level == 41 && name == 26) {
+        *option = KERNEL_SOCKET_V6ONLY; return 0;
+    }
+    return -KERNEL_ENOPROTOOPT;
+}
+
+static int sockopt(struct kernel_socket *socket, struct kernel_mm *mm,
+                   const struct kernel_syscall_request *request, int get)
+{
+    int level = (int32_t)request->arguments[1];
+    int name = (int32_t)request->arguments[2];
+    int32_t length = (int32_t)request->arguments[4];
+    size_t copied = 0;
+    union { int value; struct linux_timeval timeout; } payload = {0};
+    size_t size = sizeof(int);
+    int timed = level == LINUX_SOL_SOCKET &&
+                (name == LINUX_SO_RCVTIMEO || name == LINUX_SO_SNDTIMEO);
+    enum kernel_socket_option option = KERNEL_SOCKET_TYPE;
+    if (get) {
+        if (kernel_copy_from_user(mm, &length, request->arguments[4], sizeof(length), &copied) !=
+                KERNEL_UACCESS_STATUS_OK || copied != sizeof(length)) return -KERNEL_EFAULT;
+    }
+    if (length < 0) return -KERNEL_EINVAL;
+    if (timed) size = sizeof(payload.timeout);
+    else {
+        int result = socket_option(level, name, &option);
+        if (result != 0) return result;
+    }
+    if (!get) {
+        if ((uint32_t)length < size) return -KERNEL_EINVAL;
+        if (kernel_copy_from_user(mm, &payload, request->arguments[3], size, &copied) !=
+                KERNEL_UACCESS_STATUS_OK || copied != size) return -KERNEL_EFAULT;
+        if (!timed) return kernel_socket_set_option(socket, option, payload.value);
+        if (payload.timeout.seconds < 0 || payload.timeout.microseconds < 0 ||
+            payload.timeout.microseconds >= 1000000 ||
+            (uint64_t)payload.timeout.seconds >
+                (UINT64_MAX - (uint64_t)payload.timeout.microseconds * 1000U) /
+                    UINT64_C(1000000000)) return -KERNEL_EINVAL;
+        uint64_t ns = (uint64_t)payload.timeout.seconds * UINT64_C(1000000000) +
+                      (uint64_t)payload.timeout.microseconds * 1000U;
+        if (name == LINUX_SO_RCVTIMEO) kernel_socket_set_receive_timeout(socket, ns);
+        else kernel_socket_set_send_timeout(socket, ns);
+        return 0;
+    }
+    if (timed) {
+        uint64_t ns = name == LINUX_SO_RCVTIMEO ? kernel_socket_receive_timeout(socket)
+                                              : kernel_socket_send_timeout(socket);
+        payload.timeout.seconds = (int64_t)(ns / UINT64_C(1000000000));
+        payload.timeout.microseconds = (int64_t)((ns % UINT64_C(1000000000)) / 1000U);
+    } else {
+        int result = kernel_socket_get_option(socket, option, &payload.value);
+        if (result != 0) return result;
+    }
+    size_t written = (uint32_t)length < size ? (uint32_t)length : size;
+    if (kernel_copy_to_user(mm, request->arguments[3], &payload, written, &copied) !=
+            KERNEL_UACCESS_STATUS_OK || copied != written) return -KERNEL_EFAULT;
+    length = (int32_t)written;
+    if (kernel_copy_to_user(mm, request->arguments[4], &length, sizeof(length), &copied) !=
             KERNEL_UACCESS_STATUS_OK || copied != sizeof(length)) return -KERNEL_EFAULT;
     return 0;
 }
@@ -400,7 +478,9 @@ enum kernel_syscall_status syscall_handle_socket_operation(
         result = kernel_socket_listen(socket, (int32_t)request->arguments[1]);
         break;
     case 204: /* getsockname */
-        result = kernel_socket_getname(socket, &peer_address);
+    case 205: /* getpeername */
+        result = op == 204 ? kernel_socket_getname(socket, &peer_address)
+                           : kernel_socket_getpeer(socket, &peer_address);
         if (result == 0)
             result = copy_address_out(mm, request->arguments[1],
                                       request->arguments[2], &peer_address);
@@ -446,37 +526,10 @@ enum kernel_syscall_status syscall_handle_socket_operation(
             if (address_result != 0) result = address_result;
         }
         break;
-    case 208: { /* setsockopt */
-        struct linux_timeval timeout;
-        size_t copied = 0;
-        if ((int32_t)request->arguments[1] != LINUX_SOL_SOCKET ||
-            (int32_t)request->arguments[2] != LINUX_SO_RCVTIMEO) {
-            result = -KERNEL_ENOTSUP;
-            break;
-        }
-        if ((uint32_t)request->arguments[4] < sizeof(timeout)) {
-            result = -KERNEL_EINVAL;
-            break;
-        }
-        if (kernel_copy_from_user(mm, &timeout, request->arguments[3],
-                                  sizeof(timeout), &copied) !=
-                KERNEL_UACCESS_STATUS_OK || copied != sizeof(timeout)) {
-            result = -KERNEL_EFAULT;
-            break;
-        }
-        if (timeout.seconds < 0 || timeout.microseconds < 0 ||
-            timeout.microseconds >= 1000000 ||
-            (uint64_t)timeout.seconds >
-                (UINT64_MAX - (uint64_t)timeout.microseconds * 1000U) /
-                    UINT64_C(1000000000)) {
-            result = -KERNEL_EINVAL;
-            break;
-        }
-        kernel_socket_set_receive_timeout(socket,
-            (uint64_t)timeout.seconds * UINT64_C(1000000000) +
-            (uint64_t)timeout.microseconds * UINT64_C(1000));
+    case 208: /* setsockopt */
+    case 209: /* getsockopt */
+        result = sockopt(socket, mm, request, op == 209);
         break;
-    }
     case 202: /* accept */
         result = kernel_socket_accept_check(socket);
         if (result != 0) break;
