@@ -8,6 +8,36 @@ Linux 为 `references/linux` 的 `f4cdf7ca9a1fdcca413157df19753f388a5a224e`。
 此前于 `main@959da70` 完成仅文档审计；下面独立 Review 小节记录新一轮实际修复与验证。
 下列“已交付”引用该阶段证据，“未实现”据当前源码，“待定位”不等于已证实内核缺陷。
 
+## 存储流水线与性能演进（2026-10-01，实施中）
+
+维护者已选择完成存储流水线，沿 `main@c53eadf` 推进。保留 ordered-data/log/commit
+和恢复契约，解决前台重复准备、操作数阈值等待完整 checkpoint、同步完成与 checkpoint
+耦合及逐块 I/O。下面是已确认任务，不是已完成能力；旧 S0–S5 的验收记录保留。
+
+| 阶段 | 交付与状态 |
+|---|---|
+| S6 操作准备与封口 | [ ] 独立 undo、组级增量 credit、块载荷与 owner 分离及有界空闲池；64 操作/256KiB/100ms 只触发封口，真实容量/日志/复用依赖才等待 |
+| S7 提交与 checkpoint | [ ] 两组待提交 FIFO、一组提交中及待 checkpoint FIFO；commit 屏障后发布 durable，checkpoint 连续完成并持久更新起点后释放日志和 quarantine |
+| S8 批量 I/O 与热读 | [ ] 最多八 span 的可选块批量接口、VirtIO 发布/收割与逻辑调用 owner；relatime 无更新共享查询，更新时独占重查 |
+| S9 消费者与收口 | [ ] 一次最终恢复/扩大回归；三次关闭观测原消费者、一次定点观测及一次 1GiB 原专项；main 单向合入 oscomp-rv-compat |
+
+事务硬预算仍为 `min(4MiB, RAM/32)`，空闲池上限 `min(256KiB, 预算/4)`，计入预算。
+普通写、错误/短写、时间语义、版本所有权、msync pin、close/退出和卸载契约保持。
+内部等待明确区分 sealed/durable/checkpoint；不将计数阈值当真实空间耗尽。
+
+验收以匹配的 S5 基线为准：五项写方法的十格 Parent 中位吞吐目标≥5倍，自动模式
+程序完成加最终排空至少减半；固定字节热读不得退化超过5%，原消费者 Parent 读项不得
+退化超过10%。同时报告 Max、Children、实际传输量、同步延迟、排空、内存峰值和剩余成本。
+默认关闭观测，聚合≤64KiB、每任务诊断标量≤64B；不重跑 C0–C6。
+最终机制变化要求完整 lwext4/SQLite DELETE/WAL 恢复矩阵、双盘隔离、RV64、真实
+musl/glibc、1091 ABI、scale、四组合 io-sleep 和栈检查；失败后只重跑受影响范围。
+完整 Harness 缺 `kernel-la` 仍阻塞，不 push、发布或转换阶段。
+
+后续顺序为 resident 范围索引 → 只含有期限任务的 deadline 索引 → 长 IRQ-off 的安全
+分段/抢占边界 → usercopy/分配固定成本 → 缓存政策和真实网络应用 → SMP/实板与多核编译。
+每项先按真实应用和已有计数确定价值，再确认具体结构；本轮不实现这些重构。
+性能术语、已确认成本和统计边界见[性能全景](learning/cost-baseline.md#性能全景与存储流水线2026-10-01)。
+
 ## 异步日志与 I/O 优化（2026-10-01，已验收）
 
 已选择完整异步日志、跨调用组提交和提交线程，保持 ordered-data/log/commit 屏障及恢复正确性。
@@ -27,9 +57,9 @@ Linux 为 `references/linux` 的 `f4cdf7ca9a1fdcca413157df19753f388a5a224e`。
 最终候选一次执行实际持久化机制所需的恢复矩阵与扩大回归。既有成本矩阵不重跑，完成的检查仅在相关修改或失败后重跑。
 
 完整结论、各次输入、分布和重建命令见[机制与性能验收](learning/cost-baseline.md#异步日志与组提交验收2026-10-01)。
-本轮性能目标达到，但 re-readers 中位回退 36%–38%，当前 whole-command 窗口不足以归因到读阶段；
+本轮性能目标达到；重新核对重读原字段，Max 中位下降36%–38%，Parent 则提高12%–13%，不能称整体读退化；
 热写 O_DSYNC/fdatasync 仍明显落后于固定 Linux，版本预留仍有大量分配/清零。
-这些是后续调查与优化候选，尚未选择新的结构路线。完整 Harness 因缺 kernel-la 继续阻塞。
+这些是 S5 收口时保留的成本；随后已选择上文 S6–S9 路线。完整 Harness 因缺 kernel-la 继续阻塞。
 
 ## 独立 Review 的组合边界（2026-09-30）
 
@@ -206,7 +236,7 @@ P5 + P6 → P7 多核编译与性能；P7 + N + L → P8 平台交付
 |---|---|---|
 | P-A deadline | `kernel/sched/wait.c::kernel_scheduler_expire_deadlines` 每 tick 遍历全部 blocked，包括无 deadline 的等待者 | 固定少量到期任务，增加无期限 blocked；计扫描节点、最大 IRQ 占用、到期偏差。保持超时/取消一致后，才比较独立定时结构。 |
 | P-B 改权 | `arch/riscv/mm.c::kernel_mm_mprotect` 仍遍历全部 file_residents；R6 权限上限检查已限定到重叠 VMA，数组编辑/合并成本仍在 | 固定单页目标，增加无关 VMA/驻留页；把 prepare/commit、resident 与 PTE 访问都计入，禁止只报告目标页计数。先获得总探测数，再选择范围索引。 |
-| P-C 唤醒 | `kernel/sched/sync.c::kernel_lock_release` 在可用时 wake_all，等待写者阻止新读者；新写门闩复用这一机制 | 独立 inode 与同 inode 混合读写，计有效唤醒、再次睡眠、切换、等待分位与最长饥饿。保持取消/超时与进展，不直接改 wake_one。 |
+| P-C 唤醒 | S4 已改 FIFO 资格交接与定向唤醒，新到者不能抢走预留资格；四写者重阻塞降为零 | 已验收的交接保留；继续区分 inode 门闩、后端竞争和实际任务分布，不将剩余写入差距笼统归因于调度算法。 |
 | P-D 小写 | 普通文件/TCP 非零请求仍分配整页 staging；AF_UNIX DGRAM 已改整包 heap owner，有界为 64 KiB | 1/3/63/64/65/4096 字节 × 缓存冷/热，计每调用物理/heap 分配、复制字节和峰值所有权。优化后须保留 fault/OOM/退出清理与消息原子性。 |
 | P-E 延迟 | `arch/riscv/trap_entry.S` 至用户返回保持 SIE 关闭；缓存命中的大复制/扫描可能无睡眠点 | 固定大复制/改权与独立唤醒任务，计 irq-off 最大值、锁持有/等待、唤醒到运行延迟和切换。先明确重入约束，不随意开中断/yield，不承诺硬实时。 |
 

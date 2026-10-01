@@ -484,7 +484,7 @@ PID1配置运行、本轮scratch及栈重建目录）。再次预览候选为零
 
 本轮从 `main@7628662` 实现完整操作隔离、挂载点异步组提交、FIFO 锁资格交接及 idle IRQ 返回修复。
 **十格写吞吐均超过 10 倍、两种 libc 自动模式均少于旧耗时的一半，性能目标达到。**
-这不表示所有性能改善：re-readers 回退 36%–38%，热写 fdatasync 明显落后于固定 Linux，
+这不表示所有指标改善：re-readers 的 Max 下降36%–38%，Parent 则提高12%–13%；热写 fdatasync 明显落后于固定 Linux，
 累计分配/清零和提交 I/O 仍是大成本。以下新证据与上文历史 C0–C6、九启动旧基线分开；
 上文“尚未实施/待验收”描述的是当时阶段，不代表当前机制。
 
@@ -548,10 +548,12 @@ pwrite writers 取 `(9,10)`；不把别的组里同名字段混入。下面按�
 
 读项 `(0,1)` 的中位为：musl readers 10889.22→23581.93（2.17×），
 glibc 17700.65→62151.33（3.51×）；分别只有 Linux 的 6.23%/16.28%。
-**re-readers 回退**：musl 65331.82→41799.64（-36.02%），
-glibc 68381.61→42229.14（-38.24%）。当前快照覆盖整条命令的写、读、重读和协调阶段，
-不能唯一分辨新后台提交竞争、读锁资格公平性或缓存状态对重读的贡献。
-这是未定位完的性能缺陷；没有用整体耗时大幅下降掩盖它，也没有追加重复启动猜因果。
+**re-readers 字段变化**：Max 的 musl 65331.82→41799.64（-36.02%），
+glibc 68381.61→42229.14（-38.24%）；Parent 的 musl 50211.21→56424.77（+12.37%），
+glibc 50339.61→56981.63（+13.19%）。Children 速率和分别下降21.23%/23.57%。
+Max 是最快子进程，Children 使用各自计时，Parent 使用实际总量及父进程计时，不能互换。
+当前快照覆盖写、读、重读和协调，不能唯一分辨后台竞争、资格公平性或缓存状态的贡献；
+保留分布变化，但修正之前将单一 Max 称为整体读回退的结论。
 
 #### 机制改变如何解释收益
 
@@ -645,13 +647,13 @@ musl 自动前台运行 9.778s、后台 .839s；窗口21.249s，所有任务 run
 未解释余量 .208s（约 .98%）。idle accounting 不等同于精确 WFI 驻留；blocked/ready跨任务区间不能加到分母。
 unknown_read 仍为73371648B，约占该窗口总磁盘字节69.2%，没有证明它全部属于文件数据或 metadata。
 
-两个优先优化候选及一项必须定位的回退，均留待人选择下一轮路线：
+以下是 S5 收口时的候选；随后已选择完整存储流水线，见末节：
 
 | 候选 | 依据与可能收益 | 正确性/复杂度/演进约束 |
 |---|---|---|
 | 复用 running version 与有界日志 credit/缓冲 | 私有小操作分配量增加；可降低 allocator/清零周转 | 仍须保留本次 undo、OOM原子性和冻结版本；可逐层验证，不能直接共享可变提交源 |
 | 将 durable commit 与后续 checkpoint 推进分离，缩短 data-only 等待 | hot fdatasync 落后8.83倍，当前每批立即checkpoint；可减少同步关键路径 | 需保持环形日志空间、版本checkpoint、quarantine和错误owner；复杂度更高，必须再次跑恢复矩阵，不能只删flush |
-| 定位 re-readers 回退后再决定读锁/后台节奏/缓存措施 | 两种libc三启动均回退36%–38%，whole-command不能独立归因 | 只需能区分读阶段的窄对照，不能重新铺C矩阵或直接改resident/deadline索引；当前无确定首因 |
+| 区分 re-readers 字段与读锁/后台节奏/缓存措施 | Max下降36%–38%而Parent提高12%–13%，whole-command不能独立归因 | 只需能区分读阶段的窄对照，不能重新铺C矩阵或直接改resident/deadline索引；当前无确定首因 |
 
 #### 验证含义、失败修正与分支交付
 
@@ -706,3 +708,54 @@ make test-riscv test-userland-riscv test-glibc-riscv test-diff-abi-riscv test-sc
 以及 `references/oscomp-autotest@d1bb3a3c4b27274e196a2648518525c1a304e339`。
 证据提交后使用仓库prune清理运行副本、日志及临时探针，保留可复用构建/工具/固定Linux缓存；
 build路径是历史运行身份，不再作为永久证据。没有实板、硬实时或完整双架构成绩。
+
+### 性能全景与存储流水线（2026-10-01）
+
+内核性能分为真实工作吞吐/程序耗时、单次和尾部延迟、CPU固定成本、并发公平性、内存/规模
+以及持久化/恢复。普通 write 的成功表示接受字节，fsync 才等待相应持久化；缓存接受、程序
+结束与最终排空分别报告。Max 为最快子进程，Children 使用各子进程的计时分母，Parent 为
+实际传输总量除以父进程计时，不能把三者互换或由 Max 推导整个内核的速度。
+
+inode 保存文件身份、大小、权限、时间及块位置；文件字节与这些元数据属于不同层。操作
+undo 隔离本次尚未成功的修改，磁盘 journal 则保护多块元数据的恢复。ordered-data 先写
+数据并屏障，再写 metadata log 并屏障，最后 commit 并屏障；commit 成功表示该版本可以
+在重启时重放。checkpoint 随后把已提交版本写回原位置，持久更新日志起点，才释放日志
+空间和禁止复用的块/inode。SQLite WAL 管数据库事务，ext4 journal 管文件系统结构，不能
+互相代替。设备 WRITE 完成不一律表示掉电安全；FLUSH 必须遵守声明的设备契约。
+
+`main@c53eadf` 的具体问题：`__ext4_trans_start` 把64操作阈值与内存/复用压力一起
+送入 checkpoint 等待；私有操作反复准备 before/after/checkpoint/log 后才合并；
+`jbd_journal_submit` 逐块同步，retire 同时推进 durable/checkpoint。旧定点 musl 窗口
+510组仅83组含ordered-data，2123 FLUSH中2040来自每组固定四个屏障。这证明固定成本
+仍高，不表示所有427个metadata组都由timestamp产生，也不表示日志和屏障应被删除。
+
+重新读取已有 `cost-consumer-followup.json` 的原输出，重读三启动中位如下；没有新增启动：
+
+| libc / 字段 | S5之前 | S5之后 | 变化 |
+|---|---:|---:|---:|
+| musl Max kB/s | 65331.82 | 41799.64 | -36.02% |
+| musl Parent kB/s | 50211.21 | 56424.77 | +12.37% |
+| musl Children kB/s | 149653.59 | 117885.30 | -21.23% |
+| glibc Max kB/s | 68381.61 | 42229.14 | -38.24% |
+| glibc Parent kB/s | 50339.61 | 56981.63 | +13.19% |
+| glibc Children kB/s | 157791.75 | 120596.66 | -23.57% |
+
+原始S5关闭观测记录位于归档 `journal_optimization.original_off`，旧记录位于
+`records` 中 platform=boaros、cost_diagnostics=0 的三个副本。Parent改善与Max/Children下降同时成立，任务分配、后台
+竞争和协调成本需分开；热读relatime无更新仍取得inode独占锁是可省的固定操作，尚无
+它占整个读耗时的独占百分比。
+
+维护者已选择完整存储流水线：S6复用组级预留/版本，保留操作undo；S7分离sealed、
+durable和checkpoint；S8同阶段最多八span发布及热读共享检查；S9集中验收。事务
+预算仍为min(4MiB,RAM/32)，含空闲池，空闲池最多min(256KiB,预算/4)。这段记录
+已确认路线，实施状态以 `docs/goals.md` 为准；没有新增收益或恢复通过声明。
+
+非I/O成本按证据另行推进：单页两次mprotect仍访问64MiB驻留的32768项，期限检查随
+无期限blocked从7增至263项，大复制存在毫秒级IRQ-off采样；ready常见操作已O(1)。
+resident/deadline索引、安全分段、usercopy/分配、缓存政策、网络兼容和SMP分别验收。
+观测构建的时间不能直接当生产延迟，尤其逐resident计时曾带来40.9倍扰动。
+
+固定依据为 `references/linux@f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的
+`fs/inode.c`、`fs/jbd2/{transaction,commit,checkpoint}.c`、`mm/mprotect.c`，
+`references/qemu@84f07211cc5b4fc6a371559bf8a5de4fb068e648`（v11.1.0），以及
+`references/riscv` 特权规范20260120。实际运行QEMU版本/哈希另记，不混作源码版本。

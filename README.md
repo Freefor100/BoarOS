@@ -97,4 +97,6 @@ make test-references
 - [工程原则](docs/design.md)与[贡献说明](CONTRIBUTING.md)：技术取舍、验证与提交边界。
 - [固定资料](references/README.md)与[第三方代码](docs/third-party.md)：版本、来源及许可。
 
-异步日志与组提交已启用并验收：操作私有 undo、挂载点 running group、不可变提交版本与 joinable worker 保持 ordered/log/commit/checkpoint 屏障；完整 lwext4、SQLite DELETE/WAL 恢复和双盘隔离通过。关闭观测的原版 iozone 三次启动，musl/glibc 五项写入共十格中位吞吐提升 25.29–54.00 倍，自动模式降至 16.450/18.372 秒，均达到本轮目标。原 1GiB iozone 专项得 24.8500/25.1791；它不是完整 Harness。re-readers 回退 36%–38%、热写 fdatasync 与 Linux 的差距及未分类读请求仍明确保留，见[机制与性能验收](docs/learning/cost-baseline.md#异步日志与组提交验收2026-10-01)。
+异步日志与组提交已启用并验收：操作私有 undo、挂载点 running group、不可变提交版本与 joinable worker 保持 ordered/log/commit/checkpoint 屏障；完整 lwext4、SQLite DELETE/WAL 恢复和双盘隔离通过。关闭观测的原版 iozone 三次启动，musl/glibc 五项写入共十格中位吞吐提升 25.29–54.00 倍，自动模式降至 16.450/18.372 秒，均达到该轮目标。原 1GiB iozone 专项得 24.8500/25.1791；它不是完整 Harness。重读 Max 下降36%–38%，Parent 提高12%–13%，不能由最快子进程推导整体读退化。热写同步、前台版本准备及未分类读请求仍有成本，见[机制与性能验收](docs/learning/cost-baseline.md#异步日志与组提交验收2026-10-01)。
+
+下一轮已选择完整存储流水线：有界资源复用、封口与空间等待分离、durable commit 与 checkpoint 分离及批量 I/O；当前实施中，尚无新的性能收益声明。非 I/O 的 resident/deadline 扫描、长 IRQ-off、缓存和网络方向按证据另行推进，见[路线](docs/goals.md)与[性能全景](docs/learning/cost-baseline.md#性能全景与存储流水线2026-10-01)。
