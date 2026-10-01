@@ -69,6 +69,7 @@ for source in "$project_root"/third_party/lwext4/src/*.c; do
 		-Wno-unused-but-set-variable -Wno-stringop-truncation \
 		-DCONFIG_USE_DEFAULT_CFG=1 \
 		-I"$project_root/third_party/lwext4/include" \
+		-idirafter "$project_root/include" \
 		-c "$source" -o "$object"
 	objects="$objects $object"
 done
@@ -76,6 +77,7 @@ done
 "$host_cc" -std=gnu11 -O2 -Wall -Wextra -Werror \
 	-DCONFIG_USE_DEFAULT_CFG=1 \
 	-I"$project_root/third_party/lwext4/include" \
+	-idirafter "$project_root/include" \
 	-c "$project_root/tests/host/lwext4_read.c" \
 	-o "$work_dir/objects/lwext4_read.o"
 
