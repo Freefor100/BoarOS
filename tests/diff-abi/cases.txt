@@ -106,6 +106,9 @@ socket.udp-scale.recvfrom.short.4096
 socket.udp-scale.recvfrom.short.8192
 socket.udp-large-fault.read
 socket.udp-large-fault.readv
+network.tcp-trunc-discard
+network.tcp-trunc-protected
+network.tcp-trunc-consumed
 socket.tcp-scale.mebibyte
 socket.tcp-scale.fault-conservation
 socket.bad-type-flags
@@ -228,6 +231,8 @@ network.recvmsg-empty-iov
 network.recvmsg-empty-iov-consumed
 network.udp-shutdown-read
 network.udp-shutdown-eof
+network.udp-disconnect-auto-port
+network.udp-rebind-after-disconnect
 network.unix-send
 network.unix-shutdown-write
 network.unix-receive-before-eof

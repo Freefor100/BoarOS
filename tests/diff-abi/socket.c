@@ -207,6 +207,12 @@ static void tcp_scale_cases(void)
     abi_require(client >= 0 && SC3(203, client, &address, size) == 0);
     long server = SC3(202, listener, 0, 0);
     abi_require(server >= 0);
+    abi_require(SC3(64,client,"abc",3)==3);output[0]=output[1]=output[2]='z';
+    record("network.tcp-trunc-discard",SC6(207,server,output,3,0x20,0,0)==3 && output[0]=='z' && output[2]=='z');
+    long guard=SC6(222,0,4096,0,0x22,-1,0);abi_require(guard>0 && SC3(64,client,"abc",3)==3);
+    record("network.tcp-trunc-protected",SC6(207,server,guard,3,0x20,0,0));
+    record("network.tcp-trunc-consumed",SC6(207,server,output,3,0x40,0,0));
+    abi_require(SC2(215,guard,4096)==0);
     for (unsigned i = 0; i < sizeof(input); i++) input[i] = (unsigned char)(i * 13 + 7);
     int good = 1, batched = 0;
     for (unsigned batch = 0; batch < 128; batch++) {
@@ -338,6 +344,10 @@ static void network_application_cases(void)
     record("network.recvmsg-empty-iov-consumed",SC3(212,fd,&message,0x40));
     record("network.udp-shutdown-read",SC2(210,fd,0));
     record("network.udp-shutdown-eof",SC6(207,fd,data,sizeof(data),0,0,0));
+    struct socket_address disconnect={0};abi_require(SC3(203,fd,&disconnect,sizeof(disconnect))==0);
+    length=sizeof(peer);
+    record("network.udp-disconnect-auto-port",SC3(204,fd,&peer,&length)==0 && peer.port==0 && peer.address==address.address);
+    address.port=0;record("network.udp-rebind-after-disconnect",SC3(200,fd,&address,sizeof(address)));
     close_socket(fd);
     int pair[2];abi_require(SC4(199,1,1,0,pair)==0);
     record("network.unix-send",SC6(206,pair[0],"queued",6,0,0,0));

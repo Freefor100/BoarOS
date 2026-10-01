@@ -281,11 +281,12 @@ static enum kernel_files_status read_pinned(
         }
         int message = (socket_flags & KERNEL_SOCKET_IO_MESSAGE) &&
                       kernel_socket_is_datagram(kernel_open_file_socket(description));
+        int discard = kernel_socket_discard_receive(kernel_open_file_socket(description),socket_flags);
         if (count == 0U && !message) {
             *linux_result = 0;
             return KERNEL_FILES_STATUS_OK;
         }
-        if (kernel_task_io_buffer_acquire(&buffer, mm->allocator) !=
+        if (!discard && kernel_task_io_buffer_acquire(&buffer, mm->allocator) !=
                 KERNEL_TASK_STATUS_OK) {
             *linux_result = -KERNEL_ENOMEM;
             files->record->statistics.read_failures++;
@@ -306,7 +307,7 @@ static enum kernel_files_status read_pinned(
             if (received < 0 || read_request.socket == 0) break;
             int datagram = read_request.datagram;
             if (datagram) kernel_socket_read_info(&read_request, peer, message_size);
-            uint32_t done = 0;
+            uint32_t done = discard ? (uint32_t)received : 0;
             int fault = 0;
             while (done < (uint32_t)received) {
                 size_t chunk = (uint32_t)received - done, copied = 0;
@@ -328,7 +329,7 @@ static enum kernel_files_status read_pinned(
             total += (uint32_t)received;
             if (datagram) break;
         }
-        kernel_task_io_buffer_release(&buffer);
+        if (buffer.allocator) kernel_task_io_buffer_release(&buffer);
         *linux_result = total != 0U ? (int64_t)total : received;
         if (*linux_result < 0) files->record->statistics.read_failures++;
         else files->record->statistics.bytes_read += total;
