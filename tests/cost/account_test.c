@@ -16,6 +16,15 @@ int main(void)
     assert(kernel_cost_begin(1,10000000,0,0)==0);
     kernel_cost_join(&foreground);
     kernel_cost_switch(&background,&foreground);
+    struct kernel_cost_io_scope io=kernel_cost_io_enter(0);
+    assert((foreground.operation & 15)==1);
+    struct kernel_cost_io_scope file=kernel_cost_phase_enter(5);
+    assert(foreground.operation==81);
+    struct kernel_cost_io_scope metadata=kernel_cost_phase_enter(6);
+    assert(foreground.operation==97);
+    kernel_cost_io_leave(&metadata);assert(foreground.operation==81);
+    kernel_cost_io_leave(&file);assert(foreground.operation==1);
+    kernel_cost_io_leave(&io);assert(!foreground.operation);
     ticks=110; kernel_cost_block(&foreground);
     actor=&background; kernel_cost_switch(&foreground,&background);
     ticks=990; kernel_cost_wake(&foreground); kernel_cost_timeout(&foreground,980);

@@ -44,6 +44,7 @@
  */
 
 #include <ext4_config.h>
+#include <kernel/cost.h>
 #include <ext4_types.h>
 #include <ext4_misc.h>
 #include <ext4_errno.h>
@@ -599,6 +600,7 @@ static bool ext4_fs_verify_bg_csum(struct ext4_sblock *sb,
 int ext4_fs_get_block_group_ref(struct ext4_fs *fs, uint32_t bgid,
 				struct ext4_block_group_ref *ref)
 {
+	COST_PHASE_SCOPE(read_source, 6);
 	if (bgid >= ext4_block_group_cnt(&fs->sb))
 		return EUCLEAN;
 	/* Compute number of descriptors, that fits in one data block */
@@ -840,6 +842,7 @@ __ext4_fs_get_inode_ref(struct ext4_fs *fs, uint32_t index,
 			struct ext4_inode_ref *ref,
 			bool initialized)
 {
+	COST_PHASE_SCOPE(read_source, 6);
 	if (index == 0 || index > ext4_get32(&fs->sb, inodes_count))
 		return EUCLEAN;
 	/* Compute number of i-nodes, that fits in one data block */
@@ -1471,6 +1474,7 @@ static int ext4_fs_get_inode_dblk_idx_internal(struct ext4_inode_ref *inode_ref,
 				       bool extent_create,
 				       bool support_unwritten __unused)
 {
+	COST_PHASE_SCOPE(read_source, 6);
 	struct ext4_fs *fs = inode_ref->fs;
 
 	/* For empty file is situation simple */

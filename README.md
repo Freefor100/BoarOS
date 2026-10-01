@@ -76,6 +76,7 @@ make test-offline-c-tmpfs-riscv # tmpfs 工作目录的同 ELF 离线 GCC
 make test-busybox-tmpfs-riscv # 固定 BusyBox 在 tmpfs 上执行文件操作
 make test-stack-usage
 make test-lwext4-host
+make test-lwext4-cache-host # 命中先于回收、引用与失败owner
 make test-lwext4-recovery-host # 日志与 orphan 的断电/故障矩阵
 make test-lwext4-rename-host   # 改名、硬链接与最后链接回收的故障矩阵
 make test-lwext4-metadata-host # 时间设置、空间计数与几何/失败验证
@@ -100,3 +101,5 @@ make test-references
 异步日志与组提交已启用并验收：操作私有 undo、挂载点 running group、不可变提交版本与 joinable worker 保持 ordered/log/commit/checkpoint 屏障；完整 lwext4、SQLite DELETE/WAL 恢复和双盘隔离通过。关闭观测的原版 iozone 三次启动，musl/glibc 五项写入共十格中位吞吐提升 25.29–54.00 倍，自动模式降至 16.450/18.372 秒，均达到该轮目标。原 1GiB iozone 专项得 24.8500/25.1791；它不是完整 Harness。重读 Max 下降36%–38%，Parent 提高12%–13%，不能由最快子进程推导整体读退化。热写同步、前台版本准备及未分类读请求仍有成本，见[机制与性能验收](docs/learning/cost-baseline.md#异步日志与组提交验收2026-10-01)。
 
 S6–S8 存储流水线已落地：有界资源复用、封口与容量等待分离、durable commit 与 checkpoint 分离、八 span 批量 I/O 及热读共享 relatime 查询。最终恢复与系统回归通过，但 S9 收益目标未完成：匹配 S5 的十格 Parent 写吞吐为0.98–1.88倍，自动模式程序加同步收尾下降约22%–23%，未达到五倍/减半；固定4MiB热读回退低于2%，musl 四进程普通读 Parent 回退17.05%。原1GiB iozone 专项为25.0271/25.3164，不代表完整 Harness。分配调用下降约91%，提交仍510组，说明前台与小事务固定成本仍须处理；完整分析、未关闭项及后续方向见[本轮验收](docs/learning/cost-baseline.md#s9-存储流水线验收2026-10-01)与[路线](docs/goals.md)。
+
+块缓存已修正先回收再查询的命中破坏：生产目标8块不变，八块热工作集宿主预热后800次访问的额外设备读从800降为0；这是局部因果证据，真实程序收益另按本轮记录验收。后续主线和当前性能纠错/用户环境范围统一见[开发路线](docs/goals.md)，固定吞吐倍数不作为开发准入条件。

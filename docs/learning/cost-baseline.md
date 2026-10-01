@@ -1125,3 +1125,17 @@ IRQ-off也会推迟完成观察。应分清CPU策略、锁资格交接与设备�
 `qemu-options.hx` writeback/flush说明及 `hw/block/virtio-blk.c`。
 当前BoarOS策略与安全边界见 `kernel/sched/{policy,runqueue,scheduling}.c`、
 `docs/modules/kernel-scheduler.md`，故障模型见 `tests/host/{nbd_fault,block_fault}.c`。
+
+## 缓存查询顺序纠错（2026-10-01）
+
+main@6dce5a1 的 `ext4_block_get_noread`先shake再allocator查命中；实际源码宿主回归
+在8热块预热后800次读取产生800次设备读。只把已有块取得放到shake前，生产目标8不变，
+新增读降到0。7热块/700次、8引用+1热块/100次、64目标+8引用+1热块/100次分别也为0。
+峰值驻留7/8/9/9，说明引用块使软目标可超限；容量扩大不是本次收益来源。
+内容、dirty EIO保留、journal_pending、loading引用交接、descriptor/payload OOM、
+加载失败重试、共享只读回收和睡眠后allocator重查均验收，最终分配归零。
+
+可重建：`make test-lwext4-cache-host test-lwext4-metadata-host test-lwext4-group-host test-lwext4-recovery-host`。
+宿主窄测试先在旧实现证伪再运行补丁；相关日志、ordered-data、orphan、truncate、
+lost/reordered-sector恢复通过。本结论是缓存局部因果，不由0次额外读推导iozone倍数；
+实际消费者与固定工作量的端到端结果另在本节补齐。

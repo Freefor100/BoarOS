@@ -35,6 +35,7 @@
  */
 
 #include <ext4_config.h>
+#include <kernel/cost.h>
 #include <ext4_types.h>
 #include <ext4_misc.h>
 #include <ext4_errno.h>
@@ -2697,6 +2698,7 @@ static int ext4_zero_fblock_range(struct ext4_inode_ref *ref,
 				  ext4_fsblk_t fblock, uint32_t offset,
 				  uint32_t length)
 {
+	COST_PHASE_SCOPE(read_source, 7);
 	struct ext4_block block = EXT4_BLOCK_ZERO();
 	int r = ext4_trans_data_get(ref->fs->bdev, &block, fblock);
 	if (r != EOK) return r;
@@ -2709,6 +2711,7 @@ static int ext4_write_fblock_range(struct ext4_inode_ref *ref,
 				   ext4_fsblk_t fblock, uint32_t offset,
 				   const uint8_t *buf, uint32_t length)
 {
+	COST_PHASE_SCOPE(read_source, 7);
 	uint32_t block_size = ext4_sb_get_block_size(&ref->fs->sb);
 	struct ext4_block block = EXT4_BLOCK_ZERO();
 	int r;
@@ -2871,6 +2874,7 @@ static int ext4_read_pending_data(struct ext4_blockdev *bdev,
 
 static int ext4_fread_body(ext4_file *file, void *buf, size_t size, size_t *rcnt, bool pure)
 {
+	COST_PHASE_SCOPE(read_source, 5);
 	uint32_t block_size;
 	uint8_t *u8_buf = buf;
 	int r;

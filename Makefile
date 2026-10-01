@@ -602,6 +602,10 @@ test-lwext4-metadata-host:
 test-lwext4-cost-host:
 	sh tests/lwext4-cost-host.sh
 
+.PHONY: test-lwext4-cache-host
+test-lwext4-cache-host:
+	sh tests/lwext4-cache-host.sh
+
 .PHONY: test-lwext4-group-host
 test-lwext4-group-host:
 	sh tests/lwext4-group-host.sh

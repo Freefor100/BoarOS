@@ -249,3 +249,12 @@ proc mounts 保留用户给出的磁盘来源名，并正确标识 tmpfs。
 异步准备事务会改变故障执行器握手后的 I/O 前缀，SQLite 恢复 fixture 在 `mutation armed` 前同步根目录，排空 loader/control/SQLite 准备元数据，再开始本次数据库变更的故障计数。页缓存短写/重脏注入拦截实际 `ext4_fpwrite` 入口，避免链接器无法拦截同 translation unit 的内部调用。
 
 接近满盘时，若释放位图中的空闲块/inode 仍归运行或提交事务的 checkpoint 所有，下一操作先释放后端锁等待已接受序号，而不是返回暂时性的 ENOSPC。近满盘宿主 fixture 在回收 checkpoint I/O 中尝试另一文件扩展，旧实现未走等待边界，修正后明确等待、checkpoint 后重试成功，随后 e2fsck 正确；正常 RV64 组提交/回收亦通过。
+
+## lwext4 块缓存命中与回收
+
+`ext4_block_get_noread()` 在设备/LBA检查后先 `ext4_bcache_find_get()`。命中只取得引用，
+不为不存在的新分配提前回收；未命中才 shake，再由 allocator 再查一次，覆盖回收睡眠
+期间其他任务先加载同块的交错。有效内容、loading等待、加载错误、dirty及journal_pending
+沿原owner处理。共享后端读取不刷脏回收。生产目标保持8块（4KiB时32KiB），是回收目标，
+不是引用块驻留上限。`make test-lwext4-cache-host`保护循环热块、固定引用、加载/回收/OOM
+失败与最终释放；真实I/O等待和恢复仍由io-sleep、journal及SQLite回归保护。

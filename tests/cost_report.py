@@ -15,9 +15,10 @@ def schema():
 def supported_schemas():
     current=schema()
     pipeline={'journal_checkpoint_ticks','journal_wait_sealed','journal_wait_durable','journal_wait_checkpoint'}
-    journal=[metric for metric in current if metric[0] not in pipeline]
+    stored_pipeline=current[:next(i+1 for i,x in enumerate(current) if x[0]=='io_complete_to_resume')]
+    journal=[metric for metric in stored_pipeline if metric[0] not in pipeline]
     original=current[:next(i+1 for i,x in enumerate(current) if x[0]=='wake_to_run')]
-    return current,journal,original
+    return current,stored_pipeline,journal,original
 
 def parse(text, epoch, metrics=None):
     metrics=schema() if metrics is None else metrics

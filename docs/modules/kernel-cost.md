@@ -128,3 +128,11 @@ C4按握手确认的N+4个blocked成员检查扫描max下限，遗漏扫描或�
 v1 `values` 与 SHA256，仍可直接送入 `cost_report.parse` 核对 epoch、完成状态、单位和溢出；
 历史根记录及 seal 保持原样，`iozone-closure.py --verify` 继续只核对历史九启动。
 各次身份、原输出、比较值和开销限制见[验收分析](../learning/cost-baseline.md#异步日志与组提交验收2026-10-01)。
+
+缓存纠错观测另计块缓存hit/miss/eviction/load_wait；hit表示取得已有缓冲引用，
+不保证内容已经有效，因此loading命中仍可等待。设备READ在实际发布处只按可证明的
+file_read/metadata_read/prepare_read归因，不能证明的仍为unknown。来源scope嵌套恢复，
+不改变既有OUT的data/journal/checkpoint/super分类。名称容量32字节，逐项编译断言；
+新增13个无直方图聚合后存储65483字节，任务仍64字节；历史182项schema继续可读。
+`--case readers`是统一起跑、每任务8MiB/1KiB的同/不同inode冷/热读诊断，
+全部工作者完成且内容/状态核对后结束，记录标量时间和字节，不保留对象引用。
