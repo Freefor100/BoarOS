@@ -42,7 +42,7 @@ def classify(raw, timeout, status):
     return dict(completion_marker=marker,process_completed=process_completed,
                 requested_tests_available=available,outcome=outcome,reason=reason)
 
-def commands(output, expected_budget_ms=180000):
+def commands(output, expected_budget_ms=180000, expected_names=None):
     policies=re.findall(r'^COST CONSUMER BUDGET ([^\n]+)$',output,re.M)
     if len(policies)>1:raise ValueError('duplicate consumer budget')
     # Older sealed records used the fixed 180 s policy without a header.
@@ -53,12 +53,16 @@ def commands(output, expected_budget_ms=180000):
     for libc in ('musl','glibc'):
         for index,group in enumerate(GROUPS):
             name=f'consumer-{libc}-{index}'
+            if expected_names is not None and name not in expected_names:continue
             start=f'COST COMMAND BEGIN {name}\n';finish=re.findall(r'^COST COMMAND RESULT '+name+r' (\d+) (\d+)$',output,re.M)
             if output.count(start)!=1 or len(finish)!=1:raise ValueError('missing/duplicate original command '+name)
             timeout,status=map(int,finish[0]);raw=output.split(start,1)[1].split('COST RESULT '+name+' ',1)[0]
             argv=['./iozone','-a','-r','1k','-s','4m'] if group is None else ['./iozone','-t','4','-i',str(group[0]),'-i',str(group[1]),'-r','1k','-s','1m']
             sections=[line.strip() for line in raw.splitlines() if 'throughput for' in line or 'Initial write' in line or 'Re-write' in line]
-            result.append(dict(command_timeout_ms=budget,reported_sections=sections,name=name,elf_sha256=ELFS[libc],argv=argv,cwd='/'+libc,timeout=timeout,wait_status=status,raw_output=raw,**classify(raw,timeout,status)))
+            timing=re.findall(r'^COST COMMAND TIMING '+name+r' (\d+) (\d+)$',output,re.M)
+            if len(timing)>1:raise ValueError('duplicate command timing '+name)
+            split_timing=dict(zip(('program_ns','drain_ns'),map(int,timing[0]))) if timing else {}
+            result.append(dict(command_timeout_ms=budget,reported_sections=sections,name=name,elf_sha256=ELFS[libc],argv=argv,cwd='/'+libc,timeout=timeout,wait_status=status,raw_output=raw,**split_timing,**classify(raw,timeout,status)))
     return result
 
 def validate_method_results(raw, index):
@@ -96,9 +100,11 @@ def validate_record(row, require_completion=False):
     if (row.get('original_sha256')!=ORIGINAL_SHA or row.get('consumer_elf_sha256')!=ELFS or
         row.get('consumer_script_sha256')!=SCRIPTS or row.get('consumer_dependencies')!=DEPENDENCIES):
         raise ValueError('original consumer or dependency changed')
-    expected_names={f'consumer-{libc}-{i}' for libc in ELFS for i in range(8)}
+    all_names={f'consumer-{libc}-{i}' for libc in ELFS for i in range(8)}
+    expected_names=set(row.get('consumer_command_names',all_names))
+    if not expected_names or not expected_names<=all_names:raise ValueError('unknown selected original command')
     rows=row.get('commands',[])
-    if len(rows)!=16 or {c['name'] for c in rows}!=expected_names:raise ValueError('original command coverage')
+    if len(rows)!=len(expected_names) or {c['name'] for c in rows}!=expected_names:raise ValueError('original command coverage')
     budget=row.get('consumer_timeout_ms',180000)
     if not isinstance(budget,int) or not 1000<=budget<=3600000:raise ValueError('invalid frozen consumer budget')
     for c in rows:
