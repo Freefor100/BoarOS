@@ -2,8 +2,7 @@
 
 本文是唯一开发路线入口。P/N/L 编号保留为能力与依赖索引，不是机械执行顺序。
 `[x]` 只表示具体交付已验收；历史测量、输入身份和可重建命令归现有 learning。
-固定 Linux 为 `references/linux@f4cdf7ca9a1fdcca413157df19753f388a5a224e`，
-其他资料由 `references/sources.tsv` 管理。评审是调查输入，不自动成为实现或验收证据。
+固定 Linux 位于 `references/linux`，精确版本与其他资料由 `references/sources.tsv` 管理。评审是调查输入，不自动成为实现或验收证据。
 
 ## 当前轮：性能纠错与用户环境补全（2026-10-01）
 
@@ -63,8 +62,7 @@ A1完成后运行相关lwext4、真实加载等待/回收、四组合io-sleep及
 | S9消费者收口 | 测量/归档与正确性验收完成；原性能预期未达：Parent写0.98–1.88倍，自动程序+fsync收尾12.668/14.339秒，改善23.09%/22.04%；musl读Parent回退17.05%转A3，完整checkpoint未单独计时转本轮fixture |
 | 挂载/共享/数据库/工具链 | 统一后备、tmpfs、多盘、SysV shm、SQLite DELETE/WAL及固定小型离线GCC已交付；[多挂载](learning/memory-backed-mounts.md)、[恢复](learning/record-lock-sqlite-recovery.md)、[工具环境](modules/program-environment.md) |
 
-S9最终默认内核SHA为`75682369a7aed056d0f85f70413d8c31d577322707e57a0bd2d2dc629eb9dac6`；
-该轮完整恢复/双盘/RV64/libc/1091 ABI/scale/四组合io-sleep/栈通过。原1GiB专项
+S9完整恢复/双盘/RV64/libc/1091 ABI/scale/四组合io-sleep/栈通过。原1GiB专项
 25.0271/25.3164不是完整Harness。mtime事务已组提交，后端重阻塞已为零，不能继续当作
 尚未实现的下一轮任务。缓存顺序缺陷在未改HEAD宿主复现为0/800/100/0新增读，修复均为0；
 匹配自动程序+durable中位改善7.76%/6.99%，四进程读Parent改善14.08%/1.20%，
@@ -322,7 +320,7 @@ glibc四进程整命令仍增加0.73%。剩余prepare读取、1547 FLUSH和前�
 - [x] 基础矩阵双侧验证静态、动态、PIE、静态 PIE、额外 DSO、初始 TLS、dlopen TLS、pthread、信号及其组合；保留装载/main 之前、运行时和退出阶段的首个失败。更广 glibc 应用仍待试跑。
 - [x] 已区分内核 PT_INTERP 装载和用户动态链接器/运行时职责；首次 pthread_join 失败经固定 Linux 差分定位到 futex bitset，而非动态重定位。
 
-整合后 `make test-glibc-riscv test-diff-abi-riscv test-userland-riscv test-sqlite-wal-riscv test-riscv test-stack-usage` 通过，固定 Linux 差分为 408 条一致。228 项清单按 `python3 tests/program-inventory/run.py --reuse-builds --output build/glibc-futex-inventory` 全量重跑仍为 223/2/3，五个旧失败 ID 不变；内核 SHA-256 `ebc11763ddac2661df3af45cca96ca322abeba0623e5cb9919a9051392db4574`，suite identity SHA-256 `5419a733de0e8e5095f53876f261a5a17c0c9f49b6f445dc0953e6fcef48c9c9`。输入和重建命令见[程序清单](learning/user-program-inventory.md)。
+整合后 `make test-glibc-riscv test-diff-abi-riscv test-userland-riscv test-sqlite-wal-riscv test-riscv test-stack-usage` 通过，固定 Linux 差分为 408 条一致。228 项清单按 `python3 tests/program-inventory/run.py --reuse-builds --output build/glibc-futex-inventory` 全量重跑仍为 223/2/3，五个旧失败 ID 不变。输入和重建命令见[程序清单](learning/user-program-inventory.md)。
 
 ### P5b shebang 与 exec 组合
 
@@ -347,7 +345,7 @@ glibc四进程整命令仍增加0.73%。剩余prepare读取、1547 FLUSH和前�
 
 **验证与退出**：现有 `test-exec-riscv`、`test-elf-tail-riscv`、`test-userland-riscv`，新增 `test-glibc-riscv`、futex bitset 固定 Linux 差分和 `make test-offline-c-riscv` 的客体原生五阶段编译验收；`tests/userland/exec_scripts.c` 仍待后续能力建设。未特改动态 glibc 的基础矩阵和固定小型 C 程序的离线构建已有闭环；Rust 与更大项目尚未验收，不能把剩余运行失败合并成一个“动态链接未支持”。
 
-整合后 `make test-diff-abi-riscv test-files-riscv test-userland-riscv test-lwext4-metadata-host test-references test-offline-c-riscv test-glibc-riscv test-sqlite-wal-riscv test-sqlite-wal-recovery-riscv test-riscv test-offline-c-baseline-riscv test-stack-usage` 通过；固定 Linux 差分为 430 条。228 项清单通过 `python3 tests/program-inventory/run.py --reuse-builds --output build/offline-gcc-inventory` 全量重跑仍为 223/2/3，五个旧失败 ID 不变。内核 SHA-256 为 `9f848c4b74aa8415c0869616abfccd456e26742e1959d717b7f59f57f50164c4`，清单身份 SHA-256 为 `f3540ed6f317d7ca605780c938e4dbd6b66f76af56836e128234018f7c9329a4`；固定 Linux Image SHA-256 为 `16a93ddb1d451898b93fff14de0cc076bcf1b10dad54c19a3e179a6cd81103b1`。
+整合后 `make test-diff-abi-riscv test-files-riscv test-userland-riscv test-lwext4-metadata-host test-references test-offline-c-riscv test-glibc-riscv test-sqlite-wal-riscv test-sqlite-wal-recovery-riscv test-riscv test-offline-c-baseline-riscv test-stack-usage` 通过；固定 Linux 差分为 430 条。228 项清单通过 `python3 tests/program-inventory/run.py --reuse-builds --output build/offline-gcc-inventory` 全量重跑仍为 223/2/3，五个旧失败 ID 不变。精确输入与历史证据见[程序清单](learning/user-program-inventory.md)。
 
 ## P6：SMP、TLB 与中断/I/O 并发
 
