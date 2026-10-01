@@ -42,8 +42,8 @@ make test-init-config-riscv       # 交替重建检查，结束后恢复默认
 ```
 
 runner 读取固定 Harness `kernel/judge/config.json`。其中 `qemu.timeout=3600`；
-60 秒只是 `run_qemu.py` 的缺省值，不能冒充随附配置。RV 参数按该源码取 `smp`、
-`mem`（默认 1 hart/1G）、VirtIO block/net、user net、RTC UTC、OpenSBI default。
+60 秒只是 `run_qemu.py` 的缺省值，不能冒充随附配置。RV 参数按该源码取 `qemu.smp`、
+`qemu.mem`（默认 1 hart/1G）、VirtIO block/net、user net、RTC UTC、OpenSBI default。
 本 profile 无第二盘，不伪造不存在的输入；总时间预算覆盖一次 QEMU 启动。
 
 原 `parse_serial_out_new` 和 22 个 judge 原样运行，未到达组也由原 judge 产生结果。
@@ -289,3 +289,5 @@ qemu-system-riscv64 -machine virt -kernel kernel-rv -m 1G -nographic -smp 1 \
 以上是旧基线当时的待办。真实 procfs/设备与 mount 首批能力已在后续主线交付；
 当前未关闭的统计、tmpfs、环境接口及 SysV IPC 依赖以 [goals](../goals.md) 为准。
 原 judge 分数不能直接等同于内核能力覆盖率。
+
+`python3 -B tests/oscomp/run.py --groups iozone --output build/oscomp-iozone` 在原 1GiB/1hart/3600 秒配置中仅执行两套原 iozone 脚本，原脚本/ELF/八组参数和 judge 均保留。未选择的组明确标为 not-selected；原 postwork 的局部 RV 投影不表示完整 Harness 通过，专项只比较各 libc 的 iozone 原分数。执行器保存 kernel 副本、原盘副本身份、DTB 和实际 QEMU 二进制哈希。

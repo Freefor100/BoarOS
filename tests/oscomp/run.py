@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -55,7 +56,7 @@ class ReportJob:
     def detail(self, value): pass
     def verdict(self, value): self.verdict_value = value
 
-def grade(log, directory, config):
+def grade(log, directory, config, selected):
     sys.dont_write_bytecode = True
     os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
     sys.path.insert(0, str(REF / 'kernel'))
@@ -78,14 +79,15 @@ def grade(log, directory, config):
         raw, _ = postwork.build_table(name, ['rv'], {'rv': results})
         groups[name] = {'judge_score': raw['#TOTAL'], 'started': begin, 'ended': end,
                         'script_exit': int(status[1]) if status else None,
-                        'state': 'not-reached' if not begin else 'incomplete' if not end else 'completed'}
+                        'state': 'not-selected' if name.rsplit('-',1)[0] not in selected else 'not-reached' if not begin else 'incomplete' if not end else 'completed'}
     return {'groups': groups, 'postwork_integer_score': job.integer_score,
-            'postwork_rank': job.ranking, 'scope': 'RV only; LA was not run and is absent from the postwork input'}
+            'postwork_rank': job.ranking, 'scope': 'RV '+','.join(selected)+' only; unselected groups and LA were not run'}
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--output', type=Path, default=ROOT / 'build/oscomp-rv-run')
     ap.add_argument('--diagnostic-timeout', type=int, help='override budget; labels result diagnostic, never the formal baseline')
+    ap.add_argument('--groups',choices=('all','iozone'),default='all',help='iozone is a local专项, never full Harness acceptance')
     args = ap.parse_args()
     directory = args.output.resolve()
     if directory.exists():
@@ -93,6 +95,7 @@ def main():
     if not directory.is_relative_to(ROOT / 'build'):
         raise SystemExit('run outputs must be under build/')
     identity = validate()
+    selected=GROUPS if args.groups=='all' else ['iozone']
     config_path = REF / 'kernel/judge/config.json'
     config = json.loads(config_path.read_text())
     budget = args.diagnostic_timeout if args.diagnostic_timeout is not None else config.get('qemu.timeout', 60)
@@ -103,14 +106,17 @@ def main():
     subprocess.run(['cp', '--reflink=auto', '--sparse=always', str(REF / 'sdcard-rv.img'), str(disk)], check=True)
     # Add only our startup script; all upstream test files and metadata stay intact.
     commands = f'write {HERE / "init.sh"} /boaros-start.sh\nset_inode_field /boaros-start.sh mode 0100755\n'
+    if args.groups!='all':
+        selection=directory/'groups';selection.write_text(' '.join(selected)+'\n')
+        commands+=f'write {selection} /boaros-eval-groups\n'
     injected = subprocess.run(['debugfs', '-w', str(disk)], input=commands, text=True, capture_output=True, check=True)
     (directory / 'prepare.log').write_text(injected.stdout + injected.stderr)
     check = subprocess.check_output(['debugfs', '-R', 'cat /boaros-start.sh', str(disk)], stderr=subprocess.DEVNULL)
     if check != (HERE / 'init.sh').read_bytes(): raise RuntimeError('startup script injection failed')
-    kernel = ROOT / 'kernel-rv'
+    kernel = directory / 'kernel-rv';shutil.copyfile(ROOT/'kernel-rv',kernel)
     qemu = os.environ.get('QEMU_RISCV64', 'qemu-system-riscv64')
-    command = [qemu, '-machine', 'virt', '-kernel', str(kernel), '-m', str(config.get('mem', '1G')),
-               '-nographic', '-smp', str(config.get('smp', 1)), '-bios', 'default',
+    command = [qemu, '-machine', 'virt', '-kernel', str(kernel), '-m', str(config.get('qemu.mem', '1G')),
+               '-nographic', '-smp', str(config.get('qemu.smp', 1)), '-bios', 'default',
                '-drive', f'file={disk},if=none,format=raw,id=x0', '-device',
                'virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0', '-no-reboot',
                '-device', 'virtio-net-device,netdev=net', '-netdev', 'user,id=net', '-rtc', 'base=utc']
@@ -120,7 +126,13 @@ def main():
               'init_config_sha256': sha(HERE / 'init.json'), 'init_script_sha256': sha(HERE / 'init.sh'),
               'qemu': output([qemu, '--version']).splitlines()[0], 'qemu_command': command,
               'timeout_seconds': budget, 'diagnostic': args.diagnostic_timeout is not None,
-              'boot_count': 1, 'extra_disk': None}
+              'boot_count': 1, 'extra_disk': None, 'selected_groups':selected,
+              'qemu_sha256':sha(shutil.which(qemu)), 'fixture_sha256':sha(disk),
+              'source_tree':output(['git','write-tree']), 'timebase_hz':10000000,
+              'firmware_sha256':sha(Path('/usr/share/qemu/opensbi-riscv64-generic-fw_dynamic.bin'))}
+    dtb=directory/'boot.dtb';probe=list(command);probe[probe.index('-machine')+1]='virt,dumpdtb='+str(dtb)
+    subprocess.run(probe,cwd=directory,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,check=True)
+    report['dtb_sha256']=sha(dtb);command+=['-dtb',str(dtb)]
     (directory / 'identity.json').write_text(json.dumps(report, indent=2) + '\n')
     print(f'Running one RV boot, total budget {budget}s; log: {directory / "serial.log"}', flush=True)
     start = time.monotonic()
@@ -135,7 +147,7 @@ def main():
             report['exit_reason'] = 'total-budget-timeout'
     report['elapsed_seconds'] = time.monotonic() - start
     report['serial_sha256'] = sha(log)
-    report.update(grade(log, directory, config))
+    report.update(grade(log, directory, config, selected))
     for group in report['groups'].values():
         if group['state'] == 'incomplete' and report['exit_reason'] == 'total-budget-timeout':
             group['state'] = 'timeout'

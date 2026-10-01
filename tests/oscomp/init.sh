@@ -13,7 +13,9 @@ $BB mknod -m 600 /dev/console c 5 1
 exec </dev/console >/dev/console 2>&1
 $BB mount -t proc proc /proc
 export HOME=/ TERM=vt100
-for group in basic busybox cyclictest iozone iperf libcbench libctest lmbench ltp lua netperf; do
+groups='basic busybox cyclictest iozone iperf libcbench libctest lmbench ltp lua netperf'
+if [ -f /boaros-eval-groups ]; then groups=$($BB cat /boaros-eval-groups); fi
+for group in $groups; do
     for libc in glibc musl; do
         (
             cd /$libc
