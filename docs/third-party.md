@@ -37,6 +37,7 @@ glibc 2.44 作为外部测试输入使用：官方源码归档保存在被忽略
 
 - 单 hart 可睡眠扩展：mount 读写锁、任务 transaction owner、纯定位 `ext4_fpread`、同块 loading 等待、RELATIME 无副作用读预检；orphan/journal/恢复/卸载统一独占。生产 owner 检查不依赖可关闭的 debug assert。写事务仍单 owner 且保持日志格式与提交顺序，未升级上游版本；验证见 `test-io-sleep-riscv` 与 `test-lwext4-recovery-host`。
 - 多实例扩展：锁回调显式携带 context，BoarOS 适配按实例登记名称、块设备、锁和错误 owner；公共堆绑定按引用计数维护。新增固定源 inode 的硬链接事务入口，同步目录项、链接数和时间戳；最后链接才进入 orphan 生命周期。验证为 `test-lwext4-instances-host` 与扩展的 `test-lwext4-rename-host`，上游 commit 不变。
+- 异步日志扩展：操作级私有 undo/资源预留、mount running group、不可变 metadata/data/log 版本及独立 worker；有预算的日志映射、未提交 home writeback 禁止、释放块/inode quarantine、full/data 同步目标与版本 checkpoint。保持现有磁盘格式和 ordered/log/commit 屏障，未启用 ASYNC_COMMIT 特性，也未升级上游。旧“即时提交”描述仅适用于未启用组引擎的路径；生产 journal mount 使用组提交。实际 1/4KiB 引擎、RV64 IRQ/lifecycle、完整恢复及原消费者验收见 [VFS模块](modules/vfs-ext4.md) 和 [机制分析](learning/cost-baseline.md#异步日志与组提交验收2026-10-01)。
 
 ## BLAKE2s
 

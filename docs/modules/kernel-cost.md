@@ -109,10 +109,16 @@ C4按握手确认的N+4个blocked成员检查扫描max下限，遗漏扫描或�
 
 原版消费者定点归因可用 `--consumer-commands musl:0,musl:1,glibc:0,glibc:1`；部分集合的验收范围仅为该集合，不能替代完整八组。逐命令程序时间和排空时间分开保存；窗口关闭前包装器同步当前工作目录中的普通文件与目录。事务内存指标的 max 是按堆容量和 home buffer 保守计费的峰值，value 是每批峰值样本之和，不能当瞬时驻留量。
 
-设备请求保留观测标量的完成观察时刻，成功 harvest 且已有等待者时记录同一请求从完成观察到 wake 返回、到原 submit 调用恢复的 ticks。`io_complete_to_ready` 是 wake 返回后的上界，`io_complete_to_resume` 包含 ready 等待与恢复后的少量记账；失败/reset 另由原错误计数保护，不纳入这两个正常完成样本。它们不保存任务引用；关闭构建无这些字段。固定聚合预算现在为 64901 B，每任务仍为 64 B。
+设备请求保留观测标量的完成观察时刻，harvest 且已有等待者时记录同一请求从完成观察到 wake 返回、到原 submit 调用恢复的 ticks。`io_complete_to_ready` 是 wake 返回后的上界，`io_complete_to_resume` 包含 ready 等待与恢复后的少量记账；正常完成但设备返回错误的请求也可采样，错误另有计数，没有完成观察的 reset 路径不采样。它们不保存任务引用；关闭构建无这些字段。固定聚合预算现在为 64901 B，每任务仍为 64 B。
 
 定点消费者启动可追加 `--consumer-sync`：同一启动中使用当前静态 musl 协调器执行四组固定 4KiB 热覆盖写，各 128 次，分别 O_SYNC/O_DSYNC/每次 fsync/每次 fdatasync，另核对读回内容。`--consumer-sync-only --linux --replicas 1` 只执行这些受控同步参考，不能称为原版 iozone 或完整消费者验收。原版八组 argv 不受该选项影响；同步窗口独立命名，计入本次新增窗口范围。
 
 `--coordinator-elf` 可直接复用先前封存的 consumer ELF，保证原消费者 ON/OFF 的协调二进制一致；执行器仍冻结它并记录实际哈希。该选项不与新增同步 probe 混用。短同步参考可另用 `--consumer-sync-only`；其窗口不计入原 iozone 成绩。
 
 历史 v1 存档按原完整指标表解包：接受当前表及截止 wake_to_run 的原表，不能接受任意删减的表。旧记录无需补造 journal 指标或重跑测量，旧 seal 与九启动身份继续核对；新窗口仍要求当前完整表。
+
+异步日志验收证据追加在既有 `cost-consumer-followup.json` 的 `journal_optimization`：三次原消费者 OFF、
+一次四命令 ON、两次受控同步参考；不冒充三副本 ON 或完整成本矩阵。四个 ON snapshot 保存完整
+v1 `values` 与 SHA256，仍可直接送入 `cost_report.parse` 核对 epoch、完成状态、单位和溢出；
+历史根记录及 seal 保持原样，`iozone-closure.py --verify` 继续只核对历史九启动。
+各次身份、原输出、比较值和开销限制见[验收分析](../learning/cost-baseline.md#异步日志与组提交验收2026-10-01)。

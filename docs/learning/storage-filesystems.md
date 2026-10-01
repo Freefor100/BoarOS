@@ -186,7 +186,12 @@ BoarOS 初始化三个无路径 console OFD，返回 `ENOENT`。根启动在文�
 `tests/diff-abi/cases.txt`：一次两侧均完整输出 `ABI END 605`，但清单仍为
 603 条，解析器正确拒绝了不匹配的运行；这并非内核阻塞。
 
-## 为什么当前是同步 I/O
+## 启动期同步 I/O 的选择与后续演进
+
+下文记录最初启动期方案。当前运行期设备使用真实 IRQ 和睡眠等待，journal mount 已采用
+独立线程执行冻结版本的组提交与 checkpoint；块接口仍是同步调用，不代表调用者忙等。
+页缓存阈值清脏与事务提交分别拥有数据和版本，生产持久化边界见
+[VFS模块](../modules/vfs-ext4.md)，测得收益与剩余成本见[本轮验收](cost-baseline.md#异步日志与组提交验收2026-10-01)。
 
 设备 flush 与块缓存排空是两层边界。新增块 flush 依据固定 Linux `references/linux/drivers/block/virtio_blk.c`（`f4cdf7ca9a1fdcca413157df19753f388a5a224e`）与 QEMU `references/qemu/hw/block/virtio-blk.c`（v11.1.0，`84f07211cc5b4fc6a371559bf8a5de4fb068e648`）：不协商 CONFIG_WCE 时，FLUSH feature 决定 writeback，缺失则为 write-through。协商 FLUSH 后必须真实提交该请求；内存 fence、read-after-write、QEMU 正常退出均不能替代介质持久化证据。host 故障模型把易失状态与稳定镜像分开，允许未同步扇区丢失/重排；后续 journal 测试应复用这个模型，而非仅终止普通 QEMU 后检查恰好仍在宿主页缓存中的数据。
 

@@ -8,7 +8,7 @@ Linux 为 `references/linux` 的 `f4cdf7ca9a1fdcca413157df19753f388a5a224e`。
 此前于 `main@959da70` 完成仅文档审计；下面独立 Review 小节记录新一轮实际修复与验证。
 下列“已交付”引用该阶段证据，“未实现”据当前源码，“待定位”不等于已证实内核缺陷。
 
-## 异步日志与 I/O 优化（2026-10-01，进行中）
+## 异步日志与 I/O 优化（2026-10-01，已验收）
 
 已选择完整异步日志、跨调用组提交和提交线程，保持 ordered-data/log/commit 屏障及恢复正确性。
 默认 100ms 首次脏化期限、64 操作或 256KiB 软批次边界；每挂载点事务内存上限 min(4MiB, RAM/32)。
@@ -22,9 +22,14 @@ Linux 为 `references/linux` 的 `f4cdf7ca9a1fdcca413157df19753f388a5a224e`。
 | S2 后台组提交/checkpoint | 已接入每 mount joinable worker、期限/批次、容量预算和不可变 checkpoint；真实 RV64 窄验证通过 |
 | S3 同步及生命周期 | full/data、后端锁释放等待、unlink/truncate/卸载已接入；SQLite DELETE/WAL 正常与重启通过；lwext4 与 SQLite DELETE/WAL 完整恢复及双盘隔离通过；近满盘等待另有因果对照 |
 | S4 idle IRQ 与 FIFO 交接 | 聚焦实现通过 test-scheduler-cases-riscv（1/8/32 等待者）及 test-scheduler-riscv；完整 RV64、musl/glibc、1091 ABI、scale、四组合 io-sleep 与栈检查通过 |
-| S5 原消费者与收益 | 依赖 S1–S4；3 次关闭观测全原参数、1 次定点观测、1 次 1GiB iozone 专项；尚无新性能结论 |
+| S5 原消费者与收益 | 三次关闭观测原版八组均执行，各 libc 七组可用方法完成；十格写吞吐中位改善 25.29–54.00 倍、自动耗时下降 95.51%–96.04%；一次定点归因、两次短同步参考及一次 1GiB 原专项完成，读回退和同步差距单列 |
 
 最终候选一次执行实际持久化机制所需的恢复矩阵与扩大回归。既有成本矩阵不重跑，完成的检查仅在相关修改或失败后重跑。
+
+完整结论、各次输入、分布和重建命令见[机制与性能验收](learning/cost-baseline.md#异步日志与组提交验收2026-10-01)。
+本轮性能目标达到，但 re-readers 中位回退 36%–38%，当前 whole-command 窗口不足以归因到读阶段；
+热写 O_DSYNC/fdatasync 仍明显落后于固定 Linux，版本预留仍有大量分配/清零。
+这些是后续调查与优化候选，尚未选择新的结构路线。完整 Harness 因缺 kernel-la 继续阻塞。
 
 ## 独立 Review 的组合边界（2026-09-30）
 
@@ -113,7 +118,7 @@ SQLite DELETE/WAL 完整矩阵通过；不同验证快照的边界明确分列�
 | 方向 | 已有基础 | 尚缺能力或尚未证明的结论 |
 |---|---|---|
 | IPC / 共享内存 | 共享匿名、统一后备对象、tmpfs/POSIX shm、匿名共享 futex、AF_UNIX/socketpair、SysV 共享内存 | SysV 信号量与消息队列尚无入口；AF_UNIX 命名端点/SCM_RIGHTS、共享文件 futex、PI 仍缺 |
-| 文件与存储 | 页缓存、阈值写回、真实同步、日志恢复、多盘独立 owner | 范围写回顺序扫描与逐页提交；fdatasync 与 fsync 共用保守路径；无周期清脏、事务合并、预读或负目录项缓存 |
+| 文件与存储 | 页缓存、阈值写回、真实同步、日志恢复、多盘独立 owner；异步日志组提交与 full/data 目标序号 | 范围写回仍顺序扫描；同步序号保守地在 checkpoint 后推进；无周期页缓存清脏、预读或负目录项缓存；私有版本预留分配与读回退待改善 |
 | 并发与调度 | 单 hart IRQ 等待、每盘八槽、读共享/写独占、FIFO/RR 及预算 | 单盘后端写事务串行；同 OFD 位置、命名空间和冲突 inode 互斥；八槽不代表每个应用都可产生八个并发请求；无 SMP/PI/硬实时 |
 | 内存与信号 | demand paging、COW、fork、线程与标准信号 | mremap、按操作区分的 madvise、mlock、sigaltstack、实时信号队列未交付 |
 | 系统环境与安全 | sysinfo/proc、会话、可信虚拟熵源、固定 root 查询 | klogctl、RTC 字符接口、完整凭据/权限、TTY、内核栈 guard、实板熵源仍缺；canary 不等于 guard |

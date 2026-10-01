@@ -44,7 +44,7 @@ RISC-V VFS 测试的内存后端覆盖内部边界；用户态 `mount(2)`/`umoun
 
 `kernel_vfs_open_executable()` 在普通 open 之上统一要求 regular file 和至少一个执行位；目录、非普通文件或无执行位返回 `-EACCES`。若目标 node 存在活动的写打开者（`node->write_openers > 0`），返回 `-ETXTBSY`；检查通过后累加 `node->exec_users` 并持有 `file->exec_lease`。对应地，以写权限打开普通文件需调用 `kernel_vfs_file_acquire_write()`，当 `node->exec_users > 0` 时准确返回 `-ETXTBSY`，否则累加 `node->write_openers` 并持有 `file->write_lease`。该租约在 `kernel_vfs_close()` 时释放，严格保障运行中二进制与写入者之间的互斥。
 
-挂载为 lwext4 注册可选 realtime 时钟；尚未初始化时钟的纯模块环境保留原时间。`kernel_vfs_file_accessed()` 按活 inode 执行 relatime（包含页缓存命中的 read/pread），`kernel_vfs_file_modified()` 在非零写请求复制前更新时间并传播 metadata flush 错误。create、目录链接/删除和 truncate 在拥有 inode 引用的后端更新相应时间；同尺寸 truncate 也走后端，unlink 后仍打开的文件不依赖路径。时间字段编码、操作时机与失败 owner 的依据见[时间戳学习记录](../learning/file-timestamps.md)。
+挂载为 lwext4 注册可选 realtime 时钟；尚未初始化时钟的纯模块环境保留原时间。`kernel_vfs_file_accessed()` 按活 inode 执行 relatime（包含页缓存命中的 read/pread），`kernel_vfs_file_modified()` 在非零写请求复制前更新时间。操作预留或已知 mount 错误当场传播；异步组登记后发生的持久化错误由 journal/mount 保留并由同步接口观察。create、目录链接/删除和 truncate 在拥有 inode 引用的后端更新相应时间；同尺寸 truncate 也走后端，unlink 后仍打开的文件不依赖路径。时间字段编码、操作时机与失败 owner 的依据见[时间戳学习记录](../learning/file-timestamps.md)。
 
 `kernel_vfs_file_set_mode()` 通过持有的 inode handle 事务修改低 12 个权限位，
 保留类型和其余位并更新 ctime；路径入口复用同一 handle。后端
@@ -79,7 +79,7 @@ miss 路径先分配并清零页，再通过 node 的无 offset 副作用 `pread
 
 事务接口 `ext4_transaction_begin/end/abort` 支持同一 mount 的嵌套修改；外层提交前保留 metadata 和数据缓冲的 before-image 与引用。明确发生在日志提交前的 OOM、空间不足或关联数据 I/O 失败可回滚内存并重试；已可能影响日志持久状态的错误由 mount 保留，不能清除后继续。外层 abort 后，调用者须重新打开在内层修改过的 lwext4 handle；VFS 的普通操作各自完成事务，不持有跨 syscall 的开放事务。
 
-`ext4_journal_group_enable/service/drain` 由可写 journal mount 的独立 joinable 线程驱动；根启动与动态磁盘挂载启动该线程，宿主 fixture 显式推进同一引擎。操作仍各自持有 before-image，成功后合入挂载点 running transaction；同块修改合并，后一次失败只回滚自身。封口把 metadata 和 ordered data 复制到预留的不可变版本，提交准备使用预留日志缓冲和挂载期固定映射；设备提交和 checkpoint 不再读取可变 bcache。未提交 owner 通过 `journal_pending` 禁止隐式 home writeback，块与 inode 的释放范围保留到 checkpoint 屏障和日志起点更新完成，分配器跳过这些范围。首脏 100 ms、64 次成功操作或 256 KiB 镜像是封口条件，事务分配按堆容量向上取整计费，独立版本另保守计入固定的 home buffer，固定日志映射也纳入挂载点预算；运行时上限为 min(4MiB, RAM/32)。当前保守地在每批提交后完成 checkpoint，再发布 durable/checkpoint 序号；同步返回具有完整持久化保证，RV64 的 IRQ I/O、期限封口、同步和卸载已通过窄验证；lwext4、SQLite DELETE/WAL 完整恢复与双盘隔离已通过，消费者收益仍待验收。
+`ext4_journal_group_enable/service/drain` 由可写 journal mount 的独立 joinable 线程驱动；根启动与动态磁盘挂载启动该线程，宿主 fixture 显式推进同一引擎。操作仍各自持有 before-image，成功后合入挂载点 running transaction；同块修改合并，后一次失败只回滚自身。封口把 metadata 和 ordered data 复制到预留的不可变版本，提交准备使用预留日志缓冲和挂载期固定映射；设备提交和 checkpoint 不再读取可变 bcache。未提交 owner 通过 `journal_pending` 禁止隐式 home writeback，块与 inode 的释放范围保留到 checkpoint 屏障和日志起点更新完成，分配器跳过这些范围。首脏 100 ms、64 次成功操作或 256 KiB 镜像是封口条件，事务分配按堆容量向上取整计费，独立版本另保守计入固定的 home buffer，固定日志映射也纳入挂载点预算；运行时上限为 min(4MiB, RAM/32)。当前保守地在每批提交后完成 checkpoint，再发布 durable/checkpoint 序号；同步返回具有完整持久化保证。RV64 的 IRQ I/O、期限封口、同步和卸载，lwext4、SQLite DELETE/WAL 完整恢复与双盘隔离均已通过；原消费者十格写吞吐门槛达到，读回退与同步成本见[验收分析](../learning/cost-baseline.md#异步日志与组提交验收2026-10-01)。
 
 `make test-lwext4-group-host` 使用实际引擎与独立设备计数，覆盖 32 次时间修改合成一批、嵌套 abort、后操作各预留点 OOM、提交期间同块新修改、冻结后禁止新分配、1/4 KiB 文件系统的 WRITE/FLUSH 失败与重启恢复。默认同步路径的 metadata/几何/错误原子性回归继续由 `make test-lwext4-metadata-host` 保护。
 
