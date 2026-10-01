@@ -317,3 +317,31 @@ DTB timebase 为 10MHz。运行时 tracked tree 干净，报告中的 dirty 字�
 哈希均已归档。运行目录核对后删除；重建仍使用固定输入与本模块命令。
 512MiB 三启动性能门槛、同步差距及剩余瓶颈另见
 [完整机制与性能分析](../learning/cost-baseline.md#异步日志与组提交验收2026-10-01)。
+
+### 存储流水线后的 iozone 专项（2026-10-01）
+
+S6–S8 从 main 单向合入 `8fe3431617d61b8d514d98270abd832b49c4da10` 后，仅执行一次
+1GiB原配置专项，269.309秒正常结束（S5为293.532秒，减少8.25%）。两侧原脚本各八组，
+16次自然完成；14次可用方法的原输出成立，2次 `(11,12)` 仍为原ELF版本排除，回退输出
+不表示向量方法实现。最终PID1 status=0、heap-live=0。没有执行其他组或LA。
+
+| libc | S5原judge分数 | 本次原judge分数 | 变化 |
+|---|---:|---:|---:|
+| musl | 24.8499558194 | 25.0271282492 | +.713% |
+| glibc | 25.1790812446 | 25.3164080521 | +.545% |
+
+代表写项仍各1分，总分增长主要来自读项；不能把分数微升称为存储性能门槛通过。
+512MiB三启动的十格Parent五倍目标、自动耗时减半及musl普通读不回退均未达标，
+具体字段、分布、代码归因和同步边界见[本轮验收](../learning/cost-baseline.md#s9-存储流水线验收2026-10-01)。
+完整lwext4/SQLite恢复与系统回归通过，完整Harness仍缺 `kernel-la`；专项局部投影不是总成绩。
+
+证据追加到 [原评分证据](../learning/oscomp-rv-results.json) 的 `storage_pipeline`，
+保留历史记录、原分项judge、两侧原输出与运行身份。内核SHA-256
+`6e72791ecbf7e9d03255eabbbfbf7906f049609e2d173c5ea6c97f360d09d199`，
+tree `47088b8fbe34daa89dc1b5fae471542f68cf7a38`，串口SHA-256
+`9a2bee500b4f7a77cc715beb89cbc3a23db8e005f1ba2e248601ae2b60bc015e`。
+运行报告的tracked dirty为两个成本consumer wrapper文件，未编入该专项的内核或原启动
+脚本；保留真实dirty身份，不改写成clean tree。实际QEMU11.1.1、二进制SHA与上节一致，
+timebase10MHz，其余原盘、配置、DTB、固件和fixture哈希完整归档。当前main的通用修复
+及报告已再次单向合入，uname4.15兼容仍只在本分支；不反向合入比赛profile、不push。
+运行目录核对后按仓库prune清理，重建入口仍是本模块的原 `run.py --groups iozone`。
