@@ -136,3 +136,16 @@ file_read/metadata_read/prepare_read归因，不能证明的仍为unknown。来�
 新增13个无直方图聚合后存储65483字节，任务仍64字节；历史182项schema继续可读。
 `--case readers`是统一起跑、每任务8MiB/1KiB的同/不同inode冷/热读诊断，
 全部工作者完成且内容/状态核对后结束，记录标量时间和字节，不保留对象引用。
+
+`--consumer-readers`在所选原消费者之后追加四个固定工作量窗口。同一协调ELF可用
+`--coordinator-elf`复用；consumer/readers镜像均预置五个8MiB文件，改变了原S9前置状态，
+因此只与相同前置文件、命令集合和协调ELF的旧版对照比较。独立readers记录逐任务
+统一放行、实际开始/完成时间、字节、校验值及成功退出；原程序停止规则另由固定源码解释。
+
+`ROOT_DRAIN_FIXTURE=1`仅用于独立构建目录，通过链接wrap测量内核卸载调用，默认构建
+无此钩子。boot先卸载子挂载、最后根挂载；保留全部成功记录，最后一项报告根盘剩余
+checkpoint与卸载清理时间。它不是全程checkpoint总耗时，也不包括调用前已停止worker的
+时间，不增加用户syscall。`--kernel-identity`核对外部构建二进制与源码身份；
+`--trace-read-lbas`保存QEMU实际读范围，范围是整个启动（含初始化/格式化读取），不能
+冒充窗口内重复读。`--resume-from`仅重解析身份匹配的完整旧日志，继续未执行副本，
+保留原输入seal；不会重新执行已完成程序来修正解析问题。

@@ -225,6 +225,11 @@ ASM_SOURCES := \
 	arch/riscv/context_switch.S \
 	arch/riscv/fpu.S \
 	arch/riscv/trap_entry.S
+ifeq ($(ROOT_DRAIN_FIXTURE),1)
+C_SOURCES += tests/riscv/root_drain_fixture.c
+LDFLAGS += -Wl,--wrap=kernel_vfs_unmount
+endif
+
 OBJECTS := \
 	$(patsubst %.c,$(BUILD_DIR)/%.o,$(C_SOURCES)) \
 	$(patsubst %.S,$(BUILD_DIR)/%.o,$(ASM_SOURCES))
