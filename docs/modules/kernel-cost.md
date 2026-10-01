@@ -149,3 +149,10 @@ checkpoint与卸载清理时间。它不是全程checkpoint总耗时，也不包
 `--trace-read-lbas`保存QEMU实际读范围，范围是整个启动（含初始化/格式化读取），不能
 冒充窗口内重复读。`--resume-from`仅重解析身份匹配的完整旧日志，继续未执行副本，
 保留原输入seal；不会重新执行已完成程序来修正解析问题。
+
+本轮匹配旧/新各3个OFF、各1个定点ON及各1个固定读OFF共10启动，16快照存于既有
+`cost-consumer-followup.json.performance_correction`。每记录metric_schema及seal明确区分
+旧182/新195项；新schema热路径观测会明显扰动固定热读，成绩采用OFF。旧版外部构建的
+JSON指标表先规范化为受支持注册表，再做完整字段/epoch/溢出验证；不接受任意删项。
+程序、应用durable收尾、剩余内部卸载各自报告；有限收益和未唯一归因的历史分布保留，
+不把这10启动扩写为原八组全套或完整成本矩阵。

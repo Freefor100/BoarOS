@@ -205,7 +205,9 @@ def main():
                         _,_,name,epoch=line.split(); current=(name,int(epoch)); body=[]
                     elif line=='COST END':
                         if current is None: raise ValueError('extra snapshot end')
-                        name,epoch=current; snap=parse('\n'.join(body),epoch)
+                        name,epoch=current
+                        registry=identity.get('kernel_build_identity',{}).get('metric_schema')
+                        snap=parse('\n'.join(body),epoch,[tuple(metric) for metric in registry] if registry is not None else None)
                         if name in expectations: validate_expected(snap,expectations[name])
                         if snapshots and epoch<=snapshots[-1]['values']['epoch']: raise ValueError('stale epoch')
                         snapshots.append({'name':name,'values':snap}); current=None
