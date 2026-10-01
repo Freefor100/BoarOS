@@ -291,3 +291,29 @@ qemu-system-riscv64 -machine virt -kernel kernel-rv -m 1G -nographic -smp 1 \
 原 judge 分数不能直接等同于内核能力覆盖率。
 
 `python3 -B tests/oscomp/run.py --groups iozone --output build/oscomp-iozone` 在原 1GiB/1hart/3600 秒配置中仅执行两套原 iozone 脚本，原脚本/ELF/八组参数和 judge 均保留。未选择的组明确标为 not-selected；原 postwork 的局部 RV 投影不表示完整 Harness 通过，专项只比较各 libc 的 iozone 原分数。执行器保存 kernel 副本、原盘副本身份、DTB 和实际 QEMU 二进制哈希。
+
+### 异步日志后的 iozone 专项（2026-10-01）
+
+主线异步日志与调度实现单向合入后，在 `999cf486ee853413e49f60b89d02e24637a5ed21`
+执行一次上述专项，293.532 秒正常结束；musl/glibc 原脚本各八组均有结束标记、脚本状态为 0。
+逐方法输出与原 judge 结果一起保存在 [原评分证据](../learning/oscomp-rv-results.json)
+的 `journal_optimization`，不能仅用脚本退出码判断可用方法完成。
+
+| libc | 旧专项分数 | 本次原 judge 分数 | 变化 |
+|---|---:|---:|---:|
+| musl | 21.6687781 | 24.8499558194 | +14.68% |
+| glibc | 21.4516732 | 25.1790812446 | +17.38% |
+
+各侧 20 个正吞吐字段仍按原 judge 计分；原 ELF 不支持 `(11,12)`，该组输出的回退
+initial writers/rewriters 被原 judge 读取，不能宣称原生 pwritev/preadv 完成。
+写入字段虽大幅改善，仍低于原 judge 的参考值，单项分数仍为 1；总分变化主要来自读条目。
+专项不执行其余 20 个组或 LA。原 postwork 的整数 50 是此次局部 RV 投影，不能与历史
+全序列的 626 直接比较，更不能称为完整 Harness 分数。缺少 `kernel-la` 的阻塞仍成立。
+
+本次内核 SHA-256 为 `9d8158f449ec89fe215b7de83083d10da277f5c83903af77ebe1dc5dccde7c28`，
+QEMU 11.1.1 SHA-256 为 `a1cfcceb6c688f9b0a290d512211ed08cf465b92b26a04cfb032280a53625718`；
+DTB timebase 为 10MHz。运行时 tracked tree 干净，报告中的 dirty 字段只含未跟踪
+`tests/__pycache__`，它不是内核输入。原镜像、配置、脚本、DTB、固件、fixture 和串口
+哈希均已归档。运行目录核对后删除；重建仍使用固定输入与本模块命令。
+512MiB 三启动性能门槛、同步差距及剩余瓶颈另见
+[完整机制与性能分析](../learning/cost-baseline.md#异步日志与组提交验收2026-10-01)。
