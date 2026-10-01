@@ -157,7 +157,7 @@ make test-exec-riscv
 make test-root-init-riscv
 ```
 
-恢复测试使用 `tests/host/block_fault.c` 的易失缓存与稳定镜像，逐个写入/flush 边界丢失未同步写，并另测最后一个 512 字节扇区先落盘。journal、ordered data、公共事务、持久 orphan 记录及实际回收分别测试；1 KiB/4 KiB、extent/legacy、orphan_file/传统链覆盖两次重启、分配和链接计数、空间回收及 `e2fsck -fn`。公共事务还逐个注入内存分配失败，验证命名状态完整回滚。此承诺限于该块模型；QEMU 正常退出和实板行为不能代替断电证据。普通数据原地覆盖不承诺整文件写入原子性，成功同步保证已提交字节持久；真实 musl 已覆盖临时文件写入→文件 fsync→跨目录 rename→两侧目录 fsync，rename 后端另用同一故障模型验证断电原子性。
+恢复测试使用 `tests/host/block_fault.c` 的易失缓存与稳定镜像，逐个写入/flush 边界丢失未同步写，并另测最后一个 512 字节扇区先落盘。journal、ordered data、公共事务、持久 orphan 记录及实际回收分别测试；1 KiB/4 KiB、extent/legacy、orphan_file/传统链覆盖两次重启、分配和链接计数、空间回收及 `e2fsck -fn`。公共事务还逐个注入内存分配失败，验证命名状态完整回滚。此承诺限于该块模型；QEMU 正常退出和实板行为不能代替断电证据。 NBD 断电切点冻结磁盘执行和回复，收到切点后停止 guest，不以先断连接后的 I/O 错误代替同时掉电。异步批次的事件数可变，执行器分别记录实际序号切断和提交后控制切断；未到达的故障序号不计为已注入。成功提交后的控制切断必须恢复新内容，每例仍检查两次恢复和 fsck。普通数据原地覆盖不承诺整文件写入原子性，成功同步保证已提交字节持久；真实 musl 已覆盖临时文件写入→文件 fsync→跨目录 rename→两侧目录 fsync，rename 后端另用同一故障模型验证断电原子性。
 
 宿主测试保留两种 lwext4 metadata checksum seed 只读探针，并在独立可写的 1 KiB-block extent、1 KiB legacy 与 8 KiB legacy (`^extent,^64bit`) 镜像上验证 aligned/unaligned hole、同块 gap、sparse truncate、allocated-block 上界、各自 exact maxbytes 以及大块 legacy 逻辑号不回绕，卸载后分别运行 `e2fsck -fn`。QEMU 测试建立真实 ext4 镜像，验证 `/init` mode、目录预检、随机偏移、EOF、越过 EOF 写入、sparse truncate、`-ENOENT`、open-file `-EBUSY`、只读 dirty-journal `-EUCLEAN`、缓存 miss/hit/LRU/pin、压力回收、mount purge、raw inode metadata 和全部页回收；VFS runner 注入一次 orphan free 失败，覆盖仍有打开 fd 与无现存 node 两条路径，确认路径不复现、mount 只保留一个 owner、重试后可卸载。文件资源测试核对 fstat/newfstatat metadata、unlink-but-open 的 `nlink == 0`，并证明不同 fd 与 mmap 共用 node/cache 而保持各自 offset；生产测试由静态和动态 musl 入口通过 VFS read source 读取真实根盘。
 

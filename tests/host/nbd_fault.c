@@ -201,6 +201,16 @@ static int gate_control(int fd, struct response_gate *gate,
     int drain = !strcmp(gate->input, "drain");
     uint64_t id = 0;
     char tail;
+    if (!strcmp(gate->input, "cut")) {
+        /* The controller may cut after a durable commit when a requested
+         * ordinal does not exist in this asynchronous transaction trace. */
+        shutdown(fd, SHUT_RDWR);
+        if (persist_cut(disk, options->persist)) return -1;
+        fprintf(stderr, "cut=%" PRIu64 " policy=%s cause=control\n", *event,
+                options->persist);
+        fflush(stderr);
+        return 2;
+    }
     if (!strcmp(gate->input, "arm")) arm_faults(disk, options, event, armed);
     else if (!strcmp(gate->input, "hold")) gate->hold = 1;
     else if (drain || sscanf(gate->input, "release %" SCNu64 "%c", &id, &tail) == 1) {
@@ -238,7 +248,9 @@ static int gated_transmit(int fd, struct fault_block *disk,
             if (ready < 0 && errno == EINTR) continue;
             if (ready < 0) return -1;
             if (events[1].revents) {
-                if (gate_control(fd, gate, disk, options, &event, &armed)) return -1;
+                int result = gate_control(fd, gate, disk, options, &event, &armed);
+                if (result == 2) return 0;
+                if (result) return -1;
                 continue;
             }
         }
@@ -275,10 +287,15 @@ static int gated_transmit(int fd, struct fault_block *disk,
                     disk->writes, disk->flushes, disk->count);
             fflush(stderr);
             if (armed && event == options->cut_after) {
-                shutdown(fd, SHUT_RDWR); /* freeze before the guest can clean up */
                 if (persist_cut(disk, options->persist)) return -1;
                 fprintf(stderr, "cut=%" PRIu64 " policy=%s\n", event,
                         options->persist);
+                fflush(stderr);
+                /* Freeze disk execution and the response at the cut. Closing
+                 * now exposes an I/O error while the guest is still running;
+                 * a subsequent application marker is not a pre-cut ACK. */
+                unsigned char discarded[4096];
+                while (read(fd, discarded, sizeof(discarded)) > 0) { }
                 return 0;
             }
         }

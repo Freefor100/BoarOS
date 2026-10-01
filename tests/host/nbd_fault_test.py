@@ -160,6 +160,15 @@ def main(binary):
         log = session.close(cut=True)
         assert "event=1 type=WRITE" in log and "cut=1 policy=none" in log
         assert Path(image).read_bytes()[:512] == b"\0" * 512
+        Path(image).write_bytes(bytes(8192))
+        session = Session(binary, image, address, "--control-stdin")
+        assert session.command(1, 0, b"A" * 512)[0] == 0
+        assert session.command(3)[0] == 0
+        assert session.command(1, 0, b"B" * 512)[0] == 0
+        session.process.stdin.write(b"cut\n")
+        session.process.stdin.flush()
+        log = session.close(cut=True)
+        assert "cause=control" in log and Path(image).read_bytes()[:512] == b"A" * 512
         print("NBD protocol, flush, errors and cut policies passed")
 
 
