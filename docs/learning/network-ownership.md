@@ -6,10 +6,50 @@
 
 `NO_SYS` 没有独立网络线程。若服务端已睡在 accept，客户端非阻塞 connect 返回后不再调用 socket，SYN 若只留在 lwIP loopback 队列，服务端会永久睡眠。因此发起 connect 的系统调用必须推进一次 loopback，轮询与定时等待也推进协议。两进程握手测试固定顺序，排除了同进程立即 accept 偶然泵送队列的伪通过。另一条生命周期边界是 TCP `tcp_close` 在已连接状态可能暂保留 FIN/TIME_WAIT PCB；销毁 OFD 前必须先解绑指向 BoarOS 堆对象的回调，host 测试随后推进 200 秒计时并检查静态池回到基线。待 accept 子连接的 reset 也必须在 dequeue 前剔除。
 
-固定参考是本地 `references/lwip/` 和导入的 `third_party/lwip/` 同一 commit；移植只在 `net/lwip_port/`，不修改上游 core。重建入口与当前能力边界见[网络模块](../modules/kernel-network.md)。外部网卡、AF_UNIX、半关闭和 SMP 的 owner/同步仍需要单独验证。
+固定参考是本地 `references/lwip/` 和导入的 `third_party/lwip/` 同一 commit；移植只在 `net/lwip_port/`，不修改上游 core。重建入口与当前能力边界见[网络模块](../modules/kernel-network.md)。外部网卡、命名 AF_UNIX 和 SMP 的 owner/同步仍需要单独验证。
 
 后续固定 Linux read/readv 差分暴露两个消费边界：TCP 的用户复制跨页 fault 返回 `EFAULT`，下一次读取仍得到完整那段数据；UDP 的 recvfrom 复制 fault 则丢弃整个 datagram。先从 lwIP 队列摘数据再做可 fault 的用户复制会丢 TCP 字节；只 peek 后不保留身份又允许共享 OFD 的第二线程在复制时改动队首。解决办法是把队首 reservation 登记在任务和 socket，并暂移 OFD pin。提交或取消时验证同一 packet；强制退出在文件表清理前取消，避免被抛弃的内核调用栈留下悬空 reservation 或永久 pin。固定 Linux 依据为 `references/linux/net/ipv4/tcp.c`、`net/ipv4/udp.c`、`net/socket.c`，commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`。
 
 另一个边界是 lwIP `tcp_write` 在 `sndbuf>0` 时仍可能因 `snd_queuelen` 或全局 `MEMP_TCP_SEG`/pbuf 用尽而返回 `ERR_MEM`。只用 `sndbuf` 宣告 `POLLOUT` 会让阻塞 write 在同一 hart 上反复得到 `EAGAIN` 并立即再醒。固定 lwIP `third_party/lwip/src/core/tcp_out.c` 的检查和 host 池耗尽测试证明了触发条件；BoarOS 在真实失败时撤下可写事件，将 bounded retry 纳入 poll/epoll 与 socket 等待期限，ACK 和池释放均可促成后续写入。真实 pthread U-mode 用 UDP 接收队列占满静态 lwIP 内存，验证非阻塞 TCP write 得到 `EAGAIN` 后 `poll(POLLOUT,0)` 不虚报，释放队列后 2 秒内可写并完成写入。这个测试在旧只看 `sndbuf` 的实现上会于立即 POLLOUT 检查失败。
 
 零长度 UDP datagram 揭示另一种 owner 漏洞：`read_buffer` 已登记 reservation 并移走 OFD pin，却返回 0；调用方原来只在正字节数时 finish，导致返回后 socket 指向失效的栈请求。固定 Linux 的普通 read/readv 对空 datagram 都返回 0 且消费它；同 ELF 红测在 BoarOS 第一笔空包之后 fatal，修复后继续读取下一包并检查用户态关机 `heap-live=0`。由 `request.socket` 是否登记而非返回字节数决定是否 finish；TCP EOF 没有登记。强制退出 owner 也需按真实控制流判定：`kernel/sched/process.c::request_thread_termination` 只置位并唤醒，保存的 syscall 栈继续返回，`kernel/sched/signal.c::kernel_signal_select` 在 user-return 才终止；`kernel_socket_sendto/recvfrom` 的栈局部 pbuf/packet 在这条路径仍可清理。若以后引入绕过 syscall unwind 的非局部退出，需重审它们。
+
+2026-10-01 开始原版网络应用阶段。iperf 3.13 的 `netannounce` 在没有显式
+地址族和监听地址时主动选择 IPv6；`IPV6_V6ONLY=0` 用于接受 IPv4 客户端。
+只补 IPv4 会停在服务端 socket 创建，不能完成原脚本。以前无服务器的客户端
+试跑不能作为已建立连接 reset 的证据。调用依据为本地
+`references/oscomp-testsuits` 的 `iperf/src/net.c`（固定 pre-2025 输入）和
+`references/linux/net/ipv6/`；精确版本在既有来源清单。
+
+地址阶段沿官方 lwIP 2.2.1 loopif 启用 IPv6，把地址转换限制在 syscall 边界。
+`tests/workloads/network/contract.c` 同 ELF 验证 ::1 的 UDP、TCP 和 IPv4 到
+IPv6 通配监听的映射 accept。旧实现先在 IPv6 socket 创建以 EAFNOSUPPORT
+失败，修复后双方完成内容交换；协议静态池由 host 回归核对，socket 堆由
+真实关机零占用核对。重建：`make test-lwip-host test-network-riscv`。
+选项、端口冲突、半关闭和原版应用完整流程尚待后续阶段，不能据此宣称完成。
+
+双栈端口回归进一步发现 lwIP TCP bind 源码留下 ANY 与纯 IPv6 交集的 TODO：
+IPv6 双栈通配已占端口时，::1 的另一次 bind 居然成功。固定 Linux 拒绝该操作。
+BoarOS 用不持引用的 endpoint 列表检查真实地址交集，生命周期仍由 OFD 决定，
+补丁没有修改 lwIP core。V6ONLY 两族隔离、UDP 默认对端/解除及 SYN 拒绝的
+SO_ERROR 清除，均由相同用户态回归验证。TCP_MAXSEG 来自协议 PCB，未知
+TCP_INFO 继续报不支持，不能当成已提供统计。
+
+原 netperf 的 UDP_STREAM 暴露了网络之外的直接依赖：libc alarm 经 RV64
+setitimer 设置 SIGALRM，旧内核返回 ENOSYS，发送循环因此没有结束信号。有效
+服务器下的 syscall 观察确认了设置定时器后持续发送的路径。补真实 ITIMER_REAL
+后负载能自行进入结果交换；不能把原程序被超时杀掉当作网络链路完成。定时器
+属于线程组，fork/exec/退出及信号消费的协议见[时间模块](../modules/kernel-time.md)。
+
+阻塞发送的实质差异由原 netperf 暴露：内核在已经发送一个前缀后遇到 EAGAIN，
+立即返回短写。原程序将这种短写当作计时结束，TCP_STREAM 退出 0 但有效时间
+只有 0.00 秒。固定 Linux 小预算、一次 64 KiB 的发送会继续等待并完整接收。
+BoarOS 改为等待剩余空间，保留真正 fault/信号/超时与非阻塞短写。修复后原
+TCP_STREAM 持续约一秒并交换接收结果；这说明有效工作成立，不只是流程退出。
+
+另一种边界是原 iperf 的 listener 重建：空控制探测连接会结束一轮，再建立
+listener；连续原脚本也可能撞到这个间隙，Linux 同样会拒绝/reset。受控执行器
+为每项启动新服务端，用官方 --forceflush 在 listen 后发布的 banner 握手，不
+制造探测连接；客户端 argv 与原脚本一致。原脚本另留真实子项状态，不能用这条
+受控流程掩盖其启动竞态。服务端输出与客户端输出分开，长运行服务端的主动
+终止信号、wait status 和后代回收单独记录。

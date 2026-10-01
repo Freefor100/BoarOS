@@ -156,6 +156,11 @@ struct kernel_task {
     uint32_t group_members;
     struct kernel_task *group_next;
     struct kernel_task *group_previous;
+    /* 组身份拥有 alarm；仅排队的到期对象进入非持引用链。 */
+    struct kernel_task *real_timer_next;
+    uint64_t real_timer_deadline;
+    uint64_t real_timer_interval;
+    uint32_t real_timer_active;
     struct kernel_pid *child_creator;
     uint32_t terminate_requested;
     uint32_t proc_exiting;

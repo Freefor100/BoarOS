@@ -1,6 +1,7 @@
 #include "private.h"
 
 #include <arch/riscv/timer.h>
+#include <arch/riscv/context.h>
 #include <kernel/errno.h>
 #include <kernel/futex.h>
 #include <kernel/mm.h>
@@ -20,6 +21,58 @@
 #define LINUX_CLOCK_MONOTONIC_COARSE 6U
 #define LINUX_CLOCK_NSECS_PER_SEC UINT64_C(1000000000)
 #define LINUX_TIMER_ABSTIME UINT64_C(1)
+
+struct linux_itimerval { int64_t interval_seconds, interval_usec, seconds, usec; };
+static uint64_t itimer_ns(int64_t seconds, int64_t usec)
+{
+    uint64_t ns = (uint64_t)usec * 1000U;
+    return (uint64_t)seconds > ((uint64_t)INT64_MAX - ns) / 1000000000U ?
+        INT64_MAX : (uint64_t)seconds * 1000000000U + ns;
+}
+
+enum kernel_syscall_status syscall_handle_itimer(struct kernel_task *caller,
+    const struct kernel_syscall_request *request, struct kernel_syscall_result *decoded)
+{
+    struct kernel_mm *mm;
+    struct linux_itimerval input={0}, output={0};
+    uint64_t remaining=0, interval=0;
+    size_t copied=0;
+    int setting = request->number == 103U;
+    int which = (int32_t)request->arguments[0];
+    decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+    decoded->value = -KERNEL_EFAULT;
+    if (kernel_task_mm_borrow_mutable(caller,&mm) != KERNEL_TASK_STATUS_OK)
+        return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    if (setting && request->arguments[1] != 0) {
+        if (kernel_copy_from_user(mm,&input,request->arguments[1],sizeof(input),&copied) !=
+            KERNEL_UACCESS_STATUS_OK || copied != sizeof(input)) return KERNEL_SYSCALL_STATUS_OK;
+        if (input.seconds < 0 || input.interval_seconds < 0 ||
+            (uint64_t)input.usec >= 1000000U || (uint64_t)input.interval_usec >= 1000000U) {
+            decoded->value = -KERNEL_EINVAL; return KERNEL_SYSCALL_STATUS_OK;
+        }
+    }
+    if (which != 0) {
+        decoded->value = which == 1 || which == 2 ? -KERNEL_ENOSYS : -KERNEL_EINVAL;
+        return KERNEL_SYSCALL_STATUS_OK;
+    }
+    uintptr_t irq = riscv_interrupt_save();
+    if (setting) kernel_signal_timer_set(caller,itimer_ns(input.seconds,input.usec),
+        itimer_ns(input.interval_seconds,input.interval_usec),&remaining,&interval);
+    else kernel_signal_timer_get(caller,&remaining,&interval);
+    riscv_interrupt_restore(irq);
+    output.seconds = (int64_t)(remaining/1000000000U);
+    output.usec = (int64_t)((remaining%1000000000U)/1000U);
+    output.interval_seconds = (int64_t)(interval/1000000000U);
+    output.interval_usec = (int64_t)((interval%1000000000U)/1000U);
+    uint64_t address = request->arguments[setting ? 2 : 1];
+    if (!setting || address) {
+        /* Linux 先安装新值，再复制旧值；输出 fault 不回滚已经生效的 alarm。 */
+        if (kernel_copy_to_user(mm,address,&output,sizeof(output),&copied) != KERNEL_UACCESS_STATUS_OK ||
+            copied != sizeof(output)) return KERNEL_SYSCALL_STATUS_OK;
+    }
+    decoded->value=0;
+    return KERNEL_SYSCALL_STATUS_OK;
+}
 
 static int syscall_clock_id_coarse(uint64_t clock_id)
 {

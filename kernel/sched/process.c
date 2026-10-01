@@ -550,6 +550,7 @@ enum kernel_scheduler_status process_group_exec_current(void)
         task->child_minor_faults = leader->child_minor_faults;
         task->child_major_faults = leader->child_major_faults;
         task->group_pending = leader->group_pending;
+        kernel_signal_timer_adopt(task, leader);
         task->nofile_limit = leader->nofile_limit;
         task->stack_limit = leader->stack_limit;
         for (unsigned i = 0U; i < KERNEL_SIGNAL_COUNT; i++)
@@ -1366,6 +1367,8 @@ enum kernel_scheduler_status kernel_scheduler_reap_one(
         if (thread->group_leader == thread &&
             reparent_children(thread) != KERNEL_SCHEDULER_STATUS_OK)
             return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
+        /* GROUP_DEAD 的身份仍服务存活成员；最后成员退出才撤销 alarm。 */
+        if (thread->group_leader == thread) kernel_signal_timer_cancel(thread);
         process_orphan_notify(thread, 0);
         /* Reparenting may append orphan zombies behind this tail. */
         next = thread->next;

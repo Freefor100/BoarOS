@@ -251,6 +251,19 @@ enum kernel_files_status kernel_files_pipe2(
     uint64_t flags,
     int64_t *linux_result);
 
+struct kernel_uaccess_iovec;
+struct kernel_socket_address;
+enum kernel_files_status kernel_files_socket_iov_io(
+    struct kernel_files *files, struct kernel_mm *mm,
+    struct kernel_open_file_description **owner,
+    const struct kernel_uaccess_iovec *iov, size_t iov_count, uint64_t count,
+    uint32_t flags, int writing, struct kernel_socket_address *peer,
+    uint32_t *message_size, int64_t *linux_result);
+enum kernel_files_status kernel_files_socket_io(
+    struct kernel_files *files, struct kernel_mm *mm,
+    struct kernel_open_file_description **owner, uint64_t user_buffer,
+    uint64_t count, uint32_t flags, int writing, int64_t *linux_result);
+
 enum kernel_files_status kernel_files_read(
     struct kernel_files *files,
     struct kernel_mm *mm,
@@ -415,8 +428,9 @@ enum kernel_files_status kernel_files_close(
     int64_t fd,
     int64_t *linux_result);
 
+struct kernel_socket_address;
 enum kernel_files_status kernel_files_socket_create(
-    struct kernel_files *files, int type, uint32_t flags,
+    struct kernel_files *files, int family, int type, uint32_t flags,
     int64_t *linux_result);
 
 enum kernel_files_status kernel_files_socketpair_create(
@@ -429,7 +443,7 @@ enum kernel_files_status kernel_files_socketpair_create(
 
 enum kernel_files_status kernel_files_socket_accept(
     struct kernel_files *files, struct kernel_open_file_description *listener,
-    uint32_t flags, uint32_t *peer_address, uint16_t *peer_port,
+    uint32_t flags, struct kernel_socket_address *peer_address,
     int64_t *linux_result);
 
 /* Success returns an owned OFD reference independent of the fd slot. */

@@ -200,6 +200,7 @@ int kernel_open_file_sync_range(struct kernel_open_file_description *file,
 #define KERNEL_POLLRDBAND 0x0080U
 #define KERNEL_POLLWRNORM 0x0100U
 #define KERNEL_POLLWRBAND 0x0200U
+#define KERNEL_POLLRDHUP 0x2000U
 
 struct kernel_wait_queue;
 

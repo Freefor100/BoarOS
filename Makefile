@@ -128,6 +128,10 @@ LWIP_SOURCES := \
 	third_party/lwip/src/core/ipv4/ip4.c \
 	third_party/lwip/src/core/ipv4/ip4_addr.c \
 	third_party/lwip/src/core/ipv4/ip4_frag.c \
+	third_party/lwip/src/core/ipv6/icmp6.c \
+	third_party/lwip/src/core/ipv6/ip6.c \
+	third_party/lwip/src/core/ipv6/ip6_addr.c \
+	third_party/lwip/src/core/ipv6/nd6.c \
 	net/lwip_port/port.c
 
 C_SOURCES := \
@@ -1620,3 +1624,7 @@ test-rtc-host:
 	@mkdir -p build/host
 	cc -std=c11 -Wall -Wextra -Werror -Itests/host/random -idirafter include tests/host/rtc_device.c fs/rtc_device.c -o build/host/rtc-test
 	build/host/rtc-test
+
+.PHONY: test-network-riscv
+test-network-riscv: kernel-rv
+	python3 -B tests/network-riscv.py

@@ -40,7 +40,7 @@ static enum kernel_files_status install_socket(
 }
 
 enum kernel_files_status kernel_files_socket_create(
-    struct kernel_files *files, int type, uint32_t flags,
+    struct kernel_files *files, int family, int type, uint32_t flags,
     int64_t *linux_result)
 {
     struct kernel_socket *socket = 0;
@@ -56,7 +56,7 @@ enum kernel_files_status kernel_files_socket_create(
         *linux_result = find_result;
         return KERNEL_FILES_STATUS_OK;
     }
-    result = kernel_socket_create(files->heap, type, &socket);
+    result = kernel_socket_create(files->heap, family, type, &socket);
     if (result != 0) {
         *linux_result = result;
         return KERNEL_FILES_STATUS_OK;
@@ -66,7 +66,7 @@ enum kernel_files_status kernel_files_socket_create(
 
 enum kernel_files_status kernel_files_socket_accept(
     struct kernel_files *files, struct kernel_open_file_description *listener,
-    uint32_t flags, uint32_t *peer_address, uint16_t *peer_port,
+    uint32_t flags, struct kernel_socket_address *peer_address,
     int64_t *linux_result)
 {
     struct kernel_socket *accepted = 0;
@@ -75,7 +75,7 @@ enum kernel_files_status kernel_files_socket_accept(
     int result;
     enum kernel_files_status status;
     if (!kernel_files_is_live(files) || listener == 0 ||
-        peer_address == 0 || peer_port == 0 || linux_result == 0)
+        peer_address == 0 || linux_result == 0)
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
     status = kernel_files_find_free_fd(files, &fd, &find_result);
     if (status != KERNEL_FILES_STATUS_OK) return status;
@@ -88,7 +88,7 @@ enum kernel_files_status kernel_files_socket_accept(
         *linux_result = result;
         return KERNEL_FILES_STATUS_OK;
     }
-    result = kernel_socket_getpeer(accepted, peer_address, peer_port);
+    result = kernel_socket_getpeer(accepted, peer_address);
     if (result != 0) {
         kernel_socket_destroy(accepted);
         *linux_result = result;

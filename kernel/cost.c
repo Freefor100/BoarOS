@@ -19,8 +19,14 @@ static const char names[][32] = {
 #include <kernel/cost.def>
 #undef X
 };
-static const char units[][12] = {
-#define X(id, name, unit, hist) #unit,
+enum cost_unit { UNIT_bytes, UNIT_count, UNIT_entries, UNIT_operations,
+    UNIT_pages, UNIT_requests, UNIT_tasks, UNIT_ticks };
+/* 单位文字共享，新增只读快照不挤占聚合预算；输出 schema 不变。 */
+static const char unit_names[][11] = {
+    "bytes","count","entries","operations","pages","requests","tasks","ticks"
+};
+static const unsigned char units[] = {
+#define X(id, name, unit, hist) UNIT_##unit,
 #include <kernel/cost.def>
 #undef X
 };
@@ -40,8 +46,8 @@ static struct {
     uint64_t epoch, owner, start, end, inflight;
     uint32_t frequency, fixture, active, pending, overflow, state;
 } cost;
-enum { cost_storage = sizeof(cost) + sizeof(names) + sizeof(units) + sizeof(histograms) + sizeof(histogram_indexes) + sizeof(lanes) + 256 };
-/* Includes a reserve for bridge/IRQ scalars and formatting metadata. */
+enum { cost_storage = sizeof(cost) + sizeof(names) + sizeof(units) + sizeof(unit_names) + sizeof(histograms) + sizeof(histogram_indexes) + sizeof(lanes) + 768 };
+/* Includes bridge/IRQ scalars and the read-only protocol snapshot key table. */
 _Static_assert(cost_storage <= 65536, "cost aggregate budget");
 static struct { struct kernel_cost_tag tag; uint64_t start; unsigned opened, suppressed; } irq;
 uint64_t kernel_cost_return_timestamp, kernel_cost_return_pending;
@@ -385,7 +391,7 @@ int kernel_cost_format(char *buffer, size_t capacity)
     for (unsigned lane = 0; lane < 3; ++lane) for (unsigned m = 0; m < COST_METRIC_COUNT; ++m) {
         char key[128]; size_t n = strlen(lanes[lane]); memcpy(key, lanes[lane], n); key[n++] = '.';
         size_t len = strlen(names[m]); memcpy(key + n, names[m], len); n += len; key[n++] = '.'; key[n] = 0;
-        text(&f, key); text(&f, "unit="); text(&f, units[m]); text(&f, "\n");
+        text(&f, key); text(&f, "unit="); text(&f, unit_names[units[m]]); text(&f, "\n");
         const char suffix[][8] = {"value", "samples", "max"};
         uint64_t values[] = {cost.counters[lane][m].value, cost.counters[lane][m].samples, cost.counters[lane][m].maximum};
         for (unsigned j = 0; j < 3; ++j) { text(&f, key); field(&f, suffix[j], values[j]); }

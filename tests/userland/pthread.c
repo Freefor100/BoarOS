@@ -897,31 +897,20 @@ static int check_socket_pool_pressure(void)
     int receiver = bind_loopback_udp(&udp_address);
     int sender = socket(AF_INET, SOCK_DGRAM, 0);
     if (receiver < 0 || sender < 0) return 5;
-    int exhausted = 0;
+    /* Bounded UDP receive pressure may drop packets; it must leave room for
+     * a following TCP transfer. Raw TCP ERR_MEM retry is tested by the host pool fixture. */
     for (int attempts = 0; attempts < 8192; attempts++) {
         if (sendto(sender, "p", 1, 0, (struct sockaddr *)&udp_address,
-                   sizeof(udp_address)) == 1) continue;
-        if (errno != ENOMEM) return 6;
-        exhausted = 1;
-        break;
+                   sizeof(udp_address)) != 1) return 6;
     }
-    if (!exhausted) return 7;
     struct pollfd ready = {.fd = client, .events = POLLOUT};
-    if (poll(&ready, 1, 0) != 1 || !(ready.revents & POLLOUT))
-        return 8;
-    char large[8192] = {0};
-    errno = 0;
-    if (write(client, large, sizeof(large)) != -1 || errno != EAGAIN)
-        return 9;
-    ready.revents = 0;
-    if (poll(&ready, 1, 0) != 0 || (ready.revents & POLLOUT))
-        return 10;
+    if (poll(&ready, 1, 0) != 1 || !(ready.revents & POLLOUT)) return 8;
+    if (write(client, "v", 1) != 1) return 9;
+    char received;
+    if (read(accepted, &received, 1) != 1 || received != 'v') return 10;
     if (close(receiver) != 0) return 11;
-    ready.revents = 0;
-    if (poll(&ready, 1, 2000) != 1 || !(ready.revents & POLLOUT))
-        return 12;
-    if (fcntl(client, F_SETFL, flags) != 0 || write(client, "v", 1) != 1)
-        return 13;
+    if (fcntl(client, F_SETFL, flags) != 0 || write(client, "w", 1) != 1 ||
+        read(accepted, &received, 1) != 1 || received != 'w') return 13;
     if (close(sender) != 0 || close(client) != 0 ||
         close(accepted) != 0 || close(listener) != 0) return 14;
     return 0;

@@ -45,4 +45,18 @@ void abi_coarse_cases(void)
         abi_record(abs_names[i],SC4(115,id,1,&zero,0),-1,-1,0,0,0);
         abi_record(bad_sleep_names[i],SC4(115,id,0,1,0),-1,-1,0,0,0);
     }
+    struct { long interval_sec,interval_usec,sec,usec; } timer={0},old={0};
+    abi_record("timer.initial",SC2(102,0,&timer)==0 && !timer.sec && !timer.usec,-1,-1,0,0,0);
+    abi_record("timer.get-invalid",SC2(102,3,&timer),-1,-1,0,0,0);
+    abi_record("timer.get-fault",SC2(102,0,1),-1,-1,0,0,0);
+    abi_record("timer.set-fault",SC3(103,3,1,0),-1,-1,0,0,0);
+    timer.usec=1000000;
+    abi_record("timer.bad-usec",SC3(103,0,&timer,0),-1,-1,0,0,0);
+    timer.usec=0;timer.sec=-1;
+    abi_record("timer.negative",SC3(103,0,&timer,0),-1,-1,0,0,0);
+    timer.sec=2;
+    abi_record("timer.old-fault",SC3(103,0,&timer,1),-1,-1,0,0,0);
+    abi_record("timer.installed-after-output-fault",SC2(102,0,&old)==0 && (old.sec||old.usec),-1,-1,0,0,0);
+    abi_record("timer.null-cancels",SC3(103,0,0,0),-1,-1,0,0,0);
+    abi_record("timer.cancelled",SC2(102,0,&old)==0 && !old.sec && !old.usec && !old.interval_sec && !old.interval_usec,-1,-1,0,0,0);
 }

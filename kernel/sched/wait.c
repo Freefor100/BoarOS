@@ -1,5 +1,6 @@
 #include <arch/riscv/context.h>
 #include <kernel/scheduler.h>
+#include <kernel/socket.h>
 
 #include "private.h"
 
@@ -283,6 +284,8 @@ enum kernel_scheduler_status kernel_scheduler_expire_deadlines(uint64_t now)
         thread = next;
     }
     COST_ADD(DEADLINE_VISITS, cost_visits);
+    kernel_socket_expire_timers();
+    kernel_signal_timer_expire();
     return KERNEL_SCHEDULER_STATUS_OK;
 }
 
