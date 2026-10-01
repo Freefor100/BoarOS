@@ -807,22 +807,59 @@ Finish:
 }
 
 __unused
+static bool ext4_group_due(struct ext4_mountpoint *mp, bool force)
+{
+	struct jbd_trans *running = mp->fs.jbd_journal->running;
+	if (!running) return false;
+	unsigned blocks = running->data_cnt;
+	struct jbd_data *data;
+	TAILQ_FOREACH(data, &running->data_queue, node) blocks++;
+	uint64_t now = mp->journal_runtime.now_ns ? mp->journal_runtime.now_ns(mp->journal_runtime.context) : 0;
+	return force || (mp->fs.jbd_journal->seal_target >= running->sequence) || running->operations >= 64 ||
+		(uint64_t)blocks * mp->fs.jbd_journal->block_size >= 256 * 1024 ||
+		(now >= running->first_dirty_ns && now - running->first_dirty_ns >= 100000000);
+}
+
+__unused
+static int ext4_group_wait(struct ext4_mountpoint *mp, uint64_t target, enum ext4_journal_wait kind)
+{
+	struct jbd_journal *journal = mp->fs.jbd_journal;
+	if (journal->seal_target < target) journal->seal_target = target;
+	if (kind == EXT4_JOURNAL_WAIT_CHECKPOINT) journal->checkpoint_requested = true;
+	if (mp->journal_runtime.request) mp->journal_runtime.request(mp->journal_runtime.context);
+	if (mp->journal_runtime.wait) return mp->journal_runtime.wait(mp->journal_runtime.context, target, kind);
+	for (;;) {
+		uint64_t reached = kind == EXT4_JOURNAL_WAIT_SEALED ? journal->sealed_sequence :
+			kind == EXT4_JOURNAL_WAIT_DURABLE ? journal->durable_sequence : journal->checkpoint_sequence;
+		if (journal->error || reached >= target) return journal->error;
+		EXT4_MP_UNLOCK(mp);
+		int r = ext4_journal_group_service(mp->name, true);
+		EXT4_MP_LOCK(mp);
+		if (r != EOK) return r;
+	}
+}
+
+__unused
+static void ext4_group_free_counts(struct jbd_trans *trans, uint64_t *blocks, uint64_t *inodes)
+{
+	if (!trans) return;
+	struct jbd_quarantine *range;
+	LIST_FOREACH(range, &trans->quarantine, node) {
+		if (range->inode) *inodes += range->count;
+		else *blocks += range->count;
+	}
+}
+
+__unused
 static bool ext4_space_waits_checkpoint(struct ext4_mountpoint *mp)
 {
 	struct jbd_journal *journal = mp->fs.jbd_journal;
-	struct jbd_trans *groups[] = {journal->running, journal->committing};
 	uint64_t blocks = 0, inodes = 0;
-	for (unsigned i = 0; i < 2; i++) {
-		if (!groups[i]) continue;
-		struct jbd_quarantine *range;
-		LIST_FOREACH(range, &groups[i]->quarantine, node) {
-			if (range->inode) inodes += range->count;
-			else blocks += range->count;
-		}
-	}
-	/* Free bitmap entries owned by an older checkpoint are not allocatable.
-	 * Wait before starting a private operation, while releasing the backend
-	 * lock is still safe. Leave headroom for the bounded 32-block batch. */
+	ext4_group_free_counts(journal->running, &blocks, &inodes);
+	ext4_group_free_counts(journal->committing, &blocks, &inodes);
+	struct jbd_trans *trans;
+	TAILQ_FOREACH(trans, &journal->sealed_queue, trans_node) ext4_group_free_counts(trans, &blocks, &inodes);
+	TAILQ_FOREACH(trans, &journal->cp_queue, trans_node) ext4_group_free_counts(trans, &blocks, &inodes);
 	return (blocks && ext4_sb_get_free_blocks_cnt(&mp->fs.sb) <= blocks + 32) ||
 		(inodes && ext4_get32(&mp->fs.sb, free_inodes_count) <= inodes + 1);
 }
@@ -839,13 +876,21 @@ static int __ext4_trans_start(struct ext4_mountpoint *mp)
 	uintptr_t owner = mp->os_locks && mp->os_locks->owner ? mp->os_locks->owner(mp->os_locks->context) : 0;
 	if (mp->transaction_depth && mp->transaction_owner != owner) __builtin_trap();
 	if (mp->transaction_depth == 0) {
-		if (journal->grouped && mp->journal_runtime.wait &&
-		    (journal->memory_used > journal->memory_limit / 2 ||
-		     (journal->running && journal->running->operations >= 64) ||
-		     ext4_space_waits_checkpoint(mp))) {
-			if (mp->journal_runtime.request) mp->journal_runtime.request(mp->journal_runtime.context);
-			int wait = mp->journal_runtime.wait(mp->journal_runtime.context, journal->accepted_sequence, true);
-			if (wait != EOK) return wait;
+		while (journal->grouped) {
+			int r = EOK;
+			if (ext4_group_due(mp, false)) {
+				uint64_t target = journal->running->sequence;
+				r = jbd_journal_freeze(journal);
+				if (r == EAGAIN) r = ext4_group_wait(mp, target, EXT4_JOURNAL_WAIT_SEALED);
+				if (r != EOK) return r;
+				if (mp->journal_runtime.request) mp->journal_runtime.request(mp->journal_runtime.context);
+			}
+			bool reuse = ext4_space_waits_checkpoint(mp);
+			if (!reuse && jbd_journal_operation_room(journal, 0)) break;
+			uint64_t target = reuse ? journal->accepted_sequence : jbd_journal_reclaim_target(journal);
+			if (!target || target <= journal->checkpoint_sequence) return ENOMEM;
+			r = ext4_group_wait(mp, target, EXT4_JOURNAL_WAIT_CHECKPOINT);
+			if (r != EOK) return r;
 		}
 		mp->transaction_owner = owner;
 		struct jbd_trans *trans = jbd_journal_new_trans(journal);
@@ -974,19 +1019,16 @@ int ext4_journal_group_service(const char *mount_point, bool force)
 	EXT4_MP_LOCK(mp);
 	struct jbd_journal *journal = mp->fs.jbd_journal;
 	int r = !journal || !journal->grouped ? EINVAL : journal->error;
-	if (r == EOK && (mp->transaction_depth || journal->committing)) r = EBUSY;
-	struct jbd_trans *running = journal ? journal->running : NULL;
-	uint64_t now = mp->journal_runtime.now_ns ? mp->journal_runtime.now_ns(mp->journal_runtime.context) : 0;
-	unsigned blocks = running ? running->data_cnt : 0;
-	struct jbd_data *data;
-	if (running) TAILQ_FOREACH(data, &running->data_queue, node) blocks++;
-	bool due = running && (force || running->operations >= 64 ||
-		(uint64_t)blocks * journal->block_size >= 256 * 1024 ||
-		now - running->first_dirty_ns >= 100000000);
-	if (r == EOK && due) r = jbd_journal_freeze(journal);
+	if (r == EOK && (mp->transaction_depth || journal->committing || journal->checkpointing)) r = EBUSY;
+	if (r == EOK && ext4_group_due(mp, force)) {
+		r = jbd_journal_freeze(journal);
+		if (r == EAGAIN) r = EOK; /* 已有提交 owner，先让队首进展。 */
+	}
+	bool selected = r == EOK && jbd_journal_select(journal);
+	bool checkpoint = selected && journal->checkpointing;
 	EXT4_MP_UNLOCK(mp);
-	if (r != EOK || !due) return r;
-	r = jbd_journal_submit(journal);
+	if (r != EOK || !selected) return r;
+	r = checkpoint ? jbd_journal_checkpoint(journal) : jbd_journal_submit(journal);
 	EXT4_MP_LOCK(mp);
 	r = jbd_journal_retire(journal, r);
 	EXT4_MP_UNLOCK(mp);
@@ -1001,11 +1043,8 @@ int ext4_journal_group_drain(const char *mount_point)
 	struct jbd_journal *journal = mp->fs.jbd_journal;
 	int r = !journal || !journal->grouped ? EINVAL : journal->error;
 	uint64_t target = journal ? journal->accepted_sequence : 0;
-	if (r == EOK && journal->checkpoint_sequence < target) {
-		if (mp->journal_runtime.request) mp->journal_runtime.request(mp->journal_runtime.context);
-		if (mp->journal_runtime.wait) r = mp->journal_runtime.wait(mp->journal_runtime.context, target, true);
-		else { EXT4_MP_UNLOCK(mp); return ext4_journal_group_service(mount_point, true); }
-	}
+	if (r == EOK && journal->checkpoint_sequence < target)
+		r = ext4_group_wait(mp, target, EXT4_JOURNAL_WAIT_CHECKPOINT);
 	EXT4_MP_UNLOCK(mp);
 	return r;
 }
@@ -1019,15 +1058,13 @@ int ext4_journal_group_progress(const char *mount_point, struct ext4_journal_pro
 	int r = !journal || !journal->grouped ? ENOTSUP : EOK;
 	if (r == EOK) {
 		struct jbd_trans *running = journal->running;
-		unsigned blocks = running ? running->data_cnt : 0;
-		struct jbd_data *data;
-		if (running) TAILQ_FOREACH(data, &running->data_queue, node) blocks++;
-		*progress = (struct ext4_journal_progress){journal->accepted_sequence,
-			journal->durable_sequence, journal->checkpoint_sequence,
-			running ? running->first_dirty_ns + 100000000 : 0,
-			journal->memory_used, journal->memory_peak,
-			running && (running->operations >= 64 || (uint64_t)blocks * journal->block_size >= 256 * 1024),
-			journal->error};
+		*progress = (struct ext4_journal_progress){
+			.accepted = journal->accepted_sequence, .sealed = journal->sealed_sequence,
+			.durable = journal->durable_sequence, .checkpoint = journal->checkpoint_sequence,
+			.deadline_ns = running ? running->first_dirty_ns + 100000000 : 0,
+			.memory_used = journal->memory_used, .memory_peak = journal->memory_peak,
+			.ready = !TAILQ_EMPTY(&journal->sealed_queue) || !TAILQ_EMPTY(&journal->cp_queue) || ext4_group_due(mp, false),
+			.error = journal->error};
 	}
 	EXT4_MP_UNLOCK(mp);
 	return r;
@@ -3054,6 +3091,19 @@ int ext4_fwrite(ext4_file *file, const void *buf, size_t size, size_t *wcnt)
 
 	EXT4_MP_LOCK(file->mp);
 	r = ext4_prepare_growth(file, write_end);
+	/* 后端交接在修改前为 data 的 undo/version/home 和有界 metadata
+	 * 路径保留容量；只有真实预算不足才封口并等 owner 回收。 */
+	struct jbd_journal *journal = file->mp->fs.jbd_journal;
+	if (r == EOK && journal && journal->grouped && !file->mp->transaction_depth) {
+		size_t block = journal->block_size;
+		size_t blocks = (size + file->fpos % block - 1) / block + 1;
+		if (blocks > (SIZE_MAX - 24) / 3) r = ENOMEM;
+		while (r == EOK && !jbd_journal_operation_room(journal, 3 * blocks + 24)) {
+			uint64_t target = jbd_journal_reclaim_target(journal);
+			if (!target || target <= journal->checkpoint_sequence) { r = ENOMEM; break; }
+			r = ext4_group_wait(file->mp, target, EXT4_JOURNAL_WAIT_CHECKPOINT);
+		}
+	}
 	if (r == EOK) r = ext4_trans_start(file->mp);
 	if (r != EOK) {
 		EXT4_MP_UNLOCK(file->mp);
@@ -3329,10 +3379,8 @@ int ext4_file_sync_metadata_mode(ext4_file *file, bool data_only)
          * cannot advance its target while it sleeps. */
         if (!data_only && journal->grouped) file->sync_sequence = journal->accepted_sequence;
         uint64_t target = data_only ? file->data_sequence : file->sync_sequence;
-        if (r == EOK && journal->grouped && journal->durable_sequence < target) {
-			if (file->mp->journal_runtime.request) file->mp->journal_runtime.request(file->mp->journal_runtime.context);
-			if (file->mp->journal_runtime.wait) r = file->mp->journal_runtime.wait(file->mp->journal_runtime.context, target, false);
-			else { EXT4_MP_UNLOCK(file->mp); return ext4_journal_group_service(file->mp->name, true); }
+		if (r == EOK && journal->grouped && journal->durable_sequence < target) {
+			r = ext4_group_wait(file->mp, target, EXT4_JOURNAL_WAIT_DURABLE);
 		} else if (r == EOK && !journal->grouped) r = jbd_journal_sync(journal, file->sync_tid);
 		EXT4_MP_UNLOCK(file->mp);
 		return r;

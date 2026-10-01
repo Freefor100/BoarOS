@@ -36,6 +36,81 @@ extern int ext4_journal_group_drain(const char *) __attribute__((weak));
 extern int ext4_file_sync_metadata_mode(ext4_file *, bool) __attribute__((weak));
 static uint64_t group_now;
 static uint64_t group_clock(void *context) { (void)context; return group_now; }
+static unsigned pipeline_waits;
+static enum ext4_journal_wait pipeline_kind;
+static int pipeline_wait(void *context, uint64_t sequence, enum ext4_journal_wait kind)
+{
+    (void)context; (void)sequence;
+    pipeline_kind=kind;
+    pipeline_waits++;
+    return EAGAIN;
+}
+static ext4_file *pipeline_file;
+static void pipeline_while_submitting(void)
+{
+    struct ext4_timestamp times[3]={{1111,1},{2222,2},{3333,3}};
+    /* Device I/O of group one is held on this stack. New operations can
+     * seal two later groups, then wait for sealing capacity, never home I/O. */
+    for(unsigned i=0;i<128;i++) {
+        times[0].nanoseconds=100+i;
+        CHECK(ext4_file_set_times(pipeline_file,7,times)==EOK);
+    }
+    CHECK(ext4_file_set_times(pipeline_file,7,times)==EAGAIN);
+    CHECK(pipeline_waits==1 && pipeline_kind==EXT4_JOURNAL_WAIT_SEALED);
+}
+static void group_pipeline(struct ext4_fs *fs, bool crash)
+{
+    CHECK(fs->jbd_journal);
+    struct ext4_journal_runtime runtime={.now_ns=group_clock,.wait=pipeline_wait};
+    CHECK(ext4_journal_group_enable("/",&runtime,4*1024*1024)==EOK);
+    ext4_file f; CHECK(ext4_fopen(&f,"/file","r+")==EOK);
+    struct ext4_timestamp times[3]={{1111,1},{2222,2},{3333,3}};
+    for(unsigned i=0;i<65;i++) {times[0].nanoseconds=i;CHECK(ext4_file_set_times(&f,7,times)==EOK);}
+    CHECK(pipeline_waits==0 && disk.flushes>0);
+    pipeline_file=&f;write_interleave=pipeline_while_submitting;
+    CHECK(ext4_journal_group_service("/",true)==EOK);
+    struct ext4_journal_progress progress;
+    CHECK(ext4_journal_group_progress("/",&progress)==EOK);
+    CHECK(progress.durable>progress.checkpoint);
+    uint64_t writes=disk.writes,flushes=disk.flushes;
+    /* A committed target completes full sync even while home I/O is withheld. */
+    while(progress.durable<progress.accepted) {
+        CHECK(ext4_journal_group_service("/",true)==EOK);
+        CHECK(ext4_journal_group_progress("/",&progress)==EOK);
+    }
+    CHECK(progress.durable>progress.checkpoint);
+    writes=disk.writes;flushes=disk.flushes;
+    CHECK(ext4_file_sync_metadata(&f)==EOK);
+    CHECK(pipeline_waits==1 && disk.writes==writes && disk.flushes==flushes);
+    if(crash) {
+        CHECK(fault_block_crash(&disk)==0);
+        return;
+    }
+    CHECK(disk.writes>=writes && disk.flushes>=flushes);
+    CHECK(ext4_journal_group_service("/",true)==EOK);
+    CHECK(ext4_journal_group_drain("/")==EOK);
+    CHECK(ext4_fclose(&f)==EOK);
+    printf("group pipeline: operation 65 admitted without checkpoint; commit and checkpoint independent\n");
+}
+static void group_ring(struct ext4_fs *fs)
+{
+    struct ext4_journal_runtime runtime={.now_ns=group_clock};
+    CHECK(ext4_journal_group_enable("/",&runtime,512*1024)==EOK);
+    ext4_file f;CHECK(ext4_fopen(&f,"/file","r+")==EOK);
+    uint32_t previous=fs->jbd_journal->last;
+    bool wrapped=false;
+    unsigned iterations=to_be32(fs->jbd_journal->jbd_fs->sb.maxlen)+4;
+    for(unsigned i=0;i<iterations;i++) {
+        struct ext4_timestamp times[3]={{1111,i},{2222,2},{3333,3}};
+        CHECK(ext4_file_set_times(&f,7,times)==EOK && ext4_file_sync_metadata(&f)==EOK);
+        if(fs->jbd_journal->last<previous)wrapped=true;
+        previous=fs->jbd_journal->last;
+    }
+    CHECK(wrapped && ext4_journal_group_drain("/")==EOK);
+    CHECK(fs->jbd_journal->memory_peak<=fs->jbd_journal->memory_limit);
+    CHECK(ext4_fclose(&f)==EOK);
+    printf("group ring: same-block versions and checkpoint batches survive wrap within budget\n");
+}
 static ext4_file *interleave_file;
 static void group_modify_while_submitting(void)
 {
@@ -115,6 +190,8 @@ static void group_test(struct ext4_fs *fs)
     interleave_file=&f; write_interleave=group_modify_while_submitting;
     CHECK(ext4_journal_group_service("/",true)==EOK);
     CHECK(!write_interleave && fs->jbd_journal->running);
+    /* Explicitly advance home I/O; service now completes one worker phase. */
+    CHECK(ext4_journal_group_service("/",false)==EOK);
     CHECK(!memcmp(disk.visible+data_block*fs->bdev->lg_bsize,bytes,sizeof(bytes)));
     struct ext4_inode *stable=(void*)(disk.visible+inode_position);
     CHECK(to_le32(stable->access_time)==9999);
@@ -125,6 +202,7 @@ static void group_test(struct ext4_fs *fs)
     unsigned before_allocations=allocations;
     fail_allocation=allocations+1;
     CHECK(ext4_journal_group_service("/",true)==EOK);
+    CHECK(ext4_journal_group_drain("/")==EOK);
     fail_allocation=0;
     CHECK(allocations==before_allocations);
     CHECK(!memcmp(disk.visible+data_block*fs->bdev->lg_bsize,bytes,sizeof(bytes)));
@@ -141,8 +219,12 @@ static void group_fault(struct ext4_fs *fs, const char *kind, unsigned point)
     CHECK(ext4_file_set_times(&f,7,times)==EOK);
     if(!strcmp(kind,"group-write"))disk.fail_write=disk.writes+point;
     else disk.fail_flush=disk.flushes+point;
-    CHECK(ext4_journal_group_service("/",true)==EIO);
-    CHECK(fs->jbd_journal->error==EIO && fs->jbd_journal->committing && fs->jbd_journal->failed_trans==fs->jbd_journal->committing);
+    int result=ext4_journal_group_service("/",true);
+    if(result==EOK)result=ext4_journal_group_drain("/");
+    CHECK(result==EIO);
+    CHECK(fs->jbd_journal->error==EIO && fs->jbd_journal->failed_trans &&
+        (fs->jbd_journal->failed_trans==fs->jbd_journal->committing ||
+         fs->jbd_journal->failed_trans==fs->jbd_journal->checkpointing));
     CHECK(ext4_file_set_times(&f,7,times)==EIO);
     CHECK(ext4_journal_group_drain("/")==EIO);
     CHECK(fault_block_crash(&disk)==0);
@@ -160,21 +242,29 @@ static void group_verify_recovery(struct ext4_fs *fs)
 static struct ext4_fs *space_fs;
 static ext4_file space_other;
 static unsigned space_waited, space_interleaved;
-static int space_wait(void *context, uint64_t sequence, bool checkpoint)
+static int space_wait(void *context, uint64_t sequence, enum ext4_journal_wait kind)
 {
     (void)context;
-    if (space_fs->jbd_journal->committing) {
-        CHECK(checkpoint && sequence==space_fs->jbd_journal->accepted_sequence);
+    if (space_fs->jbd_journal->committing || space_fs->jbd_journal->checkpointing) {
+        CHECK(kind==EXT4_JOURNAL_WAIT_CHECKPOINT && sequence==space_fs->jbd_journal->accepted_sequence);
         space_waited++;
         /* A host fixture cannot suspend this C stack. Return a retry reason;
          * the RV64 adapter uses the same boundary to sleep on progress. */
         return EAGAIN;
     }
-    return ext4_journal_group_service("/",true);
+    for(;;) {
+        struct ext4_journal_progress progress;
+        CHECK(ext4_journal_group_progress("/",&progress)==EOK);
+        uint64_t reached=kind==EXT4_JOURNAL_WAIT_SEALED?progress.sealed:
+            kind==EXT4_JOURNAL_WAIT_DURABLE?progress.durable:progress.checkpoint;
+        if(reached>=sequence)return EOK;
+        int r=ext4_journal_group_service("/",true);
+        if(r!=EOK)return r;
+    }
 }
 static void space_during_checkpoint(void)
 {
-    struct jbd_trans *committing=space_fs->jbd_journal->committing;
+    struct jbd_trans *committing=space_fs->jbd_journal->checkpointing;
     if (!committing || LIST_EMPTY(&committing->quarantine)) {
         write_interleave=space_during_checkpoint;
         return;
@@ -434,6 +524,8 @@ int main(int argc,char **argv)
     else if(!strcmp(argv[2],"cost"))cost_test(dev.fs);
     else if(!strcmp(argv[2],"group"))group_test(dev.fs);
     else if(!strcmp(argv[2],"group-space"))group_space(dev.fs);
+    else if(!strcmp(argv[2],"group-ring"))group_ring(dev.fs);
+    else if(!strcmp(argv[2],"group-pipeline") || !strcmp(argv[2],"group-commit-crash")) {group_pipeline(dev.fs,!strcmp(argv[2],"group-commit-crash"));if(!strcmp(argv[2],"group-commit-crash"))return 0;}
     else if(!strcmp(argv[2],"group-write") || !strcmp(argv[2],"group-flush")) {CHECK(argc==4);group_fault(dev.fs,argv[2],strtoul(argv[3],NULL,10));return 0;}
     else if(!strcmp(argv[2],"group-recovery"))group_verify_recovery(dev.fs);
     else if(!strcmp(argv[2],"times") || !strcmp(argv[2],"readonly"))times_test(dev.fs,readonly);

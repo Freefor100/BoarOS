@@ -65,7 +65,12 @@ static void exercise(void *argument)
         check(kernel_vfs_file_modified(&file, 0, 1)==0 &&
             kernel_vfs_pwrite(&file,(uint64_t)page*sizeof(bytes),bytes,sizeof(bytes),&count)==0 && count==sizeof(bytes),22);
     }
-    check(kernel_vfs_sync(&file,1,&error)==0,23);
+    int synced=kernel_vfs_sync(&file,1,&error);
+    if(synced){virt_uart_puts("sync errno/journal memory/limit/accepted/durable/cp=");
+        virt_uart_put_hex((uint64_t)(int64_t)synced);virt_uart_putc(' ');
+        virt_uart_put_hex(journal->memory_used);virt_uart_putc(' ');virt_uart_put_hex(journal->memory_limit);virt_uart_putc(' ');
+        virt_uart_put_hex(journal->accepted_sequence);virt_uart_putc(' ');virt_uart_put_hex(journal->durable_sequence);virt_uart_putc(' ');virt_uart_put_hex(journal->checkpoint_sequence);virt_uart_putc('\n');}
+    check(synced==0,23);
     check(journal->durable_sequence==journal->accepted_sequence && journal->memory_peak<=journal->memory_limit,24);
     for(unsigned page=0;page<128;page++) {
         memset(bytes,(int)(page+1),sizeof(bytes));

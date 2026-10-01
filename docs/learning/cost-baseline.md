@@ -767,3 +767,19 @@ pin 的 home buffer 均纳入预算。`make test-lwext4-group-host` 在 1KiB/4Ki
 近满盘及 WRITE/FLUSH 错误恢复；`make test-lwext4-metadata-host` 保留 legacy OOM
 和格式几何覆盖。ASan/UBSan 的 4KiB 组测试通过。该阶段没有改变提交和同步边界，
 封口等待及 durable/checkpoint 分离仍待 S7；尚无生产吞吐改善声明。
+
+S7 提交边界（2026-10-01）：65 次真实时间修改在无 I/O 进展时开新运行组；设备提交
+暂扣的宿主回调继续封口两个后续组，FIFO 满时返回 fixture 的 sealed 等待原因，
+没有把操作数阈值转成 checkpoint 等待。内部回调改用明确枚举，进度包含 accepted、
+sealed、durable、checkpoint；同步捕获的 seal 目标持续到达成，避免一次唤醒丢掉目标。
+commit 屏障后推进 durable，释放已持久 ordered-data 的镜像及日志输出载荷，metadata
+版本与日志 credit/quarantine 仍归挂载点；checkpoint 按 FIFO 以最多八组连续批次
+写 home、flush、持久更新日志起点，再回收。
+
+`make test-lwext4-group-host` 先以旧实现的 durable=checkpoint 证伪边界，现验证
+同块跨组、暂扣提交、sealed 容量、无 checkpoint 的 fsync、其后断电重放、环形日志
+绕回、近满盘、错误 owner 和最终 fsck。两种块尺寸通过；ASan/UBSan pipeline 通过。
+`make test-journal-group-riscv` 默认与 COST_DIAGNOSTICS=1 的真实 IRQ、低内存、期限、
+同步、truncate/unlink 和卸载通过。观测新增等待原因与 checkpoint 汇总耗时，继续
+由 64KiB 编译期断言约束；无直方图的计时 scope 保存总量/样本/max，cost core 验证
+其汇总值。这里是机制验收；尚未重新声明完整恢复矩阵或新 iozone 目标达成。

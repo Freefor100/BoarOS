@@ -70,11 +70,16 @@ struct ext4_lock {
 
 /* Runtime callbacks run with the mount modification lock held. wait() must
  * release that lock while sleeping and reacquire it before returning. */
+enum ext4_journal_wait {
+	EXT4_JOURNAL_WAIT_SEALED,
+	EXT4_JOURNAL_WAIT_DURABLE,
+	EXT4_JOURNAL_WAIT_CHECKPOINT,
+};
 struct ext4_journal_runtime {
 	void *context;
 	uint64_t (*now_ns)(void *context);
 	void (*request)(void *context);
-	int (*wait)(void *context, uint64_t sequence, bool checkpoint);
+	int (*wait)(void *context, uint64_t sequence, enum ext4_journal_wait kind);
 };
 int ext4_journal_group_enable(const char *mount_point,
 	const struct ext4_journal_runtime *runtime, size_t memory_limit);
@@ -83,7 +88,7 @@ int ext4_journal_group_enable(const char *mount_point,
 int ext4_journal_group_service(const char *mount_point, bool force);
 int ext4_journal_group_drain(const char *mount_point);
 struct ext4_journal_progress {
-	uint64_t accepted, durable, checkpoint, deadline_ns;
+	uint64_t accepted, sealed, durable, checkpoint, deadline_ns;
 	size_t memory_used, memory_peak;
 	bool ready;
 	int error;

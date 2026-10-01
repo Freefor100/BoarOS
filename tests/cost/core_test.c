@@ -24,12 +24,17 @@ int main(void)
     assert(kernel_cost_end(10, 0) == -KERNEL_EPERM);
     assert(kernel_cost_end(9, 0) == -KERNEL_EBUSY);
     kernel_cost_leave(&scope);
+    scope = kernel_cost_enter(COST_JOURNAL_CHECKPOINT_TICKS);
+    clock_tick += 7;
+    kernel_cost_leave(&scope);
     assert(kernel_cost_end(9, 0) == 0);
     assert(kernel_cost_format(output, sizeof(output)) > 0);
     assert(strstr(output, "version=1\n"));
     assert(strstr(output, "foreground.operations.value=2\n"));
     assert(strstr(output, "foreground.operation_ticks.max=16\n"));
     assert(strstr(output, "foreground.operation_ticks.bucket.5=1\n"));
+    assert(strstr(output, "foreground.journal_checkpoint_ticks.value=7\n"));
+    assert(strstr(output, "foreground.journal_checkpoint_ticks.samples=1\n"));
     assert(kernel_cost_begin(9, 10000000, 0, 0) == 0);
     assert(kernel_cost_epoch() == first + 1);
     /* Old actor cannot contaminate a reused window's foreground. */
