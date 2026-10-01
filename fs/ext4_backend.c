@@ -14,6 +14,7 @@
 #include <kernel/physical_page.h>
 #include <kernel/vfs.h>
 #include <kernel/time.h>
+#include <arch/riscv/context.h>
 
 #include <ext4.h>
 #include <ext4_bcache.h>
@@ -486,6 +487,16 @@ static int ext4_backend_prepare_unmount(struct kernel_vfs_mount *mount)
         if (result != EOK) return lwext4_error(result);
         root->closed = 1U;
     }
+    if (adapter->journal_started) {
+        result = ext4_journal_group_drain(adapter->mount_point);
+        if (result != EOK) return lwext4_error(result);
+        uintptr_t irq = riscv_interrupt_save();
+        adapter->journal_stopping = 1;
+        (void)kernel_wait_queue_wake_all(&adapter->journal_work);
+        riscv_interrupt_restore(irq);
+        kernel_thread_join(&adapter->journal_worker);
+        adapter->journal_started = 0;
+    }
     if (adapter->mounted) {
         result = ext4_umount(adapter->mount_point);
         if (result != EOK) {
@@ -508,6 +519,102 @@ static int ext4_backend_prepare_unmount(struct kernel_vfs_mount *mount)
     }
 
     adapter->unmount_prepared = 1U;
+    return 0;
+}
+
+static uint64_t journal_now(void *context)
+{ (void)context; return kernel_time_monotonic_ns(); }
+
+static void journal_request(void *context)
+{
+    struct lwext4_mount_adapter *adapter = context;
+    uintptr_t irq = riscv_interrupt_save();
+    adapter->journal_requested = 1;
+    (void)kernel_wait_queue_wake_all(&adapter->journal_work);
+    riscv_interrupt_restore(irq);
+}
+
+static int journal_wait(void *context, uint64_t sequence, bool checkpoint)
+{
+    struct lwext4_mount_adapter *adapter = context;
+    adapter->journal_force = 1;
+    journal_request(adapter);
+    unsigned depth = boaros_lwext4_pause();
+    int result = EOK;
+    for (;;) {
+        struct ext4_journal_progress progress;
+        result = ext4_journal_group_progress(adapter->mount_point, &progress);
+        if (result != EOK || progress.error) {
+            if (result == EOK) result = progress.error;
+            break;
+        }
+        if ((checkpoint ? progress.checkpoint : progress.durable) >= sequence) break;
+        uintptr_t irq = riscv_interrupt_save();
+        /* Only the worker advances completion, and it cannot run between the
+         * disabled-IRQ predicate and queue insertion on this single hart. */
+        struct jbd_journal *journal = adapter->device.fs->jbd_journal;
+        if (!journal->error && (checkpoint ? journal->checkpoint_sequence : journal->durable_sequence) < sequence) {
+            enum kernel_wait_wake_reason reason;
+            if (kernel_scheduler_block_current(&adapter->journal_progress, 0, 0, &reason) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
+        }
+        riscv_interrupt_restore(irq);
+    }
+    boaros_lwext4_resume(&adapter->backend_lock, depth);
+    return result;
+}
+
+static void journal_worker(void *context)
+{
+    struct lwext4_mount_adapter *adapter = context;
+    kernel_io_context_current()->background_reclaim = 1;
+    for (;;) {
+        uintptr_t irq = riscv_interrupt_save();
+        int force = adapter->journal_force;
+        adapter->journal_force = adapter->journal_requested = 0;
+        int stopping = adapter->journal_stopping;
+        riscv_interrupt_restore(irq);
+        if (stopping) break;
+        int result = ext4_journal_group_service(adapter->mount_point, force);
+        irq = riscv_interrupt_save();
+        (void)kernel_wait_queue_wake_all(&adapter->journal_progress);
+        riscv_interrupt_restore(irq);
+        struct ext4_journal_progress progress;
+        if (ext4_journal_group_progress(adapter->mount_point, &progress) != EOK) __builtin_trap();
+        uint64_t deadline = 0;
+        if (!result && progress.deadline_ns) {
+            if (progress.ready || kernel_time_deadline_from_monotonic(progress.deadline_ns, &deadline) == KERNEL_TIME_STATUS_DEADLINE_PASSED) continue;
+        }
+        irq = riscv_interrupt_save();
+        if (!adapter->journal_requested && !adapter->journal_stopping) {
+            enum kernel_wait_wake_reason reason;
+            if (kernel_scheduler_block_current(&adapter->journal_work, deadline, 0, &reason) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
+        }
+        riscv_interrupt_restore(irq);
+    }
+    kernel_io_context_current()->background_reclaim = 0;
+}
+
+int kernel_vfs_start_journal_worker(struct kernel_vfs_mount *mount)
+{
+    if (!mount || !mount->private_data) return -KERNEL_EINVAL;
+    struct lwext4_mount_adapter *adapter = mount->private_data;
+    if (adapter->instance.backend_data != adapter || !adapter->mounted) return -KERNEL_EINVAL;
+    if (!adapter->device.fs->jbd_journal || adapter->instance.read_only) return 0;
+    if (adapter->journal_started) return -KERNEL_EBUSY;
+    kernel_wait_queue_init(&adapter->journal_work);
+    kernel_wait_queue_init(&adapter->journal_progress);
+    uint64_t budget = physical_page_total(adapter->instance.page_cache->allocator) * BOAROS_PAGE_SIZE / 32;
+    if (budget > 4 * 1024 * 1024) budget = 4 * 1024 * 1024;
+    struct ext4_journal_runtime runtime = {adapter, journal_now, journal_request, journal_wait};
+    int result = ext4_journal_group_enable(adapter->mount_point, &runtime, budget);
+    if (result != EOK) return lwext4_error(result);
+    enum kernel_scheduler_status status = kernel_thread_create_joinable(journal_worker, adapter, &adapter->journal_worker);
+    if (status != KERNEL_SCHEDULER_STATUS_OK) {
+        /* No operation could join while startup held this execution path. */
+        jbd_journal_group_fini(adapter->device.fs->jbd_journal);
+        return status == KERNEL_SCHEDULER_STATUS_NO_MEMORY ? -KERNEL_ENOMEM : -KERNEL_EIO;
+    }
+    adapter->journal_started = 1;
     return 0;
 }
 
@@ -1330,11 +1437,7 @@ static int ext4_backend_writeback(struct kernel_vfs_node *node, uint64_t offset,
 {
     COST_ADD(BACKEND_REQUESTED, size);
     *written = 0;
-    struct ext4_lock *locks = &lwext4_instance(node->instance)->locks;
-    locks->lock(locks->context);
-    int result = ext4_fseek(lwext4_node_file(node), (int64_t)offset, SEEK_SET);
-    if (result == EOK) result = ext4_fwrite(lwext4_node_file(node), buffer, size, written);
-    locks->unlock(locks->context);
+    int result = ext4_fpwrite(lwext4_node_file(node), offset, buffer, size, written);
     if (result == EOK && *written != size) result = EIO;
     if (result != EOK) kernel_vfs_record_writeback_error(node, lwext4_error(result));
     COST_ADD(BACKEND_ACCEPTED, *written);
@@ -1371,8 +1474,13 @@ static int ext4_backend_close_node(struct kernel_vfs_node *node)
 { return lwext4_error(ext4_fclose(lwext4_node_file(node))); }
 static int ext4_backend_writeback_allowed(struct kernel_vfs_instance *instance)
 { (void)instance; return !boaros_lwext4_allocation_active(); }
-static int ext4_backend_sync_metadata(struct kernel_vfs_node *node)
-{ return lwext4_error(ext4_file_sync_metadata(lwext4_node_file(node))); }
+static int ext4_backend_sync_metadata(struct kernel_vfs_node *node, int data_only)
+{
+    struct lwext4_mount_adapter *adapter = lwext4_instance(node->instance);
+    int result = ext4_file_sync_metadata_mode(lwext4_node_file(node), data_only != 0);
+    if (result == EOK && !adapter->device.fs->jbd_journal) result = block_flush(&adapter->device);
+    return lwext4_error(result);
+}
 static int ext4_backend_flush(struct kernel_vfs_instance *instance)
 {
     enum kernel_block_status status = kernel_block_flush(lwext4_instance(instance)->block);

@@ -52,6 +52,7 @@
 #include <ext4_super.h>
 #include <ext4_crc32.h>
 #include <ext4_fs.h>
+#include <ext4_journal.h>
 #include <ext4_blockdev.h>
 #include <ext4_block_group.h>
 #include <ext4_bitmap.h>
@@ -190,6 +191,12 @@ int ext4_ialloc_free_inode(struct ext4_fs *fs, uint32_t index, bool is_dir)
 		return EUCLEAN;
 	}
 
+    rc = jbd_trans_quarantine(fs, index, 1, true);
+    if (rc != EOK) {
+        ext4_block_set(fs->bdev, &b);
+        ext4_fs_put_block_group_ref(&bg_ref);
+        return rc;
+    }
 	/* Free i-node in the bitmap */
 	uint32_t index_in_group = ext4_ialloc_inode_to_bgidx(sb, index);
 	ext4_bmap_bit_clr(b.data, index_in_group);
@@ -293,6 +300,8 @@ int ext4_ialloc_alloc_inode(struct ext4_fs *fs, uint32_t *idx, bool is_dir)
 			inodes_in_bg = ext4_inodes_in_group_cnt(sb, bgid);
 			rc = ext4_bmap_bit_find_clr(b.data, 0, inodes_in_bg,
 						    &idx_in_bg);
+			while (rc == EOK && jbd_journal_quarantined(fs, (uint64_t)bgid * ext4_get32(sb, inodes_per_group) + idx_in_bg + 1, true))
+				rc = ext4_bmap_bit_find_clr(b.data, idx_in_bg + 1, inodes_in_bg, &idx_in_bg);
 			/* Block group has not any free i-node */
 			if (rc == ENOSPC) {
 				rc = ext4_block_set(fs->bdev, &b);

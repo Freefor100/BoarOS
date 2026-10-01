@@ -32,7 +32,12 @@ def main():
     parser.add_argument('--replicas',type=int,choices=(1,3),default=3,help='1 is a pilot, never a complete baseline')
     parser.add_argument('--consumer-timeout-ms',type=int,default=180000,
                         help='explicit per-command guest budget, 1000..3600000 ms; completion checks remain mandatory')
+    parser.add_argument('--consumer-commands',default='all',help='all or comma-separated libc:index (0..7); partial selection is targeted attribution')
     args=parser.parse_args()
+    names=[f'consumer-{libc}-{i}' for libc in ('musl','glibc') for i in range(8)]
+    selected=names if args.consumer_commands=='all' else [f'consumer-{v.replace(":","-")}' for v in args.consumer_commands.split(',')]
+    if not selected or len(set(selected))!=len(selected) or not set(selected)<=set(names):parser.error('invalid consumer command selection')
+    if args.consumer_commands!='all' and args.case!='consumer':parser.error('consumer selection requires --case consumer')
     if not 1000<=args.consumer_timeout_ms<=3600000:parser.error('consumer timeout must be 1000..3600000 ms')
     linux_identity=None
     if args.linux:
@@ -60,6 +65,9 @@ def main():
     if 'consumer' in cases:
         original,consumer_identity=originals(ROOT,work,digest); identity.update(consumer_identity)
         identity['consumer_timeout_ms']=args.consumer_timeout_ms
+        identity['consumer_command_names']=selected
+        identity['scope']='complete original command set' if len(selected)==16 else 'targeted attribution'
+        if len(selected)!=16:identity['acceptance']=False
     compiler=ROOT/'build/riscv/musl-root/bin/musl-gcc'
     identity['compiler']=subprocess.check_output([str(compiler),'--version'],text=True).splitlines()[0]
     records=[]
@@ -81,6 +89,8 @@ def main():
                     nonce=folder/'replica-id';nonce.write_text(str(replica)+'\n');contents+=f'write {nonce} /cost-replica\n'
                     policy=folder/'consumer-budget';policy.write_text(str(args.consumer_timeout_ms)+'\n')
                     contents+=f'write {policy} /cost-consumer-budget\n'
+                    selection=folder/'consumer-selection';selection.write_text(str(sum(1<<names.index(n) for n in selected))+'\n')
+                    contents+=f'write {selection} /cost-consumer-selection\n'
                 if args.linux:
                     flag=folder/'linux-flag'; flag.write_text('fixed Linux reference\n'); contents+=f'write {flag} /cost-linux\n'
                 if case=='write':
@@ -176,7 +186,7 @@ def main():
                     for snapshot in snapshots:
                         validate_expected(snapshot['values'],metric_expectations.get(snapshot['name'],{}))
                 if case=='consumer':
-                    record['commands']=consumer_commands(output,expected_budget_ms=args.consumer_timeout_ms)
+                    record['commands']=consumer_commands(output,expected_budget_ms=args.consumer_timeout_ms,expected_names=selected)
                     platform_lines=[line.split()[2:] for line in output.splitlines() if line.startswith('COST PLATFORM ')]
                     if len(platform_lines)!=1 or len(platform_lines[0])!=3:raise ValueError('missing/duplicate consumer platform')
                     record['uname']=dict(zip(('sysname','release','machine'),platform_lines[0]))
@@ -199,7 +209,7 @@ def main():
                 record['snapshots']=snapshots; record['timings_ns']=timings; records.append(record)
                 (folder/'result.json').write_text(json.dumps(record,indent=2)+'\n')
                 # Fixture identity is kept; disposable writable copies are pruned at stage end.
-                print(f'cost {case} replica {replica+1}: {len(timings)} workloads, {len(snapshots)} diagnostic windows'+(f', completed {sum(c["outcome"]=="completed" for c in record["commands"])}/16 original commands' if case=='consumer' else ''),flush=True)
+                print(f'cost {case} replica {replica+1}: {len(timings)} workloads, {len(snapshots)} diagnostic windows'+(f', completed {sum(c["outcome"]=="completed" for c in record["commands"])}/{len(selected)} original commands ({record["scope"]})' if case=='consumer' else ''),flush=True)
         (work/'results.json').write_text(json.dumps(records,indent=2)+'\n')
         print('cost records: '+str(work/'results.json'))
     except BaseException:

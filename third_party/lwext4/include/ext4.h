@@ -68,6 +68,28 @@ struct ext4_lock {
 	void *context;
 };
 
+/* Runtime callbacks run with the mount modification lock held. wait() must
+ * release that lock while sleeping and reacquire it before returning. */
+struct ext4_journal_runtime {
+	void *context;
+	uint64_t (*now_ns)(void *context);
+	void (*request)(void *context);
+	int (*wait)(void *context, uint64_t sequence, bool checkpoint);
+};
+int ext4_journal_group_enable(const char *mount_point,
+	const struct ext4_journal_runtime *runtime, size_t memory_limit);
+/* One caller owns service. Freezing and retirement use the mount lock; slow
+ * device I/O uses only immutable transaction-owned images outside that lock. */
+int ext4_journal_group_service(const char *mount_point, bool force);
+int ext4_journal_group_drain(const char *mount_point);
+struct ext4_journal_progress {
+	uint64_t accepted, durable, checkpoint, deadline_ns;
+	size_t memory_used, memory_peak;
+	bool ready;
+	int error;
+};
+int ext4_journal_group_progress(const char *mount_point, struct ext4_journal_progress *progress);
+
 /********************************FILE DESCRIPTOR*****************************/
 
 /**@brief   File descriptor. */
@@ -93,6 +115,8 @@ typedef struct ext4_file {
 
 	/* Last completed journal dependency in this mounted session. */
 	uint32_t sync_tid;
+	uint64_t sync_sequence;
+	uint64_t data_sequence;
 } ext4_file;
 
 /* BoarOS adapter: optional realtime source and live-inode timestamp updates.
@@ -117,6 +141,8 @@ int ext4_file_set_times(ext4_file *file, unsigned fields,
 /* Preserve inode identity after unlink; update permission bits and ctime in one
  * transaction, with the same file error owner as other metadata mutations. */
 int ext4_file_set_mode(ext4_file *file, uint32_t mode);
+int ext4_fpwrite(ext4_file *file, uint64_t offset, const void *buffer, size_t size, size_t *written);
+int ext4_file_sync_metadata_mode(ext4_file *file, bool data_only);
 
 /*****************************DIRECTORY DESCRIPTOR***************************/
 

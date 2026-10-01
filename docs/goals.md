@@ -8,6 +8,24 @@ Linux 为 `references/linux` 的 `f4cdf7ca9a1fdcca413157df19753f388a5a224e`。
 此前于 `main@959da70` 完成仅文档审计；下面独立 Review 小节记录新一轮实际修复与验证。
 下列“已交付”引用该阶段证据，“未实现”据当前源码，“待定位”不等于已证实内核缺陷。
 
+## 异步日志与 I/O 优化（2026-10-01，进行中）
+
+已选择完整异步日志、跨调用组提交和提交线程，保持 ordered-data/log/commit 屏障及恢复正确性。
+默认 100ms 首次脏化期限、64 操作或 256KiB 软批次边界；每挂载点事务内存上限 min(4MiB, RAM/32)。
+原版 musl/glibc 五项代表写入共十格须各达到旧中位吞吐的 10 倍，自动模式耗时至少减半。
+通用修改在 main，最终单向 merge 到 oscomp-rv-compat；不改 main uname，不 push。
+
+| 阶段 | 状态与依赖 |
+|---|---|
+| S0 根因复现 | idle 安全返回和后到者抢锁已由旧实现的 1/2 个失败证伪；事务隔离/版本交错与真实无 timer IRQ 因果对照已通过 |
+| S1 操作隔离与冻结版本 | 1/4 KiB 实际引擎、后操作 OOM、冻结后零分配与版本交错通过；mount 保留已接受修改 |
+| S2 后台组提交/checkpoint | 已接入每 mount joinable worker、期限/批次、容量预算和不可变 checkpoint；真实 RV64 窄验证通过 |
+| S3 同步及生命周期 | full/data、后端锁释放等待、unlink/truncate/卸载已接入；SQLite DELETE/WAL 正常与重启通过；lwext4 与 SQLite DELETE/WAL 完整恢复及双盘隔离通过；近满盘等待另有因果对照 |
+| S4 idle IRQ 与 FIFO 交接 | 聚焦实现通过 test-scheduler-cases-riscv（1/8/32 等待者）及 test-scheduler-riscv；完整 RV64、musl/glibc、1091 ABI、scale、四组合 io-sleep 与栈检查通过 |
+| S5 原消费者与收益 | 依赖 S1–S4；3 次关闭观测全原参数、1 次定点观测、1 次 1GiB iozone 专项；尚无新性能结论 |
+
+最终候选一次执行实际持久化机制所需的恢复矩阵与扩大回归。既有成本矩阵不重跑，完成的检查仅在相关修改或失败后重跑。
+
 ## 独立 Review 的组合边界（2026-09-30）
 
 核实起点为 `main@d2a548d`，Review ZIP SHA-256 为 `c462c3a48c6ed22ea83118c4117a9d113f25e455192a9224016aeb8166bb0c7f`；八个关键文件与该起点一致。旧 1031 条 ABI、VMA/scale 基线缺少本次组合边界，不能反证本次缺陷。修复后新增回归先证伪旧实现，最终 1091 条固定 RV64 Linux/BoarOS 记录一致。完整 RV64、musl、glibc 五种形态、四组合 io-sleep、scale 与栈检查通过；栈静态分析覆盖 1674 函数，最大 2368 字节。SQLite WAL/重启双侧及当前内核的 126 切点、26 写失败、16 flush 失败恢复矩阵通过，固定输入见[恢复记录](learning/record-lock-sqlite-recovery.md)。独立全改动审查未发现 Critical/Important 缺陷。

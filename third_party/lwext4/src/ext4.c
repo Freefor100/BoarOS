@@ -89,6 +89,7 @@ struct ext4_mountpoint {
 
 	/* Optional adapter-owned realtime source; cleared on mount reuse. */
 	ext4_clock_read clock;
+	struct ext4_journal_runtime journal_runtime;
 
 	/**@brief   Ext4 filesystem internals.*/
 	struct ext4_fs fs;
@@ -726,6 +727,11 @@ static int __ext4_journal_stop(const char *mount_point)
 	int r;
 	if (mp->fs.jbd_journal && !mp->journal_stopped) {
 		if (mp->jbd_journal.error) return mp->jbd_journal.error;
+		if (mp->jbd_journal.grouped) {
+			r = ext4_journal_group_drain(mount_point);
+			if (r != EOK) return r;
+			jbd_journal_group_fini(&mp->jbd_journal);
+		}
 		r = jbd_journal_stop(&mp->jbd_journal);
 		if (r != EOK) return r;
 		mp->journal_stopped = true;
@@ -801,6 +807,27 @@ Finish:
 }
 
 __unused
+static bool ext4_space_waits_checkpoint(struct ext4_mountpoint *mp)
+{
+	struct jbd_journal *journal = mp->fs.jbd_journal;
+	struct jbd_trans *groups[] = {journal->running, journal->committing};
+	uint64_t blocks = 0, inodes = 0;
+	for (unsigned i = 0; i < 2; i++) {
+		if (!groups[i]) continue;
+		struct jbd_quarantine *range;
+		LIST_FOREACH(range, &groups[i]->quarantine, node) {
+			if (range->inode) inodes += range->count;
+			else blocks += range->count;
+		}
+	}
+	/* Free bitmap entries owned by an older checkpoint are not allocatable.
+	 * Wait before starting a private operation, while releasing the backend
+	 * lock is still safe. Leave headroom for the bounded 32-block batch. */
+	return (blocks && ext4_sb_get_free_blocks_cnt(&mp->fs.sb) <= blocks + 32) ||
+		(inodes && ext4_get32(&mp->fs.sb, free_inodes_count) <= inodes + 1);
+}
+
+__unused
 static int __ext4_trans_start(struct ext4_mountpoint *mp)
 {
 	struct jbd_journal *journal = mp->fs.jbd_journal;
@@ -812,6 +839,14 @@ static int __ext4_trans_start(struct ext4_mountpoint *mp)
 	uintptr_t owner = mp->os_locks && mp->os_locks->owner ? mp->os_locks->owner(mp->os_locks->context) : 0;
 	if (mp->transaction_depth && mp->transaction_owner != owner) __builtin_trap();
 	if (mp->transaction_depth == 0) {
+		if (journal->grouped && mp->journal_runtime.wait &&
+		    (journal->memory_used > journal->memory_limit / 2 ||
+		     (journal->running && journal->running->operations >= 64) ||
+		     ext4_space_waits_checkpoint(mp))) {
+			if (mp->journal_runtime.request) mp->journal_runtime.request(mp->journal_runtime.context);
+			int wait = mp->journal_runtime.wait(mp->journal_runtime.context, journal->accepted_sequence, true);
+			if (wait != EOK) return wait;
+		}
 		mp->transaction_owner = owner;
 		struct jbd_trans *trans = jbd_journal_new_trans(journal);
 		if (!trans) return journal->error ? journal->error : ENOMEM;
@@ -877,7 +912,12 @@ static int __ext4_trans_finish(struct ext4_mountpoint *mp, int error)
 	} else {
 		/* A failed commit may already be durable. The journal retains that
 		 * transaction; do not turn an uncertain commit into an abort. */
-		r = jbd_journal_commit_trans(journal, trans);
+		if (journal->grouped) {
+			uint64_t now = mp->journal_runtime.now_ns ? mp->journal_runtime.now_ns(mp->journal_runtime.context) : 0;
+			r = jbd_journal_accept(journal, trans, now);
+			if (r != EOK) jbd_journal_free_trans(journal, trans, true);
+			else if (mp->journal_runtime.request) mp->journal_runtime.request(mp->journal_runtime.context);
+		} else r = jbd_journal_commit_trans(journal, trans);
 		if (r != EOK && !journal->error) {
 			/* Ordered-data failures happen before logging and the journal
 			 * has already restored the buffer beforeimages. */
@@ -906,6 +946,91 @@ int ext4_journal_start(const char *mount_point __unused)
 	int result = ext4_journal_start_locked(mount_point);
 	EXT4_MP_UNLOCK(mp);
 	return result;
+}
+
+int ext4_journal_group_enable(const char *mount_point,
+	const struct ext4_journal_runtime *runtime, size_t memory_limit)
+{
+	struct ext4_mountpoint *mp = ext4_get_mount(mount_point);
+	if (!mp) return ENOENT;
+	EXT4_MP_LOCK(mp);
+	struct jbd_journal *journal = mp->fs.jbd_journal;
+	int r = !journal || mp->fs.read_only ? EROFS : EOK;
+	if (!runtime || !runtime->now_ns || !memory_limit) r = EINVAL;
+	if (r == EOK && (journal->grouped || mp->transaction_depth)) r = EBUSY;
+	if (r == EOK) r = jbd_journal_purge_cp_trans(journal, true, false);
+	if (r == EOK) {
+		mp->journal_runtime = *runtime;
+		r = jbd_journal_group_init(journal, memory_limit);
+	}
+	EXT4_MP_UNLOCK(mp);
+	return r;
+}
+
+int ext4_journal_group_service(const char *mount_point, bool force)
+{
+	struct ext4_mountpoint *mp = ext4_get_mount(mount_point);
+	if (!mp) return ENOENT;
+	EXT4_MP_LOCK(mp);
+	struct jbd_journal *journal = mp->fs.jbd_journal;
+	int r = !journal || !journal->grouped ? EINVAL : journal->error;
+	if (r == EOK && (mp->transaction_depth || journal->committing)) r = EBUSY;
+	struct jbd_trans *running = journal ? journal->running : NULL;
+	uint64_t now = mp->journal_runtime.now_ns ? mp->journal_runtime.now_ns(mp->journal_runtime.context) : 0;
+	unsigned blocks = running ? running->data_cnt : 0;
+	struct jbd_data *data;
+	if (running) TAILQ_FOREACH(data, &running->data_queue, node) blocks++;
+	bool due = running && (force || running->operations >= 64 ||
+		(uint64_t)blocks * journal->block_size >= 256 * 1024 ||
+		now - running->first_dirty_ns >= 100000000);
+	if (r == EOK && due) r = jbd_journal_freeze(journal);
+	EXT4_MP_UNLOCK(mp);
+	if (r != EOK || !due) return r;
+	r = jbd_journal_submit(journal);
+	EXT4_MP_LOCK(mp);
+	r = jbd_journal_retire(journal, r);
+	EXT4_MP_UNLOCK(mp);
+	return r;
+}
+
+int ext4_journal_group_drain(const char *mount_point)
+{
+	struct ext4_mountpoint *mp = ext4_get_mount(mount_point);
+	if (!mp) return ENOENT;
+	EXT4_MP_LOCK(mp);
+	struct jbd_journal *journal = mp->fs.jbd_journal;
+	int r = !journal || !journal->grouped ? EINVAL : journal->error;
+	uint64_t target = journal ? journal->accepted_sequence : 0;
+	if (r == EOK && journal->checkpoint_sequence < target) {
+		if (mp->journal_runtime.request) mp->journal_runtime.request(mp->journal_runtime.context);
+		if (mp->journal_runtime.wait) r = mp->journal_runtime.wait(mp->journal_runtime.context, target, true);
+		else { EXT4_MP_UNLOCK(mp); return ext4_journal_group_service(mount_point, true); }
+	}
+	EXT4_MP_UNLOCK(mp);
+	return r;
+}
+
+int ext4_journal_group_progress(const char *mount_point, struct ext4_journal_progress *progress)
+{
+	struct ext4_mountpoint *mp = ext4_get_mount(mount_point);
+	if (!mp || !progress) return EINVAL;
+	EXT4_MP_LOCK(mp);
+	struct jbd_journal *journal = mp->fs.jbd_journal;
+	int r = !journal || !journal->grouped ? ENOTSUP : EOK;
+	if (r == EOK) {
+		struct jbd_trans *running = journal->running;
+		unsigned blocks = running ? running->data_cnt : 0;
+		struct jbd_data *data;
+		if (running) TAILQ_FOREACH(data, &running->data_queue, node) blocks++;
+		*progress = (struct ext4_journal_progress){journal->accepted_sequence,
+			journal->durable_sequence, journal->checkpoint_sequence,
+			running ? running->first_dirty_ns + 100000000 : 0,
+			journal->memory_used, journal->memory_peak,
+			running && (running->operations >= 64 || (uint64_t)blocks * journal->block_size >= 256 * 1024),
+			journal->error};
+	}
+	EXT4_MP_UNLOCK(mp);
+	return r;
 }
 
 static int ext4_journal_stop_locked(const char *mount_point __unused)
@@ -972,8 +1097,10 @@ static bool ext4_file_rolled_back(ext4_file *file, int result)
 static void ext4_file_completed(ext4_file *file, int result)
 {
 	if (result == EOK && file->mp && file->mp->fs.jbd_journal &&
-	    !file->mp->transaction_depth)
+	    !file->mp->transaction_depth) {
 		file->sync_tid = file->mp->fs.jbd_journal->committed_id;
+		file->sync_sequence = file->mp->fs.jbd_journal->accepted_sequence;
+	}
 }
 
 int ext4_transaction_begin(const char *mount_point)
@@ -1286,6 +1413,12 @@ static int ext4_reclaim_orphan(struct ext4_mountpoint *mp, uint32_t index,
 	int r;
 	if (!mp->fs.jbd_journal) return EOK;
 	if (mp->transaction_depth) return EBUSY;
+	/* The shrink/unlink intent must reach stable storage before recycling
+	 * tail mappings. The worker takes no inode or write-operation lock. */
+	if (mp->fs.jbd_journal->grouped) {
+		r = ext4_journal_group_drain(mp->name);
+		if (r != EOK) return r;
+	}
 	do {
 		struct ext4_inode_ref ref;
 		r = ext4_trans_start(mp);
@@ -1318,6 +1451,10 @@ static int ext4_reclaim_orphan(struct ext4_mountpoint *mp, uint32_t index,
 		}
 		r = ext4_trans_finish(mp, r);
 		if (r != EOK) return r;
+		if (mp->fs.jbd_journal->grouped) {
+			r = ext4_journal_group_drain(mp->name);
+			if (r != EOK) return r;
+		}
 	} while (!done);
 	return EOK;
 }
@@ -1617,6 +1754,8 @@ static int ext4_generic_open2(ext4_file *f, const char *path, int flags,
 		f->inode = ref.index;
 		f->fpos = 0;
 		f->sync_tid = mp->fs.jbd_journal ? mp->fs.jbd_journal->committed_id : 0;
+		f->sync_sequence = mp->fs.jbd_journal ? mp->fs.jbd_journal->accepted_sequence : 0;
+		f->data_sequence = f->sync_sequence;
 
 		if (f->flags & O_APPEND)
 			f->fpos = f->fsize;
@@ -1660,6 +1799,7 @@ static int ext4_generic_open(ext4_file *f, const char *path, const char *flags,
 	    !mp->transaction_depth)
 		r = ext4_reclaim_orphan(mp, f->inode, false);
 	ext4_file_completed(f, r);
+	if (r == EOK) f->data_sequence = f->sync_sequence;
 	return r;
 }
 
@@ -2469,6 +2609,7 @@ int ext4_fopen2(ext4_file *file, const char *path, int flags)
 	    !mp->transaction_depth)
 		r = ext4_reclaim_orphan(mp, file->inode, false);
 	ext4_file_completed(file, r);
+	if (r == EOK) file->data_sequence = file->sync_sequence;
 	EXT4_MP_UNLOCK(mp);
 	return r;
 }
@@ -2482,6 +2623,8 @@ int ext4_fclose(ext4_file *file)
 	file->inode = 0;
 	file->fpos = file->fsize = file->fmax = 0;
 	file->sync_tid = 0;
+	file->sync_sequence = 0;
+	file->data_sequence = 0;
 
 	return EOK;
 }
@@ -2649,6 +2792,7 @@ int ext4_ftruncate(ext4_file *f, uint64_t size)
 	if (r == EOK && f->mp->fs.jbd_journal && !f->mp->transaction_depth)
 		r = ext4_reclaim_orphan(f->mp, f->inode, false);
 	ext4_file_completed(f, r);
+	if (r == EOK) f->data_sequence = f->sync_sequence;
 
 	EXT4_MP_UNLOCK(f->mp);
 	return r;
@@ -2750,7 +2894,8 @@ static int ext4_fread_body(ext4_file *file, void *buf, size_t size, size_t *rcnt
 
 		if (!fblock) {
 			memset(u8_buf, 0, length);
-		} else if (pure || file->mp->fs.curr_trans) {
+		} else if (pure || file->mp->fs.curr_trans ||
+			   (file->mp->fs.jbd_journal && file->mp->fs.jbd_journal->grouped)) {
 			r = ext4_read_pending_data(file->mp->fs.bdev, fblock,
 						   offset, u8_buf, length);
 			if (r != EOK) goto Finish;
@@ -2798,7 +2943,8 @@ static int ext4_fread_body(ext4_file *file, void *buf, size_t size, size_t *rcnt
 		size_t length = run_count * block_size;
 		if (!fblock) {
 			memset(u8_buf, 0, length);
-		} else if (pure || file->mp->fs.curr_trans) {
+		} else if (pure || file->mp->fs.curr_trans ||
+			   (file->mp->fs.jbd_journal && file->mp->fs.jbd_journal->grouped)) {
 			r = ext4_read_pending_data(file->mp->fs.bdev, fblock,
 						   0, u8_buf, length);
 			if (r != EOK) goto Finish;
@@ -2829,7 +2975,8 @@ static int ext4_fread_body(ext4_file *file, void *buf, size_t size, size_t *rcnt
 			goto Finish;
 		if (!fblock) {
 			memset(u8_buf, 0, size);
-		} else if (pure || file->mp->fs.curr_trans) {
+		} else if (pure || file->mp->fs.curr_trans ||
+			   (file->mp->fs.jbd_journal && file->mp->fs.jbd_journal->grouped)) {
 			r = ext4_read_pending_data(file->mp->fs.bdev, fblock,
 						   0, u8_buf, size);
 			if (r != EOK) goto Finish;
@@ -2995,7 +3142,25 @@ Finish:
 		if (wcnt) *wcnt = 0;
 	}
 	ext4_file_completed(file, r);
+	if (r == EOK) file->data_sequence = file->sync_sequence;
 
+	EXT4_MP_UNLOCK(file->mp);
+	return r;
+}
+
+int ext4_fpwrite(ext4_file *file, uint64_t offset, const void *buffer, size_t size, size_t *written)
+{
+	if (!file || !file->mp || offset > file->fmax) return EINVAL;
+	EXT4_MP_LOCK(file->mp);
+	ext4_file local = *file;
+	local.fpos = offset;
+	int r = ext4_fwrite(&local, buffer, size, written);
+	if (r == EOK) {
+		file->fsize = local.fsize;
+		file->sync_tid = local.sync_tid;
+		if (file->sync_sequence < local.sync_sequence) file->sync_sequence = local.sync_sequence;
+		if (file->data_sequence < local.data_sequence) file->data_sequence = local.data_sequence;
+	}
 	EXT4_MP_UNLOCK(file->mp);
 	return r;
 }
@@ -3148,7 +3313,7 @@ int ext4_fraw_inode_fill(const ext4_file *file, struct ext4_inode *inode)
 	return r;
 }
 
-int ext4_file_sync_metadata(ext4_file *file)
+int ext4_file_sync_metadata_mode(ext4_file *file, bool data_only)
 {
 	struct ext4_inode_ref ref;
 	int r, cleanup;
@@ -3157,8 +3322,18 @@ int ext4_file_sync_metadata(ext4_file *file)
 	EXT4_MP_LOCK(file->mp);
 #if CONFIG_JOURNALING_ENABLE
 	if (file->mp->fs.jbd_journal) {
-		r = file->mp->transaction_depth ? EBUSY :
-		    jbd_journal_sync(file->mp->fs.jbd_journal, file->sync_tid);
+		struct jbd_journal *journal = file->mp->fs.jbd_journal;
+		r = file->mp->transaction_depth ? EBUSY : journal->error;
+		/* Namespace operations can dirty this inode through another handle.
+         * Full sync captures the current mount dependency once; newer work
+         * cannot advance its target while it sleeps. */
+        if (!data_only && journal->grouped) file->sync_sequence = journal->accepted_sequence;
+        uint64_t target = data_only ? file->data_sequence : file->sync_sequence;
+        if (r == EOK && journal->grouped && journal->durable_sequence < target) {
+			if (file->mp->journal_runtime.request) file->mp->journal_runtime.request(file->mp->journal_runtime.context);
+			if (file->mp->journal_runtime.wait) r = file->mp->journal_runtime.wait(file->mp->journal_runtime.context, target, false);
+			else { EXT4_MP_UNLOCK(file->mp); return ext4_journal_group_service(file->mp->name, true); }
+		} else if (r == EOK && !journal->grouped) r = jbd_journal_sync(journal, file->sync_tid);
 		EXT4_MP_UNLOCK(file->mp);
 		return r;
 	}
@@ -3172,6 +3347,9 @@ int ext4_file_sync_metadata(ext4_file *file)
 	EXT4_MP_UNLOCK(file->mp);
 	return r;
 }
+
+int ext4_file_sync_metadata(ext4_file *file)
+{ return ext4_file_sync_metadata_mode(file, false); }
 
 int ext4_inode_exist(const char *path, int type)
 {
@@ -4224,6 +4402,8 @@ int ext4_fopen_inode(ext4_file *file, const char *mount_point,
         file->flags = mp->fs.read_only ? O_RDONLY : O_RDWR;
         file->fpos = 0;
         file->sync_tid = mp->fs.jbd_journal ? mp->fs.jbd_journal->committed_id : 0;
+        file->sync_sequence = mp->fs.jbd_journal ? mp->fs.jbd_journal->accepted_sequence : 0;
+        file->data_sequence = file->sync_sequence;
         file->fsize = ext4_inode_get_size(&mp->fs.sb, ref.inode);
         file->fmax = ext4_inode_max_size(&mp->fs, ref.inode);
         result = ext4_fs_put_inode_ref(&ref);

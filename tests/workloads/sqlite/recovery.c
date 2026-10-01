@@ -151,6 +151,13 @@ int main(void)
     else if (phase == 'M' || phase == 'H' || phase == 'C' || phase == 'G') {
         if (phase == 'G') {
             char acknowledged;
+            /* Isolate the armed mutation from asynchronous preparation
+             * metadata (including loader and control-file access times). */
+            int directory = open("/", O_RDONLY | O_DIRECTORY);
+            if (directory < 0 || fsync(directory) || close(directory)) {
+                perror("pre-arm namespace sync");
+                return 1;
+            }
             puts("BoarOS: SQLite mutation armed");
             fflush(stdout);
             if (read(0, &acknowledged, 1) != 1 || acknowledged != 'g')

@@ -105,7 +105,7 @@ struct kernel_vfs_backend {
     int (*truncate)(struct kernel_vfs_node *node, uint64_t size, uint64_t *actual, int *changed);
     int (*close_node)(struct kernel_vfs_node *node);
     int (*writeback_allowed)(struct kernel_vfs_instance *instance);
-    int (*sync_metadata)(struct kernel_vfs_node *node);
+    int (*sync_metadata)(struct kernel_vfs_node *node, int data_only);
     int (*flush)(struct kernel_vfs_instance *instance);
     int (*symlink)(struct kernel_vfs_instance *instance, const char *target, const char *path);
     int (*mknod)(struct kernel_vfs_instance *instance, const char *path,

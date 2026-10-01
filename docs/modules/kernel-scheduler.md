@@ -13,7 +13,7 @@
 | `kernel/pid.c` | 统一身份对象、编号/代次、引用与 TID/TGID/PGID/SID 角色成员 |
 | `kernel/sched/proc.c` | 进程快照、对象路径与缺页/磁盘读取统计 |
 | `kernel/sched/exec.c` | 已准备映像的提交与旧资源清理 |
-| `kernel/sched/sync.c` | 任务 owner 的 mutex/RWlock、锁序与写者优先 |
+| `kernel/sched/sync.c` | 任务 owner 的 mutex/RWlock、锁序与 FIFO 资格交接 |
 | `kernel/sched/wait.c` | 全局 blocked 链、每队列 FIFO、超时和信号唤醒 |
 | `kernel/sched/futex.c` | 256 桶 WAIT/WAKE/REQUEUE、robust-list 退出清理、clear-child-tid 唤醒 |
 | `kernel/sched/signal.c` | 组/线程 pending、disposition、stop/continue 和重启 |
@@ -117,11 +117,13 @@ zombie 先逻辑回收再复制 status/rusage，因此坏输出指针的 EFAULT 
 
 ## 存储等待与清理任务
 
-`kernel/sync.h` 的 mutex/RWlock guard 记录任务 io_context owner 与锁序，非法释放、递归误用、逆序及读转写触发 fatal；写者排队阻止新读者进入。只有队列/引用/状态发布使用短关中断区，持锁跨设备等待允许其他任务运行。分配器回收深度及 lwext4 重入深度属于任务上下文。
+`kernel/sync.h` 的 mutex/RWlock guard 记录任务 io_context owner 与锁序，非法释放、递归误用、逆序及读转写触发 fatal。争用者按 FIFO 排队；释放时先给队首写者预留独占资格，或给连续队首读者预留共享资格，再定向唤醒。预留者尚未运行时也阻止新到任务抢占；排队写者后的读者及 try_read 不能越过队列。等待不可中断，信号退出在取得与释放后处理，栈上的等待记录不被提前销毁。只有队列/引用/状态发布使用短关中断区，持锁跨设备等待允许其他任务运行。分配器回收深度及 lwext4 重入深度属于任务上下文。
+
+公共 trap 返回在 S-mode 仅允许空闲任务、且未持 I/O 锁时消费 need_resched，防止外部 IRQ 在开中断与 WFI 之间已处理却继续入睡。普通持锁内核路径仍不增加任意抢占。`test-scheduler-cases-riscv` 不借助 timer 验证 idle 返回调度，并验证读写 FIFO、后到者不抢锁及 1/8/32 等待者；原实现分别出现一次 idle 失败和两次交接顺序失败。成本锁持有时间包含资格已交接但获得者尚未运行的区间。
 
 存储等待以 `interruptible=0` 登记：pending 信号与组退出不能拆除 DMA owner；设备完成或 reset 后原调用栈先释放资源，再在用户返回边界处理退出。指定的 cleanup task 排空已退出任务和 root-boot 收尾，阻塞时正常调度；idle/IRQ 不进入运行期可睡眠存储。无块设备的纯模块 fixture 可继续由 idle 回收不含存储的任务。清理结束检查任务锁/backend 状态均为空。
 
-`make test-scheduler-riscv test-io-sleep-riscv test-userland-riscv` 分别保护写者优先、设备等待/唤醒与真实任务组合行为。
+`make test-scheduler-cases-riscv test-scheduler-riscv test-io-sleep-riscv test-userland-riscv` 保护 FIFO 资格交接、设备等待/唤醒与真实任务组合行为。
 
 `make test-diff-abi-riscv` 的 `tid.*` 使用同一 ELF 对照固定 Linux，覆盖私有 fork、共享页但独立 MM、vfork 退出/成功与失败 exec、坏地址/只读地址、线程 futex 等待。成功 exec 与退出共用旧 MM 的注销和清 TID 顺序；延迟资源清理不增加活跃使用者数。
 

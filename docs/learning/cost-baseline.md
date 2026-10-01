@@ -458,3 +458,24 @@ python3 -B tests/oscomp/run.py
 PID1配置运行、本轮scratch及栈重建目录）。再次预览候选为零；保留cost/用户程序/固定Linux缓存，
 返回main恢复默认构建。原22个judge及身份在兼容分支Git证据中，成本归档两分支共有；
 被清理的build路径不再作为永久证据。未push、发布、比赛提交或转换阶段。
+
+### 机制优化起点：idle 返回与锁资格（2026-10-01）
+
+第三方数据已从归档复核：musl replica=2 自动窗口484.5162806s，rank40持有478.5804835s、获取等待0.0764495s；
+四进程(0,1)窗口180.9422461s，rank40等待420.4252937s，23579次阻塞/23189次重阻塞。
+这是跨任务累计，不能与窗口相加；单写者主要是锁内慢路径，多写者另有反复唤醒竞争。
+
+实际 scheduler fixture 新增 S-mode idle 安全返回及后到者抢锁测试，不依赖timer；旧实现分别报1/2个失败。
+公共 trap 返回现仅对未持I/O锁的idle立即消费need_resched；RWlock按FIFO先预留队首写者或连续读者资格再定向唤醒。
+1/8/32等待者、混合读写、资源基线以及原timer-only轮转通过：
+`make -j4 test-scheduler-cases-riscv test-scheduler-riscv`。
+依据沿用references/linux固定f4cdf7ca9a1fdcca413157df19753f388a5a224e和本地RISC-V特权规范20260120；
+本项不改变普通持锁S-mode的抢占策略，尚未测定原消费者性能收益。
+
+事务引擎的第一组机制证据（2026-10-01）：`make test-lwext4-group-host` 在 1 KiB 与 4 KiB journal 文件系统通过。32 次同 inode 时间更新在封口前没有设备写入，期限到达后形成 1 次 journal commit；4 KiB 情形该批为 5 次设备写入、4 次 flush。额外版本交错测试在本批第一次设备写入时加入新时间和新数据，验证本批磁盘仍得到旧版本，内存立即读到新版本，下一批才持久化新版本。提交阶段的下一次分配被强制失败仍能完成：日志映射预先固定，避免 `ext4_find_extent` 在封口后分配。各 private 预留点 OOM 不撤销前一已接受操作；每个设备 WRITE/FLUSH 错误保留 journal 的失败 owner，重启只得到完整旧或新 metadata。此处是机制证据，未替代 iozone 吞吐验收。
+
+运行时接入（2026-10-01）：真实 RV64 128 页组提交、期限、同步、truncate、unlink-but-open 和卸载通过。SQLite DELETE 静态/动态 CLI 以及 WAL 多进程与固定 Linux/BoarOS 重启通过。另一个真实设备 IRQ 用例不启动 timer，先等到设备中断挂起再开启 SIE：正常 idle 返回钩子即时运行等待者；同 ELF 源码仅通过 linker wrap 禁用该公共钩子的因果对照在完成到运行检查点失败。它确认可达调度缺口，仍未给出 iozone 收益大小。RV64 还发现 orphan_file slot 更新直接取块缺少事务 undo/version，已改为修改前事务取块；相关恢复验收将随最终候选补齐。新增观测只区分实际 ordered-data/journal/checkpoint/journal-SB 请求和组提交，来源不明的设备字节继续为 unknown；复用 operation 字节的高位，无新增任务诊断存储。
+
+消费者执行器支持 `--consumer-commands musl:0,musl:1,glibc:0,glibc:1`，仅运行自动模式和四进程 `(0,1)`，结果明确标为 targeted attribution；省略该参数仍执行两种 libc 的全部八组原参数。原程序 argv/ELF 不变。包装器保存逐命令 `program_ns` 与 `drain_ns`：前者至 wait 返回，后者包含工作目录中现存普通文件与目录的 fsync，诊断窗口包含这两段。卸载或删除对象的排空可能已包含在程序段中，不能把 drain 单独等同于全部持久化成本。历史封存记录没有拆分字段，仍保留原口径，不改写历史数据。
+
+运行时门禁（2026-10-01）：lwext4 的 metadata/数据与 orphan 完整断电恢复矩阵通过；SQLite DELETE 的 97 事件（70 WRITE/27 FLUSH）与 WAL 的 35 事件（25 WRITE/10 FLUSH），分别遍历 none/odd/reverse 全切点及各 WRITE/FLUSH 错误，恢复两次并 e2fsck。故障注入前增加准备事务排空，修正原探针 110/实际 97 的切点漂移，未删屏障。双盘 held-B/live-A、B WRITE/FLUSH sticky error 和冷启动内容，以及第二盘 SQLite WAL 通过。完整 RV64、真实 musl 与 glibc 2.44、1091 ABI、scale、四组合 io-sleep、1706 函数栈检查通过；短写注入迁移到实际 fpwrite 入口后通过。末次低空间进展修正再跑受影响 group host/RV64，旧代码因果对照失败，新代码及 fsck 通过。

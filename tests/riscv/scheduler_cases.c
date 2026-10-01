@@ -23,7 +23,8 @@ extern unsigned char __boot_stack_top[];
 /* One buddy metadata page plus enough alignment slack for two tasks. */
 #define TEST_PAGE_COUNT (2U + TEST_THREAD_COUNT * TEST_TASK_PAGES)
 
-static unsigned char page_pool[BOAROS_PAGE_SIZE * (TEST_PAGE_COUNT + 2U * TEST_TASK_PAGES)]
+/* Later concurrency cases use a fresh allocator with room for 32 waiters. */
+static unsigned char page_pool[BOAROS_PAGE_SIZE * (TEST_PAGE_COUNT + 36U * TEST_TASK_PAGES)]
     __attribute__((aligned(BOAROS_PAGE_SIZE)));
 static unsigned long access_calls_before_failure;
 static unsigned long fail_access_count;
@@ -966,6 +967,98 @@ static unsigned run_sync_cases(struct physical_page_allocator *allocator)
            (physical_page_available(allocator) != available);
 }
 
+static unsigned irq_return_runs;
+static void irq_return_worker(void *argument)
+{
+    (void)argument;
+    irq_return_runs++;
+}
+static unsigned run_idle_irq_return_case(struct physical_page_allocator *allocator)
+{
+    uint64_t available = physical_page_available(allocator);
+    struct kernel_thread_completion completion;
+    struct riscv_trap_frame frame = {.sstatus = RISCV_SSTATUS_SPP};
+    if (kernel_thread_create(irq_return_worker, 0) != KERNEL_SCHEDULER_STATUS_OK)
+        return 1;
+    /* 模拟 IRQ 已将任务置 ready、尚未执行 idle 的 WFI；不借助 tick。 */
+    riscv_trap_return_prepare(&frame);
+    unsigned failure = irq_return_runs != 1;
+    if (failure) (void)kernel_scheduler_yield_current();
+    if (kernel_scheduler_reap_one(&completion) != KERNEL_SCHEDULER_STATUS_OK)
+        failure++;
+    virt_uart_puts("BoarOS: idle IRQ return failures=");
+    virt_uart_put_hex(failure);
+    virt_uart_putc('\n');
+    return failure + (physical_page_available(allocator) != available);
+}
+
+static unsigned handoff_order;
+static unsigned handoff_count, handoff_events[33];
+static void handoff_waiter(void *argument)
+{
+    uintptr_t value = (uintptr_t)argument;
+    struct kernel_lock_guard guard = {0};
+    if (value & 0x100) kernel_rwlock_write(&io_lock, &guard);
+    else kernel_rwlock_read(&io_lock, &guard);
+    handoff_order = handoff_order * 10 + (value & 0xff);
+    if (handoff_count < 33) handoff_events[handoff_count++] = value & 0xff;
+    kernel_lock_release(&guard);
+}
+static unsigned run_handoff_cases(struct physical_page_allocator *allocator)
+{
+    uint64_t available = physical_page_available(allocator);
+    struct kernel_thread_completion completion;
+    unsigned failures = 0;
+    for (unsigned mixed = 0; mixed < 2; mixed++) {
+        struct kernel_lock_guard held = {0};
+        kernel_rwlock_init(&io_lock, 1, 0);
+        handoff_order = 0;
+        handoff_count = 0;
+        kernel_rwlock_write(&io_lock, &held);
+        if (kernel_thread_create(handoff_waiter, (void *)(uintptr_t)(mixed ? 1 : 0x101)) != KERNEL_SCHEDULER_STATUS_OK ||
+            kernel_thread_create(handoff_waiter, (void *)0x102) != KERNEL_SCHEDULER_STATUS_OK ||
+            kernel_scheduler_yield_current() != KERNEL_SCHEDULER_STATUS_OK)
+            return 1;
+        /* 后到任务已 ready；释放锁必须预留资格，不能让它抢走旧等待者的锁。 */
+        if (kernel_thread_create(handoff_waiter, (void *)(uintptr_t)(mixed ? 3 : 0x103)) != KERNEL_SCHEDULER_STATUS_OK)
+            return 1;
+        kernel_lock_release(&held);
+        for (unsigned i = 0; i < 3; i++) {
+            if (kernel_scheduler_yield_current() != KERNEL_SCHEDULER_STATUS_OK)
+                failures++;
+            if (kernel_scheduler_reap_one(&completion) != KERNEL_SCHEDULER_STATUS_OK)
+                failures++;
+        }
+        if (handoff_order != 123) failures++;
+    }
+    const unsigned populations[] = {1, 8, 32};
+    for (unsigned p = 0; p < 3; p++) {
+        unsigned count = populations[p];
+        struct kernel_lock_guard held = {0};
+        kernel_rwlock_init(&io_lock, 1, 0);
+        handoff_count = 0;
+        kernel_rwlock_write(&io_lock, &held);
+        for (unsigned i = 1; i <= count; i++)
+            if (kernel_thread_create(handoff_waiter, (void *)(uintptr_t)(0x100 | i)) != KERNEL_SCHEDULER_STATUS_OK)
+                return 1;
+        if (kernel_scheduler_yield_current() != KERNEL_SCHEDULER_STATUS_OK ||
+            kernel_thread_create(handoff_waiter, (void *)(uintptr_t)(0x100 | (count + 1))) != KERNEL_SCHEDULER_STATUS_OK)
+            return 1;
+        kernel_lock_release(&held);
+        for (unsigned i = 0; i <= count; i++) {
+            if (kernel_scheduler_yield_current() != KERNEL_SCHEDULER_STATUS_OK ||
+                kernel_scheduler_reap_one(&completion) != KERNEL_SCHEDULER_STATUS_OK)
+                failures++;
+            if (handoff_events[i] != i + 1) failures++;
+        }
+        if (handoff_count != count + 1) failures++;
+    }
+    virt_uart_puts("BoarOS: lock handoff failures=");
+    virt_uart_put_hex(failures);
+    virt_uart_putc('\n');
+    return failures + (physical_page_available(allocator) != available);
+}
+
 void kernel_main(unsigned long hart_id, const void *dtb)
 {
     struct boot_memory_layout layout;
@@ -1005,6 +1098,8 @@ void kernel_main(unsigned long hart_id, const void *dtb)
     failures += run_fpu_cases();
     failures += run_stack_contract_cases(&allocator);
     failures += run_sync_cases(&allocator);
+    failures += run_idle_irq_return_case(&allocator);
+    failures += run_handoff_cases(&allocator);
 
     virt_uart_puts("BoarOS: scheduler cases failures=");
     virt_uart_put_hex(failures);

@@ -15,6 +15,9 @@ struct lwext4_mount_adapter {
     struct kernel_block_device *block;
     struct kernel_rwlock backend_lock;
     struct ext4_lock locks;
+    struct kernel_thread_join journal_worker;
+    struct kernel_wait_queue journal_work, journal_progress;
+    uint8_t journal_started, journal_requested, journal_force, journal_stopping;
     char device_name[24];
     char mount_point[28];
     struct lwext4_mount_adapter *next_adapter;

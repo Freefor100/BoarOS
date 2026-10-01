@@ -184,6 +184,7 @@ int kernel_vfs_mount_root(struct kernel_vfs_mount *mount,
                           struct kernel_page_cache *page_cache);
 
 int kernel_vfs_unmount(struct kernel_vfs_mount *mount);
+int kernel_vfs_start_journal_worker(struct kernel_vfs_mount *mount);
 
 int kernel_vfs_mount_is_readonly(const struct kernel_vfs_mount *mount);
 int kernel_vfs_mount_statfs(struct kernel_vfs_mount *mount,

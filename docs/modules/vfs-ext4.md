@@ -69,9 +69,9 @@ VFS 以文件系统实例与后端 inode 标识为活节点身份，普通文件
 
 miss 路径先分配并清零页，再通过 node 的无 offset 副作用 `pread` 填充，有效字节数按 node 的逻辑大小计算，尚未写回的稀疏扩展区从清零页读取。读取整个越过 EOF 的页返回 `OUT_OF_RANGE`，尾页剩余字节保持为零。物理页分配器的压力入口由多缓存共同 owner 注册，按实例轮转；分配首次耗尽时从 LRU 尾部仅回收引用数为 1 的未固定干净页，安全的普通任务可等待后台一轮后重试一次。映射/请求固定页不驱逐；lwext4、堆与 IRQ 不等待后台写回，防止重入共享 handle、后端锁和 bcache 分配。阈值 worker 的生命周期见下文。
 
-缓存销毁和 mount 卸载有严格顺序：先释放所有进程 MM 和临时读者，停止并 join worker，再写回并 purge 该 mount 的缓存项、关闭最后的 node，之后才允许 lwext4 unmount 与设备 flush；缓存最后注销 reclaimer 并释放哈希表。物理页和堆对象的合法释放完成即返回，分配器不变量错误进入 fatal；只有真实 ext4/block I/O 清理错误保留 mount owner。
+缓存销毁和 mount 卸载有严格顺序：先释放所有进程 MM 和临时读者，停止并 join 页缓存 worker，再写回并 purge 该 mount 的缓存项、关闭最后的 node；日志 worker 继续服务这些交接，排空到 checkpoint 后才停止并 join，之后允许 lwext4 unmount 与设备 flush；缓存最后注销 reclaimer 并释放哈希表。物理页和堆对象的合法释放完成即返回，分配器不变量错误进入 fatal；只有真实 ext4/block I/O 清理错误保留 mount owner。
 
-`kernel_vfs_sync()` 只主动提交目标 inode 的脏页和必要元数据事务，再执行块设备 flush；不会用 `ext4_cache_flush("/")` 排空无关文件数据。独立 open 各持错误观察位置，dup/fork 共用 OFD 的位置。`fsync/fdatasync` 支持普通文件与目录；当前 metadata 在修改时提交，handle 记录已提交事务号，两者均等待完整 inode 元数据依赖。共享事务可能连带提交其他元数据。`O_SYNC/O_DSYNC` 对已接受的写入前缀执行相同同步，失败返回 errno，但已接受字节与 offset 保留。journal 的关键写入、checkpoint 或屏障失败使 mount 持续拒绝修改和同步；OFD 错误游标不能清除该错误。
+`kernel_vfs_sync()` 先交接目标 inode 脏页，再捕获 full/data 目标序号并等待提交完成；journal 路径已包含持久化屏障，不额外发无意义的设备 flush。无 journal 路径仍显式 flush。独立 open 各持错误观察位置，dup/fork 共用 OFD 的位置。`fsync/fdatasync` 支持普通文件与目录；共享 inode 的后端 handle 记录完整和数据序号。full 同步为涵盖经其他 handle 的 namespace 修改，保守地捕获当前 mount 序号一次；data 同步等待数据/检索依赖序号，纯时间修改不推进它。同组时间字段可以顺带持久化；新修改不会无限延长已有等待目标。`O_SYNC/O_DSYNC` 分别对已接受的写入前缀执行 full/data 同步，失败返回 errno，但已接受字节与 offset 保留。journal 的关键写入、checkpoint 或屏障失败使 mount 持续拒绝修改和同步；OFD 错误游标不能清除该错误。
 
 ## lwext4 配置和生命周期
 
@@ -79,13 +79,17 @@ miss 路径先分配并清零页，再通过 node 的无 offset 副作用 `pread
 
 事务接口 `ext4_transaction_begin/end/abort` 支持同一 mount 的嵌套修改；外层提交前保留 metadata 和数据缓冲的 before-image 与引用。明确发生在日志提交前的 OOM、空间不足或关联数据 I/O 失败可回滚内存并重试；已可能影响日志持久状态的错误由 mount 保留，不能清除后继续。外层 abort 后，调用者须重新打开在内层修改过的 lwext4 handle；VFS 的普通操作各自完成事务，不持有跨 syscall 的开放事务。
 
+`ext4_journal_group_enable/service/drain` 由可写 journal mount 的独立 joinable 线程驱动；根启动与动态磁盘挂载启动该线程，宿主 fixture 显式推进同一引擎。操作仍各自持有 before-image，成功后合入挂载点 running transaction；同块修改合并，后一次失败只回滚自身。封口把 metadata 和 ordered data 复制到预留的不可变版本，提交准备使用预留日志缓冲和挂载期固定映射；设备提交和 checkpoint 不再读取可变 bcache。未提交 owner 通过 `journal_pending` 禁止隐式 home writeback，块与 inode 的释放范围保留到 checkpoint 屏障和日志起点更新完成，分配器跳过这些范围。首脏 100 ms、64 次成功操作或 256 KiB 镜像是封口条件，事务分配按堆容量向上取整计费，独立版本另保守计入固定的 home buffer，固定日志映射也纳入挂载点预算；运行时上限为 min(4MiB, RAM/32)。当前保守地在每批提交后完成 checkpoint，再发布 durable/checkpoint 序号；同步返回具有完整持久化保证，RV64 的 IRQ I/O、期限封口、同步和卸载已通过窄验证；lwext4、SQLite DELETE/WAL 完整恢复与双盘隔离已通过，消费者收益仍待验收。
+
+`make test-lwext4-group-host` 使用实际引擎与独立设备计数，覆盖 32 次时间修改合成一批、嵌套 abort、后操作各预留点 OOM、提交期间同块新修改、冻结后禁止新分配、1/4 KiB 文件系统的 WRITE/FLUSH 失败与重启恢复。默认同步路径的 metadata/几何/错误原子性回归继续由 `make test-lwext4-metadata-host` 保护。
+
 每次提交先预留全部日志空间、映射与缓冲，再依次完成关联文件数据及 flush、日志内容及 flush、commit 记录及 flush。预留失败不写当前事务的数据；预留缓冲由事务持有至提交或回滚，内存成本随本次 metadata 日志大小增长。checkpoint 把已提交内容写回原位置并 flush，再持久化日志起点，最后释放日志空间和缓冲 owner。数据不写入 metadata 日志。主 superblock 的分配计数、恢复位和校验和也属于事务；挂载/卸载不在日志之外直接覆盖它。512 字节原子扇区模型下若 superblock 校验失败，只允许根据合法几何信息进入受限恢复，必须重放有效 superblock 日志后才能访问文件。
 
 `ext4_orphan.c` 支持传统 `last_orphan/i_dtime` 链和 `orphan_file`，校验范围、重复记录、循环、分配状态和 checksum。unlink 将最后一个链接摘除与持久 orphan 记录放在同一事务；缩小文件先提交最终 size 与 orphan，再由 `ext4_truncate.c` 每事务最多释放 32 个尾部数据块及已空的索引路径。恢复根据实际映射找到尾部，支持稀疏 extent 和三级间接块，不依赖已缩小的 size 推测待回收块。最后删除 orphan 记录与释放无链接 inode 同事务完成，重复恢复可继续前次进度。仍被打开的无链接 inode 在正常运行期间保留，重启才回收。
 
 支持有界的 JBD2 checksum v2/v3、32/64-bit revoke；异步 commit、未知必需特性和旧 CRC32 journal 格式明确拒绝。已提交事务的损坏不能当作未提交尾部丢弃。只读脏日志、恢复 I/O 错误或损坏均拒绝开放用户访问。失败的日志/挂载 owner 保留到重启；普通合法内存释放不建立重试链。挂载准备阶段的 ENOMEM/ENOSPC 与关键 I/O 错误分开：资源不足保留可恢复的准备状态，后续 cleanup 可继续恢复并卸载，不能永久锁住 heap binding。
 已有路径先逐分量取得目录项和 inode 身份，再用 `ext4_fopen_inode` 按 inode 打开普通文件、目录或字符节点；新建仍由 `ext4_fopen2` 提交。目录 handle 不在内核任务栈上分配完整 `ext4_dir` 结构。
-普通文件随机写入与追加先进入页缓存；append 以共享 node 的逻辑 EOF 为起点并推进实际接收字节。定向写回通过 `ext4_fseek` + `ext4_fwrite` 提交脏范围。lwext4 的 `SEEK_SET` 允许定位到 EOF 后，磁盘逻辑块只在写回时按数据范围分配；新分配的部分块先清零，旧 EOF 块尾清零，完整中间 hole 保持未映射。底层部分写失败不缩小缓存已经接收的逻辑长度，整段脏范围由页缓存保留供重试。`st_blocks` 报实际已分配存储，不由逻辑大小猜测；检查磁盘块生命周期的测试需先同步。
+普通文件随机写入与追加先进入页缓存；append 以共享 node 的逻辑 EOF 为起点并推进实际接收字节。定向写回通过 `ext4_fpwrite` 的独立局部位置提交脏范围，等待事务预算时不会被其他任务改变共享 handle 的 offset。lwext4 的 `SEEK_SET` 允许定位到 EOF 后，磁盘逻辑块只在写回时按数据范围分配；新分配的部分块先清零，旧 EOF 块尾清零，完整中间 hole 保持未映射。底层部分写失败不缩小缓存已经接收的逻辑长度，整段脏范围由页缓存保留供重试。`st_blocks` 报实际已分配存储，不由逻辑大小猜测；检查磁盘块生命周期的测试需先同步。
 
 截断统一通过 sparse-capable `ext4_ftruncate` 执行：缩小仍释放尾部块，扩大只清零已分配的旧 EOF 块尾并发布新 inode size，不为完整逻辑 gap 分配块，且不改变调用 OFD offset。文件打开时按实际 inode mapping 缓存可寻址 size 上限：extent inode 使用 `EXT_MAX_BLOCKS * block_size`；legacy block-map inode 取指针树容量、`EXT_MAX_BLOCKS` 个可安全计数的逻辑块和 inode `i_blocks` 容量（包含间接块开销）的最小值，再乘以 `block_size`。因此 legacy 最后可用逻辑块也是 `0xfffffffe`：即使 8 KiB 三级间接树容量超过 2^32，也不会让 `ext4_lblk_t` 在 2^45 字节处回绕到块 0。truncate/write 超界返回 `EFBIG`，seek 超界返回 `EINVAL`，在任何尾部清零、64-bit offset 缩窄为 `ext4_lblk_t` 或 inode size 更新前拒绝。lwext4 在写入或截断所有可能改变状态的返回路径上，让 handle 的 `fsize` 保持为当前 inode 中可知的最新 size。
 
@@ -122,8 +126,8 @@ cookie 可以交给 `lseek`/`telldir`/`seekdir` 恢复。OFD 持有位置，所�
 再写页缓存；页级 staging 已减少分块和用户页解析次数，并非零复制。
 `kernel_page_cache_writeback_range()` 遍历 inode 的缓存页链两次，分配并 pin
 本次脏页集合后顺序写回；索引改善驻留查找，不等于已有范围脏页索引或批量提交。
-`kernel_vfs_sync_range()` 依次执行数据写回、sync_metadata、flush；当前
-`kernel_vfs_sync()` 未区分 datasync，fsync/fdatasync 共用这条保守路径。
+`kernel_vfs_sync_range()` 依次交接数据、等待 full 同步序号；
+`kernel_vfs_sync()` 按 datasync 选择 full/data，journal 提交线程负责屏障。
 元数据随修改提交，频繁小写与逐次同步的事务/flush 放大尚需单独计量。
 
 | 串行边界 | 当前必要契约与限制 |
@@ -237,3 +241,9 @@ proc mounts 保留用户给出的磁盘来源名，并正确标识 tmpfs。
 4KiB热覆盖及组合操作；核对时间戳、读回内容及fsck。它测量后端请求数量，
 不经过VFS页缓存，不包含QEMU设备延迟，也不证明原iozone的CPU或总耗时占比。
 当前成本及可重建配置见[成本基线](../learning/cost-baseline.md)。
+
+`make test-journal-group-riscv` 在实际 IRQ 块 I/O 下验证 128 页内容、预算、100ms 期限、full/data 同步、truncate、unlink-but-open、最终卸载；观测构建亦检查后台来源明确的数据请求。`make test-journal-idle-negative-riscv` 禁用公共 idle 返回钩子，验证无 timer 的同一设备 IRQ 无法在 enable-to-wfi 返回边界运行等待者；正常构建该边界通过。`orphan_file` 的 slot 更新必须通过 `ext4_trans_block_get` 在修改前保留 undo/version，不能直接 get 后补记 dirty。
+
+异步准备事务会改变故障执行器握手后的 I/O 前缀，SQLite 恢复 fixture 在 `mutation armed` 前同步根目录，排空 loader/control/SQLite 准备元数据，再开始本次数据库变更的故障计数。页缓存短写/重脏注入拦截实际 `ext4_fpwrite` 入口，避免链接器无法拦截同 translation unit 的内部调用。
+
+接近满盘时，若释放位图中的空闲块/inode 仍归运行或提交事务的 checkpoint 所有，下一操作先释放后端锁等待已接受序号，而不是返回暂时性的 ENOSPC。近满盘宿主 fixture 在回收 checkpoint I/O 中尝试另一文件扩展，旧实现未走等待边界，修正后明确等待、checkpoint 后重试成功，随后 e2fsck 正确；正常 RV64 组提交/回收亦通过。

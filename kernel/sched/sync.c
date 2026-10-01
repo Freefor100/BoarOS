@@ -3,6 +3,14 @@
 #include "private.h"
 
 static struct kernel_io_context bootstrap_io;
+struct kernel_lock_waiter {
+    struct kernel_lock_waiter *next;
+    struct kernel_io_context *owner;
+    unsigned write, granted;
+#if BOAROS_COST_DIAGNOSTICS
+    uint64_t grant_ticks;
+#endif
+};
 struct kernel_io_context *kernel_io_context_current(void)
 {
     struct kernel_task *task = kernel_task_current();
@@ -30,17 +38,34 @@ static int acquire(struct kernel_rwlock *lock, struct kernel_lock_guard *guard, 
     unsigned rank = kernel_cost_rank(lock->rank);
     enum kernel_cost_metric metric = (enum kernel_cost_metric)(COST_LOCK10_ATTEMPTS + rank*8);
     uint64_t wait_start = kernel_cost_clock();
+    uint64_t hold_start = wait_start;
     kernel_cost_add(metric,1);
 #endif
-    if (try_only && (lock->writer || lock->writers_waiting)) {
+    if (try_only && (lock->writer || lock->pending_head)) {
         riscv_interrupt_restore(irq);
         return 0;
     }
-    if (write) {
-        if (lock->writers_waiting == UINT32_MAX) __builtin_trap();
-        lock->writers_waiting++;
+    struct kernel_lock_waiter waiter = {.owner = owner, .write = write};
+    if (lock->writer || lock->pending_head || (write && lock->readers)) {
+        if (lock->pending_tail) lock->pending_tail->next = &waiter;
+        else lock->pending_head = &waiter;
+        lock->pending_tail = &waiter;
+        if (write) {
+            if (lock->writers_waiting == UINT32_MAX) __builtin_trap();
+            lock->writers_waiting++;
+        }
+    } else {
+        waiter.granted = 1;
+        if (write) lock->writer = owner;
+        else {
+            if (lock->readers == UINT32_MAX) __builtin_trap();
+            lock->readers++;
+        }
+#if BOAROS_COST_DIAGNOSTICS
+        waiter.grant_ticks = hold_start;
+#endif
     }
-    while (lock->writer || (write ? lock->readers != 0 : lock->writers_waiting != 0)) {
+    while (!waiter.granted) {
         enum kernel_wait_wake_reason reason;
 #if BOAROS_COST_DIAGNOSTICS
         struct kernel_cost_task *task = kernel_cost_current();
@@ -53,13 +78,6 @@ static int acquire(struct kernel_rwlock *lock, struct kernel_lock_guard *guard, 
         if (kernel_scheduler_block_current(&lock->waiters, 0, 0, &reason) !=
             KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
     }
-    if (write) {
-        lock->writers_waiting--;
-        lock->writer = owner;
-    } else {
-        if (lock->readers == UINT32_MAX) __builtin_trap();
-        lock->readers++;
-    }
     *guard = (struct kernel_lock_guard){lock, owner, owner->locks, write
 #if BOAROS_COST_DIAGNOSTICS
         ,0,0
@@ -71,7 +89,7 @@ static int acquire(struct kernel_rwlock *lock, struct kernel_lock_guard *guard, 
     kernel_cost_add((enum kernel_cost_metric)(metric+1),1);
     kernel_cost_sample((enum kernel_cost_metric)(metric+5),kernel_cost_clock()-wait_start);
     struct kernel_cost_scope hold = kernel_cost_enter((enum kernel_cost_metric)(metric+6));
-    guard->cost_start = hold.start; guard->cost_registered = hold.actor != 0;
+    guard->cost_start = waiter.grant_ticks; guard->cost_registered = hold.actor != 0;
 #endif
     owner->locks = guard;
     riscv_interrupt_restore(irq);
@@ -106,8 +124,29 @@ void kernel_lock_release(struct kernel_lock_guard *guard)
 #endif
     owner->locks = guard->previous;
     *guard = (struct kernel_lock_guard){0};
-    if (!lock->readers && lock->waiters.head && kernel_wait_queue_wake_all(&lock->waiters) !=
-        KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
+    if (!lock->writer && !lock->readers) {
+        while (lock->pending_head) {
+            struct kernel_lock_waiter *next = lock->pending_head;
+            lock->pending_head = next->next;
+            if (!lock->pending_head) lock->pending_tail = 0;
+            /* 先交接资格再唤醒；尚未运行的获得者也阻止新任务抢锁。 */
+            if (next->write) {
+                if (!lock->writers_waiting) __builtin_trap();
+                lock->writers_waiting--;
+                lock->writer = next->owner;
+            } else {
+                if (lock->readers == UINT32_MAX) __builtin_trap();
+                lock->readers++;
+            }
+            next->granted = 1;
+#if BOAROS_COST_DIAGNOSTICS
+            next->grant_ticks = kernel_cost_clock();
+#endif
+            if (!lock->waiters.head || kernel_wait_queue_wake_one(&lock->waiters) !=
+                KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
+            if (next->write || (lock->pending_head && lock->pending_head->write)) break;
+        }
+    }
     riscv_interrupt_restore(irq);
 }
 

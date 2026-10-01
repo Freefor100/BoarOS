@@ -602,6 +602,24 @@ test-lwext4-metadata-host:
 test-lwext4-cost-host:
 	sh tests/lwext4-cost-host.sh
 
+.PHONY: test-lwext4-group-host
+test-lwext4-group-host:
+	sh tests/lwext4-group-host.sh
+
+JOURNAL_GROUP_KERNEL := $(BUILD_DIR)/tests/kernel-journal-group-rv
+$(BUILD_DIR)/tests/riscv/journal_group_main.o: CPPFLAGS += -Ifs/lwext4_config -Ithird_party/lwext4/include -DCONFIG_USE_DEFAULT_CFG=0
+-include $(BUILD_DIR)/tests/riscv/journal_group_main.d
+$(JOURNAL_GROUP_KERNEL): $(TEST_RUNTIME_OBJECTS) $(BUILD_DIR)/kernel/dtb.o $(BUILD_DIR)/tests/riscv/journal_group_main.o arch/riscv/linker.ld
+	$(CC) $(LDFLAGS) -o $@ $(TEST_RUNTIME_OBJECTS) $(BUILD_DIR)/kernel/dtb.o $(BUILD_DIR)/tests/riscv/journal_group_main.o
+.PHONY: test-journal-group-riscv
+test-journal-group-riscv: $(JOURNAL_GROUP_KERNEL)
+	python3 -B tests/journal-group-riscv.py --kernel $< --qemu $(QEMU_RISCV64)
+$(BUILD_DIR)/tests/kernel-journal-idle-negative-rv: $(TEST_RUNTIME_OBJECTS) $(BUILD_DIR)/kernel/dtb.o $(BUILD_DIR)/tests/riscv/journal_group_main.o arch/riscv/linker.ld
+	$(CC) $(LDFLAGS) -Wl,--wrap=kernel_scheduler_prepare_idle_return -o $@ $(TEST_RUNTIME_OBJECTS) $(BUILD_DIR)/kernel/dtb.o $(BUILD_DIR)/tests/riscv/journal_group_main.o
+.PHONY: test-journal-idle-negative-riscv
+test-journal-idle-negative-riscv: $(BUILD_DIR)/tests/kernel-journal-idle-negative-rv
+	python3 -B tests/journal-group-riscv.py --kernel $< --qemu $(QEMU_RISCV64) --expect-idle-failure
+
 # Real volatile-storage power cuts, separate from normal QEMU shutdown tests.
 test-lwext4-recovery-host:
 	sh tests/lwext4-journal-host.sh
@@ -737,7 +755,7 @@ $(FILES_PARTIAL_WRITE_TEST_KERNEL_RV): \
 		-Wl,--wrap=kernel_heap_allocate_zeroed \
 		-Wl,--wrap=physical_page_allocate \
 		-Wl,--wrap=riscv_sv39_current_satp \
-		-Wl,--wrap=ext4_fwrite \
+		-Wl,--wrap=ext4_fpwrite \
 		-Wl,--wrap=ext4_ftruncate \
 		-Wl,-Map,$(BUILD_DIR)/tests/kernel-files-partial-write-rv.map \
 		-o $@ $(FILES_PARTIAL_WRITE_TEST_OBJECTS)

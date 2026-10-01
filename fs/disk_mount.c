@@ -92,6 +92,7 @@ int kernel_vfs_disk_create(struct kernel_heap *heap, uint64_t device_number,
     /* 后端失败可能仍持有日志和 I/O；发布到清理注册表而非丢失真实 owner。 */
     disk->mount.release_owner = release_disk;
     if (!result) result = kernel_page_cache_start_worker(&disk->cache);
+    if (!result) result = kernel_vfs_start_journal_worker(&disk->mount);
     if (result) {
         if (disk->mount.private_data) {
             int cleanup = kernel_vfs_unmount(&disk->mount);

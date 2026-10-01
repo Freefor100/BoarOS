@@ -179,7 +179,7 @@ enum kernel_open_file_status __real_kernel_open_file_release(
     struct kernel_open_file_description **owner);
 uint64_t __real_riscv_sv39_current_satp(void);
 #ifdef FILES_PARTIAL_WRITE_TEST
-int __real_ext4_fwrite(ext4_file *file,
+int __real_ext4_fpwrite(ext4_file *file, uint64_t offset,
                        const void *buffer,
                        size_t size,
                        size_t *bytes_written);
@@ -202,7 +202,7 @@ enum kernel_open_file_status __wrap_kernel_open_file_release(
 }
 
 #ifdef FILES_PARTIAL_WRITE_TEST
-int __wrap_ext4_fwrite(ext4_file *file,
+int __wrap_ext4_fpwrite(ext4_file *file, uint64_t offset,
                        const void *buffer,
                        size_t size,
                        size_t *bytes_written)
@@ -211,7 +211,7 @@ int __wrap_ext4_fwrite(ext4_file *file,
     int result;
 
     if (!inject_partial_write_error) {
-        result = __real_ext4_fwrite(file, buffer, size, bytes_written);
+        result = __real_ext4_fpwrite(file, offset, buffer, size, bytes_written);
         if (writeback_redirty_mm != 0 && result == EOK &&
             bytes_written != 0 && *bytes_written == size) {
             struct kernel_mm *mm = writeback_redirty_mm;
@@ -226,10 +226,10 @@ int __wrap_ext4_fwrite(ext4_file *file,
     }
     inject_partial_write_error = 0;
     if (size < 5U) {
-        return __real_ext4_fwrite(file, buffer, size, bytes_written);
+        return __real_ext4_fpwrite(file, offset, buffer, size, bytes_written);
     }
 
-    result = __real_ext4_fwrite(file, buffer, 5U, &committed);
+    result = __real_ext4_fpwrite(file, offset, buffer, 5U, &committed);
     if (bytes_written != 0) {
         *bytes_written = committed;
     }

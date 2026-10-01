@@ -156,6 +156,7 @@ int ext4_block_flush_buf(struct ext4_blockdev *bdev, struct ext4_buf *buf)
 {
 	int r;
 	struct ext4_bcache *bc = bdev->bc;
+	if (buf->journal_pending) return EBUSY;
 
 	if (ext4_bcache_test_flag(buf, BC_DIRTY) &&
 	    ext4_bcache_test_flag(buf, BC_UPTODATE)) {

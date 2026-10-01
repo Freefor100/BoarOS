@@ -322,6 +322,7 @@ void riscv_trap_return_prepare(struct riscv_trap_frame *frame)
 {
     if ((frame->sstatus & RISCV_SSTATUS_SPP) == 0U)
         kernel_task_prepare_user_return();
+    else kernel_scheduler_prepare_idle_return();
     riscv_signal_prepare_user_return(frame);
 #if BOAROS_COST_DIAGNOSTICS
     if ((frame->sstatus & RISCV_SSTATUS_SPP) == 0U) kernel_cost_user_return();

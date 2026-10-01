@@ -285,7 +285,8 @@ static int update_slot(struct ext4_fs *fs, ext4_fsblk_t lba,
                        uint32_t slot, uint32_t seed, uint32_t value)
 {
     struct ext4_block block;
-    int r = ext4_block_get(fs->bdev, &block, lba);
+    /* Reserve the slot's undo/version owner before changing orphan_file. */
+    int r = ext4_trans_block_get(fs->bdev, &block, lba);
     if (r != EOK) return r;
     r = check_block(fs, &block, seed);
     if (r == EOK) r = ext4_trans_set_block_dirty(block.buf);

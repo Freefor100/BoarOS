@@ -469,7 +469,7 @@ void kernel_tmpfs_memory_modified(struct kernel_vfs_file *file)
     (void)modified(file, 0, 0);
 }
 static int no_writeback(struct kernel_vfs_instance *i) { (void)i; return 0; }
-static int sync_metadata(struct kernel_vfs_node *n) { (void)n; return 0; }
+static int sync_metadata(struct kernel_vfs_node *n, int data_only) { (void)n; (void)data_only; return 0; }
 static int unmount(struct kernel_vfs_mount *mount)
 {
     struct tmp_mount *m=tm(mount->private_data);

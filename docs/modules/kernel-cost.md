@@ -50,7 +50,7 @@ staging 累计请求容量、heap 请求字节和成功物理页。短写以实�
 缓存计 bucket probes、实际复制、范围写回的两轮遍历、完整页快照与逻辑后端接受量。
 设备按 registry 的磁盘0/1/其他聚合；请求在 submit 保存标量 epoch/lane，IRQ 完成和 reset
 使用提交身份，旧请求不能污染新窗口。原设备/MM 统计契约不变，fixture 未登记设备属于 other。
-所有提交磁盘字节为 unknown_read/unknown_write（含之后失败的请求），不表示持久字节；后端逻辑数据不足以证明扇区分类。
+封口事务的提交路径按 ordered data、journal、checkpoint metadata 与 journal superblock 设置标量 phase，设备按真实提交上下文归因；其余字节继续归 unknown_read/unknown_write（含之后失败的请求）。请求字节不表示持久字节；后端逻辑数据不足以证明其他扇区分类。
 复制/解析和设备请求由 scale 的独立 wrapper/原统计交叉验证；三个副本及完整窗口由
 `tests/cost-summary.py` 再验证。C1 结果和开关开销见[成本基线](../learning/cost-baseline.md)。
 
@@ -106,3 +106,7 @@ C4按握手确认的N+4个blocked成员检查扫描max下限，遗漏扫描或�
 完整消费者观测开销中位16.964%，旧180秒预算不足，不能将历史取消序列与完整序列混算。
 原judge与3600秒预算另在评测分支运行；其状态和分数不能由观测窗口的complete字段推导。
 本模块的采样验收、实际消费者完成、全套评测通过是三个分别检查的条件。
+
+原版消费者定点归因可用 `--consumer-commands musl:0,musl:1,glibc:0,glibc:1`；部分集合的验收范围仅为该集合，不能替代完整八组。逐命令程序时间和排空时间分开保存；窗口关闭前包装器同步当前工作目录中的普通文件与目录。事务内存指标的 max 是按堆容量和 home buffer 保守计费的峰值，value 是每批峰值样本之和，不能当瞬时驻留量。
+
+设备请求保留观测标量的完成观察时刻，成功 harvest 且已有等待者时记录同一请求从完成观察到 wake 返回、到原 submit 调用恢复的 ticks。`io_complete_to_ready` 是 wake 返回后的上界，`io_complete_to_resume` 包含 ready 等待与恢复后的少量记账；失败/reset 另由原错误计数保护，不纳入这两个正常完成样本。它们不保存任务引用；关闭构建无这些字段。固定聚合预算现在为 64941 B，每任务仍为 64 B。

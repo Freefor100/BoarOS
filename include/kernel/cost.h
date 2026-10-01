@@ -20,10 +20,12 @@ enum kernel_cost_metric {
 };
 struct kernel_cost_io_scope { struct kernel_cost_task *actor; unsigned previous; };
 struct kernel_cost_io_scope kernel_cost_io_enter(unsigned operation);
+struct kernel_cost_io_scope kernel_cost_phase_enter(unsigned phase);
 void kernel_cost_io_leave(struct kernel_cost_io_scope *scope);
 void kernel_cost_add_io(unsigned offset, uint64_t value);
 #define COST_IO_SCOPE(name, operation) struct kernel_cost_io_scope name __attribute__((cleanup(kernel_cost_io_leave))) = kernel_cost_io_enter(operation)
 #define COST_IO_ADD(offset, value) kernel_cost_add_io(offset, value)
+#define COST_PHASE_SCOPE(name, phase) struct kernel_cost_io_scope name __attribute__((cleanup(kernel_cost_io_leave))) = kernel_cost_phase_enter(phase)
 struct kernel_cost_tag { uint64_t epoch; unsigned lane; };
 struct kernel_cost_scope {
     struct kernel_cost_tag tag;
@@ -87,6 +89,7 @@ void kernel_cost_inherit(struct kernel_cost_task *child, const struct kernel_cos
 #else
 #define COST_IO_SCOPE(name, operation) ((void)0)
 #define COST_IO_ADD(offset, value) ((void)0)
+#define COST_PHASE_SCOPE(name, phase) ((void)0)
 #define COST_ADD(metric, value) ((void)0)
 #define COST_SAMPLE(metric, value) ((void)0)
 #define COST_SCOPE(name, metric) ((void)0)
