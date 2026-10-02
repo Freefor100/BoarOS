@@ -71,7 +71,9 @@ normal open、dup/F_DUPFD、console、pipe2 和 epoll_create1 最终都经过 `t
 
 每个已发布的 pipe 片段对应数据区中的一页。`write/writev` 跨 iovec 复制完整片段后才增加有效长度；复制中途 fault 时丢弃尚未发布的片段，已发布的前缀仍返回。后续写入只按请求长度的页内余数尝试并入尾片段，其余使用新页片段。`read/readv` 对一个片段的本轮请求必须完整复制到用户空间才消费它；fault 可使用户缓冲区出现前缀，但该未完成片段仍可被再次读取。已消费的先前片段决定返回进度，之后不会为了下一 iovec 再等待新数据。16 个槽已占满时 `poll` 不报告可写，即使尾页尚有可合并空间；小写入仍可尝试尾页合并。这些边界按固定 Linux `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 `references/linux/fs/pipe.c` 对照。
 
-pipe 的 `fstat` 以 `S_IFIFO` 形态报告，`lseek` 返回 `-ESPIPE`；它不进入 ext4 页缓存，也不暴露普通 VFS node。两个 endpoint 的最后一个 OFD 关闭后，ring buffer、等待队列和 pipe owner 一起释放。创建或双 fd 安装的任一步失败都会先回收已创建 description/fd；只有真实 VFS/I/O 清理错误才由文件表保留 pipe 或 OFD owner，物理页和堆释放不建立重试状态。
+匿名pipe的mode与创建时间由共享pipe对象持有，fchmod更新权限和ctime并保留FIFO类型；fstat与proc跟随查询报告稳定inode身份及同一元数据，两端、dup/fork和proc重开一致。数据读写不改变匿名pipe时间。`make test-fifo-riscv`的同ELF反例在旧内核以ENOTSUP失败，在固定Linux和修复后通过；raw ABI另保护改权及坏输出指针。
+
+pipe 的 `fstat` 以 `S_IFIFO` 形态报告，`lseek` 返回 `-ESPIPE`；匿名pipe不进入ext4页缓存；命名FIFO另持真实VFS node。两个 endpoint 的最后一个 OFD 关闭后，ring buffer、等待队列和 pipe owner 一起释放。创建或双 fd 安装的任一步失败都会先回收已创建 description/fd；只有真实 VFS/I/O 清理错误才由文件表保留 pipe 或 OFD owner，物理页和堆释放不建立重试状态。
 
 ## `read/readv`、offset 与部分复制
 
@@ -167,7 +169,7 @@ make test-files-partial-write-riscv
 
 `kernel_files_fstat()/newfstatat()` 按 riscv64 asm-generic 128 字节 `struct stat` 填充。regular file 与 directory 都先由 `kernel_vfs_fstat()` 取得同一份 filesystem-independent metadata，再转换为 Linux ABI；dev/ino/mode/nlink/uid/gid/size、512-byte `blocks`、filesystem `blksize` 和 atime/mtime/ctime 除 size 来自共享 node 的逻辑大小外，均来自当前 ext4 inode。打开后 unlink 的 file handle 仍指向活着的 inode，因此 `fstat` 可继续读取内容与 metadata，并观察到 `nlink == 0`。当前根 mount 的 `st_dev` 是稳定的 VFS 内部 mount ID 1，只用于同一挂载内的身份比较，不冒充硬件 major/minor。
 
-console、pipe 和 epoll 是不属于 filesystem inode 的合成对象，继续走各自的显式 stat 形态；console 呈现 5:1 字符设备，pipe 呈现 FIFO。`newfstatat` 支持 cwd/dirfd/绝对路径与 `AT_EMPTY_PATH`（按 fd 取对象，`AT_FDCWD` 取 cwd）；目录路径可统计，`AT_SYMLINK_NOFOLLOW` 通过路径 inode 查询返回链接自身的 mode、大小和时间戳。proc fd 的伪对象跟随式统计复用同一元数据快照。常规文件 create/read/pread/write/writev/truncate/unlink 已更新 realtime 时间戳：读取按 relatime（含缓存命中、非零 EOF 和 user fault），写入先校验 inode maxbytes，再在 usercopy 前修改 mtime/ctime，同长度 truncate 也更新；零长度或访问模式拒绝不更新。创建/移除更新父目录 mtime/ctime，unlink 后仍打开的 inode 继续通过 live handle 更新。扩展 inode 保留纳秒与 signed epoch，旧 128-byte inode 按秒截断；只读挂载不写 atime，未初始化时钟不覆盖 fixture metadata。触发、I/O 错误 owner 和固定 Linux 依据见[文件时间戳](../learning/file-timestamps.md)。
+console、匿名pipe和epoll是不属于filesystem inode的合成对象，继续走各自的显式 stat 形态；console 呈现 5:1 字符设备，pipe 呈现 FIFO。`newfstatat` 支持 cwd/dirfd/绝对路径与 `AT_EMPTY_PATH`（按 fd 取对象，`AT_FDCWD` 取 cwd）；目录路径可统计，`AT_SYMLINK_NOFOLLOW` 通过路径 inode 查询返回链接自身的 mode、大小和时间戳。proc fd 的伪对象跟随式统计复用同一元数据快照。常规文件 create/read/pread/write/writev/truncate/unlink 已更新 realtime 时间戳：读取按 relatime（含缓存命中、非零 EOF 和 user fault），写入先校验 inode maxbytes，再在 usercopy 前修改 mtime/ctime，同长度 truncate 也更新；零长度或访问模式拒绝不更新。创建/移除更新父目录 mtime/ctime，unlink 后仍打开的 inode 继续通过 live handle 更新。扩展 inode 保留纳秒与 signed epoch，旧 128-byte inode 按秒截断；只读挂载不写 atime，未初始化时钟不覆盖 fixture metadata。触发、I/O 错误 owner 和固定 Linux 依据见[文件时间戳](../learning/file-timestamps.md)。
 
 `faccessat` syscall 48 复用 cwd/dirfd/绝对路径查找并跟随符号链接；非法 mode 先返回 `EINVAL`，用户路径 fault 为 `EFAULT`，不存在路径沿用查找 errno。当前不可变 root 身份仅需对普通文件执行请求保留“至少一个执行位”约束，对只读挂载的普通文件或目录写请求返回 `EROFS`；多用户凭据、ACL 与 mount `noexec` 尚未实现。边界由 `tests/diff-abi/access.c` 在同一 RV64 ELF 的固定 Linux 和 BoarOS 上核对；依据是本地 `references/linux/fs/open.c::do_faccessat`，commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`。
 
@@ -269,7 +271,7 @@ make test-riscv
 
 `mknodat(33)` 复用 dirfd/cwd/root 路径快照，应用进程 umask 后调用 VFS。
 当前交付普通文件（类型 0 或 S_IFREG）、字符设备（S_IFCHR）与块设备节点（S_IFBLK）；目录返回 EPERM，
-非法类型 EINVAL，FIFO/socket 节点尚未闭环，返回 ENOTSUP。块节点仅用于 stat、命名和 mount 的 st_rdev 识别，裸盘 open 不支持。设备号取 Linux
+非法类型EINVAL；FIFO节点与传输已接入，socket节点仍返回ENOTSUP。块节点仅用于 stat、命名和 mount 的 st_rdev 识别，裸盘 open 不支持。设备号取 Linux
 32 位编码；任意字符设备号可存储，打开时既有 null/zero/console/random/urandom 及RTC后端可用，
 未知号返回 ENXIO。不以路径名识别设备。
 
@@ -309,3 +311,20 @@ poll的HUP/ERR直接当作取得队首资格。等待期间释放CPU并保留当
 完成或fault释放reservation后唤醒后继；SO_RCVTIMEO与信号仍由同一次等待处理。
 `make test-io-sleep-riscv`的定向交错复用现有MM/uaccess包装器，保护完成、fault、
 超时和信号的结果以及页基线；对外poll和非阻塞语义另由network与固定ABI验证。
+
+## 命名 FIFO
+
+ext4/tmpfs 的 FIFO inode 保存持久身份、权限与时间，传输仍使用现有64KiB pipe。
+节点只保存弱关联；每个打开中或已打开的OFD同时钉住节点与pipe，最后owner先摘关联、
+丢弃内容，再关闭VFS引用。dup/fork共享OFD资格，hardlink/rename/unlink不改变实例；
+同名重建是新inode。创建节点不分配传输缓冲。
+
+阻塞只读/只写与对端会合，非阻塞只写无读者返回ENXIO，O_RDWR立即成功。
+到达代次保护对端出现后立即关闭的交错；初始非阻塞只读尚未见过写者时抑制HUP，
+后续写者离开才报告HUP。等待前没有namespace/inode锁；信号唤醒后先检查会合代次，只有对端未到达才按重启协议归还资格。
+pipe端点先关闭一次，真实VFS关闭错误继续归mount清理，不重新归还端点。
+
+正数读写更新命名节点时间，匿名pipe不更新；只读挂载允许FIFO传输而不修改时间。
+FIFO不可seek或fsync，节点由文件系统同步持久化，传输内容永不恢复。
+`make test-fifo-riscv`以同ELF核对Linux的身份、打开、poll/select/epoll、时间、信号、
+fd满、只读挂载与重启；`make test-files-riscv`另注入对象/缓冲OOM并验证重试与回收。

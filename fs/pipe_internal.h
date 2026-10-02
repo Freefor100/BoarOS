@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 #include <kernel/scheduler.h>
+#include <kernel/vfs.h>
 
 struct kernel_heap;
 struct physical_page_allocator;
@@ -15,6 +16,8 @@ struct kernel_uaccess_iovec;
 struct kernel_pipe {
     struct kernel_heap *heap;
     uint64_t proc_identity;
+    uint32_t mode;
+    struct kernel_vfs_timespec atime, mtime, ctime;
     struct physical_page_allocator *allocator;
     uint64_t buffer_physical;
     unsigned char *buffer;
@@ -25,6 +28,9 @@ struct kernel_pipe {
     uint16_t page_length[16];
     uint8_t can_merge[16];
     uint64_t bytes;
+    struct kernel_vfs_node *fifo_node; /* 弱关联；每个owner另持节点引用。 */
+    uint32_t owners;
+    uint64_t reader_generation, writer_generation;
     uint32_t readers;
     uint32_t writers;
     struct kernel_wait_queue read_queue;
@@ -52,7 +58,13 @@ enum kernel_pipe_status kernel_pipe_create(
     struct kernel_heap *heap,
     struct kernel_pipe **owner);
 
+int kernel_pipe_fifo_open(struct kernel_heap *heap, struct kernel_vfs_node *node,
+    uint32_t flags, struct kernel_pipe **owner, uint8_t *endpoint,
+    uint64_t *observed_writers);
+
 uint64_t kernel_pipe_proc_identity(const struct kernel_pipe *pipe);
+int kernel_pipe_stat(const struct kernel_pipe *pipe, struct kernel_vfs_stat *stat);
+int kernel_pipe_set_mode(struct kernel_pipe *pipe, uint32_t mode);
 
 /* Disposes a newly-created pipe before either endpoint is attached. */
 enum kernel_pipe_status kernel_pipe_destroy_unowned(
@@ -88,6 +100,7 @@ enum kernel_pipe_status kernel_pipe_writev(
 uint32_t kernel_pipe_poll(
     struct kernel_pipe *pipe,
     uint32_t endpoint,
+    uint64_t observed_writers,
     struct kernel_wait_queue **out_queue);
 
 enum kernel_pipe_status kernel_pipe_write_buffer(

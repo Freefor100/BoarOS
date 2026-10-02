@@ -1,4 +1,5 @@
 #include "pipe_internal.h"
+#include "vfs_objects.h"
 #include "uaccess_iov_internal.h"
 
 #include <arch/riscv/context.h>
@@ -12,6 +13,7 @@
 #include <kernel/scheduler.h>
 #include <kernel/signal.h>
 #include <kernel/task.h>
+#include <kernel/time.h>
 #include <kernel/uaccess.h>
 
 #include <stdint.h>
@@ -28,8 +30,38 @@ uint64_t kernel_pipe_proc_identity(const struct kernel_pipe *pipe)
     return pipe ? pipe->proc_identity : 0U;
 }
 
+static struct kernel_vfs_timespec pipe_now(void)
+{
+    uint64_t ns = kernel_time_realtime_ns();
+    return (struct kernel_vfs_timespec){(int64_t)(ns / 1000000000), (int64_t)(ns % 1000000000)};
+}
+int kernel_pipe_stat(const struct kernel_pipe *pipe, struct kernel_vfs_stat *stat)
+{
+    if (!pipe || !stat) return -KERNEL_EINVAL;
+    uintptr_t irq = riscv_interrupt_save();
+    *stat = (struct kernel_vfs_stat){.ino=pipe->proc_identity, .mode=pipe->mode,
+        .nlink=1, .blksize=BOAROS_PAGE_SIZE,
+        .atime=pipe->atime, .mtime=pipe->mtime, .ctime=pipe->ctime};
+    riscv_interrupt_restore(irq);
+    return 0;
+}
+int kernel_pipe_set_mode(struct kernel_pipe *pipe, uint32_t mode)
+{
+    if (!pipe) return -KERNEL_EINVAL;
+    uintptr_t irq = riscv_interrupt_save();
+    /* 共享端点只改权限；访问方向仍由每个OFD拥有。 */
+    pipe->mode = KERNEL_VFS_S_IFIFO | (mode & 07777U);
+    pipe->ctime = pipe_now();
+    riscv_interrupt_restore(irq);
+    return 0;
+}
+
 static enum kernel_pipe_status pipe_destroy(struct kernel_pipe *pipe)
 {
+    if (pipe->fifo_node) {
+        if (pipe->fifo_node->fifo_pipe != pipe) __builtin_trap();
+        pipe->fifo_node->fifo_pipe = 0;
+    }
     if (pipe->buffer_physical != KERNEL_PIPE_NO_BUFFER) {
         (void)physical_page_release_order(pipe->allocator,
                                         pipe->buffer_physical,
@@ -65,6 +97,8 @@ enum kernel_pipe_status kernel_pipe_create(
     }
     pipe->heap = heap;
     pipe->allocator = heap->page_allocator;
+    pipe->mode = KERNEL_VFS_S_IFIFO | 0600U;
+    pipe->atime = pipe->mtime = pipe->ctime = pipe_now();
     pipe->buffer_physical = KERNEL_PIPE_NO_BUFFER;
     page_status = physical_page_allocate_order(heap->page_allocator,
                                                KERNEL_PIPE_ORDER,
@@ -106,12 +140,18 @@ enum kernel_pipe_status kernel_pipe_acquire_endpoint(
         endpoint > KERNEL_PIPE_ENDPOINT_BOTH) {
         return KERNEL_PIPE_STATUS_INVALID_ARGUMENT;
     }
-    if (((endpoint & KERNEL_PIPE_ENDPOINT_READ) &&
-         pipe->readers == UINT32_MAX) ||
-        ((endpoint & KERNEL_PIPE_ENDPOINT_WRITE) &&
-         pipe->writers == UINT32_MAX)) return KERNEL_PIPE_STATUS_STATE;
-    if (endpoint & KERNEL_PIPE_ENDPOINT_READ) pipe->readers++;
-    if (endpoint & KERNEL_PIPE_ENDPOINT_WRITE) pipe->writers++;
+    uintptr_t saved = riscv_interrupt_save();
+    if (pipe->owners == UINT32_MAX ||
+        ((endpoint & KERNEL_PIPE_ENDPOINT_READ) && pipe->readers == UINT32_MAX) ||
+        ((endpoint & KERNEL_PIPE_ENDPOINT_WRITE) && pipe->writers == UINT32_MAX))
+        __builtin_trap();
+    pipe->owners++;
+    if (endpoint & KERNEL_PIPE_ENDPOINT_READ) { pipe->readers++; pipe->reader_generation++; }
+    if (endpoint & KERNEL_PIPE_ENDPOINT_WRITE) { pipe->writers++; pipe->writer_generation++; }
+    (void)kernel_wait_queue_wake_all(&pipe->read_queue);
+    (void)kernel_wait_queue_wake_all(&pipe->write_queue);
+    (void)kernel_wait_queue_wake_all(&pipe->both_queue);
+    riscv_interrupt_restore(saved);
     return KERNEL_PIPE_STATUS_OK;
 }
 
@@ -122,7 +162,7 @@ enum kernel_pipe_status kernel_pipe_destroy_unowned(
     enum kernel_pipe_status status;
 
     if (pipe == 0 || pipe->heap == 0 || pipe->readers != 0U ||
-        pipe->writers != 0U) {
+        pipe->writers != 0U || pipe->owners != 0U) {
         return KERNEL_PIPE_STATUS_INVALID_ARGUMENT;
     }
     saved = riscv_interrupt_save();
@@ -161,13 +201,89 @@ enum kernel_pipe_status kernel_pipe_release_endpoint(
         (void)kernel_wait_queue_wake_all(&pipe->write_queue);
         (void)kernel_wait_queue_wake_all(&pipe->both_queue);
     }
-    if (pipe->readers == 0U && pipe->writers == 0U) {
+    if (!pipe->owners) __builtin_trap();
+    if (--pipe->owners == 0U) {
         status = pipe_destroy(pipe);
     } else {
         status = KERNEL_PIPE_STATUS_OK;
     }
     riscv_interrupt_restore(saved);
     return status;
+}
+
+/* 打开中和已安装的OFD均拥有pipe；inode关联本身不延长生命周期。 */
+int kernel_pipe_fifo_open(struct kernel_heap *heap, struct kernel_vfs_node *node,
+    uint32_t flags, struct kernel_pipe **owner, uint8_t *endpoint,
+    uint64_t *observed_writers)
+{
+    struct kernel_pipe *candidate = 0, *pipe;
+    uintptr_t irq = riscv_interrupt_save();
+    pipe = node->fifo_pipe;
+    if (pipe) { if (pipe->owners == UINT32_MAX) __builtin_trap(); pipe->owners++; }
+    riscv_interrupt_restore(irq);
+    if (!pipe) {
+        enum kernel_pipe_status status = kernel_pipe_create(heap, &candidate);
+        if (status != KERNEL_PIPE_STATUS_OK)
+            return status == KERNEL_PIPE_STATUS_NO_MEMORY ? -KERNEL_ENOMEM : -KERNEL_EIO;
+        irq = riscv_interrupt_save();
+        pipe = node->fifo_pipe;
+        if (!pipe) {
+            pipe = candidate; candidate = 0;
+            node->fifo_pipe = pipe; pipe->fifo_node = node;
+        }
+        if (pipe->owners == UINT32_MAX) __builtin_trap();
+        pipe->owners++;
+        riscv_interrupt_restore(irq);
+        if (candidate) (void)kernel_pipe_destroy_unowned(candidate);
+    }
+    irq = riscv_interrupt_save();
+    uint8_t direction = (flags & 3U) == 0 ? KERNEL_PIPE_ENDPOINT_READ :
+        (flags & 3U) == 1 ? KERNEL_PIPE_ENDPOINT_WRITE : KERNEL_PIPE_ENDPOINT_BOTH;
+    int result = 0;
+    if (direction == KERNEL_PIPE_ENDPOINT_WRITE && (flags & KERNEL_PIPE_NONBLOCK) && !pipe->readers)
+        result = -KERNEL_ENXIO;
+    uint64_t generation = direction == KERNEL_PIPE_ENDPOINT_READ ?
+        pipe->writer_generation : pipe->reader_generation;
+    *observed_writers = 0;
+    if (!result) {
+        if (((direction & KERNEL_PIPE_ENDPOINT_READ) &&
+             (pipe->readers == UINT32_MAX || pipe->reader_generation == UINT64_MAX)) ||
+            ((direction & KERNEL_PIPE_ENDPOINT_WRITE) &&
+             (pipe->writers == UINT32_MAX || pipe->writer_generation == UINT64_MAX))) __builtin_trap();
+        if (direction & KERNEL_PIPE_ENDPOINT_READ) { pipe->readers++; pipe->reader_generation++; }
+        if (direction & KERNEL_PIPE_ENDPOINT_WRITE) { pipe->writers++; pipe->writer_generation++; }
+        (void)kernel_wait_queue_wake_all(&pipe->read_queue);
+        (void)kernel_wait_queue_wake_all(&pipe->write_queue);
+        (void)kernel_wait_queue_wake_all(&pipe->both_queue);
+        if (direction == KERNEL_PIPE_ENDPOINT_READ && !pipe->writers && (flags & KERNEL_PIPE_NONBLOCK))
+            *observed_writers = pipe->writer_generation;
+        /* 到达代次捕获短暂出现的对端，不能只重查当前人数。 */
+        while (direction != KERNEL_PIPE_ENDPOINT_BOTH && !(flags & KERNEL_PIPE_NONBLOCK) &&
+            (direction == KERNEL_PIPE_ENDPOINT_READ ?
+                !pipe->writers && pipe->writer_generation == generation :
+                !pipe->readers && pipe->reader_generation == generation)) {
+            enum kernel_wait_wake_reason reason;
+            if (kernel_scheduler_block_current(&pipe->both_queue, 0, 1, &reason) != KERNEL_SCHEDULER_STATUS_OK) {
+                result = -KERNEL_EIO; break;
+            }
+            /* 信号唤醒后仍优先认领已经发生的会合，避免重启后错失短暂对端。 */
+            if (reason == KERNEL_WAIT_SIGNALLED &&
+                (direction == KERNEL_PIPE_ENDPOINT_READ ?
+                 pipe->writer_generation : pipe->reader_generation) == generation) {
+                kernel_signal_note_syscall_restart(kernel_task_current());
+                result = -KERNEL_ERESTARTSYS; break;
+            }
+        }
+        if (result) {
+            /* 已取得的方向资格只归还一次，最后owner同时摘弱关联。 */
+            if (kernel_pipe_release_endpoint(pipe, direction) != KERNEL_PIPE_STATUS_OK) __builtin_trap();
+        }
+    } else if (--pipe->owners == 0) {
+        (void)pipe_destroy(pipe);
+    }
+    if (!result) { *owner = pipe; *endpoint = direction; }
+    riscv_interrupt_restore(irq);
+    return result;
 }
 
 static uint16_t next_slot(uint16_t slot)
@@ -486,6 +602,7 @@ enum kernel_pipe_status kernel_pipe_write_buffer(
 uint32_t kernel_pipe_poll(
     struct kernel_pipe *pipe,
     uint32_t endpoint,
+    uint64_t observed_writers,
     struct kernel_wait_queue **out_queue)
 {
     uint32_t events = 0U;
@@ -504,7 +621,7 @@ uint32_t kernel_pipe_poll(
         if (pipe->bytes > 0U) {
             events |= (KERNEL_POLLIN | KERNEL_POLLRDNORM);
         }
-        if (pipe->writers == 0U) {
+        if (pipe->writers == 0U && pipe->writer_generation != observed_writers) {
             events |= KERNEL_POLLHUP;
         }
     }

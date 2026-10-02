@@ -23,6 +23,7 @@ struct kernel_open_file_description {
     uint8_t kind;
     uint8_t vfs_closed;
     struct kernel_pipe *pipe;
+    uint64_t pipe_observed_writers;
     uint8_t pipe_endpoint;
     uint8_t pipe_endpoint_closed;
     struct kernel_epoll *epoll;

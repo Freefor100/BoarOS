@@ -764,7 +764,7 @@ $(FILES_TEST_KERNEL_RV): $(FILES_TEST_OBJECTS) arch/riscv/linker.ld
 		-Wl,--wrap=kernel_open_file_release \
 		-Wl,--wrap=kernel_heap_allocate \
 		-Wl,--wrap=kernel_heap_allocate_zeroed \
-		-Wl,--wrap=physical_page_allocate \
+		-Wl,--wrap=physical_page_allocate -Wl,--wrap=physical_page_allocate_order \
 		-Wl,--wrap=virt_uart_rx_ready \
 		-Wl,--wrap=virt_uart_getc \
 		-Wl,--wrap=riscv_sv39_current_satp \
@@ -777,7 +777,7 @@ $(FILES_PARTIAL_WRITE_TEST_KERNEL_RV): \
 		-Wl,--wrap=kernel_open_file_get_page \
 		-Wl,--wrap=kernel_open_file_release \
 		-Wl,--wrap=kernel_heap_allocate_zeroed \
-		-Wl,--wrap=physical_page_allocate \
+		-Wl,--wrap=physical_page_allocate -Wl,--wrap=physical_page_allocate_order \
 		-Wl,--wrap=riscv_sv39_current_satp \
 		-Wl,--wrap=ext4_fpwrite \
 		-Wl,--wrap=ext4_ftruncate \
@@ -1663,3 +1663,19 @@ test-allocator-preemption-host:
 	cc -std=c11 -O1 -fno-inline -finstrument-functions -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=12 -Itests/host/allocator -Iinclude -c mm/heap.c -o build/host/allocator/heap.o
 	cc -std=c11 -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=12 -Iinclude tests/host/allocator_preemption.c build/host/allocator/page.o build/host/allocator/heap.o -o build/host/allocator/preemption
 	build/host/allocator/preemption
+
+.PHONY: test-fifo-riscv
+test-fifo-riscv: $(KERNEL_RV)
+	python3 -B tests/fifo-riscv.py --kernel $(KERNEL_RV)
+
+OFFLINE_PROJECT_RV := $(BUILD_DIR)/tests/user/offline-project-rv
+$(OFFLINE_PROJECT_RV): tests/workloads/toolchain/project.c $(MUSL_STAMP)
+	@mkdir -p $(dir $@)
+	$(MUSL_ROOT)/bin/musl-gcc $(MUSL_GCC_FLAGS) -static -O2 -Wall -Wextra -Werror $< -o $@
+
+.PHONY: test-offline-project-riscv test-offline-project-tmpfs-riscv
+test-offline-project-riscv: $(OFFLINE_PROJECT_RV) $(KERNEL_RV) prepare-offline-c-toolchain
+	python3 -B tests/offline-c-riscv.py --project lua --kernel $(KERNEL_RV) --program $(OFFLINE_PROJECT_RV) --toolchain-tree build/offline-c/alpine-tree --timeout 900
+
+test-offline-project-tmpfs-riscv: $(OFFLINE_PROJECT_RV) $(KERNEL_RV) prepare-offline-c-toolchain
+	python3 -B tests/offline-c-riscv.py --project lua --kernel $(KERNEL_RV) --program $(OFFLINE_PROJECT_RV) --toolchain-tree build/offline-c/alpine-tree --timeout 900 --tmpfs --performance

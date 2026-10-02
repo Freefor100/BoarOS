@@ -78,7 +78,7 @@ musl `/init`。它从 `/work/tools.conf` 读取客体内编译器、汇编器绝
 `OFFLINE_C_LINUX_KERNEL` 可指向由固定 Linux commit
 `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 构建且有 `identity.json`
 的缓存 Image；不指定时 runner 按固定资料构建。`make prepare-offline-c-toolchain`
-单独重建编译器树。`references/sources.tsv` 对以下 15 个 APK 固定逐项完整 URL
+单独重建编译器树。`references/sources.tsv` 对以下16个APK 固定逐项完整 URL
 和 SHA-256，访问日期为 2026-09-27；准备脚本逐项校验 archive 哈希、
 `.PKGINFO` 的名称/版本/架构/许可和缓存树内容，不修改上游包。
 
@@ -90,6 +90,7 @@ runner 从同一稀疏 ext4 fixture 建立 Linux 与 BoarOS 的独立原始镜�
 
 | APK 包名 | 固定版本 | `.PKGINFO` 许可 |
 |---|---|---|
+| make | 4.4.1-r3 | GPL-3.0-or-later |
 | binutils | 2.44-r3 | GPL-2.0-or-later AND LGPL-2.1-or-later AND BSD-3-Clause |
 | gcc | 14.2.0-r6 | GPL-2.0-or-later AND LGPL-2.1-or-later |
 | gmp | 6.3.0-r3 | LGPL-3.0-or-later OR GPL-2.0-or-later |
@@ -106,8 +107,7 @@ runner 从同一稀疏 ext4 fixture 建立 Linux 与 BoarOS 的独立原始镜�
 | zlib | 1.3.2-r0 | Zlib |
 | zstd-libs | 1.5.7-r0 | BSD-3-Clause OR GPL-2.0-or-later |
 
-它只证明此固定 C 源码、静态链接与单核环境的客体离线编译闭环；其他 C
-项目、C++、Rust 或持续本机自举仍需独立验证。
+小探针证明此固定C源码的五阶段；中等工程流程见下节。C++、Rust或持续本机自举仍需独立验证。
 原版 libc-test `functional/socket.c` 的静态和动态 entry 可单独验收：
 
 ```sh
@@ -171,3 +171,18 @@ contract和wait status比较，保留原输出及raw_output_equal；日期、内
 随系统变化，不能据字节不同虚构程序失败。其他案例默认字节比较不变。独立
 `busybox.environment`核对日志-r/-c/-n、真实RTC内容和df/statfs同客体一致性。
 分类证据及后续应用边界见[程序清单](../learning/user-program-inventory.md#当前基线与口径)。
+
+## 原版 Lua 工程
+
+固定Lua5.4.3（MIT）与GNU make4.4.1-r3，GCC14.2.0-r6及Alpine依赖保持原包。
+`tests/offline-c-riscv.py --project lua`使用原Lua构建规则和默认FIFO jobserver；
+`make test-offline-project-riscv`执行干净-j1、无变化、单源增量、clean重建、语法错误与
+恢复、-j2及产物运行。Lua/luac、静态库嵌入及C共享模块由客体原GCC生成和实际执行。
+递归jobserver另用共享计数核对两份资格和令牌归还，中断后检查子进程与临时FIFO清理。
+
+`--performance --repeat 3`仅测独立启动的干净-j1/-j2和产物验证/收尾；
+`make test-offline-project-tmpfs-riscv`是一次相同工作量的tmpfs归因对照。
+`--observe --only boaros`使用默认关闭的COST构建；输出只留忽略的build。
+程序、同步、根卸载分别计时，卸载使用已有ROOT_DRAIN_FIXTURE，不增加用户ABI。
+固定Linux的PID1退出以panic停机，不能把它等同于BoarOS的根卸载；离线检查先重放日志。
+输入与输出身份在机器清单校验，人类结果和解释归[离线工具链记录](../learning/offline-toolchain-probe.md)。

@@ -1,4 +1,5 @@
 #include "../open_file_internal.h"
+#include "../pipe_internal.h"
 #include "../vfs_internal.h"
 #include "../char_device_internal.h"
 #include "private.h"
@@ -333,6 +334,18 @@ enum kernel_files_status kernel_files_openat(
         }
         description->kind = generated
             ? KERNEL_OPEN_FILE_KIND_GENERATED : KERNEL_OPEN_FILE_KIND_REGULAR;
+    } else if ((kernel_open_file_mode(description) & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFIFO) {
+        int error = (flags & LINUX_O_DIRECTORY) ? -KERNEL_ENOTDIR :
+            kernel_pipe_fifo_open(files->heap, description->file.private_data, (uint32_t)flags,
+                &description->pipe, &description->pipe_endpoint, &description->pipe_observed_writers);
+        if (error) {
+            files->record->statistics.open_failures++;
+            kernel_files_queue_description(files, description);
+            (void)kernel_files_drain_file_cleanup(files);
+            *linux_result = error;
+            return KERNEL_FILES_STATUS_OK;
+        }
+        description->kind = KERNEL_OPEN_FILE_KIND_PIPE;
     } else if ((kernel_open_file_mode(description) & KERNEL_VFS_S_IFMT) ==
                KERNEL_VFS_S_IFCHR) {
         struct kernel_vfs_stat stat;

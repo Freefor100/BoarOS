@@ -253,7 +253,7 @@ static int mknod_regular(struct kernel_vfs_instance *instance, const char *path,
     uint32_t type, uint32_t mode, uint32_t device)
 {
     (void)device;
-    if (type != KERNEL_VFS_S_IFREG) return -KERNEL_ENOTSUP;
+    if (type != KERNEL_VFS_S_IFREG && type != KERNEL_VFS_S_IFIFO) return -KERNEL_ENOTSUP;
     struct tmp_inode *created;
     return create_inode(tm(instance), path, type | (mode & 07777), 0, &created);
 }
