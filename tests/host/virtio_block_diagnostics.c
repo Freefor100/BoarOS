@@ -16,7 +16,8 @@ static char diagnostic[8192];
 static size_t diagnostic_length;
 static enum fault_kind {
     NORMAL, DEVICE_IO, DEVICE_UNSUPPORTED, USED_OVERFLOW, INVALID_ID,
-    MISALIGNED_ID, ZERO_LENGTH, FREE_SLOT, DUPLICATE_SLOT, INVALID_STATUS
+    MISALIGNED_ID, ZERO_LENGTH, FREE_SLOT, DUPLICATE_SLOT, INVALID_STATUS,
+    NO_COMPLETION, MANUAL_COMPLETION
 } fault;
 static int injected;
 
@@ -44,7 +45,7 @@ static uint64_t register_address(unsigned low)
 uint64_t host_block_time(void)
 {
     clock_value += 1;
-    if (!queue_allocation || injected) return clock_value;
+    if (!queue_allocation || injected || fault >= NO_COMPLETION) return clock_value;
     unsigned queue_size = registers[0x38 / 4];
     uint64_t descriptor_address, available_address, used_address;
     if (registers[4 / 4] == 1) {
@@ -166,7 +167,7 @@ static void run_case(unsigned version, enum fault_kind kind)
 {
     static const char *reasons[] = {
         NULL, NULL, NULL, "used-overflow", "used-element", "used-element",
-        "used-element", "slot-state", "slot-state", "device-status"
+        "used-element", "slot-state", "slot-state", "device-status", "timeout"
     };
     struct riscv_virtio_mmio_block device = {0};
     struct physical_page_allocator allocator = {0};
@@ -194,7 +195,8 @@ static void run_case(unsigned version, enum fault_kind kind)
     /* A second completion fails the device after the first valid completion;
      * it must not rewrite an already-complete request's actual result. */
     assert(result == (kind == NORMAL || kind == DUPLICATE_SLOT ? KERNEL_BLOCK_STATUS_OK :
-        kind == DEVICE_UNSUPPORTED ? KERNEL_BLOCK_STATUS_UNSUPPORTED : KERNEL_BLOCK_STATUS_IO));
+        kind == DEVICE_UNSUPPORTED ? KERNEL_BLOCK_STATUS_UNSUPPORTED :
+        kind == NO_COMPLETION ? KERNEL_BLOCK_STATUS_TIMEOUT : KERNEL_BLOCK_STATUS_IO));
     assert(device.active == 0 && device.inflight == 0);
     assert(request_at(&device, 0)->state == 0 && request_at(&device, 0)->owner == NULL);
     if (kind <= DEVICE_UNSUPPORTED) {
@@ -206,20 +208,24 @@ static void run_case(unsigned version, enum fault_kind kind)
         assert(field("queue=") == (uintptr_t)queue_allocation);
         assert(field("transport=") == version);
         assert(field("avail=") == 1);
-        assert(field("used=") == (kind == USED_OVERFLOW ? 9 : kind == DUPLICATE_SLOT ? 2 : 1));
-        assert(field("observed_count=") == (kind == USED_OVERFLOW ? 9 : kind == DUPLICATE_SLOT ? 2 : 1));
-        assert(field("consumed=") == (kind == USED_OVERFLOW ? 0 : kind == DUPLICATE_SLOT ? 2 : 1));
+        assert(field("used=") == (kind == NO_COMPLETION ? 0 : kind == USED_OVERFLOW ? 9 : kind == DUPLICATE_SLOT ? 2 : 1));
+        assert(field("observed_count=") == (kind == NO_COMPLETION ? 0 : kind == USED_OVERFLOW ? 9 : kind == DUPLICATE_SLOT ? 2 : 1));
+        assert(field("consumed=") == (kind == NO_COMPLETION || kind == USED_OVERFLOW ? 0 : kind == DUPLICATE_SLOT ? 2 : 1));
         assert(field("published=") == (kind == DUPLICATE_SLOT ? 0 : 1));
         assert(field("complete=") == (kind == DUPLICATE_SLOT ? 1 : 0));
         assert(field("inflight=") == (kind == DUPLICATE_SLOT ? 0 : 1));
         assert(field("active=") == 1);
         assert(field("mmio_status=") == (version == 1 ? 7 : 15));
-        assert(field("interrupt=") == 1);
-        if (kind != USED_OVERFLOW) {
+        assert(field("interrupt=") == (kind == NO_COMPLETION ? 0 : 1));
+        if (kind != USED_OVERFLOW && kind != NO_COMPLETION) {
             assert(field("item_index=") == (kind == DUPLICATE_SLOT ? 1 : 0));
             assert(field("id=") == (kind == INVALID_ID ? UINT32_MAX :
                 kind == MISALIGNED_ID ? 1 : kind == FREE_SLOT ? 3 : 0));
             assert(field("length=") == (kind == ZERO_LENGTH ? 0 : 513));
+        }
+        if (kind == NO_COMPLETION) {
+            assert(device.statistics.timeouts == 1);
+            assert(strstr(diagnostic, "item_index=") == NULL);
         }
         assert(field("owner=") == (uintptr_t)&caller);
         assert(strstr(diagnostic, "owner=0x1 completion=0x3") != NULL);
@@ -234,14 +240,96 @@ static void run_case(unsigned version, enum fault_kind kind)
     printf("PASS block-diagnostics transport=%u case=%u\n", version, kind);
 }
 
+/* Device-side pop/push accounting is independent of guest last_used_index.
+ * Reuse eight owner slots across a complete 16-bit index wrap, with reversed
+ * completions and repeated IRQs. No metadata corruption or special workload. */
+static void queue_reuse_case(unsigned version)
+{
+    struct riscv_virtio_mmio_block device = {0};
+    struct physical_page_allocator allocator = {0};
+    memset(registers, 0, sizeof(registers));
+    registers[0] = 0x74726976;
+    registers[1] = version;
+    registers[2] = 2;
+    registers[0x10 / 4] = 1;
+    registers[0x34 / 4] = 32;
+    registers[0x100 / 4] = 16;
+    clock_value = 0;
+    fault = MANUAL_COMPLETION;
+    diagnostic_length = 0;
+    diagnostic[0] = 0;
+    assert(riscv_virtio_mmio_block_init(&device, registers, sizeof(registers),
+        &allocator, dma_address, 1000) == RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK);
+    uint64_t descriptor_address = version == 1
+        ? (uint64_t)registers[0x40 / 4] << 12 : register_address(0x80);
+    uint64_t available_address = version == 1
+        ? descriptor_address + registers[0x38 / 4] * 16 : register_address(0x90);
+    uint64_t used_address = version == 1
+        ? descriptor_address + 4096 : register_address(0xa0);
+    struct wire_descriptor *descriptors = physical_pointer(descriptor_address, 32 * 16);
+    uint16_t *available = physical_pointer(available_address, 4 + 32 * 2);
+    uint16_t *used = physical_pointer(used_address, 4 + 32 * 8);
+    struct wire_completion *completion = (void *)(used + 2);
+    uint16_t popped = 0, pushed = 0;
+    unsigned inuse = 0, live_heads = 0;
+    for (unsigned round = 0; round < 8193; round++) {
+        struct block_request *requests[8];
+        unsigned heads[8];
+        assert(begin_call(&device, 0));
+        for (unsigned i = 0; i < 8; i++) {
+            requests[i] = reserve_request(&device);
+            assert(requests[i]);
+            assert(publish_request(&device, requests[i], VIRTIO_BLOCK_REQUEST_IN,
+                i, UINT64_C(0x82000000) + i * 512, 512, 0) == KERNEL_BLOCK_STATUS_OK);
+        }
+        assert((uint16_t)(available[1] - popped) == 8);
+        for (unsigned i = 0; i < 8; i++) {
+            unsigned head = available[2 + popped++ % 32];
+            assert(head < 32 && !(live_heads & (1U << head)));
+            heads[i] = head;
+            live_heads |= 1U << head;
+            assert(++inuse <= 8);
+        }
+        for (unsigned i = 8; i > 0; i--) {
+            unsigned head = heads[i - 1];
+            assert(live_heads & (1U << head));
+            unsigned tail = descriptors[descriptors[head].next].next;
+            *(unsigned char *)physical_pointer(descriptors[tail].address, 1) = 0;
+            completion[pushed++ % 32] = (struct wire_completion){head, 513};
+            live_heads &= ~(1U << head);
+            inuse--;
+        }
+        used[1] = pushed;
+        block_irq(&device);
+        block_irq(&device);
+        assert(device.inflight == 0 && !inuse && !live_heads);
+        for (unsigned i = 0; i < 8; i++) {
+            assert(wait_request(&device, requests[i]) == KERNEL_BLOCK_STATUS_OK);
+            release_request(&device, requests[i]);
+        }
+        end_call(&device, 0);
+    }
+    assert(!diagnostic_length && device.statistics.requests == 65544);
+    assert(device.statistics.max_inflight == 8 && !device.active);
+    assert(riscv_virtio_mmio_block_destroy(&device) == RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK);
+    assert(allocations == releases);
+    printf("PASS block queue reuse transport=%u: 65544 requests, reversed completions, index wrap\n", version);
+}
+
 int main(int argc, char **argv)
 {
+    if (argc == 2 && !strcmp(argv[1], "reuse")) {
+        queue_reuse_case(1);
+        queue_reuse_case(2);
+        return 0;
+    }
     if (argc == 2) {
         run_case(2, (enum fault_kind)strtoul(argv[1], NULL, 0));
         return 0;
     }
     for (unsigned version = 1; version <= 2; ++version) {
-        for (unsigned kind = NORMAL; kind <= INVALID_STATUS; ++kind) {
+        queue_reuse_case(version);
+        for (unsigned kind = NORMAL; kind <= NO_COMPLETION; ++kind) {
             run_case(version, (enum fault_kind)kind);
         }
     }

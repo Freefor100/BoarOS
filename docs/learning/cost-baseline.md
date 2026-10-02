@@ -523,9 +523,27 @@ python3 -B tests/cost-riscv.py --case consumer --consumer-commands musl:0,musl:1
 
 旧日志留下过两次异常。一次发生在四进程 iozone 并发写，trap 显示发生在物理页
 buddy 释放函数；那个内核没有保存 allocator 元数据快照，所以单靠 trap 地址不能
-判断具体命中了哪个释放 guard。另一次发生在原 iperf 五连接传输，QEMU 输出
-`Virtqueue size exceeded`，随后 guest 块请求 timeout/reset。旧日志没有留下报错设备
-和队列 owner 的状态。
+判断具体命中了哪个释放 guard。
+
+另一次的原运行入口与失败阶段已还原：10月2日13:32（北京时间）抓取到原版网络
+代表负载的告警。它使用纠错前的兼容内核、关闭观测、512 MiB、单 hart、legacy
+块盘与writeback缓存，另挂RNG；当时没有VirtIO-net设备，TCP全部走loopback。
+musl单连接完成后，协调器重新启动服务器并确认监听；五连接客户端
+`./iperf3 -c 127.0.0.1 -p 5001 -t 2 -i 0 -P 5`开始后出现以下顺序：
+
+1. QEMU输出`Virtqueue size exceeded`。
+2. guest块请求超时并reset。
+3. `tests/workloads/network/consumers.c`的`show_output()`打开客户端输出文件时得到
+   `EIO`，尚未打印该命令的wait status；随后根卸载返回`EBUSY`。
+
+这定位了触发负载和受损的文件I/O路径；原日志没有保存最先报错的VirtIO设备、
+队列与owner状态，不能把后续文件错误归给TCP协议或尚未加入的网卡驱动。
+原入口如下；`--repeat 1`用于单次定位，历史计划的三个性能副本并未在这次失败中完成：
+
+```sh
+python3 -B tests/network-consumers.py --only boaros --libc both --suite both \
+  --case representative --repeat 1 --kernel <纠错前兼容内核>
+```
 
 ### 确认并修复的内存根因
 
@@ -582,3 +600,17 @@ inuse 或 reset 前 DMA 内容快照，不能把相邻时间出现的块 timeout
 由块驱动自身造成，也不能断言该共同候选是唯一根因。本次内存修复消除了这个已证实的
 双 owner 污染机制；QEMU 那次 `inuse>=vring.num` 的具体来源仍是未关闭问题，应视为仍有历史
 风险，而不是仅因新的代表运行通过就记为修复。
+
+10月3日继续沿原块驱动核对发布与回收，宿主设备模型在legacy/modern各65544次请求中
+覆盖八槽全满、反序完成、重复IRQ和索引绕回，未出现重复head或超额在途。RNG的固定
+QEMU路径在同一回调内逐个pop/push，没有找到会积累未完成链的正常路径。这收窄了调查，
+仍不能补回旧现场的设备身份。
+
+本次另修复了实际的现场丢失缺口：原诊断只覆盖非法used项，而旧告警后的纯超时会
+直接reset。现在超时先保存MMIO、transport、队列地址、avail/used、在途数量和各槽
+owner标量，随后按原协议reset。新反例在旧代码中缺失这些字段；修复后两种transport
+的宿主检查通过，真实legacy/writeback的八槽NBD超时也核对了输出与reset顺序、原
+TIMEOUT结果和最终回收。该改动提高下一次失败的可定位性，不将历史告警标为修复。
+重建：`python3 -B tests/host/virtio_block_diagnostics.py`；真实用例使用
+`make build/riscv/tests/kernel-io-sleep-rv build/host/nbd-fault`，随后运行
+`python3 -B tests/io-sleep-riscv.py --kernel build/riscv/tests/kernel-io-sleep-rv --transport legacy`。

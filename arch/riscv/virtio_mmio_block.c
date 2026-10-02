@@ -370,10 +370,22 @@ static void wake(struct kernel_wait_queue *queue)
     if (queue->head && kernel_wait_queue_wake_all(queue) != KERNEL_SCHEDULER_STATUS_OK)
         __builtin_trap();
 }
+static void diagnose_queue_fault(struct riscv_virtio_mmio_block *device,
+    const char *reason, uint16_t used_index, uint16_t observed_count,
+    uint32_t pending, const struct virtq_used_element *item);
 static void fail_device(struct riscv_virtio_mmio_block *device, enum kernel_block_status result)
 {
     device->state = RISCV_VIRTIO_BLOCK_STATE_FAILED;
-    if (result == KERNEL_BLOCK_STATUS_TIMEOUT) virt_uart_puts("BoarOS: block timeout; resetting device\n");
+    if (result == KERNEL_BLOCK_STATUS_TIMEOUT) {
+        volatile struct virtq_used *used = (void *)((unsigned char *)device->queue_memory + queue_used_offset(device));
+        uint16_t used_index = used->index;
+        memory_barrier();
+        /* 纯超时没有非法 used 项；reset 前仍需保留设备身份与在途 owner。 */
+        diagnose_queue_fault(device, "timeout", used_index,
+            (uint16_t)(used_index - device->last_used_index),
+            mmio_read32(device, VIRTIO_MMIO_INTERRUPT_STATUS_OFFSET), NULL);
+        virt_uart_puts("BoarOS: block timeout; resetting device\n");
+    }
     device_reset(device); /* No DMA owner is released before reset acknowledgement. */
     for (unsigned i = 0; i < slot_count(device); i++) {
         struct block_request *r = request_at(device, i);
