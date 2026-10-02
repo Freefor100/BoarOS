@@ -155,13 +155,14 @@ C0–C6或存储恢复。本轮没有改事务、调度策略或通用堆同步�
 `python3 -B tests/network-riscv.py --workload content`，计时器依赖用
 `--workload timer`。固定源码依据为本地`references/linux`（v7.2）、
 `references/lwip`/`third_party/lwip`（2.2.1），原输入为固定公共RV镜像及
-`references/oscomp-testsuits`的pre-2025源码；精确机器身份、原始子项输出、
-argv、配置、协议快照与cost v1在[机器归档](network-measurements.json)。运行
-QEMU 11.1.1，参考源码为11.1.0；Linux的loopback环境另加127.0.0.2本地别名
+`references/oscomp-testsuits`的pre-2025源码。执行器在`build/`运行目录记录逐项
+argv、配置、原始输出、wait status和观测快照；本文保留验收范围、分布与解释，
+大型运行记录不纳入Git。运行QEMU 11.1.1，参考源码为11.1.0；Linux的loopback
+环境另加127.0.0.2本地别名
 以满足旧glibc AI_ADDRCONFIG，没有借此提供外部网卡。
 
-机器归档另标记一次COST内核版本失配的无效启动，未计入验收；阶段样本与最终
-修正版也分开，不混算副本。源码/ELF/fixture/kernel/QEMU身份在机器数据中，
-人类阅读结论不需要手工比对校验值。最终仅单向合入兼容分支，不push。
+一次COST内核版本失配的无效启动未计入验收；阶段样本与最终修正版分开，
+不混算副本。重建时由执行器核对输入身份，不要求读者手工比对校验值。
+最终仅单向合入兼容分支，不push。
 VirtIO-net与宿主双向应用是下一阶段；命名UNIX、SCM_RIGHTS、TCP_INFO、真实
 网卡、SMP与LoongArch均未由此次loopback结果交付。

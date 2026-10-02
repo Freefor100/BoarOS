@@ -2,9 +2,8 @@ import unittest
 from cost_report import parse, schema, percentile, validate_expected, validate_replicas
 
 class CostReportTest(unittest.TestCase):
-    def test_original_consumer_closure_rejects_startup_failure_and_censoring(self):
-        from cost_consumer import commands,validate_record,classify,ELFS,SCRIPTS,ORIGINAL_SHA,DEPENDENCIES
-        from copy import deepcopy
+    def consumer_record(self):
+        from cost_consumer import commands,ELFS,SCRIPTS,ORIGINAL_SHA,DEPENDENCIES
         lines=[]
         for libc in ELFS:
             for i in range(8):
@@ -12,8 +11,42 @@ class CostReportTest(unittest.TestCase):
                 lines += [f'COST COMMAND BEGIN {name}',
                           'Selected test not available on the version.' if i==7 else '',
                           self.consumer_method_output(i),f'COST RESULT {name} 123',f'COST COMMAND RESULT {name} 0 0']
-        row=dict(original_sha256=ORIGINAL_SHA,consumer_elf_sha256=ELFS,consumer_script_sha256=SCRIPTS,
-                 consumer_dependencies=DEPENDENCIES,commands=commands('\n'.join(lines)+'\n'))
+        return dict(original_sha256=ORIGINAL_SHA,consumer_elf_sha256=ELFS,consumer_script_sha256=SCRIPTS,
+                    consumer_dependencies=DEPENDENCIES,commands=commands('\n'.join(lines)+'\n'))
+
+    def comparison_records(self):
+        from copy import deepcopy
+        import hashlib,json
+        rows=[]
+        # 比较输入的检错只需一个有效窗口，不依赖历史吞吐数据。
+        for platform,on in (('boaros',0),('boaros',1),('linux',0)):
+            for replica in range(3):
+                row=deepcopy(self.consumer_record())
+                row['commands']=row['commands'][:1]
+                name=row['commands'][0]['name']
+                row.update(case='consumer',platform=platform,cost_diagnostics=on,
+                    transport='modern',cache='writeback',replica=replica,replicas=3,acceptance=True,
+                    consumer_command_names=[name],consumer_timeout_ms=180000,
+                    kernel_sha256=f'{platform}-{on}',elf_sha256='coordinator',source_sha256=platform,
+                    fixture_sha256=f'{platform}-{on}-{replica}',firmware_sha256='firmware',
+                    qemu_sha256='qemu',dtb_sha256='dtb',timebase_hz=10000000,
+                    uname=dict(machine='riscv64',release='4.15.0'),snapshots=[],timings_ns={name:123})
+                if on:
+                    fields=self.valid();fields['epoch']='1'
+                    row['snapshots']=[dict(name=name,values=parse(self.render(fields),1))]
+                if platform=='linux':
+                    row['linux_reference']=dict(inputs=dict(source=['linux','f4cdf7ca9a1fdcca413157df19753f388a5a224e']))
+                row['input_keys']=['kernel_sha256','elf_sha256','source_sha256','fixture_sha256',
+                                   'firmware_sha256','qemu_sha256','dtb_sha256','timebase_hz','consumer_timeout_ms']
+                frozen={k:row[k] for k in row['input_keys']}
+                row['input_sha256']=hashlib.sha256((json.dumps(frozen,sort_keys=True,separators=(',',':'))+'\n').encode()).hexdigest()
+                rows.append(row)
+        return rows
+
+    def test_original_consumer_closure_rejects_startup_failure_and_censoring(self):
+        from cost_consumer import validate_record,classify
+        from copy import deepcopy
+        row=self.consumer_record()
         validate_record(row,True)
         for raw,timeout,status in [('iozone test complete.',1,9),('FATAL: kernel too old',0,32512),
                                    ('still running',0,0)]:
@@ -44,10 +77,8 @@ class CostReportTest(unittest.TestCase):
 
     def test_closure_requires_actual_requested_method_results(self):
         from cost_consumer import validate_record,classify
-        import json
         from copy import deepcopy
-        from pathlib import Path
-        row=json.loads(Path('docs/learning/cost-consumer-followup.json').read_text())['records'][0]
+        row=self.consumer_record()
         validate_record(row,True)
         for index in range(7):
             actual=row['commands'][index]['raw_output']
@@ -68,10 +99,9 @@ class CostReportTest(unittest.TestCase):
     def test_closure_rejects_different_comparison_inputs(self):
         import importlib.util,json,hashlib
         from copy import deepcopy
-        from pathlib import Path
         spec=importlib.util.spec_from_file_location('closure','tests/iozone-closure.py')
         m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
-        rows=m.evidence.unpack(json.loads(Path('docs/learning/cost-consumer-followup.json').read_text()))
+        rows=self.comparison_records()
         m.validate(rows)
         for field,value in [('source_sha256','0'*64),('consumer_timeout_ms',1000000),
                             ('firmware_sha256','0'*64),('qemu_sha256','0'*64),('timebase_hz',20000000)]:

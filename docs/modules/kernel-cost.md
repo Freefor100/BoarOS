@@ -103,11 +103,12 @@ Children及Max per-process正值；只留marker、缺列/方法、重复或非�
 正常exit也可能贡献，不能解释成取消用户操作数；rank取消与原wait status分别报告。
 C4按握手确认的N+4个blocked成员检查扫描max下限，遗漏扫描或只计有期限任务都会失败。
 
-最终20配置、60启动、339窗口归档及14项报告检错通过；结论见[最终成本报告](../learning/cost-baseline.md)。
+历史20配置、60启动、339窗口测量及14项报告检错通过；结论见[成本报告](../learning/cost-baseline.md)。
 `cost-evidence.py --final --output` 接受用户 runner 列表与 io-sleep fixture 单记录，按真实配置收集三副本，
 规范化不修改封存输入，并从原消费者输出重新核对完成分类；解包会验证完整固定矩阵和全部快照seal。
-新增九次串行启动、48个窗口的原消费者续测见 `cost-consumer-followup.json`，由
-`tests/iozone-closure.py --verify` 独立核对，18项报告检错通过。兼容分支保留uname 4.15.0，
+原消费者续测为九次串行启动、48个窗口，当时由`tests/iozone-closure.py --verify`
+核对生成报告，18项报告检错通过。运行报告保存在`build/`，不纳入Git；报告解析
+测试独立构造小型样本。兼容分支保留uname 4.15.0，
 旧glibc/musl各七组可用测试全部完成，原向量组在固定Linux同样不支持；这项排除不是向量ABI通过。
 完整消费者观测开销中位16.964%，旧180秒预算不足，不能将历史取消序列与完整序列混算。
 原judge与3600秒预算另在评测分支运行；其状态和分数不能由观测窗口的complete字段推导。
@@ -123,11 +124,10 @@ C4按握手确认的N+4个blocked成员检查扫描max下限，遗漏扫描或�
 
 历史 v1 存档按原完整指标表解包：接受当前表及截止 wake_to_run 的原表，不能接受任意删减的表。旧记录无需补造 journal 指标或重跑测量，旧 seal 与九启动身份继续核对；新窗口仍要求当前完整表。
 
-异步日志验收证据追加在既有 `cost-consumer-followup.json` 的 `journal_optimization`：三次原消费者 OFF、
-一次四命令 ON、两次受控同步参考；不冒充三副本 ON 或完整成本矩阵。四个 ON snapshot 保存完整
-v1 `values` 与 SHA256，仍可直接送入 `cost_report.parse` 核对 epoch、完成状态、单位和溢出；
-历史根记录及 seal 保持原样，`iozone-closure.py --verify` 继续只核对历史九启动。
-各次身份、原输出、比较值和开销限制见[验收分析](../learning/cost-baseline.md#异步日志与组提交验收2026-10-01)。
+异步日志验收范围为三次原消费者 OFF、一次四命令 ON、两次受控同步参考；
+不冒充三副本 ON 或完整成本矩阵。生成的 ON snapshot 可送入`cost_report.parse`
+核对epoch、完成状态、单位和溢出；`iozone-closure.py --verify`核对传入报告的范围。
+比较值、机制解释和开销限制见[验收分析](../learning/cost-baseline.md#异步日志与组提交验收2026-10-01)。
 
 缓存纠错观测另计块缓存hit/miss/eviction/load_wait；hit表示取得已有缓冲引用，
 不保证内容已经有效，因此loading命中仍可等待。设备READ在实际发布处只按可证明的
@@ -150,9 +150,9 @@ checkpoint与卸载清理时间。它不是全程checkpoint总耗时，也不包
 冒充窗口内重复读。`--resume-from`仅重解析身份匹配的完整旧日志，继续未执行副本，
 保留原输入seal；不会重新执行已完成程序来修正解析问题。
 
-本轮匹配旧/新各3个OFF、各1个定点ON及各1个固定读OFF共10启动，16快照存于既有
-`cost-consumer-followup.json.performance_correction`。每记录metric_schema及seal明确区分
-旧182/新195项；新schema热路径观测会明显扰动固定热读，成绩采用OFF。旧版外部构建的
+缓存纠错匹配旧/新各3个OFF、各1个定点ON及各1个固定读OFF，共10启动、16快照。
+执行器的metric_schema及seal明确区分旧182/新195项；新schema热路径观测会明显
+扰动固定热读，成绩采用OFF。旧版外部构建的
 JSON指标表先规范化为受支持注册表，再做完整字段/epoch/溢出验证；不接受任意删项。
 程序、应用durable收尾、剩余内部卸载各自报告；有限收益和未唯一归因的历史分布保留，
 不把这10启动扩写为原八组全套或完整成本矩阵。

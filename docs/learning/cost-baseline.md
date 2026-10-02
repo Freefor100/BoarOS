@@ -130,7 +130,7 @@ glibc 增加 0.73%，这项没有改善。各列分别取中位数，不能将�
 
 四条命令结束后，根卸载的剩余 checkpoint 与清理中位为旧 39.815 毫秒、新 44.257 毫秒。
 该区间不包含调用之前的 worker 停止时间，不能据此推断整个后台阶段回退。
-Max、Children、最少传输量、逐次分布及原始输出保留在消费者归档。
+Max、Children、最少传输量与分布应分别核对，不能互相替代；原始输出由执行器生成。
 本轮没有重测八组总耗时或专项分数。
 
 ### 请求少了，为什么只快了一部分
@@ -349,10 +349,10 @@ python3 -B tests/cost-riscv.py --case consumer --consumer-commands musl:0,musl:1
 ```
 
 复建比较须使用相同协调器、初始文件和配置。执行器负责核对精确输入身份；
-逐次分布、原输出、工具与二进制校验资料保存在 [消费者归档](cost-consumer-followup.json)：
-`journal_optimization` 对应组提交，`storage_pipeline` 对应流水线，
-`performance_correction` 对应缓存纠错。历史全成本见 [测量归档](cost-measurements.json)。
-机器身份集中在归档与 [固定资料清单](../../references/sources.tsv)，正文保留条件与解释。
+本页保留成本基线、组提交、流水线和缓存纠错的结果与解释。
+逐次输出与完整快照由运行目录中的报告提供，不将大型运行记录纳入 Git。
+固定输入见 [资料清单](../../references/sources.tsv)；重建时执行器记录实际工具、
+二进制和镜像身份，分析仍须区分观测开关、前置状态和完成边界。
 固定依据是本地 Linux 的 ext4 journal/fsync 路径、QEMU v11.1.0 的 writeback/flush 实现
 及 iozone 3.506 原源码，具体路径见参考清单与模块索引。
-本文重算既有记录，不表示又运行了一轮实验。
+文档整理不表示又运行了一轮实验。
