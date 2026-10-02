@@ -1203,3 +1203,6 @@ rtc.fault
 rtc.unknown
 rtc.dup_exclusive
 rtc.reopen
+pipe.mode-shared
+pipe.mode-type-preserved
+pipe.stat-fault

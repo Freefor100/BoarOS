@@ -1,3 +1,4 @@
+#include "../pipe_internal.h"
 #include "../open_file_internal.h"
 #include "private.h"
 
@@ -122,6 +123,8 @@ enum kernel_files_status kernel_files_fchmod(
     struct kernel_open_file_description *description =
         kernel_files_hold_fd(files, fd, &pin_guard);
     if (!description) *linux_result = -KERNEL_EBADF;
+    else if (description->kind == KERNEL_OPEN_FILE_KIND_PIPE && !description->file.private_data)
+        *linux_result = kernel_pipe_set_mode(description->pipe, mode);
     else if (!description->file.private_data) *linux_result = -KERNEL_ENOTSUP;
     else *linux_result = kernel_vfs_file_set_mode(&description->file, mode);
     return KERNEL_FILES_STATUS_OK;

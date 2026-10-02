@@ -90,4 +90,17 @@ void abi_mode_cases(void)
     abi_require(SC4(260, child, &status, 0, 0) == child);
     abi_record("mode.umask-shared-fs", SC1(166, previous), -1, -1,
                status, 0, 0);
+
+    int32_t pipefd[2];
+    abi_require(SC2(59, pipefd, 0) == 0);
+    struct abi_stat reader, writer;
+    result = SC2(52, pipefd[0], 0640);
+    abi_require(SC2(80, pipefd[0], &reader) == 0 && SC2(80, pipefd[1], &writer) == 0);
+    abi_record("pipe.mode-shared", result, reader.mode & 07777,
+               reader.mode == writer.mode && reader.ino == writer.ino && reader.ino != 0, 0, 0, 0);
+    result = SC2(52, pipefd[1], 0100600);
+    abi_require(SC2(80, pipefd[0], &reader) == 0);
+    abi_record("pipe.mode-type-preserved", result, reader.mode, -1, 0, 0, 0);
+    abi_record("pipe.stat-fault", SC2(80, pipefd[0], 1), -1, -1, 0, 0, 0);
+    abi_require(SC1(57, pipefd[0]) == 0 && SC1(57, pipefd[1]) == 0);
 }

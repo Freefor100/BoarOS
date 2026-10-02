@@ -12,6 +12,7 @@
 #include <kernel/scheduler.h>
 #include <kernel/signal.h>
 #include <kernel/task.h>
+#include <kernel/time.h>
 #include <kernel/uaccess.h>
 
 #include <stdint.h>
@@ -26,6 +27,32 @@ static uint64_t next_pipe_proc_identity = 1U;
 uint64_t kernel_pipe_proc_identity(const struct kernel_pipe *pipe)
 {
     return pipe ? pipe->proc_identity : 0U;
+}
+
+static struct kernel_vfs_timespec pipe_now(void)
+{
+    uint64_t ns = kernel_time_realtime_ns();
+    return (struct kernel_vfs_timespec){(int64_t)(ns / 1000000000), (int64_t)(ns % 1000000000)};
+}
+int kernel_pipe_stat(const struct kernel_pipe *pipe, struct kernel_vfs_stat *stat)
+{
+    if (!pipe || !stat) return -KERNEL_EINVAL;
+    uintptr_t irq = riscv_interrupt_save();
+    *stat = (struct kernel_vfs_stat){.ino=pipe->proc_identity, .mode=pipe->mode,
+        .nlink=1, .blksize=BOAROS_PAGE_SIZE,
+        .atime=pipe->atime, .mtime=pipe->mtime, .ctime=pipe->ctime};
+    riscv_interrupt_restore(irq);
+    return 0;
+}
+int kernel_pipe_set_mode(struct kernel_pipe *pipe, uint32_t mode)
+{
+    if (!pipe) return -KERNEL_EINVAL;
+    uintptr_t irq = riscv_interrupt_save();
+    /* 共享端点只改权限；访问方向仍由每个OFD拥有。 */
+    pipe->mode = KERNEL_VFS_S_IFIFO | (mode & 07777U);
+    pipe->ctime = pipe_now();
+    riscv_interrupt_restore(irq);
+    return 0;
 }
 
 static enum kernel_pipe_status pipe_destroy(struct kernel_pipe *pipe)
@@ -65,6 +92,8 @@ enum kernel_pipe_status kernel_pipe_create(
     }
     pipe->heap = heap;
     pipe->allocator = heap->page_allocator;
+    pipe->mode = KERNEL_VFS_S_IFIFO | 0600U;
+    pipe->atime = pipe->mtime = pipe->ctime = pipe_now();
     pipe->buffer_physical = KERNEL_PIPE_NO_BUFFER;
     page_status = physical_page_allocate_order(heap->page_allocator,
                                                KERNEL_PIPE_ORDER,

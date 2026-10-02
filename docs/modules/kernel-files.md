@@ -71,6 +71,8 @@ normal open、dup/F_DUPFD、console、pipe2 和 epoll_create1 最终都经过 `t
 
 每个已发布的 pipe 片段对应数据区中的一页。`write/writev` 跨 iovec 复制完整片段后才增加有效长度；复制中途 fault 时丢弃尚未发布的片段，已发布的前缀仍返回。后续写入只按请求长度的页内余数尝试并入尾片段，其余使用新页片段。`read/readv` 对一个片段的本轮请求必须完整复制到用户空间才消费它；fault 可使用户缓冲区出现前缀，但该未完成片段仍可被再次读取。已消费的先前片段决定返回进度，之后不会为了下一 iovec 再等待新数据。16 个槽已占满时 `poll` 不报告可写，即使尾页尚有可合并空间；小写入仍可尝试尾页合并。这些边界按固定 Linux `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 `references/linux/fs/pipe.c` 对照。
 
+匿名pipe的mode与创建时间由共享pipe对象持有，fchmod更新权限和ctime并保留FIFO类型；fstat与proc跟随查询报告稳定inode身份及同一元数据，两端、dup/fork和proc重开一致。数据读写不改变匿名pipe时间。`make test-fifo-riscv`的同ELF反例在旧内核以ENOTSUP失败，在固定Linux和修复后通过；raw ABI另保护改权及坏输出指针。
+
 pipe 的 `fstat` 以 `S_IFIFO` 形态报告，`lseek` 返回 `-ESPIPE`；它不进入 ext4 页缓存，也不暴露普通 VFS node。两个 endpoint 的最后一个 OFD 关闭后，ring buffer、等待队列和 pipe owner 一起释放。创建或双 fd 安装的任一步失败都会先回收已创建 description/fd；只有真实 VFS/I/O 清理错误才由文件表保留 pipe 或 OFD owner，物理页和堆释放不建立重试状态。
 
 ## `read/readv`、offset 与部分复制

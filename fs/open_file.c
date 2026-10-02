@@ -402,7 +402,7 @@ int kernel_open_file_pseudo_stat(
     uint32_t mode;
     uint64_t rdev = 0U;
     if (file->kind == KERNEL_OPEN_FILE_KIND_PIPE)
-        mode = KERNEL_VFS_S_IFIFO | 0600U;
+        return kernel_pipe_stat(file->pipe, stat);
     else if (file->kind == KERNEL_OPEN_FILE_KIND_SOCKET)
         mode = KERNEL_VFS_S_IFSOCK | 0600U;
     else if (file->kind == KERNEL_OPEN_FILE_KIND_EPOLL)
@@ -685,7 +685,10 @@ void kernel_open_file_reset_generated(struct kernel_open_file_description *file)
 uint32_t kernel_open_file_mode(
     const struct kernel_open_file_description *file)
 {
-    return open_file_live(file) ? file->file.mode : 0U;
+    if (!open_file_live(file)) return 0U;
+    if (file->kind == KERNEL_OPEN_FILE_KIND_PIPE && !file->file.private_data)
+        return file->pipe->mode;
+    return file->file.mode;
 }
 
 uint32_t kernel_open_file_flags(

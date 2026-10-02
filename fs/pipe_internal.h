@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 #include <kernel/scheduler.h>
+#include <kernel/vfs.h>
 
 struct kernel_heap;
 struct physical_page_allocator;
@@ -15,6 +16,8 @@ struct kernel_uaccess_iovec;
 struct kernel_pipe {
     struct kernel_heap *heap;
     uint64_t proc_identity;
+    uint32_t mode;
+    struct kernel_vfs_timespec atime, mtime, ctime;
     struct physical_page_allocator *allocator;
     uint64_t buffer_physical;
     unsigned char *buffer;
@@ -53,6 +56,8 @@ enum kernel_pipe_status kernel_pipe_create(
     struct kernel_pipe **owner);
 
 uint64_t kernel_pipe_proc_identity(const struct kernel_pipe *pipe);
+int kernel_pipe_stat(const struct kernel_pipe *pipe, struct kernel_vfs_stat *stat);
+int kernel_pipe_set_mode(struct kernel_pipe *pipe, uint32_t mode);
 
 /* Disposes a newly-created pipe before either endpoint is attached. */
 enum kernel_pipe_status kernel_pipe_destroy_unowned(

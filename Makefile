@@ -1663,3 +1663,7 @@ test-allocator-preemption-host:
 	cc -std=c11 -O1 -fno-inline -finstrument-functions -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=12 -Itests/host/allocator -Iinclude -c mm/heap.c -o build/host/allocator/heap.o
 	cc -std=c11 -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=12 -Iinclude tests/host/allocator_preemption.c build/host/allocator/page.o build/host/allocator/heap.o -o build/host/allocator/preemption
 	build/host/allocator/preemption
+
+.PHONY: test-fifo-riscv
+test-fifo-riscv: $(KERNEL_RV)
+	python3 -B tests/fifo-riscv.py --kernel $(KERNEL_RV)

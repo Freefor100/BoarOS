@@ -41,7 +41,7 @@ URL、SHA-256 和许可见 `references/sources.tsv`、
 handle 事务实现 `fchmod/fchmodat`。路径专用 setter 不可行：已 unlink 的
 fd 仍须修改原 inode；直接越过 lwext4 改 raw inode 又会绕开 journal、
 ctime 和错误 owner。固定 Linux 的 `fchmod(pipefd)` 也成功，但 pipe
-合成 inode mode/fstat 尚未实现；此点不在本次编译器负载覆盖内。
+合成inode mode/fstat当时未实现；此点不在该次编译器负载覆盖内，后续实现见文末。
 
 重建：`make prepare-offline-c-toolchain`，随后
 `make test-offline-c-riscv OFFLINE_C_LINUX_KERNEL=<固定 Image>`；不提供
@@ -73,3 +73,13 @@ BoarOS 内核 SHA-256 `1a0dc5b9dc338e01d9fc7b10c689edaaa761f75952bc8fce90f2f4a4c
 2026-09-29 [CI run #37](https://github.com/Freefor100/BoarOS/actions/runs/36515194047) 证实稀疏复制与同步已生效，DELETE/WAL 仍通过；离线 GCC 在 QEMU 8.2.2 上变为固定 Linux 的 `preprocess:signal:4`，BoarOS 五阶段均 `exit:0`。本地同版 QEMU 的 `-d int` 记录用户态 `epc=0x2d83e`、指令 `0xaca2`；固定 Alpine `usr/bin/gcc` 的反汇编为 `fsd fs0,88(sp)`。QEMU 8.2.2 的 `virt` DTB 只有 `riscv,isa=rv64imafdch...`，QEMU 11.1.1 同时提供 `riscv,isa-extensions`。固定 Linux `references/linux/arch/riscv/kernel/cpufeature.c` 和 `Kconfig`（commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`）表明精简配置若禁用 `CONFIG_RISCV_ISA_FALLBACK`，旧 DTB 不能识别 F/D，`start_thread` 不打开用户浮点状态。同一 Linux Image 在 QEMU 8.2.2 仅加 `riscv_isa_fallback` 启动参数就完成五阶段。因此两个固定 Linux 测试 profile 显式启用该回退；旧 QEMU 的参考侧恢复真实浮点能力，较新 QEMU 仍用扩展列表。先前把本地 SIGILL 视为无关环境差异的结论已撤回。
 
 修正后的本地固定 Linux Image SHA-256 为 `48ef24ee16e84e9f7b4c593a1b0794b43c6cedc9611ff581e4fefc87a5d3db35`，实际 `.config` 同时含 `CONFIG_FPU=y` 与 `CONFIG_RISCV_ISA_FALLBACK=y`。Ubuntu 24.04 的 QEMU 8.2.2 环境中，`make test-offline-c-riscv` 的双侧五阶段、679 条差分、ELF 尾页以及 SQLite DELETE/WAL 均通过；QEMU 11.1.1 的离线 GCC 严格对照也通过，产物哈希维持不变。这是本地 CI 环境复现，不代替新提交在 GitHub Actions 上的最终结果。
+
+## 共享管道元数据（2026-10-03）
+
+原fchmod只接受有VFS inode的OFD，匿名pipe返回ENOTSUP，fstat还固定为0600。
+同一用户态探针在固定Linux通过、旧BoarOS在fchmod失败；修复将mode、ctime和
+稳定身份放入已有共享pipe，两端及dup/fork/proc重开一致。匿名管道读写不伪造
+普通文件时间更新，改权不改变已经打开的访问方向。坏stat指针用raw syscall验证，
+避免把libc内部转换时的用户fault误当成内核errno。
+依据是references/linux/fs/open.c与fs/pipe.c，固定Linux v7.2；重建入口
+为make test-fifo-riscv，已有文件聚焦回归通过。本段不宣称命名FIFO或Lua工程完成。
