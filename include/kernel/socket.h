@@ -92,7 +92,7 @@ int kernel_socket_reserve_read(struct kernel_socket *socket,
                               struct kernel_task *task,
                               struct kernel_socket_read_request *request,
                               struct kernel_open_file_description **pin_owner,
-                              uint32_t capacity);
+                              uint32_t capacity, int nonblocking);
 void kernel_socket_read_info(const struct kernel_socket_read_request *request,
                              struct kernel_socket_address *address, uint32_t *length);
 void kernel_socket_copy_read(const struct kernel_socket_read_request *request,

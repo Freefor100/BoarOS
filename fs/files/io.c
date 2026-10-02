@@ -59,10 +59,10 @@ static int socket_wait_ready(struct kernel_open_file_description *description,
     uint64_t deadline = 0;
     uint64_t target_ns = 0;
     uintptr_t saved;
-    if ((kernel_socket_poll(socket, 0) & events) != 0U) return 0;
     if ((description->open_flags & KERNEL_FILES_O_NONBLOCK) != 0U ||
         (socket_flags & KERNEL_SOCKET_MSG_DONTWAIT) != 0U)
         return -KERNEL_EAGAIN;
+    if ((kernel_socket_poll(socket, 0) & events) != 0U) return 0;
     if (timeout_ns != 0U) {
         uint64_t now = kernel_time_monotonic_ns();
         uint64_t target = UINT64_MAX - now < timeout_ns
@@ -297,7 +297,9 @@ static enum kernel_files_status read_pinned(
             received = kernel_socket_reserve_read(
                 kernel_open_file_socket(description), kernel_task_current(),
                 &read_request, description_owner,
-                remaining > UINT32_MAX ? UINT32_MAX : (uint32_t)remaining);
+                remaining > UINT32_MAX ? UINT32_MAX : (uint32_t)remaining,
+                (description->open_flags & KERNEL_FILES_O_NONBLOCK) ||
+                    (socket_flags & KERNEL_SOCKET_MSG_DONTWAIT));
             if (received == -KERNEL_EAGAIN && total == 0U) {
                 int waited = socket_wait_ready(description, KERNEL_POLLIN,
                     kernel_socket_receive_timeout(kernel_open_file_socket(description)), socket_flags);

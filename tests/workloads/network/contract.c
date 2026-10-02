@@ -320,6 +320,8 @@ static void unix_half_close(void)
         CHECK(epoll_wait(epoll, &event, 1, 0) == 1 && (event.events & (EPOLLIN | EPOLLRDHUP)) == (EPOLLIN | EPOLLRDHUP));
         char byte;
         if (queued) CHECK(recv(pair[1], &byte, 1, 0) == 1 && byte == 'q');
+        CHECK(recv(pair[1], &byte, 1, 0) == -1 && errno == EAGAIN);
+        CHECK(fcntl(pair[1], F_SETFL, fcntl(pair[1], F_GETFL) & ~O_NONBLOCK) == 0);
         CHECK(recv(pair[1], &byte, 1, 0) == 0);
         CHECK(shutdown(pair[1], SHUT_RDWR) == 0 && poll(&ready, 1, 0) == 1 && (ready.revents & POLLHUP));
         CHECK(close(epoll) == 0 && close(pair[0]) == 0 && close(pair[1]) == 0);
