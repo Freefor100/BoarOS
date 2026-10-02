@@ -186,6 +186,26 @@ static int duplicate_declares_final(void)
     return 0;
 }
 
+static int duplicate_final_timeout(void)
+{
+    unsigned frees = 0;
+    CHECK(input(fragment(0, 16, 1, 17, 0x4201, &frees), &interface_a) == NULL);
+    CHECK(input(fragment(16, 16, 1, 17, 0x4201, &frees), &interface_a) == NULL);
+    /* Linux先记终点，但重复输入未被接纳，不能因此直接交付已有内容。 */
+    CHECK(input(fragment(16, 16, 0, 17, 0x4201, &frees), &interface_a) == NULL);
+    CHECK(frees == 1 && live_wire_buffers == 2);
+    CHECK(lwip_stats.memp[MEMP_REASSDATA]->used == 1);
+    expire_all();
+    CHECK(frees == 3 && live_wire_buffers == 0);
+    CHECK(lwip_stats.memp[MEMP_REASSDATA]->used == 0);
+    CHECK(input(fragment(0, 16, 1, 17, 0x4201, &frees), &interface_a) == NULL);
+    struct pbuf *p = input(fragment(16, 16, 0, 17, 0x4201, &frees), &interface_a);
+    CHECK(complete_literal(p, 17) == 0);
+    pbuf_free(p);
+    CHECK(frees == 5);
+    return 0;
+}
+
 static int different_protocol(void)
 {
     unsigned frees = 0;
@@ -512,6 +532,7 @@ static const struct test_case cases[] = {
     {"covered_range_duplicate", covered_range_duplicate},
     {"contiguous_range_duplicate", contiguous_range_duplicate},
     {"duplicate_declares_final", duplicate_declares_final},
+    {"duplicate_final_timeout", duplicate_final_timeout},
     {"different_protocol", different_protocol},
     {"different_interface", different_interface},
     {"partial_overlap", partial_overlap}, {"overlap_same_start", overlap_same_start},
