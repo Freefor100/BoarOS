@@ -74,8 +74,8 @@ runner 读取固定 Harness `kernel/judge/config.json`。其中 `qemu.timeout=36
 不是全套通过，不是双架构交付，也不能由逐组诊断成绩拼接提高分数。
 运行始于上海2026-09-30 22:37:39，结束于23:37:39；本节于10月1日收口。
 
-[固定运行身份与全部原judge明细](../learning/oscomp-rv-results.json)保存报告、22组原结果、
-内核/配置/原输入身份和原文件SHA-256。iozone逐组完成统计来自同一份串口，未补跑后拼接。
+本节保存22组原judge的分数与边界。执行器将完整运行报告、逐组输出和输入身份
+写入`build/`；大型运行记录不纳入Git。iozone完成统计来自同一次运行，未补跑后拼接。
 
 | 组 | glibc 原分数 | musl 原分数 | 状态/边界 |
 |---|---:|---:|---|
@@ -296,8 +296,8 @@ qemu-system-riscv64 -machine virt -kernel kernel-rv -m 1G -nographic -smp 1 \
 
 主线异步日志与调度实现单向合入后，在 `999cf486ee853413e49f60b89d02e24637a5ed21`
 执行一次上述专项，293.532 秒正常结束；musl/glibc 原脚本各八组均有结束标记、脚本状态为 0。
-逐方法输出与原 judge 结果一起保存在 [原评分证据](../learning/oscomp-rv-results.json)
-的 `journal_optimization`，不能仅用脚本退出码判断可用方法完成。
+下表保留原judge结果；逐方法输出由执行器在运行目录生成，
+不能仅用脚本退出码判断可用方法完成。
 
 | libc | 旧专项分数 | 本次原 judge 分数 | 变化 |
 |---|---:|---:|---:|
@@ -335,13 +335,9 @@ S6–S8 从 main 单向合入 `8fe3431617d61b8d514d98270abd832b49c4da10` 后，�
 具体字段、分布、代码归因和同步边界见[本轮验收](../learning/cost-baseline.md#s9-存储流水线验收2026-10-01)。
 完整lwext4/SQLite恢复与系统回归通过，完整Harness仍缺 `kernel-la`；专项局部投影不是总成绩。
 
-证据追加到 [原评分证据](../learning/oscomp-rv-results.json) 的 `storage_pipeline`，
-保留历史记录、原分项judge、两侧原输出与运行身份。内核SHA-256
-`6e72791ecbf7e9d03255eabbbfbf7906f049609e2d173c5ea6c97f360d09d199`，
-tree `47088b8fbe34daa89dc1b5fae471542f68cf7a38`，串口SHA-256
-`9a2bee500b4f7a77cc715beb89cbc3a23db8e005f1ba2e248601ae2b60bc015e`。
+本节保留分项结论与原judge分数，两侧原输出和运行身份由执行器生成。
 运行报告的tracked dirty为两个成本consumer wrapper文件，未编入该专项的内核或原启动
-脚本；保留真实dirty身份，不改写成clean tree。实际QEMU11.1.1、二进制SHA与上节一致，
-timebase10MHz，其余原盘、配置、DTB、固件和fixture哈希完整归档。当前main的通用修复
+脚本，不能将这次报告写成clean tree。实际QEMU11.1.1、timebase10MHz；
+执行器核对原盘、配置、DTB、固件和fixture。当前main的通用修复
 及报告已再次单向合入，uname4.15兼容仍只在本分支；不反向合入比赛profile、不push。
 运行目录核对后按仓库prune清理，重建入口仍是本模块的原 `run.py --groups iozone`。
