@@ -1513,8 +1513,10 @@ uint32_t kernel_socket_poll(struct kernel_socket *socket,
     if (socket->domain == KERNEL_SOCKET_DOMAIN_UNIX) {
         uintptr_t saved = riscv_interrupt_save();
         if (socket->type == SOCKET_DGRAM) {
-            if (socket->packets_head != 0 && socket->read_request == 0)
+            if ((socket->packets_head != 0 || socket->read_closed) && socket->read_request == 0)
                 events |= KERNEL_POLLIN | KERNEL_POLLRDNORM;
+            if (socket->read_closed) events |= KERNEL_POLLRDHUP;
+            if (socket->read_closed && socket->write_closed) events |= KERNEL_POLLHUP;
             if (socket->peer_closed) {
                 events |= KERNEL_POLLIN | KERNEL_POLLRDNORM | KERNEL_POLLHUP;
             }

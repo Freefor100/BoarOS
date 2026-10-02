@@ -359,6 +359,25 @@ static void network_application_cases(void)
     close_socket(pair[0]);close_socket(pair[1]);
 }
 
+static void unix_shutdown_cases(void)
+{
+    int32_t pair[2] = {-1, -1};
+    long created = SC4(199, LINUX_AF_UNIX, LINUX_SOCK_DGRAM, 0, pair);
+    long shut = created == 0 ? SC2(210, pair[1], 0) : created;
+    record("socket.unix-dgram-shut-rd", shut);
+    struct socket_timespec timeout = {0};
+    struct socket_pollfd ready = {pair[1], 0x2045, 0};
+    long polled = SC5(73, &ready, 1, &timeout, 0, 8);
+    record("socket.unix-dgram-shut-rd-poll", polled == 1 ? ready.revents : polled);
+    char byte;
+    record("socket.unix-dgram-shut-rd-recv", SC6(207, pair[1], &byte, 1, 0x40, 0, 0));
+    record("socket.unix-dgram-shut-rdwr", SC2(210, pair[1], 2));
+    ready.revents = 0;
+    polled = SC5(73, &ready, 1, &timeout, 0, 8);
+    record("socket.unix-dgram-shut-rdwr-poll", polled == 1 ? ready.revents : polled);
+    close_socket(pair[0]); close_socket(pair[1]);
+}
+
 static void fresh_tcp_cases(void)
 {
     char byte;
@@ -860,4 +879,5 @@ void abi_socket_cases(void)
     unix_datagram_cases();
     network_application_cases();
     fresh_tcp_cases();
+    unix_shutdown_cases();
 }

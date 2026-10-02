@@ -13,7 +13,7 @@
 | 任务 | 交付与状态 |
 |---|---|
 | D1 TCP 接收状态 | [x] 未连接、连接中、数据/错误/EOF及零长度 read/recv；接收与就绪状态一致 |
-| D2 UNIX DGRAM半关闭 | [ ] own SHUT_RD/SHUT_RDWR的可读、RDHUP/HUP；保留reservation独占 |
+| D2 UNIX DGRAM半关闭 | [x] own SHUT_RD/SHUT_RDWR的可读、RDHUP/HUP；保留reservation独占 |
 | D3 接收预算通知 | [ ] STREAM/DGRAM扩大实际接收预算后通知已阻塞对端；关闭/取消不遗留owner |
 | T1 流发送暂存游标 | [ ] EAGAIN和部分发送后复用尚未发送的暂存内容，保留fault前缀、期限和pin |
 | J1 按版本量和期限封口 | [ ] 去掉64次操作软阈值；保留256KiB、首脏100ms、同步/强制和真实资源条件 |

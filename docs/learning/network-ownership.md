@@ -175,3 +175,7 @@ VirtIO-net与宿主双向应用是下一阶段；命名UNIX、SCM_RIGHTS、TCP_I
 非阻塞为EAGAIN，已有内容则返回0且不消费。队首数据、待交付错误与EOF继续分开。
 重建：`make all && python3 -B tests/network-riscv.py`，固定资料见网络模块。
 本段只记录该边界的双侧验证；本轮整体应用和性能结论在收口后追加。
+
+UNIX数据报半关闭不是队列中存在数据才可读：SHUT_RD后空接收立即EOF，因此等待接口
+也必须报告可读，同时给出RDHUP；SHUT_RDWR另报告HUP。修复保留已排队内容和活动
+reservation，原反例在旧内核漏掉空队列事件，固定Linux及修复后BoarOS均通过。

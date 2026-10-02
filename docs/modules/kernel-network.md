@@ -136,3 +136,8 @@ read/readv零长度仍直接返回；recv/recvmsg零长度检查协议状态：�
 内部空队列状态查询不消费错误，接收入口才交付pending_error。
 同ELF反例由`tests/workloads/network/contract.c`保护，差分新增fresh IPv4/IPv6记录；
 固定依据为`references/linux/net/ipv4/tcp.c`和`include/net/sock.h`（Linux v7.2）。
+
+UNIX DGRAM自身SHUT_RD后，即使空队列也有IN/RDNORM和RDHUP；双向关闭另有HUP。
+活动read reservation仍排除第二个数据消费者，方向事件不提前解除reservation。
+真实U-mode反例核对poll/select/epoll、dup共享方向和关闭前排队内容，固定Linux通过、
+旧BoarOS空队列poll漏事件；修复后通过。依据为固定Linux的`net/unix/af_unix.c`。

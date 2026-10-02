@@ -9,6 +9,8 @@
 #include <sys/uio.h>
 #include <signal.h>
 #include <poll.h>
+#include <sys/epoll.h>
+#include <sys/select.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -297,11 +299,40 @@ static void receive_state(void)
     puts("NETWORK PASS receive-state: fresh TCP errors and zero-length message state");
 }
 
+static void unix_half_close(void)
+{
+    for (unsigned queued = 0; queued < 2; queued++) {
+        int pair[2];
+        CHECK(socketpair(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK, 0, pair) == 0);
+        int shared = dup(pair[1]); CHECK(shared >= 0);
+        if (queued) CHECK(send(pair[0], "q", 1, 0) == 1);
+        CHECK(shutdown(shared, SHUT_RD) == 0 && close(shared) == 0);
+        struct pollfd ready = {.fd = pair[1], .events = POLLIN | POLLRDNORM | POLLRDHUP};
+        CHECK(poll(&ready, 1, 0) == 1);
+        CHECK((ready.revents & (POLLIN | POLLRDNORM | POLLRDHUP)) == (POLLIN | POLLRDNORM | POLLRDHUP));
+        CHECK(!(ready.revents & POLLHUP));
+        fd_set reads; FD_ZERO(&reads); FD_SET(pair[1], &reads);
+        struct timeval timeout = {0};
+        CHECK(select(pair[1] + 1, &reads, NULL, NULL, &timeout) == 1 && FD_ISSET(pair[1], &reads));
+        int epoll = epoll_create1(EPOLL_CLOEXEC); CHECK(epoll >= 0);
+        struct epoll_event event = {.events = EPOLLIN | EPOLLRDHUP, .data.fd = pair[1]};
+        CHECK(epoll_ctl(epoll, EPOLL_CTL_ADD, pair[1], &event) == 0);
+        CHECK(epoll_wait(epoll, &event, 1, 0) == 1 && (event.events & (EPOLLIN | EPOLLRDHUP)) == (EPOLLIN | EPOLLRDHUP));
+        char byte;
+        if (queued) CHECK(recv(pair[1], &byte, 1, 0) == 1 && byte == 'q');
+        CHECK(recv(pair[1], &byte, 1, 0) == 0);
+        CHECK(shutdown(pair[1], SHUT_RDWR) == 0 && poll(&ready, 1, 0) == 1 && (ready.revents & POLLHUP));
+        CHECK(close(epoll) == 0 && close(pair[0]) == 0 && close(pair[1]) == 0);
+    }
+    puts("NETWORK PASS unix-half-close: queued data, shared direction and poll/select/epoll");
+}
+
 int main(void)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
     addresses();
     receive_state();
+    unix_half_close();
     data_and_shutdown();
     options();
     reset_and_accept_rollback();
