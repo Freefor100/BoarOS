@@ -304,10 +304,28 @@ def project_main(args):
     variants = []
     if args.only != "boaros": variants.append(("linux", linux_image(args.linux_kernel), True))
     if args.only != "linux": variants.append(("boaros", args.kernel.resolve(), False))
-    summary = []
+    # Freeze all variants before the first boot. Live build paths may be replaced.
+    source_patch = command("git", "diff", "HEAD", "--binary").stdout
+    (directory / "source.patch").write_text(source_patch)
+    identity = {"driver": sha256(directory / "tree/init"), "fixture": sha256(disk),
+        "lua": sha256(ROOT / "references/lua/lua-5.4.3.tar.gz"),
+        "toolchain": tree_identity(args.toolchain_tree), "qemu": command(args.qemu, "--version").stdout.splitlines()[0],
+        "filesystem": "tmpfs" if args.tmpfs else "ext4", "mode": "performance" if args.performance else "functional",
+        "source_head": command("git", "rev-parse", "HEAD").stdout.strip(),
+        "source_head_tree": command("git", "rev-parse", "HEAD^{tree}").stdout.strip(),
+        "source_patch_sha256": sha256(directory / "source.patch"), "transport": "modern", "cache": "writeback",
+        "qemu_sha256": sha256(shutil.which(args.qemu)), "timebase_hz": 10000000, "ram_mib": 768, "harts": 1,
+        "kernel_snapshots": {}, "status": "running"}
+    snapshots = []
     for name, kernel, linux in variants:
         snapshot = directory / (name + "-kernel")
         shutil.copy2(kernel, snapshot)
+        identity["kernel_snapshots"][name] = sha256(snapshot)
+        snapshots.append((name, snapshot, linux))
+    identity["kernel"] = identity["kernel_snapshots"].get("boaros")
+    (directory / "identity.json").write_text(json.dumps(identity, sort_keys=True, indent=2)+"\n")
+    summary = []
+    for name, snapshot, linux in snapshots:
         for replica in range(args.repeat):
             target = directory / f"{name}-{replica}.img"
             copy_boot_disk(disk, target)
@@ -352,12 +370,7 @@ def project_main(args):
                 parse((extracted / "cost.log").read_text().strip(), 1)
             print(name, replica, "native Lua PASS", flush=True)
     (directory / "commands.tsv").write_text("\n".join("\t".join(map(str,row)) for row in summary)+"\n")
-    identity = {"kernel": sha256(args.kernel), "driver": sha256(args.program),
-        "lua": sha256(ROOT / "references/lua/lua-5.4.3.tar.gz"),
-        "toolchain": tree_identity(args.toolchain_tree), "qemu": command(args.qemu, "--version").stdout.splitlines()[0],
-        "filesystem": "tmpfs" if args.tmpfs else "ext4", "mode": "performance" if args.performance else "functional",
-        "tree": command("git", "write-tree").stdout.strip(), "transport": "modern", "cache": "writeback",
-        "qemu_sha256": sha256(shutil.which(args.qemu)), "timebase_hz": 10000000, "ram_mib": 768, "harts": 1}
+    identity["status"] = "passed"
     (directory / "identity.json").write_text(json.dumps(identity, sort_keys=True, indent=2)+"\n")
     print("Native Lua summary:", summary, flush=True)
 

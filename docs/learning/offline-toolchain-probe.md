@@ -1,97 +1,98 @@
-# 客体内编译的可观察边界
+# 客体内编译：从小探针到原版工程
 
-宿主交叉编译器生成 RV64 ELF，只证明宿主工具链和客体执行路径；验证客体内
-离线编译必须把**可在 RV64 客体内执行**的编译器、汇编器、链接器、libc
-开发文件和依赖安装进同一离线磁盘。探针按预处理、编译、汇编、链接、
-运行分别记录真实子进程状态；若某步失败，后续阶段标记 skipped，避免
-“找到 object 文件”掩盖编译或链接失败。严格模式要求同一输入在固定 Linux
-与 BoarOS 的阶段状态、SHA-256 和最终程序输出一致。
+宿主交叉编译生成RV64 ELF，只证明宿主工具链和客体执行路径。客体内编译需要把
+原生RV64编译器、汇编器、链接器、libc开发文件及依赖安装到同一离线磁盘，实际执行
+构建规则，再运行新产物。目标文件存在、版本字符串正确或包装器退出0，都不足以
+证明这条链路成立。
 
-固定 Linux 在 `/init` 退出后以 panic 结束客体，不走正常卸载。即便客体
-对新产物及其父目录调用了 `fsync`，ext4 的目录项仍可能只在 journal 中；
-直接用 `debugfs` 读原始镜像会误报文件不存在。宿主检查前先用
-`e2fsck -E journal_only -y` 重放，再用 `e2fsck -fn` 核对，且只对该次运行
-的镜像做此操作。GCC 的临时文件在异常退出时还可能留在 ext4 orphan file：
-`journal_only` 不做 orphan 清理，固定 Linux `references/linux/fs/ext4/orphan.c`
-commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 则在下次读写挂载时
-调用 `ext4_orphan_cleanup()`。runner 仅当 fsck 输出**只有** orphan inode
-及其空闲块/inode 计数问题时允许一次显式修复，检查修复输出只含这些变化，
-再执行 `e2fsck -fn` 要求完全干净；其他修复一律失败并保留镜像。这样模拟
-下次挂载可见内容，不把 fsck 的任意修复当成程序成功。
+固定输入由references/sources.tsv和准备脚本校验。当前为Alpine v3.22的
+GCC14.2.0-r6、binutils2.44-r3、musl开发环境和GNU make4.4.1-r3；make许可
+GPL-3.0-or-later，Lua5.4.3许可MIT。工具和Lua保持原包/发布内容。
+固定Linux依据位于references/linux（v7.2）；精确输入身份归机器清单，人类记录
+保留版本、机制、结果与重建入口。
 
-2026-09-27 的无编译器诊断基线：固定 Linux
-`references/linux` commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`
-的 Image SHA-256 为 `7ca338ec75e681cc68c5d946b3ae633fc0088fd78569b7847528105a9de6c8ec`；
-BoarOS Image SHA-256 为 `717e11b014a2de22165e9f6ffe7d86199c9da5c17937933808efcb02f62dec17`；
-驱动 SHA-256 为 `7810210bfc8cc50c65923650633c84e7aea69b1dce24ce6a0ff14f1f04fa7713`；
-QEMU 为 11.1.1。两侧的第一失败均为 `preprocess:exec:2`，其余四阶段
-跳过，`stages.tsv` SHA-256 同为
-`bc6803c7bab4a798c61cd77da971f93f99cb0cb5c57d3706f9f0aa9779bd2728`。
-重建入口：`make test-offline-c-baseline-riscv`。这不是 C 编译通过的证据。
+## 小探针怎样发现通用缺口
 
-2026-09-27 的固定 Alpine GCC 14.2.0-r6 路线（15 个 riscv64 APK 的完整
-URL、SHA-256 和许可见 `references/sources.tsv`、
-`docs/modules/program-environment.md`）暴露两个通用 ABI 缺口：GCC 的 cc1
-以 `O_NOCTTY` 打开 `/work/program.c`，BoarOS 原先在 flag 校验阶段返回
-`EINVAL`；随后四个编译阶段与 Linux 的产物已逐字节一致，但 GCC 对链接
-产物调用 `fchmodat`，原先 `ENOSYS` 使最后 `execve` 返回 `EACCES`。
-按固定 Linux `references/linux/fs/open.c` commit
-`f4cdf7ca9a1fdcca413157df19753f388a5a224e` 与 raw 差分，BoarOS
-接纳 `O_NOCTTY`，在 fs context 中保存 umask，并通过 lwext4 活 inode
-handle 事务实现 `fchmod/fchmodat`。路径专用 setter 不可行：已 unlink 的
-fd 仍须修改原 inode；直接越过 lwext4 改 raw inode 又会绕开 journal、
-ctime 和错误 owner。固定 Linux 的 `fchmod(pipefd)` 也成功，但 pipe
-合成inode mode/fstat当时未实现；此点不在该次编译器负载覆盖内，后续实现见文末。
+2026-09-27先建立没有编译器的诊断镜像，Linux和BoarOS均在预处理阶段无法exec，
+后续四阶段跳过。这是有效的失败分类，不能称为离线编译成功。
 
-重建：`make prepare-offline-c-toolchain`，随后
-`make test-offline-c-riscv OFFLINE_C_LINUX_KERNEL=<固定 Image>`；不提供
-Image 时按固定 Linux 来源构建。严格运行的五阶段退出码两侧全为 0，
-`.i/.s/.o/ELF/output.txt` 的 SHA-256 各自双侧相同；生成 ELF 为
-`9eb903417c06855766559ca00af19529ee85aa8a35973c2840de6ec6655e2697`，
-stdout SHA-256 为
-`a3f7bf4004ee05dee3c87923426f96984cb656d08bc17301a18c78910448c37f`。
-Alpine 展开树 SHA-256 为
-`ce84a7bb9fc7c97552121b37238622bbefbd4a3672600b57374e25230c582a07`；
-固定 Linux Image SHA-256 为
-`7ca338ec75e681cc68c5d946b3ae633fc0088fd78569b7847528105a9de6c8ec`。
+安装原GCC后，cc1以O_NOCTTY打开源文件，原内核的flag校验返回EINVAL；接纳该
+通用flag后，又在GCC对链接产物执行fchmodat时遇到ENOSYS，最终exec返回EACCES。
+修复使用lwext4的活inode句柄与事务，保护unlink后的fd、ctime及错误owner。
+最终预处理、编译、汇编、链接、运行五阶段在两侧均退出0，产物逐字节一致。
+2026-09-28的VFS/proc整合后复验保持一致。
 
-主分支整合 glibc/futex 后的重建再次通过 `make test-offline-c-riscv`：
-BoarOS `kernel-rv` SHA-256 为
-`9f848c4b74aa8415c0869616abfccd456e26742e1959d717b7f59f57f50164c4`，
-固定 Linux Image SHA-256 为
-`16a93ddb1d451898b93fff14de0cc076bcf1b10dad54c19a3e179a6cd81103b1`，
-驱动 SHA-256 为 `7810210bfc8cc50c65923650633c84e7aea69b1dce24ce6a0ff14f1f04fa7713`，
-输入 C 源 SHA-256 为 `5f3226afadc0a75dc9a9692baa7428fca406c00c65711b786b0994d94caf5beb`。
-五阶段均为 `exit:0`；产物哈希仍与上段一致。固定 Linux 异常退出产生的
-orphan 文件在审核后清理，最终 `e2fsck -fn` 完全干净。
+默认的小型探针仍由`make test-offline-c-riscv`运行；无工具诊断入口为
+`make test-offline-c-baseline-riscv`，两者判定边界不同。新项目选择不会改变默认行为。
 
-2026-09-28 通用 VFS/procfs 阶段复验 `make test-offline-c-riscv`：
-BoarOS 内核 SHA-256 `1a0dc5b9dc338e01d9fc7b10c689edaaa761f75952bc8fce90f2f4a4c1478167`，固定 Linux Image SHA-256 `09aef347ca137306aa97c9b7a87ec464bae1097011ce15f08b91529e114f8b5c`，Alpine 展开树 SHA-256 `ce84a7bb9fc7c97552121b37238622bbefbd4a3672600b57374e25230c582a07`。预处理、编译、汇编、链接、运行五阶段两侧均 `exit:0`；生成 ELF 与输出 SHA-256 保持上述固定值，未出现回退。
+## 镜像与参考环境也必须有效
 
-2026-09-29 [CI run #36](https://github.com/Freefor100/BoarOS/actions/runs/36513240987) 的 SQLite DELETE/WAL 均通过，离线 GCC 却在 `/init` 执行前的根盘启动过程中报 VirtIO 一秒 timeout。失败日志只能证明设备请求超时，不能据此判定 ext4 或 SQLite 回归，也未打印出请求类型。该 fixture 逻辑大小 556598166 字节、实际分配约 248 MiB；原 `shutil.copyfile` 把每个启动副本扩成约 531 MiB，两侧启动前增加约 600 MiB 无意义的宿主写入。本地旧 QEMU 8.2.2 在 25% 和 5% CPU 配额下各 20 次根启动均通过，单纯 CPU 配额未复现 CI 的块延迟。runner 现使用保留稀疏空洞的复制并在启动前 `fsync` fixture 和副本，减少宿主回写与客体首次请求竞争；逐字节 `cmp` 已确认副本内容不变，内核一秒超时也不变。修正后的本地 QEMU 11.1.1 双侧五阶段通过，QEMU 8.2.2 上 BoarOS 单侧五阶段连续 10 次通过。远端间歇性故障是否消除仍须新 CI run 验证。
+固定Linux的PID1退出以panic停止客体，并没有正常卸载ext4。fsync后的目录项可能
+仍位于journal中，直接debugfs查询会误报缺失。执行器先重放日志，再检查一致性；
+只有明确属于异常退出的orphan清理才允许一次限定修复，其他fsck修复均失败。
+依据为references/linux/fs/ext4/orphan.c。BoarOS则在可信启动栈回收任务和根挂载。
 
-2026-09-29 [CI run #37](https://github.com/Freefor100/BoarOS/actions/runs/36515194047) 证实稀疏复制与同步已生效，DELETE/WAL 仍通过；离线 GCC 在 QEMU 8.2.2 上变为固定 Linux 的 `preprocess:signal:4`，BoarOS 五阶段均 `exit:0`。本地同版 QEMU 的 `-d int` 记录用户态 `epc=0x2d83e`、指令 `0xaca2`；固定 Alpine `usr/bin/gcc` 的反汇编为 `fsd fs0,88(sp)`。QEMU 8.2.2 的 `virt` DTB 只有 `riscv,isa=rv64imafdch...`，QEMU 11.1.1 同时提供 `riscv,isa-extensions`。固定 Linux `references/linux/arch/riscv/kernel/cpufeature.c` 和 `Kconfig`（commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`）表明精简配置若禁用 `CONFIG_RISCV_ISA_FALLBACK`，旧 DTB 不能识别 F/D，`start_thread` 不打开用户浮点状态。同一 Linux Image 在 QEMU 8.2.2 仅加 `riscv_isa_fallback` 启动参数就完成五阶段。因此两个固定 Linux 测试 profile 显式启用该回退；旧 QEMU 的参考侧恢复真实浮点能力，较新 QEMU 仍用扩展列表。先前把本地 SIGILL 视为无关环境差异的结论已撤回。
+[CI run36](https://github.com/Freefor100/BoarOS/actions/runs/36513240987)中SQLite
+通过而离线GCC在根盘第一请求超时。该现场没有请求类型，不能归因于ext4或SQLite。
+原复制会把稀疏镜像扩成大量零写；执行器改为保留空洞并在启动前同步副本，镜像
+内容和内核一秒超时保持不变。
 
-修正后的本地固定 Linux Image SHA-256 为 `48ef24ee16e84e9f7b4c593a1b0794b43c6cedc9611ff581e4fefc87a5d3db35`，实际 `.config` 同时含 `CONFIG_FPU=y` 与 `CONFIG_RISCV_ISA_FALLBACK=y`。Ubuntu 24.04 的 QEMU 8.2.2 环境中，`make test-offline-c-riscv` 的双侧五阶段、679 条差分、ELF 尾页以及 SQLite DELETE/WAL 均通过；QEMU 11.1.1 的离线 GCC 严格对照也通过，产物哈希维持不变。这是本地 CI 环境复现，不代替新提交在 GitHub Actions 上的最终结果。
+[CI run37](https://github.com/Freefor100/BoarOS/actions/runs/36515194047)中的新失败
+是固定Linux在旧QEMU上SIGILL。相同版本复现和反汇编定位到用户浮点指令；旧DTB
+只提供riscv,isa，精简Linux配置未启用ISA回退，未开启用户浮点状态。
+启用固定Linux的CONFIG_RISCV_ISA_FALLBACK后，本地QEMU8.2.2与11.1.1均通过。
+依据为references/linux/arch/riscv/kernel/cpufeature.c和Kconfig。此结论是本地复现，
+不替代新提交在远端CI上的结果。
 
-## 共享管道元数据（2026-10-03）
+## 管道与默认FIFO jobserver（2026-10-03）
 
-原fchmod只接受有VFS inode的OFD，匿名pipe返回ENOTSUP，fstat还固定为0600。
-同一用户态探针在固定Linux通过、旧BoarOS在fchmod失败；修复将mode、ctime和
-稳定身份放入已有共享pipe，两端及dup/fork/proc重开一致。匿名管道读写不伪造
-普通文件时间更新，改权不改变已经打开的访问方向。坏stat指针用raw syscall验证，
-避免把libc内部转换时的用户fault误当成内核errno。
-依据是references/linux/fs/open.c与fs/pipe.c，固定Linux v7.2；重建入口
-为make test-fifo-riscv，已有文件聚焦回归通过。本段不宣称命名FIFO或Lua工程完成。
+匿名pipe原先固定返回0600，fchmod返回ENOTSUP。mode、创建时间、ctime和稳定身份
+现归共享pipe；两端、dup/fork/proc重开一致，改权保留FIFO类型和原访问方向。
+匿名pipe读写不更新文件时间。坏stat指针使用raw syscall，避免把libc转换时的用户
+fault误当作内核errno。
 
-## 命名FIFO与默认jobserver（2026-10-03）
+命名FIFO的身份、权限与时间归真实ext4/tmpfs inode，传输与等待归pipe。
+节点只保存弱关联，每个打开中和已打开的OFD另持节点与pipe。最后owner先摘关联、
+丢弃缓冲，再关闭VFS引用，避免循环引用和重复端点归还。硬链接与改名沿用实例，
+unlink后已打开实例仍有效，同名重建则隔离为新inode。
 
-固定Linux的fs/pipe.c使用读写到达计数处理打开会合。仅看当前人数会漏掉“对端已出现又
-立即关闭”，使打开者再次睡眠。BoarOS采用同样的代次边界；数据和等待队列仍归pipe，
-身份与时间归真实inode。弱关联避免节点与pipe互相持引用，打开中也必须有独立owner。
+固定Linux的fs/pipe.c以到达计数保护“对端出现后立即关闭”。只重查当前人数会漏掉
+会合并再次睡眠。BoarOS采用到达代次；初始非阻塞只读尚未见过写者时抑制HUP，
+随后写者离开才报告HUP。信号重启、取消和fd满均不残留资格。对象与64KiB连续缓冲
+分配失败后可重试，最终归还owner。只读挂载允许FIFO传输，无法取得挂载写资格时
+跳过时间更新；节点可以同步持久化，传输内容永不恢复。
 
-同ELF先在旧BoarOS以mkfifo ENOTSUP失败；修复后ext4/tmpfs的身份隔离、HUP、
-信号重启/取消、fd满和最终清理成立。只读挂载仍可传输，Linux的file_update_time在
-无法取得挂载写资格时跳过时间更新；不能把普通文件的EROFS直接套到FIFO传输。
-节点同步后重启仍是FIFO，旧pipe内容不恢复。对象与连续缓冲OOM均验证失败后可重试。
-依据为references/linux/fs/{pipe,inode}.c，固定Linux v7.2；重建`make test-fifo-riscv`。
+同ELF先证伪旧mkfifo行为，再验证两种文件系统、打开会合、poll/select/epoll、时间、
+信号、只读挂载和重启。重建`make test-fifo-riscv`；OOM入口为`make test-files-riscv`。
+语义依据为references/linux/fs/{pipe,open,inode}.c。
+
+## 原版Lua工程的完整流程（2026-10-03）
+
+使用34个C源文件与原Makefile，在客体运行`make -j1 linux`和`make -j2 linux`。
+两侧完成干净构建、无变化重建、仅lapi.c改变的增量、clean后重建、明确语法错误的
+非零退出及恢复。对象与lua/luac/liblua.a的内容保持一致；无变化重建不重新编译，
+增量只更新必要对象、归档和链接目标。新Lua实际执行文件/模块和受控子进程，luac
+完成字节码往返，静态库嵌入程序与C动态模块运行。同步后重启仍可使用这些产物。
+
+默认make jobserver确实使用命名FIFO。递归负载的共享计数证明峰值两份资格，六个
+任务全部完成且令牌归还；中断后子进程被回收，GMfifo节点被删除。正式性能输入
+不使用这套资格诊断包装器。
+
+参考流程曾因镜像缺/bin/echo失败：make可直接exec简单recipe，因此shell中能执行
+某工具并不代表PATH里有对应程序。补齐工具链接后Linux的窄探针和完整流程成立。
+错误恢复驱动还使用过未实现的路径truncate系统调用；现用已有ftruncate恢复输入。
+这未修改Lua或make，路径truncate仍是能力缺口，不被这次工程通过掩盖。
+
+重建`make prepare-offline-c-toolchain test-offline-project-riscv`。现有小C探针默认
+不变；项目执行器记录每条命令的argv、cwd、真实wait status、耗时和产物身份。
+运行目录与机器记录在忽略的build，Git保存本记录与可重建代码。
+
+收口审查补到了信号与会合的交错：信号已将打开者唤醒，但它恢复前对端已出现又关闭。
+固定Linux仍认领成功会合；旧代码错误返回EINTR，SA_RESTART还可能错过对端再等待。
+以不同实时优先级控制单hart交错，先证伪再修复，读写两方向和两类信号均通过。
+窄探针使用raw sched_setscheduler，因为固定musl的POSIX同名封装返回ENOSYS，不能
+把该libc行为误报为系统调用缺失。
+
+执行器的输入身份也改为在启动前固定：驱动取实际fixture中的init，Linux与BoarOS
+均使用独立kernel快照；源commit、源树与未提交patch分开记录。运行结束不再重新
+散列可被重建替换的输入路径。确定性测试在模拟启动中替换这些文件，保护这个契约。

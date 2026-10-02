@@ -266,7 +266,10 @@ int kernel_pipe_fifo_open(struct kernel_heap *heap, struct kernel_vfs_node *node
             if (kernel_scheduler_block_current(&pipe->both_queue, 0, 1, &reason) != KERNEL_SCHEDULER_STATUS_OK) {
                 result = -KERNEL_EIO; break;
             }
-            if (reason == KERNEL_WAIT_SIGNALLED) {
+            /* 信号唤醒后仍优先认领已经发生的会合，避免重启后错失短暂对端。 */
+            if (reason == KERNEL_WAIT_SIGNALLED &&
+                (direction == KERNEL_PIPE_ENDPOINT_READ ?
+                 pipe->writer_generation : pipe->reader_generation) == generation) {
                 kernel_signal_note_syscall_restart(kernel_task_current());
                 result = -KERNEL_ERESTARTSYS; break;
             }

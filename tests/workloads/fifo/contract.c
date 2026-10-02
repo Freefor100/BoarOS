@@ -16,6 +16,7 @@
 #include <sys/epoll.h>
 #include <sys/select.h>
 #include <sys/sysmacros.h>
+#include <sched.h>
 #define CHECK(x) do { if (!(x)) { fprintf(stderr,"fifo:%d: %s errno=%d\n",__LINE__,#x,errno); exit(1); } } while(0)
 static void metadata(void)
 {
@@ -135,6 +136,27 @@ static void handshake(void)
     CHECK(open(path,O_WRONLY|O_NONBLOCK)==-1 && errno==ENXIO);
     CHECK(unlink(path)==0);puts("FIFO PASS handshake and cancellation");
 }
+static void signal_meeting(void)
+{
+    CHECK(mkdir("/signal-fifo",0755)==0&&mount("tmpfs","/signal-fifo","tmpfs",0,NULL)==0);
+    const char *path="/signal-fifo/meeting";CHECK(mkfifo(path,0600)==0);
+    struct sched_param priority={.sched_priority=20};CHECK(syscall(SYS_sched_setscheduler,0,SCHED_FIFO,&priority)==0);
+    for(int writer=0;writer<2;writer++) for(int restart=0;restart<2;restart++) {
+        pid_t child=fork();CHECK(child>=0);
+        if(!child) {
+            priority.sched_priority=10;CHECK(syscall(SYS_sched_setscheduler,0,SCHED_FIFO,&priority)==0);
+            struct sigaction act={.sa_handler=handler,.sa_flags=restart?SA_RESTART:0};sigemptyset(&act.sa_mask);CHECK(sigaction(SIGUSR1,&act,NULL)==0);
+            int fd=open(path,writer?O_WRONLY:O_RDONLY);CHECK(fd>=0&&close(fd)==0);_exit(0);
+        }
+        wait_blocked(child);
+        /* 高优先级父任务保证信号与短暂对端先于被唤醒者恢复。 */
+        CHECK(kill(child,SIGUSR1)==0);
+        int fd=open(path,(writer?O_RDONLY:O_WRONLY)|O_NONBLOCK);CHECK(fd>=0&&close(fd)==0);
+        int status;CHECK(waitpid(child,&status,0)==child&&status==0);
+    }
+    priority.sched_priority=0;CHECK(syscall(SYS_sched_setscheduler,0,SCHED_OTHER,&priority)==0);
+    CHECK(unlink(path)==0&&umount("/signal-fifo")==0);puts("FIFO PASS signal meeting wins");
+}
 static void readonly(void)
 {
     puts("FIFO readonly discovery");unsigned major=252,minor=16;FILE *devices=fopen("/proc/devices","r");
@@ -156,7 +178,7 @@ int main(void)
         struct stat st;CHECK(stat("/persist-fifo",&st)==0&&S_ISFIFO(st.st_mode)&&(st.st_mode&0777)==0640);
         int fd=open("/persist-fifo",O_RDWR|O_NONBLOCK);CHECK(fd>=0);char byte;CHECK(read(fd,&byte,1)==-1&&errno==EAGAIN);CHECK(close(fd)==0);puts("FIFO PASS reboot");puts("FIFO PASS all");return 0;
     }
-    readonly();metadata();handshake();named("/fifo-ext4");
+    readonly();metadata();handshake();signal_meeting();named("/fifo-ext4");
     CHECK(mkdir("/ram",0755)==0 && mount("tmpfs","/ram","tmpfs",0,NULL)==0);
     named("/ram/fifo");CHECK(umount("/ram")==0);
     CHECK(mkfifo("/persist-fifo",0640)==0);int fd=open("/persist-fifo",O_RDWR|O_NONBLOCK);CHECK(fd>=0&&write(fd,"volatile",8)==8&&close(fd)==0);sync();puts("FIFO PASS all");return 0;
