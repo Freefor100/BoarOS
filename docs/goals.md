@@ -4,37 +4,36 @@
 `[x]` 只表示具体交付已验收；历史测量、输入身份和可重建命令归现有 learning。
 固定 Linux 位于 `references/linux`，精确版本与其他资料由 `references/sources.tsv` 管理。评审是调查输入，不自动成为实现或验收证据。
 
-## 当前轮：原版网络应用与 IPv6 双栈 loopback（2026-10-02）
+## 当前轮：socket 纠错、TCP 复制与日志批次（2026-10-02）
 
-本轮交付原 iperf 3.13、netperf 2.7.0 的完整本地网络流程；保留两种 libc 的
-原 ELF、脚本和参数，共 22 个客户端子项。不设置吞吐倍数或评分准入条件。
-旧 iperf 客户端诊断没有服务器，Linux 也未提供可用 loopback，不能据此认定
-正常连接会 reset。原服务端默认使用 IPv6 双栈监听，因此本轮包含本地 IPv6。
+本轮处理已经核实的错误状态、遗漏通知和重复工作；不设吞吐倍数或评分门槛。
+性能收口同时核对机制成本、真实程序进展、同步/最终排空与内存代价，不把内部计数下降
+直接当成端到端收益。沿 main 推进，最终单向合入兼容分支；旧 glibc 使用兼容配置。
 
 | 任务 | 交付与状态 |
 |---|---|
-| N2a 地址与双栈 | [x] 统一地址对象、::1、映射地址、双栈监听、V6ONLY、端口冲突与地址输出 |
-| N2b 连接与选项 | [x] 已接入 getpeername/getsockopt、预算和选项、UDP 对端/解除及 SYN 拒绝；来源过滤、收发等待已同 ELF 验证 |
-| N2c 数据与生命周期 | [x] 原 netperf 所需 ITIMER_REAL 已补齐并同 ELF 验证； send/recv、整包与用户 fault、半关闭、backlog、就绪、取消和协议回收 |
-| N2d 原版应用 | [x] 两种 libc 22 项受控原 ELF 完成；原 netperf 脚本5/5，iperf连续脚本竞态单列，未冒充全部通过 |
-| N2e 结果与收口 | [x] 内容负载、修正版三个关闭观测启动、一次有效定点归因及独立协议排空；1166 ABI、系统、scale与栈验收 |
+| D1 TCP 接收状态 | [ ] 未连接、连接中、数据/错误/EOF及零长度 read/recv；接收与就绪状态一致 |
+| D2 UNIX DGRAM半关闭 | [ ] own SHUT_RD/SHUT_RDWR的可读、RDHUP/HUP；保留reservation独占 |
+| D3 接收预算通知 | [ ] STREAM/DGRAM扩大实际接收预算后通知已阻塞对端；关闭/取消不遗留owner |
+| T1 流发送暂存游标 | [ ] EAGAIN和部分发送后复用尚未发送的暂存内容，保留fault前缀、期限和pin |
+| J1 按版本量和期限封口 | [ ] 去掉64次操作软阈值；保留256KiB、首脏100ms、同步/强制和真实资源条件 |
+| V1 结果与收口 | [ ] 选定原消费者对照、恢复及系统集中验收；报告绝对值、分布、代价和剩余成本 |
 
-继续固定 lwIP 2.2.1 raw API、NO_SYS 和单 hart；协议对象用有界池，socket/OFD
-和请求 owner 沿现有堆与 pin。半关闭和取消不能提前释放真实 owner。每方向缓冲
-预算默认及上限 64 KiB，按需使用；未知选项明确报错，不用零值成功伪造统计。
+先用窄反例证伪，再分问题修复和提交。I/O只比较自动、四进程(0,1)/(6,7)，网络只比较
+单TCP、五TCP、UDP_RR；新候选各三次串行关闭观测启动，身份不匹配才补相应旧版。
+旧/新策略各一次定点COST，不重跑C0–C6或八组评分。改变事务边界后集中一次完整
+lwext4、SQLite DELETE/WAL恢复与双盘；最终一次RV64、真实libc、1166及新增ABI、
+scale、四组合io-sleep和栈。已通过且没有相关修改的范围不重复运行。
 
-窄测试先证伪旧行为，最终集中一次 RV64、真实 musl/glibc、1166 条
-ABI、socket scale 和栈检查；已通过且未受新修改影响的不重复运行。不运行
-iozone、C0–C6 或存储恢复矩阵。原脚本退出 0 不代替逐项实际传输；参考侧和
-启动时序失败单列。网络按时长运行，比较传输量、事务和进展，不用固定时长
-冒充速度。完整 Harness 仍缺 kernel-la。
-
-沿 main 分问题提交，Co-authored-by 使用 GPT-6.1 Sol；最终单向合入兼容分支。
-证据收口后清理运行产物并保留缓存，本轮不 push、发布或阶段转换。
+日志和必要FLUSH保留，不更换调度器、不扩大TCP窗口、不接入零拷贝、不改checkpoint
+选择。运行输出只在忽略的build；Git保留结论和重建命令。本轮不push、发布或阶段转换；
+完整Harness缺kernel-la的阻塞继续保留。提交trailer使用GPT-6.1 Sol。
 
 ## 下一阶段：真实网卡与宿主网络（N3）
 
-以本轮 socket 基线推进 VirtIO-net、实际收发/IRQ/DMA owner 和宿主双向应用。
+以当前 socket 基线推进单队列 VirtIO-net、静态 IPv4＋ARP及实际收发/IRQ/DMA owner；
+在隔离宿主网络完成双向TCP/HTTP文件传输、内容与错误回收。DHCP/DNS、多队列和
+offload不并入首期。N3不等待I/O接近Linux。
 中等规模离线 C 工程与交互式 shell 是后续应用候选；LoongArch 为双架构交付
 的独立依赖，SMP 单独处理跨核锁、IPI/TLB 和回收。性能候选由实际应用证据触发。
 
@@ -43,7 +42,7 @@ iozone、C0–C6 或存储恢复矩阵。原脚本退出 0 不代替逐项实际
 | 触发证据 | 候选与必要代价 |
 |---|---|
 | 重复读取/未命中仍支配目标应用阶段 | 回收预算、必要预读或可省读取；核对内存峰值、压力和脏数据一致性 |
-| 每组有效修改少且操作数主导封口 | 重复修改合并/组预算；核对脏数据年龄、内存/日志空间和同步尾延迟 |
+| 新封口政策下仍有细碎版本或重复准备 | 增量组织/合并；先量化，核对脏数据年龄、内存/日志空间和同步尾延迟 |
 | checkpoint阻塞提交或最终排空成本显著 | 有界批次和调度；核对积压、日志环绕、低内存、卸载及完整恢复 |
 | 固定热缓存负载运行成本高 | staging复用、重复解析/复制/查询；保留EFAULT前缀、取消和页生命周期 |
 | 真实大映射/多等待者负载规模退化 | resident范围索引、deadline索引或安全长操作边界；核对维护成本、OOM和取消 |
@@ -54,10 +53,11 @@ iozone、C0–C6 或存储恢复矩阵。原脚本退出 0 不代替逐项实际
 
 | 阶段/能力 | 事实与证据入口 |
 |---|---|
+| N2a–N2e网络应用 | IPv6双栈、选项、半关闭与生命周期、22项受控原ELF、内容负载和1166 ABI已交付；原iperf连续脚本参考竞态单列，见[网络记录](learning/network-ownership.md#原版网络应用交付2026-10-02) |
 | A＋B缓存与环境 | 已交付缓存命中先于回收、读来源和进展归因、真实日志/RTC/根盘；BusyBox55/55、1118 ABI及结果见[成本基线](learning/cost-baseline.md#缓存查询顺序纠错2026-10-01) |
 | R1–R8组合边界 | SHM owner/attachment/权限、msync pin、整包DGRAM、同步故障与整次写门闩已交付；1091 ABI及RV64/真实libc/恢复证据见[组合边界](learning/cost-baseline.md)、对应模块和Git提交 |
 | 进程身份、随机、调度 | TID/TGID/PGID/SID、coarse clock、可信VirtIO RNG、OTHER/FIFO/RR与实时预算已交付；见[消费者](learning/session-consumers.md)、[调度](learning/kernel-scheduling.md) |
-| C0–C6成本测量 | 已收口的窗口/输入/开销/unknown与原消费者结果见[成本基线](learning/cost-baseline.md)、既有JSON归档；不重复保留测量待办 |
+| C0–C6成本测量 | 已收口的窗口/输入/开销/unknown与原消费者结果见[成本基线](learning/cost-baseline.md)、可重建命令；不重复保留测量待办 |
 | S0–S5异步日志与交接 | 私有undo、running/frozen组、mount worker、idle IRQ和FIFO资格已交付；原五项写吞吐实测改善25.29–54.00倍，属于历史测量而非新准入条件 |
 | S6–S8存储流水线 | 增量预留/有界池、sealed/durable/checkpoint分离、八span批量和共享relatime已实现及恢复验收；见[S9报告](learning/cost-baseline.md#s9-存储流水线验收2026-10-01) |
 | S9消费者收口 | 测量/归档与正确性验收完成；原性能预期未达：Parent写0.98–1.88倍，自动程序+fsync收尾12.668/14.339秒，改善23.09%/22.04%；musl读Parent当时回退17.05%；后续A＋B已解释进展分布并单独测量根卸载余量 |
