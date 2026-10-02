@@ -167,6 +167,9 @@ CPU分解，就不能称它为唯一根因。下一次性能调查应限定内�
 重建正式分布：准备工具链后，先以ROOT_DRAIN_FIXTURE=1构建独立fixture内核，再运行：
 
 ```sh
+make prepare-offline-c-toolchain build/riscv/tests/user/offline-project-rv
+make -j4 ROOT_DRAIN_FIXTURE=1 BUILD_DIR=build/offline-project/riscv-drain \
+  KERNEL_RV=build/offline-project/kernel-rv all
 python3 -B tests/offline-c-riscv.py --project lua --performance --repeat 3 \
   --kernel build/offline-project/kernel-rv \
   --program build/riscv/tests/user/offline-project-rv \
@@ -179,3 +182,7 @@ COST构建使用COST_DIAGNOSTICS=1、ROOT_DRAIN_FIXTURE=1；相同执行器加
 归本地机器记录。完整RV64、真实musl/glibc、1207条差分、scale、四组合io-sleep和
 栈检查通过；信号会合修正后仅重跑受影响的FIFO/文件/信号与差分。未改事务、写回或
 队列顺序，未重跑无关iozone或完整故障恢复矩阵。历史三项异常仍按goals保留。
+
+最终候选已单向合入oscomp-rv-compat，原旧glibc BASIC_TCP完成wait=0、无超时，
+后代清理为0；兼容配置的FIFO与重启也通过。主分支保留BoarOS uname，不将该旧glibc
+结果写成默认main全面兼容。回到main后重建正常内核；本轮未push。
