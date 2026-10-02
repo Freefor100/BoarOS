@@ -119,7 +119,7 @@ zombie 先逻辑回收再复制 status/rusage，因此坏输出指针的 EFAULT 
 
 `kernel/sync.h` 的 mutex/RWlock guard 记录任务 io_context owner 与锁序，非法释放、递归误用、逆序及读转写触发 fatal。争用者按 FIFO 排队；释放时先给队首写者预留独占资格，或给连续队首读者预留共享资格，再定向唤醒。预留者尚未运行时也阻止新到任务抢占；排队写者后的读者及 try_read 不能越过队列。等待不可中断，信号退出在取得与释放后处理，栈上的等待记录不被提前销毁。只有队列/引用/状态发布使用短关中断区，持锁跨设备等待允许其他任务运行。分配器回收深度及 lwext4 重入深度属于任务上下文。
 
-公共 trap 返回在 S-mode 仅允许空闲任务、且未持 I/O 锁时消费 need_resched，防止外部 IRQ 在开中断与 WFI 之间已处理却继续入睡。普通持锁内核路径仍不增加任意抢占。`test-scheduler-cases-riscv` 不借助 timer 验证 idle 返回调度，并验证读写 FIFO、后到者不抢锁及 1/8/32 等待者；原实现分别出现一次 idle 失败和两次交接顺序失败。成本锁持有时间包含资格已交接但获得者尚未运行的区间。
+外部IRQ的公共trap返回在S-mode仅允许空闲任务、且未持I/O锁时消费need_resched，防止中断在开中断与WFI之间已处理却继续入睡。这条限制不适用于既有timer调度：开启SIE的普通内核线程仍可在tick切换，持有I/O锁不等于禁止抢占。syscall进入时SIE关闭，但显式block/yield仍能切换；共享元数据必须有独立临界区和睡眠前引用，不能以单hart或持锁作为整段不可切换的证明。buddy/slab已补对应保护，见[物理页模块](physical-pages.md)。`test-scheduler-cases-riscv` 不借助 timer 验证 idle 返回调度，并验证读写 FIFO、后到者不抢锁及 1/8/32 等待者；原实现分别出现一次 idle 失败和两次交接顺序失败。成本锁持有时间包含资格已交接但获得者尚未运行的区间。
 
 存储等待以 `interruptible=0` 登记：pending 信号与组退出不能拆除 DMA owner；设备完成或 reset 后原调用栈先释放资源，再在用户返回边界处理退出。指定的 cleanup task 排空已退出任务和 root-boot 收尾，阻塞时正常调度；idle/IRQ 不进入运行期可睡眠存储。无块设备的纯模块 fixture 可继续由 idle 回收不含存储的任务。清理结束检查任务锁/backend 状态均为空。
 

@@ -112,6 +112,6 @@ S6–S8 存储流水线已落地：有界资源复用、封口与容量等待分
 
 2026-10-02已交付N3：DTB发现的VirtIO-net legacy/modern、静态eth0、ARP及有界IPv4重组，IRQ收割、worker每批八帧。RX直接引用DMA至最后pbuf释放，最多32借用并有界回退；TX仍复制。原BusyBox wget/httpd在main/musl与兼容glibc的两种transport完成双向16MiB GET、16MiB CGI上传和4KiB文本POST。完整RV64、真实libc、1196 ABI、scale和栈，以及22项loopback已验收。
 
-modern关闭观测三次启动，固定内容的单/五TCP双向总量效率中位297/285Mbit/s，匹配Linux1171/1107；完整程序12.151秒，退出后到根卸载关机另约2.035秒。两项计时不能混称为纯网络或checkpoint耗时。仍有复制、协议和应用固定成本，不设置倍数门槛；buddy/slab timer交错已修复；旧QEMU Virtqueue告警未确定具体来源。公网、DNS/TLS和外部IPv6未交付。
+modern关闭观测三次启动，固定内容的单/五TCP双向总量效率中位297/285Mbit/s，匹配Linux1171/1107；完整程序12.151秒，退出后到根卸载关机另约2.035秒。两项计时不能混称为纯网络或checkpoint耗时。仍有复制、协议和应用固定成本，不设置倍数门槛；buddy/slab timer交错已修复；旧QEMU Virtqueue告警未确定具体来源。公网、DNS/TLS和外部IPv6未交付。下一主线已选择中等规模离线C工程，先完成真实构建、重建和错误退出，再由实际成本选择优化；近期队列统一见[开发路线](docs/goals.md)。
 
 接口与owner见[网卡模块](docs/modules/riscv-virtio-net.md)，内容、分布和剩余成本见[真实网卡记录](docs/learning/network-ownership.md#真实-virtio-net-与宿主应用交付2026-10-02)。下一应用由真实需求选择，现有路线只保留一项待选应用与证据触发的性能候选。

@@ -4,37 +4,48 @@
 `[x]` 只表示具体交付已验收；历史测量、输入身份和可重建命令归现有 learning。
 固定 Linux 位于 `references/linux`，精确版本与其他资料由 `references/sources.tsv` 管理。评审是调查输入，不自动成为实现或验收证据。
 
-## 近期交付：VirtIO-net、零拷贝接收与宿主双向应用（N3）
+## 当前状态与未关闭风险（2026-10-03）
 
-已确认legacy/modern单对RX/TX split队列；RX为custom pbuf零拷贝，借用达到上限时
-有界复制回退。静态IPv4＋ARP、48 pbuf/8对象的IPv4分片重组、隔离TAP和真实TCP/HTTP
-已交付。不设吞吐倍数门槛，未扩大TCP窗口或改调度器；实际结果与限制见
-[真实网卡记录](learning/network-ownership.md#真实-virtio-net-与宿主应用交付2026-10-02)。
+N3已经交付：legacy/modern VirtIO-net、受限DMA借用与复制回退、静态IPv4＋ARP、
+有界分片重组，以及隔离宿主双向TCP/HTTP。1196条ABI、原22项网络客户端和相关系统
+回归属于该轮已完成证据，见[网卡记录](learning/network-ownership.md#真实-virtio-net-与宿主应用交付2026-10-02)。
+随后buddy/slab的timer抢占竞态已确定性复现、修复并验收；纯块超时也已补reset前快照。
+最新两项修复目前只在main，兼容分支仍需接收并做受影响的旧glibc验收。
 
-| 阶段 | 状态与交付 |
+| 未关闭项 | 当前证据与下一步 |
 |---|---|
-| N3a 现场与驱动 | [x] 页释放失败原因、队列/设备现场；32描述符、64×2KiB RX/TX、两种传输及真实DMA/reset owner |
-| N3b 零拷贝与worker | [x] 最后pbuf引用前不复用DMA；最多32借用、压力回退、控制余量、IRQ不分配及8帧有界处理 |
-| N3c ARP与重组 | [x] 实际eth0/地址/路由/ioctl；协议＋接口重组键、重叠和冲突整队丢弃、48片上限/超时/停止回收 |
-| N3d 原应用 | [x] 两种传输的双向TCP/HTTP；原wget/httpd、CGI上传、逐任务内容/状态与服务清理 |
-| N3e 集中收口 | [x] RV64/libc/1196 ABI/scale/栈、原22项、块/RNG混合IRQ；关闭观测分布、资源与机制解释 |
+| 历史Virtqueue告警 | 已还原到旧兼容内核的五连接loopback；原启动只有块盘和RNG，没有VirtIO-net。具体报错队列与超额原因仍未知；后续失败必须先保留新快照，按队列身份定位，不以重复通过关闭。 |
+| 历史页释放fatal的具体现场 | 已修复能够产生同类fatal的分配器双owner竞态；原事件没有owner快照，不能反推唯一触发链。 |
+| 历史pthread取消偶发异常 | 后续直接entry通过，尚无原脚本的最小因果序列；保留P0c风险，以新失败和目标应用触发定位，不安排无目的重复次数。 |
+| 内核抢占边界 | allocator修复不等于所有共享状态已审完。限定检查开中断worker到共享对象的调用链、睡眠前引用和发布临界区；发现具体错误才扩大。 |
 
-DMA预算不超过288KiB，metadata/worker栈另计；guest默认10.77.0.2/24、隔离宿主10.77.0.1，
-无默认网关。保留IPv6 loopback；外部IPv6、DHCP/DNS/TLS、公网、SMP及实板不并入本轮。
-buddy/slab 的 timer 抢占竞态已确定性复现并修复：两个合法分配者曾能获得同一物理页。旧 trap 没有具体 owner 快照，不能断定历史释放异常正是此交错；旧 VirtIO 告警也缺少具体队列现场。状态、来源和验证见[成本基线](learning/cost-baseline.md#旧版内存释放与virtqueue告警2026-10-02)。
-已修协议号与接口重组键、重叠及冲突边界，IPv4分片重组已启用；原异常不由新诊断通过关闭。
+[风险证据与重建](learning/cost-baseline.md#旧版内存释放与-virtqueue-告警2026-10-02)
+区分已经修复的机制与缺少历史现场的归因。固定root、单hart、QEMU和选定应用验收
+均不代表多用户隔离、SMP、实板或完整Linux兼容。完整比赛Harness仍缺kernel-la。
 
-窄回归与最终集中验收已完成；未运行iozone/C0–C6或不相关存储恢复矩阵。
-主线分阶段提交并单向合入兼容分支；旧glibc使用兼容配置，
-main不改uname。一次汇总审查，不push/发布/转换阶段；完整Harness仍缺kernel-la。
-临时输出/抓包/快照只留build，Git保存人类结论与重建命令，不新增平行台账或大型JSON。
+## 下一主线：中等规模离线C工程（P5d，方向已确认）
 
-## 后续应用方向
+用户已选择扩大离线C工程，优先补通用应用能力。当前仅完成小型固定C源码的客体
+编译闭环；下一轮要验证原工程的完整构建和实际产物，不能只列新增syscall或编译器版本。
+首选现有固定测试源码树内的Lua 5.4.3（34个C源文件，lua、luac、liblua.a）；实施前核对
+来源差异、许可和原Makefile配置，补齐尚未纳管的客体make依赖。工程选择是实施建议，
+不把它写成已经构建成功。固定来源仍使用references清单和现有程序输入profile。
 
-N3后只选择一项真实应用任务，候选是地址/路由与DNS、更大离线C构建或交互式shell；
-先核实具体程序阻塞、范围及代价，再确认路线。DNS/TLS须独立核对
-用户态随机、时间和证书依赖，不把TCP连通写成HTTPS已支持。LoongArch是双架构交付
-的独立依赖，SMP单独处理跨核锁、IPI/TLB和回收，不以追平Linux为前置门槛。
+| 顺序 | 有限范围与完成依据 |
+|---|---|
+| 0．基线交接 | 单向合入最新内存/诊断修复，验证受影响的兼容入口；限定worker共享状态审计。不等待历史偶发事件靠重跑自行出现。 |
+| 1．完整工程 | 原源码、原构建规则和正常配置参数，在固定Linux先确认有效输入，再由BoarOS客体GCC/make完成构建、运行lua/luac及功能脚本。补通第一个真实阻塞；pipe的fchmod元数据已是明确语义缺口，应在受控差分后修所属对象。 |
+| 2．组合行为 | 干净构建、无变化重建、修改一个源文件后的增量构建、clean后重建、故意语法错误的非零退出和子进程回收。先-j1；工具依赖和基本流程稳定后以单hart的-j2检查jobserver与进程协调，不称为多核加速。 |
+| 3．效率与持久化 | 先确认相同有效产物，再记录编译/汇编/链接/运行阶段耗时、内存与等待。ext4是正式结果，tmpfs只用于同工作量归因；分别计程序完成、显式同步和最终排空。只选择该工程暴露的一个主要成本优化。 |
+
+收口要求为真实工程可用、错误退出可靠、资源有界、产物与同步承诺正确，且主要成本
+能够解释；不设置固定吞吐倍数，不重跑iozone或C0–C6全矩阵。完整恢复矩阵仅在实际
+修改事务/写回/队列顺序时触发。保持现有runner和文档入口，原始运行输出只留忽略的build。
+
+交互式shell/TTY和地址路由/DNS/HTTPS保留为下一应用候选，不同时开工。TLS主要由
+用户态库承担，须核对熵、时间、证书与socket依赖，不能把TCP可用写成HTTPS已交付。
+LoongArch是双架构交付的独立依赖，有明确比赛期限时重新排序；SMP另行确认跨核锁、
+IPI/TLB和回收设计。所有当前建议均不授权push、发布或阶段转换。
 
 ## 按证据触发的性能候选
 
@@ -68,7 +79,7 @@ S9完整恢复/双盘/RV64/libc/1091 ABI/scale/四组合io-sleep/栈通过。原
 25.0271/25.3164不是完整Harness。mtime事务已组提交，后端重阻塞已为零，不能继续当作
 尚未实现的下一轮任务。缓存顺序缺陷在未改HEAD宿主复现为0/800/100/0新增读，修复均为0；
 匹配自动程序+durable中位改善7.76%/6.99%，四进程读Parent改善14.08%/1.20%，
-glibc四进程整命令仍增加0.73%。剩余prepare读取、1547 FLUSH和前台热读运行成本已有归因，
+glibc四进程整命令仍增加0.73%。该轮的prepare读取、1547次FLUSH和前台热读成本已有归因；后续版本量封口已减少组数与屏障，不能把这组历史计数继续当作当前值。
 完整分布及观测扰动见[本轮纠错](learning/cost-baseline.md#缓存查询顺序纠错2026-10-01)；
 没有因此新增性能准入门槛。
 
@@ -88,13 +99,10 @@ glibc四进程整命令仍增加0.73%。剩余prepare读取、1547 FLUSH和前�
 
 **入口**：`tests/program-inventory/{inputs.json,run.py,suites.py,reports.py}`、`tests/diff-abi/`、`.github/workflows/ci.yml`、[程序清单](learning/user-program-inventory.md)。2026-09-23 基线的 228 项为 223 pass、2 个直接 entry 退出不符、3 个包装失败；2026-09-27 整合内核为 227 pass、1 个 BusyBox 包装失败。静态/动态和脚本重叠不重复计算缺陷。
 
-### P0c 时序根因闭环
+### P0c 历史取消异常的归因
 
-- [ ] 固定 kernel/ELF/loader/fixture/runner/QEMU 身份与次数，分别复跑静态、动态取消 entry 和原脚本；保存双侧 stdout/stderr、真实 wait status、超时和第一个失败。先区分 reference-not-pass、setup-error、脚本顺序依赖。
-- [x] 在固定构建输入上重复运行静态/动态取消直接 entry 各 30 次：Linux 与 BoarOS 均 30/30 通过，原始逐次证据和身份在 `build/cancel-repeat-20260923/`；未复现不等于旧异常已定位，原脚本复跑和最小因果序列继续保留在上条待办。
-- [ ] 取消异常缩成可独立运行的 shm_open、取消登记、阻塞、join/clear_tid 序列；确认取消点前后状态，不让错误诊断中的 write 再次隐藏原错误。用同步事件安排顺序，不靠随意 sleep 假定先后。
-- [x] P1c 后以同步握手确认独立后台子进程进入目标阶段，再执行 kill/回收，固定重复 20 轮均成功；原 BusyBox 包装器中的 sleep+kill 子项也为 20/20，包装器其他缺口继续单列，未据此关闭历史取消异常。
-- [ ] 若定位到支持范围内的错误，先加入能证伪旧实现的最小回归，再修所属模块；记录失败前和修复后的重复次数。一次转绿不能关闭未知根因。
+- [x] 当时固定输入的静态/动态取消直接entry在Linux与BoarOS各30次通过；同步握手的后台sleep+kill和原BusyBox子项各20次通过。它们只证明对应输入，未还原旧脚本异常；运行目录已清理，重建入口归程序清单learning。
+- [ ] 目标应用或原脚本再次出现失败时，先保存首次失败与真正wait status，缩小为取消登记、阻塞、join/clear_tid序列，再以确定性交错修所属机制；没有新证据不重复扩大次数。环境、辅助程序等待与reference-not-pass分别记录。
 
 ### P0d 持续证据与清单维护
 
@@ -140,7 +148,7 @@ glibc四进程整命令仍增加0.73%。剩余prepare读取、1547 FLUSH和前�
 - [x] 受控时钟测试与真实 Linux 差分共同验证；重跑原 `utime` 静态/动态及 BusyBox touch，保持 create/read/write/truncate/unlink 时间回归。
 
 上述勾选对应程序清单的固定输入；2026-09-29 原 RV 评测镜像的 glibc `utime`
-另出现时间比较失败；双侧原 ELF 与原 libc 探针已定位为 CLOCK_REALTIME_COARSE 缺失导致旧 time() 使用未初始化值。诊断已闭环，能力补齐仍待后续；详见文件时间 learning。
+另出现时间比较失败；双侧原 ELF 与原 libc 探针已定位为 CLOCK_REALTIME_COARSE 缺失导致旧 time() 使用未初始化值。该能力随后已经补齐，当前REALTIME_COARSE/MONOTONIC_COARSE读取真实tick快照；本段保留旧失败原因，不再列为待办。
 
 ### P1f 文件系统统计
 
@@ -150,7 +158,7 @@ glibc四进程整命令仍增加0.73%。剩余prepare读取、1547 FLUSH和前�
 
 ### P1g 链接、rename 与权限相关文件操作
 
-- [ ] `linkat` 覆盖同 inode 身份、nlink、打开后删除、跨 mount EXDEV、目录限制与失败后原对象；符号链接跟随 flags 单独验证。
+- [x] `linkat` 已接入同inode/nlink、活引用与跨mount约束，支持flags 0、AT_SYMLINK_FOLLOW、AT_EMPTY_PATH；见文件模块与多挂载证据，不再重复立项。
 - [x] `renameat/renameat2` 支持普通/NOREPLACE；单事务文件/空目录覆盖、跨目录移动、祖先拒绝、同 inode、活目标及失败回滚，EXCHANGE/WHITEOUT 明确不支持。单根挂载的跨 mount 拒绝存在，真实多挂载验证归 P1h。
 - [ ] `umask` 已按 fs context 的 fork 复制与 `CLONE_FS` 共享实现，真实 inode 的 `fchmod/fchmodat` 已覆盖；继续按消费者补 `faccessat` 的权限模型、合成 inode 的 chmod 与凭据依赖，与 P2e 保持一致，不能总返回允许。已有 open 未知 bits 拒绝策略另用差分核对，不能写成 Linux 通用要求。
 
@@ -181,11 +189,11 @@ glibc四进程整命令仍增加0.73%。剩余prepare读取、1547 FLUSH和前�
 
 ### P2b 等待、取消与 futex 扩展
 
-- [ ] 写出比较、登记、睡眠、超时、signal、wake、requeue、clear_tid、组终止的状态转换与唯一队列 owner；保证 compare-and-block 不可分割，无漏唤醒/重复摘链。
+- [x] 现有WAIT/WAKE/REQUEUE、bitset、deadline、clear_tid和组退出owner已在调度/信号模块记录并有对应回归；扩展操作继续独立验收，不代表所有futex命令已支持。
 - [x] `WAIT_BITSET/WAKE_BITSET`、掩码与绝对超时已由 glibc/差分验收。
 - [ ] 按实际调用补 `CMP_REQUEUE/WAKE_OP`；每个 operation 单独核对参数宽度、bitset、比较失败、relative/absolute 和 CLOCK_REALTIME，未知/未支持操作不算完成。PI futex 后置。
-- [ ] 保持无超时 WAIT 的 SA_RESTART、带超时 WAIT 的 EINTR 与无 handler restart 保持原 deadline；测试信号在登记前后到达、超时与 wake 交错、重启前用户字变化、哈希碰撞和同桶 requeue。
-- [ ] 取消/exec/exit_group 让阻塞线程沿原栈释放 pin 的 OFD、等待节点及 MM 引用；不能直接删除仍执行的内核栈。共享匿名跨 MM key 已接入 P4d，单 hart 关中断仅是当前实现条件。
+- [x] 无超时WAIT的SA_RESTART、带超时WAIT的EINTR与无handler时原deadline重启已有真实pthread和差分回归；新操作与跨MM信号组合仍按具体范围验证。
+- [x] 致命取消/exec/exit_group沿原调用栈释放OFD pin、等待节点和MM引用，不提前释放执行栈；共享匿名key已接入P4d。历史pthread取消事件仍保留P0c归因边界。
 
 ### P2c 替代栈与实时信号
 
@@ -326,7 +334,7 @@ glibc四进程整命令仍增加0.73%。剩余prepare读取、1547 FLUSH和前�
 
 ### P5b shebang 与 exec 组合
 
-- [x] main 已交付 shebang 的解释器路径、单个可选参数、argv/envp、嵌套与错误边界。固定 Linux 开启 BINFMT_SCRIPT 后先复现四组差异；含递归错误优先级和空参数边界的 15 条脚本记录纳入完整 583 条差分，exec、musl、glibc 和栈检查通过。契约见[exec](modules/kernel-exec.md)，根因见[ELF 学习](learning/elf-loading.md#shebang-与-shell-回退2026-09-28)。原镜像 BusyBox 已验证无 shebang 回退依赖自执行路径，真实 procfs 仍属 P1h 后续。
+- [x] main 已交付 shebang 的解释器路径、单个可选参数、argv/envp、嵌套与错误边界。固定 Linux 开启 BINFMT_SCRIPT 后先复现四组差异；含递归错误优先级和空参数边界的 15 条脚本记录纳入完整 583 条差分，exec、musl、glibc 和栈检查通过。契约见[exec](modules/kernel-exec.md)，根因见[ELF 学习](learning/elf-loading.md#shebang-与-shell-回退2026-09-28)。原镜像 BusyBox 已验证无 shebang 回退依赖自执行路径；真实procfs与self/exe后来已在P1h交付。
 - [ ] 保留 PT_PHDR/auxv、段重叠/对齐、文件尾页+BSS、PIE/解释器布局回归；与线程组 exec、信号、CLOEXEC 和文本写互斥组合验证，不在内核代替动态链接器重定位。
 
 ### P5c 随机数与系统环境
