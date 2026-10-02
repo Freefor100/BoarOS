@@ -1979,6 +1979,12 @@ int kernel_vfs_files_share_node(const struct kernel_vfs_file *left,
     return left_node != 0 && left_node == kernel_vfs_file_node(right);
 }
 
+uint64_t kernel_vfs_file_max_size(const struct kernel_vfs_file *file)
+{
+    struct kernel_vfs_node *node = kernel_vfs_file_node(file);
+    return node != 0 ? node->max_size : 0U;
+}
+
 struct kernel_page_cache *kernel_vfs_file_page_cache(
     const struct kernel_vfs_file *file)
 {

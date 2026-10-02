@@ -35,6 +35,7 @@ enum kernel_syscall_status kernel_syscall_dispatch(
 | epoll_create1/ctl/pwait（20–22）、dup/dup3/fcntl（23–25） | [文件模块](kernel-files.md)：OFD 共享、就绪与生命周期 |
 | getcwd（17）、mkdirat/unlinkat/symlinkat（34–36）、renameat/renameat2（38/276）、chdir/fchdir（49/50）、openat/close（56/57）、readlinkat（78） | [文件模块](kernel-files.md)：路径、flags、dirfd 与错误 |
 | ftruncate（46）、pipe2（59）、getdents64/lseek（61/62）、read/write/readv/writev/pread64（63–67） | [文件模块](kernel-files.md)：部分成功、offset、pin、稀疏文件、pipe 与目录 cookie |
+| sendfile（71） | [文件模块](kernel-files.md)：有界内核复制、位置、来源片段、整包与同步错误 |
 | statfs/fstatfs（43/44）、utimensat（88） | [文件模块](kernel-files.md)：挂载统计、显式纳秒时间与 fd/nofollow |
 | pselect6/ppoll（72/73）、newfstatat/fstat（79/80） | [文件模块](kernel-files.md)：集合/信号屏蔽、stat 编码和元数据 |
 

@@ -906,6 +906,195 @@ static int description_writable(
     return 0;
 }
 
+static int64_t sendfile_output(struct kernel_open_file_description **output_owner,
+                               const void *buffer, size_t size,
+                               uint64_t position, uint64_t deadline)
+{
+    struct kernel_open_file_description *output = *output_owner;
+    enum kernel_open_file_kind kind = kernel_open_file_kind(output);
+    if (kind == KERNEL_OPEN_FILE_KIND_PIPE) {
+        int64_t result;
+        if (kernel_pipe_write_buffer(output->pipe, buffer, size,
+                output->open_flags, &result) != KERNEL_PIPE_STATUS_OK)
+            __builtin_trap();
+        return result;
+    }
+    if (kind == KERNEL_OPEN_FILE_KIND_SOCKET) {
+        struct kernel_socket *socket = kernel_open_file_socket(output);
+        if (kernel_socket_is_datagram(socket))
+            return kernel_socket_write_datagram_buffer(output_owner, buffer, size,
+                (output->open_flags & KERNEL_FILES_O_NONBLOCK) ? KERNEL_SOCKET_MSG_DONTWAIT : 0U);
+        for (;;) {
+            int result = kernel_socket_write_buffer(socket, buffer, (uint32_t)size, 0);
+            if (result != -KERNEL_EAGAIN) return result;
+            uint64_t now = deadline ? kernel_time_monotonic_ns() : 0;
+            int waited = deadline && now >= deadline ? -KERNEL_EAGAIN :
+                socket_wait_ready(output, KERNEL_POLLOUT, deadline ? deadline - now : 0, 0);
+            if (waited != 0) return waited;
+        }
+    }
+    size_t written = 0;
+    int error;
+    if (kind == KERNEL_OPEN_FILE_KIND_REGULAR) {
+        /* pwrite 每批自取 rank 15；跨输入读取持目标门闩会形成交叉 inode 等待。 */
+        error = kernel_vfs_pwrite(&output->file, position, buffer, size, &written);
+    } else if (output->device && output->device->write) {
+        error = output->device->write(buffer, size, &written);
+    } else return -KERNEL_EINVAL;
+    if (written > size) __builtin_trap();
+    return written != 0U ? (int64_t)written : error;
+}
+
+static int64_t sendfile_pinned(struct kernel_files *files, struct kernel_mm *mm,
+    struct kernel_open_file_description *input,
+    struct kernel_open_file_description **output_owner,
+    int explicit_offset, int64_t *position, uint64_t count)
+{
+    struct kernel_open_file_description *output = *output_owner;
+    KERNEL_LOCK_SCOPE(first_guard);
+    KERNEL_LOCK_SCOPE(second_guard);
+    struct kernel_open_file_description *first =
+        !explicit_offset && input->kind == KERNEL_OPEN_FILE_KIND_REGULAR ? input : 0;
+    struct kernel_open_file_description *second =
+        output->kind == KERNEL_OPEN_FILE_KIND_REGULAR && output != first ? output : 0;
+    if (first != 0 && second != 0 && (uintptr_t)first > (uintptr_t)second) {
+        struct kernel_open_file_description *swap = first; first = second; second = swap;
+    }
+    /* rank 10 的 OFD 锁按 key 取得；同一 OFD 只有一个锁 owner。 */
+    if (first != 0) kernel_mutex_lock(&first->offset_lock, &first_guard);
+    if (second != 0) kernel_mutex_lock(&second->offset_lock, &second_guard);
+    uint64_t start = explicit_offset ? (uint64_t)*position : input->offset;
+    uint64_t out_start = output->offset, total = 0;
+    int error = 0;
+    if (count > (uint64_t)INT64_MAX || start > (uint64_t)INT64_MAX - count)
+        return -KERNEL_EINVAL;
+    if (count > KERNEL_FILES_MAX_RW_COUNT) count = KERNEL_FILES_MAX_RW_COUNT;
+    uint64_t limit = input->kind == KERNEL_OPEN_FILE_KIND_REGULAR
+        ? kernel_vfs_file_max_size(&input->file) : (uint64_t)INT64_MAX;
+    if (output->kind == KERNEL_OPEN_FILE_KIND_REGULAR) {
+        uint64_t out_limit = kernel_vfs_file_max_size(&output->file);
+        if (limit > out_limit) limit = out_limit;
+    }
+    if (start > limit || (count != 0U && start == limit)) return -KERNEL_EOVERFLOW;
+    if (count > limit - start) count = limit - start;
+    if (output->kind != KERNEL_OPEN_FILE_KIND_PIPE) {
+        if (out_start > (uint64_t)INT64_MAX - count) return -KERNEL_EINVAL;
+        if (output->open_flags & KERNEL_FILES_O_APPEND) return -KERNEL_EINVAL;
+    }
+    if (input->kind != KERNEL_OPEN_FILE_KIND_REGULAR) return -KERNEL_EINVAL;
+    kernel_vfs_file_accessed(&input->file);
+    if (count == 0U || start >= kernel_open_file_size(input)) return 0;
+    struct kernel_task_io_buffer scratch = {0};
+    if (kernel_task_io_buffer_acquire(&scratch, mm->allocator) != KERNEL_TASK_STATUS_OK)
+        return -KERNEL_ENOMEM;
+    size_t capacity = BOAROS_PAGE_SIZE;
+    void *staging = scratch.data, *datagram_staging = 0;
+    if (kernel_socket_is_datagram(kernel_open_file_socket(output))) {
+        capacity = count > KERNEL_PIPE_CAPACITY ? (size_t)KERNEL_PIPE_CAPACITY : (size_t)count;
+        enum kernel_heap_status allocated = kernel_heap_allocate(files->heap, capacity, &datagram_staging);
+        if (allocated != KERNEL_HEAP_STATUS_OK) {
+            kernel_task_io_buffer_release(&scratch);
+            if (allocated != KERNEL_HEAP_STATUS_EMPTY) __builtin_trap();
+            return -KERNEL_ENOMEM;
+        }
+        staging = datagram_staging;
+    }
+    uint64_t timeout = output->kind == KERNEL_OPEN_FILE_KIND_SOCKET
+        ? kernel_socket_send_timeout(kernel_open_file_socket(output)) : 0;
+    uint64_t deadline = 0;
+    if (timeout != 0U) {
+        uint64_t now = kernel_time_monotonic_ns();
+        deadline = UINT64_MAX - now < timeout ? UINT64_MAX : now + timeout;
+    }
+    while (total < count) {
+        size_t wanted = count - total > capacity
+            ? capacity : (size_t)(count - total), available = 0;
+        /* pread 交还 inode 数据锁后才写目标，允许同 inode 复制而不锁升级。 */
+        error = kernel_open_file_pread(input, start + total, staging, wanted, &available);
+        if (available > wanted) __builtin_trap();
+        if (available == 0U) break;
+        if (total == 0U && output->kind == KERNEL_OPEN_FILE_KIND_REGULAR) {
+            int modified = kernel_vfs_file_modified(&output->file, out_start, 0);
+            if (modified != 0) { error = modified; break; }
+        }
+        int64_t sent = sendfile_output(output_owner, staging, available,
+                                       out_start + total, deadline);
+        if (sent < 0) { error = (int)sent; break; }
+        if ((uint64_t)sent > available) __builtin_trap();
+        if (sent > 0 && output->kind == KERNEL_OPEN_FILE_KIND_REGULAR &&
+            (output->open_flags & KERNEL_FILES_O_DSYNC) != 0U) {
+            int datasync = (output->open_flags & KERNEL_FILES_O_SYNC) != KERNEL_FILES_O_SYNC;
+            int synced = kernel_vfs_sync(&output->file, datasync, &output->observed_writeback_error);
+            if (synced != 0) { error = synced; break; }
+        }
+        total += (uint64_t)sent;
+        if ((size_t)sent < available || error != 0) break;
+    }
+    if (datagram_staging != 0 && kernel_heap_release(files->heap, datagram_staging) != KERNEL_HEAP_STATUS_OK)
+        __builtin_trap();
+    kernel_task_io_buffer_release(&scratch);
+    if (total != 0U && error == -KERNEL_ERESTARTSYS)
+        kernel_signal_clear_syscall_restart(kernel_task_current());
+    if (total != 0U) {
+        /* Linux 先发布输出位置再输入位置；NULL offset 的 alias 只推进一次。 */
+        if (output->kind == KERNEL_OPEN_FILE_KIND_REGULAR && (explicit_offset || output != input))
+            output->offset = out_start + total;
+        if (explicit_offset) *position = (int64_t)(start + total);
+        else input->offset = start + total;
+        return (int64_t)total;
+    }
+    return error;
+}
+
+enum kernel_files_status kernel_files_sendfile(
+    struct kernel_files *files, struct kernel_mm *mm, int64_t out_fd,
+    int64_t in_fd, uint64_t user_offset, uint64_t count, int64_t *linux_result)
+{
+    COST_SCOPE(sendfile_cost, OPERATION_TICKS);
+    struct kernel_open_file_description *input = 0, *output = 0;
+    int64_t position = 0;
+    size_t copied = 0;
+    if (!kernel_files_is_live(files) || mm == 0 || linux_result == 0)
+        return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
+    if (user_offset != 0U && (kernel_copy_from_user(mm, &position, user_offset,
+            sizeof(position), &copied) != KERNEL_UACCESS_STATUS_OK || copied != sizeof(position))) {
+        *linux_result = -KERNEL_EFAULT; return KERNEL_FILES_STATUS_OK;
+    }
+    enum kernel_files_status status = kernel_files_pin(files, in_fd, &input, linux_result);
+    files->record->statistics.read_calls++;
+    files->record->statistics.write_calls++;
+    if (status != KERNEL_FILES_STATUS_OK || *linux_result != 0) goto done;
+    if (!kernel_open_file_readable(input)) { *linux_result = -KERNEL_EBADF; goto done; }
+    if (user_offset != 0U && (input->kind == KERNEL_OPEN_FILE_KIND_PIPE ||
+            input->kind == KERNEL_OPEN_FILE_KIND_SOCKET || (input->device && !input->device->positioned))) {
+        *linux_result = -KERNEL_ESPIPE; goto done;
+    }
+    uint64_t checked_position = user_offset != 0U ? (uint64_t)position : input->offset;
+    if (position < 0 || count > (uint64_t)INT64_MAX ||
+        checked_position > (uint64_t)INT64_MAX - count) {
+        *linux_result = -KERNEL_EINVAL; goto done;
+    }
+    status = kernel_files_pin(files, out_fd, &output, linux_result);
+    if (status != KERNEL_FILES_STATUS_OK || *linux_result != 0) goto done;
+    if (!description_writable(output)) { *linux_result = -KERNEL_EBADF; goto done; }
+    /* 两份 pin 由仍会恢复的 syscall 栈持有；退出先唤醒等待，正常展开再交还。 */
+    *linux_result = sendfile_pinned(files, mm, input, &output, user_offset != 0U, &position, count);
+    if (*linux_result > 0) {
+        files->record->statistics.bytes_read += (uint64_t)*linux_result;
+        files->record->statistics.bytes_written += (uint64_t)*linux_result;
+    }
+done:
+    if (output != 0) status = release_io_description(files, &output, status);
+    if (input != 0) status = release_io_description(files, &input, status);
+    if (status != KERNEL_FILES_STATUS_OK) return status;
+    /* 即使 do_sendfile 已失败也写回 offset；只读指针的 fault 覆盖先前结果。 */
+    copied = 0;
+    if (user_offset != 0U && (kernel_copy_to_user(mm, user_offset, &position,
+            sizeof(position), &copied) != KERNEL_UACCESS_STATUS_OK || copied != sizeof(position)))
+        *linux_result = -KERNEL_EFAULT;
+    return KERNEL_FILES_STATUS_OK;
+}
+
 static enum kernel_files_status control_write(
     struct kernel_files *files, struct kernel_mm *mm,
     struct kernel_open_file_description *description,

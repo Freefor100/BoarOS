@@ -185,6 +185,7 @@ static void pipe_consume(struct kernel_pipe *pipe, uint64_t count)
     pipe->bytes -= count;
     if (pipe->page_length[slot] == 0U) {
         pipe->page_offset[slot] = 0U;
+        pipe->can_merge[slot] = 0U;
         pipe->head = next_slot(slot);
         pipe->slots--;
     }
@@ -198,6 +199,7 @@ static uint16_t pipe_tail_space(const struct kernel_pipe *pipe)
     last = (uint16_t)((pipe->tail +
                        KERNEL_PIPE_CAPACITY / BOAROS_PAGE_SIZE - 1U) %
                       (KERNEL_PIPE_CAPACITY / BOAROS_PAGE_SIZE));
+    if (!pipe->can_merge[last]) return 0U;
     return (uint16_t)(BOAROS_PAGE_SIZE - pipe->page_offset[last] -
                       pipe->page_length[last]);
 }
@@ -330,23 +332,24 @@ static enum kernel_pipe_status pipe_signal_broken(
     return KERNEL_PIPE_STATUS_OK;
 }
 
-enum kernel_pipe_status kernel_pipe_writev(
+static enum kernel_pipe_status pipe_write_source(
     struct kernel_pipe *pipe,
     struct kernel_mm *mm,
     const struct kernel_uaccess_iovec *iov,
     size_t iov_count,
     uint64_t count,
     uint32_t open_flags,
-    int64_t *linux_result)
+    int64_t *linux_result,
+    const unsigned char *kernel_buffer)
 {
     uintptr_t saved;
     enum kernel_scheduler_status scheduler_status;
     enum kernel_wait_wake_reason wake_reason = KERNEL_WAIT_WOKEN;
     uint64_t total = 0U;
-    uint16_t merge_bytes = (uint16_t)(count & BOAROS_PAGE_MASK);
+    uint16_t merge_bytes = kernel_buffer ? 0U : (uint16_t)(count & BOAROS_PAGE_MASK);
     struct kernel_uaccess_iov_cursor cursor = {iov, iov_count, 0U, 0U};
 
-    if (pipe == 0 || mm == 0 || linux_result == 0 ||
+    if (pipe == 0 || (mm == 0 && kernel_buffer == 0) || linux_result == 0 ||
         pipe->heap == 0 || pipe->buffer == 0) {
         return KERNEL_PIPE_STATUS_INVALID_ARGUMENT;
     }
@@ -424,14 +427,16 @@ enum kernel_pipe_status kernel_pipe_writev(
         }
         chunk = (size_t)chunk64;
         copied = 0U;
-        access_status = kernel_copy_from_user_iov(
-            mm,
-            &cursor,
-            pipe->buffer + (size_t)slot * BOAROS_PAGE_SIZE +
-                (!merging ? 0U : pipe->page_offset[slot] +
-                                   pipe->page_length[slot]),
-            chunk,
-            &copied);
+        unsigned char *destination = pipe->buffer + (size_t)slot * BOAROS_PAGE_SIZE +
+            (!merging ? 0U : pipe->page_offset[slot] + pipe->page_length[slot]);
+        if (kernel_buffer != 0) {
+            memcpy(destination, kernel_buffer + total, chunk);
+            copied = chunk;
+            access_status = KERNEL_UACCESS_STATUS_OK;
+        } else {
+            access_status = kernel_copy_from_user_iov(mm, &cursor,
+                destination, chunk, &copied);
+        }
         if (access_status != KERNEL_UACCESS_STATUS_OK || copied != chunk) {
             riscv_interrupt_restore(saved);
             if (access_status != KERNEL_UACCESS_STATUS_FAULT) {
@@ -443,6 +448,8 @@ enum kernel_pipe_status kernel_pipe_writev(
         if (!merging) {
             pipe->page_offset[slot] = 0U;
             pipe->page_length[slot] = 0U;
+            /* 来源状态随成功发布的片段持有，后继 user write 不并入 sendfile。 */
+            pipe->can_merge[slot] = kernel_buffer == 0;
             pipe->tail = next_slot(slot);
             pipe->slots++;
         }
@@ -456,6 +463,24 @@ enum kernel_pipe_status kernel_pipe_writev(
     riscv_interrupt_restore(saved);
     *linux_result = (int64_t)total;
     return KERNEL_PIPE_STATUS_OK;
+}
+
+enum kernel_pipe_status kernel_pipe_writev(
+    struct kernel_pipe *pipe, struct kernel_mm *mm,
+    const struct kernel_uaccess_iovec *iov, size_t iov_count, uint64_t count,
+    uint32_t open_flags, int64_t *linux_result)
+{
+    return pipe_write_source(pipe, mm, iov, iov_count, count,
+                             open_flags, linux_result, 0);
+}
+
+enum kernel_pipe_status kernel_pipe_write_buffer(
+    struct kernel_pipe *pipe, const void *buffer, size_t count,
+    uint32_t open_flags, int64_t *linux_result)
+{
+    if (buffer == 0) return KERNEL_PIPE_STATUS_INVALID_ARGUMENT;
+    return pipe_write_source(pipe, 0, 0, 0, count,
+                             open_flags, linux_result, buffer);
 }
 
 uint32_t kernel_pipe_poll(

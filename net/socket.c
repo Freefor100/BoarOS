@@ -1150,12 +1150,15 @@ void kernel_socket_abort_write(struct kernel_socket_write_request *request)
 }
 int kernel_socket_is_datagram(const struct kernel_socket *socket)
 { return socket && socket->type == SOCKET_DGRAM; }
-int kernel_socket_write_datagram(struct kernel_open_file_description **pin_owner,
+static int socket_write_datagram_source(struct kernel_open_file_description **pin_owner,
     struct kernel_mm *mm, const struct kernel_uaccess_iovec *iov,
     size_t iov_count, uint64_t count, uint32_t flags,
-    const struct kernel_socket_address *destination)
+    const struct kernel_socket_address *destination, const void *kernel_buffer)
 {
     struct kernel_socket *socket = kernel_open_file_socket(*pin_owner);
+    /* sendfile 的 UDP actor 在协议长度检查前解析缺失的 connected peer。 */
+    if (kernel_buffer && socket->domain == KERNEL_SOCKET_DOMAIN_INET && !destination &&
+        !socket->connected && count <= UINT16_MAX) return -KERNEL_EDESTADDRREQ;
     if (count > (socket->domain == KERNEL_SOCKET_DOMAIN_INET ? UDP_MAX_PAYLOAD : 65536U) ||
         count > socket->tx_limit) return -KERNEL_EMSGSIZE;
     if (socket->write_closed) {
@@ -1192,12 +1195,16 @@ int kernel_socket_write_datagram(struct kernel_open_file_description **pin_owner
             }
         }
     }
-    struct kernel_uaccess_iov_cursor cursor = {iov, iov_count, 0, 0};
-    size_t copied = 0;
-    enum kernel_uaccess_status access = kernel_copy_from_user_iov(mm, &cursor,
-        packet->data, (size_t)count, &copied);
-    if (access == KERNEL_UACCESS_STATUS_FAULT) { result = -KERNEL_EFAULT; goto out; }
-    if (access != KERNEL_UACCESS_STATUS_OK || copied != count) __builtin_trap();
+    if (kernel_buffer) {
+        if (count) __builtin_memcpy(packet->data, kernel_buffer, (size_t)count);
+    } else {
+        struct kernel_uaccess_iov_cursor cursor = {iov, iov_count, 0, 0};
+        size_t copied = 0;
+        enum kernel_uaccess_status access = kernel_copy_from_user_iov(mm, &cursor,
+            packet->data, (size_t)count, &copied);
+        if (access == KERNEL_UACCESS_STATUS_FAULT) { result = -KERNEL_EFAULT; goto out; }
+        if (access != KERNEL_UACCESS_STATUS_OK || copied != count) __builtin_trap();
+    }
     if (request.socket->domain == KERNEL_SOCKET_DOMAIN_INET) {
         ip_addr_t remote;
         int imported = destination ? address_import(request.socket, destination, &remote, 0) : 0;
@@ -1259,6 +1266,22 @@ out:
     clear_write_request(&request);
     *pin_owner = request.pin;
     return result;
+}
+
+int kernel_socket_write_datagram(struct kernel_open_file_description **pin_owner,
+    struct kernel_mm *mm, const struct kernel_uaccess_iovec *iov,
+    size_t iov_count, uint64_t count, uint32_t flags,
+    const struct kernel_socket_address *destination)
+{
+    return socket_write_datagram_source(pin_owner, mm, iov, iov_count, count,
+                                        flags, destination, 0);
+}
+
+int kernel_socket_write_datagram_buffer(struct kernel_open_file_description **pin_owner,
+    const void *buffer, uint64_t count, uint32_t flags)
+{
+    if (!buffer) return -KERNEL_EINVAL;
+    return socket_write_datagram_source(pin_owner, 0, 0, 0, count, flags, 0, buffer);
 }
 
 int kernel_socket_discard_receive(const struct kernel_socket *socket, uint32_t flags)

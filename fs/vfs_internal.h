@@ -22,6 +22,7 @@ struct kernel_record_lock_state;
 
 struct kernel_vfs_node *kernel_vfs_file_node(
     const struct kernel_vfs_file *file);
+uint64_t kernel_vfs_file_max_size(const struct kernel_vfs_file *file);
 struct kernel_record_lock_state *kernel_vfs_node_record_locks(
     struct kernel_vfs_node *node);
 

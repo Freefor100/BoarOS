@@ -85,6 +85,8 @@ int kernel_socket_accept_check(const struct kernel_socket *socket);
 int kernel_socket_sendto(struct kernel_socket *socket, struct kernel_mm *mm,
                          uint64_t user_data, uint64_t size,
                          const struct kernel_socket_address *address);
+int kernel_socket_write_datagram_buffer(struct kernel_open_file_description **pin_owner,
+    const void *buffer, uint64_t count, uint32_t flags);
 int kernel_socket_recvfrom(struct kernel_socket *socket, struct kernel_mm *mm,
                            uint64_t user_data, uint64_t size,
                            struct kernel_socket_address *address);

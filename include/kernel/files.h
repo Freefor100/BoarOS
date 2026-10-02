@@ -290,6 +290,10 @@ enum kernel_files_status kernel_files_write(
     uint64_t count,
     int64_t *linux_result);
 
+enum kernel_files_status kernel_files_sendfile(
+    struct kernel_files *files, struct kernel_mm *mm, int64_t out_fd,
+    int64_t in_fd, uint64_t user_offset, uint64_t count, int64_t *linux_result);
+
 /* pwrite64 writes without changing the shared open-file description offset. */
 enum kernel_files_status kernel_files_pwrite(
     struct kernel_files *files,

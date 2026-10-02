@@ -134,6 +134,10 @@ enum kernel_syscall_status syscall_handle_write(
     const struct kernel_syscall_request *request,
     struct kernel_syscall_result *decoded);
 
+enum kernel_syscall_status syscall_handle_sendfile(
+    struct kernel_task *caller, const struct kernel_syscall_request *request,
+    struct kernel_syscall_result *decoded);
+
 enum kernel_syscall_status syscall_handle_lseek(
     struct kernel_task *caller,
     const struct kernel_syscall_request *request,
