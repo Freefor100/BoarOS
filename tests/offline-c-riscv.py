@@ -310,7 +310,7 @@ def project_main(args):
     identity = {"driver": sha256(directory / "tree/init"), "fixture": sha256(disk),
         "lua": sha256(ROOT / "references/lua/lua-5.4.3.tar.gz"),
         "toolchain": tree_identity(args.toolchain_tree), "qemu": command(args.qemu, "--version").stdout.splitlines()[0],
-        "filesystem": "tmpfs" if args.tmpfs else "ext4", "mode": "performance" if args.performance else "functional",
+        "filesystem": "tmpfs" if args.tmpfs else "ext4", "mode": "observed-clean-j1" if args.observe else "performance" if args.performance else "functional",
         "source_head": command("git", "rev-parse", "HEAD").stdout.strip(),
         "source_head_tree": command("git", "rev-parse", "HEAD^{tree}").stdout.strip(),
         "source_patch_sha256": sha256(directory / "source.patch"), "transport": "modern", "cache": "writeback",

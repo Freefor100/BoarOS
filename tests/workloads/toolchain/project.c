@@ -89,9 +89,16 @@ int main(void)
         run("syntax-error","make -j1 linux",0);fd=open("src/lapi.c",O_WRONLY);CHECK(fd>=0&&ftruncate(fd,st.st_size)==0&&close(fd)==0);run("syntax-recovery","make -j1 linux",1);
         jobserver();
     }
-    run("clean","make clean",1);run("clean-j2","make -j2 linux",1);products();
-    CHECK(lua==hash("src/lua")&&luac==hash("src/luac")&&lib==hash("src/liblua.a"));
-    if(control>=0) {CHECK(write(control,"end\n",4)==4&&close(control)==0);run("cost","cat /proc/boaros_cost",1);}
+    if(control<0) {
+        run("clean","make clean",1);run("clean-j2","make -j2 linux",1);products();
+        CHECK(lua==hash("src/lua")&&luac==hash("src/luac")&&lib==hash("src/liblua.a"));
+    }
+    if(control>=0) {
+        /* 定点窗口只含一个干净-j1及产物验证；先完成在途同步，再关闭窗口。 */
+        sync();uint64_t deadline=now()+5000000000ULL;ssize_t ended;
+        while((ended=write(control,"end\n",4))<0&&errno==EBUSY) {CHECK(now()<deadline);usleep(1000);}
+        CHECK(ended==4&&close(control)==0);run("cost","cat /proc/boaros_cost",1);
+    }
     uint64_t start=now();run("sync","sync",1);printf("PROJECT SYNC elapsed_ns=%llu\n",(unsigned long long)(now()-start));
     puts("PROJECT PASS all");return 42;
 }

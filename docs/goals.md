@@ -35,13 +35,13 @@ N3已经交付：legacy/modern VirtIO-net、受限DMA借用与复制回退、静
 | B 匿名管道元数据 | [x] mode、身份与时间归共享pipe，fchmod/fstat及两端、dup/fork/proc重开一致；先同ELF证伪旧行为。 |
 | C 命名FIFO | [x] ext4/tmpfs节点、按inode关联的活动pipe、打开会合/代次、非阻塞、信号、就绪、双owner与最后回收；节点可持久化，传输内容不持久化。 |
 | D 原版工程 | [x] make默认FIFO jobserver，Lua/luac/liblua.a及嵌入/动态模块；干净、无变化、增量、clean、语法错误、恢复、-j2与中断清理。 |
-| E 成本与收口 | [ ] 正式ext4三副本、tmpfs定点对照、一次COST归因；分别记录程序完成、同步与最终卸载，集中相关系统验收和文档检查。 |
+| E 成本与收口 | [ ] 正式ext4三副本、tmpfs和单-j1 COST已完成；1207 ABI及集中系统验收通过。构建与清理的成本边界见工具链记录；最后兼容交接与清理待完成。 |
 
 原工程在固定Linux先建立有效参考；原始输出和机器清单只留忽略的build，Git保存机制、
 结论与重建入口。不重跑iozone/C0–C6；仅在实际改事务/写回/队列顺序时扩大恢复矩阵。
 最终单向合入兼容分支，完成受影响验收；不push、发布或转换阶段。
 
-交互式shell/TTY、路由/DNS/HTTPS保留为后续应用候选。LoongArch是双架构独立依赖，
+下一应用候选为交互式shell/TTY，需另行调查并确认范围；路由/DNS/HTTPS不作为本轮追加任务。LoongArch是双架构独立依赖，
 SMP另行设计；历史异常风险继续按上表保留，不因本轮通过关闭。
 
 ## 按证据触发的性能候选
@@ -52,6 +52,7 @@ SMP另行设计；历史异常风险继续按上表保留，不因本轮通过�
 | 新封口政策下仍有细碎版本或重复准备 | 增量组织/合并；先量化，核对脏数据年龄、内存/日志空间和同步尾延迟 |
 | checkpoint阻塞提交或最终排空成本显著 | 有界批次和调度；核对积压、日志环绕、低内存、卸载及完整恢复 |
 | 非阻塞发送复制放大或固定热缓存运行成本高 | 发送credit约束暂存、重复解析/复制/查询；先核对错误优先级，保留短写、EFAULT前缀、取消和页生命周期 |
+| Lua构建在tmpfs仍有差距，页周转及VMA访问较多 | 先分解页初始化/复制与VMA点查询CPU成本，选一个因果机制；不以计数直接承诺收益 |
 | 真实大映射/多等待者负载规模退化 | resident范围索引、deadline索引或安全长操作边界；核对维护成本、OOM和取消 |
 
 每次选择一个有独立证据的机制，不把这张候选表当成新排期，不换调度器来解释尚未归因的分布。
@@ -87,6 +88,7 @@ glibc四进程整命令仍增加0.73%。该轮的prepare读取、1547次FLUSH和
 | 原BusyBox55/55 | 此前日志/RTC/根设备补全已验收；完整228项没有在本轮网络工作中重跑 |
 | iperf/netperf | 22项受控原ELF完成；原iperf连续脚本的listener重建竞态在Linux也存在，原脚本结果和受控验收分别报告 |
 | LTP/helper | abort01到chown ENOSYS；cgroup_fj_proc无参数在Linux/BoarOS都等待，不是调度死锁；helper身份由固定上游调用规则确认 |
+| 路径truncate | 尚未实现；本轮错误恢复使用已交付ftruncate，原Lua/GCC/make保持不变 |
 | 用户内存/信号 | mremap、按操作madvise、mlock、sigaltstack、实时信号队列、共享文件/PI futex待真实应用需求触发 |
 | 系统与平台 | 固定root查询不等于完整凭据/权限；无完整TTY、外部IPv6/DNS/TLS、公网配置、SMP/实板、kernel-la，不声明完整Linux兼容或硬实时 |
 
