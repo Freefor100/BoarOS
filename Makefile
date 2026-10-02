@@ -1667,3 +1667,15 @@ test-allocator-preemption-host:
 .PHONY: test-fifo-riscv
 test-fifo-riscv: $(KERNEL_RV)
 	python3 -B tests/fifo-riscv.py --kernel $(KERNEL_RV)
+
+OFFLINE_PROJECT_RV := $(BUILD_DIR)/tests/user/offline-project-rv
+$(OFFLINE_PROJECT_RV): tests/workloads/toolchain/project.c $(MUSL_STAMP)
+	@mkdir -p $(dir $@)
+	$(MUSL_ROOT)/bin/musl-gcc $(MUSL_GCC_FLAGS) -static -O2 -Wall -Wextra -Werror $< -o $@
+
+.PHONY: test-offline-project-riscv test-offline-project-tmpfs-riscv
+test-offline-project-riscv: $(OFFLINE_PROJECT_RV) $(KERNEL_RV) prepare-offline-c-toolchain
+	python3 -B tests/offline-c-riscv.py --project lua --kernel $(KERNEL_RV) --program $(OFFLINE_PROJECT_RV) --toolchain-tree build/offline-c/alpine-tree --timeout 900
+
+test-offline-project-tmpfs-riscv: $(OFFLINE_PROJECT_RV) $(KERNEL_RV) prepare-offline-c-toolchain
+	python3 -B tests/offline-c-riscv.py --project lua --kernel $(KERNEL_RV) --program $(OFFLINE_PROJECT_RV) --toolchain-tree build/offline-c/alpine-tree --timeout 900 --tmpfs --performance

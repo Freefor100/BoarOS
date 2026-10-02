@@ -39,7 +39,7 @@ SQLite 3.53.4 官方 amalgamation 保存于 `sqlite/sqlite-amalgamation-3530400.
 不修改上游源码。
 
 Alpine v3.22 `main/riscv64` 的 GCC 14.2.0-r6、binutils、musl 开发文件和
-其余 12 个运行依赖 APK 保存于 `alpine/v3.22/main/riscv64/`。`sources.tsv`
+GNU make4.4.1-r3及其余12个运行依赖APK 保存于 `alpine/v3.22/main/riscv64/`。`sources.tsv`
 逐包固定官方 URL、SHA-256 与 2026-09-27 访问日期；包内 `.PKGINFO`
 的版本、架构和许可表达式由
 `tests/workloads/toolchain/prepare_alpine.py` 核对。`make
@@ -150,3 +150,6 @@ README 保留官方发布地址。星云板仓库只公开了指向网盘资料�
 
 确切 URL、Git commit 与 SHA-256 以 [`sources.tsv`](sources.tsv) 为准。
 更新任何固定输入都应单独提交并重新运行 `make test-references`。
+
+Lua5.4.3官方发布包保存在`lua/lua-5.4.3.tar.gz`，许可MIT；下载位置与校验归sources.tsv。
+离线工程执行器只解包已校验的原发布内容，受控修改由测试流程执行并恢复，不修改上游构建规则。

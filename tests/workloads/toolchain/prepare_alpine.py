@@ -19,6 +19,7 @@ IDENTITY = ROOT / "build/offline-c/alpine-tree.identity.json"
 
 # Exact .PKGINFO identities, including the upstream license expressions.
 PACKAGES = {
+    "make-4.4.1-r3.apk": ("make", "4.4.1-r3", "GPL-3.0-or-later"),
     "binutils-2.44-r3.apk": ("binutils", "2.44-r3", "GPL-2.0-or-later AND LGPL-2.1-or-later AND BSD-3-Clause"),
     "gcc-14.2.0-r6.apk": ("gcc", "14.2.0-r6", "GPL-2.0-or-later AND LGPL-2.1-or-later"),
     "gmp-6.3.0-r3.apk": ("gmp", "6.3.0-r3", "LGPL-3.0-or-later OR GPL-2.0-or-later"),
@@ -126,24 +127,34 @@ def main():
         if not IDENTITY.is_file():
             raise ValueError("compiler tree exists without identity; remove stale ignored tree")
         recorded = json.loads(IDENTITY.read_text())
-        if recorded != {"manifest_sha256": manifest,
-                        "tree_sha256": tree_digest(DESTINATION)}:
+        if recorded.get("tree_sha256") != tree_digest(DESTINATION):
             raise ValueError("compiler tree differs from its pinned identity")
-    else:
-        DESTINATION.parent.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(prefix="alpine-tree.", dir=DESTINATION.parent) as temporary:
-            tree = Path(temporary)
-            for archive in packages.values():
-                subprocess.run(("bsdtar", "-xf", str(archive), "-C", str(tree),
-                                "--exclude", ".PKGINFO", "--exclude", ".SIGN.*"),
-                               check=True)
-            for executable in ("usr/bin/gcc", "usr/bin/as", "lib/ld-musl-riscv64.so.1"):
-                if not (tree / executable).is_file():
-                    raise ValueError(f"compiler payload lacks {executable}")
-            identity = {"manifest_sha256": manifest,
-                        "tree_sha256": tree_digest(tree)}
+        if recorded.get("manifest_sha256") == manifest:
+            print(f"Alpine native compiler: {len(packages)} verified APKs, cached tree verified")
+            return
+    DESTINATION.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="alpine-tree.", dir=DESTINATION.parent) as temporary:
+        tree = Path(temporary)
+        for archive in packages.values():
+            subprocess.run(("bsdtar", "-xf", str(archive), "-C", str(tree),
+                            "--exclude", ".PKGINFO", "--exclude", ".SIGN.*"),
+                           check=True)
+        for executable in ("usr/bin/gcc", "usr/bin/as", "lib/ld-musl-riscv64.so.1"):
+            if not (tree / executable).is_file():
+                raise ValueError(f"compiler payload lacks {executable}")
+        identity = {"manifest_sha256": manifest,
+                    "tree_sha256": tree_digest(tree)}
+        # Prepare completely before replacing an unchanged older package closure.
+        previous = DESTINATION.with_name("alpine-tree.previous")
+        if previous.exists(): raise ValueError("unfinished compiler cache replacement")
+        if DESTINATION.exists(): os.rename(DESTINATION, previous)
+        try:
             os.rename(tree, DESTINATION)
-        IDENTITY.write_text(json.dumps(identity, sort_keys=True, indent=2) + "\n")
+        except BaseException:
+            if previous.exists(): os.rename(previous, DESTINATION)
+            raise
+        if previous.exists(): shutil.rmtree(previous)
+    IDENTITY.write_text(json.dumps(identity, sort_keys=True, indent=2) + "\n")
     print(f"Alpine native compiler: {len(packages)} verified APKs, "
           f"tree SHA-256 {tree_digest(DESTINATION)}")
 
