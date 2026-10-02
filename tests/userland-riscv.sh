@@ -2,6 +2,17 @@
 
 set -eu
 
+# Idle IRQ返回可在启动行中间运行用户程序；保留完整后缀和唯一性，不丢弃失败记录。
+marker_once() {
+    python3 -B - "$1" "$2" <<'MARKER'
+from pathlib import Path
+import sys
+raw=Path(sys.argv[1]).read_bytes().replace(b'\r',b'')
+marker=sys.argv[2].encode()
+sys.exit(0 if raw.count(marker)==1 and any(line.endswith(marker) for line in raw.splitlines()) else 1)
+MARKER
+}
+
 project_root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 kernel=${KERNEL_RV:-"$project_root/kernel-rv"}
 program=${REAL_USERLAND_RV:-"$project_root/build/riscv/tests/user/real-userland-rv"}
@@ -94,7 +105,7 @@ for marker in \
     'BoarOS: real userland pipe checks ok' \
     'BoarOS: real userland poll/select checks ok' \
     'BoarOS: real userland epoll checks ok'; do
-    if [ "$(grep -cxF "$marker" "$static_output" || true)" -ne 1 ]; then
+    if ! marker_once "$static_output" "$marker"; then
         tail -n 120 "$static_output" >&2
         echo "real userland marker missing or duplicated: $marker" >&2
         exit 1
@@ -164,7 +175,7 @@ for marker in \
     'BoarOS: real pthread robust remote query checks ok' \
     'BoarOS: real pthread robust mutex protocol checks ok' \
     'BoarOS: real pthread robust raw exit checks ok'; do
-    if [ "$(grep -cxF "$marker" "$pthread_output" || true)" -ne 1 ]; then
+    if ! marker_once "$pthread_output" "$marker"; then
         tail -n 160 "$pthread_output" >&2
         echo "pthread userland marker missing or duplicated: $marker" >&2
         exit 1
