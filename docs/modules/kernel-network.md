@@ -126,3 +126,13 @@ TCP MSG_TRUNC、UDP自动端口释放，IRQ重试由独立heap包装器保护。
 
 结果与限制见[网络记录](../learning/network-ownership.md#原版网络应用交付2026-10-02)。
 没有真实网卡、命名AF_UNIX、SCM_RIGHTS或TCP_INFO；相关应用字段不作为已验证统计。
+
+## 接收状态纠错（2026-10-02）
+
+新建未连接INET stream的read/recv立即返回ENOTCONN，poll报告HUP；连接中仍按
+连接进展等待，已建立连接保留队首数据优先和错误/FIN/reset后的终止语义。
+read/readv零长度仍直接返回；recv/recvmsg零长度检查协议状态：空已连接socket
+非阻塞返回EAGAIN，有数据返回0且不消费，EOF返回0。零容量请求无需scratch页。
+内部空队列状态查询不消费错误，接收入口才交付pending_error。
+同ELF反例由`tests/workloads/network/contract.c`保护，差分新增fresh IPv4/IPv6记录；
+固定依据为`references/linux/net/ipv4/tcp.c`和`include/net/sock.h`（Linux v7.2）。

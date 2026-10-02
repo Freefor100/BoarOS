@@ -166,3 +166,12 @@ argv、配置、原始输出、wait status和观测快照；本文保留验收�
 最终仅单向合入兼容分支，不push。
 VirtIO-net与宿主双向应用是下一阶段；命名UNIX、SCM_RIGHTS、TCP_INFO、真实
 网卡、SMP与LoongArch均未由此次loopback结果交付。
+
+## socket状态与发送纠错（2026-10-02）
+
+独立评审指出未连接TCP非零读取缺少ENOTCONN。真实U-mode反例在固定Linux通过，
+旧BoarOS返回EAGAIN；零长度recv还被文件层的read(0)快捷返回绕过。修复让消息接收
+经过协议状态检查，保留read(0)与recv(0)的区别；空已连接socket的recv(0)也会等待，
+非阻塞为EAGAIN，已有内容则返回0且不消费。队首数据、待交付错误与EOF继续分开。
+重建：`make all && python3 -B tests/network-riscv.py`，固定资料见网络模块。
+本段只记录该边界的双侧验证；本轮整体应用和性能结论在收口后追加。

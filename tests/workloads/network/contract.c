@@ -257,10 +257,51 @@ static void reset_and_accept_rollback(void)
     else CHECK(errno==ENOENT);
     puts("NETWORK PASS lifecycle: reset differs from SYN refusal; failed accept releases backlog");
 }
+static void receive_state(void)
+{
+    char byte = 0;
+    struct msghdr empty = {0};
+    for (unsigned i = 0; i < 2; i++) {
+        int fd = socket(i ? AF_INET6 : AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+        CHECK(fd >= 0);
+        CHECK(read(fd, &byte, 0) == 0 && readv(fd, NULL, 0) == 0);
+        CHECK(recv(fd, &byte, 1, MSG_DONTWAIT) == -1 && errno == ENOTCONN);
+        CHECK(recv(fd, &byte, 0, MSG_DONTWAIT) == -1 && errno == ENOTCONN);
+        CHECK(recvmsg(fd, &empty, MSG_DONTWAIT) == -1 && errno == ENOTCONN);
+        struct pollfd ready = {.fd = fd, .events = POLLIN | POLLOUT};
+        CHECK(poll(&ready, 1, 0) == 1 && (ready.revents & POLLHUP));
+        CHECK(close(fd) == 0);
+    }
+    int listener = socket(AF_INET, SOCK_STREAM, 0);
+    CHECK(listener >= 0);
+    struct sockaddr_in address = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    CHECK(bind(listener, (void *)&address, sizeof(address)) == 0 && listen(listener, 1) == 0);
+    socklen_t length = sizeof(address);
+    CHECK(getsockname(listener, (void *)&address, &length) == 0);
+    CHECK(recv(listener, &byte, 0, MSG_DONTWAIT) == -1 && errno == ENOTCONN);
+    int client = socket(AF_INET, SOCK_STREAM, 0);
+    CHECK(client >= 0 && connect(client, (void *)&address, sizeof(address)) == 0);
+    int server = accept(listener, NULL, NULL);
+    CHECK(server >= 0);
+    CHECK(recv(server, &byte, 0, MSG_DONTWAIT) == -1 && errno == EAGAIN);
+    CHECK(recvmsg(server, &empty, MSG_DONTWAIT) == -1 && errno == EAGAIN);
+    CHECK(send(client, "x", 1, MSG_NOSIGNAL) == 1);
+    struct pollfd ready = {.fd = server, .events = POLLIN};
+    CHECK(poll(&ready, 1, 2000) == 1);
+    CHECK(recv(server, &byte, 0, MSG_DONTWAIT) == 0);
+    CHECK(recvmsg(server, &empty, MSG_DONTWAIT) == 0);
+    CHECK(recv(server, &byte, 1, MSG_DONTWAIT) == 1 && byte == 'x');
+    CHECK(shutdown(client, SHUT_WR) == 0 && poll(&ready, 1, 2000) == 1);
+    CHECK(recv(server, &byte, 0, MSG_DONTWAIT) == 0);
+    CHECK(close(server) == 0 && close(client) == 0 && close(listener) == 0);
+    puts("NETWORK PASS receive-state: fresh TCP errors and zero-length message state");
+}
+
 int main(void)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
     addresses();
+    receive_state();
     data_and_shutdown();
     options();
     reset_and_accept_rollback();

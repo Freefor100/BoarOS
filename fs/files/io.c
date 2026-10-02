@@ -279,14 +279,14 @@ static enum kernel_files_status read_pinned(
                 return KERNEL_FILES_STATUS_OK;
             }
         }
-        int message = (socket_flags & KERNEL_SOCKET_IO_MESSAGE) &&
-                      kernel_socket_is_datagram(kernel_open_file_socket(description));
+        int message = (socket_flags & KERNEL_SOCKET_IO_MESSAGE) != 0;
+        /* read(0)可直接返回；recv(0)仍须检查协议状态和等待条件。 */
         int discard = kernel_socket_discard_receive(kernel_open_file_socket(description),socket_flags);
         if (count == 0U && !message) {
             *linux_result = 0;
             return KERNEL_FILES_STATUS_OK;
         }
-        if (!discard && kernel_task_io_buffer_acquire(&buffer, mm->allocator) !=
+        if (count != 0U && !discard && kernel_task_io_buffer_acquire(&buffer, mm->allocator) !=
                 KERNEL_TASK_STATUS_OK) {
             *linux_result = -KERNEL_ENOMEM;
             files->record->statistics.read_failures++;

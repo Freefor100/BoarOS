@@ -914,6 +914,19 @@ int kernel_socket_recvfrom(struct kernel_socket *socket, struct kernel_mm *mm,
     return user_fault ? -KERNEL_EFAULT : (int)done;
 }
 
+/* 无队首数据时的状态；查询不消费错误，reservation入口负责交付。 */
+static int socket_receive_empty(const struct kernel_socket *socket)
+{
+    if (socket->pending_error) return socket->pending_error;
+    if (socket->read_closed ||
+        ((socket->type == SOCKET_STREAM || socket->domain == KERNEL_SOCKET_DOMAIN_UNIX) && socket->peer_closed))
+        return 0;
+    if (socket->domain == KERNEL_SOCKET_DOMAIN_INET && socket->type == SOCKET_STREAM &&
+        !socket->connected && !socket->connecting)
+        return -KERNEL_ENOTCONN;
+    return -KERNEL_EAGAIN;
+}
+
 int kernel_socket_reserve_read(struct kernel_socket *socket,
                               struct kernel_task *task,
                               struct kernel_socket_read_request *request,
@@ -924,7 +937,6 @@ int kernel_socket_reserve_read(struct kernel_socket *socket,
     uint32_t available;
     uint32_t length;
     uintptr_t old_status;
-    if (capacity == 0U && socket->type != SOCKET_DGRAM) return 0;
     if (request == 0 || request->socket != 0 ||
         pin_owner == 0 || *pin_owner == 0 ||
         kernel_open_file_socket(*pin_owner) != socket)
@@ -940,12 +952,15 @@ int kernel_socket_reserve_read(struct kernel_socket *socket,
     }
     packet = socket->packets_head;
     if (packet == 0) {
-        int result = socket->pending_error;
-        if (result) socket->pending_error = 0;
-        else result = (socket->read_closed || ((socket->type == SOCKET_STREAM || socket->domain == KERNEL_SOCKET_DOMAIN_UNIX) && socket->peer_closed))
-                         ? 0 : -KERNEL_EAGAIN;
+        int result = socket_receive_empty(socket);
+        if (socket->pending_error) socket->pending_error = 0;
         riscv_interrupt_restore(old_status);
         return result;
+    }
+    /* recv(0)检查连接/等待状态，但不取得或消费已有stream数据。 */
+    if (capacity == 0U && socket->type == SOCKET_STREAM) {
+        riscv_interrupt_restore(old_status);
+        return 0;
     }
     available = packet->payload != 0 ? (uint32_t)(packet->payload->tot_len - packet->consumed)
                                      : (packet->length - packet->consumed);
@@ -1558,6 +1573,8 @@ uint32_t kernel_socket_poll(struct kernel_socket *socket,
         riscv_interrupt_restore(saved);
     } else if (socket->peer_closed) {
         events |= KERNEL_POLLHUP | KERNEL_POLLOUT | KERNEL_POLLRDHUP | KERNEL_POLLIN;
+    } else if (socket_receive_empty(socket) == -KERNEL_ENOTCONN) {
+        events |= KERNEL_POLLHUP;
     }
     if (socket->pending_error) events |= KERNEL_POLLERR;
     return events;
