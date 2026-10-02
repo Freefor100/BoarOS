@@ -1,0 +1,38 @@
+#ifndef BOAROS_HOST_LWIP_REASSEMBLY_OPTS_H
+#define BOAROS_HOST_LWIP_REASSEMBLY_OPTS_H
+
+#define NO_SYS 1
+#define SYS_LIGHTWEIGHT_PROT 0
+#define LWIP_TIMERS 0
+#define LWIP_IPV4 1
+#define LWIP_IPV6 0
+#define LWIP_TCP 0
+#define LWIP_UDP 0
+#define LWIP_RAW 0
+#define LWIP_ICMP 0
+#define LWIP_ARP 0
+#define LWIP_NETCONN 0
+#define LWIP_SOCKET 0
+#define LWIP_DNS 0
+#define LWIP_DHCP 0
+#define LWIP_AUTOIP 0
+#define LWIP_IGMP 0
+#define LWIP_NETIF_LOOPBACK 0
+#define LWIP_HAVE_LOOPIF 0
+#define IP_REASSEMBLY 1
+#define IP_FRAG 1
+#define MEM_ALIGNMENT 8
+#define MEM_SIZE (256U * 1024U)
+#define MEM_LIBC_MALLOC 0
+#define MEMP_MEM_MALLOC 0
+#define MEMP_NUM_REASSDATA 8
+#define IP_REASS_MAX_PBUFS 48
+#define MEMP_NUM_FRAG_PBUF 64
+#define MEMP_NUM_PBUF 64
+#define PBUF_POOL_SIZE 64
+#define PBUF_POOL_BUFSIZE 1536
+#define LWIP_STATS 1
+#define LWIP_STATS_DISPLAY 0
+#define LWIP_DEBUG 0
+
+#endif

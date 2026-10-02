@@ -10,6 +10,7 @@
 | `include/kernel/physical_page.h`、`kernel/physical_page.c` | 管理显式分配器对象、bootstrap→buddy 状态迁移、单页共享引用、连续页所有权、压力回收入口和计数 |
 | `tests/riscv/physical_page_cases.c` | 验证 bootstrap 兼容、buddy split/coalesce、所有权状态和耗尽语义 |
 | `tests/riscv/physical_page_main.c`、`tests/page-riscv.sh` | 构建并运行独立的 QEMU 聚焦测试内核 |
+| `tests/host/allocator_release.c` | 独立子进程验证非法释放 fatal 和各 guard 的失败诊断 |
 
 RISC-V64 构建固定 `BOAROS_PAGE_SHIFT=12`。初始化把每个字节粒度可用区间
 向内收缩到完整页，拒绝溢出、乱序或重叠输入；不足一页的碎片被忽略。失败不会
@@ -43,6 +44,15 @@ finalized 后，`physical_page_allocate_order(order)` 分配 `2^order` 个物理
 `physical_page_allocate/release` 签名保持不变，在 finalized 模式委托给 order 0，因此
 Sv39 和 MM 的单页接口不需要识别分配器模式；scheduler 初始化要求 finalized allocator，为独立内核栈取得 order-1 连续页。分配耗尽仍返回 `EMPTY`，分配调用不会
 修改输出或 `available_pages`。
+
+释放的 fatal 分支先输出 guard 原因、调用者传入的物理地址和 requested order，再触发
+原 fatal trap。wrong-order、非 allocated head、重复释放、可用页计数、buddy 元数据和
+free-list 操作各有可区分的原因。只有 finalized 分配器的受检查页查找成功后，才输出
+该页的索引、state、stored order、引用数和链索引；buddy/free-list 失败显示相关页的
+metadata 地址，非法地址或 bootstrap 失败不读取 metadata，也不追踪损坏的链索引。
+输出经 `kernel_console_putc()` 的同步 raw UART sink，不分配、不回收、不睡眠，不经过
+内核日志的等待者唤醒；正常释放路径没有诊断输出。这些字段标识本次命中的不变量检查，
+单独的 trap PC 或这类 guard 现场仍不能证明导致元数据损坏的上游根因。
 
 finalized 的 order-0 页可用 `physical_page_acquire()` 增加 32 位引用，
 `physical_page_release()` 只在末引用消失时把页归还 buddy；
@@ -96,6 +106,7 @@ bootstrap 分散耗尽时 finalize 仍返回 `EMPTY`。当前 QEMU 满足该约�
 ## 验证
 
 ```sh
+make test-allocator-release-host
 make test-page-riscv
 make test-riscv
 ```
@@ -108,6 +119,11 @@ recycled/tail 导入、metadata 扣除、order 对齐、强制 split 与多级 c
 执行分配—解析—释放—再分配，并精确要求
 `total - available == Sv39 table_pages + metadata_pages`；生产 idle 测试还要求 buddy
 模式在 timer 启动前已经生效。
+
+host fatal 测试仍要求非法释放终止于 `SIGILL`，同时检查 wrong-order、tail、重复释放、
+非对齐地址、未初始化分配器、计数损坏和 buddy 元数据损坏的 guard 原因、地址、order
+及有条件的 metadata 字段；不要求整句文案或 trap PC 相同。fixture 只替换硬件 console
+sink 来读取真实分配器输出，并检查合法共享单页及连续页释放保持无输出。
 
 ## 内存快照与后台压力通知
 

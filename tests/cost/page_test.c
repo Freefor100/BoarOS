@@ -1,4 +1,5 @@
 #include <kernel/cost.h>
+#include <kernel/console.h>
 #include <kernel/physical_page.h>
 #include <assert.h>
 #include <stdio.h>
@@ -8,6 +9,8 @@ static uint32_t depth=1;
 static uint32_t *reclaim_depth(void){return &depth;}
 static uint64_t reclaim(void *context,uint64_t pages){(void)context;(void)pages;assert(0);return 0;}
 static void *access_page(uint64_t address){return (void *)(uintptr_t)address;}
+/* The host has no UART; this legal/OOM workload must never emit a fatal. */
+void kernel_console_putc(char character){(void)character;assert(0);}
 uint64_t kernel_cost_clock(void){return 100;}
 uint64_t kernel_cost_lock(void){return 0;}
 void kernel_cost_unlock(uint64_t s){(void)s;}

@@ -4,6 +4,7 @@
 #include <arch/riscv/sv39.h>
 #include <arch/riscv/virtio_mmio_block.h>
 #include <arch/riscv/virtio_mmio_rng.h>
+#include <kernel/network.h>
 #include <kernel/dtb.h>
 #include <kernel/elf64_source.h>
 #include <kernel/exec_image.h>
@@ -54,10 +55,12 @@ enum riscv_root_finish_failure {
     RISCV_ROOT_FINISH_HEAP_BASELINE = 1U << 5,
     RISCV_ROOT_FINISH_PAGE_BASELINE = 1U << 6,
     RISCV_ROOT_FINISH_RNG = 1U << 7,
+    RISCV_ROOT_FINISH_NETWORK = 1U << 8,
 };
 
 struct riscv_root_boot {
     struct riscv_virtio_mmio_rng rng;
+    struct kernel_network *network;
     struct kernel_heap heap;
     struct kernel_page_cache page_cache;
     struct riscv_virtio_mmio_block device;

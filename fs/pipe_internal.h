@@ -23,6 +23,7 @@ struct kernel_pipe {
     uint16_t slots;
     uint16_t page_offset[16];
     uint16_t page_length[16];
+    uint8_t can_merge[16];
     uint64_t bytes;
     uint32_t readers;
     uint32_t writers;
@@ -88,5 +89,9 @@ uint32_t kernel_pipe_poll(
     struct kernel_pipe *pipe,
     uint32_t endpoint,
     struct kernel_wait_queue **out_queue);
+
+enum kernel_pipe_status kernel_pipe_write_buffer(
+    struct kernel_pipe *pipe, const void *buffer, size_t count,
+    uint32_t open_flags, int64_t *linux_result);
 
 #endif

@@ -124,6 +124,8 @@ LWIP_SOURCES := \
 	third_party/lwip/src/core/tcp_out.c \
 	third_party/lwip/src/core/timeouts.c \
 	third_party/lwip/src/core/udp.c \
+	third_party/lwip/src/netif/ethernet.c \
+	third_party/lwip/src/core/ipv4/etharp.c \
 	third_party/lwip/src/core/ipv4/icmp.c \
 	third_party/lwip/src/core/ipv4/ip4.c \
 	third_party/lwip/src/core/ipv4/ip4_addr.c \
@@ -151,6 +153,7 @@ C_SOURCES := \
 	arch/riscv/virt_uart.c \
 	arch/riscv/virtio_mmio_block.c \
 	arch/riscv/virtio_mmio_rng.c \
+	arch/riscv/virtio_mmio_net.c \
 	arch/riscv/plic.c \
 	fs/lwext4_port.c \
 	fs/files/table.c \
@@ -216,6 +219,7 @@ C_SOURCES := \
 	kernel/cost.c \
 	kernel/sched/cost.c \
 	net/socket.c \
+	net/ethernet.c \
 	lib/qsort.c \
 	lib/string.c \
 	mm/vma.c \
@@ -253,6 +257,7 @@ TEST_RUNTIME_C_SOURCES := \
 	arch/riscv/virt_uart.c \
 	arch/riscv/virtio_mmio_block.c \
 	arch/riscv/virtio_mmio_rng.c \
+	arch/riscv/virtio_mmio_net.c \
 	arch/riscv/plic.c \
 	fs/files/table.c \
 	fs/files/locks.c \
@@ -974,7 +979,9 @@ $(BUILD_DIR)/fs/lwext4_port.o $(BUILD_DIR)/fs/ext4_backend.o: \
 
 $(BUILD_DIR)/third_party/lwip/src/core/%.o \
 $(BUILD_DIR)/net/lwip_port/%.o \
-$(BUILD_DIR)/net/socket.o: CPPFLAGS += $(LWIP_CPPFLAGS)
+$(BUILD_DIR)/net/socket.o \
+$(BUILD_DIR)/net/ethernet.o \
+$(BUILD_DIR)/third_party/lwip/src/netif/ethernet.o: CPPFLAGS += $(LWIP_CPPFLAGS)
 
 $(BUILD_DIR)/third_party/lwext4/src/%.o: \
 		third_party/lwext4/src/%.c
@@ -1628,3 +1635,23 @@ test-rtc-host:
 .PHONY: test-network-riscv
 test-network-riscv: kernel-rv
 	python3 -B tests/network-riscv.py
+
+.PHONY: test-virtio-net-host test-lwip-reassembly-host test-ethernet-worker-host test-network-external-riscv force-net-config
+NET_IPV4 ?= 0x0a4d0002
+NET_NETMASK ?= 0xffffff00
+force-net-config:
+$(BUILD_DIR)/generated/net-config.h: force-net-config
+	@mkdir -p $(dir $@)
+	@printf '#define BOAROS_NET_IPV4 %sU\n#define BOAROS_NET_NETMASK %sU\n' '$(NET_IPV4)' '$(NET_NETMASK)' > $@.tmp
+	@cmp -s $@ $@.tmp && rm $@.tmp || mv $@.tmp $@
+$(BUILD_DIR)/net/ethernet.o: $(BUILD_DIR)/generated/net-config.h
+$(BUILD_DIR)/net/ethernet.o: CPPFLAGS += -I$(BUILD_DIR)/generated
+test-virtio-net-host:
+	python3 -B tests/host/virtio_net.py
+test-lwip-reassembly-host:
+	sh tests/host/lwip_reassembly.sh
+
+test-ethernet-worker-host:
+	python3 -B tests/host/ethernet_worker.py
+test-network-external-riscv: $(KERNEL_RV)
+	python3 -B tests/network-external.py --kernel $(KERNEL_RV) --transport both

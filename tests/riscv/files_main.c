@@ -135,6 +135,8 @@ static int inject_truncate_error;
 static kernel_block_write_fn time_original_write;
 static kernel_block_flush_fn sync_original_flush;
 static unsigned int sync_flush_failures;
+static struct kernel_open_file_description *sendfile_flush_output;
+static uint64_t sendfile_flush_threshold;
 static unsigned int time_write_failures;
 static unsigned int time_write_calls;
 static uint32_t time_clock_nanoseconds;
@@ -146,6 +148,11 @@ static unsigned int writeback_redirty_seen;
 
 static enum kernel_block_status sync_test_flush(void *context)
 {
+    if (sendfile_flush_output != 0 &&
+        kernel_open_file_size(sendfile_flush_output) >= sendfile_flush_threshold) {
+        sendfile_flush_output = 0;
+        return KERNEL_BLOCK_STATUS_IO;
+    }
     if (sync_flush_failures != 0U) {
         sync_flush_failures--;
         return KERNEL_BLOCK_STATUS_IO;
@@ -3710,6 +3717,53 @@ static void run_partial_write_test(const void *dtb)
                 KERNEL_FILES_STATUS_OK || result != 0)
             fail_files(412U, 0, result);
     }
+    /* sendfile 的同步错误发生在批次位置发布前；后批失败只发布成功前缀。 */
+    static unsigned char sendfile_data[BOAROS_PAGE_SIZE];
+    for (size_t i = 0; i < sizeof(sendfile_data); i++) sendfile_data[i] = (unsigned char)(i % 251U);
+    if (!write_user_bytes(&mm, TEST_USER_BUFFER, sendfile_data, sizeof(sendfile_data)) ||
+        kernel_files_pwrite(&files, &mm, 0, TEST_USER_BUFFER, BOAROS_PAGE_SIZE, 0, &result) != KERNEL_FILES_STATUS_OK || result != BOAROS_PAGE_SIZE ||
+        kernel_files_pwrite(&files, &mm, 0, TEST_USER_BUFFER, BOAROS_PAGE_SIZE, BOAROS_PAGE_SIZE, &result) != KERNEL_FILES_STATUS_OK || result != BOAROS_PAGE_SIZE)
+        fail_files(450U, BOAROS_PAGE_SIZE, result);
+    for (size_t n = 0; n < 2; n++) {
+        for (int explicit_offset = 0; explicit_offset < 2; explicit_offset++) {
+            for (unsigned failed_batch = 1; failed_batch < 3; failed_batch++) {
+                const char sendfile_path[] = "/sendfile-sync";
+                if (!write_user_bytes(&mm, TEST_USER_PATH, sendfile_path, sizeof(sendfile_path)) ||
+                    kernel_files_openat(&files, &fs, &mm, TEST_AT_FDCWD, TEST_USER_PATH,
+                        TEST_O_CREAT | UINT64_C(00001000) | 2U | sync_flags[n], 0600U, &result) != KERNEL_FILES_STATUS_OK || result != 1 ||
+                    kernel_files_lseek(&files, 0, 0, 0, &result) != KERNEL_FILES_STATUS_OK || result != 0)
+                    fail_files(451U, 0, result);
+                int64_t offset = 0, observed_offset = -1;
+                if (!write_user_bytes(&mm, TEST_USER_PATH + 64U, &offset, sizeof(offset))) fail_files(452U, 0, -1);
+                struct kernel_open_file_description *target = kernel_files_lookup_description(&files, 1);
+                sendfile_flush_output = target;
+                sendfile_flush_threshold = failed_batch * BOAROS_PAGE_SIZE;
+                int64_t expected = failed_batch == 1 ? -KERNEL_EIO : (int64_t)BOAROS_PAGE_SIZE;
+                uint64_t progress = failed_batch == 1 ? 0U : BOAROS_PAGE_SIZE;
+                if (kernel_files_sendfile(&files, &mm, 1, 0, explicit_offset ? TEST_USER_PATH + 64U : 0U,
+                        2U * BOAROS_PAGE_SIZE, &result) != KERNEL_FILES_STATUS_OK || result != expected || sendfile_flush_output != 0)
+                    fail_files(453U, expected, result);
+                if (kernel_open_file_offset(target) != progress ||
+                    kernel_open_file_offset(description) != (explicit_offset ? 0U : progress))
+                    fail_files(456U, progress, kernel_open_file_offset(target));
+                if (kernel_open_file_size(target) != failed_batch * BOAROS_PAGE_SIZE)
+                    fail_files(457U, failed_batch * BOAROS_PAGE_SIZE, kernel_open_file_size(target));
+                if (!read_user_bytes(&mm, TEST_USER_PATH + 64U, &observed_offset, sizeof(observed_offset)) ||
+                    observed_offset != (explicit_offset ? (int64_t)progress : 0))
+                    fail_files(458U, explicit_offset ? (int64_t)progress : 0, observed_offset);
+                size_t copied_data = 0;
+                if (kernel_open_file_pread(target, (failed_batch - 1U) * BOAROS_PAGE_SIZE, observed,
+                        sizeof(observed), &copied_data) != 0 || copied_data != sizeof(observed) ||
+                    memcmp(observed, sendfile_data, sizeof(observed)) != 0 ||
+                    kernel_files_sync(&files, 1, 1, &result) != KERNEL_FILES_STATUS_OK || result != 0 ||
+                    kernel_files_close(&files, 1, &result) != KERNEL_FILES_STATUS_OK || result != 0)
+                    fail_files(454U, 0, result);
+            }
+        }
+    }
+    if (kernel_files_ftruncate(&files, 0, 0, &result) != KERNEL_FILES_STATUS_OK || result != 0 ||
+        kernel_files_lseek(&files, 0, 28, 0, &result) != KERNEL_FILES_STATUS_OK || result != 28)
+        fail_files(455U, 28, result);
     device.block.flush = sync_original_flush;
 
     /* msync keeps the inode's writeback error owner while the mapping pins

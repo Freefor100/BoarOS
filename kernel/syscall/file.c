@@ -520,6 +520,30 @@ enum kernel_syscall_status syscall_handle_write(
     return KERNEL_SYSCALL_STATUS_OK;
 }
 
+enum kernel_syscall_status syscall_handle_sendfile(
+    struct kernel_task *caller, const struct kernel_syscall_request *request,
+    struct kernel_syscall_result *decoded)
+{
+    struct kernel_files *files;
+    struct kernel_mm *mm;
+    int64_t value;
+    enum kernel_task_status task_status = kernel_task_files_borrow(caller, &files);
+    if (task_status == KERNEL_TASK_STATUS_RESOURCE_UNAVAILABLE) {
+        decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+        decoded->value = -KERNEL_EBADF;
+        return KERNEL_SYSCALL_STATUS_OK;
+    }
+    if (task_status != KERNEL_TASK_STATUS_OK ||
+        kernel_task_mm_borrow_mutable(caller, &mm) != KERNEL_TASK_STATUS_OK ||
+        kernel_files_sendfile(files, mm, (int32_t)request->arguments[0],
+            (int32_t)request->arguments[1], request->arguments[2],
+            request->arguments[3], &value) != KERNEL_FILES_STATUS_OK)
+        return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+    decoded->value = value;
+    return KERNEL_SYSCALL_STATUS_OK;
+}
+
 enum kernel_syscall_status syscall_handle_lseek(
     struct kernel_task *caller,
     const struct kernel_syscall_request *request,
@@ -746,6 +770,162 @@ enum kernel_syscall_status syscall_handle_getdents64(
     const struct kernel_syscall_request *request,
     struct kernel_syscall_result *decoded);
 
+struct linux_interface_request {
+    char name[16];
+    union {
+        uint16_t flags;
+        int32_t value;
+        struct {
+            uint16_t family, port;
+            uint32_t address;
+            uint8_t zero[8];
+        } address;
+        struct {
+            uint16_t family;
+            uint8_t bytes[14];
+        } hardware;
+        uint8_t bytes[24];
+    } data;
+};
+
+struct linux_interface_configuration {
+    int32_t length;
+    uint32_t padding;
+    uint64_t buffer;
+};
+
+_Static_assert(sizeof(struct linux_interface_request) == 40U, "RV64 ifreq");
+_Static_assert(sizeof(struct linux_interface_configuration) == 16U, "RV64 ifconf");
+
+static int interface_ioctl_command(uint32_t command)
+{
+    switch (command) {
+    case 0x8910: /* SIOCGIFNAME */
+    case 0x8912: /* SIOCGIFCONF */
+    case 0x8913: /* SIOCGIFFLAGS */
+    case 0x8914: /* SIOCSIFFLAGS */
+    case 0x8915: /* SIOCGIFADDR */
+    case 0x891b: /* SIOCGIFNETMASK */
+    case 0x8921: /* SIOCGIFMTU */
+    case 0x8927: /* SIOCGIFHWADDR */
+    case 0x8933: /* SIOCGIFINDEX */
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static int64_t interface_configuration_ioctl(struct kernel_mm *mm,
+                                             uint64_t user_configuration)
+{
+    struct linux_interface_configuration configuration;
+    struct kernel_socket_interface snapshot;
+    int32_t total = 0;
+    size_t copied = 0;
+    if (kernel_copy_from_user(mm, &configuration, user_configuration,
+                              sizeof(configuration), &copied) !=
+            KERNEL_UACCESS_STATUS_OK || copied != sizeof(configuration))
+        return -KERNEL_EFAULT;
+
+    for (uint32_t ordinal = 0;; ordinal++) {
+        int result = kernel_socket_interface_nth(ordinal, &snapshot);
+        if (result == -KERNEL_ENODEV) break;
+        if (result != 0) return result;
+        if (snapshot.address == 0U) continue;
+        if (configuration.buffer != 0U) {
+            struct linux_interface_request interface = {0};
+            if ((int64_t)configuration.length - total <
+                    (int64_t)sizeof(interface))
+                break;
+            __builtin_memcpy(interface.name, snapshot.name, sizeof(interface.name));
+            interface.data.address.family = KERNEL_SOCKET_AF_INET;
+            interface.data.address.address = snapshot.address;
+            /* 逐条交付完整记录；后续 fault 保留前缀且不发布新 ifc_len。 */
+            copied = 0;
+            if (kernel_copy_to_user(mm, configuration.buffer + (uint32_t)total,
+                                    &interface, sizeof(interface), &copied) !=
+                    KERNEL_UACCESS_STATUS_OK || copied != sizeof(interface))
+                return -KERNEL_EFAULT;
+        }
+        total += (int32_t)sizeof(struct linux_interface_request);
+    }
+    /* Linux 只写长度，保留调用者 ifconf 的 padding 与指针。 */
+    copied = 0;
+    if (kernel_copy_to_user(mm, user_configuration, &total, sizeof(total),
+                            &copied) != KERNEL_UACCESS_STATUS_OK ||
+        copied != sizeof(total))
+        return -KERNEL_EFAULT;
+    return 0;
+}
+
+static int64_t interface_request_ioctl(struct kernel_mm *mm, uint32_t command,
+                                      uint64_t user_interface)
+{
+    struct linux_interface_request interface;
+    struct kernel_socket_interface snapshot;
+    char name[16];
+    int alias = 0, result;
+    size_t copied = 0;
+    if (kernel_copy_from_user(mm, &interface, user_interface, sizeof(interface),
+                              &copied) != KERNEL_UACCESS_STATUS_OK ||
+        copied != sizeof(interface))
+        return -KERNEL_EFAULT;
+    interface.name[sizeof(interface.name) - 1U] = 0;
+    if (command == 0x8910) {
+        result = kernel_socket_interface_index((uint32_t)interface.data.value,
+                                               &snapshot);
+    } else {
+        __builtin_memcpy(name, interface.name, sizeof(name));
+        for (size_t i = 0; i < sizeof(name) && name[i] != 0; i++) {
+            if (name[i] == ':') { name[i] = 0; alias = 1; break; }
+        }
+        result = kernel_socket_interface_get(name, &snapshot);
+    }
+    if (result != 0) return result;
+
+    switch (command) {
+    case 0x8910:
+        for (size_t i = 0; i < sizeof(interface.name) - 1U; i++) {
+            interface.name[i] = snapshot.name[i];
+            if (snapshot.name[i] == 0) break;
+        }
+        break;
+    case 0x8913:
+        interface.data.flags = snapshot.flags;
+        break;
+    case 0x8914:
+        if (alias) return -KERNEL_EADDRNOTAVAIL;
+        return kernel_socket_interface_set_flags(name, interface.data.flags);
+    case 0x8915:
+    case 0x891b:
+        if (alias || snapshot.address == 0U) return -KERNEL_EADDRNOTAVAIL;
+        __builtin_memset(&interface.data.address, 0, sizeof(interface.data.address));
+        interface.data.address.family = KERNEL_SOCKET_AF_INET;
+        interface.data.address.address = command == 0x8915
+            ? snapshot.address : snapshot.netmask;
+        break;
+    case 0x8921:
+        interface.data.value = (int32_t)snapshot.mtu;
+        break;
+    case 0x8927:
+        interface.data.hardware.family = snapshot.hardware_type;
+        __builtin_memcpy(interface.data.hardware.bytes, snapshot.mac,
+                         sizeof(snapshot.mac));
+        break;
+    case 0x8933:
+        interface.data.value = (int32_t)snapshot.index;
+        break;
+    default:
+        return -KERNEL_ENOTTY;
+    }
+    copied = 0;
+    if (kernel_copy_to_user(mm, user_interface, &interface, sizeof(interface),
+                            &copied) != KERNEL_UACCESS_STATUS_OK ||
+        copied != sizeof(interface))
+        return -KERNEL_EFAULT;
+    return 0;
+}
+
 enum kernel_syscall_status syscall_handle_ioctl(
     struct kernel_task *caller,
     const struct kernel_syscall_request *request,
@@ -764,47 +944,27 @@ enum kernel_syscall_status syscall_handle_ioctl(
     }
     if (task_status != KERNEL_TASK_STATUS_OK)
         return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
-    if ((uint32_t)request->arguments[1] == UINT64_C(0x8913) ||
-        (uint32_t)request->arguments[1] == UINT64_C(0x8914)) {
-        struct {
-            char name[16];
-            uint16_t flags;
-            uint8_t padding[22];
-        } interface;
-        size_t copied = 0;
+    if (interface_ioctl_command((uint32_t)request->arguments[1])) {
+        enum kernel_syscall_status status = KERNEL_SYSCALL_STATUS_OK;
         if (kernel_files_pin(files, (int32_t)request->arguments[0],
                              &file, &linux_result) != KERNEL_FILES_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
         if (linux_result == 0 && kernel_open_file_socket(file) == 0)
             linux_result = -KERNEL_ENOTTY;
-        if (linux_result == 0 &&
-            kernel_task_mm_borrow_mutable(caller, &mm) != KERNEL_TASK_STATUS_OK)
-            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
-        if (linux_result == 0 &&
-            (kernel_copy_from_user(mm, &interface, request->arguments[2],
-                                   sizeof(interface), &copied) !=
-                 KERNEL_UACCESS_STATUS_OK || copied != sizeof(interface)))
-            linux_result = -KERNEL_EFAULT;
         if (linux_result == 0) {
-            if ((uint32_t)request->arguments[1] == UINT64_C(0x8913)) {
-                linux_result = kernel_socket_loopback_flags(interface.name,
-                                                              &interface.flags);
-                if (linux_result == 0) {
-                    copied = 0;
-                    if (kernel_copy_to_user(mm, request->arguments[2],
-                                            &interface, sizeof(interface),
-                                            &copied) != KERNEL_UACCESS_STATUS_OK ||
-                        copied != sizeof(interface))
-                        linux_result = -KERNEL_EFAULT;
-                }
+            if (kernel_task_mm_borrow_mutable(caller, &mm) != KERNEL_TASK_STATUS_OK) {
+                status = KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+            } else if ((uint32_t)request->arguments[1] == 0x8912) {
+                linux_result = interface_configuration_ioctl(mm, request->arguments[2]);
             } else {
-                linux_result = kernel_socket_set_loopback_flags(
-                    interface.name, interface.flags);
+                linux_result = interface_request_ioctl(mm, (uint32_t)request->arguments[1],
+                                                       request->arguments[2]);
             }
         }
         if (file != 0 && kernel_open_file_release(&file) !=
                              KERNEL_OPEN_FILE_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+        if (status != KERNEL_SYSCALL_STATUS_OK) return status;
         decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
         decoded->value = linux_result;
         return KERNEL_SYSCALL_STATUS_OK;

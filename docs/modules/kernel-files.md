@@ -81,7 +81,7 @@ open file description 的 offset 只增加实际复制到用户空间的字节�
 
 `kernel_files_readv()` 使用相同的普通文件读取核心，整个调用只钉住一次 OFD，并把用户 iovec 快照到最多 8 项的栈数组或最多 1024 项的受限堆数组。先检查 fd 的读权限，再导入向量；每项长度与地址按固定 Linux 的 `references/linux/lib/iov_iter.c` 校验，单项向量先按 `MAX_RW_COUNT` 截断，多项向量先校验原始范围再截断累计长度。零项向量返回 0，零长度段跳过；普通文件按实际交付量推进共享 OFD，EOF、短读、fault 与后端错误均结束本次请求。console 从一次 UART 暂存分散到多个 iovec，不为每项重新等待。pipe 按上述片段提交规则消费数据。epoll 描述符没有 read 操作，在向量导入前返回 `-EINVAL`。
 
-每个 chunk 最多覆盖当前 4 KiB 文件页剩余部分：cache miss 承担一次底层随机读，hit 只增加页引用并复制；用户方向仍按基页做软件页表查询。模块统计调用/失败次数、字节、chunk、当前/峰值 fd、表容量与 close-on-exec 数量，页缓存另统计 hit/miss/insert/eviction/reclaim。当前仍有 cache-to-user 一次复制，尚无 read-ahead、直接用户页 I/O 或异步阻塞。优化这些路径时必须保持部分读取、offset 和错误返回语义。
+每个 chunk 最多覆盖当前 4 KiB 文件页剩余部分：cache miss 承担一次底层随机读，hit 只增加页引用并复制；用户方向仍按基页做软件页表查询。模块统计调用/失败次数、字节、chunk、当前/峰值 fd、表容量与 close-on-exec 数量，页缓存另统计 hit/miss/insert/eviction/reclaim。当前仍有 cache-to-user 一次复制，尚无 read-ahead、直接用户页 I/O 或用户态异步 I/O 接口。优化这些路径时必须保持部分读取、offset 和错误返回语义。
 
 ## 描述符 `write`/`writev` 与文件修改
 
@@ -90,8 +90,43 @@ open file description 的 offset 只增加实际复制到用户空间的字节�
 - pipe 的 `write/writev` 汇总后沿用 pipe 单次写空间、原子性、阻塞、EPIPE/SIGPIPE 和片段提交规则。
 - regular 文件的 `kernel_vfs_pwrite/append()` 将已复制字节接收到共享 inode 页缓存；部分 usercopy 只发布成功复制的前缀，并推进对应 offset/逻辑大小。writeback 错误由 inode 保留，不能事后撤销已经接收的字节。
 - `kernel_files_sync()` pin 选定 OFD，同步目标 inode 的数据/元数据与设备缓存；独立 open 各持错误序列观察位置，dup/fork 共享同一 OFD 的位置。普通文件和目录支持 fsync/fdatasync；pipe、字符设备、epoll 返回 EINVAL，无效 fd 返回 EBADF。
-- `O_SYNC/O_DSYNC` 在普通写的成功前缀之后执行同步。同步失败返回 errno，OFD offset 与已接受内容保持；这与 Linux `generic_write_sync()` 的顺序一致。full/data 模式分别捕获完整/数据依赖序号，fdatasync 可以顺带持久化同组时间元数据；当前在 checkpoint 后推进 durable，后台阈值清脏和组提交不替代同步错误观察与屏障。
+- `O_SYNC/O_DSYNC` 在普通写的成功前缀之后执行同步。同步失败返回 errno，OFD offset 与已接受内容保持；这与 Linux `generic_write_sync()` 的顺序一致。full/data 模式分别捕获完整/数据依赖序号，fdatasync 可以顺带持久化同组时间元数据；journal commit 屏障成功后发布 durable，checkpoint 独立回收旧版本。后台清脏和组提交不替代同步错误观察与屏障。
 - `writev` 先快照完整用户 iovec 数组，校验长度和范围，再与 write 共用写入核心；`iovcnt` 上限 1024。
+
+## `sendfile` 与来源片段
+
+RV64 syscall 71 用内核有界复制支持 regular/tmpfs 输入，输出可为 regular、pipe、
+stream 或 datagram socket。输入、输出各有 OFD pin，正常或信号取消均沿保存的
+syscall 栈展开。stream/file/pipe 使用请求暂存页；datagram 源暂存有效容量最多
+64 KiB，再接既有整包 request owner 和 charge 等待，不以普通 POLLOUT 猜整包
+能否容纳。此接口尚未采用文件页到设备的零拷贝。
+
+NULL offset 推进共享输入位置；显式 offset 只更新用户给定位置。两个 regular
+OFD 的位置锁按 rank/key 排序，同一 OFD 或 dup alias 只取一个锁、只推进一次。
+读取来源后释放 inode 数据锁，再经目标每批 rank 15 门闩写入；整次复制允许批次
+间交错，不跨另一个 inode 的读取持目标门闩。用户 offset 的初始读取先于 fd
+检查，最终复制在锁外；只读 offset 可在内容已经输出后返回 EFAULT，不能回滚
+真实副作用。
+
+每个同步输出批次都等待 O_SYNC/O_DSYNC。首批同步失败不发布位置，但保留真实
+修改的内容；后批失败仅返回此前成功同步批次的正前缀。这个位置规则与普通 write
+不同，依据固定 Linux v7.2 的 `fs/read_write.c::do_sendfile`、`fs/splice.c`
+和 `generic_write_sync`。不改变 journal、必要 FLUSH 或 durable 条件。
+
+pipe 的内核来源片段不允许后继普通写并尾，普通 write/writev 的来源仍可合并。
+片段完全消费时清理 can_merge，复用时按新来源发布；数据仍在独立 pipe 缓冲中，
+不会借用可被普通写修改的文件页。这保护容量和等待语义，不能只检查内容复制成功。
+
+```sh
+python3 -B tests/network-riscv.py --workload sendfile
+make test-files-partial-write-riscv
+```
+
+同一真实用户态探针检查位置、alias、错误顺序、传输后 offset fault、EOF/count
+上限、stream 短输出、datagram 边界和整包预算、pipe EINTR/EPIPE/SIGKILL，另有
+动态填满 pipe 后的来源组合回归。模块复用真实 FLUSH 错误，检查八种同步批次
+失败副作用；宿主、固定 RV64 Linux 与 BoarOS 证据见网络学习记录。输入特殊
+设备/proc 的 splice 能力、splice/copy_file_range 与 F_GETPIPE_SZ 尚未交付。
 
 ## 目录与文件系统操作
 

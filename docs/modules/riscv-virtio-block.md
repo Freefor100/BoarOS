@@ -28,12 +28,17 @@ flush 先阻止新逻辑调用并排空此前逻辑调用，再发送 FLUSH，�
 
 PLIC 路由由 `dtb_read_irq_info()` 根据 CPU interrupt-controller phandle、启动 hart 的 supervisor cause 9 和 VirtIO interrupt-parent 关联；不硬编码 IRQ/context 编号。外部中断执行 claim、设备分派/ack、complete；IRQ 不分配或做文件清理。块/VFS 同步接口不变，设备内部允许多个调用同时等待。实板、IOMMU、非一致 DMA 和 SMP 仍不在此边界内。
 
+完成队列的冷路径诊断在 reset 前输出 `block queue fault`：used 快照与消费差值超过槽容量为 `used-overflow`；完成项的描述符 head 未按三描述符槽对齐、超出槽范围或 length 为零为 `used-element`；指向非 submitted 槽为 `slot-state`；设备 status 超出 OK/IOERR/UNSUPP 为 `device-status`。输出包含 MMIO 地址/status、中断快照、transport、队列虚拟/物理地址及容量，used、consumed、avail、入口观察到的完成数，逻辑调用/在途数和 reserved/published/complete 槽数；每个固定槽记录 state、owner/completion 指针值、status、type、字节数、扇区与期限。只读取驱动持有的 MMIO、队列和最多八个固定槽，不追 owner/completion 或设备提供的描述符地址，不分配、不增加重试。used 是触发校验的快照，consumed 包含已经取出的非法项，avail/status 是打印期间的标量；它不是跨 DMA 的原子快照。正常完成和普通 IOERR/UNSUPP 不输出这段诊断，reset、返回状态和 owner 回收契约不变。重复完成若发生在本次合法完成已收割之后，设备仍失败，但不会覆写已完成请求的真实结果。
+
+旧对照中曾出现的 QEMU `Virtqueue size exceeded` 目前仍未定位。固定 QEMU v11.1.0 的 `references/qemu/hw/virtio/virtio.c`（commit `84f07211cc5b4fc6a371559bf8a5de4fb068e648`）在 `virtqueue_split_pop()` 的设备侧 `inuse >= vring.num` 时报告该错误，与本驱动检查的 used 消费差值不是同一计数；旧日志也不足以确认是哪种 VirtIO 设备。新增诊断与受控 host 反例不能关闭旧异常或证明其原因。
+
 ## 验证
 
 ```sh
 make test-dtb-riscv
 make test-block-riscv
 make test-block-host
+python3 -B tests/host/virtio_block_diagnostics.py
 make test-io-sleep-riscv
 # 聚焦一个代表配置；不替代默认四组合验收。
 BLOCK_TEST_TRANSPORT=modern BLOCK_TEST_CACHE=writeback make test-block-riscv
@@ -43,6 +48,8 @@ python3 -B tests/io-sleep-riscv.py --kernel build/riscv/tests/kernel-io-sleep-rv
 测试使用真实 QEMU raw disk，分别以默认 legacy 和显式 modern 配置覆盖 feature/status negotiation、批量 direct DMA、非对齐 bounce、容量边界、超时/错误统计和队列页回收。默认无块设备的生产内核仍可进入 timer idle；挂入两种 transport 的根盘时由根启动测试继续消费本模块。
 
 块测试将两个 transport 分别与 writeback/writethrough 组合，检查协商结果、flush 完成与独立统计，并覆盖单批八个 direct DMA、非对齐相邻字节/跨扇区的 RMW 回读及只读拒绝。host 测试检查未知能力拒绝和错误传播，以及 batch 的整批预检、零项、重叠、八项边界、顺序回退和可选回调；`tests/host/block_registry.c` 检查稳定设备号查找、重复登记拒绝、跨设备独立 claim、同设备重复 claim 拒绝及 claim 释放后注销；`tests/host/block_fault.c` 提供以文件为稳定镜像、以内存为易失缓存的 512 字节原子写模型，可选择持久化任意事件、丢弃未同步写、注入 write/flush 失败。模型自测不是文件系统恢复验收。
+
+`virtio_block_diagnostics.py` 仅在临时副本中将 RISC-V fence/time 指令替换为宿主 fence/受控时钟，编译实际驱动其余代码。legacy/modern 的 literal split-ring 反例检查上述四种错误分类、reset 前字段、非法指针值不被追踪、真实返回状态、一次发布及最终队列回收；正常完成与普通设备错误检查无诊断输出。它不验证真实 DMA 顺序、中断时序或 QEMU 完成行为。
 
 请求、扇区与 direct/bounce 计数提供当前结构成本基线；QEMU 功能测试不能证明 VisionFive 2 上的吞吐、延迟、cache coherency 或 CPU 忙等成本。开发板接入后需要用相同镜像分别记录冷启动读量、周期、吞吐和 CPU 占用，再决定请求合并深度、队列并行度及 IRQ 唤醒优先级。
 

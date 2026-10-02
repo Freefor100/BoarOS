@@ -18,7 +18,8 @@ def current_linux_keys():
     sys.path.insert(0, str(ROOT / 'tests/diff-abi'))
     import harness
     return {harness.identity(ROOT / config)[0] for config in
-            ('tests/diff-abi/linux.config', 'tests/program-inventory/linux.config')}
+            ('tests/diff-abi/linux.config', 'tests/program-inventory/linux.config',
+             'tests/network-linux.config')}
 
 
 def candidates():

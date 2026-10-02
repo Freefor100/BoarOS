@@ -393,6 +393,67 @@ static void fail_device(struct riscv_virtio_mmio_block *device, enum kernel_bloc
     }
     wake(&device->available);
 }
+
+static void queue_fault_scalar(const char *name, uint64_t value)
+{
+    virt_uart_puts(name);
+    virt_uart_put_hex((unsigned long)value);
+}
+
+static void diagnose_queue_fault(struct riscv_virtio_mmio_block *device,
+    const char *reason, uint16_t used_index, uint16_t observed_count,
+    uint32_t pending, const struct virtq_used_element *item)
+{
+    volatile struct virtq_available *available = (void *)((unsigned char *)device->queue_memory + queue_avail_offset(device));
+    unsigned reserved = 0, published = 0, complete = 0;
+    for (unsigned i = 0; i < slot_count(device); i++) {
+        unsigned state = request_at(device, i)->state;
+        reserved += state == 1;
+        published += state == 2;
+        complete += state == 3;
+    }
+    /* reset前记录driver拥有的标量；owner/completion只打印值，不追指针。 */
+    virt_uart_puts("BoarOS: block queue fault reason=");
+    virt_uart_puts(reason);
+    queue_fault_scalar(" mmio=", (uintptr_t)device->mmio);
+    queue_fault_scalar(" mmio_status=", mmio_read32(device, VIRTIO_MMIO_STATUS_OFFSET));
+    queue_fault_scalar(" interrupt=", pending);
+    queue_fault_scalar(" transport=", device->transport_version);
+    queue_fault_scalar(" queue=", (uintptr_t)device->queue_memory);
+    queue_fault_scalar(" physical=", device->queue_physical_address);
+    queue_fault_scalar(" size=", device->queue_size);
+    virt_uart_puts("\n");
+    queue_fault_scalar(" used=", used_index);
+    queue_fault_scalar(" consumed=", device->last_used_index);
+    queue_fault_scalar(" avail=", available->index);
+    queue_fault_scalar(" observed_count=", observed_count);
+    queue_fault_scalar(" inflight=", device->inflight);
+    queue_fault_scalar(" active=", device->active);
+    queue_fault_scalar(" reserved=", reserved);
+    queue_fault_scalar(" published=", published);
+    queue_fault_scalar(" complete=", complete);
+    virt_uart_puts("\n");
+    if (item != NULL) {
+        queue_fault_scalar(" item_index=", (uint16_t)(device->last_used_index - 1));
+        queue_fault_scalar(" id=", item->id);
+        queue_fault_scalar(" length=", item->length);
+        virt_uart_puts("\n");
+    }
+    for (unsigned i = 0; i < slot_count(device); i++) {
+        const struct block_request *r = request_at(device, i);
+        queue_fault_scalar(" slot=", i);
+        queue_fault_scalar(" state=", r->state);
+        queue_fault_scalar(" owner=", (uintptr_t)r->owner);
+        queue_fault_scalar(" completion=", (uintptr_t)r->completion);
+        queue_fault_scalar(" status=", r->status);
+        queue_fault_scalar(" type=", r->type);
+        queue_fault_scalar(" bytes=", r->data_length);
+        queue_fault_scalar(" sector=", r->header.sector);
+        queue_fault_scalar(" deadline=", r->deadline);
+        virt_uart_puts("\n");
+    }
+}
+
 static void collect_used(struct riscv_virtio_mmio_block *device)
 {
     uint32_t pending = mmio_read32(device, VIRTIO_MMIO_INTERRUPT_STATUS_OFFSET);
@@ -403,20 +464,32 @@ static void collect_used(struct riscv_virtio_mmio_block *device)
         __asm__ volatile("fence iorw, iorw" ::: "memory");
     }
     volatile struct virtq_used *used = (void *)((unsigned char *)device->queue_memory + queue_used_offset(device));
-    uint16_t count = (uint16_t)(used->index - device->last_used_index);
+    uint16_t used_index = used->index;
+    uint16_t count = (uint16_t)(used_index - device->last_used_index);
+    uint16_t observed_count = count;
     int completed = count != 0;
     memory_barrier();
-    if (count > slot_count(device)) { fail_device(device, KERNEL_BLOCK_STATUS_IO); return; }
+    if (count > slot_count(device)) {
+        diagnose_queue_fault(device, "used-overflow", used_index, observed_count, pending, NULL);
+        fail_device(device, KERNEL_BLOCK_STATUS_IO); return;
+    }
     while (count--) {
         struct virtq_used_element item = used->ring[device->last_used_index++ % device->queue_size];
         if (item.id % 3 || item.id / 3 >= slot_count(device) || !item.length) {
+            diagnose_queue_fault(device, "used-element", used_index, observed_count, pending, &item);
             fail_device(device, KERNEL_BLOCK_STATUS_IO); return;
         }
         struct block_request *r = request_at(device, item.id / 3);
-        if (r->state != 2) { fail_device(device, KERNEL_BLOCK_STATUS_IO); return; }
+        if (r->state != 2) {
+            diagnose_queue_fault(device, "slot-state", used_index, observed_count, pending, &item);
+            fail_device(device, KERNEL_BLOCK_STATUS_IO); return;
+        }
         r->result = r->status == VIRTIO_BLOCK_STATUS_OK ? KERNEL_BLOCK_STATUS_OK :
             r->status == VIRTIO_BLOCK_STATUS_UNSUPPORTED ? KERNEL_BLOCK_STATUS_UNSUPPORTED : KERNEL_BLOCK_STATUS_IO;
-        if (r->status > VIRTIO_BLOCK_STATUS_UNSUPPORTED) { fail_device(device, KERNEL_BLOCK_STATUS_IO); return; }
+        if (r->status > VIRTIO_BLOCK_STATUS_UNSUPPORTED) {
+            diagnose_queue_fault(device, "device-status", used_index, observed_count, pending, &item);
+            fail_device(device, KERNEL_BLOCK_STATUS_IO); return;
+        }
         r->state = 3;
 #if BOAROS_COST_DIAGNOSTICS
         r->cost_completed = kernel_cost_clock();
