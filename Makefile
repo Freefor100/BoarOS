@@ -1636,7 +1636,7 @@ test-rtc-host:
 test-network-riscv: kernel-rv
 	python3 -B tests/network-riscv.py
 
-.PHONY: test-virtio-net-host test-lwip-reassembly-host force-net-config
+.PHONY: test-virtio-net-host test-lwip-reassembly-host test-ethernet-worker-host test-network-external-riscv force-net-config
 NET_IPV4 ?= 0x0a4d0002
 NET_NETMASK ?= 0xffffff00
 force-net-config:
@@ -1650,3 +1650,8 @@ test-virtio-net-host:
 	python3 -B tests/host/virtio_net.py
 test-lwip-reassembly-host:
 	sh tests/host/lwip_reassembly.sh
+
+test-ethernet-worker-host:
+	python3 -B tests/host/ethernet_worker.py
+test-network-external-riscv: $(KERNEL_RV)
+	python3 -B tests/network-external.py --kernel $(KERNEL_RV) --transport both

@@ -5,6 +5,7 @@
 #include <arch/riscv/memory_layout.h>
 #include <arch/riscv/mm.h>
 #include <arch/riscv/root_boot.h>
+#include <arch/riscv/virt_uart.h>
 #include <kernel/elf64_source.h>
 #include <kernel/exec_image.h>
 #include <kernel/files.h>
@@ -529,6 +530,7 @@ enum riscv_root_boot_status riscv_root_boot_finish(
     }
     root->finish_failure = RISCV_ROOT_FINISH_NONE;
     root->finish_error = 0;
+    int had_network = root->network != 0;
     error = kernel_network_stop(&root->network);
     if (error) {
         root->finish_failure = RISCV_ROOT_FINISH_NETWORK;
@@ -540,6 +542,15 @@ enum riscv_root_boot_status riscv_root_boot_finish(
         root->finish_failure = RISCV_ROOT_FINISH_RNG;
         root->finish_error = error;
         return RISCV_ROOT_BOOT_STATUS_CLEANUP;
+    }
+    if (had_network) {
+        uint64_t block_irqs = 0;
+        for (uint32_t i = 0; i < root->device_count; i++)
+            block_irqs += riscv_root_boot_device(root, i)->statistics.interrupts;
+        virt_uart_puts("BoarOS: mixed IRQ rng-bytes="); virt_uart_put_hex(root->rng.bytes);
+        virt_uart_puts(" rng-errors="); virt_uart_put_hex(root->rng.errors);
+        virt_uart_puts(" rng-timeouts="); virt_uart_put_hex(root->rng.timeouts);
+        virt_uart_puts(" block-irqs="); virt_uart_put_hex(block_irqs); virt_uart_puts("\n");
     }
     if (root->cleanup_interpreter_source != 0) {
         error = (int)kernel_elf64_source_release(
