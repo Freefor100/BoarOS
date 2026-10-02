@@ -1703,7 +1703,13 @@ void kernel_socket_network_failed(uint32_t address)
     socket_device_failed = 1;
     for (struct kernel_socket *s = inet_sockets; s; s = s->inet_next) {
         const ip_addr_t *local = local_ip(s);
-        if (!local || !IP_IS_V4(local) || ip4_addr_get_u32(ip_2_ip4(local)) != address) continue;
+        int affected = local && IP_IS_V4(local) && ip4_addr_get_u32(ip_2_ip4(local)) == address;
+        if (!affected && s->udp && s->connected && IP_IS_V4(&s->udp->remote_ip)) {
+            /* connected UDP可仍绑定ANY；在撤下carrier前按实际路由归因。 */
+            struct netif *route = ip4_route_src(ip_2_ip4(&s->udp->local_ip), ip_2_ip4(&s->udp->remote_ip));
+            affected = route && ip4_addr_get_u32(netif_ip4_addr(route)) == address;
+        }
+        if (!affected) continue;
         /* endpoint仍归OFD；设备故障与协议超时分开，排队数据先按原规则交付。 */
         s->error = s->pending_error = -KERNEL_EIO;
         if (s->tcp && !s->listening) tcp_abort(s->tcp);
@@ -1722,7 +1728,7 @@ static void interface_snapshot(struct netif *n, struct kernel_socket_interface *
     s->netmask = netif_ip4_netmask(n)->addr; s->mtu = loop ? 65536U : n->mtu;
     s->hardware_type = loop ? 772 : 1;
     if (netif_is_up(n)) s->flags |= 1;
-    if (netif_is_link_up(n)) s->flags |= 0x40;
+    if (netif_is_up(n) && netif_is_link_up(n)) s->flags |= 0x40;
     s->flags |= loop ? 8 : 0x1002;
     if (!loop) __builtin_memcpy(s->mac, n->hwaddr, 6);
 }

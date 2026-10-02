@@ -25,7 +25,7 @@ enum {
     MMIO_QUEUE_USED_HIGH = 0xa4, MMIO_CONFIG = 0x100,
 };
 enum { FEATURE_MAC = 1U << 5, FEATURE_STATUS = 1U << 16 };
-enum { STATUS_FEATURES_OK = 8, STATUS_DRIVER_OK = 4 };
+enum { STATUS_FEATURES_OK = 8, STATUS_DRIVER_OK = 4, STATUS_DEVICE_NEEDS_RESET = 64 };
 
 struct allocation { uint64_t phys; void *data; unsigned order; };
 struct model_queue {
@@ -296,7 +296,7 @@ static void failed_owner(struct riscv_virtio_mmio_net *d)
     unsigned notifications = queues[0].notifications + queues[1].notifications;
     assert(riscv_virtio_mmio_net_service(d) == -KERNEL_EIO && live == 3);
     assert(d->statistics.errors == 1);
-    assert(riscv_virtio_mmio_net_send(d, "x", 1) == -KERNEL_ENETDOWN);
+    assert(riscv_virtio_mmio_net_send(d, "x", 1) == -KERNEL_EIO);
     assert(queues[0].notifications + queues[1].notifications == notifications);
 }
 static void test_loan_budget(unsigned version)
@@ -494,6 +494,77 @@ static void test_reset_owner(unsigned version)
     assert(!memcmp(frame.data, "borrow", 6)); riscv_virtio_mmio_net_release(&d, frame.buffer); stop(&d);
     printf("PASS: VirtIO-net v%u repeated reset refusal and borrowed frame retain the same DMA owner\n", version);
 }
+
+static unsigned test_device_needs_reset(unsigned entry)
+{
+    static const char *const names[] = {"config-IRQ", "service-without-IRQ", "send-without-IRQ"};
+    struct riscv_virtio_mmio_net d; start(2, &d);
+    uint16_t advertised[2] = {available_index(0), available_index(1)};
+    unsigned notifications = queues[0].notifications + queues[1].notifications;
+    /* QEMU virtio_error publishes this modern status bit, then config IRQ. */
+    regs[MMIO_STATUS / 4] |= STATUS_DEVICE_NEEDS_RESET;
+    if (entry == 0) trigger_interrupt(2);
+    int irq_reported = entry != 0 || (d.failed == 1 && d.statistics.errors == 1);
+    int result = entry == 2 ? riscv_virtio_mmio_net_send(&d, "x", 1) :
+                              riscv_virtio_mmio_net_service(&d);
+    int correct = result == -KERNEL_EIO && irq_reported &&
+                  d.failed == 1 && d.statistics.errors == 1 && live == 3 &&
+                  d.statistics.tx_packets == 0 &&
+                  available_index(0) == advertised[0] && available_index(1) == advertised[1] &&
+                  queues[0].notifications + queues[1].notifications == notifications;
+    if (!correct) {
+        fprintf(stderr, "FAIL: VirtIO-net v2 DEVICE_NEEDS_RESET entry=%s result=%d IRQ_reported=%d failed=%u errors=%llu tx_packets=%llu notifications_before=%u notifications_after=%u\n",
+                names[entry], result, irq_reported, d.failed, (unsigned long long)d.statistics.errors,
+                (unsigned long long)d.statistics.tx_packets, notifications,
+                queues[0].notifications + queues[1].notifications);
+    } else {
+        failed_owner(&d);
+        printf("PASS: VirtIO-net v2 DEVICE_NEEDS_RESET via %s fails once and publishes no descriptors\n", names[entry]);
+    }
+    stop(&d); return !correct;
+}
+
+static unsigned test_device_needs_reset_loan(void)
+{
+    struct riscv_virtio_mmio_net d; start(2, &d); receive("status-loan", 11);
+    struct riscv_net_frame frame;
+    assert(riscv_virtio_mmio_net_receive(&d, &frame) == 1 && !riscv_virtio_mmio_net_lend(&d, frame.buffer));
+    assert(!riscv_virtio_mmio_net_service(&d));
+    uint64_t physical[3] = {d.queue_phys, d.rx_phys, d.tx_phys};
+    void *data[3] = {d.queues, d.rx_memory, d.tx_memory};
+    unsigned notifications = queues[0].notifications + queues[1].notifications;
+    regs[MMIO_STATUS / 4] |= STATUS_DEVICE_NEEDS_RESET; trigger_interrupt(2);
+    int result = riscv_virtio_mmio_net_service(&d);
+    int correct = result == -KERNEL_EIO && d.failed == 1 && d.statistics.errors == 1 &&
+                  queues[0].notifications + queues[1].notifications == notifications;
+    if (!correct)
+        fprintf(stderr, "FAIL: VirtIO-net v2 DEVICE_NEEDS_RESET with loan result=%d failed=%u errors=%llu\n",
+                result, d.failed, (unsigned long long)d.statistics.errors);
+    reject_reset_from = reset_calls + 1;
+    for (unsigned i = 0; i < 2; i++) {
+        assert(riscv_virtio_mmio_net_stop(&d) == -KERNEL_EIO && live == 3 && d.mmio);
+        assert(d.queue_phys == physical[0] && d.rx_phys == physical[1] && d.tx_phys == physical[2]);
+        assert(d.queues == data[0] && d.rx_memory == data[1] && d.tx_memory == data[2]);
+        assert(d.loaned == 1 && !memcmp(frame.data, "status-loan", 11));
+    }
+    reject_reset_from = 0;
+    assert(riscv_virtio_mmio_net_stop(&d) == -KERNEL_EBUSY && live == 3 && d.mmio);
+    assert(d.loaned == 1 && !memcmp(frame.data, "status-loan", 11));
+    riscv_virtio_mmio_net_release(&d, frame.buffer); assert(!d.loaned); stop(&d);
+    if (correct)
+        puts("PASS: VirtIO-net v2 DEVICE_NEEDS_RESET and refused resets retain DMA owner until final loan return");
+    return !correct;
+}
+
+static void test_legacy_reserved_status(void)
+{
+    struct riscv_virtio_mmio_net d; start(1, &d);
+    regs[MMIO_STATUS / 4] |= STATUS_DEVICE_NEEDS_RESET; trigger_interrupt(2);
+    assert(!riscv_virtio_mmio_net_service(&d) && !d.failed && !d.statistics.errors);
+    assert(riscv_virtio_mmio_net_send(&d, "x", 1) == 1);
+    complete(1, next_head(1), 0, 1); stop(&d);
+    puts("PASS: VirtIO-net v1 reserved status bit does not imply unnegotiated modern reset semantics");
+}
 int main(void)
 {
     setvbuf(stdout, 0, _IONBF, 0); unsigned errors = 0;
@@ -507,5 +578,8 @@ int main(void)
         for (unsigned nth = 1; nth <= 3; nth++) { test_allocation_failure(version, nth, 0); test_allocation_failure(version, nth, 1); }
         test_plic_failure(version, 0); test_plic_failure(version, 1); test_reset_owner(version);
     }
+    test_legacy_reserved_status();
+    for (unsigned entry = 0; entry < 3; entry++) errors += test_device_needs_reset(entry);
+    errors += test_device_needs_reset_loan();
     return errors ? 1 : 0;
 }

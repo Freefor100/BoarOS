@@ -193,7 +193,7 @@ static void flags(int fd)
     CHECK(ioctl(fd, SIOCGIFFLAGS, &result) == 0);
     result.ifr_flags &= ~IFF_UP;
     CHECK(ioctl(fd, SIOCSIFFLAGS, &result) == 0);
-    CHECK(ioctl(fd, SIOCGIFFLAGS, &result) == 0 && !(result.ifr_flags & IFF_UP));
+    CHECK(ioctl(fd, SIOCGIFFLAGS, &result) == 0 && !(result.ifr_flags & (IFF_UP | IFF_RUNNING)));
     result.ifr_flags |= IFF_UP;
     CHECK(ioctl(fd, SIOCSIFFLAGS, &result) == 0);
     CHECK(ioctl(fd, SIOCGIFFLAGS, &result) == 0 && (result.ifr_flags & IFF_UP));

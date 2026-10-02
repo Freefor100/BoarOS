@@ -100,6 +100,14 @@ static void fail(struct riscv_virtio_mmio_net *d, const char *reason, unsigned q
     d->failed = 1;
     wake(d);
 }
+static void check_status(struct riscv_virtio_mmio_net *d)
+{
+    if (d->configured && !d->failed && d->version == 2) {
+        uint32_t status = rd(d, 0x70);
+        /* 即使没有TX或配置IRQ丢失，NEEDS_RESET也不能继续发布DMA。 */
+        if (status & 64U) fail(d, "needs-reset", 0, status, 0);
+    }
+}
 static void harvest(struct riscv_virtio_mmio_net *d)
 {
     if (!d->configured || d->failed) return;
@@ -142,6 +150,7 @@ static void interrupt(void *owner)
     uint32_t status = rd(d, 0x60);
     /* 先ack再收割；新的完成必须仍能留下通知。IRQ不发布新RX/TX。 */
     if (status) wr(d, 0x64, status);
+    check_status(d);
     if (d->feature_low & (1U << 16)) d->link_up = (d->mmio[0x106] & 1) != 0;
     d->statistics.interrupts++; harvest(d); wake(d);
 }
@@ -227,6 +236,7 @@ failed:
 int riscv_virtio_mmio_net_service(struct riscv_virtio_mmio_net *d)
 {
     uintptr_t saved = riscv_interrupt_save();
+    check_status(d);
     harvest(d);
     if (!d->failed) {
         uint64_t now = riscv_time_read();
@@ -274,7 +284,9 @@ int riscv_virtio_mmio_net_send_copy(struct riscv_virtio_mmio_net *d, uint32_t si
 {
     if (!copy || size > 1514) return -KERNEL_EMSGSIZE;
     uintptr_t saved = riscv_interrupt_save();
-    if (d->failed || d->stopping || !d->configured || !d->link_up) { riscv_interrupt_restore(saved); return -KERNEL_ENETDOWN; }
+    check_status(d);
+    if (d->failed) { riscv_interrupt_restore(saved); return -KERNEL_EIO; }
+    if (d->stopping || !d->configured || !d->link_up) { riscv_interrupt_restore(saved); return -KERNEL_ENETDOWN; }
     harvest(d);
     unsigned b; for (b = 0; b < 64; b++) if (d->tx_state[b] == TX_FREE) break;
     if (b == 64 || d->failed) { riscv_interrupt_restore(saved); return d->failed ? -KERNEL_EIO : -KERNEL_EAGAIN; }

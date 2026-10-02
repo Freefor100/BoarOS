@@ -62,13 +62,14 @@ static err_t interface_init(struct netif *interface)
 }
 static unsigned pool_used(void)
 { return lwip_stats.memp[MEMP_PBUF_POOL] ? lwip_stats.memp[MEMP_PBUF_POOL]->used : 0; }
-static int udp_capacity(void *context)
+static int udp_capacity_after(struct kernel_network *n, unsigned loans, unsigned pbufs)
 {
-    struct kernel_network *n = context;
-    uint64_t owned = lwip_stats.mem.used + (uint64_t)n->device.loaned * 2048 +
-        (uint64_t)pool_used() * PBUF_POOL_BUFSIZE;
-    return pool_used() <= PBUF_POOL_SIZE - 16 && owned <= MEM_SIZE - (65536U + 4096U);
+    unsigned used = pool_used() + pbufs;
+    uint64_t owned = lwip_stats.mem.used + ((uint64_t)n->device.loaned + loans) * 2048 +
+        (uint64_t)used * PBUF_POOL_BUFSIZE;
+    return used <= PBUF_POOL_SIZE - 16 && owned <= MEM_SIZE - (65536U + 4096U);
 }
+static int udp_capacity(void *context) { return udp_capacity_after(context, 0, 0); }
 static void timer_wake(void *context)
 {
     struct kernel_network *n = context;
@@ -81,7 +82,10 @@ static void input_frame(struct kernel_network *n, struct riscv_net_frame *frame)
     int udp = frame->size >= 34 && data[12] == 8 && data[13] == 0 && data[23] == 17;
     int address_ok = frame->size >= 14 &&
         ((!memcmp(data, n->device.mac, 6)) || (data[0] & 1));
-    if (!address_ok || (udp && !udp_capacity(n))) goto dropped;
+    /* 预算检查包含即将持有的版本，不能先吃掉控制余量再等待完整重组。 */
+    unsigned loans = n->device.loaned < 32 ? 1 : 0;
+    unsigned pool = loans ? 0 : (frame->size + PBUF_POOL_BUFSIZE - 1) / PBUF_POOL_BUFSIZE;
+    if (!address_ok || (udp && !udp_capacity_after(n, loans, pool))) goto dropped;
     struct pbuf *p;
     if (!riscv_virtio_mmio_net_lend(&n->device, frame->buffer)) {
         struct network_rx *rx = &n->rx[frame->buffer];
@@ -103,6 +107,14 @@ dropped:
     n->device.statistics.drops++;
     riscv_virtio_mmio_net_release(&n->device, frame->buffer);
 }
+static void device_failed(struct kernel_network *n)
+{
+    if (!n->failure_delivered) {
+        n->failure_delivered = 1;
+        kernel_socket_network_failed(ip4_addr_get_u32(netif_ip4_addr(&n->interface)));
+    }
+    netif_set_link_down(&n->interface);
+}
 static void worker(void *context)
 {
     struct kernel_network *n = context;
@@ -110,24 +122,19 @@ static void worker(void *context)
     for (;;) {
         uintptr_t irq = riscv_interrupt_save();
         if (d->stopping) { riscv_interrupt_restore(irq); return; }
-        if (riscv_virtio_mmio_net_service(d)) {
-            netif_set_link_down(&n->interface);
-            if (!n->failure_delivered) {
-                n->failure_delivered = 1;
-                kernel_socket_network_failed(ip4_addr_get_u32(netif_ip4_addr(&n->interface)));
-            }
-            enum kernel_wait_wake_reason reason;
-            if (kernel_scheduler_block_current(&d->progress, 0, 0, &reason) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
-            riscv_interrupt_restore(irq); continue;
-        }
-        if (d->link_up) netif_set_link_up(&n->interface); else netif_set_link_down(&n->interface);
-        struct riscv_net_frame frame;
         unsigned handled = 0;
-        while (handled < 8 && riscv_virtio_mmio_net_receive(d, &frame)) {
-            input_frame(n, &frame); handled++;
+        if (riscv_virtio_mmio_net_service(d)) {
+            device_failed(n);
+        } else {
+            if (d->link_up) netif_set_link_up(&n->interface); else netif_set_link_down(&n->interface);
+            struct riscv_net_frame frame;
+            while (!d->failed && handled < 8 && riscv_virtio_mmio_net_receive(d, &frame)) {
+                input_frame(n, &frame); handled++;
+            }
         }
+        /* 失败NIC不再收发，但共享的loopback与协议期限仍须独立进展。 */
         kernel_socket_network_process();
-        (void)riscv_virtio_mmio_net_service(d);
+        if (riscv_virtio_mmio_net_service(d)) device_failed(n);
         if (handled == 8) {
             /* 批次间给中断和其他任务机会，不持raw调用栈睡在设备credit上。 */
             riscv_interrupt_restore(irq);
