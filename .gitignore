@@ -21,6 +21,8 @@
 *.d
 
 # Emulator, debugger, coverage, and benchmark artifacts.
+# Machine measurement records belong in run outputs, not reader-facing docs.
+/docs/**/*.json
 *.log
 *.trace
 *.profraw

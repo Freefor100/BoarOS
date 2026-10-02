@@ -91,4 +91,4 @@ PR CI 增加可睡眠存储并发门槛，失败保存 guest/server 日志和磁
 `make test-io-sleep-riscv` 使用实际调度器和 VFS/MM/uaccess，在第一块接受、第二块复制前暂停写者，再运行独立 OFD 的追加/定位写/截断；旧实现得到交错内容，门闩版本完整通过 legacy/modern × writeback/writethrough。追加的第二向量使用同 inode 尚未驻留的文件映射，并走真实冷页装载；fixture 仅模型化未激活测试 MM 的 satp，VFS/调度等待在真实 hart 上执行。另检查 O_SYNC 和等待期间的终止请求。实际 U-mode 的 `tests/userland/write_operations.h` 验证不同 OFD 的 8 KiB 向量记录和同 inode 映射输入；原 partial-write 用例继续保护短写、EFAULT/EIO 与资源基线。SQLite WAL 和重启已双侧通过，当前内核的完整恢复矩阵亦通过，固定输入和事件覆盖见[恢复记录](record-lock-sqlite-recovery.md)。操作锁包含用户复制等待，成本/公平性仍需实测。
 
 2026-09-30 的最终 C0–C6 测量、观测扰动、消费者阻塞及优化候选见[成本基线](cost-baseline.md)，
-完整可验证计数和原消费者输出见[测量归档](cost-measurements.json)。这是主线成本诊断，未重跑评测分支原judge。
+该页保留结果与重建命令，原消费者输出由执行器生成。这是主线成本诊断，未重跑评测分支原judge。

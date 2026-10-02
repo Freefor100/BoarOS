@@ -39,8 +39,8 @@ UART半行插在SUITE/ABI标记之前，重新核对同一原日志完整记录�
 重建：`make test-environment-riscv test-log-host test-rtc-host`；
 `python3 -B tests/program-inventory/run.py --suite busybox --case busybox.official --case busybox.environment --reuse-builds --require-pass --output build/environment-check`。
 输入依旧为本页固定BusyBox源码/原包装器和Linux commit；实际QEMU11.1.1、512MiB、
-单hart。逐条原结果、原输出、fixture/ELF/内核身份及ABI重核依据归档在既有
-[消费者证据](cost-consumer-followup.json)的environment_completion，不依赖被清理的build日志。
+单hart。环境补全的结果与分类记录在本页；逐条输出、输入身份及ABI重核记录
+由上述执行器在运行目录生成，大型运行记录不纳入Git。
 
 | 分类 | 证据与判断边界 |
 |---|---|
