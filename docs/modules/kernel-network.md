@@ -119,8 +119,8 @@ python3 -B tests/network-consumers.py --only boaros --libc both --suite both --c
 只有 COST 构建提供只读 `/proc/boaros_net_stats`，复用现有协议统计，不保存对象
 引用。TCP写入调用/字节为64位，lwIP包/错误计数为16位，会环绕，不能当作大流量
 窗口的完整总包数；pool用量和高水位是即时值。窗口仍使用已有 cost v1 schema，
-聚合63938字节、每任务64字节，默认构建没有新增诊断节点。观测影响吞吐，关闭
-观测的三次分布才是性能结果。当前1166条ABI、完整RV64、真实musl/glibc 2.44、
+聚合64794字节、每任务64字节，默认构建没有新增诊断节点。观测影响吞吐，关闭
+观测的三次分布才是性能结果。当前1179条ABI、完整RV64、真实musl/glibc 2.44、
 socket scale和栈检查通过；修复后的用户态契约覆盖reset、accept输出fault、
 TCP MSG_TRUNC、UDP自动端口释放，IRQ重试由独立heap包装器保护。
 
@@ -154,6 +154,9 @@ UNIX DGRAM自身SHUT_RD后，即使空队列也有IN/RDNORM和RDHUP；双向关�
 不再次读取同一段用户数据。非阻塞/fault/信号/期限仍返回已接受前缀；不借用用户页到ACK。
 预算fixture的COST窗口独立核对全阻塞和部分发送各1000字节只有1000字节stream usercopy，
 旧全阻塞实现为2000字节。`--workload content`校验单TCP16MiB、五TCP各8MiB及UDP内容。
+游标不跨系统调用保留内容。原iperf使用非阻塞socket，短写/EAGAIN后再次write仍可能
+重复暂存未接受字节；三次关闭观测的单TCP仅改善0.4%/2.2%，不宣称解决主要吞吐差距。
+结果、前台复制放大与代价见[本轮网络结果](../learning/network-ownership.md#本轮应用结果与剩余复制2026-10-02)。
 
 实际阻塞接收等待使用`kernel_socket_receive_ready`，活动reservation始终未就绪；
 对外poll仍保留终止事件。HUP/ERR不能让第二读者绕过owner并空转。io-sleep fixture
