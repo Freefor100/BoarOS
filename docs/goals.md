@@ -10,7 +10,7 @@ N3已经交付：legacy/modern VirtIO-net、受限DMA借用与复制回退、静
 有界分片重组，以及隔离宿主双向TCP/HTTP。1196条ABI、原22项网络客户端和相关系统
 回归属于该轮已完成证据，见[网卡记录](learning/network-ownership.md#真实-virtio-net-与宿主应用交付2026-10-02)。
 随后buddy/slab的timer抢占竞态已确定性复现、修复并验收；纯块超时也已补reset前快照。
-最新内存/诊断修复已合入兼容分支并通过原旧glibc单TCP入口；本轮后续改动仍需最终交接。
+最新内存/诊断修复已合入兼容分支并通过原旧glibc单TCP入口；本轮最终候选也已单向合入；旧glibc BASIC_TCP和兼容FIFO/重启通过。
 
 | 未关闭项 | 当前证据与下一步 |
 |---|---|
@@ -23,7 +23,7 @@ N3已经交付：legacy/modern VirtIO-net、受限DMA借用与复制回退、静
 区分已经修复的机制与缺少历史现场的归因。固定root、单hart、QEMU和选定应用验收
 均不代表多用户隔离、SMP、实板或完整Linux兼容。完整比赛Harness仍缺kernel-la。
 
-## 本轮：命名FIFO、管道元数据与离线C工程（实施中）
+## 本轮交付：命名FIFO、管道元数据与离线C工程
 
 已确认完整命名FIFO与默认make -j2；匿名管道元数据归共享pipe，不建立通用匿名inode。
 固定Lua 5.4.3、Alpine GCC 14.2.0-r6与GNU make 4.4.1-r3，使用原源码和构建规则。
@@ -35,11 +35,11 @@ N3已经交付：legacy/modern VirtIO-net、受限DMA借用与复制回退、静
 | B 匿名管道元数据 | [x] mode、身份与时间归共享pipe，fchmod/fstat及两端、dup/fork/proc重开一致；先同ELF证伪旧行为。 |
 | C 命名FIFO | [x] ext4/tmpfs节点、按inode关联的活动pipe、打开会合/代次、非阻塞、信号、就绪、双owner与最后回收；节点可持久化，传输内容不持久化。 |
 | D 原版工程 | [x] make默认FIFO jobserver，Lua/luac/liblua.a及嵌入/动态模块；干净、无变化、增量、clean、语法错误、恢复、-j2与中断清理。 |
-| E 成本与收口 | [ ] 正式ext4三副本、tmpfs和单-j1 COST已完成；1207 ABI及集中系统验收通过。构建与清理的成本边界见工具链记录；最后兼容交接与清理待完成。 |
+| E 成本与收口 | [x] 正式ext4三副本、tmpfs和单-j1 COST、1207 ABI及集中系统验收；兼容旧glibc入口与FIFO/重启通过。结论和重建命令已归工具链记录，运行产物按既有prune规则清理。 |
 
 原工程在固定Linux先建立有效参考；原始输出和机器清单只留忽略的build，Git保存机制、
 结论与重建入口。不重跑iozone/C0–C6；仅在实际改事务/写回/队列顺序时扩大恢复矩阵。
-最终单向合入兼容分支，完成受影响验收；不push、发布或转换阶段。
+已单向合入兼容分支并完成受影响验收；不push、发布或转换阶段。
 
 下一应用候选为交互式shell/TTY，需另行调查并确认范围；路由/DNS/HTTPS不作为本轮追加任务。LoongArch是双架构独立依赖，
 SMP另行设计；历史异常风险继续按上表保留，不因本轮通过关闭。
@@ -352,7 +352,7 @@ glibc四进程整命令仍增加0.73%。该轮的prepare读取、1547次FLUSH和
 - [ ] 再固定 rustc/cargo、依赖锁定和离线最小项目，成功后扩大完整项目。先 `-j1` 建立正确性，不要求 SMP，也不把网络下载失败混入内核 ABI。
 - [ ] 每个新失败最小化、对照固定 Linux，再修通用机制；保留可恢复的成功输入和失败样本，不能为构建脚本改写预期输出。
 
-**验证与退出**：现有 `test-exec-riscv`、`test-elf-tail-riscv`、`test-userland-riscv`，新增 `test-glibc-riscv`、futex bitset 固定 Linux 差分和 `make test-offline-c-riscv` 的客体原生五阶段编译验收；`tests/userland/exec_scripts.c` 仍待后续能力建设。未特改动态 glibc 的基础矩阵和固定小型 C 程序的离线构建已有闭环；Rust 与更大项目尚未验收，不能把剩余运行失败合并成一个“动态链接未支持”。
+**验证与退出**：现有 `test-exec-riscv`、`test-elf-tail-riscv`、`test-userland-riscv`，新增 `test-glibc-riscv`、futex bitset 固定 Linux 差分和 `make test-offline-c-riscv` 的客体原生五阶段编译验收；`tests/userland/exec_scripts.c` 仍待后续能力建设。未特改动态 glibc 的基础矩阵和固定小型 C 程序的离线构建已有闭环；Lua5.4.3原工程、默认make jobserver及产物运行已验收；Lua之外的更大工程、C++与Rust仍未验收，不能把剩余运行失败合并成一个“动态链接未支持”。
 
 整合后 `make test-diff-abi-riscv test-files-riscv test-userland-riscv test-lwext4-metadata-host test-references test-offline-c-riscv test-glibc-riscv test-sqlite-wal-riscv test-sqlite-wal-recovery-riscv test-riscv test-offline-c-baseline-riscv test-stack-usage` 通过；固定 Linux 差分为 430 条。228 项清单通过 `python3 tests/program-inventory/run.py --reuse-builds --output build/offline-gcc-inventory` 全量重跑仍为 223/2/3，五个旧失败 ID 不变。精确输入与历史证据见[程序清单](learning/user-program-inventory.md)。
 

@@ -117,4 +117,4 @@ modern关闭观测三次启动，固定内容的单/五TCP双向总量效率中�
 接口与owner见[网卡模块](docs/modules/riscv-virtio-net.md)，内容、分布和剩余成本见[真实网卡记录](docs/learning/network-ownership.md#真实-virtio-net-与宿主应用交付2026-10-02)。下一应用由真实需求选择，现有路线只保留一项待选应用与证据触发的性能候选。
 
 2026-10-03本轮已先补匿名管道共享元数据：fchmod/fstat与两端、dup/fork/proc重开一致。
-命名FIFO与原GCC/make的Lua5.4.3工程已交付构建、增量、失败恢复、默认-j2和产物运行，成本测量正在收口，具体进度归[开发路线](docs/goals.md)。
+命名FIFO与原GCC/make的Lua5.4.3工程已交付构建、增量、失败恢复、默认-j2和产物运行，构建成本已收口，-j1/-j2中位135.542/133.225秒；tmpfs表明工作目录存储不足以解释整体差距，清理元数据与内存CPU候选见[工具链记录](docs/learning/offline-toolchain-probe.md)，具体进度归[开发路线](docs/goals.md)。
