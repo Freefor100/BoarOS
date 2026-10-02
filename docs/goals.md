@@ -4,31 +4,35 @@
 `[x]` 只表示具体交付已验收；历史测量、输入身份和可重建命令归现有 learning。
 固定 Linux 位于 `references/linux`，精确版本与其他资料由 `references/sources.tsv` 管理。评审是调查输入，不自动成为实现或验收证据。
 
-## 最近交付：socket纠错、发送暂存与日志批次（2026-10-02）
+## 当前轮：VirtIO-net、零拷贝接收与宿主双向应用（N3）
 
-D1/D2/D3已修复TCP接收状态、UNIX数据报半关闭及扩容遗漏通知；T1复用同次发送的
-暂存尾部，另修复活动reservation遇HUP后的接收空转。J1删除64操作软封口，保留
-版本量、首脏年龄、同步/强制、真实资源和恢复边界。V1完成限定消费者旧新对照、
-恢复与系统验收，1179条ABI一致；原网络22项完成。没有固定吞吐倍数或评分准入。
+已确认legacy/modern单对RX/TX split队列；RX为custom pbuf零拷贝，借用达到上限时
+有界复制回退。静态IPv4＋ARP、48 pbuf/8对象的IPv4分片重组、隔离TAP和真实TCP/HTTP
+同时交付。不设吞吐倍数门槛，不扩大TCP窗口或改调度器。当前均为执行任务，未标已验收。
 
-自动iozone程序加durable中位11.541→5.129秒（musl）、12.108→5.359秒（glibc）；
-提交组510→149、FLUSH1547→677。单TCP249→250、268→274Mbit/s，收益有限：
-原iperf非阻塞跨syscall重试仍重复暂存，不能把请求内复制纠错称为主要TCP瓶颈已消除。
-完整分布、同步/卸载余量、资源及观测扰动见[存储结果](learning/cost-baseline.md#版本量封口与socket纠错对照2026-10-02)
-和[网络结果](learning/network-ownership.md#本轮应用结果与剩余复制2026-10-02)。
-旧对照出现过未定位页释放fatal和VirtIO队列异常；随后同内核通过不等于问题已修复，
-复现时须保留owner/allocator现场及设备队列身份。该风险不以验收转绿关闭。
+| 阶段 | 状态与交付 |
+|---|---|
+| N3a 现场与驱动 | [ ] 页释放失败原因、队列/设备现场；32描述符、64×2KiB RX/TX、两种传输及真实DMA/reset owner |
+| N3b 零拷贝与worker | [ ] 最后pbuf引用前不复用DMA；最多32借用、压力回退、控制余量、IRQ不分配及8帧有界处理 |
+| N3c ARP与重组 | [ ] 实际eth0/地址/路由/ioctl；协议＋接口重组键、重叠和冲突整队丢弃、48片上限/超时/停止回收 |
+| N3d 原应用 | [ ] 两种传输的双向TCP/HTTP；原wget/httpd、CGI上传、逐任务内容/状态与服务清理 |
+| N3e 集中收口 | [ ] RV64/libc/1179＋新增ABI/scale/栈、原22项、块/RNG混合IRQ；关闭观测分布、资源与机制解释 |
 
-本轮沿main分问题提交并单向合入兼容分支；main不改uname。运行记录只在忽略build，
-Git保存结论和重建入口。未重跑C0–C6或八组评分，不push、发布或转换阶段。
+DMA预算不超过288KiB，metadata/worker栈另计；guest默认10.77.0.2/24、隔离宿主10.77.0.1，
+无默认网关。保留IPv6 loopback；外部IPv6、DHCP/DNS/TLS、公网、SMP及实板不并入本轮。
+旧页释放fatal和VirtIO队列超额未定位，先补现场，复现后修所属层；不以后续通过关闭风险。
+重组当前关闭，开启前先修已核实的协议号键遗漏与部分重叠处理差异。
 
-## 下一轮主线：真实网卡与宿主网络（N3）
+先做能证伪的窄回归，最终一次集中验收；已通过且无相关改动不重跑，不运行iozone/C0–C6
+或不相关存储恢复矩阵。主线分阶段提交，最终单向合入兼容分支；旧glibc使用兼容配置，
+main不改uname。一次汇总审查，不push/发布/转换阶段；完整Harness仍缺kernel-la。
+临时输出/抓包/快照只留build，Git保存人类结论与重建命令，不新增平行台账或大型JSON。
 
-以当前 socket 基线推进单队列 VirtIO-net、静态 IPv4＋ARP及实际收发/IRQ/DMA owner；
-在隔离宿主网络完成双向TCP/HTTP文件传输、内容与错误回收。DHCP/DNS、多队列和
-offload不并入首期。N3不等待I/O接近Linux。
-中等规模离线 C 工程与交互式 shell 是后续应用候选；LoongArch 为双架构交付
-的独立依赖，SMP 单独处理跨核锁、IPI/TLB 和回收。性能候选由实际应用证据触发。
+## 后续应用方向
+
+N3完成后由真实应用决定下一项网络、开发工具或交互式shell任务；DNS/TLS须独立核对
+用户态随机、时间和证书依赖，不把TCP连通写成HTTPS已支持。LoongArch是双架构交付
+的独立依赖，SMP单独处理跨核锁、IPI/TLB和回收，不以追平Linux为前置门槛。
 
 ## 按证据触发的性能候选
 
@@ -46,7 +50,7 @@ offload不并入首期。N3不等待I/O接近Linux。
 
 | 阶段/能力 | 事实与证据入口 |
 |---|---|
-| D1–D3/T1/J1/V1纠错 | socket状态/扩容/接收资格、请求内暂存、版本量封口与限定旧新对照已交付；完整恢复/双盘、1179 ABI及资源限制见上方结果，不宣称已解决TCP主要差距 |
+| D1–D3/T1/J1/V1纠错 | socket状态/扩容/接收资格、请求内暂存、版本量封口已交付；自动程序＋durable 11.541→5.129/12.108→5.359秒；完整恢复/双盘、1179 ABI及TCP复制限制见[存储](learning/cost-baseline.md#版本量封口与socket纠错对照2026-10-02)与[网络](learning/network-ownership.md#本轮应用结果与剩余复制2026-10-02) |
 | N2a–N2e网络应用 | IPv6双栈、选项、半关闭与生命周期、22项受控原ELF、内容负载和1166 ABI已交付；原iperf连续脚本参考竞态单列，见[网络记录](learning/network-ownership.md#原版网络应用交付2026-10-02) |
 | A＋B缓存与环境 | 已交付缓存命中先于回收、读来源和进展归因、真实日志/RTC/根盘；BusyBox55/55、1118 ABI及结果见[成本基线](learning/cost-baseline.md#缓存查询顺序纠错2026-10-01) |
 | R1–R8组合边界 | SHM owner/attachment/权限、msync pin、整包DGRAM、同步故障与整次写门闩已交付；1091 ABI及RV64/真实libc/恢复证据见[组合边界](learning/cost-baseline.md)、对应模块和Git提交 |
