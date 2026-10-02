@@ -234,6 +234,7 @@ try:
     success = (guest.returncode == 0 and server.returncode == 0 and released and queue_verified and reset_seen and
                batch_verified == {'batch', 'batch-partial', 'batch-error'} and
                b'BoarOS: I/O sleep tests passed' in logs['guest'] and
+               b'I/O socket reservation passed: owner, HUP, timeout, signal and fault' in logs['guest'] and
                b'I/O sleep failed:' not in logs['guest'])
     if success and args.cost_output:
         snapshots=[]; current=None; body=[]

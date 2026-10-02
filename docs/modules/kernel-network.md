@@ -129,7 +129,7 @@ TCP MSG_TRUNC、UDP自动端口释放，IRQ重试由独立heap包装器保护。
 
 ## 接收状态纠错（2026-10-02）
 
-新建未连接INET stream的read/recv立即返回ENOTCONN，poll报告HUP；连接中仍按
+新建未连接INET stream的read/recv立即返回ENOTCONN，poll报告OUT/HUP（完整请求另有WRNORM）；连接中仍按
 连接进展等待，已建立连接保留队首数据优先和错误/FIN/reset后的终止语义。
 read/readv零长度仍直接返回；recv/recvmsg零长度检查协议状态：空已连接socket
 非阻塞返回EAGAIN，有数据返回0且不消费，EOF返回0。零容量请求无需scratch页。
@@ -154,3 +154,8 @@ UNIX DGRAM自身SHUT_RD后，即使空队列也有IN/RDNORM和RDHUP；双向关�
 不再次读取同一段用户数据。非阻塞/fault/信号/期限仍返回已接受前缀；不借用用户页到ACK。
 预算fixture的COST窗口独立核对全阻塞和部分发送各1000字节只有1000字节stream usercopy，
 旧全阻塞实现为2000字节。`--workload content`校验单TCP16MiB、五TCP各8MiB及UDP内容。
+
+实际阻塞接收等待使用`kernel_socket_receive_ready`，活动reservation始终未就绪；
+对外poll仍保留终止事件。HUP/ERR不能让第二读者绕过owner并空转。io-sleep fixture
+暂扣真实usercopy调用，确认第二读者阻塞；finish/fault后唤醒，期限和信号可打断等待，
+最后页数回到基线。四种transport/cache均保护这一交错，不新增用户ABI或长寿命引用。

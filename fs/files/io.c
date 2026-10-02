@@ -52,6 +52,14 @@ static enum kernel_files_status release_io_description(
     return KERNEL_FILES_STATUS_STATE;
 }
 
+static int socket_operation_ready(struct kernel_socket *socket, uint32_t events)
+{
+    uint32_t polled = kernel_socket_poll(socket, 0);
+    /* 终止事件可对外发布，实际接收仍须等待独占reservation的owner交还。 */
+    return events == KERNEL_POLLIN ? kernel_socket_receive_ready(socket) :
+        (polled & (events | KERNEL_POLLERR | KERNEL_POLLHUP)) != 0U;
+}
+
 static int socket_wait_ready(struct kernel_open_file_description *description,
                              uint32_t events, uint64_t timeout_ns, uint32_t socket_flags)
 {
@@ -62,7 +70,7 @@ static int socket_wait_ready(struct kernel_open_file_description *description,
     if ((description->open_flags & KERNEL_FILES_O_NONBLOCK) != 0U ||
         (socket_flags & KERNEL_SOCKET_MSG_DONTWAIT) != 0U)
         return -KERNEL_EAGAIN;
-    if ((kernel_socket_poll(socket, 0) & events) != 0U) return 0;
+    if (socket_operation_ready(socket, events)) return 0;
     if (timeout_ns != 0U) {
         uint64_t now = kernel_time_monotonic_ns();
         uint64_t target = UINT64_MAX - now < timeout_ns
@@ -75,8 +83,7 @@ static int socket_wait_ready(struct kernel_open_file_description *description,
         if (status != KERNEL_TIME_STATUS_OK) return -KERNEL_EIO;
     }
     saved = riscv_interrupt_save();
-    while ((kernel_socket_poll(socket, 0) &
-            (events | KERNEL_POLLERR | KERNEL_POLLHUP)) == 0U) {
+    while (!socket_operation_ready(socket, events)) {
         enum kernel_wait_wake_reason reason;
         uint64_t sleep_deadline = deadline;
         uint64_t protocol_deadline = kernel_socket_next_timer_deadline();

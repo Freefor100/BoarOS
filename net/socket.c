@@ -929,6 +929,15 @@ static int socket_receive_empty(const struct kernel_socket *socket, int nonblock
     return -KERNEL_EAGAIN;
 }
 
+int kernel_socket_receive_ready(struct kernel_socket *socket)
+{
+    uintptr_t saved = riscv_interrupt_save();
+    int ready = socket->read_request == 0 &&
+        (socket->listening || socket->packets_head != 0 || socket_receive_empty(socket, 0) != -KERNEL_EAGAIN);
+    riscv_interrupt_restore(saved);
+    return ready;
+}
+
 int kernel_socket_reserve_read(struct kernel_socket *socket,
                               struct kernel_task *task,
                               struct kernel_socket_read_request *request,
@@ -1584,7 +1593,7 @@ uint32_t kernel_socket_poll(struct kernel_socket *socket,
     } else if (socket->peer_closed) {
         events |= KERNEL_POLLHUP | KERNEL_POLLOUT | KERNEL_POLLRDHUP | KERNEL_POLLIN;
     } else if (socket_receive_empty(socket, 0) == -KERNEL_ENOTCONN) {
-        events |= KERNEL_POLLHUP;
+        events |= KERNEL_POLLHUP | KERNEL_POLLOUT | KERNEL_POLLWRNORM;
     }
     if (socket->pending_error) events |= KERNEL_POLLERR;
     return events;
