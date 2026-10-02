@@ -126,3 +126,36 @@ TCP MSG_TRUNC、UDP自动端口释放，IRQ重试由独立heap包装器保护。
 
 结果与限制见[网络记录](../learning/network-ownership.md#原版网络应用交付2026-10-02)。
 没有真实网卡、命名AF_UNIX、SCM_RIGHTS或TCP_INFO；相关应用字段不作为已验证统计。
+
+## 接收状态纠错（2026-10-02）
+
+新建未连接INET stream的read/recv立即返回ENOTCONN，poll报告OUT/HUP（完整请求另有WRNORM）；连接中仍按
+连接进展等待，已建立连接保留队首数据优先和错误/FIN/reset后的终止语义。
+read/readv零长度仍直接返回；recv/recvmsg零长度检查协议状态：空已连接socket
+非阻塞返回EAGAIN，有数据返回0且不消费，EOF返回0。零容量请求无需scratch页。
+内部空队列状态查询不消费错误，接收入口才交付pending_error。
+同ELF反例由`tests/workloads/network/contract.c`保护，差分新增fresh IPv4/IPv6记录；
+固定依据为`references/linux/net/ipv4/tcp.c`和`include/net/sock.h`（Linux v7.2）。
+
+UNIX DGRAM自身SHUT_RD后，即使空队列也有IN/RDNORM和RDHUP；双向关闭另有HUP。
+活动read reservation仍排除第二个数据消费者，方向事件不提前解除reservation。
+真实U-mode反例核对poll/select/epoll、dup共享方向和关闭前排队内容。空已关闭
+数据报的阻塞接收返回0，O_NONBLOCK/MSG_DONTWAIT返回EAGAIN；就绪掩码仍有IN。
+收到EAGAIN后的非阻塞调用不能因poll可读而重新循环。固定Linux和BoarOS现均通过；
+依据为固定Linux的`net/unix/af_unix.c`和`net/core/datagram.c`。
+
+扩大实际SO_RCVBUF预算会在单hart保护区内通知UNIX对端；STREAM和DGRAM发送者
+醒来后仍重查容量、关闭和错误，不延长peer引用。相同/缩小预算不通知对端。
+独立U-mode预算入口：`python3 -B tests/network-riscv.py --only boaros --workload budget`。
+该测试先握手并从proc确认发送者已阻塞，再核对扩容、缩容、对端关闭、SIGKILL和内容。
+它保护BoarOS的接收端字节预算，不把Linux的SO_RCVBUF当成相同排队模型。
+
+流发送的请求页持有有效内容和已发送游标：EAGAIN后等待及部分发送后继续消费暂存尾部，
+不再次读取同一段用户数据。非阻塞/fault/信号/期限仍返回已接受前缀；不借用用户页到ACK。
+预算fixture的COST窗口独立核对全阻塞和部分发送各1000字节只有1000字节stream usercopy，
+旧全阻塞实现为2000字节。`--workload content`校验单TCP16MiB、五TCP各8MiB及UDP内容。
+
+实际阻塞接收等待使用`kernel_socket_receive_ready`，活动reservation始终未就绪；
+对外poll仍保留终止事件。HUP/ERR不能让第二读者绕过owner并空转。io-sleep fixture
+暂扣真实usercopy调用，确认第二读者阻塞；finish/fault后唤醒，期限和信号可打断等待，
+最后页数回到基线。四种transport/cache均保护这一交错，不新增用户ABI或长寿命引用。

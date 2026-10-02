@@ -127,7 +127,7 @@ static void tcp_cost(struct kernel_files *files, struct kernel_mm *mm)
     uint32_t consumed=0;
     while(consumed<8192){
         struct kernel_socket_read_request request={0};
-        int got=kernel_socket_reserve_read(accepted,0,&request,&reader,sizeof(payload));
+        int got=kernel_socket_reserve_read(accepted,0,&request,&reader,sizeof(payload),0);
         check(got>0,202);kernel_socket_finish_read(&request,0);consumed+=(uint32_t)got;
     }
     /* 强制协议保留一次未接纳的 pbuf；IRQ 重试不能重入被中断的堆分配。 */
@@ -138,7 +138,7 @@ static void tcp_cost(struct kernel_files *files, struct kernel_mm *mm)
     do{kernel_socket_expire_timers();}while(kernel_time_monotonic_ns()<deadline);
     timer_probe=0;check(timer_heap_calls==0,204);
     struct kernel_socket_read_request request={0};
-    check(kernel_socket_reserve_read(accepted,0,&request,&reader,sizeof(payload))==5,205);
+    check(kernel_socket_reserve_read(accepted,0,&request,&reader,sizeof(payload),0)==5,205);
     char retry[5];kernel_socket_copy_read(&request,0,retry,5);check(!memcmp(retry,"retry",5),206);
     kernel_socket_finish_read(&request,0);
     check(kernel_open_file_release(&reader)==KERNEL_OPEN_FILE_STATUS_OK,207);

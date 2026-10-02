@@ -914,17 +914,40 @@ int kernel_socket_recvfrom(struct kernel_socket *socket, struct kernel_mm *mm,
     return user_fault ? -KERNEL_EFAULT : (int)done;
 }
 
+/* 无队首数据时的状态；查询不消费错误，reservation入口负责交付。 */
+static int socket_receive_empty(const struct kernel_socket *socket, int nonblocking)
+{
+    if (socket->pending_error) return socket->pending_error;
+    if (socket->type == SOCKET_DGRAM && socket->read_closed && nonblocking)
+        return -KERNEL_EAGAIN;
+    if (socket->read_closed ||
+        ((socket->type == SOCKET_STREAM || socket->domain == KERNEL_SOCKET_DOMAIN_UNIX) && socket->peer_closed))
+        return 0;
+    if (socket->domain == KERNEL_SOCKET_DOMAIN_INET && socket->type == SOCKET_STREAM &&
+        !socket->connected && !socket->connecting)
+        return -KERNEL_ENOTCONN;
+    return -KERNEL_EAGAIN;
+}
+
+int kernel_socket_receive_ready(struct kernel_socket *socket)
+{
+    uintptr_t saved = riscv_interrupt_save();
+    int ready = socket->read_request == 0 &&
+        (socket->listening || socket->packets_head != 0 || socket_receive_empty(socket, 0) != -KERNEL_EAGAIN);
+    riscv_interrupt_restore(saved);
+    return ready;
+}
+
 int kernel_socket_reserve_read(struct kernel_socket *socket,
                               struct kernel_task *task,
                               struct kernel_socket_read_request *request,
                               struct kernel_open_file_description **pin_owner,
-                              uint32_t capacity)
+                              uint32_t capacity, int nonblocking)
 {
     struct socket_packet *packet;
     uint32_t available;
     uint32_t length;
     uintptr_t old_status;
-    if (capacity == 0U && socket->type != SOCKET_DGRAM) return 0;
     if (request == 0 || request->socket != 0 ||
         pin_owner == 0 || *pin_owner == 0 ||
         kernel_open_file_socket(*pin_owner) != socket)
@@ -940,12 +963,15 @@ int kernel_socket_reserve_read(struct kernel_socket *socket,
     }
     packet = socket->packets_head;
     if (packet == 0) {
-        int result = socket->pending_error;
-        if (result) socket->pending_error = 0;
-        else result = (socket->read_closed || ((socket->type == SOCKET_STREAM || socket->domain == KERNEL_SOCKET_DOMAIN_UNIX) && socket->peer_closed))
-                         ? 0 : -KERNEL_EAGAIN;
+        int result = socket_receive_empty(socket, nonblocking);
+        if (socket->pending_error) socket->pending_error = 0;
         riscv_interrupt_restore(old_status);
         return result;
+    }
+    /* recv(0)检查连接/等待状态，但不取得或消费已有stream数据。 */
+    if (capacity == 0U && socket->type == SOCKET_STREAM) {
+        riscv_interrupt_restore(old_status);
+        return 0;
     }
     available = packet->payload != 0 ? (uint32_t)(packet->payload->tot_len - packet->consumed)
                                      : (packet->length - packet->consumed);
@@ -1412,7 +1438,13 @@ int kernel_socket_set_option(struct kernel_socket *socket,
         limit *= 2;
         if (limit < minimum) limit = minimum;
         if (option == KERNEL_SOCKET_SNDBUF) socket->tx_limit = limit;
-        else socket->rx_limit = limit;
+        else {
+            uint32_t previous = socket->rx_limit;
+            socket->rx_limit = limit;
+            /* UNIX发送者等待对端预算；peer仅在当前保护区内借用。 */
+            if (limit > previous && socket->domain == KERNEL_SOCKET_DOMAIN_UNIX && socket->peer != 0)
+                wake_socket(socket->peer);
+        }
         wake_socket(socket);
         break;
     }
@@ -1498,8 +1530,10 @@ uint32_t kernel_socket_poll(struct kernel_socket *socket,
     if (socket->domain == KERNEL_SOCKET_DOMAIN_UNIX) {
         uintptr_t saved = riscv_interrupt_save();
         if (socket->type == SOCKET_DGRAM) {
-            if (socket->packets_head != 0 && socket->read_request == 0)
+            if ((socket->packets_head != 0 || socket->read_closed) && socket->read_request == 0)
                 events |= KERNEL_POLLIN | KERNEL_POLLRDNORM;
+            if (socket->read_closed) events |= KERNEL_POLLRDHUP;
+            if (socket->read_closed && socket->write_closed) events |= KERNEL_POLLHUP;
             if (socket->peer_closed) {
                 events |= KERNEL_POLLIN | KERNEL_POLLRDNORM | KERNEL_POLLHUP;
             }
@@ -1558,6 +1592,8 @@ uint32_t kernel_socket_poll(struct kernel_socket *socket,
         riscv_interrupt_restore(saved);
     } else if (socket->peer_closed) {
         events |= KERNEL_POLLHUP | KERNEL_POLLOUT | KERNEL_POLLRDHUP | KERNEL_POLLIN;
+    } else if (socket_receive_empty(socket, 0) == -KERNEL_ENOTCONN) {
+        events |= KERNEL_POLLHUP | KERNEL_POLLOUT | KERNEL_POLLWRNORM;
     }
     if (socket->pending_error) events |= KERNEL_POLLERR;
     return events;

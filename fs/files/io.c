@@ -52,6 +52,14 @@ static enum kernel_files_status release_io_description(
     return KERNEL_FILES_STATUS_STATE;
 }
 
+static int socket_operation_ready(struct kernel_socket *socket, uint32_t events)
+{
+    uint32_t polled = kernel_socket_poll(socket, 0);
+    /* 终止事件可对外发布，实际接收仍须等待独占reservation的owner交还。 */
+    return events == KERNEL_POLLIN ? kernel_socket_receive_ready(socket) :
+        (polled & (events | KERNEL_POLLERR | KERNEL_POLLHUP)) != 0U;
+}
+
 static int socket_wait_ready(struct kernel_open_file_description *description,
                              uint32_t events, uint64_t timeout_ns, uint32_t socket_flags)
 {
@@ -59,10 +67,10 @@ static int socket_wait_ready(struct kernel_open_file_description *description,
     uint64_t deadline = 0;
     uint64_t target_ns = 0;
     uintptr_t saved;
-    if ((kernel_socket_poll(socket, 0) & events) != 0U) return 0;
     if ((description->open_flags & KERNEL_FILES_O_NONBLOCK) != 0U ||
         (socket_flags & KERNEL_SOCKET_MSG_DONTWAIT) != 0U)
         return -KERNEL_EAGAIN;
+    if (socket_operation_ready(socket, events)) return 0;
     if (timeout_ns != 0U) {
         uint64_t now = kernel_time_monotonic_ns();
         uint64_t target = UINT64_MAX - now < timeout_ns
@@ -75,8 +83,7 @@ static int socket_wait_ready(struct kernel_open_file_description *description,
         if (status != KERNEL_TIME_STATUS_OK) return -KERNEL_EIO;
     }
     saved = riscv_interrupt_save();
-    while ((kernel_socket_poll(socket, 0) &
-            (events | KERNEL_POLLERR | KERNEL_POLLHUP)) == 0U) {
+    while (!socket_operation_ready(socket, events)) {
         enum kernel_wait_wake_reason reason;
         uint64_t sleep_deadline = deadline;
         uint64_t protocol_deadline = kernel_socket_next_timer_deadline();
@@ -279,14 +286,14 @@ static enum kernel_files_status read_pinned(
                 return KERNEL_FILES_STATUS_OK;
             }
         }
-        int message = (socket_flags & KERNEL_SOCKET_IO_MESSAGE) &&
-                      kernel_socket_is_datagram(kernel_open_file_socket(description));
+        int message = (socket_flags & KERNEL_SOCKET_IO_MESSAGE) != 0;
+        /* read(0)可直接返回；recv(0)仍须检查协议状态和等待条件。 */
         int discard = kernel_socket_discard_receive(kernel_open_file_socket(description),socket_flags);
         if (count == 0U && !message) {
             *linux_result = 0;
             return KERNEL_FILES_STATUS_OK;
         }
-        if (!discard && kernel_task_io_buffer_acquire(&buffer, mm->allocator) !=
+        if (count != 0U && !discard && kernel_task_io_buffer_acquire(&buffer, mm->allocator) !=
                 KERNEL_TASK_STATUS_OK) {
             *linux_result = -KERNEL_ENOMEM;
             files->record->statistics.read_failures++;
@@ -297,7 +304,9 @@ static enum kernel_files_status read_pinned(
             received = kernel_socket_reserve_read(
                 kernel_open_file_socket(description), kernel_task_current(),
                 &read_request, description_owner,
-                remaining > UINT32_MAX ? UINT32_MAX : (uint32_t)remaining);
+                remaining > UINT32_MAX ? UINT32_MAX : (uint32_t)remaining,
+                (description->open_flags & KERNEL_FILES_O_NONBLOCK) ||
+                    (socket_flags & KERNEL_SOCKET_MSG_DONTWAIT));
             if (received == -KERNEL_EAGAIN && total == 0U) {
                 int waited = socket_wait_ready(description, KERNEL_POLLIN,
                     kernel_socket_receive_timeout(kernel_open_file_socket(description)), socket_flags);
@@ -995,30 +1004,37 @@ static enum kernel_files_status buffered_write_request(
                 if (access != KERNEL_UACCESS_STATUS_OK &&
                     access != KERNEL_UACCESS_STATUS_FAULT)
                     return KERNEL_FILES_STATUS_STATE;
-                sent = kernel_socket_write_buffer(socket, staging,
-                                                    (uint32_t)copied, socket_flags);
-                if (sent == -KERNEL_EAGAIN) {
-                    uint64_t now = target ? kernel_time_monotonic_ns() : 0;
-                    int waited = target && now >= target ? -KERNEL_EAGAIN :
-                        socket_wait_ready(description, KERNEL_POLLOUT,
-                                          target ? target-now : 0, socket_flags);
-                    if (waited == 0) continue;
-                    if (total && waited == -KERNEL_ERESTARTSYS)
-                        kernel_signal_clear_syscall_restart(kernel_task_current());
-                    sent = waited;
-                }
-                if (sent < 0) {
-                    *linux_result = total != 0U ? (int64_t)total : sent;
-                    return KERNEL_FILES_STATUS_OK;
-                }
-                total += (uint64_t)sent;
-                offset += (uint64_t)sent;
-                /* 阻塞 stream 继续等待剩余空间；fault/信号/超时仍返回已接受前缀。 */
-                if (access == KERNEL_UACCESS_STATUS_FAULT || ((size_t)sent < copied &&
-                    ((description->open_flags & KERNEL_FILES_O_NONBLOCK) ||
-                     (socket_flags & KERNEL_SOCKET_MSG_DONTWAIT)))) {
-                    *linux_result = (int64_t)total;
-                    return KERNEL_FILES_STATUS_OK;
+                size_t consumed = 0U;
+                /* 等待和短发送只推进暂存游标，不能重新解析尚未发送的用户字节。 */
+                while (consumed < copied) {
+                    sent = kernel_socket_write_buffer(socket, (const unsigned char *)staging + consumed,
+                                                        (uint32_t)(copied - consumed), socket_flags);
+                    if (sent == -KERNEL_EAGAIN) {
+                        uint64_t now = target ? kernel_time_monotonic_ns() : 0;
+                        int waited = target && now >= target ? -KERNEL_EAGAIN :
+                            socket_wait_ready(description, KERNEL_POLLOUT,
+                                              target ? target-now : 0, socket_flags);
+                        if (waited == 0) continue;
+                        if (total && waited == -KERNEL_ERESTARTSYS)
+                            kernel_signal_clear_syscall_restart(kernel_task_current());
+                        sent = waited;
+                    }
+                    if (sent < 0) {
+                        *linux_result = total != 0U ? (int64_t)total : sent;
+                        return KERNEL_FILES_STATUS_OK;
+                    }
+                    if (sent == 0 || (size_t)sent > copied - consumed)
+                        return KERNEL_FILES_STATUS_STATE;
+                    consumed += (size_t)sent;
+                    total += (uint64_t)sent;
+                    offset += (uint64_t)sent;
+                    /* fault或非阻塞仍返回本次已接受前缀。 */
+                    if (access == KERNEL_UACCESS_STATUS_FAULT || (consumed < copied &&
+                        ((description->open_flags & KERNEL_FILES_O_NONBLOCK) ||
+                         (socket_flags & KERNEL_SOCKET_MSG_DONTWAIT)))) {
+                        *linux_result = (int64_t)total;
+                        return KERNEL_FILES_STATUS_OK;
+                    }
                 }
             }
         }

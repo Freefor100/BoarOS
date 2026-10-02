@@ -88,11 +88,13 @@ int kernel_socket_sendto(struct kernel_socket *socket, struct kernel_mm *mm,
 int kernel_socket_recvfrom(struct kernel_socket *socket, struct kernel_mm *mm,
                            uint64_t user_data, uint64_t size,
                            struct kernel_socket_address *address);
+/* Actual blocking-receive predicate; terminal poll bits do not bypass a reservation. */
+int kernel_socket_receive_ready(struct kernel_socket *socket);
 int kernel_socket_reserve_read(struct kernel_socket *socket,
                               struct kernel_task *task,
                               struct kernel_socket_read_request *request,
                               struct kernel_open_file_description **pin_owner,
-                              uint32_t capacity);
+                              uint32_t capacity, int nonblocking);
 void kernel_socket_read_info(const struct kernel_socket_read_request *request,
                              struct kernel_socket_address *address, uint32_t *length);
 void kernel_socket_copy_read(const struct kernel_socket_read_request *request,

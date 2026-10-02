@@ -199,3 +199,13 @@ X(DEVICE1_PREPARE_READ, device1_prepare_read, bytes, 0)
 X(DEVICE_OTHER_FILE_READ, device_other_file_read, bytes, 0)
 X(DEVICE_OTHER_METADATA_READ, device_other_metadata_read, bytes, 0)
 X(DEVICE_OTHER_PREPARE_READ, device_other_prepare_read, bytes, 0)
+
+/* Successful seals can have multiple causes; wait ticks are elapsed, not CPU. */
+X(JOURNAL_SEAL_OPERATIONS, journal_seal_operations, count, 0)
+X(JOURNAL_SEAL_BYTES, journal_seal_bytes, count, 0)
+X(JOURNAL_SEAL_AGE, journal_seal_age, count, 0)
+X(JOURNAL_SEAL_TARGET, journal_seal_target, count, 0)
+X(JOURNAL_SEAL_FORCE, journal_seal_force, count, 0)
+X(JOURNAL_WAIT_SEALED_TICKS, journal_wait_sealed_ticks, ticks, 0)
+X(JOURNAL_WAIT_DURABLE_TICKS, journal_wait_durable_ticks, ticks, 0)
+X(JOURNAL_WAIT_CHECKPOINT_TICKS, journal_wait_checkpoint_ticks, ticks, 0)

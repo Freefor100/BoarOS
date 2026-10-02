@@ -266,3 +266,11 @@ unsigned32位，与Linux相同，兼容musl传来的符号扩展。未知命令E
 2100世纪例外、dup/fork/exec、坏指针、符号扩展请求与失败后重开。依据固定Linux
 `include/uapi/linux/rtc.h`、`drivers/rtc/dev.c`及`Documentation/admin-guide/devices.txt`，
 commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`；平台设备协议保持Goldfish原契约。
+
+## socket终止事件与接收独占（2026-10-02）
+
+阻塞接收的内部等待谓词由socket的实际数据/错误/EOF和reservation决定，不能把
+poll的HUP/ERR直接当作取得队首资格。等待期间释放CPU并保留当前请求/OFD owner，
+完成或fault释放reservation后唤醒后继；SO_RCVTIMEO与信号仍由同一次等待处理。
+`make test-io-sleep-riscv`的定向交错复用现有MM/uaccess包装器，保护完成、fault、
+超时和信号的结果以及页基线；对外poll和非阻塞语义另由network与固定ABI验证。

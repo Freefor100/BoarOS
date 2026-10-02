@@ -21,9 +21,11 @@ def digest(path):
 def main():
     parser=argparse.ArgumentParser(__doc__)
     parser.add_argument('--only',choices=('linux','boaros'))
-    parser.add_argument('--workload',choices=('contract','content','timer'),default='contract')
+    parser.add_argument('--workload',choices=('contract','content','timer','budget'),default='contract')
     parser.add_argument('--kernel',type=Path,default=ROOT/'kernel-rv')
     args=parser.parse_args()
+    if args.workload=='budget' and args.only!='boaros':
+        parser.error('UNIX receiver-budget contract requires --only boaros')
     work=ROOT/'build/network'/('contract-'+str(time.time_ns()))
     work.mkdir(parents=True)
     program=work/'init'

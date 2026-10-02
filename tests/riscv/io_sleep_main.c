@@ -2,6 +2,8 @@
 #include <arch/riscv/context.h>
 #include <arch/riscv/mm.h>
 #include <kernel/open_file.h>
+#include <kernel/socket.h>
+#include <kernel/errno.h>
 #include <kernel/files.h>
 #include <kernel/fs_context.h>
 #include <kernel/uaccess.h>
@@ -306,6 +308,102 @@ static void whole_write_probe(void *argument)
             physical_page_release(&allocator, table.root_address) == PHYSICAL_PAGE_STATUS_OK, 261);
     }
     virt_uart_puts("I/O whole write operation passed\n");
+    riscv_interrupt_restore(irq);
+}
+static int receive_testing;
+static unsigned receive_paused, receive_done, receive_mode;
+static int32_t receive_pair[2];
+static struct kernel_task *receive_holder, *receive_waiter;
+static struct kernel_wait_queue receive_held, receive_completed;
+enum kernel_uaccess_status __real_kernel_copy_to_user(struct kernel_mm *, uint64_t, const void *, size_t, size_t *);
+enum kernel_uaccess_status __wrap_kernel_copy_to_user(struct kernel_mm *mm, uint64_t address, const void *buffer, size_t size, size_t *copied)
+{
+    if(!receive_testing || mm!=&sync_mm)
+        return __real_kernel_copy_to_user(mm,address,buffer,size,copied);
+    if(scheduler.current==receive_holder && address==OP_USER+256 && !receive_paused) {
+        receive_paused=1;
+        enum kernel_wait_wake_reason reason;
+        check(kernel_scheduler_block_current(&receive_held,0,0,&reason)==KERNEL_SCHEDULER_STATUS_OK,270);
+    }
+    int previous=sync_edit; sync_edit=1;
+    enum kernel_uaccess_status result=__real_kernel_copy_to_user(mm,address,buffer,size,copied);
+    sync_edit=previous;
+    return result;
+}
+static void receive_owner(void *argument)
+{
+    (void)argument; uintptr_t irq=riscv_interrupt_save(); receive_holder=scheduler.current;
+    int64_t result;
+    check(kernel_files_read(&operation_files,&sync_mm,receive_pair[1],OP_USER+256,3,&result)==KERNEL_FILES_STATUS_OK && result==(receive_mode==3 ? -KERNEL_EFAULT : 3),271);
+    riscv_interrupt_restore(irq);
+}
+static void receive_follower(void *argument)
+{
+    (void)argument; uintptr_t irq=riscv_interrupt_save(); receive_waiter=scheduler.current;
+    int64_t result;
+    enum kernel_files_status status=kernel_files_read(&operation_files,&sync_mm,receive_pair[1],OP_USER+300,3,&result);
+    int64_t expected=(receive_mode==0 || receive_mode==3) ? 0 : receive_mode==1 ? -KERNEL_EAGAIN : -KERNEL_ERESTARTSYS;
+    if(status!=KERNEL_FILES_STATUS_OK || result!=expected) {
+        virt_uart_puts("I/O receive mode/status/result=");virt_uart_put_hex(receive_mode);virt_uart_putc(' ');
+        virt_uart_put_hex(status);virt_uart_putc(' ');virt_uart_put_hex((uint64_t)result);virt_uart_putc('\n');
+    }
+    check(status==KERNEL_FILES_STATUS_OK && result==expected,272);
+    receive_done=1; check(kernel_wait_queue_wake_all(&receive_completed)==KERNEL_SCHEDULER_STATUS_OK,273);
+    riscv_interrupt_restore(irq);
+}
+static void receive_reservation_probe(void *argument)
+{
+    (void)argument; uintptr_t irq=riscv_interrupt_save();
+    for(receive_mode=0;receive_mode<4;receive_mode++) {
+        receive_testing=operation_testing=1; receive_paused=receive_done=0;
+        receive_holder=receive_waiter=0;
+        kernel_wait_queue_init(&receive_held); kernel_wait_queue_init(&receive_completed);
+        sync_mm=(struct kernel_mm){0}; operation_files=(struct kernel_files){0};
+        struct riscv_sv39_page_table table={0}; struct riscv_sv39_user_space space={0};
+        check(riscv_sv39_page_table_init(&table,&allocator)==RISCV_SV39_STATUS_OK,274); table.state=RISCV_SV39_STATE_ACTIVE;
+        check(riscv_sv39_user_space_init(&space,&allocator,&table)==RISCV_SV39_STATUS_OK &&
+            riscv_kernel_mm_create(&sync_mm,&space)==KERNEL_MM_STATUS_OK &&
+            kernel_mm_vma_enable(&sync_mm,&heap)==KERNEL_MM_STATUS_OK &&
+            kernel_mm_brk_initialize(&sync_mm,0x10000000,0x70000000)==KERNEL_MM_STATUS_OK &&
+            riscv_kernel_mm_satp(&sync_mm,&sync_satp)==KERNEL_MM_STATUS_OK &&
+            kernel_files_create(&operation_files,&heap)==KERNEL_FILES_STATUS_OK,275);
+        uint64_t address; size_t copied; int64_t result; sync_edit=1;
+        check(kernel_mm_mmap_anonymous(&sync_mm,OP_USER,4096,KERNEL_MM_READ|KERNEL_MM_WRITE,KERNEL_MM_MAP_FIXED_NOREPLACE,&address)==KERNEL_MM_STATUS_OK &&
+            kernel_files_socketpair_create(&operation_files,&sync_mm,2,0,OP_USER,&result)==KERNEL_FILES_STATUS_OK && result==0 &&
+            kernel_copy_from_user(&sync_mm,receive_pair,OP_USER,sizeof(receive_pair),&copied)==KERNEL_UACCESS_STATUS_OK &&
+            kernel_copy_to_user(&sync_mm,OP_USER+512,"xyz",3,&copied)==KERNEL_UACCESS_STATUS_OK,276);
+        sync_edit=0;
+        check(kernel_files_write(&operation_files,&sync_mm,receive_pair[0],OP_USER+512,3,&result)==KERNEL_FILES_STATUS_OK && result==3,277);
+        struct kernel_socket *socket=kernel_open_file_socket(kernel_files_fd_borrow(&operation_files,receive_pair[1]));
+        kernel_socket_set_receive_timeout(socket,receive_mode==1 ? 100000000 : 0);
+        struct kernel_thread_join holder={0},waiter={0};
+        check(kernel_thread_create_joinable(receive_owner,0,&holder)==KERNEL_SCHEDULER_STATUS_OK,278);
+        while(!receive_paused) check(kernel_scheduler_yield_current()==KERNEL_SCHEDULER_STATUS_OK,279);
+        check(kernel_socket_shutdown(socket,2)==0 && (kernel_socket_poll(socket,0)&KERNEL_POLLHUP),280);
+        virt_uart_puts("I/O socket holder reserved; HUP published\n");
+        check(kernel_thread_create_joinable(receive_follower,0,&waiter)==KERNEL_SCHEDULER_STATUS_OK,281);
+        while(!receive_done && (!receive_waiter || receive_waiter->state!=KERNEL_THREAD_STATE_BLOCKED))
+            check(kernel_scheduler_yield_current()==KERNEL_SCHEDULER_STATUS_OK,282);
+        check(!receive_done && receive_paused,283);
+        if(receive_mode==2) check(kernel_scheduler_wake_signal(receive_waiter)==KERNEL_SCHEDULER_STATUS_OK,284);
+        if(receive_mode==1 || receive_mode==2) while(!receive_done) {
+            enum kernel_wait_wake_reason reason;
+            check(kernel_scheduler_block_current(&receive_completed,0,0,&reason)==KERNEL_SCHEDULER_STATUS_OK,285);
+        }
+        if(receive_mode==3) {
+            sync_edit=1;
+            check(kernel_mm_mprotect(&sync_mm,OP_USER,4096,KERNEL_MM_READ)==KERNEL_MM_STATUS_OK,292);
+            sync_edit=0;
+        }
+        check(kernel_wait_queue_wake_all(&receive_held)==KERNEL_SCHEDULER_STATUS_OK,286);
+        kernel_thread_join(&holder); kernel_thread_join(&waiter);
+        sync_edit=1; char bytes[3];
+        check(kernel_copy_from_user(&sync_mm,bytes,OP_USER+256,3,&copied)==KERNEL_UACCESS_STATUS_OK && (receive_mode==3 ? bytes[0]==0 && bytes[1]==0 && bytes[2]==0 : !memcmp(bytes,"xyz",3)),287);
+        sync_edit=receive_testing=operation_testing=0; sync_satp=0;
+        check(kernel_files_release(&operation_files)==KERNEL_FILES_STATUS_OK && kernel_mm_release(&sync_mm)==KERNEL_MM_STATUS_OK &&
+            physical_page_release(&allocator,table.root_address)==PHYSICAL_PAGE_STATUS_OK,288);
+    }
+    virt_uart_puts("I/O socket reservation passed: owner, HUP, timeout, signal and fault\n");
     riscv_interrupt_restore(irq);
 }
 static void print_counters(const char *phase, const struct riscv_virtio_mmio_block_statistics *stats)
@@ -1124,5 +1222,14 @@ void kernel_main(unsigned long hart, const void *dtb)
 #if BOAROS_COST_DIAGNOSTICS
     cost_finish("timeout-cancel", 2);
 #endif
+    check(kernel_thread_create(receive_reservation_probe, 0) == KERNEL_SCHEDULER_STATUS_OK, 289);
+    for (;;) {
+        uintptr_t irq = riscv_interrupt_save();
+        check(kernel_scheduler_yield_current() == KERNEL_SCHEDULER_STATUS_OK, 290);
+        struct kernel_thread_completion completion;
+        if (kernel_scheduler_reap_one(&completion) == KERNEL_SCHEDULER_STATUS_OK) break;
+        riscv_interrupt_restore(irq | RISCV_SSTATUS_SIE);
+    }
+    check(physical_page_available(&allocator) == baseline, 291);
     virt_uart_puts("BoarOS: I/O sleep tests passed\n"); sbi_shutdown();
 }

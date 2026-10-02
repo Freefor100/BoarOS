@@ -79,7 +79,7 @@ miss 路径先分配并清零页，再通过 node 的无 offset 副作用 `pread
 
 事务接口 `ext4_transaction_begin/end/abort` 支持同一 mount 的嵌套修改；外层提交前保留 metadata 和数据缓冲的 before-image 与引用。明确发生在日志提交前的 OOM、空间不足或关联数据 I/O 失败可回滚内存并重试；已可能影响日志持久状态的错误由 mount 保留，不能清除后继续。外层 abort 后，调用者须重新打开在内层修改过的 lwext4 handle；VFS 的普通操作各自完成事务，不持有跨 syscall 的开放事务。
 
-`ext4_journal_group_enable/service/drain` 由可写 journal mount 的独立 joinable 线程驱动；根启动与动态磁盘挂载启动该线程，宿主 fixture 显式推进同一引擎。操作仍各自持有 before-image，成功后合入挂载点 running transaction；同块修改合并，后一次失败只回滚自身。封口把 metadata 和 ordered data 复制到预留的不可变版本，提交准备使用预留日志缓冲和挂载期固定映射；设备提交和 checkpoint 不再读取可变 bcache。未提交 owner 通过 `journal_pending` 禁止隐式 home writeback，块与 inode 的释放范围保留到 checkpoint 屏障和日志起点更新完成，分配器跳过这些范围。首脏 100 ms、64 次成功操作或 256 KiB 镜像是封口条件，块载荷按恰好一个文件系统块单独分配，控制记录按实际尺寸档容量分配；同运行块复用 after/log 预留，本次 undo 仍独立。每个 home buffer 在第一个版本 pin 时计费，最后一个版本释放时撤销计费。空闲镜像和控制记录池最多保留 min(256KiB, 预算/4)，也计入硬预算；不足时先释放空闲资源。固定日志映射也纳入挂载点预算，运行时上限为 min(4MiB, RAM/32)。运行组之外最多两组冻结 FIFO 和一组提交中，commit 屏障后独立发布 durable；已提交 FIFO 留存 metadata 版本、日志空间与 quarantine 到 checkpoint 完成。worker 优先就绪提交；空队列、回收压力或累计四组 checkpoint 时执行最多八组连续 checkpoint 批次，完成后重新选择。内部等待区分 sealed/durable/checkpoint；64 操作阈值只封口，封口 FIFO 满才等 sealed，实际预算、日志 credit 或复用不足才等 checkpoint。页交接写入在操作前预留 data undo/version/home 与有界 metadata 路径的容量；私有原子操作内不释放修改锁等待。同步返回具有 commit 持久化保证。S6–S8 已通过宿主版本/环绕/断电、真实 IRQ 组提交及最终 lwext4/SQLite DELETE/WAL 恢复矩阵、双盘隔离；S9 测量完成但五倍/减半及 musl 普通读不回退目标未达，见[本轮验收](../learning/cost-baseline.md#s9-存储流水线验收2026-10-01)。旧 S5 的 lwext4、SQLite DELETE/WAL 恢复、双盘与消费者结论见[验收分析](../learning/cost-baseline.md#异步日志与组提交验收2026-10-01)。
+`ext4_journal_group_enable/service/drain` 由可写 journal mount 的独立 joinable 线程驱动；根启动与动态磁盘挂载启动该线程，宿主 fixture 显式推进同一引擎。操作仍各自持有 before-image，成功后合入挂载点 running transaction；同块修改合并，后一次失败只回滚自身。封口把 metadata 和 ordered data 复制到预留的不可变版本，提交准备使用预留日志缓冲和挂载期固定映射；设备提交和 checkpoint 不再读取可变 bcache。未提交 owner 通过 `journal_pending` 禁止隐式 home writeback，块与 inode 的释放范围保留到 checkpoint 屏障和日志起点更新完成，分配器跳过这些范围。首脏 100 ms 或 256 KiB 镜像是软封口条件，同步目标与强制请求另触发封口，块载荷按恰好一个文件系统块单独分配，控制记录按实际尺寸档容量分配；同运行块复用 after/log 预留，本次 undo 仍独立。每个 home buffer 在第一个版本 pin 时计费，最后一个版本释放时撤销计费。空闲镜像和控制记录池最多保留 min(256KiB, 预算/4)，也计入硬预算；不足时先释放空闲资源。固定日志映射也纳入挂载点预算，运行时上限为 min(4MiB, RAM/32)。运行组之外最多两组冻结 FIFO 和一组提交中，commit 屏障后独立发布 durable；已提交 FIFO 留存 metadata 版本、日志空间与 quarantine 到 checkpoint 完成。worker 优先就绪提交；空队列、回收压力或累计四组 checkpoint 时执行最多八组连续 checkpoint 批次，完成后重新选择。内部等待区分 sealed/durable/checkpoint；软阈值只封口，封口 FIFO 满才等 sealed，实际预算、日志 credit 或复用不足才等 checkpoint。页交接写入在操作前预留 data undo/version/home 与有界 metadata 路径的容量；私有原子操作内不释放修改锁等待。同步返回具有 commit 持久化保证。S6–S8 已通过宿主版本/环绕/断电、真实 IRQ 组提交及最终 lwext4/SQLite DELETE/WAL 恢复矩阵、双盘隔离；S9 测量完成但收益和 musl 普通读进展未达当时预期，见[本轮验收](../learning/cost-baseline.md#s9-存储流水线验收2026-10-01)。旧 S5 的 lwext4、SQLite DELETE/WAL 恢复、双盘与消费者结论见[验收分析](../learning/cost-baseline.md#异步日志与组提交验收2026-10-01)。
 
 `make test-lwext4-group-host` 使用实际引擎与独立设备计数，覆盖 32 次时间修改合成一批、嵌套 abort、后操作各预留点 OOM、提交期间同块新修改、冻结后禁止新分配、1/4 KiB 文件系统的 WRITE/FLUSH 失败与重启恢复。默认同步路径的 metadata/几何/错误原子性回归继续由 `make test-lwext4-metadata-host` 保护。
 
@@ -263,3 +263,14 @@ proc mounts 保留用户给出的磁盘来源名，并正确标识 tmpfs。
 字符串在mount adapter内由mount持有，不借用启动栈；卸载清空来源指针后释放adapter。
 动态挂载仍由自己的source owner管理。公共程序镜像创建相应块节点，proc mount快照
 沿现有转义规则输出，原df根盘行与statfs容量/空闲/类型另做内容核对。
+
+COST构建在成功freeze处记录封口条件，并在挂载点wait记录sealed/durable/checkpoint
+经过时间；失败freeze不增加成功原因。普通构建不增加这些观测，原因可重叠且等待
+不能跨任务相加。旧策略定点对照保留64次操作条件；当前已删除该条件及运行组计数字段，
+相同块的重复修改不单凭调用数封口。100ms是首次脏化起算的软触发，不是持久化
+完成期限。新旧真实收益和排空代价在本轮收口更新。诊断契约见[成本模块](kernel-cost.md)。
+
+本轮宿主回归以固定时钟下128次同块修改证明不会额外封口或重新分配组载荷；
+年龄在100ms触发，48/96页独立内容在固定时钟下触发版本量边界并校验内容。
+真正sealed FIFO满、预算与近满盘复用等待继续保护；后操作OOM、旧冻结版本、
+环绕、commit后checkpoint前恢复和WRITE/FLUSH失败通过`make test-lwext4-group-host`。
