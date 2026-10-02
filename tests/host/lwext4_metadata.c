@@ -51,9 +51,11 @@ static void pipeline_while_submitting(void)
     struct ext4_timestamp times[3]={{1111,1},{2222,2},{3333,3}};
     /* Device I/O of group one is held on this stack. New operations can
      * seal two later groups, then wait for sealing capacity, never home I/O. */
-    for(unsigned i=0;i<128;i++) {
-        times[0].nanoseconds=100+i;
+    for(unsigned group=0;group<3;group++) {
+        times[0].nanoseconds=100+group;
         CHECK(ext4_file_set_times(pipeline_file,7,times)==EOK);
+        /* 真实年龄条件封口后续组，直到sealed FIFO确实没有空间。 */
+        group_now+=100000000;
     }
     CHECK(ext4_file_set_times(pipeline_file,7,times)==EAGAIN);
     CHECK(pipeline_waits==1 && pipeline_kind==EXT4_JOURNAL_WAIT_SEALED);
@@ -65,8 +67,8 @@ static void group_pipeline(struct ext4_fs *fs, bool crash)
     CHECK(ext4_journal_group_enable("/",&runtime,4*1024*1024)==EOK);
     ext4_file f; CHECK(ext4_fopen(&f,"/file","r+")==EOK);
     struct ext4_timestamp times[3]={{1111,1},{2222,2},{3333,3}};
-    for(unsigned i=0;i<65;i++) {times[0].nanoseconds=i;CHECK(ext4_file_set_times(&f,7,times)==EOK);}
-    CHECK(pipeline_waits==0 && disk.flushes>0);
+    CHECK(ext4_file_set_times(&f,7,times)==EOK);
+    CHECK(pipeline_waits==0);
     pipeline_file=&f;write_interleave=pipeline_while_submitting;
     CHECK(ext4_journal_group_service("/",true)==EOK);
     struct ext4_journal_progress progress;
@@ -90,7 +92,33 @@ static void group_pipeline(struct ext4_fs *fs, bool crash)
     CHECK(ext4_journal_group_service("/",true)==EOK);
     CHECK(ext4_journal_group_drain("/")==EOK);
     CHECK(ext4_fclose(&f)==EOK);
-    printf("group pipeline: operation 65 admitted without checkpoint; commit and checkpoint independent\n");
+    printf("group pipeline: age seals fill FIFO; commit and checkpoint independent\n");
+}
+static void group_bounds(struct ext4_fs *fs)
+{
+    struct ext4_journal_runtime runtime={.now_ns=group_clock};
+    CHECK(ext4_journal_group_enable("/",&runtime,4*1024*1024)==EOK);
+    ext4_file f; CHECK(ext4_fopen(&f,"/file","r+")==EOK);
+    CHECK(ext4_ftruncate(&f,0)==EOK && ext4_journal_group_drain("/")==EOK);
+    struct ext4_journal_progress before, small, large;
+    CHECK(ext4_journal_group_progress("/",&before)==EOK);
+    unsigned char bytes[4096]; size_t count;
+    for(unsigned i=0;i<96;i++) {
+        memset(bytes,(int)i,sizeof(bytes));
+        CHECK(ext4_fwrite(&f,bytes,sizeof(bytes),&count)==EOK && count==sizeof(bytes));
+        if(i==47) {
+            CHECK(ext4_journal_group_progress("/",&small)==EOK && small.sealed==before.sealed);
+        }
+    }
+    CHECK(ext4_journal_group_progress("/",&large)==EOK && large.sealed>small.sealed);
+    CHECK(group_now==0 && fs->jbd_journal->memory_peak<=fs->jbd_journal->memory_limit);
+    CHECK(ext4_journal_group_drain("/")==EOK && ext4_fseek(&f,0,SEEK_SET)==EOK);
+    for(unsigned i=0;i<96;i++) {
+        CHECK(ext4_fread(&f,bytes,sizeof(bytes),&count)==EOK && count==sizeof(bytes));
+        for(unsigned j=0;j<sizeof(bytes);j++) CHECK(bytes[j]==(unsigned char)i);
+    }
+    CHECK(ext4_fclose(&f)==EOK);
+    puts("group bounds: unique data seals at constant clock; content and budget preserved");
 }
 static void group_ring(struct ext4_fs *fs)
 {
@@ -133,12 +161,15 @@ static void group_test(struct ext4_fs *fs)
     payload_threshold=fs->bdev->lg_bsize;
     for(unsigned i=0;i<4;i++)CHECK(ext4_file_set_times(&f,7,times)==EOK);
     unsigned warmed_payloads=payload_allocations;
-    for(unsigned i=4;i<32;i++) {
+    struct ext4_journal_progress before_repeat, after_repeat;
+    CHECK(ext4_journal_group_progress("/",&before_repeat)==EOK);
+    for(unsigned i=4;i<128;i++) {
         times[0].nanoseconds=i;
         CHECK(ext4_file_set_times(&f,7,times)==EOK);
     }
     /* Repeated edits of one running block must reuse reserved payloads.
      * A fresh block/undo allocation per warm edit fails this cost contract. */
+    CHECK(ext4_journal_group_progress("/",&after_repeat)==EOK && after_repeat.sealed==before_repeat.sealed);
     CHECK(payload_allocations==warmed_payloads);
     CHECK(disk.writes==writes && disk.flushes==flushes && fs->jbd_journal->committed_id==tid);
     struct ext4_inode committed, actual;
@@ -147,6 +178,8 @@ static void group_test(struct ext4_fs *fs)
     times[0].seconds=9999; CHECK(ext4_file_set_times(&f,1,times)==EOK);
     CHECK(ext4_transaction_abort("/",ECANCELED)==ECANCELED);
     CHECK(ext4_fraw_inode_fill(&f,&actual)==EOK && !memcmp(&actual,&committed,sizeof(actual)));
+    CHECK(ext4_journal_group_service("/",false)==EOK && disk.writes==writes);
+    group_now=99999999;
     CHECK(ext4_journal_group_service("/",false)==EOK && disk.writes==writes);
     group_now=100000000;
     CHECK(ext4_journal_group_service("/",false)==EOK);
@@ -208,7 +241,7 @@ static void group_test(struct ext4_fs *fs)
     CHECK(!memcmp(disk.visible+data_block*fs->bdev->lg_bsize,bytes,sizeof(bytes)));
     CHECK(to_le32(stable->access_time)==7777);
     CHECK(ext4_fclose(&f)==EOK); CHECK(ext4_journal_group_drain("/")==EOK);
-    printf("group operations=32 commits=%u writes=%llu flushes=%llu\n",fs->jbd_journal->committed_id-tid,(unsigned long long)(disk.writes-writes),(unsigned long long)(disk.flushes-flushes));
+    printf("group operations=128 commits=%u writes=%llu flushes=%llu\n",fs->jbd_journal->committed_id-tid,(unsigned long long)(disk.writes-writes),(unsigned long long)(disk.flushes-flushes));
 }
 static void group_fault(struct ext4_fs *fs, const char *kind, unsigned point)
 {
@@ -525,6 +558,7 @@ int main(int argc,char **argv)
     else if(!strcmp(argv[2],"group"))group_test(dev.fs);
     else if(!strcmp(argv[2],"group-space"))group_space(dev.fs);
     else if(!strcmp(argv[2],"group-ring"))group_ring(dev.fs);
+    else if(!strcmp(argv[2],"group-bounds")) group_bounds(dev.fs);
     else if(!strcmp(argv[2],"group-pipeline") || !strcmp(argv[2],"group-commit-crash")) {group_pipeline(dev.fs,!strcmp(argv[2],"group-commit-crash"));if(!strcmp(argv[2],"group-commit-crash"))return 0;}
     else if(!strcmp(argv[2],"group-write") || !strcmp(argv[2],"group-flush")) {CHECK(argc==4);group_fault(dev.fs,argv[2],strtoul(argv[3],NULL,10));return 0;}
     else if(!strcmp(argv[2],"group-recovery"))group_verify_recovery(dev.fs);

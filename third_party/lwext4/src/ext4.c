@@ -816,7 +816,7 @@ static bool ext4_group_due(struct ext4_mountpoint *mp, bool force)
 	struct jbd_data *data;
 	TAILQ_FOREACH(data, &running->data_queue, node) blocks++;
 	uint64_t now = mp->journal_runtime.now_ns ? mp->journal_runtime.now_ns(mp->journal_runtime.context) : 0;
-	return force || (mp->fs.jbd_journal->seal_target >= running->sequence) || running->operations >= 64 ||
+	return force || (mp->fs.jbd_journal->seal_target >= running->sequence) ||
 		(uint64_t)blocks * mp->fs.jbd_journal->block_size >= 256 * 1024 ||
 		(now >= running->first_dirty_ns && now - running->first_dirty_ns >= 100000000);
 }
@@ -831,7 +831,6 @@ static int ext4_group_freeze(struct ext4_mountpoint *mp, bool force)
     struct jbd_data *data;
     TAILQ_FOREACH(data, &running->data_queue, node) blocks++;
     uint64_t now = mp->journal_runtime.now_ns(mp->journal_runtime.context);
-    bool operations = running->operations >= 64;
     bool bytes = (uint64_t)blocks * journal->block_size >= 256 * 1024;
     bool age = now >= running->first_dirty_ns && now - running->first_dirty_ns >= 100000000;
     bool target = journal->seal_target >= running->sequence;
@@ -840,7 +839,6 @@ static int ext4_group_freeze(struct ext4_mountpoint *mp, bool force)
 #if BOAROS_COST_DIAGNOSTICS
     /* 只记成功封口；条件可重叠，不能相加推导提交组数。 */
     if (result == EOK) {
-        if (operations) COST_ADD(JOURNAL_SEAL_OPERATIONS, 1);
         if (bytes) COST_ADD(JOURNAL_SEAL_BYTES, 1);
         if (age) COST_ADD(JOURNAL_SEAL_AGE, 1);
         if (target) COST_ADD(JOURNAL_SEAL_TARGET, 1);

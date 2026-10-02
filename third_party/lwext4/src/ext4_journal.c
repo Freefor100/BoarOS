@@ -3030,7 +3030,6 @@ int jbd_journal_accept(struct jbd_journal *journal, struct jbd_trans *operation,
 		journal->log_reserved--;
 		jbd_log_free(log);
 	}
-	running->operations++;
 	COST_ADD(JOURNAL_ACCEPTED, 1);
 	return EOK;
 }

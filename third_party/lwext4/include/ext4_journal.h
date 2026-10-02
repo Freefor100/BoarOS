@@ -116,7 +116,7 @@ struct jbd_trans {
 	int error;
 	uint64_t sequence;
 	uint64_t first_dirty_ns;
-	unsigned operations, reserved_logs;
+	unsigned reserved_logs;
 	bool frozen;
 	struct jbd_image *checkpoint_image;
 	ext4_fsblk_t checkpoint_lba;

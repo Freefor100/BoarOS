@@ -367,3 +367,9 @@ python3 -B tests/cost-riscv.py --case consumer --consumer-commands musl:0,musl:1
 诊断追加八个聚合项，当前实际storage_bytes=64794、task_bytes=64；既有host契约和
 18项解析验证通过。等待ticks是经过时间；后台和前台累计值、嵌套等待不能相加当
 端到端时间。成功封口条件可能重叠，不能把其和当作组数。
+
+新封口机制已经落实：操作级undo不变，相同块反复修改合并已有运行版本，不再以
+64次成功操作封口。旧实现在128次同块修改、固定时钟和足够容量下推进sealed序号，
+新实现不推进且复用已有载荷。独立版本量、100ms年龄、真实FIFO满及空间等待仍成立。
+`make test-lwext4-group-host`覆盖1/4KiB、内容、预算、OOM、版本交错及恢复；
+这证明批次机制和约束，尚不能单凭它宣布iozone收益。
