@@ -61,7 +61,10 @@ extern "C" {
 struct ip_reassdata {
   struct ip_reassdata *next;
   struct pbuf *p;
+  /** Borrowed input interface; its owner must clean up before removing it. */
+  struct netif *netif;
   struct ip_hdr iphdr;
+  /** Highest received end until LASTFRAG, then the fixed final extent. */
   u16_t datagram_len;
   u8_t flags;
   u8_t timer;
@@ -69,7 +72,10 @@ struct ip_reassdata {
 
 void ip_reass_init(void);
 void ip_reass_tmr(void);
-struct pbuf * ip4_reass(struct pbuf *p);
+struct pbuf * ip4_reass(struct pbuf *p, struct netif *inp);
+/** Release all queued fragments for an input interface, without emitting ICMP.
+ * Call in the same serialized context as input/timers before netif teardown. */
+void ip4_reass_cleanup_netif(struct netif *inp);
 #endif /* IP_REASSEMBLY */
 
 #if IP_FRAG
