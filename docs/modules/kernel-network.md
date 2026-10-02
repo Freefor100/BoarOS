@@ -34,7 +34,7 @@ TCP `POLLOUT` 同时要求发送缓冲和队列空间。`tcp_write` 还可能因
 
 关闭活动 TCP 连接先解绑全部指向 BoarOS socket 的回调，再 `tcp_close`；协议 FIN/TIME_WAIT 可能暂占静态 PCB/segment 池，随后由定时器回收。这与内核堆对象生命周期分开。
 
-支持 `AF_UNIX` (domain=1) 的 `socketpair(199)` 系统调用，支持 `SOCK_STREAM` 和 `SOCK_DGRAM` 类型以及 `SOCK_CLOEXEC`、`SOCK_NONBLOCK`。`kernel_files_socketpair_create` 保证双向 OFD 的原子分配与双 fd 安装，失败时完整回滚不泄露 fd 或 OFD。两个 endpoint 在内核中互相绑定 peer；流和数据报在接收端堆上排队，每个 socket 拥有 64 KiB 独立接收缓冲配额（超出时返回 `-EAGAIN` 并在接收端读取后唤醒对端写者）。向已关闭或断开的对端写入向调用任务产生 `SIGPIPE` 并返回 `-EPIPE`；读取已关闭对端返回 0 (EOF)；`SOCK_DGRAM` 将一次 write/writev 聚合为一条消息，64 KiB 上限之外返回 EMSGSIZE；用户复制全部成功后才移动整包 owner，fault/OOM/取消不发布前缀。队列按 `max(length, 1)` 收取预算，零长度消息可入队。容量不足时等待整条消息可容纳，不以普通 POLLOUT 作为重试条件；短读、复制 fault 或销毁释放整包及其全部预算。发送请求登记在任务上，退出前撤销临时 packet 与 OFD pin。poll/ppoll/epoll 准确反映对端关闭时的 `POLLHUP`/`POLLIN` 就绪。命名 AF_UNIX 端点、SCM_RIGHTS 凭据传递、带 ancillary 的 sendmsg/recvmsg、更多 sockopt、外部网卡与 SMP 并发仍在 `docs/goals.md` N2/N3，不能由本切片推出。
+支持 `AF_UNIX` (domain=1) 的 `socketpair(199)` 系统调用，支持 `SOCK_STREAM` 和 `SOCK_DGRAM` 类型以及 `SOCK_CLOEXEC`、`SOCK_NONBLOCK`。`kernel_files_socketpair_create` 保证双向 OFD 的原子分配与双 fd 安装，失败时完整回滚不泄露 fd 或 OFD。两个 endpoint 在内核中互相绑定 peer；流和数据报在接收端堆上排队，每个 socket 拥有 64 KiB 独立接收缓冲配额（超出时返回 `-EAGAIN` 并在接收端读取后唤醒对端写者）。向已关闭或断开的对端写入向调用任务产生 `SIGPIPE` 并返回 `-EPIPE`；读取已关闭对端返回 0 (EOF)；`SOCK_DGRAM` 将一次 write/writev 聚合为一条消息，64 KiB 上限之外返回 EMSGSIZE；用户复制全部成功后才移动整包 owner，fault/OOM/取消不发布前缀。队列按 `max(length, 1)` 收取预算，零长度消息可入队。容量不足时等待整条消息可容纳，不以普通 POLLOUT 作为重试条件；短读、复制 fault 或销毁释放整包及其全部预算。发送请求登记在任务上，退出前撤销临时 packet 与 OFD pin。poll/ppoll/epoll 准确反映对端关闭时的 `POLLHUP`/`POLLIN` 就绪。命名 AF_UNIX 端点、SCM_RIGHTS 凭据传递、带 ancillary 的 sendmsg/recvmsg、更多 sockopt、外部 IPv6 与 SMP 并发仍在 `docs/goals.md`，不能由本切片推出。
 
 ## 验证
 
@@ -128,12 +128,12 @@ python3 -B tests/network-consumers.py --only boaros --libc both --suite both --c
 引用。TCP写入调用/字节为64位，lwIP包/错误计数为16位，会环绕，不能当作大流量
 窗口的完整总包数；pool用量和高水位是即时值。窗口仍使用已有 cost v1 schema，
 聚合64794字节、每任务64字节，默认构建没有新增诊断节点。观测影响吞吐，关闭
-观测的三次分布才是性能结果。当前1179条ABI、完整RV64、真实musl/glibc 2.44、
+观测的三次分布才是性能结果。此前纠错轮1179条ABI、完整RV64、真实musl/glibc 2.44、
 socket scale和栈检查通过；修复后的用户态契约覆盖reset、accept输出fault、
 TCP MSG_TRUNC、UDP自动端口释放，IRQ重试由独立heap包装器保护。
 
 结果与限制见[网络记录](../learning/network-ownership.md#原版网络应用交付2026-10-02)。
-没有真实网卡、命名AF_UNIX、SCM_RIGHTS或TCP_INFO；相关应用字段不作为已验证统计。
+该段是此前loopback验收；现已接入VirtIO-net，仍没有命名AF_UNIX、SCM_RIGHTS或TCP_INFO，相关应用字段不作为已验证统计。
 
 ## 接收状态纠错（2026-10-02）
 
@@ -170,3 +170,19 @@ UNIX DGRAM自身SHUT_RD后，即使空队列也有IN/RDNORM和RDHUP；双向关�
 对外poll仍保留终止事件。HUP/ERR不能让第二读者绕过owner并空转。io-sleep fixture
 暂扣真实usercopy调用，确认第二读者阻塞；finish/fault后唤醒，期限和信号可打断等待，
 最后页数回到基线。四种transport/cache均保护这一交错，不新增用户ABI或长寿命引用。
+
+## Ethernet与真实宿主应用（2026-10-02）
+
+根启动对象持有独立VirtIO-net、netif与joinable worker，DTB发现device ID和IRQ。
+官方Ethernet入口接纳custom pbuf，启用ARP及48 pbuf/8对象的IPv4重组；MTU1500、
+MAC来自设备、静态地址由构建配置决定。RX loan直到最后协议/reservation引用释放；
+回退与UDP接纳保留控制余量。IRQ只收割，raw API在单hart临界区串行；worker每批
+八帧，失败NIC也继续共享loopback与协议定时器。停止join、清理接口引用、reset确认，
+真实借用未归还时保留owner。接口查询来自真实netif，DOWN撤下RUNNING。
+详细预算、寄存器、失败与验证命令见[网卡模块](riscv-virtio-net.md)。
+
+两种transport与两种libc的原wget/httpd均完成双向GET、CGI上传与文本POST。
+固定单/五TCP及UDP内容、压力下TCP进展、块/RNG混合IRQ、最终heap live=0已核对；
+完整1196 ABI、RV64、真实libc、scale和栈检查通过。零拷贝仅去掉DMA到pbuf一跳，
+用户接收和TX复制仍在；没有外部IPv6、DHCP/DNS/TLS或默认网关。结果、效率、
+程序与最终卸载计时边界见[真实网卡记录](../learning/network-ownership.md#真实-virtio-net-与宿主应用交付2026-10-02)。

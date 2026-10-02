@@ -35,7 +35,9 @@ worker 在任务上下文推进 Ethernet/ARP、协议定时器和重试，每批
 raw API 沿既有单 hart 临界区串行化，IRQ 不重入堆。
 
 停止先禁止新工作、唤醒并 join worker，清理接口的重组/ARP，移除 netif，然后
-reset 并确认 DMA 已停。reset 未确认保留 DMA；reset 已确认但协议或接收请求
+reset 并确认 DMA 已停。netif 移除会同步按旧本地地址 abort active/bound TCP PCB，
+包括已脱离 socket 登记的 FIN_WAIT，释放其乱序 RX 引用；TIME_WAIT 转入前已 purge，
+此处不依赖已 join worker 的后续 timer。reset 未确认保留 DMA；reset 已确认但协议或接收请求
 仍持 pbuf，也保留整个设备 owner，返回 EBUSY。最后引用归还后才可释放队列页、
 RX/TX 页和控制对象。设备故障与连接拒绝、RST、协议超时分别交付；错误回调
 不读取已经释放的 PCB。该协议未覆盖非一致 DMA、IOMMU、多 hart 或实板。
@@ -54,7 +56,7 @@ loopback 的协议 MTU=0 表示无 L2 限制，其公开逻辑 MTU 为 Linux 的
 ## 验证与固定资料
 
 ```sh
-make test-virtio-net-host test-lwip-reassembly-host
+make test-virtio-net-host test-lwip-reassembly-host test-ethernet-worker-host
 python3 -B tests/network-riscv.py --only boaros --workload interface
 python3 -B tests/network-external.py --transport both
 python3 -B tests/network-external.py --only linux --transport modern
@@ -63,8 +65,9 @@ python3 -B tests/network-external.py --only linux --transport modern
 宿主模型独立解码寄存器银行与 split-ring 字节，57 项覆盖两种传输、头部、64 位
 地址、队列满、非法完成、索引绕回、启动失败、超时、借用与 reset owner。它不能
 替代真实 DMA/IRQ。`python3 -B tests/host/ethernet_worker.py` 另编译实际 worker，
-用协议/调度边界模型验证设备失败后仍推进期限并按下一期限等待；它不验证实际协议
-时钟或 DMA。真实 TAP runner 在无特权 user/network namespace 内运行，
+用协议/调度边界模型验证设备失败后仍推进期限并按下一期限等待；同一1514字节
+输入的custom路径零复制、回退路径精确复制1514字节，最后引用、OOM、控制余量
+及input失败回收均核对。边界模型不验证实际协议时钟或DMA。真实 TAP runner 在无特权 user/network namespace 内运行，
 不启用 vhost/offload、不设置网关，输出只留 build。应用、性能和最终资源证据见
 [网络学习记录](../learning/network-ownership.md)，当前收口状态见[开发路线](../goals.md)。
 

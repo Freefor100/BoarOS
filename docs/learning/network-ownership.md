@@ -282,3 +282,162 @@ TIME_WAIT对象在到期前仍有协议owner，不将暂留资源误报为已释
 与请求内复制。逐调用身份与原输出在忽略的build中，本文保存结论和可重建入口。
 没有接入真实网卡、扩大窗口、零拷贝或更换调度器。下一主线是N3：单队列VirtIO-net、
 静态IPv4＋ARP及隔离宿主双向TCP/HTTP传输；性能改进持续按实际应用成本选择。
+
+## 真实 VirtIO-net 与宿主应用交付（2026-10-02）
+
+这一轮使内核从 loopback 走到真实 MMIO 网卡：QEMU legacy/modern split ring、Ethernet、
+ARP 和静态 IPv4 均实际收发。设备和协议仍在单 hart 上运行；隔离 TAP 的宿主是
+10.77.0.1，客体 eth0 是 10.77.0.2/24，不设置网关、vhost 或 offload。
+`::1` 内容探针继续通过。它证明隔离宿主双向网络成立，不能推出公网、DNS、TLS
+或外部 IPv6 已交付。
+
+### 解锁的程序与实际工作
+
+固定原镜像的 BusyBox wget/httpd 未修改。main 使用原 musl，兼容分支保留旧 glibc
+需要的版本身份；两个配置的 legacy/modern 都完成以下流程：
+
+- 宿主向客体、客体向宿主分别进行 16 MiB HTTP GET，逐字节核对内容。
+- 宿主向客体 CGI 上传任意 16 MiB 文件，CGI 输出、落盘文件内容和子进程状态均核对。
+- 客体原 wget 向宿主发送 4 KiB 文本 POST，宿主核对内容并返回确认。
+- 单 TCP 双向各 16 MiB；五个工作者统一开始、各双向 8 MiB，全部完成才结束。
+- UDP 一万次 64 字节请求响应，另核对 1472、1473 和 65507 字节的往返内容；
+  后两项确实经过 IPv4 分片和重组。
+
+原 httpd 的 GET 调用 sendfile，首次有效外部流程因此暴露 syscall 71 缺口。
+本轮实现有界内核复制，保护 fd/OFD pin、位置、短进展、同步错误和整包数据报。
+它不是发送零拷贝。固定 Linux 还证实 sendfile 生成的 pipe 片段不能被普通 write
+并尾；原 BoarOS 会多接纳一个字节，现已修正。重建入口和特殊输入限制见
+[文件模块](../modules/kernel-files.md#sendfile-与来源片段)。
+
+服务端由 fixture 有意终止：httpd 使用 SIGKILL，netserver 使用 SIGTERM；
+记录其真实 wait status，不把这种清理写成服务程序自行正常退出。
+兼容配置的 iperf/netperf 两种 libc 共 22 项受控原 ELF 流程再次全部完成，
+各客户端 wait=0 且有实际接收或事务数。此前原连续 iperf 脚本的参考侧竞态仍单列，
+此次没有把受控启动说成原连续脚本已经全部通过。
+
+### 零拷贝减少的是哪一层工作
+
+RX 完成后先归还描述符资格，DMA 槽的内容仍由 custom pbuf 持有。
+最后一个引用释放才允许该槽再次发布；reset 确认也不能提前释放借出的内容。
+超过 32 个借用时复制到有界备用池，立即归还 DMA。worker 最多处理八帧，
+批次间开放中断并让出运行机会；IRQ 不分配、不重入 raw API 或堆。
+
+实际 Ethernet input 的宿主边界探针把同一 1514 字节帧交给两条路径：
+custom pbuf 直接引用原 payload、复制零字节；借用满时恰好复制 1514 字节。
+它另核对第二个引用、最后释放、OOM、控制余量和 input 错误的清理；
+驱动模型独立保护旧 DMA 内容、非法完成及 reset owner。
+这是字节和生命期的因果证据，不是宿主模拟的吞吐成绩。
+
+三个关闭观测启动中，112897–113369 个帧使用借用，117–124 个帧使用复制回退；
+借用占接纳帧约 99.89%，累计直接引用约 99 MB 的 Ethernet 内容。
+被省掉的是 DMA 到协议 pbuf 的一跳复制，包含帧头；不能把它当成应用有效字节，
+也不能称为全链路零拷贝。TCP 到用户缓冲的复制、发送暂存、lwIP COPY 和 TX DMA
+复制均保留。此前没有真实网卡基线，不能据此宣称相对旧版某个吞吐倍数。
+
+压力阶段先投递 128 个 1472 字节 UDP 包，接收端暂不读取，再要求 TCP 双向各完成
+8192 字节。BoarOS 接纳 44 包、64768 字节并丢弃至少 84 包，TCP 内容仍完整；
+固定 Linux 接纳 22 包，不能用同一个 SO_RCVBUF 数值要求它们有相同包数。
+BoarOS 定点窗口明确记录 84 次 UDP 接纳资源错误，驱动 drops=0 表示此处在协议层
+拒绝，不表示没有丢包。备用池保留 16 个控制 pbuf，判断包括即将借用或分配的版本。
+
+### 关闭观测的实际完成效率
+
+modern、512 MiB、单 hart，三次串行独立启动；每次重建隔离宿主 namespace，
+固定 Linux 使用独立的 VirtIO-net 配置，同一 ELF、数据、请求顺序和 TAP 条件。
+参考源码是本地 Linux v7.2、QEMU v11.1.0、lwIP 2.2.1；实际 QEMU 二进制为 11.1.1，
+DTB timebase 为 10 MHz。精确工具和输入身份仅保存在 runner 的机器记录。
+
+下表为中位数（最小–最大）。TCP 吞吐按双向串行的实际总量计算：单连接 32 MiB，
+五连接 80 MiB，使用客体计时。单连接从 accept 完成后开始；五连接从最早工作者
+开始到最晚完成，已排除全部 accept、fork 和 gate 准备。区间包含内容检查、发送、
+半关闭和 close，是传输阶段的完成效率，不能当成单向峰值或与此前 loopback iperf
+直接换算。
+
+| 指标 | BoarOS | 匹配 Linux |
+|---|---:|---:|
+| 单 TCP 阶段，秒 | 0.902（0.899–0.950） | 0.229（0.229–0.248） |
+| 单 TCP 双向总量，Mbit/s | 297.5（282.4–298.5） | 1171.2（1083.4–1173.1） |
+| 五 TCP 阶段，秒 | 2.359（2.302–2.706） | 0.606（0.594–0.608） |
+| 五 TCP 双向总量，Mbit/s | 284.5（248.0–291.6） | 1106.6（1103.0–1130.7） |
+| UDP 64 B 请求响应，次/秒 | 7777（7657–7795） | 20255（19092–21284） |
+| HTTP 完整阶段，秒 | 7.563（7.466–7.581） | 1.158（1.156–1.202） |
+| 程序自身完成，秒 | 12.151（12.044–12.540） | 2.572（2.529–2.613） |
+| 程序完成后到最终关机，秒 | 2.035（1.991–2.046） | 0.023（0.021–0.025） |
+
+BoarOS 五个工作者全部接收、发送 8 MiB 且退出 0；最早和最晚完成的差为
+18–107 ms，中位 25 ms，不能用平均值掩盖慢任务。UDP 往返 p99 中位为
+225 μs（186–228），Linux 为 84 μs（78–118）；最大值中位为 725 μs 与
+2028 μs。这是宿主逐请求计时，最大值对偶发宿主停顿敏感，不作硬实时保证。
+
+程序后的时间由读取 PASS 到 QEMU 最终退出计量：BoarOS 包含 fixture 内部根卸载、
+剩余 durable/checkpoint、协议及 owner 收口；Linux 包含其关机流程。
+它们分别公开，但不是匹配的 fsync 或纯 checkpoint 微基准，不把差值全归给日志。
+总 runner 墙钟还含启动和宿主 HTTP 服务结束，不能替代程序自身完成时间。
+legacy 的同一内容流程完成；旧 glibc 的两个 transport 也完成，单次结果用于能力验收，
+不拼入 main/musl 的三次分布。
+
+### 剩余成本与本轮发现
+
+一次 COST 启动使用原有五个窗口，没有增加诊断字段或节点。
+64 KiB 聚合预算内实际为 64794 字节，每任务为 64 字节，时钟分辨率为 100 ns。
+单/五 TCP 的 stream usercopy 分别恰好为 16/40 MiB，与发送接受字节相等；
+请求内没有背压重复复制。但这次是阻塞内容负载，不推翻此前非阻塞 iperf 跨调用
+复制放大的结论。
+
+单 TCP 窗口约 1.098 秒，前台运行记账 0.742 秒、后台 0.335 秒；
+五 TCP 窗口约 3.145 秒，对应 2.248 秒和 0.821 秒。
+两者没有块设备请求，主要时间已在客体运行上下文中，不能归给 FLUSH。
+运行记账包括用户内容检查与内核/协议处理，不是函数指令占比。
+ready 和 blocked 是多任务累计等待，与运行时间、窗口时间不能直接相加。
+TCP 仍使用 11680 字节收发窗口、128 个全局 segment，用户页解析、复制、分段和
+ACK 等固定工作仍存在；没有此次独立证据把差距单独定位为某种调度算法。
+
+HTTP 观测窗口约 10.505 秒，前台/后台运行为 7.252/1.546 秒；
+文件接受约 32 MiB，同时包含文件下载、上传、检查和后台持久化。
+后台 576 次 FLUSH、约 1.490 秒提交和 1.075 秒 checkpoint 累计时间说明它已是
+网络与文件系统组合流程，不能用裸 TCP 的机制解释全部差距。
+unknown read 约 17.74 MB 保持 unknown；journal 内存峰值取 max 为 862912 字节，
+不将累计峰值采样之和写成内存占用。观测程序耗时 18.388 秒，明显扰动负载，
+正式成绩只用关闭观测的三个启动。
+
+实际 DMA 为 legacy 272 KiB、modern 264 KiB，控制对象 4896 字节。
+关闭观测的 root heap 峰值为 1139–1145 页（约 4.45–4.47 MiB），它不包含全部
+物理页缓存、静态协议池和 DMA，不能称为全内核峰值。任务栈实际最大使用
+3176–3192 字节，最小余量 4984 字节；所有启动最终 heap live 为零。
+同一启动另有真实块设备 IRQ 与 RNG 完成，RNG 读取 64 字节且无错误/超时。
+
+本轮收口修复 modern DEVICE_NEEDS_RESET 的发布缺口、失败 NIC 停止共享协议
+定时推进、行政 DOWN 仍报告 RUNNING，以及 connected UDP 的设备故障路由归因。
+57 项驱动模型、22 项重组宿主契约及实际 ARP/UDP 内容覆盖它们所属的边界。
+此前旧对照的物理页释放 fatal 和 QEMU queue-excess 仍未定位：新增诊断输出具体
+页状态/失败原因与 reset 前队列现场，但后续通过不能证明历史根因已关闭。
+
+### 验证、重建与后续方向
+
+集中一次完整 RV64、真实 musl 与 glibc 2.44、1196 条固定 Linux ABI、socket scale
+及生产栈检查通过；编译器检查 1892 个函数，最大单帧 2352 字节。
+另有原 22 项 loopback、两种 transport 的真实外部内容和兼容 glibc HTTP。
+不重跑 iozone、C0–C6 或不相关的存储恢复矩阵，持久化协议本轮未改。
+一次汇总源审查完成，设备状态缺口在该次收口中修正，没有多轮独立审查循环。
+
+```sh
+make test-virtio-net-host test-lwip-reassembly-host test-ethernet-worker-host
+make all
+python3 -B tests/network-external.py --transport both
+python3 -B tests/network-external.py --transport modern --repeat 3
+python3 -B tests/network-external.py --only linux --transport modern --repeat 3
+# 旧镜像的 glibc 使用兼容版本身份；独立构建目录避免混用内核。
+git switch oscomp-rv-compat
+make BUILD_DIR=build/network-compat KERNEL_RV=build/network-compat/kernel all
+python3 -B tests/network-external.py --libc glibc --transport both --kernel build/network-compat/kernel
+python3 -B tests/network-consumers.py --only boaros --libc both --suite both --case all --kernel build/network-compat/kernel
+git switch main
+make BUILD_DIR=build/network-cost COST_DIAGNOSTICS=1 KERNEL_RV=build/network-cost/kernel all
+python3 -B tests/network-external.py --observe --kernel build/network-cost/kernel
+```
+
+输出只在忽略的 build；核对后清理，Git 保存上述可理解结论和可重建负载。
+完整 Harness 仍缺 kernel-la。下一项由真实应用需求选择：地址/路由与 DNS、
+更大的离线 C 构建或交互式 shell；TLS 需另核对随机、时间和证书。
+窗口、非阻塞发送暂存和接收复制等优化仍按目标应用证据选择，不设固定倍数，
+也不让继续优化挡住功能交付。

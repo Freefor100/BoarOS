@@ -4,33 +4,35 @@
 `[x]` 只表示具体交付已验收；历史测量、输入身份和可重建命令归现有 learning。
 固定 Linux 位于 `references/linux`，精确版本与其他资料由 `references/sources.tsv` 管理。评审是调查输入，不自动成为实现或验收证据。
 
-## 当前轮：VirtIO-net、零拷贝接收与宿主双向应用（N3）
+## 近期交付：VirtIO-net、零拷贝接收与宿主双向应用（N3）
 
 已确认legacy/modern单对RX/TX split队列；RX为custom pbuf零拷贝，借用达到上限时
 有界复制回退。静态IPv4＋ARP、48 pbuf/8对象的IPv4分片重组、隔离TAP和真实TCP/HTTP
-同时交付。不设吞吐倍数门槛，不扩大TCP窗口或改调度器。当前均为执行任务，未标已验收。
+已交付。不设吞吐倍数门槛，未扩大TCP窗口或改调度器；实际结果与限制见
+[真实网卡记录](learning/network-ownership.md#真实-virtio-net-与宿主应用交付2026-10-02)。
 
 | 阶段 | 状态与交付 |
 |---|---|
-| N3a 现场与驱动 | [ ] 页释放失败原因、队列/设备现场；32描述符、64×2KiB RX/TX、两种传输及真实DMA/reset owner |
-| N3b 零拷贝与worker | [ ] 最后pbuf引用前不复用DMA；最多32借用、压力回退、控制余量、IRQ不分配及8帧有界处理 |
-| N3c ARP与重组 | [ ] 实际eth0/地址/路由/ioctl；协议＋接口重组键、重叠和冲突整队丢弃、48片上限/超时/停止回收 |
-| N3d 原应用 | [ ] 两种传输的双向TCP/HTTP；原wget/httpd、CGI上传、逐任务内容/状态与服务清理 |
-| N3e 集中收口 | [ ] RV64/libc/1179＋新增ABI/scale/栈、原22项、块/RNG混合IRQ；关闭观测分布、资源与机制解释 |
+| N3a 现场与驱动 | [x] 页释放失败原因、队列/设备现场；32描述符、64×2KiB RX/TX、两种传输及真实DMA/reset owner |
+| N3b 零拷贝与worker | [x] 最后pbuf引用前不复用DMA；最多32借用、压力回退、控制余量、IRQ不分配及8帧有界处理 |
+| N3c ARP与重组 | [x] 实际eth0/地址/路由/ioctl；协议＋接口重组键、重叠和冲突整队丢弃、48片上限/超时/停止回收 |
+| N3d 原应用 | [x] 两种传输的双向TCP/HTTP；原wget/httpd、CGI上传、逐任务内容/状态与服务清理 |
+| N3e 集中收口 | [x] RV64/libc/1196 ABI/scale/栈、原22项、块/RNG混合IRQ；关闭观测分布、资源与机制解释 |
 
 DMA预算不超过288KiB，metadata/worker栈另计；guest默认10.77.0.2/24、隔离宿主10.77.0.1，
 无默认网关。保留IPv6 loopback；外部IPv6、DHCP/DNS/TLS、公网、SMP及实板不并入本轮。
-旧页释放fatal和VirtIO队列超额未定位，先补现场，复现后修所属层；不以后续通过关闭风险。
-重组当前关闭，开启前先修已核实的协议号键遗漏与部分重叠处理差异。
+旧页释放fatal和VirtIO队列超额未定位，已补冷路径现场，待复现后修所属层；不以后续通过关闭风险。
+已修协议号与接口重组键、重叠及冲突边界，IPv4分片重组已启用；原异常不由新诊断通过关闭。
 
-先做能证伪的窄回归，最终一次集中验收；已通过且无相关改动不重跑，不运行iozone/C0–C6
-或不相关存储恢复矩阵。主线分阶段提交，最终单向合入兼容分支；旧glibc使用兼容配置，
+窄回归与最终集中验收已完成；未运行iozone/C0–C6或不相关存储恢复矩阵。
+主线分阶段提交并单向合入兼容分支；旧glibc使用兼容配置，
 main不改uname。一次汇总审查，不push/发布/转换阶段；完整Harness仍缺kernel-la。
 临时输出/抓包/快照只留build，Git保存人类结论与重建命令，不新增平行台账或大型JSON。
 
 ## 后续应用方向
 
-N3完成后由真实应用决定下一项网络、开发工具或交互式shell任务；DNS/TLS须独立核对
+N3后只选择一项真实应用任务，候选是地址/路由与DNS、更大离线C构建或交互式shell；
+先核实具体程序阻塞、范围及代价，再确认路线。DNS/TLS须独立核对
 用户态随机、时间和证书依赖，不把TCP连通写成HTTPS已支持。LoongArch是双架构交付
 的独立依赖，SMP单独处理跨核锁、IPI/TLB和回收，不以追平Linux为前置门槛。
 
@@ -50,6 +52,7 @@ N3完成后由真实应用决定下一项网络、开发工具或交互式shell�
 
 | 阶段/能力 | 事实与证据入口 |
 |---|---|
+| N3网卡与宿主应用 | legacy/modern、零拷贝RX及回退、有界重组、实际双向TCP/HTTP和1196 ABI；性能、原应用与历史风险见[网卡记录](learning/network-ownership.md#真实-virtio-net-与宿主应用交付2026-10-02) |
 | D1–D3/T1/J1/V1纠错 | socket状态/扩容/接收资格、请求内暂存、版本量封口已交付；自动程序＋durable 11.541→5.129/12.108→5.359秒；完整恢复/双盘、1179 ABI及TCP复制限制见[存储](learning/cost-baseline.md#版本量封口与socket纠错对照2026-10-02)与[网络](learning/network-ownership.md#本轮应用结果与剩余复制2026-10-02) |
 | N2a–N2e网络应用 | IPv6双栈、选项、半关闭与生命周期、22项受控原ELF、内容负载和1166 ABI已交付；原iperf连续脚本参考竞态单列，见[网络记录](learning/network-ownership.md#原版网络应用交付2026-10-02) |
 | A＋B缓存与环境 | 已交付缓存命中先于回收、读来源和进展归因、真实日志/RTC/根盘；BusyBox55/55、1118 ABI及结果见[成本基线](learning/cost-baseline.md#缓存查询顺序纠错2026-10-01) |
@@ -77,7 +80,7 @@ glibc四进程整命令仍增加0.73%。剩余prepare读取、1547 FLUSH和前�
 | iperf/netperf | 22项受控原ELF完成；原iperf连续脚本的listener重建竞态在Linux也存在，原脚本结果和受控验收分别报告 |
 | LTP/helper | abort01到chown ENOSYS；cgroup_fj_proc无参数在Linux/BoarOS都等待，不是调度死锁；helper身份由固定上游调用规则确认 |
 | 用户内存/信号 | mremap、按操作madvise、mlock、sigaltstack、实时信号队列、共享文件/PI futex待真实应用需求触发 |
-| 系统与平台 | 固定root查询不等于完整凭据/权限；无完整TTY、真实网卡、SMP/实板、kernel-la，不声明完整Linux兼容或硬实时 |
+| 系统与平台 | 固定root查询不等于完整凭据/权限；无完整TTY、外部IPv6/DNS/TLS、公网配置、SMP/实板、kernel-la，不声明完整Linux兼容或硬实时 |
 
 下面P/N/L小节保留稳定能力编号、契约、依赖和已有验证入口；只以上面的当前队列决定近期实施。
 
@@ -414,7 +417,7 @@ backlog 和期限回收已交付。真实用户态保护用户复制、共享 OF
 
 ### N3 网卡与真实服务
 
-- [ ] VirtIO-net 实际数据路径、ARP/IP 与宿主双向报文，再验证多个连接、异常断连、半关闭、并发请求及停止回收的固定真实服务。
+- [x] VirtIO-net legacy/modern实际数据路径、ARP/IPv4与隔离宿主双向TCP/HTTP；内容、多个连接、半关闭、UDP压力及停止回收已验收，限制见[网卡模块](modules/riscv-virtio-net.md)。
 - [ ] VF2/LS2K 后端分别核对 DMA/cache、MDIO、checksum、IRQ、路由和链路故障；内存 loopback 不算实网卡完成。
 - [ ] DNS/TLS 属于用户态时独立验证其随机、时间、文件/证书和网络依赖；TCP 通不等于 HTTPS 可用。
 
@@ -493,7 +496,7 @@ backlog 和期限回收已交付。真实用户态保护用户复制、共享 OF
 | P3d 恢复 | journal/replay 与持久 orphan 已启用并验收；故障模型、限制和复现命令见 VFS 模块。 |
 | P6 SMP：当前 SIE 串行化，缺远端 TLB 确认 | ① 进程态对象先用粗粒度可睡眠锁、IRQ/队列另设短锁，验证较少但并行有限；② MM/OFD/cache/队列对象锁直接演进，锁顺序/取消成本更高。先盘点消费者和睡眠边界再选，临时启动大锁有退出条件。 |
 | P6g 栈 guard：连续物理栈、canary/高水位 | ① 独立虚拟栈区映射已有页，便于未映射 guard，但需页表与回收接口；② 调整内核现有映射形成受保护栈区域，初始接口可能更少，但别名/大页拆分与 direct-map 消费者成本须实测。先验证真实越界保护范围再选。 |
-| N1 协议栈与分配 owner | 已确认 BoarOS 持有 fd/OFD、ABI、等待与缓冲队列，固定官方 lwIP 2.2.1 raw API/NO_SYS；协议和 pbuf 静态有界池，socket/OFD/请求由 kernel_heap 持有。IPv4/IPv6双栈loopback和socketpair已验收；真实网卡继续N3，命名AF_UNIX按需设计。 |
+| N1 协议栈与分配 owner | 已确认 BoarOS 持有 fd/OFD、ABI、等待与缓冲队列，固定官方 lwIP 2.2.1 raw API/NO_SYS；协议和 pbuf 静态有界池，socket/OFD/请求由 kernel_heap 持有。IPv4/IPv6双栈loopback和socketpair已验收；QEMU VirtIO-net与静态IPv4宿主应用已交付，实板另核对；命名AF_UNIX按需设计。 |
 
 单 hart 已交付 OTHER/FIFO/RR 与全局实时带宽；后续调度改动以公平性/负载和实际消费者证据比较策略。第二架构按连续小里程碑推进；不等待 RV “全部完成”，也不复制整套通用内核。
 

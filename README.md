@@ -25,7 +25,7 @@ BoarOS 是从零搭建、面向 OS Comp 能力建设的 C / 少量汇编内核�
 | 缓存与存储 | read/write/private fault 共用文件页、inode 脏范围与定向写回、OFD 错误观察、`fsync/fdatasync/O_SYNC/O_DSYNC`；VirtIO legacy/modern 多设备独立 IRQ/队列、每实例页缓存/worker、八 span 批量发布与 flush 屏障 | ordered journal/replay、durable commit 与后续 checkpoint、持久 orphan；恢复承诺限于已验证块模型，已接入阈值驱动后台写回与 2%/4% 空闲水位回收，无周期清脏 |
 | 内核日志 | 从启动保存16KiB真实内核日志、完整klogctl 0–10、消费式阻塞读、清空及console级别控制 | 当前不可变root权限模型；用户console输出与日志分离，无/dev/kmsg接口 |
 | 身份与资源 | 单用户 root 的 UID/GID 查询；线程组共享并执行 NOFILE/STACK，fork 继承、exec 保留 | 无凭据变更/完整权限；fd 硬容量 1024、栈硬容量 8 MiB；其他有效 limit 返回 `ENOTSUP` |
-| 平台与网络 | RISC-V QEMU 真实根盘可配置 PID 1（默认 `/init`） 与 musl 用户态；单 hart IPv4/IPv6 UDP/TCP loopback、双栈监听、连接选项、半关闭与向量消息，固定 lwIP 2.2.1 raw API，AF_UNIX socketpair | 无命名 AF_UNIX 端点、真实网卡链路、LoongArch、实板或多核验证 |
+| 平台与网络 | RISC-V QEMU 真实根盘可配置 PID 1（默认 `/init`） 与 musl 用户态；单 hart IPv4/IPv6 UDP/TCP loopback、双栈监听、连接选项、半关闭与向量消息，固定 lwIP 2.2.1 raw API，AF_UNIX socketpair；legacy/modern VirtIO-net、静态 IPv4/ARP、有界分片重组与隔离宿主双向 TCP/HTTP，custom pbuf RX | 无命名 AF_UNIX 端点、外部 IPv6、公网/DHCP/DNS/TLS、LoongArch、实板或多核验证 |
 
 单 hart 存储等待已由运行期 IRQ 唤醒：两个不同文件冷读可同时在途，等待期间计算与无关缓存命中继续执行；OFD、inode、后端事务与退出清理各自保留 owner。八槽乱序完成、flush 屏障和一秒超时 reset 在 legacy/modern、writeback/writethrough 四种组合验收，见[可睡眠存储](docs/learning/sleepable-storage.md)。
 
@@ -106,6 +106,12 @@ S6–S8 存储流水线已落地：有界资源复用、封口与容量等待分
 
 块缓存已修正先回收再查询的命中破坏：生产目标8块不变，八块热工作集宿主预热后800次访问的额外设备读从800降为0。匹配旧/新三个关闭观测启动，自动程序加durable中位改善7.76%/6.99%，四进程普通读Parent改善14.08%/1.20%；glibc四进程整条命令增加0.73%，如实保留。定点读请求下降约68%，日志组/屏障仍510/1547，热读固定工作量0设备请求但存在前台成本；原停止规则不能用来证明调度饥饿，完整分布、资源与观测扰动见[纠错分析](docs/learning/cost-baseline.md#缓存查询顺序纠错2026-10-01)。日志/RTC/根盘真实内容及BusyBox55/55此前已验收，当前ABI累计1179条；完整228项本轮未重跑。后续主线统一见[开发路线](docs/goals.md)，固定吞吐倍数不作为开发准入条件。
 
-原 iperf 3.13、netperf 2.7.0 的两种 libc 共22个受控子项完成实际传输、结果交换和退出，单连接16MiB、五连接各8MiB及UDP一万次请求响应另有内容核对。最终两种libc的代表测量统一在兼容分支，旧glibc结果不代表main版本身份支持。原连续iperf脚本仍有listener重建竞态，不能将受控完成写成原脚本全部通过；netperf原脚本两侧5/5。此前N2关闭观测三次启动的TCP接收吞吐中位为musl单/五连接242/352.6 Mbit/s、glibc261/346.7 Mbit/s；UDP_RR为6443/6612事务每秒。限制、丢包与成本解释见[网络应用结果](docs/learning/network-ownership.md#原版网络应用交付2026-10-02)。下一阶段是VirtIO-net与宿主双向应用，尚未实施。
+原 iperf 3.13、netperf 2.7.0 的两种 libc 共22个受控子项完成实际传输、结果交换和退出，单连接16MiB、五连接各8MiB及UDP一万次请求响应另有内容核对。最终两种libc的代表测量统一在兼容分支，旧glibc结果不代表main版本身份支持。原连续iperf脚本仍有listener重建竞态，不能将受控完成写成原脚本全部通过；netperf原脚本两侧5/5。此前N2关闭观测三次启动的TCP接收吞吐中位为musl单/五连接242/352.6 Mbit/s、glibc261/346.7 Mbit/s；UDP_RR为6443/6612事务每秒。限制、丢包与成本解释见[网络应用结果](docs/learning/network-ownership.md#原版网络应用交付2026-10-02)。该段是N2 loopback测量；本轮真实网卡结果见下。
 
-2026-10-02纠错轮已交付未连接TCP/零长度recv、UNIX数据报半关闭、接收扩容通知和活动reservation的终止事件等待；流发送复用同请求暂存尾部。journal取消64次操作软封口，保留版本量/首脏期限、同步和恢复协议。关闭观测三次启动，自动iozone程序加durable中位musl11.541→5.129秒、glibc12.108→5.359秒；四进程所选两组改善约8%–11%，最终卸载余量约0.04秒。单TCP仅249→250、268→274Mbit/s，非阻塞跨调用复制放大仍在，不能称为主要网络瓶颈已解决。完整lwext4/SQLite恢复与双盘、1179 ABI、相关系统回归已验收；旧对照中的两项未定位fatal/队列异常仍保留风险。结果、边界和重建见[本轮存储](docs/learning/cost-baseline.md#版本量封口与socket纠错对照2026-10-02)与[网络](docs/learning/network-ownership.md#本轮应用结果与剩余复制2026-10-02)。下一主线固定为N3真实网卡和隔离宿主双向TCP/HTTP，不等待I/O接近Linux。
+2026-10-02纠错轮已交付未连接TCP/零长度recv、UNIX数据报半关闭、接收扩容通知和活动reservation的终止事件等待；流发送复用同请求暂存尾部。journal取消64次操作软封口，保留版本量/首脏期限、同步和恢复协议。关闭观测三次启动，自动iozone程序加durable中位musl11.541→5.129秒、glibc12.108→5.359秒；四进程所选两组改善约8%–11%，最终卸载余量约0.04秒。单TCP仅249→250、268→274Mbit/s，非阻塞跨调用复制放大仍在，不能称为主要网络瓶颈已解决。完整lwext4/SQLite恢复与双盘、1179 ABI、相关系统回归已验收；旧对照中的两项未定位fatal/队列异常仍保留风险。结果、边界和重建见[本轮存储](docs/learning/cost-baseline.md#版本量封口与socket纠错对照2026-10-02)与[网络](docs/learning/network-ownership.md#本轮应用结果与剩余复制2026-10-02)。这段保留上一轮的机制与测量，不作为当前网卡能力的状态。
+
+2026-10-02已交付N3：DTB发现的VirtIO-net legacy/modern、静态eth0、ARP及有界IPv4重组，IRQ收割、worker每批八帧。RX直接引用DMA至最后pbuf释放，最多32借用并有界回退；TX仍复制。原BusyBox wget/httpd在main/musl与兼容glibc的两种transport完成双向16MiB GET、16MiB CGI上传和4KiB文本POST。完整RV64、真实libc、1196 ABI、scale和栈，以及22项loopback已验收。
+
+modern关闭观测三次启动，固定内容的单/五TCP双向总量效率中位297/285Mbit/s，匹配Linux1171/1107；完整程序12.151秒，退出后到根卸载关机另约2.035秒。两项计时不能混称为纯网络或checkpoint耗时。仍有复制、协议和应用固定成本，不设置倍数门槛；两项历史异常未定位，公网、DNS/TLS和外部IPv6未交付。
+
+接口与owner见[网卡模块](docs/modules/riscv-virtio-net.md)，内容、分布和剩余成本见[真实网卡记录](docs/learning/network-ownership.md#真实-virtio-net-与宿主应用交付2026-10-02)。下一应用由真实需求选择，现有路线只保留一项待选应用与证据触发的性能候选。
