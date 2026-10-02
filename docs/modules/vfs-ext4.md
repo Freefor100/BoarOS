@@ -263,3 +263,8 @@ proc mounts 保留用户给出的磁盘来源名，并正确标识 tmpfs。
 字符串在mount adapter内由mount持有，不借用启动栈；卸载清空来源指针后释放adapter。
 动态挂载仍由自己的source owner管理。公共程序镜像创建相应块节点，proc mount快照
 沿现有转义规则输出，原df根盘行与statfs容量/空闲/类型另做内容核对。
+
+COST构建在成功freeze处记录封口条件，并在挂载点wait记录sealed/durable/checkpoint
+经过时间；失败freeze不增加成功原因。普通构建不增加这些观测，原因可重叠且等待
+不能跨任务相加。当前策略对照先保留64次操作条件，再按本轮路线取消；最终政策及
+真实结果在本轮收口更新。诊断契约见[成本模块](kernel-cost.md)。

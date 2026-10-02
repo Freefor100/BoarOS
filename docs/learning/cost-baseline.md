@@ -356,3 +356,14 @@ python3 -B tests/cost-riscv.py --case consumer --consumer-commands musl:0,musl:1
 固定依据是本地 Linux 的 ext4 journal/fsync 路径、QEMU v11.1.0 的 writeback/flush 实现
 及 iozone 3.506 原源码，具体路径见参考清单与模块索引。
 文档整理不表示又运行了一轮实验。
+
+## 版本量封口与socket纠错对照（2026-10-02）
+
+本轮固定宿主ext4、modern/writeback、512MiB和单hart，journal和必要FLUSH保留。
+对照仅选自动模式、四进程(0,1)及(6,7)，不是八组完整评分。程序、应用durable收尾
+和根卸载checkpoint余量分别记录。新增原因和等待指标用于解释批次，完整收益在
+候选关闭观测的三个启动后填写，当前不预先宣称完成。
+
+诊断追加八个聚合项，当前实际storage_bytes=64794、task_bytes=64；既有host契约和
+18项解析验证通过。等待ticks是经过时间；后台和前台累计值、嵌套等待不能相加当
+端到端时间。成功封口条件可能重叠，不能把其和当作组数。

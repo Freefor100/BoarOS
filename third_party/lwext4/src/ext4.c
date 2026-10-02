@@ -822,6 +822,37 @@ static bool ext4_group_due(struct ext4_mountpoint *mp, bool force)
 }
 
 __unused
+static int ext4_group_freeze(struct ext4_mountpoint *mp, bool force)
+{
+#if BOAROS_COST_DIAGNOSTICS
+    struct jbd_journal *journal = mp->fs.jbd_journal;
+    struct jbd_trans *running = journal->running;
+    unsigned blocks = running->data_cnt;
+    struct jbd_data *data;
+    TAILQ_FOREACH(data, &running->data_queue, node) blocks++;
+    uint64_t now = mp->journal_runtime.now_ns(mp->journal_runtime.context);
+    bool operations = running->operations >= 64;
+    bool bytes = (uint64_t)blocks * journal->block_size >= 256 * 1024;
+    bool age = now >= running->first_dirty_ns && now - running->first_dirty_ns >= 100000000;
+    bool target = journal->seal_target >= running->sequence;
+#endif
+    int result = jbd_journal_freeze(mp->fs.jbd_journal);
+#if BOAROS_COST_DIAGNOSTICS
+    /* 只记成功封口；条件可重叠，不能相加推导提交组数。 */
+    if (result == EOK) {
+        if (operations) COST_ADD(JOURNAL_SEAL_OPERATIONS, 1);
+        if (bytes) COST_ADD(JOURNAL_SEAL_BYTES, 1);
+        if (age) COST_ADD(JOURNAL_SEAL_AGE, 1);
+        if (target) COST_ADD(JOURNAL_SEAL_TARGET, 1);
+        if (force) COST_ADD(JOURNAL_SEAL_FORCE, 1);
+    }
+#else
+    (void)force;
+#endif
+    return result;
+}
+
+__unused
 static int ext4_group_wait(struct ext4_mountpoint *mp, uint64_t target, enum ext4_journal_wait kind)
 {
 	struct jbd_journal *journal = mp->fs.jbd_journal;
@@ -881,7 +912,7 @@ static int __ext4_trans_start(struct ext4_mountpoint *mp)
 			int r = EOK;
 			if (ext4_group_due(mp, false)) {
 				uint64_t target = journal->running->sequence;
-				r = jbd_journal_freeze(journal);
+				r = ext4_group_freeze(mp, false);
 				if (r == EAGAIN) r = ext4_group_wait(mp, target, EXT4_JOURNAL_WAIT_SEALED);
 				if (r != EOK) return r;
 				if (mp->journal_runtime.request) mp->journal_runtime.request(mp->journal_runtime.context);
@@ -1022,7 +1053,7 @@ int ext4_journal_group_service(const char *mount_point, bool force)
 	int r = !journal || !journal->grouped ? EINVAL : journal->error;
 	if (r == EOK && (mp->transaction_depth || journal->committing || journal->checkpointing)) r = EBUSY;
 	if (r == EOK && ext4_group_due(mp, force)) {
-		r = jbd_journal_freeze(journal);
+		r = ext4_group_freeze(mp, force);
 		if (r == EAGAIN) r = EOK; /* 已有提交 owner，先让队首进展。 */
 	}
 	bool selected = r == EOK && jbd_journal_select(journal);

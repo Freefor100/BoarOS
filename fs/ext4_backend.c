@@ -566,6 +566,11 @@ static uint64_t journal_reached(const struct jbd_journal *journal, enum ext4_jou
 
 static int journal_wait(void *context, uint64_t sequence, enum ext4_journal_wait kind)
 {
+#if BOAROS_COST_DIAGNOSTICS
+    struct kernel_cost_scope elapsed __attribute__((cleanup(kernel_cost_leave))) = kernel_cost_enter(
+        kind == EXT4_JOURNAL_WAIT_SEALED ? COST_JOURNAL_WAIT_SEALED_TICKS :
+        kind == EXT4_JOURNAL_WAIT_DURABLE ? COST_JOURNAL_WAIT_DURABLE_TICKS : COST_JOURNAL_WAIT_CHECKPOINT_TICKS);
+#endif
     if (kind == EXT4_JOURNAL_WAIT_SEALED) { COST_ADD(JOURNAL_WAIT_SEALED, 1); }
     else if (kind == EXT4_JOURNAL_WAIT_DURABLE) { COST_ADD(JOURNAL_WAIT_DURABLE, 1); }
     else { COST_ADD(JOURNAL_WAIT_CHECKPOINT, 1); }
