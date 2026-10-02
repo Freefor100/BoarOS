@@ -141,3 +141,9 @@ UNIX DGRAM自身SHUT_RD后，即使空队列也有IN/RDNORM和RDHUP；双向关�
 活动read reservation仍排除第二个数据消费者，方向事件不提前解除reservation。
 真实U-mode反例核对poll/select/epoll、dup共享方向和关闭前排队内容，固定Linux通过、
 旧BoarOS空队列poll漏事件；修复后通过。依据为固定Linux的`net/unix/af_unix.c`。
+
+扩大实际SO_RCVBUF预算会在单hart保护区内通知UNIX对端；STREAM和DGRAM发送者
+醒来后仍重查容量、关闭和错误，不延长peer引用。相同/缩小预算不通知对端。
+独立U-mode预算入口：`python3 -B tests/network-riscv.py --only boaros --workload budget`。
+该测试先握手并从proc确认发送者已阻塞，再核对扩容、缩容、对端关闭、SIGKILL和内容。
+它保护BoarOS的接收端字节预算，不把Linux的SO_RCVBUF当成相同排队模型。

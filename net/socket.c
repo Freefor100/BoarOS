@@ -1427,7 +1427,13 @@ int kernel_socket_set_option(struct kernel_socket *socket,
         limit *= 2;
         if (limit < minimum) limit = minimum;
         if (option == KERNEL_SOCKET_SNDBUF) socket->tx_limit = limit;
-        else socket->rx_limit = limit;
+        else {
+            uint32_t previous = socket->rx_limit;
+            socket->rx_limit = limit;
+            /* UNIX发送者等待对端预算；peer仅在当前保护区内借用。 */
+            if (limit > previous && socket->domain == KERNEL_SOCKET_DOMAIN_UNIX && socket->peer != 0)
+                wake_socket(socket->peer);
+        }
         wake_socket(socket);
         break;
     }

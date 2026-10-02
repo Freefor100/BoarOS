@@ -179,3 +179,8 @@ VirtIO-net与宿主双向应用是下一阶段；命名UNIX、SCM_RIGHTS、TCP_I
 UNIX数据报半关闭不是队列中存在数据才可读：SHUT_RD后空接收立即EOF，因此等待接口
 也必须报告可读，同时给出RDHUP；SHUT_RDWR另报告HUP。修复保留已排队内容和活动
 reservation，原反例在旧内核漏掉空队列事件，固定Linux及修复后BoarOS均通过。
+
+预算等待必须通知真正的等待队列。UNIX发送者睡在自己的socket上，消费接收内容时
+已有peer通知，但扩大接收预算过去只唤醒接收者。反例确认孩子已进入S状态，扩容
+后旧实现仍无进展；修复后STREAM/DGRAM均完成。重复设置、缩容、关闭和取消也
+核对，结束heap回到零。等待确认采用握手与proc状态，不用sleep猜测发送是否开始。
