@@ -83,3 +83,15 @@ BoarOS 内核 SHA-256 `1a0dc5b9dc338e01d9fc7b10c689edaaa761f75952bc8fce90f2f4a4c
 避免把libc内部转换时的用户fault误当成内核errno。
 依据是references/linux/fs/open.c与fs/pipe.c，固定Linux v7.2；重建入口
 为make test-fifo-riscv，已有文件聚焦回归通过。本段不宣称命名FIFO或Lua工程完成。
+
+## 命名FIFO与默认jobserver（2026-10-03）
+
+固定Linux的fs/pipe.c使用读写到达计数处理打开会合。仅看当前人数会漏掉“对端已出现又
+立即关闭”，使打开者再次睡眠。BoarOS采用同样的代次边界；数据和等待队列仍归pipe，
+身份与时间归真实inode。弱关联避免节点与pipe互相持引用，打开中也必须有独立owner。
+
+同ELF先在旧BoarOS以mkfifo ENOTSUP失败；修复后ext4/tmpfs的身份隔离、HUP、
+信号重启/取消、fd满和最终清理成立。只读挂载仍可传输，Linux的file_update_time在
+无法取得挂载写资格时跳过时间更新；不能把普通文件的EROFS直接套到FIFO传输。
+节点同步后重启仍是FIFO，旧pipe内容不恢复。对象与连续缓冲OOM均验证失败后可重试。
+依据为references/linux/fs/{pipe,inode}.c，固定Linux v7.2；重建`make test-fifo-riscv`。

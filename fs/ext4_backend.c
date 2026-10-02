@@ -1559,7 +1559,8 @@ static int ext4_backend_mknod(struct kernel_vfs_instance *instance, const char *
     BACKEND_PATH(adapter, path);
     int status = ext4_transaction_begin(adapter->mount_point);
     if (status == EOK) {
-        if (type == KERNEL_VFS_S_IFCHR) status = ext4_mknod(path, EXT4_DE_CHRDEV, device);
+        if (type == KERNEL_VFS_S_IFIFO) status = ext4_mknod(path, EXT4_DE_FIFO, 0);
+        else if (type == KERNEL_VFS_S_IFCHR) status = ext4_mknod(path, EXT4_DE_CHRDEV, device);
         else if (type == KERNEL_VFS_S_IFBLK) status = ext4_mknod(path, EXT4_DE_BLKDEV, device);
         else {
             ext4_file file;

@@ -1438,10 +1438,10 @@ int kernel_vfs_mknod_at(struct kernel_vfs_path *start,
         return -KERNEL_EINVAL;
     uint32_t type = mode & KERNEL_VFS_S_IFMT;
     if (type == KERNEL_VFS_S_IFDIR) return -KERNEL_EPERM;
-    if (type == KERNEL_VFS_S_IFIFO || type == KERNEL_VFS_S_IFSOCK)
+    if (type == KERNEL_VFS_S_IFSOCK)
         return -KERNEL_ENOTSUP;
     if (type != 0 && type != KERNEL_VFS_S_IFREG && type != KERNEL_VFS_S_IFCHR &&
-        type != KERNEL_VFS_S_IFBLK)
+        type != KERNEL_VFS_S_IFBLK && type != KERNEL_VFS_S_IFIFO)
         return -KERNEL_EINVAL;
     if (!type) type = KERNEL_VFS_S_IFREG;
     KERNEL_LOCK_SCOPE(namespace_guard);
@@ -1854,7 +1854,7 @@ int kernel_vfs_node_release(struct kernel_vfs_node **owner)
         return 0;
     }
     if (node->references == 1U) {
-        if (node->mappings != 0) __builtin_trap();
+        if (node->mappings != 0 || node->fifo_pipe) __builtin_trap();
         if (!kernel_record_lock_state_empty(&node->record_locks))
             __builtin_trap();
         node->references = 0U;

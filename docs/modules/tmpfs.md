@@ -68,3 +68,7 @@ make test-busybox-tmpfs-riscv
 `mm/memory.c: fault_dirty_shared_page`、`mm/vma.c: vma_wants_writenotify`
 及 shmem 无 page_mkwrite 回调相符，不能为测试强制所有 tmpfs 首写陷入。
 时间更新在成功发布后以单 hart IRQ 临界区完成，不升级 fault 持有的 inode 读锁。
+
+命名FIFO使用真实tmpfs inode与目录项，但不创建稀疏文件数据对象；打开才取得活动pipe。
+inode配额和只读创建检查与普通节点一致，传输不计入文件数据容量。打开/关闭及弱关联
+契约见[文件模块](kernel-files.md#命名-fifo)，同ELF验证入口为`make test-fifo-riscv`。

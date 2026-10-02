@@ -413,6 +413,8 @@ static enum kernel_files_status read_pinned(
         if (pipe_status != KERNEL_PIPE_STATUS_OK) {
             return KERNEL_FILES_STATUS_STATE;
         }
+        if (*linux_result > 0 && description->file.private_data)
+            kernel_vfs_file_accessed(&description->file);
         if (*linux_result >= 0) {
             files->record->statistics.bytes_read += (uint64_t)*linux_result;
         } else {
@@ -917,6 +919,11 @@ static int64_t sendfile_output(struct kernel_open_file_description **output_owne
         if (kernel_pipe_write_buffer(output->pipe, buffer, size,
                 output->open_flags, &result) != KERNEL_PIPE_STATUS_OK)
             __builtin_trap();
+        if (result > 0 && output->file.private_data &&
+            !kernel_vfs_mount_is_readonly(output->file.mount)) {
+            int error = kernel_vfs_file_modified(&output->file, 0, 0);
+            if (error) return error;
+        }
         return result;
     }
     if (kind == KERNEL_OPEN_FILE_KIND_SOCKET) {
@@ -1158,10 +1165,15 @@ static enum kernel_files_status buffered_write_request(
         return KERNEL_FILES_STATUS_OK;
     }
     if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_PIPE) {
-        return kernel_pipe_writev(description->pipe, mm, iov, iov_count,
-                                   count, description->open_flags, linux_result)
-                       == KERNEL_PIPE_STATUS_OK
-                   ? KERNEL_FILES_STATUS_OK : KERNEL_FILES_STATUS_STATE;
+        if (kernel_pipe_writev(description->pipe, mm, iov, iov_count,
+                count, description->open_flags, linux_result) != KERNEL_PIPE_STATUS_OK)
+            return KERNEL_FILES_STATUS_STATE;
+        if (*linux_result > 0 && description->file.private_data &&
+            !kernel_vfs_mount_is_readonly(description->file.mount)) {
+            int error = kernel_vfs_file_modified(&description->file, 0, 0);
+            if (error) *linux_result = error;
+        }
+        return KERNEL_FILES_STATUS_OK;
     }
     if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_SOCKET) {
         struct kernel_socket *socket = kernel_open_file_socket(description);

@@ -91,7 +91,7 @@ void abi_mode_cases(void)
     abi_record("mode.umask-shared-fs", SC1(166, previous), -1, -1,
                status, 0, 0);
 
-    int32_t pipefd[2];
+    int pipefd[2];
     abi_require(SC2(59, pipefd, 0) == 0);
     struct abi_stat reader, writer;
     result = SC2(52, pipefd[0], 0640);
@@ -103,4 +103,21 @@ void abi_mode_cases(void)
     abi_record("pipe.mode-type-preserved", result, reader.mode, -1, 0, 0, 0);
     abi_record("pipe.stat-fault", SC2(80, pipefd[0], 1), -1, -1, 0, 0, 0);
     abi_require(SC1(57, pipefd[0]) == 0 && SC1(57, pipefd[1]) == 0);
+    abi_record("fifo.create", SC4(33, -100, "/abi-fifo", 0010640, 0), -1, -1, 0, 0, 0);
+    abi_record("fifo.create-existing", SC4(33, -100, "/abi-fifo", 0010600, 0), -1, -1, 0, 0, 0);
+    abi_record("fifo.nonblock-writer", abi_open("/abi-fifo", 1 | 04000), -1, -1, 0, 0, 0);
+    long fifo = abi_open("/abi-fifo", 0 | 04000);
+    abi_require(fifo >= 0);
+    abi_require(SC2(80, fifo, &reader) == 0);
+    abi_record("fifo.stat", 0, reader.mode, reader.size, 0, 0, 0);
+    abi_record("fifo.empty-read", SC3(63, fifo, &status, 1), -1, -1, 0, 0, 0);
+    abi_record("fifo.seek", SC3(62, fifo, 0, 0), -1, -1, 0, 0, 0);
+    abi_record("fifo.sync", SC1(82, fifo), -1, -1, 0, 0, 0);
+    abi_require(SC1(57, fifo) == 0);
+    fifo = abi_open("/abi-fifo", 2 | 04000);
+    abi_require(fifo >= 0);
+    abi_record("fifo.rdwr-empty", SC3(63, fifo, &status, 1), -1, -1, 0, 0, 0);
+    abi_require(SC1(57, fifo) == 0);
+    abi_require(SC3(35, -100, "/abi-fifo", 0) == 0);
+
 }

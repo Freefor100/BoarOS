@@ -62,6 +62,17 @@ mode.fchmod-reset
 mode.fchmod-unlinked
 mode.umask-fork
 mode.umask-shared-fs
+pipe.mode-shared
+pipe.mode-type-preserved
+pipe.stat-fault
+fifo.create
+fifo.create-existing
+fifo.nonblock-writer
+fifo.stat
+fifo.empty-read
+fifo.seek
+fifo.sync
+fifo.rdwr-empty
 socket.if.address
 socket.if.netmask
 socket.if.hardware
@@ -1203,6 +1214,3 @@ rtc.fault
 rtc.unknown
 rtc.dup_exclusive
 rtc.reopen
-pipe.mode-shared
-pipe.mode-type-preserved
-pipe.stat-fault

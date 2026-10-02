@@ -33,7 +33,7 @@ N3已经交付：legacy/modern VirtIO-net、受限DMA借用与复制回退、静
 |---|---|
 | A 基线与有限审计 | [x] 最新main已单向合入兼容分支；原旧glibc BASIC_TCP完成wait=0、无超时和最终清理。journal进度受后端锁保护，网络/回收worker在既定IRQ区处理共享状态；未发现新的确定性违例，不将有限核对写成全内核证明。 |
 | B 匿名管道元数据 | [x] mode、身份与时间归共享pipe，fchmod/fstat及两端、dup/fork/proc重开一致；先同ELF证伪旧行为。 |
-| C 命名FIFO | [ ] ext4/tmpfs节点、按inode关联的活动pipe、打开会合/代次、非阻塞、信号、就绪、双owner与最后回收；节点可持久化，传输内容不持久化。 |
+| C 命名FIFO | [x] ext4/tmpfs节点、按inode关联的活动pipe、打开会合/代次、非阻塞、信号、就绪、双owner与最后回收；节点可持久化，传输内容不持久化。 |
 | D 原版工程 | [ ] make默认FIFO jobserver，Lua/luac/liblua.a及嵌入/动态模块；干净、无变化、增量、clean、语法错误、恢复、-j2与中断清理。 |
 | E 成本与收口 | [ ] 正式ext4三副本、tmpfs定点对照、一次COST归因；分别记录程序完成、同步与最终卸载，集中相关系统验收和文档检查。 |
 
@@ -161,7 +161,7 @@ glibc四进程整命令仍增加0.73%。该轮的prepare读取、1547次FLUSH和
 
 ### P1h 虚拟文件系统与多挂载
 
-- [x] main 已补普通文件/字符节点 mknodat，复用 null/zero/console；块节点已供设备识别和 ext4 挂载使用；裸块 I/O、devfs 和 FIFO 后端仍未交付。见[节点创建](modules/kernel-files.md#节点创建)。
+- [x] main 已补普通文件/字符节点 mknodat，复用 null/zero/console；块节点已供设备识别和 ext4 挂载使用；FIFO已接入ext4/tmpfs；裸块I/O和devfs仍未交付。见[节点创建](modules/kernel-files.md#节点创建)。
 
 - [x] 通用后端、mount/path 生命周期、null/zero/console 设备后端与首批真实 procfs 已分阶段交付；内部覆盖挂载遮蔽、根和 `..`、忙卸载及引用回收，真实第二盘及 tmpfs 的组合验证见本阶段 learning。
 - [x] tmpfs 与真实第二 ext4 挂载具备独立路径身份；内存文件有真实后备对象/目录生命周期、配额耗尽、截断及最后引用回收；不宣称持久化或共享文件 futex。

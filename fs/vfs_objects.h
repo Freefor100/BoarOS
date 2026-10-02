@@ -29,6 +29,7 @@ struct kernel_vfs_instance {
 };
 
 struct kernel_vfs_node {
+    struct kernel_pipe *fifo_pipe;
     struct kernel_vfs_node *next;
     struct kernel_page_cache_entry *cache_pages;
     struct kernel_memory_object *memory;

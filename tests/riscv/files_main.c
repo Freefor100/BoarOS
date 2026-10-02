@@ -21,6 +21,8 @@
 
 #include "../../fs/files/private.h"
 #include "../../fs/open_file_internal.h"
+#include "../../fs/pipe_internal.h"
+#include "../../fs/vfs_objects.h"
 #include "../../fs/vfs_internal.h"
 #ifdef FILES_PARTIAL_WRITE_TEST
 #include "../../fs/vfs_internal.h"
@@ -114,6 +116,16 @@ enum physical_page_status __wrap_physical_page_allocate(
     if (fail_physical_allocation && --fail_physical_allocation == 0)
         return PHYSICAL_PAGE_STATUS_EMPTY;
     return __real_physical_page_allocate(allocator, out);
+}
+
+static int fail_fifo_backing;
+enum physical_page_status __real_physical_page_allocate_order(
+    struct physical_page_allocator *, uint32_t, uint64_t *);
+enum physical_page_status __wrap_physical_page_allocate_order(
+    struct physical_page_allocator *allocator, uint32_t order, uint64_t *out)
+{
+    if (fail_fifo_backing) { fail_fifo_backing = 0; return PHYSICAL_PAGE_STATUS_EMPTY; }
+    return __real_physical_page_allocate_order(allocator, order, out);
 }
 
 static unsigned fail_metadata_allocation;
@@ -2557,6 +2569,37 @@ static void run_dup_fcntl_operations(struct kernel_files *files,
     }
 }
 
+static void run_fifo_allocation_failure(struct kernel_heap *heap)
+{
+    struct kernel_vfs_mount *mount = 0;
+    struct kernel_vfs_path *root = 0;
+    struct kernel_open_file_description *file = 0;
+    if (kernel_tmpfs_create(heap, 0, 0, &mount) || kernel_vfs_path_root(mount, heap, &root) ||
+        kernel_vfs_mknod_at(root, root, "/fifo", KERNEL_VFS_S_IFIFO | 0600, 0))
+        fail_files(600U, 0, -1);
+    int result;
+    if (kernel_open_file_create_at(heap, root, root, "/fifo", KERNEL_OPEN_PATH_FOLLOW, 0,
+            &file, &result) != KERNEL_OPEN_FILE_STATUS_OK || result)
+        fail_files(601U, 0, result);
+    struct kernel_vfs_node *node = file->file.private_data;
+    for (unsigned failure = 0; failure < 2; failure++) {
+        struct kernel_pipe *pipe = 0;
+        uint8_t endpoint; uint64_t observed;
+        if (failure) fail_fifo_backing = 1;
+        else fail_metadata_allocation = 1;
+        result = kernel_pipe_fifo_open(heap, node, 2U, &pipe, &endpoint, &observed);
+        fail_metadata_allocation = 0; fail_fifo_backing = 0;
+        if (result != -KERNEL_ENOMEM || pipe || node->fifo_pipe)
+            fail_files(602U, -KERNEL_ENOMEM, result);
+        if (kernel_pipe_fifo_open(heap, node, 2U, &pipe, &endpoint, &observed) ||
+            kernel_pipe_release_endpoint(pipe, endpoint) != KERNEL_PIPE_STATUS_OK || node->fifo_pipe)
+            fail_files(603U, 0, -1);
+    }
+    if (kernel_open_file_release(&file) != KERNEL_OPEN_FILE_STATUS_OK ||
+        kernel_vfs_path_release(&root) || kernel_vfs_unmount(mount))
+        fail_files(604U, 0, -1);
+}
+
 static void run_pipe_operations(struct kernel_files *files,
                                 const struct kernel_fs_context *fs,
                                 struct kernel_mm *mm)
@@ -2567,6 +2610,7 @@ static void run_pipe_operations(struct kernel_files *files,
     int64_t result = INT64_MIN;
     uint32_t index;
 
+    run_fifo_allocation_failure(files->heap);
     /* When only fd 31 is free, growing the table must allocate a distinct
      * second descriptor from the new slots. */
     for (index = 0U; index < 31U; index++) {

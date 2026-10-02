@@ -572,6 +572,8 @@ enum kernel_open_file_status kernel_open_file_release(
                 file->pipe_endpoint_closed = 1U;
                 file->pipe = 0;
             }
+            if (file->file.private_data && kernel_vfs_close(&file->file))
+                return KERNEL_OPEN_FILE_STATUS_CLEANUP_REQUIRED;
             file->vfs_closed = 1U;
         } else if (file->kind == KERNEL_OPEN_FILE_KIND_EPOLL) {
             if (file->epoll != 0) {
@@ -904,7 +906,7 @@ uint32_t kernel_open_file_poll(
     if (file->device) return file->device->poll(requested_events, out_queue);
     switch (file->kind) {
     case KERNEL_OPEN_FILE_KIND_PIPE:
-        return kernel_pipe_poll(file->pipe, file->pipe_endpoint, out_queue);
+        return kernel_pipe_poll(file->pipe, file->pipe_endpoint, file->pipe_observed_writers, out_queue);
     case KERNEL_OPEN_FILE_KIND_REGULAR:
     case KERNEL_OPEN_FILE_KIND_GENERATED:
     case KERNEL_OPEN_FILE_KIND_DIRECTORY:

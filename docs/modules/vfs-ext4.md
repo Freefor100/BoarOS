@@ -200,7 +200,7 @@ make test-root-init-riscv
 
 验证入口：`make test-io-sleep-riscv test-files-riscv test-files-partial-write-riscv test-lwext4-recovery-host`。设备握手、同页合并、快照、并发插入缓存页、最后 close/写回及完整恢复的证据见[可睡眠存储](../learning/sleepable-storage.md)。
 
-`kernel_vfs_mknod_at` 在 namespace 锁内定位未存在的末级名字，普通文件或字符设备
+`kernel_vfs_mknod_at` 在 namespace 锁内定位未存在的末级名字，普通文件、字符/块设备及FIFO
 创建与 mode 设置放在同一个 lwext4 写事务内。失败回滚由原 mount/日志 owner 处理；
 该入口不实现 devfs，不增加新的设备后端。只读根返回 EROFS，创建不占用进程 fd。
 
@@ -277,3 +277,11 @@ FLUSH1547→677，但准备读取和前台固定工作仍在；完整分布、�
 年龄在100ms触发，48/96页独立内容在固定时钟下触发版本量边界并校验内容。
 真正sealed FIFO满、预算与近满盘复用等待继续保护；后操作OOM、旧冻结版本、
 环绕、commit后checkpoint前恢复和WRITE/FLUSH失败通过`make test-lwext4-group-host`。
+
+## FIFO 节点与传输 owner
+
+mknodat的FIFO使用lwext4已有EXT4_DE_FIFO格式，不改变日志、写回或持久化顺序。
+VFS node按mount/inode共享，fifo_pipe是短IRQ区保护的弱关联；候选缓冲在发布前准备，
+重查并复用竞争者已发布的pipe。打开会合不持VFS锁睡眠，节点引用保持到端点释放后。
+类型/umask、目录项、hardlink/rename/unlink及重启见`make test-fifo-riscv`；
+相关创建/元数据入口由`make test-lwext4-metadata-host`覆盖。
