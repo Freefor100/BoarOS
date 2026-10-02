@@ -124,6 +124,8 @@ enum riscv_root_boot_status riscv_root_boot_cleanup(
     }
     if (riscv_virtio_mmio_rng_stop(&root->rng))
         return RISCV_ROOT_BOOT_STATUS_CLEANUP;
+    if (kernel_network_stop(&root->network))
+        return RISCV_ROOT_BOOT_STATUS_CLEANUP;
     if ((root->cleanup_files.state == KERNEL_FILES_LIVE ||
          root->cleanup_files.state == KERNEL_FILES_CLEANUP) &&
         kernel_files_release(&root->cleanup_files) !=
@@ -527,6 +529,12 @@ enum riscv_root_boot_status riscv_root_boot_finish(
     }
     root->finish_failure = RISCV_ROOT_FINISH_NONE;
     root->finish_error = 0;
+    error = kernel_network_stop(&root->network);
+    if (error) {
+        root->finish_failure = RISCV_ROOT_FINISH_NETWORK;
+        root->finish_error = error;
+        return RISCV_ROOT_BOOT_STATUS_CLEANUP;
+    }
     error = riscv_virtio_mmio_rng_stop(&root->rng);
     if (error) {
         root->finish_failure = RISCV_ROOT_FINISH_RNG;

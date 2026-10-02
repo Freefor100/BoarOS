@@ -87,6 +87,52 @@ static long enable_loopback(long fd)
     return SC3(29, fd, LINUX_SIOCSIFFLAGS, &interface);
 }
 
+/* Interface values are public Linux ABI, not lwIP layout. */
+static void interface_cases(void)
+{
+    long fd = SC3(198, LINUX_AF_INET, LINUX_SOCK_DGRAM, 0);
+    abi_require(fd >= 0 && enable_loopback(fd) == 0);
+    static const unsigned requests[] = {0x8915, 0x891b, 0x8927, 0x8921, 0x8933};
+    static const char *names[] = {"socket.if.address", "socket.if.netmask", "socket.if.hardware", "socket.if.mtu", "socket.if.index"};
+    int index = 0;
+    for (unsigned i = 0; i < 5; ++i) {
+        struct socket_ifreq req = {.name = "lo"};
+        long result = SC3(29, fd, requests[i], &req);
+        abi_record(names[i], result, -1, -1, 0, &req.flags, 24);
+        if (i == 4) __builtin_memcpy(&index, &req.flags, sizeof(index));
+    }
+    struct socket_ifreq req = {0};
+    __builtin_memcpy(&req.flags, &index, sizeof(index));
+    long result = SC3(29, fd, 0x8910, &req);
+    abi_record("socket.if.name", result, -1, -1, 0, req.name, 3);
+    index = -1; __builtin_memcpy(&req.flags, &index, sizeof(index));
+    record("socket.if.name-bad-index", SC3(29, fd, 0x8910, &req));
+    req = (struct socket_ifreq){.name = "absent"};
+    record("socket.if.absent", SC3(29, fd, 0x8915, &req));
+    req = (struct socket_ifreq){.name = "lo:999"};
+    record("socket.if.absent-alias", SC3(29, fd, 0x8915, &req));
+    record("socket.if.pointer", SC3(29, fd, 0x8915, 1));
+    record("socket.if.bad-fd-pointer", SC3(29, -1, 0x8915, 1));
+    struct { int32_t size, pad; void *data; } conf = {0};
+    result = SC3(29, fd, 0x8912, &conf);
+    abi_record("socket.ifconf.size", result, conf.size, -1, 0, 0, 0);
+    struct socket_ifreq record_buffer = {0};
+    conf.size = 39; conf.data = &record_buffer;
+    result = SC3(29, fd, 0x8912, &conf);
+    abi_record("socket.ifconf.short", result, conf.size, -1, 0, 0, 0);
+    conf.size = 40;
+    result = SC3(29, fd, 0x8912, &conf);
+    abi_record("socket.ifconf.record", result, conf.size, -1, 0, &record_buffer, 40);
+    conf.size = -1;
+    result = SC3(29, fd, 0x8912, &conf);
+    abi_record("socket.ifconf.negative", result, conf.size, -1, 0, 0, 0);
+    conf.size = 40; conf.data = (void *)1;
+    result = SC3(29, fd, 0x8912, &conf);
+    abi_record("socket.ifconf.buffer-fault", result, conf.size, -1, 0, 0, 0);
+    record("socket.ifconf.pointer", SC3(29, fd, 0x8912, 1));
+    close_socket(fd);
+}
+
 /* Internal staging must not truncate a datagram. A following marker also
  * proves that a short receive consumes exactly one packet. */
 static void udp_scale_cases(void)
@@ -396,6 +442,7 @@ static void fresh_tcp_cases(void)
 
 void abi_socket_cases(void)
 {
+    interface_cases();
     udp_scale_cases();
     udp_large_fault_cases();
     tcp_scale_cases();

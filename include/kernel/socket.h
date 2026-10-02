@@ -132,5 +132,19 @@ uint64_t kernel_socket_next_timer_deadline(void);
 void kernel_socket_expire_timers(void);
 int kernel_socket_loopback_flags(const char name[16], uint16_t *flags);
 int kernel_socket_set_loopback_flags(const char name[16], uint16_t flags);
+struct kernel_socket_interface {
+    char name[16];
+    uint32_t index, address, netmask, mtu;
+    uint16_t flags, hardware_type;
+    uint8_t mac[6];
+};
+int kernel_socket_interface_get(const char name[16], struct kernel_socket_interface *snapshot);
+int kernel_socket_interface_index(uint32_t index, struct kernel_socket_interface *snapshot);
+int kernel_socket_interface_nth(uint32_t ordinal, struct kernel_socket_interface *snapshot);
+int kernel_socket_interface_set_flags(const char name[16], uint16_t flags);
+void kernel_socket_network_initialize(void);
+void kernel_socket_network_process(void);
+void kernel_socket_network_failed(uint32_t address);
+void kernel_socket_network_hooks(void (*timer_wake)(void *), int (*udp_capacity)(void *), void *context);
 
 #endif

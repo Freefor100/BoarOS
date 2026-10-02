@@ -137,6 +137,11 @@ static int address_import(const struct kernel_socket *socket,
 static struct kernel_socket *inet_sockets;
 static uint8_t socket_initialized;
 static uint8_t socket_timer_irq;
+static uint8_t socket_timer_running;
+static uint8_t socket_device_failed;
+static void (*network_timer_wake)(void *);
+static int (*network_udp_capacity)(void *);
+static void *network_context;
 static struct kernel_socket *write_retry_head;
 
 /* Called with interrupts disabled: the list itself owns no socket reference.
@@ -213,7 +218,9 @@ static void poll_loopback(void)
             if (socket->receive_retry && socket->tcp && socket->tcp->refused_data)
                 (void)tcp_process_refused_data(socket->tcp);
         }
+        socket_timer_running = 1;
         sys_check_timeouts();
+        socket_timer_running = 0;
         netif_poll_all(); retire_timewait();
     }
     riscv_interrupt_restore(old_status);
@@ -221,9 +228,10 @@ static void poll_loopback(void)
 
 void kernel_socket_expire_timers(void)
 {
+    if (network_timer_wake) { network_timer_wake(network_context); return; }
     /* IRQ 只推进有界协议定时器；收包/accept 和用户复制仍在调用上下文。 */
     if (socket_initialized) {
-        retire_timewait();socket_timer_irq=1;sys_check_timeouts();socket_timer_irq=0;
+        retire_timewait();socket_timer_irq=1;socket_timer_running=1;sys_check_timeouts();socket_timer_running=0;socket_timer_irq=0;
     }
 }
 
@@ -318,7 +326,8 @@ static void udp_received(void *context, struct udp_pcb *pcb,
     (void)pcb;
     uint32_t charge = payload->tot_len ? payload->tot_len : 1U;
     /* 接收队列不能占尽共享协议堆：给下一条最大 UDP 和 TCP 控制报文留空间。 */
-    if (lwip_stats.mem.used > MEM_SIZE - (65536U + 4096U) ||
+    if ((network_udp_capacity && !network_udp_capacity(network_context)) ||
+        lwip_stats.mem.used > MEM_SIZE - (65536U + 4096U) ||
         charge > socket->rx_limit || socket->rx_bytes > socket->rx_limit - charge) {
         UDP_STATS_INC(udp.memerr);
         pbuf_free(payload); return;
@@ -409,8 +418,9 @@ static void tcp_failed(void *context, err_t error)
     if (error == ERR_CLSD) {
         socket->tcp = 0; socket->peer_closed = 1; wake_socket(socket); return;
     }
-    socket->error = error == ERR_RST && socket->connecting
-        ? -KERNEL_ECONNREFUSED : lwip_error(error);
+    socket->error = socket_device_failed ? -KERNEL_EIO : error == ERR_RST && socket->connecting
+        ? -KERNEL_ECONNREFUSED : error == ERR_ABRT && socket_timer_running
+            ? -KERNEL_ETIMEDOUT : lwip_error(error);
     socket->pending_error = socket->error;
     socket->tcp = 0;
     socket->connecting = 0U;
@@ -500,10 +510,7 @@ int kernel_socket_create(struct kernel_heap *heap, int family, int type,
     }
     if (status != KERNEL_HEAP_STATUS_OK) __builtin_trap();
     old_status = riscv_interrupt_save();
-    if (!socket_initialized) {
-        lwip_init();
-        socket_initialized = 1U;
-    }
+    kernel_socket_network_initialize();
     socket->heap = heap;
     socket->type = (uint8_t)type;
     socket->family = (uint8_t)family;
@@ -656,8 +663,12 @@ int kernel_socket_bind(struct kernel_socket *socket,
     int result = address_import(socket, address, &local, 1);
     if (result != 0) return result;
     if (!ip_addr_isany(&local) &&
-        !(IP_IS_V4(&local) ? ip4_addr_isloopback(ip_2_ip4(&local)) : ip6_addr_isloopback(ip_2_ip6(&local))))
-        return -KERNEL_EADDRNOTAVAIL;
+        !(IP_IS_V4(&local) ? ip4_addr_isloopback(ip_2_ip4(&local)) : ip6_addr_isloopback(ip_2_ip6(&local)))) {
+        int found = 0;
+        for (struct netif *n = netif_list; n; n = n->next)
+            if (IP_IS_V4(&local) && ip4_addr_eq(ip_2_ip4(&local), netif_ip4_addr(n))) found = 1;
+        if (!found) return -KERNEL_EADDRNOTAVAIL;
+    }
     uintptr_t old_status = riscv_interrupt_save();
     result = port_conflict(socket, &local, address->port, 0);
     if (result != 0) { riscv_interrupt_restore(old_status); return result; }
@@ -1643,4 +1654,96 @@ int kernel_socket_set_loopback_flags(const char name[16], uint16_t flags)
     else netif_set_down(loopback);
     riscv_interrupt_restore(old_status);
     return 0;
+}
+
+void kernel_socket_network_initialize(void)
+{
+    if (!socket_initialized) { lwip_init(); socket_initialized = 1; }
+}
+void kernel_socket_network_hooks(void (*timer_wake)(void *), int (*udp_capacity)(void *), void *context)
+{
+    uintptr_t irq = riscv_interrupt_save();
+    network_timer_wake = timer_wake; network_udp_capacity = udp_capacity; network_context = context;
+    riscv_interrupt_restore(irq);
+}
+void kernel_socket_network_process(void)
+{
+    poll_loopback();
+    uintptr_t irq = riscv_interrupt_save();
+    for (struct kernel_socket *s = inet_sockets; s; s = s->inet_next)
+        if (s->tcp && !s->listening && s->tcp->unsent) (void)tcp_output(s->tcp);
+    riscv_interrupt_restore(irq);
+}
+void kernel_socket_network_failed(uint32_t address)
+{
+    uintptr_t saved = riscv_interrupt_save();
+    socket_device_failed = 1;
+    for (struct kernel_socket *s = inet_sockets; s; s = s->inet_next) {
+        const ip_addr_t *local = local_ip(s);
+        if (!local || !IP_IS_V4(local) || ip4_addr_get_u32(ip_2_ip4(local)) != address) continue;
+        /* endpoint仍归OFD；设备故障与协议超时分开，排队数据先按原规则交付。 */
+        s->error = s->pending_error = -KERNEL_EIO;
+        if (s->tcp && !s->listening) tcp_abort(s->tcp);
+        wake_socket(s);
+    }
+    socket_device_failed = 0;
+    riscv_interrupt_restore(saved);
+}
+static void interface_snapshot(struct netif *n, struct kernel_socket_interface *s)
+{
+    *s = (struct kernel_socket_interface){0};
+    int loop = n->name[0] == 'l' && n->name[1] == 'o';
+    __builtin_memcpy(s->name, loop ? "lo" : "eth0", loop ? 3 : 5);
+    s->index = netif_get_index(n); s->address = netif_ip4_addr(n)->addr;
+    /* loopif的0表示不受L2 MTU限制；Linux逻辑MTU容纳完整IPv4长度范围。 */
+    s->netmask = netif_ip4_netmask(n)->addr; s->mtu = loop ? 65536U : n->mtu;
+    s->hardware_type = loop ? 772 : 1;
+    if (netif_is_up(n)) s->flags |= 1;
+    if (netif_is_link_up(n)) s->flags |= 0x40;
+    s->flags |= loop ? 8 : 0x1002;
+    if (!loop) __builtin_memcpy(s->mac, n->hwaddr, 6);
+}
+int kernel_socket_interface_index(uint32_t index, struct kernel_socket_interface *s)
+{
+    uintptr_t irq = riscv_interrupt_save();
+    for (struct netif *n = netif_list; n; n = n->next) if (netif_get_index(n) == index) {
+        interface_snapshot(n, s); riscv_interrupt_restore(irq); return 0;
+    }
+    riscv_interrupt_restore(irq); return -KERNEL_ENODEV;
+}
+int kernel_socket_interface_get(const char name[16], struct kernel_socket_interface *s)
+{
+    uintptr_t irq = riscv_interrupt_save();
+    for (struct netif *n = netif_list; n; n = n->next) {
+        int loop = n->name[0] == 'l' && n->name[1] == 'o';
+        if (!__builtin_memcmp(name, loop ? "lo" : "eth0", loop ? 3 : 5)) {
+            interface_snapshot(n, s); riscv_interrupt_restore(irq); return 0;
+        }
+    }
+    riscv_interrupt_restore(irq); return -KERNEL_ENODEV;
+}
+int kernel_socket_interface_nth(uint32_t ordinal, struct kernel_socket_interface *s)
+{
+    uintptr_t irq = riscv_interrupt_save(); unsigned previous = 0;
+    for (uint32_t i = 0; i <= ordinal; i++) {
+        struct netif *selected = 0;
+        for (struct netif *n = netif_list; n; n = n->next)
+            if (netif_get_index(n) > previous && (!selected || netif_get_index(n) < netif_get_index(selected))) selected = n;
+        if (!selected) { riscv_interrupt_restore(irq); return -KERNEL_ENODEV; }
+        previous = netif_get_index(selected);
+        if (i == ordinal) { interface_snapshot(selected, s); riscv_interrupt_restore(irq); return 0; }
+    }
+    __builtin_trap();
+}
+int kernel_socket_interface_set_flags(const char name[16], uint16_t flags)
+{
+    uintptr_t irq = riscv_interrupt_save();
+    for (struct netif *n = netif_list; n; n = n->next) {
+        int loop = n->name[0] == 'l' && n->name[1] == 'o';
+        if (!__builtin_memcmp(name, loop ? "lo" : "eth0", loop ? 3 : 5)) {
+            if (flags & 1) netif_set_up(n); else netif_set_down(n);
+            riscv_interrupt_restore(irq); return 0;
+        }
+    }
+    riscv_interrupt_restore(irq); return -KERNEL_ENODEV;
 }

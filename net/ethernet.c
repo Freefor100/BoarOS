@@ -1,0 +1,216 @@
+#include <kernel/network.h>
+#include <kernel/socket.h>
+#include <kernel/errno.h>
+#include <kernel/console.h>
+#include <arch/riscv/context.h>
+#include <arch/riscv/memory_layout.h>
+#include <arch/riscv/timer.h>
+#include <arch/riscv/virtio_mmio_net.h>
+#include "net-config.h"
+#include "lwip/etharp.h"
+#include "lwip/ip4_frag.h"
+#include "lwip/netif.h"
+#include "lwip/pbuf.h"
+#include "lwip/stats.h"
+#include "netif/ethernet.h"
+#include <stddef.h>
+#include <string.h>
+
+struct network_rx {
+    struct pbuf_custom custom;
+    struct riscv_virtio_mmio_net *device;
+    unsigned buffer;
+};
+struct kernel_network {
+    struct riscv_virtio_mmio_net device;
+    struct netif interface;
+    struct network_rx rx[64];
+    struct kernel_heap *heap;
+    uint64_t deadline;
+    uint8_t attached, failure_delivered;
+};
+static void print_text(const char *s) { while (*s) kernel_console_putc(*s++); }
+static void print_u64(uint64_t v)
+{
+    char digits[24]; unsigned n = 0;
+    do { digits[n++] = (char)('0' + v % 10); v /= 10; } while (v);
+    while (n) kernel_console_putc(digits[--n]);
+}
+static void rx_free(struct pbuf *p)
+{
+    struct network_rx *r = (void *)p;
+    riscv_virtio_mmio_net_release(r->device, r->buffer);
+}
+static int copy_pbuf(const void *context, void *destination, uint32_t length)
+{ return pbuf_copy_partial(context, destination, (u16_t)length, 0) == length; }
+static err_t link_output(struct netif *interface, struct pbuf *p)
+{
+    struct kernel_network *n = interface->state;
+    int result = riscv_virtio_mmio_net_send_copy(&n->device, p->tot_len, copy_pbuf, p);
+    return result >= 0 ? ERR_OK : result == -KERNEL_EAGAIN ? ERR_MEM :
+        result == -KERNEL_EMSGSIZE ? ERR_BUF : ERR_IF;
+}
+static err_t interface_init(struct netif *interface)
+{
+    struct kernel_network *n = interface->state;
+    interface->name[0] = 'e'; interface->name[1] = 't';
+    interface->hwaddr_len = 6; memcpy(interface->hwaddr, n->device.mac, 6);
+    interface->mtu = 1500;
+    interface->flags = NETIF_FLAG_BROADCAST | NETIF_FLAG_ETHARP | NETIF_FLAG_ETHERNET;
+    interface->output = etharp_output; interface->linkoutput = link_output;
+    return ERR_OK;
+}
+static unsigned pool_used(void)
+{ return lwip_stats.memp[MEMP_PBUF_POOL] ? lwip_stats.memp[MEMP_PBUF_POOL]->used : 0; }
+static int udp_capacity(void *context)
+{
+    struct kernel_network *n = context;
+    uint64_t owned = lwip_stats.mem.used + (uint64_t)n->device.loaned * 2048 +
+        (uint64_t)pool_used() * PBUF_POOL_BUFSIZE;
+    return pool_used() <= PBUF_POOL_SIZE - 16 && owned <= MEM_SIZE - (65536U + 4096U);
+}
+static void timer_wake(void *context)
+{
+    struct kernel_network *n = context;
+    if (n->deadline && (int64_t)(riscv_time_read() - n->deadline) >= 0)
+        (void)kernel_wait_queue_wake_all(&n->device.progress);
+}
+static void input_frame(struct kernel_network *n, struct riscv_net_frame *frame)
+{
+    const unsigned char *data = frame->data;
+    int udp = frame->size >= 34 && data[12] == 8 && data[13] == 0 && data[23] == 17;
+    int address_ok = frame->size >= 14 &&
+        ((!memcmp(data, n->device.mac, 6)) || (data[0] & 1));
+    if (!address_ok || (udp && !udp_capacity(n))) goto dropped;
+    struct pbuf *p;
+    if (!riscv_virtio_mmio_net_lend(&n->device, frame->buffer)) {
+        struct network_rx *rx = &n->rx[frame->buffer];
+        rx->device = &n->device; rx->buffer = frame->buffer; rx->custom.custom_free_function = rx_free;
+        p = pbuf_alloced_custom(PBUF_RAW, (u16_t)frame->size, PBUF_REF, &rx->custom,
+                               frame->data, 2048 - 16);
+        if (!p) __builtin_trap();
+    } else {
+        p = pbuf_alloc(PBUF_RAW, (u16_t)frame->size, PBUF_POOL);
+        if (!p) goto dropped;
+        if (pbuf_take(p, frame->data, frame->size) != ERR_OK) __builtin_trap();
+        n->device.statistics.copied_packets++; n->device.statistics.copied_bytes += frame->size;
+        riscv_virtio_mmio_net_release(&n->device, frame->buffer);
+    }
+    /* 成功input消耗或接纳pbuf；失败才由当前接收请求释放。 */
+    if (n->interface.input(p, &n->interface) != ERR_OK) pbuf_free(p);
+    return;
+dropped:
+    n->device.statistics.drops++;
+    riscv_virtio_mmio_net_release(&n->device, frame->buffer);
+}
+static void worker(void *context)
+{
+    struct kernel_network *n = context;
+    struct riscv_virtio_mmio_net *d = &n->device;
+    for (;;) {
+        uintptr_t irq = riscv_interrupt_save();
+        if (d->stopping) { riscv_interrupt_restore(irq); return; }
+        if (riscv_virtio_mmio_net_service(d)) {
+            netif_set_link_down(&n->interface);
+            if (!n->failure_delivered) {
+                n->failure_delivered = 1;
+                kernel_socket_network_failed(ip4_addr_get_u32(netif_ip4_addr(&n->interface)));
+            }
+            enum kernel_wait_wake_reason reason;
+            if (kernel_scheduler_block_current(&d->progress, 0, 0, &reason) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
+            riscv_interrupt_restore(irq); continue;
+        }
+        if (d->link_up) netif_set_link_up(&n->interface); else netif_set_link_down(&n->interface);
+        struct riscv_net_frame frame;
+        unsigned handled = 0;
+        while (handled < 8 && riscv_virtio_mmio_net_receive(d, &frame)) {
+            input_frame(n, &frame); handled++;
+        }
+        kernel_socket_network_process();
+        (void)riscv_virtio_mmio_net_service(d);
+        if (handled == 8) {
+            /* 批次间给中断和其他任务机会，不持raw调用栈睡在设备credit上。 */
+            riscv_interrupt_restore(irq);
+            irq = riscv_interrupt_save();
+            if (kernel_scheduler_yield_current() != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
+            riscv_interrupt_restore(irq); continue;
+        }
+        n->deadline = kernel_socket_next_timer_deadline();
+        uint64_t timeout = riscv_time_read() + 5 * d->frequency;
+        if (!n->deadline || timeout < n->deadline) n->deadline = timeout;
+        enum kernel_wait_wake_reason reason;
+        if (kernel_scheduler_block_current(&d->progress, n->deadline, 0, &reason) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
+        riscv_interrupt_restore(irq);
+    }
+}
+int kernel_network_start(struct kernel_network **owner, struct kernel_heap *heap,
+    const struct dtb_boot_info *boot, const struct dtb_irq_info *irq)
+{
+    if (!owner || *owner || !heap || !boot || !irq) return -KERNEL_EINVAL;
+    for (unsigned i = 0; i < boot->virtio_mmio_count; i++) {
+        volatile uint32_t *mmio = (void *)(uintptr_t)(RISCV_KERNEL_MMIO_BASE + boot->virtio_mmio[i].base);
+        if (boot->virtio_mmio[i].size < 0x108 || mmio[0] != 0x74726976 || mmio[2] != 1) continue;
+        uint32_t source = 0;
+        for (unsigned j = 0; j < irq->route_count; j++) if (irq->routes[j].base == boot->virtio_mmio[i].base) source = irq->routes[j].source;
+        if (!source) return -KERNEL_EIO;
+        struct kernel_network *n = 0;
+        enum kernel_heap_status allocation = kernel_heap_allocate_zeroed(heap, 1, sizeof(*n), (void **)&n);
+        if (allocation == KERNEL_HEAP_STATUS_EMPTY) return -KERNEL_ENOMEM;
+        if (allocation != KERNEL_HEAP_STATUS_OK) __builtin_trap();
+        n->heap = heap; *owner = n;
+        int error = riscv_virtio_mmio_net_init(&n->device, mmio, boot->virtio_mmio[i].size,
+            heap->page_allocator, boot->timebase_frequency, source);
+        if (error) { if (kernel_network_stop(owner)) return -KERNEL_EIO; return error; }
+        uintptr_t saved = riscv_interrupt_save();
+        kernel_socket_network_initialize();
+        ip4_addr_t address = {lwip_htonl(BOAROS_NET_IPV4)}, mask = {lwip_htonl(BOAROS_NET_NETMASK)}, gateway = {0};
+        if (!netif_add(&n->interface, &address, &mask, &gateway, n, interface_init, ethernet_input)) {
+            riscv_interrupt_restore(saved); (void)kernel_network_stop(owner); return -KERNEL_ENOMEM;
+        }
+        n->attached = 1;
+        netif_set_up(&n->interface); if (n->device.link_up) netif_set_link_up(&n->interface);
+        netif_set_default(&n->interface);
+        if (kernel_thread_create_joinable(worker, n, &n->device.worker) != KERNEL_SCHEDULER_STATUS_OK) {
+            riscv_interrupt_restore(saved); (void)kernel_network_stop(owner); return -KERNEL_ENOMEM;
+        }
+        kernel_socket_network_hooks(timer_wake, udp_capacity, n);
+        riscv_interrupt_restore(saved);
+        print_text("BoarOS: eth0 ready transport="); print_text(n->device.version == 1 ? "legacy" : "modern");
+        print_text(" irq="); print_u64(source); print_text(" MTU=1500 RX/TX=32 DMA-bytes=");
+        print_u64((4096U << n->device.queue_order) + 2 * 131072U);
+        print_text(" control-bytes="); print_u64(sizeof(*n)); print_text("\n");
+        return 0;
+    }
+    return 0;
+}
+int kernel_network_stop(struct kernel_network **owner)
+{
+    if (!owner || !*owner) return 0;
+    struct kernel_network *n = *owner;
+    uintptr_t irq = riscv_interrupt_save();
+    n->device.stopping = 1;
+    (void)kernel_wait_queue_wake_all(&n->device.progress);
+    if (n->device.worker.task) kernel_thread_join(&n->device.worker);
+    if (n->attached) {
+        ip4_reass_cleanup_netif(&n->interface);
+        etharp_cleanup_netif(&n->interface);
+        netif_set_down(&n->interface); netif_remove(&n->interface); n->attached = 0;
+    }
+    int error = riscv_virtio_mmio_net_stop(&n->device);
+    if (error) { riscv_interrupt_restore(irq); return error; }
+    kernel_socket_network_hooks(0, 0, 0);
+    print_text("BoarOS: network final rx="); print_u64(n->device.statistics.rx_packets);
+    print_text(" tx="); print_u64(n->device.statistics.tx_packets);
+    print_text(" loan-packets="); print_u64(n->device.statistics.loan_packets);
+    print_text(" loan-bytes="); print_u64(n->device.statistics.loan_bytes);
+    print_text(" loan-peak="); print_u64(n->device.statistics.loan_peak);
+    print_text(" copy-packets="); print_u64(n->device.statistics.copied_packets);
+    print_text(" copy-bytes="); print_u64(n->device.statistics.copied_bytes);
+    print_text(" drops="); print_u64(n->device.statistics.drops);
+    print_text(" errors="); print_u64(n->device.statistics.errors);
+    struct kernel_heap_statistics heap_statistics;
+    kernel_heap_get_statistics(n->heap, &heap_statistics);
+    print_text(" root-heap-peak-pages="); print_u64(heap_statistics.peak_pages); print_text("\n");
+    if (kernel_heap_release(n->heap, n) != KERNEL_HEAP_STATUS_OK) __builtin_trap();
+    *owner = 0; riscv_interrupt_restore(irq); return 0;
+}
