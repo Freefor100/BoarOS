@@ -30,7 +30,7 @@ PLIC 路由由 `dtb_read_irq_info()` 根据 CPU interrupt-controller phandle、�
 
 完成队列的冷路径诊断在 reset 前输出 `block queue fault`：used 快照与消费差值超过槽容量为 `used-overflow`；完成项的描述符 head 未按三描述符槽对齐、超出槽范围或 length 为零为 `used-element`；指向非 submitted 槽为 `slot-state`；设备 status 超出 OK/IOERR/UNSUPP 为 `device-status`。输出包含 MMIO 地址/status、中断快照、transport、队列虚拟/物理地址及容量，used、consumed、avail、入口观察到的完成数，逻辑调用/在途数和 reserved/published/complete 槽数；每个固定槽记录 state、owner/completion 指针值、status、type、字节数、扇区与期限。只读取驱动持有的 MMIO、队列和最多八个固定槽，不追 owner/completion 或设备提供的描述符地址，不分配、不增加重试。used 是触发校验的快照，consumed 包含已经取出的非法项，avail/status 是打印期间的标量；它不是跨 DMA 的原子快照。正常完成和普通 IOERR/UNSUPP 不输出这段诊断，reset、返回状态和 owner 回收契约不变。重复完成若发生在本次合法完成已收割之后，设备仍失败，但不会覆写已完成请求的真实结果。
 
-旧对照中曾出现的 QEMU `Virtqueue size exceeded` 目前仍未定位。固定 QEMU v11.1.0 的 `references/qemu/hw/virtio/virtio.c`（commit `84f07211cc5b4fc6a371559bf8a5de4fb068e648`）在 `virtqueue_split_pop()` 的设备侧 `inuse >= vring.num` 时报告该错误，与本驱动检查的 used 消费差值不是同一计数；旧日志也不足以确认是哪种 VirtIO 设备。新增诊断与受控 host 反例不能关闭旧异常或证明其原因。
+旧对照曾出现 QEMU `Virtqueue size exceeded`，随后块 I/O timeout/reset。固定 QEMU v11.1.0 的 `references/qemu/hw/virtio/virtio.c` 在 `virtqueue_split_pop()` 的设备侧 `inuse >= vring.num` 时报告该错误；这是已 pop 但未 flush 的描述符链数，和本驱动对 used-index 的校验不是同一计数。根启动现场有块盘和 RNG，但旧日志没有给出报错时的设备或 queue identity。后续带 virtqueue pop/flush trace 的同类原版网络运行，块队列峰值为 8、RNG 为 1且最终归零，没有复现告警。分配器竞态可以污染任一 DMA 页面，因而是可能的共因；目前没有证据将那次告警唯一归因于它。不得把该历史异常记作已经修复。
 
 ## 验证
 

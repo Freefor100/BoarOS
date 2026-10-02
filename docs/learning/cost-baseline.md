@@ -518,3 +518,67 @@ python3 -B tests/cost-riscv.py --case consumer --consumer-commands musl:0,musl:1
 与既有输入清单管理。TCP的收益和限制另见[网络纠错结果](network-ownership.md#本轮应用结果与剩余复制2026-10-02)。
 本轮解决了小事务过早封口，没有消除准备读取、前台按调用工作、积极checkpoint或Linux差距。
 下一主线为N3真实网卡，性能候选由应用证据选择，不作为其前置门槛。
+
+## 旧版内存释放与 Virtqueue 告警（2026-10-02）
+
+旧日志留下过两次异常。一次发生在四进程 iozone 并发写，trap 显示发生在物理页
+buddy 释放函数；那个内核没有保存 allocator 元数据快照，所以单靠 trap 地址不能
+判断具体命中了哪个释放 guard。另一次发生在原 iperf 五连接传输，QEMU 输出
+`Virtqueue size exceeded`，随后 guest 块请求 timeout/reset。旧日志没有留下报错设备
+和队列 owner 的状态。
+
+### 确认并修复的内存根因
+
+timer 会直接切换正在运行的 S-mode 内核线程。buddy 和 slab 曾因单 hart 假设而不
+保护多步 metadata 更新；2026-10-01 加入开中断运行的异步 journal worker 后，这成为
+实际写入路径。worker 与原使用 root heap 的任务可以在一次摘链发布中间被切换。
+
+在 `free_list_remove()` 的合法边界插入一次确定性 timer 交错，原 buddy 返回成功给
+两个申请者，却把同一物理页地址发给双方。两边分别释放时触发 `already-free` fatal。
+测试没有改写 allocator metadata，也没有让同一个 owner 重复释放。复现同时覆盖
+slab 的空闲槽交错，确认页分配器和 heap 都需保护。原始 fatal 没有这些 owner 快照，
+因此这确证了可达的同类根因，不能声称已经证明当时唯一那次释放错误必由该交错造成。
+
+修复在短 IRQ 临界区保护 buddy 验证、摘链、split、coalesce、引用和发布；heap 的
+slot/bitmap/free-list 更新也完整保护。新 slab 先在区外作为私有页分配和初始化，之后
+在临界区内发布；大对象页申请、calloc 清零和 resize 复制仍在区外。干净回收与
+显式压力等待保持进展，等待前先取得既有 cache group 引用，不在睡眠期间借用已释放
+的回收器 context。内核线程抢占策略没有更改；此处短临界区只保证共享 metadata 不会
+在S-mode timer切换中被两个合法分配者同时修改。它针对的是单 hart，SMP 仍需跨核锁。
+
+两次具体露出该竞态的演进分属 2026-08-23 的内核线程 timer 抢占和 2026-10-01 的
+开中断 journal worker；buddy/slab 本身则在 8 月下旬引入，没建立对应短临界区。更早
+的 timer 抢占是有意保留的内核能力。当前不把它作为错误调度策略；错误是之后的内存
+分配器仍按整段执行不可被切换来写，并在异步 worker 上变得实际可达。
+
+确定性 host 用例沿真实 public allocate/acquire/release 和 heap 接口逐函数边界模拟
+任务切换，检查 owner、数据内容、统计和最后空闲页。最终 RV64、物理页、heap、timer
+调度及成本 host 测试通过。复现与重建入口为：
+
+```sh
+make test-allocator-preemption-host test-allocator-release-host test-cost-host
+make test-page-riscv test-heap-riscv test-scheduler-riscv test-riscv
+make test-io-sleep-riscv
+PYTHONDONTWRITEBYTECODE=1 make BUILD_DIR=build/risk/drain \
+  KERNEL_RV=build/risk/drain/kernel-rv ROOT_DRAIN_FIXTURE=1 all
+PYTHONDONTWRITEBYTECODE=1 python3 -B tests/cost-riscv.py \
+  --case consumer --off --kernel build/risk/drain/kernel-rv \
+  --root-drain-fixture --consumer-commands musl:0,musl:1,musl:5 \
+  --replicas 1
+```
+
+### 仍未唯一定位的 QEMU 告警
+
+固定 QEMU v11.1.0 在 `virtqueue_split_pop()` 中仅当一个 virtqueue 的 `inuse` 达到
+`vring.num` 才报告 `Virtqueue size exceeded`。块队列配置32个描述符，软件最多发布8条
+请求链；RNG队列只有1个描述符，设备正常处理是同步pop/push，不应在它仍在用时再次pop。
+新的设备 trace 在相同
+旧来源的原版代表网络运行中看到块队列峰值为8、RNG为1，所有任务完成且队列最终清空，
+但没有复现原 QEMU 报告，也无法从后来通过的 trace 得知旧现场是哪一设备。
+
+未保护的 buddy 确实能重复发放同一 DMA 页，因而可能污染队列数据；这是新找到的可信
+共因候选，但尚无旧失败时的 avail ring、queue id、
+inuse 或 reset 前 DMA 内容快照，不能把相邻时间出现的块 timeout 当作更早 queue fault
+由块驱动自身造成，也不能断言该共同候选是唯一根因。本次内存修复消除了这个已证实的
+双 owner 污染机制；QEMU 那次 `inuse>=vring.num` 的具体来源仍是未关闭问题，应视为仍有历史
+风险，而不是仅因新的代表运行通过就记为修复。
