@@ -1,4 +1,5 @@
 #include <kernel/cost.h>
+#include <kernel/irq.h>
 #include <kernel/console.h>
 #include <kernel/page.h>
 #include <kernel/physical_page.h>
@@ -375,6 +376,7 @@ static enum physical_page_status physical_page_allocate_bootstrap(
     struct physical_page_allocator *allocator,
     uint64_t *address)
 {
+    KERNEL_IRQ_SCOPE(irq);
     uint32_t index;
 
     if (allocator->available_pages == 0U) {
@@ -425,6 +427,7 @@ static enum physical_page_status physical_page_release_bootstrap(
     struct physical_page_allocator *allocator,
     uint64_t address)
 {
+    KERNEL_IRQ_SCOPE(irq);
     uint64_t current;
     uint64_t scanned = 0U;
 
@@ -1017,6 +1020,7 @@ static enum physical_page_status physical_page_allocate_order_once(
     uint32_t order,
     uint64_t *address)
 {
+    KERNEL_IRQ_SCOPE(irq);
     uint32_t found;
     uint32_t page_index;
     uint64_t block_pages;
@@ -1104,26 +1108,31 @@ enum physical_page_status physical_page_allocate_order(
     enum physical_page_status status =
         physical_page_allocate_order_once(allocator, order, address);
 
-    if (allocator_initialized(allocator) && allocator->pressure_notify)
-        allocator->pressure_notify(allocator->pressure_context);
-    if (status == PHYSICAL_PAGE_STATUS_EMPTY &&
-        allocator_initialized(allocator) &&
-        physical_page_allocator_is_finalized(allocator) &&
-        allocator->reclaimer != 0) {
-        uint32_t *depth = allocator->reclaim_depth ? allocator->reclaim_depth() : &allocator->reclaiming;
-        if (*depth) { COST_ADD(PAGE_FAILURES, 1); return status; }
-        if (depth != &allocator->reclaiming) *depth = 1U;
-        if (allocator->reclaiming == UINT32_MAX) __builtin_trap();
-        allocator->reclaiming++;
-        (void)allocator->reclaimer(allocator->reclaimer_context,
-                                   order_page_count(order));
-        allocator->reclaiming--;
-        if (depth != &allocator->reclaiming) *depth = 0U;
-        if (allocator->available_pages < order_page_count(order) && allocator->pressure_wait)
-            allocator->pressure_wait(allocator->pressure_context);
-        status = physical_page_allocate_order_once(allocator,
-                                                   order,
-                                                   address);
+    {
+        /* 分发与 callback 取得自身 owner 之间不得被卸载。干净回收不睡眠；
+         * pressure_wait 在显式睡眠前自行 pin 组，不持有 buddy 修改状态。 */
+        KERNEL_IRQ_SCOPE(irq);
+        if (allocator_initialized(allocator) && allocator->pressure_notify)
+            allocator->pressure_notify(allocator->pressure_context);
+        if (status == PHYSICAL_PAGE_STATUS_EMPTY &&
+            allocator_initialized(allocator) &&
+            physical_page_allocator_is_finalized(allocator) &&
+            allocator->reclaimer != 0) {
+            uint32_t *depth = allocator->reclaim_depth ? allocator->reclaim_depth() : &allocator->reclaiming;
+            if (*depth) { COST_ADD(PAGE_FAILURES, 1); return status; }
+            if (depth != &allocator->reclaiming) *depth = 1U;
+            if (allocator->reclaiming == UINT32_MAX) __builtin_trap();
+            allocator->reclaiming++;
+            (void)allocator->reclaimer(allocator->reclaimer_context,
+                                       order_page_count(order));
+            allocator->reclaiming--;
+            if (depth != &allocator->reclaiming) *depth = 0U;
+            if (allocator->available_pages < order_page_count(order) && allocator->pressure_wait)
+                allocator->pressure_wait(allocator->pressure_context);
+            status = physical_page_allocate_order_once(allocator,
+                                                       order,
+                                                       address);
+        }
     }
 
     if (status == PHYSICAL_PAGE_STATUS_OK) {
@@ -1173,6 +1182,7 @@ enum physical_page_status physical_page_allocation_order(
     uint64_t address,
     uint32_t *order)
 {
+    KERNEL_IRQ_SCOPE(irq);
     uint32_t page_index;
     const struct physical_page_metadata *metadata;
 
@@ -1203,6 +1213,7 @@ enum physical_page_status physical_page_release_order(
     uint64_t address,
     uint32_t order)
 {
+    KERNEL_IRQ_SCOPE(irq);
     uint32_t page_index;
     uint32_t original_range;
     uint32_t merge_buddies[PHYSICAL_PAGE_MAX_ORDER];
@@ -1411,6 +1422,7 @@ enum physical_page_status physical_page_acquire(
     struct physical_page_allocator *allocator,
     uint64_t address)
 {
+    KERNEL_IRQ_SCOPE(irq);
     uint32_t page_index;
     struct physical_page_metadata *metadata;
 
@@ -1443,6 +1455,7 @@ enum physical_page_status physical_page_reference_count(
     uint64_t address,
     uint32_t *references)
 {
+    KERNEL_IRQ_SCOPE(irq);
     uint32_t page_index;
     const struct physical_page_metadata *metadata;
 
@@ -1473,6 +1486,7 @@ enum physical_page_status physical_page_allocator_set_reclaimer(
     physical_page_reclaim_fn reclaimer,
     void *context)
 {
+    KERNEL_IRQ_SCOPE(irq);
     if (!physical_page_allocator_is_finalized(allocator) ||
         reclaimer == 0) {
         return PHYSICAL_PAGE_STATUS_INVALID;
@@ -1489,6 +1503,7 @@ enum physical_page_status physical_page_allocator_set_reclaimer(
 enum physical_page_status physical_page_allocator_clear_reclaimer(
     struct physical_page_allocator *allocator)
 {
+    KERNEL_IRQ_SCOPE(irq);
     if (!physical_page_allocator_is_finalized(allocator)) {
         return PHYSICAL_PAGE_STATUS_INVALID;
     }
@@ -1507,6 +1522,7 @@ enum physical_page_status physical_page_resolve(
     uint64_t physical_address,
     void **pointer)
 {
+    KERNEL_IRQ_SCOPE(irq);
     void *result;
 
     if (!allocator_initialized(allocator) || pointer == 0) {

@@ -1404,7 +1404,7 @@ test-lwip-host: build/host/lwip-port
 
 test-allocator-release-host:
 	mkdir -p build/host
-	cc -std=c11 -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=12 -Iinclude tests/host/allocator_release.c kernel/physical_page.c mm/heap.c -o build/host/allocator-release
+	cc -std=c11 -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=12 -Itests/host/random -Iinclude tests/host/allocator_release.c kernel/physical_page.c mm/heap.c -o build/host/allocator-release
 	build/host/allocator-release
 
 include tests/diff-abi/Makefile.inc
@@ -1609,7 +1609,7 @@ test-cost-host:
 	build/cost/host/account-test
 	cc -std=c11 -Wall -Wextra -Werror -idirafter include -DBOAROS_COST_DIAGNOSTICS=1 tests/cost/irq_test.c kernel/cost.c -o build/cost/host/irq-test
 	build/cost/host/irq-test
-	cc -std=c11 -Wall -Wextra -Werror -idirafter include -DBOAROS_PAGE_SHIFT=12 -DBOAROS_COST_DIAGNOSTICS=1 tests/cost/page_test.c kernel/cost.c kernel/physical_page.c -o build/cost/host/page-test
+	cc -std=c11 -Wall -Wextra -Werror -Itests/host/random -idirafter include -DBOAROS_PAGE_SHIFT=12 -DBOAROS_COST_DIAGNOSTICS=1 tests/cost/page_test.c kernel/cost.c kernel/physical_page.c -o build/cost/host/page-test
 	build/cost/host/page-test
 	python3 -B tests/test-cost-report.py
 test-cost-riscv: test-cost-host
@@ -1655,3 +1655,11 @@ test-ethernet-worker-host:
 	python3 -B tests/host/ethernet_worker.py
 test-network-external-riscv: $(KERNEL_RV)
 	python3 -B tests/network-external.py --kernel $(KERNEL_RV) --transport both
+
+.PHONY: test-allocator-preemption-host
+test-allocator-preemption-host:
+	mkdir -p build/host/allocator
+	cc -std=c11 -O1 -fno-inline -finstrument-functions -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=12 -Itests/host/allocator -Iinclude -c kernel/physical_page.c -o build/host/allocator/page.o
+	cc -std=c11 -O1 -fno-inline -finstrument-functions -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=12 -Itests/host/allocator -Iinclude -c mm/heap.c -o build/host/allocator/heap.o
+	cc -std=c11 -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=12 -Iinclude tests/host/allocator_preemption.c build/host/allocator/page.o build/host/allocator/heap.o -o build/host/allocator/preemption
+	build/host/allocator/preemption

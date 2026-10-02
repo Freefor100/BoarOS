@@ -1,4 +1,5 @@
 #include <kernel/cost.h>
+#include <kernel/irq.h>
 #include <kernel/sync.h>
 #include <kernel/heap.h>
 
@@ -368,26 +369,18 @@ static enum kernel_heap_status slab_create(struct kernel_heap *heap,
 
         slot_set_next(slab, index, next);
     }
-    partial_insert(heap, slab);
-    statistics_add_pages(heap, 0U);
+    /* 私有页初始化不占用共享 slab 临界区。 */
     *slab_out = slab;
     return KERNEL_HEAP_STATUS_OK;
 }
 
-static enum kernel_heap_status allocate_small(struct kernel_heap *heap,
-                                              uint32_t class_index,
-                                              void **pointer)
+/* 调用者持有短 IRQ 临界区，slab 从查找到取槽不能被回收。 */
+static enum kernel_heap_status slab_allocate_slot(struct kernel_heap *heap,
+                                                 struct kernel_slab *slab,
+                                                 uint32_t class_index,
+                                                 void **pointer)
 {
-    struct kernel_slab *slab = heap->partial_slabs[class_index];
     uint32_t slot_index;
-    enum kernel_heap_status status;
-
-    if (slab == 0) {
-        status = slab_create(heap, class_index, &slab);
-        if (status != KERNEL_HEAP_STATUS_OK) {
-            return status;
-        }
-    }
     if (slab->magic != KERNEL_SLAB_MAGIC || slab->heap != heap ||
         slab->class_index != class_index || slab->free_count == 0U ||
         slab->free_head >= slab->slot_count) {
@@ -405,8 +398,31 @@ static enum kernel_heap_status allocate_small(struct kernel_heap *heap,
         partial_remove(heap, slab);
     }
 
+    heap->statistics.live_allocations++;
     *pointer = slab_slot(slab, slot_index);
     return KERNEL_HEAP_STATUS_OK;
+}
+
+static enum kernel_heap_status allocate_small(struct kernel_heap *heap,
+                                              uint32_t class_index,
+                                              void **pointer)
+{
+    struct kernel_slab *prepared = 0;
+    enum kernel_heap_status status;
+    {
+        KERNEL_IRQ_SCOPE(irq);
+        struct kernel_slab *slab = heap->partial_slabs[class_index];
+        if (slab) return slab_allocate_slot(heap, slab, class_index, pointer);
+    }
+    /* 回收可能重入堆；申请页时尚未借用任何共享 slab 指针。 */
+    status = slab_create(heap, class_index, &prepared);
+    if (status != KERNEL_HEAP_STATUS_OK) return status;
+    {
+        KERNEL_IRQ_SCOPE(irq);
+        partial_insert(heap, prepared);
+        statistics_add_pages(heap, 0U);
+        return slab_allocate_slot(heap, prepared, class_index, pointer);
+    }
 }
 
 static int allocation_order_for_size(size_t size, uint32_t *order)
@@ -459,7 +475,11 @@ static enum kernel_heap_status allocate_large(struct kernel_heap *heap,
         return page_status_to_heap(page_status);
     }
 
-    statistics_add_pages(heap, order);
+    {
+        KERNEL_IRQ_SCOPE(irq);
+        statistics_add_pages(heap, order);
+        heap->statistics.live_allocations++;
+    }
     *pointer = result;
     return KERNEL_HEAP_STATUS_OK;
 }
@@ -507,7 +527,10 @@ enum kernel_heap_status kernel_heap_allocate(
     if (!heap_initialized(heap) || pointer == 0) {
         return KERNEL_HEAP_STATUS_INVALID;
     }
-    heap->statistics.allocation_calls++;
+    {
+        KERNEL_IRQ_SCOPE(irq);
+        heap->statistics.allocation_calls++;
+    }
     COST_ADD(HEAP_CALLS, 1); COST_ADD(HEAP_REQUESTED, size);
     if (size == 0U) {
         *pointer = 0;
@@ -520,12 +543,14 @@ enum kernel_heap_status kernel_heap_allocate(
         status = allocate_large(heap, size, &result);
     }
     if (status != KERNEL_HEAP_STATUS_OK) {
-        heap->statistics.allocation_failures++;
+        {
+            KERNEL_IRQ_SCOPE(irq);
+            heap->statistics.allocation_failures++;
+        }
         COST_ADD(HEAP_FAILURES, 1);
         return status;
     }
 
-    heap->statistics.live_allocations++;
     COST_ADD(HEAP_ACCEPTED, size); COST_IO_ADD(6, size);
     *pointer = result;
     return KERNEL_HEAP_STATUS_OK;
@@ -545,6 +570,7 @@ enum kernel_heap_status kernel_heap_allocate_zeroed(
         return KERNEL_HEAP_STATUS_INVALID;
     }
     if (size != 0U && count > SIZE_MAX / size) {
+        KERNEL_IRQ_SCOPE(irq);
         heap->statistics.allocation_calls++;
         heap->statistics.allocation_failures++;
         return KERNEL_HEAP_STATUS_OVERFLOW;
@@ -568,6 +594,7 @@ static enum kernel_heap_status allocation_information(
     struct kernel_slab **slab_out,
     uint32_t *slot_index_out)
 {
+    KERNEL_IRQ_SCOPE(irq);
     uintptr_t value = (uintptr_t)pointer;
     uintptr_t page_value = value & ~(uintptr_t)BOAROS_PAGE_MASK;
     uint64_t page_address;
@@ -643,6 +670,7 @@ enum kernel_heap_status kernel_heap_release(
     struct kernel_heap *heap,
     void *pointer)
 {
+    KERNEL_IRQ_SCOPE(irq);
     uint64_t physical_address;
     uint32_t order;
     size_t capacity;
@@ -776,6 +804,7 @@ void kernel_heap_get_statistics(
     const struct kernel_heap *heap,
     struct kernel_heap_statistics *statistics)
 {
+    KERNEL_IRQ_SCOPE(irq);
     if (!heap_initialized(heap) || statistics == 0) {
         return;
     }

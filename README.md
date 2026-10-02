@@ -110,10 +110,10 @@ S6–S8 存储流水线已落地：有界资源复用、封口与容量等待分
 
 原 iperf 3.13、netperf 2.7.0 的两种 libc 共22个受控子项完成实际传输、结果交换和退出，单连接16MiB、五连接各8MiB及UDP一万次请求响应另有内容核对。最终两种libc的代表测量统一在兼容分支，旧glibc结果不代表main版本身份支持。原连续iperf脚本仍有listener重建竞态，不能将受控完成写成原脚本全部通过；netperf原脚本两侧5/5。此前N2关闭观测三次启动的TCP接收吞吐中位为musl单/五连接242/352.6 Mbit/s、glibc261/346.7 Mbit/s；UDP_RR为6443/6612事务每秒。限制、丢包与成本解释见[网络应用结果](docs/learning/network-ownership.md#原版网络应用交付2026-10-02)。该段是N2 loopback测量；本轮真实网卡结果见下。
 
-2026-10-02纠错轮已交付未连接TCP/零长度recv、UNIX数据报半关闭、接收扩容通知和活动reservation的终止事件等待；流发送复用同请求暂存尾部。journal取消64次操作软封口，保留版本量/首脏期限、同步和恢复协议。关闭观测三次启动，自动iozone程序加durable中位musl11.541→5.129秒、glibc12.108→5.359秒；四进程所选两组改善约8%–11%，最终卸载余量约0.04秒。单TCP仅249→250、268→274Mbit/s，非阻塞跨调用复制放大仍在，不能称为主要网络瓶颈已解决。完整lwext4/SQLite恢复与双盘、1179 ABI、相关系统回归已验收；旧对照中的两项未定位fatal/队列异常仍保留风险。结果、边界和重建见[本轮存储](docs/learning/cost-baseline.md#版本量封口与socket纠错对照2026-10-02)与[网络](docs/learning/network-ownership.md#本轮应用结果与剩余复制2026-10-02)。这段保留上一轮的机制与测量，不作为当前网卡能力的状态。
+2026-10-02纠错轮已交付未连接TCP/零长度recv、UNIX数据报半关闭、接收扩容通知和活动reservation的终止事件等待；流发送复用同请求暂存尾部。journal取消64次操作软封口，保留版本量/首脏期限、同步和恢复协议。关闭观测三次启动，自动iozone程序加durable中位musl11.541→5.129秒、glibc12.108→5.359秒；四进程所选两组改善约8%–11%，最终卸载余量约0.04秒。单TCP仅249→250、268→274Mbit/s，非阻塞跨调用复制放大仍在，不能称为主要网络瓶颈已解决。完整lwext4/SQLite恢复与双盘、1179 ABI、相关系统回归已验收。后续调查确定性复现了timer切换造成的buddy/slab元数据竞态，并已加短临界区；该竞态可导致合法释放fatal，但原始iozone fatal缺少owner快照，无法确认那一次的具体触发链。Virtqueue告警依然未找到那次运行的具体队列破坏原因；新增确定性反例说明同一页双发会污染DMA owner，重跑未复现QEMU告警。结果、边界和重建见[本轮存储](docs/learning/cost-baseline.md#版本量封口与socket纠错对照2026-10-02)与[网络](docs/learning/network-ownership.md#本轮应用结果与剩余复制2026-10-02)。这段保留上一轮的机制与测量，不作为当前网卡能力的状态。
 
 2026-10-02已交付N3：DTB发现的VirtIO-net legacy/modern、静态eth0、ARP及有界IPv4重组，IRQ收割、worker每批八帧。RX直接引用DMA至最后pbuf释放，最多32借用并有界回退；TX仍复制。原BusyBox wget/httpd在main/musl与兼容glibc的两种transport完成双向16MiB GET、16MiB CGI上传和4KiB文本POST。完整RV64、真实libc、1196 ABI、scale和栈，以及22项loopback已验收。
 
-modern关闭观测三次启动，固定内容的单/五TCP双向总量效率中位297/285Mbit/s，匹配Linux1171/1107；完整程序12.151秒，退出后到根卸载关机另约2.035秒。两项计时不能混称为纯网络或checkpoint耗时。仍有复制、协议和应用固定成本，不设置倍数门槛；两项历史异常未定位，公网、DNS/TLS和外部IPv6未交付。
+modern关闭观测三次启动，固定内容的单/五TCP双向总量效率中位297/285Mbit/s，匹配Linux1171/1107；完整程序12.151秒，退出后到根卸载关机另约2.035秒。两项计时不能混称为纯网络或checkpoint耗时。仍有复制、协议和应用固定成本，不设置倍数门槛；buddy/slab timer交错已修复；旧QEMU Virtqueue告警未确定具体来源。公网、DNS/TLS和外部IPv6未交付。下一主线已选择中等规模离线C工程，先完成真实构建、重建和错误退出，再由实际成本选择优化；近期队列统一见[开发路线](docs/goals.md)。
 
 接口与owner见[网卡模块](docs/modules/riscv-virtio-net.md)，内容、分布和剩余成本见[真实网卡记录](docs/learning/network-ownership.md#真实-virtio-net-与宿主应用交付2026-10-02)。下一应用由真实需求选择，现有路线只保留一项待选应用与证据触发的性能候选。

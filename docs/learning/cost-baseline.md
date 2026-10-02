@@ -294,7 +294,7 @@ S9与缓存纠错当时可以确认的剩余成本包括：
   尚未量化为主要瓶颈，缩小依赖前须保留命名空间和跨句柄关系。
 
 当前普通调度是 100 Hz OTHER 轮转，FIFO/RR 提供实时优先级和预算限制。
-常见 ready 队列操作为 O(1)，deadline 仍遍历 blocked；普通持锁内核路径没有任意抢占。
+常见ready队列操作为O(1)，deadline仍遍历blocked。外部IRQ的S-mode返回只在idle安全边界调度；timer则保留对开中断内核线程的抢占，持有I/O锁也不自动禁止切换。此前将两条路径笼统写成“普通内核路径不抢占”不准确；分配器修复与实际边界见文末风险调查。
 调度优化可能减少就绪等待和流水线空档，但不能消除必要屏障或补齐接口。
 是否值得改，应看真实程序的完成→唤醒→就绪→运行时间线。
 
@@ -518,3 +518,99 @@ python3 -B tests/cost-riscv.py --case consumer --consumer-commands musl:0,musl:1
 与既有输入清单管理。TCP的收益和限制另见[网络纠错结果](network-ownership.md#本轮应用结果与剩余复制2026-10-02)。
 本轮解决了小事务过早封口，没有消除准备读取、前台按调用工作、积极checkpoint或Linux差距。
 下一主线为N3真实网卡，性能候选由应用证据选择，不作为其前置门槛。
+
+## 旧版内存释放与 Virtqueue 告警（2026-10-02）
+
+旧日志留下过两次异常。一次发生在四进程 iozone 并发写，trap 显示发生在物理页
+buddy 释放函数；那个内核没有保存 allocator 元数据快照，所以单靠 trap 地址不能
+判断具体命中了哪个释放 guard。
+
+另一次的原运行入口与失败阶段已还原：10月2日13:32（北京时间）抓取到原版网络
+代表负载的告警。它使用纠错前的兼容内核、关闭观测、512 MiB、单 hart、legacy
+块盘与writeback缓存，另挂RNG；当时没有VirtIO-net设备，TCP全部走loopback。
+musl单连接完成后，协调器重新启动服务器并确认监听；五连接客户端
+`./iperf3 -c 127.0.0.1 -p 5001 -t 2 -i 0 -P 5`开始后出现以下顺序：
+
+1. QEMU输出`Virtqueue size exceeded`。
+2. guest块请求超时并reset。
+3. `tests/workloads/network/consumers.c`的`show_output()`打开客户端输出文件时得到
+   `EIO`，尚未打印该命令的wait status；随后根卸载返回`EBUSY`。
+
+这定位了触发负载和受损的文件I/O路径；原日志没有保存最先报错的VirtIO设备、
+队列与owner状态，不能把后续文件错误归给TCP协议或尚未加入的网卡驱动。
+原入口如下；`--repeat 1`用于单次定位，历史计划的三个性能副本并未在这次失败中完成：
+
+```sh
+python3 -B tests/network-consumers.py --only boaros --libc both --suite both \
+  --case representative --repeat 1 --kernel <纠错前兼容内核>
+```
+
+### 确认并修复的内存根因
+
+timer 会直接切换正在运行的 S-mode 内核线程。buddy 和 slab 曾因单 hart 假设而不
+保护多步 metadata 更新；2026-10-01 加入开中断运行的异步 journal worker 后，这成为
+实际写入路径。worker 与原使用 root heap 的任务可以在一次摘链发布中间被切换。
+
+在 `free_list_remove()` 的合法边界插入一次确定性 timer 交错，原 buddy 返回成功给
+两个申请者，却把同一物理页地址发给双方。两边分别释放时触发 `already-free` fatal。
+测试没有改写 allocator metadata，也没有让同一个 owner 重复释放。复现同时覆盖
+slab 的空闲槽交错，确认页分配器和 heap 都需保护。原始 fatal 没有这些 owner 快照，
+因此这确证了可达的同类根因，不能声称已经证明当时唯一那次释放错误必由该交错造成。
+
+修复在短 IRQ 临界区保护 buddy 验证、摘链、split、coalesce、引用和发布；heap 的
+slot/bitmap/free-list 更新也完整保护。新 slab 先在区外作为私有页分配和初始化，之后
+在临界区内发布；大对象页申请、calloc 清零和 resize 复制仍在区外。干净回收与
+显式压力等待保持进展，等待前先取得既有 cache group 引用，不在睡眠期间借用已释放
+的回收器 context。内核线程抢占策略没有更改；此处短临界区只保证共享 metadata 不会
+在S-mode timer切换中被两个合法分配者同时修改。它针对的是单 hart，SMP 仍需跨核锁。
+
+两次具体露出该竞态的演进分属 2026-08-23 的内核线程 timer 抢占和 2026-10-01 的
+开中断 journal worker；buddy/slab 本身则在 8 月下旬引入，没建立对应短临界区。更早
+的 timer 抢占是有意保留的内核能力。当前不把它作为错误调度策略；错误是之后的内存
+分配器仍按整段执行不可被切换来写，并在异步 worker 上变得实际可达。
+
+确定性 host 用例沿真实 public allocate/acquire/release 和 heap 接口逐函数边界模拟
+任务切换，检查 owner、数据内容、统计和最后空闲页。最终 RV64、物理页、heap、timer
+调度及成本 host 测试通过。复现与重建入口为：
+
+```sh
+make test-allocator-preemption-host test-allocator-release-host test-cost-host
+make test-page-riscv test-heap-riscv test-scheduler-riscv test-riscv
+make test-io-sleep-riscv
+PYTHONDONTWRITEBYTECODE=1 make BUILD_DIR=build/risk/drain \
+  KERNEL_RV=build/risk/drain/kernel-rv ROOT_DRAIN_FIXTURE=1 all
+PYTHONDONTWRITEBYTECODE=1 python3 -B tests/cost-riscv.py \
+  --case consumer --off --kernel build/risk/drain/kernel-rv \
+  --root-drain-fixture --consumer-commands musl:0,musl:1,musl:5 \
+  --replicas 1
+```
+
+### 仍未唯一定位的 QEMU 告警
+
+固定 QEMU v11.1.0 在 `virtqueue_split_pop()` 中仅当一个 virtqueue 的 `inuse` 达到
+`vring.num` 才报告 `Virtqueue size exceeded`。块队列配置32个描述符，软件最多发布8条
+请求链；RNG队列只有1个描述符，设备正常处理是同步pop/push，不应在它仍在用时再次pop。
+新的设备 trace 在相同
+旧来源的原版代表网络运行中看到块队列峰值为8、RNG为1，所有任务完成且队列最终清空，
+但没有复现原 QEMU 报告，也无法从后来通过的 trace 得知旧现场是哪一设备。
+
+未保护的 buddy 确实能重复发放同一 DMA 页，因而可能污染队列数据；这是新找到的可信
+共因候选，但尚无旧失败时的 avail ring、queue id、
+inuse 或 reset 前 DMA 内容快照，不能把相邻时间出现的块 timeout 当作更早 queue fault
+由块驱动自身造成，也不能断言该共同候选是唯一根因。本次内存修复消除了这个已证实的
+双 owner 污染机制；QEMU 那次 `inuse>=vring.num` 的具体来源仍是未关闭问题，应视为仍有历史
+风险，而不是仅因新的代表运行通过就记为修复。
+
+10月3日继续沿原块驱动核对发布与回收，宿主设备模型在legacy/modern各65544次请求中
+覆盖八槽全满、反序完成、重复IRQ和索引绕回，未出现重复head或超额在途。RNG的固定
+QEMU路径在同一回调内逐个pop/push，没有找到会积累未完成链的正常路径。这收窄了调查，
+仍不能补回旧现场的设备身份。
+
+本次另修复了实际的现场丢失缺口：原诊断只覆盖非法used项，而旧告警后的纯超时会
+直接reset。现在超时先保存MMIO、transport、队列地址、avail/used、在途数量和各槽
+owner标量，随后按原协议reset。新反例在旧代码中缺失这些字段；修复后两种transport
+的宿主检查通过，真实legacy/writeback的八槽NBD超时也核对了输出与reset顺序、原
+TIMEOUT结果和最终回收。该改动提高下一次失败的可定位性，不将历史告警标为修复。
+重建：`python3 -B tests/host/virtio_block_diagnostics.py`；真实用例使用
+`make build/riscv/tests/kernel-io-sleep-rv build/host/nbd-fault`，随后运行
+`python3 -B tests/io-sleep-riscv.py --kernel build/riscv/tests/kernel-io-sleep-rv --transport legacy`。

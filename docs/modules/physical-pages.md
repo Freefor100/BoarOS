@@ -85,8 +85,9 @@ finalized 分配最多检查 32 个 order；free-list head 的插入和双向摘
 与 coalesce 为 O(order)，不会扫描同 order 的其他空闲块。为了让 interior release 和
 resolve 能精确判定所有权，分配或释放 order N 块还会更新本次块内 `2^N` 条状态；
 常用 order-0 热路径只更新一个页记录，acquire/非末 release 也只修改该页引用数。
-分配热路径只发布阈值唤醒，不扫描缓存或执行 I/O；首次分配失败才同步扫描干净缓存。当前单 hart 不需要锁，SMP
-接入前必须把 free-list、引用数、回收器注册和计数纳入同一同步边界。
+分配热路径只发布阈值唤醒，不扫描缓存或执行 I/O；首次分配失败才同步扫描干净缓存。当前单 hart 仍会在开中断的内核线程中发生 timer 抢占。一次 buddy 摘链、split、
+分配发布或 release/coalesce，以及引用更新和一致性读取，均由保存/恢复 SIE 的短临界区
+保护。SMP 接入前仍须把这些边界升级为跨核锁。
 
 绑定前只允许顺序发放从未释放过的页；合法 bootstrap 释放完成即返回。越界、重复或
 不属于当前 owner 的释放触发 fatal trap。
@@ -101,11 +102,12 @@ bootstrap 分散耗尽时 finalize 仍返回 `EMPTY`。当前 QEMU 满足该约�
 512 MiB、1 GiB 和 16 GiB 启动验证；开发板必须按
 真实 DTB 保留区和启动占用重新核对。若未来早期分配规模或稀疏内存使其不成立，应
 改为每 range metadata 或稀疏索引，而不是退回固定容量 heap。模块还没有清零分配、
-多回收器优先级、并发锁、NUMA、热插拔、CMA 或 per-CPU page cache。
+多回收器优先级、SMP 并发锁、NUMA、热插拔、CMA 或 per-CPU page cache。
 
 ## 验证
 
 ```sh
+make test-allocator-preemption-host
 make test-allocator-release-host
 make test-page-riscv
 make test-riscv
@@ -138,3 +140,31 @@ sink 来读取真实分配器输出，并检查合法共享单页及连续页释
 安全 OOM 路径等待共同一轮的首次实际释放进展，或所有参与 worker 完成；不逐盘
 串行等待。worker 与等待者各自保持 owner 引用，注销和唤醒不依赖借用悬空指针。
 统一内存后备对象的 tmpfs 页与共享匿名页同计 Shmem，不进入磁盘回收候选。
+
+### 内核抢占与回调分发
+
+分配器不能依赖“单 hart 等于不会交错”：内核线程保持 timer 抢占能力，异步 journal
+worker 在 SIE 开启时也调用堆和物理页分配器。`kernel/irq.h` 的 scope 只负责保存和
+恢复本 hart 的 SIE；嵌套进入不会提前打开中断，所有正常/失败返回均恢复调用者状态。
+bootstrap 回收链也使用该边界，避免 idle 安全 IRQ 返回中执行另一 owner 后破坏链。
+
+每次 buddy 分配尝试结束后才进行压力回调分发。分发另行关闭 IRQ，使 callback 函数与
+context 的读取、非阻塞干净回收、以及等待回调取得自身 owner 之间不能被卸载插入。
+`pressure_wait` 在显式睡眠前增加既有缓存组引用，睡眠期间允许其他任务运行、释放页
+和卸载最后缓存；此时没有未完成的 buddy/heap 元数据修改。回收递归深度在进入等待前
+清零，返回后只重新尝试 buddy 分配，不再借用旧缓存 context。这不是跨 I/O 持有分配器锁。
+干净回收仍在 IRQ-off 的调用契约内扫描，后续若需可抢占扫描必须另行定义缓存游标与引用。
+
+宿主抢占回归在生产函数入口/出口逐一模拟一次 timer 切换，IRQ-off 时推迟到恢复后；
+断言只检查公共分配/引用/释放结果、不同 owner 的内容互不覆盖、heap 统计和空闲页归还，
+不锁定私有布局或固定调用次数。旧实现会出现合法请求失败；定点调查还证明两个成功
+请求取得同页，两个 owner 各释放一次即触发 `already-free`。修复后覆盖页发放、释放合并与并发分配、引用交错、
+slab 分配/释放和私有 slab 发布；压力模型验证递归抑制、等待期间另一任务进展/注销，
+以及 IRQ 开/关两种入口状态恢复。这些反例确认分配器缺陷，不能单独证明历史
+`Virtqueue size exceeded` 的具体来源。
+
+固定参考 `references/linux/mm/page_alloc.c`（Linux commit
+`f4cdf7ca9a1fdcca413157df19753f388a5a224e`）要求 `__rmqueue` 在 `zone->lock`
+内执行，`rmqueue_bulk` 使用 `spin_lock_irqsave` 保护摘链和 split。这里沿用的是共享
+元数据必须串行化的契约；BoarOS 当前实现只覆盖单 hart 的 IRQ/任务交错，并未移植 Linux
+的 SMP 锁或 per-CPU 分配机制。

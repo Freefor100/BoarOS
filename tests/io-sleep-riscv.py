@@ -100,6 +100,7 @@ try:
     queue_verified = False
     timeout_held = []
     reset_seen = False
+    timeout_snapshot = []
     batch_writes = []
     batch_pending = False
     batch_released = 0
@@ -153,7 +154,16 @@ try:
                         server.stdin.write(b'drain\n')
                         batch_verified.add(phase)
                         batch_deadline = None
+                elif label == 'guest' and line.startswith(b'BoarOS: block queue fault reason=timeout '):
+                    assert phase == 'timeout'
+                    timeout_snapshot = [bytes(line)]
+                elif label == 'guest' and timeout_snapshot and not reset_seen and line.startswith((b' used=', b' slot=')):
+                    timeout_snapshot.append(bytes(line))
                 elif label == 'guest' and line == b'BoarOS: block timeout; resetting device':
+                    assert len(timeout_snapshot) == 10, timeout_snapshot
+                    fields = dict(part.split(b'=', 1) for part in timeout_snapshot[1].split())
+                    assert int(fields[b'published'], 0) == int(fields[b'inflight'], 0) == 8, fields
+                    assert int(fields[b'observed_count'], 0) == 0, fields
                     assert phase == 'timeout' and len(timeout_held) == 8, timeout_held
                     reset_seen = True
                     server.stdin.write(b'drain\n')
