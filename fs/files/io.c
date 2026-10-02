@@ -997,30 +997,37 @@ static enum kernel_files_status buffered_write_request(
                 if (access != KERNEL_UACCESS_STATUS_OK &&
                     access != KERNEL_UACCESS_STATUS_FAULT)
                     return KERNEL_FILES_STATUS_STATE;
-                sent = kernel_socket_write_buffer(socket, staging,
-                                                    (uint32_t)copied, socket_flags);
-                if (sent == -KERNEL_EAGAIN) {
-                    uint64_t now = target ? kernel_time_monotonic_ns() : 0;
-                    int waited = target && now >= target ? -KERNEL_EAGAIN :
-                        socket_wait_ready(description, KERNEL_POLLOUT,
-                                          target ? target-now : 0, socket_flags);
-                    if (waited == 0) continue;
-                    if (total && waited == -KERNEL_ERESTARTSYS)
-                        kernel_signal_clear_syscall_restart(kernel_task_current());
-                    sent = waited;
-                }
-                if (sent < 0) {
-                    *linux_result = total != 0U ? (int64_t)total : sent;
-                    return KERNEL_FILES_STATUS_OK;
-                }
-                total += (uint64_t)sent;
-                offset += (uint64_t)sent;
-                /* 阻塞 stream 继续等待剩余空间；fault/信号/超时仍返回已接受前缀。 */
-                if (access == KERNEL_UACCESS_STATUS_FAULT || ((size_t)sent < copied &&
-                    ((description->open_flags & KERNEL_FILES_O_NONBLOCK) ||
-                     (socket_flags & KERNEL_SOCKET_MSG_DONTWAIT)))) {
-                    *linux_result = (int64_t)total;
-                    return KERNEL_FILES_STATUS_OK;
+                size_t consumed = 0U;
+                /* 等待和短发送只推进暂存游标，不能重新解析尚未发送的用户字节。 */
+                while (consumed < copied) {
+                    sent = kernel_socket_write_buffer(socket, (const unsigned char *)staging + consumed,
+                                                        (uint32_t)(copied - consumed), socket_flags);
+                    if (sent == -KERNEL_EAGAIN) {
+                        uint64_t now = target ? kernel_time_monotonic_ns() : 0;
+                        int waited = target && now >= target ? -KERNEL_EAGAIN :
+                            socket_wait_ready(description, KERNEL_POLLOUT,
+                                              target ? target-now : 0, socket_flags);
+                        if (waited == 0) continue;
+                        if (total && waited == -KERNEL_ERESTARTSYS)
+                            kernel_signal_clear_syscall_restart(kernel_task_current());
+                        sent = waited;
+                    }
+                    if (sent < 0) {
+                        *linux_result = total != 0U ? (int64_t)total : sent;
+                        return KERNEL_FILES_STATUS_OK;
+                    }
+                    if (sent == 0 || (size_t)sent > copied - consumed)
+                        return KERNEL_FILES_STATUS_STATE;
+                    consumed += (size_t)sent;
+                    total += (uint64_t)sent;
+                    offset += (uint64_t)sent;
+                    /* fault或非阻塞仍返回本次已接受前缀。 */
+                    if (access == KERNEL_UACCESS_STATUS_FAULT || (consumed < copied &&
+                        ((description->open_flags & KERNEL_FILES_O_NONBLOCK) ||
+                         (socket_flags & KERNEL_SOCKET_MSG_DONTWAIT)))) {
+                        *linux_result = (int64_t)total;
+                        return KERNEL_FILES_STATUS_OK;
+                    }
                 }
             }
         }

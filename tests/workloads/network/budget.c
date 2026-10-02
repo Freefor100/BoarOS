@@ -12,7 +12,7 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
-#define CHECK(x) do { if (!(x)) { fprintf(stderr,"budget:%d %s errno=%d\n",__LINE__,#x,errno); exit(1); } } while(0)
+#include "../cost/common.h"
 
 /* BoarOS以接收端字节预算约束UNIX队列；Linux的SO_RCVBUF不是此预算协议。 */
 static void blocked(pid_t pid)
@@ -33,7 +33,10 @@ static void transfer(int type, unsigned action)
     CHECK(socketpair(AF_UNIX,type,0,pair)==0 && pipe(gate)==0 && pipe(done)==0);
     CHECK(setsockopt(pair[1],SOL_SOCKET,SO_RCVBUF,&value,sizeof(value))==0);
     char initial[4096], next[1000]; memset(initial,'a',sizeof(initial)); memset(next,'b',sizeof(next));
-    CHECK(write(pair[0],initial,sizeof(initial))==(ssize_t)sizeof(initial));
+    size_t initial_size=action==3 ? 3500 : sizeof(initial);
+    CHECK(write(pair[0],initial,initial_size)==(ssize_t)initial_size);
+    int observe=type==SOCK_STREAM && (action==0 || action==3);
+    if(observe) cost_begin();
     pid_t child=fork(); CHECK(child>=0);
     if (!child) {
         signal(SIGPIPE,SIG_IGN); close(pair[1]); close(gate[0]); close(done[0]);
@@ -50,12 +53,12 @@ static void transfer(int type, unsigned action)
     blocked(child); CHECK(poll(&ready,1,0)==0);
     value=0; CHECK(setsockopt(pair[1],SOL_SOCKET,SO_RCVBUF,&value,sizeof(value))==0);
     blocked(child); CHECK(poll(&ready,1,0)==0);
-    if (action==0) {
+    if (action==0 || action==3) {
         value=4096; CHECK(setsockopt(pair[1],SOL_SOCKET,SO_RCVBUF,&value,sizeof(value))==0);
         CHECK(poll(&ready,1,2000)==1 && read(done[0],&byte,1)==1);
         char content[5096]; size_t total=0;
-        while(total<sizeof(content)) { ssize_t n=read(pair[1],content+total,sizeof(content)-total); CHECK(n>0); total+=(size_t)n; }
-        CHECK(!memcmp(content,initial,sizeof(initial)) && !memcmp(content+sizeof(initial),next,sizeof(next)));
+        while(total<initial_size+sizeof(next)) { ssize_t n=read(pair[1],content+total,initial_size+sizeof(next)-total); CHECK(n>0); total+=(size_t)n; }
+        CHECK(!memcmp(content,initial,initial_size) && !memcmp(content+initial_size,next,sizeof(next)));
         CHECK(close(pair[1])==0);
     } else {
         if (action==2) CHECK(kill(child,SIGKILL)==0);
@@ -65,13 +68,30 @@ static void transfer(int type, unsigned action)
     int status; CHECK(waitpid(child,&status,0)==child);
     CHECK(action==2 ? WIFSIGNALED(status)&&WTERMSIG(status)==SIGKILL : WIFEXITED(status)&&WEXITSTATUS(status)==0);
     CHECK(close(gate[0])==0 && close(done[0])==0);
+    if(observe) {
+        cost_end("budget-staging",NULL,0,0,0);
+        if(cost_control>=0) {
+            int fd=open("/proc/boaros_cost",O_RDONLY); CHECK(fd>=0);
+            char line[256]; size_t used=0; int found=0;
+            while(read(fd,&byte,1)==1) {
+                if(byte=='\n') {
+                    line[used]=0;
+                    if(!strncmp(line,"foreground.stream_copy.value=",29)) {
+                        CHECK(strtoull(line+29,NULL,10)==sizeof(next)); found++;
+                    }
+                    used=0;
+                } else { CHECK(used+1<sizeof(line)); line[used++]=byte; }
+            }
+            CHECK(found==1 && close(fd)==0);
+        }
+    }
+
 }
 int main(void)
 {
     setvbuf(stdout,NULL,_IONBF,0);
-    CHECK(mkdir("/proc",0755)==0 || errno==EEXIST);
-    CHECK(mount("proc","/proc","proc",0,NULL)==0);
+    cost_init();
     for(unsigned type=SOCK_STREAM;type<=SOCK_DGRAM;type++)
-        for(unsigned action=0;action<3;action++) transfer((int)type,action);
+        for(unsigned action=0;action<4;action++) transfer((int)type,action);
     puts("NETWORK PASS budget"); return 0;
 }

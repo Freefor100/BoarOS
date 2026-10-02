@@ -149,3 +149,8 @@ UNIX DGRAM自身SHUT_RD后，即使空队列也有IN/RDNORM和RDHUP；双向关�
 独立U-mode预算入口：`python3 -B tests/network-riscv.py --only boaros --workload budget`。
 该测试先握手并从proc确认发送者已阻塞，再核对扩容、缩容、对端关闭、SIGKILL和内容。
 它保护BoarOS的接收端字节预算，不把Linux的SO_RCVBUF当成相同排队模型。
+
+流发送的请求页持有有效内容和已发送游标：EAGAIN后等待及部分发送后继续消费暂存尾部，
+不再次读取同一段用户数据。非阻塞/fault/信号/期限仍返回已接受前缀；不借用用户页到ACK。
+预算fixture的COST窗口独立核对全阻塞和部分发送各1000字节只有1000字节stream usercopy，
+旧全阻塞实现为2000字节。`--workload content`校验单TCP16MiB、五TCP各8MiB及UDP内容。
