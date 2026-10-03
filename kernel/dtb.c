@@ -1076,7 +1076,7 @@ struct irq_node {
     struct dtb_discovery_node bus;
     const unsigned char *extended;
     uint32_t extended_length, phandle, parent, source, ndev, intcells;
-    uint32_t clock, shift, width;
+    uint32_t clock, shift, width, layout_seen;
     int cpu, intc, plic, virtio, uart, big_endian;
 };
 static enum dtb_status irq_discover(const unsigned char *blob, uint64_t hart,
@@ -1114,6 +1114,9 @@ static enum dtb_status irq_discover(const unsigned char *blob, uint64_t hart,
                 if (IRQ_PROP("#address-cells")) n->bus.child_address_cells = read_be32(v);
                 else if (IRQ_PROP("clock-frequency") || IRQ_PROP("reg-shift") || IRQ_PROP("reg-io-width")) {
                     if (len != 4) return DTB_STATUS_INVALID;
+                    unsigned bit = IRQ_PROP("clock-frequency") ? 1 : IRQ_PROP("reg-shift") ? 2 : 4;
+                    if (n->layout_seen & bit) return DTB_STATUS_INVALID;
+                    n->layout_seen |= bit;
                     if (IRQ_PROP("clock-frequency")) n->clock = read_be32(v);
                     else if (IRQ_PROP("reg-shift")) n->shift = read_be32(v);
                     else n->width = read_be32(v);
