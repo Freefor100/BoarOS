@@ -123,6 +123,7 @@ enum kernel_pipe_status kernel_pipe_create(
     kernel_wait_queue_init(&pipe->read_queue);
     kernel_wait_queue_init(&pipe->write_queue);
     kernel_wait_queue_init(&pipe->both_queue);
+    kernel_mutex_init(&pipe->copy_lock, 15U, (uintptr_t)pipe);
     uintptr_t irq = riscv_interrupt_save();
     if (!next_pipe_proc_identity) __builtin_trap();
     pipe->proc_identity = next_pipe_proc_identity++;
@@ -358,32 +359,41 @@ enum kernel_pipe_status kernel_pipe_readv(
         return KERNEL_PIPE_STATUS_OK;
     }
     saved = riscv_interrupt_save();
+    KERNEL_LOCK_SCOPE(copy_guard);
+    kernel_mutex_lock(&pipe->copy_lock, &copy_guard);
     requested = count < pipe->bytes ? count : pipe->bytes;
     while (requested == 0U) {
         if (pipe->writers == 0U) {
+            kernel_lock_scope_release(&copy_guard);
             riscv_interrupt_restore(saved);
             *linux_result = 0;
             return KERNEL_PIPE_STATUS_OK;
         }
         if ((open_flags & KERNEL_PIPE_NONBLOCK) != 0U) {
+            kernel_lock_scope_release(&copy_guard);
             riscv_interrupt_restore(saved);
             *linux_result = -KERNEL_EAGAIN;
             return KERNEL_PIPE_STATUS_OK;
         }
+        /* 用户缺页可睡眠，复制资格保护片段；空管道等待前归还，允许写者进展。 */
+        kernel_lock_release(&copy_guard);
         scheduler_status = kernel_scheduler_block_current(&pipe->read_queue,
                                                            0U,
                                                            1,
                                                            &wake_reason);
         if (scheduler_status != KERNEL_SCHEDULER_STATUS_OK) {
+            kernel_lock_scope_release(&copy_guard);
             riscv_interrupt_restore(saved);
             return KERNEL_PIPE_STATUS_STATE;
         }
         if (wake_reason == KERNEL_WAIT_SIGNALLED) {
             kernel_signal_note_syscall_restart(kernel_task_current());
+            kernel_lock_scope_release(&copy_guard);
             riscv_interrupt_restore(saved);
             *linux_result = -KERNEL_ERESTARTSYS;
             return KERNEL_PIPE_STATUS_OK;
         }
+        kernel_mutex_lock(&pipe->copy_lock, &copy_guard);
         requested = count < pipe->bytes ? count : pipe->bytes;
     }
 
@@ -396,6 +406,7 @@ enum kernel_pipe_status kernel_pipe_readv(
         enum kernel_uaccess_status part_status;
 
         if (pipe->slots == 0U || pipe->page_length[slot] == 0U) {
+            kernel_lock_scope_release(&copy_guard);
             riscv_interrupt_restore(saved);
             return KERNEL_PIPE_STATUS_STATE;
         }
@@ -412,6 +423,7 @@ enum kernel_pipe_status kernel_pipe_readv(
         if (part_status != KERNEL_UACCESS_STATUS_OK ||
             part_copied != chunk) {
             if (part_status != KERNEL_UACCESS_STATUS_FAULT) {
+                kernel_lock_scope_release(&copy_guard);
                 riscv_interrupt_restore(saved);
                 return KERNEL_PIPE_STATUS_STATE;
             }
@@ -425,6 +437,7 @@ enum kernel_pipe_status kernel_pipe_readv(
         (void)kernel_wait_queue_wake_all(&pipe->write_queue);
         (void)kernel_wait_queue_wake_all(&pipe->both_queue);
     }
+    kernel_lock_scope_release(&copy_guard);
     riscv_interrupt_restore(saved);
     if (committed == 0U && fault) {
         *linux_result = -KERNEL_EFAULT;
@@ -478,6 +491,8 @@ static enum kernel_pipe_status pipe_write_source(
         return KERNEL_PIPE_STATUS_OK;
     }
     saved = riscv_interrupt_save();
+    KERNEL_LOCK_SCOPE(copy_guard);
+    kernel_mutex_lock(&pipe->copy_lock, &copy_guard);
     while (total < count) {
         uint64_t free_slots = KERNEL_PIPE_CAPACITY / BOAROS_PAGE_SIZE -
                               pipe->slots;
@@ -498,21 +513,26 @@ static enum kernel_pipe_status pipe_write_source(
             if (total != 0U && status == KERNEL_PIPE_STATUS_OK) {
                 *linux_result = (int64_t)total;
             }
+            kernel_lock_scope_release(&copy_guard);
             riscv_interrupt_restore(saved);
             return status;
         }
         if (!merging && free_slots == 0U) {
             if ((open_flags & KERNEL_PIPE_NONBLOCK) != 0U) {
+                kernel_lock_scope_release(&copy_guard);
                 riscv_interrupt_restore(saved);
                 *linux_result = total != 0U ? (int64_t)total : -KERNEL_EAGAIN;
                 return KERNEL_PIPE_STATUS_OK;
             }
+            /* 不能持复制资格等空间，否则读者不能消费。睡醒后重新检查尾片段。 */
+            kernel_lock_release(&copy_guard);
             scheduler_status = kernel_scheduler_block_current(
                 &pipe->write_queue,
                 0U,
                 1,
                 &wake_reason);
             if (scheduler_status != KERNEL_SCHEDULER_STATUS_OK) {
+                kernel_lock_scope_release(&copy_guard);
                 riscv_interrupt_restore(saved);
                 return KERNEL_PIPE_STATUS_STATE;
             }
@@ -523,9 +543,11 @@ static enum kernel_pipe_status pipe_write_source(
                 } else {
                     *linux_result = (int64_t)total;
                 }
+                kernel_lock_scope_release(&copy_guard);
                 riscv_interrupt_restore(saved);
                 return KERNEL_PIPE_STATUS_OK;
             }
+            kernel_mutex_lock(&pipe->copy_lock, &copy_guard);
             continue;
         }
         /* Linux merges only the request's page remainder into the previous
@@ -554,6 +576,7 @@ static enum kernel_pipe_status pipe_write_source(
                 destination, chunk, &copied);
         }
         if (access_status != KERNEL_UACCESS_STATUS_OK || copied != chunk) {
+            kernel_lock_scope_release(&copy_guard);
             riscv_interrupt_restore(saved);
             if (access_status != KERNEL_UACCESS_STATUS_FAULT) {
                 return KERNEL_PIPE_STATUS_STATE;
@@ -576,6 +599,7 @@ static enum kernel_pipe_status pipe_write_source(
         (void)kernel_wait_queue_wake_all(&pipe->read_queue);
         (void)kernel_wait_queue_wake_all(&pipe->both_queue);
     }
+    kernel_lock_scope_release(&copy_guard);
     riscv_interrupt_restore(saved);
     *linux_result = (int64_t)total;
     return KERNEL_PIPE_STATUS_OK;

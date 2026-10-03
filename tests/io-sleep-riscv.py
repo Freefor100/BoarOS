@@ -245,6 +245,7 @@ try:
                batch_verified == {'batch', 'batch-partial', 'batch-error'} and
                b'BoarOS: I/O sleep tests passed' in logs['guest'] and
                b'I/O socket reservation passed: owner, HUP, timeout, signal and fault' in logs['guest'] and
+               b'I/O pipe copy sleep passed: two writers, complete content and cleanup' in logs['guest'] and
                b'I/O sleep failed:' not in logs['guest'])
     if success and args.cost_output:
         snapshots=[]; current=None; body=[]
