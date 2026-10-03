@@ -101,7 +101,8 @@ int ext4_bmap_bit_find_clr(uint8_t *bmap, uint32_t sbit, uint32_t ebit,
 			return ENOSPC;
 
 		if (ext4_bmap_is_bit_clr(bmap, i)) {
-			*bit_id = sbit;
+			/* 跳过头部已占用位后，返回实际空闲位，不能返回原起点。 */
+			*bit_id = i;
 			return EOK;
 		}
 

@@ -5,6 +5,7 @@
 #include <ext4_inode.h>
 #include <ext4_super.h>
 #include <ext4_block_group.h>
+#include <ext4_bitmap.h>
 #include <ext4_journal.h>
 #include <ext4_trans.h>
 #include <stdio.h>
@@ -357,6 +358,24 @@ static void cost_test(struct ext4_fs *fs)
     CHECK(ext4_fread(&f,actual,sizeof(actual),&read_count)==EOK && read_count==sizeof(actual));
     CHECK(!memcmp(actual,bytes,sizeof(actual)));CHECK(ext4_fclose(&f)==EOK);
 }
+static void bitmap_test(void)
+{
+    unsigned char bitmap[16];
+    for(unsigned pattern=0;pattern<4;pattern++) {
+        for(unsigned i=0;i<sizeof(bitmap);i++)
+            bitmap[i]=(unsigned char[]){0xff,0xfe,0x55,0xa5}[pattern];
+        bitmap[5]&=~0x80U;
+        for(unsigned first=0;first<128;first++)
+        for(unsigned end=first;end<=128;end++) {
+            unsigned expected=first;
+            while(expected<end && (bitmap[expected/8]&(1U<<(expected%8)))) expected++;
+            uint32_t actual=UINT32_MAX;
+            int r=ext4_bmap_bit_find_clr(bitmap,first,end,&actual);
+            CHECK(expected==end ? r==ENOSPC : r==EOK && actual==expected);
+        }
+    }
+    puts("bitmap: aligned/unaligned subranges match independent byte oracle");
+}
 static struct ext4_timestamp get_time(const struct ext4_inode *inode,unsigned i,bool extended)
 {
     uint32_t low[3] = {inode->access_time,inode->modification_time,inode->change_inode_time};
@@ -544,6 +563,7 @@ static void corrupt_stats(struct ext4_fs *fs,const char *kind)
 }
 int main(int argc,char **argv)
 {
+    if(argc==2 && !strcmp(argv[1],"bitmap")){bitmap_test();return 0;}
     CHECK(argc>=3);CHECK(fault_block_open(&disk,argv[1])==0);unsigned char scratch[512];
     struct ext4_blockdev_iface iface={.open=dev_open,.close=dev_open,.bread=dev_read,.bwrite=dev_write,.flush=dev_flush,.ph_bsize=512,.ph_bcnt=disk.device.capacity_bytes/512,.ph_bbuf=scratch};
     struct ext4_blockdev dev={.bdif=&iface,.part_size=disk.device.capacity_bytes};
