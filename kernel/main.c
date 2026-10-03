@@ -485,21 +485,21 @@ static enum riscv_sv39_status build_kernel_page_table(
         return status;
     }
 
-    status = map_mmio_alias(&kernel_page_table,
-                            VIRT_UART_MMIO_PHYSICAL_BASE,
-                            VIRT_UART_MMIO_SIZE);
-    if (status != RISCV_SV39_STATUS_OK) {
-        return status;
+    struct dtb_memory_range uart_ranges[2];
+    unsigned uart_count = riscv_uart_tty_mapping_ranges(
+        (struct dtb_memory_range){VIRT_UART_MMIO_PHYSICAL_BASE, VIRT_UART_MMIO_SIZE},
+        &boot_irq.uart, uart_ranges);
+    if (!uart_count) return RISCV_SV39_STATUS_INVALID;
+    /* 固定早期sink与发现的UART可能共用页；同一PTE只能建立一次。 */
+    for (unsigned i = 0; i < uart_count; i++) {
+        status = map_mmio_alias(&kernel_page_table, uart_ranges[i].base, uart_ranges[i].size);
+        if (status != RISCV_SV39_STATUS_OK) return status;
     }
     status = map_mmio_alias(&kernel_page_table,
                             VIRT_RTC_MMIO_PHYSICAL_BASE,
                             VIRT_RTC_MMIO_SIZE);
     if (status != RISCV_SV39_STATUS_OK) {
         return status;
-    }
-    if (boot_irq.uart.registers.size) {
-        status = map_mmio_alias(&kernel_page_table, boot_irq.uart.registers.base, boot_irq.uart.registers.size);
-        if (status != RISCV_SV39_STATUS_OK) return status;
     }
     status = map_mmio_alias(&kernel_page_table, boot_irq.plic.base, boot_irq.plic.size);
     if (status != RISCV_SV39_STATUS_OK) return status;

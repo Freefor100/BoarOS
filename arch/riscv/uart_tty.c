@@ -278,3 +278,28 @@ int riscv_uart_tty_stop(struct riscv_uart_tty **owner)
 {
     return riscv_uart_tty_stop_report(owner, 0);
 }
+
+unsigned riscv_uart_tty_mapping_ranges(struct dtb_memory_range early,
+    const struct dtb_uart_info *info, struct dtb_memory_range ranges[2])
+{
+    if (!info || !ranges || !early.size || early.base > UINT64_MAX-early.size)
+        return 0;
+    struct dtb_memory_range spans[2] = {early, info->registers};
+    unsigned count = spans[1].size ? 2 : 1;
+    for (unsigned i = 0; i < count; i++) {
+        if (spans[i].base > UINT64_MAX-spans[i].size) return 0;
+        uint64_t end = spans[i].base+spans[i].size;
+        if (end > UINT64_MAX-BOAROS_PAGE_MASK) return 0;
+        spans[i].base &= ~BOAROS_PAGE_MASK;
+        spans[i].size = ((end+BOAROS_PAGE_MASK)&~BOAROS_PAGE_MASK)-spans[i].base;
+    }
+    if (count == 2 && spans[0].base < spans[1].base+spans[1].size &&
+        spans[1].base < spans[0].base+spans[0].size) {
+        uint64_t start = spans[0].base < spans[1].base ? spans[0].base : spans[1].base;
+        uint64_t a = spans[0].base+spans[0].size, b = spans[1].base+spans[1].size;
+        spans[0] = (struct dtb_memory_range){start, (a > b ? a : b)-start};
+        count = 1;
+    }
+    for (unsigned i = 0; i < count; i++) ranges[i] = spans[i];
+    return count;
+}

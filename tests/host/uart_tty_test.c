@@ -80,6 +80,16 @@ static void enqueue(unsigned count) { for(unsigned i=0;i<count;i++){input[input_
 int main(void) {
     struct kernel_heap heap={0};struct riscv_uart_tty *port=0;
     struct dtb_uart_info info={{0x10000000,4096},3686400,11,0,1};
+    struct dtb_memory_range mappings[2], early={0x10000000,4096};
+    assert(riscv_uart_tty_mapping_ranges(early,&info,mappings)==1);
+    assert(mappings[0].base==early.base&&mappings[0].size==4096);
+    struct dtb_uart_info other=info;other.registers.base+=256;
+    assert(riscv_uart_tty_mapping_ranges(early,&other,mappings)==1&&mappings[0].size==8192);
+    other.registers.base=0x20000000;
+    assert(riscv_uart_tty_mapping_ranges(early,&other,mappings)==2&&mappings[1].base==0x20000000);
+    other.registers.size=0;assert(riscv_uart_tty_mapping_ranges(early,&other,mappings)==1);
+    other.registers=(struct dtb_memory_range){UINT64_MAX-1,4096};
+    assert(riscv_uart_tty_mapping_ranges(early,&other,mappings)==0);
     for(unsigned f=0;f<4;f++) {
         fail_heap=f==0;fail_tty=f==1;fail_irq=f==2;fail_worker=f==3;
         assert(riscv_uart_tty_start(&port,&heap,&info,regs,10000)<0);

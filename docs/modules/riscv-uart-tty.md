@@ -4,7 +4,7 @@
 
 ## 入口与 owner
 
-root 的 heap 分配 port；port 保存 MMIO mapping、PLIC 登记、joinable worker、1024 个字符/状态 RX 项和 1024 字节内核控制台队列。port 创建 TTY 后发布串口实例，标准 OFD 才能绑定它。`riscv_root_boot_start_with_irq` 是生产入口；原 `riscv_root_boot_start` 保留模块启动的早期 console。生产路径由 `kernel/main.c` 映射 DTB 发现的范围、初始化 PLIC，然后调用带 IRQ 的入口。
+root 的 heap 分配 port；port 保存 MMIO mapping、PLIC 登记、joinable worker、1024 个字符/状态 RX 项和 1024 字节内核控制台队列。port 创建 TTY 后发布串口实例，标准 OFD 才能绑定它。`riscv_root_boot_start_with_irq` 是生产入口；原 `riscv_root_boot_start` 保留模块启动的早期 console。生产路径由 `kernel/main.c` 把固定早期 sink 与 DTB UART 的相交页合并后只映射一次，避免重复 PTE 冲突，然后初始化 PLIC，然后调用带 IRQ 的入口。
 
 worker 使用调度器标准 8 KiB 栈和任务存储。root baseline 在创建 port/worker 前采集，正常 finish 必须先回收用户任务及其 OFD/session 引用，再 drain、停止和 join UART worker、注销 IRQ、销毁 TTY、释放 port，最后检查 heap 与物理页。启动失败路径先释放准备期 OFD，再停止 UART；没有遗失的 port 指针。TTY 销毁仍被真实引用阻塞或硬件 drain 超时会保留 port，下一次 stop 可继续进展；合法 allocator 释放失败直接 fatal，不转换成清理重试。
 
