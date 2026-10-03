@@ -202,6 +202,18 @@ class CostReportTest(unittest.TestCase):
                     fields.update({prefix+'bucket.'+str(i):'0' for i in range(65)})
         return fields
     def render(self, fields): return ''.join(k+'='+v+'\n' for k,v in fields.items())
+    def test_frozen_pre_memory_schema(self):
+        from cost_report import supported_schemas
+        old=supported_schemas()[1]
+        self.assertEqual(len(old),203)
+        fields=self.valid()
+        added={name for name,_,_ in schema()[len(old):]}
+        fields={key:value for key,value in fields.items()
+                if not any(key.startswith(lane+'.'+name+'.')
+                    for lane in ('foreground','background','observer') for name in added)}
+        self.assertEqual(parse(self.render(fields),3,old)['epoch'],3)
+        with self.assertRaises(ValueError):parse(self.render(fields),3)
+
     def test_valid(self): self.assertEqual(parse(self.render(self.valid()), 3)['epoch'], 3)
     def test_reject_corrupt(self):
         for key, value in [('version','2'), ('epoch','2'), ('state','incomplete'),

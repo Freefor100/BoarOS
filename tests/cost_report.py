@@ -19,7 +19,8 @@ def supported_schemas():
     journal=[metric for metric in stored_pipeline if metric[0] not in pipeline]
     original=current[:next(i+1 for i,x in enumerate(current) if x[0]=='wake_to_run')]
     previous=current[:next(i for i,x in enumerate(current) if x[0]=='journal_seal_operations')]
-    return current,previous,stored_pipeline,journal,original
+    memory_previous=current[:next(i for i,x in enumerate(current) if x[0]=='heap_zero_bytes')]
+    return current,memory_previous,previous,stored_pipeline,journal,original
 
 def parse(text, epoch, metrics=None):
     metrics=schema() if metrics is None else metrics
