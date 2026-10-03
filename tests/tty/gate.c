@@ -1,5 +1,7 @@
 #define _GNU_SOURCE
 #include <errno.h>
+#include <fcntl.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -23,6 +25,31 @@ static void continued(int signal_number)
 }
 int main(int argc, char **argv)
 {
+    if (argc == 3 && !strcmp(argv[1], "wait-foreground")) {
+        char *end;
+        long target = strtol(argv[2], &end, 10);
+        if (*end || target <= 0 || target > INT32_MAX) return 2;
+        char path[64];
+        snprintf(path, sizeof(path), "/proc/%ld/stat", target);
+        for (;;) {
+            if (kill((pid_t)target, 0) && errno == ESRCH) return 5;
+            char status[512];
+            int fd = open(path, O_RDONLY);
+            ssize_t n = fd < 0 ? -1 : read(fd, status, sizeof(status) - 1);
+            if (fd >= 0) close(fd);
+            if (n > 0) {
+                status[n] = 0;
+                char *tail = strrchr(status, ')');
+                /* 实际原sleep已取得前台且进入睡眠，才允许宿主注入终端信号。 */
+                if (tail && tail[1] == ' ' && tail[2] == 'S' &&
+                    tcgetpgrp(0) == (pid_t)target) {
+                    puts("TTY_GATE_SLEEP_READY");
+                    return 0;
+                }
+            }
+            sched_yield();
+        }
+    }
     if (argc != 2) return 2;
     setvbuf(stdout, NULL, _IONBF, 0);
     int foreground = tcgetpgrp(0) == getpgrp();
