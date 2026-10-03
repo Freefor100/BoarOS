@@ -71,6 +71,7 @@ static void shutdown_for_dtb_error(enum dtb_status status)
 
 static void shutdown_for_dtb_error(enum dtb_status status)
 {
+    virt_uart_emergency_begin();
     if (status == DTB_STATUS_INVALID) {
         virt_uart_puts("BoarOS: invalid DTB\n");
     } else if (status == DTB_STATUS_NOT_FOUND) {
@@ -89,6 +90,7 @@ static void shutdown_for_boot_memory_error(enum boot_memory_status status)
 
 static void shutdown_for_boot_memory_error(enum boot_memory_status status)
 {
+    virt_uart_emergency_begin();
     if (status == BOOT_MEMORY_STATUS_INVALID) {
         virt_uart_puts("BoarOS: invalid boot memory input\n");
     } else if (status == BOOT_MEMORY_STATUS_EMPTY) {
@@ -105,6 +107,7 @@ static void shutdown_for_physical_page_error(enum physical_page_status status)
 
 static void shutdown_for_physical_page_error(enum physical_page_status status)
 {
+    virt_uart_emergency_begin();
     if (status == PHYSICAL_PAGE_STATUS_INVALID) {
         virt_uart_puts("BoarOS: invalid physical page layout\n");
     } else if (status == PHYSICAL_PAGE_STATUS_EMPTY) {
@@ -123,6 +126,7 @@ static void shutdown_for_sv39_error(enum riscv_sv39_status status)
 
 static void shutdown_for_sv39_error(enum riscv_sv39_status status)
 {
+    virt_uart_emergency_begin();
     if (status == RISCV_SV39_STATUS_INVALID) {
         virt_uart_puts("BoarOS: invalid Sv39 mapping\n");
     } else if (status == RISCV_SV39_STATUS_NO_MEMORY) {
@@ -142,6 +146,7 @@ static void shutdown_for_direct_map_error(void) __attribute__((noreturn));
 
 static void shutdown_for_direct_map_error(void)
 {
+    virt_uart_emergency_begin();
     virt_uart_puts("BoarOS: direct map verification failed\n");
     sbi_shutdown();
 }
@@ -151,6 +156,7 @@ static void shutdown_for_time_error(enum kernel_time_status status)
 
 static void shutdown_for_time_error(enum kernel_time_status status)
 {
+    virt_uart_emergency_begin();
     if (status == KERNEL_TIME_STATUS_INVALID_ARGUMENT) {
         virt_uart_puts("BoarOS: invalid time argument\n");
     } else if (status == KERNEL_TIME_STATUS_ALREADY_INITIALIZED) {
@@ -166,6 +172,7 @@ static void shutdown_for_timer_error(enum riscv_timer_status status)
 
 static void shutdown_for_timer_error(enum riscv_timer_status status)
 {
+    virt_uart_emergency_begin();
     if (status == RISCV_TIMER_STATUS_INVALID_ARGUMENT) {
         virt_uart_puts("BoarOS: invalid timer argument\n");
     } else if (status == RISCV_TIMER_STATUS_INVALID_FREQUENCY) {
@@ -191,6 +198,7 @@ static void shutdown_for_scheduler_error(
 static void shutdown_for_scheduler_error(
     enum kernel_scheduler_status status)
 {
+    virt_uart_emergency_begin();
     virt_uart_puts("BoarOS: scheduler startup/idle error status=");
     virt_uart_put_hex((unsigned long)status);
     virt_uart_putc('\n');
@@ -203,6 +211,7 @@ static void shutdown_for_root_boot_error(
 static void shutdown_for_root_boot_error(
     enum riscv_root_boot_status status)
 {
+    virt_uart_emergency_begin();
     virt_uart_puts("BoarOS: root boot error status=");
     virt_uart_put_hex((unsigned long)status);
     virt_uart_putc('\n');

@@ -16,6 +16,11 @@ worker 使用调度器标准 8 KiB 栈和任务存储。root baseline 在创建 
 - `virt_uart_putc` 先把真实内核字符保存在 16 KiB klog，再按 console level 送到独立 port 队列。`kernel_console_putc` 是不写 klog 的诊断输出；TTY 用户/echo 不经过这两条路径。queue 满时记录 `console_dropped`，IRQ 打印不阻塞。`virt_uart_emergency_begin` 使 fatal 输出改用既有固定轮询 sink；pre/post runtime 也保持轮询输出。
 - stop 首先阻止新 TTY 工作并关闭输入，在正常关闭中保留已接受且未 flush 的 TX。超过一秒仍无法 drain 返回 EIO，worker 已 join，但队列、MMIO 和 IRQ 登记仍有 port owner；再次 stop 可重建 worker 重试。成功停止在 join 后注销 IRQ，才释放 TTY/port。`stop_report` 在 drain/join 完成后、释放前冻结最终计数；失败或空 owner 不修改输出，root 保存该固定快照供聚焦验证。
 
+fatal入口先关闭中断并选择同步sink，绕过日志级别和worker队列；物理页释放诊断也
+在打印元数据前选择该入口。普通内核日志仍按原环与级别处理。宿主反例证明旧路由
+在console关闭时丢失fatal字符，以及分配器诊断未选择同步sink；修复后硬件输出和
+allocator fatal原因均保留。该检查保护新UART接入，不反推历史fatal的唯一触发链。
+
 ## 验证
 
 ```sh

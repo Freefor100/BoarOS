@@ -22,6 +22,7 @@ static void riscv_trap_fatal(const struct riscv_trap_frame *frame)
 
 static void riscv_trap_fatal(const struct riscv_trap_frame *frame)
 {
+    virt_uart_emergency_begin();
     virt_uart_puts("BoarOS: fatal trap scause=");
     virt_uart_put_hex(frame->scause);
     virt_uart_puts(" sepc=");
@@ -42,6 +43,7 @@ static void riscv_timer_fatal(const struct riscv_trap_frame *frame,
 static void riscv_timer_fatal(const struct riscv_trap_frame *frame,
                               enum riscv_timer_status status)
 {
+    virt_uart_emergency_begin();
     virt_uart_puts("BoarOS: timer error status=");
     virt_uart_put_hex((unsigned long)status);
     virt_uart_puts(" scause=");
@@ -60,6 +62,7 @@ static void riscv_scheduler_fatal(
     const struct riscv_trap_frame *frame,
     enum kernel_scheduler_status status)
 {
+    virt_uart_emergency_begin();
     struct kernel_task *curr = kernel_task_current();
     kernel_pid_t tid = 0;
     virt_uart_puts("BoarOS: scheduler error status=");
@@ -84,6 +87,7 @@ static void riscv_user_fault_resolver_fatal(
     const struct riscv_trap_frame *frame,
     enum kernel_mm_status status)
 {
+    virt_uart_emergency_begin();
     virt_uart_puts("BoarOS: user fault resolver error status=");
     virt_uart_put_hex((unsigned long)status);
     virt_uart_puts(" scause=");

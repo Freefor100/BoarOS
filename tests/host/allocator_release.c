@@ -21,8 +21,11 @@ struct kernel_io_context *kernel_io_context_current(void) { return &io_context; 
 
 /* Replace only the hardware sink: the allocator emits the real diagnostic. */
 static unsigned int console_characters;
+static int emergency_selected;
+void kernel_console_emergency_begin(void) { emergency_selected = 1; }
 void kernel_console_putc(char character)
 {
+    assert(emergency_selected);
     console_characters++;
     assert(write(STDOUT_FILENO, &character, 1U) == 1);
 }
