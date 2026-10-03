@@ -141,3 +141,15 @@ Linux commit。较长请求的上游 RISC-V usercopy 进展问题留作独立 re
 实际秒值。固定Linux profile启用Goldfish RTC与HCTOSYS，Linux用其真实devtmpfs节点。
 启动UART可能在保留的ABI前缀前插入内核半行；normalizer只截掉前缀之前的串口文本，
 仍严格核对完整payload、全部ID、顺序、计数、errno及最终回收。
+
+## 串口终端差分
+
+通用runner的stdin为无输入设备，不能代替真实UART交互。`make test-tty-diff-riscv`
+使用独立raw宿主PTY、关闭monitor混用，对相同RV64 ELF执行27条termios/读取及80条
+作业控制记录；与原1207条通用差分分别计量。客体按FIONREAD、任务状态、pipe/wait
+握手推进，记录返回值、errno、关系与字节，不比较分配的PID或实际墙钟。原始字节
+不做全局CR归一化；同时核对真实wait status与BoarOS最终heap-live=0。
+
+测试输入和可重建命令见[TTY模块](kernel-tty.md)，原ash/stty验收另由
+`make test-tty-riscv`负责。两个入口不能由宿主模型或编译成功替代；宿主PTY也不代表
+客体拥有PTY。

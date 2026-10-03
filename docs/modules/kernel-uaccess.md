@@ -47,6 +47,11 @@ enum kernel_uaccess_status kernel_copy_string_from_user(
 
 驻留页每个基页进行一次三级软件页表查询和一次物理页解析，随后执行页内线性字节复制；首次提交的页额外承担 VMA 二分查找、页分配/清零、PTE 写入和单页 `SFENCE.VMA`。uaccess 不切换 `satp`，也不修改 `sstatus.SUM`。文件 `read` 已以 4 KiB staging chunk 使用该路径，但当前只用结构成本和 QEMU 正确性测试约束，尚未取得开发板吞吐、TLB miss 或 cache 数据。应在真实工作负载上比较软件遍历与 RISC-V SUM+异常表快路径，再决定阈值或替换策略。
 
+COST 构建在成功解析后的固定长度页内 chunk 记录实际复制字节、次数、单次最大值
+及经过 ticks；解析失败、权限检查和字符串扫描不归入该复制样本。采样不改变已复制
+前缀。Lua 定点结果只归因这段复制，不能用它排除解析、缺页或全部内存成本；
+[工具链记录](../learning/offline-toolchain-probe.md#内存操作的有限归因与未上线候选2026-10-03)保留了字节实现与未上线宽字候选的比较。
+
 QEMU `virt` 与 VisionFive 2 共享这套 Sv39 实现，板级 RAM/MMIO 差异已由启动内存和页表建立隔离。LoongArch 后续为相同公共接口提供 16 KiB/三级页表实现，并使用自己的用户地址范围与硬件访问机制。
 
 ## 验证与限制

@@ -32,15 +32,17 @@ heap清零/搬迁与已解析用户页内复制，以原Lua工程判断一次局
 
 | 阶段 | 状态与验收 |
 |---|---|
-| T1 实例与UART | [ ] OFD持有实例；DTB UART/IRQ、1024项RX、4KiB输入/echo/TX及1KiB内核输出队列；有界IRQ和可join worker、失败回滚与最终回收。 |
-| T2 行规程 | [ ] 真实termios、canonical/EOF、VMIN/VTIME、flow/drain/flush、poll与整次readv continuation；交付前缀和已消费输入分别对照Linux。 |
-| T3 会话与应用 | [ ] ctty、稳定SID/前台PGID、终端信号、后台I/O、旧OFD hangup代次；原ash的Ctrl-C/Ctrl-Z、jobs/fg/bg和退出。 |
-| M1 有限归因 | [ ] 六项消费者COST，聚合不超过64KiB、每任务64B；一次优化前Lua定点窗口，保留历史schema。 |
-| M2 内存原语 | [ ] alias-safe对齐word及byte回退；heap与已解析页内chunk接入，保护重叠、页边界、fault前缀和owner。 |
-| M3 应用价值 | [ ] 一次独立微fixture、CPU候选三次关闭观测Lua启动；实际成本、程序/同步/卸载、资源与剩余差距分别解释。 |
-| 集成收口 | [ ] 一次完整RV64、真实libc、1207条及新增ABI、scale/栈与受影响回归；原串口应用及Lua集成功能；单向合入兼容分支。 |
+| T1 实例与UART | [x] OFD持有实例；DTB UART/IRQ、1024项RX、4KiB输入/echo/TX及1KiB内核输出队列；有界IRQ和可join worker；初始TEMT忙的独立失败/等待反例已修复，正常stop超时保留owner及恢复回收成立。 |
+| T2 行规程 | [x] 真实termios、canonical/EOF、VMIN/VTIME、flow/drain/flush、poll与整次readv continuation；交付前缀和已消费输入分别对照Linux。 |
+| T3 会话与应用 | [x] ctty、稳定SID/前台PGID、终端信号、后台I/O、旧OFD hangup代次；原ash的Ctrl-C/Ctrl-Z、jobs/fg/bg和退出。 |
+| M1 有限归因 | [x] 六项消费者COST，聚合不超过64KiB、每任务64B；一次优化前Lua定点窗口，保留历史schema。 |
+| M2 内存原语 | [x] 实验分支验证alias-safe word、byte回退及heap/页内chunk；微实验有效，Lua无可验证收益，生产保留字节实现，候选未上线。 |
+| M3 应用价值 | [x] 一次独立微fixture、CPU候选三次关闭观测Lua启动；实际成本、程序/同步/卸载、资源与剩余差距分别解释。 |
+| 集成收口 | [x] 完整RV64、真实libc、1207通用＋107终端记录、scale/栈/FIFO及原Lua集成功能；兼容候选的旧glibc TCP与原串口应用通过，单向合入兼容分支。 |
 
-当前已完成调查和接口取舍，以上项目尚未实施或验收。PTY、凭据、调度策略更换、
+TTY与有限CPU归因已实施并分别验收；107条终端同ELF记录一致，原ash/stty两种transport完成。
+CPU选定内层工作合计约0.170秒/170秒窗口，宽字候选没有工程收益，未上线。完整Lua集成功能
+与兼容入口通过；初始TEMT忙的启动回滚和空worker等待缺口经独立反例修复。PTY、凭据、调度策略更换、
 存储重构及新网络能力不进入本轮；缺少收益的CPU候选不上线，也不自动追加其他改造。
 原始输出与机器快照归忽略的build，Git保存人类可读结论和重建命令。
 下一应用候选收敛为PTY＋原BusyBox script，另行确认范围；LoongArch和SMP是独立依赖。
@@ -54,7 +56,7 @@ heap清零/搬迁与已解析用户页内复制，以原Lua工程判断一次局
 | 新封口政策下仍有细碎版本或重复准备 | 增量组织/合并；先量化，核对脏数据年龄、内存/日志空间和同步尾延迟 |
 | checkpoint阻塞提交或最终排空成本显著 | 有界批次和调度；核对积压、日志环绕、低内存、卸载及完整恢复 |
 | 非阻塞发送复制放大或固定热缓存运行成本高 | 发送credit约束暂存、重复解析/复制/查询；先核对错误优先级，保留短写、EFAULT前缀、取消和页生命周期 |
-| Lua构建在tmpfs仍有差距，页周转及VMA访问较多 | 先分解页初始化/复制与VMA点查询CPU成本，选一个因果机制；不以计数直接承诺收益 |
+| Lua构建仍有差距，选定heap清零/搬迁与页内复制不足以解释 | 核对用户程序运行、页解析/ELF及未测固定成本，再选一个机制；VMA指标是比较次数，不能当查询数或时间 |
 | 真实大映射/多等待者负载规模退化 | resident范围索引、deadline索引或安全长操作边界；核对维护成本、OOM和取消 |
 
 每次选择一个有独立证据的机制，不把这张候选表当成新排期，不换调度器来解释尚未归因的分布。
@@ -93,7 +95,7 @@ glibc四进程整命令仍增加0.73%。该轮的prepare读取、1547次FLUSH和
 | LTP/helper | abort01到chown ENOSYS；cgroup_fj_proc无参数在Linux/BoarOS都等待，不是调度死锁；helper身份由固定上游调用规则确认 |
 | 路径truncate | 尚未实现；本轮错误恢复使用已交付ftruncate，原Lua/GCC/make保持不变 |
 | 用户内存/信号 | mremap、按操作madvise、mlock、sigaltstack、实时信号队列、共享文件/PI futex待真实应用需求触发 |
-| 系统与平台 | 固定root查询不等于完整凭据/权限；无完整TTY、外部IPv6/DNS/TLS、公网配置、SMP/实板、kernel-la，不声明完整Linux兼容或硬实时 |
+| 系统与平台 | 固定root查询不等于完整凭据/权限；无PTY/termios2/完整modem控制、外部IPv6/DNS/TLS、公网配置、SMP/实板、kernel-la，不声明完整Linux兼容或硬实时 |
 
 下面P/N/L小节保留稳定能力编号、契约、依赖和已有验证入口；只以上面的当前队列决定近期实施。
 
@@ -209,8 +211,8 @@ glibc四进程整命令仍增加0.73%。该轮的prepare读取、1547次FLUSH和
 ### P2d 会话、进程组与 TTY
 
 - [x] 统一身份对象承担 TID/TGID/PGID/SID 角色引用；已实现 setsid/setpgid/getpgid/getsid，105 条差分覆盖组长、父子/exec、zombie、组信号与等待、身份继续存活及孤儿组。见[线程证据](learning/threads-and-futex.md)。
-- [x] 原始消费者验证 daemon 的 SID/PGID 实际变化；孤儿组按固定 Linux 的退出/收养触发 HUP/CONT，SA_SIGINFO 与 sigwait 均保留 SI_KERNEL。TTY 行为未扩展。见[消费者诊断](learning/session-consumers.md)。
-- [ ] TTY 对象出现后接控制终端、前台组、作业控制与终端信号；无 TTY 阶段不能宣称交互 shell 作业控制完整。对象末引用与关闭唤醒分别验收。
+- [x] 原始消费者验证 daemon 的 SID/PGID 实际变化；孤儿组按固定 Linux 的退出/收养触发 HUP/CONT，SA_SIGINFO 与 sigwait 均保留 SI_KERNEL。该历史诊断未覆盖TTY；后来串口交付见[消费者](learning/session-consumers.md#原串口ashstty与控制终端2026-10-03)。
+- [x] 串口TTY已接ctty、稳定前台组、终端信号和原ash/stty作业控制，覆盖末引用、挂断与取消；PTY、其他行规程和完整modem控制不计完成，下一应用另行确认。
 
 ### P2e clone、凭据与资源限制
 
