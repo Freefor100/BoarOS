@@ -31,6 +31,8 @@ PID 1 配置，直接启动官方原盘的 `/musl/busybox`。不需要本地 run
 每组在自己的 libc 根目录执行原 `*_testcode.sh`，分别设置 `LD_LIBRARY_PATH`，
 避免同时搜索两套 libc。musl 的普通/sf 加载器名指向镜像自带 libc；
 glibc 加载器指向其真实文件。proc 内容来自真实内核对象，没有假随机设备或测试输出。
+LTP 阶段设置实际 `LTPROOT`，其 `testcases/bin` 排在 libc 根目录之前；否则 `. test.sh`
+会错误加载 Lua 的同名驱动。其他组保留自己的根目录查找顺序。
 原镜像两侧的 `hello` 辅助脚本都写死执行 `/code/lmbench_src/bin/build/lmbench_all`；
 进入 lmbench 组前，用户态只将该路径链接到当前 libc 目录下镜像自带的真实二进制，
 不改动 `hello` 或组脚本。

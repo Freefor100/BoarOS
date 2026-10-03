@@ -41,6 +41,9 @@ for group in $groups; do
             echo "BOAROS-EVAL ENTER $group-$libc"
             set +e
             if [ "$group" = ltp ]; then
+                export LTPROOT=/$libc/ltp
+                # LTP 的 test.sh 必须先于 libc 根目录的同名 Lua 驱动脚本。
+                export PATH=/bin:$LTPROOT/testcases/bin:/$libc:.
                 export BOAROS_CASE_SHELL=/$libc/busybox
                 # 仅在临时副本中接入逐项监督，原循环、参数、标记和判分行均保留。
                 if ! $BB sh /tmp/boaros-ltp-hook.sh ./ltp_testcode.sh /tmp/boaros-ltp-$libc.sh; then
