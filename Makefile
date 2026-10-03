@@ -1702,3 +1702,19 @@ test-tty-host:
 	build/host/tty/flags
 	cc -std=gnu11 -O1 -g -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=12 -idirafter include -ffunction-sections -fdata-sections -Wl,--gc-sections -fsanitize=address,undefined tests/tty/group_host.c kernel/sched/tty.c kernel/pid.c -o build/host/tty/group
 	build/host/tty/group
+
+TTY_PROBE_RV := $(BUILD_DIR)/tests/user/tty-probe-rv
+TTY_JOBCTRL_RV := $(BUILD_DIR)/tests/user/tty-jobctrl-rv
+$(TTY_PROBE_RV): tests/tty/probe.c $(MUSL_STAMP)
+	@mkdir -p $(dir $@)
+	$(MUSL_ROOT)/bin/musl-gcc $(MUSL_GCC_FLAGS) -static -pthread -O2 -Wall -Wextra -Werror $< -o $@
+$(TTY_JOBCTRL_RV): tests/tty/jobctrl_probe.c $(MUSL_STAMP)
+	@mkdir -p $(dir $@)
+	$(MUSL_ROOT)/bin/musl-gcc $(MUSL_GCC_FLAGS) -static -O2 -Wall -Wextra -Werror $< -o $@
+
+.PHONY: test-tty-riscv test-tty-diff-riscv
+test-tty-riscv: $(KERNEL_RV) $(MUSL_STAMP)
+	python3 -B tests/tty/riscv.py --kernel $(KERNEL_RV) --qemu $(QEMU_RISCV64)
+test-tty-diff-riscv: $(KERNEL_RV) $(TTY_PROBE_RV) $(TTY_JOBCTRL_RV)
+	python3 -B tests/tty/riscv.py --kernel $(KERNEL_RV) --qemu $(QEMU_RISCV64) --probe $(TTY_PROBE_RV)
+	python3 -B tests/tty/riscv.py --kernel $(KERNEL_RV) --qemu $(QEMU_RISCV64) --probe $(TTY_JOBCTRL_RV) --no-ctty
