@@ -63,7 +63,10 @@ int kernel_tty_create(struct kernel_heap *heap,const struct kernel_tty_transport
     (void)heap;if(fail_tty)return -KERNEL_ENOMEM;test_transport=t;transport_owner=o;*out=(void*)2;
     struct kernel_tty_termios settings={.cflag=0x10b2};return t->configure(o,&settings);
 }
-int kernel_tty_destroy(struct kernel_tty **owner) { *owner=0;return 0; }
+int kernel_tty_destroy(struct kernel_tty **owner) {
+    if(!test_transport->drained(transport_owner))return -KERNEL_EBUSY;
+    *owner=0;return 0;
+}
 void kernel_tty_publish_serial(struct kernel_tty *tty) { (void)tty; }
 void kernel_tty_shutdown(struct kernel_tty *tty) { (void)tty;shutdown_count++; }
 void kernel_tty_receive(struct kernel_tty *tty,const struct kernel_tty_rx *input_rx,size_t count) {

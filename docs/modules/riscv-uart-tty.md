@@ -21,6 +21,20 @@ fatal入口先关闭中断并选择同步sink，绕过日志级别和worker队�
 在console关闭时丢失fatal字符，以及分配器诊断未选择同步sink；修复后硬件输出和
 allocator fatal原因均保留。该检查保护新UART接入，不反推历史fatal的唯一触发链。
 
+准备阶段在单hart关中断区间内创建core、登记IRQ和worker，最后才发布owner/TTY。
+仅在这个明确的setup rollback状态，软件对象尚未接受TX、没有可见客户，PIO硬件里
+早期raw的尾字节也不借用port/core内存：撤销IRQ、stop/join可能已有worker后，可以
+释放未发布的软件owner而不等待该尾字节。回调断言无接受的TX、无队列/登记/worker；
+这不放宽已发布port的tcdrain/stop TEMT承诺。正常启动从初始LSR记录尚忙的硬件尾字节，
+即使第一轮没有新TX也保留10ms观察期限，TEMT变空后通知真实core的drain等待者。
+
+RV64/COST关闭构建的DWARF对象大小为port **3272 B**、core **28936 B**。真实create模型
+核对了这两个分配请求；当前heap的大对象按请求页数上取整为buddy order，分别占1与8个
+4KiB页，合计9个heap页（36KiB）。worker另有标准8KiB物理栈（2页，含16B guard/canary区域）
+和2368B任务metadata（独立1页），固定直接owner合计12页（48KiB），不包含后续OFD实例、
+用户任务、session/PID引用或其他heap owner。此次编译worker自身栈帧608B，仍需与调用链及
+运行高水位分开解释，不以单个`.su`代替完整运行栈边界。
+
 ## 验证
 
 ```sh
@@ -28,6 +42,6 @@ make test-uart-host
 make build/riscv/arch/riscv/uart_tty.o
 ```
 
-宿主 fixture 使用生产传输实现与真实 IIR/LSR/IER 行为模型，TTY 边界只模拟回调；保护 IRQ 预算、满环/恢复和索引回绕、LSR 错误位、控制台 overflow、部分发送、发送 credit IRQ、TEMT 期限、modem/configure、四类启动失败与 unregister，以及关闭超时 owner 保留/恢复。ASAN/UBSAN 验证 owner 清理。DTB fixture 另验证地址/clock/route/layout 与失败保持输出。真实 U-mode 和整合回归由集成 owner 验证，宿主 fixture 或 object 编译不等于真实 TTY ABI 已通过。
+宿主 fixture 使用生产传输实现与真实 IIR/LSR/IER 行为模型，TTY 边界只模拟回调；保护 IRQ 预算、满环/恢复和索引回绕、LSR 错误位、控制台 overflow、部分发送、发送 credit IRQ、TEMT 期限、modem/configure、四类启动失败与 unregister，以及关闭超时 owner 保留/恢复。新增fixture链接实际 `fs/tty.c`，分别保护TEMT忙时IRQ/worker启动失败的rollback、第一空worker期限/真实drain唤醒和正常stop超时保留/恢复；准备状态的公开入口不可接受TX，模型同时检查IRQ临界区。ASAN/UBSAN 验证 owner 清理。DTB fixture 另验证地址/clock/route/layout 与失败保持输出。真实 U-mode 和整合回归由集成 owner 验证，宿主 fixture 或 object 编译不等于真实 TTY ABI 已通过。
 
 固定资料：`references/qemu/hw/riscv/virt.c` 与 `hw/char/serial.c`，QEMU v11.1.0 commit `84f07211cc5b4fc6a371559bf8a5de4fb068e648`；`references/linux/drivers/tty/serial/8250/8250_port.c`，Linux commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`。本实现没有复制外部代码。当前范围不包含 modem 输入查询、硬件流控、多串口、DMA、PTY 或实板验证。

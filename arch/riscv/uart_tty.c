@@ -22,6 +22,7 @@ struct riscv_uart_tty {
     unsigned char console[CONSOLE_SIZE];
     uint32_t rx_read, rx_write, console_read, console_write, frequency;
     uint8_t ier, input_enabled, registered, stopping, tx_active, turn;
+    uint8_t published, setup_rollback;
     uint64_t stop_deadline;
     int stop_error;
 };
@@ -85,6 +86,8 @@ static size_t transmit(void *owner, const unsigned char *bytes, size_t size)
 {
     struct riscv_uart_tty *p = owner;
     uintptr_t irq = riscv_interrupt_save();
+    /* 准备中的port尚无可见客户；回调不能替外部提前接受TX。 */
+    if (!p->published || p->setup_rollback) __builtin_trap();
     size_t accepted = 0;
     while (accepted < size && (UART_READ(p, 5) & 32)) {
         UART_WRITE(p, 0, bytes[accepted++]);
@@ -97,7 +100,14 @@ static int drained(void *owner)
 {
     struct riscv_uart_tty *p = owner;
     uintptr_t irq = riscv_interrupt_save();
-    int ready = p->console_read == p->console_write && (UART_READ(p, 5) & 64);
+    int ready;
+    if (p->setup_rollback) {
+        /* 未发布且无接受的TX；旧raw shift字节不借用这些PIO软件对象。 */
+        if (p->published || p->registered || p->worker.task ||
+            p->statistics.transmitted || p->console_read != p->console_write ||
+            kernel_tty_output_pending(p->tty)) __builtin_trap();
+        ready = 1;
+    } else ready = p->console_read == p->console_write && (UART_READ(p, 5) & 64);
     riscv_interrupt_restore(irq); return ready;
 }
 static void kick(void *owner)
@@ -162,6 +172,8 @@ static void worker(void *owner)
     struct riscv_uart_tty *p = owner;
     for (;;) {
         uintptr_t irq = riscv_interrupt_save();
+        if (p->setup_rollback) { riscv_interrupt_restore(irq); return; }
+        if (!p->published) __builtin_trap();
         struct kernel_tty_rx batch[256]; size_t received = 0;
         while (received < 256 && p->rx_read != p->rx_write)
             batch[received++] = p->rx[p->rx_read++ % RX_SIZE];
@@ -216,27 +228,32 @@ int riscv_uart_tty_start(struct riscv_uart_tty **owner, struct kernel_heap *heap
     if (status != KERNEL_HEAP_STATUS_OK) __builtin_trap();
     p->heap = heap; p->info = *info; p->mapping = mapping; p->frequency = frequency;
     kernel_wait_queue_init(&p->work);
+    uintptr_t irq = riscv_interrupt_save();
     UART_WRITE(p, 3, 3); set_ier(p, 0);
     UART_WRITE(p, 2, 7); /* FIFO enable/reset只在没有接受运行期字节时执行。 */
     int error = kernel_tty_create(heap, &transport, p, &p->tty);
     if (error) goto fail;
-    uintptr_t irq = riscv_interrupt_save();
-    if (!riscv_plic_register(info->source, interrupt, p)) { error = -KERNEL_EIO; goto fail_irq; }
+    /* THRE不代表TEMT；第一批没有新TX时也要观察早期硬件尾字节。 */
+    p->tx_active = !(UART_READ(p, 5) & 64);
+    if (!riscv_plic_register(info->source, interrupt, p)) { error = -KERNEL_EIO; goto fail; }
     p->registered = 1;
     if (kernel_thread_create_joinable(worker, p, &p->worker) != KERNEL_SCHEDULER_STATUS_OK) {
-        error = -KERNEL_ENOMEM; goto fail_irq;
+        error = -KERNEL_ENOMEM; goto fail;
     }
+    p->published = 1;
     *owner = p; console_port = p; kernel_tty_publish_serial(p->tty);
     riscv_interrupt_restore(irq); return 0;
-fail_irq:
-    set_ier(p, 0);
-    if (p->registered) { riscv_plic_unregister(p->info.source, p); p->registered = 0; }
-    riscv_interrupt_restore(irq);
 fail:
     set_ier(p, 0);
+    if (p->registered) { riscv_plic_unregister(p->info.source, p); p->registered = 0; }
+    if (p->published || console_port == p || p->statistics.transmitted ||
+        p->console_read != p->console_write ||
+        (p->tty && kernel_tty_output_pending(p->tty))) __builtin_trap();
+    p->setup_rollback = 1;
+    if (p->worker.task) { wake(p); kernel_thread_join(&p->worker); }
     if (p->tty && kernel_tty_destroy(&p->tty)) __builtin_trap();
     if (kernel_heap_release(heap, p) != KERNEL_HEAP_STATUS_OK) __builtin_trap();
-    return error;
+    riscv_interrupt_restore(irq); return error;
 }
 int riscv_uart_tty_console(char character)
 {
