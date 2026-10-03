@@ -168,6 +168,7 @@ C_SOURCES := \
 	fs/files/socket.c \
 	fs/fs_context.c \
 	fs/char_device.c \
+	fs/tty.c \
 	fs/rtc_device.c \
 	fs/open_file.c \
 	fs/pipe.c \
@@ -199,6 +200,7 @@ C_SOURCES := \
 	kernel/sched/process.c \
 	kernel/sched/proc.c \
 	kernel/sched/signal.c \
+	kernel/sched/tty.c \
 	kernel/sched/wait.c \
 	kernel/sched/sync.c \
 	kernel/sched/futex.c \
@@ -272,6 +274,7 @@ TEST_RUNTIME_C_SOURCES := \
 	fs/files/socket.c \
 	fs/fs_context.c \
 	fs/char_device.c \
+	fs/tty.c \
 	fs/rtc_device.c \
 	fs/lwext4_port.c \
 	fs/open_file.c \
@@ -301,6 +304,7 @@ TEST_RUNTIME_C_SOURCES := \
 	kernel/sched/process.c \
 	kernel/sched/proc.c \
 	kernel/sched/signal.c \
+	kernel/sched/tty.c \
 	kernel/sched/wait.c \
 	kernel/sched/sync.c \
 	kernel/sched/futex.c \
@@ -1688,3 +1692,11 @@ test-offline-project-tmpfs-riscv: $(OFFLINE_PROJECT_RV) $(KERNEL_RV) prepare-off
 test-uart-host:
 	python3 -B tests/host/dtb_uart_test.py
 	./tests/uart-host.sh
+
+.PHONY: test-tty-host
+test-tty-host:
+	@mkdir -p build/host/tty
+	cc -std=gnu11 -O1 -g -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=12 -Itests/host/random -idirafter include -fsanitize=address,undefined tests/tty/core_host.c fs/tty.c -o build/host/tty/core
+	build/host/tty/core
+	cc -std=gnu11 -O1 -g -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=12 -Itests/host/random -idirafter include -fsanitize=address,undefined tests/tty/flags_host.c fs/tty.c -o build/host/tty/flags
+	build/host/tty/flags

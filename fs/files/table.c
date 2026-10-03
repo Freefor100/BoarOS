@@ -33,7 +33,7 @@ enum kernel_files_status kernel_files_ioctl(
                                                        linux_result);
     if (status != KERNEL_FILES_STATUS_OK || *linux_result) return status;
     *linux_result = description->device && description->device->ioctl
-        ? description->device->ioctl(description->device_instance, kernel_task_current(), mm, command, argument) : -KERNEL_ENOTTY;
+        ? description->device->ioctl(description->device_instance, kernel_task_current(), files, &description, mm, command, argument) : -KERNEL_ENOTTY;
     enum kernel_open_file_status release = kernel_open_file_release(&description);
     if (release == KERNEL_OPEN_FILE_STATUS_CLEANUP_REQUIRED && description) {
         kernel_files_queue_description(files, description);

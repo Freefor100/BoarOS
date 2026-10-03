@@ -365,7 +365,7 @@ static enum kernel_files_status read_pinned(
         }
         if (device->readv) {
             enum kernel_files_status status = device->readv(description->device_instance,
-                kernel_task_current(), mm, iov, iov_count,
+                kernel_task_current(), files, description_owner, 0, mm, iov, iov_count,
                 count > KERNEL_FILES_MAX_RW_COUNT ? KERNEL_FILES_MAX_RW_COUNT : count,
                 description->open_flags, linux_result);
             if (*linux_result < 0) files->record->statistics.read_failures++;
@@ -683,12 +683,19 @@ enum kernel_files_status kernel_files_readv(
         status = KERNEL_FILES_STATUS_OK;
         goto out;
     }
-    status = read_pinned(files, mm, description, &description,
+    if (description->device && description->device->readv) {
+        status = description->device->readv(description->device_instance,
+            kernel_task_current(), files, &description,
+            iov == local ? 0 : (void **)&iov, mm, iov, (size_t)iovcnt,
+            total, description->open_flags, linux_result);
+        if (*linux_result < 0) files->record->statistics.read_failures++;
+        else files->record->statistics.bytes_read += (uint64_t)*linux_result;
+    } else status = read_pinned(files, mm, description, &description,
                          iov, (size_t)iovcnt,
                          total, linux_result, 0U, 0, 0);
     dispatched = 1;
 out:
-    if (iov != local &&
+    if (iov && iov != local &&
         kernel_files_release_allocation(files, iov) ==
             KERNEL_FILES_STATUS_STATE) {
         status = KERNEL_FILES_STATUS_STATE;
@@ -1159,11 +1166,6 @@ static enum kernel_files_status buffered_write_request(
 {
     uint64_t total = 0U;
 
-    if (description->device && description->device->writev) {
-        return description->device->writev(description->device_instance,
-            kernel_task_current(), mm, iov, iov_count, count,
-            description->open_flags, linux_result);
-    }
     if (description->device && description->device->discard_writes) {
         size_t consumed = 0U;
         int result = description->device->write(description->device_instance, kernel_task_current(), description->open_flags, 0, (size_t)count, &consumed);
@@ -1557,7 +1559,11 @@ enum kernel_files_status kernel_files_write(
         return release_io_description(files, &description,
                                       KERNEL_FILES_STATUS_OK);
     }
-    status = write_request(files, mm, description, &iov, 1U, count,
+    if (description->device && description->device->writev) {
+        status = description->device->writev(description->device_instance,
+            kernel_task_current(), files, &description, 0, mm, &iov, 1U,
+            count, description->open_flags, linux_result);
+    } else status = write_request(files, mm, description, &iov, 1U, count,
                            0, 0U, linux_result, 0U);
     if (status == KERNEL_FILES_STATUS_OK) {
         account_write(files, *linux_result);
@@ -1703,10 +1709,15 @@ enum kernel_files_status kernel_files_writev(
     if (total > KERNEL_FILES_MAX_RW_COUNT) {
         total = KERNEL_FILES_MAX_RW_COUNT;
     }
-    status = write_request(files, mm, description, iov, iovcnt, total,
+    if (description->device && description->device->writev) {
+        status = description->device->writev(description->device_instance,
+            kernel_task_current(), files, &description,
+            iov == local ? 0 : (void **)&iov, mm, iov, iovcnt,
+            total, description->open_flags, linux_result);
+    } else status = write_request(files, mm, description, iov, iovcnt, total,
                            0, 0U, linux_result, 0U);
 out:
-    if (iov != local &&
+    if (iov && iov != local &&
         kernel_files_release_allocation(files, iov) ==
             KERNEL_FILES_STATUS_STATE) {
         status = KERNEL_FILES_STATUS_STATE;

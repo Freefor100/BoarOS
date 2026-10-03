@@ -25,9 +25,9 @@ static void rtc_release(void *instance)
 static unsigned leap(unsigned year)
 { return year % 4 == 0 && (year % 100 != 0 || year % 400 == 0); }
 struct rtc_time { int sec, min, hour, mday, mon, year, wday, yday, isdst; };
-static int rtc_ioctl(void *instance, struct kernel_task *caller, struct kernel_mm *mm, uint64_t command, uint64_t argument)
+static int rtc_ioctl(void *instance, struct kernel_task *caller, struct kernel_files *files, struct kernel_open_file_description **owner, struct kernel_mm *mm, uint64_t command, uint64_t argument)
 {
-    (void)instance; (void)caller;
+    (void)instance; (void)caller; (void)files; (void)owner;
     if (command != UINT64_C(0x80247009)) {
         switch (command) {
         case 0x4004700c: case 0x4008700c: case 0x4004700e: case 0x4008700e:

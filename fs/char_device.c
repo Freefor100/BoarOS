@@ -9,6 +9,7 @@
 #include <kernel/task.h>
 #include "open_file_internal.h"
 #include <kernel/uaccess.h>
+#include <kernel/tty.h>
 
 #include <string.h>
 
@@ -120,9 +121,9 @@ static uint32_t random_poll(void *instance, uint32_t flags, uint32_t requested,
                                  : KERNEL_POLLOUT | KERNEL_POLLWRNORM;
 }
 
-static int random_ioctl(void *instance, struct kernel_task *caller, struct kernel_mm *mm, uint64_t command, uint64_t argument)
+static int random_ioctl(void *instance, struct kernel_task *caller, struct kernel_files *files, struct kernel_open_file_description **owner, struct kernel_mm *mm, uint64_t command, uint64_t argument)
 {
-    (void)instance; (void)caller;
+    (void)instance; (void)caller; (void)files; (void)owner;
     switch ((unsigned)command) {
     case 0x80045200U: {
         int bits = (int)kernel_random_credited_bits();
@@ -191,6 +192,8 @@ static void initialize_devices(void)
 
 const struct kernel_char_device *kernel_char_device_lookup(uint64_t rdev)
 {
+    const struct kernel_char_device *tty = kernel_tty_device_lookup(rdev);
+    if (tty) return tty;
     if (rdev == kernel_rtc_device.rdev) return &kernel_rtc_device;
     initialize_devices();
     for (size_t i = 0U; i < sizeof(devices) / sizeof(devices[0]); i++)
