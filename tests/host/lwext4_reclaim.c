@@ -19,6 +19,7 @@
 static struct fault_block disk;
 static unsigned event, cut, reorder;
 static bool armed;
+static uint64_t group_clock(void *context) { (void)context; return 0; }
 struct facts {
     unsigned long long free_blocks, old_size, old_blocks;
     unsigned free_inodes, inode, sparse;
@@ -244,6 +245,11 @@ int main(int argc, char **argv)
     CHECK(ext4_journal_start("/") == EOK);
     CHECK(ext4_orphan_recover("/") == EOK);
     if (!strcmp(action,"setup")) { setup(dev.fs,facts_path,!strcmp(kind,"sparse")); return 0; }
+    bool grouped=!strncmp(action,"mutate-group-",13);
+    if (grouped) {
+        struct ext4_journal_runtime runtime={.now_ns=group_clock};
+        CHECK(ext4_journal_group_enable("/",&runtime,4*1024*1024)==EOK);
+    }
     struct facts f=read_facts(facts_path);
     bool unlink=!strcmp(kind,"unlink");
     if (recovery) {
@@ -265,6 +271,21 @@ int main(int argc, char **argv)
         uint32_t orphan;
         CHECK(ext4_orphan_peek(dev.fs,&orphan) == EOK && orphan == f.inode);
         if (unlink) check_range(&file,0,dev.lg_bsize,dev.lg_bsize,false);
+        if (grouped) {
+            if (!strcmp(action,"mutate-group-split")) {
+                CHECK(ext4_journal_group_service("/",true)==EOK);
+                struct ext4_journal_progress progress;
+                CHECK(ext4_journal_group_progress("/",&progress)==EOK && progress.durable>progress.checkpoint);
+            }
+            if (unlink) {
+                CHECK(ext4_fclose(&file)==EOK);
+                CHECK(ext4_orphan_free("/",f.inode)==EOK);
+            } else {
+                CHECK(ext4_ftruncate(&file,5ULL*dev.lg_bsize+17)==EOK);
+                CHECK(ext4_fclose(&file)==EOK);
+            }
+            CHECK(ext4_journal_group_drain("/")==EOK);
+        }
         if (!strcmp(action,"publish")) CHECK(ext4_journal_stop("/") == EOK);
         /* Keep the opened unlink handle alive until the simulated power cut. */
     }

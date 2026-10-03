@@ -14,6 +14,8 @@
  * same transaction and restore its in-memory snapshot on transaction abort.
  * Remove the orphan record before freeing the inode bitmap, in one transaction.
  * Add/remove are idempotent; malformed or duplicated records are errors.
+ * Remove also clears ORPHAN_PRESENT when its validated record count proves
+ * the resulting set empty; the caller journals/rolls back that marker with sb.
  *
  * Reads validate the complete legacy list and orphan file; temporary memory is
  * O(number of live orphan records), with no retained handles or buffer pins.

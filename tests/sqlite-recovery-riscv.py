@@ -131,7 +131,9 @@ def nbd_boot(args, image, directory, name, *, options=(), marker=None,
                 backend.stdin.write(b"arm\n")
                 backend.stdin.flush()
                 wait_for_marker(backend, backend_log, "control=arm")
-                guest.stdin.write(b"g")
+                # Console input is canonical on both ordinary Linux and the
+                # serial TTY; a complete line releases the one-byte guest read.
+                guest.stdin.write(b"g\n")
                 guest.stdin.flush()
             if marker:
                 wait_for_marker(guest, guest_log, marker)

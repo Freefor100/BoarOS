@@ -1485,7 +1485,7 @@ static int ext4_trunc_inode(struct ext4_mountpoint *mp,
 	return r == EOK ? cleanup : r;
 }
 
-/* Finish a persisted truncate or unlink in bounded transactions. Live unlinked
+/* Finish an accepted truncate or unlink in bounded transactions. Live unlinked
  * inodes keep their orphan record until their last VFS owner calls free. */
 static int ext4_reclaim_orphan(struct ext4_mountpoint *mp, uint32_t index,
 			       bool release_inode)
@@ -1493,13 +1493,20 @@ static int ext4_reclaim_orphan(struct ext4_mountpoint *mp, uint32_t index,
 	bool done = false;
 	int r;
 	if (!mp->fs.jbd_journal) return EOK;
+	if (mp->fs.jbd_journal->error) return mp->fs.jbd_journal->error;
 	if (mp->transaction_depth) return EBUSY;
-	/* The shrink/unlink intent must reach stable storage before recycling
-	 * tail mappings. The worker takes no inode or write-operation lock. */
-	if (mp->fs.jbd_journal->grouped) {
-		r = ext4_journal_group_drain(mp->name);
-		if (r != EOK) return r;
+	if (!release_inode) {
+		/* 新建、同尺寸截断和普通扩展没有待回收映射，不创建清理事务。 */
+		if (!ext4_get32(&mp->fs.sb, last_orphan) &&
+		    !ext4_sb_feature_ro_com(&mp->fs.sb, EXT4_FRO_COM_ORPHAN_PRESENT))
+			return EOK;
+		bool present;
+		r = ext4_orphan_contains(&mp->fs, index, &present);
+		if (r != EOK || !present) return r;
 	}
+	/* 意图与回收按同一 journal FIFO 提交；同组则原子合并。已释放的
+	 * 块/inode由quarantine保留到checkpoint，只有实际预算或复用压力
+	 * 才在trans_start等待，普通操作不排空整个挂载点。 */
 	do {
 		struct ext4_inode_ref ref;
 		r = ext4_trans_start(mp);
@@ -1524,18 +1531,8 @@ static int ext4_reclaim_orphan(struct ext4_mountpoint *mp, uint32_t index,
 			}
 		}
 		r = ext4_result(r, ext4_fs_put_inode_ref(&ref));
-		if (r == EOK && done) {
-			uint32_t remaining;
-			r = ext4_orphan_peek(&mp->fs, &remaining);
-			if (r == EOK && !remaining)
-				r = ext4_orphan_set_present(&mp->fs, false);
-		}
 		r = ext4_trans_finish(mp, r);
 		if (r != EOK) return r;
-		if (mp->fs.jbd_journal->grouped) {
-			r = ext4_journal_group_drain(mp->name);
-			if (r != EOK) return r;
-		}
 	} while (!done);
 	return EOK;
 }

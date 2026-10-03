@@ -60,6 +60,29 @@ for mapping in ${RECLAIM_MAPPINGS:-extent indirect}; do
         done
         printf 'PASS: %s-byte %s %s %s: %s mutation + %s recovery cuts, lost/reordered sectors\n' \
             "$blocksize" "$format" "$mapping" "$action" "$mutation" "$recovery"
+        # Same-group cleanup and cleanup after an intent-only durable commit
+        # must both survive every actual I/O boundary before checkpoint.
+        for mode in mutate-group-same mutate-group-split; do
+            cp "$work/base.img" "$work/group.img"
+            total=$(timeout 60 "$work/probe" "$work/group.img" "$mode" "$work/facts" "$action")
+            timeout 60 "$work/probe" "$work/group.img" recover "$work/facts" "$action" >/dev/null
+            check_fs "$work/group.img"
+            for reorder in 0 1; do
+                event=1
+                while [ "$event" -le "$total" ]; do
+                    cp "$work/base.img" "$work/group-cut.img"
+                    status=0
+                    timeout 60 "$work/probe" "$work/group-cut.img" "$mode" "$work/facts" "$action" "$event" "$reorder" >/dev/null || status=$?
+                    [ "$status" -eq 75 ] || { echo "missing grouped cut: $mode $event status=$status" >&2; exit 1; }
+                    timeout 60 "$work/probe" "$work/group-cut.img" verify "$work/facts" "$action" >/dev/null
+                    timeout 60 "$work/probe" "$work/group-cut.img" verify "$work/facts" "$action" >/dev/null
+                    check_fs "$work/group-cut.img"
+                    event=$((event+1))
+                done
+            done
+            printf 'PASS: %s-byte %s %s %s %s: %s grouped cuts, lost/reordered sectors\n' \
+                "$blocksize" "$format" "$mapping" "$action" "$mode" "$total"
+        done
     done
 done
 done

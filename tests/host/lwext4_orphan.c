@@ -245,6 +245,8 @@ int main(int argc, char **argv)
                 CHECK(ext4_fs_put_inode_ref(&ref) == EOK);
                 CHECK(commit(fs) == EOK);
                 CHECK(ext4_orphan_peek(fs, &ino) == EOK);
+                CHECK(ext4_sb_feature_ro_com(&fs->sb, EXT4_FRO_COM_ORPHAN_PRESENT) ==
+                    (ino != 0 && ext4_sb_feature_com(&fs->sb, EXT4_ORPHAN_FILE_COMPAT)));
             }
         }
         if (!strcmp(argv[2], "remove-one") || !strcmp(argv[2], "remove-error")) {

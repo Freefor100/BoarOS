@@ -337,8 +337,12 @@ int ext4_orphan_remove(struct ext4_inode_ref *inode)
     if (r != EOK) return r;
     struct orphan_scan scan = { .target = inode->index };
     r = scan_all(fs, &scan, inode);
-    if (r != EOK || !scan.found) return r;
-    if (scan.block) return update_slot(fs, scan.block, scan.slot, scan.seed, 0);
+    if (r != EOK) return r;
+    if (!scan.found) goto Done;
+    if (scan.block) {
+        r = update_slot(fs, scan.block, scan.slot, scan.seed, 0);
+        goto Done;
+    }
     struct ext4_inode_ref previous;
     if (scan.previous) {
         r = load_inode(fs, scan.previous, &previous, false);
@@ -359,6 +363,13 @@ int ext4_orphan_remove(struct ext4_inode_ref *inode)
         int release = ext4_fs_put_inode_ref(&previous);
         if (r == EOK) r = release;
     }
+Done:
+    /* 已完整校验并去重的计数也证明删除后是否为空；在同一事务内
+     * 清标记，不为peek和set_present重复读取整个orphan文件。 */
+    if (r == EOK && scan.seen.count == (size_t)scan.found &&
+        ext4_sb_feature_com(&fs->sb, EXT4_ORPHAN_FILE_COMPAT))
+        ext4_set32(&fs->sb, features_read_only,
+            ext4_get32(&fs->sb, features_read_only) & ~EXT4_ORPHAN_PRESENT_RO_COMPAT);
     return r;
 }
 
