@@ -39,7 +39,13 @@ for group in $groups; do
             fi
             echo "BOAROS-EVAL ENTER $group-$libc"
             set +e
-            /$libc/busybox sh ./${group}_testcode.sh
+            if [ "$group" = ltp ] && [ -f /boaros-ltp-suites ]; then
+                /$libc/busybox sh /boaros-ltp.sh /$libc/ltp \
+                    "$($BB cat /boaros-ltp-suites)" "$($BB cat /boaros-ltp-pattern)" \
+                    /tmp/boaros-ltp-$libc
+            else
+                /$libc/busybox sh ./${group}_testcode.sh
+            fi
             result=$?
             echo "BOAROS-EVAL EXIT $group-$libc status=$result"
         )

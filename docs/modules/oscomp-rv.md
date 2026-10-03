@@ -24,6 +24,8 @@ runner 从原盘建立可丢弃副本，增加自己的启动脚本。测例脚�
 重新绑定到真实 console，再挂载 procfs 与 `/dev/shm` 的 tmpfs。`/tmp` 仍为 ext4，
 权限为1777。随机节点接入真实内核随机源；节点存在不等于可信熵已就绪，本 profile
 不提供 VirtIO RNG，不能用固定字节或成功存根掩盖缺失的熵源。
+LTP 的 C 框架优先在 `/dev/shm` 建立共享结果页；缺少该目录时会退到临时目录并调用
+`chown`。真实 tmpfs 挂载保护测试框架的 IPC 环境，不代替需要 `chown` 的测试语义。
 每组在自己的 libc 根目录执行原 `*_testcode.sh`，分别设置 `LD_LIBRARY_PATH`，
 避免同时搜索两套 libc。musl 的普通/sf 加载器名指向镜像自带 libc；
 glibc 加载器指向其真实文件。proc 内容来自真实内核对象，没有假随机设备或测试输出。
@@ -34,11 +36,25 @@ glibc 加载器指向其真实文件。proc 内容来自真实内核对象，没
 默认顺序为 basic、busybox、cyclictest、iozone、iperf、libcbench、libctest、
 lmbench、lua、netperf、ltp，每组先 glibc 后 musl。无逐组超时、重启或失败后宿主拼接。
 
+`--groups ltp` 是独立、无评分的诊断入口：`tests/oscomp/ltp.sh` 调用原镜像的
+`runltp/ltp-pan`，按 `runtest` 清单保留命令和参数，不遍历辅助程序目录。
+`--ltp-suites` 选择清单，`--ltp-pattern` 使用原 runltp 的基本 grep 表达式。
+脚本设置原 IDcheck 的 `CREATE_ENTRIES=0` 并关闭交互输入；缺少账户的警告仍保留，
+不创建账户条目冒充凭据支持。两套 libc 分开保存原输出、结果表、失败及 TCONF 清单，
+引擎非零状态不阻止启动下一套 libc。测例仍使用自身超时，另有整次 QEMU 预算；
+预算耗尽不等于清单已完成。该模式不执行原 LTP 目录遍历包装器、不运行原 judge，
+不能产生正式分数；默认 `all` 入口和原测例内容不变。
+
 ## 重建与评分
 
 ```sh
 python3 -B tests/oscomp/run.py --output build/oscomp-rv-baseline
 python3 -B tests/oscomp/run.py --groups environment --output build/oscomp-rv-environment
+# 原 LTP 控制脚本正确传参，随后运行 syscall；仅诊断，不计分：
+python3 -B tests/oscomp/run.py --groups ltp --ltp-suites controllers,syscalls \
+  --ltp-pattern '^\(cgroup_fj_function_cpuset\|getuid01\)[[:space:]]' \
+  --diagnostic-timeout 120 --output build/oscomp-ltp-smoke
+python3 -B tests/oscomp/test_ltp.py
 # 明确标为诊断，不能合入正式总分：
 python3 -B tests/oscomp/run.py --output build/oscomp-rv-diagnostic --diagnostic-timeout 60
 make all                         # 恢复默认 /init 配置
@@ -66,8 +82,8 @@ runner 读取固定 Harness `kernel/judge/config.json`。其中 `qemu.timeout=36
 错误分别记录。镜像 basic 的 `run-all.sh` 为0644，启动环境负责补执行权限；保留测例
 内容与原包装器调用方式，不把环境准备问题归为缺少对应 syscall。
 
-评分核对后将结论、运行身份和重建命令写入本文，运行产物由 `make prune-build`
-清理。原始 `.img/.img.xz` 在 references，不属于清理范围。通用新缺陷先最小复现，
+本文维护运行契约和重建方法，不追加每轮成绩或运行记录。诊断输出留在忽略的 build，
+核对后由 `make prune-build` 清理。原始 `.img/.img.xz` 在 references，不属于清理范围。通用新缺陷先最小复现，
 回 main 修复并验收，再 merge 回本分支重新构建运行。
 
 ## 2026-10-01 原消费者更新后的单次 RV 基线
