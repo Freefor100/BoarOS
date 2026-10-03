@@ -17,6 +17,11 @@ for block in 1024 4096; do
     mkfs.ext4 -q -F -b "$block" -I 256 "$work/disk.img"
     "$work/probe" "$work/disk.img" seed
     cp "$work/disk.img" "$work/base.img"
+    for operation in truncate unlink; do
+        cp "$work/base.img" "$work/namespace.img"
+        "$work/probe" "$work/namespace.img" "group-namespace-$operation"
+        e2fsck -fn "$work/namespace.img" > "$work/fsck.log" 2>&1 || { cat "$work/fsck.log" >&2; exit 1; }
+    done
     cp "$work/base.img" "$work/bounds.img"
     "$work/probe" "$work/bounds.img" group-bounds
     e2fsck -fn "$work/bounds.img" > "$work/fsck.log" 2>&1 || { cat "$work/fsck.log" >&2; exit 1; }

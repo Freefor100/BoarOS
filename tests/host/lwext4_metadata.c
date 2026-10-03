@@ -358,6 +358,7 @@ static void cost_test(struct ext4_fs *fs)
     CHECK(ext4_fread(&f,actual,sizeof(actual),&read_count)==EOK && read_count==sizeof(actual));
     CHECK(!memcmp(actual,bytes,sizeof(actual)));CHECK(ext4_fclose(&f)==EOK);
 }
+static bool namespace_hold;
 static void bitmap_test(void)
 {
     unsigned char bitmap[16];
@@ -375,6 +376,92 @@ static void bitmap_test(void)
         }
     }
     puts("bitmap: aligned/unaligned subranges match independent byte oracle");
+}
+static unsigned namespace_waits;
+static int namespace_wait(void *context, uint64_t sequence, enum ext4_journal_wait kind)
+{
+    (void)context;
+    namespace_waits++;
+    if (namespace_hold) return EAGAIN;
+    for (;;) {
+        struct ext4_journal_progress progress;
+        CHECK(ext4_journal_group_progress("/", &progress)==EOK);
+        uint64_t reached=kind==EXT4_JOURNAL_WAIT_SEALED?progress.sealed:
+            kind==EXT4_JOURNAL_WAIT_DURABLE?progress.durable:progress.checkpoint;
+        if (reached>=sequence) return EOK;
+        int r=ext4_journal_group_service("/",true);
+        if (r!=EOK) return r;
+    }
+}
+/* Ordinary operations must not synchronize unrelated work while version,
+ * journal and reuse credits are still available. */
+static void group_namespace(struct ext4_fs *fs, bool unlink_files)
+{
+    struct ext4_journal_runtime runtime={.now_ns=group_clock,.wait=namespace_wait};
+    CHECK(ext4_journal_group_enable("/",&runtime,4*1024*1024)==EOK);
+    CHECK(ext4_mount_setup_clock("/",cost_clock)==EOK);
+    ext4_file f;
+    CHECK(ext4_fopen(&f,"/file","r+")==EOK);
+    struct ext4_timestamp times[3]={{1111,1},{2222,2},{3333,3}};
+    CHECK(ext4_file_set_times(&f,7,times)==EOK);
+    unsigned waits=namespace_waits;
+    uint64_t writes=disk.writes,flushes=disk.flushes;
+    namespace_hold=true;
+    if (!unlink_files) {
+        CHECK(ext4_ftruncate(&f,f.fsize)==EOK);
+        CHECK(ext4_ftruncate(&f,4096)==EOK);
+        CHECK(ext4_ftruncate(&f,0)==EOK);
+        CHECK(ext4_fclose(&f)==EOK);
+        CHECK(ext4_fopen(&f,"/namespace-new","w+")==EOK);
+        CHECK(f.fsize==0 && ext4_fclose(&f)==EOK);
+    } else {
+        CHECK(ext4_fclose(&f)==EOK);
+        /* Quarantined holes separated by a live inode must never let a new
+         * directory entry alias that live inode. */
+        uint32_t holes[3];
+        ext4_file live;
+        for(unsigned i=0;i<3;i++) {
+            char name[64];snprintf(name,sizeof(name),"/namespace-hole-%u",i);
+            CHECK(ext4_fopen2(&f,name,O_CREAT|O_RDWR)==EOK);
+            holes[i]=f.inode;
+            if(i==1)live=f;else CHECK(ext4_fclose(&f)==EOK);
+        }
+        CHECK(ext4_fremove("/namespace-hole-0")==EOK && ext4_fremove("/namespace-hole-2")==EOK);
+        size_t alive_count;
+        CHECK(ext4_fwrite(&live,"live",4,&alive_count)==EOK && alive_count==4);
+        CHECK(ext4_fopen2(&f,"/namespace-after-holes",O_CREAT|O_RDWR)==EOK);
+        for(unsigned i=0;i<3;i++)CHECK(f.inode!=holes[i]);
+        CHECK(ext4_fclose(&f)==EOK);
+        unsigned char alive[4];
+        CHECK(ext4_fpread(&live,0,alive,sizeof(alive),&alive_count)==EOK && alive_count==4 && !memcmp(alive,"live",4));
+        CHECK(ext4_fclose(&live)==EOK && ext4_fremove("/namespace-hole-1")==EOK && ext4_fremove("/namespace-after-holes")==EOK);
+        uint32_t retired[16];
+        unsigned char data[4096];memset(data,0x5a,sizeof(data));
+        for(unsigned i=0;i<16;i++) {
+            char name[64];snprintf(name,sizeof(name),"/namespace-%u",i);
+            CHECK(ext4_fopen2(&f,name,O_CREAT|O_RDWR)==EOK);
+            retired[i]=f.inode;
+            for(unsigned j=0;j<i;j++) CHECK(f.inode!=retired[j]);
+            if(i&1) {size_t count;CHECK(ext4_fwrite(&f,data,sizeof(data),&count)==EOK && count==sizeof(data));}
+            CHECK(ext4_fclose(&f)==EOK && ext4_fremove(name)==EOK);
+            CHECK(ext4_fopen(&f,name,"r")==ENOENT);
+            CHECK(jbd_journal_quarantined(fs,retired[i],true));
+        }
+        /* An open unlinked inode retains its content until its last owner. */
+        CHECK(ext4_fopen2(&f,"/namespace-live",O_CREAT|O_RDWR)==EOK);
+        size_t count;CHECK(ext4_fwrite(&f,data,sizeof(data),&count)==EOK && count==sizeof(data));
+        uint32_t inode;bool orphan;
+        CHECK(ext4_funlink_dentry("/namespace-live",&inode,&orphan)==EOK && orphan && inode==f.inode);
+        unsigned char actual[4096];
+        CHECK(ext4_fpwrite(&f,0,data,sizeof(data),&count)==EOK && count==sizeof(data));
+        CHECK(ext4_fpread(&f,0,actual,sizeof(actual),&count)==EOK && count==sizeof(actual) && !memcmp(data,actual,sizeof(data)));
+        CHECK(ext4_fclose(&f)==EOK && ext4_orphan_free("/",inode)==EOK);
+        CHECK(jbd_journal_quarantined(fs,inode,true));
+    }
+    CHECK(namespace_waits==waits && disk.writes==writes && disk.flushes==flushes);
+    namespace_hold=false;
+    CHECK(ext4_journal_group_drain("/")==EOK);
+    printf("group namespace: %s accepted without forced I/O; reuse quarantined until checkpoint\n",unlink_files?"unlink":"truncate");
 }
 static struct ext4_timestamp get_time(const struct ext4_inode *inode,unsigned i,bool extended)
 {
@@ -576,6 +663,8 @@ int main(int argc,char **argv)
     if(!strcmp(argv[2],"seed"))seed();
     else if(!strcmp(argv[2],"cost"))cost_test(dev.fs);
     else if(!strcmp(argv[2],"group"))group_test(dev.fs);
+    else if(!strcmp(argv[2],"group-namespace-truncate"))group_namespace(dev.fs,false);
+    else if(!strcmp(argv[2],"group-namespace-unlink"))group_namespace(dev.fs,true);
     else if(!strcmp(argv[2],"group-space"))group_space(dev.fs);
     else if(!strcmp(argv[2],"group-ring"))group_ring(dev.fs);
     else if(!strcmp(argv[2],"group-bounds")) group_bounds(dev.fs);
