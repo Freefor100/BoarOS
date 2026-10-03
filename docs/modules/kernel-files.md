@@ -296,7 +296,10 @@ Goldfish RTC按st_rdev=10:135选择，/dev/rtc0、/dev/rtc和/dev/misc/rtc是同
 unsigned32位，与Linux相同，兼容musl传来的符号扩展。未知命令ENOTTY，设置时间、
 告警/事件等已知但未交付操作ENOTSUP，普通事件read/write同样明确不支持。
 
-可选char open/release回调把设备资格归OFD。RTC独占打开，dup/fork/请求pin增加同一OFD
+字符设备回调携带实例上下文、调用者及open flags；open在OFD发布前构造实例，
+失败不留下实例owner。最后OFD清理才release；dup/fork/请求pin不重新open。
+可选整次readv/writev入口用于有请求状态的后端，简单设备继续使用缓冲回调。
+RTC独占打开，dup/fork/请求pin增加同一OFD
 引用，不重新打开；最后真实引用脱离即释放资格，VFS后续清理错误不会继续霸占RTC。
 失败打开不发布资格；CLOEXEC、退出和最终关闭沿统一文件引用路径处理。
 验证：`make test-rtc-host test-environment-riscv`与固定Linux环境ABI记录，含闰日、

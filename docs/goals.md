@@ -23,26 +23,28 @@ N3已经交付：legacy/modern VirtIO-net、受限DMA借用与复制回退、静
 区分已经修复的机制与缺少历史现场的归因。固定root、单hart、QEMU和选定应用验收
 均不代表多用户隔离、SMP、实板或完整Linux兼容。完整比赛Harness仍缺kernel-la。
 
-## 本轮交付：命名FIFO、管道元数据与离线C工程
+## 本轮：串口交互式TTY与内存操作优化
 
-已确认完整命名FIFO与默认make -j2；匿名管道元数据归共享pipe，不建立通用匿名inode。
-固定Lua 5.4.3、Alpine GCC 14.2.0-r6与GNU make 4.4.1-r3，使用原源码和构建规则。
-范围为完整应用能力与成本归因，不额外承诺存储/调度重构或固定吞吐倍数。
+已确认UART中断＋worker、统一字符设备实例接口和保守宽字内存原语。
+应用线交付未经修改的BusyBox ash/stty、行编辑和完整串口作业控制；CPU线量化
+heap清零/搬迁与已解析用户页内复制，以原Lua工程判断一次局部优化的实际价值。
+两条线可独立推进、分别验收；QEMU性能测量串行，不设置固定吞吐倍数。
 
 | 阶段 | 状态与验收 |
 |---|---|
-| A 基线与有限审计 | [x] 最新main已单向合入兼容分支；原旧glibc BASIC_TCP完成wait=0、无超时和最终清理。journal进度受后端锁保护，网络/回收worker在既定IRQ区处理共享状态；未发现新的确定性违例，不将有限核对写成全内核证明。 |
-| B 匿名管道元数据 | [x] mode、身份与时间归共享pipe，fchmod/fstat及两端、dup/fork/proc重开一致；先同ELF证伪旧行为。 |
-| C 命名FIFO | [x] ext4/tmpfs节点、按inode关联的活动pipe、打开会合/代次、非阻塞、信号、就绪、双owner与最后回收；节点可持久化，传输内容不持久化。 |
-| D 原版工程 | [x] make默认FIFO jobserver，Lua/luac/liblua.a及嵌入/动态模块；干净、无变化、增量、clean、语法错误、恢复、-j2与中断清理。 |
-| E 成本与收口 | [x] 正式ext4三副本、tmpfs和单-j1 COST、1207 ABI及集中系统验收；兼容旧glibc入口与FIFO/重启通过。结论和重建命令已归工具链记录，运行产物按既有prune规则清理。 |
+| T1 实例与UART | [ ] OFD持有实例；DTB UART/IRQ、1024项RX、4KiB输入/echo/TX及1KiB内核输出队列；有界IRQ和可join worker、失败回滚与最终回收。 |
+| T2 行规程 | [ ] 真实termios、canonical/EOF、VMIN/VTIME、flow/drain/flush、poll与整次readv continuation；交付前缀和已消费输入分别对照Linux。 |
+| T3 会话与应用 | [ ] ctty、稳定SID/前台PGID、终端信号、后台I/O、旧OFD hangup代次；原ash的Ctrl-C/Ctrl-Z、jobs/fg/bg和退出。 |
+| M1 有限归因 | [ ] 六项消费者COST，聚合不超过64KiB、每任务64B；一次优化前Lua定点窗口，保留历史schema。 |
+| M2 内存原语 | [ ] alias-safe对齐word及byte回退；heap与已解析页内chunk接入，保护重叠、页边界、fault前缀和owner。 |
+| M3 应用价值 | [ ] 一次独立微fixture、CPU候选三次关闭观测Lua启动；实际成本、程序/同步/卸载、资源与剩余差距分别解释。 |
+| 集成收口 | [ ] 一次完整RV64、真实libc、1207条及新增ABI、scale/栈与受影响回归；原串口应用及Lua集成功能；单向合入兼容分支。 |
 
-原工程在固定Linux先建立有效参考；原始输出和机器清单只留忽略的build，Git保存机制、
-结论与重建入口。不重跑iozone/C0–C6；仅在实际改事务/写回/队列顺序时扩大恢复矩阵。
-已单向合入兼容分支并完成受影响验收；不push、发布或转换阶段。
-
-下一应用候选为交互式shell/TTY，需另行调查并确认范围；路由/DNS/HTTPS不作为本轮追加任务。LoongArch是双架构独立依赖，
-SMP另行设计；历史异常风险继续按上表保留，不因本轮通过关闭。
+当前已完成调查和接口取舍，以上项目尚未实施或验收。PTY、凭据、调度策略更换、
+存储重构及新网络能力不进入本轮；缺少收益的CPU候选不上线，也不自动追加其他改造。
+原始输出与机器快照归忽略的build，Git保存人类可读结论和重建命令。
+下一应用候选收敛为PTY＋原BusyBox script，另行确认范围；LoongArch和SMP是独立依赖。
+历史异常风险继续按上表保留，不因本轮通过关闭。不push、发布或转换阶段。
 
 ## 按证据触发的性能候选
 
@@ -61,6 +63,7 @@ SMP另行设计；历史异常风险继续按上表保留，不因本轮通过�
 
 | 阶段/能力 | 事实与证据入口 |
 |---|---|
+| 命名FIFO与原Lua工程 | 管道元数据、ext4/tmpfs FIFO、默认make jobserver、构建/增量/失败恢复及产物运行；1207 ABI与集中回归、兼容入口已交付。关闭观测-j1/-j2中位135.542/133.225秒；工作目录tmpfs不足以解释整体差距，见[工具链记录](learning/offline-toolchain-probe.md)。 |
 | N3网卡与宿主应用 | legacy/modern、零拷贝RX及回退、有界重组、实际双向TCP/HTTP和1196 ABI；性能、原应用与历史风险见[网卡记录](learning/network-ownership.md#真实-virtio-net-与宿主应用交付2026-10-02) |
 | D1–D3/T1/J1/V1纠错 | socket状态/扩容/接收资格、请求内暂存、版本量封口已交付；自动程序＋durable 11.541→5.129/12.108→5.359秒；完整恢复/双盘、1179 ABI及TCP复制限制见[存储](learning/cost-baseline.md#版本量封口与socket纠错对照2026-10-02)与[网络](learning/network-ownership.md#本轮应用结果与剩余复制2026-10-02) |
 | N2a–N2e网络应用 | IPv6双栈、选项、半关闭与生命周期、22项受控原ELF、内容负载和1166 ABI已交付；原iperf连续脚本参考竞态单列，见[网络记录](learning/network-ownership.md#原版网络应用交付2026-10-02) |

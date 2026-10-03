@@ -10,6 +10,7 @@
 #include <kernel/mm.h>
 #include <kernel/open_file.h>
 #include <kernel/uaccess.h>
+#include <kernel/task.h>
 
 #include <stddef.h>
 #include <stdint.h>
@@ -32,7 +33,7 @@ enum kernel_files_status kernel_files_ioctl(
                                                        linux_result);
     if (status != KERNEL_FILES_STATUS_OK || *linux_result) return status;
     *linux_result = description->device && description->device->ioctl
-        ? description->device->ioctl(mm, command, argument) : -KERNEL_ENOTTY;
+        ? description->device->ioctl(description->device_instance, kernel_task_current(), mm, command, argument) : -KERNEL_ENOTTY;
     enum kernel_open_file_status release = kernel_open_file_release(&description);
     if (release == KERNEL_OPEN_FILE_STATUS_CLEANUP_REQUIRED && description) {
         kernel_files_queue_description(files, description);
@@ -585,6 +586,13 @@ enum kernel_files_status kernel_files_open_boot_console(
     if (!description->device) __builtin_trap();
     description->kind = description->device->kind;
     description->open_flags = 2U;
+    result = kernel_char_device_open(description, description->open_flags);
+    if (result) {
+        kernel_files_queue_description(files, description);
+        (void)kernel_files_drain_file_cleanup(files);
+        *linux_result = result;
+        return KERNEL_FILES_STATUS_OK;
+    }
     if (kernel_files_install_new_owned_at(files, (uint32_t)fd, 0U,
                                           &description) != KERNEL_FILES_STATUS_OK) {
         kernel_files_queue_description(files, description);

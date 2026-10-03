@@ -363,6 +363,15 @@ static enum kernel_files_status read_pinned(
                 return KERNEL_FILES_STATUS_OK;
             }
         }
+        if (device->readv) {
+            enum kernel_files_status status = device->readv(description->device_instance,
+                kernel_task_current(), mm, iov, iov_count,
+                count > KERNEL_FILES_MAX_RW_COUNT ? KERNEL_FILES_MAX_RW_COUNT : count,
+                description->open_flags, linux_result);
+            if (*linux_result < 0) files->record->statistics.read_failures++;
+            else files->record->statistics.bytes_read += (uint64_t)*linux_result;
+            return status;
+        }
         unsigned char staging[64];
         request = count > KERNEL_FILES_MAX_RW_COUNT
                       ? KERNEL_FILES_MAX_RW_COUNT : count;
@@ -373,7 +382,7 @@ static enum kernel_files_status read_pinned(
             size_t copied = 0U;
             size_t chunk = request - total < sizeof(staging)
                                ? (size_t)(request - total) : sizeof(staging);
-            int result = device->read(description->open_flags, staging,
+            int result = device->read(description->device_instance, kernel_task_current(), description->open_flags, staging,
                                       chunk, &received);
             if (result) {
                 *linux_result = total ? (int64_t)total : result;
@@ -946,7 +955,7 @@ static int64_t sendfile_output(struct kernel_open_file_description **output_owne
         /* pwrite 每批自取 rank 15；跨输入读取持目标门闩会形成交叉 inode 等待。 */
         error = kernel_vfs_pwrite(&output->file, position, buffer, size, &written);
     } else if (output->device && output->device->write) {
-        error = output->device->write(buffer, size, &written);
+        error = output->device->write(output->device_instance, kernel_task_current(), output->open_flags, buffer, size, &written);
     } else return -KERNEL_EINVAL;
     if (written > size) __builtin_trap();
     return written != 0U ? (int64_t)written : error;
@@ -1150,9 +1159,14 @@ static enum kernel_files_status buffered_write_request(
 {
     uint64_t total = 0U;
 
+    if (description->device && description->device->writev) {
+        return description->device->writev(description->device_instance,
+            kernel_task_current(), mm, iov, iov_count, count,
+            description->open_flags, linux_result);
+    }
     if (description->device && description->device->discard_writes) {
         size_t consumed = 0U;
-        int result = description->device->write(0, (size_t)count, &consumed);
+        int result = description->device->write(description->device_instance, kernel_task_current(), description->open_flags, 0, (size_t)count, &consumed);
         if (consumed > count) return KERNEL_FILES_STATUS_STATE;
         *linux_result = result && !consumed ? result : (int64_t)consumed;
         return KERNEL_FILES_STATUS_OK;
@@ -1362,7 +1376,7 @@ static enum kernel_files_status buffered_write_request(
                                             iov[index].base + offset,
                                             chunk, &copied);
             size_t written = 0U;
-            int result = description->device->write(staging, copied, &written);
+            int result = description->device->write(description->device_instance, kernel_task_current(), description->open_flags, staging, copied, &written);
             if (written > copied) return KERNEL_FILES_STATUS_STATE;
             total += written;
             offset += written;

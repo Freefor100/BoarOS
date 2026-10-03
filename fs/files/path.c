@@ -358,10 +358,7 @@ enum kernel_files_status kernel_files_openat(
             if (!description->device) stat_result = -KERNEL_ENXIO;
             else {
                 description->kind = description->device->kind;
-                if (description->device->open) {
-                    stat_result = description->device->open();
-                    if (!stat_result) description->device_opened = 1;
-                }
+                stat_result = kernel_char_device_open(description, (uint32_t)flags);
             }
         }
         if (stat_result != 0) {

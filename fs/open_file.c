@@ -265,6 +265,11 @@ enum kernel_open_file_status kernel_open_file_create_console(
     file->kind = KERNEL_OPEN_FILE_KIND_CONSOLE;
     file->device = kernel_char_device_lookup(UINT64_C(0x501));
     if (!file->device) __builtin_trap();
+    file->open_flags = 2U;
+    if (kernel_char_device_open(file, file->open_flags)) {
+        (void)kernel_heap_release(heap, file);
+        return KERNEL_OPEN_FILE_STATUS_STATE;
+    }
     *owner = file;
     return KERNEL_OPEN_FILE_STATUS_OK;
 }
@@ -551,7 +556,8 @@ enum kernel_open_file_status kernel_open_file_release(
     }
     if (file->device_opened) {
         file->device_opened = 0;
-        file->device->release();
+        if (file->device->release) file->device->release(file->device_instance);
+        file->device_instance = 0;
     }
     if (file->ep_items != 0) {
         kernel_epoll_notify_file_release(file);
@@ -624,7 +630,8 @@ enum kernel_open_file_status kernel_open_file_detach(
         release_record_locks(file);
         if (file->device_opened) {
             file->device_opened = 0;
-            file->device->release();
+            if (file->device->release) file->device->release(file->device_instance);
+            file->device_instance = 0;
         }
     }
     file->references--;
@@ -903,7 +910,7 @@ uint32_t kernel_open_file_poll(
     if (!open_file_live(file)) {
         return KERNEL_POLLNVAL;
     }
-    if (file->device) return file->device->poll(requested_events, out_queue);
+    if (file->device) return file->device->poll ? file->device->poll(file->device_instance, file->open_flags, requested_events, out_queue) : 0U;
     switch (file->kind) {
     case KERNEL_OPEN_FILE_KIND_PIPE:
         return kernel_pipe_poll(file->pipe, file->pipe_endpoint, file->pipe_observed_writers, out_queue);
