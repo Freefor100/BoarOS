@@ -15,7 +15,10 @@ cpuhotplug_do_kcompile_loop	testcases/kernel/hotplug/cpu_hotplug/tools/cpuhotplu
 cpuhotplug_do_spin_loop	testcases/kernel/hotplug/cpu_hotplug/tools/cpuhotplug_do_spin_loop	unbounded-hotplug-workload
 cpuset_cpu_hog	testcases/kernel/controllers/cpuset/cpuset_load_balance_test/cpuset_cpu_hog.c	controller-FIFO-and-signals-required
 cpuset_mem_hog	testcases/kernel/controllers/cpuset/cpuset_memory_spread_test/cpuset_mem_hog.c	controller-FIFO-and-signals-required
+cpuset_memory_test	testcases/kernel/controllers/cpuset/cpuset_memory_test/cpuset_memory_test.c	controller-SIGUSR1-and-SIGINT-required
+doio	testcases/kernel/fs/doio/doio.c	iogen-structured-stdin-required
 fork_exec_loop	testcases/kernel/controllers/freezer/fork_exec_loop.c	unbounded-freezer-workload
+ftp-download-stress02-rmt.sh	testcases/network/stress/ftp/ftp-download-stress02-rmt.sh	controller-server-duration-and-concurrency-required
 fs_racer_dir_create.sh	testcases/kernel/fs/racer/fs_racer_dir_create.sh	unbounded-racer-worker-requires-controller
 fs_racer_dir_test.sh	testcases/kernel/fs/racer/fs_racer_dir_test.sh	unbounded-racer-worker-requires-controller
 fs_racer_file_concat.sh	testcases/kernel/fs/racer/fs_racer_file_concat.sh	unbounded-racer-worker-requires-controller
@@ -28,3 +31,7 @@ fs_racer_file_symlink.sh	testcases/kernel/fs/racer/fs_racer_file_symlink.sh	unbo
 memcg_test_2	testcases/kernel/controllers/memcg/regression/memcg_test_2.c	controller-SIGUSR1-and-kill-required
 memcg_test_4	testcases/kernel/controllers/memcg/regression/memcg_test_4.c	controller-SIGUSR1-and-kill-required
 pids_task2	testcases/kernel/controllers/pids/pids_task2.c	controller-kill-required
+pthserv	testcases/kernel/sched/clisrv/pthserv.c	controller-client-and-termination-required
+shell_pipe01.sh	testcases/commands/shell/shell_pipe01.sh	upstream-pipeline-stdin-required
+timed_forkbomb	testcases/kernel/controllers/freezer/timed_forkbomb.c	controller-stdin-start-token-required
+tst_hexdump	testcases/lib/tst_hexdump.c	pipeline-stdin-and-EOF-required

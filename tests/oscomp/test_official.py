@@ -31,6 +31,12 @@ class OfficialFlowTests(unittest.TestCase):
         self.assertEqual(result.returncode, 7, result.stderr)
         self.assertEqual(result.stdout, 'native output\n')
 
+    def test_disabled_timeout_waits_for_native_completion(self):
+        result = self.run_case('sleep 1.2; printf "completed without deadline\\n"; exit 7', limit='0')
+        self.assertEqual(result.returncode, 7, result.stderr)
+        self.assertEqual(result.stdout, 'completed without deadline\n')
+        self.assertNotIn('BOAROS-CASE TIMEOUT', result.stderr)
+
     def test_timeout_is_not_success_and_next_case_runs(self):
         result = self.run_case('while :; do :; done', limit='1')
         self.assertEqual(result.returncode, 124, result.stderr)

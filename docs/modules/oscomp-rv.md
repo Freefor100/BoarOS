@@ -54,7 +54,7 @@ LTP 仍使用比赛脚本的原目录遍历、原参数及原 START/RUN/FAIL/END
 也不承诺回收已脱离测试组的守护进程。官方脚本本身将辅助程序作为无参数单项执行，
 监督不能把这种输入转化成上游控制脚本的有效输入或语义通过。
 
-直接无参数运行的无限辅助程序由 `tests/oscomp/ltp-skips.tsv` 明确列出来源和原因；固定依据为pre-2025树中的ltp-full-20240524。原遍历仍输出RUN/FAIL，跳过另记SKIP并返回125，不输出伪造Summary、TCONF或通过结果，原judge不给通过分。控制脚本和普通测例照常运行，不能将cgroup能力缺失本身作为跳过所有相关测例的理由。
+直接无参数运行时缺少配套控制器或输入、不能独立结束的辅助程序由 `tests/oscomp/ltp-skips.tsv` 明确列出来源和原因；固定依据为pre-2025树中的ltp-full-20240524。原遍历仍输出RUN/FAIL，跳过另记SKIP并返回125，不输出伪造Summary、TCONF或通过结果，原judge不给通过分。控制脚本和普通测例照常运行，不能将cgroup能力缺失本身作为跳过所有相关测例的理由。有限的大规模压力负载不因耗时长自动归入该清单。
 
 默认每项 LTP 安全预算300秒，可在构建时用 `OSCOMP_CASE_TIMEOUT` 设置，0关闭此预算。
 这属于本项目的执行预算，可能提前结束合法长测试；超时不代表内核缺功能，完成循环
@@ -74,6 +74,8 @@ python3 -B tests/oscomp/run.py --groups ltp --output build/oscomp-ltp
 python3 -B tests/oscomp/test_official.py
 # 明确标为诊断，不能合入正式总分：
 python3 -B tests/oscomp/run.py --output build/oscomp-rv-diagnostic --diagnostic-timeout 60
+# 观察原生完成或阻塞位置，关闭总预算和逐项监督期限：
+python3 -B tests/oscomp/run.py --output build/oscomp-rv-uncapped --diagnostic-timeout 0 --case-timeout 0
 make all                         # 恢复完整官方启动选择
 make all INIT_CONFIG=config/init.json # 显式恢复通用 /init 配置
 make test-init-config-riscv       # 交替重建检查，结束后恢复默认
@@ -83,6 +85,7 @@ runner 读取固定 Harness `kernel/judge/config.json`。其中 `qemu.timeout=36
 60 秒只是 `run_qemu.py` 的缺省值，不能冒充随附配置。RV 参数按该源码取 `qemu.smp`、
 `qemu.mem`（默认 1 hart/1G）、VirtIO block/net、user net、RTC UTC、OpenSBI default。
 本 profile 无第二盘，不伪造不存在的输入；总时间预算覆盖一次 QEMU 启动。
+`--diagnostic-timeout 0` 将宿主监督设为无截止时间，`--case-timeout 0` 关闭客体逐项监督期限；两者不会改动测例自身的 watchdog 或原 judge。此模式用于定位长任务与真实阻塞，结果明确标为诊断，不能替代官方固定预算成绩。
 
 原 `parse_serial_out_new` 和 22 个 judge 原样运行，未到达组也由原 judge 产生结果。
 原 `postwork.postwork` 接收仅含 RV 的 summary；LA 未运行，不在输入中伪造成绩。

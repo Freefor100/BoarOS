@@ -86,7 +86,7 @@ def grade(log, directory, config, selected):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--output', type=Path, default=ROOT / 'build/oscomp-rv-run')
-    ap.add_argument('--diagnostic-timeout', type=int, help='override budget; labels result diagnostic, never the formal baseline')
+    ap.add_argument('--diagnostic-timeout', type=int, help='override total budget, 0 disables it; labels result diagnostic, never the formal baseline')
     ap.add_argument('--groups',choices=('all','iozone','environment','ltp'),default='all',help='subsets run the same original scripts and never imply full Harness acceptance')
     ap.add_argument('--case-timeout', type=int, default=300, help='LTP per-case safety budget seconds, 0 disables it; timeout is never a pass')
     args = ap.parse_args()
@@ -100,7 +100,7 @@ def main():
     config_path = REF / 'kernel/judge/config.json'
     config = json.loads(config_path.read_text())
     budget = args.diagnostic_timeout if args.diagnostic_timeout is not None else config.get('qemu.timeout', 60)
-    if budget <= 0: raise SystemExit('timeout must be positive')
+    if budget < 0: raise SystemExit('timeout must be nonnegative; 0 disables it')
     if not 0 <= args.case_timeout <= 86400: raise SystemExit('case timeout must be between 0 and 86400 seconds')
     subprocess.run(['make', 'all', 'OSCOMP_GROUPS=' + ' '.join(selected),
                     'OSCOMP_CASE_TIMEOUT=' + str(args.case_timeout)], cwd=ROOT, check=True)
@@ -135,12 +135,13 @@ def main():
     subprocess.run(probe,cwd=directory,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,check=True)
     report['dtb_sha256']=sha(dtb);command+=['-dtb',str(dtb)]
     (directory / 'identity.json').write_text(json.dumps(report, indent=2) + '\n')
-    print(f'Running one RV boot, total budget {budget}s; log: {directory / "serial.log"}', flush=True)
+    budget_label = f'{budget}s' if budget else 'disabled'
+    print(f'Running one RV boot, total budget {budget_label}; log: {directory / "serial.log"}', flush=True)
     start = time.monotonic()
     log = directory / 'serial.log'
     with log.open('wb') as stream:
         try:
-            result = subprocess.run(command, cwd=directory, input=b'\n', stdout=stream, stderr=subprocess.STDOUT, timeout=budget)
+            result = subprocess.run(command, cwd=directory, input=b'\n', stdout=stream, stderr=subprocess.STDOUT, timeout=budget or None)
             report['qemu_returncode'] = result.returncode
             report['exit_reason'] = 'qemu-exit'
         except subprocess.TimeoutExpired:
