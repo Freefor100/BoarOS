@@ -603,7 +603,7 @@ enum riscv_root_boot_status riscv_root_boot_finish(
         return RISCV_ROOT_BOOT_STATUS_CLEANUP;
     }
 
-    error = riscv_uart_tty_stop(&root->uart);
+    error = riscv_uart_tty_stop_report(&root->uart, &root->uart_statistics);
     if (error) {
         root->finish_failure = RISCV_ROOT_FINISH_UART;
         root->finish_error = error;

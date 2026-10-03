@@ -14,7 +14,7 @@ worker 使用调度器标准 8 KiB 栈和任务存储。root baseline 在创建 
 - worker 每轮最多提交 256 个 RX 项，发送内核 console 与 TTY 用户/echo 合计最多 256 字节，轮换先服务的来源。仍有可执行工作时 yield；THRE credit 缺失时启用发送就绪 IRQ，handler 关闭该中断并唤醒 worker。THRE 只证明可继续发送，drain 同时要求软件队列为空与实际 TEMT；最后的 TEMT 由最多 10 ms 的定时等待观察，避免空转 IRQ。
 - `transmit` 逐次检查 THRE，返回真实接受字节；没有分配、睡眠或成功存根。default 115200/8N1/CREAD 的 divisor 来自 DTB 时钟；CS5–8、parity、stop bits 实际写 LCR。B0 撤 DTR/RTS；HUPCL 在 last close 撤 modem 输出，后续 configure 可恢复。独立输入速度归一到硬件输出速度，未实现的 CMSPAR、BOTHER 和 CRTSCTS 不对用户保留支持声明。
 - `virt_uart_putc` 先把真实内核字符保存在 16 KiB klog，再按 console level 送到独立 port 队列。`kernel_console_putc` 是不写 klog 的诊断输出；TTY 用户/echo 不经过这两条路径。queue 满时记录 `console_dropped`，IRQ 打印不阻塞。`virt_uart_emergency_begin` 使 fatal 输出改用既有固定轮询 sink；pre/post runtime 也保持轮询输出。
-- stop 首先阻止新 TTY 工作并关闭输入，在正常关闭中保留已接受且未 flush 的 TX。超过一秒仍无法 drain 返回 EIO，worker 已 join，但队列、MMIO 和 IRQ 登记仍有 port owner；再次 stop 可重建 worker 重试。成功停止在 join 后注销 IRQ，才释放 TTY/port。
+- stop 首先阻止新 TTY 工作并关闭输入，在正常关闭中保留已接受且未 flush 的 TX。超过一秒仍无法 drain 返回 EIO，worker 已 join，但队列、MMIO 和 IRQ 登记仍有 port owner；再次 stop 可重建 worker 重试。成功停止在 join 后注销 IRQ，才释放 TTY/port。`stop_report` 在 drain/join 完成后、释放前冻结最终计数；失败或空 owner 不修改输出，root 保存该固定快照供聚焦验证。
 
 ## 验证
 

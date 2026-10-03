@@ -250,7 +250,8 @@ void riscv_uart_tty_statistics(struct riscv_uart_tty *p, struct riscv_uart_stati
 {
     uintptr_t irq = riscv_interrupt_save(); *statistics = p->statistics; riscv_interrupt_restore(irq);
 }
-int riscv_uart_tty_stop(struct riscv_uart_tty **owner)
+int riscv_uart_tty_stop_report(struct riscv_uart_tty **owner,
+                             struct riscv_uart_statistics *statistics)
 {
     if (!owner || !*owner) return 0;
     struct riscv_uart_tty *p = *owner;
@@ -268,6 +269,12 @@ int riscv_uart_tty_stop(struct riscv_uart_tty **owner)
     console_port = 0;
     int error = kernel_tty_destroy(&p->tty);
     if (error) { riscv_interrupt_restore(irq); return error; }
+    if (statistics) *statistics = p->statistics;
     if (kernel_heap_release(p->heap, p) != KERNEL_HEAP_STATUS_OK) __builtin_trap();
     *owner = 0; riscv_interrupt_restore(irq); return 0;
+}
+
+int riscv_uart_tty_stop(struct riscv_uart_tty **owner)
+{
+    return riscv_uart_tty_stop_report(owner, 0);
 }

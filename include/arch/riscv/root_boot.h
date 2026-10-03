@@ -62,6 +62,7 @@ enum riscv_root_finish_failure {
 
 struct riscv_root_boot {
     struct riscv_uart_tty *uart;
+    struct riscv_uart_statistics uart_statistics;
     struct riscv_virtio_mmio_rng rng;
     struct kernel_network *network;
     struct kernel_heap heap;

@@ -118,7 +118,10 @@ int main(void) {
     test_transport->last_close(transport_owner,0x400);assert(regs[4]==0);
     settings.cflag=0x10b2;assert(!test_transport->configure(transport_owner,&settings));assert(regs[4]==3);
     tty_output[tty_write++]='S';thre=0;
-    assert(riscv_uart_tty_stop(&port)==-KERNEL_EIO);assert(port&&live_allocations&&irq_handler&&tty_read!=tty_write);
-    thre=1;assert(!riscv_uart_tty_stop(&port));assert(output[output_w-1]=='S');assert(!port&&!live_allocations&&!irq_handler&&regs[1]==0);
+    struct riscv_uart_statistics final={.transmitted=99999};
+    assert(riscv_uart_tty_stop_report(&port,&final)==-KERNEL_EIO);assert(final.transmitted==99999);assert(port&&live_allocations&&irq_handler&&tty_read!=tty_write);
+    thre=1;assert(!riscv_uart_tty_stop_report(&port,&final));
+    assert(final.transmitted==1539&&final.received==2200&&final.console_dropped==76);
+    assert(!riscv_uart_tty_stop_report(&port,&final));assert(final.transmitted==1539);assert(output[output_w-1]=='S');assert(!port&&!live_allocations&&!irq_handler&&regs[1]==0);
     assert(!riscv_uart_tty_console('x'));puts("UART IRQ/worker transport tests passed");
 }

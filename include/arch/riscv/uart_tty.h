@@ -10,6 +10,9 @@ struct riscv_uart_statistics {
 int riscv_uart_tty_start(struct riscv_uart_tty **owner, struct kernel_heap *heap,
     const struct dtb_uart_info *info, volatile void *mapping, uint32_t frequency);
 int riscv_uart_tty_stop(struct riscv_uart_tty **owner);
+/* Freeze final counters after drain/join; failure or empty owner leaves output unchanged. */
+int riscv_uart_tty_stop_report(struct riscv_uart_tty **owner,
+                             struct riscv_uart_statistics *statistics);
 /* Returns one when a live transport accepted or counted this character. */
 int riscv_uart_tty_console(char character);
 void riscv_uart_tty_statistics(struct riscv_uart_tty *port,
