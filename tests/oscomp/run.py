@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parents[2]
 HERE = Path(__file__).resolve().parent
 REF = ROOT / 'references/oscomp-autotest'
 GROUPS = ['basic', 'busybox', 'cyclictest', 'iozone', 'iperf', 'libcbench',
-          'libctest', 'lmbench', 'ltp', 'lua', 'netperf']
+          'libctest', 'lmbench', 'lua', 'netperf', 'ltp']
 
 def sha(path):
     with Path(path).open('rb') as stream:
@@ -87,7 +87,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--output', type=Path, default=ROOT / 'build/oscomp-rv-run')
     ap.add_argument('--diagnostic-timeout', type=int, help='override budget; labels result diagnostic, never the formal baseline')
-    ap.add_argument('--groups',choices=('all','iozone'),default='all',help='iozone is a local专项, never full Harness acceptance')
+    ap.add_argument('--groups',choices=('all','iozone','environment'),default='all',help='environment selects basic/busybox; subsets never imply full Harness acceptance')
     args = ap.parse_args()
     directory = args.output.resolve()
     if directory.exists():
@@ -95,7 +95,7 @@ def main():
     if not directory.is_relative_to(ROOT / 'build'):
         raise SystemExit('run outputs must be under build/')
     identity = validate()
-    selected=GROUPS if args.groups=='all' else ['iozone']
+    selected={'all':GROUPS,'iozone':['iozone'],'environment':['basic','busybox']}[args.groups]
     config_path = REF / 'kernel/judge/config.json'
     config = json.loads(config_path.read_text())
     budget = args.diagnostic_timeout if args.diagnostic_timeout is not None else config.get('qemu.timeout', 60)

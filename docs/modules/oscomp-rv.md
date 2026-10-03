@@ -15,12 +15,15 @@ e2fsprogs、Python 3.11+、jinja2、pytz，原 judge 使用宿主 Python。
 ## 启动和用户态环境
 
 `init.json` 将 PID 1 配成原盘 `/musl/busybox sh /boaros-start.sh`。
-runner 从原盘建立可丢弃副本，只增加自己的启动脚本。原测试脚本、二进制、权限及
-判断逻辑均保留。内核没有比赛路径或调度特判。
+runner 从原盘建立可丢弃副本，增加自己的启动脚本。测例脚本、二进制和判断逻辑
+保持原内容；启动脚本为两侧 `basic/run-all.sh` 补执行权限，使原包装器能够调用它。
+内核没有比赛路径或调度特判。
 
 启动脚本通过原 BusyBox 创建 `/bin /lib /tmp /dev /proc`、工具与加载器符号链接，
-通过 mknodat 创建 null/zero/console，将标准 fd 重新绑定到真实 console 节点，
-再挂载内核 procfs。`/tmp` 是 ext4 目录，不是 tmpfs。
+通过 mknodat 创建 null/zero、串口、random/urandom、RTC 和根盘设备节点，将标准 fd
+重新绑定到真实 console，再挂载 procfs 与 `/dev/shm` 的 tmpfs。`/tmp` 仍为 ext4，
+权限为1777。随机节点接入真实内核随机源；节点存在不等于可信熵已就绪，本 profile
+不提供 VirtIO RNG，不能用固定字节或成功存根掩盖缺失的熵源。
 每组在自己的 libc 根目录执行原 `*_testcode.sh`，分别设置 `LD_LIBRARY_PATH`，
 避免同时搜索两套 libc。musl 的普通/sf 加载器名指向镜像自带 libc；
 glibc 加载器指向其真实文件。proc 内容来自真实内核对象，没有假随机设备或测试输出。
@@ -29,12 +32,13 @@ glibc 加载器指向其真实文件。proc 内容来自真实内核对象，没
 不改动 `hello` 或组脚本。
 
 默认顺序为 basic、busybox、cyclictest、iozone、iperf、libcbench、libctest、
-lmbench、ltp、lua、netperf，每组先 glibc 后 musl。无逐组超时、重启或失败后宿主拼接。
+lmbench、lua、netperf、ltp，每组先 glibc 后 musl。无逐组超时、重启或失败后宿主拼接。
 
 ## 重建与评分
 
 ```sh
 python3 -B tests/oscomp/run.py --output build/oscomp-rv-baseline
+python3 -B tests/oscomp/run.py --groups environment --output build/oscomp-rv-environment
 # 明确标为诊断，不能合入正式总分：
 python3 -B tests/oscomp/run.py --output build/oscomp-rv-diagnostic --diagnostic-timeout 60
 make all                         # 恢复默认 /init 配置
@@ -59,8 +63,8 @@ runner 读取固定 Harness `kernel/judge/config.json`。其中 `qemu.timeout=36
 ## 证据边界与清理
 
 历史逐组重启、修改启动方式的成绩仅作诊断；官方脚本是否启动、环境缺口和内核 ABI
-错误分别记录。镜像 basic 的 `run-all.sh` 为 0644，原包装器却直接执行它；本入口
-保留该行为，不能据此把 basic 的低分全部归为内核缺少对应 syscall。
+错误分别记录。镜像 basic 的 `run-all.sh` 为0644，启动环境负责补执行权限；保留测例
+内容与原包装器调用方式，不把环境准备问题归为缺少对应 syscall。
 
 评分核对后将结论、运行身份和重建命令写入本文，运行产物由 `make prune-build`
 清理。原始 `.img/.img.xz` 在 references，不属于清理范围。通用新缺陷先最小复现，
