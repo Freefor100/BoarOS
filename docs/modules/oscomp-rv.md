@@ -10,22 +10,24 @@ uname 4.15.0、启动配置和评测入口，不整体回合主线。这里只�
 `d1bb3a3c4b27274e196a2648518525c1a304e339`。四个发布资产长期保存于该目录，
 缺失或校验失败直接报错，不重新下载、不修改原盘。LA 只校验身份，不启动。
 来源为清单记录的 GitHub release 与 Harness；运行依赖包括项目工具链、QEMU、
-e2fsprogs、Python 3.11+、jinja2、pytz，原 judge 使用宿主 Python。
+Python 3.11+、jinja2、pytz，原 judge 使用宿主 Python。
 
 ## 启动和用户态环境
 
-`init.json` 将 PID 1 配成原盘 `/musl/busybox sh /boaros-start.sh`。
-runner 从原盘建立可丢弃副本，增加自己的启动脚本。测例脚本、二进制和判断逻辑
-保持原内容；启动脚本为两侧 `basic/run-all.sh` 补执行权限，使原包装器能够调用它。
-内核没有比赛路径或调度特判。
+本分支普通 `make all` 将 `tests/oscomp/init.sh` 和通用单项监督程序编入生成的
+PID 1 配置，直接启动官方原盘的 `/musl/busybox`。不需要本地 runner 向测试盘注入
+启动文件，也不依赖额外 libc 或修改原测例二进制。生成配置保存在忽略的 build；
+`INIT_CONFIG=...` 仍可显式选择其他启动配置。内核没有比赛路径或调度特判。
+使用只含 `/init` 的通用模块 fixture 时，需显式传入 `INIT_CONFIG=config/init.json`；
+默认评测启动配置要求官方盘中的 BusyBox 和目录布局。
+
+启动脚本为两侧 `basic/run-all.sh` 补执行权限，使原包装器能够调用它。
 
 启动脚本通过原 BusyBox 创建 `/bin /lib /tmp /dev /proc`、工具与加载器符号链接，
 通过 mknodat 创建 null/zero、串口、random/urandom、RTC 和根盘设备节点，将标准 fd
 重新绑定到真实 console，再挂载 procfs 与 `/dev/shm` 的 tmpfs。`/tmp` 仍为 ext4，
 权限为1777。随机节点接入真实内核随机源；节点存在不等于可信熵已就绪，本 profile
 不提供 VirtIO RNG，不能用固定字节或成功存根掩盖缺失的熵源。
-LTP 的 C 框架优先在 `/dev/shm` 建立共享结果页；缺少该目录时会退到临时目录并调用
-`chown`。真实 tmpfs 挂载保护测试框架的 IPC 环境，不代替需要 `chown` 的测试语义。
 每组在自己的 libc 根目录执行原 `*_testcode.sh`，分别设置 `LD_LIBRARY_PATH`，
 避免同时搜索两套 libc。musl 的普通/sf 加载器名指向镜像自带 libc；
 glibc 加载器指向其真实文件。proc 内容来自真实内核对象，没有假随机设备或测试输出。
@@ -34,30 +36,40 @@ glibc 加载器指向其真实文件。proc 内容来自真实内核对象，没
 不改动 `hello` 或组脚本。
 
 默认顺序为 basic、busybox、cyclictest、iozone、iperf、libcbench、libctest、
-lmbench、lua、netperf、ltp，每组先 glibc 后 musl。无逐组超时、重启或失败后宿主拼接。
+lmbench、lua、netperf、ltp，每组先 glibc 后 musl。各组串行执行原脚本，不切换 LTP 的
+上游 runtest 清单，不白名单过滤，也不在失败后重启、拼接结果。
 
-`--groups ltp` 是独立、无评分的诊断入口：`tests/oscomp/ltp.sh` 调用原镜像的
-`runltp/ltp-pan`，按 `runtest` 清单保留命令和参数，不遍历辅助程序目录。
-`--ltp-suites` 选择清单，`--ltp-pattern` 使用原 runltp 的基本 grep 表达式。
-脚本设置原 IDcheck 的 `CREATE_ENTRIES=0` 并关闭交互输入；缺少账户的警告仍保留，
-不创建账户条目冒充凭据支持。两套 libc 分开保存原输出、结果表、失败及 TCONF 清单，
-引擎非零状态不阻止启动下一套 libc。测例仍使用自身超时，另有整次 QEMU 预算；
-预算耗尽不等于清单已完成。该模式不执行原 LTP 目录遍历包装器、不运行原 judge，
-不能产生正式分数；默认 `all` 入口和原测例内容不变。
+LTP 仍使用比赛脚本的原目录遍历、原参数及原 START/RUN/FAIL/END 标记。
+`ltp-hook.sh` 只在临时脚本副本的唯一单项执行行接入 `case`，原盘文件保留。
+监督程序使用原 BusyBox 的 exec/文本回退，继承 cwd 和环境，将单项置于独立进程组。
+直接子进程不是组长，仍可调用 setsid；监督者在握手放行前离开测试组，避免测例的
+`kill(0, signal)` 终止原包装器。监督者的存活 PID 保护组身份，不使用按名称的进程扫描。
+正常退出和信号结果原样转换为 shell 状态；超时先发 TERM，
+两秒后必要时发 KILL，另保留 native wait status，返回 124 而非成功。
+直接子进程回收后，清理仍留在该组中的后代；不会向等待信号的程序伪造启动信号，
+也不承诺回收已脱离测试组的守护进程。官方脚本本身将辅助程序作为无参数单项执行，
+监督不能把这种输入转化成上游控制脚本的有效输入或语义通过。
+
+默认每项 LTP 上限 60 秒，可在构建时用 `OSCOMP_CASE_TIMEOUT` 设置，0 关闭超时。
+这属于本项目的执行预算，可能提前结束合法长测试；超时不代表内核缺功能，完成循环
+也不代表语义通过。官方总启动预算和原 judge 不变，缺少 `kernel-la` 仍阻塞完整 Harness。
 
 ## 重建与评分
 
+官方 Docker 入口见 `references/oscomp-autotest/README.md`，它直接调用 `make all`
+并启动两种架构。下列 `run.py` 是复用原脚本与 judge 的本地 RV 投影，不代替该入口。
+
 ```sh
+make all                         # 官方构建入口；无需修改官方测试盘
 python3 -B tests/oscomp/run.py --output build/oscomp-rv-baseline
 python3 -B tests/oscomp/run.py --groups environment --output build/oscomp-rv-environment
-# 原 LTP 控制脚本正确传参，随后运行 syscall；仅诊断，不计分：
-python3 -B tests/oscomp/run.py --groups ltp --ltp-suites controllers,syscalls \
-  --ltp-pattern '^\(cgroup_fj_function_cpuset\|getuid01\)[[:space:]]' \
-  --diagnostic-timeout 120 --output build/oscomp-ltp-smoke
-python3 -B tests/oscomp/test_ltp.py
+# 聚焦验证仍执行完整原 LTP 包装器，不选内部清单：
+python3 -B tests/oscomp/run.py --groups ltp --output build/oscomp-ltp
+python3 -B tests/oscomp/test_official.py
 # 明确标为诊断，不能合入正式总分：
 python3 -B tests/oscomp/run.py --output build/oscomp-rv-diagnostic --diagnostic-timeout 60
-make all                         # 恢复默认 /init 配置
+make all                         # 恢复完整官方启动选择
+make all INIT_CONFIG=config/init.json # 显式恢复通用 /init 配置
 make test-init-config-riscv       # 交替重建检查，结束后恢复默认
 ```
 
@@ -82,7 +94,7 @@ runner 读取固定 Harness `kernel/judge/config.json`。其中 `qemu.timeout=36
 错误分别记录。镜像 basic 的 `run-all.sh` 为0644，启动环境负责补执行权限；保留测例
 内容与原包装器调用方式，不把环境准备问题归为缺少对应 syscall。
 
-本文维护运行契约和重建方法，不追加每轮成绩或运行记录。诊断输出留在忽略的 build，
+本文维护启动、监督和评分契约，不追加每轮成绩或运行记录。输出留在忽略的 build，
 核对后由 `make prune-build` 清理。原始 `.img/.img.xz` 在 references，不属于清理范围。通用新缺陷先最小复现，
 回 main 修复并验收，再 merge 回本分支重新构建运行。
 

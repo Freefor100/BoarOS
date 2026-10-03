@@ -589,9 +589,28 @@ DEPS := \
 	test-uaccess-riscv test-user-riscv test-vma-riscv test-brk-riscv \
 	test-mmap-riscv
 
+OSCOMP_GROUPS ?= basic busybox cyclictest iozone iperf libcbench libctest lmbench lua netperf ltp
+OSCOMP_CASE_TIMEOUT ?= 60
+OSCOMP_CASE := $(BUILD_DIR)/oscomp/case
+OSCOMP_INIT := $(BUILD_DIR)/oscomp/init.json
+.DEFAULT_GOAL := all
+
+$(OSCOMP_CASE): tests/oscomp/case.c tests/riscv/user_elf.ld
+	@mkdir -p $(@D)
+	$(CC) $(ARCH_FLAGS) -O2 -ffreestanding -fno-builtin -fno-stack-protector \
+		-nostdlib -static -s -Wall -Wextra -Werror -Wl,--build-id=none \
+		-Wl,-T,tests/riscv/user_elf.ld -o $@ $<
+
+.PHONY: force-oscomp-init
+force-oscomp-init:
+
+$(OSCOMP_INIT): force-oscomp-init $(OSCOMP_CASE) tests/oscomp/init.sh tests/oscomp/ltp-hook.sh tests/oscomp/prepare.py
+	python3 -B tests/oscomp/prepare.py --case $(OSCOMP_CASE) --output $@ \
+		--groups '$(OSCOMP_GROUPS)' --case-timeout $(OSCOMP_CASE_TIMEOUT)
+
 all: $(KERNEL_RV)
 
-INIT_CONFIG ?= config/init.json
+INIT_CONFIG ?= $(OSCOMP_INIT)
 .PHONY: force-init-config test-init-config-riscv
 force-init-config:
 

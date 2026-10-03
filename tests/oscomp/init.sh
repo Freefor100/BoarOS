@@ -25,8 +25,9 @@ $BB chmod 1777 /tmp
 # 发布镜像将此脚本存成 0644；补执行权限，不改测例内容或判断。
 $BB chmod +x /glibc/basic/run-all.sh /musl/basic/run-all.sh
 export HOME=/ TERM=vt100
-groups='basic busybox cyclictest iozone iperf libcbench libctest lmbench lua netperf ltp'
-if [ -f /boaros-eval-groups ]; then groups=$($BB cat /boaros-eval-groups); fi
+# BOAROS_CASE_PAYLOAD
+groups=${BOAROS_EVAL_GROUPS:-'basic busybox cyclictest iozone iperf libcbench libctest lmbench lua netperf ltp'}
+export BOAROS_LTP_CASE_TIMEOUT=${BOAROS_LTP_CASE_TIMEOUT:-60}
 for group in $groups; do
     for libc in glibc musl; do
         (
@@ -39,14 +40,19 @@ for group in $groups; do
             fi
             echo "BOAROS-EVAL ENTER $group-$libc"
             set +e
-            if [ "$group" = ltp ] && [ -f /boaros-ltp-suites ]; then
-                /$libc/busybox sh /boaros-ltp.sh /$libc/ltp \
-                    "$($BB cat /boaros-ltp-suites)" "$($BB cat /boaros-ltp-pattern)" \
-                    /tmp/boaros-ltp-$libc
+            if [ "$group" = ltp ]; then
+                export BOAROS_CASE_SHELL=/$libc/busybox
+                # 仅在临时副本中接入逐项监督，原循环、参数、标记和判分行均保留。
+                if ! $BB sh /tmp/boaros-ltp-hook.sh ./ltp_testcode.sh /tmp/boaros-ltp-$libc.sh; then
+                    result=125
+                else
+                    /$libc/busybox sh /tmp/boaros-ltp-$libc.sh
+                    result=$?
+                fi
             else
                 /$libc/busybox sh ./${group}_testcode.sh
+                result=$?
             fi
-            result=$?
             echo "BOAROS-EVAL EXIT $group-$libc status=$result"
         )
     done
