@@ -2,6 +2,7 @@
 #define BOAROS_ARCH_RISCV_ROOT_BOOT_H
 
 #include <arch/riscv/sv39.h>
+#include <arch/riscv/uart_tty.h>
 #include <arch/riscv/virtio_mmio_block.h>
 #include <arch/riscv/virtio_mmio_rng.h>
 #include <kernel/network.h>
@@ -56,9 +57,11 @@ enum riscv_root_finish_failure {
     RISCV_ROOT_FINISH_PAGE_BASELINE = 1U << 6,
     RISCV_ROOT_FINISH_RNG = 1U << 7,
     RISCV_ROOT_FINISH_NETWORK = 1U << 8,
+    RISCV_ROOT_FINISH_UART = 1U << 9,
 };
 
 struct riscv_root_boot {
+    struct riscv_uart_tty *uart;
     struct riscv_virtio_mmio_rng rng;
     struct kernel_network *network;
     struct kernel_heap heap;
@@ -96,6 +99,12 @@ enum riscv_root_boot_status riscv_root_boot_start(
     struct riscv_root_boot *root,
     const struct dtb_boot_info *info,
     struct physical_page_allocator *allocator,
+    const struct riscv_sv39_page_table *kernel_table);
+
+/* Production seam: PLIC and mapped DTB UART precede standard OFDs. */
+enum riscv_root_boot_status riscv_root_boot_start_with_irq(
+    struct riscv_root_boot *root, const struct dtb_boot_info *info,
+    const struct dtb_irq_info *irq, struct physical_page_allocator *allocator,
     const struct riscv_sv39_page_table *kernel_table);
 
 /*

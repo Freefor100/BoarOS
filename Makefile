@@ -151,6 +151,7 @@ C_SOURCES := \
 	arch/riscv/uaccess.c \
 	arch/riscv/virt_rtc.c \
 	arch/riscv/virt_uart.c \
+	arch/riscv/uart_tty.c \
 	arch/riscv/virtio_mmio_block.c \
 	arch/riscv/virtio_mmio_rng.c \
 	arch/riscv/virtio_mmio_net.c \
@@ -255,6 +256,7 @@ TEST_RUNTIME_C_SOURCES := \
 	arch/riscv/uaccess.c \
 	arch/riscv/virt_rtc.c \
 	arch/riscv/virt_uart.c \
+	arch/riscv/uart_tty.c \
 	arch/riscv/virtio_mmio_block.c \
 	arch/riscv/virtio_mmio_rng.c \
 	arch/riscv/virtio_mmio_net.c \
@@ -1681,3 +1683,8 @@ test-offline-project-riscv: $(OFFLINE_PROJECT_RV) $(KERNEL_RV) prepare-offline-c
 
 test-offline-project-tmpfs-riscv: $(OFFLINE_PROJECT_RV) $(KERNEL_RV) prepare-offline-c-toolchain
 	python3 -B tests/offline-c-riscv.py --project lua --kernel $(KERNEL_RV) --program $(OFFLINE_PROJECT_RV) --toolchain-tree build/offline-c/alpine-tree --timeout 900 --tmpfs --performance
+
+.PHONY: test-uart-host
+test-uart-host:
+	python3 -B tests/host/dtb_uart_test.py
+	./tests/uart-host.sh

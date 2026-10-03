@@ -194,6 +194,7 @@ enum riscv_root_boot_status riscv_root_boot_cleanup(
             }
         }
     }
+    if (riscv_uart_tty_stop(&root->uart)) cleanup_failed = 1;
     if (root->heap.page_allocator == 0) {
         cleanup_failed = 1;
     } else {
@@ -212,9 +213,10 @@ enum riscv_root_boot_status riscv_root_boot_cleanup(
     return root->failure_status;
 }
 
-enum riscv_root_boot_status riscv_root_boot_start(
+enum riscv_root_boot_status riscv_root_boot_start_with_irq(
     struct riscv_root_boot *root,
     const struct dtb_boot_info *info,
+    const struct dtb_irq_info *irq,
     struct physical_page_allocator *allocator,
     const struct riscv_sv39_page_table *kernel_table)
 {
@@ -243,7 +245,7 @@ enum riscv_root_boot_status riscv_root_boot_start(
     int64_t console_result;
 
     if (root == 0 || info == 0 || allocator == 0 ||
-        kernel_table == 0 || root->state != RISCV_ROOT_BOOT_EMPTY ||
+        kernel_table == 0 || root->state != RISCV_ROOT_BOOT_EMPTY || root->uart != 0 ||
         root->device.page_allocator != 0 || root->device_count != 0U ||
         info->virtio_mmio_count > DTB_MAX_VIRTIO_MMIO_RANGES ||
         root->mount.private_data != 0 ||
@@ -458,7 +460,15 @@ enum riscv_root_boot_status riscv_root_boot_start(
         failure = RISCV_ROOT_BOOT_STATUS_RESOURCES;
         goto fail;
     }
-    /* 真实 /dev/console 节点优先；缺失时保留早期串口标准 fd。 */
+    if (irq && irq->uart.registers.size) {
+        if (irq->uart.registers.base > UINT64_MAX-RISCV_KERNEL_MMIO_BASE ||
+            riscv_uart_tty_start(&root->uart, &root->heap, &irq->uart,
+                (void *)(uintptr_t)(RISCV_KERNEL_MMIO_BASE+irq->uart.registers.base),
+                info->timebase_frequency)) {
+            failure = RISCV_ROOT_BOOT_STATUS_RESOURCES; goto fail;
+        }
+    }
+    /* 运行期串口TTY必须先发布，初始OFD才能保存正确的实例。 */
     for (stdio_index = 0U; stdio_index < 3U; stdio_index++) {
         if (kernel_files_open_boot_console(&files,
                                       kernel_fs_context_root(&fs),
@@ -593,6 +603,12 @@ enum riscv_root_boot_status riscv_root_boot_finish(
         return RISCV_ROOT_BOOT_STATUS_CLEANUP;
     }
 
+    error = riscv_uart_tty_stop(&root->uart);
+    if (error) {
+        root->finish_failure = RISCV_ROOT_FINISH_UART;
+        root->finish_error = error;
+        return RISCV_ROOT_BOOT_STATUS_CLEANUP;
+    }
     kernel_heap_get_statistics(&root->heap, heap_statistics);
     *available_pages = physical_page_available(root->heap.page_allocator);
     if (heap_statistics->live_allocations != 0U ||
@@ -607,4 +623,13 @@ enum riscv_root_boot_status riscv_root_boot_finish(
     }
     root->state = RISCV_ROOT_BOOT_FINISHED;
     return RISCV_ROOT_BOOT_STATUS_OK;
+}
+
+/* Module boot fixtures deliberately retain only the early polling console. */
+enum riscv_root_boot_status riscv_root_boot_start(
+    struct riscv_root_boot *root, const struct dtb_boot_info *info,
+    struct physical_page_allocator *allocator,
+    const struct riscv_sv39_page_table *kernel_table)
+{
+    return riscv_root_boot_start_with_irq(root, info, 0, allocator, kernel_table);
 }

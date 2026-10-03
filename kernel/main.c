@@ -497,6 +497,10 @@ static enum riscv_sv39_status build_kernel_page_table(
     if (status != RISCV_SV39_STATUS_OK) {
         return status;
     }
+    if (boot_irq.uart.registers.size) {
+        status = map_mmio_alias(&kernel_page_table, boot_irq.uart.registers.base, boot_irq.uart.registers.size);
+        if (status != RISCV_SV39_STATUS_OK) return status;
+    }
     status = map_mmio_alias(&kernel_page_table, boot_irq.plic.base, boot_irq.plic.size);
     if (status != RISCV_SV39_STATUS_OK) return status;
     for (index = 0U; index < info->virtio_mmio_count; index++) {
@@ -821,8 +825,9 @@ static void kernel_main_high(void)
     if (!riscv_plic_init((void *)(uintptr_t)(RISCV_KERNEL_MMIO_BASE + boot_irq.plic.base),
                          boot_irq.plic.size, boot_irq.context, boot_irq.source_count)) __builtin_trap();
 
-    root_status = riscv_root_boot_start(&root_boot,
+    root_status = riscv_root_boot_start_with_irq(&root_boot,
                                         &boot_info,
+                                        &boot_irq,
                                         &page_allocator,
                                         &kernel_page_table);
     if (root_status == RISCV_ROOT_BOOT_STATUS_OK) {
