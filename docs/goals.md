@@ -159,7 +159,7 @@ glibc四进程整命令仍增加0.73%。该轮的prepare读取、1547次FLUSH和
 
 - [x] `linkat` 已接入同inode/nlink、活引用与跨mount约束，支持flags 0、AT_SYMLINK_FOLLOW、AT_EMPTY_PATH；见文件模块与多挂载证据，不再重复立项。
 - [x] `renameat/renameat2` 支持普通/NOREPLACE；单事务文件/空目录覆盖、跨目录移动、祖先拒绝、同 inode、活目标及失败回滚，EXCHANGE/WHITEOUT 明确不支持。单根挂载的跨 mount 拒绝存在，真实多挂载验证归 P1h。
-- [ ] `umask` 已按 fs context 的 fork 复制与 `CLONE_FS` 共享实现，真实 inode 的 `fchmod/fchmodat` 已覆盖；继续按消费者补 `faccessat` 的权限模型、合成 inode 的 chmod 与凭据依赖，与 P2e 保持一致，不能总返回允许。已有 open 未知 bits 拒绝策略另用差分核对，不能写成 Linux 通用要求。
+- [ ] `umask` 已按 fs context 的 fork 复制与 `CLONE_FS` 共享实现，真实 inode 的 `fchmod/fchmodat` 已覆盖；匿名pipe改权也已交付；其余合成对象的改权和`faccessat`等完整凭据/权限消费者按实际需求推进，与 P2e 保持一致，不能总返回允许。已有 open 未知 bits 拒绝策略另用差分核对，不能写成 Linux 通用要求。
 
 ### P1h 虚拟文件系统与多挂载
 
@@ -347,8 +347,8 @@ glibc四进程整命令仍增加0.73%。该轮的prepare读取、1547次FLUSH和
 ### P5d 离线编译闭环
 
 - [x] 同一静态 musl 驱动和磁盘在固定 Linux/BoarOS 记录预处理、编译、汇编、链接、运行五阶段的独立结果，重放 journal 后检查逐阶段产物哈希与 ext4；无原生编译器时两侧明确停在 `preprocess:exec:2`。这是诊断基线，不是编译闭环。
-- [x] 固定 Alpine v3.22 riscv64 GCC 14.2.0-r6 和 14 个依赖 APK，完成同一镜像中的预处理→编译→汇编→静态链接→运行；五阶段退出码、产物哈希与最终输出在固定 Linux/BoarOS 一致。现只覆盖固定小型 C 源码，其他项目须逐个验证。
-- [ ] 单独补齐 pipe/匿名 inode 的 mode 存储、`fstat` 与 `fchmod` 契约：固定 Linux 对 `fchmod(pipefd)` 成功，当前 BoarOS 对无 VFS inode 的 fd 返回 `ENOTSUP`；不以成功存根替代元数据。
+- [x] 固定 Alpine v3.22 riscv64 GCC 14.2.0-r6 和 14 个依赖 APK，完成同一镜像中的预处理→编译→汇编→静态链接→运行；五阶段退出码、产物哈希与最终输出在固定 Linux/BoarOS 一致。该早期记录只覆盖小型C源码；当前已扩到Lua5.4.3原工程，其他项目仍须逐个验证。
+- [x] 匿名pipe的mode、时间和身份归共享pipe，`fstat/fchmod`及两端、dup/fork/proc重开已交付；本轮未建立通用匿名inode框架。命名FIFO与默认make jobserver亦已验收，见[工具链记录](learning/offline-toolchain-probe.md#管道与默认fifo-jobserver2026-10-03)。
 - [ ] 再固定 rustc/cargo、依赖锁定和离线最小项目，成功后扩大完整项目。先 `-j1` 建立正确性，不要求 SMP，也不把网络下载失败混入内核 ABI。
 - [ ] 每个新失败最小化、对照固定 Linux，再修通用机制；保留可恢复的成功输入和失败样本，不能为构建脚本改写预期输出。
 
