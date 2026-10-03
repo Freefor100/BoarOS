@@ -164,7 +164,7 @@ static int run(int argc, char **argv, char **envp)
     }
     call(NR_CLOSE, ready[1], 0, 0, 0, 0, 0);
     int status = 0, expired = 0, killed = 0, clock_failed = 0;
-    long grace = 0;
+    long grace = 0, deadline_elapsed = -1;
     for (;;) {
         long waited = call(NR_WAIT, child, (long)&status, 1, 0, 0, 0);
         if (waited == child) break;
@@ -177,6 +177,7 @@ static int run(int argc, char **argv, char **envp)
         if (!expired && (time < 0 || (limit && time - start >= limit * 1000))) {
             expired = 1;
             clock_failed = time < 0;
+            if (time >= start) deadline_elapsed = time - start;
             message("BOAROS-CASE TIMEOUT seconds="); number(limit);
             message(" command="); message(argv[3]); message("\n");
             /* wait 尚未回收 PID；即使子进程此刻退出，也不能误杀复用者。 */
@@ -194,7 +195,16 @@ static int run(int argc, char **argv, char **envp)
     if (!setup_failed) stop_group(group, 0, 9);
     if (setup_failed) return 125;
     if (expired) {
-        message("BOAROS-CASE TIMEOUT-END wait_status="); number(status); message("\n");
+        message("BOAROS-CASE TIMEOUT-END wait_status="); number(status);
+        /* 只保留数值诊断；child 已回收，不能再按其 PID 发信号或保活。 */
+        message(" child_pid="); number(child);
+        message(" test_pgid="); number(group);
+        message(" deadline_elapsed_ms=");
+        if (deadline_elapsed >= 0) number(deadline_elapsed); else message("unavailable");
+        message(" total_elapsed_ms=");
+        long end = now();
+        if (end >= start) number(end - start); else message("unavailable");
+        message("\n");
         return clock_failed ? 125 : 124;
     }
     return status & 127 ? 128 + (status & 127) : (status >> 8) & 255;

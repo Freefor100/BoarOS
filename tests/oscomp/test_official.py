@@ -1,6 +1,7 @@
 """Check the official script hook and the owned-child time limit."""
 from pathlib import Path
 import os
+import re
 import subprocess
 import tempfile
 import unittest
@@ -35,6 +36,13 @@ class OfficialFlowTests(unittest.TestCase):
         self.assertEqual(result.returncode, 124, result.stderr)
         self.assertIn('BOAROS-CASE TIMEOUT', result.stderr)
         self.assertIn('wait_status=', result.stderr)
+        context = re.search(r'child_pid=(\d+) test_pgid=(\d+) deadline_elapsed_ms=(\d+) total_elapsed_ms=(\d+)', result.stderr)
+        self.assertIsNotNone(context, result.stderr)
+        child, group, deadline, total = map(int, context.groups())
+        self.assertGreater(child, 0)
+        self.assertGreater(group, 0)
+        self.assertGreaterEqual(deadline, 1000)
+        self.assertGreaterEqual(total, deadline)
         self.assertEqual(self.run_case('exit 0').returncode, 0)
 
     def test_signal_result_and_shell_text_fallback(self):
