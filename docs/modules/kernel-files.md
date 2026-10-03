@@ -81,14 +81,14 @@ pipe 的 `fstat` 以 `S_IFIFO` 形态报告，`lseek` 返回 `-ESPIPE`；匿名p
 
 open file description 的 offset 只增加实际复制到用户空间的字节数。首块即发生用户 fault 时返回 `-EFAULT` 且 offset 不变；已经复制前缀后再 fault 或遇到底层读错误时返回前缀长度，并只提交该前缀。短读和 EOF 返回实际长度。这样已经进入缓存但未交付用户的数据不会被错误计入文件位置。
 
-`kernel_files_readv()` 使用相同的普通文件读取核心，整个调用只钉住一次 OFD，并把用户 iovec 快照到最多 8 项的栈数组或最多 1024 项的受限堆数组。先检查 fd 的读权限，再导入向量；每项长度与地址按固定 Linux 的 `references/linux/lib/iov_iter.c` 校验，单项向量先按 `MAX_RW_COUNT` 截断，多项向量先校验原始范围再截断累计长度。零项向量返回 0，零长度段跳过；普通文件按实际交付量推进共享 OFD，EOF、短读、fault 与后端错误均结束本次请求。console 从一次 UART 暂存分散到多个 iovec，不为每项重新等待。pipe 按上述片段提交规则消费数据。epoll 描述符没有 read 操作，在向量导入前返回 `-EINVAL`。
+`kernel_files_readv()` 使用相同的普通文件读取核心，整个调用只钉住一次 OFD，并把用户 iovec 快照到最多 8 项的栈数组或最多 1024 项的受限堆数组。先检查 fd 的读权限，再导入向量；每项长度与地址按固定 Linux 的 `references/linux/lib/iov_iter.c` 校验，单项向量先按 `MAX_RW_COUNT` 截断，多项向量先校验原始范围再截断累计长度。零项向量返回 0，零长度段跳过；普通文件按实际交付量推进共享 OFD，EOF、短读、fault 与后端错误均结束本次请求。已发布 serial TTY 的 console/ttyS0/tty 完整 readv 由 [TTY 行规程](kernel-tty.md) 保持一次请求、64B continuation 与消费前缀；未建立 transport 的裸 UART fixture 仍只做一次输入暂存。pipe 按上述片段提交规则消费数据。epoll 描述符没有 read 操作，在向量导入前返回 `-EINVAL`。
 
 每个 chunk 最多覆盖当前 4 KiB 文件页剩余部分：cache miss 承担一次底层随机读，hit 只增加页引用并复制；用户方向仍按基页做软件页表查询。模块统计调用/失败次数、字节、chunk、当前/峰值 fd、表容量与 close-on-exec 数量，页缓存另统计 hit/miss/insert/eviction/reclaim。当前仍有 cache-to-user 一次复制，尚无 read-ahead、直接用户页 I/O 或用户态异步 I/O 接口。优化这些路径时必须保持部分读取、offset 和错误返回语义。
 
 ## 描述符 `write`/`writev` 与文件修改
 
 `write` 与 `writev` 支持 console、pipe 以及具备写权限（`O_WRONLY/O_RDWR`）的常规文件：
-- console 经 `kernel_console_putc` 逐字节输出并返回完整计数；用户 fault 与部分复制按前缀保持返回。console 的 `read` 阻塞等待真实 UART 输入。
+- 生产 console 经 [TTY](kernel-tty.md) 接受有界 TX、OPOST 和真实输入；不自动建立 ctty。未发布 serial transport 的裸 console fixture 经 kernel_console_putc/原输入暂存。用户 fault、短计数和阻塞 pin 保持所属请求的真实 owner。
 - pipe 的 `write/writev` 汇总后沿用 pipe 单次写空间、原子性、阻塞、EPIPE/SIGPIPE 和片段提交规则。
 - regular 文件的 `kernel_vfs_pwrite/append()` 将已复制字节接收到共享 inode 页缓存；部分 usercopy 只发布成功复制的前缀，并推进对应 offset/逻辑大小。writeback 错误由 inode 保留，不能事后撤销已经接收的字节。
 - `kernel_files_sync()` pin 选定 OFD，同步目标 inode 的数据/元数据与设备缓存；独立 open 各持错误序列观察位置，dup/fork 共享同一 OFD 的位置。普通文件和目录支持 fsync/fdatasync；pipe、字符设备、epoll 返回 EINVAL，无效 fd 返回 EBADF。
@@ -255,9 +255,9 @@ make test-riscv
 
 聚焦测试在真实 QEMU legacy 与 modern VirtIO/ext4 上覆盖绝对/相对路径、错误 flags、目录与缺失文件、4096 字节路径上限、最低 fd 复用、表扩容、统一 fd 安装统计、epoll 满表原子性、`O_CLOEXEC/O_NONBLOCK`、缓存命中后的跨页读取、EOF、部分 fault、fork 后 fd 表独立与 OFD offset 共享，以及 VFS orphan/I/O owner。stat 回归核对 regular/directory 的真实 inode metadata、allocated blocks、fstat/newfstatat 共同字段和 unlink-but-open 的零链接计数。它还在关闭 fd 后通过 MM backing 继续缺页，反复固定地址映射同一 OFD 并检查来源释放只发生一次，验证父子各自持有一份来源引用。生产 exec/clone 链验证普通 fd 与 offset 跨映像和父子保持、CLOEXEC fd 不可见，PID 1 的 stdio 与跨 exec 的 console 描述符由串口标记验证，并由最终资源基线证明退出清理生效。`make test-userland-riscv` 用静态和动态 musl 程序作为 PID 1 运行 stdio、readdir、read/lseek/fstat、dup、signal、pipe、pthread、TLS 和 dlopen；其中写打开普通文件的真实 `read/pread` 及其 dup 均验证 `EBADF`，是真实 U-mode 外部测例的入口。
 
-当前提供可共享的文件表与根 fs context handle，普通 clone 仍实现“复制表/复制 cwd、共享 OFD”；系统调用层是否选择共享由 clone flags 决定。当前已支持常规文件的读写（`write/writev/pwrite64/append`）、新建、删除（`unlinkat`）、截断（`ftruncate`）与目录修改（`mkdirat/rmdir`）及符号链接（`symlinkat/readlinkat`）；并支持 cwd/dirfd、普通/NOREPLACE rename；已有阈值驱动后台写回，仍无周期清脏或 read-ahead；linkat 硬链接、tmpfs 和独立第二 ext4 盘已接入，块节点用于挂载识别，裸设备 OFD 明确不支持。当前单 hart 下 fd lookup 与 OFD acquire 之间不可调度；启用 SMP 前必须为共享 record 引用、槽查找/替换、统计和 OFD 引用补齐同步，不能直接复用这些无锁字段。pipe 同样是单 hart 对象。console 接收仍为 tick 轮询；通常按 tick 检测，IRQ 延迟与调度可继续推迟执行，不构成一个 tick 的硬上界。PLIC 已用于块设备/RNG，UART 接收尚未迁移为中断驱动。
+当前提供可共享的文件表与根 fs context handle，普通 clone 仍实现“复制表/复制 cwd、共享 OFD”；系统调用层是否选择共享由 clone flags 决定。当前已支持常规文件的读写（`write/writev/pwrite64/append`）、新建、删除（`unlinkat`）、截断（`ftruncate`）与目录修改（`mkdirat/rmdir`）及符号链接（`symlinkat/readlinkat`）；并支持 cwd/dirfd、普通/NOREPLACE rename；已有阈值驱动后台写回，仍无周期清脏或 read-ahead；linkat 硬链接、tmpfs 和独立第二 ext4 盘已接入，块节点用于挂载识别，裸设备 OFD 明确不支持。当前单 hart 下 fd lookup 与 OFD acquire 之间不可调度；启用 SMP 前必须为共享 record 引用、槽查找/替换、统计和 OFD 引用补齐同步，不能直接复用这些无锁字段。pipe 同样是单 hart 对象。生产 console 接收由 DTB UART IRQ 收割、worker 推进行规程；raw/tick 轮询只保留在未建立 transport 的独立模块 fixture。IRQ、worker 和任务运行延迟没有硬实时上界，具体 continuation、termios 与 owner 见[TTY 模块](kernel-tty.md)。
 
-字符设备节点由 ext4 提供名称和 `st_rdev`；`openat` 只按设备号查找 `fs/char_device.c` 的内建操作表，未知设备号返回 `ENXIO`。OFD 持有选定的静态后端操作，read/write/poll 从它分派；初始标准 fd 也取得同一 console 后端。启动时优先打开根盘已有的 5:1 `/dev/console`，使标准 fd 持有真实路径；只有该节点缺失才使用无路径 UART OFD。其他查找/I/O 错误明确中止启动，不伪装为节点缺失。该表在当前执行地址域中初始化回调，兼容分页前模块测试与生产高半区。console 的 UART 输入等待支持非阻塞 `EAGAIN` 和信号打断；null 读 EOF、写消费请求长度，zero 读按实际用户复制进度填零；两者不经过普通文件页缓存和 ext4 数据 I/O。设备 OFD 由 fd 表安装和引用，dup/fork 共享，关闭 fd 不撤销已 pin 的 I/O。`readv/writev/pread64/pwrite64/lseek/fstat/ppoll` 及 console 非阻塞读取经固定 Linux 差分验证；未知 ioctl 对有效 fd 返回 `ENOTTY`。另登记 1:8 random 和 1:9 urandom：random 读取等待可信源初始化，遵循固定 Linux 的 random_read_iter，O_NONBLOCK 在未就绪时返回 EAGAIN；urandom 允许未初始化的不安全流。random poll 未就绪报告可写，就绪报告可读；urandom 始终可读写。用户写入经 BLAKE2s 混种但不计可信熵。随机 ioctl 的 RNDGETENTCNT 返回已计入可信字节数乘 8（最多 256），坏输出地址返回 EFAULT；未知请求返回 EINVAL，尚未实现的特权注熵、清池与重播种请求明确返回 ENOTSUP，不声称增加熵成功。random 支持 epoll，urandom 遵循固定 Linux 无 poll 回调的 EPERM 边界。节点仍由用户态 mknodat 建立。当前登记六个静态内建设备，没有动态设备注册、TTY 会话、设备 mmap 或 devfs。
+字符设备节点由 ext4 提供名称和 `st_rdev`；`openat` 只按设备号查找 `fs/char_device.c` 的内建操作表，未知设备号返回 `ENXIO`。OFD 持有选定的静态操作及 open 创建的实例，read/write/poll/ioctl 从它分派；初始标准 fd 也取得同一 console 后端。启动时优先打开根盘已有的 5:1 `/dev/console`，使标准 fd 持有真实路径；只有该节点缺失才使用无路径 UART OFD。其他查找/I/O 错误明确中止启动，不伪装为节点缺失。该表在当前执行地址域中初始化回调，兼容分页前模块测试与生产高半区。console 的 UART 输入等待支持非阻塞 `EAGAIN` 和信号打断；null 读 EOF、写消费请求长度，zero 读按实际用户复制进度填零；两者不经过普通文件页缓存和 ext4 数据 I/O。设备 OFD 由 fd 表安装和引用，dup/fork 共享，关闭 fd 不撤销已 pin 的 I/O。`readv/writev/pread64/pwrite64/lseek/fstat/ppoll` 及 console 非阻塞读取经固定 Linux 差分验证；未知 ioctl 对有效 fd 返回 `ENOTTY`。另登记 1:8 random 和 1:9 urandom：random 读取等待可信源初始化，遵循固定 Linux 的 random_read_iter，O_NONBLOCK 在未就绪时返回 EAGAIN；urandom 允许未初始化的不安全流。random poll 未就绪报告可写，就绪报告可读；urandom 始终可读写。用户写入经 BLAKE2s 混种但不计可信熵。随机 ioctl 的 RNDGETENTCNT 返回已计入可信字节数乘 8（最多 256），坏输出地址返回 EFAULT；未知请求返回 EINVAL，尚未实现的特权注熵、清池与重播种请求明确返回 ENOTSUP，不声称增加熵成功。random 支持 epoll，urandom 遵循固定 Linux 无 poll 回调的 EPERM 边界。节点仍由用户态 mknodat 建立。serial transport 发布后另按 rdev 登记 ttyS0/console/tty，并提供 [TTY 会话与行规程](kernel-tty.md)。没有动态设备注册、设备 mmap 或 devfs。
 
 设备号与操作依据固定 Linux commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 [`fs/char_dev.c`](../../references/linux/fs/char_dev.c)、[`drivers/char/mem.c`](../../references/linux/drivers/char/mem.c)、[`fs/eventpoll.c`](../../references/linux/fs/eventpoll.c) 与 [`fs/read_write.c`](../../references/linux/fs/read_write.c)。
 
@@ -296,7 +296,10 @@ Goldfish RTC按st_rdev=10:135选择，/dev/rtc0、/dev/rtc和/dev/misc/rtc是同
 unsigned32位，与Linux相同，兼容musl传来的符号扩展。未知命令ENOTTY，设置时间、
 告警/事件等已知但未交付操作ENOTSUP，普通事件read/write同样明确不支持。
 
-可选char open/release回调把设备资格归OFD。RTC独占打开，dup/fork/请求pin增加同一OFD
+字符设备回调携带实例上下文、调用者及open flags；open在OFD发布前构造实例，
+失败不留下实例owner。最后OFD清理才release；dup/fork/请求pin不重新open。
+可选整次readv/writev入口用于有请求状态的后端，简单设备继续使用缓冲回调。
+RTC独占打开，dup/fork/请求pin增加同一OFD
 引用，不重新打开；最后真实引用脱离即释放资格，VFS后续清理错误不会继续霸占RTC。
 失败打开不发布资格；CLOEXEC、退出和最终关闭沿统一文件引用路径处理。
 验证：`make test-rtc-host test-environment-riscv`与固定Linux环境ABI记录，含闰日、

@@ -57,7 +57,7 @@ TID、TGID、PGID 和 SID 共用 `kernel_pid` 对象：编号、不可回退的�
 
 组长退出或被收割不销毁仍有 PGID/SID 成员的身份。zombie 在被收割前允许查询和符合条件的 setpgid；kill 对仍存在的 zombie 进程或组成功但不向已结束线程排队。kill 的正值按 TID 查找所属进程，零/负 PGID 按角色成员查找，wait4 的零/负 PGID 按当前真实组关系选择子进程；proc stat/status 从对象获取相同组/会话信息。
 
-进程退出与跨进程 reparent 检查最后一个同会话、不同组的父关系是否消失；忽略 init 父关系和真正结束的成员。新孤儿组含已完成 group stop 的任务时，全组依次收到内核 SIGHUP、SIGCONT（SI_KERNEL），恢复停止任务。仅有 TID 的线程回收不触发进程级孤儿事件。固定 Linux `kernel/sys.c` 的 setpgid/setsid 只改角色，不主动调用孤儿 HUP/CONT 检查；`kernel/exit.c` 的调用点是 reparent_leader 和 exit_notify，本实现保持这一范围。已孤儿组的默认 TSTP/TTIN/TTOU 丢弃，SIGSTOP 仍停止；没有控制终端、前台终端组或完整凭据权限模型。
+进程退出与跨进程 reparent 检查最后一个同会话、不同组的父关系是否消失；忽略 init 父关系和真正结束的成员。新孤儿组含已完成 group stop 的任务时，全组依次收到内核 SIGHUP、SIGCONT（SI_KERNEL），恢复停止任务。仅有 TID 的线程回收不触发进程级孤儿事件。固定 Linux `kernel/sys.c` 的 setpgid/setsid 只改角色，不主动调用孤儿 HUP/CONT 检查；`kernel/exit.c` 的调用点是 reparent_leader 和 exit_notify，本实现保持这一范围。已孤儿组的默认 TSTP/TTIN/TTOU 丢弃，SIGSTOP 仍停止；[Serial TTY](kernel-tty.md) 通过稳定 SID/前台 PGID 引用接入 ctty、终端组信号与线程组生命周期；完整凭据权限模型仍未实现。
 
 `tests/diff-abi/session.c` 使用 pipe/wait4 握手与专用 exec probe，覆盖父子 exec errno、线程目标、非组长 setsid/exec、session 边界、zombie/proc、组定向 kill/wait、进程组长先收割后的组存续、退出/reparent 两条孤儿路径，以及 sigtimedwait 和 SA_SIGINFO 的内核信号来源。启动上下文不同：固定 Linux 裸 PID 1 初始 PGID/SID 为 0，BoarOS 初始身份为 1；测试先建立真实非零会话，再比较用户操作，不把启动整数差异混入会话机制断言。
 

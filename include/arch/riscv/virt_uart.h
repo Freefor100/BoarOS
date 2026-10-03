@@ -9,6 +9,8 @@
 #define VIRT_UART_MMIO_SIZE 0x1000UL
 
 void virt_uart_use_kernel_mapping(void);
+/* Fatal paths select a non-sleeping polling sink before diagnostics. */
+void virt_uart_emergency_begin(void);
 void virt_uart_putc(char character);
 void virt_uart_puts(const char *text);
 void virt_uart_put_hex(unsigned long value);

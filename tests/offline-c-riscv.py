@@ -323,6 +323,12 @@ def project_main(args):
         identity["kernel_snapshots"][name] = sha256(snapshot)
         snapshots.append((name, snapshot, linux))
     identity["kernel"] = identity["kernel_snapshots"].get("boaros")
+    if args.kernel_identity:
+        build_identity = json.loads(args.kernel_identity.read_text())
+        if build_identity["kernel_sha256"] != identity["kernel"]:
+            raise ValueError("sealed kernel build identity does not match snapshot")
+        # 协调器与被测内核可来自不同工作树，分别保存来源，避免将活跃HEAD冒充内核来源。
+        identity["kernel_build_identity"] = build_identity
     (directory / "identity.json").write_text(json.dumps(identity, sort_keys=True, indent=2)+"\n")
     summary = []
     for name, snapshot, linux in snapshots:
@@ -378,6 +384,8 @@ def project_main(args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--kernel", type=Path, required=True)
+    parser.add_argument("--kernel-identity", type=Path,
+                        help="sealed build identity for a kernel from another source tree")
     parser.add_argument("--program", type=Path, required=True)
     parser.add_argument("--linux-kernel", type=Path)
     parser.add_argument("--toolchain-tree", type=Path)

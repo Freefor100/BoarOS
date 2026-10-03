@@ -580,7 +580,18 @@ enum kernel_heap_status kernel_heap_allocate_zeroed(
     if (status != KERNEL_HEAP_STATUS_OK) {
         return status;
     }
-    bytes_zero(result, total);
+    {
+#if BOAROS_COST_DIAGNOSTICS
+        struct kernel_cost_tag memory_tag = kernel_cost_capture();
+        uint64_t memory_start = kernel_cost_clock();
+#endif
+        bytes_zero(result, total);
+#if BOAROS_COST_DIAGNOSTICS
+        uint64_t memory_elapsed = kernel_cost_clock() - memory_start;
+        kernel_cost_add_tag(memory_tag, COST_HEAP_ZERO_TICKS, memory_elapsed);
+        kernel_cost_add_tag(memory_tag, COST_HEAP_ZERO_BYTES, total);
+#endif
+    }
     *pointer = result;
     return KERNEL_HEAP_STATUS_OK;
 }
@@ -789,7 +800,18 @@ enum kernel_heap_status kernel_heap_resize(
     if (status != KERNEL_HEAP_STATUS_OK) {
         return status;
     }
-    bytes_copy(result, old_pointer, capacity);
+    {
+#if BOAROS_COST_DIAGNOSTICS
+        struct kernel_cost_tag memory_tag = kernel_cost_capture();
+        uint64_t memory_start = kernel_cost_clock();
+#endif
+        bytes_copy(result, old_pointer, capacity);
+#if BOAROS_COST_DIAGNOSTICS
+        uint64_t memory_elapsed = kernel_cost_clock() - memory_start;
+        kernel_cost_add_tag(memory_tag, COST_HEAP_COPY_TICKS, memory_elapsed);
+        kernel_cost_add_tag(memory_tag, COST_HEAP_COPY_BYTES, capacity);
+#endif
+    }
     status = kernel_heap_release(heap, old_pointer);
     if (status != KERNEL_HEAP_STATUS_OK) {
         (void)kernel_heap_release(heap, result);

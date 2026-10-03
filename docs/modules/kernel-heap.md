@@ -41,6 +41,11 @@ make test-page-riscv
 
 当前检查能约束分配次数和占页峰值，但 QEMU 启动时间不能替代目标开发板上的 cache miss、锁争用和周期基线。SMP 或长期文件负载出现后再在相同对象分布下比较全局锁、per-CPU cache 与不同 size class，现阶段不据功能测试宣称吞吐优势。
 
+默认关闭的 COST 构建另在实际 calloc 清零与 resize 搬迁处记录字节、次数、单次最大值
+和经过 ticks，不在公共内存函数采样。字节是原实际范围，失败准备不制造成功样本；
+ticks 可以包含中断与切换，不能当作独占 CPU 时间。公共字节实现仍是生产路径；
+宽字候选的微实验改善没有带来原 Lua 工程收益，见[有限归因](../learning/offline-toolchain-probe.md#内存操作的有限归因与未上线候选2026-10-03)。
+
 堆 allocate/resize 与 MM 元数据变更使用任务 `allocation_depth` 限制回收：可回收干净且无外部引用的页，不允许在分配器内部发起脏页 I/O。物理分配器递归检测使用任务 `reclaim_depth`，一个任务睡眠不把其他任务误判为自身递归。脏页回收只在外层无锁处执行；不足返回真实 EMPTY/ENOMEM，不构造重试锁链。
 
 宿主抢占测试使用真实 heap/buddy 实现和有状态 IRQ 模型，在生产函数边界逐一切入第二个

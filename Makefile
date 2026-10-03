@@ -151,6 +151,7 @@ C_SOURCES := \
 	arch/riscv/uaccess.c \
 	arch/riscv/virt_rtc.c \
 	arch/riscv/virt_uart.c \
+	arch/riscv/uart_tty.c \
 	arch/riscv/virtio_mmio_block.c \
 	arch/riscv/virtio_mmio_rng.c \
 	arch/riscv/virtio_mmio_net.c \
@@ -167,6 +168,7 @@ C_SOURCES := \
 	fs/files/socket.c \
 	fs/fs_context.c \
 	fs/char_device.c \
+	fs/tty.c \
 	fs/rtc_device.c \
 	fs/open_file.c \
 	fs/pipe.c \
@@ -198,6 +200,7 @@ C_SOURCES := \
 	kernel/sched/process.c \
 	kernel/sched/proc.c \
 	kernel/sched/signal.c \
+	kernel/sched/tty.c \
 	kernel/sched/wait.c \
 	kernel/sched/sync.c \
 	kernel/sched/futex.c \
@@ -255,6 +258,7 @@ TEST_RUNTIME_C_SOURCES := \
 	arch/riscv/uaccess.c \
 	arch/riscv/virt_rtc.c \
 	arch/riscv/virt_uart.c \
+	arch/riscv/uart_tty.c \
 	arch/riscv/virtio_mmio_block.c \
 	arch/riscv/virtio_mmio_rng.c \
 	arch/riscv/virtio_mmio_net.c \
@@ -270,6 +274,7 @@ TEST_RUNTIME_C_SOURCES := \
 	fs/files/socket.c \
 	fs/fs_context.c \
 	fs/char_device.c \
+	fs/tty.c \
 	fs/rtc_device.c \
 	fs/lwext4_port.c \
 	fs/open_file.c \
@@ -299,6 +304,7 @@ TEST_RUNTIME_C_SOURCES := \
 	kernel/sched/process.c \
 	kernel/sched/proc.c \
 	kernel/sched/signal.c \
+	kernel/sched/tty.c \
 	kernel/sched/wait.c \
 	kernel/sched/sync.c \
 	kernel/sched/futex.c \
@@ -1611,6 +1617,8 @@ test-cost-host:
 	build/cost/host/irq-test
 	cc -std=c11 -Wall -Wextra -Werror -Itests/host/random -idirafter include -DBOAROS_PAGE_SHIFT=12 -DBOAROS_COST_DIAGNOSTICS=1 tests/cost/page_test.c kernel/cost.c kernel/physical_page.c -o build/cost/host/page-test
 	build/cost/host/page-test
+	cc -std=c11 -Wall -Wextra -Werror -Itests/host/random -idirafter include -DBOAROS_PAGE_SHIFT=12 -DBOAROS_COST_DIAGNOSTICS=1 tests/memory/cost_test.c kernel/cost.c kernel/physical_page.c mm/heap.c arch/riscv/uaccess.c -o build/cost/host/memory-test
+	build/cost/host/memory-test
 	python3 -B tests/test-cost-report.py
 test-cost-riscv: test-cost-host
 	$(MAKE) COST_DIAGNOSTICS=1 all
@@ -1679,3 +1687,34 @@ test-offline-project-riscv: $(OFFLINE_PROJECT_RV) $(KERNEL_RV) prepare-offline-c
 
 test-offline-project-tmpfs-riscv: $(OFFLINE_PROJECT_RV) $(KERNEL_RV) prepare-offline-c-toolchain
 	python3 -B tests/offline-c-riscv.py --project lua --kernel $(KERNEL_RV) --program $(OFFLINE_PROJECT_RV) --toolchain-tree build/offline-c/alpine-tree --timeout 900 --tmpfs --performance
+
+.PHONY: test-uart-host
+test-uart-host:
+	python3 -B tests/host/dtb_uart_test.py
+	./tests/uart-host.sh
+
+.PHONY: test-tty-host
+test-tty-host:
+	@mkdir -p build/host/tty
+	cc -std=gnu11 -O1 -g -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=12 -Itests/host/random -idirafter include -fsanitize=address,undefined tests/tty/core_host.c fs/tty.c -o build/host/tty/core
+	build/host/tty/core
+	cc -std=gnu11 -O1 -g -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=12 -Itests/host/random -idirafter include -fsanitize=address,undefined tests/tty/flags_host.c fs/tty.c -o build/host/tty/flags
+	build/host/tty/flags
+	cc -std=gnu11 -O1 -g -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=12 -idirafter include -ffunction-sections -fdata-sections -Wl,--gc-sections -fsanitize=address,undefined tests/tty/group_host.c kernel/sched/tty.c kernel/pid.c -o build/host/tty/group
+	build/host/tty/group
+
+TTY_PROBE_RV := $(BUILD_DIR)/tests/user/tty-probe-rv
+TTY_JOBCTRL_RV := $(BUILD_DIR)/tests/user/tty-jobctrl-rv
+$(TTY_PROBE_RV): tests/tty/probe.c $(MUSL_STAMP)
+	@mkdir -p $(dir $@)
+	$(MUSL_ROOT)/bin/musl-gcc $(MUSL_GCC_FLAGS) -static -pthread -O2 -Wall -Wextra -Werror $< -o $@
+$(TTY_JOBCTRL_RV): tests/tty/jobctrl_probe.c $(MUSL_STAMP)
+	@mkdir -p $(dir $@)
+	$(MUSL_ROOT)/bin/musl-gcc $(MUSL_GCC_FLAGS) -static -O2 -Wall -Wextra -Werror $< -o $@
+
+.PHONY: test-tty-riscv test-tty-diff-riscv
+test-tty-riscv: $(KERNEL_RV) $(MUSL_STAMP)
+	python3 -B tests/tty/riscv.py --kernel $(KERNEL_RV) --qemu $(QEMU_RISCV64)
+test-tty-diff-riscv: $(KERNEL_RV) $(TTY_PROBE_RV) $(TTY_JOBCTRL_RV)
+	python3 -B tests/tty/riscv.py --kernel $(KERNEL_RV) --qemu $(QEMU_RISCV64) --probe $(TTY_PROBE_RV)
+	python3 -B tests/tty/riscv.py --kernel $(KERNEL_RV) --qemu $(QEMU_RISCV64) --probe $(TTY_JOBCTRL_RV) --no-ctty

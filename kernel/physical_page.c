@@ -6,6 +6,9 @@
 
 #include <stdint.h>
 
+/* 宿主/无终端平台可没有该hook；已有同步sink仍可输出。 */
+extern void kernel_console_emergency_begin(void) __attribute__((weak));
+
 #define PHYSICAL_PAGE_ALLOCATOR_INITIALIZED UINT32_C(0x50414745)
 #define PHYSICAL_PAGE_ALLOCATOR_FINALIZED UINT32_C(0x42554459)
 #define PHYSICAL_PAGE_NONE UINT64_MAX
@@ -152,6 +155,7 @@ static void physical_page_release_fatal(
     uint32_t page_index;
 
     /* Fatal 输出只走同步硬件 sink，不分配、回收或唤醒日志等待者。 */
+    if (kernel_console_emergency_begin) kernel_console_emergency_begin();
     release_diagnostic_text("BoarOS: physical page release fatal reason=");
     release_diagnostic_text(reason);
     release_diagnostic_text(" address=");

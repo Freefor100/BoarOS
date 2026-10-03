@@ -955,14 +955,17 @@ static int proc_process_snapshot(struct kernel_vfs_node *node,
         data[used++] = process.state;
         const uint64_t prefix[] = {
             (uint32_t)process.ppid, (uint32_t)process.process_group,
-            (uint32_t)process.session_id, 0U,
+            (uint32_t)process.session_id, process.tty_nr,
         };
         for (size_t i = 0U; i < sizeof(prefix) / sizeof(prefix[0]); i++) {
             data[used++] = ' ';
             used += decimal(data + used, prefix[i]);
         }
-        memcpy(data + used, " -1", 3U);
-        used += 3U;
+        data[used++] = ' ';
+        if (process.tty_pgrp < 0) {
+            data[used++] = '-';
+            used += decimal(data + used, (uint32_t)(-process.tty_pgrp));
+        } else used += decimal(data + used, (uint32_t)process.tty_pgrp);
         const uint64_t fields[] = {
             0U, process.minor_faults, process.child_minor_faults,
             process.major_faults, process.child_major_faults,

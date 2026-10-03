@@ -1076,7 +1076,8 @@ struct irq_node {
     struct dtb_discovery_node bus;
     const unsigned char *extended;
     uint32_t extended_length, phandle, parent, source, ndev, intcells;
-    int cpu, intc, plic, virtio;
+    uint32_t clock, shift, width, layout_seen;
+    int cpu, intc, plic, virtio, uart, big_endian;
 };
 static enum dtb_status irq_discover(const unsigned char *blob, uint64_t hart,
                                    struct dtb_irq_info *out)
@@ -1097,6 +1098,7 @@ static enum dtb_status irq_discover(const unsigned char *blob, uint64_t hart,
                 pos = (pos + len + 4) & ~3U;
                 struct irq_node *n = &stack[depth];
                 *n = (struct irq_node){0};
+                n->width = 1;
                 n->bus.enabled = depth ? stack[depth - 1].bus.enabled : 1;
                 n->parent = depth ? stack[depth - 1].parent : 0;
                 n->bus.child_address_cells = 2; n->bus.child_size_cells = 1;
@@ -1110,6 +1112,15 @@ static enum dtb_status irq_discover(const unsigned char *blob, uint64_t hart,
                 struct irq_node *n = &stack[depth - 1];
 #define IRQ_PROP(key) bytes_equal_string(name, nl, key)
                 if (IRQ_PROP("#address-cells")) n->bus.child_address_cells = read_be32(v);
+                else if (IRQ_PROP("clock-frequency") || IRQ_PROP("reg-shift") || IRQ_PROP("reg-io-width")) {
+                    if (len != 4) return DTB_STATUS_INVALID;
+                    unsigned bit = IRQ_PROP("clock-frequency") ? 1 : IRQ_PROP("reg-shift") ? 2 : 4;
+                    if (n->layout_seen & bit) return DTB_STATUS_INVALID;
+                    n->layout_seen |= bit;
+                    if (IRQ_PROP("clock-frequency")) n->clock = read_be32(v);
+                    else if (IRQ_PROP("reg-shift")) n->shift = read_be32(v);
+                    else n->width = read_be32(v);
+                } else if (IRQ_PROP("big-endian") || IRQ_PROP("native-endian")) n->big_endian = 1;
                 else if (IRQ_PROP("#size-cells")) n->bus.child_size_cells = read_be32(v);
                 else if (IRQ_PROP("ranges")) { n->bus.ranges_seen = 1; n->bus.ranges = v; n->bus.ranges_length = len; }
                 else if (IRQ_PROP("reg")) { n->bus.reg = v; n->bus.reg_length = len; }
@@ -1123,6 +1134,9 @@ static enum dtb_status irq_discover(const unsigned char *blob, uint64_t hart,
                     if (!string_list_contains(v, len, "riscv,plic0", &a) ||
                         !string_list_contains(v, len, "sifive,plic-1.0.0", &b)) return DTB_STATUS_INVALID;
                     n->plic = a || b;
+                    if (!string_list_contains(v, len, "ns16550a", &a) ||
+                        !string_list_contains(v, len, "ns16550", &b)) return DTB_STATUS_INVALID;
+                    n->uart = a || b;
                     if (!string_list_contains(v, len, "riscv,cpu-intc", &n->intc) ||
                         !string_list_contains(v, len, "virtio,mmio", &n->virtio)) return DTB_STATUS_INVALID;
                 } else if (IRQ_PROP("interrupts-extended")) {
@@ -1152,7 +1166,7 @@ static enum dtb_status irq_discover(const unsigned char *blob, uint64_t hart,
                         cpu_intc = n->phandle;
                     }
                 }
-                if (n->bus.enabled && (n->plic || n->virtio)) {
+                if (n->bus.enabled && (n->plic || n->virtio || n->uart)) {
                     if (depth < 2) return DTB_STATUS_INVALID;
                     uint32_t ac = stack[depth - 2].bus.child_address_cells;
                     uint32_t sc = stack[depth - 2].bus.child_size_cells;
@@ -1184,6 +1198,15 @@ static enum dtb_status irq_discover(const unsigned char *blob, uint64_t hart,
                     } else if (pass) {
                         if (n->parent != plic_phandle || !n->source || n->source > out->source_count)
                             return DTB_STATUS_UNSUPPORTED;
+                        if (n->uart) {
+                            if (out->uart.registers.size) return DTB_STATUS_UNSUPPORTED;
+                            if (n->big_endian || !n->clock || n->shift > 4 || (n->width != 1 && n->width != 4) ||
+                                size < (7ULL << n->shift) + n->width ||
+                                (n->width == 4 && (n->shift < 2 || (address & 3))))
+                                return DTB_STATUS_UNSUPPORTED;
+                            out->uart = (struct dtb_uart_info){{address, size}, n->clock, n->source, n->shift, n->width};
+                            depth--; continue;
+                        }
                         if (out->route_count == DTB_MAX_VIRTIO_MMIO_RANGES) return DTB_STATUS_UNSUPPORTED;
                         out->routes[out->route_count].base = address;
                         out->routes[out->route_count++].source = n->source;
@@ -1203,5 +1226,8 @@ enum dtb_status dtb_read_irq_info(const void *dtb, uint64_t boot_hart,
     if (!info) return DTB_STATUS_INVALID;
     enum dtb_status status = dtb_read_boot_info(dtb, &validated);
     if (status != DTB_STATUS_OK) return status;
-    return irq_discover(dtb, boot_hart, info);
+    struct dtb_irq_info result;
+    status = irq_discover(dtb, boot_hart, &result);
+    if (status == DTB_STATUS_OK) *info = result;
+    return status;
 }

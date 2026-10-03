@@ -71,6 +71,7 @@ static void shutdown_for_dtb_error(enum dtb_status status)
 
 static void shutdown_for_dtb_error(enum dtb_status status)
 {
+    virt_uart_emergency_begin();
     if (status == DTB_STATUS_INVALID) {
         virt_uart_puts("BoarOS: invalid DTB\n");
     } else if (status == DTB_STATUS_NOT_FOUND) {
@@ -89,6 +90,7 @@ static void shutdown_for_boot_memory_error(enum boot_memory_status status)
 
 static void shutdown_for_boot_memory_error(enum boot_memory_status status)
 {
+    virt_uart_emergency_begin();
     if (status == BOOT_MEMORY_STATUS_INVALID) {
         virt_uart_puts("BoarOS: invalid boot memory input\n");
     } else if (status == BOOT_MEMORY_STATUS_EMPTY) {
@@ -105,6 +107,7 @@ static void shutdown_for_physical_page_error(enum physical_page_status status)
 
 static void shutdown_for_physical_page_error(enum physical_page_status status)
 {
+    virt_uart_emergency_begin();
     if (status == PHYSICAL_PAGE_STATUS_INVALID) {
         virt_uart_puts("BoarOS: invalid physical page layout\n");
     } else if (status == PHYSICAL_PAGE_STATUS_EMPTY) {
@@ -123,6 +126,7 @@ static void shutdown_for_sv39_error(enum riscv_sv39_status status)
 
 static void shutdown_for_sv39_error(enum riscv_sv39_status status)
 {
+    virt_uart_emergency_begin();
     if (status == RISCV_SV39_STATUS_INVALID) {
         virt_uart_puts("BoarOS: invalid Sv39 mapping\n");
     } else if (status == RISCV_SV39_STATUS_NO_MEMORY) {
@@ -142,6 +146,7 @@ static void shutdown_for_direct_map_error(void) __attribute__((noreturn));
 
 static void shutdown_for_direct_map_error(void)
 {
+    virt_uart_emergency_begin();
     virt_uart_puts("BoarOS: direct map verification failed\n");
     sbi_shutdown();
 }
@@ -151,6 +156,7 @@ static void shutdown_for_time_error(enum kernel_time_status status)
 
 static void shutdown_for_time_error(enum kernel_time_status status)
 {
+    virt_uart_emergency_begin();
     if (status == KERNEL_TIME_STATUS_INVALID_ARGUMENT) {
         virt_uart_puts("BoarOS: invalid time argument\n");
     } else if (status == KERNEL_TIME_STATUS_ALREADY_INITIALIZED) {
@@ -166,6 +172,7 @@ static void shutdown_for_timer_error(enum riscv_timer_status status)
 
 static void shutdown_for_timer_error(enum riscv_timer_status status)
 {
+    virt_uart_emergency_begin();
     if (status == RISCV_TIMER_STATUS_INVALID_ARGUMENT) {
         virt_uart_puts("BoarOS: invalid timer argument\n");
     } else if (status == RISCV_TIMER_STATUS_INVALID_FREQUENCY) {
@@ -191,6 +198,7 @@ static void shutdown_for_scheduler_error(
 static void shutdown_for_scheduler_error(
     enum kernel_scheduler_status status)
 {
+    virt_uart_emergency_begin();
     virt_uart_puts("BoarOS: scheduler startup/idle error status=");
     virt_uart_put_hex((unsigned long)status);
     virt_uart_putc('\n');
@@ -203,6 +211,7 @@ static void shutdown_for_root_boot_error(
 static void shutdown_for_root_boot_error(
     enum riscv_root_boot_status status)
 {
+    virt_uart_emergency_begin();
     virt_uart_puts("BoarOS: root boot error status=");
     virt_uart_put_hex((unsigned long)status);
     virt_uart_putc('\n');
@@ -485,11 +494,15 @@ static enum riscv_sv39_status build_kernel_page_table(
         return status;
     }
 
-    status = map_mmio_alias(&kernel_page_table,
-                            VIRT_UART_MMIO_PHYSICAL_BASE,
-                            VIRT_UART_MMIO_SIZE);
-    if (status != RISCV_SV39_STATUS_OK) {
-        return status;
+    struct dtb_memory_range uart_ranges[2];
+    unsigned uart_count = riscv_uart_tty_mapping_ranges(
+        (struct dtb_memory_range){VIRT_UART_MMIO_PHYSICAL_BASE, VIRT_UART_MMIO_SIZE},
+        &boot_irq.uart, uart_ranges);
+    if (!uart_count) return RISCV_SV39_STATUS_INVALID;
+    /* 固定早期sink与发现的UART可能共用页；同一PTE只能建立一次。 */
+    for (unsigned i = 0; i < uart_count; i++) {
+        status = map_mmio_alias(&kernel_page_table, uart_ranges[i].base, uart_ranges[i].size);
+        if (status != RISCV_SV39_STATUS_OK) return status;
     }
     status = map_mmio_alias(&kernel_page_table,
                             VIRT_RTC_MMIO_PHYSICAL_BASE,
@@ -821,8 +834,9 @@ static void kernel_main_high(void)
     if (!riscv_plic_init((void *)(uintptr_t)(RISCV_KERNEL_MMIO_BASE + boot_irq.plic.base),
                          boot_irq.plic.size, boot_irq.context, boot_irq.source_count)) __builtin_trap();
 
-    root_status = riscv_root_boot_start(&root_boot,
+    root_status = riscv_root_boot_start_with_irq(&root_boot,
                                         &boot_info,
+                                        &boot_irq,
                                         &page_allocator,
                                         &kernel_page_table);
     if (root_status == RISCV_ROOT_BOOT_STATUS_OK) {

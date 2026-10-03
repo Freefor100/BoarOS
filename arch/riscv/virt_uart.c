@@ -1,4 +1,6 @@
 #include <arch/riscv/virt_uart.h>
+#include <arch/riscv/uart_tty.h>
+#include <arch/riscv/context.h>
 #include <kernel/console.h>
 #include <kernel/log.h>
 
@@ -7,6 +9,16 @@
 #define UART_LSR 5UL
 #define UART_LSR_THR_EMPTY (1U << 5)
 #define UART_LSR_DATA_READY (1U << 0)
+
+static int emergency;
+
+void virt_uart_emergency_begin(void)
+{
+    /* 致命路径不再回到调度；禁止worker与同步现场输出交错。 */
+    (void)riscv_interrupt_save();
+    emergency = 1;
+}
+void kernel_console_emergency_begin(void) { virt_uart_emergency_begin(); }
 
 static unsigned long uart_mmio_base = VIRT_UART_MMIO_PHYSICAL_BASE;
 
@@ -30,7 +42,8 @@ static void uart_raw_putc(char character)
 
 void virt_uart_putc(char character)
 {
-    if (kernel_log_putc(6, character)) uart_raw_putc(character);
+    if (emergency) { uart_raw_putc(character); return; }
+    if (kernel_log_putc(6, character)) kernel_console_putc(character);
 }
 
 void virt_uart_puts(const char *text)
@@ -72,5 +85,5 @@ char virt_uart_getc(void)
 
 void kernel_console_putc(char character)
 {
-    uart_raw_putc(character);
+    if (emergency || !riscv_uart_tty_console(character)) uart_raw_putc(character);
 }

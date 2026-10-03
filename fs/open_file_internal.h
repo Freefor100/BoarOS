@@ -31,6 +31,7 @@ struct kernel_open_file_description {
     struct kernel_epoll_item *ep_items;
     struct kernel_record_lock *record_locks;
     const struct kernel_char_device *device;
+    void *device_instance;
     uint8_t device_opened;
     char *generated_data;
     size_t generated_length;

@@ -20,6 +20,7 @@
 #include <kernel/signal.h>
 #include <kernel/task.h>
 #include <kernel/uaccess.h>
+#include <kernel/tty_task.h>
 
 #include <stddef.h>
 #include <stdint.h>
@@ -142,6 +143,7 @@ int64_t kernel_task_setsid(struct kernel_task *caller)
     struct kernel_task *leader = caller->group_leader;
     struct kernel_pid *identity = process_identity(leader, KERNEL_PID_TGID);
     if (leader->session_leader || identity->members[KERNEL_PID_PGID]) return -KERNEL_EPERM;
+    kernel_task_tty_clear(leader);
     leader->session_leader = 1;
     identity_change_role(leader, KERNEL_PID_SID, identity);
     identity_change_role(leader, KERNEL_PID_PGID, identity);
@@ -244,6 +246,9 @@ static void child_creator_change(struct kernel_task *child, struct kernel_pid *c
 
 static void identity_adopt(struct kernel_task *task, struct kernel_task *leader)
 {
+    if (task->controlling_tty) kernel_task_tty_clear(task);
+    task->controlling_tty = leader->controlling_tty;
+    leader->controlling_tty = 0;
     process_identity_release(task);
     for (unsigned role = 0; role < KERNEL_PID_ROLES; role++)
         kernel_pid_transfer(&leader->identities[role], &task->identities[role], task);
@@ -852,6 +857,9 @@ enum kernel_scheduler_status riscv_process_clone_current(
         child->completion.tgid = leader->tid;
     } else {
         child_creator_change(child, process_identity(parent, KERNEL_PID_TID));
+        if (kernel_task_controlling_tty(parent) &&
+            kernel_task_tty_set(child, kernel_task_controlling_tty(parent)))
+            __builtin_trap();
         child_append(parent->group_leader, child);
     }
     kernel_mm_add_user(&child->mm);
@@ -1276,6 +1284,8 @@ enum kernel_scheduler_status kernel_scheduler_reap_one(
     if (thread->socket_write_request) kernel_socket_abort_write(thread->socket_write_request);
     if (thread->socket_read_request) kernel_socket_abort_read(thread->socket_read_request);
     if (thread->io_buffer) kernel_task_io_buffer_release(thread->io_buffer);
+    /* 阻塞TTY请求仍借用退出任务的栈；先消费真实owner，再归还栈页。 */
+    if (thread->tty_request) kernel_tty_abort_request(thread->tty_request);
     status = release_task_stack(thread);
     if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
     result = thread->completion;
@@ -1367,6 +1377,10 @@ enum kernel_scheduler_status kernel_scheduler_reap_one(
         if (thread->group_leader == thread &&
             reparent_children(thread) != KERNEL_SCHEDULER_STATUS_OK)
             return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
+        if (thread->group_leader == thread && thread->controlling_tty) {
+            if (thread->session_leader) kernel_tty_disassociate(thread->controlling_tty, 1);
+            else kernel_task_tty_clear(thread);
+        }
         /* GROUP_DEAD 的身份仍服务存活成员；最后成员退出才撤销 alarm。 */
         if (thread->group_leader == thread) kernel_signal_timer_cancel(thread);
         process_orphan_notify(thread, 0);
@@ -1453,6 +1467,7 @@ static enum kernel_scheduler_status cleanup_user_task_resources(
     enum kernel_files_status files_status;
     enum kernel_fs_context_status fs_status;
 
+    if (thread->tty_request) kernel_tty_abort_request(thread->tty_request);
     if (thread->socket_write_request != 0)
         kernel_socket_abort_write(thread->socket_write_request);
     if (thread->socket_read_request != 0)

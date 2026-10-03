@@ -32,12 +32,18 @@ struct dtb_boot_info {
     uint32_t rng_seed_size;
 };
 
+struct dtb_uart_info {
+    struct dtb_memory_range registers;
+    uint32_t clock, source, shift, width;
+};
+
 struct dtb_irq_info {
     struct dtb_memory_range plic;
     uint32_t context;
     uint32_t source_count;
     uint32_t route_count;
     struct { uint64_t base; uint32_t source; } routes[DTB_MAX_VIRTIO_MMIO_RANGES];
+    struct dtb_uart_info uart;
 };
 
 enum dtb_status dtb_read_irq_info(const void *dtb, uint64_t boot_hart,

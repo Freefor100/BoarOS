@@ -22,6 +22,8 @@ struct kernel_proc_process_snapshot {
     kernel_pid_t ppid;
     kernel_pid_t process_group;
     kernel_pid_t session_id;
+    uint64_t tty_nr;
+    int32_t tty_pgrp;
     uint64_t identity;
     uint64_t start_ticks;
     uint64_t user_ticks;

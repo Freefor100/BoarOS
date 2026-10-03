@@ -134,6 +134,8 @@ struct kernel_task {
     struct kernel_socket_read_request *socket_read_request;
     struct kernel_socket_write_request *socket_write_request;
     struct kernel_task_io_buffer *io_buffer;
+    struct kernel_tty_request *tty_request;
+    struct kernel_tty *controlling_tty;
     struct kernel_io_context io_context;
     uint64_t user_ticks;
     uint64_t kernel_ticks;

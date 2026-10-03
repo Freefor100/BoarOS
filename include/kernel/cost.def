@@ -209,3 +209,11 @@ X(JOURNAL_SEAL_FORCE, journal_seal_force, count, 0)
 X(JOURNAL_WAIT_SEALED_TICKS, journal_wait_sealed_ticks, ticks, 0)
 X(JOURNAL_WAIT_DURABLE_TICKS, journal_wait_durable_ticks, ticks, 0)
 X(JOURNAL_WAIT_CHECKPOINT_TICKS, journal_wait_checkpoint_ticks, ticks, 0)
+
+/* Actual heap bodies and successful resolved user-page chunks; elapsed time. */
+X(HEAP_ZERO_BYTES, heap_zero_bytes, bytes, 0)
+X(HEAP_ZERO_TICKS, heap_zero_ticks, ticks, 0)
+X(HEAP_COPY_BYTES, heap_copy_bytes, bytes, 0)
+X(HEAP_COPY_TICKS, heap_copy_ticks, ticks, 0)
+X(UACCESS_COPY_BYTES, uaccess_copy_bytes, bytes, 0)
+X(UACCESS_COPY_TICKS, uaccess_copy_ticks, ticks, 0)

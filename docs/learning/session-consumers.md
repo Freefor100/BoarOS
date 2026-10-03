@@ -27,31 +27,15 @@ QEMU observer 使用同目录 `syscall-entry-plugin.c`。
 
 ## 固定资料与输入
 
-- Linux：`references/linux`，commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`。
-- QEMU 插件接口参照 `references/qemu` v11.1.0 的
-  `include/plugins/qemu-plugin.h`、`contrib/plugins/execlog.c` 和
-  `gdbstub/gdb-xml/riscv-64bit-virtual.xml`；实跑 QEMU 11.1.1。
-- 完整 BusyBox 来源 `references/oscomp-testsuits` revision
-  `b5ec6ef8497e1818cbdec3b54bb722f036e57972`，构建 manifest 在
-  `build/program-environment/full-busybox/build.json`；ELF SHA-256
-  `f2cda5fcdff6d41c8a553ac658e8aa55b6a48aa40898cb123a19f7865f3773ac`。
-- 原镜像 `references/oscomp-autotest/sdcard-rv.img` SHA-256
-  `f419468678d342133546add2f8459ea09aeba987ba968e28753d6ee656996b8b`；
-  `/musl/iperf3` SHA-256
-  `8a87cda6b79966699bc68c72894288ba9aa4a5d44dc0036cfb257a4a4d73860b`；
-  `/musl/cyclictest` SHA-256
-  `79e6cf0b469168fb1aae66db6904b839544d5b1fd8a46272fd32943a0db66835`。
+使用本地 Linux7.2 的 `references/linux`、QEMU v11.1.0 的 `references/qemu`、
+固定 BusyBox1.33.1，以及原镜像的 musl iperf3/cyclictest。具体版本与输入校验由
+`references/sources.tsv`、既有程序清单和执行器机器记录管理；实跑QEMU11.1.1。
 
-## 2026-09-29 最终快照证据
+## 2026-09-29 窄诊断的历史结论
 
-BoarOS kernel SHA-256
-`be5ca22629c904a427241b0f92e9d561d0312952e787ab75870ec4beae0143b3`，
-Linux Image SHA-256
-`a8b79593d1beb2acbd6be5c89062d1e924f14d1f502a026acae2d1de2b060d74`；
-driver ELF SHA-256
-`9d343a3bf4036e62ab9a7d7bef57ca2e1e85f1bd0c2021a3658978e1a39d87d4`。
-最终快照以同一 driver 和固定 Linux 重跑，相关 syscall 入口计数与初版一致。
-两边七条独立调用链全部到达 `PROBE complete`，BoarOS 最终 heap-live=0。
+最终快照以同一driver和固定Linux重跑，两边七条独立调用链全部到达
+`PROBE complete`，BoarOS最终heap-live=0。该轮没有TTY或真实网卡验收；网络能力
+以[后来交付的应用与网卡](network-ownership.md)为准，不能将旧试跑错误当作当前连接缺陷。
 
 | 消费者 | 两边实际入口与观察结果 | 后续限制 |
 | --- | --- | --- |
@@ -70,4 +54,84 @@ cyclictest 的 `shm_open` 错误也可能 exit0，必须检查真实 `C:` 输出
 endpoint 用明确的 `syscall(SYS_sched_*, ...)` 查询，避免把 libc stub 误判成内核失败。
 Linux 裸 PID1 的 PGID/SID 是 0，BoarOS 为 1；这里比较关系与策略，不比较分配的数字。
 
-原始运行目录是可清理证据，不是永久档案；上述输入身份和命令才是重建依据。
+原始运行目录是可清理证据，不是永久档案；上述版本与命令提供重建入口。
+
+## 原串口ash/stty与控制终端（2026-10-03）
+
+这一轮交付的是原BusyBox ash/stty的串口完整流程，不是给ioctl补成功返回值。
+launcher执行fork→setsid→open ttyS0→dup2→exec ash；TTY通过线程组持有的ctty
+连接稳定SID/前台PGID。键盘Ctrl-C/Ctrl-Z由行规程向整个前台组发信号，shell通过
+wait看到停止状态，bg/fg改变前台资格并继续任务。后台read触发TTIN，TOSTOP时
+后台write触发TTOU；忽略/阻塞、孤儿条件和修改型ioctl各自处理，不只是发送一个信号。
+
+UART从DTB取MMIO、clock和PLIC route，IRQ只收割有界字符/状态；worker负责输入
+规程与有界输出。默认115200/8N1、canonical/echo/ISIG。软件行规程、UART队列、OFD
+实例、线程组ctty和稳定PID身份分别有真实owner；最后pgrp成员退出不等于立即删除
+TTY仍引用的身份号码。hangup使旧OFD代次失效，新会话取得终端不会复活它。
+root在用户/OFD/会话清理后drain、stop/join worker，再释放队列与设备。
+
+同一RV64 ELF在固定Linux与BoarOS通过27项读取/termios记录和80项作业控制记录：
+
+| 验证 | 实际结论 |
+|---|---|
+| canonical、EOF、63/64/65字节与四种VMIN/VTIME | 整次readv维持64字节scratch、资格与deadline，不为下一块重新等待 |
+| fault与部分信号 | 已交付前缀和已消费staging分别核对；SIGUSR1返回真实2字节，不遗留restart标记 |
+| 阻塞readv9线程组取消 | leader及存活pthread被SIGKILL清退后，向量、OFD与读资格释放，独立后续read可继续 |
+| 控制终端与错误 | console不自动取得ctty；无ctty的tty返回ENXIO；setsid、dup/fork、外会话及坏指针一致 |
+| 后台任务 | 默认TTIN/TTOU真实stop并kill/reap；ignored/blocked TTIN返回EIO，TTOU允许写进展 |
+| detach、steal、leader退出 | HUP/CONT真实到达；旧OFD EOF/EIO/HUP，新代次能重新打开，旧代次不复活 |
+
+新增探针找出了一个实现错误：TIOCSPGRP把不存在身份与外会话统一返回EPERM。
+固定Linux `tty_jobctrl.c` 在身份不存在时返回ESRCH，存在但不属该session才EPERM。
+修复先经真实core反例红测，再验证registry查询、PID fallback、失败不改前台引用，
+最终80项与Linux一致。冻结旧raw内核首个TCGETS返回ENOTTY，证明新增探针覆盖新增能力。
+
+原BusyBox流程在modern/legacy完成stty -a/-g、raw/cooked/sane与原设置恢复、winsize，
+DEL行编辑、管线/重定向，前台cat/计算程序Ctrl-C、停止sleep再jobs/bg/fg，以及后台
+cat与TOSTOP输出。shell与子进程正常回收；launcher真实wait status=0，PID1退出42，
+最终heap-live=0。完整tty能力仍有限：没有客体PTY、termios2、其他行规程、break生成、
+完整modem控制或多用户凭据。宿主PTY只用于投递UART字节，不能当作客体PTY实现。
+
+测试器的两处修正也有机制依据。QEMU stdio会重新开启宿主OPOST；宿主PTY必须同时
+清除残留ONLCR，才能保留客体真实CRLF，不能事后全局删CR掩盖字节错误。ash作业号
+随异步回收变化，清理使用实际PID与退出握手；恢复foreground后由真实SIGCONT handler
+确认资格才投递Ctrl-C，避免把仍在后台的任务当作已恢复。原终端探针完整保留原始
+字节，不进行文本归一化。普通测试的console与内核消息可交错，用户标记不依赖偶然
+行首；唯一完整标记、真实退出、fatal检查与资源检查仍保留。
+
+fatal必须走同步raw sink，绕过console级别与worker：否则console关闭、IRQ关闭或
+worker被中断时会丢失现场。宿主反例保护这一入口，UART模型验证TEMT drain、队列满、
+配置、失败回滚与stop超时owner；这些证据没有还原历史页释放fatal或Virtqueue的唯一原因。
+
+重建使用固定BusyBox环境与musl，不修改原程序源码：
+
+```sh
+make musl-toolchain
+python3 -B tests/program-inventory/environment.py --busybox
+make test-uart-host test-tty-host
+make test-tty-riscv test-tty-diff-riscv
+python3 -B tests/tty/riscv.py --only boaros --transport legacy
+```
+
+runner关闭monitor混用，通过prompt、任务状态和客体握手推进；保存kernel/ELF/fixture、
+调用及wait status到忽略的build。低层依据为本地Linux7.2的n_tty.c、tty_io.c、
+tty_jobctrl.c和asm-generic/termbits.h，UART硬件参照本地QEMU v11.1.0的serial.c。
+本轮不据交互完成宣称实板延迟、硬实时或多用户隔离；PTY＋原BusyBox script另行确认。
+
+最终系统检查包含原1207条通用ABI、另107条终端记录、完整RV64、真实musl与glibc
+五种ELF形态、scale、FIFO及栈预算。编译栈检查1971个函数，最大单函数3152字节；
+它与运行期canary/高水位共同保护8KiB任务栈，不等于整个调用链只有3152字节。
+集成后的原Lua完整功能流程再次完成干净/增量/无变化重建、语法错误恢复、默认FIFO
+jobserver及其中断清理、-j2和全部产物运行，PID1退出42、heap-live=0，文件系统检查正常。
+这一次是集成功能验证，不与CPU候选的三次正式构建混作新的性能分布。
+
+收口还修复了新UART路径的一个准备阶段缺口：合法THRE=1/TEMT=0时，旧raw shift
+尾字节不引用新port/core软件内存，不能让随后IRQ/worker资源失败变成fatal。现在仅
+对尚未发布且未接受TX的对象，在撤IRQ、join及断言后逆序回滚；已发布TTY的drain与
+stop仍要求真实TEMT，超时继续保留owner。首次空worker也记录初始忙状态，以10ms
+请求期限观察完成并通知等待者。实际core的两个失败反例与一个等待反例先红后绿，
+正常stop超时/恢复、原串口两种transport和根启动/ABI重验通过。
+
+main保留BoarOS uname；通用实现单向合入兼容分支，原旧glibc BASIC_TCP正常完成、
+后代清理为零，原串口应用同样完成。该入口不等于默认main支持全部旧glibc程序。
+没有重跑iozone、完整成本矩阵或无关存储恢复，也没有改变journal/durable/FLUSH语义。

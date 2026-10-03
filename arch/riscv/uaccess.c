@@ -121,9 +121,18 @@ enum kernel_uaccess_status kernel_copy_to_user(
             *bytes_copied = copied;
             return status;
         }
+#if BOAROS_COST_DIAGNOSTICS
+        struct kernel_cost_tag memory_tag = kernel_cost_capture();
+        uint64_t memory_start = kernel_cost_clock();
+#endif
         for (index = 0U; index < chunk; index++) {
             page[offset + index] = source[copied + index];
         }
+#if BOAROS_COST_DIAGNOSTICS
+        uint64_t memory_elapsed = kernel_cost_clock() - memory_start;
+        kernel_cost_add_tag(memory_tag, COST_UACCESS_COPY_TICKS, memory_elapsed);
+        kernel_cost_add_tag(memory_tag, COST_UACCESS_COPY_BYTES, chunk);
+#endif
         COST_ADD(COPY_TO_USER, chunk);
         copied += chunk;
     }
@@ -175,9 +184,18 @@ enum kernel_uaccess_status kernel_copy_from_user(
             *bytes_copied = copied;
             return status;
         }
+#if BOAROS_COST_DIAGNOSTICS
+        struct kernel_cost_tag memory_tag = kernel_cost_capture();
+        uint64_t memory_start = kernel_cost_clock();
+#endif
         for (index = 0U; index < chunk; index++) {
             destination[copied + index] = page[offset + index];
         }
+#if BOAROS_COST_DIAGNOSTICS
+        uint64_t memory_elapsed = kernel_cost_clock() - memory_start;
+        kernel_cost_add_tag(memory_tag, COST_UACCESS_COPY_TICKS, memory_elapsed);
+        kernel_cost_add_tag(memory_tag, COST_UACCESS_COPY_BYTES, chunk);
+#endif
         COST_ADD(COPY_FROM_USER, chunk); COST_IO_ADD(3, chunk);
         copied += chunk;
     }

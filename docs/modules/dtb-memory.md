@@ -45,6 +45,7 @@
 ## 验证与限制
 
 ```sh
+python3 -B tests/host/dtb_uart_test.py
 make test-dtb-riscv
 make test-riscv
 ```
@@ -54,3 +55,5 @@ make test-riscv
 本模块仍不处理多 RAM bank、动态 reserved-memory、NUMA、热插拔或 CMA；页边界收缩和单页分配由[物理页分配模块](physical-pages.md)承担。
 
 `dtb_read_irq_info(dtb, boot_hart, ...)` 从固定 DTB 图解析 PLIC reg/ranges、CPU interrupt-controller phandle 与 `interrupts-extended` 的 supervisor context，并关联 VirtIO `interrupt-parent` 和 source。PLIC MMIO 进入最终高半区映射，交由 `arch/riscv/plic.c` claim/dispatch/complete；找不到启动 hart 的 S context 或路由越界时明确失败，不使用固定 IRQ/context 常数。见 `make test-dtb-riscv test-block-riscv test-io-sleep-riscv`。
+
+IRQ discovery additionally selects one enabled `ns16550a`/`ns16550` UART, translates its `reg` through parent buses and requires a valid PLIC parent/source plus nonzero `clock-frequency`. `reg-shift` defaults to zero and `reg-io-width` to one; supported layouts use shift 0–4 and width 1 or aligned width 4, with all eight registers inside the range. Unsupported endian/layout, missing clock/route and multiple UARTs are rejected; failure leaves the caller snapshot unchanged. This discovery has no hardware side effects. The UART fixture exercises the real parser without QEMU. Fixed board description: `references/qemu/hw/riscv/virt.c`, v11.1.0 commit `84f07211cc5b4fc6a371559bf8a5de4fb068e648` (`create_fdt_uart`).

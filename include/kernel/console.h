@@ -9,6 +9,8 @@
  * supervisor-mode context; the polling transport makes it synchronous.
  */
 void kernel_console_putc(char character);
+/* Optional platform emergency sink; fatal diagnostics must not depend on a worker. */
+void kernel_console_emergency_begin(void);
 
 /*
  * Timer-interrupt hook: wakes one blocked console reader when receive

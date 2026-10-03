@@ -7,6 +7,7 @@
 #include <kernel/proc_task.h>
 #include <kernel/fs_context.h>
 #include <kernel/task.h>
+#include <kernel/tty_task.h>
 #include <kernel/vfs.h>
 #include <string.h>
 
@@ -119,6 +120,8 @@ int kernel_proc_process_snapshot(kernel_pid_t pid, uint64_t identity,
             ? leader->parent->group_leader->tid : 0,
         .process_group = process_identity_number(leader, KERNEL_PID_PGID),
         .session_id = process_identity_number(leader, KERNEL_PID_SID),
+        .tty_nr = kernel_tty_rdev(kernel_task_controlling_tty(leader)),
+        .tty_pgrp = kernel_tty_foreground(kernel_task_controlling_tty(leader)),
         .identity = identity,
         .start_ticks = leader->proc_start_ticks,
         .state = task->proc_exiting ||
