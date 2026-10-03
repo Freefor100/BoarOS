@@ -36,7 +36,7 @@ broken，legacy又不会发布modern的NEEDS_RESET状态，原先只有一行超
 丢掉关键现场。新增输出仍返回TIMEOUT，且reset确认之前保留所有DMA owner；它用于
 定位停滞的设备与请求，不会仅凭超时判断是哪种设备故障或内存破坏。
 
-旧对照曾出现 QEMU `Virtqueue size exceeded`，随后块 I/O timeout/reset。固定 QEMU v11.1.0 的 `references/qemu/hw/virtio/virtio.c` 在 `virtqueue_split_pop()` 的设备侧 `inuse >= vring.num` 时报告该错误；这是已 pop 但未 flush 的描述符链数，和本驱动对 used-index 的校验不是同一计数。根启动现场有块盘和 RNG，但旧日志没有给出报错时的设备或 queue identity。后续带 virtqueue pop/flush trace 的同类原版网络运行，块队列峰值为 8、RNG 为 1且最终归零，没有复现告警。分配器竞态可以污染任一 DMA 页面，因而是可能的共因；目前没有证据将那次告警唯一归因于它。不得把该历史异常记作已经修复。
+split ring 使用协议规定的自然对齐布局，available/used 的 16 位 index 必须以单次半字指令访问，不能使用使编译器拆成字节访问的 `packed`。例如 `0x00ff → 0x0100` 的字节写可能先暴露 `0x0000`；设备会把反向跳变当作大量待处理 head，重复消费并触发 `Virtqueue size exceeded`。单 hart 关中断不能阻止设备并行访问，写后的 fence 也不能消除已暴露的中间值。既有发布/收割屏障仍保留。布局与对齐由编译断言保护，RV64 访问宽度由聚焦测试核对；固定依据为 `references/linux/include/uapi/linux/virtio_ring.h` 和 QEMU v11.1.0 的 `references/qemu/hw/virtio/virtio.c`。
 
 ## 验证
 

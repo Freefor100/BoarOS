@@ -8,6 +8,8 @@ unchanged. This checks cold diagnostics, not DMA ordering or a real device.
 from pathlib import Path
 import os
 import shlex
+import shutil
+import re
 import subprocess
 import tempfile
 
@@ -28,6 +30,31 @@ for instruction, native in translations.items():
 source = '#include <stdint.h>\nuint64_t host_block_time(void);\n' + source
 with tempfile.TemporaryDirectory(prefix="boaros-block-diagnostics-") as work:
     work = Path(work)
+    # 宿主 x86 可把 packed 半字当成一次访问；必须核对实际 RV64 DMA 访问宽度。
+    cross = next((p for p in ("riscv64-elf-", "riscv64-unknown-elf-")
+                  if shutil.which(p + "gcc")), None)
+    if cross is None:
+        raise RuntimeError("RV64 compiler required to verify shared ring index accesses")
+    access = work / "ring-access.c"
+    access.write_text('#include "' + str(root / "arch/riscv/virtio_mmio_block.c") + '"\n' + r'''
+uint16_t wire_available_read(volatile struct virtq_available *ring) { return ring->index; }
+void wire_available_write(volatile struct virtq_available *ring, uint16_t value) { ring->index = value; }
+uint16_t wire_used_read(volatile struct virtq_used *ring) { return ring->index; }
+''')
+    obj = work / "ring-access.o"
+    subprocess.run([cross + "gcc", "-O2", "-ffreestanding", "-fno-builtin",
+        "-march=rv64imac_zicsr_zifencei", "-mabi=lp64", "-mcmodel=medany",
+        "-DBOAROS_PAGE_SHIFT=12", "-Iinclude", "-c", str(access), "-o", str(obj)],
+        cwd=root, check=True)
+    for function, instruction in (("wire_available_read", "lhu"),
+                                  ("wire_available_write", "sh"),
+                                  ("wire_used_read", "lhu")):
+        assembly = subprocess.check_output([cross + "objdump", "-d",
+            "--disassemble=" + function, str(obj)], text=True)
+        if re.search(r"\b(?:sb|lbu|lb)\s", assembly) or not re.search(r"\b" + instruction + r"\s", assembly):
+            raise AssertionError(f"{function}: split-ring index needs one aligned halfword access; "
+                "bytewise 0x00ff -> 0x0100 can expose 0x0000 to the device\n" + assembly)
+    print("PASS RV64 split-ring index access width: aligned halfword publication and snapshots", flush=True)
     (work / "virtio_mmio_block_native.c").write_text(source)
     exe = work / "test"
     subprocess.run([

@@ -87,26 +87,26 @@ struct virtq_descriptor {
     uint32_t length;
     uint16_t flags;
     uint16_t next;
-} __attribute__((packed));
+};
 
 struct virtq_available {
     uint16_t flags;
     uint16_t index;
     uint16_t ring[VIRTIO_QUEUE_SIZE];
     uint16_t used_event;
-} __attribute__((packed));
+};
 
 struct virtq_used_element {
     uint32_t id;
     uint32_t length;
-} __attribute__((packed));
+};
 
 struct virtq_used {
     uint16_t flags;
     uint16_t index;
     struct virtq_used_element ring[VIRTIO_QUEUE_SIZE];
     uint16_t available_event;
-} __attribute__((packed));
+};
 
 struct virtio_block_request_header {
     uint32_t type;
@@ -116,6 +116,16 @@ struct virtio_block_request_header {
 
 _Static_assert(sizeof(struct virtq_descriptor) == 16U,
                "VirtIO descriptor layout must match the specification");
+/* ring 已按协议对齐；packed 会把 RV64 的共享 idx 拆成字节访问，进位时可被 DMA 撕裂。 */
+_Static_assert(offsetof(struct virtq_available, index) == 2U &&
+               offsetof(struct virtq_available, ring) == 4U &&
+               _Alignof(struct virtq_available) >= 2U,
+               "available index must be naturally aligned");
+_Static_assert(offsetof(struct virtq_used, index) == 2U &&
+               offsetof(struct virtq_used, ring) == 4U &&
+               sizeof(struct virtq_used_element) == 8U &&
+               _Alignof(struct virtq_used) >= 4U,
+               "used index and elements must be naturally aligned");
 struct block_request {
     struct virtio_block_request_header header;
     volatile unsigned char status;
