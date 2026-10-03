@@ -44,15 +44,22 @@ struct kernel_pid *kernel_task_tty_identity(const struct kernel_task *task,
 {
     return process_identity(task, role);
 }
-struct kernel_pid *kernel_task_tty_find_group(struct kernel_task *task, kernel_pid_t number)
+int kernel_task_tty_find_group(struct kernel_task *task, kernel_pid_t number,
+                               struct kernel_pid **out)
 {
     struct kernel_pid *group = kernel_pid_find(&scheduler.identities, number);
-    struct kernel_task *member =
-        group && group->members[KERNEL_PID_PGID] ? group->members[KERNEL_PID_PGID]->task : 0;
-    return member && process_identity(member, KERNEL_PID_SID) ==
-                         process_identity(task, KERNEL_PID_SID)
-               ? group
-               : 0;
+    *out = 0;
+    if (!group)
+        return -KERNEL_ESRCH;
+    /* 固定 Linux session_of_pgrp 在没有 PGID 成员时仍检查数字 PID 的 session。 */
+    struct kernel_pid_member *member = group->members[KERNEL_PID_PGID];
+    if (!member)
+        member = group->members[KERNEL_PID_TID];
+    if (!member || process_identity(member->task, KERNEL_PID_SID) !=
+                       process_identity(task, KERNEL_PID_SID))
+        return -KERNEL_EPERM;
+    *out = group;
+    return 0;
 }
 int kernel_task_tty_session_leader(const struct kernel_task *task)
 {

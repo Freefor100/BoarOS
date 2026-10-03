@@ -1433,10 +1433,9 @@ static int device_ioctl(void *opaque, struct kernel_task *caller, struct kernel_
             break;
         }
         uintptr_t irq = riscv_interrupt_save();
-        struct kernel_pid *group = kernel_task_tty_find_group(caller, number);
-        if (!group)
-            error = -KERNEL_EPERM;
-        else {
+        struct kernel_pid *group = 0;
+        error = kernel_task_tty_find_group(caller, number, &group);
+        if (!error) {
             kernel_pid_get(group);
             if (tty->foreground)
                 kernel_pid_put(tty->foreground);

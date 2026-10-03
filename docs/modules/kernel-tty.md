@@ -22,6 +22,8 @@ leader 最后成员退出的 serial hangup 向 session leader 发 HUP/CONT，并
 既有实例的 generation 随 hangup 失效，后来的新 session 不会复活旧 OFD。普通 close
 不触发会话 hangup，最后一次真实 OFD close 的 HUPCL 由 transport 操作硬件 modem。
 proc stat 的 tty_nr/tpgid 来自同一受保护的实际关联快照。
+TIOCSPGRP 查找数字身份：身份不存在返回 ESRCH；存在但属于其他 session 或没有活成员
+返回 EPERM。按固定 Linux 在无 PGID 成员时检查 PID 成员的 session，成功才更新前台引用。
 
 完整 readv/writev 与可阻塞 ioctl 的调用拥有 OFD pin 和已导入的 heap iov。进入 hook
 时从调用者 owner 指针移交，正常返回恢复供原调用者收尾；强制终止则消费这些 owner，

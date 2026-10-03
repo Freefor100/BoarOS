@@ -96,10 +96,17 @@ struct kernel_pid *kernel_task_tty_identity(const struct kernel_task *t,
     (void)r;
     return t ? &identity : 0;
 }
-struct kernel_pid *kernel_task_tty_find_group(struct kernel_task *t, kernel_pid_t n)
+int kernel_task_tty_find_group(struct kernel_task *t, kernel_pid_t n,
+                               struct kernel_pid **group)
 {
     (void)t;
-    return n == 7 ? &identity : 0;
+    *group = 0;
+    if (n == 8)
+        return -KERNEL_EPERM;
+    if (n != 7)
+        return -KERNEL_ESRCH;
+    *group = &identity;
+    return 0;
 }
 int kernel_task_tty_session_leader(const struct kernel_task *t)
 {
@@ -471,6 +478,15 @@ int main(void)
            kernel_tty_foreground(tty) == 7);
     int32_t group;
     assert(ioctl_call(0x540f, &group) == 0 && group == 7);
+    group = INT32_MAX;
+    assert(ioctl_call(0x5410, &group) == -KERNEL_ESRCH);
+    assert(kernel_tty_foreground(tty) == 7 && identity.references == 3);
+    group = 8;
+    assert(ioctl_call(0x5410, &group) == -KERNEL_EPERM);
+    assert(kernel_tty_foreground(tty) == 7 && identity.references == 3);
+    group = 7;
+    assert(ioctl_call(0x5410, &group) == 0);
+    assert(kernel_tty_foreground(tty) == 7 && identity.references == 3);
     uint16_t winsize[4] = {24, 80, 0, 0};
     assert(ioctl_call(0x5414, winsize) == 0 && signals[28] == 1);
     memset(winsize, 0, sizeof(winsize));

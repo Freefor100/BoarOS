@@ -1700,3 +1700,5 @@ test-tty-host:
 	build/host/tty/core
 	cc -std=gnu11 -O1 -g -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=12 -Itests/host/random -idirafter include -fsanitize=address,undefined tests/tty/flags_host.c fs/tty.c -o build/host/tty/flags
 	build/host/tty/flags
+	cc -std=gnu11 -O1 -g -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=12 -idirafter include -ffunction-sections -fdata-sections -Wl,--gc-sections -fsanitize=address,undefined tests/tty/group_host.c kernel/sched/tty.c kernel/pid.c -o build/host/tty/group
+	build/host/tty/group

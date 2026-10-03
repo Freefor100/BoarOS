@@ -12,7 +12,8 @@ void kernel_task_tty_clear(struct kernel_task *task);
 void kernel_task_tty_clear_session(struct kernel_tty *tty, struct kernel_pid *session);
 struct kernel_pid *kernel_task_tty_identity(const struct kernel_task *task,
                                             enum kernel_pid_role role);
-struct kernel_pid *kernel_task_tty_find_group(struct kernel_task *task, kernel_pid_t number);
+int kernel_task_tty_find_group(struct kernel_task *task, kernel_pid_t number,
+                               struct kernel_pid **group);
 int kernel_task_tty_session_leader(const struct kernel_task *task);
 int kernel_task_tty_signal_ignored(const struct kernel_task *task, unsigned signal);
 int kernel_task_tty_group_orphaned(const struct kernel_task *task);
