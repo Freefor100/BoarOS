@@ -14,7 +14,7 @@
 
 每任务有同步/分配/后端上下文。锁顺序 OFD offset → namespace → 稳定身份排序的 inode → backend，写者排队后阻止后续读者。内核存储 wait 不可被信号拆除；pending 退出在请求完成或 reset 之后，沿正常调用栈释放资源，再返回用户边界处理。任务退出后的存储清理由可调度内核任务承担，idle/IRQ 不进入可睡眠路径。
 
-VirtIO 使用最多 32 描述符、8 个在途槽。准备不发布 DMA；提交后槽的任务 owner、header/status、bounce 与描述符一直保留至确认完成。IRQ 只收割/ack/唤醒；队列满则等待。flush 阻止新提交、排空此前请求，再完成设备或软件屏障。timeout 先禁止提交并 reset，确认停止 DMA 后一次性完成失败请求；设备保持失败态。统计的 max_inflight 计已发布且未确认完成的请求，不计仅预留槽。
+VirtIO 使用最多 32 描述符、8 个在途槽。准备不发布 DMA；提交后槽的任务 owner、header/status、bounce 与描述符一直保留至确认完成。IRQ 只收割/ack/唤醒；队列满则等待。flush 阻止新提交、排空此前请求，再完成设备或软件屏障。timeout 先禁止提交并 reset，确认停止 DMA 后一次性完成失败请求；设备保持失败态。当前请求期限为30秒；超时不是应用执行预算。QEMU的FLUSH会同步宿主后备文件，包括启动前宿主复制留下的脏页，不能用一秒期限或预同步镜像冒充可靠性。统计的 max_inflight 计已发布且未确认完成的请求，不计仅预留槽。
 
 缓存同页 miss 合并为一个 loader，不同页并发；写回固定页快照和 dirty generation。writeback 选页数组在首次睡眠前逐项 pin，之后只释放原集合。inode 写锁排除 truncate/失效/orphan 最后 close 与 loading/writeback。用户复制在存储锁外；文件/ELF 缺页先 pin source 和 VMA generation，I/O 返回后验证版本与同地址 PTE，再发布。另一任务先完成同页缺页可满足本次请求。
 
