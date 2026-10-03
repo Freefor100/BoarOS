@@ -31,9 +31,10 @@ if ! timeout -k 2s 30s "$qemu" -machine virt -bios default \
     exit 1
 fi
 # console与内核日志各自排队，线路还可产生CRLF；契约是完整且唯一的用户记录。
-if [ "$(grep -oF 'ELF RWX PASS' "$output" | wc -l)" -ne 1 ] ||
-    ! grep -q 'BoarOS: PID 1 exited status=0x0' "$output" ||
-    grep -qE 'BoarOS: (fatal trap|root boot error)' "$output"; then
+# 固件横幅可含NUL；按字节文本查用户标记，不让grep的二进制提示替代实际匹配。
+if [ "$(LC_ALL=C grep -aoF 'ELF RWX PASS' "$output" | wc -l)" -ne 1 ] ||
+    ! LC_ALL=C grep -aq 'BoarOS: PID 1 exited status=0x0' "$output" ||
+    LC_ALL=C grep -aqE 'BoarOS: (fatal trap|root boot error)' "$output"; then
     tail -n 30 "$output" >&2
     exit 1
 fi

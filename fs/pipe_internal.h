@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 #include <kernel/scheduler.h>
+#include <kernel/sync.h>
 #include <kernel/vfs.h>
 
 struct kernel_heap;
@@ -36,6 +37,7 @@ struct kernel_pipe {
     struct kernel_wait_queue read_queue;
     struct kernel_wait_queue write_queue;
     struct kernel_wait_queue both_queue;
+    struct kernel_mutex copy_lock;
 };
 
 #define KERNEL_PIPE_ENDPOINT_READ 1U

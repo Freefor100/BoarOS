@@ -24,11 +24,17 @@ if ! timeout -k 2s 60s "$qemu" -machine virt -bios default -kernel "$kernel" \
     tail -80 "$work/boot.log" >&2
     exit 1
 fi
-if ! grep -qxF 'BoarOS: SQLite rollback smoke passed' "$work/boot.log"; then
+# 只还原终端的CRLF，原始串口字节仍保留；不删除任意CR或改变程序输出。
+python3 - "$work/boot.log" "$work/boot.text" <<'PY'
+import sys
+from pathlib import Path
+Path(sys.argv[2]).write_bytes(Path(sys.argv[1]).read_bytes().replace(b'\r\n', b'\n'))
+PY
+if ! LC_ALL=C grep -aqxF 'BoarOS: SQLite rollback smoke passed' "$work/boot.text"; then
     tail -80 "$work/boot.log" >&2
     exit 1
 fi
-if ! grep -qE '^BoarOS: PID 1 exited status=0x2a pages=0x[1-9a-f][0-9a-f]* heap-live=0x0; shutting down$' "$work/boot.log"; then
+if ! LC_ALL=C grep -aqE '^BoarOS: PID 1 exited status=0x2a pages=0x[1-9a-f][0-9a-f]* heap-live=0x0; shutting down$' "$work/boot.text"; then
     tail -80 "$work/boot.log" >&2
     exit 1
 fi
@@ -51,7 +57,12 @@ if ! timeout -k 2s 60s "$qemu" -machine virt -bios default -kernel "$kernel" \
     tail -80 "$work/cli.log" >&2
     exit 1
 fi
-if ! grep -qxF 'BoarOS: SQLite CLI static and dynamic passed' "$work/cli.log"; then
+python3 - "$work/cli.log" "$work/cli.text" <<'PY'
+import sys
+from pathlib import Path
+Path(sys.argv[2]).write_bytes(Path(sys.argv[1]).read_bytes().replace(b'\r\n', b'\n'))
+PY
+if ! LC_ALL=C grep -aqxF 'BoarOS: SQLite CLI static and dynamic passed' "$work/cli.text"; then
     tail -80 "$work/cli.log" >&2
     exit 1
 fi
