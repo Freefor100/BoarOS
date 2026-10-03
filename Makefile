@@ -590,7 +590,7 @@ DEPS := \
 	test-mmap-riscv
 
 OSCOMP_GROUPS ?= basic busybox cyclictest iozone iperf libcbench libctest lmbench lua netperf ltp
-OSCOMP_CASE_TIMEOUT ?= 60
+OSCOMP_CASE_TIMEOUT ?= 300
 OSCOMP_CASE := $(BUILD_DIR)/oscomp/case
 OSCOMP_INIT := $(BUILD_DIR)/oscomp/init.json
 .DEFAULT_GOAL := all

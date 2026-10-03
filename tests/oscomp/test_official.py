@@ -93,13 +93,35 @@ class OfficialFlowTests(unittest.TestCase):
         target = Path(self.temp.name) / 'adapted.sh'
         source.write_text(original)
         subprocess.run(['sh', str(HERE / 'ltp-hook.sh'), str(source), str(target)], check=True)
-        hook = '    /tmp/boaros-case "$BOAROS_LTP_CASE_TIMEOUT" "$BOAROS_CASE_SHELL" "$file"'
+        hook = '    sh /tmp/boaros-ltp-case.sh /tmp/boaros-case /tmp/boaros-ltp-skips.tsv "$BOAROS_LTP_CASE_TIMEOUT" "$BOAROS_CASE_SHELL" "$file"'
         self.assertEqual(target.read_text().replace(hook, '    "$file"'), original)
         for malformed in (original.replace('    "$file"', '    echo "$file"'),
                           original + '    "$file"\n'):
             source.write_text(malformed)
             result = subprocess.run(['sh', str(HERE / 'ltp-hook.sh'), str(source), str(target)], capture_output=True)
             self.assertEqual(result.returncode, 125)
+
+    def test_confirmed_controller_helper_is_skipped_without_success(self):
+        program = Path(self.temp.name) / 'cgroup_fj_proc'
+        program.write_text('#!/bin/sh\necho SHOULD-NOT-RUN\n')
+        program.chmod(0o755)
+        result = subprocess.run(['sh', str(HERE / 'ltp-case.sh'), str(self.binary),
+            str(HERE / 'ltp-skips.tsv'), '3', '/bin/sh', str(program)],
+            capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 125)
+        self.assertEqual(result.stdout, '')
+        self.assertIn('BOAROS-CASE SKIP', result.stderr)
+        self.assertIn('cgroup_fj_proc', result.stderr)
+
+    def test_unlisted_case_keeps_native_exit_and_output(self):
+        program = Path(self.temp.name) / 'ordinary-test'
+        program.write_text('#!/bin/sh\necho real-result\nexit 7\n')
+        program.chmod(0o755)
+        result = subprocess.run(['sh', str(HERE / 'ltp-case.sh'), str(self.binary),
+            str(HERE / 'ltp-skips.tsv'), '3', '/bin/sh', str(program)],
+            capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 7, result.stderr)
+        self.assertEqual(result.stdout, 'real-result\n')
 
 
 if __name__ == '__main__':

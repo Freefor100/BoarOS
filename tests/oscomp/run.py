@@ -88,7 +88,7 @@ def main():
     ap.add_argument('--output', type=Path, default=ROOT / 'build/oscomp-rv-run')
     ap.add_argument('--diagnostic-timeout', type=int, help='override budget; labels result diagnostic, never the formal baseline')
     ap.add_argument('--groups',choices=('all','iozone','environment','ltp'),default='all',help='subsets run the same original scripts and never imply full Harness acceptance')
-    ap.add_argument('--case-timeout', type=int, default=60, help='LTP per-case deadline seconds, 0 disables the deadline; timeout is never a pass')
+    ap.add_argument('--case-timeout', type=int, default=300, help='LTP per-case safety budget seconds, 0 disables it; timeout is never a pass')
     args = ap.parse_args()
     directory = args.output.resolve()
     if directory.exists():
@@ -108,8 +108,7 @@ def main():
     disk = directory / 'root.img'
     subprocess.run(['cp', '--reflink=auto', '--sparse=always', str(REF / 'sdcard-rv.img'), str(disk)], check=True)
     # Official image is copied intact. make all supplies the boot command and helpers.
-    with disk.open('rb') as stream:
-        os.fsync(stream.fileno())
+    # 不预同步宿主副本：官方准备流程没有此保证，正常慢 FLUSH 由驱动承担。
     kernel = directory / 'kernel-rv';shutil.copyfile(ROOT/'kernel-rv',kernel)
     qemu = os.environ.get('QEMU_RISCV64', 'qemu-system-riscv64')
     command = [qemu, '-machine', 'virt', '-kernel', str(kernel), '-m', str(config.get('qemu.mem', '1G')),
@@ -126,6 +125,8 @@ def main():
               'ltp_case_timeout_seconds': args.case_timeout,
               'case_sha256': sha(ROOT / 'build/riscv/oscomp/case'),
               'ltp_hook_sha256': sha(HERE / 'ltp-hook.sh'),
+              'ltp_skips_sha256': sha(HERE / 'ltp-skips.tsv'),
+              'ltp_case_script_sha256': sha(HERE / 'ltp-case.sh'),
               'boot_count': 1, 'extra_disk': None, 'selected_groups':selected,
               'qemu_sha256':sha(shutil.which(qemu)), 'fixture_sha256':sha(disk),
               'source_tree':output(['git','write-tree']), 'timebase_hz':10000000,

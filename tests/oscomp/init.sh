@@ -27,7 +27,7 @@ $BB chmod +x /glibc/basic/run-all.sh /musl/basic/run-all.sh
 export HOME=/ TERM=vt100
 # BOAROS_CASE_PAYLOAD
 groups=${BOAROS_EVAL_GROUPS:-'basic busybox cyclictest iozone iperf libcbench libctest lmbench lua netperf ltp'}
-export BOAROS_LTP_CASE_TIMEOUT=${BOAROS_LTP_CASE_TIMEOUT:-60}
+export BOAROS_LTP_CASE_TIMEOUT=${BOAROS_LTP_CASE_TIMEOUT:-300}
 for group in $groups; do
     for libc in glibc musl; do
         (

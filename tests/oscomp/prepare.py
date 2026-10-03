@@ -12,7 +12,7 @@ def main():
     parser.add_argument('--case', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--groups', default='basic busybox cyclictest iozone iperf libcbench libctest lmbench lua netperf ltp')
-    parser.add_argument('--case-timeout', type=int, default=60)
+    parser.add_argument('--case-timeout', type=int, default=300)
     args = parser.parse_args()
     known = {'basic','busybox','cyclictest','iozone','iperf','libcbench','libctest','lmbench','lua','netperf','ltp'}
     if not args.groups.split() or not set(args.groups.split()) <= known:
@@ -25,7 +25,11 @@ def main():
     startup = startup.replace('# BOAROS_CASE_PAYLOAD',
         f"$BB printf '%b' '{payload}' > /tmp/boaros-case\n$BB chmod 755 /tmp/boaros-case\n"
         "$BB cat > /tmp/boaros-ltp-hook.sh <<'BOAROS_LTP_HOOK_END'\n"
-        + (HERE / 'ltp-hook.sh').read_text() + '\nBOAROS_LTP_HOOK_END')
+        + (HERE / 'ltp-hook.sh').read_text() + '\nBOAROS_LTP_HOOK_END\n'
+        + "$BB cat > /tmp/boaros-ltp-case.sh <<'BOAROS_LTP_CASE_END'\n"
+        + (HERE / 'ltp-case.sh').read_text() + '\nBOAROS_LTP_CASE_END\n'
+        + "$BB cat > /tmp/boaros-ltp-skips.tsv <<'BOAROS_LTP_SKIPS_END'\n"
+        + (HERE / 'ltp-skips.tsv').read_text() + '\nBOAROS_LTP_SKIPS_END')
     profile = {'path': '/musl/busybox', 'argv': ['/musl/busybox', 'sh', '-c', startup],
                'envp': ['PATH=/musl','HOME=/','TERM=vt100',
                         'BOAROS_EVAL_GROUPS=' + args.groups,

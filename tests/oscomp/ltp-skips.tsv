@@ -1,0 +1,30 @@
+# ltp-full-20240524; fixed pre-2025 source in references/oscomp-testsuits.
+# Only direct no-argument execution is skipped; controllers themselves still run.
+# name	source	reason
+cgroup_fj_proc	testcases/kernel/controllers/cgroup_fj/cgroup_fj_proc.c	controller-SIGUSR1-required
+cgroup_regression_3_1.sh	testcases/kernel/controllers/cgroup/cgroup_regression_3_1.sh	controller-stop-signal-required
+cgroup_regression_3_2.sh	testcases/kernel/controllers/cgroup/cgroup_regression_3_2.sh	controller-stop-signal-required
+cgroup_regression_5_1.sh	testcases/kernel/controllers/cgroup/cgroup_regression_5_1.sh	controller-stop-signal-required
+cgroup_regression_5_2.sh	testcases/kernel/controllers/cgroup/cgroup_regression_5_2.sh	controller-stop-signal-required
+cgroup_regression_6_1.sh	testcases/kernel/controllers/cgroup/cgroup_regression_6_1.sh	controller-stop-signal-required
+cgroup_regression_6_2.sh	testcases/kernel/controllers/cgroup/cgroup_regression_6_2.sh	controller-stop-signal-required
+cgroup_regression_fork_processes	testcases/kernel/controllers/cgroup/cgroup_regression_fork_processes.c	unbounded-controller-fork-workload
+cpuctl_fj_cpu-hog	testcases/kernel/controllers/cpuctl_fj/cpuctl_fj_cpu-hog.c	controller-SIGUSR1-required
+cpuhotplug_do_disk_write_loop	testcases/kernel/hotplug/cpu_hotplug/tools/cpuhotplug_do_disk_write_loop	unbounded-hotplug-workload
+cpuhotplug_do_kcompile_loop	testcases/kernel/hotplug/cpu_hotplug/tools/cpuhotplug_do_kcompile_loop	unbounded-hotplug-workload
+cpuhotplug_do_spin_loop	testcases/kernel/hotplug/cpu_hotplug/tools/cpuhotplug_do_spin_loop	unbounded-hotplug-workload
+cpuset_cpu_hog	testcases/kernel/controllers/cpuset/cpuset_load_balance_test/cpuset_cpu_hog.c	controller-FIFO-and-signals-required
+cpuset_mem_hog	testcases/kernel/controllers/cpuset/cpuset_memory_spread_test/cpuset_mem_hog.c	controller-FIFO-and-signals-required
+fork_exec_loop	testcases/kernel/controllers/freezer/fork_exec_loop.c	unbounded-freezer-workload
+fs_racer_dir_create.sh	testcases/kernel/fs/racer/fs_racer_dir_create.sh	unbounded-racer-worker-requires-controller
+fs_racer_dir_test.sh	testcases/kernel/fs/racer/fs_racer_dir_test.sh	unbounded-racer-worker-requires-controller
+fs_racer_file_concat.sh	testcases/kernel/fs/racer/fs_racer_file_concat.sh	unbounded-racer-worker-requires-controller
+fs_racer_file_create.sh	testcases/kernel/fs/racer/fs_racer_file_create.sh	unbounded-racer-worker-requires-controller
+fs_racer_file_link.sh	testcases/kernel/fs/racer/fs_racer_file_link.sh	unbounded-racer-worker-requires-controller
+fs_racer_file_list.sh	testcases/kernel/fs/racer/fs_racer_file_list.sh	unbounded-racer-worker-requires-controller
+fs_racer_file_rename.sh	testcases/kernel/fs/racer/fs_racer_file_rename.sh	unbounded-racer-worker-requires-controller
+fs_racer_file_rm.sh	testcases/kernel/fs/racer/fs_racer_file_rm.sh	unbounded-racer-worker-requires-controller
+fs_racer_file_symlink.sh	testcases/kernel/fs/racer/fs_racer_file_symlink.sh	unbounded-racer-worker-requires-controller
+memcg_test_2	testcases/kernel/controllers/memcg/regression/memcg_test_2.c	controller-SIGUSR1-and-kill-required
+memcg_test_4	testcases/kernel/controllers/memcg/regression/memcg_test_4.c	controller-SIGUSR1-and-kill-required
+pids_task2	testcases/kernel/controllers/pids/pids_task2.c	controller-kill-required

@@ -39,7 +39,7 @@ LTP 阶段设置实际 `LTPROOT`，其 `testcases/bin` 排在 libc 根目录之�
 
 默认顺序为 basic、busybox、cyclictest、iozone、iperf、libcbench、libctest、
 lmbench、lua、netperf、ltp，每组先 glibc 后 musl。各组串行执行原脚本，不切换 LTP 的
-上游 runtest 清单，不白名单过滤，也不在失败后重启、拼接结果。
+上游 runtest 清单，不替换上游runtest，也不在失败后重启、拼接结果。
 
 LTP 仍使用比赛脚本的原目录遍历、原参数及原 START/RUN/FAIL/END 标记。
 `ltp-hook.sh` 只在临时脚本副本的唯一单项执行行接入 `case`，原盘文件保留。
@@ -54,7 +54,9 @@ LTP 仍使用比赛脚本的原目录遍历、原参数及原 START/RUN/FAIL/END
 也不承诺回收已脱离测试组的守护进程。官方脚本本身将辅助程序作为无参数单项执行，
 监督不能把这种输入转化成上游控制脚本的有效输入或语义通过。
 
-默认每项 LTP 上限 60 秒，可在构建时用 `OSCOMP_CASE_TIMEOUT` 设置，0 关闭超时。
+直接无参数运行的无限辅助程序由 `tests/oscomp/ltp-skips.tsv` 明确列出来源和原因；固定依据为pre-2025树中的ltp-full-20240524。原遍历仍输出RUN/FAIL，跳过另记SKIP并返回125，不输出伪造Summary、TCONF或通过结果，原judge不给通过分。控制脚本和普通测例照常运行，不能将cgroup能力缺失本身作为跳过所有相关测例的理由。
+
+默认每项 LTP 安全预算300秒，可在构建时用 `OSCOMP_CASE_TIMEOUT` 设置，0关闭此预算。
 这属于本项目的执行预算，可能提前结束合法长测试；超时不代表内核缺功能，完成循环
 也不代表语义通过。官方总启动预算和原 judge 不变，缺少 `kernel-la` 仍阻塞完整 Harness。
 
