@@ -11,6 +11,7 @@ static size_t allocation_size;
 static unsigned allocations;
 static unsigned releases;
 static uint64_t clock_value;
+static uint64_t complete_at;
 static struct kernel_io_context caller;
 static char diagnostic[8192];
 static size_t diagnostic_length;
@@ -45,7 +46,7 @@ static uint64_t register_address(unsigned low)
 uint64_t host_block_time(void)
 {
     clock_value += 1;
-    if (!queue_allocation || injected || fault >= NO_COMPLETION) return clock_value;
+    if (!queue_allocation || injected || fault >= NO_COMPLETION || clock_value < complete_at) return clock_value;
     unsigned queue_size = registers[0x38 / 4];
     uint64_t descriptor_address, available_address, used_address;
     if (registers[4 / 4] == 1) {
@@ -64,7 +65,9 @@ uint64_t host_block_time(void)
     struct wire_descriptor *descriptors = physical_pointer(descriptor_address,
                                                            queue_size * 16);
     unsigned head = available[2];
-    unsigned status_descriptor = descriptors[descriptors[head].next].next;
+    unsigned status_descriptor = head;
+    while (descriptors[status_descriptor].flags & 1)
+        status_descriptor = descriptors[status_descriptor].next;
     unsigned char *status = physical_pointer(descriptors[status_descriptor].address, 1);
     *status = fault == DEVICE_IO ? 1 : fault == DEVICE_UNSUPPORTED ? 2 :
         fault == INVALID_STATUS ? 7 : 0;
@@ -73,7 +76,7 @@ uint64_t host_block_time(void)
     completion[0] = (struct wire_completion){
         fault == INVALID_ID ? UINT32_MAX : fault == MISALIGNED_ID ? 1 :
         fault == FREE_SLOT ? 3 : head,
-        fault == ZERO_LENGTH ? 0 : 513
+        fault == ZERO_LENGTH ? 0 : descriptors[head].next == status_descriptor ? 1 : 513
     };
     if (fault == DUPLICATE_SLOT) completion[1] = completion[0];
     used[1] = fault == USED_OVERFLOW ? 9 : fault == DUPLICATE_SLOT ? 2 : 1;
@@ -316,8 +319,50 @@ static void queue_reuse_case(unsigned version)
     printf("PASS block queue reuse transport=%u: 65544 requests, reversed completions, index wrap\n", version);
 }
 
+/* A valid backing-file sync can take several seconds. Independently advance
+ * the device clock, then complete successfully; no wall-clock sleep or retry. */
+static void slow_completion_case(unsigned version, unsigned type)
+{
+    struct riscv_virtio_mmio_block device = {0};
+    struct physical_page_allocator allocator = {0};
+    unsigned char buffer[512] = {0};
+    memset(registers, 0, sizeof(registers));
+    registers[0] = 0x74726976;
+    registers[1] = version;
+    registers[2] = 2;
+    registers[0x10 / 4] = 1 | (1 << 9);
+    registers[0x34 / 4] = 32;
+    registers[0x100 / 4] = 16;
+    clock_value = 0;
+    complete_at = 2500;
+    injected = 0;
+    fault = NORMAL;
+    diagnostic_length = 0;
+    diagnostic[0] = 0;
+    assert(riscv_virtio_mmio_block_init(&device, registers, sizeof(registers),
+        &allocator, dma_address, 1000) == RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK);
+    enum kernel_block_status status = type == 4 ? device.block.flush(device.block.context) :
+        type == 1 ? device.block.write(device.block.context, 0, buffer, sizeof(buffer)) :
+                    device.block.read(device.block.context, 0, buffer, sizeof(buffer));
+    assert(status == KERNEL_BLOCK_STATUS_OK);
+    assert(clock_value >= 2500 && !device.statistics.timeouts && !diagnostic_length);
+    assert(device_live(&device) && !device.active && !device.inflight);
+    assert(riscv_virtio_mmio_block_destroy(&device) == RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK);
+    assert(allocations == releases);
+    complete_at = 0;
+    printf("PASS block slow completion transport=%u type=%u: 2.5 seconds, no false timeout\n", version, type);
+}
+
 int main(int argc, char **argv)
 {
+    if (argc == 2 && !strcmp(argv[1], "slow")) {
+        for (unsigned version = 1; version <= 2; version++) {
+            slow_completion_case(version, 0);
+            slow_completion_case(version, 1);
+            slow_completion_case(version, 4);
+        }
+        return 0;
+    }
     if (argc == 2 && !strcmp(argv[1], "reuse")) {
         queue_reuse_case(1);
         queue_reuse_case(2);
@@ -328,6 +373,9 @@ int main(int argc, char **argv)
         return 0;
     }
     for (unsigned version = 1; version <= 2; ++version) {
+        slow_completion_case(version, 0);
+        slow_completion_case(version, 1);
+        slow_completion_case(version, 4);
         queue_reuse_case(version);
         for (unsigned kind = NORMAL; kind <= NO_COMPLETION; ++kind) {
             run_case(version, (enum fault_kind)kind);

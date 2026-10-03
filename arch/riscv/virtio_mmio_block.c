@@ -1099,7 +1099,9 @@ enum riscv_virtio_mmio_block_status riscv_virtio_mmio_block_init(
     result.dma_address = dma_address;
     result.mmio = mmio;
     result.mmio_size = mmio_size;
-    result.timeout_ticks = timebase_frequency;
+    /* 合法 FLUSH 可能等待宿主整份后备文件落盘；一秒不能判定设备故障。
+     * 保留有限期限及原 reset/DMA owner 契约，乘法先提升避免频率溢出。 */
+    result.timeout_ticks = (uint64_t)timebase_frequency * 30;
 
     if (mmio_read32(&result, VIRTIO_MMIO_MAGIC_VALUE_OFFSET) !=
         VIRTIO_MMIO_MAGIC_VALUE) {
