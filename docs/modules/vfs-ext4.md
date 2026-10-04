@@ -319,3 +319,8 @@ open窗口、2048次空文件创建删除，以及原lmbench的三种文件sysca
 `--platform-config official`使用本地固定平台的1GiB、单hart、默认VirtIO、网卡和
 UTC RTC，不添加RNG；不是完整比赛Harness。原旧glibc使用兼容分支配置。
 关闭观测的重复启动与单次定点COST分别解释；原始输出和机器身份只进build。
+
+热路径查询与数据带宽应分开解释：弱path registry只共享仍活着的路径，普通分量仍先
+进行后端lookup；解析还使用有界临时缓冲。复用活inode减少后端owner准备，不消除整个
+路径遍历。定点计数按固定工作量核对；原lmbench自适应文件数，不能只比较整命令耗时。
+原旧glibc的完整metadata选择需要兼容分支内核，可通过`--kernel`指定，不改变main身份。

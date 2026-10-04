@@ -40,7 +40,7 @@ BoarOS 是从零搭建、面向 OS Comp 能力建设的 C / 少量汇编内核�
 
 客体内固定 Alpine v3.22 RV64 GCC 14.2.0-r6 已在同一离线镜像上完成预处理、编译、汇编、静态链接和运行；固定 Linux 与 BoarOS 的五阶段状态、产物哈希和输出一致。同一编译流程也通过 tmpfs 工作目录；产物复制到根盘供比对，不代表 tmpfs 持久。另已完成原 GNU make4.4.1 默认FIFO jobserver的Lua5.4.3工程构建、增量、错误恢复和产物运行；其他项目与Rust尚未验收。
 
-固定BusyBox/libc-test最近完整清单仍为228项、227项双侧通过的历史结果；此前环境补全验收原BusyBox包装器，55/55子项成功，dmesg/RTC及df根盘内容另做真实核对。当前通用ABI差分1254条匹配，终端另有同ELF的107条差分记录；完整清单和本轮选择集合分别见[程序清单](docs/learning/user-program-inventory.md)。成本门禁见[单核规模回归](docs/learning/single-hart-scale.md)。
+固定BusyBox/libc-test最近完整清单仍为228项、227项双侧通过的历史结果；此前环境补全验收原BusyBox包装器，55/55子项成功，dmesg/RTC及df根盘内容另做真实核对。当前通用ABI差分1317条匹配，终端另有同ELF的107条差分记录；完整清单和本轮选择集合分别见[程序清单](docs/learning/user-program-inventory.md)。成本门禁见[单核规模回归](docs/learning/single-hart-scale.md)。
 
 ## 构建与验证
 
