@@ -25,7 +25,7 @@ BoarOS 是从零搭建、面向 OS Comp 能力建设的 C / 少量汇编内核�
 | 缓存与存储 | read/write/private fault 共用文件页、inode 脏范围与定向写回、OFD 错误观察、`fsync/fdatasync/O_SYNC/O_DSYNC`；VirtIO legacy/modern 多设备独立 IRQ/队列、每实例页缓存/worker、八 span 批量发布与 flush 屏障 | ordered journal/replay、durable commit 与后续 checkpoint、持久 orphan；恢复承诺限于已验证块模型，已接入阈值驱动后台写回与 2%/4% 空闲水位回收，无周期清脏 |
 | 串口终端 | DTB ns16550 IRQ＋worker，ttyS0/console/tty、canonical/raw、termios、VMIN/VTIME、控制终端和前后台作业；原BusyBox ash/stty | 无客体PTY、termios2、其他行规程、break生成或完整modem控制；固定root、单hart |
 | 内核日志 | 从启动保存16KiB真实内核日志、完整klogctl 0–10、消费式阻塞读、清空及console级别控制 | 当前不可变root权限模型；用户console输出与日志分离，无/dev/kmsg接口 |
-| 身份与资源 | 单用户 root 的 UID/GID 查询；线程组共享并执行 NOFILE/STACK，fork 继承、exec 保留 | 无凭据变更/完整权限；fd 硬容量 1024、栈硬容量 8 MiB；其他有效 limit 返回 `ENOTSUP` |
+| 身份与资源 | 单用户 root 的 UID/GID 查询；线程组共享并执行 NOFILE/STACK，fork 继承、exec 保留 | 无chown系列、凭据变更/完整权限；fd 硬容量 1024、栈硬容量 8 MiB；其他有效 limit 返回 `ENOTSUP` |
 | 平台与网络 | RISC-V QEMU 真实根盘可配置 PID 1（默认 `/init`） 与 musl 用户态；单 hart IPv4/IPv6 UDP/TCP loopback、双栈监听、连接选项、半关闭与向量消息，固定 lwIP 2.2.1 raw API，AF_UNIX socketpair；legacy/modern VirtIO-net、静态 IPv4/ARP、有界分片重组与隔离宿主双向 TCP/HTTP，custom pbuf RX | 无命名 AF_UNIX 端点、外部 IPv6、公网/DHCP/DNS/TLS、LoongArch、实板或多核验证 |
 
 单 hart 存储等待已由运行期 IRQ 唤醒：两个不同文件冷读可同时在途，等待期间计算与无关缓存命中继续执行；OFD、inode、后端事务与退出清理各自保留 owner。八槽乱序完成、flush 屏障和超时 reset 在 legacy/modern、writeback/writethrough 四种组合验收，见[可睡眠存储](docs/learning/sleepable-storage.md)。
@@ -136,4 +136,8 @@ CPU线补了默认关闭的有限诊断。Lua窗口中，选定heap清零/搬迁
 内层经过约0.170秒，不能解释170秒窗口。保守宽字候选虽改善对齐微实验，原工程
 三次构建没有收益，**未启用到main**；生产保留字节实现与诊断，见
 [实际工作与候选判断](docs/learning/offline-toolchain-probe.md#内存操作的有限归因与未上线候选2026-10-03)。
-下一应用候选为PTY＋原BusyBox script，范围另行确认；不因理论先进或微实验更快自动上线。
+近期建议先补真实文件所有权和局部ABI纠错；PTY＋原BusyBox script保留为应用候选，
+范围另行确认。原生accept4、O_PATH和路径truncate仍缺；原LTP准备依赖、旧libc包装、
+镜像环境与目标接口失败分开，不能由遍历结束宣称完整兼容。
+性能候选包括元数据路径、短睡眠deadline和协议背压；按真实工作量选择一项，不因理论
+先进或微实验更快自动上线，见[证据读法](docs/learning/user-program-inventory.md#性能结果必须对应实际工作)。

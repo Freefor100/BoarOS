@@ -44,6 +44,16 @@ syscall 层的 `clock_gettime(113)`、`clock_getres(114)` 支持 `CLOCK_REALTIME
 
 当前限制：无 NTP/阶跃调整、无 CPU-time clockid；timekeeper只在启动采样RTC，此后由CSR换算推进，用户RTC_RD_TIME仍读取设备当前值；无 SMP timekeeper 写入协议。
 
+fine时钟和deadline换算精度不等于到期唤醒精度。普通blocked deadline由timer路径
+检查；`kernel/sched/scheduling.c::scheduler_rearm_timer`的额外SBI事件目前只考虑
+实时预算和RR时间片，没有纳入最早睡眠deadline。因此短睡眠可能等到下一次100Hz
+tick才被发现，换成更高优先级或不同ready策略不能让尚未唤醒的任务提前运行。
+提高HZ与按最早deadline重装timer是待确认的两种取舍，涉及IRQ成本、取消和对象复用。
+
+`times(153)`与proc的user/kernel统计来自timer采样：trap按当时的U/S状态记账，
+不是逐段结算的运行时间。频繁短syscall、关中断与延迟tick会影响归属，不能把
+`tms_stime=0`解释成没有内核工作；CPU-time clock或PROF timer扩展前需核对该边界。
+
 Goldfish的真实墙钟另由10:135 RTC字符后端提供只读RTC_RD_TIME；UTC转换、OFD独占和限制见[文件设备](kernel-files.md#仅读rtc与ofd设备资格)。这没有增加RTC写入或clock_settime能力。
 
 ## 应用 alarm 与进程组实时时间定时器
