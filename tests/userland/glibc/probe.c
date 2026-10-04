@@ -53,6 +53,23 @@ static void *run_thread(void *argument)
     probe->value = program_tls;
     return (void *)0x1234;
 }
+
+struct cancel_probe { int ready[2], blocked[2], cleaned; };
+static void cancel_cleanup(void *argument)
+{
+    ((struct cancel_probe *)argument)->cleaned = 1;
+}
+
+static void *cancel_thread(void *argument)
+{
+    struct cancel_probe *probe = argument;
+    char byte;
+    pthread_cleanup_push(cancel_cleanup, probe);
+    if (write(probe->ready[1], "r", 1) != 1) _exit(96);
+    (void)read(probe->blocked[0], &byte, 1);
+    pthread_cleanup_pop(1);
+    return 0;
+}
 #endif
 
 int main(void)
@@ -81,6 +98,17 @@ int main(void)
     if (joined != (void *)0x1234 || probe.value != 19 ||
         program_tls != 13 || library_bump() != 34) return 24;
     EMIT("GLIBC PTHREAD TLS OK\n");
+
+    struct cancel_probe cancel = {0};
+    char byte;
+    if (pipe(cancel.ready) != 0 || pipe(cancel.blocked) != 0 ||
+        pthread_create(&thread, 0, cancel_thread, &cancel) != 0) return 27;
+    if (read(cancel.ready[0], &byte, 1) != 1 ||
+        pthread_cancel(thread) != 0 || pthread_join(thread, &joined) != 0 ||
+        joined != PTHREAD_CANCELED || !cancel.cleaned) return 28;
+    for (unsigned i = 0; i < 2; i++)
+        if (close(cancel.ready[i]) != 0 || close(cancel.blocked[i]) != 0) return 29;
+    EMIT("GLIBC PTHREAD CANCEL OK\n");
 
     struct sigaction action = {.sa_handler = signal_handler};
     if (sigemptyset(&action.sa_mask) != 0 ||
