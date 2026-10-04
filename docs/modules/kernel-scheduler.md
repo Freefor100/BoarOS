@@ -29,6 +29,13 @@ OTHER 保留 100 Hz tick 轮转，内核 worker 使用 OTHER。FIFO/RR 的用户
 
 ready 节点独立于 blocked/cleanup 链。全局优先级排序双链保留遍历视图，100 个等级各存 head/tail；同级插入、OTHER 尾追加、删除和选取均 O(1)，新增空的中间等级最多扫描 99 个等级，不扫描任务数。RT 被节流时只取 OTHER 队首；没有 OTHER 则 idle，不能借机运行已耗尽的 RT。
 
+退出在发布 completion、清 TID 并唤醒等待者后，若已注册 cleanup worker，按同一
+ready 策略直接选择下一任务。退出栈只切离，回收仍由 worker 或 join owner 在可信栈
+执行；不能强制返回 idle，使已经 ready 的 joiner 在 `wfi` 中等待下一次 timer。
+没有 cleanup worker 的模块 fixture 继续返回负责回收的 idle。
+`test-scheduler-cases-riscv` 在未启动 timer 时验证退出、join 和清理的连续进展，
+以及除启动 owner 所持 cleanup worker 外的页回到基线。
+
 全局预算默认 period=1,000,000us、runtime=950,000us，仅运行中的 FIFO/RR 扣费，阻塞及 idle 不扣。周期补充不积累旧余额；runtime=-1 禁用节流，0 不允许运行 RT。控制更新在 IRQ 临界区先结算旧配置下的实际运行，校验 period>0、runtime>=-1 且 runtime<=period（-1除外）、两值均不超过 INT_MAXus。runtime 修改不清消费；相同 period 写入不重开周期，改变 period 时从当前时刻建立新长度但保留已消费值。proc 控件见 [procfs](procfs.md)。
 
 硬件 timer 取普通 tick、RT 配额耗尽/补充和 RR 片尾中的最早期限。预算 IRQ 可以返回 elapsed_ticks=0；此时仍重新记账调度，但不推进 tick、CPU tick 统计或 coarse clock。实际运行时间由切换、策略/配置修改和 timer 入口结算，精度受关中断临界区与模拟器 IRQ 延迟限制。用户访问复制与可睡眠路径不放在调度状态锁内。
