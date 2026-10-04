@@ -833,6 +833,39 @@ Finish:
  *
  * @return Error code
  */
+int ext4_xattr_release_inode_block(struct ext4_inode_ref *inode_ref)
+{
+	struct ext4_fs *fs = inode_ref->fs;
+	ext4_fsblk_t lba = ext4_inode_get_file_acl(inode_ref->inode, &fs->sb);
+	if (!lba) return EOK;
+	struct ext4_block block;
+	int ret = ext4_trans_block_get(fs->bdev, &block, lba);
+	if (ret != EOK) return ret;
+	struct ext4_xattr_header *header = EXT4_XATTR_BHDR(&block);
+	uint32_t references = to_le32(header->h_refcount);
+	uint64_t sectors = ext4_inode_get_blocks_count(&fs->sb, inode_ref->inode);
+	uint32_t charge = ext4_sb_get_block_size(&fs->sb) / 512U;
+	if (!ext4_xattr_is_block_valid(inode_ref, &block) || !references ||
+	    sectors < charge) {
+		ret = EIO;
+	} else if (references > 1) {
+		/* 只归还此 inode 的 EA 引用，不释放其他 inode 仍拥有的块。 */
+		header->h_refcount = to_le32(references - 1U);
+		ext4_xattr_set_block_checksum(inode_ref, lba, header);
+		ret = ext4_trans_set_block_dirty(block.buf);
+	}
+	int release = ext4_block_set(fs->bdev, &block);
+	if (ret == EOK) ret = release;
+	if (ret != EOK) return ret;
+	if (references == 1) ret = ext4_balloc_free_block(inode_ref, lba);
+	else ext4_inode_set_blocks_count(&fs->sb, inode_ref->inode, sectors - charge);
+	if (ret == EOK) {
+		ext4_inode_set_file_acl(inode_ref->inode, &fs->sb, 0);
+		inode_ref->dirty = true;
+	}
+	return ret;
+}
+
 static int ext4_xattr_try_free_block(struct ext4_inode_ref *inode_ref)
 {
 	ext4_fsblk_t xattr_block;

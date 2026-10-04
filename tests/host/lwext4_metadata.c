@@ -531,7 +531,7 @@ static void times_test(struct ext4_fs *fs, bool readonly)
           !ext4_inode_get_links_cnt(&after));
     CHECK(ext4_fclose(&f)==EOK);CHECK(ext4_orphan_free("/",unlinked)==EOK);
 }
-static void owner_shared_test(struct ext4_fs *fs)
+static void owner_shared_test(struct ext4_fs *fs, bool unlink_shared)
 {
     uint32_t cap[5]={0x02000000,1,0,0,0}; unsigned char padding[48]={1};size_t length;
     ext4_file first, second;struct ext4_inode initial, other, changed;
@@ -558,6 +558,15 @@ static void owner_shared_test(struct ext4_fs *fs)
     ext4_inode_set_blocks_count(&fs->sb,ref.inode,ext4_inode_get_blocks_count(&fs->sb,ref.inode)+ext4_sb_get_block_size(&fs->sb)/512);
     ref.dirty=true;CHECK(ext4_fs_put_inode_ref(&ref)==EOK && ext4_transaction_end("/")==EOK);
     CHECK(ext4_fraw_inode_fill(&second,&other)==EOK);
+    if(unlink_shared) {
+        CHECK(ext4_fclose(&first)==EOK && ext4_fremove("/file")==EOK);
+        CHECK(ext4_getxattr("/owner-other","security.capability",19,padding,sizeof(padding),&length)==EOK && length==sizeof(cap) && !memcmp(padding,cap,sizeof(cap)));
+        CHECK(ext4_block_get(fs->bdev,&block,shared)==EOK);
+        memcpy(&header,block.data,sizeof(header));
+        CHECK(to_le32(header.refcount)==1 && ext4_block_set(fs->bdev,&block)==EOK);
+        CHECK(ext4_fclose(&second)==EOK && ext4_fremove("/owner-other")==EOK);
+        return;
+    }
     CHECK(ext4_transaction_begin("/")==EOK && ext4_file_set_owner(&first,70001,80002)==EOK);
     CHECK(ext4_transaction_abort("/",ECANCELED)==ECANCELED);
     CHECK(ext4_fraw_inode_fill(&first,&changed)==EOK && !memcmp(&changed,&initial,sizeof(initial)));
@@ -764,7 +773,8 @@ int main(int argc,char **argv)
     else if(!strcmp(argv[2],"group-pipeline") || !strcmp(argv[2],"group-commit-crash")) {group_pipeline(dev.fs,!strcmp(argv[2],"group-commit-crash"));if(!strcmp(argv[2],"group-commit-crash"))return 0;}
     else if(!strcmp(argv[2],"group-write") || !strcmp(argv[2],"group-flush")) {CHECK(argc==4);group_fault(dev.fs,argv[2],strtoul(argv[3],NULL,10));return 0;}
     else if(!strcmp(argv[2],"group-recovery"))group_verify_recovery(dev.fs);
-    else if(!strcmp(argv[2],"owner-shared"))owner_shared_test(dev.fs);
+    else if(!strcmp(argv[2],"owner-shared") || !strcmp(argv[2],"owner-shared-unlink"))
+        owner_shared_test(dev.fs,!strcmp(argv[2],"owner-shared-unlink"));
     else if(!strcmp(argv[2],"owner") || !strcmp(argv[2],"owner-ro"))owner_test(dev.fs,readonly);
     else if(!strcmp(argv[2],"verify-owner")) {
         ext4_file f;struct ext4_inode ino;

@@ -60,7 +60,9 @@ ext4 UID/GID使用两组16位磁盘字段；仅更新低位会让大ID错误变�
 非目录chown还须移除capability属性，与UID/GID、mode、ctime共用操作undo。
 属性可能在inode内，也可能位于有引用计数的外部EA块；共享块须先复制，旧块
 refcount、新块checksum、inode占有扇区数和释放都必须一致。操作失败只回滚本次
-修改，不能删除另一inode的共享属性，也不能失去缓冲owner。独立e2fsck核对磁盘
+修改，不能删除另一inode的共享属性，也不能失去缓冲owner。inode删除同样只
+归还自己的EA引用，最后引用才释放物理块；否则属性内容仍可能读到，但位图已经
+把块误记为空闲，后续复用才暴露损坏。独立e2fsck核对磁盘
 格式，raw-syscall差分核对可见语义，两类证据不能互相替代。
 
 重建用`./tests/lwext4-metadata-host.sh ownership`和`make test-diff-abi-riscv`。

@@ -20,7 +20,7 @@ for block in 1024 4096; do
         mkfs.ext4 -q -F -b "$block" -I "$inode" "$work/base.img"
         overhead=$(dumpe2fs -h "$work/base.img" 2>/dev/null | sed -n 's/^Overhead clusters:[[:space:]]*//p')
         "$work/probe" "$work/base.img" seed
-        for mode in owner owner-ro owner-shared; do
+        for mode in owner owner-ro owner-shared owner-shared-unlink; do
             cp "$work/base.img" "$work/test.img"
             "$work/probe" "$work/test.img" "$mode" "$overhead"
             check_fs "$work/test.img"

@@ -58,7 +58,8 @@ namespace锁，fd形式无需重新查路径。`ext4_file_set_owner()`将UID/GID
 ctime与非目录的capability属性删除放在同一undo/日志事务中；成功后更新node的mode
 缓存和同步目标，后续I/O失败仍由原mount owner保留。UID/GID按磁盘low/high 16位
 合成32位。新建节点在父inode仍被引用时继承setgid目录的GID，初始目录权限设置
-保留继承的setgid；普通chmod仍可明确清除它。匿名pipe元数据不经过ext4。
+保留继承的setgid；普通chmod仍可明确清除它。匿名pipe元数据不经过ext4。inode最后释放时，外部EA块先归还引用，只有
+最后引用才释放块；共享块的refcount、校验和与各inode占有的扇区数同事务更新。
 
 ## 文件节点与页缓存
 
@@ -88,7 +89,7 @@ miss 路径先分配并清零页，再通过 node 的无 offset 副作用 `pread
 
 `ext4_journal_group_enable/service/drain` 由可写 journal mount 的独立 joinable 线程驱动；根启动与动态磁盘挂载启动该线程，宿主 fixture 显式推进同一引擎。操作仍各自持有 before-image，成功后合入挂载点 running transaction；同块修改合并，后一次失败只回滚自身。封口把 metadata 和 ordered data 复制到预留的不可变版本，提交准备使用预留日志缓冲和挂载期固定映射；设备提交和 checkpoint 不再读取可变 bcache。未提交 owner 通过 `journal_pending` 禁止隐式 home writeback，块与 inode 的释放范围保留到 checkpoint 屏障和日志起点更新完成，分配器跳过这些范围。首脏 100 ms 或 256 KiB 镜像是软封口条件，同步目标与强制请求另触发封口，块载荷按恰好一个文件系统块单独分配，控制记录按实际尺寸档容量分配；同运行块复用 after/log 预留，本次 undo 仍独立。每个 home buffer 在第一个版本 pin 时计费，最后一个版本释放时撤销计费。空闲镜像和控制记录池最多保留 min(256KiB, 预算/4)，也计入硬预算；不足时先释放空闲资源。固定日志映射也纳入挂载点预算，运行时上限为 min(4MiB, RAM/32)。运行组之外最多两组冻结 FIFO 和一组提交中，commit 屏障后独立发布 durable；已提交 FIFO 留存 metadata 版本、日志空间与 quarantine 到 checkpoint 完成。worker 优先就绪提交；空队列、回收压力或累计四组 checkpoint 时执行最多八组连续 checkpoint 批次，完成后重新选择。内部等待区分 sealed/durable/checkpoint；软阈值只封口，封口 FIFO 满才等 sealed，实际预算、日志 credit 或复用不足才等 checkpoint。页交接写入在操作前预留 data undo/version/home 与有界 metadata 路径的容量；私有原子操作内不释放修改锁等待。同步返回具有 commit 持久化保证。S6–S8 已通过宿主版本/环绕/断电、真实 IRQ 组提交及最终 lwext4/SQLite DELETE/WAL 恢复矩阵、双盘隔离；S9 测量完成但收益和 musl 普通读进展未达当时预期，见[本轮验收](../learning/cost-baseline.md#s9-存储流水线验收2026-10-01)。旧 S5 的 lwext4、SQLite DELETE/WAL 恢复、双盘与消费者结论见[验收分析](../learning/cost-baseline.md#异步日志与组提交验收2026-10-01)。
 
-`make test-lwext4-group-host` 使用实际引擎与独立设备计数，覆盖 32 次时间修改合成一批、嵌套 abort、后操作各预留点 OOM、提交期间同块新修改、冻结后禁止新分配、1/4 KiB 文件系统的 WRITE/FLUSH 失败与重启恢复。命名空间回归暂扣提交进度，核对正常容量下的 truncate、空文件/数据文件删除、仍打开的无链接文件及 inode 复用隔离。`make test-lwext4-reclaim-host` 在同组回收与意图先 durable、checkpoint 暂未执行的跨组回收上，逐实际 I/O 边界检查丢失/重排、两次恢复和文件系统一致性。默认同步路径的 metadata/几何/错误原子性回归继续由 `make test-lwext4-metadata-host` 保护。
+`make test-lwext4-group-host` 使用实际引擎与独立设备计数，覆盖 32 次时间修改合成一批、嵌套 abort、后操作各预留点 OOM、提交期间同块新修改、冻结后禁止新分配、1/4 KiB 文件系统的 WRITE/FLUSH 失败与重启恢复。命名空间回归暂扣提交进度，核对正常容量下的 truncate、空文件/数据文件删除、仍打开的无链接文件及 inode 复用隔离。`sh tests/lwext4-reclaim-host.sh` 在同组回收与意图先 durable、checkpoint 暂未执行的跨组回收上，逐实际 I/O 边界检查丢失/重排、两次恢复和文件系统一致性。默认同步路径的 metadata/几何/错误原子性回归继续由 `make test-lwext4-metadata-host` 保护。
 
 同阶段的冻结 ordered-data、日志和 checkpoint 使用 `ext4_blocks_set_batch()`，最多八项，经可选 `bwrite_batch` 回调交给块层；没有批量回调时按序回退。每项完整预检后才发布，同批不包含重叠 LBA；跨 checkpoint 组的同 LBA 先完成旧版本，再发布新版本。阶段仍排空并保留原屏障，镜像 owner 持有到所有 DMA 完成或 reset 确认停止。热读 relatime 先持 inode/backend 共享资格查询；无更新直接释放，需更新时先释放共享资格，再取得独占资格重查当前时间，不做锁升级。读结果仍不受 atime I/O 失败覆盖。
 

@@ -55,6 +55,7 @@
 #include <ext4_blockdev.h>
 #include <ext4_super.h>
 #include <ext4_crc32.h>
+#include <ext4_xattr.h>
 #include <ext4_block_group.h>
 #include <ext4_balloc.h>
 #include <ext4_bitmap.h>
@@ -1178,11 +1179,14 @@ finish:
 	ext4_fsblk_t xattr_block =
 	    ext4_inode_get_file_acl(inode_ref->inode, &fs->sb);
 	if (xattr_block) {
-		int rc = ext4_balloc_free_block(inode_ref, xattr_block);
+#if CONFIG_XATTR_ENABLE
+		int rc = ext4_xattr_release_inode_block(inode_ref);
+#else
+		/* 无属性解析器不能证明引用数，保留 owner 并拒绝破坏共享块。 */
+		int rc = ENOTSUP;
+#endif
 		if (rc != EOK)
 			return rc;
-
-		ext4_inode_set_file_acl(inode_ref->inode, &fs->sb, 0);
 	}
 
 	/* Free inode by allocator */
