@@ -1260,6 +1260,15 @@ int kernel_vfs_append(struct kernel_vfs_file *file,
     return 0;
 }
 
+int kernel_vfs_path_truncate(struct kernel_vfs_path *path, uint64_t size)
+{
+    if (!path || !path->references) return -KERNEL_EINVAL;
+    VFS_PATH_PIN(path_pin, path);
+    if ((kernel_vfs_path_mode(path) & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFDIR)
+        return -KERNEL_EISDIR;
+    return kernel_vfs_ftruncate(&path->file, size);
+}
+
 int kernel_vfs_ftruncate(struct kernel_vfs_file *file,
                          uint64_t size)
 {

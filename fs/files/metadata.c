@@ -65,6 +65,27 @@ static enum kernel_files_status copy_metadata_path(
            access == KERNEL_UACCESS_STATUS_TOO_LONG ? KERNEL_FILES_STATUS_OK : KERNEL_FILES_STATUS_STATE;
 }
 
+enum kernel_files_status kernel_files_truncate(
+    struct kernel_files *files, const struct kernel_fs_context *fs,
+    struct kernel_mm *mm, uint64_t user_path, int64_t length,
+    int64_t *linux_result)
+{
+    if (!kernel_files_is_live(files) || !kernel_fs_context_is_live(fs) ||
+        !mm || !linux_result) return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
+    if (length < 0) {
+        *linux_result = -KERNEL_EINVAL;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    KERNEL_FILES_PATH_SCOPE(path);
+    int result;
+    enum kernel_files_status status = copy_metadata_path(files, fs, mm,
+        KERNEL_FS_AT_FDCWD, user_path, 0, &path, &result);
+    if (status != KERNEL_FILES_STATUS_OK) return status;
+    if (!result) result = kernel_vfs_path_truncate(path, (uint64_t)length);
+    *linux_result = result;
+    return KERNEL_FILES_STATUS_OK;
+}
+
 enum kernel_files_status kernel_files_utimensat(
     struct kernel_files *files, const struct kernel_fs_context *fs,
     struct kernel_mm *mm, int64_t dirfd, uint64_t user_path,

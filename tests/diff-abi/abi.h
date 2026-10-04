@@ -53,6 +53,7 @@ void abi_sync_cases(void);
 void abi_namespace_cases(void);
 void abi_metadata_cases(void);
 void abi_path_only_cases(void);
+void abi_path_truncate_cases(void);
 void abi_ownership_cases(void);
 void abi_robust_cases(void);
 void abi_shared_mapping_cases(void);

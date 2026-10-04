@@ -300,6 +300,29 @@ enum kernel_syscall_status syscall_handle_readlinkat(
     return KERNEL_SYSCALL_STATUS_OK;
 }
 
+enum kernel_syscall_status syscall_handle_truncate(
+    struct kernel_task *caller, const struct kernel_syscall_request *request,
+    struct kernel_syscall_result *decoded)
+{
+    decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+    if ((int64_t)request->arguments[1] < 0) {
+        decoded->value = -KERNEL_EINVAL;
+        return KERNEL_SYSCALL_STATUS_OK;
+    }
+    struct kernel_files *files;
+    const struct kernel_fs_context *fs;
+    struct kernel_mm *mm;
+    int64_t result;
+    if (kernel_task_files_borrow(caller, &files) != KERNEL_TASK_STATUS_OK ||
+        kernel_task_fs_context_borrow(caller, &fs) != KERNEL_TASK_STATUS_OK ||
+        kernel_task_mm_borrow_mutable(caller, &mm) != KERNEL_TASK_STATUS_OK ||
+        kernel_files_truncate(files, fs, mm, request->arguments[0],
+            (int64_t)request->arguments[1], &result) != KERNEL_FILES_STATUS_OK)
+        return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    decoded->value = result;
+    return KERNEL_SYSCALL_STATUS_OK;
+}
+
 enum kernel_syscall_status syscall_handle_ftruncate(
     struct kernel_task *caller,
     const struct kernel_syscall_request *request,

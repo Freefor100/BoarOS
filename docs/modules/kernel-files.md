@@ -360,3 +360,9 @@ pipe端点先关闭一次，真实VFS关闭错误继续归mount清理，不重�
 FIFO不可seek或fsync，节点由文件系统同步持久化，传输内容永不恢复。
 `make test-fifo-riscv`以同ELF核对Linux的身份、打开、poll/select/epoll、时间、信号、
 fd满、只读挂载与重启；`make test-files-riscv`另注入对象/缓冲OOM并验证重试与回收。
+
+RV64 `truncate(45)`复制完整pathname后取得稳定path；相对cwd、绝对路径和
+末端符号链接沿共同解析器，长度与错误顺序由`path_only.c`核对。
+`ftruncate/O_TRUNC/truncate`共用后端大小、时间、capability清理与映射失效；
+`make test-lwext4-metadata-host`包含共享EA、操作abort和持久化格式核对，
+`sh tests/lwext4-metadata-host.sh truncate`可只检查新增属性边界。

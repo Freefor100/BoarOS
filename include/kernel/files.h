@@ -350,6 +350,11 @@ enum kernel_files_status kernel_files_lseek(
     uint64_t whence,
     int64_t *linux_result);
 
+enum kernel_files_status kernel_files_truncate(
+    struct kernel_files *files, const struct kernel_fs_context *fs,
+    struct kernel_mm *mm, uint64_t user_path, int64_t length,
+    int64_t *linux_result);
+
 enum kernel_files_status kernel_files_ftruncate(
     struct kernel_files *files,
     int64_t fd,

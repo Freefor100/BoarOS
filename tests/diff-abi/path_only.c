@@ -76,3 +76,26 @@ void abi_path_only_cases(void)
     abi_record("path.fork",0,-1,-1,status,0,0);
     SC1(57,replacement);SC1(57,dup);SC1(57,sym);SC1(57,dir);SC1(57,path);SC1(57,fd);
 }
+
+void abi_path_truncate_cases(void)
+{
+    long fd=abi_open("/path-truncate",2|64|128);abi_require(fd>=0);
+    abi_require(SC3(64,fd,"abcdefgh",8)==8 && SC2(52,fd,06755)==0);
+    record("truncate.path-negative-fault",SC2(45,-1,-1));
+    record("truncate.path-fault",SC2(45,-1,0));
+    record("truncate.path-missing",SC2(45,"/no-path-truncate",0));
+    record("truncate.path-directory",SC2(45,"/",0));
+    record("truncate.path-device",SC2(45,"/dev/null",0));
+    record("truncate.path-empty",SC2(45,"",0));
+    abi_require(SC3(36,"/path-truncate",-100,"/path-truncate-sym")==0);
+    long r=SC2(45,"/path-truncate-sym",4);struct abi_stat st;
+    abi_require(SC2(80,fd,&st)==0);
+    abi_record("truncate.path-symlink",r,st.size,-1,0,&st.mode,sizeof(st.mode));
+    r=SC2(45,"path-truncate",4);abi_record("truncate.path-same",r,abi_size(fd),-1,0,0,0);
+    r=SC2(45,"/path-truncate",8193);abi_record("truncate.path-extend",r,abi_size(fd),-1,0,0,0);
+    char tail[8];long got=SC4(67,fd,tail,sizeof(tail),8190);
+    abi_record("truncate.path-tail",got,abi_size(fd),-1,0,tail,got>0?(usize)got:0);
+    r=SC2(45,"/path-truncate",0);abi_record("truncate.path-zero",r,abi_size(fd),-1,0,0,0);
+    record("truncate.path-running-executable",SC2(45,"/init",0));
+    SC1(57,fd);SC3(35,-100,"/path-truncate",0);SC3(35,-100,"/path-truncate-sym",0);
+}

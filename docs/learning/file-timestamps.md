@@ -192,3 +192,8 @@ python3 -B tests/runtime-diagnostics.py --output build/coarse-original-diagnosti
 不能因身份可查询就授予数据访问。固定Linux的`fs/open.c:build_open_how`
 先掩去open/openat的其他位，`build_open_flags`的严格校验只适用于已经构造的how；
 不能拿openat2的拒绝规则套用普通open。相关差分入口是`path_only.c`。
+
+截断的特权处理与chown不同。固定root对应`fs/attr.c:setattr_should_drop_suidgid`
+的CAP_FSETID边界，保留set-ID；`fs/open.c:do_truncate`仍检查
+`dentry_needs_remove_privs`，因此capability必须清理。属性清理须在大小变更
+的同一undo内，尤其保护共享外部EA块及同长度请求。路径入口无须临时用户fd。

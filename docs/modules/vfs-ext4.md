@@ -299,3 +299,10 @@ VFS node按mount/inode共享，fifo_pipe是短IRQ区保护的弱关联；候选�
 重查并复用竞争者已发布的pipe。打开会合不持VFS锁睡眠，节点引用保持到端点释放后。
 类型/umask、目录项、hardlink/rename/unlink及重启见`make test-fifo-riscv`；
 相关创建/元数据入口由`make test-lwext4-metadata-host`覆盖。
+
+路径truncate持有解析后的path并直接调用共同截断入口，不安装临时用户fd。
+rank15整次操作锁、inode锁、缓存写回、尾页清零和跨MM失效沿原路径；
+目录返回EISDIR，非普通节点EINVAL，负长度在访问pathname前EINVAL。
+共同ext4截断在原操作undo内删除capability，包含同长度请求；固定root的
+CAP_FSETID语义保留set-ID，不能套用chown清位规则。共享外部EA块继续按引用计数
+复制或释放，失败只回滚本操作；日志、orphan和持久化顺序不变。

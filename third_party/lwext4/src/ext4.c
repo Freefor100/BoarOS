@@ -2852,6 +2852,10 @@ static int ext4_ftruncate_no_lock(ext4_file *file, uint64_t size)
 
 	old_size = ext4_inode_get_size(sb, ref.inode);
 	file->fsize = old_size;
+	/* 固定 root 保留 set-ID；capability 与大小修改共用操作 undo。 */
+	r = ext4_xattr_remove(&ref, 6, "capability", 10);
+	if (r == ENODATA) r = EOK;
+	if (r != EOK) goto Finish;
 	if (old_size == size)
 		goto Finish;
 

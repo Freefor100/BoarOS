@@ -200,6 +200,7 @@ void abi_main(const unsigned long *initial_stack)
     }
     text("ABI BEGIN 1"); flush();
     abi_path_only_cases();
+    abi_path_truncate_cases();
 #ifndef ABI_PATH_ONLY
     mode_cases(); sparse_cases(); abi_shared_mapping_cases();
     abi_shared_file_mapping_cases();

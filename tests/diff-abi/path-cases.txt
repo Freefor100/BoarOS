@@ -37,3 +37,15 @@ path.empty
 path.bad-input
 path.proc-reopen
 path.fork
+truncate.path-negative-fault
+truncate.path-fault
+truncate.path-missing
+truncate.path-directory
+truncate.path-device
+truncate.path-empty
+truncate.path-symlink
+truncate.path-same
+truncate.path-extend
+truncate.path-tail
+truncate.path-zero
+truncate.path-running-executable
