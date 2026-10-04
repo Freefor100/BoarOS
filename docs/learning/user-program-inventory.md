@@ -112,6 +112,23 @@ python3 tests/program-inventory/run.py --output build/p4d-full-20260925
 
 ## 可复用的调试结论
 
+### 从原ELF到内核，逐层核对失败归属
+
+程序名和errno不能单独决定归因。先检查测试构建时是否编入目标分支，再核对libc
+包装器实际传给内核的系统调用与参数、内核支持集合，最后比较断言和参考版本。
+LTP 20240524 的 `ksm02`、`io_cancel02` 有缺少libnuma/libaio开发依赖时直接TCONF的
+条件编译分支；内核新增功能或运行时安装库，不能开启原ELF中已被编译掉的测试。
+固定来源为 `references/oscomp-testsuits` 的pre-2025树中对应源码。
+
+原比赛镜像的musl `epoll_create` 包装器先将参数置零，再调用 `epoll_create1(0)`，
+丢弃了size；负size断言失败时，内核接收的是合法flags=0。原二进制应通过只读镜像
+提取与反汇编核对，不能拿另一个版本的musl源码代替实际输入，也不能在内核按程序名
+补回丢失参数。该输入问题不否定同一程序其他有效的epoll断言。
+
+旧LTP的 `epoll_ctl04` 要求嵌套过深返回EINVAL，而固定Linux 7.2
+`references/linux/fs/eventpoll.c` 的 `ep_loop_check` 失败路径返回ELOOP。记录版本差异，
+再决定是否存在内核错误；不能为了旧断言改变已经符合固定参考的errno。
+
 ### 先验证参考环境
 
 固定 Linux 的 `init/do_mounts.c` 在 `/init` 前挂载 devtmpfs，会遮住镜像中原有 `/dev/shm`。初次 `pthread_cancel_points` 的 shm_open 因此失败；错误诊断中的 write 又成为 pending cancellation 的取消点，隐藏了原错误。补齐可见目录和 tmpfs 后同一 Linux/ELF 通过。socket 访问 loopback 前同样需要真正启用接口。环境 setup 失败不算内核 ABI 差异。
