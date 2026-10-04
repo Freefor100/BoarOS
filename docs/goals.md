@@ -25,11 +25,11 @@ N3已经交付：legacy/modern VirtIO-net、受限DMA借用与复制回退、静
 
 ## 近期队列：文件元数据与路径接口
 
-已确认局部复用路线，以下均为待实现/验收任务，不把规划写成完成。
+局部复用、路径资格和共同截断已实现；剩余收口集中在匹配成本、原消费者与兼容入口。
 
-- [ ] 复用同一实例中已有活inode，消除临时后端打开；创建后按已取得句柄设置权限。
-- [ ] 实现只持路径身份的O_PATH，覆盖设备/FIFO不打开、目录fd、空路径、proc和末引用。
-- [ ] 接入路径truncate，复用共同截断、映射失效与错误owner，核对特权属性和恢复。
+- [x] 复用同一实例中已有活inode，消除临时后端打开；创建后按已取得句柄设置权限。
+- [x] 实现只持路径身份的O_PATH，覆盖设备/FIFO不打开、目录fd、空路径、proc和末引用。
+- [x] 接入路径truncate，复用共同截断、映射失效与错误owner，核对特权属性和恢复。
 - [ ] 匹配旧/新元数据负载及原lmbench/所选四进程iozone，解释实际收益、同步和最终排空。
 
 不新增常驻目录项缓存或改变事务、checkpoint、TCP窗口及调度策略。TCP仅做最新
@@ -91,7 +91,7 @@ glibc四进程整命令仍增加0.73%。该轮的prepare读取、1547次FLUSH和
 | 原BusyBox55/55 | 此前日志/RTC/根设备补全已验收；完整228项没有在本轮网络工作中重跑 |
 | iperf/netperf | 22项受控原ELF完成；原iperf连续脚本的listener重建竞态在Linux也存在，原脚本结果和受控验收分别报告 |
 | LTP执行角色 | 比赛目录遍历不是上游runtest；控制器helper、上游禁用shmat1和有限shm_test分开。原libc的EINTR重试、NULL栈clone、缺unwind库或账户可先于目标syscall阻塞，见[程序证据](learning/user-program-inventory.md#ltp的准备依赖与libc边界) |
-| 所有权与接口子集 | fchown/fchownat已接入真实元数据；完整凭据/权限、O_PATH、原生accept4、路径truncate仍有缺口；CPU-time clock、VIRTUAL/PROF timer、pipe容量操作、扩展clone/futex按具体子语义核对，不把已有整个模块记为缺失 |
+| 所有权与接口子集 | fchown/fchownat已接入真实元数据；O_PATH和路径truncate已接入；完整凭据/权限、原生accept4仍有缺口；CPU-time clock、VIRTUAL/PROF timer、pipe容量操作、扩展clone/futex按具体子语义核对，不把已有整个模块记为缺失 |
 | 路径truncate | 尚未实现；本轮错误恢复使用已交付ftruncate，原Lua/GCC/make保持不变 |
 | 用户内存/信号 | mremap、按操作madvise、mlock、sigaltstack、实时信号队列、共享文件/PI futex待真实应用需求触发 |
 | 系统与平台 | 固定root查询不等于完整凭据/权限；无PTY/termios2/完整modem控制、外部IPv6/DNS/TLS、公网配置、SMP/实板、kernel-la，不声明完整Linux兼容或硬实时 |

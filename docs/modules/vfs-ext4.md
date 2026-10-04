@@ -308,3 +308,14 @@ rank15整次操作锁、inode锁、缓存写回、尾页清零和跨MM失效沿�
 共同ext4截断在原操作undo内删除capability，包含同长度请求；固定root的
 CAP_FSETID语义保留set-ID，不能套用chown清位规则。共享外部EA块继续按引用计数
 复制或释放，失败只回滚本操作；日志、orphan和持久化顺序不变。
+
+## 元数据成本复建
+
+`tests/cost-riscv.py --case metadata`复用既有统计，提供固定4096次stat/fstat/
+open窗口、2048次空文件创建删除，以及原lmbench的三种文件syscall和lat_fs、
+原iozone四进程(0,1)。open窗口逐次fstat校验身份，故包含校验成本；纯open/close
+成本由原lmbench对应项给出。路径持有与未持有分别测量，fstat本身必须持有fd。
+程序完成、显式同步和`ROOT_DRAIN_FIXTURE=1`的内部最终卸载分别记录。
+`--platform-config official`使用本地固定平台的1GiB、单hart、默认VirtIO、网卡和
+UTC RTC，不添加RNG；不是完整比赛Harness。原旧glibc使用兼容分支配置。
+关闭观测的重复启动与单次定点COST分别解释；原始输出和机器身份只进build。
