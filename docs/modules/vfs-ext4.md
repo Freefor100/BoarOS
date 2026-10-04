@@ -63,7 +63,9 @@ ctime与非目录的capability属性删除放在同一undo/日志事务中；成
 
 已有活inode的按身份打开在namespace保护下先检查mount错误，再取得该节点引用与
 新的file资格，保留实时size/mode；不先分配/打开临时后端对象再合并。节点registry
-仍为弱链，closed/retired节点不复用，没有新增长期缓存owner。普通文件创建后
+仍为弱链，closed/retired节点不复用，没有新增长期缓存owner。重新取得节点时，
+先持有独立引用再等待inode锁；最后缓存页可在锁交接后立即回收，namespace锁
+不能替代该生命周期引用。发布路径的候选合并也遵守这一边界。普通文件创建后
 用已取得的lwext4 handle设置mode，避免重新走pathname，外层操作undo与错误归属不变。
 `make test-vfs-riscv`以独立后端计数保护这两项可省工作及真实最后关闭的错误owner。
 

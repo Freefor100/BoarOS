@@ -1845,6 +1845,11 @@ int kernel_vfs_node_acquire(struct kernel_vfs_node *node)
     return 0;
 }
 
+static void release_node_pin(struct kernel_vfs_node **owner)
+{
+    if (*owner && kernel_vfs_node_release(owner)) __builtin_trap();
+}
+
 void kernel_file_mapping_register(struct kernel_file_mapping *mapping)
 {
     if (mapping == 0 || mapping->node == 0 || mapping->owner == 0 ||
@@ -2114,12 +2119,17 @@ static int vfs_open_raw(struct kernel_vfs_mount *mount,
         if (error) return error;
         for (struct kernel_vfs_node *node = instance->nodes; node; node = node->next) {
             if (node->inode != inode_number || node->retired || node->closed) continue;
+            if (node->references == UINT32_MAX) return -KERNEL_EOVERFLOW;
+            struct kernel_vfs_node *pin __attribute__((cleanup(release_node_pin))) = 0;
+            int pinned = kernel_vfs_node_acquire(node);
+            if (pinned) return pinned;
+            pin = node;
+            /* 等待锁之前独立持有节点，回收者可在锁交接后归还最后缓存引用。 */
             KERNEL_LOCK_SCOPE(node_guard);
             kernel_vfs_node_lock(node, &node_guard, 1);
-            if (node->references == UINT32_MAX || node->open_files == UINT32_MAX ||
+            if (node->open_files == UINT32_MAX ||
                 instance->external_files == UINT32_MAX) return -KERNEL_EOVERFLOW;
             /* 已有 owner 保证 inode 有效；新 file 只取得资格，不再临时打开后端。 */
-            node->references++;
             node->open_files++;
             instance->external_files++;
             file->private_data = node;
@@ -2128,6 +2138,7 @@ static int vfs_open_raw(struct kernel_vfs_mount *mount,
             file->mode = node->mode;
             file->state = VFS_FILE_STATE_LIVE;
             file->write_lease = file->exec_lease = 0;
+            pin = 0; /* 临时 pin 转为 file owner。 */
             return 0;
         }
     }
@@ -2270,6 +2281,17 @@ int kernel_vfs_node_writeback(struct kernel_vfs_node *node, uint64_t offset,
 }
 
 /* 后端已准备好私有 handle；同一实例的活 inode 只发布一个通用节点。 */
+static int discard_unpublished_node(struct kernel_vfs_node *node)
+{
+    struct kernel_vfs_instance *instance = node->instance;
+    int result = instance->ops->close_node(node);
+    if (result) {
+        node->next = instance->cleanup_nodes;
+        instance->cleanup_nodes = node;
+    } else (void)kernel_heap_release(instance->heap, node);
+    return result;
+}
+
 int kernel_vfs_publish_node(struct kernel_vfs_mount *mount,
     struct kernel_vfs_node *node, struct kernel_vfs_file *file, int creating)
 {
@@ -2277,25 +2299,32 @@ int kernel_vfs_publish_node(struct kernel_vfs_mount *mount,
     struct kernel_vfs_node *existing;
     node->instance = instance;
     for (existing = instance->nodes; existing; existing = existing->next)
-        if (existing->inode == node->inode && !existing->retired) break;
+        if (existing->inode == node->inode && !existing->retired && !existing->closed) break;
     if (existing) {
+        int pin_error = existing->references == UINT32_MAX ? -KERNEL_EOVERFLOW :
+                        kernel_vfs_node_acquire(existing);
+        struct kernel_vfs_node *pin __attribute__((cleanup(release_node_pin))) =
+            pin_error ? 0 : existing;
+        if (pin_error) {
+            int error = discard_unpublished_node(node);
+            return error ? error : pin_error;
+        }
         KERNEL_LOCK_SCOPE(existing_guard);
         kernel_vfs_node_lock(existing, &existing_guard, 1);
         int busy = creating && existing->exec_users;
-        int error = instance->ops->close_node(node);
-        if (error) {
-            node->next = instance->cleanup_nodes;
-            instance->cleanup_nodes = node;
-            return busy ? -KERNEL_ETXTBSY : error;
-        }
-        (void)kernel_heap_release(instance->heap, node);
+        int error = discard_unpublished_node(node);
+        if (error) return busy ? -KERNEL_ETXTBSY : error;
         if (busy) return -KERNEL_ETXTBSY;
-        if (existing->references == UINT32_MAX || existing->open_files == UINT32_MAX)
+        if (existing->open_files == UINT32_MAX || instance->external_files == UINT32_MAX)
             return -KERNEL_EOVERFLOW;
-        existing->references++;
         existing->open_files++;
         node = existing;
+        pin = 0;
     } else {
+        if (instance->external_files == UINT32_MAX) {
+            int error = discard_unpublished_node(node);
+            return error ? error : -KERNEL_EOVERFLOW;
+        }
         node->mount = mount;
         node->references = 1;
         node->open_files = 1;

@@ -203,6 +203,44 @@ static void synthetic_mount_init(struct kernel_vfs_mount *mount,
     mount->state = VFS_MOUNT_STATE_LIVE;
 }
 
+static struct kernel_vfs_node *cache_reopen_owner;
+static unsigned cache_reopen_checks;
+void __real_kernel_rwlock_write(struct kernel_rwlock *lock, struct kernel_lock_guard *guard);
+void __wrap_kernel_rwlock_write(struct kernel_rwlock *lock, struct kernel_lock_guard *guard)
+{
+    if (cache_reopen_owner && lock == &cache_reopen_owner->io_lock) {
+        /* 等锁可以把控制权交给回收者；候选必须先有独立 owner。 */
+        if (cache_reopen_owner->references < 2U)
+            fail_vfs(129U, 2, cache_reopen_owner->references);
+        cache_reopen_checks++;
+        if (kernel_vfs_node_release(&cache_reopen_owner)) fail_vfs(130U, 0, -1);
+    }
+    __real_kernel_rwlock_write(lock, guard);
+}
+static void run_cache_only_reopen(struct kernel_heap *heap)
+{
+    for (unsigned route = 0; route < 2; route++) {
+        struct kernel_vfs_instance instance = {0};
+        struct kernel_vfs_mount mount = {0};
+        struct kernel_vfs_path *root = 0;
+        struct kernel_vfs_file alias = {0};
+        synthetic_mount_init(&mount, &instance, heap, 92U + route);
+        if (kernel_vfs_path_root(&mount, heap, &root)) fail_vfs(131U, 0, -1);
+        if (kernel_vfs_path_open(root, &alias)) fail_vfs(131U, 0, -1);
+        struct kernel_vfs_node *cache_node = alias.private_data;
+        if (kernel_vfs_node_acquire(cache_node) || kernel_vfs_close(&alias) || kernel_vfs_path_release(&root))
+            fail_vfs(132U, 0, -1);
+        cache_reopen_owner = cache_node;
+        unsigned before = cache_reopen_checks;
+        int error = route ? synthetic_open(&mount, 0, 2U, KERNEL_VFS_S_IFDIR, &alias) :
+                            kernel_vfs_path_root(&mount, heap, &root);
+        if (error || cache_reopen_owner || cache_reopen_checks != before + 1U)
+            fail_vfs(133U, 0, error);
+        if ((route ? kernel_vfs_close(&alias) : kernel_vfs_path_release(&root)) ||
+            synthetic_unmount(&mount)) fail_vfs(134U, 0, -1);
+    }
+}
+
 static void run_live_inode_reuse(struct kernel_heap *heap)
 {
     struct kernel_vfs_instance instance = {0};
@@ -909,6 +947,7 @@ static void run_vfs_test(const void *dtb)
 #ifndef VFS_EXPECT_RECOVERY
     run_backend_inode_identity_regression(&heap);
     run_live_inode_reuse(&heap);
+    run_cache_only_reopen(&heap);
 #endif
 
     for (index = 0U; index < info.virtio_mmio_count; index++) {
