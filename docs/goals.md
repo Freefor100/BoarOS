@@ -4,7 +4,7 @@
 `[x]` 只表示具体交付已验收；历史测量、输入身份和可重建命令归现有 learning。
 固定 Linux 位于 `references/linux`，精确版本与其他资料由 `references/sources.tsv` 管理。评审是调查输入，不自动成为实现或验收证据。
 
-## 当前状态与未关闭风险（2026-10-03）
+## 当前状态与未关闭风险（2026-10-04）
 
 N3已经交付：legacy/modern VirtIO-net、受限DMA借用与复制回退、静态IPv4＋ARP、
 有界分片重组，以及隔离宿主双向TCP/HTTP。1196条ABI、原22项网络客户端和相关系统

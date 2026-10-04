@@ -95,7 +95,18 @@ make test-references
 
 [开发路线](docs/goals.md)统一记录本轮任务、分支交接和后续依赖。通用兼容性在 `main`，比赛环境与运行入口在 `oscomp-rv-compat`；后者单向合入已验收主线。只跑 RV 的原 judge 评分不等于双架构比赛交付，也不能把逐组诊断分数拼成正式总分。
 
-已按统一 VFS 对象路线分阶段拆分 ext4 后端、实现挂载路径和首批真实 procfs。真实内存快照、RV64 sysinfo、后台写回及 proc fd 复用压力已接入；统一内存后备对象、tmpfs、硬链接和真实第二 ext4 磁盘已接入，验收见[多挂载证据](docs/learning/memory-backed-mounts.md)。独立 Review 的 R1–R8 已修复：覆盖 SysV owner/片段/权限、msync 来源 pin、AF_UNIX 整包、同步信号与 inode 整次写/截断互斥；完整 RV64、musl/glibc、差分及 WAL 恢复矩阵通过，见[路线与验收](docs/goals.md)。C0–C6 成本测量已收口：历史 60 次启动/339 窗口另补兼容分支与固定 Linux 的 9 次启动/48 窗口，原 musl/旧 glibc 各七组实际 I/O 完成，向量组因原 ELF 不支持在双侧排除。完整消费者的观测开销中位约 17%，大量提交/屏障与等待有证据，磁盘来源 unknown 仍保留，见[成本基线](docs/learning/cost-baseline.md)。评测分支已单向合入主线；原 judge 的 iozone 两侧得 21.4517/21.6688，RV 单侧总分 626，但总预算在 lmbench 耗尽、七组未到达，完整 Harness 缺 kernel-la；不等于全套评测通过。main 保留自身 uname，旧 glibc 结果属于评测兼容配置。异步日志与组提交、idle 安全 IRQ 返回和 FIFO 锁资格交接已验收，该轮十格原版写吞吐实测改善25.29–54.00倍；日志/RTC已补齐，原iperf/netperf完整loopback及IPv6双栈已交付。SMP、LoongArch、实板和更大工具链按新基线另行排期。
+统一VFS对象、活目录项、多挂载、共享后备、SysV shm、日志/RTC、串口TTY和真实网络
+应用已交付，具体边界见[开发路线](docs/goals.md)与模块。R1–R8组合边界的修复覆盖
+SHM附件/权限、msync来源pin、整包DGRAM、同步故障与整次写门闩；文件系统仍保留
+journal、必要屏障、durable同步、orphan及恢复契约。
+
+C0–C6提供默认关闭的成本观测；组提交、版本量封口、commit/checkpoint分离和批量
+I/O已经接入。机制、历史性能口径和unknown见[成本分析](docs/learning/cost-baseline.md)，
+不以内部计数下降替代真实程序效率。当前能力与下一项优化由有效应用证据选择。
+
+评测兼容分支单向接纳main；main保留自身uname，旧glibc结果属于兼容配置。
+完整Harness仍缺kernel-la，单侧诊断和逐组补跑不能宣称完整交付。逐次成绩和运行
+输出留在忽略的build；SMP、LoongArch、实板及更大应用另行规划。
 
 - [文档导航](docs/README.md)：模块契约与可复用学习材料。
 - [工程原则](docs/design.md)与[贡献说明](CONTRIBUTING.md)：技术取舍、验证与提交边界。
@@ -126,9 +137,9 @@ modern关闭观测三次启动，固定内容的单/五TCP双向总量效率中�
 27＋80条Linux差分及真实资源清理保护，见[TTY契约](docs/modules/kernel-tty.md)与
 [应用机制](docs/learning/session-consumers.md#原串口ashstty与控制终端2026-10-03)。
 
-CPU线补了默认关闭的有限诊断。Lua窗口中，选定heap清零/搬迁与页内usercopy合计
-内层经过约0.170秒，不能解释170秒窗口。保守宽字候选虽改善对齐微实验，原工程
-三次构建没有收益，**未启用到main**；生产保留字节实现与诊断，见
+CPU线已有默认关闭的有限诊断。选定heap清零/搬迁与页内usercopy不足以解释原工程
+成本；保守宽字候选改善对齐微实验，但没有可验证的工程收益，**未启用到main**。
+生产保留字节实现与诊断，见
 [实际工作与候选判断](docs/learning/offline-toolchain-probe.md#内存操作的有限归因与未上线候选2026-10-03)。
 近期建议先补真实文件所有权和局部ABI纠错；PTY＋原BusyBox script保留为应用候选，
 范围另行确认。原生accept4、O_PATH和路径truncate仍缺；原LTP准备依赖、旧libc包装、
