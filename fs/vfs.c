@@ -2077,6 +2077,32 @@ static int vfs_open_raw(struct kernel_vfs_mount *mount,
     if (!mount || !mount->private_data) return -KERNEL_EINVAL;
     struct kernel_vfs_instance *instance = mount->private_data;
     if (instance->quiescing) return -KERNEL_EIO;
+    if (!file || file->state != VFS_FILE_STATE_EMPTY || file->private_data)
+        return -KERNEL_EINVAL;
+    KERNEL_LOCK_SCOPE(namespace_guard);
+    kernel_vfs_namespace_lock(mount, &namespace_guard);
+    if (!path) {
+        int error = instance->ops->error ? instance->ops->error(instance) : 0;
+        if (error) return error;
+        for (struct kernel_vfs_node *node = instance->nodes; node; node = node->next) {
+            if (node->inode != inode_number || node->retired || node->closed) continue;
+            KERNEL_LOCK_SCOPE(node_guard);
+            kernel_vfs_node_lock(node, &node_guard, 1);
+            if (node->references == UINT32_MAX || node->open_files == UINT32_MAX ||
+                instance->external_files == UINT32_MAX) return -KERNEL_EOVERFLOW;
+            /* 已有 owner 保证 inode 有效；新 file 只取得资格，不再临时打开后端。 */
+            node->references++;
+            node->open_files++;
+            instance->external_files++;
+            file->private_data = node;
+            file->mount = mount;
+            file->size = node->size;
+            file->mode = node->mode;
+            file->state = VFS_FILE_STATE_LIVE;
+            file->write_lease = file->exec_lease = 0;
+            return 0;
+        }
+    }
     return instance->ops->open(mount, path, inode_number, inode_mode, file);
 }
 

@@ -61,6 +61,12 @@ ctime与非目录的capability属性删除放在同一undo/日志事务中；成
 保留继承的setgid；普通chmod仍可明确清除它。匿名pipe元数据不经过ext4。inode最后释放时，外部EA块先归还引用，只有
 最后引用才释放块；共享块的refcount、校验和与各inode占有的扇区数同事务更新。
 
+已有活inode的按身份打开在namespace保护下先检查mount错误，再取得该节点引用与
+新的file资格，保留实时size/mode；不先分配/打开临时后端对象再合并。节点registry
+仍为弱链，closed/retired节点不复用，没有新增长期缓存owner。普通文件创建后
+用已取得的lwext4 handle设置mode，避免重新走pathname，外层操作undo与错误归属不变。
+`make test-vfs-riscv`以独立后端计数保护这两项可省工作及真实最后关闭的错误owner。
+
 ## 文件节点与页缓存
 
 VFS 以文件系统实例与后端 inode 标识为活节点身份，普通文件、目录和字符节点都持有引用计数 node；路径对象另持有父目录项身份和一份活 inode 引用。独立 open file description 各自保存 offset，但同一 inode 指向共享 node。文件大小通过 `kernel_vfs_file_size()` 实时查询所属 node 的实时大小，确保写入或截断后各共享描述符观察到一致的文件长度。
