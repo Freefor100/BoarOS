@@ -656,33 +656,60 @@ enum kernel_files_status kernel_files_fstatat(
     struct kernel_linux_stat stat = {0};
     struct kernel_vfs_stat vfs_stat;
     KERNEL_FILES_PATH_SCOPE(start);
-    char *path;
-    size_t length;
+    char *path = 0;
+    size_t length = 0;
     int result;
     if (!kernel_files_is_live(files) || !kernel_fs_context_is_live(fs) ||
         !mm || !linux_result) return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
-    if (flags & ~(KERNEL_FILES_AT_SYMLINK_NOFOLLOW | KERNEL_FILES_AT_EMPTY_PATH)) {
+    /* 本地后端没有自动挂载或远端属性缓存；这些查询位不增加数据访问资格。 */
+    const uint64_t valid_flags = KERNEL_FILES_AT_SYMLINK_NOFOLLOW |
+        KERNEL_FILES_AT_EMPTY_PATH | UINT64_C(0x800) | UINT64_C(0x6000);
+    int invalid_flags = (flags & ~valid_flags) != 0;
+    int empty = 0;
+    if (flags & KERNEL_FILES_AT_EMPTY_PATH) {
+        if (!user_path) empty = 1;
+        else {
+            unsigned char first;
+            size_t copied;
+            enum kernel_uaccess_status access = kernel_copy_from_user(mm, &first,
+                                                   user_path, 1, &copied);
+            if (access == KERNEL_UACCESS_STATUS_FAULT) {
+                *linux_result = invalid_flags ? -KERNEL_EINVAL : -KERNEL_EFAULT;
+                return KERNEL_FILES_STATUS_OK;
+            }
+            if (access != KERNEL_UACCESS_STATUS_OK || copied != 1)
+                return KERNEL_FILES_STATUS_STATE;
+            empty = first == 0;
+        }
+        /* Linux 的空路径正 fd 直接进入 fstat，连其他查询位也不再参与校验。 */
+        if (empty && dirfd >= 0)
+            return kernel_files_fstat(files, mm, dirfd, user_buffer, linux_result);
+    }
+    if (invalid_flags) {
         *linux_result = -KERNEL_EINVAL;
         return KERNEL_FILES_STATUS_OK;
     }
-    enum kernel_heap_status allocation = kernel_heap_allocate(files->heap,
-                                         KERNEL_FS_PATH_MAX, (void **)&path);
-    if (allocation != KERNEL_HEAP_STATUS_OK) {
-        if (allocation != KERNEL_HEAP_STATUS_EMPTY) return KERNEL_FILES_STATUS_STATE;
-        *linux_result = -KERNEL_ENOMEM;
-        return KERNEL_FILES_STATUS_OK;
+    if (!empty) {
+        enum kernel_heap_status allocation = kernel_heap_allocate(files->heap,
+                                             KERNEL_FS_PATH_MAX, (void **)&path);
+        if (allocation != KERNEL_HEAP_STATUS_OK) {
+            if (allocation != KERNEL_HEAP_STATUS_EMPTY) return KERNEL_FILES_STATUS_STATE;
+            *linux_result = -KERNEL_ENOMEM;
+            return KERNEL_FILES_STATUS_OK;
+        }
+        enum kernel_uaccess_status access = kernel_copy_string_from_user(mm, path,
+                                     user_path, KERNEL_FS_PATH_MAX, &length);
+        if (access != KERNEL_UACCESS_STATUS_OK) {
+            (void)finish_path(files, path);
+            if (access != KERNEL_UACCESS_STATUS_FAULT && access != KERNEL_UACCESS_STATUS_TOO_LONG)
+                return KERNEL_FILES_STATUS_STATE;
+            *linux_result = access == KERNEL_UACCESS_STATUS_FAULT ? -KERNEL_EFAULT
+                                                                  : -KERNEL_ENAMETOOLONG;
+            return KERNEL_FILES_STATUS_OK;
+        }
+        empty = !length && (flags & KERNEL_FILES_AT_EMPTY_PATH);
     }
-    enum kernel_uaccess_status access = kernel_copy_string_from_user(mm, path,
-                                 user_path, KERNEL_FS_PATH_MAX, &length);
-    if (access != KERNEL_UACCESS_STATUS_OK) {
-        (void)finish_path(files, path);
-        if (access != KERNEL_UACCESS_STATUS_FAULT && access != KERNEL_UACCESS_STATUS_TOO_LONG)
-            return KERNEL_FILES_STATUS_STATE;
-        *linux_result = access == KERNEL_UACCESS_STATUS_FAULT ? -KERNEL_EFAULT
-                                                              : -KERNEL_ENAMETOOLONG;
-        return KERNEL_FILES_STATUS_OK;
-    }
-    if (!length && (flags & KERNEL_FILES_AT_EMPTY_PATH)) {
+    if (empty) {
         if (dirfd == KERNEL_FS_AT_FDCWD) {
             result = kernel_vfs_path_stat(kernel_fs_context_cwd(fs), &vfs_stat);
             if (!result) fill_linux_vfs_stat(&stat, &vfs_stat);
@@ -697,7 +724,7 @@ enum kernel_files_status kernel_files_fstatat(
                     path, !(flags & KERNEL_FILES_AT_SYMLINK_NOFOLLOW), &vfs_stat);
         if (!result) fill_linux_vfs_stat(&stat, &vfs_stat);
     }
-    if (finish_path(files, path) != KERNEL_FILES_STATUS_OK) return KERNEL_FILES_STATUS_STATE;
+    if (path && finish_path(files, path) != KERNEL_FILES_STATUS_OK) return KERNEL_FILES_STATUS_STATE;
     if (result) { *linux_result = result; return KERNEL_FILES_STATUS_OK; }
     int copied = copy_stat_to_user(mm, user_buffer, &stat, linux_result);
     if (copied < 0) return KERNEL_FILES_STATUS_STATE;

@@ -61,11 +61,14 @@ static char fork_resolved_path[KERNEL_FS_PATH_MAX];
 static const char *injected_console_input;
 static size_t injected_console_remaining;
 static unsigned fail_readv_allocation;
+static unsigned count_empty_stat_paths;
+static unsigned empty_stat_path_allocations;
 enum kernel_heap_status __real_kernel_heap_allocate(
     struct kernel_heap *, size_t, void **);
 enum kernel_heap_status __wrap_kernel_heap_allocate(
     struct kernel_heap *heap, size_t size, void **out)
 {
+    if (count_empty_stat_paths && size == KERNEL_FS_PATH_MAX) empty_stat_path_allocations++;
     if (fail_readv_allocation && --fail_readv_allocation == 0U) {
         return KERNEL_HEAP_STATUS_EMPTY;
     }
@@ -1794,6 +1797,16 @@ static void run_seek_stat_operations(struct kernel_files *files,
         stat.st_size != 9000) {
         fail_files(88U, 0, result);
     }
+#ifndef FILES_PARTIAL_WRITE_TEST
+    if (!write_user_bytes(mm, TEST_USER_PATH, empty_path, 1U)) fail_files(189U,0,-1);
+    count_empty_stat_paths = 1U;
+    empty_stat_path_allocations = 0U;
+    enum kernel_files_status empty_status = kernel_files_fstatat(files, fs, mm, 1,
+        TEST_USER_PATH, stat_buffer, KERNEL_FILES_AT_EMPTY_PATH, &result);
+    count_empty_stat_paths = 0U;
+    if (empty_status != KERNEL_FILES_STATUS_OK || result || empty_stat_path_allocations)
+        fail_files(189U,0,empty_stat_path_allocations ? empty_stat_path_allocations : result);
+#endif
     if (!write_user_bytes(mm, TEST_USER_PATH, empty_path, 1U) ||
         kernel_files_fstatat(files,
                              fs,
@@ -1834,7 +1847,7 @@ static void run_seek_stat_operations(struct kernel_files *files,
                              stat_buffer,
                              UINT64_C(0x2000),
                              &result) != KERNEL_FILES_STATUS_OK ||
-        result != -KERNEL_EINVAL) {
+        result != -KERNEL_ENOENT) {
         fail_files(89U, 0, result);
     }
     if (!write_user_bytes(mm, TEST_USER_PATH, "data", 5U) ||

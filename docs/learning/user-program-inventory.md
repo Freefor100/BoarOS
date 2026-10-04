@@ -193,7 +193,7 @@ libc-bench 的 `utf8.c` 依次尝试六个 UTF-8 locale；若 `CODESET` 仍不�
 | 负载 | 实际路径与正确读法 |
 |---|---|
 | lmbench lat_fs | `lmbench_src/src/lat_fs.c` 输出创建/删除次数每秒；0k执行creat/close/unlink，不写文件内容。慢路径要分解目录查找、inode/位图、事务准备、orphan及真实资源等待，数据复制不是唯一候选。 |
-| 路径stat/open与fstat | 前者包含用户路径导入、路径解析和元数据，后者使用已打开的对象；差距不能直接当磁盘带宽。热缓存/冷设备、同/不同目录和后台事务状态分别控制。 |
+| 路径stat/open与fstat | 前者包含用户路径导入、路径解析和元数据，后者使用已打开的对象；差距不能直接当磁盘带宽。glibc的fstat可以经由newfstatat的空路径进入内核，raw fstat或另一libc的成本不能直接替代该路径。空路径先识别再取得对象，避免每次准备完整路径容量；热缓存/冷设备、同/不同目录和后台事务状态分别控制。 |
 | iozone | 固定工作量完成、应用要求的durable、后台checkpoint排空分别记录；多进程停止规则和实际传输量影响Parent/Max/Children，零长度元数据成本不能由大块缓存写吞吐替代。 |
 | cyclictest | 原脚本使用1ms间隔；judge取各线程最大值再平均，不是平均每次唤醒延迟。普通sleep deadline尚未纳入额外SBI重装，先区分到期检查、ready等待与IRQ-off，不把细粒度读时钟等同及时唤醒。 |
 | iperf/netperf | 原iperf UDP使用1000G目标，属于过载；按实际接收、丢包、每连接进展判断。STREAM是字节吞吐，RR/CRR是事务速率；不同参数和baseline使两程序分数不能互相代替。 |
