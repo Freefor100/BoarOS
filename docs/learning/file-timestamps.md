@@ -33,7 +33,9 @@ VFS 在 mount 上绑定可选 realtime 回调，未初始化 kernel clock 时返
 非零首字节用户 fault 写仍更新 mtime/ctime。写入会先按实际 append/普通 offset 校验 inode maxbytes，`-EFBIG` 不更新时间；pread 按原始 count 在 MAX_RW_COUNT 截断及 EOF 判定前检查完整用户范围，含非法高地址的零长度范围，`-EFAULT` 不更新时间。实际数据返回值和 OFD offset 继续只统计 backend
 提交的字节数，metadata 更新不构成数据进度。
 
-创建时直接初始化新 inode 的 atime/mtime/ctime；成功目录链接/移除更新父目录 mtime/ctime，
+创建时直接初始化新 inode 的 atime/mtime/ctime；权限通过同一 inode handle 设置，
+避免成功创建后再次解析完整路径，操作仍在原事务内失败回滚。初始化权限
+不重新采样ctime，普通chmod则更新ctime；两者不能混用。成功目录链接/移除更新父目录 mtime/ctime，
 unlink 更新子 inode ctime。truncate 在活 inode 修改后更新 mtime/ctime，包括同长度请求；
 已改变大小但后续错误的 inode 状态仍按原 VFS mutation reconciliation 保持可见。
 
@@ -185,3 +187,14 @@ python3 -B tests/runtime-diagnostics.py --output build/coarse-original-diagnosti
 来自最终生产快照 `be5ca22629c904a427241b0f92e9d561d0312952e787ab75870ec4beae0143b3`。
 固定 Linux 与 BoarOS 的原静态/动态 utime 仍各 30/30 成功，原 libc time/coarse
 及 UTIME_NOW/fstat 跨秒记录均完成；主线 uname 保持不变。
+
+路径资格与普通打开资格分别控制元数据操作。`O_PATH`的稳定path owner允许
+空字符串/AT_EMPTY_PATH操作；直接fchown/fchmod/futimens仍要求普通打开资格，
+不能因身份可查询就授予数据访问。固定Linux的`fs/open.c:build_open_how`
+先掩去open/openat的其他位，`build_open_flags`的严格校验只适用于已经构造的how；
+不能拿openat2的拒绝规则套用普通open。相关差分入口是`path_only.c`。
+
+截断的特权处理与chown不同。固定root对应`fs/attr.c:setattr_should_drop_suidgid`
+的CAP_FSETID边界，保留set-ID；`fs/open.c:do_truncate`仍检查
+`dentry_needs_remove_privs`，因此capability必须清理。属性清理须在大小变更
+的同一undo内，尤其保护共享外部EA块及同长度请求。路径入口无须临时用户fd。

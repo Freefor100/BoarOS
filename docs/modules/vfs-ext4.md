@@ -61,6 +61,14 @@ ctime与非目录的capability属性删除放在同一undo/日志事务中；成
 保留继承的setgid；普通chmod仍可明确清除它。匿名pipe元数据不经过ext4。inode最后释放时，外部EA块先归还引用，只有
 最后引用才释放块；共享块的refcount、校验和与各inode占有的扇区数同事务更新。
 
+已有活inode的按身份打开在namespace保护下先检查mount错误，再取得该节点引用与
+新的file资格，保留实时size/mode；不先分配/打开临时后端对象再合并。节点registry
+仍为弱链，closed/retired节点不复用，没有新增长期缓存owner。重新取得节点时，
+先持有独立引用再等待inode锁；最后缓存页可在锁交接后立即回收，namespace锁
+不能替代该生命周期引用。发布路径的候选合并也遵守这一边界。普通文件创建后
+用已取得的lwext4 handle设置mode，避免重新走pathname，外层操作undo与错误归属不变。
+`make test-vfs-riscv`以独立后端计数保护这两项可省工作及真实最后关闭的错误owner。
+
 ## 文件节点与页缓存
 
 VFS 以文件系统实例与后端 inode 标识为活节点身份，普通文件、目录和字符节点都持有引用计数 node；路径对象另持有父目录项身份和一份活 inode 引用。独立 open file description 各自保存 offset，但同一 inode 指向共享 node。文件大小通过 `kernel_vfs_file_size()` 实时查询所属 node 的实时大小，确保写入或截断后各共享描述符观察到一致的文件长度。
@@ -293,3 +301,21 @@ VFS node按mount/inode共享，fifo_pipe是短IRQ区保护的弱关联；候选�
 重查并复用竞争者已发布的pipe。打开会合不持VFS锁睡眠，节点引用保持到端点释放后。
 类型/umask、目录项、hardlink/rename/unlink及重启见`make test-fifo-riscv`；
 相关创建/元数据入口由`make test-lwext4-metadata-host`覆盖。
+
+路径truncate持有解析后的path并直接调用共同截断入口，不安装临时用户fd。
+rank15整次操作锁、inode锁、缓存写回、尾页清零和跨MM失效沿原路径；
+目录返回EISDIR，非普通节点EINVAL，负长度在访问pathname前EINVAL。
+共同ext4截断在原操作undo内删除capability，包含同长度请求；固定root的
+CAP_FSETID语义保留set-ID，不能套用chown清位规则。共享外部EA块继续按引用计数
+复制或释放，失败只回滚本操作；日志、orphan和持久化顺序不变。
+
+## 元数据成本复建
+
+`tests/cost-riscv.py --case metadata`复用既有统计，提供固定4096次stat/fstat/
+open窗口、2048次空文件创建删除，以及原lmbench的三种文件syscall和lat_fs、
+原iozone四进程(0,1)。open窗口逐次fstat校验身份，故包含校验成本；纯open/close
+成本由原lmbench对应项给出。路径持有与未持有分别测量，fstat本身必须持有fd。
+程序完成、显式同步和`ROOT_DRAIN_FIXTURE=1`的内部最终卸载分别记录。
+`--platform-config official`使用本地固定平台的1GiB、单hart、默认VirtIO、网卡和
+UTC RTC，不添加RNG；不是完整比赛Harness。原旧glibc使用兼容分支配置。
+关闭观测的重复启动与单次定点COST分别解释；原始输出和机器身份只进build。

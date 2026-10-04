@@ -134,7 +134,7 @@ enum kernel_syscall_status syscall_handle_mmap(
             return KERNEL_SYSCALL_STATUS_OK;
         }
         if (task_status != KERNEL_TASK_STATUS_OK ||
-            kernel_files_pin(files,
+            kernel_files_pin_data(files,
                              (int64_t)request->arguments[4],
                              &file,
                              &linux_result) != KERNEL_FILES_STATUS_OK) {

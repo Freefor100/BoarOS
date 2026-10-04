@@ -175,7 +175,7 @@ enum kernel_files_status __wrap_kernel_files_write(
     return write_files_status;
 }
 
-enum kernel_files_status __wrap_kernel_files_pin(
+enum kernel_files_status __wrap_kernel_files_pin_data(
     struct kernel_files *files,
     int64_t fd,
     struct kernel_open_file_description **owner,

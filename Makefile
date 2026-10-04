@@ -732,7 +732,7 @@ $(BLOCK_TEST_KERNEL_RV): $(BLOCK_TEST_OBJECTS) arch/riscv/linker.ld
 
 $(VFS_TEST_KERNEL_RV): $(VFS_TEST_OBJECTS) arch/riscv/linker.ld
 	$(CC) $(LDFLAGS) -Wl,--wrap=ext4_orphan_free -Wl,--wrap=ext4_fclose -Wl,--wrap=kernel_heap_allocate \
-		-Wl,--wrap=ext4_journal_start -Wl,--wrap=ext4_user_calloc \
+		-Wl,--wrap=ext4_journal_start -Wl,--wrap=ext4_user_calloc -Wl,--wrap=ext4_mode_set -Wl,--wrap=kernel_rwlock_write \
 		-Wl,-Map,$(BUILD_DIR)/tests/kernel-vfs-rv.map \
 		-o $@ $(VFS_TEST_OBJECTS)
 
@@ -860,7 +860,7 @@ $(SYSCALL_TEST_KERNEL_RV): $(SYSCALL_TEST_OBJECTS) arch/riscv/linker.ld
 	-Wl,--wrap=kernel_task_fs_context_borrow \
 	-Wl,--wrap=kernel_task_set_tid_address \
 	-Wl,--wrap=kernel_task_cpu_ticks \
-	-Wl,--wrap=kernel_files_pin \
+	-Wl,--wrap=kernel_files_pin_data \
 	-Wl,--wrap=kernel_files_write \
 	-Wl,--wrap=kernel_files_writev \
 	-Wl,--wrap=kernel_files_lseek \

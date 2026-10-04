@@ -143,10 +143,12 @@ static int synthetic_lookup(struct kernel_vfs_instance *instance,
     return -KERNEL_ENOENT;
 }
 
+static unsigned synthetic_backend_opens;
 static int synthetic_open(struct kernel_vfs_mount *mount, const char *path,
                           uint64_t inode, uint32_t mode,
                           struct kernel_vfs_file *file)
 {
+    synthetic_backend_opens++;
     struct kernel_vfs_instance *instance = mount->private_data;
     struct kernel_vfs_node *node = 0;
     (void)path;
@@ -199,6 +201,64 @@ static void synthetic_mount_init(struct kernel_vfs_mount *mount,
     mount->private_data = instance;
     mount->id = id;
     mount->state = VFS_MOUNT_STATE_LIVE;
+}
+
+static struct kernel_vfs_node *cache_reopen_owner;
+static unsigned cache_reopen_checks;
+void __real_kernel_rwlock_write(struct kernel_rwlock *lock, struct kernel_lock_guard *guard);
+void __wrap_kernel_rwlock_write(struct kernel_rwlock *lock, struct kernel_lock_guard *guard)
+{
+    if (cache_reopen_owner && lock == &cache_reopen_owner->io_lock) {
+        /* 等锁可以把控制权交给回收者；候选必须先有独立 owner。 */
+        if (cache_reopen_owner->references < 2U)
+            fail_vfs(129U, 2, cache_reopen_owner->references);
+        cache_reopen_checks++;
+        if (kernel_vfs_node_release(&cache_reopen_owner)) fail_vfs(130U, 0, -1);
+    }
+    __real_kernel_rwlock_write(lock, guard);
+}
+static void run_cache_only_reopen(struct kernel_heap *heap)
+{
+    for (unsigned route = 0; route < 2; route++) {
+        struct kernel_vfs_instance instance = {0};
+        struct kernel_vfs_mount mount = {0};
+        struct kernel_vfs_path *root = 0;
+        struct kernel_vfs_file alias = {0};
+        synthetic_mount_init(&mount, &instance, heap, 92U + route);
+        if (kernel_vfs_path_root(&mount, heap, &root)) fail_vfs(131U, 0, -1);
+        if (kernel_vfs_path_open(root, &alias)) fail_vfs(131U, 0, -1);
+        struct kernel_vfs_node *cache_node = alias.private_data;
+        if (kernel_vfs_node_acquire(cache_node) || kernel_vfs_close(&alias) || kernel_vfs_path_release(&root))
+            fail_vfs(132U, 0, -1);
+        cache_reopen_owner = cache_node;
+        unsigned before = cache_reopen_checks;
+        int error = route ? synthetic_open(&mount, 0, 2U, KERNEL_VFS_S_IFDIR, &alias) :
+                            kernel_vfs_path_root(&mount, heap, &root);
+        if (error || cache_reopen_owner || cache_reopen_checks != before + 1U)
+            fail_vfs(133U, 0, error);
+        if ((route ? kernel_vfs_close(&alias) : kernel_vfs_path_release(&root)) ||
+            synthetic_unmount(&mount)) fail_vfs(134U, 0, -1);
+    }
+}
+
+static void run_live_inode_reuse(struct kernel_heap *heap)
+{
+    struct kernel_vfs_instance instance = {0};
+    struct kernel_vfs_mount mount = {0};
+    struct kernel_vfs_path *root = 0;
+    synthetic_mount_init(&mount, &instance, heap, 91U);
+    if (kernel_vfs_path_root(&mount, heap, &root)) fail_vfs(124U, 0, -1);
+    unsigned before = synthetic_backend_opens;
+    for (unsigned i = 0; i < 16; i++) {
+        struct kernel_vfs_file alias = {0};
+        if (kernel_vfs_path_open(root, &alias) ||
+            kernel_vfs_file_inode(&alias) != kernel_vfs_path_inode(root) ||
+            kernel_vfs_close(&alias)) fail_vfs(125U, 0, -1);
+    }
+    if (synthetic_backend_opens != before)
+        fail_vfs(126U, before, synthetic_backend_opens);
+    if (kernel_vfs_path_release(&root) || synthetic_unmount(&mount))
+        fail_vfs(127U, 0, -1);
 }
 
 static void run_mount_tree_regression(struct kernel_vfs_mount *root_mount,
@@ -347,6 +407,13 @@ static void run_prepare_unmount_regression(struct kernel_vfs_mount *mount,
 }
 
 static uint32_t orphan_free_calls;
+static unsigned pathname_mode_calls;
+int __real_ext4_mode_set(const char *path, uint32_t mode);
+int __wrap_ext4_mode_set(const char *path, uint32_t mode)
+{
+    pathname_mode_calls++;
+    return __real_ext4_mode_set(path, mode);
+}
 static uint32_t fail_fclose_calls;
 static uint32_t failed_fclose_calls;
 static struct kernel_page_cache *pressure_cache;
@@ -447,6 +514,7 @@ static void run_orphan_cleanup_regression(struct kernel_vfs_mount *mount,
     struct kernel_vfs_path *replacement_path = 0;
     struct kernel_vfs_stat orphan_stat;
     int linux_result = -1;
+    unsigned modes_before = pathname_mode_calls;
 
     if (kernel_open_file_create_mode(heap,
                                      mount,
@@ -466,6 +534,8 @@ static void run_orphan_cleanup_regression(struct kernel_vfs_mount *mount,
         kernel_vfs_unlink(mount, "/orphan-open") != 0) {
         fail_vfs(24U, 0, linux_result);
     }
+    if (pathname_mode_calls != modes_before)
+        fail_vfs(128U, modes_before, pathname_mode_calls);
 
     fail_orphan_free_calls = 1U;
     if (kernel_open_file_release(&orphan_open) !=
@@ -762,11 +832,11 @@ static void run_path_cleanup_regression(struct kernel_vfs_mount *mount,
     if (kernel_vfs_create(mount, "/path-merge-cleanup", 0600U, &file) != 0)
         fail_vfs(38U, 0, -1);
     fail_fclose_calls = 1U;
-    if (kernel_vfs_open(mount, "/path-merge-cleanup", &alias) !=
-            -KERNEL_EIO ||
-        alias.private_data != 0 || fail_fclose_calls != 0U ||
-        failed_fclose_calls != 2U || kernel_vfs_close(&file) != 0)
-        fail_vfs(39U, -KERNEL_EIO, -1);
+    if (kernel_vfs_open(mount, "/path-merge-cleanup", &alias) != 0 ||
+        fail_fclose_calls != 1U || kernel_vfs_close(&file) != 0 ||
+        kernel_vfs_close(&alias) != 0 || fail_fclose_calls != 0U ||
+        failed_fclose_calls != 2U)
+        fail_vfs(39U, 0, -1);
 }
 #endif
 
@@ -876,6 +946,8 @@ static void run_vfs_test(const void *dtb)
     }
 #ifndef VFS_EXPECT_RECOVERY
     run_backend_inode_identity_regression(&heap);
+    run_live_inode_reuse(&heap);
+    run_cache_only_reopen(&heap);
 #endif
 
     for (index = 0U; index < info.virtio_mmio_count; index++) {

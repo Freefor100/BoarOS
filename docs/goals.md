@@ -23,17 +23,22 @@ N3已经交付：legacy/modern VirtIO-net、受限DMA借用与复制回退、静
 区分已经修复的机制与缺少历史现场的归因。固定root、单hart、QEMU和选定应用验收
 均不代表多用户隔离、SMP、实板或完整Linux兼容。完整比赛Harness仍缺kernel-la。
 
-## 下一项应用候选：PTY＋原BusyBox script（待确认范围）
+## 近期队列：文件元数据与路径接口
 
-串口TTY、有限CPU归因，以及libc暴露的局部错误和文件所有权已收口，移入下方
-交付摘要。下一应用候选是PTY＋原BusyBox script；先调查主从端owner、终端复用、
-挂断及真实程序调用链，再确认范围。它不等待I/O达到固定分数或吞吐倍数。
+局部复用、路径资格和共同截断已实现；剩余收口集中在匹配成本、原消费者与兼容入口。
 
-逐次成绩、原始输出、人工停止及补跑记录只留在忽略的build；不同启动不拼成正式
-成绩。原LTP缺少账户、工具、scratch设备及库准备的问题按所属层补齐；不因目录
-遍历有一个文件就自动安排整个模块。更大离线工程、外部网络和凭据体系仍由真实
-使用流程选择；LoongArch是双架构交付依赖，SMP另行规划。已有P/N/L编号继续描述
-依赖，不形成第二套排期。性能工作只从下面候选表中选择一个有实际证据的机制。
+- [x] 复用同一实例中已有活inode，消除临时后端打开；创建后按已取得句柄设置权限。
+- [x] 实现只持路径身份的O_PATH，覆盖设备/FIFO不打开、目录fd、空路径、proc和末引用。
+- [x] 接入路径truncate，复用共同截断、映射失效与错误owner，核对特权属性和恢复。
+- [ ] 匹配旧/新元数据负载及原lmbench/所选四进程iozone，解释实际收益、同步和最终排空。
+
+不新增常驻目录项缓存或改变事务、checkpoint、TCP窗口及调度策略。TCP仅做最新
+固定字节单/五连接状态核对。性能环境沿平台既定配置，不添加RNG或改命令获得通过；
+无可信熵时的getrandom合同和旧libc断言边界保持明确。
+逐次成绩、原始输出和机器快照只留在忽略的build，不进入文档或Git。
+
+下一应用候选仍为PTY＋原BusyBox script，范围另行确认。完整凭据/权限、运行时
+网络配置和随机源由真实需求触发；LoongArch是独立交付依赖，SMP单独规划。
 
 ## 按证据触发的性能候选
 
@@ -86,7 +91,7 @@ glibc四进程整命令仍增加0.73%。该轮的prepare读取、1547次FLUSH和
 | 原BusyBox55/55 | 此前日志/RTC/根设备补全已验收；完整228项没有在本轮网络工作中重跑 |
 | iperf/netperf | 22项受控原ELF完成；原iperf连续脚本的listener重建竞态在Linux也存在，原脚本结果和受控验收分别报告 |
 | LTP执行角色 | 比赛目录遍历不是上游runtest；控制器helper、上游禁用shmat1和有限shm_test分开。原libc的EINTR重试、NULL栈clone、缺unwind库或账户可先于目标syscall阻塞，见[程序证据](learning/user-program-inventory.md#ltp的准备依赖与libc边界) |
-| 所有权与接口子集 | fchown/fchownat已接入真实元数据；完整凭据/权限、O_PATH、原生accept4、路径truncate仍有缺口；CPU-time clock、VIRTUAL/PROF timer、pipe容量操作、扩展clone/futex按具体子语义核对，不把已有整个模块记为缺失 |
+| 所有权与接口子集 | fchown/fchownat已接入真实元数据；O_PATH和路径truncate已接入；完整凭据/权限、原生accept4仍有缺口；CPU-time clock、VIRTUAL/PROF timer、pipe容量操作、扩展clone/futex按具体子语义核对，不把已有整个模块记为缺失 |
 | 路径truncate | 尚未实现；本轮错误恢复使用已交付ftruncate，原Lua/GCC/make保持不变 |
 | 用户内存/信号 | mremap、按操作madvise、mlock、sigaltstack、实时信号队列、共享文件/PI futex待真实应用需求触发 |
 | 系统与平台 | 固定root查询不等于完整凭据/权限；无PTY/termios2/完整modem控制、外部IPv6/DNS/TLS、公网配置、SMP/实板、kernel-la，不声明完整Linux兼容或硬实时 |

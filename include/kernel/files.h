@@ -350,6 +350,11 @@ enum kernel_files_status kernel_files_lseek(
     uint64_t whence,
     int64_t *linux_result);
 
+enum kernel_files_status kernel_files_truncate(
+    struct kernel_files *files, const struct kernel_fs_context *fs,
+    struct kernel_mm *mm, uint64_t user_path, int64_t length,
+    int64_t *linux_result);
+
 enum kernel_files_status kernel_files_ftruncate(
     struct kernel_files *files,
     int64_t fd,
@@ -459,6 +464,12 @@ enum kernel_files_status kernel_files_socket_accept(
 
 /* Success returns an owned OFD reference independent of the fd slot. */
 enum kernel_files_status kernel_files_pin(
+    struct kernel_files *files,
+    int64_t fd,
+    struct kernel_open_file_description **owner,
+    int64_t *linux_result);
+/* Reject path-only descriptors before accessing operation buffers. */
+enum kernel_files_status kernel_files_pin_data(
     struct kernel_files *files,
     int64_t fd,
     struct kernel_open_file_description **owner,

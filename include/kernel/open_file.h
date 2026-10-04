@@ -40,6 +40,7 @@ enum kernel_open_file_kind {
     KERNEL_OPEN_FILE_KIND_RANDOM,
     KERNEL_OPEN_FILE_KIND_URANDOM,
     KERNEL_OPEN_FILE_KIND_RTC,
+    KERNEL_OPEN_FILE_KIND_PATH,
 };
 
 /* VFS errors are returned through linux_result when status is OK. */
@@ -49,6 +50,8 @@ enum kernel_open_file_path_operation {
     KERNEL_OPEN_PATH_NOFOLLOW,
     KERNEL_OPEN_PATH_CREATE,
     KERNEL_OPEN_PATH_EXECUTABLE,
+    KERNEL_OPEN_PATH_ONLY,
+    KERNEL_OPEN_PATH_ONLY_NOFOLLOW,
 };
 enum kernel_open_file_status kernel_open_file_create_at(
     struct kernel_heap *heap, struct kernel_vfs_path *start,

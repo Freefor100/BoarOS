@@ -205,7 +205,16 @@ fd-slot OFD references -> files table -> fs context
 活 inode，故 unlink 后仍可修改；两者保留文件类型位、更新 ctime，
 只读挂载返回 `EROFS`。匿名pipe的mode、UID/GID和ctime属于共享pipe对象，
 两端、dup/fork与proc重开观察同一元数据；匿名epoll和socket的改权仍返回`ENOTSUP`。
-`O_PATH` 尚在 `openat` 边界返回 `ENOTSUP`。
+`O_PATH` 使用明确的路径OFD，拥有稳定path引用；它不打开字符设备、会合FIFO、
+初始化数据缓存或取得写/执行租约。open/openat先归一化为PATH、DIRECTORY、NOFOLLOW，
+CLOEXEC归fd槽；其他访问/创建/截断位不取得数据资格。dup/fork共享OFD，最后关闭释放path。
+fstat/fstatfs、目录相对操作、fchdir、FD标志和F_GETFL可用；空路径stat/chown/utimens、
+linkat和readlinkat使用原身份，NOFOLLOW可持有链接自身。数据、seek、mmap、ioctl、记录锁、
+直接fd改权/所有权/时间与同步入口先返回EBADF；网络ioctl/socket入口同样先检查资格。
+poll显示POLLNVAL；select按固定Linux的POLLIN/OUT/EX_SET将它映射到所请求的集合，
+不把有效路径fd误当成已经关闭的fd。
+unlink/rename及同名重建不会替换句柄身份。execveat、openat2仍未交付。
+`make build/diff-abi/path-rv`配`tests/diff-abi/path-cases.txt`可聚焦差分；完整ABI仍包含同一记录。
 `O_NOCTTY` 是合法open flag，其控制终端语义见[TTY模块](kernel-tty.md)。
 固定 Linux
 `references/linux/fs/open.c`（commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`）
@@ -353,3 +362,9 @@ pipe端点先关闭一次，真实VFS关闭错误继续归mount清理，不重�
 FIFO不可seek或fsync，节点由文件系统同步持久化，传输内容永不恢复。
 `make test-fifo-riscv`以同ELF核对Linux的身份、打开、poll/select/epoll、时间、信号、
 fd满、只读挂载与重启；`make test-files-riscv`另注入对象/缓冲OOM并验证重试与回收。
+
+RV64 `truncate(45)`复制完整pathname后取得稳定path；相对cwd、绝对路径和
+末端符号链接沿共同解析器，长度与错误顺序由`path_only.c`核对。
+`ftruncate/O_TRUNC/truncate`共用后端大小、时间、capability清理与映射失效；
+`make test-lwext4-metadata-host`包含共享EA、操作abort和持久化格式核对，
+`sh tests/lwext4-metadata-host.sh truncate`可只检查新增属性边界。

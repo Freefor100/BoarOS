@@ -105,6 +105,16 @@ enum kernel_open_file_status kernel_open_file_create_at(
     }
     int result;
     switch (operation) {
+    case KERNEL_OPEN_PATH_ONLY:
+    case KERNEL_OPEN_PATH_ONLY_NOFOLLOW:
+        result = kernel_vfs_path_resolve(start, root, path,
+                    operation == KERNEL_OPEN_PATH_ONLY, &file->file.path);
+        if (!result) {
+            file->kind = KERNEL_OPEN_FILE_KIND_PATH;
+            file->file.mount = kernel_vfs_path_mount(file->file.path);
+            file->file.mode = kernel_vfs_path_mode(file->file.path);
+        }
+        break;
     case KERNEL_OPEN_PATH_CREATE:
         result = kernel_vfs_create_at(start, root, path, mode, &file->file);
         break;
@@ -495,6 +505,8 @@ enum kernel_open_file_kind kernel_open_file_kind(
         return KERNEL_OPEN_FILE_KIND_RANDOM;
     case KERNEL_OPEN_FILE_KIND_URANDOM:
         return KERNEL_OPEN_FILE_KIND_URANDOM;
+    case KERNEL_OPEN_FILE_KIND_PATH:
+        return KERNEL_OPEN_FILE_KIND_PATH;
     case KERNEL_OPEN_FILE_KIND_RTC:
         return KERNEL_OPEN_FILE_KIND_RTC;
     default:
@@ -566,6 +578,9 @@ enum kernel_open_file_status kernel_open_file_release(
     if (!file->vfs_closed) {
         if (file->kind == KERNEL_OPEN_FILE_KIND_CONSOLE &&
             file->file.private_data == 0) {
+            file->vfs_closed = 1U;
+        } else if (file->kind == KERNEL_OPEN_FILE_KIND_PATH) {
+            if (kernel_vfs_path_release(&file->file.path)) __builtin_trap();
             file->vfs_closed = 1U;
         } else if (file->kind == KERNEL_OPEN_FILE_KIND_PIPE) {
             if (file->pipe_endpoint_closed == 0U) {
@@ -697,6 +712,8 @@ uint32_t kernel_open_file_mode(
     if (!open_file_live(file)) return 0U;
     if (file->kind == KERNEL_OPEN_FILE_KIND_PIPE && !file->file.private_data)
         return file->pipe->mode;
+    if (file->kind == KERNEL_OPEN_FILE_KIND_PATH)
+        return kernel_vfs_path_mode(file->file.path);
     return file->file.mode;
 }
 
@@ -739,7 +756,7 @@ int kernel_open_file_readable(
 int kernel_open_file_writable(
     const struct kernel_open_file_description *file)
 {
-    if (!open_file_live(file)) return 0;
+    if (!open_file_live(file) || file->kind == KERNEL_OPEN_FILE_KIND_PATH) return 0;
     return (file->open_flags & 3U) == 1U ||
            (file->open_flags & 3U) == 2U;
 }
@@ -904,6 +921,11 @@ uint32_t kernel_open_file_poll(
     uint32_t requested_events,
     struct kernel_wait_queue **out_queue)
 {
+    if (file && file->kind == KERNEL_OPEN_FILE_KIND_PATH) {
+        if (out_queue) *out_queue = 0;
+        return KERNEL_POLLNVAL;
+    }
+
     if (out_queue != 0) {
         *out_queue = 0;
     }

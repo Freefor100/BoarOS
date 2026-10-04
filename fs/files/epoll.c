@@ -448,7 +448,7 @@ enum kernel_files_status kernel_files_epoll_ctl(
     if (!kernel_files_is_live(files) || linux_result == 0) {
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
     }
-    pin_status = kernel_files_pin(files, epfd, &epoll_file, linux_result);
+    pin_status = kernel_files_pin_data(files, epfd, &epoll_file, linux_result);
     if (pin_status != KERNEL_FILES_STATUS_OK || *linux_result != 0 || epoll_file == 0) {
         return pin_status;
     }
@@ -463,7 +463,7 @@ enum kernel_files_status kernel_files_epoll_ctl(
         *linux_result = -KERNEL_EINVAL;
         return KERNEL_FILES_STATUS_OK;
     }
-    pin_status = kernel_files_pin(files, fd, &target_file, linux_result);
+    pin_status = kernel_files_pin_data(files, fd, &target_file, linux_result);
     if (pin_status != KERNEL_FILES_STATUS_OK || *linux_result != 0 || target_file == 0) {
         (void)kernel_open_file_release(&epoll_file);
         return pin_status;
@@ -710,7 +710,7 @@ enum kernel_files_status kernel_files_epoll_pwait(
         return KERNEL_FILES_STATUS_OK;
     }
 
-    pin_status = kernel_files_pin(files, epfd, &epoll_file, linux_result);
+    pin_status = kernel_files_pin_data(files, epfd, &epoll_file, linux_result);
     if (pin_status != KERNEL_FILES_STATUS_OK || epoll_file == 0) {
         return pin_status;
     }

@@ -1,6 +1,6 @@
 #!/bin/sh
 set -eu
-case "${1:-all}" in all|ownership) ;; *) echo 'usage: lwext4-metadata-host.sh [all|ownership]' >&2; exit 2;; esac
+case "${1:-all}" in all|ownership|truncate) ;; *) echo 'usage: lwext4-metadata-host.sh [all|ownership|truncate]' >&2; exit 2;; esac
 root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT HUP INT TERM
@@ -20,12 +20,16 @@ for block in 1024 4096; do
         mkfs.ext4 -q -F -b "$block" -I "$inode" "$work/base.img"
         overhead=$(dumpe2fs -h "$work/base.img" 2>/dev/null | sed -n 's/^Overhead clusters:[[:space:]]*//p')
         "$work/probe" "$work/base.img" seed
-        for mode in owner owner-ro owner-shared owner-shared-unlink; do
+        modes="owner owner-ro owner-shared owner-shared-unlink truncate-shared"
+        if [ "${1:-all}" = truncate ]; then modes="truncate-shared"; fi
+        for mode in $modes; do
             cp "$work/base.img" "$work/test.img"
             "$work/probe" "$work/test.img" "$mode" "$overhead"
             check_fs "$work/test.img"
+            if [ "$mode" = truncate-shared ]; then "$work/probe" "$work/test.img" verify-truncate-shared; fi
             if [ "$mode" = owner ]; then "$work/probe" "$work/test.img" verify-owner; fi
         done
+        if [ "${1:-all}" = truncate ]; then continue; fi
         cp "$work/base.img" "$work/test.img"
         attempts=$("$work/probe" "$work/test.img" oom-owner "$overhead")
         point=1
@@ -75,7 +79,7 @@ for block in 1024 4096; do
         printf 'PASS: metadata block=%s inode=%s\n' "$block" "$inode"
     done
 done
-if [ "${1:-all}" = ownership ]; then exit 0; fi
+if [ "${1:-all}" != all ]; then exit 0; fi
 truncate -s 8193K "$work/base.img"
 mkfs.ext4 -q -F -b 1024 -O '^has_journal' "$work/base.img"
 overhead=$(dumpe2fs -h "$work/base.img" 2>/dev/null | sed -n 's/^Overhead clusters:[[:space:]]*//p')

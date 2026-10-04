@@ -15,8 +15,8 @@ import subprocess
 import tempfile
 from cost_report import validate_deadline, parse, validate_expected
 ROOT=Path(__file__).resolve().parents[1]
-CASES=('contract','write','locking','mprotect','deadline','latency','consumer','readers')
-IMPLEMENTED={'contract','write','locking','mprotect','deadline','latency','consumer','readers'}
+CASES=('contract','write','locking','mprotect','deadline','latency','consumer','readers','metadata')
+IMPLEMENTED={'contract','write','locking','mprotect','deadline','latency','consumer','readers','metadata'}
 def digest(path):
     with Path(path).open('rb') as stream: return hashlib.file_digest(stream,'sha256').hexdigest()
 def run(command, **kwargs): return subprocess.run(command,check=True,**kwargs)
@@ -31,6 +31,9 @@ def main():
     parser.add_argument('--trace-read-lbas',action='store_true',help='QEMU read trace, whole boot including initialization and snapshot reads')
     parser.add_argument('--linux',action='store_true',help='fixed Linux original consumer reference, diagnostics absent')
     parser.add_argument('--bios',type=Path,default=Path('/usr/share/qemu/opensbi-riscv64-generic-fw_dynamic.bin'))
+    parser.add_argument('--platform-config',choices=('fixture','official'),default='fixture',help='official hardware: fixed RAM/hart, default VirtIO, net/RTC, no RNG')
+    parser.add_argument('--output',type=Path)
+    parser.add_argument('--metadata-core-only',action='store_true',help='accept only fixed metadata/lmbench measurements from a frozen coordinator; retain failed extra consumer attempts explicitly')
     parser.add_argument('--two-disks',action='store_true')
     parser.add_argument('--off',action='store_true',help='run identical ELF with diagnostics disabled')
     parser.add_argument('--transport',choices=('legacy','modern'),default='modern')
@@ -50,12 +53,16 @@ def main():
     if (not selected and not args.consumer_sync_only) or len(set(selected))!=len(selected) or not set(selected)<=set(names):parser.error('invalid consumer command selection')
     if args.consumer_sync and args.case!='consumer':parser.error('synchronous probes require --case consumer')
     if args.consumer_readers and args.case!='consumer':parser.error('appended readers require --case consumer')
-    if args.coordinator_elf and (args.case not in ('consumer','readers') or args.consumer_sync):parser.error('frozen coordinator requires original consumer commands without new probes')
+    if args.coordinator_elf and (args.case not in ('consumer','readers','metadata') or args.consumer_sync):parser.error('frozen coordinator requires original consumer commands without new probes')
     if args.consumer_commands!='all' and args.case!='consumer':parser.error('consumer selection requires --case consumer')
     if not 1000<=args.consumer_timeout_ms<=3600000:parser.error('consumer timeout must be 1000..3600000 ms')
+    if args.case in ('metadata','all') and args.consumer_timeout_ms!=180000:parser.error('metadata coordinator uses a fixed 180000 ms consumer budget')
+    if args.metadata_core_only and args.case!='metadata':parser.error('metadata-core-only requires --case metadata')
+    if args.platform_config=='official':args.transport='legacy'
+    if args.case=='metadata':selected=['consumer-musl-1','consumer-glibc-1']
     linux_identity=None
     if args.linux:
-        if args.case!='consumer': parser.error('Linux reference applies to original consumers')
+        if args.case not in ('consumer','metadata'): parser.error('Linux reference applies to original consumers')
         sys.path.insert(0,str(ROOT/'tests/diff-abi')); import harness
         args.kernel,linux_identity=harness.fixed_linux_image(None); args.off=True
     (ROOT/'build/cost').mkdir(parents=True,exist_ok=True)
@@ -65,14 +72,16 @@ def main():
     cases=CASES if args.case=='all' else (args.case,)
     missing=set(cases)-IMPLEMENTED
     if missing: parser.error('not implemented: '+','.join(sorted(missing)))
-    work=args.resume_from.resolve() if args.resume_from else Path(tempfile.mkdtemp(prefix='cost-run.',dir=ROOT/'build'))
+    work=args.resume_from.resolve() if args.resume_from else args.output or Path(tempfile.mkdtemp(prefix='cost-run.',dir=ROOT/'build'))
+    if not work.exists():work.mkdir(parents=True)
+    elif args.output and not args.resume_from and any(work.iterdir()):parser.error("output directory is not empty")
     identity={'tree':subprocess.check_output(['git','write-tree'],cwd=ROOT,text=True).strip(),
         'base':subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip(),
         'source_sha256':hashlib.sha256(b''.join(p.encode()+b'\0'+digest(ROOT/p).encode()+b'\n' for p in sorted(subprocess.check_output(['git','ls-files','-co','--exclude-standard'],cwd=ROOT,text=True).splitlines()) if '__pycache__' not in Path(p).parts)).hexdigest(),
         'diff_sha256':hashlib.sha256(subprocess.check_output(['git','diff','HEAD'],cwd=ROOT)).hexdigest(),
         'qemu_version':subprocess.check_output([args.qemu,'--version'],text=True).splitlines()[0],
         'qemu_sha256':digest(shutil.which(args.qemu)), 'cost_diagnostics':0 if args.off else 1,
-        'replicas':args.replicas,'acceptance':args.replicas==3,'transport':args.transport,'cache':args.cache,'two_disks':args.two_disks,'platform':'linux' if args.linux else 'boaros','linux_reference':linux_identity}
+        'replicas':args.replicas,'acceptance':args.replicas==3,'transport':args.transport,'cache':args.cache,'two_disks':args.two_disks,'platform_config':args.platform_config,'platform':'linux' if args.linux else 'boaros','linux_reference':linux_identity}
     kernel=work/'kernel'; shutil.copyfile(args.kernel,kernel); identity['kernel_sha256']=digest(kernel)
     bios=work/'firmware'; shutil.copyfile(args.bios,bios); identity['firmware_sha256']=digest(bios)
     if args.kernel_identity:
@@ -82,11 +91,11 @@ def main():
     identity['root_drain_fixture']=args.root_drain_fixture
     identity['trace_read_lbas']=args.trace_read_lbas
     original=None
-    if 'consumer' in cases:
+    if set(cases)&{'consumer','metadata'}:
         original,consumer_identity=originals(ROOT,work,digest); identity.update(consumer_identity)
         identity['consumer_timeout_ms']=args.consumer_timeout_ms
         identity['consumer_command_names']=selected
-        identity['scope']='complete original command set' if len(selected)==16 else 'targeted attribution'
+        identity['scope']='metadata fixed work and selected original commands' if args.case=='metadata' else 'complete original command set' if len(selected)==16 else 'targeted attribution'
         identity['consumer_sync_probes']=args.consumer_sync
         identity['consumer_fixed_readers']=args.consumer_readers
         if len(selected)!=16:identity['acceptance']=False
@@ -99,6 +108,12 @@ def main():
             if args.coordinator_elf:shutil.copyfile(args.coordinator_elf,program)
             else:run([str(compiler),'-fno-link-libatomic','-static','-O2','-pthread','-Wall','-Wextra','-Werror',
                 str(ROOT/'tests/workloads/cost'/f'{case}.c'),'-o',str(program)])
+            if case=='metadata':
+                identity['lmbench_elf_sha256']={}
+                for libc in ('musl','glibc'):
+                    elf=work/(libc+'-lmbench_all')
+                    run(['debugfs','-R',f'dump /{libc}/lmbench_all {elf}',str(original)],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                    identity['lmbench_elf_sha256'][libc]=digest(elf)
             for replica in range(args.replicas):
                 folder=work/f'{case}-{replica}'; folder.mkdir(exist_ok=bool(args.resume_from))
                 reusing = args.resume_from and (folder/'boot.log').is_file() and (folder/'input.json').is_file()
@@ -110,13 +125,13 @@ def main():
                                       'case':case,'root_drain_fixture':args.root_drain_fixture,
                                       'trace_read_lbas':args.trace_read_lbas}.items():
                         if record[key]!=value:raise ValueError('resume input differs: '+key)
-                    if record.get('consumer_command_names')!=selected:raise ValueError('resume command selection differs')
+                    if record.get('consumer_command_names')!=(['consumer-musl-1','consumer-glibc-1'] if case=='metadata' else selected):raise ValueError('resume command selection differs')
                     if case=='consumer' and record.get('consumer_fixed_readers',False)!=args.consumer_readers:raise ValueError('resume reader selection differs')
                     record['input_keys']=list(record);record['input_sha256']=hashlib.sha256(payload.encode()).hexdigest()
                     returncode=0
                 else:
                     disk=folder/'root.img'
-                    if case=='consumer': run(['cp','--sparse=always','--reflink=auto',str(original),str(disk)])
+                    if case in ('consumer','metadata'): run(['cp','--sparse=always','--reflink=auto',str(original),str(disk)])
                     else:
                         with disk.open('wb') as stream: stream.truncate(256*1024*1024)
                         run(['mkfs.ext4','-q','-F','-b','4096',str(disk)])
@@ -150,12 +165,21 @@ def main():
                         flag=folder/'dual-flag'; flag.write_text('two disks\n'); contents+=f'write {flag} /cost-dual\n'
                     commands.write_text(contents)
                     run(['debugfs','-w','-f',str(commands),str(disk)],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                    with disk.open('rb') as prepared:os.fdatasync(prepared.fileno())
                     record={**identity,'case':case,'replica':replica,'elf_sha256':digest(program),'fixture_sha256':digest(disk),'timebase_hz':10000000}
+                    if case=='metadata':
+                        record['consumer_command_names']=['consumer-musl-1','consumer-glibc-1']
+                        record['scope']='metadata fixed work and two selected original iozone commands'
+                        record['acceptance']=args.replicas==3 and not args.metadata_core_only
                     invocation=[args.qemu,'-machine','virt','-bios',str(bios),'-kernel',str(kernel),
                         '-m','512M','-smp','1','-nographic','-no-reboot',
                         '-drive',f'file={disk},if=none,format=raw,id=root,cache={args.cache}',
                         '-global','virtio-mmio.force-legacy='+('true' if args.transport=='legacy' else 'false'),
                         '-device','virtio-blk-device,drive=root,bus=virtio-mmio-bus.0']
+                    if args.platform_config=='official':
+                        invocation[invocation.index('-m')+1]='1G'
+                        global_index=invocation.index('-global');del invocation[global_index:global_index+2]
+                        invocation+=['-device','virtio-net-device,netdev=net','-netdev','user,id=net','-rtc','base=utc']
                     if args.two_disks:
                         second=folder/'second.img'
                         with second.open('wb') as stream: stream.truncate(256*1024*1024)
@@ -165,7 +189,9 @@ def main():
                         record['second_fixture_sha256']=digest(second)
                         invocation+=['-drive',f'file={second},if=none,format=raw,id=second,cache={args.cache}',
                             '-device','virtio-blk-device,drive=second,bus=virtio-mmio-bus.1']
-                    if args.linux: invocation+=['-append','root=/dev/vda rw rootwait console=ttyS0 init=/init loglevel=0 panic=-1','-object','rng-random,id=entropy,filename=/dev/urandom','-device','virtio-rng-device,rng=entropy,bus=virtio-mmio-bus.7']
+                    if args.linux:
+                        invocation+=['-append','root=/dev/vda rw rootwait console=ttyS0 init=/init loglevel=0 panic=-1']
+                        if args.platform_config!='official':invocation+=['-object','rng-random,id=entropy,filename=/dev/urandom','-device','virtio-rng-device,rng=entropy,bus=virtio-mmio-bus.7']
                     if args.trace_read_lbas:invocation+=['-trace',f'enable=virtio_blk_handle_read,file={folder}/reads.trace']
                     dtb=folder/'boot.dtb'; probe=list(invocation); probe[probe.index('-machine')+1]='virt,dumpdtb='+str(dtb)
                     run(probe,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
@@ -176,7 +202,7 @@ def main():
                     record['input_keys']=list(record);record['input_sha256']=hashlib.sha256(frozen.encode()).hexdigest()
                     with (folder/'boot.log').open('w') as boot_log:
                         result=subprocess.Popen(invocation,stdin=subprocess.DEVNULL,stdout=boot_log,stderr=subprocess.STDOUT,text=True)
-                        try: returncode=result.wait(timeout=16*args.consumer_timeout_ms/1000+120 if case=='consumer' else 180)
+                        try: returncode=result.wait(timeout=16*args.consumer_timeout_ms/1000+120 if case in ('consumer','metadata') else 180)
                         except subprocess.TimeoutExpired:
                             result.kill();result.wait();raise
                 output=(folder/'boot.log').read_text()
@@ -184,7 +210,7 @@ def main():
                     raise RuntimeError('guest failed: '+output[-4000:])
                 snapshots=[]; current=None; body=[]; expectations={}; timings={}; metric_expectations={}
                 for line in output.splitlines():
-                    if case=='consumer':line=framed_line(line)
+                    if case in ('consumer','metadata'):line=framed_line(line)
                     if line.startswith('COST METRIC '):
                         _,_,name,metric,value=line.split()
                         metric_expectations.setdefault(name,{})['foreground.'+metric+'.value']=int(value)
@@ -241,6 +267,35 @@ def main():
                     if args.consumer_sync:required|={f'consumer-sync-{i}' for i in range(4)}
                     if args.consumer_readers:required|={f'readers-{relation}-{hot}' for relation in (0,1) for hot in (0,1)}
                     if set(timings)!=required or (not args.off and {s['name'] for s in snapshots}!=required): raise ValueError('consumer coverage')
+                if case=='metadata':
+                    required={f'metadata-{kind}-{held}' for kind in ('stat','open') for held in ('held','unheld')}|{'metadata-fstat-held','metadata-create','metadata-final-sync'}
+                    required|={f'metadata-{libc}-lmbench-{i}' for libc in ('musl','glibc') for i in range(4)}|{'consumer-musl-1','consumer-glibc-1'}
+                    if set(timings)!=required or (not args.off and {s['name'] for s in snapshots}!=required):raise ValueError('metadata workload coverage')
+                    record['commands']=consumer_commands(output,expected_names=['consumer-musl-1','consumer-glibc-1'])
+                    applications=re.findall(r'^COST APPLICATION RESULT (\S+) (\d+) (\d+) (\d+)$',output,re.M)
+                    if len(applications)!=8 or any(int(v[1]) for v in applications):raise ValueError('metadata original applications did not complete')
+                    record['applications']=[]
+                    for name,status,elapsed,drain in applications:
+                        start='COST APPLICATION ARGV '+name+' '
+                        raw=output.split(start,1)[1].split('COST RESULT '+name+' ',1)[0]
+                        index=int(name.rsplit('-',1)[1])
+                        if index<3:
+                            method=('stat','fstat','open/close')[index]
+                            samples=re.findall(r'Simple '+re.escape(method)+r':\s+([0-9.]+) microseconds',raw)
+                            if len(samples)!=1 or float(samples[0])<=0:raise ValueError('lmbench method output missing')
+                        else:
+                            rows=re.findall(r'^\s*(\d+)k[ \t]+(\d+)[ \t]+([0-9.]+)[ \t]+([0-9.]+)',raw,re.M)
+                            if {int(row[0]) for row in rows}!={0,1,4,10} or any(any(float(v)<=0 for v in row[1:]) for row in rows):raise ValueError('lmbench filesystem work output missing')
+                        record['applications'].append(dict(name=name,wait_status=int(status),program_ns=int(elapsed),sync_ns=int(drain),argv=raw.splitlines()[0].split(),raw_output=raw))
+                    work_items=re.findall(r'^COST METADATA WORK (\S+) (\d+)$',output,re.M)
+                    if len(work_items)!=6 or any(int(n)!=(2048 if name=='metadata-create' else 4096) for name,n in work_items):raise ValueError('metadata fixed work incomplete')
+                    record['fixed_work']=work_items
+                    record['actual_scope']='metadata fixed work, eight lmbench and two four-process iozone commands'
+                    record['actual_transport']='legacy' if args.platform_config=='official' else args.transport
+                    record['core_acceptance']=args.replicas==3
+                    record['original_io_completed']=all(c['outcome']=='completed' for c in record['commands'])
+                    if not record['original_io_completed'] and not args.metadata_core_only:raise ValueError('original iozone did not complete')
+                    if args.metadata_core_only:record['actual_scope']='fixed metadata and eight lmbench commands only; extra iozone attempts retain their real failed status'
                 if case=='contract' and not args.off:
                     if {s['name'] for s in snapshots}!={'contract','reuse','inflight','after-abort'} or [s['values']['epoch'] for s in snapshots]!=[1,2,3,5]: raise ValueError('contract epoch/coverage')
                 if case=='latency':

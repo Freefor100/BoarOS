@@ -329,7 +329,7 @@ def prune_pass_images(directory, result, *, dry_run=False):
 def run_suite(manifest, output_dir, driver_elf, linux_kernel, boaros_kernel, *,
               case_ids=None, resume=True, default_timeout=10, boot_timeout=15,
               qemu='qemu-system-riscv64', output_validator=None,
-              keep_pass_images=True):
+              keep_pass_images=True, platform_config='fixture'):
     """Run all selected cases serially; persist each result before continuing.
 
     A driver or guest failure affects its case only. No result is called pass
@@ -337,6 +337,7 @@ def run_suite(manifest, output_dir, driver_elf, linux_kernel, boaros_kernel, *,
     An interruption leaves remaining records explicitly not-run; repeat the
     same invocation to resume, or set case_ids to select independent cases.
     """
+    if platform_config not in ('fixture','official'):raise ValueError('unknown platform configuration')
     manifest = json.loads(Path(manifest).read_text()) if not isinstance(manifest, dict) else manifest
     destination = Path(output_dir).resolve()
     destination.mkdir(parents=True, exist_ok=True)
@@ -365,6 +366,7 @@ def run_suite(manifest, output_dir, driver_elf, linux_kernel, boaros_kernel, *,
         identity['tools'][str(tool)] = {'path': executable, 'sha256': digest(executable),
                                       'version': version}
     # Validate source bytes on every resume, even when manifest omitted hashes.
+    identity['platform_config']=platform_config
     identity['inputs'] = {entry['source']: digest(entry['source']) for entry in manifest.get('files', []) if 'source' in entry}
     if output_validator is not None:
         validator_source = inspect.getsourcefile(output_validator)
@@ -429,6 +431,10 @@ def run_suite(manifest, output_dir, driver_elf, linux_kernel, boaros_kernel, *,
                         '-m', '512M', '-smp', '1', '-nographic', '-no-reboot',
                         '-drive', f'file={disk},if=none,format=raw,id=root',
                         '-device', 'virtio-blk-device,drive=root,bus=virtio-mmio-bus.0']
+                if platform_config == 'official':
+                    at=argv.index('-object');del argv[at:at+4]
+                    argv[argv.index('-m')+1]='1G'
+                    argv+=['-device','virtio-net-device,netdev=net','-netdev','user,id=net','-rtc','base=utc']
                 if name == 'linux':
                     argv += ['-append', 'root=/dev/vda rw rootwait console=ttyS0 init=/init loglevel=0 panic=-1']
                 log = directory / (name + '.log')

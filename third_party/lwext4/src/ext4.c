@@ -1376,7 +1376,7 @@ Unlock:
     return r;
 }
 
-int ext4_file_set_mode(ext4_file *file, uint32_t mode)
+static int ext4_file_set_mode_common(ext4_file *file, uint32_t mode, bool initial)
 {
     if (!file || !file->mp || !file->mp->mounted) return EINVAL;
     struct ext4_mountpoint *mp = file->mp;
@@ -1392,7 +1392,7 @@ int ext4_file_set_mode(ext4_file *file, uint32_t mode)
         ext4_inode_set_mode(&mp->fs.sb, ref.inode,
                             (previous & ~0xfffU) | (mode & 0xfffU));
         ref.dirty = true;
-        ext4_touch_inode(mp, &ref, EXT4_TIME_CTIME);
+        if (!initial) ext4_touch_inode(mp, &ref, EXT4_TIME_CTIME);
         r = ext4_fs_put_inode_ref(&ref);
     }
     r = ext4_trans_finish(mp, r);
@@ -1403,6 +1403,12 @@ Unlock:
     EXT4_MP_UNLOCK(mp);
     return r;
 }
+
+int ext4_file_set_mode(ext4_file *file, uint32_t mode)
+{ return ext4_file_set_mode_common(file, mode, false); }
+
+int ext4_file_set_mode_initial(ext4_file *file, uint32_t mode)
+{ return ext4_file_set_mode_common(file, mode, true); }
 
 int ext4_file_set_owner(ext4_file *file, uint32_t uid, uint32_t gid)
 {
@@ -2852,6 +2858,10 @@ static int ext4_ftruncate_no_lock(ext4_file *file, uint64_t size)
 
 	old_size = ext4_inode_get_size(sb, ref.inode);
 	file->fsize = old_size;
+	/* 固定 root 保留 set-ID；capability 与大小修改共用操作 undo。 */
+	r = ext4_xattr_remove(&ref, 6, "capability", 10);
+	if (r == ENODATA) r = EOK;
+	if (r != EOK) goto Finish;
 	if (old_size == size)
 		goto Finish;
 

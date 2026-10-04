@@ -232,7 +232,7 @@ enum kernel_files_status kernel_files_sync(struct kernel_files *files,
     struct kernel_open_file_description *description = 0;
     if (!kernel_files_is_live(files) || linux_result == 0)
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
-    enum kernel_files_status status = kernel_files_pin(files, fd, &description,
+    enum kernel_files_status status = kernel_files_pin_data(files, fd, &description,
                                                        linux_result);
     if (status != KERNEL_FILES_STATUS_OK || *linux_result != 0) return status;
     enum kernel_open_file_kind kind = kernel_open_file_kind(description);
@@ -571,7 +571,7 @@ enum kernel_files_status kernel_files_read(
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
     }
     files->record->statistics.read_calls++;
-    status = kernel_files_pin(files, fd, &description, linux_result);
+    status = kernel_files_pin_data(files, fd, &description, linux_result);
     if (status != KERNEL_FILES_STATUS_OK) {
         return status;
     }
@@ -605,7 +605,7 @@ enum kernel_files_status kernel_files_readv(
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
     }
     files->record->statistics.read_calls++;
-    status = kernel_files_pin(files, fd, &description, linux_result);
+    status = kernel_files_pin_data(files, fd, &description, linux_result);
     if (status != KERNEL_FILES_STATUS_OK) {
         return status;
     }
@@ -885,7 +885,7 @@ enum kernel_files_status kernel_files_pread(
     if (!kernel_files_is_live(files) || mm == 0 || linux_result == 0)
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
     files->record->statistics.read_calls++;
-    status = kernel_files_pin(files, fd, &description, linux_result);
+    status = kernel_files_pin_data(files, fd, &description, linux_result);
     if (status != KERNEL_FILES_STATUS_OK) return status;
     if (*linux_result != 0) {
         files->record->statistics.read_failures++;
@@ -1083,7 +1083,7 @@ enum kernel_files_status kernel_files_sendfile(
             sizeof(position), &copied) != KERNEL_UACCESS_STATUS_OK || copied != sizeof(position))) {
         *linux_result = -KERNEL_EFAULT; return KERNEL_FILES_STATUS_OK;
     }
-    enum kernel_files_status status = kernel_files_pin(files, in_fd, &input, linux_result);
+    enum kernel_files_status status = kernel_files_pin_data(files, in_fd, &input, linux_result);
     files->record->statistics.read_calls++;
     files->record->statistics.write_calls++;
     if (status != KERNEL_FILES_STATUS_OK || *linux_result != 0) goto done;
@@ -1097,7 +1097,7 @@ enum kernel_files_status kernel_files_sendfile(
         checked_position > (uint64_t)INT64_MAX - count) {
         *linux_result = -KERNEL_EINVAL; goto done;
     }
-    status = kernel_files_pin(files, out_fd, &output, linux_result);
+    status = kernel_files_pin_data(files, out_fd, &output, linux_result);
     if (status != KERNEL_FILES_STATUS_OK || *linux_result != 0) goto done;
     if (!description_writable(output)) { *linux_result = -KERNEL_EBADF; goto done; }
     /* 两份 pin 由仍会恢复的 syscall 栈持有；退出先唤醒等待，正常展开再交还。 */
@@ -1527,7 +1527,7 @@ enum kernel_files_status kernel_files_write(
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
     }
     files->record->statistics.write_calls++;
-    status = kernel_files_pin(files, fd, &description, linux_result);
+    status = kernel_files_pin_data(files, fd, &description, linux_result);
     if (status != KERNEL_FILES_STATUS_OK) {
         return status;
     }
@@ -1584,7 +1584,7 @@ enum kernel_files_status kernel_files_pwrite(
     if (!kernel_files_is_live(files) || mm == 0 || linux_result == 0)
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
     files->record->statistics.write_calls++;
-    status = kernel_files_pin(files, fd, &description, linux_result);
+    status = kernel_files_pin_data(files, fd, &description, linux_result);
     if (status != KERNEL_FILES_STATUS_OK) return status;
     if (*linux_result != 0) {
         *linux_result = -KERNEL_EBADF;
@@ -1642,7 +1642,7 @@ enum kernel_files_status kernel_files_writev(
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
     }
     files->record->statistics.write_calls++;
-    status = kernel_files_pin(files, fd, &description, linux_result);
+    status = kernel_files_pin_data(files, fd, &description, linux_result);
     if (status != KERNEL_FILES_STATUS_OK) {
         return status;
     }
@@ -1813,7 +1813,7 @@ enum kernel_files_status kernel_files_lseek(
     struct kernel_open_file_description *description = 0;
     if (!kernel_files_is_live(files) || !linux_result)
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
-    enum kernel_files_status status = kernel_files_pin(files, fd, &description, linux_result);
+    enum kernel_files_status status = kernel_files_pin_data(files, fd, &description, linux_result);
     if (status != KERNEL_FILES_STATUS_OK || *linux_result) return status;
     if (whence > 4U) {
         *linux_result = -KERNEL_EINVAL;
@@ -1836,7 +1836,7 @@ enum kernel_files_status kernel_files_ftruncate(
     if (!kernel_files_is_live(files) || linux_result == 0) {
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
     }
-    status = kernel_files_pin(files, fd, &description, linux_result);
+    status = kernel_files_pin_data(files, fd, &description, linux_result);
     if (status != KERNEL_FILES_STATUS_OK) {
         return status;
     }
@@ -1888,6 +1888,10 @@ enum kernel_files_status kernel_files_getdents(
     KERNEL_FILES_PIN_SCOPE(pin_guard);
     description = kernel_files_hold_fd(files, fd, &pin_guard);
     if (description == 0) {
+        *linux_result = -KERNEL_EBADF;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_PATH) {
         *linux_result = -KERNEL_EBADF;
         return KERNEL_FILES_STATUS_OK;
     }

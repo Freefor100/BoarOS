@@ -1143,7 +1143,7 @@ static int ext4_backend_create(struct kernel_vfs_mount *mount,
     if (result == EOK) {
         result = ext4_fopen2(lwext4_node_file(node), path, O_CREAT | O_RDWR);
         if (result == EOK)
-            result = ext4_mode_set(path, (mode & 07777U) | KERNEL_VFS_S_IFREG);
+            result = ext4_file_set_mode_initial(lwext4_node_file(node), (mode & 07777U) | KERNEL_VFS_S_IFREG);
         if (result == EOK) result = ext4_transaction_end(adapter->mount_point);
         else (void)ext4_transaction_abort(adapter->mount_point, result);
     }

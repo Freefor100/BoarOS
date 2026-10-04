@@ -104,6 +104,9 @@ int kernel_vfs_path_resolve(struct kernel_vfs_path *start,
                             const char *path, int follow_final,
                             struct kernel_vfs_path **owner);
 uint64_t kernel_vfs_path_inode(const struct kernel_vfs_path *path);
+int kernel_vfs_path_truncate(struct kernel_vfs_path *path, uint64_t size);
+uint32_t kernel_vfs_path_mode(const struct kernel_vfs_path *path);
+int kernel_vfs_path_readlink(struct kernel_vfs_path *path, char *buffer, size_t size, size_t *read);
 int kernel_vfs_path_stat(const struct kernel_vfs_path *path,
                          struct kernel_vfs_stat *stat);
 int kernel_vfs_path_set_times(struct kernel_vfs_path *path,

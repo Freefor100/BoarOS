@@ -22,6 +22,7 @@ def main():
     parser=argparse.ArgumentParser(__doc__)
     parser.add_argument('--only',choices=('linux','boaros'))
     parser.add_argument('--workload',choices=('contract','content','timer','budget','interface','sendfile'),default='contract')
+    parser.add_argument('--platform-config',choices=('fixture','official'),default='fixture')
     parser.add_argument('--kernel',type=Path,default=ROOT/'kernel-rv')
     args=parser.parse_args()
     if args.workload=='budget' and args.only!='boaros':
@@ -46,6 +47,9 @@ def main():
         command=[qemu,'-machine','virt','-bios','default','-kernel',str(snapshot),'-m','512M','-smp','1',
                  '-nographic','-no-reboot','-drive',f'file={disk},if=none,format=raw,id=root',
                  '-device','virtio-blk-device,drive=root,bus=virtio-mmio-bus.0']
+        if args.platform_config=='official':
+            command[command.index('-m')+1]='1G'
+            command+=['-device','virtio-net-device,netdev=net','-netdev','user,id=net','-rtc','base=utc']
         if name=='linux':command+=['-append','root=/dev/vda rw rootwait console=ttyS0 init=/init loglevel=0 panic=-1']
         log=work/(name+'.log')
         try:harness.run_logged(command,log,60)
