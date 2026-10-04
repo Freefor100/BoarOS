@@ -992,6 +992,56 @@ static unsigned run_idle_irq_return_case(struct physical_page_allocator *allocat
     return failure + (physical_page_available(allocator) != available);
 }
 
+static unsigned exit_join_done;
+static struct kernel_thread_join exit_cleanup_owner;
+
+static void exit_cleanup_entry(void *argument)
+{
+    (void)argument;
+    (void)riscv_interrupt_save();
+    kernel_scheduler_register_cleanup();
+    for (;;) {
+        struct kernel_thread_completion completion;
+        while (kernel_scheduler_reap_one(&completion) == KERNEL_SCHEDULER_STATUS_OK) { }
+        kernel_scheduler_wait_cleanup(0);
+    }
+}
+
+static void exit_empty_entry(void *argument) { (void)argument; }
+
+static void exit_join_entry(void *argument)
+{
+    (void)argument;
+    struct kernel_thread_join child = {0};
+    if (kernel_thread_create_joinable(exit_empty_entry, 0, &child) != KERNEL_SCHEDULER_STATUS_OK)
+        return;
+    kernel_thread_join(&child);
+    exit_join_done = 1;
+}
+
+static unsigned run_exit_dispatch_case(struct physical_page_allocator *allocator)
+{
+    /* 最后运行：此 worker 与生产 cleanup 一样由启动 owner 保有至 shutdown。 */
+    if (kernel_thread_create_joinable(exit_cleanup_entry, 0, &exit_cleanup_owner)
+            != KERNEL_SCHEDULER_STATUS_OK ||
+        kernel_scheduler_yield_current() != KERNEL_SCHEDULER_STATUS_OK)
+        return 1;
+    uint64_t available = physical_page_available(allocator);
+    if (kernel_thread_create(exit_join_entry, 0) != KERNEL_SCHEDULER_STATUS_OK ||
+        kernel_scheduler_yield_current() != KERNEL_SCHEDULER_STATUS_OK)
+        return 1;
+    /* fixture 未启动 timer；退出、join 唤醒和清理必须自行连续进展。 */
+    unsigned failure = !exit_join_done;
+    for (unsigned retry = 0; retry < 4; retry++)
+        if (kernel_scheduler_yield_current() != KERNEL_SCHEDULER_STATUS_OK) failure++;
+    if (!exit_join_done || physical_page_available(allocator) != available)
+        failure++;
+    virt_uart_puts("BoarOS: exit dispatch failures=");
+    virt_uart_put_hex(failure);
+    virt_uart_putc('\n');
+    return failure;
+}
+
 static unsigned handoff_order;
 static unsigned handoff_count, handoff_events[33];
 static void handoff_waiter(void *argument)
@@ -1100,6 +1150,7 @@ void kernel_main(unsigned long hart_id, const void *dtb)
     failures += run_sync_cases(&allocator);
     failures += run_idle_irq_return_case(&allocator);
     failures += run_handoff_cases(&allocator);
+    failures += run_exit_dispatch_case(&allocator);
 
     virt_uart_puts("BoarOS: scheduler cases failures=");
     virt_uart_put_hex(failures);

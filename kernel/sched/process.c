@@ -1739,18 +1739,19 @@ static void kernel_thread_finish(
     exited_append(current);
     if (current->join) (void)kernel_wait_queue_wake_all(&current->join->waiters);
 
-    /* Resume the saved cleanup context even when users remain runnable;
-     * zombie publication and group teardown must not depend on idleness. */
-    next = &scheduler.idle;
+    scheduler_account_runtime();
+    /* cleanup 已有可调度 owner；不能把 ready joiner 送入 idle 的 WFI。
+     * 无 worker 的 fixture 仍回到负责回收的可信空闲栈。 */
+    next = scheduler.cleanup_task ? ready_best() : 0;
+    if (!next) next = &scheduler.idle;
     status = activate_thread_address_space(next);
     if (status != KERNEL_SCHEDULER_STATUS_OK) {
         switch_to_fatal_idle(status);
     }
     if (next != &scheduler.idle) {
-        next = ready_pop();
+        ready_remove(next);
         next->state = KERNEL_THREAD_STATE_RUNNING;
     }
-    scheduler_account_runtime();
 #if BOAROS_COST_DIAGNOSTICS
     kernel_cost_switch(&scheduler.current->cost, &next->cost);
 #endif

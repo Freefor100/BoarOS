@@ -14,7 +14,7 @@ BoarOS 是从零搭建、面向 OS Comp 能力建设的 C / 少量汇编内核�
 |---|---|---|
 | 启动与内存 | OpenSBI、DTB、高半区/direct map、buddy/slab、连续页和引用回收 | 无 SMP；任务栈有 canary/高水位，没有未映射 guard page |
 | 虚拟内存 | VMA、按需匿名页、共享匿名与共享文件映射、文件私有 COW、共享文件首次写追踪、`msync`、跨 MM 截断撤映射 | 无 `mremap`、按操作区分的 `madvise`、共享文件 futex、匿名共享页 swap 回收或 SMP 页表同步 |
-| ELF / exec | shebang、按需 ELF、PIE、`PT_INTERP`、初始栈/auxv、musl DSO/TLS、固定 glibc 2.44 启动/TLS/pthread 子集、失败保持旧映像 | 无 `execveat`；glibc 应用覆盖尚有限 |
+| ELF / exec | shebang、按需 ELF、PIE、`PT_INTERP`、初始栈/auxv、musl DSO/TLS、固定 glibc 2.44 启动/TLS/pthread及取消子集、失败保持旧映像 | 无 `execveat`；glibc 应用覆盖尚有限 |
 | 进程与等待 | 统一 TID/TGID/PGID/SID 身份对象、会话/进程组、fork/vfork、child-TID 生命周期差分、pthread clone、线程组退出、非组长 exec、wait/zombie/reparent、时钟与睡眠、进程组 ITIMER_REAL/SIGALRM | 合法 clone 组合仍有限；控制终端仅串口，PTY 未交付；单 hart 关中断不等于跨核同步 |
 | 调度 | OTHER tick 轮转、FIFO/RR 1–99 优先级、CPU0 affinity、RESET_ON_FORK、可配置全局实时预算及 proc 查询 | 默认 1 秒 / 950 毫秒；无 nice 权重、PI、SMP 或硬实时保证 |
 | 随机数 | ChaCha20 fast-key-erasure、BLAKE2s 混种、legacy/modern VirtIO RNG、`getrandom` 与 random/urandom 字符节点 | QEMU 宿主是信任边界；DTB/用户写入不计可信熵，缺设备时保持未就绪 |
@@ -32,7 +32,7 @@ BoarOS 是从零搭建、面向 OS Comp 能力建设的 C / 少量汇编内核�
 
 块驱动对读、写及FLUSH采用30秒有限请求期限，保留真实超时、reset与DMA owner边界；官方镜像副本无需通过宿主预同步规避一秒误判。
 
-文件层已有部分读写、OFD 生命周期、稀疏文件与映射截断的语义深度；显式时间设置和真实挂载统计已接入；共享匿名映射已迁移统一稀疏内存后备对象，与共享文件页均可跨 MM 读写，串口交互 TTY 已交付，PTY、其他行规程和完整 modem 控制仍有缺口。ext4 恢复已覆盖 512 字节原子写、未 flush 写丢失或重排的故障模型；实板持久性仍待独立验证。固定 glibc 2.44 的五种 ELF 形态与 TLS/pthread/信号组合已双侧验证，完整 glibc 应用兼容尚未证明。
+文件层已有部分读写、OFD 生命周期、稀疏文件与映射截断的语义深度；显式时间设置和真实挂载统计已接入；共享匿名映射已迁移统一稀疏内存后备对象，与共享文件页均可跨 MM 读写，串口交互 TTY 已交付，PTY、其他行规程和完整 modem 控制仍有缺口。ext4 恢复已覆盖 512 字节原子写、未 flush 写丢失或重排的故障模型；实板持久性仍待独立验证。固定 glibc 2.44 的五种 ELF 形态与 TLS/pthread/取消清理/信号组合已双侧验证，完整 glibc 应用兼容尚未证明。
 
 内存统计按文件页、共享匿名/tmpfs 后备页和各盘块缓冲真实 owner 计量；`sysinfo` 返回真实任务数与 1/5/15 分钟负载。原镜像 BusyBox `free` 已显示有效容量，LTP 越过缺失 `Cached` 的阻塞。已新增由真实 timer 快照支持的 coarse clock，并通过窄差分；原静态/动态 glibc `utime` 各 30 次复跑通过，诊断环境边界见[文件时间](docs/learning/file-timestamps.md)。LTP cgroup 辅助程序等待已独立定位，见[路线与验收](docs/goals.md)。
 
@@ -50,7 +50,7 @@ BoarOS 是从零搭建、面向 OS Comp 能力建设的 C / 少量汇编内核�
 make all                       # kernel-rv
 make test-riscv                 # 通用模块、架构与真实根启动
 make test-userland-riscv        # 静态 musl、动态 pthread / TLS
-make test-glibc-riscv           # 固定 glibc 2.44 静态/动态/PIE、TLS、pthread
+make test-glibc-riscv           # 固定 glibc 2.44 静态/动态/PIE、TLS、pthread与取消
 make test-diff-abi-riscv        # 同一 ELF 对照固定 Linux
 make test-io-sleep-riscv        # 暂扣响应验证并发、计算/缓存进展、flush 与 reset
 make test-cost-riscv COST_CASE=contract # 默认关闭的诊断窗口，三个启动副本

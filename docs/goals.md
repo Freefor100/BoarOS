@@ -16,7 +16,7 @@ N3已经交付：legacy/modern VirtIO-net、受限DMA借用与复制回退、静
 |---|---|
 | 历史Virtqueue告警 | 已还原到旧兼容内核的五连接loopback；原启动只有块盘和RNG，没有VirtIO-net。具体报错队列与超额原因仍未知；后续失败必须先保留新快照，按队列身份定位，不以重复通过关闭。 |
 | 历史页释放fatal的具体现场 | 已修复能够产生同类fatal的分配器双owner竞态；原事件没有owner快照，不能反推唯一触发链。 |
-| pthread取消与旧libc输入 | 动态glibc的cancel/exit先核对真实libgcc_s依赖；静态cancel-points的join结果另行定位，不能用补库解释全部失败。历史偶发现场仍保留P0c边界，不安排无目的重复次数。 |
+| pthread取消与旧libc输入 | 原镜像动态glibc的cancel/exit缺libgcc_s；独立glibc运行环境已固定unwind依赖并保护取消/cleanup。静态cancel-points的join结果在固定Linux也失败，按库/测试契约继续核对，不能归给内核。历史偶发现场仍保留P0c边界，不安排无目的重复次数。 |
 | 内核抢占边界 | allocator修复不等于所有共享状态已审完。限定检查开中断worker到共享对象的调用链、睡眠前引用和发布临界区；发现具体错误才扩大。 |
 
 [风险证据与重建](learning/cost-baseline.md#旧版内存释放与-virtqueue-告警2026-10-02)
@@ -32,9 +32,9 @@ N3已经交付：legacy/modern VirtIO-net、受限DMA借用与复制回退、静
 | 优先级/能力编号 | 明确问题与下一项交付 |
 |---|---|
 | 1．P1/P2e 文件所有权 | 公共LTP临时目录准备调用chown，当前缺fchownat/fchown。先确认“真实inode所有权元数据＋固定root”或“连同凭据/权限”的边界，再实现ext4/tmpfs、ctime、保留值、只读与错误路径；不返回空成功，也不把解锁准备阶段算目标测例通过。 |
-| 2．P1/P0c 局部ABI纠错 | 记录锁的flock复制与对象类型错误顺序有源码支持的差异；静态glibc取消/join及fd耗尽路径需匹配参考定位。每项先做窄反例；旧musl NULL栈clone和EINTR重试先归输入层，不改内核迎合包装器。 |
+| 2．P1/P0c 局部ABI纠错 | 记录锁已保护坏fd与坏flock的错误优先级；原glibc取消/join及fd耗尽路径以匹配Linux区分库行为和内核差异。每项先做窄反例；旧musl NULL栈clone和EINTR重试先归输入层，不改内核迎合包装器。 |
 | 3．P2/P5 时间与可用诊断 | times的内核时间仅按timer中断采样，不能表示全部短syscall成本；先验证记账缺口，再设计运行边界结算。旧glibc补匹配的unwind依赖；账户、工具、scratch设备与原ELF编译缺项分别处理。 |
-| 性能候选，仅选一项 | 空文件创建/删除、路径stat/open、1ms睡眠唤醒或TCP背压，先选择目标应用和固定工作量。比较具体机制与资源代价，不同时改存储、timer和调度器。 |
+| 性能候选，仅选一项 | 线程退出到ready调度的idle中转已纠正；下一候选为空文件创建/删除、路径stat/open、1ms睡眠唤醒或TCP背压，先选择目标应用和固定工作量。比较具体机制与资源代价，不同时改存储、timer和调度器。 |
 
 PTY＋原BusyBox script保留为下一项应用候选。更大离线工程、外部网络与凭据体系由实际
 使用流程选择；LoongArch是双架构交付依赖，SMP另行规划。cgroup、NUMA、BPF等没有因

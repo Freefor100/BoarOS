@@ -128,8 +128,6 @@ enum kernel_files_status kernel_files_fcntl_lock(
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
     status = kernel_files_pin(files, fd, &file, linux_result);
     if (status != KERNEL_FILES_STATUS_OK || !file) return status;
-    node = kernel_open_file_node(file);
-    if (!node) { *linux_result = -KERNEL_EBADF; goto out; }
     access = kernel_copy_from_user(mm, &flock, user_flock,
                                     sizeof(flock), &copied);
     if (access == KERNEL_UACCESS_STATUS_FAULT) {
@@ -140,6 +138,9 @@ enum kernel_files_status kernel_files_fcntl_lock(
         status = KERNEL_FILES_STATUS_STATE;
         goto out;
     }
+    /* fd pin 先于复制；有效 fd 的坏 flock 不能被对象类型错误遮蔽。 */
+    node = kernel_open_file_node(file);
+    if (!node) { *linux_result = -KERNEL_EBADF; goto out; }
     if (flock.type < 0 || flock.type > 2 ||
         (query && !kind && flock.type == 2) ||
         (kind && flock.pid != 0)) {

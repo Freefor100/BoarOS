@@ -7,6 +7,7 @@
   },
   "runtime": {
     "/usr/riscv64-linux-gnu/lib/ld-linux-riscv64-lp64d.so.1": "f7c08812fe4e07dab8c3895ec3134a9c6695bfd1ece495530b280c1edfc11edb",
-    "/usr/riscv64-linux-gnu/lib/libc.so.6": "4103e7ae1d355639a116bd5393fd9ba03c6a3cd78b8e08bafd3fe9642c6fe9f5"
+    "/usr/riscv64-linux-gnu/lib/libc.so.6": "4103e7ae1d355639a116bd5393fd9ba03c6a3cd78b8e08bafd3fe9642c6fe9f5",
+    "/usr/riscv64-linux-gnu/lib/libgcc_s.so.1": "5db693cd3e297f726a106de22a0aefed7f5bc655d3f864bec041ca3629bb76a7"
   }
 }

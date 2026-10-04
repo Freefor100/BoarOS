@@ -138,9 +138,18 @@ SQLite 大事务需要 Unix VFS 探测临时目录。固定 `build/riscv/sqlite/
 
 ## glibc 2.44 独立矩阵
 
-`tests/userland/glibc/inputs.json` 固定宿主 RV64 GNU 工具链的 GCC、assembler、linker，以及未经修改的 `/usr/riscv64-linux-gnu/lib/ld-linux-riscv64-lp64d.so.1` 和 `libc.so.6` 的绝对路径与 SHA-256。loader 为 `f7c08812fe4e07dab8c3895ec3134a9c6695bfd1ece495530b280c1edfc11edb`，libc 为 `4103e7ae1d355639a116bd5393fd9ba03c6a3cd78b8e08bafd3fe9642c6fe9f5`；libc 内版本字符串为 2.44。身份不符即失败，不以另一个宿主 glibc 代跑。固定源码参考为 `references/glibc/glibc-2.44.tar.xz`，SHA-256 `37f600f2bef3c5e8300147059568b2a2e40a7ad6ccc65ce942556d49429cc667`；官方 URL 和 2026-09-27 访问日期见 `references/sources.tsv`。源码归档用于 ABI/许可证分析，不代表已证明宿主二进制从该归档逐位重建。
+`tests/userland/glibc/inputs.json` 固定 RV64 GNU 工具链及 loader、`libc.so.6`、
+`libgcc_s.so.1` 的机器身份。当前 GNU 工具链为 GCC 16.2.1，libc 为 glibc 2.44；
+身份不符即失败，不用另一套运行库代跑。glibc 可能直到 pthread 取消／退出时才加载
+unwind 库，因此程序进入 main 不能证明运行依赖完整。源码背景使用
+`references/glibc/glibc-2.44.tar.xz`，二进制身份与源码构建证明分别维护。
 
-`make test-glibc-riscv` 编译同一源的静态 ET_EXEC、动态 ET_EXEC、动态 PIE、静态 PIE 和动态 pthread PIE，以及独立 TLS DSO；各 ELF 保留 GNU 编译器默认启动对象和 glibc，不修改二进制绕开内核。runner 将同一 ELF、loader/libc/DSO 分别放入 Linux 和 BoarOS 的隔离 ext4 镜像，使用固定 Linux commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`。它按 constructor/main、运行时、`atexit` 和 BoarOS 资源回收逐段判定失败。组合探针覆盖初始 TLS、`dlopen` 后主线程与新线程的独立 TLS、`pthread_create/join`、信号 handler 和退出；输出身份保存于 `build/riscv/glibc/identity.json`，成功后的运行镜像自动清理。构建命令为 `make test-glibc-riscv`。这只是固定版本上的已列举 ABI 子集，完整 glibc 应用及离线客体内编译仍待独立验证。
+`make test-glibc-riscv` 编译同一源的静态 ET_EXEC、动态 ET_EXEC、动态 PIE、静态
+PIE 和动态 pthread PIE，以及独立 TLS DSO。runner 将同一 ELF 和完整运行库放入
+Linux 7.2 与 BoarOS 的隔离 ext4 镜像，分 constructor/main、运行时、atexit 和资源
+回收检查。组合探针覆盖独立 TLS、dlopen、pthread 创建／join、阻塞读取期间的取消及
+cleanup handler、信号 handler 和正常退出。取消时管道与暂存 owner 仍由原请求及
+共享文件表清理；不能由缺库 abort 冒充内核取消语义测试。
 
 glibc 2.44 的 `pthread_join` 通过 `FUTEX_WAIT_BITSET | FUTEX_CLOCK_REALTIME` 等待线程退出；初始试跑在 BoarOS 返回 ENOSYS，glibc 因意外 futex 错误退出。`tests/diff-abi/futex_shared.c` 的同一 ELF 现在对照固定 Linux 检查 bitset 零值、绝对时钟、用户 fault、按掩码唤醒与 requeue；`tests/userland/pthread.c` 进一步检查 stop/continue 重启保留掩码与原截止时刻。当前内核 realtime offset 启动后不变，可一次换算为 monotonic；引入调时 syscall 时需重新处理阻塞中的 realtime deadline。
 
