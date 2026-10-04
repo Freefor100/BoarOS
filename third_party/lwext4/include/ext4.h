@@ -149,6 +149,8 @@ int ext4_file_set_times(ext4_file *file, unsigned fields,
 /* Preserve inode identity after unlink; update permission bits and ctime in one
  * transaction, with the same file error owner as other metadata mutations. */
 int ext4_file_set_mode(ext4_file *file, uint32_t mode);
+/* Creation permission setup preserves the inode creation timestamps. */
+int ext4_file_set_mode_initial(ext4_file *file, uint32_t mode);
 /* Live inode owner update, set-ID/capability removal and ctime share one
  * operation transaction. UINT32_MAX preserves the corresponding ID. */
 int ext4_file_set_owner(ext4_file *file, uint32_t uid, uint32_t gid);

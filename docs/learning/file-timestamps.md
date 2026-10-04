@@ -34,7 +34,8 @@ VFS 在 mount 上绑定可选 realtime 回调，未初始化 kernel clock 时返
 提交的字节数，metadata 更新不构成数据进度。
 
 创建时直接初始化新 inode 的 atime/mtime/ctime；权限通过同一 inode handle 设置，
-避免成功创建后再次解析完整路径，操作仍在原事务内失败回滚。成功目录链接/移除更新父目录 mtime/ctime，
+避免成功创建后再次解析完整路径，操作仍在原事务内失败回滚。初始化权限
+不重新采样ctime，普通chmod则更新ctime；两者不能混用。成功目录链接/移除更新父目录 mtime/ctime，
 unlink 更新子 inode ctime。truncate 在活 inode 修改后更新 mtime/ctime，包括同长度请求；
 已改变大小但后续错误的 inode 状态仍按原 VFS mutation reconciliation 保持可见。
 
