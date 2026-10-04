@@ -376,7 +376,13 @@ RV64 `truncate(45)`复制完整pathname后取得稳定path；相对cwd、绝对�
 `make test-lwext4-metadata-host`包含共享EA、操作abort和持久化格式核对，
 `sh tests/lwext4-metadata-host.sh truncate`可只检查新增属性边界。
 
-全局`sync(81)`与`syncfs(267)`尚未接入，不能由`fsync/fdatasync`已支持推导它们可用。
-libc的void `sync()`不向调用者返回错误，工具退出0也不证明完成同步。持久化验收使用
-检查返回值的文件与目录fsync，再核对重启结果；未来全局接口需独立处理挂载引用、
-并发修改的目标边界及真实I/O错误。
+RV64 `sync(81)`同步当前单一挂载树；`syncfs(267)`同步fd实际所属挂载，O_PATH返回
+EBADF，字符节点及命名FIFO不改变所属挂载。匿名pipe/socket/epoll与无路径console没有
+持久化后端，不能借它们同步根盘。tmpfs/procfs的同步不制造设备I/O。
+OFD持有独立挂载错误游标，新打开从当前序号开始，dup/fork共享观察位置；文件fsync
+的inode游标保持独立。内存不足保留脏数据和真实owner，可重试；真实EIO/ENOSPC记录到
+所属挂载，不因一次观察或任务退出而清除设备／journal冻结状态。
+全局sync始终返回0，并继续尝试其他挂载，因此工具退出0仍不能替代持久化结果验证。
+快照、durable边界及OOM退路见[VFS契约](vfs-ext4.md)；窄入口为
+`make test-vfs-riscv test-files-riscv`及`tests/diff-abi/sync-cases.txt`，真实libc入口为
+`tests/userland/sync.h`。

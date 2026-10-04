@@ -244,6 +244,27 @@ enum kernel_files_status kernel_files_sync(struct kernel_files *files,
     return release_io_description(files, &description, KERNEL_FILES_STATUS_OK);
 }
 
+enum kernel_files_status kernel_files_syncfs(struct kernel_files *files,
+    int64_t fd, int64_t *linux_result)
+{
+    struct kernel_open_file_description *description = 0;
+    if (!kernel_files_is_live(files) || !linux_result)
+        return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
+    enum kernel_files_status status = kernel_files_pin_data(files, fd, &description, linux_result);
+    if (status != KERNEL_FILES_STATUS_OK || *linux_result) return status;
+    if (description->file.mount)
+        *linux_result = kernel_vfs_sync_mount(description->file.mount,
+                                               &description->observed_mount_error);
+    else {
+        /* 匿名pipe/socket/epoll及无路径console没有持久化后端。 */
+        enum kernel_open_file_kind kind = kernel_open_file_kind(description);
+        *linux_result = kind == KERNEL_OPEN_FILE_KIND_PIPE || kind == KERNEL_OPEN_FILE_KIND_SOCKET ||
+                        kind == KERNEL_OPEN_FILE_KIND_EPOLL || kind == KERNEL_OPEN_FILE_KIND_CONSOLE
+                            ? 0 : -KERNEL_ENOTSUP;
+    }
+    return release_io_description(files, &description, KERNEL_FILES_STATUS_OK);
+}
+
 static enum kernel_files_status read_pinned(
     struct kernel_files *files,
     struct kernel_mm *mm,

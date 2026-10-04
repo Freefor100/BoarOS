@@ -7,6 +7,7 @@
 #include <kernel/task.h>
 #include <kernel/socket.h>
 #include <kernel/uaccess.h>
+#include <kernel/vfs.h>
 
 #include <stddef.h>
 #include <stdint.h>
@@ -369,6 +370,29 @@ enum kernel_syscall_status syscall_handle_fsync(
         kernel_files_sync(files, (int64_t)(int32_t)request->arguments[0],
                            datasync, &result) != KERNEL_FILES_STATUS_OK) {
         return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    }
+    decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+    decoded->value = result;
+    return KERNEL_SYSCALL_STATUS_OK;
+}
+
+enum kernel_syscall_status syscall_handle_sync(
+    struct kernel_task *caller, const struct kernel_syscall_request *request,
+    struct kernel_syscall_result *decoded, int filesystem_only)
+{
+    int64_t result = 0;
+    if (filesystem_only) {
+        struct kernel_files *files;
+        enum kernel_task_status status = kernel_task_files_borrow(caller, &files);
+        if (status == KERNEL_TASK_STATUS_RESOURCE_UNAVAILABLE) result = -KERNEL_EBADF;
+        else if (status != KERNEL_TASK_STATUS_OK ||
+                 kernel_files_syncfs(files, (int64_t)(int32_t)request->arguments[0], &result) != KERNEL_FILES_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    } else {
+        const struct kernel_fs_context *fs;
+        if (kernel_task_fs_context_borrow(caller, &fs) != KERNEL_TASK_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+        kernel_vfs_sync_all(kernel_fs_context_root(fs));
     }
     decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
     decoded->value = result;

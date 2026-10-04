@@ -10,6 +10,7 @@
 #include <kernel/page_cache.h>
 #include <kernel/physical_page.h>
 #include <kernel/procfs.h>
+#include <kernel/tmpfs.h>
 #include <kernel/vfs.h>
 #include "../../fs/vfs_objects.h"
 
@@ -885,6 +886,66 @@ static void run_writeback_regression(struct kernel_vfs_mount *mount,
         kernel_vfs_sync(&second, 1, &observed) ||
         kernel_vfs_close(&second)) fail_vfs(75, 0, -1);
 }
+
+static struct kernel_vfs_mount *sync_probe_child;
+static int (*sync_probe_original)(struct kernel_vfs_instance *, struct kernel_vfs_node *);
+static unsigned sync_probe_calls;
+static int sync_probe_backend(struct kernel_vfs_instance *instance, struct kernel_vfs_node *root)
+{
+    sync_probe_calls++;
+    if (sync_probe_child) {
+        struct kernel_vfs_path *path = sync_probe_child->root_path;
+        if (kernel_vfs_path_acquire(path) ||
+            kernel_vfs_mount_prepare_detach(sync_probe_child, path) != -KERNEL_EBUSY ||
+            kernel_vfs_path_release(&path)) fail_vfs(137U, -KERNEL_EBUSY, -1);
+    }
+    return sync_probe_original(instance, root);
+}
+
+static void run_mount_sync_regression(struct kernel_vfs_mount *mount,
+                                      struct kernel_heap *heap)
+{
+    struct kernel_vfs_path *root = 0, *covered = 0, *child_root = 0;
+    struct kernel_vfs_mount *child = 0;
+    struct kernel_vfs_file first = {0}, second = {0};
+    struct lwext4_mount_adapter *adapter = mount->private_data;
+    struct kernel_vfs_backend *ops = (struct kernel_vfs_backend *)adapter->instance.ops;
+    size_t count;
+    ext4_file raw;
+    char data[8] = {0};
+    if (kernel_vfs_path_root(mount, heap, &root) ||
+        kernel_vfs_mkdir(mount, "/sync-child", 0700) ||
+        kernel_vfs_path_lookup(root, "sync-child", 10, &covered) ||
+        kernel_tmpfs_create(heap, 0, "mode=0700", &child) || kernel_vfs_mount_attach(child, covered) ||
+        kernel_vfs_create(mount, "/sync-first", 0600, &first) ||
+        kernel_vfs_create(mount, "/sync-second", 0600, &second) ||
+        kernel_vfs_pwrite(&first, 0, "first", 5, &count) || count != 5 ||
+        kernel_vfs_pwrite(&second, 0, "second", 6, &count) || count != 6)
+        fail_vfs(138U, 0, -1);
+    sync_probe_original = ops->sync_filesystem;
+    ops->sync_filesystem = sync_probe_backend;
+    sync_probe_calls = 0;
+    uint64_t observed = kernel_vfs_mount_error_sequence(mount);
+    if (kernel_vfs_sync_mount(mount, &observed) || sync_probe_calls != 1 ||
+        ext4_fopen_inode(&raw, adapter->mount_point, kernel_vfs_file_inode(&first)) ||
+        ext4_fread(&raw, data, sizeof(data), &count) || count != 5 || memcmp(data, "first", 5) ||
+        ext4_fclose(&raw) ||
+        ext4_fopen_inode(&raw, adapter->mount_point, kernel_vfs_file_inode(&second)) ||
+        ext4_fread(&raw, data, sizeof(data), &count) || count != 6 || memcmp(data, "second", 6) ||
+        ext4_fclose(&raw)) fail_vfs(139U, 0, -1);
+    sync_probe_child = child;
+    kernel_vfs_sync_all(root);
+    sync_probe_child = 0;
+    ops->sync_filesystem = sync_probe_original;
+    if (sync_probe_calls != 2 || kernel_vfs_close(&first) || kernel_vfs_close(&second))
+        fail_vfs(140U, 0, -1);
+    child_root = child->root_path;
+    if (kernel_vfs_path_acquire(child_root) || kernel_vfs_mount_prepare_detach(child, child_root) ||
+        kernel_vfs_mount_detach(child, child_root) || kernel_vfs_path_release(&child_root) ||
+        kernel_vfs_unmount(child) ||
+        kernel_vfs_path_release(&covered) || kernel_vfs_path_release(&root))
+        fail_vfs(141U, 0, -1);
+}
 #endif
 
 static void run_vfs_test(const void *dtb)
@@ -1166,6 +1227,7 @@ static void run_vfs_test(const void *dtb)
     run_mount_tree_regression(&mount, &heap);
     run_proc_shutdown_regression(&mount, &heap);
     run_writeback_regression(&mount, &page_cache);
+    run_mount_sync_regression(&mount, &heap);
     run_prepare_unmount_regression(&mount, &heap);
     if (retried_fclose_calls != failed_fclose_calls) {
         fail_vfs(12U, failed_fclose_calls, retried_fclose_calls);

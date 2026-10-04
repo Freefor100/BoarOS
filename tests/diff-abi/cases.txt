@@ -710,11 +710,24 @@ positioned.file-read
 # Explicit and synchronous file writeback
 sync.fsync
 sync.fdatasync
+sync.filesystem
+sync.filesystem-dup
+sync.filesystem-path
+sync.global
 sync.readonly
 sync.directory
+sync.filesystem-directory
 sync.bad-fd
+sync.filesystem-bad-fd
 sync.pipe
+sync.filesystem-pipe
 sync.device
+sync.filesystem-device
+sync.filesystem-socket
+sync.filesystem-epoll
+sync.filesystem-tmpfs
+sync.global-mounted
+sync.filesystem-readonly
 sync.dsync-write
 sync.sync-write
 sync.internal-bit

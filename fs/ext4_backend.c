@@ -1563,6 +1563,17 @@ static int ext4_backend_flush(struct kernel_vfs_instance *instance)
     return status == KERNEL_BLOCK_STATUS_OK ? 0 :
         status == KERNEL_BLOCK_STATUS_UNSUPPORTED ? -KERNEL_ENOTSUP : -KERNEL_EIO;
 }
+static int ext4_backend_sync_filesystem(struct kernel_vfs_instance *instance,
+                                        struct kernel_vfs_node *root)
+{
+    struct lwext4_mount_adapter *adapter = lwext4_instance(instance);
+    int result = ext4_file_sync_metadata_mode(lwext4_node_file(root), false);
+    if (result == EOK && !adapter->device.fs->jbd_journal) {
+        result = ext4_cache_flush(adapter->mount_point);
+        if (result == EOK) result = block_flush(&adapter->device);
+    }
+    return lwext4_error(result);
+}
 static int ext4_backend_symlink(struct kernel_vfs_instance *instance, const char *target, const char *path)
 {
     struct lwext4_mount_adapter *adapter = lwext4_instance(instance);
@@ -1630,6 +1641,7 @@ static void initialize_backend(void)
     ops->close_node = ext4_backend_close_node;
     ops->writeback_allowed = ext4_backend_writeback_allowed;
     ops->sync_metadata = ext4_backend_sync_metadata;
+    ops->sync_filesystem = ext4_backend_sync_filesystem;
     ops->flush = ext4_backend_flush;
     ops->symlink = ext4_backend_symlink;
     ops->mknod = ext4_backend_mknod;

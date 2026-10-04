@@ -199,6 +199,9 @@ void abi_main(const unsigned long *initial_stack)
             abi_file_lock_exec_probe((unsigned)(argument[index] - '0'));
     }
     text("ABI BEGIN 1"); flush();
+#ifdef ABI_SYNC_ONLY
+    abi_sync_cases();
+#else
     abi_path_only_cases();
     abi_path_truncate_cases();
 #ifndef ABI_PATH_ONLY
@@ -239,8 +242,9 @@ void abi_main(const unsigned long *initial_stack)
     abi_shm_cases();
     abi_environment_cases();
 #endif
+#endif
     text("ABI END "); number(records); flush();
-    SC0(81); /* Linux sync; unsupported on BoarOS, outside observed cases. */
+    SC0(81);
     CALL(142, 0xfee1dead, 672274793, 0x4321fedc, 0, 0, 0);
     abi_exit(42);
 }

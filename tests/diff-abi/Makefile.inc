@@ -28,3 +28,10 @@ build/diff-abi/path-rv: $(DIFF_ABI_SOURCES) tests/diff-abi/abi.h tests/riscv/use
 		-ffreestanding -fno-builtin -fno-stack-protector -nostdlib -static \
 		-Wl,--build-id=none -Wl,-T,tests/riscv/user_elf.ld -Wl,--defsym,__global_pointer\$$=0 \
 		-o $@ $(DIFF_ABI_SOURCES)
+
+build/diff-abi/sync-rv: $(DIFF_ABI_SOURCES) tests/diff-abi/abi.h tests/riscv/user_elf.ld
+	@mkdir -p $(@D)
+	$(CC) -DABI_SYNC_ONLY -Wno-unused-function -march=rv64gc -mabi=lp64d -O2 -Wall -Wextra -Werror \
+		-ffreestanding -fno-builtin -fno-stack-protector -nostdlib -static \
+		-Wl,--build-id=none -Wl,-T,tests/riscv/user_elf.ld -Wl,--defsym,__global_pointer\$$=0 \
+		-o $@ $(DIFF_ABI_SOURCES)

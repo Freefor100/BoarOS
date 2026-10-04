@@ -1947,9 +1947,207 @@ int kernel_vfs_node_writeback_allowed(const struct kernel_vfs_node *node)
 
 void kernel_vfs_record_writeback_error(struct kernel_vfs_node *node, int error)
 {
+    uintptr_t irq = riscv_interrupt_save();
     node->writeback_error = error;
     node->writeback_error_sequence++;
     if (node->writeback_error_sequence == 0) __builtin_trap();
+    /* 内存不足不是已发生的设备写回失败，不污染后续独立打开的错误游标。 */
+    if (error == -KERNEL_EIO || error == -KERNEL_ENOSPC) {
+        node->instance->writeback_error = error;
+        if (++node->instance->writeback_error_sequence == 0) __builtin_trap();
+    }
+    riscv_interrupt_restore(irq);
+}
+
+uint64_t kernel_vfs_mount_error_sequence(const struct kernel_vfs_mount *mount)
+{
+    if (!mount || !mount->private_data) return 0;
+    uintptr_t irq = riscv_interrupt_save();
+    uint64_t sequence = ((struct kernel_vfs_instance *)mount->private_data)->writeback_error_sequence;
+    riscv_interrupt_restore(irq);
+    return sequence;
+}
+
+struct sync_nodes {
+    struct kernel_heap *heap;
+    struct kernel_vfs_node **nodes;
+    size_t count;
+};
+
+static void release_sync_nodes(struct sync_nodes *snapshot)
+{
+    uintptr_t irq = riscv_interrupt_save();
+    for (size_t i = 0; i < snapshot->count; i++)
+        if (kernel_vfs_node_release(&snapshot->nodes[i])) __builtin_trap();
+    riscv_interrupt_restore(irq);
+    if (snapshot->nodes && kernel_heap_release(snapshot->heap, snapshot->nodes) != KERNEL_HEAP_STATUS_OK)
+        __builtin_trap();
+}
+
+static int snapshot_sync_nodes(struct kernel_vfs_instance *instance,
+                                struct sync_nodes *snapshot)
+{
+    snapshot->heap = instance->heap;
+    for (;;) {
+        uintptr_t irq = riscv_interrupt_save();
+        size_t capacity = 0;
+        for (struct kernel_vfs_node *node = instance->nodes; node; node = node->next) capacity++;
+        riscv_interrupt_restore(irq);
+        if (!capacity) return 0;
+        if (capacity > SIZE_MAX / sizeof(*snapshot->nodes)) return -KERNEL_ENOMEM;
+        enum kernel_heap_status allocation = kernel_heap_allocate(instance->heap,
+                   capacity * sizeof(*snapshot->nodes), (void **)&snapshot->nodes);
+        if (allocation != KERNEL_HEAP_STATUS_OK) {
+            if (allocation != KERNEL_HEAP_STATUS_EMPTY) __builtin_trap();
+            return -KERNEL_ENOMEM;
+        }
+        irq = riscv_interrupt_save();
+        size_t count = 0;
+        for (struct kernel_vfs_node *node = instance->nodes; node; node = node->next) count++;
+        if (count > capacity) {
+            riscv_interrupt_restore(irq);
+            if (kernel_heap_release(instance->heap, snapshot->nodes) != KERNEL_HEAP_STATUS_OK) __builtin_trap();
+            snapshot->nodes = 0;
+            continue;
+        }
+        for (struct kernel_vfs_node *node = instance->nodes; node; node = node->next) {
+            int result = kernel_vfs_node_acquire(node);
+            if (result) { riscv_interrupt_restore(irq); return result; }
+            snapshot->nodes[snapshot->count++] = node;
+        }
+        riscv_interrupt_restore(irq);
+        return 0;
+    }
+}
+
+int kernel_vfs_sync_mount(struct kernel_vfs_mount *mount, uint64_t *observed_error)
+{
+    if (!mount || mount->state != VFS_MOUNT_STATE_LIVE || !mount->private_data)
+        return -KERNEL_EBADF;
+    struct kernel_vfs_instance *instance = mount->private_data;
+    struct kernel_vfs_path *root __attribute__((cleanup(release_path_pin))) = 0;
+    struct sync_nodes snapshot __attribute__((cleanup(release_sync_nodes))) = {0};
+    int result = kernel_vfs_path_root(mount, instance->heap, &root);
+    if (result) goto observe;
+    if (instance->read_only) goto observe;
+    result = snapshot_sync_nodes(instance, &snapshot);
+    if (result) goto observe;
+    /* 等待任何inode或设备之前，完整节点集合已经各持有一份引用。 */
+    for (size_t i = 0; i < snapshot.count; i++) {
+        struct kernel_vfs_node *node = snapshot.nodes[i];
+        if ((node->mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFREG || !instance->page_cache)
+            continue;
+        KERNEL_LOCK_SCOPE(node_guard);
+        kernel_vfs_node_lock(node, &node_guard, 0);
+        int error = kernel_page_cache_writeback(instance->page_cache, node);
+        if (error && error != -KERNEL_ENOMEM && error != -KERNEL_EBUSY)
+            kernel_vfs_record_writeback_error(node, error);
+        if (error && !result) result = error;
+    }
+    /* 捕获此前数据交接与namespace修改的durable目标一次，不等待checkpoint。 */
+    if (instance->ops->sync_filesystem) {
+        int error = instance->ops->sync_filesystem(instance, root->file.private_data);
+        if (error) {
+            kernel_vfs_record_writeback_error(root->file.private_data, error);
+            if (!result) result = error;
+        }
+    } else if (instance->page_cache) __builtin_trap();
+observe:
+    if (observed_error) {
+        uintptr_t irq = riscv_interrupt_save();
+        if (*observed_error != instance->writeback_error_sequence) {
+            if (!result) result = instance->writeback_error;
+            *observed_error = instance->writeback_error_sequence;
+        }
+        riscv_interrupt_restore(irq);
+    }
+    return result;
+}
+
+static struct kernel_vfs_mount *next_sync_mount(struct kernel_vfs_mount *mount,
+                                               struct kernel_vfs_mount *root)
+{
+    if (mount->first_child) return mount->first_child;
+    while (mount != root) {
+        if (mount->next_sibling) return mount->next_sibling;
+        mount = mount->parent;
+    }
+    return 0;
+}
+
+static void sync_mounts_without_array(struct kernel_vfs_path *root)
+{
+    struct kernel_vfs_mount *mount = root->file.mount;
+    uint64_t last = 0, limit = 0;
+    uintptr_t irq = riscv_interrupt_save();
+    for (struct kernel_vfs_mount *m = mount; m; m = next_sync_mount(m, mount))
+        if (m->id > limit) limit = m->id;
+    riscv_interrupt_restore(irq);
+    /* OOM时按启动时的身份上界逐个取得引用，跨等待不保存树中的裸指针。
+     * 已卸载者由卸载路径排空；新挂载不能无限延长本次sync。 */
+    for (;;) {
+        irq = riscv_interrupt_save();
+        struct kernel_vfs_mount *selected = 0;
+        for (struct kernel_vfs_mount *m = mount; m; m = next_sync_mount(m, mount)) {
+            if (m->id <= last || m->id > limit ||
+                ((struct kernel_vfs_instance *)m->private_data)->quiescing) continue;
+            if (!selected || m->id < selected->id) selected = m;
+        }
+        if (!selected) { riscv_interrupt_restore(irq); return; }
+        struct kernel_vfs_path *path = selected == mount ? root : selected->root_path;
+        if (!path || kernel_vfs_path_acquire(path)) __builtin_trap();
+        last = selected->id;
+        riscv_interrupt_restore(irq);
+        (void)kernel_vfs_sync_mount(path->file.mount, 0);
+        if (kernel_vfs_path_release(&path)) __builtin_trap();
+    }
+}
+
+void kernel_vfs_sync_all(struct kernel_vfs_path *root)
+{
+    if (!root || !root->file.mount) return;
+    struct kernel_vfs_mount *mount = root->file.mount;
+    struct kernel_heap *heap = ((struct kernel_vfs_instance *)mount->private_data)->heap;
+    struct kernel_vfs_path **paths = 0;
+    size_t count = 0;
+    for (;;) {
+        uintptr_t irq = riscv_interrupt_save();
+        size_t capacity = 0;
+        for (struct kernel_vfs_mount *m = mount; m; m = next_sync_mount(m, mount)) capacity++;
+        riscv_interrupt_restore(irq);
+        if (capacity > SIZE_MAX / sizeof(*paths)) {
+            sync_mounts_without_array(root);
+            return;
+        }
+        enum kernel_heap_status allocation = kernel_heap_allocate(heap,
+                                        capacity * sizeof(*paths), (void **)&paths);
+        if (allocation != KERNEL_HEAP_STATUS_OK) {
+            if (allocation != KERNEL_HEAP_STATUS_EMPTY) __builtin_trap();
+            sync_mounts_without_array(root);
+            return;
+        }
+        irq = riscv_interrupt_save();
+        size_t needed = 0;
+        for (struct kernel_vfs_mount *m = mount; m; m = next_sync_mount(m, mount)) needed++;
+        if (needed > capacity) {
+            riscv_interrupt_restore(irq);
+            if (kernel_heap_release(heap, paths) != KERNEL_HEAP_STATUS_OK) __builtin_trap();
+            paths = 0;
+            continue;
+        }
+        for (struct kernel_vfs_mount *m = mount; m; m = next_sync_mount(m, mount)) {
+            if (((struct kernel_vfs_instance *)m->private_data)->quiescing) continue;
+            struct kernel_vfs_path *path = m == mount ? root : m->root_path;
+            if (!path || kernel_vfs_path_acquire(path)) __builtin_trap();
+            paths[count++] = path;
+        }
+        riscv_interrupt_restore(irq);
+        break;
+    }
+    for (size_t i = 0; i < count; i++) (void)kernel_vfs_sync_mount(paths[i]->file.mount, 0);
+    for (size_t i = 0; i < count; i++)
+        if (kernel_vfs_path_release(&paths[i])) __builtin_trap();
+    if (kernel_heap_release(heap, paths) != KERNEL_HEAP_STATUS_OK) __builtin_trap();
 }
 
 uint64_t kernel_vfs_error_sequence(const struct kernel_vfs_file *file)

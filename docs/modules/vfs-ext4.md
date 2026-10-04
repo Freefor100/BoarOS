@@ -89,6 +89,25 @@ miss 路径先分配并清零页，再通过 node 的无 offset 副作用 `pread
 
 `kernel_vfs_sync()` 先交接目标 inode 脏页，再捕获 full/data 目标序号并等待提交完成；journal 路径已包含持久化屏障，不额外发无意义的设备 flush。无 journal 路径仍显式 flush。独立 open 各持错误观察位置，dup/fork 共用 OFD 的位置。`fsync/fdatasync` 支持普通文件与目录；共享 inode 的后端 handle 记录完整和数据序号。full 同步为涵盖经其他 handle 的 namespace 修改，保守地捕获当前 mount 序号一次；data 同步等待数据/检索依赖序号，纯时间修改不推进它。同组时间字段可以顺带持久化；新修改不会无限延长已有等待目标。`O_SYNC/O_DSYNC` 分别对已接受的写入前缀执行 full/data 同步，失败返回 errno，但已接受字节与 offset 保留。journal 的关键写入、checkpoint 或屏障失败使 mount 持续拒绝修改和同步；OFD 错误游标不能清除该错误。
 
+## 挂载范围与全局同步
+
+`kernel_vfs_sync_mount()`先取得根路径owner，再在短发布保护区捕获并引用全部活节点；
+节点在取得inode锁和睡眠前已被钉住，调用结束统一归还。逐个交接普通文件页缓存后，
+后端捕获挂载durable目标一次；并发新修改不不断推进该目标。journal保留ordered-data、
+日志与commit的既有屏障，syncfs不要求checkpoint全部完成；无journal则写回全部块缓存
+并执行设备FLUSH。文件被unlink或最后fd关闭，不会从本次已捕获的节点集合消失。
+
+全局sync先捕获已发布挂载的根路径引用，释放发布保护后进行I/O；额外引用阻止卸载。
+挂载数组OOM时，按入口时的挂载身份上界逐个重新查找并取得引用，跨等待不保留裸树指针。
+新挂载不无限延长调用，已卸载者由卸载路径排空；一个挂载失败不阻止尝试其他挂载。
+节点／挂载数组只属于当前请求，不建立长期索引或后台引用。页与对象原有回收协议不变。
+
+挂载记录写回错误序号和最近EIO/ENOSPC，OFD从打开时的序号开始观察；syncfs原子更新
+该OFD的游标，dup/fork共享它，fsync仍使用独立的inode游标。内存不足返回资源错误并
+保留脏状态，不能当成设备写回失败；不可确定的journal失败仍冻结原mount。
+依据为`references/linux` v7.2的`fs/sync.c`、`fs/file_table.c`和`lib/errseq.c`。
+验证入口是文件／VFS fixture、`tests/diff-abi/sync.c`及真实musl的`tests/userland/sync.h`。
+
 ## lwext4 配置和生命周期
 
 内核编译 lwext4 journal/replay、orphan 和分批截断路径，启用内部xattr操作供chown删除capability；关闭debug/assert和mkfs，并把 malloc/calloc/realloc/free 绑定到当前内核堆。尚未接入用户xattr/ACL syscall或capability执行权限。根设备是 raw whole-disk ext4，物理块大小固定为 512 字节；当前不解析分区表。

@@ -17,6 +17,7 @@ struct kernel_open_file_description {
     struct kernel_mutex offset_lock;
     uint64_t offset;
     uint64_t observed_writeback_error;
+    uint64_t observed_mount_error;
     uint64_t proc_identity;
     uint32_t open_flags;
     uint32_t references;

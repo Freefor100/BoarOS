@@ -7,13 +7,17 @@ static int check_file_sync(void)
     for (unsigned n = 0; n < sizeof(flags) / sizeof(flags[0]); n++) {
         char data[8] = {0};
         int fd = open("/user-sync", O_CREAT | O_TRUNC | O_RDWR | flags[n], 0600);
-        if (fd < 0 || write(fd, "persist", 7) != 7 || fsync(fd) != 0 ||
+        if (fd < 0 || write(fd, "persist", 7) != 7 || syscall(267, fd) || fsync(fd) != 0 ||
             fdatasync(fd) != 0 || close(fd) != 0) return 1;
         fd = open("/user-sync", O_RDONLY);
         if (fd < 0 || read(fd, data, sizeof(data)) != 7 ||
             memcmp(data, "persist", 7) != 0 || fsync(fd) != 0 ||
             close(fd) != 0) return 2;
     }
+    int filesystem = open("/user-sync", O_RDONLY);
+    if (filesystem < 0 || syscall(267, filesystem) || close(filesystem)) return 6;
+    if (syscall(267, -1) != -1 || errno != EBADF) return 7;
+    if (syscall(81) != 0) return 8;
     int directory = open("/", O_RDONLY | O_DIRECTORY);
     if (directory < 0 || fsync(directory) != 0 || close(directory) != 0)
         return 3;

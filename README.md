@@ -148,6 +148,9 @@ ext4在同一事务删除文件capability属性；进程身份仍固定root。�
 任务，清理继续由原worker拥有。PTY＋原BusyBox script保留为下一应用候选，范围另行确认。
 O_PATH已持有独立路径资格，支持目录相对与空路径身份操作，不获得数据或设备打开资格。
 路径truncate已接入共同截断与capability清理，负长度先于路径访问拒绝。
+空路径stat接受NULL并避免完整路径缓冲；glibc的fstat经newfstatat进入时也复用fd资格。
+全局sync与挂载范围syncfs已接入稳定引用快照、数据交接及日志durable等待；
+syncfs独立观察挂载错误，dup/fork共享OFD游标。它们不将checkpoint强行并入每次同步。
 原生accept4仍缺；原LTP准备依赖、旧libc包装、
 镜像环境与目标接口失败分开，不能由遍历结束宣称完整兼容。
 性能候选包括元数据路径、短睡眠deadline和协议背压；按真实工作量选择一项，不因理论

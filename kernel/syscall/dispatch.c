@@ -57,6 +57,8 @@
 #define LINUX_SYSCALL_PPOLL 73U
 #define LINUX_SYSCALL_READLINKAT 78U
 #define LINUX_SYSCALL_FSYNC 82U
+#define LINUX_SYSCALL_SYNC 81U
+#define LINUX_SYSCALL_SYNCFS 267U
 #define LINUX_SYSCALL_FDATASYNC 83U
 #define LINUX_SYSCALL_EXIT 93U
 #define LINUX_SYSCALL_EXIT_GROUP 94U
@@ -410,6 +412,10 @@ enum kernel_syscall_status kernel_syscall_dispatch(
             KERNEL_SYSCALL_STATUS_OK) {
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
         }
+    } else if (request->number == LINUX_SYSCALL_SYNC || request->number == LINUX_SYSCALL_SYNCFS) {
+        if (syscall_handle_sync(caller, request, &decoded,
+                                request->number == LINUX_SYSCALL_SYNCFS) != KERNEL_SYSCALL_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     } else if (request->number == LINUX_SYSCALL_FSYNC ||
                request->number == LINUX_SYSCALL_FDATASYNC) {
         if (syscall_handle_fsync(caller, request, &decoded,
