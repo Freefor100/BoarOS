@@ -78,6 +78,7 @@ static enum kernel_open_file_status create_open_file(
     }
     file->heap = heap;
     file->references = 1U;
+    file->observed_mount_error = kernel_vfs_mount_error_sequence(file->file.mount);
     kernel_mutex_init(&file->offset_lock, 10, (uintptr_t)file);
     if (kernel_vfs_file_generated(&file->file))
         file->kind = KERNEL_OPEN_FILE_KIND_GENERATED;
@@ -133,6 +134,7 @@ enum kernel_open_file_status kernel_open_file_create_at(
     } else {
         file->heap = heap;
         file->references = 1U;
+        file->observed_mount_error = kernel_vfs_mount_error_sequence(file->file.mount);
         kernel_mutex_init(&file->offset_lock, 10, (uintptr_t)file);
         if (kernel_vfs_file_generated(&file->file))
             file->kind = KERNEL_OPEN_FILE_KIND_GENERATED;
@@ -200,6 +202,7 @@ enum kernel_open_file_status kernel_open_file_create_mode(
     }
     file->heap = heap;
     file->references = 1U;
+    file->observed_mount_error = kernel_vfs_mount_error_sequence(file->file.mount);
     kernel_mutex_init(&file->offset_lock, 10, (uintptr_t)file);
     file->kind = KERNEL_OPEN_FILE_KIND_REGULAR;
     *owner = file;
@@ -243,6 +246,7 @@ enum kernel_open_file_status kernel_open_file_create_executable(
     }
     file->heap = heap;
     file->references = 1U;
+    file->observed_mount_error = kernel_vfs_mount_error_sequence(file->file.mount);
     kernel_mutex_init(&file->offset_lock, 10, (uintptr_t)file);
     *owner = file;
     *linux_result = 0;

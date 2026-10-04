@@ -3681,6 +3681,23 @@ static void run_partial_write_test(const void *dtb)
         !read_user_bytes(&mm, TEST_USER_BUFFER, observed, 8U) ||
         memcmp(observed, payload, 8U) != 0)
         fail_files(307U, 8, result);
+    /* syncfs观察整挂载的写回错误，dup共享游标；新打开不重报旧错误。 */
+    if (kernel_files_syncfs(&files, 0, &result) != KERNEL_FILES_STATUS_OK || result != -KERNEL_EIO ||
+        kernel_files_syncfs(&files, 2, &result) != KERNEL_FILES_STATUS_OK || result ||
+        kernel_files_syncfs(&files, 1, &result) != KERNEL_FILES_STATUS_OK || result != -KERNEL_EIO ||
+        kernel_files_syncfs(&files, 1, &result) != KERNEL_FILES_STATUS_OK || result ||
+        kernel_files_syncfs(&files, 3, &result) != KERNEL_FILES_STATUS_OK || result)
+        fail_files(323U, 0, result);
+#ifndef FILES_PARTIAL_WRITE_TEST
+    fail_readv_allocation = 1U;
+    if (kernel_files_syncfs(&files, 0, &result) != KERNEL_FILES_STATUS_OK || result != -KERNEL_ENOMEM ||
+        fail_readv_allocation || kernel_files_syncfs(&files, 0, &result) != KERNEL_FILES_STATUS_OK || result)
+        fail_files(324U, 0, result);
+    fail_readv_allocation = 1U;
+    kernel_vfs_sync_all(kernel_fs_context_root(&fs));
+    if (fail_readv_allocation || kernel_files_syncfs(&files, 0, &result) != KERNEL_FILES_STATUS_OK || result)
+        fail_files(325U, 0, result);
+#endif
     for (int fd = 1; fd < 4; fd++)
         if (kernel_files_close(&files, fd, &result) != KERNEL_FILES_STATUS_OK ||
             result != 0) fail_files(308U, 0, result);

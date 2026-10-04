@@ -24,6 +24,8 @@ struct kernel_vfs_instance {
     struct kernel_vfs_node *cleanup_nodes;
     struct kernel_vfs_path *paths; /* Weak registry; live callers own references. */
     uint32_t external_files;
+    uint64_t writeback_error_sequence;
+    int writeback_error;
     uint8_t read_only;
     uint8_t quiescing;
 };
@@ -107,6 +109,9 @@ struct kernel_vfs_backend {
     int (*close_node)(struct kernel_vfs_node *node);
     int (*writeback_allowed)(struct kernel_vfs_instance *instance);
     int (*sync_metadata)(struct kernel_vfs_node *node, int data_only);
+    /* NULL denotes a memory-only backend without persistent writeback. */
+    int (*sync_filesystem)(struct kernel_vfs_instance *instance,
+                           struct kernel_vfs_node *root);
     int (*flush)(struct kernel_vfs_instance *instance);
     int (*symlink)(struct kernel_vfs_instance *instance, const char *target, const char *path);
     int (*mknod)(struct kernel_vfs_instance *instance, const char *path,

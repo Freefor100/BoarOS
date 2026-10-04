@@ -116,6 +116,9 @@ enum kernel_syscall_status syscall_handle_fsync(
     struct kernel_task *caller,
     const struct kernel_syscall_request *request,
     struct kernel_syscall_result *decoded, int datasync);
+enum kernel_syscall_status syscall_handle_sync(
+    struct kernel_task *caller, const struct kernel_syscall_request *request,
+    struct kernel_syscall_result *decoded, int filesystem_only);
 
 enum kernel_syscall_status syscall_handle_pipe2(
     struct kernel_task *caller,

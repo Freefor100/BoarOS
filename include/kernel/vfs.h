@@ -200,6 +200,11 @@ int kernel_vfs_unmount(struct kernel_vfs_mount *mount);
 int kernel_vfs_start_journal_worker(struct kernel_vfs_mount *mount);
 
 int kernel_vfs_mount_is_readonly(const struct kernel_vfs_mount *mount);
+/* Caller holds a path/file owner of the mount throughout the call. */
+uint64_t kernel_vfs_mount_error_sequence(const struct kernel_vfs_mount *mount);
+int kernel_vfs_sync_mount(struct kernel_vfs_mount *mount, uint64_t *observed_error);
+/* Snapshot the current single namespace; failures remain with their mount. */
+void kernel_vfs_sync_all(struct kernel_vfs_path *root);
 int kernel_vfs_mount_statfs(struct kernel_vfs_mount *mount,
                             struct kernel_vfs_statfs *stat);
 int kernel_vfs_file_set_times(struct kernel_vfs_file *file,

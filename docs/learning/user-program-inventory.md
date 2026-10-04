@@ -209,6 +209,12 @@ CPU百分比也要说明记账边界。`times`的U/S时间目前按timer中断�
 
 ### 先验证参考环境
 
+工具输出成功不等于同步发生。libc的`sync()`没有返回值，即使底层syscall尚未接入，
+工具也可能退出0；因此持久化探针应检查raw sync/syncfs或fsync返回值，并在独立后端／
+重启视角核对内容。已接入的syncfs按fd所属挂载交接数据并等待durable；全局sync继续
+尝试所有挂载而不返回I/O错误，错误保留给所属挂载和后续同步观察。匿名对象的syncfs
+不触及根盘，不能借这种成功证明磁盘内容持久化。
+
 固定 Linux 的 `init/do_mounts.c` 在 `/init` 前挂载 devtmpfs，会遮住镜像中原有 `/dev/shm`。初次 `pthread_cancel_points` 的 shm_open 因此失败；错误诊断中的 write 又成为 pending cancellation 的取消点，隐藏了原错误。补齐可见目录和 tmpfs 后同一 Linux/ELF 通过。socket 访问 loopback 前同样需要真正启用接口。环境 setup 失败不算内核 ABI 差异。
 
 完整 BusyBox 构建缺 `linux/kd.h` 是目标 UAPI 未导出；`tc` 的旧 CBQ 定义则需固定 6.6 UAPI。分别解决工具输入，保留原配置，不以裁剪 applet 回避缺口。默认决赛 commit 没有 libc-test，只能说明该树的内容；完整对象库中可取得固定 `pre-2025` 输入。

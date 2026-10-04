@@ -30,8 +30,8 @@ N3已经交付：legacy/modern VirtIO-net、受限DMA借用与复制回退、静
 清理和恢复由对应模块维护。局部准备成本的减少不代表连续文件I/O瓶颈已经解决。
 逐次成绩、原始输出与机器快照只留在忽略的build，不进入文档或Git。
 
-当前补齐空路径stat的Linux边界并消除其重复路径缓冲，随后接入全局sync/syncfs：
-按已确认的通用VFS快照路线保护挂载与节点，复用写回和durable等待，独立维护挂载错误观察。
+空路径stat的Linux边界、免路径缓冲及全局sync/syncfs已接入；通用VFS快照保护
+挂载与节点，复用写回和durable等待，独立维护挂载错误观察；相关系统回归已验收。
 这不代表连续I/O或TCP瓶颈已经消失，也不以某个分数作为其他应用开发的前置条件。
 下一应用候选是**PTY＋原BusyBox script**，范围待确认。完整凭据/权限、运行时网络
 配置和无RNG平台的可信熵接入由目标应用确定交付范围；LoongArch是独立交付依赖，SMP单独规划。
@@ -89,7 +89,7 @@ glibc四进程整命令仍增加0.73%。该轮的prepare读取、1547次FLUSH和
 | iperf/netperf | 22项受控原ELF完成；原iperf连续脚本的listener重建竞态在Linux也存在，原脚本结果和受控验收分别报告 |
 | LTP执行角色 | 比赛目录遍历不是上游runtest；控制器helper、上游禁用shmat1和有限shm_test分开。原libc的EINTR重试、NULL栈clone、缺unwind库或账户可先于目标syscall阻塞，见[程序证据](learning/user-program-inventory.md#ltp的准备依赖与libc边界) |
 | 所有权与接口子集 | fchown/fchownat已接入真实元数据；O_PATH和路径truncate已接入；完整凭据/权限、原生accept4仍有缺口；CPU-time clock、VIRTUAL/PROF timer、pipe容量操作、扩展clone/futex按具体子语义核对，不把已有整个模块记为缺失 |
-| 全局文件同步 | fsync/fdatasync与msync已有；sync/syncfs尚未接入。void sync的程序退出码不能证明持久化，文件/目录同步须检查真实返回值；后续需设计挂载范围、引用、并发修改目标与错误观察 |
+| 全局文件同步 | sync/syncfs接入单一挂载树、节点快照与durable等待；syncfs维护独立的挂载错误观察。void sync的程序退出码仍不能单独证明持久化，匿名对象不触及根盘，见[VFS契约](modules/vfs-ext4.md)。 |
 | 用户内存/信号 | mremap、按操作madvise、mlock、sigaltstack、实时信号队列、共享文件/PI futex待真实应用需求触发 |
 | 系统与平台 | 固定root查询不等于完整凭据/权限；无PTY/termios2/完整modem控制、外部IPv6/DNS/TLS、公网配置、SMP/实板、kernel-la，不声明完整Linux兼容或硬实时 |
 
