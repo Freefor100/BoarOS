@@ -355,7 +355,7 @@ def run_suite(manifest, output_dir, driver_elf, linux_kernel, boaros_kernel, *,
                 'runner_sha256': digest(__file__),
                 'kernels': {name: {'path': str(path), 'sha256': digest(path)} for name, path in kernels.items()},
                 'default_timeout': default_timeout, 'boot_timeout': boot_timeout,
-                'qemu': str(qemu), 'memory': '512M', 'smp': 1}
+                'qemu': str(qemu), 'memory': '1G' if platform_config=='official' else '512M', 'smp': 1}
     identity['tools'] = {}
     for tool, flag in ((qemu, '--version'), ('mkfs.ext4', '-V'), ('debugfs', '-V')):
         executable = shutil.which(str(tool))

@@ -4,13 +4,13 @@
 `[x]` 只表示具体交付已验收；历史测量、输入身份和可重建命令归现有 learning。
 固定 Linux 位于 `references/linux`，精确版本与其他资料由 `references/sources.tsv` 管理。评审是调查输入，不自动成为实现或验收证据。
 
-## 当前状态与未关闭风险（2026-10-04）
+## 当前状态与未关闭风险（2026-10-05）
 
 N3已经交付：legacy/modern VirtIO-net、受限DMA借用与复制回退、静态IPv4＋ARP、
 有界分片重组，以及隔离宿主双向TCP/HTTP。1196条ABI、原22项网络客户端和相关系统
 回归属于该轮已完成证据，见[网卡记录](learning/network-ownership.md#真实-virtio-net-与宿主应用交付2026-10-02)。
 随后buddy/slab的timer抢占竞态已确定性复现、修复并验收；纯块超时也已补reset前快照。
-最新内存/诊断修复已合入兼容分支并通过原旧glibc单TCP入口；本轮最终候选也已单向合入；旧glibc BASIC_TCP和兼容FIFO/重启通过。
+这些内存与诊断修复已单向合入兼容分支；网络、FIFO和重启的适用范围见对应模块。
 
 | 未关闭项 | 当前证据与下一步 |
 |---|---|
@@ -23,22 +23,16 @@ N3已经交付：legacy/modern VirtIO-net、受限DMA借用与复制回退、静
 区分已经修复的机制与缺少历史现场的归因。固定root、单hart、QEMU和选定应用验收
 均不代表多用户隔离、SMP、实板或完整Linux兼容。完整比赛Harness仍缺kernel-la。
 
-## 近期队列：文件元数据与路径接口
+## 近期方向
 
-局部复用、路径资格和共同截断已实现；剩余收口集中在匹配成本、原消费者与兼容入口。
+文件元数据的活inode复用、创建句柄初始化、O_PATH与路径truncate已交付，通用实现
+已单向合入兼容分支。路径资格、睡眠前节点引用、初始时间与显式改权的区别、截断属性
+清理和恢复由对应模块维护。局部准备成本的减少不代表连续文件I/O瓶颈已经解决。
+逐次成绩、原始输出与机器快照只留在忽略的build，不进入文档或Git。
 
-- [x] 复用同一实例中已有活inode，消除临时后端打开；创建后按已取得句柄设置权限。
-- [x] 实现只持路径身份的O_PATH，覆盖设备/FIFO不打开、目录fd、空路径、proc和末引用。
-- [x] 接入路径truncate，复用共同截断、映射失效与错误owner，核对特权属性和恢复。
-- [ ] 匹配旧/新元数据负载及原lmbench/所选四进程iozone，解释实际收益、同步和最终排空。
-
-不新增常驻目录项缓存或改变事务、checkpoint、TCP窗口及调度策略。TCP仅做最新
-固定字节单/五连接状态核对。性能环境沿平台既定配置，不添加RNG或改命令获得通过；
-无可信熵时的getrandom合同和旧libc断言边界保持明确。
-逐次成绩、原始输出和机器快照只留在忽略的build，不进入文档或Git。
-
-下一应用候选仍为PTY＋原BusyBox script，范围另行确认。完整凭据/权限、运行时
-网络配置和随机源由真实需求触发；LoongArch是独立交付依赖，SMP单独规划。
+下一应用候选是**PTY＋原BusyBox script**，范围待确认；不以I/O或TCP达到某个分数
+作为前置条件。全局sync/syncfs、完整凭据/权限、运行时网络配置和无RNG平台的可信熵接入仍有能力缺口，
+由目标应用确定交付范围。LoongArch是独立交付依赖，SMP单独规划。
 
 ## 按证据触发的性能候选
 
@@ -49,7 +43,7 @@ N3已经交付：legacy/modern VirtIO-net、受限DMA借用与复制回退、静
 | checkpoint阻塞提交或最终排空成本显著 | 有界批次和调度；核对积压、日志环绕、低内存、卸载及完整恢复 |
 | 非阻塞发送复制放大或固定热缓存运行成本高 | 发送credit约束暂存、重复解析/复制/查询；先核对错误优先级，保留短写、EFAULT前缀、取消和页生命周期 |
 | Lua构建仍有差距，选定heap清零/搬迁与页内复制不足以解释 | 核对用户程序运行、页解析/ELF及未测固定成本，再选一个机制；VMA指标是比较次数，不能当查询数或时间 |
-| 空文件create/unlink和路径stat慢，fstat明显更轻 | 分解路径/目录、inode/位图、事务准备与真实资源等待；0k没有文件内容写入，不能只优化数据复制。保留节点身份、orphan、同步及复用边界 |
+| 热路径stat/open无大量设备请求仍慢，fstat更轻 | 核对路径临时缓冲、逐级后端查询及对象周转；累计请求容量不是峰值。空文件创建删除另分解目录、inode/位图、事务及真实资源等待；保护身份、orphan、同步与复用，不顺势扩大缓存重构 |
 | 短睡眠的到期唤醒接近tick周期 | 比较提高HZ与最早blocked deadline参与SBI重装；当前额外timer只服务实时预算/RR。核对中断开销、取消、重启、对象复用和空闲功耗，不先换调度策略 |
 | UDP过载丢包或TCP受协议credit约束 | 核对接收/丢弃量、每连接进展、lwIP窗口/池和socket预算；限速可靠性与饱和效率分开，TCP_INFO未支持的字段不作为重传证据 |
 | 真实大映射/多等待者负载规模退化 | resident范围索引、deadline索引或安全长操作边界；核对维护成本、OOM和取消 |
@@ -60,6 +54,7 @@ N3已经交付：legacy/modern VirtIO-net、受限DMA借用与复制回退、静
 
 | 阶段/能力 | 事实与证据入口 |
 |---|---|
+| 文件元数据与路径资格 | 活inode重开避免临时后端owner；创建权限按已有句柄初始化并保留创建时间。O_PATH只持路径身份，路径truncate接入共同截断和capability清理；见[文件契约](modules/kernel-files.md)、[VFS](modules/vfs-ext4.md)与[时间语义](learning/file-timestamps.md)。 |
 | libc局部纠错与文件所有权 | flock错误优先级、无timer辅助的退出ready调度、固定glibc unwind依赖与取消清理已交付；fchown/fchownat修改ext4/tmpfs/匿名pipe真实元数据，capability删除与inode修改同事务，进程仍固定root。见[调度](modules/kernel-scheduler.md)、[文件契约](modules/kernel-files.md)和[所有权背景](learning/file-timestamps.md#文件所有权与进程身份)。 |
 | T1–T3 串口TTY | 实例owner、UART IRQ/worker、行规程/readv continuation、ctty/作业控制及原ash/stty已交付；初始TEMT忙回滚与停机资格已修复，见[TTY契约](modules/kernel-tty.md)。PTY仍未交付。 |
 | M1–M3 有限CPU归因 | 六项消费者诊断已交付；宽字原语仅实验验证，未带来原Lua工程收益，未上线。生产保留字节路径，见[工具链机制](learning/offline-toolchain-probe.md)。 |
@@ -92,7 +87,7 @@ glibc四进程整命令仍增加0.73%。该轮的prepare读取、1547次FLUSH和
 | iperf/netperf | 22项受控原ELF完成；原iperf连续脚本的listener重建竞态在Linux也存在，原脚本结果和受控验收分别报告 |
 | LTP执行角色 | 比赛目录遍历不是上游runtest；控制器helper、上游禁用shmat1和有限shm_test分开。原libc的EINTR重试、NULL栈clone、缺unwind库或账户可先于目标syscall阻塞，见[程序证据](learning/user-program-inventory.md#ltp的准备依赖与libc边界) |
 | 所有权与接口子集 | fchown/fchownat已接入真实元数据；O_PATH和路径truncate已接入；完整凭据/权限、原生accept4仍有缺口；CPU-time clock、VIRTUAL/PROF timer、pipe容量操作、扩展clone/futex按具体子语义核对，不把已有整个模块记为缺失 |
-| 路径truncate | 尚未实现；本轮错误恢复使用已交付ftruncate，原Lua/GCC/make保持不变 |
+| 全局文件同步 | fsync/fdatasync与msync已有；sync/syncfs尚未接入。void sync的程序退出码不能证明持久化，文件/目录同步须检查真实返回值；后续需设计挂载范围、引用、并发修改目标与错误观察 |
 | 用户内存/信号 | mremap、按操作madvise、mlock、sigaltstack、实时信号队列、共享文件/PI futex待真实应用需求触发 |
 | 系统与平台 | 固定root查询不等于完整凭据/权限；无PTY/termios2/完整modem控制、外部IPv6/DNS/TLS、公网配置、SMP/实板、kernel-la，不声明完整Linux兼容或硬实时 |
 
