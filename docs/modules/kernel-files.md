@@ -178,6 +178,13 @@ make test-files-partial-write-riscv
 
 console、匿名pipe和epoll是不属于filesystem inode的合成对象，继续走各自的显式 stat 形态；console 呈现 5:1 字符设备，pipe 呈现 FIFO。`newfstatat` 支持 cwd/dirfd/绝对路径与 `AT_EMPTY_PATH`（按 fd 取对象，`AT_FDCWD` 取 cwd）；目录路径可统计，`AT_SYMLINK_NOFOLLOW` 通过路径 inode 查询返回链接自身的 mode、大小和时间戳。proc fd 的伪对象跟随式统计复用同一元数据快照。常规文件 create/read/pread/write/writev/truncate/unlink 已更新 realtime 时间戳：读取按 relatime（含缓存命中、非零 EOF 和 user fault），写入先校验 inode maxbytes，再在 usercopy 前修改 mtime/ctime，同长度 truncate 也更新；零长度或访问模式拒绝不更新。创建/移除更新父目录 mtime/ctime，unlink 后仍打开的 inode 继续通过 live handle 更新。扩展 inode 保留纳秒与 signed epoch，旧 128-byte inode 按秒截断；只读挂载不写 atime，未初始化时钟不覆盖 fixture metadata。触发、I/O 错误 owner 和固定 Linux 依据见[文件时间戳](../learning/file-timestamps.md)。
 
+`AT_EMPTY_PATH`接受空字符串和NULL pathname。已知空路径直接取得fd对象或cwd，
+不分配完整路径缓冲；正fd的空路径查询按固定Linux优先走fstat，包括其他查询位的
+错误顺序。非空路径接受NO_AUTOMOUNT和stat查询同步位；本地后端没有自动挂载或远端
+元数据缓存，不由这些位增加数据操作资格。依据为`references/linux` v7.2的
+`fs/namei.c::__getname_maybe_null`与`fs/stat.c::vfs_fstatat`，同ELF差分入口是
+`tests/diff-abi/path_only.c`；文件fixture另检查空路径不产生路径容量的分配。
+
 `faccessat` syscall 48 复用 cwd/dirfd/绝对路径查找并跟随符号链接；非法 mode 先返回 `EINVAL`，用户路径 fault 为 `EFAULT`，不存在路径沿用查找 errno。当前不可变 root 身份仅需对普通文件执行请求保留“至少一个执行位”约束，对只读挂载的普通文件或目录写请求返回 `EROFS`；多用户凭据、ACL 与 mount `noexec` 尚未实现。边界由 `tests/diff-abi/access.c` 在同一 RV64 ELF 的固定 Linux 和 BoarOS 上核对；依据是本地 `references/linux/fs/open.c::do_faccessat`，commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`。
 
 `kernel_files_getdents64()` 只作用于目录描述符，其他类型返回 `-ENOTDIR`。每条记录按 linux_dirent64 编码（`d_reclen` 8 字节对齐，`d_type` 来自 ext4 filetype），`d_off` 是下一条记录的后端 cookie，不是条目计数；缓冲区连第一条记录都放不下返回 `-EINVAL`，用户 fault 在已完整发出的记录上返回前缀计数。
