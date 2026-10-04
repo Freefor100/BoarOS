@@ -16,37 +16,29 @@ N3已经交付：legacy/modern VirtIO-net、受限DMA借用与复制回退、静
 |---|---|
 | 历史Virtqueue告警 | 已还原到旧兼容内核的五连接loopback；原启动只有块盘和RNG，没有VirtIO-net。具体报错队列与超额原因仍未知；后续失败必须先保留新快照，按队列身份定位，不以重复通过关闭。 |
 | 历史页释放fatal的具体现场 | 已修复能够产生同类fatal的分配器双owner竞态；原事件没有owner快照，不能反推唯一触发链。 |
-| 历史pthread取消偶发异常 | 后续直接entry通过，尚无原脚本的最小因果序列；保留P0c风险，以新失败和目标应用触发定位，不安排无目的重复次数。 |
+| pthread取消与旧libc输入 | 动态glibc的cancel/exit先核对真实libgcc_s依赖；静态cancel-points的join结果另行定位，不能用补库解释全部失败。历史偶发现场仍保留P0c边界，不安排无目的重复次数。 |
 | 内核抢占边界 | allocator修复不等于所有共享状态已审完。限定检查开中断worker到共享对象的调用链、睡眠前引用和发布临界区；发现具体错误才扩大。 |
 
 [风险证据与重建](learning/cost-baseline.md#旧版内存释放与-virtqueue-告警2026-10-02)
 区分已经修复的机制与缺少历史现场的归因。固定root、单hart、QEMU和选定应用验收
 均不代表多用户隔离、SMP、实板或完整Linux兼容。完整比赛Harness仍缺kernel-la。
 
-## 本轮：串口交互式TTY与内存操作优化
+## 近期队列：应用兼容性与局部纠错（待确认实施范围）
 
-已确认UART中断＋worker、统一字符设备实例接口和保守宽字内存原语。
-应用线交付未经修改的BusyBox ash/stty、行编辑和完整串口作业控制；CPU线量化
-heap清零/搬迁与已解析用户页内复制，以原Lua工程判断一次局部优化的实际价值。
-两条线可独立推进、分别验收；QEMU性能测量串行，不设置固定吞吐倍数。
+串口TTY与有限CPU归因已收口，移入下方已交付摘要。测试调查用于选择下一项工作，
+不把遍历结束、固定分数或吞吐倍数作为开发目标。这里是建议顺序，不是新实现的批准记录。
+逐次成绩、原始输出、人工停止及补跑记录只留在忽略的build；不同启动不拼成正式成绩。
 
-| 阶段 | 状态与验收 |
+| 优先级/能力编号 | 明确问题与下一项交付 |
 |---|---|
-| T1 实例与UART | [x] OFD持有实例；DTB UART/IRQ、1024项RX、4KiB输入/echo/TX及1KiB内核输出队列；有界IRQ和可join worker；初始TEMT忙的独立失败/等待反例已修复，正常stop超时保留owner及恢复回收成立。 |
-| T2 行规程 | [x] 真实termios、canonical/EOF、VMIN/VTIME、flow/drain/flush、poll与整次readv continuation；交付前缀和已消费输入分别对照Linux。 |
-| T3 会话与应用 | [x] ctty、稳定SID/前台PGID、终端信号、后台I/O、旧OFD hangup代次；原ash的Ctrl-C/Ctrl-Z、jobs/fg/bg和退出。 |
-| M1 有限归因 | [x] 六项消费者COST，聚合不超过64KiB、每任务64B；一次优化前Lua定点窗口，保留历史schema。 |
-| M2 内存原语 | [x] 实验分支验证alias-safe word、byte回退及heap/页内chunk；微实验有效，Lua无可验证收益，生产保留字节实现，候选未上线。 |
-| M3 应用价值 | [x] 一次独立微fixture、CPU候选三次关闭观测Lua启动；实际成本、程序/同步/卸载、资源与剩余差距分别解释。 |
-| 集成收口 | [x] 完整RV64、真实libc、1207通用＋107终端记录、scale/栈/FIFO及原Lua集成功能；兼容候选的旧glibc TCP与原串口应用通过，单向合入兼容分支。 |
+| 1．P1/P2e 文件所有权 | 公共LTP临时目录准备调用chown，当前缺fchownat/fchown。先确认“真实inode所有权元数据＋固定root”或“连同凭据/权限”的边界，再实现ext4/tmpfs、ctime、保留值、只读与错误路径；不返回空成功，也不把解锁准备阶段算目标测例通过。 |
+| 2．P1/P0c 局部ABI纠错 | 记录锁的flock复制与对象类型错误顺序有源码支持的差异；静态glibc取消/join及fd耗尽路径需匹配参考定位。每项先做窄反例；旧musl NULL栈clone和EINTR重试先归输入层，不改内核迎合包装器。 |
+| 3．P2/P5 时间与可用诊断 | times的内核时间仅按timer中断采样，不能表示全部短syscall成本；先验证记账缺口，再设计运行边界结算。旧glibc补匹配的unwind依赖；账户、工具、scratch设备与原ELF编译缺项分别处理。 |
+| 性能候选，仅选一项 | 空文件创建/删除、路径stat/open、1ms睡眠唤醒或TCP背压，先选择目标应用和固定工作量。比较具体机制与资源代价，不同时改存储、timer和调度器。 |
 
-TTY与有限CPU归因已实施并分别验收；107条终端同ELF记录一致，原ash/stty两种transport完成。
-CPU选定内层工作合计约0.170秒/170秒窗口，宽字候选没有工程收益，未上线。完整Lua集成功能
-与兼容入口通过；初始TEMT忙的启动回滚和空worker等待缺口经独立反例修复。PTY、凭据、调度策略更换、
-存储重构及新网络能力不进入本轮；缺少收益的CPU候选不上线，也不自动追加其他改造。
-原始输出与机器快照归忽略的build，Git保存人类可读结论和重建命令。
-下一应用候选收敛为PTY＋原BusyBox script，另行确认范围；LoongArch和SMP是独立依赖。
-历史异常风险继续按上表保留，不因本轮通过关闭。不push、发布或转换阶段。
+PTY＋原BusyBox script保留为下一项应用候选。更大离线工程、外部网络与凭据体系由实际
+使用流程选择；LoongArch是双架构交付依赖，SMP另行规划。cgroup、NUMA、BPF等没有因
+目录中存在测例就自动进入近期队列。已有P/N/L编号继续描述依赖，不形成第二套排期。
 
 ## 按证据触发的性能候选
 
@@ -57,6 +49,9 @@ CPU选定内层工作合计约0.170秒/170秒窗口，宽字候选没有工程�
 | checkpoint阻塞提交或最终排空成本显著 | 有界批次和调度；核对积压、日志环绕、低内存、卸载及完整恢复 |
 | 非阻塞发送复制放大或固定热缓存运行成本高 | 发送credit约束暂存、重复解析/复制/查询；先核对错误优先级，保留短写、EFAULT前缀、取消和页生命周期 |
 | Lua构建仍有差距，选定heap清零/搬迁与页内复制不足以解释 | 核对用户程序运行、页解析/ELF及未测固定成本，再选一个机制；VMA指标是比较次数，不能当查询数或时间 |
+| 空文件create/unlink和路径stat慢，fstat明显更轻 | 分解路径/目录、inode/位图、事务准备与真实资源等待；0k没有文件内容写入，不能只优化数据复制。保留节点身份、orphan、同步及复用边界 |
+| 短睡眠的到期唤醒接近tick周期 | 比较提高HZ与最早blocked deadline参与SBI重装；当前额外timer只服务实时预算/RR。核对中断开销、取消、重启、对象复用和空闲功耗，不先换调度策略 |
+| UDP过载丢包或TCP受协议credit约束 | 核对接收/丢弃量、每连接进展、lwIP窗口/池和socket预算；限速可靠性与饱和效率分开，TCP_INFO未支持的字段不作为重传证据 |
 | 真实大映射/多等待者负载规模退化 | resident范围索引、deadline索引或安全长操作边界；核对维护成本、OOM和取消 |
 
 每次选择一个有独立证据的机制，不把这张候选表当成新排期，不换调度器来解释尚未归因的分布。
@@ -65,6 +60,8 @@ CPU选定内层工作合计约0.170秒/170秒窗口，宽字候选没有工程�
 
 | 阶段/能力 | 事实与证据入口 |
 |---|---|
+| T1–T3 串口TTY | 实例owner、UART IRQ/worker、行规程/readv continuation、ctty/作业控制及原ash/stty已交付；初始TEMT忙回滚与停机资格已修复，见[TTY契约](modules/kernel-tty.md)。PTY仍未交付。 |
+| M1–M3 有限CPU归因 | 六项消费者诊断已交付；宽字原语仅实验验证，未带来原Lua工程收益，未上线。生产保留字节路径，见[工具链机制](learning/offline-toolchain-probe.md)。 |
 | 命名FIFO与原Lua工程 | 管道元数据、ext4/tmpfs FIFO、默认make jobserver、构建/增量/失败恢复及产物运行；1207 ABI与集中回归、兼容入口已交付。关闭观测-j1/-j2中位135.542/133.225秒；工作目录tmpfs不足以解释整体差距，见[工具链记录](learning/offline-toolchain-probe.md)。 |
 | N3网卡与宿主应用 | legacy/modern、零拷贝RX及回退、有界重组、实际双向TCP/HTTP和1196 ABI；性能、原应用与历史风险见[网卡记录](learning/network-ownership.md#真实-virtio-net-与宿主应用交付2026-10-02) |
 | D1–D3/T1/J1/V1纠错 | socket状态/扩容/接收资格、请求内暂存、版本量封口已交付；自动程序＋durable 11.541→5.129/12.108→5.359秒；完整恢复/双盘、1179 ABI及TCP复制限制见[存储](learning/cost-baseline.md#版本量封口与socket纠错对照2026-10-02)与[网络](learning/network-ownership.md#本轮应用结果与剩余复制2026-10-02) |
@@ -92,7 +89,8 @@ glibc四进程整命令仍增加0.73%。该轮的prepare读取、1547次FLUSH和
 |---|---|
 | 原BusyBox55/55 | 此前日志/RTC/根设备补全已验收；完整228项没有在本轮网络工作中重跑 |
 | iperf/netperf | 22项受控原ELF完成；原iperf连续脚本的listener重建竞态在Linux也存在，原脚本结果和受控验收分别报告 |
-| LTP/helper | abort01到chown ENOSYS；cgroup_fj_proc无参数在Linux/BoarOS都等待，不是调度死锁；helper身份由固定上游调用规则确认 |
+| LTP执行角色 | 比赛目录遍历不是上游runtest；控制器helper、上游禁用shmat1和有限shm_test分开。原libc的EINTR重试、NULL栈clone、缺unwind库或账户可先于目标syscall阻塞，见[程序证据](learning/user-program-inventory.md#ltp的准备依赖与libc边界) |
+| 所有权与接口子集 | chown系列、O_PATH、原生accept4、路径truncate缺口成立；CPU-time clock、VIRTUAL/PROF timer、pipe容量操作、扩展clone/futex按具体子语义核对，不把已有整个模块记为缺失 |
 | 路径truncate | 尚未实现；本轮错误恢复使用已交付ftruncate，原Lua/GCC/make保持不变 |
 | 用户内存/信号 | mremap、按操作madvise、mlock、sigaltstack、实时信号队列、共享文件/PI futex待真实应用需求触发 |
 | 系统与平台 | 固定root查询不等于完整凭据/权限；无PTY/termios2/完整modem控制、外部IPv6/DNS/TLS、公网配置、SMP/实板、kernel-la，不声明完整Linux兼容或硬实时 |

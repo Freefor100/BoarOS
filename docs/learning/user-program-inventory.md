@@ -129,6 +129,68 @@ LTP 20240524 的 `ksm02`、`io_cancel02` 有缺少libnuma/libaio开发依赖时�
 `references/linux/fs/eventpoll.c` 的 `ep_loop_check` 失败路径返回ELOOP。记录版本差异，
 再决定是否存在内核错误；不能为了旧断言改变已经符合固定参考的errno。
 
+### LTP的准备依赖与libc边界
+
+固定比赛输入中的LTP为20240524，来源是 `references/oscomp-testsuits` 中由
+`tests/program-inventory/inputs.json` 选定的pre-2025树；不能把默认分支源码当成
+原镜像二进制。Linux比较依据仍为本地Linux 7.2，精确对象由来源清单管理。
+比赛脚本无参数遍历bin目录，上游runtest则选择程序、参数、控制器和环境，二者覆盖不同。
+
+先保存目标测试之前的失败。`lib/tst_tmpdir.c` 的公共准备调用
+`chown(TESTDIR, -1, getgid())`，而RV64路径需要fchownat。当前未实现文件所有权
+修改，这会挡住多个不同模块的测例；补齐该调用只解锁准备，不证明后续权限、映射或
+信号断言通过。文件uid/gid由inode持有，进程凭据是另一个owner；不能用返回0或
+创建nobody账户冒充完整权限。原镜像缺账户时，`symlink03`、`mlockall03` 的旧setup
+还会在没有检查getpwnam结果的情况下读取pw_uid，用户SIGSEGV应先查这个调用链。
+
+原musl的两个包装行为尤其容易误判：
+
+- `sigtimedwait` 在raw返回-EINTR后循环重试，`sigwaitinfo`以NULL timeout调用它。
+  原libc二进制中的重试分支与固定musl 1.2.5源码一致。LTP的
+  `libs/libltpsigwait/sigwait.c::test_empty_set`却要求空集合等待被SIGUSR1打断并
+  向应用返回EINTR；发送子进程在测试返回之前持续发信号。即使内核正确打断，包装器
+  也会重新等待，直到原watchdog终止。保留失败，不把它记作调度死锁；raw syscall的
+  EINTR、匹配信号消费及剩余子测试仍用有效输入独立保护。
+- `clone04`要求libc对NULL child stack返回EINVAL。原旧musl直接进入汇编
+  `__clone`，先在stack-16保存函数和参数，再执行ecall；NULL输入在进入内核clone
+  前就触发用户fault。LTP也标注了对应musl修复。不能拿新的libc源码覆盖这个事实，
+  更不能让内核把所有raw clone的NULL栈一概拒绝，破坏合法fork式调用。
+
+glibc线程退出和取消可能在运行期加载 `libgcc_s.so.1`。缺少匹配unwind库时会由libc
+主动abort；程序已加载不代表依赖完整，随意复制不同libc工具链的libgcc也不是修复。
+静态cancel-points的join结果与动态缺库分别核对，不用一个解释覆盖所有取消异常。
+同样，旧clock_gettime断言同时要求成功返回和errno为0，且没有先清errno；成功调用
+通常不承诺清除历史errno，必须分别观察返回值和errno，不能直接记作时钟未实现。
+
+`shmat1`在上游 `runtest/mm` 因无限循环问题禁用：每批线程有次数上限，外层却
+反复建批，读写与附加之间缺少完成握手，24小时alarm的exit0不证明线程工作完成。
+`shm_test`则是有限压力：默认30线程、1000轮、逐字节yield，上游用较小的线程/轮数
+组合。大量循环本身不是缺陷；无控制器helper、上游缺陷、资源压力与有效长任务分开，
+只有明确的输入角色才能支持跳过。补跑改变前置状态，不能拼接为一次正式成绩。
+
+### 性能结果必须对应实际工作
+
+原judge的内嵌baseline不是当前固定Linux、同镜像和同QEMU下新测的对照。正值、
+分数或某个Max只能提示调查方向，不能证明整个系统效率；原脚本无逐命令时间时，
+也不能把全组耗时全部归给其中一个子项。
+
+| 负载 | 实际路径与正确读法 |
+|---|---|
+| lmbench lat_fs | `lmbench_src/src/lat_fs.c` 输出创建/删除次数每秒；0k执行creat/close/unlink，不写文件内容。慢路径要分解目录查找、inode/位图、事务准备、orphan及真实资源等待，数据复制不是唯一候选。 |
+| 路径stat/open与fstat | 前者包含用户路径导入、路径解析和元数据，后者使用已打开的对象；差距不能直接当磁盘带宽。热缓存/冷设备、同/不同目录和后台事务状态分别控制。 |
+| iozone | 固定工作量完成、应用要求的durable、后台checkpoint排空分别记录；多进程停止规则和实际传输量影响Parent/Max/Children，零长度元数据成本不能由大块缓存写吞吐替代。 |
+| cyclictest | 原脚本使用1ms间隔；judge取各线程最大值再平均，不是平均每次唤醒延迟。普通sleep deadline尚未纳入额外SBI重装，先区分到期检查、ready等待与IRQ-off，不把细粒度读时钟等同及时唤醒。 |
+| iperf/netperf | 原iperf UDP使用1000G目标，属于过载；按实际接收、丢包、每连接进展判断。STREAM是字节吞吐，RR/CRR是事务速率；不同参数和baseline使两程序分数不能互相代替。 |
+
+当前socket预算与lwIP协议预算不是同一个限制。生产 `lwipopts.h` 的TCP_WND和
+TCP_SND_BUF均为8个1460字节MSS；仅增加SO_SNDBUF不能自动扩大协议窗口。池压力、
+背压后的复制/重试与任务运行机会是候选，需固定内容和全部任务完成后归因；loopback
+成绩不代表网卡或公网能力。TCP_INFO尚未提供，原应用的Retr/Cwnd字段不作为可靠统计。
+
+CPU百分比也要说明记账边界。`times`的U/S时间目前按timer中断当时状态采样；反复
+短syscall仍可能没有足够S-mode样本，不能因此称内核工作为零。优化一次只选择一个
+有证据的机制，并核对端到端完成、响应和资源代价；待办统一维护在goals。
+
 ### 先验证参考环境
 
 固定 Linux 的 `init/do_mounts.c` 在 `/init` 前挂载 devtmpfs，会遮住镜像中原有 `/dev/shm`。初次 `pthread_cancel_points` 的 shm_open 因此失败；错误诊断中的 write 又成为 pending cancellation 的取消点，隐藏了原错误。补齐可见目录和 tmpfs 后同一 Linux/ELF 通过。socket 访问 loopback 前同样需要真正启用接口。环境 setup 失败不算内核 ABI 差异。
