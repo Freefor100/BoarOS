@@ -18,6 +18,17 @@ void abi_path_only_cases(void)
     record("path.chown",SC3(55,path,0,0));
     record("path.truncate",SC2(46,path,0));
     record("path.ioctl",SC3(29,path,0,-1));
+    record("path.interface-ioctl",SC3(29,path,0x8913,-1));
+    int option=0;unsigned option_length=sizeof(option);
+    record("path.getsockopt",SC5(209,path,1,3,&option,&option_length));
+    long read_bits=1UL<<path,write_bits=read_bits,error_bits=read_bits;
+    long select_timeout[2]={0,0};
+    long selected=SC6(72,path+1,&read_bits,&write_bits,&error_bits,select_timeout,0);
+    long select_bits[3]={read_bits,write_bits,error_bits};
+    abi_record("path.select",selected,-1,-1,0,select_bits,sizeof(select_bits));
+    struct { unsigned events; unsigned long data; } __attribute__((packed)) event={1,0};
+    record("path.epoll-control",SC4(21,path,1,fd,&event));
+    record("path.epoll-wait",SC6(22,path,&event,1,0,0,0));
     record("path.setfl",SC3(25,path,4,0));
     record("path.lock-fault",SC3(25,path,5,-1));
     record("path.sync",SC1(82,path));

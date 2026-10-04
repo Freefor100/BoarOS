@@ -1001,7 +1001,7 @@ enum kernel_syscall_status syscall_handle_ioctl(
         return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     if (interface_ioctl_command((uint32_t)request->arguments[1])) {
         enum kernel_syscall_status status = KERNEL_SYSCALL_STATUS_OK;
-        if (kernel_files_pin(files, (int32_t)request->arguments[0],
+        if (kernel_files_pin_data(files, (int32_t)request->arguments[0],
                              &file, &linux_result) != KERNEL_FILES_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
         if (linux_result == 0 && kernel_open_file_socket(file) == 0)

@@ -82,7 +82,7 @@ static enum kernel_syscall_status borrow_socket(
         return KERNEL_SYSCALL_STATUS_OK;
     }
     if (status != KERNEL_TASK_STATUS_OK ||
-        kernel_files_pin(*files_out, fd, file_out, result) !=
+        kernel_files_pin_data(*files_out, fd, file_out, result) !=
             KERNEL_FILES_STATUS_OK) {
         return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     }

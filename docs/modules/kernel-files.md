@@ -210,7 +210,9 @@ fd-slot OFD references -> files table -> fs context
 CLOEXEC归fd槽；其他访问/创建/截断位不取得数据资格。dup/fork共享OFD，最后关闭释放path。
 fstat/fstatfs、目录相对操作、fchdir、FD标志和F_GETFL可用；空路径stat/chown/utimens、
 linkat和readlinkat使用原身份，NOFOLLOW可持有链接自身。数据、seek、mmap、ioctl、记录锁、
-直接fd改权/所有权/时间与同步入口先返回EBADF；poll显示POLLNVAL。
+直接fd改权/所有权/时间与同步入口先返回EBADF；网络ioctl/socket入口同样先检查资格。
+poll显示POLLNVAL；select按固定Linux的POLLIN/OUT/EX_SET将它映射到所请求的集合，
+不把有效路径fd误当成已经关闭的fd。
 unlink/rename及同名重建不会替换句柄身份。execveat、openat2仍未交付。
 `make build/diff-abi/path-rv`配`tests/diff-abi/path-cases.txt`可聚焦差分；完整ABI仍包含同一记录。
 `O_NOCTTY` 是合法open flag，其控制终端语义见[TTY模块](kernel-tty.md)。

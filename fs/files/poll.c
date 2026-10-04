@@ -722,16 +722,16 @@ enum kernel_files_status kernel_files_pselect6(
             if (r &&
                 (pfds[i].revents &
                  (KERNEL_POLLIN | KERNEL_POLLRDNORM | KERNEL_POLLHUP |
-                  KERNEL_POLLERR)) != 0) {
+                  KERNEL_POLLERR | KERNEL_POLLNVAL)) != 0) {
                 out_rfds[widx] |= bit;
                 total_bits++;
             }
             if (w &&
-                (pfds[i].revents & (KERNEL_POLLOUT | KERNEL_POLLWRNORM)) != 0) {
+                (pfds[i].revents & (KERNEL_POLLOUT | KERNEL_POLLWRNORM | KERNEL_POLLERR | KERNEL_POLLNVAL)) != 0) {
                 out_wfds[widx] |= bit;
                 total_bits++;
             }
-            if (e && (pfds[i].revents & KERNEL_POLLPRI) != 0) {
+            if (e && (pfds[i].revents & (KERNEL_POLLPRI | KERNEL_POLLNVAL)) != 0) {
                 out_efds[widx] |= bit;
                 total_bits++;
             }

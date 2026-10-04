@@ -8,6 +8,11 @@ path.chmod
 path.chown
 path.truncate
 path.ioctl
+path.interface-ioctl
+path.getsockopt
+path.select
+path.epoll-control
+path.epoll-wait
 path.setfl
 path.lock-fault
 path.sync
