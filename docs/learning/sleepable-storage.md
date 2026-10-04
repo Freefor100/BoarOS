@@ -29,7 +29,7 @@ lwext4 纯读使用局部游标 `ext4_fpread`；同块缓存 loading 合并，�
 - 最后 close 与已 unlink inode 的写回交错，等待写回结束后再失效缓存，不在 writeback 页上 fatal。
 - host recovery 在块写入口检查 mount lock owner。首次在 orphan 回收发现无锁 transaction owner，补齐公开维护入口后通过；fixture 自己直接调用底层 orphan peek 时也须显式持锁，不能把测试裸调用误归因于公开 API。
 - 两个文件冷读的 NBD 响应必须同时暂扣；此时计算任务与无关缓存命中必须完成。额外设置 pending termination 并调用 signal wake，两个内部 DMA wait 仍保持 BLOCKED，随后完成、退出和资源基线回收。
-- 八个写请求全部暂扣后逆序释放；writeback 模式下一条必须为 FLUSH，再为后继内容回读；write-through 同样排空前八个才放行后继。另一次设备生命周期暂扣八请求直至 guest 一秒 timeout，收到 reset 标记后由 host 放行，验证八个失败结果、单次 reset 及后续提交失败。每项覆盖两种 transport 和两种 cache mode。
+- 八个写请求全部暂扣后逆序释放；writeback 模式下一条必须为 FLUSH，再为后继内容回读；write-through 同样排空前八个才放行后继。另一次设备生命周期暂扣八请求直至客体驱动的有限请求期限到期（当前为30秒），收到 reset 标记后由 host 放行，验证八个失败结果、单次 reset 及后续提交失败。每项覆盖两种 transport 和两种 cache mode。
 - 完整 WAL 验证暴露旧故障启用的信号竞态：probe 为 43 事件，另一次仅 42，末端 cut 永远不会触发。`SIGUSR1` 与客体放行之间缺少后端确认，启用边界会漂移。增加通用 `arm` 控制命令，等待 `control=arm` 后才发客体许可；host 红测先验证旧协议无法在 NBD 空闲时确认，新协议和末端抽样通过后重跑 DELETE/WAL 完整矩阵。
 - NBD arm/hold/release/drain 是协议握手，未用固定宿主 sleep 推断完成。QEMU 可把相邻读合并为一个 NBD 请求，因此并发门槛显式关闭 request-merging；普通测试不更改内核合并行为。
 - 高半区切换后继续使用编译器保存在寄存器里的物理栈指针曾造成启动 fault。把 DTB 存储探测放入 noinline 调用，避免该指针跨地址切换存活；无盘不创建额外 cleanup task，有盘在资源基线快照前创建。
