@@ -3,6 +3,7 @@
 static void record(const char *id, long ret) { abi_record(id,ret,-1,-1,0,0,0); }
 void abi_path_only_cases(void)
 {
+    abi_require(SC3(34,-100,"/path-proc",0755)==0 && SC5(40,"proc","/path-proc","proc",0,0)==0);
     long fd=abi_open("/path-target",2|64|128); abi_require(fd>=0);
     abi_require(SC3(64,fd,"data",4)==4);
     long path=abi_open("/path-target",010000000|02000000|2|01000|0100);
@@ -46,6 +47,19 @@ void abi_path_only_cases(void)
     long device=abi_open("/dev/rtc0",010000000);
     record("path.device-open",device<0?device:0);if(device>=0)SC1(57,device);
     long dup=SC1(23,path); record("path.dup",dup<0?dup:0);
+    char proc_live[48];const char *base="/path-proc/self/fd/";
+    unsigned live_pos=0;while(base[live_pos]){proc_live[live_pos]=base[live_pos];live_pos++;}
+    unsigned live_num=(unsigned)path;char live_digits[12];unsigned live_used=0;
+    do {live_digits[live_used++]=(char)('0'+live_num%10);live_num/=10;}while(live_num);
+    while(live_used) proc_live[live_pos++]=live_digits[--live_used];
+    proc_live[live_pos]=0;
+    long reopened=abi_open(proc_live,0);record("path.proc-live-reopen",reopened<0?reopened:0);
+    if(reopened>=0){char bytes[4];long count=SC3(63,reopened,bytes,sizeof(bytes));abi_record("path.proc-live-content",count,-1,-1,0,bytes,count>0?(usize)count:0);SC1(57,reopened);}
+    else abi_record("path.proc-live-content",reopened,-1,-1,0,0,0);
+    struct abi_stat followed;long followed_result=SC4(79,-100,proc_live,&followed,0);
+    abi_record("path.proc-live-stat",followed_result,followed_result? -1:followed.size,-1,0,0,0);
+    long fsinfo[15];long fsresult=SC2(44,path,fsinfo);
+    abi_record("path.statfs",fsresult,-1,-1,0,fsresult?0:fsinfo,fsresult?0:2*sizeof(long));
     abi_require(SC3(35,dir,"path-target",0)==0);
     long replacement=abi_open("/path-target",2|64|128);abi_require(replacement>=0);
     struct abi_stat newer; abi_require(SC2(80,path,&st)==0 && SC2(80,replacement,&newer)==0);
@@ -74,7 +88,15 @@ void abi_path_only_cases(void)
     if(!pid){struct abi_stat child_st;abi_exit(SC2(80,path,&child_st)?99:0);}
     int status=0;abi_require(SC4(260,pid,&status,0,0)==pid);
     abi_record("path.fork",0,-1,-1,status,0,0);
+    unsigned long old_limit[2],low_limit[2];
+    abi_require(SC4(261,0,7,0,old_limit)==0);
+    low_limit[0]=0;low_limit[1]=old_limit[1];abi_require(SC4(261,0,7,low_limit,0)==0);
+    record("path.full-bad-input",abi_open((void *)-1L,010000000));
+    record("path.full-valid",abi_open("/path-target",010000000));
+    record("path.full-bad-dirfd",SC4(56,-1,"path-target",010000000,0));
+    abi_require(SC4(261,0,7,old_limit,0)==0);
     SC1(57,replacement);SC1(57,dup);SC1(57,sym);SC1(57,dir);SC1(57,path);SC1(57,fd);
+    abi_require(SC2(39,"/path-proc",0)==0 && SC3(35,-100,"/path-proc",0x200)==0);
 }
 
 void abi_path_truncate_cases(void)

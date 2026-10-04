@@ -26,6 +26,10 @@ path.symlink-directory
 path.fifo-open
 path.device-open
 path.dup
+path.proc-live-reopen
+path.proc-live-content
+path.proc-live-stat
+path.statfs
 path.recreate-identity
 path.poll
 path.readv-fault
@@ -37,6 +41,9 @@ path.empty
 path.bad-input
 path.proc-reopen
 path.fork
+path.full-bad-input
+path.full-valid
+path.full-bad-dirfd
 truncate.path-negative-fault
 truncate.path-fault
 truncate.path-missing
