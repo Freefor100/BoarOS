@@ -159,8 +159,13 @@ LTP 20240524 的 `ksm02`、`io_cancel02` 有缺少libnuma/libaio开发依赖时�
 glibc线程退出和取消可能在运行期加载 `libgcc_s.so.1`。缺少匹配unwind库时会由libc
 主动abort；程序已加载不代表依赖完整，随意复制不同libc工具链的libgcc也不是修复。
 静态cancel-points的join结果与动态缺库分别核对，不用一个解释覆盖所有取消异常。
-同样，旧clock_gettime断言同时要求成功返回和errno为0，且没有先清errno；成功调用
-通常不承诺清除历史errno，必须分别观察返回值和errno，不能直接记作时钟未实现。
+旧clock_gettime断言同时要求成功返回和errno为0，且没有先清errno。原静态glibc
+启动会请求8字节的`getrandom(..., GRND_NONBLOCK)`；没有可信RNG、熵尚未就绪时
+内核应返回EAGAIN，libc可以留下该errno。成功的时钟调用不承诺清除历史errno。
+同内核、原ELF的有/无VirtIO RNG对照区分了这个环境与断言边界；不是RTC未实现，
+也不能由内核伪造熵或成功时清errno来迎合测试。固定行为见
+`references/linux/drivers/char/random.c`和BoarOS的`kernel/syscall/random.c`。
+临时诊断只在忽略的build通过链接包装器核对请求及返回，不加入生产打印或观测。
 
 比赛镜像中的 glibc 是 Ubuntu 2.35，不能用项目另行固定的 glibc 2.44 源码来声称
 它的全部行为。libc-test 的 C locale、扫描／格式化、正则和取消断言有些反映
