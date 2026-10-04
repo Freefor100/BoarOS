@@ -9,6 +9,14 @@ shell=$4
 file=$5
 name=${file##*/}
 [ -r "$skips" ] || exit 125
+# 显式诊断排除与缺少控制器的辅助程序分开；默认为空，不制造通过结果。
+set -f
+for excluded in ${BOAROS_DIAGNOSTIC_EXCLUDE:-}; do
+    if [ "$name" = "$excluded" ]; then
+        echo "BOAROS-CASE EXCLUDE command=$file reason=user-requested-diagnostic-exclusion" >&2
+        exit 125
+    fi
+done
 tab=$(printf '\t')
 while IFS="$tab" read -r helper source reason; do
     case "$helper" in ''|'#'*) continue ;; esac

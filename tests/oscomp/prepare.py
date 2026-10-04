@@ -2,6 +2,7 @@
 """Build the compatibility bootstrap into PID 1's shell command, not the test disk."""
 import argparse
 import json
+import re
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -13,12 +14,16 @@ def main():
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--groups', default='basic busybox cyclictest iozone iperf libcbench libctest lmbench lua netperf ltp')
     parser.add_argument('--case-timeout', type=int, default=300)
+    parser.add_argument('--diagnostic-exclude', default='', help='space-separated LTP basenames, empty by default')
     args = parser.parse_args()
     known = {'basic','busybox','cyclictest','iozone','iperf','libcbench','libctest','lmbench','lua','netperf','ltp'}
     if not args.groups.split() or not set(args.groups.split()) <= known:
         parser.error('unknown evaluation group')
     if not 0 <= args.case_timeout <= 86400:
         parser.error('case timeout must be between 0 and 86400 seconds')
+    exclusions = args.diagnostic_exclude.split()
+    if any(not re.fullmatch(r'[A-Za-z0-9_.-]+', name) or name in ('.', '..') for name in exclusions):
+        parser.error('diagnostic exclusions must be literal LTP basenames')
     payload = ''.join(f'\\0{byte:03o}' for byte in args.case.read_bytes())
     startup = (HERE / 'init.sh').read_text()
     # Decode a build-owned executable with the original BusyBox; no host disk injection.
@@ -33,7 +38,8 @@ def main():
     profile = {'path': '/musl/busybox', 'argv': ['/musl/busybox', 'sh', '-c', startup],
                'envp': ['PATH=/musl','HOME=/','TERM=vt100',
                         'BOAROS_EVAL_GROUPS=' + args.groups,
-                        'BOAROS_LTP_CASE_TIMEOUT=' + str(args.case_timeout)]}
+                        'BOAROS_LTP_CASE_TIMEOUT=' + str(args.case_timeout),
+                        'BOAROS_DIAGNOSTIC_EXCLUDE=' + ' '.join(exclusions)]}
     args.output.parent.mkdir(parents=True, exist_ok=True)
     value = json.dumps(profile, ensure_ascii=False, indent=2) + '\n'
     if not args.output.exists() or args.output.read_text() != value:

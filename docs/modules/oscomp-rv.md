@@ -87,6 +87,8 @@ runner 读取固定 Harness `kernel/judge/config.json`。其中 `qemu.timeout=36
 本 profile 无第二盘，不伪造不存在的输入；总时间预算覆盖一次 QEMU 启动。
 `--diagnostic-timeout 0` 将宿主监督设为无截止时间，`--case-timeout 0` 关闭客体逐项监督期限；两者不会改动测例自身的 watchdog 或原 judge。此模式用于定位长任务与真实阻塞，结果明确标为诊断，不能替代官方固定预算成绩。
 
+`--diagnostic-exclude CASE` 可显式排除一个 LTP 文件名，重复参数可列多个；默认清单为空。对应构建参数为 `OSCOMP_DIAGNOSTIC_EXCLUDE`。原目录仍遍历该条目，另输出 `EXCLUDE` 原因并返回125，不输出Summary或通过分；报告单独保存排除清单，并将整轮标为诊断。有限压力项的人工排除不能归为缺少控制器，也不能宣称它已执行或通过。不同启动的日志和分数不拼接。
+
 原 `parse_serial_out_new` 和 22 个 judge 原样运行，未到达组也由原 judge 产生结果。
 原 `postwork.postwork` 接收仅含 RV 的 summary；LA 未运行，不在输入中伪造成绩。
 其整数分数为 RV 投影，保留原始分组分数与 LTP 变换，不自行重写总分公式。

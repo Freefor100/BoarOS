@@ -129,6 +129,24 @@ class OfficialFlowTests(unittest.TestCase):
         self.assertEqual(result.returncode, 7, result.stderr)
         self.assertEqual(result.stdout, 'real-result\n')
 
+    def test_diagnostic_exclusion_is_explicit_and_never_passes(self):
+        program = Path(self.temp.name) / 'finite-workload'
+        program.write_text('#!/bin/sh\necho real-work\nexit 7\n')
+        program.chmod(0o755)
+        command = ['sh', str(HERE / 'ltp-case.sh'), str(self.binary),
+            str(HERE / 'ltp-skips.tsv'), '0', '/bin/sh', str(program)]
+        env = dict(os.environ, BOAROS_DIAGNOSTIC_EXCLUDE='')
+        native = subprocess.run(command, env=env, capture_output=True, text=True, timeout=5)
+        self.assertEqual(native.returncode, 7, native.stderr)
+        self.assertEqual(native.stdout, 'real-work\n')
+        env['BOAROS_DIAGNOSTIC_EXCLUDE'] = 'other-workload finite-workload'
+        excluded = subprocess.run(command, env=env, capture_output=True, text=True, timeout=5)
+        self.assertEqual(excluded.returncode, 125, excluded.stderr)
+        self.assertEqual(excluded.stdout, '')
+        self.assertIn('BOAROS-CASE EXCLUDE', excluded.stderr)
+        self.assertIn('reason=user-requested-diagnostic-exclusion', excluded.stderr)
+        self.assertNotIn('Summary', excluded.stderr)
+
 
 if __name__ == '__main__':
     unittest.main()

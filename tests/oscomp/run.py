@@ -89,6 +89,7 @@ def main():
     ap.add_argument('--diagnostic-timeout', type=int, help='override total budget, 0 disables it; labels result diagnostic, never the formal baseline')
     ap.add_argument('--groups',choices=('all','iozone','environment','ltp'),default='all',help='subsets run the same original scripts and never imply full Harness acceptance')
     ap.add_argument('--case-timeout', type=int, default=300, help='LTP per-case safety budget seconds, 0 disables it; timeout is never a pass')
+    ap.add_argument('--diagnostic-exclude', action='append', default=[], metavar='CASE', help='explicitly leave a LTP basename unexecuted, status 125; labels the whole run diagnostic')
     args = ap.parse_args()
     directory = args.output.resolve()
     if directory.exists():
@@ -102,8 +103,11 @@ def main():
     budget = args.diagnostic_timeout if args.diagnostic_timeout is not None else config.get('qemu.timeout', 60)
     if budget < 0: raise SystemExit('timeout must be nonnegative; 0 disables it')
     if not 0 <= args.case_timeout <= 86400: raise SystemExit('case timeout must be between 0 and 86400 seconds')
+    if any(not re.fullmatch(r'[A-Za-z0-9_.-]+', name) or name in ('.', '..') for name in args.diagnostic_exclude):
+        ap.error('diagnostic exclusions must be literal LTP basenames')
     subprocess.run(['make', 'all', 'OSCOMP_GROUPS=' + ' '.join(selected),
-                    'OSCOMP_CASE_TIMEOUT=' + str(args.case_timeout)], cwd=ROOT, check=True)
+                    'OSCOMP_CASE_TIMEOUT=' + str(args.case_timeout),
+                    'OSCOMP_DIAGNOSTIC_EXCLUDE=' + ' '.join(args.diagnostic_exclude)], cwd=ROOT, check=True)
     directory.mkdir(parents=True)
     disk = directory / 'root.img'
     subprocess.run(['cp', '--reflink=auto', '--sparse=always', str(REF / 'sdcard-rv.img'), str(disk)], check=True)
@@ -121,8 +125,9 @@ def main():
               'kernel_sha256': sha(kernel), 'config': config, 'config_sha256': sha(config_path),
               'init_config_sha256': sha(ROOT / 'build/riscv/oscomp/init.json'), 'init_script_sha256': sha(HERE / 'init.sh'),
               'qemu': output([qemu, '--version']).splitlines()[0], 'qemu_command': command,
-              'timeout_seconds': budget, 'diagnostic': args.diagnostic_timeout is not None or args.groups != 'all',
+              'timeout_seconds': budget, 'diagnostic': args.diagnostic_timeout is not None or args.groups != 'all' or bool(args.diagnostic_exclude),
               'ltp_case_timeout_seconds': args.case_timeout,
+              'ltp_diagnostic_exclusions': args.diagnostic_exclude,
               'case_sha256': sha(ROOT / 'build/riscv/oscomp/case'),
               'ltp_hook_sha256': sha(HERE / 'ltp-hook.sh'),
               'ltp_skips_sha256': sha(HERE / 'ltp-skips.tsv'),

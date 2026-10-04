@@ -591,6 +591,7 @@ DEPS := \
 
 OSCOMP_GROUPS ?= basic busybox cyclictest iozone iperf libcbench libctest lmbench lua netperf ltp
 OSCOMP_CASE_TIMEOUT ?= 300
+OSCOMP_DIAGNOSTIC_EXCLUDE ?=
 OSCOMP_CASE := $(BUILD_DIR)/oscomp/case
 OSCOMP_INIT := $(BUILD_DIR)/oscomp/init.json
 .DEFAULT_GOAL := all
@@ -606,7 +607,8 @@ force-oscomp-init:
 
 $(OSCOMP_INIT): force-oscomp-init $(OSCOMP_CASE) tests/oscomp/init.sh tests/oscomp/ltp-hook.sh tests/oscomp/prepare.py
 	python3 -B tests/oscomp/prepare.py --case $(OSCOMP_CASE) --output $@ \
-		--groups '$(OSCOMP_GROUPS)' --case-timeout $(OSCOMP_CASE_TIMEOUT)
+		--groups '$(OSCOMP_GROUPS)' --case-timeout $(OSCOMP_CASE_TIMEOUT) \
+		--diagnostic-exclude '$(OSCOMP_DIAGNOSTIC_EXCLUDE)'
 
 all: $(KERNEL_RV)
 
