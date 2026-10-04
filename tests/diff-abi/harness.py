@@ -167,7 +167,7 @@ def fixture(directory, program):
 
 
 def run(args):
-    directory = BUILD / 'run'
+    directory = getattr(args, 'output', None) or BUILD / 'run'
     if directory.exists():
         shutil.rmtree(directory)
     directory.mkdir(parents=True)
@@ -179,7 +179,7 @@ def run(args):
         shutil.copyfile(args.kernel, kernel_snapshot)
         shutil.copyfile(args.program, program_snapshot)
         manifest_snapshot = directory / 'cases.txt'
-        shutil.copyfile(HERE / 'cases.txt', manifest_snapshot)
+        shutil.copyfile(getattr(args, 'case_manifest', None) or HERE / 'cases.txt', manifest_snapshot)
         metadata.update(boaros_sha256=digest(kernel_snapshot),
                         program_sha256=digest(program_snapshot),
                         case_manifest_sha256=digest(manifest_snapshot))
@@ -245,6 +245,8 @@ def main():
     parser.add_argument('--linux-kernel', type=Path,
                         help='verified fixed Linux Image cache')
     parser.add_argument('--program', type=Path, default=BUILD / 'cases-rv')
+    parser.add_argument('--case-manifest', type=Path)
+    parser.add_argument('--output', type=Path)
     parser.add_argument('--timeout', type=float, default=60)
     args = parser.parse_args()
     if args.cache_key:

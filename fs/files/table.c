@@ -29,7 +29,7 @@ enum kernel_files_status kernel_files_ioctl(
     struct kernel_open_file_description *description = 0;
     if (!kernel_files_is_live(files) || !linux_result)
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
-    enum kernel_files_status status = kernel_files_pin(files, fd, &description,
+    enum kernel_files_status status = kernel_files_pin_data(files, fd, &description,
                                                        linux_result);
     if (status != KERNEL_FILES_STATUS_OK || *linux_result) return status;
     *linux_result = description->device && description->device->ioctl
@@ -481,6 +481,19 @@ struct kernel_open_file_description *kernel_files_lookup_description(
         return 0;
     }
     return files->record->slots[fd].description;
+}
+
+enum kernel_files_status kernel_files_pin_data(
+    struct kernel_files *files, int64_t fd,
+    struct kernel_open_file_description **description, int64_t *result)
+{
+    enum kernel_files_status status = kernel_files_pin(files, fd, description, result);
+    if (status != KERNEL_FILES_STATUS_OK || *result || !*description) return status;
+    if (kernel_open_file_kind(*description) == KERNEL_OPEN_FILE_KIND_PATH) {
+        if (kernel_open_file_release(description) != KERNEL_OPEN_FILE_STATUS_OK) __builtin_trap();
+        *result = -KERNEL_EBADF;
+    }
+    return status;
 }
 
 enum kernel_files_status kernel_files_pin(
@@ -1064,6 +1077,12 @@ enum kernel_files_status kernel_files_fcntl(
         return KERNEL_FILES_STATUS_OK;
     }
     slot = &files->record->slots[fd];
+    if (slot->description->kind == KERNEL_OPEN_FILE_KIND_PATH &&
+        command != KERNEL_FILES_F_GETFD && command != KERNEL_FILES_F_SETFD &&
+        command != KERNEL_FILES_F_GETFL) {
+        *linux_result = -KERNEL_EBADF;
+        return KERNEL_FILES_STATUS_OK;
+    }
     switch (command) {
     case KERNEL_FILES_F_GETFD:
         /* The fd flag is FD_CLOEXEC, value 1, not the O_CLOEXEC bit. */

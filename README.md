@@ -146,7 +146,8 @@ CPU线已有默认关闭的有限诊断。选定heap清零/搬迁与页内userco
 文件所有权已接入fchown/fchownat：修改真实inode的UID/GID、ctime和特权位，
 ext4在同一事务删除文件capability属性；进程身份仍固定root。线程退出直接选择ready
 任务，清理继续由原worker拥有。PTY＋原BusyBox script保留为下一应用候选，范围另行确认。
-原生accept4、O_PATH和路径truncate仍缺；原LTP准备依赖、旧libc包装、
+O_PATH已持有独立路径资格，支持目录相对与空路径身份操作，不获得数据或设备打开资格。
+原生accept4和路径truncate仍缺；原LTP准备依赖、旧libc包装、
 镜像环境与目标接口失败分开，不能由遍历结束宣称完整兼容。
 性能候选包括元数据路径、短睡眠deadline和协议背压；按真实工作量选择一项，不因理论
 先进或微实验更快自动上线，见[证据读法](docs/learning/user-program-inventory.md#性能结果必须对应实际工作)。

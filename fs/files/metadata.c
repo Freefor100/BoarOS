@@ -96,6 +96,7 @@ enum kernel_files_status kernel_files_utimensat(
         struct kernel_open_file_description *file;
         if (flags) result = -KERNEL_EINVAL;
         else if (!(file = kernel_files_hold_fd(files, dirfd, &pin_guard))) result = -KERNEL_EBADF;
+        else if (file->kind == KERNEL_OPEN_FILE_KIND_PATH) result = -KERNEL_EBADF;
         else if (!file->file.private_data) result = -KERNEL_ENOTSUP;
         else result = kernel_vfs_file_set_times(&file->file, user_times ? times : 0);
     } else {
@@ -122,7 +123,7 @@ enum kernel_files_status kernel_files_fchmod(
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
     struct kernel_open_file_description *description =
         kernel_files_hold_fd(files, fd, &pin_guard);
-    if (!description) *linux_result = -KERNEL_EBADF;
+    if (!description || description->kind == KERNEL_OPEN_FILE_KIND_PATH) *linux_result = -KERNEL_EBADF;
     else if (description->kind == KERNEL_OPEN_FILE_KIND_PIPE && !description->file.private_data)
         *linux_result = kernel_pipe_set_mode(description->pipe, mode);
     else if (!description->file.private_data) *linux_result = -KERNEL_ENOTSUP;
@@ -156,7 +157,7 @@ enum kernel_files_status kernel_files_fchown(
     if (!kernel_files_is_live(files) || !linux_result)
         return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
     struct kernel_open_file_description *file = kernel_files_hold_fd(files, fd, &pin_guard);
-    if (!file) *linux_result = -KERNEL_EBADF;
+    if (!file || file->kind == KERNEL_OPEN_FILE_KIND_PATH) *linux_result = -KERNEL_EBADF;
     else if (file->kind == KERNEL_OPEN_FILE_KIND_PIPE && !file->file.private_data)
         *linux_result = kernel_pipe_set_owner(file->pipe, uid, gid);
     else if (!file->file.private_data) *linux_result = -KERNEL_ENOTSUP;
@@ -197,7 +198,16 @@ enum kernel_files_status kernel_files_fchownat(
         if ((!name || !name[0]) && (flags & KERNEL_FILES_AT_EMPTY_PATH) &&
             dirfd != KERNEL_FS_AT_FDCWD) {
             /* 空路径按选定 OFD 修改，也覆盖没有路径的共享 pipe 和已 unlink inode。 */
-            status = kernel_files_fchown(files, dirfd, uid, gid, linux_result);
+            struct kernel_open_file_description *file = kernel_files_lookup_description(files, dirfd);
+            if (file && file->kind == KERNEL_OPEN_FILE_KIND_PATH) {
+                struct kernel_vfs_path *held = file->file.path;
+                result = kernel_vfs_path_acquire(held);
+                if (!result) {
+                    result = kernel_vfs_path_set_owner(held, uid, gid);
+                    (void)kernel_vfs_path_release(&held);
+                }
+                *linux_result = result;
+            } else status = kernel_files_fchown(files, dirfd, uid, gid, linux_result);
             if (status == KERNEL_FILES_STATUS_OK) result = (int)*linux_result;
         } else {
             struct kernel_vfs_path *path = 0;

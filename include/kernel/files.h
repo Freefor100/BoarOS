@@ -463,6 +463,12 @@ enum kernel_files_status kernel_files_pin(
     int64_t fd,
     struct kernel_open_file_description **owner,
     int64_t *linux_result);
+/* Reject path-only descriptors before accessing operation buffers. */
+enum kernel_files_status kernel_files_pin_data(
+    struct kernel_files *files,
+    int64_t fd,
+    struct kernel_open_file_description **owner,
+    int64_t *linux_result);
 
 /* All marked descriptors become unreachable even when cleanup must retry. */
 enum kernel_files_status kernel_files_close_on_exec(

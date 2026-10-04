@@ -186,3 +186,9 @@ python3 -B tests/runtime-diagnostics.py --output build/coarse-original-diagnosti
 来自最终生产快照 `be5ca22629c904a427241b0f92e9d561d0312952e787ab75870ec4beae0143b3`。
 固定 Linux 与 BoarOS 的原静态/动态 utime 仍各 30/30 成功，原 libc time/coarse
 及 UTIME_NOW/fstat 跨秒记录均完成；主线 uname 保持不变。
+
+路径资格与普通打开资格分别控制元数据操作。`O_PATH`的稳定path owner允许
+空字符串/AT_EMPTY_PATH操作；直接fchown/fchmod/futimens仍要求普通打开资格，
+不能因身份可查询就授予数据访问。固定Linux的`fs/open.c:build_open_how`
+先掩去open/openat的其他位，`build_open_flags`的严格校验只适用于已经构造的how；
+不能拿openat2的拒绝规则套用普通open。相关差分入口是`path_only.c`。

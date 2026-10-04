@@ -249,7 +249,7 @@ static int core_poll_run(
             pinned[i], (uint32_t)(uint16_t)pfds[i].events, &wq);
         uint32_t rev =
             active & ((uint32_t)(uint16_t)pfds[i].events | KERNEL_POLLERR |
-                      KERNEL_POLLHUP);
+                      KERNEL_POLLHUP | KERNEL_POLLNVAL);
         if (rev != 0U) {
             pfds[i].revents = (int16_t)rev;
             ready_count++;
@@ -281,7 +281,7 @@ static int core_poll_run(
                     pinned[i], (uint32_t)(uint16_t)pfds[i].events, &wq);
                 uint32_t rev =
                     active & ((uint32_t)(uint16_t)pfds[i].events |
-                              KERNEL_POLLERR | KERNEL_POLLHUP);
+                              KERNEL_POLLERR | KERNEL_POLLHUP | KERNEL_POLLNVAL);
                 if (rev != 0U) {
                     pfds[i].revents = (int16_t)rev;
                     ready_count++;
@@ -316,7 +316,7 @@ static int core_poll_run(
                     pinned[i], (uint32_t)(uint16_t)pfds[i].events, &wq);
                 uint32_t rev = active &
                     ((uint32_t)(uint16_t)pfds[i].events |
-                     KERNEL_POLLERR | KERNEL_POLLHUP);
+                     KERNEL_POLLERR | KERNEL_POLLHUP | KERNEL_POLLNVAL);
                 if (rev != 0U) ready_count++;
             }
             if (wake_reason == KERNEL_WAIT_TIMEOUT &&
@@ -356,7 +356,7 @@ static int core_poll_run(
                 pinned[i], (uint32_t)(uint16_t)pfds[i].events, &wq);
             uint32_t rev =
                 active & ((uint32_t)(uint16_t)pfds[i].events | KERNEL_POLLERR |
-                          KERNEL_POLLHUP);
+                          KERNEL_POLLHUP | KERNEL_POLLNVAL);
             pfds[i].revents = (int16_t)rev;
             if (rev != 0U) {
                 ready_count++;

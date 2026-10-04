@@ -290,6 +290,25 @@ uint64_t kernel_vfs_path_inode(const struct kernel_vfs_path *path)
     return node->inode;
 }
 
+uint32_t kernel_vfs_path_mode(const struct kernel_vfs_path *path)
+{
+    if (!path || !path->references || !path->file.private_data) return 0;
+    const struct kernel_vfs_node *node = path->file.private_data;
+    return node->mode;
+}
+
+int kernel_vfs_path_readlink(struct kernel_vfs_path *path, char *buffer,
+                              size_t size, size_t *read)
+{
+    if (!path || !path->references) return -KERNEL_EINVAL;
+    KERNEL_LOCK_SCOPE(namespace_guard);
+    kernel_vfs_namespace_lock(path->file.mount, &namespace_guard);
+    struct kernel_vfs_instance *instance = path->file.mount->private_data;
+    if ((kernel_vfs_path_mode(path) & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFLNK)
+        return -KERNEL_EINVAL;
+    return instance->ops->readlink(path->file.private_data, buffer, size, read);
+}
+
 static void release_path_pin(struct kernel_vfs_path **path)
 {
     if (*path && kernel_vfs_path_release(path) != 0) __builtin_trap();
