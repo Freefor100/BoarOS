@@ -28,6 +28,28 @@ static struct flock write_lock(off_t start)
                            .l_start = start, .l_len = 1 };
 }
 
+static void pointer_priority_test(void)
+{
+    int endpoints[2];
+    int console = open("/dev/console", O_RDWR);
+    check(console >= 0 && pipe(endpoints) == 0, "pointer priority opens");
+    const int commands[] = { F_GETLK, F_SETLK, F_SETLKW,
+                            F_OFD_GETLK, F_OFD_SETLK, F_OFD_SETLKW };
+    for (unsigned i = 0; i < sizeof(commands) / sizeof(commands[0]); i++) {
+        errno = 0;
+        check(fcntl(console, commands[i], (void *)1) == -1 && errno == EFAULT,
+              "valid console bad flock");
+        errno = 0;
+        check(fcntl(endpoints[0], commands[i], (void *)1) == -1 && errno == EFAULT,
+              "valid pipe bad flock");
+        errno = 0;
+        check(fcntl(-1, commands[i], (void *)1) == -1 && errno == EBADF,
+              "bad fd before bad flock");
+    }
+    check(close(console) == 0 && close(endpoints[0]) == 0 &&
+          close(endpoints[1]) == 0, "pointer priority closes");
+}
+
 static void *waiter(void *argument)
 {
     (void)argument;
@@ -180,6 +202,7 @@ static void forced_exit_test(void)
 
 int main(void)
 {
+    pointer_priority_test();
     path = getenv("LOCK_TEST_PATH");
     if (!path) path = "/lockdata";
     shared_table_test();

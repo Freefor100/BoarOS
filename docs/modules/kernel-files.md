@@ -36,9 +36,10 @@ normal open、dup/F_DUPFD、console、pipe2 和 epoll_create1 最终都经过 `t
 
 `fs/record_lock.c` 为每个活 VFS inode 维护按有符号闭区间排序、带子树最大终点的 AVL 树和等待队列；每个锁节点同时挂在 owner 的侵入式索引上。长度为零延伸到 `INT64_MAX`，负长度向文件前方锁定，锁可以超过 EOF。`fs/files/locks.c` 导入 RV64 `struct flock` 并分派 `F_GETLK/F_SETLK/F_SETLKW` 与 `F_OFD_GETLK/F_OFD_SETLK/F_OFD_SETLKW`；标量 `fcntl` 命令仍走原入口。区间转换、读写权限、`l_pid`、坏指针和溢出错误按固定 Linux `references/linux/fs/locks.c`，commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 核对。
 
-当前还有一处错误优先级差异：有效TTY等无VFS node的OFD在导入flock之前返回EBADF，
-而固定Linux `fs/fcntl.c::do_fcntl`先复制F_SETLK的flock，坏指针应先得到EFAULT。
-这是待窄验证纠正的边界，不表示普通inode上的记录锁或所有坏fd都错误。
+错误检查先 pin fd，再导入 `flock`，最后检查对象是否支持记录锁。坏 fd 返回
+`EBADF`；有效 TTY 或 pipe fd 的坏指针返回 `EFAULT`，不被对象类型错误遮蔽。
+OFD pin 覆盖可能缺页睡眠的复制。`make test-record-lock-riscv` 用同一 ELF
+对照固定 Linux，覆盖六种记录锁命令及两种错误的优先级。
 
 传统锁 owner 是共享的 `kernel_files_record`，所以普通 fork 的新表不继承它，同表线程共享；该 owner 关闭同 inode 的任意 fd 就定向释放它在该 inode 的全部传统锁。OFD 锁 owner 是打开文件对象，dup/fork 共用且在最后真实引用消失时释放。两类 owner 身份不同，但相同 inode、范围和读写类型之间真实检查冲突。锁节点不反向引用 owner；VFS inode 在树或等待队列非空时不得释放。close、dup 覆盖、CLOEXEC、退出都在摘除 fd 的既有生命周期中释放对应锁，不把 OFD 锁留给历史 I/O cleanup。
 

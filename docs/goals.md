@@ -32,7 +32,7 @@ N3已经交付：legacy/modern VirtIO-net、受限DMA借用与复制回退、静
 | 优先级/能力编号 | 明确问题与下一项交付 |
 |---|---|
 | 1．P1/P2e 文件所有权 | 公共LTP临时目录准备调用chown，当前缺fchownat/fchown。先确认“真实inode所有权元数据＋固定root”或“连同凭据/权限”的边界，再实现ext4/tmpfs、ctime、保留值、只读与错误路径；不返回空成功，也不把解锁准备阶段算目标测例通过。 |
-| 2．P1/P0c 局部ABI纠错 | 记录锁的flock复制与对象类型错误顺序有源码支持的差异；静态glibc取消/join及fd耗尽路径需匹配参考定位。每项先做窄反例；旧musl NULL栈clone和EINTR重试先归输入层，不改内核迎合包装器。 |
+| 2．P1/P0c 局部ABI纠错 | 记录锁已保护坏fd与坏flock的错误优先级；静态glibc取消/join及fd耗尽路径需匹配参考定位。每项先做窄反例；旧musl NULL栈clone和EINTR重试先归输入层，不改内核迎合包装器。 |
 | 3．P2/P5 时间与可用诊断 | times的内核时间仅按timer中断采样，不能表示全部短syscall成本；先验证记账缺口，再设计运行边界结算。旧glibc补匹配的unwind依赖；账户、工具、scratch设备与原ELF编译缺项分别处理。 |
 | 性能候选，仅选一项 | 空文件创建/删除、路径stat/open、1ms睡眠唤醒或TCP背压，先选择目标应用和固定工作量。比较具体机制与资源代价，不同时改存储、timer和调度器。 |
 
