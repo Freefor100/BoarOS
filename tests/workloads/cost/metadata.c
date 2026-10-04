@@ -2,6 +2,7 @@
 #define main original_consumer_main
 #include "consumer.c"
 #undef main
+#include <termios.h>
 
 static void metadata_loop(unsigned mode, int held)
 {
@@ -84,5 +85,9 @@ int main(void)
     CHECK(chdir("/")==0);cost_begin();
     fd=open("/",O_RDONLY|O_DIRECTORY);CHECK(fd>=0 && fsync(fd)==0 && close(fd)==0);
     cost_end("metadata-final-sync",0,0,0,0);
-    puts("COST PASS metadata");fflush(NULL);reboot(RB_POWER_OFF);return 0;
+    puts("COST PASS metadata");CHECK(fflush(NULL)==0);
+    /* fflush 只清用户缓冲；等待 UART 排空，防止关机 raw 输出插入快照尾部。 */
+    CHECK(tcdrain(STDOUT_FILENO)==0);
+    if(access("/cost-linux",F_OK)==0)reboot(RB_POWER_OFF);
+    return 0;
 }
