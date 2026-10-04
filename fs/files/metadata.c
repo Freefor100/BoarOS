@@ -148,6 +148,70 @@ enum kernel_files_status kernel_files_fchmodat(
     return KERNEL_FILES_STATUS_OK;
 }
 
+enum kernel_files_status kernel_files_fchown(
+    struct kernel_files *files, int64_t fd, uint32_t uid, uint32_t gid,
+    int64_t *linux_result)
+{
+    KERNEL_FILES_PIN_SCOPE(pin_guard);
+    if (!kernel_files_is_live(files) || !linux_result)
+        return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
+    struct kernel_open_file_description *file = kernel_files_hold_fd(files, fd, &pin_guard);
+    if (!file) *linux_result = -KERNEL_EBADF;
+    else if (file->kind == KERNEL_OPEN_FILE_KIND_PIPE && !file->file.private_data)
+        *linux_result = kernel_pipe_set_owner(file->pipe, uid, gid);
+    else if (!file->file.private_data) *linux_result = -KERNEL_ENOTSUP;
+    else *linux_result = kernel_vfs_file_set_owner(&file->file, uid, gid);
+    return KERNEL_FILES_STATUS_OK;
+}
+
+enum kernel_files_status kernel_files_fchownat(
+    struct kernel_files *files, const struct kernel_fs_context *fs,
+    struct kernel_mm *mm, int64_t dirfd, uint64_t user_path,
+    uint32_t uid, uint32_t gid, uint32_t flags, int64_t *linux_result)
+{
+    if (!kernel_files_is_live(files) || !kernel_fs_context_is_live(fs) || !mm || !linux_result)
+        return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
+    if (flags & ~(KERNEL_FILES_AT_SYMLINK_NOFOLLOW | KERNEL_FILES_AT_EMPTY_PATH)) {
+        *linux_result = -KERNEL_EINVAL;
+        return KERNEL_FILES_STATUS_OK;
+    }
+    char *name = 0;
+    int result = 0;
+    enum kernel_files_status status = KERNEL_FILES_STATUS_OK;
+    {
+        enum kernel_heap_status allocation = kernel_heap_allocate(files->heap,
+                                           KERNEL_FS_PATH_MAX, (void **)&name);
+        if (allocation != KERNEL_HEAP_STATUS_OK) {
+            if (allocation != KERNEL_HEAP_STATUS_EMPTY) return KERNEL_FILES_STATUS_STATE;
+            *linux_result = -KERNEL_ENOMEM;
+            return KERNEL_FILES_STATUS_OK;
+        }
+        size_t length;
+        enum kernel_uaccess_status access = kernel_copy_string_from_user(mm, name,
+                                           user_path, KERNEL_FS_PATH_MAX, &length);
+        if (access == KERNEL_UACCESS_STATUS_FAULT) result = -KERNEL_EFAULT;
+        else if (access == KERNEL_UACCESS_STATUS_TOO_LONG) result = -KERNEL_ENAMETOOLONG;
+        else if (access != KERNEL_UACCESS_STATUS_OK) status = KERNEL_FILES_STATUS_STATE;
+    }
+    if (!result && status == KERNEL_FILES_STATUS_OK) {
+        if ((!name || !name[0]) && (flags & KERNEL_FILES_AT_EMPTY_PATH) &&
+            dirfd != KERNEL_FS_AT_FDCWD) {
+            /* 空路径按选定 OFD 修改，也覆盖没有路径的共享 pipe 和已 unlink inode。 */
+            status = kernel_files_fchown(files, dirfd, uid, gid, linux_result);
+            if (status == KERNEL_FILES_STATUS_OK) result = (int)*linux_result;
+        } else {
+            struct kernel_vfs_path *path = 0;
+            result = metadata_path(files, fs, dirfd, name ? name : "", flags, &path);
+            if (!result) result = kernel_vfs_path_set_owner(path, uid, gid);
+            if (path) (void)kernel_vfs_path_release(&path);
+        }
+    }
+    if (name && kernel_files_release_allocation(files, name) != KERNEL_FILES_STATUS_OK)
+        return KERNEL_FILES_STATUS_STATE;
+    *linux_result = result;
+    return status;
+}
+
 static enum kernel_files_status copy_statfs(struct kernel_mm *mm,
     struct kernel_vfs_mount *mount, uint64_t user_buffer, int64_t *linux_result)
 {

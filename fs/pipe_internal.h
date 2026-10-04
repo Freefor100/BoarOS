@@ -18,6 +18,7 @@ struct kernel_pipe {
     struct kernel_heap *heap;
     uint64_t proc_identity;
     uint32_t mode;
+    uint32_t uid, gid;
     struct kernel_vfs_timespec atime, mtime, ctime;
     struct physical_page_allocator *allocator;
     uint64_t buffer_physical;
@@ -67,6 +68,7 @@ int kernel_pipe_fifo_open(struct kernel_heap *heap, struct kernel_vfs_node *node
 uint64_t kernel_pipe_proc_identity(const struct kernel_pipe *pipe);
 int kernel_pipe_stat(const struct kernel_pipe *pipe, struct kernel_vfs_stat *stat);
 int kernel_pipe_set_mode(struct kernel_pipe *pipe, uint32_t mode);
+int kernel_pipe_set_owner(struct kernel_pipe *pipe, uint32_t uid, uint32_t gid);
 
 /* Disposes a newly-created pipe before either endpoint is attached. */
 enum kernel_pipe_status kernel_pipe_destroy_unowned(

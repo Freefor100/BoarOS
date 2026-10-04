@@ -23,22 +23,17 @@ N3已经交付：legacy/modern VirtIO-net、受限DMA借用与复制回退、静
 区分已经修复的机制与缺少历史现场的归因。固定root、单hart、QEMU和选定应用验收
 均不代表多用户隔离、SMP、实板或完整Linux兼容。完整比赛Harness仍缺kernel-la。
 
-## 近期队列：应用兼容性与局部纠错（待确认实施范围）
+## 下一项应用候选：PTY＋原BusyBox script（待确认范围）
 
-串口TTY与有限CPU归因已收口，移入下方已交付摘要。测试调查用于选择下一项工作，
-不把遍历结束、固定分数或吞吐倍数作为开发目标。这里是建议顺序，不是新实现的批准记录。
-逐次成绩、原始输出、人工停止及补跑记录只留在忽略的build；不同启动不拼成正式成绩。
+串口TTY、有限CPU归因，以及libc暴露的局部错误和文件所有权已收口，移入下方
+交付摘要。下一应用候选是PTY＋原BusyBox script；先调查主从端owner、终端复用、
+挂断及真实程序调用链，再确认范围。它不等待I/O达到固定分数或吞吐倍数。
 
-| 优先级/能力编号 | 明确问题与下一项交付 |
-|---|---|
-| 1．P1/P2e 文件所有权 | 公共LTP临时目录准备调用chown，当前缺fchownat/fchown。先确认“真实inode所有权元数据＋固定root”或“连同凭据/权限”的边界，再实现ext4/tmpfs、ctime、保留值、只读与错误路径；不返回空成功，也不把解锁准备阶段算目标测例通过。 |
-| 2．P1/P0c 局部ABI纠错 | 记录锁已保护坏fd与坏flock的错误优先级；原glibc取消/join及fd耗尽路径以匹配Linux区分库行为和内核差异。每项先做窄反例；旧musl NULL栈clone和EINTR重试先归输入层，不改内核迎合包装器。 |
-| 3．P2/P5 时间与可用诊断 | times的内核时间仅按timer中断采样，不能表示全部短syscall成本；先验证记账缺口，再设计运行边界结算。旧glibc补匹配的unwind依赖；账户、工具、scratch设备与原ELF编译缺项分别处理。 |
-| 性能候选，仅选一项 | 线程退出到ready调度的idle中转已纠正；下一候选为空文件创建/删除、路径stat/open、1ms睡眠唤醒或TCP背压，先选择目标应用和固定工作量。比较具体机制与资源代价，不同时改存储、timer和调度器。 |
-
-PTY＋原BusyBox script保留为下一项应用候选。更大离线工程、外部网络与凭据体系由实际
-使用流程选择；LoongArch是双架构交付依赖，SMP另行规划。cgroup、NUMA、BPF等没有因
-目录中存在测例就自动进入近期队列。已有P/N/L编号继续描述依赖，不形成第二套排期。
+逐次成绩、原始输出、人工停止及补跑记录只留在忽略的build；不同启动不拼成正式
+成绩。原LTP缺少账户、工具、scratch设备及库准备的问题按所属层补齐；不因目录
+遍历有一个文件就自动安排整个模块。更大离线工程、外部网络和凭据体系仍由真实
+使用流程选择；LoongArch是双架构交付依赖，SMP另行规划。已有P/N/L编号继续描述
+依赖，不形成第二套排期。性能工作只从下面候选表中选择一个有实际证据的机制。
 
 ## 按证据触发的性能候选
 
@@ -60,6 +55,7 @@ PTY＋原BusyBox script保留为下一项应用候选。更大离线工程、外
 
 | 阶段/能力 | 事实与证据入口 |
 |---|---|
+| libc局部纠错与文件所有权 | flock错误优先级、无timer辅助的退出ready调度、固定glibc unwind依赖与取消清理已交付；fchown/fchownat修改ext4/tmpfs/匿名pipe真实元数据，capability删除与inode修改同事务，进程仍固定root。见[调度](modules/kernel-scheduler.md)、[文件契约](modules/kernel-files.md)和[所有权背景](learning/file-timestamps.md#文件所有权与进程身份)。 |
 | T1–T3 串口TTY | 实例owner、UART IRQ/worker、行规程/readv continuation、ctty/作业控制及原ash/stty已交付；初始TEMT忙回滚与停机资格已修复，见[TTY契约](modules/kernel-tty.md)。PTY仍未交付。 |
 | M1–M3 有限CPU归因 | 六项消费者诊断已交付；宽字原语仅实验验证，未带来原Lua工程收益，未上线。生产保留字节路径，见[工具链机制](learning/offline-toolchain-probe.md)。 |
 | 命名FIFO与原Lua工程 | 管道元数据、ext4/tmpfs FIFO、默认make jobserver、构建/增量/失败恢复及产物运行；1207 ABI与集中回归、兼容入口已交付。关闭观测-j1/-j2中位135.542/133.225秒；工作目录tmpfs不足以解释整体差距，见[工具链记录](learning/offline-toolchain-probe.md)。 |
@@ -90,7 +86,7 @@ glibc四进程整命令仍增加0.73%。该轮的prepare读取、1547次FLUSH和
 | 原BusyBox55/55 | 此前日志/RTC/根设备补全已验收；完整228项没有在本轮网络工作中重跑 |
 | iperf/netperf | 22项受控原ELF完成；原iperf连续脚本的listener重建竞态在Linux也存在，原脚本结果和受控验收分别报告 |
 | LTP执行角色 | 比赛目录遍历不是上游runtest；控制器helper、上游禁用shmat1和有限shm_test分开。原libc的EINTR重试、NULL栈clone、缺unwind库或账户可先于目标syscall阻塞，见[程序证据](learning/user-program-inventory.md#ltp的准备依赖与libc边界) |
-| 所有权与接口子集 | chown系列、O_PATH、原生accept4、路径truncate缺口成立；CPU-time clock、VIRTUAL/PROF timer、pipe容量操作、扩展clone/futex按具体子语义核对，不把已有整个模块记为缺失 |
+| 所有权与接口子集 | fchown/fchownat已接入真实元数据；完整凭据/权限、O_PATH、原生accept4、路径truncate仍有缺口；CPU-time clock、VIRTUAL/PROF timer、pipe容量操作、扩展clone/futex按具体子语义核对，不把已有整个模块记为缺失 |
 | 路径truncate | 尚未实现；本轮错误恢复使用已交付ftruncate，原Lua/GCC/make保持不变 |
 | 用户内存/信号 | mremap、按操作madvise、mlock、sigaltstack、实时信号队列、共享文件/PI futex待真实应用需求触发 |
 | 系统与平台 | 固定root查询不等于完整凭据/权限；无PTY/termios2/完整modem控制、外部IPv6/DNS/TLS、公网配置、SMP/实板、kernel-la，不声明完整Linux兼容或硬实时 |
@@ -162,7 +158,7 @@ glibc四进程整命令仍增加0.73%。该轮的prepare读取、1547次FLUSH和
 
 - [x] `linkat` 已接入同inode/nlink、活引用与跨mount约束，支持flags 0、AT_SYMLINK_FOLLOW、AT_EMPTY_PATH；见文件模块与多挂载证据，不再重复立项。
 - [x] `renameat/renameat2` 支持普通/NOREPLACE；单事务文件/空目录覆盖、跨目录移动、祖先拒绝、同 inode、活目标及失败回滚，EXCHANGE/WHITEOUT 明确不支持。单根挂载的跨 mount 拒绝存在，真实多挂载验证归 P1h。
-- [ ] `umask` 已按 fs context 的 fork 复制与 `CLONE_FS` 共享实现，真实 inode 的 `fchmod/fchmodat` 已覆盖；匿名pipe改权也已交付；其余合成对象的改权和`faccessat`等完整凭据/权限消费者按实际需求推进，与 P2e 保持一致，不能总返回允许。已有 open 未知 bits 拒绝策略另用差分核对，不能写成 Linux 通用要求。
+- [ ] `umask` 已按 fs context 的 fork 复制与 `CLONE_FS` 共享实现，真实inode的`fchmod/fchmodat/fchown/fchownat`已覆盖；匿名pipe改权和所有权也已交付；其余合成对象的改权和`faccessat`等完整凭据/权限消费者按实际需求推进，与 P2e 保持一致，不能总返回允许。已有 open 未知 bits 拒绝策略另用差分核对，不能写成 Linux 通用要求。
 
 ### P1h 虚拟文件系统与多挂载
 

@@ -20,6 +20,15 @@
 #define KERNEL_VFS_S_IXGRP UINT32_C(0000010)
 #define KERNEL_VFS_S_IXOTH UINT32_C(0000001)
 
+/* 固定 root 的 chown 规则；目录保留 set-ID，非执行组的 setgid 保留。 */
+static inline uint32_t kernel_vfs_chown_mode(uint32_t mode)
+{
+    if ((mode & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFDIR) return mode;
+    mode &= ~04000U;
+    if (mode & KERNEL_VFS_S_IXGRP) mode &= ~02000U;
+    return mode;
+}
+
 uint64_t kernel_vfs_allocate_mount_id(void);
 struct kernel_vfs_path;
 struct kernel_open_file_description;
@@ -100,6 +109,7 @@ int kernel_vfs_path_stat(const struct kernel_vfs_path *path,
 int kernel_vfs_path_set_times(struct kernel_vfs_path *path,
                               const struct kernel_vfs_timespec times[2]);
 int kernel_vfs_path_set_mode(struct kernel_vfs_path *path, uint32_t mode);
+int kernel_vfs_path_set_owner(struct kernel_vfs_path *path, uint32_t uid, uint32_t gid);
 int kernel_vfs_path_release(struct kernel_vfs_path **owner);
 struct kernel_vfs_mount *kernel_vfs_path_mount(
     const struct kernel_vfs_path *path);
@@ -192,6 +202,7 @@ int kernel_vfs_mount_statfs(struct kernel_vfs_mount *mount,
 int kernel_vfs_file_set_times(struct kernel_vfs_file *file,
                               const struct kernel_vfs_timespec times[2]);
 int kernel_vfs_file_set_mode(struct kernel_vfs_file *file, uint32_t mode);
+int kernel_vfs_file_set_owner(struct kernel_vfs_file *file, uint32_t uid, uint32_t gid);
 
 int kernel_vfs_open(struct kernel_vfs_mount *mount,
                     const char *path,

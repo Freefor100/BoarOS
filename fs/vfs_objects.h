@@ -124,6 +124,7 @@ struct kernel_vfs_backend {
     int (*set_times)(struct kernel_vfs_file *file,
         const struct kernel_vfs_timespec times[2]);
     int (*set_mode)(struct kernel_vfs_file *file, uint32_t mode);
+    int (*set_owner)(struct kernel_vfs_file *file, uint32_t uid, uint32_t gid);
     int (*open)(struct kernel_vfs_mount *mount,
         const char *path, uint64_t inode_number,
         uint32_t inode_mode,

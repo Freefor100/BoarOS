@@ -40,7 +40,7 @@ int kernel_pipe_stat(const struct kernel_pipe *pipe, struct kernel_vfs_stat *sta
     if (!pipe || !stat) return -KERNEL_EINVAL;
     uintptr_t irq = riscv_interrupt_save();
     *stat = (struct kernel_vfs_stat){.ino=pipe->proc_identity, .mode=pipe->mode,
-        .nlink=1, .blksize=BOAROS_PAGE_SIZE,
+        .nlink=1, .blksize=BOAROS_PAGE_SIZE, .uid=pipe->uid, .gid=pipe->gid,
         .atime=pipe->atime, .mtime=pipe->mtime, .ctime=pipe->ctime};
     riscv_interrupt_restore(irq);
     return 0;
@@ -51,6 +51,18 @@ int kernel_pipe_set_mode(struct kernel_pipe *pipe, uint32_t mode)
     uintptr_t irq = riscv_interrupt_save();
     /* 共享端点只改权限；访问方向仍由每个OFD拥有。 */
     pipe->mode = KERNEL_VFS_S_IFIFO | (mode & 07777U);
+    pipe->ctime = pipe_now();
+    riscv_interrupt_restore(irq);
+    return 0;
+}
+
+int kernel_pipe_set_owner(struct kernel_pipe *pipe, uint32_t uid, uint32_t gid)
+{
+    if (!pipe) return -KERNEL_EINVAL;
+    uintptr_t irq = riscv_interrupt_save();
+    if (uid != UINT32_MAX) pipe->uid = uid;
+    if (gid != UINT32_MAX) pipe->gid = gid;
+    pipe->mode = kernel_vfs_chown_mode(pipe->mode);
     pipe->ctime = pipe_now();
     riscv_interrupt_restore(irq);
     return 0;

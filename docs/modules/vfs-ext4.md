@@ -53,6 +53,13 @@ RISC-V VFS 测试的内存后端覆盖内部边界；用户态 `mount(2)`/`umoun
 exec 权限检查可立即观察修改。该接口沿用现有
 `ext4_file_set_times()` 的事务、sync_tid 和错误所有权边界。
 
+`kernel_vfs_file_set_owner()`复用活inode handle和后端独占锁；路径形式另持
+namespace锁，fd形式无需重新查路径。`ext4_file_set_owner()`将UID/GID、mode、
+ctime与非目录的capability属性删除放在同一undo/日志事务中；成功后更新node的mode
+缓存和同步目标，后续I/O失败仍由原mount owner保留。UID/GID按磁盘low/high 16位
+合成32位。新建节点在父inode仍被引用时继承setgid目录的GID，初始目录权限设置
+保留继承的setgid；普通chmod仍可明确清除它。匿名pipe元数据不经过ext4。
+
 ## 文件节点与页缓存
 
 VFS 以文件系统实例与后端 inode 标识为活节点身份，普通文件、目录和字符节点都持有引用计数 node；路径对象另持有父目录项身份和一份活 inode 引用。独立 open file description 各自保存 offset，但同一 inode 指向共享 node。文件大小通过 `kernel_vfs_file_size()` 实时查询所属 node 的实时大小，确保写入或截断后各共享描述符观察到一致的文件长度。
@@ -75,7 +82,7 @@ miss 路径先分配并清零页，再通过 node 的无 offset 副作用 `pread
 
 ## lwext4 配置和生命周期
 
-内核编译 lwext4 journal/replay、orphan 和分批截断路径，关闭 xattr、debug/assert 和 mkfs，并把 malloc/calloc/realloc/free 绑定到当前内核堆。根设备是 raw whole-disk ext4，物理块大小固定为 512 字节；当前不解析分区表。
+内核编译 lwext4 journal/replay、orphan 和分批截断路径，启用内部xattr操作供chown删除capability；关闭debug/assert和mkfs，并把 malloc/calloc/realloc/free 绑定到当前内核堆。尚未接入用户xattr/ACL syscall或capability执行权限。根设备是 raw whole-disk ext4，物理块大小固定为 512 字节；当前不解析分区表。
 
 事务接口 `ext4_transaction_begin/end/abort` 支持同一 mount 的嵌套修改；外层提交前保留 metadata 和数据缓冲的 before-image 与引用。明确发生在日志提交前的 OOM、空间不足或关联数据 I/O 失败可回滚内存并重试；已可能影响日志持久状态的错误由 mount 保留，不能清除后继续。外层 abort 后，调用者须重新打开在内层修改过的 lwext4 handle；VFS 的普通操作各自完成事务，不持有跨 syscall 的开放事务。
 

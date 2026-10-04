@@ -42,6 +42,31 @@ unlink 更新子 inode ctime。truncate 在活 inode 修改后更新 mtime/ctime
 其余 30 位保存纳秒。写入超范围时间按 inode 支持范围截断，不把 2038 年之后时间解释成负数，
 也不把不存在的 extra 字段写进下一 inode。
 
+## 文件所有权与进程身份
+
+inode的UID/GID是文件元数据，不等于当前进程的UID/GID。固定root也可以通过
+chown记录其他所有者，后续stat和硬链接应读到该值；这并不自动实现setuid、账户
+查询、访问权限或capability执行。匿名pipe的元数据归共享pipe对象，命名FIFO归
+VFS inode，不能把所有特殊fd都当成根盘路径。
+
+固定Linux 7.2的`references/linux/fs/open.c:chown_common/do_fchownat`与
+`fs/attr.c:setattr_should_drop_sgid`定义字段保留、ctime、set-ID和错误检查顺序。
+尤其是`fchownat(fd, "", ..., AT_EMPTY_PATH)`与NULL路径不同：后者是EFAULT，
+不能借用utimensat的NULL pathname规则。chown不会改变atime/mtime；固定root下
+非目录清S_ISUID，组执行位存在时才清S_ISGID，目录保留set-ID。setgid目录的
+GID继承另见`references/linux/fs/inode.c:inode_init_owner`。
+
+ext4 UID/GID使用两组16位磁盘字段；仅更新低位会让大ID错误变成另一所有者。
+非目录chown还须移除capability属性，与UID/GID、mode、ctime共用操作undo。
+属性可能在inode内，也可能位于有引用计数的外部EA块；共享块须先复制，旧块
+refcount、新块checksum、inode占有扇区数和释放都必须一致。操作失败只回滚本次
+修改，不能删除另一inode的共享属性，也不能失去缓冲owner。独立e2fsck核对磁盘
+格式，raw-syscall差分核对可见语义，两类证据不能互相替代。
+
+重建用`./tests/lwext4-metadata-host.sh ownership`和`make test-diff-abi-riscv`。
+原BusyBox可用`chown 70001:80002 file`与`stat -c '%u:%g:%a' file`核对实际字段；
+显式sync后正常卸载再启动才能核对持久化，tmpfs和匿名pipe不适用重启保存要求。
+
 ## I/O 失败与持久化
 
 `ext4_fs_put_inode_ref()` 标记 inode 所属 metadata block 为 dirty；早期即时路径修复了上游 `ext4_bcache_free()` 忽略 flush errno 的问题，失败缓冲保留在 mount dirty list。2026-10-01 生产 journal mount 改为操作私有 undo 与挂载点组提交：touch 完成操作接受后即可返回，时间从当前内存立即可见；零更新、无时钟和只读访问不新增时间操作。资源/日志预留在接受前完成，提交只使用独立冻结版本，未提交 home buffer 禁止隐式写回；truncate 与普通写不能在块尚无 owner 时发布成功。未启用组引擎的宿主/无 journal 路径继续保持各自明确契约。

@@ -137,9 +137,9 @@ LTP 20240524 的 `ksm02`、`io_cancel02` 有缺少libnuma/libaio开发依赖时�
 比赛脚本无参数遍历bin目录，上游runtest则选择程序、参数、控制器和环境，二者覆盖不同。
 
 先保存目标测试之前的失败。`lib/tst_tmpdir.c` 的公共准备调用
-`chown(TESTDIR, -1, getgid())`，而RV64路径需要fchownat。当前未实现文件所有权
-修改，这会挡住多个不同模块的测例；补齐该调用只解锁准备，不证明后续权限、映射或
-信号断言通过。文件uid/gid由inode持有，进程凭据是另一个owner；不能用返回0或
+`chown(TESTDIR, -1, getgid())`，而RV64路径需要fchownat。该准备依赖已由
+真实ext4/tmpfs所有权修改补齐；进程仍固定root。它只解锁准备，不证明后续权限、
+映射或信号断言通过。文件uid/gid由inode持有，进程凭据是另一个owner；不能用返回0或
 创建nobody账户冒充完整权限。原镜像缺账户时，`symlink03`、`mlockall03` 的旧setup
 还会在没有检查getpwnam结果的情况下读取pw_uid，用户SIGSEGV应先查这个调用链。
 

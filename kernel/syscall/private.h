@@ -71,6 +71,9 @@ enum kernel_syscall_status syscall_handle_umask(
     struct kernel_task *caller,
     const struct kernel_syscall_request *request,
     struct kernel_syscall_result *decoded);
+enum kernel_syscall_status syscall_handle_chown(
+    struct kernel_task *caller, const struct kernel_syscall_request *request,
+    struct kernel_syscall_result *decoded, int by_fd);
 enum kernel_syscall_status syscall_handle_chmod(
     struct kernel_task *caller,
     const struct kernel_syscall_request *request,

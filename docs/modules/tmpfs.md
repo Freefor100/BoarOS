@@ -22,6 +22,12 @@
 末页尾部。私有 COW 仍属于 MM；文件尾页清零不改写独立私有副本。
 关闭或删除一个名字不会释放仍被打开、映射或执行的 inode。
 
+mode、UID/GID和时间属于inode；`fchown/fchownat`在node独占锁下更新真实
+所有权与ctime，硬链接和已unlink的fd仍观察同一对象。`UINT32_MAX`保留字段；
+非目录的set-ID清除遵循固定root契约。setgid父目录使新节点继承GID、子目录
+继承setgid位，进程UID仍为root。这不是凭据变更或完整权限检查。只读挂载
+拒绝元数据修改；tmpfs所有权与内容同样不跨重启持久保存。
+
 驻留内存后备页计入 Shmem，并包含于 Cached；无 swap 时不可驱逐，不计入
 MemAvailable 的文件回收估算，也不进入磁盘 Dirty/Writeback。短符号链接使用
 inode 内存，长符号链接使用有配额的后备页。
@@ -58,7 +64,7 @@ make test-busybox-tmpfs-riscv
 ```
 
 差分覆盖配额、稀疏读、实际占用、尾页/COW、映射 SIGBUS、删除后经 proc fd
-重新打开并截断、硬链接限额和选项边界。musl 消费者实际调用 shm_open/shm_unlink，
+重新打开并截断、所有权与setgid继承、硬链接限额和选项边界。musl 消费者实际调用 shm_open/shm_unlink，
 通过管道握手验证 fork、不同地址别名、重建同名对象与最后映射的忙引用。
 离线 GCC 的工作目录和 TMPDIR 都位于 tmpfs；最终产物复制到根盘仅用于主机
 核验，不是 tmpfs 持久化证据。

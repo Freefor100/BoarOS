@@ -2050,6 +2050,25 @@ int kernel_vfs_file_set_mode(struct kernel_vfs_file *file, uint32_t mode)
     return instance->ops->set_mode(file, mode);
 }
 
+int kernel_vfs_file_set_owner(struct kernel_vfs_file *file, uint32_t uid, uint32_t gid)
+{
+    if (!file || !file->mount || !file->mount->private_data) return -KERNEL_EINVAL;
+    struct kernel_vfs_instance *instance = file->mount->private_data;
+    if (instance->quiescing) return -KERNEL_EIO;
+    if (instance->read_only) return -KERNEL_EROFS;
+    if (!instance->ops->set_owner) return -KERNEL_ENOTSUP;
+    return instance->ops->set_owner(file, uid, gid);
+}
+
+int kernel_vfs_path_set_owner(struct kernel_vfs_path *path, uint32_t uid, uint32_t gid)
+{
+    if (!path || !path->file.mount || !path->file.mount->private_data) return -KERNEL_EINVAL;
+    VFS_PATH_PIN(path_pin, path);
+    KERNEL_LOCK_SCOPE(namespace_guard);
+    kernel_vfs_namespace_lock(path->file.mount, &namespace_guard);
+    return kernel_vfs_file_set_owner(&path->file, uid, gid);
+}
+
 static int vfs_open_raw(struct kernel_vfs_mount *mount,
                         const char *path, uint64_t inode_number,
                         uint32_t inode_mode,

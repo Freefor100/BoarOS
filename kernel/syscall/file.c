@@ -66,6 +66,38 @@ enum kernel_syscall_status syscall_handle_chmod(
     return KERNEL_SYSCALL_STATUS_OK;
 }
 
+enum kernel_syscall_status syscall_handle_chown(
+    struct kernel_task *caller, const struct kernel_syscall_request *request,
+    struct kernel_syscall_result *decoded, int by_fd)
+{
+    struct kernel_files *files;
+    enum kernel_task_status task_status = kernel_task_files_borrow(caller, &files);
+    if (task_status == KERNEL_TASK_STATUS_RESOURCE_UNAVAILABLE) {
+        decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+        decoded->value = -KERNEL_EBADF;
+        return KERNEL_SYSCALL_STATUS_OK;
+    }
+    if (task_status != KERNEL_TASK_STATUS_OK) return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    int64_t value;
+    enum kernel_files_status status;
+    if (by_fd) status = kernel_files_fchown(files, (int32_t)request->arguments[0],
+            (uint32_t)request->arguments[1], (uint32_t)request->arguments[2], &value);
+    else {
+        const struct kernel_fs_context *fs;
+        struct kernel_mm *mm;
+        if (kernel_task_fs_context_borrow(caller, &fs) != KERNEL_TASK_STATUS_OK ||
+            kernel_task_mm_borrow_mutable(caller, &mm) != KERNEL_TASK_STATUS_OK)
+            return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+        status = kernel_files_fchownat(files, fs, mm, (int32_t)request->arguments[0],
+            request->arguments[1], (uint32_t)request->arguments[2],
+            (uint32_t)request->arguments[3], (uint32_t)request->arguments[4], &value);
+    }
+    if (status != KERNEL_FILES_STATUS_OK) return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
+    decoded->value = value;
+    return KERNEL_SYSCALL_STATUS_OK;
+}
+
 enum kernel_syscall_status syscall_handle_openat(
     struct kernel_task *caller,
     const struct kernel_syscall_request *request,
