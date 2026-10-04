@@ -99,6 +99,7 @@ LWEXT4_SOURCES := \
 	third_party/lwext4/src/ext4_extent.c \
 	third_party/lwext4/src/ext4_fs.c \
 	third_party/lwext4/src/ext4_hash.c \
+	third_party/lwext4/src/ext4_xattr.c \
 	third_party/lwext4/src/ext4_ialloc.c \
 	third_party/lwext4/src/ext4_inode.c \
 	third_party/lwext4/src/ext4_journal.c \

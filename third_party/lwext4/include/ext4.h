@@ -149,6 +149,9 @@ int ext4_file_set_times(ext4_file *file, unsigned fields,
 /* Preserve inode identity after unlink; update permission bits and ctime in one
  * transaction, with the same file error owner as other metadata mutations. */
 int ext4_file_set_mode(ext4_file *file, uint32_t mode);
+/* Live inode owner update, set-ID/capability removal and ctime share one
+ * operation transaction. UINT32_MAX preserves the corresponding ID. */
+int ext4_file_set_owner(ext4_file *file, uint32_t uid, uint32_t gid);
 int ext4_fpwrite(ext4_file *file, uint64_t offset, const void *buffer, size_t size, size_t *written);
 int ext4_file_sync_metadata_mode(ext4_file *file, bool data_only);
 
@@ -555,6 +558,8 @@ int ext4_inode_exist(const char *path, int type);
  *
  * @return  Standard error code.*/
 int ext4_mode_set(const char *path, uint32_t mode);
+/* Initial directory permissions preserve the inherited setgid bit. */
+int ext4_mode_set_initial(const char *path, uint32_t mode);
 
 
 /**@brief Get file/directory/link mode bits.

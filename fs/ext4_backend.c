@@ -122,6 +122,8 @@ static int ext4_backend_statfs(struct kernel_vfs_mount *mount,
 static int ext4_backend_set_times(struct kernel_vfs_file *file,
                               const struct kernel_vfs_timespec times[2]);
 static int ext4_backend_set_mode(struct kernel_vfs_file *file, uint32_t mode);
+static int ext4_backend_set_owner(struct kernel_vfs_file *file, uint32_t uid, uint32_t gid);
+
 static int ext4_backend_open(struct kernel_vfs_mount *mount,
                         const char *path, uint64_t inode_number,
                         uint32_t inode_mode,
@@ -1012,6 +1014,21 @@ static int ext4_backend_set_mode(struct kernel_vfs_file *file, uint32_t mode)
     return result;
 }
 
+static int ext4_backend_set_owner(struct kernel_vfs_file *file, uint32_t uid, uint32_t gid)
+{
+    if (!file || !file->private_data || file->state != VFS_FILE_STATE_LIVE)
+        return -KERNEL_EINVAL;
+    struct kernel_vfs_node *node = file->private_data;
+    KERNEL_LOCK_SCOPE(node_guard);
+    kernel_vfs_node_lock(node, &node_guard, 1);
+    if (node->instance->read_only) return -KERNEL_EROFS;
+    int result = mount_error(lwext4_instance(node->instance));
+    if (result) return lwext4_error(result);
+    result = lwext4_error(ext4_file_set_owner(lwext4_node_file(node), uid, gid));
+    if (!result) file->mode = node->mode = kernel_vfs_chown_mode(node->mode);
+    return result;
+}
+
 static int ext4_backend_open(struct kernel_vfs_mount *mount,
                         const char *path, uint64_t inode_number,
                         uint32_t inode_mode,
@@ -1228,7 +1245,7 @@ static int ext4_backend_mkdir(struct kernel_vfs_mount *mount,
     if (result != EOK) return lwext4_error(result);
     result = ext4_dir_mk(path);
     if (result == EOK)
-        result = ext4_mode_set(path, (mode & 07777U) | KERNEL_VFS_S_IFDIR);
+        result = ext4_mode_set_initial(path, (mode & 07777U) | KERNEL_VFS_S_IFDIR);
     if (result == EOK) result = ext4_transaction_end(adapter->mount_point);
     else (void)ext4_transaction_abort(adapter->mount_point, result);
     if (result != EOK) return lwext4_error(result);
@@ -1623,6 +1640,7 @@ static void initialize_backend(void)
     ops->statfs = ext4_backend_statfs;
     ops->set_times = ext4_backend_set_times;
     ops->set_mode = ext4_backend_set_mode;
+    ops->set_owner = ext4_backend_set_owner;
     ops->open = ext4_backend_open;
     ops->create = ext4_backend_create;
     ops->accessed = ext4_backend_accessed;

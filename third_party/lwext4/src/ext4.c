@@ -1404,6 +1404,44 @@ Unlock:
     return r;
 }
 
+int ext4_file_set_owner(ext4_file *file, uint32_t uid, uint32_t gid)
+{
+    if (!file || !file->mp || !file->mp->mounted) return EINVAL;
+    struct ext4_mountpoint *mp = file->mp;
+    struct ext4_inode_ref ref;
+    int r = EOK;
+    EXT4_MP_LOCK(mp);
+    if (mp->fs.read_only) { r = EROFS; goto Unlock; }
+    r = ext4_trans_start(mp);
+    if (r != EOK) goto Unlock;
+    r = ext4_fs_get_inode_ref(&mp->fs, file->inode, &ref);
+    if (r == EOK) {
+        uint32_t mode = ext4_inode_get_mode(&mp->fs.sb, ref.inode);
+        if ((mode & 0170000U) != 0040000U) {
+            mode &= ~04000U;
+            if (mode & 0010U) mode &= ~02000U;
+            /* 同一 undo 边界删除文件 capability，失败不能留下半次 chown。 */
+            r = ext4_xattr_remove(&ref, 6, "capability", 10);
+            if (r == ENODATA) r = EOK;
+        }
+        if (r == EOK) {
+            if (uid != UINT32_MAX) ext4_inode_set_uid(ref.inode, uid);
+            if (gid != UINT32_MAX) ext4_inode_set_gid(ref.inode, gid);
+            ext4_inode_set_mode(&mp->fs.sb, ref.inode, mode);
+            ref.dirty = true;
+            ext4_touch_inode(mp, &ref, EXT4_TIME_CTIME);
+        }
+        r = ext4_result(r, ext4_fs_put_inode_ref(&ref));
+    }
+    r = ext4_trans_finish(mp, r);
+    ext4_file_completed(file, r);
+Unlock:
+    if (r != EOK && mp->fs.curr_trans && !mp->fs.curr_trans->error)
+        mp->fs.curr_trans->error = r;
+    EXT4_MP_UNLOCK(mp);
+    return r;
+}
+
 /********************************FILE OPERATIONS*****************************/
 
 static int ext4_path_check(const char *path, bool *is_goal)
@@ -1729,6 +1767,13 @@ static int ext4_generic_open2(ext4_file *f, const char *path, int flags,
 				break;
 
 			ext4_fs_inode_blocks_init(fs, &child_ref);
+			/* 固定 root 创建者仍从 setgid 父目录继承 group；目录继承该位。 */
+			if (ext4_inode_get_mode(sb, ref.inode) & 02000U) {
+				ext4_inode_set_gid(child_ref.inode, ext4_inode_get_gid(ref.inode));
+				uint32_t child_mode = ext4_inode_get_mode(sb, child_ref.inode);
+				if ((child_mode & 0170000U) == 0040000U)
+					ext4_inode_set_mode(sb, child_ref.inode, child_mode | 02000U);
+			}
 			ext4_touch_inode(mp, &child_ref,
 			    EXT4_TIME_ATIME | EXT4_TIME_MTIME | EXT4_TIME_CTIME);
 
@@ -3459,7 +3504,7 @@ int ext4_inode_exist(const char *path, int type)
 	return r;
 }
 
-int ext4_mode_set(const char *path, uint32_t mode)
+static int ext4_mode_set_common(const char *path, uint32_t mode, bool initial)
 {
 	int r;
 	uint32_t orig_mode;
@@ -3479,6 +3524,8 @@ int ext4_mode_set(const char *path, uint32_t mode)
 		goto Finish;
 
 	orig_mode = ext4_inode_get_mode(&mp->fs.sb, inode_ref.inode);
+	if (initial && (orig_mode & 0170000U) == 0040000U)
+		mode |= orig_mode & 02000U;
 	orig_mode &= ~0xFFF;
 	orig_mode |= mode & 0xFFF;
 	ext4_inode_set_mode(&mp->fs.sb, inode_ref.inode, orig_mode);
@@ -3491,6 +3538,11 @@ int ext4_mode_set(const char *path, uint32_t mode)
 
 	return r;
 }
+
+int ext4_mode_set(const char *path, uint32_t mode)
+{ return ext4_mode_set_common(path, mode, false); }
+int ext4_mode_set_initial(const char *path, uint32_t mode)
+{ return ext4_mode_set_common(path, mode, true); }
 
 int ext4_owner_set(const char *path, uint32_t uid, uint32_t gid)
 {

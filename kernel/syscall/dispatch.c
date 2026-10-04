@@ -18,6 +18,8 @@
 #define LINUX_SYSCALL_UTIMENSAT 88U
 #define LINUX_SYSCALL_FCHMOD 52U
 #define LINUX_SYSCALL_FCHMODAT 53U
+#define LINUX_SYSCALL_FCHOWNAT 54U
+#define LINUX_SYSCALL_FCHOWN 55U
 #define LINUX_SYSCALL_GETCWD 17U
 #define LINUX_SYSCALL_RENAMEAT 38U
 #define LINUX_SYSCALL_UMOUNT2 39U
@@ -346,6 +348,11 @@ enum kernel_syscall_status kernel_syscall_dispatch(
         if (syscall_handle_umask(caller, request, &decoded) !=
             KERNEL_SYSCALL_STATUS_OK)
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    } else if (request->number == LINUX_SYSCALL_FCHOWNAT ||
+               request->number == LINUX_SYSCALL_FCHOWN) {
+        if (syscall_handle_chown(caller, request, &decoded,
+                                request->number == LINUX_SYSCALL_FCHOWN) !=
+            KERNEL_SYSCALL_STATUS_OK) return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     } else if (request->number == LINUX_SYSCALL_FCHMOD ||
                request->number == LINUX_SYSCALL_FCHMODAT) {
         if (syscall_handle_chmod(caller, request, &decoded,

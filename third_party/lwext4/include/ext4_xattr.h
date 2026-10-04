@@ -94,6 +94,8 @@ int ext4_xattr_get(struct ext4_inode_ref *inode_ref, uint8_t name_index,
 int ext4_xattr_remove(struct ext4_inode_ref *inode_ref, uint8_t name_index,
 		      const char *name, size_t name_len);
 
+int ext4_xattr_release_inode_block(struct ext4_inode_ref *inode_ref);
+
 int ext4_xattr_set(struct ext4_inode_ref *inode_ref, uint8_t name_index,
 		   const char *name, size_t name_len, const void *value,
 		   size_t value_len);

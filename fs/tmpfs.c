@@ -14,7 +14,7 @@
 struct tmp_inode {
     struct tmp_inode *next;
     uint64_t number, parent, size;
-    uint32_t mode, links, handles;
+    uint32_t mode, links, handles, uid, gid;
     struct kernel_memory_object *memory;
     char *target;
     struct kernel_vfs_timespec atime, mtime, ctime;
@@ -150,6 +150,10 @@ static int create_inode(struct tmp_mount *m, const char *path, uint32_t mode,
     r = allocate(m, sizeof(*i), (void **)&i);
     if (r) { dispose(m, e); return r; }
     i->mode = mode; i->parent = parent->number;
+    if (parent->mode & 02000U) {
+        i->gid = parent->gid;
+        if ((mode & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFDIR) i->mode |= 02000U;
+    }
     if ((mode & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFDIR) i->size = 2 * TMPFS_DIRENT_SIZE;
     if ((mode & KERNEL_VFS_S_IFMT) == KERNEL_VFS_S_IFREG) {
         if (kernel_memory_object_create(m->instance.heap, m->instance.heap->page_allocator,
@@ -350,7 +354,7 @@ static int rename_inode(struct kernel_vfs_instance *instance, uint64_t old_paren
 static int stat_inode(const struct kernel_vfs_file *f, struct kernel_vfs_stat *s)
 {
     struct kernel_vfs_node *n=f->private_data; struct tmp_inode *i=ti(n);
-    *s=(struct kernel_vfs_stat){.dev=f->mount->id,.ino=i->number,.mode=i->mode,.nlink=i->links,
+    *s=(struct kernel_vfs_stat){.dev=f->mount->id,.ino=i->number,.mode=i->mode,.nlink=i->links,.uid=i->uid,.gid=i->gid,
         .size=i->size,.blksize=BOAROS_PAGE_SIZE,.blocks=i->memory ? kernel_memory_object_resident_pages(i->memory)*8 : 0,
         .atime=i->atime,.mtime=i->mtime,.ctime=i->ctime}; return 0;
 }
@@ -448,6 +452,20 @@ static int set_mode(struct kernel_vfs_file *f,uint32_t mode)
     n->mode = f->mode = i->mode; i->ctime = now();
     return 0;
 }
+static int set_owner(struct kernel_vfs_file *f, uint32_t uid, uint32_t gid)
+{
+    struct kernel_vfs_node *n = f->private_data;
+    KERNEL_LOCK_SCOPE(guard);
+    kernel_vfs_node_lock(n, &guard, 1);
+    if (n->instance->read_only) return -KERNEL_EROFS;
+    struct tmp_inode *i = ti(n);
+    if (uid != UINT32_MAX) i->uid = uid;
+    if (gid != UINT32_MAX) i->gid = gid;
+    i->mode = kernel_vfs_chown_mode(i->mode);
+    n->mode = f->mode = i->mode;
+    i->ctime = now();
+    return 0;
+}
 static int time_not_after(struct kernel_vfs_timespec a, struct kernel_vfs_timespec b)
 {
     return a.seconds < b.seconds || (a.seconds == b.seconds && a.nanoseconds <= b.nanoseconds);
@@ -496,7 +514,7 @@ static void initialize_ops(void)
     o->create=create; o->mkdir=mkdir; o->symlink=symlink; o->mknod=mknod_regular; o->readlink=readlink; o->unlink=unlink_file;
     o->rmdir=rmdir; o->release_unlinked=release_unlinked; o->link=link_inode; o->rename=rename_inode;
     o->stat=stat_inode; o->statfs=statfs; o->dir_entry=dir_entry; o->truncate=truncate_inode;
-    o->pread=pread_inode; o->memory_write=write_inode; o->set_times=set_times; o->set_mode=set_mode;
+    o->pread=pread_inode; o->memory_write=write_inode; o->set_times=set_times; o->set_mode=set_mode; o->set_owner=set_owner;
     o->accessed=accessed; o->modified=modified; o->writeback_allowed=no_writeback;
     o->sync_metadata=sync_metadata; o->flush=error; o->unmount=unmount;
 }

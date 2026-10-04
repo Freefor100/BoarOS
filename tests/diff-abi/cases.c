@@ -220,6 +220,7 @@ void abi_main(const unsigned long *initial_stack)
     abi_sync_cases();
     abi_namespace_cases();
     abi_metadata_cases();
+    abi_ownership_cases();
     abi_child_tid_cases();
     abi_script_cases();
     abi_mknod_cases();

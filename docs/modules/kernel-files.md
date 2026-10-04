@@ -203,21 +203,36 @@ fd-slot OFD references -> files table -> fs context
 `openat(O_CREAT)` 与 `mkdirat` 在创建时用当前掩码削去权限位，打开已有文件
 不改权限。`fchmodat` 解析路径并跟随末端符号链接，`fchmod` 用 fd 持有的
 活 inode，故 unlink 后仍可修改；两者保留文件类型位、更新 ctime，
-只读挂载返回 `EROFS`。当前仍是不可变 root 凭据模型，没有所有者变更。
-pipe/匿名 epoll 等没有 VFS inode 的描述符目前返回 `ENOTSUP`；固定 Linux
-`fchmod(pipefd)` 可成功并修改其匿名 inode mode，这个独立合成 inode 元数据
-契约尚未实现。`O_PATH` 尚在 `openat` 边界明确返回 `ENOTSUP`，不会形成可传给
-`fchmod` 的有效描述符。
-`O_NOCTTY` 在当前字符设备模型中接受为合法 open flag；尚无控制终端会话，
-因此该 flag 不产生 TTY 状态变更。固定 Linux
+只读挂载返回 `EROFS`。匿名pipe的mode、UID/GID和ctime属于共享pipe对象，
+两端、dup/fork与proc重开观察同一元数据；匿名epoll和socket的改权仍返回`ENOTSUP`。
+`O_PATH` 尚在 `openat` 边界返回 `ENOTSUP`。
+`O_NOCTTY` 是合法open flag，其控制终端语义见[TTY模块](kernel-tty.md)。
+固定 Linux
 `references/linux/fs/open.c`（commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`）
 和 raw `tests/diff-abi/access.c`、`mode.c` 核对 errno、权限与 fork/共享边界。
+
+`fchown(55)`与`fchownat(54)`接受32位UID/GID；`UINT32_MAX`保留对应字段，
+其他值不会被截断到16位。路径形式支持cwd、dirfd、符号链接跟随及
+`AT_SYMLINK_NOFOLLOW`；空字符串配`AT_EMPTY_PATH`选取fd或cwd，NULL路径返回
+`EFAULT`。未知flags先返回`EINVAL`；空字符串无该flag返回`ENOENT`；有效fd
+不要求写访问模式，只读挂载返回`EROFS`。用户路径只复制一次且在存储锁外进行；
+fd形式从查表到后端修改结束持有选定OFD，unlink后仍修改原inode。
+
+所有权修改更新ctime、保留atime/mtime；非目录清除S_ISUID，带组执行位时
+清除S_ISGID，目录保留set-ID位。ext4还在同一操作事务内删除`security.capability`，
+失败回滚UID/GID、mode、ctime与属性。setgid目录创建的节点继承父GID，子目录
+另继承setgid位。命名FIFO走VFS inode，匿名pipe走共享pipe元数据；没有真实后端
+的其他合成对象不返回空成功。当前进程仍是不可变root，本接口不提供setuid、账户、
+完整权限检查或文件capability执行语义。
 
 `utimensat` 的 times 先完整复制，两项 `UTIME_OMIT` 随即成功，不解析路径、fd 或 flags。其他请求先检查 flags 并取得目标，再检查纳秒，最后检查只读挂载；不存在路径与坏 fd 优先于非法纳秒。NULL pathname 且 dirfd 不是 `AT_FDCWD` 是 musl `futimens` 使用的 fd 形式，只接受 flags=0；空字符串配 `AT_EMPTY_PATH` 支持 fd 与 cwd。`AT_SYMLINK_NOFOLLOW` 修改链接自身，默认跟随链接。NULL times 或 `UTIME_NOW` 使用本次同一个 realtime 值，`UTIME_OMIT` 保留字段，实际修改同时更新 ctime，不修改父目录时间。fd 无须写访问模式；权限仍限于当前不可变 root 模型。
 
 `statfs/fstatfs` 输出 RV64 asm-generic 的 120 字节布局，输出前取得真实 mount 统计；路径/fd 错误优先于输出指针 fault。fd 直接使用其持有的 mount，unlink 后仍可查询；没有文件系统 mount 的 pipe/匿名 epoll/初始 console 返回 `ENOTSUP`，不伪装成根盘。统计不触发文件数据写回，空闲块只计实际磁盘分配；容量扣除真实 ext4 元数据及内部 journal 开销，bavail 扣除 superblock 保留块。BoarOS 没有 Linux 的紧急 extent 保留池，因此不额外扣除不存在的池。只读和 relatime 标志来自实际挂载契约。
 
 固定依据为 `references/linux` commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 `fs/utimes.c`、`fs/statfs.c`、`fs/ext4/super.c`、`fs/inode.c` 与 `include/uapi/asm-generic/statfs.h`。测试入口为 `make test-files-riscv test-lwext4-metadata-host test-userland-riscv test-diff-abi-riscv`。
+所有权窄宿主回归用`./tests/lwext4-metadata-host.sh ownership`，覆盖大ID、
+内联/外部/共享属性块、嵌套abort、逐分配点OOM、WRITE/FLUSH错误、重开与独立e2fsck；
+`tests/diff-abi/ownership.c`用同ELF比较ext4/tmpfs、pipe、符号链接、只读与错误顺序。
 
 ## 请求暂存与成本
 
