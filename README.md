@@ -110,7 +110,7 @@ I/O已经接入。机制、历史性能口径和unknown见[成本分析](docs/le
 完整Harness仍缺kernel-la，单侧诊断和逐组补跑不能宣称完整交付。逐次成绩和运行
 输出留在忽略的build；SMP、LoongArch、实板及更大应用另行规划。
 
-本评测分支的固定预算 RV 原 judge 基线、22 组状态与输入身份见[RV 评测模块](docs/modules/oscomp-rv.md)；该结果仍只代表 RV 单侧。
+本评测分支的固定输入、启动、监督与原judge契约见[RV评测模块](docs/modules/oscomp-rv.md)。逐次成绩留在忽略的build，RV单侧诊断不等于完整Harness。
 普通 `make all` 可直接启动官方原盘；启动辅助文件不由本地 runner 注入。
 LTP 沿原比赛脚本逐项执行，只有通用超时监督，不以另一份测例清单替换官方流程。
 
