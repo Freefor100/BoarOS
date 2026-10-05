@@ -33,19 +33,15 @@ N3已经交付：legacy/modern VirtIO-net、受限DMA借用与复制回退、静
 空路径stat的Linux边界、免路径缓冲及全局sync/syncfs已接入；通用VFS快照保护
 挂载与节点，复用写回和durable等待，独立维护挂载错误观察；相关系统回归已验收。
 这不代表连续I/O或TCP瓶颈已经消失，也不以某个分数作为其他应用开发的前置条件。
-本轮主线是 **Unix98 PTY、devpts 与原 BusyBox script/scriptreplay**，按以下边界推进。
-阶段状态只在对应机制与真实应用验收后更新；逐次 transcript、成绩和机器快照留在忽略的 build。
+Unix98 PTY、独立 devpts、peer 打开、packet 模式和 PTY/串口 termios2 已交付。
+原 BusyBox script/scriptreplay、真实 libc PTY API、作业控制及录制文件重启读取已成立；
+接口、身份与有界资源归[TTY契约](modules/kernel-tty.md)，应用边界归
+[消费者机制](learning/session-consumers.md#pty-的身份传输与应用边界)。
+原终端不需要特制程序或改变 main 身份；TTY 的有限传输成本仍需由目标应用选择优化，
+不将更换调度策略或某个吞吐倍数设为后续能力开发的前置条件。
 
-| 阶段 | 当前交付任务 |
-|---|---|
-| P1 设备与 TTY 接缝 | 已实现并聚焦验收：pin 下的打开上下文、动态身份、非阻塞接收及生命周期通知；原串口继续工作 |
-| P2 devpts 与配对 | 核心已验收：独立挂载/编号空间、稳定节点、锁定/peer、双向传输、worker 与可信栈回收 |
-| P3 packet 模式 | 核心已验收：前缀、控制事件/优先就绪、EXTPROC 与 fault/readv/关闭；真实 libc 所需的 termios2 已接入 PTY/串口 |
-| P4 原应用 | 原 script/replay、真实 libc PTY API、作业控制、多终端进展和集中系统验收 |
-
-资源按需分配：默认全局 64 对、每挂载 max=32；两方向各 4 KiB 传输 FIFO，worker
-每对每方向最多推进 256 字节。关闭 master 后旧节点与旧 OFD 不能进入复用编号的新配对。
-不设置吞吐倍数或评分门槛，不扩大 I/O、TCP、调度或凭据改造。
+近期只保留一个待确认的应用方向：在现有 shell、PTY 和工具链上完成可复用的交互式
+开发环境。先确认用户工作流及首个阻塞，再选择接口或性能任务，不预先铺开一组重构。
 完整凭据/权限、运行时网络配置和无 RNG 平台的可信熵接入由目标应用确定交付范围；
 LoongArch 是独立交付依赖，SMP 单独规划。
 
@@ -71,7 +67,7 @@ LoongArch 是独立交付依赖，SMP 单独规划。
 |---|---|
 | 文件元数据与路径资格 | 活inode重开避免临时后端owner；创建权限按已有句柄初始化并保留创建时间。O_PATH只持路径身份，路径truncate接入共同截断和capability清理；见[文件契约](modules/kernel-files.md)、[VFS](modules/vfs-ext4.md)与[时间语义](learning/file-timestamps.md)。 |
 | libc局部纠错与文件所有权 | flock错误优先级、无timer辅助的退出ready调度、固定glibc unwind依赖与取消清理已交付；fchown/fchownat修改ext4/tmpfs/匿名pipe真实元数据，capability删除与inode修改同事务，进程仍固定root。见[调度](modules/kernel-scheduler.md)、[文件契约](modules/kernel-files.md)和[所有权背景](learning/file-timestamps.md#文件所有权与进程身份)。 |
-| T1–T3 串口TTY | 实例owner、UART IRQ/worker、行规程/readv continuation、ctty/作业控制及原ash/stty已交付；初始TEMT忙回滚与停机资格已修复，见[TTY契约](modules/kernel-tty.md)。PTY仍未交付。 |
+| T1–T3/P1–P4 终端 | UART IRQ/worker、行规程、ctty/作业控制、Unix98 devpts/PTY、packet 与36/44字节termios；原ash/stty、script/replay和真实libc PTY API已交付。稳定节点、背压、关闭和可信栈回收见[TTY契约](modules/kernel-tty.md)。 |
 | M1–M3 有限CPU归因 | 六项消费者诊断已交付；宽字原语仅实验验证，未带来原Lua工程收益，未上线。生产保留字节路径，见[工具链机制](learning/offline-toolchain-probe.md)。 |
 | 命名FIFO与原Lua工程 | 管道元数据、ext4/tmpfs FIFO、默认make jobserver、构建/增量/失败恢复及产物运行；1207 ABI与集中回归、兼容入口已交付。关闭观测-j1/-j2中位135.542/133.225秒；工作目录tmpfs不足以解释整体差距，见[工具链记录](learning/offline-toolchain-probe.md)。 |
 | N3网卡与宿主应用 | legacy/modern、零拷贝RX及回退、有界重组、实际双向TCP/HTTP和1196 ABI；性能、原应用与历史风险见[网卡记录](learning/network-ownership.md#真实-virtio-net-与宿主应用交付2026-10-02) |
@@ -104,7 +100,7 @@ glibc四进程整命令仍增加0.73%。该轮的prepare读取、1547次FLUSH和
 | 所有权与接口子集 | fchown/fchownat已接入真实元数据；O_PATH和路径truncate已接入；完整凭据/权限、原生accept4仍有缺口；CPU-time clock、VIRTUAL/PROF timer、pipe容量操作、扩展clone/futex按具体子语义核对，不把已有整个模块记为缺失 |
 | 全局文件同步 | sync/syncfs接入单一挂载树、节点快照与durable等待；syncfs维护独立的挂载错误观察。void sync的程序退出码仍不能单独证明持久化，匿名对象不触及根盘，见[VFS契约](modules/vfs-ext4.md)。 |
 | 用户内存/信号 | mremap、按操作madvise、mlock、sigaltstack、实时信号队列、共享文件/PI futex待真实应用需求触发 |
-| 系统与平台 | 固定root查询不等于完整凭据/权限；无PTY/termios2/完整modem控制、外部IPv6/DNS/TLS、公网配置、SMP/实板、kernel-la，不声明完整Linux兼容或硬实时 |
+| 系统与平台 | 固定root查询不等于完整凭据/权限；其他行规程、完整modem控制、外部IPv6/DNS/TLS、公网配置、SMP/实板、kernel-la仍缺，不声明完整Linux兼容或硬实时 |
 
 下面P/N/L小节保留稳定能力编号、契约、依赖和已有验证入口；只以上面的当前队列决定近期实施。
 
@@ -221,7 +217,7 @@ glibc四进程整命令仍增加0.73%。该轮的prepare读取、1547次FLUSH和
 
 - [x] 统一身份对象承担 TID/TGID/PGID/SID 角色引用；已实现 setsid/setpgid/getpgid/getsid，105 条差分覆盖组长、父子/exec、zombie、组信号与等待、身份继续存活及孤儿组。见[线程证据](learning/threads-and-futex.md)。
 - [x] 原始消费者验证 daemon 的 SID/PGID 实际变化；孤儿组按固定 Linux 的退出/收养触发 HUP/CONT，SA_SIGINFO 与 sigwait 均保留 SI_KERNEL。该历史诊断未覆盖TTY；后来串口交付见[消费者](learning/session-consumers.md#原串口ashstty与控制终端2026-10-03)。
-- [x] 串口TTY已接ctty、稳定前台组、终端信号和原ash/stty作业控制，覆盖末引用、挂断与取消；PTY、其他行规程和完整modem控制不计完成，下一应用另行确认。
+- [x] 串口与Unix98 PTY已接ctty、稳定前台组、终端信号和原ash/stty作业控制，覆盖末引用、挂断与取消；devpts、peer与packet保护编号复用、真实传输和回收。其他行规程和完整modem控制仍未交付。
 
 ### P2e clone、凭据与资源限制
 

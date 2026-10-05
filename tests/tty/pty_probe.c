@@ -1018,6 +1018,8 @@ int main(int argc, char **argv)
         dprintf(1, "PTY_DURABLE scope=sync elapsed_ns=%llu\n", (unsigned long long)(now() - durable_start));
     } else sync();
     dprintf(1, "PTY_PROBE_PASS records=%u\n", records);
+    /* 软件console异步发送；先排空，不能与停机raw诊断拼接一行。 */
+    exact(tcdrain(STDOUT_FILENO), 0, "final observation console drain");
     exact(klogctl(7, NULL, 0), 0, "restore console loglevel");
     if (!strcmp(selected, "script") || !strcmp(selected, "recording-check"))
         exact(klogctl(8, NULL, 7), 0, "publish actual init exit status");

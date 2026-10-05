@@ -167,3 +167,23 @@ master 上取得控制终端绑定的是 slave，与组查询、proc 身份和�
 `-f` 不是 fsync 承诺。录制完成、显式持久化和最终挂载排空也需要分别理解。
 原 `scriptreplay` 按 timing 的字节数读取录制文件，检查完整尾部比只观察 shell prompt
 更能发现关闭与传输交错中的丢失。
+
+TTY 的软件输出与停机诊断使用不同 sink。测量结束后应先 tcdrain console，再交给
+停机阶段输出，避免把两条真实消息拼成无法解释的一行。根盘排空计时只覆盖实际根
+文件系统，摘下的 devpts/proc/tmpfs 虽然已无 parent，也不能被误标为根盘。
+
+固定字节传输由一个协调进程推进全部方向，报告每对内容与完成时刻；它检验配对
+进展，不能替代独立应用任务的调度公平性。times 的粗粒度运行记账也不能伪装成精确
+user/system 分解。当前路径仍执行行规程的逐字符处理、64字节用户复制和有界搬运，
+这些成本与磁盘无关；确认主耗时需要局部对照，不能由 Linux 差距直接归罪调度器。
+
+```sh
+make test-pty-host test-pty-riscv test-pty-apps-riscv
+make test-tty-termios2-riscv
+python3 -B tests/tty/pty_riscv.py --case performance --pairs 1 --bytes 4194304 --replicas 3
+python3 -B tests/tty/pty_riscv.py --case performance --pairs 8 --bytes 1048576 --replicas 3
+```
+
+`ROOT_DRAIN_FIXTURE=1` 的独立内核可补充根盘卸载时间和既有 heap 峰值；普通内核没有
+该 hook。heap 峰值覆盖启动及负载，不是单个 PTY 的独占用量；meminfo 采样最低值
+也不是精确峰值。输入、逐次结果与原始输出留在忽略的 build，文档只保存可复用方法。

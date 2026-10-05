@@ -1,6 +1,9 @@
 /* Linked only by ROOT_DRAIN_FIXTURE=1; ordinary kernels contain no hook. */
 #include <kernel/vfs.h>
 #include <kernel/heap.h>
+#include <kernel/procfs.h>
+#include <kernel/tmpfs.h>
+#include <kernel/devpts.h>
 #include "../../fs/vfs_objects.h"
 #include <arch/riscv/timer.h>
 #include <arch/riscv/virt_uart.h>
@@ -9,7 +12,10 @@ int __wrap_kernel_vfs_unmount(struct kernel_vfs_mount *mount)
 {
     /* Boot teardown detaches child mounts before the root. The final record
      * measures root unmount; earlier records retain child teardown costs. */
-    int root = mount && !mount->parent && !mount->release_owner;
+    /* 已摘挂载的虚拟子文件系统也没有parent，但不属于根盘排空。 */
+    int root = mount && !mount->parent && !mount->release_owner &&
+        !kernel_procfs_is_mount(mount) && !kernel_tmpfs_is_mount(mount) &&
+        !kernel_devpts_is_mount(mount);
     struct kernel_heap *heap = root && mount->private_data ?
         ((struct kernel_vfs_instance *)mount->private_data)->heap : 0;
     uint64_t start = root ? riscv_time_read() : 0;

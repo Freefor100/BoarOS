@@ -256,6 +256,19 @@ def run(args):
                     raise AssertionError('recording reboot replicas differ')
                 reboot_observed[name] = reboot_records
                 script_artifacts(directory, work, disk)
+            if args.case == 'performance':
+                timing = re.findall(rb'(?m)^PTY_TIMING pairs=([0-9]+) bytes_each_direction=([0-9]+) elapsed_ns=([0-9]+)\r?$', text)
+                if len(timing) != 1 or tuple(map(int, timing[0][:2])) != (args.pairs, args.bytes) or int(timing[0][2]) <= 0:
+                    raise AssertionError('missing or interleaved PTY payload timing')
+                progress = re.findall(rb'(?m)^PTY_PROGRESS pair=([0-9]+) direction=([01]) bytes=([0-9]+) complete_ns=([0-9]+)\r?$', text)
+                if len(progress) != args.pairs * 2 or {(int(p), int(d), int(n)) for p, d, n, _ in progress} != {
+                        (p, d, args.bytes) for p in range(args.pairs) for d in (0, 1)}:
+                    raise AssertionError('missing per-direction PTY completion')
+                if len(re.findall(rb'(?m)^PTY_DURABLE scope=sync elapsed_ns=[0-9]+\r?$', text)) != 1:
+                    raise AssertionError('missing explicit PTY sync boundary')
+                drains = re.findall(rb'(?m)^ROOT DRAIN FIXTURE ticks=0x[0-9a-f]+ status=0x0\r?$', text)
+                if b'ROOT DRAIN FIXTURE' in text and len(drains) != 1:
+                    raise AssertionError('root fixture did not identify a single successful disk drain')
             timings = re.findall(rb'(?m)^(?:PTY_(?:TIMING|DURABLE|PROGRESS|CPU|MEMORY|SCRIPT_ADOPTED)|ROOT (?:DRAIN|HEAP) FIXTURE)[^\r\n]*', text)
             (work / 'records.txt').write_bytes(b'\n'.join(records) + b'\n')
             (work / 'timings.txt').write_bytes(b'\n'.join(timings) + b'\n')
