@@ -14,7 +14,7 @@ N3已经交付：legacy/modern VirtIO-net、受限DMA借用与复制回退、静
 
 | 未关闭项 | 当前证据与下一步 |
 |---|---|
-| 历史Virtqueue告警 | 已还原到旧兼容内核的五连接loopback；原启动只有块盘和RNG，没有VirtIO-net。具体报错队列与超额原因仍未知；后续失败必须先保留新快照，按队列身份定位，不以重复通过关闭。 |
+| 历史Virtqueue告警 | 已还原到旧兼容内核的五连接loopback；原启动只有块盘和RNG，没有VirtIO-net。具体报错队列与超额原因仍未知；后续失败必须先保留新快照，按队列身份定位，不以重复通过关闭。net 失败路径现已有槽级快照（2026-10-05，见网卡模块），原告警仍缺历史现场。 |
 | 历史页释放fatal的具体现场 | 已修复能够产生同类fatal的分配器双owner竞态；原事件没有owner快照，不能反推唯一触发链。 |
 | pthread取消与旧libc输入 | 原镜像动态glibc的cancel/exit缺libgcc_s；独立glibc运行环境已固定unwind依赖并保护取消/cleanup。静态cancel-points的join结果在固定Linux也失败，按库/测试契约继续核对，不能归给内核。历史偶发现场仍保留P0c边界，不安排无目的重复次数。 |
 | 内核抢占边界 | allocator修复不等于所有共享状态已审完。限定检查开中断worker到共享对象的调用链、睡眠前引用和发布临界区；发现具体错误才扩大。 |
@@ -57,8 +57,11 @@ LoongArch 是独立交付依赖，SMP 单独规划。
 不使用 ASID），收益为零，且收窄 fence 的正确性缺陷会被 QEMU 全刷掩盖，只能在
 ASID 标签 TLB 的硬件上验证。本轮实施：TX indirect+SG 零拷贝（保留复制回退）、
 块设备在途深度测量（时间加权深度/queue-wait/服务时间，测后再定是否加深）、无 NIC
-的 lwIP timer 出 IRQ 与网络 fail 槽表诊断。块设备在途与页 owner 身份的加深仍按
-"先测量/发现具体错误才扩大"的既有纪律。
+的 lwIP timer 出 IRQ 与网络 fail 槽表诊断（均已交付）。提交审查与本轮自审另发现
+两处真实缺陷并修复：镜像 VA→PA 换算在 va>end 时边界减法下溢（新增越界拒绝与
+sv39 越界用例），以及设备失败路径在复位确认前 abandon 在途 TX owner（失败不等于
+DMA 停止，改为保留到 stop 复位确认；host worker 模型断言失败路径 abandon=0）。
+块设备在途与页 owner 身份的加深仍按"先测量/发现具体错误才扩大"的既有纪律。
 
 ## 按证据触发的性能候选
 
@@ -79,7 +82,8 @@ ASID 标签 TLB 的硬件上验证。本轮实施：TX indirect+SG 零拷贝（�
 
 | 阶段/能力 | 事实与证据入口 |
 |---|---|
-| TX indirect+SG 零拷贝 | 协商 bit28 后每包发布间接表（设备头+≤2 段 pbuf），驱动持引用至完成、IRQ 标记/worker 释放、失败与 stop abandon；未协商或不可换算回退复制。真实 TAP 两 transport：tx-sg≈12.7 万包、tx-copy=47、errors=0。见[网卡模块](modules/riscv-virtio-net.md)。 |
+| TX indirect+SG 零拷贝 | 协商 bit28 后每包发布间接表（设备头+≤2 段 pbuf），驱动持引用至完成、IRQ 标记/worker 释放；未协商或不可换算回退复制。真实 TAP 两 transport：tx-sg≈12.7 万包、tx-copy=47、errors=0。见[网卡模块](modules/riscv-virtio-net.md)。 |
+| 无NIC timer owner与失败快照 | `kernel_network_start` 无 NIC 时创建 timer-only worker（按 min(下一socket期限, now+5×frequency) 睡眠），最后的 OFD 定时回收不再依赖用户 syscall；设备失败打印设备/队列/槽级快照并停止新发布，在途 TX owner 保留到 reset 确认（复现越界 used id 与 abandon 语义的 host 场景）。见[网卡模块](modules/riscv-virtio-net.md)、[网络](modules/kernel-network.md)与[本轮记录](learning/network-ownership.md#无nic定时器owner与审查修正2026-10-05)。 |
 | 块在途测量与最终统计 | 块统计新增时间加权在途积分/忙时/总span/queue-wait/服务时间，设备销毁打印最终行；真实窗口实测忙时平均 1.31、空闲 86%、峰值 8，按触发条件不加深队列。见[块模块](modules/riscv-virtio-block.md)与[成本基线](learning/cost-baseline.md#块设备在途深度实测2026-10-05)。 |
 | 内核栈窗口与未映射 guard | 生产任务栈映射到独立 128 MiB 窗口槽位，低 4 KiB 无 PTE 作为 guard，越界经窗口 VA 立即 store fault；窗口骨架构建期预留、运行期受限 map/unmap、空 level-0 表释放；无页表 fixture 回退 direct-map。见[调度](modules/kernel-scheduler.md)与[Sv39](modules/riscv-sv39.md)。 |
 | 任务常驻 I/O scratch 页 | 每任务首次 I/O 分配一页并跨调用复用，正常调用只解除登记，任务销毁路径归还；musl 自动窗口物理页分配 42744→18066（差 24678 与 24576 次调用吻合）。见[调度](modules/kernel-scheduler.md)与[网络](modules/kernel-network.md)。 |

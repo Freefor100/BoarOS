@@ -107,6 +107,22 @@ static void timer_wake(void *context)
     if (n->deadline && (int64_t)(riscv_time_read() - n->deadline) >= 0)
         (void)kernel_wait_queue_wake_all(&n->device.progress);
 }
+/* 无 NIC 的 timer-only owner：IRQ 只唤醒它，协议定时器在 worker 上下文推进。 */
+static void timer_worker(void *context)
+{
+    struct kernel_network *n = context;
+    for (;;) {
+        uintptr_t irq = riscv_interrupt_save();
+        if (n->device.stopping) { riscv_interrupt_restore(irq); return; }
+        kernel_socket_network_process();
+        n->deadline = kernel_socket_next_timer_deadline();
+        uint64_t timeout = riscv_time_read() + 5 * n->device.frequency;
+        if (!n->deadline || timeout < n->deadline) n->deadline = timeout;
+        enum kernel_wait_wake_reason reason;
+        if (kernel_scheduler_block_current(&n->device.progress, n->deadline, 0, &reason) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
+        riscv_interrupt_restore(irq);
+    }
+}
 static void input_frame(struct kernel_network *n, struct riscv_net_frame *frame)
 {
     const unsigned char *data = frame->data;
@@ -224,6 +240,22 @@ int kernel_network_start(struct kernel_network **owner, struct kernel_heap *heap
         print_text(" control-bytes="); print_u64(sizeof(*n)); print_text("\n");
         return 0;
     }
+    /* 无 NIC 仍保留 timer-only owner：最后的 OFD 定时回收与 loopback 期限
+     * 不再依赖另一个用户 syscall，也不在 IRQ 里跑协议回调。 */
+    struct kernel_network *n = 0;
+    if (kernel_heap_allocate_zeroed(heap, 1, sizeof(*n), (void **)&n) !=
+        KERNEL_HEAP_STATUS_OK)
+        return -KERNEL_ENOMEM;
+    n->heap = heap;
+    n->device.frequency = boot->timebase_frequency;
+    kernel_wait_queue_init(&n->device.progress);
+    if (kernel_thread_create_joinable(timer_worker, n, &n->device.worker) !=
+        KERNEL_SCHEDULER_STATUS_OK) {
+        (void)kernel_heap_release(heap, n);
+        return -KERNEL_EIO;
+    }
+    kernel_socket_network_hooks(timer_wake, 0, n);
+    *owner = n;
     return 0;
 }
 int kernel_network_stop(struct kernel_network **owner)

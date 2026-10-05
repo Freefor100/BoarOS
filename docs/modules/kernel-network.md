@@ -177,12 +177,16 @@ UNIX DGRAM自身SHUT_RD后，即使空队列也有IN/RDNORM和RDHUP；双向关�
 官方Ethernet入口接纳custom pbuf，启用ARP及48 pbuf/8对象的IPv4重组；MTU1500、
 MAC来自设备、静态地址由构建配置决定。RX loan直到最后协议/reservation引用释放；
 回退与UDP接纳保留控制余量。IRQ只收割，raw API在单hart临界区串行；worker每批
-八帧，失败NIC也继续共享loopback与协议定时器。停止join、清理接口引用、reset确认，
-真实借用未归还时保留owner。接口查询来自真实netif，DOWN撤下RUNNING。
+八帧，失败NIC也继续共享loopback与协议定时器。无NIC时同一owner退化为
+timer-only worker：推进协议定时器并按min(下一socket期限, now+5×frequency)
+睡眠，最后的OFD定时回收不再依赖用户再次进入syscall。停止join、清理接口引用、
+reset确认；设备失败不等于DMA停止，TX在途owner与RX借用一律保留到reset确认，
+已完成owner在worker归还。接口查询来自真实netif，DOWN撤下RUNNING。
 详细预算、寄存器、失败与验证命令见[网卡模块](riscv-virtio-net.md)。
 
 两种transport与两种libc的原wget/httpd均完成双向GET、CGI上传与文本POST。
 固定单/五TCP及UDP内容、压力下TCP进展、块/RNG混合IRQ、最终heap live=0已核对；
-完整1196 ABI、RV64、真实libc、scale和栈检查通过。零拷贝仅去掉DMA到pbuf一跳，
-用户接收和TX复制仍在；没有外部IPv6、DHCP/DNS/TLS或默认网关。结果、效率、
+完整1196 ABI、RV64、真实libc、scale和栈检查通过。TX 已用 indirect 表做零拷贝
+（每包最多两段镜像内 payload，其余回退复制），用户接收复制仍在；没有外部IPv6、
+DHCP/DNS/TLS或默认网关。结果、效率、
 程序与最终卸载计时边界见[真实网卡记录](../learning/network-ownership.md#真实-virtio-net-与宿主应用交付2026-10-02)。

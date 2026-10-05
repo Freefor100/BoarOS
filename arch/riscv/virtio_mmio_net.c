@@ -107,6 +107,38 @@ static void fail(struct riscv_virtio_mmio_net *d, const char *reason, unsigned q
         diagnostic_text(" consumed="); diagnostic_hex(d->consumed[q]);
         diagnostic_text(" posted="); diagnostic_hex(q ? d->tx_posted : d->rx_posted);
         diagnostic_text("\n");
+        /* 槽级快照：只读驱动自有数组与队列索引，不追描述符地址、不分配。 */
+        volatile uint16_t *used_words = (void *)((unsigned char *)d->queues + used_offset(d));
+        diagnostic_text("BoarOS: VirtIO-net slots version="); diagnostic_hex(d->version);
+        diagnostic_text(" status="); diagnostic_hex(rd(d, 0x70));
+        diagnostic_text(" irq="); diagnostic_hex(d->irq_source);
+        diagnostic_text(" configured="); diagnostic_hex(d->configured);
+        diagnostic_text(" link="); diagnostic_hex(d->link_up);
+        diagnostic_text(" loaned="); diagnostic_hex(d->loaned);
+        diagnostic_text(" ready="); diagnostic_hex(d->ready_count);
+        diagnostic_text(" pending="); diagnostic_hex(d->tx_count);
+        diagnostic_text(" done="); diagnostic_hex(d->tx_done_count);
+        diagnostic_text(" used="); diagnostic_hex(used_words[1]);
+        diagnostic_text(" avail-rx="); diagnostic_hex(d->available[0]);
+        diagnostic_text(" avail-tx="); diagnostic_hex(d->available[1]);
+        diagnostic_text("\n");
+        for (unsigned b = 0; b < RISCV_NET_BUFFERS; b++) {
+            if (d->rx_state[b] != RX_FREE) {
+                diagnostic_text("BoarOS: VirtIO-net rx buffer="); diagnostic_hex(b);
+                diagnostic_text(" state="); diagnostic_hex(d->rx_state[b]);
+                diagnostic_text(" length="); diagnostic_hex(d->rx_length[b]);
+                diagnostic_text("\n");
+            }
+        }
+        for (unsigned b = 0; b < RISCV_NET_BUFFERS; b++) {
+            if (d->tx_state[b] != TX_FREE) {
+                diagnostic_text("BoarOS: VirtIO-net tx buffer="); diagnostic_hex(b);
+                diagnostic_text(" state="); diagnostic_hex(d->tx_state[b]);
+                diagnostic_text(" age="); diagnostic_hex(riscv_time_read() - d->tx_time[b]);
+                diagnostic_text(" owner="); diagnostic_hex((uintptr_t)d->tx_owner[b]);
+                diagnostic_text("\n");
+            }
+        }
     }
     d->failed = 1;
     wake(d);

@@ -441,3 +441,35 @@ python3 -B tests/network-external.py --observe --kernel build/network-cost/kerne
 更大的离线 C 构建或交互式 shell；TLS 需另核对随机、时间和证书。
 窗口、非阻塞发送暂存和接收复制等优化仍按目标应用证据选择，不设固定倍数，
 也不让继续优化挡住功能交付。
+
+## 无NIC定时器owner与审查修正（2026-10-05）
+
+协议回调不在IRQ上下文执行：IRQ只标记完成并唤醒owner。此前无NIC时最后的OFD
+TIME_WAIT回收依赖用户再次进入syscall顺带推进lwIP定时器，没有后续syscall的最后
+一份状态会一直停留。现在`kernel_network_start`在无NIC时也创建一个joinable
+timer-only worker（复用同一`struct kernel_network`与progress等待队列），循环调用
+`kernel_socket_network_process()`并按min(下一socket期限, now+5×frequency)阻塞；
+IRQ/期限只负责唤醒它，停止路径与有NIC一致（禁止新工作、join、释放）。
+
+设备失败打印的快照从设备/队列级扩到槽级：loaned/ready/pending/done、失败队列的
+available/consumed/posted、RX used索引与avail-rx/avail-tx，以及每个非空闲RX/TX槽
+的状态、长度、age、owner指针，只读驱动自有数组，不分配、不追描述符地址，失败
+只打印一次。owner为内核指针，会进入syslog：在固定root、无KASLR、控制台本就可读
+的威胁模型下，定位卡住的pbuf比隐藏地址更有价值，按诊断信息接受。
+
+提交审查与自审发现的两个真实问题，作为后续审查的参考模式：
+
+- `riscv_image_va_to_pa` 用 `size > end - va` 做上界检查，在 `va > end` 时减法下溢，
+  放行越界地址后再返回 `va - load_offset` 的垃圾物理地址。边界检查必须先排除两端
+  之外的值再做减法；sv39 用例现固定未绑定拒绝、va=end 与 va=end+0x1000 的拒绝，
+  以及端内换算的正确值。
+- `device_failed` 在设备未复位时就 `abandon` 全部在途TX owner（pbuf_free），而设备
+  仍可能读取已投递的描述符与payload，这是DMA-after-free。失败不等于DMA停止：归还
+  只在stop()复位确认后发生，与RX借用同一策略；host worker模型现要求失败路径只做
+  drain(0)、abandon=0，并会在旧行为下失败（旧代码abandon=2）。
+
+```sh
+make test-virtio-net-host test-ethernet-worker-host
+make test-network-riscv          # linux/boaros 同一ELF内容合同
+make test-sv39-riscv             # 含镜像VA->PA越界用例
+```

@@ -241,7 +241,21 @@ void riscv_plic_unregister(uint32_t source, void *owner)
     assert(source == 7 && interrupt_fn && owner == interrupt_owner);
     interrupt_fn = 0; interrupt_owner = 0;
 }
-void kernel_console_putc(char character) { (void)character; }
+static char console_text[16384]; static size_t console_length;
+static int console_contains(const char *needle)
+{
+    size_t n = 0; while (needle[n]) n++;
+    for (size_t i = 0; i + n <= console_length; i++) {
+        size_t j = 0; while (j < n && console_text[i + j] == needle[j]) j++;
+        if (j == n) return 1;
+    }
+    return 0;
+}
+void kernel_console_putc(char character)
+{
+    if (console_length + 1 < sizeof(console_text)) console_text[console_length++] = character;
+    console_text[console_length] = 0;
+}
 enum physical_page_status physical_page_allocate_order(struct physical_page_allocator *a,
     uint32_t order, uint64_t *p)
 {
@@ -601,6 +615,35 @@ static void test_legacy_reserved_status(void)
     complete(1, next_head(1), 0, 1); stop(&d);
     puts("PASS: VirtIO-net v1 reserved status bit does not imply unnegotiated modern reset semantics");
 }
+static void test_failure_slot_dump(unsigned version)
+{
+    struct riscv_virtio_mmio_net d; start(version, &d);
+    console_length = 0; console_text[0] = 0;
+    /* 两个在借 RX、一个在途 TX，再以越界 used id 触发失败快照。 */
+    struct riscv_net_frame frames[2];
+    receive("ab", 2); assert(riscv_virtio_mmio_net_receive(&d, &frames[0]) == 1);
+    receive("cd", 2); assert(riscv_virtio_mmio_net_receive(&d, &frames[1]) == 1);
+    assert(!riscv_virtio_mmio_net_lend(&d, frames[0].buffer));
+    assert(!riscv_virtio_mmio_net_lend(&d, frames[1].buffer));
+    assert(riscv_virtio_mmio_net_send(&d, "xyz", 3) == 3);
+    complete(1, 99, 0, 1);
+    assert(riscv_virtio_mmio_net_service(&d) == -KERNEL_EIO);
+    assert(console_contains("VirtIO-net failed reason=head-owner") != 0);
+    assert(console_contains("VirtIO-net slots version=") != 0);
+    /* diagnostic_hex 固定输出 16 位十六进制，槽快照断言按同一格式。 */
+    assert(console_contains("loaned=0x0000000000000002") != 0 &&
+           console_contains("pending=0x0000000000000000") != 0 &&
+           console_contains("done=0x0000000000000000") != 0);
+    assert(console_contains("VirtIO-net rx buffer=0x0000000000000000"
+                            " state=0x0000000000000004") != 0);
+    assert(console_contains("VirtIO-net tx buffer=0x") != 0 &&
+           console_contains("owner=0x0000000000000000") != 0);
+    riscv_virtio_mmio_net_release(&d, frames[0].buffer);
+    riscv_virtio_mmio_net_release(&d, frames[1].buffer);
+    stop(&d);
+    printf("PASS: VirtIO-net v%u failure keeps a device/queue/slot snapshot\n", version);
+}
+
 static void test_tx_segments(unsigned version)
 {
     struct riscv_virtio_mmio_net d; start(version, &d);
@@ -650,7 +693,8 @@ int main(void)
 {
     setvbuf(stdout, 0, _IONBF, 0); unsigned errors = 0;
     for (unsigned version = 1; version <= 2; version++) {
-        test_loan_budget(version); test_tx_copy_budget(version); test_tx_segments(version);
+        test_loan_budget(version); test_tx_copy_budget(version); test_failure_slot_dump(version);
+        test_tx_segments(version);
         test_tx_segments_unsupported(version); test_index_wrap(version);
         for (unsigned q = 0; q < 2; q++) { test_used_index(version, q, 0); test_used_index(version, q, 1); test_duplicate_id(version, q); }
         test_rx_length(version, 0); test_rx_length(version, 1);

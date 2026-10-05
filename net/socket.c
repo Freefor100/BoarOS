@@ -233,7 +233,7 @@ static void poll_loopback(void)
 void kernel_socket_expire_timers(void)
 {
     if (network_timer_wake) { network_timer_wake(network_context); return; }
-    /* IRQ 只推进有界协议定时器；收包/accept 和用户复制仍在调用上下文。 */
+    /* 无 owner 的早期/停用窗口仍直接推进有界协议定时器。 */
     if (socket_initialized) {
         retire_timewait();socket_timer_irq=1;socket_timer_running=1;sys_check_timeouts();socket_timer_running=0;socket_timer_irq=0;
     }
