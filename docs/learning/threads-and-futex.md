@@ -123,3 +123,23 @@ proc 字段、组信号/wait 选择，以及退出/reparent/handler 三类孤儿
 的 PID 对象 host 契约测试覆盖。没有因此宣称控制终端、完整凭据权限或 SMP 已支持。
 
 会话提交的独立源码树导出到 `build/session-stage-src/`，执行 `make -C build/session-stage-src -j4 all` 后，以 `python3 -B tests/diff-abi/harness.py --kernel build/session-stage-src/kernel-rv --program build/diff-abi/cases-rv` 跑完整差分，936 条全部匹配。内核 SHA-256 `96e4f211220c78a6d9d67a2c39a7505b9c1d2f5bf5fedf303a0b958d9aa3f554`，同 ELF SHA-256 `9c31cdff503d182da4a54707a181fcd54c1ed62724f85950abb3169e2a2a21e6`。该验证不包含尚在实现的 FIFO/RR 与预算机制。新增 session exec 用例必须安排在 proc 已打开执行文件 unlink 压力之前，避免测试自身先删除 `/init` 后等待一个无法 exec 的探针。
+
+## 用户态重启测试的握手边界（2026-10-05）
+
+网络服务回归暴露一次旧 `raw futex:11` 失败。独立提取原信号重启函数后，
+原生 Linux 7.2.7-zen1-1-zen 在首次尝试返回 EAGAIN，原 BoarOS `5687377`
+在第44次出现同样结果。父线程看见handler写入标志，不等于子线程已重新进入
+WAIT；此时父线程先改字，重启重新比较后返回EAGAIN合法。固定依据为
+`references/linux/kernel/futex/waitwake.c`，commit
+`f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的值检查。
+
+原fixture还混用private WAIT与shared WAKE；固定Linux的原循环在首次等待
+挂住，不能将BoarOS上的偶然通过当作正确跨平台握手。测试现统一使用private
+WAKE，重启成功场景保持用户字不变，直到WAKE明确返回选中一个等待者。
+仍要求最终WAIT返回0，不通过放宽为任意错误来隐藏失败；其他改变用户字和
+非重启的场景继续检查各自错误。
+
+修正后的原生Linux重复2000次通过；同一RV64 ELF（SHA-256
+`5a994a989c1866b0bbc84a944bc42810efaf2b01387009d5b803d2b562cc3898`）
+在原BoarOS和固定Linux各重复200次通过，完整 `make test-userland-riscv`
+亦通过。重建的常规入口仍是该目标；内核futex实现没有随此测试修正改变。
