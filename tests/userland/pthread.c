@@ -34,6 +34,7 @@
 #define FUTEX_WAKE_BITSET 10
 #define FUTEX_CLOCK_REALTIME 256
 #define FUTEX_WAIT_PRIVATE (FUTEX_WAIT | FUTEX_PRIVATE_FLAG)
+#define FUTEX_WAKE_PRIVATE (FUTEX_WAKE | FUTEX_PRIVATE_FLAG)
 #define FUTEX_WAIT_BITSET_PRIVATE (FUTEX_WAIT_BITSET | FUTEX_PRIVATE_FLAG)
 #define FUTEX_BITSET_MATCH_ANY UINT32_MAX
 
@@ -111,13 +112,31 @@ static int run_futex_signal_case(int restart, int timed, int change_word,
     if (wait_for_futex_case_ready(&test) != 0 ||
         pthread_kill(thread, SIGUSR1) != 0 || wait_for_futex_signal() != 0) {
         test.word = 1;
-        syscall(SYS_futex, &test.word, FUTEX_WAKE, 1, 0, 0, 0);
+        syscall(SYS_futex, &test.word, FUTEX_WAKE_PRIVATE, 1, 0, 0, 0);
         pthread_join(thread, &thread_result);
         return 3;
     }
     if (!change_word) {
-        test.word = 1;
-        syscall(SYS_futex, &test.word, FUTEX_WAKE, 1, 0, 0, 0);
+        if (restart && !timed) {
+            /* handler标志只证明信号已进入，不能证明重启的WAIT已入队。
+             * 保持期望值不变，直到WAKE明确选中等待者，避免合法EAGAIN。 */
+            int woke = 0;
+            for (int tries = 0; tries < 10000 && !woke; tries++) {
+                long count = syscall(SYS_futex, &test.word, FUTEX_WAKE_PRIVATE, 1, 0, 0, 0);
+                if (count < 0) break;
+                woke = count == 1;
+                if (!woke) sched_yield();
+            }
+            if (!woke) {
+                test.word = 1;
+                syscall(SYS_futex, &test.word, FUTEX_WAKE_PRIVATE, 1, 0, 0, 0);
+                pthread_join(thread, &thread_result);
+                return 3;
+            }
+        } else {
+            test.word = 1;
+            syscall(SYS_futex, &test.word, FUTEX_WAKE_PRIVATE, 1, 0, 0, 0);
+        }
     }
     if (pthread_join(thread, &thread_result) != 0 || thread_result != 0)
         return 4;
@@ -151,7 +170,7 @@ static int check_futex_wake_signal_boundary(void)
      * before it can run. The completed wake wins; the signal is still
      * delivered, and must not turn the successful wait into a retry. */
     test.word = 1;
-    if (syscall(SYS_futex, &test.word, FUTEX_WAKE, 1, 0, 0, 0) != 1 ||
+    if (syscall(SYS_futex, &test.word, FUTEX_WAKE_PRIVATE, 1, 0, 0, 0) != 1 ||
         pthread_kill(thread, SIGUSR1) != 0 ||
         pthread_join(thread, &thread_result) != 0 || thread_result != 0 ||
         test.result != 0 || wait_for_futex_signal() != 0) return 4;
