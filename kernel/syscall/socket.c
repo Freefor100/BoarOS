@@ -271,10 +271,6 @@ static int wait_ready(struct kernel_task *caller,
     while ((kernel_socket_poll(socket, 0) & event) == 0U) {
         enum kernel_wait_wake_reason reason;
         uint64_t sleep_deadline = deadline;
-        uint64_t protocol_deadline = kernel_socket_next_timer_deadline();
-        if (protocol_deadline != 0U &&
-            (sleep_deadline == 0U || protocol_deadline < sleep_deadline))
-            sleep_deadline = protocol_deadline;
         if ((kernel_open_file_flags(file) & LINUX_SOCK_NONBLOCK) != 0U ||
             (flags & KERNEL_SOCKET_MSG_DONTWAIT) != 0U) {
             riscv_interrupt_restore(saved);

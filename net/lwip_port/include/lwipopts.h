@@ -1,6 +1,12 @@
 #ifndef BOAROS_LWIPOPTS_H
 #define BOAROS_LWIPOPTS_H
 
+#include "boaros_lwip.h"
+#define LWIP_HOOK_TCP_INPACKET_PCB(pcb, hdr, optlen, opt1len, opt2, p) boaros_lwip_tcp_input(pcb)
+#define LWIP_HOOK_NETIF_LOOPBACK_QUEUED(netif) boaros_lwip_work_ready()
+#define LWIP_HOOK_MEMP_RELEASED(type) boaros_lwip_capacity_available(type)
+#define LWIP_HOOK_MEM_AVAILABLE() boaros_lwip_capacity_available(-1)
+
 #define NO_SYS 1
 #define SYS_LIGHTWEIGHT_PROT 0
 #define LWIP_TIMERS 1

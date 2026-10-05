@@ -348,17 +348,18 @@ sys_untimeout(sys_timeout_handler handler, void *arg)
  *
  * Must be called periodically from your main loop.
  */
-void
-sys_check_timeouts(void)
+unsigned
+sys_check_timeouts_budget(unsigned budget)
 {
   u32_t now;
+  unsigned handled = 0;
 
   LWIP_ASSERT_CORE_LOCKED();
 
   /* Process only timers expired at the start of the function. */
   now = sys_now();
 
-  do {
+  while (handled < budget) {
     struct sys_timeo *tmptimeout;
     sys_timeout_handler handler;
     void *arg;
@@ -367,11 +368,11 @@ sys_check_timeouts(void)
 
     tmptimeout = next_timeout;
     if (tmptimeout == NULL) {
-      return;
+      return handled;
     }
 
     if (TIME_LESS_THAN(now, tmptimeout->time)) {
-      return;
+      return handled;
     }
 
     /* Timeout has expired */
@@ -386,13 +387,21 @@ sys_check_timeouts(void)
     }
 #endif /* LWIP_DEBUG_TIMERNAMES */
     memp_free(MEMP_SYS_TIMEOUT, tmptimeout);
+    handled++;
     if (handler != NULL) {
       handler(arg);
     }
     LWIP_TCPIP_THREAD_ALIVE();
 
     /* Repeat until all expired timers have been called */
-  } while (1);
+  }
+  return handled;
+}
+
+void
+sys_check_timeouts(void)
+{
+  (void)sys_check_timeouts_budget(~0U);
 }
 
 /** Rebase the timeout times to the current time.

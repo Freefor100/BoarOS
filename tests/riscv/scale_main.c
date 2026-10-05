@@ -19,6 +19,7 @@
 #include <kernel/uaccess.h>
 #include <kernel/vfs.h>
 #include <string.h>
+#include "lwip/memp.h"
 
 #define USER UINT64_C(0x10000)
 #define BUFFER UINT64_C(0x100000)
@@ -40,6 +41,26 @@ enum kernel_uaccess_status __wrap_kernel_copy_from_user(struct kernel_mm *mm, vo
 #endif
     return status;
 }
+
+static unsigned freeze_lwip_clock;
+static uint32_t frozen_lwip_ms;
+uint32_t __real_sys_now(void);
+uint32_t __wrap_sys_now(void)
+{ return freeze_lwip_clock ? frozen_lwip_ms : __real_sys_now(); }
+static unsigned polling_snapshot, snapshot_protocol_calls;
+struct netif;
+void __real_netif_poll_all(void);
+void __wrap_netif_poll_all(void)
+{ if (polling_snapshot) snapshot_protocol_calls++; __real_netif_poll_all(); }
+void __real_sys_check_timeouts(void);
+void __wrap_sys_check_timeouts(void)
+{ if (polling_snapshot) snapshot_protocol_calls++; __real_sys_check_timeouts(); }
+unsigned __real_netif_poll_budget(struct netif *, unsigned);
+unsigned __wrap_netif_poll_budget(struct netif *netif, unsigned budget)
+{ if (polling_snapshot) snapshot_protocol_calls++; return __real_netif_poll_budget(netif, budget); }
+unsigned __real_sys_check_timeouts_budget(unsigned);
+unsigned __wrap_sys_check_timeouts_budget(unsigned budget)
+{ if (polling_snapshot) snapshot_protocol_calls++; return __real_sys_check_timeouts_budget(budget); }
 
 /* This boot fixture has no scheduled tasks. Reject any attempted blocking;
  * only an empty socket queue's notification may be ignored. */
@@ -111,6 +132,26 @@ static void tcp_cost(struct kernel_files *files, struct kernel_mm *mm)
           kernel_socket_listen(server_socket, 1) == 0 &&
           (remote.port = address.port, kernel_socket_connect(client_socket, &remote, 0)) == 0 &&
           kernel_socket_accept(server_socket, &accepted) == 0, 31);
+    struct kernel_socket *idle[16] = {0};
+    for (unsigned i = 0; i < 16; i++)
+        check(kernel_socket_create(files->heap, KERNEL_SOCKET_AF_INET, 1, &idle[i]) == 0, 222);
+#if BOAROS_COST_DIAGNOSTICS
+    check(kernel_cost_begin(4, cost_frequency, 1, 0) == 0, 236);
+#endif
+    polling_snapshot = 1;
+    for (unsigned i = 0; i < 64; i++)
+        check((kernel_socket_poll(client_socket, 0) & KERNEL_POLLOUT) != 0, 220);
+    polling_snapshot = 0;
+#if BOAROS_COST_DIAGNOSTICS
+    uint64_t polls, services, scans;
+    check(kernel_cost_end(4, 0) == 0 &&
+          kernel_cost_read(0, COST_NETWORK_POLL_CALLS, &polls) == 0 && polls == 64 &&
+          kernel_cost_read(0, COST_NETWORK_POLL_SERVICES, &services) == 0 && services == 0 &&
+          kernel_cost_read(0, COST_NETWORK_GLOBAL_SCANS, &scans) == 0 && scans == 0, 237);
+#endif
+    number("poll protocol calls: ", snapshot_protocol_calls);
+    check(snapshot_protocol_calls == 0, 221);
+    for (unsigned i = 0; i < 16; i++) kernel_socket_destroy(idle[i]);
     struct kernel_socket_statistics before, after;
     kernel_socket_get_statistics(&before);
     uint64_t resolutions = kernel_uaccess_page_resolutions();
@@ -130,6 +171,50 @@ static void tcp_cost(struct kernel_files *files, struct kernel_mm *mm)
         int got=kernel_socket_reserve_read(accepted,0,&request,&reader,sizeof(payload),0);
         check(got>0,202);kernel_socket_finish_read(&request,0);consumed+=(uint32_t)got;
     }
+    uintptr_t core = kernel_socket_protocol_enter();
+    check(kernel_socket_write_buffer(client_socket, "batch", 5, 0) == 5, 223);
+    kernel_socket_protocol_leave(core);
+    check(!(kernel_socket_poll(accepted, 0) & KERNEL_POLLIN), 224);
+    struct kernel_socket_service_result service = kernel_socket_service_pending(
+        (struct kernel_socket_service_budget){0, 0, 0});
+    check(!service.sockets && !service.packets && !service.timers && service.runnable, 225);
+    unsigned rounds = 0;
+    do {
+        service = kernel_socket_service_pending((struct kernel_socket_service_budget){1, 1, 0});
+        check(service.sockets <= 1 && service.packets <= 1 && !service.timers && ++rounds < 64, 226);
+    } while (service.runnable);
+    struct kernel_socket_read_request budget_read = {0};
+    char budget_bytes[5];
+    check(kernel_socket_reserve_read(accepted, 0, &budget_read, &reader, 5, 0) == 5, 227);
+    kernel_socket_copy_read(&budget_read, 0, budget_bytes, 5);
+    check(!memcmp(budget_bytes, "batch", 5), 228);
+    kernel_socket_finish_read(&budget_read, 0);
+    static void *held_segments[MEMP_NUM_TCP_SEG];
+    unsigned held = 0;
+    core = kernel_socket_protocol_enter();
+    while (held < MEMP_NUM_TCP_SEG && (held_segments[held] = memp_malloc(MEMP_TCP_SEG))) held++;
+    check(held > 1 && !memp_malloc(MEMP_TCP_SEG), 229);
+    frozen_lwip_ms = __real_sys_now(); freeze_lwip_clock = 1;
+    memp_free(MEMP_TCP_SEG, held_segments[--held]);
+    check(kernel_socket_write_buffer(client_socket, payload, 2 * TCP_MSS, 0) == -KERNEL_EAGAIN &&
+          !(kernel_socket_poll(client_socket, 0) & KERNEL_POLLOUT), 230);
+    memp_free(MEMP_TCP_SEG, held_segments[--held]);
+    kernel_socket_protocol_leave(core);
+    /* 不推进任何timer；归还事件必须直接恢复真正的池等待者。 */
+    service = kernel_socket_service_pending((struct kernel_socket_service_budget){8, 0, 0});
+    check(!service.timers && !service.packets, 231);
+    check(kernel_socket_poll(client_socket, 0) & KERNEL_POLLOUT, 232);
+    freeze_lwip_clock = 0;
+    core = kernel_socket_protocol_enter();
+    while (held) memp_free(MEMP_TCP_SEG, held_segments[--held]);
+    kernel_socket_protocol_leave(core);
+    check(kernel_socket_write_buffer(client_socket, "pool", 4, 0) == 4, 233);
+    budget_read = (struct kernel_socket_read_request){0};
+    check(kernel_socket_reserve_read(accepted, 0, &budget_read, &reader, 4, 0) == 4, 234);
+    kernel_socket_copy_read(&budget_read, 0, budget_bytes, 4);
+    check(!memcmp(budget_bytes, "pool", 4), 235);
+    kernel_socket_finish_read(&budget_read, 0);
+    virt_uart_puts("protocol budget and capacity progress passed\n");
     /* 强制协议保留一次未接纳的 pbuf；IRQ 重试不能重入被中断的堆分配。 */
     fail_packet=1;
     check(kernel_socket_write_buffer(client_socket,"retry",5,0)==5 && fail_packet==0,203);

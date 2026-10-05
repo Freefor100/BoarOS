@@ -4,7 +4,7 @@
 
 取舍比较过三条路线：自写有限 TCP/UDP 子集能控制所有状态，但协议重传、定时器和互操作验证成本最高；宿主转发可快速启动，但 fd、错误和恢复语义被宿主环境决定；固定成熟 C 栈的 raw API 保留 BoarOS 的 fd/OFD、用户复制、等待、就绪和 errno owner，同时复用已测协议状态机。用户选择第三条，固定官方 lwIP `STABLE-2_2_1_RELEASE` 采用 `NO_SYS` 单 hart 事件驱动。分配 owner 另经用户确认：协议/packet 用静态有界池，BoarOS socket/OFD/队列节点用 kernel_heap，以池计数与 root `heap-live=0` 分别核对。
 
-`NO_SYS` 没有独立网络线程。若服务端已睡在 accept，客户端非阻塞 connect 返回后不再调用 socket，SYN 若只留在 lwIP loopback 队列，服务端会永久睡眠。因此发起 connect 的系统调用必须推进一次 loopback，轮询与定时等待也推进协议。两进程握手测试固定顺序，排除了同进程立即 accept 偶然泵送队列的伪通过。另一条生命周期边界是 TCP `tcp_close` 在已连接状态可能暂保留 FIN/TIME_WAIT PCB；销毁 OFD 前必须先解绑指向 BoarOS 堆对象的回调，host 测试随后推进 200 秒计时并检查静态池回到基线。待 accept 子连接的 reset 也必须在 dequeue 前剔除。
+最初接入时，`NO_SYS` 尚没有内核后台服务（下面记录当时的设计，当前已由文末有界服务取代）。若服务端已睡在 accept，客户端非阻塞 connect 返回后不再调用 socket，SYN 若只留在 lwIP loopback 队列，服务端会永久睡眠。因此发起 connect 的系统调用必须推进一次 loopback，轮询与定时等待也推进协议。两进程握手测试固定顺序，排除了同进程立即 accept 偶然泵送队列的伪通过。另一条生命周期边界是 TCP `tcp_close` 在已连接状态可能暂保留 FIN/TIME_WAIT PCB；销毁 OFD 前必须先解绑指向 BoarOS 堆对象的回调，host 测试随后推进 200 秒计时并检查静态池回到基线。待 accept 子连接的 reset 也必须在 dequeue 前剔除。
 
 固定参考是本地 `references/lwip/` 和导入的 `third_party/lwip/` 同一版本；移植只在 `net/lwip_port/`，不修改上游 core。重建入口与当前能力边界见[网络模块](../modules/kernel-network.md)。外部网卡、命名 AF_UNIX 和 SMP 的 owner/同步仍需要单独验证。
 
@@ -490,3 +490,46 @@ make test-sv39-riscv             # 含镜像VA->PA越界用例
 通过实际TAP双向内容、HTTP和清理检查；无NIC的`network-riscv.py --only boaros --workload timer`
 通过。两个TAP运行分别14.523/14.816秒，只有一个副本，属于契约运行时长，
 不是与旧版匹配的吞吐结果。RX八帧仍不约束全部协议成本，有界协议服务是后续独立阶段。
+
+
+## 纯就绪与有界协议服务（2026-10-05）
+
+沿用户确认的短 syscall + 统一后台路线实现，保留单 hart 执行资格与 `tcp_write(COPY)`。
+query 不承担协议执行：64 次 poll、16 个无关 socket 的生产函数规模测试，旧实现的包装器
+记录 128 次协议调用，当前为 0；COST 门禁也要求 poll 服务数和全局 socket 扫描均为 0。
+监听 live 计数由回调维护，失效 child 与 TIME_WAIT 由工作集合回收，查询不消费错误。
+
+独立弱队列区分可运行、NIC、协议池及接收堆等待；socket 销毁前全部解绑。
+每次真实容量释放更新代次，失败者只等待之后的新代次。stock lwIP 的 MEMP_AVAILABLE
+只在空池变为非空时通知；冻结协议时钟、禁用包与 timer 服务后，先释放一个 segment、
+尝试需要两个的写入、再释放第二个，旧通知方式不能恢复可写，新 RELEASED hook 通过。
+回调只发布工作，不能在释放栈中直接再次尝试发送。250 ms 仍是未知资源变化的兜底，
+不把它作为用户 poll/epoll/阻塞 I/O 的额外唤醒期限。
+
+服务分别限制 RX 八帧、loopback 八包、socket 八个单元、一个 timer 回调。
+容量转交、重试期限、实际 socket 工作轮转；三个资源等待集合也轮转。完整 raw 调用
+返回后才检查预算，单个 timer callback 可能处理多个协议对象，预算不是固定 CPU 时间。
+执行资格记录当前 I/O owner 并抑制可能进入块 I/O 的堆回收；用户复制与睡眠不持资格。
+批次之间开放中断并调度；NIC 失败和无 NIC 均继续同一软件服务。关闭窗口的 unsent
+不自动重新排队，睡前重新检查容量、设备 ready 与软件工作，避免无进展忙等。
+
+本地依据 `references/lwip` 2.2.1 commit
+`77dcd25a72509eb83f72b033d219b1d40cd8eb95` 的 `tcp_out.c`、`memp.c`、
+`netif.c`、`timeouts.c`。本地补丁逐项登记于第三方文档，原无预算 API 保持兼容包装。
+最终发布内核 SHA-256 `bcea1a6972abe6589eaabf6e95f798baec62387d68b8cb51a0693274a8a03868`，
+QEMU 11.1.1：lwIP/重组/worker/epoll 宿主测试、真实 RV64 scale、COST growth/poll 门禁、
+完整 userland 和栈预算通过。网络 contract 与 epoll fault 用同 RV64 ELF 在固定 Linux
+`f4cdf7ca9a1fdcca413157df19753f388a5a224e` 及 BoarOS 通过；无 NIC timer 和内容通过。
+TAP legacy/modern 各单次应用与清理通过，程序 17.138/18.535 秒，仅为本轮组合验收，
+并行运行其他测试且未匹配三次基线，不能解释为吞吐改善或回退。重建命令：
+
+```sh
+make all test-scale-riscv test-ethernet-worker-host test-lwip-host test-lwip-reassembly-host
+make test-epoll-host test-epoll-riscv test-userland-riscv test-cache-growth-riscv test-cost-host test-stack-usage
+python3 -B tests/network-riscv.py --workload contract
+python3 -B tests/network-riscv.py --only boaros --workload timer
+python3 -B tests/network-riscv.py --only boaros --workload content
+python3 -B tests/network-external.py --only boaros --transport both --repeat 1
+```
+
+发送 reservation、复制量优化与 TCP 预算比较仍在后续独立阶段；本阶段不声明其完成。

@@ -21,7 +21,8 @@ def supported_schemas():
     previous=current[:next(i for i,x in enumerate(current) if x[0]=='journal_seal_operations')]
     memory_previous=current[:next(i for i,x in enumerate(current) if x[0]=='heap_zero_bytes')]
     resize_previous=current[:next(i for i,x in enumerate(current) if x[0]=='resize_visits')]
-    return current,memory_previous,previous,stored_pipeline,journal,original,resize_previous
+    network_previous=current[:next(i for i,x in enumerate(current) if x[0]=='network_service_calls')]
+    return current,memory_previous,previous,stored_pipeline,journal,original,network_previous,resize_previous
 
 def parse(text, epoch, metrics=None):
     metrics=schema() if metrics is None else metrics

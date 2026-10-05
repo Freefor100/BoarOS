@@ -1248,9 +1248,10 @@ netif_loop_output_ipv6(struct netif *netif, struct pbuf *p, const ip6_addr_t *ad
  * netif_loop_output() are put on a list that is passed to netif->input() by
  * netif_poll().
  */
-void
-netif_poll(struct netif *netif)
+unsigned
+netif_poll_budget(struct netif *netif, unsigned budget)
 {
+  unsigned handled = 0;
   /* If we have a loopif, SNMP counters are adjusted for it,
    * if not they are adjusted for 'netif'. */
 #if MIB2_STATS
@@ -1266,7 +1267,7 @@ netif_poll(struct netif *netif)
 
   /* Get a packet from the list. With SYS_LIGHTWEIGHT_PROT=1, this is protected */
   SYS_ARCH_PROTECT(lev);
-  while (netif->loop_first != NULL) {
+  while (handled < budget && netif->loop_first != NULL) {
     struct pbuf *in, *in_end;
 #if LWIP_LOOPBACK_MAX_PBUFS
     u8_t clen = 1;
@@ -1300,6 +1301,7 @@ netif_poll(struct netif *netif)
     in_end->next = NULL;
     SYS_ARCH_UNPROTECT(lev);
 
+    handled++;
     in->if_idx = netif_get_index(netif);
 
     LINK_STATS_INC(link.recv);
@@ -1312,6 +1314,13 @@ netif_poll(struct netif *netif)
     SYS_ARCH_PROTECT(lev);
   }
   SYS_ARCH_UNPROTECT(lev);
+  return handled;
+}
+
+void
+netif_poll(struct netif *netif)
+{
+  (void)netif_poll_budget(netif, ~0U);
 }
 
 #if !LWIP_NETIF_LOOPBACK_MULTITHREADING

@@ -20,25 +20,6 @@
 
 #define KERNEL_EPOLL_MAX_NESTS 4U
 
-static struct kernel_open_file_description *epoll_first_socket(
-    struct kernel_epoll *epoll, unsigned depth)
-{
-    struct kernel_epoll_item *item;
-    if (epoll == 0 || depth >= KERNEL_EPOLL_MAX_NESTS) return 0;
-    for (item = epoll->items_head; item != 0; item = item->items_next) {
-        struct kernel_open_file_description *target = item->target_file;
-        if (target == 0 || item->oneshot_disarmed) continue;
-        if (kernel_open_file_kind(target) == KERNEL_OPEN_FILE_KIND_SOCKET)
-            return target;
-        if (kernel_open_file_kind(target) == KERNEL_OPEN_FILE_KIND_EPOLL) {
-            struct kernel_open_file_description *nested =
-                epoll_first_socket(target->epoll, depth + 1U);
-            if (nested != 0) return nested;
-        }
-    }
-    return 0;
-}
-
 static void epoll_ready_add(struct kernel_epoll *epoll, struct kernel_epoll_item *item)
 {
     if (!item->linked || item->oneshot_disarmed || item->on_ready_list) return;
@@ -872,13 +853,6 @@ enum kernel_files_status kernel_files_epoll_pwait(
             enum kernel_wait_wake_reason wake_reason = KERNEL_WAIT_WOKEN;
             uint64_t saved_intr = riscv_interrupt_save();
             uint64_t sleep_deadline = deadline;
-            if (epoll_first_socket(epoll, 0U) != 0) {
-                uint64_t protocol_deadline =
-                    kernel_socket_next_timer_deadline();
-                if (protocol_deadline != 0U &&
-                    (sleep_deadline == 0U || protocol_deadline < sleep_deadline))
-                    sleep_deadline = protocol_deadline;
-            }
             if (!epoll->scan_owner && epoll->ready_head != 0) {
                 riscv_interrupt_restore(saved_intr);
                 continue;
@@ -898,14 +872,6 @@ enum kernel_files_status kernel_files_epoll_pwait(
                 break;
             }
             if (wake_reason == KERNEL_WAIT_TIMEOUT) {
-                if (sleep_deadline != deadline) {
-                    /* The timed protocol pump can enqueue an epoll item. */
-                    struct kernel_open_file_description *socket_file =
-                        epoll_first_socket(epoll, 0U);
-                    if (socket_file != 0)
-                        (void)kernel_open_file_poll(socket_file, 0U, 0);
-                    continue;
-                }
                 *linux_result = 0;
                 break;
             }

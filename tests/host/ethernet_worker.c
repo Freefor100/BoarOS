@@ -23,14 +23,21 @@ int riscv_virtio_mmio_net_receive(struct riscv_virtio_mmio_net *d, struct riscv_
 void netif_set_link_down(struct netif *n) { n->flags &= (u8_t)~NETIF_FLAG_LINK_UP; }
 void netif_set_link_up(struct netif *n) { n->flags |= NETIF_FLAG_LINK_UP; }
 void kernel_socket_network_failed(uint32_t address) { (void)address; errors++; }
-void kernel_socket_network_process(void)
+struct kernel_socket_service_result kernel_socket_service_pending(struct kernel_socket_service_budget budget)
 {
+    (void)budget;
     expired = riscv_time_read() >= 950;
     if (worker_mode) {
         protocol_attempts++;
         if (!sent && worker_mode != 3 && held < 64) { sent++; held++; }
     }
+    return (struct kernel_socket_service_result){.runnable = worker_mode >= 5 && protocol_attempts == 1, .next_deadline = 1200};
 }
+uintptr_t kernel_socket_protocol_enter(void) { return 0; }
+void kernel_socket_protocol_leave(uintptr_t irq) { (void)irq; }
+int kernel_socket_work_pending(void) { return worker_mode >= 5 && protocol_attempts == 1; }
+void kernel_socket_network_capacity(void) {}
+void kernel_socket_network_blocked(void) {}
 uint64_t kernel_socket_next_timer_deadline(void) { return 1200; }
 enum kernel_scheduler_status kernel_scheduler_block_current(struct kernel_wait_queue *q,
     uint64_t deadline, int interruptible, enum kernel_wait_wake_reason *reason)
@@ -148,7 +155,7 @@ int main(void)
     }
     printf("PASS failed-NIC preserves unrelated protocol timer progress, tx drain=%u abandon=%u\n",
            drain_calls, abandon_calls);
-    for (worker_mode = 1; worker_mode <= 4; worker_mode++) {
+    for (worker_mode = 1; worker_mode <= 5; worker_mode++) {
         memset(&owner, 0, sizeof(owner)); owner.device.frequency = 100;
         owner.device.tx_done_count = worker_mode == 2 || worker_mode == 4 ? 0 : 64;
         held = 64; sent = service_calls = protocol_attempts = yields = 0;
@@ -161,6 +168,11 @@ int main(void)
         printf("PASS TX completion mode=%u attempts=%u sent=%u held=%u yields=%u\n",
             worker_mode, protocol_attempts, sent, held, yields);
     }
+    worker_mode = 6; protocol_attempts = yields = sent = held = 0;
+    memset(&owner, 0, sizeof(owner)); owner.device.frequency = 100;
+    if (!setjmp(stopped)) timer_worker(&owner);
+    if (protocol_attempts != 2 || yields != 1 || blocked_deadline != 1200) return 1;
+    puts("PASS timer-only worker drains runnable software before sleeping");
     worker_mode = 0;
     return receive_contract();
 }

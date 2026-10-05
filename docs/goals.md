@@ -19,6 +19,7 @@ N3已经交付：legacy/modern VirtIO-net、受限DMA借用与复制回退、静
 | pthread取消与旧libc输入 | 原镜像动态glibc的cancel/exit缺libgcc_s；独立glibc运行环境已固定unwind依赖并保护取消/cleanup。静态cancel-points的join结果在固定Linux也失败，按库/测试契约继续核对，不能归给内核。历史偶发现场仍保留P0c边界，不安排无目的重复次数。 |
 | 内核抢占边界 | allocator修复不等于所有共享状态已审完。限定检查开中断worker到共享对象的调用链、睡眠前引用和发布临界区；发现具体错误才扩大。 |
 | TX 完成进展纠错 | worker先收割并释放完成槽，再推进协议；睡眠前覆盖SG与复制路径的新容量。宿主顺序/关闭窗口、真实两种TAP传输和无NIC定时器验证通过；见[网络owner](learning/network-ownership.md)。 |
+| 就绪查询与协议服务 | poll 为局部只读快照，短 syscall 与后台 worker 共用有界服务；协议池/NIC/接收堆归还按代次通知等待者。模型与真实 RV64 验证见[网络记录](learning/network-ownership.md#纯就绪与有界协议服务2026-10-05)，发送复制和窗口实验仍属后续阶段。 |
 | 追加增长纠错 | 增长与截断分离；对齐增长不扫描缓存页链，非对齐增长仅处理旧尾页。1/4/16/64 MiB 成本门禁与真实文件/映射回归通过，吞吐尚未重测；见[规模成本](learning/single-hart-scale.md)。 |
 | epoll 交付纠错 | 完整 event 复制后提交 ET/ONESHOT；独立扫描/pending、MOD 代次与任务退出 owner 已接入。生产函数宿主边界及固定 Linux 同 RV64 ELF 验证通过；见[事件交付](learning/epoll-delivery.md)。 |
 | 双盘控制协议纠错 | 原基线 `3c34091`/`5687377` 的暂扣阶段超时已定位为规范模式终端等待行结束：host只发送单字节g，尚未出现B盘暂扣READ。guest显式设置并恢复控制终端后，暂扣/故障/重启和FIFO/RR四组合通过；已加入CI目标，尚无本提交的托管CI结果。见[可睡眠存储](learning/sleepable-storage.md)。 |
@@ -541,7 +542,7 @@ backlog 和期限回收已交付。真实用户态保护用户复制、共享 OF
 | 单 hart ASID：当前 ASID 0，换根前后各一次全局 fence | 已调查并推迟到实板：固定 QEMU 无 ASID 化 TLB（satp 变化与任意 sfence.vma 均全刷、翻译不使用 ASID），收益不可观测，且收窄 fence 的正确性缺陷会被 QEMU 全刷掩盖；在 ASID 标签 TLB 的硬件（L4）上实现并验证 ASIDLEN 与复用顺序。 |
 | P6g 栈 guard：连续物理栈、canary/高水位 | 已选择①并交付：独立内核栈窗口（12 KiB 槽＝4 KiB 未映射 guard＋8 KiB 栈），运行期插/删叶、空表释放；见已交付表。direct-map 别名与 idle/boot 栈的边界见[调度模块](modules/kernel-scheduler.md)。 |
 | N1 协议栈与分配 owner | 已确认 BoarOS 持有 fd/OFD、ABI、等待与缓冲队列，固定官方 lwIP 2.2.1 raw API/NO_SYS；协议和 pbuf 静态有界池，socket/OFD/请求由 kernel_heap 持有。IPv4/IPv6双栈loopback和socketpair已验收；QEMU VirtIO-net与静态IPv4宿主应用已交付，实板另核对；命名AF_UNIX按需设计。 |
-| N4 网络关中断区与协议所有权：worker 批处理、syscall 协议临界区与无 NIC 的 timer IRQ 全部依赖单 hart SIE 串行化 | ① 保持串行化，仅把无 NIC 的 lwIP timer 移出 IRQ（小、独立，只影响 loopback/测试配置）；② network-core 单 owner + syscall 请求队列（usercopy/等待/取消留在 syscall，协议调用与队列记账过队列；大改动，是 SMP 前置）；③ 维持现状，待 SMP 或真实延迟证据再动。单 hart 下 SIE 长区不直接损失吞吐（工作照做、IRQ 推迟），收益是延迟上界与 SMP 准备；当前无真实负载证据，暂不实施。 |
+| N4 网络执行资格与预算 | 已确认并实现短 syscall + 统一后台服务；raw 调用持单 hart 执行资格、不睡眠、不重入，批次之间开放中断并调度。poll 不推进协议。SMP 的每 hart 状态和锁仍另设计，不把当前资格当作多核同步。 |
 
 单 hart 已交付 OTHER/FIFO/RR 与全局实时带宽；后续调度改动以公平性/负载和实际消费者证据比较策略。第二架构按连续小里程碑推进；不等待 RV “全部完成”，也不复制整套通用内核。
 

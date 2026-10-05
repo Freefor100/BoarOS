@@ -203,7 +203,6 @@ static int core_poll_run(
     void *heap_block = 0;
     int ready_count = 0;
     int error = 0;
-    int has_socket = 0;
 
     if (nfds > KERNEL_POLL_STACK_CAPACITY) {
         size_t alloc_size =
@@ -242,8 +241,6 @@ static int core_poll_run(
             ready_count++;
             continue;
         }
-        if (kernel_open_file_kind(pinned[i]) == KERNEL_OPEN_FILE_KIND_SOCKET)
-            has_socket = 1;
         struct kernel_wait_queue *wq = 0;
         uint32_t active = kernel_open_file_poll(
             pinned[i], (uint32_t)(uint16_t)pfds[i].events, &wq);
@@ -292,13 +289,6 @@ static int core_poll_run(
         while (ready_count == 0 && error == 0) {
             enum kernel_wait_wake_reason wake_reason = KERNEL_WAIT_WOKEN;
             uint64_t sleep_deadline = deadline;
-            if (has_socket) {
-                uint64_t protocol_deadline =
-                    kernel_socket_next_timer_deadline();
-                if (protocol_deadline != 0U &&
-                    (sleep_deadline == 0U || protocol_deadline < sleep_deadline))
-                    sleep_deadline = protocol_deadline;
-            }
             if (kernel_scheduler_block_current(0, sleep_deadline, 1,
                                                &wake_reason) !=
                 KERNEL_SCHEDULER_STATUS_OK) {

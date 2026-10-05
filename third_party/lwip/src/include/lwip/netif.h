@@ -520,6 +520,7 @@ void netif_set_link_callback(struct netif *netif, netif_status_callback_fn link_
 
 #if ENABLE_LOOPBACK
 err_t netif_loop_output(struct netif *netif, struct pbuf *p);
+unsigned netif_poll_budget(struct netif *netif, unsigned budget);
 void netif_poll(struct netif *netif);
 #if !LWIP_NETIF_LOOPBACK_MULTITHREADING
 void netif_poll_all(void);
