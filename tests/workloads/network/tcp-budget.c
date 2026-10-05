@@ -168,7 +168,7 @@ static void serve(int fd)
     _exit(0);
 }
 
-static void client(unsigned id, int ready, int gate)
+static void client(unsigned id, int ready, int connected_gate, int measured_gate)
 {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     CHECK(fd >= 0);
@@ -178,7 +178,8 @@ static void client(unsigned id, int ready, int gate)
     options(fd);
     unsigned char token = 1;
     transfer(ready, &token, 1, 1);
-    transfer(gate, &token, 1, 0);
+    transfer(connected_gate, &token, 1, 0);
+    CHECK(close(connected_gate) == 0);
     uint32_t header[2] = {htonl(0x424f4152U), htonl(id)};
     transfer(fd, header, sizeof(header), 1);
     unsigned char ping[64], expected[64];
@@ -195,8 +196,8 @@ static void client(unsigned id, int ready, int gate)
     struct rr_sample *samples = mixed && !is_bulk(id) ? calloc(rounds, sizeof(*samples)) : NULL;
     CHECK(!mixed || is_bulk(id) || samples);
     /* 所有流完成 RTT 探测后再共同开始 bulk/control，避免预热阶段假重叠。 */
-    transfer(ready, &token, 1, 1); transfer(gate, &token, 1, 0);
-    CHECK(close(ready) == 0 && close(gate) == 0);
+    transfer(ready, &token, 1, 1); transfer(measured_gate, &token, 1, 0);
+    CHECK(close(ready) == 0 && close(measured_gate) == 0);
     token = 'G'; transfer(fd, &token, 1, 1);
     uint64_t start = now();
     if (is_bulk(id)) payload(fd, id, !transmit);
@@ -329,33 +330,35 @@ int main(int argc, char **argv)
     CHECK(pipe(reports) == 0);
     if (mixed && !external) CHECK(pipe(control_samples) == 0);
     if (!external) {
-        int ready[2], gate[2];
-        CHECK(pipe(ready) == 0 && pipe(gate) == 0);
+        int ready[2], gate[2][2];
+        /* 两轮放行各用一条管道，快参与者不能消费慢参与者的上一轮 token。 */
+        CHECK(pipe(ready) == 0 && pipe(gate[0]) == 0 && pipe(gate[1]) == 0);
         pid_t coordinator = fork(); CHECK(coordinator >= 0);
         if (!coordinator) {
-            close(listener); close(ready[0]); close(gate[1]);
+            close(listener); close(ready[0]); close(gate[0][1]); close(gate[1][1]);
             for (unsigned id = 0; id < connections; ++id) {
                 pid_t child = fork(); CHECK(child >= 0);
-                if (!child) { children_count = 0; client(id, ready[1], gate[0]); }
+                if (!child) { children_count = 0; client(id, ready[1], gate[0][0], gate[1][0]); }
                 children[children_count++] = child;
             }
-            close(ready[1]); close(gate[0]); wait_all(); _exit(0);
+            close(ready[1]); close(gate[0][0]); close(gate[1][0]); wait_all(); _exit(0);
         }
         children[children_count++] = coordinator;
-        close(ready[1]); close(gate[0]);
+        close(ready[1]); close(gate[0][0]); close(gate[1][0]);
         for (unsigned id = 0; id < connections; ++id) {
             int fd = accept(listener, NULL, NULL); CHECK(fd >= 0);
             pid_t child = fork(); CHECK(child >= 0);
-            if (!child) { children_count = 0; close(listener); close(ready[0]); close(gate[1]); serve(fd); }
+            if (!child) { children_count = 0; close(listener); close(ready[0]); close(gate[0][1]); close(gate[1][1]); serve(fd); }
             children[children_count++] = child;
             close(fd);
         }
         unsigned char token;
         for (unsigned phase = 0; phase < 2; ++phase) {
             for (unsigned id = 0; id < connections; ++id) transfer(ready[0], &token, 1, 0);
-            for (unsigned id = 0; id < connections; ++id) transfer(gate[1], &token, 1, 1);
+            for (unsigned id = 0; id < connections; ++id) transfer(gate[phase][1], &token, 1, 1);
+            close(gate[phase][1]);
         }
-        close(ready[0]); close(gate[1]);
+        close(ready[0]);
     } else {
         puts("BUDGET READY tap");
         for (unsigned id = 0; id < connections; ++id) {

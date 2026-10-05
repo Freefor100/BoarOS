@@ -42,6 +42,13 @@ TAP 27 bulk+1 control，留四个 active PCB 槽；这是 fixture 配额，不�
 控制 tail 的主集合按 RR **发起时 bulk 尚活跃**选择，跨 bulk 结束的慢回复仍计入；
 全部样本和 fully-contained 辅助集合另存，保留样本数，不按完成时点筛掉最慢请求。
 
+loopback 的连接就绪与 RTT 预热完成使用两条独立放行管道。首次扩大验证在固定
+Linux 的 blocking/RR/5 连接遇到 180 秒 workload timeout，结果文件为空；旧程序
+两轮共用一条 gate，快客户端可能把慢客户端的第一轮 token 当成第二轮放行。
+新增实际 workload 的宿主到达偏斜测试，旧代码稳定报告跨轮消费并停滞；分离后
+通过。这里修改的是测量协调器，未改内核协议路径；新 workload ELF 必须与基线
+重新匹配，旧失败批次标 incomplete，不混合两版 ELF 的吞吐或观测开销。
+
 TAP 可选 `--tap-delay-ms 0/1/10`，只在隔离 namespace 的 host→guest egress 设置
 netem，另报告实际 RTT。本宿主 1/10 ms 均返回 `Specified qdisc kind is unknown`，
 在 QEMU 启动前明确记 unsupported。没有加载宿主模块或用另一种 relay 混作同一测量后端。
