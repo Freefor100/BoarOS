@@ -18,6 +18,7 @@ N3已经交付：legacy/modern VirtIO-net、受限DMA借用与复制回退、静
 | 历史页释放fatal的具体现场 | 已修复能够产生同类fatal的分配器双owner竞态；原事件没有owner快照，不能反推唯一触发链。 |
 | pthread取消与旧libc输入 | 原镜像动态glibc的cancel/exit缺libgcc_s；独立glibc运行环境已固定unwind依赖并保护取消/cleanup。静态cancel-points的join结果在固定Linux也失败，按库/测试契约继续核对，不能归给内核。历史偶发现场仍保留P0c边界，不安排无目的重复次数。 |
 | 内核抢占边界 | allocator修复不等于所有共享状态已审完。限定检查开中断worker到共享对象的调用链、睡眠前引用和发布临界区；发现具体错误才扩大。 |
+| 本机 multi-disk-io 测试 | `make test-multi-disk-io-riscv` 在基线 `3c34091` 上同样失败：guest 在 B 盘暂扣阶段挂住，harness 90 秒后超时；CI 不运行该目标，本会话改动 A/B 均复现，因果待独立定位。 |
 
 [风险证据与重建](learning/cost-baseline.md#旧版内存释放与-virtqueue-告警2026-10-02)
 区分已经修复的机制与缺少历史现场的归因。固定root、单hart、QEMU和选定应用验收
@@ -78,6 +79,7 @@ ASID 标签 TLB 的硬件上验证。本轮实施：TX indirect+SG 零拷贝（�
 
 | 阶段/能力 | 事实与证据入口 |
 |---|---|
+| 块在途测量与最终统计 | 块统计新增时间加权在途积分/忙时/总span/queue-wait/服务时间，设备销毁打印最终行；真实窗口实测忙时平均 1.31、空闲 86%、峰值 8，按触发条件不加深队列。见[块模块](modules/riscv-virtio-block.md)与[成本基线](learning/cost-baseline.md#块设备在途深度实测2026-10-05)。 |
 | 内核栈窗口与未映射 guard | 生产任务栈映射到独立 128 MiB 窗口槽位，低 4 KiB 无 PTE 作为 guard，越界经窗口 VA 立即 store fault；窗口骨架构建期预留、运行期受限 map/unmap、空 level-0 表释放；无页表 fixture 回退 direct-map。见[调度](modules/kernel-scheduler.md)与[Sv39](modules/riscv-sv39.md)。 |
 | 任务常驻 I/O scratch 页 | 每任务首次 I/O 分配一页并跨调用复用，正常调用只解除登记，任务销毁路径归还；musl 自动窗口物理页分配 42744→18066（差 24678 与 24576 次调用吻合）。见[调度](modules/kernel-scheduler.md)与[网络](modules/kernel-network.md)。 |
 | 到期有序索引与最早期限重装 | blocked deadline 使用 (deadline, tid) 有序索引，到期只弹出已到期者；SBI 事件取 min(RT 预算, RR 片尾, 最早睡眠 deadline)；socket 写重试链按期限有序。COST deadline 门禁改为到期处理数与 timeout 一致、不随无期限 blocked 增长。见[调度](modules/kernel-scheduler.md)、[时间](modules/kernel-time.md)与[定时器](modules/riscv-timer.md)。 |
@@ -532,7 +534,6 @@ backlog 和期限回收已交付。真实用户态保护用户复制、共享 OF
 | P6g 栈 guard：连续物理栈、canary/高水位 | 已选择①并交付：独立内核栈窗口（12 KiB 槽＝4 KiB 未映射 guard＋8 KiB 栈），运行期插/删叶、空表释放；见已交付表。direct-map 别名与 idle/boot 栈的边界见[调度模块](modules/kernel-scheduler.md)。 |
 | N1 协议栈与分配 owner | 已确认 BoarOS 持有 fd/OFD、ABI、等待与缓冲队列，固定官方 lwIP 2.2.1 raw API/NO_SYS；协议和 pbuf 静态有界池，socket/OFD/请求由 kernel_heap 持有。IPv4/IPv6双栈loopback和socketpair已验收；QEMU VirtIO-net与静态IPv4宿主应用已交付，实板另核对；命名AF_UNIX按需设计。 |
 | N4 网络关中断区与协议所有权：worker 批处理、syscall 协议临界区与无 NIC 的 timer IRQ 全部依赖单 hart SIE 串行化 | ① 保持串行化，仅把无 NIC 的 lwIP timer 移出 IRQ（小、独立，只影响 loopback/测试配置）；② network-core 单 owner + syscall 请求队列（usercopy/等待/取消留在 syscall，协议调用与队列记账过队列；大改动，是 SMP 前置）；③ 维持现状，待 SMP 或真实延迟证据再动。单 hart 下 SIE 长区不直接损失吞吐（工作照做、IRQ 推迟），收益是延迟上界与 SMP 准备；当前无真实负载证据，暂不实施。 |
-| 块设备实际在途深度长期为 1–2 | 协商 indirect descriptors、加深队列并按配置分配请求槽；先测量平均/最大在途、queue-wait 与设备服务时间，再核对 flush 顺序、超时/reset 与 DMA owner。 |
 
 单 hart 已交付 OTHER/FIFO/RR 与全局实时带宽；后续调度改动以公平性/负载和实际消费者证据比较策略。第二架构按连续小里程碑推进；不等待 RV “全部完成”，也不复制整套通用内核。
 

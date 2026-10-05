@@ -614,3 +614,17 @@ TIMEOUT结果和最终回收。该改动提高下一次失败的可定位性，�
 重建：`python3 -B tests/host/virtio_block_diagnostics.py`；真实用例使用
 `make build/riscv/tests/kernel-io-sleep-rv build/host/nbd-fault`，随后运行
 `python3 -B tests/io-sleep-riscv.py --kernel build/riscv/tests/kernel-io-sleep-rv --transport legacy`。
+
+## 块设备在途深度实测（2026-10-05）
+
+时间加权计数器（inflight-ticks/busy-ticks/total-ticks/wait-ticks/service-ticks，
+见[块模块](../modules/riscv-virtio-block.md)）用于回答"设备是否长期只有 1–2 个
+在途"。musl 自动 `-a -r 1k -s 4m` 加四进程 `-t 4 -i A -i B` 同一 pilot 单启动
+（重建：`python3 -B tests/cost-riscv.py --kernel build/cost/kernel-rv --qemu
+qemu-system-riscv64 --case consumer --consumer-commands musl:0,musl:1 --replicas 1`）
+得到：设备请求 18157、峰值在途 8、忙时平均在途 1.31、设备空闲 86%、队列等待占忙时
+68%、平均服务 2631 ticks/请求（10 MHz timebase）。异步回写与超时场景能真正打满：
+io-sleep 超时阶段 inflight-ticks/busy-ticks ≈ 8.0（八请求扣满 30 秒期限）。结论：
+真实工作负载下设备大部分时间空闲、忙时深度接近 1，不满足"加深队列"的触发条件，
+队列深度与 indirect 不做；单副本 pilot 只用于归因，不是可比成绩。
+

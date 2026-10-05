@@ -135,6 +135,7 @@ struct block_request {
     struct kernel_wait_queue done;
     struct kernel_wait_queue *completion;
     uint64_t deadline;
+    uint64_t publish_time;
     uint32_t type, data_length;
     int bounce_used;
     unsigned char bounce[VIRTIO_BLOCK_SECTOR_SIZE];
@@ -210,6 +211,17 @@ static uint64_t time_now(void)
 
     __asm__ volatile("csrr %0, time" : "=r"(value));
     return value;
+}
+
+/* 在途深度变化前收口一段区间：累计 Σ深度·Δt 与忙时。 */
+static void account_inflight(struct riscv_virtio_mmio_block *device)
+{
+    uint64_t now = time_now();
+    uint64_t elapsed = now - device->statistics_last;
+
+    device->statistics.inflight_ticks += (uint64_t)device->inflight * elapsed;
+    if (device->inflight) device->statistics.busy_ticks += elapsed;
+    device->statistics_last = now;
 }
 
 static void bytes_zero(void *pointer, size_t size)
@@ -408,7 +420,9 @@ static void fail_device(struct riscv_virtio_mmio_block *device, enum kernel_bloc
             kernel_cost_sample_tag(r->cost_tag, (enum kernel_cost_metric)(metric + 7), kernel_cost_clock() - r->cost_start);
 #endif
             if (!device->inflight) __builtin_trap();
+            account_inflight(device);
             device->inflight--;
+            device->statistics.service_ticks += time_now() - r->publish_time;
             if (r->completion->head) device->statistics.wakes++;
             wake(r->completion);
         }
@@ -522,7 +536,9 @@ static void collect_used(struct riscv_virtio_mmio_block *device)
         kernel_cost_sample_tag(r->cost_tag, (enum kernel_cost_metric)(metric + 7), kernel_cost_clock() - r->cost_start);
 #endif
         if (!device->inflight) __builtin_trap();
+        account_inflight(device);
         device->inflight--;
+        device->statistics.service_ticks += time_now() - r->publish_time;
         if (r->result != KERNEL_BLOCK_STATUS_OK) device->statistics.io_errors++;
         if (r->completion->head) device->statistics.wakes++;
         wake(r->completion);
@@ -563,8 +579,10 @@ static int begin_call(struct riscv_virtio_mmio_block *device, int barrier)
         if (!device->irq_source) __builtin_trap();
         enum kernel_wait_wake_reason reason;
         device->statistics.queue_waits++;
+        uint64_t wait_start = time_now();
         if (kernel_scheduler_block_current(&device->available, 0, 0, &reason) != KERNEL_SCHEDULER_STATUS_OK)
             __builtin_trap();
+        device->statistics.queue_wait_ticks += time_now() - wait_start;
     }
     if (barrier) device->barrier_waiters--;
     riscv_interrupt_restore(irq); return 0;
@@ -602,8 +620,10 @@ static struct block_request *reserve_request(struct riscv_virtio_mmio_block *dev
         if (!device->irq_source) __builtin_trap();
         enum kernel_wait_wake_reason reason;
         device->statistics.queue_waits++;
+        uint64_t wait_start = time_now();
         if (kernel_scheduler_block_current(&device->available, 0, 0, &reason) != KERNEL_SCHEDULER_STATUS_OK)
             __builtin_trap();
+        device->statistics.queue_wait_ticks += time_now() - wait_start;
     }
     if (!device_live(device)) r = 0;
     riscv_interrupt_restore(irq); return r;
@@ -631,7 +651,10 @@ static enum kernel_block_status publish_request(struct riscv_virtio_mmio_block *
     r->header = (struct virtio_block_request_header){type, 0, sector};
     r->status = UINT8_MAX; r->state = 2;
     r->type = type; r->data_length = data_length; r->bounce_used = bounce;
-    r->deadline = time_now() + device->timeout_ticks;
+    uint64_t publish_now = time_now();
+    r->deadline = publish_now + device->timeout_ticks;
+    r->publish_time = publish_now;
+    account_inflight(device);
     device->statistics.requests++;
     device->inflight++;
 #if BOAROS_COST_DIAGNOSTICS
@@ -1061,8 +1084,10 @@ static enum kernel_block_status virtio_block_write_batch(void *context,
             else device->statistics.queue_waits++;
             /* Other calls may free slots while every request in this batch is
              * still pending. Their completion must also wake this publisher. */
+            uint64_t batch_wait_start = time_now();
             if (kernel_scheduler_block_current(&device->available, deadline, 0, &reason) != KERNEL_SCHEDULER_STATUS_OK)
                 __builtin_trap();
+            device->statistics.queue_wait_ticks += time_now() - batch_wait_start;
             if (reason == KERNEL_WAIT_TIMEOUT && device_live(device)) collect_used(device);
         }
         riscv_interrupt_restore(irq);
@@ -1102,6 +1127,8 @@ enum riscv_virtio_mmio_block_status riscv_virtio_mmio_block_init(
     /* 合法 FLUSH 可能等待宿主整份后备文件落盘；一秒不能判定设备故障。
      * 保留有限期限及原 reset/DMA owner 契约，乘法先提升避免频率溢出。 */
     result.timeout_ticks = (uint64_t)timebase_frequency * 30;
+    result.statistics_start = time_now();
+    result.statistics_last = result.statistics_start;
 
     if (mmio_read32(&result, VIRTIO_MMIO_MAGIC_VALUE_OFFSET) !=
         VIRTIO_MMIO_MAGIC_VALUE) {
@@ -1256,6 +1283,22 @@ enum riscv_virtio_mmio_block_status riscv_virtio_mmio_block_destroy(
     }
 
     if (device->active || device->available.head) return RISCV_VIRTIO_MMIO_BLOCK_STATUS_STATE;
+    /* 最终统计行：时间加权在途深度与等待/服务时间供真实窗口取证。 */
+    struct riscv_virtio_mmio_block_statistics statistics;
+    riscv_virtio_mmio_block_get_statistics(device, &statistics);
+    virt_uart_puts("BoarOS: block final device=");
+    virt_uart_put_hex((unsigned long)device->block.device_number);
+    virt_uart_puts(" requests="); virt_uart_put_hex(statistics.requests);
+    virt_uart_puts(" max-inflight="); virt_uart_put_hex(statistics.max_inflight);
+    virt_uart_puts(" inflight-ticks="); virt_uart_put_hex(statistics.inflight_ticks);
+    virt_uart_puts(" busy-ticks="); virt_uart_put_hex(statistics.busy_ticks);
+    virt_uart_puts(" total-ticks="); virt_uart_put_hex(statistics.total_ticks);
+    virt_uart_puts(" wait-ticks="); virt_uart_put_hex(statistics.queue_wait_ticks);
+    virt_uart_puts(" service-ticks="); virt_uart_put_hex(statistics.service_ticks);
+    virt_uart_puts(" timeouts="); virt_uart_put_hex(statistics.timeouts);
+    virt_uart_puts(" errors="); virt_uart_put_hex(statistics.io_errors);
+    virt_uart_puts(" flushes="); virt_uart_put_hex(statistics.flush_requests);
+    virt_uart_putc('\n');
     device_reset(device);
     if (device->irq_source) { riscv_plic_unregister(device->irq_source, device); device->irq_source = 0; }
     page_status = physical_page_release_order(device->page_allocator,
@@ -1289,5 +1332,11 @@ void riscv_virtio_mmio_block_get_statistics(
         return;
     }
 
+    uint64_t now = time_now();
     *statistics = device->statistics;
+    /* 查询时收口打开的区间，使深度与忙时覆盖到调用时刻。 */
+    uint64_t elapsed = now - device->statistics_last;
+    statistics->inflight_ticks += (uint64_t)device->inflight * elapsed;
+    if (device->inflight) statistics->busy_ticks += elapsed;
+    statistics->total_ticks = now - device->statistics_start;
 }
