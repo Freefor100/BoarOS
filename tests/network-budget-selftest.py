@@ -2,9 +2,11 @@
 """Host checks for receiver verification, case accounting, and the experiment driver."""
 import concurrent.futures
 import fcntl
+import os
 import importlib.util
 from pathlib import Path
 import subprocess
+import signal
 import tempfile
 import threading
 import unittest
@@ -120,9 +122,32 @@ class Workload(unittest.TestCase):
     def tearDownClass(cls):
         cls.temp.cleanup()
 
+    def test_start_barriers_tolerate_arrival_skew(self):
+        program = self.work / 'tcp-budget-stagger'
+        subprocess.run(['cc', '-O2', '-Wall', '-Wextra', '-Werror',
+                        str(ROOT / 'tests/workloads/network/tcp-budget.c'),
+                        str(ROOT / 'tests/host/network_budget_barrier.c'),
+                        '-Wl,--wrap=connect', '-Wl,--wrap=read', '-o', str(program)], check=True)
+        config = self.work / 'stagger-config'
+        config.write_text('loopback blocking rr 5 262144 32 rx\n')
+        process = subprocess.Popen([str(program), str(config)], text=True,
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                   start_new_session=True)
+        try:
+            try:
+                output, _ = process.communicate(timeout=3)
+            except subprocess.TimeoutExpired as error:
+                self.fail('start barrier stalled: ' + (error.output or b'').decode(errors='replace'))
+            self.assertEqual(process.returncode, 0, output)
+            self.assertIn('BUDGET PASS all', output)
+        finally:
+            try: os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError: pass
+            process.wait()
+
     def test_loopback_content_and_modes(self):
         for mode in ('blocking', 'nonblocking'):
-            for kind, direction, count in (('bulk', 'rx', 5), ('bulk', 'tx', 14), ('rr', 'rx', 1), ('mixed', 'tx', 5), ('mixed', 'rx', 5)):
+            for kind, direction, count in (('bulk', 'rx', 5), ('bulk', 'tx', 14), ('rr', 'rx', 1), ('rr', 'rx', 5), ('rr', 'rx', 14), ('mixed', 'tx', 5), ('mixed', 'rx', 5)):
                 with self.subTest(mode=mode, kind=kind, direction=direction):
                     case = budget.parse_case(f'loopback:{mode}:{kind}:{count}:{direction}', 262145, 32)
                     config = self.work / 'config'
