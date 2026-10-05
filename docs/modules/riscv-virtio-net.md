@@ -64,6 +64,14 @@ loopback 的协议 MTU=0 表示无 L2 限制，其公开逻辑 MTU 为 Linux 的
 
 ## 验证与固定资料
 
+`COST_DIAGNOSTICS=1` 的 final 行另报 `tx-done-free-*` 与 `tx-free-post-*` 的
+count、ticks、max、时钟频率和 overflow 标志，发布构建不增加时间戳或计数。
+DONE 从软件收割 used ring 开始，不是硬件 DMA 完成时刻；copy 完成直接归还计零。
+FREE→post 跟踪同一槽再次发布，包含正常空闲和排队时间，不能直接解释成可运行工作的
+延迟。首次使用没有 FREE 样本，reset 撤销未完成 owner 不计完成；统计范围为设备整个
+生命期，溢出会显式拒绝该实验结果。宿主模型在两种构建/传输下核对已知时间差、重复
+release、copy 与 abandon，实际进展仍由 worker/NIC-only 契约单独验证。
+
 ```sh
 make test-virtio-net-host test-lwip-reassembly-host test-ethernet-worker-host
 python3 -B tests/network-riscv.py --only boaros --workload interface
