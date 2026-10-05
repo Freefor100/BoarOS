@@ -32,6 +32,8 @@ BoarOS 是从零搭建、面向 OS Comp 能力建设的 C / 少量汇编内核�
 
 单 hart 存储等待已由运行期 IRQ 唤醒：两个不同文件冷读可同时在途，等待期间计算与无关缓存命中继续执行；OFD、inode、后端事务与退出清理各自保留 owner。八槽乱序完成、flush 屏障和超时 reset 在 legacy/modern、writeback/writethrough 四种组合验收，见[可睡眠存储](docs/learning/sleepable-storage.md)。
 
+双盘暂扣与故障隔离测试已修复单字节控制终端握手，并接入 CI 配置；本机原矩阵和 FIFO/RR 组合通过，托管 CI 状态另行核对。
+
 网络 worker 已在协议推进前归还 TX 完成槽，并在睡眠前复查新容量与收包；已验证两种 VirtIO 传输下的实际 TAP 程序，尚未以此声明吞吐收益。
 
 文件追加增长已与截断分离：对齐增长不遍历缓存页，非对齐增长只处理旧 EOF 尾页；1–64 MiB 的实际页缓存规模门禁保护这一成本界，未把计数下降换算为吞吐提升。

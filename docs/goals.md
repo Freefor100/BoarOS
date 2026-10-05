@@ -21,7 +21,7 @@ N3已经交付：legacy/modern VirtIO-net、受限DMA借用与复制回退、静
 | TX 完成进展纠错 | worker先收割并释放完成槽，再推进协议；睡眠前覆盖SG与复制路径的新容量。宿主顺序/关闭窗口、真实两种TAP传输和无NIC定时器验证通过；见[网络owner](learning/network-ownership.md)。 |
 | 追加增长纠错 | 增长与截断分离；对齐增长不扫描缓存页链，非对齐增长仅处理旧尾页。1/4/16/64 MiB 成本门禁与真实文件/映射回归通过，吞吐尚未重测；见[规模成本](learning/single-hart-scale.md)。 |
 | epoll 交付纠错 | 完整 event 复制后提交 ET/ONESHOT；独立扫描/pending、MOD 代次与任务退出 owner 已接入。生产函数宿主边界及固定 Linux 同 RV64 ELF 验证通过；见[事件交付](learning/epoll-delivery.md)。 |
-| 本机 multi-disk-io 测试 | `make test-multi-disk-io-riscv` 在基线 `3c34091` 上同样失败：guest 在 B 盘暂扣阶段挂住，harness 90 秒后超时；CI 不运行该目标，本会话改动 A/B 均复现，因果待独立定位。 |
+| 双盘控制协议纠错 | 原基线 `3c34091`/`5687377` 的暂扣阶段超时已定位为规范模式终端等待行结束：host只发送单字节g，尚未出现B盘暂扣READ。guest显式设置并恢复控制终端后，暂扣/故障/重启和FIFO/RR四组合通过；已加入CI目标，尚无本提交的托管CI结果。见[可睡眠存储](learning/sleepable-storage.md)。 |
 
 [风险证据与重建](learning/cost-baseline.md#旧版内存释放与-virtqueue-告警2026-10-02)
 区分已经修复的机制与缺少历史现场的归因。固定root、单hart、QEMU和选定应用验收

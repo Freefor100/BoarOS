@@ -368,3 +368,7 @@ OFD 和控制终端保活配对，配对持有挂载 root/path 引用；挂载�
 而 worker 不永久 pin 自己的 root。卸载须先确认外部引用消失、停止并 join worker，
 再释放后端。TTY 的内部 base 引用不形成配对引用环。仅支持单 hart 的发布契约，
 不能把此实现作为跨核路径与 TTY 同步已经成立的证据。
+
+双盘暂扣/错误隔离门禁由guest显式配置单字节控制终端，避免规范输入阻塞握手；
+`make test-multi-disk-io-riscv test-multi-disk-rt-riscv`覆盖原故障/重启和实时负载。
+runner超时保存token及guest/NBD边界现场，CI已接入原双盘目标，见[可睡眠存储](../learning/sleepable-storage.md)。

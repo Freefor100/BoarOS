@@ -2,6 +2,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
+#include <stdlib.h>
+#include <termios.h>
 #include <sched.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
@@ -14,6 +16,26 @@
 #include <unistd.h>
 
 #define CHECK(x) do { if (!(x)) { dprintf(2, "multi-disk failure line=%d errno=%d: %s\n", __LINE__, errno, #x); return 1; } } while (0)
+static struct termios control_settings;
+static void restore_control(void)
+{
+    if (tcsetattr(0, TCSANOW, &control_settings)) {
+        dprintf(2, "multi-disk failure restoring control terminal errno=%d\n", errno);
+        _Exit(1);
+    }
+}
+static int prepare_control(void)
+{
+    CHECK(tcgetattr(0, &control_settings) == 0);
+    struct termios settings = control_settings;
+    /* host发送单字节token；不能依赖UART默认行规程恰好为raw。 */
+    settings.c_lflag &= ~(ICANON | ECHO);
+    settings.c_cc[VMIN] = 1;
+    settings.c_cc[VTIME] = 0;
+    CHECK(atexit(restore_control) == 0);
+    CHECK(tcsetattr(0, TCSANOW, &settings) == 0);
+    return 0;
+}
 static int token(void) { char c; return read(0, &c, 1) == 1 && c == 'g'; }
 static int directory(const char *p) { return !mkdir(p,0755) || errno == EEXIST; }
 static int verify(int fd, const char *value)
@@ -98,6 +120,7 @@ static int rt_load(int a, int b)
 int main(void)
 {
     setvbuf(stdout, 0, _IONBF, 0);
+    CHECK(prepare_control() == 0);
     CHECK(directory("/second"));
     CHECK(!mknod("/disk-b", S_IFBLK|0600,makedev(252,16)) || errno == EEXIST);
     int phase = open("/phase", O_RDONLY);
