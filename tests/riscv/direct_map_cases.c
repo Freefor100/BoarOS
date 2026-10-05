@@ -101,5 +101,54 @@ int run_direct_map_tests(void)
         return 12;
     }
 
+    extern unsigned char __kernel_start[];
+    extern unsigned char __kernel_end[];
+    uint64_t start = (uint64_t)(uintptr_t)__kernel_start;
+    uint64_t end = (uint64_t)(uintptr_t)__kernel_end;
+    uint64_t sentinel = UINT64_C(0x1122334455667788);
+
+    address = sentinel;
+    /* 测试内核不经过main.c，未绑定加载偏移时镜像换算必须拒绝。 */
+    if (riscv_image_va_to_pa(start, 1U, &address) !=
+            RISCV_DIRECT_MAP_STATUS_INVALID ||
+        address != sentinel) {
+        return 13;
+    }
+    riscv_image_bind_load_offset(UINT64_C(0x1000));
+    if (riscv_image_va_to_pa(start + UINT64_C(0x80), UINT64_C(0x40),
+                             &address) !=
+            RISCV_DIRECT_MAP_STATUS_OK ||
+        address != start + UINT64_C(0x80) - UINT64_C(0x1000)) {
+        return 14;
+    }
+    if (riscv_image_va_to_pa(end - 1U, 1U, &address) !=
+            RISCV_DIRECT_MAP_STATUS_OK ||
+        address != end - 1U - UINT64_C(0x1000)) {
+        return 15;
+    }
+    address = sentinel;
+    if (riscv_image_va_to_pa(end - 1U, 2U, &address) !=
+            RISCV_DIRECT_MAP_STATUS_INVALID ||
+        address != sentinel) {
+        return 16;
+    }
+    /* end 及其之上必须拒绝：end-va 曾在 va>end 时下溢并放行越界地址。 */
+    if (riscv_image_va_to_pa(end, 1U, &address) !=
+            RISCV_DIRECT_MAP_STATUS_INVALID ||
+        address != sentinel) {
+        return 17;
+    }
+    if (riscv_image_va_to_pa(end + UINT64_C(0x1000), 8U, &address) !=
+            RISCV_DIRECT_MAP_STATUS_INVALID ||
+        address != sentinel ||
+        riscv_image_va_to_pa(start - 1U, 1U, &address) !=
+            RISCV_DIRECT_MAP_STATUS_INVALID ||
+        riscv_image_va_to_pa(start, 0U, &address) !=
+            RISCV_DIRECT_MAP_STATUS_INVALID ||
+        riscv_image_va_to_pa(start, 1U, 0) !=
+            RISCV_DIRECT_MAP_STATUS_INVALID) {
+        return 18;
+    }
+
     return 0;
 }

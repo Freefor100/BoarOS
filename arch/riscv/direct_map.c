@@ -65,7 +65,8 @@ enum riscv_direct_map_status riscv_image_va_to_pa(
     uint64_t end = (uint64_t)(uintptr_t)__kernel_end;
 
     if (image_load_offset == 0 || physical_address == 0 || size == 0 ||
-        virtual_address < start || size > end - virtual_address) {
+        virtual_address < start || virtual_address >= end ||
+        size > end - virtual_address) {
         return RISCV_DIRECT_MAP_STATUS_INVALID;
     }
     *physical_address = virtual_address - image_load_offset;
