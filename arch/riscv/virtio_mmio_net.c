@@ -8,7 +8,12 @@
 #include <string.h>
 
 enum { RX_FREE, RX_POSTED, RX_READY, RX_CPU, RX_LOAN };
-enum { TX_FREE, TX_PENDING, TX_POSTED };
+enum { TX_FREE, TX_PENDING, TX_POSTED, TX_DONE };
+_Static_assert(RISCV_NET_TX_TABLE_OFFSET % 16U == 0U &&
+               RISCV_NET_TX_TABLE_OFFSET +
+                   (RISCV_NET_TX_SEGMENTS + 1U) * 16U <=
+                   RISCV_NET_BUFFER_SIZE,
+               "TX indirect table must fit 16-byte aligned in a slot");
 struct net_descriptor { uint64_t address; uint32_t length; uint16_t flags, next; };
 struct net_used { uint32_t id, length; };
 
@@ -67,9 +72,15 @@ static void flush_tx(struct riscv_virtio_mmio_net *d)
         if (d->tx_state[b] != TX_PENDING) __builtin_trap();
         d->tx_state[b] = TX_POSTED; d->tx_map[id] = (uint16_t)b;
         struct net_descriptor *desc = queue(d, 1);
-        /* TX长度保存在独立buffer记录，不能从上次同head的描述符继承。 */
-        uint16_t length; memcpy(&length, (char *)d->tx_memory + b * 2048, sizeof(length));
-        desc[id] = (struct net_descriptor){ d->tx_phys + b * 2048 + padding(d), length, 0, 0 };
+        if (d->tx_owner[b]) {
+            /* 零拷贝：主描述符指向槽内 indirect 表（头+各段），不复制 payload。 */
+            desc[id] = (struct net_descriptor){ d->tx_phys + b * 2048 +
+                    RISCV_NET_TX_TABLE_OFFSET, d->tx_table[b], 4U, 0 };
+        } else {
+            /* TX长度保存在独立buffer记录，不能从上次同head的描述符继承。 */
+            uint16_t length; memcpy(&length, (char *)d->tx_memory + b * 2048, sizeof(length));
+            desc[id] = (struct net_descriptor){ d->tx_phys + b * 2048 + padding(d), length, 0, 0 };
+        }
         d->tx_time[b] = riscv_time_read();
         d->tx_posted |= UINT32_C(1) << id;
         publish(d, 1, id);
@@ -96,6 +107,38 @@ static void fail(struct riscv_virtio_mmio_net *d, const char *reason, unsigned q
         diagnostic_text(" consumed="); diagnostic_hex(d->consumed[q]);
         diagnostic_text(" posted="); diagnostic_hex(q ? d->tx_posted : d->rx_posted);
         diagnostic_text("\n");
+        /* 槽级快照：只读驱动自有数组与队列索引，不追描述符地址、不分配。 */
+        volatile uint16_t *used_words = (void *)((unsigned char *)d->queues + used_offset(d));
+        diagnostic_text("BoarOS: VirtIO-net slots version="); diagnostic_hex(d->version);
+        diagnostic_text(" status="); diagnostic_hex(rd(d, 0x70));
+        diagnostic_text(" irq="); diagnostic_hex(d->irq_source);
+        diagnostic_text(" configured="); diagnostic_hex(d->configured);
+        diagnostic_text(" link="); diagnostic_hex(d->link_up);
+        diagnostic_text(" loaned="); diagnostic_hex(d->loaned);
+        diagnostic_text(" ready="); diagnostic_hex(d->ready_count);
+        diagnostic_text(" pending="); diagnostic_hex(d->tx_count);
+        diagnostic_text(" done="); diagnostic_hex(d->tx_done_count);
+        diagnostic_text(" used="); diagnostic_hex(used_words[1]);
+        diagnostic_text(" avail-rx="); diagnostic_hex(d->available[0]);
+        diagnostic_text(" avail-tx="); diagnostic_hex(d->available[1]);
+        diagnostic_text("\n");
+        for (unsigned b = 0; b < RISCV_NET_BUFFERS; b++) {
+            if (d->rx_state[b] != RX_FREE) {
+                diagnostic_text("BoarOS: VirtIO-net rx buffer="); diagnostic_hex(b);
+                diagnostic_text(" state="); diagnostic_hex(d->rx_state[b]);
+                diagnostic_text(" length="); diagnostic_hex(d->rx_length[b]);
+                diagnostic_text("\n");
+            }
+        }
+        for (unsigned b = 0; b < RISCV_NET_BUFFERS; b++) {
+            if (d->tx_state[b] != TX_FREE) {
+                diagnostic_text("BoarOS: VirtIO-net tx buffer="); diagnostic_hex(b);
+                diagnostic_text(" state="); diagnostic_hex(d->tx_state[b]);
+                diagnostic_text(" age="); diagnostic_hex(riscv_time_read() - d->tx_time[b]);
+                diagnostic_text(" owner="); diagnostic_hex((uintptr_t)d->tx_owner[b]);
+                diagnostic_text("\n");
+            }
+        }
     }
     d->failed = 1;
     wake(d);
@@ -134,7 +177,14 @@ static void harvest(struct riscv_virtio_mmio_net *d)
                 }
             }
             *posted &= ~(UINT32_C(1) << e.id); d->consumed[q]++;
-            if (q) d->tx_state[b] = TX_FREE;
+            if (q) {
+                if (d->tx_owner[b]) {
+                    if (d->tx_done_count == RISCV_NET_BUFFERS) __builtin_trap();
+                    d->tx_state[b] = TX_DONE;
+                    d->tx_done[(d->tx_done_head + d->tx_done_count++) %
+                               RISCV_NET_BUFFERS] = (uint16_t)b;
+                } else d->tx_state[b] = TX_FREE;
+            }
             else {
                 if (d->ready_count == 64) __builtin_trap();
                 d->rx_state[b] = RX_READY; d->rx_length[b] = (uint16_t)(e.length - header(d));
@@ -186,7 +236,7 @@ int riscv_virtio_mmio_net_init(struct riscv_virtio_mmio_net *d, volatile void *m
     wr(d, 0x70, 1); wr(d, 0x70, 3); wr(d, 0x14, 0);
     uint32_t features = rd(d, 0x10);
     if (!(features & (1U << 5))) { error = -KERNEL_ENOTSUP; goto failed; }
-    d->feature_low = features & ((1U << 5) | (1U << 16));
+    d->feature_low = features & ((1U << 5) | (1U << 16) | (1U << 28));
     wr(d, 0x24, 0); wr(d, 0x20, d->feature_low);
     if (version == 2) {
         wr(d, 0x14, 1);
@@ -299,11 +349,79 @@ int riscv_virtio_mmio_net_send_copy(struct riscv_virtio_mmio_net *d, uint32_t si
     d->tx_state[b] = TX_PENDING;
     d->tx_pending[(d->tx_head + d->tx_count++) % 64] = (uint16_t)b;
     d->statistics.tx_packets++; d->statistics.tx_bytes += size;
+    d->statistics.tx_copy_packets++;
     flush_tx(d); wake(d);
     riscv_interrupt_restore(saved); return (int)size;
 }
 static int copy_data(const void *source, void *destination, uint32_t size)
 { memcpy(destination, source, size); return 1; }
+int riscv_virtio_mmio_net_send_segments(struct riscv_virtio_mmio_net *d,
+    const struct riscv_net_tx_segment *segments, unsigned count, void *owner)
+{
+    if (!segments || count == 0U || count > RISCV_NET_TX_SEGMENTS) return -KERNEL_EMSGSIZE;
+    uint64_t total = 0;
+    for (unsigned i = 0; i < count; i++) {
+        if (segments[i].length == 0U) return -KERNEL_EMSGSIZE;
+        total += segments[i].length;
+    }
+    if (total > 1514U) return -KERNEL_EMSGSIZE;
+    uintptr_t saved = riscv_interrupt_save();
+    if (!(d->feature_low & (1U << 28))) { riscv_interrupt_restore(saved); return -KERNEL_ENOTSUP; }
+    check_status(d);
+    if (d->failed) { riscv_interrupt_restore(saved); return -KERNEL_EIO; }
+    if (d->stopping || !d->configured || !d->link_up) { riscv_interrupt_restore(saved); return -KERNEL_ENETDOWN; }
+    harvest(d);
+    unsigned b; for (b = 0; b < RISCV_NET_BUFFERS; b++) if (d->tx_state[b] == TX_FREE) break;
+    if (b == RISCV_NET_BUFFERS || d->failed) {
+        riscv_interrupt_restore(saved);
+        return d->failed ? -KERNEL_EIO : -KERNEL_EAGAIN;
+    }
+    unsigned h = header(d);
+    memset(tx_data(d, b), 0, h);
+    struct net_descriptor *table = (void *)((char *)d->tx_memory +
+        b * RISCV_NET_BUFFER_SIZE + RISCV_NET_TX_TABLE_OFFSET);
+    table[0] = (struct net_descriptor){ d->tx_phys + b * RISCV_NET_BUFFER_SIZE +
+        padding(d), h, 1U, 1U };
+    for (unsigned i = 0; i < count; i++) {
+        table[1 + i] = (struct net_descriptor){ segments[i].physical_address,
+            segments[i].length, i + 1U < count ? 1U : 0U, (uint16_t)(i + 2U) };
+    }
+    d->tx_table[b] = (uint16_t)((count + 1U) * 16U);
+    d->tx_owner[b] = owner;
+    d->tx_state[b] = TX_PENDING;
+    d->tx_pending[(d->tx_head + d->tx_count++) % RISCV_NET_BUFFERS] = (uint16_t)b;
+    d->statistics.tx_packets++; d->statistics.tx_bytes += total;
+    d->statistics.tx_sg_packets++;
+    flush_tx(d); wake(d);
+    riscv_interrupt_restore(saved);
+    return 0;
+}
+void riscv_virtio_mmio_net_tx_release(struct riscv_virtio_mmio_net *d,
+    void (*release)(void *owner), int abandon)
+{
+    if (!d || !release) return;
+    uintptr_t saved = riscv_interrupt_save();
+    if (abandon) {
+        /* reset/stop 已确认 DMA 停止，归还所有仍持有的 owner。 */
+        for (unsigned b = 0; b < RISCV_NET_BUFFERS; b++) {
+            if (!d->tx_owner[b]) continue;
+            release(d->tx_owner[b]);
+            d->tx_owner[b] = 0;
+            d->tx_state[b] = TX_FREE;
+        }
+        d->tx_head = 0; d->tx_count = 0; d->tx_done_head = 0; d->tx_done_count = 0;
+    } else {
+        while (d->tx_done_count) {
+            unsigned b = d->tx_done[d->tx_done_head++ % RISCV_NET_BUFFERS];
+            d->tx_done_count--;
+            if (d->tx_state[b] != TX_DONE || !d->tx_owner[b]) __builtin_trap();
+            release(d->tx_owner[b]);
+            d->tx_owner[b] = 0;
+            d->tx_state[b] = TX_FREE;
+        }
+    }
+    riscv_interrupt_restore(saved);
+}
 int riscv_virtio_mmio_net_send(struct riscv_virtio_mmio_net *d, const void *data, uint32_t size)
 {
     if (!data) return -KERNEL_EINVAL;

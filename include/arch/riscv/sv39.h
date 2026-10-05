@@ -89,6 +89,27 @@ enum riscv_sv39_status riscv_sv39_map_range(
 enum riscv_sv39_status riscv_sv39_activate(
     struct riscv_sv39_page_table *table);
 
+/*
+ * Kernel stack window: reserve the empty subtree while the table is
+ * BUILDING so every later user root copy inherits it, then insert and
+ * remove 4 KiB leaves at runtime.  The window must stay inside one root
+ * index; unmapped pages inside it fault instead of following a fallback.
+ * The runtime allocator is passed per call: reserve runs before relocation,
+ * so it must not capture pointers.
+ */
+enum riscv_sv39_status riscv_sv39_kernel_window_reserve(
+    struct riscv_sv39_page_table *table,
+    uint64_t virtual_address,
+    uint64_t size);
+int riscv_sv39_kernel_window_active(void);
+enum riscv_sv39_status riscv_sv39_kernel_window_map(
+    struct physical_page_allocator *allocator,
+    uint64_t virtual_address,
+    uint64_t physical_address);
+enum riscv_sv39_status riscv_sv39_kernel_window_unmap(
+    struct physical_page_allocator *allocator,
+    uint64_t virtual_address);
+
 uint64_t riscv_sv39_current_satp(void);
 
 /* Only Bare or Sv39 with ASID 0 is accepted. */

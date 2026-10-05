@@ -1,6 +1,7 @@
 #include <arch/riscv/context.h>
 #include <arch/riscv/fpu.h>
 #include <arch/riscv/sbi.h>
+#include <arch/riscv/timer.h>
 #include <arch/riscv/thread.h>
 #include <arch/riscv/trap.h>
 #include <arch/riscv/virt_uart.h>
@@ -23,8 +24,9 @@ extern unsigned char __boot_stack_top[];
 /* One buddy metadata page plus enough alignment slack for two tasks. */
 #define TEST_PAGE_COUNT (2U + TEST_THREAD_COUNT * TEST_TASK_PAGES)
 
-/* Later concurrency cases use a fresh allocator with room for 32 waiters. */
-static unsigned char page_pool[BOAROS_PAGE_SIZE * (TEST_PAGE_COUNT + 36U * TEST_TASK_PAGES)]
+/* Later concurrency cases use a fresh allocator with room for 32 waiters
+ * plus the four concurrent deadline waiters and their retained pages. */
+static unsigned char page_pool[BOAROS_PAGE_SIZE * (TEST_PAGE_COUNT + 44U * TEST_TASK_PAGES)]
     __attribute__((aligned(BOAROS_PAGE_SIZE)));
 static unsigned long access_calls_before_failure;
 static unsigned long fail_access_count;
@@ -917,6 +919,140 @@ static unsigned long run_stack_contract_cases(
     return failures + stack_contract_failures;
 }
 
+static unsigned long io_buffer_failures;
+static uint64_t io_buffer_pages[2];
+
+static void io_buffer_worker(void *argument)
+{
+    unsigned slot = (unsigned)(uintptr_t)argument;
+    uint64_t available = physical_page_available(test_page_allocator);
+    struct kernel_task_io_buffer first = {0};
+    struct kernel_task_io_buffer second = {0};
+    uint64_t first_page = 0U;
+    void *first_data = 0;
+    if (kernel_task_io_buffer_acquire(&first, test_page_allocator) !=
+        KERNEL_TASK_STATUS_OK) {
+        io_buffer_failures++;
+    } else {
+        first_page = first.physical_address;
+        first_data = first.data;
+        kernel_task_io_buffer_release(&first);
+    }
+    if (kernel_task_io_buffer_acquire(&second, test_page_allocator) !=
+        KERNEL_TASK_STATUS_OK) {
+        io_buffer_failures++;
+        return;
+    }
+    /* 顺序调用复用任务的常驻 scratch 页：第二次不再分配，释放后仍归任务。 */
+    if (physical_page_available(test_page_allocator) != available - 1U)
+        io_buffer_failures++;
+    if (second.physical_address != first_page || second.data != first_data)
+        io_buffer_failures++;
+    if (second.allocator != test_page_allocator ||
+        second.task != kernel_task_current())
+        io_buffer_failures++;
+    if (slot < 2U)
+        io_buffer_pages[slot] = second.physical_address;
+    kernel_task_io_buffer_release(&second);
+    if (physical_page_available(test_page_allocator) != available - 1U)
+        io_buffer_failures++;
+}
+
+static unsigned long run_io_buffer_cases(
+    struct physical_page_allocator *allocator)
+{
+    uint64_t available = physical_page_available(allocator);
+    struct kernel_thread_completion completion;
+    unsigned long failures = 0U;
+    /* 两个任务各自保留自己的 scratch 页，页身份不得相同：任务间共享或
+     * 继承同一页会在这里暴露，并在销毁时表现为重复释放。 */
+    for (unsigned slot = 0U; slot < 2U; slot++) {
+        failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
+            kernel_thread_create(io_buffer_worker, (void *)(uintptr_t)slot));
+        failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
+                                  kernel_scheduler_on_tick(1U));
+    }
+    if (io_buffer_pages[0] == 0U || io_buffer_pages[1] == 0U ||
+        io_buffer_pages[0] == io_buffer_pages[1])
+        io_buffer_failures++;
+    for (unsigned slot = 0U; slot < 2U; slot++)
+        failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
+                                  kernel_scheduler_reap_one(&completion));
+    /* 任务销毁后常驻页必须归还分配器。 */
+    if (physical_page_available(allocator) != available) failures++;
+    return failures + io_buffer_failures;
+}
+
+static struct kernel_wait_queue deadline_queue;
+static uint64_t deadline_case_ticks[4];
+static unsigned deadline_wake_order[4];
+static unsigned deadline_wake_count;
+
+static void deadline_waiter(void *argument)
+{
+    unsigned slot = (unsigned)(uintptr_t)argument;
+    enum kernel_wait_wake_reason reason;
+    (void)riscv_interrupt_save();
+    if (kernel_scheduler_block_current(&deadline_queue,
+            deadline_case_ticks[slot], 0, &reason) !=
+        KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
+    if (deadline_wake_count < 4U)
+        deadline_wake_order[deadline_wake_count++] = slot;
+}
+
+static unsigned long run_deadline_cases(
+    struct physical_page_allocator *allocator)
+{
+    uint64_t available = physical_page_available(allocator);
+    struct kernel_thread_completion completion;
+    unsigned long failures = 0U;
+    uint64_t now = riscv_time_read();
+
+    kernel_wait_queue_init(&deadline_queue);
+    deadline_wake_count = 0U;
+    for (unsigned slot = 0U; slot < 4U; slot++) {
+        deadline_case_ticks[slot] = now + 1000U * (slot + 1U);
+        failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
+            kernel_thread_create(deadline_waiter, (void *)(uintptr_t)slot));
+    }
+    /* 阻塞会链式切换到下一个 ready 成员，一次 tick 让四个等待者全部就位。 */
+    failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
+                              kernel_scheduler_on_tick(1U));
+
+    /* timer 重装必须包含最早的阻塞期限。 */
+    if (scheduler.armed_deadline != deadline_case_ticks[0]) failures++;
+
+    /* 到期扫描只处理已到期者；未到期成员保持阻塞。 */
+    failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
+        kernel_scheduler_expire_deadlines(now + 1500U));
+    failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
+                              kernel_scheduler_on_tick(1U));
+    if (deadline_wake_count != 1U || deadline_wake_order[0] != 0U) failures++;
+
+    /* 事件唤醒必须摘除期限索引项并且不再被到期重复唤醒。fixture 的退出
+     * 路径回到 idle，因此每个被唤醒成员需要各自一次调度。 */
+    failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
+                              kernel_wait_queue_wake_all(&deadline_queue));
+    for (unsigned slot = 0U; slot < 3U; slot++)
+        failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
+                                  kernel_scheduler_on_tick(1U));
+    if (deadline_wake_count != 4U || deadline_wake_order[1] != 1U ||
+        deadline_wake_order[2] != 2U || deadline_wake_order[3] != 3U)
+        failures++;
+    failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
+        kernel_scheduler_expire_deadlines(now + 100000U));
+    if (deadline_wake_count != 4U) failures++;
+
+    for (unsigned slot = 0U; slot < 4U; slot++)
+        failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
+                                  kernel_scheduler_reap_one(&completion));
+    failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
+                              kernel_scheduler_on_tick(1U));
+    /* 成员全部销毁后，硬件事件不再携带阻塞期限。 */
+    if (scheduler.armed_deadline != 0U) failures++;
+    return failures + (physical_page_available(allocator) != available);
+}
+
 static struct kernel_rwlock io_lock;
 static unsigned sync_order, sync_failures;
 static void sync_reader(void *arg)
@@ -1148,10 +1284,11 @@ void kernel_main(unsigned long hart_id, const void *dtb)
     failures += run_fpu_cases();
     failures += run_stack_contract_cases(&allocator);
     failures += run_sync_cases(&allocator);
+    failures += run_io_buffer_cases(&allocator);
+    failures += run_deadline_cases(&allocator);
     failures += run_idle_irq_return_case(&allocator);
     failures += run_handoff_cases(&allocator);
     failures += run_exit_dispatch_case(&allocator);
-
     virt_uart_puts("BoarOS: scheduler cases failures=");
     virt_uart_put_hex(failures);
     virt_uart_putc('\n');

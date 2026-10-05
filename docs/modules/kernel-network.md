@@ -22,7 +22,7 @@ IPv4 重组键包括源/目的地址、IP ID、协议号和输入 netif 身份�
 
 普通 socket read/readv 使用“预留队首片段→按偏移复制→提交/取消”。用户容量决定 UDP 的截断长度，一个报文可经请求持有的 4 KiB 页反复复制，最终只消费一次；不能以内部暂存容量截断报文。零长度 datagram 也必须完成 reservation；TCP EOF 没有 reservation。TCP 在用户容量内继续读取已排队片段，取得进展后不等待新数据。每段完整复制后才消费；当前段 fault 保留整段，返回先前已提交的字节数，没有先前进展则 EFAULT。UDP fault 丢弃当前 datagram。read reservation 独占队首，第二个 read/recvfrom 不得越过它。
 
-请求 scratch 页由 `kernel_task_io_buffer` 持有，按需分配并登记在当前任务；分配失败返回 ENOMEM，不预留或消费队首。正常返回解除登记并释放物理页，强制退出先取消 read reservation／释放其 OFD pin，再释放 scratch，之后才释放任务文件表和栈。没有用户任务的模块测试沿正常返回路径回收。socket 普通 write/writev 同样使用请求页，按用户页和协议剩余空间提交；不再每 64 字节调用 tcp_write。`kernel_socket_get_statistics` 提供单 hart 累计 tcp_write 调用及成功复制字节数，`kernel_uaccess_page_resolutions` 记录用户页解析尝试。计数没有新增用户 ABI。
+请求 scratch 页由任务持有并在多次调用间复用（首次使用时分配），调用期间登记在当前任务；分配失败返回 ENOMEM，不预留或消费队首。正常返回解除登记，物理页保留至任务最终存储释放；强制退出先取消 read reservation／释放其 OFD pin，再解除登记，之后才释放任务文件表和栈。没有用户任务的模块测试按调用分配并沿正常返回路径释放。socket 普通 write/writev 同样使用请求页，按用户页和协议剩余空间提交；不再每 64 字节调用 tcp_write。`kernel_socket_get_statistics` 提供单 hart 累计 tcp_write 调用及成功复制字节数，`kernel_uaccess_page_resolutions` 记录用户页解析尝试。计数没有新增用户 ABI。
 
 `recvfrom` 的缓冲区范围在等待空 UDP socket 前检查，负 socklen_t 返回 EINVAL；accept/recvfrom 的地址输出错误发生在协议 dequeue 后，与固定 Linux 顺序一致。
 
@@ -30,7 +30,7 @@ IPv4 重组键包括源/目的地址、IP ID、协议号和输入 netif 身份�
 先标记/唤醒，保存的syscall栈返回后才在user-return处理终止；正常和取消路径
 均须平衡临时owner。以后若允许直接抛弃内核调用栈，必须重新审计这条契约。
 
-TCP `POLLOUT` 同时要求发送缓冲和队列空间。`tcp_write` 还可能因全局 segment/pbuf 池满而返回 `ERR_MEM`，此时 socket 撤下可写事件并登记有界重试期限；ACK、成功写、错误或销毁解除登记。等待者取最近的 lwIP 协议和写重试期限，池释放后即使没有 ACK 也能继续，而不会因虚假的 `POLLOUT` 在单 hart 上空转。`F_SETFL(F_GETFL|O_NONBLOCK)` 接受已有 access mode 位，只更新可变状态位。
+TCP `POLLOUT` 同时要求发送缓冲和队列空间。`tcp_write` 还可能因全局 segment/pbuf 池满而返回 `ERR_MEM`，此时 socket 撤下可写事件并登记有界重试期限；ACK、成功写、错误或销毁解除登记。重试链按期限有序，等待者只读链首与最近的 lwIP 协议期限，池释放后即使没有 ACK 也能继续，而不会因虚假的 `POLLOUT` 在单 hart 上空转。`F_SETFL(F_GETFL|O_NONBLOCK)` 接受已有 access mode 位，只更新可变状态位。
 
 关闭活动 TCP 连接先解绑全部指向 BoarOS socket 的回调，再 `tcp_close`；协议 FIN/TIME_WAIT 可能暂占静态 PCB/segment 池，随后由定时器回收。这与内核堆对象生命周期分开。
 
@@ -177,12 +177,16 @@ UNIX DGRAM自身SHUT_RD后，即使空队列也有IN/RDNORM和RDHUP；双向关�
 官方Ethernet入口接纳custom pbuf，启用ARP及48 pbuf/8对象的IPv4重组；MTU1500、
 MAC来自设备、静态地址由构建配置决定。RX loan直到最后协议/reservation引用释放；
 回退与UDP接纳保留控制余量。IRQ只收割，raw API在单hart临界区串行；worker每批
-八帧，失败NIC也继续共享loopback与协议定时器。停止join、清理接口引用、reset确认，
-真实借用未归还时保留owner。接口查询来自真实netif，DOWN撤下RUNNING。
+八帧，失败NIC也继续共享loopback与协议定时器。无NIC时同一owner退化为
+timer-only worker：推进协议定时器并按min(下一socket期限, now+5×frequency)
+睡眠，最后的OFD定时回收不再依赖用户再次进入syscall。停止join、清理接口引用、
+reset确认；设备失败不等于DMA停止，TX在途owner与RX借用一律保留到reset确认，
+已完成owner在worker归还。接口查询来自真实netif，DOWN撤下RUNNING。
 详细预算、寄存器、失败与验证命令见[网卡模块](riscv-virtio-net.md)。
 
 两种transport与两种libc的原wget/httpd均完成双向GET、CGI上传与文本POST。
 固定单/五TCP及UDP内容、压力下TCP进展、块/RNG混合IRQ、最终heap live=0已核对；
-完整1196 ABI、RV64、真实libc、scale和栈检查通过。零拷贝仅去掉DMA到pbuf一跳，
-用户接收和TX复制仍在；没有外部IPv6、DHCP/DNS/TLS或默认网关。结果、效率、
+完整1196 ABI、RV64、真实libc、scale和栈检查通过。TX 已用 indirect 表做零拷贝
+（每包最多两段镜像内 payload，其余回退复制），用户接收复制仍在；没有外部IPv6、
+DHCP/DNS/TLS或默认网关。结果、效率、
 程序与最终卸载计时边界见[真实网卡记录](../learning/network-ownership.md#真实-virtio-net-与宿主应用交付2026-10-02)。

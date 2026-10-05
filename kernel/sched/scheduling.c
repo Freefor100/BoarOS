@@ -76,6 +76,11 @@ void scheduler_rearm_timer(void)
         if (status == KERNEL_TIME_STATUS_DEADLINE_PASSED) deadline = riscv_time_read() + 1U;
         else if (status != KERNEL_TIME_STATUS_OK) __builtin_trap();
     }
+    /* 最早阻塞期限与 RT/时间片预算同为 tick 域；取最小者编入硬件事件。 */
+    struct kernel_task *blocked = deadline_index_first();
+    if (blocked != 0 && (!deadline || blocked->wakeup_deadline < deadline))
+        deadline = blocked->wakeup_deadline;
+    scheduler.armed_deadline = deadline;
     enum riscv_timer_status status = riscv_timer_set_scheduler_deadline(deadline);
     if (status != RISCV_TIMER_STATUS_OK && status != RISCV_TIMER_STATUS_NOT_STARTED)
         __builtin_trap();

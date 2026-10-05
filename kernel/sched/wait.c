@@ -42,6 +42,146 @@ void blocked_unlink(struct kernel_task *thread)
     thread->next = 0;
 }
 
+/*
+ * Tasks with a timeout enter an intrusive AVL keyed by (deadline, tid).
+ * Insertion happens once per block, removal rides the single wake path
+ * (scheduler_wake_task), and expiry pops only the earliest entries, so
+ * tick cost tracks expirations instead of the blocked population.
+ */
+
+static int deadline_height(const struct kernel_task *task)
+{
+    return task ? task->deadline_height : 0;
+}
+
+static void deadline_update(struct kernel_task *task)
+{
+    int left = deadline_height(task->deadline_left);
+    int right = deadline_height(task->deadline_right);
+    task->deadline_height = (int8_t)(1 + (left > right ? left : right));
+}
+
+static struct kernel_task *deadline_rotate_left(struct kernel_task *root)
+{
+    struct kernel_task *next = root->deadline_right;
+    root->deadline_right = next->deadline_left;
+    next->deadline_left = root;
+    deadline_update(root);
+    deadline_update(next);
+    return next;
+}
+
+static struct kernel_task *deadline_rotate_right(struct kernel_task *root)
+{
+    struct kernel_task *next = root->deadline_left;
+    root->deadline_left = next->deadline_right;
+    next->deadline_right = root;
+    deadline_update(root);
+    deadline_update(next);
+    return next;
+}
+
+static struct kernel_task *deadline_balance(struct kernel_task *root)
+{
+    deadline_update(root);
+    if (deadline_height(root->deadline_left) -
+            deadline_height(root->deadline_right) > 1) {
+        if (deadline_height(root->deadline_left->deadline_left) <
+            deadline_height(root->deadline_left->deadline_right))
+            root->deadline_left = deadline_rotate_left(root->deadline_left);
+        return deadline_rotate_right(root);
+    }
+    if (deadline_height(root->deadline_right) -
+            deadline_height(root->deadline_left) > 1) {
+        if (deadline_height(root->deadline_right->deadline_right) <
+            deadline_height(root->deadline_right->deadline_left))
+            root->deadline_right = deadline_rotate_right(root->deadline_right);
+        return deadline_rotate_left(root);
+    }
+    return root;
+}
+
+static int deadline_before(const struct kernel_task *a,
+                           const struct kernel_task *b)
+{
+    return a->wakeup_deadline < b->wakeup_deadline ||
+           (a->wakeup_deadline == b->wakeup_deadline && a->tid < b->tid);
+}
+
+static struct kernel_task *deadline_insert_node(struct kernel_task *root,
+                                                struct kernel_task *task)
+{
+    if (root == 0) return task;
+    if (deadline_before(task, root))
+        root->deadline_left = deadline_insert_node(root->deadline_left, task);
+    else
+        root->deadline_right = deadline_insert_node(root->deadline_right, task);
+    return deadline_balance(root);
+}
+
+static struct kernel_task *deadline_extract_min(struct kernel_task *root,
+                                                struct kernel_task **minimum)
+{
+    if (root->deadline_left == 0) {
+        *minimum = root;
+        return root->deadline_right;
+    }
+    root->deadline_left = deadline_extract_min(root->deadline_left, minimum);
+    return deadline_balance(root);
+}
+
+static struct kernel_task *deadline_remove_node(struct kernel_task *root,
+                                                const struct kernel_task *task)
+{
+    if (root == 0) __builtin_trap();
+    if (root != task) {
+        if (deadline_before(task, root))
+            root->deadline_left =
+                deadline_remove_node(root->deadline_left, task);
+        else
+            root->deadline_right =
+                deadline_remove_node(root->deadline_right, task);
+        return deadline_balance(root);
+    }
+    if (root->deadline_left == 0) return root->deadline_right;
+    if (root->deadline_right == 0) return root->deadline_left;
+    struct kernel_task *next;
+    struct kernel_task *right = deadline_extract_min(root->deadline_right, &next);
+    next->deadline_left = root->deadline_left;
+    next->deadline_right = right;
+    return deadline_balance(next);
+}
+
+void deadline_index_insert(struct kernel_task *task)
+{
+    if (task == 0 || task->wakeup_deadline == 0U ||
+        task->deadline_indexed) __builtin_trap();
+    task->deadline_left = 0;
+    task->deadline_right = 0;
+    task->deadline_height = 1;
+    task->deadline_indexed = 1U;
+    scheduler.deadline_root =
+        deadline_insert_node(scheduler.deadline_root, task);
+}
+
+void deadline_index_remove(struct kernel_task *task)
+{
+    if (task == 0 || !task->deadline_indexed) return;
+    scheduler.deadline_root =
+        deadline_remove_node(scheduler.deadline_root, task);
+    task->deadline_left = 0;
+    task->deadline_right = 0;
+    task->deadline_height = 0;
+    task->deadline_indexed = 0U;
+}
+
+struct kernel_task *deadline_index_first(void)
+{
+    struct kernel_task *task = scheduler.deadline_root;
+    while (task != 0 && task->deadline_left != 0) task = task->deadline_left;
+    return task;
+}
+
 void kernel_wait_node_init(struct kernel_wait_node *node,
                            struct kernel_task *task)
 {
@@ -167,6 +307,7 @@ void scheduler_wake_task(struct kernel_task *thread, uint32_t reason)
         kernel_cost_timeout(&thread->cost, thread->wakeup_deadline);
 #endif
     scheduler_wait_requeue(thread, 0);
+    deadline_index_remove(thread);
     thread->wakeup_deadline = 0;
     thread->wait_interruptible = 0U;
     thread->wake_reason = reason;
@@ -266,24 +407,13 @@ enum kernel_scheduler_status kernel_scheduler_expire_deadlines(uint64_t now)
         return status;
     }
 
-#if BOAROS_COST_DIAGNOSTICS
-    uint64_t cost_visits = 0;
-#endif
-    thread = scheduler.blocked_head;
-    while (thread != 0) {
-#if BOAROS_COST_DIAGNOSTICS
-        cost_visits++;
-#endif
-        struct kernel_task *next = thread->next;
-
-        if (thread->wakeup_deadline != 0U &&
-            (int64_t)(now - thread->wakeup_deadline) >= 0) {
-            blocked_unlink(thread);
-            scheduler_wake_task(thread, (uint32_t)KERNEL_WAIT_TIMEOUT);
-        }
-        thread = next;
+    while ((thread = deadline_index_first()) != 0 &&
+           (int64_t)(now - thread->wakeup_deadline) >= 0) {
+        deadline_index_remove(thread);
+        COST_ADD(DEADLINE_VISITS, 1);
+        blocked_unlink(thread);
+        scheduler_wake_task(thread, (uint32_t)KERNEL_WAIT_TIMEOUT);
     }
-    COST_ADD(DEADLINE_VISITS, cost_visits);
     kernel_socket_expire_timers();
     kernel_signal_timer_expire();
     return KERNEL_SCHEDULER_STATUS_OK;
@@ -328,6 +458,7 @@ enum kernel_scheduler_status kernel_scheduler_block_current(
     }
     scheduler_wait_requeue(current, queue);
     current->wakeup_deadline = deadline;
+    if (deadline != 0U) deadline_index_insert(current);
     current->wake_reason = (uint32_t)KERNEL_WAIT_WOKEN;
     current->wait_interruptible = (uint32_t)interruptible;
 #if BOAROS_COST_DIAGNOSTICS

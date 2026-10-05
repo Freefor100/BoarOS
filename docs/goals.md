@@ -14,10 +14,11 @@ N3已经交付：legacy/modern VirtIO-net、受限DMA借用与复制回退、静
 
 | 未关闭项 | 当前证据与下一步 |
 |---|---|
-| 历史Virtqueue告警 | 已还原到旧兼容内核的五连接loopback；原启动只有块盘和RNG，没有VirtIO-net。具体报错队列与超额原因仍未知；后续失败必须先保留新快照，按队列身份定位，不以重复通过关闭。 |
+| 历史Virtqueue告警 | 已还原到旧兼容内核的五连接loopback；原启动只有块盘和RNG，没有VirtIO-net。具体报错队列与超额原因仍未知；后续失败必须先保留新快照，按队列身份定位，不以重复通过关闭。net 失败路径现已有槽级快照（2026-10-05，见网卡模块），原告警仍缺历史现场。 |
 | 历史页释放fatal的具体现场 | 已修复能够产生同类fatal的分配器双owner竞态；原事件没有owner快照，不能反推唯一触发链。 |
 | pthread取消与旧libc输入 | 原镜像动态glibc的cancel/exit缺libgcc_s；独立glibc运行环境已固定unwind依赖并保护取消/cleanup。静态cancel-points的join结果在固定Linux也失败，按库/测试契约继续核对，不能归给内核。历史偶发现场仍保留P0c边界，不安排无目的重复次数。 |
 | 内核抢占边界 | allocator修复不等于所有共享状态已审完。限定检查开中断worker到共享对象的调用链、睡眠前引用和发布临界区；发现具体错误才扩大。 |
+| 本机 multi-disk-io 测试 | `make test-multi-disk-io-riscv` 在基线 `3c34091` 上同样失败：guest 在 B 盘暂扣阶段挂住，harness 90 秒后超时；CI 不运行该目标，本会话改动 A/B 均复现，因果待独立定位。 |
 
 [风险证据与重建](learning/cost-baseline.md#旧版内存释放与-virtqueue-告警2026-10-02)
 区分已经修复的机制与缺少历史现场的归因。固定root、单hart、QEMU和选定应用验收
@@ -45,6 +46,23 @@ Unix98 PTY、独立 devpts、peer 打开、packet 模式和 PTY/串口 termios2 
 完整凭据/权限、运行时网络配置和无 RNG 平台的可信熵接入由目标应用确定交付范围；
 LoongArch 是独立交付依赖，SMP 单独规划。
 
+2026-10-05 第三方审计已逐条核实（对照 5c82103 与当前工作树）：机制描述基本属实，
+性能数字全部可溯源但存在口径混用；其归纳的基础问题与仓库已知边界一致，建议中的
+数值目标不作验收门禁。本轮据此实施 B（scratch 复用，已交付）、A（到期索引与最早
+期限重装，已交付）与 D（内核栈 guard，已交付）；C（网络关中断区/协议所有权）只出
+设计对比。
+
+2026-10-05 后续轮：审计剩余项经调查后确认三项实施、一项推迟。ASID 推迟到实板
+轨道——固定 QEMU 没有 ASID 化 TLB（任何 satp 变化与任意 sfence.vma 都全刷、翻译
+不使用 ASID），收益为零，且收窄 fence 的正确性缺陷会被 QEMU 全刷掩盖，只能在
+ASID 标签 TLB 的硬件上验证。本轮实施：TX indirect+SG 零拷贝（保留复制回退）、
+块设备在途深度测量（时间加权深度/queue-wait/服务时间，测后再定是否加深）、无 NIC
+的 lwIP timer 出 IRQ 与网络 fail 槽表诊断（均已交付）。提交审查与本轮自审另发现
+两处真实缺陷并修复：镜像 VA→PA 换算在 va>end 时边界减法下溢（新增越界拒绝与
+sv39 越界用例），以及设备失败路径在复位确认前 abandon 在途 TX owner（失败不等于
+DMA 停止，改为保留到 stop 复位确认；host worker 模型断言失败路径 abandon=0）。
+块设备在途与页 owner 身份的加深仍按"先测量/发现具体错误才扩大"的既有纪律。
+
 ## 按证据触发的性能候选
 
 | 触发证据 | 候选与必要代价 |
@@ -55,7 +73,6 @@ LoongArch 是独立交付依赖，SMP 单独规划。
 | 非阻塞发送复制放大或固定热缓存运行成本高 | 发送credit约束暂存、重复解析/复制/查询；先核对错误优先级，保留短写、EFAULT前缀、取消和页生命周期 |
 | Lua构建仍有差距，选定heap清零/搬迁与页内复制不足以解释 | 核对用户程序运行、页解析/ELF及未测固定成本，再选一个机制；VMA指标是比较次数，不能当查询数或时间 |
 | 热路径stat/open无大量设备请求仍慢，fstat更轻 | 核对路径临时缓冲、逐级后端查询及对象周转；累计请求容量不是峰值。空文件创建删除另分解目录、inode/位图、事务及真实资源等待；保护身份、orphan、同步与复用，不顺势扩大缓存重构 |
-| 短睡眠的到期唤醒接近tick周期 | 比较提高HZ与最早blocked deadline参与SBI重装；当前额外timer只服务实时预算/RR。核对中断开销、取消、重启、对象复用和空闲功耗，不先换调度策略 |
 | UDP过载丢包或TCP受协议credit约束 | 核对接收/丢弃量、每连接进展、lwIP窗口/池和socket预算；限速可靠性与饱和效率分开，TCP_INFO未支持的字段不作为重传证据 |
 | 真实大映射/多等待者负载规模退化 | resident范围索引、deadline索引或安全长操作边界；核对维护成本、OOM和取消 |
 
@@ -65,6 +82,12 @@ LoongArch 是独立交付依赖，SMP 单独规划。
 
 | 阶段/能力 | 事实与证据入口 |
 |---|---|
+| TX indirect+SG 零拷贝 | 协商 bit28 后每包发布间接表（设备头+≤2 段 pbuf），驱动持引用至完成、IRQ 标记/worker 释放；未协商或不可换算回退复制。真实 TAP 两 transport：tx-sg≈12.7 万包、tx-copy=47、errors=0。见[网卡模块](modules/riscv-virtio-net.md)。 |
+| 无NIC timer owner与失败快照 | `kernel_network_start` 无 NIC 时创建 timer-only worker（按 min(下一socket期限, now+5×frequency) 睡眠），最后的 OFD 定时回收不再依赖用户 syscall；设备失败打印设备/队列/槽级快照并停止新发布，在途 TX owner 保留到 reset 确认（复现越界 used id 与 abandon 语义的 host 场景）。见[网卡模块](modules/riscv-virtio-net.md)、[网络](modules/kernel-network.md)与[本轮记录](learning/network-ownership.md#无nic定时器owner与审查修正2026-10-05)。 |
+| 块在途测量与最终统计 | 块统计新增时间加权在途积分/忙时/总span/queue-wait/服务时间，设备销毁打印最终行；真实窗口实测忙时平均 1.31、空闲 86%、峰值 8，按触发条件不加深队列。见[块模块](modules/riscv-virtio-block.md)与[成本基线](learning/cost-baseline.md#块设备在途深度实测2026-10-05)。 |
+| 内核栈窗口与未映射 guard | 生产任务栈映射到独立 128 MiB 窗口槽位，低 4 KiB 无 PTE 作为 guard，越界经窗口 VA 立即 store fault；窗口骨架构建期预留、运行期受限 map/unmap、空 level-0 表释放；无页表 fixture 回退 direct-map。见[调度](modules/kernel-scheduler.md)与[Sv39](modules/riscv-sv39.md)。 |
+| 任务常驻 I/O scratch 页 | 每任务首次 I/O 分配一页并跨调用复用，正常调用只解除登记，任务销毁路径归还；musl 自动窗口物理页分配 42744→18066（差 24678 与 24576 次调用吻合）。见[调度](modules/kernel-scheduler.md)与[网络](modules/kernel-network.md)。 |
+| 到期有序索引与最早期限重装 | blocked deadline 使用 (deadline, tid) 有序索引，到期只弹出已到期者；SBI 事件取 min(RT 预算, RR 片尾, 最早睡眠 deadline)；socket 写重试链按期限有序。COST deadline 门禁改为到期处理数与 timeout 一致、不随无期限 blocked 增长。见[调度](modules/kernel-scheduler.md)、[时间](modules/kernel-time.md)与[定时器](modules/riscv-timer.md)。 |
 | 文件元数据与路径资格 | 活inode重开避免临时后端owner；创建权限按已有句柄初始化并保留创建时间。O_PATH只持路径身份，路径truncate接入共同截断和capability清理；见[文件契约](modules/kernel-files.md)、[VFS](modules/vfs-ext4.md)与[时间语义](learning/file-timestamps.md)。 |
 | libc局部纠错与文件所有权 | flock错误优先级、无timer辅助的退出ready调度、固定glibc unwind依赖与取消清理已交付；fchown/fchownat修改ext4/tmpfs/匿名pipe真实元数据，capability删除与inode修改同事务，进程仍固定root。见[调度](modules/kernel-scheduler.md)、[文件契约](modules/kernel-files.md)和[所有权背景](learning/file-timestamps.md#文件所有权与进程身份)。 |
 | T1–T3/P1–P4 终端 | UART IRQ/worker、行规程、ctty/作业控制、Unix98 devpts/PTY、packet 与36/44字节termios；原ash/stty、script/replay和真实libc PTY API已交付。稳定节点、背压、关闭和可信栈回收见[TTY契约](modules/kernel-tty.md)。 |
@@ -408,8 +431,8 @@ glibc四进程整命令仍增加0.73%。该轮的prepare读取、1547次FLUSH和
 
 ### P6g 真实内核栈 guard（可单 hart 先做）
 
-- [ ] 比较栈虚拟映射方案，明确未映射 guard 与 direct-map 别名的保护范围、栈页 owner 和映射失败回滚；不能把连续物理栈底 canary 当 guard page。
-- [ ] 用受控越界验证 fault 可诊断，保留 canary、高水位、compiler stack usage 和实际调用链预算；合法退出切到可信栈后才回收执行栈，zombie 不持有它。
+- [x] 已选择并交付独立栈窗口：guard 为不建 PTE 的 4 KiB 页（无物理 owner），窗口骨架构建期预留、运行期 map/unmap、空表释放；direct-map 别名与 idle/boot 栈的保护边界记入[调度模块](modules/kernel-scheduler.md)与[Sv39](modules/riscv-sv39.md)。
+- [x] 受控越界由 `make test-stack-guard-riscv` 验证：任务先写映射页，再写 guard 立即产生 store page fault（scause=0xf、stval=guard）；canary、高水位、`test-stack-usage` 与可信栈回收规则保留。
 
 **验证与退出**：拟新增 `tests/userland/smp_memory.c`、`tests/userland/smp_wait.c`、`tests/riscv/ipi_tlb_main.c` 与对应多 hart runner；保留 `test-riscv`、`test-userland-riscv`、`test-stack-usage` 的单 hart 门禁。2/4/8 核各自有重复正确性和资源基线证据，不能由某一核数或 multi-hart boot 推定其余配置。
 
@@ -512,8 +535,10 @@ backlog 和期限回收已交付。真实用户态保护用户复制、共享 OF
 | P3b 持久化 | 用户已选择并交付逐 inode dirty/error、定向写回和真实 flush；共享事务可提交关联元数据，不主动全量写回无关文件。 |
 | P3d 恢复 | journal/replay 与持久 orphan 已启用并验收；故障模型、限制和复现命令见 VFS 模块。 |
 | P6 SMP：当前 SIE 串行化，缺远端 TLB 确认 | ① 进程态对象先用粗粒度可睡眠锁、IRQ/队列另设短锁，验证较少但并行有限；② MM/OFD/cache/队列对象锁直接演进，锁顺序/取消成本更高。先盘点消费者和睡眠边界再选，临时启动大锁有退出条件。 |
-| P6g 栈 guard：连续物理栈、canary/高水位 | ① 独立虚拟栈区映射已有页，便于未映射 guard，但需页表与回收接口；② 调整内核现有映射形成受保护栈区域，初始接口可能更少，但别名/大页拆分与 direct-map 消费者成本须实测。先验证真实越界保护范围再选。 |
+| 单 hart ASID：当前 ASID 0，换根前后各一次全局 fence | 已调查并推迟到实板：固定 QEMU 无 ASID 化 TLB（satp 变化与任意 sfence.vma 均全刷、翻译不使用 ASID），收益不可观测，且收窄 fence 的正确性缺陷会被 QEMU 全刷掩盖；在 ASID 标签 TLB 的硬件（L4）上实现并验证 ASIDLEN 与复用顺序。 |
+| P6g 栈 guard：连续物理栈、canary/高水位 | 已选择①并交付：独立内核栈窗口（12 KiB 槽＝4 KiB 未映射 guard＋8 KiB 栈），运行期插/删叶、空表释放；见已交付表。direct-map 别名与 idle/boot 栈的边界见[调度模块](modules/kernel-scheduler.md)。 |
 | N1 协议栈与分配 owner | 已确认 BoarOS 持有 fd/OFD、ABI、等待与缓冲队列，固定官方 lwIP 2.2.1 raw API/NO_SYS；协议和 pbuf 静态有界池，socket/OFD/请求由 kernel_heap 持有。IPv4/IPv6双栈loopback和socketpair已验收；QEMU VirtIO-net与静态IPv4宿主应用已交付，实板另核对；命名AF_UNIX按需设计。 |
+| N4 网络关中断区与协议所有权：worker 批处理、syscall 协议临界区与无 NIC 的 timer IRQ 全部依赖单 hart SIE 串行化 | ① 保持串行化，仅把无 NIC 的 lwIP timer 移出 IRQ（小、独立，只影响 loopback/测试配置）；② network-core 单 owner + syscall 请求队列（usercopy/等待/取消留在 syscall，协议调用与队列记账过队列；大改动，是 SMP 前置）；③ 维持现状，待 SMP 或真实延迟证据再动。单 hart 下 SIE 长区不直接损失吞吐（工作照做、IRQ 推迟），收益是延迟上界与 SMP 准备；当前无真实负载证据，暂不实施。 |
 
 单 hart 已交付 OTHER/FIFO/RR 与全局实时带宽；后续调度改动以公平性/负载和实际消费者证据比较策略。第二架构按连续小里程碑推进；不等待 RV “全部完成”，也不复制整套通用内核。
 

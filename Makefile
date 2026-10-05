@@ -43,6 +43,7 @@ FILES_PARTIAL_WRITE_TEST_KERNEL_RV := \
 	$(BUILD_DIR)/tests/kernel-files-partial-write-rv
 SV39_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-sv39-rv
 SV39_FAULT_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-sv39-fault-rv
+STACK_GUARD_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-stack-guard-rv
 MM_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-mm-rv
 MM_FATAL_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-mm-fatal-rv
 VMA_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-vma-rv
@@ -442,6 +443,13 @@ SV39_FAULT_TEST_C_SOURCES := \
 SV39_FAULT_TEST_OBJECTS := \
 	$(TEST_RUNTIME_OBJECTS) \
 	$(patsubst %.c,$(BUILD_DIR)/%.o,$(SV39_FAULT_TEST_C_SOURCES))
+STACK_GUARD_TEST_C_SOURCES := \
+	kernel/boot_memory.c \
+	kernel/dtb.c \
+	tests/riscv/stack_guard_main.c
+STACK_GUARD_TEST_OBJECTS := \
+	$(TEST_RUNTIME_OBJECTS) \
+	$(patsubst %.c,$(BUILD_DIR)/%.o,$(STACK_GUARD_TEST_C_SOURCES))
 MM_TEST_C_SOURCES := \
 	tests/riscv/mm_cases.c \
 	tests/riscv/mm_cases_main.c
@@ -553,6 +561,7 @@ DEPS := \
 	$(FILES_PARTIAL_WRITE_TEST_MAIN_OBJECT:.o=.d) \
 	$(SV39_TEST_OBJECTS:.o=.d) \
 	$(SV39_FAULT_TEST_OBJECTS:.o=.d) \
+	$(STACK_GUARD_TEST_OBJECTS:.o=.d) \
 	$(MM_TEST_OBJECTS:.o=.d) \
 	$(MM_FATAL_TEST_OBJECTS:.o=.d) \
 	$(VMA_TEST_OBJECTS:.o=.d) \
@@ -588,7 +597,7 @@ DEPS := \
 	test-block-riscv test-heap-riscv test-page-riscv test-vfs-riscv \
 	test-scheduler-cases-riscv test-scheduler-riscv \
 	test-boot-riscv test-references test-riscv \
-	test-sv39-fault-riscv test-sv39-riscv \
+	test-sv39-fault-riscv test-sv39-riscv test-stack-guard-riscv \
 	test-syscall-riscv test-signal-riscv test-timer-riscv test-trap-riscv \
 	test-trap-return-riscv test-user-fatal-riscv test-mm-riscv \
 	test-uaccess-riscv test-user-riscv test-vma-riscv test-brk-riscv \
@@ -762,6 +771,12 @@ $(SV39_FAULT_TEST_KERNEL_RV): $(SV39_FAULT_TEST_OBJECTS) \
 	$(CC) $(LDFLAGS) \
 		-Wl,-Map,$(BUILD_DIR)/tests/kernel-sv39-fault-rv.map \
 		-o $@ $(SV39_FAULT_TEST_OBJECTS)
+
+$(STACK_GUARD_TEST_KERNEL_RV): $(STACK_GUARD_TEST_OBJECTS) \
+		arch/riscv/linker.ld
+	$(CC) $(LDFLAGS) \
+		-Wl,-Map,$(BUILD_DIR)/tests/kernel-stack-guard-rv.map \
+		-o $@ $(STACK_GUARD_TEST_OBJECTS)
 
 $(MM_TEST_KERNEL_RV): $(MM_TEST_OBJECTS) \
 		arch/riscv/linker.ld
@@ -1043,7 +1058,7 @@ test-riscv: test-dtb-riscv test-page-riscv test-heap-riscv \
 	test-elf64-riscv test-elf-rwx-riscv \
 	test-user-riscv test-user-fatal-riscv \
 	test-mm-riscv test-vma-riscv test-uaccess-riscv \
-	test-sv39-riscv test-sv39-fault-riscv \
+	test-sv39-riscv test-sv39-fault-riscv test-stack-guard-riscv \
 	test-trap-return-riscv test-timer-riscv test-boot-riscv \
 	test-high-half-trap-riscv test-no-identity-riscv \
 	test-root-init-riscv test-root-orphan-riscv \
@@ -1380,6 +1395,10 @@ test-sv39-riscv: $(SV39_TEST_KERNEL_RV)
 test-sv39-fault-riscv: $(SV39_FAULT_TEST_KERNEL_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) SV39_FAULT_TEST_KERNEL_RV=$< \
 		./tests/sv39-fault-riscv.sh
+
+test-stack-guard-riscv: $(STACK_GUARD_TEST_KERNEL_RV)
+	QEMU_RISCV64=$(QEMU_RISCV64) STACK_GUARD_TEST_KERNEL_RV=$< \
+		./tests/stack-guard-riscv.sh
 
 test-timer-riscv: $(TIMER_CASES_TEST_KERNEL_RV) \
 		$(TIMER_BOOT_TEST_KERNEL_RV)

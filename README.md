@@ -12,11 +12,11 @@ BoarOS 是从零搭建、面向 OS Comp 能力建设的 C / 少量汇编内核�
 
 | 范围 | 已有能力 | 主要边界 |
 |---|---|---|
-| 启动与内存 | OpenSBI、DTB、高半区/direct map、buddy/slab、连续页和引用回收 | 无 SMP；任务栈有 canary/高水位，没有未映射 guard page |
+| 启动与内存 | OpenSBI、DTB、高半区/direct map、buddy/slab、连续页和引用回收、独立栈窗未映射 guard 页 | 无 SMP；guard 只覆盖窗口 VA 的 SP 式越界，direct-map 别名仍在；idle/boot 栈无 guard |
 | 虚拟内存 | VMA、按需匿名页、共享匿名与共享文件映射、文件私有 COW、共享文件首次写追踪、`msync`、跨 MM 截断撤映射 | 无 `mremap`、按操作区分的 `madvise`、共享文件 futex、匿名共享页 swap 回收或 SMP 页表同步 |
 | ELF / exec | shebang、按需 ELF、PIE、`PT_INTERP`、初始栈/auxv、musl DSO/TLS、固定 glibc 2.44 启动/TLS/pthread及取消子集、失败保持旧映像 | 无 `execveat`；glibc 应用覆盖尚有限 |
 | 进程与等待 | 统一 TID/TGID/PGID/SID 身份对象、会话/进程组、fork/vfork、child-TID 生命周期差分、pthread clone、线程组退出、非组长 exec、wait/zombie/reparent、时钟与睡眠、进程组 ITIMER_REAL/SIGALRM | 合法 clone 组合仍有限；串口及 Unix98 PTY 控制终端；单 hart 关中断不等于跨核同步 |
-| 调度 | OTHER tick 轮转、FIFO/RR 1–99 优先级、CPU0 affinity、RESET_ON_FORK、可配置全局实时预算及 proc 查询 | 默认 1 秒 / 950 毫秒；无 nice 权重、PI、SMP 或硬实时保证 |
+| 调度 | OTHER tick 轮转、FIFO/RR 1–99 优先级、CPU0 affinity、RESET_ON_FORK、可配置全局实时预算及 proc 查询、到期有序索引与最早 deadline 参与 timer 重装 | 默认 1 秒 / 950 毫秒；无 nice 权重、PI、SMP 或硬实时保证 |
 | 随机数 | ChaCha20 fast-key-erasure、BLAKE2s 混种、legacy/modern VirtIO RNG、`getrandom` 与 random/urandom 字符节点 | QEMU 宿主是信任边界；DTB/用户写入不计可信熵，缺设备时保持未就绪 |
 | futex / 信号 | WAIT/WAKE/REQUEUE、超时/重启、跨 MM 共享匿名 futex、同 MM 非 PI robust-list 退出清理、标准信号、用户 handler、同步 SEGV/BUS/ILL/TRAP 故障信息与恢复、`rt_sigtimedwait` | 无共享文件 futex、PI futex、实时信号队列和 `sigaltstack`；单 hart 验证范围 |
 | 文件与事件 | fd/OFD 分离、dup/CLOEXEC、共享 offset、阻塞 pin、部分/向量/定位 I/O、匿名pipe及ext4/tmpfs命名FIFO、poll/select/epoll；传统与 OFD 记录锁；socket OFD 与读写/就绪；mknodat 字符节点按设备号接入 null、zero、console、RTC | 独立 devpts、PTY 锁定/peer 与 packet、36/44 字节 termios；无 devfs，设备 mmap 未支持 |
@@ -26,7 +26,7 @@ BoarOS 是从零搭建、面向 OS Comp 能力建设的 C / 少量汇编内核�
 | 终端 | DTB ns16550 IRQ＋worker，ttyS0/console/tty、canonical/raw、termios/termios2、VMIN/VTIME、控制终端和前后台作业；Unix98 PTY/devpts、packet、真实 libc PTY API及原 BusyBox ash/stty/script/replay | 其他行规程、break 生成和完整 modem 控制未交付；固定 root、单 hart |
 | 内核日志 | 从启动保存16KiB真实内核日志、完整klogctl 0–10、消费式阻塞读、清空及console级别控制 | 当前不可变root权限模型；用户console输出与日志分离，无/dev/kmsg接口 |
 | 身份与资源 | 单用户 root 的 UID/GID 查询；线程组共享并执行 NOFILE/STACK，fork 继承、exec 保留 | 真实ext4/tmpfs/匿名pipe所有权可变，进程仍固定root；无凭据变更/完整权限；fd 硬容量 1024、栈硬容量 8 MiB；其他有效 limit 返回 `ENOTSUP` |
-| 平台与网络 | RISC-V QEMU 真实根盘可配置 PID 1（默认 `/init`） 与 musl 用户态；单 hart IPv4/IPv6 UDP/TCP loopback、双栈监听、连接选项、半关闭与向量消息，固定 lwIP 2.2.1 raw API，AF_UNIX socketpair；legacy/modern VirtIO-net、静态 IPv4/ARP、有界分片重组与隔离宿主双向 TCP/HTTP，custom pbuf RX | 无命名 AF_UNIX 端点、外部 IPv6、公网/DHCP/DNS/TLS、LoongArch、实板或多核验证 |
+| 平台与网络 | RISC-V QEMU 真实根盘可配置 PID 1（默认 `/init`） 与 musl 用户态；单 hart IPv4/IPv6 UDP/TCP loopback、双栈监听、连接选项、半关闭与向量消息，固定 lwIP 2.2.1 raw API，AF_UNIX socketpair；legacy/modern VirtIO-net、静态 IPv4/ARP、有界分片重组与隔离宿主双向 TCP/HTTP，custom pbuf RX、TX indirect+SG 零拷贝（保留复制回退）、无 NIC 时协议/OFD 定时器仍由内核 worker 推进 | 无命名 AF_UNIX 端点、外部 IPv6、公网/DHCP/DNS/TLS、LoongArch、实板或多核验证 |
 
 活 inode 的再次打开先取得现有节点资格，避免临时后端打开与关闭；创建权限通过已有句柄设置。弱路径 registry 仍不保存常驻目录项缓存。
 

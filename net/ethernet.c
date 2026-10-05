@@ -3,6 +3,7 @@
 #include <kernel/errno.h>
 #include <kernel/console.h>
 #include <arch/riscv/context.h>
+#include <arch/riscv/direct_map.h>
 #include <arch/riscv/memory_layout.h>
 #include <arch/riscv/timer.h>
 #include <arch/riscv/virtio_mmio_net.h>
@@ -43,9 +44,39 @@ static void rx_free(struct pbuf *p)
 }
 static int copy_pbuf(const void *context, void *destination, uint32_t length)
 { return pbuf_copy_partial(context, destination, (u16_t)length, 0) == length; }
+static void release_owner(void *owner)
+{ pbuf_free((struct pbuf *)owner); }
 static err_t link_output(struct netif *interface, struct pbuf *p)
 {
     struct kernel_network *n = interface->state;
+    /* 零拷贝候选：整链为可 DMA 的 PBUF_RAM/POOL、段数受限且地址可换算。 */
+    if (p->tot_len != 0 && p->tot_len <= 1514) {
+        struct riscv_net_tx_segment segments[RISCV_NET_TX_SEGMENTS];
+        unsigned count = 0;
+        int eligible = 1;
+        for (struct pbuf *q = p; q != 0; q = q->next) {
+            uint64_t physical;
+            if (count == RISCV_NET_TX_SEGMENTS || q->len == 0 ||
+                PBUF_NEEDS_COPY(q) ||
+                riscv_image_va_to_pa((uint64_t)(uintptr_t)q->payload, q->len,
+                                     &physical) != RISCV_DIRECT_MAP_STATUS_OK) {
+                eligible = 0; break;
+            }
+            segments[count].physical_address = physical;
+            segments[count].length = q->len;
+            count++;
+        }
+        if (eligible && count != 0) {
+            pbuf_ref(p);
+            int result = riscv_virtio_mmio_net_send_segments(&n->device, segments,
+                                                             count, p);
+            if (result == 0) return ERR_OK;
+            pbuf_free(p);
+            if (result == -KERNEL_EAGAIN) return ERR_MEM;
+            if (result != -KERNEL_ENOTSUP) return ERR_IF;
+            /* 未协商 indirect：回退复制路径。 */
+        }
+    }
     int result = riscv_virtio_mmio_net_send_copy(&n->device, p->tot_len, copy_pbuf, p);
     return result >= 0 ? ERR_OK : result == -KERNEL_EAGAIN ? ERR_MEM :
         result == -KERNEL_EMSGSIZE ? ERR_BUF : ERR_IF;
@@ -75,6 +106,22 @@ static void timer_wake(void *context)
     struct kernel_network *n = context;
     if (n->deadline && (int64_t)(riscv_time_read() - n->deadline) >= 0)
         (void)kernel_wait_queue_wake_all(&n->device.progress);
+}
+/* 无 NIC 的 timer-only owner：IRQ 只唤醒它，协议定时器在 worker 上下文推进。 */
+static void timer_worker(void *context)
+{
+    struct kernel_network *n = context;
+    for (;;) {
+        uintptr_t irq = riscv_interrupt_save();
+        if (n->device.stopping) { riscv_interrupt_restore(irq); return; }
+        kernel_socket_network_process();
+        n->deadline = kernel_socket_next_timer_deadline();
+        uint64_t timeout = riscv_time_read() + 5 * n->device.frequency;
+        if (!n->deadline || timeout < n->deadline) n->deadline = timeout;
+        enum kernel_wait_wake_reason reason;
+        if (kernel_scheduler_block_current(&n->device.progress, n->deadline, 0, &reason) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
+        riscv_interrupt_restore(irq);
+    }
 }
 static void input_frame(struct kernel_network *n, struct riscv_net_frame *frame)
 {
@@ -114,6 +161,9 @@ static void device_failed(struct kernel_network *n)
         kernel_socket_network_failed(ip4_addr_get_u32(netif_ip4_addr(&n->interface)));
     }
     netif_set_link_down(&n->interface);
+    /* 失败不等于DMA停止：设备仍可能读取已投递的TX描述符与payload，
+     * 在途owner保留到stop()复位确认，与RX借用同一策略；已完成owner
+     * 仍由worker的release(0)归还。 */
 }
 static void worker(void *context)
 {
@@ -134,6 +184,8 @@ static void worker(void *context)
         }
         /* 失败NIC不再收发，但共享的loopback与协议期限仍须独立进展。 */
         kernel_socket_network_process();
+        /* 完成通知在IRQ标记；owner释放留在worker上下文。 */
+        riscv_virtio_mmio_net_tx_release(d, release_owner, 0);
         if (riscv_virtio_mmio_net_service(d)) device_failed(n);
         if (handled == 8) {
             /* 批次间给中断和其他任务机会，不持raw调用栈睡在设备credit上。 */
@@ -188,6 +240,22 @@ int kernel_network_start(struct kernel_network **owner, struct kernel_heap *heap
         print_text(" control-bytes="); print_u64(sizeof(*n)); print_text("\n");
         return 0;
     }
+    /* 无 NIC 仍保留 timer-only owner：最后的 OFD 定时回收与 loopback 期限
+     * 不再依赖另一个用户 syscall，也不在 IRQ 里跑协议回调。 */
+    struct kernel_network *n = 0;
+    if (kernel_heap_allocate_zeroed(heap, 1, sizeof(*n), (void **)&n) !=
+        KERNEL_HEAP_STATUS_OK)
+        return -KERNEL_ENOMEM;
+    n->heap = heap;
+    n->device.frequency = boot->timebase_frequency;
+    kernel_wait_queue_init(&n->device.progress);
+    if (kernel_thread_create_joinable(timer_worker, n, &n->device.worker) !=
+        KERNEL_SCHEDULER_STATUS_OK) {
+        (void)kernel_heap_release(heap, n);
+        return -KERNEL_EIO;
+    }
+    kernel_socket_network_hooks(timer_wake, 0, n);
+    *owner = n;
     return 0;
 }
 int kernel_network_stop(struct kernel_network **owner)
@@ -205,6 +273,8 @@ int kernel_network_stop(struct kernel_network **owner)
     }
     int error = riscv_virtio_mmio_net_stop(&n->device);
     if (error) { riscv_interrupt_restore(irq); return error; }
+    /* reset已确认DMA停止；worker已join，归还剩余TX owner。 */
+    riscv_virtio_mmio_net_tx_release(&n->device, release_owner, 1);
     kernel_socket_network_hooks(0, 0, 0);
     print_text("BoarOS: network final rx="); print_u64(n->device.statistics.rx_packets);
     print_text(" tx="); print_u64(n->device.statistics.tx_packets);
@@ -213,6 +283,8 @@ int kernel_network_stop(struct kernel_network **owner)
     print_text(" loan-peak="); print_u64(n->device.statistics.loan_peak);
     print_text(" copy-packets="); print_u64(n->device.statistics.copied_packets);
     print_text(" copy-bytes="); print_u64(n->device.statistics.copied_bytes);
+    print_text(" tx-sg="); print_u64(n->device.statistics.tx_sg_packets);
+    print_text(" tx-copy="); print_u64(n->device.statistics.tx_copy_packets);
     print_text(" drops="); print_u64(n->device.statistics.drops);
     print_text(" errors="); print_u64(n->device.statistics.errors);
     struct kernel_heap_statistics heap_statistics;

@@ -264,14 +264,19 @@ class CostReportTest(unittest.TestCase):
         with self.assertRaises(ValueError):m.unpack(packed,final=True)
         del packed['records'][0]['snapshots'][0]['counters']['foreground.operations']
         with self.assertRaises(ValueError):m.unpack(packed)
-    def test_deadline_scanning_uses_all_blocked_members(self):
+    def test_deadline_work_tracks_expirations(self):
         from cost_report import validate_deadline
         snap=parse(self.render(self.valid()),3)
-        for count in (0,4,131):
-            snap['foreground.deadline_visits.samples']=1 if count else 0
-            snap['foreground.deadline_visits.max']=count
+        # 到期扫描的工作量必须与到期数一致，不再随无期限阻塞成员增长。
+        for visits,expired in ((0,0),(4,0),(131,4),(4,136)):
+            snap['foreground.deadline_visits.samples']=1 if (visits or expired) else 0
+            snap['foreground.deadline_visits.value']=visits
+            snap['foreground.deadline_visits.max']=visits
+            snap['foreground.deadline_expired.value']=expired
             with self.assertRaises(ValueError):validate_deadline('deadline-128-0-0',snap)
-        snap['foreground.deadline_visits.max']=132
+        snap['foreground.deadline_visits.value']=136
+        snap['foreground.deadline_expired.value']=136
+        snap['foreground.deadline_visits.max']=136
         validate_deadline('deadline-128-0-0',snap)
 
     def test_bucket_intervals(self):

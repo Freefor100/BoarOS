@@ -50,7 +50,7 @@ pthread 成功创建并不证明线程组完整：还应检查 join/TLS、竞争
 证明连续进展，原 pthread 程序负责检查实际成本；二者都要检查已退出任务的栈和 MM
 只能由可信上下文释放。
 
-BoarOS 使用 256 个桶和每队列 FIFO 成员链。普通唤醒不扫描全局 blocked 链，futex 唤醒仍需检查目标桶中的碰撞 waiter。deadline 到期目前仍扫描全局 blocked 链。线程 clone 共享 MM/files/fs，避免复制页表和 fd 槽；首次建立共享 disposition 时，原本尚未分配的信号表仍需要分配，不能宣称所有 clone 都只分配一个页。QEMU 运行时间不构成真实硬件性能结论。
+BoarOS 使用 256 个桶和每队列 FIFO 成员链。普通唤醒不扫描全局 blocked 链，futex 唤醒仍需检查目标桶中的碰撞 waiter。deadline 到期由按 (deadline, tid) 排序的索引处理，只弹出已到期者。线程 clone 共享 MM/files/fs，避免复制页表和 fd 槽；首次建立共享 disposition 时，原本尚未分配的信号表仍需要分配，不能宣称所有 clone 都只分配一个页。QEMU 运行时间不构成真实硬件性能结论。
 
 一次可复用的调试经验：线程控制块变大后，原本通过的 ext4 目录枚举可能耗尽剩余内核栈，而错误要到后续 syscall 的 canary 检查才被发现。用硬件 watchpoint 监视 canary 的首次写入，能把“nanosleep 失败”的表象还原到真正的 getdents 调用链。此处直接复用待返回 dirent 中的文件名空间消除了冗余 256 字节副本，不需要为每次枚举增加堆分配。
 

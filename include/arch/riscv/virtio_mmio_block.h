@@ -32,6 +32,8 @@ struct riscv_virtio_mmio_block_statistics {
     uint64_t io_errors;
     uint64_t flush_requests;
     uint64_t interrupts, sleeps, wakes, queue_waits, runtime_polls, max_inflight;
+    /* 时间加权在途深度（Σ深度·tick）、忙时、总span、等待与设备服务时间。 */
+    uint64_t inflight_ticks, busy_ticks, total_ticks, queue_wait_ticks, service_ticks;
 };
 
 struct riscv_virtio_mmio_block {
@@ -50,6 +52,7 @@ struct riscv_virtio_mmio_block {
     uint32_t state;
     uint32_t read_only;
     uint32_t irq_source, active, inflight, barrier_waiters, barrier;
+    uint64_t statistics_start, statistics_last;
     struct kernel_wait_queue available;
     struct riscv_virtio_mmio_block_statistics statistics;
 };

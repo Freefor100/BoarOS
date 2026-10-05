@@ -495,6 +495,11 @@ static void print_counters(const char *phase, const struct riscv_virtio_mmio_blo
     virt_uart_puts(" wakes="); virt_uart_put_hex(stats->wakes);
     virt_uart_puts(" queue-waits="); virt_uart_put_hex(stats->queue_waits);
     virt_uart_puts(" runtime-polls="); virt_uart_put_hex(stats->runtime_polls);
+    virt_uart_puts(" inflight-ticks="); virt_uart_put_hex(stats->inflight_ticks);
+    virt_uart_puts(" busy-ticks="); virt_uart_put_hex(stats->busy_ticks);
+    virt_uart_puts(" total-ticks="); virt_uart_put_hex(stats->total_ticks);
+    virt_uart_puts(" wait-ticks="); virt_uart_put_hex(stats->queue_wait_ticks);
+    virt_uart_puts(" service-ticks="); virt_uart_put_hex(stats->service_ticks);
     virt_uart_putc('\n');
 }
 static void *access_page(uint64_t address) { return (void *)(uintptr_t)address; }
@@ -1214,6 +1219,7 @@ void kernel_main(unsigned long hart, const void *dtb)
     struct riscv_virtio_mmio_block_statistics stats;
     riscv_virtio_mmio_block_get_statistics(&device, &stats);
     check(cold_done == 2 && progress_done && stats.max_inflight >= 2 && stats.sleeps >= 2 && !stats.runtime_polls, 46);
+    struct riscv_virtio_mmio_block_statistics queue_before = stats;
     virt_uart_puts("I/O handshake: queue\n");
     while (!virt_uart_rx_ready()) { }
     check(virt_uart_getc() == 'g', 53);
@@ -1229,7 +1235,22 @@ void kernel_main(unsigned long hart, const void *dtb)
     (void)riscv_interrupt_save();
     riscv_virtio_mmio_block_get_statistics(&device, &stats);
     check(queue_done == 10 && stats.max_inflight == 8 && stats.queue_waits >= 2, 56);
+    /* 队列场景持握 8 个请求：时间加权在途深度必须显著高于 1，
+     * 等待与设备服务时间必须真实累计，忙时不超过总span。 */
     print_counters("queue", &stats);
+    uint64_t queue_busy = stats.busy_ticks - queue_before.busy_ticks;
+    uint64_t queue_weighted = stats.inflight_ticks - queue_before.inflight_ticks;
+    uint64_t queue_waited = stats.queue_wait_ticks - queue_before.queue_wait_ticks;
+    virt_uart_puts("I/O deltas: busy="); virt_uart_put_hex(queue_busy);
+    virt_uart_puts(" weighted="); virt_uart_put_hex(queue_weighted);
+    virt_uart_puts(" wait="); virt_uart_put_hex(queue_waited);
+    virt_uart_putc('\n');
+    /* 语义不变量：忙时每 tick 深度>=1，故 忙时<=加权；加权不超过观测峰值×忙时。
+     * 只按事件计数的错误实现会给出 加权 << 忙时 而被拒绝。 */
+    check(queue_busy > 0 && queue_weighted >= queue_busy &&
+          queue_weighted <= stats.max_inflight * queue_busy && queue_waited > 0 &&
+          stats.service_ticks > queue_before.service_ticks &&
+          stats.total_ticks >= stats.busy_ticks, 270);
     for (unsigned mode = 0; mode < 3; mode++) test_batch(mode);
     check(kernel_thread_create(background_writeback_probe, 0) == KERNEL_SCHEDULER_STATUS_OK, 98);
     for (;;) {

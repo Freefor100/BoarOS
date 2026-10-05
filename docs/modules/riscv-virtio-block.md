@@ -24,7 +24,7 @@ reset 停止 DMA 的依据是固定 `references/qemu/hw/virtio/virtio-mmio.c` �
 
 扇区对齐且位于 direct map 的目标缓冲区直接作为 DMA 地址，连续多扇区合并成一个请求；写入请求使用 `VIRTIO_BLOCK_REQUEST_OUT` 且数据描述符不设 `VIRTQ_DESC_WRITE`。非整扇区写入通过 bounce buffer 执行读-改-写（Read-Modify-Write）：先读出包含该范围的完整扇区，将修改字节合并到 bounce buffer，再将该扇区写回磁盘。启动阶段显式轮询；生产调度启用后，PLIC IRQ 先确认设备中断，再读取 used ring 并唤醒任务，使确认期间的新完成保留通知。轮询和期限唤醒都先收割已发布完成，再判定请求超时；期限唤醒只做一次收割，运行期不连续轮询。运行期满槽和设备等待均不可中断地睡眠，idle/IRQ 提交会 fatal，不能退回忙等。超时采用 DTB timebase 的30秒有限期限，从请求发布时计算，先停止提交并 reset，确认 DMA 停止后统一完成未完成请求；设备保持失败态，不自动重试写。IRQ 与超时在同一短关中断区仲裁，完成、唤醒和槽归还各一次。期限用于识别停滞，不是正常I/O延迟上限；合法FLUSH可能等待宿主整个后备文件落盘，一秒会误判。固定Linux v7.2的 `references/linux/block/blk-mq.c` 同样采用30秒默认块队列期限；BoarOS仍在超时后冻结设备，不承诺Linux的恢复策略。
 
-flush 先阻止新逻辑调用并排空此前逻辑调用，再发送 FLUSH，完成后才放行后续调用；已入场的 batch 在 flush 等待期间仍可补发余下 span，避免屏障与未发布项互锁。无 FLUSH 特性的 write-through 同样经过软件排空屏障。batch 收到一个错误后停止发布所有剩余项，包含已读入 bounce 但尚未写出的 RMW；已发布 DMA 继续收割，或在期限到达时 reset 并确认 DMA 停止，最后才返回实际失败。取消和信号不会中断内部等待或提前归还 buffer。统计记录提交数、实际最大已发布在途数、IRQ、完成等待睡眠/唤醒、队列等待、运行期轮询及错误；不把已预留但未发布槽计入在途。
+flush 先阻止新逻辑调用并排空此前逻辑调用，再发送 FLUSH，完成后才放行后续调用；已入场的 batch 在 flush 等待期间仍可补发余下 span，避免屏障与未发布项互锁。无 FLUSH 特性的 write-through 同样经过软件排空屏障。batch 收到一个错误后停止发布所有剩余项，包含已读入 bounce 但尚未写出的 RMW；已发布 DMA 继续收割，或在期限到达时 reset 并确认 DMA 停止，最后才返回实际失败。取消和信号不会中断内部等待或提前归还 buffer。统计记录提交数、实际最大已发布在途数、IRQ、完成等待睡眠/唤醒、队列等待、运行期轮询及错误；不把已预留但未发布槽计入在途。另有时间加权计量：在途深度积分（inflight-ticks，单位 深度·tick）、忙时、总span、队列等待与服务时间，销毁时打印一行最终统计供真实窗口取证。
 
 PLIC 路由由 `dtb_read_irq_info()` 根据 CPU interrupt-controller phandle、启动 hart 的 supervisor cause 9 和 VirtIO interrupt-parent 关联；不硬编码 IRQ/context 编号。外部中断执行 claim、设备分派/ack、complete；IRQ 不分配或做文件清理。块/VFS 同步接口不变，设备内部允许多个调用同时等待。实板、IOMMU、非一致 DMA 和 SMP 仍不在此边界内。
 

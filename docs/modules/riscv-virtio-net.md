@@ -20,19 +20,25 @@ worker，不分配、不睡眠。达到借用上限则复制到有界 PBUF_POOL�
 DMA 槽。UDP 接纳同时检查 DMA 借用、协议堆和备用池占用，保留至少 16 个
 备用 pbuf 给 TCP/控制流；不足计丢弃，不承诺不限速 UDP 无丢包。
 
-TX 把完整 pbuf 链复制到设备自有缓冲，最多 64 个排队，32 个可发布。
+TX 在协商 indirect（bit28）后按包发布槽内 indirect 表：首项为设备头（驱动缓冲），其余为最多两段 pbuf（PBUF_RAM/POOL 且地址落在内核镜像映射内），驱动 `pbuf_ref` 持有到完成；IRQ 只把完成槽标为待归还，worker 在非 IRQ 上下文释放引用。设备失败/超时不提前归还：失败不等于 DMA 停止，设备仍可能读取已投递的描述符与 payload，在途 owner 保留到 stop 复位确认后才 abandon，与 RX 借用同一策略；已完成 owner 仍由 worker 归还。未协商 indirect、段数超限、volatile 或地址不可换算时回退为复制路径；`tx-sg`/`tx-copy` 统计两条路径的包数。最多 64 个排队，32 个可发布。
 `linkoutput` 不睡眠，容量不足返回 ERR_MEM。TCP 已接受的内容仍归协议，完成
-唤醒 worker 后重试 unsent 数据，无需用户再次进入 syscall。TX 尚未零拷贝。
+唤醒 worker 后重试 unsent 数据，无需用户再次进入 syscall。零拷贝 TX 持引用期间 TCP 段保持 busy，完成后才可重传。
 
 IRQ 先确认事件，再校验并收割完成，只唤醒 worker。used-index 差值、head ID、
 发布资格、长度和未协商 offload 头都必须合法；modern 运行期 NEEDS_RESET 在
 IRQ、service 与直接 send 入口都检查，不能因无 TX 或配置 IRQ 丢失而继续发布。
 失败保留冷路径队列现场并停止
-新发布。只有已发布 TX 使用五秒设备完成期限，正常 RX 空闲不是设备故障。
+新发布：除设备/队列现场外打印槽级快照（loaned/ready/pending/done、队列索引与
+每个非空闲 RX/TX 槽的状态、长度、age、owner），只读驱动自有数组，不追描述符
+地址、不分配。只有已发布 TX 使用五秒设备完成期限，正常 RX 空闲不是设备故障。
 worker 在任务上下文推进 Ethernet/ARP、协议定时器和重试，每批最多八帧；批次
 之间开放中断并让出运行机会。失败 NIC 不再收发，但共享的 loopback 和协议期限
 仍继续推进；不能在错误分支永久睡眠并停止 TIME_WAIT/重组回收。
-raw API 沿既有单 hart 临界区串行化，IRQ 不重入堆。
+raw API 沿既有单 hart 临界区串行化，IRQ 不重入堆。无 NIC 时 `kernel_network_start`
+不创建收发 worker，但保留同一 `kernel_network` owner 与 timer-only worker：循环
+推进协议定时器并按 min(下一 socket 期限, now+5×frequency) 阻塞，期限/IRQ 只唤醒
+它，最后的 OFD 定时回收不再依赖用户再次进入 syscall，`kernel_network_stop`
+同样禁止新工作、join 后释放。
 
 停止先禁止新工作、唤醒并 join worker，清理接口的重组/ARP，移除 netif，然后
 reset 并确认 DMA 已停。netif 移除会同步按旧本地地址 abort active/bound TCP PCB，
@@ -62,10 +68,12 @@ python3 -B tests/network-external.py --transport both
 python3 -B tests/network-external.py --only linux --transport modern
 ```
 
-宿主模型独立解码寄存器银行与 split-ring 字节，57 项覆盖两种传输、头部、64 位
-地址、队列满、非法完成、索引绕回、启动失败、超时、借用与 reset owner。它不能
+宿主模型独立解码寄存器银行与 split-ring 字节，63 项覆盖两种传输、头部、64 位
+地址、队列满、非法完成、索引绕回、indirect 表展开与未协商回退、abandon 归还
+语义、启动失败、超时、借用、reset owner 与失败槽级快照。它不能
 替代真实 DMA/IRQ。`python3 -B tests/host/ethernet_worker.py` 另编译实际 worker，
-用协议/调度边界模型验证设备失败后仍推进期限并按下一期限等待；同一1514字节
+用协议/调度边界模型验证设备失败后仍推进期限并按下一期限等待，且失败只归还
+已完成 owner、不 abandon 在途引用；同一1514字节
 输入的custom路径零复制、回退路径精确复制1514字节，最后引用、OOM、控制余量
 及input失败回收均核对。边界模型不验证实际协议时钟或DMA。真实 TAP runner 在无特权 user/network namespace 内运行，
 不启用 vhost/offload、不设置网关，输出只留 build。应用、性能和最终资源证据见

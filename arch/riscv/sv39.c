@@ -453,6 +453,235 @@ static enum riscv_sv39_status allocate_runtime_table(
     return RISCV_SV39_STATUS_OK;
 }
 
+/*
+ * Kernel stack window.  The empty subtree is reserved while the kernel
+ * table is BUILDING so every user root copy inherits it; stack leaves are
+ * inserted and removed through the two runtime entry points below.
+ */
+static struct {
+    uint64_t root_address;
+    uint64_t base;
+    uint64_t size;
+    uint32_t active;
+} kernel_stack_window;
+
+enum riscv_sv39_status riscv_sv39_kernel_window_reserve(
+    struct riscv_sv39_page_table *table,
+    uint64_t virtual_address,
+    uint64_t size)
+{
+    uint64_t *root;
+    uint64_t *root_entry;
+    uint64_t table_address;
+    enum riscv_sv39_status status;
+
+    if (table == 0 || table->state != RISCV_SV39_STATE_BUILDING ||
+        kernel_stack_window.active != 0U || size == 0U ||
+        (virtual_address & (RISCV_SV39_PAGE_SIZE_4K - 1U)) != 0U ||
+        (size & (RISCV_SV39_PAGE_SIZE_4K - 1U)) != 0U ||
+        !canonical_virtual_address(virtual_address) ||
+        !valid_virtual_range(virtual_address, size) ||
+        ((virtual_address >> 30U) & RISCV_SV39_INDEX_MASK) !=
+            (((virtual_address + size - 1U) >> 30U) &
+                RISCV_SV39_INDEX_MASK)) {
+        return RISCV_SV39_STATUS_INVALID;
+    }
+    root = (uint64_t *)(uintptr_t)table->root_address;
+    root_entry = &root[(virtual_address >> 30U) & RISCV_SV39_INDEX_MASK];
+    if (*root_entry != 0U) {
+        return RISCV_SV39_STATUS_CONFLICT;
+    }
+    status = allocate_table_page(table, &table_address);
+    if (status != RISCV_SV39_STATUS_OK) {
+        return status;
+    }
+    *root_entry = table_entry(table_address);
+    kernel_stack_window.root_address = table->root_address;
+    kernel_stack_window.base = virtual_address;
+    kernel_stack_window.size = size;
+    kernel_stack_window.active = 1U;
+    return RISCV_SV39_STATUS_OK;
+}
+
+int riscv_sv39_kernel_window_active(void)
+{
+    return kernel_stack_window.active != 0U;
+}
+
+static int kernel_window_contains(uint64_t address)
+{
+    return address >= kernel_stack_window.base &&
+           address - kernel_stack_window.base <=
+               kernel_stack_window.size - RISCV_SV39_PAGE_SIZE_4K;
+}
+
+static enum riscv_sv39_status kernel_window_allocate_level0(
+    struct physical_page_allocator *allocator,
+    uint64_t *address,
+    uint64_t **entries)
+{
+    enum physical_page_status page_status;
+    enum riscv_sv39_status status;
+
+    page_status = physical_page_allocate(allocator, address);
+    if (page_status == PHYSICAL_PAGE_STATUS_EMPTY) {
+        return RISCV_SV39_STATUS_NO_MEMORY;
+    }
+    if (page_status != PHYSICAL_PAGE_STATUS_OK) {
+        return RISCV_SV39_STATUS_INVALID;
+    }
+    status = resolve_runtime_table(allocator, *address, entries);
+    if (status != RISCV_SV39_STATUS_OK) {
+        (void)physical_page_release(allocator, *address);
+        return status;
+    }
+    clear_runtime_table(*entries);
+    return RISCV_SV39_STATUS_OK;
+}
+
+static enum riscv_sv39_status kernel_window_leaf(
+    struct physical_page_allocator *allocator,
+    uint64_t virtual_address,
+    uint64_t **leaf)
+{
+    uint64_t *root;
+    uint64_t *level1;
+    uint64_t *level0;
+    uint64_t entry;
+    uint64_t table_address;
+    enum riscv_sv39_status status;
+
+    status = resolve_runtime_table(allocator,
+                                   kernel_stack_window.root_address, &root);
+    if (status != RISCV_SV39_STATUS_OK) {
+        return status;
+    }
+    entry = root[(virtual_address >> 30U) & RISCV_SV39_INDEX_MASK];
+    if (entry == 0U ||
+        (entry & RISCV_SV39_PTE_FLAGS_MASK) != RISCV_SV39_PTE_VALID) {
+        return RISCV_SV39_STATUS_INVALID;
+    }
+    status = resolve_runtime_table(allocator,
+                                   (entry >> 10U) << BOAROS_PAGE_SHIFT,
+                                   &level1);
+    if (status != RISCV_SV39_STATUS_OK) {
+        return status;
+    }
+    entry = level1[(virtual_address >> 21U) & RISCV_SV39_INDEX_MASK];
+    if (entry == 0U) {
+        status = kernel_window_allocate_level0(allocator, &table_address,
+                                               &level0);
+        if (status != RISCV_SV39_STATUS_OK) {
+            return status;
+        }
+        level1[(virtual_address >> 21U) & RISCV_SV39_INDEX_MASK] =
+            table_entry(table_address);
+    } else {
+        if ((entry & RISCV_SV39_PTE_FLAGS_MASK) != RISCV_SV39_PTE_VALID) {
+            return RISCV_SV39_STATUS_INVALID;
+        }
+        status = resolve_runtime_table(allocator,
+                                       (entry >> 10U) << BOAROS_PAGE_SHIFT,
+                                       &level0);
+        if (status != RISCV_SV39_STATUS_OK) {
+            return status;
+        }
+    }
+    *leaf = &level0[(virtual_address >> 12U) & RISCV_SV39_INDEX_MASK];
+    return RISCV_SV39_STATUS_OK;
+}
+
+enum riscv_sv39_status riscv_sv39_kernel_window_map(
+    struct physical_page_allocator *allocator,
+    uint64_t virtual_address,
+    uint64_t physical_address)
+{
+    uint64_t *leaf;
+    enum riscv_sv39_status status;
+
+    if (allocator == 0 || kernel_stack_window.active == 0U ||
+        (virtual_address & (RISCV_SV39_PAGE_SIZE_4K - 1U)) != 0U ||
+        (physical_address & (RISCV_SV39_PAGE_SIZE_4K - 1U)) != 0U ||
+        !kernel_window_contains(virtual_address) ||
+        physical_address > RISCV_SV39_PHYSICAL_MAX) {
+        return RISCV_SV39_STATUS_INVALID;
+    }
+    status = kernel_window_leaf(allocator, virtual_address, &leaf);
+    if (status != RISCV_SV39_STATUS_OK) {
+        return status;
+    }
+    if (*leaf != 0U) {
+        return RISCV_SV39_STATUS_CONFLICT;
+    }
+    *leaf = leaf_entry(physical_address, RISCV_SV39_READ | RISCV_SV39_WRITE);
+    __asm__ volatile("sfence.vma %0, zero" ::"r"(virtual_address) : "memory");
+    return RISCV_SV39_STATUS_OK;
+}
+
+enum riscv_sv39_status riscv_sv39_kernel_window_unmap(
+    struct physical_page_allocator *allocator,
+    uint64_t virtual_address)
+{
+    uint64_t *root;
+    uint64_t *level1;
+    uint64_t *level0;
+    uint64_t entry;
+    uint32_t index1;
+    enum riscv_sv39_status status;
+
+    if (allocator == 0 || kernel_stack_window.active == 0U ||
+        (virtual_address & (RISCV_SV39_PAGE_SIZE_4K - 1U)) != 0U ||
+        !kernel_window_contains(virtual_address)) {
+        return RISCV_SV39_STATUS_INVALID;
+    }
+    status = resolve_runtime_table(allocator, kernel_stack_window.root_address,
+                                   &root);
+    if (status != RISCV_SV39_STATUS_OK) {
+        return status;
+    }
+    entry = root[(virtual_address >> 30U) & RISCV_SV39_INDEX_MASK];
+    if (entry == 0U ||
+        (entry & RISCV_SV39_PTE_FLAGS_MASK) != RISCV_SV39_PTE_VALID) {
+        return RISCV_SV39_STATUS_NOT_MAPPED;
+    }
+    status = resolve_runtime_table(allocator,
+                                   (entry >> 10U) << BOAROS_PAGE_SHIFT,
+                                   &level1);
+    if (status != RISCV_SV39_STATUS_OK) {
+        return status;
+    }
+    index1 = (virtual_address >> 21U) & RISCV_SV39_INDEX_MASK;
+    entry = level1[index1];
+    if (entry == 0U ||
+        (entry & RISCV_SV39_PTE_FLAGS_MASK) != RISCV_SV39_PTE_VALID) {
+        return RISCV_SV39_STATUS_NOT_MAPPED;
+    }
+    status = resolve_runtime_table(allocator,
+                                   (entry >> 10U) << BOAROS_PAGE_SHIFT,
+                                   &level0);
+    if (status != RISCV_SV39_STATUS_OK) {
+        return status;
+    }
+    if (level0[(virtual_address >> 12U) & RISCV_SV39_INDEX_MASK] == 0U) {
+        return RISCV_SV39_STATUS_NOT_MAPPED;
+    }
+    level0[(virtual_address >> 12U) & RISCV_SV39_INDEX_MASK] = 0U;
+    for (uint32_t index = 0U; index < BOAROS_PAGE_SIZE / sizeof(*level0);
+         index++) {
+        if (level0[index] != 0U) {
+            __asm__ volatile("sfence.vma %0, zero" ::"r"(virtual_address)
+                             : "memory");
+            return RISCV_SV39_STATUS_OK;
+        }
+    }
+    /* 最后一个叶撤除后释放空表：窗口不保留常驻物理页。 */
+    level1[index1] = 0U;
+    (void)physical_page_release(allocator,
+                                (entry >> 10U) << BOAROS_PAGE_SHIFT);
+    __asm__ volatile("sfence.vma zero, zero" ::: "memory");
+    return RISCV_SV39_STATUS_OK;
+}
+
 static int valid_nonleaf_entry(uint64_t entry)
 {
     return (entry & ~RISCV_SV39_PTE_ALLOWED_MASK) == 0U &&
