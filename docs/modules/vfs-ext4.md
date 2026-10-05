@@ -405,3 +405,9 @@ OOM、独立错误与重试；后者运行 1/4/8 KiB ext4、extent/传统映射�
 `make test-io-sleep-riscv` 另用真实八页 VFS batch，要求在释放任何响应前发布八项，
 并验证保留最后一个 DMA 时取消不能提前返回。普通页缓存的顺序预读单独接入，
 不把这个内部接口门禁解释为用户 read 的吞吐收益。
+
+
+深度至少 2 的 extent 树截断会修改非根内部索引；每次路径上移归还该引用前，必须
+通过 `ext4_ext_drop_refs` 重算已修改块的校验和。直接归还并清空块号会绕过最终
+checksum 更新，使下一轮合法查找返回 EUCLEAN。`make test-lwext4-deep-truncate-host`
+构造深层稀疏树，验证 1/4 KiB 文件系统部分截断、跨进程重启读回、截零和 e2fsck。
