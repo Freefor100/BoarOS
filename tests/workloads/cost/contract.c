@@ -10,6 +10,7 @@
 #include <sys/wait.h>
 #include <sched.h>
 #include <unistd.h>
+#include <termios.h>
 static int control;
 #define CHECK(x) do { if (!(x)) { fprintf(stderr,"cost contract failed line %d errno %d\n",__LINE__,errno); exit(1); } } while (0)
 static void command(const char *text, int error)
@@ -36,11 +37,18 @@ static void blocked(pid_t pid)
     }
     CHECK(0);
 }
+static int finish(void)
+{
+    puts("COST PASS contract"); CHECK(fflush(stdout)==0);
+    /* 用户缓冲写完仍可能留在 UART 队列；快照须先排空，再允许关机 raw 输出。 */
+    CHECK(tcdrain(STDOUT_FILENO)==0);
+    return 0;
+}
 int main(void)
 {
     mkdir("/proc",0755); CHECK(mount("proc","/proc","proc",0,0)==0);
     control=open("/proc/boaros_cost_control",O_WRONLY);
-    if(control<0) { CHECK(errno==ENOENT); CHECK(open("/proc/boaros_cost",O_RDONLY)<0 && errno==ENOENT); puts("COST PASS contract"); return 0; }
+    if(control<0) { CHECK(errno==ENOENT); CHECK(open("/proc/boaros_cost",O_RDONLY)<0 && errno==ENOENT); return finish(); }
     CHECK(control>=0);
     command("end\n",EINVAL); command("begin",EINVAL); command("begin\nextra",EINVAL);
     CHECK(write(control,(void *)1,6)==-1 && errno==EFAULT);
@@ -66,5 +74,5 @@ int main(void)
     char header[1024]; ssize_t n=read(report,header,sizeof(header)-1); CHECK(n>0); header[n]=0;
     CHECK(strstr(header,"state=incomplete\n")!=NULL); close(report);
     command("begin\n",0); command("end\n",0); snapshot("after-abort",5);
-    puts("COST PASS contract"); return 0;
+    return finish();
 }

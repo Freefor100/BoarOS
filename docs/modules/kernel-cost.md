@@ -23,6 +23,10 @@ consumer 包装器允许同步已达到 durable、后台 checkpoint 尚在途的
 不能并入原操作延迟，也不能把原操作已成功解释成 checkpoint 已排空。其他受控
 case 的严格结束检查不变；内核的 EBUSY/inflight/complete 契约不放宽。
 
+`contract` 程序打印最后的快照与通过标记后，先 `fflush` 再 `tcdrain`，确认
+TTY 输出队列排空才退出。仅清 libc 缓冲不足以阻止关机 raw 诊断插入 UART
+队列中的快照行；runner 保持严格解析，不删除损坏行或把部分快照当成有效结果。
+
 窗口身份是递增 epoch，owner 是进程身份代次。开始覆盖控制线程组和当前后代；
 后续 fork/clone 继承 epoch，exec 保留。开始前已阻塞的成员操作重新登记在途数量，
 结束不得越过它；取消消耗本任务尚未离开的 scope，未回到的栈不成为永久诊断 owner。

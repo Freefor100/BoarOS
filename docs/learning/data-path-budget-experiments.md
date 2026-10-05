@@ -84,6 +84,12 @@ BoarOS/Linux 18 次 release 功能启动和两次诊断通过。新增 managed �
 均读出 peak>=current 和合法 COST 快照。所有记录为 functional-smoke-not-performance，
 不生成性能分布，也没有把参数列表中的 64 MiB 全矩阵称为已运行。
 
+最终 COST 契约复核曾捕获 `observer.journal_wait...` 一行被关机 network final
+诊断插入，原始记录保留为失败。原因是 `fflush` 后 UART 队列尚未排空；沿已有
+metadata workload 的边界，在 contract 正常退出前显式 `tcdrain`。该操作位于
+全部观测窗口之后；不修改 COST 状态机，也不让解析器跳过坏行。修复后三次独立
+启动、每次四个诊断窗口通过，原失败记录不计为成功副本。
+
 ```sh
 python3 -B tests/network-budget-config.py
 python3 -B tests/network-budget-selftest.py
