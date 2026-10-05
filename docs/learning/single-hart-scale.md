@@ -295,3 +295,17 @@ python3 -B tests/readahead-riscv.py --pages 1 2 4 8 --block-size 4096 --held --t
 python3 -B tests/readahead-riscv.py --pages 1 8 --block-size 4096 --held --transport legacy
 make CFLAGS_EXTRA='-DBOAROS_PAGE_CACHE_READAHEAD_PAGES=8 -DBOAROS_PAGE_CACHE_WRITEBACK_PAGES=8' test-stack-usage
 ```
+
+
+## 诊断内存高水位（2026-10-06）
+
+仅用 workload 后的 meminfo 无法报告峰值。COST 构建新增受管分配器高水位，并复用
+heap 已有 peak_pages；二者分别输出初始化以来的最大占用，heap 为子集，不相加。
+峰值不在窗口 begin 清零，明确包含启动与其他内核运行分配，不冒充 workload 独占峰值。
+协议静态数组属于内核映像，不计入受管池峰值；TCP 实验另列静态预算与 lwIP 自身
+高水位。release 编译掉新跟踪；观察扰动仍需匹配 release/diagnostic 运行单独测量。
+
+初始接线但未更新峰值时，实际 allocator 的 finalize 断言失败；更新后 bootstrap、
+metadata、order-3、满池与释放保持测试通过，既有 COST/allocator 抢占宿主测试通过。
+两次实际网络 mixed 与两次 RA8/WB8 的追加 fsync/冷读诊断烟测成功读出 current/peak，
+均 peak>=current，并解析完整成本快照。这四次仍是功能烟测，不作性能样本。

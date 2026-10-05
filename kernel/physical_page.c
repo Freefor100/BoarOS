@@ -14,6 +14,16 @@ extern void kernel_console_emergency_begin(void) __attribute__((weak));
 #define PHYSICAL_PAGE_NONE UINT64_MAX
 #define PHYSICAL_PAGE_INDEX_NONE UINT32_MAX
 
+static void note_allocated_peak(struct physical_page_allocator *allocator)
+{
+#if BOAROS_COST_DIAGNOSTICS
+    uint64_t current = allocator->total_pages - allocator->available_pages;
+    if (current > allocator->allocated_peak_pages) allocator->allocated_peak_pages = current;
+#else
+    (void)allocator;
+#endif
+}
+
 enum physical_page_state {
     PHYSICAL_PAGE_STATE_ALLOCATED_HEAD = 0,
     PHYSICAL_PAGE_STATE_ALLOCATED_TAIL,
@@ -292,6 +302,9 @@ enum physical_page_status physical_page_allocator_init(
     result.buffer_context = 0;
     result.total_pages = 0U;
     result.available_pages = 0U;
+#if BOAROS_COST_DIAGNOSTICS
+    result.allocated_peak_pages = 0;
+#endif
     result.recycled_head = PHYSICAL_PAGE_NONE;
     result.metadata_address = PHYSICAL_PAGE_NONE;
     result.metadata_pages = 0U;
@@ -407,6 +420,7 @@ static enum physical_page_status physical_page_allocate_bootstrap(
 
         allocator->recycled_head = next;
         allocator->available_pages--;
+        note_allocated_peak(allocator);
         *address = result;
         return PHYSICAL_PAGE_STATUS_OK;
     }
@@ -419,6 +433,7 @@ static enum physical_page_status physical_page_allocate_bootstrap(
 
             range->next += BOAROS_PAGE_SIZE;
             allocator->available_pages--;
+            note_allocated_peak(allocator);
             *address = result;
             return PHYSICAL_PAGE_STATUS_OK;
         }
@@ -1013,6 +1028,7 @@ enum physical_page_status physical_page_allocator_finalize(
     }
 
     result.available_pages = free_pages;
+    note_allocated_peak(&result);
     result.recycled_head = PHYSICAL_PAGE_NONE;
     result.finalized = PHYSICAL_PAGE_ALLOCATOR_FINALIZED;
     *allocator = result;
@@ -1099,6 +1115,7 @@ static enum physical_page_status physical_page_allocate_order_once(
                PHYSICAL_PAGE_STATE_ALLOCATED_TAIL);
     allocator->metadata[page_index].reference_count = 1U;
     allocator->available_pages -= block_pages;
+    note_allocated_peak(allocator);
     *address = result_address;
     return PHYSICAL_PAGE_STATUS_OK;
 }
