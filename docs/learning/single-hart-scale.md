@@ -58,7 +58,7 @@ make prune-build
 
 PR CI 加入规模、SQLite DELETE/WAL 和离线 GCC 入口。SQLite/musl 源按固定清单恢复，Alpine 工具链由 runner 校验固定输入；缺失或校验失败不能跳过报绿。恢复 CI 独立支持手动与每周一北京时间 02:00（UTC 周日 18:00），显式 bash pipefail 保留 make 的失败状态，失败产物上传。Linux 缓存由身份键定位，runner 仍检查输入。工作流已做本地解析与对应入口验证，尚未执行托管 GitHub Actions。glibc 仍是固定本机输入的严格本地验收，可移植供应另列待办。
 
-本次规模阶段当时未包含可睡眠 I/O、后台写回或多盘；这些机制现已在后续阶段交付，见[可睡眠存储](sleepable-storage.md)及[VFS/ext4](../modules/vfs-ext4.md)。范围写回索引、事务合并、共享文件 futex、SMP 和第二架构仍未交付；后续优先顺序只在[路线](../goals.md)维护。
+本次规模阶段当时未包含可睡眠 I/O、后台写回或多盘；这些机制现已在后续阶段交付，见[可睡眠存储](sleepable-storage.md)及[VFS/ext4](../modules/vfs-ext4.md)。范围写回索引与事务合并也已在后续阶段交付；共享文件 futex、SMP 和第二架构仍未交付；后续优先顺序只在[路线](../goals.md)维护。
 
 AF_UNIX DGRAM 的成本边界为每条消息最多 64 KiB 连续暂存与一次队列提交，不把用户页或 iovec 当作消息边界。零消息收一字节预算，截断接收和 fault 丢弃返还整包预算；否则只返还复制字节会在重复短接收后泄漏队列容量。`make test-scale-riscv` 覆盖两处分配 OOM、100 条零消息、满队列、重复截断和接收 fault；`make test-userland-riscv` 用真实 pthread 验证尚有少量 POLLOUT 空间时写者仍等待整条预算，并检查取消不发布消息。这里验证语义和内存上界，没有吞吐测量结论。
 
@@ -147,7 +147,7 @@ DELETE 的 WRITE 36/38、FLUSH 20，以及 WAL 的 WRITE 17/18 在对应执行�
 切点由各自运行日志测得，不借用历史 441 次矩阵的包络。恢复用相同程序 SHA-256
 `510fc4c7b8e72a2224603b053bc9d5967f295e20a5085500038a4dd4936436f5`，
 NBD server 为 `22a8c979a85a153c28c7b7fdeac7aa73f06d440b44c5e90cda7590db8dd452ab`。
-这些是正确性和成本结果，当前没有匹配发布构建的吞吐结论。
+这些是该阶段的正确性和成本结果；后续综合改动的匹配吞吐另见[预算报告](data-path-budget-experiments.md)，不能把两层证据混为一次测量。
 
 ```sh
 make all test-scale-riscv test-cache-growth-riscv
@@ -175,7 +175,7 @@ make test-io-sleep-riscv
 ```
 
 这是底层并发和生命周期验收，既不表示 ext4 已用批量读，也不是预读吞吐收益。
-VFS/ext4/页缓存接入、预读和连续写回实验继续作为独立阶段交付。
+VFS/ext4/页缓存接入、预读和连续写回随后已独立交付，见本页后文和最终预算报告。
 
 
 ## ext4 缓存版本内的批量读（2026-10-06）
@@ -198,7 +198,7 @@ journal pending 缓存的新内容；ASan/UBSan 通过。实际 bcache 模型另
 先释放七个仍保持最后一个 DMA owner，之后检查全部页内容、完成量与最终无在途。
 本轮 fixture 内核 SHA-256 为
 `681421ab44460fec278a3a813fb9ce5679e376d34491443f7a4418cd26332b70`，QEMU 11.1.1。
-该证据到 VFS 内部接口为止；普通 demand read 的页缓存预读调度尚待接入，未测吞吐。
+该证据到当时的 VFS 内部接口为止；普通 demand read 的页缓存预读调度随后接入，吞吐结果另记于最终预算报告。
 
 ```sh
 make test-lwext4-cache-host test-lwext4-batch-read-host test-lwext4-host
@@ -263,8 +263,8 @@ make test-writeback-batch-riscv
 python3 -B tests/writeback-batch-riscv.py --pages 1 8 --block-size 1024 4096 --transport legacy
 ```
 
-这是机制与成本验收；候选改变 undo 操作大小后的完整恢复矩阵和匹配发布吞吐，
-仍与预读、TCP 候选一起完成。当前结果不用于自动选择新的生产默认值。
+这是该阶段的机制与成本验收；随后默认/RA8WB8 的完整恢复与匹配发布吞吐已完成，
+见[最终预算报告](data-path-budget-experiments.md)。结果不用于自动选择新的生产默认值。
 
 
 ## 页缓存顺序预读与取消（2026-10-06）
@@ -303,9 +303,17 @@ make CFLAGS_EXTRA='-DBOAROS_PAGE_CACHE_READAHEAD_PAGES=8 -DBOAROS_PAGE_CACHE_WRI
 heap 已有 peak_pages；二者分别输出初始化以来的最大占用，heap 为子集，不相加。
 峰值不在窗口 begin 清零，明确包含启动与其他内核运行分配，不冒充 workload 独占峰值。
 协议静态数组属于内核映像，不计入受管池峰值；TCP 实验另列静态预算与 lwIP 自身
-高水位。release 编译掉新跟踪；观察扰动仍需匹配 release/diagnostic 运行单独测量。
+高水位。release 编译掉新跟踪；后续已用匹配 release/diagnostic 运行单独测量观察扰动。
 
 初始接线但未更新峰值时，实际 allocator 的 finalize 断言失败；更新后 bootstrap、
 metadata、order-3、满池与释放保持测试通过，既有 COST/allocator 抢占宿主测试通过。
 两次实际网络 mixed 与两次 RA8/WB8 的追加 fsync/冷读诊断烟测成功读出 current/peak，
 均 peak>=current，并解析完整成本快照。这四次仍是功能烟测，不作性能样本。
+
+
+## 综合测量收口（2026-10-06）
+
+[数据路径预算报告](data-path-budget-experiments.md)记录阶段七后 1,218 次发布启动、
+184 次诊断，以及默认/RA8WB8 完整恢复的输入边界。64 MiB 追加的规模收益与 WB8
+在缓存完成中的回退均保留，RA8 冷读收益也不推广为所有读取模式。默认仍 RA0/WB1。
+每连接/文件完成时间、内存 owner、观测开销和失败过的测试协调协议均可在该报告复核。

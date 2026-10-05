@@ -583,7 +583,7 @@ python3 -B tests/network-riscv.py --only boaros --workload budget
 make test-io-sleep-riscv test-userland-riscv test-glibc-riscv test-diff-abi-riscv test-stack-usage
 ```
 
-窗口、pbuf/segment、NIC 和块队列默认值未扩大；后续批量读/写及 TCP 预算实验仍需匹配测量。
+该阶段没有扩大窗口、pbuf/segment、NIC 或块队列默认值；后续批量读/写及 TCP 预算已完成匹配测量，见文末收口。
 
 
 ## 资源分类与 TIME_WAIT 借用的审查修复（2026-10-06）
@@ -615,3 +615,17 @@ host 门禁证明。烟测不计入发布吞吐。可先重建窄门禁：
 ```sh
 python3 -B tests/host/network_owner.py --sanitize
 ```
+
+
+## 最终预算与协调器复核（2026-10-06）
+
+固定生产源码 faf8e63 的 TCP 27 组候选、新 ELF 的 702 次发布启动及独立诊断已完成，
+见[完整指标与每连接完成时间](data-path-budget-experiments.md#正式匹配结果2026-10-06)。
+默认 8/1/1 在部分吞吐负载回退；近池的 8/4/2 避免实测 segment/heap 饱和后重复复制，
+恢复接近旧基线的吞吐并降低控制尾延迟。它不是通用最优或硬控制流预留，默认未变。
+
+扩大验证曾在固定 Linux 的 RR 五连接超时：两轮屏障共用 gate，快客户端能取走慢
+客户端的上一轮 token。实际 workload 的到达偏斜 host 测试先稳定失败，再以独立
+管道修复；重新冻结 ELF 后全套网络筛选/扩展完成，旧 ELF 数字不混入最终表。
+QEMU 11.1.1 的实际 echo RTT、诊断扰动、TX 软件收割到归还及同槽再用的范围独立
+报告；1/10 ms netem 在 host 创建 qdisc 时被拒绝，未启动客体，不推断远程网络收益。

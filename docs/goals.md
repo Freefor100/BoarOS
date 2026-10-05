@@ -4,7 +4,7 @@
 `[x]` 只表示具体交付已验收；历史测量、输入身份和可重建命令归现有 learning。
 固定 Linux 位于 `references/linux`，精确版本与其他资料由 `references/sources.tsv` 管理。评审是调查输入，不自动成为实现或验收证据。
 
-## 当前状态与未关闭风险（2026-10-05）
+## 当前状态与未关闭风险（2026-10-06）
 
 N3已经交付：legacy/modern VirtIO-net、受限DMA借用与复制回退、静态IPv4＋ARP、
 有界分片重组，以及隔离宿主双向TCP/HTTP。1196条ABI、原22项网络客户端和相关系统
@@ -12,25 +12,27 @@ N3已经交付：legacy/modern VirtIO-net、受限DMA借用与复制回退、静
 随后buddy/slab的timer抢占竞态已确定性复现、修复并验收；纯块超时也已补reset前快照。
 这些内存与诊断修复已单向合入兼容分支；网络、FIFO和重启的适用范围见对应模块。
 
-| 未关闭项 | 当前证据与下一步 |
+| 条目 | 当前证据与下一步 |
 |---|---|
 | 历史Virtqueue告警 | 已还原到旧兼容内核的五连接loopback；原启动只有块盘和RNG，没有VirtIO-net。具体报错队列与超额原因仍未知；后续失败必须先保留新快照，按队列身份定位，不以重复通过关闭。net 失败路径现已有槽级快照（2026-10-05，见网卡模块），原告警仍缺历史现场。 |
 | 历史页释放fatal的具体现场 | 已修复能够产生同类fatal的分配器双owner竞态；原事件没有owner快照，不能反推唯一触发链。 |
 | pthread取消与旧libc输入 | 原镜像动态glibc的cancel/exit缺libgcc_s；独立glibc运行环境已固定unwind依赖并保护取消/cleanup。静态cancel-points的join结果在固定Linux也失败，按库/测试契约继续核对，不能归给内核。历史偶发现场仍保留P0c边界，不安排无目的重复次数。 |
 | 内核抢占边界 | allocator修复不等于所有共享状态已审完。限定检查开中断worker到共享对象的调用链、睡眠前引用和发布临界区；发现具体错误才扩大。 |
 | TX 完成进展纠错 | worker先收割并释放完成槽，再推进协议；睡眠前覆盖SG与复制路径的新容量。宿主顺序/关闭窗口、真实两种TAP传输和无NIC定时器验证通过；见[网络owner](learning/network-ownership.md)。 |
-| 就绪查询与协议服务 | poll 为局部只读快照，短 syscall 与后台 worker 共用有界服务；协议池/NIC/接收堆归还按代次通知等待者。模型与真实 RV64 验证见[网络记录](learning/network-ownership.md#纯就绪与有界协议服务2026-10-05)，接纳 reservation 已接入 TCP 流复制；窗口实验仍属后续阶段。 |
-| TCP 接纳约束复制 | 参数/状态/容量优先于 payload 复制，任务登记的 byte reservation 和 OFD pin 允许复制睡眠。预先 EAGAIN 为零页解析/零复制；全局协议资源变化仍允许有界失败。Linux 同 ELF 契约、交错和退出验收见[网络记录](learning/network-ownership.md#tcp接纳预算与复制2026-10-05)。 |
-| 缓存覆盖与脏范围 | 冷页完整覆盖不预读旧页，独立脏页组织与哈希选择最小候选集合，快照只复制脏段。64 MiB 成本门禁及文件/映射/交错回归通过；完整 lwext4 及 SQLite DELETE/WAL 恢复矩阵通过，候选序号未触发的条目单列于[规模记录](learning/single-hart-scale.md#冷页覆盖与脏范围2026-10-06)；块层与 VFS/ext4 八项批量读已通过真实暂扣门禁，写回 1/2/4/8 页候选已通过独立门禁，预读 0/1/2/4/8 页和取消/真实暂扣门禁已通过；身份绑定的 TCP 27 组/存储 20 组工具及功能烟测已交付；最终恢复矩阵与匹配性能实验继续实施，见[预算实验](learning/data-path-budget-experiments.md)。 |
-| 追加增长纠错 | 增长与截断分离；对齐增长不扫描缓存页链，非对齐增长仅处理旧尾页。1/4/16/64 MiB 成本门禁与真实文件/映射回归通过，吞吐尚未重测；见[规模成本](learning/single-hart-scale.md)。 |
+| 就绪查询与协议服务 | poll 为局部只读快照，短 syscall 与后台 worker 共用有界服务；协议池/NIC/接收堆归还按代次通知等待者。模型与真实 RV64 验证见[网络记录](learning/network-ownership.md#纯就绪与有界协议服务2026-10-05)，接纳 reservation 已接入 TCP 流复制；27 组窗口/池/堆实验已完成，默认预算部分负载吞吐回退，控制尾延迟与资源峰值分开列于[预算结果](learning/data-path-budget-experiments.md)。 |
+| TCP 接纳约束复制 | 参数/状态/容量优先于 payload 复制，任务登记的 byte reservation 和 OFD pin 允许复制睡眠。预先 EAGAIN 为零页解析/零复制；全局协议资源变化仍允许有界失败；近池诊断实际捕获 segment/heap 饱和后的重复复制，8/4/2 在本负载消除该项失败，尚非跨层预约。Linux 同 ELF 契约、交错和退出验收见[网络记录](learning/network-ownership.md#tcp接纳预算与复制2026-10-05)。 |
+| 缓存覆盖与脏范围 | 冷页完整覆盖不预读旧页，独立脏页组织与哈希选择最小候选集合，快照只复制脏段。64 MiB 成本门禁及文件/映射/交错回归通过；完整 lwext4 及 SQLite DELETE/WAL 恢复矩阵通过，候选序号未触发的条目单列于[规模记录](learning/single-hart-scale.md#冷页覆盖与脏范围2026-10-06)；块层与 VFS/ext4 八项批量读已通过真实暂扣门禁，写回 1/2/4/8 页候选已通过独立门禁，预读 0/1/2/4/8 页和取消/真实暂扣门禁已通过；默认与 RA8/WB8 的阶段七后完整 DELETE/WAL 恢复已通过；身份绑定的 TCP 27 组/存储 20 组及扩展实验共 1,218 次发布启动、184 次诊断通过，默认配置待用户依据负载选择；见[预算实验](learning/data-path-budget-experiments.md)。 |
+| 追加增长纠错 | 增长与截断分离；对齐增长不扫描缓存页链，非对齐增长仅处理旧尾页。1/4/16/64 MiB 成本门禁与真实文件/映射回归通过，另有匹配吞吐：64 MiB、1 KiB 缓存追加默认约 20.86 MiB/s，旧基线约 3.70；不推广成整体倍数。见[规模成本](learning/single-hart-scale.md)和[测量边界](learning/data-path-budget-experiments.md)。 |
 | epoll 交付纠错 | 完整 event 复制后提交 ET/ONESHOT；独立扫描/pending、MOD 代次与任务退出 owner 已接入。生产函数宿主边界及固定 Linux 同 RV64 ELF 验证通过；见[事件交付](learning/epoll-delivery.md)。 |
-| 双盘控制协议纠错 | 原基线 `3c34091`/`5687377` 的暂扣阶段超时已定位为规范模式终端等待行结束：host只发送单字节g，尚未出现B盘暂扣READ。guest显式设置并恢复控制终端后，暂扣/故障/重启和FIFO/RR四组合通过；已加入CI目标，尚无本提交的托管CI结果。见[可睡眠存储](learning/sleepable-storage.md)。 |
+| 双盘控制协议纠错 | 原基线 `3c34091`/`5687377` 的暂扣阶段超时已定位为规范模式终端等待行结束：host只发送单字节g，尚未出现B盘暂扣READ。guest显式设置并恢复控制终端后，暂扣/故障/重启和FIFO/RR四组合通过；最终复核还修复主动kill与NBD响应写入的收口竞态，受控cut确认后30次额外故障/重启通过。已加入CI目标，尚无本提交的托管CI结果。见[可睡眠存储](learning/sleepable-storage.md)。 |
 
 [风险证据与重建](learning/cost-baseline.md#旧版内存释放与-virtqueue-告警2026-10-02)
 区分已经修复的机制与缺少历史现场的归因。固定root、单hart、QEMU和选定应用验收
 均不代表多用户隔离、SMP、实板或完整Linux兼容。完整比赛Harness仍缺kernel-la。
 
 ## 近期方向
+
+本轮单核数据路径阶段一至七已交付，保留以下由测量暴露的后续边界：默认 TCP 预算在部分 bulk/高并发负载吞吐回退；全局协议资源不足后的复制与重试仍有成本；WB8 可能降低仅缓存完成的小写速度。优先按[匹配结果](learning/data-path-budget-experiments.md)选择目标程序和候选，再决定是否调整生产默认。1/10 ms netem 因宿主缺少 qdisc 支持未测，不能推断远程 RTT 下的收益；完整比赛仍缺 kernel-la。
 
 文件元数据的活inode复用、创建句柄初始化、O_PATH与路径truncate已交付，通用实现
 已单向合入兼容分支。路径资格、睡眠前节点引用、初始时间与显式改权的区别、截断属性

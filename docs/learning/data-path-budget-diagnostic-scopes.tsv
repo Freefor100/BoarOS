@@ -1,0 +1,13 @@
+scope	description
+S1	Active COST lanes, including setup/teardown inside the epoch; excludes observer lane.
+S2	Active COST lanes, including setup/teardown inside the epoch; excludes observer lane. Per verified I/O MiB.
+S3	Active COST lanes, including setup/teardown inside the epoch; excludes observer lane. Per verified bulk MiB; mixed RR traffic is included in costs. Loopback counts both guest endpoints, TAP only guest.
+S4	Allocator/owning OFD heap lifetime to snapshot, before COST text formatting; heap is a subset of managed pages; reserved image/static protocol arrays excluded.
+S5	Between protocol snapshots around COST epoch; TCP transmit attempts are not wire packets.
+S6	Device lifetime including setup and shutdown.
+S7	Device lifetime including setup and shutdown; DONE is software harvest, FREE-to-post includes idle reuse.
+S8	Observed build, not a release throughput result.
+S9	Per verified bulk MiB, including mixed RR/setup/teardown protocol work.
+S10	Per-boot arithmetic mean; software slot lifetime, not hardware completion or ready-only wait.
+S11	Per-boot maximum; FREE-to-post includes legitimate idle slots.
+S12	lwIP lifetime high watermark; static backing budget is reported separately.
