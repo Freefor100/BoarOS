@@ -249,3 +249,14 @@ INET stream 的 write/writev/send/sendmsg 使用任务登记的 `kernel_socket_w
 scale 保护竞争 reservation、abort 归还及零容量下零页解析/零 stream usercopy；
 真实调度的 io-sleep 包装用户复制边界，覆盖保留 reservation 时关闭并复用 fd、并发 shutdown、
 用户页撤销后的 fault 和预算重取。它模型化可睡眠复制的交错，不宣称复现硬件缺页的具体时序。
+
+`python3 -B tests/network-owner-riscv.py --kernel kernel-rv` 在 legacy/modern
+两种 VirtIO 传输下关闭 indirect 特性，以真实 TAP 的双向 bulk/control 内容检查
+验证复制路径，并要求 driver 的 `tx-copy>0`、`tx-sg=0`、`errors=0`。该入口只运行
+功能 smoke；它与冻结资源边界的 host 用例共同验证，不单靠最终传输成功证明
+NIC 容量通知没有遗漏。
+
+TCP 的 27 组窗口/池/堆候选由 `BOAROS_LWIP_WINDOW_MSS`、`BOAROS_LWIP_POOL_SCALE`、
+`BOAROS_LWIP_MEM_SCALE` 选择，默认 8/1/1，PCB 数不变。工具、静态/动态内存口径、
+控制流 tail 与固定输入约束见[预算实验](../learning/data-path-budget-experiments.md)，
+可运行候选不等于吞吐已经验收，默认值须依据匹配结果由人选择。

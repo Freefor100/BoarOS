@@ -9,7 +9,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 BUILD = ROOT / 'build'
-KEEP_TOP = {'cost', 'riscv', 'diff-abi', 'program-environment', 'program-libc', 'host', 'tools', 'offline-c'}
+KEEP_TOP = {'data-path-baselines', 'network-budget', 'io-budget', 'cost', 'riscv', 'diff-abi', 'program-environment', 'program-libc', 'host', 'tools', 'offline-c'}
 KEEP_ROOT_FILES = {'elf-tail-rv', 'elf-tail-dynamic-rv', 'elf-tail-norelro-rv'}
 
 
@@ -33,6 +33,15 @@ def candidates():
         if path.is_file() and path.name in KEEP_ROOT_FILES:
             continue
         result.append(path)
+
+    # Matched-kernel builds and their identities are reusable; runs/images are not.
+    for family in ('network-budget', 'io-budget'):
+        directory = BUILD / family
+        if directory.is_dir():
+            result.extend(path for path in directory.iterdir() if path.name != 'kernels')
+            kernels = directory / 'kernels'
+            if kernels.is_dir():
+                result.extend(path for path in kernels.glob('*/build.log'))
 
     riscv = BUILD / 'riscv'
     if riscv.is_dir():
