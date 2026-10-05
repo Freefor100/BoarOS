@@ -1147,6 +1147,8 @@ static void apply_truncated_size(struct kernel_vfs_node *node,
                                  struct kernel_vfs_file *file, uint64_t size)
 {
     uint64_t old_size = node->size;
+    if (size > old_size && node->instance->page_cache)
+        kernel_page_cache_extend(node->instance->page_cache, node, old_size, size);
     node->size = size;
     file->size = node->size;
     if (node->size < old_size) {
@@ -1155,10 +1157,8 @@ static void apply_truncated_size(struct kernel_vfs_node *node,
             mapping->truncate(mapping->owner, node, node->size);
         }
     }
-    if (node->instance->page_cache != 0) {
-        kernel_page_cache_resize(node->instance->page_cache, node,
-                                  old_size, node->size);
-    }
+    if (size < old_size && node->instance->page_cache)
+        kernel_page_cache_truncate(node->instance->page_cache, node, size);
 }
 
 int kernel_vfs_pwrite(struct kernel_vfs_file *file,

@@ -1778,3 +1778,7 @@ test-epoll-host:
 	build/host/epoll-delivery
 test-epoll-riscv: $(KERNEL_RV) $(MUSL_STAMP)
 	python3 -B tests/epoll-riscv.py --kernel $(KERNEL_RV) --qemu $(QEMU_RISCV64)
+
+.PHONY: test-cache-growth-riscv
+test-cache-growth-riscv:
+	$(MAKE) COST_DIAGNOSTICS=1 test-scale-riscv

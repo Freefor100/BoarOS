@@ -159,6 +159,13 @@ cookie 可以交给 `lseek`/`telldir`/`seekdir` 恢复。OFD 持有位置，所�
 
 ## 当前成本边界
 
+增长与缩小分别进入 `kernel_page_cache_extend` 和 `kernel_page_cache_truncate`。
+增长只查询旧 EOF 的非对齐尾页，清零新暴露字节并重新保护别名，再发布长度；
+页对齐或同长度不访问 inode 页链，也不排空历史 cleanup。真正缩小仍在撤映射后
+处理越界页、尾页脏范围和 owner。该优化不改变私有 COW 副本，哈希探测与尾页
+实际别名工作单独计量。`make test-cache-growth-riscv` 在 COST 构建检查
+1/4/16/64 MiB × 1/4/64 KiB 写入的增长访问界及全文件内容，见[规模成本](../learning/single-hart-scale.md)。
+
 正确性验收不等于吞吐已优化。`fs/files/io.c` 先将用户数据复制到请求缓冲，
 再写页缓存；页级 staging 已减少分块和用户页解析次数，并非零复制。
 `kernel_page_cache_writeback_range()` 遍历 inode 的缓存页链两次，分配并 pin

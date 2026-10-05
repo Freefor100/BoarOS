@@ -18,6 +18,7 @@ N3已经交付：legacy/modern VirtIO-net、受限DMA借用与复制回退、静
 | 历史页释放fatal的具体现场 | 已修复能够产生同类fatal的分配器双owner竞态；原事件没有owner快照，不能反推唯一触发链。 |
 | pthread取消与旧libc输入 | 原镜像动态glibc的cancel/exit缺libgcc_s；独立glibc运行环境已固定unwind依赖并保护取消/cleanup。静态cancel-points的join结果在固定Linux也失败，按库/测试契约继续核对，不能归给内核。历史偶发现场仍保留P0c边界，不安排无目的重复次数。 |
 | 内核抢占边界 | allocator修复不等于所有共享状态已审完。限定检查开中断worker到共享对象的调用链、睡眠前引用和发布临界区；发现具体错误才扩大。 |
+| 追加增长纠错 | 增长与截断分离；对齐增长不扫描缓存页链，非对齐增长仅处理旧尾页。1/4/16/64 MiB 成本门禁与真实文件/映射回归通过，吞吐尚未重测；见[规模成本](learning/single-hart-scale.md)。 |
 | epoll 交付纠错 | 完整 event 复制后提交 ET/ONESHOT；独立扫描/pending、MOD 代次与任务退出 owner 已接入。生产函数宿主边界及固定 Linux 同 RV64 ELF 验证通过；见[事件交付](learning/epoll-delivery.md)。 |
 | 本机 multi-disk-io 测试 | `make test-multi-disk-io-riscv` 在基线 `3c34091` 上同样失败：guest 在 B 盘暂扣阶段挂住，harness 90 秒后超时；CI 不运行该目标，本会话改动 A/B 均复现，因果待独立定位。 |
 

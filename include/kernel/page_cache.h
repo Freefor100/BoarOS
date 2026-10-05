@@ -103,8 +103,12 @@ int kernel_page_cache_writeback_before(struct kernel_page_cache *cache,
     struct kernel_vfs_node *node, uint64_t end);
 int kernel_page_cache_writeback_range(struct kernel_page_cache *cache,
     struct kernel_vfs_node *node, uint64_t start, uint64_t end);
-void kernel_page_cache_resize(struct kernel_page_cache *cache,
+/* Caller owns the inode mutation lock. Growth only touches the cached old
+ * EOF tail; shrink follows mapping invalidation and removes out-of-range pages. */
+void kernel_page_cache_extend(struct kernel_page_cache *cache,
     struct kernel_vfs_node *node, uint64_t old_size, uint64_t new_size);
+void kernel_page_cache_truncate(struct kernel_page_cache *cache,
+    struct kernel_vfs_node *node, uint64_t new_size);
 
 int kernel_page_cache_start_worker(struct kernel_page_cache *cache);
 void kernel_page_cache_stop_worker(struct kernel_page_cache *cache);
