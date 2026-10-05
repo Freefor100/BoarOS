@@ -51,11 +51,15 @@ _Static_assert(offsetof(struct linux_epoll_event, data) == 8U,
                "Linux epoll_event.data must be at offset 8");
 
 struct kernel_epoll;
+struct kernel_epoll_wait_request;
 
 struct kernel_epoll_item {
     int target_fd;
     struct kernel_open_file_description *target_file;
     struct kernel_epoll *epoll;
+    struct kernel_heap *heap;
+    uint32_t references;
+    uint64_t control_generation, notification_generation;
     uint32_t events;
     uint64_t data;
     struct kernel_wait_node wait_node;
@@ -64,11 +68,12 @@ struct kernel_epoll_item {
     struct kernel_epoll_item *items_prev;
 
     struct kernel_epoll_item *ready_next;
+    struct kernel_epoll_item *pending_next;
 
     struct kernel_epoll_item *target_next;
     struct kernel_epoll_item *target_prev;
 
-    uint8_t on_ready_list;
+    uint8_t on_ready_list, on_pending_list, in_scan, linked;
     uint8_t oneshot_disarmed;
 };
 
@@ -79,7 +84,16 @@ struct kernel_epoll {
     struct kernel_epoll_item *items_head;
     struct kernel_epoll_item *ready_head;
     struct kernel_epoll_item *ready_tail;
+    struct kernel_epoll_item *pending_head, *pending_tail;
+    struct kernel_epoll_wait_request *scan_owner;
     uint32_t item_count;
+};
+
+struct kernel_epoll_wait_request {
+    struct kernel_task *task;
+    struct kernel_epoll *epoll;
+    struct kernel_open_file_description *file, *target;
+    struct kernel_epoll_item *head;
 };
 
 int kernel_epoll_create(struct kernel_heap *heap,

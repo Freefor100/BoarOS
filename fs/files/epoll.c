@@ -4,6 +4,8 @@
 
 #include <arch/riscv/context.h>
 #include <kernel/errno.h>
+#include <kernel/epoll.h>
+#include <kernel/task.h>
 #include <kernel/heap.h>
 #include <kernel/open_file.h>
 #include <kernel/scheduler.h>
@@ -16,7 +18,6 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define KERNEL_EPOLL_STACK_CAPACITY 4U
 #define KERNEL_EPOLL_MAX_NESTS 4U
 
 static struct kernel_open_file_description *epoll_first_socket(
@@ -38,33 +39,48 @@ static struct kernel_open_file_description *epoll_first_socket(
     return 0;
 }
 
-static void kernel_epoll_wait_callback(
-    struct kernel_wait_node *node,
-    uint32_t reason)
+static void epoll_ready_add(struct kernel_epoll *epoll, struct kernel_epoll_item *item)
 {
-    struct kernel_epoll_item *item;
-    struct kernel_epoll *epoll;
+    if (!item->linked || item->oneshot_disarmed || item->on_ready_list) return;
+    item->ready_next = 0;
+    if (epoll->ready_tail) epoll->ready_tail->ready_next = item;
+    else epoll->ready_head = item;
+    epoll->ready_tail = item;
+    item->on_ready_list = 1;
+}
 
+static void epoll_pending_add(struct kernel_epoll *epoll, struct kernel_epoll_item *item)
+{
+    if (!item->linked || item->oneshot_disarmed || item->on_pending_list) return;
+    item->pending_next = 0;
+    if (epoll->pending_tail) epoll->pending_tail->pending_next = item;
+    else epoll->pending_head = item;
+    epoll->pending_tail = item;
+    item->on_pending_list = 1;
+}
+
+static void epoll_item_put(struct kernel_epoll_item *item)
+{
+    if (!item->references) __builtin_trap();
+    if (!--item->references && kernel_heap_release(item->heap, item) != KERNEL_HEAP_STATUS_OK)
+        __builtin_trap();
+}
+
+static void kernel_epoll_wait_callback(struct kernel_wait_node *node, uint32_t reason)
+{
     (void)reason;
-    if (node == 0 || node->context == 0) {
-        return;
+    if (!node || !node->context) return;
+    uintptr_t irq = riscv_interrupt_save();
+    struct kernel_epoll_item *item = node->context;
+    struct kernel_epoll *epoll = item->epoll;
+    if (epoll && item->linked && !item->oneshot_disarmed) {
+        item->notification_generation++;
+        /* poll和用户复制都可能重入；通知链不借用扫描者的ready_next。 */
+        if (epoll->scan_owner) epoll_pending_add(epoll, item);
+        else epoll_ready_add(epoll, item);
+        kernel_wait_queue_wake_all(&epoll->wait_queue);
     }
-    item = (struct kernel_epoll_item *)node->context;
-    if (item->epoll == 0 || item->oneshot_disarmed) {
-        return;
-    }
-    epoll = item->epoll;
-    if (!item->on_ready_list) {
-        item->ready_next = 0;
-        if (epoll->ready_tail != 0) {
-            epoll->ready_tail->ready_next = item;
-        } else {
-            epoll->ready_head = item;
-        }
-        epoll->ready_tail = item;
-        item->on_ready_list = 1U;
-    }
-    kernel_wait_queue_wake_all(&epoll->wait_queue);
+    riscv_interrupt_restore(irq);
 }
 
 static void epoll_remove_from_ready_list(
@@ -128,9 +144,10 @@ int kernel_epoll_create(
 static enum kernel_files_status epoll_item_unlink_and_destroy(
     struct kernel_epoll_item *item)
 {
-    if (item == 0) {
+    if (item == 0 || !item->linked) {
         return KERNEL_FILES_STATUS_OK;
     }
+    uintptr_t irq = riscv_interrupt_save();
     struct kernel_epoll *epoll = item->epoll;
     struct kernel_open_file_description *target_file = item->target_file;
 
@@ -140,6 +157,15 @@ static enum kernel_files_status epoll_item_unlink_and_destroy(
 
     if (epoll != 0) {
         epoll_remove_from_ready_list(epoll, item);
+        if (item->on_pending_list) {
+            struct kernel_epoll_item **link = &epoll->pending_head, *previous = 0;
+            while (*link && *link != item) { previous = *link; link = &(*link)->pending_next; }
+            if (!*link) __builtin_trap();
+            *link = item->pending_next;
+            if (epoll->pending_tail == item) epoll->pending_tail = previous;
+            item->pending_next = 0;
+            item->on_pending_list = 0;
+        }
         if (item->items_prev != 0) {
             item->items_prev->items_next = item->items_next;
         } else if (epoll->items_head == item) {
@@ -169,9 +195,10 @@ static enum kernel_files_status epoll_item_unlink_and_destroy(
         item->target_file = 0;
     }
 
-    if (epoll != 0 && epoll->heap != 0) {
-        (void)kernel_heap_release(epoll->heap, item);
-    }
+    item->linked = 0;
+    item->epoll = 0;
+    epoll_item_put(item);
+    riscv_interrupt_restore(irq);
     return KERNEL_FILES_STATUS_OK;
 }
 
@@ -180,6 +207,7 @@ enum kernel_files_status kernel_epoll_destroy(struct kernel_epoll *epoll)
     if (epoll == 0) {
         return KERNEL_FILES_STATUS_OK;
     }
+    if (epoll->scan_owner) __builtin_trap();
     while (epoll->items_head != 0) {
         struct kernel_epoll_item *item = epoll->items_head;
         (void)epoll_item_unlink_and_destroy(item);
@@ -501,6 +529,9 @@ enum kernel_files_status kernel_files_epoll_ctl(
             *linux_result = -KERNEL_ENOMEM;
             break;
         }
+        item->heap = epoll->heap;
+        item->references = 1;
+        item->linked = 1;
         item->target_fd = (int)fd;
         item->target_file = target_file;
         item->epoll = epoll;
@@ -536,18 +567,8 @@ enum kernel_files_status kernel_files_epoll_ctl(
             kernel_wait_queue_add(target_queue, &item->wait_node);
         }
 
-        /* If already ready, place on ready list */
-        if ((current_revents & (events | KERNEL_POLLERR | KERNEL_POLLHUP)) != 0U) {
-            item->ready_next = 0;
-            if (epoll->ready_tail != 0) {
-                epoll->ready_tail->ready_next = item;
-            } else {
-                epoll->ready_head = item;
-            }
-            epoll->ready_tail = item;
-            item->on_ready_list = 1U;
-            kernel_wait_queue_wake_all(&epoll->wait_queue);
-        }
+        if ((current_revents & (events | KERNEL_POLLERR | KERNEL_POLLHUP)) != 0U)
+            kernel_epoll_wait_callback(&item->wait_node, 0);
         *linux_result = 0;
         break;
 
@@ -557,24 +578,14 @@ enum kernel_files_status kernel_files_epoll_ctl(
             *linux_result = -KERNEL_ENOENT;
             break;
         }
+        item->control_generation++;
         item->events = events;
         item->data = data;
         item->oneshot_disarmed = 0U;
 
         current_revents = kernel_open_file_poll(target_file, events, 0);
-        if ((current_revents & (events | KERNEL_POLLERR | KERNEL_POLLHUP)) != 0U) {
-            if (!item->on_ready_list) {
-                item->ready_next = 0;
-                if (epoll->ready_tail != 0) {
-                    epoll->ready_tail->ready_next = item;
-                } else {
-                    epoll->ready_head = item;
-                }
-                epoll->ready_tail = item;
-                item->on_ready_list = 1U;
-                kernel_wait_queue_wake_all(&epoll->wait_queue);
-            }
-        }
+        if ((current_revents & (events | KERNEL_POLLERR | KERNEL_POLLHUP)) != 0U)
+            kernel_epoll_wait_callback(&item->wait_node, 0);
         *linux_result = 0;
         break;
 
@@ -672,6 +683,113 @@ static int epoll_setup_sigmask(
     return 0;
 }
 
+static void epoll_scan_finish(struct kernel_epoll_wait_request *request)
+{
+    struct kernel_epoll *epoll = request->epoll;
+    uintptr_t irq = riscv_interrupt_save();
+    if (request->target && kernel_open_file_release(&request->target) != KERNEL_OPEN_FILE_STATUS_OK)
+        __builtin_trap();
+    if (epoll->scan_owner == request) {
+        /* 尚未交付的项目仍由扫描引用保活；DEL只撤销注册引用。 */
+        while (request->head) {
+            struct kernel_epoll_item *item = request->head;
+            request->head = item->ready_next;
+            item->ready_next = 0;
+            item->in_scan = 0;
+            epoll_ready_add(epoll, item);
+            epoll_item_put(item);
+        }
+        while (epoll->pending_head) {
+            struct kernel_epoll_item *item = epoll->pending_head;
+            epoll->pending_head = item->pending_next;
+            item->pending_next = 0;
+            item->on_pending_list = 0;
+            epoll_ready_add(epoll, item);
+        }
+        epoll->pending_tail = 0;
+        epoll->scan_owner = 0;
+        kernel_wait_queue_wake_all(&epoll->wait_queue);
+    }
+    riscv_interrupt_restore(irq);
+}
+
+void kernel_epoll_abort_wait(struct kernel_epoll_wait_request *request)
+{
+    if (!request || !request->task) return;
+    epoll_scan_finish(request);
+    if (kernel_task_epoll_clear(request->task, request) != KERNEL_TASK_STATUS_OK)
+        __builtin_trap();
+    request->task = 0;
+    if (kernel_open_file_release(&request->file) != KERNEL_OPEN_FILE_STATUS_OK)
+        __builtin_trap();
+}
+
+static int64_t epoll_deliver(struct kernel_epoll_wait_request *request,
+    struct kernel_mm *mm, uint64_t user_events, size_t maximum)
+{
+    struct kernel_epoll *epoll = request->epoll;
+    uintptr_t irq = riscv_interrupt_save();
+    if (epoll->scan_owner || !epoll->ready_head) {
+        riscv_interrupt_restore(irq);
+        return 0;
+    }
+    epoll->scan_owner = request;
+    request->head = epoll->ready_head;
+    epoll->ready_head = epoll->ready_tail = 0;
+    for (struct kernel_epoll_item *item = request->head; item; item = item->ready_next) {
+        if (item->references == UINT32_MAX || item->in_scan) __builtin_trap();
+        item->references++;
+        item->in_scan = 1;
+        item->on_ready_list = 0;
+    }
+    riscv_interrupt_restore(irq);
+    int64_t delivered = 0;
+    while (request->head && (size_t)delivered < maximum) {
+        struct kernel_epoll_item *item = request->head;
+        uint64_t control = item->control_generation;
+        uint64_t notification = item->notification_generation;
+        uint32_t interest = item->events;
+        struct linux_epoll_event event = {.data = item->data};
+        if (item->linked && !item->oneshot_disarmed && item->target_file) {
+            request->target = item->target_file;
+            if (kernel_open_file_acquire(request->target) != KERNEL_OPEN_FILE_STATUS_OK)
+                __builtin_trap();
+            event.events = kernel_open_file_poll(request->target, interest, 0) &
+                (interest | KERNEL_POLLERR | KERNEL_POLLHUP);
+            if (item->linked && event.events && control == item->control_generation) {
+                size_t copied = 0;
+                enum kernel_uaccess_status status = kernel_copy_to_user(mm,
+                    user_events + (uint64_t)delivered * sizeof(event), &event, sizeof(event), &copied);
+                if (status != KERNEL_UACCESS_STATUS_OK || copied != sizeof(event)) {
+                    if (status != KERNEL_UACCESS_STATUS_OK && status != KERNEL_UACCESS_STATUS_FAULT)
+                        __builtin_trap();
+                    if (!delivered) delivered = -KERNEL_EFAULT;
+                    break;
+                }
+                delivered++;
+                /* 完整event复制是提交点；睡眠期间的MOD不能被旧ONESHOT覆盖。 */
+                if (item->linked && control == item->control_generation) {
+                    if (interest & KERNEL_EPOLLONESHOT) item->oneshot_disarmed = 1;
+                    else if (!(interest & KERNEL_EPOLLET)) epoll_pending_add(epoll, item);
+                }
+            }
+            if (kernel_open_file_release(&request->target) != KERNEL_OPEN_FILE_STATUS_OK)
+                __builtin_trap();
+        }
+        irq = riscv_interrupt_save();
+        if (item->linked && (control != item->control_generation ||
+                            notification != item->notification_generation))
+            epoll_pending_add(epoll, item);
+        request->head = item->ready_next;
+        item->ready_next = 0;
+        item->in_scan = 0;
+        epoll_item_put(item);
+        riscv_interrupt_restore(irq);
+    }
+    epoll_scan_finish(request);
+    return delivered;
+}
+
 enum kernel_files_status kernel_files_epoll_pwait(
     struct kernel_files *files,
     struct kernel_mm *mm,
@@ -686,9 +804,7 @@ enum kernel_files_status kernel_files_epoll_pwait(
 {
     struct kernel_open_file_description *epoll_file = 0;
     struct kernel_epoll *epoll;
-    struct linux_epoll_event stack_events[KERNEL_EPOLL_STACK_CAPACITY];
-    struct linux_epoll_event *event_buffer = stack_events;
-    size_t buffer_capacity;
+    struct kernel_epoll_wait_request request = {0};
     int has_timeout = 0;
     int immediate = 0;
     uint64_t deadline = 0U;
@@ -729,106 +845,20 @@ enum kernel_files_status kernel_files_epoll_pwait(
         return KERNEL_FILES_STATUS_OK;
     }
 
-    buffer_capacity = (size_t)maxevents;
-    if (epoll->item_count > 0U && buffer_capacity > epoll->item_count) {
-        buffer_capacity = epoll->item_count;
-    }
-    if (buffer_capacity > KERNEL_FILES_MAX_CAPACITY) {
-        buffer_capacity = KERNEL_FILES_MAX_CAPACITY;
-    }
-    if (buffer_capacity == 0U) {
-        buffer_capacity = 1U;
-    }
-    if (buffer_capacity > KERNEL_EPOLL_STACK_CAPACITY) {
-        enum kernel_heap_status heap_status = kernel_heap_allocate_zeroed(
-            files->heap,
-            buffer_capacity,
-            sizeof(struct linux_epoll_event),
-            (void **)&event_buffer);
-        if (heap_status != KERNEL_HEAP_STATUS_OK) {
-            (void)kernel_open_file_release(&epoll_file);
-            *linux_result = -KERNEL_ENOMEM;
-            return KERNEL_FILES_STATUS_OK;
-        }
-    }
+    request = (struct kernel_epoll_wait_request){.task = task, .epoll = epoll, .file = epoll_file};
+    if (kernel_task_epoll_register(task, &request) != KERNEL_TASK_STATUS_OK) __builtin_trap();
 
     sig_error = epoll_setup_sigmask(mm, task, user_sigmask, sigsetsize, &saved_mask, &mask_modified);
     if (sig_error != 0) {
-        if (event_buffer != stack_events) {
-            (void)kernel_heap_release(files->heap, event_buffer);
-        }
-        (void)kernel_open_file_release(&epoll_file);
+        kernel_epoll_abort_wait(&request);
         *linux_result = sig_error;
         return KERNEL_FILES_STATUS_OK;
     }
 
     for (;;) {
-        size_t ready_count = 0U;
-        struct kernel_epoll_item *item = epoll->ready_head;
-        struct kernel_epoll_item *requeue_head = 0;
-        struct kernel_epoll_item *requeue_tail = 0;
-
-        /* Harvest from ready list */
-        while (item != 0 && ready_count < buffer_capacity) {
-            struct kernel_epoll_item *next_item = item->ready_next;
-            epoll->ready_head = next_item;
-            if (epoll->ready_head == 0) {
-                epoll->ready_tail = 0;
-            }
-            item->ready_next = 0;
-            item->on_ready_list = 0U;
-
-            if (!item->oneshot_disarmed && item->target_file != 0) {
-                uint32_t revents = kernel_open_file_poll(item->target_file, item->events, 0);
-                revents &= (item->events | KERNEL_POLLERR | KERNEL_POLLHUP);
-                if (revents != 0U) {
-                    event_buffer[ready_count].events = revents;
-                    event_buffer[ready_count]._pad = 0U;
-                    event_buffer[ready_count].data = item->data;
-                    ready_count++;
-
-                    if ((item->events & KERNEL_EPOLLONESHOT) != 0U) {
-                        item->oneshot_disarmed = 1U;
-                    } else if ((item->events & KERNEL_EPOLLET) == 0U) {
-                        /* Level-triggered: stage to re-add to ready list */
-                        item->ready_next = 0;
-                        if (requeue_tail != 0) {
-                            requeue_tail->ready_next = item;
-                        } else {
-                            requeue_head = item;
-                        }
-                        requeue_tail = item;
-                        item->on_ready_list = 1U;
-                    }
-                }
-            }
-            item = next_item;
-        }
-
-        /* Requeue level-triggered items that are still ready */
-        if (requeue_head != 0) {
-            if (epoll->ready_tail != 0) {
-                epoll->ready_tail->ready_next = requeue_head;
-            } else {
-                epoll->ready_head = requeue_head;
-            }
-            epoll->ready_tail = requeue_tail;
-        }
-
-        if (ready_count > 0U) {
-            size_t copied = 0U;
-            enum kernel_uaccess_status u_status = kernel_copy_to_user(
-                mm,
-                user_events,
-                event_buffer,
-                ready_count * sizeof(struct linux_epoll_event),
-                &copied);
-            if (u_status != KERNEL_UACCESS_STATUS_OK ||
-                copied != ready_count * sizeof(struct linux_epoll_event)) {
-                *linux_result = -KERNEL_EFAULT;
-            } else {
-                *linux_result = (int64_t)ready_count;
-            }
+        int64_t delivered = epoll_deliver(&request, mm, user_events, (size_t)maxevents);
+        if (delivered) {
+            *linux_result = delivered;
             break;
         }
 
@@ -849,7 +879,7 @@ enum kernel_files_status kernel_files_epoll_pwait(
                     (sleep_deadline == 0U || protocol_deadline < sleep_deadline))
                     sleep_deadline = protocol_deadline;
             }
-            if (epoll->ready_head != 0) {
+            if (!epoll->scan_owner && epoll->ready_head != 0) {
                 riscv_interrupt_restore(saved_intr);
                 continue;
             }
@@ -886,9 +916,6 @@ enum kernel_files_status kernel_files_epoll_pwait(
         int interrupted = (*linux_result == -KERNEL_EINTR);
         kernel_signal_restore_temporary_mask(task, saved_mask, interrupted);
     }
-    if (event_buffer != stack_events) {
-        (void)kernel_heap_release(files->heap, event_buffer);
-    }
-    (void)kernel_open_file_release(&epoll_file);
+    kernel_epoll_abort_wait(&request);
     return KERNEL_FILES_STATUS_OK;
 }

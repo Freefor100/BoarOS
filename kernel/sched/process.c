@@ -5,6 +5,7 @@
 #include <arch/riscv/thread.h>
 #include <arch/riscv/trap.h>
 #include <kernel/errno.h>
+#include <kernel/epoll.h>
 #include <kernel/exec.h>
 #include <kernel/files.h>
 #include <kernel/futex.h>
@@ -1283,6 +1284,7 @@ enum kernel_scheduler_status kernel_scheduler_reap_one(
     }
     /* Request handles may live on the old stack; release them before it. */
     if (thread->io_context.locks || thread->io_context.backend_depth) __builtin_trap();
+    if (thread->epoll_wait_request) kernel_epoll_abort_wait(thread->epoll_wait_request);
     if (thread->socket_write_request) kernel_socket_abort_write(thread->socket_write_request);
     if (thread->socket_read_request) kernel_socket_abort_read(thread->socket_read_request);
     if (thread->io_buffer) kernel_task_io_buffer_release(thread->io_buffer);
@@ -1470,6 +1472,7 @@ static enum kernel_scheduler_status cleanup_user_task_resources(
     enum kernel_files_status files_status;
     enum kernel_fs_context_status fs_status;
 
+    if (thread->epoll_wait_request) kernel_epoll_abort_wait(thread->epoll_wait_request);
     if (thread->tty_request) kernel_tty_abort_request(thread->tty_request);
     if (thread->socket_write_request != 0)
         kernel_socket_abort_write(thread->socket_write_request);
@@ -1617,6 +1620,24 @@ void kernel_task_release_io_scratch(struct kernel_task *task)
     task->io_scratch_allocator = 0;
     task->io_scratch_physical_address = 0;
     task->io_scratch_data = 0;
+}
+
+enum kernel_task_status kernel_task_epoll_register(
+    struct kernel_task *task, struct kernel_epoll_wait_request *request)
+{
+    if (!task || task != kernel_task_current() || !request || task->epoll_wait_request)
+        return KERNEL_TASK_STATUS_STATE;
+    task->epoll_wait_request = request;
+    return KERNEL_TASK_STATUS_OK;
+}
+
+enum kernel_task_status kernel_task_epoll_clear(
+    struct kernel_task *task, struct kernel_epoll_wait_request *request)
+{
+    if (!task || !request || task->epoll_wait_request != request)
+        return KERNEL_TASK_STATUS_STATE;
+    task->epoll_wait_request = 0;
+    return KERNEL_TASK_STATUS_OK;
 }
 
 enum kernel_task_status kernel_task_socket_read_register(
