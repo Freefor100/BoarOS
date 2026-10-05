@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Two independent NBD disks: held B, live A, real B EIO, cold reboot."""
 import argparse
+import json
 from pathlib import Path
 import re
 import selectors
@@ -19,6 +20,24 @@ parser.add_argument('--cache', choices=('writeback', 'writethrough'), default='w
 parser.add_argument('--fault', choices=('write', 'flush'), default='write')
 parser.add_argument('--rt-load', action='store_true', help='independent no-fault FIFO/RR storage progress mode')
 args = parser.parse_args()
+
+
+def send_token(guest, tokens, label, boundary):
+    guest.stdin.write(b'g')
+    tokens.append({'index': len(tokens) + 1, 'time': time.monotonic(),
+                   'after': label + ':' + boundary.decode(errors='replace')})
+
+
+def check_progress_timeout(guest, work, phase, logs, tokens, state, deadline):
+    if guest.poll() is not None or time.monotonic() < deadline:
+        return
+    snapshot = {'phase': phase, 'tokens': tokens, 'state': state,
+                'guest_pid': guest.pid,
+                'tails': {name: data.decode(errors='replace').splitlines()[-20:]
+                          for name, data in logs.items()}}
+    path = work / (str(phase) + '-timeout.json')
+    path.write_text(json.dumps(snapshot, indent=2) + '\n')
+    raise TimeoutError(f'multi-disk progress timeout: {state}; tokens={len(tokens)}; {path}')
 
 
 def run(transport, cache, fault):
@@ -45,6 +64,7 @@ def run(transport, cache, fault):
             servers = []
             addresses = []
             logs = {k: bytearray() for k in ('guest', 'a', 'b')}
+            tokens = []
             for name, disk in zip(('a', 'b'), disks):
                 address = work / f'{name}-{int(reboot)}.sock'
                 command = [str(ROOT / 'build/host/nbd-fault'), str(disk), str(address),
@@ -95,11 +115,11 @@ def run(transport, cache, fault):
                         if label == 'guest' and line == b'multi-disk: hold ready':
                             servers[1].stdin.write(b'hold\n')
                         elif label == 'b' and line == b'control=hold':
-                            guest.stdin.write(b'g')
+                            send_token(guest, tokens, label, line)
                         elif label == 'b' and line.startswith(b'held=') and not held:
                             if b'command=0 ' in line:
                                 held = True
-                                guest.stdin.write(b'g')
+                                send_token(guest, tokens, label, line)
                             else:
                                 identity = int(line.split()[0].split(b'=')[1])
                                 servers[1].stdin.write(f'release {identity}\n'.encode())
@@ -116,7 +136,7 @@ def run(transport, cache, fault):
                             assert not reboot and progressed
                             isolated = True
                         elif label == 'b' and line == b'control=arm':
-                            guest.stdin.write(b'g')
+                            send_token(guest, tokens, label, line)
                         elif label == 'b' and line.startswith(b'event=') and b'result=5 ' in line:
                             assert f'type={fault.upper()} '.encode() in line, line
                             actual_fault = True
@@ -129,6 +149,10 @@ def run(transport, cache, fault):
                             guest.kill()
                 if guest.poll() is not None:
                     break
+            check_progress_timeout(guest, work, int(reboot), logs, tokens,
+                {'held': held, 'released': released, 'progressed': progressed,
+                 'actual_fault': actual_fault, 'isolated': isolated,
+                 'a_write': a_write, 'a_flush': a_flush}, deadline)
             guest.wait(timeout=3)
             for server in servers:
                 server.wait(timeout=3)
@@ -168,6 +192,7 @@ def run_rt(transport, cache):
         (work / 'mode').write_text('rt')
         disks, addresses, servers = [], [], []
         logs = {key: bytearray() for key in ('guest', 'a', 'b')}
+        tokens = []
         for name in ('a', 'b'):
             disk = work / (name + '.img')
             with disk.open('wb') as stream: stream.truncate(32 * 1024 * 1024)
@@ -223,7 +248,7 @@ def run_rt(transport, cache):
                         for server in servers: server.stdin.write(b'hold\n')
                     elif label in ('a', 'b') and line == b'control=hold' and active is not None:
                         hold_acks.add(label)
-                        if hold_acks == {'a', 'b'}: guest.stdin.write(b'g')
+                        if hold_acks == {'a', 'b'}: send_token(guest, tokens, label, line)
                     elif label in ('a', 'b') and line.startswith(b'held=') and active is not None:
                         server = servers[0 if label == 'a' else 1]
                         if b'command=0 ' in line:
@@ -239,8 +264,12 @@ def run_rt(transport, cache):
                     elif label == 'guest' and line.startswith(b'multi-disk-rt: I/O progressed policy='):
                         assert active == int(line.rsplit(b'=', 1)[1]);progressed = True
                     if progressed and all((disk, event) in observed for disk in ('a', 'b') for event in ('READ', 'WRITE', 'FLUSH')):
-                        completed.add(active);active = None;progressed = False;guest.stdin.write(b'g')
+                        completed.add(active);active = None;progressed = False;send_token(guest, tokens, label, line)
             if guest.poll() is not None: break
+        check_progress_timeout(guest, work, 'rt', logs, tokens,
+            {'active_policy': active, 'completed_policies': sorted(completed),
+             'hold_acks': sorted(hold_acks), 'observed': sorted(observed),
+             'progressed': progressed}, deadline)
         guest.wait(timeout=3)
         for server in servers: server.wait(timeout=3)
         text = logs['guest'].decode(errors='replace')
