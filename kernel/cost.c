@@ -14,11 +14,25 @@ enum { cost_histograms = 0
 #define X(id, name, unit, hist) _Static_assert(sizeof(#name) <= 32, "cost metric name budget");
 #include <kernel/cost.def>
 #undef X
-static const char names[][32] = {
+/* 名称按实际长度保存，给新增诊断留空间而不提高64KiB聚合上限。 */
+struct cost_metric_names {
+#define X(id, name, unit, hist) char id[sizeof(#name)];
+#include <kernel/cost.def>
+#undef X
+};
+static const struct cost_metric_names names = {
 #define X(id, name, unit, hist) #name,
 #include <kernel/cost.def>
 #undef X
 };
+static const uint16_t name_offsets[] = {
+#define X(id, name, unit, hist) offsetof(struct cost_metric_names, id),
+#include <kernel/cost.def>
+#undef X
+};
+_Static_assert(sizeof(names) <= UINT16_MAX, "cost name offsets");
+static const char *metric_name(unsigned metric)
+{ return (const char *)&names + name_offsets[metric]; }
 enum cost_unit { UNIT_bytes, UNIT_count, UNIT_entries, UNIT_operations,
     UNIT_pages, UNIT_requests, UNIT_tasks, UNIT_ticks };
 /* 单位文字共享，新增只读快照不挤占聚合预算；输出 schema 不变。 */
@@ -46,7 +60,7 @@ static struct {
     uint64_t epoch, owner, start, end, inflight;
     uint32_t frequency, fixture, active, pending, overflow, state;
 } cost;
-enum { cost_storage = sizeof(cost) + sizeof(names) + sizeof(units) + sizeof(unit_names) + sizeof(histograms) + sizeof(histogram_indexes) + sizeof(lanes) + 768 };
+enum { cost_storage = sizeof(cost) + sizeof(names) + sizeof(name_offsets) + sizeof(units) + sizeof(unit_names) + sizeof(histograms) + sizeof(histogram_indexes) + sizeof(lanes) + 768 };
 /* Includes bridge/IRQ scalars and the read-only protocol snapshot key table. */
 _Static_assert(cost_storage <= 65536, "cost aggregate budget");
 static struct { struct kernel_cost_tag tag; uint64_t start; unsigned opened, suppressed; } irq;
@@ -390,7 +404,7 @@ int kernel_cost_format(char *buffer, size_t capacity)
     field(&f, "overflow", cost.overflow); field(&f, "inflight", cost.inflight);
     for (unsigned lane = 0; lane < 3; ++lane) for (unsigned m = 0; m < COST_METRIC_COUNT; ++m) {
         char key[128]; size_t n = strlen(lanes[lane]); memcpy(key, lanes[lane], n); key[n++] = '.';
-        size_t len = strlen(names[m]); memcpy(key + n, names[m], len); n += len; key[n++] = '.'; key[n] = 0;
+        size_t len = strlen(metric_name(m)); memcpy(key + n, metric_name(m), len); n += len; key[n++] = '.'; key[n] = 0;
         text(&f, key); text(&f, "unit="); text(&f, unit_names[units[m]]); text(&f, "\n");
         const char suffix[][8] = {"value", "samples", "max"};
         uint64_t values[] = {cost.counters[lane][m].value, cost.counters[lane][m].samples, cost.counters[lane][m].maximum};

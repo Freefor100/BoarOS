@@ -32,6 +32,8 @@ BoarOS 是从零搭建、面向 OS Comp 能力建设的 C / 少量汇编内核�
 
 单 hart 存储等待已由运行期 IRQ 唤醒：两个不同文件冷读可同时在途，等待期间计算与无关缓存命中继续执行；OFD、inode、后端事务与退出清理各自保留 owner。八槽乱序完成、flush 屏障和超时 reset 在 legacy/modern、writeback/writethrough 四种组合验收，见[可睡眠存储](docs/learning/sleepable-storage.md)。
 
+文件追加增长已与截断分离：对齐增长不遍历缓存页，非对齐增长只处理旧 EOF 尾页；1–64 MiB 的实际页缓存规模门禁保护这一成本界，未把计数下降换算为吞吐提升。
+
 epoll 以完整用户事件交付作为 ET/ONESHOT 提交点，复制 fault 保留未交付项；扫描与重入通知独立，取消和 close 保持对象寿命。验证边界见[事件交付](docs/learning/epoll-delivery.md)。
 
 文件层已有部分读写、OFD 生命周期、稀疏文件与映射截断的语义深度；显式时间设置和真实挂载统计已接入；共享匿名映射已迁移统一稀疏内存后备对象，与共享文件页均可跨 MM 读写，串口与 Unix98 PTY 已具备真实行规程、控制终端和有界传输；其他行规程与完整 modem 控制仍有缺口。ext4 恢复已覆盖 512 字节原子写、未 flush 写丢失或重排的故障模型；实板持久性仍待独立验证。固定 glibc 2.44 的五种 ELF 形态与 TLS/pthread/取消清理/信号组合已双侧验证，完整 glibc 应用兼容尚未证明。

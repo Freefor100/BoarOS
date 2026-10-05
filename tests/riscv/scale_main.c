@@ -548,6 +548,45 @@ static struct riscv_mm_statistics mapped_cost(struct kernel_files *files,
     return after;
 }
 
+#if BOAROS_COST_DIAGNOSTICS
+static unsigned char growth_payload[65536];
+static void growth_cost(struct kernel_vfs_mount *mount, struct kernel_page_cache *cache)
+{
+    struct kernel_vfs_file file = {0};
+    check(kernel_vfs_create(mount, "/growth", 0600, &file) == 0, 210);
+    for (unsigned i = 0; i < sizeof(growth_payload); i++) growth_payload[i] = (unsigned char)(i * 19 + 7);
+    const unsigned chunks[] = {4096, 1024, 65536};
+    for (uint64_t size = MIB; size <= 64 * MIB; size *= 4) {
+        for (unsigned c = 0; c < 3; c++) {
+            check(kernel_vfs_ftruncate(&file, 0) == 0, 211);
+            check(kernel_cost_begin(3, cost_frequency, 1, 0) == 0, 212);
+            for (uint64_t offset = 0; offset < size; offset += chunks[c]) {
+                size_t written = 0;
+                check(kernel_vfs_pwrite(&file, offset, growth_payload, chunks[c], &written) == 0 && written == chunks[c], 213);
+            }
+            check(kernel_cost_end(3, 0) == 0, 214);
+            uint64_t visits, tails;
+            check(kernel_cost_read(0, COST_RESIZE_VISITS, &visits) == 0 &&
+                  kernel_cost_read(0, COST_RESIZE_TAIL_PAGES, &tails) == 0, 215);
+            number("growth bytes: ", size); number("growth chunk: ", chunks[c]);
+            number("growth visits: ", visits); number("growth tail pages: ", tails);
+            uint64_t needed = chunks[c] == 1024 ? size / 4096 * 3 : 0;
+            check(visits <= needed && tails == needed, 216);
+            struct kernel_page_cache_statistics stats;
+            kernel_page_cache_get_statistics(cache, &stats);
+            check(stats.current_pages >= size / 4096, 217);
+            for (uint64_t offset = 0; offset < size; offset += 4096) {
+                size_t read = 0;
+                check(kernel_vfs_pread(&file, offset, payload, sizeof(payload), &read) == 0 && read == sizeof(payload) &&
+                      !memcmp(payload, growth_payload, sizeof(payload)), 218);
+            }
+        }
+    }
+    check(kernel_vfs_ftruncate(&file, 0) == 0 && kernel_vfs_close(&file) == 0 &&
+          kernel_vfs_unlink(mount, "/growth") == 0, 219);
+}
+#endif
+
 void kernel_main(unsigned long hart, const void *dtb)
 {
     (void)hart;
@@ -647,6 +686,9 @@ void kernel_main(unsigned long hart, const void *dtb)
     fail_page = 1;
     check(kernel_files_pwrite(&files, &mm, fd, BUFFER, 4096, 0, &result) == KERNEL_FILES_STATUS_OK &&
           result == -KERNEL_ENOMEM && fail_page == 0, 14);
+#if BOAROS_COST_DIAGNOSTICS
+    growth_cost(&mount, &cache);
+#endif
     tcp_cost(&files, &mm);
     udp_buffer_oom(&files, &mm);
     socketpair_scale(&files, &mm);

@@ -68,7 +68,10 @@ int main(void)
     /* The controlled clock advances once between the two reads around each body. */
     expect("heap_zero_ticks",2,2,1); expect("heap_copy_ticks",1,1,1);
     expect("uaccess_copy_ticks",5,5,1);
-    assert(strstr(snapshot,"storage_bytes=65436\n"));
+    const char *storage_field = strstr(snapshot, "storage_bytes=");
+    unsigned long long storage_bytes = 0;
+    assert(storage_field && sscanf(storage_field, "storage_bytes=%llu", &storage_bytes) == 1);
+    assert(storage_bytes > 0 && storage_bytes <= 65536);
     assert(!strstr(snapshot,"heap_zero_ticks.bucket."));
     assert(kernel_heap_release(&heap,fresh)==0);
     for(unsigned i=0;i<2;i++) assert(physical_page_release(&allocator,mapped[i])==0);
