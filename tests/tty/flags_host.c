@@ -37,7 +37,7 @@ static void start_case(void) {
     assert(!live&&!tty&&identity.references==1);
     assert(!kernel_tty_create(&heap,&transport,0,&tty));
     kernel_tty_publish_serial(tty);device=kernel_tty_device_lookup(0x440);
-    assert(!device->open(&heap,&task,0400,&instance));
+    assert(!device->open(&heap,&task,0400,0,&instance));
 }
 static void end_case(void) {
     kernel_tty_shutdown(tty);device->release(instance);instance=0;

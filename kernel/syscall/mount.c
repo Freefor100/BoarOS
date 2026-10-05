@@ -5,6 +5,7 @@
 #include <kernel/heap.h>
 #include <kernel/mm.h>
 #include <kernel/procfs.h>
+#include <kernel/devpts.h>
 #include <kernel/tmpfs.h>
 #include <kernel/task.h>
 #include <kernel/uaccess.h>
@@ -47,7 +48,8 @@ static int mount_filesystem(struct kernel_mm *mm, const struct kernel_fs_context
     if (result) return result;
     int tmpfs = !strcmp(type, "tmpfs");
     int ext4 = !strcmp(type, "ext4");
-    if (!tmpfs && !ext4 && strcmp(type, "proc")) return -KERNEL_ENODEV;
+    int devpts = !strcmp(type, "devpts");
+    if (!tmpfs && !ext4 && !devpts && strcmp(type, "proc")) return -KERNEL_ENODEV;
     enum kernel_heap_status allocation = kernel_heap_allocate(fs->heap,
         2U * KERNEL_FS_PATH_MAX, (void **)&target);
     if (allocation != KERNEL_HEAP_STATUS_OK)
@@ -74,7 +76,7 @@ static int mount_filesystem(struct kernel_mm *mm, const struct kernel_fs_context
         result = import_string(mm, options, sizeof(options),
                                request->arguments[4]);
         if (result) goto Finish;
-        if (!tmpfs && options[0]) { result = -KERNEL_ENOTSUP; goto Finish; }
+        if (!tmpfs && !devpts && options[0]) { result = -KERNEL_ENOTSUP; goto Finish; }
     }
     result = import_string(mm, target, KERNEL_FS_PATH_MAX,
                            request->arguments[1]);
@@ -90,13 +92,14 @@ static int mount_filesystem(struct kernel_mm *mm, const struct kernel_fs_context
         goto Finish;
     }
     result = ext4 ? kernel_vfs_disk_create(fs->heap, source_device, flags & LINUX_MS_RDONLY, source_name, &mounted)
+           : devpts ? kernel_devpts_create(fs->heap, flags & LINUX_MS_RDONLY, options, &mounted)
            : tmpfs ? kernel_tmpfs_create(fs->heap, flags & LINUX_MS_RDONLY, options, &mounted)
                    : kernel_procfs_create(fs->heap, flags & LINUX_MS_RDONLY, &mounted);
     if (result) goto Finish;
     result = kernel_vfs_mount_attach(mounted, covered);
     if (result) {
         int cleanup = kernel_vfs_unmount(mounted);
-        if (cleanup) kernel_vfs_disk_defer_cleanup(mounted);
+        if (cleanup) { if (ext4) kernel_vfs_disk_defer_cleanup(mounted); else __builtin_trap(); }
         mounted = 0;
     }
 Finish:

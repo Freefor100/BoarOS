@@ -103,6 +103,8 @@ static void environment(void)
     environment_mount("shm", "/dev/shm", "tmpfs", "mode=1777");
     environment_directory("mqueue-dir", "/dev/mqueue");
     environment_mount("mqueue", "/dev/mqueue", "mqueue", NULL);
+    environment_directory("pts-dir", "/dev/pts");
+    environment_mount("devpts", "/dev/pts", "devpts", "mode=0620,gid=0,ptmxmode=0666");
     environment_loopback();
 #endif
 }

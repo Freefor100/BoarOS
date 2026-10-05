@@ -343,3 +343,21 @@ UTC RTC，不添加RNG；不是完整比赛Harness。原旧glibc使用兼容分�
 进行后端lookup；解析还使用有界临时缓冲。复用活inode减少后端owner准备，不消除整个
 路径遍历。定点计数按固定工作量核对；原lmbench自适应文件数，不能只比较整命令耗时。
 原旧glibc的完整metadata选择需要兼容分支内核，可通过`--kernel`指定，不改变main身份。
+
+## devpts 节点与挂载
+
+`fs/devpts.c` 管理独立的终端编号空间、目录枚举和节点元数据，`fs/pty.c` 管理真实
+配对与传输。挂载接受 uid/gid/mode/ptmxmode/max/newinstance，默认 slave 为 0600、
+ptmx 为 0000、max=32；公共用户环境显式使用
+`mount -t devpts -o mode=0620,gid=0,ptmxmode=0666 devpts /dev/pts`，并将 `/dev/ptmx`
+链接到 `/dev/pts/ptmx`。外部 5:2 节点按其父目录下的 pts 挂载选择实例。
+
+编号与 inode 身份分开：master 最后关闭立即撤销 slave 的可见名字和弱配对绑定，
+worker 回收配对后才释放编号。已 pin 的旧节点保留元数据，编号复用创建新 inode；
+旧 O_PATH/proc 路径打开不能进入新配对。创建节点不预分配全部终端。普通用户不能
+直接增删这些动态节点，不支持的 namespace 修改返回明确 errno。
+
+OFD 和控制终端保活配对，配对持有挂载 root/path 引用；挂载拥有可 join worker，
+而 worker 不永久 pin 自己的 root。卸载须先确认外部引用消失、停止并 join worker，
+再释放后端。TTY 的内部 base 引用不形成配对引用环。仅支持单 hart 的发布契约，
+不能把此实现作为跨核路径与 TTY 同步已经成立的证据。

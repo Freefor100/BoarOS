@@ -89,4 +89,7 @@ void kernel_files_queue_description(
 enum kernel_files_status kernel_files_drain_file_cleanup(
     struct kernel_files *files);
 
+int kernel_files_open_pty_peer(struct kernel_files *files, struct kernel_task *caller,
+    struct kernel_vfs_path *path, uint32_t flags);
+
 #endif

@@ -170,6 +170,8 @@ C_SOURCES := \
 	fs/fs_context.c \
 	fs/char_device.c \
 	fs/tty.c \
+	fs/devpts.c \
+	fs/pty.c \
 	fs/rtc_device.c \
 	fs/open_file.c \
 	fs/pipe.c \
@@ -276,6 +278,8 @@ TEST_RUNTIME_C_SOURCES := \
 	fs/fs_context.c \
 	fs/char_device.c \
 	fs/tty.c \
+	fs/devpts.c \
+	fs/pty.c \
 	fs/rtc_device.c \
 	fs/lwext4_port.c \
 	fs/open_file.c \
@@ -1413,7 +1417,7 @@ clean:
 
 .PHONY: prune-build
 prune-build:
-	python3 tests/prune-build.py --apply
+	python3 tests/prune-build.py --apply $(foreach path,$(PRUNE_BUILD_KEEP),--keep $(path))
 
 -include $(DEPS)
 
@@ -1720,6 +1724,8 @@ test-tty-host:
 	@mkdir -p build/host/tty
 	cc -std=gnu11 -O1 -g -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=12 -Itests/host/random -idirafter include -fsanitize=address,undefined tests/tty/core_host.c fs/tty.c -o build/host/tty/core
 	build/host/tty/core
+	cc -std=gnu11 -O1 -g -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=12 -Itests/host/random -idirafter include -fsanitize=address,undefined tests/tty/endpoints_host.c fs/tty.c -o build/host/tty/endpoints
+	build/host/tty/endpoints
 	cc -std=gnu11 -O1 -g -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=12 -Itests/host/random -idirafter include -fsanitize=address,undefined tests/tty/flags_host.c fs/tty.c -o build/host/tty/flags
 	build/host/tty/flags
 	cc -std=gnu11 -O1 -g -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=12 -idirafter include -ffunction-sections -fdata-sections -Wl,--gc-sections -fsanitize=address,undefined tests/tty/group_host.c kernel/sched/tty.c kernel/pid.c -o build/host/tty/group
@@ -1727,10 +1733,14 @@ test-tty-host:
 
 TTY_PROBE_RV := $(BUILD_DIR)/tests/user/tty-probe-rv
 TTY_JOBCTRL_RV := $(BUILD_DIR)/tests/user/tty-jobctrl-rv
+TTY_TERMIOS2_RV := $(BUILD_DIR)/tests/user/tty-termios2-probe-rv
 $(TTY_PROBE_RV): tests/tty/probe.c $(MUSL_STAMP)
 	@mkdir -p $(dir $@)
 	$(MUSL_ROOT)/bin/musl-gcc $(MUSL_GCC_FLAGS) -static -pthread -O2 -Wall -Wextra -Werror $< -o $@
 $(TTY_JOBCTRL_RV): tests/tty/jobctrl_probe.c $(MUSL_STAMP)
+	@mkdir -p $(dir $@)
+	$(MUSL_ROOT)/bin/musl-gcc $(MUSL_GCC_FLAGS) -static -O2 -Wall -Wextra -Werror $< -o $@
+$(TTY_TERMIOS2_RV): tests/tty/termios2_probe.c $(MUSL_STAMP)
 	@mkdir -p $(dir $@)
 	$(MUSL_ROOT)/bin/musl-gcc $(MUSL_GCC_FLAGS) -static -O2 -Wall -Wextra -Werror $< -o $@
 
@@ -1740,3 +1750,22 @@ test-tty-riscv: $(KERNEL_RV) $(MUSL_STAMP)
 test-tty-diff-riscv: $(KERNEL_RV) $(TTY_PROBE_RV) $(TTY_JOBCTRL_RV)
 	python3 -B tests/tty/riscv.py --kernel $(KERNEL_RV) --qemu $(QEMU_RISCV64) --probe $(TTY_PROBE_RV)
 	python3 -B tests/tty/riscv.py --kernel $(KERNEL_RV) --qemu $(QEMU_RISCV64) --probe $(TTY_JOBCTRL_RV) --no-ctty
+
+.PHONY: test-pty-host
+test-pty-host:
+	@mkdir -p build/host/tty
+	cc -std=c11 -O1 -g -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=12 -idirafter include -fsanitize=address,undefined tests/host/devpts_test.c -o build/host/tty/devpts
+	build/host/tty/devpts
+	cc -std=gnu11 -O1 -g -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=12 -Itests/host/random -idirafter include -fsanitize=address,undefined tests/pty/transport_host.c fs/tty.c fs/pty.c -o build/host/tty/pty-transport
+	build/host/tty/pty-transport
+
+.PHONY: test-tty-termios2-riscv
+test-tty-termios2-riscv: $(KERNEL_RV) $(TTY_TERMIOS2_RV)
+	python3 -B tests/tty/riscv.py --kernel $(KERNEL_RV) --qemu $(QEMU_RISCV64) --probe $(TTY_TERMIOS2_RV)
+
+.PHONY: test-pty-riscv test-pty-apps-riscv
+test-pty-riscv: $(KERNEL_RV) $(MUSL_STAMP)
+	python3 -B tests/tty/pty_riscv.py --case core --kernel $(KERNEL_RV) --qemu $(QEMU_RISCV64)
+test-pty-apps-riscv: $(KERNEL_RV) $(MUSL_STAMP)
+	python3 -B tests/tty/pty_riscv.py --case libc --kernel $(KERNEL_RV) --qemu $(QEMU_RISCV64)
+	python3 -B tests/tty/pty_riscv.py --case script --kernel $(KERNEL_RV) --qemu $(QEMU_RISCV64)

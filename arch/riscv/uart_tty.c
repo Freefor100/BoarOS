@@ -115,35 +115,77 @@ static void kick(void *owner)
     struct riscv_uart_tty *p = owner;
     uintptr_t irq = riscv_interrupt_save(); wake(p); riscv_interrupt_restore(irq);
 }
-static int configure(void *owner, struct kernel_tty_termios *settings)
+/* Linux asm-generic baud编码；输入/输出数字由TTY core解码。 */
+static const uint32_t baud_rates[] = {
+    0,50,75,110,134,150,200,300,600,1200,1800,2400,4800,9600,19200,38400,
+    57600,115200,230400,460800,500000,576000,921600,1000000,1152000,1500000,
+    2000000,2500000,3000000,3500000,4000000
+};
+static uint32_t baud_bits(unsigned index)
+{ return index < 16 ? index : 0x1000U | (index - 15U); }
+static int configure_line(struct riscv_uart_tty *p, uint32_t flags, uint32_t rate)
 {
-    struct riscv_uart_tty *p = owner;
-    /* Linux CBAUD编码；输入速度归一到唯一的硬件线路速度。 */
-    static const uint32_t rates[] = {0,50,75,110,134,150,200,300,600,1200,1800,2400,4800,9600,19200,38400};
-    uint32_t baud_code = settings->cflag & 0x100fU, rate;
-    if (baud_code < 16) rate = rates[baud_code];
-    else if (baud_code == 0x1001) rate = 57600;
-    else if (baud_code == 0x1002) rate = 115200;
-    else if (baud_code == 0x1003) rate = 230400;
-    else { baud_code = 0x1002; rate = 115200; }
     uint64_t divisor = rate ? ((uint64_t)p->info.clock + 8ULL * rate) / (16ULL * rate) : 0;
+    /* 先完成全部可失败校验，错误不能留下DLL/DLH或软件IER的部分配置。 */
     if (rate && (!divisor || divisor > 65535)) return -KERNEL_EINVAL;
     uintptr_t irq = riscv_interrupt_save();
-    uint8_t lcr = (settings->cflag >> 4) & 3;
-    if (settings->cflag & 0x40) lcr |= 4;
-    if (settings->cflag & 0x100) { lcr |= 8; if (!(settings->cflag & 0x200)) lcr |= 16; }
-    /* 不声明硬件没有实现的CMSPAR、CRTSCTS、BOTHER或独立输入速度。 */
-    settings->cflag &= ~(0x80000000U | 0x40000000U | 0x100f0000U | 0x100fU);
-    settings->cflag |= baud_code;
+    uint8_t lcr = (flags >> 4) & 3;
+    if (flags & 0x40) lcr |= 4;
+    if (flags & 0x100) { lcr |= 8; if (!(flags & 0x200)) lcr |= 16; }
     if (rate) {
         UART_WRITE(p, 3, lcr | 128);
         UART_WRITE(p, 0, (uint8_t)divisor); UART_WRITE(p, 1, (uint8_t)(divisor >> 8));
     }
     UART_WRITE(p, 3, lcr);
     UART_WRITE(p, 4, rate ? 3 : 0);
-    p->input_enabled = rate && (settings->cflag & 0x80);
+    p->input_enabled = rate && (flags & 0x80);
     set_ier(p, (p->ier & 2) | (p->input_enabled && !p->stopping && p->rx_write-p->rx_read < RX_SIZE ? RX_INTERRUPTS : 0));
     riscv_interrupt_restore(irq); return 0;
+}
+static int configure(void *owner, struct kernel_tty_termios *settings)
+{
+    uint32_t code = settings->cflag & 0x100fU, rate;
+    if (code < 16) rate = baud_rates[code];
+    else if (code >= 0x1001 && code <= 0x1003) rate = baud_rates[15 + (code & 15)];
+    else { code = 0x1002; rate = 115200; }
+    /* 保持旧36字节配置的普通速率fallback与未实现hardware bits归一契约。 */
+    uint32_t flags = (settings->cflag & ~(0x80000000U | 0x40000000U | 0x100f0000U | 0x100fU)) | code;
+    int result = configure_line(owner, flags, rate);
+    if (!result) settings->cflag = flags;
+    return result;
+}
+static void encode_line_speed(struct kernel_tty_termios2 *settings)
+{
+    uint32_t rate = settings->ospeed;
+    uint32_t flags = settings->basic.cflag;
+    int explicit_input = (flags & 0x100f0000U) != 0;
+    uint32_t output_tolerance = (flags & 0x100fU) == 0x1000U ? 0 : rate / 50U;
+    uint32_t input_tolerance = (flags & 0x100f0000U) == 0x10000000U ||
+        (!explicit_input && !output_tolerance) ? 0 : rate / 50U;
+    unsigned output = UINT32_MAX, input = UINT32_MAX;
+    for (unsigned i = 0; i < sizeof(baud_rates) / sizeof(baud_rates[0]); i++) {
+        uint32_t distance = baud_rates[i] > rate ? baud_rates[i] - rate : rate - baud_rates[i];
+        if (distance <= output_tolerance) output = i;
+        if (distance <= input_tolerance) input = i;
+    }
+    flags &= ~(0x100fU | 0x100f0000U | 0x80000000U | 0x40000000U);
+    flags |= output == UINT32_MAX ? 0x1000U : baud_bits(output);
+    if (explicit_input)
+        flags |= (input == UINT32_MAX ? 0x1000U : baud_bits(input)) << 16;
+    settings->basic.cflag = flags;
+    settings->ispeed = rate; /* ns16550没有独立RX/TX时钟，按输出线路归一。 */
+}
+static int configure2(void *owner, struct kernel_tty_termios2 *settings)
+{
+    struct riscv_uart_tty *port = owner;
+    /* 可量化的名义速度仍需落在UART单时钟范围；不能用divisor=1冒充更高速线路。 */
+    uint64_t maximum = ((uint64_t)port->info.clock + port->info.clock / 100U) / 16U;
+    if (settings->ospeed > maximum) return -KERNEL_EINVAL;
+    struct kernel_tty_termios2 actual = *settings;
+    encode_line_speed(&actual);
+    int result = configure_line(owner, actual.basic.cflag, actual.ospeed);
+    if (!result) *settings = actual;
+    return result;
 }
 static void last_close(void *owner, uint32_t cflag)
 {
@@ -152,7 +194,7 @@ static void last_close(void *owner, uint32_t cflag)
     if (cflag & 0x400) UART_WRITE(p, 4, 0);
     riscv_interrupt_restore(irq);
 }
-static const struct kernel_tty_transport transport = {transmit, drained, configure, kick, last_close};
+static const struct kernel_tty_transport transport = {.transmit=transmit, .drained=drained, .configure=configure, .configure2=configure2, .kick=kick, .last_close=last_close};
 static size_t console_service(struct riscv_uart_tty *p, size_t budget)
 {
     size_t done = 0;

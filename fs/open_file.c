@@ -724,7 +724,9 @@ uint32_t kernel_open_file_mode(
 uint32_t kernel_open_file_flags(
     const struct kernel_open_file_description *file)
 {
-    return open_file_live(file) ? file->open_flags : 0U;
+    /* 创建/终端取得/fd标志不是OFD状态；F_GETFL结果可直接用于F_SETFL。 */
+    const uint32_t open_only = 0100U | 0200U | 0400U | 01000U | 02000000U;
+    return open_file_live(file) ? file->open_flags & ~open_only : 0U;
 }
 
 int kernel_open_file_readable(
