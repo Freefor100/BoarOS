@@ -25,7 +25,7 @@ try:
     (work / 'boot.log').write_text(result.stdout + result.stderr)
     if result.returncode or 'BoarOS: scale tests passed' not in result.stdout or 'scale failed:' in result.stdout:
         raise RuntimeError(result.stdout[-4000:] + result.stderr)
-    labels = ('growth ', 'file ', 'TCP ', 'mapped bytes:', 'resident probes:',
+    labels = ('protocol ', 'poll ', 'growth ', 'file ', 'TCP ', 'mapped bytes:', 'resident probes:',
               'protect visits:', 'address flushes:', 'global flushes:', 'BoarOS: scale')
     print('\n'.join(line for line in result.stdout.splitlines()
                     if line.startswith(labels)))

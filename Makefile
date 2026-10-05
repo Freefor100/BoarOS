@@ -1544,6 +1544,8 @@ $(BUILD_DIR)/tests/kernel-scale-rv: $(SCALE_OBJECTS) arch/riscv/linker.ld
 		-Wl,--wrap=kernel_heap_resize -Wl,--wrap=kernel_heap_allocate \
 		-Wl,--wrap=kernel_copy_from_user \
 		-Wl,--wrap=kernel_wait_queue_wake_all \
+		-Wl,--wrap=netif_poll_all -Wl,--wrap=sys_check_timeouts -Wl,--wrap=sys_now \
+		-Wl,--wrap=netif_poll_budget -Wl,--wrap=sys_check_timeouts_budget \
 		-o $@ $(SCALE_OBJECTS)
 .PHONY: test-scale-riscv
 test-scale-riscv: $(BUILD_DIR)/tests/kernel-scale-rv
@@ -1782,3 +1784,5 @@ test-epoll-riscv: $(KERNEL_RV) $(MUSL_STAMP)
 .PHONY: test-cache-growth-riscv
 test-cache-growth-riscv:
 	$(MAKE) COST_DIAGNOSTICS=1 test-scale-riscv
+
+$(BUILD_DIR)/tests/riscv/scale_main.o: CPPFLAGS += $(LWIP_CPPFLAGS)

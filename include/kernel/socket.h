@@ -130,7 +130,6 @@ uint64_t kernel_socket_receive_timeout(const struct kernel_socket *socket);
 uint32_t kernel_socket_poll(struct kernel_socket *socket,
                             struct kernel_wait_queue **queue);
 struct kernel_wait_queue *kernel_socket_wait_queue(struct kernel_socket *socket);
-uint64_t kernel_socket_next_timer_deadline(void);
 void kernel_socket_expire_timers(void);
 int kernel_socket_loopback_flags(const char name[16], uint16_t *flags);
 int kernel_socket_set_loopback_flags(const char name[16], uint16_t flags);
@@ -145,8 +144,19 @@ int kernel_socket_interface_index(uint32_t index, struct kernel_socket_interface
 int kernel_socket_interface_nth(uint32_t ordinal, struct kernel_socket_interface *snapshot);
 int kernel_socket_interface_set_flags(const char name[16], uint16_t flags);
 void kernel_socket_network_initialize(void);
-void kernel_socket_network_process(void);
+struct kernel_socket_service_budget { unsigned sockets, packets, timers; };
+struct kernel_socket_service_result {
+    unsigned sockets, packets, timers, runnable;
+    uint64_t next_deadline;
+};
+uintptr_t kernel_socket_protocol_enter(void);
+void kernel_socket_protocol_leave(uintptr_t interrupts);
+struct kernel_socket_service_result kernel_socket_service_pending(struct kernel_socket_service_budget budget);
+int kernel_socket_work_pending(void);
+void kernel_socket_network_capacity(void);
+void kernel_socket_network_blocked(void);
 void kernel_socket_network_failed(uint32_t address);
-void kernel_socket_network_hooks(void (*timer_wake)(void *), int (*udp_capacity)(void *), void *context);
+void kernel_socket_network_hooks(void (*timer_wake)(void *), void (*work_wake)(void *),
+    int (*udp_capacity)(void *), void *context);
 
 #endif

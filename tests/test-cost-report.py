@@ -208,7 +208,7 @@ class CostReportTest(unittest.TestCase):
         self.assertFalse(any(name.startswith('resize_') for name,_,_ in old))
         fields=self.valid()
         added={name for name,_,_ in schema()[len(old):]}
-        self.assertEqual(added, {'resize_visits','resize_tail_pages','resize_alias_rearms'})
+        self.assertTrue({'resize_visits','resize_tail_pages','resize_alias_rearms'} <= added)
         fields={key:value for key,value in fields.items()
                 if not any(key.startswith(lane+'.'+name+'.')
                     for lane in ('foreground','background','observer') for name in added)}

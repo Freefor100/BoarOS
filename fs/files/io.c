@@ -86,10 +86,6 @@ static int socket_wait_ready(struct kernel_open_file_description *description,
     while (!socket_operation_ready(socket, events)) {
         enum kernel_wait_wake_reason reason;
         uint64_t sleep_deadline = deadline;
-        uint64_t protocol_deadline = kernel_socket_next_timer_deadline();
-        if (protocol_deadline != 0U &&
-            (sleep_deadline == 0U || protocol_deadline < sleep_deadline))
-            sleep_deadline = protocol_deadline;
         if (kernel_scheduler_block_current(kernel_socket_wait_queue(socket),
                                             sleep_deadline, 1, &reason) !=
             KERNEL_SCHEDULER_STATUS_OK) {

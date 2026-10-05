@@ -34,12 +34,12 @@ IRQ、service 与直接 send 入口都检查，不能因无 TX 或配置 IRQ 丢
 worker 在首次收割后、RX与协议回调前释放完成owner；最后一次service及release后
 比较容量代次并复核RX ready。SG release返回归还数，容量代次还覆盖复制TX在IRQ/service
 中的直接归还。有新容量或RX才继续服务，单纯窗口关闭的unsent不会形成自旋。
-worker 在任务上下文推进 Ethernet/ARP、协议定时器和重试，每批最多八帧；批次
+worker 在任务上下文推进 Ethernet/ARP、协议定时器和重试，每批 RX 最多八帧，另独立限制 loopback 八包、socket 八个工作单元、一个 timer 回调；批次
 之间开放中断并让出运行机会。失败 NIC 不再收发，但共享的 loopback 和协议期限
 仍继续推进；不能在错误分支永久睡眠并停止 TIME_WAIT/重组回收。
 raw API 沿既有单 hart 临界区串行化，IRQ 不重入堆。无 NIC 时 `kernel_network_start`
 不创建收发 worker，但保留同一 `kernel_network` owner 与 timer-only worker：循环
-推进协议定时器并按 min(下一 socket 期限, now+5×frequency) 阻塞，期限/IRQ 只唤醒
+使用相同有界服务，先排空可立即执行的软件工作，再按 min(下一 socket 期限, now+5×frequency) 阻塞，期限/IRQ 只唤醒
 它，最后的 OFD 定时回收不再依赖用户再次进入 syscall，`kernel_network_stop`
 同样禁止新工作、join 后释放。
 

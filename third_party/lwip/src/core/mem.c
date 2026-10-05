@@ -670,6 +670,9 @@ mem_free(void *rmem)
   mem_free_count = 1;
 #endif /* LWIP_ALLOW_MEM_FREE_FROM_OTHER_CONTEXT */
   LWIP_MEM_FREE_UNPROTECT();
+#ifdef LWIP_HOOK_MEM_AVAILABLE
+  LWIP_HOOK_MEM_AVAILABLE();
+#endif
 }
 
 /**
