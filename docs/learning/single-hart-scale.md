@@ -227,3 +227,41 @@ make test-io-sleep-riscv
 格式依据是 `references/linux/Documentation/filesystems/ext4/ifork.rst`，固定 commit
 `f4cdf7ca9a1fdcca413157df19753f388a5a224e`；`make test-lwext4-deep-truncate-host` 可重建。
 该门禁验证深层索引修改与 checksum，并不替代完整断电恢复矩阵。
+
+
+## 连续写回的有界候选（2026-10-06）
+
+`BOAROS_PAGE_CACHE_WRITEBACK_PAGES` 提供 1/2/4/8 页候选，生产默认 1。
+范围写回和阈值 worker 共用连续稳定快照；只合并同 inode 相接的脏字节，不扩写
+中间干净范围。每页独立捕获 generation/别名/等待者；后端整批完整接受且该页未再脏
+才清除它。前台高阶分配失败在提交前退回单页；后台预留可逐级降到 4 KiB。
+同一轮 worker 的邻页哈希查询计入原有 64 次候选预算，哈希冲突另外统计。
+
+一次 `ext4_fpwrite` 保留整请求预留、私有 undo 与 handle 同步序号；已有 running group
+本来就会合并多次调用。减少页缓存交接数不等于减少同等数量的设备 flush，仍有
+ordered data、log/commit、durable 与 checkpoint 的原屏障；1 KiB ext4 的八个页含
+32 个数据块，不能把八页称为八个物理请求。
+
+旧页缓存在 8 页候选下对 9 页连续脏数据仍发出 9 次交接，新增实际函数门禁失败。
+现代 transport × 1/2/4/8 页 × 1/4 KiB ext4 八组合，以及 legacy × 1/8 页 × 两种块大小
+四组合通过；预算收紧后再次验证 modern 的 1/8 页四组合。结果为：
+
+| 候选页数 | 九页范围的后端调用 | 后台最大稳定快照 | 分配压力下降级 |
+|---:|---:|---:|---:|
+| 1 | 9 | 4 KiB | 4 KiB |
+| 2 | 5 | 8 KiB | 4 KiB |
+| 4 | 3 | 16 KiB | 4 KiB |
+| 8 | 2 | 32 KiB | 4 KiB |
+
+完整夹具包含部分首尾、范围裁剪、脏段间隙、前台 OOM、真实线程再脏、I/O 等待期间
+快照不变、短写/EIO 后保脏、后台停止、重复截断和 e2fsck。8 页配置的原 scale/VFS
+门禁也通过。重复截断新发现的 extent checksum 问题已作为独立修复记录在上一节，
+最终矩阵恢复原触发步骤，未用绕开的夹具结果收口。
+
+```sh
+make test-writeback-batch-riscv
+python3 -B tests/writeback-batch-riscv.py --pages 1 8 --block-size 1024 4096 --transport legacy
+```
+
+这是机制与成本验收；候选改变 undo 操作大小后的完整恢复矩阵和匹配发布吞吐，
+仍与预读、TCP 候选一起完成。当前结果不用于自动选择新的生产默认值。
