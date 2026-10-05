@@ -107,10 +107,21 @@ def nbd_boot(args, image, directory, name, *, options=(), marker=None,
     with open(backend_log, "w") as backend_output, \
          open(guest_log, "w") as guest_output:
         backend = subprocess.Popen([str(args.server), str(image), str(socket),
-                                    *options, *(["--control-stdin"] if gate else [])],
-                                   stdin=subprocess.PIPE if gate else subprocess.DEVNULL,
+                                    *options, "--control-stdin"],
+                                   stdin=subprocess.PIPE,
                                    stdout=backend_output, stderr=subprocess.STDOUT)
         guest = None
+        controlled_cut = False
+        def request_cut():
+            nonlocal controlled_cut
+            # Killing the client can interrupt a valid reply or WRITE payload.
+            # Cut the backend at its request boundary and require its explicit
+            # acknowledgement before terminating QEMU.
+            backend.stdin.write(b"cut\n")
+            backend.stdin.flush()
+            if backend.wait(timeout=10) or "cause=control" not in backend_log.read_text(errors="replace"):
+                raise AssertionError("NBD controlled cut not acknowledged")
+            controlled_cut = True
         try:
             for _ in range(200):
                 if socket.exists():
@@ -137,6 +148,7 @@ def nbd_boot(args, image, directory, name, *, options=(), marker=None,
                 guest.stdin.flush()
             if marker:
                 wait_for_marker(guest, guest_log, marker)
+                request_cut()
                 guest.kill()
                 guest.wait(timeout=5)
             elif cut or (gate and expect_failure):
@@ -157,9 +169,7 @@ def nbd_boot(args, image, directory, name, *, options=(), marker=None,
                     # changes later event ordinals. An unreachable ordinal is
                     # a distinct post-commit power cut, never a claimed fault.
                     if (committed or faulted) and time.monotonic() - quiet_since >= 0.2:
-                        backend.stdin.write(b"cut\n")
-                        backend.stdin.flush()
-                        backend.wait(timeout=10)
+                        request_cut()
                         break
                     if time.monotonic() - start >= 60:
                         raise AssertionError("mutation neither progressed nor reached commit/fault")
@@ -172,7 +182,7 @@ def nbd_boot(args, image, directory, name, *, options=(), marker=None,
                 if code:
                     raise AssertionError("QEMU exited unsuccessfully")
             if backend.wait(timeout=10):
-                raise AssertionError("NBD backend exited unsuccessfully")
+                raise AssertionError(f"NBD backend exited unsuccessfully: {backend.returncode}; {backend_log}")
         finally:
             if guest and guest.poll() is None:
                 guest.kill()
@@ -180,6 +190,11 @@ def nbd_boot(args, image, directory, name, *, options=(), marker=None,
             if backend.poll() is None:
                 backend.kill()
                 backend.wait()
+            (directory / f"{name}.exit.json").write_text(json.dumps({
+                "guest": guest.returncode if guest else None,
+                "backend": backend.returncode, "controlled_cut": controlled_cut,
+                "marker": marker, "ordinal_cut": cut, "expect_failure": expect_failure,
+            }, indent=2) + "\n")
     guest_text = guest_log.read_text(errors="replace")
     backend_text = backend_log.read_text(errors="replace")
     if args.journal == "wal" and "BoarOS: SQLite journal=wal" not in guest_text:
