@@ -379,6 +379,7 @@ static void test_tx_copy_budget(unsigned version)
     assert(desc.length == h + sizeof(input));
     assert(((char *)resolve(desc.address))[h] == 'x');
     complete(1, id, 0, 1); assert(!riscv_virtio_mmio_net_service(&d));
+    assert(d.tx_capacity_generation == 1);
     assert(riscv_virtio_mmio_net_send(&d, input, sizeof(input)) == 64);
     complete(1, 99, 0, 1); failed_owner(&d); stop(&d);
     printf("PASS: VirtIO-net v%u TX copies, 64-buffer budget and out-of-range used ID\n", version);
@@ -664,9 +665,10 @@ static void test_tx_segments(unsigned version)
            !memcmp(resolve(first.address), data[0], 64));
     assert(second.flags == 0 && second.length == 37 && !memcmp(resolve(second.address), data[1], 37));
     complete(1, id, 0, 1); assert(!riscv_virtio_mmio_net_service(&d));
-    riscv_virtio_mmio_net_tx_release(&d, collect_owner, 0);
+    assert(d.tx_capacity_generation == 0);
+    assert(riscv_virtio_mmio_net_tx_release(&d, collect_owner, 0) == 1 && d.tx_capacity_generation == 1);
     assert(released_count == 1 && released_owner[0] == &owner);
-    riscv_virtio_mmio_net_tx_release(&d, collect_owner, 0);
+    assert(riscv_virtio_mmio_net_tx_release(&d, collect_owner, 0) == 0 && d.tx_capacity_generation == 1);
     assert(released_count == 1);
     /* abandon 释放仍持有的在途 owner 且不重复释放。 */
     assert(riscv_virtio_mmio_net_send_segments(&d, segments, 1, &owner) == 0);

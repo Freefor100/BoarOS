@@ -473,3 +473,20 @@ make test-virtio-net-host test-ethernet-worker-host
 make test-network-riscv          # linux/boaros 同一ELF内容合同
 make test-sv39-riscv             # 含镜像VA->PA越界用例
 ```
+
+## 完成归还与发送进展（2026-10-05）
+
+旧 worker 在协议重试后才释放 TX_DONE owner。生产 worker 的边界测试设置
+64个已完成但未归还的槽，旧实现得到 attempts=1/sent=0/held=0，随后睡眠。
+调整为先收割/释放再运行RX及协议，并在最后收割后复核容量代次和RX ready。
+容量代次覆盖SG owner释放和复制发送完成，不能只看SG done链。
+
+`make test-ethernet-worker-host test-virtio-net-host`通过：初始已有完成槽时一轮发送；
+最后service才出现SG或复制完成时两轮发送、一次yield；对端窗口关闭时一轮后睡眠，
+没有发送或yield循环。失败NIC仍推进无关定时器，DMA未停止前不abandon在途owner。
+驱动测试核对两种transport的释放返回值、容量代次和重复释放，保留原有DMA/reset矩阵。
+
+`python3 -B tests/network-external.py --transport both --only boaros`在QEMU11.1.1
+通过实际TAP双向内容、HTTP和清理检查；无NIC的`network-riscv.py --only boaros --workload timer`
+通过。两个TAP运行分别14.523/14.816秒，只有一个副本，属于契约运行时长，
+不是与旧版匹配的吞吐结果。RX八帧仍不约束全部协议成本，有界协议服务是后续独立阶段。
