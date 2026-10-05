@@ -97,6 +97,9 @@ def run(transport, cache, fault):
             pending = {k: bytearray() for k in logs}
             held = released = progressed = actual_fault = isolated = False
             a_write = a_flush = False
+            cutting = False
+            cut_acks = set()
+            verified_text = None
             deadline = time.monotonic() + 90
             while selector.get_map() and time.monotonic() < deadline:
                 for key, _ in selector.select(.2):
@@ -140,25 +143,43 @@ def run(transport, cache, fault):
                         elif label == 'b' and line.startswith(b'event=') and b'result=5 ' in line:
                             assert f'type={fault.upper()} '.encode() in line, line
                             actual_fault = True
+                        if label in ('a', 'b') and line.startswith(b'cut=') and b'cause=control' in line:
+                            assert cutting
+                            cut_acks.add(label)
                         # Pipe readiness across processes does not imply a log
                         # ordering. Require all evidence before releasing B.
                         if progressed and a_write and a_flush and not released:
                             servers[1].stdin.write(b'drain\n')
                             released = True
-                        if isolated and actual_fault and guest.poll() is None:
+                        if isolated and actual_fault and not cutting:
+                            # Stop each NBD endpoint at its explicit power-cut
+                            # boundary before killing QEMU: killing first can
+                            # interrupt an otherwise healthy response writer.
+                            verified_text = logs['guest'].decode(errors='replace')
+                            cutting = True
+                            for server in servers:
+                                server.stdin.write(b'cut\n')
+                        if cut_acks == {'a', 'b'} and guest.poll() is None:
                             guest.kill()
-                if guest.poll() is not None:
+                if guest.poll() is not None and (not cutting or cut_acks == {'a', 'b'}):
                     break
             check_progress_timeout(guest, work, int(reboot), logs, tokens,
                 {'held': held, 'released': released, 'progressed': progressed,
                  'actual_fault': actual_fault, 'isolated': isolated,
-                 'a_write': a_write, 'a_flush': a_flush}, deadline)
+                 'a_write': a_write, 'a_flush': a_flush,
+                 'cut_requested': cutting, 'cut_acks': sorted(cut_acks)}, deadline)
             guest.wait(timeout=3)
             for server in servers:
                 server.wait(timeout=3)
-            text = logs['guest'].decode(errors='replace')
+            # The induced disconnect is teardown, after the verified guest
+            # checkpoint. Keep its complete raw log, but judge progress before it.
+            text = verified_text if cutting else logs['guest'].decode(errors='replace')
+            exit_state = {'guest': guest.returncode, 'servers': [s.returncode for s in servers],
+                          'isolated': isolated, 'cut_requested': cutting, 'cut_acks': sorted(cut_acks)}
+            (work / f'{int(reboot)}-exit.json').write_text(json.dumps(exit_state, indent=2) + '\n')
+            assert not cutting or cut_acks == {'a', 'b'}, exit_state
             marker = 'multi-disk: persistent readback ok' if reboot else 'multi-disk: isolation ok'
-            assert (guest.returncode == 0 or isolated) and all(s.returncode == 0 for s in servers), text[-5000:]
+            assert (guest.returncode == 0 or isolated) and all(s.returncode == 0 for s in servers), (exit_state, text[-5000:])
             if not isolated:
                 assert marker in text and re.search(r'PID 1 exited status=0x2a .*heap-live=0x0;', text), text[-5000:]
             assert not re.search(r'multi-disk failure|fatal trap|root finish failure|block timeout', text), text[-5000:]
