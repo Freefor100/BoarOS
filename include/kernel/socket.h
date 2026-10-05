@@ -57,7 +57,7 @@ struct kernel_socket_statistics {
 };
 void kernel_socket_get_statistics(struct kernel_socket_statistics *statistics);
 #if BOAROS_COST_DIAGNOSTICS
-#define KERNEL_SOCKET_PROTOCOL_VALUES 16U
+#define KERNEL_SOCKET_PROTOCOL_VALUES 22U
 void kernel_socket_protocol_snapshot(uint64_t values[KERNEL_SOCKET_PROTOCOL_VALUES]);
 #endif
 

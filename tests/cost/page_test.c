@@ -21,8 +21,15 @@ int main(void)
     layout.usable_count=1;layout.usable[0].base=(uintptr_t)pool;layout.usable[0].size=sizeof(pool);
     assert(physical_page_allocator_init(&allocator,&layout)==0);
     assert(physical_page_allocator_bind_access(&allocator,access_page)==0);
+    uint64_t boot;
+    assert(physical_page_allocate(&allocator,&boot)==0 && allocator.allocated_peak_pages==1);
+    assert(physical_page_release(&allocator,boot)==0 && allocator.allocated_peak_pages==1);
     assert(physical_page_allocator_finalize(&allocator)==0);
+    assert(allocator.allocated_peak_pages == allocator.total_pages - allocator.available_pages);
     uint64_t pages[128],address;unsigned count=0;
+    uint64_t initial=allocator.allocated_peak_pages;
+    assert(physical_page_allocate_order(&allocator,3,&address)==0 && allocator.allocated_peak_pages==initial+8);
+    assert(physical_page_release_order(&allocator,address,3)==0 && allocator.allocated_peak_pages==initial+8);
     while(physical_page_available(&allocator)){assert(count<128);assert(physical_page_allocate(&allocator,&pages[count++])==0);}
     assert(physical_page_allocator_set_reclaimer(&allocator,reclaim,0)==0);allocator.reclaim_depth=reclaim_depth;
     assert(kernel_cost_begin(1,10000000,1,0)==0);
@@ -31,7 +38,9 @@ int main(void)
     assert(kernel_cost_read(0,COST_PAGE_CALLS,&value)==0 && value==1);
     assert(kernel_cost_read(0,COST_PAGE_FAILURES,&value)==0 && value==1);
     assert(kernel_cost_read(0,COST_PAGE_ACCEPTED,&value)==0 && value==0);
+    assert(allocator.allocated_peak_pages == allocator.total_pages);
     allocator.reclaim_depth=0;assert(physical_page_allocator_clear_reclaimer(&allocator)==0);
     while(count)assert(physical_page_release(&allocator,pages[--count])==0);
+    assert(allocator.allocated_peak_pages == allocator.total_pages);
     puts("real allocator reentry OOM preserves errno and reports one failed allocation");
 }

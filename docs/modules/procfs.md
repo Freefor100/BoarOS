@@ -28,3 +28,14 @@ PID 数字目录的 inode 编入单调分配代次；进程退出后旧目录对
 
 默认关闭的成本诊断构建另外提供完整命令控制与冻结快照，具体 owner、窗口和失败契约见
 [成本观测模块](kernel-cost.md)。普通构建的目录 cookie、节点集合和生成文件语义保持一致。
+
+
+COST 构建的 `/proc/boaros_net_stats` 保留原 16 个字段，并追加 segment、pbuf、
+pbuf pool 与 PCB 的实际高水位；包计数改用 32 位，release 仍保持 lwIP 默认宽度。
+缺失旧字段的消费者必须保留未知值，不把旧 16 位计数差当作无界窗口内的准确增量。
+同一诊断构建另有 `/proc/boaros_mem_stats`，输出 managed/heap 的 current/peak 字节数。
+managed 峰值由分配器在 bootstrap、finalize 与 buddy 成功分配时维护，释放不降低，
+从本分配器初始化持续到快照；包含受管内核运行页、缓存和用户页，排除不在受管池中的
+内核映像、固件和 MMIO。heap 是其中的子集，两种峰值不可相加，也不是 workload
+窗口专属峰值。读取在分配自身快照缓冲之前捕获计数，字段仅在 COST 构建出现；
+关闭 COST 不增加该峰值字段或更新代码。`meminfo` 继续只表示当前时点状态。

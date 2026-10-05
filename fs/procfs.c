@@ -33,6 +33,7 @@
 #define PROC_COST_INODE UINT64_C(10)
 #define PROC_COST_CONTROL_INODE UINT64_C(11)
 #define PROC_NETWORK_STATS_INODE UINT64_C(12)
+#define PROC_MEMORY_STATS_INODE UINT64_C(13)
 #define PROC_PID_DIR_KIND 1U
 #define PROC_PID_EXE_KIND 2U
 #define PROC_PID_CWD_KIND 3U
@@ -190,6 +191,9 @@ static int proc_lookup(struct kernel_vfs_instance *instance, uint64_t parent,
         return 0;
     }
 #if BOAROS_COST_DIAGNOSTICS
+    if (length == 16U && !memcmp(name,"boaros_mem_stats",length)) {
+        *inode=PROC_MEMORY_STATS_INODE;*mode=KERNEL_VFS_S_IFREG|0444U;return 0;
+    }
     if (length == 16U && !memcmp(name,"boaros_net_stats",length)) {
         *inode=PROC_NETWORK_STATS_INODE;*mode=KERNEL_VFS_S_IFREG|0444U;return 0;
     }
@@ -261,7 +265,7 @@ static int proc_open(struct kernel_vfs_mount *mount, const char *path,
          inode != PROC_RT_RUNTIME_INODE &&
 #if BOAROS_COST_DIAGNOSTICS
          inode != PROC_COST_INODE && inode != PROC_COST_CONTROL_INODE &&
-         inode != PROC_NETWORK_STATS_INODE &&
+         inode != PROC_NETWORK_STATS_INODE && inode != PROC_MEMORY_STATS_INODE &&
 #endif
          (proc_inode_kind(inode) != PROC_PID_DIR_KIND &&
           proc_inode_kind(inode) != PROC_PID_EXE_KIND &&
@@ -303,7 +307,7 @@ static int proc_open(struct kernel_vfs_mount *mount, const char *path,
 #if BOAROS_COST_DIAGNOSTICS
     node->generated_control |= inode == PROC_COST_CONTROL_INODE;
     node->generated_diagnostic = inode == PROC_COST_INODE || inode == PROC_COST_CONTROL_INODE ||
-                                 inode == PROC_NETWORK_STATS_INODE;
+                                 inode == PROC_NETWORK_STATS_INODE || inode == PROC_MEMORY_STATS_INODE;
 #endif
     node->inode = inode;
     node->mode = mode;
@@ -452,8 +456,9 @@ static int proc_dir_entry(struct kernel_vfs_file *file, uint64_t position,
     else if (position == 7U) entry_name = "boaros_cost";
     else if (position == 8U) entry_name = "boaros_cost_control";
     else if (position == 9U) entry_name = "boaros_net_stats";
-    else if (position >= 10U) {
-        position -= 3U;
+    else if (position == 10U) entry_name = "boaros_mem_stats";
+    else if (position >= 11U) {
+        position -= 4U;
 #else
     else if (position >= 7U) {
 #endif
@@ -467,7 +472,7 @@ static int proc_dir_entry(struct kernel_vfs_file *file, uint64_t position,
         name[length] = '\0';
         *next_position = 7U + (uint32_t)pid;
 #if BOAROS_COST_DIAGNOSTICS
-        *next_position += 3U;
+        *next_position += 4U;
 #endif
         *inode = proc_pid_inode(pid, identity, PROC_PID_DIR_KIND);
         *type = 4U;
@@ -486,6 +491,7 @@ static int proc_dir_entry(struct kernel_vfs_file *file, uint64_t position,
              position == 7U ? PROC_COST_INODE :
              position == 8U ? PROC_COST_CONTROL_INODE :
              position == 9U ? PROC_NETWORK_STATS_INODE :
+             position == 10U ? PROC_MEMORY_STATS_INODE :
 #endif
              PROC_ROOT_INODE;
     *type = position == 4U || position == 5U ? 10U :
@@ -1040,11 +1046,29 @@ static int proc_snapshot(struct kernel_vfs_node *node, struct kernel_heap *heap,
                          char **buffer, size_t *length)
 {
 #if BOAROS_COST_DIAGNOSTICS
+    if (node->inode == PROC_MEMORY_STATS_INODE) {
+        struct kernel_heap_statistics hs;
+        uint64_t irq = riscv_interrupt_save();
+        kernel_heap_get_statistics(heap, &hs);
+        uint64_t current = heap->page_allocator->total_pages - heap->page_allocator->available_pages;
+        uint64_t peak = heap->page_allocator->allocated_peak_pages;
+        riscv_interrupt_restore(irq);
+        char *data = 0;
+        enum kernel_heap_status result = kernel_heap_allocate(heap, 256, (void **)&data);
+        if (result != KERNEL_HEAP_STATUS_OK) return result == KERNEL_HEAP_STATUS_EMPTY ? -KERNEL_ENOMEM : -KERNEL_EIO;
+        size_t used = append_number_line(data,"managed_current_bytes=",current * BOAROS_PAGE_SIZE,"\n");
+        used += append_number_line(data+used,"managed_peak_bytes=",peak * BOAROS_PAGE_SIZE,"\n");
+        used += append_number_line(data+used,"heap_current_bytes=",hs.current_pages * BOAROS_PAGE_SIZE,"\n");
+        used += append_number_line(data+used,"heap_peak_bytes=",hs.peak_pages * BOAROS_PAGE_SIZE,"\n");
+        if (used >= 256) __builtin_trap();
+        data[used] = 0; *buffer = data; *length = used; return 0;
+    }
     if (node->inode == PROC_NETWORK_STATS_INODE) {
         static const char *const keys[KERNEL_SOCKET_PROTOCOL_VALUES] = {
             "tcp_write_calls=","tcp_written_bytes=","tcp_xmit=","tcp_recv=","tcp_memerr=",
             "udp_xmit=","udp_recv=","udp_memerr=","heap_used=","heap_max=",
-            "active_pcbs=","listen_pcbs=","segments=","udp_pcbs=","pbufs=","counter_bits="
+            "active_pcbs=","listen_pcbs=","segments=","udp_pcbs=","pbufs=","counter_bits=",
+            "tcp_segment_peak=","pbuf_peak=","pbuf_pool_used=","pbuf_pool_peak=","tcp_active_peak=","tcp_listen_peak="
         };
         char *data=0;uint64_t values[KERNEL_SOCKET_PROTOCOL_VALUES];
         enum kernel_heap_status allocation=kernel_heap_allocate(heap,1024,(void **)&data);

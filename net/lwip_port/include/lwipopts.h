@@ -56,6 +56,10 @@
 #define TCP_SND_BUF (8 * TCP_MSS)
 
 #define LWIP_STATS 1
+#if BOAROS_COST_DIAGNOSTICS
+/* 诊断长窗口避免 16 位包计数反复回绕；release 仍用上游默认宽度。 */
+#define LWIP_STATS_LARGE 1
+#endif
 #define LWIP_STATS_DISPLAY 0
 #define LWIP_DEBUG 0
 
