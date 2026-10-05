@@ -19,6 +19,7 @@
 #include <kernel/uaccess.h>
 #include <kernel/vfs.h>
 #include <string.h>
+#include "../../fs/vfs_internal.h"
 #include "lwip/memp.h"
 
 #define USER UINT64_C(0x10000)
@@ -40,6 +41,24 @@ enum kernel_uaccess_status __wrap_kernel_copy_from_user(struct kernel_mm *mm, vo
     if (cost_copy_measuring) cost_copy_observed += *copied;
 #endif
     return status;
+}
+
+static unsigned cache_io_probe, cache_reads, cache_writes;
+static uint64_t cache_last_offset;
+int __real_kernel_vfs_node_pread(struct kernel_vfs_node *, uint64_t, void *, size_t, size_t *);
+int __wrap_kernel_vfs_node_pread(struct kernel_vfs_node *node, uint64_t offset, void *buffer, size_t size, size_t *done)
+{
+    if (cache_io_probe) cache_reads++;
+    return __real_kernel_vfs_node_pread(node, offset, buffer, size, done);
+}
+int __real_kernel_vfs_node_writeback(struct kernel_vfs_node *, uint64_t, const void *, size_t, size_t *);
+int __wrap_kernel_vfs_node_writeback(struct kernel_vfs_node *node, uint64_t offset, const void *buffer, size_t size, size_t *done)
+{
+    if (cache_io_probe) {
+        if (cache_writes && offset <= cache_last_offset) __builtin_trap();
+        cache_last_offset = offset; cache_writes++;
+    }
+    return __real_kernel_vfs_node_writeback(node, offset, buffer, size, done);
 }
 
 static unsigned freeze_lwip_clock;
@@ -114,6 +133,98 @@ static void number(const char *label, uint64_t value)
 {
     virt_uart_puts(label); virt_uart_put_hex(value); virt_uart_putc('\n');
 }
+static void cache_range_cost(struct kernel_vfs_mount *mount, struct kernel_page_cache *cache)
+{
+    struct kernel_vfs_file file = {0};
+    static unsigned char bytes[4096], output[4096];
+    unsigned pages = BOAROS_COST_DIAGNOSTICS ? 16384 : 256;
+    size_t count; uint64_t observed = 0;
+    memset(bytes, 0x31, sizeof(bytes));
+    check(kernel_vfs_create(mount, "/cache-cost", 0600, &file) == 0, 250);
+    /* 范围索引的规模用真实缓存的稀疏零页建立，避免准备阶段逐页同步64MiB。
+     * 第0页仍先写入并同步真实旧内容，再测冷页完整覆盖。 */
+    check(kernel_vfs_ftruncate(&file, (uint64_t)pages * 4096) == 0 &&
+          kernel_vfs_pwrite(&file, 0, bytes, 4096, &count) == 0 && count == 4096, 251);
+    check(kernel_vfs_sync(&file, 0, &observed) == 0 &&
+          kernel_page_cache_invalidate_node(cache, kernel_vfs_file_node(&file)) == KERNEL_PAGE_CACHE_STATUS_OK, 252);
+    memset(bytes, 0x52, sizeof(bytes));
+    cache_reads = cache_writes = 0; cache_io_probe = 1;
+    check(kernel_vfs_pwrite(&file, 0, bytes, 4096, &count) == 0 && count == 4096, 253);
+    cache_io_probe = 0;
+    number("cache full-overwrite backend reads: ", cache_reads);
+    check(!cache_reads && kernel_vfs_sync(&file, 0, &observed) == 0 &&
+          kernel_page_cache_invalidate_node(cache, kernel_vfs_file_node(&file)) == KERNEL_PAGE_CACHE_STATUS_OK, 254);
+    cache_reads = cache_writes = 0; cache_io_probe = 1;
+    unsigned char value = 0x73;
+    check(kernel_vfs_pwrite(&file, 17, &value, 1, &count) == 0 && count == 1, 255);
+    cache_io_probe = 0;
+    check(cache_reads == 1 && kernel_vfs_pread(&file, 0, output, 4096, &count) == 0 && count == 4096, 256);
+    bytes[17] = value; check(!memcmp(bytes, output, 4096), 257);
+    check(kernel_vfs_sync(&file, 0, &observed) == 0, 258);
+    /* 保留整个inode的干净页，再只改一个字节；选区不能遍历其余页。 */
+    struct kernel_page_cache_statistics before, after;
+    kernel_page_cache_get_statistics(cache, &before);
+    for (unsigned i = 1; i < pages; i++)
+        check(kernel_vfs_pread(&file, (uint64_t)i * 4096, output, 4096, &count) == 0 && count == 4096, 259);
+    kernel_page_cache_get_statistics(cache, &after);
+    check(after.current_pages >= before.current_pages + pages - 1, 274);
+    check(kernel_vfs_pwrite(&file, 3 * 4096 + 19, &value, 1, &count) == 0 && count == 1, 260);
+#if BOAROS_COST_DIAGNOSTICS
+    check(kernel_cost_begin(6, cost_frequency, 1, 0) == 0, 261);
+#endif
+    cache_reads = cache_writes = 0; cache_io_probe = 1;
+    check(kernel_page_cache_writeback_range(cache, kernel_vfs_file_node(&file), 3 * 4096, 4 * 4096) == 0, 262);
+    cache_io_probe = 0; check(cache_writes == 1 && !cache_reads, 263);
+#if BOAROS_COST_DIAGNOSTICS
+    uint64_t visits, snapshot;
+    check(kernel_cost_end(6, 0) == 0 && kernel_cost_read(0, COST_WRITEBACK_VISITS, &visits) == 0 &&
+          visits <= 2 && kernel_cost_read(0, COST_SNAPSHOT_COPY, &snapshot) == 0 && snapshot == 1, 264);
+    number("cache small-range visits: ", visits); number("cache one-byte snapshot: ", snapshot);
+#endif
+    unsigned indices[] = {200, 3, 100};
+    for (unsigned i = 0; i < 3; i++)
+        check(kernel_vfs_pwrite(&file, (uint64_t)indices[i] * 4096 + 29, &value, 1, &count) == 0 && count == 1, 265);
+#if BOAROS_COST_DIAGNOSTICS
+    check(kernel_cost_begin(7, cost_frequency, 1, 0) == 0, 266);
+#endif
+    cache_reads = cache_writes = 0; cache_io_probe = 1;
+    check(kernel_page_cache_writeback(cache, kernel_vfs_file_node(&file)) == 0, 267);
+    cache_io_probe = 0; check(cache_writes == 3 && !cache_reads, 268);
+#if BOAROS_COST_DIAGNOSTICS
+    check(kernel_cost_end(7, 0) == 0 && kernel_cost_read(0, COST_WRITEBACK_VISITS, &visits) == 0 &&
+          visits <= 6 && kernel_cost_read(0, COST_SNAPSHOT_COPY, &snapshot) == 0 && snapshot == 3, 269);
+    number("cache sparse-dirty visits: ", visits);
+#endif
+    for (unsigned i = 64; i < 80; i++)
+        check(kernel_vfs_pwrite(&file, (uint64_t)i * 4096 + 37, &value, 1, &count) == 0 && count == 1, 275);
+#if BOAROS_COST_DIAGNOSTICS
+    check(kernel_cost_begin(8, cost_frequency, 1, 0) == 0, 276);
+#endif
+    cache_reads = cache_writes = 0; cache_io_probe = 1;
+    check(kernel_page_cache_writeback_range(cache, kernel_vfs_file_node(&file), 70 * 4096, 71 * 4096) == 0, 277);
+    cache_io_probe = 0; check(cache_writes == 1, 278);
+#if BOAROS_COST_DIAGNOSTICS
+    check(kernel_cost_end(8, 0) == 0 && kernel_cost_read(0, COST_WRITEBACK_VISITS, &visits) == 0 &&
+          visits == 1 && kernel_cost_read(0, COST_SNAPSHOT_COPY, &snapshot) == 0 && snapshot == 1, 279);
+    number("cache selected hash visits among 16 dirty: ", visits);
+#endif
+    cache_reads = cache_writes = 0; cache_io_probe = 1;
+    check(kernel_page_cache_writeback(cache, kernel_vfs_file_node(&file)) == 0, 280);
+    cache_io_probe = 0; check(cache_writes == 15, 281);
+    check(kernel_vfs_sync(&file, 0, &observed) == 0 &&
+          kernel_page_cache_invalidate_node(cache, kernel_vfs_file_node(&file)) == KERNEL_PAGE_CACHE_STATUS_OK, 270);
+    for (unsigned i = 0; i < 3; i++) {
+        check(kernel_vfs_pread(&file, (uint64_t)indices[i] * 4096, output, 4096, &count) == 0 && count == 4096, 271);
+        for (unsigned j = 0; j < 4096; j++) check(output[j] == ((j == 29 || (indices[i] == 3 && j == 19)) ? value : 0), 272);
+    }
+    for (unsigned i = 64; i < 80; i++) {
+        check(kernel_vfs_pread(&file, (uint64_t)i * 4096, output, 4096, &count) == 0 && count == 4096, 282);
+        for (unsigned j = 0; j < 4096; j++) check(output[j] == (j == 37 ? value : 0), 283);
+    }
+    check(kernel_vfs_unlink(mount, "/cache-cost") == 0 && kernel_vfs_close(&file) == 0, 273);
+    number("cache retained pages tested: ", pages);
+}
+
 static void tcp_cost(struct kernel_files *files, struct kernel_mm *mm)
 {
     int64_t listener_fd, client_fd, result;
@@ -803,6 +914,7 @@ void kernel_main(unsigned long hart, const void *dtb)
 #if BOAROS_COST_DIAGNOSTICS
     growth_cost(&mount, &cache);
 #endif
+    cache_range_cost(&mount, &cache);
     tcp_cost(&files, &mm);
     udp_buffer_oom(&files, &mm);
     socketpair_scale(&files, &mm);
