@@ -917,6 +917,58 @@ static unsigned long run_stack_contract_cases(
     return failures + stack_contract_failures;
 }
 
+static unsigned long io_buffer_failures;
+
+static void io_buffer_worker(void *argument)
+{
+    (void)argument;
+    uint64_t available = physical_page_available(test_page_allocator);
+    struct kernel_task_io_buffer first = {0};
+    struct kernel_task_io_buffer second = {0};
+    uint64_t first_page = 0U;
+    void *first_data = 0;
+    if (kernel_task_io_buffer_acquire(&first, test_page_allocator) !=
+        KERNEL_TASK_STATUS_OK) {
+        io_buffer_failures++;
+    } else {
+        first_page = first.physical_address;
+        first_data = first.data;
+        kernel_task_io_buffer_release(&first);
+    }
+    if (kernel_task_io_buffer_acquire(&second, test_page_allocator) !=
+        KERNEL_TASK_STATUS_OK) {
+        io_buffer_failures++;
+    }
+    /* 顺序调用复用任务的常驻 scratch 页：第二次不再分配，释放后仍归任务。 */
+    if (physical_page_available(test_page_allocator) != available - 1U)
+        io_buffer_failures++;
+    if (second.physical_address != first_page || second.data != first_data)
+        io_buffer_failures++;
+    if (second.allocator != test_page_allocator ||
+        second.task != kernel_task_current())
+        io_buffer_failures++;
+    kernel_task_io_buffer_release(&second);
+    if (physical_page_available(test_page_allocator) != available - 1U)
+        io_buffer_failures++;
+}
+
+static unsigned long run_io_buffer_cases(
+    struct physical_page_allocator *allocator)
+{
+    uint64_t available = physical_page_available(allocator);
+    struct kernel_thread_completion completion;
+    unsigned long failures = 0U;
+    failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
+                              kernel_thread_create(io_buffer_worker, 0));
+    failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
+                              kernel_scheduler_on_tick(1U));
+    failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
+                              kernel_scheduler_reap_one(&completion));
+    /* 任务销毁后常驻页必须归还分配器。 */
+    if (physical_page_available(allocator) != available) failures++;
+    return failures + io_buffer_failures;
+}
+
 static struct kernel_rwlock io_lock;
 static unsigned sync_order, sync_failures;
 static void sync_reader(void *arg)
@@ -1147,6 +1199,7 @@ void kernel_main(unsigned long hart_id, const void *dtb)
     failures += run_load_wait_cases(&allocator);
     failures += run_fpu_cases();
     failures += run_stack_contract_cases(&allocator);
+    failures += run_io_buffer_cases(&allocator);
     failures += run_sync_cases(&allocator);
     failures += run_idle_irq_return_case(&allocator);
     failures += run_handoff_cases(&allocator);

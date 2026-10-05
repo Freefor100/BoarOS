@@ -647,6 +647,7 @@ static enum kernel_scheduler_status finish_clone_failure(
     process_identity_collect();
     if (!cleanup_failed) {
         scheduler_forget_task(thread);
+        kernel_task_release_io_scratch(thread);
         (void)physical_page_release(scheduler.allocator,
                                   thread->physical_address);
     }
@@ -944,6 +945,7 @@ static enum kernel_scheduler_status reap_waited_child(
     child->group_members = 0U;
     child->publish_completion = 0U;
     scheduler_forget_task(child);
+    kernel_task_release_io_scratch(child);
     (void)physical_page_release(scheduler.allocator,
                               child->physical_address);
 
@@ -1418,6 +1420,7 @@ enum kernel_scheduler_status kernel_scheduler_reap_one(
         return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
     }
     scheduler_forget_task(thread);
+    kernel_task_release_io_scratch(thread);
     (void)physical_page_release(scheduler.allocator,
                               thread->physical_address);
     scheduler.exited_head = next;
@@ -1557,13 +1560,28 @@ enum kernel_task_status kernel_task_io_buffer_acquire(
     if (buffer == 0 || buffer->allocator != 0 || allocator == 0 ||
         (task != 0 && task->io_buffer != 0)) __builtin_trap();
     uint64_t physical;
-    enum physical_page_status status = physical_page_allocate(allocator, &physical);
-    if (status == PHYSICAL_PAGE_STATUS_EMPTY)
-        return KERNEL_TASK_STATUS_RESOURCE_UNAVAILABLE;
-    if (status != PHYSICAL_PAGE_STATUS_OK) __builtin_trap();
     void *data;
-    if (physical_page_resolve(allocator, physical, &data) !=
-        PHYSICAL_PAGE_STATUS_OK) __builtin_trap();
+    if (task != 0 && task->io_scratch_data != 0) {
+        /* The task keeps one scratch page across calls; only the allocator
+         * identity is re-checked because every caller resolves the same
+         * physical-page owner. */
+        if (task->io_scratch_allocator != allocator) __builtin_trap();
+        physical = task->io_scratch_physical_address;
+        data = task->io_scratch_data;
+    } else {
+        enum physical_page_status status =
+            physical_page_allocate(allocator, &physical);
+        if (status == PHYSICAL_PAGE_STATUS_EMPTY)
+            return KERNEL_TASK_STATUS_RESOURCE_UNAVAILABLE;
+        if (status != PHYSICAL_PAGE_STATUS_OK) __builtin_trap();
+        if (physical_page_resolve(allocator, physical, &data) !=
+            PHYSICAL_PAGE_STATUS_OK) __builtin_trap();
+        if (task != 0) {
+            task->io_scratch_allocator = allocator;
+            task->io_scratch_physical_address = physical;
+            task->io_scratch_data = data;
+        }
+    }
     *buffer = (struct kernel_task_io_buffer){task, allocator, physical, data};
     if (task != 0) task->io_buffer = buffer;
     return KERNEL_TASK_STATUS_OK;
@@ -1573,12 +1591,32 @@ void kernel_task_io_buffer_release(struct kernel_task_io_buffer *buffer)
 {
     if (buffer == 0 || buffer->allocator == 0) __builtin_trap();
     if (buffer->task != 0) {
-        if (buffer->task->io_buffer != buffer) __builtin_trap();
+        if (buffer->task->io_buffer != buffer ||
+            buffer->task->io_scratch_data == 0 ||
+            buffer->task->io_scratch_physical_address !=
+                buffer->physical_address) __builtin_trap();
         buffer->task->io_buffer = 0;
+        /* The retained scratch page stays with the task until teardown. */
+    } else if (physical_page_release(buffer->allocator,
+                                     buffer->physical_address) !=
+               PHYSICAL_PAGE_STATUS_OK) {
+        __builtin_trap();
     }
-    if (physical_page_release(buffer->allocator, buffer->physical_address) !=
-        PHYSICAL_PAGE_STATUS_OK) __builtin_trap();
     *buffer = (struct kernel_task_io_buffer){0};
+}
+
+/* Final storage release frees the retained scratch page; callers run on a
+ * trusted stack after every live request handle was already released. */
+void kernel_task_release_io_scratch(struct kernel_task *task)
+{
+    if (task == 0 || task->io_buffer != 0) __builtin_trap();
+    if (task->io_scratch_data == 0) return;
+    if (physical_page_release(task->io_scratch_allocator,
+                              task->io_scratch_physical_address) !=
+        PHYSICAL_PAGE_STATUS_OK) __builtin_trap();
+    task->io_scratch_allocator = 0;
+    task->io_scratch_physical_address = 0;
+    task->io_scratch_data = 0;
 }
 
 enum kernel_task_status kernel_task_socket_read_register(

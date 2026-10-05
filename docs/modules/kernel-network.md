@@ -22,7 +22,7 @@ IPv4 重组键包括源/目的地址、IP ID、协议号和输入 netif 身份�
 
 普通 socket read/readv 使用“预留队首片段→按偏移复制→提交/取消”。用户容量决定 UDP 的截断长度，一个报文可经请求持有的 4 KiB 页反复复制，最终只消费一次；不能以内部暂存容量截断报文。零长度 datagram 也必须完成 reservation；TCP EOF 没有 reservation。TCP 在用户容量内继续读取已排队片段，取得进展后不等待新数据。每段完整复制后才消费；当前段 fault 保留整段，返回先前已提交的字节数，没有先前进展则 EFAULT。UDP fault 丢弃当前 datagram。read reservation 独占队首，第二个 read/recvfrom 不得越过它。
 
-请求 scratch 页由 `kernel_task_io_buffer` 持有，按需分配并登记在当前任务；分配失败返回 ENOMEM，不预留或消费队首。正常返回解除登记并释放物理页，强制退出先取消 read reservation／释放其 OFD pin，再释放 scratch，之后才释放任务文件表和栈。没有用户任务的模块测试沿正常返回路径回收。socket 普通 write/writev 同样使用请求页，按用户页和协议剩余空间提交；不再每 64 字节调用 tcp_write。`kernel_socket_get_statistics` 提供单 hart 累计 tcp_write 调用及成功复制字节数，`kernel_uaccess_page_resolutions` 记录用户页解析尝试。计数没有新增用户 ABI。
+请求 scratch 页由任务持有并在多次调用间复用（首次使用时分配），调用期间登记在当前任务；分配失败返回 ENOMEM，不预留或消费队首。正常返回解除登记，物理页保留至任务最终存储释放；强制退出先取消 read reservation／释放其 OFD pin，再解除登记，之后才释放任务文件表和栈。没有用户任务的模块测试按调用分配并沿正常返回路径释放。socket 普通 write/writev 同样使用请求页，按用户页和协议剩余空间提交；不再每 64 字节调用 tcp_write。`kernel_socket_get_statistics` 提供单 hart 累计 tcp_write 调用及成功复制字节数，`kernel_uaccess_page_resolutions` 记录用户页解析尝试。计数没有新增用户 ABI。
 
 `recvfrom` 的缓冲区范围在等待空 UDP socket 前检查，负 socklen_t 返回 EINVAL；accept/recvfrom 的地址输出错误发生在协议 dequeue 后，与固定 Linux 顺序一致。
 

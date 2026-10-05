@@ -507,6 +507,7 @@ enum kernel_scheduler_status release_task_storage(
     enum kernel_scheduler_status status = release_task_stack(thread);
     if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
     scheduler_forget_task(thread);
+    kernel_task_release_io_scratch(thread);
     (void)physical_page_release(scheduler.allocator, thread->physical_address);
     return original_status;
 }

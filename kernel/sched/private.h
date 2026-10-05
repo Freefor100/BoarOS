@@ -134,6 +134,10 @@ struct kernel_task {
     struct kernel_socket_read_request *socket_read_request;
     struct kernel_socket_write_request *socket_write_request;
     struct kernel_task_io_buffer *io_buffer;
+    /* Task-owned scratch page retained across sequential I/O calls. */
+    struct physical_page_allocator *io_scratch_allocator;
+    uint64_t io_scratch_physical_address;
+    void *io_scratch_data;
     struct kernel_tty_request *tty_request;
     struct kernel_tty *controlling_tty;
     struct kernel_io_context io_context;
@@ -262,6 +266,7 @@ enum kernel_scheduler_status process_group_exec_current(void);
 void clear_page(void *pointer);
 enum kernel_scheduler_status allocate_task_storage(struct kernel_task **task);
 enum kernel_scheduler_status release_task_stack(struct kernel_task *task);
+void kernel_task_release_io_scratch(struct kernel_task *task);
 enum kernel_scheduler_status release_task_storage(struct kernel_task *task,
     enum kernel_scheduler_status original_status);
 struct kernel_task *ready_first(void);
