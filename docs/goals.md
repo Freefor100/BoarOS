@@ -45,6 +45,12 @@ Unix98 PTY、独立 devpts、peer 打开、packet 模式和 PTY/串口 termios2 
 完整凭据/权限、运行时网络配置和无 RNG 平台的可信熵接入由目标应用确定交付范围；
 LoongArch 是独立交付依赖，SMP 单独规划。
 
+2026-10-05 第三方审计已逐条核实（对照 5c82103 与当前工作树）：机制描述基本属实，
+性能数字全部可溯源但存在口径混用；其归纳的基础问题与仓库已知边界一致，建议中的
+数值目标不作验收门禁。本轮据此实施 B（scratch 复用，已交付）、A（到期索引与最早
+期限重装，已交付）与 D（内核栈 guard，进行中）；C（网络关中断区/协议所有权）只出
+设计对比。
+
 ## 按证据触发的性能候选
 
 | 触发证据 | 候选与必要代价 |
@@ -55,7 +61,6 @@ LoongArch 是独立交付依赖，SMP 单独规划。
 | 非阻塞发送复制放大或固定热缓存运行成本高 | 发送credit约束暂存、重复解析/复制/查询；先核对错误优先级，保留短写、EFAULT前缀、取消和页生命周期 |
 | Lua构建仍有差距，选定heap清零/搬迁与页内复制不足以解释 | 核对用户程序运行、页解析/ELF及未测固定成本，再选一个机制；VMA指标是比较次数，不能当查询数或时间 |
 | 热路径stat/open无大量设备请求仍慢，fstat更轻 | 核对路径临时缓冲、逐级后端查询及对象周转；累计请求容量不是峰值。空文件创建删除另分解目录、inode/位图、事务及真实资源等待；保护身份、orphan、同步与复用，不顺势扩大缓存重构 |
-| 短睡眠的到期唤醒接近tick周期 | 比较提高HZ与最早blocked deadline参与SBI重装；当前额外timer只服务实时预算/RR。核对中断开销、取消、重启、对象复用和空闲功耗，不先换调度策略 |
 | UDP过载丢包或TCP受协议credit约束 | 核对接收/丢弃量、每连接进展、lwIP窗口/池和socket预算；限速可靠性与饱和效率分开，TCP_INFO未支持的字段不作为重传证据 |
 | 真实大映射/多等待者负载规模退化 | resident范围索引、deadline索引或安全长操作边界；核对维护成本、OOM和取消 |
 
@@ -65,6 +70,8 @@ LoongArch 是独立交付依赖，SMP 单独规划。
 
 | 阶段/能力 | 事实与证据入口 |
 |---|---|
+| 任务常驻 I/O scratch 页 | 每任务首次 I/O 分配一页并跨调用复用，正常调用只解除登记，任务销毁路径归还；musl 自动窗口物理页分配 42744→18066（差 24678 与 24576 次调用吻合）。见[调度](modules/kernel-scheduler.md)与[网络](modules/kernel-network.md)。 |
+| 到期有序索引与最早期限重装 | blocked deadline 使用 (deadline, tid) 有序索引，到期只弹出已到期者；SBI 事件取 min(RT 预算, RR 片尾, 最早睡眠 deadline)；socket 写重试链按期限有序。COST deadline 门禁改为到期处理数与 timeout 一致、不随无期限 blocked 增长。见[调度](modules/kernel-scheduler.md)、[时间](modules/kernel-time.md)与[定时器](modules/riscv-timer.md)。 |
 | 文件元数据与路径资格 | 活inode重开避免临时后端owner；创建权限按已有句柄初始化并保留创建时间。O_PATH只持路径身份，路径truncate接入共同截断和capability清理；见[文件契约](modules/kernel-files.md)、[VFS](modules/vfs-ext4.md)与[时间语义](learning/file-timestamps.md)。 |
 | libc局部纠错与文件所有权 | flock错误优先级、无timer辅助的退出ready调度、固定glibc unwind依赖与取消清理已交付；fchown/fchownat修改ext4/tmpfs/匿名pipe真实元数据，capability删除与inode修改同事务，进程仍固定root。见[调度](modules/kernel-scheduler.md)、[文件契约](modules/kernel-files.md)和[所有权背景](learning/file-timestamps.md#文件所有权与进程身份)。 |
 | T1–T3/P1–P4 终端 | UART IRQ/worker、行规程、ctty/作业控制、Unix98 devpts/PTY、packet 与36/44字节termios；原ash/stty、script/replay和真实libc PTY API已交付。稳定节点、背压、关闭和可信栈回收见[TTY契约](modules/kernel-tty.md)。 |

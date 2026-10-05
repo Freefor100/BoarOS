@@ -45,10 +45,10 @@ syscall 层的 `clock_gettime(113)`、`clock_getres(114)` 支持 `CLOCK_REALTIME
 当前限制：无 NTP/阶跃调整、无 CPU-time clockid；timekeeper只在启动采样RTC，此后由CSR换算推进，用户RTC_RD_TIME仍读取设备当前值；无 SMP timekeeper 写入协议。
 
 fine时钟和deadline换算精度不等于到期唤醒精度。普通blocked deadline由timer路径
-检查；`kernel/sched/scheduling.c::scheduler_rearm_timer`的额外SBI事件目前只考虑
-实时预算和RR时间片，没有纳入最早睡眠deadline。因此短睡眠可能等到下一次100Hz
-tick才被发现，换成更高优先级或不同ready策略不能让尚未唤醒的任务提前运行。
-提高HZ与按最早deadline重装timer是待确认的两种取舍，涉及IRQ成本、取消和对象复用。
+检查；`kernel/sched/scheduling.c::scheduler_rearm_timer`的SBI事件取min(实时预算、
+RR时间片、最早睡眠deadline)，到期由按(deadline, tid)排序的索引只弹出已到期者，
+短睡眠不再固定等到下一次100Hz tick。IRQ延迟、关中断段和更高优先级任务仍会延后
+实际运行，不宣称硬上界；提高HZ的取舍不再用于唤醒精度。
 
 `times(153)`与proc的user/kernel统计来自timer采样：trap按当时的U/S状态记账，
 不是逐段结算的运行时间。频繁短syscall、关中断与延迟tick会影响归属，不能把

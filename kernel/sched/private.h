@@ -128,6 +128,12 @@ struct kernel_task {
     uint64_t robust_list_head;
     struct kernel_wait_queue *wait_queue;
     uint64_t wakeup_deadline;
+    /* Intrusive ordered index over tasks with a deadline, keyed by
+     * (wakeup_deadline, tid); maintained with interrupts disabled. */
+    struct kernel_task *deadline_left;
+    struct kernel_task *deadline_right;
+    int8_t deadline_height;
+    uint8_t deadline_indexed;
     uint32_t wake_reason;
     uint32_t wait_interruptible;
     struct kernel_syscall_restart_state syscall_restart;
@@ -231,6 +237,8 @@ struct kernel_scheduler {
     struct kernel_task *exited_tail;
     struct kernel_task *blocked_head;
     struct kernel_task *blocked_tail;
+    struct kernel_task *deadline_root;
+    uint64_t armed_deadline; /* Last deadline handed to the hardware timer. */
     struct kernel_task *stopped_head;
     struct kernel_task *stopped_tail;
     struct kernel_task *init_task;
@@ -282,6 +290,9 @@ void scheduler_forget_task(struct kernel_task *thread);
 struct kernel_task *ready_pop(void);
 void blocked_append(struct kernel_task *thread);
 void blocked_unlink(struct kernel_task *thread);
+void deadline_index_insert(struct kernel_task *task);
+void deadline_index_remove(struct kernel_task *task);
+struct kernel_task *deadline_index_first(void);
 enum kernel_scheduler_status scheduler_switch_current_away(
     struct kernel_task *previous);
 void process_complete_vfork(struct kernel_task *thread);

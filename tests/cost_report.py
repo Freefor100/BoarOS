@@ -84,11 +84,13 @@ def validate_expected(snapshot, expected):
 def validate_deadline(name, snapshot):
     _, unrelated, mode, _ = name.split('-')
     if int(mode) == 0:
-        samples=sum(snapshot[lane+'.deadline_visits.samples'] for lane in LANES[:2])
-        maximum=max(snapshot[lane+'.deadline_visits.max'] for lane in LANES[:2])
-        # Handshakes prove N+4 blocked members, without fixing system-worker count.
-        if not samples or maximum < int(unrelated)+4:
-            raise ValueError('deadline scan omitted blocked members: '+name)
+        lanes=LANES[:2]
+        samples=sum(snapshot[lane+'.deadline_visits.samples'] for lane in lanes)
+        visits=sum(snapshot[lane+'.deadline_visits.value'] for lane in lanes)
+        expired=sum(snapshot[lane+'.deadline_expired.value'] for lane in lanes)
+        # 到期工作必须与到期数一致，而不是与含 N 个无期限成员的阻塞总数一致。
+        if not samples or visits != expired or expired < 4:
+            raise ValueError('deadline work does not track expirations: '+name)
 
 def validate_replicas(records):
     """Three independent launches per immutable configuration, with complete identical windows."""

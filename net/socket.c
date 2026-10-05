@@ -145,7 +145,8 @@ static void *network_context;
 static struct kernel_socket *write_retry_head;
 
 /* Called with interrupts disabled: the list itself owns no socket reference.
- * A socket must remove its entry before its OFD frees it. */
+ * A socket must remove its entry before its OFD frees it.  Entries stay
+ * ordered by write_retry_ms so the earliest retry is the head. */
 static void write_retry_disarm(struct kernel_socket *socket)
 {
     struct kernel_socket **link;
@@ -164,12 +165,15 @@ static void write_retry_disarm(struct kernel_socket *socket)
 
 static void write_retry_arm(struct kernel_socket *socket)
 {
-    if (!socket->write_blocked) {
-        socket->write_retry_next = write_retry_head;
-        write_retry_head = socket;
-        socket->write_blocked = 1U;
-    }
     socket->write_retry_ms = sys_now() + SOCKET_WRITE_RETRY_MS;
+    write_retry_disarm(socket);
+    struct kernel_socket **link = &write_retry_head;
+    while (*link != 0 &&
+           (int32_t)((*link)->write_retry_ms - socket->write_retry_ms) <= 0)
+        link = &(*link)->write_retry_next;
+    socket->write_retry_next = *link;
+    *link = socket;
+    socket->write_blocked = 1U;
 }
 
 static int lwip_error(err_t error)
@@ -245,9 +249,9 @@ uint64_t kernel_socket_next_timer_deadline(void)
     milliseconds = socket_initialized ? sys_timeouts_sleeptime()
                                       : SYS_TIMEOUTS_SLEEPTIME_INFINITE;
     u32_t current_ms = sys_now();
-    for (struct kernel_socket *socket = write_retry_head; socket != 0;
-         socket = socket->write_retry_next) {
-        int32_t remaining = (int32_t)(socket->write_retry_ms - current_ms);
+    if (write_retry_head != 0) {
+        int32_t remaining =
+            (int32_t)(write_retry_head->write_retry_ms - current_ms);
         u32_t retry = remaining <= 0 ? 1U : (u32_t)remaining;
         if (milliseconds == SYS_TIMEOUTS_SLEEPTIME_INFINITE ||
             retry < milliseconds) milliseconds = retry;

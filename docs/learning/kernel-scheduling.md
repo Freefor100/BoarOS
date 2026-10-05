@@ -158,7 +158,7 @@ ready/exited 队列会同时被普通线程创建路径、timer handler 和 idle
 
 - BoarOS 的阻塞机制沿用 wait4 确立的模式：关中断内检查条件、置 BLOCKED、经 `riscv_context_switch` 切走；唤醒方把任务置 READY 并入其优先级队尾，被唤醒者从原调用点返回后必须重查条件。所有 BLOCKED 任务都在全局 blocked 链上，事件通道（wait_queue 令牌）与超时（deadline 刻度）是任务的字段而不是独立节点，唤醒按 FIFO 走链。
 - 单 hart 下，检查条件与登记阻塞之间若打开中断，事件可能提前发生并造成丢失唤醒。因此内核线程（trampoline 运行在 SIE=1）调用阻塞接口前用 `riscv_interrupt_save/restore` 收敛临界区，而 syscall/trap 入口天然关中断。当前已有用户线程；将来引入 SMP 时，还必须用锁和跨 hart 内存序保护同一条件与等待队列，单纯关闭本地中断不再足够。
-- 超时唤醒与事件唤醒共用一条 blocked 链：timer 处理器在抢占检查之前扫描到期 deadline，使刚到期的任务能参与本次选取。通用等待 deadline 仍按 O(阻塞数) 扫描，没有各自设置最早硬件期限；RT 预算与 RR 片尾已有独立 deadline。周期 tick 提供通常约一个 tick 的检测粒度，但关中断、IRQ 延迟和更高优先级任务会延后实际运行，不能宣称一个 tick 的硬上界。Linux 用红黑树/timer wheel 等结构组织到期任务，等待队列按需唤醒；当前扫描的成本与扩展边界见模块文档。
+- 超时唤醒与事件唤醒共用一条 blocked 链：timer 处理器在抢占检查之前处理到期 deadline，使刚到期的任务能参与本次选取。通用等待 deadline 由按 (deadline, tid) 排序的索引组织，每次到期只弹出已到期者；最早睡眠期限与 RT 预算、RR 片尾共同参与 SBI 重装，短睡眠不再固定等待下一次 100 Hz tick。关中断、IRQ 延迟和更高优先级任务仍会延后实际运行，不能宣称硬上界。索引维护与成本边界见模块文档。
 
 ## FP 状态为什么不塞进基础 Trap Frame
 

@@ -605,6 +605,8 @@ enum kernel_scheduler_status kernel_scheduler_init(
     scheduler.exited_tail = 0;
     scheduler.blocked_head = 0;
     scheduler.blocked_tail = 0;
+    scheduler.deadline_root = 0;
+    scheduler.armed_deadline = 0;
     scheduler.stopped_head = 0;
     scheduler.stopped_tail = 0;
     scheduler.init_task = 0;
@@ -911,6 +913,8 @@ restore_interrupts:
 
 void scheduler_forget_task(struct kernel_task *thread)
 {
+    /* 退出任务必须先经唤醒路径摘除期限索引，不能带着索引项被销毁。 */
+    if (thread->deadline_indexed) __builtin_trap();
     process_identity_release(thread);
     process_identity_collect();
     if (thread->join) {

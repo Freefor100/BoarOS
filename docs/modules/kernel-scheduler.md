@@ -78,7 +78,7 @@ vfork 共享 MM，复制 files；fs 默认复制，显式 CLONE_FS 时共享。�
 
 ## 等待与 futex
 
-所有 BLOCKED 任务在全局双向 blocked 链上，并可加入一个等待队列 FIFO。队列 wake-one 取队首，wake-all 唤醒全部；摘除 blocked 和 queue 成员均为 O(1)。deadline 使用原始 time ticks，0 表示无限；tick 仍扫描 blocked 链处理到期。
+所有 BLOCKED 任务在全局双向 blocked 链上，并可加入一个等待队列 FIFO。队列 wake-one 取队首，wake-all 唤醒全部；摘除 blocked 和 queue 成员均为 O(1)。deadline 使用原始 time ticks，0 表示无限；带期限任务同时进入以 (deadline, tid) 为键的有序索引，tick 只弹出已到期者，全部唤醒路径统一摘除索引项。
 
 WAIT 在关中断内读取用户字、比较 expected、登记并阻塞。private key 使用不复用的 MM 身份号与四字节对齐地址；共享匿名 key 使用后备对象身份与连续字节偏移，等待者持有对象引用直到原等待调用恢复。非 private 操作先从用户映射读取并解析后备，坏页在 WAKE 中也返回 EFAULT。哈希碰撞需二次匹配，REQUEUE 将目标 key 的引用交给迁移的等待者、保留 FIFO，返回唤醒数与迁移数之和。WAIT_BITSET 为等待者保存非零掩码；WAKE_BITSET 只唤醒掩码相交者，普通 WAKE 匹配全部，REQUEUE 保留原掩码。值不匹配为 EAGAIN，非法地址为 EFAULT，零掩码等非法参数为 EINVAL，超时为 ETIMEDOUT。
 
@@ -114,7 +114,7 @@ zombie 先逻辑回收再复制 status/rusage，因此坏输出指针的 EFAULT 
 
 每线程拥有独立的 4 KiB 元数据页和 8 KiB 连续物理内核栈（buddy order 1）；调度器初始化要求分配器已进入 finalized buddy 模式，栈分配、构造回滚与正常释放使用同一 order。栈底留 16 字节对齐区和 canary，剩余 8176 字节包含 Trap Frame 与 C 调用链。新栈填充固定字节，初始用户 Trap Frame 显式清零。退出后只在其他可信栈扫描未覆盖前缀；累计最小剩余空间和最大已用空间由只读统计接口提供，生产 PID 1 完成时报告。构造回滚同样释放独立栈，不让资源清理失败保留它。
 
-`make test-stack-usage` 强制重建隔离的生产对象，编译器 `-fstack-usage` 产出逐函数记录；host probe 从实际栈配置和 Trap Frame 头计算容量、guard、汇编 Frame 与余量预算，避免测试大栈或旧报告污染门禁。`tests/stack-usage.py` 拒绝超出“栈容量减 16 字节、288 字节汇编 Trap Frame、1024 字节余量”的单帧及无界动态栈；该检查不能证明完整调用链。真实 root-init、静态 musl 与动态 pthread 测试另要求已退出任务的最小实测余量至少 1024 字节，不足时必须扩大栈后重新运行。Canary 用于发现破坏，填充测量用于观察高水位；两者都不等价于未映射 guard page，也不证明未执行分支的栈界。ASID 0 的切换刷新成本、OTHER 的 100 Hz tick、线性 wait4 与 deadline 扫描仍存在。
+`make test-stack-usage` 强制重建隔离的生产对象，编译器 `-fstack-usage` 产出逐函数记录；host probe 从实际栈配置和 Trap Frame 头计算容量、guard、汇编 Frame 与余量预算，避免测试大栈或旧报告污染门禁。`tests/stack-usage.py` 拒绝超出“栈容量减 16 字节、288 字节汇编 Trap Frame、1024 字节余量”的单帧及无界动态栈；该检查不能证明完整调用链。真实 root-init、静态 musl 与动态 pthread 测试另要求已退出任务的最小实测余量至少 1024 字节，不足时必须扩大栈后重新运行。Canary 用于发现破坏，填充测量用于观察高水位；两者都不等价于未映射 guard page，也不证明未执行分支的栈界。ASID 0 的切换刷新成本、OTHER 的 100 Hz tick 与线性 wait4 仍存在。
 
 聚焦入口为 `make test-stack-usage`、`make test-scheduler-cases-riscv`、`make test-scheduler-riscv`、`make test-files-riscv` 和 `make test-signal-riscv`；`make test-userland-riscv` 验证真实 pthread、共享匿名 futex、bitset 绝对 realtime 等待在 stop/continue 后保留掩码和截止时刻。`make test-diff-abi-riscv` 用同一 ELF 对照固定 Linux 的零掩码、超时、错误、按掩码唤醒和 requeue；`make test-glibc-riscv` 验证 glibc 2.44 的 `pthread_join` 消费路径。阶段收口使用 `make test-riscv`。各次实际通过范围以 README 和提交验证说明为准，不把实现路径存在等同于全部线程负载已验证。
 
@@ -153,9 +153,10 @@ zombie 先逻辑回收再复制 status/rusage，因此坏输出指针的 EFAULT 
 独立假时钟测试保护睡眠排除及前后台归属；13窗口三启动锁对照与四组合三启动低内存fixture
 保护原来的阻塞、取消和资源回收。测量不改变队列/公平策略。
 
-C4 另计 queue validation 次数、shape/thread检查、deadline每轮访问及最大集合大小、
+C4 另计 queue validation 次数、shape/thread检查、deadline到期处理数与最大单轮到期数、
 实际timeout数量、到期到下一次运行的直方图。到期时复用已有 blocked_start 标量存期限，
 调度后清除，不增加任务字节。timer计时在可能切换前收口，跨切换的暂停栈不成为诊断在途owner。
 `make test-cost-riscv COST_CASE=deadline` 固定4期限任务加0/32/128/256无期限blocked，
 pipe/proc状态双握手确认，覆盖同期限、提前信号、默认信号、取消和对象复用。
-队列shape检查目前只查头尾，计数与deadline全集合遍历分开，不将它误报成全队列扫描。
+到期处理数必须与timeout数量一致且不随无期限blocked总数增长；队列shape检查只查头尾，
+计数与索引弹出分开，不将它误报成全队列扫描。
