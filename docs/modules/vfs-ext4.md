@@ -386,3 +386,22 @@ OFD 和控制终端保活配对，配对持有挂载 root/path 引用；挂载�
 双盘暂扣/错误隔离门禁由guest显式配置单字节控制终端，避免规范输入阻塞握手；
 `make test-multi-disk-io-riscv test-multi-disk-rt-riscv`覆盖原故障/重启和实时负载。
 runner超时保存token及guest/NBD边界现场，CI已接入原双盘目标，见[可睡眠存储](../learning/sleepable-storage.md)。
+
+
+## 缓存版本内的批量读
+
+内部 `kernel_vfs_node_pread_batch` 接受最多八个独立输出区段。caller 在整个调用期间
+持有 inode/read gate 和所有输出；全部参数先检查，逐项返回连续成功前缀与负 errno，
+无批量后端时执行独立标量回退，不隐含完整批次成功或原子性。
+ext4 的 `ext4_fpread_batch` 持 mount read lock，按 extent/传统块映射处理洞、EOF 和
+块内片段；真实缺失块才进入最多八项的 `bread_batch`。`ext4_block_get_batch` 引用
+当前 bcache，dirty/journal-pending 数据优先；相同块的多个片段共用一次加载。
+为避免交叉等待尚未发布的 loading，本批自有加载全部发布、完成并唤醒后，才等待
+其他 owner 的既有加载。失败块释放本批引用，其余项可成功；读失败不记录为 inode
+写回错误。设备发布后的输出由块层持有至全部完成或确认 reset。
+
+`make test-lwext4-cache-host test-lwext4-batch-read-host` 覆盖共享加载、旧缓存版本保护、
+OOM、独立错误与重试；后者运行 1/4/8 KiB ext4、extent/传统映射的洞、EOF 和片段。
+`make test-io-sleep-riscv` 另用真实八页 VFS batch，要求在释放任何响应前发布八项，
+并验证保留最后一个 DMA 时取消不能提前返回。普通页缓存的顺序预读单独接入，
+不把这个内部接口门禁解释为用户 read 的吞吐收益。

@@ -2438,6 +2438,34 @@ int kernel_vfs_node_pread(struct kernel_vfs_node *node,
     return instance->ops->pread(node, offset, buffer, size, bytes_read);
 }
 
+int kernel_vfs_node_pread_batch(struct kernel_vfs_node *node,
+    struct kernel_vfs_read_span *spans, size_t count)
+{
+    if (!node || !node->mount || !node->mount->private_data ||
+        count > KERNEL_VFS_READ_BATCH_MAX || (count && !spans)) return -KERNEL_EINVAL;
+    for (size_t i = 0; i < count; i++) { spans[i].completed = 0; spans[i].error = -KERNEL_EINVAL; }
+    for (size_t i = 0; i < count; i++) {
+        uintptr_t a = (uintptr_t)spans[i].buffer, b = (uintptr_t)spans;
+        size_t n = spans[i].size;
+        if (spans[i].offset > INT64_MAX || n > UINT64_MAX - spans[i].offset ||
+            (n && (!a || n - 1 > UINTPTR_MAX - a ||
+            (a < b ? b - a < n : a - b < count * sizeof(*spans))))) return spans[i].error = -KERNEL_EINVAL;
+        for (size_t j = 0; j < i; j++) {
+            b = (uintptr_t)spans[j].buffer;
+            if (n && spans[j].size && (a < b ? b - a < n : a - b < spans[j].size)) return spans[i].error = -KERNEL_EINVAL;
+        }
+    }
+    for (size_t i = 0; i < count; i++) spans[i].error = 0;
+    struct kernel_vfs_instance *instance = node->mount->private_data;
+    if (instance->ops->pread_batch) return instance->ops->pread_batch(node, spans, count);
+    int result = 0;
+    for (size_t i = 0; i < count; i++) {
+        spans[i].error = instance->ops->pread(node, spans[i].offset, spans[i].buffer, spans[i].size, &spans[i].completed);
+        if (!result) result = spans[i].error;
+    }
+    return result;
+}
+
 int kernel_vfs_file_is_control(const struct kernel_vfs_file *file)
 {
     struct kernel_vfs_node *node = kernel_vfs_file_node(file);

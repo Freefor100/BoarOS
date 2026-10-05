@@ -115,4 +115,90 @@ static void contracts(void)
     CHECK(ext4_bcache_free(&cache,&b)==EOK);CHECK(ext4_bcache_free(&cache,&interleaved)==EOK);finish(&cache);
     puts("cache contracts: dirty/journal owner, loading, shared reads, OOM, errors and reclaim interleave balanced");
 }
-int main(void) { cycle(8,0,7,100);cycle(8,0,8,100);cycle(8,8,1,100);cycle(64,8,1,100);contracts();return 0; }
+#ifndef EXT4_CACHED_READ_BATCH
+static int cache_batch(struct ext4_blockdev *d, struct ext4_block *b, const uint64_t *lba, int *errors, unsigned n)
+{
+    int first=EOK;
+    for(unsigned i=0;i<n;i++){errors[i]=ext4_block_get(d,&b[i],lba[i]);if(!first)first=errors[i];}
+    return first;
+}
+#else
+#define cache_batch ext4_block_get_batch
+#endif
+static unsigned batch_width, batch_calls;
+static int batch_failure;
+#ifdef EXT4_CACHED_READ_BATCH
+static int dev_read_batch(struct ext4_blockdev *dev, struct ext4_block_read_span *s, unsigned n)
+{
+    batch_calls++;if(n>batch_width)batch_width=n;
+    int first=EOK;
+    for(unsigned i=n;i>0;i--){unsigned j=i-1;
+        s[j].error = batch_failure && j==2 ? EIO : dev_read(dev,s[j].data,s[j].block,s[j].count);
+        if(s[j].error)first=s[j].error;
+    }
+    return first;
+}
+#endif
+static void batch_wait(void *key)
+{
+    /* 本批的新读已发布并完成，才允许等待外部批次，避免加载环。 */
+    CHECK(batch_calls==1 && batch_width==7);
+    wait_read(key);
+}
+static void batch_contracts(void)
+{
+    struct ext4_bcache cache;struct ext4_blockdev dev;struct ext4_blockdev_iface iface;
+    struct ext4_block out[8]={0};uint64_t lba[8];int errors[8];
+    init(&cache,&dev,&iface,16);batch_calls=batch_width=0;batch_failure=0;
+#ifdef EXT4_CACHED_READ_BATCH
+    iface.bread_batch=dev_read_batch;
+#endif
+    for(unsigned i=0;i<8;i++)lba[i]=i+16;
+    CHECK(cache_batch(&dev,out,lba,errors,8)==EOK);
+    printf("cached read batch width=%u calls=%u reads=%u\n",batch_width,batch_calls,reads);
+    CHECK(batch_width==8 && batch_calls==1 && reads==8);
+    for(unsigned i=0;i<8;i++){CHECK(errors[i]==EOK);CHECK(out[i].data[0]==lba[i]);CHECK(ext4_block_set(&dev,&out[i])==EOK);}
+    /* journal_pending 的当前版本不能被磁盘旧内容替换。 */
+    CHECK(ext4_block_get(&dev,&out[0],16)==EOK);memset(out[0].data,0xa5,4096);
+    ext4_bcache_set_flag(out[0].buf,BC_DIRTY);out[0].buf->journal_pending=1;
+    CHECK(cache_batch(&dev,out+1,lba,errors,1)==EOK && out[1].data[0]==0xa5 && reads==8);
+    out[0].buf->journal_pending=0;CHECK(ext4_block_set(&dev,&out[1])==EOK);CHECK(ext4_block_set(&dev,&out[0])==EOK);
+    finish(&cache);
+
+    init(&cache,&dev,&iface,16);batch_calls=batch_width=0;batch_failure=0;
+#ifdef EXT4_CACHED_READ_BATCH
+    iface.bread_batch=dev_read_batch;
+#endif
+    struct ext4_block held={0};CHECK(ext4_block_get_noread(&dev,&held,16)==EOK);
+    held.buf->loading=true;loading_owner=&held;iface.wait_read=batch_wait;
+    CHECK(cache_batch(&dev,out,lba,errors,8)==EOK && waits==1 && reads==7);
+    for(unsigned i=0;i<8;i++)CHECK(ext4_block_set(&dev,&out[i])==EOK);
+    CHECK(ext4_block_set(&dev,&held)==EOK);finish(&cache);
+
+    init(&cache,&dev,&iface,16);batch_calls=batch_width=0;batch_failure=1;
+#ifdef EXT4_CACHED_READ_BATCH
+    iface.bread_batch=dev_read_batch;
+#endif
+    CHECK(cache_batch(&dev,out,lba,errors,8)==EIO);
+    for(unsigned i=0;i<8;i++)if(i==2)CHECK(errors[i]==EIO && !out[i].data);
+        else CHECK(!errors[i] && ext4_block_set(&dev,&out[i])==EOK);
+    batch_failure=0;get(&dev,&out[0],18);CHECK(ext4_block_set(&dev,&out[0])==EOK);
+    finish(&cache);
+    /* 无批量设备的回退仍经过缓存，每个失败块都可独立重试。 */
+    init(&cache,&dev,&iface,16);
+    lba[1]=lba[0];CHECK(cache_batch(&dev,out,lba,errors,8)==EOK && reads==7 && out[0].buf==out[1].buf);
+    for(unsigned i=0;i<8;i++)CHECK(ext4_block_set(&dev,&out[i])==EOK);
+    finish(&cache);
+    for(unsigned i=0;i<8;i++)lba[i]=16+i;
+    for(unsigned fail=1;fail<=16;fail++) {
+        init(&cache,&dev,&iface,16);fail_allocation=fail;
+#ifdef EXT4_CACHED_READ_BATCH
+        iface.bread_batch=dev_read_batch;
+#endif
+        CHECK(cache_batch(&dev,out,lba,errors,8)==ENOMEM);
+        for(unsigned i=0;i<8;i++)if(!errors[i])CHECK(ext4_block_set(&dev,&out[i])==EOK);
+        fail_allocation=0;finish(&cache);
+    }
+    puts("cached read batches: dirty version, overlapping loads, duplicate blocks, per-block error and fallback balanced");
+}
+int main(void) { cycle(8,0,7,100);cycle(8,0,8,100);cycle(8,8,1,100);cycle(64,8,1,100);contracts();batch_contracts();return 0; }

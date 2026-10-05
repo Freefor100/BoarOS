@@ -176,3 +176,32 @@ make test-io-sleep-riscv
 
 这是底层并发和生命周期验收，既不表示 ext4 已用批量读，也不是预读吞吐收益。
 VFS/ext4/页缓存接入、预读和连续写回实验继续作为独立阶段交付。
+
+
+## ext4 缓存版本内的批量读（2026-10-06）
+
+新增内部 `kernel_vfs_node_pread_batch` 与 lwext4 `ext4_fpread_batch`，保持 caller 的
+inode/read owner，无共享 file offset 副作用。固定输入为仓库中的 lwext4
+`58bcf89a121b72d4fb66334f1693d3b30e4cb9c5` 加已记录本地补丁；不绕过 bcache 读取
+journal pending 的磁盘旧版本。本批的新 loading 先发布并完成，再等其他批次的
+loading；单块失败只释放对应引用，其他项保留独立结果。
+
+旧标量 `ext4_fpread` 对照在同一 fixture 中得到 width=0、batch calls=0，新门禁失败。
+当前 8 个 4 KiB 页在 1/4/8 KiB ext4 上分别得到 4×8、1×8、1×4 个物理块请求批次；
+8 KiB 情形同块双页只加载一次。extent 与传统映射共六组合通过，检查洞、EOF、
+非对齐片段、首个失败块前的 17 字节成功前缀、其他 span 完成、失败后重试与
+journal pending 缓存的新内容；ASan/UBSan 通过。实际 bcache 模型另覆盖重叠加载、
+重复块、16 个分配失败位置的引用回收，以及无批量设备的标量回退。
+
+真实 `test-io-sleep-riscv` 使用八页 `/batch-data`，同一次 VFS batch 在任何响应释放
+前产生八个 NBD READ。四个 legacy/modern × writeback/writethrough 组合全部通过，
+先释放七个仍保持最后一个 DMA owner，之后检查全部页内容、完成量与最终无在途。
+本轮 fixture 内核 SHA-256 为
+`681421ab44460fec278a3a813fb9ce5679e376d34491443f7a4418cd26332b70`，QEMU 11.1.1。
+该证据到 VFS 内部接口为止；普通 demand read 的页缓存预读调度尚待接入，未测吞吐。
+
+```sh
+make test-lwext4-cache-host test-lwext4-batch-read-host test-lwext4-host
+BATCH_TEST_CFLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer' sh tests/lwext4-batch-read-host.sh
+make test-io-sleep-riscv
+```
