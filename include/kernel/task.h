@@ -10,6 +10,7 @@ struct kernel_files;
 struct kernel_fs_context;
 struct kernel_socket_read_request;
 struct kernel_socket_write_request;
+struct kernel_epoll_wait_request;
 
 struct physical_page_allocator;
 /* One scratch page owned by a live I/O invocation, including forced exit. */
@@ -29,6 +30,10 @@ enum kernel_task_status {
 
 /* Returns the scheduler current task, or null before scheduler publication. */
 struct kernel_task *kernel_task_current(void);
+enum kernel_task_status kernel_task_epoll_register(
+    struct kernel_task *task, struct kernel_epoll_wait_request *request);
+enum kernel_task_status kernel_task_epoll_clear(
+    struct kernel_task *task, struct kernel_epoll_wait_request *request);
 enum kernel_task_status kernel_task_socket_write_register(
     struct kernel_task *task, struct kernel_socket_write_request *request);
 enum kernel_task_status kernel_task_socket_write_clear(

@@ -1767,3 +1767,14 @@ test-pty-riscv: $(KERNEL_RV) $(MUSL_STAMP)
 test-pty-apps-riscv: $(KERNEL_RV) $(MUSL_STAMP)
 	python3 -B tests/tty/pty_riscv.py --case libc --kernel $(KERNEL_RV) --qemu $(QEMU_RISCV64)
 	python3 -B tests/tty/pty_riscv.py --case script --kernel $(KERNEL_RV) --qemu $(QEMU_RISCV64)
+
+.PHONY: test-epoll-host test-epoll-riscv
+test-epoll-host:
+	@mkdir -p build/host
+	cc -std=c11 -O1 -g -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=12 \
+		-ffunction-sections -fdata-sections -Wl,--gc-sections \
+		-Itests/host/random -idirafter include -fsanitize=address,undefined \
+		tests/host/epoll_delivery.c -o build/host/epoll-delivery
+	build/host/epoll-delivery
+test-epoll-riscv: $(KERNEL_RV) $(MUSL_STAMP)
+	python3 -B tests/epoll-riscv.py --kernel $(KERNEL_RV) --qemu $(QEMU_RISCV64)
