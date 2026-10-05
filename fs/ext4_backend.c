@@ -346,6 +346,34 @@ static int block_write_batch(struct ext4_blockdev *device,
     }
 }
 
+static int block_read_batch(struct ext4_blockdev *device,
+                            struct ext4_block_read_span *spans, unsigned count)
+{
+    struct lwext4_mount_adapter *adapter = device->bdif->p_user;
+    if (count > KERNEL_BLOCK_BATCH_MAX || (count && !spans)) return EINVAL;
+    struct kernel_block_read_span physical[KERNEL_BLOCK_BATCH_MAX];
+    for (unsigned i = 0; i < count; i++) {
+        if (spans[i].block > UINT64_MAX / LWEXT4_PHYSICAL_BLOCK_SIZE ||
+            (uint64_t)spans[i].count * LWEXT4_PHYSICAL_BLOCK_SIZE > SIZE_MAX) return EINVAL;
+        physical[i] = (struct kernel_block_read_span){.offset = spans[i].block * LWEXT4_PHYSICAL_BLOCK_SIZE,
+            .buffer = spans[i].data, .size = (size_t)spans[i].count * LWEXT4_PHYSICAL_BLOCK_SIZE,
+            .status = KERNEL_BLOCK_STATUS_NOT_SUBMITTED};
+    }
+    kernel_block_read_batch(adapter->block, physical, count);
+    int result = EOK;
+    for (unsigned i = 0; i < count; i++) {
+        switch (physical[i].status) {
+        case KERNEL_BLOCK_STATUS_OK: spans[i].error = EOK; break;
+        case KERNEL_BLOCK_STATUS_NO_MEMORY: spans[i].error = ENOMEM; break;
+        case KERNEL_BLOCK_STATUS_INVALID: spans[i].error = EINVAL; break;
+        case KERNEL_BLOCK_STATUS_UNSUPPORTED: spans[i].error = ENOTSUP; break;
+        default: spans[i].error = EIO; break;
+        }
+        if (!result) result = spans[i].error;
+    }
+    return result;
+}
+
 static int block_flush(struct ext4_blockdev *device)
 {
     struct lwext4_mount_adapter *adapter = device->bdif->p_user;
@@ -729,6 +757,7 @@ int kernel_vfs_mount_ext4(struct kernel_vfs_mount *mount,
 
     adapter->interface.open = block_open;
     adapter->interface.bread = block_read;
+    adapter->interface.bread_batch = block_read_batch;
     adapter->interface.bwrite = block_write;
     adapter->interface.bwrite_batch = block_write_batch;
     adapter->interface.close = block_close;
@@ -1508,6 +1537,28 @@ static int ext4_backend_pread(struct kernel_vfs_node *node,
     return 0;
 }
 
+static int ext4_backend_pread_batch(struct kernel_vfs_node *node,
+    struct kernel_vfs_read_span *spans, size_t count)
+{
+    if (!node || !node->references || node->closed || count > KERNEL_VFS_READ_BATCH_MAX) return -KERNEL_EINVAL;
+    struct ext4_file_read_span batch[KERNEL_VFS_READ_BATCH_MAX];
+    for (size_t i = 0; i < count; i++) {
+        size_t n = 0;
+        if (spans[i].offset < node->size) {
+            n = spans[i].size;
+            if (n > node->size - spans[i].offset) n = node->size - spans[i].offset;
+        }
+        batch[i] = (struct ext4_file_read_span){spans[i].offset, spans[i].buffer, n, 0, EIO};
+    }
+    int result = ext4_fpread_batch(lwext4_node_file(node), batch, count);
+    for (size_t i = 0; i < count; i++) {
+        spans[i].error = lwext4_error(batch[i].error);
+        spans[i].completed = batch[i].completed;
+        if (spans[i].completed > batch[i].size) __builtin_trap();
+    }
+    return lwext4_error(result);
+}
+
 static int ext4_backend_writeback(struct kernel_vfs_node *node, uint64_t offset,
                               const void *buffer, size_t size, size_t *written)
 {
@@ -1664,5 +1715,6 @@ static void initialize_backend(void)
     ops->release_unlinked = ext4_backend_release_unlinked;
     ops->dir_entry = ext4_backend_dir_entry;
     ops->pread = ext4_backend_pread;
+    ops->pread_batch = ext4_backend_pread_batch;
     ops->writeback = ext4_backend_writeback;
 }

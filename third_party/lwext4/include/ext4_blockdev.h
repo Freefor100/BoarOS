@@ -47,6 +47,13 @@ extern "C" {
 #include <stdint.h>
 
 #define EXT4_BLOCK_BATCH_MAX 8U
+#define EXT4_CACHED_READ_BATCH 1
+struct ext4_block_read_span {
+	void *data;
+	uint64_t block;
+	uint32_t count;
+	int error;
+};
 struct ext4_block_span {
 	const void *data;
 	uint64_t block;
@@ -65,6 +72,10 @@ struct ext4_blockdev_iface {
 	 * @param   blk_cnt block count*/
 	int (*bread)(struct ext4_blockdev *bdev, void *buf, uint64_t blk_id,
 		     uint32_t blk_cnt);
+
+	/* Mutable physical spans; every published read is finished on return. */
+	int (*bread_batch)(struct ext4_blockdev *bdev,
+		struct ext4_block_read_span *spans, unsigned count);
 
 	/**@brief   Block write function.
 	 * @param   buf input buffer
@@ -223,6 +234,10 @@ int ext4_block_get_noread(struct ext4_blockdev *bdev, struct ext4_block *b,
  * @return  standard error code*/
 int ext4_block_get(struct ext4_blockdev *bdev, struct ext4_block *b,
 		   uint64_t lba);
+/* Cache-aware reads. Successful blocks retain one caller reference each,
+ * failed blocks are released. Duplicate LBAs share content and loading. */
+int ext4_block_get_batch(struct ext4_blockdev *bdev, struct ext4_block *blocks,
+	const uint64_t *lbas, int *errors, unsigned count);
 
 /**@brief   Block set procedure (through cache).
  * @param   bdev block device descriptor

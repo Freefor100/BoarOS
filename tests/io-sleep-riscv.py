@@ -46,6 +46,10 @@ try:
         data.write_bytes(bytes((i * 19 + index) % 256 for i in range(4096)))
         subprocess.run(['debugfs', '-w', '-R', f'write {data} /cold{index}', str(disk)],
                        check=True, capture_output=True)
+    batch_data = work / 'batch-data'
+    batch_data.write_bytes(b''.join(bytes([i + 1]) * 4096 for i in range(8)))
+    subprocess.run(['debugfs', '-w', '-R', f'write {batch_data} /batch-data', str(disk)],
+                   check=True, capture_output=True)
     fixture_sha256=hashlib.sha256(disk.read_bytes()).hexdigest() if args.cost_output else None
     kernel_snapshot=work/'kernel'
     if args.cost_output:
@@ -96,7 +100,8 @@ try:
     progress = False
     released = False
     read_held = []
-    read_pending = read_released = read_verified = False
+    read_pending = read_released = False
+    read_verified = 0
     phase = "cold"
     queued = []
     queue_verified = False
@@ -133,8 +138,10 @@ try:
                 elif label == 'guest' and line == b'I/O handshake: queue':
                     phase = 'queue'
                     server.stdin.write(b'hold\n')
-                elif label == 'guest' and line == b'I/O handshake: read-batch':
+                elif label == 'guest' and line in (b'I/O handshake: read-batch', b'I/O handshake: file-read-batch'):
                     phase = 'read-batch'
+                    read_held = []
+                    read_pending = read_released = False
                     batch_deadline = time.monotonic() + 15
                     server.stdin.write(b'hold\n')
                 elif label == 'guest' and line == b'I/O handshake: read-batch-pending':
@@ -143,7 +150,7 @@ try:
                 elif label == 'guest' and line == b'I/O handshake: read-batch-held':
                     assert read_released and len(read_held) == 8
                     server.stdin.write(f'release {read_held[0]}\ndrain\n'.encode())
-                    read_verified = True
+                    read_verified += 1
                     batch_deadline = None
                 elif label == 'guest' and line == b'I/O handshake: timeout':
                     phase = 'timeout'
@@ -266,7 +273,7 @@ try:
     guest.wait(timeout=5)
     server.wait(timeout=5)
     success = (guest.returncode == 0 and server.returncode == 0 and released and queue_verified and reset_seen and
-               batch_verified == {'batch', 'batch-partial', 'batch-error'} and read_verified and
+               batch_verified == {'batch', 'batch-partial', 'batch-error'} and read_verified == 2 and
                b'BoarOS: I/O sleep tests passed' in logs['guest'] and
                b'I/O socket reservation passed: owner, HUP, timeout, signal and fault' in logs['guest'] and
                b'I/O pipe copy sleep passed: two writers, complete content and cleanup' in logs['guest'] and

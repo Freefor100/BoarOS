@@ -45,3 +45,11 @@ glibc 2.44 作为外部测试输入使用：官方源码归档保存在被忽略
 - 本地路径：`kernel/blake2s.c`、`include/kernel/blake2s.h`；保留 Jason A. Donenfeld 的版权与 `GPL-2.0 OR MIT` 声明，项目按 GPL-2.0 使用。
 - 用途与修改：移植为无动态分配的便携 BLAKE2s-256 混种接口，去除 Linux 专用调用约定；中间状态显式清除。ChaCha20 fast-key-erasure 契约另对照同版本 `drivers/char/random.c`，密钥更新材料不返回给调用者。
 - 验证：`make test-random-host` 比较已知向量、分块边界与旧输出预测下一密钥的回归；确定性向量不证明熵源质量。
+
+- lwext4 批量只读扩展：`ext4_fpread_batch` 在 mount read lock 下按真实 inode 映射处理
+  洞、EOF 与块内片段；`ext4_block_get_batch` 先固定当前 bcache 版本，仅对缺失块调用
+  可选 `bread_batch`，重复块共用 loading。本批新读先完成，再等待其他 loading，避免
+  重叠批次互等未发布缓冲。每项保留独立错误和成功字节前缀，失败读不进入 journal
+  写回错误状态；设备侧最多八项并保留 DMA owner 至返回。未升级上游，来源仍为
+  `third_party/lwext4` 的 `58bcf89a121b72d4fb66334f1693d3b30e4cb9c5` 加本地补丁。
+  验证为 `make test-lwext4-cache-host test-lwext4-batch-read-host test-io-sleep-riscv`。

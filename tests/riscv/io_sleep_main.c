@@ -849,6 +849,9 @@ static void test_batch(unsigned mode)
 }
 static struct kernel_task *read_batch_task;
 static unsigned read_batch_finished;
+static struct kernel_vfs_file read_batch_file;
+static unsigned char read_batch_pages[8][4096];
+static unsigned read_batch_filesystem;
 static void batch_reader(void *unused)
 {
     (void)unused;
@@ -858,6 +861,21 @@ static void batch_reader(void *unused)
     read_batch_task = kernel_task_current();
     for (unsigned i = 0; i < 8; i++) spans[i] = (struct kernel_block_read_span){
         .offset = 120 * 1024 * 1024 + i * 4096, .buffer = sectors[i], .size = 512};
+    if (read_batch_filesystem) {
+        struct kernel_vfs_read_span pages[8];
+        for (unsigned i = 0; i < 8; i++) pages[i] = (struct kernel_vfs_read_span){i * 4096,
+            read_batch_pages[i], 4096, 0, 0};
+        KERNEL_LOCK_SCOPE(guard);
+        kernel_vfs_node_lock(kernel_vfs_file_node(&read_batch_file), &guard, 0);
+        check(kernel_vfs_node_pread_batch(kernel_vfs_file_node(&read_batch_file), pages, 8) == 0, 351);
+        for (unsigned i = 0; i < 8; i++) {
+            check(!pages[i].error && pages[i].completed == 4096, 352);
+            for (unsigned j = 0; j < 4096; j++) check(read_batch_pages[i][j] == i + 1, 353);
+        }
+        read_batch_finished = 1;
+        riscv_interrupt_restore(irq);
+        return;
+    }
     check(kernel_block_read_batch(&device.block, spans, 8) == KERNEL_BLOCK_STATUS_OK, 340);
     for (unsigned i = 0; i < 8; i++) {
         check(spans[i].status == KERNEL_BLOCK_STATUS_OK && spans[i].completed == 512, 341);
@@ -884,11 +902,12 @@ static void batch_reader_owner_probe(void *unused)
     virt_uart_puts("I/O handshake: read-batch-held\n");
     riscv_interrupt_restore(irq);
 }
-static void test_read_batch(void)
+static void test_read_batch(unsigned filesystem)
 {
-    read_batch_task = 0; read_batch_finished = 0;
+    read_batch_task = 0; read_batch_finished = 0; read_batch_filesystem = filesystem;
+    if (filesystem) check(kernel_vfs_open(&mount, "/batch-data", &read_batch_file) == 0, 354);
     uint64_t before = device.statistics.requests;
-    virt_uart_puts("I/O handshake: read-batch\n");
+    virt_uart_puts(filesystem ? "I/O handshake: file-read-batch\n" : "I/O handshake: read-batch\n");
     while (!virt_uart_rx_ready()) { }
     check(virt_uart_getc() == 'g', 347);
     check(kernel_thread_create(batch_reader, 0) == KERNEL_SCHEDULER_STATUS_OK &&
@@ -903,6 +922,7 @@ static void test_read_batch(void)
     }
     (void)riscv_interrupt_save();
     check(read_batch_finished && device.statistics.requests - before == 8 && !device.inflight && !device.active, 350);
+    if (filesystem) check(kernel_vfs_close(&read_batch_file) == 0, 355);
     virt_uart_puts("I/O batch read passed: eight in flight, reversed prefix, held DMA and cancellation owner\n");
 }
 
@@ -1409,7 +1429,8 @@ void kernel_main(unsigned long hart, const void *dtb)
           stats.service_ticks > queue_before.service_ticks &&
           stats.total_ticks >= stats.busy_ticks, 270);
     for (unsigned mode = 0; mode < 3; mode++) test_batch(mode);
-    test_read_batch();
+    test_read_batch(0);
+    test_read_batch(1);
     check(kernel_thread_create(background_writeback_probe, 0) == KERNEL_SCHEDULER_STATUS_OK, 98);
     for (;;) {
         uintptr_t irq = riscv_interrupt_save();
