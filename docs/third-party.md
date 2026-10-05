@@ -53,3 +53,8 @@ glibc 2.44 作为外部测试输入使用：官方源码归档保存在被忽略
   写回错误状态；设备侧最多八项并保留 DMA owner 至返回。未升级上游，来源仍为
   `third_party/lwext4` 的 `58bcf89a121b72d4fb66334f1693d3b30e4cb9c5` 加本地补丁。
   验证为 `make test-lwext4-cache-host test-lwext4-batch-read-host test-io-sleep-riscv`。
+
+- 深层 extent 截断纠错：删除叶节点后上移时，用既有 `ext4_ext_drop_refs` 释放内部
+  索引引用，先重算脏块 checksum，再归还引用。原路径直接 `ext4_block_set` 清掉块号，
+  后续查找会返回 EUCLEAN；1/4 KiB 的真实深层树、跨进程重启与最终截零由
+  `make test-lwext4-deep-truncate-host` 保护，未改变日志版本或持久化屏障。

@@ -643,6 +643,10 @@ test-lwext4-cost-host:
 	sh tests/lwext4-cost-host.sh
 
 .PHONY: test-lwext4-cache-host
+.PHONY: test-lwext4-deep-truncate-host
+test-lwext4-deep-truncate-host:
+	sh tests/lwext4-deep-truncate-host.sh
+
 .PHONY: test-lwext4-batch-read-host
 test-lwext4-batch-read-host:
 	sh tests/lwext4-batch-read-host.sh

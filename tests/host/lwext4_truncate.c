@@ -148,6 +148,71 @@ static void verify(struct ext4_fs *fs, uint64_t target, bool unlink)
     CHECK(ext4_fclose(&file) == EOK);
 }
 
+static uint64_t deep_target(struct ext4_fs *fs)
+{
+    /* ext4 disk format: 12-byte header/entry and 4-byte checksum tail. */
+    uint32_t capacity = (fs->bdev->lg_bsize - 16) / 12;
+    return (uint64_t)(4 * capacity + 16) / 3 * 2 * fs->bdev->lg_bsize + 17;
+}
+
+static uint64_t deep_clock(void *context)
+{ (void)context; return 0; }
+
+static void deep_prepare(struct ext4_fs *fs)
+{
+    uint32_t block = fs->bdev->lg_bsize;
+    uint32_t capacity = (block - 16) / 12;
+    struct ext4_journal_runtime runtime = {.now_ns = deep_clock};
+    CHECK(ext4_journal_group_enable("/", &runtime, 4 * 1024 * 1024) == EOK);
+    ext4_file file;
+    CHECK(ext4_fopen(&file, "/victim", "w+") == EOK);
+    unsigned char *bytes = malloc(block);
+    CHECK(bytes != NULL);
+    memset(bytes, 0x6d, block);
+    /* Logical holes prevent merging even when physical allocations are adjacent. */
+    for (unsigned i = 0; i < 4 * capacity + 16; i++) {
+        size_t written;
+        CHECK(ext4_fseek(&file, (uint64_t)i * 2 * block, SEEK_SET) == EOK);
+        CHECK(ext4_fwrite(&file, bytes, block, &written) == EOK && written == block);
+    }
+    free(bytes);
+    struct ext4_inode_ref ref;
+    CHECK(ext4_fs_get_inode_ref(fs, file.inode, &ref) == EOK);
+    /* eh_depth is the little-endian 16-bit field at offset six in i_block. */
+    unsigned char *header = (void *)ref.inode->blocks;
+    CHECK((unsigned)(header[6] | (unsigned)header[7] << 8) >= 2);
+    CHECK(ext4_fs_put_inode_ref(&ref) == EOK);
+    CHECK(ext4_file_sync_metadata(&file) == EOK);
+    /* Removing complete leaves also modifies their non-root index parent. */
+    int truncated = ext4_ftruncate(&file, deep_target(fs));
+    if (truncated) fprintf(stderr, "deep extent truncate returned %d\n", truncated);
+    CHECK(truncated == EOK);
+    CHECK(ext4_file_sync_metadata(&file) == EOK && ext4_fclose(&file) == EOK);
+    CHECK(ext4_journal_group_drain("/") == EOK);
+}
+
+static void deep_check(struct ext4_fs *fs)
+{
+    ext4_file file;
+    CHECK(ext4_fopen(&file, "/victim", "r+") == EOK);
+    uint64_t target = deep_target(fs);
+    CHECK(ext4_fsize(&file) == target);
+    unsigned char *bytes = malloc(fs->bdev->lg_bsize);
+    CHECK(bytes != NULL);
+    for (uint64_t offset = 0; offset < target;) {
+        size_t size = target - offset < fs->bdev->lg_bsize ?
+            (size_t)(target - offset) : fs->bdev->lg_bsize;
+        size_t read;
+        CHECK(ext4_fread(&file, bytes, size, &read) == EOK && read == size);
+        unsigned char expected = (offset / fs->bdev->lg_bsize) % 2 ? 0 : 0x6d;
+        for (size_t i = 0; i < read; i++) CHECK(bytes[i] == expected);
+        offset += read;
+    }
+    free(bytes);
+    CHECK(ext4_ftruncate(&file, 0) == EOK && ext4_file_sync_metadata(&file) == EOK);
+    CHECK(ext4_fsize(&file) == 0 && ext4_fclose(&file) == EOK);
+}
+
 int main(int argc, char **argv)
 {
     CHECK(argc >= 5);
@@ -161,6 +226,13 @@ int main(int argc, char **argv)
     CHECK(ext4_mount("truncate", "/", false) == EOK);
     replay(dev.fs);
     CHECK(ext4_journal_start("/") == EOK);
+    if (!strcmp(argv[2], "deep-prepare") || !strcmp(argv[2], "deep-check")) {
+        if (!strcmp(argv[2], "deep-prepare")) deep_prepare(dev.fs);
+        else deep_check(dev.fs);
+        CHECK(ext4_journal_stop("/") == EOK && ext4_umount("/") == EOK);
+        fault_block_close(&disk);
+        return 0;
+    }
     uint64_t target = strtoull(argv[3], NULL, 10);
     bool unlink = !strcmp(argv[4], "unlinked");
     if (!strcmp(argv[2], "prepare")) {

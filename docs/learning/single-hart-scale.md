@@ -205,3 +205,25 @@ make test-lwext4-cache-host test-lwext4-batch-read-host test-lwext4-host
 BATCH_TEST_CFLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer' sh tests/lwext4-batch-read-host.sh
 make test-io-sleep-riscv
 ```
+
+
+## 连续写回验收中发现的深层 extent 截断失败（2026-10-06）
+
+追加后台写回的重复截断夹具在第二次 `ftruncate(0)` 返回 `EUCLEAN`，同步本身成功。
+完整 `e879345c958f5d1f938e4ace557eadb8cff44e21` 生产树经 `git archive` 独立编译、
+只加入夹具，在 1 KiB ext4/16 MiB 受管池/QEMU 11.1.1 下同样失败；不是新增写回
+合批产生的回归。旧内核 SHA-256 为
+`21d1d601d346c88ff5b5e4c6ef1b951d725b33ad7ed5bb9aa7bd12afa10d2053`，夹具 SHA-256 为
+`7ee0152c703a6d02b1d5bd64496029906618a40bc9543d54e729e2b3b7344e83`。
+
+实际错误来自深度至少 2 的 extent 树：删除叶节点后，上移路径直接释放已修改的
+内部索引块，跳过 `ext4_ext_drop_refs` 中的 checksum 更新；随后清空的块引用又让
+最终统一释放无法补做。诊断捕获同一内部块 0x12fe 在释放前已脏、校验和过期，
+下一轮 `ext4_extent_last_block` 的读取校验返回 117。将该释放点改回既有 drop_refs
+流程后，原 RV64 重复截断和读回通过，没有删除触发步骤。
+
+新增宿主门禁构造实际 depth>=2 的稀疏 extent 树，部分截断后独立进程重启核对数据，
+再截零并检查 e2fsck；1/4 KiB 两种块大小均先在旧实现失败、修复后通过。
+格式依据是 `references/linux/Documentation/filesystems/ext4/ifork.rst`，固定 commit
+`f4cdf7ca9a1fdcca413157df19753f388a5a224e`；`make test-lwext4-deep-truncate-host` 可重建。
+该门禁验证深层索引修改与 checksum，并不替代完整断电恢复矩阵。
