@@ -39,3 +39,5 @@ managed 峰值由分配器在 bootstrap、finalize 与 buddy 成功分配时维�
 内核映像、固件和 MMIO。heap 是其中的子集，两种峰值不可相加，也不是 workload
 窗口专属峰值。读取在分配自身快照缓冲之前捕获计数，字段仅在 COST 构建出现；
 关闭 COST 不增加该峰值字段或更新代码。`meminfo` 继续只表示当前时点状态。
+
+上述 heap 指打开该 proc OFD 所属的 heap，本轮为 root heap；网卡 final 行稍后记录的 root-heap-peak 还可能包含 COST 文本格式化和结果文件持久化，不能把不同采样时点当成同一峰值。静态 lwIP 协议堆/pool 数组在内核映像中，另由 ELF 符号预算记录，不能因 managed 峰值相近就宣称候选内存成本相同。完整 scope 与诊断扰动见[数据路径报告](../learning/data-path-budget-experiments.md)。

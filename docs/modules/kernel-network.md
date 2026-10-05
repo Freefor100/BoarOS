@@ -260,3 +260,5 @@ TCP 的 27 组窗口/池/堆候选由 `BOAROS_LWIP_WINDOW_MSS`、`BOAROS_LWIP_PO
 `BOAROS_LWIP_MEM_SCALE` 选择，默认 8/1/1，PCB 数不变。工具、静态/动态内存口径、
 控制流 tail 与固定输入约束见[预算实验](../learning/data-path-budget-experiments.md)，
 可运行候选不等于吞吐已经验收，默认值须依据匹配结果由人选择。
+
+阶段七已完成 TCP 27 组预算的发布筛选、30 项组合扩展与独立 COST 诊断；PCB 仍为 32，生产仍为 8 MSS/池 1 倍/堆 1 倍。默认预算的吞吐回退、全局池/堆饱和和 8/4/2 的有限负载收益均保留在[实验报告](../learning/data-path-budget-experiments.md#正式匹配结果2026-10-06)，不以零 poll 服务次数代替端到端收益。

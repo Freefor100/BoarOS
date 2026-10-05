@@ -34,9 +34,9 @@ BoarOS 是从零搭建、面向 OS Comp 能力建设的 C / 少量汇编内核�
 
 双盘暂扣与故障隔离测试已修复单字节控制终端握手，并接入 CI 配置；本机原矩阵和 FIFO/RR 组合通过，托管 CI 状态另行核对。
 
-网络 worker 已在协议推进前归还 TX 完成槽，并在睡眠前复查新容量与收包；已验证两种 VirtIO 传输下的实际 TAP 程序，尚未以此声明吞吐收益。TCP 流发送已用接纳 reservation 约束 payload 复制，预先无容量时不解析用户页；socket poll 已收紧为局部快照；短 syscall 与统一 worker 按独立协议预算推进，资源归还只服务等待集合。验证边界见[网络记录](docs/learning/network-ownership.md#纯就绪与有界协议服务2026-10-05)。
+网络 worker 已在协议推进前归还 TX 完成槽，并在睡眠前复查新容量与收包；已验证两种 VirtIO 传输下的实际 TAP 程序；综合改动的匹配实验既有收益也有默认预算吞吐回退，见[预算结果](docs/learning/data-path-budget-experiments.md#正式匹配结果2026-10-06)。TCP 流发送已用接纳 reservation 约束 payload 复制，预先无容量时不解析用户页；socket poll 已收紧为局部快照；短 syscall 与统一 worker 按独立协议预算推进，资源归还只服务等待集合。验证边界见[网络记录](docs/learning/network-ownership.md#纯就绪与有界协议服务2026-10-05)。
 
-文件追加增长已与截断分离：对齐增长不遍历缓存页，非对齐增长只处理旧 EOF 尾页；1–64 MiB 的实际页缓存规模门禁保护这一成本界，未把计数下降换算为吞吐提升。冷页完整覆盖省去页缓存旧内容读取，范围写回按哈希/脏页链选择较小集合，快照只复制脏区间；恢复与测量边界见[VFS 模块](docs/modules/vfs-ext4.md#当前成本边界)。
+文件追加增长已与截断分离：对齐增长不遍历缓存页，非对齐增长只处理旧 EOF 尾页；1–64 MiB 的实际页缓存规模门禁保护这一成本界；另有三启动匹配吞吐测量，64 MiB 小请求追加不再随文件增长急剧降速，缓存完成与显式同步分别报告。冷页完整覆盖省去页缓存旧内容读取，范围写回按哈希/脏页链选择较小集合，快照只复制脏区间；恢复与测量边界见[VFS 模块](docs/modules/vfs-ext4.md#当前成本边界)。
 
 epoll 以完整用户事件交付作为 ET/ONESHOT 提交点，复制 fault 保留未交付项；扫描与重入通知独立，取消和 close 保持对象寿命。验证边界见[事件交付](docs/learning/epoll-delivery.md)。
 
@@ -48,10 +48,10 @@ epoll 以完整用户事件交付作为 ET/ONESHOT 提交点，复制 fault 保�
 
 客体内固定 Alpine v3.22 RV64 GCC 14.2.0-r6 已在同一离线镜像上完成预处理、编译、汇编、静态链接和运行；固定 Linux 与 BoarOS 的五阶段状态、产物哈希和输出一致。同一编译流程也通过 tmpfs 工作目录；产物复制到根盘供比对，不代表 tmpfs 持久。另已完成原 GNU make4.4.1 默认FIFO jobserver的Lua5.4.3工程构建、增量、错误恢复和产物运行；其他项目与Rust尚未验收。
 
-固定BusyBox/libc-test最近完整清单仍为228项、227项双侧通过的历史结果；此前环境补全验收原BusyBox包装器，55/55子项成功，dmesg/RTC及df根盘内容另做真实核对。当前通用ABI差分1317条匹配，终端另有同ELF的107条差分记录；完整清单和本轮选择集合分别见[程序清单](docs/learning/user-program-inventory.md)。成本门禁见[单核规模回归](docs/learning/single-hart-scale.md)。
+固定BusyBox/libc-test最近完整清单仍为228项、227项双侧通过的历史结果；此前环境补全验收原BusyBox包装器，55/55子项成功，dmesg/RTC及df根盘内容另做真实核对。当前通用ABI差分1344条匹配，终端另有同ELF的107条差分记录；完整清单和本轮选择集合分别见[程序清单](docs/learning/user-program-inventory.md)。成本门禁见[单核规模回归](docs/learning/single-hart-scale.md)。
 
 顺序预读与连续写回提供有界实验候选，生产默认仍为预读关闭、写回一页。
-机制门禁和吞吐测量分别记录，参数不因计数下降自动调整；见[单核数据路径记录](docs/learning/single-hart-scale.md)。
+机制门禁和吞吐测量分别记录；TCP 27 组、存储 20 组已完成匹配筛选和组合扩展，共 1,218 次发布启动与 184 次诊断。大批写回在部分缓存追加中回退，较大 TCP 窗口也未单调提高性能；参数选择保留给用户，见[结果、每连接完成时间和输入身份](docs/learning/data-path-budget-experiments.md#正式匹配结果2026-10-06)。
 
 ## 构建与验证
 
