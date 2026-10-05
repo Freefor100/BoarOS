@@ -18,7 +18,7 @@ IPv4 重组键包括源/目的地址、IP ID、协议号和输入 netif 身份�
 
 当前支持 `AF_INET`/`AF_INET6` 的 `SOCK_DGRAM`/`SOCK_STREAM`，`SOCK_CLOEXEC`、`SOCK_NONBLOCK`，UDP bind/getsockname/sendto/recvfrom 和 `SO_RCVTIMEO`，TCP bind/listen/connect/accept，以及连接后的普通读写和就绪。`ioctl(SIOCGIFFLAGS/SIOCSIFFLAGS)` 让真实用户程序启用 `lo`；接口对象从公开 `netif_list` 查找。地址在 syscall 边界使用 RV64 `sockaddr_in`/`sockaddr_in6` 布局；内核地址携带族、16 字节网络序地址、宿主序端口和 scope。官方 loopif 提供 `::1`；IPv6 通配监听默认接收 IPv4，accept 返回映射地址。V6ONLY 在绑定前生效，双栈通配与纯 IPv6/IPv4 的端口交集由非持引用的 endpoint 登记补齐 lwIP TCP bind 的 ANY 检查缺口。登记在 OFD 销毁前摘除。非阻塞、坏 fd/地址/指针和协议错误由固定 Linux 同一 ELF 差分约束。未覆盖的地址族、选项和操作返回明确 errno，不伪造成功。
 
-单 hart 下，就绪订阅与睡眠沿已有短临界区。`kernel_socket_poll` 是局部只读快照，不推进协议、不清理 accept、不解除写重试、不消费错误。监听就绪由接纳/失效回调维护 live 数；失效 child 的销毁和 TIME_WAIT 回调解绑由待工作集合处理。poll/epoll 与阻塞 syscall 只订阅对象通知和调用者期限。
+单 hart 下，就绪订阅与睡眠沿已有短临界区。`kernel_socket_poll` 是局部只读快照，不推进协议、不清理 accept、不解除写重试、不消费错误。监听就绪由接纳/失效回调维护 live 数；失效 child 的销毁由待工作集合处理。TIME_WAIT 可由工作批次提前解绑，在协议释放边界仍同步确保借用撤销。poll/epoll 与阻塞 syscall 只订阅对象通知和调用者期限。
 
 短 syscall 在完整 raw 调用退出后可执行有界服务；网络 worker 与无 NIC worker 使用同一 `kernel_socket_service_pending`。每批分别限制 RX 八帧、loopback 八包、socket 八个工作单元及一个 timer 回调。socket 单元包含容量转交、到期重试、实际对象工作，三类轮转；协议池、NIC、接收堆等待集合也轮转。零预算不消费对应工作，返回值报告处理量、是否可立即继续及下一期限。unsent 等待远端窗口或 ACK 不会自行重新入队；预算耗尽且仍有工作时开放中断并让出，睡前再次查软件工作与设备完成。
 
@@ -39,6 +39,25 @@ IPv4 重组键包括源/目的地址、IP ID、协议号和输入 netif 身份�
 TCP `POLLOUT` 同时要求发送缓冲、队列空间及未被真实 `ERR_MEM` 阻塞。失败后登记协议池等待及 250 ms 兜底；每次真实资源归还更新容量代次，仅恢复旧代次等待者，避免失败分配自行释放资源造成忙等。不能仅采用 lwIP 的“空池变为非空”通知：多 segment 请求可能在空闲池已有一个元素时仍失败，第二个元素释放必须促成进展。期限只由后台服务推进，等待 syscall 不再为协议设置兜底轮询。`F_SETFL(F_GETFL|O_NONBLOCK)` 接受已有 access mode 位，只更新可变状态位。
 
 关闭活动 TCP 连接先解绑全部指向 BoarOS socket 的回调，再 `tcp_close`；协议 FIN/TIME_WAIT 可能暂占静态 PCB/segment 池，随后由定时器回收。这与内核堆对象生命周期分开。
+
+`socket->tcp` 是对 lwIP PCB 的借用，不延长协议对象寿命。普通工作批次可提前
+解绑 TIME_WAIT，但预算不足时不能把生命周期责任留到下一批。固定 lwIP 的
+`tcp_alloc()` 会在 PCB 池满时通过 `tcp_kill_timewait()` / `tcp_abort()` 回收
+TIME_WAIT；该分支不执行普通错误回调，并且 `tcp_pcb_remove()` 会把状态改为
+CLOSED。当前在该分支 remove 之前，以及慢定时器从 TIME_WAIT 链摘除对象后、
+free 之前调用本地可选 `LWIP_HOOK_TCP_TIMEWAIT_FREE`。socket 层仅接受
+`callback_arg` 与自身错误回调配对的 PCB，验证借用身份后清空借用及回调、撤销
+容量/重试等待并唤醒。hook 不分配、不睡眠、不重新调用 raw API、不销毁堆
+socket，也不遍历全局 socket registry。OFD 销毁仍先清回调，再释放 socket，
+因此稍后的 TIME_WAIT 回收不会回调已经销毁的 owner。
+
+固定依据为 `references/lwip/src/core/tcp.c`，commit
+`77dcd25a72509eb83f72b033d219b1d40cd8eb95` 的 `tcp_abandon()`、
+`tcp_pcb_remove()`、`tcp_slowtmr()` 与 `tcp_alloc()`；生产本地补丁位于
+`third_party/lwip/src/core/tcp.c`。`python3 -B tests/host/network_owner.py --sanitize`
+连接实际 socket、Ethernet 与 lwIP，使用真实堆 socket 完成握手和半关闭，并在
+关闭工作尚未服务时验证容量回收及 timer 到期均清空借用；同时检查非 socket
+raw PCB 和已经销毁的 socket，不用无 owner 的 raw PCB 代替主要所有权用例。
 
 支持 `AF_UNIX` (domain=1) 的 `socketpair(199)` 系统调用，支持 `SOCK_STREAM` 和 `SOCK_DGRAM` 类型以及 `SOCK_CLOEXEC`、`SOCK_NONBLOCK`。`kernel_files_socketpair_create` 保证双向 OFD 的原子分配与双 fd 安装，失败时完整回滚不泄露 fd 或 OFD。两个 endpoint 在内核中互相绑定 peer；流和数据报在接收端堆上排队，每个 socket 拥有 64 KiB 独立接收缓冲配额（超出时返回 `-EAGAIN` 并在接收端读取后唤醒对端写者）。向已关闭或断开的对端写入向调用任务产生 `SIGPIPE` 并返回 `-EPIPE`；读取已关闭对端返回 0 (EOF)；`SOCK_DGRAM` 将一次 write/writev 聚合为一条消息，64 KiB 上限之外返回 EMSGSIZE；用户复制全部成功后才移动整包 owner，fault/OOM/取消不发布前缀。队列按 `max(length, 1)` 收取预算，零长度消息可入队。容量不足时等待整条消息可容纳，不以普通 POLLOUT 作为重试条件；短读、复制 fault 或销毁释放整包及其全部预算。发送请求登记在任务上，退出前撤销临时 packet 与 OFD pin。poll/ppoll/epoll 准确反映对端关闭时的 `POLLHUP`/`POLLIN` 就绪。命名 AF_UNIX 端点、SCM_RIGHTS 凭据传递、带 ancillary 的 sendmsg/recvmsg、更多 sockopt、外部 IPv6 与 SMP 并发仍在 `docs/goals.md`，不能由本切片推出。
 
@@ -192,6 +211,13 @@ reset确认；设备失败不等于DMA停止，TX在途owner与RX借用一律保
 （每包最多两段镜像内 payload，其余回退复制），用户接收复制仍在；没有外部IPv6、
 DHCP/DNS/TLS或默认网关。结果、效率、
 程序与最终卸载计时边界见[真实网卡记录](../learning/network-ownership.md#真实-virtio-net-与宿主应用交付2026-10-02)。
+
+TX 的 SG 与复制回退在槽满时都登记 NIC 容量等待。无 indirect 特性或 pbuf 链
+不满足 SG 条件时，复制发送返回 `EAGAIN` 仍属于 NIC 槽不足，不能落入协议池
+等待。上述 `network_owner.py` 分别覆盖两种回退原因，冻结时钟、禁用包与 timer
+服务并确认协议池没有归还，仅通知 NIC 新容量就能重新输出实际 TCP 内容；
+该边界测试不把正常 timer 重传当作容量通知正确的证据。
+
 
 纯查询及预算回归位于 `tests/riscv/scale_main.c`：16 个无关 socket 下的 64 次 poll 没有协议调用；零/一单元服务遵守预算并最终交付完整内容。协议池回归冻结时钟且禁用包与 timer 服务，证明“空闲 segment 已有一个，再释放一个”足以恢复真正等待者。`make test-cache-growth-riscv` 的 COST 构建同时核对 poll 触发服务数和全局扫描数均为零；全局 registry 只用于 bind 冲突、销毁解绑与设备故障。重建与证据层次见[网络记录](../learning/network-ownership.md#纯就绪与有界协议服务2026-10-05)。
 

@@ -584,3 +584,34 @@ make test-io-sleep-riscv test-userland-riscv test-glibc-riscv test-diff-abi-risc
 ```
 
 窗口、pbuf/segment、NIC 和块队列默认值未扩大；后续批量读/写及 TCP 预算实验仍需匹配测量。
+
+
+## 资源分类与 TIME_WAIT 借用的审查修复（2026-10-06）
+
+有界服务独立审查发现两个遗漏。复制回退 `send_copy(-EAGAIN)` 未像 SG 分支一样
+登记 NIC blocked，导致进入错误的协议池等待集合；完成归还 NIC 容量后仍需额外事件。
+另一项是 TIME_WAIT 的 socket 借用解除仍依赖普通工作预算，而 lwIP 容量回收和
+慢定时器可以无普通 err 回调地释放 PCB。固定依据为 `references/lwip/src/core/tcp.c`
+`77dcd25a72509eb83f72b033d219b1d40cd8eb95`；容量回收还会在 free 前把状态改成 CLOSED。
+
+复制回退现对两种回退原因统一发布 NIC 容量等待。两条 TIME_WAIT 释放路径在回收
+之前通知本层，配对 callback_arg/errf 并核对 PCB 身份后清借用、清回调和摘等待项；
+不重入 raw API、不分配、不睡眠、不在该栈销毁 socket，也不增加全局扫描。
+
+实际 socket/Ethernet/lwIP 的 host 模型先在旧代码失败，修复后五组通过：未协商
+indirect 与 SG 不适用的复制容量归还、真实堆 socket 的 TIME_WAIT 池回收与定时
+到期，以及已销毁/非 socket opaque owner 控制组。复制用例冻结时钟并禁止包/timer
+服务，确认协议池代次没变，仅 NIC 归还即可继续 TCP 输出。TIME_WAIT 由真实握手
+与半关闭形成，普通 socket 关闭工作尚未服务；不能用无 owner raw PCB 代替此门禁。
+ASan/UBSan 及独立复审均通过，最终堆、PCB、segment 和协议内存回到基线。
+
+独立 RV64 内核 SHA-256
+`3b89b53663e52b211dfc9aea9c7b4959d3b20fbad36b947033488eff69ee1f6f` 的真实 U-mode
+contract/admission/timer 与 scale 通过；poll 服务计数仍为零。关闭 indirect 的
+legacy/modern × 双向 TAP 五 bulk 加一控制连接四次功能烟测也通过，均满足
+`tx-copy>0`、`tx-sg=0`、`errors=0`；该层检查内容与整合，槽满的因果关系由上述
+host 门禁证明。烟测不计入发布吞吐。可先重建窄门禁：
+
+```sh
+python3 -B tests/host/network_owner.py --sanitize
+```

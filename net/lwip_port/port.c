@@ -55,3 +55,5 @@ void boaros_lwip_work_ready(void)
 { if (protocol_hooks.work) protocol_hooks.work(); }
 void boaros_lwip_capacity_available(int pool)
 { if (protocol_hooks.capacity) protocol_hooks.capacity(pool); }
+void boaros_lwip_tcp_timewait_free(struct tcp_pcb *pcb)
+{ if (protocol_hooks.timewait_free) protocol_hooks.timewait_free(pcb); }

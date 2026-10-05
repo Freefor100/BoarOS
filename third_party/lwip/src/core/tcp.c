@@ -579,6 +579,10 @@ tcp_abandon(struct tcp_pcb *pcb, int reset)
      are in an active state, call the receive function associated with
      the PCB with a NULL argument, and send an RST to the remote end. */
   if (pcb->state == TIME_WAIT) {
+#ifdef LWIP_HOOK_TCP_TIMEWAIT_FREE
+    /* Notify while TIME_WAIT and callback identity still precede list removal. */
+    LWIP_HOOK_TCP_TIMEWAIT_FREE(pcb);
+#endif
     tcp_pcb_remove(&tcp_tw_pcbs, pcb);
     tcp_free(pcb);
   } else {
@@ -1465,6 +1469,9 @@ tcp_slowtmr_start:
       }
       pcb2 = pcb;
       pcb = pcb->next;
+#ifdef LWIP_HOOK_TCP_TIMEWAIT_FREE
+      LWIP_HOOK_TCP_TIMEWAIT_FREE(pcb2);
+#endif
       tcp_free(pcb2);
     } else {
       prev = pcb;
