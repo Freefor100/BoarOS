@@ -847,6 +847,65 @@ static void test_batch(unsigned mode)
     riscv_virtio_mmio_block_get_statistics(&device, &stats);
     print_counters(mode == 0 ? "batch" : mode == 1 ? "batch-partial" : "batch-error", &stats);
 }
+static struct kernel_task *read_batch_task;
+static unsigned read_batch_finished;
+static void batch_reader(void *unused)
+{
+    (void)unused;
+    uintptr_t irq = riscv_interrupt_save();
+    unsigned char sectors[8][512];
+    struct kernel_block_read_span spans[8];
+    read_batch_task = kernel_task_current();
+    for (unsigned i = 0; i < 8; i++) spans[i] = (struct kernel_block_read_span){
+        .offset = 120 * 1024 * 1024 + i * 4096, .buffer = sectors[i], .size = 512};
+    check(kernel_block_read_batch(&device.block, spans, 8) == KERNEL_BLOCK_STATUS_OK, 340);
+    for (unsigned i = 0; i < 8; i++) {
+        check(spans[i].status == KERNEL_BLOCK_STATUS_OK && spans[i].completed == 512, 341);
+        for (unsigned j = 0; j < 512; j++) check(sectors[i][j] == i + 1, 342);
+    }
+    read_batch_finished = 1;
+    riscv_interrupt_restore(irq);
+}
+static void batch_reader_owner_probe(void *unused)
+{
+    (void)unused;
+    uintptr_t irq = riscv_interrupt_save();
+    while (!read_batch_task || read_batch_task->state != KERNEL_THREAD_STATE_BLOCKED)
+        check(kernel_scheduler_yield_current() == KERNEL_SCHEDULER_STATUS_OK, 343);
+    read_batch_task->terminate_requested = 1;
+    check(kernel_scheduler_wake_signal(read_batch_task) == KERNEL_SCHEDULER_STATUS_OK &&
+        read_batch_task->state == KERNEL_THREAD_STATE_BLOCKED && !read_batch_finished, 344);
+    virt_uart_puts("I/O handshake: read-batch-pending\n");
+    while (device.inflight != 1 || read_batch_task->state != KERNEL_THREAD_STATE_BLOCKED) {
+        check(!read_batch_finished && kernel_scheduler_yield_current() == KERNEL_SCHEDULER_STATUS_OK, 345);
+        riscv_interrupt_restore(RISCV_SSTATUS_SIE); (void)riscv_interrupt_save();
+    }
+    check(!read_batch_finished, 346);
+    virt_uart_puts("I/O handshake: read-batch-held\n");
+    riscv_interrupt_restore(irq);
+}
+static void test_read_batch(void)
+{
+    read_batch_task = 0; read_batch_finished = 0;
+    uint64_t before = device.statistics.requests;
+    virt_uart_puts("I/O handshake: read-batch\n");
+    while (!virt_uart_rx_ready()) { }
+    check(virt_uart_getc() == 'g', 347);
+    check(kernel_thread_create(batch_reader, 0) == KERNEL_SCHEDULER_STATUS_OK &&
+        kernel_thread_create(batch_reader_owner_probe, 0) == KERNEL_SCHEDULER_STATUS_OK, 348);
+    unsigned reaped = 0;
+    while (reaped < 2) {
+        uintptr_t irq = riscv_interrupt_save();
+        check(kernel_scheduler_yield_current() == KERNEL_SCHEDULER_STATUS_OK, 349);
+        struct kernel_thread_completion completion;
+        if (kernel_scheduler_reap_one(&completion) == KERNEL_SCHEDULER_STATUS_OK) reaped++;
+        riscv_interrupt_restore(irq | RISCV_SSTATUS_SIE);
+    }
+    (void)riscv_interrupt_save();
+    check(read_batch_finished && device.statistics.requests - before == 8 && !device.inflight && !device.active, 350);
+    virt_uart_puts("I/O batch read passed: eight in flight, reversed prefix, held DMA and cancellation owner\n");
+}
+
 static void timeout_worker(void *argument)
 {
     uintptr_t irq = riscv_interrupt_save();
@@ -1350,6 +1409,7 @@ void kernel_main(unsigned long hart, const void *dtb)
           stats.service_ticks > queue_before.service_ticks &&
           stats.total_ticks >= stats.busy_ticks, 270);
     for (unsigned mode = 0; mode < 3; mode++) test_batch(mode);
+    test_read_batch();
     check(kernel_thread_create(background_writeback_probe, 0) == KERNEL_SCHEDULER_STATUS_OK, 98);
     for (;;) {
         uintptr_t irq = riscv_interrupt_save();

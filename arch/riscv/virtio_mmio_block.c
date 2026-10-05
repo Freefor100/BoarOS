@@ -615,7 +615,7 @@ static struct block_request *try_reserve_request(struct riscv_virtio_mmio_block 
 static struct block_request *reserve_request(struct riscv_virtio_mmio_block *device)
 {
     uintptr_t irq = riscv_interrupt_save();
-    struct block_request *r;
+    struct block_request *r = 0;
     while (device_live(device) && !(r = try_reserve_request(device))) {
         if (!device->irq_source) __builtin_trap();
         enum kernel_wait_wake_reason reason;
@@ -1097,6 +1097,124 @@ static enum kernel_block_status virtio_block_write_batch(void *context,
     return result;
 }
 
+struct batch_read_transfer {
+    struct block_request *request;
+    uint64_t offset;
+    unsigned char *output;
+    size_t remaining, copied;
+};
+
+static enum kernel_block_status publish_read_part(struct riscv_virtio_mmio_block *device,
+    struct batch_read_transfer *part)
+{
+    uint64_t sector = part->offset / VIRTIO_BLOCK_SECTOR_SIZE, address;
+    unsigned skip = part->offset % VIRTIO_BLOCK_SECTOR_SIZE;
+    if (!skip && part->remaining >= VIRTIO_BLOCK_SECTOR_SIZE) {
+        size_t size = part->remaining;
+        size_t maximum = (size_t)UINT32_MAX & ~(size_t)(VIRTIO_BLOCK_SECTOR_SIZE - 1);
+        if (size > maximum) size = maximum;
+        size &= ~(size_t)(VIRTIO_BLOCK_SECTOR_SIZE - 1);
+        if (device->dma_address(part->output, size, &address)) {
+            part->copied = size;
+            return publish_request(device, part->request, VIRTIO_BLOCK_REQUEST_IN,
+                sector, address, (uint32_t)size, 0);
+        }
+    }
+    part->copied = VIRTIO_BLOCK_SECTOR_SIZE - skip;
+    if (part->copied > part->remaining) part->copied = part->remaining;
+    return publish_request(device, part->request, VIRTIO_BLOCK_REQUEST_IN, sector,
+        device->queue_physical_address + bounce_offset(device, part->request), VIRTIO_BLOCK_SECTOR_SIZE, 1);
+}
+
+static enum kernel_block_status virtio_block_read_batch(void *context,
+    struct kernel_block_read_span *spans, size_t count)
+{
+    COST_SCOPE(device_cost, OPERATION_TICKS);
+    struct riscv_virtio_mmio_block *device = context;
+    if (!begin_call(device, 0)) {
+        for (size_t i = 0; i < count; i++) if (spans[i].size) spans[i].status = KERNEL_BLOCK_STATUS_IO;
+        return KERNEL_BLOCK_STATUS_IO;
+    }
+    struct kernel_io_context *owner = kernel_io_context_current();
+    struct batch_read_transfer parts[KERNEL_BLOCK_BATCH_MAX] = {0};
+    for (size_t i = 0; i < count; i++) {
+        parts[i].offset = spans[i].offset; parts[i].output = spans[i].buffer; parts[i].remaining = spans[i].size;
+    }
+    for (;;) {
+        uintptr_t irq = riscv_interrupt_save();
+        if (owner != kernel_io_context_current()) __builtin_trap();
+        if (!device->irq_source && device_live(device)) collect_used(device);
+        for (size_t i = 0; i < count; i++) {
+            struct batch_read_transfer *part = &parts[i];
+            struct block_request *r = part->request;
+            if (!r || r->state != 3) continue;
+            enum kernel_block_status status = finish_request(device, r);
+            if (status == KERNEL_BLOCK_STATUS_OK) {
+                if (r->bounce_used)
+                    bytes_copy(part->output, r->bounce + part->offset % VIRTIO_BLOCK_SECTOR_SIZE, part->copied);
+                part->output += part->copied; part->offset += part->copied;
+                part->remaining -= part->copied; spans[i].completed += part->copied;
+                if (!part->remaining) spans[i].status = KERNEL_BLOCK_STATUS_OK;
+            } else {
+                spans[i].status = status; part->remaining = 0;
+            }
+            release_request(device, r); part->request = 0;
+        }
+        for (size_t i = 0; i < count; i++) {
+            struct batch_read_transfer *part = &parts[i];
+            if (!part->remaining || part->request) continue;
+            if (!device_live(device)) { spans[i].status = KERNEL_BLOCK_STATUS_IO; part->remaining = 0; continue; }
+            part->request = try_reserve_request(device);
+            if (!part->request) continue;
+            part->request->completion = &device->available;
+            enum kernel_block_status status = publish_read_part(device, part);
+            if (status != KERNEL_BLOCK_STATUS_OK) {
+                spans[i].status = status; part->remaining = 0;
+                release_request(device, part->request); part->request = 0;
+            }
+        }
+        unsigned pending = 0, remaining = 0;
+        uint64_t deadline = 0;
+        for (size_t i = 0; i < count; i++) {
+            struct block_request *r = parts[i].request;
+            remaining += parts[i].remaining != 0;
+            if (!r) continue;
+            if (r->state != 2) __builtin_trap();
+            pending++;
+            if (!deadline || (int64_t)(r->deadline - deadline) < 0) deadline = r->deadline;
+        }
+        /* 单span错误不撤销其他读取；尤其不能越过尚未完成的DMA归还buffer。 */
+        if (!pending && !remaining) { riscv_interrupt_restore(irq); break; }
+        if (deadline && (int64_t)(time_now() - deadline) >= 0) {
+            if (device_live(device)) collect_used(device);
+            for (size_t i = 0; i < count; i++) {
+                struct block_request *r = parts[i].request;
+                if (r && r->state == 2 && (int64_t)(time_now() - r->deadline) >= 0) {
+                    device->statistics.timeouts++; fail_device(device, KERNEL_BLOCK_STATUS_TIMEOUT); break;
+                }
+            }
+            riscv_interrupt_restore(irq); continue;
+        }
+        if (device->irq_source) {
+            enum kernel_wait_wake_reason reason;
+            if (pending) device->statistics.sleeps++; else device->statistics.queue_waits++;
+            uint64_t wait_start = time_now();
+            if (kernel_scheduler_block_current(&device->available, deadline, 0, &reason) != KERNEL_SCHEDULER_STATUS_OK)
+                __builtin_trap();
+            device->statistics.queue_wait_ticks += time_now() - wait_start;
+            if (reason == KERNEL_WAIT_TIMEOUT && device_live(device)) collect_used(device);
+        }
+        riscv_interrupt_restore(irq);
+    }
+    enum kernel_block_status result = KERNEL_BLOCK_STATUS_OK;
+    for (size_t i = 0; i < count; i++) {
+        if (parts[i].request) __builtin_trap();
+        if (result == KERNEL_BLOCK_STATUS_OK && spans[i].status != KERNEL_BLOCK_STATUS_OK) result = spans[i].status;
+    }
+    end_call(device, 0);
+    return result;
+}
+
 enum riscv_virtio_mmio_block_status riscv_virtio_mmio_block_init(
     struct riscv_virtio_mmio_block *device,
     volatile void *mmio,
@@ -1257,6 +1375,7 @@ enum riscv_virtio_mmio_block_status riscv_virtio_mmio_block_init(
 
     result.block.context = device;
     result.block.read = virtio_block_read;
+    result.block.read_batch = virtio_block_read_batch;
     result.block.write = result.read_only != 0U ? 0 : virtio_block_write;
     result.block.write_batch = result.read_only != 0U ? 0 : virtio_block_write_batch;
     result.block.flush = virtio_block_flush;
@@ -1310,6 +1429,7 @@ enum riscv_virtio_mmio_block_status riscv_virtio_mmio_block_destroy(
 
     device->block.context = 0;
     device->block.read = 0;
+    device->block.read_batch = 0;
     device->block.write = 0;
     device->block.write_batch = 0;
     device->block.flush = 0;

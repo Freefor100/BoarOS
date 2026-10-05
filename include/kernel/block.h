@@ -13,6 +13,7 @@ enum kernel_block_status {
     KERNEL_BLOCK_STATUS_UNSUPPORTED,
     KERNEL_BLOCK_STATUS_NO_MEMORY,
     KERNEL_BLOCK_STATUS_STATE,
+    KERNEL_BLOCK_STATUS_NOT_SUBMITTED,
 };
 
 struct kernel_block_device;
@@ -45,6 +46,17 @@ struct kernel_block_span {
     size_t size;
 };
 
+struct kernel_block_read_span {
+    uint64_t offset;
+    void *buffer;
+    size_t size;
+    size_t completed;
+    enum kernel_block_status status;
+};
+
+typedef enum kernel_block_status (*kernel_block_read_batch_fn)(
+    void *context, struct kernel_block_read_span *spans, size_t count);
+
 typedef enum kernel_block_status (*kernel_block_write_batch_fn)(
     void *context, const struct kernel_block_span *spans, size_t count);
 
@@ -53,6 +65,7 @@ struct kernel_block_device {
     kernel_block_read_fn read;
     kernel_block_write_fn write;
     kernel_block_write_batch_fn write_batch;
+    kernel_block_read_batch_fn read_batch;
     uint64_t capacity_bytes;
     uint32_t logical_block_size;
     kernel_block_flush_fn flush;
@@ -103,5 +116,14 @@ enum kernel_block_status kernel_block_write_batch(
     struct kernel_block_device *device,
     const struct kernel_block_span *spans,
     size_t count);
+
+/* Preflight all spans before I/O. Disk ranges may overlap, but mutable outputs
+ * must be disjoint from each other and these descriptors. Every span reports
+ * its completed prefix; only OK guarantees its complete size. No read_batch
+ * callback falls back to all scalar reads in input order, preserving each
+ * result. The return is the first failed span status. Published DMA remains
+ * owned until every request finishes or device reset has been acknowledged. */
+enum kernel_block_status kernel_block_read_batch(struct kernel_block_device *device,
+    struct kernel_block_read_span *spans, size_t count);
 
 #endif
