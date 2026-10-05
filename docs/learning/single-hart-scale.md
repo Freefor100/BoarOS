@@ -104,3 +104,55 @@ AF_UNIX DGRAM 的成本边界为每条消息最多 64 KiB 连续暂存与一次�
 总工作随页数线性增加。哈希扩容/探测和实际别名数量另计，不宣称任意冲突及任意别名下
 严格常数耗时。真实 VFS、文件、部分写、静态 musl/动态 pthread 回归通过，包含
 稀疏洞、截断再增长与私有 COW 尾页；COST 宿主和旧 schema 解析测试通过。
+
+
+## 冷页覆盖与脏范围（2026-10-06）
+
+冷页完整覆盖的生产函数反例先在旧实现运行：已存在且已同步的页被缓存失效后覆盖，
+`kernel_vfs_node_pread` 包装计数为 1，触发门禁；当前为 0。稳定内核输入完整覆盖
+才走新路径，loading 保留至初始化、脏组织和长度更新完成；部分页仍读取旧内容，
+1 字节覆盖后检查其余 4095 字节未变。省去的是页缓存层预读，不是 ext4 的必要 undo、
+块内合并和元数据读取。
+
+每个 inode 保留全页链用于失效，另有脏页链与计数。首次标脏、共享映射变脏、写回、
+再次变脏、截断和回收走同一索引维护；索引自身不持额外页引用。范围写回按页数/脏页数
+选择较小集合，在不可睡眠的捕获区间分配并 pin，之后排序和 I/O 可以等待。
+完整写回且代次相同才摘脏链，旧写回不清除新修改。快照页仍独立持有，只复制需要的区间。
+
+`tests/riscv/scale_main.c` 的普通构建测试 1 MiB，COST 构建保留 64 MiB / 16384 页，
+统计确认这些页没有被回收。范围规模使用真实缓存的稀疏零页，冷页覆盖另有第 0 页
+真实已同步内容。它不是密集文件吞吐测量。最初把 64 MiB 全部写入后逐页同步的准备
+放入 120 秒 fixture，超时盘上已推进至 18,759,680 字节；改为与范围索引契约直接相关的
+稀疏准备，并让 runner 在后续超时时保存已捕获输出。没有将原超时算作通过。
+
+| 已测操作 | 候选访问 | 快照复制 | 其他约束 |
+|---|---:|---:|---|
+| 16384 个常驻页中，一个脏页的页范围 | 1 | 1 字节 | 其余缓存页不扫描 |
+| 整文件中仅 3 个脏页 | 3 | 3 字节 | 实际后端提交按偏移递增 |
+| 16 个脏页中同步一个页范围 | 1 | 1 字节 | 剩余 15 页仍脏，之后全部写回 |
+
+VFS、文件、部分写、共享/private mmap、1/4/16/64 MiB 增长、真实 userland、COST 和
+栈门禁通过；四组 io-sleep 保留并发加载/写回、快照不变、映射再脏、inode owner 与错误回收。
+生产内核 SHA-256 `56970dc9d644c26b42f37d903bd7be4805f93bb4571a9888d89c3923b98d2440`，
+QEMU 11.1.1。完整 lwext4 恢复宿主目标通过，SQLite 3.53.4 原生 Unix VFS 的
+DELETE/WAL EXTRA/FULL、热日志、已确认提交及两次重启完整性通过：
+
+| SQLite 模式 | 断电切点 none/odd/reverse | WRITE 候选 / 实际注入 | FLUSH 候选 / 实际注入 |
+|---|---|---:|---:|
+| DELETE | 57 / 55 / 60（172 次） | 40 / 38 | 20 / 19 |
+| WAL | 28 / 28 / 26（82 次） | 18 / 16 | 10 / 10 |
+
+DELETE 的 WRITE 36/38、FLUSH 20，以及 WAL 的 WRITE 17/18 在对应执行中未达到
+注入序号，runner 明确记作已提交后的切断与重启检查；不能算真实故障注入通过。
+切点由各自运行日志测得，不借用历史 441 次矩阵的包络。恢复用相同程序 SHA-256
+`510fc4c7b8e72a2224603b053bc9d5967f295e20a5085500038a4dd4936436f5`，
+NBD server 为 `22a8c979a85a153c28c7b7fdeac7aa73f06d440b44c5e90cda7590db8dd452ab`。
+这些是正确性和成本结果，当前没有匹配发布构建的吞吐结论。
+
+```sh
+make all test-scale-riscv test-cache-growth-riscv
+make test-vfs-riscv test-files-riscv test-files-partial-write-riscv
+make test-io-sleep-riscv test-userland-riscv test-stack-usage
+make test-lwext4-host test-lwext4-recovery-host
+make test-sqlite-recovery-matrix-riscv test-sqlite-wal-recovery-matrix-riscv
+```

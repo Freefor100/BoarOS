@@ -92,8 +92,11 @@ void kernel_page_cache_alias_clone(struct kernel_page_cache_alias *target,
 void kernel_page_cache_alias_detach(struct kernel_page_cache_alias *alias);
 void kernel_page_cache_alias_mark_dirty(struct kernel_page_cache_alias *alias);
 
-/* Buffered writes own their dirty pages until writeback or explicit discard.
- * These operations return zero or a negative errno, retaining partial progress. */
+/* Caller supplies stable kernel bytes and owns the inode mutation lock.
+ * A full-page cache miss stays loading until initialized and dirty, without
+ * reading the overwritten data. Partial pages preserve their old contents.
+ * Dirty pages remain owned until writeback or explicit discard; return zero
+ * or a negative errno while retaining partial progress. */
 int kernel_page_cache_write(struct kernel_page_cache *cache,
                              struct kernel_vfs_file *file, uint64_t offset,
                              const void *buffer, size_t size, size_t *written);

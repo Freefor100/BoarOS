@@ -17,15 +17,20 @@ try:
     with disk.open('wb') as stream:
         stream.truncate(128 * 1024 * 1024)
     subprocess.run(['mkfs.ext4', '-q', '-F', '-b', '4096', str(disk)], check=True)
-    result = subprocess.run([args.qemu, '-machine', 'virt', '-bios', 'default',
+    try:
+        result = subprocess.run([args.qemu, '-machine', 'virt', '-bios', 'default',
         '-kernel', args.kernel, '-m', '512M', '-smp', '1', '-nographic', '-no-reboot',
         '-drive', f'file={disk},if=none,format=raw,id=root',
         '-device', 'virtio-blk-device,drive=root,bus=virtio-mmio-bus.0'],
         stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired as error:
+        def text(value): return value.decode(errors='replace') if isinstance(value,bytes) else value or ''
+        (work / 'boot.log').write_text(text(error.stdout) + text(error.stderr))
+        raise
     (work / 'boot.log').write_text(result.stdout + result.stderr)
     if result.returncode or 'BoarOS: scale tests passed' not in result.stdout or 'scale failed:' in result.stdout:
         raise RuntimeError(result.stdout[-4000:] + result.stderr)
-    labels = ('protocol ', 'poll ', 'growth ', 'file ', 'TCP ', 'mapped bytes:', 'resident probes:',
+    labels = ('cache ', 'protocol ', 'poll ', 'growth ', 'file ', 'TCP ', 'mapped bytes:', 'resident probes:',
               'protect visits:', 'address flushes:', 'global flushes:', 'BoarOS: scale')
     print('\n'.join(line for line in result.stdout.splitlines()
                     if line.startswith(labels)))

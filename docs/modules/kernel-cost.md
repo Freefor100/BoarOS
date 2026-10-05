@@ -53,7 +53,7 @@ C1 进一步按 file/stream/dgram/other 记录 calls、requested/accepted、实�
 staging 累计请求容量、heap 请求字节和成功物理页。短写以实际接受前缀为准；同步尾部失败
 不会抹掉先前接受量。全局 heap/page 指标是实际 allocator 入口和成功结果，按本层单位记录，
 不能把 heap 字节、物理页及 staging 引用容量相加当驻留峰值。
-缓存计 bucket probes、实际复制、范围写回的两轮遍历、完整页快照与逻辑后端接受量。
+缓存计 bucket probes、实际复制、范围写回候选访问、实际脏区间快照与逻辑后端接受量。旧两轮全页链与整页快照的历史值保持原解释，当前算法访问较小的候选集合。
 设备按 registry 的磁盘0/1/其他聚合；请求在 submit 保存标量 epoch/lane，IRQ 完成和 reset
 使用提交身份，旧请求不能污染新窗口。原设备/MM 统计契约不变，fixture 未登记设备属于 other。
 封口事务的提交路径按 ordered data、journal、checkpoint metadata 与 journal superblock 设置标量 phase，设备按真实提交上下文归因；其余字节继续归 unknown_read/unknown_write（含之后失败的请求）。请求字节不表示持久字节；后端逻辑数据不足以证明其他扇区分类。

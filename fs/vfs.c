@@ -1887,7 +1887,8 @@ int kernel_vfs_node_release(struct kernel_vfs_node **owner)
         return 0;
     }
     if (node->references == 1U) {
-        if (node->mappings != 0 || node->fifo_pipe) __builtin_trap();
+        if (node->mappings != 0 || node->fifo_pipe || node->cache_pages ||
+            node->dirty_cache_pages.head || node->dirty_cache_pages.count) __builtin_trap();
         if (!kernel_record_lock_state_empty(&node->record_locks))
             __builtin_trap();
         node->references = 0U;
@@ -1934,6 +1935,9 @@ struct kernel_page_cache_entry **kernel_vfs_node_cache_pages(
 {
     return &node->cache_pages;
 }
+
+struct kernel_page_cache_dirty *kernel_vfs_node_dirty_pages(struct kernel_vfs_node *node)
+{ return &node->dirty_cache_pages; }
 
 void kernel_vfs_node_written(struct kernel_vfs_node *node, uint64_t end)
 {
