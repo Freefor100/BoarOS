@@ -145,8 +145,9 @@ static void device_failed(struct kernel_network *n)
         kernel_socket_network_failed(ip4_addr_get_u32(netif_ip4_addr(&n->interface)));
     }
     netif_set_link_down(&n->interface);
-    /* 失败设备只读DMA已无意义；归还全部在途TX owner。 */
-    riscv_virtio_mmio_net_tx_release(&n->device, release_owner, 1);
+    /* 失败不等于DMA停止：设备仍可能读取已投递的TX描述符与payload，
+     * 在途owner保留到stop()复位确认，与RX借用同一策略；已完成owner
+     * 仍由worker的release(0)归还。 */
 }
 static void worker(void *context)
 {

@@ -28,6 +28,7 @@ struct stats_ lwip_stats;
 static struct stats_mem pool_stats;
 static struct pbuf *received;
 static unsigned released, copied, allocation_fail;
+static unsigned abandon_calls, drain_calls;
 static unsigned char lent[64];
 static err_t input_result;
 struct pbuf *pbuf_alloced_custom(pbuf_layer layer, u16_t length, pbuf_type type,
@@ -63,7 +64,7 @@ u8_t pbuf_free(struct pbuf *p)
 void pbuf_ref(struct pbuf *p) { p->ref++; }
 void riscv_virtio_mmio_net_tx_release(struct riscv_virtio_mmio_net *d,
     void (*release)(void *), int abandon)
-{ (void)d; (void)release; (void)abandon; }
+{ (void)d; (void)release; if (abandon) abandon_calls++; else drain_calls++; }
 int riscv_virtio_mmio_net_send_segments(struct riscv_virtio_mmio_net *d,
     const struct riscv_net_tx_segment *s, unsigned count, void *owner)
 { (void)d; (void)s; (void)count; (void)owner; return -KERNEL_ENOTSUP; }
@@ -116,6 +117,13 @@ int main(void)
                expired, errors, (unsigned long long)blocked_deadline);
         return 1;
     }
-    puts("PASS failed-NIC preserves unrelated protocol timer progress");
+    /* 失败只能归还已完成owner；在途DMA在stop()复位确认前不得abandon。 */
+    if (abandon_calls != 0 || drain_calls == 0) {
+        printf("FAIL failed-NIC tx-release abandon=%u drain=%u\n",
+               abandon_calls, drain_calls);
+        return 1;
+    }
+    printf("PASS failed-NIC preserves unrelated protocol timer progress, tx drain=%u abandon=%u\n",
+           drain_calls, abandon_calls);
     return receive_contract();
 }
