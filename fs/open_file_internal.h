@@ -16,6 +16,10 @@ struct kernel_open_file_description {
     struct kernel_heap *heap;
     struct kernel_mutex offset_lock;
     uint64_t offset;
+#if BOAROS_PAGE_CACHE_READAHEAD_PAGES
+    uint64_t read_end, readahead_cookie;
+    uint8_t read_sequential;
+#endif
     uint64_t observed_writeback_error;
     uint64_t observed_mount_error;
     uint64_t proc_identity;

@@ -480,6 +480,7 @@ static enum kernel_files_status read_pinned(
                               linux_result);
     }
     if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_REGULAR) {
+        kernel_open_file_read_begin(description, kernel_open_file_offset(description));
         kernel_vfs_file_accessed(&description->file);
     }
     request = count > KERNEL_FILES_MAX_RW_COUNT
@@ -490,6 +491,7 @@ static enum kernel_files_status read_pinned(
                            kernel_open_file_offset(description), 1, linux_result);
     while (total < request) {
         uint64_t file_offset = kernel_open_file_offset(description);
+        kernel_open_file_read_begin(description, file_offset);
         uint64_t page_index = file_offset >> BOAROS_PAGE_SHIFT;
         size_t page_offset = (size_t)(file_offset & BOAROS_PAGE_MASK);
         size_t valid_bytes;
@@ -547,6 +549,7 @@ static enum kernel_files_status read_pinned(
                 PHYSICAL_PAGE_STATUS_OK) {
             return KERNEL_FILES_STATUS_STATE;
         }
+        kernel_open_file_read_progress(description, file_offset, copied);
         total += copied;
         if (access_status == KERNEL_UACCESS_STATUS_FAULT) {
             files->record->statistics.read_failures++;
@@ -798,6 +801,7 @@ static enum kernel_files_status pread_pinned(
                            linux_result, 0U, 0, 0);
     }
     if (kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_REGULAR) {
+        kernel_open_file_read_begin(description, (uint64_t)offset);
         kernel_vfs_file_accessed(&description->file);
     }
     request = count > KERNEL_FILES_MAX_RW_COUNT
@@ -818,6 +822,7 @@ static enum kernel_files_status pread_pinned(
         return memory_read(files, mm, description, &cursor, request, position, 0, linux_result);
     }
     while (total < request) {
+        kernel_open_file_read_begin(description, position);
         uint64_t page_index = position >> BOAROS_PAGE_SHIFT;
         size_t page_offset = (size_t)(position & BOAROS_PAGE_MASK);
         size_t valid_bytes;
@@ -870,6 +875,7 @@ static enum kernel_files_status pread_pinned(
         (void)physical_page_release(files->heap->page_allocator,
                                   physical_address);
         total += copied;
+        kernel_open_file_read_progress(description, position, copied);
         position += copied;
         if (access_status == KERNEL_UACCESS_STATUS_FAULT) {
             files->record->statistics.read_failures++;
@@ -1020,6 +1026,7 @@ static int64_t sendfile_pinned(struct kernel_files *files, struct kernel_mm *mm,
         if (output->open_flags & KERNEL_FILES_O_APPEND) return -KERNEL_EINVAL;
     }
     if (input->kind != KERNEL_OPEN_FILE_KIND_REGULAR) return -KERNEL_EINVAL;
+    if (count) kernel_open_file_read_begin(input, start);
     kernel_vfs_file_accessed(&input->file);
     if (count == 0U || start >= kernel_open_file_size(input)) return 0;
     struct kernel_task_io_buffer scratch = {0};

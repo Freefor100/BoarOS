@@ -22,6 +22,42 @@
 static int open_file_live(
     const struct kernel_open_file_description *file);
 
+static void reset_read_prediction(struct kernel_open_file_description *file)
+{
+#if BOAROS_PAGE_CACHE_READAHEAD_PAGES
+    if (file->readahead_cookie)
+        kernel_page_cache_cancel_readahead(kernel_vfs_file_page_cache(&file->file), file->readahead_cookie);
+    file->readahead_cookie = 0; file->read_sequential = 0;
+#else
+    (void)file;
+#endif
+}
+
+#if BOAROS_PAGE_CACHE_READAHEAD_PAGES
+void kernel_open_file_read_begin(struct kernel_open_file_description *file, uint64_t offset)
+{
+    if (!open_file_live(file)) return;
+    uintptr_t irq = riscv_interrupt_save();
+    if (file->read_sequential && file->read_end != offset) reset_read_prediction(file);
+    riscv_interrupt_restore(irq);
+}
+void kernel_open_file_read_progress(struct kernel_open_file_description *file,
+    uint64_t offset, size_t count)
+{
+    if (!count || !open_file_live(file) || file->kind != KERNEL_OPEN_FILE_KIND_REGULAR ||
+        kernel_open_file_memory_backed(file) || kernel_vfs_file_generated(&file->file)) return;
+    if (offset > UINT64_MAX - count) __builtin_trap();
+    uintptr_t irq = riscv_interrupt_save();
+    int sequential = file->read_sequential && file->read_end == offset;
+    if (!sequential) reset_read_prediction(file);
+    file->read_end = offset + count; file->read_sequential = 1;
+    if (sequential && !(file->read_end & BOAROS_PAGE_MASK))
+        file->readahead_cookie = kernel_page_cache_readahead(kernel_vfs_file_page_cache(&file->file),
+            kernel_vfs_file_node(&file->file), file->read_end >> BOAROS_PAGE_SHIFT, file->readahead_cookie);
+    riscv_interrupt_restore(irq);
+}
+#endif
+
 static uint64_t next_socket_proc_identity = 1U;
 
 struct kernel_vfs_path *kernel_open_file_path(
@@ -567,6 +603,7 @@ enum kernel_open_file_status kernel_open_file_release(
         return KERNEL_OPEN_FILE_STATUS_OK;
     }
     if (file->references == 1U) {
+        reset_read_prediction(file);
         release_record_locks(file);
         file->references = 0U;
     }
@@ -646,6 +683,7 @@ enum kernel_open_file_status kernel_open_file_detach(
         return kernel_open_file_release(owner);
     }
     if (file->references == 1U) {
+        reset_read_prediction(file);
         release_record_locks(file);
         if (file->device_opened) {
             file->device_opened = 0;
@@ -780,6 +818,7 @@ enum kernel_open_file_status kernel_open_file_seek(
     if (!open_file_live(file)) {
         return KERNEL_OPEN_FILE_STATUS_STATE;
     }
+    reset_read_prediction(file);
     file->offset = offset;
     return KERNEL_OPEN_FILE_STATUS_OK;
 }
@@ -905,13 +944,12 @@ int kernel_open_file_pread(struct kernel_open_file_description *file,
                            size_t size,
                            size_t *bytes_read)
 {
-    return open_file_live(file)
-               ? kernel_vfs_pread(&file->file,
-                                  offset,
-                                  buffer,
-                                  size,
-                                  bytes_read)
-               : -KERNEL_EINVAL;
+    if (!open_file_live(file)) return -KERNEL_EINVAL;
+    if (bytes_read) *bytes_read = 0;
+    if (size) kernel_open_file_read_begin(file, offset);
+    int result = kernel_vfs_pread(&file->file, offset, buffer, size, bytes_read);
+    if (bytes_read) kernel_open_file_read_progress(file, offset, *bytes_read);
+    return result;
 }
 
 int kernel_open_file_sync_range(struct kernel_open_file_description *file,

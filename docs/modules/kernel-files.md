@@ -395,3 +395,10 @@ INET TCP 的流写接纳先于 payload usercopy：请求把 OFD pin 和 byte res
 完整请求正常展开或强制退出归还预留；同一次阻塞发送保留暂存后缀。
 数值地址范围检查仍在状态与容量判断之前，实际读页在之后；文件、UNIX 和数据报路径保持各自契约。
 接口与同 ELF 验证见[网络模块](kernel-network.md#tcp-发送接纳与复制2026-10-05)。
+
+
+普通磁盘文件的顺序预测保存在 OFD，dup 共享，独立 open 不共享。非零预读候选中，
+read/readv、pread 系列与 sendfile 在访问时间更新等首次可睡眠动作前调用
+`kernel_open_file_read_begin`，成功前缀才调用 read_progress；冷不连续读取不能先睡眠
+再撤销旧预测。seek 和最后释放 OFD 取消其 cookie，预读持有 inode 而非 fd 编号，
+因此 fd 复用不会继承旧预测。默认关闭及取消接纳边界见[VFS 预读](vfs-ext4.md#有界顺序预读候选)。

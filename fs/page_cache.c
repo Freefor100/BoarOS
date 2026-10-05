@@ -54,6 +54,14 @@ struct page_cache_group {
     uint64_t refs, round, pending, progressed;
 };
 
+#if BOAROS_PAGE_CACHE_READAHEAD_PAGES
+struct readahead_job {
+    struct kernel_vfs_node *node;
+    uint64_t cookie, first;
+    int active, cancelled;
+};
+#endif
+
 struct kernel_page_cache_record {
     struct page_cache_group *group;
     struct kernel_page_cache_record *next;
@@ -77,9 +85,17 @@ struct kernel_page_cache_record {
     int started, stopping;
     int snapshot_busy;
     uint32_t snapshot_order;
+#if BOAROS_PAGE_CACHE_READAHEAD_PAGES
+    struct readahead_job readahead_jobs[8];
+    struct kernel_thread_join readahead_worker;
+    struct kernel_wait_queue readahead_work;
+    uint64_t readahead_cookie;
+    int readahead_started;
+#endif
 
 };
 
+static void readahead_cancel_node(struct kernel_page_cache *cache, struct kernel_vfs_node *node);
 static void pressure_notify(void *context);
 static void group_notify(void *context);
 static void pressure_wait(void *context);
@@ -699,6 +715,242 @@ enum kernel_page_cache_status kernel_page_cache_lookup(
     return KERNEL_PAGE_CACHE_STATUS_OK;
 }
 
+/* New entries own node/page and remain loading until their producer publishes. */
+static enum kernel_page_cache_status prepare_page(struct kernel_page_cache *cache,
+    struct kernel_vfs_node *node, uint64_t page_index, int clear,
+    struct kernel_page_cache_entry **output, void **bytes, int *created)
+{
+    struct kernel_page_cache_entry *entry;
+    void *page;
+    size_t bucket;
+    int found;
+    if (!reserve_bucket(cache) ||
+        kernel_heap_allocate_zeroed(cache->heap,
+                                    1U,
+                                    sizeof(*entry),
+                                    (void **)&entry) !=
+            KERNEL_HEAP_STATUS_OK) {
+        return KERNEL_PAGE_CACHE_STATUS_NO_MEMORY;
+    }
+    if (physical_page_allocate(cache->allocator,
+                               &entry->physical_address) !=
+        PHYSICAL_PAGE_STATUS_OK) {
+        (void)kernel_heap_release(cache->heap, entry);
+        return KERNEL_PAGE_CACHE_STATUS_NO_MEMORY;
+    }
+    entry->page_references_owned = 1U;
+    if (physical_page_resolve(cache->allocator,
+                              entry->physical_address,
+                              &page) != PHYSICAL_PAGE_STATUS_OK) {
+        return abandon_entry(cache,
+                             entry,
+                             KERNEL_PAGE_CACHE_STATUS_STATE);
+    }
+    if (clear) zero_bytes(page, BOAROS_PAGE_SIZE);
+    if (kernel_vfs_node_acquire(node) != 0) {
+        return abandon_entry(cache,
+                             entry,
+                             KERNEL_PAGE_CACHE_STATUS_STATE);
+    }
+    entry->cache = cache;
+    entry->node = node;
+    entry->page_index = page_index;
+    bucket = find_bucket(cache->record, node, page_index, &found);
+    if (found) {
+        (void)abandon_entry(cache, entry, KERNEL_PAGE_CACHE_STATUS_OK);
+        *created = 0; *output = cache->record->buckets[bucket]; *bytes = 0;
+        return KERNEL_PAGE_CACHE_STATUS_OK;
+    }
+    kernel_wait_queue_init(&entry->ready);
+    entry->loading = 1;
+    entry->users = 1;
+    entry->page_references_owned = 1U;
+    if (cache->record->buckets[bucket] == PAGE_CACHE_TOMBSTONE) {
+        cache->record->tombstones--;
+    }
+    cache->record->buckets[bucket] = entry;
+    cache->record->occupied++;
+    entry->node_next = *kernel_vfs_node_cache_pages(node);
+    entry->node_previous = kernel_vfs_node_cache_pages(node);
+    if (entry->node_next != 0)
+        entry->node_next->node_previous = &entry->node_next;
+    *entry->node_previous = entry;
+    lru_insert_head(cache->record, entry);
+    cache->record->statistics.insertions++;
+    cache->record->statistics.current_pages++;
+    if (cache->record->statistics.current_pages >
+        cache->record->statistics.peak_pages) {
+        cache->record->statistics.peak_pages =
+            cache->record->statistics.current_pages;
+    }
+    *output = entry; *bytes = page; *created = 1;
+    return KERNEL_PAGE_CACHE_STATUS_OK;
+}
+
+#if BOAROS_PAGE_CACHE_READAHEAD_PAGES
+static void readahead_drop(struct kernel_page_cache_record *r, struct readahead_job *job)
+{
+    if (job->active) __builtin_trap();
+    if (job->cancelled) r->statistics.readahead_cancelled++;
+    if (kernel_vfs_node_release(&job->node)) __builtin_trap();
+    *job = (struct readahead_job){0};
+}
+
+/* Caller serializes the short queue mutation; active jobs keep their node. */
+static void readahead_cancel_node(struct kernel_page_cache *cache, struct kernel_vfs_node *node)
+{
+    struct kernel_page_cache_record *r = cache->record;
+    for (unsigned i = 0; i < 8; i++) {
+        struct readahead_job *job = &r->readahead_jobs[i];
+        if (!job->node || (node && job->node != node)) continue;
+        job->cancelled = 1;
+        if (!job->active) readahead_drop(r, job);
+    }
+}
+
+void kernel_page_cache_cancel_readahead(struct kernel_page_cache *cache, uint64_t cookie)
+{
+    if (!cache_live(cache) || !cookie) return;
+    uintptr_t irq = riscv_interrupt_save();
+    struct kernel_page_cache_record *r = cache->record;
+    for (unsigned i = 0; i < 8; i++) {
+        struct readahead_job *job = &r->readahead_jobs[i];
+        if (!job->node || job->cookie != cookie) continue;
+        job->cancelled = 1;
+        if (!job->active) readahead_drop(r, job);
+    }
+    riscv_interrupt_restore(irq);
+}
+
+uint64_t kernel_page_cache_readahead(struct kernel_page_cache *cache,
+    struct kernel_vfs_node *node, uint64_t first, uint64_t cookie)
+{
+    if (!cache_live(cache) || !node || first > UINT64_MAX >> BOAROS_PAGE_SHIFT) return 0;
+    uintptr_t irq = riscv_interrupt_save();
+    struct kernel_page_cache_record *r = cache->record;
+    if (!r->readahead_started || r->stopping || physical_page_available(cache->allocator) <= r->low ||
+        (first << BOAROS_PAGE_SHIFT) >= kernel_vfs_node_size(node)) {
+        kernel_page_cache_cancel_readahead(cache, cookie);
+        riscv_interrupt_restore(irq); return 0;
+    }
+    struct readahead_job *available = 0;
+    for (unsigned i = 0; i < 8; i++) {
+        struct readahead_job *job = &r->readahead_jobs[i];
+        if (!job->node) { if (!available) available = job; continue; }
+        if (cookie && job->cookie == cookie && job->node == node && !job->cancelled) {
+            if (!job->active) job->first = first;
+            riscv_interrupt_restore(irq); return cookie;
+        }
+    }
+    if (!available) { riscv_interrupt_restore(irq); return 0; }
+    if (kernel_vfs_node_acquire(node)) __builtin_trap();
+    if (!++r->readahead_cookie) __builtin_trap();
+    *available = (struct readahead_job){.node = node, .first = first, .cookie = r->readahead_cookie};
+    r->statistics.readahead_queued++;
+    if (r->readahead_work.head) (void)kernel_wait_queue_wake_all(&r->readahead_work);
+    cookie = available->cookie;
+    riscv_interrupt_restore(irq);
+    return cookie;
+}
+
+static void readahead_load(struct kernel_page_cache *cache, struct readahead_job *job)
+{
+    KERNEL_LOCK_SCOPE(guard);
+    if (!kernel_vfs_node_try_read(job->node, &guard)) { job->cancelled = 1; return; }
+    struct kernel_page_cache_record *r = cache->record;
+    struct kernel_page_cache_entry *entries[BOAROS_PAGE_CACHE_READAHEAD_PAGES] = {0};
+    struct kernel_vfs_read_span spans[BOAROS_PAGE_CACHE_READAHEAD_PAGES];
+    unsigned count = 0;
+    {
+        /* 准备未发布的 loading 页时禁止回收 I/O，避免和需求读互等。 */
+        KERNEL_NO_RECLAIM_IO;
+        for (unsigned i = 0; i < BOAROS_PAGE_CACHE_READAHEAD_PAGES; i++) {
+            if (r->stopping || job->cancelled || physical_page_available(cache->allocator) <= r->low) {
+                job->cancelled = 1; break;
+            }
+            uint64_t index = job->first + i;
+            if (index > UINT64_MAX >> BOAROS_PAGE_SHIFT || (index << BOAROS_PAGE_SHIFT) >= kernel_vfs_node_size(job->node)) break;
+            int found, created;
+            (void)find_bucket(r, job->node, index, &found);
+            if (found) continue; /* 已有加载由原 owner 完成，预读不与它交叉等待。 */
+            struct kernel_page_cache_entry *entry;
+            void *page;
+            enum kernel_page_cache_status status = prepare_page(cache, job->node, index, 1, &entry, &page, &created);
+            if (status != KERNEL_PAGE_CACHE_STATUS_OK) break;
+            if (!created) continue;
+            r->statistics.misses++;
+            entries[count] = entry;
+            spans[count++] = (struct kernel_vfs_read_span){index << BOAROS_PAGE_SHIFT, page, BOAROS_PAGE_SIZE, 0, 0};
+        }
+    }
+    /* 取消仅丢弃尚无需求读者的页；已经订阅的需求保留完整加载 owner。 */
+    if (r->stopping || job->cancelled || physical_page_available(cache->allocator) <= r->low) {
+        unsigned kept = 0;
+        for (unsigned i = 0; i < count; i++) {
+            struct kernel_page_cache_entry *entry = entries[i];
+            if (entry->users > 1) { entries[kept] = entry; spans[kept++] = spans[i]; continue; }
+            entry->loading = 0; entry->users = 0;
+            remove_entry(cache, entry);
+        }
+        count = kept;
+        uint64_t released = 0; (void)drain_entries(cache, &released);
+    }
+    if (!count) return;
+    r->statistics.readahead_batches++;
+    if (count > r->statistics.readahead_peak_pages) r->statistics.readahead_peak_pages = count;
+    int result = kernel_vfs_node_pread_batch(job->node, spans, count);
+    for (unsigned i = 0; i < count; i++) {
+        struct kernel_page_cache_entry *entry = entries[i];
+        int error = spans[i].error;
+        /* A backend must identify its failed span; reject an unexplained global failure. */
+        if (result && !error) {
+            int identified = 0;
+            for (unsigned j = 0; j < count; j++) identified |= spans[j].error != 0;
+            if (!identified) error = result;
+        }
+        if (spans[i].completed > BOAROS_PAGE_SIZE) __builtin_trap();
+        entry->load_error = error == -KERNEL_ENOMEM ? KERNEL_PAGE_CACHE_STATUS_NO_MEMORY :
+            error ? KERNEL_PAGE_CACHE_STATUS_IO : KERNEL_PAGE_CACHE_STATUS_OK;
+        entry->loading = 0; entry->users--;
+        if (entry->ready.head) (void)kernel_wait_queue_wake_all(&entry->ready);
+        if (error) {
+            r->statistics.readahead_failed++;
+            if (!entry->users) remove_entry(cache, entry);
+        } else r->statistics.readahead_loaded++;
+    }
+    uint64_t released = 0; (void)drain_entries(cache, &released);
+}
+
+static void readahead_worker(void *argument)
+{
+    struct kernel_page_cache *cache = argument;
+    struct kernel_page_cache_record *r = cache->record;
+    (void)riscv_interrupt_save();
+    for (;;) {
+        struct readahead_job *next = 0;
+        for (unsigned i = 0; i < 8; i++) {
+            struct readahead_job *job = &r->readahead_jobs[i];
+            if (job->node && (!next || job->cookie < next->cookie)) next = job;
+        }
+        if (r->stopping) { readahead_cancel_node(cache, 0); break; }
+        if (!next) {
+            enum kernel_wait_wake_reason reason;
+            if (kernel_scheduler_block_current(&r->readahead_work, 0, 1, &reason) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
+            continue;
+        }
+        next->active = 1;
+        readahead_load(cache, next);
+        next->active = 0; readahead_drop(r, next);
+        /* 一批最多八页；只在完整后端调用返回后让出，不截断内部 I/O。 */
+        riscv_interrupt_restore(RISCV_SSTATUS_SIE); (void)riscv_interrupt_save();
+        if (kernel_scheduler_yield_current() != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
+    }
+}
+#else
+static void readahead_cancel_node(struct kernel_page_cache *cache, struct kernel_vfs_node *node)
+{ (void)cache; (void)node; }
+#endif
+
 static enum kernel_page_cache_status get_page(
     struct kernel_page_cache *cache,
     const struct kernel_vfs_file *file,
@@ -712,8 +964,6 @@ static enum kernel_page_cache_status get_page(
     void *page;
     uint64_t offset;
     size_t bytes_read = 0U;
-    int found;
-    size_t bucket;
     enum kernel_page_cache_status lookup_status;
 
     if (overwritten) *overwritten = 0;
@@ -738,64 +988,10 @@ static enum kernel_page_cache_status get_page(
         return KERNEL_PAGE_CACHE_STATUS_OUT_OF_RANGE;
     }
     cache->record->statistics.misses++;
-    if (!reserve_bucket(cache) ||
-        kernel_heap_allocate_zeroed(cache->heap,
-                                    1U,
-                                    sizeof(*entry),
-                                    (void **)&entry) !=
-            KERNEL_HEAP_STATUS_OK) {
-        return KERNEL_PAGE_CACHE_STATUS_NO_MEMORY;
-    }
-    if (physical_page_allocate(cache->allocator,
-                               &entry->physical_address) !=
-        PHYSICAL_PAGE_STATUS_OK) {
-        (void)kernel_heap_release(cache->heap, entry);
-        return KERNEL_PAGE_CACHE_STATUS_NO_MEMORY;
-    }
-    entry->page_references_owned = 1U;
-    if (physical_page_resolve(cache->allocator,
-                              entry->physical_address,
-                              &page) != PHYSICAL_PAGE_STATUS_OK) {
-        return abandon_entry(cache,
-                             entry,
-                             KERNEL_PAGE_CACHE_STATUS_STATE);
-    }
-    if (!overwrite) zero_bytes(page, BOAROS_PAGE_SIZE);
-    if (kernel_vfs_node_acquire(node) != 0) {
-        return abandon_entry(cache,
-                             entry,
-                             KERNEL_PAGE_CACHE_STATUS_STATE);
-    }
-    entry->cache = cache;
-    entry->node = node;
-    entry->page_index = page_index;
-    bucket = find_bucket(cache->record, node, page_index, &found);
-    if (found) {
-        (void)abandon_entry(cache, entry, KERNEL_PAGE_CACHE_STATUS_OK);
-        return kernel_page_cache_lookup(cache, file, page_index, physical_address, valid_bytes);
-    }
-    kernel_wait_queue_init(&entry->ready);
-    entry->loading = 1;
-    entry->users = 1;
-    entry->page_references_owned = 1U;
-    if (cache->record->buckets[bucket] == PAGE_CACHE_TOMBSTONE) {
-        cache->record->tombstones--;
-    }
-    cache->record->buckets[bucket] = entry;
-    cache->record->occupied++;
-    entry->node_next = *kernel_vfs_node_cache_pages(node);
-    entry->node_previous = kernel_vfs_node_cache_pages(node);
-    if (entry->node_next != 0)
-        entry->node_next->node_previous = &entry->node_next;
-    *entry->node_previous = entry;
-    lru_insert_head(cache->record, entry);
-    cache->record->statistics.insertions++;
-    cache->record->statistics.current_pages++;
-    if (cache->record->statistics.current_pages >
-        cache->record->statistics.peak_pages) {
-        cache->record->statistics.peak_pages =
-            cache->record->statistics.current_pages;
-    }
+    int created;
+    lookup_status = prepare_page(cache, node, page_index, !overwrite, &entry, &page, &created);
+    if (lookup_status != KERNEL_PAGE_CACHE_STATUS_OK) return lookup_status;
+    if (!created) return kernel_page_cache_lookup(cache, file, page_index, physical_address, valid_bytes);
     int read_error = 0;
     if (!overwrite) read_error = kernel_vfs_node_pread(node, offset, page, BOAROS_PAGE_SIZE, &bytes_read);
     uintptr_t irq = riscv_interrupt_save();
@@ -1181,6 +1377,7 @@ void kernel_page_cache_extend(struct kernel_page_cache *cache,
 void kernel_page_cache_truncate(struct kernel_page_cache *cache,
     struct kernel_vfs_node *node, uint64_t size)
 {
+    if (cache_live(cache)) readahead_cancel_node(cache, node);
     struct kernel_page_cache_entry *entry = *kernel_vfs_node_cache_pages(node);
     uint64_t released = 0;
     while (entry) {
@@ -1268,6 +1465,7 @@ static void group_notify(void *context)
     for (struct kernel_page_cache_record *r = g->head; r; r = r->next) {
         if (!r->started || r->stopping) continue;
         if (physical_page_available(g->allocator) > r->low && dirty < r->dirty_high) continue;
+        if (physical_page_available(g->allocator) <= r->low) readahead_cancel_node(r->owner, 0);
         r->requested = 1;
         if (r->work.head) (void)kernel_wait_queue_wake_all(&r->work);
     }
@@ -1444,6 +1642,15 @@ int kernel_page_cache_start_worker(struct kernel_page_cache *cache)
         return result == KERNEL_SCHEDULER_STATUS_NO_MEMORY ? -KERNEL_ENOMEM : -KERNEL_EINVAL;
     }
     r->started = 1;
+#if BOAROS_PAGE_CACHE_READAHEAD_PAGES
+    kernel_wait_queue_init(&r->readahead_work);
+    result = kernel_thread_create_joinable(readahead_worker, cache, &r->readahead_worker);
+    if (result != KERNEL_SCHEDULER_STATUS_OK) {
+        kernel_page_cache_stop_worker(cache);
+        return result == KERNEL_SCHEDULER_STATUS_NO_MEMORY ? -KERNEL_ENOMEM : -KERNEL_EINVAL;
+    }
+    r->readahead_started = 1;
+#endif
     pressure_notify(cache);
     return 0;
 }
@@ -1454,6 +1661,14 @@ void kernel_page_cache_stop_worker(struct kernel_page_cache *cache)
     struct kernel_page_cache_record *r = cache->record;
     uintptr_t irq = riscv_interrupt_save();
     r->stopping = 1;
+#if BOAROS_PAGE_CACHE_READAHEAD_PAGES
+    readahead_cancel_node(cache, 0);
+    if (r->readahead_started) {
+        (void)kernel_wait_queue_wake_all(&r->readahead_work);
+        kernel_thread_join(&r->readahead_worker);
+        r->readahead_started = 0;
+    }
+#endif
     (void)kernel_wait_queue_wake_all(&r->work);
     (void)kernel_wait_queue_wake_all(&r->progress);
     kernel_thread_join(&r->worker);
@@ -1513,6 +1728,9 @@ enum kernel_page_cache_status kernel_page_cache_invalidate_node(
     if (!cache_live(cache) || node == 0) {
         return KERNEL_PAGE_CACHE_STATUS_INVALID_ARGUMENT;
     }
+    KERNEL_LOCK_SCOPE(node_guard);
+    kernel_vfs_node_lock(node, &node_guard, 1);
+    readahead_cancel_node(cache, node);
     entry = *kernel_vfs_node_cache_pages(node);
     while (entry != 0) {
         struct kernel_page_cache_entry *next = entry->node_next;

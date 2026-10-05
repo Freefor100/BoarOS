@@ -12,6 +12,14 @@
 #error "BOAROS_PAGE_CACHE_WRITEBACK_PAGES must be 1, 2, 4, or 8"
 #endif
 
+#ifndef BOAROS_PAGE_CACHE_READAHEAD_PAGES
+#define BOAROS_PAGE_CACHE_READAHEAD_PAGES 0
+#endif
+#if BOAROS_PAGE_CACHE_READAHEAD_PAGES != 0 && BOAROS_PAGE_CACHE_READAHEAD_PAGES != 1 && \
+    BOAROS_PAGE_CACHE_READAHEAD_PAGES != 2 && BOAROS_PAGE_CACHE_READAHEAD_PAGES != 4 && BOAROS_PAGE_CACHE_READAHEAD_PAGES != 8
+#error "BOAROS_PAGE_CACHE_READAHEAD_PAGES must be 0, 1, 2, 4, or 8"
+#endif
+
 struct kernel_heap;
 struct kernel_page_cache_record;
 struct kernel_page_cache_entry;
@@ -57,6 +65,8 @@ struct kernel_page_cache_statistics {
     uint64_t current_pages;
     uint64_t peak_pages;
     uint64_t worker_scanned, worker_written, worker_failed, worker_batches;
+    uint64_t readahead_queued, readahead_cancelled, readahead_loaded, readahead_failed;
+    uint64_t readahead_batches, readahead_peak_pages;
 };
 
 struct kernel_page_cache {
@@ -120,6 +130,14 @@ void kernel_page_cache_extend(struct kernel_page_cache *cache,
     struct kernel_vfs_node *node, uint64_t old_size, uint64_t new_size);
 void kernel_page_cache_truncate(struct kernel_page_cache *cache,
     struct kernel_vfs_node *node, uint64_t new_size);
+
+#if BOAROS_PAGE_CACHE_READAHEAD_PAGES
+/* A queue slot pins only the inode. The opaque cookie cancels unsubmitted
+ * work; a published read retains its owners through completion/reset. */
+uint64_t kernel_page_cache_readahead(struct kernel_page_cache *cache,
+    struct kernel_vfs_node *node, uint64_t first, uint64_t cookie);
+void kernel_page_cache_cancel_readahead(struct kernel_page_cache *cache, uint64_t cookie);
+#endif
 
 int kernel_page_cache_start_worker(struct kernel_page_cache *cache);
 void kernel_page_cache_stop_worker(struct kernel_page_cache *cache);
