@@ -21,7 +21,7 @@ N3已经交付：legacy/modern VirtIO-net、受限DMA借用与复制回退、静
 | TX 完成进展纠错 | worker先收割并释放完成槽，再推进协议；睡眠前覆盖SG与复制路径的新容量。宿主顺序/关闭窗口、真实两种TAP传输和无NIC定时器验证通过；见[网络owner](learning/network-ownership.md)。 |
 | 就绪查询与协议服务 | poll 为局部只读快照，短 syscall 与后台 worker 共用有界服务；协议池/NIC/接收堆归还按代次通知等待者。模型与真实 RV64 验证见[网络记录](learning/network-ownership.md#纯就绪与有界协议服务2026-10-05)，接纳 reservation 已接入 TCP 流复制；窗口实验仍属后续阶段。 |
 | TCP 接纳约束复制 | 参数/状态/容量优先于 payload 复制，任务登记的 byte reservation 和 OFD pin 允许复制睡眠。预先 EAGAIN 为零页解析/零复制；全局协议资源变化仍允许有界失败。Linux 同 ELF 契约、交错和退出验收见[网络记录](learning/network-ownership.md#tcp接纳预算与复制2026-10-05)。 |
-| 缓存覆盖与脏范围 | 冷页完整覆盖不预读旧页，独立脏页组织与哈希选择最小候选集合，快照只复制脏段。64 MiB 成本门禁及文件/映射/交错回归通过；完整 lwext4 及 SQLite DELETE/WAL 恢复矩阵通过，候选序号未触发的条目单列于[规模记录](learning/single-hart-scale.md#冷页覆盖与脏范围2026-10-06)；批量读与连续提交实验尚未交付。 |
+| 缓存覆盖与脏范围 | 冷页完整覆盖不预读旧页，独立脏页组织与哈希选择最小候选集合，快照只复制脏段。64 MiB 成本门禁及文件/映射/交错回归通过；完整 lwext4 及 SQLite DELETE/WAL 恢复矩阵通过，候选序号未触发的条目单列于[规模记录](learning/single-hart-scale.md#冷页覆盖与脏范围2026-10-06)；块层八项批量读已通过真实暂扣门禁，ext4/页缓存接入与连续提交实验尚未交付。 |
 | 追加增长纠错 | 增长与截断分离；对齐增长不扫描缓存页链，非对齐增长仅处理旧尾页。1/4/16/64 MiB 成本门禁与真实文件/映射回归通过，吞吐尚未重测；见[规模成本](learning/single-hart-scale.md)。 |
 | epoll 交付纠错 | 完整 event 复制后提交 ET/ONESHOT；独立扫描/pending、MOD 代次与任务退出 owner 已接入。生产函数宿主边界及固定 Linux 同 RV64 ELF 验证通过；见[事件交付](learning/epoll-delivery.md)。 |
 | 双盘控制协议纠错 | 原基线 `3c34091`/`5687377` 的暂扣阶段超时已定位为规范模式终端等待行结束：host只发送单字节g，尚未出现B盘暂扣READ。guest显式设置并恢复控制终端后，暂扣/故障/重启和FIFO/RR四组合通过；已加入CI目标，尚无本提交的托管CI结果。见[可睡眠存储](learning/sleepable-storage.md)。 |

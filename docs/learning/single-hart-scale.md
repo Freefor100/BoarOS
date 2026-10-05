@@ -156,3 +156,23 @@ make test-io-sleep-riscv test-userland-riscv test-stack-usage
 make test-lwext4-host test-lwext4-recovery-host
 make test-sqlite-recovery-matrix-riscv test-sqlite-wal-recovery-matrix-riscv
 ```
+
+
+## 八请求批量读的设备边界（2026-10-06）
+
+`kernel_block_read_batch` 在既有八槽容量内增加读发布/收割分离，不扩队列。
+旧回退路径的实际驱动探针 max-inflight=1，等待八项的门禁超时；当前为 8。
+宿主实际驱动覆盖 legacy/modern × 七种完成模式，包括单项错误、另一项仍在途、
+超时 reset 与跨扇区失败的 505 字节成功前缀；ASan/UBSan 通过。真实 QEMU 11.1.1
+四种 transport/cache 组合均在释放前收到八个 NBD READ，反序释放七个后仍保留
+最后一个 DMA owner，取消/唤醒不能提前返回，全部完成后逐字节核对输出。
+顺序设备回退、全参数预检与可写目标重叠拒绝由通用块宿主测试覆盖。
+
+```sh
+make test-block-host test-block-riscv
+python3 -B tests/host/virtio_block_diagnostics.py
+make test-io-sleep-riscv
+```
+
+这是底层并发和生命周期验收，既不表示 ext4 已用批量读，也不是预读吞吐收益。
+VFS/ext4/页缓存接入、预读和连续写回实验继续作为独立阶段交付。

@@ -1,6 +1,6 @@
 # RISC-V VirtIO MMIO 块设备模块
 
-本文描述 QEMU `virt` 上同步读写与批量写块设备路径。DTB 节点来源见[DTB 与启动内存布局模块](dtb-memory.md)，上层文件语义见[VFS 与 ext4 模块](vfs-ext4.md)。
+本文描述 QEMU `virt` 上同步读写与批量读写块设备路径。DTB 节点来源见[DTB 与启动内存布局模块](dtb-memory.md)，上层文件语义见[VFS 与 ext4 模块](vfs-ext4.md)。
 
 ## 发现与 transport
 
@@ -13,6 +13,14 @@
 通用 `kernel_block_device` 暴露容量、逻辑块大小和精确字节范围的同步读写接口（`kernel_block_read_at`/`kernel_block_write_at`），统一检查空参数、越界和整数溢出。两种 transport 共用最多 32 个描述符的 split queue，每请求占三描述符，最多八个在途槽；按设备 QueueNumMax 向下取可用容量，至少一个槽。modern 分配连续 8 KiB，legacy 分配连续 16 KiB 并以 4 KiB 对齐 used ring。每槽独立持有 header/status、512 字节 bounce、任务 owner、完成状态与等待队列；同步调用拥有槽位直到完成确认，不能在 DMA 期间复用。
 
 `kernel_block_write_batch(device, spans, count)` 接受最多八个 `kernel_block_span { offset, buffer, size }`。设备与逻辑块大小必须有效，至少具有单写或批量写回调；只读设备返回 UNSUPPORTED。通用层在任何写入前检查所有 span 的容量、指针范围和非空字节区间重叠；非空 span 之间重叠返回 INVALID。有效可写设备上的 `count == 0` 可以传空 spans，成功且不调用驱动；空 span 可以传空 buffer，但 offset 仍须不超过容量，全部为空也不调用驱动。可选 `device.write_batch` 一次接收原 span 数组，可能含空项；没有回调时跳过空项、按输入顺序调用单写，遇到首个错误即停止。它保留实际失败状态，不承诺整批原子性或自动 flush；已完成的写不会回滚，调用方须保持所有非空 buffer 有效直到函数返回。
+
+`kernel_block_read_batch(device, spans, count)` 同样最多八项，在发布前检查全部参数。
+读 span 提供可写 buffer、已完成字节前缀和独立状态；磁盘范围可以重叠，但目标内存
+必须彼此及与描述符数组分离。预检失败不发布任何请求，未执行项保留 NOT_SUBMITTED。
+没有批量回调时按顺序执行全部标量读，保存每项结果；返回输入顺序中首个错误。
+VirtIO 批量读支持 direct DMA 与逐扇区 bounce；一个 span 出错不会取消其他独立 span，
+失败 span 只承诺其 completed 前缀。调用返回前必须排空所有已发布 DMA，或确认 reset。
+读取消同样不能提前归还目标内存；成功完成的部分不会因别的请求超时而改写为失败。
 
 VirtIO 将发布、等待和收割分开。同一 batch 按当前空闲槽发布多个 span，支持乱序完成，并在其他调用释放槽时继续补发；不要求先凑齐整批槽位。每个请求保留独立的 I/O context、期限、状态、DMA buffer 和成本身份。batch 只占一个逻辑调用 owner，`active` 统计逻辑调用数，`inflight` 统计已经发布的请求数；释放某个槽不会提前释放整批 owner。不同字节区间仍可能落在同一物理扇区，因此本批内涉及同扇区的 span 按输入顺序串行推进读改写，其他 span 可并发；不会因两个独立 bounce 快照覆盖相邻字节。
 
@@ -77,3 +85,10 @@ RT 组合进展由 `make test-multi-disk-rt-riscv`（调用 `tests/multi-disk-io
 成本诊断的请求带提交时标量 epoch/lane，正常 IRQ 和 timeout/reset 均按该身份记账；registry 磁盘归属与 unknown 字节见[成本观测](kernel-cost.md)，现有设备统计保持原契约。
 
 2026-10-01 最终四组合 io-sleep 与真实日志/消费者路径均达到最大八个已发布请求，运行期轮询为零；这不表示串行读或阶段间 FLUSH 也能保持八槽并行。消费者定点诊断的 ready/resume 关联只覆盖实际唤醒 owner 的请求，batch 会合并唤醒，不能把这一子集与旧所有请求样本直接比较平均延迟。存储流水线的恢复通过、Parent 收益未达标与完整输入身份见[最终验收](../learning/cost-baseline.md#s9-存储流水线验收2026-10-01)。
+
+批量读的旧驱动顺序回退在生产函数宿主模型中只能发布一个请求，新增“暂扣至八项”
+门禁超时；新驱动同时发布八项。两种 transport 的反序完成、单项错误、错误时另项
+仍在途、超时 reset、非对齐、多片段和 505 字节成功前缀由同一实际驱动模型验证，
+含 ASan/UBSan；这些是受控设备边界证据。真实 `test-io-sleep-riscv` 四组合额外要求
+单次调用先产生八个 NBD READ，释放七个后取消/唤醒仍不得返回，最后一个回复后才
+检查完整数据、独立状态和 owner 回收。此阶段尚未证明 ext4/页缓存能产生批量读。

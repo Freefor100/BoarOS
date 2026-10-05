@@ -5,7 +5,7 @@
 
 struct batch_disk {
     unsigned char bytes[64];
-    unsigned writes, batches;
+    unsigned writes, reads, batches;
     unsigned fail_at;
     enum kernel_block_status result;
     uint64_t order[8];
@@ -114,6 +114,53 @@ static void test_write_batch(void)
     assert(kernel_block_write_batch(&device, spans, 1) == KERNEL_BLOCK_STATUS_UNSUPPORTED);
 }
 
+static enum kernel_block_status read_bytes(void *context, uint64_t offset, void *buffer, size_t size)
+{
+    struct batch_disk *disk = context;
+    disk->order[disk->reads++] = offset;
+    if (disk->reads == disk->fail_at) return disk->result;
+    memcpy(buffer, disk->bytes + offset, size); return KERNEL_BLOCK_STATUS_OK;
+}
+static void test_read_batch(void)
+{
+    struct batch_disk disk = {0};
+    for (unsigned i = 0; i < 64; i++) disk.bytes[i] = (unsigned char)(i + 1);
+    struct kernel_block_device device = {.context = &disk, .read = read_bytes,
+        .logical_block_size = 512, .capacity_bytes = 64};
+    unsigned char output[24]; memset(output, 0xa5, sizeof(output));
+    struct kernel_block_read_span spans[3] = {
+        {.offset = 16, .buffer = output, .size = 8},
+        {.offset = 0, .buffer = output + 8, .size = 8},
+        {.offset = 16, .buffer = output + 16, .size = 8}};
+    assert(kernel_block_read_batch(&device, 0, 0) == KERNEL_BLOCK_STATUS_OK);
+    assert(kernel_block_read_batch(&device, 0, 1) == KERNEL_BLOCK_STATUS_INVALID);
+    assert(kernel_block_read_batch(&device, spans, 9) == KERNEL_BLOCK_STATUS_INVALID);
+    spans[2].offset = 60;
+    assert(kernel_block_read_batch(&device, spans, 3) == KERNEL_BLOCK_STATUS_OUT_OF_RANGE && !disk.reads);
+    spans[2].offset = 16; spans[2].buffer = output + 7;
+    assert(kernel_block_read_batch(&device, spans, 3) == KERNEL_BLOCK_STATUS_INVALID && !disk.reads);
+    spans[2].buffer = (void *)UINTPTR_MAX;
+    assert(kernel_block_read_batch(&device, spans, 3) == KERNEL_BLOCK_STATUS_INVALID && !disk.reads);
+    spans[2].buffer = &spans[0];
+    assert(kernel_block_read_batch(&device, spans, 3) == KERNEL_BLOCK_STATUS_INVALID && !disk.reads);
+    spans[2].buffer = output + 16;
+    assert(kernel_block_read_batch(&device, spans, 3) == KERNEL_BLOCK_STATUS_OK && disk.reads == 3);
+    for (unsigned i = 0; i < 3; i++)
+        assert(spans[i].status == KERNEL_BLOCK_STATUS_OK && spans[i].completed == 8 &&
+            !memcmp(spans[i].buffer, disk.bytes + spans[i].offset, 8));
+    disk.reads = 0; disk.fail_at = 2; disk.result = KERNEL_BLOCK_STATUS_IO;
+    memset(output, 0xa5, sizeof(output));
+    assert(kernel_block_read_batch(&device, spans, 3) == KERNEL_BLOCK_STATUS_IO && disk.reads == 3);
+    assert(spans[0].completed == 8 && spans[0].status == KERNEL_BLOCK_STATUS_OK &&
+        spans[1].completed == 0 && spans[1].status == KERNEL_BLOCK_STATUS_IO &&
+        spans[2].completed == 8 && spans[2].status == KERNEL_BLOCK_STATUS_OK && output[8] == 0xa5);
+    spans[0] = (struct kernel_block_read_span){.offset = 64};
+    disk.reads = 0;
+    assert(kernel_block_read_batch(&device, spans, 1) == KERNEL_BLOCK_STATUS_OK && !disk.reads &&
+        spans[0].status == KERNEL_BLOCK_STATUS_OK && !spans[0].completed);
+    puts("block read batch: complete preflight, disjoint destinations and per-span fallback status passed");
+}
+
 static enum kernel_block_status completion;
 static unsigned calls;
 
@@ -149,5 +196,6 @@ int main(void)
     }
     puts("block flush capability and error tests passed");
     test_write_batch();
+    test_read_batch();
     puts("block batch preflight, ordered fallback and callback error tests passed");
 }

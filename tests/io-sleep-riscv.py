@@ -95,6 +95,8 @@ try:
     held = []
     progress = False
     released = False
+    read_held = []
+    read_pending = read_released = read_verified = False
     phase = "cold"
     queued = []
     queue_verified = False
@@ -131,6 +133,18 @@ try:
                 elif label == 'guest' and line == b'I/O handshake: queue':
                     phase = 'queue'
                     server.stdin.write(b'hold\n')
+                elif label == 'guest' and line == b'I/O handshake: read-batch':
+                    phase = 'read-batch'
+                    batch_deadline = time.monotonic() + 15
+                    server.stdin.write(b'hold\n')
+                elif label == 'guest' and line == b'I/O handshake: read-batch-pending':
+                    assert phase == 'read-batch'
+                    read_pending = True
+                elif label == 'guest' and line == b'I/O handshake: read-batch-held':
+                    assert read_released and len(read_held) == 8
+                    server.stdin.write(f'release {read_held[0]}\ndrain\n'.encode())
+                    read_verified = True
+                    batch_deadline = None
                 elif label == 'guest' and line == b'I/O handshake: timeout':
                     phase = 'timeout'
                     batch_deadline = None
@@ -175,6 +189,11 @@ try:
                         held.append(identity)
                     elif phase == 'timeout':
                         timeout_held.append(identity)
+                    elif phase == 'read-batch':
+                        command = int(line.split()[1].split(b'=')[1])
+                        assert command == 0
+                        read_held.append(identity)
+                        assert len(read_held) <= 8
                     elif phase.startswith('batch'):
                         command = int(line.split()[1].split(b'=')[1])
                         expected_writes = 10 if phase == 'batch-partial' else 8
@@ -219,6 +238,11 @@ try:
                 if len(held) >= 2 and progress and not released:
                     server.stdin.write(f'release {held[1]}\ndrain\n'.encode())
                     released = True
+                if phase == 'read-batch' and len(read_held) == 8 and read_pending and not read_released:
+                    # 七个反序完成后仍暂扣一个，guest确认其请求owner尚未归还。
+                    for held_id in reversed(read_held[1:]):
+                        server.stdin.write(f'release {held_id}\n'.encode())
+                    read_released = True
                 if phase in ('batch', 'batch-partial') and batch_pending:
                     if phase == 'batch-partial' and args.write_through:
                         # Without NBD FUA, WRITE replies still require backend
@@ -242,11 +266,12 @@ try:
     guest.wait(timeout=5)
     server.wait(timeout=5)
     success = (guest.returncode == 0 and server.returncode == 0 and released and queue_verified and reset_seen and
-               batch_verified == {'batch', 'batch-partial', 'batch-error'} and
+               batch_verified == {'batch', 'batch-partial', 'batch-error'} and read_verified and
                b'BoarOS: I/O sleep tests passed' in logs['guest'] and
                b'I/O socket reservation passed: owner, HUP, timeout, signal and fault' in logs['guest'] and
                b'I/O pipe copy sleep passed: two writers, complete content and cleanup' in logs['guest'] and
                b'I/O TCP copy sleep passed: reservation, close/reuse, shutdown and fault rollback' in logs['guest'] and
+               b'I/O batch read passed: eight in flight, reversed prefix, held DMA and cancellation owner' in logs['guest'] and
                b'I/O sleep failed:' not in logs['guest'])
     if success and args.cost_output:
         snapshots=[]; current=None; body=[]
@@ -265,7 +290,7 @@ try:
         args.cost_output.write_text(json.dumps({**input_record,'snapshots':snapshots},indent=2)+'\n')
     if not success:
         raise RuntimeError(logs['guest'][-4000:].decode(errors='replace'))
-    print(f'BoarOS: I/O sleep tests passed ({args.transport}, {'writethrough' if args.write_through else 'writeback'}); two cold reads held, CPU/cache progressed, eight-span batch and partial-slot refill and error drain and FLUSH barrier and timeout/reset verified')
+    print(f'BoarOS: I/O sleep tests passed ({args.transport}, {'writethrough' if args.write_through else 'writeback'}); two cold reads held, CPU/cache progressed, eight-span read/write batches and held read DMA and partial-slot refill and error drain and FLUSH barrier and timeout/reset verified')
 finally:
     for process in processes:
         if process.poll() is None:
