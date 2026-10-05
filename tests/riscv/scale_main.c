@@ -221,6 +221,20 @@ static void cache_range_cost(struct kernel_vfs_mount *mount, struct kernel_page_
         check(kernel_vfs_pread(&file, (uint64_t)i * 4096, output, 4096, &count) == 0 && count == 4096, 282);
         for (unsigned j = 0; j < 4096; j++) check(output[j] == (j == 37 ? value : 0), 283);
     }
+    /* 连续全脏范围按候选窗口交接；独立 wrapper 验证未退回逐页入口。 */
+    memset(bytes, 0x49, sizeof(bytes));
+    for (unsigned i = 32; i < 40; i++)
+        check(kernel_vfs_pwrite(&file, (uint64_t)i * 4096, bytes, sizeof(bytes), &count) == 0 && count == sizeof(bytes), 284);
+    cache_reads = cache_writes = 0; cache_io_probe = 1;
+    check(kernel_page_cache_writeback_range(cache, kernel_vfs_file_node(&file), 32 * 4096, 40 * 4096) == 0, 285);
+    cache_io_probe = 0;
+    check(!cache_reads && cache_writes == 8 / BOAROS_PAGE_CACHE_WRITEBACK_PAGES, 286);
+    number("cache contiguous writeback calls: ", cache_writes);
+    check(kernel_vfs_sync(&file, 1, &observed) == 0 &&
+          kernel_page_cache_invalidate_node(cache, kernel_vfs_file_node(&file)) == KERNEL_PAGE_CACHE_STATUS_OK, 287);
+    for (unsigned i = 32; i < 40; i++)
+        check(kernel_vfs_pread(&file, (uint64_t)i * 4096, output, sizeof(output), &count) == 0 &&
+              count == sizeof(output) && !memcmp(bytes, output, sizeof(bytes)), 288);
     check(kernel_vfs_unlink(mount, "/cache-cost") == 0 && kernel_vfs_close(&file) == 0, 273);
     number("cache retained pages tested: ", pages);
 }

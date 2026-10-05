@@ -4,6 +4,14 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#ifndef BOAROS_PAGE_CACHE_WRITEBACK_PAGES
+#define BOAROS_PAGE_CACHE_WRITEBACK_PAGES 1
+#endif
+#if BOAROS_PAGE_CACHE_WRITEBACK_PAGES != 1 && BOAROS_PAGE_CACHE_WRITEBACK_PAGES != 2 && \
+    BOAROS_PAGE_CACHE_WRITEBACK_PAGES != 4 && BOAROS_PAGE_CACHE_WRITEBACK_PAGES != 8
+#error "BOAROS_PAGE_CACHE_WRITEBACK_PAGES must be 1, 2, 4, or 8"
+#endif
+
 struct kernel_heap;
 struct kernel_page_cache_record;
 struct kernel_page_cache_entry;

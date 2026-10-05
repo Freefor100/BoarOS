@@ -1794,3 +1794,7 @@ test-cache-growth-riscv:
 	$(MAKE) COST_DIAGNOSTICS=1 test-scale-riscv
 
 $(BUILD_DIR)/tests/riscv/scale_main.o: CPPFLAGS += $(LWIP_CPPFLAGS)
+
+.PHONY: test-writeback-batch-riscv
+test-writeback-batch-riscv:
+	python3 -B tests/writeback-batch-riscv.py

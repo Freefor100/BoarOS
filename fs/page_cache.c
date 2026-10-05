@@ -76,6 +76,7 @@ struct kernel_page_cache_record {
     uint64_t requested;
     int started, stopping;
     int snapshot_busy;
+    uint32_t snapshot_order;
 
 };
 
@@ -966,6 +967,113 @@ static int writeback_entry(struct kernel_page_cache *cache,
     return result;
 }
 
+static uint32_t writeback_order(size_t count)
+{
+    uint32_t order = 0;
+    while (((size_t)1 << order) < count) order++;
+    return order;
+}
+
+/* 同一 inode 锁下只合并相接的脏字节；相邻页中的干净间隙不进入快照。 */
+static int writeback_adjacent(const struct kernel_page_cache_entry *left,
+    const struct kernel_page_cache_entry *right, uint64_t limit)
+{
+    uint64_t start = right->page_index << BOAROS_PAGE_SHIFT;
+    return left->node == right->node && left->cache == right->cache &&
+        right->page_index == left->page_index + 1 &&
+        left->dirty_end == BOAROS_PAGE_SIZE && right->dirty_begin == 0 &&
+        right->dirty_end && !right->loading && !right->writeback && limit > start;
+}
+
+/* Caller owns an inode read lock and pins every candidate across waits.
+ * Only *used entries were submitted; a snapshot OOM falls back before I/O. */
+static int writeback_run(struct kernel_page_cache *cache,
+    struct kernel_page_cache_entry **entries, size_t count, uint64_t limit, size_t *used)
+{
+    *used = 1;
+    if (!count || count > BOAROS_PAGE_CACHE_WRITEBACK_PAGES) __builtin_trap();
+    if (count == 1 || entries[0]->writeback || entries[0]->loading || !entries[0]->dirty_end)
+        return writeback_entry(cache, entries[0], limit);
+    struct {
+        size_t begin, end;
+        uint64_t generation;
+    } saved[BOAROS_PAGE_CACHE_WRITEBACK_PAGES];
+    struct kernel_page_cache_record *record = cache->record;
+    uint64_t snapshot_address;
+    uint32_t order = writeback_order(count);
+    int reserved = kernel_io_context_current()->background_reclaim &&
+        record->started && !record->snapshot_busy && order <= record->snapshot_order;
+    if (reserved) {
+        record->snapshot_busy = 1;
+        snapshot_address = record->snapshot_address;
+    } else {
+        enum physical_page_status status = physical_page_allocate_order(cache->allocator, order, &snapshot_address);
+        if (status != PHYSICAL_PAGE_STATUS_OK) {
+            if (status != PHYSICAL_PAGE_STATUS_EMPTY) __builtin_trap();
+            return writeback_entry(cache, entries[0], limit);
+        }
+    }
+    void *snapshot;
+    if (physical_page_resolve(cache->allocator, snapshot_address, &snapshot) != PHYSICAL_PAGE_STATUS_OK) __builtin_trap();
+    uintptr_t irq = riscv_interrupt_save();
+    /* 分配可触发回收；重新检查成员，不能把已完成的页误当成本次 owner。 */
+    size_t ready = 1;
+    if (entries[0]->writeback || entries[0]->loading || !entries[0]->dirty_end ||
+        !kernel_vfs_node_writeback_allowed(entries[0]->node)) ready = 0;
+    while (ready && ready < count && writeback_adjacent(entries[ready - 1], entries[ready], limit)) ready++;
+    if (ready < 2) {
+        riscv_interrupt_restore(irq);
+        if (reserved) record->snapshot_busy = 0;
+        else if (physical_page_release_order(cache->allocator, snapshot_address, order) != PHYSICAL_PAGE_STATUS_OK) __builtin_trap();
+        return writeback_entry(cache, entries[0], limit);
+    }
+    count = ready;
+    uint64_t offset = (entries[0]->page_index << BOAROS_PAGE_SHIFT) + entries[0]->dirty_begin;
+    size_t size = 0;
+    for (size_t i = 0; i < count; i++) {
+        struct kernel_page_cache_entry *entry = entries[i];
+        uint64_t start = entry->page_index << BOAROS_PAGE_SHIFT;
+        void *page;
+        entry->writeback = 1; record->writeback_active++;
+        if (physical_page_acquire(cache->allocator, entry->physical_address) != PHYSICAL_PAGE_STATUS_OK ||
+            physical_page_resolve(cache->allocator, entry->physical_address, &page) != PHYSICAL_PAGE_STATUS_OK) __builtin_trap();
+        for (struct kernel_page_cache_alias *alias = entry->aliases; alias; alias = alias->next)
+            alias->rearm(alias->owner, alias->virtual_address);
+        saved[i].begin = entry->dirty_begin;
+        saved[i].end = entry->dirty_end;
+        if (saved[i].end > limit - start) saved[i].end = (size_t)(limit - start);
+        saved[i].generation = entry->generation;
+        size_t length = saved[i].end - saved[i].begin;
+        COST_ADD(SNAPSHOT_COPY, length);
+        memcpy((unsigned char *)snapshot + size, (unsigned char *)page + saved[i].begin, length);
+        size += length;
+    }
+    COST_ADD(WRITEBACK_REQUESTED, size);
+    riscv_interrupt_restore(irq);
+    size_t written = 0;
+    int result = kernel_vfs_node_writeback(entries[0]->node, offset, snapshot, size, &written);
+    COST_ADD(WRITEBACK_ACCEPTED, written);
+    if (written > size) __builtin_trap();
+    if (!result && written != size) result = -KERNEL_EIO;
+    irq = riscv_interrupt_save();
+    for (size_t i = 0; i < count; i++) {
+        struct kernel_page_cache_entry *entry = entries[i];
+        if (!result && saved[i].generation == entry->generation) {
+            if (saved[i].end == entry->dirty_end) dirty_clear(entry);
+            else entry->dirty_begin = saved[i].end;
+        }
+        if (physical_page_release(cache->allocator, entry->physical_address) != PHYSICAL_PAGE_STATUS_OK) __builtin_trap();
+        entry->writeback_error = result;
+        entry->writeback = 0; record->writeback_active--;
+        if (entry->ready.head) (void)kernel_wait_queue_wake_all(&entry->ready);
+    }
+    if (reserved) record->snapshot_busy = 0;
+    else if (physical_page_release_order(cache->allocator, snapshot_address, order) != PHYSICAL_PAGE_STATUS_OK) __builtin_trap();
+    riscv_interrupt_restore(irq);
+    *used = count;
+    return result;
+}
+
 static int page_offset_compare(const void *left, const void *right)
 {
     const struct kernel_page_cache_entry *a = *(struct kernel_page_cache_entry *const *)left;
@@ -1019,7 +1127,13 @@ int kernel_page_cache_writeback_range(struct kernel_page_cache *cache,
     /* 在首次I/O等待前固定选中集合；排序不再沿可被别的读者扩展的inode链。 */
     qsort(selected, count, sizeof(*selected), page_offset_compare);
     int result = 0;
-    for (size_t i = 0; i < count && !result; i++) result = writeback_entry(cache, selected[i], end);
+    for (size_t i = 0; i < count && !result; ) {
+        size_t batch = 1, used;
+        while (batch < BOAROS_PAGE_CACHE_WRITEBACK_PAGES && i + batch < count &&
+               writeback_adjacent(selected[i + batch - 1], selected[i + batch], end)) batch++;
+        result = writeback_run(cache, &selected[i], batch, end, &used);
+        i += used;
+    }
     for (size_t i = 0; i < count; i++)
         if (physical_page_release(cache->allocator, selected[i]->physical_address) != PHYSICAL_PAGE_STATUS_OK) __builtin_trap();
     (void)kernel_heap_release(cache->heap, selected);
@@ -1242,25 +1356,45 @@ static void page_cache_worker(void *argument)
                         (pressure && physical_page_available(cache->allocator) >= r->high)) break;
                     KERNEL_LOCK_SCOPE(guard);
                     if (!kernel_vfs_node_try_read(e->node, &guard)) continue;
-                    /* 持 inode 引用锁跨等待；选中页的 owner 不交给 IRQ。 */
-                    e->users++;
-                    int result = writeback_entry(cache, e, UINT64_MAX);
-                    e->users--;
-                    if (result) {
-                        r->statistics.worker_failed++;
-                        if (result != -KERNEL_ENOMEM && result != -KERNEL_EBUSY)
-                            kernel_vfs_record_writeback_error(e->node, result);
-                    } else {
-                        r->statistics.worker_written++;
-                        uint32_t refs;
-                        if (pressure && !e->dirty_end && !e->aliases &&
-                            physical_page_reference_count(cache->allocator, e->physical_address, &refs)
-                                == PHYSICAL_PAGE_STATUS_OK && refs == 1) {
-                            remove_entry(cache, e);
-                            kernel_lock_release(&guard);
-                            (void)drain_entries(cache, &released);
-                            group_progress(r->group);
+                    struct kernel_page_cache_entry *batch[BOAROS_PAGE_CACHE_WRITEBACK_PAGES];
+                    size_t count = 1, used;
+                    batch[0] = e;
+                    while (count < ((size_t)1 << r->snapshot_order) && scanned < 64) {
+                        scanned++; r->statistics.worker_scanned++;
+                        int found;
+                        size_t bucket = find_bucket(r, e->node, e->page_index + count, &found);
+                        if (!found) break;
+                        struct kernel_page_cache_entry *next = r->buckets[bucket];
+                        if (next->worker_epoch == epoch || next->users ||
+                            !writeback_adjacent(batch[count - 1], next, UINT64_MAX)) break;
+                        batch[count++] = next;
+                    }
+                    /* 所有候选在首次等待前固定；回退未提交的成员留给后续轮次。 */
+                    for (size_t i = 0; i < count; i++) batch[i]->users++;
+                    int result = writeback_run(cache, batch, count, UINT64_MAX, &used);
+                    int removed = 0;
+                    for (size_t i = 0; i < count; i++) {
+                        e = batch[i]; e->users--;
+                        if (i >= used) continue;
+                        e->worker_epoch = epoch;
+                        if (result) {
+                            r->statistics.worker_failed++;
+                            if (result != -KERNEL_ENOMEM && result != -KERNEL_EBUSY)
+                                kernel_vfs_record_writeback_error(e->node, result);
+                        } else {
+                            r->statistics.worker_written++;
+                            uint32_t refs;
+                            if (pressure && !e->dirty_end && !e->aliases &&
+                                physical_page_reference_count(cache->allocator, e->physical_address, &refs)
+                                    == PHYSICAL_PAGE_STATUS_OK && refs == 1) {
+                                remove_entry(cache, e); removed = 1;
+                            }
                         }
+                    }
+                    if (removed) {
+                        kernel_lock_release(&guard);
+                        (void)drain_entries(cache, &released);
+                        group_progress(r->group);
                     }
                 }
                 r->statistics.worker_batches++;
@@ -1286,8 +1420,16 @@ int kernel_page_cache_start_worker(struct kernel_page_cache *cache)
 {
     if (!cache_live(cache) || cache->record->started) return -KERNEL_EINVAL;
     struct kernel_page_cache_record *r = cache->record;
-    if (physical_page_allocate(cache->allocator, &r->snapshot_address) != PHYSICAL_PAGE_STATUS_OK)
-        return -KERNEL_ENOMEM;
+    r->snapshot_order = writeback_order(BOAROS_PAGE_CACHE_WRITEBACK_PAGES);
+    for (;;) {
+        enum physical_page_status status = r->snapshot_order
+            ? physical_page_allocate_order(cache->allocator, r->snapshot_order, &r->snapshot_address)
+            : physical_page_allocate(cache->allocator, &r->snapshot_address);
+        if (status == PHYSICAL_PAGE_STATUS_OK) break;
+        if (status != PHYSICAL_PAGE_STATUS_EMPTY) __builtin_trap();
+        if (!r->snapshot_order) return -KERNEL_ENOMEM;
+        r->snapshot_order--;
+    }
     uint64_t total = physical_page_total(cache->allocator);
     r->low = total / 50 ? total / 50 : 1;
     r->high = total / 25 > r->low ? total / 25 : r->low + 1;
@@ -1298,7 +1440,7 @@ int kernel_page_cache_start_worker(struct kernel_page_cache *cache)
     kernel_wait_queue_init(&r->progress);
     enum kernel_scheduler_status result = kernel_thread_create_joinable(page_cache_worker, cache, &r->worker);
     if (result != KERNEL_SCHEDULER_STATUS_OK) {
-        (void)physical_page_release(cache->allocator, r->snapshot_address);
+        if (physical_page_release_order(cache->allocator, r->snapshot_address, r->snapshot_order) != PHYSICAL_PAGE_STATUS_OK) __builtin_trap();
         return result == KERNEL_SCHEDULER_STATUS_NO_MEMORY ? -KERNEL_ENOMEM : -KERNEL_EINVAL;
     }
     r->started = 1;
@@ -1315,7 +1457,7 @@ void kernel_page_cache_stop_worker(struct kernel_page_cache *cache)
     (void)kernel_wait_queue_wake_all(&r->work);
     (void)kernel_wait_queue_wake_all(&r->progress);
     kernel_thread_join(&r->worker);
-    (void)physical_page_release(cache->allocator, r->snapshot_address);
+    if (physical_page_release_order(cache->allocator, r->snapshot_address, r->snapshot_order) != PHYSICAL_PAGE_STATUS_OK) __builtin_trap();
     r->started = 0;
     riscv_interrupt_restore(irq);
 }
