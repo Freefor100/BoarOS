@@ -83,8 +83,9 @@ static err_t link_output(struct netif *interface, struct pbuf *p)
         }
     }
     int result = riscv_virtio_mmio_net_send_copy(&n->device, p->tot_len, copy_pbuf, p);
-    return result >= 0 ? ERR_OK : result == -KERNEL_EAGAIN ? ERR_MEM :
-        result == -KERNEL_EMSGSIZE ? ERR_BUF : ERR_IF;
+    /* 复制回退耗尽的仍是 NIC 槽；只等协议池归还会漏掉真实 TX 完成。 */
+    if (result == -KERNEL_EAGAIN) { kernel_socket_network_blocked(); return ERR_MEM; }
+    return result >= 0 ? ERR_OK : result == -KERNEL_EMSGSIZE ? ERR_BUF : ERR_IF;
 }
 static err_t interface_init(struct netif *interface)
 {

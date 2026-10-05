@@ -58,3 +58,8 @@ glibc 2.44 作为外部测试输入使用：官方源码归档保存在被忽略
   索引引用，先重算脏块 checksum，再归还引用。原路径直接 `ext4_block_set` 清掉块号，
   后续查找会返回 EUCLEAN；1/4 KiB 的真实深层树、跨进程重启与最终截零由
   `make test-lwext4-deep-truncate-host` 保护，未改变日志版本或持久化屏障。
+
+- lwIP TIME_WAIT 释放边界增加可选 `LWIP_HOOK_TCP_TIMEWAIT_FREE`：主动池回收在
+  remove 将状态改为 CLOSED 之前通知；slow timer 在摘链后、free 前通知。BoarOS
+  端口只清除仍匹配的 socket 借用与回调，不重入 raw API 或改变协议计时，避免把
+  PCB 生命周期交给受预算限制的普通工作队列。仍固定 2.2.1，验证见网络模块。

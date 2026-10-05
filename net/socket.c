@@ -314,11 +314,12 @@ static void wake_socket(struct kernel_socket *socket)
 
 static void retire_timewait(struct kernel_socket *socket)
 {
-    /* 输入通知只排队；raw输入返回后才检查最终状态，避免保留协议将释放的PCB。 */
-    if (!socket->tcp || socket->listening || socket->tcp->state != TIME_WAIT) return;
-    tcp_arg(socket->tcp, 0); tcp_err(socket->tcp, 0);
-    tcp_recv(socket->tcp, 0); tcp_sent(socket->tcp, 0); tcp_poll(socket->tcp, 0, 0);
-    socket->tcp->connected = 0;
+    struct tcp_pcb *pcb = socket->tcp;
+    if (!pcb || socket->listening || pcb->state != TIME_WAIT) return;
+    /* 释放 hook 也走这里：只清借用与回调，不重入 raw API 或销毁堆 owner。 */
+    pcb->callback_arg = 0; pcb->errf = 0;
+    pcb->recv = 0; pcb->sent = 0; pcb->poll = 0; pcb->pollinterval = 0;
+    pcb->connected = 0;
     socket->tcp = 0; socket->peer_closed = 1; socket->receive_retry = 0;
     work_remove(&pool_wait, socket); work_remove(&nic_wait, socket); work_remove(&receive_wait, socket);
     write_retry_disarm(socket); wake_socket(socket);
@@ -542,6 +543,16 @@ static void tcp_failed(void *context, err_t error)
     socket->connected = 0U;
     socket->peer_closed = 1U;
     wake_socket(socket);
+}
+
+static void protocol_timewait_free(struct tcp_pcb *pcb)
+{
+    /* raw 的 opaque 参数不一定是 socket；本层回调配对会在 destroy 前清除。 */
+    if (!pcb->callback_arg || pcb->errf != tcp_failed) return;
+    struct kernel_socket *socket = pcb->callback_arg;
+    if (pcb->state != TIME_WAIT || socket->tcp != pcb || socket->destroying || socket->listening)
+        __builtin_trap();
+    retire_timewait(socket);
 }
 
 static err_t socket_tcp_accepted(void *context, struct tcp_pcb *pcb,
@@ -1903,7 +1914,10 @@ int kernel_socket_set_loopback_flags(const char name[16], uint16_t flags)
 void kernel_socket_network_initialize(void)
 {
     if (!socket_initialized) {
-        const struct boaros_lwip_hooks hooks = {protocol_input, protocol_work_ready, protocol_capacity};
+        const struct boaros_lwip_hooks hooks = {
+            .input = protocol_input, .work = protocol_work_ready, .capacity = protocol_capacity,
+            .timewait_free = protocol_timewait_free
+        };
         boaros_lwip_set_hooks(&hooks);
         lwip_init(); socket_initialized = 1;
     }
