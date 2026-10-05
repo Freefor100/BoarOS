@@ -521,6 +521,15 @@ static enum riscv_sv39_status build_kernel_page_table(
         }
     }
 
+    /* 空栈窗口必须在任何 mm 复制 root 项之前建立。 */
+    status = riscv_sv39_kernel_window_reserve(
+        &kernel_page_table,
+        RISCV_KERNEL_STACK_WINDOW_BASE,
+        RISCV_KERNEL_STACK_WINDOW_SIZE);
+    if (status != RISCV_SV39_STATUS_OK) {
+        return status;
+    }
+
     return RISCV_SV39_STATUS_OK;
 }
 

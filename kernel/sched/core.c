@@ -1,6 +1,7 @@
 #include <arch/riscv/context.h>
 #include <arch/riscv/direct_map.h>
 #include <arch/riscv/fpu.h>
+#include <arch/riscv/memory_layout.h>
 #include <arch/riscv/mm.h>
 #include <arch/riscv/sv39.h>
 #include <arch/riscv/thread.h>
@@ -406,6 +407,50 @@ enum kernel_scheduler_status release_after_create_failure(
     return original_status;
 }
 
+/*
+ * 内核栈窗口槽位：未映射 guard 页后接 KERNEL_STACK_BYTES。窗口骨架在
+ * 页表构建期预留，只有生产内核激活它；无页表的 fixture 回退直接映射。
+ */
+_Static_assert(KERNEL_STACK_BYTES + BOAROS_PAGE_SIZE ==
+                   RISCV_KERNEL_STACK_SLOT_SIZE,
+               "kernel stack window slot is one guard page plus the stack");
+#define KERNEL_STACK_SLOT_COUNT \
+    ((uint32_t)(RISCV_KERNEL_STACK_WINDOW_SIZE / RISCV_KERNEL_STACK_SLOT_SIZE))
+#define KERNEL_STACK_SLOT_WORDS ((KERNEL_STACK_SLOT_COUNT + 63U) / 64U)
+static uint64_t kernel_stack_slot_bitmap[KERNEL_STACK_SLOT_WORDS];
+
+static int kernel_stack_slot_acquire(uint64_t *window_address)
+{
+    for (uint32_t word = 0U; word < KERNEL_STACK_SLOT_WORDS; word++) {
+        uint64_t free_bits = ~kernel_stack_slot_bitmap[word];
+        uint32_t bit = 0U;
+
+        if (free_bits == 0U) continue;
+        while ((free_bits & (UINT64_C(1) << bit)) == 0U) bit++;
+        if (word * 64U + bit >= KERNEL_STACK_SLOT_COUNT) return -1;
+        kernel_stack_slot_bitmap[word] |= UINT64_C(1) << bit;
+        *window_address = RISCV_KERNEL_STACK_WINDOW_BASE +
+                          (uint64_t)(word * 64U + bit) *
+                              RISCV_KERNEL_STACK_SLOT_SIZE;
+        return 0;
+    }
+    return -1;
+}
+
+static void kernel_stack_slot_release(uint64_t window_address)
+{
+    uint32_t index = (uint32_t)((window_address -
+                                 RISCV_KERNEL_STACK_WINDOW_BASE) /
+                                RISCV_KERNEL_STACK_SLOT_SIZE);
+    kernel_stack_slot_bitmap[index / 64U] &= ~(UINT64_C(1) << (index % 64U));
+}
+
+static void kernel_stack_slots_reset(void)
+{
+    for (uint32_t word = 0U; word < KERNEL_STACK_SLOT_WORDS; word++)
+        kernel_stack_slot_bitmap[word] = 0U;
+}
+
 /* Allocate the metadata and execution stack before publishing any owner. */
 enum kernel_scheduler_status allocate_task_storage(struct kernel_task **task)
 {
@@ -446,8 +491,47 @@ enum kernel_scheduler_status allocate_task_storage(struct kernel_task **task)
     }
     memset(stack, KERNEL_STACK_FILL, KERNEL_STACK_BYTES);
     thread->stack_physical_address = stack_address;
-    thread->stack_low = (uintptr_t)stack + KERNEL_STACK_GUARD_BYTES;
-    thread->stack_high = (uintptr_t)stack + KERNEL_STACK_BYTES;
+    if (riscv_sv39_kernel_window_active()) {
+        uint64_t window;
+        uint64_t stack_va;
+        enum riscv_sv39_status map_status;
+
+        if (kernel_stack_slot_acquire(&window) != 0) {
+            (void)physical_page_release_order(scheduler.allocator,
+                                              stack_address,
+                                              KERNEL_STACK_ORDER);
+            return release_after_create_failure(
+                metadata_address, KERNEL_SCHEDULER_STATUS_NO_MEMORY);
+        }
+        stack_va = window + BOAROS_PAGE_SIZE;
+        map_status = riscv_sv39_kernel_window_map(scheduler.allocator,
+                                                  stack_va, stack_address);
+        if (map_status == RISCV_SV39_STATUS_OK) {
+            map_status = riscv_sv39_kernel_window_map(
+                scheduler.allocator, stack_va + BOAROS_PAGE_SIZE,
+                stack_address + BOAROS_PAGE_SIZE);
+        }
+        if (map_status != RISCV_SV39_STATUS_OK) {
+            (void)riscv_sv39_kernel_window_unmap(scheduler.allocator,
+                                                 stack_va);
+            (void)riscv_sv39_kernel_window_unmap(
+                scheduler.allocator, stack_va + BOAROS_PAGE_SIZE);
+            kernel_stack_slot_release(window);
+            (void)physical_page_release_order(scheduler.allocator,
+                                              stack_address,
+                                              KERNEL_STACK_ORDER);
+            return release_after_create_failure(
+                metadata_address,
+                map_status == RISCV_SV39_STATUS_NO_MEMORY
+                    ? KERNEL_SCHEDULER_STATUS_NO_MEMORY
+                    : KERNEL_SCHEDULER_STATUS_INVALID_STATE);
+        }
+        thread->stack_low = (uintptr_t)(stack_va + KERNEL_STACK_GUARD_BYTES);
+        thread->stack_high = (uintptr_t)(stack_va + KERNEL_STACK_BYTES);
+    } else {
+        thread->stack_low = (uintptr_t)stack + KERNEL_STACK_GUARD_BYTES;
+        thread->stack_high = (uintptr_t)stack + KERNEL_STACK_BYTES;
+    }
     thread->arch.kernel_sp = thread->stack_high;
     *(uint64_t *)(thread->stack_low - sizeof(uint64_t)) = KERNEL_STACK_CANARY;
     *task = thread;
@@ -490,6 +574,15 @@ enum kernel_scheduler_status release_task_stack(struct kernel_task *thread)
         scheduler.stack_statistics.minimum_free_bytes = free_bytes;
     if (used_bytes > scheduler.stack_statistics.maximum_used_bytes)
         scheduler.stack_statistics.maximum_used_bytes = used_bytes;
+    if (riscv_sv39_kernel_window_active()) {
+        uint64_t window = (uint64_t)thread->stack_low -
+                          KERNEL_STACK_GUARD_BYTES - BOAROS_PAGE_SIZE;
+        (void)riscv_sv39_kernel_window_unmap(scheduler.allocator,
+                                             window + BOAROS_PAGE_SIZE);
+        (void)riscv_sv39_kernel_window_unmap(
+            scheduler.allocator, window + BOAROS_PAGE_SIZE * 2U);
+        kernel_stack_slot_release(window);
+    }
     (void)physical_page_release_order(scheduler.allocator,
                                       thread->stack_physical_address,
                                       KERNEL_STACK_ORDER);
@@ -607,6 +700,7 @@ enum kernel_scheduler_status kernel_scheduler_init(
     scheduler.blocked_tail = 0;
     scheduler.deadline_root = 0;
     scheduler.armed_deadline = 0;
+    kernel_stack_slots_reset();
     scheduler.stopped_head = 0;
     scheduler.stopped_tail = 0;
     scheduler.init_task = 0;
