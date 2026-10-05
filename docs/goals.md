@@ -33,8 +33,21 @@ N3已经交付：legacy/modern VirtIO-net、受限DMA借用与复制回退、静
 空路径stat的Linux边界、免路径缓冲及全局sync/syncfs已接入；通用VFS快照保护
 挂载与节点，复用写回和durable等待，独立维护挂载错误观察；相关系统回归已验收。
 这不代表连续I/O或TCP瓶颈已经消失，也不以某个分数作为其他应用开发的前置条件。
-下一应用候选是**PTY＋原BusyBox script**，范围待确认。完整凭据/权限、运行时网络
-配置和无RNG平台的可信熵接入由目标应用确定交付范围；LoongArch是独立交付依赖，SMP单独规划。
+本轮主线是 **Unix98 PTY、devpts 与原 BusyBox script/scriptreplay**，按以下边界推进。
+阶段状态只在对应机制与真实应用验收后更新；逐次 transcript、成绩和机器快照留在忽略的 build。
+
+| 阶段 | 当前交付任务 |
+|---|---|
+| P1 设备与 TTY 接缝 | 已实现并聚焦验收：pin 下的打开上下文、动态身份、非阻塞接收及生命周期通知；原串口继续工作 |
+| P2 devpts 与配对 | 核心已验收：独立挂载/编号空间、稳定节点、锁定/peer、双向传输、worker 与可信栈回收 |
+| P3 packet 模式 | 核心已验收：前缀、控制事件/优先就绪、EXTPROC 与 fault/readv/关闭；真实 libc 所需的 termios2 已接入 PTY/串口 |
+| P4 原应用 | 原 script/replay、真实 libc PTY API、作业控制、多终端进展和集中系统验收 |
+
+资源按需分配：默认全局 64 对、每挂载 max=32；两方向各 4 KiB 传输 FIFO，worker
+每对每方向最多推进 256 字节。关闭 master 后旧节点与旧 OFD 不能进入复用编号的新配对。
+不设置吞吐倍数或评分门槛，不扩大 I/O、TCP、调度或凭据改造。
+完整凭据/权限、运行时网络配置和无 RNG 平台的可信熵接入由目标应用确定交付范围；
+LoongArch 是独立交付依赖，SMP 单独规划。
 
 ## 按证据触发的性能候选
 

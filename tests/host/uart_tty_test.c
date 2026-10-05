@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <string.h>
 #define BOAROS_ARCH_RISCV_CONTEXT_H
 static uintptr_t riscv_interrupt_save(void) { return 0; }
 static void riscv_interrupt_restore(uintptr_t saved) { (void)saved; }
@@ -12,6 +13,8 @@ static void riscv_interrupt_restore(uintptr_t saved) { (void)saved; }
 #include <kernel/scheduler.h>
 #include <kernel/errno.h>
 static uint8_t regs[8], input[4096], errors[4096], output[8192];
+static uint8_t dll, dlh;
+static unsigned register_writes;
 static unsigned input_r,input_w,output_w,lsr_reads;
 static void (*irq_handler)(void *), (*worker_entry)(void *);
 static void *irq_owner,*worker_owner;
@@ -29,10 +32,14 @@ static uint8_t hardware_read(unsigned offset) {
     if (offset==2) return input_r<input_w && (regs[1]&1) ? ((errors[input_r] && (regs[1]&4)) ? 6 : 4) : ((regs[1]&2)&&thre ? 2 : 1);
     if (offset==5) { lsr_reads++; return (thre?32:0)|(temt?64:0)|(input_r<input_w?1|errors[input_r]:0); }
     if (offset==0 && !(regs[3]&128)) return input[input_r++];
+    if (regs[3]&128) { if(offset==0)return dll;if(offset==1)return dlh; }
     return regs[offset];
 }
 static void hardware_write(unsigned offset,uint8_t value) {
+    register_writes++;
     if (offset==0 && !(regs[3]&128)) { output[output_w++]=value; temt=0;if(drop_thre)thre=0; }
+    else if((regs[3]&128)&&offset==0)dll=value;
+    else if((regs[3]&128)&&offset==1)dlh=value;
     else regs[offset]=value;
 }
 #define UART_READ(port,offset) ((void)(port),hardware_read(offset))
@@ -80,6 +87,53 @@ int kernel_tty_output_pending(struct kernel_tty *tty) { (void)tty;return tty_pen
 void kernel_tty_transport_ready(struct kernel_tty *tty) { (void)tty;ready_count++; }
 static void service(void) { if(setjmp(blocked)==0)worker_entry(worker_owner); }
 static void enqueue(unsigned count) { for(unsigned i=0;i<count;i++){input[input_w]=(uint8_t)input_w;errors[input_w]=(input_w%13==0)?0x1e:0;input_w++;} }
+static void termios2_contract(void)
+{
+    assert(test_transport->configure2);
+    struct kernel_tty_termios2 settings={.basic={.cflag=0x10b2U},.ispeed=115200,.ospeed=115200};
+    assert(!test_transport->configure2(transport_owner,&settings));
+    assert(dll==2&&dlh==0&&regs[3]==3&&regs[4]==3&&(regs[1]&5)==5);
+    assert(settings.ispeed==115200&&settings.ospeed==115200&&(settings.basic.cflag&0x100fU)==0x1002U);
+    settings=(struct kernel_tty_termios2){.basic={.cflag=0x1080U},.ispeed=12345,.ospeed=12345};
+    assert(!test_transport->configure2(transport_owner,&settings));
+    assert(dll==19&&dlh==0&&regs[3]==0&&regs[4]==3);
+    /* 名义ABI速度和16倍采样的实际divisor量化是两个独立证据。 */
+    assert(settings.ispeed==settings.ospeed&&settings.ospeed==12345&&(settings.basic.cflag&0x100fU)==0x1000U);
+    settings=(struct kernel_tty_termios2){.basic={.cflag=0xc00011f0U},.ispeed=23000,.ospeed=23000};
+    assert(!test_transport->configure2(transport_owner,&settings));
+    assert(dll==10&&dlh==0&&regs[3]==31&&regs[4]==3&&(regs[1]&5)==5);
+    assert(!(settings.basic.cflag&0xc0000000U)&&settings.ispeed==23000&&settings.ospeed==23000);
+    settings=(struct kernel_tty_termios2){.basic={.cflag=0x100010b0U},.ispeed=9700,.ospeed=9700};
+    assert(!test_transport->configure2(transport_owner,&settings));
+    assert(dll==24&&settings.ispeed==9700&&settings.ospeed==9700);
+    assert((settings.basic.cflag&0x100f100fU)==0x10001000U);
+    /* 高位输入速度是显式请求，但硬件只有一条共享的波特率线路。 */
+    settings=(struct kernel_tty_termios2){.basic={.cflag=0x100200bdU},.ispeed=115200,.ospeed=9600};
+    assert(!test_transport->configure2(transport_owner,&settings));
+    assert(dll==24&&dlh==0&&settings.ispeed==9600&&settings.ospeed==9600);
+    assert((settings.basic.cflag&0x100f0000U)==0x000d0000U);
+    assert((settings.basic.cflag&0x100fU)==0x000dU);
+    settings=(struct kernel_tty_termios2){.basic={.cflag=0x000d0080U},.ispeed=9600,.ospeed=0};
+    assert(!test_transport->configure2(transport_owner,&settings));
+    assert(dll==24&&dlh==0&&regs[4]==0&&!(regs[1]&5)&&!((struct riscv_uart_tty*)transport_owner)->input_enabled);
+    assert(!settings.ispeed&&!settings.ospeed&&!(settings.basic.cflag&0x100f100fU));
+    /* 低速超过16-bit divisor与过快线路均不得发布部分硬件/软件状态。 */
+    static const uint32_t impossible[]={1,460800,UINT32_MAX};
+    for(unsigned i=0;i<sizeof(impossible)/sizeof(impossible[0]);i++) {
+        settings=(struct kernel_tty_termios2){.basic={.iflag=0x1234,.oflag=5,.cflag=0x1000U|0x80U|0x40U|0x100U,.lflag=0x4321},.ispeed=impossible[i],.ospeed=impossible[i]};
+        struct kernel_tty_termios2 original=settings;
+        uint8_t original_regs[8];memcpy(original_regs,regs,sizeof(regs));
+        uint8_t original_dll=dll,original_dlh=dlh,original_ier=((struct riscv_uart_tty*)transport_owner)->ier;
+        uint8_t original_enabled=((struct riscv_uart_tty*)transport_owner)->input_enabled;
+        unsigned writes=register_writes;
+        assert(test_transport->configure2(transport_owner,&settings)==-KERNEL_EINVAL);
+        assert(!memcmp(&settings,&original,sizeof(settings))&&!memcmp(regs,original_regs,sizeof(regs)));
+        assert(dll==original_dll&&dlh==original_dlh&&register_writes==writes);
+        assert(((struct riscv_uart_tty*)transport_owner)->ier==original_ier&&((struct riscv_uart_tty*)transport_owner)->input_enabled==original_enabled);
+    }
+    settings=(struct kernel_tty_termios2){.basic={.cflag=0x10b2U},.ispeed=115200,.ospeed=115200};
+    assert(!test_transport->configure2(transport_owner,&settings));
+}
 int main(void) {
     struct kernel_heap heap={0};struct riscv_uart_tty *port=0;
     struct dtb_uart_info info={{0x10000000,4096},3686400,11,0,1};
@@ -100,7 +154,8 @@ int main(void) {
     }
     fail_heap=fail_tty=fail_irq=fail_worker=0;
     assert(riscv_uart_tty_start(&port,&heap,&info,regs,10000)==0);
-    assert(regs[3]==3&&regs[0]==2&&(regs[1]&5)==5&&regs[4]==3);
+    assert(regs[3]==3&&dll==2&&dlh==0&&(regs[1]&5)==5&&regs[4]==3);
+    termios2_contract();
     drop_thre=1;assert(test_transport->transmit(transport_owner,(const unsigned char*)"abc",3)==1);
     assert(output_w==1&&output[0]=='a');drop_thre=0;
     tty_output[tty_write++]='T';service();assert(regs[1]&2);

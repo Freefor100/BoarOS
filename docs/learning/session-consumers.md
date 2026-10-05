@@ -135,3 +135,35 @@ stop仍要求真实TEMT，超时继续保留owner。首次空worker也记录初�
 main保留BoarOS uname；通用实现单向合入兼容分支，原旧glibc BASIC_TCP正常完成、
 后代清理为零，原串口应用同样完成。该入口不等于默认main支持全部旧glibc程序。
 没有重跑iozone、完整成本矩阵或无关存储恢复，也没有改变journal/durable/FLUSH语义。
+
+## PTY 的身份、传输与应用边界
+
+Unix98 PTY 不是给原 UART ioctl 增加几个成功返回值。devpts 管目录身份和元数据，
+配对持有两个 TTY core，行规程管理编辑、信号和等待，transport 管已经接受但尚未
+交给对端的字节。应用持有的 OFD 与控制终端引用保活配对；core 的内部 base 引用
+归配对拥有，不能反过来保活配对，否则最后关闭后永远不能回收。
+
+slave 从未打开、最后关闭后可再开，以及 master 永久关闭是不同状态。前两种需要
+master 保持身份与进展能力；后一种撤销可见 slave，使旧 OFD 和旧路径继续指向旧对象。
+编号只是当前目录中的地址，不能作为跨回收的身份。只要旧路径仍被持有，旧元数据就
+必须独立存在，但它不因此获得新配对的打开资格。
+
+一个挂载的 worker 负责多对终端，不能因一对 raw 输入满或 mode guard 忙而睡死在
+该终端内部。计数式非阻塞 receive 保留未处理后缀；信号立即发送，flush 在 guard
+归还后完成。没有进展时等真实事件，输出读者归还容量后再次唤醒。有界 read/poll
+推进用于收齐已经接受的尾部，不是伪造可读或靠忙轮询等待子进程。
+
+固定 Linux v7.2 的 `references/linux/drivers/tty/{pty,n_tty,tty_ioctl}.c` 区分 N_TTY
+flush 与 flip-buffer flush；不能把每个输入 flush 都扩大成无条件清空传输 FIFO。
+packet 的 STOP/START 和 DOSTOP/NOSTOP 是互斥状态，flush 位可合并；数据前缀只在
+规定的读取分支产生，PRI 表示尚未消费的真实控制状态。
+流控事件对应实际输出状态变化，不能把每次设置都当成新事件。软件 VSTART 和
+IXANY 不解除 TCOOFF；信号、关闭 IXON 与显式恢复也必须经过同一停止资格。
+master 上取得控制终端绑定的是 slave，与组查询、proc 身份和最后关闭的 hangup 一致。
+
+原 BusyBox 1.33.1 的 `references/oscomp-testsuits/busybox/util-linux/script.c` 有两个
+应用边界：它返回成功并不代表被录制命令成功，也没有转发 SIGWINCH。验收需额外收集
+被收养子进程的真实 wait 状态，并独立验证内核 resize；不能改内核迎合应用缺失的转发。
+`-f` 不是 fsync 承诺。录制完成、显式持久化和最终挂载排空也需要分别理解。
+原 `scriptreplay` 按 timing 的字节数读取录制文件，检查完整尾部比只观察 shell prompt
+更能发现关闭与传输交错中的丢失。

@@ -12,7 +12,7 @@ worker 使用调度器标准 8 KiB 栈和任务存储。root baseline 在创建 
 
 - 每次 UART handler 最多处理 64 个硬件字符。字符及 OE/PE/FE/BI 状态来自实际 LSR；IRQ 不分配、不睡眠、不调用线路规程。满 RX 环关闭 RDI/RLSI，worker 消费后恢复；硬件 OE 计入真实 overrun，满软件队列本身不伪造硬件错误。
 - worker 每轮最多提交 256 个 RX 项，发送内核 console 与 TTY 用户/echo 合计最多 256 字节，轮换先服务的来源。仍有可执行工作时 yield；THRE credit 缺失时启用发送就绪 IRQ，handler 关闭该中断并唤醒 worker。THRE 只证明可继续发送，drain 同时要求软件队列为空与实际 TEMT；最后的 TEMT 以 10 ms 请求期限再次观察，避免空转 IRQ；调度可能推迟实际恢复，不是硬上界。
-- `transmit` 逐次检查 THRE，返回真实接受字节；没有分配、睡眠或成功存根。default 115200/8N1/CREAD 的 divisor 来自 DTB 时钟；CS5–8、parity、stop bits 实际写 LCR。B0 撤 DTR/RTS；HUPCL 在 last close 撤 modem 输出，后续 configure 可恢复。独立输入速度归一到硬件输出速度，未实现的 CMSPAR、BOTHER 和 CRTSCTS 不对用户保留支持声明。
+- `transmit` 逐次检查 THRE，返回真实接受字节；没有分配、睡眠或成功存根。default 115200/8N1/CREAD 的 divisor 来自 DTB 时钟；CS5–8、parity、stop bits 实际写 LCR。B0 撤 DTR/RTS；HUPCL 在 last close 撤 modem 输出，后续 configure 可恢复。独立输入速度归一到硬件输出速度，未实现的 CMSPAR 和 CRTSCTS 不对用户保留支持声明。
 - `virt_uart_putc` 先把真实内核字符保存在 16 KiB klog，再按 console level 送到独立 port 队列。`kernel_console_putc` 是不写 klog 的诊断输出；TTY 用户/echo 不经过这两条路径。queue 满时记录 `console_dropped`，IRQ 打印不阻塞。`virt_uart_emergency_begin` 使 fatal 输出改用既有固定轮询 sink；pre/post runtime 也保持轮询输出。
 - stop 首先阻止新 TTY 工作并关闭输入，在正常关闭中保留已接受且未 flush 的 TX。超过一秒仍无法 drain 返回 EIO，worker 已 join，但队列、MMIO 和 IRQ 登记仍有 port owner；再次 stop 可重建 worker 重试。成功停止在 join 后注销 IRQ，才释放 TTY/port。`stop_report` 在 drain/join 完成后、释放前冻结最终计数；失败或空 owner 不修改输出，root 保存该固定快照供聚焦验证。
 
@@ -28,7 +28,7 @@ allocator fatal原因均保留。该检查保护新UART接入，不反推历史f
 这不放宽已发布port的tcdrain/stop TEMT承诺。正常启动从初始LSR记录尚忙的硬件尾字节，
 即使第一轮没有新TX也保留10ms观察期限，TEMT变空后通知真实core的drain等待者。
 
-RV64/COST关闭构建的DWARF对象大小为port **3272 B**、core **28936 B**。真实create模型
+RV64/COST关闭构建的DWARF对象大小为port **3272 B**、core **29032 B**。真实create模型
 核对了这两个分配请求；当前heap的大对象按请求页数上取整为buddy order，分别占1与8个
 4KiB页，合计9个heap页（36KiB）。worker另有标准8KiB物理栈（2页，含16B guard/canary区域）
 和2368B任务metadata（独立1页），固定直接owner合计12页（48KiB），不包含后续OFD实例、
@@ -44,4 +44,22 @@ make build/riscv/arch/riscv/uart_tty.o
 
 宿主 fixture 使用生产传输实现与真实 IIR/LSR/IER 行为模型，TTY 边界只模拟回调；保护 IRQ 预算、满环/恢复和索引回绕、LSR 错误位、控制台 overflow、部分发送、发送 credit IRQ、TEMT 期限、modem/configure、四类启动失败与 unregister，以及关闭超时 owner 保留/恢复。新增fixture链接实际 `fs/tty.c`，分别保护TEMT忙时IRQ/worker启动失败的rollback、第一空worker期限/真实drain唤醒和正常stop超时保留/恢复；准备状态的公开入口不可接受TX，模型同时检查IRQ临界区。ASAN/UBSAN 验证 owner 清理。DTB fixture 另验证地址/clock/route/layout 与失败保持输出。真实 U-mode 和整合回归由集成 owner 验证，宿主 fixture 或 object 编译不等于真实 TTY ABI 已通过。
 
-固定资料：`references/qemu/hw/riscv/virt.c` 与 `hw/char/serial.c`，QEMU v11.1.0 commit `84f07211cc5b4fc6a371559bf8a5de4fb068e648`；`references/linux/drivers/tty/serial/8250/8250_port.c`，Linux commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`。本实现没有复制外部代码。当前范围不包含 modem 输入查询、硬件流控、多串口、DMA、PTY 或实板验证。
+固定资料：`references/qemu/hw/riscv/virt.c` 与 `hw/char/serial.c`，QEMU v11.1.0 commit `84f07211cc5b4fc6a371559bf8a5de4fb068e648`；`references/linux/drivers/tty/serial/8250/8250_port.c`，Linux commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`。本实现没有复制外部代码。本传输范围不包含 modem 输入查询、硬件流控、多串口、DMA 或实板验证；
+PTY 使用独立软件 transport，见[TTY 模块](kernel-tty.md)。
+
+## termios2 与线路速度
+
+44 字节 termios2 支持标准速率与 BOTHER 数字速率。UART 使用同一个 RX/TX 时钟，
+将输入归一到输出；TTY core 保存回读速度，旧 36 字节 ioctl 不越界访问附加字段。
+设备设置先校验速度范围和 16 位 divisor，再在短发布区写 DLL/DLH、LCR、MCR、IER；
+失败保留旧硬件与软件状态。B0 保留原 divisor、撤 modem 输出并关闭 RX。
+
+ABI 报告的是接受的名义速度，硬件通过 DTB 时钟及四舍五入的 divisor 实现近似线路
+速度，两者不是同一个测量值；固定 Linux 8250 也区分这两个边界。本驱动在 termios2
+硬件范围之外返回 EINVAL，不承诺完整复制 Linux 的超范围回退策略。
+CMSPAR/CRTSCTS 沿现有支持集合归一，不伪装硬件流控已经实现。
+
+`make test-uart-host` 核对真实寄存器别名、divisor、线路格式、速度归一、B0 和
+错误不发布；`make test-tty-termios2-riscv` 用同一 ELF 在真实串口核对
+44 字节复制、标准/数字速度、坏指针、drain/flush 与旧 36 字节布局。
+探针先明确设置双方共有的线路基线，最后恢复各自原配置，不将不同启动默认值当作 ABI 差异。

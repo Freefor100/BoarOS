@@ -48,8 +48,8 @@ class ObservationTests(unittest.TestCase):
                                  '/tmp/boaros', case_ids=['unknown'])
 
     def test_reference_environment_requires_all_facilities(self):
-        mounts = ('proc', 'sysfs', 'shm', 'mqueue')
-        names = mounts + ('shm-dir', 'mqueue-dir', 'lo')
+        mounts = ('proc', 'sysfs', 'shm', 'mqueue', 'devpts')
+        names = mounts + ('shm-dir', 'mqueue-dir', 'pts-dir', 'lo')
         value = {'environment': {name: {'result': 0, 'errno': 0} for name in names}}
         self.assertTrue(suites.reference_environment_ready(value))
         for name in names:
@@ -220,7 +220,8 @@ int __wrap_mkdir(const char *path, mode_t mode) {
     assert(mode == 01777);
     if (unsupported()) return -1;
     if (!strcmp(path,"/dev/shm")) directories |= 1;
-    else { assert(!strcmp(path,"/dev/mqueue")); directories |= 2; }
+    else if (!strcmp(path,"/dev/mqueue")) directories |= 2;
+    else { assert(!strcmp(path,"/dev/pts")); directories |= 4; }
     errno=EEXIST; return -1;
 }
 int __wrap_mount(const char *source, const char *target, const char *type, unsigned long flags, const void *data) {
@@ -228,6 +229,7 @@ int __wrap_mount(const char *source, const char *target, const char *type, unsig
     if (unsupported()) return -1;
     if (!strcmp(target,"/dev/shm")) { assert(directories & 1); assert(!strcmp(type,"tmpfs")); assert(data && !strcmp(data,"mode=1777")); }
     else if (!strcmp(target,"/dev/mqueue")) { assert(directories & 2); assert(!strcmp(type,"mqueue")); }
+    else if (!strcmp(target,"/dev/pts")) { assert(directories & 4); assert(!strcmp(type,"devpts")); assert(data && !strcmp(data,"mode=0620,gid=0,ptmxmode=0666")); }
     else assert(!strcmp(target,"/proc") || !strcmp(target,"/sys"));
     return 0;
 }
@@ -272,7 +274,7 @@ int __wrap_ioctl(int fd, unsigned long request, ...) {
         self.assertEqual(result['exit_code'], 0)
         self.assertTrue(result['complete'])
         self.assertFalse(suites.reference_environment_ready(result))
-        for name in ('proc', 'sysfs', 'shm-dir', 'shm', 'mqueue-dir', 'mqueue', 'lo'):
+        for name in ('proc', 'sysfs', 'shm-dir', 'shm', 'mqueue-dir', 'mqueue', 'pts-dir', 'devpts', 'lo'):
             self.assertEqual(result['environment'][name]['errno'], 38)
 
     def test_root_cwd_needs_no_chdir_but_other_cwd_reports_setup_errno(self):

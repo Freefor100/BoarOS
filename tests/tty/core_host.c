@@ -53,6 +53,8 @@ enum kernel_heap_status kernel_heap_release(struct kernel_heap *h, void *p)
     }
     return 0;
 }
+enum kernel_heap_status kernel_heap_allocate(struct kernel_heap *h, size_t n, void **p)
+{ return kernel_heap_allocate_zeroed(h, 1, n, p); }
 void kernel_pid_get(struct kernel_pid *id)
 {
     assert(id->references);
@@ -267,8 +269,8 @@ static void last_close(void *o, uint32_t flags)
     (void)flags;
     closes++;
 }
-static const struct kernel_tty_transport transport = {transmit, drained, configure, kick,
-                                                      last_close};
+static const struct kernel_tty_transport transport = {.transmit=transmit, .drained=drained, .configure=configure, .kick=kick,
+                                                      .last_close=last_close};
 static int ioctl_call(unsigned command, void *data)
 {
     return device->ioctl(instance, &task, 0, 0, 0, command, (uintptr_t)data);
@@ -345,15 +347,15 @@ int main(void)
     device = kernel_tty_device_lookup(0x440);
     assert(device);
     fail_alloc = 1;
-    assert(device->open(&heap, &task, 0, &instance) == -KERNEL_ENOMEM && !instance);
-    assert(device->open(&heap, &task, 0, &instance) == 0);
+    assert(device->open(&heap, &task, 0, 0, &instance) == -KERNEL_ENOMEM && !instance);
+    assert(device->open(&heap, &task, 0, 0, &instance) == 0);
     struct kernel_tty_termios s;
     termios(&s);
     assert(sizeof(s) == 36 && s.iflag == 0x500 && s.oflag == 5 && s.cflag == 0x10b2 &&
            s.lflag == 0x8a3b);
     const struct kernel_char_device *current = kernel_tty_device_lookup(0x500);
     void *bad = 0;
-    assert(current->open(&heap, &task, 0, &bad) == -KERNEL_ENXIO);
+    assert(current->open(&heap, &task, 0, 0, &bad) == -KERNEL_ENXIO);
     s.lflag &= ~8U;
     settings(&s);
     unsigned char buf[512];
@@ -503,4 +505,5 @@ int main(void)
     assert(kernel_tty_destroy(&tty) == 0 && !tty && !live && identity.references == 1);
     puts("TTY core host: real "
          "termios/rings/continuation/fault/timeouts/flow/cancellation/ownership pass");
+    return 0;
 }

@@ -46,6 +46,7 @@
 #define ECHOCTL 512U
 #define ECHOKE 2048U
 #define IEXTEN 32768U
+#define EXTPROC 65536U
 #define O_NOCTTY 0400U
 #define VINTR 0U
 #define VQUIT 1U
@@ -69,13 +70,15 @@ struct kernel_tty {
     void *transport_owner;
     struct kernel_tty_termios settings;
     struct kernel_wait_queue events;
-    struct kernel_tty_request *reader, *mode_owner;
+    struct kernel_tty_request *reader, *writer, *mode_owner;
     struct kernel_pid *session, *foreground;
-    uint64_t generation, head, tail, canonical_head;
+    uint64_t rdev, generation, head, tail, canonical_head;
     uint64_t tx_head, tx_tail, echo_head, echo_tail, order_head, order_tail;
     uint32_t references, opens, column;
+    uint32_t ispeed, ospeed;
     uint16_t rows, columns, xpixel, ypixel;
     uint8_t stopped, flow_stopped, throttled, xchar, xchar_valid, quoted, shutdown;
+    uint8_t master, packet, packet_status, deferred_flush, nonblocking_rx;
     unsigned char input[RING], flags[RING], width[RING];
     unsigned char tx[RING], echo[RING], order[ORDER];
 };
@@ -88,9 +91,7 @@ struct tty_instance {
 struct kernel_tty_request {
     struct tty_instance *instance;
     struct kernel_task *caller;
-    struct kernel_mm *mm;
-    const struct kernel_uaccess_iovec *iov;
-    size_t iov_count;
+    unsigned char *write_scratch;
     struct kernel_files *files;
     struct kernel_open_file_description *file;
     struct kernel_open_file_description **file_owner;
@@ -98,7 +99,7 @@ struct kernel_tty_request {
     void **vector_owner;
     uint64_t deadline_ns;
     unsigned min, time;
-    uint8_t registered, reading, mode, continuation, write_qualified, initial_canonical;
+    uint8_t registered, reading, mode, continuation, write_qualified, initial_canonical, packet_started, writing;
 };
 _Static_assert(sizeof(struct kernel_tty_request) <= 160, "TTY request stack budget");
 static struct kernel_tty *serial_tty;
@@ -127,16 +128,18 @@ void kernel_tty_get(struct kernel_tty *tty)
     if (!tty || !tty->references || tty->references == UINT32_MAX)
         __builtin_trap();
     tty->references++;
+    if (tty->transport.external_ref) tty->transport.external_ref(tty->transport_owner, 1);
 }
 void kernel_tty_put(struct kernel_tty *tty)
 {
     if (!tty || tty->references <= 1)
         __builtin_trap();
     tty->references--;
+    if (tty->transport.external_ref) tty->transport.external_ref(tty->transport_owner, -1);
 }
 uint64_t kernel_tty_rdev(const struct kernel_tty *tty)
 {
-    return tty ? UINT64_C(0x440) : 0;
+    return tty ? tty->rdev : 0;
 }
 int32_t kernel_tty_foreground(const struct kernel_tty *tty)
 {
@@ -146,12 +149,60 @@ static int hungup(const struct tty_instance *instance)
 {
     return instance->tty->shutdown || instance->generation != instance->tty->generation;
 }
+static void packet_event(struct kernel_tty *tty, unsigned flags)
+{
+    if (tty->transport.event) tty->transport.event(tty->transport_owner, flags);
+}
+static void stop_output(struct kernel_tty *tty)
+{
+    if (tty->flow_stopped) return;
+    tty->flow_stopped = 1;
+    packet_event(tty, 4);
+    changed(tty);
+}
+static void start_output(struct kernel_tty *tty)
+{
+    /* TCOOFF 是独立资格；VSTART、IXANY 和信号不能越过它。 */
+    if (!tty->flow_stopped || tty->stopped) return;
+    tty->flow_stopped = 0;
+    packet_event(tty, 8);
+    changed(tty);
+}
+static int canonical_mode(struct kernel_tty *tty)
+{ return (tty->settings.lflag & (ICANON | EXTPROC)) == ICANON; }
+static enum kernel_tty_peer_state peer_state(struct kernel_tty *tty)
+{ return tty->transport.peer_state ? tty->transport.peer_state(tty->transport_owner) : KERNEL_TTY_PEER_LIVE; }
+static uint32_t decode_speed(uint32_t code, uint32_t arbitrary)
+{
+    static const uint32_t rates[] = {0,50,75,110,134,150,200,300,600,1200,1800,2400,
+        4800,9600,19200,38400,57600,115200,230400,460800,500000,576000,921600,
+        1000000,1152000,1500000,2000000,2500000,3000000,3500000,4000000};
+    code &= 0x100fU;
+    if (code == 0x1000U) return arbitrary;
+    return rates[code < 16 ? code : 15U + (code & 15U)];
+}
+static void resolve_speeds(struct kernel_tty_termios2 *settings)
+{
+    settings->ospeed = decode_speed(settings->basic.cflag, settings->ospeed);
+    uint32_t code = (settings->basic.cflag >> 16) & 0x100fU;
+    settings->ispeed = code ? decode_speed(code, settings->ispeed) : settings->ospeed;
+}
+static int configure_settings(struct kernel_tty *tty, struct kernel_tty_termios2 *settings)
+{
+    resolve_speeds(settings);
+    if (tty->transport.configure2)
+        return tty->transport.configure2(tty->transport_owner, settings);
+    int result = tty->transport.configure(tty->transport_owner, &settings->basic);
+    if (!result) resolve_speeds(settings);
+    return result;
+}
 static int special(const struct kernel_tty *tty, unsigned index, unsigned char c)
 {
     return tty->settings.cc[index] != 0 && tty->settings.cc[index] == c;
 }
 static void flush_input(struct kernel_tty *tty)
 {
+    packet_event(tty, 1);
     tty->head = tty->tail = tty->canonical_head = 0;
     tty->quoted = 0;
     memset(tty->flags, 0, sizeof(tty->flags));
@@ -164,6 +215,7 @@ static void flush_input(struct kernel_tty *tty)
 }
 static void flush_output(struct kernel_tty *tty)
 {
+    packet_event(tty, 2);
     tty->tx_head = tty->tx_tail = tty->echo_head = tty->echo_tail = tty->order_head =
         tty->order_tail = 0;
     changed(tty);
@@ -176,6 +228,10 @@ static void finish_mode(struct kernel_tty_request *request)
             __builtin_trap();
         tty->mode_owner = 0;
         request->mode = 0;
+        if (tty->deferred_flush) {
+            tty->deferred_flush = 0; flush_input(tty); flush_output(tty);
+            tty->transport.kick(tty->transport_owner);
+        }
         changed(tty);
     }
 }
@@ -190,6 +246,14 @@ static void finish_request(struct kernel_tty_request *request)
         tty->reader = 0;
         request->reading = 0;
         changed(tty);
+    }
+    if (request->writing) {
+        if (tty->writer != request) __builtin_trap();
+        tty->writer = 0; request->writing = 0; changed(tty);
+    }
+    if (request->write_scratch) {
+        if (kernel_heap_release(request->instance->heap, request->write_scratch) != KERNEL_HEAP_STATUS_OK) __builtin_trap();
+        request->write_scratch = 0;
     }
     if (request->registered) {
         kernel_task_tty_request_clear(request->caller, request);
@@ -420,6 +484,10 @@ static void signal_input(struct kernel_tty *tty, unsigned signal)
     kernel_task_tty_signal_group(tty->foreground, signal);
     if (tty->settings.lflag & NOFLSH)
         return;
+    if (tty->nonblocking_rx && tty->mode_owner) {
+        tty->deferred_flush = 1;
+        return;
+    }
     /* RX worker waits on the logical mode guard; no allocation/usercopy/device lock is held.
      */
     while (tty->mode_owner) {
@@ -433,7 +501,11 @@ static void signal_input(struct kernel_tty *tty, unsigned signal)
 }
 static void input_byte(struct kernel_tty *tty, unsigned char c, int literal)
 {
-    int canonical = (tty->settings.lflag & ICANON) != 0;
+    int canonical = canonical_mode(tty);
+    if (tty->settings.lflag & EXTPROC) {
+        if (tty->settings.iflag & ISTRIP) c &= 127;
+        literal = 2;
+    }
     if (!literal && tty->quoted) {
         tty->quoted = 0;
         literal = 1;
@@ -445,13 +517,11 @@ static void input_byte(struct kernel_tty *tty, unsigned char c, int literal)
             c &= 127;
         if (tty->settings.iflag & IXON) {
             if (special(tty, VSTOP, c)) {
-                tty->flow_stopped = 1;
-                changed(tty);
+                stop_output(tty);
                 return;
             }
             if (special(tty, VSTART, c)) {
-                tty->flow_stopped = 0;
-                changed(tty);
+                start_output(tty);
                 return;
             }
         }
@@ -465,15 +535,13 @@ static void input_byte(struct kernel_tty *tty, unsigned char c, int literal)
             signal_input(tty, sig);
             if (tty->settings.lflag & ECHO)
                 (void)echo_character(tty, c);
-            tty->flow_stopped = 0;
-            changed(tty);
+            if (tty->settings.iflag & IXON) start_output(tty);
             return;
         }
     }
     if (!literal) {
         if ((tty->settings.iflag & (IXON | IXANY)) == (IXON | IXANY) && tty->flow_stopped) {
-            tty->flow_stopped = 0;
-            changed(tty);
+            start_output(tty);
         }
         if (c == '\r') {
             if (tty->settings.iflag & IGNCR)
@@ -578,14 +646,29 @@ static void input_byte(struct kernel_tty *tty, unsigned char c, int literal)
     }
     changed(tty);
 }
-void kernel_tty_receive(struct kernel_tty *tty, const struct kernel_tty_rx *input,
-                        size_t count)
+static size_t receive_input(struct kernel_tty *tty, const struct kernel_tty_rx *input,
+                        size_t count, int nonblocking)
 {
     if (!tty || (!input && count))
         __builtin_trap();
-    for (size_t j = 0; j < count; j++) {
+    size_t j = 0;
+    for (; j < count; j++) {
         uintptr_t irq = riscv_interrupt_save();
+        if (nonblocking && tty->deferred_flush) {
+            if (tty->mode_owner) { riscv_interrupt_restore(irq); break; }
+            tty->deferred_flush = 0;
+            flush_input(tty); flush_output(tty);
+        }
         unsigned char c = input[j].character, status = input[j].status;
+        size_t needed = (tty->settings.iflag & PARMRK) && !(tty->settings.lflag & EXTPROC) ?
+            ((status & 28U) ? 3U : (c == 255 && !(tty->settings.iflag & ISTRIP) ? 2U : 1U)) : 1U;
+        if (nonblocking && !canonical_mode(tty) && tty->head - tty->tail > RING - 1 - needed) {
+            int control = !(tty->settings.lflag & EXTPROC) &&
+                (((tty->settings.iflag & IXON) && (special(tty, VSTART, c) || special(tty, VSTOP, c))) ||
+                 ((tty->settings.lflag & ISIG) && (special(tty, VINTR, c) || special(tty, VQUIT, c) || special(tty, VSUSP, c))));
+            if (!control) { riscv_interrupt_restore(irq); break; }
+        }
+        tty->nonblocking_rx = nonblocking;
         if (tty->shutdown || !(tty->settings.cflag & 0x80U)) {
             riscv_interrupt_restore(irq);
             continue;
@@ -622,8 +705,14 @@ void kernel_tty_receive(struct kernel_tty *tty, const struct kernel_tty_rx *inpu
         }
         riscv_interrupt_restore(irq);
     }
+    tty->nonblocking_rx = 0;
     tty->transport.kick(tty->transport_owner);
+    return j;
 }
+void kernel_tty_receive(struct kernel_tty *tty, const struct kernel_tty_rx *input, size_t count)
+{ (void)receive_input(tty, input, count, 0); }
+size_t kernel_tty_receive_nonblocking(struct kernel_tty *tty, const struct kernel_tty_rx *input, size_t count)
+{ return receive_input(tty, input, count, 1); }
 size_t kernel_tty_service_output(struct kernel_tty *tty, size_t budget)
 {
     size_t total = 0;
@@ -747,10 +836,9 @@ static int acquire_ctty(struct kernel_tty *tty, struct kernel_task *caller, int 
     tty->foreground = pgid;
     return kernel_task_tty_set(caller, tty);
 }
-static int open_instance(struct kernel_heap *heap, struct kernel_task *caller, uint32_t flags,
+static int open_instance(struct kernel_tty *tty, struct kernel_heap *heap, struct kernel_task *caller, uint32_t flags,
                          void **result, int kind)
 {
-    struct kernel_tty *tty = kind == 2 ? kernel_task_controlling_tty(caller) : serial_tty;
     if (!tty)
         return -KERNEL_ENXIO;
     struct tty_instance *instance = 0;
@@ -759,18 +847,22 @@ static int open_instance(struct kernel_heap *heap, struct kernel_task *caller, u
     if (allocation != KERNEL_HEAP_STATUS_OK)
         return allocation == KERNEL_HEAP_STATUS_EMPTY ? -KERNEL_ENOMEM : -KERNEL_EIO;
     uintptr_t irq = riscv_interrupt_save();
-    if (tty->shutdown) {
+    int open_error = tty->transport.open_check ? tty->transport.open_check(tty->transport_owner) : 0;
+    if (tty->shutdown || open_error) {
         riscv_interrupt_restore(irq);
         (void)kernel_heap_release(heap, instance);
-        return -KERNEL_ENXIO;
+        return open_error ? open_error : -KERNEL_ENXIO;
     }
     if (!tty->opens) {
-        int error = tty->transport.configure(tty->transport_owner, &tty->settings);
+        struct kernel_tty_termios2 settings = {tty->settings, tty->ispeed, tty->ospeed};
+        int error = configure_settings(tty, &settings);
         if (error) {
             riscv_interrupt_restore(irq);
             (void)kernel_heap_release(heap, instance);
             return error;
         }
+        tty->settings = settings.basic;
+        tty->ispeed = settings.ispeed; tty->ospeed = settings.ospeed;
     }
     instance->tty = tty;
     instance->heap = heap;
@@ -778,6 +870,7 @@ static int open_instance(struct kernel_heap *heap, struct kernel_task *caller, u
     instance->console = kind == 1;
     kernel_tty_get(tty);
     tty->opens++;
+    if (tty->transport.opened) tty->transport.opened(tty->transport_owner);
     if (!kind && !(flags & O_NOCTTY) && (flags & 3) != 1 &&
         kernel_task_tty_session_leader(caller) && !kernel_task_controlling_tty(caller) &&
         !tty->session)
@@ -786,17 +879,20 @@ static int open_instance(struct kernel_heap *heap, struct kernel_task *caller, u
     *result = instance;
     return 0;
 }
-static int open_serial(struct kernel_heap *h, struct kernel_task *c, uint32_t f, void **i)
+static int open_serial(struct kernel_heap *h, struct kernel_task *c, uint32_t f, const struct kernel_vfs_file *path, void **i)
 {
-    return open_instance(h, c, f, i, 0);
+    (void)path;
+    return open_instance(serial_tty, h, c, f, i, 0);
 }
-static int open_console(struct kernel_heap *h, struct kernel_task *c, uint32_t f, void **i)
+static int open_console(struct kernel_heap *h, struct kernel_task *c, uint32_t f, const struct kernel_vfs_file *path, void **i)
 {
-    return open_instance(h, c, f, i, 1);
+    (void)path;
+    return open_instance(serial_tty, h, c, f, i, 1);
 }
-static int open_current(struct kernel_heap *h, struct kernel_task *c, uint32_t f, void **i)
+static int open_current(struct kernel_heap *h, struct kernel_task *c, uint32_t f, const struct kernel_vfs_file *path, void **i)
 {
-    return open_instance(h, c, f, i, 2);
+    (void)path;
+    return open_instance(kernel_task_controlling_tty(c), h, c, f, i, 2);
 }
 static void release_instance(void *opaque)
 {
@@ -827,6 +923,7 @@ int kernel_tty_create(struct kernel_heap *heap, const struct kernel_tty_transpor
     tty->heap = heap;
     tty->transport = *transport;
     tty->transport_owner = owner;
+    tty->rdev = 0x440;
     tty->references = 1;
     tty->generation = 1;
     tty->settings.iflag = ICRNL | IXON;
@@ -842,6 +939,7 @@ int kernel_tty_create(struct kernel_heap *heap, const struct kernel_tty_transpor
         (void)kernel_heap_release(heap, tty);
         return error;
     }
+    tty->ispeed = tty->ospeed = decode_speed(tty->settings.cflag, 0);
     *out = tty;
     return 0;
 }
@@ -851,7 +949,7 @@ int kernel_tty_destroy(struct kernel_tty **owner)
         return -KERNEL_EINVAL;
     struct kernel_tty *tty = *owner;
     uintptr_t irq = riscv_interrupt_save();
-    if (tty->references != 1 || tty->reader || tty->mode_owner || tty->session ||
+    if (tty->references != 1 || tty->reader || tty->writer || tty->mode_owner || tty->session ||
         tty->foreground || kernel_tty_output_pending(tty) ||
         !tty->transport.drained(tty->transport_owner)) {
         riscv_interrupt_restore(irq);
@@ -930,6 +1028,11 @@ static size_t take_input(struct kernel_tty *tty, unsigned char *buffer, size_t c
     size_t n = 0;
     *more = 0;
     uint64_t limit = canonical ? tty->canonical_head : tty->head;
+    if (!canonical && capacity && tty->head - tty->tail == 1 &&
+        (tty->settings.lflag & (EXTPROC | ICANON)) == (EXTPROC | ICANON) &&
+        special(tty, VEOF, tty->input[tty->tail & MASK])) {
+        tty->tail++; unthrottle(tty); tty->transport.kick(tty->transport_owner); return 0;
+    }
     while (n < capacity && tty->tail < limit) {
         unsigned pos = tty->tail & MASK, flag = canonical ? tty->flags[pos] : 0;
         unsigned char c = tty->input[pos];
@@ -939,11 +1042,13 @@ static size_t take_input(struct kernel_tty *tty, unsigned char *buffer, size_t c
             buffer[n++] = c;
         if (flag) {
             unthrottle(tty);
+            tty->transport.kick(tty->transport_owner);
             return n;
         }
     }
     *more = tty->tail < limit;
     unthrottle(tty);
+    tty->transport.kick(tty->transport_owner);
     return n;
 }
 static int read_stage(struct kernel_tty_request *r, uint32_t flags, unsigned char *buffer,
@@ -951,6 +1056,7 @@ static int read_stage(struct kernel_tty_request *r, uint32_t flags, unsigned cha
 {
     struct kernel_tty *tty = r->instance->tty;
     *staged = 0;
+    if (tty->transport.progress) tty->transport.progress(tty->transport_owner);
     uintptr_t irq = riscv_interrupt_save();
     if (hungup(r->instance)) {
         r->continuation = 0;
@@ -971,7 +1077,7 @@ static int read_stage(struct kernel_tty_request *r, uint32_t flags, unsigned cha
         }
         int more;
         *staged =
-            take_input(tty, buffer, capacity, (tty->settings.lflag & ICANON) != 0, &more);
+            take_input(tty, buffer, capacity, canonical_mode(tty), &more);
         r->continuation = (uint8_t)more;
         riscv_interrupt_restore(irq);
         return 0;
@@ -999,22 +1105,32 @@ static int read_stage(struct kernel_tty_request *r, uint32_t flags, unsigned cha
         riscv_interrupt_restore(irq);
         return error;
     }
-    r->initial_canonical = (tty->settings.lflag & ICANON) != 0;
+    r->initial_canonical = canonical_mode(tty);
     r->min = r->initial_canonical ? 0 : tty->settings.cc[VMIN];
-    r->time = (tty->settings.lflag & ICANON) ? 0 : tty->settings.cc[VTIME];
+    r->time = canonical_mode(tty) ? 0 : tty->settings.cc[VTIME];
     if (!r->min && r->time)
         r->deadline_ns = kernel_time_monotonic_ns() + (uint64_t)r->time * 100000000;
     for (;;) {
-        int canonical = (tty->settings.lflag & ICANON) != 0;
+        int canonical = canonical_mode(tty);
         if (hungup(r->instance)) {
             error = 0;
             break;
         }
+        if (tty->packet && !r->packet_started && tty->packet_status) {
+            if (capacity) { buffer[0] = tty->packet_status; tty->packet_status = 0; *staged = 1; }
+            r->continuation = 0;
+            break;
+        }
         int available = canonical ? tty->canonical_head > tty->tail : tty->head > tty->tail;
         if (available) {
+            if (tty->packet && !canonical && !r->packet_started) {
+                buffer[(*staged)++] = 0; r->packet_started = 1;
+                if (*staged == capacity) { r->continuation = 0; break; }
+            }
             int more;
             size_t n = take_input(tty, buffer + *staged, capacity - *staged, canonical, &more);
             *staged += n;
+            if (!n && (tty->settings.lflag & EXTPROC)) break;
             if (canonical) {
                 r->continuation = (uint8_t)more;
                 break;
@@ -1029,6 +1145,10 @@ static int read_stage(struct kernel_tty_request *r, uint32_t flags, unsigned cha
                 r->deadline_ns = kernel_time_monotonic_ns() + (uint64_t)r->time * 100000000;
         } else if (!canonical && !r->initial_canonical && !r->min && !r->time)
             break;
+        if (peer_state(tty) != KERNEL_TTY_PEER_LIVE) {
+            error = peer_state(tty) == KERNEL_TTY_PEER_ABSENT ? -KERNEL_EIO : 0;
+            break;
+        }
         /* Waiting releases only mode protection; this invocation keeps read serialization. */
         finish_mode(r);
         error = wait_event(r, flags, 1);
@@ -1058,9 +1178,6 @@ device_readv(void *opaque, struct kernel_task *caller, struct kernel_files *file
     enum kernel_files_status status = KERNEL_FILES_STATUS_OK;
     struct kernel_uaccess_iov_cursor cursor = {iov, iov_count, 0, 0};
     begin_request(&r, i, caller);
-    r.mm = mm;
-    r.iov = iov;
-    r.iov_count = iov_count;
     handoff(&r, files, owner, vectors);
     if (!count) {
         *result = 0;
@@ -1106,18 +1223,29 @@ static int device_read(void *opaque, struct kernel_task *caller, uint32_t flags,
     finish_request(&r);
     return error;
 }
+static int lock_writer(struct kernel_tty_request *r, uint32_t flags)
+{
+    struct kernel_tty *tty = r->instance->tty;
+    while (tty->writer && tty->writer != r) {
+        int error = wait_event(r, flags, 0);
+        if (error) return error;
+    }
+    tty->writer = r; r->writing = 1;
+    return 0;
+}
 static int write_bytes(struct kernel_tty_request *r, uint32_t flags,
                        const unsigned char *input, size_t size, size_t *written)
 {
     struct kernel_tty *tty = r->instance->tty;
     *written = 0;
     uintptr_t irq = riscv_interrupt_save();
-    int error = hungup(r->instance) ? -KERNEL_EIO : 0;
+    int error = hungup(r->instance) || peer_state(tty) != KERNEL_TTY_PEER_LIVE ? -KERNEL_EIO : 0;
     if (!error && !r->write_qualified && (tty->settings.lflag & TOSTOP))
         error = job_control(r->instance, r->caller, 22, 1);
     r->write_qualified = 1;
+    if (!error && !r->writing) error = lock_writer(r, flags);
     while (!error && *written < size) {
-        if (hungup(r->instance)) {
+        if (hungup(r->instance) || peer_state(tty) != KERNEL_TTY_PEER_LIVE) {
             error = -KERNEL_EIO;
             break;
         }
@@ -1167,38 +1295,37 @@ device_writev(void *opaque, struct kernel_task *caller, struct kernel_files *fil
     uint64_t total = 0;
     int error = 0;
     enum kernel_files_status status = KERNEL_FILES_STATUS_OK;
-    unsigned char scratch[64];
+    size_t staging = count < 2048U ? (size_t)count : 2048U;
     uintptr_t irq = riscv_interrupt_save();
     error = hungup(r.instance)                           ? -KERNEL_EIO
             : (r.instance->tty->settings.lflag & TOSTOP) ? job_control(r.instance, caller, 22, 1)
                                                          : 0;
     r.write_qualified = 1;
+    if (!error && count) error = lock_writer(&r, flags);
     riscv_interrupt_restore(irq);
+    if (!error && count) {
+        enum kernel_heap_status allocated = kernel_heap_allocate(r.instance->heap, staging, (void **)&r.write_scratch);
+        if (allocated != KERNEL_HEAP_STATUS_OK) error = allocated == KERNEL_HEAP_STATUS_EMPTY ? -KERNEL_ENOMEM : -KERNEL_EIO;
+    }
     if (error) {
         finish_request(&r);
         *result = error;
         return status;
     }
     while (total < count) {
-        size_t n = 0, capacity = count - total < sizeof(scratch) ? (size_t)(count - total)
-                                                                 : sizeof(scratch);
+        size_t n = 0, capacity = count - total < staging ? (size_t)(count - total) : staging;
         enum kernel_uaccess_status access =
-            kernel_copy_from_user_iov(mm, &cursor, scratch, capacity, &n);
-        if (n) {
-            size_t written = 0;
-            error = write_bytes(&r, flags, scratch, n, &written);
-            total += written;
-            if (error || written < n)
-                break;
-        }
+            kernel_copy_from_user_iov(mm, &cursor, r.write_scratch, capacity, &n);
         if (access != KERNEL_UACCESS_STATUS_OK || n != capacity) {
             error = -KERNEL_EFAULT;
-            if (access != KERNEL_UACCESS_STATUS_FAULT)
-                status = KERNEL_FILES_STATUS_STATE;
+            if (access != KERNEL_UACCESS_STATUS_FAULT) status = KERNEL_FILES_STATUS_STATE;
             break;
         }
+        size_t written = 0;
+        error = write_bytes(&r, flags, r.write_scratch, n, &written);
+        total += written;
+        if (error || written < n) break;
     }
-    memset(scratch, 0, sizeof(scratch));
     finish_request(&r);
     *result = total ? (int64_t)total : error;
     return status;
@@ -1210,6 +1337,7 @@ static uint32_t device_poll(void *opaque, uint32_t flags, uint32_t requested,
     (void)requested;
     struct tty_instance *i = opaque;
     struct kernel_tty *tty = i->tty;
+    if (tty->transport.progress) tty->transport.progress(tty->transport_owner);
     uintptr_t irq = riscv_interrupt_save();
     uint32_t result = 0;
     if (queue)
@@ -1218,7 +1346,7 @@ static uint32_t device_poll(void *opaque, uint32_t flags, uint32_t requested,
         result = KERNEL_POLLIN | KERNEL_POLLRDNORM | KERNEL_POLLOUT | KERNEL_POLLWRNORM |
                  KERNEL_POLLHUP;
     else {
-        if (tty->settings.lflag & ICANON) {
+        if (canonical_mode(tty)) {
             if (tty->canonical_head > tty->tail)
                 result |= KERNEL_POLLIN | KERNEL_POLLRDNORM;
         } else {
@@ -1228,6 +1356,8 @@ static uint32_t device_poll(void *opaque, uint32_t flags, uint32_t requested,
             if (tty->head - tty->tail >= minimum)
                 result |= KERNEL_POLLIN | KERNEL_POLLRDNORM;
         }
+        if (peer_state(tty) != KERNEL_TTY_PEER_LIVE) result |= KERNEL_POLLHUP;
+        if (tty->packet && tty->packet_status) result |= KERNEL_POLLPRI | KERNEL_POLLIN | KERNEL_POLLRDNORM;
         if (tty->order_head - tty->order_tail < 256 && tty->tx_head - tty->tx_tail < RING)
             result |= KERNEL_POLLOUT | KERNEL_POLLWRNORM;
     }
@@ -1268,6 +1398,14 @@ static int device_ioctl(void *opaque, struct kernel_task *caller, struct kernel_
 {
     struct tty_instance *i = opaque;
     struct kernel_tty *tty = i->tty;
+    struct kernel_tty *control = tty->master && tty->transport.peer ? tty->transport.peer(tty->transport_owner) : tty;
+    struct tty_instance target = *i;
+    /* Linux mode ioctl在master上操作slave；master自身行规程仍为独立raw状态。 */
+    int extended = command == 0x802c542a || (command >= 0x402c542b && command <= 0x402c542d);
+    if (((command >= 0x5401 && command <= 0x5404) || extended) && control != tty) {
+        target.tty = control; target.generation = control->generation;
+        i = &target; tty = control;
+    }
     struct kernel_tty_request r;
     begin_request(&r, i, caller);
     handoff(&r, files, owner, 0);
@@ -1277,54 +1415,71 @@ static int device_ioctl(void *opaque, struct kernel_task *caller, struct kernel_
         return command == 0x5410 ? -KERNEL_ENOTTY : -KERNEL_EIO;
     }
     switch ((uint32_t)command) {
-    case 0x5401: { /* TCGETS: always the kernel 36-byte layout. */
-        struct kernel_tty_termios settings;
+    case 0x5401: /* TCGETS保持36字节，不能按libc结构长度复制。 */
+    case 0x802c542a: {
+        struct kernel_tty_termios2 settings;
         uintptr_t irq = riscv_interrupt_save();
-        settings = tty->settings;
+        settings = (struct kernel_tty_termios2){tty->settings, tty->ispeed, tty->ospeed};
         riscv_interrupt_restore(irq);
-        error = copy_ioctl(mm, argument, &settings, sizeof(settings), 1);
+        error = copy_ioctl(mm, argument, &settings, extended ? sizeof(settings) : sizeof(settings.basic), 1);
         break;
     }
     case 0x5402:
     case 0x5403:
-    case 0x5404: {
+    case 0x5404:
+    case 0x402c542b:
+    case 0x402c542c:
+    case 0x402c542d: {
+        struct kernel_tty_termios2 modern;
         struct kernel_tty_termios settings;
         error = job_control(i, caller, 22, 0);
         if (error)
             break;
-        error = copy_ioctl(mm, argument, &settings, sizeof(settings), 0);
+        uintptr_t snapshot = riscv_interrupt_save();
+        modern = (struct kernel_tty_termios2){tty->settings, tty->ispeed, tty->ospeed};
+        riscv_interrupt_restore(snapshot);
+        error = copy_ioctl(mm, argument, &modern, extended ? sizeof(modern) : sizeof(modern.basic), 0);
         if (error)
             break;
+        settings = modern.basic;
         if (settings.line) {
             error = -KERNEL_EINVAL;
             break;
         }
         settings.iflag &= 0x7dffU;
         settings.oflag &= 0x183dU;
-        settings.lflag &= 0x8bfbU;
+        settings.lflag &= tty->transport.peer ? 0x18bfbU : 0x8bfbU;
         if ((settings.oflag & TAB3) != TAB3)
             settings.oflag &= ~TAB3;
-        settings.cflag &= 0x1fffU;
-        if (command != 0x5402) {
+        settings.cflag &= 0xd00f1fffU;
+        if (command != 0x5402 && command != 0x402c542b) {
             error = drain(&r);
             if (error)
                 break;
         }
         uintptr_t irq = riscv_interrupt_save();
         error = lock_mode(&r, 0);
-        if (!error)
-            error = tty->transport.configure(tty->transport_owner, &settings);
         if (!error) {
-            int was_canonical = (tty->settings.lflag & ICANON) != 0;
+            modern.basic = settings;
+            error = configure_settings(tty, &modern);
+            settings = modern.basic;
+        }
+        if (!error) {
+            int was_canonical = canonical_mode(tty);
+            int old_stop = (tty->settings.iflag & IXON) && tty->settings.cc[VSTOP] == 19 && tty->settings.cc[VSTART] == 17;
+            int new_stop = (settings.iflag & IXON) && settings.cc[VSTOP] == 19 && settings.cc[VSTART] == 17;
+            if (old_stop != new_stop) packet_event(tty, new_stop ? 32 : 16);
+            if ((tty->settings.lflag | settings.lflag) & EXTPROC) packet_event(tty, 64);
             tty->settings = settings;
+            tty->ispeed = modern.ispeed; tty->ospeed = modern.ospeed;
             if (!(settings.iflag & IXON))
-                tty->flow_stopped = 0;
-            if (command == 0x5404)
+                start_output(tty);
+            if (command == 0x5404 || command == 0x402c542d)
                 flush_input(tty);
-            else if (was_canonical != (int)((settings.lflag & ICANON) != 0)) {
+            else if (was_canonical != canonical_mode(tty)) {
                 memset(tty->flags, 0, sizeof(tty->flags));
                 tty->canonical_head = tty->tail;
-                if ((settings.lflag & ICANON) && tty->head > tty->tail) {
+                if (canonical_mode(tty) && tty->head > tty->tail) {
                     tty->flags[(tty->head - 1) & MASK] =
                         tty->input[(tty->head - 1) & MASK] == 0 ? 2 : 1;
                     tty->canonical_head = tty->head;
@@ -1347,10 +1502,15 @@ static int device_ioctl(void *opaque, struct kernel_task *caller, struct kernel_
         if (error)
             break;
         uintptr_t irq = riscv_interrupt_save();
-        if (argument == 0)
+        if (argument == 0) {
             tty->stopped = 1;
-        else if (argument == 1)
-            tty->stopped = 0;
+            stop_output(tty);
+        } else if (argument == 1) {
+            if (tty->stopped) {
+                tty->stopped = 0;
+                start_output(tty);
+            }
+        }
         else if (argument == 2 || argument == 3) {
             tty->xchar = tty->settings.cc[argument == 2 ? VSTOP : VSTART];
             tty->xchar_valid = tty->xchar != 0;
@@ -1383,7 +1543,8 @@ static int device_ioctl(void *opaque, struct kernel_task *caller, struct kernel_
     }
     case 0x540e: {
         uintptr_t irq = riscv_interrupt_save();
-        error = acquire_ctty(tty, caller, argument == 1);
+        /* PTY master 的控制身份属于 slave，与组查询和 hangup 使用同一 owner。 */
+        error = acquire_ctty(control, caller, argument == 1);
         riscv_interrupt_restore(irq);
         break;
     }
@@ -1403,24 +1564,26 @@ static int device_ioctl(void *opaque, struct kernel_task *caller, struct kernel_
     }
     case 0x540f:
     case 0x5429: {
-        if (kernel_task_controlling_tty(caller) != tty) {
+        if (!tty->master && kernel_task_controlling_tty(caller) != control) {
             error = -KERNEL_ENOTTY;
             break;
         }
         uintptr_t irq = riscv_interrupt_save();
-        int32_t value = command == 0x540f ? kernel_tty_foreground(tty)
-                        : tty->session    ? tty->session->number
+        if (command == 0x5429 && !control->session) { riscv_interrupt_restore(irq); error = -KERNEL_ENOTTY; break; }
+        int32_t value = command == 0x540f ? (control->foreground ? control->foreground->number : 0)
+                        : control->session    ? control->session->number
                                           : -1;
         riscv_interrupt_restore(irq);
         error = copy_ioctl(mm, argument, &value, sizeof(value), 1);
         break;
     }
     case 0x5410: {
-        error = job_control(i, caller, 22, 0);
+        struct tty_instance control_instance = *i; control_instance.tty = control;
+        error = job_control(&control_instance, caller, 22, 0);
         if (error)
             break;
-        if (kernel_task_controlling_tty(caller) != tty ||
-            tty->session != kernel_task_tty_identity(caller, KERNEL_PID_SID)) {
+        if (kernel_task_controlling_tty(caller) != control ||
+            control->session != kernel_task_tty_identity(caller, KERNEL_PID_SID)) {
             error = -KERNEL_ENOTTY;
             break;
         }
@@ -1437,9 +1600,9 @@ static int device_ioctl(void *opaque, struct kernel_task *caller, struct kernel_
         error = kernel_task_tty_find_group(caller, number, &group);
         if (!error) {
             kernel_pid_get(group);
-            if (tty->foreground)
-                kernel_pid_put(tty->foreground);
-            tty->foreground = group;
+            if (control->foreground)
+                kernel_pid_put(control->foreground);
+            control->foreground = group;
             changed(tty);
         }
         riscv_interrupt_restore(irq);
@@ -1449,10 +1612,10 @@ static int device_ioctl(void *opaque, struct kernel_task *caller, struct kernel_
     case 0x5414: {
         uint16_t size[4];
         uintptr_t irq = riscv_interrupt_save();
-        size[0] = tty->rows;
-        size[1] = tty->columns;
-        size[2] = tty->xpixel;
-        size[3] = tty->ypixel;
+        size[0] = control->rows;
+        size[1] = control->columns;
+        size[2] = control->xpixel;
+        size[3] = control->ypixel;
         riscv_interrupt_restore(irq);
         if (command == 0x5413)
             error = copy_ioctl(mm, argument, size, sizeof(size), 1);
@@ -1460,13 +1623,18 @@ static int device_ioctl(void *opaque, struct kernel_task *caller, struct kernel_
             error = copy_ioctl(mm, argument, size, sizeof(size), 0);
             if (!error) {
                 irq = riscv_interrupt_save();
-                if (size[0] != tty->rows || size[1] != tty->columns ||
-                    size[2] != tty->xpixel || size[3] != tty->ypixel) {
-                    tty->rows = size[0];
-                    tty->columns = size[1];
-                    tty->xpixel = size[2];
-                    tty->ypixel = size[3];
-                    kernel_task_tty_signal_group(tty->foreground, 28);
+                if (size[0] != control->rows || size[1] != control->columns ||
+                    size[2] != control->xpixel || size[3] != control->ypixel) {
+                    control->rows = size[0];
+                    control->columns = size[1];
+                    control->xpixel = size[2];
+                    control->ypixel = size[3];
+                    struct kernel_tty *other = control->transport.peer ? control->transport.peer(control->transport_owner) : 0;
+                    if (other) {
+                        other->rows = size[0]; other->columns = size[1]; other->xpixel = size[2]; other->ypixel = size[3];
+                        if (other->foreground != control->foreground) kernel_task_tty_signal_group(other->foreground, 28);
+                    }
+                    kernel_task_tty_signal_group(control->foreground, 28);
                 }
                 riscv_interrupt_restore(irq);
             }
@@ -1481,9 +1649,9 @@ static int device_ioctl(void *opaque, struct kernel_task *caller, struct kernel_
         if (command == 0x5411)
             value = (int32_t)(tty->order_head - tty->order_tail + tty->xchar_valid);
         else if (command == 0x541b) {
-            uint64_t end = (tty->settings.lflag & ICANON) ? tty->canonical_head : tty->head;
+            uint64_t end = canonical_mode(tty) ? tty->canonical_head : tty->head;
             for (uint64_t p = tty->tail; p < end; p++)
-                if (!(tty->settings.lflag & ICANON) || tty->flags[p & MASK] != 2)
+                if (!canonical_mode(tty) || tty->flags[p & MASK] != 2)
                     value++;
         }
         riscv_interrupt_restore(irq);
@@ -1497,10 +1665,74 @@ static int device_ioctl(void *opaque, struct kernel_task *caller, struct kernel_
             error = -KERNEL_EINVAL;
         break;
     }
+    case 0x5420: { /* TIOCPKT */
+        int value;
+        if (!tty->master) { error = -KERNEL_ENOTTY; break; }
+        error = copy_ioctl(mm, argument, &value, sizeof(value), 0);
+        if (!error) {
+            uintptr_t irq = riscv_interrupt_save();
+            if (!tty->packet && value) tty->packet_status = 0;
+            tty->packet = value != 0; changed(tty);
+            riscv_interrupt_restore(irq);
+        }
+        break;
+    }
+    case 0x80045438: {
+        if (!tty->master) { error = -KERNEL_ENOTTY; break; }
+        int value = tty->packet;
+        error = copy_ioctl(mm, argument, &value, sizeof(value), 1);
+        break;
+    }
+    case 0x40045436: { /* TIOCSIG carries signal by value, not by pointer. */
+        if (!tty->master || !tty->transport.peer) { error = -KERNEL_ENOTTY; break; }
+        if (argument != 2 && argument != 3 && argument != 20) { error = -KERNEL_EINVAL; break; }
+        struct kernel_tty *peer = tty->transport.peer(tty->transport_owner);
+        kernel_task_tty_signal_group(peer->foreground, (unsigned)argument);
+        break;
+    }
     default:
-        error = -KERNEL_ENOTTY;
+        error = tty->transport.ioctl ? tty->transport.ioctl(tty->transport_owner, caller, files, &r.file, mm, command, argument) : -KERNEL_ENOTTY;
         break;
     }
     finish_request(&r);
     return error;
+}
+
+void kernel_tty_configure_identity(struct kernel_tty *tty, uint64_t rdev, int raw)
+{
+    if (tty->opens || tty->references != 1) __builtin_trap();
+    tty->rdev = rdev; tty->master = raw != 0;
+    if (raw) { tty->settings.iflag = 0; tty->settings.oflag = 0; tty->settings.lflag = 0; }
+}
+int kernel_tty_open(struct kernel_tty *tty, struct kernel_heap *heap, struct kernel_task *caller, uint32_t flags, int automatic, void **instance)
+{ return open_instance(tty, heap, caller, flags, instance, automatic ? 0 : 2); }
+void *kernel_tty_instance_owner(void *opaque)
+{ return ((struct tty_instance *)opaque)->tty->transport_owner; }
+unsigned kernel_tty_open_count(struct kernel_tty *tty) { return tty->opens; }
+int kernel_tty_base_only(struct kernel_tty *tty)
+{ return tty->references == 1 && !tty->opens && !tty->reader && !tty->writer && !tty->mode_owner; }
+void kernel_tty_packet_event(struct kernel_tty *tty, unsigned flags)
+{
+    uintptr_t irq = riscv_interrupt_save();
+    if (tty->packet) {
+        if (flags & 12U) tty->packet_status &= ~12U;
+        if (flags & 48U) tty->packet_status &= ~48U;
+        tty->packet_status |= (uint8_t)flags; changed(tty);
+    }
+    riscv_interrupt_restore(irq);
+}
+void kernel_tty_discard(struct kernel_tty *tty)
+{
+    uintptr_t irq = riscv_interrupt_save();
+    flush_input(tty); flush_output(tty); tty->xchar_valid = 0;
+    riscv_interrupt_restore(irq);
+}
+const struct kernel_char_device *kernel_tty_device_template(void)
+{
+    static const struct kernel_char_device operations = {
+        .kind = KERNEL_OPEN_FILE_KIND_CONSOLE, .release = release_instance,
+        .read = device_read, .write = device_write, .readv = device_readv,
+        .writev = device_writev, .ioctl = device_ioctl, .poll = device_poll
+    };
+    return &operations;
 }

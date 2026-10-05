@@ -8,6 +8,9 @@
 #include <kernel/signal.h>
 #include <kernel/task.h>
 #include "open_file_internal.h"
+#include "pty_internal.h"
+#include "vfs_objects.h"
+#include <kernel/devpts.h>
 #include <kernel/uaccess.h>
 #include <kernel/tty.h>
 
@@ -194,6 +197,7 @@ const struct kernel_char_device *kernel_char_device_lookup(uint64_t rdev)
 {
     const struct kernel_char_device *tty = kernel_tty_device_lookup(rdev);
     if (tty) return tty;
+    if (rdev == 0x502 || (rdev >= 0x8800 && rdev < 0x8840)) return kernel_tty_device_template();
     if (rdev == kernel_rtc_device.rdev) return &kernel_rtc_device;
     initialize_devices();
     for (size_t i = 0U; i < sizeof(devices) / sizeof(devices[0]); i++)
@@ -205,8 +209,27 @@ int kernel_char_device_open(struct kernel_open_file_description *file,
                             uint32_t flags)
 {
     if (!file || !file->device || file->device_opened) return -KERNEL_EINVAL;
-    int error = file->device->open ? file->device->open(file->heap,
-        kernel_task_current(), flags, &file->device_instance) : 0;
+    int error;
+    if (kernel_devpts_file_mount(&file->file)) {
+        error = kernel_pty_open(&file->file, file->heap, kernel_task_current(), flags,
+            &file->device_instance, &file->device);
+    } else {
+        struct kernel_vfs_stat stat;
+        int pty_category = file->device == kernel_tty_device_template();
+        /* 动态 slave 必须有 devpts 绑定；同设备号的普通节点没有实例 owner。 */
+        error = pty_category ? (file->file.private_data ?
+            kernel_vfs_fstat(&file->file, &stat) : -KERNEL_EIO) : 0;
+        if (!error && pty_category && file->file.private_data && stat.rdev == 0x502) {
+            struct kernel_vfs_path *parent = file->file.path ? file->file.path->parent : 0;
+            struct kernel_vfs_path *pts = 0;
+            error = parent ? kernel_vfs_path_lookup(parent, "pts", 3, &pts) : -KERNEL_ENODEV;
+            if (!error) error = kernel_pty_open_ptmx(kernel_vfs_path_mount(pts), file->heap,
+                kernel_task_current(), flags, &file->device_instance, &file->device);
+            if (pts && kernel_vfs_path_release(&pts)) __builtin_trap();
+        } else if (!error && pty_category) error = -KERNEL_EIO;
+        else if (!error) error = file->device->open ? file->device->open(file->heap,
+        kernel_task_current(), flags, &file->file, &file->device_instance) : 0;
+    }
     if (!error) file->device_opened = 1;
     return error;
 }

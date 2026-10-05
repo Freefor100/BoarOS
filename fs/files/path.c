@@ -66,6 +66,56 @@ static int validate_open_flags(uint64_t flags, uint32_t *fd_flags)
     return 0;
 }
 
+/* peer ioctl已持有稳定路径；在可能睡眠的device open前预留fd。 */
+int kernel_files_open_pty_peer(struct kernel_files *files, struct kernel_task *caller,
+    struct kernel_vfs_path *path, uint32_t flags)
+{
+    (void)caller;
+    uint32_t fd_flags = 0, fd;
+    if (flags & LINUX_O_PATH) flags &= LINUX_O_PATH | LINUX_O_DIRECTORY | LINUX_O_NOFOLLOW | LINUX_O_CLOEXEC;
+    int error = validate_open_flags(flags, &fd_flags);
+    if (error) return error;
+    if (kernel_files_find_free_fd(files, &fd, &error) != KERNEL_FILES_STATUS_OK) __builtin_trap();
+    if (error) return error;
+    struct kernel_files_fd_reservation reservation __attribute__((cleanup(kernel_files_cancel_reservation))) = {files, fd};
+    files->record->slots[fd].flags = KERNEL_FILES_FD_RESERVED;
+    struct kernel_open_file_description *file = 0;
+    enum kernel_heap_status allocation = kernel_heap_allocate_zeroed(files->heap, 1, sizeof(*file), (void **)&file);
+    if (allocation != KERNEL_HEAP_STATUS_OK) return allocation == KERNEL_HEAP_STATUS_EMPTY ? -KERNEL_ENOMEM : -KERNEL_EIO;
+    file->heap = files->heap; file->references = 1;
+    kernel_mutex_init(&file->offset_lock, 10, (uintptr_t)file);
+    if (flags & LINUX_O_PATH) {
+        error = kernel_vfs_path_acquire(path);
+        if (!error) {
+            file->kind = KERNEL_OPEN_FILE_KIND_PATH;
+            file->file.path = path; file->file.mount = kernel_vfs_path_mount(path);
+            file->file.mode = kernel_vfs_path_mode(path);
+        }
+    } else error = kernel_vfs_path_open(path, &file->file);
+    if (error) { if (kernel_heap_release(files->heap, file) != KERNEL_HEAP_STATUS_OK) __builtin_trap(); return error; }
+    if (flags & LINUX_O_DIRECTORY) error = -KERNEL_ENOTDIR;
+    if (!error && !(flags & LINUX_O_PATH)) {
+        struct kernel_vfs_stat stat;
+        error = kernel_vfs_fstat(&file->file, &stat);
+        if (!error) {
+            file->device = kernel_char_device_lookup(stat.rdev);
+            if (!file->device) error = -KERNEL_ENXIO;
+            else { file->kind = file->device->kind; error = kernel_char_device_open(file, flags); }
+        }
+    }
+    if (error) {
+        kernel_files_queue_description(files, file);
+        (void)kernel_files_drain_file_cleanup(files);
+        return error;
+    }
+    file->open_flags = flags & ~LINUX_O_CLOEXEC;
+    file->observed_mount_error = kernel_vfs_mount_error_sequence(file->file.mount);
+    file->observed_writeback_error = kernel_vfs_error_sequence(&file->file);
+    kernel_files_cancel_reservation(&reservation);
+    if (kernel_files_install_new_owned_at(files, fd, fd_flags, &file) != KERNEL_FILES_STATUS_OK) __builtin_trap();
+    return (int)fd;
+}
+
 static enum kernel_files_status finish_path(struct kernel_files *files,
                                              char *path)
 {

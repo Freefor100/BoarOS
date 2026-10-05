@@ -9,6 +9,7 @@
 #include <kernel/physical_page.h>
 #include <kernel/procfs.h>
 #include <kernel/tmpfs.h>
+#include <kernel/devpts.h>
 #include <kernel/proc_task.h>
 #include <kernel/scheduler.h>
 #include <kernel/task.h>
@@ -752,7 +753,7 @@ struct proc_mount_entry {
     struct kernel_vfs_path *path;
     struct kernel_vfs_path *mount_root;
     const char *source;
-    uint8_t is_proc, is_tmpfs;
+    uint8_t is_proc, is_tmpfs, is_devpts;
     uint8_t read_only;
 };
 
@@ -850,6 +851,7 @@ static int proc_mounts_snapshot(struct kernel_vfs_node *node,
             entries[captured].source = it->source_name;
             entries[captured].is_proc = kernel_procfs_is_mount(it);
             entries[captured].is_tmpfs = kernel_tmpfs_is_mount(it);
+            entries[captured].is_devpts = kernel_devpts_is_mount(it);
             entries[captured].read_only =
                 ((struct kernel_vfs_instance *)it->private_data)->read_only;
             captured++;
@@ -884,9 +886,9 @@ static int proc_mounts_snapshot(struct kernel_vfs_node *node,
         if (result) goto Finish;
         const char *source = entries[i].source ? entries[i].source :
                              entries[i].is_proc ? "proc" :
-                             entries[i].is_tmpfs ? "tmpfs" : "rootfs";
+                             entries[i].is_tmpfs ? "tmpfs" : entries[i].is_devpts ? "devpts" : "rootfs";
         const char *kind = entries[i].is_proc ? "proc" :
-                           entries[i].is_tmpfs ? "tmpfs" : "ext4";
+                           entries[i].is_tmpfs ? "tmpfs" : entries[i].is_devpts ? "devpts" : "ext4";
         size_t needed = 4U * strlen(source) + 1U + 4U * strlen(path_text) +
                         1U + strlen(kind) + 9U;
         if (needed > capacity - used) { result = -KERNEL_EOVERFLOW; goto Finish; }

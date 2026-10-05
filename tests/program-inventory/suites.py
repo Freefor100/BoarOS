@@ -21,8 +21,8 @@ DEFAULT_ENV = {'PATH': '/bin:/usr/bin:/', 'LC_ALL': 'C',
 
 
 def reference_environment_ready(observation):
-    mounts = {'proc', 'sysfs', 'shm', 'mqueue'}
-    for name in mounts | {'shm-dir', 'mqueue-dir', 'lo'}:
+    mounts = {'proc', 'sysfs', 'shm', 'mqueue', 'devpts'}
+    for name in mounts | {'shm-dir', 'mqueue-dir', 'pts-dir', 'lo'}:
         value = observation['environment'].get(name, {})
         if value.get('result') == 0:
             continue
@@ -197,7 +197,7 @@ def build_fixture(manifest, destination, driver):
     if tree.exists():
         tree.rename(destination / ('fixture-tree.incomplete-' + str(time.time_ns())))
     tree.mkdir()
-    directories = ['/tmp', '/proc', '/sys', '/dev', '/dev/shm', '/dev/mqueue', '/dev/misc', '/dev/block', '/lib', '/bin', '/usr/bin']
+    directories = ['/tmp', '/proc', '/sys', '/dev', '/dev/shm', '/dev/mqueue', '/dev/pts', '/dev/misc', '/dev/block', '/lib', '/bin', '/usr/bin']
     directories += manifest.get('directories', [])
     for entry in directories:
         entry = {'path': entry} if isinstance(entry, str) else entry
@@ -235,6 +235,9 @@ def build_fixture(manifest, destination, driver):
         if not target.exists():
             target.write_text(contents)
             target.chmod(0o644)
+    ptmx = tree / 'dev/ptmx'
+    if not ptmx.exists() and not ptmx.is_symlink():
+        ptmx.symlink_to('pts/ptmx')
     (tree / 'root').mkdir(exist_ok=True)
     shutil.copyfile(driver, tree / 'init')
     (tree / 'init').chmod(0o755)

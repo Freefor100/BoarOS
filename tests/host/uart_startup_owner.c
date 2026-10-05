@@ -103,7 +103,7 @@ int main(int argc,char **argv) {
         assert(port&&live==2&&registered);service_worker();
         assert(last_deadline>ticks&&last_deadline-ticks<=100);
         device=kernel_tty_device_lookup(0x440);assert(device);
-        assert(!device->open(&heap,&task,0400,&instance));
+        assert(!device->open(&heap,&task,0400,0,&instance));
         (void)device->poll(instance,0,0,&drain_waiters);assert(drain_waiters);
         unsigned before=drain_wakes;sleep_action=shift_completed;
         assert(!device->ioctl(instance,&task,0,0,0,0x5409,1));

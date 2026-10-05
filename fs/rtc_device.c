@@ -5,9 +5,9 @@
 #include <kernel/uaccess.h>
 
 static unsigned opened;
-static int rtc_open(struct kernel_heap *heap, struct kernel_task *caller, uint32_t flags, void **instance)
+static int rtc_open(struct kernel_heap *heap, struct kernel_task *caller, uint32_t flags, const struct kernel_vfs_file *path, void **instance)
 {
-    (void)heap; (void)caller; (void)flags; (void)instance;
+    (void)heap; (void)caller; (void)flags; (void)path; (void)instance;
     uint64_t now;
     if (riscv_virt_rtc_read_ns(&now) != RISCV_VIRT_RTC_STATUS_OK) return -KERNEL_ENODEV;
     uintptr_t irq = riscv_interrupt_save();

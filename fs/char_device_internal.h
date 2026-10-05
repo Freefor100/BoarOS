@@ -11,6 +11,7 @@ struct kernel_wait_queue;
 struct kernel_mm;
 struct kernel_task;
 struct kernel_heap;
+struct kernel_vfs_file;
 
 /* Built-in character backends are selected by st_rdev, not pathname. */
 struct kernel_char_device {
@@ -23,7 +24,7 @@ struct kernel_char_device {
     uint8_t interruptible_bulk;
     /* 一份OFD持有一个实例；dup/fork与阻塞pin不重复打开设备。 */
     int (*open)(struct kernel_heap *heap, struct kernel_task *caller,
-                uint32_t flags, void **instance);
+                uint32_t flags, const struct kernel_vfs_file *path, void **instance);
     void (*release)(void *instance);
     int (*read)(void *instance, struct kernel_task *caller, uint32_t flags,
                 void *buffer, size_t size, size_t *bytes_read);

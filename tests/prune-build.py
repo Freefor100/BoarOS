@@ -19,7 +19,7 @@ def current_linux_keys():
     import harness
     return {harness.identity(ROOT / config)[0] for config in
             ('tests/diff-abi/linux.config', 'tests/program-inventory/linux.config',
-             'tests/network-linux.config')}
+             'tests/network-linux.config', 'tests/tty/pty-linux.config')}
 
 
 def candidates():
@@ -39,7 +39,7 @@ def candidates():
         result.extend(path for path in riscv.iterdir()
                       if path.name in {'artifacts', 'musl-src', 'truncate-probe'}
                       or path.name.startswith(('userland-run.', 'record-lock-run.',
-                                                'offline-c-run.', 'offline-project-run.', 'tty-run.', 'sched-bandwidth.',
+                                                'offline-c-run.', 'offline-project-run.', 'tty-run.', 'pty-run.', 'sched-bandwidth.',
                                                 'sqlite-run.',
                                                 'sqlite-nbd-run.',
                                                 'sqlite-recovery-run.')))
@@ -91,8 +91,16 @@ def candidates():
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--apply', action='store_true', help='delete listed artifacts')
+    parser.add_argument('--keep', action='append', default=[], type=Path,
+                        help='preserve a selected build path and any containing candidate')
     args = parser.parse_args()
+    kept = [path.resolve() for path in args.keep]
+    if any(not path.is_relative_to(BUILD.resolve()) for path in kept):
+        parser.error('--keep paths must be inside build/')
     paths = candidates()
+    paths = [path for path in paths if not any(
+        path.resolve() == item or item.is_relative_to(path.resolve())
+        or path.resolve().is_relative_to(item) for item in kept)]
     for path in paths:
         print(path.relative_to(ROOT))
         if args.apply:
