@@ -102,3 +102,23 @@ python3 -B tests/io-budget-experiment.py run --variant current=build/io-budget/k
 
 `make prune-build` 保留身份绑定候选的 kernels/ 编译缓存及固定基线，清理 runs、镜像、
 日志与汇总；核实后的永久结论和可重建命令在本页，不把被忽略的输出当作永久档案。
+
+
+## 最终正确性复核
+
+生产源码冻结于 `faf8e6395a7d56cd92e5fdb460fd9532066d2f26`。默认 `test-riscv`、
+musl、glibc 2.44 五种 ELF 形态、1,344 条固定 Linux ABI 差分、epoll 同 ELF、
+实际网络 owner ASan、VirtIO/worker/重组/块层/分配器抢占与 COST 宿主门禁通过。
+I/O 暂扣四组合通过；双盘收口竞态修复后四组故障/重启、四组 FIFO/RR 和额外
+30 次触发配置故障/重启通过。上述两个测试收口修复与原失败见各模块 learning。
+
+1/4/16/64 MiB × 1/4/64 KiB 的 COST 规模门禁通过；64 MiB 对齐追加增长访问为零，
+1 KiB 追加仅处理 49,152 次实际尾页。16,384 页缓存中的小范围写回只访问一个候选。
+默认及 RA8/WB8、TCP32MSS/池4倍/堆4倍的编译栈门禁通过，最大单帧 3,152 B；
+这不是整个调用链的栈上界，动态栈仍由各真实客体检查。
+
+lwext4 完整恢复与阶段七后默认/RA8WB8 的 SQLite DELETE/WAL 完整矩阵均通过，
+精确切点、实际故障命中和未到达项见[最终恢复](record-lock-sqlite-recovery.md#数据路径最终恢复与宿主收口2026-10-06)。
+完整比赛 Harness 仍阻塞于缺少 `kernel-la`：固定
+`references/oscomp-autotest@d1bb3a3c4b27274e196a2648518525c1a304e339/kernel/run.py`
+要求启动 LoongArch 内核，当前 `make -n kernel-la` 无目标；上述 RV64 验收不算完整比赛通过。

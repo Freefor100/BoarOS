@@ -455,3 +455,8 @@ seek/非顺序/关闭、冷不连续读、单页错误隔离、低水位、截�
 `python3 -B tests/readahead-riscv.py --pages 1 8 --block-size 4096 --held --transport legacy`
 及 modern 模式使用 NBD 暂扣所有窗口 READ，再保留最后一个；需求读取者和 stop/join
 调用者均须保持等待，响应后才归还 owner。用户态组合、恢复与发布性能另行验收。
+
+
+SQLite NBD runner 的 marker 停机使用显式受控 cut：后端先冻结磁盘并确认退出零，
+再终止 guest，避免主动 kill 被误记成后端协议错误。默认及 RA8/WB8 的阶段七后
+完整 DELETE/WAL 恢复结果、未到达故障序号和输入身份见[最终恢复](../learning/record-lock-sqlite-recovery.md#数据路径最终恢复与宿主收口2026-10-06)。
