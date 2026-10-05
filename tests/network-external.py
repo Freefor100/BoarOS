@@ -304,6 +304,9 @@ def run_one(work, kernel, image, transport, reference, workload, tap_fd):
                 row['driver_statistics'] = {key: int(value) for key, value in re.findall(r'([\w-]+)=(\d+)', final.group(1))} if final else {}
                 if not reference and (row['driver_statistics'].get('loan-peak') != 32 or
                                       row['driver_statistics'].get('copy-packets', 0) == 0 or
+                                      row['driver_statistics'].get('tx-sg', 0) == 0 or
+                                      row['driver_statistics'].get('tx-copy', 0) >=
+                                          row['driver_statistics'].get('tx-sg', 0) or
                                       row['driver_statistics'].get('errors') != 0):
                     raise RuntimeError('loan budget/fallback/device completion not verified')
                 mixed = re.search(r'BoarOS: mixed IRQ rng-bytes=(0x[0-9a-f]+) rng-errors=(0x[0-9a-f]+) rng-timeouts=(0x[0-9a-f]+) block-irqs=(0x[0-9a-f]+)', text)

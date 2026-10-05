@@ -757,6 +757,9 @@ void kernel_main(unsigned long hart_id, const void *dtb)
         shutdown_for_dtb_error(DTB_STATUS_UNSUPPORTED);
     boot_hart_id = hart_id;
     boot_dtb_address = (uintptr_t)dtb;
+    /* 重定位前 __kernel_start 即物理加载地址，绑定镜像 VA->PA 偏移。 */
+    riscv_image_bind_load_offset(RISCV_KERNEL_VIRTUAL_BASE -
+                                 (uint64_t)(uintptr_t)__kernel_start);
     cleanup_retry_ticks = boot_info.timebase_frequency / KERNEL_TICKS_PER_SECOND;
     (void)kernel_random_initialize(boot_info.rng_seed, boot_info.rng_seed_size);
     kernel_random_erase(boot_info.rng_seed, sizeof(boot_info.rng_seed));

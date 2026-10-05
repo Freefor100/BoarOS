@@ -20,9 +20,9 @@ worker，不分配、不睡眠。达到借用上限则复制到有界 PBUF_POOL�
 DMA 槽。UDP 接纳同时检查 DMA 借用、协议堆和备用池占用，保留至少 16 个
 备用 pbuf 给 TCP/控制流；不足计丢弃，不承诺不限速 UDP 无丢包。
 
-TX 把完整 pbuf 链复制到设备自有缓冲，最多 64 个排队，32 个可发布。
+TX 在协商 indirect（bit28）后按包发布槽内 indirect 表：首项为设备头（驱动缓冲），其余为最多两段 pbuf（PBUF_RAM/POOL 且地址落在内核镜像映射内），驱动 `pbuf_ref` 持有到完成；IRQ 只把完成槽标为待归还，worker 在非 IRQ 上下文释放引用，设备失败/超时与 stop 时 abandon 归还全部在途引用后才释放设备内存。未协商 indirect、段数超限、volatile 或地址不可换算时回退为复制路径；`tx-sg`/`tx-copy` 统计两条路径的包数。最多 64 个排队，32 个可发布。
 `linkoutput` 不睡眠，容量不足返回 ERR_MEM。TCP 已接受的内容仍归协议，完成
-唤醒 worker 后重试 unsent 数据，无需用户再次进入 syscall。TX 尚未零拷贝。
+唤醒 worker 后重试 unsent 数据，无需用户再次进入 syscall。零拷贝 TX 持引用期间 TCP 段保持 busy，完成后才可重传。
 
 IRQ 先确认事件，再校验并收割完成，只唤醒 worker。used-index 差值、head ID、
 发布资格、长度和未协商 offload 头都必须合法；modern 运行期 NEEDS_RESET 在

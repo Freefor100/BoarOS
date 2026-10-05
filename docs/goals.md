@@ -67,7 +67,7 @@ ASID 标签 TLB 的硬件上验证。本轮实施：TX indirect+SG 零拷贝（�
 | 重复读取/未命中仍支配目标应用阶段 | 回收预算、必要预读或可省读取；核对内存峰值、压力和脏数据一致性 |
 | 新封口政策下仍有细碎版本或重复准备 | 增量组织/合并；先量化，核对脏数据年龄、内存/日志空间和同步尾延迟 |
 | checkpoint阻塞提交或最终排空成本显著 | 有界批次和调度；核对积压、日志环绕、低内存、卸载及完整恢复 |
-| 非阻塞发送复制放大或固定热缓存运行成本高 | 发送credit约束暂存、重复解析/复制/查询、TX pbuf 链到设备缓冲的驱动复制（SG/indirect descriptors）；先核对错误优先级，保留短写、EFAULT前缀、取消和页生命周期 |
+| 非阻塞发送复制放大或固定热缓存运行成本高 | 发送credit约束暂存、重复解析/复制/查询；先核对错误优先级，保留短写、EFAULT前缀、取消和页生命周期 |
 | Lua构建仍有差距，选定heap清零/搬迁与页内复制不足以解释 | 核对用户程序运行、页解析/ELF及未测固定成本，再选一个机制；VMA指标是比较次数，不能当查询数或时间 |
 | 热路径stat/open无大量设备请求仍慢，fstat更轻 | 核对路径临时缓冲、逐级后端查询及对象周转；累计请求容量不是峰值。空文件创建删除另分解目录、inode/位图、事务及真实资源等待；保护身份、orphan、同步与复用，不顺势扩大缓存重构 |
 | UDP过载丢包或TCP受协议credit约束 | 核对接收/丢弃量、每连接进展、lwIP窗口/池和socket预算；限速可靠性与饱和效率分开，TCP_INFO未支持的字段不作为重传证据 |
@@ -79,6 +79,7 @@ ASID 标签 TLB 的硬件上验证。本轮实施：TX indirect+SG 零拷贝（�
 
 | 阶段/能力 | 事实与证据入口 |
 |---|---|
+| TX indirect+SG 零拷贝 | 协商 bit28 后每包发布间接表（设备头+≤2 段 pbuf），驱动持引用至完成、IRQ 标记/worker 释放、失败与 stop abandon；未协商或不可换算回退复制。真实 TAP 两 transport：tx-sg≈12.7 万包、tx-copy=47、errors=0。见[网卡模块](modules/riscv-virtio-net.md)。 |
 | 块在途测量与最终统计 | 块统计新增时间加权在途积分/忙时/总span/queue-wait/服务时间，设备销毁打印最终行；真实窗口实测忙时平均 1.31、空闲 86%、峰值 8，按触发条件不加深队列。见[块模块](modules/riscv-virtio-block.md)与[成本基线](learning/cost-baseline.md#块设备在途深度实测2026-10-05)。 |
 | 内核栈窗口与未映射 guard | 生产任务栈映射到独立 128 MiB 窗口槽位，低 4 KiB 无 PTE 作为 guard，越界经窗口 VA 立即 store fault；窗口骨架构建期预留、运行期受限 map/unmap、空 level-0 表释放；无页表 fixture 回退 direct-map。见[调度](modules/kernel-scheduler.md)与[Sv39](modules/riscv-sv39.md)。 |
 | 任务常驻 I/O scratch 页 | 每任务首次 I/O 分配一页并跨调用复用，正常调用只解除登记，任务销毁路径归还；musl 自动窗口物理页分配 42744→18066（差 24678 与 24576 次调用吻合）。见[调度](modules/kernel-scheduler.md)与[网络](modules/kernel-network.md)。 |

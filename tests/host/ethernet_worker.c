@@ -60,6 +60,16 @@ u8_t pbuf_free(struct pbuf *p)
     }
     return 0;
 }
+void pbuf_ref(struct pbuf *p) { p->ref++; }
+void riscv_virtio_mmio_net_tx_release(struct riscv_virtio_mmio_net *d,
+    void (*release)(void *), int abandon)
+{ (void)d; (void)release; (void)abandon; }
+int riscv_virtio_mmio_net_send_segments(struct riscv_virtio_mmio_net *d,
+    const struct riscv_net_tx_segment *s, unsigned count, void *owner)
+{ (void)d; (void)s; (void)count; (void)owner; return -KERNEL_ENOTSUP; }
+enum riscv_direct_map_status riscv_image_va_to_pa(uint64_t v, uint64_t size,
+    uint64_t *p)
+{ (void)v; (void)size; (void)p; return RISCV_DIRECT_MAP_STATUS_INVALID; }
 int riscv_virtio_mmio_net_lend(struct riscv_virtio_mmio_net *d, unsigned b)
 { if (d->loaned == 32) return -KERNEL_EAGAIN; lent[b] = 1; d->loaned++; return 0; }
 void riscv_virtio_mmio_net_release(struct riscv_virtio_mmio_net *d, unsigned b)

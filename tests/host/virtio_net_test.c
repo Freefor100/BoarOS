@@ -24,7 +24,8 @@ enum {
     MMIO_QUEUE_AVAIL_HIGH = 0x94, MMIO_QUEUE_USED_LOW = 0xa0,
     MMIO_QUEUE_USED_HIGH = 0xa4, MMIO_CONFIG = 0x100,
 };
-enum { FEATURE_MAC = 1U << 5, FEATURE_STATUS = 1U << 16 };
+enum { FEATURE_MAC = 1U << 5, FEATURE_STATUS = 1U << 16, FEATURE_INDIRECT = 1U << 28 };
+enum { DESC_NEXT = 1U, DESC_WRITE = 2U, DESC_INDIRECT = 4U };
 enum { STATUS_FEATURES_OK = 8, STATUS_DRIVER_OK = 4, STATUS_DEVICE_NEEDS_RESET = 64 };
 
 struct allocation { uint64_t phys; void *data; unsigned order; };
@@ -35,7 +36,7 @@ struct model_queue {
     uint16_t pending[256];
     unsigned pending_count, notifications;
 };
-struct wire_descriptor { uint64_t address; uint32_t length; uint16_t flags; };
+struct wire_descriptor { uint64_t address; uint32_t length; uint16_t flags, next; };
 
 static const unsigned char device_mac[6] = {0x52, 0x54, 0x00, 0x12, 0x34, 0x56};
 static struct physical_page_allocator allocator;
@@ -84,15 +85,50 @@ static void *resolve(uint64_t p)
     }
     assert(0); return 0;
 }
+/* 测试自有的 DMA 可见缓冲：不参与驱动分配计数（live/allocation_calls）。 */
+static void *model_extra_memory(uint64_t *phys)
+{
+    unsigned i = allocation_count++;
+    assert(i < 8);
+    memory[i] = (struct allocation){dma_base + i * UINT64_C(0x100000), calloc(1, 4096), 0};
+    assert(memory[i].data); *phys = memory[i].phys; return memory[i].data;
+}
+static void model_extra_free(uint64_t phys)
+{
+    for (unsigned i = 0; i < allocation_count; i++)
+        if (memory[i].data && memory[i].phys == phys) { free(memory[i].data); memory[i].data = 0; return; }
+    assert(0);
+}
+static void *released_owner[8]; static unsigned released_count;
+static void collect_owner(void *owner)
+{
+    assert(released_count < 8); released_owner[released_count++] = owner;
+}
+static struct wire_descriptor raw_descriptor(uint64_t table, unsigned id)
+{
+    const unsigned char *p = resolve(table + 16U * id);
+    return (struct wire_descriptor){read64(p), read32(p + 8), read16(p + 12), read16(p + 14)};
+}
 static struct wire_descriptor descriptor(unsigned q, unsigned id)
 {
     assert(q < 2 && id < queues[q].number);
-    const unsigned char *p = resolve(queues[q].descriptor + 16U * id);
-    struct wire_descriptor result = {read64(p), read32(p + 8), read16(p + 12)};
-    assert(!(result.flags & ~2U) && read16(p + 14) == 0);
-    assert((result.flags & 2U) == (q == 0 ? 2U : 0U));
+    struct wire_descriptor result = raw_descriptor(queues[q].descriptor, id);
+    if (result.flags & DESC_INDIRECT) {
+        assert(q == 1 && !(result.flags & ~DESC_INDIRECT) && result.next == 0);
+        assert(result.length && result.length % 16U == 0);
+        (void)resolve(result.address + result.length - 1U);
+        return result;
+    }
+    assert(!(result.flags & ~DESC_WRITE) && result.next == 0);
+    assert((result.flags & DESC_WRITE) == (q == 0 ? DESC_WRITE : 0U));
     (void)resolve(result.address + result.length - 1U);
     return result;
+}
+static struct wire_descriptor table_entry(uint64_t table, unsigned index)
+{
+    struct wire_descriptor entry = raw_descriptor(table, index);
+    (void)resolve(entry.address + entry.length - 1U);
+    return entry;
 }
 static uint16_t available_index(unsigned q)
 { return read16((char *)resolve(queues[q].available) + 2); }
@@ -238,7 +274,7 @@ static void setup(unsigned version)
     selected = guest_page_size = allocation_count = allocation_calls = allocation_fail = 0;
     reset_calls = reject_reset_from = reject_features = reject_plic = 0;
     regs[MMIO_MAGIC / 4] = UINT32_C(0x74726976); regs[MMIO_VERSION / 4] = version;
-    regs[MMIO_DEVICE_ID / 4] = 1; low_features = FEATURE_MAC | FEATURE_STATUS; high_features = 1;
+    regs[MMIO_DEVICE_ID / 4] = 1; low_features = FEATURE_MAC | FEATURE_STATUS | FEATURE_INDIRECT; high_features = 1;
     memcpy((char *)regs + MMIO_CONFIG, device_mac, sizeof(device_mac));
     ((unsigned char *)regs)[MMIO_CONFIG + 6] = 1;
     for (unsigned q = 0; q < 2; q++) queues[q].maximum = 256;
@@ -251,7 +287,7 @@ static void start(unsigned version, struct riscv_virtio_mmio_net *d)
     setup(version); memset(d, 0, sizeof(*d));
     assert(riscv_virtio_mmio_net_init(d, regs, sizeof(regs), &allocator, 100, 7) == 0);
     assert(live == 3 && d->link_up && !memcmp(d->mac, device_mac, sizeof(device_mac)));
-    assert(driver_features[0] == (FEATURE_MAC | FEATURE_STATUS));
+    assert(driver_features[0] == (FEATURE_MAC | FEATURE_STATUS | (low_features & FEATURE_INDIRECT)));
     assert(driver_features[1] == (version == 2 ? 1U : 0U));
     assert(queues[0].pending_count == queues[0].number && queues[1].pending_count == 0);
 }
@@ -565,11 +601,57 @@ static void test_legacy_reserved_status(void)
     complete(1, next_head(1), 0, 1); stop(&d);
     puts("PASS: VirtIO-net v1 reserved status bit does not imply unnegotiated modern reset semantics");
 }
+static void test_tx_segments(unsigned version)
+{
+    struct riscv_virtio_mmio_net d; start(version, &d);
+    uint64_t phys[2]; unsigned char *data[2] = {model_extra_memory(&phys[0]), model_extra_memory(&phys[1])};
+    memset(data[0], 'a', 64); memset(data[1], 'b', 37);
+    struct riscv_net_tx_segment segments[2] = {{phys[0], 64}, {phys[1], 37}};
+    int owner = 42; released_count = 0;
+    assert(riscv_virtio_mmio_net_send_segments(&d, segments, 2, &owner) == 0);
+    assert(d.statistics.tx_sg_packets == 1 && d.statistics.tx_copy_packets == 0);
+    unsigned id = next_head(1); struct wire_descriptor desc = descriptor(1, id);
+    assert(desc.flags == DESC_INDIRECT && desc.length == 3U * 16U);
+    unsigned h = version == 1 ? 10 : 12;
+    struct wire_descriptor header = table_entry(desc.address, 0);
+    struct wire_descriptor first = table_entry(desc.address, 1);
+    struct wire_descriptor second = table_entry(desc.address, 2);
+    assert(header.flags == DESC_NEXT && header.next == 1 && header.length == h);
+    assert(first.flags == DESC_NEXT && first.next == 2 && first.length == 64 &&
+           !memcmp(resolve(first.address), data[0], 64));
+    assert(second.flags == 0 && second.length == 37 && !memcmp(resolve(second.address), data[1], 37));
+    complete(1, id, 0, 1); assert(!riscv_virtio_mmio_net_service(&d));
+    riscv_virtio_mmio_net_tx_release(&d, collect_owner, 0);
+    assert(released_count == 1 && released_owner[0] == &owner);
+    riscv_virtio_mmio_net_tx_release(&d, collect_owner, 0);
+    assert(released_count == 1);
+    /* abandon 释放仍持有的在途 owner 且不重复释放。 */
+    assert(riscv_virtio_mmio_net_send_segments(&d, segments, 1, &owner) == 0);
+    riscv_virtio_mmio_net_tx_release(&d, collect_owner, 1);
+    assert(released_count == 2);
+    riscv_virtio_mmio_net_tx_release(&d, collect_owner, 1);
+    assert(released_count == 2);
+    stop(&d); model_extra_free(phys[0]); model_extra_free(phys[1]);
+    printf("PASS: VirtIO-net v%u TX segments post an indirect table and release owners once\n", version);
+}
+
+static void test_tx_segments_unsupported(unsigned version)
+{
+    setup(version); low_features = FEATURE_MAC | FEATURE_STATUS;
+    struct riscv_virtio_mmio_net d; memset(&d, 0, sizeof(d));
+    assert(riscv_virtio_mmio_net_init(&d, regs, sizeof(regs), &allocator, 100, 7) == 0);
+    struct riscv_net_tx_segment segment = {UINT64_C(0x81000000), 16};
+    assert(riscv_virtio_mmio_net_send_segments(&d, &segment, 1, 0) == -KERNEL_ENOTSUP);
+    stop(&d);
+    printf("PASS: VirtIO-net v%u TX segments require the negotiated indirect feature\n", version);
+}
+
 int main(void)
 {
     setvbuf(stdout, 0, _IONBF, 0); unsigned errors = 0;
     for (unsigned version = 1; version <= 2; version++) {
-        test_loan_budget(version); test_tx_copy_budget(version); test_index_wrap(version);
+        test_loan_budget(version); test_tx_copy_budget(version); test_tx_segments(version);
+        test_tx_segments_unsupported(version); test_index_wrap(version);
         for (unsigned q = 0; q < 2; q++) { test_used_index(version, q, 0); test_used_index(version, q, 1); test_duplicate_id(version, q); }
         test_rx_length(version, 0); test_rx_length(version, 1);
         errors += test_rx_offload(version, 1, 0); errors += test_rx_offload(version, 0, 1);
