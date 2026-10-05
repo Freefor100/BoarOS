@@ -422,11 +422,36 @@ ext4 的 `ext4_fpread_batch` 持 mount read lock，按 extent/传统块映射处
 `make test-lwext4-cache-host test-lwext4-batch-read-host` 覆盖共享加载、旧缓存版本保护、
 OOM、独立错误与重试；后者运行 1/4/8 KiB ext4、extent/传统映射的洞、EOF 和片段。
 `make test-io-sleep-riscv` 另用真实八页 VFS batch，要求在释放任何响应前发布八项，
-并验证保留最后一个 DMA 时取消不能提前返回。普通页缓存的顺序预读单独接入，
-不把这个内部接口门禁解释为用户 read 的吞吐收益。
+并验证保留最后一个 DMA 时取消不能提前返回。普通页缓存的顺序预读通过下述候选接入；该内部接口门禁不代表用户 read 的吞吐收益。
 
 
 深度至少 2 的 extent 树截断会修改非根内部索引；每次路径上移归还该引用前，必须
 通过 `ext4_ext_drop_refs` 重算已修改块的校验和。直接归还并清空块号会绕过最终
 checksum 更新，使下一轮合法查找返回 EUCLEAN。`make test-lwext4-deep-truncate-host`
 构造深层稀疏树，验证 1/4 KiB 文件系统部分截断、跨进程重启读回、截零和 e2fsck。
+
+
+## 有界顺序预读候选
+
+`BOAROS_PAGE_CACHE_READAHEAD_PAGES` 支持 0/1/2/4/8，默认 0；只有非零候选才创建
+每缓存实例的独立预读 worker。OFD 保存成功读取的末端和取消 cookie；read/pread/
+sendfile 在首次可能睡眠的 accessed、后端或 usercopy 之前执行 read_begin，立即取消
+不连续预测，read_progress 只登记成功前缀。两个连续片段在页边界完成后可申请下一窗口。
+seek、非顺序读、最后关闭、截断/失效、低水位和停止取消未接纳工作。
+
+队列固定八个 job，只持 inode pin；一实例同时处理一个最多八页批次。worker 取得
+inode read gate，复用 demand/full-overwrite 的 loading 页准备；已存在的页或加载由
+原 owner 处理，预读不交叉等待它。需求读可订阅已发布 loading，只有成功页面对外
+可见；错误页按用户引用收口，无关页面独立成功，也不记作 inode 写回错误。
+准备过程禁止分配回收 I/O，取消时已经有需求读者的页仍保留加载 owner。
+
+接纳点是进入一次 VFS batch：此前可以撤销，之后完整排空最多 32 KiB 的批次，
+包括 1 KiB ext4 内部的多轮块读，不声称逐 DMA 取消。stop 先撤未接纳 job，再 join
+已接纳批次，最后释放实例；截断/失效的 inode write gate 与加载互斥。每个批次完成后
+重新开放中断并让出，队列满或内存不足只放弃推测，不制造需求读错误。
+
+`make test-readahead-riscv` 覆盖全部窗口及 1/4 KiB ext4，验证实际缓存内容、窗口上限、
+seek/非顺序/关闭、冷不连续读、单页错误隔离、低水位、截断、unlink 和回收。
+`python3 -B tests/readahead-riscv.py --pages 1 8 --block-size 4096 --held --transport legacy`
+及 modern 模式使用 NBD 暂扣所有窗口 READ，再保留最后一个；需求读取者和 stop/join
+调用者均须保持等待，响应后才归还 owner。用户态组合、恢复与发布性能另行验收。

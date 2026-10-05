@@ -265,3 +265,33 @@ python3 -B tests/writeback-batch-riscv.py --pages 1 8 --block-size 1024 4096 --t
 
 这是机制与成本验收；候选改变 undo 操作大小后的完整恢复矩阵和匹配发布吞吐，
 仍与预读、TCP 候选一起完成。当前结果不用于自动选择新的生产默认值。
+
+
+## 页缓存顺序预读与取消（2026-10-06）
+
+关闭、1/2/4/8 页均可独立构建，生产仍关闭。初始红测在连续读取两页后只有两页
+缓存，8 页候选门禁失败；接入后为 2+窗口 页，逐字节核对随后数据。常规 modern
+窗口×1/4 KiB ext4 共十组合通过；NBD modern 1/2/4/8 与 legacy 1/8 的 4 KiB ext4
+暂扣门禁通过，发布所有窗口 READ 前不释放，先完成反序前缀再暂扣最后一个。
+真实需求读者与 stop/join 调用者均保持等待，最后响应后读取成功，设备 active/inflight
+归零。它验证预读贯穿页缓存、VFS、ext4 与设备，并不以插入缓存的数量冒充吞吐。
+
+审查发现原连续性判断晚于读取完成：冷非顺序 pread 睡眠时，旧排队预测能够先提交。
+新增实际 OFD 冷读门禁先在 test 78 失败；read_begin 提前到 accessed/后端/usercopy
+之前后通过。成功进度仍单独更新。其他用例覆盖 seek、热非顺序读、最后 close、
+单个推测页的 EIO/17 字节前缀被丢弃、无关页及后续重试成功、无写回错误污染、
+低水位撤销、截断新 EOF 和 unlink 后最后关闭。错误为后端边界注入，NBD 所有权
+暂扣为真实设备响应，两层证据分开。
+
+取消按最多八页 VFS 批次接纳：未接纳 job 可以撤销，已接纳调用包含的内部多轮
+块读取完整收口，故 1 KiB ext4 可继续完成同批的最多 32 个块；stop 不再取下一 job。
+这不是逐 DMA 可取消接口。默认构建 VFS/files/partial-write/真实 musl/pthread 回归
+通过，8 页预读+8 页写回的编译栈门禁通过（最大单函数 3152 B）；运行期栈水位和
+完整恢复矩阵继续在最终组合验证记录，不能以单函数门禁证明所有调用链。
+
+```sh
+make test-readahead-riscv
+python3 -B tests/readahead-riscv.py --pages 1 2 4 8 --block-size 4096 --held --transport modern
+python3 -B tests/readahead-riscv.py --pages 1 8 --block-size 4096 --held --transport legacy
+make CFLAGS_EXTRA='-DBOAROS_PAGE_CACHE_READAHEAD_PAGES=8 -DBOAROS_PAGE_CACHE_WRITEBACK_PAGES=8' test-stack-usage
+```

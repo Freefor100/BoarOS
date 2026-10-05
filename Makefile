@@ -1798,3 +1798,7 @@ $(BUILD_DIR)/tests/riscv/scale_main.o: CPPFLAGS += $(LWIP_CPPFLAGS)
 .PHONY: test-writeback-batch-riscv
 test-writeback-batch-riscv:
 	python3 -B tests/writeback-batch-riscv.py
+
+.PHONY: test-readahead-riscv
+test-readahead-riscv:
+	python3 -B tests/readahead-riscv.py
