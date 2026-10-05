@@ -26,8 +26,6 @@
 
 #include <arch/riscv/context.h>
 
-#define KERNEL_FILES_MAX_RW_COUNT \
-    ((uint64_t)INT32_MAX & ~(uint64_t)BOAROS_PAGE_MASK)
 #define KERNEL_FILES_WRITE_STAGING 64U
 
 static enum kernel_files_status release_io_description(
@@ -1419,6 +1417,82 @@ static enum kernel_files_status buffered_write_request(
     return KERNEL_FILES_STATUS_OK;
 }
 
+static enum kernel_files_status tcp_write_request(
+    struct kernel_files *files, struct kernel_mm *mm,
+    struct kernel_open_file_description *description,
+    const struct kernel_uaccess_iovec *iov, size_t iov_count, uint64_t count,
+    uint32_t flags, int64_t *linux_result)
+{
+    struct kernel_open_file_description *borrowed = description;
+    struct kernel_socket *socket = kernel_open_file_socket(description);
+    struct kernel_socket_write_request request = {0};
+    struct kernel_task_io_buffer buffer = {0};
+    struct kernel_uaccess_iov_cursor cursor = {iov, iov_count, 0, 0};
+    enum kernel_files_status status = KERNEL_FILES_STATUS_OK;
+    uint64_t total = 0, target = 0, timeout = kernel_socket_send_timeout(socket);
+    size_t staged = 0, consumed = 0;
+    int fault = 0;
+    if (timeout) {
+        uint64_t now = kernel_time_monotonic_ns();
+        target = UINT64_MAX - now < timeout ? UINT64_MAX : now + timeout;
+    }
+    kernel_socket_stream_begin(&request, &description);
+    do {
+        uint64_t address = 0;
+        size_t chunk = staged - consumed;
+        if (!chunk && count) {
+            size_t limit = count - total < BOAROS_PAGE_SIZE ? (size_t)(count - total) : BOAROS_PAGE_SIZE;
+            chunk = kernel_uaccess_iov_span(&cursor, limit, &address);
+            if (!chunk) { status = KERNEL_FILES_STATUS_STATE; break; }
+        }
+        int result = kernel_socket_stream_reserve(&request, (uint32_t)chunk, flags);
+        size_t copied_now = 0;
+        if (result >= 0) {
+            if (!count) { *linux_result = 0; break; }
+            if (!result || (size_t)result > chunk) { status = KERNEL_FILES_STATUS_STATE; break; }
+            chunk = (size_t)result;
+            if (staged == consumed) {
+                if (!buffer.allocator) {
+                    if (kernel_task_io_buffer_acquire(&buffer, mm->allocator) != KERNEL_TASK_STATUS_OK) {
+                        *linux_result = total ? (int64_t)total : -KERNEL_ENOMEM; break;
+                    }
+                    COST_IO_ADD(5, BOAROS_PAGE_SIZE);
+                }
+                files->record->statistics.write_chunks++;
+                enum kernel_uaccess_status access = kernel_copy_from_user_iov(mm, &cursor,
+                    buffer.data, chunk, &copied_now);
+                if ((access != KERNEL_UACCESS_STATUS_OK && access != KERNEL_UACCESS_STATUS_FAULT) ||
+                    copied_now > chunk || (access == KERNEL_UACCESS_STATUS_OK && copied_now != chunk)) {
+                    status = KERNEL_FILES_STATUS_STATE; break;
+                }
+                fault = access == KERNEL_UACCESS_STATUS_FAULT;
+                if (!copied_now) { *linux_result = total ? (int64_t)total : -KERNEL_EFAULT; break; }
+                staged = copied_now; consumed = 0; chunk = copied_now;
+            }
+            result = kernel_socket_stream_commit(&request,
+                (const unsigned char *)buffer.data + consumed, (uint32_t)chunk, flags);
+        }
+        if (result == -KERNEL_EAGAIN) {
+            if (!total) COST_ADD(STREAM_COPY_BLOCKED_BYTES, copied_now);
+            uint64_t now = target ? kernel_time_monotonic_ns() : 0;
+            result = target && now >= target ? -KERNEL_EAGAIN : socket_wait_ready(borrowed,
+                KERNEL_POLLOUT, target ? target - now : 0, flags);
+            if (!result) continue; /* 暂存尾部留在当前请求，下次只重取接纳预算。 */
+            if (total && result == -KERNEL_ERESTARTSYS)
+                kernel_signal_clear_syscall_restart(kernel_task_current());
+        }
+        if (result < 0) { *linux_result = total ? (int64_t)total : result; break; }
+        if (!result || (size_t)result > staged - consumed) { status = KERNEL_FILES_STATUS_STATE; break; }
+        consumed += (size_t)result; total += (uint64_t)result;
+        *linux_result = (int64_t)total;
+        if (fault || (consumed < staged && ((borrowed->open_flags & KERNEL_FILES_O_NONBLOCK) ||
+            (flags & KERNEL_SOCKET_MSG_DONTWAIT)))) break;
+    } while (total < count);
+    kernel_socket_stream_finish(&request);
+    if (buffer.allocator) kernel_task_io_buffer_release(&buffer);
+    return status;
+}
+
 static enum kernel_files_status write_request(
     struct kernel_files *files, struct kernel_mm *mm,
     struct kernel_open_file_description *description,
@@ -1438,6 +1512,12 @@ static enum kernel_files_status write_request(
                 ((description->open_flags & KERNEL_FILES_O_NONBLOCK) ? KERNEL_SOCKET_MSG_DONTWAIT : 0U), 0);
         COST_IO_ADD(2, *linux_result > 0 ? (uint64_t)*linux_result : 0);
         return KERNEL_FILES_STATUS_OK;
+    }
+    if (kernel_socket_is_tcp(kernel_open_file_socket(description))) {
+        enum kernel_files_status status = tcp_write_request(files, mm, description,
+            iov, iov_count, count, socket_flags, linux_result);
+        if (status == KERNEL_FILES_STATUS_OK) COST_IO_ADD(2, *linux_result > 0 ? (uint64_t)*linux_result : 0);
+        return status;
     }
     KERNEL_LOCK_SCOPE(offset_guard);
     if ((!positioned && kernel_open_file_kind(description) == KERNEL_OPEN_FILE_KIND_REGULAR) ||

@@ -33,6 +33,7 @@ static struct kernel_vfs_file file;
 static struct riscv_virtio_mmio_block device;
 static unsigned char payload[4096];
 static struct kernel_mm sync_mm;
+static struct riscv_sv39_page_table protocol_table;
 static uint64_t sync_satp, sync_address;
 static int sync_edit, operation_testing;
 static struct kernel_files operation_files;
@@ -44,6 +45,10 @@ static int64_t operation_fd[2];
 static int pipe_copy_testing;
 static unsigned pipe_copy_entered;
 static int32_t pipe_copy_pair[2];
+static unsigned send_copy_testing, send_copy_paused, send_copy_mode;
+static struct kernel_task *send_copy_task;
+static struct kernel_wait_queue send_copy_held;
+static int64_t send_copy_fd;
 #define OP_USER UINT64_C(0x21000000)
 struct kernel_task *__real_kernel_task_current(void);
 struct kernel_task *__wrap_kernel_task_current(void)
@@ -185,6 +190,16 @@ static void sync_source_probe(void *argument)
 }
 enum kernel_uaccess_status __wrap_kernel_copy_from_user(struct kernel_mm *mm, void *buffer, uint64_t address, size_t size, size_t *copied)
 {
+    if (send_copy_testing && mm == &sync_mm) {
+        if (address == OP_USER && scheduler.current == send_copy_task && !send_copy_paused) {
+            send_copy_paused = 1;
+            enum kernel_wait_wake_reason reason;
+            check(kernel_scheduler_block_current(&send_copy_held, 0, 0, &reason) == KERNEL_SCHEDULER_STATUS_OK, 310);
+        }
+        int previous = sync_edit; sync_edit = 1;
+        enum kernel_uaccess_status result = __real_kernel_copy_from_user(mm, buffer, address, size, copied);
+        sync_edit = previous; return result;
+    }
     if (pipe_copy_testing && mm == &sync_mm) {
         if (address == OP_USER + 4096 && !pipe_copy_entered) {
             pipe_copy_entered = 1;
@@ -480,10 +495,82 @@ static void receive_reservation_probe(void *argument)
     virt_uart_puts("I/O socket reservation passed: owner, HUP, timeout, signal and fault\n");
     riscv_interrupt_restore(irq);
 }
+static void stream_copy_owner(void *argument)
+{
+    (void)argument;
+    uintptr_t irq = riscv_interrupt_save(); send_copy_task = scheduler.current;
+    struct kernel_open_file_description *pin = 0;
+    int64_t result;
+    check(kernel_files_pin(&operation_files, send_copy_fd, &pin, &result) == KERNEL_FILES_STATUS_OK && !result, 311);
+    check(kernel_files_socket_io(&operation_files, &sync_mm, &pin, OP_USER, 3,
+        KERNEL_SOCKET_MSG_NOSIGNAL, 1, &result) == KERNEL_FILES_STATUS_OK &&
+        result == (send_copy_mode == 0 ? 3 : send_copy_mode == 1 ? -KERNEL_EPIPE : -KERNEL_EFAULT), 312);
+    check(!scheduler.current->socket_write_request && kernel_open_file_release(&pin) == KERNEL_OPEN_FILE_STATUS_OK, 313);
+    riscv_interrupt_restore(irq);
+}
+static void stream_copy_probe(void)
+{
+    uintptr_t irq = riscv_interrupt_save();
+    for (send_copy_mode = 0; send_copy_mode < 3; send_copy_mode++) {
+        send_copy_testing = operation_testing = 1; send_copy_paused = 0; send_copy_task = 0;
+        kernel_wait_queue_init(&send_copy_held);
+        sync_mm = (struct kernel_mm){0}; operation_files = (struct kernel_files){0};
+        struct riscv_sv39_page_table table = {0}; struct riscv_sv39_user_space space = {0};
+        check(riscv_sv39_page_table_init(&table, &allocator) == RISCV_SV39_STATUS_OK, 314); table.state = RISCV_SV39_STATE_ACTIVE;
+        check(riscv_sv39_user_space_init(&space, &allocator, &table) == RISCV_SV39_STATUS_OK &&
+            riscv_kernel_mm_create(&sync_mm, &space) == KERNEL_MM_STATUS_OK && kernel_mm_vma_enable(&sync_mm, &heap) == KERNEL_MM_STATUS_OK &&
+            kernel_mm_brk_initialize(&sync_mm, 0x10000000, 0x70000000) == KERNEL_MM_STATUS_OK &&
+            riscv_kernel_mm_satp(&sync_mm, &sync_satp) == KERNEL_MM_STATUS_OK && kernel_files_create(&operation_files, &heap) == KERNEL_FILES_STATUS_OK, 315);
+        uint64_t address; size_t copied; int64_t result, listener_fd;
+        sync_edit = 1;
+        check(kernel_mm_mmap_anonymous(&sync_mm, OP_USER, 4096, KERNEL_MM_READ | KERNEL_MM_WRITE,
+            KERNEL_MM_MAP_FIXED_NOREPLACE, &address) == KERNEL_MM_STATUS_OK &&
+            kernel_copy_to_user(&sync_mm, OP_USER, "pin", 3, &copied) == KERNEL_UACCESS_STATUS_OK, 316);
+        sync_edit = 0;
+        struct kernel_open_file_description *listener = 0, *client = 0, *reader = 0;
+        struct kernel_socket *accepted = 0;
+        check(kernel_files_socket_create(&operation_files, 2, 1, 0, &listener_fd) == KERNEL_FILES_STATUS_OK && listener_fd >= 0 &&
+            kernel_files_socket_create(&operation_files, 2, 1, 0, &send_copy_fd) == KERNEL_FILES_STATUS_OK && send_copy_fd >= 0 &&
+            kernel_files_pin(&operation_files, listener_fd, &listener, &result) == KERNEL_FILES_STATUS_OK && !result &&
+            kernel_files_pin(&operation_files, send_copy_fd, &client, &result) == KERNEL_FILES_STATUS_OK && !result, 317);
+        struct kernel_socket *socket = kernel_open_file_socket(client), *listening = kernel_open_file_socket(listener);
+        struct kernel_socket_address local = {.family = KERNEL_SOCKET_AF_INET}, remote = {.family = KERNEL_SOCKET_AF_INET, .bytes = {127,0,0,1}};
+        check(kernel_socket_bind(listening, &local) == 0 && kernel_socket_getname(listening, &local) == 0 &&
+            kernel_socket_listen(listening, 2) == 0 && (remote.port = local.port, kernel_socket_connect(socket, &remote, 0)) == 0 &&
+            kernel_socket_accept(listening, &accepted) == 0 &&
+            kernel_open_file_create_socket(&heap, accepted, 0, &reader) == KERNEL_OPEN_FILE_STATUS_OK, 318);
+        struct kernel_thread_join writer = {0};
+        check(kernel_thread_create_joinable(stream_copy_owner, 0, &writer) == KERNEL_SCHEDULER_STATUS_OK, 319);
+        while (!send_copy_paused) check(kernel_scheduler_yield_current() == KERNEL_SCHEDULER_STATUS_OK, 320);
+        check(send_copy_task->socket_write_request && send_copy_task->socket_write_request->reserved == 3, 321);
+        check(kernel_files_close(&operation_files, send_copy_fd, &result) == KERNEL_FILES_STATUS_OK && !result, 322);
+        int64_t replacement;
+        check(kernel_files_socket_create(&operation_files, 2, 2, 0, &replacement) == KERNEL_FILES_STATUS_OK && replacement == send_copy_fd, 323);
+        if (send_copy_mode == 1) check(kernel_socket_shutdown(socket, 1) == 0, 324);
+        if (send_copy_mode == 2) { sync_edit = 1; check(kernel_mm_munmap(&sync_mm, OP_USER, 4096) == KERNEL_MM_STATUS_OK, 325); sync_edit = 0; }
+        check(kernel_wait_queue_wake_all(&send_copy_held) == KERNEL_SCHEDULER_STATUS_OK, 326);
+        kernel_thread_join(&writer);
+        if (!send_copy_mode) {
+            struct kernel_socket_read_request request = {0}; char data[3];
+            check(kernel_socket_reserve_read(accepted, kernel_task_current(), &request, &reader, 3, 1) == 3, 327);
+            kernel_socket_copy_read(&request, 0, data, 3); check(!memcmp(data, "pin", 3), 328); kernel_socket_finish_read(&request, 0);
+        } else if (send_copy_mode == 2) {
+            struct kernel_socket_write_request request = {0}; kernel_socket_stream_begin(&request, &client);
+            check(kernel_socket_stream_reserve(&request, 3, 0) == 3, 329); kernel_socket_stream_finish(&request);
+        }
+        check(kernel_open_file_release(&client) == KERNEL_OPEN_FILE_STATUS_OK && kernel_open_file_release(&reader) == KERNEL_OPEN_FILE_STATUS_OK &&
+            kernel_open_file_release(&listener) == KERNEL_OPEN_FILE_STATUS_OK && kernel_files_release(&operation_files) == KERNEL_FILES_STATUS_OK, 330);
+        send_copy_testing = operation_testing = 0; sync_satp = 0;
+        check(kernel_mm_release(&sync_mm) == KERNEL_MM_STATUS_OK && physical_page_release(&allocator, table.root_address) == PHYSICAL_PAGE_STATUS_OK, 331);
+    }
+    virt_uart_puts("I/O TCP copy sleep passed: reservation, close/reuse, shutdown and fault rollback\n");
+    riscv_interrupt_restore(irq);
+}
 static void socket_and_pipe_copy_probes(void *argument)
 {
     receive_reservation_probe(argument);
     pipe_copy_probe(argument);
+    stream_copy_probe();
 }
 static void print_counters(const char *phase, const struct riscv_virtio_mmio_block_statistics *stats)
 {
@@ -1100,6 +1187,17 @@ void kernel_main(unsigned long hart, const void *dtb)
           physical_page_allocator_bind_access(&allocator, access_page) == PHYSICAL_PAGE_STATUS_OK &&
           physical_page_allocator_finalize(&allocator) == PHYSICAL_PAGE_STATUS_OK &&
           kernel_heap_init(&heap, &allocator, physical) == KERNEL_HEAP_STATUS_OK, 2);
+    /* lwIP静态表含链接的高地址；启用双别名后再初始化调度器，其页计入fixture固定基线。 */
+    check(riscv_sv39_page_table_init(&protocol_table, &allocator) == RISCV_SV39_STATUS_OK &&
+        riscv_sv39_map_range(&protocol_table, 0x80000000, 0x80000000, 512 * 1024 * 1024,
+            RISCV_SV39_READ | RISCV_SV39_WRITE | RISCV_SV39_EXECUTE) == RISCV_SV39_STATUS_OK &&
+        riscv_sv39_map_range(&protocol_table, UINT64_C(0xffffffff80000000), 0x80200000, 128 * 1024 * 1024,
+            RISCV_SV39_READ | RISCV_SV39_WRITE | RISCV_SV39_EXECUTE) == RISCV_SV39_STATUS_OK &&
+        riscv_sv39_map_range(&protocol_table, 0x10000000, 0x10000000, 0x200000,
+            RISCV_SV39_READ | RISCV_SV39_WRITE) == RISCV_SV39_STATUS_OK &&
+        riscv_sv39_map_range(&protocol_table, 0xc000000, 0xc000000, 0x400000,
+            RISCV_SV39_READ | RISCV_SV39_WRITE) == RISCV_SV39_STATUS_OK &&
+        riscv_sv39_activate(&protocol_table) == RISCV_SV39_STATUS_OK, 333);
     uint64_t baseline = physical_page_available(&allocator);
     timebase = info.timebase_frequency;
     check(kernel_page_cache_init(&cache, &heap, &allocator) == KERNEL_PAGE_CACHE_STATUS_OK, 3);

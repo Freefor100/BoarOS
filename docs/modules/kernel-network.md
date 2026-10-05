@@ -194,3 +194,32 @@ DHCP/DNS/TLS或默认网关。结果、效率、
 程序与最终卸载计时边界见[真实网卡记录](../learning/network-ownership.md#真实-virtio-net-与宿主应用交付2026-10-02)。
 
 纯查询及预算回归位于 `tests/riscv/scale_main.c`：16 个无关 socket 下的 64 次 poll 没有协议调用；零/一单元服务遵守预算并最终交付完整内容。协议池回归冻结时钟且禁用包与 timer 服务，证明“空闲 segment 已有一个，再释放一个”足以恢复真正等待者。`make test-cache-growth-riscv` 的 COST 构建同时核对 poll 触发服务数和全局扫描数均为零；全局 registry 只用于 bind 冲突、销毁解绑与设备故障。重建与证据层次见[网络记录](../learning/network-ownership.md#纯就绪与有界协议服务2026-10-05)。
+
+
+## TCP 发送接纳与复制（2026-10-05）
+
+INET stream 的 write/writev/send/sendmsg 使用任务登记的 `kernel_socket_write_request`，
+与数据报请求共用退出登记但不拥有数据报 packet。请求持有原 OFD pin，
+`stream_reserve/commit/cancel` 只预留本 socket 的 TCP 接纳字节，按 sndbuf、socket 预算、
+队列空间及已经预留量决定上限，不预占 segment、pbuf 或 NIC 槽。其他 writer、sendfile
+及 POLLOUT 都扣除现存预留；SO_SNDBUF 缩小或连接状态变化后，commit 再检查真实状态。
+用户复制可缺页睡眠，不持 raw 资格；取消、fault、错误、返回和任务退出均归还未提交预算。
+
+扩展现有 iovec cursor 提供页内有界 span。先验证参数的数值范围及连接状态，再取得接纳量，
+最后才取得任务 scratch 并复制 payload；预先无容量不解析用户页。协议资源可能在复制时变化，
+此时仍可能发生有界的零进度失败。阻塞调用保留暂存后缀，重取预算后继续提交，
+不再次复制后缀；非阻塞返回已接受前缀，未接受用户内容不跨调用持有。仍用
+`tcp_write(COPY)`，scratch 不借给 TCP 到 ACK。本阶段不改变 UNIX stream 和数据报的缓冲策略。
+
+固定 Linux 的 `net/socket.c` 和 `net/ipv4/tcp.c` 约束状态与 payload fault 顺序：
+数值越界地址先 EFAULT；有效地址范围中的不可读页在满缓冲时为 EAGAIN，
+在关闭/未连接时为 EPIPE，NOSIGNAL 仅抑制 SIGPIPE。空 TCP 发送也检查终止状态。
+`tests/workloads/network/admission.c` 由 `network-riscv.py --workload admission` 在同 ELF 双侧验证，
+包含头/iovec fault、范围错误、部分接受字节守恒、SIGPIPE 与实际阻塞发送者 SIGKILL。
+已有进展时的 shutdown 返回正前缀且不发 SIGPIPE；RST 后也保留 pending error，下一次调用才观察并消费 ECONNRESET。
+跨页 fault 的提交片段大小是内部策略：本输入 Linux 未提交返回 EFAULT，BoarOS 返回已提交
+4096 字节，测试分别验证接收量与返回值，不能将该项写成逐值差分一致。
+
+scale 保护竞争 reservation、abort 归还及零容量下零页解析/零 stream usercopy；
+真实调度的 io-sleep 包装用户复制边界，覆盖保留 reservation 时关闭并复用 fd、并发 shutdown、
+用户页撤销后的 fault 和预算重取。它模型化可睡眠复制的交错，不宣称复现硬件缺页的具体时序。

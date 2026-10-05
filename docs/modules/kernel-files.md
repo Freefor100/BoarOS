@@ -388,3 +388,10 @@ OFD持有独立挂载错误游标，新打开从当前序号开始，dup/fork共
 快照、durable边界及OOM退路见[VFS契约](vfs-ext4.md)；窄入口为
 `make test-vfs-riscv test-files-riscv`及`tests/diff-abi/sync-cases.txt`，真实libc入口为
 `tests/userland/sync.h`。
+
+
+INET TCP 的流写接纳先于 payload usercopy：请求把 OFD pin 和 byte reservation 登记到当前任务，
+页内 iovec span 受接纳量限制，缺页睡眠期间 pin 保证 close/fd 复用不改变目标。
+完整请求正常展开或强制退出归还预留；同一次阻塞发送保留暂存后缀。
+数值地址范围检查仍在状态与容量判断之前，实际读页在之后；文件、UNIX 和数据报路径保持各自契约。
+接口与同 ELF 验证见[网络模块](kernel-network.md#tcp-发送接纳与复制2026-10-05)。
