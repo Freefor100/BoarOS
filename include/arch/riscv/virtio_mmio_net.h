@@ -26,6 +26,7 @@ struct riscv_virtio_mmio_net {
     struct kernel_thread_join worker;
     struct riscv_net_statistics statistics;
     uint64_t tx_time[RISCV_NET_BUFFERS];
+    uint64_t tx_capacity_generation;
     uint32_t version, queue_order, irq_source, feature_low;
     uint32_t rx_posted, tx_posted;
     uint16_t available[2], consumed[2];
@@ -60,8 +61,8 @@ int riscv_virtio_mmio_net_send_copy(struct riscv_virtio_mmio_net *device, uint32
  * until the caller releases it. Needs the negotiated indirect feature. */
 int riscv_virtio_mmio_net_send_segments(struct riscv_virtio_mmio_net *device,
     const struct riscv_net_tx_segment *segments, unsigned count, void *owner);
-/* Release completed owners; abandon also returns posted/pending owners after
- * the device stopped its DMA. */
-void riscv_virtio_mmio_net_tx_release(struct riscv_virtio_mmio_net *device,
+/* Return the number of released owners; abandon also releases posted/pending
+ * owners after DMA stopped. tx_capacity_generation also includes copied TX. */
+unsigned riscv_virtio_mmio_net_tx_release(struct riscv_virtio_mmio_net *device,
     void (*release)(void *owner), int abandon);
 #endif

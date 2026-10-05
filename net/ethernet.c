@@ -173,7 +173,11 @@ static void worker(void *context)
         uintptr_t irq = riscv_interrupt_save();
         if (d->stopping) { riscv_interrupt_restore(irq); return; }
         unsigned handled = 0;
-        if (riscv_virtio_mmio_net_service(d)) {
+        int failed = riscv_virtio_mmio_net_service(d);
+        /* RX和协议回调都可能发送；先归还完成owner及其槽位。 */
+        riscv_virtio_mmio_net_tx_release(d, release_owner, 0);
+        uint64_t capacity_generation = d->tx_capacity_generation;
+        if (failed) {
             device_failed(n);
         } else {
             if (d->link_up) netif_set_link_up(&n->interface); else netif_set_link_down(&n->interface);
@@ -184,10 +188,10 @@ static void worker(void *context)
         }
         /* 失败NIC不再收发，但共享的loopback与协议期限仍须独立进展。 */
         kernel_socket_network_process();
-        /* 完成通知在IRQ标记；owner释放留在worker上下文。 */
-        riscv_virtio_mmio_net_tx_release(d, release_owner, 0);
         if (riscv_virtio_mmio_net_service(d)) device_failed(n);
-        if (handled == 8) {
+        riscv_virtio_mmio_net_tx_release(d, release_owner, 0);
+        /* 最后一次收割也会归还复制路径的容量，不能只检查SG done链。 */
+        if (capacity_generation != d->tx_capacity_generation || (!d->failed && d->ready_count)) {
             /* 批次间给中断和其他任务机会，不持raw调用栈睡在设备credit上。 */
             riscv_interrupt_restore(irq);
             irq = riscv_interrupt_save();

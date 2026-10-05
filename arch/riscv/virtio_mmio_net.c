@@ -183,7 +183,7 @@ static void harvest(struct riscv_virtio_mmio_net *d)
                     d->tx_state[b] = TX_DONE;
                     d->tx_done[(d->tx_done_head + d->tx_done_count++) %
                                RISCV_NET_BUFFERS] = (uint16_t)b;
-                } else d->tx_state[b] = TX_FREE;
+                } else { d->tx_state[b] = TX_FREE; d->tx_capacity_generation++; }
             }
             else {
                 if (d->ready_count == 64) __builtin_trap();
@@ -396,10 +396,11 @@ int riscv_virtio_mmio_net_send_segments(struct riscv_virtio_mmio_net *d,
     riscv_interrupt_restore(saved);
     return 0;
 }
-void riscv_virtio_mmio_net_tx_release(struct riscv_virtio_mmio_net *d,
+unsigned riscv_virtio_mmio_net_tx_release(struct riscv_virtio_mmio_net *d,
     void (*release)(void *owner), int abandon)
 {
-    if (!d || !release) return;
+    if (!d || !release) return 0;
+    unsigned released = 0;
     uintptr_t saved = riscv_interrupt_save();
     if (abandon) {
         /* reset/stop 已确认 DMA 停止，归还所有仍持有的 owner。 */
@@ -408,6 +409,8 @@ void riscv_virtio_mmio_net_tx_release(struct riscv_virtio_mmio_net *d,
             release(d->tx_owner[b]);
             d->tx_owner[b] = 0;
             d->tx_state[b] = TX_FREE;
+            d->tx_capacity_generation++;
+            released++;
         }
         d->tx_head = 0; d->tx_count = 0; d->tx_done_head = 0; d->tx_done_count = 0;
     } else {
@@ -418,9 +421,12 @@ void riscv_virtio_mmio_net_tx_release(struct riscv_virtio_mmio_net *d,
             release(d->tx_owner[b]);
             d->tx_owner[b] = 0;
             d->tx_state[b] = TX_FREE;
+            d->tx_capacity_generation++;
+            released++;
         }
     }
     riscv_interrupt_restore(saved);
+    return released;
 }
 int riscv_virtio_mmio_net_send(struct riscv_virtio_mmio_net *d, const void *data, uint32_t size)
 {
