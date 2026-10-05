@@ -193,3 +193,8 @@ CPU 时间。零字节成功执行可以有样本，失败准备不能伪造工�
 聚合存储仍受 64 KiB 上限保护；测试约束这一公开预算，不绑定某个私有布局字节数。
 
 网络服务指标在版本 1 末尾追加，旧 schema 仍由报告器识别：服务批次、socket 工作单元、loopback 包、timer 回调、全局 registry 扫描、poll 查询及查询触发服务、带可执行工作睡眠次数。socket 工作单元含容量转交与到期重试，不能解释为唯一 socket 数；末项为睡前诊断谓词，正常应为零。没有新增对象引用或动态观测内存，聚合仍受 64 KiB 门禁。
+
+TCP admission 新增 `stream_admit_blocked`（预先无容量的尝试）、`stream_protocol_blocked`
+（复制后提交仍为 EAGAIN 的尝试）和 `stream_copy_blocked_bytes`（尚无进展时这些失败新复制的
+payload 字节）。阻塞调用可能有多次尝试，不能当作 syscall 次数；复用暂存后缀不再次计复制。
+现有 `stream_copy` 仍记录全部真实复制。指标在末尾追加，前一网络 schema 继续可读。

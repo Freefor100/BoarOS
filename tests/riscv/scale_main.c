@@ -171,6 +171,35 @@ static void tcp_cost(struct kernel_files *files, struct kernel_mm *mm)
         int got=kernel_socket_reserve_read(accepted,0,&request,&reader,sizeof(payload),0);
         check(got>0,202);kernel_socket_finish_read(&request,0);consumed+=(uint32_t)got;
     }
+    struct kernel_socket_write_request reservation = {0}, competing = {0};
+    struct kernel_open_file_description *second_pin = client;
+    check(kernel_open_file_acquire(second_pin) == KERNEL_OPEN_FILE_STATUS_OK, 240);
+    kernel_socket_stream_begin(&reservation, &client);
+    int reserved = kernel_socket_stream_reserve(&reservation, UINT16_MAX, 0);
+    check(reserved > 0 && !client && !(kernel_socket_poll(client_socket, 0) & KERNEL_POLLOUT), 241);
+    kernel_socket_stream_begin(&competing, &second_pin);
+    check(kernel_socket_stream_reserve(&competing, 1, 0) == -KERNEL_EAGAIN, 242);
+    resolutions = kernel_uaccess_page_resolutions();
+#if BOAROS_COST_DIAGNOSTICS
+    check(kernel_cost_begin(5, cost_frequency, 1, 0) == 0, 243);
+#endif
+    check(kernel_files_write(files, mm, client_fd, BUFFER, 4096, &result) == KERNEL_FILES_STATUS_OK &&
+          result == -KERNEL_EAGAIN && kernel_uaccess_page_resolutions() == resolutions, 244);
+#if BOAROS_COST_DIAGNOSTICS
+    uint64_t denied, copied_blocked, copied_stream;
+    check(kernel_cost_end(5, 0) == 0 &&
+          kernel_cost_read(0, COST_STREAM_ADMIT_BLOCKED, &denied) == 0 && denied == 1 &&
+          kernel_cost_read(0, COST_STREAM_COPY_BLOCKED_BYTES, &copied_blocked) == 0 && !copied_blocked &&
+          kernel_cost_read(0, COST_STREAM_COPY, &copied_stream) == 0 && !copied_stream, 245);
+#endif
+    kernel_socket_stream_cancel(&reservation);
+    check(kernel_socket_stream_reserve(&competing, 3, 0) == 3, 246);
+    /* 故障/退出走同一个abort；其他请求随后必须重新拿到这份接纳量。 */
+    kernel_socket_abort_write(&competing);
+    check(kernel_socket_stream_reserve(&reservation, (uint32_t)reserved, 0) == reserved, 247);
+    kernel_socket_stream_finish(&reservation);
+    check(client && kernel_socket_poll(client_socket, 0) & KERNEL_POLLOUT, 248);
+    virt_uart_puts("TCP admission: competing reservations, cancel and zero-copy EAGAIN passed\n");
     uintptr_t core = kernel_socket_protocol_enter();
     check(kernel_socket_write_buffer(client_socket, "batch", 5, 0) == 5, 223);
     kernel_socket_protocol_leave(core);

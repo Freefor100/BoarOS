@@ -26,6 +26,8 @@ struct kernel_socket_read_request {
 };
 
 struct kernel_socket_write_request {
+    uint32_t reserved;
+    uint8_t progressed;
     struct kernel_socket *socket;
     struct kernel_task *task;
     void *packet;
@@ -39,6 +41,15 @@ int kernel_socket_write_datagram(struct kernel_open_file_description **pin_owner
     size_t iov_count, uint64_t count, uint32_t flags,
     const struct kernel_socket_address *destination);
 void kernel_socket_abort_write(struct kernel_socket_write_request *request);
+int kernel_socket_is_tcp(const struct kernel_socket *socket);
+void kernel_socket_stream_begin(struct kernel_socket_write_request *request,
+    struct kernel_open_file_description **pin_owner);
+int kernel_socket_stream_reserve(struct kernel_socket_write_request *request,
+    uint32_t size, uint32_t flags);
+int kernel_socket_stream_commit(struct kernel_socket_write_request *request,
+    const void *buffer, uint32_t size, uint32_t flags);
+void kernel_socket_stream_cancel(struct kernel_socket_write_request *request);
+void kernel_socket_stream_finish(struct kernel_socket_write_request *request);
 
 struct kernel_socket_statistics {
     uint64_t tcp_write_calls;

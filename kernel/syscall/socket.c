@@ -483,6 +483,7 @@ static enum kernel_files_status socket_message(
          KERNEL_UACCESS_STATUS_OK || copied != header.iov_count * sizeof(*iov))) goto out;
     for (size_t i = 0; i < header.iov_count; i++) {
         if (iov[i].length > INT64_MAX - count) { *result = -KERNEL_EINVAL; goto out; }
+        if (kernel_user_range_check(iov[i].base, (size_t)iov[i].length) != KERNEL_UACCESS_STATUS_OK) { *result = -KERNEL_EFAULT; goto out; }
         count += iov[i].length;
     }
     struct kernel_socket *socket = kernel_open_file_socket(*file);
@@ -545,9 +546,11 @@ enum kernel_syscall_status syscall_handle_socket_operation(
     int op = (int)request->number;
 
     decoded->action = KERNEL_SYSCALL_ACTION_RETURN;
-    /* import_ubuf precedes fd lookup and the UDP receive wait on Linux. */
-    if (op == 207 && kernel_user_range_check(
-            request->arguments[1], (size_t)request->arguments[2]) !=
+    /* 这里只验证数值范围；payload缺页必须留在状态检查和接纳预算之后。 */
+    uint64_t range_size = request->arguments[2];
+    if (op == 206 && range_size > KERNEL_FILES_MAX_RW_COUNT) range_size = KERNEL_FILES_MAX_RW_COUNT;
+    if ((op == 206 || op == 207) && kernel_user_range_check(
+            request->arguments[1], (size_t)range_size) !=
             KERNEL_UACCESS_STATUS_OK) {
         decoded->value = -KERNEL_EFAULT;
         return KERNEL_SYSCALL_STATUS_OK;

@@ -533,3 +533,54 @@ python3 -B tests/network-external.py --only boaros --transport both --repeat 1
 ```
 
 发送 reservation、复制量优化与 TCP 预算比较仍在后续独立阶段；本阶段不声明其完成。
+
+
+## TCP接纳预算与复制（2026-10-05）
+
+先用同 RV64 ELF 对照固定 Linux，发现旧路径对不可读但数值合法的 payload 总是先
+EFAULT：新建 TCP、SHUT_WR、发送缓冲已满都遮蔽了实际 EPIPE/EAGAIN。依据
+`references/linux/net/socket.c::__sys_sendto`、`lib/iov_iter.c::import_ubuf`、
+`net/ipv4/tcp.c::tcp_sendmsg_locked`，固定 commit
+`f4cdf7ca9a1fdcca413157df19753f388a5a224e`，数值范围/头导入在前，协议状态和
+内存接纳判断在实际 payload 读取前。send 的范围错误甚至先于坏 fd；普通 write
+仍先检查 fd。这些区别由新增 admission 契约保护，未把数值检查当作缺页不会失败的保证。
+
+在原任务 write request 上扩展 stream reservation 与进展位，不新增 task 指针槽。
+请求持 OFD pin，容量来自 sndbuf、发送预算及已有 reservation；协议池和 NIC 独立。
+copy 允许睡眠，提交前重新检查连接和真实资源。失败、取消、退出归还未提交预算；
+短阻塞提交保留暂存后缀。只保留 `tcp_write(COPY)`，不把可复用 scratch 借到 ACK。
+COST 将预先无容量、复制后协议失败及零进展失败的新复制字节分开，原 stream_copy
+仍是实际总复制。scale 保留整个接纳量后再 write 4 KiB，页解析和 stream_copy 都为 0；
+另验证两个请求竞争、abort 归还和恢复资格，不按内部链布局断言。
+
+扩展实际阻塞程序后另发现旧控制流的部分成功错误：已有 15972 字节进展后本地
+shutdown，虽然返回正值却发了 SIGPIPE；固定 Linux 不发。请求进展位使后续错误
+返回已接受前缀，不消费待观察错误或发 SIGPIPE。真实对端关闭未读队列产生 RST
+后，下一次 send 观察 ECONNRESET，再下一次才 EPIPE，双方通过。不同协议预算
+导致的正前缀长度不作为逐值差分项。跨页 fault 在本输入上 Linux 返回 EFAULT，
+BoarOS 返回已接纳 4096 字节；分别核对无额外字节和返回/接收守恒，保留 BoarOS
+已有页内接纳策略，不把该测试写成返回值完全相同。
+
+真实 RV64 io-sleep 在复制边界调度另一任务，验证 reservation 仍在任务登记、
+close/fd 复用保持目标 pin、shutdown 后 EPIPE、撤销用户页后 EFAULT 并可重新预留。
+最初给裸地址 fixture 加 TCP 时，lwIP 静态表的高半区指针不可访问；已在初始化
+调度器前映射双地址别名，不能在运行中单改 satp 破坏调度器地址空间不变量。
+这仅调整测试启动映射，生产映射不变。legacy/modern × writeback/writethrough
+四组 I/O 暂扣矩阵通过，原收包 reservation、pipe、存储进展门禁保持。
+
+本阶段发布内核 SHA-256 `d9274411b022ff29b1819d0be8a1f46a0f27cf3de7adc7083c2883a90e2e6a71`，
+QEMU 11.1.1。发布构建通过新增同 ELF admission（包括实际阻塞 sender SIGKILL）、网络 contract/content、
+UNIX budget、完整 musl userland；glibc 2.44 五种形态与固定 Linux 通过。
+现有差分 suite 为 1344 条逐值一致，独立 admission 不混入这个数量。
+scale、诊断 growth/admission/COST 和编译栈上界通过；此阶段未重测匹配吞吐。
+
+```sh
+make all test-scale-riscv test-cache-growth-riscv test-cost-host
+python3 -B tests/network-riscv.py --workload admission
+python3 -B tests/network-riscv.py --workload contract
+python3 -B tests/network-riscv.py --only boaros --workload content
+python3 -B tests/network-riscv.py --only boaros --workload budget
+make test-io-sleep-riscv test-userland-riscv test-glibc-riscv test-diff-abi-riscv test-stack-usage
+```
+
+窗口、pbuf/segment、NIC 和块队列默认值未扩大；后续批量读/写及 TCP 预算实验仍需匹配测量。

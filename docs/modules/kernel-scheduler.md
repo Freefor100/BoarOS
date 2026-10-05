@@ -120,7 +120,7 @@ zombie 先逻辑回收再复制 status/rusage，因此坏输出指针的 EFAULT 
 
 尚无 SMP、共享文件 futex、PI futex、实时信号队列、sigaltstack、clone3 或 LoongArch context。固定语义依据见学习总结的 Linux commit 与 musl 归档。
 
-活动普通文件/TCP I/O 的单页暂存由任务持有并跨调用复用：首次使用时分配，调用期间登记在任务的 `io_buffer`，正常调用完成只解除登记。任务资源清理在 socket read reservation 之后、MM/文件表和任务栈释放之前解除登记；常驻页在任务最终存储释放时归还。页释放错误遵循物理分配器 fatal 不变量，不进入历史 cleanup 重试链。
+活动普通文件/TCP I/O 的单页暂存由任务持有并跨调用复用：首次使用时分配，调用期间登记在任务的 `io_buffer`，正常调用完成只解除登记。任务资源清理在 socket read/write reservation 之后、MM/文件表和任务栈释放之前解除登记；常驻页在任务最终存储释放时归还。页释放错误遵循物理分配器 fatal 不变量，不进入历史 cleanup 重试链。
 
 ## 存储等待与清理任务
 
