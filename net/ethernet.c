@@ -330,6 +330,16 @@ int kernel_network_stop(struct kernel_network **owner)
     print_text(" tx-copy="); print_u64(n->device.statistics.tx_copy_packets);
     print_text(" drops="); print_u64(n->device.statistics.drops);
     print_text(" errors="); print_u64(n->device.statistics.errors);
+#if BOAROS_COST_DIAGNOSTICS
+    print_text(" tx-clock-hz="); print_u64(n->device.frequency);
+    print_text(" tx-done-free-count="); print_u64(n->device.statistics.tx_done_free_count);
+    print_text(" tx-done-free-ticks="); print_u64(n->device.statistics.tx_done_free_ticks);
+    print_text(" tx-done-free-max="); print_u64(n->device.statistics.tx_done_free_max);
+    print_text(" tx-free-post-count="); print_u64(n->device.statistics.tx_free_post_count);
+    print_text(" tx-free-post-ticks="); print_u64(n->device.statistics.tx_free_post_ticks);
+    print_text(" tx-free-post-max="); print_u64(n->device.statistics.tx_free_post_max);
+    print_text(" tx-latency-overflow="); print_u64(n->device.statistics.tx_latency_overflow);
+#endif
     struct kernel_heap_statistics heap_statistics;
     kernel_heap_get_statistics(n->heap, &heap_statistics);
     print_text(" root-heap-peak-pages="); print_u64(heap_statistics.peak_pages); print_text("\n");

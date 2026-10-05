@@ -19,7 +19,9 @@ def run(command, root, timeout):
 root = Path(__file__).resolve().parents[2]
 with tempfile.TemporaryDirectory(prefix="boaros-virtio-net-") as work:
     exe = Path(work) / "net"
-    run(["cc", "-std=c11", "-Wall", "-Wextra", "-Werror",
-         "-Itests/host/random", "-Iinclude", "tests/host/virtio_net_test.c",
-         "arch/riscv/virtio_mmio_net.c", "-o", str(exe)], root, 30)
-    run([str(exe)], root, 20)
+    for observe in (0, 1):
+        run(["cc", "-std=c11", "-Wall", "-Wextra", "-Werror",
+             f"-DBOAROS_COST_DIAGNOSTICS={observe}",
+             "-Itests/host/random", "-Iinclude", "tests/host/virtio_net_test.c",
+             "arch/riscv/virtio_mmio_net.c", "-o", str(exe)], root, 30)
+        run([str(exe)], root, 20)

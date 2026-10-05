@@ -504,6 +504,9 @@ def run_one(specfile):
                 row['counter_delta_policy'] = 'Raw counters only; an unbounded 16-bit interval has no exact packet delta. Missing legacy peak fields remain null.'
             final = re.search(r'BoarOS: network final (.*)', raw)
             row['driver_statistics'] = {k: int(v) for k, v in re.findall(r'([\w-]+)=(\d+)', final.group(1))} if final else {}
+            row['driver_statistics_scope'] = 'Device lifetime, including setup and teardown. DONE is software used-ring harvest, not hardware completion. FREE-to-post is same-slot reuse including idle time; it is not ready-only scheduling delay. First use and reset-only cancellation are excluded from completion samples.'
+            if row['driver_statistics'].get('tx-latency-overflow', 0):
+                raise RuntimeError('TX latency totals overflowed')
             if row['driver_statistics'].get('errors', 0):
                 raise RuntimeError('network device error counter nonzero')
             if fd is not None:
