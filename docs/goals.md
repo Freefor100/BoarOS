@@ -51,6 +51,14 @@ LoongArch 是独立交付依赖，SMP 单独规划。
 期限重装，已交付）与 D（内核栈 guard，已交付）；C（网络关中断区/协议所有权）只出
 设计对比。
 
+2026-10-05 后续轮：审计剩余项经调查后确认三项实施、一项推迟。ASID 推迟到实板
+轨道——固定 QEMU 没有 ASID 化 TLB（任何 satp 变化与任意 sfence.vma 都全刷、翻译
+不使用 ASID），收益为零，且收窄 fence 的正确性缺陷会被 QEMU 全刷掩盖，只能在
+ASID 标签 TLB 的硬件上验证。本轮实施：TX indirect+SG 零拷贝（保留复制回退）、
+块设备在途深度测量（时间加权深度/queue-wait/服务时间，测后再定是否加深）、无 NIC
+的 lwIP timer 出 IRQ 与网络 fail 槽表诊断。块设备在途与页 owner 身份的加深仍按
+"先测量/发现具体错误才扩大"的既有纪律。
+
 ## 按证据触发的性能候选
 
 | 触发证据 | 候选与必要代价 |
@@ -520,6 +528,7 @@ backlog 和期限回收已交付。真实用户态保护用户复制、共享 OF
 | P3b 持久化 | 用户已选择并交付逐 inode dirty/error、定向写回和真实 flush；共享事务可提交关联元数据，不主动全量写回无关文件。 |
 | P3d 恢复 | journal/replay 与持久 orphan 已启用并验收；故障模型、限制和复现命令见 VFS 模块。 |
 | P6 SMP：当前 SIE 串行化，缺远端 TLB 确认 | ① 进程态对象先用粗粒度可睡眠锁、IRQ/队列另设短锁，验证较少但并行有限；② MM/OFD/cache/队列对象锁直接演进，锁顺序/取消成本更高。先盘点消费者和睡眠边界再选，临时启动大锁有退出条件。 |
+| 单 hart ASID：当前 ASID 0，换根前后各一次全局 fence | 已调查并推迟到实板：固定 QEMU 无 ASID 化 TLB（satp 变化与任意 sfence.vma 均全刷、翻译不使用 ASID），收益不可观测，且收窄 fence 的正确性缺陷会被 QEMU 全刷掩盖；在 ASID 标签 TLB 的硬件（L4）上实现并验证 ASIDLEN 与复用顺序。 |
 | P6g 栈 guard：连续物理栈、canary/高水位 | 已选择①并交付：独立内核栈窗口（12 KiB 槽＝4 KiB 未映射 guard＋8 KiB 栈），运行期插/删叶、空表释放；见已交付表。direct-map 别名与 idle/boot 栈的边界见[调度模块](modules/kernel-scheduler.md)。 |
 | N1 协议栈与分配 owner | 已确认 BoarOS 持有 fd/OFD、ABI、等待与缓冲队列，固定官方 lwIP 2.2.1 raw API/NO_SYS；协议和 pbuf 静态有界池，socket/OFD/请求由 kernel_heap 持有。IPv4/IPv6双栈loopback和socketpair已验收；QEMU VirtIO-net与静态IPv4宿主应用已交付，实板另核对；命名AF_UNIX按需设计。 |
 | N4 网络关中断区与协议所有权：worker 批处理、syscall 协议临界区与无 NIC 的 timer IRQ 全部依赖单 hart SIE 串行化 | ① 保持串行化，仅把无 NIC 的 lwIP timer 移出 IRQ（小、独立，只影响 loopback/测试配置）；② network-core 单 owner + syscall 请求队列（usercopy/等待/取消留在 syscall，协议调用与队列记账过队列；大改动，是 SMP 前置）；③ 维持现状，待 SMP 或真实延迟证据再动。单 hart 下 SIE 长区不直接损失吞吐（工作照做、IRQ 推迟），收益是延迟上界与 SMP 准备；当前无真实负载证据，暂不实施。 |
