@@ -379,3 +379,16 @@ AF_UNIX发送者模型后续已落地：budget/sendfile/unix_sender同ELF在Linu
 本地实际packet/payload请求字节计费；发送成功次数不作为与Linux私有skb布局
 一致的证明。根Linux参考先检查退出，再明确清理其proc挂载层并卸载ext4，
 BoarOS仍要求完整页/堆/任务栈/设备基线。
+
+## 共用串口、原交互与 PTY（2026-10-07）
+
+UART硬件寄存器是平台事实；RX/TX预算、TTY发布、worker/drain和owner清理从RV实现移入
+`drivers/serial/ns16550.c`。LA第一UART pin2经既有PCH/EIOINTC接入，正常输出进TTY，
+fatal保持关闭中断后的轮询。固定依据与命令见[模块](../modules/riscv-uart-tty.md#la-平台与对照验收)。
+
+首次native runner暴露QEMU默认NIC占用测试块设备addr1，修复的是fixture显式关闭默认NIC，
+生产枚举仍不假定槽位。PTY原script需要PID1收养其真实command，因此Linux使用直接根盘PID1；
+不能用普通supervisor子进程再把漏reap当内核差异。退出42由Linux真实panic状态解析，
+BoarOS另检查实际根页/堆/任务栈/BAR基线。原输入、录制文件、尾部和独立重启内容全部验证，
+不以串口PASS替代进程状态或磁盘内容。Linux/BoarOS的启动默认termios不同，
+探针先设置共同基线再恢复各自初值；不归一化实际串口字节。

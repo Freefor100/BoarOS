@@ -18,6 +18,7 @@
 #include <kernel/virtio_pci_rng.h>
 #include <kernel/virtio_pci_net.h>
 #include <kernel/network.h>
+#include <kernel/ns16550.h>
 
 #define ROOT_DEVICES 8
 static struct {
@@ -28,6 +29,8 @@ static struct {
     struct virtio_pci_rng rng;
     struct virtio_pci_net net;
     struct kernel_network *network;
+    struct ns16550_port *uart;
+    struct ns16550_statistics uart_statistics;
     unsigned count,detected;
     struct kernel_exec_image image;
     struct kernel_files files;
@@ -109,6 +112,15 @@ static int release_root(void)
     if(root.interpreter_file && kernel_open_file_release(&root.interpreter_file)!=KERNEL_OPEN_FILE_STATUS_OK) return -KERNEL_EIO;
     if(root.source && kernel_elf64_source_release(&root.source)!=KERNEL_ELF64_SOURCE_STATUS_OK) return -KERNEL_EIO;
     if(root.file && kernel_open_file_release(&root.file)!=KERNEL_OPEN_FILE_STATUS_OK) return -KERNEL_EIO;
+    if(root.uart) {
+        int stopped=ns16550_stop_report(&root.uart,&root.uart_statistics);
+        if(stopped)return stopped;
+        la_virt_puts("LA UART final irq=");la_virt_hex(root.uart_statistics.interrupts);
+        la_virt_puts(" rx=");la_virt_hex(root.uart_statistics.received);
+        la_virt_puts(" tx=");la_virt_hex(root.uart_statistics.transmitted);
+        la_virt_puts(" overruns=");la_virt_hex(root.uart_statistics.overruns);
+        la_virt_puts(" console-dropped=");la_virt_hex(root.uart_statistics.console_dropped);la_virt_puts("\n");
+    }
     kernel_page_cache_stop_worker(&root.cache);
     int error=kernel_vfs_disk_cleanup_pending();
     if(error) return error;
@@ -242,6 +254,7 @@ static int start_root(void)
     }
     if(!error && kernel_page_cache_init(&root.cache,&root.heap,allocator)!=KERNEL_PAGE_CACHE_STATUS_OK) error=-KERNEL_ENOMEM;
     if(!error) error=kernel_vfs_mount_root(&root.mount,&root.devices[0].device.block,&root.heap,&root.cache);
+    if(!error) error=la_virt_uart_start(&root.uart,&root.heap,la_timer_frequency());
     if(!error) error=start_rng(allocator,host);
     if(!error) error=start_network(allocator,host);
     if(!error) error=prepare_init();

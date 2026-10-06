@@ -1,12 +1,12 @@
-# RISC-V 串口传输
+# 共用 ns16550 串口传输
 
-`arch/riscv/uart_tty.c` 实现单 hart 上一个 DTB 发现的 ns16550 串口传输；`include/arch/riscv/uart_tty.h` 是 root owner 接口。线路规程、read/write/ioctl/poll、作业控制和 OFD 生命周期由 `kernel_tty` 负责，本模块只提供实际硬件能力。
+`drivers/serial/ns16550.c` 和 `include/kernel/ns16550.h` 实现单 CPU 的 RX/TX、IRQ/worker、线路配置、drain 与 console 生命周期。RV 的 `arch/riscv/uart_tty.c` 仅提供 DTB/PLIC 适配；LA 的 `platform/loongarch_virt.c` 提供固定 QEMU UART 与 PCH-PIC/EIOINTC 适配。线路规程、read/write/ioctl/poll、作业控制和 OFD 生命周期由 `kernel_tty` 负责，本模块只提供实际硬件能力。
 
 ## 入口与 owner
 
-root 的 heap 分配 port；port 保存 MMIO mapping、PLIC 登记、joinable worker、1024 个字符/状态 RX 项和 1024 字节内核控制台队列。port 创建 TTY 后发布串口实例，标准 OFD 才能绑定它。`riscv_root_boot_start_with_irq` 是生产入口；原 `riscv_root_boot_start` 保留模块启动的早期 console。生产路径由 `kernel/main.c` 把固定早期 sink 与 DTB UART 的相交页合并后只映射一次，避免重复 PTE 冲突，然后初始化 PLIC，然后调用带 IRQ 的入口。
+root 的 heap 分配 port；port 保存 借用的 MMIO mapping、复制的 IRQ 回调和登记、joinable worker、1024 个字符/状态 RX 项和 1024 字节内核控制台队列。port 创建 TTY 后发布串口实例，标准 OFD 才能绑定它。`riscv_root_boot_start_with_irq` 是生产入口；原 `riscv_root_boot_start` 保留模块启动的早期 console。生产路径由 `kernel/main.c` 把固定早期 sink 与 DTB UART 的相交页合并后只映射一次，避免重复 PTE 冲突，然后初始化 PLIC，然后调用带 IRQ 的入口。
 
-worker 使用调度器标准 8 KiB 栈和任务存储。root baseline 在创建 port/worker 前采集，正常 finish 必须先回收用户任务及其 OFD/session 引用，再 drain、停止和 join UART worker、注销 IRQ、销毁 TTY、释放 port，最后检查 heap 与物理页。启动失败路径先释放准备期 OFD，再停止 UART；没有遗失的 port 指针。TTY 销毁仍被真实引用阻塞或硬件 drain 超时会保留 port，下一次 stop 可继续进展；合法 allocator 释放失败直接 fatal，不转换成清理重试。
+worker 使用调度器架构标准栈（RV 8 KiB、LA 32 KiB）和任务存储。root baseline 在创建 port/worker 前采集，正常 finish 必须先回收用户任务及其 OFD/session 引用，再 drain、停止和 join UART worker、注销 IRQ、销毁 TTY、释放 port，最后检查 heap 与物理页。启动失败路径先释放准备期 OFD，再停止 UART；没有遗失的 port 指针。TTY 销毁仍被真实引用阻塞或硬件 drain 超时会保留 port，下一次 stop 可继续进展；合法 allocator 释放失败直接 fatal，不转换成清理重试。
 
 ## IRQ、worker 与线路
 
@@ -28,7 +28,7 @@ allocator fatal原因均保留。该检查保护新UART接入，不反推历史f
 这不放宽已发布port的tcdrain/stop TEMT承诺。正常启动从初始LSR记录尚忙的硬件尾字节，
 即使第一轮没有新TX也保留10ms观察期限，TEMT变空后通知真实core的drain等待者。
 
-RV64/COST关闭构建的DWARF对象大小为port **3272 B**、core **29032 B**。真实create模型
+RV64/COST关闭构建的DWARF对象大小为port **3296 B**、core **29032 B**。真实create模型
 核对了这两个分配请求；当前heap的大对象按请求页数上取整为buddy order，分别占1与8个
 4KiB页，合计9个heap页（36KiB）。worker另有标准8KiB物理栈（2页，含16B guard/canary区域）
 和2368B任务metadata（独立1页），固定直接owner合计12页（48KiB），不包含后续OFD实例、
@@ -63,3 +63,30 @@ CMSPAR/CRTSCTS 沿现有支持集合归一，不伪装硬件流控已经实现�
 错误不发布；`make test-tty-termios2-riscv` 用同一 ELF 在真实串口核对
 44 字节复制、标准/数字速度、坏指针、drain/flush 与旧 36 字节布局。
 探针先明确设置双方共有的线路基线，最后恢复各自原配置，不将不同启动默认值当作 ABI 差异。
+
+## LA 平台与对照验收
+
+固定 QEMU `references/qemu/hw/loongarch/virt.c`、`include/hw/loongarch/virt.h`
+(commit `84f07211cc5b4fc6a371559bf8a5de4fb068e648`) 的第一 UART 为
+`0x1fe001e0/0x100`，字节寄存器、shift=0、clock=1843200 Hz、PCH pin2。
+该信息仅在平台层构造；共用核心不包含 RV CSR 或 PLIC 地址。IRQ callbacks 按值复制，
+mapping 由 root/platform 持有至 stop 成功。LA root 在创建标准 OFD 前发布 TTY，
+在用户/OFD/session owner 释放后 drain/join、注销 IRQ、销毁 core/port，再检查完整基线。
+正常 LA 内核日志进入同一 klog 环并遵守 console level；早期/退出后的 console 用轮询，
+fatal 先关中断并绕过日志级别与拥塞队列。
+
+`tests/tty/riscv.py --arch loongarch` 共用原始串口字节通道、输入和结果解析。
+`tests/tty/pty_riscv.py --arch loongarch` 共用 PTY 案例、原版 BusyBox、
+原版 glibc API 和磁盘真实重启检查。每架构内固定同一 ELF/fixture，
+Linux 先运行、BoarOS 后运行；LA 默认分别执行512 MiB/1 GiB。
+Linux PTY coordinator 作为真实 PID1 验证原 script 的收养/reap，退出42由 Linux panic
+报告实际 wait status；这不是 Linux 资源基线证据。BoarOS 根 owner 必须全部回收。
+
+入口：`make test-tty-diff-loongarch test-tty-termios2-loongarch test-tty-loongarch
+test-pty-loongarch test-pty-apps-loongarch test-uart-failures-loongarch`。
+共同串口27、作业控制80、termios2 29条记录一致；PTY core9、musl/GNU API2、
+原 script21条及重启1条一致。原 ash/stty 交互覆盖Ctrl-C/Z、bg/fg、TTIN/TTOU和回收。
+UART port/core heap、worker任务页/栈、IRQ共五类构造失败不发布PID1，
+两种RAM回到页/堆/栈/BAR基线；另有活跃UART+console关闭+满队列的fatal轮询证据。
+宿主真实core模型保护超时保留owner与后续stop、THRE/TEMT和启动回滚。
+RTC和完整指定程序矩阵在本阶段尚未验收，不由终端通过推导能力全部对齐。

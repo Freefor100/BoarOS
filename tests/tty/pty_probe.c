@@ -44,14 +44,14 @@
 #endif
 
 struct pair { int master, slave; unsigned number; char path[128]; };
-/* 不使用libc扩展termios；固定RV64 asm-generic分别为36/44字节。 */
+/* 不使用libc扩展termios；固定RV64/LA64 asm-generic分别为36/44字节。 */
 struct raw_termios {
     uint32_t iflag, oflag, cflag, lflag;
     uint8_t line, cc[19];
 };
 struct raw_termios2 { struct raw_termios basic; uint32_t ispeed, ospeed; };
-_Static_assert(sizeof(struct raw_termios) == 36, "RV64 old termios layout");
-_Static_assert(sizeof(struct raw_termios2) == 44, "RV64 termios2 layout");
+_Static_assert(sizeof(struct raw_termios) == 36, "asm-generic old termios layout");
+_Static_assert(sizeof(struct raw_termios2) == 44, "asm-generic termios2 layout");
 #define RAW_TCGETS2 UINT32_C(0x802c542a)
 #define RAW_TCSETS2 UINT32_C(0x402c542b)
 #define RAW_TCSETSW2 UINT32_C(0x402c542c)

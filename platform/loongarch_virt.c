@@ -2,19 +2,38 @@
 #include <kernel/page.h>
 #include <stddef.h>
 #include <kernel/console.h>
+#include <kernel/ns16550.h>
+#include <arch/context.h>
 #include <kernel/random.h>
+#include <kernel/log.h>
 #include <platform/loongarch_pci.h>
 
 /* QEMU v11.1.0 virt.h: ns16550 and ACPI GED, accessed uncached. */
 static volatile unsigned char *const uart = (void *)(LA_UNCACHED_BASE + 0x1fe001e0);
+static int emergency;
 void kernel_console_putc(char c)
-{ while (!(uart[5] & 0x20)) { } uart[0] = (unsigned char)c; }
-void kernel_console_emergency_begin(void) { }
+{
+    if(!emergency && ns16550_console(c))return;
+    while(!(uart[5]&0x20)) {} uart[0]=(unsigned char)c;
+}
+void kernel_console_emergency_begin(void)
+{ (void)arch_interrupt_save(); emergency=1; }
+static int uart_register_irq(void *context,uint32_t source,void (*handler)(void *),void *owner)
+{ (void)context;return la_virt_irq_register(source,handler,owner); }
+static void uart_unregister_irq(void *context,uint32_t source,void *owner)
+{ (void)context;la_virt_irq_unregister(source,owner); }
+int la_virt_uart_start(struct ns16550_port **owner,struct kernel_heap *heap,uint64_t frequency)
+{
+    /* QEMU virt.c serial_mm_init: PCH pin2, byte registers, baudbase115200. */
+    struct dtb_uart_info info={{0x1fe001e0,0x100},115200U*16U,2,0,1};
+    struct ns16550_irq_ops irq={.register_irq=uart_register_irq,.unregister_irq=uart_unregister_irq};
+    return ns16550_start(owner,heap,&info,(void *)uart,frequency,&irq);
+}
 void la_virt_puts(const char *text)
 {
     while (*text) {
-        while (!(uart[5] & 0x20)) { }
-        uart[0] = (unsigned char)*text++;
+        char character=*text++;
+        if(emergency || kernel_log_putc(6,character))kernel_console_putc(character);
     }
 }
 void la_virt_hex(uint64_t value)
@@ -29,7 +48,7 @@ void la_virt_shutdown(void)
     for (;;) __asm__ volatile("idle 0");
 }
 void la_virt_fatal(const char *message)
-{ la_virt_puts("BoarOS: fatal LA "); la_virt_puts(message); la_virt_puts("\n"); la_virt_shutdown(); }
+{ kernel_console_emergency_begin(); la_virt_puts("BoarOS: fatal LA "); la_virt_puts(message); la_virt_puts("\n"); la_virt_shutdown(); }
 void *la_virt_page_access(uint64_t address)
 { return (void *)(uintptr_t)(LA_DIRECT_BASE + address); }
 int la_virt_physical_address(const void *pointer, uint64_t *address)

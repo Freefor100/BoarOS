@@ -3,6 +3,9 @@
 #include <kernel/boot_memory.h>
 #define LA_DIRECT_BASE UINT64_C(0x9000000000000000)
 #define LA_UNCACHED_BASE UINT64_C(0x8000000000000000)
+struct ns16550_port;
+struct kernel_heap;
+int la_virt_uart_start(struct ns16550_port **,struct kernel_heap *,uint64_t);
 void la_virt_puts(const char *);
 void la_virt_hex(uint64_t);
 void la_virt_shutdown(void) __attribute__((noreturn));

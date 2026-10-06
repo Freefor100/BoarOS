@@ -44,6 +44,7 @@ static void hardware_write(unsigned offset,uint8_t value) {
 }
 #define UART_READ(port,offset) ((void)(port),hardware_read(offset))
 #define UART_WRITE(port,offset,value) ((void)(port),hardware_write(offset,value))
+#include "../../drivers/serial/ns16550.c"
 #include "../../arch/riscv/uart_tty.c"
 enum kernel_heap_status kernel_heap_allocate_zeroed(struct kernel_heap *h,size_t n,size_t size,void **out) {
     (void)h; if(fail_heap) return KERNEL_HEAP_STATUS_EMPTY;
