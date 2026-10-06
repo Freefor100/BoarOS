@@ -474,3 +474,15 @@ DMW别名/跨越整个guard/boot-idle栈、全IEEE运算及完整信号组合、
 完整Harness、BoarOS RTC告警与全TCG时钟迁移亦保持范围外。旧allocator/Virtqueue
 历史归因没有新增现场证据，继续保留unknown。作者只做这一轮集中修复，不请求
 第二位独立reviewer；最终判定依赖新反例和真实回归。
+
+2026-10-07收口：review后生产kernel-la SHA-256
+`e1e234c3dbf8a6d0448b857947ff85c31aaa66fda3041ef7cc592e7e37b88f98`，
+kernel-rv `e4cc9dbe43c01b9d03b276350e92a8e2ff4250dd2bda42ae2422c4f5d087d11a`，
+与完整清单/ABI/设备/存储门禁冻结内核一致。派生模拟器二进制为
+`63dcacc82765ba4a18cfb623410d19fd462bd3755c06cc81cd73caaf226bc0b9`；RV本轮默认
+模拟器实际为11.1.1，SHA-256 `a1cfcceb6c688f9b0a290d512211ed08cf465b92b26a04cfb032280a53625718`，
+没有把两个架构的模拟器身份混称为同一个二进制。只读review确认的P2已用真实红/绿
+和全量记录纠正，没有新增独立review。预览后执行 `make prune-build` 删除349项
+临时目录/日志/镜像及旧缓存，复查预览0项；未保留临时plan、ledger或review package。
+LP64D musl、两种GNU runtime、原版/派生QEMU、两套LA Linux及编译产物缓存保留，
+清理后内容/模式/链接/构建配置身份再检查通过。提交沿main，未push或发布。

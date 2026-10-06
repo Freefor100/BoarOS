@@ -1,6 +1,7 @@
 # LoongArch QEMU 启动与根盘
 
-当前验收范围为 QEMU virt、LA464、单核、LA64、16 KiB/三级页表及整数用户态。
+当前验收范围为 QEMU virt、LA464、单核、LA64、16 KiB/三级页表，
+整数/FPU/LSX/LASX状态与本轮指定用户程序、平台矩阵；完整Harness/原生开发另行验收。
 入口为 `arch/loongarch/boot.S` 与 `main.c`，平台事实独立放在
 `platform/loongarch_virt.c`。`kernel-la` 有现代 PCI block 时启动可配置根盘 PID 1，
 无盘时运行内嵌独立 ELF 契约；平台存储生命周期在 `platform/loongarch_root.c`。
@@ -223,17 +224,18 @@ make test-fpu-loongarch test-dynamic-loongarch test-exec-errors-loongarch
 make test-la-dynamic-host
 ```
 
-FP/SIMD旧历史范围中的FP限制已由标量FPU阶段解除；SIMD、glibc、更广原应用、
-完整TTY/网络、SMP/实板和完整Harness仍待独立验收，不把这个矩阵称为全面等价。
+该动态musl阶段的FP限制已由标量FPU解除；当时SIMD、glibc、更广应用与TTY/网络
+尚未验收。当前指定矩阵已完成，SMP/实板、完整Harness等仍在范围之外。
 
-本轮RV完整架构、原静态/动态用户态、五种glibc、1366条ABI、栈检查，以及SQLite
-DELETE/WAL多进程和重启回归通过；NBD全恢复矩阵和LA原SQLite应用本轮未跑。
+动态musl阶段RV完整架构、原静态/动态用户态、五种glibc、1366条ABI、栈和SQLite
+DELETE/WAL多进程/重启通过；当时未跑NBD全恢复和LA原SQLite。后者已在当前
+单核对齐轮完成，见下节及[SQLite](vfs-ext4.md#双架构-sqlite-deletewal-原程序)。
 
 共用net核心和Ethernet已接入LA现代PCI。root枚举device1、持有BAR和device，
 网络层借用它；missing NIC仍有timer worker保障loopback与AF_UNIX。块addr1、
 net addr5、RNG addr9的共享INTx是测试输入，生产扫描不依赖槽位。真实TAP、
-九类失败与资源证据见[net模块](riscv-virtio-net.md)。TTY UART IRQ、RTC、
-AF_UNIX sendfile计费差异及更广原程序尚在本轮计划内，不能声明LA/RV全面等价。
+九类失败与资源证据见[net模块](riscv-virtio-net.md)。本轮TTY UART IRQ、RTC、
+AF_UNIX sendfile计费及指定原程序均已验收；范围外应用仍不能由此声明全部等价。
 
 ## LS7A RTC 与派生模拟器
 
