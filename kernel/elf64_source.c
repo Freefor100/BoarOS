@@ -672,6 +672,17 @@ enum kernel_elf64_source_status kernel_elf64_source_create_reader(
     uint64_t page_size, uint16_t machine, struct kernel_elf64_source **source)
 { return create_from_reader(heap,0,reader,page_size,machine,source); }
 
+enum kernel_elf64_source_status kernel_elf64_source_create_interpreter(
+    struct kernel_heap *heap,struct kernel_open_file_description **file,
+    uint64_t page_size,uint16_t machine,struct kernel_elf64_source **source)
+{
+    enum kernel_elf64_source_status status=kernel_elf64_source_create(heap,file,page_size,machine,source);
+    /* Linux elf_read 的短 header 是 EIO，完整但损坏的解释器才是 ELIBBAD。 */
+    if(status==KERNEL_ELF64_SOURCE_STATUS_TRUNCATED && kernel_open_file_size(*file)<64)
+        return KERNEL_ELF64_SOURCE_STATUS_IO;
+    return status;
+}
+
 enum kernel_elf64_source_status kernel_elf64_source_acquire(
     struct kernel_elf64_source *source)
 {

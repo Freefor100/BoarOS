@@ -48,14 +48,14 @@ refill 写入无效 paired entry，交由普通用户缺页路径处理，不能
 LA 保存完整整数 trap frame（304 字节）、内核 ABI context、用户 SP/TP/ERA/PRMD；
 KS0 用于区分并交换用户/内核 TP。timer 使用 CPUCFG 频率、RDTIME.D 和 one-shot
 TCFG，接入共用 tick、deadline、预算与调度；未启用 UART 外部 IRQ，timer 轮询
-就绪输入并唤醒阻塞 read/ppoll owner。EUEN 保持关闭，FP/LSX/LASX 状态不宣称支持。
+就绪输入并唤醒阻塞 read/ppoll owner。未使用FP的task保持EUEN关闭；已使用者只启用FPE并保存标量状态，LSX/LASX/LBT未支持。
 
 内存 reader 经共用 source、映像、MM、任务创建与 syscall dispatch 路径进入 PLV3。
 LA syscall 从 a7/a0–a5 解码，返回 a0 并恢复 ERA+4。未知 syscall 返回 ENOSYS；
 坏复制指针返回 EFAULT；权限/未映射故障和访问内核地址按实际用户故障处理。
 合法缺页 OOM 使用 RESOURCE/NO_MEMORY 退出，不能误报为用户地址非法。
 rt_sigaction/rt_sigreturn 已接入共用信号策略和 LA 整数帧；布局、故障与重启契约见
-[信号模块](kernel-signal.md)。尚无 FP/SIMD 扩展帧和 sigaltstack。
+[信号模块](kernel-signal.md)。标量FPU扩展帧已接入，见[LA浮点](loongarch-fpu.md)；SIMD与sigaltstack未支持。
 
 2026-10-06 在 512 MiB 和 1 GiB 下完成：
 
@@ -117,7 +117,9 @@ timer trap中被分发，真实QEMU先复现失败后修复。
 block，不通过后续磁盘或内存 fixture 掩盖启动错误。legacy PCI 明确 ENOTSUP，
 数量超限 ENOSPC，损坏 ext4 保留后端 EUCLEAN。默认 `/init` 的 path/argv/envp
 使用与 RV 相同的 `INIT_CONFIG=config/init.json` 生成方式，LA 有独立生成依赖。
-PT_INTERP 暂未接入，返回 ENOEXEC，不发布半成品任务；此限制可在后续扩展。
+PT_INTERP已按fs context打开唯一解释器source并交给共用image，路径错误保留errno；
+短64字节header为EIO，完整但损坏/错误架构为ELIBBAD，失败不发布PID1。
+解释器含另一个PT_INTERP仍按现有明确子集拒绝，不声称Linux递归解释器全部行为。
 
 永久可信 cleanup 栈在页基线前创建，启动构造也在该内核任务上执行。设备与
 cache/mount/files/fs/source/image 的真实字段一直保存 owner；映像准备、I/O worker
@@ -162,7 +164,8 @@ futex重启及非PI robust注册/查询/owner死亡/raw exit/COW。原BusyBox完
 另执行非交互trap、后台sleep和wait；不据此宣称LA UART控制终端或PTY作业控制。
 
 `tests/loongarch/pthread.c` 直接调用已有RV用户测试的适用函数，没有裁剪原RV入口；
-动态DSO、socket和RV的未支持PI marker门禁保留在原目录，不能把这一静态选择集
+此静态入口不执行动态DSO；动态入口在下节另测。socket和RV的未支持PI marker
+门禁保留在原目录，不能把这一静态选择集
 称为原pthread全量测试。Linux对照发现并修正测试的join/PID摘除时序，以及WAKE
 后目标可能退出的假设；内核不按测试输入特判。
 
@@ -171,6 +174,38 @@ clone的任务页、栈分配两处故障分别在两种RAM注入，真实pthrea
 证据，与同ELF Linux语义对照分别报告。每次正常、故障、OOM根启动收口要求
 heap live/pages为0，所有可回收物理页、根盘/cache/PCI owner回到预热基线。
 
-本阶段RV信号/syscall、完整架构、原静态/动态用户态、五种固定glibc、1366条ABI
-和栈门禁均通过。此次未改文件映射/COW或块核心，不把此前SQLite/存储恢复矩阵
-记为本轮重跑。FP/SIMD、动态musl/DSO TLS、LA完整终端/网络和比赛Harness仍缺。
+整数信号阶段的RV信号/syscall、完整架构、原静态/动态用户态、五种固定glibc、
+1366条ABI和栈门禁通过；当时未改文件映射/COW或块核心，未重跑SQLite/存储
+恢复矩阵。当时的标量FP、动态musl/DSO TLS限制已由下节解除，SIMD、LA完整
+终端/网络和比赛Harness仍缺。
+
+## 原版动态 musl、解释器与 DSO TLS
+
+`make prepare-la-dynamic` 在独立dynamic-dp-v2缓存构建固定musl1.2.5原源码，
+用户使用已安装GCC15.1.0 LP64D和匹配CRT/libgcc；内核仍LP64S。输入记录
+compiler/frontend/内建headers、runtime、原archive/flags；完整安装树记录文件
+内容、权限和链接目标。`test-la-dynamic-host` 的9个反例先验证合法命中，再
+拒绝loader/header/specs/CRT/mode/link/ABI及compiler/runtime身份变化。原静态
+SF缓存独立，`test-la-userland-host` 原9个反例继续通过。
+
+`make test-dynamic-loongarch` 对相同PIE和非PIE ELF执行原late-dlopen TLS案例与
+11组线程消费者，另有DT_NEEDED、ORIGIN RPATH、RELRO链接及初始DSO TLS。
+均在Linux/BoarOS两种RAM实际运行；ldso/libc和DSO由用户运行时装载、重定位、
+分配TLS，不在内核另写动态链接器。依赖库与程序在运行期间逐文件核对SHA。
+
+`make test-exec-errors-loongarch` 双侧核对缺失、无执行位、错误架构、损坏完整
+header和短header的errno；失败后旧PID、TLS、存活线程、CLOEXEC fd/offset、
+信号handler保持。初始动态PID1的上述五条失败及image构造物理OOM，在两种
+RAM共12次启动中不发布任务，主/解释器source、MM、页/堆与PCI/root owner
+准确回收。真实VFS/block I/O清理失败仍按原owner契约保留。
+
+```sh
+make test-fpu-loongarch test-dynamic-loongarch test-exec-errors-loongarch
+make test-la-dynamic-host
+```
+
+FP/SIMD旧历史范围中的FP限制已由标量FPU阶段解除；SIMD、glibc、更广原应用、
+完整TTY/网络、SMP/实板和完整Harness仍待独立验收，不把这个矩阵称为全面等价。
+
+本轮RV完整架构、原静态/动态用户态、五种glibc、1366条ABI、栈检查，以及SQLite
+DELETE/WAL多进程和重启回归通过；NBD全恢复矩阵和LA原SQLite应用本轮未跑。

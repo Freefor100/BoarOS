@@ -28,7 +28,7 @@ N3已经交付：legacy/modern VirtIO-net、受限DMA借用与复制回退、静
 
 [风险证据与重建](learning/cost-baseline.md#旧版内存释放与-virtqueue-告警2026-10-02)
 区分已经修复的机制与缺少历史现场的归因。固定root、单hart、QEMU和选定应用验收
-均不代表多用户隔离、SMP、实板或完整Linux兼容。LA PCI根盘与静态整数用户态已验收，完整比赛Harness仍缺LA动态环境及完整平台能力。
+均不代表多用户隔离、SMP、实板或完整Linux兼容。LA PCI根盘与静态整数用户态已验收，完整比赛Harness仍缺LA更广原程序、SIMD及完整平台能力。
 
 ## 近期方向
 
@@ -131,7 +131,7 @@ glibc四进程整命令仍增加0.73%。该轮的prepare读取、1547次FLUSH和
 | 所有权与接口子集 | fchown/fchownat已接入真实元数据；O_PATH和路径truncate已接入；完整凭据/权限、原生accept4仍有缺口；CPU-time clock、VIRTUAL/PROF timer、pipe容量操作、扩展clone/futex按具体子语义核对，不把已有整个模块记为缺失 |
 | 全局文件同步 | sync/syncfs接入单一挂载树、节点快照与durable等待；syncfs维护独立的挂载错误观察。void sync的程序退出码仍不能单独证明持久化，匿名对象不触及根盘，见[VFS契约](modules/vfs-ext4.md)。 |
 | 用户内存/信号 | mremap、按操作madvise、mlock、sigaltstack、实时信号队列、共享文件/PI futex待真实应用需求触发 |
-| 系统与平台 | 固定root查询不等于完整凭据/权限；其他行规程、完整modem控制、外部IPv6/DNS/TLS、公网配置、SMP/实板及LA完整动态/平台环境仍缺，不声明完整Linux兼容或硬实时 |
+| 系统与平台 | 固定root查询不等于完整凭据/权限；其他行规程、完整modem控制、外部IPv6/DNS/TLS、公网配置、SMP/实板及LA更广原程序/SIMD/完整平台环境仍缺，不声明完整Linux兼容或硬实时 |
 
 下面P/N/L小节保留稳定能力编号、契约、依赖和已有验证入口；只以上面的当前队列决定近期实施。
 
@@ -496,7 +496,9 @@ RV完整架构、真实用户程序、glibc、1344条ABI和SQLite回归通过。
 statx/clone子TID、PCI根盘及LP64S静态musl已通过第二阶段验收；整数signal handler、
 sigreturn/同步故障/等待重启和静态pthread/TLS已双侧验收，含真实musl取消、
 非PI robust、线程组生命周期及任务/栈创建OOM回滚；原BusyBox ash非交互trap/wait通过。
-FP/SIMD、动态libc/DSO TLS及完整终端/网络/用户环境仍未完成；下一阶段动态musl另由人决定。
+用户已选择原版LP64D musl与LA标量FPU路线，动态libc/解释器/初始及late DSO TLS
+和FR/FCC/FCSR/信号/clone/exec子集已双侧验收。SIMD、glibc、更广原程序和完整终端/网络
+仍未完成；后续扩展由人决定。
 
 - [ ] ELF 段对齐、BSS 尾页、auxv、用户栈、stat/signal 结构及 clone 寄存器逐项核对；不能只换汇编入口却保留 RV ABI 编码。
 - [ ] 同一用户源码分别编译 RV/LA ELF，每架构内部用同一 ELF 对照 Linux 与 BoarOS；共享测试语义，隔离寄存器/页表差异，不拿 RV ELF 验证 LA。
@@ -594,7 +596,8 @@ make test-program-inventory-host test-diff-abi-host
 make inventory-userland-riscv
 ```
 
-`inventory-userland-riscv` 默认成功只说明清单生成成功。全量 228 项仍有明确缺口，严格模式失败不是自动产生的新回归；`--case` 与 `--require-pass` 只严格判定本次选择集合，未选项目保留历史结果或 `not-run`，选择集合写入状态供恢复报告解释。完整 Harness 缺 LA 动态libc/DSO TLS、FP/SIMD及完整平台环境或其他能力时保留阻塞原因；整数信号和静态pthread子集已有独立验收。
+`inventory-userland-riscv` 默认成功只说明清单生成成功。全量 228 项仍有明确缺口，严格模式失败不是自动产生的新回归；`--case` 与 `--require-pass` 只严格判定本次选择集合，未选项目保留历史结果或 `not-run`，选择集合写入状态供恢复报告解释。完整Harness仍缺LA更广原程序/SIMD/完整平台环境或其他能力时保留阻塞原因；
+原版动态musl/DSO TLS、标量FPU与线程子集已有独立验收。
 
 ## 范围与交付边界
 

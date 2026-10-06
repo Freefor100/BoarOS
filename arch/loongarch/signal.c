@@ -1,4 +1,5 @@
 #include <arch/loongarch/signal.h>
+#include <arch/loongarch/fpu.h>
 #include <kernel/errno.h>
 #include <kernel/signal.h>
 #include <kernel/task.h>
@@ -18,9 +19,12 @@ struct la_linux_ucontext {
     struct la_linux_mcontext mcontext;
 };
 struct la_context_info { uint32_t magic, size; uint64_t padding; };
+struct la_linux_fp {uint64_t regs[32],fcc;uint32_t fcsr,padding;};
 struct la_linux_frame {
     uint8_t info[128];
     struct la_linux_ucontext context;
+    struct la_context_info extension;
+    struct la_linux_fp fp;
     struct la_context_info end;
 };
 _Static_assert(sizeof(struct la_linux_mcontext)==272, "Linux LA sigcontext size");
@@ -29,7 +33,8 @@ _Static_assert(offsetof(struct la_linux_ucontext,mcontext)==176, "Linux LA mcont
 _Static_assert(sizeof(struct la_linux_ucontext)==448, "Linux LA ucontext size");
 /* sizeof rounds this aligned object up; only 592 ABI bytes are published. */
 #define LA_SIGNAL_FRAME_BYTES (576U+sizeof(struct la_context_info))
-_Static_assert(offsetof(struct la_linux_frame,end)==576, "Linux LA extension offset");
+_Static_assert(offsetof(struct la_linux_frame,extension)==576, "Linux LA extension offset");
+_Static_assert(sizeof(struct la_linux_fp)==272 && sizeof(struct la_linux_frame)==880,"Linux LA FPU frame");
 
 static void bad_frame(void)
 { kernel_user_group_exit(KERNEL_THREAD_EXIT_SIGNAL,11,1); }
@@ -44,10 +49,11 @@ static void build_frame(struct kernel_task *task, struct kernel_mm *mm,
     struct arch_trap_frame *frame, const struct kernel_signal_delivery *delivery)
 {
     struct la_linux_frame data;
+    size_t bytes=task->fpu.saved ? sizeof(data) : LA_SIGNAL_FRAME_BYTES;
     uint64_t vdso;
     size_t copied;
-    if(frame->regs[3]<LA_SIGNAL_FRAME_BYTES) bad_frame();
-    uint64_t sp=(frame->regs[3]-LA_SIGNAL_FRAME_BYTES)&~UINT64_C(15);
+    if(frame->regs[3]<bytes) bad_frame();
+    uint64_t sp=(frame->regs[3]-bytes)&~UINT64_C(15);
     memset(&data,0,sizeof(data));
     memcpy(data.info,&delivery->signal,4);
     memcpy(data.info+8,&delivery->code,4);
@@ -57,10 +63,15 @@ static void build_frame(struct kernel_task *task, struct kernel_mm *mm,
     data.context.sigmask[0]=delivery->restore_mask;
     data.context.mcontext.pc=frame->era;
     memcpy(data.context.mcontext.regs,frame->regs,sizeof(frame->regs));
-    if(task->arch.signal_error_code==1) data.context.mcontext.flags=UINT32_C(1)<<30;
-    if(task->arch.signal_error_code==2) data.context.mcontext.flags=UINT32_C(1)<<31;
-    if(kernel_copy_to_user(mm,sp,&data,LA_SIGNAL_FRAME_BYTES,&copied)!=KERNEL_UACCESS_STATUS_OK ||
-       copied!=LA_SIGNAL_FRAME_BYTES || kernel_mm_vdso_address(mm,&vdso)!=KERNEL_MM_STATUS_OK)
+    if(task->arch.signal_error_code==1) data.context.mcontext.flags|=UINT32_C(1)<<30;
+    if(task->arch.signal_error_code==2) data.context.mcontext.flags|=UINT32_C(1)<<31;
+    if(task->fpu.saved) {
+        la_fpu_save(&task->fpu);data.context.mcontext.flags|=1;
+        data.extension.magic=0x46505501;data.extension.size=16+sizeof(data.fp);
+        memcpy(&data.fp,&task->fpu,sizeof(data.fp));
+    }
+    if(kernel_copy_to_user(mm,sp,&data,bytes,&copied)!=KERNEL_UACCESS_STATUS_OK ||
+       copied!=bytes || kernel_mm_vdso_address(mm,&vdso)!=KERNEL_MM_STATUS_OK)
         bad_frame();
     frame->regs[3]=sp;frame->regs[1]=vdso;frame->era=delivery->handler;
     frame->regs[4]=delivery->signal;frame->regs[5]=sp;frame->regs[6]=sp+128;
@@ -90,20 +101,43 @@ void la_signal_restore_current(struct arch_trap_frame *frame)
     struct kernel_task *task=kernel_task_current();
     struct kernel_mm *mm;
     struct la_linux_mcontext context;
-    struct la_context_info end;
+    struct la_context_info extension;
+    struct arch_fpu_state fp={0};
     uint64_t mask,sp=frame->regs[3];
     size_t copied;
     if(sp>UINT64_MAX-LA_SIGNAL_FRAME_BYTES ||
        kernel_task_mm_borrow_mutable(task,&mm)!=KERNEL_TASK_STATUS_OK) bad_frame();
     /* 所有输入先快照；失败不能发布一半恢复的 mask 或寄存器。 */
     if(kernel_copy_from_user(mm,&mask,sp+128+40,sizeof(mask),&copied)!=KERNEL_UACCESS_STATUS_OK || copied!=sizeof(mask) ||
-       kernel_copy_from_user(mm,&context,sp+128+176,sizeof(context),&copied)!=KERNEL_UACCESS_STATUS_OK || copied!=sizeof(context) ||
-       kernel_copy_from_user(mm,&end,sp+576,sizeof(end),&copied)!=KERNEL_UACCESS_STATUS_OK || copied!=sizeof(end)) bad_frame();
-    /* 整数阶段只接受 END；扩展记录必须由未来实际 FP/SIMD owner 解析。 */
-    if(end.magic || (context.flags&1)) bad_frame();
+       kernel_copy_from_user(mm,&context,sp+128+176,sizeof(context),&copied)!=KERNEL_UACCESS_STATUS_OK || copied!=sizeof(context)) bad_frame();
+    uint64_t address=sp+576,fp_address=0;
+    for(;;) {
+        /* Linux END 只读取 magic/size；padding 不需要可读，对齐也不额外限制。 */
+        if(kernel_copy_from_user(mm,&extension,address,8,&copied)!=KERNEL_UACCESS_STATUS_OK || copied!=8)bad_frame();
+        if(!extension.magic)break;
+        if(extension.magic!=0x46505501 || extension.size<16+sizeof(struct la_linux_fp) ||
+           address>UINT64_MAX-extension.size)bad_frame();
+        fp_address=address+16;address+=extension.size;
+    }
+    if(fp_address) {
+        if(kernel_copy_from_user(mm,&fp,fp_address,sizeof(struct la_linux_fp),&copied)!=KERNEL_UACCESS_STATUS_OK ||
+           copied!=sizeof(struct la_linux_fp))bad_frame();
+    } else if(context.flags&1) {
+        if(task->fpu.saved)la_fpu_save(&task->fpu);
+        fp=task->fpu;
+    }
+    uint32_t pending=fp_address ? fp.fcsr&((fp.fcsr&31U)<<24) : 0;
+    if(pending) {
+        fp.fcsr&=~((fp.fcsr&31U)<<24);
+        if(kernel_copy_to_user(mm,fp_address+264,&fp.fcsr,sizeof(fp.fcsr),&copied)!=KERNEL_UACCESS_STATUS_OK || copied!=sizeof(fp.fcsr))bad_frame();
+    }
     if(kernel_signal_update_blocked(task,LINUX_SIG_SETMASK,&mask,0)!=KERNEL_SIGNAL_STATUS_OK) bad_frame();
     kernel_signal_clear_syscall_restart(task);
     frame->era=context.pc;frame->regs[0]=0;
     memcpy(frame->regs+1,context.regs+1,31*sizeof(uint64_t));
+    fp.saved=(context.flags&1)!=0;task->fpu=fp;
+    if(fp.saved)la_fpu_restore(&task->fpu);
+    else __asm__ volatile("csrwr $zero,2":::"memory");
+    if(pending)kernel_signal_force_fault(task,8,128,0);
     /* PRMD 与内核 TP 始终来自可信 trap，不能由用户帧提升权限。 */
 }

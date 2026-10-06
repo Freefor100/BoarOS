@@ -72,8 +72,8 @@ def candidates():
         result.extend(la.glob('userland-identity-v1.json'))
         result.extend(la.glob('userland-identity-v2-pre-mode.json'))
         result.extend(la.glob('userland-identity-v2-pre-wrapper.json'))
-        result.extend(path for path in la.iterdir() if path.name in {'root-run','root-io-run','block-run','toolchain-check'}
-                      or path.name.startswith(('root-run.','root-io-run.','userland-run.')))
+        result.extend(path for path in la.iterdir() if path.name in {'root-run','root-io-run','block-run','toolchain-check','dynamic','dynamic-dp','exec-error-inputs'}
+                      or path.name.startswith(('root-run.','root-io-run.','userland-run.','exec-fail-run.')))
         gcc_cache=la/'gcc-sf'
         if gcc_cache.is_dir():
             result.extend(path for path in gcc_cache.iterdir() if path.name in {'build','build-sf'})

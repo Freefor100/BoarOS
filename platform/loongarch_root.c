@@ -28,6 +28,8 @@ static struct {
     struct kernel_fs_context fs;
     struct kernel_elf64_source *source;
     struct kernel_open_file_description *file;
+    struct kernel_elf64_source *interpreter_source;
+    struct kernel_open_file_description *interpreter_file;
     uint64_t baseline;
     int live;
 } root;
@@ -46,6 +48,8 @@ static int release_root(void)
        kernel_fs_context_release(&root.fs)!=KERNEL_FS_CONTEXT_STATUS_OK) return -KERNEL_EIO;
     if((root.image.mm.state==KERNEL_MM_LIVE || root.image.mm.state==KERNEL_MM_CLEANUP) &&
        kernel_exec_image_cleanup(&root.heap,&root.image)!=KERNEL_EXEC_IMAGE_STATUS_OK) return -KERNEL_EIO;
+    if(root.interpreter_source && kernel_elf64_source_release(&root.interpreter_source)!=KERNEL_ELF64_SOURCE_STATUS_OK) return -KERNEL_EIO;
+    if(root.interpreter_file && kernel_open_file_release(&root.interpreter_file)!=KERNEL_OPEN_FILE_STATUS_OK) return -KERNEL_EIO;
     if(root.source && kernel_elf64_source_release(&root.source)!=KERNEL_ELF64_SOURCE_STATUS_OK) return -KERNEL_EIO;
     if(root.file && kernel_open_file_release(&root.file)!=KERNEL_OPEN_FILE_STATUS_OK) return -KERNEL_EIO;
     kernel_page_cache_stop_worker(&root.cache);
@@ -133,9 +137,20 @@ static int prepare_init(void)
     enum kernel_elf64_source_status source=kernel_elf64_source_create(&root.heap,&root.file,BOAROS_PAGE_SIZE,ARCH_ELF_MACHINE,&root.source);
     if(source!=KERNEL_ELF64_SOURCE_STATUS_OK) return source==KERNEL_ELF64_SOURCE_STATUS_NO_MEMORY ? -KERNEL_ENOMEM :
         source==KERNEL_ELF64_SOURCE_STATUS_IO ? -KERNEL_EIO : -KERNEL_ENOEXEC;
-    /* 动态解释器尚未在本阶段接入；按可观察 ABI 报错，不发布任务。 */
-    if(kernel_elf64_source_interpreter(root.source,0)) return -KERNEL_ENOEXEC;
-    struct kernel_exec_image_request request={.executable_source=root.source,
+    const char *interpreter=kernel_elf64_source_interpreter(root.source,0);
+    if(interpreter) {
+        opened=kernel_open_file_create_at(&root.heap,kernel_fs_context_cwd(&root.fs),
+            kernel_fs_context_root(&root.fs),interpreter,KERNEL_OPEN_PATH_EXECUTABLE,0,
+            &root.interpreter_file,&error);
+        if(opened!=KERNEL_OPEN_FILE_STATUS_OK)return opened==KERNEL_OPEN_FILE_STATUS_NO_MEMORY ? -KERNEL_ENOMEM : -KERNEL_EIO;
+        if(error)return error;
+        source=kernel_elf64_source_create_interpreter(&root.heap,&root.interpreter_file,BOAROS_PAGE_SIZE,
+            ARCH_ELF_MACHINE,&root.interpreter_source);
+        if(source!=KERNEL_ELF64_SOURCE_STATUS_OK)return source==KERNEL_ELF64_SOURCE_STATUS_NO_MEMORY ? -KERNEL_ENOMEM :
+            source==KERNEL_ELF64_SOURCE_STATUS_IO ? -KERNEL_EIO : -KERNEL_ELIBBAD;
+        if(kernel_elf64_source_interpreter(root.interpreter_source,0))return -KERNEL_ELIBBAD;
+    }
+    struct kernel_exec_image_request request={.executable_source=root.source,.interpreter_source=root.interpreter_source,
         .executable={init_path,sizeof(init_path)-1},.arguments=init_arguments,.argument_count=INIT_ARGUMENTS_COUNT,
         .environment=init_environment,.environment_count=INIT_ENVIRONMENT_COUNT};
     int64_t result=0;

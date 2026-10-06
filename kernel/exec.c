@@ -739,7 +739,7 @@ enum kernel_exec_status kernel_execve_prepare(
         }
         {
             enum kernel_elf64_source_status source_status =
-                kernel_elf64_source_create(transaction->heap,
+                kernel_elf64_source_create_interpreter(transaction->heap,
                                            &transaction->interpreter_file,
                                            BOAROS_PAGE_SIZE,
                                            ARCH_ELF_MACHINE,

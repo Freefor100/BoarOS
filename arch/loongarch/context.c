@@ -1,4 +1,5 @@
 #include <arch/task.h>
+#include <arch/loongarch/fpu.h>
 #include <platform/loongarch_virt.h>
 #include <string.h>
 #include "../../kernel/sched/private.h"
@@ -21,16 +22,16 @@ enum arch_context_status arch_context_init_user(struct arch_switch_context *cont
 }
 void arch_fpu_switch(struct arch_fpu_state *previous, struct arch_fpu_state *next)
 {
-    /* 首阶段不允许任务借用浮点/向量寄存器，切换时保持 EUEN 禁用。 */
-    if ((previous && previous->saved) || (next && next->saved)) la_virt_fatal("unsupported FPU owner");
-    __asm__ volatile("csrwr $zero, 2" ::: "memory");
+    if(previous && previous->saved)la_fpu_save(previous);
+    if(next && next->saved)la_fpu_restore(next);
+    else __asm__ volatile("csrwr $zero, 2" ::: "memory");
 }
 void arch_process_prepare_initial(struct kernel_task *task, uintptr_t entry, uintptr_t stack, uintptr_t tls)
 {
     struct arch_trap_frame *frame=(void *)(task->stack_high-sizeof(*frame));
     memset(frame, 0, sizeof(*frame)); frame->regs[3]=stack; frame->regs[2]=tls;
     frame->era=entry; frame->prmd=7; frame->kernel_tp=(uintptr_t)task;
-    task->fpu.saved=0;
+    memset(&task->fpu,0,sizeof(task->fpu));
 }
 void arch_process_prepare_exec(struct kernel_task *task, uintptr_t entry, uintptr_t stack, uintptr_t tls)
 { arch_process_prepare_initial(task, entry, stack, tls); __asm__ volatile("csrwr $zero, 2" ::: "memory"); }
@@ -38,7 +39,9 @@ enum kernel_scheduler_status arch_process_prepare_clone(struct kernel_task *chil
     const struct arch_trap_frame *old, uint64_t stack, int set_tls, uint64_t tls)
 {
     struct arch_trap_frame *frame=(void *)(child->stack_high-sizeof(*frame));
-    if ((uintptr_t)frame<child->stack_low || parent->fpu.saved) return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
+    if ((uintptr_t)frame<child->stack_low) return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
+    if(parent->fpu.saved)la_fpu_save(&parent->fpu);
+    child->fpu=parent->fpu;
     *frame=*old; frame->regs[4]=0; frame->era+=4; frame->kernel_tp=(uintptr_t)child;
     child->arch.signal_error_code=parent->arch.signal_error_code;
     frame->estat=0; frame->badv=0;

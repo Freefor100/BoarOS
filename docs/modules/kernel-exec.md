@@ -12,7 +12,7 @@
 | `kernel/sched/exec.c` | 在不可返回提交点切换架构地址空间、替换 MM、重建 Trap Frame 并处理 close-on-exec |
 | `kernel/syscall/process.c`、`arch/riscv/trap.c` | 解码 syscall 221 和提交动作 |
 
-通用入口 `kernel_execve_prepare()` 在旧 MM 上建立 `PREPARED` 事务；`kernel_exec_image_prepare()` 调用共用 `kernel_elf_image_build()`。machine、页大小、MMU 和线程寄存器由构建期绑定的 RV/LA 实现提供，不使用运行期 vtable。RV 的旧入口保留薄包装；LA 首阶段通过内存 reader 验证同一 image 契约，尚无根盘 execve 验收。
+通用入口 `kernel_execve_prepare()` 在旧 MM 上建立 `PREPARED` 事务；`kernel_exec_image_prepare()` 调用共用 `kernel_elf_image_build()`。machine、页大小、MMU 和线程寄存器由构建期绑定的 RV/LA 实现提供，不使用运行期 vtable。RV 的旧入口保留薄包装；LA已通过内存reader、PCI根盘、原版LP64S静态和LP64D动态musl同一image/exec契约的双侧验收。
 
 ## 准备事务
 
@@ -30,7 +30,7 @@
 -> 发布 PREPARED
 ```
 
-主程序支持 RISC-V `ET_EXEC` 和 `ET_DYN`；解释器支持非递归 `ET_EXEC`/`ET_DYN`。动态 source 的 `PT_DYNAMIC`/`PT_TLS` 等元数据留给用户动态链接器。主文件格式或架构错误映射为 `-ENOEXEC`；解释器路径不存在时保留路径 errno，解释器格式或架构不正确映射为 `-ELIBBAD`；资源、I/O 和参数限制分别返回 `-ENOMEM`、`-EIO`、`-E2BIG`。解析、打开或构造失败时旧进程映像完全不变。
+主程序支持 RISC-V `ET_EXEC` 和 `ET_DYN`；解释器支持非递归 `ET_EXEC`/`ET_DYN`。动态 source 的 `PT_DYNAMIC`/`PT_TLS` 等元数据留给用户动态链接器。主文件格式或架构错误映射为 `-ENOEXEC`；解释器路径不存在时保留路径 errno，不足64字节的解释器header按Linux elf_read返回 `-EIO`，完整header的格式或架构不正确映射为 `-ELIBBAD`；资源、I/O 和参数限制分别返回 `-ENOMEM`、`-EIO`、`-E2BIG`。解析、打开或构造失败时旧进程映像完全不变。
 
 事务中的 `executable_file`/`interpreter_file` 是 source 创建前的 OFD owners；source 创建成功后由 source 持有 OFD，事务改为持有 source owner。映像构造给 MM 增加各 source 的引用，事务在提交后释放自己的引用。解析、打开或真实 VFS/I/O 清理失败时保留准确 owner；物理页、VMA metadata 和堆的合法释放完成即结束，分配器不变量错误进入 fatal。
 
@@ -72,7 +72,7 @@ make test-glibc-riscv
 make test-riscv
 ```
 
-动态 ET_DYN/解释器的生产构造已经接入；真实 userland runner 已验证动态 musl PIE、解释器、额外 DSO、初始 TLS 和运行中 dlopen TLS。固定 glibc 2.44 的静态、动态、PIE、静态 PIE 与 pthread/TLS/信号组合另由 `test-glibc-riscv` 双侧验证。更广重定位矩阵、`execveat`、凭据变化、写入文件的一致性和 LoongArch 后端仍未完成。128 KiB 是当前序列化初始栈镜像限制，不是完整 Linux `ARG_MAX` 策略。
+动态 ET_DYN/解释器的生产构造已经接入；真实 userland runner 已验证动态 musl PIE、解释器、额外 DSO、初始 TLS 和运行中 dlopen TLS。固定 glibc 2.44 的静态、动态、PIE、静态 PIE 与 pthread/TLS/信号组合另由 `test-glibc-riscv` 双侧验证。更广重定位矩阵、`execveat`、凭据变化、写入文件的一致性尚未完成；LA原版动态musl/初始及late DSO TLS已双侧验证。128 KiB 是当前序列化初始栈镜像限制，不是完整 Linux `ARG_MAX` 策略。
 
 ## 脚本执行
 
