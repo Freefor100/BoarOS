@@ -51,8 +51,9 @@ Linux 的 blocking/RR/5 连接遇到 180 秒 workload timeout，结果文件为�
 重新匹配，旧失败批次标 incomplete，不混合两版 ELF 的吞吐或观测开销。
 
 TAP 可选 `--tap-delay-ms 0/1/10`，只在隔离 namespace 的 host→guest egress 设置
-netem，另报告实际 RTT。本宿主 1/10 ms 均返回 `Specified qdisc kind is unknown`，
-在 QEMU 启动前明确记 unsupported。没有加载宿主模块或用另一种 relay 混作同一测量后端。
+netem，另报告实际 RTT。首次测量时宿主 1/10 ms 均返回 `Specified qdisc kind is unknown`，
+在 QEMU 启动前明确记 unsupported。随后确认运行内核 7.2.7 与已安装的 7.2.8 模块不匹配；
+重启后的补测见文末。原失败未改记为通过，也没有用另一种 relay 混作同一测量后端。
 固定 ABI Linux 未启用 NETDEVICES，TAP 配置实测 ENODEV 后，另用既有
 `tests/network-linux.config` 从固定 `references/linux@f4cdf7ca9a1fdcca413157df19753f388a5a224e`
 构建网卡参考 Image（SHA-256 `7fdeac1a0821f821e02c15c35cd2c4003b66268a65b8ef591520094c096f442e`），
@@ -324,7 +325,7 @@ lwext4 完整恢复与阶段七后默认/RA8WB8 的 SQLite DELETE/WAL 完整矩�
 - 顺序冷读占主导：RA8 值得在目标数据集继续验证；RA1 没有普遍收益。显式同步写占主导时 WB8 的收益更明确；同时需要两类负载可试 RA8/WB8。纯预读失败仍不污染无关 demand 或写回错误 owner。
 - 接近连接池上限且重视控制尾延迟：本次优先候选为 `w8-p4-m2`，它增加全局资源而保留小窗口；五连接 bulk 优先的应用可另评估 `w16-p2-m2`。32 MSS 不是通用推荐，更多池/堆也未单调提高收益。
 - TCP 生产默认仍为 8 MSS、1 倍池/堆；存储仍为 RA0/WB1。配置取舍由用户依据目标程序选择，本轮没有自动切换默认。
-- 只测本机 QEMU 11.1.1、单 hart、512 MiB、modern VirtIO、固定 ELF/数据集及当前主机条件。legacy 的正确性另有门禁，此处没有对应吞吐分布。echo RTT 来自 16 次 64 B 应用请求，包含端点处理与调度，不等同于 TCP 内部 SRTT。1/10 ms netem 在创建 qdisc 时被拒绝，未启动客体；没有受控 RTT 收益结论。
+- 本节只测本机 QEMU 11.1.1、单 hart、512 MiB、modern VirtIO、固定 ELF/数据集及当时主机条件。legacy 的正确性另有门禁，此处没有对应吞吐分布。echo RTT 来自 16 次 64 B 应用请求，包含端点处理与调度，不等同于 TCP 内部 SRTT。本节最初的 1/10 ms netem 创建失败；文末是重启后的独立补测。
 - 三次范围不是充分统计置信度，也不支持实板、SMP、无限并发、长期无饥饿、所有 libc 应用或完整比赛 Harness 的结论。默认网络预算在若干吞吐负载的回退，以及全局协议资源失败后的重复复制，继续作为真实优化输入保留。
 
 
@@ -404,3 +405,120 @@ python3 -B tests/budget-plot.py --table docs/learning/data-path-budget-summary.t
 发布表和诊断表已由原结果重新导出，逐字节比对一致；图从 Git 中的表重新生成并目视
 检查。导出器拒绝未完成/非对应模式、重复启动或输入身份冲突，不把缺数据填成零。
 记录结论后按项目规则清理运行镜像、日志和临时探针，保留可复用候选/固定基线/工具链缓存。
+
+## 受控延迟与原版五项评分补测（2026-10-06）
+
+用户重启后，宿主为 `7.2.8-zen1-2-zen`，运行内核与 `sch_netem` 模块版本一致。
+隔离 namespace 中实际创建 1 ms netem 成功，随后补跑 1/10 ms。这里设置的是
+host→guest 单向延迟，不能直接称为固定 RTT；实际 echo RTT 另列。未重建候选，
+复用此前 main 的关闭 COST 发布内核；五项原版评分则使用同步主线后的兼容分支。
+
+### RV 原版五项成绩
+
+`oscomp-rv-compat` 单向合入 main 后为 `a9fdc9e`，保留兼容 uname 与启动配置。
+仅选择 iozone、cyclictest、iperf、libcbench、lmbench，按此顺序分别运行 glibc/musl，
+一次 QEMU 启动，1 hart/1 GiB、原 Harness 设备参数，COST 关闭。没有跑 LTP 或其他组，
+没有追加回归、诊断构建或重复启动。十个原脚本均到达结束且返回 0，经过 704.268 秒。
+使用固定 `references/oscomp-autotest@d1bb3a3c4b27274e196a2648518525c1a304e339`
+的原 parser/judge；原发布镜像为 pre-20250615，程序与脚本未改。
+
+| 项目 | musl | glibc | 每种 libc 的分数上界 | 原 judge 指标数 |
+|---|---:|---:|---:|---:|
+| iozone | 28.3247 | 28.6106 | 40 | 20 |
+| cyclictest | 7.3915 | 7.4545 | 8 | 4 |
+| iperf | 6.0000 | 6.0000 | 12 | 6 |
+| libcbench | 30.0344 | 37.3851 | 54 | 27 |
+| lmbench | 51.4950 | 51.5927 | 72 | 36 |
+
+[186 项原 judge 数值](oscomp-rv-five-results.tsv)保留实际结果、内嵌参考值及逐项分数。
+`judge_reference` 是原 judge 的历史内嵌数值，既不是 5687377，也不是本次新测 Linux。
+原性能 judge 对有效但低于参考的结果仍给 1 分，所以正分不能证明接近参考性能。
+本次是 RV 五组的一次原版评分，不是完整双架构 Harness 或三启动性能分布。
+
+| 原 iperf 接收端 TCP，Mbit/s | musl | glibc |
+|---|---:|---:|
+| 单连接 | 229 | 226 |
+| 五连接合计 | 319 | 285 |
+| 反向单连接 | 227 | 227 |
+
+这些是本次原脚本的真实接收输出，不能用上一节自写 bulk 的数值代替。
+三种 TCP 均低于 judge 内嵌参考，各得 1 分；UDP 三项也各得 1 分。
+与此前单 TCP 250/274、五 TCP 359.9/355.5 的历史中位数相比，本次更低，
+但历史是另一轮三启动兼容配置，本次只有一次，不宣称已经隔离出变化原因。
+
+cyclictest 继续报告 `mlock Function not implemented`。glibc 的压力八线程计数为
+`1000,667,500,40,34,0,0,0`，后三条没有有效延迟样本；musl 八条都有样本。
+原 judge 的 `Min:\s+` 正则不匹配零样本行的 `Min:1000000`，glibc 压力八线程
+397 µs 实际只平均了五条记录，不能把 7.4545 分解读为八线程均稳定运行。
+这里保留原 judge，不改公式或补造样本。
+
+所有组结束并打印 `BOAROS-EVAL COMPLETE` 后，内核最后报告
+`root boot error status=0xb`。该值是 `RISCV_ROOT_BOOT_STATUS_CLEANUP`，不是 errno。
+网络/rng 收口已完成；最后失败的下层 owner 未在本次日志中打印，仍待定位。
+报告保留 `guest-boot-error`，不能将这次启动写成完全无错误通过；应用测量与分数
+均在此错误之前输出。没有为消除这条记录重跑五组或展开存储恢复矩阵。
+
+重建仅需：
+
+```sh
+git switch oscomp-rv-compat
+python3 -B tests/oscomp/run.py --groups benchmarks --output build/oscomp-rv-five-new
+```
+
+新增 `benchmarks` 只选择这五个原组。常规 runner 复用已核对的发布输入；
+四个 RV/LA 大文件的哈希复查改为显式 `--verify-inputs`，不再作为每次评分的前置扫描。
+
+### 1/10 ms 单向延迟结果
+
+仅比较原基线、默认 8/1/1 和已有证据的近池候选 8/4/2。两个负载为 TAP 非阻塞
+单 bulk 与 27 bulk＋1 control，bulk 每条 4 MiB。每组三次独立启动，共 36 次，
+全部内容/完成检查成功，netem 没有丢包。QEMU 11.1.1、1 hart/512 MiB、modern；
+实测 RTT 是每连接 16 次 64 B echo 的中位数，再在连接和启动间取中位数。
+没有展开 27 组参数，也没有诊断构建或无关回归。
+
+| 单连接配置 | 1 ms 吞吐 Mbit/s | 实测 RTT ms | 10 ms 吞吐 Mbit/s | 实测 RTT ms |
+|---|---:|---:|---:|---:|
+| 5687377 | 75.80 | 1.243 | 8.69 | 10.506 |
+| 默认 8/1/1 | 74.78 | 1.459 | 8.68 | 10.726 |
+| 候选 8/4/2 | 75.05 | 1.423 | 8.67 | 10.719 |
+
+| 近池单向延迟／配置 | 吞吐 Mbit/s，中位 [范围] | 控制 P99 ms，中位 [范围] | 准备阶段实测 RTT ms |
+|---|---:|---:|---:|
+| 1 ms / 5687377 | 181.76 [181.55, 183.11] | 259.88 [257.81, 507.09] | 3.485 |
+| 1 ms / 8/1/1 | 77.71 [77.34, 77.77] | 40.14 [38.16, 41.95] | 3.810 |
+| 1 ms / 8/4/2 | 189.51 [181.21, 192.09] | 17.73 [17.59, 20.76] | 3.921 |
+| 10 ms / 5687377 | 97.39 [96.67, 100.06] | 261.78 [261.64, 512.02] | 10.319 |
+| 10 ms / 8/1/1 | 75.21 [74.23, 75.37] | 41.71 [40.22, 42.37] | 10.391 |
+| 10 ms / 8/4/2 | 177.72 [151.40, 180.67] | 19.73 [19.35, 31.84] | 10.332 |
+
+[完整聚合范围](data-path-controlled-delay.tsv)包含上述 12 组。10 ms 候选的范围较宽，
+保留全部三次而不挑选最快样本。0 ms 的旧报告发生于重启前，不冒充同一宿主内核
+的新对照。单连接没有池/堆扩大收益；8 MSS=11680 B，在约 10.7 ms 下的窗口演算
+约 8.7 Mbit/s，与实测接近，这是窗口约束的解释依据，不是独立隔离证明。
+
+两个 run 串行执行，且在五项原版评分结束后启动：
+
+```sh
+for delay in 1 10; do
+  python3 -B tests/network-budget-experiment.py run --variant w8-p1-m1=build/network-budget/kernels/w8-p1-m1/kernel-rv --variant w8-p4-m2=build/network-budget/kernels/w8-p4-m2/kernel-rv --cases tap:nonblocking:bulk:1:tx,tap:nonblocking:mixed:near:tx --repeat 3 --tap-delay-ms "$delay" --output "build/network-budget/delay-${delay}ms-new"
+done
+```
+
+### 实现路线、候选与选择标准
+
+实现路线已由用户确认：短 syscall＋有界 worker 保留低延迟提交并明确协议执行资格；
+脏页链＋哈希利用现有局部索引；TCP reservation 只预约接纳字节，继续 COPY，避免
+引入稳定到 ACK 的内容生命周期。全邮箱会增加每次小请求排队/调度，TCP 重写与
+跨层预约扩大验证和所有权成本，统一大树也不是消除增长扫描所必需，故本轮未选。
+这些是实现取舍，不是已经实测击败了所有替代架构。
+
+参数标准是正确完成、接收有效吞吐、控制尾延迟、内存代价和目标负载的稳定收益。
+0 ms 近池的 8/4/2 为 177.27 Mbit/s、P99 19.93 ms；8/4/4 为 165.26、22.08，
+增加堆却无收益；16/2/2 为 76.03、78.31；32/4/4 为 63.05、144.95。五连接的
+16/2/2 则更快，说明不能跨负载推广。此次延迟补测支持 8/4/2 作为高并发候选，
+但没有比较长 RTT 下的 16/32 MSS，单连接窗口参数尚未由本次比较选出。
+
+存储同理：WB8 将 64 MiB fsync 追加从默认 4.52 提高到 6.23 MiB/s，却将缓存
+1 KiB 追加从 20.86 降到 18.68；RA8/WB8 的顺序冷读 36.66 对默认 25.53 有收益。
+因此按负载推荐，不能统一开启所有更大值。生产仍 TCP 8/1/1、RA0/WB1；本轮未
+自动采用候选。后续以原版目标程序和直接相关回归为主，不因小改动重跑全部矩阵。

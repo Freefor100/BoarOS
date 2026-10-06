@@ -26,17 +26,20 @@ def sha(path):
 def output(args, cwd=ROOT):
     return subprocess.check_output(args, cwd=cwd, text=True).strip()
 
-def validate():
+def validate(verify_assets=False):
     identity = json.loads((HERE / 'inputs.json').read_text())
     if output(['git', 'remote', 'get-url', 'origin'], REF) != identity['autotest_url']:
         raise RuntimeError('autotest origin differs')
     actual = output(['git', 'rev-parse', 'HEAD'], REF)
     if actual != identity['autotest_commit'] or output(['git', 'status', '--porcelain'], REF):
         raise RuntimeError('autotest identity or clean worktree differs')
-    for name, expected in identity['assets'].items():
-        path = REF / name
-        if not path.is_file() or sha(path) != expected:
-            raise RuntimeError(f'missing or altered release asset: {path}')
+    if not (REF / 'sdcard-rv.img').is_file():
+        raise RuntimeError('RV release image is missing')
+    if verify_assets:
+        for name, expected in identity['assets'].items():
+            path = REF / name
+            if not path.is_file() or sha(path) != expected:
+                raise RuntimeError(f'missing or altered release asset: {path}')
     return identity
 
 class ReportJob:
@@ -86,8 +89,9 @@ def grade(log, directory, config, selected):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--output', type=Path, default=ROOT / 'build/oscomp-rv-run')
+    ap.add_argument('--verify-inputs', action='store_true', help='explicitly recheck release asset hashes; routine runs reuse the previously verified inputs')
     ap.add_argument('--diagnostic-timeout', type=int, help='override total budget, 0 disables it; labels result diagnostic, never the formal baseline')
-    ap.add_argument('--groups',choices=('all','iozone','environment','ltp'),default='all',help='subsets run the same original scripts and never imply full Harness acceptance')
+    ap.add_argument('--groups',choices=('all','benchmarks','iozone','environment','ltp'),default='all',help='benchmarks selects only iozone, cyclictest, iperf, libcbench and lmbench; subsets use the original scripts')
     ap.add_argument('--case-timeout', type=int, default=300, help='LTP per-case safety budget seconds, 0 disables it; timeout is never a pass')
     ap.add_argument('--diagnostic-exclude', action='append', default=[], metavar='CASE', help='explicitly leave a LTP basename unexecuted, status 125; labels the whole run diagnostic')
     args = ap.parse_args()
@@ -96,8 +100,8 @@ def main():
         raise SystemExit(f'output already exists; choose a new disposable run directory: {directory}')
     if not directory.is_relative_to(ROOT / 'build'):
         raise SystemExit('run outputs must be under build/')
-    identity = validate()
-    selected={'all':GROUPS,'iozone':['iozone'],'environment':['basic','busybox'],'ltp':['ltp']}[args.groups]
+    identity = validate(args.verify_inputs)
+    selected={'all':GROUPS,'benchmarks':['iozone','cyclictest','iperf','libcbench','lmbench'],'iozone':['iozone'],'environment':['basic','busybox'],'ltp':['ltp']}[args.groups]
     config_path = REF / 'kernel/judge/config.json'
     config = json.loads(config_path.read_text())
     budget = args.diagnostic_timeout if args.diagnostic_timeout is not None else config.get('qemu.timeout', 60)
@@ -121,6 +125,7 @@ def main():
                'virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0', '-no-reboot',
                '-device', 'virtio-net-device,netdev=net', '-netdev', 'user,id=net', '-rtc', 'base=utc']
     report = {'started_utc': datetime.now(timezone.utc).isoformat(), 'inputs': identity,
+              'release_assets_verified_this_run': args.verify_inputs,
               'kernel_commit': output(['git', 'rev-parse', 'HEAD']), 'kernel_dirty': output(['git', 'status', '--porcelain']),
               'kernel_sha256': sha(kernel), 'config': config, 'config_sha256': sha(config_path),
               'init_config_sha256': sha(ROOT / 'build/riscv/oscomp/init.json'), 'init_script_sha256': sha(HERE / 'init.sh'),

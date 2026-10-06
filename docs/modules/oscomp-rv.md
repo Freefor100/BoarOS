@@ -8,7 +8,8 @@ uname 4.15.0、启动配置和评测入口，不整体回合主线。这里只�
 `tests/oscomp/inputs.json` 固定 `pre-20250615` 发布镜像及压缩包的 SHA-256，
 以及 `references/oscomp-autotest` commit
 `d1bb3a3c4b27274e196a2648518525c1a304e339`。四个发布资产长期保存于该目录，
-缺失或校验失败直接报错，不重新下载、不修改原盘。LA 只校验身份，不启动。
+缺失直接报错，不重新下载、不修改原盘。常规运行复用已核对的发布输入，不再扫描
+RV/LA 四个大文件；需要重新校验时显式传 `--verify-inputs`。LA 不启动。
 来源为清单记录的 GitHub release 与 Harness；运行依赖包括项目工具链、QEMU、
 Python 3.11+、jinja2、pytz，原 judge 使用宿主 Python。
 
@@ -90,6 +91,7 @@ LTP 仍使用比赛脚本的原目录遍历、原参数及原 START/RUN/FAIL/END
 make all                         # 官方构建入口；无需修改官方测试盘
 python3 -B tests/oscomp/run.py --output build/oscomp-rv-baseline
 python3 -B tests/oscomp/run.py --groups environment --output build/oscomp-rv-environment
+python3 -B tests/oscomp/run.py --groups benchmarks --output build/oscomp-rv-benchmarks
 # 聚焦验证仍执行完整原 LTP 包装器，不选内部清单：
 python3 -B tests/oscomp/run.py --groups ltp --output build/oscomp-ltp
 python3 -B tests/oscomp/test_official.py
@@ -119,6 +121,9 @@ runner 读取固定 Harness `kernel/judge/config.json`。其中 `qemu.timeout=36
 退出原因、22 组细目及原 postwork 分数。`judge.json` 为原解析器结果，`serial.log`
 为完整串口，`identity.json` 在启动前写入，方便中断后定位。HTML 是原 postwork 展示，
 可能带有 LA 空列，不能把它解释成跑过 LA。输出只允许放在新建的 `build/` 子目录。
+`release_assets_verified_this_run` 区分此次全量复查与复用既有输入；`--groups benchmarks`
+仅执行五项原脚本，未选组只由原 parser 产生空结果。最新实测、cleanup 错误和
+cyclictest 零采样见[五项评分记录](../learning/data-path-budget-experiments.md#受控延迟与原版五项评分补测2026-10-06)。
 
 ## 证据边界与清理
 

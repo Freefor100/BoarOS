@@ -25,6 +25,7 @@ N3已经交付：legacy/modern VirtIO-net、受限DMA借用与复制回退、静
 | 追加增长纠错 | 增长与截断分离；对齐增长不扫描缓存页链，非对齐增长仅处理旧尾页。1/4/16/64 MiB 成本门禁与真实文件/映射回归通过，另有匹配吞吐：64 MiB、1 KiB 缓存追加默认约 20.86 MiB/s，旧基线约 3.70；不推广成整体倍数。见[规模成本](learning/single-hart-scale.md)和[测量边界](learning/data-path-budget-experiments.md)。 |
 | epoll 交付纠错 | 完整 event 复制后提交 ET/ONESHOT；独立扫描/pending、MOD 代次与任务退出 owner 已接入。生产函数宿主边界及固定 Linux 同 RV64 ELF 验证通过；见[事件交付](learning/epoll-delivery.md)。 |
 | 双盘控制协议纠错 | 原基线 `3c34091`/`5687377` 的暂扣阶段超时已定位为规范模式终端等待行结束：host只发送单字节g，尚未出现B盘暂扣READ。guest显式设置并恢复控制终端后，暂扣/故障/重启和FIFO/RR四组合通过；最终复核还修复主动kill与NBD响应写入的收口竞态，受控cut确认后30次额外故障/重启通过。已加入CI目标，尚无本提交的托管CI结果。见[可睡眠存储](learning/sleepable-storage.md)。 |
+| 原版五项评分暴露的边界 | 兼容分支同步 main 后，一次启动仅跑 iozone/cyclictest/iperf/libcbench/lmbench，两种 libc 原脚本均结束并取到原 judge 分数。glibc cyclictest 压力八线程有三条零采样；所有组结束后根盘 finish 返回 CLEANUP（0xb），失败 owner 尚未打印。先定位这两个具体现场，不以分数或整组结束掩盖，也不展开无关回归；见[五项记录](learning/data-path-budget-experiments.md#受控延迟与原版五项评分补测2026-10-06)。 |
 
 [风险证据与重建](learning/cost-baseline.md#旧版内存释放与-virtqueue-告警2026-10-02)
 区分已经修复的机制与缺少历史现场的归因。固定root、单hart、QEMU和选定应用验收
@@ -32,7 +33,7 @@ N3已经交付：legacy/modern VirtIO-net、受限DMA借用与复制回退、静
 
 ## 近期方向
 
-本轮单核数据路径阶段一至七已交付，保留以下由测量暴露的后续边界：默认 TCP 预算在部分 bulk/高并发负载吞吐回退；全局协议资源不足后的复制与重试仍有成本；WB8 可能降低仅缓存完成的小写速度。优先按[匹配结果](learning/data-path-budget-experiments.md)选择目标程序和候选，再决定是否调整生产默认。1/10 ms netem 因宿主缺少 qdisc 支持未测，不能推断远程 RTT 下的收益；完整比赛仍缺 kernel-la。
+本轮单核数据路径阶段一至七已交付，保留以下由测量暴露的后续边界：默认 TCP 预算在部分 bulk/高并发负载吞吐回退；全局协议资源不足后的复制与重试仍有成本；WB8 可能降低仅缓存完成的小写速度。优先按[匹配结果](learning/data-path-budget-experiments.md)选择目标程序和候选，再决定是否调整生产默认。重启后 1/10 ms 单向 netem 已完成 36 次补测，支持 8/4/2 的近池收益，单连接长 RTT 的窗口候选尚未选定；完整比赛仍缺 kernel-la。后续以目标程序及直接相关回归为主，不为小改动重跑全矩阵。
 
 文件元数据的活inode复用、创建句柄初始化、O_PATH与路径truncate已交付，通用实现
 已单向合入兼容分支。路径资格、睡眠前节点引用、初始时间与显式改权的区别、截断属性

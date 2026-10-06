@@ -1,0 +1,187 @@
+group	libc	metric	result	judge_reference	score
+iozone	musl	iozone write/read 4 initial writers (kb/sec)	2717.04	3524.04	1.0
+iozone	musl	iozone write/read 4 rewriters (kb/sec)	2769.84	7471.07	1.0
+iozone	musl	iozone write/read 4 readers (kb/sec)	31673.42	13135.64	1.5852787605506446
+iozone	musl	iozone write/read 4 re-readers (kb/sec)	63885.21	13064.75	1.7954964850236854
+iozone	musl	iozone random-read 4 initial writers (kb/sec)	7143.18	3401.72	1.523780725111225
+iozone	musl	iozone random-read 4 rewriters (kb/sec)	6972.64	7196.32	1.0
+iozone	musl	iozone random-read 4 random readers (kb/sec)	39804.4	11082.03	1.721587814412477
+iozone	musl	iozone random-read 4 random writers (kb/sec)	6743.85	7140.81	1.0
+iozone	musl	iozone read-backwards 4 initial writers (kb/sec)	7171.86	3331.39	1.5354914903525723
+iozone	musl	iozone read-backwards 4 rewriters (kb/sec)	7146.45	4906.05	1.3134983103498938
+iozone	musl	iozone read-backwards 4 reverse readers (kb/sec)	28695.6	10743.42	1.6256074101952913
+iozone	musl	iozone stride-read 4 initial writers (kb/sec)	6964.8	3468.09	1.5020546175051688
+iozone	musl	iozone stride-read 4 rewriters (kb/sec)	7086.97	7004.64	1.0116170944705565
+iozone	musl	iozone stride-read 4 stride readers (kb/sec)	40797.87	11848.11	1.7095899859477959
+iozone	musl	iozone fwrite/fread 4 fwriters (kb/sec)	6236.45	3204.25	1.4862060948135558
+iozone	musl	iozone fwrite/fread 4 freaders (kb/sec)	28592.21	7123.18	1.750869904774762
+iozone	musl	iozone pwrite/pread 4 pwrite writers (kb/sec)	7295.85	3724.0	1.4895728393538792
+iozone	musl	iozone pwrite/pread 4 pread readers (kb/sec)	64903.17	14183.61	1.7814650655738387
+iozone	musl	iozone pwritev/preadv 4 initial writers (kb/sec)	7113.3	3609.25	1.4926054011499585
+iozone	musl	iozone pwritev/preadv 4 rewriters (kb/sec)	7674.69	8305.9	1.0
+iozone	glibc	iozone write/read 4 initial writers (kb/sec)	6219.29	3524.04	1.433369403903018
+iozone	glibc	iozone write/read 4 rewriters (kb/sec)	2730.65	7471.07	1.0
+iozone	glibc	iozone write/read 4 readers (kb/sec)	41183.52	13135.64	1.6810462048897228
+iozone	glibc	iozone write/read 4 re-readers (kb/sec)	45689.93	13064.75	1.7140562482805293
+iozone	glibc	iozone random-read 4 initial writers (kb/sec)	6194.16	3401.72	1.4508181900370671
+iozone	glibc	iozone random-read 4 rewriters (kb/sec)	7359.99	7196.32	1.0222378019535352
+iozone	glibc	iozone random-read 4 random readers (kb/sec)	28362.21	11082.03	1.6092677545226552
+iozone	glibc	iozone random-read 4 random writers (kb/sec)	6766.85	7140.81	1.0
+iozone	glibc	iozone read-backwards 4 initial writers (kb/sec)	6815.82	3331.39	1.5112268223045797
+iozone	glibc	iozone read-backwards 4 rewriters (kb/sec)	7201.07	4906.05	1.3187054146119952
+iozone	glibc	iozone read-backwards 4 reverse readers (kb/sec)	39790.84	10743.42	1.730002684034818
+iozone	glibc	iozone stride-read 4 initial writers (kb/sec)	7082.57	3468.09	1.5103345254618028
+iozone	glibc	iozone stride-read 4 rewriters (kb/sec)	7151.16	7004.64	1.020488983605457
+iozone	glibc	iozone stride-read 4 stride readers (kb/sec)	37226.96	11848.11	1.6817330773181587
+iozone	glibc	iozone fwrite/fread 4 fwriters (kb/sec)	6256.84	3204.25	1.4878804636206135
+iozone	glibc	iozone fwrite/fread 4 freaders (kb/sec)	46066.23	7123.18	1.8453708931683797
+iozone	glibc	iozone pwrite/pread 4 pwrite writers (kb/sec)	6255.46	3724.0	1.4046800714895467
+iozone	glibc	iozone pwrite/pread 4 pread readers (kb/sec)	44823.6	14183.61	1.6835682542232218
+iozone	glibc	iozone pwritev/preadv 4 initial writers (kb/sec)	7303.34	3609.25	1.5058083014073014
+iozone	glibc	iozone pwritev/preadv 4 rewriters (kb/sec)	7361.06	8305.9	1.0
+cyclictest	musl	cyclictest NO_STRESS_P1 (microseconds)	253.0	1862.0	1.864124597207304
+cyclictest	musl	cyclictest NO_STRESS_P8 (microseconds)	276.25	1558.125	1.8227035699959888
+cyclictest	musl	cyclictest STRESS_P1 (microseconds)	375.0	1310.0	1.713740458015267
+cyclictest	musl	cyclictest STRESS_P8 (microseconds)	125.25	13842.75	1.990951942352495
+cyclictest	glibc	cyclictest NO_STRESS_P1 (microseconds)	383.0	1862.0	1.7943071965628357
+cyclictest	glibc	cyclictest NO_STRESS_P8 (microseconds)	221.875	1558.125	1.8576012835940634
+cyclictest	glibc	cyclictest STRESS_P1 (microseconds)	221.0	1310.0	1.831297709923664
+cyclictest	glibc	cyclictest STRESS_P8 (microseconds)	397.0	13842.75	1.971320727456611
+iperf	musl	iperf BASIC_UDP (Mbits/sec)	51.1	393.0	1.0
+iperf	musl	iperf BASIC_TCP (Mbits/sec)	229.0	796.0	1.0
+iperf	musl	iperf PARALLEL_UDP (Mbits/sec)	127.0	442.0	1.0
+iperf	musl	iperf PARALLEL_TCP (Mbits/sec)	319.0	1310.72	1.0
+iperf	musl	iperf REVERSE_UDP (Mbits/sec)	51.5	381.0	1.0
+iperf	musl	iperf REVERSE_TCP (Mbits/sec)	227.0	792.0	1.0
+iperf	glibc	iperf BASIC_UDP (Mbits/sec)	49.3	393.0	1.0
+iperf	glibc	iperf BASIC_TCP (Mbits/sec)	226.0	796.0	1.0
+iperf	glibc	iperf PARALLEL_UDP (Mbits/sec)	144.0	442.0	1.0
+iperf	glibc	iperf PARALLEL_TCP (Mbits/sec)	285.0	1310.72	1.0
+iperf	glibc	iperf REVERSE_UDP (Mbits/sec)	51.5	381.0	1.0
+iperf	glibc	iperf REVERSE_TCP (Mbits/sec)	227.0	792.0	1.0
+libcbench	musl	libc-bench b_malloc_sparse (0) (seconds)	0.3512941	0.384919462	1.0873568767484145
+libcbench	musl	libc-bench b_malloc_bubble (0) (seconds)	0.349247	0.36015349	1.0302828941071764
+libcbench	musl	libc-bench b_malloc_tiny1 (0) (seconds)	0.0112717	0.014186324	1.2054530828423204
+libcbench	musl	libc-bench b_malloc_tiny2 (0) (seconds)	0.0089221	0.010810043	1.1746471313758882
+libcbench	musl	libc-bench b_malloc_big1 (0) (seconds)	0.1128928	0.118578071	1.0479453827512508
+libcbench	musl	libc-bench b_malloc_big2 (0) (seconds)	0.1119764	0.107088632	1.0
+libcbench	musl	libc-bench b_malloc_thread_stress (0) (seconds)	0.0911196	0.09632549	1.0540447808778342
+libcbench	musl	libc-bench b_malloc_thread_local (0) (seconds)	0.0922488	0.096989785	1.0488812816731163
+libcbench	musl	"libc-bench b_string_strstr (""abcdefghijklmnopqrstuvwxyz"") (seconds)"	0.016553	0.011402239	1.0
+libcbench	musl	"libc-bench b_string_strstr (""azbycxdwevfugthsirjqkplomn"") (seconds)"	0.0216601	0.020868089	1.0
+libcbench	musl	"libc-bench b_string_strstr (""aaaaaaaaaaaaaacccccccccccc"") (seconds)"	0.0158761	0.011944437	1.0
+libcbench	musl	"libc-bench b_string_strstr (""aaaaaaaaaaaaaaaaaaaaaaaaac"") (seconds)"	0.0158454	0.011749838	1.0
+libcbench	musl	"libc-bench b_string_strstr (""aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaac"") (seconds)"	0.0199158	0.013963025	1.0
+libcbench	musl	libc-bench b_string_memset (0) (seconds)	0.0087027	0.025313365	1.6562013782047547
+libcbench	musl	libc-bench b_string_strchr (0) (seconds)	0.0167163	0.012811332	1.0
+libcbench	musl	libc-bench b_string_strlen (0) (seconds)	0.0155595	0.013459429	1.0
+libcbench	musl	libc-bench b_pthread_createjoin_serial1 (0) (seconds)	0.707607	1.284791557	1.449243734406016
+libcbench	musl	libc-bench b_pthread_createjoin_serial2 (0) (seconds)	0.5866783	1.006433722	1.4170720960798648
+libcbench	musl	libc-bench b_pthread_create_serial1 (0) (seconds)	0.8696699	0.892420718	1.0254933772167312
+libcbench	musl	libc-bench b_pthread_uselesslock (0) (seconds)	0.0847227	0.080551368	1.0
+libcbench	musl	libc-bench b_utf8_bigbuf (0) (seconds)	0.04688	0.036977802	1.0
+libcbench	musl	libc-bench b_utf8_onebyone (0) (seconds)	0.1253349	0.109599811	1.0
+libcbench	musl	libc-bench b_stdio_putcgetc (0) (seconds)	0.5753379	0.767822967	1.250689384497143
+libcbench	musl	libc-bench b_stdio_putcgetc_unlocked (0) (seconds)	0.5764587	0.765147171	1.2466041542745245
+libcbench	musl	"libc-bench b_regex_compile (""(a|b|c)*d*b"") (seconds)"	0.0740744	0.088259223	1.1607177416461054
+libcbench	musl	"libc-bench b_regex_search (""(a|b|c)*d*b"") (seconds)"	0.0804363	0.083251251	1.033812717120611
+libcbench	musl	"libc-bench b_regex_search (""a{25}b"") (seconds)"	0.2448602	0.286712251	1.1459723149395524
+libcbench	glibc	libc-bench b_malloc_sparse (0) (seconds)	0.3160518	0.384919462	1.1789144712043687
+libcbench	glibc	libc-bench b_malloc_bubble (0) (seconds)	0.3130736	0.36015349	1.130721737556951
+libcbench	glibc	libc-bench b_malloc_tiny1 (0) (seconds)	0.0073253	0.014186324	1.4836364938514022
+libcbench	glibc	libc-bench b_malloc_tiny2 (0) (seconds)	0.006529	0.010810043	1.3960246041574487
+libcbench	glibc	libc-bench b_malloc_big1 (0) (seconds)	0.0671701	0.118578071	1.433536914257949
+libcbench	glibc	libc-bench b_malloc_big2 (0) (seconds)	0.06451	0.107088632	1.3976017921304664
+libcbench	glibc	libc-bench b_malloc_thread_stress (0) (seconds)	0.0575902	0.09632549	1.4021291768149844
+libcbench	glibc	libc-bench b_malloc_thread_local (0) (seconds)	0.0465034	0.096989785	1.5205330128322276
+libcbench	glibc	"libc-bench b_string_strstr (""abcdefghijklmnopqrstuvwxyz"") (seconds)"	0.0127934	0.011402239	1.0
+libcbench	glibc	"libc-bench b_string_strstr (""azbycxdwevfugthsirjqkplomn"") (seconds)"	0.0117814	0.020868089	1.435434648567964
+libcbench	glibc	"libc-bench b_string_strstr (""aaaaaaaaaaaaaacccccccccccc"") (seconds)"	0.018696	0.011944437	1.0
+libcbench	glibc	"libc-bench b_string_strstr (""aaaaaaaaaaaaaaaaaaaaaaaaac"") (seconds)"	0.012125	0.011749838	1.0
+libcbench	glibc	"libc-bench b_string_strstr (""aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaac"") (seconds)"	0.0134876	0.013963025	1.0340488540269748
+libcbench	glibc	libc-bench b_string_memset (0) (seconds)	0.0068661	0.025313365	1.728755935846538
+libcbench	glibc	libc-bench b_string_strchr (0) (seconds)	0.0126323	0.012811332	1.013974503197638
+libcbench	glibc	libc-bench b_string_strlen (0) (seconds)	0.0107482	0.013459429	1.2014371486338686
+libcbench	glibc	libc-bench b_pthread_createjoin_serial1 (0) (seconds)	0.5154597	1.284791557	1.5987989668895373
+libcbench	glibc	libc-bench b_pthread_createjoin_serial2 (0) (seconds)	0.7657956	1.006433722	1.2390998202264132
+libcbench	glibc	libc-bench b_pthread_create_serial1 (0) (seconds)	0.9657377	0.892420718	1.0
+libcbench	glibc	libc-bench b_pthread_uselesslock (0) (seconds)	0.0708062	0.080551368	1.1209807883088962
+libcbench	glibc	libc-bench b_utf8_bigbuf (0) (seconds)	0.0052061	0.036977802	1.859210128281827
+libcbench	glibc	libc-bench b_utf8_onebyone (0) (seconds)	0.0015849	0.109599811	1.9855392086396937
+libcbench	glibc	libc-bench b_stdio_putcgetc (0) (seconds)	0.3874359	0.767822967	1.4954098579340882
+libcbench	glibc	libc-bench b_stdio_putcgetc_unlocked (0) (seconds)	0.3540506	0.765147171	1.5372777768526835
+libcbench	glibc	"libc-bench b_regex_compile (""(a|b|c)*d*b"") (seconds)"	0.0279808	0.088259223	1.6829702432345228
+libcbench	glibc	"libc-bench b_regex_search (""(a|b|c)*d*b"") (seconds)"	0.0074312	0.083251251	1.9107376776836662
+libcbench	glibc	"libc-bench b_regex_search (""a{25}b"") (seconds)"	0.1151583	0.286712251	1.598348868601363
+lmbench	musl	lmbench Simple syscall:(microseconds)	0.9263	9.25013	1.8998608668202501
+lmbench	musl	lmbench Simple read:(microseconds)	3.1962	16.8192	1.8099671803652968
+lmbench	musl	lmbench Simple write:(microseconds)	2.3507	16.87553	1.8607036341969705
+lmbench	musl	lmbench Simple stat:(microseconds)	154.3768	425.2565	1.6369795640983735
+lmbench	musl	lmbench Simple fstat:(microseconds)	9.1219	29.54674	1.6912722012648433
+lmbench	musl	lmbench Simple open/close:(microseconds)	170.1719	501.2352	1.6604949133660205
+lmbench	musl	lmbench Select on 100 fd's:(microseconds)	34.5594	56.05561	1.3834800834385712
+lmbench	musl	lmbench Signal handler installation:(microseconds)	4.027	18.84948	1.7863601542323715
+lmbench	musl	lmbench Signal handler overhead:(microseconds)	15.0668	25.89064	1.4180599629827613
+lmbench	musl	lmbench Pipe latency:(microseconds)	78.5704	141.9106	1.4463387512983525
+lmbench	musl	lmbench Process fork+exit:(microseconds)	628.5864	4409.188	1.8574371516932369
+lmbench	musl	lmbench Process fork+execve:(microseconds)	776.7536	2004.3333	1.6124628573501223
+lmbench	musl	lmbench Process fork+/bin/sh -c:(microseconds)	9697.0	920010.2	1.989459899466332
+lmbench	musl	lmbench Pagefaults on /var/tmp/XXX:(microseconds)	25.6011	978.2374643	1.9738293605241142
+lmbench	musl	lmbench lat_mmap:(microseconds)	162.0	4109.0	1.9605743489900218
+lmbench	musl	lmbench fs latency 0k create	1016	24573	1.0
+lmbench	musl	lmbench fs latency 0k remove	378	30703	1.0
+lmbench	musl	lmbench fs latency 1k create	955	15130	1.0
+lmbench	musl	lmbench fs latency 1k remove	372	255558	1.0
+lmbench	musl	lmbench fs latency 4k create	979	13265	1.0
+lmbench	musl	lmbench fs latency 4k remove	355	126595	1.0
+lmbench	musl	lmbench fs latency 10k create	935	11723	1.0
+lmbench	musl	lmbench fs latency 10k remove	378	23688	1.0
+lmbench	musl	lmbench Pipe bandwidth:(MB/sec)	152.79	127.244	1.167196806073696
+lmbench	musl	lmbench bw_file_rd io_only	445.46	71703.7	1.0
+lmbench	musl	lmbench bw_file_rd open2close	362.18	2637.494	1.0
+lmbench	musl	lmbench bw_mmap_rd mmap_only	8891.37	1037.403	1.8833247294848825
+lmbench	musl	lmbench bw_mmap_rd open2close	150.06	187.0208	1.0
+lmbench	musl	lmbench context switch 2:(microseconds)	33.49	41.24	1.1879243452958295
+lmbench	musl	lmbench context switch 4:(microseconds)	32.3	41.58071	1.22319748748879
+lmbench	musl	lmbench context switch 8:(microseconds)	31.07	41.04231	1.2429763334471184
+lmbench	musl	lmbench context switch 16:(microseconds)	33.02	40.77077	1.1901060490150173
+lmbench	musl	lmbench context switch 24:(microseconds)	32.59	43.86385	1.2570191627045961
+lmbench	musl	lmbench context switch 32:(microseconds)	30.07	47.74923	1.370251625000026
+lmbench	musl	lmbench context switch 64:(microseconds)	31.81	8703.026	1.996344949446319
+lmbench	musl	lmbench context switch 96:(microseconds)	31.4	2952.14	1.989363648065471
+lmbench	glibc	lmbench Simple syscall:(microseconds)	0.9335	9.25013	1.8990824993810898
+lmbench	glibc	lmbench Simple read:(microseconds)	2.9607	16.8192	1.823969035388128
+lmbench	glibc	lmbench Simple write:(microseconds)	2.1556	16.87553	1.872264752573697
+lmbench	glibc	lmbench Simple stat:(microseconds)	131.1429	425.2565	1.6916145902531765
+lmbench	glibc	lmbench Simple fstat:(microseconds)	9.3793	29.54674	1.6825605802873684
+lmbench	glibc	lmbench Simple open/close:(microseconds)	131.2458	501.2352	1.738155261242626
+lmbench	glibc	lmbench Select on 100 fd's:(microseconds)	33.2532	56.05561	1.4067819438589644
+lmbench	glibc	lmbench Signal handler installation:(microseconds)	3.7023	18.84948	1.8035860936216808
+lmbench	glibc	lmbench Signal handler overhead:(microseconds)	15.0592	25.89064	1.4183535053594658
+lmbench	glibc	lmbench Pipe latency:(microseconds)	78.7366	141.9106	1.4451675914272788
+lmbench	glibc	lmbench Process fork+exit:(microseconds)	753.0811	4409.188	1.8292018621115724
+lmbench	glibc	lmbench Process fork+execve:(microseconds)	901.1912	2004.3333	1.550378572266399
+lmbench	glibc	lmbench Process fork+/bin/sh -c:(microseconds)	13053.6667	920010.2	1.9858113891563376
+lmbench	glibc	lmbench Pagefaults on /var/tmp/XXX:(microseconds)	25.0226	978.2374643	1.974420730228416
+lmbench	glibc	lmbench lat_mmap:(microseconds)	147.0	4109.0	1.9642248722316866
+lmbench	glibc	lmbench fs latency 0k create	1040	24573	1.0
+lmbench	glibc	lmbench fs latency 0k remove	494	30703	1.0
+lmbench	glibc	lmbench fs latency 1k create	964	15130	1.0
+lmbench	glibc	lmbench fs latency 1k remove	406	255558	1.0
+lmbench	glibc	lmbench fs latency 4k create	938	13265	1.0
+lmbench	glibc	lmbench fs latency 4k remove	332	126595	1.0
+lmbench	glibc	lmbench fs latency 10k create	951	11723	1.0
+lmbench	glibc	lmbench fs latency 10k remove	358	23688	1.0
+lmbench	glibc	lmbench Pipe bandwidth:(MB/sec)	208.59	127.244	1.389980344215926
+lmbench	glibc	lmbench bw_file_rd io_only	444.8	71703.7	1.0
+lmbench	glibc	lmbench bw_file_rd open2close	395.84	2637.494	1.0
+lmbench	glibc	lmbench bw_mmap_rd mmap_only	11330.56	1037.403	1.9084420364042025
+lmbench	glibc	lmbench bw_mmap_rd open2close	150.81	187.0208	1.0
+lmbench	glibc	lmbench context switch 2:(microseconds)	34.07	41.24	1.1738603297769157
+lmbench	glibc	lmbench context switch 4:(microseconds)	34.37	41.58071	1.1734147877705792
+lmbench	glibc	lmbench context switch 8:(microseconds)	33.77	41.04231	1.1771905626169676
+lmbench	glibc	lmbench context switch 16:(microseconds)	34.92	40.77077	1.1435040348759662
+lmbench	glibc	lmbench context switch 24:(microseconds)	33.01	43.86385	1.2474440798060362
+lmbench	glibc	lmbench context switch 32:(microseconds)	33.06	47.74923	1.3076328141836004
+lmbench	glibc	lmbench context switch 64:(microseconds)	31.16	8703.026	1.9964196361127726
+lmbench	glibc	lmbench context switch 96:(microseconds)	31.73	2952.14	1.9892518647489619
