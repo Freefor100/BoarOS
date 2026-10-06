@@ -261,4 +261,8 @@ TCP 的 27 组窗口/池/堆候选由 `BOAROS_LWIP_WINDOW_MSS`、`BOAROS_LWIP_PO
 控制流 tail 与固定输入约束见[预算实验](../learning/data-path-budget-experiments.md)，
 可运行候选不等于吞吐已经验收，默认值须依据匹配结果由人选择。
 
+`python3 -B tests/network-budget-config.py` 独立验证无覆盖宏的生产默认 8/4/2，
+并显式覆盖全部 27 个候选，保留非法配置与统计计数宽度检查。
+`tests/network-budget-selftest.py` 用临时头文件默认值漂移验证门禁会失败。
+
 阶段七已完成 TCP 27 组预算的发布筛选、30 项组合扩展与独立 COST 诊断；当时默认为 8/1/1。用户依据近池与 1/10 ms 结果批准改为 8/4/2，保留 8 MSS 和 32 PCB。历史默认的吞吐回退、全局池/堆饱和和 8/4/2 的有限负载收益保留在[实验报告](../learning/data-path-budget-experiments.md#正式匹配结果2026-10-06)，不重跑完整矩阵，也不将预算调整宣称为单连接吞吐保证。
