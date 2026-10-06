@@ -158,6 +158,7 @@ C_SOURCES := \
 	arch/riscv/virt_uart.c \
 	arch/riscv/uart_tty.c \
 	arch/riscv/virtio_mmio_block.c \
+	drivers/virtio/block.c \
 	arch/riscv/virtio_mmio_rng.c \
 	arch/riscv/virtio_mmio_net.c \
 	arch/riscv/plic.c \
@@ -271,6 +272,7 @@ TEST_RUNTIME_C_SOURCES := \
 	arch/riscv/virt_uart.c \
 	arch/riscv/uart_tty.c \
 	arch/riscv/virtio_mmio_block.c \
+	drivers/virtio/block.c \
 	arch/riscv/virtio_mmio_rng.c \
 	arch/riscv/virtio_mmio_net.c \
 	arch/riscv/plic.c \
@@ -1812,3 +1814,8 @@ test-readahead-riscv:
 	python3 -B tests/readahead-riscv.py
 
 include arch/loongarch/build.mk
+
+.PHONY: test-virtio-block-host
+test-virtio-block-host:
+	python3 -B tests/host/virtio_block_diagnostics.py
+	HOST_ALTERNATE_TRANSPORT=1 python3 -B tests/host/virtio_block_diagnostics.py

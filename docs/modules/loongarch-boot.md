@@ -58,7 +58,8 @@ rt_sigaction/rt_sigreturn 尚无 LA handler frame，明确返回 ENOSYS。
 本轮 RV allocator、MM/VMA、uaccess、context、scheduler、exec 及 `test-riscv`、
 真实静态/动态用户程序、五种固定 glibc 形态、1,344 条 ABI 差分、栈检查与 SQLite
 DELETE/WAL 恢复回归通过。上述结果不代表 LA 完整线程、信号、libc 或比赛 Harness。
-下一阶段 PCI→VirtIO 块→ext4→静态 musl 仍待人决定，SMP、实板与动态加载不在本阶段。
+下一阶段 PCI→VirtIO 块→ext4→静态 musl 已由人批准，采用共用块核心与独立 MMIO/PCI transport；
+该阶段正在开发，以下已通过结果仍只覆盖首阶段。SMP、实板与动态加载另行验收。
 
 固定依据为`references/qemu` v11.1.0，commit
 `84f07211cc5b4fc6a371559bf8a5de4fb068e648`的`hw/loongarch/boot.c`、

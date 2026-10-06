@@ -153,14 +153,14 @@ void kernel_main(unsigned long hart,const void *dtb)
     check(kernel_scheduler_init(&allocator,(uintptr_t)__boot_stack_bottom,(uintptr_t)__boot_stack_top)==KERNEL_SCHEDULER_STATUS_OK,4);
     check(riscv_plic_init((void*)(uintptr_t)routing.plic.base,routing.plic.size,routing.context,routing.source_count),5);
     uint32_t source=0;
-    for(unsigned i=0;i<routing.route_count;i++) if(routing.routes[i].base==(uintptr_t)device.mmio)source=routing.routes[i].source;
+    for(unsigned i=0;i<routing.route_count;i++) if(routing.routes[i].base==(uintptr_t)riscv_virtio_mmio_block_base(&device))source=routing.routes[i].source;
     check(riscv_virtio_mmio_block_enable_irq(&device,source),6);
     /* Timer is not started. Hold SIE clear until the device IRQ is pending,
      * then expose precisely the enable-to-wfi interval in the idle caller. */
     check(kernel_thread_create(irq_only_reader,NULL)==KERNEL_SCHEDULER_STATUS_OK &&
         kernel_scheduler_yield_current()==KERNEL_SCHEDULER_STATUS_OK,11);
     uint64_t irq_limit=riscv_time_read()+2*info.timebase_frequency;
-    volatile uint32_t *interrupt_status=(void*)((uintptr_t)device.mmio+0x60);
+    volatile uint32_t *interrupt_status=(void*)((uintptr_t)riscv_virtio_mmio_block_base(&device)+0x60);
     while(!(*interrupt_status&1) && riscv_time_read()<irq_limit) { }
     check((*interrupt_status&1)!=0,12);
     riscv_interrupt_restore(RISCV_SSTATUS_SIE);

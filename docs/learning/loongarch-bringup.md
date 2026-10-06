@@ -83,3 +83,14 @@ canary/高水位和编译器单帧门禁互补，但 LA 尚无虚拟 guard page�
 本轮 RV 完整架构测试、真实 musl、固定 glibc 五种形态、1,344 条 ABI 差分及
 SQLite DELETE/WAL/重启恢复回归通过。它们保护共用层的既有行为，不构成 LA
 根盘/libc 的验收。LA 用户 handler、FP/SIMD、实板、SMP 和完整比赛仍待后续证据。
+
+## 第二阶段的 VirtIO 边界
+
+远程网络预算修复 ae2a525 已合入本地主线，当前无覆盖宏的8/4/2及27候选门禁
+分别验证；12个selftest在本机原环境通过。本阶段沿已选路线提取共用VirtIO块
+核心，保留RV transport与旧入口，PCI布局和IRQ事实单独实现。
+
+真实RV块fixture复现了新的回调表陷阱：静态const表保存链接高VA，在尚无高地址
+映射的物理入口调用会产生instruction-access fault。改为从当前PC初始化MMIO
+回调，再在合法映射阶段发布设备；同一真实fixture恢复，生产根与四组合睡眠I/O
+均通过。宿主wire模型无法检出物理别名与链接VA的区别，必须保留QEMU启动证据。

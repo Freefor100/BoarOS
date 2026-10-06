@@ -1377,7 +1377,7 @@ void kernel_main(unsigned long hart, const void *dtb)
                           irq_info.context, irq_info.source_count), 40);
     uint32_t source = 0;
     for (unsigned i = 0; i < irq_info.route_count; i++)
-        if (irq_info.routes[i].base == (uintptr_t)device.mmio) source = irq_info.routes[i].source;
+        if (irq_info.routes[i].base == (uintptr_t)riscv_virtio_mmio_block_base(&device)) source = irq_info.routes[i].source;
     check(riscv_virtio_mmio_block_enable_irq(&device, source), 41);
     virt_uart_puts("I/O handshake: ready\n");
     while (!virt_uart_rx_ready()) { }
@@ -1468,8 +1468,11 @@ void kernel_main(unsigned long hart, const void *dtb)
 #if BOAROS_COST_DIAGNOSTICS
     cost_finish("pressure-io", 1);
 #endif
-    volatile void *mmio = device.mmio;
-    uint64_t mmio_size = device.mmio_size;
+    volatile void *mmio = riscv_virtio_mmio_block_base(&device);
+    uint64_t mmio_size=0;
+    for (uint32_t i=0;i<info.virtio_mmio_count;i++)
+        if (info.virtio_mmio[i].base==(uintptr_t)mmio) mmio_size=info.virtio_mmio[i].size;
+    check(mmio_size!=0,62);
     device = (struct riscv_virtio_mmio_block){0};
     check(riscv_virtio_mmio_block_init(&device, mmio, mmio_size, &allocator, dma,
                                       info.timebase_frequency) == RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK &&

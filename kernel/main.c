@@ -866,7 +866,7 @@ static void kernel_main_high(void)
             struct riscv_virtio_mmio_block *device =
                 riscv_root_boot_device(&root_boot, disk);
             uint32_t source = 0;
-            uint64_t base = (uintptr_t)device->mmio - RISCV_KERNEL_MMIO_BASE;
+            uint64_t base = (uintptr_t)riscv_virtio_mmio_block_base(device) - RISCV_KERNEL_MMIO_BASE;
             for (uint32_t i = 0; i < boot_irq.route_count; i++)
                 if (boot_irq.routes[i].base == base) source = boot_irq.routes[i].source;
             if (!riscv_virtio_mmio_block_enable_irq(device, source)) __builtin_trap();
