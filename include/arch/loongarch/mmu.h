@@ -174,4 +174,5 @@ int arch_mmu_kernel_window_active(void);
 enum arch_mmu_status arch_mmu_kernel_window_map(struct physical_page_allocator *, uint64_t, uint64_t);
 enum arch_mmu_status arch_mmu_kernel_window_unmap(struct physical_page_allocator *, uint64_t);
 void la_mmu_initialize(void);
+enum arch_mmu_status la_mmu_kernel_window_initialize(struct physical_page_allocator *);
 #endif

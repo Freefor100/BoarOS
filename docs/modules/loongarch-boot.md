@@ -42,7 +42,12 @@ refill 写入无效 paired entry，交由普通用户缺页路径处理，不能
 所以冷 EXEC 页的数据读取与合法取指后的驻留页行为分别验证。
 撤映射先失效转换再归还页；地址空间切换使用 PGDL、ASID0 和全量失效。
 用户页、目录页及 COW 引用均按通用 MM owner 协议转移或回滚，所有权损坏 fatal。
-内核当前使用 PLV0 DMW，LA 任务栈有 canary 和回收高水位统计，尚无虚拟 guard page。
+内核代码/数据继续使用PLV0 DMW；任务栈使用独立PGDH窗口，RW/NX叶仅允许PLV0，
+每槽下方留一个16KiB未映射guard页。窗口骨架属于永久boot owner，任务栈页仍由
+调度器持有；撤叶先刷新TLB，切回可信栈后再释放物理页。SP恰好为栈上界时以
+其下方字节决定槽位；不能容纳304字节trap frame时改用永久16KiB emergency栈。
+`make test-stack-guard-loongarch`验证实际guard/SP越界/NX/旧翻译故障、用户访问
+拒绝、slot改映射复用及全部骨架分配OOM回滚，均覆盖512MiB/1GiB。
 
 调度器通过 `arch/task.h`、`context.h`、`timer.h` 和 `mmu.h` 构建期选择实现。
 LA 保存完整整数 trap frame（304 字节）、内核 ABI context、用户 SP/TP/ERA/PRMD；

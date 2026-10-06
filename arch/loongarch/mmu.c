@@ -1,5 +1,6 @@
 #include <arch/mmu.h>
 #include <arch/context.h>
+#include <arch/task.h>
 #include <platform/loongarch_virt.h>
 #include <string.h>
 #define ENTRIES (BOAROS_PAGE_SIZE/8)
@@ -35,11 +36,8 @@ void la_mmu_initialize(void)
         : "+r"(low), "+r"(high), "+r"(entry), "+r"(page) :: "memory");
     arch_mmu_switch_context(0);
 }
-int arch_mmu_kernel_window_active(void) { return 0; }
-enum arch_mmu_status arch_mmu_kernel_window_map(struct physical_page_allocator *a, uint64_t v, uint64_t p)
-{ (void)a; (void)v; (void)p; return ARCH_MMU_STATUS_STATE; }
-enum arch_mmu_status arch_mmu_kernel_window_unmap(struct physical_page_allocator *a, uint64_t v)
-{ (void)a; (void)v; return ARCH_MMU_STATUS_STATE; }
+static struct arch_mmu_user_space kernel_window;
+int arch_mmu_kernel_window_active(void) { return kernel_window.root_address!=0; }
 static uint64_t *table(struct arch_mmu_user_space *s, uint64_t address)
 {
     void *p;
@@ -53,6 +51,67 @@ static enum arch_mmu_status allocate_table(struct arch_mmu_user_space *s, uint64
 {
     if (physical_page_allocate(s->allocator,address)!=PHYSICAL_PAGE_STATUS_OK) return ARCH_MMU_STATUS_NO_MEMORY;
     memset(table(s,*address),0,BOAROS_PAGE_SIZE); s->table_pages++; return ARCH_MMU_STATUS_OK;
+}
+enum arch_mmu_status la_mmu_kernel_window_initialize(struct physical_page_allocator *a)
+{
+    if(!a)return ARCH_MMU_STATUS_INVALID;
+    if(kernel_window.root_address)return ARCH_MMU_STATUS_STATE;
+    struct arch_mmu_user_space candidate={.allocator=a,.state=ARCH_MMU_USER_SPACE_LIVE};
+    enum arch_mmu_status status=allocate_table(&candidate,&candidate.root_address);
+    uint64_t middle=0;
+    if(status==ARCH_MMU_STATUS_OK)status=allocate_table(&candidate,&middle);
+    if(status==ARCH_MMU_STATUS_OK) {
+        table(&candidate,candidate.root_address)[(ARCH_KERNEL_STACK_WINDOW_BASE>>36)&(ENTRIES-1)]=middle;
+        for(uint64_t offset=0;offset<ARCH_KERNEL_STACK_WINDOW_SIZE;offset+=UINT64_C(1)<<25) {
+            uint64_t child;
+            status=allocate_table(&candidate,&child);
+            if(status!=ARCH_MMU_STATUS_OK)break;
+            table(&candidate,middle)[((ARCH_KERNEL_STACK_WINDOW_BASE+offset)>>25)&(ENTRIES-1)]=child;
+        }
+    }
+    if(status!=ARCH_MMU_STATUS_OK) {
+        if(middle) {
+            uint64_t *entries=table(&candidate,middle);
+            for(unsigned i=0;i<ENTRIES;i++)if(entries[i])
+                (void)physical_page_release(a,entries[i]);
+            (void)physical_page_release(a,middle);
+        }
+        if(candidate.root_address)(void)physical_page_release(a,candidate.root_address);
+        return status;
+    }
+    /* 骨架属于永久 boot owner；叶只借用任务栈页，不转移物理页引用。 */
+    kernel_window=candidate;
+    uint64_t root=candidate.root_address;
+    __asm__ volatile("dbar 0;csrwr %0,0x1a":"+r"(root)::"memory");
+    flush_all();return ARCH_MMU_STATUS_OK;
+}
+static enum arch_mmu_status kernel_slot(struct physical_page_allocator *a,uint64_t v,uint64_t **slot)
+{
+    if(!kernel_window.root_address || a!=kernel_window.allocator)return ARCH_MMU_STATUS_STATE;
+    if(v<ARCH_KERNEL_STACK_WINDOW_BASE || v-ARCH_KERNEL_STACK_WINDOW_BASE>=ARCH_KERNEL_STACK_WINDOW_SIZE ||
+       (v&BOAROS_PAGE_MASK) || (v-ARCH_KERNEL_STACK_WINDOW_BASE)%ARCH_KERNEL_STACK_SLOT_SIZE<BOAROS_PAGE_SIZE)
+        return ARCH_MMU_STATUS_INVALID;
+    uint64_t root=table(&kernel_window,kernel_window.root_address)[(v>>36)&(ENTRIES-1)];
+    uint64_t leaf=table(&kernel_window,root)[(v>>25)&(ENTRIES-1)];
+    *slot=&table(&kernel_window,leaf)[(v>>14)&(ENTRIES-1)];return ARCH_MMU_STATUS_OK;
+}
+enum arch_mmu_status arch_mmu_kernel_window_map(struct physical_page_allocator *a,uint64_t v,uint64_t p)
+{
+    uint64_t *slot;void *bytes;
+    enum arch_mmu_status status=kernel_slot(a,v,&slot);
+    if(status!=ARCH_MMU_STATUS_OK)return status;
+    if((p&BOAROS_PAGE_MASK) || p>PTE_ADDRESS || physical_page_resolve(a,p,&bytes)!=PHYSICAL_PAGE_STATUS_OK)return ARCH_MMU_STATUS_INVALID;
+    if(*slot)return ARCH_MMU_STATUS_CONFLICT;
+    *slot=p|PTE_PRESENT|PTE_VALID|PTE_DIRTY|PTE_WRITE|PTE_NX|0x10;
+    __asm__ volatile("dbar 0":::"memory");arch_mmu_flush_address(v);return ARCH_MMU_STATUS_OK;
+}
+enum arch_mmu_status arch_mmu_kernel_window_unmap(struct physical_page_allocator *a,uint64_t v)
+{
+    uint64_t *slot;
+    enum arch_mmu_status status=kernel_slot(a,v,&slot);
+    if(status!=ARCH_MMU_STATUS_OK)return status;
+    *slot=0;
+    __asm__ volatile("dbar 0":::"memory");arch_mmu_flush_address(v);return ARCH_MMU_STATUS_OK;
 }
 static uint64_t encode(uint64_t physical, uint32_t permissions, int cow)
 {

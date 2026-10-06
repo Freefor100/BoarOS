@@ -14,6 +14,11 @@
 #include <platform/loongarch_pci.h>
 #include <string.h>
 void la_trap_entry(void);
+void la_kernel_stack_overflow(uint64_t sp)
+{
+    la_virt_puts("LA exhausted kernel SP=");la_virt_hex(sp);la_virt_puts("\n");
+    la_virt_fatal("kernel stack guard");
+}
 void la_trap_initialize(void)
 {
     uint64_t entry=(uintptr_t)la_trap_entry;
@@ -39,6 +44,10 @@ void la_trap_dispatch(struct arch_trap_frame *frame)
 {
     uint64_t code=(frame->estat>>16)&63;
     int user=(frame->prmd&3)==3;
+    if(!user && code>=1 && code<=7 && frame->badv>=ARCH_KERNEL_STACK_WINDOW_BASE &&
+       frame->badv-ARCH_KERNEL_STACK_WINDOW_BASE<ARCH_KERNEL_STACK_WINDOW_SIZE &&
+       (frame->badv-ARCH_KERNEL_STACK_WINDOW_BASE)%ARCH_KERNEL_STACK_SLOT_SIZE<BOAROS_PAGE_SIZE)
+        la_virt_fatal("kernel stack guard");
     uint64_t pending=0;
     if(!code) {
         uint64_t enabled;__asm__ volatile("csrrd %0, 4":"=r"(enabled));

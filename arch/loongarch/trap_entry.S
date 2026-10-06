@@ -7,6 +7,24 @@ la_trap_entry:
     csrwr $tp, 0x30
     bnez $tp, .Luser
     csrwr $tp, 0x30
+    /* 不向已经越界的 SP 写 trap frame；scratch CSR 保持正常路径寄存器。 */
+    csrwr $t0, 0x31
+    csrwr $t1, 0x32
+    li.d $t0, ARCH_KERNEL_STACK_WINDOW_BASE
+    bltu $sp, $t0, .Lkernel_stack_ok
+    beq $sp, $t0, .Lguard_overflow
+    sub.d $t1, $sp, $t0
+    /* SP 可以恰好等于当前栈上界；其下方的字节决定所属槽位。 */
+    addi.d $t1, $t1, -1
+    li.w $t0, ARCH_KERNEL_STACK_WINDOW_SIZE
+    bgeu $t1, $t0, .Lkernel_stack_ok
+    li.w $t0, ARCH_KERNEL_STACK_SLOT_SIZE
+    mod.du $t1, $t1, $t0
+    li.w $t0, 16384+ARCH_TRAP_FRAME_SIZE-1
+    bltu $t1, $t0, .Lguard_overflow
+.Lkernel_stack_ok:
+    csrrd $t0, 0x31
+    csrrd $t1, 0x32
     addi.d $sp, $sp, -ARCH_TRAP_FRAME_SIZE
     st.d $t0, $sp, 96
     st.d $tp, $sp, 16
@@ -107,3 +125,13 @@ la_trap_return:
     ld.d $r31, $sp, 248
     ld.d $sp, $sp, 24
     ertn
+.Lguard_overflow:
+    move $a0, $sp
+    la.abs $sp, la_guard_stack_end
+    bl la_kernel_stack_overflow
+    break 0
+    .bss
+    .balign 16384
+la_guard_stack:
+    .space 16384
+la_guard_stack_end:

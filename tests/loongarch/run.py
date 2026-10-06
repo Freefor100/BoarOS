@@ -16,6 +16,7 @@ def main():
     parser.add_argument('--stage', choices=('boot', 'mmu', 'user'), default='user')
     parser.add_argument('--timeout', type=float, default=90)
     parser.add_argument('--log')
+    parser.add_argument('--marker',action='append',default=[])
     args = parser.parse_args()
     kernel = Path(args.kernel)
     if not kernel.is_file():
@@ -33,7 +34,7 @@ def main():
         logs.append(output)
         sys.stdout.write(output)
         expected = f'LA {args.stage} contracts passed'
-        if code or expected not in output or 'fatal' in output:
+        if code or expected not in output or 'fatal' in output or any(marker not in output for marker in args.marker):
             raise SystemExit(f'LA contract failed ({memory}, exit '
                              f'{code})')
     if args.log:

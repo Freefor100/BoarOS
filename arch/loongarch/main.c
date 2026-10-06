@@ -10,6 +10,7 @@ void la_boot_tasks(struct physical_page_allocator *);
 extern unsigned char __boot_stack_bottom[], __boot_stack_top[];
 void la_heap_contract(struct physical_page_allocator *);
 void la_mmu_contract(struct physical_page_allocator *);
+void la_stack_window_contract(struct physical_page_allocator *);
 static struct physical_page_allocator allocator;
 extern unsigned char __kernel_start[], __kernel_end[];
 void la_kernel_main(uint64_t systab)
@@ -38,6 +39,8 @@ void la_kernel_main(uint64_t systab)
     la_heap_contract(&allocator);
     la_mmu_initialize();
     la_mmu_contract(&allocator);
+    if(la_mmu_kernel_window_initialize(&allocator)!=ARCH_MMU_STATUS_OK)la_virt_fatal("kernel stack page tables");
+    la_stack_window_contract(&allocator);
     if (kernel_time_init(la_timer_frequency(),0)!=KERNEL_TIME_STATUS_OK ||
         kernel_scheduler_init(&allocator,(uintptr_t)__boot_stack_bottom,(uintptr_t)__boot_stack_top)!=KERNEL_SCHEDULER_STATUS_OK) la_virt_fatal("scheduler init");
     la_boot_tasks(&allocator);
