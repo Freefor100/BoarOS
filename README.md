@@ -64,7 +64,8 @@ VirtIO 块核心→ext4 根盘→LP64S 静态 musl 已通过两种 RAM 的新验
 未修改的完整 BusyBox 中 cp/cmp/grep/cat/echo/uname/dd 七个 applet、真实文件映射、
 fork/exec/wait、错误/创建 OOM 与资源基线；真实 PCI 写故障保留失败 I/O owner 并明确停止。
 `kernel-la` 有盘时启动可配置 PID 1，无盘时运行首阶段内存 ELF 契约，见
-[LA 模块](docs/modules/loongarch-boot.md)。动态加载、完整 TLS/线程和信号 handler、
+[LA 模块](docs/modules/loongarch-boot.md)。整数信号 handler/sigreturn、同步故障恢复、
+mask/嵌套和等待重启已通过同 ELF 的双侧两种 RAM 验证。动态加载、完整 TLS/线程、
 FP/SIMD、实板和 SMP 仍须另行验收。
 
 ## 构建与验证

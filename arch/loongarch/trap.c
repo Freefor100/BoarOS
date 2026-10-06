@@ -1,5 +1,6 @@
 #include <arch/task.h>
 #include <arch/timer.h>
+#include <arch/loongarch/signal.h>
 #include <platform/loongarch_virt.h>
 #include <kernel/task.h>
 #include <kernel/tick.h>
@@ -15,8 +16,8 @@ void la_trap_initialize(void)
     uint64_t entry=(uintptr_t)la_trap_entry;
     __asm__ volatile("csrwr %0, 0xc\ncsrwr $zero, 0x30" : "+r"(entry) :: "memory");
 }
-static void fault(struct arch_trap_frame *frame, uint32_t signal)
-{ kernel_user_thread_exit(KERNEL_THREAD_EXIT_SIGNAL,signal,frame->badv); }
+static void fault(uint32_t signal, int32_t code, uint64_t address)
+{ kernel_signal_force_fault(kernel_task_current(),signal,code,address); }
 void la_trap_dispatch(struct arch_trap_frame *frame)
 {
     uint64_t code=(frame->estat>>16)&63;
@@ -49,9 +50,11 @@ void la_trap_dispatch(struct arch_trap_frame *frame)
         if (status==KERNEL_MM_STATUS_NO_MEMORY)
             kernel_user_thread_exit(KERNEL_THREAD_EXIT_RESOURCE,
                                     KERNEL_THREAD_RESOURCE_NO_MEMORY,frame->badv);
-        if (status==KERNEL_MM_STATUS_NOT_MAPPED || status==KERNEL_MM_STATUS_ACCESS)
-            fault(frame,11);
-        if (status==KERNEL_MM_STATUS_BUS_FAULT) fault(frame,7);
+        if (status==KERNEL_MM_STATUS_NOT_MAPPED || status==KERNEL_MM_STATUS_ACCESS) {
+            la_signal_note_address_error(access);
+            fault(11,status==KERNEL_MM_STATUS_NOT_MAPPED ? 1 : 2,frame->badv);return;
+        }
+        if (status==KERNEL_MM_STATUS_BUS_FAULT) { fault(7,2,frame->badv);return; }
         la_virt_fatal("fault owner");
     }
     if (user && code==11) {
@@ -79,6 +82,8 @@ void la_trap_dispatch(struct arch_trap_frame *frame)
         case KERNEL_SYSCALL_ACTION_EXEC:
             if (kernel_scheduler_exec_commit()!=KERNEL_SCHEDULER_STATUS_OK) la_virt_fatal("exec commit");
             return;
+        case KERNEL_SYSCALL_ACTION_SIGNAL_RETURN:
+            la_signal_restore_current(frame);return;
         case KERNEL_SYSCALL_ACTION_RETURN: break;
         default: la_virt_fatal("unsupported internal syscall action");
         }
@@ -87,7 +92,12 @@ void la_trap_dispatch(struct arch_trap_frame *frame)
         }
         frame->regs[4]=(uint64_t)result.value; frame->era+=4; return;
     }
-    if (user) fault(frame,code==12 ? 5 : ((code==8 || code==9) ? 7 : 4));
+    if (user) {
+        if(code==12) fault(5,1,frame->era);
+        else if(code==8 || code==9) fault(7,code==8 ? 2 : 1,frame->badv);
+        else fault(4,128,0); /* Linux LA do_ri/disabled ISA 的 SI_KERNEL 来源。 */
+        return;
+    }
     la_virt_puts("trap code=");la_virt_hex(code);la_virt_puts(" pc=");la_virt_hex(frame->era);la_virt_puts(" badv=");la_virt_hex(frame->badv);la_virt_puts("\n");
     la_virt_fatal("kernel trap");
 }
@@ -95,15 +105,7 @@ void la_trap_return_prepare(struct arch_trap_frame *frame)
 {
     if ((frame->prmd&3)==3) {
         kernel_task_prepare_user_return();
-        struct kernel_signal_delivery delivery;
-        struct kernel_task *task=kernel_task_current();
-        enum kernel_signal_select_result selected=kernel_signal_select(task,&delivery);
-        if (selected==KERNEL_SIGNAL_SELECT_EXIT)
-            kernel_user_thread_exit(delivery.exit_reason,delivery.exit_status,delivery.exit_detail);
-        if (selected==KERNEL_SIGNAL_SELECT_HANDLER) la_virt_fatal("unregistered handler ABI");
-        enum kernel_signal_restart restart=kernel_signal_restart_decide(task,0,0);
-        if (restart==KERNEL_SIGNAL_RESTART_BLOCK) frame->regs[11]=128;
-        else if (restart==KERNEL_SIGNAL_RESTART_INTERRUPTED) { frame->regs[4]=(uint64_t)(int64_t)-KERNEL_EINTR;frame->era+=4; }
+        la_signal_prepare_user_return(frame);
     }
     else kernel_scheduler_prepare_idle_return();
 }

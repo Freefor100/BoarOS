@@ -38,7 +38,7 @@ struct kernel_signal_wait_info {
 #define LINUX_SA_NODEFER UINT64_C(0x40000000)
 #define LINUX_SA_RESETHAND UINT64_C(0x80000000)
 
-/* Linux riscv64 rt_sigaction layout. The syscall consumes one 64-bit mask,
+/* Linux RV64/LA64 rt_sigaction layout. The syscall consumes one 64-bit mask,
  * not libc's larger sigset_t or its userspace struct sigaction layout. */
 struct kernel_linux_sigaction {
     uint64_t handler;
