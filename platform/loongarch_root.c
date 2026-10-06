@@ -174,7 +174,12 @@ static int start_root(void)
         if(id!=0x10421af4) {error=-KERNEL_ENOTSUP;break;}
         struct virtio_pci_block *device=&root.devices[root.count];
         enum virtio_block_status status=virtio_pci_block_init(device,host,bdf,allocator,dma,la_timer_frequency());
-        if(status!=VIRTIO_BLOCK_DRIVER_STATUS_OK) { error=status==VIRTIO_BLOCK_DRIVER_STATUS_NO_MEMORY ? -KERNEL_ENOMEM : -KERNEL_EIO; break; }
+        if(status!=VIRTIO_BLOCK_DRIVER_STATUS_OK) {
+            /* 半成品也可能持有真实BAR；清理不能只遍历成功发布的块核心。 */
+            if(device->pci.function.host)root.count++;
+            error=status==VIRTIO_BLOCK_DRIVER_STATUS_NO_MEMORY ? -KERNEL_ENOMEM : -KERNEL_EIO;
+            break;
+        }
         unsigned number=root.count++;
         if(kernel_block_register(&device->device.block,KERNEL_BLOCK_DEVICE_NUMBER(number))) error=-KERNEL_EBUSY;
     }
@@ -185,7 +190,7 @@ static int start_root(void)
     if(!error) error=kernel_vfs_start_journal_worker(&root.mount);
     if(error) return error;
     for(unsigned i=0;i<root.count;i++)
-        if(!virtio_block_enable_irq(&root.devices[i].device,root.devices[i].irq)) return -KERNEL_EIO;
+        if(!virtio_block_enable_irq(&root.devices[i].device,root.devices[i].pci.irq)) return -KERNEL_EIO;
     /* 后台 I/O owner 就绪后才原子发布 PID 1，启动 OOM 从未留下半成品用户任务。 */
     enum kernel_scheduler_status created=kernel_user_thread_create(&root.image.mm,&root.files,&root.fs,
         root.image.entry,root.image.stack_pointer,root.image.thread_pointer);

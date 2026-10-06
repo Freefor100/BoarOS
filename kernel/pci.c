@@ -35,7 +35,7 @@ enum pci_status pci_virtio_capabilities(const struct pci_function *f,struct pci_
             if (type>=1 && type<=4) {
                 if (length<16 || (type==2 && length<20)) return PCI_MALFORMED;
                 struct pci_cap_region region={.bar=read(f,pos+4,1),.offset=read(f,pos+8,4),.length=read(f,pos+12,4)};
-                unsigned minimum=type==1 ? 56 : type==2 ? 2 : type==3 ? 1 : 8;
+                unsigned minimum=type==1 ? 56 : type==2 ? 2 : 1;
                 if (region.bar>=6 || region.length<minimum || region.offset>UINT32_MAX-region.length)
                     return PCI_MALFORMED;
                 /* 同类 capability 可有不同 id；选第一个完整、可用的标准区域。 */
@@ -50,7 +50,8 @@ enum pci_status pci_virtio_capabilities(const struct pci_function *f,struct pci_
         }
         pos=next;
     }
-    if (present!=0x1e) return PCI_UNSUPPORTED;
+    /* Device configuration is optional (RNG); its consumer validates required bytes. */
+    if ((present&0xe)!=0xe) return PCI_UNSUPPORTED;
     *out=caps;return PCI_OK;
 }
 unsigned pci_host_claimed(const struct pci_host *host)

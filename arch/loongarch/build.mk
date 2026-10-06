@@ -4,21 +4,21 @@ LA_BUILD := build/loongarch
 LA_CC := $(LA_CROSS_COMPILE)gcc
 LA_FLAGS := -march=loongarch64 -mabi=lp64s -msoft-float -mno-lsx -mno-lasx -mcmodel=normal
 LA_CPPFLAGS := -Iinclude -DBOAROS_ARCH_LOONGARCH=1 -DBOAROS_PAGE_SHIFT=14 -DBOAROS_COST_DIAGNOSTICS=0 -DBOAROS_UTS_MACHINE=\"loongarch64\"
-LA_CFLAGS := $(LA_FLAGS) -std=gnu11 -O2 -g3 -ffreestanding -fno-builtin -fno-stack-protector -fno-pic -fno-pie -ffunction-sections -fdata-sections -Wall -Wextra -Werror -fstack-usage
+LA_CFLAGS := $(LA_FLAGS) -std=gnu11 -O2 -g3 -ffreestanding -fno-builtin -fno-stack-protector -fno-pic -fno-pie -ffunction-sections -fdata-sections -Wall -Wextra -Werror -fstack-usage -MMD -MP
 LA_C_SOURCES := $(filter-out arch/% kernel/main.c net/ethernet.c,$(C_SOURCES)) \
     arch/loongarch/main.c arch/loongarch/mmu.c arch/loongarch/context.c \
     arch/loongarch/timer.c arch/loongarch/trap.c arch/loongarch/signal.c arch/loongarch/fpu.c platform/loongarch_virt.c \
-    platform/loongarch_pci.c platform/loongarch_root.c drivers/virtio/pci_block.c kernel/pci.c \
+    platform/loongarch_pci.c platform/loongarch_root.c drivers/virtio/pci_block.c drivers/virtio/pci.c kernel/pci.c \
     tests/loongarch/mmu.c tests/loongarch/heap.c tests/loongarch/user_boot.c tests/loongarch/elf_failures.c
 LA_ASM_SOURCES := arch/loongarch/boot.S arch/loongarch/context_switch.S \
     arch/loongarch/tlb_refill.S arch/loongarch/trap_entry.S arch/loongarch/signal_trampoline.S arch/loongarch/fpu_state.S tests/loongarch/user_blob.S
 LA_OBJECTS = $(patsubst %.c,$(LA_BUILD)/%.o,$(LA_C_SOURCES)) $(patsubst %.S,$(LA_BUILD)/%.o,$(LA_ASM_SOURCES))
-$(LA_BUILD)/%.o: %.c
+$(LA_BUILD)/%.o: %.c arch/loongarch/build.mk
 	@mkdir -p $(dir $@)
-	$(LA_CC) $(LA_CPPFLAGS) $(LWEXT4_CPPFLAGS) $(LWIP_CPPFLAGS) $(LA_CFLAGS) -MMD -MP -c $< -o $@
-$(LA_BUILD)/%.o: %.S
+	$(LA_CC) $(LA_CPPFLAGS) $(LWEXT4_CPPFLAGS) $(LWIP_CPPFLAGS) $(LA_CFLAGS) -c $< -o $@
+$(LA_BUILD)/%.o: %.S arch/loongarch/build.mk
 	@mkdir -p $(dir $@)
-	$(LA_CC) $(LA_CPPFLAGS) $(LA_FLAGS) -g3 -c $< -o $@
+	$(LA_CC) $(LA_CPPFLAGS) $(LA_FLAGS) -g3 -MMD -MP -c $< -o $@
 kernel-la: $(LA_OBJECTS) arch/loongarch/linker.ld
 	$(LA_CC) $(LA_FLAGS) -nostdlib -nostartfiles -static -no-pie -T arch/loongarch/linker.ld -Wl,--build-id=none,--gc-sections,--wrap=physical_page_allocate,--wrap=physical_page_allocate_order,--wrap=kernel_syscall_dispatch -Wl,-Map,$(LA_BUILD)/kernel.map -o $@ $(LA_OBJECTS) -lgcc
 .PHONY: run-loongarch test-loongarch test-loongarch-boot prepare-la-tools prepare-la-linux test-stack-usage-la
@@ -35,6 +35,15 @@ $(LA_BUILD)/kernel-block-la: $(LA_OBJECTS) $(LA_BUILD)/tests/loongarch/block.o a
 .PHONY: test-block-loongarch test-pci-host
 test-block-loongarch: $(LA_BUILD)/kernel-block-la prepare-la-tools
 	python3 -B tests/loongarch/block.py --qemu $(QEMU_LOONGARCH64)
+$(LA_BUILD)/kernel-pci-reset-owner: $(LA_OBJECTS) $(LA_BUILD)/tests/loongarch/block.o $(LA_BUILD)/tests/loongarch/pci_reset_owner.o arch/loongarch/linker.ld
+	$(LA_CC) $(LA_FLAGS) -nostdlib -nostartfiles -static -no-pie -T arch/loongarch/linker.ld -Wl,--build-id=none,--gc-sections,--wrap=physical_page_allocate,--wrap=physical_page_allocate_order,--wrap=kernel_syscall_dispatch,--wrap=la_boot_tasks,--wrap=virtio_transport_reset,--wrap=virtio_pci_block_init,--wrap=virtio_pci_block_destroy -o $@ $(LA_OBJECTS) $(LA_BUILD)/tests/loongarch/block.o $(LA_BUILD)/tests/loongarch/pci_reset_owner.o -lgcc
+.PHONY: test-pci-reset-owner-loongarch
+test-pci-reset-owner-loongarch: $(LA_BUILD)/kernel-pci-reset-owner prepare-la-tools
+	python3 -B tests/loongarch/block.py --qemu $(QEMU_LOONGARCH64) --kernel $(LA_BUILD)/kernel-pci-reset-owner
+	python3 -B tests/loongarch/root_reset.py
+$(LA_BUILD)/kernel-pci-root-reset: $(LA_OBJECTS) $(LA_BUILD)/tests/loongarch/pci_root_reset.o arch/loongarch/linker.ld
+	$(LA_CC) $(LA_FLAGS) -nostdlib -nostartfiles -static -no-pie -T arch/loongarch/linker.ld -Wl,--build-id=none,--gc-sections,--wrap=physical_page_allocate,--wrap=physical_page_allocate_order,--wrap=kernel_syscall_dispatch,--wrap=virtio_transport_reset -o $@ $(LA_OBJECTS) $(LA_BUILD)/tests/loongarch/pci_root_reset.o -lgcc
+test-pci-reset-owner-loongarch: $(LA_BUILD)/kernel-pci-root-reset $(LA_BUILD)/root-probe
 test-pci-host:
 	@mkdir -p build/host
 	cc -std=c11 -Wall -Wextra -Werror -idirafter include tests/host/pci.c kernel/pci.c -o build/host/pci
@@ -71,6 +80,8 @@ $(LA_BUILD)/kernel-stack-window-oom: $(LA_OBJECTS) $(LA_BUILD)/tests/loongarch/s
 	$(LA_CC) $(LA_FLAGS) -nostdlib -nostartfiles -static -no-pie -T arch/loongarch/linker.ld -Wl,--build-id=none,--gc-sections,--wrap=physical_page_allocate,--wrap=physical_page_allocate_order,--wrap=kernel_syscall_dispatch,--wrap=la_mmu_kernel_window_initialize -o $@ $(LA_OBJECTS) $(LA_BUILD)/tests/loongarch/stack_window_oom.o -lgcc
 test-stack-guard-loongarch: $(LA_BUILD)/kernel-stack-window-oom
 -include $(LA_OBJECTS:.o=.d)
+# 独立fixture同样依赖共享头；不能用旧布局对象验收新的设备/架构状态。
+-include $(wildcard $(LA_BUILD)/*.d $(LA_BUILD)/tests/loongarch/*.d)
 
 $(LA_BUILD)/user-probe: tests/loongarch/user.c tests/loongarch/user_start.S tests/loongarch/registers.S tests/loongarch/user.ld
 	@mkdir -p $(dir $@)

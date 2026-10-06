@@ -39,6 +39,11 @@ int main(void)
         function.bars[4].address==0x40000000 && pci_host_claimed(&host)==1);
     assert(pci_function_restore(&function)==PCI_OK && pci_host_claimed(&host)==0 &&
         read_config(config,8,0x20,4)==12 && read_config(config,8,4,2)==0);
+    /* RNG has no device configuration region; common/notify/ISR remain mandatory. */
+    config[0x65]=0;
+    assert(pci_virtio_capabilities(&function,&caps)==PCI_OK && !caps.device.length);
+    config[0x65]=0x74;
+    assert(pci_virtio_capabilities(&function,&caps)==PCI_OK && caps.device.length==8);
     /* A capability cycle or invalid extent is rejected without partial output. */
     struct pci_virtio_caps untouched=caps;
     config[0x75]=0x40;

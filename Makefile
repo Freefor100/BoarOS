@@ -159,6 +159,9 @@ C_SOURCES := \
 	arch/riscv/uart_tty.c \
 	arch/riscv/virtio_mmio_block.c \
 	drivers/virtio/block.c \
+	drivers/virtio/transport.c \
+	drivers/virtio/split_queue.c \
+	drivers/virtio/mmio.c \
 	arch/riscv/virtio_mmio_rng.c \
 	arch/riscv/virtio_mmio_net.c \
 	arch/riscv/plic.c \
@@ -273,6 +276,9 @@ TEST_RUNTIME_C_SOURCES := \
 	arch/riscv/uart_tty.c \
 	arch/riscv/virtio_mmio_block.c \
 	drivers/virtio/block.c \
+	drivers/virtio/transport.c \
+	drivers/virtio/split_queue.c \
+	drivers/virtio/mmio.c \
 	arch/riscv/virtio_mmio_rng.c \
 	arch/riscv/virtio_mmio_net.c \
 	arch/riscv/plic.c \
@@ -1816,6 +1822,13 @@ test-readahead-riscv:
 include arch/loongarch/build.mk
 
 .PHONY: test-virtio-block-host
+.PHONY: test-virtio-framework-host
+test-virtio-framework-host:
+	@mkdir -p build/host
+	cc -std=c11 -Wall -Wextra -Werror -Itests/host/random -Iinclude tests/host/virtio_framework.c drivers/virtio/transport.c drivers/virtio/split_queue.c -o build/host/virtio-framework
+	build/host/virtio-framework
+	cc -std=c11 -Wall -Wextra -Werror -Itests/host/random -Iinclude tests/host/virtio_adapters.c drivers/virtio/transport.c drivers/virtio/mmio.c drivers/virtio/pci.c kernel/pci.c -o build/host/virtio-adapters
+	build/host/virtio-adapters
 test-virtio-block-host:
 	python3 -B tests/host/virtio_block_diagnostics.py
 	HOST_ALTERNATE_TRANSPORT=1 python3 -B tests/host/virtio_block_diagnostics.py

@@ -62,13 +62,13 @@ void __wrap_la_boot_tasks(struct physical_page_allocator *allocator)
         la_fault_injection_set(0);
         enum virtio_block_status rejected=virtio_pci_block_init(&devices[found],host,bdf,allocator,dma,la_timer_frequency());
         la_fault_injection_set(-1);
-        if(rejected!=VIRTIO_BLOCK_DRIVER_STATUS_NO_MEMORY || devices[found].function.host ||
+        if(rejected!=VIRTIO_BLOCK_DRIVER_STATUS_NO_MEMORY || devices[found].pci.function.host ||
             physical_page_available(allocator)!=before || pci_host_claimed(host)!=claims)
             la_virt_fatal("PCI queue OOM owner rollback");
         enum virtio_block_status status=virtio_pci_block_init(&devices[found],host,bdf,allocator,dma,la_timer_frequency());
         if(status!=VIRTIO_BLOCK_DRIVER_STATUS_OK) {la_virt_puts("PCI init status=");la_virt_hex(status);la_virt_puts("\n");la_virt_fatal("PCI block init");}
         if(kernel_block_register(&devices[found].device.block,KERNEL_BLOCK_DEVICE_NUMBER(found))) la_virt_fatal("PCI registry");
-        la_virt_puts("LA PCI block bdf=");la_virt_hex(bdf);la_virt_puts(" irq=");la_virt_hex(devices[found].irq);la_virt_puts("\n");found++;
+        la_virt_puts("LA PCI block bdf=");la_virt_hex(bdf);la_virt_puts(" irq=");la_virt_hex(devices[found].pci.irq);la_virt_puts("\n");found++;
     }
     if(found!=2 || devices[0].device.read_only || !devices[1].device.read_only) la_virt_fatal("PCI block discovery");
     unsigned char buffer[512];
@@ -83,8 +83,8 @@ void __wrap_la_boot_tasks(struct physical_page_allocator *allocator)
     uint64_t prepared=physical_page_available(allocator);
     if(kernel_thread_create(io_worker,0)!=KERNEL_SCHEDULER_STATUS_OK ||
         kernel_thread_create(cpu_worker,0)!=KERNEL_SCHEDULER_STATUS_OK ||
-        !virtio_block_enable_irq(&devices[0].device,devices[0].irq) ||
-        !virtio_block_enable_irq(&devices[1].device,devices[1].irq) ||
+        !virtio_block_enable_irq(&devices[0].device,devices[0].pci.irq) ||
+        !virtio_block_enable_irq(&devices[1].device,devices[1].pci.irq) ||
         la_timer_start(la_timer_frequency(),100)!=ARCH_TIMER_STATUS_OK) la_virt_fatal("PCI tasks");
     arch_interrupt_restore(ARCH_INTERRUPT_ENABLE_MASK);
     unsigned reaped=0;uint64_t deadline=arch_time_read()+la_timer_frequency()*5;

@@ -504,6 +504,9 @@ PGDH内核栈窗口/guard/NX及可信异常栈已验收。SIMD接入后GNU启动
 SIGSEGV已定位到LA漏接QEMU DTB种子；复用不计熵的早期随机材料策略后，固定原版
 glibc2.42五形态在Linux/BoarOS两种RAM均通过退出及根owner门禁。真实PCI RNG仍未
 接入，启动种子不会提前发布random ready；完整指定原程序及平台矩阵仍待完成。
+共用VirtIO transport/split queue已迁入block，三个transport的真实块与LA根owner
+门禁、RV可睡眠I/O四组合已通过。RNG/net迁移及LA平台接入继续沿已批准路线实施；
+全部指定程序矩阵和最终整体审查收口前，不声明本轮对齐完成。
 
 - [ ] ELF 段对齐、BSS 尾页、auxv、用户栈、stat/signal 结构及 clone 寄存器逐项核对；不能只换汇编入口却保留 RV ABI 编码。
 - [ ] 同一用户源码分别编译 RV/LA ELF，每架构内部用同一 ELF 对照 Linux 与 BoarOS；共享测试语义，隔离寄存器/页表差异，不拿 RV ELF 验证 LA。

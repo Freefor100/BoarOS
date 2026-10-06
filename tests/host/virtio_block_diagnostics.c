@@ -52,7 +52,7 @@ static uint64_t register_address(unsigned low)
 
 static void read_batch_device(void)
 {
-    if (!queue_allocation) return;
+    if (!queue_allocation || !(registers[0x70 / 4] & 4)) return;
     unsigned queue_size = registers[0x38 / 4];
     uint64_t descriptors_at = registers[4 / 4] == 1 ? (uint64_t)registers[0x40 / 4] << 12 : register_address(0x80);
     if (!descriptors_at) return;
@@ -115,6 +115,12 @@ uint64_t host_block_time(void)
                                                            queue_size * 16);
     unsigned head = available[2];
     unsigned status_descriptor = head;
+    unsigned writable = 0, descriptor = head;
+    for (;;) {
+        if (descriptors[descriptor].flags & 2) writable += descriptors[descriptor].length;
+        if (!(descriptors[descriptor].flags & 1)) break;
+        descriptor = descriptors[descriptor].next;
+    }
     while (descriptors[status_descriptor].flags & 1)
         status_descriptor = descriptors[status_descriptor].next;
     unsigned char *status = physical_pointer(descriptors[status_descriptor].address, 1);
@@ -125,7 +131,7 @@ uint64_t host_block_time(void)
     completion[0] = (struct wire_completion){
         fault == INVALID_ID ? UINT32_MAX : fault == MISALIGNED_ID ? 1 :
         fault == FREE_SLOT ? 3 : head,
-        fault == ZERO_LENGTH ? 0 : descriptors[head].next == status_descriptor ? 1 : 513
+        fault == ZERO_LENGTH ? 0 : writable
     };
     if (fault == DUPLICATE_SLOT) completion[1] = completion[0];
     used[1] = fault == USED_OVERFLOW ? 9 : fault == DUPLICATE_SLOT ? 2 : 1;
@@ -224,19 +230,19 @@ static uint64_t field(const char *name)
 
 #ifdef HOST_ALTERNATE_TRANSPORT
 static unsigned alternate_accesses;
-static unsigned transport_offset(enum virtio_block_register reg)
+static unsigned transport_offset(enum virtio_register reg)
 {
     static const unsigned offsets[]={0x70,0x14,0x10,0x24,0x20,0x30,0x34,0x38,
         0x44,0x28,0x3c,0x40,0x50,0x80,0x84,0x90,0x94,0xa0,0xa4,0xfc,0x100,0x104};
     assert((unsigned)reg<sizeof(offsets)/sizeof(offsets[0]));
     return offsets[reg];
 }
-static uint32_t alternate_read(void *context,enum virtio_block_register reg)
+static uint32_t alternate_read(void *context,enum virtio_register reg)
 {
     assert(context==&alternate_accesses);alternate_accesses++;
     return registers[transport_offset(reg)/4];
 }
-static void alternate_write(void *context,enum virtio_block_register reg,uint32_t value)
+static void alternate_write(void *context,enum virtio_register reg,uint32_t value)
 {
     assert(context==&alternate_accesses);alternate_accesses++;
     registers[transport_offset(reg)/4]=value;
@@ -247,8 +253,10 @@ static uint32_t alternate_ack(void *context)
     uint32_t pending=registers[0x60/4];registers[0x60/4]=0;
     return pending;
 }
-static const struct virtio_block_transport_ops alternate_ops={
-    .read=alternate_read,.write=alternate_write,.ack_interrupt=alternate_ack};
+static uint32_t alternate_config(void *context,uint32_t offset,unsigned width)
+{ assert(context==&alternate_accesses && width==4 && offset<8);alternate_accesses++;return registers[(0x100+offset)/4]; }
+static const struct virtio_transport_ops alternate_ops={
+    .read=alternate_read,.write=alternate_write,.config_read=alternate_config,.ack_interrupt=alternate_ack};
 #endif
 static enum riscv_virtio_mmio_block_status initialize_model(
     struct riscv_virtio_mmio_block *device,volatile void *mmio,uint64_t size,
@@ -256,8 +264,8 @@ static enum riscv_virtio_mmio_block_status initialize_model(
 {
 #ifdef HOST_ALTERNATE_TRANSPORT
     (void)mmio;(void)size;
-    struct virtio_block_transport transport={.context=&alternate_accesses,
-        .ops=&alternate_ops,.version=registers[1]};
+    struct virtio_transport transport={.context=&alternate_accesses,
+        .ops=alternate_ops,.version=registers[1],.config_size=8};
     return virtio_block_init(device,&transport,allocator,dma,frequency);
 #else
     return riscv_virtio_mmio_block_init(device,mmio,size,allocator,dma,frequency);

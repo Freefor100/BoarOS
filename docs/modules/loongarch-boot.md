@@ -93,8 +93,9 @@ refill 和 syscall 核对路径及调试经验见[LA 学习记录](../learning/l
 ## 第二阶段：PCI 块设备已验证
 
 `kernel/pci.c` 有界解析 capability、按真实 BAR mask 分配不重叠资源，失败恢复
-原 BAR/command 并归还 claim。`drivers/virtio/pci_block.c` 通过共用块核心完成
-现代 PCI transport；总线访问宽度、read-to-clear ISR 和通知地址由 PCI 实现，
+原 BAR/command 并归还 claim。`drivers/virtio/pci_block.c` 将共用块核心与
+`drivers/virtio/pci.c`的现代PCI adapter绑定；[共用框架](virtio-framework.md)拥有
+feature/status和split queue。总线访问宽度、read-to-clear ISR和通知地址由PCI实现，
 ECAM、uncached 映射及 INTx 来源由 `platform/loongarch_pci.c` 提供。BAR 地址
 不能假设由固件分配：无 BIOS QEMU 上先 sizing/分配，再确认 reset，最后打开
 bus-master，销毁按 stop DMA→摘 IRQ→释放队列→恢复 BAR/command 的 owner 顺序。
