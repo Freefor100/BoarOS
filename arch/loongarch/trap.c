@@ -11,6 +11,7 @@
 #include <kernel/console.h>
 #include <kernel/uaccess.h>
 #include <platform/loongarch_pci.h>
+#include <string.h>
 void la_trap_entry(void);
 void la_trap_initialize(void)
 {
@@ -19,6 +20,20 @@ void la_trap_initialize(void)
 }
 static void fault(uint32_t signal, int32_t code, uint64_t address)
 { kernel_signal_force_fault(kernel_task_current(),signal,code,address); }
+static int read_instruction(struct kernel_mm *mm,uint64_t pc,uint32_t *instruction)
+{
+    struct kernel_mm_mapping mapping;void *page;
+    if((pc&3) || kernel_user_range_check(pc,sizeof(*instruction))!=KERNEL_UACCESS_STATUS_OK)return 0;
+    enum kernel_mm_status status=kernel_mm_lookup(mm,pc,&mapping);
+    if(status==KERNEL_MM_STATUS_NOT_MAPPED || status==KERNEL_MM_STATUS_ADDRESS_SPACE)return 0;
+    if(status!=KERNEL_MM_STATUS_OK)la_virt_fatal("instruction MM owner");
+    if((mapping.permissions&(KERNEL_MM_USER|KERNEL_MM_EXECUTE))!=(KERNEL_MM_USER|KERNEL_MM_EXECUTE))return 0;
+    /* 已取指的页驻留且 trap 中不切换；以 EXEC 资格借用 owner，不放宽数据 READ。 */
+    if(physical_page_resolve(mm->allocator,mapping.physical_address&~BOAROS_PAGE_MASK,&page)!=PHYSICAL_PAGE_STATUS_OK)
+        la_virt_fatal("instruction page owner");
+    memcpy(instruction,(unsigned char *)page+(pc&BOAROS_PAGE_MASK),sizeof(*instruction));
+    return 1;
+}
 void la_trap_dispatch(struct arch_trap_frame *frame)
 {
     uint64_t code=(frame->estat>>16)&63;
@@ -95,10 +110,10 @@ void la_trap_dispatch(struct arch_trap_frame *frame)
     }
     if (user) {
         if(code==12) {
-            struct kernel_mm *mm;uint32_t instruction;size_t copied;
+            struct kernel_mm *mm;uint32_t instruction;
             if(kernel_task_mm_borrow_mutable(kernel_task_current(),&mm)!=KERNEL_TASK_STATUS_OK)
                 la_virt_fatal("break MM owner");
-            if(kernel_copy_from_user(mm,&instruction,frame->era,sizeof(instruction),&copied)!=KERNEL_UACCESS_STATUS_OK || copied!=sizeof(instruction))
+            if(!read_instruction(mm,frame->era,&instruction))
                 fault(11,128,0);
             else {
                 /* Linux do_bp 用 break immediate 区分软件整数溢出与除零。 */

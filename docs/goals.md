@@ -28,7 +28,7 @@ N3已经交付：legacy/modern VirtIO-net、受限DMA借用与复制回退、静
 
 [风险证据与重建](learning/cost-baseline.md#旧版内存释放与-virtqueue-告警2026-10-02)
 区分已经修复的机制与缺少历史现场的归因。固定root、单hart、QEMU和选定应用验收
-均不代表多用户隔离、SMP、实板或完整Linux兼容。完整比赛Harness仍缺LA根盘与完整用户环境。
+均不代表多用户隔离、SMP、实板或完整Linux兼容。LA PCI根盘与静态整数用户态已验收，完整比赛Harness仍缺LA动态环境及完整平台能力。
 
 ## 近期方向
 
@@ -131,7 +131,7 @@ glibc四进程整命令仍增加0.73%。该轮的prepare读取、1547次FLUSH和
 | 所有权与接口子集 | fchown/fchownat已接入真实元数据；O_PATH和路径truncate已接入；完整凭据/权限、原生accept4仍有缺口；CPU-time clock、VIRTUAL/PROF timer、pipe容量操作、扩展clone/futex按具体子语义核对，不把已有整个模块记为缺失 |
 | 全局文件同步 | sync/syncfs接入单一挂载树、节点快照与durable等待；syncfs维护独立的挂载错误观察。void sync的程序退出码仍不能单独证明持久化，匿名对象不触及根盘，见[VFS契约](modules/vfs-ext4.md)。 |
 | 用户内存/信号 | mremap、按操作madvise、mlock、sigaltstack、实时信号队列、共享文件/PI futex待真实应用需求触发 |
-| 系统与平台 | 固定root查询不等于完整凭据/权限；其他行规程、完整modem控制、外部IPv6/DNS/TLS、公网配置、SMP/实板、LA根盘与完整用户环境仍缺，不声明完整Linux兼容或硬实时 |
+| 系统与平台 | 固定root查询不等于完整凭据/权限；其他行规程、完整modem控制、外部IPv6/DNS/TLS、公网配置、SMP/实板及LA完整动态/平台环境仍缺，不声明完整Linux兼容或硬实时 |
 
 下面P/N/L小节保留稳定能力编号、契约、依赖和已有验证入口；只以上面的当前队列决定近期实施。
 
@@ -500,6 +500,9 @@ FP/SIMD、动态libc/DSO TLS及完整终端/网络/用户环境仍未完成；�
 
 - [ ] ELF 段对齐、BSS 尾页、auxv、用户栈、stat/signal 结构及 clone 寄存器逐项核对；不能只换汇编入口却保留 RV ABI 编码。
 - [ ] 同一用户源码分别编译 RV/LA ELF，每架构内部用同一 ELF 对照 Linux 与 BoarOS；共享测试语义，隔离寄存器/页表差异，不拿 RV ELF 验证 LA。
+- [ ] LA `PROT_EXEC` 的普通数据读取有效权限仍需单独对照：固定 Linux 使用可读
+  PTE，当前 LA 后端保留独立 NR。本次只修复执行资格的 break 解码，没有修改
+  通用 VMA/数据 uaccess 策略；资料与边界见[LA学习记录](learning/loongarch-bringup.md)。
 
 ### L3 扩大真实用户空间
 
@@ -591,7 +594,7 @@ make test-program-inventory-host test-diff-abi-host
 make inventory-userland-riscv
 ```
 
-`inventory-userland-riscv` 默认成功只说明清单生成成功。全量 228 项仍有明确缺口，严格模式失败不是自动产生的新回归；`--case` 与 `--require-pass` 只严格判定本次选择集合，未选项目保留历史结果或 `not-run`，选择集合写入状态供恢复报告解释。完整 Harness 缺 LA 动态libc/TLS/信号等完整用户环境或其他能力时保留阻塞原因。
+`inventory-userland-riscv` 默认成功只说明清单生成成功。全量 228 项仍有明确缺口，严格模式失败不是自动产生的新回归；`--case` 与 `--require-pass` 只严格判定本次选择集合，未选项目保留历史结果或 `not-run`，选择集合写入状态供恢复报告解释。完整 Harness 缺 LA 动态libc/DSO TLS、FP/SIMD及完整平台环境或其他能力时保留阻塞原因；整数信号和静态pthread子集已有独立验收。
 
 ## 范围与交付边界
 

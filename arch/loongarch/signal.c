@@ -93,7 +93,7 @@ void la_signal_restore_current(struct arch_trap_frame *frame)
     struct la_context_info end;
     uint64_t mask,sp=frame->regs[3];
     size_t copied;
-    if((sp&15) || sp>UINT64_MAX-LA_SIGNAL_FRAME_BYTES ||
+    if(sp>UINT64_MAX-LA_SIGNAL_FRAME_BYTES ||
        kernel_task_mm_borrow_mutable(task,&mm)!=KERNEL_TASK_STATUS_OK) bad_frame();
     /* 所有输入先快照；失败不能发布一半恢复的 mask 或寄存器。 */
     if(kernel_copy_from_user(mm,&mask,sp+128+40,sizeof(mask),&copied)!=KERNEL_UACCESS_STATUS_OK || copied!=sizeof(mask) ||

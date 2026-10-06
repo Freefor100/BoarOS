@@ -32,6 +32,8 @@ flags，再对齐至272字节。只发布 END，不发布未拥有的 FP/LSX/LAS
 未知扩展或 SC_USED_FP 帧以用户坏帧处理，扩展支持另行实现。恢复先快照 mask、
 context 和 END，再提交用户寄存器；PRMD、内核 TP 不来自用户，r0保持零。
 handler 的 a0/a1/a2、ra 与 SP 使用 LA ABI，VDSO 执行 syscall 139；sigreturn 不再推进 ERA。
+内核交付帧保持16字节对齐；用户提供的恢复帧不另加这一拒绝条件，Linux接受
+可读的8字节偏移帧。仍完整检查范围、复制和不支持扩展，先快照后提交。
 
 ## 等待与重启
 
@@ -64,6 +66,8 @@ TRAP/BRKPT、si_addr=ERA。固定 Linux LA do_ri 使用 SI_KERNEL=128、空地�
 编码，后续异步帧和 clone 保留该值；PRMD 不发布在用户上下文。
 break 6/7 分别为 SIGFPE/FPE_INTOVF、FPE_INTDIV，按真实指令 immediate 解码，
 不能把整数运算 fault 全部归为 TRAP。两个类型也由同 ELF 的双侧 handler 验证。
+解码使用已驻留页的 USER/EXEC 资格借用物理owner，不要求普通数据READ权限；
+仅执行映射中的break6也由双侧真实程序保护，不全局放宽数据uaccess。
 `make test-signal-loongarch` 在512MiB/1GiB分别运行同一个真实 LP64S musl ELF，
 验证布局、来源/mask、嵌套、故障映射修复、整数寄存器/PC恢复、坏帧、pipe
 SA_RESTART/EINTR、nanosleep EINTR 和 sigsuspend。每次 BoarOS 退出要求根盘 owner、
