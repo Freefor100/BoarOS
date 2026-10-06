@@ -1,6 +1,6 @@
 #include "private.h"
 
-#include <arch/riscv/timer.h>
+#include <arch/timer.h>
 #include <arch/context.h>
 #include <kernel/errno.h>
 #include <kernel/futex.h>
@@ -304,7 +304,7 @@ enum kernel_syscall_status syscall_handle_restart_syscall(
         return KERNEL_SYSCALL_STATUS_OK;
     }
     if (deadline == 0U ||
-        (int64_t)(riscv_time_read() - deadline) >= 0) {
+        (int64_t)(arch_time_read() - deadline) >= 0) {
         kernel_signal_clear_syscall_restart(caller);
         decoded->value = 0;
         return KERNEL_SYSCALL_STATUS_OK;

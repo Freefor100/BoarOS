@@ -4,6 +4,14 @@
 #include <arch/loongarch/mmu.h>
 #else
 #include <arch/riscv/sv39.h>
+#define ARCH_MMU_STATE_ACTIVE RISCV_SV39_STATE_ACTIVE
+#define arch_mmu_page_table riscv_sv39_page_table
+#define arch_mmu_user_space_init riscv_sv39_user_space_init
+#define arch_mmu_user_space_populate riscv_sv39_user_space_populate
+#define arch_mmu_switch_context riscv_sv39_switch_satp
+#define arch_mmu_kernel_window_active riscv_sv39_kernel_window_active
+#define arch_mmu_kernel_window_map riscv_sv39_kernel_window_map
+#define arch_mmu_kernel_window_unmap riscv_sv39_kernel_window_unmap
 #define arch_mmu_current_context riscv_sv39_current_satp
 #define arch_mmu_mapping riscv_sv39_mapping
 #define arch_mmu_status riscv_sv39_status

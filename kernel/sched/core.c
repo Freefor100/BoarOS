@@ -1,11 +1,5 @@
+#include <arch/task.h>
 #include <arch/context.h>
-#include <arch/riscv/direct_map.h>
-#include <arch/riscv/fpu.h>
-#include <arch/riscv/memory_layout.h>
-#include <arch/riscv/mm.h>
-#include <arch/riscv/sv39.h>
-#include <arch/riscv/thread.h>
-#include <arch/riscv/trap.h>
 #include <kernel/files.h>
 #include <kernel/errno.h>
 #include <kernel/exec.h>
@@ -32,8 +26,8 @@
 struct kernel_scheduler scheduler;
 static int identity_heap_address(const void *pointer, uint64_t *address)
 {
-    return riscv_direct_map_va_to_pa((uint64_t)(uintptr_t)pointer, 1U, address)
-        == RISCV_DIRECT_MAP_STATUS_OK;
+    return arch_direct_map_va_to_pa((uint64_t)(uintptr_t)pointer, 1U, address)
+        == ARCH_DIRECT_MAP_STATUS_OK;
 }
 
 
@@ -46,17 +40,14 @@ _Static_assert(KERNEL_STACK_ORDER <= PHYSICAL_PAGE_MAX_ORDER &&
 _Static_assert(KERNEL_STACK_BYTES == (BOAROS_PAGE_SIZE << KERNEL_STACK_ORDER),
                "kernel stack size must match its contiguous-page owner");
 _Static_assert(KERNEL_STACK_BYTES >= KERNEL_STACK_GUARD_BYTES +
-                   RISCV_TRAP_FRAME_SIZE + KERNEL_STACK_MINIMUM_RESERVE,
+                   ARCH_TRAP_FRAME_SIZE + KERNEL_STACK_MINIMUM_RESERVE,
                "kernel stack needs room for a trap frame and reserve");
 _Static_assert(offsetof(struct kernel_task, arch) == 0U,
-               "RISC-V thread state must prefix the scheduler thread");
+               "architecture state must prefix the scheduler task");
 
 static uintptr_t current_sp(void)
 {
-    uintptr_t value;
-
-    __asm__ volatile("mv %0, sp" : "=r"(value));
-    return value;
+    return arch_current_stack();
 }
 
 static enum kernel_scheduler_status validate_queue_shape(
@@ -95,7 +86,7 @@ static enum kernel_scheduler_status validate_thread(
             thread->arch.kernel_sp != thread->stack_high ||
             thread->arch.user_sp != 0U ||
             thread->arch.user_mode != 0U ||
-            thread->arch.satp != scheduler.kernel_satp ||
+            arch_thread_mm(&thread->arch) != scheduler.kernel_context ||
             thread->completion.kind != KERNEL_THREAD_KIND_KERNEL ||
             thread->completion.tid != 0 ||
             thread->completion.tgid != 0 ||
@@ -134,7 +125,7 @@ static enum kernel_scheduler_status validate_thread(
 
     if (thread->arch.user_mode == 0U) {
         if (thread->arch.user_sp != 0U ||
-            thread->arch.satp != scheduler.kernel_satp ||
+            arch_thread_mm(&thread->arch) != scheduler.kernel_context ||
             thread->completion.kind != KERNEL_THREAD_KIND_KERNEL ||
             thread->completion.tid != 0 ||
             thread->completion.tgid != 0 ||
@@ -262,7 +253,7 @@ enum kernel_scheduler_status validate_current(void)
         stack_pointer >= scheduler.current->stack_high) {
         return KERNEL_SCHEDULER_STATUS_STACK_CORRUPT;
     }
-    if (riscv_sv39_current_satp() != scheduler.current->arch.satp) {
+    if (arch_mmu_current_context() != arch_thread_mm(&scheduler.current->arch)) {
         return KERNEL_SCHEDULER_STATUS_ADDRESS_SPACE;
     }
     return KERNEL_SCHEDULER_STATUS_OK;
@@ -274,11 +265,11 @@ enum kernel_scheduler_status activate_thread_address_space(
     if (thread == 0) {
         return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
     }
-    if (riscv_sv39_current_satp() == thread->arch.satp) {
+    if (arch_mmu_current_context() == arch_thread_mm(&thread->arch)) {
         return KERNEL_SCHEDULER_STATUS_OK;
     }
-    if (riscv_sv39_switch_satp(thread->arch.satp) !=
-        RISCV_SV39_STATUS_OK) {
+    if (arch_mmu_switch_context(arch_thread_mm(&thread->arch)) !=
+        ARCH_MMU_STATUS_OK) {
         return KERNEL_SCHEDULER_STATUS_ADDRESS_SPACE;
     }
     return KERNEL_SCHEDULER_STATUS_OK;
@@ -384,8 +375,8 @@ enum kernel_scheduler_status scheduler_switch_current_away(
     scheduler.need_resched = 0;
     scheduler_rearm_timer();
     if (next == previous) return KERNEL_SCHEDULER_STATUS_OK;
-    riscv_fpu_switch(&previous->fpu, &next->fpu);
-    riscv_context_switch(&previous->context, &next->context);
+    arch_fpu_switch(&previous->fpu, &next->fpu);
+    arch_context_switch(&previous->context, &next->context);
     return KERNEL_SCHEDULER_STATUS_OK;
 }
 
@@ -412,10 +403,10 @@ enum kernel_scheduler_status release_after_create_failure(
  * 页表构建期预留，只有生产内核激活它；无页表的 fixture 回退直接映射。
  */
 _Static_assert(KERNEL_STACK_BYTES + BOAROS_PAGE_SIZE ==
-                   RISCV_KERNEL_STACK_SLOT_SIZE,
+                   ARCH_KERNEL_STACK_SLOT_SIZE,
                "kernel stack window slot is one guard page plus the stack");
 #define KERNEL_STACK_SLOT_COUNT \
-    ((uint32_t)(RISCV_KERNEL_STACK_WINDOW_SIZE / RISCV_KERNEL_STACK_SLOT_SIZE))
+    ((uint32_t)(ARCH_KERNEL_STACK_WINDOW_SIZE / ARCH_KERNEL_STACK_SLOT_SIZE))
 #define KERNEL_STACK_SLOT_WORDS ((KERNEL_STACK_SLOT_COUNT + 63U) / 64U)
 static uint64_t kernel_stack_slot_bitmap[KERNEL_STACK_SLOT_WORDS];
 
@@ -429,9 +420,9 @@ static int kernel_stack_slot_acquire(uint64_t *window_address)
         while ((free_bits & (UINT64_C(1) << bit)) == 0U) bit++;
         if (word * 64U + bit >= KERNEL_STACK_SLOT_COUNT) return -1;
         kernel_stack_slot_bitmap[word] |= UINT64_C(1) << bit;
-        *window_address = RISCV_KERNEL_STACK_WINDOW_BASE +
+        *window_address = ARCH_KERNEL_STACK_WINDOW_BASE +
                           (uint64_t)(word * 64U + bit) *
-                              RISCV_KERNEL_STACK_SLOT_SIZE;
+                              ARCH_KERNEL_STACK_SLOT_SIZE;
         return 0;
     }
     return -1;
@@ -440,8 +431,8 @@ static int kernel_stack_slot_acquire(uint64_t *window_address)
 static void kernel_stack_slot_release(uint64_t window_address)
 {
     uint32_t index = (uint32_t)((window_address -
-                                 RISCV_KERNEL_STACK_WINDOW_BASE) /
-                                RISCV_KERNEL_STACK_SLOT_SIZE);
+                                 ARCH_KERNEL_STACK_WINDOW_BASE) /
+                                ARCH_KERNEL_STACK_SLOT_SIZE);
     kernel_stack_slot_bitmap[index / 64U] &= ~(UINT64_C(1) << (index % 64U));
 }
 
@@ -491,10 +482,10 @@ enum kernel_scheduler_status allocate_task_storage(struct kernel_task **task)
     }
     memset(stack, KERNEL_STACK_FILL, KERNEL_STACK_BYTES);
     thread->stack_physical_address = stack_address;
-    if (riscv_sv39_kernel_window_active()) {
+    if (arch_mmu_kernel_window_active()) {
         uint64_t window;
         uint64_t stack_va;
-        enum riscv_sv39_status map_status;
+        enum arch_mmu_status map_status;
 
         if (kernel_stack_slot_acquire(&window) != 0) {
             (void)physical_page_release_order(scheduler.allocator,
@@ -504,17 +495,17 @@ enum kernel_scheduler_status allocate_task_storage(struct kernel_task **task)
                 metadata_address, KERNEL_SCHEDULER_STATUS_NO_MEMORY);
         }
         stack_va = window + BOAROS_PAGE_SIZE;
-        map_status = riscv_sv39_kernel_window_map(scheduler.allocator,
+        map_status = arch_mmu_kernel_window_map(scheduler.allocator,
                                                   stack_va, stack_address);
-        if (map_status == RISCV_SV39_STATUS_OK) {
-            map_status = riscv_sv39_kernel_window_map(
+        if (map_status == ARCH_MMU_STATUS_OK) {
+            map_status = arch_mmu_kernel_window_map(
                 scheduler.allocator, stack_va + BOAROS_PAGE_SIZE,
                 stack_address + BOAROS_PAGE_SIZE);
         }
-        if (map_status != RISCV_SV39_STATUS_OK) {
-            (void)riscv_sv39_kernel_window_unmap(scheduler.allocator,
+        if (map_status != ARCH_MMU_STATUS_OK) {
+            (void)arch_mmu_kernel_window_unmap(scheduler.allocator,
                                                  stack_va);
-            (void)riscv_sv39_kernel_window_unmap(
+            (void)arch_mmu_kernel_window_unmap(
                 scheduler.allocator, stack_va + BOAROS_PAGE_SIZE);
             kernel_stack_slot_release(window);
             (void)physical_page_release_order(scheduler.allocator,
@@ -522,7 +513,7 @@ enum kernel_scheduler_status allocate_task_storage(struct kernel_task **task)
                                               KERNEL_STACK_ORDER);
             return release_after_create_failure(
                 metadata_address,
-                map_status == RISCV_SV39_STATUS_NO_MEMORY
+                map_status == ARCH_MMU_STATUS_NO_MEMORY
                     ? KERNEL_SCHEDULER_STATUS_NO_MEMORY
                     : KERNEL_SCHEDULER_STATUS_INVALID_STATE);
         }
@@ -574,12 +565,12 @@ enum kernel_scheduler_status release_task_stack(struct kernel_task *thread)
         scheduler.stack_statistics.minimum_free_bytes = free_bytes;
     if (used_bytes > scheduler.stack_statistics.maximum_used_bytes)
         scheduler.stack_statistics.maximum_used_bytes = used_bytes;
-    if (riscv_sv39_kernel_window_active()) {
+    if (arch_mmu_kernel_window_active()) {
         uint64_t window = (uint64_t)thread->stack_low -
                           KERNEL_STACK_GUARD_BYTES - BOAROS_PAGE_SIZE;
-        (void)riscv_sv39_kernel_window_unmap(scheduler.allocator,
+        (void)arch_mmu_kernel_window_unmap(scheduler.allocator,
                                              window + BOAROS_PAGE_SIZE);
-        (void)riscv_sv39_kernel_window_unmap(
+        (void)arch_mmu_kernel_window_unmap(
             scheduler.allocator, window + BOAROS_PAGE_SIZE * 2U);
         kernel_stack_slot_release(window);
     }
@@ -618,7 +609,7 @@ enum kernel_scheduler_status kernel_scheduler_init(
     uintptr_t idle_stack_high)
 {
     uintptr_t stack_pointer = current_sp();
-    uint64_t kernel_satp = riscv_sv39_current_satp();
+    uint64_t kernel_context = arch_mmu_current_context();
     enum kernel_pid_status pid_status;
 
     if (scheduler.initialized == KERNEL_SCHEDULER_INITIALIZED) {
@@ -637,7 +628,7 @@ enum kernel_scheduler_status kernel_scheduler_init(
     if (arch_interrupt_is_enabled()) {
         return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
     }
-    if (riscv_sv39_switch_satp(kernel_satp) != RISCV_SV39_STATUS_OK) {
+    if (arch_mmu_switch_context(kernel_context) != ARCH_MMU_STATUS_OK) {
         return KERNEL_SCHEDULER_STATUS_ADDRESS_SPACE;
     }
     pid_status = kernel_pid_allocator_init(&scheduler.pid_allocator,
@@ -655,11 +646,11 @@ enum kernel_scheduler_status kernel_scheduler_init(
     scheduler.identities.next_generation = 1U;
     if (kernel_heap_init(&scheduler.identity_heap, allocator, identity_heap_address)
             != KERNEL_HEAP_STATUS_OK) return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
-    scheduler.kernel_satp = kernel_satp;
+    scheduler.kernel_context = kernel_context;
     scheduler.idle.arch.kernel_sp = idle_stack_high;
     scheduler.idle.arch.user_sp = 0U;
     scheduler.idle.arch.user_mode = 0U;
-    scheduler.idle.arch.satp = scheduler.kernel_satp;
+    arch_thread_set_mm(&scheduler.idle.arch, scheduler.kernel_context);
     scheduler.idle.magic = KERNEL_THREAD_MAGIC;
     scheduler.idle.physical_address = KERNEL_THREAD_NO_PAGE;
     scheduler.idle.stack_physical_address = KERNEL_THREAD_NO_PAGE;
@@ -723,7 +714,7 @@ enum kernel_scheduler_status kernel_thread_create_joinable(
 {
     struct kernel_task *thread;
     uintptr_t old_status;
-    enum riscv_context_status context_status;
+    enum arch_context_status context_status;
     enum kernel_scheduler_status status;
 
     if (scheduler.initialized != KERNEL_SCHEDULER_INITIALIZED) {
@@ -753,7 +744,7 @@ enum kernel_scheduler_status kernel_thread_create_joinable(
     }
     thread->arch.user_sp = 0U;
     thread->arch.user_mode = 0U;
-    thread->arch.satp = scheduler.kernel_satp;
+    arch_thread_set_mm(&thread->arch, scheduler.kernel_context);
     thread->magic = KERNEL_THREAD_MAGIC;
     thread->next = 0;
     thread->state = KERNEL_THREAD_STATE_READY;
@@ -773,12 +764,12 @@ enum kernel_scheduler_status kernel_thread_create_joinable(
     thread->exec_transaction = 0;
     kernel_wait_queue_init(&thread->child_exit_queue);
     kernel_wait_queue_init(&thread->vfork_done_queue);
-    context_status = riscv_context_init(&thread->context,
+    context_status = arch_context_init(&thread->context,
                                         thread->stack_high,
                                         entry,
                                         argument,
                                         thread);
-    if (context_status != RISCV_CONTEXT_STATUS_OK) {
+    if (context_status != ARCH_CONTEXT_STATUS_OK) {
         status = release_task_storage(
             thread,
             KERNEL_SCHEDULER_STATUS_INVALID_STATE);
@@ -809,11 +800,11 @@ enum kernel_scheduler_status kernel_user_thread_create(
     struct kernel_mm_mapping entry_mapping;
     struct kernel_mm_mapping stack_mapping;
     struct kernel_vma entry_vma;
-    struct riscv_trap_frame *frame;
+    struct arch_trap_frame *frame;
     struct kernel_task *thread;
-    uint64_t user_satp;
+    uint64_t user_context;
     uintptr_t old_status;
-    enum riscv_context_status context_status;
+    enum arch_context_status context_status;
     enum kernel_pid_status pid_status;
     kernel_pid_t tid;
     enum kernel_mm_status mm_status;
@@ -853,7 +844,7 @@ enum kernel_scheduler_status kernel_user_thread_create(
         status = KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
         goto restore_interrupts;
     }
-    mm_status = riscv_kernel_mm_satp(mm, &user_satp);
+    mm_status = kernel_mm_context(mm, &user_context);
     if (mm_status != KERNEL_MM_STATUS_OK) {
         status = mm_status ==
                          KERNEL_MM_STATUS_INVALID_ARGUMENT
@@ -911,7 +902,7 @@ enum kernel_scheduler_status kernel_user_thread_create(
     }
     thread->arch.user_sp = 0U;
     thread->arch.user_mode = 1U;
-    thread->arch.satp = user_satp;
+    arch_thread_set_mm(&thread->arch, user_context);
     thread->magic = KERNEL_THREAD_MAGIC;
     thread->next = 0;
     thread->state = KERNEL_THREAD_STATE_READY;
@@ -926,7 +917,7 @@ enum kernel_scheduler_status kernel_user_thread_create(
     kernel_wait_queue_init(&thread->child_exit_queue);
     kernel_wait_queue_init(&thread->vfork_done_queue);
 
-    frame = (struct riscv_trap_frame *)(thread->stack_high -
+    frame = (struct arch_trap_frame *)(thread->stack_high -
                                         sizeof(*frame));
     if ((uintptr_t)frame < thread->stack_low) {
         status = release_task_storage(
@@ -934,20 +925,11 @@ enum kernel_scheduler_status kernel_user_thread_create(
             KERNEL_SCHEDULER_STATUS_INVALID_STATE);
         goto restore_interrupts;
     }
-    memset(frame, 0, sizeof(*frame));
-    frame->sp = stack_pointer;
-    frame->tp = thread_pointer;
-    /* The user image starts with the FP unit enabled but unmodified;
-     * the zeroed task page is its saved register image. */
-    frame->sstatus = RISCV_SSTATUS_SPIE | RISCV_SSTATUS_UXL_64 |
-                     RISCV_SSTATUS_FS_INITIAL;
-    frame->sepc = entry;
-    frame->kernel_tp = (uintptr_t)thread;
-    thread->fpu.saved = 1U;
-    context_status = riscv_context_init_user(&thread->context,
+    arch_process_prepare_initial(thread, entry, stack_pointer, thread_pointer);
+    context_status = arch_context_init_user(&thread->context,
                                              (uintptr_t)frame,
                                              thread);
-    if (context_status != RISCV_CONTEXT_STATUS_OK) {
+    if (context_status != ARCH_CONTEXT_STATUS_OK) {
         status = release_task_storage(
             thread,
             KERNEL_SCHEDULER_STATUS_INVALID_STATE);

@@ -1,17 +1,18 @@
 # 进程映像替换模块
 
-本文描述 Linux `execve(221)` 的准备事务、RISC-V 映像后端和 scheduler 提交边界。ELF source 与缺页规则见[用户 ELF64 装载模块](user-elf.md)，任务与 MM 生命周期见[内核调度与进程生命周期模块](kernel-scheduler.md)。
+本文描述 Linux `execve(221)` 的准备事务、共用映像策略和 scheduler 提交边界。ELF source 与缺页规则见[用户 ELF64 装载模块](user-elf.md)，任务与 MM 生命周期见[内核调度与进程生命周期模块](kernel-scheduler.md)。
 
 ## 入口与职责
 
 | 文件 | 职责 |
 |---|---|
 | `kernel/exec.c`、`include/kernel/exec.h` | 捕获用户路径/argv/envp，打开可执行文件，解析并持有主程序和解释器 source，管理准备期 owner |
-| `arch/riscv/exec.c`、`arch/riscv/elf_image.c` | 将 source 变成 Sv39 MM、入口 PC、SP 和架构线程状态 |
-| `kernel/sched/exec.c` | 在不可返回提交点切换 `satp`、替换 MM、重建 Trap Frame 并处理 close-on-exec |
+| `kernel/exec_image.c`、`kernel/elf_image.c` | 将 source 变成 MM、入口 PC、SP、VMA、栈和 auxv；页表操作构建期绑定 |
+| `include/arch/elf.h`、`include/arch/task.h` | machine/HWCAP/trampoline 与初始、clone、exec 寄存器操作 |
+| `kernel/sched/exec.c` | 在不可返回提交点切换架构地址空间、替换 MM、重建 Trap Frame 并处理 close-on-exec |
 | `kernel/syscall/process.c`、`arch/riscv/trap.c` | 解码 syscall 221 和提交动作 |
 
-通用入口 `kernel_execve_prepare()` 在旧 MM 上建立 `PREPARED` 事务；RISC-V `kernel_exec_image_prepare()` 调用 `riscv_elf_image_build()`。不使用运行期 vtable。LoongArch 后续实现同一 image 契约，但自行完成页表、布局和 trap 状态。
+通用入口 `kernel_execve_prepare()` 在旧 MM 上建立 `PREPARED` 事务；`kernel_exec_image_prepare()` 调用共用 `kernel_elf_image_build()`。machine、页大小、MMU 和线程寄存器由构建期绑定的 RV/LA 实现提供，不使用运行期 vtable。RV 的旧入口保留薄包装；LA 首阶段通过内存 reader 验证同一 image 契约，尚无根盘 execve 验收。
 
 ## 准备事务
 
@@ -41,7 +42,7 @@ RISC-V 后端固定 Sv39/4 KiB，并支持：
 - 带解释器的 PIE `ET_DYN`；
 - 无解释器的 `ET_DYN`。
 
-`PT_LOAD` 不在 exec 时复制整段文件，而登记 `ELF_PRIVATE` VMA。完整文件页使用 page cache+COW，文件/BSS 边界和 BSS 页按需建立私有页。缺页 I/O 在用户边界产生 `SIGBUS`，物理耗尽终止本次用户操作；新建可执行页完成 `SFENCE.VMA` 和必要 `FENCE.I` 后才可取指。source 的 program headers 只解析一次，避免重新读取造成 TOCTOU。
+`PT_LOAD` 不在 exec 时复制整段文件，而登记 `ELF_PRIVATE` VMA。完整文件页使用 page cache+COW，文件/BSS 边界和 BSS 页按需建立私有页。缺页 I/O 在用户边界产生 `SIGBUS`，物理耗尽终止本次用户操作；新建可执行页完成架构转换失效和取指同步后才可取指（RV 为 `SFENCE.VMA`/`FENCE.I`，LA 为 `INVTLB`/`IBAR`）。source 的 program headers 只解析一次，避免重新读取造成 TOCTOU。
 
 布局从随机核心产生独立的 PIE/解释器 bias、mmap base、stack、brk 和 vDSO 随机量。VirtIO RNG 累计至少 32 字节可信输入才使核心就绪；只有 DTB 材料时沿用明确的非安全降级接口，不计可信熵。完全没有材料时使用确定性布局并省略 `AT_RANDOM`。初始 PC 是解释器入口（若有），`AT_ENTRY` 始终为主程序入口；初始栈保存真实 `AT_PHDR`、`AT_BASE`、`AT_ENTRY`、`AT_HWCAP`、`AT_RANDOM`（可用时）、`AT_EXECFN` 等 auxv。入口 SP 按 RISC-V psABI 16 字节对齐，scheduler 允许入口页尚未驻留，但必须属于可执行 VMA。
 

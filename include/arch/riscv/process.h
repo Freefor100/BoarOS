@@ -12,6 +12,8 @@ enum kernel_scheduler_status riscv_process_prepare_clone(
     struct kernel_task *child, struct kernel_task *parent,
     const struct riscv_trap_frame *parent_frame,
     uint64_t child_stack, int set_tls, uint64_t tls);
+void riscv_process_prepare_initial(struct kernel_task *task, uintptr_t entry,
+                                   uintptr_t stack, uintptr_t tls);
 void riscv_process_prepare_exec(struct kernel_task *task, uintptr_t entry,
                                 uintptr_t stack, uintptr_t tls);
 /* Borrow the current user task's architecture-owned register image. */

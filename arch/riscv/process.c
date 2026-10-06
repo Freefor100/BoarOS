@@ -33,7 +33,7 @@ enum kernel_scheduler_status riscv_process_prepare_clone(
                : KERNEL_SCHEDULER_STATUS_INVALID_STATE;
 }
 
-void riscv_process_prepare_exec(struct kernel_task *task, uintptr_t entry,
+void riscv_process_prepare_initial(struct kernel_task *task, uintptr_t entry,
                                 uintptr_t stack, uintptr_t tls)
 {
     struct riscv_trap_frame *frame = (struct riscv_trap_frame *)(
@@ -46,5 +46,19 @@ void riscv_process_prepare_exec(struct kernel_task *task, uintptr_t entry,
                      RISCV_SSTATUS_FS_INITIAL;
     frame->sepc = entry;
     frame->kernel_tp = (uintptr_t)task;
+    task->fpu.saved = 1U;
+}
+
+void riscv_process_prepare_exec(struct kernel_task *task, uintptr_t entry,
+                                uintptr_t stack, uintptr_t tls)
+{
+    riscv_process_prepare_initial(task, entry, stack, tls);
     riscv_fpu_reset_current(&task->fpu);
 }
+
+struct riscv_fpu_state *riscv_process_fpu_borrow_current(void)
+{ return arch_process_fpu_borrow_current(); }
+enum kernel_scheduler_status riscv_process_clone_current(
+    const struct riscv_trap_frame *frame, uint64_t flags, uint64_t stack,
+    uint64_t parent_tid, uint64_t tls, uint64_t child_tid, int64_t *result)
+{ return arch_process_clone_current(frame, flags, stack, parent_tid, tls, child_tid, result); }

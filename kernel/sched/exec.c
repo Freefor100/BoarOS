@@ -1,12 +1,7 @@
+#include <arch/task.h>
 #include "../exec_internal.h"
 #include "private.h"
 
-#include <arch/riscv/fpu.h>
-#include <arch/riscv/mm.h>
-#include <arch/riscv/process.h>
-#include <arch/riscv/sv39.h>
-#include <arch/riscv/thread.h>
-#include <arch/riscv/trap.h>
 #include <kernel/exec.h>
 #include <kernel/futex.h>
 #include <kernel/files.h>
@@ -33,7 +28,7 @@ enum kernel_scheduler_status kernel_scheduler_exec_commit(void)
     struct kernel_mm_mapping entry_mapping;
     struct kernel_mm_mapping stack_mapping;
     struct kernel_vma entry_vma;
-    uint64_t new_satp;
+    uint64_t new_context;
     enum kernel_exec_status exec_status;
     enum kernel_files_status files_status;
     enum kernel_mm_status mm_status;
@@ -65,7 +60,7 @@ enum kernel_scheduler_status kernel_scheduler_exec_commit(void)
         (transaction->image.stack_pointer & (uintptr_t)15U) != 0U) {
         return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
     }
-    mm_status = riscv_kernel_mm_satp(&transaction->image.mm, &new_satp);
+    mm_status = kernel_mm_context(&transaction->image.mm, &new_context);
     if (mm_status != KERNEL_MM_STATUS_OK) {
         return KERNEL_SCHEDULER_STATUS_ADDRESS_SPACE;
     }
@@ -116,7 +111,7 @@ enum kernel_scheduler_status kernel_scheduler_exec_commit(void)
      * a non-leader exec adopted the group leader's identity. */
     kernel_futex_release_robust(thread, old_tid);
     kernel_futex_release_mm(thread);
-    if (riscv_sv39_switch_satp(new_satp) != RISCV_SV39_STATUS_OK) {
+    if (arch_mmu_switch_context(new_context) != ARCH_MMU_STATUS_OK) {
         return KERNEL_SCHEDULER_STATUS_ADDRESS_SPACE;
     }
     transaction->retired_mm = thread->mm;
@@ -124,8 +119,8 @@ enum kernel_scheduler_status kernel_scheduler_exec_commit(void)
     kernel_mm_add_user(&thread->mm);
     kernel_proc_task_update_comm(thread);
     finish_mm_move(&transaction->image.mm);
-    thread->arch.satp = new_satp;
-    riscv_process_prepare_exec(thread,
+    arch_thread_set_mm(&thread->arch, new_context);
+    arch_process_prepare_exec(thread,
                           transaction->image.entry,
                           transaction->image.stack_pointer,
                           transaction->image.thread_pointer);

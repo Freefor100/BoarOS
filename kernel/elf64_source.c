@@ -20,6 +20,7 @@ struct kernel_elf64_source {
     uint64_t magic;
     struct kernel_heap *heap;
     struct kernel_open_file_description *file;
+    struct kernel_read_source reader;
     struct kernel_elf64_header header;
     struct kernel_elf64_program_header *program_headers;
     uint16_t program_header_count;
@@ -534,11 +535,9 @@ static enum kernel_elf64_source_status build_runs(
     return KERNEL_ELF64_SOURCE_STATUS_OK;
 }
 
-enum kernel_elf64_source_status kernel_elf64_source_create(
-    struct kernel_heap *heap,
-    struct kernel_open_file_description **file,
-    uint64_t page_size,
-    uint16_t machine,
+static enum kernel_elf64_source_status create_from_reader(
+    struct kernel_heap *heap, struct kernel_open_file_description **file,
+    const struct kernel_read_source *input, uint64_t page_size, uint16_t machine,
     struct kernel_elf64_source **source_out)
 {
     struct kernel_read_source read_source;
@@ -553,19 +552,10 @@ enum kernel_elf64_source_status kernel_elf64_source_create(
     enum kernel_elf64_source_status status;
     enum kernel_heap_status heap_status;
 
-    if (heap == 0 || file == 0 || *file == 0 || source_out == 0 ||
-        *source_out != 0 || page_size != BOAROS_PAGE_SIZE ||
-        (page_size & (page_size - 1U)) != 0U ||
-        (kernel_open_file_mode(*file) & KERNEL_VFS_S_IFMT) !=
-            KERNEL_VFS_S_IFREG) {
-        return KERNEL_ELF64_SOURCE_STATUS_INVALID_ARGUMENT;
-    }
-    image_size = kernel_open_file_size(*file);
-    read_source = (struct kernel_read_source){
-        .context = *file,
-        .size = image_size,
-        .read_at = source_read_at,
-    };
+    if (!heap || !input || !input->read_at || !source_out || *source_out ||
+        page_size != BOAROS_PAGE_SIZE) return KERNEL_ELF64_SOURCE_STATUS_INVALID_ARGUMENT;
+    image_size=input->size;
+    read_source=*input;
     heap_status = kernel_heap_allocate_zeroed(heap,
                                               1U,
                                               sizeof(*source),
@@ -580,6 +570,7 @@ enum kernel_elf64_source_status kernel_elf64_source_create(
     source->references = 1U;
     source->page_size = page_size;
     source->state = SOURCE_LIVE;
+    source->reader = read_source;
     *source_out = source;
     heap_status = kernel_heap_allocate_zeroed(
         heap,
@@ -663,10 +654,23 @@ enum kernel_elf64_source_status kernel_elf64_source_create(
     if (status != KERNEL_ELF64_SOURCE_STATUS_OK) {
         return abort_source(source_out, status);
     }
-    source->file = *file;
-    *file = 0;
+    if (file) { source->file = *file; *file = 0; }
     return KERNEL_ELF64_SOURCE_STATUS_OK;
 }
+
+enum kernel_elf64_source_status kernel_elf64_source_create(
+    struct kernel_heap *heap, struct kernel_open_file_description **file,
+    uint64_t page_size, uint16_t machine, struct kernel_elf64_source **source)
+{
+    if (!file || !*file || (kernel_open_file_mode(*file)&KERNEL_VFS_S_IFMT)!=KERNEL_VFS_S_IFREG)
+        return KERNEL_ELF64_SOURCE_STATUS_INVALID_ARGUMENT;
+    struct kernel_read_source reader={*file,kernel_open_file_size(*file),source_read_at};
+    return create_from_reader(heap,file,&reader,page_size,machine,source);
+}
+enum kernel_elf64_source_status kernel_elf64_source_create_reader(
+    struct kernel_heap *heap, const struct kernel_read_source *reader,
+    uint64_t page_size, uint16_t machine, struct kernel_elf64_source **source)
+{ return create_from_reader(heap,0,reader,page_size,machine,source); }
 
 enum kernel_elf64_source_status kernel_elf64_source_acquire(
     struct kernel_elf64_source *source)
@@ -800,7 +804,7 @@ enum kernel_elf64_source_status kernel_elf64_source_page(
     enum physical_page_status page_status;
 
     if (!source_valid(source) || source->state != SOURCE_LIVE ||
-        source->file == 0 || allocator == 0 || physical_address == 0 || shared == 0 ||
+        source->reader.read_at == 0 || allocator == 0 || physical_address == 0 || shared == 0 ||
         virtual_offset % source->page_size != 0U) {
         return KERNEL_ELF64_SOURCE_STATUS_INVALID_ARGUMENT;
     }
@@ -808,7 +812,7 @@ enum kernel_elf64_source_status kernel_elf64_source_page(
     if (run == 0) {
         return KERNEL_ELF64_SOURCE_STATUS_MALFORMED;
     }
-    if (run->kind == KERNEL_ELF64_SOURCE_RUN_FILE) {
+    if (run->kind == KERNEL_ELF64_SOURCE_RUN_FILE && source->file) {
         uint64_t file_offset;
         size_t valid_bytes;
         enum kernel_page_cache_status cache_status;
@@ -849,7 +853,8 @@ enum kernel_elf64_source_status kernel_elf64_source_page(
                             KERNEL_ELF64_SOURCE_STATUS_STATE);
     }
     zero_page(page, source->page_size);
-    if (run->kind == KERNEL_ELF64_SOURCE_RUN_COMPOSITE) {
+    if (run->kind == KERNEL_ELF64_SOURCE_RUN_COMPOSITE ||
+        (run->kind == KERNEL_ELF64_SOURCE_RUN_FILE && !source->file)) {
         uint16_t index;
         uint64_t page_end;
 
@@ -867,7 +872,6 @@ enum kernel_elf64_source_status kernel_elf64_source_page(
             uint64_t file_end;
             uint64_t copy_start;
             uint64_t copy_end;
-            size_t bytes_read = 0U;
 
             if (header->type != KERNEL_ELF64_PROGRAM_LOAD ||
                 header->file_size == 0U) {
@@ -883,13 +887,10 @@ enum kernel_elf64_source_status kernel_elf64_source_page(
             }
             if (header->offset > UINT64_MAX -
                                      (copy_start - header->virtual_address) ||
-                kernel_open_file_pread(
-                    source->file,
+                kernel_read_source_read_exact(&source->reader,
                     header->offset + (copy_start - header->virtual_address),
                     (unsigned char *)page + (copy_start - virtual_offset),
-                    (size_t)(copy_end - copy_start),
-                    &bytes_read) != 0 ||
-                bytes_read != (size_t)(copy_end - copy_start)) {
+                    (size_t)(copy_end - copy_start)) != 0) {
                 return discard_page(source,
                                     allocator,
                                     address,
@@ -905,9 +906,7 @@ enum kernel_elf64_source_status kernel_elf64_source_page(
 uint64_t kernel_elf64_source_file_size(
     const struct kernel_elf64_source *source)
 {
-    return source_valid(source) && source->file != 0
-               ? kernel_open_file_size(source->file)
-               : 0U;
+    return source_valid(source) ? source->reader.size : 0U;
 }
 
 struct kernel_open_file_description *kernel_elf64_source_file(
