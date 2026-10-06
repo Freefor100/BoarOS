@@ -719,6 +719,21 @@ enum kernel_syscall_status syscall_handle_newfstatat(
     return KERNEL_SYSCALL_STATUS_OK;
 }
 
+enum kernel_syscall_status syscall_handle_statx(struct kernel_task *caller,
+    const struct kernel_syscall_request *request,struct kernel_syscall_result *decoded)
+{
+    struct kernel_files *files;const struct kernel_fs_context *fs;struct kernel_mm *mm;
+    enum kernel_task_status status=kernel_task_files_borrow(caller,&files);
+    decoded->action=KERNEL_SYSCALL_ACTION_RETURN;
+    if(status==KERNEL_TASK_STATUS_RESOURCE_UNAVAILABLE) {decoded->value=-KERNEL_EBADF;return KERNEL_SYSCALL_STATUS_OK;}
+    if(status!=KERNEL_TASK_STATUS_OK || kernel_task_fs_context_borrow(caller,&fs)!=KERNEL_TASK_STATUS_OK ||
+       kernel_task_mm_borrow_mutable(caller,&mm)!=KERNEL_TASK_STATUS_OK ||
+       kernel_files_statx(files,fs,mm,(int32_t)request->arguments[0],request->arguments[1],
+                         (uint32_t)request->arguments[2],(uint32_t)request->arguments[3],request->arguments[4],
+                         &decoded->value)!=KERNEL_FILES_STATUS_OK) return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
+    return KERNEL_SYSCALL_STATUS_OK;
+}
+
 enum kernel_syscall_status syscall_handle_faccessat(
     struct kernel_task *caller,
     const struct kernel_syscall_request *request,

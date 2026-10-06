@@ -86,3 +86,8 @@ enum kernel_syscall_status kernel_syscall_dispatch(
 `getrandom(278)` 支持 GRND_NONBLOCK、GRND_RANDOM、GRND_INSECURE；未知标志或 RANDOM 与 INSECURE 同用返回 EINVAL。普通请求在可信 RNG 未就绪时等待，NONBLOCK 返回 EAGAIN，等待被信号打断按 SA_RESTART 选择重新等待或返回 EINTR；INSECURE 明确允许初始化前输出。长度最多 `0x7ffff000`，不在持有随机状态锁时执行用户复制。就绪后的 256 字节以内请求不因 pending signal 短返回；大请求按 256 字节分段，返回已复制进度，跨用户不可访问页同样保留已复制字节，首字节 fault 返回 EFAULT。核心与设备契约见[随机源](../learning/random-source.md)。
 
 RV64 `syslog(116)`交付完整klogctl 0–10；真实日志owner、游标、清空、fault和权限契约见[内核日志](kernel-log.md)。
+
+`statx(291)` 已接入通用 dispatch；参数按 Linux 的 int/unsigned 宽度截断后交给
+files 层，采用真实 `BASIC_STATS`，未实现的扩展字段不报告。LA 的 `clone(220)`
+用户参数顺序是 flags、stack、parent_tid、child_tid、TLS；trap 入口将最后两个
+重排后调用通用进程接口。真实父子 COW TID 写入由同 ELF 的 LA/Linux 对照保护。
