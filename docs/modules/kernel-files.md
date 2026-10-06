@@ -8,7 +8,7 @@
 
 - `kernel_files` 是进程可见的 fd 槽数组；槽保存 descriptor flags 和指向 open file description 的指针。
 - `kernel_open_file_description` 拥有一个 VFS file、当前 offset 和清理状态。分别打开同一路径会得到独立 description，因此 offset 互不影响。
-- pipe description 不拥有 VFS file，而是各自持有同一个 `struct kernel_pipe` 的读/写 endpoint；pipe 对象拥有连续 64 KiB 数据区、16 个固定页片段的有效范围、读写端引用和等待队列。
+- pipe description 不拥有 VFS file，而是各自持有同一个 `struct kernel_pipe` 的读/写 endpoint；pipe 对象拥有连续16个目标页的数据区（RV64KiB、LA256KiB）、16 个固定页片段的有效范围、读写端引用和等待队列。
 - socket description 同样不拥有 VFS file，而是独占 `struct kernel_socket`；fd 关闭、dup 覆盖、exec CLOEXEC 或退出导致最后一个真实 OFD 引用消失时，销毁 socket 并解绑 lwIP 回调。请求期间的 OFD pin 使 fd 复用不改变当前请求的 endpoint。普通 read/write 与向量路径使用 socket 数据队列，定位 I/O 返回 `ESPIPE`；`fstat` 报 `S_IFSOCK`。协议与等待契约见[网络模块](kernel-network.md)。
 - `kernel_fs_context` 持有 root 和 cwd 的独立路径引用；普通 fork 复制两份引用，`CLONE_FS` 共享 context record，exec 保留。`chdir/fchdir/getcwd` 操作共享活目录项；exec 从当前目录对象解析相对路径。
 
@@ -70,7 +70,7 @@ OFD pin 覆盖可能缺页睡眠的复制。`make test-record-lock-riscv` 用同
 
 ## `pipe2` 与 FIFO endpoint
 
-`kernel_files_pipe2()` 创建两个新的 open file description 和两个 fd 槽；它们共享一个 order-4、64 KiB 连续 ring buffer，但读端只增加 read-side 引用，写端只增加 write-side 引用。`O_CLOEXEC` 保存在两个 descriptor flag 中，`O_NONBLOCK` 保存在两个 OFD status 中；`F_SETFL` 可切换 `O_NONBLOCK`，并接受 64 位目标上 musl 每次带来的 `O_LARGEFILE` 兼容位而不改变该位。
+`kernel_files_pipe2()` 创建两个新的 open file description 和两个 fd 槽；它们共享一个 order-4、16个目标页的连续 ring buffer（RV64KiB、LA256KiB），但读端只增加 read-side 引用，写端只增加 write-side 引用。`O_CLOEXEC` 保存在两个 descriptor flag 中，`O_NONBLOCK` 保存在两个 OFD status 中；`F_SETFL` 可切换 `O_NONBLOCK`，并接受 64 位目标上 musl 每次带来的 `O_LARGEFILE` 兼容位而不改变该位。
 
 读端有数据时按 ring 顺序返回，空且仍有 writer 时：阻塞 fd 进入 interruptible wait，非阻塞 fd 返回 `-EAGAIN`。所有 writer 关闭后空读返回 EOF；写端没有 reader 时返回 `-EPIPE`，同时向当前 task 发送 SIGPIPE，因此有 handler 时先观察信号、无 handler 时按默认动作终止。写端空间不足时阻塞或返回 `-EAGAIN`；不超过 4096 字节的单次写在当前单 hart 实现中保持原子，较大写按可用空间推进。EOF/EPIPE 唤醒全部受影响 waiter；数据/空间变化也唤醒对端全部 waiter，被唤醒后重查条件，并可被未阻塞信号唤醒后返回 `-EINTR`/按 `SA_RESTART` 重启。
 
@@ -418,3 +418,15 @@ LA musl1.2.5 不提供旧 `fstat/newfstatat` syscall，而通过 statx 实现 li
 固定依据为 `references/linux` commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`
 的 `fs/stat.c`、`include/uapi/linux/stat.h`，以及固定 musl1.2.5 归档的
 `src/stat/fstatat.c` 和 `arch/loongarch64/bits/syscall.h.in`。
+
+
+## pipe 容量与目标页（2026-10-07）
+
+LA差分的无阻塞反例证明：原代码分配order4的16个目标页，却把capacity固定为
+64KiB，LA只使用其中四页；16页循环的既有共用案例因此提前EAGAIN或阻塞。
+capacity现在由16×目标页大小导出，匹配原有16槽/16页owner和固定Linux正常默认容量，
+没有新增物理分配。PIPE_BUF的4096字节原子写语义保持，文件块和用户传输长度也不改。
+`tests/workloads/pipe_geometry.c` 用真实nonblocking写满、EAGAIN、部分读取后环回、
+每页内容及关闭验证；同一LA ELF在Linux/BoarOS512MiB/1GiB均通过，
+BoarOS退出回到根页/堆/任务栈/BAR基线。入口为`make test-pipe-loongarch`，
+RV继续由files/userland的pipe、FIFO、poll、取消和引用测试保护。
