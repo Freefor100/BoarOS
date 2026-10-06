@@ -106,9 +106,9 @@ open file description 的 offset 只增加实际复制到用户空间的字节�
 
 RV64 syscall 71 用内核有界复制支持 regular/tmpfs 输入，输出可为 regular、pipe、
 stream 或 datagram socket。输入、输出各有 OFD pin，正常或信号取消均沿保存的
-syscall 栈展开。stream/file/pipe 使用请求暂存页；datagram 源暂存有效容量最多
-64 KiB，再接既有整包 request owner 和 charge 等待，不以普通 POLLOUT 猜整包
-能否容纳。此接口尚未采用文件页到设备的零拷贝。
+syscall 栈展开。stream/file/pipe 使用请求暂存页；datagram来源按固定Linux的最多16个目标页为一批（RV64KiB、LA256KiB），
+再接发送者整包request owner/内存等待。每批是一条datagram，页大小不改变
+用户指定长度或UDP最大payload；不以普通POLLOUT预留整包。此接口尚未采用文件页到设备的零拷贝。
 
 NULL offset 推进共享输入位置；显式 offset 只更新用户给定位置。两个 regular
 OFD 的位置锁按 rank/key 排序，同一 OFD 或 dup alias 只取一个锁、只推进一次。

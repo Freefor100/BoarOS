@@ -244,7 +244,8 @@ test-network-loongarch: kernel-la prepare-la-userland prepare-la-linux-platform 
 	python3 -B tests/network-loongarch.py --workload timer
 	python3 -B tests/network-loongarch.py --workload admission
 	python3 -B tests/network-loongarch.py --workload sendfile
-	python3 -B tests/network-loongarch.py --workload budget --only boaros
+	python3 -B tests/network-loongarch.py --workload budget
+	python3 -B tests/network-loongarch.py --workload unix_sender
 $(LA_BUILD)/net-failure-%.o: tests/loongarch/net_failures.c
 	$(LA_CC) $(LA_CPPFLAGS) $(LA_CFLAGS) -DNET_FAIL_CASE=$* -c $< -o $@
 $(LA_BUILD)/kernel-net-failure-%: $(LA_OBJECTS) $(LA_BUILD)/net-failure-%.o arch/loongarch/linker.ld
