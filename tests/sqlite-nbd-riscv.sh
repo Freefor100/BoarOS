@@ -30,8 +30,14 @@ if ! timeout -k 2s 90s "$qemu" -machine virt -bios default -kernel "$kernel" \
     tail -40 "$work/nbd.log" >&2
     exit 1
 fi
-if ! grep -qxF 'BoarOS: SQLite rollback smoke passed' "$work/boot.log" ||
-   ! grep -qE '^BoarOS: PID 1 exited status=0x2a pages=0x[1-9a-f][0-9a-f]* heap-live=0x0; shutting down$' "$work/boot.log"; then
+# 共用TTY将NL输出为CRLF；只还原这对字节，原串口与NBD请求日志仍完整保留。
+python3 - "$work/boot.log" "$work/boot.text" <<'PY'
+import sys
+from pathlib import Path
+Path(sys.argv[2]).write_bytes(Path(sys.argv[1]).read_bytes().replace(b'\r\n', b'\n'))
+PY
+if ! grep -qxF 'BoarOS: SQLite rollback smoke passed' "$work/boot.text" ||
+   ! grep -qE '^BoarOS: PID 1 exited status=0x2a pages=0x[1-9a-f][0-9a-f]* heap-live=0x0; shutting down$' "$work/boot.text"; then
     tail -80 "$work/boot.log" >&2
     exit 1
 fi

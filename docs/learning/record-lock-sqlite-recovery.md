@@ -214,3 +214,30 @@ python3 -B tests/io-budget-experiment.py build --profiles ra8-wb8 --jobs 2
 python3 -B tests/sqlite-recovery-riscv.py --kernel build/io-budget/kernels/ra8-wb8/kernel-rv --matrix full --journal delete
 python3 -B tests/sqlite-recovery-riscv.py --kernel build/io-budget/kernels/ra8-wb8/kernel-rv --matrix full --journal wal
 ```
+
+## LA 原 SQLite 单核交付（2026-10-07）
+
+固定输入为 `references/sqlite/sqlite-amalgamation-3530400.zip`，SQLite3.53.4，
+SHA-256 `1e71ddf93849c6a6ecf58b827c0692073d2dd7ee40196158068f7b29f422e87d`。
+原 amalgamation 与 shell.c 使用LP64D musl1.2.5，内核继续整数ABI；每个ELF在
+Linux `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 与BoarOS共用，默认16KiB页。
+512MiB/1GiB的DELETE、热日志恢复、多进程竞争、原静态/动态CLI及两次内容重启，
+加WAL多进程与重启已全部通过真实wait42和根生命周期门禁。派生QEMU身份见LA模块。
+这不把RV NBD断电恢复矩阵自动记为LA恢复覆盖；LA本轮验证实际正常关机独立重启。
+
+CLI只检查integrity_check不能发现合法但丢失的行。源自本仓库的launcher增加SQL
+读取已提交行及spill计数/回滚内容，两个原CLI均须返回完整精确内容。RV固定Linux
+CONFIG_BLK_DEV_INITRD=n，新增共享runner不能依照LA使用initrd；实际失败的
+unknown-block(0,0)启动保留后，改为已有根盘上的Linux PID1 supervisor，fork/exec
+原/init、wait42、syncfs、关机。未调整固定Linux配置或原SQLite来获取通过。
+
+最终RV NBD首次执行的SQLite程序实际通过、退出42、owner归还，backend含861次
+WRITE和379次FLUSH；shell的grep -qx却不接受应用TTY行末CRLF。只还原终端CRLF
+后重验完整NBD与恢复矩阵，原串口和设备请求保留；这种runner失败不能归为设备I/O
+或SQLite事务失败。
+
+```sh
+make test-sqlite-rollback-loongarch test-sqlite-wal-loongarch
+python3 -B tests/sqlite-rollback.py --arch riscv
+make test-sqlite-nbd-riscv test-sqlite-recovery-matrix-riscv test-sqlite-wal-recovery-matrix-riscv
+```

@@ -20,7 +20,9 @@ static void run(const char *program)
               " PRAGMA synchronous;"
               " SELECT sqlite_version(),"
               "sqlite_compileoption_used('THREADSAFE=1');"
-              " PRAGMA integrity_check;",
+              " PRAGMA integrity_check;"
+              " SELECT group_concat(value) FROM (SELECT value FROM items ORDER BY id);"
+              " SELECT count(*),sum(value LIKE '1%') FROM spill;",
               (char *)0);
         _exit(2);
     }
@@ -36,7 +38,7 @@ static void run(const char *program)
     close(output[0]);
     actual[used] = 0;
     static const char expected[] =
-        "delete\nnormal\n0\n3\n3.53.4|1\nok\n";
+        "delete\nnormal\n0\n3\n3.53.4|1\nok\ncommitted,parent,child\n24|0\n";
     int status = 0;
     if (waitpid(child, &status, 0) != child ||
         !WIFEXITED(status) || WEXITSTATUS(status) != 0 ||
