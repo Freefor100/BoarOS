@@ -69,4 +69,20 @@ PATH 没有 LA QEMU，`make prepare-la-tools` 从固定 QEMU v11.1.0 源码构�
 
 `make kernel-la` 使用LP64S、soft-float、禁用LSX/LASX，用户探针独立链接为
 `build/loongarch/user-probe`。`make test-loongarch` 在512MiB/1GiB下对照同一个ELF。
-本轮工具和整数用户态通过不代表浮点ABI、实板或LA libc已验收。
+首阶段结果不代表浮点ABI、实板或完整LA libc；第二阶段静态libc范围见下文。
+
+
+## LA 整数静态 libc 工具
+
+`make prepare-la-userland` 从固定 GCC15.1.0 archive 构建
+`build/loongarch/gcc-sf/root/bin/loongarch64-unknown-linux-gnusf-gcc`，包括LP64S
+CRT/libgcc，匹配 `build/loongarch/musl-root` 的静态 musl1.2.5。系统工具仍用于
+整数内核、raw探针和固定Linux构建；系统LP64D runtime不能拿来链接LP64S libc。
+实际 musl/BusyBox 编译以 REALGCC 选择 gnusf driver，关闭FPU/LSX/LASX。
+源码归档、宿主 C/C++、binutils、配置和输出身份保存在缓存中；已有身份变化时
+拒绝混用，复用缓存会核对 ELF/libc/libgcc/CRT哈希。
+
+BusyBox 原commit/完整配置和固定v6.6 LA UAPI未改动，`make test-root-loongarch`
+运行同ELF的固定Linux/BoarOS PCI/ext4验收。GCC构建需宿主g++、GMP/MPFR/MPC开发
+依赖，首次工具构建可耗时数分钟；后续保留源码/构建/安装缓存。原程序范围为模块
+列出的七个applet，完整动态libc/TLS/线程/信号与FPU仍独立验收。

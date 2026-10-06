@@ -45,3 +45,6 @@ file	alpine/v3.22/main/riscv64/zstd-libs-1.5.7-r0.apk	https://dl-cdn.alpinelinux
 file	alpine/v3.22/main/riscv64/make-4.4.1-r3.apk	https://dl-cdn.alpinelinux.org/alpine/v3.22/main/riscv64/make-4.4.1-r3.apk	-	e57d545d8427629cd7f611b3bda0088b4c67da8d1a6a4438c889f72b1c9e60b4
 # Lua 5.4.3, MIT; official release, checked 2026-10-03.
 file	lua/lua-5.4.3.tar.gz	https://www.lua.org/ftp/lua-5.4.3.tar.gz	-	f8612276169e3bfcbcfb8f226195bfc6e466fe13042f1076cbde92b7ec96bbfb
+
+# GCC15.1.0 official release source for matching LA LP64S runtime; accessed 2026-10-06.
+file	gcc/gcc-15.1.0.tar.xz	https://gcc.gnu.org/pub/gcc/releases/gcc-15.1.0/gcc-15.1.0.tar.xz	-	e2b09ec21660f01fecffb715e0120265216943f038d0e48a9868713e54f06cea
