@@ -1,9 +1,9 @@
 #include <kernel/block.h>
 #include <kernel/errno.h>
 #ifdef __riscv
-#include <arch/riscv/context.h>
-static uintptr_t registry_lock(void) { return riscv_interrupt_save(); }
-static void registry_unlock(uintptr_t state) { riscv_interrupt_restore(state); }
+#include <arch/context.h>
+static uintptr_t registry_lock(void) { return arch_interrupt_save(); }
+static void registry_unlock(uintptr_t state) { arch_interrupt_restore(state); }
 #else
 /* Host block models share the same registry contract without RISC-V CSRs. */
 static unsigned char registry_busy;

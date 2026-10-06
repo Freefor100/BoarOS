@@ -2,7 +2,7 @@
 #include "char_device_internal.h"
 #include "files/private.h"
 #include "vfs_objects.h"
-#include <arch/riscv/context.h>
+#include <arch/context.h>
 #include <kernel/devpts.h>
 #include <kernel/errno.h>
 #include <kernel/heap.h>
@@ -55,11 +55,11 @@ static unsigned global_pairs;
 
 static void request_work(struct pty_mount *mount)
 {
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     /* 本轮自身的kick不能把无进展FIFO变成持续忙轮询。 */
     if (!mount->servicing) mount->requested = 1;
     (void)kernel_wait_queue_wake_all(&mount->work);
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
 }
 static void pair_get(struct pty_pair *pair)
 {
@@ -190,13 +190,13 @@ static size_t progress_pair(struct pty_pair *pair)
 static void progress(void *owner)
 {
     struct pty_pair *pair = ((struct pty_end *)owner)->pair;
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     uint8_t servicing = pair->mount->servicing;
     pair->mount->servicing = 1;
     size_t advanced = progress_pair(pair); /* read/poll在检查HUP前交付已接受的尾部。 */
     pair->mount->servicing = servicing;
     if (advanced) request_work(pair->mount);
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
 }
 static int copy_int(struct kernel_mm *mm, uint64_t address, int32_t *value, int output)
 {
@@ -224,9 +224,9 @@ static int ioctl(void *owner, struct kernel_task *caller, struct kernel_files *f
     case UINT64_C(0x40045431): { /* TIOCSPTLCK */
         int result = copy_int(mm, argument, &value, 0);
         if (!result) {
-            uintptr_t irq = riscv_interrupt_save();
+            uintptr_t irq = arch_interrupt_save();
             pair->slave_locked = value != 0;
-            riscv_interrupt_restore(irq);
+            arch_interrupt_restore(irq);
         }
         return result;
     }
@@ -255,20 +255,20 @@ static const struct kernel_tty_transport transport = {
 static void release_path(struct kernel_vfs_path **owner)
 {
     /* 通用path引用/弱registry沿单hart发布契约操作；worker不能在SIE开启时借用它。 */
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     if (*owner && kernel_vfs_path_release(owner)) __builtin_trap();
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
 }
 static int retire_pair(struct pty_pair *pair)
 {
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     if (pair->creating || !pair->master_closed || pair->owners != 1 || pair->busy) {
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
         return 0;
     }
     for (unsigned side = 0; side < 2; side++) {
         struct kernel_tty *tty = pair->ends[side].tty;
-        if (tty && !kernel_tty_base_only(tty)) { riscv_interrupt_restore(irq); return 0; }
+        if (tty && !kernel_tty_base_only(tty)) { arch_interrupt_restore(irq); return 0; }
     }
     struct pty_mount *mount = pair->mount;
     struct pty_pair **link = &mount->pairs;
@@ -291,16 +291,16 @@ static int retire_pair(struct pty_pair *pair)
         if (pair->ends[side].tty && kernel_tty_destroy(&pair->ends[side].tty)) __builtin_trap();
     if (pair->entry) kernel_devpts_retire(pair->entry);
     mount->servicing = 0;
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     release_path(&pair->slave_path);
     release_path(&pair->root);
     if (pair->entry) kernel_devpts_entry_release(&pair->entry);
-    irq = riscv_interrupt_save();
+    irq = arch_interrupt_save();
     if (pair->owners != 1) __builtin_trap();
     pair->owners = 0; /* 消费本轮临时owner；不再向已摘链对象发送kick。 */
     global_pairs--;
     (void)kernel_wait_queue_wake_all(&mount->work);
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     if (kernel_heap_release(mount->heap, pair) != KERNEL_HEAP_STATUS_OK) __builtin_trap();
     return 1;
 }
@@ -308,21 +308,21 @@ static void worker(void *argument)
 {
     struct pty_mount *mount = argument;
     for (;;) {
-        uintptr_t irq = riscv_interrupt_save();
+        uintptr_t irq = arch_interrupt_save();
         while (!mount->requested && !mount->stopping) {
             enum kernel_wait_wake_reason reason;
             if (kernel_scheduler_block_current(&mount->work, 0, 1, &reason) !=
                 KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
         }
-        if (mount->stopping) { riscv_interrupt_restore(irq); return; }
+        if (mount->stopping) { arch_interrupt_restore(irq); return; }
         mount->requested = 0;
         struct pty_pair *pair = mount->cursor ? mount->cursor : mount->pairs;
         unsigned count = 0;
         for (struct pty_pair *p = mount->pairs; p; p = p->next) count++;
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
         size_t advanced = 0;
         while (count-- && pair) {
-            irq = riscv_interrupt_save();
+            irq = arch_interrupt_save();
             struct pty_pair *next = pair->next ? pair->next : mount->pairs;
             if (next == pair) next = 0;
             pair_get(pair); /* SIE恢复和路径释放跨等待前先取得独立owner。 */
@@ -333,25 +333,25 @@ static void worker(void *argument)
             }
             advanced += progress_pair(pair);
             mount->servicing = 0;
-            riscv_interrupt_restore(irq);
+            arch_interrupt_restore(irq);
             int retired = retire_pair(pair);
             advanced += retired;
             if (!retired) {
-                irq = riscv_interrupt_save();
+                irq = arch_interrupt_save();
                 if (!pair->owners) __builtin_trap();
                 pair->owners--; /* 本轮借用归还不产生新的工作事件。 */
-                riscv_interrupt_restore(irq);
+                arch_interrupt_restore(irq);
             }
             pair = next;
         }
-        irq = riscv_interrupt_save();
+        irq = arch_interrupt_save();
         mount->cursor = pair ? pair : mount->pairs;
         if (advanced) mount->requested = 1;
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
         /* 每轮每方向至多256字节，轮后让出CPU；无进展必须等待真实新事件。 */
-        irq = riscv_interrupt_save();
+        irq = arch_interrupt_save();
         if (kernel_scheduler_yield_current() != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
     }
 }
 int kernel_pty_mount_start(struct kernel_vfs_mount *mount)
@@ -379,13 +379,13 @@ int kernel_pty_mount_stop(struct kernel_vfs_mount *mount)
     if (!kernel_devpts_is_mount(mount)) return -KERNEL_EINVAL;
     struct pty_mount *owner = kernel_devpts_mount_private(mount);
     if (!owner) return 0;
-    uintptr_t irq = riscv_interrupt_save();
-    if (owner->pairs) { riscv_interrupt_restore(irq); return -KERNEL_EBUSY; }
+    uintptr_t irq = arch_interrupt_save();
+    if (owner->pairs) { arch_interrupt_restore(irq); return -KERNEL_EBUSY; }
     owner->stopping = 1;
     (void)kernel_wait_queue_wake_all(&owner->work);
     kernel_thread_join(&owner->worker);
     kernel_devpts_mount_set_private(mount, 0);
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     if (kernel_heap_release(owner->heap, owner) != KERNEL_HEAP_STATUS_OK) __builtin_trap();
     return 0;
 }
@@ -396,7 +396,7 @@ int kernel_pty_open_ptmx(struct kernel_vfs_mount *mount, struct kernel_heap *hea
     if (!kernel_devpts_is_mount(mount) || !heap || !instance || !device) return -KERNEL_EINVAL;
     struct pty_mount *owner = kernel_devpts_mount_private(mount);
     if (!owner || owner->stopping) return -KERNEL_EIO;
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     for (;;) {
         int reclaimable = 0;
         for (struct pty_pair *p = owner->pairs; p; p = p->next)
@@ -406,7 +406,7 @@ int kernel_pty_open_ptmx(struct kernel_vfs_mount *mount, struct kernel_heap *hea
         /* 最后close已归还资格但worker尚未回收；不能把这种暂态冒充配额耗尽。 */
         if (caller && kernel_signal_has_pending(caller)) {
             kernel_signal_note_syscall_restart(caller);
-            riscv_interrupt_restore(irq);
+            arch_interrupt_restore(irq);
             return -KERNEL_ERESTARTSYS;
         }
         request_work(owner);
@@ -415,26 +415,26 @@ int kernel_pty_open_ptmx(struct kernel_vfs_mount *mount, struct kernel_heap *hea
             __builtin_trap();
         if (reason == KERNEL_WAIT_SIGNALLED) {
             kernel_signal_note_syscall_restart(caller);
-            riscv_interrupt_restore(irq);
+            arch_interrupt_restore(irq);
             return -KERNEL_ERESTARTSYS;
         }
     }
-    if (global_pairs == PTY_GLOBAL_LIMIT) { riscv_interrupt_restore(irq); return -KERNEL_ENOSPC; }
+    if (global_pairs == PTY_GLOBAL_LIMIT) { arch_interrupt_restore(irq); return -KERNEL_ENOSPC; }
     global_pairs++;
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     struct pty_pair *pair = 0;
     enum kernel_heap_status allocated = kernel_heap_allocate_zeroed(owner->heap, 1,
         sizeof(*pair), (void **)&pair);
     if (allocated != KERNEL_HEAP_STATUS_OK) {
-        irq = riscv_interrupt_save(); global_pairs--; riscv_interrupt_restore(irq);
+        irq = arch_interrupt_save(); global_pairs--; arch_interrupt_restore(irq);
         return allocated == KERNEL_HEAP_STATUS_EMPTY ? -KERNEL_ENOMEM : -KERNEL_EIO;
     }
     pair->mount = owner;
     pair->creating = pair->slave_locked = 1;
     pair->owners = 1; /* 构造期间的临时owner；失败也交worker回收。 */
-    irq = riscv_interrupt_save();
+    irq = arch_interrupt_save();
     pair->next = owner->pairs; owner->pairs = pair;
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     int result = 0;
     for (unsigned side = 0; side < 2 && !result; side++) {
         pair->ends[side].pair = pair;
@@ -459,14 +459,14 @@ int kernel_pty_open_ptmx(struct kernel_vfs_mount *mount, struct kernel_heap *hea
         kernel_tty_configure_identity(pair->ends[PTY_SLAVE].tty, UINT64_C(0x8800) + number, 0);
         result = kernel_tty_open(pair->ends[PTY_MASTER].tty, heap, caller, flags, 0, instance);
     }
-    irq = riscv_interrupt_save();
+    irq = arch_interrupt_save();
     pair->creating = 0;
     if (result) {
         pair->master_closed = pair->hangup_pending = 1;
         if (pair->entry) kernel_devpts_unpublish(pair->entry);
     } else *device = kernel_tty_device_template();
     pair_put(pair);
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     return result;
 }
 int kernel_pty_open(const struct kernel_vfs_file *file, struct kernel_heap *heap,
@@ -480,18 +480,18 @@ int kernel_pty_open(const struct kernel_vfs_file *file, struct kernel_heap *heap
         return kernel_pty_open_ptmx(mount, heap, caller, flags, instance, device);
     struct kernel_devpts_entry *entry = kernel_devpts_file_entry(file);
     if (!entry) return -KERNEL_ENODEV;
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     struct pty_pair *pair = kernel_devpts_entry_binding(entry);
     if (!pair || pair->creating || pair->master_closed || pair->slave_locked) {
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
         return -KERNEL_EIO;
     }
     pair_get(pair);
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     int result = kernel_tty_open(pair->ends[PTY_SLAVE].tty, heap, caller, flags, 1, instance);
-    irq = riscv_interrupt_save();
+    irq = arch_interrupt_save();
     if (!result) *device = kernel_tty_device_template();
     pair_put(pair);
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     return result;
 }

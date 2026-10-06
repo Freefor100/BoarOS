@@ -5,7 +5,7 @@
 #include "char_device_internal.h"
 #include "files/epoll_internal.h"
 
-#include <arch/riscv/context.h>
+#include <arch/context.h>
 #include <kernel/console.h>
 #include <kernel/errno.h>
 #include <kernel/heap.h>
@@ -37,9 +37,9 @@ static void reset_read_prediction(struct kernel_open_file_description *file)
 void kernel_open_file_read_begin(struct kernel_open_file_description *file, uint64_t offset)
 {
     if (!open_file_live(file)) return;
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     if (file->read_sequential && file->read_end != offset) reset_read_prediction(file);
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
 }
 void kernel_open_file_read_progress(struct kernel_open_file_description *file,
     uint64_t offset, size_t count)
@@ -47,14 +47,14 @@ void kernel_open_file_read_progress(struct kernel_open_file_description *file,
     if (!count || !open_file_live(file) || file->kind != KERNEL_OPEN_FILE_KIND_REGULAR ||
         kernel_open_file_memory_backed(file) || kernel_vfs_file_generated(&file->file)) return;
     if (offset > UINT64_MAX - count) __builtin_trap();
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     int sequential = file->read_sequential && file->read_end == offset;
     if (!sequential) reset_read_prediction(file);
     file->read_end = offset + count; file->read_sequential = 1;
     if (sequential && !(file->read_end & BOAROS_PAGE_MASK))
         file->readahead_cookie = kernel_page_cache_readahead(kernel_vfs_file_page_cache(&file->file),
             kernel_vfs_file_node(&file->file), file->read_end >> BOAROS_PAGE_SHIFT, file->readahead_cookie);
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
 }
 #endif
 
@@ -429,10 +429,10 @@ enum kernel_open_file_status kernel_open_file_create_socket(
     file->file.mode = KERNEL_VFS_S_IFSOCK | UINT32_C(0000600);
     file->open_flags = flags;
     file->socket = socket;
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     if (!next_socket_proc_identity) __builtin_trap();
     file->proc_identity = next_socket_proc_identity++;
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     *owner = file;
     return KERNEL_OPEN_FILE_STATUS_OK;
 }
@@ -859,9 +859,9 @@ static enum kernel_page_cache_status memory_page(struct kernel_open_file_descrip
 void kernel_open_file_memory_modified(struct kernel_open_file_description *file)
 {
     if (!kernel_open_file_memory_backed(file)) __builtin_trap();
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     kernel_tmpfs_memory_modified(&file->file);
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
 }
 
 enum kernel_page_cache_status kernel_open_file_get_page_for_fault(

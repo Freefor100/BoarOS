@@ -8,7 +8,7 @@
 #include <kernel/mm.h>
 #include <kernel/uaccess.h>
 #include <kernel/time.h>
-#include <arch/riscv/context.h>
+#include <arch/context.h>
 
 #include <stddef.h>
 #include <stdint.h>
@@ -73,7 +73,7 @@ enum kernel_shm_status kernel_shm_init(
     if (heap == 0 || allocator == 0) {
         return KERNEL_SHM_STATUS_INVALID_ARGUMENT;
     }
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     shm_table.heap = heap;
     shm_table.allocator = allocator;
     if (!shm_table.initialized) {
@@ -90,7 +90,7 @@ enum kernel_shm_status kernel_shm_init(
         }
         shm_table.initialized = 1;
     }
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     return KERNEL_SHM_STATUS_OK;
 }
 
@@ -102,9 +102,9 @@ int kernel_shm_get(struct kernel_task *caller, int32_t key, uint64_t size,
     }
     int32_t caller_pid = current_tgid(caller);
 
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     if (!shm_table.initialized || shm_table.heap == 0 || shm_table.allocator == 0) {
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
         return -KERNEL_ENOSPC;
     }
 
@@ -114,27 +114,27 @@ int kernel_shm_get(struct kernel_task *caller, int32_t key, uint64_t size,
             if (seg->active && !seg->marked_for_deletion && seg->key == key) {
                 if ((shmflg & (KERNEL_IPC_CREAT | KERNEL_IPC_EXCL)) ==
                     (KERNEL_IPC_CREAT | KERNEL_IPC_EXCL)) {
-                    riscv_interrupt_restore(irq);
+                    arch_interrupt_restore(irq);
                     return -KERNEL_EEXIST;
                 }
                 if (size > seg->size) {
-                    riscv_interrupt_restore(irq);
+                    arch_interrupt_restore(irq);
                     return -KERNEL_EINVAL;
                 }
                 *out_shmid = seg->shmid;
-                riscv_interrupt_restore(irq);
+                arch_interrupt_restore(irq);
                 return 0;
             }
         }
         if ((shmflg & KERNEL_IPC_CREAT) == 0) {
-            riscv_interrupt_restore(irq);
+            arch_interrupt_restore(irq);
             return -KERNEL_ENOENT;
         }
     }
 
     /* 已有 key 的 size=0 是查找；创建下限只约束新段。 */
     if (size < KERNEL_SHMMIN || size > KERNEL_SHMMAX) {
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
         return -KERNEL_EINVAL;
     }
     uint64_t aligned_size = (size + BOAROS_PAGE_SIZE - 1U) & ~BOAROS_PAGE_MASK;
@@ -148,7 +148,7 @@ int kernel_shm_get(struct kernel_task *caller, int32_t key, uint64_t size,
         }
     }
     if (slot_idx < 0) {
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
         return -KERNEL_ENOSPC;
     }
 
@@ -157,7 +157,7 @@ int kernel_shm_get(struct kernel_task *caller, int32_t key, uint64_t size,
     enum kernel_memory_object_status mem_status =
         kernel_memory_object_create(shm_table.heap, shm_table.allocator, &mem);
     if (mem_status != KERNEL_MEMORY_OBJECT_OK) {
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
         return mem_status == KERNEL_MEMORY_OBJECT_NO_MEMORY ? -KERNEL_ENOMEM
                                                             : -KERNEL_ENOSPC;
     }
@@ -184,7 +184,7 @@ int kernel_shm_get(struct kernel_task *caller, int32_t key, uint64_t size,
     new_seg->active = 1;
 
     *out_shmid = shmid;
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     return 0;
 }
 
@@ -199,18 +199,18 @@ int kernel_shm_at_mm(struct kernel_mm *mm, int32_t caller_pid, int32_t shmid, ui
     }
     uint32_t slot_idx = (uint32_t)shmid % KERNEL_SHMMNI;
 
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     if (!shm_table.initialized) {
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
         return -KERNEL_EINVAL;
     }
     struct kernel_shm_segment *seg = &shm_table.segments[slot_idx];
     if (!seg->active || seg->shmid != shmid) {
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
         return -KERNEL_EINVAL;
     }
     if (seg->marked_for_deletion) {
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
         return -KERNEL_EIDRM;
     }
 
@@ -227,7 +227,7 @@ int kernel_shm_at_mm(struct kernel_mm *mm, int32_t caller_pid, int32_t shmid, ui
         mm, seg, shmaddr, permissions, (uint32_t)shmflg, &attached_addr);
 
     if (status != KERNEL_MM_STATUS_OK) {
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
         if (status == KERNEL_MM_STATUS_CONFLICT) {
             return -KERNEL_EINVAL;
         }
@@ -241,7 +241,7 @@ int kernel_shm_at_mm(struct kernel_mm *mm, int32_t caller_pid, int32_t shmid, ui
     seg->atime = current_time_seconds();
     *out_attached_addr = attached_addr;
 
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     return 0;
 }
 
@@ -292,13 +292,13 @@ enum kernel_shm_status kernel_shm_attachment_create(
     struct kernel_shm_attachment **owner)
 {
     struct kernel_shm_attachment *attachment = 0;
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     if (!owner || *owner || !segment || !segment->active || !segment->memory ||
         start >= end || segment->attachments == UINT32_MAX) __builtin_trap();
     enum kernel_heap_status status = kernel_heap_allocate_zeroed(
         shm_table.heap, 1, sizeof(*attachment), (void **)&attachment);
     if (status != KERNEL_HEAP_STATUS_OK) {
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
         if (status != KERNEL_HEAP_STATUS_EMPTY) __builtin_trap();
         return KERNEL_SHM_STATUS_NO_MEMORY;
     }
@@ -311,23 +311,23 @@ enum kernel_shm_status kernel_shm_attachment_create(
     /* 预备 owner 也保住槽身份，但不伪增用户可见 nattch。 */
     segment->attachments++;
     *owner = attachment;
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     return KERNEL_SHM_STATUS_OK;
 }
 
 void kernel_shm_attachment_acquire(struct kernel_shm_attachment *attachment)
 {
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     attachment_valid(attachment);
     if (attachment->references == UINT32_MAX) __builtin_trap();
     attachment->references++;
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
 }
 
 void kernel_shm_attachment_release(struct kernel_shm_attachment **owner)
 {
     if (!owner || !*owner) return;
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     struct kernel_shm_attachment *attachment = *owner;
     attachment_valid(attachment);
     *owner = 0;
@@ -340,24 +340,24 @@ void kernel_shm_attachment_release(struct kernel_shm_attachment **owner)
         if (!segment->nattch && !segment->attachments && segment->marked_for_deletion)
             kernel_shm_destroy_segment_locked(segment);
     }
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
 }
 
 void kernel_shm_attachment_open(struct kernel_shm_attachment *attachment)
 {
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     kernel_shm_attachment_acquire(attachment);
     struct kernel_shm_segment *segment = attachment->segment;
     if (segment->nattch == UINT64_MAX) __builtin_trap();
     segment->nattch++;
     segment->atime = current_time_seconds();
     segment->lpid = current_tgid(0);
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
 }
 
 void kernel_shm_attachment_close(struct kernel_shm_attachment *attachment)
 {
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     attachment_valid(attachment);
     struct kernel_shm_segment *segment = attachment->segment;
     if (!segment->nattch) __builtin_trap();
@@ -365,7 +365,7 @@ void kernel_shm_attachment_close(struct kernel_shm_attachment *attachment)
     segment->dtime = current_time_seconds();
     segment->lpid = current_tgid(0);
     kernel_shm_attachment_release(&attachment);
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
 }
 
 int kernel_shm_ctl_mm(struct kernel_mm *mm, int32_t shmid, int32_t cmd,
@@ -376,9 +376,9 @@ int kernel_shm_ctl_mm(struct kernel_mm *mm, int32_t shmid, int32_t cmd,
     }
     int pure_cmd = cmd & ~KERNEL_IPC_64;
 
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     if (!shm_table.initialized) {
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
         return -KERNEL_EINVAL;
     }
 
@@ -390,7 +390,7 @@ int kernel_shm_ctl_mm(struct kernel_mm *mm, int32_t shmid, int32_t cmd,
             .shmseg = KERNEL_SHMMNI,
             .shmall = KERNEL_SHMALL,
         };
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
 
         if (mm != 0) {
             size_t copied = 0;
@@ -407,13 +407,13 @@ int kernel_shm_ctl_mm(struct kernel_mm *mm, int32_t shmid, int32_t cmd,
     }
 
     if (shmid < 0) {
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
         return -KERNEL_EINVAL;
     }
     uint32_t slot_idx = (uint32_t)shmid % KERNEL_SHMMNI;
     struct kernel_shm_segment *seg = &shm_table.segments[slot_idx];
     if (!seg->active || seg->shmid != shmid) {
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
         return -KERNEL_EINVAL;
     }
 
@@ -426,7 +426,7 @@ int kernel_shm_ctl_mm(struct kernel_mm *mm, int32_t shmid, int32_t cmd,
             seg->ctime = current_time_seconds();
         }
         *out_result = 0;
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
         return 0;
     }
     case KERNEL_IPC_STAT: {
@@ -445,7 +445,7 @@ int kernel_shm_ctl_mm(struct kernel_mm *mm, int32_t shmid, int32_t cmd,
         ds.shm_cpid = seg->cpid;
         ds.shm_lpid = seg->lpid;
         ds.shm_nattch = seg->nattch;
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
 
         if (mm != 0) {
             size_t copied = 0;
@@ -462,11 +462,11 @@ int kernel_shm_ctl_mm(struct kernel_mm *mm, int32_t shmid, int32_t cmd,
     }
     case KERNEL_IPC_SET: {
         if (seg->marked_for_deletion) {
-            riscv_interrupt_restore(irq);
+            arch_interrupt_restore(irq);
             return -KERNEL_EIDRM;
         }
         struct kernel_shmid64_ds ds;
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
         if (mm != 0) {
             size_t copied = 0;
             if (kernel_copy_from_user(mm, &ds, user_buf, sizeof(ds), &copied) !=
@@ -477,9 +477,9 @@ int kernel_shm_ctl_mm(struct kernel_mm *mm, int32_t shmid, int32_t cmd,
             if (user_buf == 0) return -KERNEL_EFAULT;
             ds = *(const struct kernel_shmid64_ds *)(uintptr_t)user_buf;
         }
-        irq = riscv_interrupt_save();
+        irq = arch_interrupt_save();
         if (!seg->active || seg->shmid != shmid) {
-            riscv_interrupt_restore(irq);
+            arch_interrupt_restore(irq);
             return -KERNEL_EINVAL;
         }
         seg->mode = (uint32_t)(ds.shm_perm.mode & 0777);
@@ -487,11 +487,11 @@ int kernel_shm_ctl_mm(struct kernel_mm *mm, int32_t shmid, int32_t cmd,
         seg->gid = ds.shm_perm.gid;
         seg->ctime = current_time_seconds();
         *out_result = 0;
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
         return 0;
     }
     default:
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
         return -KERNEL_EINVAL;
     }
 }

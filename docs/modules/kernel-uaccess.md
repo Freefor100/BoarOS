@@ -4,7 +4,7 @@
 
 ## 接口与职责
 
-公共声明位于 `include/kernel/uaccess.h`，当前 RISC-V 实现在 `arch/riscv/uaccess.c`：
+公共声明位于 `include/kernel/uaccess.h`，共享实现在 `mm/uaccess.c`，用户地址上界由 `include/arch/mmu.h` 绑定：
 
 ```c
 enum kernel_uaccess_status kernel_copy_to_user(

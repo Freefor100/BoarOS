@@ -1,7 +1,7 @@
 #include <kernel/socket.h>
 #include "../fs/uaccess_iov_internal.h"
 
-#include <arch/riscv/context.h>
+#include <arch/context.h>
 #include <kernel/errno.h>
 #include <kernel/heap.h>
 #include <kernel/mm.h>
@@ -165,7 +165,7 @@ static struct kernel_io_context *protocol_owner;
 
 uintptr_t kernel_socket_protocol_enter(void)
 {
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     struct kernel_io_context *owner = kernel_io_context_current();
     if (protocol_depth && protocol_owner != owner) __builtin_trap();
     if (!protocol_depth) {
@@ -185,7 +185,7 @@ void kernel_socket_protocol_leave(uintptr_t irq)
         protocol_owner->allocation_depth--;
         protocol_owner = 0;
     }
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
 }
 static void socket_pbuf_free(struct pbuf *payload)
 {
@@ -1366,7 +1366,7 @@ static int socket_write_datagram_source(struct kernel_open_file_description **pi
         result = error == ERR_OK ? (int)count : lwip_error(error);
         goto out;
     }
-    uintptr_t saved = riscv_interrupt_save();
+    uintptr_t saved = arch_interrupt_save();
     uint32_t charge = count ? (uint32_t)count : 1U;
     uint64_t deadline = 0;
     if (request.socket->send_timeout_ns) {
@@ -1406,7 +1406,7 @@ static int socket_write_datagram_source(struct kernel_open_file_description **pi
             break;
         }
     }
-    riscv_interrupt_restore(saved);
+    arch_interrupt_restore(saved);
 out:
     clear_write_request(&request);
     *pin_owner = request.pin;

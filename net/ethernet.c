@@ -3,7 +3,7 @@
 #include <kernel/errno.h>
 #include <kernel/cost.h>
 #include <kernel/console.h>
-#include <arch/riscv/context.h>
+#include <arch/context.h>
 #include <arch/riscv/direct_map.h>
 #include <arch/riscv/memory_layout.h>
 #include <arch/riscv/timer.h>
@@ -132,15 +132,15 @@ static void timer_worker(void *context)
 {
     struct kernel_network *n = context;
     for (;;) {
-        uintptr_t irq = riscv_interrupt_save();
-        if (n->device.stopping) { riscv_interrupt_restore(irq); return; }
+        uintptr_t irq = arch_interrupt_save();
+        if (n->device.stopping) { arch_interrupt_restore(irq); return; }
         struct kernel_socket_service_result service = kernel_socket_service_pending(
             (struct kernel_socket_service_budget){8, 8, 1});
         if (service.runnable || kernel_socket_work_pending()) {
-            riscv_interrupt_restore(irq);
-            irq = riscv_interrupt_save();
+            arch_interrupt_restore(irq);
+            irq = arch_interrupt_save();
             if (kernel_scheduler_yield_current() != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
-            riscv_interrupt_restore(irq); continue;
+            arch_interrupt_restore(irq); continue;
         }
         n->deadline = service.next_deadline;
         uint64_t timeout = riscv_time_read() + 5 * n->device.frequency;
@@ -148,7 +148,7 @@ static void timer_worker(void *context)
         COST_ADD(NETWORK_RUNNABLE_SLEEP, kernel_socket_work_pending() != 0);
         enum kernel_wait_wake_reason reason;
         if (kernel_scheduler_block_current(&n->device.progress, n->deadline, 0, &reason) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
     }
 }
 static void input_frame(struct kernel_network *n, struct riscv_net_frame *frame)
@@ -203,8 +203,8 @@ static void worker(void *context)
     struct kernel_network *n = context;
     struct riscv_virtio_mmio_net *d = &n->device;
     for (;;) {
-        uintptr_t irq = riscv_interrupt_save();
-        if (d->stopping) { riscv_interrupt_restore(irq); return; }
+        uintptr_t irq = arch_interrupt_save();
+        if (d->stopping) { arch_interrupt_restore(irq); return; }
         unsigned handled = 0;
         int failed = riscv_virtio_mmio_net_service(d);
         /* RX和协议回调都可能发送；先归还完成owner及其槽位。 */
@@ -229,10 +229,10 @@ static void worker(void *context)
         /* 最后一次收割也会归还复制路径的容量，不能只检查SG done链。 */
         if (service.runnable || kernel_socket_work_pending() || capacity_generation != d->tx_capacity_generation || (!d->failed && d->ready_count)) {
             /* 批次间给中断和其他任务机会，不持raw调用栈睡在设备credit上。 */
-            riscv_interrupt_restore(irq);
-            irq = riscv_interrupt_save();
+            arch_interrupt_restore(irq);
+            irq = arch_interrupt_save();
             if (kernel_scheduler_yield_current() != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
-            riscv_interrupt_restore(irq); continue;
+            arch_interrupt_restore(irq); continue;
         }
         n->deadline = service.next_deadline;
         uint64_t timeout = riscv_time_read() + 5 * d->frequency;
@@ -240,7 +240,7 @@ static void worker(void *context)
         COST_ADD(NETWORK_RUNNABLE_SLEEP, kernel_socket_work_pending() != 0);
         enum kernel_wait_wake_reason reason;
         if (kernel_scheduler_block_current(&d->progress, n->deadline, 0, &reason) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
     }
 }
 int kernel_network_start(struct kernel_network **owner, struct kernel_heap *heap,
@@ -303,7 +303,7 @@ int kernel_network_stop(struct kernel_network **owner)
 {
     if (!owner || !*owner) return 0;
     struct kernel_network *n = *owner;
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     n->device.stopping = 1;
     (void)kernel_wait_queue_wake_all(&n->device.progress);
     if (n->device.worker.task) kernel_thread_join(&n->device.worker);
@@ -315,7 +315,7 @@ int kernel_network_stop(struct kernel_network **owner)
         kernel_socket_protocol_leave(core);
     }
     int error = riscv_virtio_mmio_net_stop(&n->device);
-    if (error) { riscv_interrupt_restore(irq); return error; }
+    if (error) { arch_interrupt_restore(irq); return error; }
     /* reset已确认DMA停止；worker已join，归还剩余TX owner。 */
     riscv_virtio_mmio_net_tx_release(&n->device, release_owner, 1);
     kernel_socket_network_hooks(0, 0, 0, 0);
@@ -344,5 +344,5 @@ int kernel_network_stop(struct kernel_network **owner)
     kernel_heap_get_statistics(n->heap, &heap_statistics);
     print_text(" root-heap-peak-pages="); print_u64(heap_statistics.peak_pages); print_text("\n");
     if (kernel_heap_release(n->heap, n) != KERNEL_HEAP_STATUS_OK) __builtin_trap();
-    *owner = 0; riscv_interrupt_restore(irq); return 0;
+    *owner = 0; arch_interrupt_restore(irq); return 0;
 }

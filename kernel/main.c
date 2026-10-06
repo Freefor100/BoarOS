@@ -1,4 +1,4 @@
-#include <arch/riscv/context.h>
+#include <arch/context.h>
 #include <arch/riscv/direct_map.h>
 #include <arch/riscv/memory_layout.h>
 #include <arch/riscv/root_boot.h>
@@ -657,14 +657,14 @@ static int __attribute__((noinline)) boot_storage_present(const struct dtb_boot_
 static void storage_cleanup_worker(void *argument)
 {
     (void)argument;
-    (void)riscv_interrupt_save();
+    (void)arch_interrupt_save();
     kernel_scheduler_register_cleanup();
     enum kernel_scheduler_status scheduler_status;
     enum riscv_root_boot_status root_status;
     struct kernel_thread_completion init_completion;
     int init_reaped = 0;
     for (;;) {
-        uintptr_t interrupt_status = riscv_interrupt_save();
+        uintptr_t interrupt_status = arch_interrupt_save();
         struct kernel_thread_completion completion;
 
         do {
@@ -681,7 +681,7 @@ static void storage_cleanup_worker(void *argument)
                  kernel_scheduler_reap_pending()));
         /* PID 1死亡后先结束用户owner，不能带着daemon的cwd/MM去卸载根盘。 */
         int users_pending = init_reaped && kernel_scheduler_stop_users();
-        riscv_interrupt_restore(interrupt_status);
+        arch_interrupt_restore(interrupt_status);
         if (init_reaped && !users_pending) {
             struct kernel_heap_statistics heap_statistics;
             uint64_t available_pages;
@@ -740,9 +740,9 @@ static void storage_cleanup_worker(void *argument)
         }
         int cleanup_retry =
             scheduler_status == KERNEL_SCHEDULER_STATUS_RESOURCE_CLEANUP;
-        interrupt_status = riscv_interrupt_save();
+        interrupt_status = arch_interrupt_save();
         kernel_scheduler_wait_cleanup(cleanup_retry ? riscv_time_read() + cleanup_retry_ticks : 0);
-        riscv_interrupt_restore(interrupt_status);
+        arch_interrupt_restore(interrupt_status);
     }
 }
 
@@ -988,14 +988,14 @@ static void kernel_main_high(void)
     virt_uart_putc('\n');
 
     for (;;) {
-        uintptr_t irq = riscv_interrupt_save();
+        uintptr_t irq = arch_interrupt_save();
         if (!root_started) {
             struct kernel_thread_completion completion;
             while (kernel_scheduler_reap_one(&completion) == KERNEL_SCHEDULER_STATUS_OK) { }
         }
         scheduler_status = kernel_scheduler_yield_current();
         if (scheduler_status != KERNEL_SCHEDULER_STATUS_OK) shutdown_for_scheduler_error(scheduler_status);
-        riscv_interrupt_restore(irq | RISCV_SSTATUS_SIE);
+        arch_interrupt_restore(irq | RISCV_SSTATUS_SIE);
         asm volatile("wfi");
     }
 

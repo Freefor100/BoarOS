@@ -1,4 +1,4 @@
-#include <arch/riscv/context.h>
+#include <arch/context.h>
 #include <arch/riscv/mm.h>
 #include <arch/riscv/process.h>
 #include <arch/riscv/sv39.h>
@@ -342,7 +342,7 @@ enum kernel_mm_status kernel_scheduler_resolve_current_user_fault(
     uint32_t access)
 {
     if (scheduler.initialized != KERNEL_SCHEDULER_INITIALIZED ||
-        riscv_interrupt_is_enabled() ||
+        arch_interrupt_is_enabled() ||
         validate_current() != KERNEL_SCHEDULER_STATUS_OK ||
         scheduler.current == &scheduler.idle ||
         scheduler.current->state != KERNEL_THREAD_STATE_RUNNING ||
@@ -687,7 +687,7 @@ enum kernel_scheduler_status riscv_process_clone_current(
         return KERNEL_SCHEDULER_STATUS_NOT_INITIALIZED;
     }
     if (parent_frame == 0 || linux_result == 0 ||
-        riscv_interrupt_is_enabled()) {
+        arch_interrupt_is_enabled()) {
         return KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
     }
     status = validate_current();
@@ -1055,7 +1055,7 @@ enum kernel_scheduler_status kernel_scheduler_wait4_current(
     if (scheduler.initialized != KERNEL_SCHEDULER_INITIALIZED) {
         return KERNEL_SCHEDULER_STATUS_NOT_INITIALIZED;
     }
-    if (linux_result == 0 || riscv_interrupt_is_enabled()) {
+    if (linux_result == 0 || arch_interrupt_is_enabled()) {
         return KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
     }
     if ((options & ~LINUX_WAIT4_SUPPORTED_OPTIONS) != 0U) {
@@ -1193,13 +1193,13 @@ int kernel_scheduler_can_sleep(void)
 }
 void kernel_scheduler_register_cleanup(void)
 {
-    if (riscv_interrupt_is_enabled() || !kernel_scheduler_can_sleep() ||
+    if (arch_interrupt_is_enabled() || !kernel_scheduler_can_sleep() ||
         scheduler.current->arch.user_mode || scheduler.cleanup_task) __builtin_trap();
     scheduler.cleanup_task = scheduler.current;
 }
 void kernel_scheduler_wait_cleanup(uint64_t retry_deadline)
 {
-    if (riscv_interrupt_is_enabled() || scheduler.current != scheduler.cleanup_task) __builtin_trap();
+    if (arch_interrupt_is_enabled() || scheduler.current != scheduler.cleanup_task) __builtin_trap();
     if (!scheduler.exited_head || retry_deadline) {
         enum kernel_wait_wake_reason reason;
         if (kernel_scheduler_block_current(&scheduler.cleanup_queue, retry_deadline, 1, &reason) != KERNEL_SCHEDULER_STATUS_OK)
@@ -1209,7 +1209,7 @@ void kernel_scheduler_wait_cleanup(uint64_t retry_deadline)
 
 void kernel_thread_join(struct kernel_thread_join *join)
 {
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     if (!join || join->task == scheduler.current) __builtin_trap();
     while (join->task && join->task->state != KERNEL_THREAD_STATE_EXITED) {
         enum kernel_wait_wake_reason reason;
@@ -1227,7 +1227,7 @@ void kernel_thread_join(struct kernel_thread_join *join)
         if (release_task_storage(task, KERNEL_SCHEDULER_STATUS_OK)
                 != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
     }
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
 }
 
 int kernel_scheduler_reap_pending(void)
@@ -1266,7 +1266,7 @@ enum kernel_scheduler_status kernel_scheduler_reap_one(
     if (completion == 0) {
         return KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
     }
-    if (riscv_interrupt_is_enabled()) {
+    if (arch_interrupt_is_enabled()) {
         return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
     }
     if (scheduler.fatal_status != KERNEL_SCHEDULER_STATUS_OK) {
@@ -1776,7 +1776,7 @@ static void kernel_thread_finish(
     enum kernel_scheduler_status status;
 
     if (scheduler.initialized != KERNEL_SCHEDULER_INITIALIZED ||
-        riscv_interrupt_is_enabled()) {
+        arch_interrupt_is_enabled()) {
         switch_to_fatal_idle(KERNEL_SCHEDULER_STATUS_INVALID_STATE);
     }
     current = scheduler.current;
@@ -1898,7 +1898,7 @@ struct kernel_task *kernel_task_current(void)
 {
     if (scheduler.initialized != KERNEL_SCHEDULER_INITIALIZED ||
         scheduler.current == 0 ||
-        riscv_current_thread_get() != scheduler.current) {
+        arch_current_thread_get() != scheduler.current) {
         return 0;
     }
     return scheduler.current;

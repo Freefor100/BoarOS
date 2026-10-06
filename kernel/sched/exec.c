@@ -44,7 +44,7 @@ enum kernel_scheduler_status kernel_scheduler_exec_commit(void)
     if (scheduler.initialized != KERNEL_SCHEDULER_INITIALIZED) {
         return KERNEL_SCHEDULER_STATUS_NOT_INITIALIZED;
     }
-    if (riscv_interrupt_is_enabled()) {
+    if (arch_interrupt_is_enabled()) {
         return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
     }
     status = validate_current();

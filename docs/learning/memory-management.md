@@ -477,3 +477,15 @@ SysV attachment 与 VMA 片段必须分别建模。逻辑 attachment 保存固�
 权限上限是映射创建契约，不能由当前权限反推。初始 READ 的匿名映射仍可合法提升 WRITE，而只读 SHM 和只读 fd 的共享文件映射不可提升；降权到 NONE 也不能丢掉原来的合法上限。固定依据为 `references/linux/mm/mprotect.c` 的 VM_MAY 权限检查，以及 `references/linux/ipc/shm.c` 的 `do_shmat` 清除 VM_MAYWRITE，commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`。`make test-vma-riscv test-diff-abi-riscv` 验证只读附加、分裂、fork 和降权恢复；本阶段累计 1077 条记录一致。
 
 VMA 查询副本不能替代来源 owner。`msync` 把 OFD 的错误游标地址交给会睡眠的 VFS，即使只同步清洁页也可能先等待 inode；此时并发撤销最后 VMA 仍必须 pin 来源。BoarOS 复用缺页来源计数作为操作 pin，返回后释放 pin，再基于当前集合清理。三任务 `make test-io-sleep-riscv` 在最后撤映射时检查 release 不得早于 sync 返回，并注入同步/末次关闭错误核对 retained owner；真正的写回错误另由 `make test-files-partial-write-riscv` 验证。此证据使用实际单 hart 调度器，不等于 SMP 覆盖。
+
+## 第二架构前的策略分离（2026-10-06）
+
+MM record 的引用、VMA、文件/ELF 后备 pin、驻留来源和退出清理已移到
+`mm/mm.c`；用户复制的页解析和部分 fault 策略移到 `mm/uaccess.c`。
+`include/arch/mmu.h` 在构建期选择页表操作、用户地址上界与 TLB/取指同步，
+不引入运行期分派。RV 公开创建和统计入口保留薄适配；迁移不改变 map 的
+引用转移、PROT_NONE/COW 或真正 I/O owner 的清理契约。
+
+`include/arch/context.h` 同样提供构建期 IRQ 绑定；RV 仍使用保存/恢复 SIE，
+不把名称中立化当成 SMP 互斥。聚焦重建为 `make test-allocator-preemption-host
+test-mm-riscv test-vma-riscv test-uaccess-riscv`。这一分离尚不构成 LA 用户态交付。

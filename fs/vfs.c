@@ -1,7 +1,7 @@
 #include "vfs_objects.h"
 #include "vfs_internal.h"
 #include "record_lock.h"
-#include <arch/riscv/context.h>
+#include <arch/context.h>
 
 #include <kernel/block.h>
 #include <kernel/errno.h>
@@ -62,10 +62,10 @@ static void release_path(struct kernel_heap *heap, char *work)
 uint64_t kernel_vfs_allocate_mount_id(void)
 {
     static uint64_t next = 1;
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     if (next == UINT64_MAX) __builtin_trap();
     uint64_t id = next++;
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     return id;
 }
 
@@ -95,12 +95,12 @@ int kernel_vfs_mount_attach(struct kernel_vfs_mount *mount,
     if (result) return result;
     KERNEL_LOCK_SCOPE(covered_guard);
     kernel_vfs_namespace_lock(parent, &covered_guard);
-    irq = riscv_interrupt_save();
+    irq = arch_interrupt_save();
     if (covered->detached ||
         ((struct kernel_vfs_node *)covered->file.private_data)->unlinked ||
         covered->mounted_here || parent->child_mounts == UINT32_MAX ||
         covered->references == UINT32_MAX) {
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
         kernel_lock_scope_release(&covered_guard);
         (void)kernel_vfs_path_release(&new_root);
         return -KERNEL_EBUSY;
@@ -114,7 +114,7 @@ int kernel_vfs_mount_attach(struct kernel_vfs_mount *mount,
     if (parent->first_child) parent->first_child->previous_sibling = mount;
     parent->first_child = mount;
     covered->mounted_here = mount;
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     return 0;
 }
 
@@ -126,16 +126,16 @@ int kernel_vfs_mount_prepare_detach(struct kernel_vfs_mount *mount,
     struct kernel_vfs_instance *instance = mount->private_data;
     KERNEL_LOCK_SCOPE(namespace_guard);
     kernel_vfs_namespace_lock(mount, &namespace_guard);
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     uint32_t expected = named_root == mount->root_path ? 2U : 1U;
     if (mount->covered_path->mounted_here != mount || mount->child_mounts ||
         mount->root_path->references != expected || instance->external_files != 1U) {
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
         return -KERNEL_EBUSY;
     }
     /* 先关闭新提交入口，再放锁等待 worker；失败仍由可达的挂载持有。 */
     instance->quiescing = 1;
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     kernel_lock_scope_release(&namespace_guard);
     return instance->ops->prepare_unmount ? instance->ops->prepare_unmount(mount) : 0;
 }
@@ -155,12 +155,12 @@ int kernel_vfs_mount_detach(struct kernel_vfs_mount *mount,
     instance = mount->private_data;
     KERNEL_LOCK_SCOPE(covered_guard);
     kernel_vfs_namespace_lock(mount->parent, &covered_guard);
-    irq = riscv_interrupt_save();
+    irq = arch_interrupt_save();
     uint32_t expected_refs = named_root == root ? 2U : 1U;
     if (covered->mounted_here != mount || !mount->parent->child_mounts ||
         mount->child_mounts ||
         root->references != expected_refs || instance->external_files != 1U) {
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
         return -KERNEL_EBUSY;
     }
     if (mount->previous_sibling) {
@@ -181,7 +181,7 @@ int kernel_vfs_mount_detach(struct kernel_vfs_mount *mount,
     mount->parent = 0;
     mount->next_sibling = 0;
     mount->previous_sibling = 0;
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     kernel_lock_scope_release(&covered_guard);
     if (kernel_vfs_path_release(&root) || kernel_vfs_path_release(&covered))
         __builtin_trap();
@@ -193,20 +193,20 @@ static int enter_mounts(struct kernel_vfs_path **owner)
     struct kernel_vfs_path *current = *owner;
     for (;;) {
         struct kernel_vfs_path *next;
-        uintptr_t irq = riscv_interrupt_save();
+        uintptr_t irq = arch_interrupt_save();
         struct kernel_vfs_mount *child = current->mounted_here;
         if (!child) {
-            riscv_interrupt_restore(irq);
+            arch_interrupt_restore(irq);
             *owner = current;
             return 0;
         }
         next = child->root_path;
         if (!next || kernel_vfs_path_acquire(next)) {
-            riscv_interrupt_restore(irq);
+            arch_interrupt_restore(irq);
             *owner = current;
             return -KERNEL_EBUSY;
         }
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
         if (kernel_vfs_path_release(&current)) __builtin_trap();
         current = next;
         *owner = current;
@@ -358,13 +358,13 @@ int kernel_vfs_path_lookup(struct kernel_vfs_path *parent,
         return result;
     }
     if (name_length == 2U && name[0] == '.' && name[1] == '.') {
-        uintptr_t irq = riscv_interrupt_save();
+        uintptr_t irq = arch_interrupt_save();
         struct kernel_vfs_path *ancestor = parent;
         while (ancestor->parent == 0 && ancestor->file.mount->covered_path)
             ancestor = ancestor->file.mount->covered_path;
         if (ancestor->parent) ancestor = ancestor->parent;
         result = kernel_vfs_path_acquire(ancestor);
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
         if (result == 0) *owner = ancestor;
         return result;
     }
@@ -741,7 +741,7 @@ static int path_string(const struct kernel_vfs_path *path,
     if (!path || !path->file.mount || !path->file.mount->private_data) return -KERNEL_EINVAL;
     VFS_PATH_PIN(path_pin, path);
     if (!root || !buffer || capacity < 2U) return -KERNEL_ERANGE;
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     const struct kernel_vfs_path *cursor = path;
     size_t position = capacity - 1U;
     int result = 0;
@@ -785,7 +785,7 @@ static int path_string(const struct kernel_vfs_path *path,
             else memcpy(buffer + length, suffix, sizeof(suffix));
         }
     }
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     return result;
 }
 
@@ -1797,7 +1797,7 @@ int kernel_vfs_rename_at(struct kernel_vfs_path *old_start,
     if (!target && renamed.replaced_inode) __builtin_trap();
     struct kernel_vfs_path *old_parent = source->parent;
     char *old_name = source->name;
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     if (target) {
         struct kernel_vfs_node *node = target->file.private_data;
         target->detached = 1U;
@@ -1805,7 +1805,7 @@ int kernel_vfs_rename_at(struct kernel_vfs_path *old_start,
     }
     source->parent = new_parent;
     source->name = new_name;
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     new_parent = 0;
     new_name = 0;
     if (old_name != source->initial_name) release_path(adapter->heap, old_name);
@@ -1951,7 +1951,7 @@ int kernel_vfs_node_writeback_allowed(const struct kernel_vfs_node *node)
 
 void kernel_vfs_record_writeback_error(struct kernel_vfs_node *node, int error)
 {
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     node->writeback_error = error;
     node->writeback_error_sequence++;
     if (node->writeback_error_sequence == 0) __builtin_trap();
@@ -1960,15 +1960,15 @@ void kernel_vfs_record_writeback_error(struct kernel_vfs_node *node, int error)
         node->instance->writeback_error = error;
         if (++node->instance->writeback_error_sequence == 0) __builtin_trap();
     }
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
 }
 
 uint64_t kernel_vfs_mount_error_sequence(const struct kernel_vfs_mount *mount)
 {
     if (!mount || !mount->private_data) return 0;
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     uint64_t sequence = ((struct kernel_vfs_instance *)mount->private_data)->writeback_error_sequence;
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     return sequence;
 }
 
@@ -1980,10 +1980,10 @@ struct sync_nodes {
 
 static void release_sync_nodes(struct sync_nodes *snapshot)
 {
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     for (size_t i = 0; i < snapshot->count; i++)
         if (kernel_vfs_node_release(&snapshot->nodes[i])) __builtin_trap();
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     if (snapshot->nodes && kernel_heap_release(snapshot->heap, snapshot->nodes) != KERNEL_HEAP_STATUS_OK)
         __builtin_trap();
 }
@@ -1993,10 +1993,10 @@ static int snapshot_sync_nodes(struct kernel_vfs_instance *instance,
 {
     snapshot->heap = instance->heap;
     for (;;) {
-        uintptr_t irq = riscv_interrupt_save();
+        uintptr_t irq = arch_interrupt_save();
         size_t capacity = 0;
         for (struct kernel_vfs_node *node = instance->nodes; node; node = node->next) capacity++;
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
         if (!capacity) return 0;
         if (capacity > SIZE_MAX / sizeof(*snapshot->nodes)) return -KERNEL_ENOMEM;
         enum kernel_heap_status allocation = kernel_heap_allocate(instance->heap,
@@ -2005,21 +2005,21 @@ static int snapshot_sync_nodes(struct kernel_vfs_instance *instance,
             if (allocation != KERNEL_HEAP_STATUS_EMPTY) __builtin_trap();
             return -KERNEL_ENOMEM;
         }
-        irq = riscv_interrupt_save();
+        irq = arch_interrupt_save();
         size_t count = 0;
         for (struct kernel_vfs_node *node = instance->nodes; node; node = node->next) count++;
         if (count > capacity) {
-            riscv_interrupt_restore(irq);
+            arch_interrupt_restore(irq);
             if (kernel_heap_release(instance->heap, snapshot->nodes) != KERNEL_HEAP_STATUS_OK) __builtin_trap();
             snapshot->nodes = 0;
             continue;
         }
         for (struct kernel_vfs_node *node = instance->nodes; node; node = node->next) {
             int result = kernel_vfs_node_acquire(node);
-            if (result) { riscv_interrupt_restore(irq); return result; }
+            if (result) { arch_interrupt_restore(irq); return result; }
             snapshot->nodes[snapshot->count++] = node;
         }
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
         return 0;
     }
 }
@@ -2058,12 +2058,12 @@ int kernel_vfs_sync_mount(struct kernel_vfs_mount *mount, uint64_t *observed_err
     } else if (instance->page_cache) __builtin_trap();
 observe:
     if (observed_error) {
-        uintptr_t irq = riscv_interrupt_save();
+        uintptr_t irq = arch_interrupt_save();
         if (*observed_error != instance->writeback_error_sequence) {
             if (!result) result = instance->writeback_error;
             *observed_error = instance->writeback_error_sequence;
         }
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
     }
     return result;
 }
@@ -2083,25 +2083,25 @@ static void sync_mounts_without_array(struct kernel_vfs_path *root)
 {
     struct kernel_vfs_mount *mount = root->file.mount;
     uint64_t last = 0, limit = 0;
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     for (struct kernel_vfs_mount *m = mount; m; m = next_sync_mount(m, mount))
         if (m->id > limit) limit = m->id;
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     /* OOM时按启动时的身份上界逐个取得引用，跨等待不保存树中的裸指针。
      * 已卸载者由卸载路径排空；新挂载不能无限延长本次sync。 */
     for (;;) {
-        irq = riscv_interrupt_save();
+        irq = arch_interrupt_save();
         struct kernel_vfs_mount *selected = 0;
         for (struct kernel_vfs_mount *m = mount; m; m = next_sync_mount(m, mount)) {
             if (m->id <= last || m->id > limit ||
                 ((struct kernel_vfs_instance *)m->private_data)->quiescing) continue;
             if (!selected || m->id < selected->id) selected = m;
         }
-        if (!selected) { riscv_interrupt_restore(irq); return; }
+        if (!selected) { arch_interrupt_restore(irq); return; }
         struct kernel_vfs_path *path = selected == mount ? root : selected->root_path;
         if (!path || kernel_vfs_path_acquire(path)) __builtin_trap();
         last = selected->id;
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
         (void)kernel_vfs_sync_mount(path->file.mount, 0);
         if (kernel_vfs_path_release(&path)) __builtin_trap();
     }
@@ -2115,10 +2115,10 @@ void kernel_vfs_sync_all(struct kernel_vfs_path *root)
     struct kernel_vfs_path **paths = 0;
     size_t count = 0;
     for (;;) {
-        uintptr_t irq = riscv_interrupt_save();
+        uintptr_t irq = arch_interrupt_save();
         size_t capacity = 0;
         for (struct kernel_vfs_mount *m = mount; m; m = next_sync_mount(m, mount)) capacity++;
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
         if (capacity > SIZE_MAX / sizeof(*paths)) {
             sync_mounts_without_array(root);
             return;
@@ -2130,11 +2130,11 @@ void kernel_vfs_sync_all(struct kernel_vfs_path *root)
             sync_mounts_without_array(root);
             return;
         }
-        irq = riscv_interrupt_save();
+        irq = arch_interrupt_save();
         size_t needed = 0;
         for (struct kernel_vfs_mount *m = mount; m; m = next_sync_mount(m, mount)) needed++;
         if (needed > capacity) {
-            riscv_interrupt_restore(irq);
+            arch_interrupt_restore(irq);
             if (kernel_heap_release(heap, paths) != KERNEL_HEAP_STATUS_OK) __builtin_trap();
             paths = 0;
             continue;
@@ -2145,7 +2145,7 @@ void kernel_vfs_sync_all(struct kernel_vfs_path *root)
             if (!path || kernel_vfs_path_acquire(path)) __builtin_trap();
             paths[count++] = path;
         }
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
         break;
     }
     for (size_t i = 0; i < count; i++) (void)kernel_vfs_sync_mount(paths[i]->file.mount, 0);

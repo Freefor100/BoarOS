@@ -1,0 +1,43 @@
+#ifndef BOAROS_ARCH_MMU_H
+#define BOAROS_ARCH_MMU_H
+#if defined(BOAROS_ARCH_LOONGARCH)
+#include <arch/loongarch/mmu.h>
+#else
+#include <arch/riscv/sv39.h>
+#define arch_mmu_current_context riscv_sv39_current_satp
+#define arch_mmu_mapping riscv_sv39_mapping
+#define arch_mmu_status riscv_sv39_status
+#define arch_mmu_user_discard_owned_page riscv_sv39_user_discard_owned_page
+#define arch_mmu_user_lookup riscv_sv39_user_lookup
+#define arch_mmu_user_map_cow_page riscv_sv39_user_map_cow_page
+#define arch_mmu_user_map_owned_page riscv_sv39_user_map_owned_page
+#define arch_mmu_user_map_zeroed_page riscv_sv39_user_map_zeroed_page
+#define arch_mmu_user_protect_owned_page riscv_sv39_user_protect_owned_page
+#define arch_mmu_user_protect_owned_range riscv_sv39_user_protect_owned_range
+#define arch_mmu_user_resolve_cow riscv_sv39_user_resolve_cow
+#define arch_mmu_user_space riscv_sv39_user_space
+#define arch_mmu_user_space_context riscv_sv39_user_space_satp
+#define arch_mmu_user_space_destroy riscv_sv39_user_space_destroy
+#define arch_mmu_user_space_fork riscv_sv39_user_space_fork
+#define arch_mmu_user_space_move riscv_sv39_user_space_move
+#define arch_mmu_user_unmap_owned_range riscv_sv39_user_unmap_owned_range
+#define ARCH_MMU_EXECUTE RISCV_SV39_EXECUTE
+#define ARCH_MMU_PAGE_SIZE RISCV_SV39_PAGE_SIZE_4K
+#define ARCH_MMU_READ RISCV_SV39_READ
+#define ARCH_MMU_STATUS_CONFLICT RISCV_SV39_STATUS_CONFLICT
+#define ARCH_MMU_STATUS_INVALID RISCV_SV39_STATUS_INVALID
+#define ARCH_MMU_STATUS_NOT_MAPPED RISCV_SV39_STATUS_NOT_MAPPED
+#define ARCH_MMU_STATUS_NO_MEMORY RISCV_SV39_STATUS_NO_MEMORY
+#define ARCH_MMU_STATUS_OK RISCV_SV39_STATUS_OK
+#define ARCH_MMU_STATUS_STATE RISCV_SV39_STATUS_STATE
+#define ARCH_MMU_USER RISCV_SV39_USER
+#define ARCH_MMU_USER_LIMIT RISCV_SV39_USER_LIMIT
+#define ARCH_MMU_USER_SPACE_EMPTY RISCV_SV39_USER_SPACE_EMPTY
+#define ARCH_MMU_USER_SPACE_LIVE RISCV_SV39_USER_SPACE_LIVE
+#define ARCH_MMU_WRITE RISCV_SV39_WRITE
+static inline void arch_mmu_sync_instructions(void)
+{ __asm__ volatile("fence.i" ::: "memory"); }
+static inline void arch_mmu_flush_address(uint64_t address)
+{ __asm__ volatile("sfence.vma %0, zero" :: "r"(address) : "memory"); }
+#endif
+#endif

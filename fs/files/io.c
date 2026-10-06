@@ -24,7 +24,7 @@
 #include <stdint.h>
 #include <string.h>
 
-#include <arch/riscv/context.h>
+#include <arch/context.h>
 
 #define KERNEL_FILES_WRITE_STAGING 64U
 
@@ -80,32 +80,32 @@ static int socket_wait_ready(struct kernel_open_file_description *description,
             return -KERNEL_EAGAIN;
         if (status != KERNEL_TIME_STATUS_OK) return -KERNEL_EIO;
     }
-    saved = riscv_interrupt_save();
+    saved = arch_interrupt_save();
     while (!socket_operation_ready(socket, events)) {
         enum kernel_wait_wake_reason reason;
         uint64_t sleep_deadline = deadline;
         if (kernel_scheduler_block_current(kernel_socket_wait_queue(socket),
                                             sleep_deadline, 1, &reason) !=
             KERNEL_SCHEDULER_STATUS_OK) {
-            riscv_interrupt_restore(saved);
+            arch_interrupt_restore(saved);
             return -KERNEL_EIO;
         }
         if (reason == KERNEL_WAIT_TIMEOUT) {
             if (target_ns != 0U &&
                 kernel_time_monotonic_ns() >= target_ns) {
-                riscv_interrupt_restore(saved);
+                arch_interrupt_restore(saved);
                 return -KERNEL_EAGAIN;
             }
             continue;
         }
         if (reason == KERNEL_WAIT_SIGNALLED) {
-            riscv_interrupt_restore(saved);
+            arch_interrupt_restore(saved);
             if (timeout_ns != 0U) return -KERNEL_EINTR;
             kernel_signal_note_syscall_restart(kernel_task_current());
             return -KERNEL_ERESTARTSYS;
         }
     }
-    riscv_interrupt_restore(saved);
+    arch_interrupt_restore(saved);
     return 0;
 }
 

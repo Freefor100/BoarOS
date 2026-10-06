@@ -1,4 +1,4 @@
-#include <arch/riscv/context.h>
+#include <arch/context.h>
 #include <kernel/sync.h>
 #include "private.h"
 
@@ -24,7 +24,7 @@ void kernel_rwlock_init(struct kernel_rwlock *lock, uint32_t rank, uintptr_t key
 static int acquire(struct kernel_rwlock *lock, struct kernel_lock_guard *guard, int write, int try_only)
 {
     COST_SCOPE(acquire_cost, OPERATION_TICKS);
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     struct kernel_io_context *owner = kernel_io_context_current();
     if (!lock || !guard || guard->lock || !lock->waiters.initialized) __builtin_trap();
     for (struct kernel_lock_guard *held = owner->locks; held; held = held->previous)
@@ -42,7 +42,7 @@ static int acquire(struct kernel_rwlock *lock, struct kernel_lock_guard *guard, 
     kernel_cost_add(metric,1);
 #endif
     if (try_only && (lock->writer || lock->pending_head)) {
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
         return 0;
     }
     struct kernel_lock_waiter waiter = {.owner = owner, .write = write};
@@ -92,7 +92,7 @@ static int acquire(struct kernel_rwlock *lock, struct kernel_lock_guard *guard, 
     guard->cost_start = waiter.grant_ticks; guard->cost_registered = hold.actor != 0;
 #endif
     owner->locks = guard;
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     return 1;
 }
 int kernel_rwlock_try_read(struct kernel_rwlock *lock, struct kernel_lock_guard *guard)
@@ -103,7 +103,7 @@ void kernel_rwlock_write(struct kernel_rwlock *lock, struct kernel_lock_guard *g
 { (void)acquire(lock, guard, 1, 0); }
 void kernel_lock_release(struct kernel_lock_guard *guard)
 {
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     struct kernel_io_context *owner = kernel_io_context_current();
     if (!guard || !guard->lock || guard->owner != owner || owner->locks != guard)
         __builtin_trap();
@@ -147,7 +147,7 @@ void kernel_lock_release(struct kernel_lock_guard *guard)
             if (next->write || (lock->pending_head && lock->pending_head->write)) break;
         }
     }
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
 }
 
 int kernel_lock_held(const struct kernel_rwlock *lock, int write)

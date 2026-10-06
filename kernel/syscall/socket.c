@@ -11,7 +11,7 @@
 #include <kernel/time.h>
 #include <kernel/uaccess.h>
 
-#include <arch/riscv/context.h>
+#include <arch/context.h>
 
 #include <stdint.h>
 #include <stddef.h>
@@ -267,38 +267,38 @@ static int wait_ready(struct kernel_task *caller,
             return -KERNEL_EAGAIN;
         if (status != KERNEL_TIME_STATUS_OK) return -KERNEL_EIO;
     }
-    saved = riscv_interrupt_save();
+    saved = arch_interrupt_save();
     while ((kernel_socket_poll(socket, 0) & event) == 0U) {
         enum kernel_wait_wake_reason reason;
         uint64_t sleep_deadline = deadline;
         if ((kernel_open_file_flags(file) & LINUX_SOCK_NONBLOCK) != 0U ||
             (flags & KERNEL_SOCKET_MSG_DONTWAIT) != 0U) {
-            riscv_interrupt_restore(saved);
+            arch_interrupt_restore(saved);
             return -KERNEL_EAGAIN;
         }
         if (kernel_scheduler_block_current(
                 kernel_socket_wait_queue(socket), sleep_deadline, 1,
                 &reason) !=
             KERNEL_SCHEDULER_STATUS_OK) {
-            riscv_interrupt_restore(saved);
+            arch_interrupt_restore(saved);
             return -KERNEL_EIO;
         }
         if (reason == KERNEL_WAIT_TIMEOUT) {
             if (target_ns != 0U &&
                 kernel_time_monotonic_ns() >= target_ns) {
-                riscv_interrupt_restore(saved);
+                arch_interrupt_restore(saved);
                 return -KERNEL_EAGAIN;
             }
             continue;
         }
         if (reason == KERNEL_WAIT_SIGNALLED) {
-            riscv_interrupt_restore(saved);
+            arch_interrupt_restore(saved);
             if (timeout_ns != 0U) return -KERNEL_EINTR;
             kernel_signal_note_syscall_restart(caller);
             return -KERNEL_ERESTARTSYS;
         }
     }
-    riscv_interrupt_restore(saved);
+    arch_interrupt_restore(saved);
     return 0;
 }
 

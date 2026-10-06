@@ -145,12 +145,13 @@ C_SOURCES := \
 	arch/riscv/exec.c \
 	arch/riscv/process.c \
 	arch/riscv/mm.c \
+	mm/mm.c \
 	arch/riscv/root_boot.c \
 	arch/riscv/sbi.c \
 	arch/riscv/sv39.c \
 	arch/riscv/timer.c \
 	arch/riscv/trap.c \
-	arch/riscv/uaccess.c \
+	mm/uaccess.c \
 	arch/riscv/virt_rtc.c \
 	arch/riscv/virt_uart.c \
 	arch/riscv/uart_tty.c \
@@ -255,11 +256,12 @@ TEST_RUNTIME_C_SOURCES := \
 	arch/riscv/exec.c \
 	arch/riscv/process.c \
 	arch/riscv/mm.c \
+	mm/mm.c \
 	arch/riscv/sbi.c \
 	arch/riscv/sv39.c \
 	arch/riscv/timer.c \
 	arch/riscv/trap.c \
-	arch/riscv/uaccess.c \
+	mm/uaccess.c \
 	arch/riscv/virt_rtc.c \
 	arch/riscv/virt_uart.c \
 	arch/riscv/uart_tty.c \
@@ -1651,7 +1653,7 @@ test-cost-host:
 	build/cost/host/irq-test
 	cc -std=c11 -Wall -Wextra -Werror -Itests/host/random -idirafter include -DBOAROS_PAGE_SHIFT=12 -DBOAROS_COST_DIAGNOSTICS=1 tests/cost/page_test.c kernel/cost.c kernel/physical_page.c -o build/cost/host/page-test
 	build/cost/host/page-test
-	cc -std=c11 -Wall -Wextra -Werror -Itests/host/random -idirafter include -DBOAROS_PAGE_SHIFT=12 -DBOAROS_COST_DIAGNOSTICS=1 tests/memory/cost_test.c kernel/cost.c kernel/physical_page.c mm/heap.c arch/riscv/uaccess.c -o build/cost/host/memory-test
+	cc -std=c11 -Wall -Wextra -Werror -Itests/host/random -idirafter include -DBOAROS_PAGE_SHIFT=12 -DBOAROS_COST_DIAGNOSTICS=1 tests/memory/cost_test.c kernel/cost.c kernel/physical_page.c mm/heap.c mm/uaccess.c -o build/cost/host/memory-test
 	build/cost/host/memory-test
 	python3 -B tests/test-cost-report.py
 test-cost-riscv: test-cost-host

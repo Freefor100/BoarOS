@@ -1,4 +1,4 @@
-#include <arch/riscv/context.h>
+#include <arch/context.h>
 #include <arch/riscv/direct_map.h>
 #include <arch/riscv/fpu.h>
 #include <arch/riscv/memory_layout.h>
@@ -246,7 +246,7 @@ enum kernel_scheduler_status validate_current(void)
     uintptr_t stack_pointer;
 
     if (scheduler.current == 0 ||
-        riscv_current_thread_get() != scheduler.current) {
+        arch_current_thread_get() != scheduler.current) {
         return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
     }
     expected_state = scheduler.current->idle != 0U
@@ -607,9 +607,9 @@ enum kernel_scheduler_status release_task_storage(
 
 void kernel_scheduler_stack_statistics(struct kernel_stack_statistics *statistics)
 {
-    uintptr_t old_status = riscv_interrupt_save();
+    uintptr_t old_status = arch_interrupt_save();
     if (statistics != 0) *statistics = scheduler.stack_statistics;
-    riscv_interrupt_restore(old_status);
+    arch_interrupt_restore(old_status);
 }
 
 enum kernel_scheduler_status kernel_scheduler_init(
@@ -634,7 +634,7 @@ enum kernel_scheduler_status kernel_scheduler_init(
         physical_page_available(allocator) > physical_page_total(allocator)) {
         return KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
     }
-    if (riscv_interrupt_is_enabled()) {
+    if (arch_interrupt_is_enabled()) {
         return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
     }
     if (riscv_sv39_switch_satp(kernel_satp) != RISCV_SV39_STATUS_OK) {
@@ -711,7 +711,7 @@ enum kernel_scheduler_status kernel_scheduler_init(
     scheduler.stack_statistics.maximum_used_bytes = 0U;
     scheduler.idle_context_saved = 0U;
     scheduler.initialized = KERNEL_SCHEDULER_INITIALIZED;
-    riscv_current_thread_set(&scheduler.idle);
+    arch_current_thread_set(&scheduler.idle);
     return KERNEL_SCHEDULER_STATUS_OK;
 }
 
@@ -733,7 +733,7 @@ enum kernel_scheduler_status kernel_thread_create_joinable(
         return KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
     }
 
-    old_status = riscv_interrupt_save();
+    old_status = arch_interrupt_save();
     if (scheduler.fatal_status != KERNEL_SCHEDULER_STATUS_OK) {
         status = scheduler.fatal_status;
         goto restore_interrupts;
@@ -794,7 +794,7 @@ enum kernel_scheduler_status kernel_thread_create_joinable(
     status = KERNEL_SCHEDULER_STATUS_OK;
 
 restore_interrupts:
-    riscv_interrupt_restore(old_status);
+    arch_interrupt_restore(old_status);
     return status;
 }
 
@@ -829,7 +829,7 @@ enum kernel_scheduler_status kernel_user_thread_create(
         return KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
     }
 
-    old_status = riscv_interrupt_save();
+    old_status = arch_interrupt_save();
     if (scheduler.fatal_status != KERNEL_SCHEDULER_STATUS_OK) {
         status = scheduler.fatal_status;
         goto restore_interrupts;
@@ -1001,7 +1001,7 @@ enum kernel_scheduler_status kernel_user_thread_create(
     status = KERNEL_SCHEDULER_STATUS_OK;
 
 restore_interrupts:
-    riscv_interrupt_restore(old_status);
+    arch_interrupt_restore(old_status);
     return status;
 }
 
@@ -1026,12 +1026,12 @@ void scheduler_forget_task(struct kernel_task *thread)
 
 void kernel_scheduler_system_statistics(uint64_t loads[3], uint16_t *tasks)
 {
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     uint64_t count = 0;
     for (struct kernel_task *t = scheduler.all_tasks; t; t = t->all_next) count++;
     *tasks = count > UINT16_MAX ? UINT16_MAX : (uint16_t)count;
     for (unsigned i = 0; i < 3; i++) loads[i] = scheduler.loads[i] << 5;
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
 }
 
 static void scheduler_sample_load(uint64_t elapsed)
@@ -1059,7 +1059,7 @@ enum kernel_scheduler_status kernel_scheduler_on_tick(uint64_t elapsed_ticks)
 {
     if (scheduler.initialized != KERNEL_SCHEDULER_INITIALIZED)
         return KERNEL_SCHEDULER_STATUS_NOT_INITIALIZED;
-    if (riscv_interrupt_is_enabled()) return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
+    if (arch_interrupt_is_enabled()) return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
     if (scheduler.fatal_status != KERNEL_SCHEDULER_STATUS_OK) return scheduler.fatal_status;
     enum kernel_scheduler_status status = validate_current();
     if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
@@ -1073,7 +1073,7 @@ enum kernel_scheduler_status kernel_scheduler_yield_current(void)
 {
     if (scheduler.initialized != KERNEL_SCHEDULER_INITIALIZED)
         return KERNEL_SCHEDULER_STATUS_NOT_INITIALIZED;
-    if (riscv_interrupt_is_enabled()) return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
+    if (arch_interrupt_is_enabled()) return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
     if (scheduler.fatal_status != KERNEL_SCHEDULER_STATUS_OK) return scheduler.fatal_status;
     enum kernel_scheduler_status status = validate_current();
     if (status != KERNEL_SCHEDULER_STATUS_OK) return status;

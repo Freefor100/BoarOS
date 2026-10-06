@@ -2,7 +2,7 @@
 #include "private.h"
 #include "../open_file_internal.h"
 
-#include <arch/riscv/context.h>
+#include <arch/context.h>
 #include <kernel/errno.h>
 #include <kernel/epoll.h>
 #include <kernel/task.h>
@@ -51,7 +51,7 @@ static void kernel_epoll_wait_callback(struct kernel_wait_node *node, uint32_t r
 {
     (void)reason;
     if (!node || !node->context) return;
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     struct kernel_epoll_item *item = node->context;
     struct kernel_epoll *epoll = item->epoll;
     if (epoll && item->linked && !item->oneshot_disarmed) {
@@ -61,7 +61,7 @@ static void kernel_epoll_wait_callback(struct kernel_wait_node *node, uint32_t r
         else epoll_ready_add(epoll, item);
         kernel_wait_queue_wake_all(&epoll->wait_queue);
     }
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
 }
 
 static void epoll_remove_from_ready_list(
@@ -128,7 +128,7 @@ static enum kernel_files_status epoll_item_unlink_and_destroy(
     if (item == 0 || !item->linked) {
         return KERNEL_FILES_STATUS_OK;
     }
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     struct kernel_epoll *epoll = item->epoll;
     struct kernel_open_file_description *target_file = item->target_file;
 
@@ -179,7 +179,7 @@ static enum kernel_files_status epoll_item_unlink_and_destroy(
     item->linked = 0;
     item->epoll = 0;
     epoll_item_put(item);
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     return KERNEL_FILES_STATUS_OK;
 }
 
@@ -667,7 +667,7 @@ static int epoll_setup_sigmask(
 static void epoll_scan_finish(struct kernel_epoll_wait_request *request)
 {
     struct kernel_epoll *epoll = request->epoll;
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     if (request->target && kernel_open_file_release(&request->target) != KERNEL_OPEN_FILE_STATUS_OK)
         __builtin_trap();
     if (epoll->scan_owner == request) {
@@ -691,7 +691,7 @@ static void epoll_scan_finish(struct kernel_epoll_wait_request *request)
         epoll->scan_owner = 0;
         kernel_wait_queue_wake_all(&epoll->wait_queue);
     }
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
 }
 
 void kernel_epoll_abort_wait(struct kernel_epoll_wait_request *request)
@@ -709,9 +709,9 @@ static int64_t epoll_deliver(struct kernel_epoll_wait_request *request,
     struct kernel_mm *mm, uint64_t user_events, size_t maximum)
 {
     struct kernel_epoll *epoll = request->epoll;
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     if (epoll->scan_owner || !epoll->ready_head) {
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
         return 0;
     }
     epoll->scan_owner = request;
@@ -723,7 +723,7 @@ static int64_t epoll_deliver(struct kernel_epoll_wait_request *request,
         item->in_scan = 1;
         item->on_ready_list = 0;
     }
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     int64_t delivered = 0;
     while (request->head && (size_t)delivered < maximum) {
         struct kernel_epoll_item *item = request->head;
@@ -757,7 +757,7 @@ static int64_t epoll_deliver(struct kernel_epoll_wait_request *request,
             if (kernel_open_file_release(&request->target) != KERNEL_OPEN_FILE_STATUS_OK)
                 __builtin_trap();
         }
-        irq = riscv_interrupt_save();
+        irq = arch_interrupt_save();
         if (item->linked && (control != item->control_generation ||
                             notification != item->notification_generation))
             epoll_pending_add(epoll, item);
@@ -765,7 +765,7 @@ static int64_t epoll_deliver(struct kernel_epoll_wait_request *request,
         item->ready_next = 0;
         item->in_scan = 0;
         epoll_item_put(item);
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
     }
     epoll_scan_finish(request);
     return delivered;
@@ -851,10 +851,10 @@ enum kernel_files_status kernel_files_epoll_pwait(
         /* Block on epoll wait queue */
         {
             enum kernel_wait_wake_reason wake_reason = KERNEL_WAIT_WOKEN;
-            uint64_t saved_intr = riscv_interrupt_save();
+            uint64_t saved_intr = arch_interrupt_save();
             uint64_t sleep_deadline = deadline;
             if (!epoll->scan_owner && epoll->ready_head != 0) {
-                riscv_interrupt_restore(saved_intr);
+                arch_interrupt_restore(saved_intr);
                 continue;
             }
             enum kernel_scheduler_status sched_status =
@@ -862,7 +862,7 @@ enum kernel_files_status kernel_files_epoll_pwait(
                                                sleep_deadline,
                                                1,
                                                &wake_reason);
-            riscv_interrupt_restore(saved_intr);
+            arch_interrupt_restore(saved_intr);
             if (sched_status != KERNEL_SCHEDULER_STATUS_OK) {
                 *linux_result = -KERNEL_EIO;
                 break;

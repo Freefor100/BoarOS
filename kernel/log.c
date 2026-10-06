@@ -1,7 +1,7 @@
 #include <kernel/log.h>
 #include <kernel/errno.h>
 #include <kernel/sync.h>
-#include <arch/riscv/context.h>
+#include <arch/context.h>
 #include <string.h>
 
 #define RECORD_COUNT 512U
@@ -25,7 +25,7 @@ static void initialize(void)
 
 int kernel_log_putc(unsigned level, char character)
 {
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     initialize();
     if (level > 7) level = 7;
     int visible = level < console_level;
@@ -48,7 +48,7 @@ int kernel_log_putc(unsigned level, char character)
         write_position += pending_length; next_sequence++; pending_length = 0;
         kernel_wait_queue_wake_all(&published);
     }
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     return visible;
 }
 
@@ -68,9 +68,9 @@ int kernel_log_action(int action, int length, int privileged,
         return -KERNEL_EINVAL;
     if (action >= 2 && action <= 4 && !length) return 0;
     if (action == 8 && (length < 1 || length > 8)) return -KERNEL_EINVAL;
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     initialize();
-    if (action == 0 || action == 1) { riscv_interrupt_restore(irq); return 0; }
+    if (action == 0 || action == 1) { arch_interrupt_restore(irq); return 0; }
     if (action >= 5) {
         int result = 0;
         if (action == 5) clear_sequence = next_sequence;
@@ -87,7 +87,7 @@ int kernel_log_action(int action, int length, int privileged,
                 result += records[seq % RECORD_COUNT].length;
             result -= read_partial;
         } else result = sizeof(ring);
-        riscv_interrupt_restore(irq); return result;
+        arch_interrupt_restore(irq); return result;
     }
     uint64_t sequence = clear_sequence > first_sequence ? clear_sequence : first_sequence;
     uint64_t end = next_sequence;
@@ -97,21 +97,21 @@ int kernel_log_action(int action, int length, int privileged,
         while (sequence < end && bytes > (unsigned)length)
             bytes -= records[sequence++ % RECORD_COUNT].length;
     }
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     struct kernel_lock_guard guard = {0};
     if (action == 2) kernel_mutex_lock(&readers, &guard);
     int total = 0;
     while (total < length) {
-        irq = riscv_interrupt_save();
+        irq = arch_interrupt_save();
         unsigned partial = 0;
         if (action == 2) { clamp_reader(); sequence = read_sequence; partial = read_partial; end = next_sequence; }
         if (sequence < first_sequence) sequence = first_sequence;
         if (sequence >= end) {
-            if (action != 2 || total) { riscv_interrupt_restore(irq); break; }
+            if (action != 2 || total) { arch_interrupt_restore(irq); break; }
             enum kernel_wait_wake_reason reason;
             kernel_lock_release(&guard);
             enum kernel_scheduler_status status = kernel_scheduler_block_current(&published, 0, 1, &reason);
-            riscv_interrupt_restore(irq);
+            arch_interrupt_restore(irq);
             if (status != KERNEL_SCHEDULER_STATUS_OK || reason == KERNEL_WAIT_SIGNALLED)
                 return status == KERNEL_SCHEDULER_STATUS_OK ? -KERNEL_EINTR : -KERNEL_EIO;
             kernel_mutex_lock(&readers, &guard); continue;
@@ -119,7 +119,7 @@ int kernel_log_action(int action, int length, int privileged,
         struct log_record record = records[sequence % RECORD_COUNT];
         unsigned n = record.length - partial;
         if (n > (unsigned)(length - total)) {
-            if (action != 2) { riscv_interrupt_restore(irq); break; }
+            if (action != 2) { arch_interrupt_restore(irq); break; }
             n = length - total;
         }
         for (unsigned i = 0; i < n; i++) scratch[i] = ring[(record.start + partial + i) % sizeof(ring)];
@@ -128,15 +128,15 @@ int kernel_log_action(int action, int length, int privileged,
             read_partial = partial + n;
             if (read_partial == record.length) { read_sequence++; read_partial = 0; }
         }
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
         if (copy(context, total, scratch, n)) { total = action == 2 && total ? total : -KERNEL_EFAULT; break; }
         total += n; sequence++;
     }
     if (guard.lock) kernel_lock_release(&guard);
     if (action == 4) {
-        irq = riscv_interrupt_save();
+        irq = arch_interrupt_save();
         if (sequence > clear_sequence) clear_sequence = sequence;
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
     }
     return total;
 }

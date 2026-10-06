@@ -1,6 +1,6 @@
 #include "char_device_internal.h"
 
-#include <arch/riscv/context.h>
+#include <arch/context.h>
 #include <kernel/console.h>
 #include <kernel/errno.h>
 #include <kernel/random.h>
@@ -148,7 +148,7 @@ static int random_ioctl(void *instance, struct kernel_task *caller, struct kerne
 
 static void initialize_devices(void)
 {
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     if (!devices_ready) {
         volatile struct kernel_char_device *null = &devices[0];
         null->rdev = UINT64_C(0x103);
@@ -190,7 +190,7 @@ static void initialize_devices(void)
         }
         devices_ready = 1U;
     }
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
 }
 
 const struct kernel_char_device *kernel_char_device_lookup(uint64_t rdev)
