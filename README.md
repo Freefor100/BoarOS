@@ -61,7 +61,8 @@ LoongArch L0–L1 首阶段已交付：QEMU virt/LA464 单核、LA64、16 KiB/�
 独立内存 ELF 经共用 MM/exec/任务/syscall 路径进入用户态，并通过 timer 抢占、
 故障/回收及 512 MiB/1 GiB 同 ELF Linux 对照。`kernel-la` 当前是首阶段验收入口；
 PCI 根盘、musl、动态加载、FP/SIMD、完整信号 handler、实板和 SMP 尚未验收，见
-[LA 首阶段](docs/modules/loongarch-boot.md)。
+[LA 首阶段](docs/modules/loongarch-boot.md)。第二阶段已按共用 VirtIO 块核心与独立 PCI transport 路线开始；
+LA 根盘与静态 musl 尚未通过新验收。
 
 ## 构建与验证
 

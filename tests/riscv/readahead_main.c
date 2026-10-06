@@ -242,7 +242,7 @@ void kernel_main(unsigned long hart, const void *dtb)
     check(kernel_scheduler_init(&allocator, (uintptr_t)__boot_stack_bottom, (uintptr_t)__boot_stack_top) == KERNEL_SCHEDULER_STATUS_OK, 4);
     check(riscv_plic_init((void *)(uintptr_t)routing.plic.base, routing.plic.size, routing.context, routing.source_count), 5);
     uint32_t source = 0;
-    for (unsigned i = 0; i < routing.route_count; i++) if (routing.routes[i].base == (uintptr_t)device.mmio) source = routing.routes[i].source;
+    for (unsigned i = 0; i < routing.route_count; i++) if (routing.routes[i].base == (uintptr_t)riscv_virtio_mmio_block_base(&device)) source = routing.routes[i].source;
     check(riscv_virtio_mmio_block_enable_irq(&device, source), 6);
     check(kernel_time_init(info.timebase_frequency, 0) == KERNEL_TIME_STATUS_OK &&
           riscv_timer_start(info.timebase_frequency, 100) == RISCV_TIMER_STATUS_OK, 7);

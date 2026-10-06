@@ -182,7 +182,7 @@ static void test_irq_reads(const void *dtb, struct physical_page_allocator *allo
         fail_block(43, 0, 1);
     uint32_t source = 0;
     for (unsigned i = 0; i < irq.route_count; i++)
-        if (irq.routes[i].base == (uintptr_t)device->mmio) source = irq.routes[i].source;
+        if (irq.routes[i].base == (uintptr_t)riscv_virtio_mmio_block_base(device)) source = irq.routes[i].source;
     if (kernel_scheduler_init(allocator, (uintptr_t)__boot_stack_bottom,
          (uintptr_t)__boot_stack_top) != KERNEL_SCHEDULER_STATUS_OK ||
         !riscv_virtio_mmio_block_enable_irq(device, source)) fail_block(44, 0, 1);

@@ -2,6 +2,24 @@
 
 本文描述 QEMU `virt` 上同步读写与批量读写块设备路径。DTB 节点来源见[DTB 与启动内存布局模块](dtb-memory.md)，上层文件语义见[VFS 与 ext4 模块](vfs-ext4.md)。
 
+## 共用块核心与 RV 适配
+
+`drivers/virtio/block.c` 和 `include/kernel/virtio_block.h` 拥有请求、split ring、
+八槽、批量/部分读写、FLUSH 门闩、超时/reset、DMA 引用与统计。transport 只提供
+语义寄存器访问、先于 used 快照的 IRQ acknowledge，以及 IRQ owner 登记/摘除。
+MMIO 与 PCI 的总线偏移、访问宽度和 read-to-clear 差异留在各自实现；IRQ/DMA
+CPU 屏障由构建期架构操作提供，不是运行期架构 vtable。
+
+RV `arch/riscv/virtio_mmio_block.c` 负责 MMIO 身份/版本和寄存器映射、PLIC 绑定；
+旧类型和入口保留薄适配。`riscv_virtio_mmio_block_base()` 仅暴露已有 MMIO 资源
+用于 DTB IRQ 匹配。启动 fixture 可在物理别名执行，函数指针必须从实际 PC 初始化，
+不能直接使用含高地址常量的静态回调表；生产内核仍在最终地址空间构造设备。
+
+`make test-virtio-block-host` 用相同真实块核心分别经 MMIO 和独立语义 transport
+驱动 wire 模型，覆盖反序完成、索引回绕、超时/reset、八槽与 DMA owner。
+新 transport 的测试不构成真实 PCI 验收。`test-block-riscv`、`test-root-init-riscv`、
+四组合 `test-io-sleep-riscv` 与栈门禁保护既有 RV 路径。
+
 ## 发现与 transport
 
 `dtb_read_boot_info()` 收集启用的 `compatible = "virtio,mmio"` 节点，翻译父总线 `ranges` 后按物理地址排序并拒绝重叠。最终 Sv39 页表只映射实际发现的 MMIO 范围。`arch/riscv/virtio_mmio_block.c` 依次探测这些 transport：非 block device 跳过，所有成功初始化的 block device 均登记，首个成为当前根设备，其余可通过设备节点挂载；已经表明自己是 block 但 transport/feature 不受支持时准确失败，不继续扫描磁盘内容。

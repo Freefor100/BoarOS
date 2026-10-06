@@ -500,6 +500,10 @@ stat/signal handler、FP/SIMD和根盘/libc未验收，以下完整范围仍未�
 
 ### L3 扩大真实用户空间
 
+2026-10-06 已批准 PCI→VirtIO块→ext4根盘→静态musl 阶段。共用块队列/owner/
+超时/reset 核心已提取，RV MMIO 与 LA PCI 独立负责 transport/IRQ；根盘与原
+静态程序结果须同时具备固定Linux对照和RV存储回归，不按架构构建成功勾选。
+
 - [ ] 静态 musl→动态 musl/DSO/TLS→fork/COW/信号→共享映射→glibc→真实应用，逐层保留错误与资源回收结果。
 - [ ] 维持 RV/LA 同口径功能矩阵，缺能力记录阻塞，不让新平台回退到固定输出或修改过的用户程序。
 
