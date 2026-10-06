@@ -15,10 +15,11 @@ uint32_t la_fpu_take_exception(void)
     uint32_t pending=csr&((csr&31U)<<24);
     uint32_t cleared=csr&~pending;
     __asm__ volatile("movgr2fcsr $fcsr0,%0"::"r"(cleared));
-    if(pending&(1U<<28))return 7; /* FPE_FLTINV 优先于其他同次原因。 */
-    if(pending&(1U<<27))return 3;
-    if(pending&(1U<<26))return 4;
-    if(pending&(1U<<25))return 5;
-    if(pending&(1U<<24))return 6;
+    /* Linux 清除启用的 Cause，却按原始 Cause 集合选择 si_code。 */
+    if(csr&(1U<<28))return 7; /* FPE_FLTINV 优先于其他同次原因。 */
+    if(csr&(1U<<27))return 3;
+    if(csr&(1U<<26))return 4;
+    if(csr&(1U<<25))return 5;
+    if(csr&(1U<<24))return 6;
     return 14; /* FPE_FLTUNK */
 }

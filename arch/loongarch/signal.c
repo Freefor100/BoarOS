@@ -120,8 +120,10 @@ void la_signal_restore_current(struct arch_trap_frame *frame)
         fp_address=address+16;address+=extension.size;
     }
     if(fp_address) {
-        if(kernel_copy_from_user(mm,&fp,fp_address,sizeof(struct la_linux_fp),&copied)!=KERNEL_UACCESS_STATUS_OK ||
-           copied!=sizeof(struct la_linux_fp))bad_frame();
+        /* Linux 只读 FR/FCC/FCSR；记录尾部 padding 可以落在不可读页。 */
+        size_t bytes=offsetof(struct la_linux_fp,padding);
+        if(kernel_copy_from_user(mm,&fp,fp_address,bytes,&copied)!=KERNEL_UACCESS_STATUS_OK ||
+           copied!=bytes)bad_frame();
     } else if(context.flags&1) {
         if(task->fpu.saved)la_fpu_save(&task->fpu);
         fp=task->fpu;

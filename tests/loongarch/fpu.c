@@ -14,6 +14,8 @@
 struct info {uint32_t magic,size;uint64_t padding;};
 struct fp {uint64_t regs[32],fcc;uint32_t fcsr,padding;};
 static volatile sig_atomic_t seen,fpe,frame_mode;
+static volatile sig_atomic_t fpe_code;
+static volatile uint32_t fpe_csr;
 int la_fp_register_probe(uint64_t pattern);
 static void handler(int sig,siginfo_t *info,void *pointer)
 {
@@ -30,11 +32,20 @@ static void handler(int sig,siginfo_t *info,void *pointer)
             if(mprotect(pages+16384,16384,PROT_NONE))_exit(88);
             __asm__ volatile("move $sp,%0;li.w $a7,139;syscall 0"::"r"(base):"memory");__builtin_unreachable();
         }
+        if(frame_mode==5) {
+            char *pages=mmap(0,49152,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);if(pages==MAP_FAILED)_exit(87);
+            /* 有效 FP 字段止于页尾；记录跳过不可读 padding 后仍有可读 END。 */
+            char *base=pages+16384-860;memcpy(base,(char *)u-128,860);
+            struct info padded={0x46505501,16384+284,0};memcpy(base+576,&padded,16);memset(pages+32768,0,16);
+            if(mprotect(pages+16384,16384,PROT_NONE))_exit(88);
+            __asm__ volatile("move $sp,%0;li.w $a7,139;syscall 0"::"r"(base):"memory");__builtin_unreachable();
+        }
         state.fcsr|=UINT32_C(0x10000010);memcpy((char *)u->uc_mcontext.__extcontext+16,&state,sizeof(state));return;
     }
     if(sig==SIGFPE) {
         if(frame_mode==4) {if(info->si_code!=SI_KERNEL || info->si_addr)_exit(89);}
-        else if(info->si_code!=FPE_FLTDIV || info->si_addr!=(void *)u->uc_mcontext.__pc)_exit(86);
+        else if(info->si_addr!=(void *)u->uc_mcontext.__pc)_exit(86);
+        fpe_code=info->si_code;fpe_csr=state.fcsr;
         state.fcsr&=~31U;memcpy((char *)u->uc_mcontext.__extcontext+16,&state,sizeof(state));
         if(frame_mode!=4)u->uc_mcontext.__pc+=4;
         fpe++;return;
@@ -78,14 +89,24 @@ int main(int argc,char **argv)
     CHECK(!sigaction(SIGFPE,&action,0));
     uint64_t one=UINT64_C(0x3ff0000000000000);uint32_t enable=8;
     __asm__ volatile("movgr2fr.d $f1,%0;movgr2fr.d $f2,$zero;movgr2fcsr $fcsr0,%1;fdiv.d $f0,$f1,$f2"::"r"(one),"r"(enable):"$f0","$f1","$f2");
-    CHECK(fpe==1);puts("LA FPU exception signal passed");
+    CHECK(fpe==1 && fpe_code==FPE_FLTDIV);
+    const uint64_t operands[]={UINT64_C(0x7fefffffffffffff),UINT64_C(0x0010000000000000)};
+    const int codes[]={FPE_FLTOVF,FPE_FLTUND};
+    const uint32_t remaining[]={UINT32_C(0x04000001),UINT32_C(0x02000001)};
+    for(unsigned i=0;i<2;i++) {
+        /* 只启用 inexact；分类仍需包含同时产生的 overflow/underflow Cause。 */
+        enable=1;
+        __asm__ volatile("movgr2fr.d $f1,%0;movgr2fcsr $fcsr0,%1;fmul.d $f0,$f1,$f1"::"r"(operands[i]),"r"(enable):"$f0","$f1");
+        CHECK(fpe==(sig_atomic_t)i+2 && fpe_code==codes[i] && fpe_csr==remaining[i]);
+    }
+    puts("LA FPU exception signal passed");
     CHECK(!sigaction(SIGTRAP,&action,0));
     pthread_t threads[2];for(uintptr_t i=0;i<2;i++)CHECK(!pthread_create(&threads[i],0,worker,(void *)i));
     for(unsigned i=0;i<2;i++){void *result;CHECK(!pthread_join(threads[i],&result) && !result);}
     CHECK(!fesetround(FE_DOWNWARD));pid_t child=fork();CHECK(child>=0);
     if(!child){execl("/init","/init","execed",(char *)0);_exit(2);}
     int status;CHECK(waitpid(child,&status,0)==child && WIFEXITED(status) && !WEXITSTATUS(status));
-    for(frame_mode=1;frame_mode<=4;frame_mode++) {
+    for(frame_mode=1;frame_mode<=5;frame_mode++) {
         child=fork();CHECK(child>=0);
         if(!child){fpe=0;if(raise(SIGUSR1))_exit(1);_exit(frame_mode==4 && fpe!=1 ? 2 : 0);}
         CHECK(waitpid(child,&status,0)==child);
