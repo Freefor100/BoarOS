@@ -13,6 +13,7 @@ make test-root-loongarch        # PCI/ext4/LP64S musl/原 BusyBox 与 Linux 对�
 make test-root-io-loongarch     # 真正的块写错误与持久 owner
 make test-la-userland-host      # 缓存输入/完整安装树的9个拒绝反例
 make test-loongarch-boot        # 512 MiB/1 GiB 启动与后续契约
+make test-boot-random-loongarch # DTB材料可用、可信熵仍为零，两种RAM
 make test-loongarch             # 同时准备固定 Linux，对照同一个用户 ELF
 make test-stack-usage-la
 make test-signal-loongarch     # 同一静态 musl ELF 的整数信号/恢复/重启对照
@@ -34,6 +35,9 @@ defconfig 建立 16 KiB/三级页表、initramfs 对照。缓存分别位于 `bu
 内核PLV0的DMW。平台从直接启动传入的EFI system table定位DTB，检查签名、
 表数与范围；按DTB中所有RAM bank排序，扣除启动信息、DTB、内核和保留区。
 物理分配器复用通用buddy实现，页大小在构建期固定为16KiB。
+完整启动布局验证成功后，将DTB的rng-seed交给共用随机核心作为不计熵材料，随后
+擦除临时副本；原DTB仍属于固件。缺种子不伪造材料或ready；AT_RANDOM只在有材料
+时构造。固定QEMU的32字节种子使GNU启动可用，可信初始化仍等待真实RNG设备输入。
 
 架构 MMU 设置 PWCL/PWCH、STLBPS 和独立 TLB refill 入口；根目录/中间目录缺失时
 refill 写入无效 paired entry，交由普通用户缺页路径处理，不能读取物理地址零。
@@ -53,7 +57,8 @@ refill 写入无效 paired entry，交由普通用户缺页路径处理，不能
 LA 保存完整整数 trap frame（304 字节）、内核 ABI context、用户 SP/TP/ERA/PRMD；
 KS0 用于区分并交换用户/内核 TP。timer 使用 CPUCFG 频率、RDTIME.D 和 one-shot
 TCFG，接入共用 tick、deadline、预算与调度；未启用 UART 外部 IRQ，timer 轮询
-就绪输入并唤醒阻塞 read/ppoll owner。未使用FP的task保持EUEN关闭；已使用者只启用FPE并保存标量状态，LSX/LASX/LBT未支持。
+就绪输入并唤醒阻塞 read/ppoll owner。未使用FP/SIMD的task保持EUEN关闭；已使用者
+按实际宽度启用FPE/SXE/ASXE并保存内嵌状态，具体见[FP/SIMD模块](loongarch-fpu.md)。LBT未支持。
 
 内存 reader 经共用 source、映像、MM、任务创建与 syscall dispatch 路径进入 PLV3。
 LA syscall 从 a7/a0–a5 解码，返回 a0 并恢复 ERA+4。未知 syscall 返回 ENOSYS；

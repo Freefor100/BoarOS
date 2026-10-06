@@ -9,6 +9,10 @@
 #include <string.h>
 #include <kernel/uaccess.h>
 void kernel_console_putc(char c) { (void)c; }
+const struct kernel_char_device *kernel_tty_device_lookup(uint64_t rdev)
+{ (void)rdev; return 0; }
+const struct kernel_char_device *kernel_tty_device_template(void) { return 0; }
+const struct kernel_char_device kernel_rtc_device = { .rdev = 0xa87 };
 uint32_t kernel_console_poll(uint32_t requested, struct kernel_wait_queue **q)
 { (void)requested;(void)q; return 0; }
 int kernel_console_read_buffer(uint32_t flags, void *b, size_t s, size_t *r)
@@ -32,24 +36,24 @@ int main(void)
     unsigned char data[32]={0}; size_t count=99;
     assert(random && urandom && !kernel_random_ready());
     int bits=-1;
-    assert(random->ioctl(0,0x80045200U,(uintptr_t)&bits)==0 && bits==0);
-    assert(random->ioctl(0,0x80045200U,0)==-KERNEL_EFAULT);
-    assert(random->ioctl(0,0xdeadU,0)==-KERNEL_EINVAL);
-    assert(random->ioctl(0,0x40045201U,0)==-KERNEL_ENOTSUP);
-    assert(random->ioctl(0,0x5207U,0)==-KERNEL_ENOTSUP);
-    assert(random->poll(0,0)==(KERNEL_POLLOUT|KERNEL_POLLWRNORM));
-    assert(random->read(KERNEL_FILES_O_NONBLOCK,data,32,&count)==-KERNEL_EAGAIN);
+    assert(random->ioctl(0,0,0,0,0,0x80045200U,(uintptr_t)&bits)==0 && bits==0);
+    assert(random->ioctl(0,0,0,0,0,0x80045200U,0)==-KERNEL_EFAULT);
+    assert(random->ioctl(0,0,0,0,0,0xdeadU,0)==-KERNEL_EINVAL);
+    assert(random->ioctl(0,0,0,0,0,0x40045201U,0)==-KERNEL_ENOTSUP);
+    assert(random->ioctl(0,0,0,0,0,0x5207U,0)==-KERNEL_ENOTSUP);
+    assert(random->poll(0,0,0,0)==(KERNEL_POLLOUT|KERNEL_POLLWRNORM));
+    assert(random->read(0,0,KERNEL_FILES_O_NONBLOCK,data,32,&count)==-KERNEL_EAGAIN);
     assert(!count && !restarted);
     /* A blocking read enters the wait fixture, which delivers a signal. */
-    assert(random->read(0,data,32,&count)==-KERNEL_ERESTARTSYS);
+    assert(random->read(0,0,0,data,32,&count)==-KERNEL_ERESTARTSYS);
     assert(!count && restarted==1);
-    assert(urandom->read(KERNEL_FILES_O_NONBLOCK,data,32,&count)==0 && count==32);
-    assert(random->write(data,32,&count)==0 && !kernel_random_ready());
+    assert(urandom->read(0,0,KERNEL_FILES_O_NONBLOCK,data,32,&count)==0 && count==32);
+    assert(random->write(0,0,0,data,32,&count)==0 && !kernel_random_ready());
     kernel_random_mix(data,31,1);
-    assert(urandom->ioctl(0,0x80045200U,(uintptr_t)&bits)==0 && bits==248);
+    assert(urandom->ioctl(0,0,0,0,0,0x80045200U,(uintptr_t)&bits)==0 && bits==248);
     kernel_random_mix(data,1,1);
-    assert(urandom->ioctl(0,0x80045200U,(uintptr_t)&bits)==0 && bits==256);
-    assert(random->read(KERNEL_FILES_O_NONBLOCK,data,32,&count)==0 && count==32);
-    assert(random->poll(0,0)==(KERNEL_POLLIN|KERNEL_POLLRDNORM));
+    assert(urandom->ioctl(0,0,0,0,0,0x80045200U,(uintptr_t)&bits)==0 && bits==256);
+    assert(random->read(0,0,KERNEL_FILES_O_NONBLOCK,data,32,&count)==0 && count==32);
+    assert(random->poll(0,0,0,0)==(KERNEL_POLLIN|KERNEL_POLLRDNORM));
     puts("random device pre-ready wait, poll, write-credit tests passed");
 }

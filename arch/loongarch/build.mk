@@ -47,6 +47,11 @@ test-loongarch: kernel-la prepare-la-linux test-stack-usage-la test-loongarch-fa
 	python3 -B tests/loongarch/reference.py --qemu $(QEMU_LOONGARCH64) --cc $(LA_CC) --boaros-log $(LA_BUILD)/boaros.log
 test-loongarch-boot: kernel-la
 	python3 -B tests/loongarch/run.py --qemu $(QEMU_LOONGARCH64) --stage boot
+$(LA_BUILD)/kernel-boot-random: $(LA_OBJECTS) $(LA_BUILD)/tests/loongarch/boot_random.o arch/loongarch/linker.ld
+	$(LA_CC) $(LA_FLAGS) -nostdlib -nostartfiles -static -no-pie -T arch/loongarch/linker.ld -Wl,--build-id=none,--gc-sections,--wrap=physical_page_allocate,--wrap=physical_page_allocate_order,--wrap=kernel_syscall_dispatch,--wrap=la_boot_tasks -o $@ $(LA_OBJECTS) $(LA_BUILD)/tests/loongarch/boot_random.o -lgcc
+.PHONY: test-boot-random-loongarch
+test-boot-random-loongarch: $(LA_BUILD)/kernel-boot-random prepare-la-tools
+	python3 -B tests/loongarch/run.py --kernel $(LA_BUILD)/kernel-boot-random --marker 'LA untrusted DTB random material passed'
 test-stack-usage-la: kernel-la
 	python3 -B tests/stack-usage.py $(LA_BUILD) --stack-bytes 32768 --trap-frame-bytes 304
 
