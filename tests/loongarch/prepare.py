@@ -53,7 +53,7 @@ def prepare(args):
                 'la64-16kb-3level-virt-platform-v1' if profile=='platform' else 'la64-16kb-3level-initramfs-v1'}
     recorded = json.loads(stamp.read_text()) if stamp.exists() else None
     if recorded and {key: value for key, value in recorded.items()
-                     if key != 'configuration_sha256'} != identity:
+                     if key not in ('configuration_sha256','image_sha256')} != identity:
         raise SystemExit(f'{directory}: cache identity changed; use a fresh build directory')
     if args.component == 'tools':
         if recorded is None or not (directory / 'build.ninja').exists():
@@ -88,6 +88,7 @@ def prepare(args):
             raise SystemExit('Linux LA platform cache lacks builtin devices')
         subprocess.run([*command, f'-j{args.jobs}', 'vmlinux'], check=True)
         identity['configuration_sha256'] = hashlib.sha256(configuration.read_bytes()).hexdigest()
+    identity['image_sha256']=hashlib.sha256((directory/('qemu-system-loongarch64' if args.component=='tools' else 'vmlinux')).read_bytes()).hexdigest()
     stamp.write_text(json.dumps(identity, indent=2) + '\n')
     print(f'LA {args.component} cache: {directory}; source {revision}; {compiler["version"]}')
 

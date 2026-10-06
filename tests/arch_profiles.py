@@ -1,6 +1,9 @@
 """Immutable target facts shared by native platform acceptance runners."""
 from dataclasses import dataclass
+import hashlib
+import json
 from pathlib import Path
+import subprocess
 import sys
 ROOT=Path(__file__).resolve().parents[1]
 @dataclass(frozen=True)
@@ -13,13 +16,22 @@ class ArchitectureProfile:
     kernel: str
     def boot(self,qemu,kernel,memory):
         command=[qemu,'-machine','virt','-smp','1','-m',memory,'-kernel',str(kernel),'-nographic','-no-reboot']
-        return command+(['-cpu','la464'] if self.name=='loongarch' else ['-bios','default'])
+        return command+(['-cpu','la464','-global','ls7a_rtc.toy-enabled=on'] if self.name=='loongarch' else ['-bios','default'])
     def linux_kernel(self):
-        if self.name=='loongarch':return ROOT/'build/linux-la-platform/vmlinux'
+        if self.name=='loongarch':
+            image=ROOT/'build/linux-la-platform/vmlinux'
+            identity=json.loads((image.parent/'boaros-identity.json').read_text())
+            revision=next(row.split('\t')[4] for row in (ROOT/'references/sources.tsv').read_text().splitlines() if row.startswith('snapshot\tlinux\t'))
+            actual=subprocess.check_output(['git','-C',str(ROOT/'references/linux'),'rev-parse','HEAD'],text=True).strip()
+            configuration=image.parent/'.config'
+            if identity['revision']!=revision or actual!=revision or 'CONFIG_16KB_3LEVEL=y' not in configuration.read_text():
+                raise RuntimeError('LA reference Linux revision/page configuration mismatch')
+            if hashlib.sha256(configuration.read_bytes()).hexdigest()!=identity.get('configuration_sha256') or hashlib.sha256(image.read_bytes()).hexdigest()!=identity.get('image_sha256'):
+                raise RuntimeError('LA reference Linux content mismatch; run prepare-la-linux-platform')
+            return image
         sys.path.insert(0,str(ROOT/'tests/diff-abi'))
         import harness
-        key,_=harness.identity(ROOT/'tests/diff-abi/linux.config')
-        return ROOT/'build/diff-abi/linux'/key/'vmlinux'
+        return harness.linux_build()[0]
     def block(self,transport):
         if self.name=='loongarch':return 'virtio-blk-pci,drive=root,addr=1,disable-legacy=on'
         return 'virtio-blk-device,drive=root,bus=virtio-mmio-bus.0'
@@ -33,5 +45,5 @@ class ArchitectureProfile:
 PROFILES={
     'riscv':ArchitectureProfile('riscv',4096,'qemu-system-riscv64','riscv64-elf-gcc',
         ('-march=rv64imac_zicsr_zifencei','-mabi=lp64','-mcmodel=medany'),'kernel-rv'),
-    'loongarch':ArchitectureProfile('loongarch',16384,'build/qemu-la/qemu-system-loongarch64',
+    'loongarch':ArchitectureProfile('loongarch',16384,'build/qemu-la-rtc/qemu-system-loongarch64',
         'loongarch64-unknown-linux-gnu-gcc',('-mabi=lp64s','-msoft-float','-mno-lsx','-mno-lasx'),'kernel-la')}

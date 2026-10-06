@@ -9,7 +9,7 @@ for case in range(6):
     for memory in ('512M','1G'):
         directory=work/f'{case}-{memory}';directory.mkdir()
         image=disk(directory,ROOT/'build/loongarch/network-contract')
-        argv=['build/qemu-la/qemu-system-loongarch64','-machine','virt','-cpu','la464','-smp','1','-m',memory,
+        argv=['build/qemu-la-rtc/qemu-system-loongarch64','-machine','virt','-cpu','la464','-global','ls7a_rtc.toy-enabled=on','-smp','1','-m',memory,
             '-kernel',f'build/loongarch/kernel-uart-failure-{case}','-nographic','-no-reboot','-net','none',
             '-drive',f'file={image},if=none,format=raw,id=root','-device','virtio-blk-pci,drive=root,addr=1,disable-legacy=on']
         code,text=run_guest(argv,90);(directory/'console.log').write_text(text)

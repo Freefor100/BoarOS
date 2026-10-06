@@ -12,7 +12,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--kernel', default='kernel-la')
     parser.add_argument('--qemu', default=os.environ.get(
-        'QEMU_LOONGARCH64', 'build/qemu-la/qemu-system-loongarch64'))
+        'QEMU_LOONGARCH64', 'build/qemu-la-rtc/qemu-system-loongarch64'))
     parser.add_argument('--stage', choices=('boot', 'mmu', 'user'), default='user')
     parser.add_argument('--timeout', type=float, default=90)
     parser.add_argument('--log')
@@ -23,7 +23,7 @@ def main():
         raise SystemExit('LA contract failed: kernel image is missing')
     logs = []
     for memory in ('512M', '1G'):
-        command = [args.qemu, '-machine', 'virt', '-cpu', 'la464',
+        command = [args.qemu, '-machine', 'virt', '-cpu', 'la464', '-global', 'ls7a_rtc.toy-enabled=on',
                    '-smp', '1', '-m', memory, '-kernel', str(kernel),
                    '-nographic', '-no-reboot']
         try:

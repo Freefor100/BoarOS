@@ -39,7 +39,7 @@ def main(args):
         for memory in ('512M','1G'):
             image=disk(directory,args.program,ROOT/'build/loongarch/busybox-source/busybox/busybox')
             for guest,source,_ in files:add_file(image,guest,source)
-            command=[args.qemu,'-machine','virt','-cpu',args.cpu,'-smp','1','-m',memory,'-kernel','build/linux-la/vmlinux' if platform=='Linux' else args.kernel,
+            command=[args.qemu,'-machine','virt','-cpu',args.cpu,'-global','ls7a_rtc.toy-enabled=on','-smp','1','-m',memory,'-kernel','build/linux-la/vmlinux' if platform=='Linux' else args.kernel,
                      '-drive',f'file={image},format=raw,if=none,id=root','-device','virtio-blk-pci,drive=root,addr=1,disable-legacy=on','-net','none','-nographic','-no-reboot']
             if platform=='Linux': command+=['-initrd',str(initrd),'-append','console=ttyS0 rdinit=/init loglevel=3']
             try: code,text=run_guest(command,args.timeout)
@@ -62,4 +62,4 @@ if __name__=='__main__':
     parser.add_argument('--file',action='append',default=[],help='/guest/path=host/path; copy original loader/library inputs')
     parser.add_argument('--exit-status',type=int,choices=range(256),default=0,metavar='0..255')
     parser.add_argument('--cpu',default='la464')
-    parser.add_argument('--cc',default='loongarch64-unknown-linux-gnu-gcc');parser.add_argument('--qemu',default='build/qemu-la/qemu-system-loongarch64');parser.add_argument('--kernel',default='kernel-la');main(parser.parse_args())
+    parser.add_argument('--cc',default='loongarch64-unknown-linux-gnu-gcc');parser.add_argument('--qemu',default='build/qemu-la-rtc/qemu-system-loongarch64');parser.add_argument('--kernel',default='kernel-la');main(parser.parse_args())

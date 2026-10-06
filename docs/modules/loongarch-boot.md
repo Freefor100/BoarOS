@@ -28,8 +28,9 @@ make test-permissions-loongarch # 冷/驻留 EXEC 页、fork、uaccess 与改权
 
 `run-loongarch` 进入 console 探针后，依次在 poll/read ready 标记出现时输入 `g` 和 `r`（各回车），完成后关机。
 
-`prepare-la-tools` 从固定 QEMU 源码构建模拟器；`prepare-la-linux` 从固定 Linux
-defconfig 建立 16 KiB/三级页表、initramfs 对照。缓存分别位于 `build/qemu-la`、
+`prepare-la-tools` 从固定 QEMU 加本地 RTC 补丁构建派生模拟器；`prepare-la-original-tools`
+保留无补丁对照构建。`prepare-la-linux` 从固定 Linux defconfig 建立
+16 KiB/三级页表、initramfs 对照。缓存分别位于 `build/qemu-la-rtc`、`build/qemu-la`、
 `build/linux-la`、`build/loongarch`；身份变化时拒绝混用。`make prune-build`
 保留工具、对象、ELF 和身份，删除运行日志及 initramfs。`QEMU_LOONGARCH64` 和
 `LA_CROSS_COMPILE` 可覆盖工具位置，版本变化需要重新验收。
@@ -233,3 +234,40 @@ DELETE/WAL多进程和重启回归通过；NBD全恢复矩阵和LA原SQLite应�
 net addr5、RNG addr9的共享INTx是测试输入，生产扫描不依赖槽位。真实TAP、
 九类失败与资源证据见[net模块](riscv-virtio-net.md)。TTY UART IRQ、RTC、
 AF_UNIX sendfile计费差异及更广原程序尚在本轮计划内，不能声明LA/RV全面等价。
+
+## LS7A RTC 与派生模拟器
+
+`platform/loongarch_rtc.c` 按 [时间模块](kernel-time.md#la-ls7a-rtc) 初始化和读取
+真实 UTC。正常用户态仍复用共用只读 RTC 字符设备，运行期不持有 RTC IRQ owner。
+原 BusyBox dmesg/hwclock/df、OFD 独占、dup/fork/exec、错误指针与最终根资源释放，
+同一 ELF 已在 Linux/BoarOS、512 MiB/1 GiB 验证。日志探针与原脚本各自清空日志，
+因此分别启动，不能以人为打印启动标记补偿已经消耗的日志内容。
+
+用户选择 A 后，模拟器采用 `tests/loongarch/qemu-ls7a-rtc.patch` 的派生构建。
+固定 `references/qemu` commit `84f07211cc5b4fc6a371559bf8a5de4fb068e648`
+保持原样；补丁 SHA-256 为
+`a2951479d2f45afed8ffc9e69ed4a44efd7174b00a688b03d5d786332515cf2d`。
+`tests/loongarch/qemu_rtc.py` 导出固定 commit 与三个固定 Meson wrap commit，
+校验源文件、构建配置、编译器及模拟器内容/权限/链接目标。派生缓存是
+`build/qemu-la-rtc`；原版缓存 `build/qemu-la` 可由 `prepare-la-original-tools` 重建。
+普通命中拒绝身份变化，已确认的补丁修改通过 `--rebuild` 重新导出和构建。
+
+补丁补齐 Linux 使用的 RTC PM 子集：PM1_STS.RTC_STS 是真实锁存的 W1C 状态，
+PM1_EN.RTC_EN 与 PM1_CNT.INT_EN 控制独立 SCI 输出。六个 TOY/RTC 比较器各自
+持有 pending，重写只清除本比较器；match=0 的无效 TOY 日期清除直接 IRQ。
+原 virt 聚合计时 IRQ 保持 pin6，PM SCI 与 GED 经 OR 共享 pin7，避免互相覆盖。
+复位撤销定时器和 IRQ；迁移保存 pending/PM 状态并恢复尚未触发的比较器。
+RTC counter 按 32 位回绕；六位年份的过去 TOY match 等待下一个 64 年周期。
+`system/rtc.c` 日期差值改用实际 `rtc_clock`，修复 clock=vm 的宿主时钟错配。
+
+直接 ELF 启动 profile 显式传入 `-global ls7a_rtc.toy-enabled=on`，代表已初始化的
+电池时钟输入；设备默认复位值仍为关闭。无需改 Linux 驱动或 RTC compatible。
+该 PM 子集不声明完整 ACPI 电源管理、休眠或调频支持；TOY 的当前模拟分辨率仍为
+1 秒，不能引用芯片手册的 0.1 秒作为 QEMU 实测能力。
+
+```sh
+make test-rtc-loongarch-host
+make test-rtc-model-loongarch    # 实际 MMIO、W1C、独立 IRQ、重编程、回绕、复位、迁移
+make test-rtc-alarm-loongarch    # 原版 Linux 两次告警/跨年，混合 block/RNG/UART 与实际退出
+make test-environment-loongarch  # 两个独立清日志场景，各在双侧、两种 RAM
+```

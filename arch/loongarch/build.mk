@@ -1,5 +1,5 @@
 LA_CROSS_COMPILE ?= loongarch64-unknown-linux-gnu-
-QEMU_LOONGARCH64 ?= build/qemu-la/qemu-system-loongarch64
+QEMU_LOONGARCH64 ?= build/qemu-la-rtc/qemu-system-loongarch64
 LA_BUILD := build/loongarch
 LA_CC := $(LA_CROSS_COMPILE)gcc
 LA_FLAGS := -march=loongarch64 -mabi=lp64s -msoft-float -mno-lsx -mno-lasx -mcmodel=normal
@@ -8,7 +8,7 @@ LA_CFLAGS := $(LA_FLAGS) -std=gnu11 -O2 -g3 -ffreestanding -fno-builtin -fno-sta
 LA_C_SOURCES := $(filter-out arch/% kernel/main.c,$(C_SOURCES)) \
     arch/loongarch/main.c arch/loongarch/mmu.c arch/loongarch/context.c \
     arch/loongarch/timer.c arch/loongarch/trap.c arch/loongarch/signal.c arch/loongarch/fpu.c platform/loongarch_virt.c \
-    platform/loongarch_pci.c platform/loongarch_root.c drivers/virtio/pci_block.c drivers/virtio/pci.c drivers/virtio/pci_rng.c drivers/virtio/pci_net.c kernel/pci.c \
+    platform/loongarch_pci.c platform/loongarch_root.c platform/loongarch_rtc.c drivers/virtio/pci_block.c drivers/virtio/pci.c drivers/virtio/pci_rng.c drivers/virtio/pci_net.c kernel/pci.c \
     tests/loongarch/mmu.c tests/loongarch/heap.c tests/loongarch/user_boot.c tests/loongarch/elf_failures.c
 LA_ASM_SOURCES := arch/loongarch/boot.S arch/loongarch/context_switch.S \
     arch/loongarch/tlb_refill.S arch/loongarch/trap_entry.S arch/loongarch/signal_trampoline.S arch/loongarch/fpu_state.S tests/loongarch/user_blob.S
@@ -23,13 +23,20 @@ kernel-la: $(LA_OBJECTS) arch/loongarch/linker.ld
 	$(LA_CC) $(LA_FLAGS) -nostdlib -nostartfiles -static -no-pie -T arch/loongarch/linker.ld -Wl,--build-id=none,--gc-sections,--wrap=physical_page_allocate,--wrap=physical_page_allocate_order,--wrap=kernel_syscall_dispatch -Wl,-Map,$(LA_BUILD)/kernel.map -o $@ $(LA_OBJECTS) -lgcc
 .PHONY: run-loongarch test-loongarch test-loongarch-boot prepare-la-tools prepare-la-linux test-stack-usage-la
 prepare-la-tools:
+	python3 -B tests/loongarch/qemu_rtc.py
+.PHONY: prepare-la-original-tools test-rtc-model-loongarch test-rtc-alarm-loongarch
+prepare-la-original-tools:
 	python3 -B tests/loongarch/prepare.py --component tools
+test-rtc-model-loongarch: prepare-la-tools
+	python3 -B tests/loongarch/rtc_model.py --qemu $(QEMU_LOONGARCH64)
+test-rtc-alarm-loongarch: prepare-la-tools prepare-la-linux-platform prepare-la-userland
+	python3 -B tests/loongarch/rtc_alarm.py
 prepare-la-linux:
 	python3 -B tests/loongarch/prepare.py --component linux --cross $(LA_CROSS_COMPILE)
 .PHONY: prepare-la-linux-platform
 prepare-la-linux-platform:
 	python3 -B tests/loongarch/prepare.py --component linux --profile platform --cross $(LA_CROSS_COMPILE)
-ifeq ($(QEMU_LOONGARCH64),build/qemu-la/qemu-system-loongarch64)
+ifeq ($(QEMU_LOONGARCH64),build/qemu-la-rtc/qemu-system-loongarch64)
 run-loongarch test-loongarch test-loongarch-boot: prepare-la-tools
 endif
 
@@ -99,7 +106,7 @@ $(LA_BUILD)/kernel-fatal-%: $(LA_BUILD)/fatal-%.o $(LA_OBJECTS) arch/loongarch/l
 .PHONY: test-loongarch-fatal
 test-loongarch-fatal: $(LA_BUILD)/kernel-fatal-1 $(LA_BUILD)/kernel-fatal-2 $(LA_BUILD)/kernel-fatal-3
 	python3 -B tests/loongarch/fatal.py --qemu $(QEMU_LOONGARCH64)
-ifeq ($(QEMU_LOONGARCH64),build/qemu-la/qemu-system-loongarch64)
+ifeq ($(QEMU_LOONGARCH64),build/qemu-la-rtc/qemu-system-loongarch64)
 test-loongarch-fatal: prepare-la-tools
 endif
 
@@ -283,6 +290,16 @@ test-pty-loongarch: kernel-la
 test-pty-apps-loongarch: kernel-la
 	python3 -B tests/tty/pty_riscv.py --arch loongarch --case libc
 	python3 -B tests/tty/pty_riscv.py --arch loongarch --case script
+
+.PHONY: test-rtc-loongarch-host
+test-rtc-loongarch-host:
+	@mkdir -p build/host
+	cc -std=c11 -O1 -g -Wall -Wextra -Werror -idirafter include -fsanitize=address,undefined tests/host/loongarch_rtc.c platform/loongarch_rtc.c -o build/host/loongarch-rtc
+	build/host/loongarch-rtc
+
+.PHONY: test-environment-loongarch
+test-environment-loongarch: kernel-la
+	python3 -B tests/environment.py --arch loongarch
 
 $(LA_BUILD)/pipe-geometry: tests/workloads/pipe_geometry.c $(LA_BUILD)/musl-root/bin/musl-gcc
 	REALGCC=$(CURDIR)/$(LA_BUILD)/gcc-sf/root/bin/loongarch64-unknown-linux-gnusf-gcc $(LA_BUILD)/musl-root/bin/musl-gcc -static -O2 -Wall -Wextra -Werror $< -o $@

@@ -400,3 +400,33 @@ BoarOS另检查实际根页/堆/任务栈/BAR基线。原输入、录制文件�
 独立nonblocking探针先在固定Linux两种RAM通过，旧BoarOS在第五页EAGAIN且正常回收，
 修复后同ELF四侧通过。修复复用已持有的数据区；4096字节PIPE_BUF仍是用户ABI字节值。
 这是实际生产容量缺陷，与探针mprotect采用错误4KiB边界分别修复，不能只放宽测试。
+
+## LS7A RTC 的 Linux 组合阻塞与派生修复（2026-10-07）
+
+依据为本地 `references/loongarch-documentation` commit
+`e0d6592229d9e00e512bd28b688a7f20b171714f` 的
+`docs/Loongson-7A1000-usermanual-EN/rtc/`、`power-management-module/` 与
+`interrupt-controller/interrupt-source-assignment.adoc`，以及固定 Linux
+`f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 `drivers/rtc/rtc-loongson.c`。
+TOY 直接计时中断与 PM RTC_STS/W1C/RTC_EN 是不同的硬件状态，不能用一个 sticky IRQ
+同时代替；固定 virt 的聚合路由也不能等同于 LS7A 实板各 pin 的分配。
+
+原 QEMU v11.1.0 `84f07211cc5b4fc6a371559bf8a5de4fb068e648` 只映射
+`0x100d0100..0x100d01ff`。Linux 启用 RTC 后，类设备初始化读 alarm 会访问
+`PM1_EN=0x100d0010`，实际 native ADEM 卡在 read_alarm+0x84；只查看成功读取
+TOY 或启动串口不能发现这个组合故障。旧 timer callback 只有 raise，Linux ISR
+写 match0=0 后也不能撤销 IRQ。实际 qtest 先复现 PM_EN 写后读零，独立定时器测试
+又复现 clock=vm 下 qemu_timedate_diff 错用 HOST，首次告警之后重新设定会延迟。
+
+人已选择补齐派生模拟器路线，未采用 DTB compatible 降级。固定参考源码保留原样，
+补丁、重建命令及身份检查入仓库；输入控制用 toy-enabled property 在 reset 时生效。
+之前 generic loader 的写入会被 reset 覆盖，GDB post-reset 原型不再是最终 runner。
+模型的 PM/直接 IRQ、比较器交错、回绕、复位和 pending 迁移经实际 QEMU 验证；
+qtest 合成 clock 不在 TCG 迁移时钟内，目的端在 restore 前对齐该测试 clock。
+原版 Linux 驱动在两种 RAM 完成两次 read/poll 告警、UTC 跨年、重新设定、坏参数/
+指针、block/RNG/UART 进展、实际退出42及卸载。
+
+BoarOS 同一环境 ELF 的真实 UTC、日志内容/OFD、别名与 fork/exec 回收及原 BusyBox
+hwclock/dmesg/df 在两种 RAM 均通过。两项测试都 clear 日志，组合到同一启动会
+破坏下一项的启动日志前提，必须用独立启动，而非伪造日志或改动原程序。
+BoarOS RTC 仍按共用只读设备口径验收；Linux 告警成功不能记作 BoarOS 告警支持。

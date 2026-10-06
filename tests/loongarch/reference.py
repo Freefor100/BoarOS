@@ -33,7 +33,7 @@ def records(output):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--qemu', default='build/qemu-la/qemu-system-loongarch64')
+    parser.add_argument('--qemu', default='build/qemu-la-rtc/qemu-system-loongarch64')
     parser.add_argument('--kernel', default='build/linux-la/vmlinux')
     parser.add_argument('--program', default='build/loongarch/user-probe')
     parser.add_argument('--cc', default='loongarch64-unknown-linux-gnu-gcc')
@@ -62,7 +62,7 @@ def main():
         ('la-probe', 0o100755, program, 0, 0), ('TRAILER!!!', 0, b'', 0, 0)]))
     expected = records(Path(args.boaros_log).read_text()) if args.boaros_log else None
     for memory in ('512M', '1G'):
-        code, text = run_guest([args.qemu, '-machine', 'virt', '-cpu', 'la464',
+        code, text = run_guest([args.qemu, '-machine', 'virt', '-cpu', 'la464', '-global', 'ls7a_rtc.toy-enabled=on',
                                  '-smp', '1', '-m', memory, '-kernel', args.kernel,
                                  '-initrd', str(ramdisk), '-append',
                                  'console=ttyS0 rdinit=/init loglevel=3', '-nographic',

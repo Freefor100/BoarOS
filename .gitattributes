@@ -1,2 +1,4 @@
 # Preserve the pinned upstream lwIP snapshot byte-for-byte.
 third_party/lwip/** whitespace=-trailing-space,-blank-at-eof
+# Unified patches use a space prefix for empty context lines.
+tests/loongarch/qemu-ls7a-rtc.patch whitespace=-trailing-space

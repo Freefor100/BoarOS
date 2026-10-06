@@ -131,6 +131,5 @@ int la_virt_boot_memory(uint64_t systab, uint64_t kernel_start, uint64_t kernel_
 
 unsigned arch_uart_rx_ready(void) { return (uart[5]&1)!=0; }
 char arch_uart_getc(void) { return (char)uart[0]; }
-/* No RTC provider is registered yet; external IRQ state belongs to the PCI platform. */
+/* External IRQ registration belongs to the platform controller. */
 int arch_external_interrupt_active(void) { return la_virt_irq_active(); }
-int arch_rtc_read_ns(uint64_t *out) { (void)out; return 1; }

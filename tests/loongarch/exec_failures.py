@@ -37,7 +37,7 @@ def main(args):
             path='/lib/ld-musl-loongarch64.so.1'
             if case!='missing':add_file(image,path,wrong if case=='wrong' else broken if case=='broken' else short if case=='short' else loader,0o100644 if case=='noexec' else 0o100755)
             kernel='build/loongarch/kernel-root-oom-1' if case=='oom' else 'kernel-la'
-            command=[args.qemu,'-machine','virt','-cpu','la464','-smp','1','-m',memory,'-kernel',kernel,
+            command=[args.qemu,'-machine','virt','-cpu','la464','-global','ls7a_rtc.toy-enabled=on','-smp','1','-m',memory,'-kernel',kernel,
                 '-drive',f'file={image},format=raw,if=none,id=root','-device','virtio-blk-pci,drive=root,addr=1,disable-legacy=on','-net','none','-nographic','-no-reboot']
             code,text=run_guest(command,120);(area/'log').write_text(text)
             expected=f'LA root boot errno=0x{error&((1<<64)-1):016x}'
@@ -45,4 +45,4 @@ def main(args):
                 print(text);raise SystemExit('dynamic construction failure '+case+'/'+memory)
             print(f'BoarOS/{memory} interpreter {case}: errno, unpublished PID1, source/MM/heap/root baseline PASS')
 if __name__=='__main__':
-    parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('--cc',default='loongarch64-unknown-linux-gnu-gcc');parser.add_argument('--qemu',default='build/qemu-la/qemu-system-loongarch64');main(parser.parse_args())
+    parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('--cc',default='loongarch64-unknown-linux-gnu-gcc');parser.add_argument('--qemu',default='build/qemu-la-rtc/qemu-system-loongarch64');main(parser.parse_args())
