@@ -85,3 +85,18 @@ make test-riscv
 
 `kernel_elf64_source_create_interpreter()` 复用create所有权契约，仅在完整64字节header之前
 区分短EOF的Linux EIO；运行期exec与RV/LA根启动均使用同一入口，失败保留OFD owner。
+
+## 双架构 GNU runtime 验收入口
+
+`tests/userland/glibc/run.py --arch riscv|loongarch` 共用五种 ELF 形态、消费者和
+marker 顺序检查。RV 保持固定 glibc 2.44；LA 的 `inputs-loongarch.json` 固定
+已安装原版 glibc 2.42、GCC15.1.0、工具/完整 sysroot/CRT/libgcc 身份，包含内容、
+权限与 symlink 目标。probe 的版本来自 profile，GNU libc 本体不改写。
+LA runtime 实际系统搜索目录为 `/usr/lib64`；不能复制 RV 的 `/lib` fixture。
+LA root runner 可显式指定预期退出码，Linux supervisor 与 BoarOS 均核对该值。
+
+`make prepare-la-glibc test-glibc-profile-host` 验证输入及身份反例；
+`python3 -B tests/userland/glibc/run.py --arch loongarch --only linux` 的静态、动态、
+PIE、静态 PIE、pthread PIE 已在固定 Linux 的512MiB/1GiB通过。初始 BoarOS
+静态 ELF 在进入main前SIGILL；完整 `test-glibc-loongarch` 尚未通过，阻塞继续
+由真实指令定位，不把 Linux-only 结果计作 LA 内核支持。

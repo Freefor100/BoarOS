@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run pinned, unmodified RV64 glibc programs on fixed Linux and BoarOS."""
+"""Run pinned GNU runtime consumers on architecture-matched root baselines."""
 
 import argparse
 import hashlib
@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from profiles import checked_inputs
 
 ROOT = Path(__file__).resolve().parents[3]
 HERE = Path(__file__).resolve().parent
@@ -49,20 +50,6 @@ def run_guest(command, log):
     return result.returncode
 
 
-def checked_inputs():
-    manifest = json.loads((HERE / "inputs.json").read_text())
-    for role in ("tools", "runtime"):
-        for name, expected in manifest[role].items():
-            path = Path(name)
-            if not path.is_file() or digest(path) != expected:
-                raise RuntimeError(f"{role} identity mismatch: {path}")
-    libc = next(Path(path) for path in manifest["runtime"]
-                if path.endswith("/libc.so.6"))
-    if f"stable release version {manifest['glibc_version']}".encode() not in libc.read_bytes():
-        raise RuntimeError("glibc release version differs from pinned binary")
-    return manifest
-
-
 def build_programs(inputs):
     BUILD.mkdir(parents=True, exist_ok=True)
     compiler = next(path for path in inputs["tools"] if path.endswith("-gcc"))
@@ -75,9 +62,10 @@ def build_programs(inputs):
     }
     programs = {}
     for name, flags in versions.items():
-        program = BUILD / f"{name}-rv"
+        program = BUILD / f"{name}-{'la' if inputs.get('arch')=='loongarch' else 'rv'}"
         command = [compiler, "-O2", "-Wall", "-Wextra", "-Werror",
-                   *flags]
+                   *inputs.get('compiler_flags',[]),
+                   f'-DGLIBC_PROBE_VERSION="{inputs["glibc_version"]}"',*flags]
         if name in ("dynamic", "pie", "pthread-pie"):
             command.append(f"-Wl,--dynamic-linker={INTERPRETER}")
         command += ["-o", str(program), str(HERE / "probe.c")]
@@ -93,7 +81,7 @@ def build_programs(inputs):
             raise RuntimeError(f"incorrect PT_INTERP: {name}")
         programs[name] = program
     library = BUILD / "libboaros-glibc-tls.so"
-    logged([compiler, "-O2", "-Wall", "-Wextra", "-Werror", "-fPIC",
+    logged([compiler, "-O2", "-Wall", "-Wextra", "-Werror", *inputs.get('compiler_flags',[]), "-fPIC",
             "-shared", "-Wl,-soname,libboaros-glibc-tls.so",
             "-o", str(library), str(HERE / "tls_dso.c")],
            BUILD / "tls-dso.build.log")
@@ -119,7 +107,7 @@ def fixture(directory, program, library, inputs):
     return disk
 
 
-def check_observation(name, target, log, expected, returncode):
+def check_observation(name, target, log, expected, returncode, arch='riscv'):
     raw = log.read_text(errors="replace").replace("\r\n", "\n")
     # Idle IRQ dispatch can run /init while the UART boot line is unfinished.
     # Keep whole marker lines and their order without requiring a UART prefix.
@@ -134,7 +122,10 @@ def check_observation(name, target, log, expected, returncode):
         raise RuntimeError(f"{name} {target} {stage}: {markers}; see {log}")
     if returncode != 0:
         raise RuntimeError(f"{name} {target} exit: QEMU status {returncode}; see {log}")
-    if target == "boaros" and not re.search(
+    if target == "boaros" and arch=='loongarch':
+        if 'LA PID 1 exited reason=0x0000000000000001 status=0x000000000000002a' not in raw or 'LA root owners released' not in raw:
+            raise RuntimeError(f'{name} boaros exit/resource mismatch; see {log}')
+    elif target == "boaros" and not re.search(
         r"^BoarOS: PID 1 exited status=0x2a pages=0x[1-9a-f][0-9a-f]* "
         r"heap-live=0x0; shutting down$", raw, re.M
     ):
@@ -169,7 +160,7 @@ def execute(programs, library, inputs, linux, kernel, qemu):
                 log = case / f"{target}.log"
                 result = run_guest(command, log)
                 check_observation(name, target, log, expected, result)
-            print(f"glibc 2.44 {name}: Linux/BoarOS markers and exit verified")
+            print(f"glibc {inputs['glibc_version']} {name}: Linux/BoarOS markers and exit verified")
         status = "passed"
     finally:
         if status == "passed":
@@ -177,14 +168,55 @@ def execute(programs, library, inputs, linux, kernel, qemu):
         else:
             print(f"glibc artifacts retained: {work}", file=sys.stderr)
 
+def execute_la(programs,library,inputs,kernel,qemu,only):
+    from types import SimpleNamespace
+    sys.path.insert(0,str(ROOT/'tests/loongarch'))
+    from userland import main as native
+    files=[f'{inputs["library_directory"]}/{Path(p).name}={p}' for p in inputs['runtime'] if Path(p).name!=Path(inputs['interpreter']).name]
+    loader=next(p for p in inputs['runtime'] if Path(p).name==Path(inputs['interpreter']).name)
+    files+=[f'{inputs["interpreter"]}={loader}']
+    files+=[f'/lib/libboaros-glibc-tls.so={library}']
+    compiler=next(p for p in inputs['tools'] if p.endswith('-gcc'))
+    for name,program in programs.items():
+        expected=BASE_MARKERS+(EXTRA_MARKERS if name=='pthread-pie' else [])+FINAL_MARKERS
+        platforms=None if only=='all' else ['Linux' if only=='linux' else 'BoarOS']
+        area=native(SimpleNamespace(program=program,marker=expected,file=files,cc=compiler,
+            kernel=str(kernel),qemu=qemu,timeout=120,platform=platforms,exit_status=42,cpu='la464'))
+        for target in platforms or ('Linux','BoarOS'):
+            for ram in ('512M','1G'):
+                check_observation(name,target.lower(),area/f'{target}-{ram}.log',expected,0,'loongarch')
+        print(f"glibc {inputs['glibc_version']} {name}: {platforms or 'Linux/BoarOS'} markers, exit and root owners verified")
+
 
 def main():
+    global BUILD,INTERPRETER
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--kernel", type=Path, default=ROOT / "kernel-rv")
-    parser.add_argument("--qemu", default=os.environ.get("QEMU_RISCV64", "qemu-system-riscv64"))
+    parser.add_argument('--arch',choices=['riscv','loongarch'],default='riscv')
+    parser.add_argument('--only',choices=['all','linux','boaros'],default='all')
+    parser.add_argument("--kernel", type=Path)
+    parser.add_argument("--qemu")
     args = parser.parse_args()
-    inputs = checked_inputs()
+    la=args.arch=='loongarch'
+    args.kernel=args.kernel or ROOT/('kernel-la' if la else 'kernel-rv')
+    args.qemu=args.qemu or ('build/qemu-la/qemu-system-loongarch64' if la else os.environ.get('QEMU_RISCV64','qemu-system-riscv64'))
+    BUILD=ROOT/('build/loongarch/glibc' if la else 'build/riscv/glibc')
+    inputs = checked_inputs(args.arch)
+    INTERPRETER=inputs.get('interpreter',INTERPRETER)
     programs, library = build_programs(inputs)
+    if la:
+        execute_la(programs,library,inputs,args.kernel,args.qemu,args.only)
+        checked_inputs(args.arch)
+        platforms=['Linux','BoarOS'] if args.only=='all' else ['Linux' if args.only=='linux' else 'BoarOS']
+        kernels={'Linux':ROOT/'build/linux-la/vmlinux','BoarOS':args.kernel}
+        identity={'inputs':inputs,'platforms':platforms,
+            'programs':{name:digest(p) for name,p in programs.items()},'library':digest(library),
+            'kernels':{name:digest(kernels[name]) for name in platforms},
+            'linux_config':digest(ROOT/'build/linux-la/.config'),'qemu':digest(args.qemu),
+            'sources':{p.name:digest(p) for p in (HERE/'run.py',HERE/'profiles.py',HERE/'probe.c',HERE/'tls_dso.c')}}
+        (BUILD/'identity.json').write_text(json.dumps(identity,indent=2)+'\n')
+        print('rebuild: make test-glibc-loongarch')
+        return
+    if args.only!='all':raise RuntimeError('--only is available on the LA bootstrap profile')
     sys.path.insert(0, str(ROOT / "tests/diff-abi"))
     from harness import linux_build
     linux, linux_identity = linux_build()

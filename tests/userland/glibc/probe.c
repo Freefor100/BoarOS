@@ -12,6 +12,9 @@
 #endif
 
 static __thread int program_tls = 7;
+#ifndef GLIBC_PROBE_VERSION
+#define GLIBC_PROBE_VERSION "2.44"
+#endif
 
 static void emit(const char *message, size_t length)
 {
@@ -76,7 +79,7 @@ int main(void)
 {
     EMIT("GLIBC MAIN\n");
     if (atexit(exit_marker) != 0) return 10;
-    if (strcmp(gnu_get_libc_version(), "2.44") != 0) return 11;
+    if (strcmp(gnu_get_libc_version(), GLIBC_PROBE_VERSION) != 0) return 11;
     if (program_tls != 7) return 12;
     program_tls = 13;
     if (program_tls != 13) return 13;

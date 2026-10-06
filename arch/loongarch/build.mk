@@ -100,6 +100,13 @@ test-root-io-loongarch: kernel-la $(LA_BUILD)/root-probe build/host/nbd-fault pr
 .PHONY: test-la-userland-host
 test-la-userland-host: prepare-la-userland
 	python3 -B tests/host/la_userland_cache.py
+.PHONY: prepare-la-glibc test-glibc-loongarch test-glibc-profile-host
+prepare-la-glibc:
+	python3 -B -c "import sys; sys.path.insert(0,'tests/userland/glibc'); from profiles import checked_inputs; checked_inputs('loongarch')"
+test-glibc-profile-host:
+	python3 -B tests/host/glibc_profile.py
+test-glibc-loongarch: kernel-la prepare-la-glibc prepare-la-tools prepare-la-linux prepare-la-userland
+	python3 -B tests/userland/glibc/run.py --arch loongarch
 $(LA_BUILD)/signal-probe: tests/loongarch/signals.c tests/loongarch/signal_registers.S prepare-la-userland
 	REALGCC=$(abspath $(LA_USER_CC)) $(LA_MUSL_CC) $(LA_FLAGS) -O2 -static -Wall -Wextra -Werror -Wl,-z,max-page-size=16384 -o $@ tests/loongarch/signals.c tests/loongarch/signal_registers.S
 .PHONY: test-signal-loongarch
