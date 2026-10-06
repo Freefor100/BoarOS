@@ -451,3 +451,26 @@ BoarOS RTC 仍按共用只读设备口径验收；Linux 告警成功不能记作
 默认路径，新增TOY输入在该二进制不受支持；改为共用架构profile的模拟器路径，
 五形态在派生模型上重新验证。二者是采集/工具路由修复，不记为缺失硬件能力被存根
 绕过，也不覆盖尚未完成的恢复/整体审查门禁。
+
+## 一次独立整体审查与集中修复（2026-10-07）
+
+对 `1c4d715..b653966` 的一次fresh-context只读审查发现一个P2验收问题：
+UDP/TCP小缓冲fault、null/zero边界与RT sysctl测例的mprotect已按目标页大小，
+指针却仍在4092/4094/4095。LA两侧都没有碰到保护页，完整1366条匹配因此不能
+证明这些原fault ID实际触发。原冻结记录保留该限制：UDP/TCP返回4、zero读8，
+rtctl分别EINVAL/读2；不能把此前计数当作这些边界已验收。
+
+集中修复先仅加入实际EFAULT/partial4与offset不改变的前置断言，旧LA两侧都在
+UDP边界停止并退出99（BoarOS仍正常归还root owner）。再将这三类指针及初始化/
+证据位置改为目标页尾，保持原案例ID、消息长度、文件offset4094和负指针-4096。
+解析器没有归一化这些返回值；修复后LA四流与RV两流各1366条完整匹配，UDP/TCP均EFAULT、zero仅4字节、rtctl均EFAULT且offset0。审查后LA启动/SIMD三配置/RTC模型及真实Linux告警/环境/pipe，以及RV完整架构、userland/GNU/ABI/栈重新通过；两内核哈希与此前229项及存储/设备全回归的冻结产物一致。
+
+审查未确认新的内核/owner阻塞。作者逐项裁定未升级项：AF_UNIX最后packet与destroy
+的假设抢占窗口在当前实际syscall/reap关闭IRQ的入口契约下不可达，未来开放内核
+抢占/SMP时需重新审计；net初始化明确要求新零对象，stop后全owner归还才能清零
+复用，failed reset不允许覆盖；没有增加热插拔功能。任意恶意DMA隔离、guard的
+DMW别名/跨越整个guard/boot-idle栈、全IEEE运算及完整信号组合、深调用链/新性能
+均没有本轮承诺。LBT/SMP/实板/packed ring/外部IPv6/DNS/TLS/原生开发/更广程序/
+完整Harness、BoarOS RTC告警与全TCG时钟迁移亦保持范围外。旧allocator/Virtqueue
+历史归因没有新增现场证据，继续保留unknown。作者只做这一轮集中修复，不请求
+第二位独立reviewer；最终判定依赖新反例和真实回归。

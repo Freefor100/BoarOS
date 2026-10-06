@@ -114,3 +114,8 @@ proc 测试在 clear_child_tid 后等待实际 nr_threads=1；线程组长的 he
 通过 lseek/re-read 等待真实 zombie 发布。固定 Linux 的 clear_child_tid 先于
 exit_state 和最终 nr_threads 更新，不能把一个调度瞬间的 R/两线程当作稳定退出状态，
 也不能在解析器中把 R 改成 Z。等待有界、结果仍来自真实用户态读取。
+
+整体审查纠正了LA几处仍用4KiB指针偏移的fault夹具：UDP/TCP置于目标页尾2字节，
+null/zero置于尾4字节，sysctl置于尾1字节；预先断言实际EFAULT/partial4及失败
+offset不变，避免两侧都未触发fault时仍差分成功。修复后的1366条全量记录是当前
+口径，旧1366记录对这些边界的覆盖限制见[审查反例](../learning/loongarch-bringup.md#一次独立整体审查与集中修复2026-10-07)。

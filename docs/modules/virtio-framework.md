@@ -93,3 +93,8 @@ net通过同一套typed配置/IRQ/queue API，不再访问MMIO/PCI偏移。MAC�
 仍由net核心读取、重试并拒绝非法值。IRQ确认与descriptor收割不归还RX loan或
 SG pbuf；`quiesce`只停止DMA、摘IRQ和撤token，业务owner由网络层归还，随后
 core释放DMA页，平台释放BAR。完整细节与实际MMIO/PCI矩阵见[net模块](riscv-virtio-net.md)。
+
+net的init输入是新的零初始化device对象；当前platform每次持有一个完整的冷启动
+owner生命周期。成功stop归还全部loan/TX/DMA/IRQ owner后，调用方可清零并重新
+初始化存储；failed reset保留的对象只能继续完成stop，不能清零或重新init覆盖owner。
+当前没有未清零对象的热插拔/原位重启接口，这个存储前提不封锁后续生命周期扩展。

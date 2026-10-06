@@ -51,7 +51,7 @@ def candidates():
                                                 'offline-c-run.', 'offline-project-run.', 'tty-run.', 'pty-run.', 'sched-bandwidth.',
                                                 'sqlite-run.',
                                                 'sqlite-nbd-run.',
-                                                'sqlite-recovery-run.','rng-run.')))
+                                                'sqlite-recovery-run.','sqlite-wal-run.','rng-run.','environment-run.')))
 
     diff = BUILD / 'diff-abi'
     if diff.is_dir():
@@ -74,6 +74,11 @@ def candidates():
         result.extend(la.glob('userland-identity-v2-pre-wrapper.json'))
         result.extend(path for path in la.iterdir() if path.name in {'root-run','root-io-run','block-run','toolchain-check','dynamic','dynamic-dp','exec-error-inputs'}
                       or path.name.startswith(('root-run.','root-io-run.','userland-run.','exec-fail-run.','stack-guard-run.','rng-run.','network-run.','net-failure-run.','uart-failure-run.','tty-run.','pty-run.','environment-run.','rtc-model.','rtc-alarm.','sqlite-wal-run.','sqlite-run.')))
+        result.extend(path for path in la.iterdir() if path.is_dir() and
+                      (path.name=='program-inventory' or path.name.startswith(('inventory-','diff-abi-','review-boundary-'))))
+        la_libc=la/'program-libc'
+        if la_libc.is_dir():
+            result.extend(path for path in la_libc.iterdir() if path.name=='upstream.tar' or path.suffix=='.log')
         gcc_cache=la/'gcc-sf'
         if gcc_cache.is_dir():
             result.extend(path for path in gcc_cache.iterdir() if path.name in {'build','build-sf'})
@@ -86,6 +91,11 @@ def candidates():
     if libc.is_dir():
         result.extend(path for path in libc.iterdir()
                       if path.name == 'upstream.tar' or path.suffix == '.log')
+
+    for architecture in ('riscv','loongarch'):
+        glibc=BUILD/architecture/'glibc'
+        if glibc.is_dir():
+            result.extend(path for path in glibc.iterdir() if path.suffix in ('.img','.log') or path.name.startswith('run.'))
 
     offline_c = BUILD / 'offline-c'
     if offline_c.is_dir():

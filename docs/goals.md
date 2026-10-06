@@ -505,13 +505,13 @@ SIGSEGV已定位到LA漏接QEMU DTB种子；复用不计熵的早期随机材料
 共用net/Ethernet和LA现代PCI真实TAP已在双侧两种RAM验证，原BusyBox HTTP、
 共享块/RNG/net IRQ及九类构造/reset失败回到基线。无metadata checksum的空索引目录误分类已由真实宿主/LA反例修复。AF_UNIX发送者缓存模型及sendfile datagram批次已按用户选择的Linux路线接入，
 实际双侧等待/取消/关闭及资源验收通过。共用ns16550与LA TTY/termios2/作业控制、PTY、原BusyBox交互/script和录制重启已双侧两种RAM验收，UART启动失败/fatal与owner通过；LA pipe实际持有16页与容量一致，双侧满环/wrap/关闭通过；LS7A RTC/环境已双侧两种RAM验证，派生QEMU的原Linux告警另有证据；完整ABI1366条已双架构匹配，BusyBox/libc-test229个共同ID已双架构通过（LA两种RAM）；原SQLite DELETE/WAL、多进程、静态/动态CLI与独立重启内容也已双侧两种RAM通过。
-最终RV完整架构、userland/GNU/ABI/栈、统一驱动/TTY、SQLite/NBD全恢复与双盘隔离，以及LA架构/平台失败回收均通过，等待一次整体审查和最终清理；不由设备通过声明所有应用等价。
+最终RV完整架构、userland/GNU/ABI/栈、统一驱动/TTY、SQLite/NBD全恢复与双盘隔离，以及LA架构/平台失败回收均通过，一次整体审查的页边界验收问题已集中修复并完成最终回归，进入清理收口；不由设备通过声明所有应用等价。
 glibc2.42五形态在Linux/BoarOS两种RAM均通过退出及根owner门禁。真实PCI RNG已接入并
 完成正常/缺失/延迟/在途停止、构造OOM/IRQ失败及回收；启动种子不会提前发布random
-ready。本轮指定原程序及单核平台矩阵已验证，整体审查与清理仍待收口。
+ready。本轮指定原程序及单核平台矩阵已验证，整体审查与集中修复完成，最终清理收口。
 共用VirtIO transport/split queue已迁入block，三个transport的真实块与LA根owner
 门禁、RV可睡眠I/O四组合已通过。RNG/net迁移及LA PCI、UART/RTC验收完成；
-全部指定程序矩阵和最终整体审查收口前，不声明本轮对齐完成。
+本轮单核QEMU指定矩阵已完成；GNU版本差异、客体原生开发、完整Harness及范围外能力继续单列，不声明所有RV应用在LA验收。
 
 - [ ] ELF 段对齐、BSS 尾页、auxv、用户栈、stat/signal 结构及 clone 寄存器逐项核对；不能只换汇编入口却保留 RV ABI 编码。
 - [ ] 同一用户源码分别编译 RV/LA ELF，每架构内部用同一 ELF 对照 Linux 与 BoarOS；共享测试语义，隔离寄存器/页表差异，不拿 RV ELF 验证 LA。

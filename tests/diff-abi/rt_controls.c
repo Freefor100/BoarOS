@@ -45,9 +45,11 @@ void abi_rt_controls_cases(void)
     abi_require(SC3(62,fd,0,0)==0);
     long map=SC6(222,0,(2 * ABI_PAGE_SIZE),3,0x22,-1,0);
     abi_require(map>=0 && SC3(226,map+ABI_PAGE_SIZE,ABI_PAGE_SIZE,0)==0);
-    *(char *)(map+4095)='1';
-    abi_record("rtctl.write-fault",SC3(64,fd,map+4095,2),-1,abi_offset(fd),0,0,0);
-    abi_record("rtctl.read-fault",SC3(63,fd,map+4095,2),-1,abi_offset(fd),0,0,0);
+    *(char *)(map+ABI_PAGE_SIZE-1)='1';
+    r=SC3(64,fd,map+ABI_PAGE_SIZE-1,2);abi_require(r==-14 && abi_offset(fd)==0);
+    abi_record("rtctl.write-fault",r,-1,abi_offset(fd),0,0,0);
+    r=SC3(63,fd,map+ABI_PAGE_SIZE-1,2);abi_require(r==-14 && abi_offset(fd)==0);
+    abi_record("rtctl.read-fault",r,-1,abi_offset(fd),0,0,0);
     abi_require(SC3(62,fd,0,0)==0);
     struct { const void *base; usize length; } iov[2]={{"95",2},{"0000",4}};
     abi_record("rtctl.writev",SC3(66,fd,iov,2),-1,abi_offset(fd),0,0,0);
@@ -57,7 +59,7 @@ void abi_rt_controls_cases(void)
     abi_record("rtctl.writev-fault",SC3(66,fd,iov,2),-1,abi_offset(fd),0,0,0);
     r=SC3(63,fd,buf,sizeof(buf));
     abi_record("rtctl.writev-fault-state",r,-1,abi_offset(fd),0,buf,r>0?(usize)r:0);
-    abi_record("rtctl.nonzero-write-fault",SC3(64,fd,map+4095,2),-1,abi_offset(fd),0,0,0);
+    abi_record("rtctl.nonzero-write-fault",SC3(64,fd,map+ABI_PAGE_SIZE-1,2),-1,abi_offset(fd),0,0,0);
     abi_record("rtctl.eof-fault-buffer",SC3(63,fd,map+ABI_PAGE_SIZE,1),-1,abi_offset(fd),0,0,0);
     long other=abi_open(runtime_path,1);abi_require(other>=0);
     abi_record("rtctl.read-wronly",SC3(63,other,buf,sizeof(buf)),-1,-1,0,0,0);
