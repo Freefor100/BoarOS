@@ -1,5 +1,5 @@
 #include "private.h"
-#include <arch/riscv/timer.h>
+#include <arch/timer.h>
 #include <kernel/errno.h>
 #include <kernel/time.h>
 
@@ -73,7 +73,7 @@ void scheduler_rearm_timer(void)
         uint64_t now = scheduler.rt_bandwidth.last_account_ns;
         uint64_t target = UINT64_MAX - now < delay ? UINT64_MAX : now + delay;
         enum kernel_time_status status = kernel_time_deadline_from_monotonic(target, &deadline);
-        if (status == KERNEL_TIME_STATUS_DEADLINE_PASSED) deadline = riscv_time_read() + 1U;
+        if (status == KERNEL_TIME_STATUS_DEADLINE_PASSED) deadline = arch_time_read() + 1U;
         else if (status != KERNEL_TIME_STATUS_OK) __builtin_trap();
     }
     /* 最早阻塞期限与 RT/时间片预算同为 tick 域；取最小者编入硬件事件。 */
@@ -81,8 +81,8 @@ void scheduler_rearm_timer(void)
     if (blocked != 0 && (!deadline || blocked->wakeup_deadline < deadline))
         deadline = blocked->wakeup_deadline;
     scheduler.armed_deadline = deadline;
-    enum riscv_timer_status status = riscv_timer_set_scheduler_deadline(deadline);
-    if (status != RISCV_TIMER_STATUS_OK && status != RISCV_TIMER_STATUS_NOT_STARTED)
+    enum arch_timer_status status = arch_timer_set_scheduler_deadline(deadline);
+    if (status != ARCH_TIMER_STATUS_OK && status != ARCH_TIMER_STATUS_NOT_STARTED)
         __builtin_trap();
 }
 

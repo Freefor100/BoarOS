@@ -142,7 +142,9 @@ C_SOURCES := \
 	arch/riscv/context.c \
 	arch/riscv/direct_map.c \
 	arch/riscv/elf_image.c \
+	kernel/elf_image.c \
 	arch/riscv/exec.c \
+	kernel/exec_image.c \
 	arch/riscv/process.c \
 	arch/riscv/mm.c \
 	mm/mm.c \
@@ -240,7 +242,8 @@ ASM_SOURCES := \
 	arch/riscv/boot.S \
 	arch/riscv/context_switch.S \
 	arch/riscv/fpu.S \
-	arch/riscv/trap_entry.S
+	arch/riscv/trap_entry.S \
+	arch/riscv/signal_trampoline.S
 ifeq ($(ROOT_DRAIN_FIXTURE),1)
 C_SOURCES += tests/riscv/root_drain_fixture.c
 LDFLAGS += -Wl,--wrap=kernel_vfs_unmount
@@ -253,7 +256,9 @@ TEST_RUNTIME_C_SOURCES := \
 	arch/riscv/context.c \
 	arch/riscv/direct_map.c \
 	arch/riscv/elf_image.c \
+	kernel/elf_image.c \
 	arch/riscv/exec.c \
+	kernel/exec_image.c \
 	arch/riscv/process.c \
 	arch/riscv/mm.c \
 	mm/mm.c \
@@ -346,7 +351,8 @@ TEST_RUNTIME_ASM_SOURCES := \
 	arch/riscv/boot.S \
 	arch/riscv/context_switch.S \
 	arch/riscv/fpu.S \
-	arch/riscv/trap_entry.S
+	arch/riscv/trap_entry.S \
+	arch/riscv/signal_trampoline.S
 TEST_RUNTIME_OBJECTS := \
 	$(patsubst %.c,$(BUILD_DIR)/%.o,$(TEST_RUNTIME_C_SOURCES)) \
 	$(patsubst %.S,$(BUILD_DIR)/%.o,$(TEST_RUNTIME_ASM_SOURCES))

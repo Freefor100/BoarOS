@@ -1,6 +1,6 @@
 # 内核时间模块
 
-本文描述架构无关时间子系统的稳定接口：单调时钟、实时时钟和睡眠 deadline 换算。timebase 读取与 SBI 定时器见 [RISC-V Timer 模块](riscv-timer.md)，等待队列与阻塞唤醒见[内核调度与进程生命周期模块](kernel-scheduler.md)。
+本文描述架构无关时间子系统的稳定接口：单调时钟、实时时钟和睡眠 deadline 换算。构建期 timer 操作见 `include/arch/timer.h`，RV timebase 与 SBI 定时器见 [RISC-V Timer 模块](riscv-timer.md)，等待队列与阻塞唤醒见[内核调度与进程生命周期模块](kernel-scheduler.md)。
 
 ## 范围与入口
 
@@ -9,11 +9,11 @@
 | `include/kernel/time.h`、`kernel/time.c` | 固定点乘数换算、单调/实时时钟、timer 驱动 coarse 快照、deadline 换算 |
 | `arch/riscv/virt_rtc.c`、`include/arch/riscv/virt_rtc.h` | QEMU virt goldfish RTC 读取与合理性探测 |
 | `kernel/main.c` | 在 timer 启动前读取 RTC 并调用 `kernel_time_init` |
-| `arch/riscv/trap.c` | 每次真实 timer interrupt 更新一次 coarse 快照 |
+| RV/LA 的 `trap.c` | 每次真实 timer interrupt 更新 coarse 快照、expire deadlines 和调度；LA 同时轮询 UART 唤醒 |
 
 ## 换算与精度
 
-时间源是 RISC-V `time` CSR 的原始计数（QEMU virt 10 MHz，来自 DTB）。换算使用启动时预算的两个 32.32 定点乘数：
+时间源由架构提供：RV 为 `time` CSR（QEMU virt 10 MHz，来自 DTB），LA 为 `RDTIME.D`，频率由 CPUCFG 4/5 计算。LA one-shot TCFG 保留 tick 相位并取 scheduler 最早期限，首阶段没有 RTC 墙钟来源。换算使用启动时预算的两个 32.32 定点乘数：
 
 - ns = ticks × `ceil(1e9·2^32/freq)` ≫ 32；
 - deadline 增量 = `ceil(ns × ceil(freq·2^32/1e9) / 2^32)`。
@@ -45,7 +45,7 @@ syscall 层的 `clock_gettime(113)`、`clock_getres(114)` 支持 `CLOCK_REALTIME
 当前限制：无 NTP/阶跃调整、无 CPU-time clockid；timekeeper只在启动采样RTC，此后由CSR换算推进，用户RTC_RD_TIME仍读取设备当前值；无 SMP timekeeper 写入协议。
 
 fine时钟和deadline换算精度不等于到期唤醒精度。普通blocked deadline由timer路径
-检查；`kernel/sched/scheduling.c::scheduler_rearm_timer`的SBI事件取min(实时预算、
+检查；`kernel/sched/scheduling.c::scheduler_rearm_timer`的架构timer事件取min(实时预算、
 RR时间片、最早睡眠deadline)，到期由按(deadline, tid)排序的索引只弹出已到期者，
 短睡眠不再固定等到下一次100Hz tick。IRQ延迟、关中断段和更高优先级任务仍会延后
 实际运行，不宣称硬上界；提高HZ的取舍不再用于唤醒精度。

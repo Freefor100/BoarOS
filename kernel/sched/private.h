@@ -1,10 +1,9 @@
+#include <arch/task.h>
 #ifndef BOAROS_KERNEL_SCHED_PRIVATE_H
 #define BOAROS_KERNEL_SCHED_PRIVATE_H
 
 #include <kernel/cost.h>
 #include <arch/context.h>
-#include <arch/riscv/fpu.h>
-#include <arch/riscv/thread.h>
 #include <kernel/files.h>
 #include <kernel/heap.h>
 #include <kernel/fs_context.h>
@@ -99,7 +98,7 @@ struct kernel_signal_table {
 };
 
 struct kernel_task {
-    struct riscv_thread_state arch;
+    struct arch_thread_state arch;
     uint64_t magic;
     uint64_t physical_address;
     uint64_t stack_physical_address;
@@ -206,10 +205,10 @@ struct kernel_task {
     struct kernel_thread_completion completion;
     struct kernel_files files;
     struct kernel_fs_context fs;
-    struct riscv_fpu_state fpu;
+    struct arch_fpu_state fpu;
     struct kernel_mm mm;
     struct kernel_exec_transaction *exec_transaction;
-    struct riscv_switch_context context;
+    struct arch_switch_context context;
 #if BOAROS_COST_DIAGNOSTICS
     struct kernel_cost_task cost;
 #endif
@@ -218,7 +217,7 @@ struct kernel_task {
 struct kernel_scheduler {
     uint32_t initialized;
     uint32_t idle_context_saved;
-    uint64_t kernel_satp;
+    uint64_t kernel_context;
     uint64_t idle_ticks;
     struct kernel_task *all_tasks;
     uint64_t loads[3], load_ticks;
@@ -244,7 +243,7 @@ struct kernel_scheduler {
     struct kernel_task *stopped_tail;
     struct kernel_task *init_task;
     enum kernel_scheduler_status fatal_status;
-    struct riscv_switch_context discard_context;
+    struct arch_switch_context discard_context;
     struct kernel_stack_statistics stack_statistics;
 };
 

@@ -1,5 +1,5 @@
 #include <kernel/cost.h>
-#include <arch/riscv/timer.h>
+#include <arch/timer.h>
 #include <kernel/time.h>
 #include <kernel/tick.h>
 
@@ -41,7 +41,7 @@ enum kernel_time_status kernel_time_init(uint32_t timebase_frequency,
         KERNEL_TIME_NS_PER_SECOND;
     time_boot_realtime_ns = boot_realtime_ns;
     __atomic_store_n(&time_coarse_monotonic_ns,
-        kernel_time_ticks_to_ns(riscv_time_read()), __ATOMIC_RELAXED);
+        kernel_time_ticks_to_ns(arch_time_read()), __ATOMIC_RELAXED);
     time_initialized = 1U;
 #if BOAROS_COST_DIAGNOSTICS
     kernel_cost_set_timebase(timebase_frequency);
@@ -62,7 +62,7 @@ uint64_t kernel_time_ticks_to_ns(uint64_t ticks)
 
 uint64_t kernel_time_monotonic_ns(void)
 {
-    return kernel_time_ticks_to_ns(riscv_time_read());
+    return kernel_time_ticks_to_ns(arch_time_read());
 }
 
 uint64_t kernel_time_realtime_ns(void)
@@ -115,7 +115,7 @@ enum kernel_time_status kernel_time_deadline_from_monotonic(
         return KERNEL_TIME_STATUS_NOT_INITIALIZED;
     }
 
-    now_ticks = riscv_time_read();
+    now_ticks = arch_time_read();
     now_ns = kernel_time_ticks_to_ns(now_ticks);
     if (target_monotonic_ns <= now_ns) {
         return KERNEL_TIME_STATUS_DEADLINE_PASSED;

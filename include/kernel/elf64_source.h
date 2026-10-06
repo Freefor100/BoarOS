@@ -2,6 +2,7 @@
 #define BOAROS_KERNEL_ELF64_SOURCE_H
 
 #include <kernel/elf64.h>
+#include <kernel/read_source.h>
 
 #include <stddef.h>
 #include <stdint.h>
@@ -46,6 +47,12 @@ enum kernel_elf64_source_status kernel_elf64_source_create(
     uint64_t page_size,
     uint16_t machine,
     struct kernel_elf64_source **source);
+
+/* Reader bytes/context must remain immutable and alive through the last source
+ * reference. The descriptor is copied; the backing lifetime stays with caller. */
+enum kernel_elf64_source_status kernel_elf64_source_create_reader(
+    struct kernel_heap *, const struct kernel_read_source *, uint64_t,
+    uint16_t, struct kernel_elf64_source **);
 
 /* Success consumes one source reference; cleanup failure leaves it retryable. */
 enum kernel_elf64_source_status kernel_elf64_source_release(

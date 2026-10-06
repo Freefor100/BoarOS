@@ -4,7 +4,7 @@
 #include <kernel/heap.h>
 #include <kernel/sync.h>
 #include <arch/context.h>
-#include <arch/riscv/plic.h>
+#include <arch/platform_io.h>
 #include <kernel/errno.h>
 #include <kernel/page.h>
 #include <kernel/page_cache.h>
@@ -942,7 +942,7 @@ static void readahead_worker(void *argument)
         readahead_load(cache, next);
         next->active = 0; readahead_drop(r, next);
         /* 一批最多八页；只在完整后端调用返回后让出，不截断内部 I/O。 */
-        arch_interrupt_restore(RISCV_SSTATUS_SIE); (void)arch_interrupt_save();
+        arch_interrupt_restore(ARCH_INTERRUPT_ENABLE_MASK); (void)arch_interrupt_save();
         if (kernel_scheduler_yield_current() != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
     }
 }
@@ -1483,7 +1483,7 @@ static void pressure_wait(void *context)
     struct page_cache_group *g = context;
     struct kernel_io_context *io = kernel_io_context_current();
     if (io->locks || io->allocation_depth || io->backend_depth || io->reclaim_depth ||
-        io->background_reclaim || !kernel_scheduler_can_sleep() || riscv_plic_in_interrupt()) return;
+        io->background_reclaim || !kernel_scheduler_can_sleep() || arch_external_interrupt_active()) return;
     uintptr_t irq = arch_interrupt_save();
     /* 等待者持有组而非实例；最后一个实例卸载后仍可安全离开队列。 */
     g->refs++;

@@ -1,6 +1,6 @@
 # 内核 MM 模块
 
-本文描述任务地址空间的通用所有权接口、共享 MM 策略和当前 RISC-V Sv39 后端。页表格式、映射规则和硬件切换见 [RISC-V Sv39 分页模块](riscv-sv39.md)，地址空间与任务身份分离的背景见[内存管理学习总结](../learning/memory-management.md)。
+本文描述任务地址空间的通用所有权接口、共享 MM 策略、RISC-V Sv39 与 LA64 后端。页表格式、映射规则和硬件切换见 [RISC-V Sv39 分页模块](riscv-sv39.md)，地址空间与任务身份分离的背景见[内存管理学习总结](../learning/memory-management.md)。
 
 ## 范围与入口
 
@@ -9,6 +9,7 @@
 | `include/kernel/mm.h` | 定义跨架构 MM 句柄、权限、状态、引用和 VMA 入口 |
 | `mm/mm.c`、`include/kernel/mm_backend.h` | MM 引用、VMA、后备来源、缺页与驻留策略；记录页拥有构建期选定的页表后端 |
 | `include/arch/mmu.h`、`arch/riscv/mm.c` | 构建期 MMU 操作绑定与既有 RV 创建/统计接口的薄适配 |
+| `arch/loongarch/mmu.c`、`tlb_refill.S` | 16 KiB/三级用户页表、COW 所有权、INVTLB 与软件 refill；LA 验收见[首阶段](loongarch-boot.md) |
 | `tests/riscv/mm_cases.c`、`tests/mm-riscv.sh`、`tests/mm-fatal-riscv.sh` | 验证创建、共享引用、移动、查询、页表回收和 resolution invariant fatal |
 | `tests/riscv/vma_cases.c`、`tests/vma-riscv.sh` | 验证 VMA 集成后的 fork、缺页解析、OOM 与所有权回收 |
 

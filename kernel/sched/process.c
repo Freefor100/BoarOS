@@ -1,9 +1,5 @@
+#include <arch/task.h>
 #include <arch/context.h>
-#include <arch/riscv/mm.h>
-#include <arch/riscv/process.h>
-#include <arch/riscv/sv39.h>
-#include <arch/riscv/thread.h>
-#include <arch/riscv/trap.h>
 #include <kernel/errno.h>
 #include <kernel/epoll.h>
 #include <kernel/exec.h>
@@ -332,7 +328,7 @@ void kernel_user_group_exit(enum kernel_thread_exit_reason reason,
     kernel_user_thread_exit(reason, status, detail);
 }
 
-struct riscv_fpu_state *riscv_process_fpu_borrow_current(void)
+struct arch_fpu_state *arch_process_fpu_borrow_current(void)
 {
     return &scheduler.current->fpu;
 }
@@ -659,8 +655,8 @@ static enum kernel_scheduler_status finish_clone_failure(
     return scheduler_failure;
 }
 
-enum kernel_scheduler_status riscv_process_clone_current(
-    const struct riscv_trap_frame *parent_frame,
+enum kernel_scheduler_status arch_process_clone_current(
+    const struct arch_trap_frame *parent_frame,
     uint64_t flags,
     uint64_t child_stack,
     uint64_t parent_tid,
@@ -670,7 +666,7 @@ enum kernel_scheduler_status riscv_process_clone_current(
 {
     struct kernel_task *parent;
     struct kernel_task *child;
-    uint64_t child_satp;
+    uint64_t child_context;
     kernel_pid_t tid;
     uint32_t vfork = (flags & (LINUX_CLONE_VM | LINUX_CLONE_VFORK)) ==
                      (LINUX_CLONE_VM | LINUX_CLONE_VFORK);
@@ -701,10 +697,10 @@ enum kernel_scheduler_status riscv_process_clone_current(
     parent = scheduler.current;
     if (parent == &scheduler.idle || parent->arch.user_mode != 1U ||
         parent->tid_owned != 1U ||
-        parent_frame != (const struct riscv_trap_frame *)(
+        parent_frame != (const struct arch_trap_frame *)(
                             parent->stack_high - sizeof(*parent_frame)) ||
-        parent_frame->kernel_tp != (uintptr_t)parent ||
-        parent_frame->sepc > UINT64_MAX - 4U) {
+        arch_frame_task(parent_frame) != (uintptr_t)parent ||
+        arch_frame_pc(parent_frame) > UINT64_MAX - 4U) {
         return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
     }
     status = validate_child_endpoints(parent);
@@ -819,16 +815,16 @@ enum kernel_scheduler_status riscv_process_clone_current(
                 ? KERNEL_SCHEDULER_STATUS_OK
                 : KERNEL_SCHEDULER_STATUS_INVALID_STATE);
     }
-    mm_status = riscv_kernel_mm_satp(&child->mm, &child_satp);
+    mm_status = kernel_mm_context(&child->mm, &child_context);
     if (mm_status != KERNEL_MM_STATUS_OK) {
         return finish_clone_failure(
             child, -KERNEL_EAGAIN, linux_result,
             KERNEL_SCHEDULER_STATUS_ADDRESS_SPACE);
     }
-    child->arch.satp = child_satp;
+    arch_thread_set_mm(&child->arch, child_context);
     if ((flags & LINUX_CLONE_CHILD_CLEARTID) != 0U)
         child->clear_tid_address = child_tid;
-    status = riscv_process_prepare_clone(child, parent, parent_frame,
+    status = arch_process_prepare_clone(child, parent, parent_frame,
                                          child_stack,
                                          (flags & LINUX_CLONE_SETTLS) != 0U,
                                          tls);
@@ -1465,17 +1461,17 @@ static void switch_to_fatal_idle(enum kernel_scheduler_status status)
         if (activate_thread_address_space(&scheduler.idle) !=
             KERNEL_SCHEDULER_STATUS_OK) {
             for (;;) {
-                __asm__ volatile("wfi");
+                arch_cpu_wait();
             }
         }
         scheduler.current = &scheduler.idle;
-        riscv_fpu_switch(0, &scheduler.idle.fpu);
-        riscv_context_switch(&scheduler.discard_context,
+        arch_fpu_switch(0, &scheduler.idle.fpu);
+        arch_context_switch(&scheduler.discard_context,
                              &scheduler.idle.context);
     }
 
     for (;;) {
-        __asm__ volatile("wfi");
+        arch_cpu_wait();
     }
 }
 
@@ -1801,8 +1797,8 @@ static void kernel_thread_finish(
     if (current->arch.user_mode == 1U) {
         kernel_futex_release_robust(current, current->tid);
         kernel_futex_release_mm(current);
-        if (riscv_sv39_switch_satp(scheduler.kernel_satp) !=
-            RISCV_SV39_STATUS_OK) {
+        if (arch_mmu_switch_context(scheduler.kernel_context) !=
+            ARCH_MMU_STATUS_OK) {
             switch_to_fatal_idle(
                 KERNEL_SCHEDULER_STATUS_ADDRESS_SPACE);
         }
@@ -1835,8 +1831,8 @@ static void kernel_thread_finish(
     scheduler_rearm_timer();
     /* The dying task's FP state is discarded, but the dispatched task
      * must still have its own image reloaded. */
-    riscv_fpu_switch(0, &next->fpu);
-    riscv_context_switch(&scheduler.discard_context, &next->context);
+    arch_fpu_switch(0, &next->fpu);
+    arch_context_switch(&scheduler.discard_context, &next->context);
 
     switch_to_fatal_idle(KERNEL_SCHEDULER_STATUS_INVALID_STATE);
 }
