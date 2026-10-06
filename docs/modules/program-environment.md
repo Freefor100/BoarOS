@@ -222,7 +222,7 @@ applets/配置，用整数静态 musl；libc-test 用原 LP64D musl 1.2.5 构建
 
 ```sh
 make prepare-la-tools prepare-la-linux-platform prepare-la-userland prepare-la-dynamic
-python3 -B tests/program-inventory/libc_build.py --arch loongarch --jobs 8 --uapi build/loongarch/uapi/include
+python3 -B tests/program-inventory/libc_build.py --arch loongarch --jobs 8 --uapi-include build/loongarch/uapi/include
 python3 -B tests/program-inventory/run.py --arch loongarch --reuse-builds --require-pass --output build/loongarch/inventory-check
 ```
 

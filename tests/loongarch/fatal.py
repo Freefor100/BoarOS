@@ -8,7 +8,7 @@ parser.add_argument('--qemu',required=True)
 args=parser.parse_args()
 for memory in ('512M','1G'):
     for case in (1,2,3):
-        code,output=run_guest([args.qemu,'-machine','virt','-cpu','la464','-smp','1',
+        code,output=run_guest([args.qemu,'-machine','virt','-cpu','la464','-global','ls7a_rtc.toy-enabled=on','-smp','1',
                               '-m',memory,'-kernel',f'build/loongarch/kernel-fatal-{case}',
                               '-nographic','-no-reboot'],20)
         expected='physical page release fatal' if case<3 else 'fatal LA page table owner'

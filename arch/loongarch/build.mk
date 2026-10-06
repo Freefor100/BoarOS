@@ -306,3 +306,28 @@ $(LA_BUILD)/pipe-geometry: tests/workloads/pipe_geometry.c $(LA_BUILD)/musl-root
 .PHONY: test-pipe-loongarch
 test-pipe-loongarch: kernel-la $(LA_BUILD)/pipe-geometry
 	python3 -B tests/loongarch/userland.py --program $(LA_BUILD)/pipe-geometry --marker 'PIPE GEOMETRY PASS'
+
+LA_SQLITE_SOURCE := $(LA_BUILD)/sqlite/sqlite-amalgamation-3530400/sqlite3.c
+LA_SQLITE_CC := $(LA_BUILD)/dynamic-dp-v2/root/bin/musl-gcc
+LA_SQLITE_FLAGS := -march=loongarch64 -mabi=lp64d -mdouble-float -mno-lsx -mno-lasx -Wl,-z,max-page-size=16384
+$(LA_SQLITE_SOURCE): $(SQLITE_ARCHIVE)
+	@mkdir -p $(LA_BUILD)/sqlite
+	unzip -oq $< -d $(LA_BUILD)/sqlite
+	@test -f $@ && test -f $(dir $@)/shell.c
+	@touch $@ $(dir $@)/shell.c
+$(LA_BUILD)/sqlite-rollback: tests/workloads/sqlite/rollback.c $(LA_SQLITE_SOURCE) $(LA_SQLITE_CC)
+	$(LA_SQLITE_CC) $(LA_SQLITE_FLAGS) -static -O2 -pthread -I$(dir $(LA_SQLITE_SOURCE)) -o $@ $< $(LA_SQLITE_SOURCE) -ldl
+$(LA_BUILD)/sqlite-wal: tests/workloads/sqlite/wal.c $(LA_SQLITE_SOURCE) $(LA_SQLITE_CC)
+	$(LA_SQLITE_CC) $(LA_SQLITE_FLAGS) -static -O2 -pthread -I$(dir $(LA_SQLITE_SOURCE)) -o $@ $< $(LA_SQLITE_SOURCE) -ldl
+$(LA_BUILD)/sqlite3-static: $(LA_SQLITE_SOURCE) $(LA_SQLITE_CC)
+	$(LA_SQLITE_CC) $(LA_SQLITE_FLAGS) -static -O2 -pthread -o $@ $(dir $(LA_SQLITE_SOURCE))/shell.c $(LA_SQLITE_SOURCE) -ldl
+$(LA_BUILD)/sqlite3-dynamic: $(LA_SQLITE_SOURCE) $(LA_SQLITE_CC)
+	$(LA_SQLITE_CC) $(LA_SQLITE_FLAGS) -fPIE -pie -O2 -pthread -Wl,--dynamic-linker=/lib/ld-musl-loongarch64.so.1 -o $@ $(dir $(LA_SQLITE_SOURCE))/shell.c $(LA_SQLITE_SOURCE) -ldl
+$(LA_BUILD)/sqlite-cli-init: tests/workloads/sqlite/cli_init.c $(LA_SQLITE_CC)
+	$(LA_SQLITE_CC) $(LA_SQLITE_FLAGS) -static -O2 -Wall -Wextra -Werror -o $@ $<
+.PHONY: test-sqlite-wal-loongarch
+test-sqlite-wal-loongarch: $(LA_BUILD)/sqlite-wal kernel-la
+	python3 -B tests/sqlite-wal-riscv.py --arch loongarch --kernel kernel-la --program $(LA_BUILD)/sqlite-wal
+.PHONY: test-sqlite-rollback-loongarch
+test-sqlite-rollback-loongarch: $(LA_BUILD)/sqlite-rollback $(LA_BUILD)/sqlite3-static $(LA_BUILD)/sqlite3-dynamic $(LA_BUILD)/sqlite-cli-init kernel-la
+	python3 -B tests/sqlite-rollback.py --arch loongarch

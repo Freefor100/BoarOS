@@ -16,6 +16,21 @@ static void puts(const char *s) {unsigned n=0;while(s[n])n++;call(64,1,(long)s,n
 int user_main(uint64_t *stack)
 {
     (void)stack;
+#ifdef ROOT_DIRECT_FILESYSTEM
+    /* RV固定profile无initrd；根盘已由Linux挂载，保留真实wait与durable门禁。 */
+    long direct_child=call(220,17,0,0,0,0,0);
+    if(!direct_child) {
+        const char *argv[]={"/init",0},*env[]={0};
+        call(221,(long)"/init",(long)argv,(long)env,0,0,0);
+        call(93,99,0,0,0,0,0);for(;;){}
+    }
+    int direct_status=-1;
+    int direct_failed=direct_child<0 || call(260,direct_child,(long)&direct_status,0,0,0,0)!=direct_child || direct_status!=(EXPECTED_EXIT_STATUS<<8);
+    long root_fd=call(56,-100,(long)"/",0,0,0,0);
+    if(root_fd<0 || call(267,root_fd,0,0,0,0,0) || call(57,root_fd,0,0,0,0,0))direct_failed=1;
+    puts(direct_failed ? "Linux " ROOT_ARCH_LABEL " root application failed\n" : "Linux " ROOT_ARCH_LABEL " root application passed\n");
+    call(142,0xfee1dead,672274793,0x4321fedc,0,0,0);for(;;){}
+#endif
     long console=call(56,-100,(long)"/dev/console",2,0,0,0);
     call(24,console,1,0,0,0,0);call(24,console,2,0,0,0,0);
     call(34,-100,(long)"/sys",0755,0,0,0);call(34,-100,(long)"/root",0755,0,0,0);
