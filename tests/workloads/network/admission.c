@@ -70,35 +70,36 @@ int main(void)
     if (getpid()==1) { struct ifreq ifr={.ifr_name="lo"}; CHECK(ioctl(init,SIOCGIFFLAGS,&ifr)==0); ifr.ifr_flags|=IFF_UP; CHECK(ioctl(init,SIOCSIFFLAGS,&ifr)==0); }
     CHECK(close(init)==0);
     if (getpid()==1) { CHECK(mkdir("/proc",0755)==0 || errno==EEXIST); CHECK(mount("proc","/proc","proc",0,0)==0 || errno==EBUSY); }
-    char *map=mmap(0,8192,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0); CHECK(map!=MAP_FAILED);
-    memset(map,'a',4096); CHECK(mprotect(map+4096,4096,PROT_NONE)==0);
+    long page=sysconf(_SC_PAGESIZE); CHECK(page>=4096);
+    char *map=mmap(0,(size_t)page*2,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0); CHECK(map!=MAP_FAILED);
+    memset(map,'a',(size_t)page); CHECK(mprotect(map+page,(size_t)page,PROT_NONE)==0);
     void *outside=(void *)(uintptr_t)UINTPTR_MAX;
     failure("send-range-before-fd",send(-1,outside,1,MSG_NOSIGNAL),EFAULT);
     failure("write-fd-before-range",write(-1,outside,1),EBADF);
     int fd=socket(AF_INET,SOCK_STREAM,0); CHECK(fd>=0);
     failure("range-before-state",send(fd,outside,1,MSG_NOSIGNAL),EFAULT);
-    failure("header-before-state",syscall(SYS_sendmsg,fd,(void *)(map+4096),MSG_NOSIGNAL),EFAULT);
+    failure("header-before-state",syscall(SYS_sendmsg,fd,(void *)(map+page),MSG_NOSIGNAL),EFAULT);
     struct iovec invalid={outside,1}; struct msghdr invalid_message={.msg_iov=&invalid,.msg_iovlen=1};
     failure("iov-range-before-state",sendmsg(fd,&invalid_message,MSG_NOSIGNAL),EFAULT);
-    failure("fresh-fault",send(fd,map+4096,1,MSG_NOSIGNAL), EPIPE);
-    failure("fresh-empty",send(fd,map+4096,0,MSG_NOSIGNAL), EPIPE); CHECK(close(fd)==0);
+    failure("fresh-fault",send(fd,map+page,1,MSG_NOSIGNAL), EPIPE);
+    failure("fresh-empty",send(fd,map+page,0,MSG_NOSIGNAL), EPIPE); CHECK(close(fd)==0);
     int fds[2]; pair(fds);
-    failure("first-fault",send(fds[0],map+4096,1,MSG_NOSIGNAL), EFAULT);
+    failure("first-fault",send(fds[0],map+page,1,MSG_NOSIGNAL), EFAULT);
     for (unsigned vector=0; vector<2; vector++) {
-        struct iovec iov[]={{map,4096},{map+4096,4096}};
-        ssize_t n=vector ? writev(fds[0],iov,2) : send(fds[0],map,8192,MSG_NOSIGNAL);
+        struct iovec iov[]={{map,(size_t)page},{map+page,4096}};
+        ssize_t n=vector ? writev(fds[0],iov,2) : send(fds[0],map,(size_t)page+4096,MSG_NOSIGNAL);
         result(vector ? "vector-prefix" : "fault-prefix",n);
         /* 两栈的内部接纳片段不同：只验证返回前缀与接收字节严格守恒。 */
-        CHECK((n<0 && errno==EFAULT) || (n>0 && n<=4096));
-        char data[4096]; size_t got=0, accepted=n<0?0:(size_t)n;
+        CHECK((n<0 && errno==EFAULT) || (n>0 && n<=page));
+        char data[16384]; size_t got=0, accepted=n<0?0:(size_t)n;
         while(got<accepted) { n=read(fds[1],data+got,accepted-got); CHECK(n>0); got+=(size_t)n; }
         CHECK(!memcmp(data,map,accepted));
         CHECK(recv(fds[1],data,1,MSG_DONTWAIT)==-1 && errno==EAGAIN);
     }
     CHECK(shutdown(fds[0],SHUT_WR)==0);
-    failure("closed-fault",send(fds[0],map+4096,1,MSG_NOSIGNAL), EPIPE);
-    failure("closed-empty",send(fds[0],map+4096,0,MSG_NOSIGNAL), EPIPE);
-    failure("closed-signal",write(fds[0],map+4096,1), EPIPE);
+    failure("closed-fault",send(fds[0],map+page,1,MSG_NOSIGNAL), EPIPE);
+    failure("closed-empty",send(fds[0],map+page,0,MSG_NOSIGNAL), EPIPE);
+    failure("closed-signal",write(fds[0],map+page,1), EPIPE);
     CHECK(pipes==1 && close(fds[0])==0 && close(fds[1])==0);
     pair(fds); int small=0; CHECK(setsockopt(fds[0],SOL_SOCKET,SO_SNDBUF,&small,sizeof(small))==0);
     CHECK(fcntl(fds[0],F_SETFL,O_NONBLOCK)==0);
@@ -109,7 +110,7 @@ int main(void)
         CHECK(i<99999);
     }
     failure("full-range",send(fds[0],outside,1,MSG_NOSIGNAL),EFAULT);
-    failure("full-fault",send(fds[0],map+4096,1,MSG_NOSIGNAL), EAGAIN);
+    failure("full-fault",send(fds[0],map+page,1,MSG_NOSIGNAL), EAGAIN);
     failure("full-valid",send(fds[0],map,1,MSG_NOSIGNAL), EAGAIN);
     pid_t child=fork(); CHECK(child>=0);
     if (!child) {
@@ -119,7 +120,7 @@ int main(void)
     wait_blocked(child);
     CHECK(kill(child,SIGKILL)==0); int status;
     CHECK(waitpid(child,&status,0)==child && WIFSIGNALED(status) && WTERMSIG(status)==SIGKILL);
-    CHECK(close(fds[0])==0 && close(fds[1])==0 && munmap(map,8192)==0);
+    CHECK(close(fds[0])==0 && close(fds[1])==0 && munmap(map,(size_t)page*2)==0);
     partial_shutdown(0);
     partial_shutdown(1);
     puts("NETWORK PASS admission"); return 0;

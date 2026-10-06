@@ -37,7 +37,7 @@ enum virtio_status virtio_transport_begin(struct virtio_transport *t,uint64_t wa
         t->ops.write(t->context,VIRTIO_REG_DRIVER_FEATURES,(uint32_t)(features>>32));
         t->ops.write(t->context,VIRTIO_REG_STATUS,11);
         arch_io_barrier();
-        if(!(t->ops.read(t->context,VIRTIO_REG_STATUS)&8))return VIRTIO_UNSUPPORTED;
+        if(!(t->ops.read(t->context,VIRTIO_REG_STATUS)&8))return VIRTIO_DEVICE;
     }
     t->features=features;t->negotiated=1;if(accepted)*accepted=features;
     return VIRTIO_OK;

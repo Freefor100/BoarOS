@@ -1,8 +1,8 @@
 # 共用 VirtIO transport 与 split queue
 
 入口为`include/kernel/virtio_transport.h`、`virtio_split_queue.h`和
-`drivers/virtio/{transport,split_queue,mmio,pci}.c`。当前block/RNG已迁入，net迁移
-仍待完成；LA真实PCI RNG与退出回收有独立验收，网卡尚未完成。
+`drivers/virtio/{transport,split_queue,mmio,pci}.c`。block、RNG、net均已迁入；三个设备的业务策略与owner仍各自持有。LA真实
+PCI RNG/net和退出回收均有独立验收，完整平台/程序矩阵仍在推进。
 
 ## 分层与硬件契约
 
@@ -11,7 +11,8 @@ transport拥有设备身份/版本、feature/status、队列配置/通知、配�
 回调逐项从实际PC构造，不能加载高地址函数常量表。架构屏障继续构建期绑定。
 设备核心不访问MMIO/PCI偏移；PCI的ISR读取即清除，MMIO先读pending再W1C。
 
-`begin`先确认reset，现代设备必须协商VERSION_1并回显FEATURES_OK；legacy仅
+`begin`先确认reset，现代设备必须协商VERSION_1并回显FEATURES_OK；必需feature
+缺失返回UNSUPPORTED，设备拒绝已写入的FEATURES_OK返回DEVICE。legacy仅
 使用低32位feature。`start`完成DMA发布屏障后设置DRIVER_OK并检查失败/reset状态。
 `queue`拒绝已启动设备、已启用现代queue、容量不足、地址溢出或不合法legacy页布局。
 MMIO/PCI由同一个核心配置，传统guest page/PFN与现代三组地址仍遵循各自协议。
@@ -87,3 +88,8 @@ EIO/未发布PID1/资源基线；这是软件边界注入，固定QEMU自身仍�
 `f4cdf7ca9a1fdcca413157df19753f388a5a224e`的`include/uapi/linux/virtio_ring.h`，
 `references/qemu` v11.1.0 commit`84f07211cc5b4fc6a371559bf8a5de4fb068e648`的
 `hw/virtio/virtio{,-mmio,-pci}.c`、`virtio-rng.c`和`hw/block/virtio-blk.c`。
+
+net通过同一套typed配置/IRQ/queue API，不再访问MMIO/PCI偏移。MAC和link一致性
+仍由net核心读取、重试并拒绝非法值。IRQ确认与descriptor收割不归还RX loan或
+SG pbuf；`quiesce`只停止DMA、摘IRQ和撤token，业务owner由网络层归还，随后
+core释放DMA页，平台释放BAR。完整细节与实际MMIO/PCI矩阵见[net模块](riscv-virtio-net.md)。

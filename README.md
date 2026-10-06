@@ -73,6 +73,9 @@ errno 隔离、timer 寄存器保持、同步/取消、futex/非 PI robust、线
 LA内核栈已接入PGDH共享窗口及真实16KiB guard，含NX、撤映射、OOM回滚与可信异常栈验收。
 LSX/LASX状态、信号、clone/exec和关闭扩展的HWCAP已双侧验收。固定原版glibc2.42的五形态、
 初始/dlopen TLS、pthread取消和信号已在双侧两种RAM验收；RV仍固定2.44，版本差异保留。
+共用VirtIO net与Ethernet已接LA现代PCI，固定Linux/BoarOS两种RAM的真实TAP、
+原BusyBox HTTP和共享块/RNG/net IRQ、正常及构造/reset失败回收通过。完整网络ABI
+仍有AF_UNIX sendfile发送者计费差异待修复；TTY/RTC及更广原程序矩阵继续推进。
 DTB随机种子仅支持早期材料和AT_RANDOM，不计可信熵。真实PCI RNG的正常、缺失、
 延迟、在途停止已双侧两种RAM验收，BoarOS构造失败与回收也已在两种RAM验收。LBT、完整终端/网络及
 更广原程序、实板和SMP仍须另行验收，LA与RV尚不等价。

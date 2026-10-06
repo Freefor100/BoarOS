@@ -5,10 +5,10 @@ LA_CC := $(LA_CROSS_COMPILE)gcc
 LA_FLAGS := -march=loongarch64 -mabi=lp64s -msoft-float -mno-lsx -mno-lasx -mcmodel=normal
 LA_CPPFLAGS := -Iinclude -DBOAROS_ARCH_LOONGARCH=1 -DBOAROS_PAGE_SHIFT=14 -DBOAROS_COST_DIAGNOSTICS=0 -DBOAROS_UTS_MACHINE=\"loongarch64\"
 LA_CFLAGS := $(LA_FLAGS) -std=gnu11 -O2 -g3 -ffreestanding -fno-builtin -fno-stack-protector -fno-pic -fno-pie -ffunction-sections -fdata-sections -Wall -Wextra -Werror -fstack-usage -MMD -MP
-LA_C_SOURCES := $(filter-out arch/% kernel/main.c net/ethernet.c,$(C_SOURCES)) \
+LA_C_SOURCES := $(filter-out arch/% kernel/main.c,$(C_SOURCES)) \
     arch/loongarch/main.c arch/loongarch/mmu.c arch/loongarch/context.c \
     arch/loongarch/timer.c arch/loongarch/trap.c arch/loongarch/signal.c arch/loongarch/fpu.c platform/loongarch_virt.c \
-    platform/loongarch_pci.c platform/loongarch_root.c drivers/virtio/pci_block.c drivers/virtio/pci.c drivers/virtio/pci_rng.c kernel/pci.c \
+    platform/loongarch_pci.c platform/loongarch_root.c drivers/virtio/pci_block.c drivers/virtio/pci.c drivers/virtio/pci_rng.c drivers/virtio/pci_net.c kernel/pci.c \
     tests/loongarch/mmu.c tests/loongarch/heap.c tests/loongarch/user_boot.c tests/loongarch/elf_failures.c
 LA_ASM_SOURCES := arch/loongarch/boot.S arch/loongarch/context_switch.S \
     arch/loongarch/tlb_refill.S arch/loongarch/trap_entry.S arch/loongarch/signal_trampoline.S arch/loongarch/fpu_state.S tests/loongarch/user_blob.S
@@ -82,7 +82,7 @@ test-stack-guard-loongarch: kernel-la $(LA_BUILD)/stack-window-user prepare-la-l
 $(LA_BUILD)/kernel-stack-window-oom: $(LA_OBJECTS) $(LA_BUILD)/tests/loongarch/stack_window_oom.o arch/loongarch/linker.ld
 	$(LA_CC) $(LA_FLAGS) -nostdlib -nostartfiles -static -no-pie -T arch/loongarch/linker.ld -Wl,--build-id=none,--gc-sections,--wrap=physical_page_allocate,--wrap=physical_page_allocate_order,--wrap=kernel_syscall_dispatch,--wrap=la_mmu_kernel_window_initialize -o $@ $(LA_OBJECTS) $(LA_BUILD)/tests/loongarch/stack_window_oom.o -lgcc
 test-stack-guard-loongarch: $(LA_BUILD)/kernel-stack-window-oom
-LA_DEPENDENCIES := $(LA_OBJECTS:.o=.d) $(wildcard $(LA_BUILD)/*.d $(LA_BUILD)/tests/loongarch/*.d)
+LA_DEPENDENCIES := $(sort $(LA_OBJECTS:.o=.d) $(wildcard $(LA_BUILD)/*.d $(LA_BUILD)/tests/loongarch/*.d))
 # 依赖由编译器生成；禁止GNU隐式链接规则把带.d后缀的stem当成fixture编号。
 $(LA_DEPENDENCIES): ;
 -include $(LA_DEPENDENCIES)
@@ -229,3 +229,30 @@ $(LA_BUILD)/exec-errors-probe: tests/loongarch/exec_errors.c prepare-la-userland
 .PHONY: test-exec-errors-loongarch
 test-exec-errors-loongarch: kernel-la $(LA_BUILD)/exec-errors-probe $(LA_BUILD)/dynamic-probe $(LA_BUILD)/kernel-root-oom-1 prepare-la-tools prepare-la-linux
 	python3 -B tests/loongarch/exec_failures.py --qemu $(QEMU_LOONGARCH64) --cc $(LA_CC)
+
+$(LA_BUILD)/generated/net-config.h: force-net-config
+	@mkdir -p $(dir $@)
+	@printf '#define BOAROS_NET_IPV4 %sU\n#define BOAROS_NET_NETMASK %sU\n' '$(NET_IPV4)' '$(NET_NETMASK)' > $@.tmp
+	@cmp -s $@ $@.tmp && rm $@.tmp || mv $@.tmp $@
+$(LA_BUILD)/net/ethernet.o: $(LA_BUILD)/generated/net-config.h
+$(LA_BUILD)/net/ethernet.o: LA_CPPFLAGS += -I$(LA_BUILD)/generated
+
+.PHONY: test-network-loongarch
+test-network-loongarch: kernel-la prepare-la-userland prepare-la-linux-platform prepare-la-tools
+	python3 -B tests/network-loongarch.py --workload contract
+	python3 -B tests/network-loongarch.py --workload content
+	python3 -B tests/network-loongarch.py --workload timer
+	python3 -B tests/network-loongarch.py --workload admission
+	python3 -B tests/network-loongarch.py --workload sendfile
+	python3 -B tests/network-loongarch.py --workload budget --only boaros
+$(LA_BUILD)/net-failure-%.o: tests/loongarch/net_failures.c
+	$(LA_CC) $(LA_CPPFLAGS) $(LA_CFLAGS) -DNET_FAIL_CASE=$* -c $< -o $@
+$(LA_BUILD)/kernel-net-failure-%: $(LA_OBJECTS) $(LA_BUILD)/net-failure-%.o arch/loongarch/linker.ld
+	$(LA_CC) $(LA_FLAGS) -nostdlib -nostartfiles -static -no-pie -T arch/loongarch/linker.ld -Wl,--build-id=none,--gc-sections,--wrap=physical_page_allocate,--wrap=physical_page_allocate_order,--wrap=kernel_syscall_dispatch,--wrap=virtio_net_init,--wrap=kernel_network_start,--wrap=kernel_heap_allocate_zeroed,--wrap=kernel_thread_create_joinable,--wrap=virtio_transport_reset -o $@ $(LA_OBJECTS) $(LA_BUILD)/net-failure-$*.o -lgcc
+.PHONY: test-net-failures-loongarch test-network-external-loongarch
+$(LA_BUILD)/network-contract: tests/workloads/network/contract.c prepare-la-userland
+	REALGCC=$(abspath $(LA_USER_CC)) $(LA_MUSL_CC) $(LA_FLAGS) -O2 -static -Wall -Wextra -Werror -Wl,-z,max-page-size=16384 -o $@ $<
+test-net-failures-loongarch: $(foreach case,0 1 2 3 4 5 6 7 8,$(LA_BUILD)/kernel-net-failure-$(case)) $(LA_BUILD)/network-contract prepare-la-tools
+	python3 -B tests/loongarch/net_failures.py
+test-network-external-loongarch: kernel-la prepare-la-userland prepare-la-linux-platform prepare-la-tools
+	python3 -B tests/network-external.py --arch loongarch

@@ -16,6 +16,8 @@
 #include <kernel/errno.h>
 #include <kernel/virtio_pci_block.h>
 #include <kernel/virtio_pci_rng.h>
+#include <kernel/virtio_pci_net.h>
+#include <kernel/network.h>
 
 #define ROOT_DEVICES 8
 static struct {
@@ -24,6 +26,8 @@ static struct {
     struct kernel_vfs_mount mount;
     struct virtio_pci_block devices[ROOT_DEVICES];
     struct virtio_pci_rng rng;
+    struct virtio_pci_net net;
+    struct kernel_network *network;
     unsigned count,detected;
     struct kernel_exec_image image;
     struct kernel_files files;
@@ -55,9 +59,30 @@ static int start_rng(struct physical_page_allocator *allocator,struct pci_host *
     return 0;
 }
 
+static int start_network(struct physical_page_allocator *allocator,struct pci_host *host)
+{
+    for(unsigned bdf=0;bdf<256;bdf++) {
+        uint32_t id=host->read(host->context,bdf,0,4);
+        if(id!=0x10411af4 && id!=0x10001af4)continue;
+        int error=virtio_pci_net_start(&root.net,host,bdf,allocator,la_timer_frequency());
+        if(error)return error;
+        la_virt_puts("LA PCI net bdf=");la_virt_hex(bdf);
+        la_virt_puts(" irq=");la_virt_hex(root.net.pci.irq);la_virt_puts("\n");break;
+    }
+    return kernel_network_start(&root.network,&root.heap,
+        root.net.device.configured ? &root.net.device : 0,la_timer_frequency());
+}
+
 /* 文件、映像和 mount 仍是 I/O owner 时保留原字段，下一次只重试未完成项。 */
 static int release_root(void)
 {
+    int had_network=root.network!=0;
+    int network_error=kernel_network_stop(&root.network);
+    if(network_error)return network_error;
+    if(root.net.device.transport.context || root.net.pci.function.host) {
+        network_error=virtio_pci_net_stop(&root.net);
+        if(network_error)return network_error;
+    }
     if(root.rng.device.transport.context || root.rng.pci.function.host) {
         struct virtio_rng_device *rng=&root.rng.device;
         la_virt_puts("LA RNG final requests=");la_virt_hex(rng->requests);
@@ -65,6 +90,14 @@ static int release_root(void)
         la_virt_puts(" errors=");la_virt_hex(rng->errors);
         la_virt_puts(" timeouts=");la_virt_hex(rng->timeouts);la_virt_puts("\n");
         if(virtio_pci_rng_stop(&root.rng))return -KERNEL_EIO;
+    }
+    if(had_network) {
+        uint64_t block_irqs=0;
+        for(unsigned i=0;i<root.count;i++)block_irqs+=root.devices[i].device.statistics.interrupts;
+        la_virt_puts("BoarOS: mixed IRQ rng-bytes=");la_virt_hex(root.rng.device.bytes);
+        la_virt_puts(" rng-errors=");la_virt_hex(root.rng.device.errors);
+        la_virt_puts(" rng-timeouts=");la_virt_hex(root.rng.device.timeouts);
+        la_virt_puts(" block-irqs=");la_virt_hex(block_irqs);la_virt_puts("\n");
     }
     if((root.files.state==KERNEL_FILES_LIVE || root.files.state==KERNEL_FILES_CLEANUP) &&
        kernel_files_release(&root.files)!=KERNEL_FILES_STATUS_OK) return -KERNEL_EIO;
@@ -210,6 +243,7 @@ static int start_root(void)
     if(!error && kernel_page_cache_init(&root.cache,&root.heap,allocator)!=KERNEL_PAGE_CACHE_STATUS_OK) error=-KERNEL_ENOMEM;
     if(!error) error=kernel_vfs_mount_root(&root.mount,&root.devices[0].device.block,&root.heap,&root.cache);
     if(!error) error=start_rng(allocator,host);
+    if(!error) error=start_network(allocator,host);
     if(!error) error=prepare_init();
     if(!error) error=kernel_page_cache_start_worker(&root.cache);
     if(!error) error=kernel_vfs_start_journal_worker(&root.mount);

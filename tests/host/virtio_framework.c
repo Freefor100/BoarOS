@@ -121,7 +121,7 @@ int main(void)
     assert(virtio_transport_reset(&t)==VIRTIO_OK && virtio_split_reset(&q,&t)==VIRTIO_OK);
     m.offered[1]=0;assert(virtio_transport_begin(&t,0,0,0)==VIRTIO_UNSUPPORTED);
     m.offered[1]=1;m.reject_features=1;
-    assert(virtio_transport_begin(&t,0,0,0)==VIRTIO_UNSUPPORTED);
+    assert(virtio_transport_begin(&t,0,0,0)==VIRTIO_DEVICE);
     m.reject_features=0;t.version=1;
     assert(virtio_transport_begin(&t,0x21,0,&features)==VIRTIO_OK && features==0x21);
     assert(virtio_transport_queue(&t,0,32,0x100000,512,4096,4096)==VIRTIO_OK);

@@ -878,8 +878,7 @@ static void kernel_main_high(void)
         }
         if (riscv_root_boot_start_rng(&root_boot, &boot_info, &boot_irq))
             shutdown_for_root_boot_error(RISCV_ROOT_BOOT_STATUS_CLEANUP);
-        if (kernel_network_start(&root_boot.network, &root_boot.heap,
-                                 &boot_info, &boot_irq))
+        if (riscv_root_boot_start_network(&root_boot, &boot_info, &boot_irq))
             shutdown_for_root_boot_error(RISCV_ROOT_BOOT_STATUS_CLEANUP);
         virt_uart_puts("BoarOS: root /init started pid=0x1\n");
     } else if (root_status != RISCV_ROOT_BOOT_STATUS_NO_DEVICE) {

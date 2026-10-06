@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Exercise the production driver against an independently decoded MMIO device."""
+import argparse
 from pathlib import Path
 import subprocess
 import sys
@@ -16,12 +17,18 @@ def run(command, root, timeout):
         raise SystemExit(result.returncode if result.returncode > 0 else 1)
 
 
+parser=argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--sanitize",action="store_true")
+args=parser.parse_args()
 root = Path(__file__).resolve().parents[2]
 with tempfile.TemporaryDirectory(prefix="boaros-virtio-net-") as work:
     exe = Path(work) / "net"
-    for observe in (0, 1):
-        run(["cc", "-std=c11", "-Wall", "-Wextra", "-Werror",
-             f"-DBOAROS_COST_DIAGNOSTICS={observe}",
+    for page_shift, observe in ((12, 0), (12, 1), (14, 0), (14, 1)):
+        command=["cc", "-std=c11", "-Wall", "-Wextra", "-Werror",
+             f"-DBOAROS_COST_DIAGNOSTICS={observe}", f"-DBOAROS_PAGE_SHIFT={page_shift}",
              "-Itests/host/random", "-Iinclude", "tests/host/virtio_net_test.c",
-             "arch/riscv/virtio_mmio_net.c", "-o", str(exe)], root, 30)
+             "arch/riscv/virtio_mmio_net.c", "drivers/virtio/net.c", "drivers/virtio/transport.c",
+             "drivers/virtio/split_queue.c", "drivers/virtio/mmio.c", "-o", str(exe)]
+        if args.sanitize:command += ["-fsanitize=address,undefined", "-fno-omit-frame-pointer"]
+        run(command,root,30)
         run([str(exe)], root, 20)

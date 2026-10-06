@@ -22,6 +22,8 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'tests/diff-abi'))
 import harness
+sys.path.insert(0,str(ROOT/"tests"))
+from arch_profiles import PROFILES
 
 PATTERN = (bytes(range(251)) * ((16 * 1024 * 1024 + 250) // 251))[:16 * 1024 * 1024]
 HOST, GUEST = '10.77.0.1', '10.77.0.2'
@@ -169,14 +171,18 @@ def http_guest():
             'elapsed_ns': time.monotonic_ns() - start}
 
 
-def fixture(work, workload, libc, reference, observe):
+def fixture(work, workload, libc, reference, observe, arch):
     tree = work / 'tree'
     tree.mkdir()
-    compiler = ROOT / 'build/riscv/musl-root/bin/musl-gcc'
+    profile=PROFILES[arch]
+    compiler = ROOT / ('build/riscv/musl-root/bin/musl-gcc' if arch=='riscv' else 'build/loongarch/musl-root/bin/musl-gcc')
+    environment=os.environ.copy()
+    flags=['-fno-link-libatomic'] if arch=='riscv' else [*profile.raw_flags,'-Wl,-z,max-page-size=16384']
+    if arch=='loongarch':environment['REALGCC']=str(ROOT/'build/loongarch/gcc-sf/root/bin/loongarch64-unknown-linux-gnusf-gcc')
     program = work / 'init'
-    subprocess.run([str(compiler), '-fno-link-libatomic', '-static', '-O2',
+    subprocess.run([str(compiler), *flags, '-static', '-O2',
                     '-Wall', '-Wextra', '-Werror', str(ROOT / 'tests/workloads/network' / (workload + '.c')),
-                    '-o', str(program)], check=True)
+                    '-o', str(program)], env=environment,check=True)
     shutil.copyfile(program, tree / 'init')
     (tree / 'init').chmod(0o755)
     for name in ('dev', 'lib', 'proc', 'tmp'):
@@ -186,7 +192,12 @@ def fixture(work, workload, libc, reference, observe):
     if observe:
         (tree / 'observe').touch()
     inputs = {}
-    if workload == 'external':
+    if workload == 'external' and arch=='loongarch':
+        if libc!='musl':raise SystemExit('LA external GNU BusyBox input must be provided by the GNU inventory stage')
+        target=tree/'busybox'
+        shutil.copyfile(ROOT/'build/loongarch/busybox-source/busybox/busybox',target);target.chmod(0o755)
+        inputs['busybox']=harness.digest(target)
+    if workload == 'external' and arch=='riscv':
         original = ROOT / 'references/oscomp-autotest/sdcard-rv.img'
         for name in ('busybox', 'lib/libc.so') if libc == 'musl' else (
                 'busybox', 'lib/libc.so.6', 'lib/libm.so.6', 'lib/ld-linux-riscv64-lp64d.so.1'):
@@ -197,12 +208,13 @@ def fixture(work, workload, libc, reference, observe):
             inputs[name] = harness.digest(target)
         if libc == 'musl':
             (tree / 'lib/ld-musl-riscv64-sf.so.1').symlink_to('libc.so')
+    if workload == 'external':
         http = tree / 'http'
         (http / 'cgi-bin').mkdir(parents=True)
         (http / 'data.bin').write_bytes(PATTERN)
-        subprocess.run([str(compiler), '-fno-link-libatomic', '-static', '-O2', '-Wall',
+        subprocess.run([str(compiler), *flags, '-static', '-O2', '-Wall',
                         '-Wextra', '-Werror', str(ROOT / 'tests/workloads/network/external-cgi.c'),
-                        '-o', str(http / 'cgi-bin/upload')], check=True)
+                        '-o', str(http / 'cgi-bin/upload')], env=environment,check=True)
     image = work / 'fixture.img'
     with image.open('wb') as stream:
         stream.truncate(128 * 1024 * 1024)
@@ -215,24 +227,24 @@ def fixture(work, workload, libc, reference, observe):
     return image, inputs
 
 
-def run_one(work, kernel, image, transport, reference, workload, tap_fd):
+def run_one(work, kernel, image, transport, reference, workload, tap_fd, arch, memory, initrd=None):
     work.mkdir()
     snapshot = work / 'kernel'
     shutil.copyfile(kernel, snapshot)
     disk = work / 'disk.img'
     shutil.copyfile(image, disk)
-    qemu = os.environ.get('QEMU_RISCV64', 'qemu-system-riscv64')
-    command = [qemu, '-machine', 'virt', '-bios', 'default', '-kernel', str(snapshot),
-               '-global', 'virtio-mmio.force-legacy=' + ('true' if transport == 'legacy' else 'false'),
-               '-m', '512M', '-smp', '1', '-nographic', '-no-reboot',
-               '-drive', f'file={disk},if=none,format=raw,id=root,cache=writeback',
-               '-device', 'virtio-blk-device,drive=root,bus=virtio-mmio-bus.0',
-               '-netdev', f'tap,id=host,fd={tap_fd},vhost=off',
-               '-device', 'virtio-net-device,netdev=host,mac=52:54:00:12:34:56,bus=virtio-mmio-bus.1',
-               '-object', 'rng-random,id=entropy,filename=/dev/urandom',
-               '-device', 'virtio-rng-device,rng=entropy,bus=virtio-mmio-bus.7']
+    profile=PROFILES[arch]
+    qemu=os.environ.get('QEMU_LOONGARCH64' if arch=='loongarch' else 'QEMU_RISCV64',profile.qemu)
+    command=profile.boot(qemu,snapshot,memory)
+    if arch=='riscv':command+=['-global','virtio-mmio.force-legacy='+('true' if transport=='legacy' else 'false')]
+    command+=['-drive',f'file={disk},if=none,format=raw,id=root,cache=writeback',
+        '-device',profile.block(transport),'-netdev',f'tap,id=host,fd={tap_fd},vhost=off',
+        '-device',('virtio-net-pci,netdev=host,mac=52:54:00:12:34:56,addr=5,disable-legacy=on' if arch=='loongarch' else
+            'virtio-net-device,netdev=host,mac=52:54:00:12:34:56,bus=virtio-mmio-bus.1'),
+        '-object','rng-random,id=entropy,filename=/dev/urandom','-device',profile.rng()]
     if reference:
-        command += ['-append', 'root=/dev/vda rw rootwait console=ttyS0 init=/init loglevel=0 panic=-1']
+        command+=(['-initrd',str(initrd),'-append','console=ttyS0 rdinit=/init loglevel=3'] if arch=='loongarch' else
+            ['-append','root=/dev/vda rw rootwait console=ttyS0 init=/init loglevel=0 panic=-1'])
     row = {'command': command, 'kernel_sha256': harness.digest(snapshot), 'phases': {}}
     events = queue.Queue()
     raw = []
@@ -287,8 +299,9 @@ def run_one(work, kernel, image, transport, reference, workload, tap_fd):
             marker = 'EXTERNAL PASS all' if workload == 'external' else 'NETWORK PASS interface'
             if marker not in text or process.returncode:
                 raise RuntimeError('guest marker/exit missing')
-            if not reference and ('heap-live=0x0; shutting down' not in text or
-                                 ('status=0x2a' if workload == 'external' else 'status=0x0') not in text):
+            if reference and arch=='loongarch' and 'Linux LA root application passed' not in text:
+                raise RuntimeError('Linux application exit/root unmount failed')
+            if not reference and not profile.root_success(text,42 if workload=='external' else 0):
                 raise RuntimeError('guest teardown not complete')
             if workload == 'external':
                 if HostHTTP.failure or HostHTTP.get_bytes != len(PATTERN) or HostHTTP.post_bytes != 4096:
@@ -357,59 +370,93 @@ def run_one(work, kernel, image, transport, reference, workload, tap_fd):
 def main():
     parser = argparse.ArgumentParser(__doc__)
     parser.add_argument('--isolated', action='store_true', help=argparse.SUPPRESS)
-    parser.add_argument('--only', choices=('linux', 'boaros'), default='boaros')
+    parser.add_argument('--prepared',type=Path,help=argparse.SUPPRESS)
+    parser.add_argument('--arch',choices=('riscv','loongarch'),default='riscv')
+    parser.add_argument('--memory',choices=('512M','1G'),action='append')
+    parser.add_argument('--only', choices=('linux', 'boaros','both'))
     parser.add_argument('--workload', choices=('interface', 'external'), default='external')
     parser.add_argument('--libc', choices=('musl', 'glibc'), default='musl')
     parser.add_argument('--transport', choices=('legacy', 'modern', 'both'), default='modern')
     parser.add_argument('--repeat', type=int, choices=(1, 3), default=1)
     parser.add_argument('--observe', action='store_true')
-    parser.add_argument('--kernel', type=Path, default=ROOT / 'kernel-rv')
+    parser.add_argument('--kernel', type=Path)
     args = parser.parse_args()
+    profile=PROFILES[args.arch]
+    args.kernel=args.kernel or ROOT/profile.kernel
+    args.only=args.only or ('both' if args.arch=='loongarch' else 'boaros')
+    if args.arch=='loongarch' and args.transport in ('legacy','both'):parser.error('LA profile supports modern PCI only')
     if not args.isolated:
+        # Compile once, then use the identical ELF and libraries in every reference/target boot.
+        prepared=ROOT/'build/network'/('external-input-'+str(time.time_ns()));prepared.mkdir(parents=True)
+        image,inputs=fixture(prepared,args.workload,args.libc,False,args.observe,args.arch)
+        inputs['init']=harness.digest(prepared/'init')
+        (prepared/'inputs.json').write_text(json.dumps(inputs,indent=2)+'\n')
         # A new host namespace per boot also resets ARP and host TCP state.
-        base = ['--isolated', '--only', args.only, '--workload', args.workload,
-                '--libc', args.libc, '--kernel', str(args.kernel), '--repeat', '1']
+        base = ['--isolated', '--arch',args.arch,'--workload', args.workload,
+                '--libc', args.libc, '--kernel', str(args.kernel), '--repeat', '1','--prepared',str(prepared)]
         if args.observe:
             base.append('--observe')
-        for transport in ('legacy', 'modern') if args.transport == 'both' else (args.transport,):
-            for repetition in range(args.repeat):
-                print(f'isolated boot {args.only} {transport} {repetition + 1}/{args.repeat}', flush=True)
-                result = subprocess.call(['unshare', '--user', '--map-root-user', '--net',
-                                          sys.executable, '-B', str(Path(__file__).resolve())]
-                                         + base + ['--transport', transport])
-                if result:
-                    return result
+        for platform in ('linux','boaros') if args.only=='both' else (args.only,):
+            for memory in args.memory or (('512M','1G') if args.arch=='loongarch' else ('512M',)):
+                for transport in ('legacy','modern') if args.transport=='both' else (args.transport,):
+                    for repetition in range(args.repeat):
+                        print(f'isolated boot {args.arch} {platform} {memory} {transport} {repetition+1}/{args.repeat}',flush=True)
+                        result=subprocess.call(['unshare','--user','--map-root-user','--net',sys.executable,'-B',
+                            str(Path(__file__).resolve()),*base,'--only',platform,'--memory',memory,'--transport',transport])
+                        if result:return result
         return 0
     work = ROOT / 'build/network' / ('external-' + str(time.time_ns()))
     work.mkdir(parents=True)
     kernel = args.kernel
     if args.only == 'linux':
-        kernel, identity = harness.linux_build(ROOT / 'tests/network-linux.config')
+        if args.arch=='loongarch':
+            kernel=profile.linux_kernel();identity=json.loads((kernel.parent/'boaros-identity.json').read_text())
+        else:kernel, identity = harness.linux_build(ROOT / 'tests/network-linux.config')
         (work / 'linux-identity.json').write_text(json.dumps(identity, indent=2) + '\n')
     if args.observe and (args.only != 'boaros' or args.repeat != 1):
         parser.error('observation is one BoarOS boot')
-    image, inputs = fixture(work, args.workload, args.libc, args.only == 'linux', args.observe)
+    if args.prepared:
+        image=work/'fixture.img';shutil.copyfile(args.prepared/'fixture.img',image)
+        inputs=json.loads((args.prepared/'inputs.json').read_text())
+        if harness.digest(args.prepared/'init')!=inputs['init']:raise RuntimeError('prepared ELF changed')
+        if args.only=='linux':
+            marker=work/'reference-network-setup';marker.touch()
+            harness.run_logged(['debugfs','-w','-R',f'write {marker} /reference-network-setup',str(image)],work/'reference-setup.log')
+    else:image,inputs=fixture(work,args.workload,args.libc,args.only=='linux',args.observe,args.arch)
     metadata = {'inputs': inputs, 'fixture_sha256': harness.digest(image),
                 'source': harness.output(['git', '-C', str(ROOT), 'rev-parse', 'HEAD']),
                 'source_tree': harness.output(['git', '-C', str(ROOT), 'rev-parse', 'HEAD^{tree}']),
-                'qemu': harness.output([os.environ.get('QEMU_RISCV64', 'qemu-system-riscv64'), '--version']),
-                'qemu_sha256': harness.digest(shutil.which(os.environ.get('QEMU_RISCV64', 'qemu-system-riscv64'))),
-                'compiler': harness.output([str(ROOT / 'build/riscv/musl-root/bin/musl-gcc'), '--version']),
+                'qemu': harness.output([os.environ.get('QEMU_LOONGARCH64' if args.arch=='loongarch' else 'QEMU_RISCV64',profile.qemu), '--version']),
+                'qemu_sha256': harness.digest(shutil.which(os.environ.get('QEMU_LOONGARCH64' if args.arch=='loongarch' else 'QEMU_RISCV64',profile.qemu))),
+                'compiler': harness.output([str(ROOT / ('build/riscv/musl-root/bin/musl-gcc' if args.arch=='riscv' else 'build/loongarch/musl-root/bin/musl-gcc')), '--version']),
                 'configuration': vars(args) | {'kernel': str(kernel)}, 'namespace': harness.output(['ip', '-brief', 'link'])}
     (work / 'identity.json').write_text(json.dumps(metadata, default=str, indent=2) + '\n')
+    initrd=None
+    if args.arch=='loongarch' and args.only=='linux':
+        sys.path.insert(0,str(ROOT/'tests/loongarch'))
+        from root import execute
+        from reference import archive
+        supervisor=work/'supervisor'
+        execute([profile.compiler,*profile.raw_flags,'-O2',f'-DEXPECTED_EXIT_STATUS={42 if args.workload=="external" else 0}',
+            '-ffreestanding','-fno-builtin','-fno-stack-protector','-nostdlib','-nostartfiles','-static','-no-pie',
+            '-Wl,--build-id=none','-Wl,-z,max-page-size=16384','-T','tests/common/user.ld',
+            'tests/loongarch/root_linux_init.c','tests/common/user_start.S','-o',supervisor])
+        initrd=work/'initramfs.gz';initrd.write_bytes(archive([('dev',0o040755,b'',0,0),('dev/console',0o020600,b'',5,1),
+            ('init',0o100755,supervisor.read_bytes(),0,0),('TRAILER!!!',0,b'',0,0)]))
     fd = tap()
     passed = True
     try:
         for transport in ('legacy', 'modern') if args.transport == 'both' else (args.transport,):
             for repetition in range(args.repeat):
                 if not run_one(work / f'{args.only}-{transport}-{repetition + 1}', kernel, image,
-                               transport, args.only == 'linux', args.workload, fd):
+                               transport, args.only == 'linux', args.workload, fd,args.arch,args.memory[0] if args.memory else '512M',initrd):
                     passed = False
                     break
             if not passed:
                 break
     finally:
         os.close(fd)
+    if args.prepared and harness.digest(args.prepared/'init')!=inputs['init']:raise RuntimeError('ELF changed during differential boots')
     print('artifacts:', work)
     return 0 if passed else 1
 
