@@ -15,11 +15,17 @@
 #include <time.h>
 #include <unistd.h>
 #define CHECK(x) do { if(!(x)){fprintf(stderr,"environment:%d: %s errno=%d\n",__LINE__,#x,errno);return 1;} } while(0)
+#ifndef ENVIRONMENT_APPS_ONLY
+#define ENVIRONMENT_APPS_ONLY 0
+#endif
 static void interrupted(int sig) { (void)sig; }
 static int log_checks(void)
 {
-    static char data[16384];int n=klogctl(10,NULL,0);CHECK(n==16384);
-    n=klogctl(3,data,sizeof(data));CHECK(n>0 && memmem(data,n,"BoarOS:",7));
+    static char data[16384];int n=klogctl(10,NULL,0);CHECK(n>=4096);
+    char *boot=malloc((size_t)n);CHECK(boot);
+    int boot_size=klogctl(3,boot,n);CHECK(boot_size>0 && (memmem(boot,boot_size,"BoarOS:",7) || memmem(boot,boot_size,"Linux version",13)));
+    free(boot);
+    n=klogctl(3,data,sizeof(data));CHECK(n>0);
     CHECK(!memmem(data,n,"user-console-only-marker",24));
     CHECK(write(1,"user-console-only-marker\n",25)==25);
     n=klogctl(3,data,sizeof(data));CHECK(n>0 && !memmem(data,n,"user-console-only-marker",24));
@@ -57,7 +63,9 @@ static int rtc_checks(void)
 {
     const char *names[]={"/dev/rtc0","/dev/rtc","/dev/misc/rtc"};
     CHECK(mkdir("/dev/misc",0755)==0 || errno==EEXIST);
-    for(unsigned i=0;i<3;i++)CHECK(mknod(names[i],S_IFCHR|0600,makedev(10,135))==0 || errno==EEXIST);
+    CHECK(mknod(names[0],S_IFCHR|0600,makedev(10,135))==0 || errno==EEXIST);
+    struct stat device;CHECK(stat(names[0],&device)==0 && S_ISCHR(device.st_mode));
+    for(unsigned i=1;i<3;i++)CHECK(mknod(names[i],S_IFCHR|0600,device.st_rdev)==0 || errno==EEXIST);
     int fd=open(names[0],O_RDONLY);CHECK(fd>=0);
     CHECK(open(names[1],O_RDONLY)==-1 && errno==EBUSY);int copy=dup(fd);CHECK(copy>=0 && close(fd)==0);
     CHECK(open(names[2],O_RDONLY)==-1 && errno==EBUSY);
@@ -87,6 +95,12 @@ int main(int argc, char **argv)
     }
     CHECK(mkdir("/dev",0755)==0 || errno==EEXIST);CHECK(mkdir("/proc",0755)==0 || errno==EEXIST);
     CHECK(mount("proc","/proc","proc",0,NULL)==0);
-    if(log_checks() || rtc_checks())return 1;
+    if(!ENVIRONMENT_APPS_ONLY && (log_checks() || rtc_checks()))return 1;
+    if(access("/environment-check",R_OK)==0) {
+        CHECK(setenv("PATH","/bin",1)==0 && setenv("TZ","UTC",1)==0);
+        pid_t child=fork();CHECK(child>=0);
+        if(!child){execl("/busybox","/busybox","sh","/environment-check",NULL);_exit(127);}
+        int status;CHECK(waitpid(child,&status,0)==child && WIFEXITED(status) && WEXITSTATUS(status)==0);
+    }
     puts("ENV PASS all");return 0;
 }

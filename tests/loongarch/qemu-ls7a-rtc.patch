@@ -1,0 +1,479 @@
+--- a/hw/rtc/ls7a_rtc.c
++++ b/hw/rtc/ls7a_rtc.c
+@@ -17,6 +17,12 @@
+ #include "hw/misc/unimp.h"
+ #include "system/rtc.h"
+ #include "hw/core/registerfields.h"
++#include "hw/core/qdev-properties.h"
++
++#define PM1_STS 0x0c
++#define PM1_EN  0x10
++#define PM1_CNT 0x14
++#define RTC_EVENT (1U << 10)
+ 
+ #define SYS_TOYTRIM        0x20
+ #define SYS_TOYWRITE0      0x24
+@@ -65,6 +71,10 @@
+     SysBusDevice parent_obj;
+ 
+     MemoryRegion iomem;
++    MemoryRegion pm_iomem;
++    uint32_t pm_sts, pm_en, pm_cnt;
++    uint8_t toy_pending, rtc_pending;
++    bool toy_boot_enabled;
+     /*
+      * Needed to preserve the tick_count across migration, even if the
+      * absolute value of the rtc_clock is different on the source and
+@@ -83,18 +93,21 @@
+     QEMUTimer *toy_timer[TIMER_NUMS];
+     QEMUTimer *rtc_timer[TIMER_NUMS];
+     qemu_irq irq;
++    qemu_irq pm_irq;
++    struct { struct LS7ARtcState *state; unsigned index; } callback[TIMER_NUMS];
+ };
+ 
+ /* switch nanoseconds time to rtc ticks */
+ static uint64_t ls7a_rtc_ticks(void)
+ {
+-    return qemu_clock_get_ns(rtc_clock) * LS7A_RTC_FREQ / NANOSECONDS_PER_SECOND;
++    return muldiv64(qemu_clock_get_ns(rtc_clock), LS7A_RTC_FREQ,
++                    NANOSECONDS_PER_SECOND);
+ }
+ 
+ /* switch rtc ticks to nanoseconds */
+ static uint64_t ticks_to_ns(uint64_t ticks)
+ {
+-    return ticks * NANOSECONDS_PER_SECOND / LS7A_RTC_FREQ;
++    return muldiv64(ticks, NANOSECONDS_PER_SECOND, LS7A_RTC_FREQ);
+ }
+ 
+ static bool toy_enabled(LS7ARtcState *s)
+@@ -133,82 +146,145 @@
+     tm->tm_year += (FIELD_EX32(val, TOY_MATCH, YEAR) - (tm->tm_year & 0x3f));
+ }
+ 
++/* Direct comparison IRQs and the PM event are distinct hardware owners. */
++static void ls7a_update_irq(LS7ARtcState *s)
++{
++    qemu_set_irq(s->irq, (toy_enabled(s) && s->toy_pending) ||
++                        (rtc_enabled(s) && s->rtc_pending));
++    qemu_set_irq(s->pm_irq, (s->pm_sts & s->pm_en & RTC_EVENT) &&
++                          (s->pm_cnt & 1));
++}
++
++static void schedule_toy(LS7ARtcState *s, int num)
++{
++    struct tm tm, check;
++    int64_t delta, now;
++
++    timer_del(s->toy_timer[num]);
++    if (!toy_enabled(s)) {
++        return;
++    }
++    toymatch_val_to_time(s, s->toymatch[num], &tm);
++    /* Zero/invalid calendar values disable comparison, including ISR ack. */
++    if (tm.tm_mon < 0 || tm.tm_mon > 11 || tm.tm_mday < 1 ||
++        tm.tm_mday > 31 || tm.tm_hour > 23 || tm.tm_min > 59 ||
++        tm.tm_sec > 59) {
++        return;
++    }
++    check = tm;
++    time_t epoch = mktimegm(&check);
++    gmtime_r(&epoch, &check);
++    if (check.tm_mon != tm.tm_mon || check.tm_mday != tm.tm_mday) {
++        return;
++    }
++    delta = qemu_timedate_diff(&tm) - s->offset_toy;
++    /* The match year repeats every 64 years; past matches are not expired IRQs. */
++    if (delta < 0) {
++        tm.tm_year += 64;
++        delta = qemu_timedate_diff(&tm) - s->offset_toy;
++    }
++    now = qemu_clock_get_ms(rtc_clock);
++    timer_mod(s->toy_timer[num], now + delta * 1000);
++}
++
++static void schedule_rtc(LS7ARtcState *s, int num)
++{
++    uint32_t count, distance;
++    timer_del(s->rtc_timer[num]);
++    if (!rtc_enabled(s)) {
++        return;
++    }
++    count = ls7a_rtc_ticks() + s->offset_rtc;
++    distance = s->rtcmatch[num] - count;
++    timer_mod_ns(s->rtc_timer[num], qemu_clock_get_ns(rtc_clock) +
++                 ticks_to_ns(distance));
++}
++
+ static void toymatch_write(LS7ARtcState *s, uint64_t val, int num)
+ {
+-    int64_t now, expire_time;
+-    struct tm tm = {};
+-
+-    /* it do not support write when toy disabled */
+     if (toy_enabled(s)) {
+         s->toymatch[num] = val;
+-        /* calculate expire time */
+-        now = qemu_clock_get_ms(rtc_clock);
+-        toymatch_val_to_time(s, val, &tm);
+-        expire_time = now + (qemu_timedate_diff(&tm) - s->offset_toy) * 1000;
+-        timer_mod(s->toy_timer[num], expire_time);
++        s->toy_pending &= ~(1U << num);
++        schedule_toy(s, num);
++        ls7a_update_irq(s);
+     }
+ }
+ 
+ static void rtcmatch_write(LS7ARtcState *s, uint64_t val, int num)
+ {
+-    uint64_t expire_ns;
+-
+-    /* it do not support write when toy disabled */
+     if (rtc_enabled(s)) {
+         s->rtcmatch[num] = val;
+-        /* calculate expire time */
+-        expire_ns = ticks_to_ns(val) - ticks_to_ns(s->offset_rtc);
+-        timer_mod_ns(s->rtc_timer[num], expire_ns);
++        s->rtc_pending &= ~(1U << num);
++        schedule_rtc(s, num);
++        ls7a_update_irq(s);
+     }
+ }
+ 
+ static void ls7a_toy_stop(LS7ARtcState *s)
+ {
+-    int i;
+-
+-    /* delete timers, and when re-enabled, recalculate expire time */
+-    for (i = 0; i < TIMER_NUMS; i++) {
++    for (int i = 0; i < TIMER_NUMS; i++) {
+         timer_del(s->toy_timer[i]);
+     }
+ }
+ 
+ static void ls7a_rtc_stop(LS7ARtcState *s)
+ {
+-    int i;
+-
+-    /* delete timers, and when re-enabled, recalculate expire time */
+-    for (i = 0; i < TIMER_NUMS; i++) {
++    for (int i = 0; i < TIMER_NUMS; i++) {
+         timer_del(s->rtc_timer[i]);
+     }
+ }
+ 
+ static void ls7a_toy_start(LS7ARtcState *s)
+ {
+-    int i;
+-    uint64_t expire_time, now;
+-    struct tm tm = {};
+-
+-    now = qemu_clock_get_ms(rtc_clock);
+-
+-    /* recalculate expire time and enable timer */
+-    for (i = 0; i < TIMER_NUMS; i++) {
+-        toymatch_val_to_time(s, s->toymatch[i], &tm);
+-        expire_time = now + (qemu_timedate_diff(&tm) - s->offset_toy) * 1000;
+-        timer_mod(s->toy_timer[i], expire_time);
++    for (int i = 0; i < TIMER_NUMS; i++) {
++        if (!(s->toy_pending & (1U << i))) {
++            schedule_toy(s, i);
++        }
+     }
+ }
+ 
+ static void ls7a_rtc_start(LS7ARtcState *s)
+ {
+-    int i;
+-    uint64_t expire_time;
+-
+-    /* recalculate expire time and enable timer */
+-    for (i = 0; i < TIMER_NUMS; i++) {
+-        expire_time = ticks_to_ns(s->rtcmatch[i]) - ticks_to_ns(s->offset_rtc);
+-        timer_mod_ns(s->rtc_timer[i], expire_time);
+-    }
+-}
++    for (int i = 0; i < TIMER_NUMS; i++) {
++        if (!(s->rtc_pending & (1U << i))) {
++            schedule_rtc(s, i);
++        }
++    }
++}
++
++static uint64_t ls7a_pm_read(void *opaque, hwaddr addr, unsigned size)
++{
++    LS7ARtcState *s = opaque;
++    switch (addr) {
++    case PM1_STS: return s->pm_sts;
++    case PM1_EN: return s->pm_en;
++    case PM1_CNT: return s->pm_cnt;
++    default:
++        qemu_log_mask(LOG_UNIMP, "ls7a RTC PM: unsupported read 0x%" HWADDR_PRIx "\n", addr);
++        return 0;
++    }
++}
++
++static void ls7a_pm_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
++{
++    LS7ARtcState *s = opaque;
++    switch (addr) {
++    case PM1_STS: s->pm_sts &= ~(val & RTC_EVENT); break;
++    case PM1_EN: s->pm_en = val & RTC_EVENT; break;
++    case PM1_CNT: s->pm_cnt = val & 1; break;
++    default:
++        qemu_log_mask(LOG_UNIMP, "ls7a RTC PM: unsupported write 0x%" HWADDR_PRIx "\n", addr);
++        return;
++    }
++    ls7a_update_irq(s);
++}
++
++static const MemoryRegionOps ls7a_pm_ops = {
++    .read = ls7a_pm_read,
++    .write = ls7a_pm_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = { .min_access_size = 4, .max_access_size = 4 },
++};
+ 
+ static uint64_t ls7a_rtc_read(void *opaque, hwaddr addr, unsigned size)
+ {
+@@ -289,6 +365,7 @@
+             tm.tm_mday = FIELD_EX32(val, TOY, DAY);
+             tm.tm_mon = FIELD_EX32(val, TOY, MON) - 1;
+             s->offset_toy = qemu_timedate_diff(&tm);
++            ls7a_toy_start(s);
+         }
+     break;
+     case SYS_TOYWRITE1:
+@@ -296,6 +373,7 @@
+             qemu_get_timedate(&tm, s->offset_toy);
+             tm.tm_year = val;
+             s->offset_toy = qemu_timedate_diff(&tm);
++            ls7a_toy_start(s);
+         }
+         break;
+     case SYS_TOYMATCH0:
+@@ -312,7 +390,7 @@
+         old_toyen = toy_enabled(s);
+         old_rtcen = rtc_enabled(s);
+ 
+-        s->cntrctl = val;
++        s->cntrctl = val & ((1U << 13) | (1U << 11) | (1U << 8));
+         /* get new ctrl */
+         new_toyen = toy_enabled(s);
+         new_rtcen = rtc_enabled(s);
+@@ -335,10 +413,12 @@
+                 ls7a_rtc_stop(s);
+             }
+         }
++        ls7a_update_irq(s);
+         break;
+     case SYS_RTCWRTIE0:
+         if (rtc_enabled(s)) {
+-            s->offset_rtc = val - ls7a_rtc_ticks();
++            s->offset_rtc = (int64_t)(uint32_t)val - ls7a_rtc_ticks();
++            ls7a_rtc_start(s);
+         }
+         break;
+     case SYS_RTCMATCH0:
+@@ -367,19 +447,22 @@
+ 
+ static void toy_timer_cb(void *opaque)
+ {
+-    LS7ARtcState *s = opaque;
+-
++    typeof(((LS7ARtcState *)0)->callback[0]) *cb = opaque;
++    LS7ARtcState *s = cb->state;
+     if (toy_enabled(s)) {
+-        qemu_irq_raise(s->irq);
++        s->toy_pending |= 1U << cb->index;
++        s->pm_sts |= RTC_EVENT;
++        ls7a_update_irq(s);
+     }
+ }
+ 
+ static void rtc_timer_cb(void *opaque)
+ {
+-    LS7ARtcState *s = opaque;
+-
++    typeof(((LS7ARtcState *)0)->callback[0]) *cb = opaque;
++    LS7ARtcState *s = cb->state;
+     if (rtc_enabled(s)) {
+-        qemu_irq_raise(s->irq);
++        s->rtc_pending |= 1U << cb->index;
++        ls7a_update_irq(s);
+     }
+ }
+ 
+@@ -391,14 +474,20 @@
+     memory_region_init_io(&d->iomem, NULL, &ls7a_rtc_ops,
+                          (void *)d, "ls7a_rtc", 0x100);
+ 
++    memory_region_init_io(&d->pm_iomem, OBJECT(d), &ls7a_pm_ops, d,
++                          "ls7a_rtc_pm", 0x100);
+     sysbus_init_irq(sbd, &d->irq);
++    sysbus_init_irq(sbd, &d->pm_irq);
+ 
+     sysbus_init_mmio(sbd, &d->iomem);
++    sysbus_init_mmio(sbd, &d->pm_iomem);
+     for (i = 0; i < TIMER_NUMS; i++) {
+         d->toymatch[i] = 0;
+         d->rtcmatch[i] = 0;
+-        d->toy_timer[i] = timer_new_ms(rtc_clock, toy_timer_cb, d);
+-        d->rtc_timer[i] = timer_new_ms(rtc_clock, rtc_timer_cb, d);
++        d->callback[i].state = d;
++        d->callback[i].index = i;
++        d->toy_timer[i] = timer_new_ms(rtc_clock, toy_timer_cb, &d->callback[i]);
++        d->rtc_timer[i] = timer_new_ms(rtc_clock, rtc_timer_cb, &d->callback[i]);
+     }
+     d->offset_toy = 0;
+     d->offset_rtc = 0;
+@@ -412,26 +501,15 @@
+     SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
+     LS7ARtcState *d = LS7A_RTC(sbd);
+     for (i = 0; i < TIMER_NUMS; i++) {
+-        if (toy_enabled(d)) {
+-            timer_del(d->toy_timer[i]);
+-        }
+-        if (rtc_enabled(d)) {
+-            timer_del(d->rtc_timer[i]);
+-        }
++        timer_del(d->toy_timer[i]);
++        timer_del(d->rtc_timer[i]);
+         d->toymatch[i] = 0;
+         d->rtcmatch[i] = 0;
+     }
+-    d->cntrctl = 0;
+-}
+-
+-static int ls7a_rtc_pre_save(void *opaque)
+-{
+-    LS7ARtcState *s = LS7A_RTC(opaque);
+-
+-    ls7a_toy_stop(s);
+-    ls7a_rtc_stop(s);
+-
+-    return 0;
++    d->toy_pending = d->rtc_pending = 0;
++    d->pm_sts = d->pm_en = d->pm_cnt = 0;
++    d->cntrctl = d->toy_boot_enabled ? (1U << 11) | (1U << 8) : 0;
++    ls7a_update_irq(d);
+ }
+ 
+ static int ls7a_rtc_post_load(void *opaque, int version_id)
+@@ -445,14 +523,14 @@
+         ls7a_rtc_start(s);
+     }
+ 
++    ls7a_update_irq(s);
+     return 0;
+ }
+ 
+ static const VMStateDescription vmstate_ls7a_rtc = {
+     .name = "ls7a_rtc",
+-    .version_id = 1,
++    .version_id = 2,
+     .minimum_version_id = 1,
+-    .pre_save = ls7a_rtc_pre_save,
+     .post_load = ls7a_rtc_post_load,
+     .fields = (const VMStateField[]) {
+         VMSTATE_INT64(offset_toy, LS7ARtcState),
+@@ -460,13 +538,26 @@
+         VMSTATE_UINT32_ARRAY(toymatch, LS7ARtcState, TIMER_NUMS),
+         VMSTATE_UINT32_ARRAY(rtcmatch, LS7ARtcState, TIMER_NUMS),
+         VMSTATE_UINT32(cntrctl, LS7ARtcState),
++        VMSTATE_UINT8_V(toy_pending, LS7ARtcState, 2),
++        VMSTATE_UINT8_V(rtc_pending, LS7ARtcState, 2),
++        VMSTATE_UINT32_V(pm_sts, LS7ARtcState, 2),
++        VMSTATE_UINT32_V(pm_en, LS7ARtcState, 2),
++        VMSTATE_UINT32_V(pm_cnt, LS7ARtcState, 2),
++        VMSTATE_UINT32_V(toytrim, LS7ARtcState, 2),
++        VMSTATE_UINT32_V(rtctrim, LS7ARtcState, 2),
+         VMSTATE_END_OF_LIST()
+     }
+ };
+ 
++static const Property ls7a_rtc_properties[] = {
++    /* Explicit direct-ELF firmware input; hardware reset remains disabled. */
++    DEFINE_PROP_BOOL("toy-enabled", LS7ARtcState, toy_boot_enabled, false),
++};
++
+ static void ls7a_rtc_class_init(ObjectClass *klass, const void *data)
+ {
+     DeviceClass *dc = DEVICE_CLASS(klass);
++    device_class_set_props(dc, ls7a_rtc_properties);
+     dc->vmsd = &vmstate_ls7a_rtc;
+     dc->realize = ls7a_rtc_realize;
+     device_class_set_legacy_reset(dc, ls7a_rtc_reset);
+--- a/hw/loongarch/virt.c
++++ b/hw/loongarch/virt.c
+@@ -22,6 +22,7 @@
+ #include "hw/loongarch/virt.h"
+ #include "system/address-spaces.h"
+ #include "hw/core/irq.h"
++#include "hw/core/or-irq.h"
+ #include "net/net.h"
+ #include "hw/core/loader.h"
+ #include "elf.h"
+@@ -279,7 +280,7 @@
+     lvms->memmap_entries = memmap_entries;
+ }
+ 
+-static DeviceState *create_acpi_ged(DeviceState *pch_pic,
++static DeviceState *create_acpi_ged(qemu_irq sci_irq,
+                                     LoongArchVirtMachineState *lvms)
+ {
+     DeviceState *dev;
+@@ -310,8 +311,7 @@
+         sysbus_mmio_map(SYS_BUS_DEVICE(dev), 3, VIRT_GED_CPUHP_ADDR);
+     }
+ 
+-    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+-                       qdev_get_gpio_in(pch_pic, VIRT_SCI_IRQ - VIRT_GSI_BASE));
++    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0, sci_irq);
+     return dev;
+ }
+ 
+@@ -485,12 +485,19 @@
+      * Create some unimplemented devices to emulate this.
+      */
+     create_unimplemented_device("pci-dma-cfg", 0x1001041c, 0x4);
+-    sysbus_create_simple("ls7a_rtc", VIRT_RTC_REG_BASE,
++    DeviceState *rtc = sysbus_create_simple("ls7a_rtc", VIRT_RTC_REG_BASE,
+                          qdev_get_gpio_in(pch_pic,
+                          VIRT_RTC_IRQ - VIRT_GSI_BASE));
++    sysbus_mmio_map(SYS_BUS_DEVICE(rtc), 1, VIRT_RTC_REG_BASE - 0x100);
+ 
+     /* acpi ged */
+-    lvms->acpi_ged = create_acpi_ged(pch_pic, lvms);
++    DeviceState *sci = qdev_new(TYPE_OR_IRQ);
++    qdev_prop_set_uint32(sci, "num-lines", 2);
++    qdev_realize_and_unref(sci, NULL, &error_fatal);
++    qdev_connect_gpio_out(sci, 0, qdev_get_gpio_in(pch_pic,
++                         VIRT_SCI_IRQ - VIRT_GSI_BASE));
++    sysbus_connect_irq(SYS_BUS_DEVICE(rtc), 1, qdev_get_gpio_in(sci, 1));
++    lvms->acpi_ged = create_acpi_ged(qdev_get_gpio_in(sci, 0), lvms);
+     /* platform bus */
+     lvms->platform_bus_dev = create_platform_bus(pch_pic);
+ }
+--- a/hw/loongarch/Kconfig
++++ b/hw/loongarch/Kconfig
+@@ -17,6 +17,7 @@
+     select LOONGARCH_EXTIOI
+     select LOONGARCH_DINTC
+     select LS7A_RTC
++    select OR_IRQ
+     select SMBIOS
+     select ACPI_CPU_HOTPLUG
+     select ACPI_PCI
+--- a/system/rtc.c
++++ b/system/rtc.c
+@@ -105,7 +105,7 @@
+         abort();
+     }
+ 
+-    return seconds - qemu_ref_timedate(QEMU_CLOCK_HOST);
++    return seconds - qemu_ref_timedate(rtc_clock);
+ }
+ 
+ static void configure_rtc_base_datetime(const char *startdate)

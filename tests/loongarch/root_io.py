@@ -23,7 +23,7 @@ def main(args):
             while not socket.exists():
                 if server.poll() is not None or time.monotonic()>deadline: raise RuntimeError('NBD startup failed')
                 time.sleep(.01)
-            command=[args.qemu,'-machine','virt','-cpu','la464','-smp','1','-m',memory,'-kernel','kernel-la',
+            command=[args.qemu,'-machine','virt','-cpu','la464','-global','ls7a_rtc.toy-enabled=on','-smp','1','-m',memory,'-kernel','kernel-la',
                      '-drive',f'file=nbd+unix:///?socket={socket},if=none,format=raw,id=root',
                      '-device','virtio-blk-pci,drive=root,addr=1,disable-legacy=on',
                      '-net','none','-nographic','-no-reboot']
@@ -53,4 +53,4 @@ def main(args):
             if guest: guest.stdout.close()
             server.stderr.close();socket.unlink(missing_ok=True)
 if __name__=='__main__':
-    parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('--qemu',default='build/qemu-la/qemu-system-loongarch64');parser.add_argument('--timeout',type=int,default=60);main(parser.parse_args())
+    parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('--qemu',default='build/qemu-la-rtc/qemu-system-loongarch64');parser.add_argument('--timeout',type=int,default=60);main(parser.parse_args())

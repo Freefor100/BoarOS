@@ -76,7 +76,7 @@ LSX/LASX状态、信号、clone/exec和关闭扩展的HWCAP已双侧验收。固
 共用VirtIO net与Ethernet已接LA现代PCI，固定Linux/BoarOS两种RAM的真实TAP、
 原BusyBox HTTP和共享块/RNG/net IRQ、正常及构造/reset失败回收通过。无metadata checksum的空索引目录误报EUCLEAN已修复并用真实1/4KiB布局及
 LA普通/挂载后rmdir验证；全恢复回归仍随本轮最终门禁执行。AF_UNIX发送者计费和sendfile批次已按固定Linux接入并双侧验证；完整网络ABI
-和程序矩阵仍需最终同口径回归。共用ns16550已接LA真实TTY，串口/termios2/作业控制、PTY与原ash/stty/script/replay及录制重启已双侧两种RAM验收；UART构造失败和fatal轮询通过。LA pipe已修正为实际持有的16页容量，双侧两种RAM验证满环、wrap和回收。RTC及完整指定原程序矩阵继续推进。
+和程序矩阵仍需最终同口径回归。共用ns16550已接LA真实TTY，串口/termios2/作业控制、PTY与原ash/stty/script/replay及录制重启已双侧两种RAM验收；UART构造失败和fatal轮询通过。LA pipe已修正为实际持有的16页容量，双侧两种RAM验证满环、wrap和回收。LS7A RTC真实UTC、日志/OFD与原BusyBox hwclock/dmesg/df已双侧两种RAM验证；Linux参考采用保留固定源的派生QEMU补齐PM/告警，具体身份和边界见[RTC平台](docs/modules/loongarch-boot.md#ls7a-rtc-与派生模拟器)。完整指定原程序矩阵继续推进。
 DTB随机种子仅支持早期材料和AT_RANDOM，不计可信熵。真实PCI RNG的正常、缺失、
 延迟、在途停止已双侧两种RAM验收，BoarOS构造失败与回收也已在两种RAM验收。LBT、
 更广原程序、实板和SMP仍须另行验收，LA与RV尚不等价。

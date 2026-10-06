@@ -8,7 +8,7 @@ with tempfile.TemporaryDirectory(prefix='pci-root-reset-',dir='build/loongarch')
     directory=Path(directory)
     for memory in ('512M','1G'):
         image=disk(directory,Path('build/loongarch/root-probe'))
-        command=['build/qemu-la/qemu-system-loongarch64','-machine','virt','-cpu','la464',
+        command=['build/qemu-la-rtc/qemu-system-loongarch64','-machine','virt','-cpu','la464','-global','ls7a_rtc.toy-enabled=on',
                  '-smp','1','-m',memory,'-kernel','build/loongarch/kernel-pci-root-reset',
                  '-drive',f'file={image},format=raw,if=none,id=root',
                  '-device','virtio-blk-pci,drive=root,addr=5,disable-legacy=on',

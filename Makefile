@@ -1697,7 +1697,7 @@ test-environment-riscv: $(KERNEL_RV)
 .PHONY: test-rtc-host
 test-rtc-host:
 	@mkdir -p build/host
-	cc -std=c11 -Wall -Wextra -Werror -Itests/host/random -idirafter include tests/host/rtc_device.c fs/rtc_device.c -o build/host/rtc-test
+	cc -std=c11 -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=12 -Itests/host/random -idirafter include tests/host/rtc_device.c fs/rtc_device.c -o build/host/rtc-test
 	build/host/rtc-test
 
 .PHONY: test-network-riscv

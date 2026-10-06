@@ -36,7 +36,7 @@ def disk(directory,program,busybox=None,case='normal'):
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--qemu',default='build/qemu-la/qemu-system-loongarch64')
+    parser.add_argument('--qemu',default='build/qemu-la-rtc/qemu-system-loongarch64')
     parser.add_argument('--cc',default='loongarch64-unknown-linux-gnu-gcc');parser.add_argument('--kernel',default='kernel-la');parser.add_argument('--program',type=Path,default=Path('build/loongarch/root-probe'))
     parser.add_argument('--busybox',type=Path,default=Path('build/loongarch/busybox-source/busybox/busybox'))
     parser.add_argument('--linux',action='store_true');parser.add_argument('--smoke',action='store_true')
@@ -58,7 +58,7 @@ def main():
             image=disk(directory,args.fault_program if case=='userfault' else args.program,args.busybox if args.busybox.exists() else None,case)
             readonly_hash=hashlib.sha256(image.read_bytes()).hexdigest() if case=='readonly' else None
             kernel='build/linux-la/vmlinux' if args.linux else args.oom_kernel if case=='oom' else args.kernel
-            command=[args.qemu,'-machine','virt','-cpu','la464','-smp','1','-m',memory,'-kernel',kernel,'-drive',f'file={image},format=raw,if=none,id=root'+(',readonly=on' if case=='readonly' else ''),'-device','virtio-blk-pci,drive=root,addr=1,disable-legacy=on','-net','none','-nographic','-no-reboot']
+            command=[args.qemu,'-machine','virt','-cpu','la464','-global','ls7a_rtc.toy-enabled=on','-smp','1','-m',memory,'-kernel',kernel,'-drive',f'file={image},format=raw,if=none,id=root'+(',readonly=on' if case=='readonly' else ''),'-device','virtio-blk-pci,drive=root,addr=1,disable-legacy=on','-net','none','-nographic','-no-reboot']
             if case=='legacy': command=[entry.replace(',disable-legacy=on','') for entry in command]
             if initrd: command+=['-initrd',str(initrd),'-append','console=ttyS0 rdinit=/init loglevel=3']
             try: code,text=run_guest(command,120)

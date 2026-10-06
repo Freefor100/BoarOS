@@ -4,6 +4,7 @@
 #include <arch/mmu.h>
 #include <arch/timer.h>
 #include <kernel/time.h>
+#include <platform/loongarch_rtc.h>
 #include <kernel/scheduler.h>
 void la_trap_initialize(void);
 void la_boot_tasks(struct physical_page_allocator *);
@@ -41,7 +42,11 @@ void la_kernel_main(uint64_t systab)
     la_mmu_contract(&allocator);
     if(la_mmu_kernel_window_initialize(&allocator)!=ARCH_MMU_STATUS_OK)la_virt_fatal("kernel stack page tables");
     la_stack_window_contract(&allocator);
-    if (kernel_time_init(la_timer_frequency(),0)!=KERNEL_TIME_STATUS_OK ||
+    uint64_t realtime=0;
+    int rtc=la_virt_rtc_initialize(&realtime);
+    la_virt_puts(rtc ? "LA RTC unavailable; realtime uses boot-relative epoch\n" : "LA RTC UTC seconds resolution=1 boot-ns=");
+    if(!rtc){la_virt_hex(realtime);la_virt_puts("\n");}
+    if (kernel_time_init(la_timer_frequency(),realtime)!=KERNEL_TIME_STATUS_OK ||
         kernel_scheduler_init(&allocator,(uintptr_t)__boot_stack_bottom,(uintptr_t)__boot_stack_top)!=KERNEL_SCHEDULER_STATUS_OK) la_virt_fatal("scheduler init");
     la_boot_tasks(&allocator);
     la_virt_shutdown();
