@@ -169,3 +169,19 @@ Linux两种RAM先通过，BoarOS在rt_sigaction返回ENOSYS复现缺口。接入
 动作/重启保持唯一实现。先决定EINTR或重试再构帧，sigreturn恢复PC而不推进4字节；
 用户上下文不能输入PRMD或内核TP。所有恢复输入先快照，未知扩展作为用户坏帧
 终止全组。FP/SIMD扩展仍缺实际owner，不能据整数帧通过宣称完整LA信号ABI。
+
+### 真实静态 pthread 与跨内核测试边界
+
+LP64S musl1.2.5 使用真实clone、TP、TLS、futex与SIGCANCEL；LA后端接入整数
+信号后，原同步/取消/robust/生命周期函数即可作为第二架构消费者。动态DSO和
+网络仍缺平台路径，选择集公开列出范围，不删改原RV入口来宣称全量通过。
+固定Linux的 `kernel/exit.c` 会先futex唤醒clear-child-tid，再完成PID摘除；
+musl `src/thread/pthread_create.c`、`pthread_join.c` 的线程列表同步也不保证调用者
+下一次查询立即ESRCH。原测试的失败先在Linux复现，改为有界观察PID实际消失。
+WAKE之后另一个任务可以在tgkill前结束，因此信号边界测试保持目标存活到handler
+完成，再join；完成的WAIT仍必须返回成功，不能以新等待覆盖已完成结果。
+
+Linux支持PI futex，BoarOS仍未支持；已有PI marker的“不修改普通word”检查是
+BoarOS未支持能力边界，不能与Linux作为同一已支持语义比较。本LA静态对照只
+选择非PIrobust案例，原RV负向门禁继续保留。任务/栈constructor OOM另用真实
+物理页失败注入验证，精确页回滚和EAGAIN/重试不依赖Linux内存大小或偶然PID。

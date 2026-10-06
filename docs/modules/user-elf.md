@@ -1,6 +1,6 @@
 # 用户 ELF64 装载模块
 
-本文描述共用 ELF64 解析、不可变来源、缺页 backing 和映像布局。RV 生产路径用 Sv39/4 KiB；LA 首阶段内存 ELF 用 LA64/16 KiB/三级页表，能力范围见[LA 首阶段](loongarch-boot.md)。ELF 的背景知识见[ELF 用户程序装载学习总结](../learning/elf-loading.md)，exec 事务见[进程映像替换模块](kernel-exec.md)。
+本文描述共用 ELF64 解析、不可变来源、缺页 backing 和映像布局。RV 生产路径用 Sv39/4 KiB；LA 的内存与 PCI/ext4 静态 ELF 用 LA64/16 KiB/三级页表，能力范围见[LA 模块](loongarch-boot.md)。ELF 的背景知识见[ELF 用户程序装载学习总结](../learning/elf-loading.md)，exec 事务见[进程映像替换模块](kernel-exec.md)。
 
 ## 稳定单元
 
@@ -81,4 +81,4 @@ make test-root-init-riscv
 make test-riscv
 ```
 
-真实根启动 fixture 验证 source-backed 静态入口；动态 musl PIE、解释器、额外 DSO、初始 TLS 和线程运行期间的 dlopen TLS 已通过生产入口验证，消费者复用 userland runner。固定 glibc 2.44 的静态/动态/PIE 与 pthread、dlopen TLS、信号子集由 `make test-glibc-riscv` 对照固定 Linux 验证。重定位与 TLS 分配由用户态动态链接器/libc 完成，不是待添加的内核 ELF 算法。更广 glibc 应用与真实开发板 I-cache/熵源仍需单独验证。LoongArch 首阶段已复用同一解析、source和映像策略，并验证16 KiB/三级页表的整数内存ELF；根盘与libc未验收。
+真实根启动 fixture 验证 source-backed 静态入口；动态 musl PIE、解释器、额外 DSO、初始 TLS 和线程运行期间的 dlopen TLS 已通过生产入口验证，消费者复用 userland runner。固定 glibc 2.44 的静态/动态/PIE 与 pthread、dlopen TLS、信号子集由 `make test-glibc-riscv` 对照固定 Linux 验证。重定位与 TLS 分配由用户态动态链接器/libc 完成，不是待添加的内核 ELF 算法。更广 glibc 应用与真实开发板 I-cache/熵源仍需单独验证。LoongArch 已复用同一解析、source和映像策略，验证16 KiB/三级页表的整数内存与PCI/ext4静态ELF、LP64S musl TLS/pthread及整数信号。LA根平台仍对PT_INTERP返回ENOEXEC；动态musl/DSO TLS未验收。

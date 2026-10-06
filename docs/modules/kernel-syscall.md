@@ -91,3 +91,8 @@ RV64 `syslog(116)`交付完整klogctl 0–10；真实日志owner、游标、清�
 files 层，采用真实 `BASIC_STATS`，未实现的扩展字段不报告。LA 的 `clone(220)`
 用户参数顺序是 flags、stack、parent_tid、child_tid、TLS；trap 入口将最后两个
 重排后调用通用进程接口。真实父子 COW TID 写入由同 ELF 的 LA/Linux 对照保护。
+
+LA 的 rt_sigaction(134)/rt_sigreturn(139) 已接入共用信号策略；trap从a7/a0–a5
+解码并由LA后端恢复ERA/GPR和mask。完整整数frame、privileged状态边界和未支持
+扩展见[信号模块](kernel-signal.md)。真实静态musl pthread取消使用这一返回路径；
+未知syscall仍为ENOSYS，不以成功存根表示缺少的FP/SIMD、altstack或动态环境。

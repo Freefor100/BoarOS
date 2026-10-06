@@ -105,3 +105,20 @@ $(LA_BUILD)/signal-probe: tests/loongarch/signals.c tests/loongarch/signal_regis
 .PHONY: test-signal-loongarch
 test-signal-loongarch: kernel-la $(LA_BUILD)/signal-probe prepare-la-tools prepare-la-linux
 	python3 -B tests/loongarch/userland.py --qemu $(QEMU_LOONGARCH64) --cc $(LA_CC) --program $(LA_BUILD)/signal-probe --marker 'LA signal layout/mask/nesting passed' --marker 'LA signal fault/recovery/badframe passed' --marker 'LA signal integer registers passed' --marker 'LA signal wait/restart/suspend passed'
+
+$(LA_BUILD)/pthread-probe: tests/loongarch/pthread.c tests/userland/pthread.c tests/loongarch/registers.S prepare-la-userland
+	REALGCC=$(abspath $(LA_USER_CC)) $(LA_MUSL_CC) $(LA_FLAGS) -O2 -static -pthread -Wall -Wextra -Werror -Wl,-z,max-page-size=16384 -o $@ tests/loongarch/pthread.c tests/loongarch/registers.S
+.PHONY: test-pthread-loongarch
+test-pthread-loongarch: kernel-la $(LA_BUILD)/pthread-probe prepare-la-tools prepare-la-linux
+	python3 -B tests/loongarch/userland.py --qemu $(QEMU_LOONGARCH64) --cc $(LA_CC) --program $(LA_BUILD)/pthread-probe --marker 'LA static pthread catalogue passed' --marker 'LA original BusyBox ash signal/wait passed'
+
+$(LA_BUILD)/pthread-oom-probe: tests/loongarch/pthread_oom.c prepare-la-userland
+	REALGCC=$(abspath $(LA_USER_CC)) $(LA_MUSL_CC) $(LA_FLAGS) -O2 -static -pthread -Wall -Wextra -Werror -Wl,-z,max-page-size=16384 -o $@ $<
+$(LA_BUILD)/clone-oom-%.o: tests/loongarch/clone_oom.c
+	$(LA_CC) $(LA_CPPFLAGS) $(LA_CFLAGS) -DCLONE_OOM_AFTER=$* -c $< -o $@
+$(LA_BUILD)/kernel-clone-oom-%: $(LA_BUILD)/clone-oom-%.o $(LA_OBJECTS) arch/loongarch/linker.ld
+	$(LA_CC) $(LA_FLAGS) -nostdlib -nostartfiles -static -no-pie -T arch/loongarch/linker.ld -Wl,--build-id=none,--gc-sections,--wrap=physical_page_allocate,--wrap=physical_page_allocate_order,--wrap=kernel_syscall_dispatch,--wrap=arch_process_clone_current -o $@ $(LA_OBJECTS) $< -lgcc
+.PHONY: test-pthread-oom-loongarch
+test-pthread-oom-loongarch: $(LA_BUILD)/kernel-clone-oom-0 $(LA_BUILD)/kernel-clone-oom-1 $(LA_BUILD)/pthread-oom-probe prepare-la-tools prepare-la-linux
+	python3 -B tests/loongarch/userland.py --platform BoarOS --qemu $(QEMU_LOONGARCH64) --cc $(LA_CC) --kernel $(LA_BUILD)/kernel-clone-oom-0 --program $(LA_BUILD)/pthread-oom-probe --marker 'LA pthread creation OOM rollback/retry passed' --marker 'LA clone failed before publication; task/stack pages restored'
+	python3 -B tests/loongarch/userland.py --platform BoarOS --qemu $(QEMU_LOONGARCH64) --cc $(LA_CC) --kernel $(LA_BUILD)/kernel-clone-oom-1 --program $(LA_BUILD)/pthread-oom-probe --marker 'LA pthread creation OOM rollback/retry passed' --marker 'LA clone failed before publication; task/stack pages restored'
