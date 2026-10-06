@@ -104,7 +104,7 @@ $(LA_BUILD)/signal-probe: tests/loongarch/signals.c tests/loongarch/signal_regis
 	REALGCC=$(abspath $(LA_USER_CC)) $(LA_MUSL_CC) $(LA_FLAGS) -O2 -static -Wall -Wextra -Werror -Wl,-z,max-page-size=16384 -o $@ tests/loongarch/signals.c tests/loongarch/signal_registers.S
 .PHONY: test-signal-loongarch
 test-signal-loongarch: kernel-la $(LA_BUILD)/signal-probe prepare-la-tools prepare-la-linux
-	python3 -B tests/loongarch/userland.py --qemu $(QEMU_LOONGARCH64) --cc $(LA_CC) --program $(LA_BUILD)/signal-probe --marker 'LA signal layout/mask/nesting passed' --marker 'LA signal fault/recovery/badframe passed' --marker 'LA signal integer registers passed' --marker 'LA signal wait/restart/suspend passed'
+	python3 -B tests/loongarch/userland.py --qemu $(QEMU_LOONGARCH64) --cc $(LA_CC) --program $(LA_BUILD)/signal-probe --marker 'LA signal layout/mask/nesting passed' --marker 'LA signal fault/recovery/badframe passed' --marker 'LA signal relocated frame passed' --marker 'LA signal integer registers passed' --marker 'LA signal wait/restart/suspend passed'
 
 $(LA_BUILD)/pthread-probe: tests/loongarch/pthread.c tests/userland/pthread.c tests/loongarch/registers.S prepare-la-userland
 	REALGCC=$(abspath $(LA_USER_CC)) $(LA_MUSL_CC) $(LA_FLAGS) -O2 -static -pthread -Wall -Wextra -Werror -Wl,-z,max-page-size=16384 -o $@ tests/loongarch/pthread.c tests/loongarch/registers.S

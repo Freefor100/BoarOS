@@ -185,3 +185,18 @@ Linux支持PI futex，BoarOS仍未支持；已有PI marker的“不修改普通w
 BoarOS未支持能力边界，不能与Linux作为同一已支持语义比较。本LA静态对照只
 选择非PIrobust案例，原RV负向门禁继续保留。任务/栈constructor OOM另用真实
 物理页失败注入验证，精确页回滚和EAGAIN/重试不依赖Linux内存大小或偶然PID。
+
+### 信号边界的独立反例
+
+最终只读审查用同一LP64S ELF在固定Linux与BoarOS复现两条ABI差异：RW写入
+break6后mprotect(PROT_EXEC)，Linux交付SIGFPE而Boar按普通READ复制失败误报SEGV；
+另将有效592字节帧移动-8字节后sigreturn，Linux接受而Boar因额外对齐检查终止。
+两条已纳入 `test-signal-loongarch`：先确认RED，再分别恢复执行资格的指令解码
+和Linux允许的可读帧。解码只借用当前MM的驻留USER/EXEC页，已取指指令4字节
+对齐、不跨16KiB页，trap中不切换；页/映射owner损坏仍fatal，不扩大普通READ复制。
+
+固定Linux `arch/loongarch/mm/cache.c::protection_map` 的PROT_EXEC使用可读PTE；
+BoarOS当前仍提供独立NR权限，此处没有改通用VMA与数据访问策略，不据这条
+break对照宣称两者所有PROT_EXEC数据访问行为等价。更广权限策略差分需另按真实
+程序与既有MM契约核对。内核交付SP对齐是构帧保证，不是任意用户恢复帧的额外
+拒绝条件；恢复仍有范围、读取、扩展终止和特权隔离检查。

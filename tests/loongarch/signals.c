@@ -15,6 +15,8 @@
 #include <string.h>
 #include <time.h>
 int la_signal_register_probe(void);
+extern const unsigned char la_signal_break_start[],la_signal_break_end[];
+__asm__(".text\n.globl la_signal_break_start,la_signal_break_end\nla_signal_break_start:\n break 6\n jirl $zero,$ra,0\nla_signal_break_end:\n");
 _Static_assert(sizeof(ucontext_t)==448,"musl LA ucontext size");
 _Static_assert(offsetof(ucontext_t,uc_mcontext)==176,"musl LA mcontext offset");
 _Static_assert(offsetof(mcontext_t,__extcontext)==272,"musl LA extension offset");
@@ -36,6 +38,13 @@ static void handler(int sig,siginfo_t *info,void *pointer)
         depth--;seen++;return;
     }
     if(kind==3) { unsigned magic=0xdead1234;memcpy(context->uc_mcontext.__extcontext,&magic,sizeof(magic));return; }
+    if(kind==7) {
+        uintptr_t base=(uintptr_t)context-128;
+        memmove((void *)(base-8),(void *)base,592);
+        uintptr_t relocated=base-8;
+        __asm__ volatile("move $sp,%0;li.w $a7,139;syscall 0"::"r"(relocated):"memory");
+        __builtin_unreachable();
+    }
     if(kind==6) {
         const unsigned long *r=context->uc_mcontext.__gregs;
         if(sig!=SIGTRAP || info->si_code!=TRAP_BRKPT || r[3]!=r[7] || r[21]!=1365 || r[22]!=819) _exit(86);
@@ -66,7 +75,12 @@ static int fault(unsigned scenario)
     if(scenario==9) {kind=3;action.sa_sigaction=handler;CHECK(!sigaction(SIGUSR1,&action,0));CHECK(!raise(SIGUSR1));return 91;}
     if(scenario==3) __asm__ volatile(".word 0":::"memory");
     else if(scenario==4) __asm__ volatile("break 0":::"memory");
-    else if(scenario==10) __asm__ volatile("break 6":::"memory");
+    else if(scenario==10) {
+        void *text=mmap(0,16384,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);CHECK(text!=MAP_FAILED);
+        memcpy(text,la_signal_break_start,la_signal_break_end-la_signal_break_start);
+        CHECK(!mprotect(text,16384,PROT_EXEC));
+        ((void (*)(void))text)();CHECK(!munmap(text,16384));
+    }
     else if(scenario==11) __asm__ volatile("break 7":::"memory");
     else if(scenario==2) {
         int fd=open("/signal-empty",O_CREAT|O_TRUNC|O_RDWR,0600);CHECK(fd>=0);
@@ -130,6 +144,10 @@ int main(void)
         else CHECK(WIFSIGNALED(status) && WTERMSIG(status)==SIGSEGV);
     }
     puts("LA signal fault/recovery/badframe passed");
+    pid_t relocated=fork();CHECK(relocated>=0);
+    if(!relocated) {kind=7;action.sa_sigaction=handler;action.sa_flags=SA_SIGINFO;CHECK(!sigaction(SIGUSR1,&action,0) && !raise(SIGUSR1));_exit(0);}
+    int relocated_status;CHECK(waitpid(relocated,&relocated_status,0)==relocated && WIFEXITED(relocated_status) && !WEXITSTATUS(relocated_status));
+    puts("LA signal relocated frame passed");
     kind=6;seen=0;action.sa_sigaction=handler;action.sa_flags=SA_SIGINFO;
     CHECK(!sigaction(SIGTRAP,&action,0) && !la_signal_register_probe() && seen==1);
     puts("LA signal integer registers passed");
