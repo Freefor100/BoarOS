@@ -292,4 +292,6 @@ FPU/LSX/LASX记录优先级按类别，不是列表顺序；同类重复取最�
 字段止于页尾、padding在PROT_NONE页且较大size跳到可读END时允许恢复。
 三CPU profile的原程序、pending/只读写回失败、嵌套及clone/exec均保留可重建入口。
 GNU2.42静态启动从SIGILL推进到空AT_RANDOM的SIGSEGV，GDB确认ERA=0x120000bbc
-位于原`__libc_start_main_impl`；这是RNG接入前的真实依赖，不补虚假随机ready。
+位于原`__libc_start_main_impl`。随后核对固定QEMU的FDT生成器，发现其已提供
+32字节rng-seed，LA只读了内存布局而漏接材料。按RV已有不计熵策略接入后，五种
+GNU形态在双侧两种RAM均通过；可信熵仍为零，random ready未置位。

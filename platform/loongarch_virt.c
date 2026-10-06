@@ -2,6 +2,7 @@
 #include <kernel/page.h>
 #include <stddef.h>
 #include <kernel/console.h>
+#include <kernel/random.h>
 #include <platform/loongarch_pci.h>
 
 /* QEMU v11.1.0 virt.h: ns16550 and ACPI GED, accessed uncached. */
@@ -101,7 +102,12 @@ int la_virt_boot_memory(uint64_t systab, uint64_t kernel_start, uint64_t kernel_
             if (last > cursor) cursor = last;
         }
     }
-    return layout->usable_count != 0;
+    if (!layout->usable_count) return 0;
+    /* DTB 只提供早期材料；不计可信熵，不提前发布 random ready。 */
+    (void)kernel_random_initialize(info.rng_seed, info.rng_seed_size);
+    kernel_random_erase(info.rng_seed, sizeof(info.rng_seed));
+    info.rng_seed_size = 0;
+    return 1;
 }
 
 unsigned arch_uart_rx_ready(void) { return (uart[5]&1)!=0; }

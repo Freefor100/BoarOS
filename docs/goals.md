@@ -500,9 +500,10 @@ sigreturn/同步故障/等待重启和静态pthread/TLS已双侧验收，含真�
 和FR/FCC/FCSR/信号/clone/exec子集已双侧验收。LSX/LASX状态与扩展帧、关闭CPU扩展
 及clone标量继承/上半部初始化已按固定Linux验收；glibc、更广原程序和完整终端/网络
 仍未完成；本轮已批准单核QEMU对齐、统一VirtIO框架、内嵌SIMD状态及原版glibc2.42。
-PGDH内核栈窗口/guard/NX及可信异常栈已验收；glibc五形态仅Linux对照通过，
-SIMD接入后BoarOS推进到main前SIGSEGV；GDB确认GNU启动读取缺失AT_RANDOM，
-真实PCI RNG尚未接入，不能计为glibc组合支持。
+PGDH内核栈窗口/guard/NX及可信异常栈已验收。SIMD接入后GNU启动缺失AT_RANDOM的
+SIGSEGV已定位到LA漏接QEMU DTB种子；复用不计熵的早期随机材料策略后，固定原版
+glibc2.42五形态在Linux/BoarOS两种RAM均通过退出及根owner门禁。真实PCI RNG仍未
+接入，启动种子不会提前发布random ready；完整指定原程序及平台矩阵仍待完成。
 
 - [ ] ELF 段对齐、BSS 尾页、auxv、用户栈、stat/signal 结构及 clone 寄存器逐项核对；不能只换汇编入口却保留 RV ABI 编码。
 - [ ] 同一用户源码分别编译 RV/LA ELF，每架构内部用同一 ELF 对照 Linux 与 BoarOS；共享测试语义，隔离寄存器/页表差异，不拿 RV ELF 验证 LA。

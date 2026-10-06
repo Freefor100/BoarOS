@@ -15,3 +15,12 @@ BLAKE2s 每次混入最多 32 字节输入与旧 32 字节 key，故混种临界
 独立提交检查将暂存源码树导出到 `build/random-stage-src/` 后执行 `make -C build/random-stage-src -j4 all`，再用 `tests/rng-riscv.py --kernel build/random-stage-src/kernel-rv` 和 `tests/diff-abi/harness.py --kernel build/random-stage-src/kernel-rv` 重跑；8 次 RNG 启动与 831 条 ABI 全部通过。该独立内核 SHA-256 为 `c9d65f2fb9bfc96c1e393c61d06a937df242608b7a66e23472e686e72f49fd37`，确认不依赖尚未提交的会话和调度改动。
 
 启动混种后立即擦除 `boot_info.rng_seed` 的临时副本并将长度清零，避免初始化后继续保留无用途种子副本；不改固件拥有的原始 DTB。该收尾在独立会话基线核上重跑 8 次 RNG 生命周期启动通过，内核 SHA-256 `b87834c37520eecd114061dde95b5ba3047e4697ae3f4ae659287370100ee530`。
+
+LA固定QEMU同样提供32字节DTB种子：`references/qemu` commit
+`84f07211cc5b4fc6a371559bf8a5de4fb068e648`的
+`hw/loongarch/virt-fdt-build.c::create_fdt`调用guest random后写入`/chosen/rng-seed`。
+LA最初只消费DTB内存信息，GNU2.42启动因缺AT_RANDOM在main前访问零地址。
+现于完整启动布局验证成功后按上述不计熵策略混入并擦除临时种子；不引入启动等待或
+虚假ready。`make test-boot-random-loongarch`先真实RED再GREEN，两种RAM都验证
+available、零可信熵、ready为假及普通非阻塞等待EAGAIN；五种原GNU形态的
+Linux/BoarOS对照随后通过。可信PCI RNG生命周期仍另行验收。

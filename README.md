@@ -71,7 +71,10 @@ errno 隔离、timer 寄存器保持、同步/取消、futex/非 PI robust、线
 原版LP64D musl的动态PIE/非PIE、解释器、DT_NEEDED/RPATH、初始与dlopen DSO TLS已通过双侧两种RAM；
 标量FR/FCC/FCSR、浮点信号/exec/clone也已验证，整数内核与原LP64S用户程序继续可用。
 LA内核栈已接入PGDH共享窗口及真实16KiB guard，含NX、撤映射、OOM回滚与可信异常栈验收。
-LSX/LASX状态、信号、clone/exec和关闭扩展的HWCAP已双侧验收；LBT、完整终端/网络、glibc及更广原程序、实板和SMP仍须另行验收，LA与RV尚不等价。
+LSX/LASX状态、信号、clone/exec和关闭扩展的HWCAP已双侧验收。固定原版glibc2.42的五形态、
+初始/dlopen TLS、pthread取消和信号已在双侧两种RAM验收；RV仍固定2.44，版本差异保留。
+DTB随机种子仅支持早期材料和AT_RANDOM，不计可信熵。LBT、完整终端/网络、可信PCI RNG及
+更广原程序、实板和SMP仍须另行验收，LA与RV尚不等价。
 LA EXEC 页的数据读权限已按固定 Linux 的冷/驻留状态核对；页表有效权限与请求
 VMA 权限分别保留，真实读取、uaccess、fork和撤权均有双侧两种 RAM 验证。
 
