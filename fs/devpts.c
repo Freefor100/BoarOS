@@ -1,5 +1,5 @@
 #include "devpts_internal.h"
-#include <arch/riscv/context.h>
+#include <arch/context.h>
 #include <kernel/errno.h>
 #include <kernel/page.h>
 #include <kernel/time.h>
@@ -132,11 +132,11 @@ static int options(struct devpts_mount *m, const char *input)
 int kernel_devpts_entry_acquire(struct kernel_devpts_entry *entry)
 {
     if (!entry) return -KERNEL_EINVAL;
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     int result = (!entry->references && !entry->embedded) ||
         entry->references == UINT32_MAX ? -KERNEL_EOVERFLOW : 0;
     if (!result) entry->references++;
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     return result;
 }
 void kernel_devpts_entry_release(struct kernel_devpts_entry **owner)
@@ -144,7 +144,7 @@ void kernel_devpts_entry_release(struct kernel_devpts_entry **owner)
     if (!owner || !*owner) __builtin_trap();
     struct kernel_devpts_entry *e = *owner;
     struct devpts_mount *m = e->mount;
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     if (!e->references) __builtin_trap();
     e->references--;
     *owner = 0;
@@ -156,7 +156,7 @@ void kernel_devpts_entry_release(struct kernel_devpts_entry **owner)
         if (!*link) __builtin_trap();
         *link = e->next;
     }
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     if (collect) dispose(m, e);
 }
 
@@ -168,19 +168,19 @@ int kernel_devpts_publish(struct kernel_vfs_mount *mount, void *pair,
     KERNEL_LOCK_SCOPE(guard);
     kernel_vfs_namespace_lock(mount, &guard);
     if (m->instance.quiescing) return -KERNEL_EIO;
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     uint32_t limit = m->max < KERNEL_DEVPTS_LIMIT ? m->max : KERNEL_DEVPTS_LIMIT;
     uint32_t index = 0;
     while (index < limit && (m->reserved_numbers & (UINT64_C(1) << index))) index++;
     int result = index == limit ? -KERNEL_ENOSPC :
         m->next_inode == UINT64_MAX ? -KERNEL_EOVERFLOW : 0;
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     if (result) return result;
     struct kernel_devpts_entry *e = 0;
     result = allocate(m, sizeof(*e), (void **)&e);
     if (result) return result;
     struct kernel_vfs_timespec time = timestamp();
-    irq = riscv_interrupt_save();
+    irq = arch_interrupt_save();
     /* namespace 锁串行化发布；回收只能释放编号，不会占用选定的空槽。 */
     if (m->reserved_numbers & (UINT64_C(1) << index)) __builtin_trap();
     {
@@ -196,14 +196,14 @@ int kernel_devpts_publish(struct kernel_vfs_mount *mount, void *pair,
         m->root.stat.ctime = m->root.stat.mtime = time;
         *owner = e;
     }
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     return 0;
 }
 void kernel_devpts_unpublish(struct kernel_devpts_entry *entry)
 {
     if (!entry || !entry->references || entry->embedded) __builtin_trap();
     struct kernel_vfs_timespec time = timestamp();
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     if (entry->published) {
         entry->published = 0; entry->binding = 0;
         entry->stat.nlink = 0; entry->stat.ctime = time;
@@ -213,19 +213,19 @@ void kernel_devpts_unpublish(struct kernel_devpts_entry *entry)
         for (struct kernel_vfs_node *n = m->instance.nodes; n; n = n->next)
             if (n->backend_data == entry) n->unlinked = 1;
     }
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
 }
 void kernel_devpts_retire(struct kernel_devpts_entry *entry)
 {
     kernel_devpts_unpublish(entry);
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     if (entry->reserved) {
         uint64_t bit = UINT64_C(1) << entry->number;
         if (!(entry->mount->reserved_numbers & bit)) __builtin_trap();
         entry->mount->reserved_numbers &= ~bit;
         entry->reserved = 0;
     }
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
 }
 uint32_t kernel_devpts_entry_number(const struct kernel_devpts_entry *entry)
 { if (!entry || !entry->references || entry->embedded) __builtin_trap(); return entry->number; }
@@ -254,11 +254,11 @@ int kernel_devpts_mount_root(struct kernel_vfs_mount *mount, struct kernel_vfs_p
     KERNEL_LOCK_SCOPE(guard);
     kernel_vfs_namespace_lock(mount, &guard);
     if (m->instance.quiescing) return -KERNEL_EIO;
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     struct kernel_vfs_path *root_path = mount->root_path;
     int result = root_path ? kernel_vfs_path_acquire(root_path) : -KERNEL_ENODEV;
     if (!result) *owner = root_path;
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     return result;
 }
 void *kernel_devpts_mount_private(const struct kernel_vfs_mount *mount)
@@ -314,7 +314,7 @@ static int lookup(struct kernel_vfs_instance *instance, uint64_t parent,
 {
     if (parent != DEVPTS_ROOT_INODE) return -KERNEL_ENOTDIR;
     struct devpts_mount *m = instance->backend_data;
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     struct kernel_devpts_entry *e = 0;
     if (length == 4U && !memcmp(name, "ptmx", 4U)) e = &m->ptmx;
     else {
@@ -323,7 +323,7 @@ static int lookup(struct kernel_vfs_instance *instance, uint64_t parent,
     }
     int result = e ? 0 : -KERNEL_ENOENT;
     if (e) { *ino = e->stat.ino; *mode = e->stat.mode; }
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     return result;
 }
 static int open_inode(struct kernel_vfs_mount *mount, const char *path,
@@ -341,19 +341,19 @@ static int open_inode(struct kernel_vfs_mount *mount, const char *path,
             if (result) return result;
         }
     }
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     struct kernel_devpts_entry *e = entry_inode(m, ino);
     int result = e ? kernel_devpts_entry_acquire(e) : -KERNEL_ENOENT;
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     if (result) return result;
     struct kernel_vfs_node *node = 0;
     result = allocate(m, sizeof(*node), (void **)&node);
     if (result) { kernel_devpts_entry_release(&e); return result; }
-    irq = riscv_interrupt_save();
+    irq = arch_interrupt_save();
     node->inode = e->stat.ino; node->mode = e->stat.mode;
     node->backend_data = e;
     if (!e->published) node->unlinked = 1;
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     return kernel_vfs_publish_node(mount, node, file, 0);
 }
 static int close_node(struct kernel_vfs_node *node)
@@ -371,9 +371,9 @@ static void release_unlinked(struct kernel_vfs_node *node)
 static int stat_inode(const struct kernel_vfs_file *file, struct kernel_vfs_stat *stat)
 {
     struct kernel_vfs_node *n = file->private_data;
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     *stat = ((struct kernel_devpts_entry *)n->backend_data)->stat;
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     return 0;
 }
 static int statfs(struct kernel_vfs_mount *mount, struct kernel_vfs_statfs *stat)
@@ -405,16 +405,16 @@ static int dir_entry(struct kernel_vfs_file *file, uint64_t position,
         *ino = position < 2U ? DEVPTS_ROOT_INODE : DEVPTS_PTMX_INODE;
         *type = position < 2U ? KERNEL_VFS_DT_DIR : KERNEL_VFS_DT_CHR;
     } else {
-        uintptr_t irq = riscv_interrupt_save();
+        uintptr_t irq = arch_interrupt_save();
         struct kernel_devpts_entry *best = 0;
         for (struct kernel_devpts_entry *e = m->entries; e; e = e->next)
             if (e->published && (uint64_t)e->number + 3U >= position &&
                 (!best || e->number < best->number)) best = e;
-        if (!best) { riscv_interrupt_restore(irq); return 0; }
+        if (!best) { arch_interrupt_restore(irq); return 0; }
         found = (uint64_t)best->number + 3U;
         *ino = best->stat.ino; *type = KERNEL_VFS_DT_CHR;
         decimal(text, best->number);
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
     }
     size_t length = strlen(text);
     if (length >= capacity) return -KERNEL_ENAMETOOLONG;
@@ -428,11 +428,11 @@ static int set_mode(struct kernel_vfs_file *file, uint32_t mode)
     kernel_vfs_node_lock(n, &guard, 1);
     if (n->instance->read_only) return -KERNEL_EROFS;
     struct kernel_vfs_timespec time = timestamp();
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     struct kernel_devpts_entry *e = n->backend_data;
     e->stat.mode = (e->stat.mode & KERNEL_VFS_S_IFMT) | (mode & 07777U);
     n->mode = file->mode = e->stat.mode; e->stat.ctime = time;
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     return 0;
 }
 static int set_owner(struct kernel_vfs_file *file, uint32_t uid, uint32_t gid)
@@ -442,13 +442,13 @@ static int set_owner(struct kernel_vfs_file *file, uint32_t uid, uint32_t gid)
     kernel_vfs_node_lock(n, &guard, 1);
     if (n->instance->read_only) return -KERNEL_EROFS;
     struct kernel_vfs_timespec time = timestamp();
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     struct kernel_devpts_entry *e = n->backend_data;
     if (uid != UINT32_MAX) e->stat.uid = uid;
     if (gid != UINT32_MAX) e->stat.gid = gid;
     e->stat.mode = kernel_vfs_chown_mode(e->stat.mode);
     n->mode = file->mode = e->stat.mode; e->stat.ctime = time;
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     return 0;
 }
 static int set_times(struct kernel_vfs_file *file, const struct kernel_vfs_timespec times[2])
@@ -465,14 +465,14 @@ static int set_times(struct kernel_vfs_file *file, const struct kernel_vfs_times
     kernel_vfs_node_lock(n, &guard, 1);
     if (n->instance->read_only) return -KERNEL_EROFS;
     struct kernel_vfs_timespec time = timestamp();
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     struct kernel_devpts_entry *e = n->backend_data;
     if (!times || times[0].nanoseconds != KERNEL_VFS_UTIME_OMIT)
         e->stat.atime = !times || times[0].nanoseconds == KERNEL_VFS_UTIME_NOW ? time : times[0];
     if (!times || times[1].nanoseconds != KERNEL_VFS_UTIME_OMIT)
         e->stat.mtime = !times || times[1].nanoseconds == KERNEL_VFS_UTIME_NOW ? time : times[1];
     e->stat.ctime = time;
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     return 0;
 }
 static void accessed(struct kernel_vfs_file *file) { (void)file; }

@@ -1,4 +1,4 @@
-#include <arch/riscv/context.h>
+#include <arch/context.h>
 #include <kernel/scheduler.h>
 #include <kernel/socket.h>
 
@@ -335,7 +335,7 @@ enum kernel_scheduler_status kernel_wait_queue_wake_one(
     if (scheduler.initialized != KERNEL_SCHEDULER_INITIALIZED) {
         return KERNEL_SCHEDULER_STATUS_NOT_INITIALIZED;
     }
-    if (riscv_interrupt_is_enabled()) {
+    if (arch_interrupt_is_enabled()) {
         return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
     }
 
@@ -369,7 +369,7 @@ enum kernel_scheduler_status kernel_wait_queue_wake_all(
     if (scheduler.initialized != KERNEL_SCHEDULER_INITIALIZED) {
         return KERNEL_SCHEDULER_STATUS_NOT_INITIALIZED;
     }
-    if (riscv_interrupt_is_enabled()) {
+    if (arch_interrupt_is_enabled()) {
         return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
     }
     node = queue->head;
@@ -399,7 +399,7 @@ enum kernel_scheduler_status kernel_scheduler_expire_deadlines(uint64_t now)
     if (scheduler.initialized != KERNEL_SCHEDULER_INITIALIZED) {
         return KERNEL_SCHEDULER_STATUS_NOT_INITIALIZED;
     }
-    if (riscv_interrupt_is_enabled()) {
+    if (arch_interrupt_is_enabled()) {
         return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
     }
     status = validate_queues();
@@ -435,7 +435,7 @@ enum kernel_scheduler_status kernel_scheduler_block_current(
         (queue != 0 && queue->initialized != KERNEL_WAIT_QUEUE_INITIALIZED)) {
         return KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
     }
-    if (riscv_interrupt_is_enabled()) {
+    if (arch_interrupt_is_enabled()) {
         return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
     }
     status = validate_current();
@@ -481,7 +481,7 @@ enum kernel_scheduler_status kernel_scheduler_wake_signal(
     if (scheduler.initialized != KERNEL_SCHEDULER_INITIALIZED) {
         return KERNEL_SCHEDULER_STATUS_NOT_INITIALIZED;
     }
-    if (task == 0 || riscv_interrupt_is_enabled()) {
+    if (task == 0 || arch_interrupt_is_enabled()) {
         return KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
     }
     if (task->state != KERNEL_THREAD_STATE_BLOCKED ||

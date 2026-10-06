@@ -4,7 +4,7 @@ set -eu
 
 project_root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 objdump=${OBJDUMP_RV:-riscv64-unknown-elf-objdump}
-mm_object=${MM_OBJECT_RV:-"$project_root/build/riscv/arch/riscv/mm.o"}
+mm_object=${MM_OBJECT_RV:-"$project_root/build/riscv/mm/mm.o"}
 elf_object=${ELF_IMAGE_OBJECT_RV:-"$project_root/build/riscv/arch/riscv/elf_image.o"}
 sv39_object=${SV39_OBJECT_RV:-"$project_root/build/riscv/arch/riscv/sv39.o"}
 

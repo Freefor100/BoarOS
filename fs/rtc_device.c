@@ -1,5 +1,5 @@
 #include "char_device_internal.h"
-#include <arch/riscv/context.h>
+#include <arch/context.h>
 #include <arch/riscv/virt_rtc.h>
 #include <kernel/errno.h>
 #include <kernel/uaccess.h>
@@ -10,17 +10,17 @@ static int rtc_open(struct kernel_heap *heap, struct kernel_task *caller, uint32
     (void)heap; (void)caller; (void)flags; (void)path; (void)instance;
     uint64_t now;
     if (riscv_virt_rtc_read_ns(&now) != RISCV_VIRT_RTC_STATUS_OK) return -KERNEL_ENODEV;
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     int result = opened ? -KERNEL_EBUSY : 0;
     if (!result) opened = 1;
-    riscv_interrupt_restore(irq); return result;
+    arch_interrupt_restore(irq); return result;
 }
 static void rtc_release(void *instance)
 {
     (void)instance;
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     if (!opened) __builtin_trap();
-    opened = 0; riscv_interrupt_restore(irq);
+    opened = 0; arch_interrupt_restore(irq);
 }
 static unsigned leap(unsigned year)
 { return year % 4 == 0 && (year % 100 != 0 || year % 400 == 0); }

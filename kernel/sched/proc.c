@@ -1,6 +1,6 @@
 #include "private.h"
 
-#include <arch/riscv/context.h>
+#include <arch/context.h>
 #include <kernel/errno.h>
 #include <kernel/files.h>
 #include <kernel/open_file.h>
@@ -91,20 +91,20 @@ uint64_t kernel_proc_task_block_reads(const struct kernel_task *task)
 void kernel_proc_task_note_fault(struct kernel_task *task, int major)
 {
     if (!task || !task->arch.user_mode) return;
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     uint64_t *counter = major ? &task->major_faults : &task->minor_faults;
     if (*counter != UINT64_MAX) (*counter)++;
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
 }
 
 int kernel_proc_process_snapshot(kernel_pid_t pid, uint64_t identity,
                                  struct kernel_proc_process_snapshot *result)
 {
     if (pid <= 0 || !identity || !result) return -KERNEL_EINVAL;
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     struct kernel_task *task = find_member(pid, identity);
     if (!task) {
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
         return -KERNEL_ENOENT;
     }
     struct kernel_task *leader = task->group_leader;
@@ -169,7 +169,7 @@ int kernel_proc_process_snapshot(kernel_pid_t pid, uint64_t identity,
         struct kernel_mm_proc_memory memory;
         if (kernel_mm_proc_memory_snapshot(&task->mm, &memory) !=
             KERNEL_MM_STATUS_OK) {
-            riscv_interrupt_restore(irq);
+            arch_interrupt_restore(irq);
             return -KERNEL_EIO;
         }
         result->virtual_bytes = memory.virtual_bytes;
@@ -178,7 +178,7 @@ int kernel_proc_process_snapshot(kernel_pid_t pid, uint64_t identity,
         result->end_code = memory.end_code;
         result->start_stack = memory.start_stack;
     }
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     return 0;
 }
 
@@ -189,10 +189,10 @@ int kernel_proc_process_path_acquire(kernel_pid_t pid, uint64_t identity,
     (void)fd;
     if (pid <= 0 || !identity || !owner || *owner)
         return -KERNEL_EINVAL;
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     struct kernel_task *task = find_resource_owner(pid, identity);
     if (!task) {
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
         return -KERNEL_ENOENT;
     }
     int result = -KERNEL_ENOENT;
@@ -212,7 +212,7 @@ int kernel_proc_process_path_acquire(kernel_pid_t pid, uint64_t identity,
             }
         }
     }
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     return result;
 }
 
@@ -221,12 +221,12 @@ int kernel_proc_next_fd(kernel_pid_t pid, uint64_t identity,
 {
     if (pid <= 0 || !identity || !fd || after < -1)
         return -KERNEL_EINVAL;
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     struct kernel_task *task = find_resource_owner(pid, identity);
     int result = task && kernel_files_is_live(&task->files)
         ? kernel_files_next_open_fd(&task->files, after, fd)
         : -KERNEL_ENOENT;
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     return result;
 }
 
@@ -235,7 +235,7 @@ int kernel_proc_fd_access_snapshot(kernel_pid_t pid, uint64_t identity,
 {
     if (pid <= 0 || !identity || fd < 0 || !readable || !writable)
         return -KERNEL_EINVAL;
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     struct kernel_task *task = find_resource_owner(pid, identity);
     struct kernel_open_file_description *file = task &&
         kernel_files_is_live(&task->files)
@@ -249,7 +249,7 @@ int kernel_proc_fd_access_snapshot(kernel_pid_t pid, uint64_t identity,
             *writable = kernel_open_file_writable(file);
         }
     }
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     return file ? 0 : -KERNEL_ENOENT;
 }
 
@@ -258,7 +258,7 @@ int kernel_proc_fd_path_acquire(kernel_pid_t pid, uint64_t identity,
 {
     if (pid <= 0 || !identity || fd < 0 || !owner || *owner)
         return -KERNEL_EINVAL;
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     struct kernel_task *task = find_resource_owner(pid, identity);
     struct kernel_open_file_description *file = task &&
         kernel_files_is_live(&task->files)
@@ -269,7 +269,7 @@ int kernel_proc_fd_path_acquire(kernel_pid_t pid, uint64_t identity,
         *owner = path;
         result = 0;
     }
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     return result;
 }
 
@@ -279,7 +279,7 @@ int kernel_proc_fd_pseudo_snapshot(kernel_pid_t pid, uint64_t identity,
 {
     if (pid <= 0 || !identity || fd < 0 || !snapshot)
         return -KERNEL_EINVAL;
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     struct kernel_task *task = find_resource_owner(pid, identity);
     struct kernel_open_file_description *file = task &&
         kernel_files_is_live(&task->files)
@@ -290,7 +290,7 @@ int kernel_proc_fd_pseudo_snapshot(kernel_pid_t pid, uint64_t identity,
         snapshot->object_identity = kernel_open_file_pseudo_identity(file);
         result = 0;
     }
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     return result;
 }
 
@@ -299,7 +299,7 @@ int kernel_proc_fd_pseudo_stat(kernel_pid_t pid, uint64_t identity,
 {
     if (pid <= 0 || !identity || fd < 0 || !stat)
         return -KERNEL_EINVAL;
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     struct kernel_task *task = find_resource_owner(pid, identity);
     struct kernel_open_file_description *file = task &&
         kernel_files_is_live(&task->files)
@@ -307,7 +307,7 @@ int kernel_proc_fd_pseudo_stat(kernel_pid_t pid, uint64_t identity,
     /* 伪对象的元数据快照不分配也不等待；解锁后不再访问 OFD。 */
     int result = file ? kernel_open_file_pseudo_stat(file, stat)
                       : -KERNEL_ENOENT;
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     return result;
 }
 
@@ -319,7 +319,7 @@ int kernel_proc_fd_reopen_link(kernel_pid_t pid, uint64_t identity,
     if (pid <= 0 || !identity || fd < 0 || !heap || !owner || *owner)
         return -KERNEL_EINVAL;
     struct kernel_open_file_pipe_pin pin = {0};
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     struct kernel_task *task = find_resource_owner(pid, identity);
     struct kernel_open_file_description *file = task &&
         kernel_files_is_live(&task->files)
@@ -330,7 +330,7 @@ int kernel_proc_fd_reopen_link(kernel_pid_t pid, uint64_t identity,
     else if (file &&
              kernel_open_file_kind(file) == KERNEL_OPEN_FILE_KIND_PIPE)
         result = kernel_open_file_pipe_pin(file, flags, &pin);
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     if (result || !pin.pipe) return result;
     return kernel_open_file_pipe_finish(heap, &pin, flags, owner);
 }
@@ -352,12 +352,12 @@ int kernel_proc_next_process(kernel_pid_t after, kernel_pid_t *pid,
     if (!pid || !identity || after < 0) return -KERNEL_EINVAL;
     kernel_pid_t best = 0;
     uint64_t token = 0U;
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     struct kernel_task *root = scheduler.init_task;
     for (struct kernel_task *leader = root; leader;
          leader = next_process(leader, root))
         consider(representative(leader), after, &best, &token);
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     if (!best) return -KERNEL_ENOENT;
     *pid = best;
     *identity = token;

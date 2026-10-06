@@ -8,7 +8,7 @@
 #include <kernel/uaccess.h>
 #include <kernel/scheduler.h>
 #include <kernel/time.h>
-#include <arch/riscv/context.h>
+#include <arch/context.h>
 
 #include <stddef.h>
 #include <stdint.h>
@@ -208,12 +208,12 @@ static enum kernel_syscall_status syscall_handle_sysinfo(struct kernel_task *cal
         return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     struct linux_sysinfo info = {0};
     struct kernel_memory_statistics memory;
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     kernel_memory_snapshot(mm->allocator, &memory);
     kernel_scheduler_system_statistics(info.loads, &info.procs);
     uint64_t ns = kernel_time_monotonic_ns();
     info.uptime = ns / 1000000000 + (ns % 1000000000 != 0);
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     info.totalram = memory.total;
     info.freeram = memory.free;
     info.sharedram = memory.shared;

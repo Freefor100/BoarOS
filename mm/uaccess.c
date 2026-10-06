@@ -1,5 +1,5 @@
 #include <kernel/cost.h>
-#include <arch/riscv/sv39.h>
+#include <arch/mmu.h>
 #include <kernel/mm.h>
 #include <kernel/page.h>
 #include <kernel/physical_page.h>
@@ -18,8 +18,8 @@ enum kernel_uaccess_status kernel_user_range_check(
     if (size == 0U) {
         return KERNEL_UACCESS_STATUS_OK;
     }
-    if (user_address >= RISCV_SV39_USER_LIMIT ||
-        (uint64_t)size > RISCV_SV39_USER_LIMIT - user_address) {
+    if (user_address >= ARCH_MMU_USER_LIMIT ||
+        (uint64_t)size > ARCH_MMU_USER_LIMIT - user_address) {
         return KERNEL_UACCESS_STATUS_FAULT;
     }
     return KERNEL_UACCESS_STATUS_OK;
@@ -241,7 +241,7 @@ enum kernel_uaccess_status kernel_copy_string_from_user(
         return KERNEL_UACCESS_STATUS_INVALID_ARGUMENT;
     }
     *string_length = 0U;
-    if (user_source >= RISCV_SV39_USER_LIMIT) {
+    if (user_source >= ARCH_MMU_USER_LIMIT) {
         return KERNEL_UACCESS_STATUS_FAULT;
     }
 
@@ -253,7 +253,7 @@ enum kernel_uaccess_status kernel_copy_string_from_user(
         size_t index;
         enum kernel_uaccess_status status;
 
-        if (current < user_source || current >= RISCV_SV39_USER_LIMIT) {
+        if (current < user_source || current >= ARCH_MMU_USER_LIMIT) {
             *string_length = copied;
             return KERNEL_UACCESS_STATUS_FAULT;
         }
@@ -262,8 +262,8 @@ enum kernel_uaccess_status kernel_copy_string_from_user(
         if (chunk > capacity - copied) {
             chunk = capacity - copied;
         }
-        if ((uint64_t)chunk > RISCV_SV39_USER_LIMIT - current) {
-            chunk = (size_t)(RISCV_SV39_USER_LIMIT - current);
+        if ((uint64_t)chunk > ARCH_MMU_USER_LIMIT - current) {
+            chunk = (size_t)(ARCH_MMU_USER_LIMIT - current);
         }
         status = resolve_user_page(mm,
                                    current,

@@ -3,7 +3,7 @@
 #include <kernel/physical_page.h>
 #include <kernel/memory_object.h>
 #include <kernel/sync.h>
-#include <arch/riscv/context.h>
+#include <arch/context.h>
 
 #include <stddef.h>
 #include <stdint.h>
@@ -29,14 +29,14 @@ struct kernel_memory_object {
 
 static void unaccount_page(struct kernel_memory_object *object)
 {
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     if (!object->allocator->shared_anon_pages) __builtin_trap();
     object->allocator->shared_anon_pages--;
     if (object->budget) {
         if (!object->budget->used) __builtin_trap();
         object->budget->used--;
     }
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
 }
 
 static size_t bucket_for(uint64_t index, size_t bucket_count)
@@ -208,11 +208,11 @@ enum kernel_memory_object_status kernel_memory_object_get_page(
         __builtin_trap();
     for (size_t i = 0U; i < BOAROS_PAGE_SIZE; i++)
         ((unsigned char *)bytes)[i] = 0U;
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     /* 多个 inode 共用预算；分配后再次核对并与发布原子记账。 */
     if (object->budget && object->budget->limit &&
         object->budget->used >= object->budget->limit) {
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
         if (physical_page_release(object->allocator, page->physical_address) != PHYSICAL_PAGE_STATUS_OK ||
             kernel_heap_release(object->heap, page) != KERNEL_HEAP_STATUS_OK) __builtin_trap();
         return KERNEL_MEMORY_OBJECT_NO_SPACE;
@@ -228,7 +228,7 @@ enum kernel_memory_object_status kernel_memory_object_get_page(
     object->allocator->shared_anon_pages++;
     *physical_address = page->physical_address;
     *created = 1;
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     return KERNEL_MEMORY_OBJECT_OK;
 }
 

@@ -1,6 +1,6 @@
 #include "vfs_objects.h"
 
-#include <arch/riscv/context.h>
+#include <arch/context.h>
 #include <kernel/errno.h>
 #include <kernel/heap.h>
 #include <kernel/fs_context.h>
@@ -822,10 +822,10 @@ static int proc_mounts_snapshot(struct kernel_vfs_node *node,
     int result = -KERNEL_EAGAIN;
     for (unsigned attempt = 0U; attempt < 3U; attempt++) {
         size_t count = 0U;
-        uintptr_t irq = riscv_interrupt_save();
+        uintptr_t irq = arch_interrupt_save();
         for (struct kernel_vfs_mount *it = top; it;
              it = next_mount(it, top)) count++;
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
         if (!count || count > SIZE_MAX / sizeof(*entries) ||
             count > SIZE_MAX / (8U * KERNEL_FS_PATH_MAX + 80U))
             return -KERNEL_EOVERFLOW;
@@ -834,7 +834,7 @@ static int proc_mounts_snapshot(struct kernel_vfs_node *node,
         if (allocation != KERNEL_HEAP_STATUS_OK)
             return allocation == KERNEL_HEAP_STATUS_EMPTY ? -KERNEL_ENOMEM
                                                           : -KERNEL_EIO;
-        irq = riscv_interrupt_save();
+        irq = arch_interrupt_save();
         int changed = 0;
         for (struct kernel_vfs_mount *it = top; it;
              it = next_mount(it, top)) {
@@ -862,7 +862,7 @@ static int proc_mounts_snapshot(struct kernel_vfs_node *node,
                 ((struct kernel_vfs_instance *)it->private_data)->read_only;
             captured++;
         }
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
         if (!changed) break;
         release_mount_entries(heap, &entries, captured);
         captured = 0U;
@@ -1048,11 +1048,11 @@ static int proc_snapshot(struct kernel_vfs_node *node, struct kernel_heap *heap,
 #if BOAROS_COST_DIAGNOSTICS
     if (node->inode == PROC_MEMORY_STATS_INODE) {
         struct kernel_heap_statistics hs;
-        uint64_t irq = riscv_interrupt_save();
+        uint64_t irq = arch_interrupt_save();
         kernel_heap_get_statistics(heap, &hs);
         uint64_t current = heap->page_allocator->total_pages - heap->page_allocator->available_pages;
         uint64_t peak = heap->page_allocator->allocated_peak_pages;
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
         char *data = 0;
         enum kernel_heap_status result = kernel_heap_allocate(heap, 256, (void **)&data);
         if (result != KERNEL_HEAP_STATUS_OK) return result == KERNEL_HEAP_STATUS_EMPTY ? -KERNEL_ENOMEM : -KERNEL_EIO;
@@ -1085,9 +1085,9 @@ static int proc_snapshot(struct kernel_vfs_node *node, struct kernel_heap *heap,
         size_t capacity = kernel_cost_format_capacity();
         enum kernel_heap_status status = kernel_heap_allocate(heap, capacity, (void **)&data);
         if (status != KERNEL_HEAP_STATUS_OK) return status == KERNEL_HEAP_STATUS_EMPTY ? -KERNEL_ENOMEM : -KERNEL_EIO;
-        uint64_t interrupts = riscv_interrupt_save();
+        uint64_t interrupts = arch_interrupt_save();
         int result = kernel_cost_format(data, capacity);
-        riscv_interrupt_restore(interrupts);
+        arch_interrupt_restore(interrupts);
         if (result < 0) { if (kernel_heap_release(heap, data) != KERNEL_HEAP_STATUS_OK) __builtin_trap(); return result; }
         *buffer = data; *length = (size_t)result;
         return 0;
@@ -1113,9 +1113,9 @@ static int proc_snapshot(struct kernel_vfs_node *node, struct kernel_heap *heap,
     size_t used = 0U;
     if (node->inode == PROC_MEMINFO_INODE) {
         struct kernel_memory_statistics memory;
-        uintptr_t irq = riscv_interrupt_save();
+        uintptr_t irq = arch_interrupt_save();
         kernel_memory_snapshot(heap->page_allocator, &memory);
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
         const char *names[] = {"MemTotal:       ", "MemFree:        ",
             "MemAvailable:   ", "Buffers:        ", "Cached:         ",
             "Shmem:          ", "Dirty:          ", "Writeback:      ",

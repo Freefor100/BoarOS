@@ -2,7 +2,7 @@
 #define BOAROS_KERNEL_SCHED_PRIVATE_H
 
 #include <kernel/cost.h>
-#include <arch/riscv/context.h>
+#include <arch/context.h>
 #include <arch/riscv/fpu.h>
 #include <arch/riscv/thread.h>
 #include <kernel/files.h>

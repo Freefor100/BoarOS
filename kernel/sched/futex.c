@@ -227,7 +227,7 @@ int64_t kernel_futex(struct kernel_task *task, uint64_t address,
     enum kernel_uaccess_status access;
 
     *status = KERNEL_SCHEDULER_STATUS_OK;
-    if (task != scheduler.current || riscv_interrupt_is_enabled()) {
+    if (task != scheduler.current || arch_interrupt_is_enabled()) {
         *status = KERNEL_SCHEDULER_STATUS_INVALID_STATE;
         return 0;
     }
@@ -320,7 +320,7 @@ int64_t kernel_futex_restart_timed(
     uint32_t command = operation & ~(FUTEX_PRIVATE | FUTEX_CLOCK_REALTIME);
 
     *status = KERNEL_SCHEDULER_STATUS_OK;
-    if (task != scheduler.current || riscv_interrupt_is_enabled()) {
+    if (task != scheduler.current || arch_interrupt_is_enabled()) {
         *status = KERNEL_SCHEDULER_STATUS_INVALID_STATE;
         return 0;
     }

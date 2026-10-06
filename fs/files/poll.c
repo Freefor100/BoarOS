@@ -1,6 +1,6 @@
 #include "private.h"
 
-#include <arch/riscv/context.h>
+#include <arch/context.h>
 #include <kernel/errno.h>
 #include <kernel/files.h>
 #include <kernel/heap.h>
@@ -255,7 +255,7 @@ static int core_poll_run(
 
     /* If events already ready, or immediate zero timeout, skip sleeping */
     if (ready_count == 0 && !immediate) {
-        uintptr_t saved_intr = riscv_interrupt_save();
+        uintptr_t saved_intr = arch_interrupt_save();
 
         /* Register wait nodes on OFD wait queues */
         for (uint32_t i = 0; i < nfds; i++) {
@@ -321,7 +321,7 @@ static int core_poll_run(
             }
         }
 
-        riscv_interrupt_restore(saved_intr);
+        arch_interrupt_restore(saved_intr);
 
     }
 
