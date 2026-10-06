@@ -498,23 +498,23 @@ sigreturn/同步故障/等待重启和静态pthread/TLS已双侧验收，含真�
 非PI robust、线程组生命周期及任务/栈创建OOM回滚；原BusyBox ash非交互trap/wait通过。
 用户已选择原版LP64D musl与LA标量FPU路线，动态libc/解释器/初始及late DSO TLS
 和FR/FCC/FCSR/信号/clone/exec子集已双侧验收。LSX/LASX状态与扩展帧、关闭CPU扩展
-及clone标量继承/上半部初始化已按固定Linux验收；更广原程序和环境矩阵
-仍未完成；本轮已批准单核QEMU对齐、统一VirtIO框架、内嵌SIMD状态及原版glibc2.42。
+及clone标量继承/上半部初始化已按固定Linux验收；本轮指定原程序和环境矩阵
+已完成，范围外的更广程序仍未验收；已选统一VirtIO框架、内嵌SIMD状态及原版glibc2.42。
 PGDH内核栈窗口/guard/NX及可信异常栈已验收。SIMD接入后GNU启动缺失AT_RANDOM的
 SIGSEGV已定位到LA漏接QEMU DTB种子；复用不计熵的早期随机材料策略后，固定原版
 共用net/Ethernet和LA现代PCI真实TAP已在双侧两种RAM验证，原BusyBox HTTP、
 共享块/RNG/net IRQ及九类构造/reset失败回到基线。无metadata checksum的空索引目录误分类已由真实宿主/LA反例修复。AF_UNIX发送者缓存模型及sendfile datagram批次已按用户选择的Linux路线接入，
 实际双侧等待/取消/关闭及资源验收通过。共用ns16550与LA TTY/termios2/作业控制、PTY、原BusyBox交互/script和录制重启已双侧两种RAM验收，UART启动失败/fatal与owner通过；LA pipe实际持有16页与容量一致，双侧满环/wrap/关闭通过；LS7A RTC/环境已双侧两种RAM验证，派生QEMU的原Linux告警另有证据；完整ABI1366条已双架构匹配，BusyBox/libc-test229个共同ID已双架构通过（LA两种RAM）；原SQLite DELETE/WAL、多进程、静态/动态CLI与独立重启内容也已双侧两种RAM通过。
-最终RV完整架构、userland/GNU/ABI/栈、统一驱动/TTY、SQLite/NBD全恢复与双盘隔离，以及LA架构/平台失败回收均通过，一次整体审查的页边界验收问题已集中修复并完成最终回归，进入清理收口；不由设备通过声明所有应用等价。
+最终RV完整架构、userland/GNU/ABI/栈、统一驱动/TTY、SQLite/NBD全恢复与双盘隔离，以及LA架构/平台失败回收均通过，一次整体审查的页边界验收问题已集中修复并完成最终回归，运行产物清理完成；不由设备通过声明所有应用等价。
 glibc2.42五形态在Linux/BoarOS两种RAM均通过退出及根owner门禁。真实PCI RNG已接入并
 完成正常/缺失/延迟/在途停止、构造OOM/IRQ失败及回收；启动种子不会提前发布random
-ready。本轮指定原程序及单核平台矩阵已验证，整体审查与集中修复完成，最终清理收口。
+ready。本轮指定原程序及单核平台矩阵已验证，整体审查与集中修复完成，最终清理完成。
 共用VirtIO transport/split queue已迁入block，三个transport的真实块与LA根owner
 门禁、RV可睡眠I/O四组合已通过。RNG/net迁移及LA PCI、UART/RTC验收完成；
 本轮单核QEMU指定矩阵已完成；GNU版本差异、客体原生开发、完整Harness及范围外能力继续单列，不声明所有RV应用在LA验收。
 
-- [ ] ELF 段对齐、BSS 尾页、auxv、用户栈、stat/signal 结构及 clone 寄存器逐项核对；不能只换汇编入口却保留 RV ABI 编码。
-- [ ] 同一用户源码分别编译 RV/LA ELF，每架构内部用同一 ELF 对照 Linux 与 BoarOS；共享测试语义，隔离寄存器/页表差异，不拿 RV ELF 验证 LA。
+- [x] ELF 段对齐、BSS 尾页、auxv、用户栈、stat/signal 结构及 clone 寄存器逐项核对；不能只换汇编入口却保留 RV ABI 编码。
+- [x] 同一用户源码分别编译 RV/LA ELF，每架构内部用同一 ELF 对照 Linux 与 BoarOS；共享测试语义，隔离寄存器/页表差异，不拿 RV ELF 验证 LA。
 - [x] LA `PROT_EXEC` 的数据读取已按冷/驻留状态独立核对：LA PTE 使用固定 Linux
   的非 NONE 可读权限，请求 VMA 保持原值；双侧验证冷页 fault、驻留读取、取指
   物化、fork、uaccess 与改权。资料见[LA学习记录](learning/loongarch-bringup.md)。
@@ -527,8 +527,8 @@ PCI共享INTx、ext4读写/只读、原BusyBox七个applet及musl组合ABI的固
 故障/OOM/页堆与BAR claim回收、真实写I/O失败owner保留，以及RV存储/SQLite回归。
 通用statx新增22条，当前RV ABI矩阵1366条匹配；完整比赛用户环境仍阻塞。
 
-- [ ] 静态 musl→动态 musl/DSO/TLS→fork/COW/信号→共享映射→glibc→真实应用，逐层保留错误与资源回收结果。
-- [ ] 维持 RV/LA 同口径功能矩阵，缺能力记录阻塞，不让新平台回退到固定输出或修改过的用户程序。
+- [x] 本轮指定静态 musl→动态 musl/DSO/TLS→fork/COW/信号→共享映射→glibc→真实应用矩阵，逐层保留错误与资源回收结果。
+- [x] 本轮RV/LA同口径功能矩阵已验收；后续继续记录缺能力/阻塞，不让新平台回退到固定输出或修改过的用户程序。
 
 ### L4 两块实板
 
@@ -609,8 +609,8 @@ make test-program-inventory-host test-diff-abi-host
 make inventory-userland-riscv
 ```
 
-`inventory-userland-riscv` 默认成功只说明清单生成成功。全量 228 项仍有明确缺口，严格模式失败不是自动产生的新回归；`--case` 与 `--require-pass` 只严格判定本次选择集合，未选项目保留历史结果或 `not-run`，选择集合写入状态供恢复报告解释。完整Harness仍缺LA更广原程序/SIMD/完整平台环境或其他能力时保留阻塞原因；
-原版动态musl/DSO TLS、标量FPU与线程子集已有独立验收。
+`inventory-userland-riscv` 默认成功只说明清单生成成功。当前229项共同清单已在RV和LA两种RAM完整通过，历史228项失败保留原记录；严格模式失败不是自动产生的新回归；`--case` 与 `--require-pass` 只严格判定本次选择集合，未选项目保留历史结果或 `not-run`，选择集合写入状态供恢复报告解释。完整Harness与更广程序、客体原生开发环境仍需另行验收，按实际缺能力保留阻塞原因；
+本轮动态musl/DSO TLS、完整FPU/LSX/LASX状态、线程、终端/网络/RTC及指定程序矩阵已经独立验收。
 
 ## 范围与交付边界
 
