@@ -204,3 +204,28 @@ contract和wait status比较，保留原输出及raw_output_equal；日期、内
 程序、同步、根卸载分别计时，卸载使用已有ROOT_DRAIN_FIXTURE，不增加用户ABI。
 固定Linux的PID1退出以panic停机，不能把它等同于BoarOS的根卸载；离线检查先重放日志。
 输入与输出身份在机器清单校验，人类结果和解释归[离线工具链记录](../learning/offline-toolchain-probe.md)。
+
+## LA 与 RV 共用真实程序清单
+
+`tests/program-inventory/{libc_build,run,suites}.py --arch loongarch` 使用同一固定
+BusyBox/libc-test 案例、原包装脚本、输出校验和失败分类。LA BusyBox 保留原398个
+applets/配置，用整数静态 musl；libc-test 用原 LP64D musl 1.2.5 构建全部
+107 静态、110 动态 entry 和两个原包装器，链接页对齐16KiB、解释器为
+`/lib/ld-musl-loongarch64.so.1`。完整安装树、工具及产物身份必须匹配；不改上游程序。
+
+默认 LA 按512MiB和1GiB各执行一次完整 Linux/BoarOS 矩阵，包括 official 平台
+案例，不能把512MiB标签下的启动偷偷改成1GiB。程序/两个内核在运行前冻结，
+逐案例记录真实 wait 状态、stdout/stderr、加载/运行/超时与资源退出；所有四份
+结果必须完整。RV 原默认入口保留。当前清单共229个ID：原228个加已有
+`busybox.environment`，两种LA RAM均229 pass，与本轮RV229 pass逐ID一致；历史
+上游失败保留在学习记录，本次通过不归因于未经单独复现的某个修复。
+
+```sh
+make prepare-la-tools prepare-la-linux-platform prepare-la-userland prepare-la-dynamic
+python3 -B tests/program-inventory/libc_build.py --arch loongarch --jobs 8 --uapi build/loongarch/uapi/include
+python3 -B tests/program-inventory/run.py --arch loongarch --reuse-builds --require-pass --output build/loongarch/inventory-check
+```
+
+运行期间冻结工具缓存，避免重链接导致短暂不可执行。runner-error 不是用户程序
+失败，必须保留原因并在同一身份下重跑对应未完成项。完整比赛Harness与客体原生
+开发工具另行验收；229个ID通过不证明所有BusyBox applet均能使用。

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build complete pinned programs, then inventory isolated RISC-V executions."""
+"""Build complete pinned programs, then inventory isolated RV/LA executions."""
 import argparse
 from collections import Counter
 import hashlib
@@ -9,6 +9,8 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
+from arch_profiles import PROFILES
 
 ROOT = Path(__file__).resolve().parents[2]
 HERE = Path(__file__).resolve().parent
@@ -83,7 +85,9 @@ def validate_build(metadata, expected_revision):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--output', type=Path, default=ROOT / 'build/program-inventory-full')
+    parser.add_argument('--arch',choices=tuple(PROFILES),default='riscv')
+    parser.add_argument('--memory',choices=('512M','1G'),action='append')
+    parser.add_argument('--output', type=Path)
     parser.add_argument('--suite', choices=('all', 'busybox', 'libc'), default='all')
     parser.add_argument('--case', action='append', dest='case_ids')
     parser.add_argument('--reuse-builds', action='store_true', help='verify and reuse existing program builds')
@@ -94,7 +98,8 @@ def main():
     parser.add_argument('--timeout', type=float, default=10)
     parser.add_argument('--require-pass', action='store_true', help='also fail for program incompatibilities')
     args = parser.parse_args()
-    destination = args.output.resolve()
+    profile=PROFILES[args.arch]
+    destination = (args.output or ROOT/('build/program-inventory-full' if args.arch=='riscv' else 'build/loongarch/program-inventory')).resolve()
     destination.mkdir(parents=True, exist_ok=True)
     # Local unpacked tools are optional; all executable identities are recorded.
     local_tools = ROOT / 'build/diff-abi/tools/usr/bin'
@@ -110,7 +115,20 @@ def main():
     metadata = {'inputs': inputs, 'inputs_sha256': sha(HERE / 'inputs.json'),
                 'runner_sha256': sha(__file__), 'status': 'preparing'}
     try:
-        if args.reuse_builds:
+        if args.arch=='loongarch':
+            sys.path.insert(0,str(ROOT/'tests/loongarch'))
+            import prepare_userland,prepare_dynamic
+            prepare_userland.main(argparse.Namespace(cross='loongarch64-unknown-linux-gnu-',jobs=args.jobs))
+            dynamic_args=argparse.Namespace(cross='loongarch64-unknown-linux-gnu-',jobs=args.jobs,output=prepare_dynamic.BASE)
+            dynamic_identity,_=prepare_dynamic.cache_inputs(dynamic_args)
+            saved=json.loads((prepare_dynamic.BASE/'identity.json').read_text())
+            if saved['inputs']!=dynamic_identity or prepare_userland.installed_tree_manifest(prepare_dynamic.BASE,['root'])!=saved['products']:
+                raise RuntimeError('LA shared musl cache identity mismatch')
+            binary=ROOT/'build/loongarch/busybox-source/busybox/busybox'
+            busybox={'revision':inputs['busybox']['revision'],'binary':str(binary),'binary_sha256':sha(binary),
+                'environment':{'identity':{'compiler_flags':list(profile.raw_flags)+['-Wl,-z,max-page-size=16384']}},
+                'static_identity_sha256':sha(ROOT/'build/loongarch/userland-identity.json')}
+        elif args.reuse_builds:
             busybox = json.loads((ROOT / 'build/program-environment/full-busybox/build.json').read_text())
         else:
             busybox = environment.build_busybox(jobs=args.jobs)
@@ -120,9 +138,9 @@ def main():
             manifest['cases'] = []
         if args.suite in ('all', 'libc'):
             if args.reuse_builds:
-                libc = json.loads((ROOT / 'build/program-libc/build.json').read_text())
+                libc = json.loads((ROOT / ('build/program-libc/build.json' if args.arch=='riscv' else 'build/loongarch/program-libc/build.json')).read_text())
             else:
-                libc = libc_build.build(jobs=args.jobs)
+                libc = libc_build.build(jobs=args.jobs,arch=args.arch,uapi_include=(None if args.arch=='riscv' else ROOT/'build/loongarch/uapi/include'))
             if libc['status'] != 'built':
                 raise RuntimeError('libc-test build incomplete: ' + json.dumps(libc['failures']))
             validate_build(libc, inputs['preliminary_suite']['revision'])
@@ -141,25 +159,41 @@ def main():
         if args.build_only:
             metadata['status'] = 'built'
             return 0
-        compiler = ROOT / 'build/riscv/musl-root/bin/musl-gcc'
-        driver = destination / 'suite-driver-rv'
+        compiler = ROOT / ('build/riscv/musl-root/bin/musl-gcc' if args.arch=='riscv' else 'build/loongarch/musl-root/bin/musl-gcc')
+        driver = destination / ('suite-driver-rv' if args.arch=='riscv' else 'suite-driver-la')
         command = [str(compiler), *busybox['environment']['identity']['compiler_flags'],
                    '-static', '-O2', '-Wall', '-Wextra', '-Werror',
                    str(HERE / 'suite_driver.c'), '-o', str(driver)]
         with (destination / 'driver-build.log').open('w') as log:
-            subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, check=True)
-        image, linux_identity = harness.linux_build(HERE / 'linux.config')
+            environment_variables=os.environ.copy()
+            if args.arch=='loongarch':environment_variables['REALGCC']=str(ROOT/'build/loongarch/gcc-sf/root/bin/loongarch64-unknown-linux-gnusf-gcc')
+            subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, check=True,env=environment_variables)
+        if args.arch=='riscv':image, linux_identity = harness.linux_build(HERE / 'linux.config')
+        else:
+            image=profile.linux_kernel();linux_identity=json.loads((image.parent/'boaros-identity.json').read_text())
+            if linux_identity['revision']!=harness.source_info()[1] or linux_identity.get('image_sha256')!=sha(image):
+                raise RuntimeError('LA fixed Linux identity mismatch')
         metadata.update(linux=linux_identity, driver_command=command,
-                        driver_sha256=sha(driver), boaros_sha256=sha(ROOT / 'kernel-rv'))
-        result = suites.run_suite(manifest, destination / 'runs', driver, image, ROOT / 'kernel-rv',
-                                 case_ids=args.case_ids, default_timeout=args.timeout,
-                                 output_validator=validate_output,
-                                 keep_pass_images=args.keep_pass_images)
-        metadata['status'] = 'inventoried'
-        metadata['execution'] = result
-        print(json.dumps(result, indent=2))
-        if args.require_pass and not suites.strict_result_passes(result, args.case_ids):
-            return 1
+                        driver_sha256=sha(driver), boaros_sha256=sha(ROOT/profile.kernel))
+        frozen={}
+        for name,source in [('linux',image),('boaros',ROOT/profile.kernel)]:
+            snapshot=destination/(name+'-kernel')
+            original=sha(source)
+            if snapshot.exists():
+                if sha(snapshot)!=original:raise RuntimeError('kernel differs from preserved snapshot; choose a fresh output directory')
+            else:snapshot.write_bytes(source.read_bytes())
+            if sha(snapshot)!=original:raise RuntimeError('kernel changed during input snapshot')
+            frozen[name]=snapshot
+        results={}
+        for memory in args.memory or (['512M','1G'] if args.arch=='loongarch' else ['512M']):
+            result=suites.run_suite(manifest,destination/('runs' if args.arch=='riscv' and memory=='512M' else 'runs-'+memory),
+                driver,frozen['linux'],frozen['boaros'],case_ids=args.case_ids,default_timeout=args.timeout,
+                output_validator=validate_output,keep_pass_images=args.keep_pass_images,
+                arch=args.arch,memory=memory,qemu=profile.qemu)
+            results[memory]=result
+        metadata['status']='inventoried';metadata['execution']=results
+        print(json.dumps({memory:{'status':state['status'],'counts':state['counts']} for memory,state in results.items()},indent=2))
+        if args.require_pass and any(not suites.strict_result_passes(result,args.case_ids) for result in results.values()):return 1
         return 0
     except Exception as error:
         metadata.update(status='environment-or-runner-error', error=str(error))
