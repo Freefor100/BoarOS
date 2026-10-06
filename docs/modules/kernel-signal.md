@@ -45,7 +45,11 @@ sigsuspend 在等待和选择 handler 时保留临时 mask，把原 mask 写入�
 
 ## 验证与当前边界
 
-构帧复用 prefix/mcontext 存储，不在内核栈放置整份 frame；新增故障记录内嵌在线程控制块中，不为故障交付分配内存。函数与调用链预算通过 `make test-stack-usage`、真实任务 canary 与退出时栈统计核对；单函数统计和一次回归不能证明所有深层 I/O/fault 清理链。
+RV 构帧复用 prefix/mcontext 存储，不在内核栈放置整份1088字节frame；LA整数帧使用
+有界592字节输入，构帧路径编译栈帧736字节、恢复352字节。故障记录内嵌在线程
+控制块中，不为交付分配内存。函数与调用链预算通过 `make test-stack-usage`、
+`make test-stack-usage-la`、真实任务 canary 与退出时栈统计核对；单函数统计和
+一次回归不能证明所有深层 I/O/fault 清理链。
 
 `make test-signal-riscv` 覆盖 syscall 复制失败、状态提交与 errno；`make test-diff-abi-riscv` 以同一 RISC-V ELF 对照等待信号的参数、真实超时、线程/进程定向来源、阻塞送达、siginfo EFAULT 消费和其他 handler 打断；`make test-userland-riscv` 以真实静态 musl 验证 handler/sigreturn、libc ucontext、sigsuspend、睡眠 EINTR、vfork、SIGCHLD 回收及 pipe 等待。架构和调度边界由 `make test-riscv` 回归。
 
@@ -58,6 +62,8 @@ MAPERR/ACCERR，EOF 为 BUS/ADRERR。ADE/ALE 的 si_addr 是 BADV，break 0 为
 TRAP/BRKPT、si_addr=ERA。固定 Linux LA do_ri 使用 SI_KERNEL=128、空地址，不能
 沿用 RV 的 ILL_ILLOPC。SC_ADDRERR_RD/WR 根据 Linux thread.error_code 的保留契约
 编码，后续异步帧和 clone 保留该值；PRMD 不发布在用户上下文。
+break 6/7 分别为 SIGFPE/FPE_INTOVF、FPE_INTDIV，按真实指令 immediate 解码，
+不能把整数运算 fault 全部归为 TRAP。两个类型也由同 ELF 的双侧 handler 验证。
 `make test-signal-loongarch` 在512MiB/1GiB分别运行同一个真实 LP64S musl ELF，
 验证布局、来源/mask、嵌套、故障映射修复、整数寄存器/PC恢复、坏帧、pipe
 SA_RESTART/EINTR、nanosleep EINTR 和 sigsuspend。每次 BoarOS 退出要求根盘 owner、
