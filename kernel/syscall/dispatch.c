@@ -241,6 +241,13 @@ enum kernel_syscall_status kernel_syscall_dispatch(
         return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     }
 
+#if defined(BOAROS_ARCH_LOONGARCH)
+    /* LA 用户 handler/sigreturn frame 尚未接入；不发布无法返回的 disposition。 */
+    if (request->number==134U || request->number==139U) {
+        *result=(struct kernel_syscall_result){KERNEL_SYSCALL_ACTION_RETURN,-KERNEL_ENOSYS};
+        return KERNEL_SYSCALL_STATUS_OK;
+    }
+#endif
 #if BOAROS_COST_DIAGNOSTICS
     kernel_cost_syscall(request->number, (int64_t)request->arguments[0]);
     COST_SCOPE(syscall_cost, OPERATION_TICKS);

@@ -26,7 +26,7 @@ BoarOS 是从零搭建、面向 OS Comp 能力建设的 C / 少量汇编内核�
 | 终端 | DTB ns16550 IRQ＋worker，ttyS0/console/tty、canonical/raw、termios/termios2、VMIN/VTIME、控制终端和前后台作业；Unix98 PTY/devpts、packet、真实 libc PTY API及原 BusyBox ash/stty/script/replay | 其他行规程、break 生成和完整 modem 控制未交付；固定 root、单 hart |
 | 内核日志 | 从启动保存16KiB真实内核日志、完整klogctl 0–10、消费式阻塞读、清空及console级别控制 | 当前不可变root权限模型；用户console输出与日志分离，无/dev/kmsg接口 |
 | 身份与资源 | 单用户 root 的 UID/GID 查询；线程组共享并执行 NOFILE/STACK，fork 继承、exec 保留 | 真实ext4/tmpfs/匿名pipe所有权可变，进程仍固定root；无凭据变更/完整权限；fd 硬容量 1024、栈硬容量 8 MiB；其他有效 limit 返回 `ENOTSUP` |
-| 平台与网络 | RISC-V QEMU 真实根盘可配置 PID 1（默认 `/init`） 与 musl 用户态；单 hart IPv4/IPv6 UDP/TCP loopback、双栈监听、连接选项、半关闭与向量消息，固定 lwIP 2.2.1 raw API，AF_UNIX socketpair；legacy/modern VirtIO-net、静态 IPv4/ARP、有界分片重组与隔离宿主双向 TCP/HTTP，custom pbuf RX、TX indirect+SG 零拷贝（保留复制回退）、无 NIC 时协议/OFD 定时器仍由内核 worker 推进 | 无命名 AF_UNIX 端点、外部 IPv6、公网/DHCP/DNS/TLS、LoongArch、实板或多核验证 |
+| 平台与网络 | RISC-V QEMU 真实根盘可配置 PID 1（默认 `/init`） 与 musl 用户态；单 hart IPv4/IPv6 UDP/TCP loopback、双栈监听、连接选项、半关闭与向量消息，固定 lwIP 2.2.1 raw API，AF_UNIX socketpair；legacy/modern VirtIO-net、静态 IPv4/ARP、有界分片重组与隔离宿主双向 TCP/HTTP，custom pbuf RX、TX indirect+SG 零拷贝（保留复制回退）、无 NIC 时协议/OFD 定时器仍由内核 worker 推进 | 无命名 AF_UNIX 端点、外部 IPv6、公网/DHCP/DNS/TLS、LA 根盘用户环境、实板或多核验证 |
 
 活 inode 的再次打开先取得现有节点资格，避免临时后端打开与关闭；创建权限通过已有句柄设置。弱路径 registry 仍不保存常驻目录项缓存。
 
@@ -57,9 +57,11 @@ PID 1 退出后先结束并回收剩余用户进程，再停止内核服务和�
 顺序预读与连续写回提供有界实验候选，生产默认仍为预读关闭、写回一页。
 机制门禁和吞吐测量分别记录；TCP 27 组、存储 20 组已完成匹配筛选和组合扩展，共 1,218 次发布启动与 184 次诊断。用户依据结果批准网络默认改为 8 MSS/池 4 倍/协议堆 2 倍；存储仍为 RA0/WB1。历史结果中的默认标签指调整前的 8/1/1，见[结果、每连接完成时间和输入身份](docs/learning/data-path-budget-experiments.md#正式匹配结果2026-10-06)。
 
-LoongArch 首阶段已开始：QEMU virt 的 LA64 高地址启动、16 KiB 物理页和
-不连续 RAM 回收已验证；用户页表、timer 与真实用户 ELF 尚未交付，见
-[LA 启动](docs/modules/loongarch-boot.md)。
+LoongArch L0–L1 首阶段已交付：QEMU virt/LA464 单核、LA64、16 KiB/三级页表，
+独立内存 ELF 经共用 MM/exec/任务/syscall 路径进入用户态，并通过 timer 抢占、
+故障/回收及 512 MiB/1 GiB 同 ELF Linux 对照。`kernel-la` 当前是首阶段验收入口；
+PCI 根盘、musl、动态加载、FP/SIMD、完整信号 handler、实板和 SMP 尚未验收，见
+[LA 首阶段](docs/modules/loongarch-boot.md)。
 
 ## 构建与验证
 
@@ -108,7 +110,7 @@ make inventory-userland-riscv  # 能力清单，不是必过门禁
 make test-references
 ```
 
-聚焦测试只在对应[模块文档](docs/README.md)维护。`make run-riscv` 不附根盘，启动后停留 timer-idle，需人工退出；`make debug-riscv` 以 `-S -s` 等待 GDB。完整比赛 Harness 当前因缺少 `kernel-la` 等能力阻塞，不算已通过。
+聚焦测试只在对应[模块文档](docs/README.md)维护。`make run-riscv` 不附根盘，启动后停留 timer-idle，需人工退出；`make debug-riscv` 以 `-S -s` 等待 GDB。完整比赛 Harness 当前仍因 LA 根盘与完整用户环境等能力阻塞，不算已通过。
 
 `build/` 是可重建的本地产物目录，不是验证档案。仅长期保留内核/用户程序编译结果、工具链、当前配置的 Linux 构建缓存等可跨轮复用的产物；一次性运行目录、磁盘镜像、日志和旧构建缓存应在核对结果后清理。`python3 tests/prune-build.py` 预览，`make prune-build` 执行清理；`make clean` 连可复用的内核构建产物也删除。需要临时保留案例镜像以调试时，可给清单入口传 `--keep-pass-images`，调试结束后仍应清理。
 
@@ -126,8 +128,8 @@ I/O已经接入。机制、历史性能口径和unknown见[成本分析](docs/le
 不以内部计数下降替代真实程序效率。当前能力与下一项优化由有效应用证据选择。
 
 评测兼容分支单向接纳main；main保留自身uname，旧glibc结果属于兼容配置。
-完整Harness仍缺kernel-la，单侧诊断和逐组补跑不能宣称完整交付。逐次成绩和运行
-输出留在忽略的build；SMP、LoongArch、实板及更大应用另行规划。
+完整Harness仍缺LA根盘与完整用户环境，单侧诊断和逐组补跑不能宣称完整交付。逐次成绩和运行
+输出留在忽略的build；SMP、LA后续用户环境、实板及更大应用另行规划。
 
 - [文档导航](docs/README.md)：模块契约与可复用学习材料。
 - [工程原则](docs/design.md)与[贡献说明](CONTRIBUTING.md)：技术取舍、验证与提交边界。

@@ -55,3 +55,18 @@ loongarch64-linux-gnu-gcc \
 本地 `autotest-for-oskernel` 快照在提交目录执行 `make all`，随后读取仓库根目录的 `kernel-rv` 和 `kernel-la`。该快照的 RISC-V 命令使用 `qemu-system-riscv64 -machine virt -kernel kernel-rv -bios default`，并挂载 virtio-mmio 块设备与网络；LoongArch 命令使用 `qemu-system-loongarch64 -kernel kernel-la` 和 virtio-pci 设备。
 
 该快照的默认配置是 1 CPU、1 GiB、3600 秒，但比赛轮次可以覆盖。2026 BuildStorm 使用 8 CPU、8 GiB，guest 内构建目标为 RISC-V 或 LoongArch musl。这些是兼容性输入，不是永久项目 API；每次接入前都要以当前规则和 Harness 为准。
+
+## LA 首阶段工具快照（2026-10-06）
+
+本机 `loongarch64-unknown-linux-gnu-gcc` 15.1.0 位于
+`/opt/loongarch64-tools/bin/`，二进制 SHA-256 为
+`93ffc1acbb540affea06c1c986a1f3869a48383a7fba849710cfe20e8fdd4cd0`。
+PATH 没有 LA QEMU，`make prepare-la-tools` 从固定 QEMU v11.1.0 源码构建
+`build/qemu-la/qemu-system-loongarch64`；`make prepare-la-linux` 用相同LA GCC
+构建固定 Linux 的16KiB/三级页表initramfs对照，保存于 `build/linux-la`。
+来源commit、配置与命令见[LA首阶段](modules/loongarch-boot.md)和
+[输入身份](learning/loongarch-bringup.md)。两种缓存由prune保留，日志与运行镜像清除。
+
+`make kernel-la` 使用LP64S、soft-float、禁用LSX/LASX，用户探针独立链接为
+`build/loongarch/user-probe`。`make test-loongarch` 在512MiB/1GiB下对照同一个ELF。
+本轮工具和整数用户态通过不代表浮点ABI、实板或LA libc已验收。

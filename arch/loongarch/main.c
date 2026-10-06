@@ -1,11 +1,21 @@
 #include <platform/loongarch_virt.h>
 #include <kernel/physical_page.h>
 #include <kernel/page.h>
+#include <arch/mmu.h>
+#include <arch/timer.h>
+#include <kernel/time.h>
+#include <kernel/scheduler.h>
+void la_trap_initialize(void);
+void la_user_contract(struct physical_page_allocator *);
+extern unsigned char __boot_stack_bottom[], __boot_stack_top[];
+void la_heap_contract(struct physical_page_allocator *);
+void la_mmu_contract(struct physical_page_allocator *);
 static struct physical_page_allocator allocator;
 extern unsigned char __kernel_start[], __kernel_end[];
 void la_kernel_main(uint64_t systab)
 {
     la_virt_puts("BoarOS: LA64 QEMU virt, 16 KiB pages\n");
+    la_trap_initialize();
     struct boot_memory_layout layout;
     if (!la_virt_boot_memory(systab, (uintptr_t)__kernel_start - LA_DIRECT_BASE,
         (uintptr_t)__kernel_end - LA_DIRECT_BASE, &layout)) la_virt_fatal("boot memory");
@@ -25,5 +35,11 @@ void la_kernel_main(uint64_t systab)
     if (physical_page_release(&allocator, page) != PHYSICAL_PAGE_STATUS_OK ||
         physical_page_available(&allocator) != before) la_virt_fatal("page recovery");
     la_virt_puts("LA boot contracts passed; available pages="); la_virt_hex(before); la_virt_puts("\n");
+    la_heap_contract(&allocator);
+    la_mmu_initialize();
+    la_mmu_contract(&allocator);
+    if (kernel_time_init(la_timer_frequency(),0)!=KERNEL_TIME_STATUS_OK ||
+        kernel_scheduler_init(&allocator,(uintptr_t)__boot_stack_bottom,(uintptr_t)__boot_stack_top)!=KERNEL_SCHEDULER_STATUS_OK) la_virt_fatal("scheduler init");
+    la_user_contract(&allocator);
     la_virt_shutdown();
 }

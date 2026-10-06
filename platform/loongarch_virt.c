@@ -102,3 +102,9 @@ int la_virt_boot_memory(uint64_t systab, uint64_t kernel_start, uint64_t kernel_
     }
     return layout->usable_count != 0;
 }
+
+unsigned arch_uart_rx_ready(void) { return (uart[5]&1)!=0; }
+char arch_uart_getc(void) { return (char)uart[0]; }
+/* External IRQ and RTC providers are not registered in the first platform stage. */
+int arch_external_interrupt_active(void) { return 0; }
+int arch_rtc_read_ns(uint64_t *out) { (void)out; return 1; }

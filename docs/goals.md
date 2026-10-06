@@ -28,11 +28,11 @@ N3已经交付：legacy/modern VirtIO-net、受限DMA借用与复制回退、静
 
 [风险证据与重建](learning/cost-baseline.md#旧版内存释放与-virtqueue-告警2026-10-02)
 区分已经修复的机制与缺少历史现场的归因。固定root、单hart、QEMU和选定应用验收
-均不代表多用户隔离、SMP、实板或完整Linux兼容。完整比赛Harness仍缺kernel-la。
+均不代表多用户隔离、SMP、实板或完整Linux兼容。完整比赛Harness仍缺LA根盘与完整用户环境。
 
 ## 近期方向
 
-本轮单核数据路径阶段一至七已交付，保留以下由测量暴露的后续边界：默认 TCP 预算在部分 bulk/高并发负载吞吐回退；全局协议资源不足后的复制与重试仍有成本；WB8 可能降低仅缓存完成的小写速度。优先按[匹配结果](learning/data-path-budget-experiments.md)选择目标程序和候选，网络默认已按用户选择调整到 8/4/2，存储保持 RA0/WB1。受控延迟补测和具体原程序问题由兼容分支记录；完整比赛仍缺 kernel-la。
+本轮单核数据路径阶段一至七已交付，保留以下由测量暴露的后续边界：默认 TCP 预算在部分 bulk/高并发负载吞吐回退；全局协议资源不足后的复制与重试仍有成本；WB8 可能降低仅缓存完成的小写速度。优先按[匹配结果](learning/data-path-budget-experiments.md)选择目标程序和候选，网络默认已按用户选择调整到 8/4/2，存储保持 RA0/WB1。受控延迟补测和具体原程序问题由兼容分支记录；完整比赛仍缺 LA 根盘与完整用户环境。
 
 文件元数据的活inode复用、创建句柄初始化、O_PATH与路径truncate已交付，通用实现
 已单向合入兼容分支。路径资格、睡眠前节点引用、初始时间与显式改权的区别、截断属性
@@ -131,7 +131,7 @@ glibc四进程整命令仍增加0.73%。该轮的prepare读取、1547次FLUSH和
 | 所有权与接口子集 | fchown/fchownat已接入真实元数据；O_PATH和路径truncate已接入；完整凭据/权限、原生accept4仍有缺口；CPU-time clock、VIRTUAL/PROF timer、pipe容量操作、扩展clone/futex按具体子语义核对，不把已有整个模块记为缺失 |
 | 全局文件同步 | sync/syncfs接入单一挂载树、节点快照与durable等待；syncfs维护独立的挂载错误观察。void sync的程序退出码仍不能单独证明持久化，匿名对象不触及根盘，见[VFS契约](modules/vfs-ext4.md)。 |
 | 用户内存/信号 | mremap、按操作madvise、mlock、sigaltstack、实时信号队列、共享文件/PI futex待真实应用需求触发 |
-| 系统与平台 | 固定root查询不等于完整凭据/权限；其他行规程、完整modem控制、外部IPv6/DNS/TLS、公网配置、SMP/实板、kernel-la仍缺，不声明完整Linux兼容或硬实时 |
+| 系统与平台 | 固定root查询不等于完整凭据/权限；其他行规程、完整modem控制、外部IPv6/DNS/TLS、公网配置、SMP/实板、LA根盘与完整用户环境仍缺，不声明完整Linux兼容或硬实时 |
 
 下面P/N/L小节保留稳定能力编号、契约、依赖和已有验证入口；只以上面的当前队列决定近期实施。
 
@@ -473,23 +473,27 @@ backlog 和期限回收已交付。真实用户态保护用户复制、共享 OF
 
 ## L：LoongArch 与实板支线
 
-**入口与资料**：`arch/riscv/`、架构头与 Makefile；后续拟新增 `arch/loongarch/` 和 `kernel-la`。先读 `references/README.md` 与清单中的 LoongArch 手册/文档、Linux、QEMU、VF2/2K1000LA 资料，记录具体 commit/tag/文档版本或 SHA-256。
+**入口与资料**：`arch/riscv/`、`arch/loongarch/`、架构头与 Makefile，LA首阶段入口为 `kernel-la`。先读 `references/README.md` 与清单中的 LoongArch 手册/文档、Linux、QEMU、VF2/2K1000LA 资料，记录具体 commit/tag/文档版本或 SHA-256。
 
 ### L0 架构依赖盘点
 
-- [ ] 列出通用 MM/调度对 RV 头、satp、SFENCE.VMA、trap frame、页大小和寄存器布局的直接依赖，按实际消费者提取架构操作；不复制 `arch/riscv/mm.c` 中通用 VMA/文件页策略。
-- [ ] 保留架构 MMU/context/trap 与平台 DTB/MMIO/DMA 的区分，新增接口由第二实现验证，不预建空泛 HAL。
+- [x] 列出通用 MM/调度对 RV 头、satp、SFENCE.VMA、trap frame、页大小和寄存器布局的直接依赖，按实际消费者提取架构操作；不复制 `arch/riscv/mm.c` 中通用 VMA/文件页策略。
+- [x] 保留架构 MMU/context/trap 与平台 DTB/MMIO/DMA 的区分，新增接口由第二实现验证，不预建空泛 HAL。
 
-L0–L1已开始：通用MM/用户访问策略和IRQ绑定已分离；QEMU LA64的高地址
-启动、全部RAM bank、16KiB物理分配及回收已通过512MiB/1GiB。三级用户页表、
-timer抢占和真实ELF仍待完成，当前不是L1完整交付。见[LA启动](modules/loongarch-boot.md)。
+L0–L1于2026-10-06通过首阶段验收：构建期IRQ/MMU/task/timer绑定、共用MM/uaccess/ELF策略、
+QEMU全部RAM bank与16KiB/三级用户页表、两个内核/用户任务的真实timer抢占及回收。
+512MiB/1GiB各有9组同LA ELF的固定Linux对照，另有构造/缺页OOM与回收门禁；
+RV完整架构、真实用户程序、glibc、1344条ABI和SQLite回归通过。范围见[LA首阶段](modules/loongarch-boot.md)。
 
 ### L1 最小启动与用户态
 
-- [ ] 串口→trap→timer→物理页→TLB/页表→高地址映射→一个真实 U-mode exit，每步有独立启动/故障/回收证据。
-- [ ] 延续已选 LA64 16 KiB/三级页表配置，页大小是架构构建期事实；不把目标配置描述为硬件唯一能力。只生成 `kernel-la` 不算用户态通过。
+- [x] 串口→trap→timer→物理页→TLB/页表→高地址映射→一个真实 U-mode exit，每步有独立启动/故障/回收证据。
+- [x] 延续已选 LA64 16 KiB/三级页表配置，页大小是架构构建期事实；不把目标配置描述为硬件唯一能力。只生成 `kernel-la` 不算用户态通过。
 
 ### L2 ABI 与映像
+
+首阶段已覆盖内存ELF段/BSS/栈/auxv、整数寄存器、基本syscall与最小fork/COW计算探针。
+stat/signal handler、FP/SIMD和根盘/libc未验收，以下完整范围仍未完成。
 
 - [ ] ELF 段对齐、BSS 尾页、auxv、用户栈、stat/signal 结构及 clone 寄存器逐项核对；不能只换汇编入口却保留 RV ABI 编码。
 - [ ] 同一用户源码分别编译 RV/LA ELF，每架构内部用同一 ELF 对照 Linux 与 BoarOS；共享测试语义，隔离寄存器/页表差异，不拿 RV ELF 验证 LA。
@@ -578,7 +582,7 @@ make test-program-inventory-host test-diff-abi-host
 make inventory-userland-riscv
 ```
 
-`inventory-userland-riscv` 默认成功只说明清单生成成功。全量 228 项仍有明确缺口，严格模式失败不是自动产生的新回归；`--case` 与 `--require-pass` 只严格判定本次选择集合，未选项目保留历史结果或 `not-run`，选择集合写入状态供恢复报告解释。完整 Harness 缺 `kernel-la` 或其他能力时保留阻塞原因。
+`inventory-userland-riscv` 默认成功只说明清单生成成功。全量 228 项仍有明确缺口，严格模式失败不是自动产生的新回归；`--case` 与 `--require-pass` 只严格判定本次选择集合，未选项目保留历史结果或 `not-run`，选择集合写入状态供恢复报告解释。完整 Harness 缺 LA 根盘用户环境或其他能力时保留阻塞原因。
 
 ## 范围与交付边界
 

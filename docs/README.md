@@ -47,4 +47,4 @@ learning 面向读者解释机制、结果和适用条件。正文使用可识�
 
 每个可独立验证的阶段收口时检查 README、模块、learning 三类文档：有新事实才更新，旧结论直接替换，细节用链接引用。运行产物仅在核对期间暂存于忽略的 `build/`，随后用 `make prune-build` 清理一次性目录与日志；临时 plan/spec 与会话材料不入库。
 
-- [LoongArch QEMU 启动](modules/loongarch-boot.md)：直接ELF启动、平台RAM与阶段验收。
+- [LoongArch QEMU 首阶段](modules/loongarch-boot.md)：平台RAM、16KiB页表、真实用户态与Linux对照；[学习记录](learning/loongarch-bringup.md)说明固定依据与owner。
