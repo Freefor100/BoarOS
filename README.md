@@ -70,6 +70,7 @@ errno 隔离、timer 寄存器保持、同步/取消、futex/非 PI robust、线
 创建 OOM/回收也已验证。原 BusyBox ash 的非交互 trap/wait 有双侧证据。
 原版LP64D musl的动态PIE/非PIE、解释器、DT_NEEDED/RPATH、初始与dlopen DSO TLS已通过双侧两种RAM；
 标量FR/FCC/FCSR、浮点信号/exec/clone也已验证，整数内核与原LP64S用户程序继续可用。
+LA内核栈已接入PGDH共享窗口及真实16KiB guard，含NX、撤映射、OOM回滚与可信异常栈验收。
 LSX/LASX/LBT、完整终端/网络、glibc及更广原程序、实板和SMP仍须另行验收，LA与RV尚不等价。
 LA EXEC 页的数据读权限已按固定 Linux 的冷/驻留状态核对；页表有效权限与请求
 VMA 权限分别保留，真实读取、uaccess、fork和撤权均有双侧两种 RAM 验证。

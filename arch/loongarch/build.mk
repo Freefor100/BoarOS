@@ -49,6 +49,22 @@ test-loongarch-boot: kernel-la
 	python3 -B tests/loongarch/run.py --qemu $(QEMU_LOONGARCH64) --stage boot
 test-stack-usage-la: kernel-la
 	python3 -B tests/stack-usage.py $(LA_BUILD) --stack-bytes 32768 --trap-frame-bytes 304
+
+$(LA_BUILD)/stack-guard-%.o: tests/loongarch/stack_guard.c
+	$(LA_CC) $(LA_CPPFLAGS) $(LA_CFLAGS) -DLA_STACK_CASE=$* -c $< -o $@
+$(LA_BUILD)/kernel-stack-guard-%: $(LA_OBJECTS) $(LA_BUILD)/stack-guard-%.o arch/loongarch/linker.ld
+	$(LA_CC) $(LA_FLAGS) -nostdlib -nostartfiles -static -no-pie -T arch/loongarch/linker.ld -Wl,--build-id=none,--gc-sections,--wrap=physical_page_allocate,--wrap=physical_page_allocate_order,--wrap=kernel_syscall_dispatch,--wrap=la_boot_tasks -o $@ $(LA_OBJECTS) $(LA_BUILD)/stack-guard-$*.o -lgcc
+.PHONY: test-stack-guard-loongarch
+test-stack-guard-loongarch: $(foreach case,0 1 2 3,$(LA_BUILD)/kernel-stack-guard-$(case)) prepare-la-tools
+	python3 -B tests/loongarch/stack_guard.py
+	python3 -B tests/loongarch/userland.py --program $(LA_BUILD)/stack-window-user --marker 'LA kernel window user access denied'
+	python3 -B tests/loongarch/run.py --kernel $(LA_BUILD)/kernel-stack-window-oom --log $(LA_BUILD)/stack-window-oom.log --marker 'LA kernel stack skeleton OOM rollback passed'
+$(LA_BUILD)/stack-window-user: tests/loongarch/stack_window_user.c prepare-la-userland
+	REALGCC=$(abspath $(LA_USER_CC)) $(LA_MUSL_CC) $(LA_FLAGS) -O2 -static -Wall -Wextra -Werror -Wl,-z,max-page-size=16384 -o $@ $<
+test-stack-guard-loongarch: kernel-la $(LA_BUILD)/stack-window-user prepare-la-linux
+$(LA_BUILD)/kernel-stack-window-oom: $(LA_OBJECTS) $(LA_BUILD)/tests/loongarch/stack_window_oom.o arch/loongarch/linker.ld
+	$(LA_CC) $(LA_FLAGS) -nostdlib -nostartfiles -static -no-pie -T arch/loongarch/linker.ld -Wl,--build-id=none,--gc-sections,--wrap=physical_page_allocate,--wrap=physical_page_allocate_order,--wrap=kernel_syscall_dispatch,--wrap=la_mmu_kernel_window_initialize -o $@ $(LA_OBJECTS) $(LA_BUILD)/tests/loongarch/stack_window_oom.o -lgcc
+test-stack-guard-loongarch: $(LA_BUILD)/kernel-stack-window-oom
 -include $(LA_OBJECTS:.o=.d)
 
 $(LA_BUILD)/user-probe: tests/loongarch/user.c tests/loongarch/user_start.S tests/loongarch/registers.S tests/loongarch/user.ld
@@ -100,6 +116,7 @@ test-root-io-loongarch: kernel-la $(LA_BUILD)/root-probe build/host/nbd-fault pr
 .PHONY: test-la-userland-host
 test-la-userland-host: prepare-la-userland
 	python3 -B tests/host/la_userland_cache.py
+
 .PHONY: prepare-la-glibc test-glibc-loongarch test-glibc-profile-host
 prepare-la-glibc:
 	python3 -B -c "import sys; sys.path.insert(0,'tests/userland/glibc'); from profiles import checked_inputs; checked_inputs('loongarch')"

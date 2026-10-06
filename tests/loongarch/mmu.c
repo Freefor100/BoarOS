@@ -1,5 +1,27 @@
 #include <arch/mmu.h>
 #include <platform/loongarch_virt.h>
+#include <arch/task.h>
+void la_stack_window_contract(struct physical_page_allocator *a)
+{
+    uint64_t before=physical_page_available(a),first,second;
+    uint64_t address=ARCH_KERNEL_STACK_WINDOW_BASE+ARCH_KERNEL_STACK_WINDOW_SIZE-BOAROS_PAGE_SIZE;
+    if(physical_page_allocate(a,&first)!=PHYSICAL_PAGE_STATUS_OK ||
+       physical_page_allocate(a,&second)!=PHYSICAL_PAGE_STATUS_OK)la_virt_fatal("window allocation");
+    *(uint64_t *)la_virt_page_access(first)=42;*(uint64_t *)la_virt_page_access(second)=77;
+    if(arch_mmu_kernel_window_map(a,ARCH_KERNEL_STACK_WINDOW_BASE,first)!=ARCH_MMU_STATUS_INVALID ||
+       arch_mmu_kernel_window_map(a,address,first)!=ARCH_MMU_STATUS_OK ||
+       *(volatile uint64_t *)address!=42 ||
+       arch_mmu_kernel_window_map(a,address,second)!=ARCH_MMU_STATUS_CONFLICT ||
+       *(volatile uint64_t *)address!=42 ||
+       arch_mmu_kernel_window_unmap(a,address+1)!=ARCH_MMU_STATUS_INVALID ||
+       arch_mmu_kernel_window_unmap(a,address)!=ARCH_MMU_STATUS_OK ||
+       arch_mmu_kernel_window_map(a,address,second)!=ARCH_MMU_STATUS_OK ||
+       *(volatile uint64_t *)address!=77 ||
+       arch_mmu_kernel_window_unmap(a,address)!=ARCH_MMU_STATUS_OK)la_virt_fatal("window ownership/translation");
+    (void)physical_page_release(a,first);(void)physical_page_release(a,second);
+    if(physical_page_available(a)!=before)la_virt_fatal("window page baseline");
+    la_virt_puts("LA kernel window conflict/reuse/recovery passed\n");
+}
 void la_mmu_contract(struct physical_page_allocator *allocator)
 {
     uint64_t before=physical_page_available(allocator);

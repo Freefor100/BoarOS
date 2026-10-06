@@ -261,3 +261,17 @@ archive/ABI/options与完整安装树身份；syslibdir设在缓存内，guest i
 `/usr/lib64`搜索路径，由本地已固定loader字符串和Linux动态启动核对，RV的
 `/lib` fixture不能直接搬用。五形态同ELF在固定Linux两种RAM通过，初始Boar
 静态程序在main前SIGILL；这只建立对照入口，尚不是glibc组合能力验收。
+
+## PGDH内核栈窗口
+
+用户选择保留DMW并只为任务栈增加分页窗口。固定QEMU v11.1.0
+`target/loongarch/tcg/csr_helper.c::helper_csrrd_pgd`依BADV最高位选择PGDL/PGDH，
+现有TLB refill可复用；原占位窗口base改为48位canonical高地址
+0xffff800000000000。页表骨架在boot预分配且每个分配失败都回滚；叶仅借用
+调度器持有的栈物理页，不能沿用户页表销毁逻辑释放它们。
+
+guard fault时原SP可能也无法承载trap frame，入口先用scratch CSR保存临时GR
+并检查，再选择保留的可信异常栈。初轮检查把合法的栈顶SP误认为下一槽guard，
+真实用户启动反例复现；改用SP下方字节所属槽位后原信号/FPU/创建OOM/根盘
+矩阵通过。实际guard写、SP不足、NX、撤映射访问及slot改映射分别有硬件证据，
+不能把canary或正常串口启动当guard验收。
