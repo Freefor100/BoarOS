@@ -1,13 +1,16 @@
-# LoongArch QEMU 首阶段
+# LoongArch QEMU 启动与根盘
 
 当前验收范围为 QEMU virt、LA464、单核、LA64、16 KiB/三级页表及整数用户态。
 入口为 `arch/loongarch/boot.S` 与 `main.c`，平台事实独立放在
-`platform/loongarch_virt.c`。`kernel-la` 是内嵌独立 ELF 的首阶段验收内核，
-尚无 PCI 根盘或静态 musl 用户环境；默认 `all` 和 RV 测试入口保持原路径。
+`platform/loongarch_virt.c`。`kernel-la` 有现代 PCI block 时启动可配置根盘 PID 1，
+无盘时运行内嵌独立 ELF 契约；平台存储生命周期在 `platform/loongarch_root.c`。
+默认 `all` 和 RV 测试入口保持原路径。
 
 ```sh
 make kernel-la                 # LP64S 整数内核和独立用户 ELF
 make run-loongarch             # QEMU 无 BIOS 直接 ELF 启动，串口可交互
+make test-root-loongarch        # PCI/ext4/LP64S musl/原 BusyBox 与 Linux 对照
+make test-root-io-loongarch     # 真正的块写错误与持久 owner
 make test-loongarch-boot        # 512 MiB/1 GiB 启动与后续契约
 make test-loongarch             # 同时准备固定 Linux，对照同一个用户 ELF
 make test-stack-usage-la
@@ -53,13 +56,13 @@ rt_sigaction/rt_sigreturn 尚无 LA handler frame，明确返回 ENOSYS。
 - 正常段、整页 FILE、BSS 尾页、初始栈/AT_PAGESZ、跨页复制、PID/TID、yield、时钟/睡眠、匿名 mmap/mprotect/munmap、exit/exit_group。
 - 只读、PROT_NONE、NX、撤映射后访问及内核 DMW 访问；9 组同 ELF 的 Linux/BoarOS 退出契约一致。
 - 损坏 header、错误 machine、重叠布局、16 个构造分配失败边界、两处任务/栈构造 OOM 和缺页 OOM；失败不发布任务，页数回到预热基线，最后 heap live 为零。
-- 可信 idle 栈回收 13 个任务栈，实测最小余量 31,016 字节、最大使用 1,736 字节；编译器 2,066 条函数记录（含 fatal fixture）最大单帧 3,392 字节。单帧检查不证明完整调用链上界。
+- 首阶段可信 idle 栈回收 13 个任务栈，实测最小余量 31,016 字节、最大使用 1,736 字节；编译器 2,066 条函数记录（含 fatal fixture）最大单帧 3,392 字节。单帧检查不证明完整调用链上界。
 
 本轮 RV allocator、MM/VMA、uaccess、context、scheduler、exec 及 `test-riscv`、
 真实静态/动态用户程序、五种固定 glibc 形态、1,344 条 ABI 差分、栈检查与 SQLite
 DELETE/WAL 恢复回归通过。上述结果不代表 LA 完整线程、信号、libc 或比赛 Harness。
 下一阶段 PCI→VirtIO 块→ext4→静态 musl 已由人批准，采用共用块核心与独立 MMIO/PCI transport；
-该阶段正在开发，以下已通过结果仍只覆盖首阶段。SMP、实板与动态加载另行验收。
+该阶段现已通过下述根盘与静态用户程序验收。SMP、实板与动态加载另行验收。
 
 固定依据为`references/qemu` v11.1.0，commit
 `84f07211cc5b4fc6a371559bf8a5de4fb068e648`的`hw/loongarch/boot.c`、
@@ -93,8 +96,49 @@ make test-block-loongarch
 任务/队列/PCI claim回收。queue OOM在真实设备初始化中恢复BAR、command和
 页基线。宿主模型额外覆盖capability循环/截断/溢出、BAR资源不足回滚，以及
 不依赖handler遍历顺序的共享level迟到完成。掩蔽外设的pending状态不能在
-timer trap中被分发，真实QEMU先复现失败后修复。ext4根启动和静态程序仍待验收。
+timer trap中被分发，真实QEMU先复现失败后修复。
 
 固定依据：QEMU上述commit的 `hw/pci-host/gpex.c`、`hw/intc/loongarch_{pch_pic,extioi}.c`
 及 `include/standard-headers/linux/virtio_pci.h`；Linux上述commit的
 `drivers/virtio/virtio_pci_modern_dev.c` 和 `drivers/irqchip/irq-loongson-{pch-pic,eiointc}.c`。
+
+
+## 根盘、静态 musl 与回收
+
+根 bus 按 BDF 顺序枚举 block 端点，最多8盘，首盘是 raw whole-disk ext4；一旦发现
+block，不通过后续磁盘或内存 fixture 掩盖启动错误。legacy PCI 明确 ENOTSUP，
+数量超限 ENOSPC，损坏 ext4 保留后端 EUCLEAN。默认 `/init` 的 path/argv/envp
+使用与 RV 相同的 `INIT_CONFIG=config/init.json` 生成方式，LA 有独立生成依赖。
+PT_INTERP 暂未接入，返回 ENOEXEC，不发布半成品任务；此限制可在后续扩展。
+
+永久可信 cleanup 栈在页基线前创建，启动构造也在该内核任务上执行。设备与
+cache/mount/files/fs/source/image 的真实字段一直保存 owner；映像准备、I/O worker
+就绪后才原子转交 MM/files/fs 并发布 PID 1。页缓存和 journal 使用原共用 worker，
+运行期 I/O 通过 PCI IRQ 睡眠；idle 只负责调度。PID 1 completion 后先停止其他
+用户 owner，回收用户任务，再 stop/join cache worker、卸载 journal/mount、销毁
+cache、摘 block 注册并 stop DMA/IRQ、释放队列和 BAR claims。成功要求 heap live
+和 heap pages 均为0，物理页回到排除永久 cleanup 栈后的精确基线；当前栈不提前释放。
+
+真实 I/O 清理失败仍由原对象持有，最多三次清理后报告并关机，不打印资源回收成功。
+`test-root-io-loongarch` 用原 NBD fault server 在真实现代 PCI 盘注入 write EIO，
+确认用户失败、mount/cache/device/claim 仍存在且没有成功标记。非法 allocator
+释放或元数据损坏继续 fatal，不进入该重试路径。
+
+2026-10-06 的两种 RAM 验收均通过：正常/只读根盘（只读镜像整盘哈希不变）、
+缺失/无 execute bit/错误 machine init、损坏 superblock、legacy PCI、用户 fault，
+以及 image、task、cache worker 构造 OOM。失败不发布 PID 1；无 I/O 故障的各条路径
+均恢复根页/堆/PCI基线。静态 musl probe 检查16KiB auxv/BSS、跨页文件读/私有和
+共享映射、fd offset、msync/fsync 持久数据、clock/sleep、fork/exec/wait；原 BusyBox
+完整配置未裁剪，执行cp/cmp/grep/cat/echo/uname/dd。相同 probe 和 BusyBox ELF 在
+固定 Linux 的 PCI ext4 上分别运行，验证关系和持久字节，不比较偶然 PID/时间。
+这是七个原 applet 与组合 ABI 的验收，未运行完整 BusyBox、RV 的 FP/signal/ucontext
+用户探针或完整比赛 Harness。最新 RV完整架构、真实用户态、五种glibc、1366条ABI、
+栈检查及共享驱动的SQLite DELETE/WAL/恢复与四种io-sleep门禁均通过。
+
+LP64S 工具缓存由 `make prepare-la-userland` 重建并校验：固定 GCC15.1.0 archive
+构建 `loongarch64-unknown-linux-gnusf` C 编译器和匹配 libgcc/CRT，使用固定 musl1.2.5
+headers bootstrap runtime，再构建静态 libc；BusyBox 使用清单 commit 和原配置，
+UAPI 从固定 Linux v6.6 `ARCH=loongarch headers` 导出后原样安装，不混宿主 glibc 头。
+编译源码与可复用产物、工具/配置/ELF身份留在 `build/loongarch`，运行目录、镜像、
+日志及早期失败构建用 `make prune-build` 清除。ELF 使用 SOFT-FLOAT ABI，EUEN关闭；
+没有用忽略 ABI mismatch 或成功存根绕过硬件限制。

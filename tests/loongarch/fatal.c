@@ -1,7 +1,7 @@
 #include <arch/mmu.h>
 #include <platform/loongarch_virt.h>
 
-void __wrap_la_user_contract(struct physical_page_allocator *allocator)
+void __wrap_la_boot_tasks(struct physical_page_allocator *allocator)
 {
     uint64_t page;
     if (physical_page_allocate(allocator,&page)!=PHYSICAL_PAGE_STATUS_OK)
