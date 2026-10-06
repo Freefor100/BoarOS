@@ -275,3 +275,21 @@ guard fault时原SP可能也无法承载trap frame，入口先用scratch CSR保�
 真实用户启动反例复现；改用SP下方字节所属槽位后原信号/FPU/创建OOM/根盘
 矩阵通过。实际guard写、SP不足、NX、撤映射访问及slot改映射分别有硬件证据，
 不能把canary或正常串口启动当guard验收。
+
+## SIMD live、used_math与固定Linux clone
+
+1056字节内嵌image同时记录当前启用宽度、已初始化宽度和used_math。用户帧
+撤销SC_USED_FP后再执行向量的同ELF反例：Linux保持原image，初版Boar把低FR
+重置NaN而失败。切换以width判断owner，首用以used_math与live共同决定初始化；
+恢复清除used时不能先快照handler硬件覆盖原内存image。
+
+固定Linux`arch/loongarch/kernel/process.c::copy_thread`清除LSX/LASX_CTX_LIVE。
+实际raw clone中的子任务低64位继承，向量上半部首用全1；父任务完整保持。该
+固定版本的真实结果与源代码一致，不能把常识性的“fork继承全部向量位”写作
+预期，再把Linux失败当fixture问题略过。Boar同反例RED后按已选Linux ABI修正。
+
+FPU/LSX/LASX记录优先级按类别，不是列表顺序；同类重复取最后一条。合法有效
+字段止于页尾、padding在PROT_NONE页且较大size跳到可读END时允许恢复。
+三CPU profile的原程序、pending/只读写回失败、嵌套及clone/exec均保留可重建入口。
+GNU2.42静态启动从SIGILL推进到空AT_RANDOM的SIGSEGV，GDB确认ERA=0x120000bbc
+位于原`__libc_start_main_impl`；这是RNG接入前的真实依赖，不补虚假随机ready。

@@ -9,10 +9,11 @@
 #include <stdint.h>
 struct arch_thread_state { uintptr_t kernel_sp, user_sp; uint64_t user_mode, page_root, signal_error_code; } __attribute__((aligned(16)));
 struct arch_switch_context { uint64_t ra, sp, tp, fp, s[9]; } __attribute__((aligned(16)));
-/* saved 标识已使用 FP；当前 owner 的硬件 image 在切换时写回。 */
-struct arch_fpu_state { uint64_t regs[32], fcc; uint32_t fcsr, padding; uint64_t saved; } __attribute__((aligned(16)));
-_Static_assert(sizeof(struct arch_fpu_state)==288 && offsetof(struct arch_fpu_state,fcc)==256 &&
-               offsetof(struct arch_fpu_state,fcsr)==264 && offsetof(struct arch_fpu_state,saved)==272,"LA FP offsets");
+/* width 为当前硬件宽度；live_width 保留已初始化的上半部，即使 sigreturn 撤销 used。 */
+struct arch_fpu_state { uint64_t regs[32][4], fcc; uint32_t fcsr, width; uint64_t saved; uint32_t live_width; } __attribute__((aligned(32)));
+_Static_assert(sizeof(struct arch_fpu_state)==1056 && offsetof(struct arch_fpu_state,fcc)==1024 &&
+               offsetof(struct arch_fpu_state,fcsr)==1032 && offsetof(struct arch_fpu_state,width)==1036 &&
+               offsetof(struct arch_fpu_state,saved)==1040,"LA FP/SIMD offsets");
 struct arch_trap_frame {
     uint64_t regs[32];
     uint64_t prmd, era, estat, badv, kernel_tp;
