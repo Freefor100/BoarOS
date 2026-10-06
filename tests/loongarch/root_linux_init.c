@@ -1,13 +1,17 @@
 #include <stdint.h>
+#include "../common/raw_syscall.h"
 #ifndef EXPECTED_EXIT_STATUS
 #define EXPECTED_EXIT_STATUS 0
 #endif
-static long call(long number,long a,long b,long c,long d,long e,long f)
-{
-    register long r4 __asm__("a0")=a,r5 __asm__("a1")=b,r6 __asm__("a2")=c;
-    register long r7 __asm__("a3")=d,r8 __asm__("a4")=e,r9 __asm__("a5")=f,r11 __asm__("a7")=number;
-    __asm__ volatile("syscall 0":"+r"(r4):"r"(r5),"r"(r6),"r"(r7),"r"(r8),"r"(r9),"r"(r11):"$t0","$t1","$t2","$t3","$t4","$t5","$t6","$t7","$t8","memory");return r4;
-}
+#ifndef ROOT_MOUNT_FLAGS
+#define ROOT_MOUNT_FLAGS 0
+#endif
+#ifdef __loongarch__
+#define ROOT_ARCH_LABEL "LA"
+#else
+#define ROOT_ARCH_LABEL "RV"
+#endif
+#define call test_syscall6
 static void puts(const char *s) {unsigned n=0;while(s[n])n++;call(64,1,(long)s,n,0,0,0);}
 int user_main(uint64_t *stack)
 {
@@ -27,7 +31,7 @@ int user_main(uint64_t *stack)
     }
     unsigned encoded=(major<<8)|(minor&255)|((minor&~255U)<<12);
     if(call(33,-100,(long)"/dev/vda",060600,encoded,0,0) ||
-        call(40,(long)"/dev/vda",(long)"/root",(long)"ext4",0,0,0)) failed=1;
+        call(40,(long)"/dev/vda",(long)"/root",(long)"ext4",ROOT_MOUNT_FLAGS,0,0)) failed=1;
     if(!failed) {
         long child=call(220,17,0,0,0,0,0);
         if(child==0) {
@@ -41,6 +45,6 @@ int user_main(uint64_t *stack)
     }
     /* reboot 不替 init checkpoint 根盘；先卸载才能直接核对宿主 home blocks。 */
     if(call(39,(long)"/root",0,0,0,0,0)) failed=1;
-    puts(failed ? "Linux LA root application failed\n" : "Linux LA root application passed\n");
+    puts(failed ? "Linux " ROOT_ARCH_LABEL " root application failed\n" : "Linux " ROOT_ARCH_LABEL " root application passed\n");
     call(142,0xfee1dead,672274793,0x4321fedc,0,0,0);for(;;){}
 }

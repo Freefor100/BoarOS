@@ -15,6 +15,7 @@
 #include <kernel/shm.h>
 #include <kernel/errno.h>
 #include <kernel/virtio_pci_block.h>
+#include <kernel/virtio_pci_rng.h>
 
 #define ROOT_DEVICES 8
 static struct {
@@ -22,6 +23,7 @@ static struct {
     struct kernel_page_cache cache;
     struct kernel_vfs_mount mount;
     struct virtio_pci_block devices[ROOT_DEVICES];
+    struct virtio_pci_rng rng;
     unsigned count,detected;
     struct kernel_exec_image image;
     struct kernel_files files;
@@ -38,10 +40,32 @@ static int is_block(uint32_t id)
 { return id==0x10421af4 || id==0x10011af4; }
 static int dma(const void *p,uint64_t size,uint64_t *address)
 { return arch_direct_map_va_to_pa((uintptr_t)p,size,address)==ARCH_DIRECT_MAP_STATUS_OK; }
+static int start_rng(struct physical_page_allocator *allocator,struct pci_host *host)
+{
+    for(unsigned bdf=0;bdf<256;bdf++) {
+        if(host->read(host->context,bdf,0,4)!=0x10441af4)continue;
+        int error=virtio_pci_rng_start(&root.rng,host,bdf,allocator,la_timer_frequency());
+        if(!error) {
+            la_virt_puts("LA PCI RNG bdf=");la_virt_hex(bdf);
+            la_virt_puts(" irq=");la_virt_hex(root.rng.pci.irq);la_virt_puts("\n");return 0;
+        }
+        la_virt_puts("LA RNG unavailable errno=");la_virt_hex((uint64_t)(int64_t)error);la_virt_puts("\n");
+        if(root.rng.device.transport.context || root.rng.pci.function.host)return error;
+    }
+    return 0;
+}
 
 /* 文件、映像和 mount 仍是 I/O owner 时保留原字段，下一次只重试未完成项。 */
 static int release_root(void)
 {
+    if(root.rng.device.transport.context || root.rng.pci.function.host) {
+        struct virtio_rng_device *rng=&root.rng.device;
+        la_virt_puts("LA RNG final requests=");la_virt_hex(rng->requests);
+        la_virt_puts(" bytes=");la_virt_hex(rng->bytes);
+        la_virt_puts(" errors=");la_virt_hex(rng->errors);
+        la_virt_puts(" timeouts=");la_virt_hex(rng->timeouts);la_virt_puts("\n");
+        if(virtio_pci_rng_stop(&root.rng))return -KERNEL_EIO;
+    }
     if((root.files.state==KERNEL_FILES_LIVE || root.files.state==KERNEL_FILES_CLEANUP) &&
        kernel_files_release(&root.files)!=KERNEL_FILES_STATUS_OK) return -KERNEL_EIO;
     if((root.fs.state==KERNEL_FS_CONTEXT_LIVE || root.fs.state==KERNEL_FS_CONTEXT_CLEANUP) &&
@@ -185,6 +209,7 @@ static int start_root(void)
     }
     if(!error && kernel_page_cache_init(&root.cache,&root.heap,allocator)!=KERNEL_PAGE_CACHE_STATUS_OK) error=-KERNEL_ENOMEM;
     if(!error) error=kernel_vfs_mount_root(&root.mount,&root.devices[0].device.block,&root.heap,&root.cache);
+    if(!error) error=start_rng(allocator,host);
     if(!error) error=prepare_init();
     if(!error) error=kernel_page_cache_start_worker(&root.cache);
     if(!error) error=kernel_vfs_start_journal_worker(&root.mount);

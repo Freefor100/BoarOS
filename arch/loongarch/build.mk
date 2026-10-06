@@ -8,7 +8,7 @@ LA_CFLAGS := $(LA_FLAGS) -std=gnu11 -O2 -g3 -ffreestanding -fno-builtin -fno-sta
 LA_C_SOURCES := $(filter-out arch/% kernel/main.c net/ethernet.c,$(C_SOURCES)) \
     arch/loongarch/main.c arch/loongarch/mmu.c arch/loongarch/context.c \
     arch/loongarch/timer.c arch/loongarch/trap.c arch/loongarch/signal.c arch/loongarch/fpu.c platform/loongarch_virt.c \
-    platform/loongarch_pci.c platform/loongarch_root.c drivers/virtio/pci_block.c drivers/virtio/pci.c kernel/pci.c \
+    platform/loongarch_pci.c platform/loongarch_root.c drivers/virtio/pci_block.c drivers/virtio/pci.c drivers/virtio/pci_rng.c kernel/pci.c \
     tests/loongarch/mmu.c tests/loongarch/heap.c tests/loongarch/user_boot.c tests/loongarch/elf_failures.c
 LA_ASM_SOURCES := arch/loongarch/boot.S arch/loongarch/context_switch.S \
     arch/loongarch/tlb_refill.S arch/loongarch/trap_entry.S arch/loongarch/signal_trampoline.S arch/loongarch/fpu_state.S tests/loongarch/user_blob.S
@@ -26,6 +26,9 @@ prepare-la-tools:
 	python3 -B tests/loongarch/prepare.py --component tools
 prepare-la-linux:
 	python3 -B tests/loongarch/prepare.py --component linux --cross $(LA_CROSS_COMPILE)
+.PHONY: prepare-la-linux-platform
+prepare-la-linux-platform:
+	python3 -B tests/loongarch/prepare.py --component linux --profile platform --cross $(LA_CROSS_COMPILE)
 ifeq ($(QEMU_LOONGARCH64),build/qemu-la/qemu-system-loongarch64)
 run-loongarch test-loongarch test-loongarch-boot: prepare-la-tools
 endif
@@ -79,9 +82,10 @@ test-stack-guard-loongarch: kernel-la $(LA_BUILD)/stack-window-user prepare-la-l
 $(LA_BUILD)/kernel-stack-window-oom: $(LA_OBJECTS) $(LA_BUILD)/tests/loongarch/stack_window_oom.o arch/loongarch/linker.ld
 	$(LA_CC) $(LA_FLAGS) -nostdlib -nostartfiles -static -no-pie -T arch/loongarch/linker.ld -Wl,--build-id=none,--gc-sections,--wrap=physical_page_allocate,--wrap=physical_page_allocate_order,--wrap=kernel_syscall_dispatch,--wrap=la_mmu_kernel_window_initialize -o $@ $(LA_OBJECTS) $(LA_BUILD)/tests/loongarch/stack_window_oom.o -lgcc
 test-stack-guard-loongarch: $(LA_BUILD)/kernel-stack-window-oom
--include $(LA_OBJECTS:.o=.d)
-# 独立fixture同样依赖共享头；不能用旧布局对象验收新的设备/架构状态。
--include $(wildcard $(LA_BUILD)/*.d $(LA_BUILD)/tests/loongarch/*.d)
+LA_DEPENDENCIES := $(LA_OBJECTS:.o=.d) $(wildcard $(LA_BUILD)/*.d $(LA_BUILD)/tests/loongarch/*.d)
+# 依赖由编译器生成；禁止GNU隐式链接规则把带.d后缀的stem当成fixture编号。
+$(LA_DEPENDENCIES): ;
+-include $(LA_DEPENDENCIES)
 
 $(LA_BUILD)/user-probe: tests/loongarch/user.c tests/loongarch/user_start.S tests/loongarch/registers.S tests/loongarch/user.ld
 	@mkdir -p $(dir $@)
@@ -130,6 +134,18 @@ test-root-io-loongarch: kernel-la $(LA_BUILD)/root-probe build/host/nbd-fault pr
 	python3 -B tests/loongarch/root_io.py --qemu $(QEMU_LOONGARCH64)
 
 .PHONY: test-la-userland-host
+.PHONY: test-rng-loongarch
+$(LA_BUILD)/rng-probe: tests/userland/rng.c prepare-la-userland
+	REALGCC=$(abspath $(LA_USER_CC)) $(LA_MUSL_CC) $(LA_FLAGS) -O2 -static -Wall -Wextra -Werror -Wl,-z,max-page-size=16384 -o $@ $<
+test-rng-loongarch: kernel-la $(LA_BUILD)/rng-probe prepare-la-tools prepare-la-linux-platform
+	python3 -B tests/rng_runner.py --arch loongarch
+$(LA_BUILD)/rng-fail-%.o: tests/loongarch/rng_failures.c arch/loongarch/build.mk
+	$(LA_CC) $(LA_CPPFLAGS) $(LA_CFLAGS) -DRNG_FAIL_AFTER=$* -c $< -o $@
+$(LA_BUILD)/kernel-rng-fail-%: $(LA_OBJECTS) $(LA_BUILD)/rng-fail-%.o arch/loongarch/linker.ld
+	$(LA_CC) $(LA_FLAGS) -nostdlib -nostartfiles -static -no-pie -T arch/loongarch/linker.ld -Wl,--build-id=none,--gc-sections,--wrap=physical_page_allocate,--wrap=physical_page_allocate_order,--wrap=kernel_syscall_dispatch,--wrap=virtio_rng_start -o $@ $(LA_OBJECTS) $(LA_BUILD)/rng-fail-$*.o -lgcc
+.PHONY: test-rng-failures-loongarch
+test-rng-failures-loongarch: $(foreach case,0 1 2 3,$(LA_BUILD)/kernel-rng-fail-$(case)) $(LA_BUILD)/rng-probe prepare-la-tools prepare-la-linux-platform
+	@for case in 0 1 2 3; do python3 -B tests/rng_runner.py --arch loongarch --platform BoarOS --mode a --force-device --kernel $(LA_BUILD)/kernel-rng-fail-$$case --marker 'LA RNG construction DMA/task/stack/IRQ rollback passed' || exit; done
 test-la-userland-host: prepare-la-userland
 	python3 -B tests/host/la_userland_cache.py
 

@@ -32,7 +32,7 @@ int riscv_root_boot_start_rng(struct riscv_root_boot *root,
             info->virtio_mmio[i].size, root->device.page_allocator,
             info->timebase_frequency, source);
         if (!error) return 0;
-        if (root->rng.mmio) return error;
+        if (root->rng.transport.context) return error;
     }
     return 0;
 }

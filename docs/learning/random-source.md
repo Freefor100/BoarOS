@@ -24,3 +24,13 @@ LA最初只消费DTB内存信息，GNU2.42启动因缺AT_RANDOM在main前访问�
 虚假ready。`make test-boot-random-loongarch`先真实RED再GREEN，两种RAM都验证
 available、零可信熵、ready为假及普通非阻塞等待EAGAIN；五种原GNU形态的
 Linux/BoarOS对照随后通过。可信PCI RNG生命周期仍另行验收。
+
+随后RNG共用transport/queue并接入LA PCI，正常、缺失、延迟与在途停止已完成同
+ELF的Linux/BoarOS、512MiB/1GiB对照；实际DMA/任务/栈OOM及IRQ失败返回准确错误
+并回到根基线。host另覆盖ready之后错误、短响应累计和拒绝reset保留owner。
+不能直接把缺设备等同于Linux未ready：固定Linux的LA`setup_arch()`先调用
+`fdt_setup()`，随后解析early params；`drivers/of/fdt.c`在前者已调用
+`add_bootloader_randomness()`，默认trust仍为true。故测试需控制固件输入。
+单用generic loader的reset写入又被稍后的ROM reset覆盖，实际对照仍ready；
+最后在已完成machine reset、vCPU尚未执行时，经GDB验证并NOP掉整个seed property。
+这只改变本轮RNG实验的公开固件输入，正常启动种子策略及固定内核/libc均未改变。

@@ -502,10 +502,11 @@ sigreturn/同步故障/等待重启和静态pthread/TLS已双侧验收，含真�
 仍未完成；本轮已批准单核QEMU对齐、统一VirtIO框架、内嵌SIMD状态及原版glibc2.42。
 PGDH内核栈窗口/guard/NX及可信异常栈已验收。SIMD接入后GNU启动缺失AT_RANDOM的
 SIGSEGV已定位到LA漏接QEMU DTB种子；复用不计熵的早期随机材料策略后，固定原版
-glibc2.42五形态在Linux/BoarOS两种RAM均通过退出及根owner门禁。真实PCI RNG仍未
-接入，启动种子不会提前发布random ready；完整指定原程序及平台矩阵仍待完成。
+glibc2.42五形态在Linux/BoarOS两种RAM均通过退出及根owner门禁。真实PCI RNG已接入并
+完成正常/缺失/延迟/在途停止、构造OOM/IRQ失败及回收；启动种子不会提前发布random
+ready。完整指定原程序及平台矩阵仍待完成。
 共用VirtIO transport/split queue已迁入block，三个transport的真实块与LA根owner
-门禁、RV可睡眠I/O四组合已通过。RNG/net迁移及LA平台接入继续沿已批准路线实施；
+门禁、RV可睡眠I/O四组合已通过。RNG迁移及LA PCI验收完成；net及其余LA平台接入继续沿已批准路线实施；
 全部指定程序矩阵和最终整体审查收口前，不声明本轮对齐完成。
 
 - [ ] ELF 段对齐、BSS 尾页、auxv、用户栈、stat/signal 结构及 clone 寄存器逐项核对；不能只换汇编入口却保留 RV ABI 编码。

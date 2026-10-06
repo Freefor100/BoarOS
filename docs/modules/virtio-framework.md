@@ -1,8 +1,8 @@
 # 共用 VirtIO transport 与 split queue
 
 入口为`include/kernel/virtio_transport.h`、`virtio_split_queue.h`和
-`drivers/virtio/{transport,split_queue,mmio,pci}.c`。当前block已迁入，RNG/net迁移
-仍待完成；不能把框架入口存在计作LA的RNG/网卡能力通过。
+`drivers/virtio/{transport,split_queue,mmio,pci}.c`。当前block/RNG已迁入，net迁移
+仍待完成；LA真实PCI RNG与退出回收有独立验收，网卡尚未完成。
 
 ## 分层与硬件契约
 
