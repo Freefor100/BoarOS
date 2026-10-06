@@ -562,8 +562,9 @@ void abi_socket_cases(void)
     send = SC6(206, udp_client, "wxyz", 4, 0, &udp_address,
                sizeof(udp_address));
     long udp_partial = send == 4
-        ? SC6(207, udp_server, (void *)(udp_fault_map + 4094), 4, 0, 0, 0)
+        ? SC6(207, udp_server, (void *)(udp_fault_map + ABI_PAGE_SIZE - 2), 4, 0, 0, 0)
         : send;
+    abi_require(udp_partial == -14);
     record("socket.udp-recvfrom-copy-fault", udp_partial);
     char after_udp_fault[4] = {0};
     long after_udp = SC6(207, udp_server, after_udp_fault, 4, 0, 0, 0);
@@ -693,9 +694,10 @@ void abi_socket_cases(void)
         ? SC4(73, &fault_ready, 1, &fault_deadline, 0) : second_write;
     record("socket.tcp-fault-second-ready", second_ready);
     long fault_prefix = second_ready == 1
-        ? SC3(63, accepted, (void *)(fault_map + 4094), 4) : second_ready;
+        ? SC3(63, accepted, (void *)(fault_map + ABI_PAGE_SIZE - 2), 4) : second_ready;
+    abi_require(fault_prefix == -14);
     abi_record("socket.tcp-read-partial-copy", fault_prefix, -1, -1, 0,
-               fault_prefix > 0 ? (void *)(fault_map + 4094) : 0,
+               fault_prefix > 0 ? (void *)(fault_map + ABI_PAGE_SIZE - 2) : 0,
                fault_prefix > 0 ? (usize)fault_prefix : 0);
     char fault_tail[4] = {0};
     long fault_remaining = SC3(63, accepted, fault_tail, sizeof(fault_tail));

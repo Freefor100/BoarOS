@@ -54,7 +54,7 @@ struct virtio_net_device {
     uint16_t tx_done[VIRTIO_NET_BUFFERS];
     uint16_t tx_done_head, tx_done_count;
 };
-
+/* init要求新的零初始化对象；stop归还全部owner后，调用方可清零再复用存储。 */
 int virtio_net_init(struct virtio_net_device *device,
     const struct virtio_transport *transport, struct physical_page_allocator *allocator,
     uint64_t frequency, uint32_t source);

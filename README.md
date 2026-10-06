@@ -76,10 +76,10 @@ LSX/LASX状态、信号、clone/exec和关闭扩展的HWCAP已双侧验收。固
 共用VirtIO net与Ethernet已接LA现代PCI，固定Linux/BoarOS两种RAM的真实TAP、
 原BusyBox HTTP和共享块/RNG/net IRQ、正常及构造/reset失败回收通过。无metadata checksum的空索引目录误报EUCLEAN已修复并用真实1/4KiB布局及
 LA普通/挂载后rmdir验证；全恢复回归仍随本轮最终门禁执行。AF_UNIX发送者计费和sendfile批次已按固定Linux接入并双侧验证；完整网络ABI
-和程序矩阵仍需最终同口径回归。共用ns16550已接LA真实TTY，串口/termios2/作业控制、PTY与原ash/stty/script/replay及录制重启已双侧两种RAM验收；UART构造失败和fatal轮询通过。LA pipe已修正为实际持有的16页容量，双侧两种RAM验证满环、wrap和回收。LS7A RTC真实UTC、日志/OFD与原BusyBox hwclock/dmesg/df已双侧两种RAM验证；Linux参考采用保留固定源的派生QEMU补齐PM/告警，具体身份和边界见[RTC平台](docs/modules/loongarch-boot.md#ls7a-rtc-与派生模拟器)。共用完整ABI的1366条记录已在LA四次启动一致匹配，RV同轮也匹配；固定BusyBox/libc-test当前229个共同ID已在LA两种RAM各全量通过，与本轮RV逐ID一致。原SQLite3.53.4的DELETE/WAL多进程、静态/动态CLI和独立重启内容也已双侧两种RAM验证；最终双架构回归（含RV SQLite/NBD全恢复及双盘）已通过，整体审查与清理继续收口。
+和程序矩阵仍需最终同口径回归。共用ns16550已接LA真实TTY，串口/termios2/作业控制、PTY与原ash/stty/script/replay及录制重启已双侧两种RAM验收；UART构造失败和fatal轮询通过。LA pipe已修正为实际持有的16页容量，双侧两种RAM验证满环、wrap和回收。LS7A RTC真实UTC、日志/OFD与原BusyBox hwclock/dmesg/df已双侧两种RAM验证；Linux参考采用保留固定源的派生QEMU补齐PM/告警，具体身份和边界见[RTC平台](docs/modules/loongarch-boot.md#ls7a-rtc-与派生模拟器)。共用完整ABI的1366条记录已在LA四次启动一致匹配，RV同轮也匹配；固定BusyBox/libc-test当前229个共同ID已在LA两种RAM各全量通过，与本轮RV逐ID一致。原SQLite3.53.4的DELETE/WAL多进程、静态/动态CLI和独立重启内容也已双侧两种RAM验证；最终双架构回归（含RV SQLite/NBD全恢复及双盘）已通过，一次整体审查的页边界夹具问题已集中修复，完整ABI及审查后回归通过；本轮指定单核QEMU矩阵对齐，正在清理运行产物。
 DTB随机种子仅支持早期材料和AT_RANDOM，不计可信熵。真实PCI RNG的正常、缺失、
 延迟、在途停止已双侧两种RAM验收，BoarOS构造失败与回收也已在两种RAM验收。LBT、
-更广原程序、实板和SMP仍须另行验收，LA与RV尚不等价。
+更广原程序、客体原生开发、完整Harness、实板和SMP仍须另行验收；本轮共同矩阵对齐不表示所有RV能力全面等价。
 共用VirtIO transport/split queue已接入RV MMIO与LA PCI block，保留batch/flush/
 超时及DMA业务owner；RNG/net已迁入，见[框架契约](docs/modules/virtio-framework.md)。
 LA EXEC 页的数据读权限已按固定 Linux 的冷/驻留状态核对；页表有效权限与请求

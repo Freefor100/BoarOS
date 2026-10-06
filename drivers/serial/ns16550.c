@@ -339,4 +339,3 @@ int ns16550_stop(struct ns16550_port **owner)
 {
     return ns16550_stop_report(owner, 0);
 }
-

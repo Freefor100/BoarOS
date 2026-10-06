@@ -229,3 +229,8 @@ python3 -B tests/program-inventory/run.py --arch loongarch --reuse-builds --requ
 运行期间冻结工具缓存，避免重链接导致短暂不可执行。runner-error 不是用户程序
 失败，必须保留原因并在同一身份下重跑对应未完成项。完整比赛Harness与客体原生
 开发工具另行验收；229个ID通过不证明所有BusyBox applet均能使用。
+
+LA完整inventory/ABI/SQLite/RTC运行目录由既有 `make prune-build` 统一清理；LA
+program-libc源码/ELF、LP64D运行时、GNU程序、Linux及原版/派生QEMU缓存保留。
+GNU临时run目录、磁盘和构建日志清理，不以被忽略的运行目录作为永久档案。
+`python3 -B tests/test-prune-build.py` 独立保护这项缓存/运行产物选择契约。
