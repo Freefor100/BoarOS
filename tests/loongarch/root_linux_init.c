@@ -36,6 +36,8 @@ int user_main(uint64_t *stack)
         int status=-1;
         if(call(260,child,(long)&status,0,0,0,0)!=child || status) failed=1;
     }
+    /* reboot 不替 init checkpoint 根盘；先卸载才能直接核对宿主 home blocks。 */
+    if(call(39,(long)"/root",0,0,0,0,0)) failed=1;
     puts(failed ? "Linux LA root application failed\n" : "Linux LA root application passed\n");
     call(142,0xfee1dead,672274793,0x4321fedc,0,0,0);for(;;){}
 }

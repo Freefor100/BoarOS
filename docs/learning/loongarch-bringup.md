@@ -136,3 +136,21 @@ baseline之前分配，可停止的任务/栈、用户页、cache和设备队列
 真实PCI/NBD write EIO复现了无界卸载重试；现在保留失败mount/cache/device owner，
 清理三次后明确报告停止。故障路径不打印“owners released”，正常/OOM/userfault
 路径则要求页、堆和BAR claim完整回收，不能把两类证据混为一次成功。
+
+### 冷构建与缓存反例
+
+独立审查在空配置目录复现：GCC顶层configure只生成顶层Makefile，提前读取
+`gcc/Makefile`会失败。工具准备改成先执行`configure-gcc`再检查子配置，验证从
+无旧对象/安装产物的缓存完成GCC、runtime、musl、完整BusyBox构建。
+
+原缓存快速路径漏读BusyBox/UAPI选择，且只记录8个产物。先用真实main入口的
+9个独立反例复现“不应verified却返回成功”，再将输入集合前移并覆盖安装树。
+清单同时记录 helper/specs/headers/CRT/库、文件权限和符号链接目标，输入或产物
+变更均拒绝复用。测试中的合法缓存先命中，防止所有输入都失败的假保护。
+旧格式不会自动承认为新身份；本轮旧缓存先核对原产物再保存旧stamp，重新执行
+构建后生成新清单。此修复只涉及构建与身份契约，不增加LA运行期能力。
+
+冷链还复现了既有 wrapper 文件掩盖的问题：headers bootstrap 时没有 runtime/
+stdio，musl auto 检测会禁用 GNU wrapper，完整 BusyBox 随后找不到 musl-gcc。
+配置显式选择 `--enable-gcc-wrapper`，libgcc 安装后重新 configure，再编译 libc；
+该选项也纳入缓存输入。冷目录从原始归档/空产物开始，不复用旧 wrapper 通过验收。

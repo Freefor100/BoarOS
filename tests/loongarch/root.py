@@ -7,6 +7,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import tempfile
 from guest import run_guest
 from reference import archive
 ROOT=Path(__file__).resolve().parents[2]
@@ -40,7 +41,7 @@ def main():
     parser.add_argument('--busybox',type=Path,default=Path('build/loongarch/busybox-source/busybox/busybox'))
     parser.add_argument('--linux',action='store_true');parser.add_argument('--smoke',action='store_true')
     parser.add_argument('--fault-program',type=Path);parser.add_argument('--oom-kernel');args=parser.parse_args()
-    directory=ROOT/'build/loongarch/root-run';directory.mkdir(exist_ok=True)
+    directory=Path(tempfile.mkdtemp(prefix='root-run.',dir=ROOT/'build/loongarch'))
     cases=['normal'] if args.linux or args.smoke else ['normal','readonly','missing','nonexec','wrong-arch','corrupt','legacy']
     initrd=None
     if args.linux:
@@ -78,5 +79,6 @@ def main():
                 recovered=directory/'persisted';execute(['debugfs','-R',f'dump /persisted {recovered}',image])
                 if recovered.read_bytes()!=bytes((i*7+3)%256 for i in range(32791)): raise SystemExit('persisted file differs after shutdown')
             print(f'{"Linux" if args.linux else "BoarOS"} LA root {case} {memory}: PASS')
+    print('Root artifacts: '+str(directory))
     print('Root ELF SHA-256 '+hashlib.sha256(args.program.read_bytes()).hexdigest())
 if __name__=='__main__': main()

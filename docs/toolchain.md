@@ -86,3 +86,12 @@ BusyBox 原commit/完整配置和固定v6.6 LA UAPI未改动，`make test-root-l
 运行同ELF的固定Linux/BoarOS PCI/ext4验收。GCC构建需宿主g++、GMP/MPFR/MPC开发
 依赖，首次工具构建可耗时数分钟；后续保留源码/构建/安装缓存。原程序范围为模块
 列出的七个applet，完整动态libc/TLS/线程/信号与FPU仍独立验收。
+
+工具缓存命中前会核对 BusyBox revision、配置路径及固定内容哈希、UAPI归档、
+编译/配置选项。安装 manifest 覆盖整个 GCC/musl/UAPI 安装树，包括 cc1/collect2、
+specs、CRT、库、头文件、权限及符号链接目标；丢失或变更明确拒绝复用。
+`make test-la-userland-host` 的9个反例先验证合法缓存可命中，再单独改变输入、
+删除 helper、改变 specs/header/链接或编译 flags，要求拒绝。冷构建可使用
+`python3 -B tests/loongarch/prepare_userland.py --output build/loongarch/toolchain-check`；
+顶层 configure 后先执行真实 `configure-gcc`，才读取 GCC 子配置，不借已有 Makefile。
+此验证目录随后由 prune 清除，默认可复用工具缓存保留。

@@ -28,7 +28,7 @@ RV `arch/riscv/virtio_mmio_block.c` 负责 MMIO 身份/版本和寄存器映射�
 
 ## 请求和 DMA
 
-通用 `kernel_block_device` 暴露容量、逻辑块大小和精确字节范围的同步读写接口（`kernel_block_read_at`/`kernel_block_write_at`），统一检查空参数、越界和整数溢出。两种 transport 共用最多 32 个描述符的 split queue，每请求占三描述符，最多八个在途槽；按设备 QueueNumMax 向下取可用容量，至少一个槽。modern 分配连续 8 KiB，legacy 分配连续 16 KiB 并以 4 KiB 对齐 used ring。每槽独立持有 header/status、512 字节 bounce、任务 owner、完成状态与等待队列；同步调用拥有槽位直到完成确认，不能在 DMA 期间复用。
+通用 `kernel_block_device` 暴露容量、逻辑块大小和精确字节范围的同步读写接口（`kernel_block_read_at`/`kernel_block_write_at`），统一检查空参数、越界和整数溢出。两种 transport 共用最多 32 个描述符的 split queue，每请求占三描述符，最多八个在途槽；按设备 QueueNumMax 向下取可用容量，至少一个槽。modern 分配连续两个架构页（RV为8KiB，LA为32KiB）；当前RV legacy分配四个4KiB页（16KiB），used ring按协议4KiB对齐。每槽独立持有 header/status、512 字节 bounce、任务 owner、完成状态与等待队列；同步调用拥有槽位直到完成确认，不能在 DMA 期间复用。
 
 `kernel_block_write_batch(device, spans, count)` 接受最多八个 `kernel_block_span { offset, buffer, size }`。设备与逻辑块大小必须有效，至少具有单写或批量写回调；只读设备返回 UNSUPPORTED。通用层在任何写入前检查所有 span 的容量、指针范围和非空字节区间重叠；非空 span 之间重叠返回 INVALID。有效可写设备上的 `count == 0` 可以传空 spans，成功且不调用驱动；空 span 可以传空 buffer，但 offset 仍须不超过容量，全部为空也不调用驱动。可选 `device.write_batch` 一次接收原 span 数组，可能含空项；没有回调时跳过空项、按输入顺序调用单写，遇到首个错误即停止。它保留实际失败状态，不承诺整批原子性或自动 flush；已完成的写不会回滚，调用方须保持所有非空 buffer 有效直到函数返回。
 
@@ -54,7 +54,7 @@ flush 先阻止新逻辑调用并排空此前逻辑调用，再发送 FLUSH，�
 
 PLIC 路由由 `dtb_read_irq_info()` 根据 CPU interrupt-controller phandle、启动 hart 的 supervisor cause 9 和 VirtIO interrupt-parent 关联；不硬编码 IRQ/context 编号。外部中断执行 claim、设备分派/ack、complete；IRQ 不分配或做文件清理。块/VFS 同步接口不变，设备内部允许多个调用同时等待。实板、IOMMU、非一致 DMA 和 SMP 仍不在此边界内。
 
-完成队列的冷路径诊断在 reset 前输出 `block queue fault`：used 快照与消费差值超过槽容量为 `used-overflow`；完成项的描述符 head 未按三描述符槽对齐、超出槽范围或 length 为零为 `used-element`；指向非 submitted 槽为 `slot-state`；设备 status 超出 OK/IOERR/UNSUPP 为 `device-status`。输出包含 MMIO 地址/status、中断快照、transport、队列虚拟/物理地址及容量，used、consumed、avail、入口观察到的完成数，逻辑调用/在途数和 reserved/published/complete 槽数；每个固定槽记录 state、owner/completion 指针值、status、type、字节数、扇区与期限。只读取驱动持有的 MMIO、队列和最多八个固定槽，不追 owner/completion 或设备提供的描述符地址，不分配、不增加重试。used 是触发校验的快照，consumed 包含已经取出的非法项，avail/status 是打印期间的标量；它不是跨 DMA 的原子快照。正常完成和普通 IOERR/UNSUPP 不输出这段诊断，reset、返回状态和 owner 回收契约不变。重复完成若发生在本次合法完成已收割之后，设备仍失败，但不会覆写已完成请求的真实结果。
+完成队列的冷路径诊断在 reset 前输出 `block queue fault`：used 快照与消费差值超过槽容量为 `used-overflow`；完成项的描述符 head 未按三描述符槽对齐、超出槽范围或 length 为零为 `used-element`；指向非 submitted 槽为 `slot-state`；设备 status 超出 OK/IOERR/UNSUPP 为 `device-status`。输出包含 transport context/device status、中断快照、transport、队列虚拟/物理地址及容量，used、consumed、avail、入口观察到的完成数，逻辑调用/在途数和 reserved/published/complete 槽数；每个固定槽记录 state、owner/completion 指针值、status、type、字节数、扇区与期限。只读取驱动持有的 transport、队列和最多八个固定槽，不追 owner/completion 或设备提供的描述符地址，不分配、不增加重试。used 是触发校验的快照，consumed 包含已经取出的非法项，avail/status 是打印期间的标量；它不是跨 DMA 的原子快照。正常完成和普通 IOERR/UNSUPP 不输出这段诊断，reset、返回状态和 owner 回收契约不变。重复完成若发生在本次合法完成已收割之后，设备仍失败，但不会覆写已完成请求的真实结果。
 
 纯超时也在reset前输出同一快照，原因为`timeout`，不附带不存在的非法完成项。
 这覆盖设备停止推进、used仍然合法的路径：固定QEMU的`virtio_error()`会将设备置为

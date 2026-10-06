@@ -96,3 +96,7 @@ test-root-loongarch: $(LA_BUILD)/root-fault $(LA_BUILD)/kernel-root-oom-1 $(LA_B
 .PHONY: test-root-io-loongarch
 test-root-io-loongarch: kernel-la $(LA_BUILD)/root-probe build/host/nbd-fault prepare-la-tools
 	python3 -B tests/loongarch/root_io.py --qemu $(QEMU_LOONGARCH64)
+
+.PHONY: test-la-userland-host
+test-la-userland-host: prepare-la-userland
+	python3 -B tests/host/la_userland_cache.py
