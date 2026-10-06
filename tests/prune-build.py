@@ -9,7 +9,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 BUILD = ROOT / 'build'
-KEEP_TOP = {'data-path-baselines', 'network-budget', 'io-budget', 'cost', 'riscv', 'diff-abi', 'program-environment', 'program-libc', 'host', 'tools', 'offline-c'}
+KEEP_TOP = {'data-path-baselines', 'network-budget', 'io-budget', 'cost', 'riscv', 'loongarch', 'qemu-la', 'linux-la', 'diff-abi', 'program-environment', 'program-libc', 'host', 'tools', 'offline-c'}
 KEEP_ROOT_FILES = {'elf-tail-rv', 'elf-tail-dynamic-rv', 'elf-tail-norelro-rv'}
 
 
@@ -65,6 +65,14 @@ def candidates():
                 elif path.is_dir():
                     result.extend(path / name for name in ('configure.log', 'build.log')
                                   if (path / name).exists())
+
+    la = BUILD / 'loongarch'
+    if la.is_dir():
+        result.extend(la.glob('*.log'))
+        reference = la / 'reference'
+        if reference.is_dir():
+            result.extend(path for path in reference.iterdir()
+                          if path.suffix == '.log' or path.name == 'initramfs.gz')
 
     libc = BUILD / 'program-libc'
     if libc.is_dir():
