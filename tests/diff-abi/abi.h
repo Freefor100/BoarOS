@@ -41,6 +41,7 @@ void abi_proc_exec_probe(void) __attribute__((noreturn));
 void abi_script_probe(const unsigned long *sp);
 void abi_script_cases(void);
 void abi_child_tid_cases(void);
+void abi_statx_cases(void);
 void abi_truncate_cases(void);
 void abi_timestamp_cases(void);
 void abi_readv_cases(void);

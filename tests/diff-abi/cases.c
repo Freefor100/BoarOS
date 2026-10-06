@@ -228,6 +228,7 @@ void abi_main(const unsigned long *initial_stack)
     abi_metadata_cases();
     abi_ownership_cases();
     abi_child_tid_cases();
+    abi_statx_cases();
     abi_script_cases();
     abi_mknod_cases();
     abi_session_cases();

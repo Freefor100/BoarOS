@@ -48,6 +48,21 @@ static int spin(void)
     __asm__ volatile(""::"r"(accumulator):"$t0","$t1","$t2","$t3","$t4","$t5","$t6","$t7","$t8","memory");
     return 0;
 }
+static int clone_tid_contract(void)
+{
+    int child_tid=-1, status=-1;
+    /* LA 的 clone 把 child_tid 放 a3、TLS 放 a4；指针必须由真实子任务验证。 */
+    long child=call6(220,17|0x1000000|0x200000,0,
+                     0,(long)&child_tid,0,0);
+    if (child<0) return child==-14 ? 91 : 94;
+    if (!child) {
+        long result=child_tid==CALL(178,0,0,0) ? 0 : 92;
+        CALL(93,result,0,0); for (;;) { }
+    }
+    if(call6(260,child,(long)&status,0,0,0,0)!=child ||
+       status || child_tid!=-1) return 93;
+    return 0;
+}
 int user_register_probe(void);
 static int console(void)
 {
@@ -91,6 +106,7 @@ int user_main(uint64_t *stack)
     if (equal(mode,"kernel")) return *(volatile unsigned char *)(uintptr_t)0x9000000000200000;
     if (CALL(172,0,0,0)<=0 || CALL(178,0,0,0)!=CALL(172,0,0,0)) return 5;
     if (CALL(0xffffffff,0,0,0)!=-38) return 6;
+    int clone_result=clone_tid_contract(); if(clone_result) return clone_result;
     struct timespec first,second,delay={0,20000000};
     if (CALL(113,1,&first,0) || CALL(113,1,0,0)!=-14) return 7;
     if (CALL(101,&delay,0,0) || CALL(113,1,&second,0)) return 8;

@@ -101,3 +101,16 @@ SQLite DELETE/WAL/重启恢复回归通过。它们保护共用层的既有行�
 ESTAT保留被mask的pending位，timer入口要与ECFG相交，不能分发未启用来源。
 宿主PIC/OR模型强制前一时序，QEMU两个共享pin的实际盘及暂时mask场景验证组合。
 PCI capability范围与BAR资源不足测试只证明解析和回滚，不替代真实DMA/IRQ证据。
+
+### libc 暴露的 ABI 边界
+
+固定 musl1.2.5 的 `src/thread/loongarch64/clone.s` 将 child_tid 放 a3、TLS 放 a4。
+原 LA trap 沿用 RV 顺序，真实 fork 子任务没有收到 `CLONE_CHILD_SETTID` 写入；
+父任务等待后观察非零子退出状态。先加入同 ELF 的子 TID 检查，再重排 LA 参数，
+512MiB/1GiB 的 Linux/BoarOS均通过。PARENT_SETTID 的普通 fork 组合在当前内核
+尚未接入；验证不拿该未支持组合代替 child-TID 的复现。
+
+LA musl 的 `fstat` 首次真实根盘运行返回 ENOSYS，因为该架构通过 `statx(291)`
+查询。新增接口复用已有 inode/path/fd owner，只序列化 Linux 256 字节 BASIC_STATS。
+22条 RV/Linux差分同时保护组合错误优先级与跨页 EFAULT；猜测的“坏指针应先于
+非法 mask”被固定 Linux 的实际结果否定，保留验证所得行为，不凭源码印象改错序。

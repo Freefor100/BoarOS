@@ -402,3 +402,19 @@ read/readv、pread 系列与 sendfile 在访问时间更新等首次可睡眠动
 `kernel_open_file_read_begin`，成功前缀才调用 read_progress；冷不连续读取不能先睡眠
 再撤销旧预测。seek 和最后释放 OFD 取消其 cookie，预读持有 inode 而非 fd 编号，
 因此 fd 复用不会继承旧预测。默认关闭及取消接纳边界见[VFS 预读](vfs-ext4.md#有界顺序预读候选)。
+
+## statx 与 LoongArch musl
+
+`kernel_files_statx()` 与 `fstatat` 共用路径、fd pin 和真实 inode 元数据，按 Linux
+固定的 256 字节布局写入用户缓冲。仅报告 `STATX_BASIC_STATS`；birthtime、挂载 ID、
+DIO/原子写对齐及 inode 属性未实现，不设置对应可用位。未知 request mask 位忽略，
+保留 bit31 与同时指定 FORCE_SYNC/DONT_SYNC 返回 EINVAL。正 fd 的空路径可为 NULL，
+与固定 Linux 一样略过其他 lookup 位；路径查询仍校验 lookup 位。坏缓冲或跨入
+无权限页返回 EFAULT，fd/path owner 按原契约回收。
+
+LA musl1.2.5 不提供旧 `fstat/newfstatat` syscall，而通过 statx 实现 libc stat API。
+验证入口是 `make test-diff-abi-riscv`（新增22条 statx、总1366条）、
+`make test-root-loongarch`（原 musl 与 BusyBox），并保留 `make test-files-riscv`。
+固定依据为 `references/linux` commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`
+的 `fs/stat.c`、`include/uapi/linux/stat.h`，以及固定 musl1.2.5 归档的
+`src/stat/fstatat.c` 和 `arch/loongarch64/bits/syscall.h.in`。
