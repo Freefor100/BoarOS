@@ -19,6 +19,8 @@
 #include <kernel/uaccess.h>
 #include <kernel/vfs.h>
 #include <string.h>
+#include "../../fs/vfs_internal.h"
+#include "lwip/memp.h"
 
 #define USER UINT64_C(0x10000)
 #define BUFFER UINT64_C(0x100000)
@@ -40,6 +42,44 @@ enum kernel_uaccess_status __wrap_kernel_copy_from_user(struct kernel_mm *mm, vo
 #endif
     return status;
 }
+
+static unsigned cache_io_probe, cache_reads, cache_writes;
+static uint64_t cache_last_offset;
+int __real_kernel_vfs_node_pread(struct kernel_vfs_node *, uint64_t, void *, size_t, size_t *);
+int __wrap_kernel_vfs_node_pread(struct kernel_vfs_node *node, uint64_t offset, void *buffer, size_t size, size_t *done)
+{
+    if (cache_io_probe) cache_reads++;
+    return __real_kernel_vfs_node_pread(node, offset, buffer, size, done);
+}
+int __real_kernel_vfs_node_writeback(struct kernel_vfs_node *, uint64_t, const void *, size_t, size_t *);
+int __wrap_kernel_vfs_node_writeback(struct kernel_vfs_node *node, uint64_t offset, const void *buffer, size_t size, size_t *done)
+{
+    if (cache_io_probe) {
+        if (cache_writes && offset <= cache_last_offset) __builtin_trap();
+        cache_last_offset = offset; cache_writes++;
+    }
+    return __real_kernel_vfs_node_writeback(node, offset, buffer, size, done);
+}
+
+static unsigned freeze_lwip_clock;
+static uint32_t frozen_lwip_ms;
+uint32_t __real_sys_now(void);
+uint32_t __wrap_sys_now(void)
+{ return freeze_lwip_clock ? frozen_lwip_ms : __real_sys_now(); }
+static unsigned polling_snapshot, snapshot_protocol_calls;
+struct netif;
+void __real_netif_poll_all(void);
+void __wrap_netif_poll_all(void)
+{ if (polling_snapshot) snapshot_protocol_calls++; __real_netif_poll_all(); }
+void __real_sys_check_timeouts(void);
+void __wrap_sys_check_timeouts(void)
+{ if (polling_snapshot) snapshot_protocol_calls++; __real_sys_check_timeouts(); }
+unsigned __real_netif_poll_budget(struct netif *, unsigned);
+unsigned __wrap_netif_poll_budget(struct netif *netif, unsigned budget)
+{ if (polling_snapshot) snapshot_protocol_calls++; return __real_netif_poll_budget(netif, budget); }
+unsigned __real_sys_check_timeouts_budget(unsigned);
+unsigned __wrap_sys_check_timeouts_budget(unsigned budget)
+{ if (polling_snapshot) snapshot_protocol_calls++; return __real_sys_check_timeouts_budget(budget); }
 
 /* This boot fixture has no scheduled tasks. Reject any attempted blocking;
  * only an empty socket queue's notification may be ignored. */
@@ -93,6 +133,112 @@ static void number(const char *label, uint64_t value)
 {
     virt_uart_puts(label); virt_uart_put_hex(value); virt_uart_putc('\n');
 }
+static void cache_range_cost(struct kernel_vfs_mount *mount, struct kernel_page_cache *cache)
+{
+    struct kernel_vfs_file file = {0};
+    static unsigned char bytes[4096], output[4096];
+    unsigned pages = BOAROS_COST_DIAGNOSTICS ? 16384 : 256;
+    size_t count; uint64_t observed = 0;
+    memset(bytes, 0x31, sizeof(bytes));
+    check(kernel_vfs_create(mount, "/cache-cost", 0600, &file) == 0, 250);
+    /* 范围索引的规模用真实缓存的稀疏零页建立，避免准备阶段逐页同步64MiB。
+     * 第0页仍先写入并同步真实旧内容，再测冷页完整覆盖。 */
+    check(kernel_vfs_ftruncate(&file, (uint64_t)pages * 4096) == 0 &&
+          kernel_vfs_pwrite(&file, 0, bytes, 4096, &count) == 0 && count == 4096, 251);
+    check(kernel_vfs_sync(&file, 0, &observed) == 0 &&
+          kernel_page_cache_invalidate_node(cache, kernel_vfs_file_node(&file)) == KERNEL_PAGE_CACHE_STATUS_OK, 252);
+    memset(bytes, 0x52, sizeof(bytes));
+    cache_reads = cache_writes = 0; cache_io_probe = 1;
+    check(kernel_vfs_pwrite(&file, 0, bytes, 4096, &count) == 0 && count == 4096, 253);
+    cache_io_probe = 0;
+    number("cache full-overwrite backend reads: ", cache_reads);
+    check(!cache_reads && kernel_vfs_sync(&file, 0, &observed) == 0 &&
+          kernel_page_cache_invalidate_node(cache, kernel_vfs_file_node(&file)) == KERNEL_PAGE_CACHE_STATUS_OK, 254);
+    cache_reads = cache_writes = 0; cache_io_probe = 1;
+    unsigned char value = 0x73;
+    check(kernel_vfs_pwrite(&file, 17, &value, 1, &count) == 0 && count == 1, 255);
+    cache_io_probe = 0;
+    check(cache_reads == 1 && kernel_vfs_pread(&file, 0, output, 4096, &count) == 0 && count == 4096, 256);
+    bytes[17] = value; check(!memcmp(bytes, output, 4096), 257);
+    check(kernel_vfs_sync(&file, 0, &observed) == 0, 258);
+    /* 保留整个inode的干净页，再只改一个字节；选区不能遍历其余页。 */
+    struct kernel_page_cache_statistics before, after;
+    kernel_page_cache_get_statistics(cache, &before);
+    for (unsigned i = 1; i < pages; i++)
+        check(kernel_vfs_pread(&file, (uint64_t)i * 4096, output, 4096, &count) == 0 && count == 4096, 259);
+    kernel_page_cache_get_statistics(cache, &after);
+    check(after.current_pages >= before.current_pages + pages - 1, 274);
+    check(kernel_vfs_pwrite(&file, 3 * 4096 + 19, &value, 1, &count) == 0 && count == 1, 260);
+#if BOAROS_COST_DIAGNOSTICS
+    check(kernel_cost_begin(6, cost_frequency, 1, 0) == 0, 261);
+#endif
+    cache_reads = cache_writes = 0; cache_io_probe = 1;
+    check(kernel_page_cache_writeback_range(cache, kernel_vfs_file_node(&file), 3 * 4096, 4 * 4096) == 0, 262);
+    cache_io_probe = 0; check(cache_writes == 1 && !cache_reads, 263);
+#if BOAROS_COST_DIAGNOSTICS
+    uint64_t visits, snapshot;
+    check(kernel_cost_end(6, 0) == 0 && kernel_cost_read(0, COST_WRITEBACK_VISITS, &visits) == 0 &&
+          visits <= 2 && kernel_cost_read(0, COST_SNAPSHOT_COPY, &snapshot) == 0 && snapshot == 1, 264);
+    number("cache small-range visits: ", visits); number("cache one-byte snapshot: ", snapshot);
+#endif
+    unsigned indices[] = {200, 3, 100};
+    for (unsigned i = 0; i < 3; i++)
+        check(kernel_vfs_pwrite(&file, (uint64_t)indices[i] * 4096 + 29, &value, 1, &count) == 0 && count == 1, 265);
+#if BOAROS_COST_DIAGNOSTICS
+    check(kernel_cost_begin(7, cost_frequency, 1, 0) == 0, 266);
+#endif
+    cache_reads = cache_writes = 0; cache_io_probe = 1;
+    check(kernel_page_cache_writeback(cache, kernel_vfs_file_node(&file)) == 0, 267);
+    cache_io_probe = 0; check(cache_writes == 3 && !cache_reads, 268);
+#if BOAROS_COST_DIAGNOSTICS
+    check(kernel_cost_end(7, 0) == 0 && kernel_cost_read(0, COST_WRITEBACK_VISITS, &visits) == 0 &&
+          visits <= 6 && kernel_cost_read(0, COST_SNAPSHOT_COPY, &snapshot) == 0 && snapshot == 3, 269);
+    number("cache sparse-dirty visits: ", visits);
+#endif
+    for (unsigned i = 64; i < 80; i++)
+        check(kernel_vfs_pwrite(&file, (uint64_t)i * 4096 + 37, &value, 1, &count) == 0 && count == 1, 275);
+#if BOAROS_COST_DIAGNOSTICS
+    check(kernel_cost_begin(8, cost_frequency, 1, 0) == 0, 276);
+#endif
+    cache_reads = cache_writes = 0; cache_io_probe = 1;
+    check(kernel_page_cache_writeback_range(cache, kernel_vfs_file_node(&file), 70 * 4096, 71 * 4096) == 0, 277);
+    cache_io_probe = 0; check(cache_writes == 1, 278);
+#if BOAROS_COST_DIAGNOSTICS
+    check(kernel_cost_end(8, 0) == 0 && kernel_cost_read(0, COST_WRITEBACK_VISITS, &visits) == 0 &&
+          visits == 1 && kernel_cost_read(0, COST_SNAPSHOT_COPY, &snapshot) == 0 && snapshot == 1, 279);
+    number("cache selected hash visits among 16 dirty: ", visits);
+#endif
+    cache_reads = cache_writes = 0; cache_io_probe = 1;
+    check(kernel_page_cache_writeback(cache, kernel_vfs_file_node(&file)) == 0, 280);
+    cache_io_probe = 0; check(cache_writes == 15, 281);
+    check(kernel_vfs_sync(&file, 0, &observed) == 0 &&
+          kernel_page_cache_invalidate_node(cache, kernel_vfs_file_node(&file)) == KERNEL_PAGE_CACHE_STATUS_OK, 270);
+    for (unsigned i = 0; i < 3; i++) {
+        check(kernel_vfs_pread(&file, (uint64_t)indices[i] * 4096, output, 4096, &count) == 0 && count == 4096, 271);
+        for (unsigned j = 0; j < 4096; j++) check(output[j] == ((j == 29 || (indices[i] == 3 && j == 19)) ? value : 0), 272);
+    }
+    for (unsigned i = 64; i < 80; i++) {
+        check(kernel_vfs_pread(&file, (uint64_t)i * 4096, output, 4096, &count) == 0 && count == 4096, 282);
+        for (unsigned j = 0; j < 4096; j++) check(output[j] == (j == 37 ? value : 0), 283);
+    }
+    /* 连续全脏范围按候选窗口交接；独立 wrapper 验证未退回逐页入口。 */
+    memset(bytes, 0x49, sizeof(bytes));
+    for (unsigned i = 32; i < 40; i++)
+        check(kernel_vfs_pwrite(&file, (uint64_t)i * 4096, bytes, sizeof(bytes), &count) == 0 && count == sizeof(bytes), 284);
+    cache_reads = cache_writes = 0; cache_io_probe = 1;
+    check(kernel_page_cache_writeback_range(cache, kernel_vfs_file_node(&file), 32 * 4096, 40 * 4096) == 0, 285);
+    cache_io_probe = 0;
+    check(!cache_reads && cache_writes == 8 / BOAROS_PAGE_CACHE_WRITEBACK_PAGES, 286);
+    number("cache contiguous writeback calls: ", cache_writes);
+    check(kernel_vfs_sync(&file, 1, &observed) == 0 &&
+          kernel_page_cache_invalidate_node(cache, kernel_vfs_file_node(&file)) == KERNEL_PAGE_CACHE_STATUS_OK, 287);
+    for (unsigned i = 32; i < 40; i++)
+        check(kernel_vfs_pread(&file, (uint64_t)i * 4096, output, sizeof(output), &count) == 0 &&
+              count == sizeof(output) && !memcmp(bytes, output, sizeof(bytes)), 288);
+    check(kernel_vfs_unlink(mount, "/cache-cost") == 0 && kernel_vfs_close(&file) == 0, 273);
+    number("cache retained pages tested: ", pages);
+}
+
 static void tcp_cost(struct kernel_files *files, struct kernel_mm *mm)
 {
     int64_t listener_fd, client_fd, result;
@@ -111,6 +257,26 @@ static void tcp_cost(struct kernel_files *files, struct kernel_mm *mm)
           kernel_socket_listen(server_socket, 1) == 0 &&
           (remote.port = address.port, kernel_socket_connect(client_socket, &remote, 0)) == 0 &&
           kernel_socket_accept(server_socket, &accepted) == 0, 31);
+    struct kernel_socket *idle[16] = {0};
+    for (unsigned i = 0; i < 16; i++)
+        check(kernel_socket_create(files->heap, KERNEL_SOCKET_AF_INET, 1, &idle[i]) == 0, 222);
+#if BOAROS_COST_DIAGNOSTICS
+    check(kernel_cost_begin(4, cost_frequency, 1, 0) == 0, 236);
+#endif
+    polling_snapshot = 1;
+    for (unsigned i = 0; i < 64; i++)
+        check((kernel_socket_poll(client_socket, 0) & KERNEL_POLLOUT) != 0, 220);
+    polling_snapshot = 0;
+#if BOAROS_COST_DIAGNOSTICS
+    uint64_t polls, services, scans;
+    check(kernel_cost_end(4, 0) == 0 &&
+          kernel_cost_read(0, COST_NETWORK_POLL_CALLS, &polls) == 0 && polls == 64 &&
+          kernel_cost_read(0, COST_NETWORK_POLL_SERVICES, &services) == 0 && services == 0 &&
+          kernel_cost_read(0, COST_NETWORK_GLOBAL_SCANS, &scans) == 0 && scans == 0, 237);
+#endif
+    number("poll protocol calls: ", snapshot_protocol_calls);
+    check(snapshot_protocol_calls == 0, 221);
+    for (unsigned i = 0; i < 16; i++) kernel_socket_destroy(idle[i]);
     struct kernel_socket_statistics before, after;
     kernel_socket_get_statistics(&before);
     uint64_t resolutions = kernel_uaccess_page_resolutions();
@@ -130,6 +296,79 @@ static void tcp_cost(struct kernel_files *files, struct kernel_mm *mm)
         int got=kernel_socket_reserve_read(accepted,0,&request,&reader,sizeof(payload),0);
         check(got>0,202);kernel_socket_finish_read(&request,0);consumed+=(uint32_t)got;
     }
+    struct kernel_socket_write_request reservation = {0}, competing = {0};
+    struct kernel_open_file_description *second_pin = client;
+    check(kernel_open_file_acquire(second_pin) == KERNEL_OPEN_FILE_STATUS_OK, 240);
+    kernel_socket_stream_begin(&reservation, &client);
+    int reserved = kernel_socket_stream_reserve(&reservation, UINT16_MAX, 0);
+    check(reserved > 0 && !client && !(kernel_socket_poll(client_socket, 0) & KERNEL_POLLOUT), 241);
+    kernel_socket_stream_begin(&competing, &second_pin);
+    check(kernel_socket_stream_reserve(&competing, 1, 0) == -KERNEL_EAGAIN, 242);
+    resolutions = kernel_uaccess_page_resolutions();
+#if BOAROS_COST_DIAGNOSTICS
+    check(kernel_cost_begin(5, cost_frequency, 1, 0) == 0, 243);
+#endif
+    check(kernel_files_write(files, mm, client_fd, BUFFER, 4096, &result) == KERNEL_FILES_STATUS_OK &&
+          result == -KERNEL_EAGAIN && kernel_uaccess_page_resolutions() == resolutions, 244);
+#if BOAROS_COST_DIAGNOSTICS
+    uint64_t denied, copied_blocked, copied_stream;
+    check(kernel_cost_end(5, 0) == 0 &&
+          kernel_cost_read(0, COST_STREAM_ADMIT_BLOCKED, &denied) == 0 && denied == 1 &&
+          kernel_cost_read(0, COST_STREAM_COPY_BLOCKED_BYTES, &copied_blocked) == 0 && !copied_blocked &&
+          kernel_cost_read(0, COST_STREAM_COPY, &copied_stream) == 0 && !copied_stream, 245);
+#endif
+    kernel_socket_stream_cancel(&reservation);
+    check(kernel_socket_stream_reserve(&competing, 3, 0) == 3, 246);
+    /* 故障/退出走同一个abort；其他请求随后必须重新拿到这份接纳量。 */
+    kernel_socket_abort_write(&competing);
+    check(kernel_socket_stream_reserve(&reservation, (uint32_t)reserved, 0) == reserved, 247);
+    kernel_socket_stream_finish(&reservation);
+    check(client && kernel_socket_poll(client_socket, 0) & KERNEL_POLLOUT, 248);
+    virt_uart_puts("TCP admission: competing reservations, cancel and zero-copy EAGAIN passed\n");
+    uintptr_t core = kernel_socket_protocol_enter();
+    check(kernel_socket_write_buffer(client_socket, "batch", 5, 0) == 5, 223);
+    kernel_socket_protocol_leave(core);
+    check(!(kernel_socket_poll(accepted, 0) & KERNEL_POLLIN), 224);
+    struct kernel_socket_service_result service = kernel_socket_service_pending(
+        (struct kernel_socket_service_budget){0, 0, 0});
+    check(!service.sockets && !service.packets && !service.timers && service.runnable, 225);
+    unsigned rounds = 0;
+    do {
+        service = kernel_socket_service_pending((struct kernel_socket_service_budget){1, 1, 0});
+        check(service.sockets <= 1 && service.packets <= 1 && !service.timers && ++rounds < 64, 226);
+    } while (service.runnable);
+    struct kernel_socket_read_request budget_read = {0};
+    char budget_bytes[5];
+    check(kernel_socket_reserve_read(accepted, 0, &budget_read, &reader, 5, 0) == 5, 227);
+    kernel_socket_copy_read(&budget_read, 0, budget_bytes, 5);
+    check(!memcmp(budget_bytes, "batch", 5), 228);
+    kernel_socket_finish_read(&budget_read, 0);
+    static void *held_segments[MEMP_NUM_TCP_SEG];
+    unsigned held = 0;
+    core = kernel_socket_protocol_enter();
+    while (held < MEMP_NUM_TCP_SEG && (held_segments[held] = memp_malloc(MEMP_TCP_SEG))) held++;
+    check(held > 1 && !memp_malloc(MEMP_TCP_SEG), 229);
+    frozen_lwip_ms = __real_sys_now(); freeze_lwip_clock = 1;
+    memp_free(MEMP_TCP_SEG, held_segments[--held]);
+    check(kernel_socket_write_buffer(client_socket, payload, 2 * TCP_MSS, 0) == -KERNEL_EAGAIN &&
+          !(kernel_socket_poll(client_socket, 0) & KERNEL_POLLOUT), 230);
+    memp_free(MEMP_TCP_SEG, held_segments[--held]);
+    kernel_socket_protocol_leave(core);
+    /* 不推进任何timer；归还事件必须直接恢复真正的池等待者。 */
+    service = kernel_socket_service_pending((struct kernel_socket_service_budget){8, 0, 0});
+    check(!service.timers && !service.packets, 231);
+    check(kernel_socket_poll(client_socket, 0) & KERNEL_POLLOUT, 232);
+    freeze_lwip_clock = 0;
+    core = kernel_socket_protocol_enter();
+    while (held) memp_free(MEMP_TCP_SEG, held_segments[--held]);
+    kernel_socket_protocol_leave(core);
+    check(kernel_socket_write_buffer(client_socket, "pool", 4, 0) == 4, 233);
+    budget_read = (struct kernel_socket_read_request){0};
+    check(kernel_socket_reserve_read(accepted, 0, &budget_read, &reader, 4, 0) == 4, 234);
+    kernel_socket_copy_read(&budget_read, 0, budget_bytes, 4);
+    check(!memcmp(budget_bytes, "pool", 4), 235);
+    kernel_socket_finish_read(&budget_read, 0);
+    virt_uart_puts("protocol budget and capacity progress passed\n");
     /* 强制协议保留一次未接纳的 pbuf；IRQ 重试不能重入被中断的堆分配。 */
     fail_packet=1;
     check(kernel_socket_write_buffer(client_socket,"retry",5,0)==5 && fail_packet==0,203);
@@ -548,6 +787,45 @@ static struct riscv_mm_statistics mapped_cost(struct kernel_files *files,
     return after;
 }
 
+#if BOAROS_COST_DIAGNOSTICS
+static unsigned char growth_payload[65536];
+static void growth_cost(struct kernel_vfs_mount *mount, struct kernel_page_cache *cache)
+{
+    struct kernel_vfs_file file = {0};
+    check(kernel_vfs_create(mount, "/growth", 0600, &file) == 0, 210);
+    for (unsigned i = 0; i < sizeof(growth_payload); i++) growth_payload[i] = (unsigned char)(i * 19 + 7);
+    const unsigned chunks[] = {4096, 1024, 65536};
+    for (uint64_t size = MIB; size <= 64 * MIB; size *= 4) {
+        for (unsigned c = 0; c < 3; c++) {
+            check(kernel_vfs_ftruncate(&file, 0) == 0, 211);
+            check(kernel_cost_begin(3, cost_frequency, 1, 0) == 0, 212);
+            for (uint64_t offset = 0; offset < size; offset += chunks[c]) {
+                size_t written = 0;
+                check(kernel_vfs_pwrite(&file, offset, growth_payload, chunks[c], &written) == 0 && written == chunks[c], 213);
+            }
+            check(kernel_cost_end(3, 0) == 0, 214);
+            uint64_t visits, tails;
+            check(kernel_cost_read(0, COST_RESIZE_VISITS, &visits) == 0 &&
+                  kernel_cost_read(0, COST_RESIZE_TAIL_PAGES, &tails) == 0, 215);
+            number("growth bytes: ", size); number("growth chunk: ", chunks[c]);
+            number("growth visits: ", visits); number("growth tail pages: ", tails);
+            uint64_t needed = chunks[c] == 1024 ? size / 4096 * 3 : 0;
+            check(visits <= needed && tails == needed, 216);
+            struct kernel_page_cache_statistics stats;
+            kernel_page_cache_get_statistics(cache, &stats);
+            check(stats.current_pages >= size / 4096, 217);
+            for (uint64_t offset = 0; offset < size; offset += 4096) {
+                size_t read = 0;
+                check(kernel_vfs_pread(&file, offset, payload, sizeof(payload), &read) == 0 && read == sizeof(payload) &&
+                      !memcmp(payload, growth_payload, sizeof(payload)), 218);
+            }
+        }
+    }
+    check(kernel_vfs_ftruncate(&file, 0) == 0 && kernel_vfs_close(&file) == 0 &&
+          kernel_vfs_unlink(mount, "/growth") == 0, 219);
+}
+#endif
+
 void kernel_main(unsigned long hart, const void *dtb)
 {
     (void)hart;
@@ -647,6 +925,10 @@ void kernel_main(unsigned long hart, const void *dtb)
     fail_page = 1;
     check(kernel_files_pwrite(&files, &mm, fd, BUFFER, 4096, 0, &result) == KERNEL_FILES_STATUS_OK &&
           result == -KERNEL_ENOMEM && fail_page == 0, 14);
+#if BOAROS_COST_DIAGNOSTICS
+    growth_cost(&mount, &cache);
+#endif
+    cache_range_cost(&mount, &cache);
     tcp_cost(&files, &mm);
     udp_buffer_oom(&files, &mm);
     socketpair_scale(&files, &mm);

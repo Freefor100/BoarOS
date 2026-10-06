@@ -58,7 +58,7 @@ make prune-build
 
 PR CI 加入规模、SQLite DELETE/WAL 和离线 GCC 入口。SQLite/musl 源按固定清单恢复，Alpine 工具链由 runner 校验固定输入；缺失或校验失败不能跳过报绿。恢复 CI 独立支持手动与每周一北京时间 02:00（UTC 周日 18:00），显式 bash pipefail 保留 make 的失败状态，失败产物上传。Linux 缓存由身份键定位，runner 仍检查输入。工作流已做本地解析与对应入口验证，尚未执行托管 GitHub Actions。glibc 仍是固定本机输入的严格本地验收，可移植供应另列待办。
 
-本次规模阶段当时未包含可睡眠 I/O、后台写回或多盘；这些机制现已在后续阶段交付，见[可睡眠存储](sleepable-storage.md)及[VFS/ext4](../modules/vfs-ext4.md)。范围写回索引、事务合并、共享文件 futex、SMP 和第二架构仍未交付；后续优先顺序只在[路线](../goals.md)维护。
+本次规模阶段当时未包含可睡眠 I/O、后台写回或多盘；这些机制现已在后续阶段交付，见[可睡眠存储](sleepable-storage.md)及[VFS/ext4](../modules/vfs-ext4.md)。范围写回索引与事务合并也已在后续阶段交付；共享文件 futex、SMP 和第二架构仍未交付；后续优先顺序只在[路线](../goals.md)维护。
 
 AF_UNIX DGRAM 的成本边界为每条消息最多 64 KiB 连续暂存与一次队列提交，不把用户页或 iovec 当作消息边界。零消息收一字节预算，截断接收和 fault 丢弃返还整包预算；否则只返还复制字节会在重复短接收后泄漏队列容量。`make test-scale-riscv` 覆盖两处分配 OOM、100 条零消息、满队列、重复截断和接收 fault；`make test-userland-riscv` 用真实 pthread 验证尚有少量 POLLOUT 空间时写者仍等待整条预算，并检查取消不发布消息。这里验证语义和内存上界，没有吞吐测量结论。
 
@@ -82,3 +82,238 @@ AF_UNIX DGRAM 的成本边界为每条消息最多 64 KiB 连续暂存与一次�
 
 2026-09-30 的最终 C0–C6 测量、观测扰动、消费者阻塞及优化候选见[成本基线](cost-baseline.md)，
 该页保留结果与重建命令，原消费者输出由执行器生成。这是主线成本诊断，未重跑评测分支原judge。
+
+## 追加增长规模门禁（2026-10-05）
+
+基线 `5687377` 每个增长片段都会从 inode 缓存页链头部扫描。直接在旧循环加入
+默认关闭的 COST 计数后，真实 RV64 1 MiB/4 KiB 追加得到 32896 次访问、0 次尾页处理，
+新增门禁因此失败。固定文件大小而只计 usercopy 分块无法发现这个问题。
+
+增长改为旧 EOF 非页对齐时的一次哈希查询；缩小仍走独立范围撤销。
+`make test-cache-growth-riscv` 使用真实 VFS/页缓存、128 MiB 受管池和 QEMU 11.1.1，
+每组确认全部文件页仍驻留并逐页核对内容，结果如下：
+
+| 文件大小 | 4 KiB/64 KiB 请求的增长访问 | 1 KiB 请求的增长访问/尾页数 |
+|---|---:|---:|
+| 1 MiB | 0 | 768 / 768 |
+| 4 MiB | 0 | 3072 / 3072 |
+| 16 MiB | 0 | 12288 / 12288 |
+| 64 MiB | 0 | 49152 / 49152 |
+
+此表是算法成本，不是吞吐。4 KiB/64 KiB 追加不需要旧尾页；1 KiB 每页三次尾部增长，
+总工作随页数线性增加。哈希扩容/探测和实际别名数量另计，不宣称任意冲突及任意别名下
+严格常数耗时。真实 VFS、文件、部分写、静态 musl/动态 pthread 回归通过，包含
+稀疏洞、截断再增长与私有 COW 尾页；COST 宿主和旧 schema 解析测试通过。
+
+
+## 冷页覆盖与脏范围（2026-10-06）
+
+冷页完整覆盖的生产函数反例先在旧实现运行：已存在且已同步的页被缓存失效后覆盖，
+`kernel_vfs_node_pread` 包装计数为 1，触发门禁；当前为 0。稳定内核输入完整覆盖
+才走新路径，loading 保留至初始化、脏组织和长度更新完成；部分页仍读取旧内容，
+1 字节覆盖后检查其余 4095 字节未变。省去的是页缓存层预读，不是 ext4 的必要 undo、
+块内合并和元数据读取。
+
+每个 inode 保留全页链用于失效，另有脏页链与计数。首次标脏、共享映射变脏、写回、
+再次变脏、截断和回收走同一索引维护；索引自身不持额外页引用。范围写回按页数/脏页数
+选择较小集合，在不可睡眠的捕获区间分配并 pin，之后排序和 I/O 可以等待。
+完整写回且代次相同才摘脏链，旧写回不清除新修改。快照页仍独立持有，只复制需要的区间。
+
+`tests/riscv/scale_main.c` 的普通构建测试 1 MiB，COST 构建保留 64 MiB / 16384 页，
+统计确认这些页没有被回收。范围规模使用真实缓存的稀疏零页，冷页覆盖另有第 0 页
+真实已同步内容。它不是密集文件吞吐测量。最初把 64 MiB 全部写入后逐页同步的准备
+放入 120 秒 fixture，超时盘上已推进至 18,759,680 字节；改为与范围索引契约直接相关的
+稀疏准备，并让 runner 在后续超时时保存已捕获输出。没有将原超时算作通过。
+
+| 已测操作 | 候选访问 | 快照复制 | 其他约束 |
+|---|---:|---:|---|
+| 16384 个常驻页中，一个脏页的页范围 | 1 | 1 字节 | 其余缓存页不扫描 |
+| 整文件中仅 3 个脏页 | 3 | 3 字节 | 实际后端提交按偏移递增 |
+| 16 个脏页中同步一个页范围 | 1 | 1 字节 | 剩余 15 页仍脏，之后全部写回 |
+
+VFS、文件、部分写、共享/private mmap、1/4/16/64 MiB 增长、真实 userland、COST 和
+栈门禁通过；四组 io-sleep 保留并发加载/写回、快照不变、映射再脏、inode owner 与错误回收。
+生产内核 SHA-256 `56970dc9d644c26b42f37d903bd7be4805f93bb4571a9888d89c3923b98d2440`，
+QEMU 11.1.1。完整 lwext4 恢复宿主目标通过，SQLite 3.53.4 原生 Unix VFS 的
+DELETE/WAL EXTRA/FULL、热日志、已确认提交及两次重启完整性通过：
+
+| SQLite 模式 | 断电切点 none/odd/reverse | WRITE 候选 / 实际注入 | FLUSH 候选 / 实际注入 |
+|---|---|---:|---:|
+| DELETE | 57 / 55 / 60（172 次） | 40 / 38 | 20 / 19 |
+| WAL | 28 / 28 / 26（82 次） | 18 / 16 | 10 / 10 |
+
+DELETE 的 WRITE 36/38、FLUSH 20，以及 WAL 的 WRITE 17/18 在对应执行中未达到
+注入序号，runner 明确记作已提交后的切断与重启检查；不能算真实故障注入通过。
+切点由各自运行日志测得，不借用历史 441 次矩阵的包络。恢复用相同程序 SHA-256
+`510fc4c7b8e72a2224603b053bc9d5967f295e20a5085500038a4dd4936436f5`，
+NBD server 为 `22a8c979a85a153c28c7b7fdeac7aa73f06d440b44c5e90cda7590db8dd452ab`。
+这些是该阶段的正确性和成本结果；后续综合改动的匹配吞吐另见[预算报告](data-path-budget-experiments.md)，不能把两层证据混为一次测量。
+
+```sh
+make all test-scale-riscv test-cache-growth-riscv
+make test-vfs-riscv test-files-riscv test-files-partial-write-riscv
+make test-io-sleep-riscv test-userland-riscv test-stack-usage
+make test-lwext4-host test-lwext4-recovery-host
+make test-sqlite-recovery-matrix-riscv test-sqlite-wal-recovery-matrix-riscv
+```
+
+
+## 八请求批量读的设备边界（2026-10-06）
+
+`kernel_block_read_batch` 在既有八槽容量内增加读发布/收割分离，不扩队列。
+旧回退路径的实际驱动探针 max-inflight=1，等待八项的门禁超时；当前为 8。
+宿主实际驱动覆盖 legacy/modern × 七种完成模式，包括单项错误、另一项仍在途、
+超时 reset 与跨扇区失败的 505 字节成功前缀；ASan/UBSan 通过。真实 QEMU 11.1.1
+四种 transport/cache 组合均在释放前收到八个 NBD READ，反序释放七个后仍保留
+最后一个 DMA owner，取消/唤醒不能提前返回，全部完成后逐字节核对输出。
+顺序设备回退、全参数预检与可写目标重叠拒绝由通用块宿主测试覆盖。
+
+```sh
+make test-block-host test-block-riscv
+python3 -B tests/host/virtio_block_diagnostics.py
+make test-io-sleep-riscv
+```
+
+这是底层并发和生命周期验收，既不表示 ext4 已用批量读，也不是预读吞吐收益。
+VFS/ext4/页缓存接入、预读和连续写回随后已独立交付，见本页后文和最终预算报告。
+
+
+## ext4 缓存版本内的批量读（2026-10-06）
+
+新增内部 `kernel_vfs_node_pread_batch` 与 lwext4 `ext4_fpread_batch`，保持 caller 的
+inode/read owner，无共享 file offset 副作用。固定输入为仓库中的 lwext4
+`58bcf89a121b72d4fb66334f1693d3b30e4cb9c5` 加已记录本地补丁；不绕过 bcache 读取
+journal pending 的磁盘旧版本。本批的新 loading 先发布并完成，再等其他批次的
+loading；单块失败只释放对应引用，其他项保留独立结果。
+
+旧标量 `ext4_fpread` 对照在同一 fixture 中得到 width=0、batch calls=0，新门禁失败。
+当前 8 个 4 KiB 页在 1/4/8 KiB ext4 上分别得到 4×8、1×8、1×4 个物理块请求批次；
+8 KiB 情形同块双页只加载一次。extent 与传统映射共六组合通过，检查洞、EOF、
+非对齐片段、首个失败块前的 17 字节成功前缀、其他 span 完成、失败后重试与
+journal pending 缓存的新内容；ASan/UBSan 通过。实际 bcache 模型另覆盖重叠加载、
+重复块、16 个分配失败位置的引用回收，以及无批量设备的标量回退。
+
+真实 `test-io-sleep-riscv` 使用八页 `/batch-data`，同一次 VFS batch 在任何响应释放
+前产生八个 NBD READ。四个 legacy/modern × writeback/writethrough 组合全部通过，
+先释放七个仍保持最后一个 DMA owner，之后检查全部页内容、完成量与最终无在途。
+本轮 fixture 内核 SHA-256 为
+`681421ab44460fec278a3a813fb9ce5679e376d34491443f7a4418cd26332b70`，QEMU 11.1.1。
+该证据到当时的 VFS 内部接口为止；普通 demand read 的页缓存预读调度随后接入，吞吐结果另记于最终预算报告。
+
+```sh
+make test-lwext4-cache-host test-lwext4-batch-read-host test-lwext4-host
+BATCH_TEST_CFLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer' sh tests/lwext4-batch-read-host.sh
+make test-io-sleep-riscv
+```
+
+
+## 连续写回验收中发现的深层 extent 截断失败（2026-10-06）
+
+追加后台写回的重复截断夹具在第二次 `ftruncate(0)` 返回 `EUCLEAN`，同步本身成功。
+完整 `e879345c958f5d1f938e4ace557eadb8cff44e21` 生产树经 `git archive` 独立编译、
+只加入夹具，在 1 KiB ext4/16 MiB 受管池/QEMU 11.1.1 下同样失败；不是新增写回
+合批产生的回归。旧内核 SHA-256 为
+`21d1d601d346c88ff5b5e4c6ef1b951d725b33ad7ed5bb9aa7bd12afa10d2053`，夹具 SHA-256 为
+`7ee0152c703a6d02b1d5bd64496029906618a40bc9543d54e729e2b3b7344e83`。
+
+实际错误来自深度至少 2 的 extent 树：删除叶节点后，上移路径直接释放已修改的
+内部索引块，跳过 `ext4_ext_drop_refs` 中的 checksum 更新；随后清空的块引用又让
+最终统一释放无法补做。诊断捕获同一内部块 0x12fe 在释放前已脏、校验和过期，
+下一轮 `ext4_extent_last_block` 的读取校验返回 117。将该释放点改回既有 drop_refs
+流程后，原 RV64 重复截断和读回通过，没有删除触发步骤。
+
+新增宿主门禁构造实际 depth>=2 的稀疏 extent 树，部分截断后独立进程重启核对数据，
+再截零并检查 e2fsck；1/4 KiB 两种块大小均先在旧实现失败、修复后通过。
+格式依据是 `references/linux/Documentation/filesystems/ext4/ifork.rst`，固定 commit
+`f4cdf7ca9a1fdcca413157df19753f388a5a224e`；`make test-lwext4-deep-truncate-host` 可重建。
+该门禁验证深层索引修改与 checksum，并不替代完整断电恢复矩阵。
+
+
+## 连续写回的有界候选（2026-10-06）
+
+`BOAROS_PAGE_CACHE_WRITEBACK_PAGES` 提供 1/2/4/8 页候选，生产默认 1。
+范围写回和阈值 worker 共用连续稳定快照；只合并同 inode 相接的脏字节，不扩写
+中间干净范围。每页独立捕获 generation/别名/等待者；后端整批完整接受且该页未再脏
+才清除它。前台高阶分配失败在提交前退回单页；后台预留可逐级降到 4 KiB。
+同一轮 worker 的邻页哈希查询计入原有 64 次候选预算，哈希冲突另外统计。
+
+一次 `ext4_fpwrite` 保留整请求预留、私有 undo 与 handle 同步序号；已有 running group
+本来就会合并多次调用。减少页缓存交接数不等于减少同等数量的设备 flush，仍有
+ordered data、log/commit、durable 与 checkpoint 的原屏障；1 KiB ext4 的八个页含
+32 个数据块，不能把八页称为八个物理请求。
+
+旧页缓存在 8 页候选下对 9 页连续脏数据仍发出 9 次交接，新增实际函数门禁失败。
+现代 transport × 1/2/4/8 页 × 1/4 KiB ext4 八组合，以及 legacy × 1/8 页 × 两种块大小
+四组合通过；预算收紧后再次验证 modern 的 1/8 页四组合。结果为：
+
+| 候选页数 | 九页范围的后端调用 | 后台最大稳定快照 | 分配压力下降级 |
+|---:|---:|---:|---:|
+| 1 | 9 | 4 KiB | 4 KiB |
+| 2 | 5 | 8 KiB | 4 KiB |
+| 4 | 3 | 16 KiB | 4 KiB |
+| 8 | 2 | 32 KiB | 4 KiB |
+
+完整夹具包含部分首尾、范围裁剪、脏段间隙、前台 OOM、真实线程再脏、I/O 等待期间
+快照不变、短写/EIO 后保脏、后台停止、重复截断和 e2fsck。8 页配置的原 scale/VFS
+门禁也通过。重复截断新发现的 extent checksum 问题已作为独立修复记录在上一节，
+最终矩阵恢复原触发步骤，未用绕开的夹具结果收口。
+
+```sh
+make test-writeback-batch-riscv
+python3 -B tests/writeback-batch-riscv.py --pages 1 8 --block-size 1024 4096 --transport legacy
+```
+
+这是该阶段的机制与成本验收；随后默认/RA8WB8 的完整恢复与匹配发布吞吐已完成，
+见[最终预算报告](data-path-budget-experiments.md)。结果不用于自动选择新的生产默认值。
+
+
+## 页缓存顺序预读与取消（2026-10-06）
+
+关闭、1/2/4/8 页均可独立构建，生产仍关闭。初始红测在连续读取两页后只有两页
+缓存，8 页候选门禁失败；接入后为 2+窗口 页，逐字节核对随后数据。常规 modern
+窗口×1/4 KiB ext4 共十组合通过；NBD modern 1/2/4/8 与 legacy 1/8 的 4 KiB ext4
+暂扣门禁通过，发布所有窗口 READ 前不释放，先完成反序前缀再暂扣最后一个。
+真实需求读者与 stop/join 调用者均保持等待，最后响应后读取成功，设备 active/inflight
+归零。它验证预读贯穿页缓存、VFS、ext4 与设备，并不以插入缓存的数量冒充吞吐。
+
+审查发现原连续性判断晚于读取完成：冷非顺序 pread 睡眠时，旧排队预测能够先提交。
+新增实际 OFD 冷读门禁先在 test 78 失败；read_begin 提前到 accessed/后端/usercopy
+之前后通过。成功进度仍单独更新。其他用例覆盖 seek、热非顺序读、最后 close、
+单个推测页的 EIO/17 字节前缀被丢弃、无关页及后续重试成功、无写回错误污染、
+低水位撤销、截断新 EOF 和 unlink 后最后关闭。错误为后端边界注入，NBD 所有权
+暂扣为真实设备响应，两层证据分开。
+
+取消按最多八页 VFS 批次接纳：未接纳 job 可以撤销，已接纳调用包含的内部多轮
+块读取完整收口，故 1 KiB ext4 可继续完成同批的最多 32 个块；stop 不再取下一 job。
+这不是逐 DMA 可取消接口。默认构建 VFS/files/partial-write/真实 musl/pthread 回归
+通过，8 页预读+8 页写回的编译栈门禁通过（最大单函数 3152 B）；运行期栈水位和
+完整恢复矩阵继续在最终组合验证记录，不能以单函数门禁证明所有调用链。
+
+```sh
+make test-readahead-riscv
+python3 -B tests/readahead-riscv.py --pages 1 2 4 8 --block-size 4096 --held --transport modern
+python3 -B tests/readahead-riscv.py --pages 1 8 --block-size 4096 --held --transport legacy
+make CFLAGS_EXTRA='-DBOAROS_PAGE_CACHE_READAHEAD_PAGES=8 -DBOAROS_PAGE_CACHE_WRITEBACK_PAGES=8' test-stack-usage
+```
+
+
+## 诊断内存高水位（2026-10-06）
+
+仅用 workload 后的 meminfo 无法报告峰值。COST 构建新增受管分配器高水位，并复用
+heap 已有 peak_pages；二者分别输出初始化以来的最大占用，heap 为子集，不相加。
+峰值不在窗口 begin 清零，明确包含启动与其他内核运行分配，不冒充 workload 独占峰值。
+协议静态数组属于内核映像，不计入受管池峰值；TCP 实验另列静态预算与 lwIP 自身
+高水位。release 编译掉新跟踪；后续已用匹配 release/diagnostic 运行单独测量观察扰动。
+
+初始接线但未更新峰值时，实际 allocator 的 finalize 断言失败；更新后 bootstrap、
+metadata、order-3、满池与释放保持测试通过，既有 COST/allocator 抢占宿主测试通过。
+两次实际网络 mixed 与两次 RA8/WB8 的追加 fsync/冷读诊断烟测成功读出 current/peak，
+均 peak>=current，并解析完整成本快照。这四次仍是功能烟测，不作性能样本。
+
+
+## 综合测量收口（2026-10-06）
+
+[数据路径预算报告](data-path-budget-experiments.md)记录阶段七后 1,218 次发布启动、
+184 次诊断，以及默认/RA8WB8 完整恢复的输入边界。64 MiB 追加的规模收益与 WB8
+在缓存完成中的回退均保留，RA8 冷读收益也不推广为所有读取模式。默认仍 RA0/WB1。
+每连接/文件完成时间、内存 owner、观测开销和失败过的测试协调协议均可在该报告复核。

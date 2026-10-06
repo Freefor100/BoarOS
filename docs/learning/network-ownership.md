@@ -4,7 +4,7 @@
 
 取舍比较过三条路线：自写有限 TCP/UDP 子集能控制所有状态，但协议重传、定时器和互操作验证成本最高；宿主转发可快速启动，但 fd、错误和恢复语义被宿主环境决定；固定成熟 C 栈的 raw API 保留 BoarOS 的 fd/OFD、用户复制、等待、就绪和 errno owner，同时复用已测协议状态机。用户选择第三条，固定官方 lwIP `STABLE-2_2_1_RELEASE` 采用 `NO_SYS` 单 hart 事件驱动。分配 owner 另经用户确认：协议/packet 用静态有界池，BoarOS socket/OFD/队列节点用 kernel_heap，以池计数与 root `heap-live=0` 分别核对。
 
-`NO_SYS` 没有独立网络线程。若服务端已睡在 accept，客户端非阻塞 connect 返回后不再调用 socket，SYN 若只留在 lwIP loopback 队列，服务端会永久睡眠。因此发起 connect 的系统调用必须推进一次 loopback，轮询与定时等待也推进协议。两进程握手测试固定顺序，排除了同进程立即 accept 偶然泵送队列的伪通过。另一条生命周期边界是 TCP `tcp_close` 在已连接状态可能暂保留 FIN/TIME_WAIT PCB；销毁 OFD 前必须先解绑指向 BoarOS 堆对象的回调，host 测试随后推进 200 秒计时并检查静态池回到基线。待 accept 子连接的 reset 也必须在 dequeue 前剔除。
+最初接入时，`NO_SYS` 尚没有内核后台服务（下面记录当时的设计，当前已由文末有界服务取代）。若服务端已睡在 accept，客户端非阻塞 connect 返回后不再调用 socket，SYN 若只留在 lwIP loopback 队列，服务端会永久睡眠。因此发起 connect 的系统调用必须推进一次 loopback，轮询与定时等待也推进协议。两进程握手测试固定顺序，排除了同进程立即 accept 偶然泵送队列的伪通过。另一条生命周期边界是 TCP `tcp_close` 在已连接状态可能暂保留 FIN/TIME_WAIT PCB；销毁 OFD 前必须先解绑指向 BoarOS 堆对象的回调，host 测试随后推进 200 秒计时并检查静态池回到基线。待 accept 子连接的 reset 也必须在 dequeue 前剔除。
 
 固定参考是本地 `references/lwip/` 和导入的 `third_party/lwip/` 同一版本；移植只在 `net/lwip_port/`，不修改上游 core。重建入口与当前能力边界见[网络模块](../modules/kernel-network.md)。外部网卡、命名 AF_UNIX 和 SMP 的 owner/同步仍需要单独验证。
 
@@ -473,3 +473,159 @@ make test-virtio-net-host test-ethernet-worker-host
 make test-network-riscv          # linux/boaros 同一ELF内容合同
 make test-sv39-riscv             # 含镜像VA->PA越界用例
 ```
+
+## 完成归还与发送进展（2026-10-05）
+
+旧 worker 在协议重试后才释放 TX_DONE owner。生产 worker 的边界测试设置
+64个已完成但未归还的槽，旧实现得到 attempts=1/sent=0/held=0，随后睡眠。
+调整为先收割/释放再运行RX及协议，并在最后收割后复核容量代次和RX ready。
+容量代次覆盖SG owner释放和复制发送完成，不能只看SG done链。
+
+`make test-ethernet-worker-host test-virtio-net-host`通过：初始已有完成槽时一轮发送；
+最后service才出现SG或复制完成时两轮发送、一次yield；对端窗口关闭时一轮后睡眠，
+没有发送或yield循环。失败NIC仍推进无关定时器，DMA未停止前不abandon在途owner。
+驱动测试核对两种transport的释放返回值、容量代次和重复释放，保留原有DMA/reset矩阵。
+
+`python3 -B tests/network-external.py --transport both --only boaros`在QEMU11.1.1
+通过实际TAP双向内容、HTTP和清理检查；无NIC的`network-riscv.py --only boaros --workload timer`
+通过。两个TAP运行分别14.523/14.816秒，只有一个副本，属于契约运行时长，
+不是与旧版匹配的吞吐结果。RX八帧仍不约束全部协议成本，有界协议服务是后续独立阶段。
+
+
+## 纯就绪与有界协议服务（2026-10-05）
+
+沿用户确认的短 syscall + 统一后台路线实现，保留单 hart 执行资格与 `tcp_write(COPY)`。
+query 不承担协议执行：64 次 poll、16 个无关 socket 的生产函数规模测试，旧实现的包装器
+记录 128 次协议调用，当前为 0；COST 门禁也要求 poll 服务数和全局 socket 扫描均为 0。
+监听 live 计数由回调维护，失效 child 与 TIME_WAIT 由工作集合回收，查询不消费错误。
+
+独立弱队列区分可运行、NIC、协议池及接收堆等待；socket 销毁前全部解绑。
+每次真实容量释放更新代次，失败者只等待之后的新代次。stock lwIP 的 MEMP_AVAILABLE
+只在空池变为非空时通知；冻结协议时钟、禁用包与 timer 服务后，先释放一个 segment、
+尝试需要两个的写入、再释放第二个，旧通知方式不能恢复可写，新 RELEASED hook 通过。
+回调只发布工作，不能在释放栈中直接再次尝试发送。250 ms 仍是未知资源变化的兜底，
+不把它作为用户 poll/epoll/阻塞 I/O 的额外唤醒期限。
+
+服务分别限制 RX 八帧、loopback 八包、socket 八个单元、一个 timer 回调。
+容量转交、重试期限、实际 socket 工作轮转；三个资源等待集合也轮转。完整 raw 调用
+返回后才检查预算，单个 timer callback 可能处理多个协议对象，预算不是固定 CPU 时间。
+执行资格记录当前 I/O owner 并抑制可能进入块 I/O 的堆回收；用户复制与睡眠不持资格。
+批次之间开放中断并调度；NIC 失败和无 NIC 均继续同一软件服务。关闭窗口的 unsent
+不自动重新排队，睡前重新检查容量、设备 ready 与软件工作，避免无进展忙等。
+
+本地依据 `references/lwip` 2.2.1 commit
+`77dcd25a72509eb83f72b033d219b1d40cd8eb95` 的 `tcp_out.c`、`memp.c`、
+`netif.c`、`timeouts.c`。本地补丁逐项登记于第三方文档，原无预算 API 保持兼容包装。
+最终发布内核 SHA-256 `bcea1a6972abe6589eaabf6e95f798baec62387d68b8cb51a0693274a8a03868`，
+QEMU 11.1.1：lwIP/重组/worker/epoll 宿主测试、真实 RV64 scale、COST growth/poll 门禁、
+完整 userland 和栈预算通过。网络 contract 与 epoll fault 用同 RV64 ELF 在固定 Linux
+`f4cdf7ca9a1fdcca413157df19753f388a5a224e` 及 BoarOS 通过；无 NIC timer 和内容通过。
+TAP legacy/modern 各单次应用与清理通过，程序 17.138/18.535 秒，仅为本轮组合验收，
+并行运行其他测试且未匹配三次基线，不能解释为吞吐改善或回退。重建命令：
+
+```sh
+make all test-scale-riscv test-ethernet-worker-host test-lwip-host test-lwip-reassembly-host
+make test-epoll-host test-epoll-riscv test-userland-riscv test-cache-growth-riscv test-cost-host test-stack-usage
+python3 -B tests/network-riscv.py --workload contract
+python3 -B tests/network-riscv.py --only boaros --workload timer
+python3 -B tests/network-riscv.py --only boaros --workload content
+python3 -B tests/network-external.py --only boaros --transport both --repeat 1
+```
+
+发送 reservation、复制量优化与 TCP 预算比较仍在后续独立阶段；本阶段不声明其完成。
+
+
+## TCP接纳预算与复制（2026-10-05）
+
+先用同 RV64 ELF 对照固定 Linux，发现旧路径对不可读但数值合法的 payload 总是先
+EFAULT：新建 TCP、SHUT_WR、发送缓冲已满都遮蔽了实际 EPIPE/EAGAIN。依据
+`references/linux/net/socket.c::__sys_sendto`、`lib/iov_iter.c::import_ubuf`、
+`net/ipv4/tcp.c::tcp_sendmsg_locked`，固定 commit
+`f4cdf7ca9a1fdcca413157df19753f388a5a224e`，数值范围/头导入在前，协议状态和
+内存接纳判断在实际 payload 读取前。send 的范围错误甚至先于坏 fd；普通 write
+仍先检查 fd。这些区别由新增 admission 契约保护，未把数值检查当作缺页不会失败的保证。
+
+在原任务 write request 上扩展 stream reservation 与进展位，不新增 task 指针槽。
+请求持 OFD pin，容量来自 sndbuf、发送预算及已有 reservation；协议池和 NIC 独立。
+copy 允许睡眠，提交前重新检查连接和真实资源。失败、取消、退出归还未提交预算；
+短阻塞提交保留暂存后缀。只保留 `tcp_write(COPY)`，不把可复用 scratch 借到 ACK。
+COST 将预先无容量、复制后协议失败及零进展失败的新复制字节分开，原 stream_copy
+仍是实际总复制。scale 保留整个接纳量后再 write 4 KiB，页解析和 stream_copy 都为 0；
+另验证两个请求竞争、abort 归还和恢复资格，不按内部链布局断言。
+
+扩展实际阻塞程序后另发现旧控制流的部分成功错误：已有 15972 字节进展后本地
+shutdown，虽然返回正值却发了 SIGPIPE；固定 Linux 不发。请求进展位使后续错误
+返回已接受前缀，不消费待观察错误或发 SIGPIPE。真实对端关闭未读队列产生 RST
+后，下一次 send 观察 ECONNRESET，再下一次才 EPIPE，双方通过。不同协议预算
+导致的正前缀长度不作为逐值差分项。跨页 fault 在本输入上 Linux 返回 EFAULT，
+BoarOS 返回已接纳 4096 字节；分别核对无额外字节和返回/接收守恒，保留 BoarOS
+已有页内接纳策略，不把该测试写成返回值完全相同。
+
+真实 RV64 io-sleep 在复制边界调度另一任务，验证 reservation 仍在任务登记、
+close/fd 复用保持目标 pin、shutdown 后 EPIPE、撤销用户页后 EFAULT 并可重新预留。
+最初给裸地址 fixture 加 TCP 时，lwIP 静态表的高半区指针不可访问；已在初始化
+调度器前映射双地址别名，不能在运行中单改 satp 破坏调度器地址空间不变量。
+这仅调整测试启动映射，生产映射不变。legacy/modern × writeback/writethrough
+四组 I/O 暂扣矩阵通过，原收包 reservation、pipe、存储进展门禁保持。
+
+本阶段发布内核 SHA-256 `d9274411b022ff29b1819d0be8a1f46a0f27cf3de7adc7083c2883a90e2e6a71`，
+QEMU 11.1.1。发布构建通过新增同 ELF admission（包括实际阻塞 sender SIGKILL）、网络 contract/content、
+UNIX budget、完整 musl userland；glibc 2.44 五种形态与固定 Linux 通过。
+现有差分 suite 为 1344 条逐值一致，独立 admission 不混入这个数量。
+scale、诊断 growth/admission/COST 和编译栈上界通过；此阶段未重测匹配吞吐。
+
+```sh
+make all test-scale-riscv test-cache-growth-riscv test-cost-host
+python3 -B tests/network-riscv.py --workload admission
+python3 -B tests/network-riscv.py --workload contract
+python3 -B tests/network-riscv.py --only boaros --workload content
+python3 -B tests/network-riscv.py --only boaros --workload budget
+make test-io-sleep-riscv test-userland-riscv test-glibc-riscv test-diff-abi-riscv test-stack-usage
+```
+
+该阶段没有扩大窗口、pbuf/segment、NIC 或块队列默认值；后续批量读/写及 TCP 预算已完成匹配测量，见文末收口。
+
+
+## 资源分类与 TIME_WAIT 借用的审查修复（2026-10-06）
+
+有界服务独立审查发现两个遗漏。复制回退 `send_copy(-EAGAIN)` 未像 SG 分支一样
+登记 NIC blocked，导致进入错误的协议池等待集合；完成归还 NIC 容量后仍需额外事件。
+另一项是 TIME_WAIT 的 socket 借用解除仍依赖普通工作预算，而 lwIP 容量回收和
+慢定时器可以无普通 err 回调地释放 PCB。固定依据为 `references/lwip/src/core/tcp.c`
+`77dcd25a72509eb83f72b033d219b1d40cd8eb95`；容量回收还会在 free 前把状态改成 CLOSED。
+
+复制回退现对两种回退原因统一发布 NIC 容量等待。两条 TIME_WAIT 释放路径在回收
+之前通知本层，配对 callback_arg/errf 并核对 PCB 身份后清借用、清回调和摘等待项；
+不重入 raw API、不分配、不睡眠、不在该栈销毁 socket，也不增加全局扫描。
+
+实际 socket/Ethernet/lwIP 的 host 模型先在旧代码失败，修复后五组通过：未协商
+indirect 与 SG 不适用的复制容量归还、真实堆 socket 的 TIME_WAIT 池回收与定时
+到期，以及已销毁/非 socket opaque owner 控制组。复制用例冻结时钟并禁止包/timer
+服务，确认协议池代次没变，仅 NIC 归还即可继续 TCP 输出。TIME_WAIT 由真实握手
+与半关闭形成，普通 socket 关闭工作尚未服务；不能用无 owner raw PCB 代替此门禁。
+ASan/UBSan 及独立复审均通过，最终堆、PCB、segment 和协议内存回到基线。
+
+独立 RV64 内核 SHA-256
+`3b89b53663e52b211dfc9aea9c7b4959d3b20fbad36b947033488eff69ee1f6f` 的真实 U-mode
+contract/admission/timer 与 scale 通过；poll 服务计数仍为零。关闭 indirect 的
+legacy/modern × 双向 TAP 五 bulk 加一控制连接四次功能烟测也通过，均满足
+`tx-copy>0`、`tx-sg=0`、`errors=0`；该层检查内容与整合，槽满的因果关系由上述
+host 门禁证明。烟测不计入发布吞吐。可先重建窄门禁：
+
+```sh
+python3 -B tests/host/network_owner.py --sanitize
+```
+
+
+## 最终预算与协调器复核（2026-10-06）
+
+固定生产源码 faf8e63 的 TCP 27 组候选、新 ELF 的 702 次发布启动及独立诊断已完成，
+见[完整指标与每连接完成时间](data-path-budget-experiments.md#正式匹配结果2026-10-06)。
+默认 8/1/1 在部分吞吐负载回退；近池的 8/4/2 避免实测 segment/heap 饱和后重复复制，
+恢复接近旧基线的吞吐并降低控制尾延迟。它不是通用最优或硬控制流预留，默认未变。
+
+扩大验证曾在固定 Linux 的 RR 五连接超时：两轮屏障共用 gate，快客户端能取走慢
+客户端的上一轮 token。实际 workload 的到达偏斜 host 测试先稳定失败，再以独立
+管道修复；重新冻结 ELF 后全套网络筛选/扩展完成，旧 ELF 数字不混入最终表。
+QEMU 11.1.1 的实际 echo RTT、诊断扰动、TX 软件收割到归还及同槽再用的范围独立
+报告；1/10 ms netem 在 host 创建 qdisc 时被拒绝，未启动客体，不推断远程网络收益。

@@ -23,6 +23,10 @@ consumer 包装器允许同步已达到 durable、后台 checkpoint 尚在途的
 不能并入原操作延迟，也不能把原操作已成功解释成 checkpoint 已排空。其他受控
 case 的严格结束检查不变；内核的 EBUSY/inflight/complete 契约不放宽。
 
+`contract` 程序打印最后的快照与通过标记后，先 `fflush` 再 `tcdrain`，确认
+TTY 输出队列排空才退出。仅清 libc 缓冲不足以阻止关机 raw 诊断插入 UART
+队列中的快照行；runner 保持严格解析，不删除损坏行或把部分快照当成有效结果。
+
 窗口身份是递增 epoch，owner 是进程身份代次。开始覆盖控制线程组和当前后代；
 后续 fork/clone 继承 epoch，exec 保留。开始前已阻塞的成员操作重新登记在途数量，
 结束不得越过它；取消消耗本任务尚未离开的 scope，未回到的栈不成为永久诊断 owner。
@@ -53,7 +57,7 @@ C1 进一步按 file/stream/dgram/other 记录 calls、requested/accepted、实�
 staging 累计请求容量、heap 请求字节和成功物理页。短写以实际接受前缀为准；同步尾部失败
 不会抹掉先前接受量。全局 heap/page 指标是实际 allocator 入口和成功结果，按本层单位记录，
 不能把 heap 字节、物理页及 staging 引用容量相加当驻留峰值。
-缓存计 bucket probes、实际复制、范围写回的两轮遍历、完整页快照与逻辑后端接受量。
+缓存计 bucket probes、实际复制、范围写回候选访问、实际脏区间快照与逻辑后端接受量。旧两轮全页链与整页快照的历史值保持原解释，当前算法访问较小的候选集合。
 设备按 registry 的磁盘0/1/其他聚合；请求在 submit 保存标量 epoch/lane，IRQ 完成和 reset
 使用提交身份，旧请求不能污染新窗口。原设备/MM 统计契约不变，fixture 未登记设备属于 other。
 封口事务的提交路径按 ordered data、journal、checkpoint metadata 与 journal superblock 设置标量 phase，设备按真实提交上下文归因；其余字节继续归 unknown_read/unknown_write（含之后失败的请求）。请求字节不表示持久字节；后端逻辑数据不足以证明其他扇区分类。
@@ -186,3 +190,15 @@ CPU 时间。零字节成功执行可以有样本，失败准备不能伪造工�
 输出最后一份快照后用`tcdrain`等待实际排空，再退出，避免关机raw日志插入快照尾部。
 损坏快照仍按严格格式拒绝；既有完整业务窗口可单独核验并注明观测范围，不能修补原始
 输出或把缺失的末窗口写成通过。
+
+增长指标 `resize_visits` / `resize_tail_pages` / `resize_alias_rearms` 区分缓存项访问、
+实际处理尾页及别名重新保护；哈希探测沿用 `cache_probes`。新指标追加在注册表尾部，
+解析器继续接受固定的旧完整 schema，缺字段不能当零。指标名按实际长度保存，
+聚合存储仍受 64 KiB 上限保护；测试约束这一公开预算，不绑定某个私有布局字节数。
+
+网络服务指标在版本 1 末尾追加，旧 schema 仍由报告器识别：服务批次、socket 工作单元、loopback 包、timer 回调、全局 registry 扫描、poll 查询及查询触发服务、带可执行工作睡眠次数。socket 工作单元含容量转交与到期重试，不能解释为唯一 socket 数；末项为睡前诊断谓词，正常应为零。没有新增对象引用或动态观测内存，聚合仍受 64 KiB 门禁。
+
+TCP admission 新增 `stream_admit_blocked`（预先无容量的尝试）、`stream_protocol_blocked`
+（复制后提交仍为 EAGAIN 的尝试）和 `stream_copy_blocked_bytes`（尚无进展时这些失败新复制的
+payload 字节）。阻塞调用可能有多次尝试，不能当作 syscall 次数；复用暂存后缀不再次计复制。
+现有 `stream_copy` 仍记录全部真实复制。指标在末尾追加，前一网络 schema 继续可读。

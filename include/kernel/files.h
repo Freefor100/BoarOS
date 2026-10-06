@@ -3,6 +3,10 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <kernel/page.h>
+
+#define KERNEL_FILES_MAX_RW_COUNT \
+    ((uint64_t)INT32_MAX & ~(uint64_t)BOAROS_PAGE_MASK)
 
 struct kernel_file_slot;
 struct kernel_files_record;

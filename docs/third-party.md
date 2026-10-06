@@ -7,7 +7,7 @@
 - 导入路径：`third_party/lwip/`，保留 `src/core/`、`src/include/`、官方 Ethernet 入口和 `COPYING`；未导入 socket/netconn API 实现、应用、PPP 和上游具体网卡驱动。
 - 许可证：BSD-3-Clause，原有版权和许可声明保留在每个源码文件及 `COPYING`。
 - 用途：向 BoarOS 自有 socket fd/OFD 与 Linux ABI 层提供单 hart IPv4 UDP/TCP 协议核心；本阶段先用 NO_SYS raw API 和 loopback，网卡后端另行验证。
-- 本地修改：IPv4重组增加协议/输入网卡键、重复/重叠/终点校验及按网卡清理，补丁不升级固定版本；其余导入文件保持原版。BoarOS 的 lwIP 配置、端口和 socket 所有权适配位于 `net/` 与 `fs/`，不以 lwIP 的 socket fd 空间代替 BoarOS 文件表。
+- 本地修改：IPv4重组增加协议/输入网卡键、重复/重叠/终点校验及按网卡清理，另在 netif/timeouts 增加有预算的轮回入口，旧公开入口保持无限预算包装；mem/memp 增加可选的每次真实归还 hook，netif 增加 loopback 入队 hook。对应 netif.h/timeouts.h 声明随实现维护；补丁不升级固定版本，其他导入文件保持原版。BoarOS 的 lwIP 配置、端口和 socket 所有权适配位于 `net/` 与 `fs/`，不以 lwIP 的 socket fd 空间代替 BoarOS 文件表。
 
 ## lwext4
 
@@ -45,3 +45,21 @@ glibc 2.44 作为外部测试输入使用：官方源码归档保存在被忽略
 - 本地路径：`kernel/blake2s.c`、`include/kernel/blake2s.h`；保留 Jason A. Donenfeld 的版权与 `GPL-2.0 OR MIT` 声明，项目按 GPL-2.0 使用。
 - 用途与修改：移植为无动态分配的便携 BLAKE2s-256 混种接口，去除 Linux 专用调用约定；中间状态显式清除。ChaCha20 fast-key-erasure 契约另对照同版本 `drivers/char/random.c`，密钥更新材料不返回给调用者。
 - 验证：`make test-random-host` 比较已知向量、分块边界与旧输出预测下一密钥的回归；确定性向量不证明熵源质量。
+
+- lwext4 批量只读扩展：`ext4_fpread_batch` 在 mount read lock 下按真实 inode 映射处理
+  洞、EOF 与块内片段；`ext4_block_get_batch` 先固定当前 bcache 版本，仅对缺失块调用
+  可选 `bread_batch`，重复块共用 loading。本批新读先完成，再等待其他 loading，避免
+  重叠批次互等未发布缓冲。每项保留独立错误和成功字节前缀，失败读不进入 journal
+  写回错误状态；设备侧最多八项并保留 DMA owner 至返回。未升级上游，来源仍为
+  `third_party/lwext4` 的 `58bcf89a121b72d4fb66334f1693d3b30e4cb9c5` 加本地补丁。
+  验证为 `make test-lwext4-cache-host test-lwext4-batch-read-host test-io-sleep-riscv`。
+
+- 深层 extent 截断纠错：删除叶节点后上移时，用既有 `ext4_ext_drop_refs` 释放内部
+  索引引用，先重算脏块 checksum，再归还引用。原路径直接 `ext4_block_set` 清掉块号，
+  后续查找会返回 EUCLEAN；1/4 KiB 的真实深层树、跨进程重启与最终截零由
+  `make test-lwext4-deep-truncate-host` 保护，未改变日志版本或持久化屏障。
+
+- lwIP TIME_WAIT 释放边界增加可选 `LWIP_HOOK_TCP_TIMEWAIT_FREE`：主动池回收在
+  remove 将状态改为 CLOSED 之前通知；slow timer 在摘链后、free 前通知。BoarOS
+  端口只清除仍匹配的 socket 借用与回调，不重入 raw API 或改变协议计时，避免把
+  PCB 生命周期交给受预算限制的普通工作队列。仍固定 2.2.1，验证见网络模块。

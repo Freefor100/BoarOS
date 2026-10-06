@@ -3,6 +3,7 @@
 
 #include <kernel/files.h>
 #include <kernel/uaccess.h>
+#include <kernel/page.h>
 
 #include <stddef.h>
 
@@ -12,6 +13,21 @@ struct kernel_uaccess_iov_cursor {
     size_t index;
     uint64_t offset;
 };
+
+/* 描述下一段但不解析用户页；复制和后端进展分别由调用者提交。 */
+static inline size_t kernel_uaccess_iov_span(struct kernel_uaccess_iov_cursor *cursor,
+    size_t limit, uint64_t *address)
+{
+    while (cursor->index < cursor->count && cursor->offset == cursor->iov[cursor->index].length) {
+        cursor->index++; cursor->offset = 0;
+    }
+    if (cursor->index == cursor->count) return 0;
+    *address = cursor->iov[cursor->index].base + cursor->offset;
+    uint64_t available = cursor->iov[cursor->index].length - cursor->offset;
+    if (available < limit) limit = (size_t)available;
+    size_t page_left = BOAROS_PAGE_SIZE - (*address & BOAROS_PAGE_MASK);
+    return limit < page_left ? limit : page_left;
+}
 
 /* The caller commits backend progress separately. A FAULT can carry a
  * successfully copied prefix, including one spanning prior iovecs. */

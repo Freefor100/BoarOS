@@ -202,6 +202,19 @@ class CostReportTest(unittest.TestCase):
                     fields.update({prefix+'bucket.'+str(i):'0' for i in range(65)})
         return fields
     def render(self, fields): return ''.join(k+'='+v+'\n' for k,v in fields.items())
+    def test_frozen_pre_resize_schema(self):
+        from cost_report import supported_schemas
+        old=supported_schemas()[-1]
+        self.assertFalse(any(name.startswith('resize_') for name,_,_ in old))
+        fields=self.valid()
+        added={name for name,_,_ in schema()[len(old):]}
+        self.assertTrue({'resize_visits','resize_tail_pages','resize_alias_rearms'} <= added)
+        fields={key:value for key,value in fields.items()
+                if not any(key.startswith(lane+'.'+name+'.')
+                    for lane in ('foreground','background','observer') for name in added)}
+        self.assertEqual(parse(self.render(fields),3,old)['epoch'],3)
+        with self.assertRaises(ValueError):parse(self.render(fields),3)
+
     def test_frozen_pre_memory_schema(self):
         from cost_report import supported_schemas
         old=supported_schemas()[1]

@@ -63,6 +63,29 @@ static void refill_rx(struct riscv_virtio_mmio_net *d)
         publish(d, 0, id);
     }
 }
+#if BOAROS_COST_DIAGNOSTICS
+static void latency_sample(struct riscv_virtio_mmio_net *d, uint64_t elapsed,
+    uint64_t *count, uint64_t *total, uint64_t *maximum)
+{
+    if (*count == UINT64_MAX || UINT64_MAX - *total < elapsed) {
+        d->statistics.tx_latency_overflow = 1;
+        return;
+    }
+    (*count)++; *total += elapsed;
+    if (elapsed > *maximum) *maximum = elapsed;
+}
+static void note_tx_free(struct riscv_virtio_mmio_net *d, unsigned b, uint64_t now)
+{
+    uint64_t bit = UINT64_C(1) << b;
+    if (d->tx_done_valid & bit) {
+        latency_sample(d, now - d->tx_done_time[b],
+            &d->statistics.tx_done_free_count, &d->statistics.tx_done_free_ticks,
+            &d->statistics.tx_done_free_max);
+        d->tx_done_valid &= ~bit;
+    }
+    d->tx_free_time[b] = now; d->tx_free_valid |= bit;
+}
+#endif
 static void flush_tx(struct riscv_virtio_mmio_net *d)
 {
     while (!d->failed && !d->stopping && d->configured && d->tx_count && d->tx_posted != UINT32_MAX) {
@@ -82,6 +105,14 @@ static void flush_tx(struct riscv_virtio_mmio_net *d)
             desc[id] = (struct net_descriptor){ d->tx_phys + b * 2048 + padding(d), length, 0, 0 };
         }
         d->tx_time[b] = riscv_time_read();
+#if BOAROS_COST_DIAGNOSTICS
+        if (d->tx_free_valid & (UINT64_C(1) << b)) {
+            latency_sample(d, d->tx_time[b] - d->tx_free_time[b],
+                &d->statistics.tx_free_post_count, &d->statistics.tx_free_post_ticks,
+                &d->statistics.tx_free_post_max);
+            d->tx_free_valid &= ~(UINT64_C(1) << b);
+        }
+#endif
         d->tx_posted |= UINT32_C(1) << id;
         publish(d, 1, id);
     }
@@ -178,12 +209,21 @@ static void harvest(struct riscv_virtio_mmio_net *d)
             }
             *posted &= ~(UINT32_C(1) << e.id); d->consumed[q]++;
             if (q) {
+#if BOAROS_COST_DIAGNOSTICS
+                d->tx_done_time[b] = riscv_time_read();
+                d->tx_done_valid |= UINT64_C(1) << b;
+#endif
                 if (d->tx_owner[b]) {
                     if (d->tx_done_count == RISCV_NET_BUFFERS) __builtin_trap();
                     d->tx_state[b] = TX_DONE;
                     d->tx_done[(d->tx_done_head + d->tx_done_count++) %
                                RISCV_NET_BUFFERS] = (uint16_t)b;
-                } else d->tx_state[b] = TX_FREE;
+                } else {
+                    d->tx_state[b] = TX_FREE; d->tx_capacity_generation++;
+#if BOAROS_COST_DIAGNOSTICS
+                    note_tx_free(d, b, d->tx_done_time[b]);
+#endif
+                }
             }
             else {
                 if (d->ready_count == 64) __builtin_trap();
@@ -396,10 +436,11 @@ int riscv_virtio_mmio_net_send_segments(struct riscv_virtio_mmio_net *d,
     riscv_interrupt_restore(saved);
     return 0;
 }
-void riscv_virtio_mmio_net_tx_release(struct riscv_virtio_mmio_net *d,
+unsigned riscv_virtio_mmio_net_tx_release(struct riscv_virtio_mmio_net *d,
     void (*release)(void *owner), int abandon)
 {
-    if (!d || !release) return;
+    if (!d || !release) return 0;
+    unsigned released = 0;
     uintptr_t saved = riscv_interrupt_save();
     if (abandon) {
         /* reset/stop 已确认 DMA 停止，归还所有仍持有的 owner。 */
@@ -408,6 +449,11 @@ void riscv_virtio_mmio_net_tx_release(struct riscv_virtio_mmio_net *d,
             release(d->tx_owner[b]);
             d->tx_owner[b] = 0;
             d->tx_state[b] = TX_FREE;
+            d->tx_capacity_generation++;
+#if BOAROS_COST_DIAGNOSTICS
+            note_tx_free(d, b, riscv_time_read());
+#endif
+            released++;
         }
         d->tx_head = 0; d->tx_count = 0; d->tx_done_head = 0; d->tx_done_count = 0;
     } else {
@@ -418,9 +464,15 @@ void riscv_virtio_mmio_net_tx_release(struct riscv_virtio_mmio_net *d,
             release(d->tx_owner[b]);
             d->tx_owner[b] = 0;
             d->tx_state[b] = TX_FREE;
+            d->tx_capacity_generation++;
+#if BOAROS_COST_DIAGNOSTICS
+            note_tx_free(d, b, riscv_time_read());
+#endif
+            released++;
         }
     }
     riscv_interrupt_restore(saved);
+    return released;
 }
 int riscv_virtio_mmio_net_send(struct riscv_virtio_mmio_net *d, const void *data, uint32_t size)
 {

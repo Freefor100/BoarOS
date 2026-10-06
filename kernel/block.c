@@ -121,6 +121,45 @@ enum kernel_block_status kernel_block_write_batch(
     return KERNEL_BLOCK_STATUS_OK;
 }
 
+static int memory_overlaps(uintptr_t a, size_t an, uintptr_t b, size_t bn)
+{ return an && bn && (a < b ? b - a < an : a - b < bn); }
+
+enum kernel_block_status kernel_block_read_batch(struct kernel_block_device *device,
+    struct kernel_block_read_span *spans, size_t count)
+{
+    if (!device || !device->logical_block_size || count > KERNEL_BLOCK_BATCH_MAX || (count && !spans))
+        return KERNEL_BLOCK_STATUS_INVALID;
+    if (!device->read && !device->read_batch) return KERNEL_BLOCK_STATUS_UNSUPPORTED;
+    for (size_t i = 0; i < count; i++) {
+        spans[i].completed = 0; spans[i].status = KERNEL_BLOCK_STATUS_NOT_SUBMITTED;
+    }
+    int nonempty = 0;
+    for (size_t i = 0; i < count; i++) {
+        struct kernel_block_read_span *span = &spans[i];
+        if (span->offset > device->capacity_bytes || span->size > device->capacity_bytes - span->offset)
+            return span->status = KERNEL_BLOCK_STATUS_OUT_OF_RANGE;
+        if (!span->size) { span->status = KERNEL_BLOCK_STATUS_OK; continue; }
+        uintptr_t buffer = (uintptr_t)span->buffer;
+        if (!buffer || span->size - 1 > UINTPTR_MAX - buffer ||
+            memory_overlaps(buffer, span->size, (uintptr_t)spans, count * sizeof(*spans)))
+            return span->status = KERNEL_BLOCK_STATUS_INVALID;
+        for (size_t j = 0; j < i; j++)
+            if (memory_overlaps(buffer, span->size, (uintptr_t)spans[j].buffer, spans[j].size))
+                return span->status = KERNEL_BLOCK_STATUS_INVALID;
+        nonempty = 1;
+    }
+    if (!nonempty) return KERNEL_BLOCK_STATUS_OK;
+    if (device->read_batch) return device->read_batch(device->context, spans, count);
+    enum kernel_block_status result = KERNEL_BLOCK_STATUS_OK;
+    for (size_t i = 0; i < count; i++) {
+        if (!spans[i].size) continue;
+        spans[i].status = device->read(device->context, spans[i].offset, spans[i].buffer, spans[i].size);
+        if (spans[i].status == KERNEL_BLOCK_STATUS_OK) spans[i].completed = spans[i].size;
+        else if (result == KERNEL_BLOCK_STATUS_OK) result = spans[i].status;
+    }
+    return result;
+}
+
 static struct kernel_block_device *registered_devices;
 
 int kernel_block_register(struct kernel_block_device *device, uint64_t number)

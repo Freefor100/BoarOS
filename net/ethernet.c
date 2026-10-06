@@ -1,6 +1,7 @@
 #include <kernel/network.h>
 #include <kernel/socket.h>
 #include <kernel/errno.h>
+#include <kernel/cost.h>
 #include <kernel/console.h>
 #include <arch/riscv/context.h>
 #include <arch/riscv/direct_map.h>
@@ -27,7 +28,7 @@ struct kernel_network {
     struct netif interface;
     struct network_rx rx[64];
     struct kernel_heap *heap;
-    uint64_t deadline;
+    uint64_t deadline, capacity_generation;
     uint8_t attached, failure_delivered;
 };
 static void print_text(const char *s) { while (*s) kernel_console_putc(*s++); }
@@ -45,7 +46,11 @@ static void rx_free(struct pbuf *p)
 static int copy_pbuf(const void *context, void *destination, uint32_t length)
 { return pbuf_copy_partial(context, destination, (u16_t)length, 0) == length; }
 static void release_owner(void *owner)
-{ pbuf_free((struct pbuf *)owner); }
+{
+    uintptr_t irq = kernel_socket_protocol_enter();
+    pbuf_free((struct pbuf *)owner);
+    kernel_socket_protocol_leave(irq);
+}
 static err_t link_output(struct netif *interface, struct pbuf *p)
 {
     struct kernel_network *n = interface->state;
@@ -72,14 +77,15 @@ static err_t link_output(struct netif *interface, struct pbuf *p)
                                                              count, p);
             if (result == 0) return ERR_OK;
             pbuf_free(p);
-            if (result == -KERNEL_EAGAIN) return ERR_MEM;
+            if (result == -KERNEL_EAGAIN) { kernel_socket_network_blocked(); return ERR_MEM; }
             if (result != -KERNEL_ENOTSUP) return ERR_IF;
             /* 未协商 indirect：回退复制路径。 */
         }
     }
     int result = riscv_virtio_mmio_net_send_copy(&n->device, p->tot_len, copy_pbuf, p);
-    return result >= 0 ? ERR_OK : result == -KERNEL_EAGAIN ? ERR_MEM :
-        result == -KERNEL_EMSGSIZE ? ERR_BUF : ERR_IF;
+    /* 复制回退耗尽的仍是 NIC 槽；只等协议池归还会漏掉真实 TX 完成。 */
+    if (result == -KERNEL_EAGAIN) { kernel_socket_network_blocked(); return ERR_MEM; }
+    return result >= 0 ? ERR_OK : result == -KERNEL_EMSGSIZE ? ERR_BUF : ERR_IF;
 }
 static err_t interface_init(struct netif *interface)
 {
@@ -101,6 +107,20 @@ static int udp_capacity_after(struct kernel_network *n, unsigned loans, unsigned
     return used <= PBUF_POOL_SIZE - 16 && owned <= MEM_SIZE - (65536U + 4096U);
 }
 static int udp_capacity(void *context) { return udp_capacity_after(context, 0, 0); }
+static void work_wake(void *context)
+{
+    struct kernel_network *network = context;
+    (void)kernel_wait_queue_wake_all(&network->device.progress);
+}
+static void release_completed(struct kernel_network *network)
+{
+    struct riscv_virtio_mmio_net *device = &network->device;
+    riscv_virtio_mmio_net_tx_release(device, release_owner, 0);
+    if (network->capacity_generation != device->tx_capacity_generation) {
+        network->capacity_generation = device->tx_capacity_generation;
+        kernel_socket_network_capacity();
+    }
+}
 static void timer_wake(void *context)
 {
     struct kernel_network *n = context;
@@ -114,10 +134,18 @@ static void timer_worker(void *context)
     for (;;) {
         uintptr_t irq = riscv_interrupt_save();
         if (n->device.stopping) { riscv_interrupt_restore(irq); return; }
-        kernel_socket_network_process();
-        n->deadline = kernel_socket_next_timer_deadline();
+        struct kernel_socket_service_result service = kernel_socket_service_pending(
+            (struct kernel_socket_service_budget){8, 8, 1});
+        if (service.runnable || kernel_socket_work_pending()) {
+            riscv_interrupt_restore(irq);
+            irq = riscv_interrupt_save();
+            if (kernel_scheduler_yield_current() != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
+            riscv_interrupt_restore(irq); continue;
+        }
+        n->deadline = service.next_deadline;
         uint64_t timeout = riscv_time_read() + 5 * n->device.frequency;
         if (!n->deadline || timeout < n->deadline) n->deadline = timeout;
+        COST_ADD(NETWORK_RUNNABLE_SLEEP, kernel_socket_work_pending() != 0);
         enum kernel_wait_wake_reason reason;
         if (kernel_scheduler_block_current(&n->device.progress, n->deadline, 0, &reason) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
         riscv_interrupt_restore(irq);
@@ -125,6 +153,7 @@ static void timer_worker(void *context)
 }
 static void input_frame(struct kernel_network *n, struct riscv_net_frame *frame)
 {
+    uintptr_t irq = kernel_socket_protocol_enter();
     const unsigned char *data = frame->data;
     int udp = frame->size >= 34 && data[12] == 8 && data[13] == 0 && data[23] == 17;
     int address_ok = frame->size >= 14 &&
@@ -149,18 +178,22 @@ static void input_frame(struct kernel_network *n, struct riscv_net_frame *frame)
     }
     /* 成功input消耗或接纳pbuf；失败才由当前接收请求释放。 */
     if (n->interface.input(p, &n->interface) != ERR_OK) pbuf_free(p);
+    kernel_socket_protocol_leave(irq);
     return;
 dropped:
     n->device.statistics.drops++;
     riscv_virtio_mmio_net_release(&n->device, frame->buffer);
+    kernel_socket_protocol_leave(irq);
 }
 static void device_failed(struct kernel_network *n)
 {
+    uintptr_t irq = kernel_socket_protocol_enter();
     if (!n->failure_delivered) {
         n->failure_delivered = 1;
         kernel_socket_network_failed(ip4_addr_get_u32(netif_ip4_addr(&n->interface)));
     }
     netif_set_link_down(&n->interface);
+    kernel_socket_protocol_leave(irq);
     /* 失败不等于DMA停止：设备仍可能读取已投递的TX描述符与payload，
      * 在途owner保留到stop()复位确认，与RX借用同一策略；已完成owner
      * 仍由worker的release(0)归还。 */
@@ -173,30 +206,38 @@ static void worker(void *context)
         uintptr_t irq = riscv_interrupt_save();
         if (d->stopping) { riscv_interrupt_restore(irq); return; }
         unsigned handled = 0;
-        if (riscv_virtio_mmio_net_service(d)) {
+        int failed = riscv_virtio_mmio_net_service(d);
+        /* RX和协议回调都可能发送；先归还完成owner及其槽位。 */
+        release_completed(n);
+        uint64_t capacity_generation = d->tx_capacity_generation;
+        if (failed) {
             device_failed(n);
         } else {
+            uintptr_t core = kernel_socket_protocol_enter();
             if (d->link_up) netif_set_link_up(&n->interface); else netif_set_link_down(&n->interface);
+            kernel_socket_protocol_leave(core);
             struct riscv_net_frame frame;
             while (!d->failed && handled < 8 && riscv_virtio_mmio_net_receive(d, &frame)) {
                 input_frame(n, &frame); handled++;
             }
         }
         /* 失败NIC不再收发，但共享的loopback与协议期限仍须独立进展。 */
-        kernel_socket_network_process();
-        /* 完成通知在IRQ标记；owner释放留在worker上下文。 */
-        riscv_virtio_mmio_net_tx_release(d, release_owner, 0);
+        struct kernel_socket_service_result service = kernel_socket_service_pending(
+            (struct kernel_socket_service_budget){8, 8, 1});
         if (riscv_virtio_mmio_net_service(d)) device_failed(n);
-        if (handled == 8) {
+        release_completed(n);
+        /* 最后一次收割也会归还复制路径的容量，不能只检查SG done链。 */
+        if (service.runnable || kernel_socket_work_pending() || capacity_generation != d->tx_capacity_generation || (!d->failed && d->ready_count)) {
             /* 批次间给中断和其他任务机会，不持raw调用栈睡在设备credit上。 */
             riscv_interrupt_restore(irq);
             irq = riscv_interrupt_save();
             if (kernel_scheduler_yield_current() != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
             riscv_interrupt_restore(irq); continue;
         }
-        n->deadline = kernel_socket_next_timer_deadline();
+        n->deadline = service.next_deadline;
         uint64_t timeout = riscv_time_read() + 5 * d->frequency;
         if (!n->deadline || timeout < n->deadline) n->deadline = timeout;
+        COST_ADD(NETWORK_RUNNABLE_SLEEP, kernel_socket_work_pending() != 0);
         enum kernel_wait_wake_reason reason;
         if (kernel_scheduler_block_current(&d->progress, n->deadline, 0, &reason) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
         riscv_interrupt_restore(irq);
@@ -220,20 +261,20 @@ int kernel_network_start(struct kernel_network **owner, struct kernel_heap *heap
         int error = riscv_virtio_mmio_net_init(&n->device, mmio, boot->virtio_mmio[i].size,
             heap->page_allocator, boot->timebase_frequency, source);
         if (error) { if (kernel_network_stop(owner)) return -KERNEL_EIO; return error; }
-        uintptr_t saved = riscv_interrupt_save();
+        uintptr_t saved = kernel_socket_protocol_enter();
         kernel_socket_network_initialize();
         ip4_addr_t address = {lwip_htonl(BOAROS_NET_IPV4)}, mask = {lwip_htonl(BOAROS_NET_NETMASK)}, gateway = {0};
         if (!netif_add(&n->interface, &address, &mask, &gateway, n, interface_init, ethernet_input)) {
-            riscv_interrupt_restore(saved); (void)kernel_network_stop(owner); return -KERNEL_ENOMEM;
+            kernel_socket_protocol_leave(saved); (void)kernel_network_stop(owner); return -KERNEL_ENOMEM;
         }
         n->attached = 1;
         netif_set_up(&n->interface); if (n->device.link_up) netif_set_link_up(&n->interface);
         netif_set_default(&n->interface);
         if (kernel_thread_create_joinable(worker, n, &n->device.worker) != KERNEL_SCHEDULER_STATUS_OK) {
-            riscv_interrupt_restore(saved); (void)kernel_network_stop(owner); return -KERNEL_ENOMEM;
+            kernel_socket_protocol_leave(saved); (void)kernel_network_stop(owner); return -KERNEL_ENOMEM;
         }
-        kernel_socket_network_hooks(timer_wake, udp_capacity, n);
-        riscv_interrupt_restore(saved);
+        kernel_socket_network_hooks(timer_wake, work_wake, udp_capacity, n);
+        kernel_socket_protocol_leave(saved);
         print_text("BoarOS: eth0 ready transport="); print_text(n->device.version == 1 ? "legacy" : "modern");
         print_text(" irq="); print_u64(source); print_text(" MTU=1500 RX/TX=32 DMA-bytes=");
         print_u64((4096U << n->device.queue_order) + 2 * 131072U);
@@ -254,7 +295,7 @@ int kernel_network_start(struct kernel_network **owner, struct kernel_heap *heap
         (void)kernel_heap_release(heap, n);
         return -KERNEL_EIO;
     }
-    kernel_socket_network_hooks(timer_wake, 0, n);
+    kernel_socket_network_hooks(timer_wake, work_wake, 0, n);
     *owner = n;
     return 0;
 }
@@ -267,15 +308,17 @@ int kernel_network_stop(struct kernel_network **owner)
     (void)kernel_wait_queue_wake_all(&n->device.progress);
     if (n->device.worker.task) kernel_thread_join(&n->device.worker);
     if (n->attached) {
+        uintptr_t core = kernel_socket_protocol_enter();
         ip4_reass_cleanup_netif(&n->interface);
         etharp_cleanup_netif(&n->interface);
         netif_set_down(&n->interface); netif_remove(&n->interface); n->attached = 0;
+        kernel_socket_protocol_leave(core);
     }
     int error = riscv_virtio_mmio_net_stop(&n->device);
     if (error) { riscv_interrupt_restore(irq); return error; }
     /* reset已确认DMA停止；worker已join，归还剩余TX owner。 */
     riscv_virtio_mmio_net_tx_release(&n->device, release_owner, 1);
-    kernel_socket_network_hooks(0, 0, 0);
+    kernel_socket_network_hooks(0, 0, 0, 0);
     print_text("BoarOS: network final rx="); print_u64(n->device.statistics.rx_packets);
     print_text(" tx="); print_u64(n->device.statistics.tx_packets);
     print_text(" loan-packets="); print_u64(n->device.statistics.loan_packets);
@@ -287,6 +330,16 @@ int kernel_network_stop(struct kernel_network **owner)
     print_text(" tx-copy="); print_u64(n->device.statistics.tx_copy_packets);
     print_text(" drops="); print_u64(n->device.statistics.drops);
     print_text(" errors="); print_u64(n->device.statistics.errors);
+#if BOAROS_COST_DIAGNOSTICS
+    print_text(" tx-clock-hz="); print_u64(n->device.frequency);
+    print_text(" tx-done-free-count="); print_u64(n->device.statistics.tx_done_free_count);
+    print_text(" tx-done-free-ticks="); print_u64(n->device.statistics.tx_done_free_ticks);
+    print_text(" tx-done-free-max="); print_u64(n->device.statistics.tx_done_free_max);
+    print_text(" tx-free-post-count="); print_u64(n->device.statistics.tx_free_post_count);
+    print_text(" tx-free-post-ticks="); print_u64(n->device.statistics.tx_free_post_ticks);
+    print_text(" tx-free-post-max="); print_u64(n->device.statistics.tx_free_post_max);
+    print_text(" tx-latency-overflow="); print_u64(n->device.statistics.tx_latency_overflow);
+#endif
     struct kernel_heap_statistics heap_statistics;
     kernel_heap_get_statistics(n->heap, &heap_statistics);
     print_text(" root-heap-peak-pages="); print_u64(heap_statistics.peak_pages); print_text("\n");

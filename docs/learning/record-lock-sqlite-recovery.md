@@ -174,3 +174,43 @@ make test-io-sleep-riscv test-sqlite-wal-riscv
 make test-sqlite-wal-recovery-riscv test-sqlite-wal-recovery-matrix-riscv
 make test-riscv test-glibc-riscv test-diff-abi-riscv test-scale-riscv test-stack-usage
 ```
+
+
+## 数据路径最终恢复与宿主收口（2026-10-06）
+
+阶段七后的首次默认 DELETE 全矩阵通过，WAL 在 `small-probe-none` 提交确认后
+遇到 NBD 非零退出。原 guest 日志已确认提交，host 最后是成功 FLUSH；runner
+随即 kill QEMU，可能中断正常 NBD 回复/WRITE payload。与双盘收口竞态同源，
+不是已复现的 SQLite durable 失效。旧失败保留，不计作通过。
+
+`nbd_boot` 现在统一保持控制通道；marker 和未到达序号的切断都先要求后端
+`cut` 回执及退出零，再终止 guest。真实 ordinal cut 仍由后端在相应请求处冻结。
+每次保存 guest/backend 退出状态、marker、cut 类型；没有放宽 NBD 错误检查。
+重新运行默认和最大存储候选的完整 DELETE/WAL 矩阵，四入口均退出零：
+
+| 配置／日志模式 | none／odd／reverse 切点 | WRITE 候选／实际注入 | FLUSH 候选／实际注入 | 未到达序号 |
+|---|---|---|---|---|
+| 默认 RA0/WB1，DELETE | 56／58／54 | 39／37 | 19／19 | WRITE 38、39 |
+| 默认 RA0/WB1，WAL | 27／26／30 | 20／16 | 10／10 | WRITE 17–20 |
+| RA8/WB8，DELETE | 57／55／60 | 40／40 | 20／19 | FLUSH 20 |
+| RA8/WB8，WAL | 28／29／28 | 19／18 | 10／10 | WRITE 19 |
+
+每例仍包括两次独立恢复、完整事务内容和 fsck；EXTRA/FULL、热日志、已确认提交
+及错误传播检查均通过。未到达序号单列为提交后控制切断，不冒充实际故障注入。
+异步组提交导致事件数随运行变化，不能把不同运行的序号当成同一个持久化边界。
+
+实际 QEMU 11.1.1，恢复 ELF SHA-256
+`510fc4c7b8e72a2224603b053bc9d5967f295e20a5085500038a4dd4936436f5`；
+默认内核 `e3867e6b19beda83949402d51e938cf36817684e86d1e7852dfaf9977b746be7`，
+RA8/WB8 候选 `ade1c0ca632c2ab1e7524daa06c52ebed49c3236113b92e01e3cb95a96628d66`；
+runner SHA-256 `65d38ab9f44c6b2dc7da0cf20df4e9ebe97974ca60967326def7164953c96131`。
+候选由生产源码 `faf8e6395a7d56cd92e5fdb460fd9532066d2f26` 构建，后续改动仅测试与文档；
+SQLite 固定归档身份同上。该验证不承诺实板断电或吞吐收益。
+
+```sh
+make test-lwext4-host test-lwext4-batch-read-host test-lwext4-deep-truncate-host test-lwext4-recovery-host
+make test-sqlite-recovery-matrix-riscv test-sqlite-wal-recovery-matrix-riscv
+python3 -B tests/io-budget-experiment.py build --profiles ra8-wb8 --jobs 2
+python3 -B tests/sqlite-recovery-riscv.py --kernel build/io-budget/kernels/ra8-wb8/kernel-rv --matrix full --journal delete
+python3 -B tests/sqlite-recovery-riscv.py --kernel build/io-budget/kernels/ra8-wb8/kernel-rv --matrix full --journal wal
+```

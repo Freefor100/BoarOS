@@ -1889,9 +1889,9 @@ int ext4_extent_remove_space(struct ext4_inode_ref *inode_ref, ext4_lblk_t from,
 					path[i - 1].index++;
 			}
 
+			/* 内部索引也已修改；释放前更新校验和，后续查找才可验证同一版本。 */
 			if (i)
-				ext4_block_set(inode_ref->fs->bdev,
-					       &path[i].block);
+				ext4_ext_drop_refs(inode_ref, path + i, true);
 
 			i--;
 		}

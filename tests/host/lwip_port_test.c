@@ -19,6 +19,12 @@ static unsigned int tcp_connected;
 static struct tcp_pcb *tcp_accepted;
 static uint64_t simulated_ns = UINT64_C(1000000000);
 
+static void counted_timeout(void *context)
+{
+    unsigned *count = context;
+    if (++*count < 3) sys_timeout(0, counted_timeout, context);
+}
+
 static err_t connected(void *context, struct tcp_pcb *pcb, err_t error)
 {
     (void)context;
@@ -116,6 +122,23 @@ int main(void)
     if (received != 1U || byte_received != 'x') {
         return 5;
     }
+    struct netif *loop = netif_list;
+    while (loop && !(loop->name[0] == 'l' && loop->name[1] == 'o')) loop = loop->next;
+    if (!loop) return 40;
+    for (unsigned i = 0; i < 3; i++) {
+        payload = pbuf_alloc(PBUF_TRANSPORT, 1U, PBUF_RAM);
+        if (!payload || pbuf_take(payload, "x", 1) != ERR_OK ||
+            udp_sendto(sender, payload, &loopback, listener->local_port) != ERR_OK) return 41;
+        pbuf_free(payload);
+    }
+    if (netif_poll_budget(loop, 0) != 0 || received != 1 ||
+        netif_poll_budget(loop, 1) != 1 || received != 2 ||
+        netif_poll_budget(loop, 2) != 2 || received != 4 || loop->loop_first) return 42;
+    unsigned expired = 0;
+    sys_timeout(0, counted_timeout, &expired);
+    if (sys_check_timeouts_budget(0) != 0 || expired ||
+        sys_check_timeouts_budget(1) != 1 || expired != 1 ||
+        sys_check_timeouts_budget(2) != 2 || expired != 3) return 43;
     udp_remove(sender);
     udp_remove(listener);
     for (unsigned int i = 0; i < MEMP_NUM_UDP_PCB; i++) {

@@ -157,6 +157,18 @@ enum kernel_open_file_status kernel_open_file_seek(
     struct kernel_open_file_description *file,
     uint64_t offset);
 
+/* Successful regular-file reads feed only this OFD's sequential predictor. */
+#if BOAROS_PAGE_CACHE_READAHEAD_PAGES
+void kernel_open_file_read_begin(struct kernel_open_file_description *file, uint64_t offset);
+void kernel_open_file_read_progress(struct kernel_open_file_description *file,
+    uint64_t offset, size_t count);
+#else
+static inline void kernel_open_file_read_begin(struct kernel_open_file_description *file,
+    uint64_t offset) { (void)file; (void)offset; }
+static inline void kernel_open_file_read_progress(struct kernel_open_file_description *file,
+    uint64_t offset, size_t count) { (void)file; (void)offset; (void)count; }
+#endif
+
 int kernel_open_file_memory_backed(struct kernel_open_file_description *file);
 /* Memory shared first-write notification; source pin owns the inode lifetime. */
 void kernel_open_file_memory_modified(struct kernel_open_file_description *file);

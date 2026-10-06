@@ -3161,6 +3161,104 @@ int ext4_fpread(const ext4_file *file, uint64_t offset, void *buf, size_t size, 
     return result;
 }
 
+/* The mount read lock stabilizes inode mappings and current cache versions. */
+int ext4_fpread_batch(const ext4_file *file, struct ext4_file_read_span *spans, unsigned count)
+{
+    if (!file || !file->mp || count > EXT4_BLOCK_BATCH_MAX || (count && !spans)) return EINVAL;
+    for (unsigned i = 0; i < count; i++) { spans[i].completed = 0; spans[i].error = EINVAL; }
+    for (unsigned i = 0; i < count; i++) {
+        uintptr_t a = (uintptr_t)spans[i].buffer;
+        size_t size = spans[i].size;
+        if (spans[i].offset > UINT64_MAX - size || (size && (!a || size - 1 > UINTPTR_MAX - a)))
+            return spans[i].error = EINVAL;
+        uintptr_t b = (uintptr_t)spans;
+        if (size && (a < b ? b - a < size : a - b < count * sizeof(*spans)))
+            return spans[i].error = EINVAL;
+        for (unsigned j = 0; j < i; j++) {
+            b = (uintptr_t)spans[j].buffer;
+            if (size && spans[j].size && (a < b ? b - a < size : a - b < spans[j].size))
+                return spans[i].error = EINVAL;
+        }
+    }
+    for (unsigned i = 0; i < count; i++) spans[i].error = EOK;
+    if (!count) return EOK;
+    const struct ext4_lock *locks = file->mp->os_locks;
+    if (locks && locks->read_lock) locks->read_lock(locks->context);
+    else EXT4_MP_LOCK(file->mp);
+    int result = EOK;
+    if (file->flags & O_WRONLY) { result = EPERM; goto Failed; }
+    struct ext4_fs *fs = &file->mp->fs;
+    struct ext4_inode_ref ref;
+    result = ext4_fs_get_inode_ref(fs, file->inode, &ref);
+    if (result) goto Failed;
+    uint64_t size = ext4_inode_get_size(&fs->sb, ref.inode);
+    if (size > file->fmax) { result = EFBIG; goto Put; }
+    unsigned block_size = ext4_sb_get_block_size(&fs->sb);
+    size_t limits[EXT4_BLOCK_BATCH_MAX];
+    bool inline_link = ext4_inode_is_type(&fs->sb, ref.inode, EXT4_INODE_MODE_SOFTLINK) &&
+        size < sizeof(ref.inode->blocks) && !ext4_inode_get_blocks_count(&fs->sb, ref.inode);
+    for (unsigned i = 0; i < count; i++) {
+        limits[i] = spans[i].offset >= size ? 0 : size - spans[i].offset < spans[i].size ?
+            (size_t)(size - spans[i].offset) : spans[i].size;
+        if (inline_link && limits[i]) {
+            memcpy(spans[i].buffer, (uint8_t *)ref.inode->blocks + spans[i].offset, limits[i]);
+            spans[i].completed = limits[i];
+        }
+    }
+    while (!inline_link) {
+        struct read_fragment { unsigned span, skip, block; size_t length; } fragments[EXT4_BLOCK_BATCH_MAX];
+        struct ext4_block blocks[EXT4_BLOCK_BATCH_MAX];
+        uint64_t lbas[EXT4_BLOCK_BATCH_MAX];
+        int errors[EXT4_BLOCK_BATCH_MAX], mapping_errors[EXT4_BLOCK_BATCH_MAX] = {0};
+        unsigned parts = 0, reads = 0;
+        for (unsigned i = 0; i < count && parts < EXT4_BLOCK_BATCH_MAX; i++) {
+            size_t planned = spans[i].completed;
+            while (!spans[i].error && planned < limits[i] && parts < EXT4_BLOCK_BATCH_MAX) {
+                uint64_t offset = spans[i].offset + planned;
+                unsigned skip = offset % block_size;
+                size_t length = block_size - skip;
+                if (length > limits[i] - planned) length = limits[i] - planned;
+                ext4_fsblk_t physical;
+                int r = ext4_fs_get_inode_dblk_idx(&ref, (ext4_lblk_t)(offset / block_size), &physical, true);
+                if (r) { mapping_errors[i] = r; break; }
+                fragments[parts++] = (struct read_fragment){i, skip, physical ? reads : EXT4_BLOCK_BATCH_MAX, length};
+                if (physical) lbas[reads++] = physical;
+                planned += length;
+            }
+        }
+        if (reads) ext4_block_get_batch(fs->bdev, blocks, lbas, errors, reads);
+        for (unsigned j = 0; j < parts; j++) {
+            struct read_fragment *part = &fragments[j];
+            struct ext4_file_read_span *span = &spans[part->span];
+            bool hole = part->block == EXT4_BLOCK_BATCH_MAX;
+            int r = hole ? EOK : errors[part->block];
+            if (!span->error) {
+                if (r) span->error = r;
+                else {
+                    uint8_t *out = (uint8_t *)span->buffer + span->completed;
+                    if (hole) memset(out, 0, part->length);
+                    else memcpy(out, blocks[part->block].data + part->skip, part->length);
+                    span->completed += part->length;
+                }
+            }
+            if (!hole && !r) {
+                r = ext4_block_set(fs->bdev, &blocks[part->block]);
+                if (!span->error) span->error = r;
+            }
+        }
+        for (unsigned i = 0; i < count; i++) if (!spans[i].error) spans[i].error = mapping_errors[i];
+        if (!parts) break;
+    }
+Put:
+    { int r = ext4_fs_put_inode_ref(&ref); if (!result) result = r; }
+Failed:
+    for (unsigned i = 0; i < count; i++) if (result && !spans[i].error) spans[i].error = result;
+    result = EOK;
+    for (unsigned i = 0; i < count; i++) if (!result) result = spans[i].error;
+    EXT4_MP_UNLOCK(file->mp);
+    return result;
+}
+
 int ext4_fwrite(ext4_file *file, const void *buf, size_t size, size_t *wcnt)
 {
 	uint32_t block_size;

@@ -62,6 +62,6 @@ uint16_t wire_used_read(volatile struct virtq_used *ring) { return ring->index; 
         "-DBOAROS_PAGE_SHIFT=12",
         *shlex.split(os.environ.get("CFLAGS", "")),
         "-Itests/host/random", "-idirafter", "include", "-I", str(work),
-        "tests/host/virtio_block_diagnostics.c", "-o", str(exe),
+        "tests/host/virtio_block_diagnostics.c", "kernel/block.c", "-o", str(exe),
     ], cwd=root, check=True)
     subprocess.run([str(exe), *os.sys.argv[1:]], check=True)

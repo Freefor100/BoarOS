@@ -169,6 +169,18 @@ def main(binary):
         session.process.stdin.flush()
         log = session.close(cut=True)
         assert "cause=control" in log and Path(image).read_bytes()[:512] == b"A" * 512
+        # Controlled teardown also discards replies still owned by the gate;
+        # the controller keeps the peer alive until the server acknowledges cut.
+        session = Session(binary, image, address, "--control-stdin")
+        session.process.stdin.write(b"hold\n"); session.process.stdin.flush()
+        assert session.process.stderr.readline() == b"control=hold\n"
+        session.socket.sendall(struct.pack(">IHHQQI", 0x25609513, 0, 0, 1, 0, 512))
+        assert session.process.stderr.readline().startswith(b"held=1 command=0 ")
+        session.process.stdin.write(b"cut\n"); session.process.stdin.flush()
+        session.process.wait(timeout=5)
+        assert session.process.returncode == 0 and session.socket.recv(1) == b""
+        log = session.close(cut=True)
+        assert "cause=control" in log and "released=" not in log
         print("NBD protocol, flush, errors and cut policies passed")
 
 

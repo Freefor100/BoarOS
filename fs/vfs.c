@@ -1147,6 +1147,8 @@ static void apply_truncated_size(struct kernel_vfs_node *node,
                                  struct kernel_vfs_file *file, uint64_t size)
 {
     uint64_t old_size = node->size;
+    if (size > old_size && node->instance->page_cache)
+        kernel_page_cache_extend(node->instance->page_cache, node, old_size, size);
     node->size = size;
     file->size = node->size;
     if (node->size < old_size) {
@@ -1155,10 +1157,8 @@ static void apply_truncated_size(struct kernel_vfs_node *node,
             mapping->truncate(mapping->owner, node, node->size);
         }
     }
-    if (node->instance->page_cache != 0) {
-        kernel_page_cache_resize(node->instance->page_cache, node,
-                                  old_size, node->size);
-    }
+    if (size < old_size && node->instance->page_cache)
+        kernel_page_cache_truncate(node->instance->page_cache, node, size);
 }
 
 int kernel_vfs_pwrite(struct kernel_vfs_file *file,
@@ -1887,7 +1887,8 @@ int kernel_vfs_node_release(struct kernel_vfs_node **owner)
         return 0;
     }
     if (node->references == 1U) {
-        if (node->mappings != 0 || node->fifo_pipe) __builtin_trap();
+        if (node->mappings != 0 || node->fifo_pipe || node->cache_pages ||
+            node->dirty_cache_pages.head || node->dirty_cache_pages.count) __builtin_trap();
         if (!kernel_record_lock_state_empty(&node->record_locks))
             __builtin_trap();
         node->references = 0U;
@@ -1934,6 +1935,9 @@ struct kernel_page_cache_entry **kernel_vfs_node_cache_pages(
 {
     return &node->cache_pages;
 }
+
+struct kernel_page_cache_dirty *kernel_vfs_node_dirty_pages(struct kernel_vfs_node *node)
+{ return &node->dirty_cache_pages; }
 
 void kernel_vfs_node_written(struct kernel_vfs_node *node, uint64_t end)
 {
@@ -2432,6 +2436,34 @@ int kernel_vfs_node_pread(struct kernel_vfs_node *node,
     if (!node || !node->mount || !node->mount->private_data) return -KERNEL_EINVAL;
     struct kernel_vfs_instance *instance = node->mount->private_data;
     return instance->ops->pread(node, offset, buffer, size, bytes_read);
+}
+
+int kernel_vfs_node_pread_batch(struct kernel_vfs_node *node,
+    struct kernel_vfs_read_span *spans, size_t count)
+{
+    if (!node || !node->mount || !node->mount->private_data ||
+        count > KERNEL_VFS_READ_BATCH_MAX || (count && !spans)) return -KERNEL_EINVAL;
+    for (size_t i = 0; i < count; i++) { spans[i].completed = 0; spans[i].error = -KERNEL_EINVAL; }
+    for (size_t i = 0; i < count; i++) {
+        uintptr_t a = (uintptr_t)spans[i].buffer, b = (uintptr_t)spans;
+        size_t n = spans[i].size;
+        if (spans[i].offset > INT64_MAX || n > UINT64_MAX - spans[i].offset ||
+            (n && (!a || n - 1 > UINTPTR_MAX - a ||
+            (a < b ? b - a < n : a - b < count * sizeof(*spans))))) return spans[i].error = -KERNEL_EINVAL;
+        for (size_t j = 0; j < i; j++) {
+            b = (uintptr_t)spans[j].buffer;
+            if (n && spans[j].size && (a < b ? b - a < n : a - b < spans[j].size)) return spans[i].error = -KERNEL_EINVAL;
+        }
+    }
+    for (size_t i = 0; i < count; i++) spans[i].error = 0;
+    struct kernel_vfs_instance *instance = node->mount->private_data;
+    if (instance->ops->pread_batch) return instance->ops->pread_batch(node, spans, count);
+    int result = 0;
+    for (size_t i = 0; i < count; i++) {
+        spans[i].error = instance->ops->pread(node, spans[i].offset, spans[i].buffer, spans[i].size, &spans[i].completed);
+        if (!result) result = spans[i].error;
+    }
+    return result;
 }
 
 int kernel_vfs_file_is_control(const struct kernel_vfs_file *file)

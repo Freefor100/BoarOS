@@ -168,7 +168,9 @@ make test-files-partial-write-riscv
   - 单次触发（`EPOLLONESHOT`）：事件交付后将 item 标记为 disarmed，直至用户显式通过 `EPOLL_CTL_MOD` 重新激活。
 - **OFD 双向解绑与所有权**：目标 OFD 中维护指向所有监视它的 `epitem` 双向链表（`file->ep_items`）。当目标 OFD 的底层释放时，自动触发 `kernel_epoll_notify_file_release()` 从所属 epoll 实例中解绑。销毁 epoll 实例时，逻辑解绑只执行一次，item 和 epoll 私有堆对象随后按正常 owner 顺序释放；物理页或堆释放若违反分配器不变量直接 fatal。若关联的 VFS/OFD 清理报告真实 I/O 错误，owner 留在文件表供后续回收，fd 槽已经摘除且再次 close 返回 `-EBADF`。
 - **休眠唤醒竞态防护**：`epoll_pwait` 进入休眠前关闭中断，在将当前任务挂入 `epoll->wait_queue` 后再次复核就绪列表；若在挂入瞬间发生唤醒，可立即捕获事件避免漏唤醒死锁。
-- **放宽 maxevents 与栈预算**：`epoll_pwait` 接受任意 `maxevents > 0`；快速路径在栈上维护至多 4 个事件缓冲（64 字节，`KERNEL_EPOLL_STACK_CAPACITY = 4`），超出时从堆分配并在返回前严格释放，守住内核栈 Canary。
+- **逐事件交付与扫描 owner**：每实例只有一个交付扫描，ready 批次与扫描期间的 pending 通知使用独立链。完整 16 字节 event 成功复制后才消费 ET 或解除 ONESHOT；fault 保留失败项和未处理项，返回完整交付前缀或首项 `EFAULT`。LT 回队去重，MOD 的控制代次使旧交付不能覆盖重装。
+- **睡眠与退出**：扫描引用保活 item，当前目标 OFD 单独 pin；DEL/close 先逻辑解绑，最后扫描引用释放才回收。任务登记整个等待请求，强制退出先归还扫描、pending 项和 OFD，再回收旧栈。一次只使用一个栈上 event，任意合法 maxevents 不再需要按数量分配事件数组。
+- **验证边界**：`make test-epoll-host` 直接编译生产实现，覆盖回调重入、复制期间 MOD/DEL/close/fd复用、第二等待者及取消；`make test-epoll-riscv` 用同一 ELF 对照固定 Linux，覆盖 LT/ET/ONESHOT 的首项、event内部和完整前缀 fault。依据与局限见[事件交付](../learning/epoll-delivery.md)。
 
 ## `lseek`、`fstat`/`newfstatat` 与 `getdents64`
 
@@ -386,3 +388,17 @@ OFD持有独立挂载错误游标，新打开从当前序号开始，dup/fork共
 快照、durable边界及OOM退路见[VFS契约](vfs-ext4.md)；窄入口为
 `make test-vfs-riscv test-files-riscv`及`tests/diff-abi/sync-cases.txt`，真实libc入口为
 `tests/userland/sync.h`。
+
+
+INET TCP 的流写接纳先于 payload usercopy：请求把 OFD pin 和 byte reservation 登记到当前任务，
+页内 iovec span 受接纳量限制，缺页睡眠期间 pin 保证 close/fd 复用不改变目标。
+完整请求正常展开或强制退出归还预留；同一次阻塞发送保留暂存后缀。
+数值地址范围检查仍在状态与容量判断之前，实际读页在之后；文件、UNIX 和数据报路径保持各自契约。
+接口与同 ELF 验证见[网络模块](kernel-network.md#tcp-发送接纳与复制2026-10-05)。
+
+
+普通磁盘文件的顺序预测保存在 OFD，dup 共享，独立 open 不共享。非零预读候选中，
+read/readv、pread 系列与 sendfile 在访问时间更新等首次可睡眠动作前调用
+`kernel_open_file_read_begin`，成功前缀才调用 read_progress；冷不连续读取不能先睡眠
+再撤销旧预测。seek 和最后释放 OFD 取消其 cookie，预读持有 inode 而非 fd 编号，
+因此 fd 复用不会继承旧预测。默认关闭及取消接纳边界见[VFS 预读](vfs-ext4.md#有界顺序预读候选)。

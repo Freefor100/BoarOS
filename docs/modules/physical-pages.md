@@ -168,3 +168,10 @@ slab 分配/释放和私有 slab 发布；压力模型验证递归抑制、等�
 内执行，`rmqueue_bulk` 使用 `spin_lock_irqsave` 保护摘链和 split。这里沿用的是共享
 元数据必须串行化的契约；BoarOS 当前实现只覆盖单 hart 的 IRQ/任务交错，并未移植 Linux
 的 SMP 锁或 per-CPU 分配机制。
+
+
+COST 构建维护 `allocated_peak_pages`：每次 bootstrap/buddy 成功发放及 finalize
+发布 metadata 占用后，按 total-available 更新初始化以来的真实最大受管占用。
+共享引用增加不算第二次分配，释放不降低高水位；连续分配计完整 order。
+默认构建编译掉字段和更新。`tests/cost/page_test.c` 验证 bootstrap、metadata、
+连续页、耗尽到满池和释放后的峰值保持；proc 诊断输出的口径见[procfs](procfs.md)。

@@ -16,6 +16,11 @@ struct riscv_net_statistics {
     uint64_t rx_packets, rx_bytes, tx_packets, tx_bytes, drops, errors, interrupts;
     uint64_t loan_packets, loan_bytes, loan_peak, copied_packets, copied_bytes;
     uint64_t tx_sg_packets, tx_copy_packets;
+#if BOAROS_COST_DIAGNOSTICS
+    uint64_t tx_done_free_count, tx_done_free_ticks, tx_done_free_max;
+    uint64_t tx_free_post_count, tx_free_post_ticks, tx_free_post_max;
+    uint64_t tx_latency_overflow;
+#endif
 };
 struct riscv_virtio_mmio_net {
     volatile uint8_t *mmio;
@@ -26,6 +31,12 @@ struct riscv_virtio_mmio_net {
     struct kernel_thread_join worker;
     struct riscv_net_statistics statistics;
     uint64_t tx_time[RISCV_NET_BUFFERS];
+#if BOAROS_COST_DIAGNOSTICS
+    /* 只记录软件收割完成；未使用槽及 reset 撤销不能伪造 DMA 完成样本。 */
+    uint64_t tx_done_time[RISCV_NET_BUFFERS], tx_free_time[RISCV_NET_BUFFERS];
+    uint64_t tx_done_valid, tx_free_valid;
+#endif
+    uint64_t tx_capacity_generation;
     uint32_t version, queue_order, irq_source, feature_low;
     uint32_t rx_posted, tx_posted;
     uint16_t available[2], consumed[2];
@@ -60,8 +71,8 @@ int riscv_virtio_mmio_net_send_copy(struct riscv_virtio_mmio_net *device, uint32
  * until the caller releases it. Needs the negotiated indirect feature. */
 int riscv_virtio_mmio_net_send_segments(struct riscv_virtio_mmio_net *device,
     const struct riscv_net_tx_segment *segments, unsigned count, void *owner);
-/* Release completed owners; abandon also returns posted/pending owners after
- * the device stopped its DMA. */
-void riscv_virtio_mmio_net_tx_release(struct riscv_virtio_mmio_net *device,
+/* Return the number of released owners; abandon also releases posted/pending
+ * owners after DMA stopped. tx_capacity_generation also includes copied TX. */
+unsigned riscv_virtio_mmio_net_tx_release(struct riscv_virtio_mmio_net *device,
     void (*release)(void *owner), int abandon);
 #endif

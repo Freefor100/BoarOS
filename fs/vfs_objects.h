@@ -34,6 +34,7 @@ struct kernel_vfs_node {
     struct kernel_pipe *fifo_pipe;
     struct kernel_vfs_node *next;
     struct kernel_page_cache_entry *cache_pages;
+    struct kernel_page_cache_dirty dirty_cache_pages;
     struct kernel_memory_object *memory;
     struct kernel_file_mapping *mappings;
     struct kernel_record_lock_state record_locks;
@@ -163,6 +164,8 @@ struct kernel_vfs_backend {
         void *buffer,
         size_t size,
         size_t *bytes_read);
+    int (*pread_batch)(struct kernel_vfs_node *node,
+        struct kernel_vfs_read_span *spans, size_t count);
     int (*memory_write)(struct kernel_vfs_node *node, uint64_t offset,
         const void *buffer, size_t size, size_t *written);
     int (*writeback)(struct kernel_vfs_node *node, uint64_t offset,

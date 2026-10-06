@@ -11,6 +11,10 @@ struct kernel_memory_object;
 struct kernel_memory_object *kernel_vfs_file_memory(const struct kernel_vfs_file *file);
 struct kernel_page_cache;
 struct kernel_page_cache_entry;
+struct kernel_page_cache_dirty {
+    struct kernel_page_cache_entry *head;
+    size_t count;
+};
 struct kernel_vfs_file;
 struct kernel_vfs_mount;
 struct kernel_vfs_node;
@@ -29,6 +33,18 @@ struct kernel_record_lock_state *kernel_vfs_node_record_locks(
 int kernel_vfs_node_acquire(struct kernel_vfs_node *node);
 int kernel_vfs_node_release(struct kernel_vfs_node **owner);
 
+#define KERNEL_VFS_READ_BATCH_MAX 8U
+struct kernel_vfs_read_span {
+    uint64_t offset;
+    void *buffer;
+    size_t size, completed;
+    int error;
+};
+/* Caller owns node/read gate and every destination until return. Successful
+ * spans may stop at EOF; errors preserve each contiguous byte prefix. */
+int kernel_vfs_node_pread_batch(struct kernel_vfs_node *node,
+    struct kernel_vfs_read_span *spans, size_t count);
+
 int kernel_vfs_node_pread(struct kernel_vfs_node *node,
                           uint64_t offset,
                           void *buffer,
@@ -44,6 +60,7 @@ int kernel_vfs_file_snapshot(const struct kernel_vfs_file *file,
 
 struct kernel_page_cache_entry **kernel_vfs_node_cache_pages(
     struct kernel_vfs_node *node);
+struct kernel_page_cache_dirty *kernel_vfs_node_dirty_pages(struct kernel_vfs_node *node);
 int kernel_vfs_node_writeback_allowed(const struct kernel_vfs_node *node);
 void kernel_vfs_node_written(struct kernel_vfs_node *node, uint64_t end);
 int kernel_vfs_node_writeback(struct kernel_vfs_node *node, uint64_t offset,

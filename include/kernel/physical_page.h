@@ -48,6 +48,9 @@ struct physical_page_allocator {
     void *buffer_context;
     uint64_t total_pages;
     uint64_t available_pages;
+#if BOAROS_COST_DIAGNOSTICS
+    uint64_t allocated_peak_pages; /* Allocator lifetime maximum, not a per-window peak. */
+#endif
     uint64_t recycled_head;
     uint64_t metadata_address;
     uint64_t metadata_pages;

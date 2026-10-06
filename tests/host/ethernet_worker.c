@@ -7,21 +7,42 @@
 
 static jmp_buf stopped;
 static uint64_t blocked_deadline;
-static unsigned expired, errors;
+static unsigned expired, errors, worker_mode, service_calls, protocol_attempts, sent, held, yields;
 uint64_t riscv_time_read(void) { return 1000; }
 int riscv_virtio_mmio_net_service(struct riscv_virtio_mmio_net *d)
-{ d->failed = 1; return -KERNEL_EIO; }
+{
+    if (!worker_mode) { d->failed = 1; return -KERNEL_EIO; }
+    if (++service_calls > 8) abort();
+    d->link_up = 1;
+    if (worker_mode == 2 && service_calls == 2) d->tx_done_count = 64;
+    if (worker_mode == 4 && service_calls == 2) { held = 0; d->tx_capacity_generation += 64; }
+    return 0;
+}
 int riscv_virtio_mmio_net_receive(struct riscv_virtio_mmio_net *d, struct riscv_net_frame *f)
 { (void)d; (void)f; return 0; }
 void netif_set_link_down(struct netif *n) { n->flags &= (u8_t)~NETIF_FLAG_LINK_UP; }
 void netif_set_link_up(struct netif *n) { n->flags |= NETIF_FLAG_LINK_UP; }
 void kernel_socket_network_failed(uint32_t address) { (void)address; errors++; }
-void kernel_socket_network_process(void) { expired = riscv_time_read() >= 950; }
+struct kernel_socket_service_result kernel_socket_service_pending(struct kernel_socket_service_budget budget)
+{
+    (void)budget;
+    expired = riscv_time_read() >= 950;
+    if (worker_mode) {
+        protocol_attempts++;
+        if (!sent && worker_mode != 3 && held < 64) { sent++; held++; }
+    }
+    return (struct kernel_socket_service_result){.runnable = worker_mode >= 5 && protocol_attempts == 1, .next_deadline = 1200};
+}
+uintptr_t kernel_socket_protocol_enter(void) { return 0; }
+void kernel_socket_protocol_leave(uintptr_t irq) { (void)irq; }
+int kernel_socket_work_pending(void) { return worker_mode >= 5 && protocol_attempts == 1; }
+void kernel_socket_network_capacity(void) {}
+void kernel_socket_network_blocked(void) {}
 uint64_t kernel_socket_next_timer_deadline(void) { return 1200; }
 enum kernel_scheduler_status kernel_scheduler_block_current(struct kernel_wait_queue *q,
     uint64_t deadline, int interruptible, enum kernel_wait_wake_reason *reason)
 { (void)q; (void)interruptible; (void)reason; blocked_deadline = deadline; longjmp(stopped, 1); }
-enum kernel_scheduler_status kernel_scheduler_yield_current(void) { return KERNEL_SCHEDULER_STATUS_OK; }
+enum kernel_scheduler_status kernel_scheduler_yield_current(void) { if (++yields > 4) abort(); return KERNEL_SCHEDULER_STATUS_OK; }
 
 /* RX boundary model: actual input decision, public pbuf refs and DMA loan API. */
 struct stats_ lwip_stats;
@@ -62,9 +83,18 @@ u8_t pbuf_free(struct pbuf *p)
     return 0;
 }
 void pbuf_ref(struct pbuf *p) { p->ref++; }
-void riscv_virtio_mmio_net_tx_release(struct riscv_virtio_mmio_net *d,
+unsigned riscv_virtio_mmio_net_tx_release(struct riscv_virtio_mmio_net *d,
     void (*release)(void *), int abandon)
-{ (void)d; (void)release; if (abandon) abandon_calls++; else drain_calls++; }
+{
+    (void)release;
+    unsigned released = d->tx_done_count;
+    if (abandon) abandon_calls++;
+    else {
+        drain_calls++;
+        if (worker_mode) { held -= d->tx_done_count; d->tx_capacity_generation += d->tx_done_count; d->tx_done_count = 0; }
+    }
+    return released;
+}
 int riscv_virtio_mmio_net_send_segments(struct riscv_virtio_mmio_net *d,
     const struct riscv_net_tx_segment *s, unsigned count, void *owner)
 { (void)d; (void)s; (void)count; (void)owner; return -KERNEL_ENOTSUP; }
@@ -125,5 +155,24 @@ int main(void)
     }
     printf("PASS failed-NIC preserves unrelated protocol timer progress, tx drain=%u abandon=%u\n",
            drain_calls, abandon_calls);
+    for (worker_mode = 1; worker_mode <= 5; worker_mode++) {
+        memset(&owner, 0, sizeof(owner)); owner.device.frequency = 100;
+        owner.device.tx_done_count = worker_mode == 2 || worker_mode == 4 ? 0 : 64;
+        held = 64; sent = service_calls = protocol_attempts = yields = 0;
+        if (!setjmp(stopped)) worker(&owner);
+        if ((worker_mode != 3 && sent != 1) || (worker_mode == 3 && (sent || protocol_attempts != 1 || yields))) {
+            printf("FAIL TX completion mode=%u attempts=%u sent=%u held=%u yields=%u\n",
+                worker_mode, protocol_attempts, sent, held, yields);
+            return 1;
+        }
+        printf("PASS TX completion mode=%u attempts=%u sent=%u held=%u yields=%u\n",
+            worker_mode, protocol_attempts, sent, held, yields);
+    }
+    worker_mode = 6; protocol_attempts = yields = sent = held = 0;
+    memset(&owner, 0, sizeof(owner)); owner.device.frequency = 100;
+    if (!setjmp(stopped)) timer_worker(&owner);
+    if (protocol_attempts != 2 || yields != 1 || blocked_deadline != 1200) return 1;
+    puts("PASS timer-only worker drains runnable software before sleeping");
+    worker_mode = 0;
     return receive_contract();
 }

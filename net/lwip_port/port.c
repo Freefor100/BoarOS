@@ -2,6 +2,7 @@
 #include <kernel/time.h>
 
 #include "lwip/sys.h"
+#include "boaros_lwip.h"
 
 #include <stdint.h>
 
@@ -44,3 +45,15 @@ int atoi(const char *text)
     }
     return (int)value;
 }
+
+static struct boaros_lwip_hooks protocol_hooks;
+void boaros_lwip_set_hooks(const struct boaros_lwip_hooks *hooks)
+{ protocol_hooks = hooks ? *hooks : (struct boaros_lwip_hooks){0}; }
+int boaros_lwip_tcp_input(struct tcp_pcb *pcb)
+{ if (protocol_hooks.input) protocol_hooks.input(pcb); return 0; }
+void boaros_lwip_work_ready(void)
+{ if (protocol_hooks.work) protocol_hooks.work(); }
+void boaros_lwip_capacity_available(int pool)
+{ if (protocol_hooks.capacity) protocol_hooks.capacity(pool); }
+void boaros_lwip_tcp_timewait_free(struct tcp_pcb *pcb)
+{ if (protocol_hooks.timewait_free) protocol_hooks.timewait_free(pcb); }

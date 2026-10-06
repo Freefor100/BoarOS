@@ -77,7 +77,7 @@ VFS 以文件系统实例与后端 inode 标识为活节点身份，普通文件
 
 每个 ext4 实例建立独立的 4 KiB 页缓存，键为 `(node, page_index)`：开放寻址哈希提供平均常数时间查找，双向 LRU 维护回收次序。缓存项持有 node 引用和一份物理页引用；命中时再给调用者一份临时引用，因此 `read`、不同 fd 与文件私有/共享映射可以安全引用同一页。共享 PTE 另持物理引用；MM 拥有的别名记录由缓存项反向索引借用，含别名的缓存项不能失效或回收。
 
-普通写把已复制的字节写入同一缓存页并更新 node 的逻辑大小；不同 fd、VFS pread、ELF 读源与映射缺页立即看到该内容。跨 EOF 的普通写先清零旧尾页中将要暴露的空隙；显式扩展亦清零新暴露字节，并重新保护共享别名，防止页仍可写时漏记脏。缓存项按 inode 另建双向链表，写回和显式失效只遍历该 inode 的页面，成本为 O(目标 inode 缓存页数)；按范围 `msync` 只提交目标文件页。每项保留脏范围、修改代次与 writeback 状态；写回前重新保护本页共享别名，再固定页面，只有完整提交且代次未变才清脏。失败保留缓存页/node owner，并记录 inode 的错误序列。lwext4 非 journal 写入/截断用操作范围固定本次修改的缓冲，建立完整的分配所有权后才提交该集合；不会全量 drain 历史 dirty list。底层最后引用的 flush 错误显式返回，失败缓冲仍在 mount dirty list。最后一个 fd 关闭不释放仍有脏页的 inode。
+普通写把已复制的字节写入同一缓存页并更新 node 的逻辑大小；不同 fd、VFS pread、ELF 读源与映射缺页立即看到该内容。跨 EOF 的普通写先清零旧尾页中将要暴露的空隙；显式扩展亦清零新暴露字节，并重新保护共享别名，防止页仍可写时漏记脏。缓存项按 inode 另建全页链供截断/失效使用，并维护独立脏页链与计数。范围写回比较目标页数和脏页数，选择页号哈希或脏链中较小的集合；按范围 `msync` 只提交目标文件页。每项保留脏范围、修改代次与 writeback 状态；写回前重新保护本页共享别名，再固定页面，只有完整提交且代次未变才清脏。失败保留缓存页/node owner，并记录 inode 的错误序列。lwext4 非 journal 写入/截断用操作范围固定本次修改的缓冲，建立完整的分配所有权后才提交该集合；不会全量 drain 历史 dirty list。底层最后引用的 flush 错误显式返回，失败缓冲仍在 mount dirty list。最后一个 fd 关闭不释放仍有脏页的 inode。
 
 截断只写回新 EOF 之前的脏范围，再调用后端；成功后按实际结果更新逻辑长度、通知 MM、丢弃越界页并清零尾页。后端失败且磁盘 size 未变时保留原逻辑长度与脏 owner，截零不需要保存待丢弃数据。删除仍打开的文件保留缓存；只有 orphan 最后一个打开/执行 owner 退出时，才丢弃已不再可观察的缓存并回收 inode。
 
@@ -159,10 +159,50 @@ cookie 可以交给 `lseek`/`telldir`/`seekdir` 恢复。OFD 持有位置，所�
 
 ## 当前成本边界
 
+增长与缩小分别进入 `kernel_page_cache_extend` 和 `kernel_page_cache_truncate`。
+增长只查询旧 EOF 的非对齐尾页，清零新暴露字节并重新保护别名，再发布长度；
+页对齐或同长度不访问 inode 页链，也不排空历史 cleanup。真正缩小仍在撤映射后
+处理越界页、尾页脏范围和 owner。该优化不改变私有 COW 副本，哈希探测与尾页
+实际别名工作单独计量。`make test-cache-growth-riscv` 在 COST 构建检查
+1/4/16/64 MiB × 1/4/64 KiB 写入的增长访问界及全文件内容，见[规模成本](../learning/single-hart-scale.md)。
+
 正确性验收不等于吞吐已优化。`fs/files/io.c` 先将用户数据复制到请求缓冲，
 再写页缓存；页级 staging 已减少分块和用户页解析次数，并非零复制。
-`kernel_page_cache_writeback_range()` 遍历 inode 的缓存页链两次，分配并 pin
-本次脏页集合后顺序写回；索引改善驻留查找，不等于已有范围脏页索引或批量提交。
+`kernel_page_cache_writeback_range()` 按 min(范围页数, inode 脏页数) 选择哈希或脏链，
+在首次 I/O 睡眠前分配并 pin 精确集合，再按页偏移排序。捕获区间关中断并禁止分配器
+进入回收 I/O，内存不足返回 ENOMEM；等待期间其他读者插入新页不会改变已选数组。
+首次标脏、映射变脏、成功写回、再次修改、截断和回收统一维护脏组织；旧代次完成不能
+摘掉新修改。选择成本不包含哈希冲突、实际别名数量及选中集合排序 O(K log K)。
+快照仍由独立页面持有，但只复制 dirty_begin 到 dirty_end 的实际区间；不能把省复制
+解释为取消稳定版本或减少已分配快照页。连续写回候选由编译配置
+`BOAROS_PAGE_CACHE_WRITEBACK_PAGES` 选择 1/2/4/8，生产默认仍为 1。
+范围写回与阈值 worker 均只合并同 inode、相邻且脏字节相接的页面，最多 32 KiB；
+首尾可为部分脏段，稀疏脏页与干净间隙不扩写。一次稳定快照调用现有
+`ext4_fpwrite`，由它建立整请求预留和一次私有 undo 操作；数据继续交给既有
+running group、封口版本与块批量写，ordered/log/commit/checkpoint 屏障不变。
+页缓存清脏表示后端已接受内容，durable 仍由同步接口等待。
+
+每个成员保留自己的 generation、writeback 状态和等待队列；旧快照完成不能清掉
+等待期间的新修改。前台连续快照分配失败时在提交前回退单页；后台每实例预留
+候选大小的连续快照，分配不足时逐级降到一页，启动后的批次受实际预留容量限制。
+停止并 join worker 后按原 allocation order 释放预留；设备 I/O 失败不触发拆批重试。
+worker 的成功/失败仍按页计，扫描轮次不作为后端批次数。
+
+`python3 -B tests/writeback-batch-riscv.py` 使用独立构建目录验证
+1/2/4/8 页与 1/4 KiB ext4，检查实际后端入口、部分首尾、范围裁剪、相邻脏段间隙、
+前台 OOM 回退、后台预留降级、真实线程重脏和快照稳定、短写/EIO 脏页保留、
+完整内容读回及 e2fsck。`make test-scale-riscv` 的独立 wrapper 另保护连续八页
+的有界后端交接。上述是局部正确性和成本门禁；改变私有操作大小后的完整恢复矩阵
+及真实程序性能测量仍需集成验收，不能用交接次数下降推导吞吐收益。
+
+完整覆盖冷缓存页仅接受已经稳定的内核输入；页面完成初始化、标脏和长度更新前保持
+loading，不先读取将被完全替换的旧页。部分页和用户 fault 留下的不足一页前缀保留旧路径。
+这省去页缓存到 VFS 的旧内容预读，不承诺 ext4 的块内合并、undo 或元数据读取也为零。
+小范围同步门禁用 64 MiB 文件的 16384 个实际常驻页：单页范围 1 次候选访问，
+3 个脏页全范围同步 3 次访问，16 个脏页中选一页仍 1 次；1 字节脏快照只复制 1 字节。
+规模准备采用稀疏零页，另独立验证第 0 页已存在且已同步的真实旧内容被完整覆盖。
+重建 `make test-scale-riscv test-cache-growth-riscv`；这是成本界验证，吞吐结果另行测量。
+
 `kernel_vfs_sync_range()` 依次交接数据、等待 full 同步序号；
 `kernel_vfs_sync()` 按 datasync 选择 full/data，journal 提交线程负责屏障。
 元数据随修改提交，频繁小写与逐次同步的事务/flush 放大尚需单独计量。
@@ -361,3 +401,64 @@ OFD 和控制终端保活配对，配对持有挂载 root/path 引用；挂载�
 而 worker 不永久 pin 自己的 root。卸载须先确认外部引用消失、停止并 join worker，
 再释放后端。TTY 的内部 base 引用不形成配对引用环。仅支持单 hart 的发布契约，
 不能把此实现作为跨核路径与 TTY 同步已经成立的证据。
+
+双盘暂扣/错误隔离门禁由guest显式配置单字节控制终端，避免规范输入阻塞握手；
+`make test-multi-disk-io-riscv test-multi-disk-rt-riscv`覆盖原故障/重启和实时负载。
+runner超时保存token及guest/NBD边界现场，CI已接入原双盘目标，见[可睡眠存储](../learning/sleepable-storage.md)。
+
+
+## 缓存版本内的批量读
+
+内部 `kernel_vfs_node_pread_batch` 接受最多八个独立输出区段。caller 在整个调用期间
+持有 inode/read gate 和所有输出；全部参数先检查，逐项返回连续成功前缀与负 errno，
+无批量后端时执行独立标量回退，不隐含完整批次成功或原子性。
+ext4 的 `ext4_fpread_batch` 持 mount read lock，按 extent/传统块映射处理洞、EOF 和
+块内片段；真实缺失块才进入最多八项的 `bread_batch`。`ext4_block_get_batch` 引用
+当前 bcache，dirty/journal-pending 数据优先；相同块的多个片段共用一次加载。
+为避免交叉等待尚未发布的 loading，本批自有加载全部发布、完成并唤醒后，才等待
+其他 owner 的既有加载。失败块释放本批引用，其余项可成功；读失败不记录为 inode
+写回错误。设备发布后的输出由块层持有至全部完成或确认 reset。
+
+`make test-lwext4-cache-host test-lwext4-batch-read-host` 覆盖共享加载、旧缓存版本保护、
+OOM、独立错误与重试；后者运行 1/4/8 KiB ext4、extent/传统映射的洞、EOF 和片段。
+`make test-io-sleep-riscv` 另用真实八页 VFS batch，要求在释放任何响应前发布八项，
+并验证保留最后一个 DMA 时取消不能提前返回。普通页缓存的顺序预读通过下述候选接入；该内部接口门禁不代表用户 read 的吞吐收益。
+
+
+深度至少 2 的 extent 树截断会修改非根内部索引；每次路径上移归还该引用前，必须
+通过 `ext4_ext_drop_refs` 重算已修改块的校验和。直接归还并清空块号会绕过最终
+checksum 更新，使下一轮合法查找返回 EUCLEAN。`make test-lwext4-deep-truncate-host`
+构造深层稀疏树，验证 1/4 KiB 文件系统部分截断、跨进程重启读回、截零和 e2fsck。
+
+
+## 有界顺序预读候选
+
+`BOAROS_PAGE_CACHE_READAHEAD_PAGES` 支持 0/1/2/4/8，默认 0；只有非零候选才创建
+每缓存实例的独立预读 worker。OFD 保存成功读取的末端和取消 cookie；read/pread/
+sendfile 在首次可能睡眠的 accessed、后端或 usercopy 之前执行 read_begin，立即取消
+不连续预测，read_progress 只登记成功前缀。两个连续片段在页边界完成后可申请下一窗口。
+seek、非顺序读、最后关闭、截断/失效、低水位和停止取消未接纳工作。
+
+队列固定八个 job，只持 inode pin；一实例同时处理一个最多八页批次。worker 取得
+inode read gate，复用 demand/full-overwrite 的 loading 页准备；已存在的页或加载由
+原 owner 处理，预读不交叉等待它。需求读可订阅已发布 loading，只有成功页面对外
+可见；错误页按用户引用收口，无关页面独立成功，也不记作 inode 写回错误。
+准备过程禁止分配回收 I/O，取消时已经有需求读者的页仍保留加载 owner。
+
+接纳点是进入一次 VFS batch：此前可以撤销，之后完整排空最多 32 KiB 的批次，
+包括 1 KiB ext4 内部的多轮块读，不声称逐 DMA 取消。stop 先撤未接纳 job，再 join
+已接纳批次，最后释放实例；截断/失效的 inode write gate 与加载互斥。每个批次完成后
+重新开放中断并让出，队列满或内存不足只放弃推测，不制造需求读错误。
+
+`make test-readahead-riscv` 覆盖全部窗口及 1/4 KiB ext4，验证实际缓存内容、窗口上限、
+seek/非顺序/关闭、冷不连续读、单页错误隔离、低水位、截断、unlink 和回收。
+`python3 -B tests/readahead-riscv.py --pages 1 8 --block-size 4096 --held --transport legacy`
+及 modern 模式使用 NBD 暂扣所有窗口 READ，再保留最后一个；需求读取者和 stop/join
+调用者均须保持等待，响应后才归还 owner。用户态组合、恢复与发布性能另行验收。
+
+
+SQLite NBD runner 的 marker 停机使用显式受控 cut：后端先冻结磁盘并确认退出零，
+再终止 guest，避免主动 kill 被误记成后端协议错误。默认及 RA8/WB8 的阶段七后
+完整 DELETE/WAL 恢复结果、未到达故障序号和输入身份见[最终恢复](../learning/record-lock-sqlite-recovery.md#数据路径最终恢复与宿主收口2026-10-06)。
+
+存储 20 组候选及 26 项扩展/同步负载已用发布构建三次独立启动比较，默认仍为 RA0/WB1。RA8 改善所测顺序冷读、WB8 改善显式同步，但 WB8 在 64 MiB 缓存追加有回退；冷热、tmpfs、缓存完成与 durable 同步分列于[报告及每文件完成时间](../learning/data-path-budget-experiments.md#正式匹配结果2026-10-06)。

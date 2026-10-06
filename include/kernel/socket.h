@@ -26,6 +26,8 @@ struct kernel_socket_read_request {
 };
 
 struct kernel_socket_write_request {
+    uint32_t reserved;
+    uint8_t progressed;
     struct kernel_socket *socket;
     struct kernel_task *task;
     void *packet;
@@ -39,6 +41,15 @@ int kernel_socket_write_datagram(struct kernel_open_file_description **pin_owner
     size_t iov_count, uint64_t count, uint32_t flags,
     const struct kernel_socket_address *destination);
 void kernel_socket_abort_write(struct kernel_socket_write_request *request);
+int kernel_socket_is_tcp(const struct kernel_socket *socket);
+void kernel_socket_stream_begin(struct kernel_socket_write_request *request,
+    struct kernel_open_file_description **pin_owner);
+int kernel_socket_stream_reserve(struct kernel_socket_write_request *request,
+    uint32_t size, uint32_t flags);
+int kernel_socket_stream_commit(struct kernel_socket_write_request *request,
+    const void *buffer, uint32_t size, uint32_t flags);
+void kernel_socket_stream_cancel(struct kernel_socket_write_request *request);
+void kernel_socket_stream_finish(struct kernel_socket_write_request *request);
 
 struct kernel_socket_statistics {
     uint64_t tcp_write_calls;
@@ -46,7 +57,7 @@ struct kernel_socket_statistics {
 };
 void kernel_socket_get_statistics(struct kernel_socket_statistics *statistics);
 #if BOAROS_COST_DIAGNOSTICS
-#define KERNEL_SOCKET_PROTOCOL_VALUES 16U
+#define KERNEL_SOCKET_PROTOCOL_VALUES 22U
 void kernel_socket_protocol_snapshot(uint64_t values[KERNEL_SOCKET_PROTOCOL_VALUES]);
 #endif
 
@@ -130,7 +141,6 @@ uint64_t kernel_socket_receive_timeout(const struct kernel_socket *socket);
 uint32_t kernel_socket_poll(struct kernel_socket *socket,
                             struct kernel_wait_queue **queue);
 struct kernel_wait_queue *kernel_socket_wait_queue(struct kernel_socket *socket);
-uint64_t kernel_socket_next_timer_deadline(void);
 void kernel_socket_expire_timers(void);
 int kernel_socket_loopback_flags(const char name[16], uint16_t *flags);
 int kernel_socket_set_loopback_flags(const char name[16], uint16_t flags);
@@ -145,8 +155,19 @@ int kernel_socket_interface_index(uint32_t index, struct kernel_socket_interface
 int kernel_socket_interface_nth(uint32_t ordinal, struct kernel_socket_interface *snapshot);
 int kernel_socket_interface_set_flags(const char name[16], uint16_t flags);
 void kernel_socket_network_initialize(void);
-void kernel_socket_network_process(void);
+struct kernel_socket_service_budget { unsigned sockets, packets, timers; };
+struct kernel_socket_service_result {
+    unsigned sockets, packets, timers, runnable;
+    uint64_t next_deadline;
+};
+uintptr_t kernel_socket_protocol_enter(void);
+void kernel_socket_protocol_leave(uintptr_t interrupts);
+struct kernel_socket_service_result kernel_socket_service_pending(struct kernel_socket_service_budget budget);
+int kernel_socket_work_pending(void);
+void kernel_socket_network_capacity(void);
+void kernel_socket_network_blocked(void);
 void kernel_socket_network_failed(uint32_t address);
-void kernel_socket_network_hooks(void (*timer_wake)(void *), int (*udp_capacity)(void *), void *context);
+void kernel_socket_network_hooks(void (*timer_wake)(void *), void (*work_wake)(void *),
+    int (*udp_capacity)(void *), void *context);
 
 #endif

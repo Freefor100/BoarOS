@@ -97,3 +97,36 @@ PR CI 增加可睡眠存储并发门槛，失败保存 guest/server 日志和磁
 如果打开者要等inode锁，必须先取得独立node pin。锁持有者可在交接资格之后
 立即回收缓存页，锁资格不等于对象的生命周期owner。成功时临时pin转为file
 引用，错误时先解锁再归还pin，真实后端关闭错误继续归mount清理owner。
+
+## 双盘控制终端与握手超时（2026-10-05）
+
+`test-multi-disk-io-riscv` 在旧基线和本轮修复前内核均90秒超时，guest最后阶段为
+`multi-disk: hold ready`，串口回显g；B盘host已输出`control=hold`，却没有
+`held=... command=0`。阻塞发生在首次控制字符读取，尚未进入被暂扣的设备READ。
+同一内核/ELF仅让host用g+规范模式EOF结束输入，原四组合及重启全部通过。
+这个对照定位的是测试控制协议，不能用于推断不存在其他存储进展缺陷。
+
+正式修复由guest读取并保存termios，关闭ICANON/ECHO，设置VMIN=1/VTIME=0，
+正常退出恢复；子进程使用_exit，不提前恢复父进程仍使用的控制终端。host仍发单字节g。
+初始化失败明确返回；超时保留JSON现场，含已发送token及边界、hold/release/fault状态、
+guest PID和guest/A/B日志尾部。真正进入设备等待后再根据实际owner和块诊断调查。
+
+`make test-multi-disk-io-riscv test-multi-disk-rt-riscv`通过：legacy/modern ×
+writeback/writethrough的原写/flush故障与重启组合、FIFO/RR下双盘进展和资源收口。
+本轮QEMU11.1.1；RT运行最大栈使用3928字节、最小余量4248字节。CI新增原双盘门禁
+及失败现场归档；此处不宣称托管CI已运行。测试协调修复没有改变TTY默认语义或磁盘锁。
+
+## 双盘受控收口（2026-10-06）
+
+最终回归的前三组故障/重启通过，legacy/writethrough/write 在已打印 `B isolated
+owner retained` 后失败。未改算法的退出码探针再次得到 guest=-9、A=1、B=0；
+源代码显示 runner 主动 kill QEMU 与 A 盘未完成的 NBD response write 竞争，
+这不同于此前规范模式终端阻塞。客体已完成 B 错误观察和 A 持久同步，不能把此
+服务器传输失败写成 guest 丢失进展，也不能直接放宽服务器退出断言。
+
+runner 改用已有 `cut` 命令：先保存完成检查点，分别等待两盘 `cause=control`
+回执并保持退出码为零，再杀 QEMU。断线诱导的后续输出保留在原日志；检查点以前
+的内核错误、健康盘 I/O 错误仍拒绝通过。每次退出另存进程状态与 cut 回执，
+冷重启和 fsck 检查保持原样。NBD 宿主测试覆盖受控 cut 丢弃尚在 gate 中的 READ
+回复且不交付伪成功。四组故障/重启、四组 FIFO/RR 矩阵和触发竞态配置的另 30 次
+独立故障/冷重启均通过；这些是正确性验证，不能作为吞吐测量。

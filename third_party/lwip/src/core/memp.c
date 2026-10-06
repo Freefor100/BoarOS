@@ -438,6 +438,9 @@ memp_free(memp_t type, void *mem)
 #endif
 
   do_memp_free_pool(memp_pools[type], mem);
+#ifdef LWIP_HOOK_MEMP_RELEASED
+  LWIP_HOOK_MEMP_RELEASED(type);
+#endif
 
 #ifdef LWIP_HOOK_MEMP_AVAILABLE
   if (old_first == NULL) {

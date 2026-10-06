@@ -664,6 +664,14 @@ test-lwext4-cost-host:
 	sh tests/lwext4-cost-host.sh
 
 .PHONY: test-lwext4-cache-host
+.PHONY: test-lwext4-deep-truncate-host
+test-lwext4-deep-truncate-host:
+	sh tests/lwext4-deep-truncate-host.sh
+
+.PHONY: test-lwext4-batch-read-host
+test-lwext4-batch-read-host:
+	sh tests/lwext4-batch-read-host.sh
+
 test-lwext4-cache-host:
 	sh tests/lwext4-cache-host.sh
 
@@ -1563,8 +1571,10 @@ $(BUILD_DIR)/tests/kernel-scale-rv: $(SCALE_OBJECTS) arch/riscv/linker.ld
 	$(CC) $(LDFLAGS) -Wl,--wrap=riscv_sv39_current_satp \
 		-Wl,--wrap=physical_page_allocate -Wl,--wrap=kernel_heap_allocate_zeroed \
 		-Wl,--wrap=kernel_heap_resize -Wl,--wrap=kernel_heap_allocate \
-		-Wl,--wrap=kernel_copy_from_user \
+		-Wl,--wrap=kernel_copy_from_user -Wl,--wrap=kernel_vfs_node_pread -Wl,--wrap=kernel_vfs_node_writeback \
 		-Wl,--wrap=kernel_wait_queue_wake_all \
+		-Wl,--wrap=netif_poll_all -Wl,--wrap=sys_check_timeouts -Wl,--wrap=sys_now \
+		-Wl,--wrap=netif_poll_budget -Wl,--wrap=sys_check_timeouts_budget \
 		-o $@ $(SCALE_OBJECTS)
 .PHONY: test-scale-riscv
 test-scale-riscv: $(BUILD_DIR)/tests/kernel-scale-rv
@@ -1788,3 +1798,28 @@ test-pty-riscv: $(KERNEL_RV) $(MUSL_STAMP)
 test-pty-apps-riscv: $(KERNEL_RV) $(MUSL_STAMP)
 	python3 -B tests/tty/pty_riscv.py --case libc --kernel $(KERNEL_RV) --qemu $(QEMU_RISCV64)
 	python3 -B tests/tty/pty_riscv.py --case script --kernel $(KERNEL_RV) --qemu $(QEMU_RISCV64)
+
+.PHONY: test-epoll-host test-epoll-riscv
+test-epoll-host:
+	@mkdir -p build/host
+	cc -std=c11 -O1 -g -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=12 \
+		-ffunction-sections -fdata-sections -Wl,--gc-sections \
+		-Itests/host/random -idirafter include -fsanitize=address,undefined \
+		tests/host/epoll_delivery.c -o build/host/epoll-delivery
+	build/host/epoll-delivery
+test-epoll-riscv: $(KERNEL_RV) $(MUSL_STAMP)
+	python3 -B tests/epoll-riscv.py --kernel $(KERNEL_RV) --qemu $(QEMU_RISCV64)
+
+.PHONY: test-cache-growth-riscv
+test-cache-growth-riscv:
+	$(MAKE) COST_DIAGNOSTICS=1 test-scale-riscv
+
+$(BUILD_DIR)/tests/riscv/scale_main.o: CPPFLAGS += $(LWIP_CPPFLAGS)
+
+.PHONY: test-writeback-batch-riscv
+test-writeback-batch-riscv:
+	python3 -B tests/writeback-batch-riscv.py
+
+.PHONY: test-readahead-riscv
+test-readahead-riscv:
+	python3 -B tests/readahead-riscv.py

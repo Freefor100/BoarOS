@@ -18,7 +18,13 @@ IPv4 重组键包括源/目的地址、IP ID、协议号和输入 netif 身份�
 
 当前支持 `AF_INET`/`AF_INET6` 的 `SOCK_DGRAM`/`SOCK_STREAM`，`SOCK_CLOEXEC`、`SOCK_NONBLOCK`，UDP bind/getsockname/sendto/recvfrom 和 `SO_RCVTIMEO`，TCP bind/listen/connect/accept，以及连接后的普通读写和就绪。`ioctl(SIOCGIFFLAGS/SIOCSIFFLAGS)` 让真实用户程序启用 `lo`；接口对象从公开 `netif_list` 查找。地址在 syscall 边界使用 RV64 `sockaddr_in`/`sockaddr_in6` 布局；内核地址携带族、16 字节网络序地址、宿主序端口和 scope。官方 loopif 提供 `::1`；IPv6 通配监听默认接收 IPv4，accept 返回映射地址。V6ONLY 在绑定前生效，双栈通配与纯 IPv6/IPv4 的端口交集由非持引用的 endpoint 登记补齐 lwIP TCP bind 的 ANY 检查缺口。登记在 OFD 销毁前摘除。非阻塞、坏 fd/地址/指针和协议错误由固定 Linux 同一 ELF 差分约束。未覆盖的地址族、选项和操作返回明确 errno，不伪造成功。
 
-单 hart 下，登记/检查就绪与睡眠用已有关中断临界区。socket syscall 与轮询入口推进 lwIP loopback 队列和协议定时器；非阻塞 connect 发出 SYN 后立即推进一次，保证已经睡眠的另一进程 accept 能被唤醒，而不依赖客户端下一次系统调用。阻塞 connect 等到握手结果，阻塞接收以 socket 队列或协议定时器唤醒；通用 poll/ppoll 和 epoll/epoll_pwait 在监听 socket 时也把最近协议定时器纳入睡眠期限，包含混合普通 fd 和无限等待。信号沿既有 syscall restart 协议，带接收超时的中断返回 `EINTR`。待 accept 子连接在对端 reset 后从队列摘除；未 listen 的 stream 和 datagram accept 立即返回类型对应错误，监听 socket 的 `SO_RCVTIMEO` 约束阻塞 accept。
+单 hart 下，就绪订阅与睡眠沿已有短临界区。`kernel_socket_poll` 是局部只读快照，不推进协议、不清理 accept、不解除写重试、不消费错误。监听就绪由接纳/失效回调维护 live 数；失效 child 的销毁由待工作集合处理。TIME_WAIT 可由工作批次提前解绑，在协议释放边界仍同步确保借用撤销。poll/epoll 与阻塞 syscall 只订阅对象通知和调用者期限。
+
+短 syscall 在完整 raw 调用退出后可执行有界服务；网络 worker 与无 NIC worker 使用同一 `kernel_socket_service_pending`。每批分别限制 RX 八帧、loopback 八包、socket 八个工作单元及一个 timer 回调。socket 单元包含容量转交、到期重试、实际对象工作，三类轮转；协议池、NIC、接收堆等待集合也轮转。零预算不消费对应工作，返回值报告处理量、是否可立即继续及下一期限。unsent 等待远端窗口或 ACK 不会自行重新入队；预算耗尽且仍有工作时开放中断并让出，睡前再次查软件工作与设备完成。
+
+`kernel_socket_protocol_enter/leave` 记录当前任务的执行资格，禁止 raw 调用期间堆回收进入可睡眠 I/O；单 hart SIE 仍负责串行化。用户复制、设备等待和调度不持此资格，回调仅发布弱引用工作。socket 销毁前解绑所有队列；NIC 完成、每次 segment/pbuf/协议堆归还、接收堆释放、loopback 入队和 timer 到期各自发布通知。失败 NIC 不影响 loopback 和协议期限。无 NIC 运行期 IRQ 只唤醒 worker；尚未建立 worker 的模块启动边界保留无堆分配的有限 timer 入口。这不是 SMP 锁或硬实时上界，单个 raw 调用和单个 timer 回调仍完整执行。
+
+非阻塞 connect 短路径推进握手，后台保证调用者不再调用 socket 时仍能进展；阻塞 connect 等待握手结果。信号沿既有 syscall restart 协议，带接收超时的中断返回 `EINTR`。未 listen 的 stream 和 datagram accept 立即返回类型对应错误，监听 socket 的 `SO_RCVTIMEO` 约束阻塞 accept。
 
 普通 socket read/readv 使用“预留队首片段→按偏移复制→提交/取消”。用户容量决定 UDP 的截断长度，一个报文可经请求持有的 4 KiB 页反复复制，最终只消费一次；不能以内部暂存容量截断报文。零长度 datagram 也必须完成 reservation；TCP EOF 没有 reservation。TCP 在用户容量内继续读取已排队片段，取得进展后不等待新数据。每段完整复制后才消费；当前段 fault 保留整段，返回先前已提交的字节数，没有先前进展则 EFAULT。UDP fault 丢弃当前 datagram。read reservation 独占队首，第二个 read/recvfrom 不得越过它。
 
@@ -30,16 +36,35 @@ IPv4 重组键包括源/目的地址、IP ID、协议号和输入 netif 身份�
 先标记/唤醒，保存的syscall栈返回后才在user-return处理终止；正常和取消路径
 均须平衡临时owner。以后若允许直接抛弃内核调用栈，必须重新审计这条契约。
 
-TCP `POLLOUT` 同时要求发送缓冲和队列空间。`tcp_write` 还可能因全局 segment/pbuf 池满而返回 `ERR_MEM`，此时 socket 撤下可写事件并登记有界重试期限；ACK、成功写、错误或销毁解除登记。重试链按期限有序，等待者只读链首与最近的 lwIP 协议期限，池释放后即使没有 ACK 也能继续，而不会因虚假的 `POLLOUT` 在单 hart 上空转。`F_SETFL(F_GETFL|O_NONBLOCK)` 接受已有 access mode 位，只更新可变状态位。
+TCP `POLLOUT` 同时要求发送缓冲、队列空间及未被真实 `ERR_MEM` 阻塞。失败后登记协议池等待及 250 ms 兜底；每次真实资源归还更新容量代次，仅恢复旧代次等待者，避免失败分配自行释放资源造成忙等。不能仅采用 lwIP 的“空池变为非空”通知：多 segment 请求可能在空闲池已有一个元素时仍失败，第二个元素释放必须促成进展。期限只由后台服务推进，等待 syscall 不再为协议设置兜底轮询。`F_SETFL(F_GETFL|O_NONBLOCK)` 接受已有 access mode 位，只更新可变状态位。
 
 关闭活动 TCP 连接先解绑全部指向 BoarOS socket 的回调，再 `tcp_close`；协议 FIN/TIME_WAIT 可能暂占静态 PCB/segment 池，随后由定时器回收。这与内核堆对象生命周期分开。
+
+`socket->tcp` 是对 lwIP PCB 的借用，不延长协议对象寿命。普通工作批次可提前
+解绑 TIME_WAIT，但预算不足时不能把生命周期责任留到下一批。固定 lwIP 的
+`tcp_alloc()` 会在 PCB 池满时通过 `tcp_kill_timewait()` / `tcp_abort()` 回收
+TIME_WAIT；该分支不执行普通错误回调，并且 `tcp_pcb_remove()` 会把状态改为
+CLOSED。当前在该分支 remove 之前，以及慢定时器从 TIME_WAIT 链摘除对象后、
+free 之前调用本地可选 `LWIP_HOOK_TCP_TIMEWAIT_FREE`。socket 层仅接受
+`callback_arg` 与自身错误回调配对的 PCB，验证借用身份后清空借用及回调、撤销
+容量/重试等待并唤醒。hook 不分配、不睡眠、不重新调用 raw API、不销毁堆
+socket，也不遍历全局 socket registry。OFD 销毁仍先清回调，再释放 socket，
+因此稍后的 TIME_WAIT 回收不会回调已经销毁的 owner。
+
+固定依据为 `references/lwip/src/core/tcp.c`，commit
+`77dcd25a72509eb83f72b033d219b1d40cd8eb95` 的 `tcp_abandon()`、
+`tcp_pcb_remove()`、`tcp_slowtmr()` 与 `tcp_alloc()`；生产本地补丁位于
+`third_party/lwip/src/core/tcp.c`。`python3 -B tests/host/network_owner.py --sanitize`
+连接实际 socket、Ethernet 与 lwIP，使用真实堆 socket 完成握手和半关闭，并在
+关闭工作尚未服务时验证容量回收及 timer 到期均清空借用；同时检查非 socket
+raw PCB 和已经销毁的 socket，不用无 owner 的 raw PCB 代替主要所有权用例。
 
 支持 `AF_UNIX` (domain=1) 的 `socketpair(199)` 系统调用，支持 `SOCK_STREAM` 和 `SOCK_DGRAM` 类型以及 `SOCK_CLOEXEC`、`SOCK_NONBLOCK`。`kernel_files_socketpair_create` 保证双向 OFD 的原子分配与双 fd 安装，失败时完整回滚不泄露 fd 或 OFD。两个 endpoint 在内核中互相绑定 peer；流和数据报在接收端堆上排队，每个 socket 拥有 64 KiB 独立接收缓冲配额（超出时返回 `-EAGAIN` 并在接收端读取后唤醒对端写者）。向已关闭或断开的对端写入向调用任务产生 `SIGPIPE` 并返回 `-EPIPE`；读取已关闭对端返回 0 (EOF)；`SOCK_DGRAM` 将一次 write/writev 聚合为一条消息，64 KiB 上限之外返回 EMSGSIZE；用户复制全部成功后才移动整包 owner，fault/OOM/取消不发布前缀。队列按 `max(length, 1)` 收取预算，零长度消息可入队。容量不足时等待整条消息可容纳，不以普通 POLLOUT 作为重试条件；短读、复制 fault 或销毁释放整包及其全部预算。发送请求登记在任务上，退出前撤销临时 packet 与 OFD pin。poll/ppoll/epoll 准确反映对端关闭时的 `POLLHUP`/`POLLIN` 就绪。命名 AF_UNIX 端点、SCM_RIGHTS 凭据传递、带 ancillary 的 sendmsg/recvmsg、更多 sockopt、外部 IPv6 与 SMP 并发仍在 `docs/goals.md`，不能由本切片推出。
 
 ## 验证
 
 ```sh
-make test-lwip-host
+make test-lwip-host test-lwip-reassembly-host test-ethernet-worker-host
 make test-network-riscv         # IPv6 UDP/TCP、双栈 accept，同一 ELF 对照 Linux
 make test-scale-riscv
 make test-syscall-riscv test-userland-riscv test-diff-abi-riscv test-stack-usage
@@ -87,13 +112,9 @@ ECONNRESET；SO_ERROR 或读/写消费 pending error，后续 EOF/EPIPE 由真�
 accept callback 延迟释放 backlog 资格，真正 accept 时归还；失败安装销毁 child，
 reset 排队 child 在下次检查摘除。监听器的预算、超时和选项传给 child，NODELAY
 同时设置实际 PCB。TIME_WAIT 在移交协议池前摘除所有堆回调；LAST_ACK 的
-ERR_CLSD 解除 PCB 借用。timer IRQ 推进协议期限，不处理新收包/accept，防止
-最后 OFD 关闭后定时回收依赖另一个用户 syscall。
+ERR_CLSD 解除 PCB 借用。运行期 timer IRQ 只通知后台 owner；最后 OFD 关闭后的协议回收不依赖另一个用户 syscall。
 
-IRQ 推进时，TCP 非空 refused-data 回调只保留协议 pbuf、登记重试并唤醒，
-不申请内核堆。调用上下文显式重试这些数据，不能仅期待下一次 timer 恰好从
-syscall 运行。FIN、错误和池回收不分配堆，继续在期限到达时推进。scale 的
-独立堆包装器强制首次接收 OOM，证明 IRQ 重试零堆调用且随后内容完整接纳。
+模块启动的 IRQ fallback 中，TCP refused-data 只保留 pbuf 并登记重试，不申请内核堆；运行期由 worker 处理接收堆归还或到期重试。scale 的独立堆包装器保留首次接收 OOM/IRQ 零堆分配回归。
 UDP 分别记录显式地址与非零端口绑定，AF_UNSPEC 断开释放自动端口；TCP
 MSG_TRUNC 沿 reservation 消费而跳过 scratch/usercopy，UDP 和 UNIX 保持各自语义。
 
@@ -190,3 +211,54 @@ reset确认；设备失败不等于DMA停止，TX在途owner与RX借用一律保
 （每包最多两段镜像内 payload，其余回退复制），用户接收复制仍在；没有外部IPv6、
 DHCP/DNS/TLS或默认网关。结果、效率、
 程序与最终卸载计时边界见[真实网卡记录](../learning/network-ownership.md#真实-virtio-net-与宿主应用交付2026-10-02)。
+
+TX 的 SG 与复制回退在槽满时都登记 NIC 容量等待。无 indirect 特性或 pbuf 链
+不满足 SG 条件时，复制发送返回 `EAGAIN` 仍属于 NIC 槽不足，不能落入协议池
+等待。上述 `network_owner.py` 分别覆盖两种回退原因，冻结时钟、禁用包与 timer
+服务并确认协议池没有归还，仅通知 NIC 新容量就能重新输出实际 TCP 内容；
+该边界测试不把正常 timer 重传当作容量通知正确的证据。
+
+
+纯查询及预算回归位于 `tests/riscv/scale_main.c`：16 个无关 socket 下的 64 次 poll 没有协议调用；零/一单元服务遵守预算并最终交付完整内容。协议池回归冻结时钟且禁用包与 timer 服务，证明“空闲 segment 已有一个，再释放一个”足以恢复真正等待者。`make test-cache-growth-riscv` 的 COST 构建同时核对 poll 触发服务数和全局扫描数均为零；全局 registry 只用于 bind 冲突、销毁解绑与设备故障。重建与证据层次见[网络记录](../learning/network-ownership.md#纯就绪与有界协议服务2026-10-05)。
+
+
+## TCP 发送接纳与复制（2026-10-05）
+
+INET stream 的 write/writev/send/sendmsg 使用任务登记的 `kernel_socket_write_request`，
+与数据报请求共用退出登记但不拥有数据报 packet。请求持有原 OFD pin，
+`stream_reserve/commit/cancel` 只预留本 socket 的 TCP 接纳字节，按 sndbuf、socket 预算、
+队列空间及已经预留量决定上限，不预占 segment、pbuf 或 NIC 槽。其他 writer、sendfile
+及 POLLOUT 都扣除现存预留；SO_SNDBUF 缩小或连接状态变化后，commit 再检查真实状态。
+用户复制可缺页睡眠，不持 raw 资格；取消、fault、错误、返回和任务退出均归还未提交预算。
+
+扩展现有 iovec cursor 提供页内有界 span。先验证参数的数值范围及连接状态，再取得接纳量，
+最后才取得任务 scratch 并复制 payload；预先无容量不解析用户页。协议资源可能在复制时变化，
+此时仍可能发生有界的零进度失败。阻塞调用保留暂存后缀，重取预算后继续提交，
+不再次复制后缀；非阻塞返回已接受前缀，未接受用户内容不跨调用持有。仍用
+`tcp_write(COPY)`，scratch 不借给 TCP 到 ACK。本阶段不改变 UNIX stream 和数据报的缓冲策略。
+
+固定 Linux 的 `net/socket.c` 和 `net/ipv4/tcp.c` 约束状态与 payload fault 顺序：
+数值越界地址先 EFAULT；有效地址范围中的不可读页在满缓冲时为 EAGAIN，
+在关闭/未连接时为 EPIPE，NOSIGNAL 仅抑制 SIGPIPE。空 TCP 发送也检查终止状态。
+`tests/workloads/network/admission.c` 由 `network-riscv.py --workload admission` 在同 ELF 双侧验证，
+包含头/iovec fault、范围错误、部分接受字节守恒、SIGPIPE 与实际阻塞发送者 SIGKILL。
+已有进展时的 shutdown 返回正前缀且不发 SIGPIPE；RST 后也保留 pending error，下一次调用才观察并消费 ECONNRESET。
+跨页 fault 的提交片段大小是内部策略：本输入 Linux 未提交返回 EFAULT，BoarOS 返回已提交
+4096 字节，测试分别验证接收量与返回值，不能将该项写成逐值差分一致。
+
+scale 保护竞争 reservation、abort 归还及零容量下零页解析/零 stream usercopy；
+真实调度的 io-sleep 包装用户复制边界，覆盖保留 reservation 时关闭并复用 fd、并发 shutdown、
+用户页撤销后的 fault 和预算重取。它模型化可睡眠复制的交错，不宣称复现硬件缺页的具体时序。
+
+`python3 -B tests/network-owner-riscv.py --kernel kernel-rv` 在 legacy/modern
+两种 VirtIO 传输下关闭 indirect 特性，以真实 TAP 的双向 bulk/control 内容检查
+验证复制路径，并要求 driver 的 `tx-copy>0`、`tx-sg=0`、`errors=0`。该入口只运行
+功能 smoke；它与冻结资源边界的 host 用例共同验证，不单靠最终传输成功证明
+NIC 容量通知没有遗漏。
+
+TCP 的 27 组窗口/池/堆候选由 `BOAROS_LWIP_WINDOW_MSS`、`BOAROS_LWIP_POOL_SCALE`、
+`BOAROS_LWIP_MEM_SCALE` 选择，默认 8/1/1，PCB 数不变。工具、静态/动态内存口径、
+控制流 tail 与固定输入约束见[预算实验](../learning/data-path-budget-experiments.md)，
+可运行候选不等于吞吐已经验收，默认值须依据匹配结果由人选择。
+
+阶段七已完成 TCP 27 组预算的发布筛选、30 项组合扩展与独立 COST 诊断；PCB 仍为 32，生产仍为 8 MSS/池 1 倍/堆 1 倍。默认预算的吞吐回退、全局池/堆饱和和 8/4/2 的有限负载收益均保留在[实验报告](../learning/data-path-budget-experiments.md#正式匹配结果2026-10-06)，不以零 poll 服务次数代替端到端收益。
