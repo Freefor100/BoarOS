@@ -9,6 +9,7 @@
 #include <kernel/errno.h>
 #include <kernel/signal.h>
 #include <kernel/console.h>
+#include <kernel/uaccess.h>
 #include <platform/loongarch_pci.h>
 void la_trap_entry(void);
 void la_trap_initialize(void)
@@ -93,7 +94,19 @@ void la_trap_dispatch(struct arch_trap_frame *frame)
         frame->regs[4]=(uint64_t)result.value; frame->era+=4; return;
     }
     if (user) {
-        if(code==12) fault(5,1,frame->era);
+        if(code==12) {
+            struct kernel_mm *mm;uint32_t instruction;size_t copied;
+            if(kernel_task_mm_borrow_mutable(kernel_task_current(),&mm)!=KERNEL_TASK_STATUS_OK)
+                la_virt_fatal("break MM owner");
+            if(kernel_copy_from_user(mm,&instruction,frame->era,sizeof(instruction),&copied)!=KERNEL_UACCESS_STATUS_OK || copied!=sizeof(instruction))
+                fault(11,128,0);
+            else {
+                /* Linux do_bp 用 break immediate 区分软件整数溢出与除零。 */
+                uint32_t immediate=instruction&0x7fff;
+                if(immediate==6 || immediate==7) fault(8,immediate==6 ? 2 : 1,frame->era);
+                else fault(5,1,frame->era);
+            }
+        }
         else if(code==8 || code==9) fault(7,code==8 ? 2 : 1,frame->badv);
         else fault(4,128,0); /* Linux LA do_ri/disabled ISA 的 SI_KERNEL 来源。 */
         return;

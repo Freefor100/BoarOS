@@ -45,6 +45,7 @@ static void handler(int sig,siginfo_t *info,void *pointer)
     if(sig!=expected_signal || info->si_code!=expected_code ||
        info->si_addr!=(expected_code==SI_KERNEL ? 0 : address ? address : (void *)context->uc_mcontext.__pc)) _exit(83);
     seen++;
+    if((kind==4 || kind==5) && !(context->uc_mcontext.__flags&(1U<<31)))_exit(88);
     if(kind==4) {
         if(mmap(address,16384,PROT_READ|PROT_WRITE,MAP_FIXED|MAP_PRIVATE|MAP_ANONYMOUS,-1,0)!=address) _exit(84);
     } else if(kind==5) {
@@ -54,8 +55,8 @@ static void handler(int sig,siginfo_t *info,void *pointer)
 static int fault(unsigned scenario)
 {
     seen=0;address=0;kind=0;
-    expected_signal=scenario==2 ? SIGBUS : scenario==3 ? SIGILL : scenario==4 ? SIGTRAP : SIGSEGV;
-    expected_code=scenario==2 ? BUS_ADRERR : scenario==3 ? SI_KERNEL : scenario==4 ? TRAP_BRKPT : scenario==1 ? SEGV_ACCERR : SEGV_MAPERR;
+    expected_signal=scenario>=10 ? SIGFPE : scenario==2 ? SIGBUS : scenario==3 ? SIGILL : scenario==4 ? SIGTRAP : SIGSEGV;
+    expected_code=scenario==10 ? FPE_INTOVF : scenario==11 ? FPE_INTDIV : scenario==2 ? BUS_ADRERR : scenario==3 ? SI_KERNEL : scenario==4 ? TRAP_BRKPT : scenario==1 ? SEGV_ACCERR : SEGV_MAPERR;
     struct sigaction action={.sa_sigaction=handler,.sa_flags=SA_SIGINFO};sigemptyset(&action.sa_mask);
     if(scenario==5)action.sa_handler=SIG_DFL;
     if(scenario==6)action.sa_handler=SIG_IGN;
@@ -65,6 +66,8 @@ static int fault(unsigned scenario)
     if(scenario==9) {kind=3;action.sa_sigaction=handler;CHECK(!sigaction(SIGUSR1,&action,0));CHECK(!raise(SIGUSR1));return 91;}
     if(scenario==3) __asm__ volatile(".word 0":::"memory");
     else if(scenario==4) __asm__ volatile("break 0":::"memory");
+    else if(scenario==10) __asm__ volatile("break 6":::"memory");
+    else if(scenario==11) __asm__ volatile("break 7":::"memory");
     else if(scenario==2) {
         int fd=open("/signal-empty",O_CREAT|O_TRUNC|O_RDWR,0600);CHECK(fd>=0);
         address=mmap(0,16384,PROT_READ,MAP_PRIVATE,fd,0);CHECK(address!=MAP_FAILED && !close(fd));
@@ -119,11 +122,11 @@ int main(void)
     sigset_t mask;CHECK(!sigprocmask(SIG_SETMASK,0,&mask) && !sigismember(&mask,SIGUSR1) && !sigismember(&mask,SIGUSR2));
     kind=2;seen=0;action.sa_flags|=SA_NODEFER;CHECK(!sigaction(SIGUSR1,&action,0) && !raise(SIGUSR1) && seen==2 && nested==1);
     puts("LA signal layout/mask/nesting passed");
-    for(unsigned i=0;i<10;i++) {
+    for(unsigned i=0;i<12;i++) {
         pid_t child=fork();CHECK(child>=0);if(!child)_exit(fault(i));
         int status=-1;CHECK(waitpid(child,&status,0)==child);
-        if(i<5 && (!WIFEXITED(status) || WEXITSTATUS(status)))fprintf(stderr,"LA fault scenario=%u status=%x\n",i,status);
-        if(i<5)CHECK(WIFEXITED(status) && !WEXITSTATUS(status));
+        if((i<5 || i>=10) && (!WIFEXITED(status) || WEXITSTATUS(status)))fprintf(stderr,"LA fault scenario=%u status=%x\n",i,status);
+        if(i<5 || i>=10)CHECK(WIFEXITED(status) && !WEXITSTATUS(status));
         else CHECK(WIFSIGNALED(status) && WTERMSIG(status)==SIGSEGV);
     }
     puts("LA signal fault/recovery/badframe passed");
