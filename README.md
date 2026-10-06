@@ -75,8 +75,8 @@ LSX/LASX状态、信号、clone/exec和关闭扩展的HWCAP已双侧验收。固
 初始/dlopen TLS、pthread取消和信号已在双侧两种RAM验收；RV仍固定2.44，版本差异保留。
 共用VirtIO net与Ethernet已接LA现代PCI，固定Linux/BoarOS两种RAM的真实TAP、
 原BusyBox HTTP和共享块/RNG/net IRQ、正常及构造/reset失败回收通过。无metadata checksum的空索引目录误报EUCLEAN已修复并用真实1/4KiB布局及
-LA普通/挂载后rmdir验证；全恢复回归仍随本轮最终门禁执行。完整网络ABI
-仍有AF_UNIX sendfile发送者计费差异待修复；TTY/RTC及更广原程序矩阵继续推进。
+LA普通/挂载后rmdir验证；全恢复回归仍随本轮最终门禁执行。AF_UNIX发送者计费和sendfile批次已按固定Linux接入并双侧验证；完整网络ABI
+和程序矩阵仍需最终同口径回归；TTY/RTC及更广原程序矩阵继续推进。
 DTB随机种子仅支持早期材料和AT_RANDOM，不计可信熵。真实PCI RNG的正常、缺失、
 延迟、在途停止已双侧两种RAM验收，BoarOS构造失败与回收也已在两种RAM验收。LBT、完整终端/网络及
 更广原程序、实板和SMP仍须另行验收，LA与RV尚不等价。

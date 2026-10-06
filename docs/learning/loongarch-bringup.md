@@ -372,3 +372,10 @@ metadata_csum开启通过，关闭立即在空目录覆盖返回EUCLEAN。LA根f
 独立ELF`d4a74d93e3ade80612549f23d32c9a777cbdcc08e4519470f543bac44e8603f0`
 在Linux/BoarOS两种RAM完成普通及挂载/卸载后rmdir和根回收。不会用干净重跑
 替代根因；checksum关闭的反例与重建入口保留在Git测试。
+
+AF_UNIX发送者模型后续已落地：budget/sendfile/unix_sender同ELF在Linux/BoarOS
+两种RAM通过，首次大消息、关闭/取消、SIGPIPE区别及真实owner另见
+[单核记录](single-hart-scale.md#af_unix发送者计费与la批次2026-10-07)。内部按
+本地实际packet/payload请求字节计费；发送成功次数不作为与Linux私有skb布局
+一致的证明。根Linux参考先检查退出，再明确清理其proc挂载层并卸载ext4，
+BoarOS仍要求完整页/堆/任务栈/设备基线。

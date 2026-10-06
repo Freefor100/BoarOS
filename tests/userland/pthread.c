@@ -1455,6 +1455,8 @@ static int check_unix_datagram_wait(void)
     static unsigned char bytes[65536];
     int pair[2]; pthread_t writer;
     if (socketpair(AF_UNIX, SOCK_DGRAM, 0, pair)) return 1;
+    int budget=32776;
+    if (setsockopt(pair[0],SOL_SOCKET,SO_SNDBUF,&budget,sizeof(budget))) return 11;
     unix_dgram_fd = pair[0];
     if (write(pair[0], bytes, 65520) != 65520) return 2;
     unix_dgram_started = unix_dgram_finished = 0;
@@ -1464,7 +1466,7 @@ static int check_unix_datagram_wait(void)
     if (unix_dgram_finished) return 4;
     if (read(pair[1], bytes, 1) != 1 || pthread_join(writer, 0) || unix_dgram_result != 32 ||
         read(pair[1], bytes, sizeof(bytes)) != 32 || bytes[0] != 0x7b) return 5;
-    if (write(pair[0], bytes, sizeof(bytes)) != sizeof(bytes)) return 6;
+    if (write(pair[0], bytes, 65520) != 65520) return 6;
     unix_dgram_started = unix_dgram_finished = 0;
     if (pthread_create(&writer, 0, unix_dgram_sender, 0)) return 7;
     while (!unix_dgram_started) sched_yield();

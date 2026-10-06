@@ -129,5 +129,6 @@ LA同一个ELF先跑固定Linux再跑BoarOS，512MiB/1GiB各覆盖16MiB TCP、�
 初始/退出reset确认九个边界，各两种RAM。启动失败不发布PID1，退出reset失败后
 保留真实owner重试；18次均最终回到基线。无NIC的AF_UNIX和IPv4/IPv6 loopback、
 内容/期限/接纳故障与取消也双侧通过。扩大的sendfile测例另发现AF_UNIX固定64KiB
-上限与LA Linux datagram批次的差异；已选择发送者计费路线，修复及全矩阵收口
-仍是后续ABI工作，不能由本节声明整个网络ABI对齐。
+上限与LA Linux datagram批次的差异；随后按[网络模块](kernel-network.md)的
+发送者计费路线修复并完成双侧budget/sendfile验收。完整LA平台/程序矩阵仍需
+独立收口，不能由本节声明全部能力等价。

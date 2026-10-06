@@ -8,7 +8,7 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
 parser = argparse.ArgumentParser(description=__doc__)
-cases = ('copy-indirect', 'copy-ineligible', 'timewait-capacity', 'timewait-timer', 'controls')
+cases = ('copy-indirect', 'copy-ineligible', 'timewait-capacity', 'timewait-timer', 'controls','unix-sender')
 parser.add_argument('--case', choices=(*cases, 'all'), default='all')
 parser.add_argument('--sanitize', action='store_true')
 args = parser.parse_args()

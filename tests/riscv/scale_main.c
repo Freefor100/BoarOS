@@ -478,11 +478,20 @@ static void unix_datagram_budget(struct kernel_files *files, struct kernel_mm *m
     int32_t pair[2]; size_t copied;
     check(kernel_files_socketpair_create(files, mm, 2, 2048, BUFFER, &result) == KERNEL_FILES_STATUS_OK && result == 0, 180);
     check(kernel_copy_from_user(mm, pair, BUFFER, sizeof(pair), &copied) == KERNEL_UACCESS_STATUS_OK, 181);
-    for (unsigned i = 0; i < 100; i++)
-        check(kernel_files_write(files, mm, pair[0], BUFFER, 0, &result) == KERNEL_FILES_STATUS_OK && result == 0, 182);
-    check(kernel_files_write(files, mm, pair[0], BUFFER, 65536, &result) == KERNEL_FILES_STATUS_OK && result == -KERNEL_EAGAIN, 183);
-    for (unsigned i = 0; i < 100; i++)
-        check(kernel_files_read(files, mm, pair[1], BUFFER, 1, &result) == KERNEL_FILES_STATUS_OK && result == 0, 184);
+    struct kernel_open_file_description *sender=0;
+    check(kernel_files_pin(files,pair[0],&sender,&result)==KERNEL_FILES_STATUS_OK && !result,197);
+    struct kernel_socket *socket=kernel_open_file_socket(sender);
+    check(kernel_socket_set_option(socket,KERNEL_SOCKET_SNDBUF,0)==0,198);
+    unsigned empty=0;
+    for(;;) {
+        check(kernel_files_write(files,mm,pair[0],BUFFER,0,&result)==KERNEL_FILES_STATUS_OK,182);
+        if(result==-KERNEL_EAGAIN)break;
+        check(!result && ++empty<65536,183);
+    }
+    for(unsigned i=0;i<empty;i++)
+        check(kernel_files_read(files,mm,pair[1],BUFFER,1,&result)==KERNEL_FILES_STATUS_OK && !result,184);
+    check(kernel_socket_set_option(socket,KERNEL_SOCKET_SNDBUF,32784)==0 &&
+        kernel_open_file_release(&sender)==KERNEL_OPEN_FILE_STATUS_OK,199);
     for (unsigned i = 0; i < 4; i++) {
         check(kernel_files_write(files, mm, pair[0], BUFFER, 65536, &result) == KERNEL_FILES_STATUS_OK && result == 65536, 185);
         check(kernel_files_write(files, mm, pair[0], BUFFER, 1, &result) == KERNEL_FILES_STATUS_OK && result == -KERNEL_EAGAIN, 186);
@@ -503,7 +512,7 @@ static void unix_datagram_budget(struct kernel_files *files, struct kernel_mm *m
         kernel_files_read(files, mm, pair[1], 0x12345000, 8, &result) == KERNEL_FILES_STATUS_OK && result == -KERNEL_EFAULT, 195);
     check(kernel_files_write(files, mm, pair[0], BUFFER, 65536, &result) == KERNEL_FILES_STATUS_OK && result == 65536, 196);
     check(kernel_files_close(files, pair[1], &result) == KERNEL_FILES_STATUS_OK && !result &&
-        kernel_files_write(files, mm, pair[0], BUFFER, 8, &result) == KERNEL_FILES_STATUS_OK && result == -KERNEL_EPIPE &&
+        kernel_files_write(files, mm, pair[0], BUFFER, 8, &result) == KERNEL_FILES_STATUS_OK && result == -KERNEL_ECONNREFUSED &&
         kernel_files_close(files, pair[0], &result) == KERNEL_FILES_STATUS_OK && !result, 191);
 }
 

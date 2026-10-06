@@ -71,7 +71,7 @@ def run_loongarch(args):
 def main(default_arch="riscv"):
     parser=argparse.ArgumentParser(__doc__)
     parser.add_argument('--only',choices=('linux','boaros'))
-    parser.add_argument('--workload',choices=('contract','content','timer','budget','interface','sendfile','admission'),default='contract')
+    parser.add_argument('--workload',choices=('contract','content','timer','budget','interface','sendfile','admission','unix_sender'),default='contract')
     parser.add_argument('--platform-config',choices=('fixture','official'),default='fixture')
     parser.add_argument('--arch',choices=('riscv','loongarch'),default=default_arch)
     parser.add_argument('--memory',action='append',choices=('512M','1G'))
@@ -79,8 +79,6 @@ def main(default_arch="riscv"):
     args=parser.parse_args()
     if args.arch=='loongarch':return run_loongarch(args)
     args.kernel=args.kernel or ROOT/'kernel-rv'
-    if args.workload=='budget' and args.only!='boaros':
-        parser.error('UNIX receiver-budget contract requires --only boaros')
     work=ROOT/'build/network'/('contract-'+str(time.time_ns()))
     work.mkdir(parents=True)
     program=work/'init'
