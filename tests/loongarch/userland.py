@@ -1,0 +1,44 @@
+#!/usr/bin/env python3
+"""Run one LA static ELF unchanged on BoarOS and the fixed Linux root baseline."""
+import argparse
+import hashlib
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+from guest import run_guest
+from reference import archive,REVISION
+from root import disk,execute,ROOT
+
+def main(args):
+    directory=Path(tempfile.mkdtemp(prefix='userland-run.',dir=ROOT/'build/loongarch'))
+    if subprocess.check_output(['git','-C','references/linux','rev-parse','HEAD'],text=True).strip()!=REVISION:
+        raise SystemExit('Linux LA revision changed')
+    configuration=(ROOT/'build/linux-la/.config').read_text()
+    if 'CONFIG_16KB_3LEVEL=y' not in configuration: raise SystemExit('Linux LA page configuration changed')
+    supervisor=directory/'linux-init'
+    execute([args.cc,'-mabi=lp64s','-msoft-float','-mno-lsx','-mno-lasx','-O2','-ffreestanding','-fno-builtin','-fno-stack-protector','-nostdlib','-nostartfiles','-static','-no-pie','-Wl,--build-id=none','-Wl,-z,max-page-size=16384','-T','tests/loongarch/user.ld','tests/loongarch/root_linux_init.c','tests/loongarch/user_start.S','-o',supervisor])
+    initrd=directory/'initramfs.gz';initrd.write_bytes(archive([('dev',0o040755,b'',0,0),('dev/console',0o020600,b'',5,1),('init',0o100755,supervisor.read_bytes(),0,0),('TRAILER!!!',0,b'',0,0)]))
+    digest=hashlib.sha256(args.program.read_bytes()).hexdigest()
+    for platform in args.platform or ('Linux','BoarOS'):
+        for memory in ('512M','1G'):
+            image=disk(directory,args.program,ROOT/'build/loongarch/busybox-source/busybox/busybox')
+            command=[args.qemu,'-machine','virt','-cpu','la464','-smp','1','-m',memory,'-kernel','build/linux-la/vmlinux' if platform=='Linux' else args.kernel,
+                     '-drive',f'file={image},format=raw,if=none,id=root','-device','virtio-blk-pci,drive=root,addr=1,disable-legacy=on','-net','none','-nographic','-no-reboot']
+            if platform=='Linux': command+=['-initrd',str(initrd),'-append','console=ttyS0 rdinit=/init loglevel=3']
+            try: code,text=run_guest(command,args.timeout)
+            except subprocess.TimeoutExpired as error:
+                (directory/f'{platform}-{memory}.log').write_text(error.output);raise
+            (directory/f'{platform}-{memory}.log').write_text(text)
+            good=code==0 and all(marker in text for marker in args.marker) and 'fatal' not in text
+            if platform=='Linux': good &= 'Linux LA root application passed' in text
+            else: good &= 'LA PID 1 exited reason=0x0000000000000001 status=0x0000000000000000' in text and 'LA root owners released' in text
+            if not good: sys.stdout.write(text);raise SystemExit(f'LA userland failed {platform}/{memory}; {directory}')
+            if hashlib.sha256(args.program.read_bytes()).hexdigest()!=digest: raise SystemExit('ELF changed during differential run')
+            print(f'{platform}/{memory}: actual ELF, markers, exit and root lifecycle PASS')
+    print(f'LA ELF SHA-256 {digest}; platforms {args.platform or ["Linux","BoarOS"]}; logs {directory}')
+if __name__=='__main__':
+    parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('--program',type=Path,required=True)
+    parser.add_argument('--marker',action='append',required=True);parser.add_argument('--timeout',type=int,default=120)
+    parser.add_argument('--platform',choices=['Linux','BoarOS'],action='append',help='default both; injected-failure fixtures select BoarOS explicitly')
+    parser.add_argument('--cc',default='loongarch64-unknown-linux-gnu-gcc');parser.add_argument('--qemu',default='build/qemu-la/qemu-system-loongarch64');parser.add_argument('--kernel',default='kernel-la');main(parser.parse_args())

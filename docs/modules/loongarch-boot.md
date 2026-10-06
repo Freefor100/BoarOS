@@ -15,6 +15,7 @@ make test-la-userland-host      # 缓存输入/完整安装树的9个拒绝反�
 make test-loongarch-boot        # 512 MiB/1 GiB 启动与后续契约
 make test-loongarch             # 同时准备固定 Linux，对照同一个用户 ELF
 make test-stack-usage-la
+make test-signal-loongarch     # 同一静态 musl ELF 的整数信号/恢复/重启对照
 ```
 
 `run-loongarch` 进入 console 探针后，依次在 poll/read ready 标记出现时输入 `g` 和 `r`（各回车），完成后关机。
@@ -48,7 +49,8 @@ TCFG，接入共用 tick、deadline、预算与调度；未启用 UART 外部 IR
 LA syscall 从 a7/a0–a5 解码，返回 a0 并恢复 ERA+4。未知 syscall 返回 ENOSYS；
 坏复制指针返回 EFAULT；权限/未映射故障和访问内核地址按实际用户故障处理。
 合法缺页 OOM 使用 RESOURCE/NO_MEMORY 退出，不能误报为用户地址非法。
-rt_sigaction/rt_sigreturn 尚无 LA handler frame，明确返回 ENOSYS。
+rt_sigaction/rt_sigreturn 已接入共用信号策略和 LA 整数帧；布局、故障与重启契约见
+[信号模块](kernel-signal.md)。尚无 FP/SIMD 扩展帧和 sigaltstack。
 
 2026-10-06 在 512 MiB 和 1 GiB 下完成：
 

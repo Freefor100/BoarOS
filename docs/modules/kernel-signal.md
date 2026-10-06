@@ -6,6 +6,7 @@
 
 - `kernel/sched/signal.c`：pending/blocked、disposition、默认动作、stop/continue、进程通知和重启策略。
 - `arch/riscv/signal.c`、`include/arch/riscv/signal.h`：RISC-V 信号帧编码、寄存器恢复和用户返回尾。
+- `arch/loongarch/signal.c`、`include/arch/loongarch/signal.h`：LA 整数帧、END 扩展终止记录与 ERA/GPR 恢复；同样调用通用选择和重启策略。
 - `kernel/syscall/signal.c`：信号 syscall 的输入快照、状态提交及 errno；`kernel/syscall/time.c`：等待 deadline 和 restart_syscall。
 - `kernel/sched/private.h`：任务私有信号状态。syscall 不直接访问任务布局。
 
@@ -24,6 +25,13 @@ rt_sigaction/rt_sigprocmask 先完整复制输入，再提交状态，最后输�
 RISC-V frame 共 1088 字节，16 字节对齐：128 字节 siginfo 加 960 字节 ucontext。ucontext 内 sigmask 偏移 40、mcontext 偏移 176；mcontext 包含 32 个整数寄存器和按 Q 扩展容量保留的 528 字节、16 字节对齐 FP union。当前只填写 D 寄存器与 32 位 fcsr，其余扩展存储清零。内核静态断言和真实 musl ucontext 共同核对布局，不能仅用同一套手写偏移自证正确。
 
 handler 的 a0/a1/a2 分别为信号、siginfo 地址和 ucontext 地址；ra 指向固定 RX VDSO 的 rt_sigreturn ecall。用户帧不保存可由用户修改的特权 sstatus。sigreturn 先复制并检查恢复输入，再恢复 signal mask、整数和 FP 状态，保持受控的 S-mode 返回状态。不可读取或不支持的扩展帧以 SIGSEGV 终止任务。
+
+LA 整数帧为 592 字节、16 字节对齐：128 字节 siginfo、448 字节 ucontext 和16字节
+END。ucontext 的 mask/mcontext 偏移仍为40/176，sigcontext 是 PC、32个GPR、32位
+flags，再对齐至272字节。只发布 END，不发布未拥有的 FP/LSX/LASX/LBT 状态；
+未知扩展或 SC_USED_FP 帧以用户坏帧处理，扩展支持另行实现。恢复先快照 mask、
+context 和 END，再提交用户寄存器；PRMD、内核 TP 不来自用户，r0保持零。
+handler 的 a0/a1/a2、ra 与 SP 使用 LA ABI，VDSO 执行 syscall 139；sigreturn 不再推进 ERA。
 
 ## 等待与重启
 
@@ -44,6 +52,16 @@ sigsuspend 在等待和选择 handler 时保留临时 mask，把原 mask 写入�
 当前为单 hart 线程组和位图 pending；尚无实时信号队列、sigaltstack、signalfd 或 SMP 同步。libc 内部信号可走线程定向路径，但不据此宣称完整实时信号排队。siginfo 提供 SI_USER/SI_TKILL sender、孤儿组 SI_KERNEL 来源以及下述同步故障信息。组 stop/continue 与致命取消不能直接释放睡眠中的任务栈；不可中断的 vfork 有独立取消握手。
 
 ## 同步故障
+
+LA 页故障同样经通用 force_fault 选择 handler，保留 ERA；未映射/权限为 SEGV
+MAPERR/ACCERR，EOF 为 BUS/ADRERR。ADE/ALE 的 si_addr 是 BADV，break 0 为
+TRAP/BRKPT、si_addr=ERA。固定 Linux LA do_ri 使用 SI_KERNEL=128、空地址，不能
+沿用 RV 的 ILL_ILLOPC。SC_ADDRERR_RD/WR 根据 Linux thread.error_code 的保留契约
+编码，后续异步帧和 clone 保留该值；PRMD 不发布在用户上下文。
+`make test-signal-loongarch` 在512MiB/1GiB分别运行同一个真实 LP64S musl ELF，
+验证布局、来源/mask、嵌套、故障映射修复、整数寄存器/PC恢复、坏帧、pipe
+SA_RESTART/EINTR、nanosleep EINTR 和 sigsuspend。每次 BoarOS 退出要求根盘 owner、
+用户页/页表/任务栈和堆恢复基线。此范围没有 FP/SIMD、altstack 或实时队列。
 
 U-mode 未映射/权限页故障分别记录 SIGSEGV/SEGV_MAPERR、SEGV_ACCERR，文件 EOF/I/O fault 记录 SIGBUS/BUS_ADRERR，`si_addr` 为故障 VA。非法指令与断点为 SIGILL/ILL_ILLOPC、SIGTRAP/TRAP_BRKPT；access/misaligned cause 按固定 Linux 映射，`si_addr` 为 PC。来源为本地 `references/linux/arch/riscv/kernel/traps.c`、`arch/riscv/mm/fault.c`、`kernel/signal.c::force_sig_info_to_task`，commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`。
 

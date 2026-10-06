@@ -154,3 +154,18 @@ baseline之前分配，可停止的任务/栈、用户页、cache和设备队列
 stdio，musl auto 检测会禁用 GNU wrapper，完整 BusyBox 随后找不到 musl-gcc。
 配置显式选择 `--enable-gcc-wrapper`，libgcc 安装后重新 configure，再编译 libc；
 该选项也纳入缓存输入。冷目录从原始归档/空产物开始，不复用旧 wrapper 通过验收。
+
+### LA 整数信号 ABI（2026-10-06）
+
+固定 `references/linux` commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的
+`arch/loongarch/kernel/signal.c`、UAPI `sigcontext.h/ucontext.h` 和 `traps.c`
+给出592字节整数帧：128字节siginfo、448字节ucontext、16字节END。musl1.2.5
+（清单SHA-256 `a9a118bbe84d8764da0ea0d28b3ab3fae8477fc7e4085d90102b8596fc7c75e4`）
+的真实ucontext静态断言及同ELF双侧运行独立保护布局。LA非法指令的Linux来源为
+SI_KERNEL，而RV为ILL_ILLOPC；最初探针在Linux失败后按实际架构事实修正。
+
+Linux两种RAM先通过，BoarOS在rt_sigaction返回ENOSYS复现缺口。接入LA后端后，
+相同LP64S程序完成handler、嵌套、fault修复和sigreturn；通用pending/mask/默认
+动作/重启保持唯一实现。先决定EINTR或重试再构帧，sigreturn恢复PC而不推进4字节；
+用户上下文不能输入PRMD或内核TP。所有恢复输入先快照，未知扩展作为用户坏帧
+终止全组。FP/SIMD扩展仍缺实际owner，不能据整数帧通过宣称完整LA信号ABI。

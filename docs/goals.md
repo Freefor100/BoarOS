@@ -493,7 +493,9 @@ RV完整架构、真实用户程序、glibc、1344条ABI和SQLite回归通过。
 ### L2 ABI 与映像
 
 首阶段已覆盖内存ELF段/BSS/栈/auxv、整数寄存器、基本syscall与最小fork/COW计算探针。
-statx/clone子TID、PCI根盘及LP64S静态musl已通过第二阶段验收；完整signal handler、FP/SIMD、动态libc和TLS仍未完成。
+statx/clone子TID、PCI根盘及LP64S静态musl已通过第二阶段验收；整数signal handler、
+sigreturn/同步故障/等待重启已双侧验收。当前继续已批准的静态pthread/TLS；
+FP/SIMD、动态libc/DSO TLS及完整用户环境仍未完成。
 
 - [ ] ELF 段对齐、BSS 尾页、auxv、用户栈、stat/signal 结构及 clone 寄存器逐项核对；不能只换汇编入口却保留 RV ABI 编码。
 - [ ] 同一用户源码分别编译 RV/LA ELF，每架构内部用同一 ELF 对照 Linux 与 BoarOS；共享测试语义，隔离寄存器/页表差异，不拿 RV ELF 验证 LA。

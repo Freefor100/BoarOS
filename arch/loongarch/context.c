@@ -40,6 +40,7 @@ enum kernel_scheduler_status arch_process_prepare_clone(struct kernel_task *chil
     struct arch_trap_frame *frame=(void *)(child->stack_high-sizeof(*frame));
     if ((uintptr_t)frame<child->stack_low || parent->fpu.saved) return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
     *frame=*old; frame->regs[4]=0; frame->era+=4; frame->kernel_tp=(uintptr_t)child;
+    child->arch.signal_error_code=parent->arch.signal_error_code;
     frame->estat=0; frame->badv=0;
     if (stack) frame->regs[3]=stack;
     if (set_tls) frame->regs[2]=tls;

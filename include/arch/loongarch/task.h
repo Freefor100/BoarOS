@@ -7,7 +7,7 @@
 #ifndef __ASSEMBLER__
 #include <stddef.h>
 #include <stdint.h>
-struct arch_thread_state { uintptr_t kernel_sp, user_sp; uint64_t user_mode, page_root; } __attribute__((aligned(16)));
+struct arch_thread_state { uintptr_t kernel_sp, user_sp; uint64_t user_mode, page_root, signal_error_code; } __attribute__((aligned(16)));
 struct arch_switch_context { uint64_t ra, sp, tp, fp, s[9]; } __attribute__((aligned(16)));
 struct arch_fpu_state { uint64_t saved; } __attribute__((aligned(16)));
 struct arch_trap_frame {

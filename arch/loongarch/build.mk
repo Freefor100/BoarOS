@@ -7,7 +7,7 @@ LA_CPPFLAGS := -Iinclude -DBOAROS_ARCH_LOONGARCH=1 -DBOAROS_PAGE_SHIFT=14 -DBOAR
 LA_CFLAGS := $(LA_FLAGS) -std=gnu11 -O2 -g3 -ffreestanding -fno-builtin -fno-stack-protector -fno-pic -fno-pie -ffunction-sections -fdata-sections -Wall -Wextra -Werror -fstack-usage
 LA_C_SOURCES := $(filter-out arch/% kernel/main.c net/ethernet.c,$(C_SOURCES)) \
     arch/loongarch/main.c arch/loongarch/mmu.c arch/loongarch/context.c \
-    arch/loongarch/timer.c arch/loongarch/trap.c platform/loongarch_virt.c \
+    arch/loongarch/timer.c arch/loongarch/trap.c arch/loongarch/signal.c platform/loongarch_virt.c \
     platform/loongarch_pci.c platform/loongarch_root.c drivers/virtio/pci_block.c kernel/pci.c \
     tests/loongarch/mmu.c tests/loongarch/heap.c tests/loongarch/user_boot.c tests/loongarch/elf_failures.c
 LA_ASM_SOURCES := arch/loongarch/boot.S arch/loongarch/context_switch.S \
@@ -100,3 +100,8 @@ test-root-io-loongarch: kernel-la $(LA_BUILD)/root-probe build/host/nbd-fault pr
 .PHONY: test-la-userland-host
 test-la-userland-host: prepare-la-userland
 	python3 -B tests/host/la_userland_cache.py
+$(LA_BUILD)/signal-probe: tests/loongarch/signals.c tests/loongarch/signal_registers.S prepare-la-userland
+	REALGCC=$(abspath $(LA_USER_CC)) $(LA_MUSL_CC) $(LA_FLAGS) -O2 -static -Wall -Wextra -Werror -Wl,-z,max-page-size=16384 -o $@ tests/loongarch/signals.c tests/loongarch/signal_registers.S
+.PHONY: test-signal-loongarch
+test-signal-loongarch: kernel-la $(LA_BUILD)/signal-probe prepare-la-tools prepare-la-linux
+	python3 -B tests/loongarch/userland.py --qemu $(QEMU_LOONGARCH64) --cc $(LA_CC) --program $(LA_BUILD)/signal-probe --marker 'LA signal layout/mask/nesting passed' --marker 'LA signal fault/recovery/badframe passed' --marker 'LA signal integer registers passed' --marker 'LA signal wait/restart/suspend passed'
