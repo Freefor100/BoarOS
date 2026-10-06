@@ -48,6 +48,12 @@ enum kernel_elf64_source_status kernel_elf64_source_create(
     uint16_t machine,
     struct kernel_elf64_source **source);
 
+/* PT_INTERP requires a complete 64-byte ELF header; short EOF is Linux EIO.
+ * The create ownership contract is unchanged on success and failure. */
+enum kernel_elf64_source_status kernel_elf64_source_create_interpreter(
+    struct kernel_heap *,struct kernel_open_file_description **,uint64_t,
+    uint16_t,struct kernel_elf64_source **);
+
 /* Reader bytes/context must remain immutable and alive through the last source
  * reference. The descriptor is copied; the backing lifetime stays with caller. */
 enum kernel_elf64_source_status kernel_elf64_source_create_reader(

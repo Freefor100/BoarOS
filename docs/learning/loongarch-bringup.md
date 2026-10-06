@@ -214,3 +214,35 @@ LA encode按Linux表发布有效权限，VMA、fault和uaccess策略保持共用
 修复后8组冷页/驻留/取指/fork/PROT_NONE/撤执行/uaccess在两侧两种RAM通过，
 根页/堆owner回到基线。原LA信号、线程、MM/COW与启动回归，以及RV MM/VMA/
 uaccess/files/exec和SQLite DELETE/WAL多进程与重启门禁通过。
+
+### 从整数 ABI 到原版动态 musl
+
+固定musl1.2.5在LP64S下的fenv.S不生成符号，但Makefile依然用架构对象替换
+通用fenv，故共享libc链接缺fetestexcept/fegetenv/__fesetround；静态整数程序
+没有拉入这些对象，所以之前通过不能证明共享libc可构建。通用fallback包含
+成功dummy，不用于掩盖缺口。人选择A：保留整数内核，补LA标量FPU，原版
+LP64D musl在固定GCC15.1.0的匹配CRT/libgcc上完整构建，无上游代码补丁。
+
+LA没有RV的Dirty跟踪位；首用异常15决定是否曾用FP，既保留整数END帧，也
+避免让所有整数任务每次保存FP。用过的task沿已有切换接口保存和恢复32FR、
+8FCC和FCSR。FCC不是八个相邻bit，而是Linux每个一字节的64位编码。信号记录
+FPU magic0x46505501、size288，完整帧880字节；END只需要前8字节可读。
+Linux FP初始化FR为全1NaN，exec首次使用不能继承旧值。异常Cause先与Enable
+相交再清除/选择SIGFPE；pending sigreturn按Linux写回并产生SI_KERNEL。
+
+相同静态LP64D程序先在Linux通过、BoarSIGILL复现，再经过真实FR/FCC/CSR
+timer、fork、signal/修改恢复、exec、FPE和扩展坏帧矩阵。原版动态PIE和非PIE
+同ELF完成late-dlopen TLS与已有pthread子集；DT_NEEDED/ORIGIN RPATH的初始
+DSO TLS另测，并实际写RELRO指针验证保护。库与程序在每次运行前后核对SHA。
+
+解释器短header原先误归ELIBBAD；固定Linux `fs/binfmt_elf.c::elf_read` 在完整
+elf header读取前返回EIO，同ELF先Linux通过/Boar失败。新create_interpreter
+入口由共用exec及RV/LA根启动使用，不另建错误策略。完整但损坏/错误架构仍
+ELIBBAD。失败保持旧映像、TLS、线程、fd与handler，根构造失败/OOM无半成品
+PID1，主/解释器OFD/source与MM均遵循原owner清理。
+
+LP64D动态缓存v2单独保留compiler、cc1、内建headers、六个CRT/runtime、原
+archive/ABI/options与完整安装树身份；syslibdir设在缓存内，guest interpreter
+由显式链接参数固定/lib路径，安装不会写宿主/lib。旧SF缓存独立。两类各9个
+合法先命中/单项拒绝反例通过，冷构建不复用旧source。缓存过期只拒绝，不
+修改已固定输入或静默承认旧产物。

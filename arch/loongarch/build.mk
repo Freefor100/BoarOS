@@ -7,11 +7,11 @@ LA_CPPFLAGS := -Iinclude -DBOAROS_ARCH_LOONGARCH=1 -DBOAROS_PAGE_SHIFT=14 -DBOAR
 LA_CFLAGS := $(LA_FLAGS) -std=gnu11 -O2 -g3 -ffreestanding -fno-builtin -fno-stack-protector -fno-pic -fno-pie -ffunction-sections -fdata-sections -Wall -Wextra -Werror -fstack-usage
 LA_C_SOURCES := $(filter-out arch/% kernel/main.c net/ethernet.c,$(C_SOURCES)) \
     arch/loongarch/main.c arch/loongarch/mmu.c arch/loongarch/context.c \
-    arch/loongarch/timer.c arch/loongarch/trap.c arch/loongarch/signal.c platform/loongarch_virt.c \
+    arch/loongarch/timer.c arch/loongarch/trap.c arch/loongarch/signal.c arch/loongarch/fpu.c platform/loongarch_virt.c \
     platform/loongarch_pci.c platform/loongarch_root.c drivers/virtio/pci_block.c kernel/pci.c \
     tests/loongarch/mmu.c tests/loongarch/heap.c tests/loongarch/user_boot.c tests/loongarch/elf_failures.c
 LA_ASM_SOURCES := arch/loongarch/boot.S arch/loongarch/context_switch.S \
-    arch/loongarch/tlb_refill.S arch/loongarch/trap_entry.S arch/loongarch/signal_trampoline.S tests/loongarch/user_blob.S
+    arch/loongarch/tlb_refill.S arch/loongarch/trap_entry.S arch/loongarch/signal_trampoline.S arch/loongarch/fpu_state.S tests/loongarch/user_blob.S
 LA_OBJECTS = $(patsubst %.c,$(LA_BUILD)/%.o,$(LA_C_SOURCES)) $(patsubst %.S,$(LA_BUILD)/%.o,$(LA_ASM_SOURCES))
 $(LA_BUILD)/%.o: %.c
 	@mkdir -p $(dir $@)
@@ -128,3 +128,40 @@ $(LA_BUILD)/permissions-probe: tests/loongarch/permissions.c prepare-la-userland
 .PHONY: test-permissions-loongarch
 test-permissions-loongarch: kernel-la $(LA_BUILD)/permissions-probe prepare-la-tools prepare-la-linux
 	python3 -B tests/loongarch/userland.py --qemu $(QEMU_LOONGARCH64) --cc $(LA_CC) --program $(LA_BUILD)/permissions-probe --marker 'LA permissions cold/resident/exec/fork/uaccess/revoke passed'
+
+.PHONY: prepare-la-dynamic
+prepare-la-dynamic:
+	python3 -B tests/loongarch/prepare_dynamic.py --cross $(LA_CROSS_COMPILE)
+.PHONY: test-la-dynamic-host
+test-la-dynamic-host: prepare-la-dynamic
+	python3 -B tests/host/la_dynamic_cache.py
+LA_DYNAMIC_ROOT := $(LA_BUILD)/dynamic-dp-v2/root
+LA_DP_FLAGS := -march=loongarch64 -mabi=lp64d -mdouble-float -mno-lsx -mno-lasx -mcmodel=normal
+LA_DYNAMIC_CC := $(LA_DYNAMIC_ROOT)/bin/musl-gcc
+LA_DYNAMIC_LINK := -Wl,--dynamic-linker=/lib/ld-musl-loongarch64.so.1 -Wl,-z,max-page-size=16384
+LA_DYNAMIC_FILES := --file /lib/ld-musl-loongarch64.so.1=$(LA_DYNAMIC_ROOT)/lib/libc.so --file /lib/libboaros-tls.so=$(LA_BUILD)/tls-dso.so
+$(LA_BUILD)/dynamic-probe: tests/loongarch/dynamic.c tests/loongarch/pthread.c tests/userland/pthread.c tests/loongarch/registers.S prepare-la-dynamic
+	REALGCC=$(LA_CC) $(LA_DYNAMIC_CC) $(LA_DP_FLAGS) -O2 -pthread -fPIE -pie $(LA_DYNAMIC_LINK) -o $@ tests/loongarch/dynamic.c tests/loongarch/registers.S -ldl
+$(LA_BUILD)/dynamic-exec-probe: tests/loongarch/dynamic.c tests/loongarch/pthread.c tests/userland/pthread.c tests/loongarch/registers.S prepare-la-dynamic
+	REALGCC=$(LA_CC) $(LA_DYNAMIC_CC) $(LA_DP_FLAGS) -O2 -pthread -fno-pie -no-pie $(LA_DYNAMIC_LINK) -o $@ tests/loongarch/dynamic.c tests/loongarch/registers.S -ldl
+$(LA_BUILD)/tls-dso.so: tests/userland/tls_dso.c prepare-la-dynamic
+	REALGCC=$(LA_CC) $(LA_DYNAMIC_CC) $(LA_DP_FLAGS) -O2 -fPIC -shared -Wl,-z,max-page-size=16384 -Wl,-soname,libboaros-tls.so -o $@ $<
+.PHONY: test-dynamic-loongarch
+test-dynamic-loongarch: kernel-la $(LA_BUILD)/dynamic-probe $(LA_BUILD)/dynamic-exec-probe $(LA_BUILD)/tls-dso.so $(LA_BUILD)/dso-link-probe prepare-la-tools prepare-la-linux
+	python3 -B tests/loongarch/userland.py --qemu $(QEMU_LOONGARCH64) --cc $(LA_CC) --program $(LA_BUILD)/dynamic-probe $(LA_DYNAMIC_FILES) --marker 'LA dynamic DSO TLS passed' --marker 'LA static pthread catalogue passed' --marker 'LA original BusyBox ash signal/wait passed'
+	python3 -B tests/loongarch/userland.py --qemu $(QEMU_LOONGARCH64) --cc $(LA_CC) --program $(LA_BUILD)/dynamic-exec-probe $(LA_DYNAMIC_FILES) --marker 'LA dynamic DSO TLS passed' --marker 'LA static pthread catalogue passed' --marker 'LA original BusyBox ash signal/wait passed'
+	python3 -B tests/loongarch/userland.py --qemu $(QEMU_LOONGARCH64) --cc $(LA_CC) --program $(LA_BUILD)/dso-link-probe $(LA_DYNAMIC_FILES) --marker 'LA DT_NEEDED/RPATH/initial DSO TLS passed'
+$(LA_BUILD)/dso-link-probe: tests/loongarch/dso_link.c $(LA_BUILD)/tls-dso.so prepare-la-dynamic
+	REALGCC=$(LA_CC) $(LA_DYNAMIC_CC) $(LA_DP_FLAGS) -O2 -pthread -fPIE -pie $(LA_DYNAMIC_LINK) -Wl,-rpath,'$$ORIGIN/lib' -L$(LA_BUILD) -Wl,-z,relro,-z,now -o $@ $< -l:tls-dso.so
+
+$(LA_BUILD)/fpu-probe: tests/loongarch/fpu.c tests/loongarch/fp_registers.S tests/loongarch/registers.S prepare-la-dynamic
+	REALGCC=$(LA_CC) $(LA_DYNAMIC_CC) $(LA_DP_FLAGS) -O2 -static -pthread -Wall -Wextra -Werror -Wl,-z,max-page-size=16384 -o $@ tests/loongarch/fpu.c tests/loongarch/fp_registers.S tests/loongarch/registers.S
+.PHONY: test-fpu-loongarch
+test-fpu-loongarch: kernel-la $(LA_BUILD)/fpu-probe prepare-la-tools prepare-la-linux
+	python3 -B tests/loongarch/userland.py --qemu $(QEMU_LOONGARCH64) --cc $(LA_CC) --program $(LA_BUILD)/fpu-probe --marker 'LA FPU arithmetic/fenv/fork/signal passed' --marker 'LA FPU registers/FCC/timer/exec passed' --marker 'LA FPU exception signal passed' --marker 'LA FPU extension/badframe/pending/cross-page END passed'
+
+$(LA_BUILD)/exec-errors-probe: tests/loongarch/exec_errors.c prepare-la-userland
+	REALGCC=$(abspath $(LA_USER_CC)) $(LA_MUSL_CC) $(LA_FLAGS) -O2 -static -pthread -Wall -Wextra -Werror -Wl,-z,max-page-size=16384 -o $@ $<
+.PHONY: test-exec-errors-loongarch
+test-exec-errors-loongarch: kernel-la $(LA_BUILD)/exec-errors-probe $(LA_BUILD)/dynamic-probe $(LA_BUILD)/kernel-root-oom-1 prepare-la-tools prepare-la-linux
+	python3 -B tests/loongarch/exec_failures.py --qemu $(QEMU_LOONGARCH64) --cc $(LA_CC)

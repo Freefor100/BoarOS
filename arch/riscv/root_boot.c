@@ -403,7 +403,7 @@ enum riscv_root_boot_status riscv_root_boot_start_with_irq(
         }
         {
             enum kernel_elf64_source_status source_status =
-                kernel_elf64_source_create(&root->heap,
+                kernel_elf64_source_create_interpreter(&root->heap,
                                            &interpreter_owner,
                                            BOAROS_PAGE_SIZE,
                                            KERNEL_ELF64_MACHINE_RISCV,

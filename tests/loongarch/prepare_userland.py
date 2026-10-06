@@ -72,14 +72,12 @@ def cache_inputs(args):
               'binutils':{k:{'path':str(v),'sha256':sha(v)} for k,v in tools.items()}}
     return identity,(gcc_tar,musl_tar,uapi_tar,tools,options,tests_source,inputs)
 
-def installed_manifest(base):
+def installed_tree_manifest(base,roots):
     paths=[]
-    for name in ('gcc-sf/root','musl-root','uapi'):
+    for name in roots:
         directory=base/name
-        if not directory.is_dir(): raise SystemExit('LA userland cache product missing: '+str(directory))
+        if not directory.exists(): raise SystemExit('LA userland cache product missing: '+str(directory))
         paths.append(directory);paths.extend(directory.rglob('*'))
-    configuration=json.loads((ROOT/'tests/program-inventory/inputs.json').read_text())['busybox']['config']
-    paths.extend(base/'busybox-source'/name for name in ('busybox/busybox','busybox/.config',configuration))
     result={}
     for path in sorted(paths):
         key=str(path.relative_to(base));mode=path.lstat().st_mode&0o777
@@ -95,6 +93,11 @@ def installed_manifest(base):
         elif path.is_dir(): result[key]={'kind':'directory','mode':mode}
         else: raise SystemExit('LA userland cache product missing: '+str(path))
     return result
+
+def installed_manifest(base):
+    configuration=json.loads((ROOT/'tests/program-inventory/inputs.json').read_text())['busybox']['config']
+    return installed_tree_manifest(base,['gcc-sf/root','musl-root','uapi',
+        *('busybox-source/'+name for name in ('busybox/busybox','busybox/.config',configuration))])
 
 def main(args):
     BASE.mkdir(parents=True, exist_ok=True)

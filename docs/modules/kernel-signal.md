@@ -28,9 +28,9 @@ handler 的 a0/a1/a2 分别为信号、siginfo 地址和 ucontext 地址；ra �
 
 LA 整数帧为 592 字节、16 字节对齐：128 字节 siginfo、448 字节 ucontext 和16字节
 END。ucontext 的 mask/mcontext 偏移仍为40/176，sigcontext 是 PC、32个GPR、32位
-flags，再对齐至272字节。只发布 END，不发布未拥有的 FP/LSX/LASX/LBT 状态；
-未知扩展或 SC_USED_FP 帧以用户坏帧处理，扩展支持另行实现。恢复先快照 mask、
-context 和 END，再提交用户寄存器；PRMD、内核 TP 不来自用户，r0保持零。
+flags，再对齐至272字节。未使用FP时只发布END；使用FP后发布实际owner的FPU记录，不发布LSX/LASX/LBT；
+标量FPU扩展已接入；未知LSX/LASX/LBT扩展以用户坏帧处理。恢复先快照 mask、
+context、FPU记录和END，再提交用户寄存器；PRMD、内核 TP 不来自用户，r0保持零。
 handler 的 a0/a1/a2、ra 与 SP 使用 LA ABI，VDSO 执行 syscall 139；sigreturn 不再推进 ERA。
 内核交付帧保持16字节对齐；用户提供的恢复帧不另加这一拒绝条件，Linux接受
 可读的8字节偏移帧。仍完整检查范围、复制和不支持扩展，先快照后提交。
@@ -48,7 +48,7 @@ sigsuspend 在等待和选择 handler 时保留临时 mask，把原 mask 写入�
 ## 验证与当前边界
 
 RV 构帧复用 prefix/mcontext 存储，不在内核栈放置整份1088字节frame；LA整数帧使用
-有界592字节输入，构帧路径编译栈帧736字节、恢复352字节。故障记录内嵌在线程
+592字节整数或880字节FPU帧，构帧编译栈帧960字节、恢复688字节。故障记录内嵌在线程
 控制块中，不为交付分配内存。函数与调用链预算通过 `make test-stack-usage`、
 `make test-stack-usage-la`、真实任务 canary 与退出时栈统计核对；单函数统计和
 一次回归不能证明所有深层 I/O/fault 清理链。
@@ -71,7 +71,7 @@ break 6/7 分别为 SIGFPE/FPE_INTOVF、FPE_INTDIV，按真实指令 immediate �
 `make test-signal-loongarch` 在512MiB/1GiB分别运行同一个真实 LP64S musl ELF，
 验证布局、来源/mask、嵌套、故障映射修复、整数寄存器/PC恢复、坏帧、pipe
 SA_RESTART/EINTR、nanosleep EINTR 和 sigsuspend。每次 BoarOS 退出要求根盘 owner、
-用户页/页表/任务栈和堆恢复基线。此范围没有 FP/SIMD、altstack 或实时队列。
+用户页/页表/任务栈和堆恢复基线。整数范围另由LP64D FPU探针扩展；尚无SIMD、altstack或实时队列。
 
 U-mode 未映射/权限页故障分别记录 SIGSEGV/SEGV_MAPERR、SEGV_ACCERR，文件 EOF/I/O fault 记录 SIGBUS/BUS_ADRERR，`si_addr` 为故障 VA。非法指令与断点为 SIGILL/ILL_ILLOPC、SIGTRAP/TRAP_BRKPT；access/misaligned cause 按固定 Linux 映射，`si_addr` 为 PC。来源为本地 `references/linux/arch/riscv/kernel/traps.c`、`arch/riscv/mm/fault.c`、`kernel/signal.c::force_sig_info_to_task`，commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`。
 
@@ -82,3 +82,5 @@ U-mode 未映射/权限页故障分别记录 SIGSEGV/SEGV_MAPERR、SEGV_ACCERR�
 TTY 的前台终端信号使用稳定 PGID 发向整个进程组；背景 TTIN/TTOU 和会话 HUP/CONT
 的 owner、忽略/阻塞/orphan 条件及生命周期见 [Serial TTY](kernel-tty.md)。终端 read/write
 实际已交付前缀后不留下 restart 标记，只有整次无进展的 ERESTARTSYS 由 trap 登记重试。
+
+标量FPU记录、pending异常、首用和owner切换见[LA浮点模块](loongarch-fpu.md)。

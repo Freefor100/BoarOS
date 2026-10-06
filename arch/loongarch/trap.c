@@ -1,6 +1,7 @@
 #include <arch/task.h>
 #include <arch/timer.h>
 #include <arch/loongarch/signal.h>
+#include <arch/loongarch/fpu.h>
 #include <platform/loongarch_virt.h>
 #include <kernel/task.h>
 #include <kernel/tick.h>
@@ -59,6 +60,8 @@ void la_trap_dispatch(struct arch_trap_frame *frame)
         return;
     }
     if(external_handled) return;
+    if(user && code==15) {la_fpu_first_use();return;}
+    if(user && code==18) {fault(8,(int32_t)la_fpu_take_exception(),frame->era);return;}
     if (user && (code==1 || code==2 || code==3 || code==4 || code==5 || code==6 || code==7)) {
         uint32_t access=(code==3 || code==6) ? KERNEL_MM_EXECUTE : ((code==2 || code==4) ? KERNEL_MM_WRITE : KERNEL_MM_READ);
         enum kernel_mm_status status=kernel_scheduler_resolve_current_user_fault(frame->badv,access);

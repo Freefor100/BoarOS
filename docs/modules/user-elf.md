@@ -53,7 +53,7 @@ run 边界同时包含每个装载段的首个完整页、最后一个完整文�
 - PIE `ET_DYN`，带 `PT_INTERP`；
 - 无解释器的 `ET_DYN`。
 
-主程序和解释器各由 exec 事务持有一个 source；解释器不能递归含 `PT_INTERP`。`PT_DYNAMIC`、`PT_TLS`、GNU RELRO/STACK 等信息保留在 source 中，供动态链接器读取；内核本身当前不执行重定位、加载额外 DSO 或分配 TLS。主文件格式/架构错误返回 `ENOEXEC`；解释器缺失保留路径错误，解释器格式或架构错误返回 `ELIBBAD`。
+主程序和解释器各由 exec 事务持有一个 source；解释器不能递归含 `PT_INTERP`。`PT_DYNAMIC`、`PT_TLS`、GNU RELRO/STACK 等信息保留在 source 中，供动态链接器读取；内核本身当前不执行重定位、加载额外 DSO 或分配 TLS。主文件格式/架构错误返回 `ENOEXEC`；解释器缺失保留路径错误，解释器短header返回 `EIO`，完整header的格式或架构错误返回 `ELIBBAD`。
 
 每个 source 的 `PT_LOAD` run 映射成 `ELF_PRIVATE` VMA，VMA 的 `backing_offset` 是 source-relative 起点，故障策略为 `ELF`。单个同时要求写与执行的装载段按 RWE 映射；共享文件页写入时仍先 COW，重叠装载段仍不得共享同一虚拟字节或形成跨段的写执行页。完整文件页共享 page cache，写入时 COW；复合页和 BSS 私有化。VMA 与 MM 各保留 source 引用：重复映射不会累积历史引用，fork 的子 MM 取得独立引用，最后一个相关 VMA 消失后释放。每次新建可执行页后先做架构地址转换失效并执行取指同步，覆盖先读后取指的路径。
 
@@ -81,4 +81,7 @@ make test-root-init-riscv
 make test-riscv
 ```
 
-真实根启动 fixture 验证 source-backed 静态入口；动态 musl PIE、解释器、额外 DSO、初始 TLS 和线程运行期间的 dlopen TLS 已通过生产入口验证，消费者复用 userland runner。固定 glibc 2.44 的静态/动态/PIE 与 pthread、dlopen TLS、信号子集由 `make test-glibc-riscv` 对照固定 Linux 验证。重定位与 TLS 分配由用户态动态链接器/libc 完成，不是待添加的内核 ELF 算法。更广 glibc 应用与真实开发板 I-cache/熵源仍需单独验证。LoongArch 已复用同一解析、source和映像策略，验证16 KiB/三级页表的整数内存与PCI/ext4静态ELF、LP64S musl TLS/pthread及整数信号。LA根平台仍对PT_INTERP返回ENOEXEC；动态musl/DSO TLS未验收。
+真实根启动 fixture 验证 source-backed 静态入口；动态 musl PIE、解释器、额外 DSO、初始 TLS 和线程运行期间的 dlopen TLS 已通过生产入口验证，消费者复用 userland runner。固定 glibc 2.44 的静态/动态/PIE 与 pthread、dlopen TLS、信号子集由 `make test-glibc-riscv` 对照固定 Linux 验证。重定位与 TLS 分配由用户态动态链接器/libc 完成，不是待添加的内核 ELF 算法。更广 glibc 应用与真实开发板 I-cache/熵源仍需单独验证。LoongArch 已复用同一解析、source和映像策略，验证16 KiB/三级页表的整数内存与PCI/ext4静态ELF、LP64S musl TLS/pthread及整数信号。LA的PT_INTERP、原版LP64D musl动态PIE/非PIE和初始/late DSO TLS已双侧验收，标量FPU与信号扩展见LA模块。
+
+`kernel_elf64_source_create_interpreter()` 复用create所有权契约，仅在完整64字节header之前
+区分短EOF的Linux EIO；运行期exec与RV/LA根启动均使用同一入口，失败保留OFD owner。

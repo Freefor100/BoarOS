@@ -56,7 +56,10 @@ static int check_nonpi_raw_exit(void)
     }
     return 83;
 }
-int main(int argc,char **argv)
+#ifndef LA_PTHREAD_ENTRY
+#define LA_PTHREAD_ENTRY main
+#endif
+int LA_PTHREAD_ENTRY(int argc,char **argv)
 {
     if(argc==3 && !strcmp(argv[1],"execed")) return execed_mode(argv[2]);
     const struct {const char *name;int (*check)(void);} cases[]={
