@@ -2,6 +2,7 @@
 #include <kernel/page.h>
 #include <stddef.h>
 #include <kernel/console.h>
+#include <platform/loongarch_pci.h>
 
 /* QEMU v11.1.0 virt.h: ns16550 and ACPI GED, accessed uncached. */
 static volatile unsigned char *const uart = (void *)(LA_UNCACHED_BASE + 0x1fe001e0);
@@ -105,6 +106,6 @@ int la_virt_boot_memory(uint64_t systab, uint64_t kernel_start, uint64_t kernel_
 
 unsigned arch_uart_rx_ready(void) { return (uart[5]&1)!=0; }
 char arch_uart_getc(void) { return (char)uart[0]; }
-/* External IRQ and RTC providers are not registered in the first platform stage. */
-int arch_external_interrupt_active(void) { return 0; }
+/* No RTC provider is registered yet; external IRQ state belongs to the PCI platform. */
+int arch_external_interrupt_active(void) { return la_virt_irq_active(); }
 int arch_rtc_read_ns(uint64_t *out) { (void)out; return 1; }

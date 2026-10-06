@@ -8,6 +8,7 @@
 #include <kernel/errno.h>
 #include <kernel/signal.h>
 #include <kernel/console.h>
+#include <platform/loongarch_pci.h>
 void la_trap_entry(void);
 void la_trap_initialize(void)
 {
@@ -20,7 +21,15 @@ void la_trap_dispatch(struct arch_trap_frame *frame)
 {
     uint64_t code=(frame->estat>>16)&63;
     int user=(frame->prmd&3)==3;
-    if (!code && (frame->estat&(UINT64_C(1)<<11))) {
+    uint64_t pending=0;
+    if(!code) {
+        uint64_t enabled;__asm__ volatile("csrrd %0, 4":"=r"(enabled));
+        /* ESTAT 包含被 mask 的外设；timer trap 不能顺便分发未启用的来源。 */
+        pending=frame->estat&enabled&0x1fff;
+    }
+    int external_handled=!code && (pending&4);
+    if(external_handled) la_virt_irq_dispatch();
+    if (!code && (pending&(UINT64_C(1)<<11))) {
         uint64_t elapsed;
         if (la_timer_interrupt(&elapsed)!=ARCH_TIMER_STATUS_OK) la_virt_fatal("timer interrupt");
         if (elapsed) { kernel_tick_advance(elapsed); kernel_time_update_coarse(); kernel_scheduler_charge_ticks(elapsed,user); }
@@ -32,6 +41,7 @@ void la_trap_dispatch(struct arch_trap_frame *frame)
             la_virt_fatal("timer scheduler");
         return;
     }
+    if(external_handled) return;
     if (user && (code==1 || code==2 || code==3 || code==4 || code==5 || code==6 || code==7)) {
         uint32_t access=(code==3 || code==6) ? KERNEL_MM_EXECUTE : ((code==2 || code==4) ? KERNEL_MM_WRITE : KERNEL_MM_READ);
         enum kernel_mm_status status=kernel_scheduler_resolve_current_user_fault(frame->badv,access);

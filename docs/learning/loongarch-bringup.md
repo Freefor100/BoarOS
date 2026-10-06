@@ -94,3 +94,10 @@ SQLite DELETE/WAL/重启恢复回归通过。它们保护共用层的既有行�
 映射的物理入口调用会产生instruction-access fault。改为从当前PC初始化MMIO
 回调，再在合法映射阶段发布设备；同一真实fixture恢复，生产根与四组合睡眠I/O
 均通过。宿主wire模型无法检出物理别名与链接VA的区别，必须保留QEMU启动证据。
+
+真实PCI阶段在512MiB/1GiB通过两盘共享INTx、8槽DMA、读写/flush和资源回收。
+两处新中断时序分别有RED→GREEN：共享level源在设备ISR快照间保持高电平时，
+仅清EXTIOI快照会漏掉迟到完成，必须mask/unmask PCH-PIC以重新采样intirr；
+ESTAT保留被mask的pending位，timer入口要与ECFG相交，不能分发未启用来源。
+宿主PIC/OR模型强制前一时序，QEMU两个共享pin的实际盘及暂时mask场景验证组合。
+PCI capability范围与BAR资源不足测试只证明解析和回滚，不替代真实DMA/IRQ证据。
