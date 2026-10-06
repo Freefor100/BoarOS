@@ -252,3 +252,12 @@ archive/ABI/options与完整安装树身份；syslibdir设在缓存内，guest i
 由显式链接参数固定/lib路径，安装不会写宿主/lib。旧SF缓存独立。两类各9个
 合法先命中/单项拒绝反例通过，冷构建不复用旧source。缓存过期只拒绝，不
 修改已固定输入或静默承认旧产物。
+
+## 双架构验收 profile
+
+原 RV GNU probe 固定2.44和退出42；LA已装的原版GNU runtime是2.42。用户选择
+先固定现有工具与runtime，profile提供版本断言，不修改上游libc；安装树身份
+同时覆盖目录/文件权限和链接目标，不能只比较loader内容。LA loader实际内建
+`/usr/lib64`搜索路径，由本地已固定loader字符串和Linux动态启动核对，RV的
+`/lib` fixture不能直接搬用。五形态同ELF在固定Linux两种RAM通过，初始Boar
+静态程序在main前SIGILL；这只建立对照入口，尚不是glibc组合能力验收。

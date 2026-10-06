@@ -1,4 +1,7 @@
 #include <stdint.h>
+#ifndef EXPECTED_EXIT_STATUS
+#define EXPECTED_EXIT_STATUS 0
+#endif
 static long call(long number,long a,long b,long c,long d,long e,long f)
 {
     register long r4 __asm__("a0")=a,r5 __asm__("a1")=b,r6 __asm__("a2")=c;
@@ -34,7 +37,7 @@ int user_main(uint64_t *stack)
             for(;;){}
         }
         int status=-1;
-        if(call(260,child,(long)&status,0,0,0,0)!=child || status) failed=1;
+        if(call(260,child,(long)&status,0,0,0,0)!=child || status!=(EXPECTED_EXIT_STATUS<<8)) failed=1;
     }
     /* reboot 不替 init checkpoint 根盘；先卸载才能直接核对宿主 home blocks。 */
     if(call(39,(long)"/root",0,0,0,0,0)) failed=1;

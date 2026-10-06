@@ -1,0 +1,32 @@
+{
+  "arch": "loongarch",
+  "glibc_version": "2.42",
+  "interpreter": "/usr/lib64/ld-linux-loongarch-lp64d.so.1",
+  "library_directory": "/usr/lib64",
+  "page_size": 16384,
+  "compiler_flags": [
+    "-march=loongarch64",
+    "-mabi=lp64d",
+    "-mdouble-float",
+    "-mno-lsx",
+    "-mno-lasx",
+    "-Wl,-z,max-page-size=16384"
+  ],
+  "tools": {
+    "/opt/loongarch64-tools/bin/loongarch64-unknown-linux-gnu-gcc": "93ffc1acbb540affea06c1c986a1f3869a48383a7fba849710cfe20e8fdd4cd0",
+    "/opt/loongarch64-tools/bin/loongarch64-unknown-linux-gnu-as": "11cd09d881c7b06525c0c8ab1683503cc9d44708e8589e55983703ef30859b4a",
+    "/opt/loongarch64-tools/bin/loongarch64-unknown-linux-gnu-ld": "6e6500ab0555e3f14d07dc67a68a42e9f471eeb1efc62d6d0cedfddf1e49bffa",
+    "/opt/loongarch64-tools/bin/loongarch64-unknown-linux-gnu-ar": "bda972e5eb38084c39bfe9823b31c3ca3b9b61e4af10a8bd63edd7ff00bdcc1e"
+  },
+  "runtime": {
+    "/opt/loongarch64-tools/target/usr/lib64/ld-linux-loongarch-lp64d.so.1": "af63e8dec2e168cd33268f5d612b9456aba7925e77c88eab99fe6943bd3a7a4b",
+    "/opt/loongarch64-tools/target/usr/lib64/libc.so.6": "b2e75cc008f1b2da43ef1604af808b8c7acc2457f8c8b3c872e046df1a41dbdc",
+    "/opt/loongarch64-tools/bin/../target/lib64/libgcc_s.so.1": "0062fc3e476db8aa13251610e5209a3224d5119c6fcfab907458a2ec0779b3ac"
+  },
+  "installation": {
+    "/opt/loongarch64-tools/bin/../libexec/gcc/loongarch64-unknown-linux-gnu/15.1.0": "97e41aed790b44c413a059c90ea2af7b88f6a0fe284d38162a852bd048ce7588",
+    "/opt/loongarch64-tools/target/usr/lib64/gcc/loongarch64-unknown-linux-gnu/15.1.0": "289d7fba19b051c994d76f00726d41281f08efb5f8ea9d522eca29934605390f",
+    "/opt/loongarch64-tools/target": "e018ad2a1a052e046a4df2deec835cfe4027d110e92133a8487bc9fc747fd641",
+    "/opt/loongarch64-tools/bin": "1e94f3d77aee4528ae1a9cb2a0b4d8c4369285a70702c30690d00f1b8b7a4a42"
+  }
+}
