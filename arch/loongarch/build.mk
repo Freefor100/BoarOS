@@ -122,3 +122,9 @@ $(LA_BUILD)/kernel-clone-oom-%: $(LA_BUILD)/clone-oom-%.o $(LA_OBJECTS) arch/loo
 test-pthread-oom-loongarch: $(LA_BUILD)/kernel-clone-oom-0 $(LA_BUILD)/kernel-clone-oom-1 $(LA_BUILD)/pthread-oom-probe prepare-la-tools prepare-la-linux
 	python3 -B tests/loongarch/userland.py --platform BoarOS --qemu $(QEMU_LOONGARCH64) --cc $(LA_CC) --kernel $(LA_BUILD)/kernel-clone-oom-0 --program $(LA_BUILD)/pthread-oom-probe --marker 'LA pthread creation OOM rollback/retry passed' --marker 'LA clone failed before publication; task/stack pages restored'
 	python3 -B tests/loongarch/userland.py --platform BoarOS --qemu $(QEMU_LOONGARCH64) --cc $(LA_CC) --kernel $(LA_BUILD)/kernel-clone-oom-1 --program $(LA_BUILD)/pthread-oom-probe --marker 'LA pthread creation OOM rollback/retry passed' --marker 'LA clone failed before publication; task/stack pages restored'
+
+$(LA_BUILD)/permissions-probe: tests/loongarch/permissions.c prepare-la-userland
+	REALGCC=$(abspath $(LA_USER_CC)) $(LA_MUSL_CC) $(LA_FLAGS) -O2 -static -Wall -Wextra -Werror -Wl,-z,max-page-size=16384 -o $@ $<
+.PHONY: test-permissions-loongarch
+test-permissions-loongarch: kernel-la $(LA_BUILD)/permissions-probe prepare-la-tools prepare-la-linux
+	python3 -B tests/loongarch/userland.py --qemu $(QEMU_LOONGARCH64) --cc $(LA_CC) --program $(LA_BUILD)/permissions-probe --marker 'LA permissions cold/resident/exec/fork/uaccess/revoke passed'

@@ -113,6 +113,14 @@ enum kernel_mm_status kernel_mm_release(struct kernel_mm *mm);
 - `release` 消耗一个 owner，非末引用只减计数，末引用才销毁页表树和记录页；
 - `lookup` 把架构权限翻译为 `KERNEL_MM_READ/WRITE/EXECUTE/USER`，不让通用调用者依赖 RISC-V PTE 位值。
 
+LA 的有效 PTE 权限按固定 Linux `arch/loongarch/mm/cache.c::protection_map`：
+非 PROT_NONE 用户页可读，EXEC 独立控制 NX。请求的 VMA 权限保持原值；因此
+未驻留的纯 EXEC 页数据读取被 VMA 拒绝，页经合法写入或取指驻留后可由 PTE
+读取。uaccess 同样先看实际 PTE，冷页才走原通用 fault 权限检查。不能统一把
+VMA 的 EXEC 改写成 READ，也不能只修改用户硬件权限而使复制仍误报 EFAULT。
+`make test-permissions-loongarch` 用同 ELF 验证两种 RAM 下的冷/驻留页、取指
+物化、mprotect、fork、uaccess 和撤执行权限；PROT_NONE、COW及回收契约保留。
+
 输入目标必须是全零 `EMPTY` 句柄。成功移动后源进入 `MOVED`，成功释放后进入 `RELEASED`；二者都不再拥有资源。分配器释放属于 fail-stop 契约，不能由调用者按错误码重试；只有文件/OFD 等真实 I/O owner 的清理状态会交给上层继续处理。
 
 RISC-V 创建先分配并解析记录页，最后才把 LIVE Sv39 空间移入记录；成功后输入空间成为 MOVED。记录页及页表的合法释放完成即结束；若同时持有 VFS/file-source owner，则仅保留对应的 I/O cleanup 状态。

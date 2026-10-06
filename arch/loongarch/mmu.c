@@ -61,7 +61,7 @@ static uint64_t encode(uint64_t physical, uint32_t permissions, int cow)
     if (cow) pte|=PTE_COW;
     if (!permissions) return pte|PTE_NONE;
     pte|=PTE_VALID;
-    if (!(permissions&ARCH_MMU_READ)) pte|=PTE_NR;
+    /* Linux LA 对非 NONE 用户页使用可读 PTE；冷页仍按请求 VMA 权限 fault。 */
     if (!(permissions&ARCH_MMU_EXECUTE)) pte|=PTE_NX;
     if (permissions&ARCH_MMU_WRITE) pte|=PTE_WRITE;
     if (!cow && (permissions&ARCH_MMU_WRITE)) pte|=PTE_DIRTY;
