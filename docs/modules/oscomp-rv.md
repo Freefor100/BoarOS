@@ -92,6 +92,8 @@ make all                         # 官方构建入口；无需修改官方测试
 python3 -B tests/oscomp/run.py --output build/oscomp-rv-baseline
 python3 -B tests/oscomp/run.py --groups environment --output build/oscomp-rv-environment
 python3 -B tests/oscomp/run.py --groups benchmarks --output build/oscomp-rv-benchmarks
+# 仅验证一个原组，仍执行该组两种 libc 的完整原脚本：
+python3 -B tests/oscomp/run.py --groups iperf --output build/oscomp-rv-iperf
 # 聚焦验证仍执行完整原 LTP 包装器，不选内部清单：
 python3 -B tests/oscomp/run.py --groups ltp --output build/oscomp-ltp
 python3 -B tests/oscomp/test_official.py
@@ -122,8 +124,9 @@ runner 读取固定 Harness `kernel/judge/config.json`。其中 `qemu.timeout=36
 为完整串口，`identity.json` 在启动前写入，方便中断后定位。HTML 是原 postwork 展示，
 可能带有 LA 空列，不能把它解释成跑过 LA。输出只允许放在新建的 `build/` 子目录。
 `release_assets_verified_this_run` 区分此次全量复查与复用既有输入；`--groups benchmarks`
-仅执行五项原脚本，未选组只由原 parser 产生空结果。最新实测、cleanup 错误和
-cyclictest 零采样见[五项评分记录](../learning/data-path-budget-experiments.md#受控延迟与原版五项评分补测2026-10-06)。
+仅执行五项原脚本，`--groups` 也接受任一原组名称，以直接验证相关程序；未选组只由
+原 parser 产生空结果。最新实测、历史 cleanup 错误及其修复、cyclictest 零采样见
+[五项评分记录](../learning/data-path-budget-experiments.md#受控延迟与原版五项评分补测2026-10-06)。
 
 ## 证据边界与清理
 

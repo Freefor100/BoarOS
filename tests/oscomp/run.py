@@ -91,7 +91,7 @@ def main():
     ap.add_argument('--output', type=Path, default=ROOT / 'build/oscomp-rv-run')
     ap.add_argument('--verify-inputs', action='store_true', help='explicitly recheck release asset hashes; routine runs reuse the previously verified inputs')
     ap.add_argument('--diagnostic-timeout', type=int, help='override total budget, 0 disables it; labels result diagnostic, never the formal baseline')
-    ap.add_argument('--groups',choices=('all','benchmarks','iozone','environment','ltp'),default='all',help='benchmarks selects only iozone, cyclictest, iperf, libcbench and lmbench; subsets use the original scripts')
+    ap.add_argument('--groups',choices=tuple(GROUPS)+('all','benchmarks','environment'),default='all',help='select one original group, the five benchmarks, or all; no original script is shortened')
     ap.add_argument('--case-timeout', type=int, default=300, help='LTP per-case safety budget seconds, 0 disables it; timeout is never a pass')
     ap.add_argument('--diagnostic-exclude', action='append', default=[], metavar='CASE', help='explicitly leave a LTP basename unexecuted, status 125; labels the whole run diagnostic')
     args = ap.parse_args()
@@ -101,7 +101,7 @@ def main():
     if not directory.is_relative_to(ROOT / 'build'):
         raise SystemExit('run outputs must be under build/')
     identity = validate(args.verify_inputs)
-    selected={'all':GROUPS,'benchmarks':['iozone','cyclictest','iperf','libcbench','lmbench'],'iozone':['iozone'],'environment':['basic','busybox'],'ltp':['ltp']}[args.groups]
+    selected={'all':GROUPS,'benchmarks':['iozone','cyclictest','iperf','libcbench','lmbench'],'environment':['basic','busybox']}.get(args.groups,[args.groups])
     config_path = REF / 'kernel/judge/config.json'
     config = json.loads(config_path.read_text())
     budget = args.diagnostic_timeout if args.diagnostic_timeout is not None else config.get('qemu.timeout', 60)

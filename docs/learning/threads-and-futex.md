@@ -176,3 +176,8 @@ make test-root-orphan-riscv
 
 这是进程/关机生命周期修复，没有修改日志 durable、checkpoint 或设备 reset 语义；
 不为此重跑存储恢复、参数或完整 ABI 矩阵。
+
+兼容分支随后用 `tests/oscomp/run.py --groups iperf` 执行两种 libc 的完整原脚本，
+一次 27.434 秒启动中十二项均 success，最终 PID 1 status=0、heap-live=0 并正常
+关机。它直接覆盖原程序遗留 server daemon 的触发条件；不据此将此前五项启动的
+失败记录改写为通过，也不将单次吞吐变化归因于参数调整。

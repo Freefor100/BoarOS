@@ -455,9 +455,10 @@ cyclictest 继续报告 `mlock Function not implemented`。glibc 的压力八线
 
 所有组结束并打印 `BOAROS-EVAL COMPLETE` 后，内核最后报告
 `root boot error status=0xb`。该值是 `RISCV_ROOT_BOOT_STATUS_CLEANUP`，不是 errno。
-网络/rng 收口已完成；最后失败的下层 owner 未在本次日志中打印，仍待定位。
-报告保留 `guest-boot-error`，不能将这次启动写成完全无错误通过；应用测量与分数
-均在此错误之前输出。没有为消除这条记录重跑五组或展开存储恢复矩阵。
+网络/rng 收口已完成；当时最后失败的下层 owner 未在日志中打印。后续已定位为
+PID 1 退出时仍存活的后台用户 owner，并修复关机顺序，见[批准默认与关机修复](#批准默认与关机修复2026-10-06)。
+原报告仍保留 `guest-boot-error`，不能将这次历史启动改写为完全无错误通过；应用
+测量与分数均在此错误之前输出。修复后只重跑直接暴露此边界的原版 iperf。
 
 重建仅需：
 
@@ -521,5 +522,43 @@ done
 
 存储同理：WB8 将 64 MiB fsync 追加从默认 4.52 提高到 6.23 MiB/s，却将缓存
 1 KiB 追加从 20.86 降到 18.68；RA8/WB8 的顺序冷读 36.66 对默认 25.53 有收益。
-因此按负载推荐，不能统一开启所有更大值。生产仍 TCP 8/1/1、RA0/WB1；本轮未
-自动采用候选。后续以原版目标程序和直接相关回归为主，不因小改动重跑全部矩阵。
+因此按负载推荐，不能统一开启所有更大值。补测结束时生产仍为 TCP 8/1/1、RA0/WB1；
+随后用户批准网络默认采用 8/4/2，存储保持 RA0/WB1，实施见下节。后续以原版目标
+程序和直接相关回归为主，不因小改动重跑全部矩阵。
+
+### 批准默认与关机修复（2026-10-06）
+
+通用改动先在 main 提交：`aacdba7` 修复 PID 1 关机生命周期，`0969e18` 将网络
+默认改为 W/P/M=8/4/2；兼容分支通过 `09d5d4a` 单向合入。窗口仍为 8 MSS
+（11680 B），TCP segment 池为 512、pbuf header/pool 各 256、协议堆为 512 KiB，
+PCB 仍为 32；生产存储仍为 RA0/WB1。`make all test-lwip-host` 通过；没有重跑
+参数矩阵。上面的历史“默认”表格仍指 8/1/1，不作为新默认的新增测量。
+
+关机错误属于内核 PID 1 收口顺序：后台 daemon 仍持有 cwd、文件、MM 等 owner，
+内核却已开始卸载根盘。最小实际 U-mode 复现打印 UNMOUNT / EBUSY，旧 5687377
+生产 ELF 同样失败。VFS 拒绝卸载是正确行为；修复通过既有组退出/取消路径结束
+用户任务并等其回收，再停止内核 I/O 服务及卸载，保留 PID 1 自身的完成状态。
+错误现场原先排在异步 UART 队列中，可能在关机前未发送；现在先切同步输出再打印。
+触发、owner 与完整定位依据见[PID 1 关机记录](threads-and-futex.md#pid-1-关机与存活后台-owner2026-10-06)。
+
+四个窄 U-mode 场景（daemon、STOPPED、存活线程组、关机期间 fork）均通过，
+PID 1 的退出码 37 保留、heap-live=0 且物理页回到基线；原 zombie 收口回归也通过。
+随后在兼容分支只跑原版 iperf：
+
+```sh
+python3 -B tests/oscomp/run.py --groups iperf --output build/oscomp-iperf-shutdown-fixed
+```
+
+一次启动用时 27.434 秒，两种 libc 的十二个原子项均为 success，原脚本结束后正常
+QEMU exit、PID 1 status=0、heap-live=0，没有 cleanup 错误。原 judge 每种 libc
+仍为 6.0000/12；实际接收端 TCP 数值如下。
+
+| 修复验证的原 iperf，Mbit/s | musl | glibc |
+|---|---:|---:|
+| 单连接 | 224 | 223 |
+| 五连接合计 | 308 | 277 |
+| 反向单连接 | 220 | 223 |
+
+这是关机修复的原程序验收，只有一次启动且前置负载与五项评分不同，不能据此归因
+吞吐变化或声称新默认提升了原 iperf。没有重跑五项、完整 ABI 或存储恢复矩阵；
+glibc cyclictest 的零采样仍是独立未完成项。
