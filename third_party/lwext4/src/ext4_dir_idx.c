@@ -1400,6 +1400,34 @@ int ext4_dir_dx_check(struct ext4_inode_ref *dir, struct ext4_block *block)
     return ext4_dir_dx_csum_verify(dir, (void *)block->data) ? EOK : EUCLEAN;
 }
 
+int ext4_dir_dx_is_node(struct ext4_inode_ref *dir, uint32_t logical, bool *is_node)
+{
+    if(!is_node)return EINVAL;
+    *is_node=logical==0;
+    if(!logical)return EOK;
+    ext4_fsblk_t home;
+    int r=ext4_fs_get_inode_dblk_idx(dir,0,&home,false);
+    if(r!=EOK)return r;
+    if(!home || home>=dir->fs->bdev->lg_bcnt)return EUCLEAN;
+    struct ext4_block block=EXT4_BLOCK_ZERO();
+    r=ext4_trans_block_get(dir->fs->bdev,&block,home);
+    if(r!=EOK)return r;
+    r=ext4_dir_dx_check(dir,&block);
+    if(r==EOK) {
+        struct ext4_dir_idx_root *root=(void *)block.data;
+        /* 空leaf与内部node都可用一个inode=0的整块记录，角色取自HTree引用。 */
+        if(root->info.indirect_levels) {
+            struct ext4_dir_idx_climit *cl=(void *)(block.data+32);
+            struct ext4_dir_idx_entry *entries=(void *)cl;
+            uint32_t count=ext4_dir_dx_climit_get_count(cl);
+            for(uint32_t i=0;i<count;i++)
+                if(ext4_dir_dx_entry_get_block(&entries[i])==logical) { *is_node=true;break; }
+        }
+    }
+    int release=ext4_block_set(dir->fs->bdev,&block);
+    return r!=EOK ? r : release;
+}
+
 static int ext4_dir_parent_block(struct ext4_inode_ref *dir, struct ext4_block *block,
                                  struct ext4_dir_en **entry)
 {

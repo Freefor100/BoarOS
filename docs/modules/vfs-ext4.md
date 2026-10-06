@@ -462,3 +462,16 @@ SQLite NBD runner 的 marker 停机使用显式受控 cut：后端先冻结磁�
 完整 DELETE/WAL 恢复结果、未到达故障序号和输入身份见[最终恢复](../learning/record-lock-sqlite-recovery.md#数据路径最终恢复与宿主收口2026-10-06)。
 
 存储 20 组候选及 26 项扩展/同步负载已用发布构建三次独立启动比较，默认仍为 RA0/WB1。RA8 改善所测顺序冷读、WB8 改善显式同步，但 WB8 在 64 MiB 缓存追加有回退；冷热、tmpfs、缓存完成与 durable 同步分列于[报告及每文件完成时间](../learning/data-path-budget-experiments.md#正式匹配结果2026-10-06)。
+
+## 无metadata checksum的空索引目录（2026-10-07）
+
+`ext4_dir_check_empty`按HTree根的层级/块引用确定root、inner node与leaf；不按
+首个零inode整块记录猜测。关闭metadata_csum后，合法空leaf与inner node都可能
+使用这种记录，错误分类曾使普通mkdir/rmdir返回EUCLEAN。root/node仍检查
+count/limit/块范围/校验，leaf仍检查记录边界/名字长度/校验，损坏不静默降级。
+
+`make test-lwext4-dir-empty-host`使用真实1/4KiB ext4、dir_index和metadata_csum
+分别开/关，运行空目录覆盖及长名称目录增长/rename，再由e2fsck验证。
+ASan/UBSan保护实际lwext4/JBD/块模型；宿主证明不替代DMA。LA真实两种RAM
+的普通mkdir/rmdir与tmpfs挂载/卸载后rmdir、Linux同ELF、退出和根owner已通过，
+程序路径由扩大的network sendfile场景保护。全恢复矩阵仍在本轮最终回归范围内。

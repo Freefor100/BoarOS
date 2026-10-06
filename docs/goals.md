@@ -503,7 +503,7 @@ sigreturn/同步故障/等待重启和静态pthread/TLS已双侧验收，含真�
 PGDH内核栈窗口/guard/NX及可信异常栈已验收。SIMD接入后GNU启动缺失AT_RANDOM的
 SIGSEGV已定位到LA漏接QEMU DTB种子；复用不计熵的早期随机材料策略后，固定原版
 共用net/Ethernet和LA现代PCI真实TAP已在双侧两种RAM验证，原BusyBox HTTP、
-共享块/RNG/net IRQ及九类构造/reset失败回到基线。仍需AF_UNIX发送者缓存模型
+共享块/RNG/net IRQ及九类构造/reset失败回到基线。无metadata checksum的空索引目录误分类已由真实宿主/LA反例修复。仍需AF_UNIX发送者缓存模型
 修复sendfile datagram批次差异（用户已选择Linux路线），TTY/RTC、完整ABI及
 指定原程序/SQLite矩阵和最终全回归；不由设备通过声明能力全部等价。
 glibc2.42五形态在Linux/BoarOS两种RAM均通过退出及根owner门禁。真实PCI RNG已接入并
