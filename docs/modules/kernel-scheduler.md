@@ -72,7 +72,7 @@ TID、TGID、PGID 和 SID 共用 `kernel_pid` 对象：编号、不可回退的�
 
 通用进程策略由构建期 `arch_process_*` 后端准备寄存器。LA64的系统调用顺序为
 flags、child_stack、parent_tid、child_tid、tls，由LA trap重排成下述通用顺序；
-SETTLS写r2/TP、child stack写r3/SP、返回a0=0并使ERA前进4字节。LA已保存独立标量FP owner（FR/FCC/FCSR），其首用、信号和成本边界见[LA浮点](loongarch-fpu.md)，不套用RV的FS Dirty或SIMD范围。真实LP64S musl线程/TLS/取消/非PI robust与
+SETTLS写r2/TP、child stack写r3/SP、返回a0=0并使ERA前进4字节。LA已保存独立FP/SIMD owner，区分启用宽度、live宽度和used_math，其首用、信号和成本边界见[LA浮点](loongarch-fpu.md)，不套用RV的FS Dirty或SIMD范围。真实LP64S musl线程/TLS/取消/非PI robust与
 组生命周期由 `make test-pthread-loongarch` 双侧验证，两处构造OOM和重试由
 `make test-pthread-oom-loongarch` 验证；任务页/栈及根盘owner要求恢复基线。
 

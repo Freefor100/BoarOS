@@ -60,7 +60,7 @@ LA syscall 从 a7/a0–a5 解码，返回 a0 并恢复 ERA+4。未知 syscall �
 坏复制指针返回 EFAULT；权限/未映射故障和访问内核地址按实际用户故障处理。
 合法缺页 OOM 使用 RESOURCE/NO_MEMORY 退出，不能误报为用户地址非法。
 rt_sigaction/rt_sigreturn 已接入共用信号策略和 LA 整数帧；布局、故障与重启契约见
-[信号模块](kernel-signal.md)。标量FPU扩展帧已接入，见[LA浮点](loongarch-fpu.md)；SIMD与sigaltstack未支持。
+[信号模块](kernel-signal.md)。FPU/LSX/LASX扩展帧已接入，见[LA浮点/SIMD](loongarch-fpu.md)；sigaltstack未支持。
 
 2026-10-06 在 512 MiB 和 1 GiB 下完成：
 

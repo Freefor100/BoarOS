@@ -184,6 +184,14 @@ $(LA_BUILD)/fpu-probe: tests/loongarch/fpu.c tests/loongarch/fp_registers.S test
 test-fpu-loongarch: kernel-la $(LA_BUILD)/fpu-probe prepare-la-tools prepare-la-linux
 	python3 -B tests/loongarch/userland.py --qemu $(QEMU_LOONGARCH64) --cc $(LA_CC) --program $(LA_BUILD)/fpu-probe --marker 'LA FPU arithmetic/fenv/fork/signal passed' --marker 'LA FPU registers/FCC/timer/exec passed' --marker 'LA FPU exception signal passed' --marker 'LA FPU extension/badframe/pending/cross-page END passed'
 
+$(LA_BUILD)/simd-probe: tests/loongarch/simd.c tests/loongarch/simd_registers.S prepare-la-dynamic
+	REALGCC=$(LA_CC) $(LA_DYNAMIC_CC) $(LA_DP_FLAGS) -O2 -static -pthread -Wall -Wextra -Werror -Wl,-z,max-page-size=16384 -o $@ tests/loongarch/simd.c tests/loongarch/simd_registers.S
+.PHONY: test-simd-loongarch
+test-simd-loongarch: kernel-la $(LA_BUILD)/simd-probe prepare-la-tools prepare-la-linux
+	python3 -B tests/loongarch/userland.py --program $(LA_BUILD)/simd-probe --marker 'LA SIMD first-use/all lanes/timer/signal/fork/exec/HWCAP passed'
+	python3 -B tests/loongarch/userland.py --program $(LA_BUILD)/simd-probe --cpu la464,lasx=off --marker 'LA SIMD first-use/all lanes/timer/signal/fork/exec/HWCAP passed'
+	python3 -B tests/loongarch/userland.py --program $(LA_BUILD)/simd-probe --cpu la464,lasx=off,lsx=off --marker 'LA SIMD first-use/all lanes/timer/signal/fork/exec/HWCAP passed'
+
 $(LA_BUILD)/exec-errors-probe: tests/loongarch/exec_errors.c prepare-la-userland
 	REALGCC=$(abspath $(LA_USER_CC)) $(LA_MUSL_CC) $(LA_FLAGS) -O2 -static -pthread -Wall -Wextra -Werror -Wl,-z,max-page-size=16384 -o $@ $<
 .PHONY: test-exec-errors-loongarch

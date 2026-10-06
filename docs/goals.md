@@ -497,10 +497,12 @@ statx/clone子TID、PCI根盘及LP64S静态musl已通过第二阶段验收；整
 sigreturn/同步故障/等待重启和静态pthread/TLS已双侧验收，含真实musl取消、
 非PI robust、线程组生命周期及任务/栈创建OOM回滚；原BusyBox ash非交互trap/wait通过。
 用户已选择原版LP64D musl与LA标量FPU路线，动态libc/解释器/初始及late DSO TLS
-和FR/FCC/FCSR/信号/clone/exec子集已双侧验收。SIMD、glibc、更广原程序和完整终端/网络
+和FR/FCC/FCSR/信号/clone/exec子集已双侧验收。LSX/LASX状态与扩展帧、关闭CPU扩展
+及clone标量继承/上半部初始化已按固定Linux验收；glibc、更广原程序和完整终端/网络
 仍未完成；本轮已批准单核QEMU对齐、统一VirtIO框架、内嵌SIMD状态及原版glibc2.42。
 PGDH内核栈窗口/guard/NX及可信异常栈已验收；glibc五形态仅Linux对照通过，
-BoarOS main前SIGILL仍是实际阻塞，不能计为组合支持。
+SIMD接入后BoarOS推进到main前SIGSEGV；GDB确认GNU启动读取缺失AT_RANDOM，
+真实PCI RNG尚未接入，不能计为glibc组合支持。
 
 - [ ] ELF 段对齐、BSS 尾页、auxv、用户栈、stat/signal 结构及 clone 寄存器逐项核对；不能只换汇编入口却保留 RV ABI 编码。
 - [ ] 同一用户源码分别编译 RV/LA ELF，每架构内部用同一 ELF 对照 Linux 与 BoarOS；共享测试语义，隔离寄存器/页表差异，不拿 RV ELF 验证 LA。

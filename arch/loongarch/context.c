@@ -22,8 +22,8 @@ enum arch_context_status arch_context_init_user(struct arch_switch_context *cont
 }
 void arch_fpu_switch(struct arch_fpu_state *previous, struct arch_fpu_state *next)
 {
-    if(previous && previous->saved)la_fpu_save(previous);
-    if(next && next->saved)la_fpu_restore(next);
+    if(previous && previous->width)la_fpu_save(previous);
+    if(next && next->width)la_fpu_restore(next);
     else __asm__ volatile("csrwr $zero, 2" ::: "memory");
 }
 void arch_process_prepare_initial(struct kernel_task *task, uintptr_t entry, uintptr_t stack, uintptr_t tls)
@@ -40,8 +40,11 @@ enum kernel_scheduler_status arch_process_prepare_clone(struct kernel_task *chil
 {
     struct arch_trap_frame *frame=(void *)(child->stack_high-sizeof(*frame));
     if ((uintptr_t)frame<child->stack_low) return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
-    if(parent->fpu.saved)la_fpu_save(&parent->fpu);
+    if(parent->fpu.width)la_fpu_save(&parent->fpu);
     child->fpu=parent->fpu;
+    /* 固定 Linux copy_thread 撤销 SIMD live；子任务首用重新初始化向量上半部。 */
+    child->fpu.width=child->fpu.saved ? 1 : 0;
+    child->fpu.live_width=child->fpu.saved ? 1 : 0;
     *frame=*old; frame->regs[4]=0; frame->era+=4; frame->kernel_tp=(uintptr_t)child;
     child->arch.signal_error_code=parent->arch.signal_error_code;
     frame->estat=0; frame->badv=0;

@@ -69,7 +69,10 @@ void la_trap_dispatch(struct arch_trap_frame *frame)
         return;
     }
     if(external_handled) return;
-    if(user && code==15) {la_fpu_first_use();return;}
+    if(user && (code==15 || code==16 || code==17)) {
+        if(!la_fpu_first_use(code==15 ? 1 : code==16 ? 2 : 4))fault(4,1,frame->era);
+        return;
+    }
     if(user && code==18) {fault(8,(int32_t)la_fpu_take_exception(),frame->era);return;}
     if (user && (code==1 || code==2 || code==3 || code==4 || code==5 || code==6 || code==7)) {
         uint32_t access=(code==3 || code==6) ? KERNEL_MM_EXECUTE : ((code==2 || code==4) ? KERNEL_MM_WRITE : KERNEL_MM_READ);
