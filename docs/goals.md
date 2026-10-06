@@ -32,7 +32,7 @@ N3已经交付：legacy/modern VirtIO-net、受限DMA借用与复制回退、静
 
 ## 近期方向
 
-本轮单核数据路径阶段一至七已交付，保留以下由测量暴露的后续边界：默认 TCP 预算在部分 bulk/高并发负载吞吐回退；全局协议资源不足后的复制与重试仍有成本；WB8 可能降低仅缓存完成的小写速度。优先按[匹配结果](learning/data-path-budget-experiments.md)选择目标程序和候选，网络默认已按用户选择调整到 8/4/2，存储保持 RA0/WB1。受控延迟补测和具体原程序问题由兼容分支记录；完整比赛仍缺 LA 根盘与完整用户环境。
+本轮单核数据路径阶段一至七已交付，保留以下由测量暴露的后续边界：默认 TCP 预算在部分 bulk/高并发负载吞吐回退；全局协议资源不足后的复制与重试仍有成本；WB8 可能降低仅缓存完成的小写速度。优先按[匹配结果](learning/data-path-budget-experiments.md)选择目标程序和候选，网络默认已按用户选择调整到 8/4/2，存储保持 RA0/WB1。受控延迟补测和具体原程序问题由兼容分支记录；完整比赛仍缺 LA 完整用户环境。
 
 文件元数据的活inode复用、创建句柄初始化、O_PATH与路径truncate已交付，通用实现
 已单向合入兼容分支。路径资格、睡眠前节点引用、初始时间与显式改权的区别、截断属性
@@ -493,7 +493,7 @@ RV完整架构、真实用户程序、glibc、1344条ABI和SQLite回归通过。
 ### L2 ABI 与映像
 
 首阶段已覆盖内存ELF段/BSS/栈/auxv、整数寄存器、基本syscall与最小fork/COW计算探针。
-stat/signal handler、FP/SIMD和根盘/libc未验收，以下完整范围仍未完成。
+statx/clone子TID、PCI根盘及LP64S静态musl已通过第二阶段验收；完整signal handler、FP/SIMD、动态libc和TLS仍未完成。
 
 - [ ] ELF 段对齐、BSS 尾页、auxv、用户栈、stat/signal 结构及 clone 寄存器逐项核对；不能只换汇编入口却保留 RV ABI 编码。
 - [ ] 同一用户源码分别编译 RV/LA ELF，每架构内部用同一 ELF 对照 Linux 与 BoarOS；共享测试语义，隔离寄存器/页表差异，不拿 RV ELF 验证 LA。
@@ -501,8 +501,10 @@ stat/signal handler、FP/SIMD和根盘/libc未验收，以下完整范围仍未�
 ### L3 扩大真实用户空间
 
 2026-10-06 已批准 PCI→VirtIO块→ext4根盘→静态musl 阶段。共用块队列/owner/
-超时/reset 核心已提取，RV MMIO 与 LA PCI 独立负责 transport/IRQ；根盘与原
-静态程序结果须同时具备固定Linux对照和RV存储回归，不按架构构建成功勾选。
+超时/reset 核心共用，RV MMIO 与 LA PCI 独立负责 transport/IRQ。该阶段已通过两种RAM的
+PCI共享INTx、ext4读写/只读、原BusyBox七个applet及musl组合ABI的固定Linux对照，
+故障/OOM/页堆与BAR claim回收、真实写I/O失败owner保留，以及RV存储/SQLite回归。
+通用statx新增22条，当前RV ABI矩阵1366条匹配；完整比赛用户环境仍阻塞。
 
 - [ ] 静态 musl→动态 musl/DSO/TLS→fork/COW/信号→共享映射→glibc→真实应用，逐层保留错误与资源回收结果。
 - [ ] 维持 RV/LA 同口径功能矩阵，缺能力记录阻塞，不让新平台回退到固定输出或修改过的用户程序。
@@ -586,7 +588,7 @@ make test-program-inventory-host test-diff-abi-host
 make inventory-userland-riscv
 ```
 
-`inventory-userland-riscv` 默认成功只说明清单生成成功。全量 228 项仍有明确缺口，严格模式失败不是自动产生的新回归；`--case` 与 `--require-pass` 只严格判定本次选择集合，未选项目保留历史结果或 `not-run`，选择集合写入状态供恢复报告解释。完整 Harness 缺 LA 根盘用户环境或其他能力时保留阻塞原因。
+`inventory-userland-riscv` 默认成功只说明清单生成成功。全量 228 项仍有明确缺口，严格模式失败不是自动产生的新回归；`--case` 与 `--require-pass` 只严格判定本次选择集合，未选项目保留历史结果或 `not-run`，选择集合写入状态供恢复报告解释。完整 Harness 缺 LA 动态libc/TLS/信号等完整用户环境或其他能力时保留阻塞原因。
 
 ## 范围与交付边界
 

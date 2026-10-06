@@ -69,10 +69,14 @@ def candidates():
     la = BUILD / 'loongarch'
     if la.is_dir():
         result.extend(la.glob('*.log'))
+        result.extend(path for path in la.iterdir() if path.name in {'root-run','root-io-run','block-run'})
+        gcc_cache=la/'gcc-sf'
+        if gcc_cache.is_dir():
+            result.extend(path for path in gcc_cache.iterdir() if path.name in {'build','build-sf'})
         reference = la / 'reference'
         if reference.is_dir():
             result.extend(path for path in reference.iterdir()
-                          if path.suffix == '.log' or path.name == 'initramfs.gz')
+                          if path.suffix in {'.log','.img','.gz'})
 
     libc = BUILD / 'program-libc'
     if libc.is_dir():

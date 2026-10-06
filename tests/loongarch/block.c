@@ -45,7 +45,7 @@ static void cpu_worker(void *argument)
         if((int64_t)(arch_time_read()-deadline)>=0) la_virt_fatal("PCI I/O IRQ timeout");
     }
 }
-void __wrap_la_user_contract(struct physical_page_allocator *allocator)
+void __wrap_la_boot_tasks(struct physical_page_allocator *allocator)
 {
     uint64_t baseline=physical_page_available(allocator);
     struct pci_host *host=la_virt_pci_host();unsigned found=0;

@@ -6,7 +6,7 @@
 #include <kernel/time.h>
 #include <kernel/scheduler.h>
 void la_trap_initialize(void);
-void la_user_contract(struct physical_page_allocator *);
+void la_boot_tasks(struct physical_page_allocator *);
 extern unsigned char __boot_stack_bottom[], __boot_stack_top[];
 void la_heap_contract(struct physical_page_allocator *);
 void la_mmu_contract(struct physical_page_allocator *);
@@ -40,6 +40,6 @@ void la_kernel_main(uint64_t systab)
     la_mmu_contract(&allocator);
     if (kernel_time_init(la_timer_frequency(),0)!=KERNEL_TIME_STATUS_OK ||
         kernel_scheduler_init(&allocator,(uintptr_t)__boot_stack_bottom,(uintptr_t)__boot_stack_top)!=KERNEL_SCHEDULER_STATUS_OK) la_virt_fatal("scheduler init");
-    la_user_contract(&allocator);
+    la_boot_tasks(&allocator);
     la_virt_shutdown();
 }

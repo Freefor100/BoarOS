@@ -114,3 +114,25 @@ LA musl 的 `fstat` 首次真实根盘运行返回 ENOSYS，因为该架构通�
 查询。新增接口复用已有 inode/path/fd owner，只序列化 Linux 256 字节 BASIC_STATS。
 22条 RV/Linux差分同时保护组合错误优先级与跨页 EFAULT；猜测的“坏指针应先于
 非法 mask”被固定 Linux 的实际结果否定，保留验证所得行为，不凭源码印象改错序。
+
+### LP64S libc 工具与根盘 owner
+
+系统 GCC15.1.0 的 multilib 只有 LP64D。`-mabi=lp64s` 只改变当前编译对象，静态
+musl 的 crtbegin/libgcc TF helpers 仍报 ABI mismatch。采用同版本官方 archive
+（来源/哈希在清单）构建 gnusf 目标、`--with-fpu=none --with-simd=none` 与匹配
+runtime，不忽略 linker 错误或扩大 FPU 范围。GCC15 的宿主 C++ 选择需要固定
+`-std=gnu++14 -fno-char8_t`；libgcc pthread 声明使用固定 musl headers bootstrap。
+musl wrapper 必须通过 REALGCC 选中缓存 gnusf driver，不能相信其默认系统 GCC。
+
+原 BusyBox 使用固定比赛 commit 的完整配置；较新 Linux 移除 CBQ，沿用固定
+v6.6 UAPI 的 LA 导出。`headers` 先生成并清洗完整 UAPI，原样复制到安装目录，
+不依赖宿主 rsync、不拼接 glibc 头或修改 BusyBox。工具输入、配置与输出身份由
+`tests/loongarch/prepare_userland.py` 记录；相同静态 ELF 在两种内核 PCI ext4 上实际执行。
+
+根启动构造先在可信永久 cleanup 任务中准备 image/files/fs，再创建cache/journal
+worker，最后发布PID1。worker OOM先在真实QEMU复现fatal，再改成真实errno和完整
+回滚；这样worker的部分构造可stop/join，不从idle尝试睡眠清理。永久cleanup栈在
+baseline之前分配，可停止的任务/栈、用户页、cache和设备队列都必须回到该基线。
+真实PCI/NBD write EIO复现了无界卸载重试；现在保留失败mount/cache/device owner，
+清理三次后明确报告停止。故障路径不打印“owners released”，正常/OOM/userfault
+路径则要求页、堆和BAR claim完整回收，不能把两类证据混为一次成功。
