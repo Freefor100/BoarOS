@@ -352,3 +352,23 @@ sendfile测试读走4KiB不能保证释放LA的槽，故仅该页边界改用sys
 现有BoarOS AF_UNIX固定64KiB成本边界因而与LA的65537字节单datagram不同。
 这需要发送者缓存计费与消息上限的真实修复，用户已选择Linux模型；既有RV接收
 配额成本用例也要重验。不能允许两种消息边界都成功来遮住可观察差异。
+
+## 空目录EUCLEAN是输入特性差异（2026-10-07）
+
+扩大sendfile先暴露tmpfs卸载后rmdir失败；独立普通mkdir/rmdir也复现，排除了
+必须由tmpfs、网络或sendfile触发的解释。宿主同源lwext4的1KiB索引目录：
+metadata_csum开启通过，关闭立即在空目录覆盖返回EUCLEAN。LA根fixture关闭
+该特性，既有RV矩阵多用开启输入；这不是LoongArch指令或页大小特例。
+
+持久目录的inode大小为两块，INDEX+EXTENTS有效。root指向一个空leaf，leaf
+首项inode=0/name_len=0/rec_len=4096；这也像inner node的包围记录，原检查
+误按索引count/limit解析空leaf。修复按已验证root的indirect_levels及entry块号
+判定角色，保留leaf记录和root/node结构校验。源码依据为固定
+`references/linux` commit`f4cdf7ca9a1fdcca413157df19753f388a5a224e`的
+`fs/ext4/namei.c::{ext4_empty_dir,is_dx_internal_node}`，实际修改为固定lwext4
+`58bcf89a121b72d4fb66334f1693d3b30e4cb9c5`之上的本地空目录检查。
+
+新的宿主八种布局在ASan/UBSan下完成空目录覆盖、长名称增长/rename和e2fsck；
+独立ELF`d4a74d93e3ade80612549f23d32c9a777cbdcc08e4519470f543bac44e8603f0`
+在Linux/BoarOS两种RAM完成普通及挂载/卸载后rmdir和根回收。不会用干净重跑
+替代根因；checksum关闭的反例与重建入口保留在Git测试。

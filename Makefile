@@ -1840,3 +1840,7 @@ test-virtio-framework-host:
 test-virtio-block-host:
 	python3 -B tests/host/virtio_block_diagnostics.py
 	HOST_ALTERNATE_TRANSPORT=1 python3 -B tests/host/virtio_block_diagnostics.py
+
+.PHONY: test-lwext4-dir-empty-host
+test-lwext4-dir-empty-host:
+	python3 -B tests/lwext4-dir-empty-host.py --sanitize

@@ -719,9 +719,11 @@ int ext4_dir_check_empty(struct ext4_inode_ref *dir, bool *empty)
         r = ext4_trans_block_get(dir->fs->bdev, &block, home);
         if (r != EOK) return r;
         struct ext4_dir_en *first = (void *)block.data;
-        bool index_block = indexed && (i == 0 ||
-            (!ext4_dir_en_get_inode(first) && !first->name_len &&
-             ext4_dir_en_get_entry_len(first) == size));
+        bool index_block=false;
+        if(indexed) {
+            r=ext4_dir_dx_is_node(dir,i,&index_block);
+            if(r!=EOK) { ext4_block_set(dir->fs->bdev,&block);return r; }
+        }
         bool found = false;
         if (index_block) r = ext4_dir_dx_check(dir, &block);
         else {

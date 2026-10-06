@@ -75,3 +75,7 @@ GCC15.1.0 原官方 archive 固定于 `references/sources.tsv` 的 `gcc/gcc-15.1
 和原完整配置（GPLv2，原 `LICENSE`）。LA构建只改变目标编译/静态链接环境，未裁剪
 applet或改上游源码；UAPI来自固定 Linux v6.6 archive 的LA导出。工具和原程序身份
 由 `prepare-la-userland` 保存，验收范围见[LA模块](modules/loongarch-boot.md)。
+
+- lwext4空索引目录纠错：通过已验证HTree root的层级和块引用区分inner node
+  与leaf，避免无metadata checksum的空leaf被误解为坏node。保留结构/记录/
+  checksum失败状态，固定上游commit不变；验证`make test-lwext4-dir-empty-host`。
