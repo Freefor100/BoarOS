@@ -16,6 +16,8 @@ make test-loongarch-boot        # 512 MiB/1 GiB 启动与后续契约
 make test-loongarch             # 同时准备固定 Linux，对照同一个用户 ELF
 make test-stack-usage-la
 make test-signal-loongarch     # 同一静态 musl ELF 的整数信号/恢复/重启对照
+make test-pthread-loongarch    # 静态 TLS/线程、原 BusyBox ash 非交互 trap/wait
+make test-pthread-oom-loongarch # 两处 clone 构造 OOM、真实 pthread EAGAIN/重试
 ```
 
 `run-loongarch` 进入 console 探针后，依次在 poll/read ready 标记出现时输入 `g` 和 `r`（各回车），完成后关机。
@@ -145,3 +147,27 @@ UAPI 从固定 Linux v6.6 `ARCH=loongarch headers` 导出后原样安装，不�
 编译源码与可复用产物、工具/配置/ELF身份留在 `build/loongarch`，完整安装树包含helpers/specs/headers与链接目标；冷构建先生成子配置。运行目录、镜像、
 日志及早期失败构建用 `make prune-build` 清除。ELF 使用 SOFT-FLOAT ABI，EUEN关闭；
 没有用忽略 ABI mismatch 或成功存根绕过硬件限制。
+
+## 整数信号与静态线程
+
+2026-10-06 `test-signal-loongarch` 与 `test-pthread-loongarch` 在固定 Linux 和
+BoarOS 的512MiB/1GiB运行相同LP64S静态ELF。信号覆盖真实musl布局、mask、嵌套、
+SEGV/BUS/ILL/TRAP/FPE、用户映射修复与上下文返回、坏帧及pipe/nanosleep/sigsuspend。
+线程覆盖11组：纯计算timer进展、整数寄存器/SP/TP、TLS data/BSS与errno隔离、
+mutex/cond/barrier/超时、取消cleanup、阻塞fd pin、组长退出/非组长exec/exit_group、
+futex重启及非PI robust注册/查询/owner死亡/raw exit/COW。原BusyBox完整配置的ash
+另执行非交互trap、后台sleep和wait；不据此宣称LA UART控制终端或PTY作业控制。
+
+`tests/loongarch/pthread.c` 直接调用已有RV用户测试的适用函数，没有裁剪原RV入口；
+动态DSO、socket和RV的未支持PI marker门禁保留在原目录，不能把这一静态选择集
+称为原pthread全量测试。Linux对照发现并修正测试的join/PID摘除时序，以及WAKE
+后目标可能退出的假设；内核不按测试输入特判。
+
+clone的任务页、栈分配两处故障分别在两种RAM注入，真实pthread_create返回EAGAIN、
+未执行半成品worker，任务/栈页立即恢复，随后成功create/join。此四组是BoarOS注入
+证据，与同ELF Linux语义对照分别报告。每次正常、故障、OOM根启动收口要求
+heap live/pages为0，所有可回收物理页、根盘/cache/PCI owner回到预热基线。
+
+本阶段RV信号/syscall、完整架构、原静态/动态用户态、五种固定glibc、1366条ABI
+和栈门禁均通过。此次未改文件映射/COW或块核心，不把此前SQLite/存储恢复矩阵
+记为本轮重跑。FP/SIMD、动态musl/DSO TLS、LA完整终端/网络和比赛Harness仍缺。

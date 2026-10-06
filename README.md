@@ -65,8 +65,10 @@ VirtIO 块核心→ext4 根盘→LP64S 静态 musl 已通过两种 RAM 的新验
 fork/exec/wait、错误/创建 OOM 与资源基线；真实 PCI 写故障保留失败 I/O owner 并明确停止。
 `kernel-la` 有盘时启动可配置 PID 1，无盘时运行首阶段内存 ELF 契约，见
 [LA 模块](docs/modules/loongarch-boot.md)。整数信号 handler/sigreturn、同步故障恢复、
-mask/嵌套和等待重启已通过同 ELF 的双侧两种 RAM 验证。动态加载、完整 TLS/线程、
-FP/SIMD、实板和 SMP 仍须另行验收。
+mask/嵌套和等待重启已通过同 ELF 的双侧两种 RAM 验证；静态 musl pthread/TLS、
+errno 隔离、timer 寄存器保持、同步/取消、futex/非 PI robust、线程组 exec/退出及
+创建 OOM/回收也已验证。原 BusyBox ash 的非交互 trap/wait 有双侧证据。
+动态加载/DSO TLS、FP/SIMD、完整终端/网络、实板和 SMP 仍须另行验收，LA与RV尚不等价。
 
 ## 构建与验证
 
