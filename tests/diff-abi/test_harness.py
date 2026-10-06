@@ -49,6 +49,37 @@ class ProtocolTests(unittest.TestCase):
             self.assertNotEqual(metadata['boaros_sha256'], harness.digest(kernel))
             self.assertEqual(metadata['status'], 'failed')
 
+    def test_loongarch_all_four_native_streams_are_checked(self):
+        for corrupt_last in (False,True):
+            with self.subTest(corrupt_last=corrupt_last), tempfile.TemporaryDirectory() as directory:
+                base=Path(directory);kernel=base/'kernel';program=base/'program';linux=base/'vmlinux'
+                for path in (kernel,program,linux):path.write_bytes(b'model input')
+                (base/'.config').write_text('CONFIG_16KB_3LEVEL=y\n')
+                (base/'boaros-identity.json').write_text(json.dumps({'revision':'pin','image_sha256':harness.digest(linux)}))
+                manifest=base/'cases.txt';manifest.write_text('result\n')
+                calls=[]
+                def fixture(work,elf):
+                    image=work/'fixture.img';image.write_bytes(b'model fixture');return image
+                def logged(argv,path,timeout):
+                    calls.append(argv)
+                    good=GOOD
+                    if corrupt_last and len(calls)==4:good=good.replace('616263','616264')
+                    if len(calls)>2:
+                        good+='LA root owners released\nLA PID 1 exited reason=0x0000000000000001 status=0x000000000000002a\n'
+                    path.write_text(good)
+                args=SimpleNamespace(arch='loongarch',memory=['512M','1G'],kernel=kernel,program=program,
+                    linux_kernel=linux,case_manifest=manifest,output=base/'run',timeout=1)
+                with patch.object(harness,'source_info',return_value=('url','pin')), \
+                     patch.object(harness,'fixture',side_effect=fixture), \
+                     patch.object(harness,'run_logged',side_effect=logged), \
+                     patch.object(harness,'output',return_value='model version'):
+                    if corrupt_last:
+                        with self.assertRaisesRegex(RuntimeError,'ABI mismatch'):harness.run(args)
+                    else:harness.run(args)
+                self.assertEqual(len(calls),4)
+                self.assertEqual([row[row.index('-m')+1] for row in calls],['512M','1G','512M','1G'])
+                self.assertEqual(json.loads((base/'run/metadata.json').read_text())['status'],'failed' if corrupt_last else 'passed')
+
     def test_cache_reuse_validates_image_and_config(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)

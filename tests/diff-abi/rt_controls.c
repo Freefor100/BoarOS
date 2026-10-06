@@ -43,8 +43,8 @@ void abi_rt_controls_cases(void)
     abi_record("rtctl.pread-offset",SC4(67,fd,buf,sizeof(buf),1),-1,-1,0,0,0);
     abi_record("rtctl.pwrite-offset",SC4(68,fd,"-1",2,1),-1,-1,0,0,0);
     abi_require(SC3(62,fd,0,0)==0);
-    long map=SC6(222,0,8192,3,0x22,-1,0);
-    abi_require(map>=0 && SC3(226,map+4096,4096,0)==0);
+    long map=SC6(222,0,(2 * ABI_PAGE_SIZE),3,0x22,-1,0);
+    abi_require(map>=0 && SC3(226,map+ABI_PAGE_SIZE,ABI_PAGE_SIZE,0)==0);
     *(char *)(map+4095)='1';
     abi_record("rtctl.write-fault",SC3(64,fd,map+4095,2),-1,abi_offset(fd),0,0,0);
     abi_record("rtctl.read-fault",SC3(63,fd,map+4095,2),-1,abi_offset(fd),0,0,0);
@@ -53,12 +53,12 @@ void abi_rt_controls_cases(void)
     abi_record("rtctl.writev",SC3(66,fd,iov,2),-1,abi_offset(fd),0,0,0);
     abi_require(SC3(62,fd,0,0)==0);
     iov[0].base="0";iov[0].length=1;
-    iov[1].base=(const void *)(map+4096);iov[1].length=1;
+    iov[1].base=(const void *)(map+ABI_PAGE_SIZE);iov[1].length=1;
     abi_record("rtctl.writev-fault",SC3(66,fd,iov,2),-1,abi_offset(fd),0,0,0);
     r=SC3(63,fd,buf,sizeof(buf));
     abi_record("rtctl.writev-fault-state",r,-1,abi_offset(fd),0,buf,r>0?(usize)r:0);
     abi_record("rtctl.nonzero-write-fault",SC3(64,fd,map+4095,2),-1,abi_offset(fd),0,0,0);
-    abi_record("rtctl.eof-fault-buffer",SC3(63,fd,map+4096,1),-1,abi_offset(fd),0,0,0);
+    abi_record("rtctl.eof-fault-buffer",SC3(63,fd,map+ABI_PAGE_SIZE,1),-1,abi_offset(fd),0,0,0);
     long other=abi_open(runtime_path,1);abi_require(other>=0);
     abi_record("rtctl.read-wronly",SC3(63,other,buf,sizeof(buf)),-1,-1,0,0,0);
     abi_require(SC3(64,other,"900000",6)==6 && SC1(57,other)==0);
@@ -73,5 +73,5 @@ void abi_rt_controls_cases(void)
     abi_record("rtctl.seek-data",SC3(62,fd,0,3),-1,abi_offset(fd),0,0,0);
     abi_record("rtctl.seek-hole",SC3(62,fd,0,4),-1,abi_offset(fd),0,0,0);
     abi_record("rtctl.seek-hole-negative",SC3(62,fd,-1,4),-1,abi_offset(fd),0,0,0);
-    abi_require(SC1(57,fd)==0 && SC2(215,map,8192)==0 && SC2(39,"/rt-proc",0)==0);
+    abi_require(SC1(57,fd)==0 && SC2(215,map,(2 * ABI_PAGE_SIZE))==0 && SC2(39,"/rt-proc",0)==0);
 }

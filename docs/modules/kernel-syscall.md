@@ -96,3 +96,21 @@ LA 的 rt_sigaction(134)/rt_sigreturn(139) 已接入共用信号策略；trap从
 解码并由LA后端恢复ERA/GPR和mask。完整整数frame、privileged状态边界和未支持
 扩展见[信号模块](kernel-signal.md)。真实静态musl pthread取消使用这一返回路径；
 未知syscall仍为ENOSYS，不以成功存根表示缺少的FP/SIMD、altstack或动态环境。
+
+## 双架构 ABI 差分入口
+
+`make test-diff-abi-riscv` 与 `make test-diff-abi-loongarch` 共用完整案例、严格记录
+协议、错误分类及时间戳关系校验。LA 使用独立 raw ELF/启动与 clone 汇编：Linux LA
+clone 的 child_tid/TLS 寄存器次序由适配层处理，信号 PC 与坏指令按 LA 编码。
+`ABI_PAGE_SIZE` 只决定目标页边界、映射/保护、管道槽和 tmpfs 页配额；文件块、扇区、
+4096 字节用户前缀、8192 字节消息和具体字符串解析用例保留原语义。
+
+当前共同 **1366 条**在 RV 的 Linux/BoarOS 和 LA 的 Linux/BoarOS、512 MiB/1 GiB
+均完整匹配。LA 每个程序只构建一次，四份完整 END/退出记录逐项比较；不是只比较
+同一 RAM，也不允许缺记录。runner 冻结程序与两内核，记录模拟器内容/权限/链接目标
+和各次启动参数，BoarOS 还需实际退出42与完整 root owner 释放。
+
+proc 测试在 clear_child_tid 后等待实际 nr_threads=1；线程组长的 held status OFD
+通过 lseek/re-read 等待真实 zombie 发布。固定 Linux 的 clear_child_tid 先于
+exit_state 和最终 nr_threads 更新，不能把一个调度瞬间的 R/两线程当作稳定退出状态，
+也不能在解析器中把 R 改成 Z。等待有界、结果仍来自真实用户态读取。

@@ -11,9 +11,9 @@ static void readv_file_edges(void)
         "readv.file-prefix-64", "readv.file-prefix-65"};
     unsigned char result[66], last = 0xa5;
     long fd = abi_open("/data", 0);
-    long map = CALL(222, 0, 8192, 3, 0x22, -1, 0);
+    long map = CALL(222, 0, (2 * ABI_PAGE_SIZE), 3, 0x22, -1, 0);
     abi_require(fd >= 0 && map >= 0);
-    abi_require(SC3(226, map + 4096, 4096, 0) == 0);
+    abi_require(SC3(226, map + ABI_PAGE_SIZE, ABI_PAGE_SIZE, 0) == 0);
 
     long ret = SC3(65, fd, (void *)-1, 0);
     abi_record("readv.empty-invalid-vector", ret, abi_size(fd),
@@ -44,7 +44,7 @@ static void readv_file_edges(void)
     for (int index = 0; index < 6; index++) {
         int prefix = prefixes[index];
         struct abi_iovec vector[2] = {
-            {(void *)(map + 4096 - prefix), (usize)prefix + 1},
+            {(void *)(map + ABI_PAGE_SIZE - prefix), (usize)prefix + 1},
             {&last, 1}
         };
         abi_require(SC3(62, fd, 0, 0) == 0);
@@ -58,7 +58,7 @@ static void readv_file_edges(void)
         abi_record(names[index], ret, abi_size(fd), abi_offset(fd), 0,
                    result, (usize)prefix + 1);
     }
-    abi_require(SC2(215, map, 8192) == 0);
+    abi_require(SC2(215, map, (2 * ABI_PAGE_SIZE)) == 0);
     close_fd(fd);
 
     fd = abi_open("/data", 1);
@@ -92,14 +92,14 @@ static void readv_pipe_edges(void)
         "readv.pipe-retry-64", "readv.pipe-retry-65"};
     unsigned char payload[128], evidence[66], retry[128], last = 0xa5;
     int pipefd[2];
-    long map = CALL(222, 0, 8192, 3, 0x22, -1, 0);
+    long map = CALL(222, 0, (2 * ABI_PAGE_SIZE), 3, 0x22, -1, 0);
     abi_require(map >= 0);
-    abi_require(SC3(226, map + 4096, 4096, 0) == 0);
+    abi_require(SC3(226, map + ABI_PAGE_SIZE, ABI_PAGE_SIZE, 0) == 0);
     for (int j = 0; j < 128; j++) payload[j] = 'A' + j % 26;
     for (int index = 0; index < 6; index++) {
         int prefix = prefixes[index];
         struct abi_iovec vector[2] = {
-            {(void *)(map + 4096 - prefix), (usize)prefix + 1},
+            {(void *)(map + ABI_PAGE_SIZE - prefix), (usize)prefix + 1},
             {&last, 1}
         };
         abi_require(SC2(59, pipefd, 0) == 0);
@@ -118,19 +118,19 @@ static void readv_pipe_edges(void)
                    ret > 0 ? (usize)ret : 0);
         close_fd(pipefd[0]); close_fd(pipefd[1]);
     }
-    abi_require(SC2(215, map, 8192) == 0);
+    abi_require(SC2(215, map, (2 * ABI_PAGE_SIZE)) == 0);
 }
 
 static void pipe_write_fragment_fault(void)
 {
     int pipefd[2];
     unsigned char first[32], observed[64];
-    long map = CALL(222, 0, 8192, 3, 0x22, -1, 0);
+    long map = CALL(222, 0, (2 * ABI_PAGE_SIZE), 3, 0x22, -1, 0);
     abi_require(map >= 0);
-    abi_require(SC3(226, map + 4096, 4096, 0) == 0);
+    abi_require(SC3(226, map + ABI_PAGE_SIZE, ABI_PAGE_SIZE, 0) == 0);
     for (int index = 0; index < 32; index++) first[index] = 'a' + index % 26;
     struct abi_iovec vector[2] = {{first, sizeof first},
-                                   {(void *)(map + 4096), 32}};
+                                   {(void *)(map + ABI_PAGE_SIZE), 32}};
     abi_require(SC2(59, pipefd, 0) == 0);
     long ret = SC3(66, pipefd[1], vector, 2);
     abi_record("readv.pipe-write-fault", ret, -1, -1, 0, 0, 0);
@@ -139,12 +139,12 @@ static void pipe_write_fragment_fault(void)
     abi_record("readv.pipe-after-write-fault", ret, -1, -1, 0,
                observed, ret > 0 ? (usize)ret : 0);
     close_fd(pipefd[0]);
-    abi_require(SC2(215, map, 8192) == 0);
+    abi_require(SC2(215, map, (2 * ABI_PAGE_SIZE)) == 0);
 }
 
 static void readv_more_edges(void)
 {
-    static unsigned char page[4096], ring[65536];
+    static unsigned char page[ABI_PAGE_SIZE], ring[(16 * ABI_PAGE_SIZE)];
     unsigned char first[3] = {0}, second[5] = {0}, sample[42];
     struct abi_iovec vector[2] = {{first, 3}, {second, 5}};
     long fd = abi_open("/data", 0);
@@ -181,18 +181,18 @@ static void readv_more_edges(void)
     abi_record("readv.pipe-eof", ret, -1, -1, 0, first, 1);
     close_fd(pipefd[0]);
 
-    long map = CALL(222, 0, 8192, 3, 0x22, -1, 0);
+    long map = CALL(222, 0, (2 * ABI_PAGE_SIZE), 3, 0x22, -1, 0);
     abi_require(map >= 0);
-    abi_require(SC3(226, map + 4096, 4096, 0) == 0);
+    abi_require(SC3(226, map + ABI_PAGE_SIZE, ABI_PAGE_SIZE, 0) == 0);
     abi_require(SC2(59, pipefd, 0) == 0);
-    for (int j = 0; j < 4096; j++) page[j] = 'x';
-    abi_require(SC3(64, pipefd[1], page, 4096) == 4096);
+    for (int j = 0; j < ABI_PAGE_SIZE; j++) page[j] = 'x';
+    abi_require(SC3(64, pipefd[1], page, ABI_PAGE_SIZE) == ABI_PAGE_SIZE);
     abi_require(SC3(64, pipefd[1], "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy", 64) == 64);
-    vector[0] = (struct abi_iovec){page, 4096};
-    vector[1] = (struct abi_iovec){(void *)(map + 4096 - 32), 64};
+    vector[0] = (struct abi_iovec){page, ABI_PAGE_SIZE};
+    vector[1] = (struct abi_iovec){(void *)(map + ABI_PAGE_SIZE - 32), 64};
     ret = SC3(65, pipefd[0], vector, 2);
     for (int j = 0; j < 8; j++) sample[j] = page[j];
-    sample[8] = page[4095];
+    sample[8] = page[(ABI_PAGE_SIZE - 1)];
     for (int j = 0; j < 32; j++)
         sample[9 + j] = ((unsigned char *)vector[1].base)[j];
     abi_record("readv.pipe-fragment-fault", ret, -1, -1, 0, sample, 41);
@@ -201,22 +201,22 @@ static void readv_more_edges(void)
     abi_record("readv.pipe-fragment-retry", ret, -1, -1, 0,
                ring, ret > 0 ? (usize)ret : 0);
     close_fd(pipefd[0]);
-    abi_require(SC2(215, map, 8192) == 0);
+    abi_require(SC2(215, map, (2 * ABI_PAGE_SIZE)) == 0);
 
     abi_require(SC2(59, pipefd, 0) == 0);
     for (int slot = 0; slot < 16; slot++) {
-        for (int j = 0; j < 4096; j++) page[j] = 'A' + slot;
-        abi_require(SC3(64, pipefd[1], page, 4096) == 4096);
+        for (int j = 0; j < ABI_PAGE_SIZE; j++) page[j] = 'A' + slot;
+        abi_require(SC3(64, pipefd[1], page, ABI_PAGE_SIZE) == ABI_PAGE_SIZE);
     }
-    abi_require(SC3(63, pipefd[0], ring, 15 * 4096) == 15 * 4096);
+    abi_require(SC3(63, pipefd[0], ring, 15 * ABI_PAGE_SIZE) == 15 * ABI_PAGE_SIZE);
     for (int slot = 0; slot < 15; slot++) {
-        for (int j = 0; j < 4096; j++) page[j] = 'a' + slot;
-        abi_require(SC3(64, pipefd[1], page, 4096) == 4096);
+        for (int j = 0; j < ABI_PAGE_SIZE; j++) page[j] = 'a' + slot;
+        abi_require(SC3(64, pipefd[1], page, ABI_PAGE_SIZE) == ABI_PAGE_SIZE);
     }
-    struct abi_iovec wrap[2] = {{ring, 4096}, {ring + 4096, 15 * 4096}};
+    struct abi_iovec wrap[2] = {{ring, ABI_PAGE_SIZE}, {ring + ABI_PAGE_SIZE, 15 * ABI_PAGE_SIZE}};
     ret = SC3(65, pipefd[0], wrap, 2);
-    sample[0] = ring[0]; sample[1] = ring[4095];
-    sample[2] = ring[4096]; sample[3] = ring[65535];
+    sample[0] = ring[0]; sample[1] = ring[(ABI_PAGE_SIZE - 1)];
+    sample[2] = ring[ABI_PAGE_SIZE]; sample[3] = ring[(16 * ABI_PAGE_SIZE - 1)];
     abi_record("readv.pipe-wrap", ret, -1, -1, 0, sample, 4);
     close_fd(pipefd[0]); close_fd(pipefd[1]);
 }
@@ -226,14 +226,14 @@ static void pipe_merge_boundary(void)
     static unsigned char data[5000], retry[6000];
     unsigned char sample[3];
     int pipefd[2];
-    long map = CALL(222, 0, 8192, 3, 0x22, -1, 0);
+    long map = CALL(222, 0, (2 * ABI_PAGE_SIZE), 3, 0x22, -1, 0);
     abi_require(map >= 0);
-    abi_require(SC3(226, map + 4096, 4096, 0) == 0);
+    abi_require(SC3(226, map + ABI_PAGE_SIZE, ABI_PAGE_SIZE, 0) == 0);
     abi_require(SC2(59, pipefd, 0) == 0);
     for (int j = 0; j < 5000; j++) data[j] = 'b';
     abi_require(SC3(64, pipefd[1], data, 500) == 500);
     abi_require(SC3(64, pipefd[1], data, 5000) == 5000);
-    struct abi_iovec vector = {(void *)(map + 4096 - 2000), 5500};
+    struct abi_iovec vector = {(void *)(map + ABI_PAGE_SIZE - 2000), 5500};
     long ret = SC3(65, pipefd[0], &vector, 1);
     sample[0] = ((unsigned char *)vector.base)[0];
     sample[1] = ((unsigned char *)vector.base)[1399];
@@ -245,19 +245,19 @@ static void pipe_merge_boundary(void)
     sample[1] = ret > 0 ? retry[ret - 1] : 0;
     abi_record("readv.pipe-merge-retry", ret, -1, -1, 0, sample, 2);
     close_fd(pipefd[0]);
-    abi_require(SC2(215, map, 8192) == 0);
+    abi_require(SC2(215, map, (2 * ABI_PAGE_SIZE)) == 0);
 }
 
 static void pipe_partial_tail_poll(void)
 {
-    static unsigned char page[4096];
+    static unsigned char page[ABI_PAGE_SIZE];
     struct { int fd; short events, revents; } pollfd;
     struct { long sec, nsec; } zero = {0, 0};
     int pipefd[2];
     abi_require(SC2(59, pipefd, 04000) == 0);
-    for (int j = 0; j < 4096; j++) page[j] = 'p';
+    for (int j = 0; j < ABI_PAGE_SIZE; j++) page[j] = 'p';
     for (int slot = 0; slot < 15; slot++)
-        abi_require(SC3(64, pipefd[1], page, 4096) == 4096);
+        abi_require(SC3(64, pipefd[1], page, ABI_PAGE_SIZE) == ABI_PAGE_SIZE);
     abi_require(SC3(64, pipefd[1], page, 1) == 1);
     pollfd = (typeof(pollfd)){pipefd[1], 4, 0};
     long ret = CALL(73, &pollfd, 1, &zero, 0, 0, 0);
@@ -283,12 +283,12 @@ void abi_readv_cases(void)
     ret = SC3(65, fd, vector, 1025);
     abi_record("readv.count", ret, abi_size(fd), abi_offset(fd), 0, 0, 0);
 
-    long map = CALL(222, 0, 8192, 3, 0x22, -1, 0);
+    long map = CALL(222, 0, (2 * ABI_PAGE_SIZE), 3, 0x22, -1, 0);
     abi_require(map >= 0);
-    abi_require(SC3(226, map + 4096, 4096, 0) == 0);
+    abi_require(SC3(226, map + ABI_PAGE_SIZE, ABI_PAGE_SIZE, 0) == 0);
     abi_require(SC3(62, fd, 0, 0) == 0);
     unsigned char untouched = 0xa5;
-    struct abi_iovec fault[2] = {{(void *)(map + 4096 - 32), 64},
+    struct abi_iovec fault[2] = {{(void *)(map + ABI_PAGE_SIZE - 32), 64},
                                   {&untouched, 1}};
     ret = SC3(65, fd, fault, 2);
     unsigned char evidence[33];
@@ -296,7 +296,7 @@ void abi_readv_cases(void)
     evidence[32] = untouched;
     abi_record("readv.file-fault", ret, abi_size(fd), abi_offset(fd), 0,
                evidence, sizeof evidence);
-    abi_require(SC2(215, map, 8192) == 0);
+    abi_require(SC2(215, map, (2 * ABI_PAGE_SIZE)) == 0);
     close_fd(fd);
 
     int pipefd[2] = {-1, -1};
@@ -314,11 +314,11 @@ void abi_readv_cases(void)
     unsigned char payload[64], retry[64];
     for (int i = 0; i < 64; i++) payload[i] = 'A' + (i % 26);
     abi_require(SC3(64, pipefd[1], payload, sizeof payload) == 64);
-    map = CALL(222, 0, 8192, 3, 0x22, -1, 0);
+    map = CALL(222, 0, (2 * ABI_PAGE_SIZE), 3, 0x22, -1, 0);
     abi_require(map >= 0);
-    abi_require(SC3(226, map + 4096, 4096, 0) == 0);
+    abi_require(SC3(226, map + ABI_PAGE_SIZE, ABI_PAGE_SIZE, 0) == 0);
     untouched = 0xa5;
-    fault[0] = (struct abi_iovec){(void *)(map + 4096 - 32), 64};
+    fault[0] = (struct abi_iovec){(void *)(map + ABI_PAGE_SIZE - 32), 64};
     fault[1] = (struct abi_iovec){&untouched, 1};
     ret = SC3(65, pipefd[0], fault, 2);
     for (int i = 0; i < 32; i++) evidence[i] = ((unsigned char *)fault[0].base)[i];
@@ -328,7 +328,7 @@ void abi_readv_cases(void)
     ret = SC3(63, pipefd[0], retry, sizeof retry);
     abi_record("readv.pipe-retry", ret, -1, -1, 0,
                retry, ret > 0 ? (usize)ret : 0);
-    abi_require(SC2(215, map, 8192) == 0);
+    abi_require(SC2(215, map, (2 * ABI_PAGE_SIZE)) == 0);
     close_fd(pipefd[0]); close_fd(pipefd[1]);
 
     readv_file_edges();

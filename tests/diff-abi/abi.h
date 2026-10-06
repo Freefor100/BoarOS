@@ -1,5 +1,16 @@
 #ifndef DIFF_ABI_H
 #define DIFF_ABI_H
+#if defined(__loongarch__)
+#define ABI_PAGE_SIZE 16384
+#define ABI_TWO_PAGES_STRING "32768"
+#define ABI_FOUR_PAGES_STRING "65536"
+#else
+#define ABI_PAGE_SIZE 4096
+#define ABI_TWO_PAGES_STRING "8192"
+#define ABI_FOUR_PAGES_STRING "16384"
+#endif
+#define ABI_STRING_(x) #x
+#define ABI_STRING(x) ABI_STRING_(x)
 
 typedef unsigned long usize;
 struct abi_iovec { void *base; usize length; };

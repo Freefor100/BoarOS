@@ -430,3 +430,17 @@ BoarOS 同一环境 ELF 的真实 UTC、日志内容/OFD、别名与 fork/exec �
 hwclock/dmesg/df 在两种 RAM 均通过。两项测试都 clear 日志，组合到同一启动会
 破坏下一项的启动日志前提，必须用独立启动，而非伪造日志或改动原程序。
 BoarOS RTC 仍按共用只读设备口径验收；Linux 告警成功不能记作 BoarOS 告警支持。
+
+## 完整 ABI 的页几何与退出发布（2026-10-07）
+
+共用完整 raw ELF 在 Linux/BoarOS 的 LA 512 MiB/1 GiB 各产生1366条完整记录，
+退出42与根资源门禁通过；同一改动的 RV 1366 条也匹配。LA 16 KiB 页改变映射/
+保护与跨页前缀，但不是把所有4096替换成16384：UDP仍发送8192字节、fault前缀
+仍为4096字节，TCP前缀仍3072，文件块offset4094、truncate4096、解析用的4097
+等保留业务含义；只有用户地址与保护页位置调整。匿名管道容量修复另有独立反例。
+
+固定 Linux `kernel/fork.c`、`kernel/exit.c` 在 clear_child_tid 之后才发布 zombie
+和递减 nr_threads。实际完整运行发现两种RAM可以读到不同的瞬时R/Z，并非结构布局
+不同。探针用 bounded yield、真实 lseek/re-read 等待约定的退出阶段，保护 held OFD
+与新打开路径均正确观察同一已退出组长；未修改内核来迎合调度时机，也未放宽记录
+解析或删除案例。host 协议测试另外验证第四个 RAM 结果的差异会失败。
