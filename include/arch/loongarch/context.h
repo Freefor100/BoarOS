@@ -1,0 +1,23 @@
+#ifndef BOAROS_ARCH_LOONGARCH_CONTEXT_H
+#define BOAROS_ARCH_LOONGARCH_CONTEXT_H
+#ifndef __ASSEMBLER__
+#include <stdint.h>
+static inline uintptr_t arch_interrupt_save(void)
+{
+    uintptr_t old, mask = 4;
+    __asm__ volatile("csrxchg %0, %1, 0" : "=r"(old) : "r"(mask), "0"((uintptr_t)0) : "memory");
+    return old;
+}
+static inline void arch_interrupt_restore(uintptr_t old)
+{
+    uintptr_t mask = 4;
+    __asm__ volatile("csrxchg %0, %1, 0" : "+r"(old) : "r"(mask) : "memory");
+}
+static inline int arch_interrupt_is_enabled(void)
+{ uintptr_t v; __asm__ volatile("csrrd %0, 0" : "=r"(v)); return (v & 4) != 0; }
+static inline void *arch_current_thread_get(void)
+{ void *v; __asm__ volatile("move %0, $tp" : "=r"(v)); return v; }
+static inline void arch_current_thread_set(void *v)
+{ __asm__ volatile("move $tp, %0" :: "r"(v) : "memory"); }
+#endif
+#endif

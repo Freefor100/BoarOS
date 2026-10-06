@@ -480,6 +480,10 @@ backlog 和期限回收已交付。真实用户态保护用户复制、共享 OF
 - [ ] 列出通用 MM/调度对 RV 头、satp、SFENCE.VMA、trap frame、页大小和寄存器布局的直接依赖，按实际消费者提取架构操作；不复制 `arch/riscv/mm.c` 中通用 VMA/文件页策略。
 - [ ] 保留架构 MMU/context/trap 与平台 DTB/MMIO/DMA 的区分，新增接口由第二实现验证，不预建空泛 HAL。
 
+L0–L1已开始：通用MM/用户访问策略和IRQ绑定已分离；QEMU LA64的高地址
+启动、全部RAM bank、16KiB物理分配及回收已通过512MiB/1GiB。三级用户页表、
+timer抢占和真实ELF仍待完成，当前不是L1完整交付。见[LA启动](modules/loongarch-boot.md)。
+
 ### L1 最小启动与用户态
 
 - [ ] 串口→trap→timer→物理页→TLB/页表→高地址映射→一个真实 U-mode exit，每步有独立启动/故障/回收证据。

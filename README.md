@@ -57,6 +57,10 @@ PID 1 退出后先结束并回收剩余用户进程，再停止内核服务和�
 顺序预读与连续写回提供有界实验候选，生产默认仍为预读关闭、写回一页。
 机制门禁和吞吐测量分别记录；TCP 27 组、存储 20 组已完成匹配筛选和组合扩展，共 1,218 次发布启动与 184 次诊断。用户依据结果批准网络默认改为 8 MSS/池 4 倍/协议堆 2 倍；存储仍为 RA0/WB1。历史结果中的默认标签指调整前的 8/1/1，见[结果、每连接完成时间和输入身份](docs/learning/data-path-budget-experiments.md#正式匹配结果2026-10-06)。
 
+LoongArch 首阶段已开始：QEMU virt 的 LA64 高地址启动、16 KiB 物理页和
+不连续 RAM 回收已验证；用户页表、timer 与真实用户 ELF 尚未交付，见
+[LA 启动](docs/modules/loongarch-boot.md)。
+
 ## 构建与验证
 
 需要 RISC-V bare-metal GCC/binutils、GNU Make 和 QEMU；支持 `riscv64-unknown-elf-` 与 `riscv64-elf-` 前缀。真实用户态和 Linux 差分的额外工具见[工具链](docs/toolchain.md)及[差分模块](docs/modules/differential-abi.md)。

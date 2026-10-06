@@ -6,6 +6,7 @@
 #define DTB_RNG_SEED_SIZE 32U
 
 #define DTB_MAX_RESERVED_RANGES 16U
+#define DTB_MAX_MEMORY_RANGES 16U
 #define DTB_MAX_VIRTIO_MMIO_RANGES 16U
 
 enum dtb_status {
@@ -22,6 +23,8 @@ struct dtb_memory_range {
 
 struct dtb_boot_info {
     struct dtb_memory_range memory;
+    uint32_t memory_count;
+    struct dtb_memory_range memories[DTB_MAX_MEMORY_RANGES];
     uint32_t dtb_size;
     uint32_t timebase_frequency;
     uint32_t reserved_count;
