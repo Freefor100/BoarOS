@@ -322,3 +322,11 @@ PCI reset失败则只剩BAR owner。若包装层仅凭core状态判断，会拒�
 布局计算还需先做有界减法再构造指针：UINT32_MAX附近的available偏移曾绕回
 大小检查，host反例实际崩溃。共享层现验证两个ring全范围及DMA物理末端溢出，
 失败不写ring；同反例返回INVALID，三传输实际块门禁继续通过。
+
+RNG迁移保持短响应累计、5秒期限、60秒退避和ready单向语义，MMIO/PCI只提供
+transport。LA缺设备/延迟/在途退出不能拿默认Linux启动种子作对照；固定Linux
+先扫描FDT再解析early params。独立platform缓存开启内建RNG/net，不动已验证
+core缓存。vCPU未执行时NOP掉固件seed并核对内存写回，两侧相同输入的原RNG ELF
+16例通过，生产种子策略不变，详见[随机资料](random-source.md)。
+新增standalone fixture依赖文件还暴露GNU make的隐式`.d.o`链接尝试，编号stem
+会变成`0.d`并产生错误日志；依赖文件现显式声明由编译器生成，禁用该隐式重造。

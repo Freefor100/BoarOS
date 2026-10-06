@@ -163,6 +163,7 @@ C_SOURCES := \
 	drivers/virtio/split_queue.c \
 	drivers/virtio/mmio.c \
 	arch/riscv/virtio_mmio_rng.c \
+	drivers/virtio/rng.c \
 	arch/riscv/virtio_mmio_net.c \
 	arch/riscv/plic.c \
 	fs/lwext4_port.c \
@@ -280,6 +281,7 @@ TEST_RUNTIME_C_SOURCES := \
 	drivers/virtio/split_queue.c \
 	drivers/virtio/mmio.c \
 	arch/riscv/virtio_mmio_rng.c \
+	drivers/virtio/rng.c \
 	arch/riscv/virtio_mmio_net.c \
 	arch/riscv/plic.c \
 	fs/files/table.c \
@@ -1623,9 +1625,13 @@ test-rng-riscv: $(KERNEL_RV) $(RNG_USER_RV)
 
 test-virtio-rng-host:
 	@mkdir -p build/host
-	cc -std=c11 -Wall -Wextra -Werror -Itests/host/random -Iinclude \
-		tests/host/virtio_rng_test.c arch/riscv/virtio_mmio_rng.c -o build/host/virtio-rng
+	cc -std=c11 -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=12 -Itests/host/random -Iinclude \
+		tests/host/virtio_rng_test.c arch/riscv/virtio_mmio_rng.c drivers/virtio/rng.c drivers/virtio/mmio.c drivers/virtio/transport.c drivers/virtio/split_queue.c -o build/host/virtio-rng
 	build/host/virtio-rng
+	build/host/virtio-rng --generic
+	cc -std=c11 -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=14 -Itests/host/random -Iinclude \
+		tests/host/virtio_rng_test.c arch/riscv/virtio_mmio_rng.c drivers/virtio/rng.c drivers/virtio/mmio.c drivers/virtio/transport.c drivers/virtio/split_queue.c -o build/host/virtio-rng-16k
+	build/host/virtio-rng-16k --generic
 
 .PHONY: test-sched-policy-host
 test-sched-policy-host:

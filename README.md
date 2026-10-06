@@ -73,10 +73,11 @@ errno 隔离、timer 寄存器保持、同步/取消、futex/非 PI robust、线
 LA内核栈已接入PGDH共享窗口及真实16KiB guard，含NX、撤映射、OOM回滚与可信异常栈验收。
 LSX/LASX状态、信号、clone/exec和关闭扩展的HWCAP已双侧验收。固定原版glibc2.42的五形态、
 初始/dlopen TLS、pthread取消和信号已在双侧两种RAM验收；RV仍固定2.44，版本差异保留。
-DTB随机种子仅支持早期材料和AT_RANDOM，不计可信熵。LBT、完整终端/网络、可信PCI RNG及
+DTB随机种子仅支持早期材料和AT_RANDOM，不计可信熵。真实PCI RNG的正常、缺失、
+延迟、在途停止已双侧两种RAM验收，BoarOS构造失败与回收也已在两种RAM验收。LBT、完整终端/网络及
 更广原程序、实板和SMP仍须另行验收，LA与RV尚不等价。
 共用VirtIO transport/split queue已接入RV MMIO与LA PCI block，保留batch/flush/
-超时及DMA业务owner；RNG/net迁移仍在本轮计划内，见[框架契约](docs/modules/virtio-framework.md)。
+超时及DMA业务owner；RNG已迁入，net仍在本轮计划内，见[框架契约](docs/modules/virtio-framework.md)。
 LA EXEC 页的数据读权限已按固定 Linux 的冷/驻留状态核对；页表有效权限与请求
 VMA 权限分别保留，真实读取、uaccess、fork和撤权均有双侧两种 RAM 验证。
 

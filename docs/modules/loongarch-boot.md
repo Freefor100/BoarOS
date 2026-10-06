@@ -14,6 +14,8 @@ make test-root-io-loongarch     # 真正的块写错误与持久 owner
 make test-la-userland-host      # 缓存输入/完整安装树的9个拒绝反例
 make test-loongarch-boot        # 512 MiB/1 GiB 启动与后续契约
 make test-boot-random-loongarch # DTB材料可用、可信熵仍为零，两种RAM
+make test-rng-loongarch        # 同ELF双侧、两种RAM、四种真实PCI RNG模式
+make test-rng-failures-loongarch # DMA/任务/栈OOM、IRQ登记失败与回收
 make test-loongarch             # 同时准备固定 Linux，对照同一个用户 ELF
 make test-stack-usage-la
 make test-signal-loongarch     # 同一静态 musl ELF 的整数信号/恢复/重启对照
@@ -38,6 +40,9 @@ defconfig 建立 16 KiB/三级页表、initramfs 对照。缓存分别位于 `bu
 完整启动布局验证成功后，将DTB的rng-seed交给共用随机核心作为不计熵材料，随后
 擦除临时副本；原DTB仍属于固件。缺种子不伪造材料或ready；AT_RANDOM只在有材料
 时构造。固定QEMU的32字节种子使GNU启动可用，可信初始化仍等待真实RNG设备输入。
+根现从PCI身份发现device4，以共用RNG核心及joinable worker提供真实可信材料。
+根退出在消费设备/BAR前stop/join并确认DMA停止，错误保留实际owner；未就绪实验
+的固件输入与正常DTB策略分开，见[随机设备模块](riscv-virtio-rng.md)。
 
 架构 MMU 设置 PWCL/PWCH、STLBPS 和独立 TLB refill 入口；根目录/中间目录缺失时
 refill 写入无效 paired entry，交由普通用户缺页路径处理，不能读取物理地址零。
