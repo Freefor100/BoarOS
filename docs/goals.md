@@ -500,9 +500,9 @@ FP/SIMD、动态libc/DSO TLS及完整终端/网络/用户环境仍未完成；�
 
 - [ ] ELF 段对齐、BSS 尾页、auxv、用户栈、stat/signal 结构及 clone 寄存器逐项核对；不能只换汇编入口却保留 RV ABI 编码。
 - [ ] 同一用户源码分别编译 RV/LA ELF，每架构内部用同一 ELF 对照 Linux 与 BoarOS；共享测试语义，隔离寄存器/页表差异，不拿 RV ELF 验证 LA。
-- [ ] LA `PROT_EXEC` 的普通数据读取有效权限仍需单独对照：固定 Linux 使用可读
-  PTE，当前 LA 后端保留独立 NR。本次只修复执行资格的 break 解码，没有修改
-  通用 VMA/数据 uaccess 策略；资料与边界见[LA学习记录](learning/loongarch-bringup.md)。
+- [x] LA `PROT_EXEC` 的数据读取已按冷/驻留状态独立核对：LA PTE 使用固定 Linux
+  的非 NONE 可读权限，请求 VMA 保持原值；双侧验证冷页 fault、驻留读取、取指
+  物化、fork、uaccess 与改权。资料见[LA学习记录](learning/loongarch-bringup.md)。
 
 ### L3 扩大真实用户空间
 

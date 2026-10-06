@@ -196,7 +196,21 @@ break6后mprotect(PROT_EXEC)，Linux交付SIGFPE而Boar按普通READ复制失败
 对齐、不跨16KiB页，trap中不切换；页/映射owner损坏仍fatal，不扩大普通READ复制。
 
 固定Linux `arch/loongarch/mm/cache.c::protection_map` 的PROT_EXEC使用可读PTE；
-BoarOS当前仍提供独立NR权限，此处没有改通用VMA与数据访问策略，不据这条
+当时BoarOS仍提供独立NR权限，那次没有改通用VMA与数据访问策略，不据这条
 break对照宣称两者所有PROT_EXEC数据访问行为等价。更广权限策略差分需另按真实
 程序与既有MM契约核对。内核交付SP对齐是构帧保证，不是任意用户恢复帧的额外
 拒绝条件；恢复仍有范围、读取、扩展终止和特权隔离检查。
+
+### EXEC 页的冷/驻留差异（2026-10-06）
+
+固定Linux commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的
+`arch/loongarch/mm/cache.c::protection_map` 对非NONE用户映射发布可读PTE；
+`mm/fault.c` 对未驻留页的数据读取仍要求VM_READ/VM_WRITE。由此纯EXEC冷页
+读取fault，但RW物化再改EXEC，或文件页经首次取指物化后，数据读取合法。
+不能把这个事实简化成VMA的EXEC总是隐含READ，否则会放宽Linux拒绝的冷页。
+
+同一LP64S ELF先在Linux512MiB/1GiB通过，BoarOS驻留EXEC读取SEGV复现差异。
+LA encode按Linux表发布有效权限，VMA、fault和uaccess策略保持共用原路径；
+修复后8组冷页/驻留/取指/fork/PROT_NONE/撤执行/uaccess在两侧两种RAM通过，
+根页/堆owner回到基线。原LA信号、线程、MM/COW与启动回归，以及RV MM/VMA/
+uaccess/files/exec和SQLite DELETE/WAL多进程与重启门禁通过。

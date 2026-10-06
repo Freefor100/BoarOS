@@ -18,6 +18,7 @@ make test-stack-usage-la
 make test-signal-loongarch     # 同一静态 musl ELF 的整数信号/恢复/重启对照
 make test-pthread-loongarch    # 静态 TLS/线程、原 BusyBox ash 非交互 trap/wait
 make test-pthread-oom-loongarch # 两处 clone 构造 OOM、真实 pthread EAGAIN/重试
+make test-permissions-loongarch # 冷/驻留 EXEC 页、fork、uaccess 与改权对照
 ```
 
 `run-loongarch` 进入 console 探针后，依次在 poll/read ready 标记出现时输入 `g` 和 `r`（各回车），完成后关机。
@@ -37,6 +38,8 @@ defconfig 建立 16 KiB/三级页表、initramfs 对照。缓存分别位于 `bu
 架构 MMU 设置 PWCL/PWCH、STLBPS 和独立 TLB refill 入口；根目录/中间目录缺失时
 refill 写入无效 paired entry，交由普通用户缺页路径处理，不能读取物理地址零。
 用户 PTE 的 PLV3、NR/NX、dirty 与软件 COW/PROT_NONE 状态由 LA 后端拥有。
+非 NONE 用户 PTE 按固定 Linux LA 映射表保持可读；请求 VMA 权限不改写，
+所以冷 EXEC 页的数据读取与合法取指后的驻留页行为分别验证。
 撤映射先失效转换再归还页；地址空间切换使用 PGDL、ASID0 和全量失效。
 用户页、目录页及 COW 引用均按通用 MM owner 协议转移或回滚，所有权损坏 fatal。
 内核当前使用 PLV0 DMW，LA 任务栈有 canary 和回收高水位统计，尚无虚拟 guard page。
