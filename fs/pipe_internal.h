@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 #include <kernel/scheduler.h>
+#include <kernel/page.h>
 #include <kernel/sync.h>
 #include <kernel/vfs.h>
 
@@ -45,7 +46,7 @@ struct kernel_pipe {
 #define KERNEL_PIPE_ENDPOINT_WRITE 2U
 #define KERNEL_PIPE_ENDPOINT_BOTH 3U
 #define KERNEL_PIPE_NONBLOCK UINT32_C(00004000)
-#define KERNEL_PIPE_CAPACITY (UINT64_C(16) * UINT64_C(4096))
+#define KERNEL_PIPE_CAPACITY (UINT64_C(16) * BOAROS_PAGE_SIZE)
 #define KERNEL_PIPE_ATOMIC_WRITE UINT64_C(4096)
 
 enum kernel_pipe_status {

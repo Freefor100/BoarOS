@@ -283,3 +283,9 @@ test-pty-loongarch: kernel-la
 test-pty-apps-loongarch: kernel-la
 	python3 -B tests/tty/pty_riscv.py --arch loongarch --case libc
 	python3 -B tests/tty/pty_riscv.py --arch loongarch --case script
+
+$(LA_BUILD)/pipe-geometry: tests/workloads/pipe_geometry.c $(LA_BUILD)/musl-root/bin/musl-gcc
+	REALGCC=$(CURDIR)/$(LA_BUILD)/gcc-sf/root/bin/loongarch64-unknown-linux-gnusf-gcc $(LA_BUILD)/musl-root/bin/musl-gcc -static -O2 -Wall -Wextra -Werror $< -o $@
+.PHONY: test-pipe-loongarch
+test-pipe-loongarch: kernel-la $(LA_BUILD)/pipe-geometry
+	python3 -B tests/loongarch/userland.py --program $(LA_BUILD)/pipe-geometry --marker 'PIPE GEOMETRY PASS'
