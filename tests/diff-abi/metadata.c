@@ -84,8 +84,8 @@ void abi_metadata_cases(void)
     result("metadata.null-flags", SC4(88, fd, 0, explicit, 0x1000));
     result("metadata.empty-no-flag", SC4(88, fd, "", explicit, 0));
     result("metadata.bad-flags", SC4(88, -1, (void *)-1L, explicit, 2));
-    long map = CALL(222, 0, 8192, 3, 0x22, -1, 0);
-    abi_require(map >= 0 && SC3(226, map + 4096, 4096, 0) == 0);
+    long map = CALL(222, 0, (2 * ABI_PAGE_SIZE), 3, 0x22, -1, 0);
+    abi_require(map >= 0 && SC3(226, map + ABI_PAGE_SIZE, ABI_PAGE_SIZE, 0) == 0);
     ((long *)(map + 4080))[0] = 0;
     ((long *)(map + 4080))[1] = OMIT;
     result("metadata.times-partial-fault", SC4(88, -1, 0, map + 4080, 0));
@@ -109,5 +109,5 @@ void abi_metadata_cases(void)
     stats("metadata.statfs-unlinked", fd);
     abi_require(SC3(35, parent, "metadata-link", 0) == 0);
     abi_require(SC1(57, fd) == 0 && SC1(57, parent) == 0);
-    abi_require(SC2(215, map, 8192) == 0);
+    abi_require(SC2(215, map, (2 * ABI_PAGE_SIZE)) == 0);
 }

@@ -30,7 +30,7 @@ void abi_child_tid_cases(void)
     abi_require(SC4(260, child, &status, 0, 0) == child);
     abi_record("tid.fork-private", private_tid, -1, -1, status, 0, 0);
 
-    volatile int *shared = (void *)CALL(222, 0, 4096, 3, 0x21, -1, 0);
+    volatile int *shared = (void *)CALL(222, 0, ABI_PAGE_SIZE, 3, 0x21, -1, 0);
     abi_require((long)shared > 0);
     *shared = 73;
     child = CALL(220, 17 | CHILD_CLEAR, 0, 0, 0, shared, 0);
@@ -53,13 +53,13 @@ void abi_child_tid_cases(void)
     for (int mode = 0; mode < 2; mode++) {
         void *address = mode ? (void *)shared : (void *)8;
         *shared = 73;
-        if (mode) abi_require(SC3(226, shared, 4096, 1) == 0);
+        if (mode) abi_require(SC3(226, shared, ABI_PAGE_SIZE, 1) == 0);
         child = CALL(220, 17 | CHILD_SET | CHILD_CLEAR, 0, 0, 0, address, 0);
         abi_require(child >= 0);
         if (!child) abi_exit(0);
         abi_require(SC4(260, child, &status, 0, 0) == child);
         abi_record(mode ? "tid.readonly" : "tid.bad-address", 0, -1, -1, status, 0, 0);
-        if (mode) abi_require(SC3(226, shared, 4096, 3) == 0);
+        if (mode) abi_require(SC3(226, shared, ABI_PAGE_SIZE, 3) == 0);
     }
     private_tid = 73;
     struct child_args args = {&private_tid, 0, 0};
@@ -74,5 +74,5 @@ void abi_child_tid_cases(void)
         abi_require(r == 0 || r == -11 || r == -4);
     }
     abi_record("tid.thread-wake", private_tid, args.observed, -1, 0, 0, 0);
-    abi_require(SC2(215, shared, 4096) == 0);
+    abi_require(SC2(215, shared, ABI_PAGE_SIZE) == 0);
 }

@@ -43,9 +43,9 @@ void abi_timestamp_cases(void)
 {
     long fd, read_only, result;
     char byte;
-    long map = CALL(222, 0, 8192, 3, 0x22, -1, 0);
-    abi_require(map >= 0 && SC3(226, map + 4096, 4096, 0) == 0);
-    *(char *)(map + 4095) = 'P';
+    long map = CALL(222, 0, 2 * ABI_PAGE_SIZE, 3, 0x22, -1, 0);
+    abi_require(map >= 0 && SC3(226, map + ABI_PAGE_SIZE, ABI_PAGE_SIZE, 0) == 0);
+    *(char *)(map + ABI_PAGE_SIZE - 1) = 'P';
     parent_fd = abi_open("/", 65536);
     abi_require(parent_fd >= 0);
     before(-1);
@@ -64,21 +64,21 @@ void abi_timestamp_cases(void)
     abi_require(SC3(62, fd, 0, 0) == 0);
     before(fd); result = SC3(63, fd, &byte, 1);
     after("time.read", fd, result);
-    before(fd); result = SC3(64, fd, map + 4096, 1);
+    before(fd); result = SC3(64, fd, map + ABI_PAGE_SIZE, 1);
     after("time.write-fault", fd, result);
     before(fd); result = SC4(67, fd, &byte, 1, 0);
     after("time.cached-pread", fd, result);
-    before(fd); result = SC3(63, fd, map + 4096, 0);
+    before(fd); result = SC3(63, fd, map + ABI_PAGE_SIZE, 0);
     after("time.read-zero", fd, result);
 
-    abi_require(SC3(64, fd, map + 4096, 1) == -14);
+    abi_require(SC3(64, fd, map + ABI_PAGE_SIZE, 1) == -14);
     before(fd); result = SC4(67, fd, &byte, 1, 1);
     after("time.pread-eof", fd, result);
-    abi_require(SC3(64, fd, map + 4096, 1) == -14);
+    abi_require(SC3(64, fd, map + ABI_PAGE_SIZE, 1) == -14);
     abi_require(SC3(62, fd, 0, 0) == 0);
-    before(fd); result = SC3(63, fd, map + 4096, 1);
+    before(fd); result = SC3(63, fd, map + ABI_PAGE_SIZE, 1);
     after("time.read-fault", fd, result);
-    before(fd); result = SC3(64, fd, map + 4095, 2);
+    before(fd); result = SC3(64, fd, map + ABI_PAGE_SIZE - 1, 2);
     after("time.write-partial", fd, result);
     before(fd); result = SC2(46, fd, 1);
     after("time.truncate-same", fd, result);
@@ -100,7 +100,7 @@ void abi_timestamp_cases(void)
     before(fd); result = SC3(64, fd, "X", 1);
     after("time.write-maxbytes", fd, result);
     abi_require(SC3(62, fd, 0, 0) == 0);
-    abi_require(SC3(64, fd, map + 4096, 1) == -14);
+    abi_require(SC3(64, fd, map + ABI_PAGE_SIZE, 1) == -14);
     before(fd); result = SC4(67, fd, -4096L, 1, 0);
     after("time.pread-invalid", fd, result);
     before(fd); result = SC4(67, fd, -4096L, 0, 0);
@@ -110,5 +110,5 @@ void abi_timestamp_cases(void)
     before(fd); result = SC4(67, fd, map, -1L, 0);
     after("time.pread-wrap", fd, result);
     abi_require(SC1(57, read_only) == 0 && SC1(57, fd) == 0 &&
-                 SC1(57, parent_fd) == 0 && SC2(215, map, 8192) == 0);
+                 SC1(57, parent_fd) == 0 && SC2(215, map, 2 * ABI_PAGE_SIZE) == 0);
 }

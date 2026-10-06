@@ -51,7 +51,7 @@ void abi_sched_policy_cases(void)
     abi_record("sched.reset-parent",SC1(120,0),-1,-1,0,0,0);
     policy(0,0,0);
 
-    long address=SC6(222,0,4096,3,0x21,-1,0);
+    long address=SC6(222,0,ABI_PAGE_SIZE,3,0x21,-1,0);
     abi_require(address>=0);
     volatile unsigned long *shared=(void *)address;
     shared[0]=0;
@@ -85,5 +85,5 @@ void abi_sched_policy_cases(void)
     wait_child(child);
     abi_record("sched.rr-equal-priority-rotation",rr_rotated,-1,-1,0,0,0);
     policy(0,0,0);
-    abi_require(SC2(215,address,4096)==0);
+    abi_require(SC2(215,address,ABI_PAGE_SIZE)==0);
 }

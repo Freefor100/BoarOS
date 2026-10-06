@@ -44,9 +44,9 @@ void abi_statx_cases(void)
     abi_record("statx.bad-path-sync",SC5(291,-100,8,0x6000,0x7ff,&st),-1,-1,0,0,0);
     abi_record("statx.bad-path-flags",SC5(291,-100,8,1,0x7ff,&st),-1,-1,0,0,0);
     abi_record("statx.path-flags",SC5(291,-100,"/statx-data",1,0x7ff,&st),-1,-1,0,0,0);
-    unsigned char *partial=(void *)SC6(222,0,8192,3,0x22,-1,0);abi_require((long)partial>0);
-    abi_require(SC3(226,partial+4096,4096,0)==0);
-    abi_record("statx.cross-copy",SC5(291,-100,"/statx-data",0,0x7ff,partial+4096-128),-1,-1,0,0,0);
-    abi_require(SC2(215,partial,8192)==0);
+    unsigned char *partial=(void *)SC6(222,0,(2 * ABI_PAGE_SIZE),3,0x22,-1,0);abi_require((long)partial>0);
+    abi_require(SC3(226,partial+ABI_PAGE_SIZE,ABI_PAGE_SIZE,0)==0);
+    abi_record("statx.cross-copy",SC5(291,-100,"/statx-data",0,0x7ff,partial+ABI_PAGE_SIZE-128),-1,-1,0,0,0);
+    abi_require(SC2(215,partial,(2 * ABI_PAGE_SIZE))==0);
     abi_require(SC1(57,fd)==0 && SC3(35,-100,"/statx-link",0)==0 && SC3(35,-100,"/statx-data",0)==0);
 }

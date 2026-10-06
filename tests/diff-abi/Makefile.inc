@@ -35,3 +35,10 @@ build/diff-abi/sync-rv: $(DIFF_ABI_SOURCES) tests/diff-abi/abi.h tests/riscv/use
 		-ffreestanding -fno-builtin -fno-stack-protector -nostdlib -static \
 		-Wl,--build-id=none -Wl,-T,tests/riscv/user_elf.ld -Wl,--defsym,__global_pointer\$$=0 \
 		-o $@ $(DIFF_ABI_SOURCES)
+
+build/loongarch/diff-abi-cases: $(DIFF_ABI_SOURCES) tests/diff-abi/abi.h tests/common/raw_syscall.h tests/common/user.ld
+	@mkdir -p $(@D)
+	$(LA_CC) $(LA_FLAGS) -O2 -Wall -Wextra -Werror -ffreestanding -fno-builtin -fno-stack-protector -nostdlib -nostartfiles -static -no-pie -Wl,--build-id=none -Wl,-z,max-page-size=16384 -Wl,-T,tests/common/user.ld -o $@ $(DIFF_ABI_SOURCES)
+.PHONY: test-diff-abi-loongarch
+test-diff-abi-loongarch: test-diff-abi-host kernel-la build/loongarch/diff-abi-cases prepare-la-tools prepare-la-linux-platform
+	python3 -B tests/diff-abi/harness.py --arch loongarch --kernel kernel-la --program build/loongarch/diff-abi-cases --timeout 180

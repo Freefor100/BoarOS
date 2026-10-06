@@ -12,10 +12,10 @@ void abi_random_cases(void)
     abi_record("random.zero-high-pointer", SC3(278, -1, 0, 4), -1,-1,0,0,0);
     abi_record("random.zero", SC3(278, 0, 0, 4), -1,-1,0,0,0);
     abi_record("random.fault", SC3(278, 0, 1, 4), -1,-1,0,0,0);
-    long map = SC6(222, 0, 8192, 3, 0x22, -1, 0);
-    abi_require(map >= 0 && SC3(226, map + 4096, 4096, 0) == 0);
-    abi_record("random.partial-fault", SC3(278, map + 4092, 8, 4), -1,-1,0,0,0);
-    abi_require(SC2(215, map, 8192) == 0);
+    long map = SC6(222, 0, (2 * ABI_PAGE_SIZE), 3, 0x22, -1, 0);
+    abi_require(map >= 0 && SC3(226, map + ABI_PAGE_SIZE, ABI_PAGE_SIZE, 0) == 0);
+    abi_record("random.partial-fault", SC3(278, map + (ABI_PAGE_SIZE - 4), 8, 4), -1,-1,0,0,0);
+    abi_require(SC2(215, map, (2 * ABI_PAGE_SIZE)) == 0);
     for (unsigned i=0; i<2; i++) {
         const char *path = i ? "/created-urandom" : "/created-random";
         abi_require(SC4(33, -100, path, 0020600, i ? 0x109 : 0x108) == 0);

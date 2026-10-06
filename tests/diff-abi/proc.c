@@ -229,10 +229,17 @@ static void proc_thread_cases(void)
     for (unsigned attempt = 0; proc_thread_tid && attempt < 10000U;
          attempt++) SC0(124);
     abi_require(!proc_thread_tid);
-    result = proc_status_fields("/proc-probe/self/status", &state, &threads);
+    /* Linux clear_child_tid发生在exit_mm，nr_threads到release_task才递减。 */
+    for(unsigned attempt=0;attempt<10000U;attempt++) {
+        result=proc_status_fields("/proc-probe/self/status",&state,&threads);
+        abi_require(!result && (threads==1 || threads==2));
+        if(threads==1)break;
+        SC0(124);
+    }
+    abi_require(threads==1);
     abi_record("proc.thread-after-exit", result, threads, -1, 0, 0, 0);
 
-    volatile int *control = (void *)CALL(222, 0, 4096, 3, 0x21, -1, 0);
+    volatile int *control = (void *)CALL(222, 0, ABI_PAGE_SIZE, 3, 0x21, -1, 0);
     abi_require((long)control > 0);
     control[0] = 0; /* member entered */
     control[1] = 0; /* member may exit */
@@ -269,7 +276,15 @@ static void proc_thread_cases(void)
     for (unsigned attempt = 0; control[2] && attempt < 10000U;
          attempt++) SC0(124);
     abi_require(!control[2]);
-    result = proc_status_fd_fields(held_status, &state, &threads);
+    /* clear_child_tid先于exit_state；等实际Z状态，不能记录调度偶然的R。 */
+    for(unsigned attempt=0;attempt<10000U;attempt++) {
+        abi_require(SC3(62,held_status,0,0)==0);
+        result=proc_status_fd_fields(held_status,&state,&threads);
+        abi_require(!result && threads==2);
+        if(state=='Z')break;
+        SC0(124);
+    }
+    abi_require(state=='Z');
     abi_record("proc.group-held-status", result, threads, -1, 0,
                &state, 1);
     abi_require(SC1(57, held_status) == 0);
@@ -299,7 +314,7 @@ static void proc_thread_cases(void)
     int status = 0;
     abi_require(SC4(260, child, &status, 0, 0) == child);
     abi_require(status == 0);
-    abi_require(SC2(215, control, 4096) == 0);
+    abi_require(SC2(215, control, ABI_PAGE_SIZE) == 0);
 }
 
 struct proc_stress_control { volatile int requested, finished, tid; long replacement; };
@@ -777,10 +792,10 @@ void abi_proc_cases(void)
         abi_record("proc.meminfo-eof", SC3(63, fd, header, sizeof(header)),
                    -1, -1, 0, 0, 0);
         abi_require(SC3(62, fd, 0, 0) == 0);
-        long fault_map = CALL(222, 0, 8192, 3, 0x22, -1, 0);
+        long fault_map = CALL(222, 0, 2 * ABI_PAGE_SIZE, 3, 0x22, -1, 0);
         abi_require(fault_map >= 0);
-        abi_require(SC3(226, fault_map + 4096, 4096, 0) == 0);
-        unsigned char *prefix = (void *)(fault_map + 4096 - 8);
+        abi_require(SC3(226, fault_map + ABI_PAGE_SIZE, ABI_PAGE_SIZE, 0) == 0);
+        unsigned char *prefix = (void *)(fault_map + ABI_PAGE_SIZE - 8);
         long partial = SC3(63, fd, prefix, 16);
         abi_record("proc.meminfo-fault-prefix", partial, -1,
                    abi_offset(fd), 0, prefix, partial > 0 && partial <= 8
@@ -790,7 +805,7 @@ void abi_proc_cases(void)
         abi_record("proc.meminfo-fault-next", continued, -1,
                    abi_offset(fd), 0, continuation,
                    continued > 0 ? 1U : 0U);
-        abi_require(SC2(215, fault_map, 8192) == 0);
+        abi_require(SC2(215, fault_map, 2 * ABI_PAGE_SIZE) == 0);
         abi_require(SC3(62, fd, 0, 0) == 0);
         abi_record("proc.meminfo-fault-first",
                    SC3(63, fd, (void *)-1, 4), -1,
