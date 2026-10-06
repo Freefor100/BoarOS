@@ -25,13 +25,16 @@ clone先快照父硬件再复制image；exit丢弃退出者，只恢复下一own
 ## 信号与错误
 
 未使用FP的交付帧仍为592字节END整数帧；使用后为880字节，SC_USED_FP置位，
-FPU记录magic=0x46505501、size=288（16字节header+272字节payload），后接END。
-payload为32FR、64位FCC和32位FCSR，padding不作为语义字段。恢复先快照全部
-GP/mask/扩展输入，随后提交；END仅读取magic/size，不额外要求用户帧对齐或
-padding可读。未知扩展和太短记录为用户坏帧，不能fatal内核。没有发布SIMD能力。
+FPU记录magic=0x46505501、size=288（16字节header、268字节有效字段及4字节
+padding），后接END。有效字段为32FR、64位FCC和32位FCSR；恢复只快照这268字节，
+不要求尾部padding可读，最小记录尺寸仍为288，也接受更大尺寸跳到后续END。
+恢复先快照全部GP/mask/扩展输入，随后提交；END仅读取magic/size，不额外要求
+用户帧对齐或END padding可读。未知扩展和太短记录为用户坏帧，不能fatal内核。
+没有发布SIMD能力。
 
-FCSR启用位与Cause相交时按Linux清除Cause并交付SIGFPE：invalid优先，其后
-divide、overflow、underflow、inexact，si_addr为ERA。sigreturn中的已启用pending
+FPE陷入时按Linux清除Cause与Enable相交的位，但从原始全部Cause中选择SIGFPE
+的si_code：invalid优先，其后divide、overflow、underflow、inexact，si_addr为ERA。
+因此只启用inexact的溢出/下溢运算仍报告FPE_FLTOVF/FPE_FLTUND。sigreturn中的已启用pending
 Cause先写回清除后的用户FCSR，再交付SI_KERNEL来源SIGFPE；只读/坏输出是坏帧。
 PRMD和内核TP不来自用户。用户FP错误由原共用信号策略处理，allocator/page
 owner损坏仍fatal。
@@ -40,8 +43,9 @@ owner损坏仍fatal。
 
 `make test-fpu-loongarch` 在Linux和BoarOS的512MiB/1GiB运行同一原版musl
 LP64D静态ELF，验证算术/fenv、全部FR/FCC/FCSR、两个计算线程的timer保持、
-fork继承、handler修改硬件与用户image、exec初始化、真实除零SIGFPE、未知/
-短扩展帧、sigreturn pending及仅END padding跨到不可读页。根owner和页/堆必须
+fork继承、handler修改硬件与用户image、exec初始化、真实除零及仅启用inexact的
+溢出/下溢SIGFPE、未知/短扩展帧、sigreturn pending，以及END/FPU尾部padding
+跨到不可读页。根owner和页/堆必须
 恢复基线。原LP64S信号/线程、LA启动/根盘和两架构栈门禁继续运行。
 
 原版动态musl/TLS的组合验证见[LA模块](loongarch-boot.md)。没有FPU性能测量，

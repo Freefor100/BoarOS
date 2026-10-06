@@ -227,8 +227,14 @@ LA没有RV的Dirty跟踪位；首用异常15决定是否曾用FP，既保留整�
 避免让所有整数任务每次保存FP。用过的task沿已有切换接口保存和恢复32FR、
 8FCC和FCSR。FCC不是八个相邻bit，而是Linux每个一字节的64位编码。信号记录
 FPU magic0x46505501、size288，完整帧880字节；END只需要前8字节可读。
-Linux FP初始化FR为全1NaN，exec首次使用不能继承旧值。异常Cause先与Enable
-相交再清除/选择SIGFPE；pending sigreturn按Linux写回并产生SI_KERNEL。
+FPU记录最小尺寸包含4字节尾部padding，但Linux恢复只读268字节有效字段。
+有效字段恰好止于页尾、padding在PROT_NONE页且大size跳到后续可读END的同ELF
+反例在Linux通过，原整结构复制却误触发SIGSEGV；按有效字段边界复制后通过。
+Linux FP初始化FR为全1NaN，exec首次使用不能继承旧值。FPE清除Cause与Enable
+相交的位，si_code却按原始Cause优先级选择。固定Linux的`force_fcsr_sig`旁旧
+注释不能代替`do_fpe`完整调用链：仅启用inexact的实际overflow/underflow运算
+分别报告FPE_FLTOVF/FPE_FLTUND，双侧真实指令已核对；pending sigreturn按Linux
+写回并产生SI_KERNEL。
 
 相同静态LP64D程序先在Linux通过、BoarSIGILL复现，再经过真实FR/FCC/CSR
 timer、fork、signal/修改恢复、exec、FPE和扩展坏帧矩阵。原版动态PIE和非PIE
