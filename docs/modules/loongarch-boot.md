@@ -68,3 +68,33 @@ DELETE/WAL 恢复回归通过。上述结果不代表 LA 完整线程、信号�
 QEMU从该固定源码在`build/qemu-la`构建，未引入新的产品依赖。
 Linux 对照 commit 为 `f4cdf7ca9a1fdcca413157df19753f388a5a224e`；CSR、PTE、
 refill 和 syscall 核对路径及调试经验见[LA 学习记录](../learning/loongarch-bringup.md)。
+
+## 第二阶段：PCI 块设备已验证
+
+`kernel/pci.c` 有界解析 capability、按真实 BAR mask 分配不重叠资源，失败恢复
+原 BAR/command 并归还 claim。`drivers/virtio/pci_block.c` 通过共用块核心完成
+现代 PCI transport；总线访问宽度、read-to-clear ISR 和通知地址由 PCI 实现，
+ECAM、uncached 映射及 INTx 来源由 `platform/loongarch_pci.c` 提供。BAR 地址
+不能假设由固件分配：无 BIOS QEMU 上先 sizing/分配，再确认 reset，最后打开
+bus-master，销毁按 stop DMA→摘 IRQ→释放队列→恢复 BAR/command 的 owner 顺序。
+
+QEMU 平台采用128个bus的ECAM、低PCI memory aperture、根bus现代端点及
+PCH-PIC→EXTIOI→CPU0/HWI0。资源 claim 有64个槽，耗尽明确失败；无桥、热插拔、
+legacy PCI、MSI-X 或实板验证。控制器为共享level pin在逐设备ISR之间保持mask，
+unmask重新采样intirr；trap只分发ESTAT与ECFG交集，同时处理已启用的timer。
+
+```sh
+make test-pci-host
+make test-block-loongarch
+```
+
+512MiB/1GiB各验证两个共享INTx pin的真实PCI盘、启动轮询和运行期IRQ、
+八槽批量数据、CPU进展、只读与范围错误、写入/FLUSH后的宿主字节和完整
+任务/队列/PCI claim回收。queue OOM在真实设备初始化中恢复BAR、command和
+页基线。宿主模型额外覆盖capability循环/截断/溢出、BAR资源不足回滚，以及
+不依赖handler遍历顺序的共享level迟到完成。掩蔽外设的pending状态不能在
+timer trap中被分发，真实QEMU先复现失败后修复。ext4根启动和静态程序仍待验收。
+
+固定依据：QEMU上述commit的 `hw/pci-host/gpex.c`、`hw/intc/loongarch_{pch_pic,extioi}.c`
+及 `include/standard-headers/linux/virtio_pci.h`；Linux上述commit的
+`drivers/virtio/virtio_pci_modern_dev.c` 和 `drivers/irqchip/irq-loongson-{pch-pic,eiointc}.c`。

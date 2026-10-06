@@ -8,6 +8,7 @@ LA_CFLAGS := $(LA_FLAGS) -std=gnu11 -O2 -g3 -ffreestanding -fno-builtin -fno-sta
 LA_C_SOURCES := $(filter-out arch/% kernel/main.c net/ethernet.c,$(C_SOURCES)) \
     arch/loongarch/main.c arch/loongarch/mmu.c arch/loongarch/context.c \
     arch/loongarch/timer.c arch/loongarch/trap.c platform/loongarch_virt.c \
+    platform/loongarch_pci.c drivers/virtio/pci_block.c kernel/pci.c \
     tests/loongarch/mmu.c tests/loongarch/heap.c tests/loongarch/user_boot.c tests/loongarch/elf_failures.c
 LA_ASM_SOURCES := arch/loongarch/boot.S arch/loongarch/context_switch.S \
     arch/loongarch/tlb_refill.S arch/loongarch/trap_entry.S arch/loongarch/signal_trampoline.S tests/loongarch/user_blob.S
@@ -28,6 +29,17 @@ prepare-la-linux:
 ifeq ($(QEMU_LOONGARCH64),build/qemu-la/qemu-system-loongarch64)
 run-loongarch test-loongarch test-loongarch-boot: prepare-la-tools
 endif
+
+$(LA_BUILD)/kernel-block-la: $(LA_OBJECTS) $(LA_BUILD)/tests/loongarch/block.o arch/loongarch/linker.ld
+	$(LA_CC) $(LA_FLAGS) -nostdlib -nostartfiles -static -no-pie -T arch/loongarch/linker.ld -Wl,--build-id=none,--gc-sections,--wrap=physical_page_allocate,--wrap=physical_page_allocate_order,--wrap=kernel_syscall_dispatch,--wrap=la_user_contract -o $@ $(LA_OBJECTS) $(LA_BUILD)/tests/loongarch/block.o -lgcc
+.PHONY: test-block-loongarch test-pci-host
+test-block-loongarch: $(LA_BUILD)/kernel-block-la prepare-la-tools
+	python3 -B tests/loongarch/block.py --qemu $(QEMU_LOONGARCH64)
+test-pci-host:
+	@mkdir -p build/host
+	cc -std=c11 -Wall -Wextra -Werror -idirafter include tests/host/pci.c kernel/pci.c -o build/host/pci
+	build/host/pci
+	python3 -B tests/host/loongarch_irq.py
 run-loongarch: kernel-la
 	$(QEMU_LOONGARCH64) -machine virt -cpu la464 -smp 1 -m 1G -kernel kernel-la -nographic -no-reboot
 test-loongarch: kernel-la prepare-la-linux test-stack-usage-la test-loongarch-fatal
