@@ -94,6 +94,14 @@ WAIT 的超时为相对 monotonic；WAIT_BITSET 的超时为绝对 monotonic 或
 
 exit 只退出当前线程，exit_group 和默认致命信号结束全组。退出先完成本线程的 robust-list 清理，仅当同一 MM 仍有其他活跃使用者时执行 clear-child-tid 清零/唤醒，完成可能睡眠的用户复制后再注销本使用者，最后释放 exec/files/fs/MM 等资源。任务仍在自己的内核栈上时不释放栈；切回可信清理上下文后检查 canary、高水位并回收旧栈；运行期需要存储的资源释放由可调度内核清理任务执行。
 
+BoarOS 的 PID 1 最终退出启动整机收口：cleanup worker 保存它的完成状态，通过
+`kernel_scheduler_stop_users()` 对剩余用户组请求致命退出，等待正常取消/回收完成，
+再停止网络与存储 worker、卸载根盘及检查内存基线。内核 worker 在用户 I/O owner
+释放之前继续服务；不强制卸载活引用，也不按 daemon 名称清理。只在关机阶段枚举
+现有任务表，等待仍复用 cleanup 队列，不轮询忙等。实际子进程、STOPPED、组长先
+退出与关机中 fork 的回归为 `python3 -B tests/root-shutdown-riscv.py`；先用通用
+`INIT_CONFIG=config/init.json` 构建。根因与旧基线反例见[收口记录](../learning/threads-and-futex.md#pid-1-关机与存活后台-owner2026-10-06)。
+
 组长先退出进入 GROUP_DEAD，保留进程容器；普通成员资源清理成功后从组环移除并回卷时间。最后一个成员结束后，组长才成为唯一进程退出对象，向父进程产生一次 zombie/SIGCHLD。SIGCHLD 显式忽略或 NOCLDWAIT 的自动回收仍遵循信号模块契约。
 
 退出切回保存的 idle/cleanup context，不依赖所有用户任务都阻塞。该 context 排空可完成的清理后主动派发 ready 任务；tick 对待清理标志只做 O(1) 检查并切换，不在中断热路径执行释放。只有真实 VFS/block I/O 清理失败保留原 owner，在后续清理机会重试；合法页/堆释放完成即返回，分配器不变量错误进入 fatal。真实 I/O 清理重试、GROUP_DEAD 和 zombie 只保留元数据，均不保留已经停止执行的内核栈；再次进入退出队列的旧组长不会重复释放栈。

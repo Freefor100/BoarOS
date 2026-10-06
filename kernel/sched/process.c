@@ -1235,6 +1235,22 @@ int kernel_scheduler_reap_pending(void)
     return scheduler.exited_head != 0;
 }
 
+int kernel_scheduler_stop_users(void)
+{
+    int pending = 0;
+    /* 仅关机收口枚举现有任务表；内核worker仍须服务用户退出中的I/O。 */
+    for (struct kernel_task *task = scheduler.all_tasks; task;
+         task = task->all_next) {
+        if (task->arch.user_mode != 1U) continue;
+        pending = 1;
+        if (task->group_leader == task &&
+            task->state != KERNEL_THREAD_STATE_EXITED &&
+            task->state != KERNEL_THREAD_STATE_ZOMBIE)
+            process_group_request_exit(task, KERNEL_THREAD_EXIT_SIGNAL, 9, 0);
+    }
+    return pending;
+}
+
 enum kernel_scheduler_status kernel_scheduler_reap_one(
     struct kernel_thread_completion *completion)
 {
