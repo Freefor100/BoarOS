@@ -4,6 +4,25 @@
 
 `build/` 是未纳入 Git 的可重建产物目录，不是永久证据库。本页所列旧 `build/` 路径是当时的运行位置，2026-09-25 已清理，不能直接打开；可复用的结论、固定输入、身份和复现命令记录在 Git 中。运行器在执行期间会保存 JSON、日志和镜像，核对后用 `python3 tests/prune-build.py` 预览、`make prune-build` 清理整个一次性运行目录，只留下可跨轮复用的编译缓存。
 
+## 双架构最近完整结果（2026-10-07）
+
+当前固定输入清单为 **229个相同ID**：BusyBox10项（原9项加已有环境内容案例），
+libc-test107静态、110动态及两项原包装器。RV完整229项全部通过；LA在512MiB、
+1GiB各完整229项全部通过，包括原BusyBox包装器55子项及静态/动态libc包装器。
+每ID均有同一ELF的Linux/BoarOS真实wait/输出判定与正常root资源退出，未修改原程序。
+过去228/227的记录仍属历史，不由本次通过推断当时失败的具体修复归因。
+
+LA Linux/QEMU及16KiB/LP64D输入见[平台模块](../modules/loongarch-boot.md)，musl
+仍固定1.2.5；glibc五形态是另一组矩阵，LA原2.42与RV原2.44的版本差异保留。
+LA最初未启用完整LS7A参考模型时，stat的时间关系和两项包装器在Linux失败，
+不能计为BoarOS通过；补齐真实参考时钟后所有ID在双方通过。途中一次模拟器重新
+链接造成启动EACCES，保留为runner-error；同一工具哈希恢复后补跑未完成项，
+不能当作用户程序加载失败或靠串口计数清除。
+
+复现使用 `--arch loongarch --reuse-builds --require-pass`；编译缓存按架构独立，
+同一个输出目录只接受相同身份。全部原程序通过的范围是这个共同清单，不是正式
+比赛分数、所有RV程序或完整客体开发环境。
+
 ## 固定输入与复现
 
 - BusyBox 1.33.1：`references/oscomp-testsuits` commit `b5ec6ef8497e1818cbdec3b54bb722f036e57972` 的原配置，保留全部 398 applet。

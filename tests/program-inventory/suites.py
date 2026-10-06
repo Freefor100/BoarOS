@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Isolated QEMU-system real-program cases with a shared reference fixture.
 
-No emulator is started at import time. Call run_suite explicitly; guests run
+No emulator is started at import time
+import sys
+sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
+from arch_profiles import PROFILES. Call run_suite explicitly; guests run
 serially, and every case starts from the same fixture on both kernels.
 """
 import hashlib
@@ -13,6 +16,9 @@ import re
 import shutil
 import subprocess
 import time
+import sys
+sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
+from arch_profiles import PROFILES
 
 ROOT = Path(__file__).resolve().parents[2]
 ID = re.compile(r'[A-Za-z0-9._-]+')
@@ -332,7 +338,7 @@ def prune_pass_images(directory, result, *, dry_run=False):
 def run_suite(manifest, output_dir, driver_elf, linux_kernel, boaros_kernel, *,
               case_ids=None, resume=True, default_timeout=10, boot_timeout=15,
               qemu='qemu-system-riscv64', output_validator=None,
-              keep_pass_images=True, platform_config='fixture'):
+              keep_pass_images=True, platform_config='fixture',arch='riscv',memory=None):
     """Run all selected cases serially; persist each result before continuing.
 
     A driver or guest failure affects its case only. No result is called pass
@@ -340,6 +346,8 @@ def run_suite(manifest, output_dir, driver_elf, linux_kernel, boaros_kernel, *,
     An interruption leaves remaining records explicitly not-run; repeat the
     same invocation to resume, or set case_ids to select independent cases.
     """
+    profile=PROFILES[arch]
+    memory=memory or ('1G' if platform_config=='official' else '512M')
     if platform_config not in ('fixture','official'):raise ValueError('unknown platform configuration')
     manifest = json.loads(Path(manifest).read_text()) if not isinstance(manifest, dict) else manifest
     destination = Path(output_dir).resolve()
@@ -358,7 +366,7 @@ def run_suite(manifest, output_dir, driver_elf, linux_kernel, boaros_kernel, *,
                 'runner_sha256': digest(__file__),
                 'kernels': {name: {'path': str(path), 'sha256': digest(path)} for name, path in kernels.items()},
                 'default_timeout': default_timeout, 'boot_timeout': boot_timeout,
-                'qemu': str(qemu), 'memory': '1G' if platform_config=='official' else '512M', 'smp': 1}
+                'arch':arch,'qemu': str(qemu), 'memory': memory, 'smp': 1}
     identity['tools'] = {}
     for tool, flag in ((qemu, '--version'), ('mkfs.ext4', '-V'), ('debugfs', '-V')):
         executable = shutil.which(str(tool))
@@ -377,6 +385,15 @@ def run_suite(manifest, output_dir, driver_elf, linux_kernel, boaros_kernel, *,
             'module': output_validator.__module__, 'name': output_validator.__qualname__,
             'source_sha256': digest(validator_source) if validator_source else None,
         }
+    for name,source in list(kernels.items()):
+        snapshot=destination/(name+'-kernel')
+        expected=identity['kernels'][name]['sha256']
+        if snapshot.exists():
+            if digest(snapshot)!=expected:raise ValueError('kernel snapshot differs from suite identity')
+        else:
+            shutil.copy2(source,snapshot)
+            if digest(snapshot)!=expected:raise ValueError('kernel changed while being snapshotted')
+        kernels[name]=snapshot
     key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
     path = destination / 'suite.json'
     if path.exists():
@@ -428,16 +445,14 @@ def run_suite(manifest, output_dir, driver_elf, linux_kernel, boaros_kernel, *,
             for name, kernel in kernels.items():
                 disk = directory / (name + '.img')
                 sparse_copy(fixture, disk)
-                argv = [qemu, '-machine', 'virt', '-bios', 'default',
-                       '-object', 'rng-random,id=entropy,filename=/dev/urandom',
-                       '-device', 'virtio-rng-device,rng=entropy,bus=virtio-mmio-bus.7', '-kernel', kernel,
-                        '-m', '512M', '-smp', '1', '-nographic', '-no-reboot',
-                        '-drive', f'file={disk},if=none,format=raw,id=root',
-                        '-device', 'virtio-blk-device,drive=root,bus=virtio-mmio-bus.0']
+                argv=profile.boot(str(qemu),kernel,memory)+['-net','none',
+                    '-object','rng-random,id=entropy,filename=/dev/urandom','-device',profile.rng(),
+                    '-drive',f'file={disk},if=none,format=raw,id=root','-device',profile.block('modern')]
+                if arch=='riscv':argv+=['-global','virtio-mmio.force-legacy=false']
                 if platform_config == 'official':
                     at=argv.index('-object');del argv[at:at+4]
-                    argv[argv.index('-m')+1]='1G'
-                    argv+=['-device','virtio-net-device,netdev=net','-netdev','user,id=net','-rtc','base=utc']
+                    if arch=='riscv':argv[argv.index('-m')+1]='1G'
+                    argv+=['-device',('virtio-net-pci,netdev=net,addr=5,disable-legacy=on' if arch=='loongarch' else 'virtio-net-device,netdev=net'),'-netdev','user,id=net','-rtc','base=utc']
                 if name == 'linux':
                     argv += ['-append', 'root=/dev/vda rw rootwait console=ttyS0 init=/init loglevel=0 panic=-1']
                 log = directory / (name + '.log')
@@ -450,8 +465,7 @@ def run_suite(manifest, output_dir, driver_elf, linux_kernel, boaros_kernel, *,
                     observed['guest_status'] = 'timeout'
                 elif code != 0:
                     observed['guest_status'] = 'guest-crash'
-                elif name == 'boaros' and not re.search(
-                    r'^BoarOS: PID 1 exited status=0x2a pages=0x[1-9a-f][0-9a-f]* heap-live=0x0; shutting down$', raw, re.M):
+                elif name == 'boaros' and not profile.root_success(raw,42):
                     observed['guest_status'] = 'guest-incomplete'
                 elif name == 'linux' and not reference_environment_ready(observed):
                     observed['guest_status'] = 'reference-environment-error'

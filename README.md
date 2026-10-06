@@ -52,7 +52,7 @@ PID 1 退出后先结束并回收剩余用户进程，再停止内核服务和�
 
 客体内固定 Alpine v3.22 RV64 GCC 14.2.0-r6 已在同一离线镜像上完成预处理、编译、汇编、静态链接和运行；固定 Linux 与 BoarOS 的五阶段状态、产物哈希和输出一致。同一编译流程也通过 tmpfs 工作目录；产物复制到根盘供比对，不代表 tmpfs 持久。另已完成原 GNU make4.4.1 默认FIFO jobserver的Lua5.4.3工程构建、增量、错误恢复和产物运行；其他项目与Rust尚未验收。
 
-固定BusyBox/libc-test最近完整清单仍为228项、227项双侧通过的历史结果；此前环境补全验收原BusyBox包装器，55/55子项成功，dmesg/RTC及df根盘内容另做真实核对。当前通用ABI差分1366条匹配，终端另有同ELF的107条差分记录；完整清单和本轮选择集合分别见[程序清单](docs/learning/user-program-inventory.md)。成本门禁见[单核规模回归](docs/learning/single-hart-scale.md)。
+固定BusyBox/libc-test当前共同清单为229项（原228项加环境内容案例），本轮RV229项与LA两种RAM各229项均双侧通过；原BusyBox包装器55/55子项、dmesg/RTC及df根盘内容均真实核对，历史结果继续保留。当前通用ABI差分1366条匹配，终端另有同ELF的107条差分记录；完整清单和本轮选择集合分别见[程序清单](docs/learning/user-program-inventory.md)。成本门禁见[单核规模回归](docs/learning/single-hart-scale.md)。
 
 顺序预读与连续写回提供有界实验候选，生产默认仍为预读关闭、写回一页。
 机制门禁和吞吐测量分别记录；TCP 27 组、存储 20 组已完成匹配筛选和组合扩展，共 1,218 次发布启动与 184 次诊断。用户依据结果批准网络默认改为 8 MSS/池 4 倍/协议堆 2 倍；存储仍为 RA0/WB1。历史结果中的默认标签指调整前的 8/1/1，见[结果、每连接完成时间和输入身份](docs/learning/data-path-budget-experiments.md#正式匹配结果2026-10-06)。
@@ -76,7 +76,7 @@ LSX/LASX状态、信号、clone/exec和关闭扩展的HWCAP已双侧验收。固
 共用VirtIO net与Ethernet已接LA现代PCI，固定Linux/BoarOS两种RAM的真实TAP、
 原BusyBox HTTP和共享块/RNG/net IRQ、正常及构造/reset失败回收通过。无metadata checksum的空索引目录误报EUCLEAN已修复并用真实1/4KiB布局及
 LA普通/挂载后rmdir验证；全恢复回归仍随本轮最终门禁执行。AF_UNIX发送者计费和sendfile批次已按固定Linux接入并双侧验证；完整网络ABI
-和程序矩阵仍需最终同口径回归。共用ns16550已接LA真实TTY，串口/termios2/作业控制、PTY与原ash/stty/script/replay及录制重启已双侧两种RAM验收；UART构造失败和fatal轮询通过。LA pipe已修正为实际持有的16页容量，双侧两种RAM验证满环、wrap和回收。LS7A RTC真实UTC、日志/OFD与原BusyBox hwclock/dmesg/df已双侧两种RAM验证；Linux参考采用保留固定源的派生QEMU补齐PM/告警，具体身份和边界见[RTC平台](docs/modules/loongarch-boot.md#ls7a-rtc-与派生模拟器)。共用完整ABI的1366条记录已在LA四次启动一致匹配，RV同轮也匹配；完整指定原程序矩阵继续推进。
+和程序矩阵仍需最终同口径回归。共用ns16550已接LA真实TTY，串口/termios2/作业控制、PTY与原ash/stty/script/replay及录制重启已双侧两种RAM验收；UART构造失败和fatal轮询通过。LA pipe已修正为实际持有的16页容量，双侧两种RAM验证满环、wrap和回收。LS7A RTC真实UTC、日志/OFD与原BusyBox hwclock/dmesg/df已双侧两种RAM验证；Linux参考采用保留固定源的派生QEMU补齐PM/告警，具体身份和边界见[RTC平台](docs/modules/loongarch-boot.md#ls7a-rtc-与派生模拟器)。共用完整ABI的1366条记录已在LA四次启动一致匹配，RV同轮也匹配；固定BusyBox/libc-test当前229个共同ID已在LA两种RAM各全量通过，与本轮RV逐ID一致。SQLite与最终整体回归继续收口。
 DTB随机种子仅支持早期材料和AT_RANDOM，不计可信熵。真实PCI RNG的正常、缺失、
 延迟、在途停止已双侧两种RAM验收，BoarOS构造失败与回收也已在两种RAM验收。LBT、
 更广原程序、实板和SMP仍须另行验收，LA与RV尚不等价。

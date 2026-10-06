@@ -27,10 +27,12 @@ def capture(argv):
                                    stderr=subprocess.STDOUT).strip()
 
 
-def build(output=None, jobs=2, uapi_include=None):
-    destination = Path(output or ROOT / 'build/program-libc').resolve()
+def build(output=None, jobs=2, uapi_include=None, arch="riscv"):
+    prefix='riscv64-linux-gnu-' if arch=='riscv' else 'loongarch64-unknown-linux-gnu-'
+    interpreter='/lib/ld-musl-riscv64.so.1' if arch=='riscv' else '/lib/ld-musl-loongarch64.so.1'
+    destination = Path(output or ROOT / ('build/program-libc' if arch=='riscv' else 'build/loongarch/program-libc')).resolve()
     destination.mkdir(parents=True, exist_ok=True)
-    metadata = {'status': 'building', 'source': str(SOURCE), 'origin': ORIGIN,
+    metadata = {'arch':arch,'status': 'building', 'source': str(SOURCE), 'origin': ORIGIN,
                 'revision': REVISION, 'builder_sha256': digest(__file__),
                 'input_pins_sha256': digest(INPUTS),
                 'selected_input': PINS['preliminary_suite'],
@@ -53,8 +55,8 @@ def build(output=None, jobs=2, uapi_include=None):
         path = Path(path)
         item = {'source': str(path), 'destination': guest_path, 'sha256': digest(path)}
         if path.read_bytes()[:4] == b'\x7fELF':
-            headers = capture(['riscv64-linux-gnu-readelf', '-lW', path])
-            dynamic = capture(['riscv64-linux-gnu-readelf', '-dW', path])
+            headers = capture([prefix+'readelf', '-lW', path])
+            dynamic = capture([prefix+'readelf', '-dW', path])
             interpreter = re.search(r'Requesting program interpreter: ([^\]]+)\]', headers)
             item['interpreter'] = interpreter.group(1) if interpreter else None
             item['needed'] = re.findall(r'\(NEEDED\).*\[([^\]]+)\]', dynamic)
@@ -68,10 +70,10 @@ def build(output=None, jobs=2, uapi_include=None):
         if run(['git', '-C', SOURCE, 'cat-file', '-e', REVISION + '^{commit}'], 'check-revision') != 0:
             if run(['git', '-C', SOURCE, 'fetch', '--no-tags', 'origin', REVISION], 'fetch-revision') != 0:
                 raise RuntimeError('cannot restore the exact selected revision')
-        compiler = ROOT / 'build/riscv/musl-root/bin/musl-gcc'
+        compiler = ROOT / ('build/riscv/musl-root/bin/musl-gcc' if arch=='riscv' else 'build/loongarch/dynamic-dp-v2/root/bin/musl-gcc')
         musl = compiler.parent.parent
-        tools = [str(compiler), 'riscv64-linux-gnu-gcc', 'riscv64-linux-gnu-objcopy',
-                 'riscv64-linux-gnu-readelf', 'riscv64-linux-gnu-ld', 'make', 'tar', 'git']
+        tools = [str(compiler), prefix+'gcc', prefix+'objcopy',
+                 prefix+'readelf', prefix+'ld', 'make', 'tar', 'git']
         metadata['tools'] = {}
         for tool in tools:
             resolved = shutil.which(tool)
@@ -100,7 +102,7 @@ def build(output=None, jobs=2, uapi_include=None):
                                'static.txt', 'dynamic.txt', 'entry.c')}
         metadata['upstream_recipe_sha256'] = digest(source_copy / 'Makefile.sub')
         metadata['upstream_runner_sha256'] = digest(source_copy / 'scripts/libctest/libctest_testcode.sh')
-        flags = []
+        flags = [] if arch=='riscv' else ['-march=loongarch64','-mabi=lp64d','-mdouble-float','-mno-lsx','-mno-lasx','-Wl,-z,max-page-size=16384']
         if run([compiler, '-fno-link-libatomic', '-E', '-x', 'c', '/dev/null'], 'compiler-probe') == 0:
             flags.append('-fno-link-libatomic')
         if uapi_include is not None:
@@ -109,14 +111,14 @@ def build(output=None, jobs=2, uapi_include=None):
                 raise RuntimeError('UAPI include directory missing')
             flags += ['-idirafter', str(include)]
         cc = shlex.join([str(compiler), *flags])
-        ldflags = '-Os -s -lpthread -lm -lrt -Wl,--dynamic-linker=/lib/ld-musl-riscv64.so.1'
-        configuration = {'CC': cc, 'PREFIX': 'riscv64-linux-gnu-', 'LDFLAGS': ldflags}
+        ldflags = '-Os -s -lpthread -lm -lrt -Wl,--dynamic-linker='+interpreter
+        configuration = {'CC': cc, 'PREFIX': prefix, 'LDFLAGS': ldflags}
         metadata['configuration'] = configuration
         metadata['configuration_sha256'] = hashlib.sha256(json.dumps(configuration, sort_keys=True).encode()).hexdigest()
         metadata['source_changes'] = []
         metadata['adaptations'] = [
             'Use existing musl 1.2.5 wrapper and supported -fno-link-libatomic toolchain flag.',
-            'Set PT_INTERP to /lib/ld-musl-riscv64.so.1 instead of the build-host install prefix.',
+            'Set PT_INTERP to '+interpreter+' instead of the build-host install prefix.',
         ]
         command = ['make', '-C', source, '-j' + str(jobs), 'disk',
                    *[key + '=' + value for key, value in configuration.items()]]
@@ -130,7 +132,7 @@ def build(output=None, jobs=2, uapi_include=None):
             program = source / ('entry-' + kind + '.exe')
             info = artifact(program, '/' + program.name)
             if (kind == 'static' and info['interpreter'] is not None) or (
-                kind == 'dynamic' and info['interpreter'] != '/lib/ld-musl-riscv64.so.1'):
+                kind == 'dynamic' and info['interpreter'] != interpreter):
                 raise RuntimeError('unexpected program interpreter for ' + kind)
             entries = (source / (kind + '.txt')).read_text().splitlines()
             expected_commands = ['./runtest.exe -w ' + program.name + ' ' +
@@ -155,7 +157,7 @@ def build(output=None, jobs=2, uapi_include=None):
             artifact(shared_object, '/lib/' + shared_object.name)
             artifact(shared_object, '/' + shared_object.name)
         artifact(musl / 'lib/libc.so', '/lib/libc.so')
-        artifact(musl / 'lib/libc.so', '/lib/ld-musl-riscv64.so.1')
+        artifact(musl / 'lib/libc.so', interpreter)
         metadata['counts'] = {kind: sum(case['suite'] == 'libc-' + kind for case in metadata['cases'])
                               for kind in ('static', 'dynamic')}
         for kind in ('static', 'dynamic'):
@@ -189,11 +191,12 @@ def build(output=None, jobs=2, uapi_include=None):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--arch', choices=('riscv','loongarch'),default='riscv')
     parser.add_argument('--output', type=Path)
     parser.add_argument('--jobs', type=int, default=2)
     parser.add_argument('--uapi-include', type=Path)
     args = parser.parse_args()
-    result = build(args.output, args.jobs, args.uapi_include)
+    result = build(args.output, args.jobs, args.uapi_include,args.arch)
     print(json.dumps({'status': result['status'], 'counts': result.get('counts'),
                       'failures': result['failures']}, indent=2))
     raise SystemExit(0 if result['status'] == 'built' else 1)
