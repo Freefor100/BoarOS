@@ -1804,3 +1804,5 @@ test-writeback-batch-riscv:
 .PHONY: test-readahead-riscv
 test-readahead-riscv:
 	python3 -B tests/readahead-riscv.py
+
+include arch/loongarch/build.mk

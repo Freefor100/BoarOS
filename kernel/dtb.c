@@ -164,7 +164,7 @@ static enum dtb_status read_memory_reg(const unsigned char *value,
                                        uint32_t length,
                                        uint32_t address_cells,
                                        uint32_t size_cells,
-                                       struct dtb_memory_range *range,
+                                       struct dtb_boot_info *info,
                                        int *found)
 {
     uint32_t tuple_cells = address_cells + size_cells;
@@ -179,10 +179,17 @@ static enum dtb_status read_memory_reg(const unsigned char *value,
         uint64_t size = read_cells(value + offset + address_cells * 4U,
                                    size_cells);
 
-        if (!*found && size != 0U) {
-            range->base = read_cells(value + offset, address_cells);
-            range->size = size;
-            *found = 1;
+        if (size != 0U) {
+            uint64_t base = read_cells(value + offset, address_cells);
+            if (base > UINT64_MAX - size) return DTB_STATUS_INVALID;
+            if (info->memory_count == DTB_MAX_MEMORY_RANGES)
+                return DTB_STATUS_UNSUPPORTED;
+            struct dtb_memory_range range = {base, size};
+            info->memories[info->memory_count++] = range;
+            if (!*found) {
+                info->memory = range;
+                *found = 1;
+            }
         }
     }
 
@@ -836,7 +843,7 @@ enum dtb_status dtb_read_boot_info(const void *dtb,
                                          memory_reg_length,
                                          address_cells,
                                          size_cells,
-                                         &result.memory,
+                                         &result,
                                          &found);
                 if (status != DTB_STATUS_OK) {
                     return status;

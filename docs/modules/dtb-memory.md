@@ -57,3 +57,11 @@ make test-riscv
 `dtb_read_irq_info(dtb, boot_hart, ...)` 从固定 DTB 图解析 PLIC reg/ranges、CPU interrupt-controller phandle 与 `interrupts-extended` 的 supervisor context，并关联 VirtIO `interrupt-parent` 和 source。PLIC MMIO 进入最终高半区映射，交由 `arch/riscv/plic.c` claim/dispatch/complete；找不到启动 hart 的 S context 或路由越界时明确失败，不使用固定 IRQ/context 常数。见 `make test-dtb-riscv test-block-riscv test-io-sleep-riscv`。
 
 IRQ discovery additionally selects one enabled `ns16550a`/`ns16550` UART, translates its `reg` through parent buses and requires a valid PLIC parent/source plus nonzero `clock-frequency`. `reg-shift` defaults to zero and `reg-io-width` to one; supported layouts use shift 0–4 and width 1 or aligned width 4, with all eight registers inside the range. Unsupported endian/layout, missing clock/route and multiple UARTs are rejected; failure leaves the caller snapshot unchanged. This discovery has no hardware side effects. The UART fixture exercises the real parser without QEMU. Fixed board description: `references/qemu/hw/riscv/virt.c`, v11.1.0 commit `84f07211cc5b4fc6a371559bf8a5de4fb068e648` (`create_fdt_uart`).
+
+## 不连续 RAM（2026-10-06）
+
+`dtb_boot_info.memory` 保留首个非空 bank；新增 `memory_count` 和
+`memories[DTB_MAX_MEMORY_RANGES]` 保存所有非空 memory reg，最多16段。
+地址加长度溢出拒绝为INVALID，超过容量为UNSUPPORTED；不把平台MMIO洞当RAM。
+原RV入口继续使用首段，LA平台按物理地址排序并扣除boot信息、DTB、内核及
+DTB保留区后交给分配器。`make test-dtb-riscv` 验证两个不连续bank和原解析契约。
