@@ -128,7 +128,10 @@ def run(args,profile,platform,memory,transport,mode):
                     assert b'rng: unready' in log and b'rng: waiter ready' not in log
                     connection.sendall(bytes(i%251 for i in range(total)));released=True
             if guest.poll() is not None:break
-        guest.wait(timeout=2);output=log.decode(errors='replace')
+        guest.wait(timeout=2)
+        # process exit does not consume bytes already buffered in the stdout pipe.
+        log.extend(guest.stdout.read());(work/'guest.log').write_bytes(log)
+        output=log.decode(errors='replace')
         assert not guest.returncode and 'fatal' not in output,output
         assert all(marker in output for marker in args.marker),output
         if platform=='Linux':assert ('Linux '+('LA' if profile.name=='loongarch' else 'RV')+' root application passed') in output,output

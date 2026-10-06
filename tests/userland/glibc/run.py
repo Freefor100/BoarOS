@@ -14,6 +14,8 @@ import tempfile
 from profiles import checked_inputs
 
 ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0,str(ROOT/'tests'))
+from arch_profiles import PROFILES
 HERE = Path(__file__).resolve().parent
 BUILD = ROOT / "build/riscv/glibc"
 INTERPRETER = "/lib/ld-linux-riscv64-lp64d.so.1"
@@ -198,7 +200,7 @@ def main():
     args = parser.parse_args()
     la=args.arch=='loongarch'
     args.kernel=args.kernel or ROOT/('kernel-la' if la else 'kernel-rv')
-    args.qemu=args.qemu or ('build/qemu-la/qemu-system-loongarch64' if la else os.environ.get('QEMU_RISCV64','qemu-system-riscv64'))
+    args.qemu=args.qemu or (PROFILES[args.arch].qemu if la else os.environ.get('QEMU_RISCV64',PROFILES[args.arch].qemu))
     BUILD=ROOT/('build/loongarch/glibc' if la else 'build/riscv/glibc')
     inputs = checked_inputs(args.arch)
     INTERPRETER=inputs.get('interpreter',INTERPRETER)

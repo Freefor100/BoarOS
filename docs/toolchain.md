@@ -62,7 +62,8 @@ loongarch64-linux-gnu-gcc \
 `/opt/loongarch64-tools/bin/`，二进制 SHA-256 为
 `93ffc1acbb540affea06c1c986a1f3869a48383a7fba849710cfe20e8fdd4cd0`。
 PATH 没有 LA QEMU，`make prepare-la-tools` 从固定 QEMU v11.1.0 源码构建
-`build/qemu-la/qemu-system-loongarch64`；`make prepare-la-linux` 用相同LA GCC
+带固定RTC补丁的 `build/qemu-la-rtc/qemu-system-loongarch64`，原版通过
+`make prepare-la-original-tools` 保留在 `build/qemu-la`；`make prepare-la-linux` 用相同LA GCC
 构建固定 Linux 的16KiB/三级页表initramfs对照，保存于 `build/linux-la`。
 来源commit、配置与命令见[LA首阶段](modules/loongarch-boot.md)和
 [输入身份](learning/loongarch-bringup.md)。两种缓存由prune保留，日志与运行镜像清除。
