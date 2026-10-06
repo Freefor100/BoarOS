@@ -2,7 +2,7 @@
 
 ## 入口与对象
 
-`kernel/syscall/socket.c` 导入 RV64 Linux socket 参数和用户指针，`fs/files/socket.c` 把 socket 作为普通 fd/OFD 安装并在失败时回滚，`net/socket.c` 持有 endpoint、数据包、待 accept 队列及等待队列。`fs/open_file.c` 在最后一个真实 OFD 引用消失时销毁 socket；dup、fork 和 syscall 期间的 pin 共享同一 endpoint，close/exec/退出均沿既有 fd 生命周期回收。`fs/files/io.c` 把普通 read/write/readv/writev 接到 socket 队列，pread/pwrite/lseek 返回 `ESPIPE`，`fstat` 标识 `S_IFSOCK`，poll/select/epoll 读取 socket 就绪和等待队列。
+`kernel/syscall/socket.c` 导入 RV64/LA64 Linux socket 参数和用户指针，`fs/files/socket.c` 把 socket 作为普通 fd/OFD 安装并在失败时回滚，`net/socket.c` 持有 endpoint、数据包、待 accept 队列及等待队列。`fs/open_file.c` 在最后一个真实 OFD 引用消失时销毁 socket；dup、fork 和 syscall 期间的 pin 共享同一 endpoint，close/exec/退出均沿既有 fd 生命周期回收。`fs/files/io.c` 把普通 read/write/readv/writev 接到 socket 队列，pread/pwrite/lseek 返回 `ESPIPE`，`fstat` 标识 `S_IFSOCK`，poll/select/epoll 读取 socket 就绪和等待队列。
 
 协议实现来自官方 lwIP `STABLE-2_2_1_RELEASE` raw API，位于 `third_party/lwip/`；固定资料和许可证见 `references/README.md`、`references/sources.tsv` 与 `third_party/lwip/COPYING`。IPv4 重组有本地所有权和边界修补，具体范围见[第三方组件](../third-party.md)。本地移植层是 `net/lwip_port/`，使用 `NO_SYS=1`；loopback 与物理接口共用协议池。生产预算为 8 MSS/池 4 倍/堆 2 倍：UDP PCB 16、TCP active 32、listen 16、segment 512、pbuf header/pool 各 256、协议堆 512 KiB。BoarOS socket、接收/accept 队列节点及 OFD 使用 kernel_heap。PCB 池耗尽映射 `ENOMEM`，创建失败不留下 OFD；分配器 `STATE` 和错误释放是 fatal 不变量。
 
@@ -266,3 +266,8 @@ TCP 的 27 组窗口/池/堆候选由 `BOAROS_LWIP_WINDOW_MSS`、`BOAROS_LWIP_PO
 `tests/network-budget-selftest.py` 用临时头文件默认值漂移验证门禁会失败。
 
 阶段七已完成 TCP 27 组预算的发布筛选、30 项组合扩展与独立 COST 诊断；当时默认为 8/1/1。用户依据近池与 1/10 ms 结果批准改为 8/4/2，保留 8 MSS 和 32 PCB。历史默认的吞吐回退、全局池/堆饱和和 8/4/2 的有限负载收益保留在[实验报告](../learning/data-path-budget-experiments.md#正式匹配结果2026-10-06)，不重跑完整矩阵，也不将预算调整宣称为单连接吞吐保证。
+
+共用Ethernet的入口为`kernel_network_start(owner, heap, device, frequency)`。device
+由平台/root持有，网络层仅借用；NULL创建独立timer-only worker。正常停止先
+禁止新发布、join，确认DMA停止后清理netif并归还TX/RX引用，再释放网络控制对象；
+平台随后销毁device/transport。LA真实PCI与无NIC双侧结果见[net模块](riscv-virtio-net.md)。

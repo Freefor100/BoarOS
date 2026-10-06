@@ -353,3 +353,11 @@ enum arch_mmu_status arch_mmu_user_resolve_cow(struct arch_mmu_user_space *s,uin
     if (perms&ARCH_MMU_EXECUTE) arch_mmu_sync_instructions();
     return ARCH_MMU_STATUS_OK;
 }
+
+int arch_dma_image_address(uint64_t address,uint64_t size,uint64_t *physical)
+{
+    extern unsigned char __kernel_start[],__kernel_end[];
+    uint64_t start=(uintptr_t)__kernel_start,end=(uintptr_t)__kernel_end;
+    if(!physical || !size || address<start || address>=end || size>end-address)return 0;
+    return arch_direct_map_va_to_pa(address,size,physical)==ARCH_DIRECT_MAP_STATUS_OK;
+}

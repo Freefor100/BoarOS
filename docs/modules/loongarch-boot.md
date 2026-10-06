@@ -15,6 +15,8 @@ make test-la-userland-host      # 缓存输入/完整安装树的9个拒绝反�
 make test-loongarch-boot        # 512 MiB/1 GiB 启动与后续契约
 make test-boot-random-loongarch # DTB材料可用、可信熵仍为零，两种RAM
 make test-rng-loongarch        # 同ELF双侧、两种RAM、四种真实PCI RNG模式
+make test-network-external-loongarch # 同ELF、实际PCI收发与原BusyBox HTTP
+make test-net-failures-loongarch      # DMA/IRQ/worker/reset失败及BAR回收
 make test-rng-failures-loongarch # DMA/任务/栈OOM、IRQ登记失败与回收
 make test-loongarch             # 同时准备固定 Linux，对照同一个用户 ELF
 make test-stack-usage-la
@@ -225,3 +227,9 @@ FP/SIMD旧历史范围中的FP限制已由标量FPU阶段解除；SIMD、glibc�
 
 本轮RV完整架构、原静态/动态用户态、五种glibc、1366条ABI、栈检查，以及SQLite
 DELETE/WAL多进程和重启回归通过；NBD全恢复矩阵和LA原SQLite应用本轮未跑。
+
+共用net核心和Ethernet已接入LA现代PCI。root枚举device1、持有BAR和device，
+网络层借用它；missing NIC仍有timer worker保障loopback与AF_UNIX。块addr1、
+net addr5、RNG addr9的共享INTx是测试输入，生产扫描不依赖槽位。真实TAP、
+九类失败与资源证据见[net模块](riscv-virtio-net.md)。TTY UART IRQ、RTC、
+AF_UNIX sendfile计费差异及更广原程序尚在本轮计划内，不能声明LA/RV全面等价。

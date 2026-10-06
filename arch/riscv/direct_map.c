@@ -72,3 +72,6 @@ enum riscv_direct_map_status riscv_image_va_to_pa(
     *physical_address = virtual_address - image_load_offset;
     return RISCV_DIRECT_MAP_STATUS_OK;
 }
+
+int arch_dma_image_address(uint64_t address,uint64_t size,uint64_t *physical)
+{ return riscv_image_va_to_pa(address,size,physical)==RISCV_DIRECT_MAP_STATUS_OK; }

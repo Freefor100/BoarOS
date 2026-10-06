@@ -14,9 +14,33 @@
 #include <kernel/open_file.h>
 #include <kernel/procfs.h>
 #include <kernel/shm.h>
+#include <kernel/errno.h>
 
 #include <stddef.h>
 #include <stdint.h>
+
+int riscv_root_boot_start_network(struct riscv_root_boot *root,
+    const struct dtb_boot_info *info,const struct dtb_irq_info *irq)
+{
+    for(unsigned i=0;i<info->virtio_mmio_count;i++) {
+        volatile uint32_t *mmio=(void *)(uintptr_t)(RISCV_KERNEL_MMIO_BASE+info->virtio_mmio[i].base);
+        if(info->virtio_mmio[i].size<0x108 || mmio[0]!=0x74726976 || mmio[2]!=1)continue;
+        uint32_t source=0;
+        for(unsigned j=0;j<irq->route_count;j++)if(irq->routes[j].base==info->virtio_mmio[i].base)source=irq->routes[j].source;
+        if(!source)return -KERNEL_EIO;
+        int error=riscv_virtio_mmio_net_init(&root->net_device,mmio,info->virtio_mmio[i].size,
+            root->heap.page_allocator,info->timebase_frequency,source);
+        if(error)return error;
+        break;
+    }
+    return kernel_network_start(&root->network,&root->heap,
+        root->net_device.configured ? &root->net_device : 0,info->timebase_frequency);
+}
+static int stop_network(struct riscv_root_boot *root)
+{
+    int error=kernel_network_stop(&root->network);
+    return error ? error : virtio_net_stop(&root->net_device);
+}
 
 int riscv_root_boot_start_rng(struct riscv_root_boot *root,
     const struct dtb_boot_info *info, const struct dtb_irq_info *irq)
@@ -125,7 +149,7 @@ enum riscv_root_boot_status riscv_root_boot_cleanup(
     }
     if (riscv_virtio_mmio_rng_stop(&root->rng))
         return RISCV_ROOT_BOOT_STATUS_CLEANUP;
-    if (kernel_network_stop(&root->network))
+    if (stop_network(root))
         return RISCV_ROOT_BOOT_STATUS_CLEANUP;
     if ((root->cleanup_files.state == KERNEL_FILES_LIVE ||
          root->cleanup_files.state == KERNEL_FILES_CLEANUP) &&
@@ -541,7 +565,7 @@ enum riscv_root_boot_status riscv_root_boot_finish(
     root->finish_failure = RISCV_ROOT_FINISH_NONE;
     root->finish_error = 0;
     int had_network = root->network != 0;
-    error = kernel_network_stop(&root->network);
+    error = stop_network(root);
     if (error) {
         root->finish_failure = RISCV_ROOT_FINISH_NETWORK;
         root->finish_error = error;

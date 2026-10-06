@@ -164,6 +164,7 @@ C_SOURCES := \
 	drivers/virtio/mmio.c \
 	arch/riscv/virtio_mmio_rng.c \
 	drivers/virtio/rng.c \
+	drivers/virtio/net.c \
 	arch/riscv/virtio_mmio_net.c \
 	arch/riscv/plic.c \
 	fs/lwext4_port.c \
@@ -282,6 +283,7 @@ TEST_RUNTIME_C_SOURCES := \
 	drivers/virtio/mmio.c \
 	arch/riscv/virtio_mmio_rng.c \
 	drivers/virtio/rng.c \
+	drivers/virtio/net.c \
 	arch/riscv/virtio_mmio_net.c \
 	arch/riscv/plic.c \
 	fs/files/table.c \

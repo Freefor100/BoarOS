@@ -65,7 +65,7 @@ def prepare(args):
         if not compiler['target'].startswith('loongarch64'):
             raise SystemExit('Linux LA requires a LoongArch64 compiler')
         command = ['make', '-C', str(source), f'O={directory}', 'ARCH=loongarch',
-                   f'CROSS_COMPILE={args.cross}']
+                   f'CROSS_COMPILE={compiler["path"][:-3]}']
         configuration = directory / '.config'
         if recorded and 'configuration_sha256' in recorded:
             if not configuration.exists() or hashlib.sha256(configuration.read_bytes()).hexdigest() != recorded['configuration_sha256']:

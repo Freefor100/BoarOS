@@ -36,6 +36,16 @@ int user_main(uint64_t *stack)
         long child=call(220,17,0,0,0,0,0);
         if(child==0) {
             if(call(51,(long)"/root",0,0,0,0,0) || call(49,(long)"/",0,0,0,0,0)) call(93,98,0,0,0,0,0);
+#ifdef ROOT_NETWORK_SETUP
+            if(call(34,-100,(long)"/proc",0755,0,0,0)<0 ||
+               call(40,(long)"proc",(long)"/proc",(long)"proc",0,0,0)) call(93,97,0,0,0,0,0);
+            long socket=call(198,2,2,0,0,0,0);
+            struct {char name[16];unsigned short flags;unsigned char rest[22];} interface={.name="lo"};
+            if(socket<0 || call(29,socket,0x8913,(long)&interface,0,0,0)) call(93,96,0,0,0,0,0);
+            interface.flags|=1;
+            if(call(29,socket,0x8914,(long)&interface,0,0,0)) call(93,96,0,0,0,0,0);
+            call(57,socket,0,0,0,0,0);
+#endif
             const char *argv[]={"/init",0},*env[]={0};
             call(221,(long)"/init",(long)argv,(long)env,0,0,0);call(93,99,0,0,0,0,0);
             for(;;){}
@@ -43,6 +53,9 @@ int user_main(uint64_t *stack)
         int status=-1;
         if(call(260,child,(long)&status,0,0,0,0)!=child || status!=(EXPECTED_EXIT_STATUS<<8)) failed=1;
     }
+#ifdef ROOT_NETWORK_SETUP
+    if(call(39,(long)"/root/proc",0,0,0,0,0)) failed=1;
+#endif
     /* reboot 不替 init checkpoint 根盘；先卸载才能直接核对宿主 home blocks。 */
     if(call(39,(long)"/root",0,0,0,0,0)) failed=1;
     puts(failed ? "Linux " ROOT_ARCH_LABEL " root application failed\n" : "Linux " ROOT_ARCH_LABEL " root application passed\n");

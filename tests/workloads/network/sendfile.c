@@ -152,10 +152,12 @@ static void outputs(int in)
     memset(data, 'p', sizeof(data)); size_t filled = 0; ssize_t got;
     while ((got = write(pipes[1], data, sizeof(data))) > 0) filled += (size_t)got;
     CHECK(errno == EAGAIN);
-    CHECK(read(pipes[0], data, 4096) == 4096 && lseek(in, 0, SEEK_SET) == 0);
+    /* Linux pipe slots are page sized; release a whole target page before refill. */
+    long page = sysconf(_SC_PAGESIZE); CHECK(page > 0 && (size_t)page < sizeof(data));
+    CHECK(read(pipes[0], data, (size_t)page) == page && lseek(in, 0, SEEK_SET) == 0);
     sent = sendfile(pipes[1], in, NULL, sizeof(data)); CHECK(sent > 0 && sent < (ssize_t)sizeof(data));
     CHECK(lseek(in, 0, SEEK_CUR) == sent);
-    for (size_t remaining = filled - 4096; remaining > 0;) {
+    for (size_t remaining = filled - (size_t)page; remaining > 0;) {
         size_t wanted = remaining > sizeof(data) ? sizeof(data) : remaining;
         got = read(pipes[0], data, wanted); CHECK(got > 0);
         for (ssize_t i = 0; i < got; i++) CHECK(data[i] == 'p');

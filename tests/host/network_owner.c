@@ -35,12 +35,12 @@ int kernel_random_available(void) { return 0; }
 enum kernel_random_status kernel_random_fill(void *buffer, size_t size)
 { (void)buffer; (void)size; abort(); }
 
-enum riscv_direct_map_status riscv_image_va_to_pa(uint64_t address, uint64_t size, uint64_t *physical)
-{ (void)size; *physical = address; return dma_eligible ? RISCV_DIRECT_MAP_STATUS_OK : RISCV_DIRECT_MAP_STATUS_INVALID; }
-int riscv_virtio_mmio_net_send_segments(struct riscv_virtio_mmio_net *device,
-    const struct riscv_net_tx_segment *segments, unsigned count, void *owner)
+int arch_dma_image_address(uint64_t address, uint64_t size, uint64_t *physical)
+{ (void)size; *physical = address; return dma_eligible; }
+int virtio_net_send_segments(struct virtio_net_device *device,
+    const struct virtio_net_tx_segment *segments, unsigned count, void *owner)
 { (void)device; CHECK(segments && count && owner); ++segment_attempts; return -KERNEL_ENOTSUP; }
-int riscv_virtio_mmio_net_send_copy(struct riscv_virtio_mmio_net *device, uint32_t size,
+int virtio_net_send_copy(struct virtio_net_device *device, uint32_t size,
     int (*copy)(const void *, void *, uint32_t), const void *context)
 {
     (void)device; ++copy_attempts;
@@ -60,7 +60,8 @@ static void copy_capacity(unsigned eligible)
 {
     uintptr_t irq = kernel_socket_protocol_enter();
     kernel_socket_network_initialize();
-    struct kernel_network network = {0};
+    struct virtio_net_device device = {0};
+    struct kernel_network network = {.device=&device};
     ip4_addr_t local, mask, gateway;
     IP4_ADDR(&local, 10, 77, 0, 2); IP4_ADDR(&mask, 255, 255, 255, 0); ip4_addr_set_zero(&gateway);
     CHECK(netif_add(&network.interface, &local, &mask, &gateway, &network, physical_init, ip_input));

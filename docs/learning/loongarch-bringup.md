@@ -330,3 +330,25 @@ core缓存。vCPU未执行时NOP掉固件seed并核对内存写回，两侧相�
 16例通过，生产种子策略不变，详见[随机资料](random-source.md)。
 新增standalone fixture依赖文件还暴露GNU make的隐式`.d.o`链接尝试，编号stem
 会变成`0.d`并产生错误日志；依赖文件现显式声明由编译器生成，禁用该隐式重造。
+
+## 共用net与LA真实PCI（2026-10-07）
+
+net迁入共用transport/split queue后，descriptor资格与业务缓冲仍分开。平台
+持有PCI/BAR/device，Ethernet只借用：worker join不代表DMA停止，必须确认reset
+后才能归还在途SG owner。core stop也检查TX owner、RX loan与CPU lease；reset
+拒绝时原字段保持，不能由上层释放BAR。真实九类失败×两种RAM回到基线，
+宿主ASan模型另验证在途SG反例与确认后只释放一次。
+
+原版固定BusyBox输入来自`references/oscomp-autotest` commit
+`b5ec6ef8497e1818cbdec3b54bb722f036e57972`；LA使用既有完整配置静态LP64S缓存。
+TAP程序ELF SHA-256 `91d9980f16276ae1babe0683e1de7947f8eced3e14180cfc4e9291496952183d`
+在Linux/BoarOS两种RAM运行，原HTTP/CGI和五连接内容、UDP分片/压力、loan上限、
+SG和共享IRQ及真实根owner均通过。执行时间只记录为功能运行资料，未做性能匹配。
+
+16KiB另外暴露了测试与ABI两种问题。固定`references/linux` commit
+`f4cdf7ca9a1fdcca413157df19753f388a5a224e`的`fs/pipe.c`按PAGE_SIZE分配pipe槽；
+sendfile测试读走4KiB不能保证释放LA的槽，故仅该页边界改用sysconf页大小。
+`fs/splice.c::splice_to_socket`每批16个bvec，RV最多64KiB而LA最多256KiB；
+现有BoarOS AF_UNIX固定64KiB成本边界因而与LA的65537字节单datagram不同。
+这需要发送者缓存计费与消息上限的真实修复，用户已选择Linux模型；既有RV接收
+配额成本用例也要重验。不能允许两种消息边界都成功来遮住可观察差异。
