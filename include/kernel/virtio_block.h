@@ -2,6 +2,7 @@
 #define BOAROS_KERNEL_VIRTIO_BLOCK_H
 
 #include <kernel/block.h>
+#include <kernel/virtio_split_queue.h>
 #include <kernel/physical_page.h>
 #include <kernel/scheduler.h>
 
@@ -36,55 +37,16 @@ struct virtio_block_statistics {
     uint64_t inflight_ticks, busy_ticks, total_ticks, queue_wait_ticks, service_ticks;
 };
 
-/* Semantic VirtIO operations; register widths and bus offsets belong to transport. */
-enum virtio_block_register {
-    VIRTIO_BLOCK_REG_STATUS,
-    VIRTIO_BLOCK_REG_DEVICE_FEATURES_SEL,
-    VIRTIO_BLOCK_REG_DEVICE_FEATURES,
-    VIRTIO_BLOCK_REG_DRIVER_FEATURES_SEL,
-    VIRTIO_BLOCK_REG_DRIVER_FEATURES,
-    VIRTIO_BLOCK_REG_QUEUE_SEL,
-    VIRTIO_BLOCK_REG_QUEUE_NUM_MAX,
-    VIRTIO_BLOCK_REG_QUEUE_NUM,
-    VIRTIO_BLOCK_REG_QUEUE_READY,
-    VIRTIO_BLOCK_REG_GUEST_PAGE_SIZE,
-    VIRTIO_BLOCK_REG_QUEUE_ALIGN,
-    VIRTIO_BLOCK_REG_QUEUE_PFN,
-    VIRTIO_BLOCK_REG_QUEUE_NOTIFY,
-    VIRTIO_BLOCK_REG_QUEUE_DESC_LOW,
-    VIRTIO_BLOCK_REG_QUEUE_DESC_HIGH,
-    VIRTIO_BLOCK_REG_QUEUE_DRIVER_LOW,
-    VIRTIO_BLOCK_REG_QUEUE_DRIVER_HIGH,
-    VIRTIO_BLOCK_REG_QUEUE_DEVICE_LOW,
-    VIRTIO_BLOCK_REG_QUEUE_DEVICE_HIGH,
-    VIRTIO_BLOCK_REG_CONFIG_GENERATION,
-    VIRTIO_BLOCK_REG_CONFIG,
-    VIRTIO_BLOCK_REG_CAPACITY_HIGH
-};
-struct virtio_block_transport_ops {
-    uint32_t (*read)(void *,enum virtio_block_register);
-    void (*write)(void *,enum virtio_block_register,uint32_t);
-    /* Snapshot and acknowledge before the used-ring snapshot. PCI ISR is read-to-clear. */
-    uint32_t (*ack_interrupt)(void *);
-    int (*register_irq)(void *,uint32_t,void (*)(void *),void *);
-    void (*unregister_irq)(void *,uint32_t,void *);
-};
-struct virtio_block_transport {
-    void *context;
-    const struct virtio_block_transport_ops *ops;
-    uint32_t version; /* 1 legacy split ring; 2 modern VERSION_1. */
-};
-
 struct virtio_block_device {
     struct kernel_block_device block;
     struct physical_page_allocator *page_allocator;
     virtio_dma_address_fn dma_address;
-    struct virtio_block_transport transport;
+    struct virtio_transport transport;
     void *queue_memory;
     uint64_t queue_physical_address;
     uint64_t timeout_ticks;
     uint16_t queue_size;
-    uint16_t last_used_index;
+    struct virtio_split_queue queue;
     uint32_t transport_version;
     uint32_t queue_allocation_order;
     uint32_t state;
@@ -96,7 +58,7 @@ struct virtio_block_device {
 };
 
 enum virtio_block_status virtio_block_init(struct virtio_block_device *,
-    const struct virtio_block_transport *, struct physical_page_allocator *,
+    const struct virtio_transport *, struct physical_page_allocator *,
     virtio_dma_address_fn, uint32_t);
 int virtio_block_enable_irq(struct virtio_block_device *,uint32_t);
 enum virtio_block_status virtio_block_destroy(struct virtio_block_device *);

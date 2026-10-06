@@ -51,50 +51,12 @@
 #define VIRTIO_BLOCK_STATE_FAILED UINT32_C(0x56464149)
 #define VIRTIO_BLOCK_STATE_DESTROYED UINT32_C(0x56444541)
 
-struct virtq_descriptor {
-    uint64_t address;
-    uint32_t length;
-    uint16_t flags;
-    uint16_t next;
-};
-
-struct virtq_available {
-    uint16_t flags;
-    uint16_t index;
-    uint16_t ring[VIRTIO_QUEUE_SIZE];
-    uint16_t used_event;
-};
-
-struct virtq_used_element {
-    uint32_t id;
-    uint32_t length;
-};
-
-struct virtq_used {
-    uint16_t flags;
-    uint16_t index;
-    struct virtq_used_element ring[VIRTIO_QUEUE_SIZE];
-    uint16_t available_event;
-};
-
 struct virtio_block_request_header {
     uint32_t type;
     uint32_t reserved;
     uint64_t sector;
 } __attribute__((packed));
 
-_Static_assert(sizeof(struct virtq_descriptor) == 16U,
-               "VirtIO descriptor layout must match the specification");
-/* ring 已按协议对齐；packed 会把 RV64 的共享 idx 拆成字节访问，进位时可被 DMA 撕裂。 */
-_Static_assert(offsetof(struct virtq_available, index) == 2U &&
-               offsetof(struct virtq_available, ring) == 4U &&
-               _Alignof(struct virtq_available) >= 2U,
-               "available index must be naturally aligned");
-_Static_assert(offsetof(struct virtq_used, index) == 2U &&
-               offsetof(struct virtq_used, ring) == 4U &&
-               sizeof(struct virtq_used_element) == 8U &&
-               _Alignof(struct virtq_used) >= 4U,
-               "used index and elements must be naturally aligned");
 struct block_request {
     struct virtio_block_request_header header;
     volatile unsigned char status;
@@ -126,7 +88,7 @@ static int legacy_transport(const struct virtio_block_device *device)
 }
 
 static uint32_t queue_avail_offset(const struct virtio_block_device *device)
-{ return device->queue_size * sizeof(struct virtq_descriptor); }
+{ return device->queue_size * sizeof(struct virtio_descriptor); }
 static uint32_t queue_used_offset(const struct virtio_block_device *device)
 {
     return legacy_transport(device) ? VIRTIO_LEGACY_QUEUE_USED_OFFSET :
@@ -157,10 +119,10 @@ static void block_hex(unsigned long value)
     do { digits[count++]="0123456789abcdef"[value&15];value>>=4; } while(value);
     while(count) kernel_console_putc(digits[--count]);
 }
-static uint32_t reg_read(const struct virtio_block_device *device,enum virtio_block_register reg)
-{ return device->transport.ops->read(device->transport.context,reg); }
-static void reg_write(struct virtio_block_device *device,enum virtio_block_register reg,uint32_t value)
-{ device->transport.ops->write(device->transport.context,reg,value); }
+static uint32_t reg_read(const struct virtio_block_device *device,enum virtio_register reg)
+{ return device->transport.ops.read(device->transport.context,reg); }
+static void reg_write(struct virtio_block_device *device,enum virtio_register reg,uint32_t value)
+{ device->transport.ops.write(device->transport.context,reg,value); }
 static void memory_barrier(void) { arch_dma_barrier(); }
 static uint64_t time_now(void) { return arch_time_read(); }
 
@@ -199,36 +161,23 @@ static void bytes_copy(void *destination,
     }
 }
 
-static void write_queue_address(struct virtio_block_device *device,
-                                enum virtio_block_register low_offset,
-                                enum virtio_block_register high_offset,
-                                uint64_t address)
-{
-    reg_write(device, low_offset, (uint32_t)address);
-    reg_write(device, high_offset, (uint32_t)(address >> 32U));
-}
-
 static void device_reset(struct virtio_block_device *device)
 {
-    reg_write(device, VIRTIO_BLOCK_REG_STATUS, 0U);
-    memory_barrier();
-    /* QEMU's MMIO reset is synchronous. Do not return a borrowed DMA buffer
-     * or release a queue if the transport violates that reset contract. */
-    if (reg_read(device, VIRTIO_BLOCK_REG_STATUS) != 0U) {
+    /* QEMU synchronous reset must confirm before returning borrowed caller DMA. */
+    if (virtio_transport_reset(&device->transport) != VIRTIO_OK) __builtin_trap();
+    if (device->queue.size && virtio_split_reset(&device->queue, &device->transport) != VIRTIO_OK)
         __builtin_trap();
-    }
 }
 
 static enum virtio_block_status init_failure(
     struct virtio_block_device *device,
-    struct virtio_block_device *owner,
     enum virtio_block_status status,
     int reset,
     int release_queue)
 {
     if (reset) {
         reg_write(device,
-                     VIRTIO_BLOCK_REG_STATUS,
+                     VIRTIO_REG_STATUS,
                      VIRTIO_STATUS_FAILED);
         device_reset(device);
     }
@@ -238,13 +187,7 @@ static enum virtio_block_status init_failure(
                                         device->queue_physical_address,
                                         device->queue_allocation_order);
 
-        if (page_status != PHYSICAL_PAGE_STATUS_OK) {
-            device->state = VIRTIO_BLOCK_STATE_FAILED;
-            if (owner != 0) {
-                *owner = *device;
-            }
-            return VIRTIO_BLOCK_DRIVER_STATUS_STATE;
-        }
+        if (page_status != PHYSICAL_PAGE_STATUS_OK) __builtin_trap();
     }
     return status;
 }
@@ -252,60 +195,15 @@ static enum virtio_block_status init_failure(
 static enum virtio_block_status negotiate_features(
     struct virtio_block_device *device)
 {
-    uint32_t status = VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER;
-    uint32_t device_features_low;
-    uint32_t device_features_high;
-    uint32_t driver_features_low = 0U;
-
-    reg_write(device, VIRTIO_BLOCK_REG_STATUS, 0U);
-    reg_write(device,
-                 VIRTIO_BLOCK_REG_STATUS,
-                 VIRTIO_STATUS_ACKNOWLEDGE);
-    reg_write(device, VIRTIO_BLOCK_REG_STATUS, status);
-
-    reg_write(device, VIRTIO_BLOCK_REG_DEVICE_FEATURES_SEL, 0U);
-    device_features_low =
-        reg_read(device, VIRTIO_BLOCK_REG_DEVICE_FEATURES);
-    if ((device_features_low & VIRTIO_BLOCK_FEATURE_RO) != 0U) {
-        driver_features_low |= VIRTIO_BLOCK_FEATURE_RO;
-        device->read_only = 1U;
-    }
-    /* CONFIG_WCE is deliberately not negotiated: FLUSH then describes the
-     * writeback mode, and absence of FLUSH means write-through (Linux virtblk
-     * uses the same fallback). No configuration write can change that mode. */
-    device->block.cache_mode = KERNEL_BLOCK_CACHE_WRITETHROUGH;
-    if ((device_features_low & VIRTIO_BLOCK_FEATURE_FLUSH) != 0U) {
-        driver_features_low |= VIRTIO_BLOCK_FEATURE_FLUSH;
-        device->block.cache_mode = KERNEL_BLOCK_CACHE_WRITEBACK;
-    }
-
-    if (legacy_transport(device)) {
-        reg_write(device, VIRTIO_BLOCK_REG_DRIVER_FEATURES_SEL, 0U);
-        reg_write(device, VIRTIO_BLOCK_REG_DRIVER_FEATURES, driver_features_low);
-        return VIRTIO_BLOCK_DRIVER_STATUS_OK;
-    }
-
-    reg_write(device, VIRTIO_BLOCK_REG_DEVICE_FEATURES_SEL, 1U);
-    device_features_high =
-        reg_read(device, VIRTIO_BLOCK_REG_DEVICE_FEATURES);
-    if ((device_features_high & VIRTIO_FEATURE_VERSION_1_HIGH_MASK) == 0U) {
-        return VIRTIO_BLOCK_DRIVER_STATUS_UNSUPPORTED;
-    }
-
-    reg_write(device, VIRTIO_BLOCK_REG_DRIVER_FEATURES_SEL, 0U);
-    reg_write(device, VIRTIO_BLOCK_REG_DRIVER_FEATURES, driver_features_low);
-    reg_write(device, VIRTIO_BLOCK_REG_DRIVER_FEATURES_SEL, 1U);
-    reg_write(device,
-                 VIRTIO_BLOCK_REG_DRIVER_FEATURES,
-                 VIRTIO_FEATURE_VERSION_1_HIGH_MASK);
-
-    status |= VIRTIO_STATUS_FEATURES_OK;
-    reg_write(device, VIRTIO_BLOCK_REG_STATUS, status);
-    if ((reg_read(device, VIRTIO_BLOCK_REG_STATUS) &
-         VIRTIO_STATUS_FEATURES_OK) == 0U) {
-        return VIRTIO_BLOCK_DRIVER_STATUS_UNSUPPORTED;
-    }
-
+    uint64_t features;
+    enum virtio_status status = virtio_transport_begin(&device->transport,
+        VIRTIO_BLOCK_FEATURE_RO | VIRTIO_BLOCK_FEATURE_FLUSH, 0, &features);
+    if (status != VIRTIO_OK) return status == VIRTIO_UNSUPPORTED ?
+        VIRTIO_BLOCK_DRIVER_STATUS_UNSUPPORTED : VIRTIO_BLOCK_DRIVER_STATUS_DEVICE;
+    device->read_only = (features & VIRTIO_BLOCK_FEATURE_RO) != 0;
+    /* 不协商CONFIG_WCE：原FLUSH/write-through业务契约保持。 */
+    device->block.cache_mode = (features & VIRTIO_BLOCK_FEATURE_FLUSH) ?
+        KERNEL_BLOCK_CACHE_WRITEBACK : KERNEL_BLOCK_CACHE_WRITETHROUGH;
     return VIRTIO_BLOCK_DRIVER_STATUS_OK;
 }
 
@@ -314,21 +212,21 @@ static uint64_t read_capacity(struct virtio_block_device *device)
     uint32_t attempt;
 
     if (legacy_transport(device)) {
-        uint32_t low = reg_read(device, VIRTIO_BLOCK_REG_CONFIG);
-        uint32_t high = reg_read(device,
-                                    VIRTIO_BLOCK_REG_CAPACITY_HIGH);
+        uint32_t low, high;
+        if (virtio_transport_config_read(&device->transport, 0, 4, &low) != VIRTIO_OK ||
+            virtio_transport_config_read(&device->transport, 4, 4, &high) != VIRTIO_OK) return 0;
 
         return ((uint64_t)high << 32U) | low;
     }
 
     for (attempt = 0U; attempt < 8U; attempt++) {
         uint32_t generation_before =
-            reg_read(device, VIRTIO_BLOCK_REG_CONFIG_GENERATION);
-        uint32_t low = reg_read(device, VIRTIO_BLOCK_REG_CONFIG);
-        uint32_t high = reg_read(device,
-                                    VIRTIO_BLOCK_REG_CAPACITY_HIGH);
+            reg_read(device, VIRTIO_REG_CONFIG_GENERATION);
+        uint32_t low, high;
+        if (virtio_transport_config_read(&device->transport, 0, 4, &low) != VIRTIO_OK ||
+            virtio_transport_config_read(&device->transport, 4, 4, &high) != VIRTIO_OK) return 0;
         uint32_t generation_after =
-            reg_read(device, VIRTIO_BLOCK_REG_CONFIG_GENERATION);
+            reg_read(device, VIRTIO_REG_CONFIG_GENERATION);
 
         if (generation_before == generation_after) {
             return ((uint64_t)high << 32U) | low;
@@ -345,18 +243,18 @@ static void wake(struct kernel_wait_queue *queue)
 }
 static void diagnose_queue_fault(struct virtio_block_device *device,
     const char *reason, uint16_t used_index, uint16_t observed_count,
-    uint32_t pending, const struct virtq_used_element *item);
+    uint32_t pending, const struct virtio_used_element *item);
 static void fail_device(struct virtio_block_device *device, enum kernel_block_status result)
 {
     device->state = VIRTIO_BLOCK_STATE_FAILED;
     if (result == KERNEL_BLOCK_STATUS_TIMEOUT) {
-        volatile struct virtq_used *used = (void *)((unsigned char *)device->queue_memory + queue_used_offset(device));
+        volatile struct virtio_used_ring *used = (void *)((unsigned char *)device->queue_memory + queue_used_offset(device));
         uint16_t used_index = used->index;
         memory_barrier();
         /* 纯超时没有非法 used 项；reset 前仍需保留设备身份与在途 owner。 */
         diagnose_queue_fault(device, "timeout", used_index,
-            (uint16_t)(used_index - device->last_used_index),
-            device->transport.ops->ack_interrupt(device->transport.context), NULL);
+            (uint16_t)(used_index - device->queue.last_used),
+            device->transport.ops.ack_interrupt(device->transport.context), NULL);
         block_puts("BoarOS: block timeout; resetting device\n");
     }
     device_reset(device); /* No DMA owner is released before reset acknowledgement. */
@@ -389,9 +287,9 @@ static void queue_fault_scalar(const char *name, uint64_t value)
 
 static void diagnose_queue_fault(struct virtio_block_device *device,
     const char *reason, uint16_t used_index, uint16_t observed_count,
-    uint32_t pending, const struct virtq_used_element *item)
+    uint32_t pending, const struct virtio_used_element *item)
 {
-    volatile struct virtq_available *available = (void *)((unsigned char *)device->queue_memory + queue_avail_offset(device));
+    volatile struct virtio_available_ring *available = (void *)((unsigned char *)device->queue_memory + queue_avail_offset(device));
     unsigned reserved = 0, published = 0, complete = 0;
     for (unsigned i = 0; i < slot_count(device); i++) {
         unsigned state = request_at(device, i)->state;
@@ -403,7 +301,7 @@ static void diagnose_queue_fault(struct virtio_block_device *device,
     block_puts("BoarOS: block queue fault reason=");
     block_puts(reason);
     queue_fault_scalar(" transport_context=", (uintptr_t)device->transport.context);
-    queue_fault_scalar(" device_status=", reg_read(device, VIRTIO_BLOCK_REG_STATUS));
+    queue_fault_scalar(" device_status=", reg_read(device, VIRTIO_REG_STATUS));
     queue_fault_scalar(" interrupt=", pending);
     queue_fault_scalar(" transport=", device->transport_version);
     queue_fault_scalar(" queue=", (uintptr_t)device->queue_memory);
@@ -411,7 +309,7 @@ static void diagnose_queue_fault(struct virtio_block_device *device,
     queue_fault_scalar(" size=", device->queue_size);
     block_puts("\n");
     queue_fault_scalar(" used=", used_index);
-    queue_fault_scalar(" consumed=", device->last_used_index);
+    queue_fault_scalar(" consumed=", device->queue.last_used);
     queue_fault_scalar(" avail=", available->index);
     queue_fault_scalar(" observed_count=", observed_count);
     queue_fault_scalar(" inflight=", device->inflight);
@@ -421,7 +319,7 @@ static void diagnose_queue_fault(struct virtio_block_device *device,
     queue_fault_scalar(" complete=", complete);
     block_puts("\n");
     if (item != NULL) {
-        queue_fault_scalar(" item_index=", (uint16_t)(device->last_used_index - 1));
+        queue_fault_scalar(" item_index=", (uint16_t)(device->queue.last_used - 1));
         queue_fault_scalar(" id=", item->id);
         queue_fault_scalar(" length=", item->length);
         block_puts("\n");
@@ -443,26 +341,33 @@ static void diagnose_queue_fault(struct virtio_block_device *device,
 
 static void collect_used(struct virtio_block_device *device)
 {
-    uint32_t pending=device->transport.ops->ack_interrupt(device->transport.context);
+    uint32_t pending=device->transport.ops.ack_interrupt(device->transport.context);
     if (pending) arch_io_barrier();
-    volatile struct virtq_used *used = (void *)((unsigned char *)device->queue_memory + queue_used_offset(device));
-    uint16_t used_index = used->index;
-    uint16_t count = (uint16_t)(used_index - device->last_used_index);
-    uint16_t observed_count = count;
-    int completed = count != 0;
-    memory_barrier();
-    if (count > slot_count(device)) {
+    uint16_t used_index = device->queue.used->index;
+    uint16_t observed_count = (uint16_t)(used_index - device->queue.last_used);
+    int completed = observed_count != 0;
+    if (observed_count > slot_count(device)) {
         diagnose_queue_fault(device, "used-overflow", used_index, observed_count, pending, NULL);
         fail_device(device, KERNEL_BLOCK_STATUS_IO); return;
     }
-    while (count--) {
-        struct virtq_used_element item = used->ring[device->last_used_index++ % device->queue_size];
-        if (item.id % 3 || item.id / 3 >= slot_count(device) || !item.length) {
-            diagnose_queue_fault(device, "used-element", used_index, observed_count, pending, &item);
+    for (;;) {
+        struct virtio_completion completion;
+        enum virtio_status status = virtio_split_take(&device->queue, &completion);
+        if (status == VIRTIO_EMPTY) break;
+        if (status != VIRTIO_OK) {
+            const struct virtio_queue_fault *fault = &device->queue.fault;
+            struct virtio_used_element item = {fault->head, fault->length};
+            const char *reason = fault->reason == VIRTIO_QUEUE_OVERFLOW ? "used-overflow" :
+                fault->head % 3 || fault->head / 3 >= slot_count(device) || !fault->length ?
+                "used-element" : fault->reason == VIRTIO_QUEUE_BAD_LENGTH ? "used-length" : "slot-state";
+            diagnose_queue_fault(device, reason, used_index, observed_count, pending,
+                fault->reason == VIRTIO_QUEUE_OVERFLOW ? NULL : &item);
             fail_device(device, KERNEL_BLOCK_STATUS_IO); return;
         }
-        struct block_request *r = request_at(device, item.id / 3);
-        if (r->state != 2) {
+        struct virtio_used_element item = {completion.head, completion.length};
+        struct block_request *r = completion.token;
+        if (item.id % 3 || item.id / 3 >= slot_count(device) ||
+            r != request_at(device, item.id / 3) || r->state != 2) {
             diagnose_queue_fault(device, "slot-state", used_index, observed_count, pending, &item);
             fail_device(device, KERNEL_BLOCK_STATUS_IO); return;
         }
@@ -499,13 +404,13 @@ static void block_irq(void *owner)
     struct virtio_block_device *device = owner;
     device->statistics.interrupts++;
     if (device_live(device)) collect_used(device);
-    else (void)device->transport.ops->ack_interrupt(device->transport.context);
+    else (void)device->transport.ops.ack_interrupt(device->transport.context);
 }
 int virtio_block_enable_irq(struct virtio_block_device *device, uint32_t source)
 {
     if (!device_live(device) || device->active || device->irq_source ||
-        !device->transport.ops->register_irq || !device->transport.ops->unregister_irq ||
-        !device->transport.ops->register_irq(device->transport.context,source,block_irq,device)) return 0;
+        !device->transport.ops.register_irq || !device->transport.ops.unregister_irq ||
+        !device->transport.ops.register_irq(device->transport.context,source,block_irq,device)) return 0;
     device->irq_source = source;
     return 1;
 }
@@ -591,8 +496,7 @@ static enum kernel_block_status publish_request(struct virtio_block_device *devi
     if (!device_live(device)) { arch_interrupt_restore(irq); return KERNEL_BLOCK_STATUS_IO; }
     if (r->state != 1 || r->owner != kernel_io_context_current()) __builtin_trap();
     unsigned head = ((unsigned char *)r - (unsigned char *)request_at(device, 0)) / REQUEST_STRIDE * 3;
-    struct virtq_descriptor *d = device->queue_memory;
-    volatile struct virtq_available *available = (void *)((unsigned char *)device->queue_memory + queue_avail_offset(device));
+    struct virtio_descriptor *d = device->queue_memory;
     int flushing = type == VIRTIO_BLOCK_REQUEST_FLUSH;
     r->header = (struct virtio_block_request_header){type, 0, sector};
     r->status = UINT8_MAX; r->state = 2;
@@ -622,14 +526,13 @@ static enum kernel_block_status publish_request(struct virtio_block_device *devi
 #endif
     if (device->inflight > device->statistics.max_inflight) device->statistics.max_inflight = device->inflight;
     uint64_t physical = request_physical(device, r);
-    d[head] = (struct virtq_descriptor){physical, sizeof(r->header), VIRTQ_DESC_NEXT, head + (flushing ? 2 : 1)};
-    d[head + 1] = (struct virtq_descriptor){data_address, data_length,
+    d[head] = (struct virtio_descriptor){physical, sizeof(r->header), VIRTQ_DESC_NEXT, head + (flushing ? 2 : 1)};
+    d[head + 1] = (struct virtio_descriptor){data_address, data_length,
         VIRTQ_DESC_NEXT | (type == VIRTIO_BLOCK_REQUEST_IN ? VIRTQ_DESC_WRITE : 0), head + 2};
-    d[head + 2] = (struct virtq_descriptor){physical + offsetof(struct block_request, status), 1, VIRTQ_DESC_WRITE, 0};
-    available->ring[available->index % device->queue_size] = head;
-    memory_barrier(); available->index++; memory_barrier();
+    d[head + 2] = (struct virtio_descriptor){physical + offsetof(struct block_request, status), 1, VIRTQ_DESC_WRITE, 0};
+    if (virtio_split_publish(&device->queue, &device->transport, 0, head, r, 1,
+        1U + (type == VIRTIO_BLOCK_REQUEST_IN ? data_length : 0)) != VIRTIO_OK) __builtin_trap();
     if (type == VIRTIO_BLOCK_REQUEST_IN) kernel_proc_task_note_block_read();
-    reg_write(device, VIRTIO_BLOCK_REG_QUEUE_NOTIFY, 0);
     arch_interrupt_restore(irq);
     return KERNEL_BLOCK_STATUS_OK;
 }
@@ -1162,7 +1065,7 @@ static enum kernel_block_status virtio_block_read_batch(void *context,
 }
 
 enum virtio_block_status virtio_block_init(
-    struct virtio_block_device *device,const struct virtio_block_transport *transport,
+    struct virtio_block_device *device,const struct virtio_transport *transport,
     struct physical_page_allocator *page_allocator,virtio_dma_address_fn dma_address,
     uint32_t timebase_frequency)
 {
@@ -1172,8 +1075,8 @@ enum virtio_block_status virtio_block_init(
     uint64_t capacity_sectors;
     uint32_t queue_max;
     void *queue_memory;
-    if (!device || device->state || !transport || !transport->context || !transport->ops ||
-        !transport->ops->read || !transport->ops->write || !transport->ops->ack_interrupt ||
+    if (!device || device->state || !transport || !transport->context ||
+        !transport->ops.read || !transport->ops.write || !transport->ops.ack_interrupt ||
         !page_allocator || !dma_address || !timebase_frequency)
         return VIRTIO_BLOCK_DRIVER_STATUS_INVALID;
     if (transport->version!=1 && transport->version!=2) return VIRTIO_BLOCK_DRIVER_STATUS_UNSUPPORTED;
@@ -1184,16 +1087,15 @@ enum virtio_block_status virtio_block_init(
     result.statistics_start=time_now();result.statistics_last=result.statistics_start;
     status = negotiate_features(&result);
     if (status != VIRTIO_BLOCK_DRIVER_STATUS_OK) {
-        return init_failure(&result, device, status, 1, 0);
+        return init_failure(&result, status, 1, 0);
     }
 
-    reg_write(&result, VIRTIO_BLOCK_REG_QUEUE_SEL, 0U);
-    queue_max = reg_read(&result, VIRTIO_BLOCK_REG_QUEUE_NUM_MAX);
+    reg_write(&result, VIRTIO_REG_QUEUE_SEL, 0U);
+    queue_max = reg_read(&result, VIRTIO_REG_QUEUE_NUM_MAX);
     if (queue_max < 4 ||
         (!legacy_transport(&result) &&
-         reg_read(&result, VIRTIO_BLOCK_REG_QUEUE_READY) != 0U)) {
+         reg_read(&result, VIRTIO_REG_QUEUE_READY) != 0U)) {
         return init_failure(&result,
-                            device,
                             VIRTIO_BLOCK_DRIVER_STATUS_UNSUPPORTED,
                             1,
                             0);
@@ -1206,7 +1108,6 @@ enum virtio_block_status virtio_block_init(
                                                 &result.queue_physical_address);
     if (page_status != PHYSICAL_PAGE_STATUS_OK) {
         return init_failure(&result,
-                            device,
                             page_status == PHYSICAL_PAGE_STATUS_EMPTY ?
                                 VIRTIO_BLOCK_DRIVER_STATUS_NO_MEMORY :
                                 VIRTIO_BLOCK_DRIVER_STATUS_STATE,
@@ -1218,7 +1119,6 @@ enum virtio_block_status virtio_block_init(
                                         &queue_memory);
     if (page_status != PHYSICAL_PAGE_STATUS_OK) {
         return init_failure(&result,
-                            device,
                             VIRTIO_BLOCK_DRIVER_STATUS_STATE,
                             1,
                             1);
@@ -1227,67 +1127,25 @@ enum virtio_block_status virtio_block_init(
     bytes_zero(queue_memory,
                (size_t)BOAROS_PAGE_SIZE << result.queue_allocation_order);
 
-    reg_write(&result,
-                 VIRTIO_BLOCK_REG_QUEUE_NUM,
-                 result.queue_size);
-    if (legacy_transport(&result)) {
-        if (result.queue_physical_address >> BOAROS_PAGE_SHIFT >
-            UINT32_MAX) {
-            return init_failure(&result,
-                                device,
-                                VIRTIO_BLOCK_DRIVER_STATUS_UNSUPPORTED,
-                                1,
-                                1);
-        }
-        reg_write(&result,
-                     VIRTIO_BLOCK_REG_GUEST_PAGE_SIZE,
-                     BOAROS_PAGE_SIZE);
-        reg_write(&result,
-                     VIRTIO_BLOCK_REG_QUEUE_ALIGN,
-                     VIRTIO_LEGACY_QUEUE_ALIGNMENT);
-        memory_barrier();
-        reg_write(&result,
-                     VIRTIO_BLOCK_REG_QUEUE_PFN,
-                     (uint32_t)(result.queue_physical_address >>
-                                BOAROS_PAGE_SHIFT));
-    } else {
-        write_queue_address(&result,
-                            VIRTIO_BLOCK_REG_QUEUE_DESC_LOW,
-                            VIRTIO_BLOCK_REG_QUEUE_DESC_HIGH,
-                            result.queue_physical_address +
-                                VIRTIO_QUEUE_DESC_OFFSET);
-        write_queue_address(&result,
-                            VIRTIO_BLOCK_REG_QUEUE_DRIVER_LOW,
-                            VIRTIO_BLOCK_REG_QUEUE_DRIVER_HIGH,
-                            result.queue_physical_address +
-                                queue_avail_offset(&result));
-        write_queue_address(&result,
-                            VIRTIO_BLOCK_REG_QUEUE_DEVICE_LOW,
-                            VIRTIO_BLOCK_REG_QUEUE_DEVICE_HIGH,
-                            result.queue_physical_address +
-                                queue_used_offset(&result));
-        memory_barrier();
-        reg_write(&result, VIRTIO_BLOCK_REG_QUEUE_READY, 1U);
-    }
+    if (virtio_split_initialize(&result.queue, queue_memory,
+        (size_t)BOAROS_PAGE_SIZE << result.queue_allocation_order, result.queue_size,
+        queue_avail_offset(&result), queue_used_offset(&result)) != VIRTIO_OK) __builtin_trap();
+    if (virtio_transport_queue(&result.transport, 0, result.queue_size,
+        result.queue_physical_address, queue_avail_offset(&result), queue_used_offset(&result),
+        BOAROS_PAGE_SIZE) != VIRTIO_OK)
+        return init_failure(&result, VIRTIO_BLOCK_DRIVER_STATUS_UNSUPPORTED, 1, 1);
 
     capacity_sectors = read_capacity(&result);
     if (capacity_sectors == 0U ||
         capacity_sectors > UINT64_MAX / VIRTIO_BLOCK_SECTOR_SIZE) {
         return init_failure(&result,
-                            device,
                             VIRTIO_BLOCK_DRIVER_STATUS_DEVICE,
                             1,
                             1);
     }
 
-    reg_write(&result,
-                 VIRTIO_BLOCK_REG_STATUS,
-                 VIRTIO_STATUS_ACKNOWLEDGE |
-                     VIRTIO_STATUS_DRIVER |
-                     (legacy_transport(&result) ? 0U
-                                                 : VIRTIO_STATUS_FEATURES_OK) |
-                     VIRTIO_STATUS_DRIVER_OK);
-    memory_barrier();
+    if (virtio_transport_start(&result.transport) != VIRTIO_OK)
+        return init_failure(&result, VIRTIO_BLOCK_DRIVER_STATUS_DEVICE, 1, 1);
 
     result.block.context = device;
     result.block.read = virtio_block_read;
@@ -1335,13 +1193,11 @@ enum virtio_block_status virtio_block_destroy(
     block_puts(" flushes="); block_hex(statistics.flush_requests);
     kernel_console_putc('\n');
     device_reset(device);
-    if (device->irq_source) { device->transport.ops->unregister_irq(device->transport.context,device->irq_source,device); device->irq_source = 0; }
+    if (device->irq_source) { device->transport.ops.unregister_irq(device->transport.context,device->irq_source,device); device->irq_source = 0; }
     page_status = physical_page_release_order(device->page_allocator,
                                               device->queue_physical_address,
                                               device->queue_allocation_order);
-    if (page_status != PHYSICAL_PAGE_STATUS_OK) {
-        return VIRTIO_BLOCK_DRIVER_STATUS_STATE;
-    }
+    if (page_status != PHYSICAL_PAGE_STATUS_OK) __builtin_trap();
 
     device->block.context = 0;
     device->block.read = 0;
@@ -1353,6 +1209,8 @@ enum virtio_block_status virtio_block_destroy(
     device->block.capacity_bytes = 0U;
     device->block.logical_block_size = 0U;
     device->queue_memory = 0;
+    device->queue_physical_address = 0;
+    device->queue = (struct virtio_split_queue){0};
     device->state = VIRTIO_BLOCK_STATE_DESTROYED;
     return VIRTIO_BLOCK_DRIVER_STATUS_OK;
 }

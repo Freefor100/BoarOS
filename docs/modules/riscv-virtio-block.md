@@ -4,13 +4,14 @@
 
 ## 共用块核心与 RV 适配
 
-`drivers/virtio/block.c` 和 `include/kernel/virtio_block.h` 拥有请求、split ring、
-八槽、批量/部分读写、FLUSH 门闩、超时/reset、DMA 引用与统计。transport 只提供
-语义寄存器访问、先于 used 快照的 IRQ acknowledge，以及 IRQ owner 登记/摘除。
+`drivers/virtio/block.c` 和 `include/kernel/virtio_block.h` 拥有请求、八槽、批量/部分
+读写、FLUSH门闩、超时、DMA借用与统计；feature/status、配置、split ring及在途
+descriptor/token由[共用VirtIO框架](virtio-framework.md)提供。transport提供
+语义寄存器访问、先于used快照的IRQ acknowledge，以及IRQ owner登记/摘除。
 MMIO 与 PCI 的总线偏移、访问宽度和 read-to-clear 差异留在各自实现；IRQ/DMA
 CPU 屏障由构建期架构操作提供，不是运行期架构 vtable。
 
-RV `arch/riscv/virtio_mmio_block.c` 负责 MMIO 身份/版本和寄存器映射、PLIC 绑定；
+RV `arch/riscv/virtio_mmio_block.c` 负责PLIC绑定，MMIO身份/版本和寄存器映射由共用adapter实现；
 旧类型和入口保留薄适配。`riscv_virtio_mmio_block_base()` 仅暴露已有 MMIO 资源
 用于 DTB IRQ 匹配。启动 fixture 可在物理别名执行，函数指针必须从实际 PC 初始化，
 不能直接使用含高地址常量的静态回调表；生产内核仍在最终地址空间构造设备。

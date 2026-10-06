@@ -295,3 +295,30 @@ GNU2.42静态启动从SIGILL推进到空AT_RANDOM的SIGSEGV，GDB确认ERA=0x120
 位于原`__libc_start_main_impl`。随后核对固定QEMU的FDT生成器，发现其已提供
 32字节rng-seed，LA只读了内存布局而漏接材料。按RV已有不计熵策略接入后，五种
 GNU形态在双侧两种RAM均通过；可信熵仍为零，random ready未置位。
+
+## 共用VirtIO拆分与缓存反例
+
+block迁入共用transport/split queue后，保留业务请求与buffer owner：descriptor
+完成仅归还队列资格，不能释放仍由调用方使用的内存。reset确认同时绑定设备
+身份，不能用另一个quiescent transport撤销本队列token。重复项在本次合法
+完成之后出现时，设备失败仍保留该合法完成结果；先按inflight数整体拒绝snapshot
+会改变这个既有契约，故共享层按ring容量检查并逐项验证head，block另保留八槽界限。
+
+完成长度校验暴露旧host模型给写请求回报了513字节。模型现按实际WRITE
+descriptor累计设备可写字节；reset后模型停止消费ring，不能根据已清零的idx
+虚构65528个新请求。这些模型修正都基于总线行为，未放宽生产长度校验。
+
+扩展共享transport结构后，LA独立block fixture仍使用旧对象，观察到IRQ零值
+和readonly错误；生产对象已重编译，fixture的`.d`却未被Make包含。现将独立
+fixture依赖一并纳入，并为定制C/汇编规则生成依赖、跟踪LA构建规则变化。
+不清缓存即可重跑恢复正确布局，实际三传输块门禁及LA根owner/OOM再次通过。
+
+PCI初始化reset失败时，只有平台BAR owner而没有块core；core销毁成功后的第二次
+PCI reset失败则只剩BAR owner。若包装层仅凭core状态判断，会拒绝两者的合法清理
+重试；若根数组只统计初始化成功设备，前者会漏清理。现单独记录core消费阶段，
+根保留失败candidate，已释放的DMA物理地址/队列指针清零。两端真实PCI确认失败
+注入及根EIO/未发布PID1/两种RAM基线已通过；不把软件注入当成QEMU真的拒绝reset。
+
+布局计算还需先做有界减法再构造指针：UINT32_MAX附近的available偏移曾绕回
+大小检查，host反例实际崩溃。共享层现验证两个ring全范围及DMA物理末端溢出，
+失败不写ring；同反例返回INVALID，三传输实际块门禁继续通过。
