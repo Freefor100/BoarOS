@@ -42,6 +42,10 @@ BoarOS 是从零搭建、面向 OS Comp 能力建设的 C / 少量汇编内核�
 
 epoll 以完整用户事件交付作为 ET/ONESHOT 提交点，复制 fault 保留未交付项；扫描与重入通知独立，取消和 close 保持对象寿命。验证边界见[事件交付](docs/learning/epoll-delivery.md)。
 
+PID 1 退出后先结束并回收剩余用户进程，再停止内核服务和卸载根盘；后台 daemon
+持有的 cwd、文件或 MM 不再使关机提前遇到 EBUSY。正常用户退出与 PID 1 的完成
+状态分别保留，见[调度生命周期](docs/modules/kernel-scheduler.md#退出与-exec)。
+
 文件层已有部分读写、OFD 生命周期、稀疏文件与映射截断的语义深度；显式时间设置和真实挂载统计已接入；共享匿名映射已迁移统一稀疏内存后备对象，与共享文件页均可跨 MM 读写，串口与 Unix98 PTY 已具备真实行规程、控制终端和有界传输；其他行规程与完整 modem 控制仍有缺口。ext4 恢复已覆盖 512 字节原子写、未 flush 写丢失或重排的故障模型；实板持久性仍待独立验证。固定 glibc 2.44 的五种 ELF 形态与 TLS/pthread/取消清理/信号组合已双侧验证，完整 glibc 应用兼容尚未证明。
 
 内存统计按文件页、共享匿名/tmpfs 后备页和各盘块缓冲真实 owner 计量；`sysinfo` 返回真实任务数与 1/5/15 分钟负载。原镜像 BusyBox `free` 已显示有效容量，LTP 越过缺失 `Cached` 的阻塞。已新增由真实 timer 快照支持的 coarse clock，并通过窄差分；原静态/动态 glibc `utime` 各 30 次复跑通过，诊断环境边界见[文件时间](docs/learning/file-timestamps.md)。LTP cgroup 辅助程序等待已独立定位，见[路线与验收](docs/goals.md)。
@@ -53,7 +57,7 @@ epoll 以完整用户事件交付作为 ET/ONESHOT 提交点，复制 fault 保�
 固定BusyBox/libc-test最近完整清单仍为228项、227项双侧通过的历史结果；此前环境补全验收原BusyBox包装器，55/55子项成功，dmesg/RTC及df根盘内容另做真实核对。当前通用ABI差分1344条匹配，终端另有同ELF的107条差分记录；完整清单和本轮选择集合分别见[程序清单](docs/learning/user-program-inventory.md)。成本门禁见[单核规模回归](docs/learning/single-hart-scale.md)。
 
 顺序预读与连续写回提供有界实验候选，生产默认仍为预读关闭、写回一页。
-机制门禁和吞吐测量分别记录；TCP 27 组、存储 20 组已完成匹配筛选和组合扩展，共 1,218 次发布启动与 184 次诊断。大批写回在部分缓存追加中回退，较大 TCP 窗口也未单调提高性能；参数选择保留给用户，见[结果、每连接完成时间和输入身份](docs/learning/data-path-budget-experiments.md#正式匹配结果2026-10-06)。
+机制门禁和吞吐测量分别记录；TCP 27 组、存储 20 组已完成匹配筛选和组合扩展，共 1,218 次发布启动与 184 次诊断。用户依据结果批准网络默认改为 8 MSS/池 4 倍/协议堆 2 倍；存储仍为 RA0/WB1。历史结果中的默认标签指调整前的 8/1/1，见[结果、每连接完成时间和输入身份](docs/learning/data-path-budget-experiments.md#正式匹配结果2026-10-06)。
 
 ## 构建与验证
 

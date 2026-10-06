@@ -240,6 +240,11 @@ enum kernel_scheduler_status kernel_scheduler_reap_one(
 /* O(1) cleanup work predicate; call with interrupts disabled. */
 int kernel_scheduler_reap_pending(void);
 
+/* PID 1 shutdown, with interrupts disabled: terminate remaining user groups
+ * through normal exit cleanup, leaving kernel I/O workers running.
+ * Returns nonzero until their task/owner records have all been reaped. */
+int kernel_scheduler_stop_users(void);
+
 void kernel_thread_exit(void) __attribute__((noreturn));
 
 void kernel_user_thread_exit(

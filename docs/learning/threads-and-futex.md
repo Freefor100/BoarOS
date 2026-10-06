@@ -143,3 +143,36 @@ WAKE，重启成功场景保持用户字不变，直到WAKE明确返回选中一
 `5a994a989c1866b0bbc84a944bc42810efaf2b01387009d5b803d2b562cc3898`）
 在原BoarOS和固定Linux各重复200次通过，完整 `make test-userland-riscv`
 亦通过。重建的常规入口仍是该目标；内核futex实现没有随此测试修正改变。
+
+## PID 1 关机与存活后台 owner（2026-10-06）
+
+原版五项脚本全结束后出现 root CLEANUP（0xb）。最小复现为 PID 1 fork 出
+setsid 后的后台进程，后者保留文件、cwd、MM 和监听 socket，PID 1 随后退出。
+同步输出实际得到 `root finish failure stage=0x4 error=0xfffffff0`：卸载根盘
+返回 EBUSY。旧 5687377 生产 ELF 同样失败；控制流程可追溯到 8dfffb7，不能
+归因于本轮页缓存优化或协议池调整。原 iperf 脚本启动 daemon 而不在末尾停止它，
+暴露了这个边界；之前的受控网络执行器主动停止 server，未覆盖该关机路径。
+
+责任在内核关机顺序：cleanup worker 只确认 PID 1 已回收就调用 root finish，
+其余用户进程仍是真实 owner。VFS 拒绝卸载是正确行为，不能忽略 EBUSY 或强制
+释放它们的对象。修复保存 PID 1 completion，通过既有组退出/取消路径结束所有
+用户任务，等待其回收，再停止内核 I/O 服务及卸载。正在关机时新发布的 fork 也由
+后续收口处理；只保存原 PID 1 状态，避免被其他 completion 或复用编号覆盖。
+普通父进程退出仍按原来的 reparent 语义处理。
+
+失败 owner 原本已经有输出，但排在异步 UART 队列中，紧接着切 emergency 并关机，
+现场行可能来不及发送。错误分支现在先切同步输出，再打印 stage/error，无需新增
+日志队列或诊断构建。
+
+独立实际 U-mode 回归使用存活 daemon、STOPPED 子进程、join 后仍存活的线程组，
+以及关机期间 fork。旧基线 daemon 场景先失败；修复后四项均保留 PID 1 的退出码
+37、heap-live=0 和物理页基线。原有未 wait 的 zombie 收口作为另一个窄回归。
+
+```sh
+make all INIT_CONFIG=config/init.json
+python3 -B tests/root-shutdown-riscv.py
+make test-root-orphan-riscv
+```
+
+这是进程/关机生命周期修复，没有修改日志 durable、checkpoint 或设备 reset 语义；
+不为此重跑存储恢复、参数或完整 ABI 矩阵。

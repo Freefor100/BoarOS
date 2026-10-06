@@ -661,25 +661,28 @@ static void storage_cleanup_worker(void *argument)
     kernel_scheduler_register_cleanup();
     enum kernel_scheduler_status scheduler_status;
     enum riscv_root_boot_status root_status;
+    struct kernel_thread_completion init_completion;
+    int init_reaped = 0;
     for (;;) {
         uintptr_t interrupt_status = riscv_interrupt_save();
         struct kernel_thread_completion completion;
-        struct kernel_thread_completion init_completion;
-        int init_reaped = 0;
 
         do {
             scheduler_status = kernel_scheduler_reap_one(&completion);
             if (scheduler_status == KERNEL_SCHEDULER_STATUS_OK &&
-                root_started && completion.kind == KERNEL_THREAD_KIND_USER &&
+                !init_reaped && root_started &&
+                completion.kind == KERNEL_THREAD_KIND_USER &&
                 completion.tgid == 1) {
                 init_completion = completion;
                 init_reaped = 1;
             }
         } while (scheduler_status == KERNEL_SCHEDULER_STATUS_OK ||
                  (scheduler_status == KERNEL_SCHEDULER_STATUS_EMPTY &&
-                  kernel_scheduler_reap_pending()));
+                 kernel_scheduler_reap_pending()));
+        /* PID 1死亡后先结束用户owner，不能带着daemon的cwd/MM去卸载根盘。 */
+        int users_pending = init_reaped && kernel_scheduler_stop_users();
         riscv_interrupt_restore(interrupt_status);
-        if (init_reaped) {
+        if (init_reaped && !users_pending) {
             struct kernel_heap_statistics heap_statistics;
             uint64_t available_pages;
 
@@ -688,6 +691,8 @@ static void storage_cleanup_worker(void *argument)
                                                   &heap_statistics,
                                                   &available_pages);
             if (root_status != RISCV_ROOT_BOOT_STATUS_OK) {
+                /* 即将关机，先切同步输出，避免失败owner还在UART队列中。 */
+                virt_uart_emergency_begin();
                 if (root_status == RISCV_ROOT_BOOT_STATUS_CLEANUP) {
                     virt_uart_puts("BoarOS: root finish failure stage=");
                     virt_uart_put_hex(root_boot.finish_failure);
@@ -720,7 +725,7 @@ static void storage_cleanup_worker(void *argument)
             virt_uart_put_hex((unsigned long)stack_statistics.maximum_used_bytes);
             virt_uart_putc('\n');
             virt_uart_puts("BoarOS: PID 1 exited status=");
-            virt_uart_put_hex((unsigned long)completion.status);
+            virt_uart_put_hex((unsigned long)init_completion.status);
             virt_uart_puts(" pages=");
             virt_uart_put_hex((unsigned long)available_pages);
             virt_uart_puts(" heap-live=");
