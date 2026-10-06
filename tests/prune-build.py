@@ -69,7 +69,11 @@ def candidates():
     la = BUILD / 'loongarch'
     if la.is_dir():
         result.extend(la.glob('*.log'))
-        result.extend(path for path in la.iterdir() if path.name in {'root-run','root-io-run','block-run'})
+        result.extend(la.glob('userland-identity-v1.json'))
+        result.extend(la.glob('userland-identity-v2-pre-mode.json'))
+        result.extend(la.glob('userland-identity-v2-pre-wrapper.json'))
+        result.extend(path for path in la.iterdir() if path.name in {'root-run','root-io-run','block-run','toolchain-check'}
+                      or path.name.startswith(('root-run.','root-io-run.')))
         gcc_cache=la/'gcc-sf'
         if gcc_cache.is_dir():
             result.extend(path for path in gcc_cache.iterdir() if path.name in {'build','build-sf'})

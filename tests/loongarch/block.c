@@ -8,7 +8,8 @@
 #include <string.h>
 static struct virtio_pci_block devices[2];
 static unsigned char data[8][512] __attribute__((aligned(16)));
-static volatile unsigned io_done,cpu_progress;
+static volatile unsigned io_done,cpu_progress,io_masked;
+static uint64_t masked_irqs[2];
 void la_fault_injection_set(int);
 static int dma(const void *pointer,uint64_t size,uint64_t *address)
 { return arch_direct_map_va_to_pa((uintptr_t)pointer,size,address)==ARCH_DIRECT_MAP_STATUS_OK; }
@@ -17,6 +18,8 @@ static void io_worker(void *argument)
     (void)argument;
     uint64_t mask=4,disabled=0;
     __asm__ volatile("csrxchg %0, %1, 4":"+r"(disabled):"r"(mask):"memory");
+    masked_irqs[0]=devices[0].device.statistics.interrupts;
+    masked_irqs[1]=devices[1].device.statistics.interrupts;io_masked=1;
     struct kernel_block_read_span spans[8];
     for(unsigned i=0;i<8;i++) spans[i]=(struct kernel_block_read_span){16384+i*512,data[i],512,0,KERNEL_BLOCK_STATUS_NOT_SUBMITTED};
     if(kernel_block_read_batch(&devices[0].device.block,spans,8)!=KERNEL_BLOCK_STATUS_OK) la_virt_fatal("PCI batch read");
@@ -30,9 +33,11 @@ static void io_worker(void *argument)
 static void cpu_worker(void *argument)
 {
     (void)argument;
+    uint64_t mask_deadline=arch_time_read()+la_timer_frequency()*3;
+    while(!io_masked) if((int64_t)(arch_time_read()-mask_deadline)>=0) la_virt_fatal("PCI mask owner progress");
     uint64_t until=arch_time_read()+la_timer_frequency()/50;
     while((int64_t)(arch_time_read()-until)<0) { }
-    if(devices[0].device.statistics.interrupts || devices[1].device.statistics.interrupts)
+    if(devices[0].device.statistics.interrupts!=masked_irqs[0] || devices[1].device.statistics.interrupts!=masked_irqs[1])
         la_virt_fatal("masked PCI interrupt dispatched on timer");
     uint64_t mask=4,enabled=4;
     __asm__ volatile("csrxchg %0, %1, 4":"+r"(enabled):"r"(mask):"memory");

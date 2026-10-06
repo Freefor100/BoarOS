@@ -7,11 +7,12 @@ import selectors
 import signal
 import subprocess
 import time
+import tempfile
 from root import disk
 ROOT=Path(__file__).resolve().parents[2]
 
 def main(args):
-    directory=ROOT/'build/loongarch/root-io-run';directory.mkdir(exist_ok=True)
+    directory=Path(tempfile.mkdtemp(prefix='root-io-run.',dir=ROOT/'build/loongarch'))
     for memory in ('512M','1G'):
         image=disk(directory,ROOT/'build/loongarch/root-probe',ROOT/'build/loongarch/busybox-source/busybox/busybox')
         socket=directory/'nbd.sock';socket.unlink(missing_ok=True)

@@ -11,6 +11,7 @@ make kernel-la                 # LP64S 整数内核和独立用户 ELF
 make run-loongarch             # QEMU 无 BIOS 直接 ELF 启动，串口可交互
 make test-root-loongarch        # PCI/ext4/LP64S musl/原 BusyBox 与 Linux 对照
 make test-root-io-loongarch     # 真正的块写错误与持久 owner
+make test-la-userland-host      # 缓存输入/完整安装树的9个拒绝反例
 make test-loongarch-boot        # 512 MiB/1 GiB 启动与后续契约
 make test-loongarch             # 同时准备固定 Linux，对照同一个用户 ELF
 make test-stack-usage-la
@@ -139,6 +140,6 @@ LP64S 工具缓存由 `make prepare-la-userland` 重建并校验：固定 GCC15.
 构建 `loongarch64-unknown-linux-gnusf` C 编译器和匹配 libgcc/CRT，使用固定 musl1.2.5
 headers bootstrap runtime，再构建静态 libc；BusyBox 使用清单 commit 和原配置，
 UAPI 从固定 Linux v6.6 `ARCH=loongarch headers` 导出后原样安装，不混宿主 glibc 头。
-编译源码与可复用产物、工具/配置/ELF身份留在 `build/loongarch`，运行目录、镜像、
+编译源码与可复用产物、工具/配置/ELF身份留在 `build/loongarch`，完整安装树包含helpers/specs/headers与链接目标；冷构建先生成子配置。运行目录、镜像、
 日志及早期失败构建用 `make prune-build` 清除。ELF 使用 SOFT-FLOAT ABI，EUEN关闭；
 没有用忽略 ABI mismatch 或成功存根绕过硬件限制。
