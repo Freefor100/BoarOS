@@ -498,19 +498,19 @@ sigreturn/同步故障/等待重启和静态pthread/TLS已双侧验收，含真�
 非PI robust、线程组生命周期及任务/栈创建OOM回滚；原BusyBox ash非交互trap/wait通过。
 用户已选择原版LP64D musl与LA标量FPU路线，动态libc/解释器/初始及late DSO TLS
 和FR/FCC/FCSR/信号/clone/exec子集已双侧验收。LSX/LASX状态与扩展帧、关闭CPU扩展
-及clone标量继承/上半部初始化已按固定Linux验收；glibc、更广原程序和完整终端/网络
+及clone标量继承/上半部初始化已按固定Linux验收；更广原程序和环境矩阵
 仍未完成；本轮已批准单核QEMU对齐、统一VirtIO框架、内嵌SIMD状态及原版glibc2.42。
 PGDH内核栈窗口/guard/NX及可信异常栈已验收。SIMD接入后GNU启动缺失AT_RANDOM的
 SIGSEGV已定位到LA漏接QEMU DTB种子；复用不计熵的早期随机材料策略后，固定原版
 共用net/Ethernet和LA现代PCI真实TAP已在双侧两种RAM验证，原BusyBox HTTP、
 共享块/RNG/net IRQ及九类构造/reset失败回到基线。无metadata checksum的空索引目录误分类已由真实宿主/LA反例修复。AF_UNIX发送者缓存模型及sendfile datagram批次已按用户选择的Linux路线接入，
-实际双侧等待/取消/关闭及资源验收通过；仍需TTY/RTC、完整ABI及
+实际双侧等待/取消/关闭及资源验收通过。共用ns16550与LA TTY/termios2/作业控制、PTY、原BusyBox交互/script和录制重启已双侧两种RAM验收，UART启动失败/fatal与owner通过；仍需RTC、完整ABI及
 指定原程序/SQLite矩阵和最终全回归；不由设备通过声明能力全部等价。
 glibc2.42五形态在Linux/BoarOS两种RAM均通过退出及根owner门禁。真实PCI RNG已接入并
 完成正常/缺失/延迟/在途停止、构造OOM/IRQ失败及回收；启动种子不会提前发布random
 ready。完整指定原程序及平台矩阵仍待完成。
 共用VirtIO transport/split queue已迁入block，三个transport的真实块与LA根owner
-门禁、RV可睡眠I/O四组合已通过。RNG迁移及LA PCI验收完成；net及其余LA平台接入继续沿已批准路线实施；
+门禁、RV可睡眠I/O四组合已通过。RNG/net迁移及LA PCI验收完成；其余LA平台接入继续沿已批准路线实施；
 全部指定程序矩阵和最终整体审查收口前，不声明本轮对齐完成。
 
 - [ ] ELF 段对齐、BSS 尾页、auxv、用户栈、stat/signal 结构及 clone 寄存器逐项核对；不能只换汇编入口却保留 RV ABI 编码。

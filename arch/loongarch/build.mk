@@ -257,3 +257,29 @@ test-net-failures-loongarch: $(foreach case,0 1 2 3 4 5 6 7 8,$(LA_BUILD)/kernel
 	python3 -B tests/loongarch/net_failures.py
 test-network-external-loongarch: kernel-la prepare-la-userland prepare-la-linux-platform prepare-la-tools
 	python3 -B tests/network-external.py --arch loongarch
+
+$(LA_BUILD)/uart-failure-%.o: tests/loongarch/uart_failures.c
+	$(LA_CC) $(LA_CPPFLAGS) $(LA_CFLAGS) -DUART_FAIL_CASE=$* -c $< -o $@
+$(LA_BUILD)/kernel-uart-failure-%: $(LA_OBJECTS) $(LA_BUILD)/uart-failure-%.o arch/loongarch/linker.ld
+	$(LA_CC) $(LA_FLAGS) -nostdlib -nostartfiles -static -no-pie -T arch/loongarch/linker.ld -Wl,--build-id=none,--gc-sections,--wrap=physical_page_allocate,--wrap=physical_page_allocate_order,--wrap=kernel_syscall_dispatch,--wrap=ns16550_start,--wrap=kernel_heap_allocate_zeroed,--wrap=kernel_thread_create_joinable -o $@ $(LA_OBJECTS) $(LA_BUILD)/uart-failure-$*.o -lgcc
+$(LA_BUILD)/tty-probe: tests/tty/probe.c $(LA_BUILD)/musl-root/bin/musl-gcc
+	REALGCC=$(CURDIR)/$(LA_BUILD)/gcc-sf/root/bin/loongarch64-unknown-linux-gnusf-gcc $(LA_BUILD)/musl-root/bin/musl-gcc -static -O2 -Wall -Wextra -Werror $< -o $@
+$(LA_BUILD)/tty-jobctrl: tests/tty/jobctrl_probe.c $(LA_BUILD)/musl-root/bin/musl-gcc
+	REALGCC=$(CURDIR)/$(LA_BUILD)/gcc-sf/root/bin/loongarch64-unknown-linux-gnusf-gcc $(LA_BUILD)/musl-root/bin/musl-gcc -static -O2 -Wall -Wextra -Werror $< -o $@
+$(LA_BUILD)/tty-termios2-probe: tests/tty/termios2_probe.c $(LA_BUILD)/musl-root/bin/musl-gcc
+	REALGCC=$(CURDIR)/$(LA_BUILD)/gcc-sf/root/bin/loongarch64-unknown-linux-gnusf-gcc $(LA_BUILD)/musl-root/bin/musl-gcc -static -O2 -Wall -Wextra -Werror $< -o $@
+.PHONY: test-uart-failures-loongarch test-tty-loongarch test-tty-diff-loongarch test-tty-termios2-loongarch test-pty-loongarch test-pty-apps-loongarch
+test-uart-failures-loongarch: $(foreach case,0 1 2 3 4 5,$(LA_BUILD)/kernel-uart-failure-$(case)) $(LA_BUILD)/network-contract
+	python3 -B tests/loongarch/uart_failures.py
+test-tty-loongarch: kernel-la
+	python3 -B tests/tty/riscv.py --arch loongarch
+test-tty-diff-loongarch: kernel-la $(LA_BUILD)/tty-probe $(LA_BUILD)/tty-jobctrl
+	python3 -B tests/tty/riscv.py --arch loongarch --probe $(LA_BUILD)/tty-probe
+	python3 -B tests/tty/riscv.py --arch loongarch --probe $(LA_BUILD)/tty-jobctrl --no-ctty
+test-tty-termios2-loongarch: kernel-la $(LA_BUILD)/tty-termios2-probe
+	python3 -B tests/tty/riscv.py --arch loongarch --probe $(LA_BUILD)/tty-termios2-probe
+test-pty-loongarch: kernel-la
+	python3 -B tests/tty/pty_riscv.py --arch loongarch --case core
+test-pty-apps-loongarch: kernel-la
+	python3 -B tests/tty/pty_riscv.py --arch loongarch --case libc
+	python3 -B tests/tty/pty_riscv.py --arch loongarch --case script

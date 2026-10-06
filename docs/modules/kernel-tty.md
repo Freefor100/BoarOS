@@ -1,7 +1,7 @@
 # TTY、串口与作业控制
 
 `fs/tty.c` 是软件行规程，`kernel/sched/tty.c` 连接线程组、稳定 PID 身份、信号与
-proc 快照；硬件入口见 [UART transport](riscv-uart-tty.md)。生产启动在标准 OFD
+proc 快照；RV/LA 共用硬件入口见 [UART transport](riscv-uart-tty.md)。生产启动在标准 OFD
 建立之前创建、配置并发布根 TTY，默认 canonical、echo、ISIG、115200 8N1、CREAD，
 winsize 初始为零。固定设备类别由 `st_rdev` 选择；open 另借用调用期间已 pin 的 VFS file/path，
 动态 devpts 实例按节点绑定识别，不能仅靠复用的设备号选择。ttyS0 为 4:64、console 为 5:1、当前
@@ -124,3 +124,5 @@ termios 通知契约。固定依据另见 `references/linux` v7.2 的
 `drivers/tty/{pty,n_tty,tty_ioctl,tty_jobctrl}.c`。
 重复停止/恢复不产生新控制包；VSTART、IXANY、信号和关闭 IXON 经统一状态转换，
 不能越过 TCOOFF 的停止资格。
+
+LA入口与同ELF两种RAM验收、原script真实重启和UART回收见[共用UART](riscv-uart-tty.md#la-平台与对照验收)。LA/RV均采用asm-generic36/44字节内核termios/termios2；字符设备号和PTY所有权共用。

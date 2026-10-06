@@ -157,6 +157,7 @@ C_SOURCES := \
 	arch/riscv/virt_rtc.c \
 	arch/riscv/virt_uart.c \
 	arch/riscv/uart_tty.c \
+	drivers/serial/ns16550.c \
 	arch/riscv/virtio_mmio_block.c \
 	drivers/virtio/block.c \
 	drivers/virtio/transport.c \
@@ -276,6 +277,7 @@ TEST_RUNTIME_C_SOURCES := \
 	arch/riscv/virt_rtc.c \
 	arch/riscv/virt_uart.c \
 	arch/riscv/uart_tty.c \
+	drivers/serial/ns16550.c \
 	arch/riscv/virtio_mmio_block.c \
 	drivers/virtio/block.c \
 	drivers/virtio/transport.c \

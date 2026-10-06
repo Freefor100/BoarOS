@@ -53,7 +53,7 @@ int user_main(uint64_t *stack)
         int status=-1;
         if(call(260,child,(long)&status,0,0,0,0)!=child || status!=(EXPECTED_EXIT_STATUS<<8)) failed=1;
     }
-#ifdef ROOT_NETWORK_SETUP
+#if defined(ROOT_NETWORK_SETUP) || defined(ROOT_PROC_CLEANUP)
     for(;;) {
         long status=call(39,(long)"/root/proc",0,0,0,0,0);
         if(!status)continue;

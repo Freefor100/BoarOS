@@ -76,12 +76,12 @@ LSX/LASX状态、信号、clone/exec和关闭扩展的HWCAP已双侧验收。固
 共用VirtIO net与Ethernet已接LA现代PCI，固定Linux/BoarOS两种RAM的真实TAP、
 原BusyBox HTTP和共享块/RNG/net IRQ、正常及构造/reset失败回收通过。无metadata checksum的空索引目录误报EUCLEAN已修复并用真实1/4KiB布局及
 LA普通/挂载后rmdir验证；全恢复回归仍随本轮最终门禁执行。AF_UNIX发送者计费和sendfile批次已按固定Linux接入并双侧验证；完整网络ABI
-和程序矩阵仍需最终同口径回归；TTY/RTC及更广原程序矩阵继续推进。
+和程序矩阵仍需最终同口径回归。共用ns16550已接LA真实TTY，串口/termios2/作业控制、PTY与原ash/stty/script/replay及录制重启已双侧两种RAM验收；UART构造失败和fatal轮询通过。RTC及完整指定原程序矩阵继续推进。
 DTB随机种子仅支持早期材料和AT_RANDOM，不计可信熵。真实PCI RNG的正常、缺失、
-延迟、在途停止已双侧两种RAM验收，BoarOS构造失败与回收也已在两种RAM验收。LBT、完整终端/网络及
+延迟、在途停止已双侧两种RAM验收，BoarOS构造失败与回收也已在两种RAM验收。LBT、
 更广原程序、实板和SMP仍须另行验收，LA与RV尚不等价。
 共用VirtIO transport/split queue已接入RV MMIO与LA PCI block，保留batch/flush/
-超时及DMA业务owner；RNG已迁入，net仍在本轮计划内，见[框架契约](docs/modules/virtio-framework.md)。
+超时及DMA业务owner；RNG/net已迁入，见[框架契约](docs/modules/virtio-framework.md)。
 LA EXEC 页的数据读权限已按固定 Linux 的冷/驻留状态核对；页表有效权限与请求
 VMA 权限分别保留，真实读取、uaccess、fork和撤权均有双侧两种 RAM 验证。
 

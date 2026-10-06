@@ -18,29 +18,37 @@ spec = importlib.util.spec_from_file_location('boaros_serial_tty', HERE / 'riscv
 serial_tty = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(serial_tty)
 Serial, command, digest = serial_tty.Serial, serial_tty.command, serial_tty.digest
+PROFILES = serial_tty.PROFILES
 
 
-def build(directory, program):
-    if program:
-        destination = directory / 'probe-rv'
-        shutil.copy2(program, destination)
-        return destination
-    compiler = ROOT / 'build/riscv/musl-root/bin/musl-gcc'
-    destination = directory / 'probe-rv'
-    command(str(compiler), '-fno-link-libatomic', '-static', '-O2', '-Wall', '-Wextra',
-            '-Werror', str(HERE / 'pty_probe.c'), '-o', str(destination))
+def compile_static(args, source, destination):
+    compiler = ROOT / ('build/riscv/musl-root/bin/musl-gcc' if args.arch == 'riscv'
+                       else 'build/loongarch/musl-root/bin/musl-gcc')
+    environment = os.environ.copy()
+    flags = ['-fno-link-libatomic'] if args.arch == 'riscv' else [
+        *PROFILES[args.arch].raw_flags, '-Wl,-z,max-page-size=16384']
+    if args.arch == 'loongarch':
+        environment['REALGCC'] = str(ROOT / 'build/loongarch/gcc-sf/root/bin/loongarch64-unknown-linux-gnusf-gcc')
+    command(str(compiler), *flags, '-static', '-O2', '-Wall', '-Wextra', '-Werror',
+            str(source), '-o', str(destination), env=environment)
+
+
+def build(directory, args):
+    destination = directory / 'probe'
+    if args.program: shutil.copy2(args.program, destination)
+    else: compile_static(args, HERE / 'pty_probe.c', destination)
     return destination
 
 
-def glibc_program(directory):
-    source = ROOT / 'tests/userland/glibc/run.py'
-    module_spec = importlib.util.spec_from_file_location('boaros_pinned_glibc', source)
-    module = importlib.util.module_from_spec(module_spec); module_spec.loader.exec_module(module)
-    inputs = module.checked_inputs()
+def glibc_program(directory, args):
+    sys.path.insert(0, str(ROOT / 'tests/userland/glibc'))
+    from profiles import checked_inputs
+    inputs = checked_inputs(args.arch)
     compiler = next(path for path in inputs['tools'] if path.endswith('-gcc'))
-    program = directory / 'glibc-api-rv'
-    command(compiler, '-O2', '-Wall', '-Wextra', '-Werror', '-no-pie',
-            '-Wl,--dynamic-linker=' + module.INTERPRETER,
+    program = directory / 'glibc-api'
+    interpreter = inputs.get('interpreter', '/lib/ld-linux-riscv64-lp64d.so.1')
+    command(compiler, *inputs.get('compiler_flags', []), '-O2', '-Wall', '-Wextra',
+            '-Werror', '-no-pie', '-Wl,--dynamic-linker=' + interpreter,
             str(HERE / 'pty_probe.c'), '-o', str(program))
     return program, inputs
 
@@ -52,19 +60,19 @@ def fixture(directory, program, args):
     shutil.copy2(program, tree / 'init')
     shutil.copy2(program, tree / 'pty-probe')
     if args.case == 'script':
-        compiler = ROOT / 'build/riscv/musl-root/bin/musl-gcc'
-        gate = directory / 'gate-rv'
-        command(str(compiler), '-fno-link-libatomic', '-static', '-O2', '-Wall', '-Wextra',
-                '-Werror', str(HERE / 'gate.c'), '-o', str(gate))
+        gate = directory / 'gate'
+        compile_static(args, HERE / 'gate.c', gate)
         shutil.copy2(gate, tree / 'gate')
     if args.case == 'libc':
-        glibc, inputs = glibc_program(directory)
-        shutil.copy2(glibc, tree / 'pty-glibc-api'); (tree / 'lib').mkdir()
+        glibc, inputs = glibc_program(directory, args)
+        shutil.copy2(glibc, tree / 'pty-glibc-api')
+        library = tree / inputs.get('library_directory', '/lib').lstrip('/')
+        library.mkdir(parents=True)
         for path in inputs['runtime']:
-            shutil.copy2(path, tree / 'lib' / Path(path).name)
+            shutil.copy2(path, library / Path(path).name)
         (directory / 'glibc-inputs.json').write_text(json.dumps(inputs, indent=2) + '\n')
     (tree / 'pty-case').write_text(f'{args.case} {args.pairs} {args.bytes}\n')
-    busybox = ROOT / 'build/program-environment/full-busybox/source/busybox/busybox'
+    busybox = ROOT / ('build/program-environment/full-busybox/source/busybox/busybox' if args.arch == 'riscv' else 'build/loongarch/busybox-source/busybox/busybox')
     shutil.copy2(busybox, tree / 'busybox')
     for applet in ('sh', 'script', 'scriptreplay', 'stty', 'cat', 'sleep', 'printf', 'true', 'false'):
         (tree / 'bin' / applet).symlink_to('/busybox')
@@ -157,9 +165,9 @@ def recording_reboot(args, work, disk, invocation, kernel):
         raise AssertionError('recording reboot did not execute the complete guest check')
     if work.name.startswith('boaros-'):
         match = re.search(rb'exited status=0x([0-9a-f]+) .*heap-live=0x0; shutting down', text)
-        if not match or int(match.group(1), 16) != 42:
+        if not PROFILES[args.arch].root_success(text.decode(errors='replace'), 42):
             raise AssertionError('recording reboot actual BoarOS status/heap cleanup')
-        guest_status = int(match.group(1), 16)
+        guest_status = 42
     else:
         match = re.search(rb'Attempted to kill init! exitcode=0x([0-9a-fA-F]+)', text)
         if not match or int(match.group(1), 16) != (42 << 8):
@@ -189,14 +197,15 @@ def linux_image(argument):
 
 
 def run(args):
-    base = ROOT / 'build/riscv'; base.mkdir(parents=True, exist_ok=True)
+    base = ROOT / ('build/riscv' if args.arch == 'riscv' else 'build/loongarch'); base.mkdir(parents=True, exist_ok=True)
     directory = Path(tempfile.mkdtemp(prefix='pty-run.', dir=base))
     print('PTY artifacts:', directory, flush=True)
-    program = build(directory, args.program)
+    program = build(directory, args)
     image = fixture(directory, program, args)
     variants = []
     if args.only != 'boaros':
-        reference, reference_identity = linux_image(args.linux_kernel)
+        reference, reference_identity = (linux_image(args.linux_kernel) if args.arch == 'riscv' else
+            (args.linux_kernel or PROFILES[args.arch].linux_kernel(), json.loads((PROFILES[args.arch].linux_kernel().parent / 'boaros-identity.json').read_text())))
         variants.append(('linux', reference, reference_identity))
     if args.only != 'linux': variants.append(('boaros', args.kernel, None))
     prepared = []
@@ -209,25 +218,27 @@ def run(args):
                 'busybox': digest(directory / 'tree/busybox'),
                 'kernels': {name: digest(kernel) for name, kernel, _ in prepared},
                 'transport': args.transport, 'pairs': args.pairs, 'bytes': args.bytes,
-                'replicas': args.replicas, 'status': 'prepared'}
+                'arch': args.arch, 'memory': args.memory, 'replicas': args.replicas, 'status': 'prepared'}
     identity['qemu'] = command(args.qemu, '--version', capture_output=True, text=True).stdout.splitlines()[0]
     identity['qemu_sha256'] = digest(shutil.which(args.qemu))
-    if args.case == 'libc': identity['glibc_api'] = digest(directory / 'glibc-api-rv')
-    if args.case == 'script': identity['gate'] = digest(directory / 'gate-rv')
+    if args.case == 'libc': identity['glibc_api'] = digest(directory / 'glibc-api')
+    if args.case == 'script': identity['gate'] = digest(directory / 'gate')
     (directory / 'identity.json').write_text(json.dumps(identity, indent=2) + '\n')
     if args.prepare_only:
         print('PTY prepared program:', program, flush=True)
         return
     observed = {}; reboot_observed = {}
     for name, kernel, _reference_identity in prepared:
-        for replica in range(args.replicas):
-            work = directory / f'{name}-{replica}'; work.mkdir()
+        for memory, replica in ((memory, replica) for memory in args.memory for replica in range(args.replicas)):
+            work = directory / f'{name}-{memory}-{replica}'; work.mkdir()
             disk = work / 'root.img'; shutil.copy2(image, disk)
-            invocation = [args.qemu, '-machine', 'virt', '-bios', 'default', '-kernel', str(kernel),
-                          '-m', '512M', '-smp', '1', '-display', 'none', '-monitor', 'none',
-                          '-serial', 'stdio', '-no-reboot', '-drive',
+            invocation = [args.qemu, '-machine', 'virt', '-kernel', str(kernel),
+                          '-m', memory, '-smp', '1', '-display', 'none', '-monitor', 'none',
+                          '-serial', 'stdio', '-net', 'none', '-no-reboot', '-drive',
                           f'file={disk},if=none,format=raw,id=root', '-device',
-                          'virtio-blk-device,drive=root,bus=virtio-mmio-bus.0', '-global',
+                          PROFILES[args.arch].block(args.transport)]
+            if args.arch == 'loongarch': invocation += ['-cpu', 'la464']
+            else: invocation += ['-bios', 'default', '-global',
                           'virtio-mmio.force-legacy=' + ('true' if args.transport == 'legacy' else 'false')]
             if name == 'linux':
                 invocation += ['-append', 'root=/dev/vda rw rootwait console=ttyS0 init=/init loglevel=0 panic=-1']
@@ -246,7 +257,7 @@ def run(args):
                 raise AssertionError(f'{name} invalid PTY observations')
             count = int(re.search(rb'PTY_PROBE_PASS records=([0-9]+)', text).group(1))
             if len(records) != count: raise AssertionError('incomplete PTY record stream')
-            if name == 'boaros' and not re.search(rb'exited status=0x2a .*heap-live=0x0; shutting down', text):
+            if name == 'boaros' and not PROFILES[args.arch].root_success(text.decode(errors='replace'), 42):
                 raise AssertionError('BoarOS PTY task/heap cleanup incomplete')
             if args.case == 'script':
                 if name == 'linux' and not re.search(rb'Attempted to kill init! exitcode=0x0*2a00', text):
@@ -275,7 +286,7 @@ def run(args):
             if name in observed and observed[name] != records:
                 raise AssertionError('independent PTY replicas differ')
             observed[name] = records
-            print(name, replica, 'PTY PASS', count, 'records', flush=True)
+            print(name, memory, replica, 'PTY PASS', count, 'records', flush=True)
     if 'linux' in observed and 'boaros' in observed and observed['linux'] != observed['boaros']:
         raise AssertionError(f'PTY differential mismatch: {observed}')
     if 'linux' in reboot_observed and 'boaros' in reboot_observed and reboot_observed['linux'] != reboot_observed['boaros']:
@@ -288,10 +299,12 @@ def main():
     parser = argparse.ArgumentParser(__doc__)
     parser.add_argument('--case', choices=('red', 'core', 'libc', 'script', 'recording-check', 'performance'), default='core')
     parser.add_argument('--only', choices=('both', 'linux', 'boaros'), default='both')
-    parser.add_argument('--kernel', type=Path, default=ROOT / 'kernel-rv')
+    parser.add_argument('--arch', choices=tuple(PROFILES), default='riscv')
+    parser.add_argument('--memory', choices=('512M', '1G'), action='append')
+    parser.add_argument('--kernel', type=Path)
     parser.add_argument('--linux-kernel', type=Path)
     parser.add_argument('--program', type=Path)
-    parser.add_argument('--qemu', default='qemu-system-riscv64')
+    parser.add_argument('--qemu')
     parser.add_argument('--transport', choices=('modern', 'legacy'), default='modern')
     parser.add_argument('--replicas', type=int, default=1)
     parser.add_argument('--pairs', type=int, choices=(1, 8), default=1)
@@ -299,6 +312,10 @@ def main():
     parser.add_argument('--timeout', type=int, default=180)
     parser.add_argument('--prepare-only', action='store_true')
     args = parser.parse_args()
+    profile = PROFILES[args.arch]
+    args.kernel = args.kernel or ROOT / profile.kernel; args.qemu = args.qemu or profile.qemu
+    args.memory = args.memory or (['512M', '1G'] if args.arch == 'loongarch' else ['512M'])
+    if args.arch == 'loongarch' and args.transport == 'legacy': parser.error('LA uses modern PCI')
     if args.replicas < 1 or args.bytes < 1: parser.error('positive replicas and byte count required')
     run(args)
 
