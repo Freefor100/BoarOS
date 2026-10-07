@@ -89,6 +89,7 @@ def case_observations(section):
     cases, errors, current = [], [], None
     for raw in section.splitlines():
         line = raw.strip()
+        visible = re.sub(r'\x1b\[[0-9;]*m', '', line)
         begin = re.fullmatch(r'RUN LTP CASE (.+)', line)
         if begin:
             if current: cases.append(current)
@@ -109,9 +110,9 @@ def case_observations(section):
             kind = ('manual-exclusion', 'preparation', 'ltp-adapter')
         elif 'BOAROS-CASE TIMEOUT' in line:
             kind = ('supervision-timeout', 'running', 'case-supervisor')
-        elif re.search(r'\b(?:TFAIL|TBROK):', line):
+        elif re.search(r'\b(?:TFAIL|TBROK)\s*:', visible):
             kind = ('reported-failure', 'running', 'original-case')
-        elif re.search(r'\bTCONF:', line):
+        elif re.search(r'\bTCONF\s*:', visible):
             kind = ('reported-skip', 'unknown', 'original-case')
         if kind:
             state, stage, owner = kind

@@ -86,6 +86,17 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(result[1]['shell_exit_status'], 32)
         self.assertIsNone(result[1]['wait_status'])
 
+    def test_actual_colored_ltp_failure_is_classified_without_changing_output(self):
+        outputs = ['tst_device.c:354: \x1b[1;31mTBROK: \x1b[0mFailed to acquire device',
+                   'asapi_01    2  \x1b[1;31mTFAIL\x1b[0m  :  missing protocols entry']
+        for output in outputs:
+            with self.subTest(output=output):
+                text = ('BOAROS-EVAL ENTER ltp-glibc\nRUN LTP CASE original-case\n' + output +
+                        '\nFAIL LTP CASE original-case : 2\n')
+                result = self.states(text, ['ltp'])['ltp-glibc']
+                self.assertEqual(result['cases'][0]['state'], 'reported-failure')
+                self.assertEqual(result['observed_errors'][0]['output'], output)
+
     def test_combined_score_uses_original_nonlinear_ltp_formula(self):
         function = getattr(runner, 'original_score', None)
         self.assertTrue(callable(function), 'runner lacks joint upstream scoring')
