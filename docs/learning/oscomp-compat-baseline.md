@@ -436,8 +436,51 @@ host反例覆盖原身份/指令拒绝、真实高地址返回、缺失/重复na
 涉及原发布输入的问题应保留原ELF证据，等待官方修正输入或明确认可处理范围；
 通用内核缺口继续通过真实实现和原输入验证收口。
 
-本次检查了`tests/oscomp/{run,official,prepare}.py`及`init.sh`，它们没有调用
+`3784ded`时检查了`tests/oscomp/{run,official,prepare}.py`及`init.sh`，当时它们没有调用
 本诊断入口、修正brk或启用调度DSO。但`official.py::snapshot_source`仍对整个
 已提交树做git archive，所以诊断工具源码也进入容器源代码快照。运行路径隔离
 已经存在，参赛源代码材料隔离尚未完成；本阶段没有获得比赛方对这些适配的许可，
 不声明正式提交合规，也不把人的诊断路线确认解释为比赛规则许可。
+
+
+### 默认make all接入LA Linux调度运行时
+
+用户随后要求将真实运行时适配纳入`oscomp-compat`的普通`make all`与官方Harness，
+并选择B保留原地址布局和原brk ELF。此次没有采用低地址PIE/heap或默认指令修正；
+原brk失败继续记录，前述92分属于独立修正诊断。
+
+默认构建用目标LA编译器生成LP64D、16KiB对齐、无宿主libc依赖的调度DSO。
+四个sched接口调用原盘libc的公开syscall函数，保留真实内核返回、线程errno和坏
+指针错误。`prepare.py`校验DSO的架构/类型/ABI并将压缩payload和发布脚本写入
+内核携带的PID1配置；原BusyBox在guest中完成解压、只读权限和原子rename。
+所有LA musl动态程序统一继承LD_PRELOAD，glibc清除，RV保持原运行时路径。
+这条默认路径不调用`user_runtime_probe.py`，也不依赖宿主向运行盘注入辅助文件。
+原cyclictest/libc保持，内核两架构继续共用原调度实现。
+
+固定输入继续为`references/oscomp-autotest@d1bb3a3c4b27274e196a2648518525c1a304e339`
+及`pre-20250615`两张原发布盘，SHA见本页固定输入记录。1GiB、单CPU、无RNG的
+正常bootstrap聚焦验收得到以下原judge结果；每次两侧各启动一次、自然退出，
+PID1/页/堆/任务栈/根盘/设备owner核对通过，heap-live=0。
+
+| 默认原盘聚焦组 | RV glibc | RV musl | LA glibc | LA musl |
+|---|---:|---:|---:|---:|
+| basic | 90 | 90 | 90 | 90 |
+| BusyBox | 54 | 54 | 54 | 54 |
+| libc-test | 178 | 217 | 179 | 217 |
+| cyclictest | 6.9033265666804535 | 7.102206866584049 | 7.284278129096231 | 6.890271965437614 |
+
+四个cyclictest组各四场景、共18条线程记录都实际采样，未见原LA调度查询ENOSYS。
+时延分受宿主并行负载影响，以上是聚焦功能运行分，不拼接为正式总分。
+默认宿主构建DSO SHA-256为
+`430c253d594a8edce85a8c9bfc2c827bbb1e6caac57fea0906df6d21555e2c0b`。
+本地与官方报告分别记录其实际目标构建产物的SHA；容器GCC13与宿主GCC15产物
+不能混用身份。完整原Harness容器运行与所有44组状态需另行验证和记录。
+
+```sh
+make all
+make test-oscomp-host
+python3 -B tests/oscomp/run.py --arch both --groups cyclictest
+python3 -B tests/oscomp/run.py --arch both --groups environment
+python3 -B tests/oscomp/run.py --arch both --groups libctest
+make test-oscomp-official
+```

@@ -233,6 +233,7 @@ def collect_results(directory, report):
             'kernel_failure': local.kernel_failure(serial),
             'root_resources_verified': reason == 'qemu-exit' and done and PROFILES[arch].root_success(serial, 0),
             'groups': local.summarize_groups(serial, local.GROUPS, reason)}
+        entry['runtime_compatibility'] = local.runtime_info(base)
         summary[key] = local.judge(log, config)
         (directory / ('judge-' + key + '.json')).write_text(json.dumps(summary[key], indent=2) + '\n')
         _, postwork = local.original_modules()

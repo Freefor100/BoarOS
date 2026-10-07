@@ -94,6 +94,17 @@ def script_adaptations(selected):
     }
 
 
+def runtime_info(base):
+    profile = json.loads((base / 'init.json').read_text())
+    environment = dict(value.split('=', 1) for value in profile['envp'])
+    path = environment.get('BOAROS_LINUX_SCHED_PRELOAD', '')
+    info = {'linux_sched': {'enabled': bool(path), 'guest_path': path or None}}
+    if path:
+        info['linux_sched'].update(elf_sha256=sha(base / 'linux-sched.so'),
+                                  scope='all dynamic programs in the musl environment')
+    return info
+
+
 def kernel_failure(serial):
     prefixes = ('BoarOS: fatal ', 'BoarOS: timer error status=',
                 'BoarOS: scheduler error status=', 'BoarOS: user fault resolver error status=')
@@ -323,6 +334,7 @@ def main():
                 'qemu_command': command, 'qemu': output([str(executable), '--version']).splitlines()[0],
                 'qemu_sha256': sha(executable), 'qemu_mode': oct(executable.stat().st_mode & 0o777),
                 'qemu_selected_path': qemu, 'qemu_resolved_path': str(executable), 'extra_disk': None}
+            entry['runtime_compatibility'] = runtime_info(base)
             for name in ('init.sh', 'ltp-hook.sh', 'libctest-hook.sh', 'ltp-case.sh', 'ltp-skips.tsv'):
                 entry[name + '_sha256'] = sha(HERE / name)
             report['architectures'][arch] = entry

@@ -632,6 +632,7 @@ OSCOMP_CASE := $(BUILD_DIR)/oscomp/case
 OSCOMP_INIT := $(BUILD_DIR)/oscomp/init.json
 OSCOMP_CASE_LA := build/loongarch/oscomp/case
 OSCOMP_INIT_LA := build/loongarch/oscomp/init.json
+OSCOMP_RUNTIME_LA := build/loongarch/oscomp/linux-sched.so
 .DEFAULT_GOAL := all
 
 $(OSCOMP_CASE): tests/oscomp/case.c tests/common/raw_syscall.h tests/riscv/user_elf.ld
@@ -646,16 +647,24 @@ $(OSCOMP_CASE_LA): tests/oscomp/case.c tests/common/raw_syscall.h tests/loongarc
 		-nostdlib -static -s -Wall -Wextra -Werror -Wl,--build-id=none \
 		-Wl,-z,max-page-size=16384 -Wl,-T,tests/loongarch/user.ld -o $@ $<
 
+$(OSCOMP_RUNTIME_LA): tests/oscomp/sched_compat.c Makefile
+	@mkdir -p $(@D)
+	$(LA_CC) -march=loongarch64 -mabi=lp64d -O2 -fno-builtin \
+		-fno-tree-vectorize -fno-tree-slp-vectorize -fno-stack-protector \
+		-nostdlib -shared -fPIC -s -Wall -Wextra -Werror \
+		-Wl,--build-id=none,-soname,boaros-linux-sched.so \
+		-Wl,-z,max-page-size=16384 -o $@ $<
+
 .PHONY: force-oscomp-init
 force-oscomp-init:
 
-$(OSCOMP_INIT): force-oscomp-init $(OSCOMP_CASE) tests/oscomp/init.sh tests/oscomp/ltp-hook.sh tests/oscomp/libctest-hook.sh tests/oscomp/ltp-case.sh tests/oscomp/ltp-skips.tsv tests/oscomp/inputs.json tests/oscomp/prepare.py
+$(OSCOMP_INIT): force-oscomp-init $(OSCOMP_CASE) tests/oscomp/init.sh tests/oscomp/runtime.sh tests/oscomp/ltp-hook.sh tests/oscomp/libctest-hook.sh tests/oscomp/ltp-case.sh tests/oscomp/ltp-skips.tsv tests/oscomp/inputs.json tests/oscomp/prepare.py
 	python3 -B tests/oscomp/prepare.py --arch riscv --case $(OSCOMP_CASE) --output $@ \
 		--groups '$(OSCOMP_GROUPS)' --case-timeout $(OSCOMP_CASE_TIMEOUT) \
 		--diagnostic-exclude '$(OSCOMP_DIAGNOSTIC_EXCLUDE)'
 
-$(OSCOMP_INIT_LA): force-oscomp-init $(OSCOMP_CASE_LA) tests/oscomp/init.sh tests/oscomp/ltp-hook.sh tests/oscomp/libctest-hook.sh tests/oscomp/ltp-case.sh tests/oscomp/ltp-skips.tsv tests/oscomp/inputs.json tests/oscomp/prepare.py
-	python3 -B tests/oscomp/prepare.py --arch loongarch --case $(OSCOMP_CASE_LA) --output $@ \
+$(OSCOMP_INIT_LA): force-oscomp-init $(OSCOMP_CASE_LA) $(OSCOMP_RUNTIME_LA) tests/oscomp/init.sh tests/oscomp/runtime.sh tests/oscomp/ltp-hook.sh tests/oscomp/libctest-hook.sh tests/oscomp/ltp-case.sh tests/oscomp/ltp-skips.tsv tests/oscomp/inputs.json tests/oscomp/prepare.py
+	python3 -B tests/oscomp/prepare.py --arch loongarch --case $(OSCOMP_CASE_LA) --runtime $(OSCOMP_RUNTIME_LA) --output $@ \
 		--groups '$(OSCOMP_GROUPS)' --case-timeout $(OSCOMP_CASE_TIMEOUT) \
 		--diagnostic-exclude '$(OSCOMP_DIAGNOSTIC_EXCLUDE)'
 

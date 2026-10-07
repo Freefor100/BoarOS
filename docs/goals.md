@@ -67,14 +67,14 @@ RV静态clock_gettime的一项失败已定位为旧原glibc在malloc初始化期
 不是时钟调用失败；原locale、数值转换、regex等共同失败按具体断言分别归属。
 原basic共同的90/102已归因：VFAT及真实/dev/vda2分区环境缺失影响mount/umount
 10分，需作为共同文件系统项目另定交付；原brk包装器截断地址影响2分，归属发布输入。
-LA原musl cyclictest需要提供真实Linux调度接口的用户运行时；RV原盘同名函数已有
-syscall实现，且不同于上游同版本源码，不通过增加LA内核分支或替换正式原libc掩盖。
-固定身份和指令依据见[basic与运行时记录](learning/oscomp-compat-baseline.md#basic的90分与原musl调度接口差异)。
-已批准的独立修正诊断验证brk完整地址及LA musl调度DSO：两种RAM下basic92/102、
-cyclictest四场景实际采样并收口；正式原输入分数保持，VFAT仍作为后续共同能力。
-正常用户环境可采用真实Linux调度接口的运行时，不能把该适配诊断当成原盘已通过。
-正式评测继续以原程序和通用机制验收；按ELF特征修正和定向preload不作为参赛
-提分路径。当前official源快照仍包含独立诊断源码，参赛材料隔离与规则核对尚未完成。
+LA原musl的sched函数直接ENOSYS，RV原盘同名函数已有syscall实现；默认兼容环境
+现已通过make all构建并携带通用调度DSO，guest发布后整个LA musl动态环境统一使用
+真实Linux调度接口。两侧原cyclictest的glibc/musl组已采样并正常回收，musl libc-test
+保持217分。固定指令依据见[basic与运行时记录](learning/oscomp-compat-baseline.md#basic的90分与原musl调度接口差异)，
+构建和报告身份见[默认接入](learning/oscomp-compat-baseline.md#默认make-all接入la-linux调度运行时)。
+已选择B保留当前地址布局，原brk ELF的截断失败继续记录；默认basic仍90/102。
+独立修正诊断的92/102保持独立身份，VFAT及/dev/vda2环境仍作为后续共同能力。
+更新后的容器完整基线另行记录，不以本地聚焦运行改写1915历史成绩。
 完整凭据/权限、运行时网络配置和无 RNG 平台的可信熵接入由目标应用确定交付范围；
 LA 更广用户环境继续按真实消费者验收，SMP 单独规划。
 

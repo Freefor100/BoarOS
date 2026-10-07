@@ -1,5 +1,6 @@
 """Report failures and combined scores from the real fixed upstream judge."""
 import importlib.util
+import json
 from pathlib import Path
 import sys
 import tempfile
@@ -14,6 +15,28 @@ spec.loader.exec_module(runner)
 
 
 class ReportTests(unittest.TestCase):
+    def test_runtime_identity_uses_actual_target_build(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            (base / 'init.json').write_text(json.dumps({'envp': [
+                'BOAROS_LINUX_SCHED_PRELOAD=/lib/boaros-linux-sched.so']}))
+            runtime = base / 'linux-sched.so'
+            runtime.write_bytes(b'container compiler output')
+            info = runner.runtime_info(base)['linux_sched']
+            self.assertTrue(info['enabled'])
+            self.assertEqual(info['elf_sha256'], runner.sha(runtime))
+            runtime.write_bytes(b'other compiler output')
+            self.assertNotEqual(runner.runtime_info(base)['linux_sched']['elf_sha256'],
+                                info['elf_sha256'])
+
+    def test_disabled_and_historical_runtime_need_no_la_artifact(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            for environment in [[], ['BOAROS_LINUX_SCHED_PRELOAD=']]:
+                (base / 'init.json').write_text(json.dumps({'envp': environment}))
+                self.assertEqual(runner.runtime_info(base), {
+                    'linux_sched': {'enabled': False, 'guest_path': None}})
+
     def states(self, text, groups, reason='qemu-exit'):
         function = getattr(runner, 'summarize_groups', None)
         self.assertTrue(callable(function), 'runner lacks complete per-group state reporting')

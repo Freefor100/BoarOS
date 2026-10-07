@@ -166,16 +166,41 @@ Linux返回故障profile验证同一因果链，512MiB/1GiB都正常回收。参
 
 用户批准后新增独立用户态修正入口：只在临时盘修正已校验SHA的brk截断，LA
 cyclictest借用原libc的syscall并通过LD_PRELOAD提供四个真实调度接口；原cyclictest
-及libc不变，正式入口不开启。只读插件验证高地址+64/+128，独立整数父任务记录
+及libc不变；这是`f6d8661`时的独立诊断身份。只读插件验证高地址+64/+128，独立整数父任务记录
 native wait，Linux诊断PID1可选择wait被收养的后代。报告保留逐线程零采样、
 其他basic分差和原盘前后身份，结束时恢复默认双架构构建。BoarOS两种RAM已获
 basic92/102、cyclictest四场景真实采样及正常回收，见[公开修正对照](../learning/oscomp-compat-baseline.md#公开用户态修正对照)。
 
-该入口不是参赛兼容实现：临时盘上的brk仍是修改后的测试二进制，preload也改变
-原测试的符号解析与运行时行为。原文件SHA保持只证明可复现，不证明正式评测许可。
-固定2026评审准则禁止以测试名称、二进制特征等触发非通用实现；诊断分不能替代
-原输入成绩。当前official运行路径不调用这些工具，但提交快照仍是整树git archive，
-包含其源码，尚未完成参赛提交材料隔离及规则核对，不能据此宣称提交已经合规。
+### 默认LA Linux调度运行时
+
+默认`make all`通过`OSCOMP_RUNTIME_LA`构建`linux-sched.so`，使用LP64D用户ABI、
+16KiB ELF段对齐和`-nostdlib`，没有宿主libc/CRT依赖。四个sched接口借用原盘libc
+公开的`syscall`，由它设置真实线程errno；内核仍走两架构共用的调度syscall实现。
+
+`prepare.py --runtime`校验ELF64/LA/ET_DYN/LP64D身份，将gzip压缩的DSO及
+`runtime.sh`嵌入LA PID1启动命令。原盘BusyBox在guest中解压至临时文件，成功后
+以只读权限rename发布`/lib/boaros-linux-sched.so`；发布失败即终止bootstrap。
+宿主构建不读取或改写评测盘。musl环境的所有动态程序统一继承LD_PRELOAD，
+glibc环境显式清除；不按测试名称、组别或ELF指纹决定是否开启。RV不携带LA库。
+原cyclictest、原libc、原测试脚本和judge字节保持，既有监督和显式shell适配继续使用。
+
+本地和容器报告从各自实际构建目录记录runtime启用状态、guest路径与DSO SHA，
+容器编译器产物不能用宿主编译器产物身份代替。官方Harness仍在干净提交快照中
+执行普通`make all`，不调用独立用户态修正诊断。显式INIT_CONFIG继续支持通用fixture。
+已确认保持当前地址布局和原brk输入，不启用默认brk指令修正或低地址布局。
+默认basic90/102与独立诊断92/102分别记录；VFAT仍是共同缺失能力。
+
+```sh
+make all
+make test-oscomp-host
+python3 -B tests/oscomp/run.py --arch both --groups cyclictest
+python3 -B tests/oscomp/run.py --arch both --groups environment
+python3 -B tests/oscomp/run.py --arch both --groups libctest
+make test-oscomp-official
+```
+
+真实采样、正常回收和容器构建身份见
+[默认运行时验收](../learning/oscomp-compat-baseline.md#默认make-all接入la-linux调度运行时)。
 
 ## 整体审查后的报告契约
 

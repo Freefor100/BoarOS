@@ -1,4 +1,4 @@
-/* 独立用户态适配：借用原libc的syscall及线程errno，不替换原libc。 */
+/* LA用户环境统一提供Linux接口；借用原libc的syscall及线程errno。 */
 struct sched_param;
 extern long syscall(long number, ...);
 

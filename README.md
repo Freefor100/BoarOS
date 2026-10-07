@@ -170,7 +170,7 @@ LA原musl ELF的`/lib64/ld-musl-loongarch-lp64d.so.1`链接遗漏已定位并补
 固定Linux和BoarOS两种RAM的同ELF启动对照通过，历史零分仍按原运行保留。
 libc-test的无shebang内层脚本改为在临时外层副本中用原BusyBox sh显式执行；
 内容、程序和judge保留，runner公开适配身份。原LA musl cyclictest的调度查询
-由原libc直接返回ENOSYS，固定Linux同样失败，不用内核或替换libc掩盖此输入限制。
+由原libc直接返回ENOSYS，固定Linux同样失败；默认兼容环境现已提供真实Linux调度接口。
 修复后的LA-musl原libc-test已得217分，iozone/netperf也已进入完整原组并正常回收；
 LA libc-test逐ID状态与固定Linux一致，共同glibc失败及可选网络项继续保留，
 见[后续诊断](docs/learning/oscomp-compat-baseline.md#启动修复后的原组诊断)。本轮没有重跑官方容器总分。
@@ -183,8 +183,12 @@ RV多出的静态clock_gettime失败已逐指令定位为原glibc malloc初始�
 已批准的独立用户态修正诊断在两架构、两种RAM验证brk3/3及basic92/102；
 原LA cyclictest/libc字节保留，通过真实调度接口DSO运行四场景、获得采样并正常
 回收。该诊断自动恢复默认构建，原盘正式成绩保留，见[修正对照](docs/learning/oscomp-compat-baseline.md#公开用户态修正对照)。
-修改测试ELF及定向preload只用于归因，不作为参赛提分路径；official运行不启用，
-当前整树提交快照仍包含诊断源码，参赛材料隔离尚未完成，见[评测要求边界](docs/learning/oscomp-compat-baseline.md#与2026评测要求的边界)。
+默认`make all`现在构建LA调度DSO并将它与发布脚本嵌入`kernel-la`的bootstrap；
+启动后由原盘BusyBox发布，整个LA musl动态环境统一启用，四个接口执行真实syscall，
+不按程序或测例名选择。RV原运行时已有这些接口，保持原路径。默认原盘cyclictest
+两种libc在两侧都完成真实采样并正常回收；musl libc-test两侧保持217分。
+按已确认的B路线保留现有地址布局和原brk ELF，默认basic仍90/102；独立修正诊断的
+92分不计入默认结果。构建链与验收见[默认运行时接入](docs/learning/oscomp-compat-baseline.md#默认make-all接入la-linux调度运行时)。
 第三次运行发现的RV ext4 fatal保留了原现场；冷读OOM的通用修复先落main再合入，并在新的完整容器运行中未再次触发fatal。原判分成绩、总预算中断和未验证的资源回收边界分别记录。
 
 本分支已合入单核数据路径修复，并补跑原版 iozone、cyclictest、iperf、libcbench、lmbench 两种 libc 的一次评分。十个脚本都结束；当时的根盘 cleanup 错误已定位为 PID 1 退出时后台用户 owner 尚未回收，并在 main 修复后同步本分支。随后仅重跑原版 iperf，两种 libc 的十二项成功且正常关机；cyclictest 部分零采样仍待定位。分数、真实 iperf 吞吐和 1/10 ms 延迟的 36 次补测见[当前五项成绩与选择依据](docs/learning/data-path-budget-experiments.md#受控延迟与原版五项评分补测2026-10-06)。常规评分复用已核对输入，不重做四个发布资产的哈希扫描。

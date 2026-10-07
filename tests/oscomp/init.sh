@@ -24,6 +24,7 @@ $BB chmod 1777 /tmp
 $BB chmod +x /glibc/basic/run-all.sh /musl/basic/run-all.sh
 export HOME=/ TERM=vt100
 # BOAROS_CASE_PAYLOAD
+# BOAROS_RUNTIME_PAYLOAD
 groups=${BOAROS_EVAL_GROUPS:-'basic busybox cyclictest iozone iperf libcbench libctest lmbench lua netperf ltp'}
 export BOAROS_LTP_CASE_TIMEOUT=${BOAROS_LTP_CASE_TIMEOUT:-300}
 for group in $groups; do
@@ -32,6 +33,12 @@ for group in $groups; do
             cd /$libc
             export PATH=/bin:/$libc:/$libc/ltp/testcases/bin:.
             export LD_LIBRARY_PATH=/$libc/lib
+            # 按运行时环境统一接入Linux接口，不识别程序名称或组别。
+            if [ "$libc" = musl ] && [ -n "${BOAROS_LINUX_SCHED_PRELOAD:-}" ]; then
+                export LD_PRELOAD=$BOAROS_LINUX_SCHED_PRELOAD
+            else
+                unset LD_PRELOAD
+            fi
             if [ "$group" = lmbench ]; then
                 $BB mkdir -p /code/lmbench_src/bin/build
                 $BB ln -sf /$libc/lmbench_all /code/lmbench_src/bin/build/lmbench_all
