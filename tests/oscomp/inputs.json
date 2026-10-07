@@ -51,6 +51,10 @@
         [
           "/musl/lib/libc.so",
           "/lib/ld-musl-loongarch64.so.1"
+        ],
+        [
+          "/musl/lib/libc.so",
+          "/lib64/ld-musl-loongarch-lp64d.so.1"
         ]
       ]
     }

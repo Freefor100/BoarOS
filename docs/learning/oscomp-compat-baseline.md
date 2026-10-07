@@ -114,3 +114,27 @@ LA已运行组还报告一些原 ELF loader错误；这些与 `fs_fill` 准备�
 只重读同一运行且不另启QEMU。按清理规则移除的原始日志不是长期档案。本轮还并行
 运行主机正确性回归；1915为原Harness的当次计分，不作为无干扰吞吐或时延对比。
 预算截止监督适配基线已经建立，44组完整执行的程序矩阵没有完成。
+
+## LA零分组的后续定位
+
+原LA盘SHA-256为 `1aa79d03cf41e2a80ae4ed43771101c1e67ec8db41c3c20b77792fe6b1b85b50`。
+从该盘读取的musl原ELF均为LA LP64D、16KiB LOAD对齐；cyclictest、iozone、
+netperf/netserver和entry-dynamic.exe的PT_INTERP是
+`/lib64/ld-musl-loongarch-lp64d.so.1`，而原bootstrap只发布标准`/lib`别名。
+这一遗漏属于oscomp-compat，不是内核架构缺失，也不是需要替换原libc的理由。
+
+原cyclictest SHA-256为
+`21c81ebe791caa060a72fcacf1ed4e2b24db289f9af0e872c2fd91ba5c311d38`，
+原iozone为 `21f518549d21cefce221826c91b7fbc8bdda8583a84682de5000e7c4d0a01c26`，
+原netperf为 `0a10da9793cc7462169f7ef3eedf7c4ceb7d5591d27570724470622d7f697f2f`，
+原libc.so为 `816cff1d1abbef3f1423bbce01a56f00c97b6ff8e20d49966c9d4b6d27e5e7be`。
+相同程序/参数在固定Linux
+`references/linux@f4cdf7ca9a1fdcca413157df19753f388a5a224e`及BoarOS，
+512MiB/1GiB均复现缺解释器时exec errno2；只补原盘libc链接后cyclictest/iozone
+help和netperf version退出0，netserver help退出1，与Linux实际native状态一致。
+八次启动均正常收口，不能把help验证当作原性能组或新正式总分。
+
+另一个独立原因是原musl BusyBox对无shebang文本脚本的处理：原
+`run-static.sh`/`run-dynamic.sh`没有`#!`，同格式的单条原runtest调用在Linux与
+BoarOS都被原BusyBox拒绝并返回`Exec format error`。kernel的ENOEXEC正确。
+这项后续采用用户确认的显式shell执行适配，必须公开新的runner身份。

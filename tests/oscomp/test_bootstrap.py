@@ -36,6 +36,7 @@ class BootstrapTests(unittest.TestCase):
         self.assertIn(' /lib64/ld-linux-loongarch-lp64d.so.1', script)
         self.assertIn('/usr/lib64/ld-linux-loongarch-lp64d.so.1', script)
         self.assertIn('/lib/ld-musl-loongarch64.so.1', script)
+        self.assertIn('ln -s /musl/lib/libc.so /lib64/ld-musl-loongarch-lp64d.so.1', script)
         self.assertNotIn('ld-linux-riscv64', script)
         self.assertIn('BOAROS_EVAL_ARCH=loongarch', profile['envp'])
         subprocess.run(['sh', '-n', '-c', script], check=True)

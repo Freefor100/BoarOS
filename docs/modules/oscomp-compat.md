@@ -130,6 +130,13 @@ PT_INTERP为`/lib64/ld-linux-loongarch-lp64d.so.1`，另需现有`/lib`与`/usr/
 三个链接，原盘程序与runtime不变。第二次容器已编译并启动两侧，发现此准备错误后
 主动结束，资源回收未验证；该流不作为正式总分，也不拼接后续运行。
 
+原LA musl的cyclictest、iozone、netperf/netserver及entry-dynamic.exe另请求
+`/lib64/ld-musl-loongarch-lp64d.so.1`。bootstrap必须把它指向原盘
+`/musl/lib/libc.so`，不能用只有`/lib/ld-musl-loongarch64.so.1`的路径代替。
+同一未修改ELF在固定Linux16KiB与BoarOS的两种RAM下，缺链接均exec ENOENT，
+补原盘链接后help/version入口正常，native状态与Linux一致且根owner正常收口。
+这是兼容启动环境修复，通用内核没有放宽exec规则；1915历史成绩不因此被改写。
+
 ## 整体审查后的报告契约
 
 一次独立只读整体审查确认四项P2并集中修复：显式公共INIT_CONFIG覆盖命令行/环境
