@@ -362,3 +362,12 @@ make test-riscv test-scale-riscv test-io-sleep-riscv test-stack-usage \
 无 subsystem 的 function 仍 exit 6，传 cpuset 仍因没有控制器 exit 32；
 无信号驱动的 helper 两侧仍在 3 秒后 SIGKILL/wait=9。abort01 的 BoarOS
 首个失败仍为 chown ENOSYS、exit 2。隔离变体身份与原 utime 结果见[文件时间](file-timestamps.md)。
+
+## TTY交互启动同步（2026-10-07）
+
+双架构集成回归在固定Linux LA1GiB暴露cat探针的同步缺口：runner只等命令
+回显便注入下一行，串口最后仅一条TTY_CAT_FOREGROUND，不能证明cat实际读取。
+自有交互命令改为子shell先输出READY、随后exec原cat，宿主收到READY才发数据；
+仍要求行规程echo与cat真实回送分别出现。Linux/BoarOS的LA512MiB/1GiB和
+RV门禁通过，没有修改原BusyBox、TTY核心、超时或结果归一化。固定资料与
+原程序身份沿上述终端验收；该事实是runner同步修复，不是Linux/BoarOS ABI差异。

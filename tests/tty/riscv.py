@@ -126,7 +126,9 @@ def applications(serial):
     serial.send(b"printf 'TTY_EDIX\x7fT_OK\\n'\n")
     serial.expect(rb'(?m)^TTY_EDIT_OK\r?\n'); serial.expect(PROMPT)
     serial.shell("test \"$(printf abcd | wc -c)\" = 4 && printf 'tty-file' >/tmp/tty-file && test \"$(cat /tmp/tty-file)\" = tty-file && printf 'TTY_FILE_OK\\n'", 'TTY_FILE_OK')
-    serial.send(b'cat\n'); serial.expect(rb'(?m)^cat\r?\n')
+    # 命令回显不能确认子进程已启动；先等前台子shell真正执行。
+    serial.send(b'sh -c \'printf "TTY_CAT_READY\\n"; exec cat\'\n')
+    serial.expect(rb'(?m)^TTY_CAT_READY\r?\n')
     serial.send(b'TTY_CAT_FOREGROUND\n')
     # canonical echo与cat真正回送分别出现，第二条记录确认子进程已经运行。
     serial.expect(rb'(?m)^TTY_CAT_FOREGROUND\r?\n')
