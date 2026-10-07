@@ -74,7 +74,10 @@ LA原musl的sched函数直接ENOSYS，RV原盘同名函数已有syscall实现；
 构建和报告身份见[默认接入](learning/oscomp-compat-baseline.md#默认make-all接入la-linux调度运行时)。
 已选择B保留当前地址布局，原brk ELF的截断失败继续记录；默认basic仍90/102。
 独立修正诊断的92/102保持独立身份，VFAT及/dev/vda2环境仍作为后续共同能力。
-更新后的容器完整基线另行记录，不以本地聚焦运行改写1915历史成绩。
+当前默认容器原联合分2130，40组结束，两侧LTP-glibc总预算中断、LTP-musl未到达；
+1915历史成绩保留，正常根owner回收未验证。LTP还暴露共同/proc/cpuinfo接口缺失
+及Bash/Perl、MMC和网络命名空间环境依赖；共同procfs修复先在main实施，环境扩展
+按真实消费者另定范围，不以fake辅助命令、输入失败或原judge分数替代能力。
 完整凭据/权限、运行时网络配置和无 RNG 平台的可信熵接入由目标应用确定交付范围；
 LA 更广用户环境继续按真实消费者验收，SMP 单独规划。
 

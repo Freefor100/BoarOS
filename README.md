@@ -173,7 +173,7 @@ libc-test的无shebang内层脚本改为在临时外层副本中用原BusyBox sh
 由原libc直接返回ENOSYS，固定Linux同样失败；默认兼容环境现已提供真实Linux调度接口。
 修复后的LA-musl原libc-test已得217分，iozone/netperf也已进入完整原组并正常回收；
 LA libc-test逐ID状态与固定Linux一致，共同glibc失败及可选网络项继续保留，
-见[后续诊断](docs/learning/oscomp-compat-baseline.md#启动修复后的原组诊断)。此前原组诊断没有重跑官方容器总分。
+见[后续诊断](docs/learning/oscomp-compat-baseline.md#启动修复后的原组诊断)。最新默认容器调用已取得原联合2130分，具体44组状态见默认运行时接入记录。
 RV多出的静态clock_gettime失败已逐指令定位为原glibc malloc初始化污染errno，
 时钟返回0；同一原ELF的Linux错误返回对照也复现，见[具体归因](docs/learning/oscomp-compat-baseline.md#rv静态clock_gettime的errno来源)。
 原basic两侧、两种libc均为90/102：原brk包装器截断地址丢2分，缺真实VFAT及
@@ -189,7 +189,8 @@ RV多出的静态clock_gettime失败已逐指令定位为原glibc malloc初始�
 `make all`已构建并启动，LA-musl cyclictest四场景及18线程采样通过。默认原盘cyclictest
 两种libc在两侧都完成真实采样并正常回收；musl libc-test两侧保持217分。
 按已确认的B路线保留现有地址布局和原brk ELF，默认basic仍90/102；独立修正诊断的
-92分不计入默认结果。构建链与验收见[默认运行时接入](docs/learning/oscomp-compat-baseline.md#默认make-all接入la-linux调度运行时)。
+92分不计入默认结果。本次容器40组结束、两侧LTP-glibc总预算中断、LTP-musl未到达，
+正常根资源回收未验证；生命周期的额外一秒误判已按实际tick精度修正。构建链与验收见[默认运行时接入](docs/learning/oscomp-compat-baseline.md#默认make-all接入la-linux调度运行时)。
 第三次运行发现的RV ext4 fatal保留了原现场；冷读OOM的通用修复先落main再合入，并在新的完整容器运行中未再次触发fatal。原判分成绩、总预算中断和未验证的资源回收边界分别记录。
 
 本分支已合入单核数据路径修复，并补跑原版 iozone、cyclictest、iperf、libcbench、lmbench 两种 libc 的一次评分。十个脚本都结束；当时的根盘 cleanup 错误已定位为 PID 1 退出时后台用户 owner 尚未回收，并在 main 修复后同步本分支。随后仅重跑原版 iperf，两种 libc 的十二项成功且正常关机；cyclictest 部分零采样仍待定位。分数、真实 iperf 吞吐和 1/10 ms 延迟的 36 次补测见[当前五项成绩与选择依据](docs/learning/data-path-budget-experiments.md#受控延迟与原版五项评分补测2026-10-06)。常规评分复用已核对输入，不重做四个发布资产的哈希扫描。

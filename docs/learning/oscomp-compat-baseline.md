@@ -496,7 +496,7 @@ make test-oscomp-official
 从内核PID1配置解压的payload与该实际DSO逐字节一致，guest成功发布后执行原程序。
 
 容器四个cyclictest原组均自然结束，四场景各组18个线程都采样，未见调度查询ENOSYS。
-原judge的单组分如下；这些数值来自同一次尚在继续的完整官方调用，未拼接正式总分。
+原judge的单组分如下；这些数值来自同一次完整官方调用，没有拼接多次启动。
 
 | 容器默认cyclictest | glibc | musl |
 |---|---:|---:|
@@ -504,4 +504,66 @@ make test-oscomp-official
 | LA | 7.228549521855053 | 7.3363133878893665 |
 
 本次容器basic四格仍90、BusyBox四格54、musl libc-test两侧217，glibc为RV178/LA179。
-全启动的PID1和根owner收口必须等整次运行结束核对；本段的原组完成不代替该证据。
+全启动最终被总预算终止，PID1和根owner正常收口未验证；本段的原组完成不代替该证据。
+
+
+这次完整原Harness调用最终产生原联合postwork整数分**2130**，同一次RV/LA
+两份输出重放原公式一致。全部44组状态为40个completed、两侧LTP-glibc各一个
+总预算timeout、两侧LTP-musl各一个not-reached。completed表示原外层结束及退出0，
+不把内部TFAIL/TBROK、跳过或缺失能力计为通过；没有新增内核fatal。
+
+| 原judge子项 | RV glibc | RV musl | LA glibc | LA musl |
+|---|---:|---:|---:|---:|
+| basic | 90 | 90 | 90 | 90 |
+| BusyBox | 54 | 54 | 54 | 54 |
+| cyclictest | 7.448426 | 7.242742 | 7.228550 | 7.336313 |
+| iozone | 27.356875 | 26.886448 | 30.640868 | 30.338661 |
+| iperf | 6 | 6 | 6 | 6 |
+| libcbench | 38.866931 | 31.360315 | 42.451386 | 36.812202 |
+| libc-test | 178 | 217 | 179 | 217 |
+| lmbench | 51.183782 | 51.653248 | 53.490334 | 53.707181 |
+| Lua | 9 | 9 | 9 | 9 |
+| netperf | 8.266265 | 8.322433 | 8.878086 | 8.805696 |
+| LTP原始分 | 654 | 0（未到达） | 616 | 0（未到达） |
+
+LTP行是原judge原始分；联合总分继续使用原postwork的LTP公式，不直接相加。
+本次RV/LA分别记录569/540个LTP单项，源码helper跳过17/16，人工排除均0。
+300秒单项监督、TERM后2秒KILL规则及原34项源码表保持；本轮单项监督超时计数
+为0，最终活动项分别为fremovexattr01/flock03，均由3600秒全启动预算截断。
+两侧最终都没有到达LTP-musl，不是cyclictest-musl仍不能运行，也不把缺少结果补成通过。
+此前1915分保留其原提交与适配身份，本次2130另立记录；并行运行的时延/吞吐分
+不用于独占性能比较。
+
+首次收集误把LA记为unknown-lifecycle：旧observer要求elapsed >= budget+1，
+RV最后采样3601.42秒，而LA为3600.94秒，因此同一总预算终止被一侧漏记。
+修复使用/proc实际start_ticks的精度：先减去一个USER_HZ tick的不确定性，再判断
+下界是否达到预算。固定容器sysconf返回100 ticks/s，两侧下界为3601.41/3600.93秒。
+新observer直接记录单位；旧记录通过同一固定镜像只读恢复单位，原lifecycle.json、
+串口、kernel/helper/DSO、原judge及postwork字节不改写。报告同时保留原记录与
+解释后的budget证据，仍将两侧PID1、页/堆/栈/盘/设备正常回收记为未验证。
+预算前、tick不确定区间、预算后不足一秒和owner变化的反例复现旧失败并通过修复；
+最终61项host门禁通过，重收集同一官方调用成功，不再启动客体或改变分数。
+
+LA报告的11条load-error并非11个主ELF解释器错误：5条来自main内的虚拟化探测，
+systemd-detect-virt缺失后回退读取/proc/cpuinfo，BoarOS当前procfs尚无该共同接口；
+4条为MMC安全/热插拔辅助脚本要求/bin/bash或/usr/bin/perl，原LA盘均缺该解释器；
+1条把调度clisrv的data文本文件作为命令遍历，1条DNS依赖tst_require_drivers及veth。
+原监督的直接EXEC-ERROR计数为0；case里的shell子命令错误仍保留原文本，不能
+据其load标签断言主ELF没有进入main。依据为
+`references/oscomp-testsuits@8b58dd16d26d30f7c74d48d5832d870d3051b703`的
+`ltp-full-20240524/lib/tst_virt.c`、MMC脚本、热插拔工具及clisrv/data，和原LA盘
+只读debugfs内容；`fs/procfs.c`核对共同接口缺失。未新增fake解释器、虚拟化成功
+命令或测例跳过。共同procfs缺口归main后续，完整Bash/Perl、MMC控制器及网络
+命名空间环境按真实消费者另定范围；本轮未补跑这些单项的固定Linux对照，不将
+其全部归为上游输入问题。
+
+```sh
+make test-oscomp-host
+python3 -B tests/oscomp/official.py --output build/oscomp-official-runtime-default
+# 新collector只读重收集该次调用；不重启、不拼接、不改原judge。
+python3 -B tests/oscomp/official.py --collect-existing build/oscomp-official-runtime-default
+```
+
+结果核对后按既有pruner清理已收口目录；工具、运行时及内核缓存保留，历史未解
+现场继续保留。结论为默认双架构、带既有监督/显式shell及LA调度运行时适配的
+容器流程已实跑并收集；原案例失败、缺失能力、总预算未到达和正常回收证据分别记录。

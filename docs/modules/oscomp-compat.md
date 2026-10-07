@@ -214,6 +214,9 @@ LTP逐项保存原shell退出值；native wait状态只从实际TIMEOUT-END读�
 保持null。TFAIL/TBROK、TCONF、源码helper SKIP、人工EXCLUDE、监督超时、EXEC
 装载失败、WAIT运行错误分别保留；已报告的失败不能被后续skip或退出0掩盖。
 不完整单项仍incomplete，非零但无法证明发生阶段的记录保持unknown；不猜main已到达。
+case内shell子命令的load-error不代表主ELF没有进入main，直接监督EXEC-ERROR与
+原程序内部辅助命令缺失分别核对。预算判断扣除/proc start_ticks的一个tick不确定性，
+不用额外一秒门槛；原采样与重解释证据都保留，预算结束不证明正常根owner回收。
 识别实际LTP彩色标签时只跳过metadata中的ANSI SGR，证据原字节和原judge输入不变。
 
 官方只读observer验证本次容器digest与隔离submit挂载，读取QEMU实际PID/start_ticks、

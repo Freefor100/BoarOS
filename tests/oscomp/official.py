@@ -129,7 +129,8 @@ def baseline_ready(architectures):
 
 
 LIFECYCLE_PROBE = r'''import os,json
-result={'uptime':float(open('/proc/uptime').read().split()[0]),'processes':{}}
+ticks=os.sysconf('SC_CLK_TCK')
+result={'uptime':float(open('/proc/uptime').read().split()[0]),'clock_ticks_per_second':ticks,'processes':{}}
 for pid in os.listdir('/proc'):
  if not pid.isdigit():continue
  try:
@@ -141,23 +142,34 @@ for pid in os.listdir('/proc'):
   words=[a.decode() for a in argv if a]
   if words[words.index('-kernel')+1]!={'riscv':'kernel-rv','loongarch':'kernel-la'}[arch]:continue
   stat=open('/proc/'+pid+'/stat').read().rpartition(')')[2].split()
-  start=int(stat[19]);elapsed=result['uptime']-start/os.sysconf('SC_CLK_TCK')
+  start=int(stat[19]);elapsed=result['uptime']-start/ticks
   if arch in result['processes']:raise RuntimeError('multiple QEMU owners')
   result['processes'][arch]={'pid':int(pid),'start_ticks':start,'elapsed_seconds':elapsed}
  except (FileNotFoundError,ProcessLookupError,ValueError):continue
 print(json.dumps(result))'''
 
 
+def budget_evidence(observed, budget_seconds, clock_ticks_per_second):
+    if observed is None: return None
+    if clock_ticks_per_second <= 0: raise ValueError('invalid process clock resolution')
+    # start_ticks向下取整，先扣除一个tick的不确定性，不能额外要求再活一秒。
+    lower_bound = observed['elapsed_seconds'] - 1 / clock_ticks_per_second
+    return {**observed, 'budget_observed': bool(observed.get('budget_observed')) or
+            lower_bound >= budget_seconds, 'elapsed_lower_bound_seconds': lower_bound}
+
+
 def update_lifecycle(record, snapshot):
     record['samples'] += 1
+    if 'clock_ticks_per_second' in snapshot:
+        record['clock_ticks_per_second'] = snapshot['clock_ticks_per_second']
     for arch in local.ARCH_KEYS:
         item, old = snapshot['processes'].get(arch), record['architectures'].get(arch)
         if item:
             if old and (old['pid'], old['start_ticks']) != (item['pid'], item['start_ticks']):
                 raise RuntimeError('QEMU owner changed during the single boot')
-            record['architectures'][arch] = {**(old or {}), **item, 'end_observed': False,
-                'budget_observed': bool(old and old.get('budget_observed')) or
-                                   item['elapsed_seconds'] >= record['budget_seconds'] + 1}
+            observed = {**(old or {}), **item, 'end_observed': False}
+            record['architectures'][arch] = budget_evidence(observed, record['budget_seconds'],
+                                                           record['clock_ticks_per_second'])
         elif old:
             old['end_observed'] = True
             old.setdefault('end_observed_uptime', snapshot['uptime'])
@@ -213,6 +225,17 @@ def collect_results(directory, report):
                       lifecycle.get('source_commit') != report['source']['commit']):
         raise RuntimeError('lifecycle evidence belongs to another image or submission')
     report['lifecycle'] = lifecycle
+    if lifecycle:
+        ticks = lifecycle.get('clock_ticks_per_second')
+        clock_source = 'owned-container-probe'
+        if ticks is None:
+            # 旧采样未保存USER_HZ；从同一固定镜像的sysconf恢复单位，原记录不改写。
+            ticks = int(subprocess.check_output(['docker', 'run', '--rm', '--network', 'none',
+                '--entrypoint', 'python3', report['container']['reference'], '-c',
+                "import os;print(os.sysconf('SC_CLK_TCK'))"], text=True))
+            clock_source = 'pinned-container-sysconf'
+        report['lifecycle_clock'] = {'ticks_per_second': ticks, 'source': clock_source,
+                                    'reference': report['container']['reference']}
     report['collector'] = {'commit': local.output(['git', 'rev-parse', 'HEAD']),
         'tree': local.output(['git', 'rev-parse', 'HEAD^{tree}']),
         'dirty': local.output(['git', 'status', '--porcelain'])}
@@ -223,7 +246,8 @@ def collect_results(directory, report):
         submit = directory / 'submit'; log = submit / ('os_serial_out_' + key + '.txt')
         if not log.is_file(): raise RuntimeError('missing actual serial stream: ' + key)
         serial = log.read_text(errors='replace'); done = 'BOAROS-EVAL COMPLETE' in serial
-        evidence = lifecycle.get('architectures', {}).get(arch)
+        evidence = budget_evidence(lifecycle.get('architectures', {}).get(arch),
+                                  config['qemu.timeout'], ticks) if lifecycle else None
         reason = classify_official_exit(serial, evidence)
         base = submit / ('build/riscv' if arch == 'riscv' else 'build/loongarch') / 'oscomp'
         entry = {'kernel_sha256': local.sha(submit / identity['architectures'][arch]['kernel']),
@@ -233,6 +257,7 @@ def collect_results(directory, report):
             'kernel_failure': local.kernel_failure(serial),
             'root_resources_verified': reason == 'qemu-exit' and done and PROFILES[arch].root_success(serial, 0),
             'groups': local.summarize_groups(serial, local.GROUPS, reason)}
+        entry['lifecycle_budget_evidence'] = evidence
         entry['runtime_compatibility'] = local.runtime_info(base)
         summary[key] = local.judge(log, config)
         (directory / ('judge-' + key + '.json')).write_text(json.dumps(summary[key], indent=2) + '\n')

@@ -96,18 +96,33 @@ class ContainerTests(unittest.TestCase):
     def test_lifecycle_requires_seen_owner_and_conservative_budget_evidence(self):
         module = self.module()
         record = {'samples': 0, 'budget_seconds': 10, 'architectures': {}}
-        module.update_lifecycle(record, {'uptime': 100, 'processes': {'riscv': {
-            'pid': 12, 'start_ticks': 9000, 'elapsed_seconds': 10.1}}})
+        module.update_lifecycle(record, {'uptime': 100, 'clock_ticks_per_second': 100,
+            'processes': {'riscv': {
+            'pid': 12, 'start_ticks': 9000, 'elapsed_seconds': 9.99}}})
         self.assertFalse(record['architectures']['riscv']['budget_observed'])
         self.assertNotIn('loongarch', record['architectures'])
-        module.update_lifecycle(record, {'uptime': 101, 'processes': {'riscv': {
-            'pid': 12, 'start_ticks': 9000, 'elapsed_seconds': 11.1}}})
+        module.update_lifecycle(record, {'uptime': 101, 'clock_ticks_per_second': 100,
+            'processes': {'riscv': {
+            'pid': 12, 'start_ticks': 9000, 'elapsed_seconds': 10.94}}})
         self.assertTrue(record['architectures']['riscv']['budget_observed'])
         with self.assertRaisesRegex(RuntimeError, 'owner changed'):
             module.update_lifecycle(record, {'uptime': 102, 'processes': {'riscv': {
                 'pid': 13, 'start_ticks': 10100, 'elapsed_seconds': 1}}})
         module.update_lifecycle(record, {'uptime': 103, 'processes': {}})
         self.assertTrue(record['architectures']['riscv']['end_observed'])
+
+    def test_budget_reclassification_keeps_raw_evidence_and_tick_uncertainty(self):
+        module = self.module()
+        observed = {'pid': 12, 'start_ticks': 9000, 'elapsed_seconds': 10.94,
+                    'budget_observed': False, 'end_observed': False}
+        effective = module.budget_evidence(observed, 10, 100)
+        self.assertTrue(effective['budget_observed'])
+        self.assertFalse(observed['budget_observed'])
+        self.assertFalse(effective['end_observed'])
+        for elapsed in (9.99, 10.0, 10.005):
+            self.assertFalse(module.budget_evidence(
+                {**observed, 'elapsed_seconds': elapsed}, 10, 100)['budget_observed'])
+        self.assertIsNone(module.budget_evidence(None, 10, 100))
 
     def test_container_entry_uses_upstream_parser_despite_local_run_module(self):
         self.module()
