@@ -39,6 +39,13 @@ lmbench、lua、netperf、ltp，各组先glibc再musl。basic/run-all.sh的原�
 为0644，bootstrap只补执行位；lmbench的写死辅助路径指向原盘当前libc二进制。
 LTPROOT和其testcases/bin在同名Lua test.sh之前，保留原比赛目录遍历与参数。
 
+libc-test原run-static.sh/run-dynamic.sh没有shebang，原LA musl BusyBox在固定
+Linux也拒绝直接执行。libctest-hook.sh只在临时外层脚本副本中将这两行改为
+原libc自己的BusyBox sh显式执行；原内层脚本、程序、参数、标记和judge不改。
+每行必须恰好匹配一次，形状变化返回125而不替换遍历流程。该适配适用于两架构
+的两种libc，本地及新官方report以script_adaptations记录是否选中及hook内容哈希；
+回收旧冻结运行时仍保留旧身份，不能把新适配归给1915历史成绩。
+
 LTP只在临时副本的唯一执行行接入现有监督，不替换上游runtest或输出测例答案。
 监督持有直接child和仍存活的进程组身份；握手放行前退出测试组，child可正常
 setsid且kill(0,signal)不会终止外层包装器。native退出/信号状态原样传递；默认
@@ -92,6 +99,9 @@ make all                              # 恢复双架构评测默认配置
 ## 验证与证据边界
 
 bootstrap host门禁验证目标loader、helper架构拒绝、独立配置和显式监督参数。
+显式shell门禁验证只改变两个入口、保留非零子脚本后续进展及拒绝异常脚本形状。
+同一原BusyBox与runtest在固定Linux/BoarOS的512MiB/1GiB验证直接执行ENOEXEC、
+显式解释后进入原案例；runtest打印Pass时包装器仍可能退出1，不能把输出当退出0。
 真实supervisor使用同一raw ELF及原盘BusyBox对照固定Linux/BoarOS，覆盖native
 退出、信号、组隔离、setsid、TERM无效后的KILL/reap、后续进展和源码helper跳过。
 Linux对照bootstrap为程序建立真实正进程组，因为直接内核init可继承PGID0。

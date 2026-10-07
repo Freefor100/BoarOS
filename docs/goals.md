@@ -59,6 +59,8 @@ oscomp-compat；保留300秒LTP监督和有源码依据的helper跳过，明确�
 环境随后单独验收，不在本阶段预先铺开新ABI和基础设施。
 原盘RV的extent释放fatal已保留，冷读OOM独立复现的通用修复先落main并合入；
 内核运行阻塞与原judge分数分开。当前容器分组40项正常结束，两侧LTP-glibc各在总预算截止、LTP-musl未到达，PID1资源收口未验证；原分与逐项失败留在兼容分支固定运行记录。
+LA零分组的原musl loader别名及libc-test显式shell启动适配留在兼容分支；
+原cyclictest运行时调度查询ENOSYS已在固定Linux复现，原输入限制与内核缺口分开。
 完整凭据/权限、运行时网络配置和无 RNG 平台的可信熵接入由目标应用确定交付范围；
 LA 更广用户环境继续按真实消费者验收，SMP 单独规划。
 

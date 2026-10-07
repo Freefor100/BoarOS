@@ -50,6 +50,14 @@ for group in $groups; do
                     /$libc/busybox sh /tmp/boaros-ltp-$libc.sh
                     result=$?
                 fi
+            elif [ "$group" = libctest ]; then
+                export BOAROS_CASE_SHELL=/$libc/busybox
+                if ! $BB sh /tmp/boaros-libctest-hook.sh ./libctest_testcode.sh /tmp/boaros-libctest-$libc.sh; then
+                    result=125
+                else
+                    /$libc/busybox sh /tmp/boaros-libctest-$libc.sh
+                    result=$?
+                fi
             else
                 /$libc/busybox sh ./${group}_testcode.sh
                 result=$?

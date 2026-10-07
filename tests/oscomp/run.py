@@ -85,6 +85,15 @@ def original_score(summary, config):
             'original_postwork_verdict': job.verdict_value, 'html': job.html}
 
 
+def script_adaptations(selected):
+    return {
+        'ltp-supervision': {'active': 'ltp' in selected, 'hook_sha256': sha(HERE / 'ltp-hook.sh')},
+        'libctest-explicit-shell': {'active': 'libctest' in selected,
+            'hook_sha256': sha(HERE / 'libctest-hook.sh'),
+            'scope': 'two nested original text scripts, original BusyBox sh; content and judge unchanged'},
+    }
+
+
 def kernel_failure(serial):
     prefixes = ('BoarOS: fatal ', 'BoarOS: timer error status=',
                 'BoarOS: scheduler error status=', 'BoarOS: user fault resolver error status=')
@@ -285,6 +294,7 @@ def main():
         'kernel_commit': output(['git', 'rev-parse', 'HEAD']), 'kernel_dirty': output(['git', 'status', '--porcelain']),
         'requested_architectures': architectures, 'selected_groups': selected,
         'ltp_case_timeout_seconds': args.case_timeout, 'ltp_diagnostic_exclusions': args.diagnostic_exclude,
+        'script_adaptations': script_adaptations(selected),
         'rng_added': args.rng, 'architectures': {}, 'baseline_completed': False}
     stage = 'preparation'
     try:
@@ -313,7 +323,7 @@ def main():
                 'qemu_command': command, 'qemu': output([str(executable), '--version']).splitlines()[0],
                 'qemu_sha256': sha(executable), 'qemu_mode': oct(executable.stat().st_mode & 0o777),
                 'qemu_selected_path': qemu, 'qemu_resolved_path': str(executable), 'extra_disk': None}
-            for name in ('init.sh', 'ltp-hook.sh', 'ltp-case.sh', 'ltp-skips.tsv'):
+            for name in ('init.sh', 'ltp-hook.sh', 'libctest-hook.sh', 'ltp-case.sh', 'ltp-skips.tsv'):
                 entry[name + '_sha256'] = sha(HERE / name)
             report['architectures'][arch] = entry
             (target / 'identity.json').write_text(json.dumps(entry, indent=2) + '\n')

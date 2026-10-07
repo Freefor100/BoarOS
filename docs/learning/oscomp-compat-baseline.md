@@ -137,4 +137,21 @@ help和netperf version退出0，netserver help退出1，与Linux实际native状�
 另一个独立原因是原musl BusyBox对无shebang文本脚本的处理：原
 `run-static.sh`/`run-dynamic.sh`没有`#!`，同格式的单条原runtest调用在Linux与
 BoarOS都被原BusyBox拒绝并返回`Exec format error`。kernel的ENOEXEC正确。
-这项后续采用用户确认的显式shell执行适配，必须公开新的runner身份。
+用户确认后新增libctest-hook.sh，在临时外层副本中仅将两条执行行改为原BusyBox
+sh显式解释，原内层内容与judge不变。45项host门禁通过；同一原runtest的静态/
+动态argv及显式shell入口在Linux/BoarOS、512MiB/1GiB均打印Pass，native wait
+均为256（包装器退出1），无装载错误。BoarOS两种RAM均正常退出、根owner收口、
+heap-live=0。完整libc-test列表的分数和逐案例失败仍须原盘诊断，不将这些入口
+验证算作整组通过。本地及新容器report公开script_adaptations与hook SHA-256。
+
+补loader后原cyclictest-musl仍在调度查询阶段退出1：原参数
+`-a -i 1000 -t1 -p99 -D 1s -q`在固定Linux/BoarOS均报告
+`unable to get scheduler parameters`，没有exec错误。上述原libc.so反汇编的
+sched_getparam（0x544e0）与sched_getscheduler（0x54500）直接生成-38并调用
+__syscall_ret，未发出syscall。固定`references/musl/musl-1.2.5.tar.gz`
+（SHA-256 `a9a118bbe84d8764da0ea0d28b3ab3fae8477fc7e4085d90102b8596fc7c75e4`）
+的src/sched同名源文件也直接返回ENOSYS；这只能核对行为，不能证明原盘libc版本。
+独立整数raw syscall 120/121在两系统、两种RAM均返回0，priority/policy均为0。
+因此该失败归属原盘运行时限制，不通过修改内核、原ELF或libc来获取分数。
+补loader后的本地原cyclictest组自然结束，glibc原judge分7.445894033199223、
+musl0且根资源正常回收；这是派生QEMU的诊断结果，不改写容器1915历史分数。

@@ -39,6 +39,8 @@ def main():
     # Decode a build-owned executable with the original BusyBox; no host disk injection.
     startup = startup.replace('# BOAROS_CASE_PAYLOAD',
         f"$BB printf '%b' '{payload}' > /tmp/boaros-case\n$BB chmod 755 /tmp/boaros-case\n"
+        "$BB cat > /tmp/boaros-libctest-hook.sh <<'BOAROS_LIBCTEST_HOOK_END'\n"
+        + (HERE / 'libctest-hook.sh').read_text() + '\nBOAROS_LIBCTEST_HOOK_END\n'
         "$BB cat > /tmp/boaros-ltp-hook.sh <<'BOAROS_LTP_HOOK_END'\n"
         + (HERE / 'ltp-hook.sh').read_text() + '\nBOAROS_LTP_HOOK_END\n'
         + "$BB cat > /tmp/boaros-ltp-case.sh <<'BOAROS_LTP_CASE_END'\n"

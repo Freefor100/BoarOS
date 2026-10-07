@@ -142,7 +142,7 @@ make inventory-userland-riscv  # 能力清单，不是必过门禁
 make test-references
 ```
 
-聚焦测试只在对应[模块文档](docs/README.md)维护。`make run-riscv` 不附根盘，启动后停留 timer-idle，需人工退出；`make debug-riscv` 以 `-S -s` 等待 GDB。完整比赛 Harness 的原盘运行与容器基线尚未验收；已完成的 LA 单核矩阵不替代该结果。
+聚焦测试只在对应[模块文档](docs/README.md)维护。`make run-riscv` 不附根盘，启动后停留 timer-idle，需人工退出；`make debug-riscv` 以 `-S -s` 等待 GDB。比赛 Harness 已有双架构预算截止的容器基线，完整程序矩阵尚未结束；已完成的 LA 单核矩阵不替代该结果。
 
 `build/` 是可重建的本地产物目录，不是验证档案。仅长期保留内核/用户程序编译结果、工具链、当前配置的 Linux 构建缓存等可跨轮复用的产物；一次性运行目录、磁盘镜像、日志和旧构建缓存应在核对结果后清理。`python3 tests/prune-build.py` 预览，`make prune-build` 执行清理；`make clean` 连可复用的内核构建产物也删除。需要临时保留案例镜像以调试时，可给清单入口传 `--keep-pass-images`，调试结束后仍应清理。
 
@@ -168,6 +168,9 @@ PID 1与设备资源正常回收未验证；测例矩阵仍有明确失败及未
 本分支已改名oscomp-compat，默认make all同时生成RV/LA内核；固定输入、独立bootstrap、监督和原judge契约见[双架构评测模块](docs/modules/oscomp-compat.md)。官方digest、逐组阻塞和评分口径见固定运行记录。
 LA原musl ELF的`/lib64/ld-musl-loongarch-lp64d.so.1`链接遗漏已定位并补向原盘libc；
 固定Linux和BoarOS两种RAM的同ELF启动对照通过，历史零分仍按原运行保留。
+libc-test的无shebang内层脚本改为在临时外层副本中用原BusyBox sh显式执行；
+内容、程序和judge保留，runner公开适配身份。原LA musl cyclictest的调度查询
+由原libc直接返回ENOSYS，固定Linux同样失败，不用内核或替换libc掩盖此输入限制。
 第三次运行发现的RV ext4 fatal保留了原现场；冷读OOM的通用修复先落main再合入，并在新的完整容器运行中未再次触发fatal。原判分成绩、总预算中断和未验证的资源回收边界分别记录。
 
 本分支已合入单核数据路径修复，并补跑原版 iozone、cyclictest、iperf、libcbench、lmbench 两种 libc 的一次评分。十个脚本都结束；当时的根盘 cleanup 错误已定位为 PID 1 退出时后台用户 owner 尚未回收，并在 main 修复后同步本分支。随后仅重跑原版 iperf，两种 libc 的十二项成功且正常关机；cyclictest 部分零采样仍待定位。分数、真实 iperf 吞吐和 1/10 ms 延迟的 36 次补测见[当前五项成绩与选择依据](docs/learning/data-path-budget-experiments.md#受控延迟与原版五项评分补测2026-10-06)。常规评分复用已核对输入，不重做四个发布资产的哈希扫描。

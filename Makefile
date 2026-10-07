@@ -649,12 +649,12 @@ $(OSCOMP_CASE_LA): tests/oscomp/case.c tests/common/raw_syscall.h tests/loongarc
 .PHONY: force-oscomp-init
 force-oscomp-init:
 
-$(OSCOMP_INIT): force-oscomp-init $(OSCOMP_CASE) tests/oscomp/init.sh tests/oscomp/ltp-hook.sh tests/oscomp/ltp-case.sh tests/oscomp/ltp-skips.tsv tests/oscomp/inputs.json tests/oscomp/prepare.py
+$(OSCOMP_INIT): force-oscomp-init $(OSCOMP_CASE) tests/oscomp/init.sh tests/oscomp/ltp-hook.sh tests/oscomp/libctest-hook.sh tests/oscomp/ltp-case.sh tests/oscomp/ltp-skips.tsv tests/oscomp/inputs.json tests/oscomp/prepare.py
 	python3 -B tests/oscomp/prepare.py --arch riscv --case $(OSCOMP_CASE) --output $@ \
 		--groups '$(OSCOMP_GROUPS)' --case-timeout $(OSCOMP_CASE_TIMEOUT) \
 		--diagnostic-exclude '$(OSCOMP_DIAGNOSTIC_EXCLUDE)'
 
-$(OSCOMP_INIT_LA): force-oscomp-init $(OSCOMP_CASE_LA) tests/oscomp/init.sh tests/oscomp/ltp-hook.sh tests/oscomp/ltp-case.sh tests/oscomp/ltp-skips.tsv tests/oscomp/inputs.json tests/oscomp/prepare.py
+$(OSCOMP_INIT_LA): force-oscomp-init $(OSCOMP_CASE_LA) tests/oscomp/init.sh tests/oscomp/ltp-hook.sh tests/oscomp/libctest-hook.sh tests/oscomp/ltp-case.sh tests/oscomp/ltp-skips.tsv tests/oscomp/inputs.json tests/oscomp/prepare.py
 	python3 -B tests/oscomp/prepare.py --arch loongarch --case $(OSCOMP_CASE_LA) --output $@ \
 		--groups '$(OSCOMP_GROUPS)' --case-timeout $(OSCOMP_CASE_TIMEOUT) \
 		--diagnostic-exclude '$(OSCOMP_DIAGNOSTIC_EXCLUDE)'

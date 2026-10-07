@@ -283,6 +283,7 @@ def main():
         'baseline_established': False, 'program_matrix_passed': False,
         'supervision': {'case_timeout_seconds': 300, 'term_grace_seconds': 2,
                         'skip_table_sha256': local.sha(HERE / 'ltp-skips.tsv'), 'diagnostic_exclusions': []},
+        'script_adaptations': local.script_adaptations(local.GROUPS),
         'architectures': {}}
     stage = 'preparation'; name = 'boaros-oscomp-' + directory.name.removeprefix('oscomp-official-')
     reference = None; observer = None
