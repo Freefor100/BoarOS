@@ -155,3 +155,54 @@ __syscall_ret，未发出syscall。固定`references/musl/musl-1.2.5.tar.gz`
 因此该失败归属原盘运行时限制，不通过修改内核、原ELF或libc来获取分数。
 补loader后的本地原cyclictest组自然结束，glibc原judge分7.445894033199223、
 musl0且根资源正常回收；这是派生QEMU的诊断结果，不改写容器1915历史分数。
+
+## 启动修复后的原组诊断
+
+源码固定为`8a1c9d1399e8342b262f00dd1cfe985bf8cb7e4e`，干净树；原盘身份和
+judge仍取上述固定Harness。每个选组由一次本地启动完成，1GiB/单CPU、无RNG。
+libc-test一次调用同时启动RV/LA，iozone和netperf是各自的LA诊断；不得把这些
+分数相加为正式容器总分。RV使用宿主QEMU11.1.2，LA使用派生RTC QEMU11.1.0，
+与官方QEMU10.0.2和容器GCC13的成绩分开。部分诊断与Linux对照并行，性能数字
+只用于原judge运行结果，不作为受控吞吐对比。
+
+| 原组 | RV glibc / musl | LA glibc / musl | 行为与退出 |
+|---|---|---|---|
+| libc-test | 178 / 217 | 179 / 217 | 两种libc全列表结束，musl的217条静态/动态调用均打印Pass；glibc仍有失败。 |
+| iozone | 未选 | 30.63088510217055 / 30.05100864020287 | 原两脚本结束，无loader错误。 |
+| netperf | 未选 | 8.879897986886947 / 8.80895080473128 | 原两脚本结束，保留so_dontroute、enable_enobufs的errno92及getprotobyname诊断，不能以有分数推断可选接口均支持。 |
+
+上述BoarOS启动均无fatal，PID1退出0，页/堆/任务栈/根盘及设备owner正常收口。
+LA-musl libc-test、iozone、netperf的历史零分已经跨过启动阻塞；cyclictest-musl
+仍属于上一节证明的原运行时ENOSYS，不能冒充修复后的成功案例。
+
+同一原libc-test列表另在固定Linux、1GiB运行，使用同一bootstrap内容与原
+BusyBox，Linux/init helper取`tests/loongarch/root_linux_init.c`，编译定义
+ROOT_CREATE_SESSION，RV另用ROOT_DIRECT_FILESYSTEM。脚本由bootstrap显式
+解释，Linux先启用lo、退出后撤销proc和/dev/shm临时挂载；原程序及列表不改。
+最初Linux未启lo时两种libc的两个socket调用均由原runtest超时，属对照环境缺失，
+纠正后再跑完整列表，没有拼接结果。LA的434条原调用与Linux逐ID、形态及
+Pass/FAIL状态完全相同：glibc179成功/38失败，musl217成功。38项glibc共同失败
+包含原runtest的setvbuf_unget超时，不是LTP监督超时；不修改原程序或libc获取通过。
+
+RV Linux同样为179/217；无RNG的BoarOS多一条静态clock_gettime失败，原断言
+同时要求errno为0，实际为EAGAIN。固定源`references/oscomp-testsuits`
+commit`8b58dd16d26d30f7c74d48d5832d870d3051b703`的
+`libc-test/src/functional/clock_gettime.c`没有在调用前清零errno。额外真实RNG
+诊断中可信设备提供64字节，原ELF该项通过，RV恢复179/217且正常回收。这证明
+差异依赖熵环境，尚未逐指令归因errno的首次写入；不把额外RNG带入正式配置，
+也不让内核伪造随机ready。逐ID失败状态见
+[原glibc失败对照](oscomp-libctest-original-failures.tsv)；该表不包含日志或偶然PID。
+
+可重建本地组与环境诊断：
+
+```sh
+make test-oscomp-host
+python3 -B tests/oscomp/run.py --arch both --groups libctest --diagnostic-timeout 600
+python3 -B tests/oscomp/run.py --arch loongarch --groups iozone --diagnostic-timeout 240
+python3 -B tests/oscomp/run.py --arch loongarch --groups netperf --diagnostic-timeout 240
+python3 -B tests/oscomp/run.py --arch riscv --groups libctest --rng --diagnostic-timeout 180
+make all
+```
+
+新的官方容器整次运行尚未执行，1915仍只指原`11e96a9`冻结运行；原LTP监督的
+300秒/TERM后2秒KILL及34项源码helper表未改动，LTP-musl总预算未到达也未改记通过。

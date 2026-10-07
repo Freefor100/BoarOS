@@ -146,6 +146,10 @@ PT_INTERP为`/lib64/ld-linux-loongarch-lp64d.so.1`，另需现有`/lib`与`/usr/
 同一未修改ELF在固定Linux16KiB与BoarOS的两种RAM下，缺链接均exec ENOENT，
 补原盘链接后help/version入口正常，native状态与Linux一致且根owner正常收口。
 这是兼容启动环境修复，通用内核没有放宽exec规则；1915历史成绩不因此被改写。
+显式shell后原libc-test列表已在RV/LA自然结束，musl均217；LA的glibc179成功/
+38失败与固定Linux逐ID状态一致，原输入的共同失败保持。原iozone/netperf两种
+libc均得到诊断分数和正常回收，netperf的可选socket项错误仍保留。源码、环境、
+失败目录及重建命令见[原组后续诊断](../learning/oscomp-compat-baseline.md#启动修复后的原组诊断)。
 
 ## 整体审查后的报告契约
 

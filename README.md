@@ -171,6 +171,9 @@ LA原musl ELF的`/lib64/ld-musl-loongarch-lp64d.so.1`链接遗漏已定位并补
 libc-test的无shebang内层脚本改为在临时外层副本中用原BusyBox sh显式执行；
 内容、程序和judge保留，runner公开适配身份。原LA musl cyclictest的调度查询
 由原libc直接返回ENOSYS，固定Linux同样失败，不用内核或替换libc掩盖此输入限制。
+修复后的LA-musl原libc-test已得217分，iozone/netperf也已进入完整原组并正常回收；
+LA libc-test逐ID状态与固定Linux一致，共同glibc失败及可选网络项继续保留，
+见[后续诊断](docs/learning/oscomp-compat-baseline.md#启动修复后的原组诊断)。本轮没有重跑官方容器总分。
 第三次运行发现的RV ext4 fatal保留了原现场；冷读OOM的通用修复先落main再合入，并在新的完整容器运行中未再次触发fatal。原判分成绩、总预算中断和未验证的资源回收边界分别记录。
 
 本分支已合入单核数据路径修复，并补跑原版 iozone、cyclictest、iperf、libcbench、lmbench 两种 libc 的一次评分。十个脚本都结束；当时的根盘 cleanup 错误已定位为 PID 1 退出时后台用户 owner 尚未回收，并在 main 修复后同步本分支。随后仅重跑原版 iperf，两种 libc 的十二项成功且正常关机；cyclictest 部分零采样仍待定位。分数、真实 iperf 吞吐和 1/10 ms 延迟的 36 次补测见[当前五项成绩与选择依据](docs/learning/data-path-budget-experiments.md#受控延迟与原版五项评分补测2026-10-06)。常规评分复用已核对输入，不重做四个发布资产的哈希扫描。
