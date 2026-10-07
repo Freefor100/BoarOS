@@ -19,6 +19,8 @@
 2026-10-07拉取并核对实际QEMU10.0.2；固定Dockerfile中的9.2.1不是这个镜像的
 实际版本。容器LA GNU编译器为13.2.0，宿主当前为15.1.0，各自产物身份独立。
 本地派生QEMU和官方容器的结果分别记录，不能只因原judge相同就合称同一环境。
+本次实际本地提交与容器运行身份、完整结果摘要及重建入口见
+[双架构评测学习记录](../learning/oscomp-compat-baseline.md#本次正式容器结果)。
 
 默认`make all`同时生成kernel-rv/kernel-la。RV/LA分别生成整数raw supervisor、
 init.json和头文件；`INIT_CONFIG_RV`/`INIT_CONFIG_LA`独立覆盖，显式共同
@@ -105,7 +107,13 @@ LTP能力缺口，也不修改原程序/libc/judge获取通过。
 
 各阶段记录结论、固定身份和重建命令；运行输出在忽略的build。未解决现场核对前
 保留，收口后先预览再make prune-build，原盘、工具、容器和可复用缓存保留。
-官方容器基线与完整回归结果仍须本阶段后续运行，不能从现有bootstrap验收推导。
+2026-10-07正式容器已按固定digest完成一次单独运行并收齐原判分及44组报告：
+原postwork整数分1915，40组外层正常结束，RV/LA各有一个LTP-glibc预算中断，
+两个LTP-musl未到达。两侧无新内核fatal，均观测到QEMU运行超过3600秒；
+因此`baseline_established=true`、`all_scripts_completed=false`、
+`program_matrix_passed=false`。两侧均由总预算终止，正常PID1及页、堆、任务栈、
+根盘和设备owner回收未验证。该原分是本次单独联合成绩，不表示44组全过。
+评测同时运行主机正确性回归；本次原分不作为无干扰吞吐或时延对比。
 
 容器首跑在原Harness的编译阶段失败：实际GCC13.2不接受-mno-lsx/-mno-lasx，
 Job为Compile Error且没有串口。official入口在采集串口前分类该状态。镜像构建

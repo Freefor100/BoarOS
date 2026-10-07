@@ -160,12 +160,13 @@ I/O已经接入。机制、历史性能口径和unknown见[成本分析](docs/le
 不以内部计数下降替代真实程序效率。当前能力与下一项优化由有效应用证据选择。
 
 评测兼容分支单向接纳main；main保留自身uname，旧glibc结果属于兼容配置。
-双架构原评测镜像与官方容器基线正在兼容分支接入；单侧诊断和逐组补跑不能宣称完整交付。逐次成绩和运行
-输出留在忽略的build；SMP、LA后续用户环境、实板及更大应用另行规划。
+双架构原盘官方容器运行已完成并收齐两侧44个组的状态及原联合评分：40组正常结束，
+两侧LTP各有一个总预算中断，后续musl组未到达。两侧无新内核fatal，但因预算停止，
+PID 1与设备资源正常回收未验证；测例矩阵仍有明确失败及未到达状态，详见
+[固定运行记录](docs/learning/oscomp-compat-baseline.md)。
 
-本分支已改名oscomp-compat，默认make all同时生成RV/LA内核；固定输入、独立bootstrap、监督和原judge契约见[双架构评测模块](docs/modules/oscomp-compat.md)。官方容器已锁定实际digest，基线执行与本地诊断分别验收。
-第三次运行的RV ext4 fatal按运行阻塞保留；冷读OOM的通用修复已先落main再合入。
-报告将原判分完成与基线建立分开，当前仍需干净官方全量结果。
+本分支已改名oscomp-compat，默认make all同时生成RV/LA内核；固定输入、独立bootstrap、监督和原judge契约见[双架构评测模块](docs/modules/oscomp-compat.md)。官方digest、逐组阻塞和评分口径见固定运行记录。
+第三次运行发现的RV ext4 fatal保留了原现场；冷读OOM的通用修复先落main再合入，并在新的完整容器运行中未再次触发fatal。原判分成绩、总预算中断和未验证的资源回收边界分别记录。
 
 本分支已合入单核数据路径修复，并补跑原版 iozone、cyclictest、iperf、libcbench、lmbench 两种 libc 的一次评分。十个脚本都结束；当时的根盘 cleanup 错误已定位为 PID 1 退出时后台用户 owner 尚未回收，并在 main 修复后同步本分支。随后仅重跑原版 iperf，两种 libc 的十二项成功且正常关机；cyclictest 部分零采样仍待定位。分数、真实 iperf 吞吐和 1/10 ms 延迟的 36 次补测见[当前五项成绩与选择依据](docs/learning/data-path-budget-experiments.md#受控延迟与原版五项评分补测2026-10-06)。常规评分复用已核对输入，不重做四个发布资产的哈希扫描。
 普通 `make all` 可直接启动官方原盘；启动辅助文件不由本地 runner 注入。

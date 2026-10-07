@@ -52,4 +52,42 @@ fatal 优先于预算分类，当前案例保存 kernel owner 和原故障行，
 重建命令为 `make test-oscomp-host test-oscomp-official`；官方入口从当前干净
 提交快照构建，不读宿主 build 缓存。每次运行独立，禁止拼接不同启动成绩。
 若只改报告采集器，`--collect-existing` 只读取同一次原 Job/串口/冻结身份和
-observer，分开记录采集器提交与实际内核提交。当前基线仍未完成。
+observer，分开记录采集器提交与实际内核提交；此操作本身不会补跑未到达的测例。
+
+## 本次正式容器结果
+
+冻结的BoarOS提交与最终采集器均为
+`11e96a95ff37158be5036fe99cced9bd17cc5575`，tree为
+`86885b475407f61104b455b473c19c4492e6cfcb`，采集时工作树干净。
+运行使用单CPU、1GiB和每架构3600秒。RV与LA QEMU均由observer以PID/start_ticks
+唯一识别，且运行实际超过预算；两份串口、原Job和联合评分已收集。
+
+| 指标 | RV | LA |
+|---|---:|---:|
+| 分组外层状态 | 20 completed、1 timeout (`ltp-glibc`)、1 not-reached (`ltp-musl`) | 20 completed、1 timeout (`ltp-glibc`)、1 not-reached (`ltp-musl`) |
+| LTP-glibc分 | 920 | 908 |
+| LTP-musl分 | 0，组未到达 | 0，组未到达 |
+| LTP-glibc | 875项状态，27项源码helper跳过 | 1035项状态，27项源码helper跳过 |
+| 正常PID1及页/堆/任务栈/根盘/设备收口 | 预算结束，未验证 | 预算结束，未验证 |
+
+两侧的 `fs_fill` 均只报告一次TBROK，因准备 `test_dev.img` 返回ENOSYS而未运行主体。
+其他错误、skip和ELF loader阶段仍按原串口、shell状态与结构化观察归属；观察项计数
+不能等同互不重复的失败测例数。
+
+原Job返回 `Accpted`，分数1915；原postwork回放得到整数1915，与一次联合
+成绩相符。报告将这项结果标为 `baseline_established=true`、
+`results_captured=true`，同时标为 `all_scripts_completed=false`、
+`program_matrix_passed=false`。40个组正常结束不等于其中的测例都通过；
+组内失败、跳过和loader错误继续以原串口及结构化观察逐项保存。
+
+两侧原 `fs_fill` 都在测试设备准备阶段报告 `Failed to create test_dev.img: ENOSYS`
+和 `Failed to acquire device`，TBROK、shell status 6。两侧没有新的
+`BoarOS: fatal`。总预算停止后PID1、页、堆、任务栈、根盘及设备owner未验证。
+LA已运行组还报告一些原 ELF loader错误；这些与 `fs_fill` 准备错误和总预算
+分别归类，不据 `Accpted` 字样合并成通过。
+
+完整原结果在核对期间位于忽略的 `build/oscomp-official-final/`；采集器重算使用
+`python3 -B tests/oscomp/official.py --collect-existing build/oscomp-official-final`，
+只重读同一运行且不另启QEMU。按清理规则移除的原始日志不是长期档案。本轮还并行
+运行主机正确性回归；1915为原Harness的当次计分，不作为无干扰吞吐或时延对比。
+预算截止监督适配基线已经建立，44组完整执行的程序矩阵没有完成。
