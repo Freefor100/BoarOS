@@ -173,7 +173,7 @@ libc-test的无shebang内层脚本改为在临时外层副本中用原BusyBox sh
 由原libc直接返回ENOSYS，固定Linux同样失败；默认兼容环境现已提供真实Linux调度接口。
 修复后的LA-musl原libc-test已得217分，iozone/netperf也已进入完整原组并正常回收；
 LA libc-test逐ID状态与固定Linux一致，共同glibc失败及可选网络项继续保留，
-见[后续诊断](docs/learning/oscomp-compat-baseline.md#启动修复后的原组诊断)。本轮没有重跑官方容器总分。
+见[后续诊断](docs/learning/oscomp-compat-baseline.md#启动修复后的原组诊断)。此前原组诊断没有重跑官方容器总分。
 RV多出的静态clock_gettime失败已逐指令定位为原glibc malloc初始化污染errno，
 时钟返回0；同一原ELF的Linux错误返回对照也复现，见[具体归因](docs/learning/oscomp-compat-baseline.md#rv静态clock_gettime的errno来源)。
 原basic两侧、两种libc均为90/102：原brk包装器截断地址丢2分，缺真实VFAT及
@@ -185,7 +185,8 @@ RV多出的静态clock_gettime失败已逐指令定位为原glibc malloc初始�
 回收。该诊断自动恢复默认构建，原盘正式成绩保留，见[修正对照](docs/learning/oscomp-compat-baseline.md#公开用户态修正对照)。
 默认`make all`现在构建LA调度DSO并将它与发布脚本嵌入`kernel-la`的bootstrap；
 启动后由原盘BusyBox发布，整个LA musl动态环境统一启用，四个接口执行真实syscall，
-不按程序或测例名选择。RV原运行时已有这些接口，保持原路径。默认原盘cyclictest
+不按程序或测例名选择。RV原运行时已有这些接口，保持原路径。原官方容器的干净
+`make all`已构建并启动，LA-musl cyclictest四场景及18线程采样通过。默认原盘cyclictest
 两种libc在两侧都完成真实采样并正常回收；musl libc-test两侧保持217分。
 按已确认的B路线保留现有地址布局和原brk ELF，默认basic仍90/102；独立修正诊断的
 92分不计入默认结果。构建链与验收见[默认运行时接入](docs/learning/oscomp-compat-baseline.md#默认make-all接入la-linux调度运行时)。

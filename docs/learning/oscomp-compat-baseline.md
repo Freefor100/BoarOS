@@ -484,3 +484,24 @@ python3 -B tests/oscomp/run.py --arch both --groups environment
 python3 -B tests/oscomp/run.py --arch both --groups libctest
 make test-oscomp-official
 ```
+
+
+默认路径又在提交`272fc465a8613a66909b7388f0a72bcedef88bcb`的干净源快照中通过
+原Docker Harness构建并启动。固定容器digest继续为
+`zhouzhouyi/os-contest@sha256:85dec949df7cef41fd03d30c6ad69f952204540e18d2c62bced9d2e262fef12d`，
+实际RV/LA GCC都是13.2.0，QEMU都是10.0.2；原配置为单CPU、1GiB、3600秒且无RNG。
+原Harness直接执行`make all`，没有宿主build缓存或独立诊断调用。
+容器DSO为LP64D，只有四个导出接口及未定义`syscall`，没有NEEDED运行库；SHA为
+`902b0fad334b9f008c27b8ee85110a1e2981775d8acdef076ce5abefa786b94d`。
+从内核PID1配置解压的payload与该实际DSO逐字节一致，guest成功发布后执行原程序。
+
+容器四个cyclictest原组均自然结束，四场景各组18个线程都采样，未见调度查询ENOSYS。
+原judge的单组分如下；这些数值来自同一次尚在继续的完整官方调用，未拼接正式总分。
+
+| 容器默认cyclictest | glibc | musl |
+|---|---:|---:|
+| RV | 7.448426158788393 | 7.242741819107794 |
+| LA | 7.228549521855053 | 7.3363133878893665 |
+
+本次容器basic四格仍90、BusyBox四格54、musl libc-test两侧217，glibc为RV178/LA179。
+全启动的PID1和根owner收口必须等整次运行结束核对；本段的原组完成不代替该证据。
