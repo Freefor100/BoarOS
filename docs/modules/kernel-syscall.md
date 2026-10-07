@@ -95,7 +95,7 @@ files 层，采用真实 `BASIC_STATS`，未实现的扩展字段不报告。LA 
 LA 的 rt_sigaction(134)/rt_sigreturn(139) 已接入共用信号策略；trap从a7/a0–a5
 解码并由LA后端恢复ERA/GPR和mask。完整整数frame、privileged状态边界和未支持
 扩展见[信号模块](kernel-signal.md)。真实静态musl pthread取消使用这一返回路径；
-未知syscall仍为ENOSYS，不以成功存根表示缺少的FP/SIMD、altstack或动态环境。
+FP/SIMD和动态musl已分别验收；altstack等缺口保持明确错误，未知syscall仍为ENOSYS。
 
 ## 双架构 ABI 差分入口
 

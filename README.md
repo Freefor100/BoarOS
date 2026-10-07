@@ -135,13 +135,13 @@ make inventory-userland-riscv  # 能力清单，不是必过门禁
 make test-references
 ```
 
-聚焦测试只在对应[模块文档](docs/README.md)维护。`make run-riscv` 不附根盘，启动后停留 timer-idle，需人工退出；`make debug-riscv` 以 `-S -s` 等待 GDB。完整比赛 Harness 当前仍因 LA 完整用户环境等能力阻塞，不算已通过。
+聚焦测试只在对应[模块文档](docs/README.md)维护。`make run-riscv` 不附根盘，启动后停留 timer-idle，需人工退出；`make debug-riscv` 以 `-S -s` 等待 GDB。完整比赛 Harness 的原盘运行与容器基线尚未验收；已完成的 LA 单核矩阵不替代该结果。
 
 `build/` 是可重建的本地产物目录，不是验证档案。仅长期保留内核/用户程序编译结果、工具链、当前配置的 Linux 构建缓存等可跨轮复用的产物；一次性运行目录、磁盘镜像、日志和旧构建缓存应在核对结果后清理。`python3 tests/prune-build.py` 预览，`make prune-build` 执行清理；`make clean` 连可复用的内核构建产物也删除。需要临时保留案例镜像以调试时，可给清单入口传 `--keep-pass-images`，调试结束后仍应清理。
 
 ## 近期工作与文档
 
-[开发路线](docs/goals.md)统一记录本轮任务、分支交接和后续依赖。通用兼容性在 `main`，比赛环境与运行入口在 `oscomp-rv-compat`；后者单向合入已验收主线。只跑 RV 的原 judge 评分不等于双架构比赛交付，也不能把逐组诊断分数拼成正式总分。
+[开发路线](docs/goals.md)统一记录本轮任务、分支交接和后续依赖。通用兼容性在 `main`，比赛环境与运行入口在 `oscomp-compat`；后者单向合入已验收主线。只跑 RV 的原 judge 评分不等于双架构比赛交付，也不能把逐组诊断分数拼成正式总分。
 
 统一VFS对象、活目录项、多挂载、共享后备、SysV shm、日志/RTC、串口TTY和真实网络
 应用已交付，具体边界见[开发路线](docs/goals.md)与模块。R1–R8组合边界的修复覆盖
@@ -153,7 +153,7 @@ I/O已经接入。机制、历史性能口径和unknown见[成本分析](docs/le
 不以内部计数下降替代真实程序效率。当前能力与下一项优化由有效应用证据选择。
 
 评测兼容分支单向接纳main；main保留自身uname，旧glibc结果属于兼容配置。
-完整Harness仍缺LA完整用户环境，单侧诊断和逐组补跑不能宣称完整交付。逐次成绩和运行
+双架构原评测镜像与官方容器基线正在兼容分支接入；单侧诊断和逐组补跑不能宣称完整交付。逐次成绩和运行
 输出留在忽略的build；SMP、LA后续用户环境、实板及更大应用另行规划。
 
 本评测分支的固定输入、启动、监督与原judge契约见[RV评测模块](docs/modules/oscomp-rv.md)。逐次成绩留在忽略的build，RV单侧诊断不等于完整Harness。
