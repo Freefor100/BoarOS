@@ -111,7 +111,7 @@ bus-master，销毁按 stop DMA→摘 IRQ→释放队列→恢复 BAR/command �
 
 QEMU 平台采用128个bus的ECAM、低PCI memory aperture、根bus现代端点及
 PCH-PIC→EXTIOI→CPU0/HWI0。资源 claim 有64个槽，耗尽明确失败；无桥、热插拔、
-legacy PCI、MSI-X 或实板验证。控制器为共享level pin在逐设备ISR之间保持mask，
+纯legacy PCI传输、MSI-X 或实板验证；transitional身份的modern接口已接入。控制器为共享level pin在逐设备ISR之间保持mask，
 unmask重新采样intirr；trap只分发ESTAT与ECFG交集，同时处理已启用的timer。
 
 ```sh
@@ -134,7 +134,7 @@ timer trap中被分发，真实QEMU先复现失败后修复。
 ## 根盘、静态 musl 与回收
 
 根 bus 按 BDF 顺序枚举 block 端点，最多8盘，首盘是 raw whole-disk ext4；一旦发现
-block，不通过后续磁盘或内存 fixture 掩盖启动错误。legacy PCI 明确 ENOTSUP，
+block，不通过后续磁盘或内存 fixture 掩盖启动错误。仅有legacy接口的PCI明确ENOTSUP，
 数量超限 ENOSPC，损坏 ext4 保留后端 EUCLEAN。默认 `/init` 的 path/argv/envp
 使用与 RV 相同的 `INIT_CONFIG=config/init.json` 生成方式，LA 有独立生成依赖。
 PT_INTERP已按fs context打开唯一解释器source并交给共用image，路径错误保留errno；
@@ -273,3 +273,9 @@ make test-rtc-model-loongarch    # 实际 MMIO、W1C、独立 IRQ、重编程、
 make test-rtc-alarm-loongarch    # 原版 Linux 两次告警/跨年，混合 block/RNG/UART 与实际退出
 make test-environment-loongarch  # 两个独立清日志场景，各在双侧、两种 RAM
 ```
+
+2026-10-07原Harness设备调查发现默认transitional PCI同时提供modern接口。
+此前按PCI ID提前拒绝并把PIO BAR当作整设备不支持，导致原盘尚未启动PID1就ENOTSUP。
+现按subsystem device枚举，保持未使用PIO关闭；host反例及真实根盘transitional/modern
+在512MiB和1GiB验证正常PID1退出、页/堆/任务栈/BAR基线，纯legacy负例仍ENOTSUP。
+同一个静态root ELF在固定Linux对照两个设备形态；命令仍为`make test-root-loongarch`。

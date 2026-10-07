@@ -11,6 +11,8 @@ struct virtio_pci_transport {
     volatile uint16_t *queue_notify[VIRTIO_PCI_MAX_QUEUES];
     uint32_t irq;
 };
+/* Modern and transitional identities; modern capabilities are checked at init. */
+int virtio_pci_device_matches(struct pci_host *,uint16_t,uint32_t);
 /* Persistent platform owner. A failed reset retains function/BAR ownership. */
 enum virtio_status virtio_pci_transport_initialize(struct virtio_pci_transport *,struct pci_host *,
     uint16_t,uint32_t,uint32_t);
