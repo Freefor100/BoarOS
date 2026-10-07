@@ -99,5 +99,7 @@ LA root runner 可显式指定预期退出码，Linux supervisor 与 BoarOS 均�
 `python3 -B tests/userland/glibc/run.py --arch loongarch --only linux` 的静态、动态、
 PIE、静态 PIE、pthread PIE 已在固定 Linux 的512MiB/1GiB通过。初始 BoarOS
 静态 ELF 在进入main前SIGILL；SIMD接入后推进至SIGSEGV，GDB在原程序
-`__libc_start_main_impl`确认空AT_RANDOM读取。完整 `test-glibc-loongarch` 尚未
-通过，等待真实PCI RNG，不把 Linux-only 结果计作 LA 内核支持。
+`__libc_start_main_impl`确认空AT_RANDOM读取。这两项启动阻塞随后已修复；
+2026-10-07完整`test-glibc-loongarch`的五种形态在Linux/BoarOS、512MiB/1GiB
+通过，含TLS/pthread/取消/信号及正常root owner回收。DTB早期材料不计可信熵，
+无RNG仍不声明随机ready；更广GNU应用与原评测runtime另行验收。

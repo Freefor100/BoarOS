@@ -129,9 +129,11 @@ I/O 暂扣四组合通过；双盘收口竞态修复后四组故障/重启、四
 
 lwext4 完整恢复与阶段七后默认/RA8WB8 的 SQLite DELETE/WAL 完整矩阵均通过，
 精确切点、实际故障命中和未到达项见[最终恢复](record-lock-sqlite-recovery.md#数据路径最终恢复与宿主收口2026-10-06)。
-完整比赛 Harness 仍阻塞于缺少 `kernel-la`：固定
+当时完整比赛Harness阻塞于缺少`kernel-la`：固定
 `references/oscomp-autotest@d1bb3a3c4b27274e196a2648518525c1a304e339/kernel/run.py`
-要求启动 LoongArch 内核，当前 `make -n kernel-la` 无目标；上述 RV64 验收不算完整比赛通过。
+要求启动LoongArch内核，该历史源码尚无构建目标。当前kernel-la及指定单核矩阵
+已交付，见[LA模块](../modules/loongarch-boot.md)；原盘容器由oscomp-compat独立
+记录，上述RV64测量仍不算完整比赛通过。
 
 ## 正式匹配结果（2026-10-06）
 
