@@ -792,7 +792,7 @@ static int read_extent_tree_block(struct ext4_inode_ref *inode_ref,
 
 	err = ext4_trans_block_get(inode_ref->fs->bdev, bh, pblk);
 	if (err != EOK)
-		goto errout;
+		return err;
 
 	err = ext4_ext_check(inode_ref, ext_block_hdr(bh), depth, pblk);
 	if (err != EOK)
@@ -800,8 +800,8 @@ static int read_extent_tree_block(struct ext4_inode_ref *inode_ref,
 
 	return EOK;
 errout:
-	if (bh->lb_id)
-		ext4_block_set(inode_ref->fs->bdev, bh);
+	/* 块号在分配前写入；只有 get 成功才持有可归还的缓存引用。 */
+	ext4_block_set(inode_ref->fs->bdev, bh);
 
 	return err;
 }

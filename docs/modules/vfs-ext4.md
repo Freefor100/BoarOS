@@ -261,6 +261,13 @@ make test-root-init-riscv
 
 `make test-lwext4-metadata-host` 覆盖 1/4 KiB 块、128/256 字节 inode、60 个 OOM 点、写与 flush 失败的 sticky owner、可重试读失败、损坏拒绝、无关脏数据不写回、稀疏/截断/删除计数、META_BG/sparse_super2/GDT_CSUM/无 journal 和精确组边界，并运行 `e2fsck -fn`。用户层契约与固定资料见[文件模块](kernel-files.md)和[时间学习记录](../learning/file-timestamps.md)。
 
+`make test-lwext4-extent-host` 单独保护冷缓存 extent 树读取的失败契约：
+块号在缓存分配前填写，不能作为已取得引用的证明；`ext4_trans_block_get()`
+失败时调用者直接传播错误，只有成功取得的块才能在格式检查失败后归还。
+测试在 1/4 KiB 块、128/256 字节 inode 下枚举实际路径的所有分配失败点，
+另注入设备读错误，验证同一 inode owner 可重试、文件内容保持、正常卸载、
+堆对象清零及 `e2fsck -fn`。非法释放仍触发原有 fatal 契约。
+
 元数据收口历史验证：当时 `build/recoverable-fs-host-final.log` 的全部 host/断电矩阵通过；`build/recoverable-fs-regression-final.log` 的 RISC-V 全套、真实 musl/pthread、320 条固定 Linux 差分、1000 个函数栈界及工具自测通过。日志已清理；最大单函数当时为 kernel_main 的 1952 字节，assembly trap 288、保留 1024。这不是实板性能或 SMP 验证。
 
 ## 单 hart 可睡眠存储契约
