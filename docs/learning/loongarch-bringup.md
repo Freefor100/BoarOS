@@ -521,3 +521,8 @@ host先复现同样capability内容因身份拒绝，修复后验证真实BAR cl
 reset后配置恢复和错误subsystem/缺modern caps的失败回滚。根盘测例区分默认
 transitional与`disable-modern=on`的纯legacy负例；不能以移除disable-legacy
 作为legacy-only证据。此修复不增加legacy PCI寄存器协议或PIO资源分配。
+
+官方原Harness首跑的Docker进程退出0，但原Job为Compile Error；编译输出在Job
+HTML中，hooks/console_log已被上游清空。实际GCC13.2不识别-mno-lsx/-mno-lasx，
+容器profile改为LP64S/soft-float和禁止C自动向量化。未改原Harness或原用户程序；
+编译成功与串口运行、判分及资源基线必须分别验证。

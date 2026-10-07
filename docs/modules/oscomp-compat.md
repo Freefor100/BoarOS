@@ -105,3 +105,8 @@ LTP能力缺口，也不修改原程序/libc/judge获取通过。
 各阶段记录结论、固定身份和重建命令；运行输出在忽略的build。未解决现场核对前
 保留，收口后先预览再make prune-build，原盘、工具、容器和可复用缓存保留。
 官方容器基线与完整回归结果仍须本阶段后续运行，不能从现有bootstrap验收推导。
+
+容器首跑在原Harness的编译阶段失败：实际GCC13.2不接受-mno-lsx/-mno-lasx，
+Job为Compile Error且没有串口。official入口在采集串口前分类该状态。镜像构建
+显式使用LP64S/soft-float并禁自动向量化；主机GCC15默认参数保持，手写SIMD
+保存汇编仍参与构建。构建环境写入identity，不能用Docker返回0推断编译成功。

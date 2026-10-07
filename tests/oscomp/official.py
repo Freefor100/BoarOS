@@ -104,6 +104,12 @@ def original_job_output(log):
     return result
 
 
+def harness_error_stage(job):
+    if job.get('verdict') == 'Compile Error': return 'compilation'
+    if job.get('verdict') in ('Runtime Error', 'Unknown Error'): return 'official-harness'
+    return None
+
+
 def main():
     parser = argparse.ArgumentParser(__doc__)
     parser.add_argument('--output', type=Path)
@@ -148,7 +154,10 @@ def main():
         tools = report['container']['tools']
         # 原Harness在PATH前面放旧Kendryte；明确选择镜像已提供且支持当前ISA的编译器。
         build_env = {'CROSS_COMPILE': tools['riscv64-unknown-elf-gcc']['path'].removesuffix('gcc'),
-                     'LA_CROSS_COMPILE': tools['loongarch64-linux-gnu-gcc']['path'].removesuffix('gcc')}
+                     'LA_CROSS_COMPILE': tools['loongarch64-linux-gnu-gcc']['path'].removesuffix('gcc'),
+                     # 镜像GCC13不识别-mno-lsx/-mno-lasx；soft-float与禁自动向量化保持整数C。
+                     'LA_FLAGS': '-march=loongarch64 -mabi=lp64s -msoft-float -mcmodel=normal '
+                                 '-fno-tree-vectorize -fno-tree-slp-vectorize'}
         command = ['docker', 'run', '--rm', '--name', name, '--network', 'none',
             '-v', str(submit) + ':/coursegrader/submit', '-v', str(data) + ':/coursegrader/testdata',
             '-v', str(cg) + ':/cg:ro', '-v', str(hooks) + ':/mnt/cghook']
@@ -165,6 +174,10 @@ def main():
         stage = 'grading'
         original = original_job_output(directory / 'harness.log')
         (directory / 'original-job.json').write_text(json.dumps(original, indent=2) + '\n')
+        failure = harness_error_stage(original)
+        if failure:
+            stage = failure
+            raise RuntimeError('original Harness returned ' + original['verdict'] + '; see original-job.json')
         summary = {}
         for arch, key in local.ARCH_KEYS.items():
             log = submit / ('os_serial_out_' + key + '.txt')

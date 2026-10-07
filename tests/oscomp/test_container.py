@@ -53,6 +53,13 @@ class ContainerTests(unittest.TestCase):
             module.require_digest('zhouzhouyi/os-contest:20260510')
         self.assertEqual(module.require_digest('image@sha256:' + 'a' * 64), 'image@sha256:' + 'a' * 64)
 
+    def test_original_compile_error_is_classified_before_serial_collection(self):
+        module = self.module()
+        self.assertEqual(module.harness_error_stage({'verdict': 'Compile Error', 'score': '0', 'rank': -1}),
+                         'compilation')
+        self.assertEqual(module.harness_error_stage({'verdict': 'Runtime Error'}), 'official-harness')
+        self.assertIsNone(module.harness_error_stage({'verdict': 'Accpted'}))
+
     def test_container_entry_uses_upstream_parser_despite_local_run_module(self):
         self.module()
         temp = tempfile.TemporaryDirectory(); self.addCleanup(temp.cleanup)
