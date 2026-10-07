@@ -254,7 +254,8 @@ musl 的最快任务同时提高约 29.5%，最少传输量降到 5 KiB；这是
 此前为 24.8500 / 25.1791。代表写入项仍各一分，分数增加主要来自读项。
 原 judge 取 Max；低于基线但为正的成绩仍给一分，压缩了速度差距。
 原向量组回退后的普通写字段也被计分，不能据此宣称向量方法通过。
-专项只运行 iozone，完整双架构 Harness 仍缺 `kernel-la`。
+该历史专项只运行iozone，当时完整双架构Harness仍缺`kernel-la`。当前LA指定
+矩阵已交付，原盘容器由oscomp-compat独立记录，见[LA模块](../modules/loongarch-boot.md)。
 
 ## 日志、持久化与剩余瓶颈
 
@@ -490,7 +491,8 @@ QEMU cache=unsafe为3.829/0.021秒。unsafe改变了宿主持久化承诺，只�
 SQLite DELETE/WAL的正常、FULL/EXTRA、WRITE/FLUSH故障和重启矩阵，以及双盘隔离。
 完整RV64之后，最后接收谓词修复只重跑相关syscall/信号/文件、真实libc、ABI、scale、
 四组合io-sleep和栈；最终1179条ABI一致。1819个函数的编译器栈界最大2352字节，
-trap汇编288字节、预留1024字节。完整Harness仍缺kernel-la，不宣称实板或SMP能力。
+trap汇编288字节、预留1024字节。当时完整Harness仍缺kernel-la；当前指定LA
+矩阵已交付，原盘容器另行记录，仍不宣称实板或SMP能力。
 
 旧版对照准备中曾出现两个未定位异常：一次物理页释放fatal trap；一次QEMU报告
 “Virtqueue size exceeded”，随后块超时/reset。释放地址是编译器合并的多条错误路径，
