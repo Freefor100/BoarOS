@@ -11,6 +11,9 @@ BoarOS 是从零搭建、面向 OS Comp 能力建设的 C / 少量汇编内核�
 LA根盘支持modern PCI及transitional设备的modern接口，纯legacy PCI传输仍未接入。
 对应两种RAM的启动与owner回收证据见[LA模块](docs/modules/loongarch-boot.md)。
 
+ext4 冷缓存 extent 读取已修正 OOM 后误释放未取得引用的问题；
+分配/读取失败、重试与正常回收由[VFS 模块](docs/modules/vfs-ext4.md)的独立门禁保护。
+
 当前生产路径为 **RV64、QEMU virt、单 hart、Sv39 / 4 KiB 页**。下表是已验证子集，具体接口与限制见模块文档。
 
 | 范围 | 已有能力 | 主要边界 |

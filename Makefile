@@ -702,6 +702,10 @@ test-lwext4-rename-host:
 test-lwext4-metadata-host:
 	sh tests/lwext4-metadata-host.sh
 
+.PHONY: test-lwext4-extent-host
+test-lwext4-extent-host:
+	sh tests/lwext4-metadata-host.sh extent
+
 .PHONY: test-lwext4-cost-host
 test-lwext4-cost-host:
 	sh tests/lwext4-cost-host.sh

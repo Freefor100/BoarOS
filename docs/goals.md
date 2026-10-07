@@ -16,6 +16,7 @@ N3已经交付：legacy/modern VirtIO-net、受限DMA借用与复制回退、静
 |---|---|
 | 历史Virtqueue告警 | 已还原到旧兼容内核的五连接loopback；原启动只有块盘和RNG，没有VirtIO-net。具体报错队列与超额原因仍未知；后续失败必须先保留新快照，按队列身份定位，不以重复通过关闭。net 失败路径现已有槽级快照（2026-10-05，见网卡模块），原告警仍缺历史现场。 |
 | 历史页释放fatal的具体现场 | 已修复能够产生同类fatal的分配器双owner竞态；原事件没有owner快照，不能反推唯一触发链。 |
+| extent 冷读 OOM 清理 | 真实冷缓存碎片文件已复现未取得 buffer 引用却按非零块号释放的错误；get 失败直接返回后，1/4 KiB 块与两种 inode 大小的全部分配失败点、读取失败、重试、卸载及堆引用清零通过。独立入口为 `make test-lwext4-extent-host`，没有放宽非法释放契约。 |
 | pthread取消与旧libc输入 | 原镜像动态glibc的cancel/exit缺libgcc_s；独立glibc运行环境已固定unwind依赖并保护取消/cleanup。静态cancel-points的join结果在固定Linux也失败，按库/测试契约继续核对，不能归给内核。历史偶发现场仍保留P0c边界，不安排无目的重复次数。 |
 | 内核抢占边界 | allocator修复不等于所有共享状态已审完。限定检查开中断worker到共享对象的调用链、睡眠前引用和发布临界区；发现具体错误才扩大。 |
 | TX 完成进展纠错 | worker先收割并释放完成槽，再推进协议；睡眠前覆盖SG与复制路径的新容量。宿主顺序/关闭窗口、真实两种TAP传输和无NIC定时器验证通过；见[网络owner](learning/network-ownership.md)。 |

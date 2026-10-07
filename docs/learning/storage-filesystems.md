@@ -331,6 +331,16 @@ PID 1 是用户空间生命周期的根。Linux 通常在 init 退出时 panic�
 
 ## 缓存接收进度与同步错误
 
+extent 树的失败清理必须依据取得引用的成功状态。固定导入
+`third_party/lwext4`（`58bcf89a121b72d4fb66334f1693d3b30e4cb9c5` 加本地补丁）
+的 `ext4_block_get_noread()` 在查找/分配前写入 `lb_id`；分配失败时非零块号
+仍可能对应 NULL buffer。2026-10-07 的冷缓存碎片文件 OOM 复现中，
+`read_extent_tree_block()` 用块号判断并归还引用，导致
+`ext4_bcache_free()` 在 NULL+0x38 处崩溃。修复在 get 失败时立即返回，
+检查格式失败才归还实际持有的引用；没有把非法 free 改为成功。
+`make test-lwext4-extent-host` 枚举真实分配点、读取失败、随后重试与收口，
+不把单文件写至 ENOSPC 的正常返回当作树读取 OOM 的证明。
+
 逐文件写回依据固定 Linux `references/linux` commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 `mm/filemap.c::file_check_and_advance_wb_err()`、`include/linux/fs.h::generic_write_sync()` 与 `fs/sync.c`：缓存接收、设备写回、持久化屏障是三个不同事件。写回失败不能把已被读取者观察的逻辑大小回滚为磁盘 handle 的 size；失败范围仍由缓存页拥有。共享 OFD 的 dup/fork 共用错误观察位置，独立 open 则各观察一次自己打开之后的错误。同步写在前缀已推进 offset 后失败，返回 errno 也不能撤销该进度。
 
 压力回收和卸载均需先写回脏页；显式 orphan 最后使用者退出后可以直接丢弃缓存，因为该数据已不再有用户 owner。写回时 lwext4 分配可能触发内存压力，必须防止递归回收正在遍历的缓存项。当前用 inode 索引、页面固定与缓存级 writeback 重入保护守住这一生命周期，不增加后台线程。物理分配计数仍读真实 inode；需要验证磁盘块生命周期的用例先 fsync，不能继续假定每次 write 必然触盘。
