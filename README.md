@@ -176,6 +176,10 @@ LA libc-test逐ID状态与固定Linux一致，共同glibc失败及可选网络�
 见[后续诊断](docs/learning/oscomp-compat-baseline.md#启动修复后的原组诊断)。本轮没有重跑官方容器总分。
 RV多出的静态clock_gettime失败已逐指令定位为原glibc malloc初始化污染errno，
 时钟返回0；同一原ELF的Linux错误返回对照也复现，见[具体归因](docs/learning/oscomp-compat-baseline.md#rv静态clock_gettime的errno来源)。
+原basic两侧、两种libc均为90/102：原brk包装器截断地址丢2分，缺真实VFAT及
+分区环境使mount/umount丢10分。原RV musl执行Linux调度syscall，原LA musl直接
+返回ENOSYS；两盘运行时实现内容不同，不以这些分差判断内核架构能力高低。
+依据和修复归属见[basic与运行时差异](docs/learning/oscomp-compat-baseline.md#basic的90分与原musl调度接口差异)。
 第三次运行发现的RV ext4 fatal保留了原现场；冷读OOM的通用修复先落main再合入，并在新的完整容器运行中未再次触发fatal。原判分成绩、总预算中断和未验证的资源回收边界分别记录。
 
 本分支已合入单核数据路径修复，并补跑原版 iozone、cyclictest、iperf、libcbench、lmbench 两种 libc 的一次评分。十个脚本都结束；当时的根盘 cleanup 错误已定位为 PID 1 退出时后台用户 owner 尚未回收，并在 main 修复后同步本分支。随后仅重跑原版 iperf，两种 libc 的十二项成功且正常关机；cyclictest 部分零采样仍待定位。分数、真实 iperf 吞吐和 1/10 ms 延迟的 36 次补测见[当前五项成绩与选择依据](docs/learning/data-path-budget-experiments.md#受控延迟与原版五项评分补测2026-10-06)。常规评分复用已核对输入，不重做四个发布资产的哈希扫描。

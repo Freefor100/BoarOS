@@ -109,7 +109,11 @@ Linux对照bootstrap为程序建立真实正进程组，因为直接内核init�
 这些probe仅是诊断fixture，不是官方镜像结果。GNU空LOAD问题在main修正后合入，
 不通过修改链接产物绕过exec差异；背景见[ELF记录](../learning/elf-loading.md)。
 
-原测例basic的mount/umount需要vfat和/dev/vda2，LTP还可能需要scratch/loop设备、
+原basic在RV/LA、glibc/musl四份结果均为90/102：brk为1/3，mount与umount均为0/5，
+其余29条89/89。brk原ELF把64位返回地址截断为32位；vfat是共同内核缺失能力，
+umount先卡在mount，没有到达卸载。原测例mount/umount还需要真实/dev/vda2分区环境，
+不是添加一个名字即可满足；归因见[basic与运行时差异](../learning/oscomp-compat-baseline.md#basic的90分与原musl调度接口差异)。
+LTP还可能需要scratch/loop设备、
 账户、工具和真实熵；准备依赖与缺失内核功能分开。原kill判分标签与实际后台PID、
 iperf连续脚本在Linux也有的listener重建竞态，以及cyclictest历史零采样，保留各自
 归因边界；历史证据见[程序清单](../learning/user-program-inventory.md)与
@@ -155,6 +159,9 @@ RV多出的静态clock_gettime失败已定位为原glibc的malloc初始化在mai
 EAGAIN；时钟实际返回0。独立诊断校验原ELF SHA后只读观察默认路径，并用公开的
 Linux返回故障profile验证同一因果链，512MiB/1GiB都正常回收。参见
 [首次errno写入](../learning/oscomp-compat-baseline.md#rv静态clock_gettime的errno来源)。
+原RV musl的四个sched查询/设置函数执行真实syscall，原LA同名函数直接ENOSYS；
+上游1.2.0与1.2.5都为ENOSYS，不能把原RV二进制内容差异归为版本新旧。
+两侧共用内核调度实现；原输入能力差异与共同VFAT缺口分别记录，见上述basic记录。
 
 ## 整体审查后的报告契约
 

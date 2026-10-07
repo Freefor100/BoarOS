@@ -65,6 +65,11 @@ LA零分组的原musl loader别名及libc-test显式shell启动适配留在兼�
 重新执行容器基线，原netperf可选socket项错误仍单列，不据计分宣布全部接口通过。
 RV静态clock_gettime的一项失败已定位为旧原glibc在malloc初始化期间污染errno，
 不是时钟调用失败；原locale、数值转换、regex等共同失败按具体断言分别归属。
+原basic共同的90/102已归因：VFAT及真实/dev/vda2分区环境缺失影响mount/umount
+10分，需作为共同文件系统项目另定交付；原brk包装器截断地址影响2分，归属发布输入。
+LA原musl cyclictest需要提供真实Linux调度接口的用户运行时；RV原盘同名函数已有
+syscall实现，且不同于上游同版本源码，不通过增加LA内核分支或替换正式原libc掩盖。
+固定身份和指令依据见[basic与运行时记录](learning/oscomp-compat-baseline.md#basic的90分与原musl调度接口差异)。
 完整凭据/权限、运行时网络配置和无 RNG 平台的可信熵接入由目标应用确定交付范围；
 LA 更广用户环境继续按真实消费者验收，SMP 单独规划。
 

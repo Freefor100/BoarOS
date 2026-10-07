@@ -267,3 +267,87 @@ endptr更新，glibc返回EINVAL时保留原endptr；`regex_ere_backref`要求�
 `references/oscomp-testsuits@8b58dd16d26d30f7c74d48d5832d870d3051b703`的
 对应functional/regression源码。它们不能归并为clock/getrandom失败；剩余取消、
 stdio等项仍须分别调查实际断言和路径。
+
+## basic的90分与原musl调度接口差异
+
+2026-10-07在干净`8ce615cf1c3f2104ee14b23345bbee71c70b0843`上重新跑原basic：
+单CPU、1GiB、无RNG，每侧一次启动，同时执行glibc/musl两个原脚本。RV/LA四份
+原judge结果完全相同，都是90/102；两侧PID1退出0，根owner释放、heap-live=0。
+原judge的32条记录中只有以下三条扣分，不能把90解释为90/100或装载失败：
+
+| 原judge项 | pass/all | 丢分 | 首个可证实原因 |
+|---|---:|---:|---|
+| test_brk | 1/3 | 2 | 原ELF自己的raw syscall包装器把64位返回地址截断为32位 |
+| test_mount | 0/5 | 5 | 请求vfat，内核尚未实现，mount返回-ENODEV |
+| test_umount | 0/5 | 5 | 前置vfat mount同样失败，未到达实际umount |
+| 其余29条 | 89/89 | 0 | 原断言通过 |
+
+判分依据为固定`references/oscomp-autotest@d1bb3a3c4b27274e196a2648518525c1a304e339`
+的`kernel/judge/judge_basic-{glibc,musl}.py`。测例源码依据为
+`references/oscomp-testsuits@8b58dd16d26d30f7c74d48d5832d870d3051b703`的
+`basic/user/src/oscomp/{brk,mount,umount}.c`。重建原组结果：
+
+```sh
+python3 -B tests/oscomp/run.py --arch both --groups basic --diagnostic-timeout 120
+make all
+```
+
+原RV `/glibc/basic/brk` SHA-256为
+`3756dce8d8734a564300ca4404e6b80136f3d369672c03afaffab63da1fae086`，
+包装器在`0x1e0c`执行ecall，`0x1e10`随即执行`sext.w a0,a0`；原LA同路径
+ELF SHA-256为`d3882df3c12108f783d23be0db1eb66429f750686d54ac1151f545067f0c9310`，
+在`0x2474`执行syscall，`0x2478`执行`slli.w a0,a0,0`。两条指令都会将
+低32位符号扩展，丢失真实地址高位。外部只读QEMU指令观测得到：
+
+| 架构 | 内核brk(0)原始返回 | 原包装器返回给调用者 | 后续错误请求 |
+|---|---|---|---|
+| RV | 0x3564c2e000 | 0x64c2e000 | 0x64c2e040 |
+| LA | 0x557d6a210000 | 0x6a210000 | 0x6a210040 |
+
+上述地址只是一次ASLR样本。两侧调用同一`kernel/syscall/memory.c`和
+`mm/mm.c::kernel_mm_brk`：错误请求低于start_brk时返回旧break，符合raw brk契约。
+高地址PIE由共用`kernel/elf_image.c::choose_pie_bias`按目标用户空间布局选择；
+不通过修改raw返回宽度或对原测例安排特殊低地址来掩盖截断。
+固定测例源码中的包装器声明与该发布ELF的截断不一致；这里归因于实际发布字节，
+不据此猜测它的编译来源。修正原程序包装器才是对应的软件修复，但正式输入保持不变。
+
+mount/umount的实际输出均为`Mounting dev:/dev/vda2 to ./mnt`后`mount return: -19`。
+共用`kernel/syscall/mount.c`目前只接入ext4/tmpfs/devpts/proc，vfat在解析设备前
+返回ENODEV。原盘也没有`/dev/vda2`节点，正式配置未提供该分区环境；仅建立名字
+不能创建真实分区及文件系统。恢复这10分需要真实VFAT能力和对应块设备/分区环境，
+属于共同内核与准备依赖的后续工作；不能把umount失败归为已到达卸载路径。
+
+原盘musl的调度函数还有独立的内容差异。RV `/musl/lib/libc.so` SHA-256为
+`a174c80743882436816923d3afd8ca4a69ca92a89c88332ac95334052e2698bf`，
+自报musl1.2.0、riscv64-sf；LA同路径SHA-256为
+`816cff1d1abbef3f1423bbce01a56f00c97b6ff8e20d49966c9d4b6d27e5e7be`，
+自报musl1.2.5、loongarch64。实际反汇编如下：
+
+| 函数 | RV原libc | LA原libc |
+|---|---|---|
+| sched_getparam | 0x4dad8，ecall 121 | 0x544e0，直接__syscall_ret(-ENOSYS) |
+| sched_getscheduler | 0x4dafc，ecall 120 | 0x54500，直接__syscall_ret(-ENOSYS) |
+| sched_setparam | 0x4db44，ecall 118 | 0x54544，直接__syscall_ret(-ENOSYS) |
+| sched_setscheduler | 0x4db68，ecall 119 | 0x54564，直接__syscall_ret(-ENOSYS) |
+
+因此RV原cyclictest-musl会进入内核查询/设置调度并获得样本；LA在首轮查询即退出1，
+无样本而得0。两架构内核使用同一`kernel/syscall/sched.c`，此前raw120/121在
+固定Linux和BoarOS、512MiB/1GiB均返回0；继续补LA内核分支不能改变未进入内核的函数。
+
+这不是“旧musl支持、新musl移除”。固定本地1.2.5源码直接返回ENOSYS；另外从
+[musl官方1.2.0归档](https://musl.libc.org/releases/musl-1.2.0.tar.gz)核对同名四函数
+也都是ENOSYS，归档SHA-256为
+`c6de7b191139142d3f9a7b5b702c9cae1b5ee6e7f57e582da9328629408fd4e8`，
+2026-10-07访问，分析缓存路径`build/tools/oscomp-analysis/musl-1.2.0.tar.gz`。
+归档没有RV专用sched_getparam覆盖，原RV二进制实现内容与上游同版本有差异；
+版本字符串不能证明具体构建来源，修改者及构建历史未确认。
+上游2012-11-11的[调度接口取舍记录](https://git.musl-libc.org/cgit/musl/log/include/pthread.h?h=v1.2.3&showmsg=1)
+（commit`1e21e78bf7a5c24c217446d8760be7b7188711c2`，2026-10-07访问）说明，
+Linux sched syscall提供线程调度，而POSIX同名接口要求进程调度，musl选择不发布
+这一可选能力并返回ENOSYS。这是上游语义选择，不能称为LA架构漏接syscall。
+
+若要支持依赖Linux调度语义的cyclictest，修复归属是提供真实Linux调度接口的
+用户运行时，四个函数都应执行实际syscall并正确传播错误；原正式盘仍保持原身份。
+两侧原运行时并非功能等价：RV旧glibc的初始化errno问题使clock少1分，原RV
+musl的实际调度接口又使cyclictest能运行。分差不能用于推导内核架构能力高低。
+本轮只完成原输入差异归因及basic原组回归，没有修改内核、原libc或原judge。
