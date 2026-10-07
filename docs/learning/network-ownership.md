@@ -437,7 +437,9 @@ python3 -B tests/network-external.py --observe --kernel build/network-cost/kerne
 ```
 
 输出只在忽略的 build；核对后清理，Git 保存上述可理解结论和可重建负载。
-完整 Harness 仍缺 kernel-la。下一项由真实应用需求选择：地址/路由与 DNS、
+本段记录时完整Harness仍缺kernel-la；当前LA指定矩阵已交付，原盘容器基线
+由oscomp-compat独立记录，见[LA模块](../modules/loongarch-boot.md)。本段历史候选
+仍由真实应用需求选择：地址/路由与DNS、
 更大的离线 C 构建或交互式 shell；TLS 需另核对随机、时间和证书。
 窗口、非阻塞发送暂存和接收复制等优化仍按目标应用证据选择，不设固定倍数，
 也不让继续优化挡住功能交付。

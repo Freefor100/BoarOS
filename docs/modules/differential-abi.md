@@ -59,7 +59,9 @@ fixture 内 `/dev/console` 是由 debugfs 创建的字符设备 inode，用于 L
 Linux Image `01d60a8ae733f56aa94cf11b4805da1fe876cac09d2ef81e7e7397568ee1f668`。
 实际 QEMU 11.1.1；`make test-diff-abi-riscv` 使用正式默认预算退出 0，
 18 项宿主协议测试也通过。同一生产源码的 RV64 全套、四组合 io-sleep、scale 与
-栈检查通过，生产内核通过 musl 和 glibc 五种形态；完整比赛 Harness 因无 `kernel-la` 保持阻塞。
+栈检查通过，生产内核通过 musl 和 glibc 五种形态；当时完整比赛Harness因无
+`kernel-la`保持阻塞。当前LA指定单核矩阵已验收，见[LA模块](loongarch-boot.md)；
+原评测容器基线由oscomp-compat独立记录，历史1091条证据不变。
 
 ## 进程、随机与调度阶段（2026-09-29）
 
