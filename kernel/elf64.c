@@ -67,9 +67,11 @@ static enum kernel_elf64_status validate_load_segment(
     }
     if (header->alignment > 1U) {
         alignment_mask = header->alignment - 1U;
+        /* 空LOAD不映射文件页；GNU表后offset可以与VA0不同余。 */
         if ((header->alignment & alignment_mask) != 0U ||
-            (header->virtual_address & alignment_mask) !=
-                (header->offset & alignment_mask)) {
+            (header->memory_size != 0U &&
+             (header->virtual_address & alignment_mask) !=
+                 (header->offset & alignment_mask))) {
             return KERNEL_ELF64_STATUS_MALFORMED;
         }
     }

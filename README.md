@@ -81,6 +81,7 @@ LA普通/挂载后rmdir验证；RV全恢复回归已随本轮最终门禁通过�
 DTB随机种子仅支持早期材料和AT_RANDOM，不计可信熵。真实PCI RNG的正常、缺失、
 延迟、在途停止已双侧两种RAM验收，BoarOS构造失败与回收也已在两种RAM验收。LBT、
 更广原程序、客体原生开发、完整Harness、实板和SMP仍须另行验收；本轮共同矩阵对齐不表示所有RV能力全面等价。
+评测接入暴露的GNU空`PT_LOAD`拒绝已在共用parser修正；同一LA监督器ELF的Linux对照、两种RAM执行和回收通过，非空段权限/布局检查保持。
 共用VirtIO transport/split queue已接入RV MMIO与LA PCI block，保留batch/flush/
 超时及DMA业务owner；RNG/net已迁入，见[框架契约](docs/modules/virtio-framework.md)。
 LA EXEC 页的数据读权限已按固定 Linux 的冷/驻留状态核对；页表有效权限与请求
