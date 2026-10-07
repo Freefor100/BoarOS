@@ -531,3 +531,19 @@ HTML中，hooks/console_log已被上游清空。实际GCC13.2不识别-mno-lsx/-
 `/glibc/basic/brk`和`/musl/basic/brk`发现二者相同，都请求/lib64/ld-linux-loongarch-lp64d.so.1。
 Linux同ELF的缺链接127/原loader链接0反例确认环境归属；bootstrap同时建立
 /lib、/lib64、/usr/lib64的原盘loader链接，不替换runtime或修改原程序。
+
+## 原Harness生命周期与联合采集（2026-10-07）
+
+固定Harness的kernel/run_qemu.py在内部wait超时后kill的是shell Popen，未向调用者
+提供逐架构退出/超时结果。不能由脚本COMPLETE或缺少COMPLETE猜QEMU自然结束
+或3600秒耗尽。外部只读observer绑定本次容器digest/submit及实际QEMU PID和
+start_ticks，原Harness与启动参数不变；没有证据就报告unknown，预算结束的owner
+回收未验证。报告修复可重读同一次原Job和两串口，联合postwork仍只调用一次，
+冻结内核版本和采集器版本各自公开，不拼接多次启动或将独立整数分相加。
+
+原LA glibc clocale_mbfuncs静态entry ELF SHA-256
+`e31723e58c961424e685aba297fbc6a94ad4dc7c2a5aa84d391261bae87c10e2`，经原
+runtest.exe在固定Linux f4cdf7ca9a1fdcca413157df19753f388a5a224e、16KiB运行，
+static/dynamic均复现byte80的mbrtowc/btowc失败且原wrapper返回1；Linux正常卸载。
+该原盘程序与libc行为差异不被归为新的BoarOS装载错误，也不修改程序取得通过。
+同一原镜像的mount/umount仍依赖vfat和/dev/vda2，缺失能力按原输出保留。

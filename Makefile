@@ -663,8 +663,8 @@ all: $(KERNEL_RV) kernel-la
 
 # 显式共同配置覆盖两侧；默认评测配置各自依赖目标架构helper。
 ifneq ($(origin INIT_CONFIG),undefined)
-INIT_CONFIG_RV ?= $(INIT_CONFIG)
-INIT_CONFIG_LA ?= $(INIT_CONFIG)
+override INIT_CONFIG_RV := $(INIT_CONFIG)
+override INIT_CONFIG_LA := $(INIT_CONFIG)
 else
 INIT_CONFIG_RV ?= $(OSCOMP_INIT)
 INIT_CONFIG_LA ?= $(OSCOMP_INIT_LA)

@@ -85,6 +85,62 @@ def original_score(summary, config):
             'original_postwork_verdict': job.verdict_value, 'html': job.html}
 
 
+def case_observations(section):
+    cases, errors, current = [], [], None
+    for raw in section.splitlines():
+        line = raw.strip()
+        begin = re.fullmatch(r'RUN LTP CASE (.+)', line)
+        if begin:
+            if current: cases.append(current)
+            current = {'name': begin[1], 'state': 'incomplete', 'stage': 'unknown',
+                'owner': 'original-case', 'shell_exit_status': None, 'wait_status': None,
+                'evidence': [], 'evidence_count': 0}
+            continue
+        kind = None
+        if 'BOAROS-CASE EXEC-ERROR ' in line or "can't execute '" in line:
+            kind = ('load-error', 'load', 'user-exec')
+        elif 'BOAROS-CASE WAIT-ERROR ' in line:
+            kind = ('runner-error', 'supervision', 'case-supervisor')
+        elif 'BOAROS-CASE SETUP-ERROR ' in line:
+            kind = ('preparation-error', 'preparation', 'case-supervisor')
+        elif 'BOAROS-CASE SKIP ' in line:
+            kind = ('source-skip', 'preparation', 'ltp-adapter')
+        elif 'BOAROS-CASE EXCLUDE ' in line:
+            kind = ('manual-exclusion', 'preparation', 'ltp-adapter')
+        elif 'BOAROS-CASE TIMEOUT' in line:
+            kind = ('supervision-timeout', 'running', 'case-supervisor')
+        elif re.search(r'\b(?:TFAIL|TBROK):', line):
+            kind = ('reported-failure', 'running', 'original-case')
+        elif re.search(r'\bTCONF:', line):
+            kind = ('reported-skip', 'unknown', 'original-case')
+        if kind:
+            state, stage, owner = kind
+            error = {'case': current['name'] if current else None, 'state': state,
+                     'stage': stage, 'owner': owner, 'output': raw}
+            errno = re.search(r'errno=(\d+)', line)
+            if errno: error['errno'] = int(errno[1])
+            errors.append(error)
+            if current:
+                if current['evidence_count'] == 0: current['first_proven_stage'] = stage
+                if current['state'] == 'incomplete' or (current['state'] == 'reported-skip' and
+                    state == 'reported-failure') or owner != 'original-case':
+                    current.update(state=state, stage=stage, owner=owner)
+                if errno: current['errno'] = int(errno[1])
+                current['evidence_count'] += 1
+                if len(current['evidence']) < 4: current['evidence'].append(raw)
+                wait = re.search(r'wait_status=(\d+)', line)
+                if wait: current['wait_status'] = int(wait[1])
+        end = re.fullmatch(r'(?:FAIL|END) LTP CASE (.+?)\s*:\s*(\d+)', line)
+        if end and current and end[1] == current['name']:
+            current['shell_exit_status'] = int(end[2])
+            if current['state'] == 'incomplete':
+                # 原外层的0退出也不能代替有效断言；未观察到main的失败阶段保持unknown。
+                current['state'] = 'returned' if int(end[2]) == 0 else 'nonzero-exit'
+            cases.append(current); current = None
+    if current: cases.append(current)
+    return cases, errors
+
+
 def summarize_groups(serial, selected, exit_reason='qemu-exit'):
     groups = {}
     for group in GROUPS:
@@ -103,12 +159,15 @@ def summarize_groups(serial, selected, exit_reason='qemu-exit'):
             section = ''
             if entered:
                 section = serial.split('BOAROS-EVAL ENTER ' + name, 1)[1].split('BOAROS-EVAL EXIT ' + name, 1)[0]
+            cases, errors = case_observations(section)
             groups[name] = {'entered': entered, 'started': started, 'ended': ended,
-                'script_exit': code, 'state': state,
+                'script_exit': code, 'state': state, 'cases': cases, 'observed_errors': errors,
                 'supervision': {'skipped': section.count('BOAROS-CASE SKIP '),
                     'excluded': section.count('BOAROS-CASE EXCLUDE '),
                     'timed_out': section.count('BOAROS-CASE TIMEOUT-END '),
-                    'setup_failed': section.count('BOAROS-CASE SETUP-ERROR ')}}
+                    'setup_failed': section.count('BOAROS-CASE SETUP-ERROR '),
+                    'exec_failed': section.count('BOAROS-CASE EXEC-ERROR '),
+                    'wait_failed': section.count('BOAROS-CASE WAIT-ERROR ')}}
     return groups
 
 
@@ -173,6 +232,21 @@ def run_guests(runs, budget):
             stream.close()
 
 
+def diagnostic_build(architectures, selected, case_timeout, exclusions):
+    environment = os.environ.copy()
+    # 本次评测配置必须与冻结身份一致；调用者make的覆盖不能带入子构建。
+    for name in ('INIT_CONFIG', 'INIT_CONFIG_RV', 'INIT_CONFIG_LA', 'MAKEFLAGS', 'MFLAGS', 'MAKEOVERRIDES'):
+        environment.pop(name, None)
+    configs = {arch: Path('build/riscv' if arch == 'riscv' else 'build/loongarch') / 'oscomp/init.json'
+               for arch in architectures}
+    command = ['make', '-j8', *('kernel-rv' if arch == 'riscv' else 'kernel-la' for arch in architectures),
+        'OSCOMP_GROUPS=' + ' '.join(selected), 'OSCOMP_CASE_TIMEOUT=' + str(case_timeout),
+        'OSCOMP_DIAGNOSTIC_EXCLUDE=' + ' '.join(exclusions)]
+    for arch, config in configs.items():
+        command.append(('INIT_CONFIG_RV=' if arch == 'riscv' else 'INIT_CONFIG_LA=') + str(config))
+    return command, environment, configs
+
+
 def main():
     ap = argparse.ArgumentParser(__doc__)
     ap.add_argument('--arch', choices=tuple(ARCH_KEYS) + ('both',), default='both')
@@ -210,9 +284,8 @@ def main():
         budget = args.diagnostic_timeout if args.diagnostic_timeout is not None else config.get('qemu.timeout', 60)
         report.update(inputs=identity, release_assets_verified_this_run=args.verify_inputs,
                       config=config, config_sha256=sha(config_path), timeout_seconds=budget)
-        subprocess.run(['make', '-j8', *(identity['architectures'][arch]['kernel'] for arch in architectures),
-            'OSCOMP_GROUPS=' + ' '.join(selected), 'OSCOMP_CASE_TIMEOUT=' + str(args.case_timeout),
-            'OSCOMP_DIAGNOSTIC_EXCLUDE=' + ' '.join(args.diagnostic_exclude)], cwd=ROOT, check=True)
+        build, environment, configs = diagnostic_build(architectures, selected, args.case_timeout, args.diagnostic_exclude)
+        subprocess.run(build, cwd=ROOT, env=environment, check=True)
         runs = []
         for arch in architectures:
             target = directory / ARCH_KEYS[arch]; target.mkdir()
@@ -225,7 +298,8 @@ def main():
             base = ROOT / ('build/riscv' if arch == 'riscv' else 'build/loongarch') / 'oscomp'
             command = boot_command(arch, str(executable), kernel, disk, config, args.rng)
             entry = {'kernel_sha256': sha(kernel), 'fixture_sha256': sha(disk), 'boot_count': 1,
-                'init_config_sha256': sha(base / 'init.json'), 'case_sha256': sha(base / 'case'),
+                'init_config_path': str(configs[arch]), 'init_config_sha256': sha(ROOT / configs[arch]),
+                'case_sha256': sha(base / 'case'),
                 'qemu_command': command, 'qemu': output([str(executable), '--version']).splitlines()[0],
                 'qemu_sha256': sha(executable), 'qemu_mode': oct(executable.stat().st_mode & 0o777),
                 'qemu_selected_path': qemu, 'qemu_resolved_path': str(executable), 'extra_disk': None}

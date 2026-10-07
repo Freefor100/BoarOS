@@ -60,6 +60,35 @@ class ContainerTests(unittest.TestCase):
         self.assertEqual(module.harness_error_stage({'verdict': 'Runtime Error'}), 'official-harness')
         self.assertIsNone(module.harness_error_stage({'verdict': 'Accpted'}))
 
+    def test_complete_script_without_process_end_cannot_prove_natural_exit(self):
+        module = self.module()
+        serial = 'BOAROS-EVAL COMPLETE\n'
+        self.assertEqual(module.classify_official_exit(serial, None), 'unknown-lifecycle')
+        self.assertEqual(module.classify_official_exit(serial, {'budget_observed': True}),
+                         'total-budget-timeout')
+
+    def test_partial_script_without_budget_evidence_is_not_timeout(self):
+        module = self.module()
+        serial = 'BOAROS-EVAL ENTER ltp-musl\n'
+        self.assertEqual(module.classify_official_exit(serial, None), 'unknown-lifecycle')
+        self.assertEqual(module.classify_official_exit(serial, {'end_observed': True}), 'qemu-exit')
+
+    def test_lifecycle_requires_seen_owner_and_conservative_budget_evidence(self):
+        module = self.module()
+        record = {'samples': 0, 'budget_seconds': 10, 'architectures': {}}
+        module.update_lifecycle(record, {'uptime': 100, 'processes': {'riscv': {
+            'pid': 12, 'start_ticks': 9000, 'elapsed_seconds': 10.1}}})
+        self.assertFalse(record['architectures']['riscv']['budget_observed'])
+        self.assertNotIn('loongarch', record['architectures'])
+        module.update_lifecycle(record, {'uptime': 101, 'processes': {'riscv': {
+            'pid': 12, 'start_ticks': 9000, 'elapsed_seconds': 11.1}}})
+        self.assertTrue(record['architectures']['riscv']['budget_observed'])
+        with self.assertRaisesRegex(RuntimeError, 'owner changed'):
+            module.update_lifecycle(record, {'uptime': 102, 'processes': {'riscv': {
+                'pid': 13, 'start_ticks': 10100, 'elapsed_seconds': 1}}})
+        module.update_lifecycle(record, {'uptime': 103, 'processes': {}})
+        self.assertTrue(record['architectures']['riscv']['end_observed'])
+
     def test_container_entry_uses_upstream_parser_despite_local_run_module(self):
         self.module()
         temp = tempfile.TemporaryDirectory(); self.addCleanup(temp.cleanup)

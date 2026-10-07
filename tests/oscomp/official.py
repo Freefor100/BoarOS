@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import time
 import zipfile
 
 import run as local
@@ -110,10 +111,155 @@ def harness_error_stage(job):
     return None
 
 
+def classify_official_exit(serial, evidence):
+    evidence = evidence or {}
+    if evidence.get('budget_observed'): return 'total-budget-timeout'
+    if 'root boot error' in serial or 'LA root boot errno=' in serial: return 'guest-boot-error'
+    if evidence.get('end_observed'): return 'qemu-exit'
+    return 'unknown-lifecycle'
+
+
+LIFECYCLE_PROBE = r'''import os,json
+result={'uptime':float(open('/proc/uptime').read().split()[0]),'processes':{}}
+for pid in os.listdir('/proc'):
+ if not pid.isdigit():continue
+ try:
+  argv=open('/proc/'+pid+'/cmdline','rb').read().split(b'\0')
+  name=os.path.basename(argv[0].decode())
+  arch={'qemu-system-riscv64':'riscv','qemu-system-loongarch64':'loongarch'}.get(name)
+  if not arch:continue
+  if os.path.basename(os.readlink('/proc/'+pid+'/exe'))!=name:continue
+  words=[a.decode() for a in argv if a]
+  if words[words.index('-kernel')+1]!={'riscv':'kernel-rv','loongarch':'kernel-la'}[arch]:continue
+  stat=open('/proc/'+pid+'/stat').read().rpartition(')')[2].split()
+  start=int(stat[19]);elapsed=result['uptime']-start/os.sysconf('SC_CLK_TCK')
+  if arch in result['processes']:raise RuntimeError('multiple QEMU owners')
+  result['processes'][arch]={'pid':int(pid),'start_ticks':start,'elapsed_seconds':elapsed}
+ except (FileNotFoundError,ProcessLookupError,ValueError):continue
+print(json.dumps(result))'''
+
+
+def update_lifecycle(record, snapshot):
+    record['samples'] += 1
+    for arch in local.ARCH_KEYS:
+        item, old = snapshot['processes'].get(arch), record['architectures'].get(arch)
+        if item:
+            if old and (old['pid'], old['start_ticks']) != (item['pid'], item['start_ticks']):
+                raise RuntimeError('QEMU owner changed during the single boot')
+            record['architectures'][arch] = {**(old or {}), **item, 'end_observed': False,
+                'budget_observed': bool(old and old.get('budget_observed')) or
+                                   item['elapsed_seconds'] >= record['budget_seconds'] + 1}
+        elif old:
+            old['end_observed'] = True
+            old.setdefault('end_observed_uptime', snapshot['uptime'])
+
+
+def observe_lifecycle(directory):
+    identity = json.loads((directory / 'identity.json').read_text())
+    command = identity['container_command']; name = command[command.index('--name') + 1]
+    reference = require_digest(identity['container']['reference'])
+    record = {'observer': 'owned-container-proc', 'reference': reference,
+        'source_commit': identity['source']['commit'], 'budget_seconds': identity['config']['qemu.timeout'],
+        'observer_source_sha256': local.sha(Path(__file__)),
+        'probe_sha256': hashlib.sha256(LIFECYCLE_PROBE.encode()).hexdigest(),
+        'architectures': {}, 'samples': 0}
+    def save():
+        target = directory / 'lifecycle.json'; temporary = target.with_suffix('.tmp')
+        temporary.write_text(json.dumps(record, indent=2) + '\n'); temporary.replace(target)
+    try:
+        # 只观察本次隔离提交的容器，名称本身不能证明owner。
+        for attempt in range(30):
+            inspected = subprocess.run(['docker', 'container', 'inspect', name], capture_output=True,
+                                       text=True, timeout=5)
+            if not inspected.returncode: break
+            time.sleep(1)
+        else: raise RuntimeError('owned official container was not observed')
+        container = json.loads(inspected.stdout)[0]
+        if container['Config']['Image'] != reference or not any(
+            mount.get('Destination') == '/coursegrader/submit' and
+            Path(mount.get('Source', '')).resolve() == (directory / 'submit').resolve()
+            for mount in container['Mounts']):
+            raise RuntimeError('container image or submission owner differs')
+        record['container_id'] = container['Id']
+        while True:
+            probe = subprocess.run(['docker', 'exec', container['Id'], 'python3', '-c', LIFECYCLE_PROBE],
+                                   capture_output=True, text=True, timeout=5)
+            if probe.returncode:
+                record['stop_reason'] = 'container-or-probe-unavailable'; break
+            update_lifecycle(record, json.loads(probe.stdout)); save(); time.sleep(1)
+    except Exception as error:
+        record['error'] = str(error)
+    finally: save()
+
+
+def collect_results(directory, report):
+    identity, config = report['inputs'], report['config']
+    original = original_job_output(directory / 'harness.log')
+    (directory / 'original-job.json').write_text(json.dumps(original, indent=2) + '\n')
+    failure = harness_error_stage(original)
+    if failure: raise RuntimeError('original Harness returned ' + original['verdict'])
+    local.validate(False)
+    lifecycle = json.loads((directory / 'lifecycle.json').read_text()) if (directory / 'lifecycle.json').is_file() else {}
+    if lifecycle and (lifecycle.get('reference') != report['container']['reference'] or
+                      lifecycle.get('source_commit') != report['source']['commit']):
+        raise RuntimeError('lifecycle evidence belongs to another image or submission')
+    report['lifecycle'] = lifecycle
+    report['collector'] = {'commit': local.output(['git', 'rev-parse', 'HEAD']),
+        'tree': local.output(['git', 'rev-parse', 'HEAD^{tree}']),
+        'dirty': local.output(['git', 'status', '--porcelain'])}
+    report['architectures'] = {}; summary = {}
+    sys.path.insert(0, str(ROOT / 'tests'))
+    from arch_profiles import PROFILES
+    for arch, key in local.ARCH_KEYS.items():
+        submit = directory / 'submit'; log = submit / ('os_serial_out_' + key + '.txt')
+        if not log.is_file(): raise RuntimeError('missing actual serial stream: ' + key)
+        serial = log.read_text(errors='replace'); done = 'BOAROS-EVAL COMPLETE' in serial
+        evidence = lifecycle.get('architectures', {}).get(arch)
+        reason = classify_official_exit(serial, evidence)
+        base = submit / ('build/riscv' if arch == 'riscv' else 'build/loongarch') / 'oscomp'
+        entry = {'kernel_sha256': local.sha(submit / identity['architectures'][arch]['kernel']),
+            'case_sha256': local.sha(base / 'case'), 'init_config_sha256': local.sha(base / 'init.json'),
+            'serial_sha256': local.sha(log), 'qemu_command_from_original_stream': serial.splitlines()[0] if serial else '',
+            'qemu_returncode': None, 'boot_count': 1, 'completed_script': done, 'exit_reason': reason,
+            'root_resources_verified': reason == 'qemu-exit' and done and PROFILES[arch].root_success(serial, 0),
+            'groups': local.summarize_groups(serial, local.GROUPS, reason)}
+        summary[key] = local.judge(log, config)
+        (directory / ('judge-' + key + '.json')).write_text(json.dumps(summary[key], indent=2) + '\n')
+        _, postwork = local.original_modules()
+        for group, details in entry['groups'].items():
+            scores, _ = postwork.build_table(group, [key], {key: summary[key]})
+            details['judge_score'] = scores['#TOTAL']
+        report['architectures'][arch] = entry
+    expected = local.original_score(summary, config)
+    if int(original['score']) != expected['postwork_integer_score']:
+        raise RuntimeError('original Job score differs from joint upstream postwork replay')
+    report.update(postwork_integer_score=int(original['score']), postwork_rank=original['rank'],
+                  original_postwork_verdict=original['verdict'], baseline_established=True)
+    report['all_scripts_completed'] = all(entry['completed_script'] for entry in report['architectures'].values())
+    report.pop('error', None)
+    print(json.dumps({'baseline_established': True, 'all_scripts_completed': report['all_scripts_completed'],
+                      'score': report['postwork_integer_score']}, indent=2), flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(__doc__)
     parser.add_argument('--output', type=Path)
+    parser.add_argument('--observe-only', type=Path, help='read only the owned running container lifecycle')
+    parser.add_argument('--collect-existing', type=Path, help='reclassify one completed original run without booting again')
     args = parser.parse_args()
+    if args.observe_only or args.collect_existing:
+        if args.output or (args.observe_only and args.collect_existing): parser.error('choose one operation')
+        directory = (args.observe_only or args.collect_existing).resolve()
+        if not directory.is_relative_to(ROOT / 'build') or not (directory / 'identity.json').is_file():
+            parser.error('existing run must have its frozen identity under build/')
+        if args.observe_only: observe_lifecycle(directory); return
+        report = json.loads((directory / 'identity.json').read_text())
+        stage = harness_error_stage(original_job_output(directory / 'harness.log')) or 'collection'
+        try: collect_results(directory, report)
+        except Exception as error:
+            report['error'] = {'stage': stage, 'type': type(error).__name__, 'message': str(error)}; raise
+        finally: (directory / 'report.json').write_text(json.dumps(report, indent=2) + '\n')
+        return
     directory = args.output.resolve() if args.output else ROOT / 'build' / ('oscomp-official-' + datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%f'))
     if directory.exists() or not directory.is_relative_to(ROOT / 'build'):
         parser.error('output must be a new directory under build/')
@@ -124,7 +270,7 @@ def main():
                         'skip_table_sha256': local.sha(HERE / 'ltp-skips.tsv'), 'diagnostic_exclusions': []},
         'architectures': {}}
     stage = 'preparation'; name = 'boaros-oscomp-' + directory.name.removeprefix('oscomp-official-')
-    reference = None
+    reference = None; observer = None
     try:
         identity = local.validate(True)
         report['inputs'] = identity
@@ -158,7 +304,7 @@ def main():
                      # 镜像GCC13不识别-mno-lsx/-mno-lasx；soft-float与禁自动向量化保持整数C。
                      'LA_FLAGS': '-march=loongarch64 -mabi=lp64s -msoft-float -mcmodel=normal '
                                  '-fno-tree-vectorize -fno-tree-slp-vectorize'}
-        command = ['docker', 'run', '--rm', '--name', name, '--network', 'none',
+        command = ['docker', 'run', '--rm', '--name', name, '--cidfile', str(directory / 'container.cid'), '--network', 'none',
             '-v', str(submit) + ':/coursegrader/submit', '-v', str(data) + ':/coursegrader/testdata',
             '-v', str(cg) + ':/cg:ro', '-v', str(hooks) + ':/mnt/cghook']
         for key, value in build_env.items(): command += ['-e', key + '=' + value]
@@ -167,6 +313,10 @@ def main():
         (directory / 'identity.json').write_text(json.dumps(report, indent=2) + '\n')
         print('Running unchanged Docker Harness; supervised compatibility baseline:', directory, flush=True)
         stage = 'official-harness'
+        observer_log = (directory / 'observer.log').open('wb')
+        observer = subprocess.Popen([sys.executable, '-B', str(HERE / 'official.py'), '--observe-only', str(directory)],
+                                    stdout=observer_log, stderr=subprocess.STDOUT)
+        observer_log.close()
         with (directory / 'harness.log').open('wb') as output:
             result = subprocess.run(command, stdout=output, stderr=subprocess.STDOUT, timeout=5400)
         report['container_returncode'] = result.returncode
@@ -178,45 +328,25 @@ def main():
         if failure:
             stage = failure
             raise RuntimeError('original Harness returned ' + original['verdict'] + '; see original-job.json')
-        summary = {}
-        for arch, key in local.ARCH_KEYS.items():
-            log = submit / ('os_serial_out_' + key + '.txt')
-            if not log.is_file(): raise RuntimeError('missing actual serial stream: ' + key)
-            serial = log.read_text(errors='replace')
-            command_line = serial.splitlines()[0] if serial else ''
-            kernel = submit / identity['architectures'][arch]['kernel']
-            done = 'BOAROS-EVAL COMPLETE' in serial
-            reason = ('guest-boot-error' if 'root boot error' in serial or 'LA root boot errno=' in serial else
-                      'qemu-exit' if done else 'incomplete-or-total-budget-timeout')
-            groups = local.summarize_groups(serial, local.GROUPS,
-                'total-budget-timeout' if not done else reason)
-            sys.path.insert(0, str(ROOT / 'tests'))
-            from arch_profiles import PROFILES
-            entry = {'kernel_sha256': local.sha(kernel), 'serial_sha256': local.sha(log),
-                'qemu_command_from_original_stream': command_line, 'boot_count': 1,
-                'completed_script': done, 'exit_reason': reason,
-                'root_resources_verified': done and PROFILES[arch].root_success(serial, 0), 'groups': groups}
-            summary[key] = local.judge(log, config)
-            (directory / ('judge-' + key + '.json')).write_text(json.dumps(summary[key], indent=2) + '\n')
-            _, postwork = local.original_modules()
-            for group, details in groups.items():
-                scores, _ = postwork.build_table(group, [key], {key: summary[key]})
-                details['judge_score'] = scores['#TOTAL']
-            report['architectures'][arch] = entry
-        expected = local.original_score(summary, config)
-        if int(original['score']) != expected['postwork_integer_score']:
-            raise RuntimeError('original Job score differs from joint upstream postwork replay')
-        report['postwork_integer_score'] = int(original['score'])
-        report['postwork_rank'] = original['rank']; report['original_postwork_verdict'] = original['verdict']
-        report['baseline_established'] = True
-        report['all_scripts_completed'] = all(entry['completed_script'] for entry in report['architectures'].values())
-        print(json.dumps({'baseline_established': True, 'all_scripts_completed': report['all_scripts_completed'],
-                          'score': report['postwork_integer_score']}, indent=2), flush=True)
+        if observer:
+            try: observer.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                observer.terminate(); observer.wait(timeout=5)
+        collect_results(directory, report)
+
     except BaseException as error:
         report['error'] = {'stage': stage, 'type': type(error).__name__, 'message': str(error)}
-        subprocess.run(['docker', 'rm', '-f', name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        cidfile = directory / 'container.cid'
+        if cidfile.is_file():
+            cid = cidfile.read_text().strip()
+            if re.fullmatch(r'[0-9a-f]{64}', cid):
+                subprocess.run(['docker', 'rm', '-f', cid], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         raise
     finally:
+        if observer and observer.poll() is None:
+            try: observer.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                observer.terminate(); observer.wait(timeout=5)
         # 容器默认root只写本次隔离目录；归还宿主owner以便既有清理流程处理。
         if reference and any(path.exists() for path in (directory / 'submit', directory / 'hooks', directory / 'testdata')):
             subprocess.run(['docker', 'run', '--rm', '--network', 'none', '--entrypoint', 'chown',

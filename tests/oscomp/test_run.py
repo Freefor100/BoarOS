@@ -48,6 +48,44 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(result['supervision']['skipped'], 1)
         self.assertEqual(result['supervision']['timed_out'], 1)
 
+    def test_completed_group_preserves_case_load_and_wait_errors(self):
+        text = ('BOAROS-EVAL ENTER ltp-glibc\n'
+                'RUN LTP CASE missing-program\nBOAROS-CASE EXEC-ERROR errno=2\n'
+                'FAIL LTP CASE missing-program : 127\n'
+                'RUN LTP CASE broken-wait\nBOAROS-CASE WAIT-ERROR errno=10\n'
+                'FAIL LTP CASE broken-wait : 125\n'
+                '#### OS COMP TEST GROUP END ltp-glibc ####\nBOAROS-EVAL EXIT ltp-glibc status=0\n')
+        result = self.states(text, ['ltp'])['ltp-glibc']
+        self.assertEqual(result['state'], 'completed')
+        self.assertEqual([(c['name'], c['state'], c['shell_exit_status']) for c in result['cases']],
+                         [('missing-program', 'load-error', 127), ('broken-wait', 'runner-error', 125)])
+        self.assertEqual(result['cases'][0]['errno'], 2)
+        self.assertEqual(result['supervision']['exec_failed'], 1)
+        self.assertEqual(result['supervision']['wait_failed'], 1)
+
+    def test_zero_exit_is_not_a_pass_and_inflight_case_stays_incomplete(self):
+        text = ('BOAROS-EVAL ENTER ltp-musl\nRUN LTP CASE reported-fail\n'
+                'case.c:9: TFAIL: contract differs\ncase.c:10: TCONF: another subcase skipped\n'
+                'FAIL LTP CASE reported-fail : 0\n'
+                'RUN LTP CASE unobserved-result\n')
+        result = self.states(text, ['ltp'], 'total-budget-timeout')['ltp-musl']
+        self.assertEqual([(c['name'], c['state']) for c in result['cases']],
+                         [('reported-fail', 'reported-failure'), ('unobserved-result', 'incomplete')])
+        self.assertIsNone(result['cases'][1]['shell_exit_status'])
+
+    def test_supervision_and_reported_skip_keep_distinct_status_and_wait_evidence(self):
+        text = ('BOAROS-EVAL ENTER ltp-musl\nRUN LTP CASE spinning\n'
+                'BOAROS-CASE TIMEOUT seconds=300 command=spinning\n'
+                'BOAROS-CASE TIMEOUT-END wait_status=9 child_pid=12\nFAIL LTP CASE spinning : 124\n'
+                'RUN LTP CASE configured-out\ncase.c:3: TCONF: missing capability\n'
+                'FAIL LTP CASE configured-out : 32\n')
+        result = self.states(text, ['ltp'])['ltp-musl']['cases']
+        self.assertEqual(result[0]['state'], 'supervision-timeout')
+        self.assertEqual(result[0]['wait_status'], 9)
+        self.assertEqual(result[1]['state'], 'reported-skip')
+        self.assertEqual(result[1]['shell_exit_status'], 32)
+        self.assertIsNone(result[1]['wait_status'])
+
     def test_combined_score_uses_original_nonlinear_ltp_formula(self):
         function = getattr(runner, 'original_score', None)
         self.assertTrue(callable(function), 'runner lacks joint upstream scoring')
@@ -73,6 +111,16 @@ class ReportTests(unittest.TestCase):
             self.assertEqual(entry['qemu_returncode'], 0)
             self.assertEqual(entry['exit_reason'], 'qemu-exit')
             self.assertEqual(log.read_text(), 'actual final output\n')
+
+    def test_architecture_failure_and_full_output_remain_independent(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            logs = [Path(temporary) / name for name in ('rv.log', 'la.log')]
+            entries = [{}, {}]
+            runner.run_guests([
+                ('riscv', entries[0], [sys.executable, '-c', 'print("RV failed tail");raise SystemExit(7)'], logs[0]),
+                ('loongarch', entries[1], [sys.executable, '-c', 'print("LA actual tail")'], logs[1])], 3)
+            self.assertEqual([entry['qemu_returncode'] for entry in entries], [7, 0])
+            self.assertEqual([log.read_text() for log in logs], ['RV failed tail\n', 'LA actual tail\n'])
 
 
 if __name__ == '__main__':

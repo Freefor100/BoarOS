@@ -28,7 +28,7 @@ init.json和头文件；`INIT_CONFIG_RV`/`INIT_CONFIG_LA`独立覆盖，显式�
 
 PID1直接exec原盘`/musl/busybox`，bootstrap作为sh -c参数编入内核，不由宿主
 向原盘注入helper。启动创建/bin、设备、proc和/dev/shm，并从目标profile建立
-原loader链接。LA除/lib外还需/usr/lib64/ld-linux-loongarch-lp64d.so.1；RV的
+原loader链接。LA使用/lib、/lib64、/usr/lib64三个实际interpreter路径；RV的
 普通/sf musl名称保留。两个libc的LD_LIBRARY_PATH和工作目录分别设置。
 
 默认组顺序为basic、busybox、cyclictest、iozone、iperf、libcbench、libctest、
@@ -117,3 +117,35 @@ PT_INTERP为`/lib64/ld-linux-loongarch-lp64d.so.1`，另需现有`/lib`与`/usr/
 路径。固定Linux同ELF缺链接退出127、补原盘loader链接退出0；bootstrap发布
 三个链接，原盘程序与runtime不变。第二次容器已编译并启动两侧，发现此准备错误后
 主动结束，资源回收未验证；该流不作为正式总分，也不拼接后续运行。
+
+## 整体审查后的报告契约
+
+一次独立只读整体审查确认四项P2并集中修复：显式公共INIT_CONFIG覆盖命令行/环境
+架构配置；本地diagnostic剔除调用者的INIT_CONFIG与MAKEFLAGS等继承覆盖，显式
+选择并记录本次实际评测配置；官方生命周期不从COMPLETE推导；单项EXEC/WAIT
+错误进入结构化结果。源码和同ELF程序未因报告修复被改写。
+
+completed仅描述原组外层END/退出0，另存cases/observed_errors与原judge分数。
+LTP逐项保存原shell退出值；native wait状态只从实际TIMEOUT-END读取，其他情况
+保持null。TFAIL/TBROK、TCONF、源码helper SKIP、人工EXCLUDE、监督超时、EXEC
+装载失败、WAIT运行错误分别保留；已报告的失败不能被后续skip或退出0掩盖。
+不完整单项仍incomplete，非零但无法证明发生阶段的记录保持unknown；不猜main已到达。
+
+官方只读observer验证本次容器digest与隔离submit挂载，读取QEMU实际PID/start_ticks、
+存活与消失。PID复用/重复实例是observer错误。进程存活超过预算并留1秒测量余量
+才记录budget_observed；COMPLETE只表示脚本完成。未观察到真实进程结束或预算
+事实时exit_reason为unknown-lifecycle，不能给当前组补记timeout或正常回收。
+原Harness不提供可靠逐架构QEMU returncode，该字段明确null；自然结束仍需真实
+PID1/页/堆/任务栈/根盘/设备收尾。容器清理由本次cidfile标识，不能仅凭名称误删其他owner。
+
+若修正报告采集器，`python3 -B tests/oscomp/official.py --collect-existing build/某次运行`
+只重读同一冻结identity、原Job、两份实际串口与observer，不再次启动或构建，不合并
+其他运行。核对原联合postwork整数分并记录collector commit/tree及dirty状态；冻结
+内核源码身份与collector身份分开。单独观察运行中的已授权容器可用--observe-only。
+当前第三次正式运行仍固定722b517，后续报告/文档提交不冒充其实际构建输入。
+
+该轮聚焦与真实回归已包括host反例、两侧supervisor、原环境basic/BusyBox自然退出、
+RV完整架构、LA核心/fatal/dynamic、RV真实userland、GNU五形态、双方1366ABI、
+栈、LA PCI/reset/RNG/net/root-I/O及双方TTY/PTY。一次并行VFS15秒超时后，同构建
+独立及完整较低并发重跑通过，未证明历史触发归因。TTY的固定Linux LA1GiB同步
+反例则已由前台子shell READY修正并先落main。
