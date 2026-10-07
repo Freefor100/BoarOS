@@ -86,3 +86,36 @@ enum kernel_syscall_status kernel_syscall_dispatch(
 `getrandom(278)` 支持 GRND_NONBLOCK、GRND_RANDOM、GRND_INSECURE；未知标志或 RANDOM 与 INSECURE 同用返回 EINVAL。普通请求在可信 RNG 未就绪时等待，NONBLOCK 返回 EAGAIN，等待被信号打断按 SA_RESTART 选择重新等待或返回 EINTR；INSECURE 明确允许初始化前输出。长度最多 `0x7ffff000`，不在持有随机状态锁时执行用户复制。就绪后的 256 字节以内请求不因 pending signal 短返回；大请求按 256 字节分段，返回已复制进度，跨用户不可访问页同样保留已复制字节，首字节 fault 返回 EFAULT。核心与设备契约见[随机源](../learning/random-source.md)。
 
 RV64 `syslog(116)`交付完整klogctl 0–10；真实日志owner、游标、清空、fault和权限契约见[内核日志](kernel-log.md)。
+
+`statx(291)` 已接入通用 dispatch；参数按 Linux 的 int/unsigned 宽度截断后交给
+files 层，采用真实 `BASIC_STATS`，未实现的扩展字段不报告。LA 的 `clone(220)`
+用户参数顺序是 flags、stack、parent_tid、child_tid、TLS；trap 入口将最后两个
+重排后调用通用进程接口。真实父子 COW TID 写入由同 ELF 的 LA/Linux 对照保护。
+
+LA 的 rt_sigaction(134)/rt_sigreturn(139) 已接入共用信号策略；trap从a7/a0–a5
+解码并由LA后端恢复ERA/GPR和mask。完整整数frame、privileged状态边界和未支持
+扩展见[信号模块](kernel-signal.md)。真实静态musl pthread取消使用这一返回路径；
+未知syscall仍为ENOSYS，不以成功存根表示缺少的FP/SIMD、altstack或动态环境。
+
+## 双架构 ABI 差分入口
+
+`make test-diff-abi-riscv` 与 `make test-diff-abi-loongarch` 共用完整案例、严格记录
+协议、错误分类及时间戳关系校验。LA 使用独立 raw ELF/启动与 clone 汇编：Linux LA
+clone 的 child_tid/TLS 寄存器次序由适配层处理，信号 PC 与坏指令按 LA 编码。
+`ABI_PAGE_SIZE` 只决定目标页边界、映射/保护、管道槽和 tmpfs 页配额；文件块、扇区、
+4096 字节用户前缀、8192 字节消息和具体字符串解析用例保留原语义。
+
+当前共同 **1366 条**在 RV 的 Linux/BoarOS 和 LA 的 Linux/BoarOS、512 MiB/1 GiB
+均完整匹配。LA 每个程序只构建一次，四份完整 END/退出记录逐项比较；不是只比较
+同一 RAM，也不允许缺记录。runner 冻结程序与两内核，记录模拟器内容/权限/链接目标
+和各次启动参数，BoarOS 还需实际退出42与完整 root owner 释放。
+
+proc 测试在 clear_child_tid 后等待实际 nr_threads=1；线程组长的 held status OFD
+通过 lseek/re-read 等待真实 zombie 发布。固定 Linux 的 clear_child_tid 先于
+exit_state 和最终 nr_threads 更新，不能把一个调度瞬间的 R/两线程当作稳定退出状态，
+也不能在解析器中把 R 改成 Z。等待有界、结果仍来自真实用户态读取。
+
+整体审查纠正了LA几处仍用4KiB指针偏移的fault夹具：UDP/TCP置于目标页尾2字节，
+null/zero置于尾4字节，sysctl置于尾1字节；预先断言实际EFAULT/partial4及失败
+offset不变，避免两侧都未触发fault时仍差分成功。修复后的1366条全量记录是当前
+口径，旧1366记录对这些边界的覆盖限制见[审查反例](../learning/loongarch-bringup.md#一次独立整体审查与集中修复2026-10-07)。

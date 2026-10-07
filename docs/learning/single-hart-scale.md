@@ -60,7 +60,7 @@ PR CI 加入规模、SQLite DELETE/WAL 和离线 GCC 入口。SQLite/musl 源按
 
 本次规模阶段当时未包含可睡眠 I/O、后台写回或多盘；这些机制现已在后续阶段交付，见[可睡眠存储](sleepable-storage.md)及[VFS/ext4](../modules/vfs-ext4.md)。范围写回索引与事务合并也已在后续阶段交付；共享文件 futex、SMP 和第二架构仍未交付；后续优先顺序只在[路线](../goals.md)维护。
 
-AF_UNIX DGRAM 的成本边界为每条消息最多 64 KiB 连续暂存与一次队列提交，不把用户页或 iovec 当作消息边界。零消息收一字节预算，截断接收和 fault 丢弃返还整包预算；否则只返还复制字节会在重复短接收后泄漏队列容量。`make test-scale-riscv` 覆盖两处分配 OOM、100 条零消息、满队列、重复截断和接收 fault；`make test-userland-riscv` 用真实 pthread 验证尚有少量 POLLOUT 空间时写者仍等待整条预算，并检查取消不发布消息。这里验证语义和内存上界，没有吞吐测量结论。
+2026-10-07以前的AF_UNIX DGRAM成本边界为每条消息最多64KiB 连续暂存与一次队列提交，不把用户页或 iovec 当作消息边界。零消息收一字节预算，截断接收和 fault 丢弃返还整包预算；否则只返还复制字节会在重复短接收后泄漏队列容量。`make test-scale-riscv` 覆盖两处分配 OOM、100 条零消息、满队列、重复截断和接收 fault；`make test-userland-riscv` 用真实 pthread 验证尚有少量 POLLOUT 空间时写者仍等待整条预算，并检查取消不发布消息。这里验证语义和内存上界，没有吞吐测量结论。
 
 ## C0 窗口验收（2026-09-30）
 
@@ -317,3 +317,18 @@ metadata、order-3、满池与释放保持测试通过，既有 COST/allocator �
 184 次诊断，以及默认/RA8WB8 完整恢复的输入边界。64 MiB 追加的规模收益与 WB8
 在缓存完成中的回退均保留，RA8 冷读收益也不推广为所有读取模式。默认仍 RA0/WB1。
 每连接/文件完成时间、内存 owner、观测开销和失败过的测试协调协议均可在该报告复核。
+
+## AF_UNIX发送者计费与LA批次（2026-10-07）
+
+LA固定Linux的splice_to_socket用最多16个target page组成消息；65537字节在
+16KiB平台是一条，在4KiB平台可为64KiB+1。原64KiB接收配额不能表达这项
+可观察边界，用户选择发送者模型，旧配额门禁也随契约更新。packet持有独立的
+sender计费引用，endpoint最后OFD关闭先断开peer，最后packet释放后才释放
+不可发送的sender存储。metadata/payload真实请求字节计费，不用Linux私有skb
+尺寸锁定成功发送个数；明确SO_SNDBUF边界和等待/归还关系。
+
+新Linux/BoarOS同ELF在两种RAM验证大datagram、配置边界、零消息、fault、两种
+关闭顺序、类型对应的peer错误和SIGPIPE区别；budget同时核对真实阻塞、发送
+扩容、接收设置无credit、取消与字节守恒。RV scale先复现预留成功后OOM错误地
+保留result=0，再修正为ENOMEM且清理预留；两处实际分配失败、截断/接收fault
+和pthread取消均仍由原gate保护。完整最终回归未由这些窄结果代替。

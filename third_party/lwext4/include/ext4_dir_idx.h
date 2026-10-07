@@ -103,6 +103,7 @@ int ext4_dir_dx_reset_parent_inode(struct ext4_inode_ref *dir,
 
 /* Checked root/inner index block and dot-dot access, also used by rename. */
 int ext4_dir_dx_check(struct ext4_inode_ref *dir, struct ext4_block *block);
+int ext4_dir_dx_is_node(struct ext4_inode_ref *dir, uint32_t logical, bool *is_node);
 int ext4_dir_parent_inode(struct ext4_inode_ref *dir, uint32_t *parent);
 int ext4_dir_reparent(struct ext4_inode_ref *dir, uint32_t expected_parent,
                      uint32_t new_parent);

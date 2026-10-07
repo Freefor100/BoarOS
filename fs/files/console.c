@@ -1,5 +1,5 @@
-#include <arch/riscv/context.h>
-#include <arch/riscv/virt_uart.h>
+#include <arch/context.h>
+#include <arch/platform_io.h>
 #include <kernel/errno.h>
 #include <kernel/files.h>
 #include <kernel/open_file.h>
@@ -17,7 +17,7 @@ static struct kernel_wait_queue console_input_queue;
 void kernel_console_poll_input(void)
 {
     if (console_input_queue.initialized == KERNEL_WAIT_QUEUE_INITIALIZED &&
-        virt_uart_rx_ready() != 0U) {
+        arch_uart_rx_ready() != 0U) {
         (void)kernel_wait_queue_wake_all(&console_input_queue);
     }
 }
@@ -31,7 +31,7 @@ uint32_t kernel_console_poll(uint32_t requested_events,
         kernel_wait_queue_init(&console_input_queue);
     }
 
-    if (virt_uart_rx_ready() != 0U) {
+    if (arch_uart_rx_ready() != 0U) {
         events |= (KERNEL_POLLIN | KERNEL_POLLRDNORM);
     }
 
@@ -60,30 +60,30 @@ int kernel_console_read_buffer(uint32_t flags, void *buffer, size_t size,
     *bytes_read = 0U;
     if (size == 0U) return 0;
     if (size > KERNEL_FILES_CONSOLE_STAGING) size = KERNEL_FILES_CONSOLE_STAGING;
-    saved = riscv_interrupt_save();
+    saved = arch_interrupt_save();
     if (console_input_queue.initialized != KERNEL_WAIT_QUEUE_INITIALIZED)
         kernel_wait_queue_init(&console_input_queue);
     for (;;) {
-        while (staged < size && virt_uart_rx_ready() != 0U)
-            staging[staged++] = (unsigned char)virt_uart_getc();
+        while (staged < size && arch_uart_rx_ready() != 0U)
+            staging[staged++] = (unsigned char)arch_uart_getc();
         if (staged) break;
         if (flags & KERNEL_FILES_O_NONBLOCK) {
-            riscv_interrupt_restore(saved);
+            arch_interrupt_restore(saved);
             return -KERNEL_EAGAIN;
         }
         sleep_status = kernel_scheduler_block_current(&console_input_queue,
                                                       0U, 1, &wake_reason);
         if (sleep_status != KERNEL_SCHEDULER_STATUS_OK) {
-            riscv_interrupt_restore(saved);
+            arch_interrupt_restore(saved);
             return -KERNEL_EIO;
         }
         if (wake_reason == KERNEL_WAIT_SIGNALLED) {
             kernel_signal_note_syscall_restart(kernel_task_current());
-            riscv_interrupt_restore(saved);
+            arch_interrupt_restore(saved);
             return -KERNEL_ERESTARTSYS;
         }
     }
-    riscv_interrupt_restore(saved);
+    arch_interrupt_restore(saved);
     *bytes_read = staged;
     return 0;
 }

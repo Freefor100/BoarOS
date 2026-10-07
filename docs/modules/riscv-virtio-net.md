@@ -1,12 +1,15 @@
 # VirtIO-net 与 Ethernet 接收 owner
 
-`arch/riscv/virtio_mmio_net.c` 实现 MMIO legacy/modern split ring；`net/ethernet.c`
-持有 netif、custom pbuf 记录和 joinable worker。根启动对象保存设备 owner，在
+`drivers/virtio/net.c` 使用共用 transport/split queue，实现设备请求与缓冲策略；
+`arch/riscv/virtio_mmio_net.c` 仅绑定 MMIO/PLIC，`drivers/virtio/pci_net.c` 绑定 LA PCI。
+平台/root 持有设备与 transport，`net/ethernet.c` 借用设备，持有 netif、custom pbuf
+记录和 joinable worker，在
 PID 1 与后代收口后停止网络，最后检查堆与物理页基线。DTB 的 device ID 1 和
 PLIC route 决定设备与 IRQ，不按槽位或测试配置硬编码。无设备保留 loopback。
 
 每个 RX/TX 队列 32 个描述符，分别预分配 64 个 2 KiB 缓冲。legacy 的两个队列
-占 16 KiB，modern 占 8 KiB；DMA 总量分别为 272/264 KiB。控制对象大小在启动时
+在 RV 占 16 KiB，modern 占 8 KiB；RV DMA 总量分别为 272/264 KiB。LA modern
+队列占一个 16 KiB 页，两个数据池仍各128KiB，共272KiB；不把2KiB帧槽改为页大小。控制对象大小在启动时
 报告，worker 的独立栈由调度器管理，最终栈统计另计。协商 MAC、可用的 STATUS
 和 modern 的 VERSION_1；不协商 mergeable RX、checksum/GSO、packed ring 或
 多队列。网络头分别为 10/12 字节，帧起点统一留在槽内 16 字节之后。
@@ -44,11 +47,13 @@ raw API 沿既有单 hart 临界区串行化，IRQ 不重入堆。无 NIC 时 `k
 同样禁止新工作、join 后释放。
 
 停止先禁止新工作、唤醒并 join worker，清理接口的重组/ARP，移除 netif，然后
-reset 并确认 DMA 已停。netif 移除会同步按旧本地地址 abort active/bound TCP PCB，
+通过 `virtio_net_quiesce` reset 并确认 DMA 已停，随后才允许 TX abandon。netif 移除会同步按旧本地地址 abort active/bound TCP PCB，
 包括已脱离 socket 登记的 FIN_WAIT，释放其乱序 RX 引用；TIME_WAIT 转入前已 purge，
 此处不依赖已 join worker 的后续 timer。reset 未确认保留 DMA；reset 已确认但协议或接收请求
 仍持 pbuf，也保留整个设备 owner，返回 EBUSY。最后引用归还后才可释放队列页、
-RX/TX 页和控制对象。设备故障与连接拒绝、RST、协议超时分别交付；错误回调
+RX/TX 页。网络层先释放自身控制对象，平台随后调用 core stop 与 PCI destroy；
+core stop 遇到 CPU lease、RX loan 或未归还 TX owner 返回 EBUSY，reset 拒绝返回 EIO
+并保留 DMA、IRQ、transport 和实际 owner，不能因 worker 已 join 而提前释放。设备故障与连接拒绝、RST、协议超时分别交付；错误回调
 不读取已经释放的 PCB。该协议未覆盖非一致 DMA、IOMMU、多 hart 或实板。
 
 ## 地址与用户接口
@@ -93,3 +98,37 @@ python3 -B tests/network-external.py --only linux --transport modern
 协议依据固定 `references/qemu` v11.1.0 的 MMIO 与 virtio_net 标准头、
 `references/linux` v7.2 的 VirtIO-net 实现、`references/lwip` 2.2.1 的 Ethernet
 入口；精确身份由 sources.tsv 管理。重组的本地修补范围见[第三方组件](../third-party.md)。
+
+## LA PCI 与共用框架验收（2026-10-07）
+
+```sh
+python3 -B tests/host/virtio_net.py --sanitize
+python3 -B tests/host/network_owner.py --sanitize
+make test-net-failures-loongarch
+python3 -B tests/network-loongarch.py --workload contract
+python3 -B tests/network-loongarch.py --workload content
+python3 -B tests/network-loongarch.py --workload timer
+python3 -B tests/network-loongarch.py --workload admission
+python3 -B tests/network-external.py --arch loongarch
+python3 -B tests/network-external.py --transport both
+```
+
+原宿主寄存器/ring模型在4KiB/16KiB、诊断开/关下运行实际共用核心，ASan/UBSan
+检查所有权与边界；新增在途SG reset拒绝、确认后归还且不重复释放。Ethernet/lwIP
+实际路径验证失败NIC仍推进期限、复制和SG容量通知、RX最后引用及协议对象回收。
+这些模型不能替代硬件；真实LA现代PCI、RV legacy/modern MMIO另有完整TAP内容校验。
+
+LA同一个ELF先跑固定Linux再跑BoarOS，512MiB/1GiB各覆盖16MiB TCP、五个8MiB
+连接、UDP 64/1472/1473/65507字节、UDP池压力和原版BusyBox httpd/wget CGI。
+原程序、helper和BusyBox由父runner固定一次，reference标记只配置Linux网络；
+每个boot保持独立namespace。BoarOS要求loan-peak=32、真实复制回退、SG和设备errors=0，
+共享INTx17上的块/RNG/net完成及页/堆/任务栈/BAR基线，退出42也单独检查。
+这是功能与所有权证据，不把执行时间或统计代次称为吞吐保证。
+
+真实PCI上另注入队列/RX/TX三处分配、IRQ登记、网络控制堆、worker任务/栈和
+初始/退出reset确认九个边界，各两种RAM。启动失败不发布PID1，退出reset失败后
+保留真实owner重试；18次均最终回到基线。无NIC的AF_UNIX和IPv4/IPv6 loopback、
+内容/期限/接纳故障与取消也双侧通过。扩大的sendfile测例另发现AF_UNIX固定64KiB
+上限与LA Linux datagram批次的差异；随后按[网络模块](kernel-network.md)的
+发送者计费路线修复并完成双侧budget/sendfile验收。完整LA平台/程序矩阵仍需
+独立收口，不能由本节声明全部能力等价。

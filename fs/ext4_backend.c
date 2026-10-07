@@ -14,7 +14,7 @@
 #include <kernel/physical_page.h>
 #include <kernel/vfs.h>
 #include <kernel/time.h>
-#include <arch/riscv/context.h>
+#include <arch/context.h>
 
 #include <ext4.h>
 #include <ext4_bcache.h>
@@ -544,10 +544,10 @@ static int ext4_backend_prepare_unmount(struct kernel_vfs_mount *mount)
     if (adapter->journal_started) {
         result = ext4_journal_group_drain(adapter->mount_point);
         if (result != EOK) return lwext4_error(result);
-        uintptr_t irq = riscv_interrupt_save();
+        uintptr_t irq = arch_interrupt_save();
         adapter->journal_stopping = 1;
         (void)kernel_wait_queue_wake_all(&adapter->journal_work);
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
         kernel_thread_join(&adapter->journal_worker);
         adapter->journal_started = 0;
     }
@@ -582,10 +582,10 @@ static uint64_t journal_now(void *context)
 static void journal_request(void *context)
 {
     struct lwext4_mount_adapter *adapter = context;
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     adapter->journal_requested = 1;
     (void)kernel_wait_queue_wake_all(&adapter->journal_work);
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
 }
 
 static uint64_t journal_reached(const struct jbd_journal *journal, enum ext4_journal_wait kind)
@@ -619,7 +619,7 @@ static int journal_wait(void *context, uint64_t sequence, enum ext4_journal_wait
         uint64_t reached = kind == EXT4_JOURNAL_WAIT_SEALED ? progress.sealed :
             kind == EXT4_JOURNAL_WAIT_DURABLE ? progress.durable : progress.checkpoint;
         if (reached >= sequence) break;
-        uintptr_t irq = riscv_interrupt_save();
+        uintptr_t irq = arch_interrupt_save();
         /* Only the worker advances completion, and it cannot run between the
          * disabled-IRQ predicate and queue insertion on this single hart. */
         struct jbd_journal *journal = adapter->device.fs->jbd_journal;
@@ -627,7 +627,7 @@ static int journal_wait(void *context, uint64_t sequence, enum ext4_journal_wait
             enum kernel_wait_wake_reason reason;
             if (kernel_scheduler_block_current(&adapter->journal_progress, 0, 0, &reason) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
         }
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
     }
     boaros_lwext4_resume(&adapter->backend_lock, depth);
     return result;
@@ -638,27 +638,27 @@ static void journal_worker(void *context)
     struct lwext4_mount_adapter *adapter = context;
     kernel_io_context_current()->background_reclaim = 1;
     for (;;) {
-        uintptr_t irq = riscv_interrupt_save();
+        uintptr_t irq = arch_interrupt_save();
         int force = adapter->journal_force;
         adapter->journal_force = adapter->journal_requested = 0;
         int stopping = adapter->journal_stopping;
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
         if (stopping) break;
         int result = ext4_journal_group_service(adapter->mount_point, force);
-        irq = riscv_interrupt_save();
+        irq = arch_interrupt_save();
         (void)kernel_wait_queue_wake_all(&adapter->journal_progress);
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
         struct ext4_journal_progress progress;
         if (ext4_journal_group_progress(adapter->mount_point, &progress) != EOK) __builtin_trap();
         uint64_t deadline = 0;
         if (!result && (progress.ready || (progress.deadline_ns &&
             kernel_time_deadline_from_monotonic(progress.deadline_ns, &deadline) == KERNEL_TIME_STATUS_DEADLINE_PASSED))) continue;
-        irq = riscv_interrupt_save();
+        irq = arch_interrupt_save();
         if (!adapter->journal_requested && !adapter->journal_stopping) {
             enum kernel_wait_wake_reason reason;
             if (kernel_scheduler_block_current(&adapter->journal_work, deadline, 0, &reason) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
         }
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
     }
     kernel_io_context_current()->background_reclaim = 0;
 }

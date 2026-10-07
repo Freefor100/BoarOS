@@ -2,6 +2,7 @@
 
 #include <kernel/errno.h>
 #include <kernel/elf64_source.h>
+#include <arch/elf.h>
 #include <kernel/exec.h>
 #include <kernel/files.h>
 #include <kernel/fs_context.h>
@@ -699,7 +700,7 @@ enum kernel_exec_status kernel_execve_prepare(
             kernel_elf64_source_create(transaction->heap,
                                        &transaction->executable_file,
                                        BOAROS_PAGE_SIZE,
-                                       KERNEL_ELF64_MACHINE_RISCV,
+                                       ARCH_ELF_MACHINE,
                                        &transaction->executable_source);
 
         if (source_status != KERNEL_ELF64_SOURCE_STATUS_OK) {
@@ -738,10 +739,10 @@ enum kernel_exec_status kernel_execve_prepare(
         }
         {
             enum kernel_elf64_source_status source_status =
-                kernel_elf64_source_create(transaction->heap,
+                kernel_elf64_source_create_interpreter(transaction->heap,
                                            &transaction->interpreter_file,
                                            BOAROS_PAGE_SIZE,
-                                           KERNEL_ELF64_MACHINE_RISCV,
+                                           ARCH_ELF_MACHINE,
                                            &transaction->interpreter_source);
 
             if (source_status != KERNEL_ELF64_SOURCE_STATUS_OK) {

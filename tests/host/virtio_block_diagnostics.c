@@ -52,7 +52,7 @@ static uint64_t register_address(unsigned low)
 
 static void read_batch_device(void)
 {
-    if (!queue_allocation) return;
+    if (!queue_allocation || !(registers[0x70 / 4] & 4)) return;
     unsigned queue_size = registers[0x38 / 4];
     uint64_t descriptors_at = registers[4 / 4] == 1 ? (uint64_t)registers[0x40 / 4] << 12 : register_address(0x80);
     if (!descriptors_at) return;
@@ -115,6 +115,12 @@ uint64_t host_block_time(void)
                                                            queue_size * 16);
     unsigned head = available[2];
     unsigned status_descriptor = head;
+    unsigned writable = 0, descriptor = head;
+    for (;;) {
+        if (descriptors[descriptor].flags & 2) writable += descriptors[descriptor].length;
+        if (!(descriptors[descriptor].flags & 1)) break;
+        descriptor = descriptors[descriptor].next;
+    }
     while (descriptors[status_descriptor].flags & 1)
         status_descriptor = descriptors[status_descriptor].next;
     unsigned char *status = physical_pointer(descriptors[status_descriptor].address, 1);
@@ -125,7 +131,7 @@ uint64_t host_block_time(void)
     completion[0] = (struct wire_completion){
         fault == INVALID_ID ? UINT32_MAX : fault == MISALIGNED_ID ? 1 :
         fault == FREE_SLOT ? 3 : head,
-        fault == ZERO_LENGTH ? 0 : descriptors[head].next == status_descriptor ? 1 : 513
+        fault == ZERO_LENGTH ? 0 : writable
     };
     if (fault == DUPLICATE_SLOT) completion[1] = completion[0];
     used[1] = fault == USED_OVERFLOW ? 9 : fault == DUPLICATE_SLOT ? 2 : 1;
@@ -154,6 +160,7 @@ void virt_uart_put_hex(unsigned long value)
     virt_uart_puts(text);
 }
 struct kernel_io_context *kernel_io_context_current(void) { return &caller; }
+void kernel_console_putc(char c) { virt_uart_putc(c); }
 int kernel_scheduler_can_sleep(void) { return 1; }
 int riscv_plic_in_interrupt(void) { return 0; }
 int riscv_plic_register(uint32_t source, void (*handler)(void *), void *owner)
@@ -221,6 +228,50 @@ static uint64_t field(const char *name)
     return strtoull(at + strlen(name), NULL, 0);
 }
 
+#ifdef HOST_ALTERNATE_TRANSPORT
+static unsigned alternate_accesses;
+static unsigned transport_offset(enum virtio_register reg)
+{
+    static const unsigned offsets[]={0x70,0x14,0x10,0x24,0x20,0x30,0x34,0x38,
+        0x44,0x28,0x3c,0x40,0x50,0x80,0x84,0x90,0x94,0xa0,0xa4,0xfc,0x100,0x104};
+    assert((unsigned)reg<sizeof(offsets)/sizeof(offsets[0]));
+    return offsets[reg];
+}
+static uint32_t alternate_read(void *context,enum virtio_register reg)
+{
+    assert(context==&alternate_accesses);alternate_accesses++;
+    return registers[transport_offset(reg)/4];
+}
+static void alternate_write(void *context,enum virtio_register reg,uint32_t value)
+{
+    assert(context==&alternate_accesses);alternate_accesses++;
+    registers[transport_offset(reg)/4]=value;
+}
+static uint32_t alternate_ack(void *context)
+{
+    assert(context==&alternate_accesses);alternate_accesses++;
+    uint32_t pending=registers[0x60/4];registers[0x60/4]=0;
+    return pending;
+}
+static uint32_t alternate_config(void *context,uint32_t offset,unsigned width)
+{ assert(context==&alternate_accesses && width==4 && offset<8);alternate_accesses++;return registers[(0x100+offset)/4]; }
+static const struct virtio_transport_ops alternate_ops={
+    .read=alternate_read,.write=alternate_write,.config_read=alternate_config,.ack_interrupt=alternate_ack};
+#endif
+static enum riscv_virtio_mmio_block_status initialize_model(
+    struct riscv_virtio_mmio_block *device,volatile void *mmio,uint64_t size,
+    struct physical_page_allocator *allocator,riscv_virtio_dma_address_fn dma,uint32_t frequency)
+{
+#ifdef HOST_ALTERNATE_TRANSPORT
+    (void)mmio;(void)size;
+    struct virtio_transport transport={.context=&alternate_accesses,
+        .ops=alternate_ops,.version=registers[1],.config_size=8};
+    return virtio_block_init(device,&transport,allocator,dma,frequency);
+#else
+    return riscv_virtio_mmio_block_init(device,mmio,size,allocator,dma,frequency);
+#endif
+}
+
 static enum riscv_virtio_mmio_block_status destroy_model(struct riscv_virtio_mmio_block *device)
 {
     final_statistics = 1;
@@ -250,7 +301,7 @@ static void run_case(unsigned version, enum fault_kind kind)
     fault = kind;
     diagnostic[0] = 0;
     diagnostic_length = 0;
-    assert(riscv_virtio_mmio_block_init(&device, registers, sizeof(registers),
+    assert(initialize_model(&device, registers, sizeof(registers),
         &allocator, dma_address, 1000) == RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK);
     /* A diagnostic may print opaque owner/completion values, never follow them.
      * The free slot cannot participate in reset or the caller's real I/O owner. */
@@ -270,7 +321,11 @@ static void run_case(unsigned version, enum fault_kind kind)
         assert(device_live(&device));
     } else {
         assert(strstr(diagnostic, reasons[kind]) != NULL);
-        assert(field("mmio=") == (uintptr_t)registers);
+        #ifdef HOST_ALTERNATE_TRANSPORT
+        assert(field("transport_context=") == (uintptr_t)&alternate_accesses);
+#else
+        assert(field("transport_context=") == (uintptr_t)registers);
+#endif
         assert(field("queue=") == (uintptr_t)queue_allocation);
         assert(field("transport=") == version);
         assert(field("avail=") == 1);
@@ -281,7 +336,7 @@ static void run_case(unsigned version, enum fault_kind kind)
         assert(field("complete=") == (kind == DUPLICATE_SLOT ? 1 : 0));
         assert(field("inflight=") == (kind == DUPLICATE_SLOT ? 0 : 1));
         assert(field("active=") == 1);
-        assert(field("mmio_status=") == (version == 1 ? 7 : 15));
+        assert(field("device_status=") == (version == 1 ? 7 : 15));
         assert(field("interrupt=") == (kind == NO_COMPLETION ? 0 : 1));
         if (kind != USED_OVERFLOW && kind != NO_COMPLETION) {
             assert(field("item_index=") == (kind == DUPLICATE_SLOT ? 1 : 0));
@@ -296,7 +351,7 @@ static void run_case(unsigned version, enum fault_kind kind)
         assert(field("owner=") == (uintptr_t)&caller);
         assert(strstr(diagnostic, "owner=0x1 completion=0x3") != NULL);
         assert(registers[0x70 / 4] == 0);
-        assert(device.state == RISCV_VIRTIO_BLOCK_STATE_FAILED);
+        assert(device.state == VIRTIO_BLOCK_STATE_FAILED);
         size_t logged = diagnostic_length;
         assert(device.block.read(device.block.context, 0, buffer, sizeof(buffer)) == KERNEL_BLOCK_STATUS_IO);
         assert(diagnostic_length == logged && device.statistics.requests == 1);
@@ -324,7 +379,7 @@ static void queue_reuse_case(unsigned version)
     fault = MANUAL_COMPLETION;
     diagnostic_length = 0;
     diagnostic[0] = 0;
-    assert(riscv_virtio_mmio_block_init(&device, registers, sizeof(registers),
+    assert(initialize_model(&device, registers, sizeof(registers),
         &allocator, dma_address, 1000) == RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK);
     uint64_t descriptor_address = version == 1
         ? (uint64_t)registers[0x40 / 4] << 12 : register_address(0x80);
@@ -402,7 +457,7 @@ static void slow_completion_case(unsigned version, unsigned type)
     fault = NORMAL;
     diagnostic_length = 0;
     diagnostic[0] = 0;
-    assert(riscv_virtio_mmio_block_init(&device, registers, sizeof(registers),
+    assert(initialize_model(&device, registers, sizeof(registers),
         &allocator, dma_address, 1000) == RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK);
     enum kernel_block_status status = type == 4 ? device.block.flush(device.block.context) :
         type == 1 ? device.block.write(device.block.context, 0, buffer, sizeof(buffer)) :
@@ -425,7 +480,7 @@ static void read_batch_case(unsigned version, unsigned mode)
     registers[0x10 / 4] = 1; registers[0x34 / 4] = 32; registers[0x100 / 4] = 1024;
     clock_value = 0; fault = BATCH_READ; batch_mode = mode; batch_popped = batch_pushed = 0;
     diagnostic_length = 0; diagnostic[0] = 0;
-    assert(riscv_virtio_mmio_block_init(&device, registers, sizeof(registers), &allocator,
+    assert(initialize_model(&device, registers, sizeof(registers), &allocator,
         dma_address, 1000) == RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK);
     memset(batch_output, 0xa5, sizeof(batch_output));
     struct kernel_block_read_span spans[8];

@@ -1,6 +1,6 @@
+#include <arch/task.h>
 #include "private.h"
 
-#include <arch/riscv/direct_map.h>
 #include <kernel/errno.h>
 #include <kernel/physical_page.h>
 #include <kernel/page.h>
@@ -330,10 +330,10 @@ enum kernel_signal_status kernel_signal_release_table(
         task->signal_table_address = 0U;
         return KERNEL_SIGNAL_STATUS_OK;
     }
-    if (riscv_direct_map_va_to_pa((uintptr_t)page,
+    if (arch_direct_map_va_to_pa((uintptr_t)page,
                                   BOAROS_PAGE_SIZE,
                                   &physical_address) !=
-        RISCV_DIRECT_MAP_STATUS_OK) {
+        ARCH_DIRECT_MAP_STATUS_OK) {
         return KERNEL_SIGNAL_STATUS_INVALID_STATE;
     }
     (void)physical_page_release(scheduler.allocator, physical_address);

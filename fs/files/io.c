@@ -24,7 +24,7 @@
 #include <stdint.h>
 #include <string.h>
 
-#include <arch/riscv/context.h>
+#include <arch/context.h>
 
 #define KERNEL_FILES_WRITE_STAGING 64U
 
@@ -68,7 +68,8 @@ static int socket_wait_ready(struct kernel_open_file_description *description,
     if ((description->open_flags & KERNEL_FILES_O_NONBLOCK) != 0U ||
         (socket_flags & KERNEL_SOCKET_MSG_DONTWAIT) != 0U)
         return -KERNEL_EAGAIN;
-    if (socket_operation_ready(socket, events)) return 0;
+    if (socket_operation_ready(socket, events))
+        return (events & KERNEL_POLLOUT) ? kernel_socket_unix_wait_error(socket) : 0;
     if (timeout_ns != 0U) {
         uint64_t now = kernel_time_monotonic_ns();
         uint64_t target = UINT64_MAX - now < timeout_ns
@@ -80,33 +81,34 @@ static int socket_wait_ready(struct kernel_open_file_description *description,
             return -KERNEL_EAGAIN;
         if (status != KERNEL_TIME_STATUS_OK) return -KERNEL_EIO;
     }
-    saved = riscv_interrupt_save();
+    saved = arch_interrupt_save();
     while (!socket_operation_ready(socket, events)) {
         enum kernel_wait_wake_reason reason;
         uint64_t sleep_deadline = deadline;
         if (kernel_scheduler_block_current(kernel_socket_wait_queue(socket),
                                             sleep_deadline, 1, &reason) !=
             KERNEL_SCHEDULER_STATUS_OK) {
-            riscv_interrupt_restore(saved);
+            arch_interrupt_restore(saved);
             return -KERNEL_EIO;
         }
         if (reason == KERNEL_WAIT_TIMEOUT) {
             if (target_ns != 0U &&
                 kernel_time_monotonic_ns() >= target_ns) {
-                riscv_interrupt_restore(saved);
+                arch_interrupt_restore(saved);
                 return -KERNEL_EAGAIN;
             }
             continue;
         }
         if (reason == KERNEL_WAIT_SIGNALLED) {
-            riscv_interrupt_restore(saved);
+            arch_interrupt_restore(saved);
             if (timeout_ns != 0U) return -KERNEL_EINTR;
             kernel_signal_note_syscall_restart(kernel_task_current());
             return -KERNEL_ERESTARTSYS;
         }
     }
-    riscv_interrupt_restore(saved);
-    return 0;
+    int error=(events & KERNEL_POLLOUT) ? kernel_socket_unix_wait_error(socket) : 0;
+    arch_interrupt_restore(saved);
+    return error;
 }
 
 /* Sysctl reads commit the offset only after the complete generated prefix was
@@ -1035,7 +1037,9 @@ static int64_t sendfile_pinned(struct kernel_files *files, struct kernel_mm *mm,
     size_t capacity = BOAROS_PAGE_SIZE;
     void *staging = scratch.data, *datagram_staging = 0;
     if (kernel_socket_is_datagram(kernel_open_file_socket(output))) {
-        capacity = count > KERNEL_PIPE_CAPACITY ? (size_t)KERNEL_PIPE_CAPACITY : (size_t)count;
+        /* Linux splice_to_socket batches at most sixteen target pages. */
+        size_t batch=(size_t)BOAROS_PAGE_SIZE*16U;
+        capacity=count>batch ? batch : (size_t)count;
         enum kernel_heap_status allocated = kernel_heap_allocate(files->heap, capacity, &datagram_staging);
         if (allocated != KERNEL_HEAP_STATUS_OK) {
             kernel_task_io_buffer_release(&scratch);

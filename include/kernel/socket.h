@@ -131,6 +131,8 @@ enum kernel_socket_option {
 };
 int kernel_socket_set_option(struct kernel_socket *socket,
                              enum kernel_socket_option option, int value);
+/* A write that already waited consumes an AF_UNIX asynchronous peer reset. */
+int kernel_socket_unix_wait_error(struct kernel_socket *socket);
 int kernel_socket_get_option(struct kernel_socket *socket,
                              enum kernel_socket_option option, int *value);
 void kernel_socket_set_send_timeout(struct kernel_socket *socket, uint64_t nanoseconds);

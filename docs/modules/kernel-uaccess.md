@@ -4,7 +4,7 @@
 
 ## 接口与职责
 
-公共声明位于 `include/kernel/uaccess.h`，当前 RISC-V 实现在 `arch/riscv/uaccess.c`：
+公共声明位于 `include/kernel/uaccess.h`，共享实现在 `mm/uaccess.c`，用户地址上界由 `include/arch/mmu.h` 绑定：
 
 ```c
 enum kernel_uaccess_status kernel_copy_to_user(
@@ -33,9 +33,9 @@ enum kernel_uaccess_status kernel_copy_string_from_user(
 
 ## 范围、权限与部分复制
 
-非零固定长度请求首先验证整个半开区间位于 Sv39 低半区 `[0, RISCV_SV39_USER_LIMIT)`；整数溢出或越过上限在复制前返回 `KERNEL_UACCESS_STATUS_FAULT`，`bytes_copied=0`。零长度请求不检查用户地址或内核 buffer，直接成功并报告 0。
+非零固定长度请求首先验证整个半开区间位于构建期架构用户范围 `[0, ARCH_MMU_USER_LIMIT)`（RV 为 2^38，LA 为 2^47）；整数溢出或越过上限在复制前返回 `KERNEL_UACCESS_STATUS_FAULT`，`bytes_copied=0`。零长度请求不检查用户地址或内核 buffer，直接成功并报告 0。
 
-合法范围按 4 KiB 基页边界切分。每个片段先经 `kernel_mm_lookup()` 查询物理地址和通用权限：若 PTE 尚未驻留，uaccess 用实际读/写方向调用 `kernel_mm_resolve_user_fault()`；anonymous `DEMAND_ZERO`、file-private 和 COW 页都复用该解析器，成功后重查 PTE。写入用户空间要求 `USER|WRITE`，读取用户空间要求 `USER|READ`，随后通过物理页分配器已绑定的 direct-map 访问函数复制。VMA 外、`PROT_NONE`、权限不足、文件整页越过 EOF 或缺页解析得到 `NO_MEMORY` 时返回 `FAULT`；MM 状态、页表结构、设备故障或已映射物理页无法解析返回 `STATE`，不能把真正的内核对象损坏伪装成普通用户 `EFAULT`。
+合法范围按构建期基页边界切分（RV 4 KiB、LA 16 KiB）。每个片段先经 `kernel_mm_lookup()` 查询物理地址和通用权限：若 PTE 尚未驻留，uaccess 用实际读/写方向调用 `kernel_mm_resolve_user_fault()`；anonymous `DEMAND_ZERO`、file-private 和 COW 页都复用该解析器，成功后重查 PTE。写入用户空间要求 `USER|WRITE`，读取用户空间要求 `USER|READ`，随后通过物理页分配器已绑定的 direct-map 访问函数复制。VMA 外、`PROT_NONE`、权限不足、文件整页越过 EOF 或缺页解析得到 `NO_MEMORY` 时返回 `FAULT`；MM 状态、页表结构、设备故障或已映射物理页无法解析返回 `STATE`，不能把真正的内核对象损坏伪装成普通用户 `EFAULT`。
 
 固定长度复制不是事务。若前面的完整片段已经复制，后续页未映射或权限不足，函数保留已复制的连续前缀并精确报告 `bytes_copied`；这与 Linux usercopy 允许部分修改目标缓冲区的内部语义一致。文件 `read` 依据这个前缀提交 open-file offset；普通文件 `write/writev` 把可读前缀提交给 backend，只按 backend 实际写入量推进 offset，并在用户 fault 后结束整个请求；`uname` 和文件层只把 `FAULT` 转成用户可见的 `-EFAULT`，内核状态错误仍由 syscall/Trap 边界判为 fatal。
 
@@ -45,14 +45,14 @@ enum kernel_uaccess_status kernel_copy_string_from_user(
 
 当前 uaccess 只对 scheduler 当前、已经激活的 MM 提交新页；VMA/PTE 检查会在真正分配前拒绝非法范围。单 hart、关中断 syscall 路径保证 lookup、fault-in/COW、物理页解析和复制之间没有并发 unmap/mprotect。接入 SMP 或共享 MM 时，必须一起定义 MM 读锁、页固定、原子页引用、分配失败、部分复制和 TLB shootdown 协议；公共 syscall ABI 不需要因此改变。
 
-驻留页每个基页进行一次三级软件页表查询和一次物理页解析，随后执行页内线性字节复制；首次提交的页额外承担 VMA 二分查找、页分配/清零、PTE 写入和单页 `SFENCE.VMA`。uaccess 不切换 `satp`，也不修改 `sstatus.SUM`。文件 `read` 已以 4 KiB staging chunk 使用该路径，但当前只用结构成本和 QEMU 正确性测试约束，尚未取得开发板吞吐、TLB miss 或 cache 数据。应在真实工作负载上比较软件遍历与 RISC-V SUM+异常表快路径，再决定阈值或替换策略。
+驻留页每个基页进行一次三级软件页表查询和一次物理页解析，随后执行页内线性字节复制；首次提交的页额外承担 VMA 二分查找、页分配/清零、PTE 写入和架构转换失效。uaccess 经内核物理映射复制，不切换硬件用户地址空间；RV 不修改 `sstatus.SUM`。文件 `read` 已以 4 KiB staging chunk 使用该路径，但当前只用结构成本和 QEMU 正确性测试约束，尚未取得开发板吞吐、TLB miss 或 cache 数据。应在真实工作负载上比较软件遍历与 RISC-V SUM+异常表快路径，再决定阈值或替换策略。
 
 COST 构建在成功解析后的固定长度页内 chunk 记录实际复制字节、次数、单次最大值
 及经过 ticks；解析失败、权限检查和字符串扫描不归入该复制样本。采样不改变已复制
 前缀。Lua 定点结果只归因这段复制，不能用它排除解析、缺页或全部内存成本；
 [工具链记录](../learning/offline-toolchain-probe.md#内存操作的有限归因与未上线候选2026-10-03)保留了字节实现与未上线宽字候选的比较。
 
-QEMU `virt` 与 VisionFive 2 共享这套 Sv39 实现，板级 RAM/MMIO 差异已由启动内存和页表建立隔离。LoongArch 后续为相同公共接口提供 16 KiB/三级页表实现，并使用自己的用户地址范围与硬件访问机制。
+QEMU `virt` 与 VisionFive 2 共享这套 Sv39 实现，板级 RAM/MMIO 差异已由启动内存和页表建立隔离。LoongArch 已用同一策略和自己的 16 KiB/三级页表、用户范围验证真实 ELF 与跨页用户复制；见[首阶段范围](loongarch-boot.md)。
 
 ## 验证与限制
 

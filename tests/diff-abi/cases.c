@@ -1,20 +1,16 @@
 #include "abi.h"
+#include "../common/raw_syscall.h"
 
 static unsigned records;
 static char line[2048];
 static usize used;
 long abi_call(long nr, long a, long b, long c, long d, long e, long f)
 {
-    register long a0 __asm__("a0") = a;
-    register long a1 __asm__("a1") = b;
-    register long a2 __asm__("a2") = c;
-    register long a3 __asm__("a3") = d;
-    register long a4 __asm__("a4") = e;
-    register long a5 __asm__("a5") = f;
-    register long a7 __asm__("a7") = nr;
-    __asm__ volatile ("ecall" : "+r"(a0) : "r"(a1), "r"(a2), "r"(a3),
-                      "r"(a4), "r"(a5), "r"(a7) : "memory");
-    return a0;
+#if defined(__loongarch__)
+    /* Linux LA clone是parent/child/TLS；公共案例接口采用RV parent/TLS/child。 */
+    if(nr==220)return test_syscall6(nr,a,b,c,e,d,f);
+#endif
+    return test_syscall6(nr,a,b,c,d,e,f);
 }
 void abi_exit(long code) { SC1(93, code); for (;;) {} }
 void abi_require(int condition)
@@ -81,10 +77,10 @@ static void mode_cases(void)
         abi_record(names[mode][1], ret, abi_size(fd), abi_offset(fd), 0, data, ret > 0 ? ret : 0);
         ret = SC4(67, fd, data, sizeof(data), 11);
         abi_record(names[mode][2], ret, abi_size(fd), abi_offset(fd), 0, data, ret > 0 ? ret : 0);
-        long map = CALL(222, 0, 4096, 1, 2, fd, 0);
+        long map = CALL(222, 0, ABI_PAGE_SIZE, 1, 2, fd, 0);
         abi_record(names[mode][3], map < 0 ? map : 0, abi_size(fd), abi_offset(fd), 0,
                    (void *)map, map >= 0 ? 8 : 0);
-        if (map >= 0) abi_require(SC2(215, map, 4096) == 0);
+        if (map >= 0) abi_require(SC2(215, map, ABI_PAGE_SIZE) == 0);
         close_fd(fd);
     }
 }
@@ -97,15 +93,15 @@ static void sparse_cases(void)
     abi_record("sparse.write", ret, abi_size(fd), abi_offset(fd), 0, 0, 0);
     ret = SC4(67, fd, data, sizeof(data), 8150);
     abi_record("sparse.pread", ret, abi_size(fd), abi_offset(fd), 0, data, ret > 0 ? ret : 0);
-    long map = CALL(222, 0, 16384, 1, 2, fd, 0);
+    long map = CALL(222, 0, 4 * ABI_PAGE_SIZE, 1, 2, fd, 0);
     abi_require(map >= 0);
     abi_record("sparse.mmap", 0, abi_size(fd), abi_offset(fd), 0, (void *)(map + 8150), 80);
     long child = CALL(220, 17, 0, 0, 0, 0, 0);
     abi_require(child >= 0);
-    if (!child) { volatile unsigned char byte = *(volatile unsigned char *)(map + 12288); (void)byte; abi_exit(0); }
+    if (!child) { volatile unsigned char byte = *(volatile unsigned char *)(map + 3 * ABI_PAGE_SIZE); (void)byte; abi_exit(0); }
     int status = 0; abi_require(SC4(260, child, &status, 0, 0) == child);
     abi_record("sparse.sigbus", 0, abi_size(fd), abi_offset(fd), status, 0, 0);
-    abi_require(SC2(215, map, 16384) == 0); close_fd(fd);
+    abi_require(SC2(215, map, 4 * ABI_PAGE_SIZE) == 0); close_fd(fd);
 }
 static void partial_cases(void)
 {
@@ -116,11 +112,11 @@ static void partial_cases(void)
         {"append.0","append.1","append.32","append.63","append.64","append.65"},
         {"appendv.0","appendv.1","appendv.32","appendv.63","appendv.64","appendv.65"}
     };
-    long map = CALL(222, 0, 8192, 3, 0x22, -1, 0);
+    long map = CALL(222, 0, 2 * ABI_PAGE_SIZE, 3, 0x22, -1, 0);
     abi_require(map >= 0);
-    abi_require(SC3(226, map + 4096, 4096, 0) == 0);
+    abi_require(SC3(226, map + ABI_PAGE_SIZE, ABI_PAGE_SIZE, 0) == 0);
     for (int mode = 0; mode < 4; ++mode) for (int index = 0; index < 6; ++index) {
-        int prefix = prefixes[index]; unsigned char *buf = (void *)(map + 4096 - prefix);
+        int prefix = prefixes[index]; unsigned char *buf = (void *)(map + ABI_PAGE_SIZE - prefix);
         for (int j = 0; j < prefix; ++j) buf[j] = 'a' + (j % 26);
         long fd = abi_open("/partial", 2 | 64 | 512);
         abi_require(fd >= 0);
@@ -137,7 +133,7 @@ static void partial_cases(void)
         abi_record(names[mode][index], ret, size, offset, 0, content, count);
         close_fd(fd);
     }
-    abi_require(SC2(215, map, 8192) == 0);
+    abi_require(SC2(215, map, 2 * ABI_PAGE_SIZE) == 0);
 }
 static int root_identity(void)
 {
@@ -228,6 +224,7 @@ void abi_main(const unsigned long *initial_stack)
     abi_metadata_cases();
     abi_ownership_cases();
     abi_child_tid_cases();
+    abi_statx_cases();
     abi_script_cases();
     abi_mknod_cases();
     abi_session_cases();

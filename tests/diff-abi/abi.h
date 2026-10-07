@@ -1,5 +1,16 @@
 #ifndef DIFF_ABI_H
 #define DIFF_ABI_H
+#if defined(__loongarch__)
+#define ABI_PAGE_SIZE 16384
+#define ABI_TWO_PAGES_STRING "32768"
+#define ABI_FOUR_PAGES_STRING "65536"
+#else
+#define ABI_PAGE_SIZE 4096
+#define ABI_TWO_PAGES_STRING "8192"
+#define ABI_FOUR_PAGES_STRING "16384"
+#endif
+#define ABI_STRING_(x) #x
+#define ABI_STRING(x) ABI_STRING_(x)
 
 typedef unsigned long usize;
 struct abi_iovec { void *base; usize length; };
@@ -41,6 +52,7 @@ void abi_proc_exec_probe(void) __attribute__((noreturn));
 void abi_script_probe(const unsigned long *sp);
 void abi_script_cases(void);
 void abi_child_tid_cases(void);
+void abi_statx_cases(void);
 void abi_truncate_cases(void);
 void abi_timestamp_cases(void);
 void abi_readv_cases(void);

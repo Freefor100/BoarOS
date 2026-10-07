@@ -414,6 +414,24 @@ static void test_first_nonzero_range(void)
     expect_memory(3U, 0x80000000ULL, 0x20000000ULL);
 }
 
+static void test_discontiguous_memory(void)
+{
+    static const uint32_t low[] = {0U, 0U, 0U, 0x10000000U};
+    static const uint32_t high[] = {0U, 0x80000000U, 0U, 0x30000000U};
+    struct dtb_boot_info info = {0};
+    builder_start(&test_blob);
+    builder_add_root_cells(&test_blob, 2U, 2U);
+    builder_add_memory(&test_blob, "memory@0", low, 4U);
+    builder_add_memory(&test_blob, "memory@80000000", high, 4U);
+    builder_finish(&test_blob);
+    if (dtb_read_boot_info(test_blob.bytes, &info) != DTB_STATUS_OK ||
+        info.memory_count != 2U || info.memories[0].base != 0U ||
+        info.memories[0].size != 0x10000000U ||
+        info.memories[1].base != 0x80000000U ||
+        info.memories[1].size != 0x30000000U || info.memory.base != 0U)
+        fail_status(40U, DTB_STATUS_OK, DTB_STATUS_INVALID);
+}
+
 static void test_rejects_reserve_block_in_header(void)
 {
     static const uint32_t reg[] = {0U, 0x80000000U, 0x20000000U};
@@ -1048,6 +1066,7 @@ void kernel_main(unsigned long hart_id, const void *dtb)
     test_default_cells();
     test_one_cell_range();
     test_first_nonzero_range();
+    test_discontiguous_memory();
     test_rejects_reserve_block_in_header();
     test_rejects_late_root_property();
     test_rejects_duplicate_root_property();

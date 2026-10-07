@@ -9,7 +9,7 @@ root = pathlib.Path(__file__).resolve().parents[2]
 with tempfile.TemporaryDirectory(prefix='boaros-random-') as temp:
     shared = pathlib.Path(temp) / 'random.so'
     subprocess.run(['cc', '-shared', '-fPIC', '-std=c11', '-Wall', '-Wextra', '-Werror',
-                    '-Itests/host/random', '-Iinclude', 'tests/host/random_stubs.c',
+                    '-DBOAROS_PAGE_SHIFT=12', '-Itests/host/random', '-Iinclude', 'tests/host/random_stubs.c',
                     'kernel/random.c', 'kernel/blake2s.c', '-o', str(shared)],
                    cwd=root, check=True)
     lib = ctypes.CDLL(str(shared))
@@ -21,13 +21,14 @@ with tempfile.TemporaryDirectory(prefix='boaros-random-') as temp:
         assert result.raw == hashlib.blake2s(data).digest(), size
     executable = pathlib.Path(temp) / 'random-test'
     subprocess.run(['cc', '-std=c11', '-Wall', '-Wextra', '-Werror',
-                    '-Itests/host/random', '-Iinclude', 'tests/host/random_test.c',
+                    '-DBOAROS_PAGE_SHIFT=12', '-Itests/host/random', '-Iinclude', 'tests/host/random_test.c',
                     'tests/host/random_stubs.c', 'kernel/random.c', 'kernel/blake2s.c',
                     '-o', str(executable)], cwd=root, check=True)
     subprocess.run([str(executable)], check=True)
     subprocess.run(['cc', '-std=c11', '-Wall', '-Wextra', '-Werror',
-                    '-Itests/host/random', '-Iinclude', 'tests/host/random_device_test.c',
+                    '-DBOAROS_PAGE_SHIFT=12', '-Itests/host/random', '-Iinclude', 'tests/host/random_device_test.c',
                     'tests/host/random_stubs.c', 'kernel/random.c', 'kernel/blake2s.c',
-                    'fs/char_device.c', '-o', str(executable)], cwd=root, check=True)
+                    'fs/char_device.c', '-ffunction-sections', '-fdata-sections',
+                    '-Wl,--gc-sections', '-o', str(executable)], cwd=root, check=True)
     subprocess.run([str(executable)], check=True)
 print('BLAKE2s independent vectors passed')

@@ -9,7 +9,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 BUILD = ROOT / 'build'
-KEEP_TOP = {'data-path-baselines', 'network-budget', 'io-budget', 'cost', 'riscv', 'diff-abi', 'program-environment', 'program-libc', 'host', 'tools', 'offline-c'}
+KEEP_TOP = {'data-path-baselines', 'network-budget', 'io-budget', 'cost', 'riscv', 'loongarch', 'qemu-la', 'qemu-la-rtc', 'linux-la', 'linux-la-platform', 'diff-abi', 'program-environment', 'program-libc', 'host', 'tools', 'offline-c'}
 KEEP_ROOT_FILES = {'elf-tail-rv', 'elf-tail-dynamic-rv', 'elf-tail-norelro-rv'}
 
 
@@ -51,7 +51,7 @@ def candidates():
                                                 'offline-c-run.', 'offline-project-run.', 'tty-run.', 'pty-run.', 'sched-bandwidth.',
                                                 'sqlite-run.',
                                                 'sqlite-nbd-run.',
-                                                'sqlite-recovery-run.')))
+                                                'sqlite-recovery-run.','sqlite-wal-run.','rng-run.','environment-run.')))
 
     diff = BUILD / 'diff-abi'
     if diff.is_dir():
@@ -66,10 +66,36 @@ def candidates():
                     result.extend(path / name for name in ('configure.log', 'build.log')
                                   if (path / name).exists())
 
+    la = BUILD / 'loongarch'
+    if la.is_dir():
+        result.extend(la.glob('*.log'))
+        result.extend(la.glob('userland-identity-v1.json'))
+        result.extend(la.glob('userland-identity-v2-pre-mode.json'))
+        result.extend(la.glob('userland-identity-v2-pre-wrapper.json'))
+        result.extend(path for path in la.iterdir() if path.name in {'root-run','root-io-run','block-run','toolchain-check','dynamic','dynamic-dp','exec-error-inputs'}
+                      or path.name.startswith(('root-run.','root-io-run.','userland-run.','exec-fail-run.','stack-guard-run.','rng-run.','network-run.','net-failure-run.','uart-failure-run.','tty-run.','pty-run.','environment-run.','rtc-model.','rtc-alarm.','sqlite-wal-run.','sqlite-run.')))
+        result.extend(path for path in la.iterdir() if path.is_dir() and
+                      (path.name=='program-inventory' or path.name.startswith(('inventory-','diff-abi-','review-boundary-'))))
+        la_libc=la/'program-libc'
+        if la_libc.is_dir():
+            result.extend(path for path in la_libc.iterdir() if path.name=='upstream.tar' or path.suffix=='.log')
+        gcc_cache=la/'gcc-sf'
+        if gcc_cache.is_dir():
+            result.extend(path for path in gcc_cache.iterdir() if path.name in {'build','build-sf'})
+        reference = la / 'reference'
+        if reference.is_dir():
+            result.extend(path for path in reference.iterdir()
+                          if path.suffix in {'.log','.img','.gz'})
+
     libc = BUILD / 'program-libc'
     if libc.is_dir():
         result.extend(path for path in libc.iterdir()
                       if path.name == 'upstream.tar' or path.suffix == '.log')
+
+    for architecture in ('riscv','loongarch'):
+        glibc=BUILD/architecture/'glibc'
+        if glibc.is_dir():
+            result.extend(path for path in glibc.iterdir() if path.suffix in ('.img','.log') or path.name.startswith('run.'))
 
     offline_c = BUILD / 'offline-c'
     if offline_c.is_dir():

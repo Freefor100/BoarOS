@@ -2,7 +2,7 @@
 
 ## 入口与对象
 
-`kernel/syscall/socket.c` 导入 RV64 Linux socket 参数和用户指针，`fs/files/socket.c` 把 socket 作为普通 fd/OFD 安装并在失败时回滚，`net/socket.c` 持有 endpoint、数据包、待 accept 队列及等待队列。`fs/open_file.c` 在最后一个真实 OFD 引用消失时销毁 socket；dup、fork 和 syscall 期间的 pin 共享同一 endpoint，close/exec/退出均沿既有 fd 生命周期回收。`fs/files/io.c` 把普通 read/write/readv/writev 接到 socket 队列，pread/pwrite/lseek 返回 `ESPIPE`，`fstat` 标识 `S_IFSOCK`，poll/select/epoll 读取 socket 就绪和等待队列。
+`kernel/syscall/socket.c` 导入 RV64/LA64 Linux socket 参数和用户指针，`fs/files/socket.c` 把 socket 作为普通 fd/OFD 安装并在失败时回滚，`net/socket.c` 持有 endpoint、数据包、待 accept 队列及等待队列。`fs/open_file.c` 在最后一个真实 OFD 引用消失时销毁 socket；dup、fork 和 syscall 期间的 pin 共享同一 endpoint，close/exec/退出均沿既有 fd 生命周期回收。`fs/files/io.c` 把普通 read/write/readv/writev 接到 socket 队列，pread/pwrite/lseek 返回 `ESPIPE`，`fstat` 标识 `S_IFSOCK`，poll/select/epoll 读取 socket 就绪和等待队列。
 
 协议实现来自官方 lwIP `STABLE-2_2_1_RELEASE` raw API，位于 `third_party/lwip/`；固定资料和许可证见 `references/README.md`、`references/sources.tsv` 与 `third_party/lwip/COPYING`。IPv4 重组有本地所有权和边界修补，具体范围见[第三方组件](../third-party.md)。本地移植层是 `net/lwip_port/`，使用 `NO_SYS=1`；loopback 与物理接口共用协议池。生产预算为 8 MSS/池 4 倍/堆 2 倍：UDP PCB 16、TCP active 32、listen 16、segment 512、pbuf header/pool 各 256、协议堆 512 KiB。BoarOS socket、接收/accept 队列节点及 OFD 使用 kernel_heap。PCB 池耗尽映射 `ENOMEM`，创建失败不留下 OFD；分配器 `STATE` 和错误释放是 fatal 不变量。
 
@@ -59,7 +59,33 @@ socket，也不遍历全局 socket registry。OFD 销毁仍先清回调，再释
 关闭工作尚未服务时验证容量回收及 timer 到期均清空借用；同时检查非 socket
 raw PCB 和已经销毁的 socket，不用无 owner 的 raw PCB 代替主要所有权用例。
 
-支持 `AF_UNIX` (domain=1) 的 `socketpair(199)` 系统调用，支持 `SOCK_STREAM` 和 `SOCK_DGRAM` 类型以及 `SOCK_CLOEXEC`、`SOCK_NONBLOCK`。`kernel_files_socketpair_create` 保证双向 OFD 的原子分配与双 fd 安装，失败时完整回滚不泄露 fd 或 OFD。两个 endpoint 在内核中互相绑定 peer；流和数据报在接收端堆上排队，每个 socket 拥有 64 KiB 独立接收缓冲配额（超出时返回 `-EAGAIN` 并在接收端读取后唤醒对端写者）。向已关闭或断开的对端写入向调用任务产生 `SIGPIPE` 并返回 `-EPIPE`；读取已关闭对端返回 0 (EOF)；`SOCK_DGRAM` 将一次 write/writev 聚合为一条消息，64 KiB 上限之外返回 EMSGSIZE；用户复制全部成功后才移动整包 owner，fault/OOM/取消不发布前缀。队列按 `max(length, 1)` 收取预算，零长度消息可入队。容量不足时等待整条消息可容纳，不以普通 POLLOUT 作为重试条件；短读、复制 fault 或销毁释放整包及其全部预算。发送请求登记在任务上，退出前撤销临时 packet 与 OFD pin。poll/ppoll/epoll 准确反映对端关闭时的 `POLLHUP`/`POLLIN` 就绪。命名 AF_UNIX 端点、SCM_RIGHTS 凭据传递、带 ancillary 的 sendmsg/recvmsg、更多 sockopt、外部 IPv6 与 SMP 并发仍在 `docs/goals.md`，不能由本切片推出。
+支持`AF_UNIX`的STREAM/DGRAM socketpair及CLOEXEC/NONBLOCK，双OFD/双fd原子
+发布，失败不残留。endpoint只借用peer；queued packet持有发送者计费引用，即使
+发送者最后OFD已关闭，也要等接收、丢弃或接收端销毁后归还。关闭先摘除peer和
+可观察身份；仍持有packet的发送者只保留不可再发送的计费owner，最后引用释放
+实际堆对象，不建立无owner的清理重试。
+
+AF_UNIX按发送者内存限制等待，SO_RCVBUF仍可设置/查询但不能给对端发送者提供
+credit。SO_SNDBUF按Linux倍增、下限与4MiB设置上限；固定双侧默认212992。
+新packet可在当前内存低于sndbuf时分配一次，计费包含实际请求的payload及本地
+packet元数据；内部不复制Linux私有skb布局，不能比较偶然的成功发送次数。
+POLLOUT使用当前发送者内存的四分之一门限，实际write仍独立检查完整状态和
+内存资格；poll不预留内存。STREAM按sndbuf/2-64及有界片段发送，部分读取不
+提前返还该packet的内存。DGRAM消息上限为sndbuf-32，一次write/writev形成
+一条消息；零消息仍占有真实metadata，队列有限。
+
+DGRAM在分配和usercopy前登记发送请求及内存预留，复制完成后才移动整包owner；
+fault/OOM/取消先释放取得的内存，再归还预留与OFD pin，不发布前缀。截断读取或
+接收fault丢弃整条datagram并归还其全部计费；sender关闭后仍可读其queued内容。
+等待者被发送缓存增大、packet最后释放或peer状态变化唤醒，重新核对状态。
+STREAM的新write在peer关闭后返回EPIPE/SIGPIPE；已有写等待在peer带未读内容
+关闭时可交付一次ECONNRESET。DGRAM关闭peer后的首次send为ECONNREFUSED，
+后续未连接send为ENOTCONN，DGRAM的EPIPE不发送SIGPIPE。关闭状态、异步错误
+与poll/recv均按各类型处理，不把datagram peer关闭变成stream EOF。
+
+固定依据为`references/linux` commit`f4cdf7ca9a1fdcca413157df19753f388a5a224e`的
+`net/unix/af_unix.c`、`net/core/sock.c`、`include/net/sock.h`。命名AF_UNIX、SCM_RIGHTS、
+凭据/ancillary及SMP仍未交付；上述有界模型不声明完整Linux网络兼容。
 
 ## 验证
 
@@ -77,12 +103,12 @@ host 入口实测 UDP loopback、PCB 16 个用尽后第 17 个失败、全部释
 
 Linux ABI 依据本地 `references/linux/net/socket.c`、`net/ipv4/af_inet.c`、`fs/read_write.c`，固定 Linux v7.2；测试输入来自 `references/oscomp-testsuits` 固定 pre-2025 版本，精确身份在来源清单和机器归档。核对后运行 `make prune-build` 清理日志和镜像。
 
-规模回归补充 0/255/256/257/1500/4096/8192 字节 UDP 的三种入口、完整与不足容量、空 iovec、后继报文和跨页 fault；TCP 用错位缓冲与向量写累计传输 1 MiB，检查内容、非 256 字节接收和跨片段 fault 的字节守恒；`socketpair_scale`/`unix_datagram_budget` 及真实 pthread 补充 AF_UNIX 向量/跨页、零长度、64 KiB 上限、整包 OOM、满队列阻塞/非阻塞、fault 无前缀、截断/接收 fault 后预算复用与取消；固定 Linux 差分累计 1086 条一致。`socketpair_scale` 覆盖 STREAM 全双工读写、对端关闭 EOF、写入关闭对端返回 EPIPE 以及 DGRAM 数据报截断边界。成本与边界见[单核规模回归](../learning/single-hart-scale.md)。
+规模回归补充 0/255/256/257/1500/4096/8192 字节 UDP 的三种入口、完整与不足容量、空 iovec、后继报文和跨页 fault；TCP 用错位缓冲与向量写累计传输 1 MiB，检查内容、非 256 字节接收和跨片段 fault 的字节守恒；`socketpair_scale`/`unix_datagram_budget` 及真实 pthread 补充 AF_UNIX 向量/跨页、零长度、按sndbuf的消息上限、整包 OOM、满队列阻塞/非阻塞、fault 无前缀、截断/接收 fault 后预算复用与取消；固定 Linux 差分累计 1086 条一致。`socketpair_scale` 覆盖 STREAM 全双工读写、对端关闭 EOF、写入关闭对端返回 EPIPE 以及 DGRAM 数据报截断边界。成本与边界见[单核规模回归](../learning/single-hart-scale.md)。
 
 本轮选项阶段接入 getpeername(205)、getsockopt(209)，以及 REUSEADDR、TYPE、
 ACCEPTCONN、ERROR、KEEPALIVE、收发预算/超时、TCP_NODELAY、TCP_MAXSEG 和
 IPV6_V6ONLY。SO_ERROR 读取清除待观察错误，连接阶段 RST 返回 ECONNREFUSED；
-已建立 RST 保留 ECONNRESET。收发预算默认/上限 64 KiB，设置按 Linux 倍增，
+已建立 RST 保留 ECONNRESET。INET收发预算默认/上限 64 KiB，设置按 Linux 倍增，
 固定 RV64 最小值分别为 4608/2304；不预分配。接收队列和 TCP 发送接受量执行
 预算，lwIP 窗口和全局池仍可更紧。UDP connect 设置/重置默认对端并由协议过滤。
 监听启用官方 backlog 计量：待 accept child 保留资格，accept/abort 归还。
@@ -173,11 +199,11 @@ UNIX DGRAM自身SHUT_RD后，即使空队列也有IN/RDNORM和RDHUP；双向关�
 收到EAGAIN后的非阻塞调用不能因poll可读而重新循环。固定Linux和BoarOS现均通过；
 依据为固定Linux的`net/unix/af_unix.c`和`net/core/datagram.c`。
 
-扩大实际SO_RCVBUF预算会在单hart保护区内通知UNIX对端；STREAM和DGRAM发送者
-醒来后仍重查容量、关闭和错误，不延长peer引用。相同/缩小预算不通知对端。
-独立U-mode预算入口：`python3 -B tests/network-riscv.py --only boaros --workload budget`。
-该测试先握手并从proc确认发送者已阻塞，再核对扩容、缩容、对端关闭、SIGKILL和内容。
-它保护BoarOS的接收端字节预算，不把Linux的SO_RCVBUF当成相同排队模型。
+发送者预算入口：`python3 -B tests/network-riscv.py --workload budget`与
+`tests/network-loongarch.py --workload budget`，现在均对照Linux。测试先填满实际
+sender并从proc确认子任务已阻塞，检查接收缓存变更不解锁、发送缓存缩小/增大、
+peer关闭的类型对应错误、SIGKILL和内容守恒。相同ELF双侧运行，不按具体packet
+个数推断内核布局；旧接收配额成本契约由用户明确选择的Linux发送者模型替换。
 
 流发送的请求页持有有效内容和已发送游标：EAGAIN后等待及部分发送后继续消费暂存尾部，
 不再次读取同一段用户数据。非阻塞/fault/信号/期限仍返回已接受前缀；不借用用户页到ACK。
@@ -261,4 +287,20 @@ TCP 的 27 组窗口/池/堆候选由 `BOAROS_LWIP_WINDOW_MSS`、`BOAROS_LWIP_PO
 控制流 tail 与固定输入约束见[预算实验](../learning/data-path-budget-experiments.md)，
 可运行候选不等于吞吐已经验收，默认值须依据匹配结果由人选择。
 
+`python3 -B tests/network-budget-config.py` 独立验证无覆盖宏的生产默认 8/4/2，
+并显式覆盖全部 27 个候选，保留非法配置与统计计数宽度检查。
+`tests/network-budget-selftest.py` 用临时头文件默认值漂移验证门禁会失败。
+
 阶段七已完成 TCP 27 组预算的发布筛选、30 项组合扩展与独立 COST 诊断；当时默认为 8/1/1。用户依据近池与 1/10 ms 结果批准改为 8/4/2，保留 8 MSS 和 32 PCB。历史默认的吞吐回退、全局池/堆饱和和 8/4/2 的有限负载收益保留在[实验报告](../learning/data-path-budget-experiments.md#正式匹配结果2026-10-06)，不重跑完整矩阵，也不将预算调整宣称为单连接吞吐保证。
+
+共用Ethernet的入口为`kernel_network_start(owner, heap, device, frequency)`。device
+由平台/root持有，网络层仅借用；NULL创建独立timer-only worker。正常停止先
+禁止新发布、join，确认DMA停止后清理netif并归还TX/RX引用，再释放网络控制对象；
+平台随后销毁device/transport。LA真实PCI与无NIC双侧结果见[net模块](riscv-virtio-net.md)。
+
+2026-10-07新增`--workload unix_sender`保护>64KiB单消息、sndbuf-32边界、有限零
+消息、坏用户页、sender关闭后读取、关闭peer的两次错误及STREAM/DGRAM信号区别。
+LA的budget/sendfile/unix_sender均在Linux/BoarOS两种RAM检查实际退出和根基线；
+内部owner另由`tests/host/network_owner.py --case unix-sender --sanitize`验证两种
+关闭顺序，真实RV scale覆盖预留后的两处OOM、截断、接收fault及对端回收，pthread
+覆盖真实等待/取消。完整双架构/程序回归继续按整个LA能力计划收口。

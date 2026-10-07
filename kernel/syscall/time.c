@@ -1,7 +1,7 @@
 #include "private.h"
 
-#include <arch/riscv/timer.h>
-#include <arch/riscv/context.h>
+#include <arch/timer.h>
+#include <arch/context.h>
 #include <kernel/errno.h>
 #include <kernel/futex.h>
 #include <kernel/mm.h>
@@ -55,11 +55,11 @@ enum kernel_syscall_status syscall_handle_itimer(struct kernel_task *caller,
         decoded->value = which == 1 || which == 2 ? -KERNEL_ENOSYS : -KERNEL_EINVAL;
         return KERNEL_SYSCALL_STATUS_OK;
     }
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     if (setting) kernel_signal_timer_set(caller,itimer_ns(input.seconds,input.usec),
         itimer_ns(input.interval_seconds,input.interval_usec),&remaining,&interval);
     else kernel_signal_timer_get(caller,&remaining,&interval);
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     output.seconds = (int64_t)(remaining/1000000000U);
     output.usec = (int64_t)((remaining%1000000000U)/1000U);
     output.interval_seconds = (int64_t)(interval/1000000000U);
@@ -304,7 +304,7 @@ enum kernel_syscall_status syscall_handle_restart_syscall(
         return KERNEL_SYSCALL_STATUS_OK;
     }
     if (deadline == 0U ||
-        (int64_t)(riscv_time_read() - deadline) >= 0) {
+        (int64_t)(arch_time_read() - deadline) >= 0) {
         kernel_signal_clear_syscall_restart(caller);
         decoded->value = 0;
         return KERNEL_SYSCALL_STATUS_OK;

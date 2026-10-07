@@ -1,7 +1,7 @@
 #include <kernel/vfs.h>
 #include <kernel/page_cache.h>
 #include <kernel/errno.h>
-#include <arch/riscv/context.h>
+#include <arch/context.h>
 #include <string.h>
 
 struct disk_mount {
@@ -23,12 +23,12 @@ static void release_disk(struct kernel_vfs_mount *mount)
         if (kernel_page_cache_destroy(&disk->cache) != KERNEL_PAGE_CACHE_STATUS_OK)
             __builtin_trap();
     }
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     struct disk_mount **link = &disk_mounts;
     while (*link && *link != disk) link = &(*link)->next;
     if (!*link) __builtin_trap();
     *link = disk->next;
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     if (disk->source && kernel_heap_release(heap, disk->source) != KERNEL_HEAP_STATUS_OK)
         __builtin_trap();
     if (kernel_heap_release(heap, disk) != KERNEL_HEAP_STATUS_OK) __builtin_trap();
@@ -38,11 +38,11 @@ int kernel_vfs_disk_cleanup_pending(void)
 {
     int first = 0;
     for (;;) {
-        uintptr_t irq = riscv_interrupt_save();
+        uintptr_t irq = arch_interrupt_save();
         struct disk_mount *disk = disk_mounts;
         while (disk && disk->pending != 1) disk = disk->next;
         if (disk) disk->pending = 2;
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
         if (!disk) break;
         int result = kernel_vfs_unmount(&disk->mount);
         if (result) {
@@ -51,10 +51,10 @@ int kernel_vfs_disk_cleanup_pending(void)
         }
     }
     /* 本轮失败 owner 只重置一次；不跨 I/O 借用 next 指针。 */
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     for (struct disk_mount *disk = disk_mounts; disk; disk = disk->next)
         if (disk->pending == 3) disk->pending = 1;
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     return first;
 }
 
@@ -71,10 +71,10 @@ int kernel_vfs_disk_create(struct kernel_heap *heap, uint64_t device_number,
     if (allocation != KERNEL_HEAP_STATUS_OK)
         return allocation == KERNEL_HEAP_STATUS_EMPTY ? -KERNEL_ENOMEM : -KERNEL_EIO;
     disk->heap = heap;
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     disk->next = disk_mounts;
     disk_mounts = disk;
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     allocation = kernel_heap_allocate(heap, strlen(source) + 1, (void **)&disk->source);
     if (allocation != KERNEL_HEAP_STATUS_OK) {
         release_disk(&disk->mount);

@@ -63,3 +63,19 @@ glibc 2.44 作为外部测试输入使用：官方源码归档保存在被忽略
   remove 将状态改为 CLOSED 之前通知；slow timer 在摘链后、free 前通知。BoarOS
   端口只清除仍匹配的 socket 借用与回调，不重入 raw API 或改变协议计时，避免把
   PCB 生命周期交给受预算限制的普通工作队列。仍固定 2.2.1，验证见网络模块。
+
+
+## LA 静态用户程序构建输入
+
+GCC15.1.0 原官方 archive 固定于 `references/sources.tsv` 的 `gcc/gcc-15.1.0.tar.xz`；
+源码在忽略的 `build/loongarch/gcc-sf/source` 原样解包，许可见 `COPYING3`，目标运行库
+适用 `COPYING.RUNTIME` 的 GCC Runtime Library Exception3.1。仅构建 C/LP64S runtime，
+未导入 Git 或改动 GCC源码。musl1.2.5 仍使用既有固定归档（MIT）；原 BusyBox1.33.1
+使用 `tests/program-inventory/inputs.json` 中 `b5ec6ef8497e1818cbdec3b54bb722f036e57972`
+和原完整配置（GPLv2，原 `LICENSE`）。LA构建只改变目标编译/静态链接环境，未裁剪
+applet或改上游源码；UAPI来自固定 Linux v6.6 archive 的LA导出。工具和原程序身份
+由 `prepare-la-userland` 保存，验收范围见[LA模块](modules/loongarch-boot.md)。
+
+- lwext4空索引目录纠错：通过已验证HTree root的层级和块引用区分inner node
+  与leaf，避免无metadata checksum的空leaf被误解为坏node。保留结构/记录/
+  checksum失败状态，固定上游commit不变；验证`make test-lwext4-dir-empty-host`。

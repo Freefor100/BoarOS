@@ -35,12 +35,12 @@ int kernel_random_available(void) { return 0; }
 enum kernel_random_status kernel_random_fill(void *buffer, size_t size)
 { (void)buffer; (void)size; abort(); }
 
-enum riscv_direct_map_status riscv_image_va_to_pa(uint64_t address, uint64_t size, uint64_t *physical)
-{ (void)size; *physical = address; return dma_eligible ? RISCV_DIRECT_MAP_STATUS_OK : RISCV_DIRECT_MAP_STATUS_INVALID; }
-int riscv_virtio_mmio_net_send_segments(struct riscv_virtio_mmio_net *device,
-    const struct riscv_net_tx_segment *segments, unsigned count, void *owner)
+int arch_dma_image_address(uint64_t address, uint64_t size, uint64_t *physical)
+{ (void)size; *physical = address; return dma_eligible; }
+int virtio_net_send_segments(struct virtio_net_device *device,
+    const struct virtio_net_tx_segment *segments, unsigned count, void *owner)
 { (void)device; CHECK(segments && count && owner); ++segment_attempts; return -KERNEL_ENOTSUP; }
-int riscv_virtio_mmio_net_send_copy(struct riscv_virtio_mmio_net *device, uint32_t size,
+int virtio_net_send_copy(struct virtio_net_device *device, uint32_t size,
     int (*copy)(const void *, void *, uint32_t), const void *context)
 {
     (void)device; ++copy_attempts;
@@ -60,7 +60,8 @@ static void copy_capacity(unsigned eligible)
 {
     uintptr_t irq = kernel_socket_protocol_enter();
     kernel_socket_network_initialize();
-    struct kernel_network network = {0};
+    struct virtio_net_device device = {0};
+    struct kernel_network network = {.device=&device};
     ip4_addr_t local, mask, gateway;
     IP4_ADDR(&local, 10, 77, 0, 2); IP4_ADDR(&mask, 255, 255, 255, 0); ip4_addr_set_zero(&gateway);
     CHECK(netif_add(&network.interface, &local, &mask, &gateway, &network, physical_init, ip_input));
@@ -169,10 +170,35 @@ static void raw_owner_control(void)
     puts("PASS unowned raw TIME_WAIT PCBs do not invoke a socket owner");
 }
 
+static void unix_sender_owner(void)
+{
+    kernel_socket_network_initialize();
+    static unsigned char bytes[65537];
+    for(unsigned reverse=0;reverse<2;reverse++) {
+        struct kernel_socket *sender=0,*receiver=0;
+        CHECK(kernel_socket_pair(&test_heap,SOCKET_DGRAM,&sender,&receiver)==0);
+        CHECK(kernel_socket_set_option(receiver,KERNEL_SOCKET_RCVBUF,0)==0);
+        CHECK(kernel_socket_write_buffer(sender,bytes,sizeof(bytes),0)==sizeof(bytes));
+        if(reverse) {
+            kernel_socket_destroy(receiver);
+            CHECK(kernel_socket_write_buffer(sender,bytes,1,KERNEL_SOCKET_MSG_NOSIGNAL)==-KERNEL_ECONNREFUSED);
+            CHECK(kernel_socket_write_buffer(sender,bytes,1,KERNEL_SOCKET_MSG_NOSIGNAL)==-KERNEL_ENOTCONN);
+            kernel_socket_destroy(sender);
+        } else {
+            kernel_socket_destroy(sender);
+            /* Receiver still owns message and dead sender accounting until final drain. */
+            kernel_socket_destroy(receiver);
+        }
+        CHECK(!heap_live);
+    }
+    puts("PASS UNIX queued sender survives endpoint close and returns accounting once in either close order");
+}
+
 int main(int argc, char **argv)
 {
     CHECK(argc == 2);
-    if (!strcmp(argv[1], "copy-indirect")) copy_capacity(1);
+    if (!strcmp(argv[1], "unix-sender")) unix_sender_owner();
+    else if (!strcmp(argv[1], "copy-indirect")) copy_capacity(1);
     else if (!strcmp(argv[1], "copy-ineligible")) copy_capacity(0);
     else if (!strcmp(argv[1], "timewait-capacity")) timewait_owner(0);
     else if (!strcmp(argv[1], "timewait-timer")) timewait_owner(1);

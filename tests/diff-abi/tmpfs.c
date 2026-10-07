@@ -13,23 +13,23 @@ static void tmpfs_mapping_times(void);
 void abi_tmpfs_cases(void)
 {
     abi_require(SC3(34, -100, "/tmpfs-probe", 0755) == 0);
-    long mounted = SC5(40, "none", "/tmpfs-probe", "tmpfs", 0, "size=8192,nr_inodes=8");
+    long mounted = SC5(40, "none", "/tmpfs-probe", "tmpfs", 0, "size=" ABI_TWO_PAGES_STRING ",nr_inodes=8");
     abi_record("tmpfs.mount", mounted, -1, -1, 0, 0, 0);
     if (mounted) return;
     long fd = abi_open("/tmpfs-probe/data", 2 | 64);
-    abi_require(fd >= 0 && SC2(46, fd, 16384) == 0);
+    abi_require(fd >= 0 && SC2(46, fd, (4 * ABI_PAGE_SIZE)) == 0);
     char byte = 1;
-    abi_require(SC4(67, fd, &byte, 1, 12288) == 1 && byte == 0);
-    abi_require(SC4(68, fd, "A", 1, 0) == 1 && SC4(68, fd, "B", 1, 4096) == 1);
-    abi_record("tmpfs.quota", SC4(68, fd, "C", 1, 8192), -1, -1, 0, 0, 0);
-    long mapping = SC6(222, 0, 4096, 3, 1, fd, 0);
+    abi_require(SC4(67, fd, &byte, 1, (3 * ABI_PAGE_SIZE)) == 1 && byte == 0);
+    abi_require(SC4(68, fd, "A", 1, 0) == 1 && SC4(68, fd, "B", 1, ABI_PAGE_SIZE) == 1);
+    abi_record("tmpfs.quota", SC4(68, fd, "C", 1, (2 * ABI_PAGE_SIZE)), -1, -1, 0, 0, 0);
+    long mapping = SC6(222, 0, ABI_PAGE_SIZE, 3, 1, fd, 0);
     abi_require(mapping > 0);
     *(volatile char *)mapping = 'Z';
     abi_require(SC4(67, fd, &byte, 1, 0) == 1 && byte == 'Z');
     abi_record("tmpfs.busy", SC2(39, "/tmpfs-probe", 0), -1, -1, 0, 0, 0);
     abi_require(SC3(35, -100, "/tmpfs-probe/data", 0) == 0);
     abi_require(SC1(57, fd) == 0 && *(volatile char *)mapping == 'Z');
-    abi_require(SC2(215, mapping, 4096) == 0);
+    abi_require(SC2(215, mapping, ABI_PAGE_SIZE) == 0);
     abi_record("tmpfs.unmount", SC2(39, "/tmpfs-probe", 0), -1, -1, 0, 0, 0);
     tmpfs_extended();
     tmpfs_faults();
@@ -46,11 +46,11 @@ static void tmpfs_mapping_times(void)
         "tmpfs.mmap-times.shared-write-first", "tmpfs.mmap-times.private-write",
         "tmpfs.mmap-times.mprotect-read-first", "tmpfs.mmap-times.mprotect-write-first",
         "tmpfs.mmap-times.none-restore"};
-    abi_require(SC5(40, "none", "/tmpfs-probe", "tmpfs", 0, "size=4096") == 0);
+    abi_require(SC5(40, "none", "/tmpfs-probe", "tmpfs", 0, "size=" ABI_STRING(ABI_PAGE_SIZE) "") == 0);
     long fd = abi_open("/tmpfs-probe/times", 2 | 64);
-    abi_require(fd >= 0 && SC2(46, fd, 4096) == 0);
+    abi_require(fd >= 0 && SC2(46, fd, ABI_PAGE_SIZE) == 0);
     for (unsigned mode = 0; mode < 6; mode++) {
-        long address = SC6(222, 0, 4096, mode == 3 ? 1 : 3, mode == 2 ? 2 : 1, fd, 0);
+        long address = SC6(222, 0, ABI_PAGE_SIZE, mode == 3 ? 1 : 3, mode == 2 ? 2 : 1, fd, 0);
         abi_require(address > 0);
         volatile unsigned char *page = (void *)address;
         if (mode == 4) *page = 'W';
@@ -60,15 +60,15 @@ static void tmpfs_mapping_times(void)
         if (mode != 1 && mode != 4) { volatile unsigned char read = *page; (void)read; }
         abi_require(SC2(80, fd, &before) == 0);
         if (mode >= 3) {
-            if (mode >= 4) abi_require(SC3(226, address, 4096, mode == 5 ? 0 : 1) == 0);
-            abi_require(SC3(226, address, 4096, 3) == 0);
+            if (mode >= 4) abi_require(SC3(226, address, ABI_PAGE_SIZE, mode == 5 ? 0 : 1) == 0);
+            abi_require(SC3(226, address, ABI_PAGE_SIZE, 3) == 0);
         }
         *page = 'M';
         abi_require(SC2(80, fd, &after) == 0);
         long values[] = {before.mtime == 123 && before.mtime_nsec == 42,
                         after.mtime != 123 || after.mtime_nsec != 42};
         abi_record(names[mode], 0, -1, -1, 0, values, sizeof(values));
-        abi_require(SC2(215, address, 4096) == 0);
+        abi_require(SC2(215, address, ABI_PAGE_SIZE) == 0);
     }
     abi_require(SC1(57, fd) == 0 && SC2(39, "/tmpfs-probe", 0) == 0);
 }
@@ -90,7 +90,7 @@ static void tmpfs_extended(void)
     struct abi_stat st;
     char byte;
     abi_require(SC5(40, "none", "/tmpfs-probe", "tmpfs", 0,
-                    "size=8192,nr_inodes=16") == 0);
+                    "size=" ABI_TWO_PAGES_STRING ",nr_inodes=16") == 0);
     tmpfs_result("tmpfs.mknod-regular", SC4(33, -100,
                  "/tmpfs-probe/mknod", 0100600, 0));
     abi_require(SC3(35, -100, "/tmpfs-probe/mknod", 0) == 0);
@@ -122,21 +122,21 @@ static void tmpfs_extended(void)
     byte = 1;
     abi_require(SC4(67, fd, &byte, 1, 61440) == 1 && byte == 0 &&
                 SC2(44, fd, &sparse) == 0 && SC2(80, fd, &st) == 0);
-    long geometry[] = {before.type == 0x01021994, before.bsize == 4096,
+    long geometry[] = {before.type == 0x01021994, before.bsize == ABI_PAGE_SIZE,
         before.namelen == 255, before.bfree == before.bavail,
         sparse.bfree == before.bfree, st.blocks == 0};
     abi_record("tmpfs.sparse-statfs", 0, -1, -1, 0, geometry, sizeof(geometry));
     abi_require(SC4(68, fd, "X", 1, 0) == 1 &&
-                SC4(68, fd, "Y", 1, 4096) == 1 && SC2(44, fd, &allocated) == 0);
-    abi_require(SC2(46, fd, 4096) == 0 && SC2(44, fd, &released) == 0);
+                SC4(68, fd, "Y", 1, ABI_PAGE_SIZE) == 1 && SC2(44, fd, &allocated) == 0);
+    abi_require(SC2(46, fd, ABI_PAGE_SIZE) == 0 && SC2(44, fd, &released) == 0);
     long deltas[] = {before.bfree - allocated.bfree,
                     released.bfree - allocated.bfree};
     abi_record("tmpfs.truncate-quota-release", 0, -1, -1, 0, deltas, sizeof(deltas));
-    abi_require(SC4(68, fd, "T", 1, 8192) == 1);
-    tmpfs_result("tmpfs.reuse-quota", SC4(68, fd, "F", 1, 12288));
-    abi_require(SC2(46, fd, 4096) == 0);
-    long shared = SC6(222, 0, 4096, 3, 1, fd, 0);
-    long private = SC6(222, 0, 4096, 3, 2, fd, 0);
+    abi_require(SC4(68, fd, "T", 1, (2 * ABI_PAGE_SIZE)) == 1);
+    tmpfs_result("tmpfs.reuse-quota", SC4(68, fd, "F", 1, (3 * ABI_PAGE_SIZE)));
+    abi_require(SC2(46, fd, ABI_PAGE_SIZE) == 0);
+    long shared = SC6(222, 0, ABI_PAGE_SIZE, 3, 1, fd, 0);
+    long private = SC6(222, 0, ABI_PAGE_SIZE, 3, 2, fd, 0);
     abi_require(shared > 0 && private > 0);
     ((volatile char *)private)[0] = 'P';
     ((volatile char *)private)[100] = 'Q';
@@ -146,14 +146,14 @@ static void tmpfs_extended(void)
         ((volatile char *)shared)[100], ((volatile char *)private)[0],
         ((volatile char *)private)[100]};
     abi_record("tmpfs.private-cow-tail", 0, -1, -1, 0, content, sizeof(content));
-    abi_require(SC2(46, fd, 4096) == 0 &&
+    abi_require(SC2(46, fd, ABI_PAGE_SIZE) == 0 &&
                 SC4(67, fd, &byte, 1, 100) == 1);
     abi_record("tmpfs.truncate-regrow-zero", 0, -1, -1, 0, &byte, 1);
-    abi_require(SC2(215, shared, 4096) == 0 && SC2(215, private, 4096) == 0 &&
+    abi_require(SC2(215, shared, ABI_PAGE_SIZE) == 0 && SC2(215, private, ABI_PAGE_SIZE) == 0 &&
                 SC1(57, fd) == 0 && SC2(39, "/tmpfs-probe", 0) == 0);
 
     abi_require(SC5(40, "none", "/tmpfs-probe", "tmpfs", 0,
-                    "size=8192,nr_inodes=3") == 0);
+                    "size=" ABI_TWO_PAGES_STRING ",nr_inodes=3") == 0);
     fd = abi_open("/tmpfs-probe/one", 2 | 64);
     long second = abi_open("/tmpfs-probe/two", 2 | 64);
     abi_require(fd >= 0 && second >= 0);
@@ -169,7 +169,7 @@ static void tmpfs_extended(void)
     tmpfs_result("tmpfs.bad-size", SC5(40, "none", "/tmpfs-probe", "tmpfs", 0, "size=bogus"));
     tmpfs_result("tmpfs.bad-inodes", SC5(40, "none", "/tmpfs-probe", "tmpfs", 0, "nr_inodes=bad"));
     tmpfs_result("tmpfs.bad-option", SC5(40, "none", "/tmpfs-probe", "tmpfs", 0, "not_an_option=1"));
-    abi_require(SC5(40, "none", "/tmpfs-probe", "tmpfs", 1, "size=8192") == 0);
+    abi_require(SC5(40, "none", "/tmpfs-probe", "tmpfs", 1, "size=" ABI_TWO_PAGES_STRING "") == 0);
     tmpfs_result("tmpfs.readonly-create", abi_open("/tmpfs-probe/no", 2 | 64));
     abi_require(SC2(43, "/tmpfs-probe", &before) == 0);
     tmpfs_result("tmpfs.readonly-statfs", !!(before.flags & 1));
@@ -181,8 +181,8 @@ static void tmpfs_extended(void)
     abi_require(SC2(39, "/tmpfs-probe", 0) == 0);
 
     abi_require(SC3(34, -100, "/tmpfs-other", 0755) == 0 &&
-                SC5(40, "none", "/tmpfs-probe", "tmpfs", 0, "size=4096,nr_inodes=16") == 0 &&
-                SC5(40, "none", "/tmpfs-other", "tmpfs", 0, "size=4096,nr_inodes=16") == 0);
+                SC5(40, "none", "/tmpfs-probe", "tmpfs", 0, "size=" ABI_STRING(ABI_PAGE_SIZE) ",nr_inodes=16") == 0 &&
+                SC5(40, "none", "/tmpfs-other", "tmpfs", 0, "size=" ABI_STRING(ABI_PAGE_SIZE) ",nr_inodes=16") == 0);
     fd = abi_open("/tmpfs-probe/data", 2 | 64);
     second = abi_open("/tmpfs-other/data", 2 | 64);
     abi_require(fd >= 0 && second >= 0 && SC4(68, fd, "A", 1, 0) == 1 &&
@@ -198,7 +198,7 @@ static void tmpfs_extended(void)
     fd = abi_open("/tmpfs-probe/new/link", 0);
     abi_require(fd >= 0 && SC3(63, fd, &byte, 1) == 1 && SC1(57, fd) == 0);
     abi_record("tmpfs.symlink-after-rename", 0, -1, -1, 0, &byte, 1);
-    abi_require(SC5(40, "none", "/tmpfs-probe/new", "tmpfs", 0, "size=4096") == 0);
+    abi_require(SC5(40, "none", "/tmpfs-probe/new", "tmpfs", 0, "size=" ABI_STRING(ABI_PAGE_SIZE) "") == 0);
     tmpfs_result("tmpfs.nested-hidden", abi_open("/tmpfs-probe/new/link", 0));
     tmpfs_result("tmpfs.nested-parent-busy", SC2(39, "/tmpfs-probe", 0));
     abi_require(SC2(39, "/tmpfs-probe/new", 0) == 0);
@@ -212,44 +212,44 @@ static void tmpfs_extended(void)
 static void tmpfs_faults(void)
 {
     abi_require(SC5(40, "none", "/tmpfs-probe", "tmpfs", 0,
-                    "size=4096,nr_inodes=16") == 0);
+                    "size=" ABI_STRING(ABI_PAGE_SIZE) ",nr_inodes=16") == 0);
     long fd = abi_open("/tmpfs-probe/fault", 2 | 64);
-    abi_require(fd >= 0 && SC2(46, fd, 8192) == 0);
-    long mapped = SC6(222, 0, 8192, 3, 1, fd, 0);
+    abi_require(fd >= 0 && SC2(46, fd, (2 * ABI_PAGE_SIZE)) == 0);
+    long mapped = SC6(222, 0, (2 * ABI_PAGE_SIZE), 3, 1, fd, 0);
     abi_require(mapped > 0);
     *(volatile char *)mapped = 'A';
     long child = SC5(220, 17, 0, 0, 0, 0);
     abi_require(child >= 0);
     if (!child) {
-        *(volatile char *)(mapped + 4096) = 'B';
+        *(volatile char *)(mapped + ABI_PAGE_SIZE) = 'B';
         abi_exit(91);
     }
     int status;
     abi_require(SC4(260, child, &status, 0, 0) == child);
     abi_record("tmpfs.mapping-quota-signal", status & 127, -1, -1, 0, 0, 0);
-    abi_require(SC2(215, mapped, 8192) == 0 && SC1(57, fd) == 0 &&
+    abi_require(SC2(215, mapped, (2 * ABI_PAGE_SIZE)) == 0 && SC1(57, fd) == 0 &&
                 SC2(39, "/tmpfs-probe", 0) == 0);
     abi_require(SC3(34, -100, "/proc-probe", 0755) == 0);
     abi_require(SC5(40, "none", "/tmpfs-probe", "tmpfs", 0,
-                    "size=16384,nr_inodes=16") == 0 &&
+                    "size=" ABI_FOUR_PAGES_STRING ",nr_inodes=16") == 0 &&
                 SC5(40, "none", "/proc-probe", "proc", 0, 0) == 0);
     for (int cow = 0; cow < 2; cow++) {
         fd = abi_open("/tmpfs-probe/reopen", 2 | 64);
-        abi_require(fd >= 0 && fd < 100 && SC2(46, fd, 8192) == 0);
-        mapped = SC6(222, 0, 8192, 3, cow ? 2 : 1, fd, 0);
+        abi_require(fd >= 0 && fd < 100 && SC2(46, fd, (2 * ABI_PAGE_SIZE)) == 0);
+        mapped = SC6(222, 0, (2 * ABI_PAGE_SIZE), 3, cow ? 2 : 1, fd, 0);
         abi_require(mapped > 0);
-        *(volatile char *)(mapped + 4096) = 'C';
+        *(volatile char *)(mapped + ABI_PAGE_SIZE) = 'C';
         abi_require(SC3(35, -100, "/tmpfs-probe/reopen", 0) == 0);
         char path[] = "/proc-probe/self/fd/00";
         usize pos = sizeof(path) - 3;
         if (fd >= 10) { path[pos++] = '0' + fd / 10; }
         path[pos++] = '0' + fd % 10; path[pos] = 0;
         long reopened = abi_open(path, 2);
-        abi_require(reopened >= 0 && SC2(46, reopened, 4096) == 0);
+        abi_require(reopened >= 0 && SC2(46, reopened, ABI_PAGE_SIZE) == 0);
         child = SC5(220, 17, 0, 0, 0, 0);
         abi_require(child >= 0);
         if (!child) {
-            volatile char value = *(volatile char *)(mapped + 4096);
+            volatile char value = *(volatile char *)(mapped + ABI_PAGE_SIZE);
             (void)value;
             abi_exit(92);
         }
@@ -257,7 +257,7 @@ static void tmpfs_faults(void)
         abi_record(cow ? "tmpfs.reopened-private-truncate" : "tmpfs.reopened-shared-truncate",
                    status & 127, -1, -1, 0, 0, 0);
         abi_require(SC1(57, reopened) == 0 && SC1(57, fd) == 0 &&
-                    SC2(215, mapped, 8192) == 0);
+                    SC2(215, mapped, (2 * ABI_PAGE_SIZE)) == 0);
     }
     abi_require(SC2(39, "/tmpfs-probe", 0) == 0 && SC2(39, "/proc-probe", 0) == 0);
 }

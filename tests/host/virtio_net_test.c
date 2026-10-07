@@ -1,6 +1,7 @@
 #include <arch/riscv/virtio_mmio_net.h>
 #include <kernel/console.h>
 #include <kernel/errno.h>
+#include <kernel/page.h>
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -80,7 +81,7 @@ static void *resolve(uint64_t p)
 {
     for (unsigned i = 0; i < allocation_count; i++) {
         if (memory[i].data && p >= memory[i].phys &&
-            p - memory[i].phys < (UINT64_C(4096) << memory[i].order))
+            p - memory[i].phys < ((uint64_t)BOAROS_PAGE_SIZE << memory[i].order))
             return (char *)memory[i].data + p - memory[i].phys;
     }
     assert(0); return 0;
@@ -90,7 +91,7 @@ static void *model_extra_memory(uint64_t *phys)
 {
     unsigned i = allocation_count++;
     assert(i < 8);
-    memory[i] = (struct allocation){dma_base + i * UINT64_C(0x100000), calloc(1, 4096), 0};
+    memory[i] = (struct allocation){dma_base + i * UINT64_C(0x100000), calloc(1, BOAROS_PAGE_SIZE), 0};
     assert(memory[i].data); *phys = memory[i].phys; return memory[i].data;
 }
 static void model_extra_free(uint64_t phys)
@@ -153,9 +154,9 @@ static void observe_notification(unsigned q)
     }
     queue->notifications++;
 }
-uint32_t riscv_virtio_net_read(volatile uint8_t *base, unsigned offset)
+uint32_t virtio_mmio_read32(volatile void *context, unsigned offset)
 {
-    assert(base == (volatile uint8_t *)regs && offset < sizeof(regs) && !(offset & 3U));
+    assert(context == (volatile void *)regs && offset < sizeof(regs) && !(offset & 3U));
     struct model_queue *queue = &queues[selected];
     switch (offset) {
     case MMIO_DEVICE_FEATURES:
@@ -180,9 +181,9 @@ static void address_part(uint64_t *address, unsigned high, uint32_t value)
     if (high) *address = (*address & UINT32_MAX) | ((uint64_t)value << 32);
     else *address = (*address & UINT64_C(0xffffffff00000000)) | value;
 }
-void riscv_virtio_net_write(volatile uint8_t *base, unsigned offset, uint32_t value)
+void virtio_mmio_write32(volatile void *context, unsigned offset, uint32_t value)
 {
-    assert(base == (volatile uint8_t *)regs && offset < MMIO_CONFIG && !(offset & 3U));
+    assert(context == (volatile void *)regs && offset < MMIO_CONFIG && !(offset & 3U));
     if (offset == MMIO_STATUS && value == 0) {
         reset_calls++;
         if (reject_reset_from && reset_calls >= reject_reset_from) return;
@@ -263,7 +264,7 @@ enum physical_page_status physical_page_allocate_order(struct physical_page_allo
     if (++allocation_calls == allocation_fail) return PHYSICAL_PAGE_STATUS_EMPTY;
     unsigned i = allocation_count++; assert(i < 8 && order <= 5);
     memory[i] = (struct allocation){dma_base + i * UINT64_C(0x100000),
-                                    calloc(1, 4096U << order), order};
+                                    calloc(1, BOAROS_PAGE_SIZE << order), order};
     assert(memory[i].data); *p = memory[i].phys; live++; return PHYSICAL_PAGE_STATUS_OK;
 }
 enum physical_page_status physical_page_resolve(const struct physical_page_allocator *a,
@@ -306,7 +307,7 @@ static void start(unsigned version, struct riscv_virtio_mmio_net *d)
     assert(queues[0].pending_count == queues[0].number && queues[1].pending_count == 0);
 }
 static void stop(struct riscv_virtio_mmio_net *d)
-{ assert(riscv_virtio_mmio_net_stop(d) == 0 && !live && !d->mmio); }
+{ assert(riscv_virtio_mmio_net_stop(d) == 0 && !live && !d->transport.context); }
 static void trigger_interrupt(unsigned bits)
 {
     assert(interrupt_fn); regs[MMIO_INTERRUPT_STATUS / 4] |= bits;
@@ -363,7 +364,7 @@ static void test_loan_budget(unsigned version)
     assert(riscv_virtio_mmio_net_lend(&d, frame.buffer) == -KERNEL_EAGAIN);
     riscv_virtio_mmio_net_release(&d, frame.buffer);
     for (unsigned i = 0; i < 2; i++) {
-        assert(riscv_virtio_mmio_net_stop(&d) == -KERNEL_EBUSY && live == 3 && d.mmio);
+        assert(riscv_virtio_mmio_net_stop(&d) == -KERNEL_EBUSY && live == 3 && d.transport.context);
         for (unsigned j = 0; j < 32; j++) assert(!memcmp(frames[j].data, "owned", 5));
     }
     for (unsigned i = 0; i < 32; i++) riscv_virtio_mmio_net_release(&d, frames[i].buffer);
@@ -393,7 +394,7 @@ static void seed_ring(struct riscv_virtio_mmio_net *d, unsigned q, uint16_t cons
     /* Public split-ring indices model long prior history; no private FIFO state is patched. */
     write16((char *)resolve(queues[q].used) + 2, consumed);
     write16((char *)resolve(queues[q].available) + 2, advertised);
-    d->consumed[q] = consumed; d->available[q] = advertised;
+    d->split[q].last_used = consumed; d->split[q].next_available = advertised;
     queues[q].observed_available = advertised;
     unsigned char *a = resolve(queues[q].available);
     for (unsigned i = 0; i < queues[q].pending_count; i++)
@@ -414,8 +415,8 @@ static void test_index_wrap(unsigned version)
         assert(!memcmp((char *)resolve(desc.address) + (version == 1 ? 10 : 12), payload, sizeof(payload)));
         complete(1, id, 0, 1); assert(!riscv_virtio_mmio_net_service(&d));
     }
-    assert(used_index(0) == 2 && d.consumed[0] == 2 && available_index(0) == 34 && d.available[0] == 34);
-    assert(used_index(1) == 34 && d.consumed[1] == 34 && available_index(1) == 34 && d.available[1] == 34);
+    assert(used_index(0) == 2 && d.split[0].last_used == 2 && available_index(0) == 34 && d.split[0].next_available == 34);
+    assert(used_index(1) == 34 && d.split[1].last_used == 34 && available_index(1) == 34 && d.split[1].next_available == 34);
     assert(d.statistics.rx_packets == 40 && d.statistics.tx_packets == 40);
     assert(queues[0].pending_count == queues[0].number && queues[1].pending_count == 0);
     stop(&d); printf("PASS: VirtIO-net v%u RX/TX available and used indices cross 65535 to 0\n", version);
@@ -428,7 +429,7 @@ static void test_used_index(unsigned version, unsigned q, int backwards)
     write16((char *)resolve(queues[q].used) + 2, index); trigger_interrupt(1);
     failed_owner(&d);
     /* A later duplicate-ID failure must not hide a missing index-range guard. */
-    assert(d.consumed[q] == 0 && d.statistics.rx_packets == 0);
+    assert(d.split[q].last_used == 0 && d.statistics.rx_packets == 0);
     stop(&d);
     printf("PASS: VirtIO-net v%u queue%u %s used-index rejected with live DMA owner\n", version, q, backwards ? "backwards" : "excess");
 }
@@ -443,7 +444,7 @@ static void test_duplicate_id(unsigned version, unsigned q)
     unsigned id = next_head(q);
     if (!q) (void)prepare_rx("", 0, 0, 0);
     complete(q, id, length, 0); complete(q, id, length, 1);
-    failed_owner(&d); assert(d.consumed[q] == 1); stop(&d);
+    failed_owner(&d); assert(q ? d.tx_posted != 0 : d.statistics.rx_packets == 1); stop(&d);
     printf("PASS: VirtIO-net v%u queue%u duplicate used ID rejected before second owner release\n", version, q);
 }
 static void test_rx_length(unsigned version, int oversized)
@@ -496,7 +497,7 @@ static void test_negotiation_failure(unsigned version, unsigned which)
     else if (which == 1) { assert(version == 2); high_features = 0; name = "missing VERSION_1"; }
     else { assert(version == 2); reject_features = 1; expected = -KERNEL_EIO; name = "FEATURES_OK refusal"; }
     assert(riscv_virtio_mmio_net_init(&d, regs, sizeof(regs), &allocator, 100, 7) == expected);
-    assert(!live && !d.mmio && !interrupt_fn && allocation_calls == 0);
+    assert(!live && !d.transport.context && !interrupt_fn && allocation_calls == 0);
     printf("PASS: VirtIO-net v%u %s resets and leaves no published owner\n", version, name);
 }
 static void test_allocation_failure(unsigned version, unsigned nth, int reset_rejected)
@@ -507,17 +508,17 @@ static void test_allocation_failure(unsigned version, unsigned nth, int reset_re
     assert(riscv_virtio_mmio_net_init(&d, regs, sizeof(regs), &allocator, 100, 7) == expected);
     assert(allocation_calls == nth);
     if (reset_rejected) {
-        assert(live == nth - 1U && d.mmio);
+        assert(live == nth - 1U && d.transport.context);
         uint64_t physical[3] = {d.queue_phys, d.rx_phys, d.tx_phys};
         void *data[3] = {d.queues, d.rx_memory, d.tx_memory};
         for (unsigned i = 0; i < 2; i++) {
-            assert(riscv_virtio_mmio_net_stop(&d) == -KERNEL_EIO && live == nth - 1U && d.mmio);
+            assert(riscv_virtio_mmio_net_stop(&d) == -KERNEL_EIO && live == nth - 1U && d.transport.context);
             assert(d.queue_phys == physical[0] && d.rx_phys == physical[1] && d.tx_phys == physical[2]);
             assert(d.queues == data[0] && d.rx_memory == data[1] && d.tx_memory == data[2]);
             for (unsigned j = 0; j < allocation_count; j++) assert(resolve(memory[j].phys) == memory[j].data);
         }
         reject_reset_from = 0; stop(&d);
-    } else assert(!live && !d.mmio && !interrupt_fn);
+    } else assert(!live && !d.transport.context && !interrupt_fn);
     printf("PASS: VirtIO-net v%u allocation%u failure %s\n", version, nth,
            reset_rejected ? "retains owner through two refused resets, releases after acknowledgement" : "rolls back after reset acknowledgement");
 }
@@ -528,10 +529,10 @@ static void test_plic_failure(unsigned version, int reset_rejected)
     assert(riscv_virtio_mmio_net_init(&d, regs, sizeof(regs), &allocator, 100, 7) == -KERNEL_EIO);
     assert(!interrupt_fn);
     if (reset_rejected) {
-        assert(live == 3 && d.mmio);
-        assert(riscv_virtio_mmio_net_stop(&d) == -KERNEL_EIO && live == 3 && d.mmio);
+        assert(live == 3 && d.transport.context);
+        assert(riscv_virtio_mmio_net_stop(&d) == -KERNEL_EIO && live == 3 && d.transport.context);
         reject_reset_from = 0; stop(&d);
-    } else assert(!live && !d.mmio);
+    } else assert(!live && !d.transport.context);
     printf("PASS: VirtIO-net v%u PLIC registration failure %s\n", version,
            reset_rejected ? "retains DMA owner while reset refused" : "rolls back all DMA allocations");
 }
@@ -541,11 +542,11 @@ static void test_reset_owner(unsigned version)
     assert(riscv_virtio_mmio_net_receive(&d, &frame) == 1 && !riscv_virtio_mmio_net_lend(&d, frame.buffer));
     reject_reset_from = reset_calls + 1;
     for (unsigned i = 0; i < 2; i++) {
-        assert(riscv_virtio_mmio_net_stop(&d) == -KERNEL_EIO && live == 3 && d.mmio && interrupt_fn);
+        assert(riscv_virtio_mmio_net_stop(&d) == -KERNEL_EIO && live == 3 && d.transport.context && interrupt_fn);
         assert(!memcmp(frame.data, "borrow", 6));
     }
     reject_reset_from = 0;
-    assert(riscv_virtio_mmio_net_stop(&d) == -KERNEL_EBUSY && live == 3 && d.mmio && !interrupt_fn);
+    assert(riscv_virtio_mmio_net_stop(&d) == -KERNEL_EBUSY && live == 3 && d.transport.context && !interrupt_fn);
     assert(!memcmp(frame.data, "borrow", 6)); riscv_virtio_mmio_net_release(&d, frame.buffer); stop(&d);
     printf("PASS: VirtIO-net v%u repeated reset refusal and borrowed frame retain the same DMA owner\n", version);
 }
@@ -597,13 +598,13 @@ static unsigned test_device_needs_reset_loan(void)
                 result, d.failed, (unsigned long long)d.statistics.errors);
     reject_reset_from = reset_calls + 1;
     for (unsigned i = 0; i < 2; i++) {
-        assert(riscv_virtio_mmio_net_stop(&d) == -KERNEL_EIO && live == 3 && d.mmio);
+        assert(riscv_virtio_mmio_net_stop(&d) == -KERNEL_EIO && live == 3 && d.transport.context);
         assert(d.queue_phys == physical[0] && d.rx_phys == physical[1] && d.tx_phys == physical[2]);
         assert(d.queues == data[0] && d.rx_memory == data[1] && d.tx_memory == data[2]);
         assert(d.loaned == 1 && !memcmp(frame.data, "status-loan", 11));
     }
     reject_reset_from = 0;
-    assert(riscv_virtio_mmio_net_stop(&d) == -KERNEL_EBUSY && live == 3 && d.mmio);
+    assert(riscv_virtio_mmio_net_stop(&d) == -KERNEL_EBUSY && live == 3 && d.transport.context);
     assert(d.loaned == 1 && !memcmp(frame.data, "status-loan", 11));
     riscv_virtio_mmio_net_release(&d, frame.buffer); assert(!d.loaned); stop(&d);
     if (correct)
@@ -686,6 +687,11 @@ static void test_tx_segments(unsigned version)
     assert(d.statistics.tx_free_post_count == 1 && d.statistics.tx_free_post_ticks == 11 &&
            d.statistics.tx_free_post_max == 11);
 #endif
+    reject_reset_from = reset_calls + 1;
+    assert(virtio_net_quiesce(&d) == -KERNEL_EIO);
+    assert(released_count == 1 && d.tx_owner[0] == &owner);
+    reject_reset_from = 0;
+    assert(virtio_net_quiesce(&d) == 0);
     riscv_virtio_mmio_net_tx_release(&d, collect_owner, 1);
     assert(released_count == 2);
     riscv_virtio_mmio_net_tx_release(&d, collect_owner, 1);

@@ -11,7 +11,7 @@
 
 static unsigned queued, logged, disabled;
 uintptr_t riscv_interrupt_save(void) { disabled++; return 0; }
-int riscv_uart_tty_console(char character) { (void)character; queued++; return 1; }
+int ns16550_console(char character) { (void)character; queued++; return 1; }
 int kernel_log_putc(unsigned level, char character)
 { (void)level; (void)character; logged++; return 0; }
 #include "../../arch/riscv/virt_uart.c"

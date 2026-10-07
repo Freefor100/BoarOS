@@ -142,20 +142,30 @@ C_SOURCES := \
 	arch/riscv/context.c \
 	arch/riscv/direct_map.c \
 	arch/riscv/elf_image.c \
+	kernel/elf_image.c \
 	arch/riscv/exec.c \
+	kernel/exec_image.c \
 	arch/riscv/process.c \
 	arch/riscv/mm.c \
+	mm/mm.c \
 	arch/riscv/root_boot.c \
 	arch/riscv/sbi.c \
 	arch/riscv/sv39.c \
 	arch/riscv/timer.c \
 	arch/riscv/trap.c \
-	arch/riscv/uaccess.c \
+	mm/uaccess.c \
 	arch/riscv/virt_rtc.c \
 	arch/riscv/virt_uart.c \
 	arch/riscv/uart_tty.c \
+	drivers/serial/ns16550.c \
 	arch/riscv/virtio_mmio_block.c \
+	drivers/virtio/block.c \
+	drivers/virtio/transport.c \
+	drivers/virtio/split_queue.c \
+	drivers/virtio/mmio.c \
 	arch/riscv/virtio_mmio_rng.c \
+	drivers/virtio/rng.c \
+	drivers/virtio/net.c \
 	arch/riscv/virtio_mmio_net.c \
 	arch/riscv/plic.c \
 	fs/lwext4_port.c \
@@ -239,7 +249,8 @@ ASM_SOURCES := \
 	arch/riscv/boot.S \
 	arch/riscv/context_switch.S \
 	arch/riscv/fpu.S \
-	arch/riscv/trap_entry.S
+	arch/riscv/trap_entry.S \
+	arch/riscv/signal_trampoline.S
 ifeq ($(ROOT_DRAIN_FIXTURE),1)
 C_SOURCES += tests/riscv/root_drain_fixture.c
 LDFLAGS += -Wl,--wrap=kernel_vfs_unmount
@@ -252,19 +263,29 @@ TEST_RUNTIME_C_SOURCES := \
 	arch/riscv/context.c \
 	arch/riscv/direct_map.c \
 	arch/riscv/elf_image.c \
+	kernel/elf_image.c \
 	arch/riscv/exec.c \
+	kernel/exec_image.c \
 	arch/riscv/process.c \
 	arch/riscv/mm.c \
+	mm/mm.c \
 	arch/riscv/sbi.c \
 	arch/riscv/sv39.c \
 	arch/riscv/timer.c \
 	arch/riscv/trap.c \
-	arch/riscv/uaccess.c \
+	mm/uaccess.c \
 	arch/riscv/virt_rtc.c \
 	arch/riscv/virt_uart.c \
 	arch/riscv/uart_tty.c \
+	drivers/serial/ns16550.c \
 	arch/riscv/virtio_mmio_block.c \
+	drivers/virtio/block.c \
+	drivers/virtio/transport.c \
+	drivers/virtio/split_queue.c \
+	drivers/virtio/mmio.c \
 	arch/riscv/virtio_mmio_rng.c \
+	drivers/virtio/rng.c \
+	drivers/virtio/net.c \
 	arch/riscv/virtio_mmio_net.c \
 	arch/riscv/plic.c \
 	fs/files/table.c \
@@ -344,7 +365,8 @@ TEST_RUNTIME_ASM_SOURCES := \
 	arch/riscv/boot.S \
 	arch/riscv/context_switch.S \
 	arch/riscv/fpu.S \
-	arch/riscv/trap_entry.S
+	arch/riscv/trap_entry.S \
+	arch/riscv/signal_trampoline.S
 TEST_RUNTIME_OBJECTS := \
 	$(patsubst %.c,$(BUILD_DIR)/%.o,$(TEST_RUNTIME_C_SOURCES)) \
 	$(patsubst %.S,$(BUILD_DIR)/%.o,$(TEST_RUNTIME_ASM_SOURCES))
@@ -1628,9 +1650,13 @@ test-rng-riscv: $(KERNEL_RV) $(RNG_USER_RV)
 
 test-virtio-rng-host:
 	@mkdir -p build/host
-	cc -std=c11 -Wall -Wextra -Werror -Itests/host/random -Iinclude \
-		tests/host/virtio_rng_test.c arch/riscv/virtio_mmio_rng.c -o build/host/virtio-rng
+	cc -std=c11 -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=12 -Itests/host/random -Iinclude \
+		tests/host/virtio_rng_test.c arch/riscv/virtio_mmio_rng.c drivers/virtio/rng.c drivers/virtio/mmio.c drivers/virtio/transport.c drivers/virtio/split_queue.c -o build/host/virtio-rng
 	build/host/virtio-rng
+	build/host/virtio-rng --generic
+	cc -std=c11 -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=14 -Itests/host/random -Iinclude \
+		tests/host/virtio_rng_test.c arch/riscv/virtio_mmio_rng.c drivers/virtio/rng.c drivers/virtio/mmio.c drivers/virtio/transport.c drivers/virtio/split_queue.c -o build/host/virtio-rng-16k
+	build/host/virtio-rng-16k --generic
 
 .PHONY: test-sched-policy-host
 test-sched-policy-host:
@@ -1672,7 +1698,7 @@ test-cost-host:
 	build/cost/host/irq-test
 	cc -std=c11 -Wall -Wextra -Werror -Itests/host/random -idirafter include -DBOAROS_PAGE_SHIFT=12 -DBOAROS_COST_DIAGNOSTICS=1 tests/cost/page_test.c kernel/cost.c kernel/physical_page.c -o build/cost/host/page-test
 	build/cost/host/page-test
-	cc -std=c11 -Wall -Wextra -Werror -Itests/host/random -idirafter include -DBOAROS_PAGE_SHIFT=12 -DBOAROS_COST_DIAGNOSTICS=1 tests/memory/cost_test.c kernel/cost.c kernel/physical_page.c mm/heap.c arch/riscv/uaccess.c -o build/cost/host/memory-test
+	cc -std=c11 -Wall -Wextra -Werror -Itests/host/random -idirafter include -DBOAROS_PAGE_SHIFT=12 -DBOAROS_COST_DIAGNOSTICS=1 tests/memory/cost_test.c kernel/cost.c kernel/physical_page.c mm/heap.c mm/uaccess.c -o build/cost/host/memory-test
 	build/cost/host/memory-test
 	python3 -B tests/test-cost-report.py
 test-cost-riscv: test-cost-host
@@ -1692,7 +1718,7 @@ test-environment-riscv: $(KERNEL_RV)
 .PHONY: test-rtc-host
 test-rtc-host:
 	@mkdir -p build/host
-	cc -std=c11 -Wall -Wextra -Werror -Itests/host/random -idirafter include tests/host/rtc_device.c fs/rtc_device.c -o build/host/rtc-test
+	cc -std=c11 -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=12 -Itests/host/random -idirafter include tests/host/rtc_device.c fs/rtc_device.c -o build/host/rtc-test
 	build/host/rtc-test
 
 .PHONY: test-network-riscv
@@ -1823,3 +1849,21 @@ test-writeback-batch-riscv:
 .PHONY: test-readahead-riscv
 test-readahead-riscv:
 	python3 -B tests/readahead-riscv.py
+
+include arch/loongarch/build.mk
+
+.PHONY: test-virtio-block-host
+.PHONY: test-virtio-framework-host
+test-virtio-framework-host:
+	@mkdir -p build/host
+	cc -std=c11 -Wall -Wextra -Werror -Itests/host/random -Iinclude tests/host/virtio_framework.c drivers/virtio/transport.c drivers/virtio/split_queue.c -o build/host/virtio-framework
+	build/host/virtio-framework
+	cc -std=c11 -Wall -Wextra -Werror -Itests/host/random -Iinclude tests/host/virtio_adapters.c drivers/virtio/transport.c drivers/virtio/mmio.c drivers/virtio/pci.c kernel/pci.c -o build/host/virtio-adapters
+	build/host/virtio-adapters
+test-virtio-block-host:
+	python3 -B tests/host/virtio_block_diagnostics.py
+	HOST_ALTERNATE_TRANSPORT=1 python3 -B tests/host/virtio_block_diagnostics.py
+
+.PHONY: test-lwext4-dir-empty-host
+test-lwext4-dir-empty-host:
+	python3 -B tests/lwext4-dir-empty-host.py --sanitize

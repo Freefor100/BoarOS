@@ -3,8 +3,8 @@
 #include <kernel/cost.h>
 #include <kernel/heap.h>
 #include <kernel/sync.h>
-#include <arch/riscv/context.h>
-#include <arch/riscv/plic.h>
+#include <arch/context.h>
+#include <arch/platform_io.h>
 #include <kernel/errno.h>
 #include <kernel/page.h>
 #include <kernel/page_cache.h>
@@ -656,9 +656,9 @@ void kernel_page_cache_alias_mark_dirty(struct kernel_page_cache_alias *alias)
     entry = alias->entry;
     end = entry_valid_bytes(entry);
     if (end == 0) __builtin_trap();
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     dirty_mark(entry, 0, end);
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     pressure_notify(entry->cache);
 }
 
@@ -688,7 +688,7 @@ enum kernel_page_cache_status kernel_page_cache_lookup(
     if (status != KERNEL_PAGE_CACHE_STATUS_OK) {
         return status;
     }
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     entry->users++;
     while (entry->loading) {
         enum kernel_wait_wake_reason reason;
@@ -699,10 +699,10 @@ enum kernel_page_cache_status kernel_page_cache_lookup(
     entry->users--;
     if (status != KERNEL_PAGE_CACHE_STATUS_OK) {
         if (!entry->users) { remove_entry(cache, entry); uint64_t released = 0; (void)drain_entries(cache, &released); }
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
         return status;
     }
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     if (physical_page_acquire(cache->allocator,
                               entry->physical_address) !=
         PHYSICAL_PAGE_STATUS_OK) {
@@ -811,7 +811,7 @@ static void readahead_cancel_node(struct kernel_page_cache *cache, struct kernel
 void kernel_page_cache_cancel_readahead(struct kernel_page_cache *cache, uint64_t cookie)
 {
     if (!cache_live(cache) || !cookie) return;
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     struct kernel_page_cache_record *r = cache->record;
     for (unsigned i = 0; i < 8; i++) {
         struct readahead_job *job = &r->readahead_jobs[i];
@@ -819,19 +819,19 @@ void kernel_page_cache_cancel_readahead(struct kernel_page_cache *cache, uint64_
         job->cancelled = 1;
         if (!job->active) readahead_drop(r, job);
     }
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
 }
 
 uint64_t kernel_page_cache_readahead(struct kernel_page_cache *cache,
     struct kernel_vfs_node *node, uint64_t first, uint64_t cookie)
 {
     if (!cache_live(cache) || !node || first > UINT64_MAX >> BOAROS_PAGE_SHIFT) return 0;
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     struct kernel_page_cache_record *r = cache->record;
     if (!r->readahead_started || r->stopping || physical_page_available(cache->allocator) <= r->low ||
         (first << BOAROS_PAGE_SHIFT) >= kernel_vfs_node_size(node)) {
         kernel_page_cache_cancel_readahead(cache, cookie);
-        riscv_interrupt_restore(irq); return 0;
+        arch_interrupt_restore(irq); return 0;
     }
     struct readahead_job *available = 0;
     for (unsigned i = 0; i < 8; i++) {
@@ -839,17 +839,17 @@ uint64_t kernel_page_cache_readahead(struct kernel_page_cache *cache,
         if (!job->node) { if (!available) available = job; continue; }
         if (cookie && job->cookie == cookie && job->node == node && !job->cancelled) {
             if (!job->active) job->first = first;
-            riscv_interrupt_restore(irq); return cookie;
+            arch_interrupt_restore(irq); return cookie;
         }
     }
-    if (!available) { riscv_interrupt_restore(irq); return 0; }
+    if (!available) { arch_interrupt_restore(irq); return 0; }
     if (kernel_vfs_node_acquire(node)) __builtin_trap();
     if (!++r->readahead_cookie) __builtin_trap();
     *available = (struct readahead_job){.node = node, .first = first, .cookie = r->readahead_cookie};
     r->statistics.readahead_queued++;
     if (r->readahead_work.head) (void)kernel_wait_queue_wake_all(&r->readahead_work);
     cookie = available->cookie;
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     return cookie;
 }
 
@@ -925,7 +925,7 @@ static void readahead_worker(void *argument)
 {
     struct kernel_page_cache *cache = argument;
     struct kernel_page_cache_record *r = cache->record;
-    (void)riscv_interrupt_save();
+    (void)arch_interrupt_save();
     for (;;) {
         struct readahead_job *next = 0;
         for (unsigned i = 0; i < 8; i++) {
@@ -942,7 +942,7 @@ static void readahead_worker(void *argument)
         readahead_load(cache, next);
         next->active = 0; readahead_drop(r, next);
         /* 一批最多八页；只在完整后端调用返回后让出，不截断内部 I/O。 */
-        riscv_interrupt_restore(RISCV_SSTATUS_SIE); (void)riscv_interrupt_save();
+        arch_interrupt_restore(ARCH_INTERRUPT_ENABLE_MASK); (void)arch_interrupt_save();
         if (kernel_scheduler_yield_current() != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
     }
 }
@@ -994,7 +994,7 @@ static enum kernel_page_cache_status get_page(
     if (!created) return kernel_page_cache_lookup(cache, file, page_index, physical_address, valid_bytes);
     int read_error = 0;
     if (!overwrite) read_error = kernel_vfs_node_pread(node, offset, page, BOAROS_PAGE_SIZE, &bytes_read);
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     if (overwrite) {
         uint64_t old_size = kernel_vfs_node_size(node);
         if (offset + BOAROS_PAGE_SIZE > old_size)
@@ -1015,12 +1015,12 @@ static enum kernel_page_cache_status get_page(
     if (read_error) {
         enum kernel_page_cache_status failed = entry->load_error;
         if (!entry->users) { remove_entry(cache, entry); uint64_t released = 0; (void)drain_entries(cache, &released); }
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
         return failed;
     }
     if (physical_page_acquire(cache->allocator, entry->physical_address) != PHYSICAL_PAGE_STATUS_OK)
         __builtin_trap();
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     *physical_address = entry->physical_address;
     *valid_bytes = entry_valid_bytes(entry);
     return KERNEL_PAGE_CACHE_STATUS_OK;
@@ -1062,7 +1062,7 @@ int kernel_page_cache_write(struct kernel_page_cache *cache,
                 KERNEL_PAGE_CACHE_STATUS_OK ||
             physical_page_resolve(cache->allocator, address, &page) !=
                 PHYSICAL_PAGE_STATUS_OK) __builtin_trap();
-        uintptr_t irq = riscv_interrupt_save();
+        uintptr_t irq = arch_interrupt_save();
         if (!overwritten) {
             uint64_t old_size = kernel_vfs_node_size(entry->node);
             if (offset + count > old_size)
@@ -1074,7 +1074,7 @@ int kernel_page_cache_write(struct kernel_page_cache *cache,
         offset += count;
         *written += count;
         kernel_vfs_node_written(entry->node, offset);
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
         (void)physical_page_release(cache->allocator, address);
         pressure_notify(cache);
     }
@@ -1088,13 +1088,13 @@ static int writeback_entry(struct kernel_page_cache *cache,
     size_t written = 0, begin, end;
     uint64_t generation;
     int result;
-    uintptr_t wait_irq = riscv_interrupt_save();
+    uintptr_t wait_irq = arch_interrupt_save();
     while (entry->writeback) {
         enum kernel_wait_wake_reason reason;
         if (kernel_scheduler_block_current(&entry->ready, 0, 0, &reason) != KERNEL_SCHEDULER_STATUS_OK)
             __builtin_trap();
     }
-    riscv_interrupt_restore(wait_irq);
+    arch_interrupt_restore(wait_irq);
     if (entry->dirty_end == 0) return 0;
     uint64_t start = entry->page_index << BOAROS_PAGE_SHIFT;
     if (limit <= start || limit - start <= entry->dirty_begin) return 0;
@@ -1121,14 +1121,14 @@ static int writeback_entry(struct kernel_page_cache *cache,
         if (allocated != PHYSICAL_PAGE_STATUS_EMPTY) __builtin_trap();
         (void)physical_page_release(cache->allocator, entry->physical_address);
         entry->writeback = 0; cache->record->writeback_active--;
-        uintptr_t irq = riscv_interrupt_save();
+        uintptr_t irq = arch_interrupt_save();
         if (entry->ready.head) (void)kernel_wait_queue_wake_all(&entry->ready);
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
         return -KERNEL_ENOMEM;
     }
     if (physical_page_resolve(cache->allocator, snapshot_address, &snapshot) != PHYSICAL_PAGE_STATUS_OK)
         __builtin_trap();
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     for (struct kernel_page_cache_alias *alias = entry->aliases; alias; alias = alias->next)
         alias->rearm(alias->owner, alias->virtual_address);
     begin = entry->dirty_begin;
@@ -1138,7 +1138,7 @@ static int writeback_entry(struct kernel_page_cache *cache,
     COST_ADD(SNAPSHOT_COPY, end - begin);
     COST_ADD(WRITEBACK_REQUESTED, end - begin);
     memcpy((unsigned char *)snapshot + begin, (unsigned char *)page + begin, end - begin);
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     result = kernel_vfs_node_writeback(entry->node,
                     (entry->page_index << BOAROS_PAGE_SHIFT) + begin,
                     (unsigned char *)snapshot + begin, end - begin, &written);
@@ -1147,19 +1147,19 @@ static int writeback_entry(struct kernel_page_cache *cache,
     COST_ADD(WRITEBACK_ACCEPTED, written);
     if (written > end - begin) __builtin_trap();
     if (result == 0 && written != end - begin) result = -KERNEL_EIO;
-    irq = riscv_interrupt_save();
+    irq = arch_interrupt_save();
     if (result == 0 && generation == entry->generation) {
         if (end == entry->dirty_end) dirty_clear(entry);
         else entry->dirty_begin = end;
     }
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     (void)physical_page_release(cache->allocator, entry->physical_address);
     entry->writeback_error = result;
     entry->writeback = 0;
     cache->record->writeback_active--;
-    irq = riscv_interrupt_save();
+    irq = arch_interrupt_save();
     if (entry->ready.head) (void)kernel_wait_queue_wake_all(&entry->ready);
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     return result;
 }
 
@@ -1211,14 +1211,14 @@ static int writeback_run(struct kernel_page_cache *cache,
     }
     void *snapshot;
     if (physical_page_resolve(cache->allocator, snapshot_address, &snapshot) != PHYSICAL_PAGE_STATUS_OK) __builtin_trap();
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     /* 分配可触发回收；重新检查成员，不能把已完成的页误当成本次 owner。 */
     size_t ready = 1;
     if (entries[0]->writeback || entries[0]->loading || !entries[0]->dirty_end ||
         !kernel_vfs_node_writeback_allowed(entries[0]->node)) ready = 0;
     while (ready && ready < count && writeback_adjacent(entries[ready - 1], entries[ready], limit)) ready++;
     if (ready < 2) {
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
         if (reserved) record->snapshot_busy = 0;
         else if (physical_page_release_order(cache->allocator, snapshot_address, order) != PHYSICAL_PAGE_STATUS_OK) __builtin_trap();
         return writeback_entry(cache, entries[0], limit);
@@ -1245,13 +1245,13 @@ static int writeback_run(struct kernel_page_cache *cache,
         size += length;
     }
     COST_ADD(WRITEBACK_REQUESTED, size);
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     size_t written = 0;
     int result = kernel_vfs_node_writeback(entries[0]->node, offset, snapshot, size, &written);
     COST_ADD(WRITEBACK_ACCEPTED, written);
     if (written > size) __builtin_trap();
     if (!result && written != size) result = -KERNEL_EIO;
-    irq = riscv_interrupt_save();
+    irq = arch_interrupt_save();
     for (size_t i = 0; i < count; i++) {
         struct kernel_page_cache_entry *entry = entries[i];
         if (!result && saved[i].generation == entry->generation) {
@@ -1265,7 +1265,7 @@ static int writeback_run(struct kernel_page_cache *cache,
     }
     if (reserved) record->snapshot_busy = 0;
     else if (physical_page_release_order(cache->allocator, snapshot_address, order) != PHYSICAL_PAGE_STATUS_OK) __builtin_trap();
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     *used = count;
     return result;
 }
@@ -1288,18 +1288,18 @@ int kernel_page_cache_writeback_range(struct kernel_page_cache *cache,
     uint64_t first = start >> BOAROS_PAGE_SHIFT, last = (end - 1) >> BOAROS_PAGE_SHIFT;
     uint64_t pages = last - first + 1;
     /* 分配与捕获之间不能睡眠或被共享映射写者插入新脏页；失败返回真实ENOMEM。 */
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     {
         KERNEL_NO_RECLAIM_IO;
         struct kernel_page_cache_dirty *dirty = kernel_vfs_node_dirty_pages(node);
         size_t capacity = pages < dirty->count ? (size_t)pages : dirty->count;
-        if (!capacity) { riscv_interrupt_restore(irq); return 0; }
-        if (capacity > SIZE_MAX / sizeof(*selected)) { riscv_interrupt_restore(irq); return -KERNEL_ENOMEM; }
+        if (!capacity) { arch_interrupt_restore(irq); return 0; }
+        if (capacity > SIZE_MAX / sizeof(*selected)) { arch_interrupt_restore(irq); return -KERNEL_ENOMEM; }
         enum kernel_heap_status allocated = kernel_heap_allocate(cache->heap,
             capacity * sizeof(*selected), (void **)&selected);
         if (allocated != KERNEL_HEAP_STATUS_OK) {
             if (allocated != KERNEL_HEAP_STATUS_EMPTY) __builtin_trap();
-            riscv_interrupt_restore(irq); return -KERNEL_ENOMEM;
+            arch_interrupt_restore(irq); return -KERNEL_ENOMEM;
         }
         if (pages <= dirty->count) {
             for (uint64_t index = first; index <= last; index++) {
@@ -1319,7 +1319,7 @@ int kernel_page_cache_writeback_range(struct kernel_page_cache *cache,
         for (size_t i = 0; i < count; i++)
             if (physical_page_acquire(cache->allocator, selected[i]->physical_address) != PHYSICAL_PAGE_STATUS_OK) __builtin_trap();
     }
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     /* 在首次I/O等待前固定选中集合；排序不再沿可被别的读者扩展的inode链。 */
     qsort(selected, count, sizeof(*selected), page_offset_compare);
     int result = 0;
@@ -1460,7 +1460,7 @@ static void group_notify(void *context)
 {
     struct page_cache_group *g = context;
     if (kernel_io_context_current()->background_reclaim) return;
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     uint64_t dirty = group_dirty(g);
     for (struct kernel_page_cache_record *r = g->head; r; r = r->next) {
         if (!r->started || r->stopping) continue;
@@ -1469,7 +1469,7 @@ static void group_notify(void *context)
         r->requested = 1;
         if (r->work.head) (void)kernel_wait_queue_wake_all(&r->work);
     }
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
 }
 
 static void pressure_notify(void *context)
@@ -1483,8 +1483,8 @@ static void pressure_wait(void *context)
     struct page_cache_group *g = context;
     struct kernel_io_context *io = kernel_io_context_current();
     if (io->locks || io->allocation_depth || io->backend_depth || io->reclaim_depth ||
-        io->background_reclaim || !kernel_scheduler_can_sleep() || riscv_plic_in_interrupt()) return;
-    uintptr_t irq = riscv_interrupt_save();
+        io->background_reclaim || !kernel_scheduler_can_sleep() || arch_external_interrupt_active()) return;
+    uintptr_t irq = arch_interrupt_save();
     /* 等待者持有组而非实例；最后一个实例卸载后仍可安全离开队列。 */
     g->refs++;
     uint64_t progressed = g->progressed;
@@ -1505,14 +1505,14 @@ static void pressure_wait(void *context)
             __builtin_trap();
     }
     group_put(g);
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
 }
 
 static void page_cache_worker(void *argument)
 {
     struct kernel_page_cache *cache = argument;
     struct kernel_page_cache_record *r = cache->record;
-    (void)riscv_interrupt_save();
+    (void)arch_interrupt_save();
     struct kernel_io_context *io = kernel_io_context_current();
     io->background_reclaim = 1;
     for (;;) {
@@ -1659,7 +1659,7 @@ void kernel_page_cache_stop_worker(struct kernel_page_cache *cache)
 {
     if (!cache_live(cache) || !cache->record->started) return;
     struct kernel_page_cache_record *r = cache->record;
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     r->stopping = 1;
 #if BOAROS_PAGE_CACHE_READAHEAD_PAGES
     readahead_cancel_node(cache, 0);
@@ -1674,7 +1674,7 @@ void kernel_page_cache_stop_worker(struct kernel_page_cache *cache)
     kernel_thread_join(&r->worker);
     if (physical_page_release_order(cache->allocator, r->snapshot_address, r->snapshot_order) != PHYSICAL_PAGE_STATUS_OK) __builtin_trap();
     r->started = 0;
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
 }
 
 enum kernel_page_cache_status kernel_page_cache_purge_mount(

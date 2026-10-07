@@ -2,7 +2,7 @@
 #include "vfs_objects.h"
 #include "uaccess_iov_internal.h"
 
-#include <arch/riscv/context.h>
+#include <arch/context.h>
 #include <kernel/errno.h>
 #include <kernel/files.h>
 #include <kernel/heap.h>
@@ -38,33 +38,33 @@ static struct kernel_vfs_timespec pipe_now(void)
 int kernel_pipe_stat(const struct kernel_pipe *pipe, struct kernel_vfs_stat *stat)
 {
     if (!pipe || !stat) return -KERNEL_EINVAL;
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     *stat = (struct kernel_vfs_stat){.ino=pipe->proc_identity, .mode=pipe->mode,
         .nlink=1, .blksize=BOAROS_PAGE_SIZE, .uid=pipe->uid, .gid=pipe->gid,
         .atime=pipe->atime, .mtime=pipe->mtime, .ctime=pipe->ctime};
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     return 0;
 }
 int kernel_pipe_set_mode(struct kernel_pipe *pipe, uint32_t mode)
 {
     if (!pipe) return -KERNEL_EINVAL;
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     /* 共享端点只改权限；访问方向仍由每个OFD拥有。 */
     pipe->mode = KERNEL_VFS_S_IFIFO | (mode & 07777U);
     pipe->ctime = pipe_now();
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     return 0;
 }
 
 int kernel_pipe_set_owner(struct kernel_pipe *pipe, uint32_t uid, uint32_t gid)
 {
     if (!pipe) return -KERNEL_EINVAL;
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     if (uid != UINT32_MAX) pipe->uid = uid;
     if (gid != UINT32_MAX) pipe->gid = gid;
     pipe->mode = kernel_vfs_chown_mode(pipe->mode);
     pipe->ctime = pipe_now();
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     return 0;
 }
 
@@ -136,10 +136,10 @@ enum kernel_pipe_status kernel_pipe_create(
     kernel_wait_queue_init(&pipe->write_queue);
     kernel_wait_queue_init(&pipe->both_queue);
     kernel_mutex_init(&pipe->copy_lock, 15U, (uintptr_t)pipe);
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     if (!next_pipe_proc_identity) __builtin_trap();
     pipe->proc_identity = next_pipe_proc_identity++;
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     *owner = pipe;
     return KERNEL_PIPE_STATUS_OK;
 }
@@ -153,7 +153,7 @@ enum kernel_pipe_status kernel_pipe_acquire_endpoint(
         endpoint > KERNEL_PIPE_ENDPOINT_BOTH) {
         return KERNEL_PIPE_STATUS_INVALID_ARGUMENT;
     }
-    uintptr_t saved = riscv_interrupt_save();
+    uintptr_t saved = arch_interrupt_save();
     if (pipe->owners == UINT32_MAX ||
         ((endpoint & KERNEL_PIPE_ENDPOINT_READ) && pipe->readers == UINT32_MAX) ||
         ((endpoint & KERNEL_PIPE_ENDPOINT_WRITE) && pipe->writers == UINT32_MAX))
@@ -164,7 +164,7 @@ enum kernel_pipe_status kernel_pipe_acquire_endpoint(
     (void)kernel_wait_queue_wake_all(&pipe->read_queue);
     (void)kernel_wait_queue_wake_all(&pipe->write_queue);
     (void)kernel_wait_queue_wake_all(&pipe->both_queue);
-    riscv_interrupt_restore(saved);
+    arch_interrupt_restore(saved);
     return KERNEL_PIPE_STATUS_OK;
 }
 
@@ -178,9 +178,9 @@ enum kernel_pipe_status kernel_pipe_destroy_unowned(
         pipe->writers != 0U || pipe->owners != 0U) {
         return KERNEL_PIPE_STATUS_INVALID_ARGUMENT;
     }
-    saved = riscv_interrupt_save();
+    saved = arch_interrupt_save();
     status = pipe_destroy(pipe);
-    riscv_interrupt_restore(saved);
+    arch_interrupt_restore(saved);
     return status;
 }
 
@@ -196,12 +196,12 @@ enum kernel_pipe_status kernel_pipe_release_endpoint(
         endpoint > KERNEL_PIPE_ENDPOINT_BOTH) {
         return KERNEL_PIPE_STATUS_INVALID_ARGUMENT;
     }
-    saved = riscv_interrupt_save();
+    saved = arch_interrupt_save();
     if (((endpoint & KERNEL_PIPE_ENDPOINT_READ) &&
          pipe->readers == 0U) ||
         ((endpoint & KERNEL_PIPE_ENDPOINT_WRITE) &&
          pipe->writers == 0U)) {
-        riscv_interrupt_restore(saved);
+        arch_interrupt_restore(saved);
         return KERNEL_PIPE_STATUS_STATE;
     }
     if (endpoint & KERNEL_PIPE_ENDPOINT_READ) pipe->readers--;
@@ -220,7 +220,7 @@ enum kernel_pipe_status kernel_pipe_release_endpoint(
     } else {
         status = KERNEL_PIPE_STATUS_OK;
     }
-    riscv_interrupt_restore(saved);
+    arch_interrupt_restore(saved);
     return status;
 }
 
@@ -230,15 +230,15 @@ int kernel_pipe_fifo_open(struct kernel_heap *heap, struct kernel_vfs_node *node
     uint64_t *observed_writers)
 {
     struct kernel_pipe *candidate = 0, *pipe;
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     pipe = node->fifo_pipe;
     if (pipe) { if (pipe->owners == UINT32_MAX) __builtin_trap(); pipe->owners++; }
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     if (!pipe) {
         enum kernel_pipe_status status = kernel_pipe_create(heap, &candidate);
         if (status != KERNEL_PIPE_STATUS_OK)
             return status == KERNEL_PIPE_STATUS_NO_MEMORY ? -KERNEL_ENOMEM : -KERNEL_EIO;
-        irq = riscv_interrupt_save();
+        irq = arch_interrupt_save();
         pipe = node->fifo_pipe;
         if (!pipe) {
             pipe = candidate; candidate = 0;
@@ -246,10 +246,10 @@ int kernel_pipe_fifo_open(struct kernel_heap *heap, struct kernel_vfs_node *node
         }
         if (pipe->owners == UINT32_MAX) __builtin_trap();
         pipe->owners++;
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
         if (candidate) (void)kernel_pipe_destroy_unowned(candidate);
     }
-    irq = riscv_interrupt_save();
+    irq = arch_interrupt_save();
     uint8_t direction = (flags & 3U) == 0 ? KERNEL_PIPE_ENDPOINT_READ :
         (flags & 3U) == 1 ? KERNEL_PIPE_ENDPOINT_WRITE : KERNEL_PIPE_ENDPOINT_BOTH;
     int result = 0;
@@ -295,7 +295,7 @@ int kernel_pipe_fifo_open(struct kernel_heap *heap, struct kernel_vfs_node *node
         (void)pipe_destroy(pipe);
     }
     if (!result) { *owner = pipe; *endpoint = direction; }
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     return result;
 }
 
@@ -370,20 +370,20 @@ enum kernel_pipe_status kernel_pipe_readv(
         *linux_result = 0;
         return KERNEL_PIPE_STATUS_OK;
     }
-    saved = riscv_interrupt_save();
+    saved = arch_interrupt_save();
     KERNEL_LOCK_SCOPE(copy_guard);
     kernel_mutex_lock(&pipe->copy_lock, &copy_guard);
     requested = count < pipe->bytes ? count : pipe->bytes;
     while (requested == 0U) {
         if (pipe->writers == 0U) {
             kernel_lock_scope_release(&copy_guard);
-            riscv_interrupt_restore(saved);
+            arch_interrupt_restore(saved);
             *linux_result = 0;
             return KERNEL_PIPE_STATUS_OK;
         }
         if ((open_flags & KERNEL_PIPE_NONBLOCK) != 0U) {
             kernel_lock_scope_release(&copy_guard);
-            riscv_interrupt_restore(saved);
+            arch_interrupt_restore(saved);
             *linux_result = -KERNEL_EAGAIN;
             return KERNEL_PIPE_STATUS_OK;
         }
@@ -395,13 +395,13 @@ enum kernel_pipe_status kernel_pipe_readv(
                                                            &wake_reason);
         if (scheduler_status != KERNEL_SCHEDULER_STATUS_OK) {
             kernel_lock_scope_release(&copy_guard);
-            riscv_interrupt_restore(saved);
+            arch_interrupt_restore(saved);
             return KERNEL_PIPE_STATUS_STATE;
         }
         if (wake_reason == KERNEL_WAIT_SIGNALLED) {
             kernel_signal_note_syscall_restart(kernel_task_current());
             kernel_lock_scope_release(&copy_guard);
-            riscv_interrupt_restore(saved);
+            arch_interrupt_restore(saved);
             *linux_result = -KERNEL_ERESTARTSYS;
             return KERNEL_PIPE_STATUS_OK;
         }
@@ -419,7 +419,7 @@ enum kernel_pipe_status kernel_pipe_readv(
 
         if (pipe->slots == 0U || pipe->page_length[slot] == 0U) {
             kernel_lock_scope_release(&copy_guard);
-            riscv_interrupt_restore(saved);
+            arch_interrupt_restore(saved);
             return KERNEL_PIPE_STATUS_STATE;
         }
         if (chunk64 > pipe->page_length[slot]) {
@@ -436,7 +436,7 @@ enum kernel_pipe_status kernel_pipe_readv(
             part_copied != chunk) {
             if (part_status != KERNEL_UACCESS_STATUS_FAULT) {
                 kernel_lock_scope_release(&copy_guard);
-                riscv_interrupt_restore(saved);
+                arch_interrupt_restore(saved);
                 return KERNEL_PIPE_STATUS_STATE;
             }
             fault = 1;
@@ -450,7 +450,7 @@ enum kernel_pipe_status kernel_pipe_readv(
         (void)kernel_wait_queue_wake_all(&pipe->both_queue);
     }
     kernel_lock_scope_release(&copy_guard);
-    riscv_interrupt_restore(saved);
+    arch_interrupt_restore(saved);
     if (committed == 0U && fault) {
         *linux_result = -KERNEL_EFAULT;
     } else {
@@ -502,7 +502,7 @@ static enum kernel_pipe_status pipe_write_source(
         *linux_result = 0;
         return KERNEL_PIPE_STATUS_OK;
     }
-    saved = riscv_interrupt_save();
+    saved = arch_interrupt_save();
     KERNEL_LOCK_SCOPE(copy_guard);
     kernel_mutex_lock(&pipe->copy_lock, &copy_guard);
     while (total < count) {
@@ -526,13 +526,13 @@ static enum kernel_pipe_status pipe_write_source(
                 *linux_result = (int64_t)total;
             }
             kernel_lock_scope_release(&copy_guard);
-            riscv_interrupt_restore(saved);
+            arch_interrupt_restore(saved);
             return status;
         }
         if (!merging && free_slots == 0U) {
             if ((open_flags & KERNEL_PIPE_NONBLOCK) != 0U) {
                 kernel_lock_scope_release(&copy_guard);
-                riscv_interrupt_restore(saved);
+                arch_interrupt_restore(saved);
                 *linux_result = total != 0U ? (int64_t)total : -KERNEL_EAGAIN;
                 return KERNEL_PIPE_STATUS_OK;
             }
@@ -545,7 +545,7 @@ static enum kernel_pipe_status pipe_write_source(
                 &wake_reason);
             if (scheduler_status != KERNEL_SCHEDULER_STATUS_OK) {
                 kernel_lock_scope_release(&copy_guard);
-                riscv_interrupt_restore(saved);
+                arch_interrupt_restore(saved);
                 return KERNEL_PIPE_STATUS_STATE;
             }
             if (wake_reason == KERNEL_WAIT_SIGNALLED) {
@@ -556,7 +556,7 @@ static enum kernel_pipe_status pipe_write_source(
                     *linux_result = (int64_t)total;
                 }
                 kernel_lock_scope_release(&copy_guard);
-                riscv_interrupt_restore(saved);
+                arch_interrupt_restore(saved);
                 return KERNEL_PIPE_STATUS_OK;
             }
             kernel_mutex_lock(&pipe->copy_lock, &copy_guard);
@@ -589,7 +589,7 @@ static enum kernel_pipe_status pipe_write_source(
         }
         if (access_status != KERNEL_UACCESS_STATUS_OK || copied != chunk) {
             kernel_lock_scope_release(&copy_guard);
-            riscv_interrupt_restore(saved);
+            arch_interrupt_restore(saved);
             if (access_status != KERNEL_UACCESS_STATUS_FAULT) {
                 return KERNEL_PIPE_STATUS_STATE;
             }
@@ -612,7 +612,7 @@ static enum kernel_pipe_status pipe_write_source(
         (void)kernel_wait_queue_wake_all(&pipe->both_queue);
     }
     kernel_lock_scope_release(&copy_guard);
-    riscv_interrupt_restore(saved);
+    arch_interrupt_restore(saved);
     *linux_result = (int64_t)total;
     return KERNEL_PIPE_STATUS_OK;
 }

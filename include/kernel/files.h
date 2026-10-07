@@ -378,6 +378,11 @@ enum kernel_files_status kernel_files_fstat(
     int64_t *linux_result);
 
 /* newfstatat: AT_FDCWD or absolute paths, plus AT_EMPTY_PATH on a fd. */
+/* Fixed 256-byte Linux statx ABI; only available BASIC_STATS are reported. */
+enum kernel_files_status kernel_files_statx(struct kernel_files *,
+    const struct kernel_fs_context *,struct kernel_mm *,int64_t,
+    uint64_t,uint64_t,uint32_t,uint64_t,int64_t *);
+
 enum kernel_files_status kernel_files_fstatat(
     struct kernel_files *files,
     const struct kernel_fs_context *fs,

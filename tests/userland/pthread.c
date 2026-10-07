@@ -56,6 +56,8 @@ struct futex_signal_case {
     long timeout_nanoseconds;
     int result;
     int error;
+    int hold_exit;
+    volatile int release_exit;
 };
 
 static void *futex_signal_waiter(void *opaque)
@@ -72,6 +74,7 @@ static void *futex_signal_waiter(void *opaque)
                                 FUTEX_WAIT_PRIVATE, 0,
                                 test->timed ? &timeout : 0, 0, 0);
     test->error = errno;
+    while (test->hold_exit && !test->release_exit) sched_yield();
     return 0;
 }
 
@@ -149,7 +152,7 @@ static int run_futex_signal_case(int restart, int timed, int change_word,
 static int check_futex_wake_signal_boundary(void)
 {
     struct sigaction action = {0};
-    struct futex_signal_case test = {0};
+    struct futex_signal_case test = {.hold_exit = 1};
     struct timespec settle = { .tv_sec = 0, .tv_nsec = 20000000L };
     pthread_t thread;
     void *thread_result = 0;
@@ -171,7 +174,11 @@ static int check_futex_wake_signal_boundary(void)
      * delivered, and must not turn the successful wait into a retry. */
     test.word = 1;
     if (syscall(SYS_futex, &test.word, FUTEX_WAKE_PRIVATE, 1, 0, 0, 0) != 1 ||
-        pthread_kill(thread, SIGUSR1) != 0 ||
+        pthread_kill(thread, SIGUSR1) != 0 || wait_for_futex_signal() != 0)
+        return 4;
+    /* 保持目标存活直到信号交付；WAKE 后目标可先运行，不能假设两 syscall 原子。 */
+    test.release_exit = 1;
+    if (
         pthread_join(thread, &thread_result) != 0 || thread_result != 0 ||
         test.result != 0 || wait_for_futex_signal() != 0) return 4;
     futex_signal_word = 0;
@@ -1364,11 +1371,16 @@ static int check_robust_remote_query(void)
         return 3;
     probe.go = 1;
     if (pthread_join(thread, 0) != 0) return 4;
-    errno = 0;
-    if (syscall(SYS_get_robust_list, probe.tid,
-                &observed, &length) != -1 || errno != ESRCH)
-        return 5;
-    return 0;
+    /* musl join 等待 clear-child-tid；Linux 可在唤醒后才摘除 task 的 PID。
+     * 等待这条真实生命周期边界，不能把 join 当作 PID 消失的保证。 */
+    for (int tries = 0; tries < 10000; tries++) {
+        errno = 0;
+        long result = syscall(SYS_get_robust_list, probe.tid, &observed, &length);
+        if (result == -1 && errno == ESRCH) return 0;
+        if (result != 0) return 5;
+        sched_yield();
+    }
+    return 5;
 }
 
 static void *robust_mutex_owner(void *opaque)
@@ -1443,6 +1455,8 @@ static int check_unix_datagram_wait(void)
     static unsigned char bytes[65536];
     int pair[2]; pthread_t writer;
     if (socketpair(AF_UNIX, SOCK_DGRAM, 0, pair)) return 1;
+    int budget=32776;
+    if (setsockopt(pair[0],SOL_SOCKET,SO_SNDBUF,&budget,sizeof(budget))) return 11;
     unix_dgram_fd = pair[0];
     if (write(pair[0], bytes, 65520) != 65520) return 2;
     unix_dgram_started = unix_dgram_finished = 0;
@@ -1452,7 +1466,7 @@ static int check_unix_datagram_wait(void)
     if (unix_dgram_finished) return 4;
     if (read(pair[1], bytes, 1) != 1 || pthread_join(writer, 0) || unix_dgram_result != 32 ||
         read(pair[1], bytes, sizeof(bytes)) != 32 || bytes[0] != 0x7b) return 5;
-    if (write(pair[0], bytes, sizeof(bytes)) != sizeof(bytes)) return 6;
+    if (write(pair[0], bytes, 65520) != 65520) return 6;
     unix_dgram_started = unix_dgram_finished = 0;
     if (pthread_create(&writer, 0, unix_dgram_sender, 0)) return 7;
     while (!unix_dgram_started) sched_yield();

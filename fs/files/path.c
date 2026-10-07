@@ -633,17 +633,45 @@ static int fill_linux_stat(
     return 0;
 }
 
+struct linux_statx_timestamp { int64_t seconds; uint32_t nanoseconds; int32_t reserved; };
+struct linux_statx {
+    uint32_t mask,blksize; uint64_t attributes;
+    uint32_t nlink,uid,gid; uint16_t mode,pad;
+    uint64_t ino,size,blocks,attributes_mask;
+    struct linux_statx_timestamp atime,btime,ctime,mtime;
+    uint32_t rdev_major,rdev_minor,dev_major,dev_minor;
+    uint64_t spare[14];
+};
+_Static_assert(sizeof(struct linux_statx)==256,"Linux statx ABI size");
+static uint32_t device_major(uint64_t device)
+{ return ((device>>8)&0xfff)|((device>>32)&0xfffff000); }
+static uint32_t device_minor(uint64_t device)
+{ return (device&0xff)|((device>>12)&0xffffff00); }
 static int copy_stat_to_user(struct kernel_mm *mm,
                              uint64_t user_buffer,
                              const struct kernel_linux_stat *stat,
-                             int64_t *linux_result)
+                             int64_t *linux_result, int extended)
 {
+    struct linux_statx statx={0};
+    const void *bytes=stat;size_t size=sizeof(*stat);
+    if(extended) {
+        /* 本地 inode 提供 BASIC_STATS；未实现 birthtime/属性等位保持未报告。 */
+        statx.mask=0x7ff;statx.blksize=stat->st_blksize;
+        statx.nlink=stat->st_nlink;statx.uid=stat->st_uid;statx.gid=stat->st_gid;
+        statx.mode=stat->st_mode;statx.ino=stat->st_ino;statx.size=stat->st_size;statx.blocks=stat->st_blocks;
+        statx.atime=(struct linux_statx_timestamp){stat->st_atime,stat->st_atime_nsec,0};
+        statx.mtime=(struct linux_statx_timestamp){stat->st_mtime,stat->st_mtime_nsec,0};
+        statx.ctime=(struct linux_statx_timestamp){stat->st_ctime,stat->st_ctime_nsec,0};
+        statx.dev_major=device_major(stat->st_dev);statx.dev_minor=device_minor(stat->st_dev);
+        statx.rdev_major=device_major(stat->st_rdev);statx.rdev_minor=device_minor(stat->st_rdev);
+        bytes=&statx;size=sizeof(statx);
+    }
     size_t copied = 0U;
     enum kernel_uaccess_status access_status =
         kernel_copy_to_user(mm,
                             user_buffer,
-                            stat,
-                            sizeof(*stat),
+                            bytes,
+                            size,
                             &copied);
 
     if (access_status == KERNEL_UACCESS_STATUS_FAULT) {
@@ -651,7 +679,7 @@ static int copy_stat_to_user(struct kernel_mm *mm,
         return 0;
     }
     return access_status == KERNEL_UACCESS_STATUS_OK &&
-                   copied == sizeof(*stat)
+                   copied == size
                ? 1
                : -1;
 }
@@ -682,7 +710,7 @@ enum kernel_files_status kernel_files_fstat(
         *linux_result = result;
         return KERNEL_FILES_STATUS_OK;
     }
-    copy_result = copy_stat_to_user(mm, user_buffer, &stat, linux_result);
+    copy_result = copy_stat_to_user(mm, user_buffer, &stat, linux_result, 0);
     if (copy_result < 0) {
         return KERNEL_FILES_STATUS_STATE;
     }
@@ -692,7 +720,7 @@ enum kernel_files_status kernel_files_fstat(
     return KERNEL_FILES_STATUS_OK;
 }
 
-enum kernel_files_status kernel_files_fstatat(
+static enum kernel_files_status stat_at_to_user(
     struct kernel_files *files,
     const struct kernel_fs_context *fs,
     struct kernel_mm *mm,
@@ -700,7 +728,7 @@ enum kernel_files_status kernel_files_fstatat(
     uint64_t user_path,
     uint64_t user_buffer,
     uint64_t flags,
-    int64_t *linux_result)
+    int64_t *linux_result, int extended)
 {
     KERNEL_FILES_PIN_SCOPE(pin_guard);
     struct kernel_linux_stat stat = {0};
@@ -732,8 +760,16 @@ enum kernel_files_status kernel_files_fstatat(
             empty = first == 0;
         }
         /* Linux 的空路径正 fd 直接进入 fstat，连其他查询位也不再参与校验。 */
-        if (empty && dirfd >= 0)
-            return kernel_files_fstat(files, mm, dirfd, user_buffer, linux_result);
+        if (empty && dirfd >= 0) {
+            if(!extended) return kernel_files_fstat(files, mm, dirfd, user_buffer, linux_result);
+            struct kernel_open_file_description *file=kernel_files_hold_fd(files,dirfd,&pin_guard);
+            result=file ? fill_linux_stat(&stat,file) : -KERNEL_EBADF;
+            if(result) { *linux_result=result; return KERNEL_FILES_STATUS_OK; }
+            int copied=copy_stat_to_user(mm,user_buffer,&stat,linux_result,1);
+            if(copied<0) return KERNEL_FILES_STATUS_STATE;
+            if(copied>0) *linux_result=0;
+            return KERNEL_FILES_STATUS_OK;
+        }
     }
     if (invalid_flags) {
         *linux_result = -KERNEL_EINVAL;
@@ -776,10 +812,27 @@ enum kernel_files_status kernel_files_fstatat(
     }
     if (path && finish_path(files, path) != KERNEL_FILES_STATUS_OK) return KERNEL_FILES_STATUS_STATE;
     if (result) { *linux_result = result; return KERNEL_FILES_STATUS_OK; }
-    int copied = copy_stat_to_user(mm, user_buffer, &stat, linux_result);
+    int copied = copy_stat_to_user(mm, user_buffer, &stat, linux_result, extended);
     if (copied < 0) return KERNEL_FILES_STATUS_STATE;
     if (copied > 0) *linux_result = 0;
     return KERNEL_FILES_STATUS_OK;
+}
+
+enum kernel_files_status kernel_files_fstatat(struct kernel_files *files,
+    const struct kernel_fs_context *fs,struct kernel_mm *mm,int64_t dirfd,
+    uint64_t user_path,uint64_t user_buffer,uint64_t flags,int64_t *result)
+{ return stat_at_to_user(files,fs,mm,dirfd,user_path,user_buffer,flags,result,0); }
+
+enum kernel_files_status kernel_files_statx(struct kernel_files *files,
+    const struct kernel_fs_context *fs,struct kernel_mm *mm,int64_t dirfd,
+    uint64_t user_path,uint64_t flags,uint32_t mask,uint64_t user_buffer,int64_t *result)
+{
+    if(!kernel_files_is_live(files) || !kernel_fs_context_is_live(fs) || !mm || !result)
+        return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
+    if((mask&0x80000000U) || (flags&0x6000)==0x6000) {
+        *result=-KERNEL_EINVAL;return KERNEL_FILES_STATUS_OK;
+    }
+    return stat_at_to_user(files,fs,mm,dirfd,user_path,user_buffer,flags,result,1);
 }
 
 enum kernel_files_status kernel_files_faccessat(

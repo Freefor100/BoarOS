@@ -26,7 +26,7 @@ BoarOS 是从零搭建、面向 OS Comp 能力建设的 C / 少量汇编内核�
 | 终端 | DTB ns16550 IRQ＋worker，ttyS0/console/tty、canonical/raw、termios/termios2、VMIN/VTIME、控制终端和前后台作业；Unix98 PTY/devpts、packet、真实 libc PTY API及原 BusyBox ash/stty/script/replay | 其他行规程、break 生成和完整 modem 控制未交付；固定 root、单 hart |
 | 内核日志 | 从启动保存16KiB真实内核日志、完整klogctl 0–10、消费式阻塞读、清空及console级别控制 | 当前不可变root权限模型；用户console输出与日志分离，无/dev/kmsg接口 |
 | 身份与资源 | 单用户 root 的 UID/GID 查询；线程组共享并执行 NOFILE/STACK，fork 继承、exec 保留 | 真实ext4/tmpfs/匿名pipe所有权可变，进程仍固定root；无凭据变更/完整权限；fd 硬容量 1024、栈硬容量 8 MiB；其他有效 limit 返回 `ENOTSUP` |
-| 平台与网络 | RISC-V QEMU 真实根盘可配置 PID 1（默认 `/init`） 与 musl 用户态；单 hart IPv4/IPv6 UDP/TCP loopback、双栈监听、连接选项、半关闭与向量消息，固定 lwIP 2.2.1 raw API，AF_UNIX socketpair；legacy/modern VirtIO-net、静态 IPv4/ARP、有界分片重组与隔离宿主双向 TCP/HTTP，custom pbuf RX、TX indirect+SG 零拷贝（保留复制回退）、无 NIC 时协议/OFD 定时器仍由内核 worker 推进 | 无命名 AF_UNIX 端点、外部 IPv6、公网/DHCP/DNS/TLS、LoongArch、实板或多核验证 |
+| 平台与网络 | RISC-V QEMU 真实根盘可配置 PID 1（默认 `/init`） 与 musl 用户态；单 hart IPv4/IPv6 UDP/TCP loopback、双栈监听、连接选项、半关闭与向量消息，固定 lwIP 2.2.1 raw API，AF_UNIX socketpair；legacy/modern VirtIO-net、静态 IPv4/ARP、有界分片重组与隔离宿主双向 TCP/HTTP，custom pbuf RX、TX indirect+SG 零拷贝（保留复制回退）、无 NIC 时协议/OFD 定时器仍由内核 worker 推进 | 无命名 AF_UNIX 端点、外部 IPv6、公网/DHCP/DNS/TLS、完整 LA 用户环境、实板或多核验证 |
 
 活 inode 的再次打开先取得现有节点资格，避免临时后端打开与关闭；创建权限通过已有句柄设置。弱路径 registry 仍不保存常驻目录项缓存。
 
@@ -54,10 +54,37 @@ PID 1 退出后先结束并回收剩余用户进程，再停止内核服务和�
 
 客体内固定 Alpine v3.22 RV64 GCC 14.2.0-r6 已在同一离线镜像上完成预处理、编译、汇编、静态链接和运行；固定 Linux 与 BoarOS 的五阶段状态、产物哈希和输出一致。同一编译流程也通过 tmpfs 工作目录；产物复制到根盘供比对，不代表 tmpfs 持久。另已完成原 GNU make4.4.1 默认FIFO jobserver的Lua5.4.3工程构建、增量、错误恢复和产物运行；其他项目与Rust尚未验收。
 
-固定BusyBox/libc-test最近完整清单仍为228项、227项双侧通过的历史结果；此前环境补全验收原BusyBox包装器，55/55子项成功，dmesg/RTC及df根盘内容另做真实核对。当前通用ABI差分1344条匹配，终端另有同ELF的107条差分记录；完整清单和本轮选择集合分别见[程序清单](docs/learning/user-program-inventory.md)。成本门禁见[单核规模回归](docs/learning/single-hart-scale.md)。
+固定BusyBox/libc-test当前共同清单为229项（原228项加环境内容案例），本轮RV229项与LA两种RAM各229项均双侧通过；原BusyBox包装器55/55子项、dmesg/RTC及df根盘内容均真实核对，历史结果继续保留。当前通用ABI差分1366条匹配，终端另有同ELF的107条差分记录；完整清单和本轮选择集合分别见[程序清单](docs/learning/user-program-inventory.md)。成本门禁见[单核规模回归](docs/learning/single-hart-scale.md)。
 
 顺序预读与连续写回提供有界实验候选，生产默认仍为预读关闭、写回一页。
 机制门禁和吞吐测量分别记录；TCP 27 组、存储 20 组已完成匹配筛选和组合扩展，共 1,218 次发布启动与 184 次诊断。用户依据结果批准网络默认改为 8 MSS/池 4 倍/协议堆 2 倍；存储仍为 RA0/WB1。历史结果中的默认标签指调整前的 8/1/1，见[结果、每连接完成时间和输入身份](docs/learning/data-path-budget-experiments.md#正式匹配结果2026-10-06)。
+
+LoongArch L0–L1 首阶段已交付：QEMU virt/LA464 单核、LA64、16 KiB/三级页表，
+独立内存 ELF 经共用 MM/exec/任务/syscall 路径进入用户态，并通过 timer 抢占、
+故障/回收及 512 MiB/1 GiB 同 ELF Linux 对照。第二阶段的现代 PCI→共用
+VirtIO 块核心→ext4 根盘→LP64S 静态 musl 已通过两种 RAM 的新验收，包含
+未修改的完整 BusyBox 中 cp/cmp/grep/cat/echo/uname/dd 七个 applet、真实文件映射、
+fork/exec/wait、错误/创建 OOM 与资源基线；真实 PCI 写故障保留失败 I/O owner 并明确停止。
+`kernel-la` 有盘时启动可配置 PID 1，无盘时运行首阶段内存 ELF 契约，见
+[LA 模块](docs/modules/loongarch-boot.md)。整数信号 handler/sigreturn、同步故障恢复、
+mask/嵌套和等待重启已通过同 ELF 的双侧两种 RAM 验证；静态 musl pthread/TLS、
+errno 隔离、timer 寄存器保持、同步/取消、futex/非 PI robust、线程组 exec/退出及
+创建 OOM/回收也已验证。原 BusyBox ash 的非交互 trap/wait 有双侧证据。
+原版LP64D musl的动态PIE/非PIE、解释器、DT_NEEDED/RPATH、初始与dlopen DSO TLS已通过双侧两种RAM；
+标量FR/FCC/FCSR、浮点信号/exec/clone也已验证，整数内核与原LP64S用户程序继续可用。
+LA内核栈已接入PGDH共享窗口及真实16KiB guard，含NX、撤映射、OOM回滚与可信异常栈验收。
+LSX/LASX状态、信号、clone/exec和关闭扩展的HWCAP已双侧验收。固定原版glibc2.42的五形态、
+初始/dlopen TLS、pthread取消和信号已在双侧两种RAM验收；RV仍固定2.44，版本差异保留。
+共用VirtIO net与Ethernet已接LA现代PCI，固定Linux/BoarOS两种RAM的真实TAP、
+原BusyBox HTTP和共享块/RNG/net IRQ、正常及构造/reset失败回收通过。无metadata checksum的空索引目录误报EUCLEAN已修复并用真实1/4KiB布局及
+LA普通/挂载后rmdir验证；RV全恢复回归已随本轮最终门禁通过。AF_UNIX发送者计费和sendfile批次已按固定Linux接入并双侧验证；完整网络ABI和本轮指定程序矩阵已完成同口径回归。共用ns16550已接LA真实TTY，串口/termios2/作业控制、PTY与原ash/stty/script/replay及录制重启已双侧两种RAM验收；UART构造失败和fatal轮询通过。LA pipe已修正为实际持有的16页容量，双侧两种RAM验证满环、wrap和回收。LS7A RTC真实UTC、日志/OFD与原BusyBox hwclock/dmesg/df已双侧两种RAM验证；Linux参考采用保留固定源的派生QEMU补齐PM/告警，具体身份和边界见[RTC平台](docs/modules/loongarch-boot.md#ls7a-rtc-与派生模拟器)。共用完整ABI的1366条记录已在LA四次启动一致匹配，RV同轮也匹配；固定BusyBox/libc-test当前229个共同ID已在LA两种RAM各全量通过，与本轮RV逐ID一致。原SQLite3.53.4的DELETE/WAL多进程、静态/动态CLI和独立重启内容也已双侧两种RAM验证；最终双架构回归（含RV SQLite/NBD全恢复及双盘）已通过，一次整体审查的页边界夹具问题已集中修复，完整ABI及审查后回归通过；本轮指定单核QEMU矩阵对齐，运行产物已按既有流程清理，工具、运行时与内核缓存保留。
+DTB随机种子仅支持早期材料和AT_RANDOM，不计可信熵。真实PCI RNG的正常、缺失、
+延迟、在途停止已双侧两种RAM验收，BoarOS构造失败与回收也已在两种RAM验收。LBT、
+更广原程序、客体原生开发、完整Harness、实板和SMP仍须另行验收；本轮共同矩阵对齐不表示所有RV能力全面等价。
+共用VirtIO transport/split queue已接入RV MMIO与LA PCI block，保留batch/flush/
+超时及DMA业务owner；RNG/net已迁入，见[框架契约](docs/modules/virtio-framework.md)。
+LA EXEC 页的数据读权限已按固定 Linux 的冷/驻留状态核对；页表有效权限与请求
+VMA 权限分别保留，真实读取、uaccess、fork和撤权均有双侧两种 RAM 验证。
 
 ## 构建与验证
 
@@ -90,6 +117,8 @@ make test-sqlite-wal-recovery-riscv # 固定 Linux/BoarOS 的 WAL 正常与错�
 make test-sqlite-wal-recovery-matrix-riscv # WAL 逐事件断电/写/flush 故障矩阵
 make test-offline-c-baseline-riscv # 双侧定位缺少客体原生编译器的第一失败
 make test-offline-c-riscv # 固定 Alpine 原生 GCC，双侧五阶段离线编译与运行
+make test-root-loongarch       # 同 LA 静态 musl/原 BusyBox ELF 对照 Linux，含错误与 OOM
+make test-root-io-loongarch    # 真实 PCI 写故障保留 owner；独立于正常回收验收
 make test-root-multi-block-riscv # 真实双盘、tmpfs 嵌套、忙引用与重启
 make test-multi-disk-io-riscv # 暂扣一盘 I/O 与故障隔离
 make test-sqlite-second-disk-riscv # 第二 ext4 盘 WAL 与重启
@@ -106,7 +135,7 @@ make inventory-userland-riscv  # 能力清单，不是必过门禁
 make test-references
 ```
 
-聚焦测试只在对应[模块文档](docs/README.md)维护。`make run-riscv` 不附根盘，启动后停留 timer-idle，需人工退出；`make debug-riscv` 以 `-S -s` 等待 GDB。完整比赛 Harness 当前因缺少 `kernel-la` 等能力阻塞，不算已通过。
+聚焦测试只在对应[模块文档](docs/README.md)维护。`make run-riscv` 不附根盘，启动后停留 timer-idle，需人工退出；`make debug-riscv` 以 `-S -s` 等待 GDB。完整比赛 Harness 当前仍因 LA 完整用户环境等能力阻塞，不算已通过。
 
 `build/` 是可重建的本地产物目录，不是验证档案。仅长期保留内核/用户程序编译结果、工具链、当前配置的 Linux 构建缓存等可跨轮复用的产物；一次性运行目录、磁盘镜像、日志和旧构建缓存应在核对结果后清理。`python3 tests/prune-build.py` 预览，`make prune-build` 执行清理；`make clean` 连可复用的内核构建产物也删除。需要临时保留案例镜像以调试时，可给清单入口传 `--keep-pass-images`，调试结束后仍应清理。
 
@@ -124,8 +153,8 @@ I/O已经接入。机制、历史性能口径和unknown见[成本分析](docs/le
 不以内部计数下降替代真实程序效率。当前能力与下一项优化由有效应用证据选择。
 
 评测兼容分支单向接纳main；main保留自身uname，旧glibc结果属于兼容配置。
-完整Harness仍缺kernel-la，单侧诊断和逐组补跑不能宣称完整交付。逐次成绩和运行
-输出留在忽略的build；SMP、LoongArch、实板及更大应用另行规划。
+完整Harness仍缺LA完整用户环境，单侧诊断和逐组补跑不能宣称完整交付。逐次成绩和运行
+输出留在忽略的build；SMP、LA后续用户环境、实板及更大应用另行规划。
 
 本评测分支的固定输入、启动、监督与原judge契约见[RV评测模块](docs/modules/oscomp-rv.md)。逐次成绩留在忽略的build，RV单侧诊断不等于完整Harness。
 

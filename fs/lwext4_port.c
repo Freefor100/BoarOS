@@ -2,7 +2,7 @@
 
 #include <kernel/heap.h>
 #include <kernel/sync.h>
-#include <arch/riscv/context.h>
+#include <arch/context.h>
 #include <ext4.h>
 
 #include <stddef.h>
@@ -65,18 +65,18 @@ static struct kernel_wait_queue *channel(void *key)
 { return &channels[((uintptr_t)key >> 4) % 64]; }
 void boaros_lwext4_wait(void *key)
 {
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     enum kernel_wait_wake_reason reason;
     if (kernel_scheduler_block_current(channel(key), 0, 0, &reason) != KERNEL_SCHEDULER_STATUS_OK)
         __builtin_trap();
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
 }
 void boaros_lwext4_wake(void *key)
 {
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     struct kernel_wait_queue *queue = channel(key);
     if (queue->head && kernel_wait_queue_wake_all(queue) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
 }
 
 int boaros_lwext4_allocation_active(void)

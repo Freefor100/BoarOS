@@ -6,6 +6,7 @@
 
 - `kernel/sched/signal.c`：pending/blocked、disposition、默认动作、stop/continue、进程通知和重启策略。
 - `arch/riscv/signal.c`、`include/arch/riscv/signal.h`：RISC-V 信号帧编码、寄存器恢复和用户返回尾。
+- `arch/loongarch/signal.c`、`include/arch/loongarch/signal.h`：LA 整数帧、END 扩展终止记录与 ERA/GPR 恢复；同样调用通用选择和重启策略。
 - `kernel/syscall/signal.c`：信号 syscall 的输入快照、状态提交及 errno；`kernel/syscall/time.c`：等待 deadline 和 restart_syscall。
 - `kernel/sched/private.h`：任务私有信号状态。syscall 不直接访问任务布局。
 
@@ -25,6 +26,15 @@ RISC-V frame 共 1088 字节，16 字节对齐：128 字节 siginfo 加 960 字�
 
 handler 的 a0/a1/a2 分别为信号、siginfo 地址和 ucontext 地址；ra 指向固定 RX VDSO 的 rt_sigreturn ecall。用户帧不保存可由用户修改的特权 sstatus。sigreturn 先复制并检查恢复输入，再恢复 signal mask、整数和 FP 状态，保持受控的 S-mode 返回状态。不可读取或不支持的扩展帧以 SIGSEGV 终止任务。
 
+LA 整数帧为 592 字节、16 字节对齐：128 字节 siginfo、448 字节 ucontext 和16字节
+END。ucontext 的 mask/mcontext 偏移仍为40/176，sigcontext 是 PC、32个GPR、32位
+flags，再对齐至272字节。未使用FP时只发布END；使用FP后发布实际owner的FPU记录，不发布LSX/LASX/LBT；
+标量FPU扩展已接入；未知LSX/LASX/LBT扩展以用户坏帧处理。恢复先快照 mask、
+context、FPU记录和END，再提交用户寄存器；PRMD、内核 TP 不来自用户，r0保持零。
+handler 的 a0/a1/a2、ra 与 SP 使用 LA ABI，VDSO 执行 syscall 139；sigreturn 不再推进 ERA。
+内核交付帧保持16字节对齐；用户提供的恢复帧不另加这一拒绝条件，Linux接受
+可读的8字节偏移帧。仍完整检查范围、复制和不支持扩展，先快照后提交。
+
 ## 等待与重启
 
 wait4、console read 和 pipe I/O 可被未阻塞信号唤醒；handler 的 SA_RESTART 决定这些可重启调用是重执行还是 EINTR。进入 handler 前清除任务内的外层重启状态，重执行所需参数保存在被中断的用户寄存器现场中。
@@ -37,13 +47,31 @@ sigsuspend 在等待和选择 handler 时保留临时 mask，把原 mask 写入�
 
 ## 验证与当前边界
 
-构帧复用 prefix/mcontext 存储，不在内核栈放置整份 frame；新增故障记录内嵌在线程控制块中，不为故障交付分配内存。函数与调用链预算通过 `make test-stack-usage`、真实任务 canary 与退出时栈统计核对；单函数统计和一次回归不能证明所有深层 I/O/fault 清理链。
+RV 构帧复用 prefix/mcontext 存储，不在内核栈放置整份1088字节frame；LA整数帧使用
+592字节整数或880字节FPU帧，构帧编译栈帧960字节、恢复688字节。故障记录内嵌在线程
+控制块中，不为交付分配内存。函数与调用链预算通过 `make test-stack-usage`、
+`make test-stack-usage-la`、真实任务 canary 与退出时栈统计核对；单函数统计和
+一次回归不能证明所有深层 I/O/fault 清理链。
 
 `make test-signal-riscv` 覆盖 syscall 复制失败、状态提交与 errno；`make test-diff-abi-riscv` 以同一 RISC-V ELF 对照等待信号的参数、真实超时、线程/进程定向来源、阻塞送达、siginfo EFAULT 消费和其他 handler 打断；`make test-userland-riscv` 以真实静态 musl 验证 handler/sigreturn、libc ucontext、sigsuspend、睡眠 EINTR、vfork、SIGCHLD 回收及 pipe 等待。架构和调度边界由 `make test-riscv` 回归。
 
 当前为单 hart 线程组和位图 pending；尚无实时信号队列、sigaltstack、signalfd 或 SMP 同步。libc 内部信号可走线程定向路径，但不据此宣称完整实时信号排队。siginfo 提供 SI_USER/SI_TKILL sender、孤儿组 SI_KERNEL 来源以及下述同步故障信息。组 stop/continue 与致命取消不能直接释放睡眠中的任务栈；不可中断的 vfork 有独立取消握手。
 
 ## 同步故障
+
+LA 页故障同样经通用 force_fault 选择 handler，保留 ERA；未映射/权限为 SEGV
+MAPERR/ACCERR，EOF 为 BUS/ADRERR。ADE/ALE 的 si_addr 是 BADV，break 0 为
+TRAP/BRKPT、si_addr=ERA。固定 Linux LA do_ri 使用 SI_KERNEL=128、空地址，不能
+沿用 RV 的 ILL_ILLOPC。SC_ADDRERR_RD/WR 根据 Linux thread.error_code 的保留契约
+编码，后续异步帧和 clone 保留该值；PRMD 不发布在用户上下文。
+break 6/7 分别为 SIGFPE/FPE_INTOVF、FPE_INTDIV，按真实指令 immediate 解码，
+不能把整数运算 fault 全部归为 TRAP。两个类型也由同 ELF 的双侧 handler 验证。
+解码使用已驻留页的 USER/EXEC 资格借用物理owner，不要求普通数据READ权限；
+仅执行映射中的break6也由双侧真实程序保护，不全局放宽数据uaccess。
+`make test-signal-loongarch` 在512MiB/1GiB分别运行同一个真实 LP64S musl ELF，
+验证布局、来源/mask、嵌套、故障映射修复、整数寄存器/PC恢复、坏帧、pipe
+SA_RESTART/EINTR、nanosleep EINTR 和 sigsuspend。每次 BoarOS 退出要求根盘 owner、
+用户页/页表/任务栈和堆恢复基线。整数范围另由LP64D FPU探针扩展；尚无SIMD、altstack或实时队列。
 
 U-mode 未映射/权限页故障分别记录 SIGSEGV/SEGV_MAPERR、SEGV_ACCERR，文件 EOF/I/O fault 记录 SIGBUS/BUS_ADRERR，`si_addr` 为故障 VA。非法指令与断点为 SIGILL/ILL_ILLOPC、SIGTRAP/TRAP_BRKPT；access/misaligned cause 按固定 Linux 映射，`si_addr` 为 PC。来源为本地 `references/linux/arch/riscv/kernel/traps.c`、`arch/riscv/mm/fault.c`、`kernel/signal.c::force_sig_info_to_task`，commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`。
 
@@ -54,3 +82,5 @@ U-mode 未映射/权限页故障分别记录 SIGSEGV/SEGV_MAPERR、SEGV_ACCERR�
 TTY 的前台终端信号使用稳定 PGID 发向整个进程组；背景 TTIN/TTOU 和会话 HUP/CONT
 的 owner、忽略/阻塞/orphan 条件及生命周期见 [Serial TTY](kernel-tty.md)。终端 read/write
 实际已交付前缀后不留下 restart 标记，只有整次无进展的 ERESTARTSYS 由 trap 登记重试。
+
+标量FPU记录、pending异常、首用和owner切换见[LA浮点模块](loongarch-fpu.md)。

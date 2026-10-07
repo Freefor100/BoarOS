@@ -1,5 +1,5 @@
 #include "private.h"
-#include <arch/riscv/timer.h>
+#include <arch/timer.h>
 #include <kernel/errno.h>
 #include <kernel/time.h>
 
@@ -73,7 +73,7 @@ void scheduler_rearm_timer(void)
         uint64_t now = scheduler.rt_bandwidth.last_account_ns;
         uint64_t target = UINT64_MAX - now < delay ? UINT64_MAX : now + delay;
         enum kernel_time_status status = kernel_time_deadline_from_monotonic(target, &deadline);
-        if (status == KERNEL_TIME_STATUS_DEADLINE_PASSED) deadline = riscv_time_read() + 1U;
+        if (status == KERNEL_TIME_STATUS_DEADLINE_PASSED) deadline = arch_time_read() + 1U;
         else if (status != KERNEL_TIME_STATUS_OK) __builtin_trap();
     }
     /* 最早阻塞期限与 RT/时间片预算同为 tick 域；取最小者编入硬件事件。 */
@@ -81,8 +81,8 @@ void scheduler_rearm_timer(void)
     if (blocked != 0 && (!deadline || blocked->wakeup_deadline < deadline))
         deadline = blocked->wakeup_deadline;
     scheduler.armed_deadline = deadline;
-    enum riscv_timer_status status = riscv_timer_set_scheduler_deadline(deadline);
-    if (status != RISCV_TIMER_STATUS_OK && status != RISCV_TIMER_STATUS_NOT_STARTED)
+    enum arch_timer_status status = arch_timer_set_scheduler_deadline(deadline);
+    if (status != ARCH_TIMER_STATUS_OK && status != ARCH_TIMER_STATUS_NOT_STARTED)
         __builtin_trap();
 }
 
@@ -130,10 +130,10 @@ int kernel_task_sched_get(struct kernel_task *caller, int32_t pid,
                            struct kernel_sched_policy *state)
 {
     if (pid < 0) return -KERNEL_EINVAL;
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     struct kernel_task *task = sched_target(caller, pid);
     if (task) *state = task->scheduling;
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     return task ? 0 : -KERNEL_ESRCH;
 }
 
@@ -141,9 +141,9 @@ int kernel_task_sched_set(struct kernel_task *caller, int32_t pid,
                            int policy, int priority, int keep_policy)
 {
     if (pid < 0) return -KERNEL_EINVAL;
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     struct kernel_task *task = sched_target(caller, pid);
-    if (!task) { riscv_interrupt_restore(irq); return -KERNEL_ESRCH; }
+    if (!task) { arch_interrupt_restore(irq); return -KERNEL_ESRCH; }
     scheduler_account_runtime();
     struct kernel_sched_policy updated = task->scheduling;
     int result = kernel_sched_policy_set(&updated, policy, priority, keep_policy);
@@ -157,13 +157,13 @@ int kernel_task_sched_set(struct kernel_task *caller, int32_t pid,
         scheduler.need_resched = 1;
         scheduler_rearm_timer();
     }
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     return result;
 }
 
 void kernel_scheduler_rt_bandwidth_get(int64_t *period_us, int64_t *runtime_us)
 {
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     if (scheduler.initialized != KERNEL_SCHEDULER_INITIALIZED) {
         *period_us = 1000000; *runtime_us = 950000;
     } else {
@@ -171,14 +171,14 @@ void kernel_scheduler_rt_bandwidth_get(int64_t *period_us, int64_t *runtime_us)
         *runtime_us = scheduler.rt_bandwidth.runtime_ns < 0 ? -1 :
                       scheduler.rt_bandwidth.runtime_ns / 1000;
     }
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
 }
 
 int kernel_scheduler_rt_bandwidth_set(int runtime_field, int64_t value)
 {
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     if (scheduler.initialized != KERNEL_SCHEDULER_INITIALIZED) {
-        riscv_interrupt_restore(irq); return -KERNEL_EAGAIN;
+        arch_interrupt_restore(irq); return -KERNEL_EAGAIN;
     }
     scheduler_account_runtime();
     int result = kernel_rt_bandwidth_set(&scheduler.rt_bandwidth, runtime_field, value,
@@ -187,6 +187,6 @@ int kernel_scheduler_rt_bandwidth_set(int runtime_field, int64_t value)
         scheduler.need_resched = 1;
         scheduler_rearm_timer();
     }
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     return result;
 }

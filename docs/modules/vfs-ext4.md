@@ -462,3 +462,36 @@ SQLite NBD runner 的 marker 停机使用显式受控 cut：后端先冻结磁�
 完整 DELETE/WAL 恢复结果、未到达故障序号和输入身份见[最终恢复](../learning/record-lock-sqlite-recovery.md#数据路径最终恢复与宿主收口2026-10-06)。
 
 存储 20 组候选及 26 项扩展/同步负载已用发布构建三次独立启动比较，默认仍为 RA0/WB1。RA8 改善所测顺序冷读、WB8 改善显式同步，但 WB8 在 64 MiB 缓存追加有回退；冷热、tmpfs、缓存完成与 durable 同步分列于[报告及每文件完成时间](../learning/data-path-budget-experiments.md#正式匹配结果2026-10-06)。
+
+## 无metadata checksum的空索引目录（2026-10-07）
+
+`ext4_dir_check_empty`按HTree根的层级/块引用确定root、inner node与leaf；不按
+首个零inode整块记录猜测。关闭metadata_csum后，合法空leaf与inner node都可能
+使用这种记录，错误分类曾使普通mkdir/rmdir返回EUCLEAN。root/node仍检查
+count/limit/块范围/校验，leaf仍检查记录边界/名字长度/校验，损坏不静默降级。
+
+`make test-lwext4-dir-empty-host`使用真实1/4KiB ext4、dir_index和metadata_csum
+分别开/关，运行空目录覆盖及长名称目录增长/rename，再由e2fsck验证。
+ASan/UBSan保护实际lwext4/JBD/块模型；宿主证明不替代DMA。LA真实两种RAM
+的普通mkdir/rmdir与tmpfs挂载/卸载后rmdir、Linux同ELF、退出和根owner已通过，
+程序路径由扩大的network sendfile场景保护。全恢复矩阵仍在本轮最终回归范围内。
+
+## 双架构 SQLite DELETE/WAL 原程序
+
+LA 同一原 SQLite3.53.4 archive 编译 LP64D 静态 workload、原 shell.c 静态/动态
+CLI（16KiB ELF对齐），共享原 musl1.2.5解释器。上游 amalgamation/shell 不修改。
+`tests/sqlite-rollback.py --arch loongarch` 与 `tests/sqlite-wal-riscv.py --arch loongarch`
+使用同一ELF先固定Linux后BoarOS，各在512MiB和1GiB运行。两内核冻结、archive和
+runtime身份检查，不能以不同二进制或不同SQL来接受架构差异。
+
+DELETE保护提交/回滚、fork/exec多进程锁竞争、进程异常离开产生的热日志恢复。
+随后独立启动原静态/动态CLI，逐字核对版本/线程编译选项/integrity_check、已提交的
+`committed,parent,child` 和 spill24行且无未提交修改，再重复独立启动核对持久内容。
+WAL保护多进程共享映射/锁、提交及独立重启。以上LA双侧两种RAM实际退出42、Linux
+卸载与BoarOS根owner释放均已通过；RV shared DELETE/CLI 六次启动也通过。
+RV固定Linux不启用initrd，直接根盘supervisor执行wait42与syncfs；LA initrd
+supervisor先卸载根盘。两种profile都检查真实子程序状态，不能只依赖一条串口标记。
+
+原RV `test-sqlite-rollback-riscv`、WAL/NBD及完整DELETE/WAL恢复矩阵保留。共用TTY
+输出CRLF后，NBD shell parser只把CRLF还原为LF，保留原字节与全部NBD请求；不删
+任意CR，不改变SQLite程序或放宽退出/WRITE/FLUSH/真实数据库门禁。

@@ -152,10 +152,12 @@ static void outputs(int in)
     memset(data, 'p', sizeof(data)); size_t filled = 0; ssize_t got;
     while ((got = write(pipes[1], data, sizeof(data))) > 0) filled += (size_t)got;
     CHECK(errno == EAGAIN);
-    CHECK(read(pipes[0], data, 4096) == 4096 && lseek(in, 0, SEEK_SET) == 0);
+    /* Linux pipe slots are page sized; release a whole target page before refill. */
+    long page = sysconf(_SC_PAGESIZE); CHECK(page > 0 && (size_t)page < sizeof(data));
+    CHECK(read(pipes[0], data, (size_t)page) == page && lseek(in, 0, SEEK_SET) == 0);
     sent = sendfile(pipes[1], in, NULL, sizeof(data)); CHECK(sent > 0 && sent < (ssize_t)sizeof(data));
     CHECK(lseek(in, 0, SEEK_CUR) == sent);
-    for (size_t remaining = filled - 4096; remaining > 0;) {
+    for (size_t remaining = filled - (size_t)page; remaining > 0;) {
         size_t wanted = remaining > sizeof(data) ? sizeof(data) : remaining;
         got = read(pipes[0], data, wanted); CHECK(got > 0);
         for (ssize_t i = 0; i < got; i++) CHECK(data[i] == 'p');
@@ -247,9 +249,15 @@ static void datagrams(int in)
     int large = source("dgram-input");
     pattern(data, 1, sizeof(data)); CHECK(pwrite(large, data, 1, sizeof(data)) == 1);
     ssize_t sent = sendfile(pair[0], large, NULL, 65537); CHECK(sent == 65536 || sent == 65537);
-    CHECK(recv(pair[1], data, sizeof(data), 0) == 65536); same(data, sizeof(data), 0);
-    if (sent == 65536) CHECK(sendfile(pair[0], large, NULL, 1) == 1);
-    CHECK(recv(pair[1], data, sizeof(data), 0) == 1); same(data, 1, 65536);
+    long page=sysconf(_SC_PAGESIZE); CHECK(page>0);
+    size_t batch=(size_t)page*16U, first=batch<65537U ? batch : 65537U;
+    unsigned char *message=malloc(65537U); CHECK(message);
+    CHECK(recv(pair[1],message,65537U,0)==(ssize_t)first);same(message,first,0);
+    if(first<65537U) {
+        if(sent==(ssize_t)first)CHECK(sendfile(pair[0],large,NULL,65537U-first)==(ssize_t)(65537U-first));
+        CHECK(recv(pair[1],message,65537U,0)==(ssize_t)(65537U-first));same(message,65537U-first,first);
+    }
+    free(message);
     CHECK(lseek(large, 0, SEEK_CUR) == 65537 && close(large) == 0 && unlink("dgram-input") == 0);
     for (;;) {
         offset = 0; ssize_t queued = sendfile(pair[0], in, &offset, 4097);
@@ -283,7 +291,8 @@ int main(int argc, char **argv)
     struct sigaction action = {.sa_handler = notified}; sigemptyset(&action.sa_mask);
     CHECK(sigaction(SIGPIPE, &action, NULL) == 0 && sigaction(SIGALRM, &action, NULL) == 0);
     if (mkdir("/tmp", 0755) < 0) CHECK(errno == EEXIST);
-    if (getpid() == 1) {
+    if (access("/proc/self/stat", F_OK) < 0) {
+        CHECK(errno == ENOENT);
         if (mkdir("/proc", 0555) < 0) CHECK(errno == EEXIST);
         if (mount("proc", "/proc", "proc", 0, NULL) < 0) CHECK(errno == EBUSY);
     }
@@ -293,13 +302,15 @@ int main(int argc, char **argv)
     if (composition_only) pipe_composition(in);
     else { files(in); aliases(); errors(in); outputs(in); datagrams(in); pipe_composition(in); }
     CHECK(close(in) == 0);
-    if (!composition_only && getpid() == 1) {
+    if (!composition_only) {
         CHECK(mkdir("memory", 0755) == 0 && mount("tmpfs", "memory", "tmpfs", 0, NULL) == 0);
         int memory = source("memory/input"), pair[2]; CHECK(pipe(pair) == 0);
         off_t offset = 13; CHECK(sendfile(pair[1], memory, &offset, 4096) == 4096 && offset == 4109);
         read_exact(pair[0], 4096, 13);
         CHECK(close(pair[0]) == 0 && close(pair[1]) == 0 && close(memory) == 0);
-        CHECK(unlink("memory/input") == 0 && umount("memory") == 0 && rmdir("memory") == 0);
+        CHECK(unlink("memory/input") == 0);
+        CHECK(umount("memory") == 0);
+        CHECK(rmdir("memory") == 0);
         puts("SENDFILE PASS tmpfs actual memory-backed input");
     }
     CHECK(unlink("input") == 0);

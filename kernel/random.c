@@ -1,6 +1,6 @@
 #include <kernel/random.h>
 
-#include <arch/riscv/context.h>
+#include <arch/context.h>
 #include <kernel/blake2s.h>
 #include <kernel/scheduler.h>
 #include <kernel/errno.h>
@@ -131,7 +131,7 @@ void kernel_random_mix(const void *data, size_t size, int trusted)
     if (!data) return;
     while (size) {
         size_t n = size > 32U ? 32U : size;
-        uintptr_t irq = riscv_interrupt_save();
+        uintptr_t irq = arch_interrupt_save();
         int was_ready = kernel_random_ready();
         memcpy(input, random_state.key, 32U);
         memcpy(input + 32U, p, n);
@@ -144,7 +144,7 @@ void kernel_random_mix(const void *data, size_t size, int trusted)
         }
         if (!was_ready && kernel_random_ready())
             (void)kernel_wait_queue_wake_all(kernel_random_wait_queue());
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
         p += n;
         size -= n;
     }
@@ -161,19 +161,19 @@ enum kernel_random_status kernel_random_initialize(const uint8_t *seed,
 
 int kernel_random_wait_ready(int nonblock)
 {
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     while (!kernel_random_ready()) {
         enum kernel_wait_wake_reason reason;
-        if (nonblock) { riscv_interrupt_restore(irq); return -KERNEL_EAGAIN; }
+        if (nonblock) { arch_interrupt_restore(irq); return -KERNEL_EAGAIN; }
         if (kernel_scheduler_block_current(kernel_random_wait_queue(), 0, 1,
                                           &reason) != KERNEL_SCHEDULER_STATUS_OK) {
-            riscv_interrupt_restore(irq); return -KERNEL_EIO;
+            arch_interrupt_restore(irq); return -KERNEL_EIO;
         }
         if (reason == KERNEL_WAIT_SIGNALLED) {
-            riscv_interrupt_restore(irq); return -KERNEL_EINTR;
+            arch_interrupt_restore(irq); return -KERNEL_EINTR;
         }
     }
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     return 0;
 }
 
@@ -184,12 +184,12 @@ enum kernel_random_status kernel_random_fill(void *buffer, size_t size)
     uint32_t counter = 1U;
     if (!buffer && size) return KERNEL_RANDOM_STATUS_INVALID_ARGUMENT;
     if (!size) return KERNEL_RANDOM_STATUS_OK;
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     memcpy(key, random_state.key, sizeof(key));
     kernel_random_chacha20_block(key, nonce, 0U, block);
     /* 首半块仅作为新全局 key；调用者只能看到后半块和旧 key 的独立流。 */
     memcpy(random_state.key, block, 32U);
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     size_t n = size > 32U ? 32U : size;
     memcpy(p, block + 32U, n);
     p += n; size -= n;

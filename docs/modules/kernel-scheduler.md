@@ -17,11 +17,11 @@
 | `kernel/sched/wait.c` | 全局 blocked 链、每队列 FIFO、超时和信号唤醒 |
 | `kernel/sched/futex.c` | 256 桶 WAIT/WAKE/REQUEUE、robust-list 退出清理、clear-child-tid 唤醒 |
 | `kernel/sched/signal.c` | 组/线程 pending、disposition、stop/continue 和重启 |
-| `arch/riscv/process.c` | clone 寄存器、FP/TLS 继承与 exec 寄存器清零 |
-| `arch/riscv/context.c`、`context_switch.S` | psABI context 和 SIE 临界区 |
+| `include/arch/task.h`、`arch/riscv/process.c`、`arch/loongarch/context.c` | 构建期线程、地址空间与 trap 操作；各架构初始/clone/exec 寄存器契约 |
+| `arch/riscv/`、`arch/loongarch/` 的 context/trap 汇编 | 架构 ABI context、用户异常返回与中断状态 |
 | `kernel/sched/private.h` | 私有任务布局、组与队列成员关系 |
 
-公共 scheduler 头不暴露 Trap Frame；架构 clone 入口位于 `include/arch/riscv/process.h`。syscall 通过不透明 task 接口取得 TID/TGID/PPID 和资源，不直接修改调度私有字段。
+公共 scheduler 头不暴露 Trap Frame；架构 clone 入口由 `include/arch/task.h` 选择，旧 RV 入口保留包装。syscall 通过不透明 task 接口取得 TID/TGID/PPID 和资源，不直接修改调度私有字段。
 
 ## 策略、就绪队列与 RT 预算
 
@@ -69,6 +69,12 @@ TID、TGID、PGID 和 SID 共用 `kernel_pid` 对象：编号、不可回退的�
 `tests/diff-abi/session.c` 使用 pipe/wait4 握手与专用 exec probe，覆盖父子 exec errno、线程目标、非组长 setsid/exec、session 边界、zombie/proc、组定向 kill/wait、进程组长先收割后的组存续、退出/reparent 两条孤儿路径，以及 sigtimedwait 和 SA_SIGINFO 的内核信号来源。启动上下文不同：固定 Linux 裸 PID 1 初始 PGID/SID 为 0，BoarOS 初始身份为 1；测试先建立真实非零会话，再比较用户操作，不把启动整数差异混入会话机制断言。
 
 ## clone 与 vfork
+
+通用进程策略由构建期 `arch_process_*` 后端准备寄存器。LA64的系统调用顺序为
+flags、child_stack、parent_tid、child_tid、tls，由LA trap重排成下述通用顺序；
+SETTLS写r2/TP、child stack写r3/SP、返回a0=0并使ERA前进4字节。LA已保存独立FP/SIMD owner，区分启用宽度、live宽度和used_math，其首用、信号和成本边界见[LA浮点](loongarch-fpu.md)，不套用RV的FS Dirty或SIMD范围。真实LP64S musl线程/TLS/取消/非PI robust与
+组生命周期由 `make test-pthread-loongarch` 双侧验证，两处构造OOM和重试由
+`make test-pthread-oom-loongarch` 验证；任务页/栈及根盘owner要求恢复基线。
 
 RISC-V clone 接收 flags、child_stack、parent_tid、tls、child_tid 和完整 syscall 入口寄存器。支持普通 SIGCHLD fork/vfork（均可额外指定 CLONE_FS 共享 cwd/root，或指定 CHILD_SETTID/CHILD_CLEARTID 管理子进程私有 MM 中的 TID），以及共享 VM/FS/FILES/SIGHAND/THREAD 的线程组合和 SETTLS/PARENT_SETTID/CHILD_SETTID/CHILD_CLEARTID/SYSVSEM/DETACHED 兼容位。非法依赖返回 EINVAL，尚未闭环的合法资源组合返回 ENOTSUP。SYSVSEM 位不代表已经支持 SysV semaphore。
 
@@ -120,13 +126,19 @@ zombie 先逻辑回收再复制 status/rusage，因此坏输出指针的 EFAULT 
 
 单 hart 的 SIE 临界区串行化组关系、fd/MM 引用和 futex 登记。共享 MM 使用同一页表与本地 SFENCE.VMA；这不是 SMP 协议。多 hart 前仍须补锁、页引用原子操作和远端 TLB shootdown。
 
-每线程拥有独立的 4 KiB 元数据页和 8 KiB 连续物理内核栈（buddy order 1）；调度器初始化要求分配器已进入 finalized buddy 模式，栈分配、构造回滚与正常释放使用同一 order。生产内核把栈映射到内核栈窗口（`RISCV_KERNEL_STACK_WINDOW_BASE` 起 128 MiB，12 KiB 槽：前置 4 KiB 页不建 PTE，作为未映射 guard，后接 8 KiB 栈）；空窗口骨架在页表构建期预留，所有用户根按值继承同一子树，叶子由受限的运行期接口插入/删除，空 level-0 表在最后一个叶撤除时释放，guard 页不占物理页。无活动内核页表的测试 fixture 继续使用 direct-map 栈。栈底留 16 字节对齐区和 canary，剩余 8176 字节包含 Trap Frame 与 C 调用链。新栈填充固定字节，初始用户 Trap Frame 显式清零。退出后只在其他可信栈扫描未覆盖前缀；累计最小剩余空间和最大已用空间由只读统计接口提供，生产 PID 1 完成时报告。构造回滚同样释放独立栈，不让资源清理失败保留它。
+RV每线程拥有独立的 4 KiB 元数据页和 8 KiB 连续物理内核栈（buddy order 1）；调度器初始化要求分配器已进入 finalized buddy 模式，栈分配、构造回滚与正常释放使用同一 order。RV生产内核把栈映射到内核栈窗口（`RISCV_KERNEL_STACK_WINDOW_BASE` 起 128 MiB，12 KiB 槽：前置 4 KiB 页不建 PTE，作为未映射 guard，后接 8 KiB 栈）；空窗口骨架在页表构建期预留，所有用户根按值继承同一子树，叶子由受限的运行期接口插入/删除，空 level-0 表在最后一个叶撤除时释放，guard 页不占物理页。无活动内核页表的测试 fixture 继续使用 direct-map 栈。栈底留 16 字节对齐区和 canary，剩余 8176 字节包含 Trap Frame 与 C 调用链。新栈填充固定字节，初始用户 Trap Frame 显式清零。退出后只在其他可信栈扫描未覆盖前缀；累计最小剩余空间和最大已用空间由只读统计接口提供，生产 PID 1 完成时报告。构造回滚同样释放独立栈，不让资源清理失败保留它。
+
+LA生产任务也沿现有内核栈窗口接口运行：PGDH共享骨架持有永久boot页，任务叶
+仅借用原连续物理栈，PLV0/RW/NX且下方16KiB未映射。异常入口在写frame前
+核对SP是否容得下304字节；不足时切到保留的可信异常栈输出fatal。合法栈上界
+按SP下方字节定位槽位。用户PGDL切换不改PGDH，回收先撤叶/TLB同步再归还栈。
+该硬件保护和映射失败/骨架OOM回滚由`test-stack-guard-loongarch`验证。
 
 `make test-stack-usage` 强制重建隔离的生产对象，编译器 `-fstack-usage` 产出逐函数记录；host probe 从实际栈配置和 Trap Frame 头计算容量、guard、汇编 Frame 与余量预算，避免测试大栈或旧报告污染门禁。`tests/stack-usage.py` 拒绝超出“栈容量减 16 字节、288 字节汇编 Trap Frame、1024 字节余量”的单帧及无界动态栈；该检查不能证明完整调用链。真实 root-init、静态 musl 与动态 pthread 测试另要求已退出任务的最小实测余量至少 1024 字节，不足时必须扩大栈后重新运行。Canary 用于发现破坏，填充测量用于观察高水位；生产栈的未映射 guard 只对经窗口 VA 的 SP 式越界生效，direct-map 别名仍可达同一批物理页，且二者都不证明未执行分支的栈界。idle/boot 栈仍在 .bss 高半区别名内，没有 guard。ASID 0 的切换刷新成本、OTHER 的 100 Hz tick 与线性 wait4 仍存在。
 
 聚焦入口为 `make test-stack-usage`、`make test-scheduler-cases-riscv`、`make test-scheduler-riscv`、`make test-files-riscv` 和 `make test-signal-riscv`；`make test-userland-riscv` 验证真实 pthread、共享匿名 futex、bitset 绝对 realtime 等待在 stop/continue 后保留掩码和截止时刻。`make test-diff-abi-riscv` 用同一 ELF 对照固定 Linux 的零掩码、超时、错误、按掩码唤醒和 requeue；`make test-glibc-riscv` 验证 glibc 2.44 的 `pthread_join` 消费路径。阶段收口使用 `make test-riscv`。各次实际通过范围以 README 和提交验证说明为准，不把实现路径存在等同于全部线程负载已验证。
 
-尚无 SMP、共享文件 futex、PI futex、实时信号队列、sigaltstack、clone3 或 LoongArch context。固定语义依据见学习总结的 Linux commit 与 musl 归档。
+尚无 SMP、共享文件 futex、PI futex、实时信号队列、sigaltstack 或 clone3。LoongArch 已验证整数 context、timer 抢占、整数信号与静态 musl TLS/pthread 子集和任务退出回收；标量FPU和原版动态musl/DSO TLS已另行验收；SIMD及更广线程范围未验收。固定语义依据见学习总结的 Linux commit 与 musl 归档。
 
 活动普通文件/TCP I/O 的单页暂存由任务持有并跨调用复用：首次使用时分配，调用期间登记在任务的 `io_buffer`，正常调用完成只解除登记。任务资源清理在 socket read/write reservation 之后、MM/文件表和任务栈释放之前解除登记；常驻页在任务最终存储释放时归还。页释放错误遵循物理分配器 fatal 不变量，不进入历史 cleanup 重试链。
 

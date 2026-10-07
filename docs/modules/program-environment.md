@@ -136,7 +136,7 @@ SQLite 大事务需要 Unix VFS 探测临时目录。固定 `build/riscv/sqlite/
 
 `tests/host/nbd_fault.c` 经 Unix socket 给 QEMU 提供 fixed-newstyle、simple replies 的 READ/WRITE/FLUSH/DISC，只宣告 `HAS_FLAGS|SEND_FLUSH`。`tests/host/block_fault.c` 是 512 字节原子写、易失可见内容、稳定镜像的真实故障模型；只有成功 FLUSH 承诺此前事件持久化。`make test-nbd-host` 检查握手、读写、写/flush 失败和丢失、部分保存、反序保存。`make test-sqlite-recovery-matrix-riscv` 使用串口与宿主信号握手，仅对 SQLite 事务内的 NBD 事件编号，逐个注入写/flush 错误和断电位置；断电先冻结服务，再杀 QEMU，从同一稳定初态恢复。断电切点的事件上限由与该次运行相同的 none/odd/reverse 持久化策略分别探测；默认策略探针只用于写/flush 故障点，不能把它的事件数借给其他策略。2026-09-27 的 DELETE 小事务有 100 次写和 47 次 flush；441 个断电组合与逐位置 147 个写/flush 失败均通过。QEMU 基线为本地 `references/qemu/` commit `84f07211cc5b4fc6a371559bf8a5de4fb068e648`，执行环境为 QEMU 11.1.1。这些入口使用隔离镜像，成功后清理一次性目录；未确认提交只允许完整旧值或完整新值，已确认提交必须保留新值。不证明实板持久性。
 
-## glibc 2.44 独立矩阵
+## glibc 独立矩阵
 
 `tests/userland/glibc/inputs.json` 固定 RV64 GNU 工具链及 loader、`libc.so.6`、
 `libgcc_s.so.1` 的机器身份。当前 GNU 工具链为 GCC 16.2.1，libc 为 glibc 2.44；
@@ -152,6 +152,14 @@ cleanup handler、信号 handler 和正常退出。取消时管道与暂存 owne
 共享文件表清理；不能由缺库 abort 冒充内核取消语义测试。
 
 glibc 2.44 的 `pthread_join` 通过 `FUTEX_WAIT_BITSET | FUTEX_CLOCK_REALTIME` 等待线程退出；初始试跑在 BoarOS 返回 ENOSYS，glibc 因意外 futex 错误退出。`tests/diff-abi/futex_shared.c` 的同一 ELF 现在对照固定 Linux 检查 bitset 零值、绝对时钟、用户 fault、按掩码唤醒与 requeue；`tests/userland/pthread.c` 进一步检查 stop/continue 重启保留掩码与原截止时刻。当前内核 realtime offset 启动后不变，可一次换算为 monotonic；引入调时 syscall 时需重新处理阻塞中的 realtime deadline。
+
+LA使用`inputs-loongarch.json`固定已安装GCC15.1.0和原版glibc2.42，完整sysroot、
+工具、GCC frontend、builtin headers、CRT、libgcc的内容/权限/链接目标均校验。
+`make test-glibc-loongarch`复用上述五形态与探针，在512MiB/1GiB各执行同ELF的
+Linux/BoarOS对照；loader的真实搜索目录为`/usr/lib64`。2026-10-06五形态全部
+通过完整阶段marker、退出42及根页/堆/任务栈回收。初始启动遇到SIMD SIGILL、
+之后缺AT_RANDOM的SIGSEGV；实现SIMD及DTB早期材料后重跑通过，不修改原libc。
+RV2.44与LA2.42版本差异不参与跨架构数值比较，probe版本断言由profile提供。
 
 ## 双侧执行与失败所有权
 
@@ -196,3 +204,33 @@ contract和wait status比较，保留原输出及raw_output_equal；日期、内
 程序、同步、根卸载分别计时，卸载使用已有ROOT_DRAIN_FIXTURE，不增加用户ABI。
 固定Linux的PID1退出以panic停机，不能把它等同于BoarOS的根卸载；离线检查先重放日志。
 输入与输出身份在机器清单校验，人类结果和解释归[离线工具链记录](../learning/offline-toolchain-probe.md)。
+
+## LA 与 RV 共用真实程序清单
+
+`tests/program-inventory/{libc_build,run,suites}.py --arch loongarch` 使用同一固定
+BusyBox/libc-test 案例、原包装脚本、输出校验和失败分类。LA BusyBox 保留原398个
+applets/配置，用整数静态 musl；libc-test 用原 LP64D musl 1.2.5 构建全部
+107 静态、110 动态 entry 和两个原包装器，链接页对齐16KiB、解释器为
+`/lib/ld-musl-loongarch64.so.1`。完整安装树、工具及产物身份必须匹配；不改上游程序。
+
+默认 LA 按512MiB和1GiB各执行一次完整 Linux/BoarOS 矩阵，包括 official 平台
+案例，不能把512MiB标签下的启动偷偷改成1GiB。程序/两个内核在运行前冻结，
+逐案例记录真实 wait 状态、stdout/stderr、加载/运行/超时与资源退出；所有四份
+结果必须完整。RV 原默认入口保留。当前清单共229个ID：原228个加已有
+`busybox.environment`，两种LA RAM均229 pass，与本轮RV229 pass逐ID一致；历史
+上游失败保留在学习记录，本次通过不归因于未经单独复现的某个修复。
+
+```sh
+make prepare-la-tools prepare-la-linux-platform prepare-la-userland prepare-la-dynamic
+python3 -B tests/program-inventory/libc_build.py --arch loongarch --jobs 8 --uapi-include build/loongarch/uapi/include
+python3 -B tests/program-inventory/run.py --arch loongarch --reuse-builds --require-pass --output build/loongarch/inventory-check
+```
+
+运行期间冻结工具缓存，避免重链接导致短暂不可执行。runner-error 不是用户程序
+失败，必须保留原因并在同一身份下重跑对应未完成项。完整比赛Harness与客体原生
+开发工具另行验收；229个ID通过不证明所有BusyBox applet均能使用。
+
+LA完整inventory/ABI/SQLite/RTC运行目录由既有 `make prune-build` 统一清理；LA
+program-libc源码/ELF、LP64D运行时、GNU程序、Linux及原版/派生QEMU缓存保留。
+GNU临时run目录、磁盘和构建日志清理，不以被忽略的运行目录作为永久档案。
+`python3 -B tests/test-prune-build.py` 独立保护这项缓存/运行产物选择契约。

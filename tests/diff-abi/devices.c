@@ -5,10 +5,10 @@ void abi_device_cases(void)
     struct abi_stat stat;
     unsigned char buffer[8] = {0xa5, 0xa5, 0xa5, 0xa5,
                                0xa5, 0xa5, 0xa5, 0xa5};
-    long map = CALL(222, 0, 8192, 3, 0x22, -1, 0);
-    abi_require(map >= 0 && SC3(226, map + 4096, 4096, 0) == 0);
+    long map = CALL(222, 0, (2 * ABI_PAGE_SIZE), 3, 0x22, -1, 0);
+    abi_require(map >= 0 && SC3(226, map + ABI_PAGE_SIZE, ABI_PAGE_SIZE, 0) == 0);
     for (int index = 0; index < 4; index++)
-        ((unsigned char *)map)[4092 + index] = 0xa5;
+        ((unsigned char *)map)[(ABI_PAGE_SIZE - 4) + index] = 0xa5;
     long fd = abi_open("/dev/null", 2);
     abi_record("device.null-open", fd < 0 ? fd : 0, -1, -1, 0, 0, 0);
     if (fd < 0) return;
@@ -22,9 +22,9 @@ void abi_device_cases(void)
                -1, -1, 0, 0, 0);
     abi_record("device.null-read-zero-invalid", SC3(63, fd, -1, 0),
                -1, -1, 0, 0, 0);
-    abi_record("device.null-read-partial", SC3(63, fd, map + 4092, 8),
-               -1, -1, 0, (void *)(map + 4092), 4);
-    abi_record("device.null-write-partial", SC3(64, fd, map + 4092, 8),
+    abi_record("device.null-read-partial", SC3(63, fd, map + (ABI_PAGE_SIZE - 4), 8),
+               -1, -1, 0, (void *)(map + (ABI_PAGE_SIZE - 4)), 4);
+    abi_record("device.null-write-partial", SC3(64, fd, map + (ABI_PAGE_SIZE - 4), 8),
                -1, -1, 0, 0, 0);
     abi_record("device.null-pread", SC4(67, fd, buffer, 8, 123),
                -1, -1, 0, 0, 0);
@@ -78,9 +78,11 @@ void abi_device_cases(void)
                -1, -1, 0, 0, 0);
     abi_record("device.zero-read-zero-invalid", SC3(63, fd, -1, 0),
                -1, -1, 0, 0, 0);
-    abi_record("device.zero-read-partial", SC3(63, fd, map + 4092, 8),
-               -1, -1, 0, (void *)(map + 4092), 4);
-    abi_record("device.zero-write-partial", SC3(64, fd, map + 4092, 8),
+    long partial = SC3(63, fd, map + (ABI_PAGE_SIZE - 4), 8);
+    abi_require(partial == 4);
+    abi_record("device.zero-read-partial", partial,
+               -1, -1, 0, (void *)(map + (ABI_PAGE_SIZE - 4)), 4);
+    abi_record("device.zero-write-partial", SC3(64, fd, map + (ABI_PAGE_SIZE - 4), 8),
                -1, -1, 0, 0, 0);
     abi_record("device.zero-pread", SC4(67, fd, buffer, 8, 123),
                -1, -1, 0, buffer, sizeof(buffer));
@@ -143,7 +145,7 @@ void abi_device_cases(void)
     abi_record("device.zero-readonly-write", SC3(64, fd, buffer, 1),
                -1, -1, 0, 0, 0);
     abi_require(SC1(57, fd) == 0);
-    abi_require(SC2(215, map, 8192) == 0);
+    abi_require(SC2(215, map, (2 * ABI_PAGE_SIZE)) == 0);
 
     fd = abi_open("/dev/console", 0);
     abi_record("device.console-open-readonly", fd < 0 ? fd : 0,

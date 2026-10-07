@@ -3,7 +3,7 @@
 #include "../record_lock.h"
 #include "../vfs_internal.h"
 
-#include <arch/riscv/context.h>
+#include <arch/context.h>
 #include <kernel/errno.h>
 #include <kernel/heap.h>
 #include <kernel/open_file.h>
@@ -163,7 +163,7 @@ enum kernel_files_status kernel_files_fcntl_lock(
         status = KERNEL_FILES_STATUS_STATE;
         goto out;
     }
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     if (query) {
         result = kernel_record_lock_get(state,
                       kind ? (const void *)file : (const void *)files->record,
@@ -194,7 +194,7 @@ enum kernel_files_status kernel_files_fcntl_lock(
                                                &reason);
             if (!kind) remove_wait_edge(&edge);
             if (sleep_status != KERNEL_SCHEDULER_STATUS_OK) {
-                riscv_interrupt_restore(irq);
+                arch_interrupt_restore(irq);
                 status = KERNEL_FILES_STATUS_STATE;
                 goto out;
             }
@@ -209,7 +209,7 @@ enum kernel_files_status kernel_files_fcntl_lock(
             }
         }
     }
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     if (result) { *linux_result = result; goto out; }
     if (query) {
         flock.type = found.type;

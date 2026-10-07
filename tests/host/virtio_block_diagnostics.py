@@ -14,14 +14,11 @@ import subprocess
 import tempfile
 
 root = Path(__file__).resolve().parents[2]
-source = (root / "arch/riscv/virtio_mmio_block.c").read_text()
+source = (root / "drivers/virtio/block.c").read_text() + '\n' + (root / "arch/riscv/virtio_mmio_block.c").read_text() + '\n' + (root / "drivers/virtio/mmio.c").read_text()
 translations = {
-    '__asm__ volatile("fence rw, rw" ::: "memory");':
-        '__atomic_thread_fence(__ATOMIC_SEQ_CST);',
-    '__asm__ volatile("fence iorw, iorw" ::: "memory");':
-        '__atomic_thread_fence(__ATOMIC_SEQ_CST);',
-    '__asm__ volatile("csrr %0, time" : "=r"(value));':
-        'value = host_block_time();',
+    'arch_dma_barrier();': '__atomic_thread_fence(__ATOMIC_SEQ_CST);',
+    'arch_io_barrier();': '__atomic_thread_fence(__ATOMIC_SEQ_CST);',
+    'return arch_time_read();': 'return host_block_time();',
 }
 for instruction, native in translations.items():
     if source.count(instruction) != 1:
@@ -36,10 +33,10 @@ with tempfile.TemporaryDirectory(prefix="boaros-block-diagnostics-") as work:
     if cross is None:
         raise RuntimeError("RV64 compiler required to verify shared ring index accesses")
     access = work / "ring-access.c"
-    access.write_text('#include "' + str(root / "arch/riscv/virtio_mmio_block.c") + '"\n' + r'''
-uint16_t wire_available_read(volatile struct virtq_available *ring) { return ring->index; }
-void wire_available_write(volatile struct virtq_available *ring, uint16_t value) { ring->index = value; }
-uint16_t wire_used_read(volatile struct virtq_used *ring) { return ring->index; }
+    access.write_text('#include "' + str(root / "drivers/virtio/block.c") + '"\n' + r'''
+uint16_t wire_available_read(volatile struct virtio_available_ring *ring) { return ring->index; }
+void wire_available_write(volatile struct virtio_available_ring *ring, uint16_t value) { ring->index = value; }
+uint16_t wire_used_read(volatile struct virtio_used_ring *ring) { return ring->index; }
 ''')
     obj = work / "ring-access.o"
     subprocess.run([cross + "gcc", "-O2", "-ffreestanding", "-fno-builtin",
@@ -60,8 +57,10 @@ uint16_t wire_used_read(volatile struct virtq_used *ring) { return ring->index; 
     subprocess.run([
         os.environ.get("CC", "cc"), "-std=c11", "-Wall", "-Wextra", "-Werror",
         "-DBOAROS_PAGE_SHIFT=12",
+        *(["-DHOST_ALTERNATE_TRANSPORT"] if os.environ.get("HOST_ALTERNATE_TRANSPORT") else []),
         *shlex.split(os.environ.get("CFLAGS", "")),
         "-Itests/host/random", "-idirafter", "include", "-I", str(work),
-        "tests/host/virtio_block_diagnostics.c", "kernel/block.c", "-o", str(exe),
+        "tests/host/virtio_block_diagnostics.c", "kernel/block.c",
+        "drivers/virtio/transport.c", "drivers/virtio/split_queue.c", "-o", str(exe),
     ], cwd=root, check=True)
     subprocess.run([str(exe), *os.sys.argv[1:]], check=True)

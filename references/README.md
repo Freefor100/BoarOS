@@ -153,3 +153,12 @@ README 保留官方发布地址。星云板仓库只公开了指向网盘资料�
 
 Lua5.4.3官方发布包保存在`lua/lua-5.4.3.tar.gz`，许可MIT；下载位置与校验归sources.tsv。
 离线工程执行器只解包已校验的原发布内容，受控修改由测试流程执行并恢复，不修改上游构建规则。
+
+
+LoongArch 整数静态 libc 工具链使用 `gcc/gcc-15.1.0.tar.xz`，2026-10-06 从
+GNU 官方 [GCC15.1 发布目录](https://gcc.gnu.org/pub/gcc/releases/gcc-15.1.0/) 取得，
+SHA-256 `e2b09ec21660f01fecffb715e0120265216943f038d0e48a9868713e54f06cea`，
+另与官方 SHA-512 清单核对。宿主已安装 GCC15.1.0 只含 LP64D runtime，不能充当
+LP64S libgcc/CRT；`tests/loongarch/prepare_userland.py` 从该固定 archive 构建
+`loongarch64-unknown-linux-gnusf`，产物和配置身份在忽略的缓存中，不修改上游源码。
+BusyBox LA 使用同一个 fixed commit/原配置，并从上述固定 v6.6 archive 导出 LA UAPI。

@@ -153,3 +153,9 @@ Linux commit。较长请求的上游 RISC-V usercopy 进展问题留作独立 re
 测试输入和可重建命令见[TTY模块](kernel-tty.md)，原ash/stty验收另由
 `make test-tty-riscv`负责。两个入口不能由宿主模型或编译成功替代；宿主PTY也不代表
 客体拥有PTY。
+
+2026-10-06 通用矩阵新增22条 statx：基本路径/fd/NULL 空路径、cwd、符号链接、
+同步与 mask、坏 fd/path/缓冲、错误组合优先级及跨页复制故障。当前1366条
+同 RV ELF 在固定 Linux 与 BoarOS 匹配；结果只证明矩阵所覆盖的契约。
+LA 的静态 musl/原 BusyBox 根盘对照入口为 `make test-root-loongarch`，采用该架构
+内部同一个 LP64S ELF，不能用 RV 记录替代其架构验收。

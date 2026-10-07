@@ -2,7 +2,7 @@
 #include "files/private.h"
 #include "open_file_internal.h"
 #include "uaccess_iov_internal.h"
-#include <arch/riscv/context.h>
+#include <arch/context.h>
 #include <kernel/errno.h>
 #include <kernel/heap.h>
 #include <kernel/scheduler.h>
@@ -237,7 +237,7 @@ static void finish_mode(struct kernel_tty_request *request)
 }
 static void finish_request(struct kernel_tty_request *request)
 {
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     struct kernel_tty *tty = request->instance->tty;
     finish_mode(request);
     if (request->reading) {
@@ -269,7 +269,7 @@ static void finish_request(struct kernel_tty_request *request)
         request->vectors = 0;
         request->vector_owner = 0;
     }
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
 }
 void kernel_tty_abort_request(struct kernel_tty_request *request)
 {
@@ -653,9 +653,9 @@ static size_t receive_input(struct kernel_tty *tty, const struct kernel_tty_rx *
         __builtin_trap();
     size_t j = 0;
     for (; j < count; j++) {
-        uintptr_t irq = riscv_interrupt_save();
+        uintptr_t irq = arch_interrupt_save();
         if (nonblocking && tty->deferred_flush) {
-            if (tty->mode_owner) { riscv_interrupt_restore(irq); break; }
+            if (tty->mode_owner) { arch_interrupt_restore(irq); break; }
             tty->deferred_flush = 0;
             flush_input(tty); flush_output(tty);
         }
@@ -666,11 +666,11 @@ static size_t receive_input(struct kernel_tty *tty, const struct kernel_tty_rx *
             int control = !(tty->settings.lflag & EXTPROC) &&
                 (((tty->settings.iflag & IXON) && (special(tty, VSTART, c) || special(tty, VSTOP, c))) ||
                  ((tty->settings.lflag & ISIG) && (special(tty, VINTR, c) || special(tty, VQUIT, c) || special(tty, VSUSP, c))));
-            if (!control) { riscv_interrupt_restore(irq); break; }
+            if (!control) { arch_interrupt_restore(irq); break; }
         }
         tty->nonblocking_rx = nonblocking;
         if (tty->shutdown || !(tty->settings.cflag & 0x80U)) {
-            riscv_interrupt_restore(irq);
+            arch_interrupt_restore(irq);
             continue;
         }
         if (status & 16U) {
@@ -679,7 +679,7 @@ static size_t receive_input(struct kernel_tty *tty, const struct kernel_tty_rx *
                     signal_input(tty, 2);
                 } else if (tty->settings.iflag & PARMRK) {
                     if (tty->head - tty->tail >= RING - 3) {
-                        riscv_interrupt_restore(irq);
+                        arch_interrupt_restore(irq);
                         continue;
                     }
                     input_byte(tty, 255, 2);
@@ -703,7 +703,7 @@ static size_t receive_input(struct kernel_tty *tty, const struct kernel_tty_rx *
         } else {
             input_byte(tty, c, 0);
         }
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
     }
     tty->nonblocking_rx = 0;
     tty->transport.kick(tty->transport_owner);
@@ -719,7 +719,7 @@ size_t kernel_tty_service_output(struct kernel_tty *tty, size_t budget)
     if (!tty)
         return 0;
     while (total < budget) {
-        uintptr_t irq = riscv_interrupt_save();
+        uintptr_t irq = arch_interrupt_save();
         unsigned char c;
         int priority = tty->xchar_valid;
         if (priority)
@@ -727,7 +727,7 @@ size_t kernel_tty_service_output(struct kernel_tty *tty, size_t budget)
         else {
             if ((!tty->shutdown && (tty->stopped || tty->flow_stopped)) ||
                 tty->order_head == tty->order_tail) {
-                riscv_interrupt_restore(irq);
+                arch_interrupt_restore(irq);
                 break;
             }
             c = tty->order[tty->order_tail & (ORDER - 1)] ? tty->echo[tty->echo_tail & MASK]
@@ -749,7 +749,7 @@ size_t kernel_tty_service_output(struct kernel_tty *tty, size_t budget)
             changed(tty);
             total++;
         }
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
         if (!sent)
             break;
     }
@@ -757,17 +757,17 @@ size_t kernel_tty_service_output(struct kernel_tty *tty, size_t budget)
 }
 int kernel_tty_output_pending(struct kernel_tty *tty)
 {
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     int result = tty && (tty->xchar_valid || tty->order_head != tty->order_tail);
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     return result;
 }
 void kernel_tty_transport_ready(struct kernel_tty *tty)
 {
     if (tty) {
-        uintptr_t irq = riscv_interrupt_save();
+        uintptr_t irq = arch_interrupt_save();
         changed(tty);
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
     }
 }
 static void drop_session(struct kernel_tty *tty)
@@ -783,7 +783,7 @@ static void drop_session(struct kernel_tty *tty)
 }
 void kernel_tty_disassociate(struct kernel_tty *tty, int on_exit)
 {
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     if (on_exit) {
         tty->generation++;
         flush_input(tty);
@@ -796,18 +796,18 @@ void kernel_tty_disassociate(struct kernel_tty *tty, int on_exit)
     }
     drop_session(tty);
     changed(tty);
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
 }
 void kernel_tty_shutdown(struct kernel_tty *tty)
 {
     if (!tty)
         return;
     kernel_tty_disassociate(tty, 1);
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     tty->shutdown = 1;
     tty->stopped = tty->flow_stopped = 0;
     changed(tty);
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     tty->transport.kick(tty->transport_owner);
 }
 static int acquire_ctty(struct kernel_tty *tty, struct kernel_task *caller, int steal)
@@ -846,10 +846,10 @@ static int open_instance(struct kernel_tty *tty, struct kernel_heap *heap, struc
         kernel_heap_allocate_zeroed(heap, 1, sizeof(*instance), (void **)&instance);
     if (allocation != KERNEL_HEAP_STATUS_OK)
         return allocation == KERNEL_HEAP_STATUS_EMPTY ? -KERNEL_ENOMEM : -KERNEL_EIO;
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     int open_error = tty->transport.open_check ? tty->transport.open_check(tty->transport_owner) : 0;
     if (tty->shutdown || open_error) {
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
         (void)kernel_heap_release(heap, instance);
         return open_error ? open_error : -KERNEL_ENXIO;
     }
@@ -857,7 +857,7 @@ static int open_instance(struct kernel_tty *tty, struct kernel_heap *heap, struc
         struct kernel_tty_termios2 settings = {tty->settings, tty->ispeed, tty->ospeed};
         int error = configure_settings(tty, &settings);
         if (error) {
-            riscv_interrupt_restore(irq);
+            arch_interrupt_restore(irq);
             (void)kernel_heap_release(heap, instance);
             return error;
         }
@@ -875,7 +875,7 @@ static int open_instance(struct kernel_tty *tty, struct kernel_heap *heap, struc
         kernel_task_tty_session_leader(caller) && !kernel_task_controlling_tty(caller) &&
         !tty->session)
         (void)acquire_ctty(tty, caller, 0);
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     *result = instance;
     return 0;
 }
@@ -898,14 +898,14 @@ static void release_instance(void *opaque)
 {
     struct tty_instance *i = opaque;
     struct kernel_tty *tty = i->tty;
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     if (!tty->opens)
         __builtin_trap();
     tty->opens--;
     if (!tty->opens && tty->transport.last_close)
         tty->transport.last_close(tty->transport_owner, tty->settings.cflag);
     kernel_tty_put(tty);
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     if (kernel_heap_release(i->heap, i) != KERNEL_HEAP_STATUS_OK)
         __builtin_trap();
 }
@@ -948,17 +948,17 @@ int kernel_tty_destroy(struct kernel_tty **owner)
     if (!owner || !*owner)
         return -KERNEL_EINVAL;
     struct kernel_tty *tty = *owner;
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     if (tty->references != 1 || tty->reader || tty->writer || tty->mode_owner || tty->session ||
         tty->foreground || kernel_tty_output_pending(tty) ||
         !tty->transport.drained(tty->transport_owner)) {
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
         return -KERNEL_EBUSY;
     }
     if (serial_tty == tty)
         serial_tty = 0;
     tty->references = 0;
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     if (kernel_heap_release(tty->heap, tty) != KERNEL_HEAP_STATUS_OK)
         __builtin_trap();
     *owner = 0;
@@ -966,7 +966,7 @@ int kernel_tty_destroy(struct kernel_tty **owner)
 }
 void kernel_tty_publish_serial(struct kernel_tty *tty)
 {
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     if (serial_tty && serial_tty != tty)
         __builtin_trap();
     serial_tty = tty;
@@ -985,7 +985,7 @@ void kernel_tty_publish_serial(struct kernel_tty *tty)
                                                  .poll = device_poll,
                                                  .readv = device_readv,
                                                  .writev = device_writev};
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
 }
 const struct kernel_char_device *kernel_tty_device_lookup(uint64_t rdev)
 {
@@ -1057,10 +1057,10 @@ static int read_stage(struct kernel_tty_request *r, uint32_t flags, unsigned cha
     struct kernel_tty *tty = r->instance->tty;
     *staged = 0;
     if (tty->transport.progress) tty->transport.progress(tty->transport_owner);
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     if (hungup(r->instance)) {
         r->continuation = 0;
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
         return 0;
     }
     if (r->continuation) {
@@ -1072,29 +1072,29 @@ static int read_stage(struct kernel_tty_request *r, uint32_t flags, unsigned cha
                 unthrottle(tty);
             }
             r->continuation = 0;
-            riscv_interrupt_restore(irq);
+            arch_interrupt_restore(irq);
             return 0;
         }
         int more;
         *staged =
             take_input(tty, buffer, capacity, canonical_mode(tty), &more);
         r->continuation = (uint8_t)more;
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
         return 0;
     }
     if (hungup(r->instance)) {
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
         return 0;
     }
     int error = job_control(r->instance, r->caller, 21, 1);
     if (error) {
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
         return error;
     }
     while (tty->reader && tty->reader != r) {
         error = wait_event(r, flags, 0);
         if (error) {
-            riscv_interrupt_restore(irq);
+            arch_interrupt_restore(irq);
             return error;
         }
     }
@@ -1102,7 +1102,7 @@ static int read_stage(struct kernel_tty_request *r, uint32_t flags, unsigned cha
     r->reading = 1;
     error = lock_mode(r, flags);
     if (error) {
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
         return error;
     }
     r->initial_canonical = canonical_mode(tty);
@@ -1161,7 +1161,7 @@ static int read_stage(struct kernel_tty_request *r, uint32_t flags, unsigned cha
         if (error)
             break;
     }
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     return *staged ? 0 : error;
 }
 static enum kernel_files_status
@@ -1238,7 +1238,7 @@ static int write_bytes(struct kernel_tty_request *r, uint32_t flags,
 {
     struct kernel_tty *tty = r->instance->tty;
     *written = 0;
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     int error = hungup(r->instance) || peer_state(tty) != KERNEL_TTY_PEER_LIVE ? -KERNEL_EIO : 0;
     if (!error && !r->write_qualified && (tty->settings.lflag & TOSTOP))
         error = job_control(r->instance, r->caller, 22, 1);
@@ -1270,7 +1270,7 @@ static int write_bytes(struct kernel_tty_request *r, uint32_t flags,
         tty->transport.kick(tty->transport_owner);
         error = wait_event(r, flags, 0);
     }
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     return *written ? 0 : error;
 }
 static int device_write(void *opaque, struct kernel_task *caller, uint32_t flags,
@@ -1296,13 +1296,13 @@ device_writev(void *opaque, struct kernel_task *caller, struct kernel_files *fil
     int error = 0;
     enum kernel_files_status status = KERNEL_FILES_STATUS_OK;
     size_t staging = count < 2048U ? (size_t)count : 2048U;
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     error = hungup(r.instance)                           ? -KERNEL_EIO
             : (r.instance->tty->settings.lflag & TOSTOP) ? job_control(r.instance, caller, 22, 1)
                                                          : 0;
     r.write_qualified = 1;
     if (!error && count) error = lock_writer(&r, flags);
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     if (!error && count) {
         enum kernel_heap_status allocated = kernel_heap_allocate(r.instance->heap, staging, (void **)&r.write_scratch);
         if (allocated != KERNEL_HEAP_STATUS_OK) error = allocated == KERNEL_HEAP_STATUS_EMPTY ? -KERNEL_ENOMEM : -KERNEL_EIO;
@@ -1338,7 +1338,7 @@ static uint32_t device_poll(void *opaque, uint32_t flags, uint32_t requested,
     struct tty_instance *i = opaque;
     struct kernel_tty *tty = i->tty;
     if (tty->transport.progress) tty->transport.progress(tty->transport_owner);
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     uint32_t result = 0;
     if (queue)
         *queue = &tty->events;
@@ -1361,7 +1361,7 @@ static uint32_t device_poll(void *opaque, uint32_t flags, uint32_t requested,
         if (tty->order_head - tty->order_tail < 256 && tty->tx_head - tty->tx_tail < RING)
             result |= KERNEL_POLLOUT | KERNEL_POLLWRNORM;
     }
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     return result;
 }
 static int copy_ioctl(struct kernel_mm *mm, uint64_t address, void *buffer, size_t size,
@@ -1381,7 +1381,7 @@ static int copy_ioctl(struct kernel_mm *mm, uint64_t address, void *buffer, size
 static int drain(struct kernel_tty_request *r)
 {
     struct kernel_tty *tty = r->instance->tty;
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     int error = 0;
     while (kernel_tty_output_pending(tty) || !tty->transport.drained(tty->transport_owner)) {
         tty->transport.kick(tty->transport_owner);
@@ -1389,7 +1389,7 @@ static int drain(struct kernel_tty_request *r)
         if (error)
             break;
     }
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
     return error;
 }
 static int device_ioctl(void *opaque, struct kernel_task *caller, struct kernel_files *files,
@@ -1418,9 +1418,9 @@ static int device_ioctl(void *opaque, struct kernel_task *caller, struct kernel_
     case 0x5401: /* TCGETS保持36字节，不能按libc结构长度复制。 */
     case 0x802c542a: {
         struct kernel_tty_termios2 settings;
-        uintptr_t irq = riscv_interrupt_save();
+        uintptr_t irq = arch_interrupt_save();
         settings = (struct kernel_tty_termios2){tty->settings, tty->ispeed, tty->ospeed};
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
         error = copy_ioctl(mm, argument, &settings, extended ? sizeof(settings) : sizeof(settings.basic), 1);
         break;
     }
@@ -1435,9 +1435,9 @@ static int device_ioctl(void *opaque, struct kernel_task *caller, struct kernel_
         error = job_control(i, caller, 22, 0);
         if (error)
             break;
-        uintptr_t snapshot = riscv_interrupt_save();
+        uintptr_t snapshot = arch_interrupt_save();
         modern = (struct kernel_tty_termios2){tty->settings, tty->ispeed, tty->ospeed};
-        riscv_interrupt_restore(snapshot);
+        arch_interrupt_restore(snapshot);
         error = copy_ioctl(mm, argument, &modern, extended ? sizeof(modern) : sizeof(modern.basic), 0);
         if (error)
             break;
@@ -1457,7 +1457,7 @@ static int device_ioctl(void *opaque, struct kernel_task *caller, struct kernel_
             if (error)
                 break;
         }
-        uintptr_t irq = riscv_interrupt_save();
+        uintptr_t irq = arch_interrupt_save();
         error = lock_mode(&r, 0);
         if (!error) {
             modern.basic = settings;
@@ -1488,7 +1488,7 @@ static int device_ioctl(void *opaque, struct kernel_task *caller, struct kernel_
             changed(tty);
         }
         finish_mode(&r);
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
         tty->transport.kick(tty->transport_owner);
         break;
     }
@@ -1501,7 +1501,7 @@ static int device_ioctl(void *opaque, struct kernel_task *caller, struct kernel_
         error = job_control(i, caller, 22, 0);
         if (error)
             break;
-        uintptr_t irq = riscv_interrupt_save();
+        uintptr_t irq = arch_interrupt_save();
         if (argument == 0) {
             tty->stopped = 1;
             stop_output(tty);
@@ -1517,7 +1517,7 @@ static int device_ioctl(void *opaque, struct kernel_task *caller, struct kernel_
         } else
             error = -KERNEL_EINVAL;
         changed(tty);
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
         tty->transport.kick(tty->transport_owner);
         break;
     }
@@ -1529,7 +1529,7 @@ static int device_ioctl(void *opaque, struct kernel_task *caller, struct kernel_
             error = -KERNEL_EINVAL;
             break;
         }
-        uintptr_t irq = riscv_interrupt_save();
+        uintptr_t irq = arch_interrupt_save();
         error = lock_mode(&r, 0);
         if (!error) {
             if (argument != 1)
@@ -1538,14 +1538,14 @@ static int device_ioctl(void *opaque, struct kernel_task *caller, struct kernel_
                 flush_output(tty);
         }
         finish_mode(&r);
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
         break;
     }
     case 0x540e: {
-        uintptr_t irq = riscv_interrupt_save();
+        uintptr_t irq = arch_interrupt_save();
         /* PTY master 的控制身份属于 slave，与组查询和 hangup 使用同一 owner。 */
         error = acquire_ctty(control, caller, argument == 1);
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
         break;
     }
     case 0x5422: {
@@ -1556,9 +1556,9 @@ static int device_ioctl(void *opaque, struct kernel_task *caller, struct kernel_
         if (kernel_task_tty_session_leader(caller))
             kernel_tty_disassociate(tty, 0);
         else {
-            uintptr_t irq = riscv_interrupt_save();
+            uintptr_t irq = arch_interrupt_save();
             kernel_task_tty_clear(caller);
-            riscv_interrupt_restore(irq);
+            arch_interrupt_restore(irq);
         }
         break;
     }
@@ -1568,12 +1568,12 @@ static int device_ioctl(void *opaque, struct kernel_task *caller, struct kernel_
             error = -KERNEL_ENOTTY;
             break;
         }
-        uintptr_t irq = riscv_interrupt_save();
-        if (command == 0x5429 && !control->session) { riscv_interrupt_restore(irq); error = -KERNEL_ENOTTY; break; }
+        uintptr_t irq = arch_interrupt_save();
+        if (command == 0x5429 && !control->session) { arch_interrupt_restore(irq); error = -KERNEL_ENOTTY; break; }
         int32_t value = command == 0x540f ? (control->foreground ? control->foreground->number : 0)
                         : control->session    ? control->session->number
                                           : -1;
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
         error = copy_ioctl(mm, argument, &value, sizeof(value), 1);
         break;
     }
@@ -1595,7 +1595,7 @@ static int device_ioctl(void *opaque, struct kernel_task *caller, struct kernel_
             error = -KERNEL_EINVAL;
             break;
         }
-        uintptr_t irq = riscv_interrupt_save();
+        uintptr_t irq = arch_interrupt_save();
         struct kernel_pid *group = 0;
         error = kernel_task_tty_find_group(caller, number, &group);
         if (!error) {
@@ -1605,24 +1605,24 @@ static int device_ioctl(void *opaque, struct kernel_task *caller, struct kernel_
             control->foreground = group;
             changed(tty);
         }
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
         break;
     }
     case 0x5413:
     case 0x5414: {
         uint16_t size[4];
-        uintptr_t irq = riscv_interrupt_save();
+        uintptr_t irq = arch_interrupt_save();
         size[0] = control->rows;
         size[1] = control->columns;
         size[2] = control->xpixel;
         size[3] = control->ypixel;
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
         if (command == 0x5413)
             error = copy_ioctl(mm, argument, size, sizeof(size), 1);
         else {
             error = copy_ioctl(mm, argument, size, sizeof(size), 0);
             if (!error) {
-                irq = riscv_interrupt_save();
+                irq = arch_interrupt_save();
                 if (size[0] != control->rows || size[1] != control->columns ||
                     size[2] != control->xpixel || size[3] != control->ypixel) {
                     control->rows = size[0];
@@ -1636,7 +1636,7 @@ static int device_ioctl(void *opaque, struct kernel_task *caller, struct kernel_
                     }
                     kernel_task_tty_signal_group(control->foreground, 28);
                 }
-                riscv_interrupt_restore(irq);
+                arch_interrupt_restore(irq);
             }
         }
         break;
@@ -1645,7 +1645,7 @@ static int device_ioctl(void *opaque, struct kernel_task *caller, struct kernel_
     case 0x5411:
     case 0x5424: {
         int32_t value = 0;
-        uintptr_t irq = riscv_interrupt_save();
+        uintptr_t irq = arch_interrupt_save();
         if (command == 0x5411)
             value = (int32_t)(tty->order_head - tty->order_tail + tty->xchar_valid);
         else if (command == 0x541b) {
@@ -1654,7 +1654,7 @@ static int device_ioctl(void *opaque, struct kernel_task *caller, struct kernel_
                 if (!canonical_mode(tty) || tty->flags[p & MASK] != 2)
                     value++;
         }
-        riscv_interrupt_restore(irq);
+        arch_interrupt_restore(irq);
         error = copy_ioctl(mm, argument, &value, sizeof(value), 1);
         break;
     }
@@ -1670,10 +1670,10 @@ static int device_ioctl(void *opaque, struct kernel_task *caller, struct kernel_
         if (!tty->master) { error = -KERNEL_ENOTTY; break; }
         error = copy_ioctl(mm, argument, &value, sizeof(value), 0);
         if (!error) {
-            uintptr_t irq = riscv_interrupt_save();
+            uintptr_t irq = arch_interrupt_save();
             if (!tty->packet && value) tty->packet_status = 0;
             tty->packet = value != 0; changed(tty);
-            riscv_interrupt_restore(irq);
+            arch_interrupt_restore(irq);
         }
         break;
     }
@@ -1713,19 +1713,19 @@ int kernel_tty_base_only(struct kernel_tty *tty)
 { return tty->references == 1 && !tty->opens && !tty->reader && !tty->writer && !tty->mode_owner; }
 void kernel_tty_packet_event(struct kernel_tty *tty, unsigned flags)
 {
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     if (tty->packet) {
         if (flags & 12U) tty->packet_status &= ~12U;
         if (flags & 48U) tty->packet_status &= ~48U;
         tty->packet_status |= (uint8_t)flags; changed(tty);
     }
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
 }
 void kernel_tty_discard(struct kernel_tty *tty)
 {
-    uintptr_t irq = riscv_interrupt_save();
+    uintptr_t irq = arch_interrupt_save();
     flush_input(tty); flush_output(tty); tty->xchar_valid = 0;
-    riscv_interrupt_restore(irq);
+    arch_interrupt_restore(irq);
 }
 const struct kernel_char_device *kernel_tty_device_template(void)
 {

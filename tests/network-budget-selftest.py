@@ -7,6 +7,8 @@ import importlib.util
 from pathlib import Path
 import subprocess
 import signal
+import shutil
+import sys
 import tempfile
 import threading
 import unittest
@@ -17,6 +19,29 @@ ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location('budget', ROOT / 'tests/network-budget-experiment.py')
 budget = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(budget)
+
+
+class Configuration(unittest.TestCase):
+    def test_gate_checks_production_defaults_without_overrides(self):
+        # Compile real headers, then simulate a production-default change without
+        # updating the gate. Both profiles remain valid experiment candidates.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for relative in ('net/lwip_port/include', 'third_party/lwip/src/include'):
+                shutil.copytree(ROOT / relative, root / relative)
+            (root / 'tests').mkdir()
+            script = root / 'tests/network-budget-config.py'
+            shutil.copyfile(ROOT / 'tests/network-budget-config.py', script)
+            command = [sys.executable, '-B', str(script)]
+            result = subprocess.run(command, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            options = root / 'net/lwip_port/include/lwipopts.h'
+            options.write_text(options.read_text().replace(
+                '#define BOAROS_LWIP_POOL_SCALE 4', '#define BOAROS_LWIP_POOL_SCALE 1').replace(
+                '#define BOAROS_LWIP_MEM_SCALE 2', '#define BOAROS_LWIP_MEM_SCALE 1'))
+            result = subprocess.run(command, capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0, 'production-default drift accepted')
+            self.assertIn('static assertion failed', result.stderr)
 
 
 class Accounting(unittest.TestCase):

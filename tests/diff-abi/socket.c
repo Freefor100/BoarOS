@@ -218,8 +218,8 @@ static void udp_scale_cases(void)
 static void udp_large_fault_cases(void)
 {
     static unsigned char payload[8192];
-    long memory = SC6(222, 0, 8192, 3, 0x22, -1, 0);
-    abi_require(memory > 0 && SC3(226, memory + 4096, 4096, 0) == 0);
+    long memory = SC6(222, 0, 2 * ABI_PAGE_SIZE, 3, 0x22, -1, 0);
+    abi_require(memory > 0 && SC3(226, memory + ABI_PAGE_SIZE, ABI_PAGE_SIZE, 0) == 0);
     long fd = SC3(198, LINUX_AF_INET, LINUX_SOCK_DGRAM | LINUX_SOCK_NONBLOCK, 0);
     struct socket_address address = {.family = LINUX_AF_INET};
     uint32_t size = sizeof(address);
@@ -229,15 +229,16 @@ static void udp_large_fault_cases(void)
     for (unsigned mode = 0; mode < 2; mode++) {
         abi_require(SC6(206, fd, payload, sizeof(payload), 0, &address, size) == sizeof(payload));
         abi_require(SC6(206, fd, "!", 1, 0, &address, size) == 1);
-        struct abi_iovec iov[] = {{(void *)memory, 1001}, {(void *)(memory + 1001), 7191}};
-        long got = mode ? SC3(65, fd, iov, 2) : SC3(63, fd, memory, 8192);
+        long destination=memory+ABI_PAGE_SIZE-4096;
+        struct abi_iovec iov[] = {{(void *)destination, 1001}, {(void *)(destination + 1001), 7191}};
+        long got = mode ? SC3(65, fd, iov, 2) : SC3(63, fd, destination, 8192);
         unsigned char marker = 0;
         long next = SC6(207, fd, &marker, 1, 0, 0, 0);
         abi_record(mode ? "socket.udp-large-fault.readv" : "socket.udp-large-fault.read",
                    got, next, marker == '!', 0, 0, 0);
     }
     close_socket(fd);
-    abi_require(SC2(215, memory, 8192) == 0);
+    abi_require(SC2(215, memory, 2 * ABI_PAGE_SIZE) == 0);
 }
 
 static void tcp_scale_cases(void)
@@ -255,10 +256,10 @@ static void tcp_scale_cases(void)
     abi_require(server >= 0);
     abi_require(SC3(64,client,"abc",3)==3);output[0]=output[1]=output[2]='z';
     record("network.tcp-trunc-discard",SC6(207,server,output,3,0x20,0,0)==3 && output[0]=='z' && output[2]=='z');
-    long guard=SC6(222,0,4096,0,0x22,-1,0);abi_require(guard>0 && SC3(64,client,"abc",3)==3);
+    long guard=SC6(222,0,ABI_PAGE_SIZE,0,0x22,-1,0);abi_require(guard>0 && SC3(64,client,"abc",3)==3);
     record("network.tcp-trunc-protected",SC6(207,server,guard,3,0x20,0,0));
     record("network.tcp-trunc-consumed",SC6(207,server,output,3,0x40,0,0));
-    abi_require(SC2(215,guard,4096)==0);
+    abi_require(SC2(215,guard,ABI_PAGE_SIZE)==0);
     for (unsigned i = 0; i < sizeof(input); i++) input[i] = (unsigned char)(i * 13 + 7);
     int good = 1, batched = 0;
     for (unsigned batch = 0; batch < 128; batch++) {
@@ -283,16 +284,16 @@ static void tcp_scale_cases(void)
     abi_record("socket.tcp-scale.mebibyte", good, batched, -1, 0, 0, 0);
     /* TCP packet coalescing differs across kernels: assert conservation of
      * committed bytes, not one particular skb/pbuf segmentation. */
-    long memory = SC6(222, 0, 8192, 3, 0x22, -1, 0);
-    abi_require(memory > 0 && SC3(226, memory + 4096, 4096, 0) == 0);
+    long memory = SC6(222, 0, 2 * ABI_PAGE_SIZE, 3, 0x22, -1, 0);
+    abi_require(memory > 0 && SC3(226, memory + ABI_PAGE_SIZE, ABI_PAGE_SIZE, 0) == 0);
     abi_require(SC3(64, client, input, 2048) == 2048 &&
                 SC3(64, client, input + 2048, 2048) == 2048);
-    long prefix = SC3(63, server, memory + 1024, 4096);
+    long prefix = SC3(63, server, memory + ABI_PAGE_SIZE - 3072, 4096);
     abi_require(prefix == -14 || (prefix > 0 && prefix <= 3072));
     unsigned committed = prefix > 0 ? (unsigned)prefix : 0;
     good = 1;
     for (unsigned i = 0; i < committed; i++)
-        if (((unsigned char *)memory)[1024 + i] != input[i]) good = 0;
+        if (((unsigned char *)memory)[ABI_PAGE_SIZE - 3072 + i] != input[i]) good = 0;
     unsigned remaining = 4096 - committed, done = 0;
     while (done < remaining) {
         long got = SC3(63, server, output + done, remaining - done);
@@ -302,7 +303,7 @@ static void tcp_scale_cases(void)
     for (unsigned i = 0; i < remaining; i++)
         if (output[i] != input[committed + i]) good = 0;
     abi_record("socket.tcp-scale.fault-conservation", good, -1, -1, 0, 0, 0);
-    abi_require(SC2(215, memory, 8192) == 0);
+    abi_require(SC2(215, memory, 2 * ABI_PAGE_SIZE) == 0);
     close_socket(server); close_socket(client); close_socket(listener);
 }
 
@@ -555,14 +556,15 @@ void abi_socket_cases(void)
                sizeof(udp_address)));
     record("socket.udp-read-after-empty-readv",
            SC3(63, udp_server, &payload, 1));
-    long udp_fault_map = CALL(222, 0, 8192, 3, 0x22, -1, 0);
+    long udp_fault_map = CALL(222, 0, 2 * ABI_PAGE_SIZE, 3, 0x22, -1, 0);
     abi_require(udp_fault_map >= 0 &&
-                SC3(226, udp_fault_map + 4096, 4096, 0) == 0);
+                SC3(226, udp_fault_map + ABI_PAGE_SIZE, ABI_PAGE_SIZE, 0) == 0);
     send = SC6(206, udp_client, "wxyz", 4, 0, &udp_address,
                sizeof(udp_address));
     long udp_partial = send == 4
-        ? SC6(207, udp_server, (void *)(udp_fault_map + 4094), 4, 0, 0, 0)
+        ? SC6(207, udp_server, (void *)(udp_fault_map + ABI_PAGE_SIZE - 2), 4, 0, 0, 0)
         : send;
+    abi_require(udp_partial == -14);
     record("socket.udp-recvfrom-copy-fault", udp_partial);
     char after_udp_fault[4] = {0};
     long after_udp = SC6(207, udp_server, after_udp_fault, 4, 0, 0, 0);
@@ -578,7 +580,7 @@ void abi_socket_cases(void)
     record("socket.udp-recvfrom-negative-length", received);
     record("socket.udp-after-negative-length",
            SC6(207, udp_server, &payload, 1, 0, 0, 0));
-    abi_require(SC2(215, udp_fault_map, 8192) == 0);
+    abi_require(SC2(215, udp_fault_map, 2 * ABI_PAGE_SIZE) == 0);
     close_socket(udp_client);
     close_socket(udp_server);
 
@@ -671,16 +673,16 @@ void abi_socket_cases(void)
            first == 'a' && second == 'b');
     /* A failed user copy must leave TCP data queued. A cross-page fault
      * commits only the bytes that really reached the caller. */
-    long fault_map = CALL(222, 0, 8192, 3, 0x22, -1, 0);
+    long fault_map = CALL(222, 0, 2 * ABI_PAGE_SIZE, 3, 0x22, -1, 0);
     abi_require(fault_map >= 0 &&
-                SC3(226, fault_map + 4096, 4096, 0) == 0);
+                SC3(226, fault_map + ABI_PAGE_SIZE, ABI_PAGE_SIZE, 0) == 0);
     abi_require(SC3(25, accepted, 4, LINUX_SOCK_NONBLOCK) == 0);
     struct socket_pollfd fault_ready = {.fd = accepted, .events = LINUX_POLLIN};
     struct socket_timespec fault_deadline = {.seconds = 2};
     abi_require(SC3(64, tcp_client, "cdef", 4) == 4 &&
                 SC4(73, &fault_ready, 1, &fault_deadline, 0) == 1);
     record("socket.tcp-read-bad-pointer", SC3(63, accepted,
-           (void *)(fault_map + 4096), 4));
+           (void *)(fault_map + ABI_PAGE_SIZE), 4));
     char fault_after[4] = {0};
     long fault_retained = SC3(63, accepted, fault_after, sizeof(fault_after));
     abi_record("socket.tcp-read-after-fault", fault_retained, -1, -1, 0,
@@ -692,9 +694,10 @@ void abi_socket_cases(void)
         ? SC4(73, &fault_ready, 1, &fault_deadline, 0) : second_write;
     record("socket.tcp-fault-second-ready", second_ready);
     long fault_prefix = second_ready == 1
-        ? SC3(63, accepted, (void *)(fault_map + 4094), 4) : second_ready;
+        ? SC3(63, accepted, (void *)(fault_map + ABI_PAGE_SIZE - 2), 4) : second_ready;
+    abi_require(fault_prefix == -14);
     abi_record("socket.tcp-read-partial-copy", fault_prefix, -1, -1, 0,
-               fault_prefix > 0 ? (void *)(fault_map + 4094) : 0,
+               fault_prefix > 0 ? (void *)(fault_map + ABI_PAGE_SIZE - 2) : 0,
                fault_prefix > 0 ? (usize)fault_prefix : 0);
     char fault_tail[4] = {0};
     long fault_remaining = SC3(63, accepted, fault_tail, sizeof(fault_tail));
@@ -707,7 +710,7 @@ void abi_socket_cases(void)
         : vector_second_write;
     char vector_prefix[2] = {0};
     struct abi_iovec fault_vector[2] = {
-        {vector_prefix, 2}, {(void *)(fault_map + 4096), 2}
+        {vector_prefix, 2}, {(void *)(fault_map + ABI_PAGE_SIZE), 2}
     };
     long vector_fault = vector_ready == 1
         ? SC3(65, accepted, fault_vector, 2) : vector_ready;
@@ -719,7 +722,7 @@ void abi_socket_cases(void)
     abi_record("socket.tcp-read-after-readv-fault", vector_after, -1, -1, 0,
                vector_after > 0 ? vector_tail : 0,
                vector_after > 0 ? (usize)vector_after : 0);
-    abi_require(SC2(215, fault_map, 8192) == 0);
+    abi_require(SC2(215, fault_map, 2 * ABI_PAGE_SIZE) == 0);
     record("socket.tcp-pread", accepted < 0 ? accepted
            : SC4(67, accepted, &payload, 1, 0));
     record("socket.tcp-pwrite", accepted < 0 ? accepted

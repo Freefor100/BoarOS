@@ -29,11 +29,13 @@ N3已经交付：legacy/modern VirtIO-net、受限DMA借用与复制回退、静
 
 [风险证据与重建](learning/cost-baseline.md#旧版内存释放与-virtqueue-告警2026-10-02)
 区分已经修复的机制与缺少历史现场的归因。固定root、单hart、QEMU和选定应用验收
-均不代表多用户隔离、SMP、实板或完整Linux兼容。完整比赛Harness仍缺kernel-la。
+均不代表多用户隔离、SMP、实板或完整Linux兼容。LA PCI根盘与静态整数用户态已验收，完整比赛Harness仍缺LA更广原程序、SIMD及完整平台能力。
 
 ## 近期方向
 
-本轮单核数据路径阶段一至七已交付，保留以下由测量暴露的后续边界：调整前的 TCP 默认在部分 bulk/高并发负载吞吐回退；全局协议资源不足后的复制与重试仍有成本；WB8 可能降低仅缓存完成的小写速度。网络默认已按用户选择改为 8/4/2，存储保持 RA0/WB1。重启后 1/10 ms 单向 netem 已完成 36 次补测，单连接长 RTT 的窗口候选尚未选定；完整比赛仍缺 kernel-la。后续以目标程序及直接相关回归为主，不为小改动重跑全矩阵。
+本轮单核数据路径阶段一至七已交付，保留以下由测量暴露的后续边界：默认 TCP 预算在部分 bulk/高并发负载吞吐回退；全局协议资源不足后的复制与重试仍有成本；WB8 可能降低仅缓存完成的小写速度。优先按[匹配结果](learning/data-path-budget-experiments.md)选择目标程序和候选，网络默认已按用户选择调整到 8/4/2，存储保持 RA0/WB1。受控延迟补测和具体原程序问题由兼容分支记录；完整比赛仍缺 LA 完整用户环境。
+
+兼容分支保留重启后的1/10 ms单向netem共36次补测；单连接长RTT窗口候选尚未选定，历史输入与测量边界不由LA验收替代。
 
 文件元数据的活inode复用、创建句柄初始化、O_PATH与路径truncate已交付，通用实现
 已单向合入兼容分支。路径资格、睡眠前节点引用、初始时间与显式改权的区别、截断属性
@@ -132,7 +134,7 @@ glibc四进程整命令仍增加0.73%。该轮的prepare读取、1547次FLUSH和
 | 所有权与接口子集 | fchown/fchownat已接入真实元数据；O_PATH和路径truncate已接入；完整凭据/权限、原生accept4仍有缺口；CPU-time clock、VIRTUAL/PROF timer、pipe容量操作、扩展clone/futex按具体子语义核对，不把已有整个模块记为缺失 |
 | 全局文件同步 | sync/syncfs接入单一挂载树、节点快照与durable等待；syncfs维护独立的挂载错误观察。void sync的程序退出码仍不能单独证明持久化，匿名对象不触及根盘，见[VFS契约](modules/vfs-ext4.md)。 |
 | 用户内存/信号 | mremap、按操作madvise、mlock、sigaltstack、实时信号队列、共享文件/PI futex待真实应用需求触发 |
-| 系统与平台 | 固定root查询不等于完整凭据/权限；其他行规程、完整modem控制、外部IPv6/DNS/TLS、公网配置、SMP/实板、kernel-la仍缺，不声明完整Linux兼容或硬实时 |
+| 系统与平台 | 固定root查询不等于完整凭据/权限；其他行规程、完整modem控制、外部IPv6/DNS/TLS、公网配置、SMP/实板及LA更广原程序/SIMD/完整平台环境仍缺，不声明完整Linux兼容或硬实时 |
 
 下面P/N/L小节保留稳定能力编号、契约、依赖和已有验证入口；只以上面的当前队列决定近期实施。
 
@@ -474,27 +476,62 @@ backlog 和期限回收已交付。真实用户态保护用户复制、共享 OF
 
 ## L：LoongArch 与实板支线
 
-**入口与资料**：`arch/riscv/`、架构头与 Makefile；后续拟新增 `arch/loongarch/` 和 `kernel-la`。先读 `references/README.md` 与清单中的 LoongArch 手册/文档、Linux、QEMU、VF2/2K1000LA 资料，记录具体 commit/tag/文档版本或 SHA-256。
+**入口与资料**：`arch/riscv/`、`arch/loongarch/`、架构头与 Makefile，LA首阶段入口为 `kernel-la`。先读 `references/README.md` 与清单中的 LoongArch 手册/文档、Linux、QEMU、VF2/2K1000LA 资料，记录具体 commit/tag/文档版本或 SHA-256。
 
 ### L0 架构依赖盘点
 
-- [ ] 列出通用 MM/调度对 RV 头、satp、SFENCE.VMA、trap frame、页大小和寄存器布局的直接依赖，按实际消费者提取架构操作；不复制 `arch/riscv/mm.c` 中通用 VMA/文件页策略。
-- [ ] 保留架构 MMU/context/trap 与平台 DTB/MMIO/DMA 的区分，新增接口由第二实现验证，不预建空泛 HAL。
+- [x] 列出通用 MM/调度对 RV 头、satp、SFENCE.VMA、trap frame、页大小和寄存器布局的直接依赖，按实际消费者提取架构操作；不复制 `arch/riscv/mm.c` 中通用 VMA/文件页策略。
+- [x] 保留架构 MMU/context/trap 与平台 DTB/MMIO/DMA 的区分，新增接口由第二实现验证，不预建空泛 HAL。
+
+L0–L1于2026-10-06通过首阶段验收：构建期IRQ/MMU/task/timer绑定、共用MM/uaccess/ELF策略、
+QEMU全部RAM bank与16KiB/三级用户页表、两个内核/用户任务的真实timer抢占及回收。
+512MiB/1GiB各有9组同LA ELF的固定Linux对照，另有构造/缺页OOM与回收门禁；
+RV完整架构、真实用户程序、glibc、1344条ABI和SQLite回归通过。范围见[LA首阶段](modules/loongarch-boot.md)。
 
 ### L1 最小启动与用户态
 
-- [ ] 串口→trap→timer→物理页→TLB/页表→高地址映射→一个真实 U-mode exit，每步有独立启动/故障/回收证据。
-- [ ] 延续已选 LA64 16 KiB/三级页表配置，页大小是架构构建期事实；不把目标配置描述为硬件唯一能力。只生成 `kernel-la` 不算用户态通过。
+- [x] 串口→trap→timer→物理页→TLB/页表→高地址映射→一个真实 U-mode exit，每步有独立启动/故障/回收证据。
+- [x] 延续已选 LA64 16 KiB/三级页表配置，页大小是架构构建期事实；不把目标配置描述为硬件唯一能力。只生成 `kernel-la` 不算用户态通过。
 
 ### L2 ABI 与映像
 
-- [ ] ELF 段对齐、BSS 尾页、auxv、用户栈、stat/signal 结构及 clone 寄存器逐项核对；不能只换汇编入口却保留 RV ABI 编码。
-- [ ] 同一用户源码分别编译 RV/LA ELF，每架构内部用同一 ELF 对照 Linux 与 BoarOS；共享测试语义，隔离寄存器/页表差异，不拿 RV ELF 验证 LA。
+首阶段已覆盖内存ELF段/BSS/栈/auxv、整数寄存器、基本syscall与最小fork/COW计算探针。
+statx/clone子TID、PCI根盘及LP64S静态musl已通过第二阶段验收；整数signal handler、
+sigreturn/同步故障/等待重启和静态pthread/TLS已双侧验收，含真实musl取消、
+非PI robust、线程组生命周期及任务/栈创建OOM回滚；原BusyBox ash非交互trap/wait通过。
+用户已选择原版LP64D musl与LA标量FPU路线，动态libc/解释器/初始及late DSO TLS
+和FR/FCC/FCSR/信号/clone/exec子集已双侧验收。LSX/LASX状态与扩展帧、关闭CPU扩展
+及clone标量继承/上半部初始化已按固定Linux验收；本轮指定原程序和环境矩阵
+已完成，范围外的更广程序仍未验收；已选统一VirtIO框架、内嵌SIMD状态及原版glibc2.42。
+PGDH内核栈窗口/guard/NX及可信异常栈已验收。SIMD接入后GNU启动缺失AT_RANDOM的
+SIGSEGV已定位到LA漏接QEMU DTB种子；复用不计熵的早期随机材料策略后，固定原版
+共用net/Ethernet和LA现代PCI真实TAP已在双侧两种RAM验证，原BusyBox HTTP、
+共享块/RNG/net IRQ及九类构造/reset失败回到基线。无metadata checksum的空索引目录误分类已由真实宿主/LA反例修复。AF_UNIX发送者缓存模型及sendfile datagram批次已按用户选择的Linux路线接入，
+实际双侧等待/取消/关闭及资源验收通过。共用ns16550与LA TTY/termios2/作业控制、PTY、原BusyBox交互/script和录制重启已双侧两种RAM验收，UART启动失败/fatal与owner通过；LA pipe实际持有16页与容量一致，双侧满环/wrap/关闭通过；LS7A RTC/环境已双侧两种RAM验证，派生QEMU的原Linux告警另有证据；完整ABI1366条已双架构匹配，BusyBox/libc-test229个共同ID已双架构通过（LA两种RAM）；原SQLite DELETE/WAL、多进程、静态/动态CLI与独立重启内容也已双侧两种RAM通过。
+最终RV完整架构、userland/GNU/ABI/栈、统一驱动/TTY、SQLite/NBD全恢复与双盘隔离，以及LA架构/平台失败回收均通过，一次整体审查的页边界验收问题已集中修复并完成最终回归，运行产物清理完成；不由设备通过声明所有应用等价。
+glibc2.42五形态在Linux/BoarOS两种RAM均通过退出及根owner门禁。真实PCI RNG已接入并
+完成正常/缺失/延迟/在途停止、构造OOM/IRQ失败及回收；启动种子不会提前发布random
+ready。本轮指定原程序及单核平台矩阵已验证，整体审查与集中修复完成，最终清理完成。
+共用VirtIO transport/split queue已迁入block，三个transport的真实块与LA根owner
+门禁、RV可睡眠I/O四组合已通过。RNG/net迁移及LA PCI、UART/RTC验收完成；
+本轮单核QEMU指定矩阵已完成；GNU版本差异、客体原生开发、完整Harness及范围外能力继续单列，不声明所有RV应用在LA验收。
+
+- [x] ELF 段对齐、BSS 尾页、auxv、用户栈、stat/signal 结构及 clone 寄存器逐项核对；不能只换汇编入口却保留 RV ABI 编码。
+- [x] 同一用户源码分别编译 RV/LA ELF，每架构内部用同一 ELF 对照 Linux 与 BoarOS；共享测试语义，隔离寄存器/页表差异，不拿 RV ELF 验证 LA。
+- [x] LA `PROT_EXEC` 的数据读取已按冷/驻留状态独立核对：LA PTE 使用固定 Linux
+  的非 NONE 可读权限，请求 VMA 保持原值；双侧验证冷页 fault、驻留读取、取指
+  物化、fork、uaccess 与改权。资料见[LA学习记录](learning/loongarch-bringup.md)。
 
 ### L3 扩大真实用户空间
 
-- [ ] 静态 musl→动态 musl/DSO/TLS→fork/COW/信号→共享映射→glibc→真实应用，逐层保留错误与资源回收结果。
-- [ ] 维持 RV/LA 同口径功能矩阵，缺能力记录阻塞，不让新平台回退到固定输出或修改过的用户程序。
+2026-10-06 已批准 PCI→VirtIO块→ext4根盘→静态musl 阶段。共用块队列/owner/
+超时/reset 核心共用，RV MMIO 与 LA PCI 独立负责 transport/IRQ。该阶段已通过两种RAM的
+PCI共享INTx、ext4读写/只读、原BusyBox七个applet及musl组合ABI的固定Linux对照，
+故障/OOM/页堆与BAR claim回收、真实写I/O失败owner保留，以及RV存储/SQLite回归。
+通用statx新增22条，当前RV ABI矩阵1366条匹配；完整比赛用户环境仍阻塞。
+
+- [x] 本轮指定静态 musl→动态 musl/DSO/TLS→fork/COW/信号→共享映射→glibc→真实应用矩阵，逐层保留错误与资源回收结果。
+- [x] 本轮RV/LA同口径功能矩阵已验收；后续继续记录缺能力/阻塞，不让新平台回退到固定输出或修改过的用户程序。
 
 ### L4 两块实板
 
@@ -575,7 +612,8 @@ make test-program-inventory-host test-diff-abi-host
 make inventory-userland-riscv
 ```
 
-`inventory-userland-riscv` 默认成功只说明清单生成成功。全量 228 项仍有明确缺口，严格模式失败不是自动产生的新回归；`--case` 与 `--require-pass` 只严格判定本次选择集合，未选项目保留历史结果或 `not-run`，选择集合写入状态供恢复报告解释。完整 Harness 缺 `kernel-la` 或其他能力时保留阻塞原因。
+`inventory-userland-riscv` 默认成功只说明清单生成成功。当前229项共同清单已在RV和LA两种RAM完整通过，历史228项失败保留原记录；严格模式失败不是自动产生的新回归；`--case` 与 `--require-pass` 只严格判定本次选择集合，未选项目保留历史结果或 `not-run`，选择集合写入状态供恢复报告解释。完整Harness与更广程序、客体原生开发环境仍需另行验收，按实际缺能力保留阻塞原因；
+本轮动态musl/DSO TLS、完整FPU/LSX/LASX状态、线程、终端/网络/RTC及指定程序矩阵已经独立验收。
 
 ## 范围与交付边界
 

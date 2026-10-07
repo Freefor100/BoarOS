@@ -6,6 +6,7 @@
 #include <arch/riscv/virtio_mmio_block.h>
 #include <arch/riscv/virtio_mmio_rng.h>
 #include <kernel/network.h>
+#include <arch/riscv/virtio_mmio_net.h>
 #include <kernel/dtb.h>
 #include <kernel/elf64_source.h>
 #include <kernel/exec_image.h>
@@ -65,6 +66,7 @@ struct riscv_root_boot {
     struct riscv_uart_statistics uart_statistics;
     struct riscv_virtio_mmio_rng rng;
     struct kernel_network *network;
+    struct virtio_net_device net_device;
     struct kernel_heap heap;
     struct kernel_page_cache page_cache;
     struct riscv_virtio_mmio_block device;
@@ -94,6 +96,8 @@ struct riscv_virtio_mmio_block *riscv_root_boot_device(
  * return success only when all DMA ownership was reclaimed. */
 int riscv_root_boot_start_rng(struct riscv_root_boot *root,
     const struct dtb_boot_info *info, const struct dtb_irq_info *irq);
+
+int riscv_root_boot_start_network(struct riscv_root_boot *,const struct dtb_boot_info *,const struct dtb_irq_info *);
 
 /* Scheduler initialization must precede this call. */
 enum riscv_root_boot_status riscv_root_boot_start(
