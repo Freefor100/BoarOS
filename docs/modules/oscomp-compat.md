@@ -2,7 +2,8 @@
 
 本模块仅存在于oscomp-compat。main保留通用内核和自身身份；通用修复先落main再
 单向合入此分支。本分支保留兼容uname4.15.0、原盘启动配置、监督与判分。分支
-由oscomp-rv-compat本地改名，旧远程引用没有迁移。历史RV专项记录仍保留原身份。
+由oscomp-rv-compat更名，现行维护名称为oscomp-compat，与main共同保留。旧名称
+仅用于历史提交与RV专项结果身份；运行时DSO留在本分支，main默认不预加载。
 输入与逐次失败的证据边界见[评测学习记录](../learning/oscomp-compat-baseline.md)。
 
 ## 固定输入与入口
