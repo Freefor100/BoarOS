@@ -1,7 +1,7 @@
 #!/musl/busybox sh
 set -e
 BB=/musl/busybox
-$BB mkdir -p /bin /lib /usr/lib64 /tmp /dev/misc /dev/block /dev/shm /proc
+$BB mkdir -p /bin /lib /lib64 /usr/lib64 /tmp /dev/misc /dev/block /dev/shm /proc
 $BB --install -s /bin
 $BB ln -s /musl/busybox /bin/busybox
 # BOAROS_LOADER_LINKS

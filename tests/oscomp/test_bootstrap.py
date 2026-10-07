@@ -33,6 +33,7 @@ class BootstrapTests(unittest.TestCase):
         profile = json.loads(target.read_text())
         script = profile['argv'][3]
         self.assertIn('/lib/ld-linux-loongarch-lp64d.so.1', script)
+        self.assertIn(' /lib64/ld-linux-loongarch-lp64d.so.1', script)
         self.assertIn('/usr/lib64/ld-linux-loongarch-lp64d.so.1', script)
         self.assertIn('/lib/ld-musl-loongarch64.so.1', script)
         self.assertNotIn('ld-linux-riscv64', script)

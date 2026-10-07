@@ -526,3 +526,8 @@ transitional与`disable-modern=on`的纯legacy负例；不能以移除disable-le
 HTML中，hooks/console_log已被上游清空。实际GCC13.2不识别-mno-lsx/-mno-lasx，
 容器profile改为LP64S/soft-float和禁止C自动向量化。未改原Harness或原用户程序；
 编译成功与串口运行、判分及资源基线必须分别验证。
+
+原盘libc自身的PT_INTERP不是所有程序的interpreter清单。进一步读取LA
+`/glibc/basic/brk`和`/musl/basic/brk`发现二者相同，都请求/lib64/ld-linux-loongarch-lp64d.so.1。
+Linux同ELF的缺链接127/原loader链接0反例确认环境归属；bootstrap同时建立
+/lib、/lib64、/usr/lib64的原盘loader链接，不替换runtime或修改原程序。

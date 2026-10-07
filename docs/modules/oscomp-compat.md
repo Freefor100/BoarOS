@@ -110,3 +110,10 @@ LTP能力缺口，也不修改原程序/libc/judge获取通过。
 Job为Compile Error且没有串口。official入口在采集串口前分类该状态。镜像构建
 显式使用LP64S/soft-float并禁自动向量化；主机GCC15默认参数保持，手写SIMD
 保存汇编仍参与构建。构建环境写入identity，不能用Docker返回0推断编译成功。
+
+原LA basic两套目录的brk ELF完全相同，SHA-256
+`d3882df3c12108f783d23be0db1eb66429f750686d54ac1151f545067f0c9310`，
+PT_INTERP为`/lib64/ld-linux-loongarch-lp64d.so.1`，另需现有`/lib`与`/usr/lib64`
+路径。固定Linux同ELF缺链接退出127、补原盘loader链接退出0；bootstrap发布
+三个链接，原盘程序与runtime不变。第二次容器已编译并启动两侧，发现此准备错误后
+主动结束，资源回收未验证；该流不作为正式总分，也不拼接后续运行。
