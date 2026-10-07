@@ -1,6 +1,6 @@
 #!/bin/sh
 set -eu
-case "${1:-all}" in all|ownership|truncate) ;; *) echo 'usage: lwext4-metadata-host.sh [all|ownership|truncate]' >&2; exit 2;; esac
+case "${1:-all}" in all|ownership|truncate|extent) ;; *) echo 'usage: lwext4-metadata-host.sh [all|ownership|truncate|extent]' >&2; exit 2;; esac
 root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT HUP INT TERM
@@ -9,7 +9,7 @@ check_fs() {
 }
 ${HOST_CC:-cc} -std=gnu11 -O1 -g -Wall -Wextra -Werror \
     -Wno-unused-but-set-variable -Wno-stringop-truncation \
-    -DCONFIG_USE_DEFAULT_CFG=1 -DCONFIG_USE_USER_MALLOC=1 \
+    -DCONFIG_USE_DEFAULT_CFG=1 -DCONFIG_USE_USER_MALLOC=1 -DCONFIG_DEBUG_ASSERT=0 \
     -include "$root/tests/host/lwext4_memory.h" \
     -I"$root/third_party/lwext4/include" -idirafter "$root/include" \
     "$root"/third_party/lwext4/src/*.c "$root/tests/host/lwext4_metadata.c" \
@@ -20,6 +20,22 @@ for block in 1024 4096; do
         mkfs.ext4 -q -F -b "$block" -I "$inode" "$work/base.img"
         overhead=$(dumpe2fs -h "$work/base.img" 2>/dev/null | sed -n 's/^Overhead clusters:[[:space:]]*//p')
         "$work/probe" "$work/base.img" seed
+        if [ "${1:-all}" = all ] || [ "${1:-all}" = extent ]; then
+            cp "$work/base.img" "$work/test.img"
+            attempts=$("$work/probe" "$work/test.img" extent-read-oom)
+            point=1
+            while [ "$point" -le "$attempts" ]; do
+                cp "$work/base.img" "$work/test.img"
+                "$work/probe" "$work/test.img" extent-read-oom "$point" > /dev/null
+                check_fs "$work/test.img"
+                point=$((point+1))
+            done
+            cp "$work/base.img" "$work/test.img"
+            "$work/probe" "$work/test.img" extent-read-error > /dev/null
+            check_fs "$work/test.img"
+            printf 'PASS: extent read block=%s inode=%s allocations=%s; OOM/read errors and owners\n' "$block" "$inode" "$attempts"
+        fi
+        if [ "${1:-all}" = extent ]; then continue; fi
         modes="owner owner-ro owner-shared owner-shared-unlink truncate-shared"
         if [ "${1:-all}" = truncate ]; then modes="truncate-shared"; fi
         for mode in $modes; do

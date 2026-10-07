@@ -2,6 +2,7 @@
 #include "block_fault.h"
 #include <ext4.h>
 #include <ext4_fs.h>
+#include <ext4_extent.h>
 #include <ext4_inode.h>
 #include <ext4_super.h>
 #include <ext4_block_group.h>
@@ -15,16 +16,16 @@
 #include <string.h>
 
 static struct fault_block disk;
-static unsigned allocations, fail_allocation, reads, fail_read;
+static unsigned allocations, fail_allocation, reads, fail_read, live_allocations;
 static size_t payload_threshold;
 static unsigned payload_allocations;
 static uint64_t forbidden_lba = UINT64_MAX, forbidden_writes;
 static void (*write_interleave)(void);
 #define CHECK(x) do { if (!(x)) { fprintf(stderr,"%d: %s (alloc=%u fail=%u)\n",__LINE__,#x,allocations,fail_allocation); exit(1); } } while (0)
-void *ext4_user_malloc(size_t n) { if(payload_threshold && n>=payload_threshold)payload_allocations++; return ++allocations == fail_allocation ? NULL : malloc(n); }
-void *ext4_user_calloc(size_t n,size_t s) { if(payload_threshold && n*s>=payload_threshold)payload_allocations++; return ++allocations == fail_allocation ? NULL : calloc(n,s); }
-void *ext4_user_realloc(void *p,size_t n) { return ++allocations == fail_allocation ? NULL : realloc(p,n); }
-void ext4_user_free(void *p) { free(p); }
+void *ext4_user_malloc(size_t n) { if(payload_threshold && n>=payload_threshold)payload_allocations++; if(++allocations==fail_allocation)return NULL;void *p=malloc(n);if(p)live_allocations++;return p; }
+void *ext4_user_calloc(size_t n,size_t s) { if(payload_threshold && n*s>=payload_threshold)payload_allocations++; if(++allocations==fail_allocation)return NULL;void *p=calloc(n,s);if(p)live_allocations++;return p; }
+void *ext4_user_realloc(void *p,size_t n) { if(++allocations==fail_allocation)return NULL;void *next=realloc(p,n);if(next&&!p)live_allocations++;return next; }
+void ext4_user_free(void *p) { if(p){CHECK(live_allocations);live_allocations--;}free(p); }
 static int dev_open(struct ext4_blockdev *b) { (void)b; return EOK; }
 static int dev_read(struct ext4_blockdev *b,void *p,uint64_t n,uint32_t c)
 { (void)b; if (++reads == fail_read) return EIO; return kernel_block_read_at(&disk.device,n*512,p,(size_t)c*512) == KERNEL_BLOCK_STATUS_OK ? EOK : EIO; }
@@ -752,6 +753,38 @@ static void corrupt_stats(struct ext4_fs *fs,const char *kind)
     if(memcmp(&stats,&before,sizeof(stats)) || disk.writes!=writes || fs->bdev->fs!=fs) fprintf(stderr,"corrupt %s bytes=%d writes=%llu/%llu owner=%d\n",kind,memcmp(&stats,&before,sizeof(stats)),(unsigned long long)disk.writes,(unsigned long long)writes,fs->bdev->fs==fs);
     CHECK(!memcmp(&stats,&before,sizeof(stats)) && disk.writes==writes && fs->bdev->fs==fs);
 }
+static void extent_read_failure(struct ext4_blockdev *dev, bool io, unsigned point)
+{
+    ext4_file f;unsigned char byte=0x5a;size_t written;
+    uint32_t block_size=dev->lg_bsize;
+    CHECK(ext4_fopen(&f,"/fragmented","w+")==EOK);
+    for(unsigned i=0;i<8;i++) {
+        CHECK(ext4_fseek(&f,(uint64_t)i*2*block_size,SEEK_SET)==EOK);
+        CHECK(ext4_fwrite(&f,&byte,1,&written)==EOK && written==1);
+    }
+    /* 冷挂载让树块必须重新取得引用，避免预热缓存绕过失败路径。 */
+    CHECK(ext4_fclose(&f)==EOK && ext4_umount("/")==EOK);
+    CHECK(!live_allocations);
+    CHECK(ext4_mount("metadata","/",false)==EOK && ext4_journal_start("/")==EOK);
+    CHECK(ext4_fopen(&f,"/fragmented","r")==EOK);
+    struct ext4_inode_ref ref;
+    CHECK(ext4_fs_get_inode_ref(dev->fs,f.inode,&ref)==EOK);
+    unsigned before=allocations;
+    if(io)fail_read=reads+1;
+    else if(point)fail_allocation=allocations+point;
+    ext4_fsblk_t physical;uint32_t count;
+    int r=ext4_extent_get_blocks(&ref,0,1,&physical,false,&count);
+    unsigned attempts=allocations-before;
+    fail_allocation=fail_read=0;
+    CHECK(r==(io?EIO:point?ENOMEM:EOK));
+    /* 失败不能消费调用者的 inode；同一 owner 随后可读并正常收口。 */
+    CHECK(ext4_extent_get_blocks(&ref,0,1,&physical,false,&count)==EOK && physical && count==1);
+    CHECK(ext4_fs_put_inode_ref(&ref)==EOK);
+    CHECK(ext4_fread(&f,&byte,1,&written)==EOK && written==1 && byte==0x5a);
+    CHECK(ext4_fclose(&f)==EOK);
+    printf("%u\n",attempts);
+}
+
 int main(int argc,char **argv)
 {
     if(argc==2 && !strcmp(argv[1],"bitmap")){bitmap_test();return 0;}
@@ -764,7 +797,9 @@ int main(int argc,char **argv)
     if(ext4_sb_feature_com(&dev.fs->sb,EXT4_FCOM_HAS_JOURNAL)) {
         CHECK(ext4_recover("/")==EOK);CHECK(ext4_journal_start("/")==EOK);CHECK(ext4_orphan_recover("/")==EOK);
     }
-    if(!strcmp(argv[2],"seed"))seed();
+    if(!strcmp(argv[2],"extent-read-oom") || !strcmp(argv[2],"extent-read-error"))
+        extent_read_failure(&dev,!strcmp(argv[2],"extent-read-error"),argc>3?strtoul(argv[3],NULL,10):0);
+    else if(!strcmp(argv[2],"seed"))seed();
     else if(!strcmp(argv[2],"cost"))cost_test(dev.fs);
     else if(!strcmp(argv[2],"group"))group_test(dev.fs);
     else if(!strcmp(argv[2],"group-namespace-truncate"))group_namespace(dev.fs,false);
@@ -819,5 +854,7 @@ int main(int argc,char **argv)
         if(!strncmp(argv[2],"write-",6) || !strncmp(argv[2],"flush-",6))return 0;
     }
     else CHECK(!"unknown mode");
-    CHECK(ext4_umount("/")==EOK);fault_block_close(&disk);return 0;
+    CHECK(ext4_umount("/")==EOK);
+    if(!strncmp(argv[2],"extent-read-",12))CHECK(!live_allocations);
+    fault_block_close(&disk);return 0;
 }
