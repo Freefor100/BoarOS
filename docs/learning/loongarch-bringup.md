@@ -486,3 +486,12 @@ kernel-rv `e4cc9dbe43c01b9d03b276350e92a8e2ff4250dd2bda42ae2422c4f5d087d11a`，
 临时目录/日志/镜像及旧缓存，复查预览0项；未保留临时plan、ledger或review package。
 LP64D musl、两种GNU runtime、原版/派生QEMU、两套LA Linux及编译产物缓存保留，
 清理后内容/模式/链接/构建配置身份再检查通过。提交沿main，未push或发布。
+
+## 转入原评测镜像（2026-10-07）
+
+最新main已单向合入兼容分支，本地分支随后改名oscomp-compat，旧远程引用保留。
+下一阶段采用固定Harness原Docker入口与原judge，保留300秒LTP监督；原盘程序
+与独立musl/GNU验收输入分别记录。固定pre-20250615 LA盘的loader为
+`/glibc/lib/ld-linux-loongarch-lp64d.so.1`，原libc的PT_INTERP还引用
+`/usr/lib64/ld-linux-loongarch-lp64d.so.1`；RV链接名不能机械迁移到LA。
+官方容器和原盘结果尚未取得，本轮指定矩阵仍保持既有证据边界。

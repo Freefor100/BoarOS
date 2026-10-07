@@ -160,7 +160,7 @@ UDP 排队同时受每 socket 配额与共享协议堆约束。队列不能耗�
 
 原 ELF 输入来自公共镜像，版本为 iperf 3.13、netperf 2.7.0。执行器保存实际
 argv、工作目录、接收端结果、wait status、时间及机器输入身份。旧 glibc 必须
-在 oscomp-rv-compat 运行；main 不改 uname。原脚本与每项新服务端的受控流程
+在 oscomp-compat 运行；main 不改 uname。原脚本与每项新服务端的受控流程
 分开验收，listener ready 使用实际输出握手，客户端参数保持原值。
 
 ```sh
