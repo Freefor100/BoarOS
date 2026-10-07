@@ -113,6 +113,9 @@ LTP能力缺口，也不修改原程序/libc/judge获取通过。
 因此`baseline_established=true`、`all_scripts_completed=false`、
 `program_matrix_passed=false`。两侧均由总预算终止，正常PID1及页、堆、任务栈、
 根盘和设备owner回收未验证。该原分是本次单独联合成绩，不表示44组全过。
+44项分组score的完整精度及总分公式见
+[原Job成绩表](../learning/oscomp-dual-official-results.tsv)和
+[预算/监督说明](../learning/oscomp-compat-baseline.md#本次正式容器结果)。
 评测同时运行主机正确性回归；本次原分不作为无干扰吞吐或时延对比。
 
 容器首跑在原Harness的编译阶段失败：实际GCC13.2不接受-mno-lsx/-mno-lasx，

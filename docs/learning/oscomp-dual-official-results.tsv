@@ -1,0 +1,45 @@
+group	arch	libc	judge_group_score	wrapper_state	note
+basic	riscv	glibc	90.0	completed	wrapper completion does not prove all subcases passed
+basic	riscv	musl	90.0	completed	wrapper completion does not prove all subcases passed
+basic	loongarch	glibc	90.0	completed	wrapper completion does not prove all subcases passed
+basic	loongarch	musl	90.0	completed	wrapper completion does not prove all subcases passed
+busybox	riscv	glibc	54.0	completed	wrapper completion does not prove all subcases passed
+busybox	riscv	musl	54.0	completed	wrapper completion does not prove all subcases passed
+busybox	loongarch	glibc	54.0	completed	wrapper completion does not prove all subcases passed
+busybox	loongarch	musl	54.0	completed	wrapper completion does not prove all subcases passed
+cyclictest	riscv	glibc	7.191630898254706	completed	wrapper completion does not prove all subcases passed
+cyclictest	riscv	musl	7.496873857361099	completed	wrapper completion does not prove all subcases passed
+cyclictest	loongarch	glibc	7.127166870827373	completed	wrapper completion does not prove all subcases passed
+cyclictest	loongarch	musl	0.0	completed	entered group; original report recorded load errors; not not-reached
+iozone	riscv	glibc	27.903198015498447	completed	wrapper completion does not prove all subcases passed
+iozone	riscv	musl	27.732140335659196	completed	wrapper completion does not prove all subcases passed
+iozone	loongarch	glibc	30.45882678018216	completed	wrapper completion does not prove all subcases passed
+iozone	loongarch	musl	0.0	completed	entered group; original report recorded load errors; not not-reached
+iperf	riscv	glibc	6.0	completed	wrapper completion does not prove all subcases passed
+iperf	riscv	musl	6.0	completed	wrapper completion does not prove all subcases passed
+iperf	loongarch	glibc	6.0	completed	wrapper completion does not prove all subcases passed
+iperf	loongarch	musl	6.0	completed	wrapper completion does not prove all subcases passed
+libcbench	riscv	glibc	39.01738150369682	completed	wrapper completion does not prove all subcases passed
+libcbench	riscv	musl	31.903180116473287	completed	wrapper completion does not prove all subcases passed
+libcbench	loongarch	glibc	42.45274946183348	completed	wrapper completion does not prove all subcases passed
+libcbench	loongarch	musl	37.399706962506514	completed	wrapper completion does not prove all subcases passed
+libctest	riscv	glibc	178.0	completed	wrapper completion does not prove all subcases passed
+libctest	riscv	musl	217.0	completed	wrapper completion does not prove all subcases passed
+libctest	loongarch	glibc	179.0	completed	wrapper completion does not prove all subcases passed
+libctest	loongarch	musl	0.0	completed	entered group; original report recorded load errors; not not-reached
+lmbench	riscv	glibc	51.90273784920322	completed	wrapper completion does not prove all subcases passed
+lmbench	riscv	musl	51.44904531823733	completed	wrapper completion does not prove all subcases passed
+lmbench	loongarch	glibc	53.58220004662065	completed	wrapper completion does not prove all subcases passed
+lmbench	loongarch	musl	53.233247141880796	completed	wrapper completion does not prove all subcases passed
+lua	riscv	glibc	9.0	completed	wrapper completion does not prove all subcases passed
+lua	riscv	musl	9.0	completed	wrapper completion does not prove all subcases passed
+lua	loongarch	glibc	9.0	completed	wrapper completion does not prove all subcases passed
+lua	loongarch	musl	9.0	completed	wrapper completion does not prove all subcases passed
+netperf	riscv	glibc	8.276886682195428	completed	wrapper completion does not prove all subcases passed
+netperf	riscv	musl	8.224836937863198	completed	wrapper completion does not prove all subcases passed
+netperf	loongarch	glibc	8.783979396310333	completed	wrapper completion does not prove all subcases passed
+netperf	loongarch	musl	0.0	completed	entered group; original report recorded load errors; not not-reached
+ltp	riscv	glibc	920.0	timeout	raw LTP score before joint nonlinear formula
+ltp	riscv	musl	0.0	not-reached	not executed; zero is not a failure result
+ltp	loongarch	glibc	908.0	timeout	raw LTP score before joint nonlinear formula
+ltp	loongarch	musl	0.0	not-reached	not executed; zero is not a failure result

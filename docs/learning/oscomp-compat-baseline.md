@@ -56,6 +56,11 @@ observer，分开记录采集器提交与实际内核提交；此操作本身不
 
 ## 本次正式容器结果
 
+44项原Job分组score的完整精度数据见
+[分组成绩表](oscomp-dual-official-results.tsv)。此表从清理前在本会话核对的同次
+原Job `rank` 转录，不是重新运行或混用历史RV成绩；最新原串口/Job已被清理，
+更细的逐程序输出、终止现场和正常单项耗时不能从这份组分数表逆推出。
+
 冻结的BoarOS提交与最终采集器均为
 `11e96a95ff37158be5036fe99cced9bd17cc5575`，tree为
 `86885b475407f61104b455b473c19c4492e6cfcb`，采集时工作树干净。
@@ -70,6 +75,18 @@ observer，分开记录采集器提交与实际内核提交；此操作本身不
 | LTP-glibc | 875项状态，27项源码helper跳过 | 1035项状态，27项源码helper跳过 |
 | 正常PID1及页/堆/任务栈/根盘/设备收口 | 预算结束，未验证 | 预算结束，未验证 |
 
+只有LTP-musl未到达；前面十类组中的musl均已进入。bootstrap按组顺序执行，
+每组先glibc再musl，所以LTP-glibc未结束时不能开始LTP-musl。300秒限制是每个
+被监督命令的上限，不是整个LTP-glibc的上限，也不为后续libc预留总预算。
+本次采集摘要的两侧 `supervision.timed_out` 均为0：没有完成的TIMEOUT-END记录，
+不能用总预算截止反推某个命令越过单项上限，或断言最后命令永久卡住。
+
+`ltp-skips.tsv`与旧兼容提交47cf15a完全一致，34项表的SHA-256仍为
+`75b01a673bde74a003d1c92c3fb14476b2fefc55ca8ac79c6c1006208279ad2b`；
+本次已走到的区间两侧各命中27项。额外 `diagnostic_exclusions` 是空列表。
+静态跳过只涵盖已核实缺控制器/输入的辅助程序，有限但昂贵的压力测试没有因此
+自动进入跳过表。现有监督/跳过接入没有丢失，但不能保证两套完整LTP在3600秒跑完。
+
 两侧的 `fs_fill` 均只报告一次TBROK，因准备 `test_dev.img` 返回ENOSYS而未运行主体。
 其他错误、skip和ELF loader阶段仍按原串口、shell状态与结构化观察归属；观察项计数
 不能等同互不重复的失败测例数。
@@ -79,6 +96,12 @@ observer，分开记录采集器提交与实际内核提交；此操作本身不
 `results_captured=true`，同时标为 `all_scripts_completed=false`、
 `program_matrix_passed=false`。40个组正常结束不等于其中的测例都通过；
 组内失败、跳过和loader错误继续以原串口及结构化观察逐项保存。
+
+固定 `references/oscomp-autotest@d1bb3a3c4b27274e196a2648518525c1a304e339`
+的 `kernel/postwork.py::postwork()` 对每种libc的RV/LA原LTP分之和应用
+`500 * log10(1 + 9 * clamp(raw, 0, 10000) / 10000)`。本次非LTP合计
+1704.1357881746039，LTP-glibc原分920+908=1828，换算211.229257015972，
+LTP-musl未运行贡献0，最终1915.3650451905762，Job取整数1915；不得直接相加44格。
 
 两侧原 `fs_fill` 都在测试设备准备阶段报告 `Failed to create test_dev.img: ENOSYS`
 和 `Failed to acquire device`，TBROK、shell status 6。两侧没有新的
