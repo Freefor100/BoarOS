@@ -1,4 +1,11 @@
-LA_CROSS_COMPILE ?= loongarch64-unknown-linux-gnu-
+LA_CROSS_COMPILE ?= $(shell \
+	if command -v loongarch64-unknown-linux-gnu-gcc >/dev/null 2>&1; then \
+		printf '%s' loongarch64-unknown-linux-gnu-; \
+	elif command -v loongarch64-linux-gnu-gcc >/dev/null 2>&1; then \
+		printf '%s' loongarch64-linux-gnu-; \
+	else \
+		printf '%s' loongarch64-unknown-linux-gnu-; \
+	fi)
 QEMU_LOONGARCH64 ?= build/qemu-la-rtc/qemu-system-loongarch64
 LA_BUILD := build/loongarch
 LA_CC := $(LA_CROSS_COMPILE)gcc
@@ -110,8 +117,8 @@ ifeq ($(QEMU_LOONGARCH64),build/qemu-la-rtc/qemu-system-loongarch64)
 test-loongarch-fatal: prepare-la-tools
 endif
 
-$(LA_BUILD)/generated/init-config.h: force-init-config $(INIT_CONFIG) tools/init-config.py
-	python3 -B tools/init-config.py $(INIT_CONFIG) $@
+$(LA_BUILD)/generated/init-config.h: force-init-config $(INIT_CONFIG_LA) tools/init-config.py
+	python3 -B tools/init-config.py $(INIT_CONFIG_LA) $@
 $(LA_BUILD)/platform/loongarch_root.o: $(LA_BUILD)/generated/init-config.h
 $(LA_BUILD)/platform/loongarch_root.o: LA_CPPFLAGS += -I$(LA_BUILD)/generated
 .PHONY: prepare-la-userland test-root-loongarch

@@ -1,0 +1,46 @@
+name: OSComp supervised RV and LA baseline
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: oscomp-compat-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  official-container:
+    if: github.ref == 'refs/heads/oscomp-compat'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Install host preparation dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential e2fsprogs python3-jinja2 python3-pytz xz-utils
+      - name: Restore exact release inputs
+        run: make prepare-oscomp-inputs
+      - name: Run host contracts
+        run: make test-oscomp-host
+      - name: Fetch immutable official container
+        run: |
+          image=$(python3 -c "import json;print(json.load(open('tests/oscomp/inputs.json'))['container']['reference'])")
+          docker pull "$image"
+      - name: Run the original dual-architecture Docker Harness
+        run: make test-oscomp-official
+      - name: Preserve reports and complete actual streams
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: oscomp-supervised-dual-architecture
+          path: |
+            build/oscomp-official-*/report.json
+            build/oscomp-official-*/identity.json
+            build/oscomp-official-*/container-identity.json
+            build/oscomp-official-*/harness.log
+            build/oscomp-official-*/original-job.json
+            build/oscomp-official-*/judge-*.json
+            build/oscomp-official-*/submit/os_serial_out_*.txt
+            build/oscomp-official-*/hooks/console_log
+          if-no-files-found: warn

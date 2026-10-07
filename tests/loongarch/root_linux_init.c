@@ -20,6 +20,9 @@ int user_main(uint64_t *stack)
     /* RV固定profile无initrd；根盘已由Linux挂载，保留真实wait与durable门禁。 */
     long direct_child=call(220,17,0,0,0,0,0);
     if(!direct_child) {
+#ifdef ROOT_CREATE_SESSION
+        if(call(157,0,0,0,0,0,0)<0)call(93,96,0,0,0,0,0);
+#endif
         const char *argv[]={"/init",0},*env[]={0};
         call(221,(long)"/init",(long)argv,(long)env,0,0,0);
         call(93,99,0,0,0,0,0);for(;;){}
@@ -51,6 +54,10 @@ int user_main(uint64_t *stack)
         long child=call(220,17,0,0,0,0,0);
         if(child==0) {
             if(call(51,(long)"/root",0,0,0,0,0) || call(49,(long)"/",0,0,0,0,0)) call(93,98,0,0,0,0,0);
+#ifdef ROOT_CREATE_SESSION
+            /* 原Linux init继承PGID0；监督入口需要真实存活的正进程组身份。 */
+            if(call(157,0,0,0,0,0,0)<0)call(93,96,0,0,0,0,0);
+#endif
 #ifdef ROOT_NETWORK_SETUP
             if(call(34,-100,(long)"/proc",0755,0,0,0)<0 ||
                call(40,(long)"proc",(long)"/proc",(long)"proc",0,0,0)) call(93,97,0,0,0,0,0);

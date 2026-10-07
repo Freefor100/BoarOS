@@ -1,6 +1,6 @@
 #!/bin/sh
 # 只给官方脚本的单项执行点接监督；不换目录、不改参数、不生成测例清单。
-set -eu
+set -e
 if [ "$#" -ne 2 ]; then exit 125; fi
 count=$(grep -c '^[[:space:]]*"\$file"[[:space:]]*$' "$1" || :)
 if [ "$count" != 1 ]; then

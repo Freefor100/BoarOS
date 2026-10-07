@@ -3,6 +3,7 @@
 import argparse
 import json
 import re
+import struct
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -10,6 +11,7 @@ HERE = Path(__file__).resolve().parent
 
 def main():
     parser = argparse.ArgumentParser(__doc__)
+    parser.add_argument('--arch', choices=('riscv', 'loongarch'), default='riscv')
     parser.add_argument('--case', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--groups', default='basic busybox cyclictest iozone iperf libcbench libctest lmbench lua netperf ltp')
@@ -24,8 +26,16 @@ def main():
     exclusions = args.diagnostic_exclude.split()
     if any(not re.fullmatch(r'[A-Za-z0-9_.-]+', name) or name in ('.', '..') for name in exclusions):
         parser.error('diagnostic exclusions must be literal LTP basenames')
-    payload = ''.join(f'\\0{byte:03o}' for byte in args.case.read_bytes())
+    facts = json.loads((HERE / 'inputs.json').read_text())['architectures'][args.arch]
+    helper = args.case.read_bytes()
+    if (len(helper) < 64 or helper[:7] != b'\x7fELF\x02\x01\x01' or
+            struct.unpack_from('<H', helper, 18)[0] != facts['elf_machine']):
+        parser.error('supervisor machine or ELF64 ABI differs from target')
+    payload = ''.join(f'\\0{byte:03o}' for byte in helper)
     startup = (HERE / 'init.sh').read_text()
+    links = '\n'.join('$BB ln -s ' + source + ' ' + target
+                      for source, target in facts['loader_links'])
+    startup = startup.replace('# BOAROS_LOADER_LINKS', links)
     # Decode a build-owned executable with the original BusyBox; no host disk injection.
     startup = startup.replace('# BOAROS_CASE_PAYLOAD',
         f"$BB printf '%b' '{payload}' > /tmp/boaros-case\n$BB chmod 755 /tmp/boaros-case\n"
@@ -37,6 +47,7 @@ def main():
         + (HERE / 'ltp-skips.tsv').read_text() + '\nBOAROS_LTP_SKIPS_END')
     profile = {'path': '/musl/busybox', 'argv': ['/musl/busybox', 'sh', '-c', startup],
                'envp': ['PATH=/musl','HOME=/','TERM=vt100',
+                        'BOAROS_EVAL_ARCH=' + args.arch,
                         'BOAROS_EVAL_GROUPS=' + args.groups,
                         'BOAROS_LTP_CASE_TIMEOUT=' + str(args.case_timeout),
                         'BOAROS_DIAGNOSTIC_EXCLUDE=' + ' '.join(exclusions)]}

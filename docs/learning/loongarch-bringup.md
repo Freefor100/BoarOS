@@ -495,3 +495,15 @@ LP64D musl、两种GNU runtime、原版/派生QEMU、两套LA Linux及编译产�
 `/glibc/lib/ld-linux-loongarch-lp64d.so.1`，原libc的PT_INTERP还引用
 `/usr/lib64/ld-linux-loongarch-lp64d.so.1`；RV链接名不能机械迁移到LA。
 官方容器和原盘结果尚未取得，本轮指定矩阵仍保持既有证据边界。
+
+## 原盘hush与运行监督（2026-10-07）
+
+固定pre-20250615 LA BusyBox1.33.1在固定Linux上实际拒绝set -u/-f，-e又会在
+空while正常结束时退出。自有LTP适配器改为显式失败检查、literal空格拆分和
+受控读取；保持源码helper跳过125、超时124、native状态，不修改原shell或程序。
+监督probe按实际单层LTP调用关系运行；双层嵌套会使临时进程组失去成员，不能
+拿它当原执行流。无shebang的自有脚本在原hush/musl Linux也不能执行，host
+/bin/sh的文本回退不能套用为原盘保证；正向forwarding使用有效shebang。
+官方镜像已实际取得，digest为85dec949df7cef41fd03d30c6ad69f952204540e18d2c62bced9d2e262fef12d，
+QEMU10.0.2、两侧GCC13.2.0、Python3.12.3和make4.3。固定Dockerfile的版本描述
+不是这个镜像的二进制身份；原盘libc仍与独立验收runtime分别记录。

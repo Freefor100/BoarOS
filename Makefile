@@ -630,30 +630,51 @@ OSCOMP_CASE_TIMEOUT ?= 300
 OSCOMP_DIAGNOSTIC_EXCLUDE ?=
 OSCOMP_CASE := $(BUILD_DIR)/oscomp/case
 OSCOMP_INIT := $(BUILD_DIR)/oscomp/init.json
+OSCOMP_CASE_LA := build/loongarch/oscomp/case
+OSCOMP_INIT_LA := build/loongarch/oscomp/init.json
 .DEFAULT_GOAL := all
 
-$(OSCOMP_CASE): tests/oscomp/case.c tests/riscv/user_elf.ld
+$(OSCOMP_CASE): tests/oscomp/case.c tests/common/raw_syscall.h tests/riscv/user_elf.ld
 	@mkdir -p $(@D)
 	$(CC) $(ARCH_FLAGS) -O2 -ffreestanding -fno-builtin -fno-stack-protector \
 		-nostdlib -static -s -Wall -Wextra -Werror -Wl,--build-id=none \
 		-Wl,-T,tests/riscv/user_elf.ld -o $@ $<
 
+$(OSCOMP_CASE_LA): tests/oscomp/case.c tests/common/raw_syscall.h tests/loongarch/user.ld
+	@mkdir -p $(@D)
+	$(LA_CC) $(LA_FLAGS) -O2 -ffreestanding -fno-builtin -fno-stack-protector \
+		-nostdlib -static -s -Wall -Wextra -Werror -Wl,--build-id=none \
+		-Wl,-z,max-page-size=16384 -Wl,-T,tests/loongarch/user.ld -o $@ $<
+
 .PHONY: force-oscomp-init
 force-oscomp-init:
 
-$(OSCOMP_INIT): force-oscomp-init $(OSCOMP_CASE) tests/oscomp/init.sh tests/oscomp/ltp-hook.sh tests/oscomp/prepare.py
-	python3 -B tests/oscomp/prepare.py --case $(OSCOMP_CASE) --output $@ \
+$(OSCOMP_INIT): force-oscomp-init $(OSCOMP_CASE) tests/oscomp/init.sh tests/oscomp/ltp-hook.sh tests/oscomp/ltp-case.sh tests/oscomp/ltp-skips.tsv tests/oscomp/inputs.json tests/oscomp/prepare.py
+	python3 -B tests/oscomp/prepare.py --arch riscv --case $(OSCOMP_CASE) --output $@ \
 		--groups '$(OSCOMP_GROUPS)' --case-timeout $(OSCOMP_CASE_TIMEOUT) \
 		--diagnostic-exclude '$(OSCOMP_DIAGNOSTIC_EXCLUDE)'
 
-all: $(KERNEL_RV)
+$(OSCOMP_INIT_LA): force-oscomp-init $(OSCOMP_CASE_LA) tests/oscomp/init.sh tests/oscomp/ltp-hook.sh tests/oscomp/ltp-case.sh tests/oscomp/ltp-skips.tsv tests/oscomp/inputs.json tests/oscomp/prepare.py
+	python3 -B tests/oscomp/prepare.py --arch loongarch --case $(OSCOMP_CASE_LA) --output $@ \
+		--groups '$(OSCOMP_GROUPS)' --case-timeout $(OSCOMP_CASE_TIMEOUT) \
+		--diagnostic-exclude '$(OSCOMP_DIAGNOSTIC_EXCLUDE)'
 
-INIT_CONFIG ?= $(OSCOMP_INIT)
+all: $(KERNEL_RV) kernel-la
+
+# 显式共同配置覆盖两侧；默认评测配置各自依赖目标架构helper。
+ifneq ($(origin INIT_CONFIG),undefined)
+INIT_CONFIG_RV ?= $(INIT_CONFIG)
+INIT_CONFIG_LA ?= $(INIT_CONFIG)
+else
+INIT_CONFIG_RV ?= $(OSCOMP_INIT)
+INIT_CONFIG_LA ?= $(OSCOMP_INIT_LA)
+endif
+
 .PHONY: force-init-config test-init-config-riscv
 force-init-config:
 
-$(BUILD_DIR)/generated/init-config.h: force-init-config $(INIT_CONFIG) tools/init-config.py include/kernel/exec_image.h include/kernel/fs_context.h
-	python3 tools/init-config.py $(INIT_CONFIG) $@
+$(BUILD_DIR)/generated/init-config.h: force-init-config $(INIT_CONFIG_RV) tools/init-config.py include/kernel/exec_image.h include/kernel/fs_context.h
+	python3 tools/init-config.py $(INIT_CONFIG_RV) $@
 
 $(BUILD_DIR)/arch/riscv/root_boot.o: $(BUILD_DIR)/generated/init-config.h
 $(BUILD_DIR)/arch/riscv/root_boot.o: CPPFLAGS += -I$(BUILD_DIR)/generated
@@ -1867,3 +1888,30 @@ test-virtio-block-host:
 .PHONY: test-lwext4-dir-empty-host
 test-lwext4-dir-empty-host:
 	python3 -B tests/lwext4-dir-empty-host.py --sanitize
+
+.PHONY: test-oscomp-host test-oscomp-riscv test-oscomp-loongarch test-oscomp-compat test-oscomp-official test-oscomp-supervisor-riscv test-oscomp-supervisor-loongarch
+
+test-oscomp-host:
+	python3 -B -m unittest discover -s tests/oscomp -p 'test_*.py'
+
+test-oscomp-supervisor-riscv:
+	python3 -B tests/oscomp/supervisor_probe.py --arch riscv
+
+test-oscomp-supervisor-loongarch:
+	python3 -B tests/oscomp/supervisor_probe.py --arch loongarch
+
+test-oscomp-riscv:
+	python3 -B tests/oscomp/run.py --arch riscv
+
+test-oscomp-loongarch:
+	python3 -B tests/oscomp/run.py --arch loongarch
+
+test-oscomp-compat:
+	python3 -B tests/oscomp/run.py --arch both
+
+test-oscomp-official:
+	python3 -B tests/oscomp/official.py
+
+.PHONY: prepare-oscomp-inputs
+prepare-oscomp-inputs:
+	python3 -B tests/oscomp/assets.py

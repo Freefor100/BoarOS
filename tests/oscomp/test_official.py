@@ -31,6 +31,12 @@ class OfficialFlowTests(unittest.TestCase):
         self.assertEqual(result.returncode, 7, result.stderr)
         self.assertEqual(result.stdout, 'native output\n')
 
+    def test_bad_budget_reports_setup_failure_without_running_command(self):
+        result = self.run_case('printf SHOULD-NOT-RUN', limit='-1')
+        self.assertEqual(result.returncode, 125)
+        self.assertEqual(result.stdout, '')
+        self.assertIn('BOAROS-CASE SETUP-ERROR stage=arguments', result.stderr)
+
     def test_disabled_timeout_waits_for_native_completion(self):
         result = self.run_case('sleep 1.2; printf "completed without deadline\\n"; exit 7', limit='0')
         self.assertEqual(result.returncode, 7, result.stderr)
@@ -90,8 +96,11 @@ class OfficialFlowTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         pid = int(result.stdout)
         stat = Path(f'/proc/{pid}/stat')
-        if stat.exists():
-            self.assertEqual(stat.read_text().rsplit(')', 1)[1].split()[0], 'Z')
+        try:
+            state = stat.read_text().rsplit(')', 1)[1].split()[0]
+        except (FileNotFoundError, ProcessLookupError):
+            return  # 已由宿主reaper归还；不存在与zombie都不能继续执行。
+        self.assertEqual(state, 'Z')
 
     def test_hook_changes_only_the_official_execution_line(self):
         original = '#!/bin/bash\nfor file in ltp/testcases/bin/*; do\n    "$file"\n    ret=$?\n    echo "FAIL LTP CASE $(basename "$file") : $ret"\ndone\n'

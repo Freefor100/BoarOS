@@ -52,3 +52,7 @@ local.mk
 /.codex/sessions/
 .zcode/
 .superpowers
+
+# Python runner caches are rebuildable local artifacts.
+__pycache__/
+*.py[cod]

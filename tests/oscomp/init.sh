@@ -1,12 +1,10 @@
 #!/musl/busybox sh
 set -e
 BB=/musl/busybox
-$BB mkdir -p /bin /lib /tmp /dev/misc /dev/block /dev/shm /proc
+$BB mkdir -p /bin /lib /usr/lib64 /tmp /dev/misc /dev/block /dev/shm /proc
 $BB --install -s /bin
 $BB ln -s /musl/busybox /bin/busybox
-$BB ln -s /glibc/lib/ld-linux-riscv64-lp64d.so.1 /lib/ld-linux-riscv64-lp64d.so.1
-$BB ln -s /musl/lib/libc.so /lib/ld-musl-riscv64.so.1
-$BB ln -s /musl/lib/libc.so /lib/ld-musl-riscv64-sf.so.1
+# BOAROS_LOADER_LINKS
 $BB mknod -m 666 /dev/null c 1 3
 $BB mknod -m 666 /dev/zero c 1 5
 $BB mknod -m 600 /dev/console c 5 1

@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""One-boot RV projection of the fixed OSComp parser, judges and postwork."""
+"""Diagnostic RV/LA projection of the fixed scripts, judges and postwork."""
 import argparse
 from datetime import datetime, timezone
 import hashlib
 import importlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -18,39 +19,43 @@ HERE = Path(__file__).resolve().parent
 REF = ROOT / 'references/oscomp-autotest'
 GROUPS = ['basic', 'busybox', 'cyclictest', 'iozone', 'iperf', 'libcbench',
           'libctest', 'lmbench', 'lua', 'netperf', 'ltp']
+ARCH_KEYS = {'riscv': 'rv', 'loongarch': 'la'}
+
 
 def sha(path):
     with Path(path).open('rb') as stream:
         return hashlib.file_digest(stream, 'sha256').hexdigest()
 
+
 def output(args, cwd=ROOT):
     return subprocess.check_output(args, cwd=cwd, text=True).strip()
 
-def validate(verify_assets=False):
+
+def validate(verify_assets=False, architectures=('riscv', 'loongarch')):
     identity = json.loads((HERE / 'inputs.json').read_text())
     if output(['git', 'remote', 'get-url', 'origin'], REF) != identity['autotest_url']:
         raise RuntimeError('autotest origin differs')
-    actual = output(['git', 'rev-parse', 'HEAD'], REF)
-    if actual != identity['autotest_commit'] or output(['git', 'status', '--porcelain'], REF):
+    if output(['git', 'rev-parse', 'HEAD'], REF) != identity['autotest_commit'] or output(['git', 'status', '--porcelain'], REF):
         raise RuntimeError('autotest identity or clean worktree differs')
-    if not (REF / 'sdcard-rv.img').is_file():
-        raise RuntimeError('RV release image is missing')
+    for arch in architectures:
+        image = REF / identity['architectures'][arch]['image']
+        if not image.is_file():
+            raise RuntimeError('release image is missing: ' + str(image))
     if verify_assets:
         for name, expected in identity['assets'].items():
-            path = REF / name
-            if not path.is_file() or sha(path) != expected:
-                raise RuntimeError(f'missing or altered release asset: {path}')
+            if not (REF / name).is_file() or sha(REF / name) != expected:
+                raise RuntimeError('missing or altered release asset: ' + name)
     return identity
 
+
 class ReportJob:
-    def __init__(self, results, config):
-        self.results, self.config = results, config
-        self.integer_score = None
-        self.ranking = None
+    def __init__(self, summary, config):
+        self.summary, self.config = summary, config
+        self.integer_score = self.ranking = None
         self.html = ''
-    def get_summary(self): return [{'rv': self.results}]
+    def get_summary(self): return [self.summary]
     def get_config(self): return self.config
-    def get_log(self, key): return 'local RV-only run'
+    def get_log(self, key): return 'local diagnostic run'
     def get_logs(self): return {}
     def get_logs_detail(self): return {}
     def score(self, value): self.integer_score = value
@@ -59,119 +64,213 @@ class ReportJob:
     def detail(self, value): pass
     def verdict(self, value): self.verdict_value = value
 
-def grade(log, directory, config, selected):
+
+def original_modules():
     sys.dont_write_bytecode = True
-    os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
     sys.path.insert(0, str(REF / 'kernel'))
-    parser = importlib.import_module('run')
-    postwork = importlib.import_module('postwork')
-    results = parser.parse_serial_out_new({'testcase_dir': str(REF / 'kernel/judge')}, str(log))
-    expected = {f'{group}-{libc}' for group in GROUPS for libc in ('glibc', 'musl')}
-    if set(results) != expected:
-        raise RuntimeError('original judge output does not contain exactly the 22 expected groups')
-    (directory / 'judge.json').write_text(json.dumps(results, indent=2) + '\n')
-    job = ReportJob(results, config)
+    name = 'boaros_fixed_oscomp_run'
+    if name not in sys.modules:
+        spec = importlib.util.spec_from_file_location(name, REF / 'kernel/run.py')
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+    return sys.modules[name], importlib.import_module('postwork')
+
+
+def original_score(summary, config):
+    _, postwork = original_modules()
+    job = ReportJob(summary, config)
     postwork.postwork(job)
-    (directory / 'original-postwork.html').write_text(job.html)
-    serial = log.read_text(errors='replace')
+    return {'postwork_integer_score': job.integer_score, 'postwork_rank': job.ranking,
+            'original_postwork_verdict': job.verdict_value, 'html': job.html}
+
+
+def summarize_groups(serial, selected, exit_reason='qemu-exit'):
     groups = {}
-    for name in sorted(expected):
-        begin = f'#### OS COMP TEST GROUP START {name} ####' in serial
-        end = f'#### OS COMP TEST GROUP END {name} ####' in serial
-        status = re.search(r'BOAROS-EVAL EXIT ' + re.escape(name) + r' status=(\d+)', serial)
-        raw, _ = postwork.build_table(name, ['rv'], {'rv': results})
-        groups[name] = {'judge_score': raw['#TOTAL'], 'started': begin, 'ended': end,
-                        'script_exit': int(status[1]) if status else None,
-                        'state': 'not-selected' if name.rsplit('-',1)[0] not in selected else 'not-reached' if not begin else 'incomplete' if not end else 'completed'}
-    return {'groups': groups, 'postwork_integer_score': job.integer_score,
-            'postwork_rank': job.ranking, 'scope': 'RV '+','.join(selected)+' only; unselected groups and LA were not run'}
+    for group in GROUPS:
+        for libc in ('glibc', 'musl'):
+            name = group + '-' + libc
+            entered = 'BOAROS-EVAL ENTER ' + name in serial
+            started = '#### OS COMP TEST GROUP START ' + name + ' ####' in serial
+            ended = '#### OS COMP TEST GROUP END ' + name + ' ####' in serial
+            status = re.search(r'BOAROS-EVAL EXIT ' + re.escape(name) + r' status=(\d+)', serial)
+            code = int(status[1]) if status else None
+            state = ('not-selected' if group not in selected else
+                     'not-reached' if not entered and not started else
+                     'script-failure' if code not in (None, 0) else
+                     'completed' if ended and code == 0 else
+                     'timeout' if exit_reason == 'total-budget-timeout' else 'incomplete')
+            section = ''
+            if entered:
+                section = serial.split('BOAROS-EVAL ENTER ' + name, 1)[1].split('BOAROS-EVAL EXIT ' + name, 1)[0]
+            groups[name] = {'entered': entered, 'started': started, 'ended': ended,
+                'script_exit': code, 'state': state,
+                'supervision': {'skipped': section.count('BOAROS-CASE SKIP '),
+                    'excluded': section.count('BOAROS-CASE EXCLUDE '),
+                    'timed_out': section.count('BOAROS-CASE TIMEOUT-END '),
+                    'setup_failed': section.count('BOAROS-CASE SETUP-ERROR ')}}
+    return groups
+
+
+def judge(log, config):
+    parser, _ = original_modules()
+    results = parser.parse_serial_out_new({'testcase_dir': str(REF / 'kernel/judge')}, str(log))
+    if set(results) != {group + '-' + libc for group in GROUPS for libc in ('glibc', 'musl')}:
+        raise RuntimeError('original judge output differs from the 22 expected groups')
+    return results
+
+
+def boot_command(arch, qemu, kernel, disk, config, rng=False):
+    command = [qemu]
+    if arch == 'riscv': command += ['-machine', 'virt']
+    command += ['-kernel', str(kernel), '-m', str(config.get('qemu.mem', '1G')),
+                '-nographic', '-smp', str(config.get('qemu.smp', 1))]
+    if arch == 'riscv': command += ['-bios', 'default']
+    command += ['-drive', f'file={disk},if=none,format=raw,id=x0', '-device',
+        'virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0' if arch == 'riscv' else 'virtio-blk-pci,drive=x0',
+        '-no-reboot', '-device', 'virtio-net-device,netdev=net0' if arch == 'riscv' else 'virtio-net-pci,netdev=net0',
+        '-netdev', 'user,id=net0', '-rtc', 'base=utc']
+    if rng:
+        command += ['-object', 'rng-random,id=entropy,filename=/dev/urandom', '-device',
+                    'virtio-rng-device,rng=entropy' if arch == 'riscv' else 'virtio-rng-pci,rng=entropy']
+    return command
+
+
+def run_guests(runs, budget):
+    active = []
+    try:
+        for arch, entry, command, log in runs:
+            stream = log.open('wb')
+            try:
+                process = subprocess.Popen(command, cwd=ROOT, stdin=subprocess.PIPE,
+                    stdout=stream, stderr=subprocess.STDOUT)
+            except Exception:
+                stream.close()
+                raise
+            active.append((entry, process, stream, time.monotonic()))
+            process.stdin.write(b'\n'); process.stdin.close()
+        pending = list(active)
+        while pending:
+            for item in list(pending):
+                entry, process, stream, start = item
+                expired = budget and time.monotonic() - start >= budget
+                code = process.poll()
+                if code is None and not expired: continue
+                timed_out = code is None and expired
+                if code is None:
+                    process.kill(); code = process.wait()
+                else: process.wait()
+                # 文件输出由真实进程关闭后收口，不能在poll结束时丢掉管道尾部。
+                stream.close()
+                entry.update(qemu_returncode=code, elapsed_seconds=time.monotonic() - start,
+                             exit_reason='total-budget-timeout' if timed_out else 'qemu-exit')
+                pending.remove(item)
+            if pending: time.sleep(0.1)
+    finally:
+        for entry, process, stream, start in active:
+            if process.poll() is None:
+                process.kill(); process.wait()
+            stream.close()
+
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument('--output', type=Path, default=ROOT / 'build/oscomp-rv-run')
-    ap.add_argument('--verify-inputs', action='store_true', help='explicitly recheck release asset hashes; routine runs reuse the previously verified inputs')
-    ap.add_argument('--diagnostic-timeout', type=int, help='override total budget, 0 disables it; labels result diagnostic, never the formal baseline')
-    ap.add_argument('--groups',choices=tuple(GROUPS)+('all','benchmarks','environment'),default='all',help='select one original group, the five benchmarks, or all; no original script is shortened')
-    ap.add_argument('--case-timeout', type=int, default=300, help='LTP per-case safety budget seconds, 0 disables it; timeout is never a pass')
-    ap.add_argument('--diagnostic-exclude', action='append', default=[], metavar='CASE', help='explicitly leave a LTP basename unexecuted, status 125; labels the whole run diagnostic')
+    ap = argparse.ArgumentParser(__doc__)
+    ap.add_argument('--arch', choices=tuple(ARCH_KEYS) + ('both',), default='both')
+    ap.add_argument('--output', type=Path, default=None)
+    ap.add_argument('--verify-inputs', action='store_true')
+    ap.add_argument('--diagnostic-timeout', type=int)
+    ap.add_argument('--groups', choices=tuple(GROUPS) + ('all', 'benchmarks', 'environment'), default='all')
+    ap.add_argument('--case-timeout', type=int, default=300)
+    ap.add_argument('--diagnostic-exclude', action='append', default=[], metavar='CASE')
+    ap.add_argument('--qemu-riscv', default=os.environ.get('QEMU_RISCV64', 'qemu-system-riscv64'))
+    ap.add_argument('--qemu-loongarch', default=os.environ.get('QEMU_LOONGARCH64', 'build/qemu-la-rtc/qemu-system-loongarch64'))
+    ap.add_argument('--rng', action='store_true', help='add real entropy only to this labelled diagnostic profile')
     args = ap.parse_args()
-    directory = args.output.resolve()
-    if directory.exists():
-        raise SystemExit(f'output already exists; choose a new disposable run directory: {directory}')
-    if not directory.is_relative_to(ROOT / 'build'):
-        raise SystemExit('run outputs must be under build/')
-    identity = validate(args.verify_inputs)
-    selected={'all':GROUPS,'benchmarks':['iozone','cyclictest','iperf','libcbench','lmbench'],'environment':['basic','busybox']}.get(args.groups,[args.groups])
-    config_path = REF / 'kernel/judge/config.json'
-    config = json.loads(config_path.read_text())
-    budget = args.diagnostic_timeout if args.diagnostic_timeout is not None else config.get('qemu.timeout', 60)
-    if budget < 0: raise SystemExit('timeout must be nonnegative; 0 disables it')
-    if not 0 <= args.case_timeout <= 86400: raise SystemExit('case timeout must be between 0 and 86400 seconds')
+    architectures = tuple(ARCH_KEYS) if args.arch == 'both' else (args.arch,)
+    directory = args.output.resolve() if args.output else ROOT / 'build' / ('oscomp-diagnostic-' + datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%f'))
+    if directory.exists(): ap.error('output already exists; use a new run directory')
+    if not directory.is_relative_to(ROOT / 'build'): ap.error('outputs must be under build/')
+    if args.diagnostic_timeout is not None and args.diagnostic_timeout < 0: ap.error('budget must be nonnegative')
+    if not 0 <= args.case_timeout <= 86400: ap.error('case budget must be 0..86400')
     if any(not re.fullmatch(r'[A-Za-z0-9_.-]+', name) or name in ('.', '..') for name in args.diagnostic_exclude):
-        ap.error('diagnostic exclusions must be literal LTP basenames')
-    subprocess.run(['make', 'all', 'OSCOMP_GROUPS=' + ' '.join(selected),
-                    'OSCOMP_CASE_TIMEOUT=' + str(args.case_timeout),
-                    'OSCOMP_DIAGNOSTIC_EXCLUDE=' + ' '.join(args.diagnostic_exclude)], cwd=ROOT, check=True)
+        ap.error('exclusions must be literal LTP basenames')
+    selected = {'all': GROUPS, 'benchmarks': ['iozone', 'cyclictest', 'iperf', 'libcbench', 'lmbench'],
+                'environment': ['basic', 'busybox']}.get(args.groups, [args.groups])
     directory.mkdir(parents=True)
-    disk = directory / 'root.img'
-    subprocess.run(['cp', '--reflink=auto', '--sparse=always', str(REF / 'sdcard-rv.img'), str(disk)], check=True)
-    # Official image is copied intact. make all supplies the boot command and helpers.
-    # 不预同步宿主副本：官方准备流程没有此保证，正常慢 FLUSH 由驱动承担。
-    kernel = directory / 'kernel-rv';shutil.copyfile(ROOT/'kernel-rv',kernel)
-    qemu = os.environ.get('QEMU_RISCV64', 'qemu-system-riscv64')
-    command = [qemu, '-machine', 'virt', '-kernel', str(kernel), '-m', str(config.get('qemu.mem', '1G')),
-               '-nographic', '-smp', str(config.get('qemu.smp', 1)), '-bios', 'default',
-               '-drive', f'file={disk},if=none,format=raw,id=x0', '-device',
-               'virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0', '-no-reboot',
-               '-device', 'virtio-net-device,netdev=net', '-netdev', 'user,id=net', '-rtc', 'base=utc']
-    report = {'started_utc': datetime.now(timezone.utc).isoformat(), 'inputs': identity,
-              'release_assets_verified_this_run': args.verify_inputs,
-              'kernel_commit': output(['git', 'rev-parse', 'HEAD']), 'kernel_dirty': output(['git', 'status', '--porcelain']),
-              'kernel_sha256': sha(kernel), 'config': config, 'config_sha256': sha(config_path),
-              'init_config_sha256': sha(ROOT / 'build/riscv/oscomp/init.json'), 'init_script_sha256': sha(HERE / 'init.sh'),
-              'qemu': output([qemu, '--version']).splitlines()[0], 'qemu_command': command,
-              'timeout_seconds': budget, 'diagnostic': args.diagnostic_timeout is not None or args.groups != 'all' or bool(args.diagnostic_exclude),
-              'ltp_case_timeout_seconds': args.case_timeout,
-              'ltp_diagnostic_exclusions': args.diagnostic_exclude,
-              'case_sha256': sha(ROOT / 'build/riscv/oscomp/case'),
-              'ltp_hook_sha256': sha(HERE / 'ltp-hook.sh'),
-              'ltp_skips_sha256': sha(HERE / 'ltp-skips.tsv'),
-              'ltp_case_script_sha256': sha(HERE / 'ltp-case.sh'),
-              'boot_count': 1, 'extra_disk': None, 'selected_groups':selected,
-              'qemu_sha256':sha(shutil.which(qemu)), 'fixture_sha256':sha(disk),
-              'source_tree':output(['git','write-tree']), 'timebase_hz':10000000,
-              'firmware_sha256':sha(Path('/usr/share/qemu/opensbi-riscv64-generic-fw_dynamic.bin'))}
-    dtb=directory/'boot.dtb';probe=list(command);probe[probe.index('-machine')+1]='virt,dumpdtb='+str(dtb)
-    subprocess.run(probe,cwd=directory,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,check=True)
-    report['dtb_sha256']=sha(dtb);command+=['-dtb',str(dtb)]
-    (directory / 'identity.json').write_text(json.dumps(report, indent=2) + '\n')
-    budget_label = f'{budget}s' if budget else 'disabled'
-    print(f'Running one RV boot, total budget {budget_label}; log: {directory / "serial.log"}', flush=True)
-    start = time.monotonic()
-    log = directory / 'serial.log'
-    with log.open('wb') as stream:
-        try:
-            result = subprocess.run(command, cwd=directory, input=b'\n', stdout=stream, stderr=subprocess.STDOUT, timeout=budget or None)
-            report['qemu_returncode'] = result.returncode
-            report['exit_reason'] = 'qemu-exit'
-        except subprocess.TimeoutExpired:
-            report['qemu_returncode'] = None
-            report['exit_reason'] = 'total-budget-timeout'
-    report['elapsed_seconds'] = time.monotonic() - start
-    report['serial_sha256'] = sha(log)
-    if 'BoarOS: root boot error' in log.read_text(errors='replace'):
-        report['exit_reason'] = 'guest-boot-error'
-    report.update(grade(log, directory, config, selected))
-    for group in report['groups'].values():
-        if group['state'] == 'incomplete' and report['exit_reason'] == 'total-budget-timeout':
-            group['state'] = 'timeout'
-        elif group['script_exit'] not in (None, 0):
-            group['state'] = 'script-failure'
-    report['completed_script'] = 'BOAROS-EVAL COMPLETE' in log.read_text(errors='replace')
-    if report['exit_reason'] == 'qemu-exit' and not report['completed_script']:
-        report['exit_reason'] = 'guest-script-incomplete'
-    (directory / 'report.json').write_text(json.dumps(report, indent=2) + '\n')
-    print(json.dumps({'exit_reason': report['exit_reason'], 'score': report['postwork_integer_score'], 'groups': report['groups']}, indent=2), flush=True)
+    report = {'kind': 'local-diagnostic', 'diagnostic': True, 'started_utc': datetime.now(timezone.utc).isoformat(),
+        'kernel_commit': output(['git', 'rev-parse', 'HEAD']), 'kernel_dirty': output(['git', 'status', '--porcelain']),
+        'requested_architectures': architectures, 'selected_groups': selected,
+        'ltp_case_timeout_seconds': args.case_timeout, 'ltp_diagnostic_exclusions': args.diagnostic_exclude,
+        'rng_added': args.rng, 'architectures': {}, 'baseline_completed': False}
+    stage = 'preparation'
+    try:
+        identity = validate(args.verify_inputs, architectures)
+        config_path = REF / 'kernel/judge/config.json'
+        config = json.loads(config_path.read_text())
+        budget = args.diagnostic_timeout if args.diagnostic_timeout is not None else config.get('qemu.timeout', 60)
+        report.update(inputs=identity, release_assets_verified_this_run=args.verify_inputs,
+                      config=config, config_sha256=sha(config_path), timeout_seconds=budget)
+        subprocess.run(['make', '-j8', *(identity['architectures'][arch]['kernel'] for arch in architectures),
+            'OSCOMP_GROUPS=' + ' '.join(selected), 'OSCOMP_CASE_TIMEOUT=' + str(args.case_timeout),
+            'OSCOMP_DIAGNOSTIC_EXCLUDE=' + ' '.join(args.diagnostic_exclude)], cwd=ROOT, check=True)
+        runs = []
+        for arch in architectures:
+            target = directory / ARCH_KEYS[arch]; target.mkdir()
+            facts = identity['architectures'][arch]
+            kernel = target / facts['kernel']; shutil.copyfile(ROOT / facts['kernel'], kernel)
+            disk = target / 'root.img'
+            subprocess.run(['cp', '--reflink=auto', '--sparse=always', str(REF / facts['image']), str(disk)], check=True)
+            qemu = args.qemu_riscv if arch == 'riscv' else args.qemu_loongarch
+            executable = Path(shutil.which(qemu) or qemu).resolve(strict=True)
+            base = ROOT / ('build/riscv' if arch == 'riscv' else 'build/loongarch') / 'oscomp'
+            command = boot_command(arch, str(executable), kernel, disk, config, args.rng)
+            entry = {'kernel_sha256': sha(kernel), 'fixture_sha256': sha(disk), 'boot_count': 1,
+                'init_config_sha256': sha(base / 'init.json'), 'case_sha256': sha(base / 'case'),
+                'qemu_command': command, 'qemu': output([str(executable), '--version']).splitlines()[0],
+                'qemu_sha256': sha(executable), 'qemu_mode': oct(executable.stat().st_mode & 0o777),
+                'qemu_selected_path': qemu, 'qemu_resolved_path': str(executable), 'extra_disk': None}
+            for name in ('init.sh', 'ltp-hook.sh', 'ltp-case.sh', 'ltp-skips.tsv'):
+                entry[name + '_sha256'] = sha(HERE / name)
+            report['architectures'][arch] = entry
+            (target / 'identity.json').write_text(json.dumps(entry, indent=2) + '\n')
+            runs.append((arch, entry, command, target / 'serial.log'))
+        (directory / 'identity.json').write_text(json.dumps(report, indent=2) + '\n')
+        print('Running concurrent diagnostic boots:', ','.join(architectures), 'budget:', budget, 'output:', directory, flush=True)
+        stage = 'runner'
+        run_guests(runs, budget)
+        stage = 'grading'
+        summary = {}
+        sys.path.insert(0, str(ROOT / 'tests'))
+        from arch_profiles import PROFILES
+        for arch, entry, command, log in runs:
+            serial = log.read_text(errors='replace')
+            reason = entry['exit_reason']
+            if 'root boot error' in serial or 'LA root boot errno=' in serial: reason = 'guest-boot-error'
+            entry.update(exit_reason=reason, serial_sha256=sha(log), completed_script='BOAROS-EVAL COMPLETE' in serial)
+            entry['root_resources_verified'] = reason == 'qemu-exit' and PROFILES[arch].root_success(serial, 0)
+            entry['groups'] = summarize_groups(serial, selected, reason)
+            results = judge(log, config)
+            summary[ARCH_KEYS[arch]] = results
+            (log.parent / 'judge.json').write_text(json.dumps(results, indent=2) + '\n')
+            _, postwork = original_modules()
+            for name, group in entry['groups'].items():
+                columns, _ = postwork.build_table(name, [ARCH_KEYS[arch]], {ARCH_KEYS[arch]: results})
+                group['judge_score'] = columns['#TOTAL']
+        graded = original_score(summary, config)
+        (directory / 'original-postwork.html').write_text(graded.pop('html'))
+        report.update(graded)
+        report['baseline_completed'] = all(entry['completed_script'] and entry['root_resources_verified']
+            and entry['qemu_returncode'] == 0 for entry in report['architectures'].values())
+    except Exception as error:
+        report.update(error={'stage': stage, 'type': type(error).__name__, 'message': str(error)})
+        raise
+    finally:
+        (directory / 'report.json').write_text(json.dumps(report, indent=2) + '\n')
+    print(json.dumps({'kind': report['kind'], 'baseline_completed': report['baseline_completed'],
+        'score': report['postwork_integer_score'], 'architectures': {
+            arch: {'exit_reason': entry['exit_reason'], 'completed_script': entry['completed_script'],
+                   'root_resources_verified': entry['root_resources_verified']} for arch, entry in report['architectures'].items()}}, indent=2), flush=True)
+
 
 if __name__ == '__main__':
     main()

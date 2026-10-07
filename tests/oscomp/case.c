@@ -19,6 +19,7 @@
 #define NR_KILL SYS_kill
 #define NR_EXIT SYS_exit_group
 #else
+#include "../common/raw_syscall.h"
 #define NR_WRITE 64
 #define NR_READ 63
 #define NR_CLOSE 57
@@ -41,16 +42,7 @@ static long call(long number, long x, long y, long z, long u, long v, long w)
     long result = syscall(number, x, y, z, u, v, w);
     return result < 0 ? -errno : result;
 #else
-    register long a0 __asm__("a0") = x;
-    register long a1 __asm__("a1") = y;
-    register long a2 __asm__("a2") = z;
-    register long a3 __asm__("a3") = u;
-    register long a4 __asm__("a4") = v;
-    register long a5 __asm__("a5") = w;
-    register long a7 __asm__("a7") = number;
-    __asm__ volatile("ecall" : "+r"(a0) : "r"(a1), "r"(a2), "r"(a3),
-                     "r"(a4), "r"(a5), "r"(a7) : "memory");
-    return a0;
+    return test_syscall6(number, x, y, z, u, v, w);
 #endif
 }
 
@@ -85,6 +77,13 @@ static long now(void)
     return status < 0 ? status : time[0] * 1000 + time[1] / 1000000;
 }
 
+static int setup_error(const char *stage, long value)
+{
+    message("BOAROS-CASE SETUP-ERROR stage="); message(stage);
+    message(" value="); number(value); message("\n");
+    return 125;
+}
+
 static void stop_group(long group, long child, int signal)
 {
     /* group 是仍存活的监督者 PID；直接 child 只在 wait 回收前使用。 */
@@ -94,31 +93,33 @@ static void stop_group(long group, long child, int signal)
 
 static int run(int argc, char **argv, char **envp)
 {
-    if (argc < 4 || argc > 27) return 125;
+    if (argc < 4 || argc > 27) return setup_error("arguments", argc);
     long limit = 0;
     for (const char *s = argv[1]; *s; s++) {
-        if (*s < '0' || *s > '9' || limit > 86400) return 125;
+        if (*s < '0' || *s > '9' || limit > 86400) return setup_error("arguments", *s);
         limit = limit * 10 + *s - '0';
     }
-    if (!argv[1][0] || limit > 86400) return 125;
+    if (!argv[1][0] || limit > 86400) return setup_error("arguments", limit);
     long start = now();
-    if (start < 0) return 125;
+    if (start < 0) return setup_error("clock", start);
     long group = call(NR_PID, 0, 0, 0, 0, 0, 0);
     long original_group = call(NR_PGID, 0, 0, 0, 0, 0, 0);
     int ready[2];
-    if (group <= 0 || original_group <= 0 ||
-        call(NR_PIPE, (long)ready, 0, 0, 0, 0, 0) < 0) return 125;
-    if (call(NR_SETPGID, 0, group, 0, 0, 0, 0) < 0) {
+    if (group <= 0 || original_group <= 0) return setup_error("identity", original_group);
+    long pipe_result = call(NR_PIPE, (long)ready, 0, 0, 0, 0, 0);
+    if (pipe_result < 0) return setup_error("pipe", pipe_result);
+    long group_result = call(NR_SETPGID, 0, group, 0, 0, 0, 0);
+    if (group_result < 0) {
         call(NR_CLOSE, ready[0], 0, 0, 0, 0, 0);
         call(NR_CLOSE, ready[1], 0, 0, 0, 0, 0);
-        return 125;
+        return setup_error("process-group", group_result);
     }
     long child = call(NR_FORK, 17, 0, 0, 0, 0, 0);
     if (child < 0) {
         call(NR_SETPGID, 0, original_group, 0, 0, 0, 0);
         call(NR_CLOSE, ready[0], 0, 0, 0, 0, 0);
         call(NR_CLOSE, ready[1], 0, 0, 0, 0, 0);
-        return 125;
+        return setup_error("clone", child);
     }
     if (!child) {
         call(NR_CLOSE, ready[1], 0, 0, 0, 0, 0);
@@ -213,8 +214,14 @@ static int run(int argc, char **argv, char **envp)
 #ifdef CASE_HOST
 int main(int argc, char **argv, char **envp) { return run(argc, argv, envp); }
 #else
+#if defined(__loongarch__)
+__asm__(".section .text.start,\"ax\"\n.global _start\n_start:\n"
+        "move $a0,$sp\nli.d $t0,-16\nand $sp,$sp,$t0\nbl entry\n"
+        "li.d $a7,94\nsyscall 0\n1: b 1b\n");
+#else
 __asm__(".section .text.start,\"ax\"\n.global _start\n_start:\n"
         "mv a0,sp\nandi sp,sp,-16\ncall entry\nli a7,94\necall\n1: j 1b\n");
+#endif
 int entry(const unsigned long *sp)
 {
     char **argv = (void *)(sp + 1);

@@ -157,11 +157,11 @@ I/O已经接入。机制、历史性能口径和unknown见[成本分析](docs/le
 双架构原评测镜像与官方容器基线正在兼容分支接入；单侧诊断和逐组补跑不能宣称完整交付。逐次成绩和运行
 输出留在忽略的build；SMP、LA后续用户环境、实板及更大应用另行规划。
 
-本评测分支的固定输入、启动、监督与原judge契约见[RV评测模块](docs/modules/oscomp-rv.md)。逐次成绩留在忽略的build，RV单侧诊断不等于完整Harness。
+本分支已改名oscomp-compat，默认make all同时生成RV/LA内核；固定输入、独立bootstrap、监督和原judge契约见[双架构评测模块](docs/modules/oscomp-compat.md)。官方容器已锁定实际digest，基线执行与本地诊断分别验收。
 
 本分支已合入单核数据路径修复，并补跑原版 iozone、cyclictest、iperf、libcbench、lmbench 两种 libc 的一次评分。十个脚本都结束；当时的根盘 cleanup 错误已定位为 PID 1 退出时后台用户 owner 尚未回收，并在 main 修复后同步本分支。随后仅重跑原版 iperf，两种 libc 的十二项成功且正常关机；cyclictest 部分零采样仍待定位。分数、真实 iperf 吞吐和 1/10 ms 延迟的 36 次补测见[当前五项成绩与选择依据](docs/learning/data-path-budget-experiments.md#受控延迟与原版五项评分补测2026-10-06)。常规评分复用已核对输入，不重做四个发布资产的哈希扫描。
 普通 `make all` 可直接启动官方原盘；启动辅助文件不由本地 runner 注入。
-LTP 沿原比赛脚本逐项执行，只有通用超时监督，不以另一份测例清单替换官方流程。
+LTP沿原比赛脚本逐项执行，保留300秒监督及源码helper跳过；报告明确标记监督适配，不以另一份测例清单替换官方流程。
 
 - [文档导航](docs/README.md)：模块契约与可复用学习材料。
 - [工程原则](docs/design.md)与[贡献说明](CONTRIBUTING.md)：技术取舍、验证与提交边界。

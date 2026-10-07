@@ -8,5 +8,53 @@
     "sdcard-la.img": "1aa79d03cf41e2a80ae4ed43771101c1e67ec8db41c3c20b77792fe6b1b85b50",
     "sdcard-rv.img.xz": "2b59aee4d26681b2d78a8faa615ac216f723a8ea157544e7867bbc8c77aac087",
     "sdcard-la.img.xz": "3cbeae1095d788cd8255e4929bcc6dace96dbe4999b6eaec003ae6fe2cdba42b"
+  },
+  "architectures": {
+    "riscv": {
+      "elf_machine": 243,
+      "page_size": 4096,
+      "image": "sdcard-rv.img",
+      "kernel": "kernel-rv",
+      "loader_links": [
+        [
+          "/glibc/lib/ld-linux-riscv64-lp64d.so.1",
+          "/lib/ld-linux-riscv64-lp64d.so.1"
+        ],
+        [
+          "/musl/lib/libc.so",
+          "/lib/ld-musl-riscv64.so.1"
+        ],
+        [
+          "/musl/lib/libc.so",
+          "/lib/ld-musl-riscv64-sf.so.1"
+        ]
+      ]
+    },
+    "loongarch": {
+      "elf_machine": 258,
+      "page_size": 16384,
+      "image": "sdcard-la.img",
+      "kernel": "kernel-la",
+      "loader_links": [
+        [
+          "/glibc/lib/ld-linux-loongarch-lp64d.so.1",
+          "/lib/ld-linux-loongarch-lp64d.so.1"
+        ],
+        [
+          "/glibc/lib/ld-linux-loongarch-lp64d.so.1",
+          "/usr/lib64/ld-linux-loongarch-lp64d.so.1"
+        ],
+        [
+          "/musl/lib/libc.so",
+          "/lib/ld-musl-loongarch64.so.1"
+        ]
+      ]
+    }
+  },
+  "container": {
+    "tag": "zhouzhouyi/os-contest:20260510",
+    "reference": "zhouzhouyi/os-contest@sha256:85dec949df7cef41fd03d30c6ad69f952204540e18d2c62bced9d2e262fef12d",
+    "verified_on": "2026-10-07",
+    "qemu_version": "10.0.2"
   }
 }
