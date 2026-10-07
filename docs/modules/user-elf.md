@@ -27,7 +27,7 @@ enum kernel_elf64_status kernel_elf64_open_cached(
     uint16_t program_header_capacity);
 ```
 
-`kernel_read_source` 只有 `context`、总长度和精确 `read_at`；回调返回零必须表示整个请求已填满。解析器逐字节解码，不把文件映射成内核整块 buffer。成功要求 ELF64、小端、当前版本、标准 header 大小、1..128 个 program header，且每个 `PT_LOAD` 满足文件范围、`p_filesz <= p_memsz`、虚拟范围不溢出和 `p_align` 同余规则。底层读取失败是独立的 `IO` 状态，输出保持不变。`open_cached` 在一次表扫描中把 program header 写入调用者存储，source 不再为布局/缺页重复读取 header。
+`kernel_read_source` 只有 `context`、总长度和精确 `read_at`；回调返回零必须表示整个请求已填满。解析器逐字节解码，不把文件映射成内核整块 buffer。成功要求 ELF64、小端、当前版本、标准 header 大小、1..128 个 program header，且每个 `PT_LOAD` 满足文件范围、`p_filesz <= p_memsz`、虚拟范围不溢出及合法的 `p_align`。非空内存段要求文件偏移与VA同余；`p_filesz=p_memsz=0` 的空LOAD不产生映射，不要求这一同余关系，仍保留文件范围和alignment格式检查。底层读取失败是独立的 `IO` 状态，输出保持不变。`open_cached` 在一次表扫描中把 program header 写入调用者存储，source 不再为布局/缺页重复读取 header。
 
 ## 不可变 ELF source
 

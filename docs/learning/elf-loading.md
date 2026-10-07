@@ -109,3 +109,19 @@ Auxv 的值必须来自真实机制，而不是为了让 libc 继续运行而伪
 `bb_busybox_exec_path` 重启 shell，并非改用 `/bin/sh`。评测分支实测无 shebang
 文本直接执行为 127，显式 `busybox sh 文件` 为 0；内核 ENOEXEC 正确不等于此
 用户态回退环境已齐全。原盘身份和重建边界由评测分支模块记录，主线不伪造 proc 内容。
+
+## GNU空LOAD与装载拒绝（2026-10-07）
+
+双架构评测监督器的LA整数ELF由GNU链接器生成两个PT_LOAD，第二段
+filesz/memsz均0、offset0xb0、VA0、align0x4000。固定Linux
+`references/linux` commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`
+的`fs/binfmt_elf.c::elf_load`对这种段不映射文件页；同一个原ELF实际执行成功，
+BoarOS却在通用parser的同余检查返回ENOEXEC。source/run和image层本来就跳过空段，
+故修正parser而没有改变监督器或链接输入。仍拒绝filesz大于memsz，以及有BSS
+内存但不同余的段；alignment格式和文件范围规则保持。
+
+`make test-elf64-riscv`新增cached/uncached反例先红（failures=1）后绿，
+ELF权限及exec/root聚焦通过。冻结的LA ELF SHA-256为
+`c609adb22c06ad374e0d3ef85e49a37c70550e5ab4549835bf8f94ed6bfd1b59`，
+在原失败fixture上用修正内核执行，512MiB/1GiB均完成退出和根owner基线。
+这项是共用装载纠错，不表示原评测全量或容器验收已经完成。

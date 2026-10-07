@@ -320,6 +320,36 @@ static unsigned long run_load_segment_cases(void)
     return failures;
 }
 
+static unsigned long run_empty_load_cases(void)
+{
+    unsigned char bytes[IMAGE_SIZE];
+    struct kernel_read_source source;
+    struct kernel_elf64_image image;
+    struct kernel_elf64_program_header cached[2];
+    const size_t ph = ELF_HEADER_SIZE + PROGRAM_HEADER_SIZE;
+    unsigned long failures = 0U;
+
+    make_valid_image(bytes);
+    put_u16(bytes, 56U, 2U);
+    put_u32(bytes, ph, KERNEL_ELF64_PROGRAM_LOAD);
+    put_u32(bytes, ph + 4U, KERNEL_ELF64_FLAG_READ | KERNEL_ELF64_FLAG_WRITE);
+    put_u64(bytes, ph + 8U, 0xb0U);
+    put_u64(bytes, ph + 48U, 0x4000U);
+    /* GNU空LOAD没有页需映射；表后offset与VA0不需要映射同余。 */
+    if (kernel_read_source_from_memory(bytes, sizeof(bytes), &source) != 0 ||
+        kernel_elf64_open(&source, &image) != KERNEL_ELF64_STATUS_OK ||
+        kernel_elf64_open_cached(&source, &image, cached, 2U) != KERNEL_ELF64_STATUS_OK ||
+        cached[1].memory_size != 0U || cached[1].file_size != 0U) {
+        failures++;
+    }
+    put_u64(bytes, ph + 32U, 1U);
+    failures += expect_open_status(bytes, sizeof(bytes), KERNEL_ELF64_STATUS_MALFORMED);
+    put_u64(bytes, ph + 32U, 0U);
+    put_u64(bytes, ph + 40U, 1U);
+    failures += expect_open_status(bytes, sizeof(bytes), KERNEL_ELF64_STATUS_MALFORMED);
+    return failures;
+}
+
 static unsigned long run_program_header_argument_cases(void)
 {
     unsigned char bytes[IMAGE_SIZE];
@@ -430,6 +460,7 @@ unsigned long run_elf64_cases(void)
     failures += run_identification_cases();
     failures += run_header_table_cases();
     failures += run_load_segment_cases();
+    failures += run_empty_load_cases();
     failures += run_program_header_argument_cases();
     failures += run_read_source_cases();
     failures += run_chacha20_vector_case();
