@@ -74,5 +74,16 @@ int main(void)
     assert(virtio_pci_transport_destroy(&p)==VIRTIO_OK && !pci_host_claimed(&host));
     assert(cfg_read(config,8,0x20,4)==12 && !cfg_read(config,8,4,2));
     assert(virtio_pci_transport_initialize(&p,&host,8,4,8)==VIRTIO_UNSUPPORTED && !pci_host_claimed(&host));
+    /* Transitional identity still exposes the modern caps; unused PIO stays disabled. */
+    put(0,0x10051af4,4);put(0x2c,0x00041af4,4);put(4,1,2);put(0x10,0x101,4);
+    assert(virtio_pci_transport_initialize(&p,&host,8,4,0)==VIRTIO_OK);
+    assert(pci_host_claimed(&host)==1 && !(cfg_read(config,8,4,2)&1));
+    assert(cfg_read(config,8,0x10,4)==0x101 && !p.function.bars[0].size);
+    assert(virtio_pci_transport_destroy(&p)==VIRTIO_OK && !pci_host_claimed(&host));
+    assert(cfg_read(config,8,4,2)==1 && cfg_read(config,8,0x10,4)==0x101);
+    put(0x2c,0x00021af4,4);
+    assert(virtio_pci_transport_initialize(&p,&host,8,4,0)==VIRTIO_EMPTY && !pci_host_claimed(&host));
+    put(0x2c,0x00041af4,4);config[0x34]=0;
+    assert(virtio_pci_transport_initialize(&p,&host,8,4,0)==VIRTIO_UNSUPPORTED && !pci_host_claimed(&host));
     puts("VirtIO legacy/modern MMIO and PCI widths, per-queue notification, optional config and BAR owner passed");
 }

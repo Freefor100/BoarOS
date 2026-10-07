@@ -42,7 +42,7 @@ def main():
     parser.add_argument('--linux',action='store_true');parser.add_argument('--smoke',action='store_true')
     parser.add_argument('--fault-program',type=Path);parser.add_argument('--oom-kernel');args=parser.parse_args()
     directory=Path(tempfile.mkdtemp(prefix='root-run.',dir=ROOT/'build/loongarch'))
-    cases=['normal'] if args.linux or args.smoke else ['normal','readonly','missing','nonexec','wrong-arch','corrupt','legacy']
+    cases=['normal','transitional'] if args.linux else ['normal'] if args.smoke else ['normal','transitional','readonly','missing','nonexec','wrong-arch','corrupt','legacy']
     initrd=None
     if args.linux:
         if subprocess.check_output(['git','-C','references/linux','rev-parse','HEAD'],text=True).strip()!='f4cdf7ca9a1fdcca413157df19753f388a5a224e': raise SystemExit('Linux revision mismatch')
@@ -59,7 +59,8 @@ def main():
             readonly_hash=hashlib.sha256(image.read_bytes()).hexdigest() if case=='readonly' else None
             kernel='build/linux-la/vmlinux' if args.linux else args.oom_kernel if case=='oom' else args.kernel
             command=[args.qemu,'-machine','virt','-cpu','la464','-global','ls7a_rtc.toy-enabled=on','-smp','1','-m',memory,'-kernel',kernel,'-drive',f'file={image},format=raw,if=none,id=root'+(',readonly=on' if case=='readonly' else ''),'-device','virtio-blk-pci,drive=root,addr=1,disable-legacy=on','-net','none','-nographic','-no-reboot']
-            if case=='legacy': command=[entry.replace(',disable-legacy=on','') for entry in command]
+            if case=='legacy': command=[entry.replace(',disable-legacy=on',',disable-modern=on') for entry in command]
+            if case=='transitional': command=[entry.replace(',disable-legacy=on','') for entry in command]
             if initrd: command+=['-initrd',str(initrd),'-append','console=ttyS0 rdinit=/init loglevel=3']
             try: code,text=run_guest(command,120)
             except subprocess.TimeoutExpired as error:
