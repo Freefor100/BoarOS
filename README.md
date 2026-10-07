@@ -180,6 +180,9 @@ RV多出的静态clock_gettime失败已逐指令定位为原glibc malloc初始�
 分区环境使mount/umount丢10分。原RV musl执行Linux调度syscall，原LA musl直接
 返回ENOSYS；两盘运行时实现内容不同，不以这些分差判断内核架构能力高低。
 依据和修复归属见[basic与运行时差异](docs/learning/oscomp-compat-baseline.md#basic的90分与原musl调度接口差异)。
+已批准的独立用户态修正诊断在两架构、两种RAM验证brk3/3及basic92/102；
+原LA cyclictest/libc字节保留，通过真实调度接口DSO运行四场景、获得采样并正常
+回收。该诊断自动恢复默认构建，原盘正式成绩保留，见[修正对照](docs/learning/oscomp-compat-baseline.md#公开用户态修正对照)。
 第三次运行发现的RV ext4 fatal保留了原现场；冷读OOM的通用修复先落main再合入，并在新的完整容器运行中未再次触发fatal。原判分成绩、总预算中断和未验证的资源回收边界分别记录。
 
 本分支已合入单核数据路径修复，并补跑原版 iozone、cyclictest、iperf、libcbench、lmbench 两种 libc 的一次评分。十个脚本都结束；当时的根盘 cleanup 错误已定位为 PID 1 退出时后台用户 owner 尚未回收，并在 main 修复后同步本分支。随后仅重跑原版 iperf，两种 libc 的十二项成功且正常关机；cyclictest 部分零采样仍待定位。分数、真实 iperf 吞吐和 1/10 ms 延迟的 36 次补测见[当前五项成绩与选择依据](docs/learning/data-path-budget-experiments.md#受控延迟与原版五项评分补测2026-10-06)。常规评分复用已核对输入，不重做四个发布资产的哈希扫描。

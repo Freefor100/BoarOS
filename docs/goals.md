@@ -70,6 +70,9 @@ RV静态clock_gettime的一项失败已定位为旧原glibc在malloc初始化期
 LA原musl cyclictest需要提供真实Linux调度接口的用户运行时；RV原盘同名函数已有
 syscall实现，且不同于上游同版本源码，不通过增加LA内核分支或替换正式原libc掩盖。
 固定身份和指令依据见[basic与运行时记录](learning/oscomp-compat-baseline.md#basic的90分与原musl调度接口差异)。
+已批准的独立修正诊断验证brk完整地址及LA musl调度DSO：两种RAM下basic92/102、
+cyclictest四场景实际采样并收口；正式原输入分数保持，VFAT仍作为后续共同能力。
+正常用户环境可采用真实Linux调度接口的运行时，不能把该适配诊断当成原盘已通过。
 完整凭据/权限、运行时网络配置和无 RNG 平台的可信熵接入由目标应用确定交付范围；
 LA 更广用户环境继续按真实消费者验收，SMP 单独规划。
 

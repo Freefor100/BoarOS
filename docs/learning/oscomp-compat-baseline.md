@@ -351,3 +351,70 @@ Linux sched syscall提供线程调度，而POSIX同名接口要求进程调度�
 两侧原运行时并非功能等价：RV旧glibc的初始化errno问题使clock少1分，原RV
 musl的实际调度接口又使cyclictest能运行。分差不能用于推导内核架构能力高低。
 本轮只完成原输入差异归因及basic原组回归，没有修改内核、原libc或原judge。
+
+## 公开用户态修正对照
+
+2026-10-07用户确认最小修正与兼容DSO路线。新增
+`tests/oscomp/user_runtime_probe.py`和`make diagnose-oscomp-user-runtime`，只执行
+独立诊断，不接入正式runner。原发布盘完整SHA在每侧启动前后核对；只允许写入
+build内非符号链接临时盘。原cyclictest、libc及原脚本/judge保持字节身份。
+修正版basic ELF只发布到临时盘，报告明确标为`repaired-user-runtime-diagnostic`、
+`official=false`，记录输入、修正、工具、Linux、内核和每次实际启动的身份。
+
+brk修正严格绑定上一节的原SHA、ELF机器类型及唯一可执行LOAD文件范围，
+拒绝指令变化、歧义映射和宽度变化。仅把返回后的截断替换成同宽NOP：
+
+| 架构 | ELF指令地址 | 原字节 → 修正字节（小端） | 修正ELF SHA-256 |
+|---|---|---|---|
+| RV | 0x1e10 | 0125 → 0100 | 1bb8cfd3f372a85ab63eeaf2044c2000dbfdc9aebcaaa3918d130200de429c2b |
+| LA | 0x2478 | 84804000 → 00004003 | 2912c15f3e60560d5ab6e115479da7fedebe440d0a9f7b9b9c7ceda42a479b77 |
+
+每架构原glibc/musl目录中的brk字节相同，适用相同修正。只读QEMU插件同时记录
+请求、内核原始返回和用户包装器返回；每次启动覆盖两种libc的修正前后共20次调用。
+验收要求地址高于32位范围，修正后实际完成base+64/base+128增长并完整返回地址，
+不能只凭原程序显示的低32位十进制输出计为正确。
+
+`tests/oscomp/sched_compat.c`的LA LP64D共享对象通过原musl的公共syscall接口
+执行118/119/120/121，并借用原libc的线程errno。原cyclictest的动态JUMP_SLOT
+允许LD_PRELOAD接管这四个符号；原ELF及libc无需替换。实际DSO SHA-256为
+`823cec886ed56d4dcee17f7177b667a2dfb96547e15d05fc974780940fad0319`。
+仅在独立sched probe和LA musl cyclictest子进程中开启preload，basic与原对照
+显式关闭。probe核对查询/设置、成功时保留errno以及EFAULT/ESRCH/EINVAL；
+不加DSO时退出91，加DSO时退出0。原cyclictest单线程参数在两系统、两种RAM下
+不加DSO均native wait=256，加DSO均wait=0且有真实采样。
+
+验收基于`fb6889d`后的本改动、固定Linux commit
+`f4cdf7ca9a1fdcca413157df19753f388a5a224e`，单CPU、无RNG；RV/LA各在Linux与
+BoarOS的512MiB/1GiB执行，八次启动均正常结束。BoarOS的页/任务/设备根owner
+校验通过、heap-live=0；Linux诊断PID1在应用退出后wait收养的后代，再卸载根盘。
+该ROOT_REAP_CHILDREN选项只在本诊断启用：原压力脚本发送SIGINT后并不wait
+hackbench，脚本结束不能证明400个后台worker已退出。八次basic原judge均为
+90/102→92/102，brk为1/3→3/3，VFAT相关10分仍缺。
+
+完整原LA musl cyclictest脚本四场景均报告子程序成功，BoarOS两种RAM的18条
+线程记录均有采样；原judge的诊断分如下。Linux压力八线程的零采样仍公开记录，
+不能以四个success或原judge分数替代每个线程的进展证据。
+
+| 系统 / RAM | 原judge诊断分 | STRESS_P8零采样线程数 |
+|---|---:|---:|
+| BoarOS / 512MiB | 7.365689562094878 | 0 |
+| BoarOS / 1GiB | 7.3843744828409665 | 0 |
+| Linux / 512MiB | 7.438810171799261 | 3 |
+| Linux / 1GiB | 7.540831489481921 | 1 |
+
+这些启动包含只读插件，部分与其他诊断同时运行，不作为独占吞吐/时延比较，
+也不替换1915历史正式总分。另一次Linux basic观察到父子`cpid`字符输出交错为
+`cpid: 222cpid: 0`，原judge要求独立行而扣pipe分；报告保留其他basic分差，
+不把两次独立执行的差异自动归因于brk修正，不修改原输出或judge。
+
+```sh
+make test-oscomp-host
+make diagnose-oscomp-user-runtime
+# 也可单独选择架构；入口结束或失败后自动恢复默认双架构make all。
+python3 -B tests/oscomp/user_runtime_probe.py --arch loongarch
+```
+
+host反例覆盖原身份/指令拒绝、真实高地址返回、缺失/重复native wait、子程序
+失败与零采样分类，以及禁止写入参考盘。保护反例本身使用临时输入；本轮一次
+误用真实LA原盘路径后，已从固定xz重新恢复并完整核对原SHA，恢复后的验收
+再次核对两侧原盘启动前后身份。结果收口后按既有pruner清理运行副本与日志。

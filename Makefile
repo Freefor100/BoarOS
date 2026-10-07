@@ -1908,6 +1908,10 @@ test-oscomp-supervisor-loongarch:
 diagnose-oscomp-clock-errno:
 	python3 -B tests/oscomp/clock_errno_probe.py
 
+.PHONY: diagnose-oscomp-user-runtime
+diagnose-oscomp-user-runtime:
+	python3 -B tests/oscomp/user_runtime_probe.py
+
 test-oscomp-riscv:
 	python3 -B tests/oscomp/run.py --arch riscv
 

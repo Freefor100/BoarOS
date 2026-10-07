@@ -13,6 +13,20 @@
 #endif
 #define call test_syscall6
 static void puts(const char *s) {unsigned n=0;while(s[n])n++;call(64,1,(long)s,n,0,0,0);}
+#ifdef ROOT_REAP_CHILDREN
+static int reap_remaining_children(void)
+{
+    /* 诊断PID1持有退出应用留下的后代；脚本退出不能代替它们的真实wait。 */
+    for(;;) {
+        int status=-1;
+        long child=call(260,-1,(long)&status,0,0,0,0);
+        if(child==-10)break;
+        if(child<0)return 1;
+    }
+    puts("Linux " ROOT_ARCH_LABEL " remaining children reaped\n");
+    return 0;
+}
+#endif
 int user_main(uint64_t *stack)
 {
     (void)stack;
@@ -29,6 +43,9 @@ int user_main(uint64_t *stack)
     }
     int direct_status=-1;
     int direct_failed=direct_child<0 || call(260,direct_child,(long)&direct_status,0,0,0,0)!=direct_child || direct_status!=(EXPECTED_EXIT_STATUS<<8);
+#ifdef ROOT_REAP_CHILDREN
+    direct_failed|=reap_remaining_children();
+#endif
     long root_fd=call(56,-100,(long)"/",0,0,0,0);
     if(root_fd<0 || call(267,root_fd,0,0,0,0,0) || call(57,root_fd,0,0,0,0,0))direct_failed=1;
     puts(direct_failed ? "Linux " ROOT_ARCH_LABEL " root application failed\n" : "Linux " ROOT_ARCH_LABEL " root application passed\n");
@@ -74,6 +91,9 @@ int user_main(uint64_t *stack)
         }
         int status=-1;
         if(call(260,child,(long)&status,0,0,0,0)!=child || status!=(EXPECTED_EXIT_STATUS<<8)) failed=1;
+#ifdef ROOT_REAP_CHILDREN
+        failed|=reap_remaining_children();
+#endif
     }
 #if defined(ROOT_NETWORK_SETUP) || defined(ROOT_PROC_CLEANUP)
     for(;;) {

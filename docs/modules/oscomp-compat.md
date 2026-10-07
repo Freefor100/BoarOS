@@ -83,6 +83,7 @@ make all
 make test-oscomp-host
 make test-oscomp-supervisor-riscv test-oscomp-supervisor-loongarch
 make diagnose-oscomp-clock-errno # 原RV静态glibc的errno写入归因，独立诊断
+make diagnose-oscomp-user-runtime # 公开brk输入修正与LA sched DSO，独立诊断
 python3 -B tests/oscomp/run.py --arch both --groups environment --output build/oscomp-environment-check
 python3 -B tests/oscomp/run.py --arch loongarch --groups ltp --output build/oscomp-la-ltp-check
 make test-oscomp-riscv       # 本地RV全量诊断
@@ -162,6 +163,13 @@ Linux返回故障profile验证同一因果链，512MiB/1GiB都正常回收。参
 原RV musl的四个sched查询/设置函数执行真实syscall，原LA同名函数直接ENOSYS；
 上游1.2.0与1.2.5都为ENOSYS，不能把原RV二进制内容差异归为版本新旧。
 两侧共用内核调度实现；原输入能力差异与共同VFAT缺口分别记录，见上述basic记录。
+
+用户批准后新增独立用户态修正入口：只在临时盘修正已校验SHA的brk截断，LA
+cyclictest借用原libc的syscall并通过LD_PRELOAD提供四个真实调度接口；原cyclictest
+及libc不变，正式入口不开启。只读插件验证高地址+64/+128，独立整数父任务记录
+native wait，Linux诊断PID1可选择wait被收养的后代。报告保留逐线程零采样、
+其他basic分差和原盘前后身份，结束时恢复默认双架构构建。BoarOS两种RAM已获
+basic92/102、cyclictest四场景真实采样及正常回收，见[公开修正对照](../learning/oscomp-compat-baseline.md#公开用户态修正对照)。
 
 ## 整体审查后的报告契约
 
