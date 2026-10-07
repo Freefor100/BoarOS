@@ -31,7 +31,7 @@ struct pci_virtio_caps {
 };
 enum pci_status pci_function_probe(struct pci_host *,uint16_t,struct pci_function *);
 enum pci_status pci_virtio_capabilities(const struct pci_function *,struct pci_virtio_caps *);
-/* Disables decode while sizing BARs; failure restores all BAR/command owners. */
+/* Assigns memory BARs with PIO decode disabled; failure restores BAR/command owners. */
 enum pci_status pci_function_assign(struct pci_function *);
 /* Caller must first reset device/stop DMA and unregister its interrupt owner. */
 enum pci_status pci_function_restore(struct pci_function *);

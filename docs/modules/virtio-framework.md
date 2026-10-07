@@ -2,7 +2,7 @@
 
 入口为`include/kernel/virtio_transport.h`、`virtio_split_queue.h`和
 `drivers/virtio/{transport,split_queue,mmio,pci}.c`。block、RNG、net均已迁入；三个设备的业务策略与owner仍各自持有。LA真实
-PCI RNG/net和退出回收均有独立验收，完整平台/程序矩阵仍在推进。
+PCI RNG/net和退出回收均有独立验收，指定双架构平台/程序矩阵已收口；原评测盘与官方容器另有独立基线。
 
 ## 分层与硬件契约
 
@@ -22,6 +22,11 @@ MMIO/PCI由同一个核心配置，传统guest page/PFN与现代三组地址仍�
 block要求8字节，其他消费者同样明确要求其有效字段。每个queue分别保存已检查的
 notify位置，不能将queue0的notify地址用于所有queue。非法外部notify范围返回
 UNSUPPORTED，不能作为内核状态损坏fatal。
+
+PCI身份按固定Linux区分modern ID与transitional subsystem device；两者均要求
+完整modern capabilities。纯legacy PCI仍返回UNSUPPORTED。memory BAR分配忽略
+未使用的PIO BAR，并在整个modern owner期间关闭PIO decode；确认reset后恢复
+原BAR和command，不能开启无owner的PIO窗口。
 
 PCI平台持有function/BAR、映射和共享INTx来源。初始化在BAR分配后确认旧DMA停止，
 随后才开启bus-master。reset不能确认时保留function/BAR；销毁必须在设备业务
@@ -82,7 +87,8 @@ host验证feature/reset失败、三个adapter的访问宽度/notify/BAR、token�
 真实PCI上的确认失败注入另验证初始化半成品、core消费后的BAR重试及根启动
 EIO/未发布PID1/资源基线；这是软件边界注入，固定QEMU自身仍提供同步reset。
 扩大RV架构、真实用户态、五形态glibc2.44、1366条ABI以及SQLite DELETE/WAL
-完整NBD恢复矩阵通过；RNG/net迁移和全计划最终回归仍需独立完成。
+完整NBD恢复矩阵通过；RNG/net迁移、双架构指定矩阵与最终审查已收口，具体范围见
+[LA模块](loongarch-boot.md)，不据此声明完整评测清单通过。
 
 固定依据为`references/linux` commit
 `f4cdf7ca9a1fdcca413157df19753f388a5a224e`的`include/uapi/linux/virtio_ring.h`，

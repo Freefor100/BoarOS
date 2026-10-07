@@ -1,6 +1,16 @@
 #include <kernel/virtio_pci.h>
 #include <arch/bus.h>
 
+int virtio_pci_device_matches(struct pci_host *host,uint16_t bdf,uint32_t device_id)
+{
+    if(!host || !host->read || !device_id)return 0;
+    uint32_t identity=host->read(host->context,bdf,0,4),kind=identity>>16;
+    if((identity&0xffff)!=0x1af4 || kind<0x1000 || kind>0x107f)return 0;
+    /* transitional 的设备种类由 subsystem 决定，不能从旧 PCI ID 相减。 */
+    kind=kind<0x1040 ? host->read(host->context,bdf,0x2c,4)>>16 : kind-0x1040;
+    return kind==device_id;
+}
+
 static unsigned reg_offset(enum virtio_register reg,unsigned *width)
 {
     static const uint8_t offsets[]={20,0,4,8,12,22,24,24,28,0,0,0,0,32,36,40,44,48,52,21};
@@ -67,7 +77,7 @@ enum virtio_status virtio_pci_transport_initialize(struct virtio_pci_transport *
     enum pci_status status=pci_function_probe(host,bdf,&p->function);
     if(status!=PCI_OK)return status==PCI_NOT_PRESENT ? VIRTIO_EMPTY : VIRTIO_UNSUPPORTED;
     enum virtio_status result=VIRTIO_UNSUPPORTED;
-    if(p->function.identity!=((0x1040+device_id)<<16|0x1af4U)) {result=VIRTIO_EMPTY;goto unassigned;}
+    if(!virtio_pci_device_matches(host,bdf,device_id)) {result=VIRTIO_EMPTY;goto unassigned;}
     status=pci_virtio_capabilities(&p->function,&p->caps);
     if(status!=PCI_OK || p->caps.device.length<config_size)goto unassigned;
     status=pci_function_assign(&p->function);
@@ -85,7 +95,7 @@ enum virtio_status virtio_pci_transport_initialize(struct virtio_pci_transport *
     /* 先确认旧queue停止，再开启bus-master；失败保留真实BAR owner。 */
     result=virtio_transport_reset(&p->transport);
     if(result!=VIRTIO_OK)return result;
-    host->write(host->context,bdf,4,2,(p->function.command|6)&~0x400U);
+    host->write(host->context,bdf,4,2,(p->function.command|6)&~0x401U);
     return VIRTIO_OK;
 assigned:
     if(pci_function_restore(&p->function)!=PCI_OK)__builtin_trap();

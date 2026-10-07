@@ -507,3 +507,17 @@ LP64D musl、两种GNU runtime、原版/派生QEMU、两套LA Linux及编译产�
 官方镜像已实际取得，digest为85dec949df7cef41fd03d30c6ad69f952204540e18d2c62bced9d2e262fef12d，
 QEMU10.0.2、两侧GCC13.2.0、Python3.12.3和make4.3。固定Dockerfile的版本描述
 不是这个镜像的二进制身份；原盘libc仍与独立验收runtime分别记录。
+
+## Transitional PCI 的 modern 接口（2026-10-07）
+
+固定Linux `references/linux@f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的
+`drivers/virtio/virtio_pci_modern_dev.c` 使用0x1000–0x107f范围；transitional
+设备的kind来自subsystem device，而不是旧PCI ID算术。固定QEMU
+`references/qemu@84f07211cc5b4fc6a371559bf8a5de4fb068e648` 的
+`hw/virtio/virtio-pci.c` 可同时暴露legacy PIO BAR和modern capabilities。
+因此“有legacy BAR”不等于“没有modern接口”。
+
+host先复现同样capability内容因身份拒绝，修复后验证真实BAR claim、PIO持续关闭、
+reset后配置恢复和错误subsystem/缺modern caps的失败回滚。根盘测例区分默认
+transitional与`disable-modern=on`的纯legacy负例；不能以移除disable-legacy
+作为legacy-only证据。此修复不增加legacy PCI寄存器协议或PIO资源分配。

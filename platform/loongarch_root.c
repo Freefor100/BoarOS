@@ -43,14 +43,12 @@ static struct {
     int live;
 } root;
 static struct arch_mmu_page_table table;
-static int is_block(uint32_t id)
-{ return id==0x10421af4 || id==0x10011af4; }
 static int dma(const void *p,uint64_t size,uint64_t *address)
 { return arch_direct_map_va_to_pa((uintptr_t)p,size,address)==ARCH_DIRECT_MAP_STATUS_OK; }
 static int start_rng(struct physical_page_allocator *allocator,struct pci_host *host)
 {
     for(unsigned bdf=0;bdf<256;bdf++) {
-        if(host->read(host->context,bdf,0,4)!=0x10441af4)continue;
+        if(!virtio_pci_device_matches(host,bdf,4))continue;
         int error=virtio_pci_rng_start(&root.rng,host,bdf,allocator,la_timer_frequency());
         if(!error) {
             la_virt_puts("LA PCI RNG bdf=");la_virt_hex(bdf);
@@ -65,8 +63,7 @@ static int start_rng(struct physical_page_allocator *allocator,struct pci_host *
 static int start_network(struct physical_page_allocator *allocator,struct pci_host *host)
 {
     for(unsigned bdf=0;bdf<256;bdf++) {
-        uint32_t id=host->read(host->context,bdf,0,4);
-        if(id!=0x10411af4 && id!=0x10001af4)continue;
+        if(!virtio_pci_device_matches(host,bdf,1))continue;
         int error=virtio_pci_net_start(&root.net,host,bdf,allocator,la_timer_frequency());
         if(error)return error;
         la_virt_puts("LA PCI net bdf=");la_virt_hex(bdf);
@@ -238,15 +235,14 @@ static int start_root(void)
     struct pci_host *host=la_virt_pci_host();
     int error=root.detected>ROOT_DEVICES ? -KERNEL_ENOSPC : 0;
     for(unsigned bdf=0;!error && bdf<256;bdf++) {
-        uint32_t id=host->read(host->context,bdf,0,4);
-        if(!is_block(id)) continue;
-        if(id!=0x10421af4) {error=-KERNEL_ENOTSUP;break;}
+        if(!virtio_pci_device_matches(host,bdf,2)) continue;
         struct virtio_pci_block *device=&root.devices[root.count];
         enum virtio_block_status status=virtio_pci_block_init(device,host,bdf,allocator,dma,la_timer_frequency());
         if(status!=VIRTIO_BLOCK_DRIVER_STATUS_OK) {
             /* 半成品也可能持有真实BAR；清理不能只遍历成功发布的块核心。 */
             if(device->pci.function.host)root.count++;
-            error=status==VIRTIO_BLOCK_DRIVER_STATUS_NO_MEMORY ? -KERNEL_ENOMEM : -KERNEL_EIO;
+            error=status==VIRTIO_BLOCK_DRIVER_STATUS_NO_MEMORY ? -KERNEL_ENOMEM :
+                status==VIRTIO_BLOCK_DRIVER_STATUS_UNSUPPORTED ? -KERNEL_ENOTSUP : -KERNEL_EIO;
             break;
         }
         unsigned number=root.count++;
@@ -273,7 +269,7 @@ static int start_root(void)
 int la_root_boot(struct physical_page_allocator *allocator)
 {
     struct pci_host *host=la_virt_pci_host();
-    for(unsigned bdf=0;bdf<256;bdf++) if(is_block(host->read(host->context,bdf,0,4))) root.detected++;
+    for(unsigned bdf=0;bdf<256;bdf++) if(virtio_pci_device_matches(host,bdf,2)) root.detected++;
     if(!root.detected) return 0;
     table.allocator=allocator;table.state=ARCH_MMU_STATE_ACTIVE;
     if(kernel_heap_init(&root.heap,allocator,la_virt_physical_address)!=KERNEL_HEAP_STATUS_OK ||

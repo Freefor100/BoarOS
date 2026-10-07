@@ -96,7 +96,8 @@ enum pci_status pci_function_assign(struct pci_function *f)
     write(f,4,2,f->command&~7U);
     for(unsigned i=0;i<6;i++) {
         uint32_t original=f->saved_bars[i];
-        if(original&1) {result=PCI_UNSUPPORTED;break;}
+        /* 这里只分配 memory BAR；未借用的 PIO BAR 保持原值且 decode 关闭。 */
+        if(original&1) continue;
         unsigned kind=(original>>1)&3;
         if(kind!=0 && kind!=2) {result=PCI_UNSUPPORTED;break;}
         if(kind==2 && i==5) {result=PCI_MALFORMED;break;}
@@ -117,7 +118,7 @@ enum pci_status pci_function_assign(struct pci_function *f)
         if(kind==2) {write(f,0x14+i*4,4,address>>32);i++;}
     }
     if(result!=PCI_OK) {restore_config(f);release_claims(f);memset(f->bars,0,sizeof(f->bars));return result;}
-    write(f,4,2,(f->command|2)&~4U);f->assigned=1;return PCI_OK;
+    write(f,4,2,(f->command|2)&~5U);f->assigned=1;return PCI_OK;
 }
 enum pci_status pci_function_restore(struct pci_function *f)
 {
