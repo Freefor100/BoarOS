@@ -89,4 +89,10 @@ test-pty-loongarch test-pty-apps-loongarch test-uart-failures-loongarch`。
 UART port/core heap、worker任务页/栈、IRQ共五类构造失败不发布PID1，
 两种RAM回到页/堆/栈/BAR基线；另有活跃UART+console关闭+满队列的fatal轮询证据。
 宿主真实core模型保护超时保留owner与后续stop、THRE/TEMT和启动回滚。
-RTC和完整指定程序矩阵在本阶段尚未验收，不由终端通过推导能力全部对齐。
+RTC和指定双架构程序矩阵已有各自验收，见[LA模块](loongarch-boot.md)；
+终端门禁仍不能代替更广应用或完整Harness证据。
+
+交互cat门禁先等待前台子shell输出READY并exec原cat，再发送测试行。
+命令回显只证明输入被回显，不能证明foreground程序已经执行。固定Linux的LA
+1GiB反例只出现一条行规程echo，旧runner等待第二条真正回送超时；新同步后
+Linux/BoarOS的LA两种RAM与RV通过，保留echo和cat双回送、Ctrl-C及后续jobs门禁。
