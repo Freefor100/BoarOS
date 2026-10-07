@@ -85,6 +85,12 @@ def original_score(summary, config):
             'original_postwork_verdict': job.verdict_value, 'html': job.html}
 
 
+def kernel_failure(serial):
+    prefixes = ('BoarOS: fatal ', 'BoarOS: timer error status=',
+                'BoarOS: scheduler error status=', 'BoarOS: user fault resolver error status=')
+    return next((line for line in serial.splitlines() if line.strip().startswith(prefixes)), None)
+
+
 def case_observations(section):
     cases, errors, current = [], [], None
     for raw in section.splitlines():
@@ -98,7 +104,9 @@ def case_observations(section):
                 'evidence': [], 'evidence_count': 0}
             continue
         kind = None
-        if 'BOAROS-CASE EXEC-ERROR ' in line or "can't execute '" in line:
+        if kernel_failure(line):
+            kind = ('kernel-runtime-error', 'running', 'kernel')
+        elif 'BOAROS-CASE EXEC-ERROR ' in line or "can't execute '" in line:
             kind = ('load-error', 'load', 'user-exec')
         elif 'BOAROS-CASE WAIT-ERROR ' in line:
             kind = ('runner-error', 'supervision', 'case-supervisor')
@@ -156,6 +164,7 @@ def summarize_groups(serial, selected, exit_reason='qemu-exit'):
                      'not-reached' if not entered and not started else
                      'script-failure' if code not in (None, 0) else
                      'completed' if ended and code == 0 else
+                     'kernel-runtime-error' if exit_reason == 'kernel-runtime-error' else
                      'timeout' if exit_reason == 'total-budget-timeout' else 'incomplete')
             section = ''
             if entered:
@@ -321,7 +330,9 @@ def main():
             serial = log.read_text(errors='replace')
             reason = entry['exit_reason']
             if 'root boot error' in serial or 'LA root boot errno=' in serial: reason = 'guest-boot-error'
+            elif kernel_failure(serial): reason = 'kernel-runtime-error'
             entry.update(exit_reason=reason, serial_sha256=sha(log), completed_script='BOAROS-EVAL COMPLETE' in serial)
+            entry['kernel_failure'] = kernel_failure(serial)
             entry['root_resources_verified'] = reason == 'qemu-exit' and PROFILES[arch].root_success(serial, 0)
             entry['groups'] = summarize_groups(serial, selected, reason)
             results = judge(log, config)

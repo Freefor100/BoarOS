@@ -3,6 +3,7 @@
 本模块仅存在于oscomp-compat。main保留通用内核和自身身份；通用修复先落main再
 单向合入此分支。本分支保留兼容uname4.15.0、原盘启动配置、监督与判分。分支
 由oscomp-rv-compat本地改名，旧远程引用没有迁移。历史RV专项记录仍保留原身份。
+输入与逐次失败的证据边界见[评测学习记录](../learning/oscomp-compat-baseline.md)。
 
 ## 固定输入与入口
 
@@ -143,7 +144,17 @@ PID1/页/堆/任务栈/根盘/设备收尾。容器清理由本次cidfile标识�
 只重读同一冻结identity、原Job、两份实际串口与observer，不再次启动或构建，不合并
 其他运行。核对原联合postwork整数分并记录collector commit/tree及dirty状态；冻结
 内核源码身份与collector身份分开。单独观察运行中的已授权容器可用--observe-only。
-当前第三次正式运行仍固定722b517，后续报告/文档提交不冒充其实际构建输入。
+第三次运行固定722b517，在RV的原fs_fill遇到ext4_bcache_free的NULL+0x38 fatal；
+现场没有原调用栈，且最终Job/LA生命周期未收齐，不作为完成的正式基线。
+main的a15fbf3已用实际lwext4冷缓存树读取OOM独立复现同一释放位置并修复，
+OOM/读失败、重试/卸载/堆清零、完整host恢复及双侧真实程序回归通过；
+先前事件与这条调用链的唯一归因仍须区别于确定性复现，干净官方全量重跑继续。
+
+实际kernel fatal优先于进程结束或预算证据，标记kernel-runtime-error，保留原故障行；
+当前组/单项保留kernel owner，未到达组保持not-reached，没有伪造exit/wait状态。
+原judge的Accepted与整数分只证明原判分完成，results_captured与baseline_established
+分开。两侧均有正常PID1/owner收口，或真实总预算证据，且没有运行阻塞时才建立基线；
+否则官方入口返回失败并保留完整已取得结果。总预算终止不声明正常资源回收。
 
 该轮聚焦与真实回归已包括host反例、两侧supervisor、原环境basic/BusyBox自然退出、
 RV完整架构、LA核心/fatal/dynamic、RV真实userland、GNU五形态、双方1366ABI、

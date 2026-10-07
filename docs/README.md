@@ -43,7 +43,7 @@ learning 面向读者解释机制、结果和适用条件。正文使用可识�
 | 内存 / ELF | [内存管理](learning/memory-management.md)、[ELF 装载](learning/elf-loading.md) |
 | 进程 / 并发 | [调度](learning/kernel-scheduling.md)、[生命周期](learning/process-lifecycle.md)、[线程与 futex](learning/threads-and-futex.md)、[可信随机源](learning/random-source.md)、[会话/调度消费者](learning/session-consumers.md) |
 | 文件 / 事件 | [存储](learning/storage-filesystems.md)、[时间戳](learning/file-timestamps.md)、[I/O 多路复用](learning/io-multiplexing.md)、[epoll](learning/epoll-subsystem.md)、[记录锁与恢复](learning/record-lock-sqlite-recovery.md)、[可睡眠存储](learning/sleepable-storage.md)、[多挂载验收](learning/memory-backed-mounts.md)、[proc 控制](learning/proc-controls.md)、[网络 owner](learning/network-ownership.md) |
-| 真实程序 | [最近全量基线、阻塞与根因](learning/user-program-inventory.md)、[客体内编译探针](learning/offline-toolchain-probe.md)、[单核规模](learning/single-hart-scale.md) |
+| 真实程序 | [最近全量基线、阻塞与根因](learning/user-program-inventory.md)、[双架构评测证据](learning/oscomp-compat-baseline.md)、[客体内编译探针](learning/offline-toolchain-probe.md)、[单核规模](learning/single-hart-scale.md) |
 
 每个可独立验证的阶段收口时检查 README、模块、learning 三类文档：有新事实才更新，旧结论直接替换，细节用链接引用。运行产物仅在核对期间暂存于忽略的 `build/`，随后用 `make prune-build` 清理一次性目录与日志；临时 plan/spec 与会话材料不入库。
 

@@ -38,6 +38,18 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(result['state'], 'timeout')
         self.assertIsNone(result['script_exit'])
 
+    def test_kernel_fatal_preserves_active_case_and_unreached_groups(self):
+        text = ('BOAROS-EVAL ENTER ltp-glibc\nRUN LTP CASE fs_fill\n'
+                'BoarOS: fatal trap scause=0xd sepc=0xffffffff80058472 stval=0x38\n')
+        groups = self.states(text, ['ltp'], 'kernel-runtime-error')
+        self.assertEqual(groups['ltp-glibc']['state'], 'kernel-runtime-error')
+        case = groups['ltp-glibc']['cases'][0]
+        self.assertEqual(case['state'], 'kernel-runtime-error')
+        self.assertEqual(case['owner'], 'kernel')
+        self.assertIsNone(case['shell_exit_status'])
+        self.assertIsNone(case['wait_status'])
+        self.assertEqual(groups['ltp-musl']['state'], 'not-reached')
+
     def test_skip_and_timeout_remain_visible_in_a_completed_wrapper(self):
         text = ('BOAROS-EVAL ENTER ltp-musl\n#### OS COMP TEST GROUP START ltp-musl ####\n'
                 'BOAROS-CASE SKIP command=x reason=controller\n'

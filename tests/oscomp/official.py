@@ -113,10 +113,19 @@ def harness_error_stage(job):
 
 def classify_official_exit(serial, evidence):
     evidence = evidence or {}
-    if evidence.get('budget_observed'): return 'total-budget-timeout'
     if 'root boot error' in serial or 'LA root boot errno=' in serial: return 'guest-boot-error'
+    if local.kernel_failure(serial): return 'kernel-runtime-error'
+    if evidence.get('budget_observed'): return 'total-budget-timeout'
     if evidence.get('end_observed'): return 'qemu-exit'
     return 'unknown-lifecycle'
+
+
+def baseline_ready(architectures):
+    # 原judge分数只证明判分完成；两侧运行与收口证据另外决定基线状态。
+    return set(architectures) == set(local.ARCH_KEYS) and all(
+        entry['exit_reason'] == 'total-budget-timeout' or
+        (entry['exit_reason'] == 'qemu-exit' and entry['root_resources_verified'])
+        for entry in architectures.values())
 
 
 LIFECYCLE_PROBE = r'''import os,json
@@ -221,6 +230,7 @@ def collect_results(directory, report):
             'case_sha256': local.sha(base / 'case'), 'init_config_sha256': local.sha(base / 'init.json'),
             'serial_sha256': local.sha(log), 'qemu_command_from_original_stream': serial.splitlines()[0] if serial else '',
             'qemu_returncode': None, 'boot_count': 1, 'completed_script': done, 'exit_reason': reason,
+            'kernel_failure': local.kernel_failure(serial),
             'root_resources_verified': reason == 'qemu-exit' and done and PROFILES[arch].root_success(serial, 0),
             'groups': local.summarize_groups(serial, local.GROUPS, reason)}
         summary[key] = local.judge(log, config)
@@ -234,10 +244,11 @@ def collect_results(directory, report):
     if int(original['score']) != expected['postwork_integer_score']:
         raise RuntimeError('original Job score differs from joint upstream postwork replay')
     report.update(postwork_integer_score=int(original['score']), postwork_rank=original['rank'],
-                  original_postwork_verdict=original['verdict'], baseline_established=True)
+                  original_postwork_verdict=original['verdict'], results_captured=True,
+                  baseline_established=baseline_ready(report['architectures']))
     report['all_scripts_completed'] = all(entry['completed_script'] for entry in report['architectures'].values())
     report.pop('error', None)
-    print(json.dumps({'baseline_established': True, 'all_scripts_completed': report['all_scripts_completed'],
+    print(json.dumps({'baseline_established': report['baseline_established'], 'all_scripts_completed': report['all_scripts_completed'],
                       'score': report['postwork_integer_score']}, indent=2), flush=True)
 
 
@@ -255,7 +266,11 @@ def main():
         if args.observe_only: observe_lifecycle(directory); return
         report = json.loads((directory / 'identity.json').read_text())
         stage = harness_error_stage(original_job_output(directory / 'harness.log')) or 'collection'
-        try: collect_results(directory, report)
+        try:
+            collect_results(directory, report)
+            if not report['baseline_established']:
+                stage = 'runtime-verification'
+                raise RuntimeError('official results captured; architecture run/owner blockers remain')
         except Exception as error:
             report['error'] = {'stage': stage, 'type': type(error).__name__, 'message': str(error)}; raise
         finally: (directory / 'report.json').write_text(json.dumps(report, indent=2) + '\n')
@@ -333,6 +348,9 @@ def main():
             except subprocess.TimeoutExpired:
                 observer.terminate(); observer.wait(timeout=5)
         collect_results(directory, report)
+        if not report['baseline_established']:
+            stage = 'runtime-verification'
+            raise RuntimeError('official results captured; architecture run/owner blockers remain')
 
     except BaseException as error:
         report['error'] = {'stage': stage, 'type': type(error).__name__, 'message': str(error)}

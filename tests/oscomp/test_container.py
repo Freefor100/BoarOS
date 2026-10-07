@@ -73,6 +73,26 @@ class ContainerTests(unittest.TestCase):
         self.assertEqual(module.classify_official_exit(serial, None), 'unknown-lifecycle')
         self.assertEqual(module.classify_official_exit(serial, {'end_observed': True}), 'qemu-exit')
 
+    def test_kernel_fatal_is_not_normal_exit_or_budget_timeout(self):
+        module = self.module()
+        for fatal in ('BoarOS: fatal trap scause=0xd sepc=0xffffffff80058472 stval=0x38',
+                      'BoarOS: fatal LA kernel trap'):
+            for evidence in (None, {'end_observed': True}, {'budget_observed': True}):
+                with self.subTest(fatal=fatal, evidence=evidence):
+                    self.assertEqual(module.classify_official_exit(fatal+'\n', evidence),
+                                     'kernel-runtime-error')
+
+    def test_baseline_requires_both_architectures_without_run_blockers(self):
+        module = self.module()
+        natural = {'exit_reason': 'qemu-exit', 'root_resources_verified': True}
+        budget = {'exit_reason': 'total-budget-timeout', 'root_resources_verified': False}
+        fatal = {'exit_reason': 'kernel-runtime-error', 'root_resources_verified': False}
+        self.assertTrue(module.baseline_ready({'riscv': natural, 'loongarch': budget}))
+        self.assertFalse(module.baseline_ready({'riscv': natural}))
+        self.assertFalse(module.baseline_ready({'riscv': fatal, 'loongarch': budget}))
+        self.assertFalse(module.baseline_ready({'riscv': natural, 'loongarch': {
+            'exit_reason': 'unknown-lifecycle', 'root_resources_verified': False}}))
+
     def test_lifecycle_requires_seen_owner_and_conservative_budget_evidence(self):
         module = self.module()
         record = {'samples': 0, 'budget_seconds': 10, 'architectures': {}}

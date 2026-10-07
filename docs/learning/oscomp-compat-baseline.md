@@ -1,0 +1,55 @@
+# 双架构评测的输入、失败与证据
+
+当前路线为 main 单向集成到本地 oscomp-compat；旧远程分支保持原名，
+没有远程迁移、push 或托管 CI 运行事实。构建/监督入口见
+[兼容模块](../modules/oscomp-compat.md)。
+
+固定 Harness 为 `references/oscomp-autotest` 的
+`d1bb3a3c4b27274e196a2648518525c1a304e339`；输入是
+`pre-20250615` 原 RV/LA 盘，身份由 `tests/oscomp/inputs.json` 固定。
+原 parser、22 个 judge 与 postwork 不改写。官方单 CPU、1 GiB、3600 秒，
+监督为既有 300 秒/TERM 后 2 秒 KILL；源码 helper 跳过与人工排除分别记录。
+
+实际容器为
+`zhouzhouyi/os-contest@sha256:85dec949df7cef41fd03d30c6ad69f952204540e18d2c62bced9d2e262fef12d`，
+工具检查得到 QEMU 10.0.2、两架构 GCC 13.2.0、Python 3.12.3 与 make 4.3。
+Dockerfile 的 QEMU 9.2.1 不作为实际运行身份。宿主工具/派生 RTC/RNG 诊断
+单独记录；官方不增加 RNG 或替换 QEMU。
+
+## 2026-10-07 的失败处理
+
+| 冻结源码 | 首个已证明阶段 | 结果与处理 |
+|---|---|---|
+| 54df367 | 容器编译 | GCC13 不支持 `-mno-lsx/-mno-lasx`；没有内核启动或测例结果。采用受支持的整数 ABI 与禁自动向量化构建，手写 CPU 状态汇编保留。 |
+| f366e33 | LA 原 GNU ELF 装载准备 | 原 ELF 请求 `/lib64/ld-linux-loongarch-lp64d.so.1`；补指向原盘 loader 的链接，未替换 libc。发现后主动停止该次运行，不拼接分数。 |
+| 722b517 | RV 内核运行 | 在原 `fs_fill` 活动期间，`ext4_bcache_free()` 访问 NULL+0x38；没有捕获原调用栈，最终 Job/LA 生命周期也未收齐。不是完成的基线。 |
+
+main `a15fbf3` 的独立实际源代码复现证明：冷缓存 extent 树读取 OOM 后，
+非零 `lb_id` 被误当作 buffer 引用，经过 `read_extent_tree_block()` 错误清理
+触发同一释放位置。分配失败直接传播后，所有实际分配点/读错误、同 inode
+重试、文件内容、正常卸载、堆对象清零与 fsck 通过；完整 host 存储恢复、
+RV VFS/files/真实 musl、双方 SQLite DELETE/WAL 与重启、LA 动态 exec/DSO TLS
+Linux/BoarOS 两种 RAM 和栈界也通过。兼容分支以 merge commit 集成。
+这证明该错误路径已修复，不反推原 fatal 的唯一调用链；新的完整运行仍需要核对。
+
+原 RV `fs_fill` 在固定 Linux
+`references/linux@f4cdf7ca9a1fdcca413157df19753f388a5a224e` 下，对同一个 ELF
+观察到创建测试盘文件 ENOSPC、TBROK 与 shell status 6，根盘正常收口；
+BoarOS 新鲜原盘诊断则在准备阶段返回 ENOSYS、status 6 并正常回收。
+这两个结果不是功能通过，测试设备准备与 syscall 缺口仍应分别保留。
+该 BoarOS 诊断只在临时内核 ELF 将 UTS 字符串同长替换为
+`6.6.0-boaros-dev`，用于进入原 GNU loader；原程序未改，但这一内核身份
+不能代替兼容分支 `4.15.0` 的正式运行证据。
+
+## 报告的完成边界
+
+原 Job 的 Accepted 和分数只能证明原判分完成。`results_captured` 表示
+完整两侧串口与联合 postwork 被取得并核对；`baseline_established` 还需要两侧
+真实进程结束/正常 owner 收口，或实际总预算证据，且没有内核运行阻塞。
+fatal 优先于预算分类，当前案例保存 kernel owner 和原故障行，后续未到达组
+保持未到达，不补 shell/wait 状态。缺失生命周期事实保持 unknown。
+
+重建命令为 `make test-oscomp-host test-oscomp-official`；官方入口从当前干净
+提交快照构建，不读宿主 build 缓存。每次运行独立，禁止拼接不同启动成绩。
+若只改报告采集器，`--collect-existing` 只读取同一次原 Job/串口/冻结身份和
+observer，分开记录采集器提交与实际内核提交。当前基线仍未完成。
