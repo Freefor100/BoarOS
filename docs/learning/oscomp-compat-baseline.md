@@ -189,8 +189,8 @@ RV Linux同样为179/217；无RNG的BoarOS多一条静态clock_gettime失败，�
 commit`8b58dd16d26d30f7c74d48d5832d870d3051b703`的
 `libc-test/src/functional/clock_gettime.c`没有在调用前清零errno。额外真实RNG
 诊断中可信设备提供64字节，原ELF该项通过，RV恢复179/217且正常回收。这证明
-差异依赖熵环境，尚未逐指令归因errno的首次写入；不把额外RNG带入正式配置，
-也不让内核伪造随机ready。逐ID失败状态见
+差异依赖熵环境；后续已逐指令定位首次errno写入，见下节。不把额外RNG带入正式
+配置，也不让内核伪造随机ready。逐ID失败状态见
 [原glibc失败对照](oscomp-libctest-original-failures.tsv)；该表不包含日志或偶然PID。
 
 可重建本地组与环境诊断：
@@ -206,3 +206,64 @@ make all
 
 新的官方容器整次运行尚未执行，1915仍只指原`11e96a9`冻结运行；原LTP监督的
 300秒/TERM后2秒KILL及34项源码helper表未改动，LTP-musl总预算未到达也未改记通过。
+
+## RV静态clock_gettime的errno来源
+
+对原盘`/glibc/entry-static.exe`，SHA-256
+`f140123cee82e5a0a1fc48ef9d845f24be920dfac9a07e5bd31ead053d3657ef`，
+使用QEMU插件观测指令、syscall返回和TLS写入，程序字节不变。结果确定为原静态
+glibc的malloc初始化污染errno，clock_gettime本身成功；原测例确实捕获了进入
+main前errno非零的运行时问题，不能用“成功后的errno检查偏强”代替这条具体归因。
+
+实际指令链：malloc初始化`0x518c6`入口errno=0，调用
+`getrandom(0x10c668,8,GRND_NONBLOCK)`，非阻塞随机接口未ready时返回-11；
+原glibc在`0x7e85a`执行`sw a4,0(a5)`，把11写到`tp+136`的errno。初始化
+随后通过两次CLOCK_MONOTONIC查询生成回退随机位，两次查询均成功但未清除此errno。
+进入原main`0x23692`时errno=11；原测例调用CLOCK_REALTIME后在`0x10e32`
+返回0，errno仍为11，断言因此失败，native wait=256。该errno字段位置另由原
+`__errno_location`代码及TLS store交叉核对；观测地址只用于这个已校验SHA的外部ELF，
+不是内核中的测试特判或通用glibc布局假设。
+
+`make diagnose-oscomp-clock-errno`在512MiB/1GiB各验证四种profile：
+
+| profile | getrandom可见返回 | main入口errno | clock返回 / errno | 原child状态 |
+|---|---:|---:|---|---|
+| BoarOS，缺RNG | -11 | 11 | 0 / 11 | 256（退出1） |
+| BoarOS，真实RNG完成后 | 8 | 0 | 0 / 0 | 0 |
+| 固定Linux，正常输入 | 8 | 0 | 0 / 0 | 0 |
+| 固定Linux，显式返回故障注入 | -11 | 11 | 0 / 11 | 256（退出1） |
+
+最后一行仅把原glibc可见的getrandom返回值注入-EAGAIN，Linux实际返回8；
+它证明同一原程序在相同错误返回下也会污染errno，不冒充Linux实际未ready启动。
+Linux时钟可能走vDSO，插件仍在原测例的C调用返回点记录0。八次root均正常收口；
+host门禁拒绝缺少首次errno写入、缺少main、未知clock错误或native wait缺失的归因。
+工具不参与正式runner、judge或原测例清单，使用前需QEMU plugin API及glib-2.0
+开发文件，运行后`make all`恢复双架构评测默认配置。
+
+固定Linux仍为`references/linux@f4cdf7ca9a1fdcca413157df19753f388a5a224e`；
+其`drivers/char/random.c::getrandom`在未ready且GRND_NONBLOCK时同样返回EAGAIN。
+本地固定`references/glibc/glibc-2.44.tar.xz`的NEWS明确列出BZ29624：malloc使
+进入main时errno不为零；malloc现使用不会污染errno的内部随机接口。
+原RV盘共享libc自报Ubuntu GLIBC2.35-0ubuntu3；静态ELF归因以它自己的字节和
+指令观测为准，不用共享库版本字符串推导静态链接身份。
+固定archive缺少当年修复历史，因此2026-10-07补核GNU官方
+[BZ29624修复讨论](https://sourceware.org/pipermail/libc-alpha/2022-September/142331.html)
+及[后续内部接口修复](https://sourceware.org/pipermail/glibc-cvs/2024q1/083880.html)
+（commit`5a85786a9005722be7cb9e70f8874a5f1130daea`）。不修改原盘libc以获得分数；
+正常新用户环境使用已修复runtime，正式原盘仍按真实熵输入报告该限制。
+
+LA为何不多失败这项也有直接代码差异：原LA静态ELF SHA-256为
+`e31723e58c961424e685aba297fbc6a94ad4dc7c2a5aa84d391261bae87c10e2`，
+malloc初始化在`0x1200573b0`直接执行getrandom syscall，随后比较原始返回值是否
+为8；错误时直接走时钟回退，没有经过把错误写入errno的公共getrandom包装器。
+原LA盘共享glibc自报2.38；这里只用静态ELF自己的代码证明初始化路径差异。
+因此原clock计分的1分差异来自原运行时初始化，不是LA时钟接口比RV更完整。
+
+其他已核对的共同失败也有具体触发条件：原glibc的`mbc`无法加载任何请求的UTF-8
+locale，停在codeset=ANSI_X3.4-1968；`strtol/wcstol`以无效base37调用并要求
+endptr更新，glibc返回EINVAL时保留原endptr；`regex_ere_backref`要求将ERE中的
+反向引用当成字面数字，而glibc支持该扩展；`strftime`的带符号年份及宽度格式输出
+与原断言不同。这些结论取上述保留的Linux实际输出与固定
+`references/oscomp-testsuits@8b58dd16d26d30f7c74d48d5832d870d3051b703`的
+对应functional/regression源码。它们不能归并为clock/getrandom失败；剩余取消、
+stdio等项仍须分别调查实际断言和路径。

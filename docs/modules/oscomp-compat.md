@@ -82,6 +82,7 @@ make prepare-oscomp-inputs  # 显式恢复；普通运行不自动下载
 make all
 make test-oscomp-host
 make test-oscomp-supervisor-riscv test-oscomp-supervisor-loongarch
+make diagnose-oscomp-clock-errno # 原RV静态glibc的errno写入归因，独立诊断
 python3 -B tests/oscomp/run.py --arch both --groups environment --output build/oscomp-environment-check
 python3 -B tests/oscomp/run.py --arch loongarch --groups ltp --output build/oscomp-la-ltp-check
 make test-oscomp-riscv       # 本地RV全量诊断
@@ -150,6 +151,10 @@ PT_INTERP为`/lib64/ld-linux-loongarch-lp64d.so.1`，另需现有`/lib`与`/usr/
 38失败与固定Linux逐ID状态一致，原输入的共同失败保持。原iozone/netperf两种
 libc均得到诊断分数和正常回收，netperf的可选socket项错误仍保留。源码、环境、
 失败目录及重建命令见[原组后续诊断](../learning/oscomp-compat-baseline.md#启动修复后的原组诊断)。
+RV多出的静态clock_gettime失败已定位为原glibc的malloc初始化在main前写入
+EAGAIN；时钟实际返回0。独立诊断校验原ELF SHA后只读观察默认路径，并用公开的
+Linux返回故障profile验证同一因果链，512MiB/1GiB都正常回收。参见
+[首次errno写入](../learning/oscomp-compat-baseline.md#rv静态clock_gettime的errno来源)。
 
 ## 整体审查后的报告契约
 
