@@ -12,7 +12,7 @@ BoarOS 是从零搭建、面向 OS Comp 能力建设的 C / 少量汇编内核�
 并提供逐日原程序/设备组合和每周存储恢复层。固定工具包可在干净 runner 恢复，
 LA 的 CPU/MM/动态 TLS/1366 条 ABI 与平台测试独立于 RV；任一必跑 job 缺失、
 跳过或失败都使汇总检查失败。入口与环境身份见[主线 CI](docs/modules/continuous-integration.md)；
-首次托管双架构结果仍须以实际运行记录确认。
+主线 `5153897` 和文档提交 `8945a7c` 的托管九项门禁已通过；后续改动按各自执行记录核对。
 
 LA根盘支持modern PCI及transitional设备的modern接口，纯legacy PCI传输仍未接入。
 对应两种RAM的启动与owner回收证据见[LA模块](docs/modules/loongarch-boot.md)。
@@ -48,6 +48,8 @@ ext4 冷缓存 extent 读取已修正 OOM 后误释放未取得引用的问题�
 单 hart 存储等待已由运行期 IRQ 唤醒：两个不同文件冷读可同时在途，等待期间计算与无关缓存命中继续执行；OFD、inode、后端事务与退出清理各自保留 owner。八槽乱序完成、flush 屏障和超时 reset 在 legacy/modern、writeback/writethrough 四种组合验收，见[可睡眠存储](docs/learning/sleepable-storage.md)。
 
 双盘暂扣与故障隔离测试已修复单字节控制终端握手，并接入 CI 配置；本机原矩阵和 FIFO/RR 组合通过，托管 CI 状态另行核对。
+
+回环包成功入队的工作通知已补齐；固定时钟的真实协议反例保护 runnable、唤醒及失败回收，见[网络契约](docs/modules/kernel-network.md)。
 
 网络 worker 已在协议推进前归还 TX 完成槽，并在睡眠前复查新容量与收包；已验证两种 VirtIO 传输下的实际 TAP 程序；综合改动的匹配实验既有收益也有默认预算吞吐回退，见[预算结果](docs/learning/data-path-budget-experiments.md#正式匹配结果2026-10-06)。TCP 流发送已用接纳 reservation 约束 payload 复制，预先无容量时不解析用户页；socket poll 已收紧为局部快照；短 syscall 与统一 worker 按独立协议预算推进，资源归还只服务等待集合。验证边界见[网络记录](docs/learning/network-ownership.md#纯就绪与有界协议服务2026-10-05)。
 

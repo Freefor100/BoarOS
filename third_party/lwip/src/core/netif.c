@@ -1203,6 +1203,11 @@ netif_loop_output(struct netif *netif, struct pbuf *p)
   }
   SYS_ARCH_UNPROTECT(lev);
 
+  /* 队列已完整发布；通知端只标记工作和唤醒，不重入协议处理。 */
+#ifdef LWIP_HOOK_NETIF_LOOPBACK_QUEUED
+  LWIP_HOOK_NETIF_LOOPBACK_QUEUED(netif);
+#endif
+
   LINK_STATS_INC(link.xmit);
   MIB2_STATS_NETIF_ADD(stats_if, ifoutoctets, p->tot_len);
   MIB2_STATS_NETIF_INC(stats_if, ifoutucastpkts);

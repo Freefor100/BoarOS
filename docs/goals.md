@@ -1,9 +1,8 @@
 # 开发路线与验收
 
 主线 CI 正在从 RV 单侧扩展为共用 host＋双架构核心/ABI/平台/GNU 常驻门禁，
-完整原程序与设备组合逐日运行，原存储恢复矩阵保持每周/手动层。代码与本地
-入口已验证；首次托管冷环境、完整 job 与定时组合结果分别收口，不能以配置
-存在代替真实通过。见[主线 CI](modules/continuous-integration.md)。
+完整原程序与设备组合逐日运行，原存储恢复矩阵保持每周/手动层。主线 `5153897` 与文档提交 `8945a7c` 的托管九项门禁已通过；
+完整程序/设备的首次定时组合仍需实际执行，配置存在不代替真实通过。见[主线 CI](modules/continuous-integration.md)。
 
 本文是唯一开发路线入口。P/N/L 编号保留为能力与依赖索引，不是机械执行顺序。
 `[x]` 只表示具体交付已验收；历史测量、输入身份和可重建命令归现有 learning。
@@ -24,6 +23,7 @@ N3已经交付：legacy/modern VirtIO-net、受限DMA借用与复制回退、静
 | extent 冷读 OOM 清理 | 真实冷缓存碎片文件已复现未取得 buffer 引用却按非零块号释放的错误；get 失败直接返回后，1/4 KiB 块与两种 inode 大小的全部分配失败点、读取失败、重试、卸载及堆引用清零通过。独立入口为 `make test-lwext4-extent-host`，没有放宽非法释放契约。 |
 | pthread取消与旧libc输入 | 原镜像动态glibc的cancel/exit缺libgcc_s；独立glibc运行环境已固定unwind依赖并保护取消/cleanup。静态cancel-points的join结果在固定Linux也失败，按库/测试契约继续核对，不能归给内核。历史偶发现场仍保留P0c边界，不安排无目的重复次数。 |
 | 内核抢占边界 | allocator修复不等于所有共享状态已审完。限定检查开中断worker到共享对象的调用链、睡眠前引用和发布临界区；发现具体错误才扩大。 |
+| 回环入队通知纠错 | 本地端口已定义 hook，导入的 lwIP 成功入队路径漏调用；已接到完整包链发布之后。固定时钟的实际 IPv4/IPv6 协议反例保护工作检测、唤醒、晚入队及 OOM/回收，不将它作为历史吞吐差距的唯一归因。见[网络记录](learning/network-ownership.md#成功回环入队必须通知工作-owner2026-10-08)。 |
 | TX 完成进展纠错 | worker先收割并释放完成槽，再推进协议；睡眠前覆盖SG与复制路径的新容量。宿主顺序/关闭窗口、真实两种TAP传输和无NIC定时器验证通过；见[网络owner](learning/network-ownership.md)。 |
 | 就绪查询与协议服务 | poll 为局部只读快照，短 syscall 与后台 worker 共用有界服务；协议池/NIC/接收堆归还按代次通知等待者。模型与真实 RV64 验证见[网络记录](learning/network-ownership.md#纯就绪与有界协议服务2026-10-05)，接纳 reservation 已接入 TCP 流复制；27 组窗口/池/堆实验已完成，默认预算部分负载吞吐回退，控制尾延迟与资源峰值分开列于[预算结果](learning/data-path-budget-experiments.md)。 |
 | TCP 接纳约束复制 | 参数/状态/容量优先于 payload 复制，任务登记的 byte reservation 和 OFD pin 允许复制睡眠。预先 EAGAIN 为零页解析/零复制；全局协议资源变化仍允许有界失败；近池诊断实际捕获 segment/heap 饱和后的重复复制，8/4/2 在本负载消除该项失败，尚非跨层预约。Linux 同 ELF 契约、交错和退出验收见[网络记录](learning/network-ownership.md#tcp接纳预算与复制2026-10-05)。 |

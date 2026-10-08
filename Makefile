@@ -1465,6 +1465,7 @@ build/host/lwip-port: tests/host/lwip_port_test.c \
 .PHONY: test-lwip-host
 test-lwip-host: build/host/lwip-port
 	$<
+	python3 -B tests/host/network_owner.py --case loopback-work
 
 test-allocator-release-host:
 	mkdir -p build/host
