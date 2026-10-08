@@ -130,6 +130,11 @@ reserved字段，要求随后的释放发现损坏。因此直接删除全尾校
 
 ### 单核纪律与跨核同步的区别
 
+本轮host门禁修正先用300ms启动延迟复现100ms预算内没有 `start`，再用临时目录中的
+无效 `libc.so.6` 复现host `/bin/true` 返回127/native wait32512。CI fixture在真实进程
+flush后通过pipe登记ready，再验证原wait超时；host suite fixture覆盖manifest环境，
+不覆盖case显式环境或生产guest默认。修复后CI12例、程序清单31例通过；不是guest回归。
+
 固定 `references/linux` commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的
 `Documentation/locking/locktypes.rst` 区分本地IRQ/抢占控制、raw锁与可睡眠锁。
 当前BoarOS `include/kernel/irq.h` 明确不提供SMP互斥，也不禁止显式调度；

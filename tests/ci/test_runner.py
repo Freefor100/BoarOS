@@ -1,7 +1,9 @@
 """CI success requires complete commands and every required job."""
 import importlib.util
 import json
+import os
 from pathlib import Path
+import select
 import sys
 import subprocess
 import tempfile
@@ -33,12 +35,43 @@ class Execution(unittest.TestCase):
     def test_timeout_and_missing_executable_are_failures(self):
         with tempfile.TemporaryDirectory() as directory:
             result = runner.run_cases([
-                {'name': 'slow', 'argv': [sys.executable, '-c', 'import time; print("start",flush=True); time.sleep(5)'], 'timeout': .1},
+                {'name': 'slow', 'argv': [sys.executable, '-c', 'import time; time.sleep(5)'], 'timeout': .1},
                 {'name': 'missing', 'argv': [str(Path(directory) / 'absent')], 'timeout': 1},
             ], Path(directory))
             self.assertEqual([row['status'] for row in result['cases']], ['timeout', 'runner-error'])
             self.assertEqual(result['status'], 'failed')
-            self.assertIn('start', (Path(directory) / 'slow.log').read_text())
+            self.assertEqual((Path(directory) / 'slow.log').read_bytes(), b'')
+
+    def test_timeout_preserves_output_after_slow_fixture_is_ready(self):
+        read_fd, write_fd = os.pipe()
+        original_popen = subprocess.Popen
+        with os.fdopen(read_fd, 'rb', buffering=0) as ready, \
+                os.fdopen(write_fd, 'wb', buffering=0) as publish, \
+                tempfile.TemporaryDirectory() as directory:
+            # 准备握手不属于被测wait预算；真实子进程flush后才开始验证超时。
+            def launch(argv, **kwargs):
+                process = original_popen(argv, pass_fds=(publish.fileno(),), **kwargs)
+                publish.close()
+                try:
+                    self.assertTrue(select.select([ready], [], [], 10)[0], 'fixture ready timeout')
+                    self.assertEqual(ready.read(1), b'R')
+                except BaseException:
+                    runner.stop(process)
+                    raise
+                return process
+
+            program = (f'import os,time; time.sleep(.3); '
+                       f'print("start",flush=True); print("TAIL",flush=True); '
+                       f'os.write({publish.fileno()},b"R"); time.sleep(5)')
+            with patch.object(runner.subprocess, 'Popen', side_effect=launch):
+                result = runner.run_cases([{'name': 'ready',
+                    'argv': [sys.executable, '-c', program], 'timeout': .1}], Path(directory))
+            row = result['cases'][0]
+            self.assertEqual(result['status'], 'failed')
+            self.assertEqual(row['status'], 'timeout')
+            self.assertEqual(row['resource_recovery'], 'unverified')
+            self.assertLess(row['exit'], 0)
+            self.assertEqual((Path(directory) / 'ready.log').read_text(), 'start\nTAIL\n')
 
     def test_empty_or_duplicate_case_sets_are_rejected(self):
         with tempfile.TemporaryDirectory() as directory:

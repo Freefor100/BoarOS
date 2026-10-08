@@ -10,8 +10,10 @@ main push 和手动执行等待同组正在运行的 workflow 收口；只保留
 
 2026-10-08外部审核发现两个host fixture假设：子Python未必能在100ms预算前打印，
 guest的`LD_LIBRARY_PATH=/lib:/`可能令host程序装载错误libc。本机11/29例通过不能
-排除这些环境问题。近期修正只改变host测试：启动前超时允许空输出，带输出的超时
-用明确ready握手验证；host执行显式使用host环境，guest驱动保持原环境。
+排除这些环境问题。host fixture现已修正：启动前超时允许空输出，带输出的超时
+在测试内启动真实子进程，flush并通过pipe发出ready后才返回被测wait，准备预算10秒。
+host执行显式使用 `os.defpath` 和空库路径，case显式环境仍有最高优先级，guest驱动保持原环境。
+慢启动300ms/100ms预算与错误libc目录的反例先失败，修复后CI12例及清单31例通过。
 正式runner的预算、超时失败与日志保存契约不因此放宽，详细任务归[近期队列](../goals.md#p6前置有界分配成本与同步契约)。
 
 ## 常驻门禁

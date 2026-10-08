@@ -1,6 +1,7 @@
 """Observation integrity for isolated real-program guests."""
 import importlib.util
 import json
+import os
 from pathlib import Path
 import unittest
 import subprocess
@@ -193,13 +194,32 @@ class DriverTests(unittest.TestCase):
         cls.workspace.cleanup()
 
     def execute(self, case, binary=None):
-        encoded, _ = suites.case_configuration(case, {}, 1)
+        # 真实guest默认库路径不能用于宿主fixture；显式case环境仍有最高优先级。
+        host = {'env': {'PATH': os.defpath, 'LD_LIBRARY_PATH': ''}}
+        encoded, _ = suites.case_configuration(case, host, 1)
         config = self.directory / 'case'
         config.write_bytes(encoded)
         process = subprocess.run([str(binary or self.binary), str(config)], capture_output=True,
                                  text=True, timeout=5)
         self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
         return suites.parse_observation(process.stdout, case['id'])
+
+    def test_host_execution_does_not_inherit_guest_library_directory(self):
+        poisoned = self.directory / 'guest-libraries'
+        poisoned.mkdir(exist_ok=True)
+        (poisoned / 'libc.so.6').write_bytes(b'not a host ELF')
+        case = {'id': 'host-loader', 'argv': ['/bin/true']}
+        with patch.dict(suites.DEFAULT_ENV, {'LD_LIBRARY_PATH': str(poisoned)}):
+            result = self.execute(case)
+            self.assertEqual(result['wait_status'], 0, result)
+            guest, _ = suites.case_configuration(case, {})
+            self.assertIn(('LD_LIBRARY_PATH=' + str(poisoned)).encode(), guest)
+            explicit = self.execute({**case, 'env': {'LD_LIBRARY_PATH': str(poisoned)}})
+            self.assertNotEqual(explicit['wait_status'], 0)
+
+    def test_guest_configuration_retains_its_library_path(self):
+        encoded, _ = suites.case_configuration({'id': 'guest-env', 'argv': ['/true']}, {})
+        self.assertIn(b'LD_LIBRARY_PATH=/lib:/\0', encoded)
 
     def test_guest_environment_setup_and_unsupported_diagnostics(self):
         wrapper = self.directory / 'environment.c'
