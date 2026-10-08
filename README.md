@@ -8,6 +8,12 @@ BoarOS 是从零搭建、面向 OS Comp 能力建设的 C / 少量汇编内核�
 
 ## 当前能力
 
+主线 CI 已配置共用 host 契约、RV 原回归、LA 核心/平台与双架构 GNU 运行时，
+并提供逐日原程序/设备组合和每周存储恢复层。固定工具包可在干净 runner 恢复，
+LA 的 CPU/MM/动态 TLS/1366 条 ABI 与平台测试独立于 RV；任一必跑 job 缺失、
+跳过或失败都使汇总检查失败。入口与环境身份见[主线 CI](docs/modules/continuous-integration.md)；
+首次托管双架构结果仍须以实际运行记录确认。
+
 LA根盘支持modern PCI及transitional设备的modern接口，纯legacy PCI传输仍未接入。
 对应两种RAM的启动与owner回收证据见[LA模块](docs/modules/loongarch-boot.md)。
 

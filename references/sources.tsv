@@ -48,3 +48,9 @@ file	lua/lua-5.4.3.tar.gz	https://www.lua.org/ftp/lua-5.4.3.tar.gz	-	f8612276169
 
 # GCC15.1.0 official release source for matching LA LP64S runtime; accessed 2026-10-06.
 file	gcc/gcc-15.1.0.tar.xz	https://gcc.gnu.org/pub/gcc/releases/gcc-15.1.0/gcc-15.1.0.tar.xz	-	e2b09ec21660f01fecffb715e0120265216943f038d0e48a9868713e54f06cea
+# Main CI tool packages; upstream release/Arch archives checked 2026-10-08.
+file	toolchains/la-gcc15-glibc242.tar.xz	https://github.com/loongson/build-tools/releases/download/2025.08.08/x86_64-cross-tools-loongarch64-binutils_2.45-gcc_15.1.0-glibc_2.42.tar.xz	-	b8572e2083143ff1807658f02e11eba53e5ed81d6194854d369b43fceea72de7
+file	toolchains/riscv64-linux-gnu-gcc-16.2.1-1-x86_64.pkg.tar.zst	https://archive.archlinux.org/packages/r/riscv64-linux-gnu-gcc/riscv64-linux-gnu-gcc-16.2.1-1-x86_64.pkg.tar.zst	-	23c6233926896cbf637699a169238578b294a5356884049a46c1e40fb2bb8650
+file	toolchains/riscv64-linux-gnu-binutils-2.47-1-x86_64.pkg.tar.zst	https://archive.archlinux.org/packages/r/riscv64-linux-gnu-binutils/riscv64-linux-gnu-binutils-2.47-1-x86_64.pkg.tar.zst	-	e818a575afe40d9681e355ea436cc7aedf69dc437791ce4374aae8c661187978
+file	toolchains/riscv64-linux-gnu-glibc-2.44-1-any.pkg.tar.zst	https://archive.archlinux.org/packages/r/riscv64-linux-gnu-glibc/riscv64-linux-gnu-glibc-2.44-1-any.pkg.tar.zst	-	a15194a1c400e5ab33e1d1d11f2104e923db84c0186777dffdd92ea86773860e
+file	toolchains/riscv64-linux-gnu-linux-api-headers-7.2-1-any.pkg.tar.zst	https://archive.archlinux.org/packages/r/riscv64-linux-gnu-linux-api-headers/riscv64-linux-gnu-linux-api-headers-7.2-1-any.pkg.tar.zst	-	9bea3639bffe0cbe4be5bc02c12a845ca77bf3e694884b87bfdd49c76aa79677

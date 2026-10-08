@@ -1835,6 +1835,10 @@ test-readahead-riscv:
 
 include arch/loongarch/build.mk
 
+.PHONY: test-ci-host
+test-ci-host:
+	python3 -B -m unittest discover -s tests/ci -p 'test_*.py'
+
 .PHONY: test-virtio-block-host
 .PHONY: test-virtio-framework-host
 test-virtio-framework-host:
