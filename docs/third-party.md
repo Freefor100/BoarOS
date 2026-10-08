@@ -9,6 +9,11 @@
 - 用途：向 BoarOS 自有 socket fd/OFD 与 Linux ABI 层提供单 hart IPv4 UDP/TCP 协议核心；本阶段先用 NO_SYS raw API 和 loopback，网卡后端另行验证。
 - 本地修改：IPv4重组增加协议/输入网卡键、重复/重叠/终点校验及按网卡清理，另在 netif/timeouts 增加有预算的轮回入口，旧公开入口保持无限预算包装；mem/memp 增加可选的每次真实归还 hook，netif 增加 loopback 入队 hook。对应 netif.h/timeouts.h 声明随实现维护；补丁不升级固定版本，其他导入文件保持原版。BoarOS 的 lwIP 配置、端口和 socket 所有权适配位于 `net/` 与 `fs/`，不以 lwIP 的 socket fd 空间代替 BoarOS 文件表。
 
+2026-10-08 核对并补齐回环通知接线：端口已定义
+`LWIP_HOOK_NETIF_LOOPBACK_QUEUED`，导入的 `netif_loop_output()` 原先没有调用。
+现在只在成功挂入完整包链后通知；hook 未定义的配置保留原行为。仍固定上述
+上游 commit，验证入口为 `make test-lwip-host` 与双架构真实网络/ABI 回归。
+
 ## lwext4
 
 - 上游地址：<https://github.com/gkostka/lwext4>
