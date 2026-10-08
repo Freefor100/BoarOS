@@ -184,7 +184,7 @@ class DriverTests(unittest.TestCase):
         cls.workspace = tempfile.TemporaryDirectory(prefix='boaros-suite-driver-')
         cls.directory = Path(cls.workspace.name)
         cls.binary = cls.directory / 'driver'
-        subprocess.run(['cc', '-O2', '-std=c11', '-Wall', '-Wextra', '-Werror',
+        subprocess.run(['cc', '-O2', '-std=c11', '-Wall', '-Wextra', '-Werror', '-D_FORTIFY_SOURCE=2',
                         '-DSUITE_DRIVER_HOST_TEST', str(Path(__file__).with_name('suite_driver.c')),
                         '-o', str(cls.binary)], check=True)
 
@@ -300,6 +300,25 @@ int __wrap_ioctl(int fd, unsigned long request, ...) {
 
     def test_actual_exec_failure_records_errno(self):
         result = self.execute({'id': 'missing', 'argv': ['/definitely-missing-boaros-suite']})
+        self.assertEqual(result['exec_errno'], 2)
+        self.assertEqual(result['exit_code'], 127)
+
+    def test_interrupted_exec_error_report_preserves_original_errno(self):
+        wrapper = self.directory / 'write-interrupted.c'
+        wrapper.write_text('''#include <errno.h>
+#include <unistd.h>
+ssize_t __real_write(int, const void *, size_t);
+ssize_t __wrap_write(int fd, const void *data, size_t size) {
+    static int interrupted;
+    if (size == 2*sizeof(int) && !interrupted++) { errno=EINTR; return -1; }
+    return __real_write(fd,data,size);
+}
+''')
+        binary = self.directory / 'driver-interrupted'
+        subprocess.run(['cc', '-O2', '-std=c11', '-Wall', '-Wextra', '-Werror',
+                        '-DSUITE_DRIVER_HOST_TEST', str(Path(__file__).with_name('suite_driver.c')),
+                        str(wrapper), '-Wl,--wrap=write', '-o', str(binary)], check=True)
+        result = self.execute({'id':'missing-interrupted','argv':['/definitely-missing-boaros-suite']},binary)
         self.assertEqual(result['exec_errno'], 2)
         self.assertEqual(result['exit_code'], 127)
 

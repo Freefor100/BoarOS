@@ -13,6 +13,7 @@ import time
 ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT/'tests/diff-abi'))
 import harness
+from arch_profiles import PROFILES
 
 def digest(path):
     with Path(path).open('rb') as stream:
@@ -82,7 +83,8 @@ def main(default_arch="riscv"):
     work=ROOT/'build/network'/('contract-'+str(time.time_ns()))
     work.mkdir(parents=True)
     program=work/'init'
-    subprocess.run([str(ROOT/'build/riscv/musl-root/bin/musl-gcc'),'-fno-link-libatomic','-static','-O2','-Wall','-Wextra','-Werror',
+    compiler=ROOT/'build/riscv/musl-root/bin/musl-gcc'
+    subprocess.run([str(compiler),*PROFILES['riscv'].musl_flags(compiler),'-static','-O2','-Wall','-Wextra','-Werror',
                     str(ROOT/f'tests/workloads/network/{args.workload}.c'),'-o',str(program)],check=True)
     image=harness.fixture(work,program)
     metadata={'program_sha256':digest(program),'fixture_sha256':digest(image),'runs':{}}
