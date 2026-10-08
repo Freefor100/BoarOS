@@ -130,3 +130,22 @@ runner 改用已有 `cut` 命令：先保存完成检查点，分别等待两盘
 冷重启和 fsck 检查保持原样。NBD 宿主测试覆盖受控 cut 丢弃尚在 gate 中的 READ
 回复且不交付伪成功。四组故障/重启、四组 FIFO/RR 矩阵和触发竞态配置的另 30 次
 独立故障/冷重启均通过；这些是正确性验证，不能作为吞吐测量。
+
+## CI 双盘输出尾部（2026-10-08）
+
+[托管运行 37636556659](https://github.com/Freefor100/BoarOS/actions/runs/37636556659)
+使用 `main@c5cb942`、Ubuntu 24.04、QEMU `8.2.2 (1:8.2.2+ds-0ubuntu1.18)`。
+modern/writeback/flush 的冷重启已输出持久数据成功记录，QEMU 与两盘服务退出码均为零，
+runner 却缺少末尾 PID 1/heap 回收记录。旧循环在 `guest.poll()` 得到退出状态后立即
+break；已退出进程的 pipe 仍可包含未读数据，不能据此判定内核没有输出回收记录。
+
+同一内核/ELF 在真实双盘 runner 的诊断副本中以 128 字节读取并在每轮暂停 10 ms，
+旧循环复现正常退出但日志截断，新循环读到各管道 EOF 后通过故障隔离与冷重启。
+没有放宽 marker、进程退出、fsck 或资源断言，受控 cut 仍按独立检查点判分。
+CI 另归档原有退出状态 JSON，避免后续调查仅有串口尾部。
+
+`make test-multi-disk-io-riscv test-multi-disk-rt-riscv INIT_CONFIG=config/init.json`
+在本机 QEMU 11.1.2 完整通过；Ubuntu 24.04/QEMU 8.2.2 容器也通过原四组故障及
+四次冷重启。所用内核 SHA-256 `e08c2569cad84fd44c6dd3ed36ffe08d8edf6eed2f5a6d63a31051f741520ba9`，
+用户 ELF `5da479333d9fc1927246e91f31a8737b838ce38edd08a2fbb5e9992dd70e6c72`。
+这些本地结果与后续托管 CI 的实际状态分别记录。
