@@ -4,6 +4,8 @@
 它保护已交付的单核 QEMU 契约，不把 CI 成功解释为所有 Linux 应用、SMP 或实板通过。
 RV 保留 Ubuntu 24.04/QEMU 8.2.2 的原回归；LA 使用固定 v11.1.0 源码及已有
 LS7A RTC 补丁。所有通用 fixture 明确使用 `INIT_CONFIG=config/init.json`。
+main push 和手动执行等待同组正在运行的 workflow 收口；只保留最新 pending
+执行。PR 继续取消同组旧执行，main 的固定环境冷构建可以先完成并保存缓存。
 
 ## 常驻门禁
 
