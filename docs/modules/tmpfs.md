@@ -50,7 +50,8 @@ ENOSPC，真实内存分配失败为 ENOMEM，已写部分仍返回进展。映�
 fsync/fdatasync/msync 完成内存文件契约，不提交磁盘 I/O，也不承诺重启后数据保留。
 
 只读和忙卸载沿通用 VFS 契约。尚无 remount、bind、move、lazy/force unmount、
-ACL、xattr、swap、SysV IPC、共享文件 futex 或完整权限模型。
+ACL、xattr、swap、SysV 信号量/消息队列、共享文件 futex 或完整权限模型；
+SysV 共享内存已由共用内存后备对象实现。挂载扩展的剩余工作归[P1h](../goals.md#p1h-虚拟文件系统与多挂载)。
 
 ## 验证入口
 
