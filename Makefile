@@ -1479,6 +1479,17 @@ test-allocator-release-host:
 	cc -std=c11 -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=12 -Itests/host/random -Iinclude tests/host/allocator_release.c kernel/physical_page.c mm/heap.c -o build/host/allocator-release
 	build/host/allocator-release
 
+.PHONY: test-allocator-cost-host
+test-allocator-cost-host:
+	@mkdir -p build/cost/host
+	@for shift in 12 14; do \
+		cc -std=c11 -O2 -Wall -Wextra -Werror -Itests/host/random -idirafter include \
+			-DBOAROS_PAGE_SHIFT=$$shift -DBOAROS_COST_DIAGNOSTICS=1 \
+			tests/cost/allocator_work.c kernel/cost.c kernel/physical_page.c \
+			-o build/cost/host/allocator-work-$$shift && \
+		build/cost/host/allocator-work-$$shift || exit; \
+	done
+
 include tests/diff-abi/Makefile.inc
 
 .PHONY: test-block-host

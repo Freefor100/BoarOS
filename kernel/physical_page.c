@@ -5,6 +5,7 @@
 #include <kernel/physical_page.h>
 
 #include <stdint.h>
+#include <string.h>
 
 /* 宿主/无终端平台可没有该hook；已有同步sink仍可输出。 */
 extern void kernel_console_emergency_begin(void) __attribute__((weak));
@@ -42,8 +43,87 @@ struct physical_page_metadata {
     uint16_t reserved;
 };
 
+struct physical_page_root
+{
+    uint64_t address;
+    uint64_t node_offset;
+    uint32_t first_page_index;
+    uint32_t order;
+    uint32_t range_index;
+    uint32_t reserved;
+};
+
+enum buddy_state
+{
+    BUDDY_INACTIVE = 0,
+    BUDDY_FREE,
+    BUDDY_SPLIT,
+    BUDDY_ALLOCATED,
+    BUDDY_INTERNAL
+};
+
+struct page_work
+{
+    uintptr_t interrupts;
+#if BOAROS_COST_DIAGNOSTICS
+    struct kernel_cost_tag tag;
+    uint64_t start, checked, written;
+#endif
+};
+
+static struct page_work page_work_begin(void)
+{
+    struct page_work work = {0};
+    work.interrupts = arch_interrupt_save();
+#if BOAROS_COST_DIAGNOSTICS
+    work.tag = kernel_cost_capture();
+    work.start = kernel_cost_clock();
+#endif
+    return work;
+}
+
+static void page_work_end(struct page_work *work)
+{
+#if BOAROS_COST_DIAGNOSTICS
+    uint64_t elapsed = kernel_cost_clock() - work->start;
+#endif
+    /* 先结束元数据计时并恢复IRQ，集中发布不能扩张每条记录的临界区。 */
+    arch_interrupt_restore(work->interrupts);
+#if BOAROS_COST_DIAGNOSTICS
+    kernel_cost_add_tag(work->tag, COST_PAGE_META_CHECKED, work->checked);
+    kernel_cost_add_tag(work->tag, COST_PAGE_META_WRITTEN, work->written);
+    kernel_cost_add_tag(work->tag, COST_ALLOCATOR_META_TICKS, elapsed);
+#endif
+}
+#define PAGE_METADATA_SCOPE(name)                                                      \
+    struct page_work name __attribute__((cleanup(page_work_end))) = page_work_begin()
+
+static void page_checked(struct page_work *work)
+{
+#if BOAROS_COST_DIAGNOSTICS
+    if (work)
+        work->checked++;
+#else
+    (void)work;
+#endif
+}
+static void page_written(struct page_work *work)
+{
+#if BOAROS_COST_DIAGNOSTICS
+    if (work)
+        work->written++;
+#else
+    (void)work;
+#endif
+}
+
 _Static_assert(sizeof(struct physical_page_metadata) == 16U,
                "physical page metadata must remain compact");
+
+static const struct physical_page_root *
+root_for_page(const struct physical_page_allocator *, uint32_t, struct page_work *);
+static const struct physical_page_root *
+root_for_address(const struct physical_page_allocator *, uint64_t, struct page_work *);
 
 static int allocator_initialized(
     const struct physical_page_allocator *allocator)
@@ -90,16 +170,24 @@ static int address_was_allocated(
     return 0;
 }
 
-static int page_lookup(
+static int page_lookup_work(
     const struct physical_page_allocator *allocator,
     uint64_t address,
     uint32_t *range_index,
-    uint32_t *page_index)
+    uint32_t *page_index, struct page_work *work)
 {
     uint32_t index;
 
     if ((address & BOAROS_PAGE_MASK) != 0U) {
         return 0;
+    }
+
+    if (physical_page_allocator_is_finalized(allocator)) {
+        const struct physical_page_root *root = root_for_address(allocator, address, work);
+        if (!root) return 0;
+        if (range_index) *range_index = root->range_index;
+        if (page_index) *page_index = root->first_page_index + (uint32_t)((address-root->address)>>BOAROS_PAGE_SHIFT);
+        return 1;
     }
 
     for (index = 0U; index < allocator->range_count; index++) {
@@ -123,6 +211,12 @@ static int page_lookup(
     }
 
     return 0;
+}
+
+static int page_lookup(const struct physical_page_allocator *a, uint64_t address,
+                       uint32_t *range, uint32_t *page)
+{
+    return page_lookup_work(a,address,range,page,0);
 }
 
 static void release_diagnostic_text(const char *text)
@@ -206,41 +300,6 @@ static void physical_page_release_fatal(
     __builtin_trap();
 }
 
-static int index_lookup(
-    const struct physical_page_allocator *allocator,
-    uint32_t page_index,
-    uint32_t *range_index,
-    uint64_t *address)
-{
-    uint32_t index;
-
-    if ((uint64_t)page_index >= allocator->total_pages) {
-        return 0;
-    }
-
-    for (index = 0U; index < allocator->range_count; index++) {
-        const struct physical_page_range *range = &allocator->ranges[index];
-        uint64_t pages = (range->end - range->base) >> BOAROS_PAGE_SHIFT;
-        uint64_t first = range->first_page_index;
-
-        if ((uint64_t)page_index >= first &&
-            (uint64_t)page_index - first < pages) {
-            uint64_t local = (uint64_t)page_index - first;
-
-            if (range_index != 0) {
-                *range_index = index;
-            }
-            if (address != 0) {
-                *address = range->base +
-                           (local << BOAROS_PAGE_SHIFT);
-            }
-            return 1;
-        }
-    }
-
-    return 0;
-}
-
 static int read_recycled_node(
     const struct physical_page_allocator *allocator,
     uint64_t address,
@@ -317,6 +376,10 @@ enum physical_page_status physical_page_allocator_init(
     result.reclaimer = 0;
     result.reclaimer_context = 0;
     result.metadata = 0;
+    result.roots = 0;
+    result.tree = 0;
+    result.tree_nodes = 0;
+    result.root_count = 0;
     for (index = 0U; index <= PHYSICAL_PAGE_MAX_ORDER; index++) {
         result.free_heads[index] = PHYSICAL_PAGE_INDEX_NONE;
     }
@@ -499,624 +562,658 @@ static uint64_t order_page_count(uint32_t order)
     return UINT64_C(1) << order;
 }
 
-static int block_geometry(
-    const struct physical_page_allocator *allocator,
-    uint32_t page_index,
-    uint32_t order,
-    uint32_t *range_index,
-    uint64_t *address)
+static uint32_t largest_fitting_order(uint64_t address, uint64_t pages)
 {
-    uint64_t block_pages;
-    uint64_t block_size;
-    uint64_t result_address;
-    uint32_t result_range;
-    const struct physical_page_range *range;
-
-    if (order > PHYSICAL_PAGE_MAX_ORDER ||
-        (uint64_t)page_index >= allocator->total_pages) {
-        return 0;
-    }
-    block_pages = order_page_count(order);
-    if (block_pages > allocator->total_pages - page_index ||
-        block_pages > (UINT64_MAX >> BOAROS_PAGE_SHIFT)) {
-        return 0;
-    }
-    block_size = block_pages << BOAROS_PAGE_SHIFT;
-    if (!index_lookup(allocator,
-                      page_index,
-                      &result_range,
-                      &result_address)) {
-        return 0;
-    }
-    range = &allocator->ranges[result_range];
-    if ((result_address & (block_size - 1U)) != 0U ||
-        block_size > range->end - result_address) {
-        return 0;
-    }
-
-    if (range_index != 0) {
-        *range_index = result_range;
-    }
-    if (address != 0) {
-        *address = result_address;
-    }
-    return 1;
-}
-
-static void mark_block(
-    struct physical_page_allocator *allocator,
-    uint32_t page_index,
-    uint32_t order,
-    enum physical_page_state head_state,
-    enum physical_page_state tail_state)
-{
-    uint64_t count = order_page_count(order);
-    uint64_t offset;
-
-    for (offset = 0U; offset < count; offset++) {
-        struct physical_page_metadata *metadata =
-            &allocator->metadata[page_index + (uint32_t)offset];
-
-        metadata->next = PHYSICAL_PAGE_INDEX_NONE;
-        metadata->previous = PHYSICAL_PAGE_INDEX_NONE;
-        metadata->reference_count = 0U;
-        metadata->order = offset == 0U ? (uint8_t)order : 0U;
-        metadata->state = (uint8_t)(offset == 0U ? head_state : tail_state);
-        metadata->reserved = 0U;
-    }
-}
-
-static int free_list_node_valid(
-    const struct physical_page_allocator *allocator,
-    uint32_t page_index,
-    uint32_t order);
-
-static int free_block_valid(
-    const struct physical_page_allocator *allocator,
-    uint32_t page_index,
-    uint32_t order);
-
-static int free_list_insert(
-    struct physical_page_allocator *allocator,
-    uint32_t page_index,
-    uint32_t order)
-{
-    struct physical_page_metadata *metadata;
-    uint32_t head;
-
-    if (!block_geometry(allocator, page_index, order, 0, 0)) {
-        return 0;
-    }
-    head = allocator->free_heads[order];
-    if (head != PHYSICAL_PAGE_INDEX_NONE) {
-        struct physical_page_metadata *old_head = &allocator->metadata[head];
-
-        if (!free_block_valid(allocator, head, order) ||
-            old_head->previous != PHYSICAL_PAGE_INDEX_NONE) {
-            return 0;
-        }
-    }
-
-    metadata = &allocator->metadata[page_index];
-    metadata->next = head;
-    metadata->previous = PHYSICAL_PAGE_INDEX_NONE;
-    metadata->order = (uint8_t)order;
-    metadata->state = PHYSICAL_PAGE_STATE_FREE_HEAD;
-    metadata->reserved = 0U;
-    if (head != PHYSICAL_PAGE_INDEX_NONE) {
-        allocator->metadata[head].previous = page_index;
-    }
-    allocator->free_heads[order] = page_index;
-    return 1;
-}
-
-static int free_block_valid(
-    const struct physical_page_allocator *allocator,
-    uint32_t page_index,
-    uint32_t order)
-{
-    uint64_t count;
-    uint64_t offset;
-
-    if (!free_list_node_valid(allocator, page_index, order)) {
-        return 0;
-    }
-    count = order_page_count(order);
-    for (offset = 1U; offset < count; offset++) {
-        const struct physical_page_metadata *tail =
-            &allocator->metadata[page_index + (uint32_t)offset];
-
-        if (tail->state != PHYSICAL_PAGE_STATE_FREE_TAIL ||
-            tail->order != 0U || tail->reference_count != 0U ||
-            tail->next != PHYSICAL_PAGE_INDEX_NONE ||
-            tail->previous != PHYSICAL_PAGE_INDEX_NONE ||
-            tail->reserved != 0U) {
-            return 0;
-        }
-    }
-    return 1;
-}
-
-static int free_list_node_valid(
-    const struct physical_page_allocator *allocator,
-    uint32_t page_index,
-    uint32_t order)
-{
-    const struct physical_page_metadata *metadata;
-
-    if (!block_geometry(allocator, page_index, order, 0, 0)) {
-        return 0;
-    }
-    metadata = &allocator->metadata[page_index];
-    if (metadata->state != PHYSICAL_PAGE_STATE_FREE_HEAD ||
-        metadata->order != order || metadata->reference_count != 0U ||
-        metadata->reserved != 0U) {
-        return 0;
-    }
-    if (metadata->previous == PHYSICAL_PAGE_INDEX_NONE) {
-        if (allocator->free_heads[order] != page_index) {
-            return 0;
-        }
-    } else {
-        const struct physical_page_metadata *previous;
-
-        if ((uint64_t)metadata->previous >= allocator->total_pages ||
-            !block_geometry(allocator, metadata->previous, order, 0, 0)) {
-            return 0;
-        }
-        previous = &allocator->metadata[metadata->previous];
-        if (previous->state != PHYSICAL_PAGE_STATE_FREE_HEAD ||
-            previous->order != order || previous->reference_count != 0U ||
-            previous->reserved != 0U || previous->next != page_index) {
-            return 0;
-        }
-        if ((uint64_t)metadata->previous + order_page_count(order) >
-                page_index &&
-            (uint64_t)page_index + order_page_count(order) >
-                metadata->previous) {
-            return 0;
-        }
-    }
-    if (metadata->next != PHYSICAL_PAGE_INDEX_NONE) {
-        const struct physical_page_metadata *next;
-
-        if ((uint64_t)metadata->next >= allocator->total_pages ||
-            !block_geometry(allocator, metadata->next, order, 0, 0)) {
-            return 0;
-        }
-        next = &allocator->metadata[metadata->next];
-        if (next->state != PHYSICAL_PAGE_STATE_FREE_HEAD ||
-            next->order != order || next->reference_count != 0U ||
-            next->reserved != 0U || next->previous != page_index) {
-            return 0;
-        }
-        if ((uint64_t)metadata->next + order_page_count(order) >
-                page_index &&
-            (uint64_t)page_index + order_page_count(order) >
-                metadata->next) {
-            return 0;
-        }
-    }
-
-    return 1;
-}
-
-static int free_list_remove(
-    struct physical_page_allocator *allocator,
-    uint32_t page_index,
-    uint32_t order)
-{
-    struct physical_page_metadata *metadata;
-    uint32_t next;
-    uint32_t previous;
-
-    if (!free_block_valid(allocator, page_index, order)) {
-        return 0;
-    }
-    metadata = &allocator->metadata[page_index];
-    next = metadata->next;
-    previous = metadata->previous;
-
-    if (previous == PHYSICAL_PAGE_INDEX_NONE) {
-        allocator->free_heads[order] = next;
-    } else {
-        allocator->metadata[previous].next = next;
-    }
-    if (next != PHYSICAL_PAGE_INDEX_NONE) {
-        allocator->metadata[next].previous = previous;
-    }
-    metadata->next = PHYSICAL_PAGE_INDEX_NONE;
-    metadata->previous = PHYSICAL_PAGE_INDEX_NONE;
-    return 1;
-}
-
-static uint32_t largest_fitting_order(uint64_t address,
-                                      uint64_t page_count)
-{
-    uint32_t order = 0U;
-
-    while (order < PHYSICAL_PAGE_MAX_ORDER &&
-           order_page_count(order + 1U) <= page_count) {
-        order++;
-    }
-    while (order > 0U) {
-        uint64_t block_size = order_page_count(order) << BOAROS_PAGE_SHIFT;
-
-        if ((address & (block_size - 1U)) == 0U) {
-            break;
-        }
+    uint32_t order = PHYSICAL_PAGE_MAX_ORDER;
+    while (order && ((address & ((order_page_count(order) << BOAROS_PAGE_SHIFT) - 1)) ||
+                     order_page_count(order) > pages))
         order--;
-    }
     return order;
 }
 
-static int build_free_lists(struct physical_page_allocator *allocator,
-                            uint64_t *free_pages)
+static int root_valid(const struct physical_page_allocator *a,
+                      const struct physical_page_root *r)
 {
-    uint64_t result = 0U;
-    uint32_t range_index;
-
-    for (range_index = 0U;
-         range_index < allocator->range_count;
-         range_index++) {
-        const struct physical_page_range *range =
-            &allocator->ranges[range_index];
-        uint64_t range_pages =
-            (range->end - range->base) >> BOAROS_PAGE_SHIFT;
-        uint64_t local = 0U;
-
-        while (local < range_pages) {
-            uint32_t page_index =
-                range->first_page_index + (uint32_t)local;
-
-            if (allocator->metadata[page_index].state !=
-                PHYSICAL_PAGE_STATE_CANDIDATE) {
-                local++;
-                continue;
-            }
-
-            {
-                uint64_t run_pages = 0U;
-                uint64_t consumed = 0U;
-
-                while (local + run_pages < range_pages &&
-                       allocator->metadata[page_index +
-                                           (uint32_t)run_pages].state ==
-                           PHYSICAL_PAGE_STATE_CANDIDATE) {
-                    run_pages++;
-                }
-
-                while (consumed < run_pages) {
-                    uint64_t address = range->base +
-                        ((local + consumed) << BOAROS_PAGE_SHIFT);
-                    uint32_t order = largest_fitting_order(
-                        address,
-                        run_pages - consumed);
-                    uint64_t block_pages = order_page_count(order);
-
-                    mark_block(allocator,
-                               page_index + (uint32_t)consumed,
-                               order,
-                               PHYSICAL_PAGE_STATE_FREE_HEAD,
-                               PHYSICAL_PAGE_STATE_FREE_TAIL);
-                    if (!free_list_insert(allocator,
-                                          page_index +
-                                              (uint32_t)consumed,
-                                          order)) {
-                        return 0;
-                    }
-                    consumed += block_pages;
-                    result += block_pages;
-                }
-                local += run_pages;
-            }
-        }
-    }
-
-    *free_pages = result;
+    if (r->order > PHYSICAL_PAGE_MAX_ORDER || r->reserved ||
+        r->range_index >= a->range_count)
+        return 0;
+    const struct physical_page_range *range = &a->ranges[r->range_index];
+    uint64_t n = order_page_count(r->order), bytes = n << BOAROS_PAGE_SHIFT;
+    uint64_t range_pages = (range->end - range->base) >> BOAROS_PAGE_SHIFT;
+    if (r->first_page_index < range->first_page_index || n > a->total_pages ||
+        n > range_pages ||
+        (uint64_t)r->first_page_index - range->first_page_index > range_pages - n ||
+        r->first_page_index > a->total_pages - n ||
+        r->address !=
+            range->base + (((uint64_t)r->first_page_index - range->first_page_index)
+                           << BOAROS_PAGE_SHIFT) ||
+        (r->address & (bytes - 1)) || r->address >= range->end ||
+        bytes > range->end - r->address || r->node_offset > a->tree_nodes ||
+        2 * n - 1 > a->tree_nodes - r->node_offset)
+        return 0;
     return 1;
 }
 
-static int validate_free_lists(
-    const struct physical_page_allocator *allocator,
-    uint64_t expected_free_pages)
+static const struct physical_page_root *
+root_for_page(const struct physical_page_allocator *a, uint32_t page,
+              struct page_work *work)
 {
-    uint64_t free_pages = 0U;
-    uint32_t order;
-
-    for (order = 0U; order <= PHYSICAL_PAGE_MAX_ORDER; order++) {
-        uint32_t page_index = allocator->free_heads[order];
-        uint32_t previous = PHYSICAL_PAGE_INDEX_NONE;
-        uint64_t visited = 0U;
-
-        while (page_index != PHYSICAL_PAGE_INDEX_NONE) {
-            const struct physical_page_metadata *metadata;
-            uint64_t block_pages = order_page_count(order);
-            uint64_t offset;
-
-            if ((uint64_t)page_index >= allocator->total_pages ||
-                !free_block_valid(allocator, page_index, order)) {
-                return 0;
-            }
-            metadata = &allocator->metadata[page_index];
-            if (metadata->previous != previous ||
-                block_pages > allocator->total_pages - free_pages) {
-                return 0;
-            }
-            for (offset = 1U; offset < block_pages; offset++) {
-                if (allocator->metadata[
-                        page_index + (uint32_t)offset].state !=
-                    PHYSICAL_PAGE_STATE_FREE_TAIL) {
-                    return 0;
-                }
-            }
-            free_pages += block_pages;
-            previous = page_index;
-            page_index = metadata->next;
-            visited++;
-            if (visited > allocator->total_pages) {
-                return 0;
-            }
-        }
+    uint32_t lo = 0, hi = a->root_count;
+    while (lo < hi)
+    {
+        uint32_t mid = lo + (hi - lo) / 2;
+        const struct physical_page_root *r = &a->roots[mid];
+        page_checked(work);
+        if (!root_valid(a, r))
+            __builtin_trap();
+        if (page < r->first_page_index)
+            hi = mid;
+        else if ((uint64_t)page - r->first_page_index >= order_page_count(r->order))
+            lo = mid + 1;
+        else
+            return r;
     }
-
-    return free_pages == expected_free_pages;
+    return 0;
 }
 
-enum physical_page_status physical_page_allocator_finalize(
-    struct physical_page_allocator *allocator)
+static const struct physical_page_root *
+root_for_address(const struct physical_page_allocator *a, uint64_t address,
+                 struct page_work *work)
 {
-    struct physical_page_allocator result;
-    uint64_t metadata_bytes;
-    uint64_t metadata_pages;
-    uint64_t metadata_span;
-    uint64_t metadata_address = PHYSICAL_PAGE_NONE;
-    uint64_t metadata_last_address;
-    uint64_t recycled_count = 0U;
-    uint64_t tail_count = 0U;
-    uint64_t free_pages;
-    uint64_t current;
-    uint32_t metadata_range = UINT32_MAX;
-    uint32_t index;
-    unsigned char *metadata_first;
-    unsigned char *metadata_last;
+    uint32_t lo = 0, hi = a->root_count;
+    while (lo < hi)
+    {
+        uint32_t mid = lo + (hi - lo) / 2;
+        const struct physical_page_root *r = &a->roots[mid];
+        page_checked(work);
+        if (!root_valid(a, r))
+            __builtin_trap();
+        if (address < r->address)
+            hi = mid;
+        else if (address - r->address >=
+                 (order_page_count(r->order) << BOAROS_PAGE_SHIFT))
+            lo = mid + 1;
+        else
+            return r;
+    }
+    return 0;
+}
 
-    if (!allocator_initialized(allocator)) {
-        return PHYSICAL_PAGE_STATUS_INVALID;
-    }
-    if (physical_page_allocator_is_finalized(allocator)) {
-        return PHYSICAL_PAGE_STATUS_STATE;
-    }
-    if (allocator->access == 0) {
-        return PHYSICAL_PAGE_STATUS_STATE;
-    }
-    if (allocator->total_pages > UINT32_MAX ||
-        allocator->total_pages >
-            UINT64_MAX / sizeof(struct physical_page_metadata)) {
-        return PHYSICAL_PAGE_STATUS_INVALID;
-    }
+static unsigned tree_get(const struct physical_page_allocator *a,
+                         const struct physical_page_root *root, uint64_t node,
+                         struct page_work *work)
+{
+    uint64_t index = root->node_offset + node;
+    if (node >= 2 * order_page_count(root->order) - 1 || index >= a->tree_nodes)
+        __builtin_trap();
+    uint64_t bit = index * 3, byte = bit / 8;
+    unsigned shift = bit % 8, value = a->tree[byte];
+    if (shift > 5)
+        value |= (unsigned)a->tree[byte + 1] << 8;
+    page_checked(work);
+    return (value >> shift) & 7U;
+}
 
-    metadata_bytes = allocator->total_pages *
-                     sizeof(struct physical_page_metadata);
-    if (metadata_bytes > UINT64_MAX - BOAROS_PAGE_MASK) {
-        return PHYSICAL_PAGE_STATUS_INVALID;
-    }
-    metadata_pages = (metadata_bytes + BOAROS_PAGE_MASK) >>
-                     BOAROS_PAGE_SHIFT;
-    if (metadata_pages == 0U ||
-        metadata_pages > allocator->available_pages ||
-        metadata_pages > (UINT64_MAX >> BOAROS_PAGE_SHIFT)) {
-        return PHYSICAL_PAGE_STATUS_EMPTY;
-    }
-    metadata_span = metadata_pages << BOAROS_PAGE_SHIFT;
+static void tree_set(struct physical_page_allocator *a,
+                     const struct physical_page_root *root, uint64_t node,
+                     unsigned state, struct page_work *work)
+{
+    uint64_t index = root->node_offset + node;
+    if (state > BUDDY_INTERNAL || node >= 2 * order_page_count(root->order) - 1 ||
+        index >= a->tree_nodes)
+        __builtin_trap();
+    uint64_t bit = index * 3, byte = bit / 8;
+    unsigned shift = bit % 8, value = a->tree[byte];
+    if (shift > 5)
+        value |= (unsigned)a->tree[byte + 1] << 8;
+    value = (value & ~(7U << shift)) | state << shift;
+    a->tree[byte] = value;
+    if (shift > 5)
+        a->tree[byte + 1] = value >> 8;
+    page_written(work);
+}
 
-    for (index = 0U; index < allocator->range_count; index++) {
-        const struct physical_page_range *range = &allocator->ranges[index];
+struct buddy_owner
+{
+    const struct physical_page_root *root;
+    uint64_t node;
+    uint32_t first, order;
+    unsigned state;
+};
 
-        if (range->next <= range->end &&
-            metadata_span <= range->end - range->next) {
-            metadata_address = range->next;
-            metadata_range = index;
+static int owner_find(const struct physical_page_allocator *a, uint32_t page,
+                      struct buddy_owner *owner, struct page_work *work)
+{
+    const struct physical_page_root *r = root_for_page(a, page, work);
+    if (!r)
+        return 0;
+    *owner = (struct buddy_owner){r, 0, r->first_page_index, r->order, 0};
+    for (;;)
+    {
+        owner->state = tree_get(a, r, owner->node, work);
+        if (owner->state == BUDDY_SPLIT)
+        {
+            if (!owner->order)
+                return 0;
+            owner->order--;
+            unsigned right =
+                (uint64_t)page - owner->first >= order_page_count(owner->order);
+            owner->node = 2 * owner->node + 1 + right;
+            if (right)
+                owner->first += (uint32_t)order_page_count(owner->order);
+        }
+        else
+            return owner->state >= BUDDY_FREE && owner->state <= BUDDY_INTERNAL;
+    }
+}
+
+static uint64_t owner_address(const struct buddy_owner *owner)
+{
+    return owner->root->address +
+           (((uint64_t)owner->first - owner->root->first_page_index)
+            << BOAROS_PAGE_SHIFT);
+}
+
+static void mark_head(struct physical_page_allocator *a, uint32_t page, unsigned order,
+                      enum physical_page_state state, struct page_work *work)
+{
+    a->metadata[page] = (struct physical_page_metadata){
+        PHYSICAL_PAGE_INDEX_NONE,
+        PHYSICAL_PAGE_INDEX_NONE,
+        state == PHYSICAL_PAGE_STATE_ALLOCATED_HEAD ? 1U : 0U,
+        order,
+        state,
+        0};
+    page_written(work);
+}
+
+static int head_valid(const struct physical_page_allocator *a,
+                      const struct buddy_owner *owner, struct page_work *work)
+{
+    const struct physical_page_metadata *m = &a->metadata[owner->first];
+    page_checked(work);
+    if (m->order != owner->order || m->reserved)
+        return 0;
+    if (owner->state == BUDDY_FREE)
+        return m->state == PHYSICAL_PAGE_STATE_FREE_HEAD && !m->reference_count;
+    if (m->next != PHYSICAL_PAGE_INDEX_NONE || m->previous != PHYSICAL_PAGE_INDEX_NONE)
+        return 0;
+    if (owner->state == BUDDY_INTERNAL)
+        return m->state == PHYSICAL_PAGE_STATE_INTERNAL && !m->reference_count;
+    return owner->state == BUDDY_ALLOCATED &&
+           m->state == PHYSICAL_PAGE_STATE_ALLOCATED_HEAD && m->reference_count &&
+           (!owner->order || m->reference_count == 1);
+}
+
+static int free_head_plain(const struct physical_page_allocator *a, uint32_t page,
+                           uint32_t order, struct page_work *work)
+{
+    struct buddy_owner owner;
+    return owner_find(a, page, &owner, work) && owner.first == page &&
+           owner.order == order && owner.state == BUDDY_FREE &&
+           head_valid(a, &owner, work);
+}
+
+static int free_head_valid(const struct physical_page_allocator *a,
+                           const struct buddy_owner *owner, struct page_work *work)
+{
+    if (owner->state != BUDDY_FREE || !head_valid(a, owner, work))
+        return 0;
+    uint32_t page = owner->first, order = owner->order;
+    const struct physical_page_metadata *m = &a->metadata[page];
+    if (m->previous == PHYSICAL_PAGE_INDEX_NONE)
+    {
+        page_checked(work);
+        if (a->free_heads[order] != page)
+            return 0;
+    }
+    else if (m->previous == page || !free_head_plain(a, m->previous, order, work) ||
+             a->metadata[m->previous].next != page)
+        return 0;
+    if (m->next != PHYSICAL_PAGE_INDEX_NONE &&
+        (m->next == page || !free_head_plain(a, m->next, order, work) ||
+         a->metadata[m->next].previous != page))
+        return 0;
+    return 1;
+}
+
+/* 调用者持有IRQ元数据区且已检查该head/两邻居，摘链不重复走owner路径。 */
+static void free_remove(struct physical_page_allocator *a, uint32_t page,
+                        struct page_work *work)
+{
+    struct physical_page_metadata *m = &a->metadata[page];
+    uint32_t previous = m->previous, next = m->next;
+    if (previous == PHYSICAL_PAGE_INDEX_NONE)
+    {
+        a->free_heads[m->order] = next;
+        page_written(work);
+    }
+    else
+    {
+        a->metadata[previous].next = next;
+        page_written(work);
+    }
+    if (next != PHYSICAL_PAGE_INDEX_NONE)
+    {
+        a->metadata[next].previous = previous;
+        page_written(work);
+    }
+    m->next = m->previous = PHYSICAL_PAGE_INDEX_NONE;
+    page_written(work);
+}
+
+static int free_insert(struct physical_page_allocator *a, uint32_t page, uint32_t order,
+                       struct page_work *work)
+{
+    page_checked(work);
+    uint32_t old = a->free_heads[order];
+    if (old != PHYSICAL_PAGE_INDEX_NONE)
+    {
+        struct buddy_owner owner;
+        if (!owner_find(a, old, &owner, work) || owner.first != old ||
+            owner.order != order || !free_head_valid(a, &owner, work) ||
+            a->metadata[old].previous != PHYSICAL_PAGE_INDEX_NONE)
+            return 0;
+    }
+    struct physical_page_metadata *m = &a->metadata[page];
+    m->next = old;
+    m->previous = PHYSICAL_PAGE_INDEX_NONE;
+    page_written(work);
+    if (old != PHYSICAL_PAGE_INDEX_NONE)
+    {
+        a->metadata[old].previous = page;
+        page_written(work);
+    }
+    a->free_heads[order] = page;
+    page_written(work);
+    return 1;
+}
+
+/* 仅一次finalize私有构建可以读取逐页导入状态，运行期不扫描旧尾载荷。 */
+static unsigned build_tree(struct physical_page_allocator *a,
+                           const struct physical_page_root *r, uint64_t node,
+                           uint32_t page, unsigned order)
+{
+    unsigned state;
+    if (!order)
+    {
+        switch (a->metadata[page].state)
+        {
+        case PHYSICAL_PAGE_STATE_CANDIDATE:
+            state = BUDDY_FREE;
+            break;
+        case PHYSICAL_PAGE_STATE_INTERNAL:
+            state = BUDDY_INTERNAL;
+            break;
+        default:
+            state = BUDDY_ALLOCATED;
             break;
         }
     }
-    if (metadata_range == UINT32_MAX) {
-        return PHYSICAL_PAGE_STATUS_EMPTY;
+    else
+    {
+        unsigned left = build_tree(a, r, 2 * node + 1, page, order - 1);
+        unsigned right =
+            build_tree(a, r, 2 * node + 2, page + (uint32_t)order_page_count(order - 1),
+                       order - 1);
+        if (left == right && (left == BUDDY_FREE || left == BUDDY_INTERNAL))
+        {
+            tree_set(a, r, 2 * node + 1, BUDDY_INACTIVE, 0);
+            tree_set(a, r, 2 * node + 2, BUDDY_INACTIVE, 0);
+            state = left;
+        }
+        else
+            state = BUDDY_SPLIT;
     }
+    tree_set(a, r, node, state, 0);
+    if (state != BUDDY_SPLIT)
+        mark_head(a, page, order,
+                  state == BUDDY_FREE       ? PHYSICAL_PAGE_STATE_FREE_HEAD
+                  : state == BUDDY_INTERNAL ? PHYSICAL_PAGE_STATE_INTERNAL
+                                            : PHYSICAL_PAGE_STATE_ALLOCATED_HEAD,
+                  0);
+    return state;
+}
 
-    metadata_last_address = metadata_address +
-        ((metadata_pages - 1U) << BOAROS_PAGE_SHIFT);
-    metadata_first = allocator->access(metadata_address);
-    metadata_last = allocator->access(metadata_last_address);
-    if (metadata_first == 0 || metadata_last == 0 ||
-        (uintptr_t)metadata_first >
-            UINTPTR_MAX -
-                ((metadata_pages - 1U) << BOAROS_PAGE_SHIFT) ||
-        (uintptr_t)metadata_last !=
-            (uintptr_t)metadata_first +
-                ((metadata_pages - 1U) << BOAROS_PAGE_SHIFT)) {
+static int publish_free_heads(struct physical_page_allocator *a,
+                              const struct physical_page_root *r, uint64_t node,
+                              uint32_t page, unsigned order, uint64_t *free_pages)
+{
+    unsigned state = tree_get(a, r, node, 0);
+    if (state == BUDDY_SPLIT)
+        return order &&
+               publish_free_heads(a, r, 2 * node + 1, page, order - 1, free_pages) &&
+               publish_free_heads(a, r, 2 * node + 2,
+                                  page + (uint32_t)order_page_count(order - 1),
+                                  order - 1, free_pages);
+    if (state == BUDDY_FREE)
+    {
+        if (!free_insert(a, page, order, 0))
+            return 0;
+        *free_pages += order_page_count(order);
+    }
+    return state >= BUDDY_FREE && state <= BUDDY_INTERNAL;
+}
+
+enum physical_page_status
+physical_page_allocator_audit(const struct physical_page_allocator *a)
+{
+    if (!allocator_initialized(a))
         return PHYSICAL_PAGE_STATUS_INVALID;
+    if (!physical_page_allocator_is_finalized(a))
+        return PHYSICAL_PAGE_STATUS_STATE;
+    if (!a->roots || !a->tree || !a->metadata || !a->root_count)
+        __builtin_trap();
+    uint64_t free_pages = 0, covered = 0, nodes = 0, internal = 0;
+    uint64_t free_by_order[PHYSICAL_PAGE_MAX_ORDER + 1] = {0};
+    uint32_t expected_range = 0;
+    uint64_t expected_address = a->ranges[0].base;
+    struct audit_frame
+    {
+        uint64_t node;
+        uint32_t page, order;
+        unsigned active;
+    };
+    struct audit_frame stack[PHYSICAL_PAGE_MAX_ORDER + 1];
+    for (uint32_t i = 0; i < a->root_count; i++)
+    {
+        const struct physical_page_root *r = &a->roots[i];
+        if (!root_valid(a, r) || r->first_page_index != covered ||
+            r->node_offset != nodes || r->range_index != expected_range ||
+            r->address != expected_address)
+            __builtin_trap();
+        unsigned depth = 1;
+        stack[0] = (struct audit_frame){0, r->first_page_index, r->order, 1};
+        while (depth)
+        {
+            struct audit_frame f = stack[--depth];
+            unsigned state = tree_get(a, r, f.node, 0);
+            if ((!f.active && state != BUDDY_INACTIVE) ||
+                (f.active && (state < BUDDY_FREE || state > BUDDY_INTERNAL)) ||
+                (state == BUDDY_SPLIT && !f.order))
+                __builtin_trap();
+            if (f.active && state != BUDDY_SPLIT)
+            {
+                struct buddy_owner o = {r, f.node, f.page, f.order, state};
+                if (!head_valid(a, &o, 0))
+                    __builtin_trap();
+                if (state == BUDDY_FREE)
+                {
+                    if (!free_head_valid(a, &o, 0))
+                        __builtin_trap();
+                    free_pages += order_page_count(f.order);
+                    free_by_order[f.order]++;
+                }
+                else if (state == BUDDY_INTERNAL)
+                {
+                    uint64_t address = owner_address(&o),
+                             bytes = order_page_count(f.order) << BOAROS_PAGE_SHIFT;
+                    if (address < a->metadata_address ||
+                        address - a->metadata_address >
+                            (a->metadata_pages << BOAROS_PAGE_SHIFT) ||
+                        bytes > (a->metadata_pages << BOAROS_PAGE_SHIFT) -
+                                    (address - a->metadata_address))
+                        __builtin_trap();
+                    internal += order_page_count(f.order);
+                }
+                else
+                {
+                    uint64_t address = owner_address(&o),
+                             bytes = order_page_count(f.order) << BOAROS_PAGE_SHIFT;
+                    if (address < a->metadata_address +
+                                      (a->metadata_pages << BOAROS_PAGE_SHIFT) &&
+                        address + bytes > a->metadata_address)
+                        __builtin_trap();
+                }
+            }
+            if (f.order)
+            {
+                if (depth + 2 > PHYSICAL_PAGE_MAX_ORDER + 1)
+                    __builtin_trap();
+                unsigned active = f.active && state == BUDDY_SPLIT;
+                stack[depth++] = (struct audit_frame){
+                    2 * f.node + 2, f.page + (uint32_t)order_page_count(f.order - 1),
+                    f.order - 1, active};
+                stack[depth++] =
+                    (struct audit_frame){2 * f.node + 1, f.page, f.order - 1, active};
+            }
+        }
+        covered += order_page_count(r->order);
+        nodes += 2 * order_page_count(r->order) - 1;
+        expected_address += order_page_count(r->order) << BOAROS_PAGE_SHIFT;
+        if (expected_address == a->ranges[expected_range].end && i + 1 < a->root_count)
+        {
+            if (++expected_range >= a->range_count)
+                __builtin_trap();
+            expected_address = a->ranges[expected_range].base;
+        }
     }
+    if (covered != a->total_pages || nodes != a->tree_nodes ||
+        free_pages != a->available_pages || internal != a->metadata_pages ||
+        expected_range + 1 != a->range_count ||
+        expected_address != a->ranges[expected_range].end)
+        __builtin_trap();
+    for (unsigned order = 0; order <= PHYSICAL_PAGE_MAX_ORDER; order++)
+    {
+        uint32_t page = a->free_heads[order], previous = PHYSICAL_PAGE_INDEX_NONE;
+        uint64_t visited = 0;
+        while (page != PHYSICAL_PAGE_INDEX_NONE)
+        {
+            if (++visited > free_by_order[order] ||
+                !free_head_plain(a, page, order, 0) ||
+                a->metadata[page].previous != previous)
+                __builtin_trap();
+            previous = page;
+            page = a->metadata[page].next;
+        }
+        if (visited != free_by_order[order])
+            __builtin_trap();
+    }
+    return PHYSICAL_PAGE_STATUS_OK;
+}
 
-    result = *allocator;
-    result.metadata_address = metadata_address;
+enum physical_page_status
+physical_page_allocator_finalize(struct physical_page_allocator *allocator)
+{
+    if (!allocator_initialized(allocator))
+        return PHYSICAL_PAGE_STATUS_INVALID;
+    if (physical_page_allocator_is_finalized(allocator) || !allocator->access)
+        return PHYSICAL_PAGE_STATUS_STATE;
+    if (allocator->total_pages > UINT32_MAX)
+        return PHYSICAL_PAGE_STATUS_INVALID;
+    uint64_t nodes = 0, root_count = 0;
+    for (uint32_t i = 0; i < allocator->range_count; i++)
+    {
+        const struct physical_page_range *r = &allocator->ranges[i];
+        for (uint64_t address = r->base; address < r->end;)
+        {
+            unsigned order =
+                largest_fitting_order(address, (r->end - address) >> BOAROS_PAGE_SHIFT);
+            nodes += 2 * order_page_count(order) - 1;
+            root_count++;
+            address += order_page_count(order) << BOAROS_PAGE_SHIFT;
+        }
+    }
+    if (root_count > UINT32_MAX || nodes > (UINT64_MAX - 7) / 3 ||
+        root_count > UINT64_MAX / sizeof(struct physical_page_root) ||
+        allocator->total_pages > UINT64_MAX / sizeof(struct physical_page_metadata))
+        return PHYSICAL_PAGE_STATUS_INVALID;
+    uint64_t payload = allocator->total_pages * sizeof(struct physical_page_metadata);
+    uint64_t roots = root_count * sizeof(struct physical_page_root),
+             tree = (nodes * 3 + 7) / 8;
+    if (roots > UINT64_MAX - payload || tree > UINT64_MAX - payload - roots ||
+        payload + roots + tree > UINT64_MAX - BOAROS_PAGE_MASK)
+        return PHYSICAL_PAGE_STATUS_INVALID;
+    uint64_t metadata_pages =
+        (payload + roots + tree + BOAROS_PAGE_MASK) >> BOAROS_PAGE_SHIFT;
+    if (!metadata_pages || metadata_pages > allocator->available_pages ||
+        metadata_pages > UINT64_MAX >> BOAROS_PAGE_SHIFT)
+        return PHYSICAL_PAGE_STATUS_EMPTY;
+    uint64_t span = metadata_pages << BOAROS_PAGE_SHIFT, address = 0;
+    uint32_t selected = UINT32_MAX;
+    for (uint32_t i = 0; i < allocator->range_count; i++)
+    {
+        const struct physical_page_range *r = &allocator->ranges[i];
+        if (r->next <= r->end && span <= r->end - r->next)
+        {
+            selected = i;
+            address = r->next;
+            break;
+        }
+    }
+    if (selected == UINT32_MAX)
+        return PHYSICAL_PAGE_STATUS_EMPTY;
+    unsigned char *first = allocator->access(address),
+                  *last = allocator->access(address + span - BOAROS_PAGE_SIZE);
+    if (!first || !last || (uintptr_t)first > UINTPTR_MAX - (span - BOAROS_PAGE_SIZE) ||
+        (uintptr_t)last != (uintptr_t)first + span - BOAROS_PAGE_SIZE)
+        return PHYSICAL_PAGE_STATUS_INVALID;
+    struct physical_page_allocator result = *allocator;
+    result.metadata_address = address;
     result.metadata_pages = metadata_pages;
-    result.metadata = (struct physical_page_metadata *)metadata_first;
-    result.ranges[metadata_range].next += metadata_span;
-    for (index = 0U; index <= PHYSICAL_PAGE_MAX_ORDER; index++) {
-        result.free_heads[index] = PHYSICAL_PAGE_INDEX_NONE;
-    }
-    for (index = 0U; (uint64_t)index < result.total_pages; index++) {
-        struct physical_page_metadata *metadata = &result.metadata[index];
-
-        metadata->next = PHYSICAL_PAGE_INDEX_NONE;
-        metadata->previous = PHYSICAL_PAGE_INDEX_NONE;
-        metadata->reference_count = 1U;
-        metadata->order = 0U;
-        metadata->state = PHYSICAL_PAGE_STATE_ALLOCATED_HEAD;
-        metadata->reserved = 0U;
-    }
-
-    for (current = metadata_address;
-         current < metadata_address + metadata_span;
-         current += BOAROS_PAGE_SIZE) {
-        uint32_t page_index;
-
-        if (!page_lookup(&result, current, 0, &page_index)) {
+    result.metadata = (struct physical_page_metadata *)first;
+    result.roots = (struct physical_page_root *)(first + payload);
+    result.root_count = (uint32_t)root_count;
+    result.tree = first + payload + roots;
+    result.tree_nodes = nodes;
+    result.ranges[selected].next += span;
+    memset(result.tree, 0, (size_t)tree);
+    for (uint32_t i = 0; i <= PHYSICAL_PAGE_MAX_ORDER; i++)
+        result.free_heads[i] = PHYSICAL_PAGE_INDEX_NONE;
+    for (uint32_t i = 0; (uint64_t)i < result.total_pages; i++)
+        mark_head(&result, i, 0, PHYSICAL_PAGE_STATE_ALLOCATED_HEAD, 0);
+    for (uint64_t pa = address; pa < address + span; pa += BOAROS_PAGE_SIZE)
+    {
+        uint32_t index;
+        if (!page_lookup(&result, pa, 0, &index))
             return PHYSICAL_PAGE_STATUS_INVALID;
-        }
-        result.metadata[page_index].state = PHYSICAL_PAGE_STATE_INTERNAL;
-        result.metadata[page_index].reference_count = 0U;
+        mark_head(&result, index, 0, PHYSICAL_PAGE_STATE_INTERNAL, 0);
     }
-
-    current = allocator->recycled_head;
-    while (current != PHYSICAL_PAGE_NONE) {
+    uint64_t recycled = 0, virgin = 0, current = allocator->recycled_head;
+    while (current != PHYSICAL_PAGE_NONE)
+    {
+        uint32_t index;
         uint64_t next;
-        uint32_t page_index;
-
-        if (recycled_count >= allocator->total_pages ||
+        if (recycled >= allocator->total_pages ||
             !address_was_allocated(allocator, current) ||
-            !page_lookup(&result, current, 0, &page_index) ||
-            result.metadata[page_index].state !=
-                PHYSICAL_PAGE_STATE_ALLOCATED_HEAD ||
+            !page_lookup(&result, current, 0, &index) ||
+            result.metadata[index].state != PHYSICAL_PAGE_STATE_ALLOCATED_HEAD ||
             !read_recycled_node(allocator, current, &next) ||
-            (next != PHYSICAL_PAGE_NONE &&
-             !address_was_allocated(allocator, next))) {
+            (next != PHYSICAL_PAGE_NONE && !address_was_allocated(allocator, next)))
             return PHYSICAL_PAGE_STATUS_INVALID;
-        }
-        result.metadata[page_index].state = PHYSICAL_PAGE_STATE_CANDIDATE;
-        result.metadata[page_index].reference_count = 0U;
-        recycled_count++;
+        mark_head(&result, index, 0, PHYSICAL_PAGE_STATE_CANDIDATE, 0);
+        recycled++;
         current = next;
     }
-
-    for (index = 0U; index < allocator->range_count; index++) {
-        const struct physical_page_range *range = &allocator->ranges[index];
-        uint64_t address;
-
-        for (address = range->next;
-             address < range->end;
-             address += BOAROS_PAGE_SIZE) {
-            uint32_t page_index;
-            struct physical_page_metadata *metadata;
-
-            if (!page_lookup(&result, address, 0, &page_index)) {
+    for (uint32_t i = 0; i < result.range_count; i++)
+    {
+        const struct physical_page_range *r = &result.ranges[i];
+        for (uint64_t pa = r->next; pa < r->end; pa += BOAROS_PAGE_SIZE)
+        {
+            uint32_t index;
+            if (!page_lookup(&result, pa, 0, &index) ||
+                result.metadata[index].state != PHYSICAL_PAGE_STATE_ALLOCATED_HEAD)
                 return PHYSICAL_PAGE_STATUS_INVALID;
-            }
-            metadata = &result.metadata[page_index];
-            if (metadata->state == PHYSICAL_PAGE_STATE_INTERNAL) {
-                continue;
-            }
-            if (metadata->state != PHYSICAL_PAGE_STATE_ALLOCATED_HEAD) {
-                return PHYSICAL_PAGE_STATUS_INVALID;
-            }
-            metadata->state = PHYSICAL_PAGE_STATE_CANDIDATE;
-            metadata->reference_count = 0U;
-            tail_count++;
+            mark_head(&result, index, 0, PHYSICAL_PAGE_STATE_CANDIDATE, 0);
+            virgin++;
         }
     }
-    if (recycled_count > UINT64_MAX - tail_count ||
-        recycled_count + tail_count !=
-            allocator->available_pages - metadata_pages) {
+    if (recycled + virgin != allocator->available_pages - metadata_pages)
         return PHYSICAL_PAGE_STATUS_INVALID;
+    uint32_t root = 0;
+    uint64_t offset = 0;
+    for (uint32_t i = 0; i < result.range_count; i++)
+    {
+        const struct physical_page_range *r = &result.ranges[i];
+        for (uint64_t pa = r->base; pa < r->end;)
+        {
+            unsigned order =
+                largest_fitting_order(pa, (r->end - pa) >> BOAROS_PAGE_SHIFT);
+            result.roots[root] = (struct physical_page_root){
+                pa,
+                offset,
+                r->first_page_index + (uint32_t)((pa - r->base) >> BOAROS_PAGE_SHIFT),
+                order,
+                i,
+                0};
+            offset += 2 * order_page_count(order) - 1;
+            pa += order_page_count(order) << BOAROS_PAGE_SHIFT;
+            root++;
+        }
     }
-
-    if (!build_free_lists(&result, &free_pages) ||
-        free_pages != allocator->available_pages - metadata_pages ||
-        !validate_free_lists(&result, free_pages)) {
+    for (uint32_t i = 0; i < result.root_count; i++)
+    {
+        const struct physical_page_root *r = &result.roots[i];
+        build_tree(&result, r, 0, r->first_page_index, r->order);
+    }
+    uint64_t free_pages = 0;
+    for (uint32_t i = 0; i < result.root_count; i++)
+    {
+        const struct physical_page_root *r = &result.roots[i];
+        if (!publish_free_heads(&result, r, 0, r->first_page_index, r->order,
+                                &free_pages))
+            return PHYSICAL_PAGE_STATUS_INVALID;
+    }
+    if (free_pages != allocator->available_pages - metadata_pages)
         return PHYSICAL_PAGE_STATUS_INVALID;
-    }
-
     result.available_pages = free_pages;
-    note_allocated_peak(&result);
     result.recycled_head = PHYSICAL_PAGE_NONE;
     result.finalized = PHYSICAL_PAGE_ALLOCATOR_FINALIZED;
+    note_allocated_peak(&result);
+    (void)physical_page_allocator_audit(&result);
     *allocator = result;
     return PHYSICAL_PAGE_STATUS_OK;
 }
 
-static enum physical_page_status physical_page_allocate_order_once(
-    struct physical_page_allocator *allocator,
-    uint32_t order,
-    uint64_t *address)
+static enum physical_page_status
+physical_page_allocate_order_once(struct physical_page_allocator *a, uint32_t order,
+                                  uint64_t *address)
 {
-    KERNEL_IRQ_SCOPE(irq);
-    uint32_t found;
-    uint32_t page_index;
-    uint64_t block_pages;
-    uint64_t result_address;
-
-    if (!allocator_initialized(allocator) || address == 0 ||
-        order > PHYSICAL_PAGE_MAX_ORDER) {
+    PAGE_METADATA_SCOPE(work);
+    if (!allocator_initialized(a) || !address || order > PHYSICAL_PAGE_MAX_ORDER)
         return PHYSICAL_PAGE_STATUS_INVALID;
-    }
-    if (!physical_page_allocator_is_finalized(allocator)) {
+    if (!physical_page_allocator_is_finalized(a))
         return PHYSICAL_PAGE_STATUS_STATE;
-    }
-
-    for (found = order; found <= PHYSICAL_PAGE_MAX_ORDER; found++) {
-        if (allocator->free_heads[found] != PHYSICAL_PAGE_INDEX_NONE) {
+    uint32_t found = order;
+    while (found <= PHYSICAL_PAGE_MAX_ORDER)
+    {
+        page_checked(&work);
+        if (a->free_heads[found] != PHYSICAL_PAGE_INDEX_NONE)
             break;
-        }
+        found++;
     }
-    if (found > PHYSICAL_PAGE_MAX_ORDER) {
+    if (found > PHYSICAL_PAGE_MAX_ORDER)
         return PHYSICAL_PAGE_STATUS_EMPTY;
-    }
-
-    page_index = allocator->free_heads[found];
-    if (!free_block_valid(allocator, page_index, found) ||
-        !index_lookup(allocator, page_index, 0, &result_address)) {
-        return PHYSICAL_PAGE_STATUS_INVALID;
-    }
-    while (found > order) {
-        uint32_t target_order;
-        uint32_t target_head;
-
+    uint32_t page = a->free_heads[found];
+    struct buddy_owner owner;
+    if (!owner_find(a, page, &owner, &work) || owner.first != page ||
+        owner.order != found || !free_head_valid(a, &owner, &work))
+        __builtin_trap();
+    uint64_t pa = owner_address(&owner);
+    if (order_page_count(order) > a->available_pages ||
+        a->available_pages > a->total_pages)
+        __builtin_trap();
+    free_remove(a, page, &work);
+    while (found > order)
+    {
+        if (tree_get(a, owner.root, 2 * owner.node + 1, &work) != BUDDY_INACTIVE ||
+            tree_get(a, owner.root, 2 * owner.node + 2, &work) != BUDDY_INACTIVE)
+            __builtin_trap();
         found--;
-        target_order = found;
-        target_head = allocator->free_heads[target_order];
-        if (target_head != PHYSICAL_PAGE_INDEX_NONE &&
-            !free_block_valid(allocator,
-                              target_head,
-                              target_order)) {
-            return PHYSICAL_PAGE_STATUS_INVALID;
-        }
-        if (!block_geometry(allocator,
-                            page_index + (uint32_t)order_page_count(found),
-                            found,
-                            0,
-                            0)) {
-            return PHYSICAL_PAGE_STATUS_INVALID;
-        }
+        uint32_t upper = page + (uint32_t)order_page_count(found);
+        tree_set(a, owner.root, 2 * owner.node + 1, BUDDY_FREE, &work);
+        tree_set(a, owner.root, 2 * owner.node + 2, BUDDY_FREE, &work);
+        tree_set(a, owner.root, owner.node, BUDDY_SPLIT, &work);
+        mark_head(a, upper, found, PHYSICAL_PAGE_STATE_FREE_HEAD, &work);
+        if (!free_insert(a, upper, found, &work))
+            __builtin_trap();
+        owner.node = 2 * owner.node + 1;
     }
-    found = allocator->metadata[page_index].order;
-    if (!free_list_remove(allocator, page_index, found)) {
-        return PHYSICAL_PAGE_STATUS_INVALID;
-    }
-
-    while (found > order) {
-        uint32_t upper;
-
-        found--;
-        upper = page_index + (uint32_t)order_page_count(found);
-        if (!free_list_insert(allocator, upper, found)) {
-            return PHYSICAL_PAGE_STATUS_INVALID;
-        }
-    }
-
-    block_pages = order_page_count(order);
-    if (block_pages > allocator->available_pages) {
-        return PHYSICAL_PAGE_STATUS_INVALID;
-    }
-    mark_block(allocator,
-               page_index,
-               order,
-               PHYSICAL_PAGE_STATE_ALLOCATED_HEAD,
-               PHYSICAL_PAGE_STATE_ALLOCATED_TAIL);
-    allocator->metadata[page_index].reference_count = 1U;
-    allocator->available_pages -= block_pages;
-    note_allocated_peak(allocator);
-    *address = result_address;
+    tree_set(a, owner.root, owner.node, BUDDY_ALLOCATED, &work);
+    mark_head(a, page, order, PHYSICAL_PAGE_STATE_ALLOCATED_HEAD, &work);
+    a->available_pages -= order_page_count(order);
+    note_allocated_peak(a);
+    *address = pa;
     return PHYSICAL_PAGE_STATUS_OK;
 }
 
@@ -1162,253 +1259,113 @@ enum physical_page_status physical_page_allocate_order(
     return status;
 }
 
-static int allocated_block_valid(
-    const struct physical_page_allocator *allocator,
-    uint32_t page_index,
-    uint32_t order)
+enum physical_page_status
+physical_page_allocation_order(const struct physical_page_allocator *a,
+                               uint64_t address, uint32_t *order)
 {
-    uint64_t count;
-    uint64_t offset;
-
-    if (!block_geometry(allocator, page_index, order, 0, 0) ||
-        allocator->metadata[page_index].state !=
-            PHYSICAL_PAGE_STATE_ALLOCATED_HEAD ||
-        allocator->metadata[page_index].order != order ||
-        allocator->metadata[page_index].next != PHYSICAL_PAGE_INDEX_NONE ||
-        allocator->metadata[page_index].previous != PHYSICAL_PAGE_INDEX_NONE ||
-        allocator->metadata[page_index].reserved != 0U) {
-        return 0;
-    }
-    count = order_page_count(order);
-    if (allocator->metadata[page_index].reference_count == 0U) {
-        return 0;
-    }
-    for (offset = 1U; offset < count; offset++) {
-        const struct physical_page_metadata *tail =
-            &allocator->metadata[page_index + (uint32_t)offset];
-
-        if (tail->state != PHYSICAL_PAGE_STATE_ALLOCATED_TAIL ||
-            tail->order != 0U || tail->reference_count != 0U ||
-            tail->next != PHYSICAL_PAGE_INDEX_NONE ||
-            tail->previous != PHYSICAL_PAGE_INDEX_NONE ||
-            tail->reserved != 0U) {
-            return 0;
-        }
-    }
-    return 1;
-}
-
-enum physical_page_status physical_page_allocation_order(
-    const struct physical_page_allocator *allocator,
-    uint64_t address,
-    uint32_t *order)
-{
-    KERNEL_IRQ_SCOPE(irq);
-    uint32_t page_index;
-    const struct physical_page_metadata *metadata;
-
-    if (!allocator_initialized(allocator) || order == 0 ||
-        !page_lookup(allocator, address, 0, &page_index)) {
+    PAGE_METADATA_SCOPE(work);
+    uint32_t page;
+    if (!allocator_initialized(a) || !order ||
+        !page_lookup_work(a, address, 0, &page, &work))
         return PHYSICAL_PAGE_STATUS_INVALID;
-    }
-    if (!physical_page_allocator_is_finalized(allocator)) {
+    if (!physical_page_allocator_is_finalized(a))
         return PHYSICAL_PAGE_STATUS_STATE;
-    }
-
-    metadata = &allocator->metadata[page_index];
-    if (metadata->state == PHYSICAL_PAGE_STATE_FREE_HEAD ||
-        metadata->state == PHYSICAL_PAGE_STATE_FREE_TAIL) {
+    struct buddy_owner owner;
+    if (!owner_find(a, page, &owner, &work))
+        __builtin_trap();
+    if (owner.state == BUDDY_FREE)
         return PHYSICAL_PAGE_STATUS_DOUBLE_FREE;
-    }
-    if (metadata->state != PHYSICAL_PAGE_STATE_ALLOCATED_HEAD ||
-        !allocated_block_valid(allocator, page_index, metadata->order)) {
+    if (owner.state != BUDDY_ALLOCATED || owner.first != page)
         return PHYSICAL_PAGE_STATUS_INVALID;
-    }
-
-    *order = metadata->order;
+    if (!head_valid(a, &owner, &work))
+        __builtin_trap();
+    *order = owner.order;
     return PHYSICAL_PAGE_STATUS_OK;
 }
 
-enum physical_page_status physical_page_release_order(
-    struct physical_page_allocator *allocator,
-    uint64_t address,
-    uint32_t order)
+enum physical_page_status physical_page_release_order(struct physical_page_allocator *a,
+                                                      uint64_t address, uint32_t order)
 {
-    KERNEL_IRQ_SCOPE(irq);
-    uint32_t page_index;
-    uint32_t original_range;
-    uint32_t merge_buddies[PHYSICAL_PAGE_MAX_ORDER];
-    uint32_t merge_count = 0U;
-    uint32_t current_order;
-    uint64_t current_address;
-    uint64_t block_pages;
-    const struct physical_page_metadata *metadata;
-
-    if (!allocator_initialized(allocator)) {
-        physical_page_release_fatal(allocator, address, order,
-                                    "allocator-state", address);
-    }
-    if (order > PHYSICAL_PAGE_MAX_ORDER) {
-        physical_page_release_fatal(allocator, address, order,
-                                    "order-range", address);
-    }
-    if ((address & BOAROS_PAGE_MASK) != 0U) {
-        physical_page_release_fatal(allocator, address, order,
-                                    "unaligned-address", address);
-    }
-    if (!page_lookup(allocator, address, &original_range, &page_index)) {
-        physical_page_release_fatal(allocator, address, order,
-                                    "address-range", address);
-    }
-    if (!physical_page_allocator_is_finalized(allocator)) {
-        physical_page_release_fatal(allocator, address, order,
-                                    "not-finalized", address);
-    }
-
-    metadata = &allocator->metadata[page_index];
-    if (metadata->state == PHYSICAL_PAGE_STATE_FREE_HEAD ||
-        metadata->state == PHYSICAL_PAGE_STATE_FREE_TAIL) {
-        physical_page_release_fatal(allocator, address, order,
-                                    "already-free", address);
-    }
-    if (metadata->state != PHYSICAL_PAGE_STATE_ALLOCATED_HEAD) {
-        physical_page_release_fatal(allocator, address, order,
-                                    "not-allocated-head", address);
-    }
-    if (metadata->order != order) {
-        physical_page_release_fatal(allocator, address, order,
-                                    "wrong-order", address);
-    }
-    if (metadata->reference_count == 0U) {
-        physical_page_release_fatal(allocator, address, order,
-                                    "reference-count", address);
-    }
-    if (!allocated_block_valid(allocator, page_index, order)) {
-        physical_page_release_fatal(allocator, address, order,
-                                    "allocated-block", address);
-    }
-
-    if (order == 0U && metadata->reference_count > 1U) {
-        allocator->metadata[page_index].reference_count--;
+    PAGE_METADATA_SCOPE(work);
+    uint32_t page;
+    if (!allocator_initialized(a))
+        physical_page_release_fatal(a, address, order, "allocator-state", address);
+    if (order > PHYSICAL_PAGE_MAX_ORDER)
+        physical_page_release_fatal(a, address, order, "order-range", address);
+    if (address & BOAROS_PAGE_MASK)
+        physical_page_release_fatal(a, address, order, "unaligned-address", address);
+    if (!page_lookup_work(a, address, 0, &page, &work))
+        physical_page_release_fatal(a, address, order, "address-range", address);
+    if (!physical_page_allocator_is_finalized(a))
+        physical_page_release_fatal(a, address, order, "not-finalized", address);
+    struct buddy_owner owner;
+    if (!owner_find(a, page, &owner, &work))
+        physical_page_release_fatal(a, address, order, "tree-owner", address);
+    if (owner.state == BUDDY_FREE)
+        physical_page_release_fatal(a, address, order, "already-free", address);
+    if (owner.state != BUDDY_ALLOCATED || owner.first != page)
+        physical_page_release_fatal(a, address, order, "not-allocated-head", address);
+    if (owner.order != order)
+        physical_page_release_fatal(a, address, order, "wrong-order", address);
+    if (!a->metadata[page].reference_count)
+        physical_page_release_fatal(a, address, order, "reference-count", address);
+    if (!head_valid(a, &owner, &work))
+        physical_page_release_fatal(a, address, order, "allocated-block", address);
+    if (a->metadata[page].reference_count > 1)
+    {
+        a->metadata[page].reference_count--;
+        page_written(&work);
         return PHYSICAL_PAGE_STATUS_OK;
     }
-    if (metadata->reference_count != 1U) {
-        physical_page_release_fatal(allocator, address, order,
-                                    "reference-count", address);
-    }
-
-    block_pages = order_page_count(order);
-    if (allocator->available_pages > allocator->total_pages ||
-        block_pages > allocator->total_pages - allocator->available_pages) {
-        physical_page_release_fatal(allocator, address, order,
-                                    "available-count", address);
-    }
-
-    current_address = address;
-    current_order = order;
-    while (current_order < PHYSICAL_PAGE_MAX_ORDER) {
-        uint64_t block_size =
-            order_page_count(current_order) << BOAROS_PAGE_SHIFT;
-        uint64_t buddy_address = current_address ^ block_size;
-        uint32_t buddy_index;
-        uint32_t buddy_range;
-
-        if (!page_lookup(allocator,
-                         buddy_address,
-                         &buddy_range,
-                         &buddy_index) ||
-            buddy_range != original_range) {
+    uint64_t pages = order_page_count(order);
+    if (a->available_pages > a->total_pages ||
+        pages > a->total_pages - a->available_pages)
+        physical_page_release_fatal(a, address, order, "available-count", address);
+    tree_set(a, owner.root, owner.node, BUDDY_FREE, &work);
+    mark_head(a, page, order, PHYSICAL_PAGE_STATE_FREE_HEAD, &work);
+    while (owner.order < owner.root->order)
+    {
+        uint64_t sibling = (owner.node & 1U) ? owner.node + 1 : owner.node - 1;
+        uint32_t buddy;
+        /* 平坦索引不一定自然对齐：兄弟位置由同一物理根的局部偏移推导。 */
+        buddy = owner.root->first_page_index +
+                ((owner.first - owner.root->first_page_index) ^
+                 (uint32_t)order_page_count(owner.order));
+        unsigned state = tree_get(a, owner.root, sibling, &work);
+        if (state == BUDDY_FREE)
+        {
+            struct buddy_owner other = {owner.root, sibling, buddy, owner.order, state};
+            if (!free_head_valid(a, &other, &work))
+                physical_page_release_fatal(a, address, order, "buddy-free-block",
+                                            owner_address(&other));
+            free_remove(a, buddy, &work);
+            tree_set(a, owner.root, owner.node, BUDDY_INACTIVE, &work);
+            tree_set(a, owner.root, sibling, BUDDY_INACTIVE, &work);
+            owner.node = (owner.node - 1) / 2;
+            if (buddy < owner.first)
+                owner.first = buddy;
+            owner.order++;
+            tree_set(a, owner.root, owner.node, BUDDY_FREE, &work);
+            mark_head(a, owner.first, owner.order, PHYSICAL_PAGE_STATE_FREE_HEAD,
+                      &work);
+        }
+        else
+        {
+            if (state != BUDDY_ALLOCATED && state != BUDDY_INTERNAL &&
+                state != BUDDY_SPLIT)
+            {
+                struct buddy_owner other = {owner.root, sibling, buddy, owner.order,
+                                            state};
+                physical_page_release_fatal(a, address, order, "buddy-free-block",
+                                            owner_address(&other));
+            }
             break;
         }
-
-        switch (allocator->metadata[buddy_index].state) {
-        case PHYSICAL_PAGE_STATE_FREE_HEAD:
-            if (allocator->metadata[buddy_index].order >
-                    PHYSICAL_PAGE_MAX_ORDER) {
-                physical_page_release_fatal(allocator, address, order,
-                                            "buddy-order-range", buddy_address);
-            }
-            if (!free_block_valid(allocator,
-                                  buddy_index,
-                                  allocator->metadata[buddy_index].order)) {
-                physical_page_release_fatal(allocator, address, order,
-                                            "buddy-free-block", buddy_address);
-            }
-            if (allocator->metadata[buddy_index].order > current_order) {
-                physical_page_release_fatal(allocator, address, order,
-                                            "buddy-order", buddy_address);
-            }
-            if (allocator->metadata[buddy_index].order < current_order) {
-                break;
-            }
-            merge_buddies[merge_count++] = buddy_index;
-            if (buddy_address < current_address) {
-                current_address = buddy_address;
-            }
-            current_order++;
-            continue;
-        case PHYSICAL_PAGE_STATE_FREE_TAIL:
-        case PHYSICAL_PAGE_STATE_CANDIDATE:
-            physical_page_release_fatal(allocator, address, order,
-                                        "buddy-state", buddy_address);
-        case PHYSICAL_PAGE_STATE_ALLOCATED_HEAD:
-        case PHYSICAL_PAGE_STATE_ALLOCATED_TAIL:
-        case PHYSICAL_PAGE_STATE_INTERNAL:
-            break;
-        default:
-            physical_page_release_fatal(allocator, address, order,
-                                        "buddy-state", buddy_address);
-        }
-        break;
     }
-
-    if (allocator->free_heads[current_order] != PHYSICAL_PAGE_INDEX_NONE &&
-        !free_block_valid(allocator,
-                          allocator->free_heads[current_order],
-                          current_order)) {
-        uint64_t head_address = PHYSICAL_PAGE_NONE;
-
-        (void)index_lookup(allocator, allocator->free_heads[current_order],
-                           0, &head_address);
-        physical_page_release_fatal(allocator, address, order,
-                                    "free-list-head", head_address);
-    }
-
-    for (page_index = 0U; page_index < merge_count; page_index++) {
-        uint32_t buddy_order = order + page_index;
-        struct physical_page_metadata *buddy_metadata;
-
-        if (!free_list_remove(allocator,
-                              merge_buddies[page_index],
-                              buddy_order)) {
-            uint64_t buddy_address = PHYSICAL_PAGE_NONE;
-
-            (void)index_lookup(allocator, merge_buddies[page_index],
-                               0, &buddy_address);
-            physical_page_release_fatal(allocator, address, order,
-                                        "free-list-remove", buddy_address);
-        }
-        buddy_metadata = &allocator->metadata[merge_buddies[page_index]];
-        buddy_metadata->order = 0U;
-        buddy_metadata->state = PHYSICAL_PAGE_STATE_FREE_TAIL;
-    }
-    /* The merged head can move to a lower-address buddy; rebuild every
-     * metadata entry so no tail retains the released block's old order. */
-    if (!page_lookup(allocator, current_address, 0, &page_index)) {
-        physical_page_release_fatal(allocator, address, order,
-                                    "merged-address", current_address);
-    }
-    mark_block(allocator,
-               page_index,
-               current_order,
-               PHYSICAL_PAGE_STATE_FREE_TAIL,
-               PHYSICAL_PAGE_STATE_FREE_TAIL);
-    if (!free_list_insert(allocator, page_index, current_order)) {
-        physical_page_release_fatal(allocator, address, order,
-                                    "free-list-insert", current_address);
-    }
-
-    allocator->available_pages += block_pages;
+    if (!free_insert(a, owner.first, owner.order, &work))
+        physical_page_release_fatal(a, address, order, "free-list-insert",
+                                    owner_address(&owner));
+    a->available_pages += pages;
     return PHYSICAL_PAGE_STATUS_OK;
 }
 
@@ -1439,66 +1396,36 @@ enum physical_page_status physical_page_release(
     return physical_page_release_bootstrap(allocator, address);
 }
 
-enum physical_page_status physical_page_acquire(
-    struct physical_page_allocator *allocator,
-    uint64_t address)
+enum physical_page_status physical_page_acquire(struct physical_page_allocator *a,
+                                                uint64_t address)
 {
-    KERNEL_IRQ_SCOPE(irq);
-    uint32_t page_index;
-    struct physical_page_metadata *metadata;
-
-    if (!allocator_initialized(allocator) ||
-        !page_lookup(allocator, address, 0, &page_index) ||
-        !physical_page_allocator_is_finalized(allocator)) {
+    PAGE_METADATA_SCOPE(work);
+    uint32_t page;
+    struct buddy_owner owner;
+    if (!physical_page_allocator_is_finalized(a) || (address & BOAROS_PAGE_MASK) ||
+        !page_lookup_work(a, address, 0, &page, &work) ||
+        !owner_find(a, page, &owner, &work) || owner.first != page || owner.order ||
+        owner.state != BUDDY_ALLOCATED || !head_valid(a, &owner, &work) ||
+        a->metadata[page].reference_count == UINT32_MAX)
         __builtin_trap();
-    }
-
-    metadata = &allocator->metadata[page_index];
-    if (metadata->state == PHYSICAL_PAGE_STATE_FREE_HEAD ||
-        metadata->state == PHYSICAL_PAGE_STATE_FREE_TAIL) {
-        __builtin_trap();
-    }
-    if (metadata->state != PHYSICAL_PAGE_STATE_ALLOCATED_HEAD ||
-        metadata->order != 0U ||
-        !allocated_block_valid(allocator, page_index, 0U)) {
-        __builtin_trap();
-    }
-    if (metadata->reference_count == UINT32_MAX) {
-        __builtin_trap();
-    }
-
-    metadata->reference_count++;
+    a->metadata[page].reference_count++;
+    page_written(&work);
     return PHYSICAL_PAGE_STATUS_OK;
 }
 
-enum physical_page_status physical_page_reference_count(
-    const struct physical_page_allocator *allocator,
-    uint64_t address,
-    uint32_t *references)
+enum physical_page_status
+physical_page_reference_count(const struct physical_page_allocator *a, uint64_t address,
+                              uint32_t *references)
 {
-    KERNEL_IRQ_SCOPE(irq);
-    uint32_t page_index;
-    const struct physical_page_metadata *metadata;
-
-    if (!allocator_initialized(allocator) || references == 0 ||
-        !page_lookup(allocator, address, 0, &page_index) ||
-        !physical_page_allocator_is_finalized(allocator)) {
+    PAGE_METADATA_SCOPE(work);
+    uint32_t page;
+    struct buddy_owner owner;
+    if (!physical_page_allocator_is_finalized(a) || !references ||
+        !page_lookup_work(a, address, 0, &page, &work) ||
+        !owner_find(a, page, &owner, &work) || owner.first != page ||
+        owner.state != BUDDY_ALLOCATED || !head_valid(a, &owner, &work))
         __builtin_trap();
-    }
-
-    metadata = &allocator->metadata[page_index];
-    if (metadata->state == PHYSICAL_PAGE_STATE_FREE_HEAD ||
-        metadata->state == PHYSICAL_PAGE_STATE_FREE_TAIL) {
-        __builtin_trap();
-    }
-    if (metadata->state != PHYSICAL_PAGE_STATE_ALLOCATED_HEAD ||
-        !allocated_block_valid(allocator,
-                               page_index,
-                               metadata->order)) {
-        __builtin_trap();
-    }
-
-    *references = metadata->reference_count;
+    *references = a->metadata[page].reference_count;
     return PHYSICAL_PAGE_STATUS_OK;
 }
 
@@ -1538,41 +1465,33 @@ enum physical_page_status physical_page_allocator_clear_reclaimer(
     return PHYSICAL_PAGE_STATUS_OK;
 }
 
-enum physical_page_status physical_page_resolve(
-    const struct physical_page_allocator *allocator,
-    uint64_t physical_address,
-    void **pointer)
+enum physical_page_status
+physical_page_resolve(const struct physical_page_allocator *allocator,
+                      uint64_t physical_address, void **pointer)
 {
-    KERNEL_IRQ_SCOPE(irq);
-    void *result;
-
-    if (!allocator_initialized(allocator) || pointer == 0) {
+    PAGE_METADATA_SCOPE(work);
+    if (!allocator_initialized(allocator) || !pointer)
         return PHYSICAL_PAGE_STATUS_INVALID;
-    }
-    if (allocator->access == 0) {
+    if (!allocator->access)
         return PHYSICAL_PAGE_STATUS_STATE;
-    }
-    if (physical_page_allocator_is_finalized(allocator)) {
-        uint32_t page_index;
-        uint8_t state;
-
-        if (!page_lookup(allocator, physical_address, 0, &page_index)) {
+    if (physical_page_allocator_is_finalized(allocator))
+    {
+        uint32_t page;
+        struct buddy_owner owner;
+        if (!page_lookup_work(allocator, physical_address, 0, &page, &work))
             return PHYSICAL_PAGE_STATUS_INVALID;
-        }
-        state = allocator->metadata[page_index].state;
-        if (state != PHYSICAL_PAGE_STATE_ALLOCATED_HEAD &&
-            state != PHYSICAL_PAGE_STATE_ALLOCATED_TAIL) {
+        if (!owner_find(allocator, page, &owner, &work))
+            __builtin_trap();
+        if (owner.state != BUDDY_ALLOCATED)
             return PHYSICAL_PAGE_STATUS_INVALID;
-        }
-    } else if (!address_was_allocated(allocator, physical_address)) {
-        return PHYSICAL_PAGE_STATUS_INVALID;
+        if (!head_valid(allocator, &owner, &work))
+            __builtin_trap();
     }
-
-    result = allocator->access(physical_address);
-    if (result == 0) {
+    else if (!address_was_allocated(allocator, physical_address))
         return PHYSICAL_PAGE_STATUS_INVALID;
-    }
-
+    void *result = allocator->access(physical_address);
+    if (!result)
+        return PHYSICAL_PAGE_STATUS_INVALID;
     *pointer = result;
     return PHYSICAL_PAGE_STATUS_OK;
 }

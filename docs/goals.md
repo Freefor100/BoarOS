@@ -23,7 +23,7 @@ N3已经交付：legacy/modern VirtIO-net、受限DMA借用与复制回退、静
 | extent 冷读 OOM 清理 | 真实冷缓存碎片文件已复现未取得 buffer 引用却按非零块号释放的错误；get 失败直接返回后，1/4 KiB 块与两种 inode 大小的全部分配失败点、读取失败、重试、卸载及堆引用清零通过。独立入口为 `make test-lwext4-extent-host`，没有放宽非法释放契约。 |
 | pthread取消与旧libc输入 | 原镜像动态glibc的cancel/exit缺libgcc_s；独立glibc运行环境已固定unwind依赖并保护取消/cleanup。静态cancel-points的join结果在固定Linux也失败，按库/测试契约继续核对，不能归给内核。历史偶发现场仍保留P0c边界，不安排无目的重复次数。 |
 | 内核抢占边界 | allocator修复不等于所有共享状态已审完。限定检查开中断worker到共享对象的调用链、睡眠前引用和发布临界区；发现具体错误才扩大。 |
-| buddy元数据成本 | `cfae103`与`774e2dc`的生产allocator相同；合法order-0操作涉及32768页空闲块时，分配尾检查65534次、释放尾检查65504次并重写32768条。4 KiB/16 KiB宿主参数均复现。分层块状态权威索引已选，尚未实现；成本闭环进入P6前置，不把计数当周期或吞吐。 |
+| buddy元数据成本 | `cfae103`与`774e2dc`的生产allocator相同；合法order-0操作涉及32768页空闲块时，分配尾检查65534次、释放尾检查65504次并重写32768条。4 KiB/16 KiB宿主参数均复现。分层块状态权威索引已实现，32768页新逻辑检查66/67、重写94/94，owner模型和窄双架构回归通过；匹配时间与完整组合尚未收口，成本闭环进入P6前置，不把计数当周期或吞吐。 |
 | GDT touch性能候选 | clean standalone grouped touch的undo/restore复制消除已在隔离候选验证，但完整读取还有负向观察，未合入main。主线`f325b1a`是独立checksum读者冲突修复，`774e2dc`补LA checksum根盘；本轮buddy工作不能替代GDT性能交付。 |
 | 回环入队通知纠错 | 本地端口已定义 hook，导入的 lwIP 成功入队路径漏调用；已接到完整包链发布之后。固定时钟的实际 IPv4/IPv6 协议反例保护工作检测、唤醒、晚入队及 OOM/回收，不将它作为历史吞吐差距的唯一归因。见[网络记录](learning/network-ownership.md#成功回环入队必须通知工作-owner2026-10-08)。 |
 | TX 完成进展纠错 | worker先收割并释放完成槽，再推进协议；睡眠前覆盖SG与复制路径的新容量。宿主顺序/关闭窗口、真实两种TAP传输和无NIC定时器验证通过；见[网络owner](learning/network-ownership.md)。 |
@@ -451,7 +451,7 @@ heap、MM/uaccess、VFS/cache和各架构后端。当前只确认A的表示与�
    后者用fixture内的ready握手再检验超时与日志保留；不改变正式runner预算，不靠重试。
    程序清单host fixture显式覆盖guest库路径，另断言真实guest仍使用固定环境；
    不修改原程序、libc或guest驱动的运行语义。
-2. **buddy表示与成本。** 各usable range按物理自然对齐分为buddy根，根目录有序二分；
+2. **buddy表示与成本（实现及窄门禁已交付）。** 各usable range按物理自然对齐分为buddy根，根目录有序二分；
    每根使用隐式完整二叉树、64位节点索引和3-bit打包状态，区分inactive/free/split/allocated/
    internal。子状态准备完成再发布split，合并退休子节点再发布free。活跃块头保留链与
    引用载荷，旧尾载荷不作为owner；不得跨range/保留区合并。bootstrap接口及一次性
@@ -679,7 +679,7 @@ PCI共享INTx、ext4读写/只读、原BusyBox七个applet及musl组合ABI的固
 | P4a 共享匿名 | 已选择并交付②：专用对象按索引惰性发布页，保持稀疏分配并提供稳定身份；急切分配会改变 lazy/OOM 成本。后续已迁移到统一 memory_object，匿名跨 MM futex 与共享文件页已交付；共享文件 futex 仍待设计。 |
 | P3b 持久化 | 用户已选择并交付逐 inode dirty/error、定向写回和真实 flush；共享事务可提交关联元数据，不主动全量写回无关文件。 |
 | P3d 恢复 | journal/replay 与持久 orphan 已启用并验收；故障模型、限制和复现命令见 VFS 模块。 |
-| P6前置 buddy成本 | 2026-10-08已选分层块状态权威索引；保守去重复/部分重写仍留下O(B)扫描，块头加位图路线的完整审计发现时点变化更大，均未选。本轮只交付buddy成本与同步契约，RV时间观测＋LA功能/工作量；表示与新成本门禁尚未实施。 |
+| P6前置 buddy成本 | 2026-10-08已选分层块状态权威索引；保守去重复/部分重写仍留下O(B)扫描，块头加位图路线的完整审计发现时点变化更大，均未选。本轮只交付buddy成本与同步契约，RV时间观测＋LA功能/工作量；表示与新成本门禁已实施并通过窄回归，匹配时间与完整组合待收口。 |
 | P6 SMP：当前 SIE 串行化，缺远端 TLB 确认 | ① 进程态对象先用粗粒度可睡眠锁、IRQ/队列另设短锁，验证较少但并行有限；② MM/OFD/cache/队列对象锁直接演进，锁顺序/取消成本更高。先盘点消费者和睡眠边界再选，临时启动大锁有退出条件。 |
 | 单 hart ASID：当前 ASID 0，换根前后各一次全局 fence | 已调查并推迟到实板：固定 QEMU 无 ASID 化 TLB（satp 变化与任意 sfence.vma 均全刷、翻译不使用 ASID），收益不可观测，且收窄 fence 的正确性缺陷会被 QEMU 全刷掩盖；在 ASID 标签 TLB 的硬件（L4）上实现并验证 ASIDLEN 与复用顺序。 |
 | P6g 栈 guard：连续物理栈、canary/高水位 | 已选择①并交付：独立内核栈窗口（12 KiB 槽＝4 KiB 未映射 guard＋8 KiB 栈），运行期插/删叶、空表释放；见已交付表。direct-map 别名与 idle/boot 栈的边界见[调度模块](modules/kernel-scheduler.md)。 |

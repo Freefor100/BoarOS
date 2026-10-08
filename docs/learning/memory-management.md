@@ -81,9 +81,9 @@ buddy_pfn = pfn XOR (1 << order)
 
 若 buddy 也空闲且仍在同一个可用 RAM 区间，就把两者摘链、取低地址作为高一级块，
 继续向上合并。BoarOS在metadata中保存双向链索引，已知buddy的链指针修改为O(1)，
-但当前校验还遍历整个空闲块；不能把链操作复杂度当成分配/释放的总成本。
+但审查基线的校验还遍历整个空闲块；不能把链操作复杂度当成分配/释放的总成本。
 
-逐页 metadata 让错误语义也更精确：allocated head 记录原 order 和引用数，allocated tail
+旧表示的逐页 metadata 让错误语义更精确：allocated head 记录原 order 和引用数，allocated tail
 不能单独释放，free head/tail 能识别重复释放，internal 页永远不能返回给调用者。代价是
 finalize 需要 O(页数) 初始化，并永久占用每页 16 字节；4 KiB 页下约占 RAM 的
 0.391%，16 GiB理论完整RAM为64 MiB。order-0分配最后只发布一个allocated记录，
@@ -122,11 +122,32 @@ make test-allocator-release-host test-allocator-preemption-host test-ci-host tes
 执行记录，也没有重跑双架构/ABI/恢复矩阵。正式成本门禁应由公开接口构造强制split/
 coalesce，统计逻辑检查/重写工作量并保护规模上界，不能长期绑定gcov行号或私有调用数。
 
-当前fatal用例不仅覆盖wrong-order、tail和重复释放，还修改空闲buddy尾记录的
-reserved字段，要求随后的释放发现损坏。因此直接删除全尾校验会改变已有检测契约。
-后续选择用分层块状态表达所有权，活跃树节点、块头引用及free-list连接共同验证；
-非活跃旧尾载荷不能再充当owner。故障注入要转为对应的权威状态破坏，保留错误所有权
-反例，完整审计检查全部活跃状态；新表示尚未实现，不能记作已消除成本。
+原fatal用例不仅覆盖wrong-order、tail和重复释放，还修改空闲buddy尾记录的reserved，
+要求随后释放发现损坏。新实现将所有权迁移到自然对齐隐式森林，保留16字节活跃head
+载荷；旧尾载荷不再是权威。该反例已改为同一空闲buddy的活跃树编码破坏，仍要求
+SIGILL与buddy guard；另覆盖高阶acquire、引用溢出/internal/零引用及审计损坏。
+不是直接删除全尾检查后继续信任旧表示。
+
+新 `test-allocator-cost-host` 的准备全部用公开API：先保留B页块、耗尽其余页，再释放
+该块，下一次order0只能split它。4 KiB与16 KiB各自得到下表，结束后释放全部准备
+owner并恢复finalize后基线；树深度H来自对齐的2B页RAM，所以H为log2(B)+1。
+
+|B|分配逻辑检查|释放逻辑检查|分配/释放逻辑重写|
+|---:|---:|---:|---:|
+|64|30|31|40/40|
+|512|42|43|58/58|
+|4096|54|55|76/76|
+|32768|66|67|94/94|
+
+新计数含根、树、head和order入口（含插入时空入口判断）；旧表只统计尾检查/逐页重写，不能把两表当相同
+微操作或据此换算吞吐倍数。结构证明是旧O(B)路径退出热区，新路径的相关树/邻居
+检查满足规模上界；单层split/coalesce写入各不超过7记录，finalize与显式全审计允许O(P)。
+两个页参数各10000次随机owner操作每步审计，另核对多range/洞、bootstrap导入、
+映射失败/无metadata空间不发布、高阶内部尾页页首解析与非对齐拒绝。
+
+本阶段已通过allocator release/preemption/COST host及RV page/heap/MM/VMA/uaccess/
+context/scheduler窄回归，LA两种RAM真实内存ELF、fault/OOM回收和同ELF Linux对照通过。
+这是表示与窄回归证据；完整组合及36次匹配时间对照另行记录，尚不能关闭阶段A。
 
 ### 单核纪律与跨核同步的区别
 

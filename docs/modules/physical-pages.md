@@ -67,14 +67,15 @@ finalized 的 order-0 页可用 `physical_page_acquire()` 增加 32 位引用，
 同一分配器的磁盘缓存登记到共同 owner，干净回收按实例轮转；停止一个实例不注销其他实例。最后实例及等待者都释放引用后才销毁共同 owner。
 
 `physical_page_resolve()` 为持有分配页的调用者提供受检查的物理地址访问。bootstrap
-模式只能按发放历史检查；finalized 模式还要求 metadata 为 allocated head/tail，明确
+模式只能按发放历史检查；finalized 模式要求页首位于 allocated 权威块，允许连续块内的尾页页首，明确
 拒绝 free 和 internal 页。两种模式都只在访问回调返回非空指针后写输出。
 
 `physical_page_total()` 保留所有对齐可用页的原始总数；
 `physical_page_available()` 在 finalized 后排除 bootstrap owner 与 metadata；
-`physical_page_metadata_pages()` 只在 finalized 后返回内部占用。metadata 每个物理页
-使用 16 字节，包含双向链索引、引用数、order 与所有权状态；16 GiB/4 KiB 的理论完整 RAM
-需要 64 MiB，即约 0.391% RAM，实际值按排除固件和内核后的页数向上取整。
+`physical_page_metadata_pages()` 只在 finalized 后返回内部占用。metadata由每页16字节载荷、有序根目录和3-bit隐式树组成；只有活跃块头使用载荷。
+令总页数P、根数R，当前字节预算为 `16*P + 32*R + ceil(3*(2*P-R)/8)`，最终按页取整。
+4 KiB下主体约占RAM的0.409%，16 KiB约0.102%；根目录与页取整另计，不能继续沿用
+旧表示的0.391%作为新资源基线。metadata来自未发放连续区间，全部标为internal。
 
 ## 算法与限制
 
@@ -82,22 +83,33 @@ finalized 的 order-0 页可用 `physical_page_acquire()` 增加 32 位引用，
 重复释放检测仍会扫描临时回收链；这条路径只服务最终页表建立前的硬件迁移。
 finalize 初始化逐页 metadata，成本为 O(物理页数)，但每次启动只发生一次。
 
-finalized分配最多搜索32个order，已知块的链指针修改不遍历同order链表；这不等于
-整个分配/释放操作只有O(order)工作。`free_block_valid()`检查块内全部尾记录，
-候选预检、摘链及插入已有head的验证可能重复扫描；末引用释放在coalesce后按最终
-合并order重写整块。令涉及的空闲/合并块页数为B，order-0分配及末引用释放仍可能
-执行O(B)元数据操作。只有分配最后的allocated标记、acquire及非末release是单页更新。
-当前main的64/512/4096/32768页反例在4 KiB及16 KiB宿主参数下已复现，
-计数与适用边界见[内存学习记录](../learning/memory-management.md#buddy-元数据成本核实2026-10-08)。
-分配热路径只发布阈值唤醒，不扫描缓存或执行 I/O；首次分配失败才同步扫描干净缓存。当前单 hart 仍会在开中断的内核线程中发生 timer 抢占。一次 buddy 摘链、split、
-分配发布或release/coalesce，以及引用更新和一致性读取，均由保存/恢复本CPU中断
-状态的临界区保护；当前没有该临界区的固定时间上界。SMP接入前仍须建立跨核同步。
+finalized分配搜索order入口，根目录按PA或平坦页索引二分；相关owner沿隐式树查找。
+free/split/allocated/internal为权威状态，inactive节点不拥有页，编码5–7为损坏。
+分裂先准备子状态再发布split，合并先摘链/退休子节点再发布free。无跨range合并；
+旧尾载荷不参与owner判断，不能用一段旧尾的状态替代树验证。
 
-已选的后续表示是按物理自然对齐分解的隐式buddy森林，以free/split/allocated/internal
-块状态作为权威；小请求只检查相关路径和活跃块头，完整一致性由显式审计保护。
-这是[近期实施计划](../goals.md#p6前置有界分配成本与同步契约)，尚未改写生产实现。
-不能先删除现有尾校验并把新表示或有界成本记成已交付；非法释放、引用、链和权威状态
-损坏的fatal契约继续保持，私有布局故障注入需随权威表示更新。
+热路径检查相关权威路径、块头引用与free-list双向连接，不扫描空闲块尾记录，也不
+重写最终合并块的全部页。小请求的检查受树/根目录深度约束，重写受split/coalesce
+层数约束；完整一致性由 `physical_page_allocator_audit()` 验证。调用者只可在未发布或
+独占finalized实例上审计；该接口不分配、回收或I/O，固定深度栈遍历包括inactive节点、
+活跃head、free-list成员与覆盖/计数，损坏fatal。非法参数INVALID，未finalized为STATE。
+
+一次元数据操作仍保存/恢复本CPU的IRQ，保证单核timer抢占不能插入半成品；这里
+没有跨核互斥或硬实时承诺。耗尽后的压力回调、I/O等待不在buddy修改区内。
+
+`test-allocator-cost-host`在4/16 KiB下用公开API强制64/512/4096/32768页split/coalesce，
+并做10000次随机操作的独立owner模型、每步审计、多range/保留洞和finalize失败验证。
+工作量计根目录/树/块头/order入口的逻辑检查和重写，重复验证重复计，批量初始化须
+按实际记录计；finalize与独立审计不并入运行期热路径窗口。请求页数N、相关根深度H、
+目录二分深度L的门禁为检查 `32*(H+1)^2+16*N+64*(L+1)`、重写 `8*(H+1)+4*N`。
+分裂每层最多7次逻辑重写、合并每层最多7次，入口/最终发布余量由上述常数覆盖；
+邻居权威检查按相关路径计，ROOT上限由最大19个usable range及order31约束，L不超过11。
+这不是固定私有调用次数或循环行号。32768页反例新检查66/67、重写94/94；
+旧尾计数与新全部逻辑计数的口径差异见[学习记录](../learning/memory-management.md#buddy-元数据成本核实2026-10-08)。
+
+COST新增三项非直方图指标，在每次元数据区内局部累计，恢复IRQ后集中提交；默认关闭，
+不持对象引用。窗口内时间排除压力I/O，完整IRQ-off分布沿用现有观测；成本计数并不
+替代客户机时间。阶段A的组合回归与匹配时间结论尚在执行，不能据窄测试宣称阶段完成。
 
 绑定前只允许顺序发放从未释放过的页；合法 bootstrap 释放完成即返回。越界、重复或
 不属于当前 owner 的释放触发 fatal trap。
@@ -119,6 +131,7 @@ bootstrap 分散耗尽时 finalize 仍返回 `EMPTY`。当前 QEMU 满足该约�
 ```sh
 make test-allocator-preemption-host
 make test-allocator-release-host
+make test-allocator-cost-host
 make test-page-riscv
 make test-riscv
 ```
