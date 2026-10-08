@@ -1,0 +1,70 @@
+"""CI success requires complete commands and every required job."""
+import importlib.util
+import json
+from pathlib import Path
+import sys
+import subprocess
+import tempfile
+import unittest
+
+spec = importlib.util.spec_from_file_location('ci_runner', Path(__file__).with_name('run.py'))
+runner = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(runner)
+
+
+class Execution(unittest.TestCase):
+    def test_failed_case_does_not_mask_following_case_or_tail(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cases = [
+                {'name': 'bad', 'argv': [sys.executable, '-c', 'print("failed"); raise SystemExit(7)'], 'timeout': 2},
+                {'name': 'good', 'argv': [sys.executable, '-c', 'print("x"*12000); print("FINAL")'], 'timeout': 2},
+            ]
+            result = runner.run_cases(cases, Path(directory))
+            self.assertEqual(result['status'], 'failed')
+            self.assertEqual([row['status'] for row in result['cases']], ['failed', 'passed'])
+            self.assertEqual(result['cases'][0]['exit'], 7)
+            self.assertTrue((Path(directory) / 'good.log').read_text().endswith('FINAL\n'))
+            self.assertTrue((Path(directory) / 'report.json').is_file())
+
+    def test_timeout_and_missing_executable_are_failures(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = runner.run_cases([
+                {'name': 'slow', 'argv': [sys.executable, '-c', 'import time; print("start",flush=True); time.sleep(5)'], 'timeout': .1},
+                {'name': 'missing', 'argv': [str(Path(directory) / 'absent')], 'timeout': 1},
+            ], Path(directory))
+            self.assertEqual([row['status'] for row in result['cases']], ['timeout', 'runner-error'])
+            self.assertEqual(result['status'], 'failed')
+            self.assertIn('start', (Path(directory) / 'slow.log').read_text())
+
+    def test_empty_or_duplicate_case_sets_are_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(ValueError):
+                runner.run_cases([], Path(directory))
+            case = {'name': 'same', 'argv': [sys.executable, '-c', 'pass'], 'timeout': 1}
+            with self.assertRaises(ValueError):
+                runner.run_cases([case, case], Path(directory))
+
+    def test_each_required_job_must_succeed(self):
+        required = ['host', 'rv', 'la', 'runtime']
+        self.assertTrue(runner.jobs_passed(required, dict.fromkeys(required, {'result': 'success'})))
+        for status in ('failure', 'cancelled', 'skipped', ''):
+            jobs = dict.fromkeys(required, {'result': 'success'})
+            jobs['la'] = {'result': status}
+            self.assertFalse(runner.jobs_passed(required, jobs))
+        self.assertFalse(runner.jobs_passed(required, {'rv': {'result': 'success'}}))
+
+    def test_extended_plan_executes_strict_inventory_on_both_memories(self):
+        for arch in ('riscv', 'loongarch'):
+            with self.subTest(arch=arch):
+                result = subprocess.run([sys.executable, '-B', str(Path(__file__).with_name('run.py')),
+                    '--arch', arch, '--suite', 'extended', '--list'], capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                cases = json.loads(result.stdout)
+                inventory = next(row for row in cases if row['name'] == 'original-programs')
+                self.assertIn('--require-pass', inventory['argv'])
+                self.assertEqual([inventory['argv'][i+1] for i, arg in enumerate(inventory['argv'])
+                                  if arg == '--memory'], ['512M', '1G'])
+
+
+if __name__ == '__main__':
+    unittest.main()

@@ -67,6 +67,12 @@ glibc 2.44 作为外部测试输入使用：官方源码归档保存在被忽略
 
 ## LA 静态用户程序构建输入
 
+主线 CI 恢复的 GNU 工具包和运行时另固定于 `references/toolchains/`：Loongson
+2025.08.08 发布包及 Arch 的 RV GCC16.2.1/binutils2.47/glibc2.44/API7.2 包。
+只用于被忽略的宿主构建环境和用户程序 fixture，不导入内核源码；保留原包
+许可证与文件内容，GNU profile 的原二进制身份不变。上游 URL/SHA-256 归
+`references/sources.tsv`，用法见[CI 环境记录](learning/ci-native-environment.md)。
+
 GCC15.1.0 原官方 archive 固定于 `references/sources.tsv` 的 `gcc/gcc-15.1.0.tar.xz`；
 源码在忽略的 `build/loongarch/gcc-sf/source` 原样解包，许可见 `COPYING3`，目标运行库
 适用 `COPYING.RUNTIME` 的 GCC Runtime Library Exception3.1。仅构建 C/LP64S runtime，

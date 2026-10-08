@@ -4,6 +4,7 @@
 |---|---|
 | [README](../README.md) | 已验证能力摘要、运行命令、近期方向 |
 | [目标与 TODO](goals.md) | 优先队列、阶段依赖、阻塞、验收和待确认路线 |
+| [主线 CI](modules/continuous-integration.md) | 双架构常驻门禁、原程序/设备与恢复分层、固定环境及失败判定 |
 | [设计原则](design.md) | 长期工程选择；协作/提交规则见 [AGENTS](../AGENTS.md)、[CONTRIBUTING](../CONTRIBUTING.md) |
 | [工具链](toolchain.md)、[固定资料](../references/README.md)、[第三方](third-party.md) | 环境、版本、来源和许可 |
 

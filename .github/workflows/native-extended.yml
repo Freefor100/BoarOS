@@ -1,0 +1,75 @@
+name: Dual-architecture original programs and device lifecycle
+on:
+  workflow_dispatch:
+  schedule:
+    # Daily 03:17 Asia/Shanghai; the default branch supplies this workflow.
+    - cron: '17 19 * * *'
+permissions:
+  contents: read
+concurrency:
+  group: native-extended-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  original-programs:
+    name: Original programs and devices (${{ matrix.arch }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [riscv, loongarch]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/native-environment
+        with:
+          arch: ${{ matrix.arch }}
+          mode: prepare
+      - name: Build the general fixture kernel
+        env:
+          TARGET_ARCH: ${{ matrix.arch }}
+        run: |
+          if [ "$TARGET_ARCH" = riscv ]; then kernel='kernel-rv'; else kernel='kernel-la'; fi
+          make INIT_CONFIG=config/init.json "$kernel"
+      - name: Run the complete declared consumer set
+        env:
+          TARGET_ARCH: ${{ matrix.arch }}
+        run: python3 -B tests/ci/run.py --arch "$TARGET_ARCH" --suite extended
+      - name: Preserve full consumer and failure observations
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: native-extended-${{ matrix.arch }}
+          path: |
+            build/ci-run/*-extended
+            build/program-inventory-full/**/*.json
+            build/program-inventory-full/**/*.log
+            build/loongarch/program-inventory/**/*.json
+            build/loongarch/program-inventory/**/*.log
+            build/loongarch/**/*.log
+            build/loongarch/**/*.json
+            build/riscv/tty-run.*/**/*
+            build/riscv/pty-run.*/**/*
+            build/diff-abi/linux/**/build.log
+            build/diff-abi/linux/**/configure.log
+            build/diff-abi/linux/**/identity.json
+            build/loongarch/*identity*.json
+            build/qemu-la-rtc/**/meson-logs/*
+            build/network*/**/*.log
+            build/network*/**/*.json
+            build/multi-disk-rt.*/*.log
+          if-no-files-found: warn
+      - name: Preserve failed consumer disks
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: native-extended-failed-images-${{ matrix.arch }}
+          path: |
+            build/program-inventory-full/**/*.img
+            build/loongarch/program-inventory/**/*.img
+            build/riscv/tty-run.*/**/*.img
+            build/riscv/pty-run.*/**/*.img
+            build/loongarch/**/*.img
+            build/network/**/*.img
+            build/multi-disk-rt.*/*.img
+          retention-days: 7
+          if-no-files-found: ignore

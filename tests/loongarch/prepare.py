@@ -55,6 +55,11 @@ def prepare(args):
     if recorded and {key: value for key, value in recorded.items()
                      if key not in ('configuration_sha256','image_sha256')} != identity:
         raise SystemExit(f'{directory}: cache identity changed; use a fresh build directory')
+    image = directory / ('qemu-system-loongarch64' if args.component == 'tools' else 'vmlinux')
+    if recorded and (not image.is_file() or
+            hashlib.sha256(image.read_bytes()).hexdigest() != recorded.get('image_sha256')):
+        # 先拒绝损坏产物，不能让后续 make 给损坏文件重新登记合法身份。
+        raise SystemExit(f'{directory}: cached image identity mismatch; use a fresh build directory')
     if args.component == 'tools':
         if recorded is None or not (directory / 'build.ninja').exists():
             subprocess.run([str(source / 'configure'), *QEMU_OPTIONS], cwd=directory, check=True)

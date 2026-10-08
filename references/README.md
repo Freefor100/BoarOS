@@ -68,6 +68,12 @@ glibc 2.44 官方源码以 `glibc/glibc-2.44.tar.xz` 保存，SHA-256
 `tests/userland/glibc/inputs.json` 逐文件 SHA-256 固定的二进制；源码
 归档不充当这些二进制的可重复构建证明。
 
+主线 CI 的原 GNU 工具与运行时包另固定在 `toolchains/`：LA 为 Loongson
+2025.08.08 的 GCC15.1.0/binutils2.45/glibc2.42，RV 为 Arch 的 GCC16.2.1-1、
+binutils2.47-1、glibc2.44-1 和 API headers7.2-1。逐包官方 URL 与 SHA-256
+见 `sources.tsv`，2026-10-08 核对。恢复到忽略的 `build/tools/` 后仍验证原
+GNU profile，安装位置可以迁移，二进制身份与库版本不变。
+
 确需整树阅读时解包到仓库外的临时目录或已忽略的 `build/`，结束后删除。不要 `git add -f`
 恢复出的仓库、PDF、压缩包或解包树，也不要把手工下载的网页副本留在仓库其他位置成为未跟踪
 快照；要长期固定的新输入应加入 `sources.tsv`，由恢复器校验。
