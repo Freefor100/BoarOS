@@ -19,6 +19,9 @@ RV64、QEMU virt、单 hart；共用挂载/syscall 路径现也由 LA 的完整 
 路径跟随；`do_umount` 的 expiry、lazy detach 和后端 force 是不同操作。
 BoarOS 当前只接受 `MS_RDONLY/MS_SILENT`，所有非零 umount flags 返回 `ENOTSUP`。
 扩展仍未实现，非法 flags 与坏指针/路径的错误优先级也须随相应能力独立核对。
+绝对根挂载另有边界：固定 Linux 的 `do_umount` 在未请求 lazy detach 时进入
+`do_umount_root` 尝试只读重配置；BoarOS 的根挂载没有 parent/covered 边，
+普通用户态卸载返回 `EINVAL`，该路径尚未接入。
 
 普通卸载先拒绝忙引用，再停 worker、完成 I/O 和持久化，失败保留可达挂载与真实
 错误 owner。lazy detach 则需要让摘树后的实例由存活的 fd/cwd/MM 引用继续持有；

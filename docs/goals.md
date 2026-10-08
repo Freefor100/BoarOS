@@ -224,9 +224,9 @@ glibc四进程整命令仍增加0.73%。该轮的prepare读取、1547次FLUSH和
 - [x] 统一内存 owner 快照提供 Cached/MemAvailable/Shmem/Buffers/Dirty/Writeback，RV64 sysinfo 接入真实任务数和负载；无 swap/slab 回收时才返回对应零值。原 BusyBox free 与 LTP 已复验。
 - [x] 阈值驱动后台写回及低/高水位回收，专用快照页、64 槽批次、有限失败、join 退出与资源回收；不加入周期清脏，fsync 错误/flush 契约保持。见物理页/VFS 模块和内存 learning。
 - [x] 多挂载覆盖路径跨越、根和 `..`、挂载点被引用、卸载忙、跨挂载文件操作和失败交接；设备/内存/磁盘错误保持所属 owner。真实双盘延迟/写/flush 失败隔离已独立验证。
-- [x] 用户态 `mount(2)` 已接 proc/tmpfs/devpts/ext4，接受 `MS_RDONLY/MS_SILENT`；`umount2(2)` 的 flags=0 路径检查 cwd、fd、映射与子挂载忙引用，停止 worker 和在途 I/O，成功后释放实例/设备。卸载再普通挂载的验证不代表 `MS_REMOUNT` 已实现。
+- [x] 用户态 `mount(2)` 已接 proc/tmpfs/devpts/ext4，接受 `MS_RDONLY/MS_SILENT`；`umount2(2)` 的 flags=0 的非根挂载路径检查 cwd、fd、映射与子挂载忙引用，停止 worker 和在途 I/O，成功后释放实例/设备。卸载再普通挂载的验证不代表 `MS_REMOUNT` 已实现。
 - [ ] bind/rbind、move 和 shared/private/slave/unbindable 传播：先按真实消费者选择切片，明确挂载边、文件系统实例、路径/OFD/MM 各自引用与退出回收；普通路径别名或共享全局挂载树不能替代这些语义。
-- [ ] remount 与其他挂载属性：按需求补只读状态切换、`MS_NOEXEC/MS_NODEV/MS_NOSUID`、atime/同步等实际执行点，核对已打开对象、写映射、dirty/flush 与失败回滚；凭据相关属性依赖 P2e，不把设置成功当作执行权限已生效。
+- [ ] remount 与其他挂载属性：包含 Linux 根挂载普通 `umount2` 的只读重配置路径；当前 BoarOS 对绝对根挂载返回 `EINVAL`。按需求补只读状态切换、`MS_NOEXEC/MS_NODEV/MS_NOSUID`、atime/同步等实际执行点，核对已打开对象、写映射、dirty/flush 与失败回滚；凭据相关属性依赖 P2e，不把设置成功当作执行权限已生效。
 - [ ] `umount2` 的 `MNT_DETACH/MNT_FORCE/MNT_EXPIRE/UMOUNT_NOFOLLOW` 及非法 flags/坏路径的错误优先级：当前所有非零 flags 明确不支持。分别核对摘树与末引用销毁、后端停止、expiry 状态和 symlink 查找；force 不允许提前释放仍被用户或 DMA 使用的对象。固定依据见[多挂载记录](learning/memory-backed-mounts.md#基础挂载与扩展操作的边界)。
 - [ ] eventfd/timerfd 只在真实消费者提出需求后接统一 OFD，就绪、非阻塞、poll/epoll 和退出回收一起验收；signalfd 另依赖 P2c 队列。
 

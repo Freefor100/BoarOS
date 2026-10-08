@@ -39,6 +39,9 @@ RISC-V VFS 测试的内存后端覆盖内部边界；用户态 `mount(2)`/`umoun
 flags 和 flags=0 的 `umount2`；其他 flags 返回 `ENOTSUP`。bind/rbind、remount、
 move、传播、noexec/nodev/nosuid 等其他挂载属性，以及 lazy/force/expire/nofollow
 卸载未实现；所有任务共享挂载树，没有 mount namespace。剩余工作归[P1h](../goals.md#p1h-虚拟文件系统与多挂载)。
+普通卸载当前针对非根挂载；绝对根挂载没有 parent/covered 边，用户态
+`umount2("/", 0)` 返回 `EINVAL`。固定 Linux 对该情形尝试只读重配置，
+这条根挂载路径须随 remount 独立实现，内核关机的根盘收口不代替它。
 卸载先检查忙引用并标记 quiescing，阻止新操作，再停 worker、完成在途 I/O 和持久化交接。失败时挂载树、设备 claim 和错误 owner 保持可达；可重试卸载。成功后才摘树、释放最后 root handle 和实例，最终释放不再产生 I/O。
 
 `kernel_vfs_mount_root()` 根据传入块设备是否提供 `write` 回调决定只读还是读写挂载。读写 journal 挂载先 replay、校验 orphan 记录、启动日志并回收遗留 orphan，完成后才发布根路径。只读介质不能完成恢复时明确拒绝；未知必需特性、损坏日志或元数据也不能作为干净镜像继续访问。
