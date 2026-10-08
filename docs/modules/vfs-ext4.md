@@ -412,6 +412,8 @@ OFD 和控制终端保活配对，配对持有挂载 root/path 引用；挂载�
 双盘暂扣/错误隔离门禁由guest显式配置单字节控制终端，避免规范输入阻塞握手；
 `make test-multi-disk-io-riscv test-multi-disk-rt-riscv`覆盖原故障/重启和实时负载。
 runner超时保存token及guest/NBD边界现场，CI已接入原双盘目标，见[可睡眠存储](../learning/sleepable-storage.md)。
+正常及实时负载 runner 在进程退出后仍将 guest/NBD 管道读到 EOF，再检查退出状态、
+持久数据及回收基线；进程退出不意味着其输出管道已经读空。CI 归档退出状态 JSON。
 
 
 ## 缓存版本内的批量读

@@ -111,6 +111,7 @@ jobs:
             build/io-sleep-run.*/*.log
             build/multi-disk-io.*/*.log
             build/multi-disk-io.*/*-timeout.json
+            build/multi-disk-io.*/*-exit.json
           if-no-files-found: ignore
       - name: Upload failed RISC-V filesystem images
         if: failure()
