@@ -62,11 +62,10 @@ static uint32_t inode_seed(struct ext4_inode_ref *ref)
 
 static uint32_t inode_checksum(struct ext4_inode_ref *ref)
 {
-    uint32_t saved = ext4_inode_get_csum(&ref->fs->sb, ref->inode);
     uint16_t size = ext4_get16(&ref->fs->sb, inode_size);
-    ext4_inode_set_csum(&ref->fs->sb, ref->inode, 0);
-    uint32_t sum = ext4_crc32c(inode_seed(ref), ref->inode, size);
-    ext4_inode_set_csum(&ref->fs->sb, ref->inode, saved);
+    uint32_t sum = ext4_crc32c_zeroed(inode_seed(ref), ref->inode, size,
+        offsetof(struct ext4_inode, osd2.linux2.checksum_lo),
+        size > EXT4_GOOD_OLD_INODE_SIZE ? offsetof(struct ext4_inode, checksum_hi) : size);
     return size == EXT4_GOOD_OLD_INODE_SIZE ? sum & 0xffff : sum;
 }
 

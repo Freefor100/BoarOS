@@ -45,6 +45,8 @@ ext4 冷缓存 extent 读取已修正 OOM 后误释放未取得引用的问题�
 
 活 inode 的再次打开先取得现有节点资格，避免临时后端打开与关闭；创建权限通过已有句柄设置。弱路径 registry 仍不保存常驻目录项缓存。
 
+GDT/inode 的 metadata checksum 计算保持共享缓冲不变；只读交错反例保护合法查询不因另一读者的临时字段变化而误报损坏，见[时间与元数据记录](docs/learning/file-timestamps.md#共享读取中的-checksum-计算2026-10-08)。
+
 单 hart 存储等待已由运行期 IRQ 唤醒：两个不同文件冷读可同时在途，等待期间计算与无关缓存命中继续执行；OFD、inode、后端事务与退出清理各自保留 owner。八槽乱序完成、flush 屏障和超时 reset 在 legacy/modern、writeback/writethrough 四种组合验收，见[可睡眠存储](docs/learning/sleepable-storage.md)。
 
 双盘暂扣与故障隔离测试已修复单字节控制终端握手，并接入 CI 配置；本机原矩阵和 FIFO/RR 组合通过，托管 CI 状态另行核对。

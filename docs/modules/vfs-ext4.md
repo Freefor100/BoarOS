@@ -52,6 +52,14 @@ move、传播、noexec/nodev/nosuid 等其他挂载属性，以及 lazy/force/ex
 
 挂载为 lwext4 注册可选 realtime 时钟；尚未初始化时钟的纯模块环境保留原时间。`kernel_vfs_file_accessed()` 按活 inode 执行 relatime（包含页缓存命中的 read/pread），`kernel_vfs_file_modified()` 在非零写请求复制前更新时间。操作预留或已知 mount 错误当场传播；异步组登记后发生的持久化错误由 journal/mount 保留并由同步接口观察。create、目录链接/删除和 truncate 在拥有 inode 引用的后端更新相应时间；同尺寸 truncate 也走后端，unlink 后仍打开的文件不依赖路径。时间字段编码、操作时机与失败 owner 的依据见[时间戳学习记录](../learning/file-timestamps.md)。
 
+共享查询的 GDT/inode checksum 校验不临时清零 cache 字段。`ext4_crc32c_zeroed()`
+以一个或两个本地零字段计算同一 CRC，不复制整个 inode、不分配或等待；真正的修改路径
+另写入计算结果。普通 inode 与 orphan 的计算共用归一化原语，128-byte/扩展 inode
+字段规则保持原语义。布局由挂载几何验证保护，helper 的非法内部布局触发 fatal，
+损坏镜像仍按原验证返回格式/校验错误。`make test-lwext4-checksum-host` 覆盖只读输入、
+非相邻字段、非法布局和真实镜像中的重入读者；引用归还、heap owner 和独立 e2fsck
+共同验证，来源及反例见时间戳学习记录。
+
 `kernel_vfs_file_set_mode()` 通过持有的 inode handle 事务修改低 12 个权限位，
 保留类型和其余位并更新 ctime；路径入口复用同一 handle。后端
 `ext4_file_set_mode()` 不用 pathname，因此 fd 已 unlink 时仍可修改原 inode，

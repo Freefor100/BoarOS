@@ -668,6 +668,13 @@ test-lwext4-extent-host:
 test-lwext4-cost-host:
 	sh tests/lwext4-cost-host.sh
 
+.PHONY: test-lwext4-checksum-host
+test-lwext4-checksum-host:
+	@mkdir -p build/host
+	cc -std=gnu11 -O2 -Wall -Wextra -Werror -DCONFIG_USE_DEFAULT_CFG=1 -Ithird_party/lwext4/include tests/host/lwext4_checksum.c third_party/lwext4/src/ext4_crc32.c -o build/host/lwext4-checksum
+	build/host/lwext4-checksum
+	python3 -B tests/lwext4-checksum-read-host.py
+
 .PHONY: test-lwext4-cache-host
 .PHONY: test-lwext4-deep-truncate-host
 test-lwext4-deep-truncate-host:

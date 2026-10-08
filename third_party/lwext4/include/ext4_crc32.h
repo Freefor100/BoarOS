@@ -61,6 +61,12 @@ uint32_t ext4_crc32(uint32_t crc, const void *buf, uint32_t size);
  * @return	updated crc32c value*/
 uint32_t ext4_crc32c(uint32_t crc, const void *buf, uint32_t size);
 
+/* Normalize one or two 16-bit fields without modifying buf. Fields must be
+ * ordered and contained in size; second == size means no second field.
+ * Invalid internal layout is a fatal programming error. */
+uint32_t ext4_crc32c_zeroed(uint32_t crc, const void *buf, uint32_t size,
+                          uint32_t first, uint32_t second);
+
 #ifdef __cplusplus
 }
 #endif

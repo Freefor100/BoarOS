@@ -182,6 +182,30 @@ uint32_t ext4_crc32c(uint32_t crc, const void *buf, uint32_t size)
 	return crc32(crc, buf, size, crc32c_tab);
 }
 
+static inline uint32_t crc32c_zero16(uint32_t crc)
+{
+	crc = crc32c_tab[crc & 0xFF] ^ (crc >> 8);
+	return crc32c_tab[crc & 0xFF] ^ (crc >> 8);
+}
+
+uint32_t ext4_crc32c_zeroed(uint32_t crc, const void *buf, uint32_t size,
+                          uint32_t first, uint32_t second)
+{
+	if (size < 2 || first > size - 2 ||
+	    (second != size && (second < first + 2 || second > size - 2)))
+		__builtin_trap();
+	const uint8_t *bytes = buf;
+	crc = crc32(crc, bytes, first, crc32c_tab);
+	crc = crc32c_zero16(crc);
+	uint32_t offset = first + 2;
+	if (second != size) {
+		crc = crc32(crc, bytes + offset, second - offset, crc32c_tab);
+		crc = crc32c_zero16(crc);
+		offset = second + 2;
+	}
+	return crc32(crc, bytes + offset, size - offset, crc32c_tab);
+}
+
 /**
  * @}
  */

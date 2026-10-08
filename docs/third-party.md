@@ -19,6 +19,9 @@
 - 上游地址：<https://github.com/gkostka/lwext4>
 - 固定版本：`58bcf89a121b72d4fb66334f1693d3b30e4cb9c5`
 - 导入路径：`third_party/lwext4/`
+- GDT/inode 与 orphan 的 CRC 计算通过只读归一化原语跳过 checksum 字段，不再
+  临时改写输入；`make test-lwext4-checksum-host` 保护并发读者、只读输入与格式边界。
+  固定来源和反例见[时间戳背景](learning/file-timestamps.md#共享读取中的-checksum-计算2026-10-08)。
 - 导入内容：`include/`、`src/`、`LICENSE`、`README.md`、`CHANGELOG`
 - 许可证：`src/ext4_extent.c` 和 `src/ext4_xattr.c` 为 GPL-2.0-or-later，其余导入源码为 BSD-3-Clause；上游说明组合后的库受 GPLv2 约束。
 - 用途：在 BoarOS 自有 VFS 与块设备接口之后提供 ext2/3/4 磁盘格式实现。
