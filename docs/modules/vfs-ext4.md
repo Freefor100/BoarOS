@@ -4,7 +4,7 @@
 
 ## 通用边界
 
-`include/kernel/block.h` 定义同步块设备（支持读与可选写），`include/kernel/vfs.h` 定义 mount/file 对象以及根挂载、open/create、pread/pwrite、ftruncate、mkdir、unlink、rmdir、close、unmount、`kernel_vfs_fstat()` 与 `kernel_vfs_mount_is_readonly()` 查询。VFS 对外返回负 Linux errno；lwext4 的结构、全局设备名和正值 errno 不泄漏到调用者。当前有独立的 ext4、tmpfs 和 proc 实例；lwext4 共用 heap binding 按实例引用计数维护，每实例携带自己的锁上下文；进程 fd/open-file-description 位于独立的[文件资源层](kernel-files.md)，所有任务共享一棵挂载树，没有 mount namespace 隔离；命名空间修改使用可睡眠 mutex，inode、OFD 与后端各自同步。
+`include/kernel/block.h` 定义同步块设备（支持读与可选写），`include/kernel/vfs.h` 定义 mount/file 对象以及根挂载、open/create、pread/pwrite、ftruncate、mkdir、unlink、rmdir、close、unmount、`kernel_vfs_fstat()` 与 `kernel_vfs_mount_is_readonly()` 查询。VFS 对外返回负 Linux errno；lwext4 的结构、全局设备名和正值 errno 不泄漏到调用者。当前有独立的 ext4、tmpfs、proc 和 devpts 实例；lwext4 共用 heap binding 按实例引用计数维护，每实例携带自己的锁上下文；进程 fd/open-file-description 位于独立的[文件资源层](kernel-files.md)，所有任务共享一棵挂载树，没有 mount namespace 隔离；命名空间修改使用可睡眠 mutex，inode、OFD 与后端各自同步。
 
 `fs/vfs_objects.h` 定义通用实例、inode 节点、路径与后端操作表；
 `fs/vfs.c` 管理路径身份、引用、执行/写租约、记录锁、缓存及映射登记。
@@ -34,8 +34,11 @@
 完成后端事务；记录锁、OFD 和页缓存仍按各自 owner 同步。ext4 inode 仍是
 32 位，但通用 inode 标识已扩展至 64 位；ext4 适配层拒绝越界标识。
 RISC-V VFS 测试的内存后端覆盖内部边界；用户态 `mount(2)`/`umount2(2)`
-已接入 proc、tmpfs 和块设备节点识别的 ext4。普通挂载、`MS_RDONLY`、`MS_SILENT`、同点覆盖、cwd 忙引用与
-卸载恢复均经真实 U-mode 差分；bind/remount/传播和 lazy detach 返回不支持。
+已接入 proc、tmpfs、devpts 和块设备节点识别的 ext4。普通挂载、`MS_RDONLY`、`MS_SILENT`、同点覆盖、cwd 忙引用与
+卸载恢复均有真实 U-mode 验证。`kernel/syscall/mount.c` 当前只接受这两个 mount
+flags 和 flags=0 的 `umount2`；其他 flags 返回 `ENOTSUP`。bind/rbind、remount、
+move、传播、noexec/nodev/nosuid 等其他挂载属性，以及 lazy/force/expire/nofollow
+卸载未实现；所有任务共享挂载树，没有 mount namespace。剩余工作归[P1h](../goals.md#p1h-虚拟文件系统与多挂载)。
 卸载先检查忙引用并标记 quiescing，阻止新操作，再停 worker、完成在途 I/O 和持久化交接。失败时挂载树、设备 claim 和错误 owner 保持可达；可重试卸载。成功后才摘树、释放最后 root handle 和实例，最终释放不再产生 I/O。
 
 `kernel_vfs_mount_root()` 根据传入块设备是否提供 `write` 回调决定只读还是读写挂载。读写 journal 挂载先 replay、校验 orphan 记录、启动日志并回收遗留 orphan，完成后才发布根路径。只读介质不能完成恢复时明确拒绝；未知必需特性、损坏日志或元数据也不能作为干净镜像继续访问。

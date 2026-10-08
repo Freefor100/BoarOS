@@ -9,7 +9,7 @@
 `[x]` 只表示具体交付已验收；历史测量、输入身份和可重建命令归现有 learning。
 固定 Linux 位于 `references/linux`，精确版本与其他资料由 `references/sources.tsv` 管理。评审是调查输入，不自动成为实现或验收证据。
 
-## 当前状态与未关闭风险（2026-10-07）
+## 当前状态与未关闭风险（2026-10-08）
 
 N3已经交付：legacy/modern VirtIO-net、受限DMA借用与复制回退、静态IPv4＋ARP、
 有界分片重组，以及隔离宿主双向TCP/HTTP。1196条ABI、原22项网络客户端和相关系统
@@ -30,7 +30,7 @@ N3已经交付：legacy/modern VirtIO-net、受限DMA借用与复制回退、静
 | 缓存覆盖与脏范围 | 冷页完整覆盖不预读旧页，独立脏页组织与哈希选择最小候选集合，快照只复制脏段。64 MiB 成本门禁及文件/映射/交错回归通过；完整 lwext4 及 SQLite DELETE/WAL 恢复矩阵通过，候选序号未触发的条目单列于[规模记录](learning/single-hart-scale.md#冷页覆盖与脏范围2026-10-06)；块层与 VFS/ext4 八项批量读已通过真实暂扣门禁，写回 1/2/4/8 页候选已通过独立门禁，预读 0/1/2/4/8 页和取消/真实暂扣门禁已通过；默认与 RA8/WB8 的阶段七后完整 DELETE/WAL 恢复已通过；身份绑定的 TCP 27 组/存储 20 组及扩展实验共 1,218 次发布启动、184 次诊断通过，TCP 默认已按用户选择 8/4/2，存储保持 RA0/WB1；见[预算实验](learning/data-path-budget-experiments.md)。 |
 | 追加增长纠错 | 增长与截断分离；对齐增长不扫描缓存页链，非对齐增长仅处理旧尾页。1/4/16/64 MiB 成本门禁与真实文件/映射回归通过，另有匹配吞吐：64 MiB、1 KiB 缓存追加默认约 20.86 MiB/s，旧基线约 3.70；不推广成整体倍数。见[规模成本](learning/single-hart-scale.md)和[测量边界](learning/data-path-budget-experiments.md)。 |
 | epoll 交付纠错 | 完整 event 复制后提交 ET/ONESHOT；独立扫描/pending、MOD 代次与任务退出 owner 已接入。生产函数宿主边界及固定 Linux 同 RV64 ELF 验证通过；见[事件交付](learning/epoll-delivery.md)。 |
-| 双盘控制协议纠错 | 原基线 `3c34091`/`5687377` 的暂扣阶段超时已定位为规范模式终端等待行结束：host只发送单字节g，尚未出现B盘暂扣READ。guest显式设置并恢复控制终端后，暂扣/故障/重启和FIFO/RR四组合通过；最终复核还修复主动kill与NBD响应写入的收口竞态，受控cut确认后30次额外故障/重启通过。已加入CI目标，尚无本提交的托管CI结果。见[可睡眠存储](learning/sleepable-storage.md)。 |
+| 双盘控制协议纠错 | 原基线 `3c34091`/`5687377` 的暂扣阶段超时已定位为规范模式终端等待行结束：host只发送单字节g，尚未出现B盘暂扣READ。guest显式设置并恢复控制终端后，暂扣/故障/重启和FIFO/RR四组合通过；最终复核还修复主动kill与NBD响应写入的收口竞态，受控cut确认后30次额外故障/重启通过。`test-multi-disk-io-riscv` 已在托管 CI 通过；新版双架构整体门禁仍按实际 job 收口。见[可睡眠存储](learning/sleepable-storage.md)。 |
 
 [风险证据与重建](learning/cost-baseline.md#旧版内存释放与-virtqueue-告警2026-10-02)
 区分已经修复的机制与缺少历史现场的归因。固定root、单hart、QEMU和选定应用验收
@@ -140,8 +140,10 @@ glibc四进程整命令仍增加0.73%。该轮的prepare读取、1547次FLUSH和
 | LTP执行角色 | 比赛目录遍历不是上游runtest；控制器helper、上游禁用shmat1和有限shm_test分开。原libc的EINTR重试、NULL栈clone、缺unwind库或账户可先于目标syscall阻塞，见[程序证据](learning/user-program-inventory.md#ltp的准备依赖与libc边界) |
 | 所有权与接口子集 | fchown/fchownat已接入真实元数据；O_PATH和路径truncate已接入；完整凭据/权限、原生accept4仍有缺口；CPU-time clock、VIRTUAL/PROF timer、pipe容量操作、扩展clone/futex按具体子语义核对，不把已有整个模块记为缺失 |
 | 全局文件同步 | sync/syncfs接入单一挂载树、节点快照与durable等待；syncfs维护独立的挂载错误观察。void sync的程序退出码仍不能单独证明持久化，匿名对象不触及根盘，见[VFS契约](modules/vfs-ext4.md)。 |
+| mount/umount 扩展 | proc/tmpfs/devpts/ext4 的基础挂载、只读、覆盖与普通忙卸载已交付；mount 当前仅接受 `MS_RDONLY/MS_SILENT`，umount2 仅接受 flags=0。bind/rbind、remount、move、传播、其他挂载属性与 lazy/force/expire/nofollow 卸载仍未实现，分别列在 P1h；所有任务共用挂载树，尚无 mount namespace。 |
 | 用户内存/信号 | mremap、按操作madvise、mlock、sigaltstack、实时信号队列、共享文件/PI futex待真实应用需求触发 |
 | 系统与平台 | 固定root查询不等于完整凭据/权限；其他行规程、完整modem控制、外部IPv6/DNS/TLS、公网配置、SMP/实板及LA更广原程序/客体原生开发/完整Harness仍未验收，不声明完整Linux兼容或硬实时 |
+| 架构专项边界 | RV F/D 与 LA FPU/LSX/LASX 的指定状态矩阵已交付，RV V 扩展未实现，固定 LA QEMU TCG 无 LBT。RV 客体离线 C/Lua 构建与 NBD 全恢复矩阵已有验收；LA 客体原生开发和相应全断电恢复矩阵仍需独立接入，不从共同 229 项或普通 SQLite 重启结果推定完成。 |
 
 下面P/N/L小节保留稳定能力编号、契约、依赖和已有验证入口；只以上面的当前队列决定近期实施。
 
@@ -222,6 +224,10 @@ glibc四进程整命令仍增加0.73%。该轮的prepare读取、1547次FLUSH和
 - [x] 统一内存 owner 快照提供 Cached/MemAvailable/Shmem/Buffers/Dirty/Writeback，RV64 sysinfo 接入真实任务数和负载；无 swap/slab 回收时才返回对应零值。原 BusyBox free 与 LTP 已复验。
 - [x] 阈值驱动后台写回及低/高水位回收，专用快照页、64 槽批次、有限失败、join 退出与资源回收；不加入周期清脏，fsync 错误/flush 契约保持。见物理页/VFS 模块和内存 learning。
 - [x] 多挂载覆盖路径跨越、根和 `..`、挂载点被引用、卸载忙、跨挂载文件操作和失败交接；设备/内存/磁盘错误保持所属 owner。真实双盘延迟/写/flush 失败隔离已独立验证。
+- [x] 用户态 `mount(2)` 已接 proc/tmpfs/devpts/ext4，接受 `MS_RDONLY/MS_SILENT`；`umount2(2)` 的 flags=0 路径检查 cwd、fd、映射与子挂载忙引用，停止 worker 和在途 I/O，成功后释放实例/设备。卸载再普通挂载的验证不代表 `MS_REMOUNT` 已实现。
+- [ ] bind/rbind、move 和 shared/private/slave/unbindable 传播：先按真实消费者选择切片，明确挂载边、文件系统实例、路径/OFD/MM 各自引用与退出回收；普通路径别名或共享全局挂载树不能替代这些语义。
+- [ ] remount 与其他挂载属性：按需求补只读状态切换、`MS_NOEXEC/MS_NODEV/MS_NOSUID`、atime/同步等实际执行点，核对已打开对象、写映射、dirty/flush 与失败回滚；凭据相关属性依赖 P2e，不把设置成功当作执行权限已生效。
+- [ ] `umount2` 的 `MNT_DETACH/MNT_FORCE/MNT_EXPIRE/UMOUNT_NOFOLLOW` 及非法 flags/坏路径的错误优先级：当前所有非零 flags 明确不支持。分别核对摘树与末引用销毁、后端停止、expiry 状态和 symlink 查找；force 不允许提前释放仍被用户或 DMA 使用的对象。固定依据见[多挂载记录](learning/memory-backed-mounts.md#基础挂载与扩展操作的边界)。
 - [ ] eventfd/timerfd 只在真实消费者提出需求后接统一 OFD，就绪、非阻塞、poll/epoll 和退出回收一起验收；signalfd 另依赖 P2c 队列。
 
 **验证与退出**：先扩展 `tests/riscv/files_main.c` 等现有聚焦入口；当前入口为 `tests/userland/{namespace.h,metadata.h}` 与 `tests/diff-abi/{devices,namespace,metadata}.c`，均接入现有 runner。`make test-files-riscv test-vfs-riscv test-lwext4-host` → `test-userland-riscv`/`test-diff-abi-riscv`。设备、cwd、时间、统计分别解除对应真实程序阻塞，旧 ext4/pipe/epoll/COW/回收不退步；daemon 新出现的 setsid 依赖交给 P2d。

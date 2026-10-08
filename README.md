@@ -20,25 +20,28 @@ LA根盘支持modern PCI及transitional设备的modern接口，纯legacy PCI传�
 ext4 冷缓存 extent 读取已修正 OOM 后误释放未取得引用的问题；
 分配/读取失败、重试与正常回收由[VFS 模块](docs/modules/vfs-ext4.md)的独立门禁保护。
 
-当前生产路径为 **RV64、QEMU virt、单 hart、Sv39 / 4 KiB 页**。下表是已验证子集，具体接口与限制见模块文档。
+当前支持两条单核 QEMU virt 生产路径：**RV64、Sv39 / 4 KiB 页**，以及
+**LA64、LA464、16 KiB / 三级页表**。下表概括共用内核的已验证子集；
+架构启动、CPU 状态和平台接入分别见 RV 模块与[LA 模块](docs/modules/loongarch-boot.md)。
 
 | 范围 | 已有能力 | 主要边界 |
 |---|---|---|
-| 启动与内存 | OpenSBI、DTB、高半区/direct map、buddy/slab、连续页和引用回收、独立栈窗未映射 guard 页 | 无 SMP；guard 只覆盖窗口 VA 的 SP 式越界，direct-map 别名仍在；idle/boot 栈无 guard |
+| 启动与内存 | RV OpenSBI、LA 直接 ELF/EFI 启动信息；DTB/RAM 保留区、内核地址映射、buddy/slab、连续页和引用回收、独立栈窗未映射 guard 页 | 无 SMP；guard 只覆盖窗口 VA 的 SP 式越界，直接映射别名仍在；idle/boot 栈无 guard |
+| CPU 状态 | RV F/D、LA 标量 FPU/LSX/LASX 的任务切换、clone/exec 和信号保存恢复 | RV V 扩展未实现；固定 QEMU TCG 不提供 LA LBT；跨核 owner 尚未验收 |
 | 虚拟内存 | VMA、按需匿名页、共享匿名与共享文件映射、文件私有 COW、共享文件首次写追踪、`msync`、跨 MM 截断撤映射 | 无 `mremap`、按操作区分的 `madvise`、共享文件 futex、匿名共享页 swap 回收或 SMP 页表同步 |
-| ELF / exec | shebang、按需 ELF、PIE、`PT_INTERP`、初始栈/auxv、musl DSO/TLS、固定 glibc 2.44 启动/TLS/pthread及取消子集、失败保持旧映像 | 无 `execveat`；glibc 应用覆盖尚有限 |
+| ELF / exec | shebang、按需 ELF、PIE、`PT_INTERP`、初始栈/auxv、musl DSO/TLS；固定 RV glibc 2.44、LA glibc 2.42 的启动/TLS/pthread及取消子集；失败保持旧映像 | 无 `execveat`；glibc 应用覆盖尚有限 |
 | 进程与等待 | 统一 TID/TGID/PGID/SID 身份对象、会话/进程组、fork/vfork、child-TID 生命周期差分、pthread clone、线程组退出、非组长 exec、wait/zombie/reparent、时钟与睡眠、进程组 ITIMER_REAL/SIGALRM | 合法 clone 组合仍有限；串口及 Unix98 PTY 控制终端；单 hart 关中断不等于跨核同步 |
 | 调度 | OTHER tick 轮转、FIFO/RR 1–99 优先级、CPU0 affinity、RESET_ON_FORK、可配置全局实时预算及 proc 查询、到期有序索引与最早 deadline 参与 timer 重装 | 默认 1 秒 / 950 毫秒；无 nice 权重、PI、SMP 或硬实时保证 |
 | 随机数 | ChaCha20 fast-key-erasure、BLAKE2s 混种、legacy/modern VirtIO RNG、`getrandom` 与 random/urandom 字符节点 | QEMU 宿主是信任边界；DTB/用户写入不计可信熵，缺设备时保持未就绪 |
 | futex / 信号 | WAIT/WAKE/REQUEUE、超时/重启、跨 MM 共享匿名 futex、同 MM 非 PI robust-list 退出清理、标准信号、用户 handler、同步 SEGV/BUS/ILL/TRAP 故障信息与恢复、`rt_sigtimedwait` | 无共享文件 futex、PI futex、实时信号队列和 `sigaltstack`；单 hart 验证范围 |
 | 文件与事件 | fd/OFD 分离、dup/CLOEXEC、共享 offset、阻塞 pin、部分/向量/定位 I/O、匿名pipe及ext4/tmpfs命名FIFO、poll/select/epoll；传统与 OFD 记录锁；socket OFD 与读写/就绪；mknodat 字符节点按设备号接入 null、zero、console、RTC | 独立 devpts、PTY 锁定/peer 与 packet、36/44 字节 termios；无 devfs，设备 mmap 未支持 |
-| 路径与 ext4 | 共享活目录项、cwd/dirfd、普通/NOREPLACE rename、可写/只读根盘、符号链接、目录枚举、稀疏文件、显式纳秒时间、真实文件系统统计、打开后删除、私有映射截断；共享挂载树可用户态挂载/卸载 proc、tmpfs 和第二 ext4 盘，通用 linkat 硬链接，含 meminfo、uptime、self、exe/cwd/root/fd、挂载信息与首批进程 stat/status 字段 | 无 EXCHANGE/WHITEOUT 或完整权限；缺少 /dev/console 节点时的初始标准 fd 没有路径链接，meminfo 已提供真实缓存/共享/脏页/可用量，完整进程字段尚未完成 |
+| 路径与 ext4 | 共享活目录项、cwd/dirfd、普通/NOREPLACE rename、可写/只读根盘、符号链接、目录枚举、稀疏文件、显式纳秒时间、真实文件系统统计、打开后删除、私有映射截断；共享挂载树可用户态挂载/卸载 proc、tmpfs、devpts 和第二 ext4 盘，通用 linkat 硬链接，含 meminfo、uptime、self、exe/cwd/root/fd、挂载信息与首批进程 stat/status 字段 | 基础 mount/umount 已实现，bind/remount/move/传播与扩展卸载 flags 未实现；无 EXCHANGE/WHITEOUT 或完整权限；缺少 /dev/console 节点时的初始标准 fd 没有路径链接，meminfo 已提供真实缓存/共享/脏页/可用量，完整进程字段尚未完成 |
 | 内存文件 | 统一稀疏内存后备对象、tmpfs 页/inode 配额、硬链接、共享/私有映射，musl POSIX 共享内存、SysV 共享内存和 tmpfs 工作目录的离线 GCC | 无 swap、SysV 信号量/消息队列、共享文件 futex；tmpfs 不持久化 |
 | 缓存与存储 | read/write/private fault 共用文件页、inode 脏范围与定向写回、OFD 错误观察、`fsync/fdatasync/O_SYNC/O_DSYNC`；VirtIO legacy/modern 多设备独立 IRQ/队列、每实例页缓存/worker、八 span 批量读写发布与 flush 屏障 | ordered journal/replay、durable commit 与后续 checkpoint、持久 orphan；恢复承诺限于已验证块模型，已接入阈值驱动后台写回与 2%/4% 空闲水位回收，无周期清脏 |
 | 终端 | DTB ns16550 IRQ＋worker，ttyS0/console/tty、canonical/raw、termios/termios2、VMIN/VTIME、控制终端和前后台作业；Unix98 PTY/devpts、packet、真实 libc PTY API及原 BusyBox ash/stty/script/replay | 其他行规程、break 生成和完整 modem 控制未交付；固定 root、单 hart |
 | 内核日志 | 从启动保存16KiB真实内核日志、完整klogctl 0–10、消费式阻塞读、清空及console级别控制 | 当前不可变root权限模型；用户console输出与日志分离，无/dev/kmsg接口 |
 | 身份与资源 | 单用户 root 的 UID/GID 查询；线程组共享并执行 NOFILE/STACK，fork 继承、exec 保留 | 真实ext4/tmpfs/匿名pipe所有权可变，进程仍固定root；无凭据变更/完整权限；fd 硬容量 1024、栈硬容量 8 MiB；其他有效 limit 返回 `ENOTSUP` |
-| 平台与网络 | RISC-V QEMU 真实根盘可配置 PID 1（默认 `/init`） 与 musl 用户态；单 hart IPv4/IPv6 UDP/TCP loopback、双栈监听、连接选项、半关闭与向量消息，固定 lwIP 2.2.1 raw API，AF_UNIX socketpair；legacy/modern VirtIO-net、静态 IPv4/ARP、有界分片重组与隔离宿主双向 TCP/HTTP，custom pbuf RX、TX indirect+SG 零拷贝（保留复制回退）、无 NIC 时协议/OFD 定时器仍由内核 worker 推进 | 无命名 AF_UNIX 端点、外部 IPv6、公网/DHCP/DNS/TLS、完整 LA 用户环境、实板或多核验证 |
+| 平台与网络 | RV/LA QEMU 真实根盘可配置 PID 1（默认 `/init`） 与 musl 用户态；单 hart IPv4/IPv6 UDP/TCP loopback、双栈监听、连接选项、半关闭与向量消息，固定 lwIP 2.2.1 raw API，AF_UNIX socketpair；legacy/modern VirtIO-net、静态 IPv4/ARP、有界分片重组与隔离宿主双向 TCP/HTTP，custom pbuf RX、TX indirect+SG 零拷贝（保留复制回退）、无 NIC 时协议/OFD 定时器仍由内核 worker 推进 | 无命名 AF_UNIX 端点、外部 IPv6、公网/DHCP/DNS/TLS；LA 更广应用与客体原生开发、实板或多核仍未验收 |
 
 活 inode 的再次打开先取得现有节点资格，避免临时后端打开与关闭；创建权限通过已有句柄设置。弱路径 registry 仍不保存常驻目录项缓存。
 
