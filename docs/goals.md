@@ -23,6 +23,8 @@ N3已经交付：legacy/modern VirtIO-net、受限DMA借用与复制回退、静
 | extent 冷读 OOM 清理 | 真实冷缓存碎片文件已复现未取得 buffer 引用却按非零块号释放的错误；get 失败直接返回后，1/4 KiB 块与两种 inode 大小的全部分配失败点、读取失败、重试、卸载及堆引用清零通过。独立入口为 `make test-lwext4-extent-host`，没有放宽非法释放契约。 |
 | pthread取消与旧libc输入 | 原镜像动态glibc的cancel/exit缺libgcc_s；独立glibc运行环境已固定unwind依赖并保护取消/cleanup。静态cancel-points的join结果在固定Linux也失败，按库/测试契约继续核对，不能归给内核。历史偶发现场仍保留P0c边界，不安排无目的重复次数。 |
 | 内核抢占边界 | allocator修复不等于所有共享状态已审完。限定检查开中断worker到共享对象的调用链、睡眠前引用和发布临界区；发现具体错误才扩大。 |
+| buddy元数据成本 | `cfae103`与`774e2dc`的生产allocator相同；合法order-0操作涉及32768页空闲块时，分配尾检查65534次、释放尾检查65504次并重写32768条。4 KiB/16 KiB宿主参数均复现。分层块状态权威索引已选，尚未实现；成本闭环进入P6前置，不把计数当周期或吞吐。 |
+| GDT touch性能候选 | clean standalone grouped touch的undo/restore复制消除已在隔离候选验证，但完整读取还有负向观察，未合入main。主线`f325b1a`是独立checksum读者冲突修复，`774e2dc`补LA checksum根盘；本轮buddy工作不能替代GDT性能交付。 |
 | 回环入队通知纠错 | 本地端口已定义 hook，导入的 lwIP 成功入队路径漏调用；已接到完整包链发布之后。固定时钟的实际 IPv4/IPv6 协议反例保护工作检测、唤醒、晚入队及 OOM/回收，不将它作为历史吞吐差距的唯一归因。见[网络记录](learning/network-ownership.md#成功回环入队必须通知工作-owner2026-10-08)。 |
 | TX 完成进展纠错 | worker先收割并释放完成槽，再推进协议；睡眠前覆盖SG与复制路径的新容量。宿主顺序/关闭窗口、真实两种TAP传输和无NIC定时器验证通过；见[网络owner](learning/network-ownership.md)。 |
 | 就绪查询与协议服务 | poll 为局部只读快照，短 syscall 与后台 worker 共用有界服务；协议池/NIC/接收堆归还按代次通知等待者。模型与真实 RV64 验证见[网络记录](learning/network-ownership.md#纯就绪与有界协议服务2026-10-05)，接纳 reservation 已接入 TCP 流复制；27 组窗口/池/堆实验已完成，默认预算部分负载吞吐回退，控制尾延迟与资源峰值分开列于[预算结果](learning/data-path-budget-experiments.md)。 |
@@ -38,7 +40,28 @@ N3已经交付：legacy/modern VirtIO-net、受限DMA借用与复制回退、静
 
 ## 近期方向
 
-本轮单核数据路径阶段一至七已交付，保留以下由测量暴露的后续边界：默认 TCP 预算在部分 bulk/高并发负载吞吐回退；全局协议资源不足后的复制与重试仍有成本；WB8 可能降低仅缓存完成的小写速度。优先按[匹配结果](learning/data-path-budget-experiments.md)选择目标程序和候选，网络默认已按用户选择调整到 8/4/2，存储保持 RA0/WB1。受控延迟补测和具体原程序问题由兼容分支记录；双架构原盘固定容器调用已在oscomp-compat完成，剩余失败和总预算未到达另列，不能计为全部测例通过。
+下一条架构主线转向SMP，采用有明确退出条件的前置工作，再逐步开放并行执行。
+2026-10-08外部审查已对照当前main核实；本轮选择分层块状态权威索引，范围为buddy
+成本闭环、必要观测、宿主门禁修正和同步契约，跨核原语与等待实现进入下一轮。
+时间观测先复用RV，LA保留真实功能/回收及16 KiB工作量验收；具体任务见P6前置。
+
+| 顺序 | 独立交付与进入下一步的条件 |
+|---|---|
+| A：本轮成本与契约 | 小请求不扫描/重写无关大块；保留非法owner与权威损坏fatal，双架构回归与资源基线通过；完成四类同步、等待及用户页生命周期契约。不开第二核。 |
+| B：同步基础实现 | raw短锁与可睡眠锁、上下文断言、CPU本地/current接口、等待登记/唤醒/取消/销毁交接通过强制交错与真实并发模型；单核退化配置继续通过。 |
+| C：RV两核基础 | 独立secondary入口/栈，BSS只初始化一次；CPU本地trap/timer/FPU、IPI、远程wake及全局runqueue，证明同任务不双核运行、idle可被唤醒及可信栈回收。 |
+| D：共享用户空间与子系统 | MM/uaccess/pin/COW、活动CPU、远端TLB确认后回收与退出、OFD/cache/DMA并发一起验收；完成前不开放共享MM用户线程跨核并行。 |
+| E：组合与LA | RV2→4核、低内存、故障与真实程序组合稳定后接LA CPU启动/IPI/TLB/状态保存，架构结果分列；再以锁等待和CPU分布决定并行优化。8核属后续扩大。 |
+
+机制扩展按真实消费者成为独立任务，sigaltstack/eventfd/timerfd等不作为SMP的无穷
+前置清单。resident范围选择是下一项有证据的规模优化，可在A后独立切片，不阻塞
+全部同步基础；不同时树化VMA/驻留记录/反向映射。调度算法、ASID性能、每核allocator/
+runqueue、全面零复制、网络窗口和磁盘队列深度不进入本轮。
+
+单核数据路径阶段一至七已交付，默认TCP预算吞吐回退、全局协议资源成本和WB8小写
+回退仍保留为证据触发支线，见[匹配结果](learning/data-path-budget-experiments.md)。
+网络保持8/4/2，存储保持RA0/WB1；受控延迟和原程序问题留在兼容分支。
+原盘容器结果的剩余失败与总预算未到达不能计为全部测例通过。
 
 文件元数据的活inode复用、创建句柄初始化、O_PATH与路径truncate已交付，通用实现
 已单向合入兼容分支。路径资格、睡眠前节点引用、初始时间与显式改权的区别、截断属性
@@ -62,7 +85,7 @@ Unix98 PTY、独立 devpts、peer 打开、packet 模式和 PTY/串口 termios2 
 通用修复继续先落main再单向合入；共同/proc/cpuinfo等真实接口缺口按消费者跟进，
 Bash/Perl及控制器环境另定范围。客体原生开发随后独立验收。
 完整凭据/权限、运行时网络配置和无 RNG 平台的可信熵接入由目标应用确定交付范围；
-LA 更广用户环境继续按真实消费者验收，SMP 单独规划。
+LA更广用户环境继续按真实消费者验收；SMP按上述有限前置与分阶段正确性路线推进。
 
 2026-10-05 第三方审计已逐条核实（对照 5c82103 与当前工作树）：机制描述基本属实，
 性能数字全部可溯源但存在口径混用；其归纳的基础问题与仓库已知边界一致，建议中的
@@ -415,7 +438,65 @@ glibc四进程整命令仍增加0.73%。该轮的prepare读取、1547次FLUSH和
 
 ## P6：SMP、TLB 与中断/I/O 并发
 
-**前置与入口**：共享对象和线程契约已有单 hart 回归，平台具备可验证的 IPI/timer/IRQ 入口。`kernel/sched/{core.c,wait.c,process.c,futex.c}`、`kernel/physical_page.c`、`mm/heap.c`、`fs/{page_cache.c,vfs.c}`、`arch/riscv/{context.c,trap.c,mm.c,sv39.c}` 及设备后端。锁/每核/远端 TLB 接口数量由真实消费者决定，路线仍待确认。
+**前置与入口**：共享对象和线程契约已有单hart回归；当前secondary启动、架构IPI及
+远端TLB确认尚未交付，不能把本地timer/IRQ当作这些能力。入口仍是调度、allocator/
+heap、MM/uaccess、VFS/cache和各架构后端。当前只确认A的表示与范围，B以后进入各
+阶段前收口实现接口和锁序；粗粒度同步优先于并行吞吐，保留全局runqueue与串行lwIP核心。
+
+### P6前置：有界分配成本与同步契约
+
+按以下独立提交收口，每个阶段同步检查README、模块与learning；临时plan/spec不入库。
+
+1. **宿主门禁。** CI测试将“启动前超时”和“已输出后的超时”分开：前者允许空日志，
+   后者用fixture内的ready握手再检验超时与日志保留；不改变正式runner预算，不靠重试。
+   程序清单host fixture显式覆盖guest库路径，另断言真实guest仍使用固定环境；
+   不修改原程序、libc或guest驱动的运行语义。
+2. **buddy表示与成本。** 各usable range按物理自然对齐分为buddy根，根目录有序二分；
+   每根使用隐式完整二叉树、64位节点索引和3-bit打包状态，区分inactive/free/split/allocated/
+   internal。子状态准备完成再发布split，合并退休子节点再发布free。活跃块头保留链与
+   引用载荷，旧尾载荷不作为owner；不得跨range/保留区合并。bootstrap接口及一次性
+   finalize不变，新树/根目录计入自托管metadata，溢出/不足时原对象和输出保持。
+3. **检查与审计。** 热路径验证相关权威节点、几何、引用和双向连接，避免全尾扫描与
+   最终合并块重写；保留wrong-order、tail、double-free、internal、引用及权威损坏fatal。
+   显式新增 `enum physical_page_status physical_page_allocator_audit(const struct physical_page_allocator *)`，
+   返回既有status：非法参数INVALID、未finalized为STATE、合法为OK，权威损坏fatal。
+   不分配、回收或I/O，固定深度栈迭代验证活跃树、链和计数；仅在发布前/独占隔离实例
+   执行，不从运行期统计触发长IRQ-off全审计。原私有布局故障用例改为等价权威破坏，
+   不删除非法所有权反例。
+4. **工作量与时间。** 增加COST的 `page_meta_checked`、`page_meta_written`（逻辑条目）
+   及 `allocator_meta_ticks`（元数据区间总时间/样本数/最大值），默认编译关闭；批量清零/
+   复制按实际逻辑记录累计，不能只计新getter。三项均用现有非直方图counter，保留
+   既有metric/schema与64 KiB聚合预算，避免新增完整三lane直方图越界。沿用RV的IRQ-off、
+   rank持锁及wake-to-run；窗口不含压力I/O等待。结构界允许请求自身的页数N与树深度H
+   成本，不允许随无关大块B线性增长；拟定检查预算为 `32*(H+1)^2+16*N+64*(L+1)`，
+   重写预算为 `8*(H+1)+4*N`，L为根目录二分层数，计数口径写入模块。实施时须以
+   最坏路径分析核实该上界，当前未验证新表示能满足它，不能为失败样本放宽成O(B)。
+   固定用户ELF/工作负载、工具链、配置和预热状态，旧/新/返回旧核各三启动，分开报告observer开销、
+   关中断max/分布和任务唤醒延迟，不以宿主计数宣称吞吐倍数或硬实时。
+5. **同步契约与退出。** 在接口邻近说明本地IRQ、禁止抢占/迁移、raw短锁、可睡眠对象
+   锁的职责、阻塞资格和owner；盘点IRQ-off内显式调度及压力回调，禁止机械替换。
+   等待合同覆盖条件检查→登记→释放保护→阻塞提交→资格交接/唤醒，timeout/cancel/
+   destroy须持有仍存活的注册与队列owner。MM合同覆盖查PTE与取得pin的同一保护、
+   fault睡眠后重查、片段级权限/复制前缀及活动CPU/TLB确认后释放；本轮不实现跨核锁
+   或改变当前uaccess行为，不宣称SMP-ready已经完成。
+
+**门禁。** 新增 `test-allocator-cost-host`，4 KiB/16 KiB下用公开API先保留大块、
+耗尽其他空闲页再释放大块，强制下一次单页split/coalesce；GCOV附件只作为历史调查。
+覆盖64/512/4096/32768页、碎片/多range/边界、order0共享引用、高阶owner、finalize
+失败不发布、压力重入及资源归零；完整审计与随机操作的独立页owner模型交叉核对。
+更大规模沿同一代数上界验收，不固定私有调用数。
+
+窄测试先跑allocator release/preemption、page/heap/MM/uaccess/scheduler与COST，再扩大
+到 `test-riscv`、LA512 MiB/1 GiB真实根盘/用户态、两侧glibc与1366 ABI、两侧栈检查及
+受影响的存储/设备组合。沿用RV512 MiB/1 GiB/16 GiB启动的metadata精确核对。
+新资源基线以新metadata实际占用和预热状态计算，不要求偶然页数与旧表示相同。
+只有有界成本、所有权/回滚/抢占、双架构组合及资源收口同时成立，A才完成；本轮
+规划核实没有重新执行这些客体门禁，原24目标审核、当前四个host目标与后续结果分列。
+
+本轮按“host门禁修正→buddy实现与新成本门禁→匹配观测→契约和最终回归”提交。
+若allocator跨MM/cache/设备消费者出现失败，先最小复现并修复，再扩大重跑；不以
+旧owner基线或简单marker判定新表示成功。通用修复沿main，AI trailer按贡献规则；
+push与进入B由维护者决定。结果核对后预览并执行prune，保留工具/运行时缓存及未关闭现场。
 
 ### P6a 每核运行状态
 
@@ -425,6 +506,9 @@ glibc四进程整命令仍增加0.73%。该轮的prepare读取、1547次FLUSH和
 
 ### P6b 锁、等待与中断规则
 
+- [ ] 在A契约基础上实现跨核raw短锁、可睡眠锁与CPU本地状态断言；raw锁下不得阻塞。
+  真实并发模型与强制交错覆盖登记之前/之后的wake、timeout/cancel/销毁，不漏wake、
+  不重复授予、不在退出后访问注册；不能以单线程顺序模型替代内存序与多核验证。
 - [ ] 列出哪些锁可在 IRQ 中获取、哪些允许睡眠、锁顺序及关中断范围；本地 SIE 不保护另一核，不能只把 refcount 改成原子就宣称 SMP 安全。
 - [ ] futex compare→登记→阻塞由同桶/等价同步协议保护；跨核 wake 与入队、timeout、signal、clear_tid 对撞不漏唤醒，不重复运行或摘队。
 - [ ] 缺页/设备 I/O 可能睡眠，不能持 spinlock 调 lwext4 或等磁盘；退出/取消期间，阻塞原栈释放已 pin 对象，IRQ 路径不做复杂生命周期回收。
@@ -449,7 +533,9 @@ glibc四进程整命令仍增加0.73%。该轮的prepare读取、1547次FLUSH和
 
 ### P6f 多核验收矩阵
 
-- [ ] 2→4→8 hart 各自重复：同页 COW、同文件页 fault、读写与 unmap/truncate/mprotect、wake 与入队、I/O 中 exit_group、fd 关闭/复用、内存耗尽与退出回收。
+- [ ] RV2→4 hart依次验证同页COW、同文件页fault、读写与unmap/truncate/mprotect、
+  wake与入队、I/O中exit_group、fd关闭/复用、OOM与退出回收；稳定后LA独立接入，
+  8 hart列为后续扩大，不从RV某核数的通过推断LA或其他配置。
 - [ ] 每一核数记录固定输入、重复次数、失败种类、泄漏/重复释放和同任务双核运行检查；保留单 hart 对照定位通用 ABI 与跨核错误。
 - [ ] 正确性收口后进入 P7 并行构建；不先替换为 EEVDF。只有饥饿/公平性或性能证据要求时，再比较调度策略。
 
@@ -458,7 +544,7 @@ glibc四进程整命令仍增加0.73%。该轮的prepare读取、1547次FLUSH和
 - [x] 已选择并交付独立栈窗口：guard 为不建 PTE 的 4 KiB 页（无物理 owner），窗口骨架构建期预留、运行期 map/unmap、空表释放；direct-map 别名与 idle/boot 栈的保护边界记入[调度模块](modules/kernel-scheduler.md)与[Sv39](modules/riscv-sv39.md)。
 - [x] 受控越界由 `make test-stack-guard-riscv` 验证：任务先写映射页，再写 guard 立即产生 store page fault（scause=0xf、stval=guard）；canary、高水位、`test-stack-usage` 与可信栈回收规则保留。
 
-**验证与退出**：拟新增 `tests/userland/smp_memory.c`、`tests/userland/smp_wait.c`、`tests/riscv/ipi_tlb_main.c` 与对应多 hart runner；保留 `test-riscv`、`test-userland-riscv`、`test-stack-usage` 的单 hart 门禁。2/4/8 核各自有重复正确性和资源基线证据，不能由某一核数或 multi-hart boot 推定其余配置。
+**验证与退出**：拟新增 `tests/userland/smp_memory.c`、`tests/userland/smp_wait.c`、`tests/riscv/ipi_tlb_main.c` 与对应多hart runner；保留双架构单核门禁。先RV2核闭环，再4核及LA各自重复正确性/资源检查，8核另扩大；multi-hart boot不能替代任一阶段。
 
 ## N：socket 与网络支线
 
@@ -593,6 +679,7 @@ PCI共享INTx、ext4读写/只读、原BusyBox七个applet及musl组合ABI的固
 | P4a 共享匿名 | 已选择并交付②：专用对象按索引惰性发布页，保持稀疏分配并提供稳定身份；急切分配会改变 lazy/OOM 成本。后续已迁移到统一 memory_object，匿名跨 MM futex 与共享文件页已交付；共享文件 futex 仍待设计。 |
 | P3b 持久化 | 用户已选择并交付逐 inode dirty/error、定向写回和真实 flush；共享事务可提交关联元数据，不主动全量写回无关文件。 |
 | P3d 恢复 | journal/replay 与持久 orphan 已启用并验收；故障模型、限制和复现命令见 VFS 模块。 |
+| P6前置 buddy成本 | 2026-10-08已选分层块状态权威索引；保守去重复/部分重写仍留下O(B)扫描，块头加位图路线的完整审计发现时点变化更大，均未选。本轮只交付buddy成本与同步契约，RV时间观测＋LA功能/工作量；表示与新成本门禁尚未实施。 |
 | P6 SMP：当前 SIE 串行化，缺远端 TLB 确认 | ① 进程态对象先用粗粒度可睡眠锁、IRQ/队列另设短锁，验证较少但并行有限；② MM/OFD/cache/队列对象锁直接演进，锁顺序/取消成本更高。先盘点消费者和睡眠边界再选，临时启动大锁有退出条件。 |
 | 单 hart ASID：当前 ASID 0，换根前后各一次全局 fence | 已调查并推迟到实板：固定 QEMU 无 ASID 化 TLB（satp 变化与任意 sfence.vma 均全刷、翻译不使用 ASID），收益不可观测，且收窄 fence 的正确性缺陷会被 QEMU 全刷掩盖；在 ASID 标签 TLB 的硬件（L4）上实现并验证 ASIDLEN 与复用顺序。 |
 | P6g 栈 guard：连续物理栈、canary/高水位 | 已选择①并交付：独立内核栈窗口（12 KiB 槽＝4 KiB 未映射 guard＋8 KiB 栈），运行期插/删叶、空表释放；见已交付表。direct-map 别名与 idle/boot 栈的边界见[调度模块](modules/kernel-scheduler.md)。 |

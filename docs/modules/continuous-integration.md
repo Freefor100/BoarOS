@@ -8,6 +8,12 @@ LS7A RTC 补丁。组合 runner 的通用 fixture 明确使用 `INIT_CONFIG=conf
 main push 和手动执行等待同组正在运行的 workflow 收口；只保留最新 pending
 执行。PR 继续取消同组旧执行，main 的固定环境冷构建可以先完成并保存缓存。
 
+2026-10-08外部审核发现两个host fixture假设：子Python未必能在100ms预算前打印，
+guest的`LD_LIBRARY_PATH=/lib:/`可能令host程序装载错误libc。本机11/29例通过不能
+排除这些环境问题。近期修正只改变host测试：启动前超时允许空输出，带输出的超时
+用明确ready握手验证；host执行显式使用host环境，guest驱动保持原环境。
+正式runner的预算、超时失败与日志保存契约不因此放宽，详细任务归[近期队列](../goals.md#p6前置有界分配成本与同步契约)。
+
 ## 常驻门禁
 
 | Job | 内容 |

@@ -23,6 +23,13 @@
 
 公共 scheduler 头不暴露 Trap Frame；架构 clone 入口由 `include/arch/task.h` 选择，旧 RV 入口保留包装。syscall 通过不透明 task 接口取得 TID/TGID/PPID 和资源，不直接修改调度私有字段。
 
+当前锁、等待队列和调度元数据依赖单CPU中断纪律。`KERNEL_IRQ_SCOPE`既不是跨核锁，
+也不禁止显式阻塞；已有mutex/RWlock在该范围内登记等待并调度，不能整体换成raw
+spinlock。SMP前置契约区分本地IRQ、禁止抢占/迁移、跨核短锁及可睡眠对象锁；
+条件检查、登记、释放保护、阻塞提交和wake必须形成一次交接，并覆盖timeout/cancel
+和队列销毁时的真实owner。现有rank/key与先授予资格再唤醒继续保护；本轮仅盘点和
+定义契约，跨核原语及等待实现留在[下一阶段](../goals.md#p6b-锁等待与中断规则)。
+
 ## 策略、就绪队列与 RT 预算
 
 OTHER 保留 100 Hz tick 轮转，内核 worker 使用 OTHER。FIFO/RR 的用户优先级为 1–99，数值越大越优先；FIFO 不因 tick 同级轮转，RR 每片 100ms，按实际在 CPU 上运行的纳秒扣除。更高优先级抢占、阻塞和 yield 不重新赠送 RR 时间片；耗尽后才重装。唤醒及策略修改标记 need_resched，在 IRQ 或返回用户态的安全边界切换。降优先级排到新级队首，升优先级排队尾，同级修改保留位置；高优先级抢占的当前任务回原级队首。

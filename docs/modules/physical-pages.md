@@ -12,7 +12,8 @@
 | `tests/riscv/physical_page_main.c`、`tests/page-riscv.sh` | 构建并运行独立的 QEMU 聚焦测试内核 |
 | `tests/host/allocator_release.c` | 独立子进程验证非法释放 fatal 和各 guard 的失败诊断 |
 
-RISC-V64 构建固定 `BOAROS_PAGE_SHIFT=12`。初始化把每个字节粒度可用区间
+共用实现按构建目标使用RV64的 `BOAROS_PAGE_SHIFT=12` 或LA64的14。
+初始化把每个字节粒度可用区间
 向内收缩到完整页，拒绝溢出、乱序或重叠输入；不足一页的碎片被忽略。失败不会
 修改调用者已有的分配器状态。
 
@@ -81,13 +82,22 @@ finalized 的 order-0 页可用 `physical_page_acquire()` 增加 32 位引用，
 重复释放检测仍会扫描临时回收链；这条路径只服务最终页表建立前的硬件迁移。
 finalize 初始化逐页 metadata，成本为 O(物理页数)，但每次启动只发生一次。
 
-finalized 分配最多检查 32 个 order；free-list head 的插入和双向摘链为 O(1)，split
-与 coalesce 为 O(order)，不会扫描同 order 的其他空闲块。为了让 interior release 和
-resolve 能精确判定所有权，分配或释放 order N 块还会更新本次块内 `2^N` 条状态；
-常用 order-0 热路径只更新一个页记录，acquire/非末 release 也只修改该页引用数。
+finalized分配最多搜索32个order，已知块的链指针修改不遍历同order链表；这不等于
+整个分配/释放操作只有O(order)工作。`free_block_valid()`检查块内全部尾记录，
+候选预检、摘链及插入已有head的验证可能重复扫描；末引用释放在coalesce后按最终
+合并order重写整块。令涉及的空闲/合并块页数为B，order-0分配及末引用释放仍可能
+执行O(B)元数据操作。只有分配最后的allocated标记、acquire及非末release是单页更新。
+当前main的64/512/4096/32768页反例在4 KiB及16 KiB宿主参数下已复现，
+计数与适用边界见[内存学习记录](../learning/memory-management.md#buddy-元数据成本核实2026-10-08)。
 分配热路径只发布阈值唤醒，不扫描缓存或执行 I/O；首次分配失败才同步扫描干净缓存。当前单 hart 仍会在开中断的内核线程中发生 timer 抢占。一次 buddy 摘链、split、
-分配发布或 release/coalesce，以及引用更新和一致性读取，均由保存/恢复 SIE 的短临界区
-保护。SMP 接入前仍须把这些边界升级为跨核锁。
+分配发布或release/coalesce，以及引用更新和一致性读取，均由保存/恢复本CPU中断
+状态的临界区保护；当前没有该临界区的固定时间上界。SMP接入前仍须建立跨核同步。
+
+已选的后续表示是按物理自然对齐分解的隐式buddy森林，以free/split/allocated/internal
+块状态作为权威；小请求只检查相关路径和活跃块头，完整一致性由显式审计保护。
+这是[近期实施计划](../goals.md#p6前置有界分配成本与同步契约)，尚未改写生产实现。
+不能先删除现有尾校验并把新表示或有界成本记成已交付；非法释放、引用、链和权威状态
+损坏的fatal契约继续保持，私有布局故障注入需随权威表示更新。
 
 绑定前只允许顺序发放从未释放过的页；合法 bootstrap 释放完成即返回。越界、重复或
 不属于当前 owner 的释放触发 fatal trap。
