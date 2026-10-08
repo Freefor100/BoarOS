@@ -52,8 +52,8 @@ class ProtocolTests(unittest.TestCase):
     def test_loongarch_all_four_native_streams_are_checked(self):
         for corrupt_last in (False,True):
             with self.subTest(corrupt_last=corrupt_last), tempfile.TemporaryDirectory() as directory:
-                base=Path(directory);kernel=base/'kernel';program=base/'program';linux=base/'vmlinux'
-                for path in (kernel,program,linux):path.write_bytes(b'model input')
+                base=Path(directory);kernel=base/'kernel';program=base/'program';linux=base/'vmlinux';qemu=base/'qemu'
+                for path in (kernel,program,linux,qemu):path.write_bytes(b'model input')
                 (base/'.config').write_text('CONFIG_16KB_3LEVEL=y\n')
                 (base/'boaros-identity.json').write_text(json.dumps({'revision':'pin','image_sha256':harness.digest(linux)}))
                 manifest=base/'cases.txt';manifest.write_text('result\n')
@@ -68,7 +68,7 @@ class ProtocolTests(unittest.TestCase):
                         good+='LA root owners released\nLA PID 1 exited reason=0x0000000000000001 status=0x000000000000002a\n'
                     path.write_text(good)
                 args=SimpleNamespace(arch='loongarch',memory=['512M','1G'],kernel=kernel,program=program,
-                    linux_kernel=linux,case_manifest=manifest,output=base/'run',timeout=1)
+                    linux_kernel=linux,case_manifest=manifest,output=base/'run',timeout=1,qemu=str(qemu))
                 with patch.object(harness,'source_info',return_value=('url','pin')), \
                      patch.object(harness,'fixture',side_effect=fixture), \
                      patch.object(harness,'run_logged',side_effect=logged), \
@@ -78,7 +78,9 @@ class ProtocolTests(unittest.TestCase):
                     else:harness.run(args)
                 self.assertEqual(len(calls),4)
                 self.assertEqual([row[row.index('-m')+1] for row in calls],['512M','1G','512M','1G'])
-                self.assertEqual(json.loads((base/'run/metadata.json').read_text())['status'],'failed' if corrupt_last else 'passed')
+                metadata=json.loads((base/'run/metadata.json').read_text())
+                self.assertEqual(metadata['status'],'failed' if corrupt_last else 'passed')
+                self.assertEqual(metadata['qemu_sha256'],harness.digest(qemu))
 
     def test_cache_reuse_validates_image_and_config(self):
         with tempfile.TemporaryDirectory() as directory:

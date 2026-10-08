@@ -101,6 +101,7 @@ def run(transport, cache, fault):
             cut_acks = set()
             verified_text = None
             deadline = time.monotonic() + 90
+            # 进程退出后管道仍可能留有串口和 NBD 尾部，必须读到 EOF。
             while selector.get_map() and time.monotonic() < deadline:
                 for key, _ in selector.select(.2):
                     chunk = key.fileobj.read(4096)
@@ -161,8 +162,6 @@ def run(transport, cache, fault):
                                 server.stdin.write(b'cut\n')
                         if cut_acks == {'a', 'b'} and guest.poll() is None:
                             guest.kill()
-                if guest.poll() is not None and (not cutting or cut_acks == {'a', 'b'}):
-                    break
             check_progress_timeout(guest, work, int(reboot), logs, tokens,
                 {'held': held, 'released': released, 'progressed': progressed,
                  'actual_fault': actual_fault, 'isolated': isolated,
@@ -254,6 +253,7 @@ def run_rt(transport, cache):
         active = None; progressed = False; observed = set(); completed = set()
         hold_acks = set()
         deadline = time.monotonic() + 120
+        # 回收记录也属于验收输入，进程退出不能代替管道 EOF。
         while selector.get_map() and time.monotonic() < deadline:
             for key, _ in selector.select(.1):
                 chunk = key.fileobj.read(4096)
@@ -286,7 +286,6 @@ def run_rt(transport, cache):
                         assert active == int(line.rsplit(b'=', 1)[1]);progressed = True
                     if progressed and all((disk, event) in observed for disk in ('a', 'b') for event in ('READ', 'WRITE', 'FLUSH')):
                         completed.add(active);active = None;progressed = False;send_token(guest, tokens, label, line)
-            if guest.poll() is not None: break
         check_progress_timeout(guest, work, 'rt', logs, tokens,
             {'active_policy': active, 'completed_policies': sorted(completed),
              'hold_acks': sorted(hold_acks), 'observed': sorted(observed),
