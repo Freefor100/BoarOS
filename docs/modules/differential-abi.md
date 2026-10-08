@@ -105,6 +105,8 @@ make test-diff-abi-riscv
 
 宿主协议测试包含刻意错误返回值/errno、数据、size、offset、signal，缺失/重复
 结果和实际子进程 timeout/nonzero，确保比较器不会将未执行或不完整运行当作成功。
+LA 四路输出的宿主模型自建内核、ELF、Linux 和 QEMU 身份 fixture，不依赖本机
+LA 模拟器缓存；真实 runner 仍校验选定 QEMU 的内容、权限和链接目标。
 此入口验证明确案例子集，不代表完整 Linux ABI 或尚未实现架构通过。
 
 ## 固定 reference 的已知限制
