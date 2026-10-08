@@ -59,3 +59,9 @@ exec/setup errno；host 编译开启 Fortify，另有一次中断后的真实错
 独立 inventory 入口还因架构 import 把 `tests/` 放到本目录前面，误导入另一个
 `environment.py`。保留脚本目录优先级后，29 项 inventory host 测试在本机和
 Ubuntu 均通过；严格原程序执行仍单独判定，入口修复不等于程序通过。
+
+首次 LA 冷环境准备超过 45 分钟；它包含 QEMU、两个 Linux 配置与整数 GCC/musl
+的源码构建。main 新 push 不再取消正在构建的环境，最新 pending 执行随后使用
+精确缓存；PR 继续取消旧执行。并发依据为
+[GitHub workflow concurrency](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/control-workflow-concurrency)
+（2026-10-08 访问）；这是缓存生产生命周期的调整，未放宽 job 的通过条件或预算。
