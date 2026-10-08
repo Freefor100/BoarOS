@@ -127,6 +127,9 @@ LA_MUSL_CC := $(LA_BUILD)/musl-root/bin/musl-gcc
 $(LA_BUILD)/root-probe: tests/loongarch/root_probe.c prepare-la-userland
 	REALGCC=$(abspath $(LA_USER_CC)) $(LA_MUSL_CC) $(LA_FLAGS) -O2 -static -Wall -Wextra -Werror -Wl,-z,max-page-size=16384 -o $@ $<
 test-root-loongarch: $(LA_BUILD)/root-probe
+.PHONY: test-root-checksum-loongarch
+test-root-checksum-loongarch: kernel-la $(LA_BUILD)/root-probe prepare-la-tools
+	python3 -B tests/loongarch/root.py --qemu $(QEMU_LOONGARCH64) --cc $(LA_CC) --smoke --metadata-csum
 $(LA_BUILD)/root-oom-%.o: tests/loongarch/root_oom.c
 	$(LA_CC) $(LA_CPPFLAGS) $(LA_CFLAGS) -DROOT_OOM_CASE=$* -c $< -o $@
 $(LA_BUILD)/kernel-root-oom-%: $(LA_BUILD)/root-oom-%.o $(LA_OBJECTS) arch/loongarch/linker.ld

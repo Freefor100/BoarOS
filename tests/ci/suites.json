@@ -18,7 +18,7 @@
       {"name":"signals-threads","targets":["test-signal-loongarch","test-pthread-loongarch","test-pthread-oom-loongarch"]},
       {"name":"cpu-state","targets":["test-fpu-loongarch","test-simd-loongarch"]},
       {"name":"dynamic-exec","targets":["test-dynamic-loongarch","test-exec-errors-loongarch"]},
-      {"name":"pci-root","targets":["test-block-loongarch","test-root-loongarch"]},
+      {"name":"pci-root","targets":["test-block-loongarch","test-root-loongarch","test-root-checksum-loongarch"]},
       {"name":"abi","targets":["test-diff-abi-loongarch"]},
       {"name":"stack-report","targets":["test-stack-usage-la"]}
     ]

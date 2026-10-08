@@ -15,10 +15,11 @@ ROOT=Path(__file__).resolve().parents[2]
 def execute(command):
     subprocess.run(list(map(str,command)),check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
 
-def disk(directory,program,busybox=None,case='normal'):
+def disk(directory,program,busybox=None,case='normal',metadata_csum=False):
     image=directory/(case+'.img')
     with image.open('wb') as output: output.truncate(64*1024*1024)
-    execute(['mkfs.ext4','-q','-F','-b','4096','-O','^metadata_csum,^64bit,^orphan_file',image])
+    features='metadata_csum,64bit,^orphan_file' if metadata_csum else '^metadata_csum,^64bit,^orphan_file'
+    execute(['mkfs.ext4','-q','-F','-b','4096','-O',features,image])
     def edit(text): execute(['debugfs','-w','-R',text,image])
     if case!='missing':
         executable=program
@@ -40,7 +41,10 @@ def main():
     parser.add_argument('--cc',default='loongarch64-unknown-linux-gnu-gcc');parser.add_argument('--kernel',default='kernel-la');parser.add_argument('--program',type=Path,default=Path('build/loongarch/root-probe'))
     parser.add_argument('--busybox',type=Path,default=Path('build/loongarch/busybox-source/busybox/busybox'))
     parser.add_argument('--linux',action='store_true');parser.add_argument('--smoke',action='store_true')
+    parser.add_argument('--metadata-csum',action='store_true',help='checksum/64bit normal-root smoke profile; default fixture remains unchanged')
     parser.add_argument('--fault-program',type=Path);parser.add_argument('--oom-kernel');args=parser.parse_args()
+    if args.metadata_csum and not args.smoke:parser.error('checksum profile currently requires normal-root --smoke')
+    if args.metadata_csum and (args.fault_program or args.oom_kernel):parser.error('checksum normal-root profile cannot use fault/OOM fixtures')
     directory=Path(tempfile.mkdtemp(prefix='root-run.',dir=ROOT/'build/loongarch'))
     cases=['normal','transitional'] if args.linux else ['normal'] if args.smoke else ['normal','transitional','readonly','missing','nonexec','wrong-arch','corrupt','legacy']
     initrd=None
@@ -55,7 +59,7 @@ def main():
     expected={'missing':-2,'nonexec':-13,'wrong-arch':-8,'corrupt':-117,'legacy':-95}
     for memory in ('512M','1G'):
         for case in cases+(['userfault'] if args.fault_program and not args.linux else [])+(['oom'] if args.oom_kernel and not args.linux else []):
-            image=disk(directory,args.fault_program if case=='userfault' else args.program,args.busybox if args.busybox.exists() else None,case)
+            image=disk(directory,args.fault_program if case=='userfault' else args.program,args.busybox if args.busybox.exists() else None,case,args.metadata_csum)
             readonly_hash=hashlib.sha256(image.read_bytes()).hexdigest() if case=='readonly' else None
             kernel='build/linux-la/vmlinux' if args.linux else args.oom_kernel if case=='oom' else args.kernel
             command=[args.qemu,'-machine','virt','-cpu','la464','-global','ls7a_rtc.toy-enabled=on','-smp','1','-m',memory,'-kernel',kernel,'-drive',f'file={image},format=raw,if=none,id=root'+(',readonly=on' if case=='readonly' else ''),'-device','virtio-blk-pci,drive=root,addr=1,disable-legacy=on','-net','none','-nographic','-no-reboot']
@@ -75,7 +79,11 @@ def main():
             else: passed &= 'LA PID 1 exited reason=0x0000000000000001 status=0x0000000000000000' in text and 'LA root owners released' in text
             if not passed: sys.stdout.write(text);raise SystemExit(f'LA root failed {case} {memory}')
             if readonly_hash and hashlib.sha256(image.read_bytes()).hexdigest()!=readonly_hash: raise SystemExit('readonly ext4 image changed')
-            if case=='normal' and not args.smoke:
+            if args.metadata_csum and not args.linux:
+                checked=subprocess.run(['e2fsck','-fn',str(image)],text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
+                (directory/f'{case}-{memory}.fsck').write_text(checked.stdout)
+                if checked.returncode:sys.stdout.write(checked.stdout);raise SystemExit('checksum root fsck failed')
+            if case=='normal' and (not args.smoke or args.metadata_csum):
                 if 'LA musl root contracts passed' not in text: raise SystemExit('missing actual musl results')
                 recovered=directory/'persisted';execute(['debugfs','-R',f'dump /persisted {recovered}',image])
                 if recovered.read_bytes()!=bytes((i*7+3)%256 for i in range(32791)): raise SystemExit('persisted file differs after shutdown')

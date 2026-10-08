@@ -58,7 +58,9 @@ move、传播、noexec/nodev/nosuid 等其他挂载属性，以及 lazy/force/ex
 字段规则保持原语义。布局由挂载几何验证保护，helper 的非法内部布局触发 fatal，
 损坏镜像仍按原验证返回格式/校验错误。`make test-lwext4-checksum-host` 覆盖只读输入、
 非相邻字段、非法布局和真实镜像中的重入读者；引用归还、heap owner 和独立 e2fsck
-共同验证，来源及反例见时间戳学习记录。
+共同验证。`make test-root-checksum-loongarch` 在512 MiB/1 GiB的带校验和根盘上
+验证真实用户程序、持久数据、正常退出和e2fsck，保留普通错误fixture的原格式。
+来源及反例见时间戳学习记录。
 
 `kernel_vfs_file_set_mode()` 通过持有的 inode handle 事务修改低 12 个权限位，
 保留类型和其余位并更新 ctime；路径入口复用同一 handle。后端

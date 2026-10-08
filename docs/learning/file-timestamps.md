@@ -24,6 +24,7 @@ metadata checksum 计算期间，把共享缓冲中的 checksum 字段清零，�
 
 ```sh
 make test-lwext4-checksum-host
+make test-root-checksum-loongarch
 python3 -B tests/lwext4-checksum-read-host.py --source-root /path/to/cfae103 --output build/checksum-read-baseline
 make test-lwext4-metadata-host test-lwext4-group-host test-lwext4-recovery-host
 ```
@@ -32,7 +33,10 @@ CRC oracle 使用 `mprotect(PROT_READ)` 的输入，260例覆盖一个/两个字
 实际 inode 124/130 offset、32～16384字节与原数据不变；7个非法内部布局必须 fatal。
 真实 ext4 镜像的8例覆盖1/4 KiB块、128/256-byte inode、GDT/inode两种交错，成功后
 归还引用、停止 journal、卸载、heap归零并经e2fsck检查。该门禁加入共同 host CI；
-本地门禁结果不等于远程 CI 已运行。
+本地门禁结果不等于远程 CI 已运行。LA 另外使用 `metadata_csum,64bit` 的正常根盘
+在512 MiB/1 GiB运行真实用户程序，正常退出、owner释放并通过e2fsck；同一原ELF在
+固定Linux的同类镜像另验证。默认根盘fixture不改变，checksum profile仅用于正常
+smoke路径，原错误fixture不能因更换格式而沿用未经核对的errno预期。
 
 GDT 只读定位的性能候选与更宽查询接口仍在隔离研究，尚未作为主线默认策略。
 上述修复处理已复现的 checksum 读者冲突，不声明它关闭了完整读写吞吐验收。
