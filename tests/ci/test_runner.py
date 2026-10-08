@@ -6,6 +6,10 @@ import sys
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from arch_profiles import PROFILES
 
 spec = importlib.util.spec_from_file_location('ci_runner', Path(__file__).with_name('run.py'))
 runner = importlib.util.module_from_spec(spec)
@@ -64,6 +68,21 @@ class Execution(unittest.TestCase):
                 self.assertIn('--require-pass', inventory['argv'])
                 self.assertEqual([inventory['argv'][i+1] for i, arg in enumerate(inventory['argv'])
                                   if arg == '--memory'], ['512M', '1G'])
+
+
+class CompilerCompatibility(unittest.TestCase):
+    def test_rv_uses_libatomic_switch_only_when_compiler_accepts_it(self):
+        for status, expected in ((0, ['-fno-link-libatomic']), (1, [])):
+            with self.subTest(status=status), patch('arch_profiles.subprocess.run') as probe:
+                probe.return_value.returncode = status
+                self.assertEqual(PROFILES['riscv'].musl_flags('/tmp/musl-gcc'), expected)
+
+    def test_la_retains_integer_abi_and_target_page_alignment(self):
+        with patch('arch_profiles.subprocess.run') as probe:
+            flags = PROFILES['loongarch'].musl_flags('/tmp/musl-gcc')
+            self.assertEqual(flags, [*PROFILES['loongarch'].raw_flags,
+                                    '-Wl,-z,max-page-size=16384'])
+            probe.assert_not_called()
 
 
 if __name__ == '__main__':

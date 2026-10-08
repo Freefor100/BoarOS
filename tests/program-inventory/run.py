@@ -9,7 +9,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
-sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
+sys.path.append(str(Path(__file__).resolve().parents[1]))
 from arch_profiles import PROFILES
 
 ROOT = Path(__file__).resolve().parents[2]

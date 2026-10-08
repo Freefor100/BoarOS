@@ -47,6 +47,11 @@ python3 -B tests/ci/run.py --arch loongarch --suite runtime
 RV 的 sysroot 指向包内 `usr/riscv64-linux-gnu`，保留原 libc 链接脚本和 CRT，
 不改库内容。整个安装的内容、权限和链接目标另有缓存指纹。
 
+RV 原回归仍用 Ubuntu 的交叉工具；平台测试先从固定源码构建完整 BusyBox，
+所需 Linux 6.6 UAPI 与测试源码均按参考清单恢复。编译 runner 检测实际 wrapper
+是否支持 `-fno-link-libatomic`，不把本机新 GCC 的选项强加给旧工具。环境 shell
+的 ripgrep 依赖显式安装；准备日志及 BusyBox 身份与测试输出一起上传。
+
 LA 的 QEMU wrap 依赖按固定源码 `.wrap` revision 恢复，派生模拟器仍核对源码、
 补丁、配置和产物。Linux 在任何 make 之前拒绝缺失或损坏的已登记 ELF；不能
 通过重复构建给损坏文件重新登记身份。输入或产物变化使缓存验证失败。

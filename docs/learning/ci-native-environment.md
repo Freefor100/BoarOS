@@ -43,3 +43,19 @@ GNU 程序已实际通过固定 Linux/BoarOS，LA 含两种 RAM。Ubuntu 24.04 �
 产物无法重新保存。已用两种架构的输入变化反例保护新 key。producer 本身
 无论成功失败都上传准备日志/身份；consumer 按实际 network、TTY/PTY 和
 原程序运行目录归档完整输出，失败镜像单列，不能只依赖聚合日志中的尾部。
+
+## 首次干净 runner 暴露的工具边界
+
+Ubuntu 24.04 的 GCC 13 不支持 `-fno-link-libatomic`。原 Makefile 会先检测，
+网络和终端 Python runner 却无条件添加，因而在用户程序编译前失败。共同
+架构 profile 现在按实际 musl wrapper 检测；LA 仍保留整数 ABI 和 16 KiB
+ELF 对齐。Ubuntu GCC 13 已真实编译 network、TTY/PTY 和环境的六个探针，
+不能用本机 GCC 16 的成功代替这项验证。环境 shell 还需要显式安装 ripgrep，
+TTY/PTY 所需原完整 BusyBox 也必须在干净 RV job 中先构建，不能依赖本机产物。
+
+原程序 driver 的 exec 错误管道原先将 `write` 返回值直接丢弃，Ubuntu Fortify
+使其成为 `-Werror` 编译失败。现在处理 EINTR 并检查实际写入，始终保留原
+exec/setup errno；host 编译开启 Fortify，另有一次中断后的真实错误回传探针。
+独立 inventory 入口还因架构 import 把 `tests/` 放到本目录前面，误导入另一个
+`environment.py`。保留脚本目录优先级后，29 项 inventory host 测试在本机和
+Ubuntu 均通过；严格原程序执行仍单独判定，入口修复不等于程序通过。

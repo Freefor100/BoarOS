@@ -203,7 +203,12 @@ int main(int argc, char **argv)
 child_error: {
             int error = errno;
             int failure[2] = {failure_stage, error};
-            (void)write(exec_pipe[1], failure, sizeof(failure));
+            ssize_t reported;
+            do {
+                reported = write(exec_pipe[1], failure, sizeof(failure));
+            } while (reported < 0 && errno == EINTR);
+            if (reported != (ssize_t)sizeof(failure))
+                dprintf(2, "driver status pipe errno=%d\n", reported < 0 ? errno : EIO);
             dprintf(2, "driver %s errno=%d: %s\n",
                     failure_stage == 1 ? "setup" : "execve", error, strerror(error));
             _exit(127);

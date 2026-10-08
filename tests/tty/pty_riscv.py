@@ -25,8 +25,7 @@ def compile_static(args, source, destination):
     compiler = ROOT / ('build/riscv/musl-root/bin/musl-gcc' if args.arch == 'riscv'
                        else 'build/loongarch/musl-root/bin/musl-gcc')
     environment = os.environ.copy()
-    flags = ['-fno-link-libatomic'] if args.arch == 'riscv' else [
-        *PROFILES[args.arch].raw_flags, '-Wl,-z,max-page-size=16384']
+    flags = PROFILES[args.arch].musl_flags(compiler)
     if args.arch == 'loongarch':
         environment['REALGCC'] = str(ROOT / 'build/loongarch/gcc-sf/root/bin/loongarch64-unknown-linux-gnusf-gcc')
     command(str(compiler), *flags, '-static', '-O2', '-Wall', '-Wextra', '-Werror',

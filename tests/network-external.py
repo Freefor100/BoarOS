@@ -177,7 +177,7 @@ def fixture(work, workload, libc, reference, observe, arch):
     profile=PROFILES[arch]
     compiler = ROOT / ('build/riscv/musl-root/bin/musl-gcc' if arch=='riscv' else 'build/loongarch/musl-root/bin/musl-gcc')
     environment=os.environ.copy()
-    flags=['-fno-link-libatomic'] if arch=='riscv' else [*profile.raw_flags,'-Wl,-z,max-page-size=16384']
+    flags=profile.musl_flags(compiler)
     if arch=='loongarch':environment['REALGCC']=str(ROOT/'build/loongarch/gcc-sf/root/bin/loongarch64-unknown-linux-gnusf-gcc')
     program = work / 'init'
     subprocess.run([str(compiler), *flags, '-static', '-O2',

@@ -41,7 +41,7 @@ def main():
     work=Path(tempfile.mkdtemp(prefix='environment-run.',dir=base));print(work,flush=True)
     compiler=ROOT/('build/riscv/musl-root/bin/musl-gcc' if args.arch=='riscv' else 'build/loongarch/musl-root/bin/musl-gcc')
     environment=os.environ.copy()
-    flags=['-fno-link-libatomic'] if args.arch=='riscv' else [*profile.raw_flags,'-Wl,-z,max-page-size=16384']
+    flags=profile.musl_flags(compiler)
     if args.arch=='loongarch':environment['REALGCC']=str(ROOT/'build/loongarch/gcc-sf/root/bin/loongarch64-unknown-linux-gnusf-gcc')
     busybox=ROOT/('build/program-environment/full-busybox/source/busybox/busybox' if args.arch=='riscv' else 'build/loongarch/busybox-source/busybox/busybox')
     cases={}

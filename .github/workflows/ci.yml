@@ -225,7 +225,7 @@ jobs:
             opensbi \
             e2fsprogs \
             curl \
-            git flex bison bc libssl-dev libelf-dev iproute2 rsync
+            git flex bison bc libssl-dev libelf-dev iproute2 rsync ripgrep
 
       - name: Show tool versions
         run: |
@@ -277,6 +277,15 @@ jobs:
       - name: Run real userland tests
         run: make test-userland-riscv
 
+      - name: Prepare original RV platform BusyBox
+        run: |
+          mkdir -p build/ci-run
+          awk -F '\t' '$2 == "linux" || $2 == "oscomp-testsuits" || $2 == "linux-uapi/linux-6.6.tar.xz"' \
+            references/sources.tsv > build/ci-run/riscv-platform-inputs.tsv
+          references/fetch.sh --manifest build/ci-run/riscv-platform-inputs.tsv
+          python3 -B tests/program-inventory/environment.py --busybox \
+            > build/ci-run/riscv-platform-environment.json
+
       - name: Run RV platform contracts
         run: python3 -B tests/ci/run.py --arch riscv --suite platform
 
@@ -306,6 +315,9 @@ jobs:
             build/multi-disk-io.*/*-timeout.json
             build/multi-disk-io.*/*-exit.json
             build/ci-run/riscv-platform
+            build/ci-run/riscv-platform-environment.json
+            build/program-environment/**/*.log
+            build/program-environment/**/*.json
             build/network/contract-*/**/*
           if-no-files-found: ignore
       - name: Upload failed RISC-V filesystem images
