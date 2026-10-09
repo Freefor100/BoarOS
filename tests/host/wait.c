@@ -25,6 +25,22 @@ static pthread_barrier_t committed, notified;
 static struct kernel_wait_token shared_token;
 static unsigned wake_after_switch;
 static int switching;
+static struct kernel_wait_queue closing;
+static pthread_barrier_t close_entered, close_released;
+static _Thread_local unsigned pause_close;
+void __real_kernel_raw_lock_release(struct kernel_raw_guard *);
+void __wrap_kernel_raw_lock_release(struct kernel_raw_guard *guard)
+{
+    int pause = pause_close && guard->lock == &kernel_wait_domain && closing.closed;
+    if (pause) pause_close = 0;
+    __real_kernel_raw_lock_release(guard);
+    if (pause) {
+        int result = pthread_barrier_wait(&close_entered);
+        assert(!result || result == PTHREAD_BARRIER_SERIAL_THREAD);
+        result = pthread_barrier_wait(&close_released);
+        assert(!result || result == PTHREAD_BARRIER_SERIAL_THREAD);
+    }
+}
 void *sync_test_cpu(void) { return &cpu; }
 static void initialize(unsigned id)
 {
@@ -159,6 +175,30 @@ static void callback_lifetime(void)
     assert(kernel_wait_queue_destroy(&callbacks) == KERNEL_SCHEDULER_STATUS_OK);
     assert(!pthread_barrier_destroy(&callback_entered) && !pthread_barrier_destroy(&callback_release));
 }
+static void *close_worker(void *argument)
+{
+    (void)argument;
+    initialize(8);
+    pause_close = 1;
+    assert(kernel_wait_queue_close(&closing) == KERNEL_SCHEDULER_STATUS_OK);
+    return 0;
+}
+static void close_lifetime(void)
+{
+    kernel_wait_queue_init(&closing);
+    assert(!pthread_barrier_init(&close_entered, 0, 2));
+    assert(!pthread_barrier_init(&close_released, 0, 2));
+    pthread_t worker;
+    assert(!pthread_create(&worker, 0, close_worker, 0));
+    barrier(&close_entered);
+    /* 已停止登记但close还要访问空队列，destroy不能提前归还owner。 */
+    assert(kernel_wait_queue_destroy(&closing) == KERNEL_SCHEDULER_STATUS_BUSY);
+    barrier(&close_released);
+    assert(!pthread_join(worker, 0));
+    assert(!closing.borrows && !closing.registrations);
+    assert(kernel_wait_queue_destroy(&closing) == KERNEL_SCHEDULER_STATUS_OK);
+    assert(!pthread_barrier_destroy(&close_entered) && !pthread_barrier_destroy(&close_released));
+}
 static void early_and_multi(void)
 {
     struct kernel_wait_queue queues[2];
@@ -255,5 +295,6 @@ int main(void)
     arbitration(2);
     arbitration(4);
     callback_lifetime();
+    close_lifetime();
     puts("wait: early wake, 2/4-thread first-winner arbitration, stale tokens, multi-queue, borrowed retired cursors and callback lifetime passed");
 }

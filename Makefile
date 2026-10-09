@@ -1918,7 +1918,7 @@ test-riscv: test-sync-riscv
 .PHONY: test-wait-host
 test-wait-host:
 	@mkdir -p build/host
-	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -Itests/host/sync -idirafter include tests/host/wait.c kernel/cpu.c kernel/raw_lock.c kernel/sched/park.c kernel/sched/runqueue.c -o build/host/wait
+	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -Itests/host/sync -idirafter include tests/host/wait.c kernel/cpu.c kernel/raw_lock.c kernel/sched/park.c kernel/sched/runqueue.c -Wl,--wrap=kernel_raw_lock_release -o build/host/wait
 	build/host/wait
 
 $(BUILD_DIR)/wait-native.o: tests/wait/native.c

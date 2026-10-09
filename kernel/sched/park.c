@@ -390,8 +390,21 @@ enum kernel_scheduler_status kernel_wait_queue_close(struct kernel_wait_queue *q
     if (!queue || queue->initialized != KERNEL_WAIT_QUEUE_INITIALIZED)
         return KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
     KERNEL_IRQ_SCOPE(close_irq);
-    { KERNEL_RAW_SCOPE(guard, &kernel_wait_domain); queue->closed = 1; }
-    return wake(queue, 1);
+    {
+        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        queue_shape(queue);
+        if (queue->borrows == UINT32_MAX) __builtin_trap();
+        /* close跨解锁继续通知，空队列也必须保留操作自身的借用。 */
+        queue->borrows++;
+        queue->closed = 1;
+    }
+    enum kernel_scheduler_status status = wake(queue, 1);
+    {
+        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        if (!queue->borrows) __builtin_trap();
+        queue->borrows--;
+    }
+    return status;
 }
 enum kernel_scheduler_status kernel_wait_queue_destroy(struct kernel_wait_queue *queue)
 {

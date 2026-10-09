@@ -42,8 +42,9 @@ wake在调度锁内判断空队列；为空直接完成，非空才建立跨解�
 被摘节点保留有引用的退休后继，引用链迭代归还，每段最多16项。
 callback在调度锁外同步执行，临时禁止抢占，不能阻塞；自身只能非阻塞remove。
 释放context前必须remove_sync等待借用归零。futex过滤遍历使用同一借用游标；
-requeue先借task、放当前游标，再收完旧node借用并迁移登记，不在raw内归还后备引用。queue_close停止新登记，queue_destroy在
-注册或借用未归零时返回BUSY，调用者继续持有queue及业务owner。
+requeue先借task、放当前游标，再收完旧node借用并迁移登记，不在raw内归还后备引用。
+queue_close停止新登记并借用队列直到通知完成，空队列也不能在close的解锁间隙销毁。
+queue_destroy在注册或操作/游标/回调借用未归零时返回BUSY，调用者继续持有queue及业务owner。
 
 聚焦入口：`make test-wait-host test-wait-riscv test-wait-loongarch`。host直接链接park.c、
 真实raw/runqueue，在2/4线程握手下检查提前wake、单次仲裁、旧代次、多队列与退休游标；
