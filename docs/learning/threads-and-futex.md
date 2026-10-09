@@ -24,7 +24,7 @@ futex 是“用户态原子变量 + 内核等待队列”，不是每次加锁�
 
 glibc 2.44 的 `pthread_join` 在 fixed source `nptl/pthread_join_common.c` 调用 `__futex_abstimed_wait_cancelable64`；`nptl/futex-internal.c` 以 `FUTEX_WAIT_BITSET | FUTEX_CLOCK_REALTIME` 发出 raw syscall，即使未传 timeout 也使用 bitset 命令。BoarOS 曾让 `pthread_create` 成功，却在 `pthread_join` 返 ENOSYS 后由 glibc 报 futex fatal。只让 `FUTEX_BITSET_MATCH_ANY` 伪装成普通 WAIT 会错误处理其他非零掩码、绝对截止时刻和 WAKE_BITSET；在既有 per-task futex key 模型内，等待者另存掩码、REQUEUE 保持掩码，WAKE_BITSET 仅按相交位唤醒。固定 Linux `kernel/futex/syscalls.c` 与 `waitwake.c` 是错误顺序、掩码和绝对时钟依据。当前 BoarOS 没有修改 realtime 的 syscall，启动偏移不变；未来支持调时时，已经阻塞的 realtime wait 不能继续依赖这一固定偏移假设。
 
-WAIT 必须原子地完成“比较用户字与 expected → 登记 waiter → 阻塞”。若比较与登记之间允许另一个线程修改用户字并执行 WAKE，唤醒可能落在空队列上，随后登记的线程就会错过通知。单 hart 的 BoarOS 通过关闭中断覆盖该区间；未来 SMP 必须在同一哈希桶锁保护下重新完成比较与登记，关本地中断并不能阻止其他 hart。
+WAIT 必须闭合“比较用户字与 expected → 登记 waiter → 阻塞”。若比较与登记之间允许另一个线程修改用户字并执行 WAKE，唤醒可能落在空队列上，随后登记的线程就会错过通知。当前BoarOS先建立token登记，再复查用户字；仲裁器保留park前通知。key解析、用户页和业务状态仍依赖单CPU IRQ纪律，未来共享MM的lookup/pin、比较与发布需要完整跨核协议；关本地中断不能替代它。
 
 private waiter 使用单调分配且不复用的 MM 身份号和四字节对齐用户地址；共享匿名 waiter 使用后备对象身份和对象内连续字节偏移。哈希仅用于定位桶，命中后仍须比较完整 key。不同 MM 的相同虚拟地址不会串扰，fork 后不同 MM 的同一共享对象可以互相唤醒。等待者持有共享对象引用到等待调用恢复；requeue 为迁移者取得目标引用并释放源引用，避免最后一个映射消失后旧对象地址重用。单 hart 关中断串行化解析、比较与登记，SMP 仍须独立锁协议。
 
@@ -220,3 +220,17 @@ futex过滤wake不能沿用跨解锁的裸next。游标借用node，requeue额�
 尚未授予才重新登记，原pending位置不变。结束登记只清局部token副本；pending中的token
 只在对象raw内更新，释放者可在该间隙授资格并发送已经过期的通知。等待者随后复查即可前进。
 `test-sleep-lock-host`以握手覆盖这两个间隙，保护继续等待及资格唯一性。
+
+关闭操作自身也有寿命：即使队列为空，close停止登记与随后通知之间仍会访问队列，
+必须保留操作借用。宿主握手曾证明该间隙destroy错误成功；现在返回BUSY，操作结束才归零。
+切换完成只属于实际恢复尾部或首次trampoline，普通异常返回无需再次查旧栈前驱。
+这些边界与[匹配时间](cost-baseline.md#等待交接的匹配时间)分开验收；功能通过不意味着吞吐提高。
+
+同一短锁内完成单任务通知时，节点不会跨解锁借用，但仍须检查活动queue与borrow_owner身份。
+省去borrow动作不能连带省掉原有非法owner检测；真实宿主反例保护该边界。
+
+信号测试的ready标志若写在WAIT syscall之前，不能证明已经登记；强制信号先进入、条件再改变，
+同一LA ELF在固定Linux与BoarOS的512MiB/1GiB均返回合法EAGAIN。当前信号目录用零wake的
+FUTEX_REQUEUE确认真实登记、保持阻塞，再交付信号；固定依据为`references/linux/kernel/futex/requeue.c`，
+commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`。这不依赖随机sleep。一次未强制的旧动态目录
+失败只有汇总码10，没有子步骤结果，不能从反例或后续成功反推其确切原因；已增加结果/errno诊断。

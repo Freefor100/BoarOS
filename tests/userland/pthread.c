@@ -29,12 +29,14 @@
 #define WORKERS 3
 #define FUTEX_WAIT 0
 #define FUTEX_WAKE 1
+#define FUTEX_REQUEUE 3
 #define FUTEX_PRIVATE_FLAG 128
 #define FUTEX_WAIT_BITSET 9
 #define FUTEX_WAKE_BITSET 10
 #define FUTEX_CLOCK_REALTIME 256
 #define FUTEX_WAIT_PRIVATE (FUTEX_WAIT | FUTEX_PRIVATE_FLAG)
 #define FUTEX_WAKE_PRIVATE (FUTEX_WAKE | FUTEX_PRIVATE_FLAG)
+#define FUTEX_REQUEUE_PRIVATE (FUTEX_REQUEUE | FUTEX_PRIVATE_FLAG)
 #define FUTEX_WAIT_BITSET_PRIVATE (FUTEX_WAIT_BITSET | FUTEX_PRIVATE_FLAG)
 #define FUTEX_BITSET_MATCH_ANY UINT32_MAX
 
@@ -51,6 +53,7 @@ static void futex_signal_handler(int signal_number)
 
 struct futex_signal_case {
     int word;
+    int signal_key;
     volatile int ready;
     int timed;
     long timeout_nanoseconds;
@@ -92,6 +95,20 @@ static int wait_for_futex_signal(void)
     return futex_signal_seen ? 0 : 1;
 }
 
+static int wait_for_futex_registration(struct futex_signal_case *test)
+{
+    /* ready先于syscall，不能证明WAIT已登记。零wake的REQUEUE确认并转移
+     * 真实等待者，保持其阻塞；信号必须针对这个已经存在的登记交付。 */
+    for (int tries = 0; tries < 10000; tries++) {
+        long moved = syscall(SYS_futex, &test->word, FUTEX_REQUEUE_PRIVATE,
+                             0, 1, &test->signal_key, 0);
+        if (moved == 1) return 0;
+        if (moved != 0) return 1;
+        sched_yield();
+    }
+    return 1;
+}
+
 static int run_futex_signal_case(int restart, int timed, int change_word,
                                  int expected_error)
 {
@@ -113,9 +130,11 @@ static int run_futex_signal_case(int restart, int timed, int change_word,
     if (pthread_create(&thread, 0, futex_signal_waiter, &test) != 0)
         return 2;
     if (wait_for_futex_case_ready(&test) != 0 ||
+        wait_for_futex_registration(&test) != 0 ||
         pthread_kill(thread, SIGUSR1) != 0 || wait_for_futex_signal() != 0) {
         test.word = 1;
         syscall(SYS_futex, &test.word, FUTEX_WAKE_PRIVATE, 1, 0, 0, 0);
+        syscall(SYS_futex, &test.signal_key, FUTEX_WAKE_PRIVATE, 1, 0, 0, 0);
         pthread_join(thread, &thread_result);
         return 3;
     }
@@ -144,9 +163,12 @@ static int run_futex_signal_case(int restart, int timed, int change_word,
     if (pthread_join(thread, &thread_result) != 0 || thread_result != 0)
         return 4;
     futex_signal_word = 0;
-    if (expected_error == 0)
-        return test.result == 0 ? 0 : 5;
-    return test.result == -1 && test.error == expected_error ? 0 : 6;
+    int matched = expected_error == 0 ? test.result == 0 :
+        test.result == -1 && test.error == expected_error;
+    if (!matched)
+        fprintf(stderr, "futex signal restart=%d timed=%d returned=%d error=%d expected=%d\n",
+                restart, timed, test.result, test.error, expected_error);
+    return matched ? 0 : expected_error == 0 ? 5 : 6;
 }
 
 static int check_futex_wake_signal_boundary(void)
