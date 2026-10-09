@@ -586,6 +586,12 @@ RV/LA各512MiB/1GiB的八次启动通过，含native退出、组隔离、超时K
 | BusyBox | 54 | 54 | 54 | 54 |
 
 RV glibc的额外4分来自pipe输出`cpid: 6cpid: 0`，随后仍打印原写入成功行；
+原盘`/glibc/basic/pipe`与`/musl/basic/pipe`的SHA相同，均为
+`e1f3d28c6e640aa897637c69e5c89d01b44d7d1fc4f897d2053c7e812600e19a`。
+原ELF自己的printf把格式前缀、数字和换行分开write（反汇编printf中实际write调用），
+fork后父子分别打印，跨syscall交错不受单次write的序列保护；目录标签不代表此项
+使用了不同glibc/musl库。它不是四个syscall失败，也不是glibc或LA/RV实现差异。
+
 固定Harness `judge_basic-glibc.py`要求单独的`cpid: 0`及第三行固定位置，
 因此该项0/4。此前固定Linux同样有父子字符输出交错记录，见上文公开修正对照；
 本次保留实际输出与判分，不修改原程序、输出或judge，也不通过重跑替换本次成绩。

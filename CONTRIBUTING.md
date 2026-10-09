@@ -38,12 +38,17 @@
 
 提交标题概括结果。除拼写、格式等从标题和 diff 即可完整理解的小修外，提交必须在空行后写说明性 body，简要交代改动动机、关键行为或约束，以及与风险相称的验证和仍存限制；`Co-authored-by` 等 trailer 不算正文。
 
-AI 对设计或代码有实质贡献时根据当时的Agent添加例如：
+提交沿用英文 `type(scope): subject` 标题，`scope` 按需要填写；正文说明原因、行为和约束，以 `Validation:` 段记录验证及限制。合并提交保留 `Merge ...` 标题并说明集成边界。
+
+标题、正文、连续 trailer 之间各留一个空行，trailer 之间不插入空行，文件以换行结束；trailer 不代替说明正文。
+
+AI 对设计或代码有实质贡献时填写具体Agent型号，不使用笼统的`GPT-6`。例如：
 
 ```text
 Co-authored-by: GPT-5.6 Sol <codex@openai.com>
 Co-authored-by: GPT-5.6 Luna <codex@openai.com>
 Co-authored-by: GPT-6 Astra <codex@openai.com>
+Co-authored-by: GPT-6.1 Sol <codex@openai.com>
 Co-authored-by: GPT-6 Sol <codex@openai.com>
 Co-authored-by: GPT-6 Luna <codex@openai.com>
 Co-authored-by: GLM 5.3 <noreply@z.ai>

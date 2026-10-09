@@ -13,6 +13,12 @@ OBJDUMP := $(CROSS_COMPILE)objdump
 READELF := $(CROSS_COMPILE)readelf
 QEMU_RISCV64 ?= qemu-system-riscv64
 QEMU_MEMORY ?= 1G
+# CI显式选择共同RAM矩阵；空值保留各聚焦入口原来的默认配置。
+TEST_MEMORIES ?=
+ifneq ($(filter-out 512M 1G,$(TEST_MEMORIES)),)
+$(error TEST_MEMORIES must contain only 512M or 1G)
+endif
+TEST_MEMORY_ARGS := $(foreach memory,$(TEST_MEMORIES),--memory $(memory))
 
 COST_DIAGNOSTICS ?= 0
 ifneq ($(filter $(COST_DIAGNOSTICS),0 1),$(COST_DIAGNOSTICS))
@@ -1255,7 +1261,7 @@ $(SQLITE_WAL_RV): tests/workloads/sqlite/wal.c $(SQLITE_SOURCE) $(MUSL_STAMP)
 test-sqlite-wal-riscv: $(SQLITE_WAL_RV) $(KERNEL_RV)
 	PYTHONDONTWRITEBYTECODE=1 python3 tests/sqlite-wal-riscv.py \
 		--kernel $(KERNEL_RV) --program $(SQLITE_WAL_RV) \
-		--qemu $(QEMU_RISCV64)
+		--qemu $(QEMU_RISCV64) $(TEST_MEMORY_ARGS)
 
 $(LOCK_LIFECYCLE_RV): tests/workloads/locks/lifecycle.c $(MUSL_STAMP)
 	@mkdir -p $(dir $@)
@@ -1297,7 +1303,7 @@ test-sqlite-rollback-riscv: $(SQLITE_ROLLBACK_RV) $(SQLITE_CLI_STATIC_RV) $(SQLI
 	SQLITE_CLI_DYNAMIC_RV=$(SQLITE_CLI_DYNAMIC_RV) \
 	SQLITE_CLI_INIT_RV=$(SQLITE_CLI_INIT_RV) MUSL_LDSO=$(MUSL_LDSO) \
 	QEMU_RISCV64=$(QEMU_RISCV64) \
-		./tests/sqlite-rollback-riscv.sh
+		./tests/sqlite-rollback-riscv.sh $(TEST_MEMORY_ARGS)
 REAL_USERLAND_RV := $(BUILD_DIR)/tests/user/real-userland-rv
 PTHREAD_USERLAND_RV := $(BUILD_DIR)/tests/user/pthread-userland-rv
 PTHREAD_TLS_DSO_RV := $(BUILD_DIR)/tests/user/libboaros-tls.so
@@ -1707,7 +1713,7 @@ $(RNG_USER_RV): tests/userland/rng.c $(MUSL_STAMP)
 
 .PHONY: test-rng-riscv test-virtio-rng-host
 test-rng-riscv: $(KERNEL_RV) $(RNG_USER_RV)
-	python3 -B tests/rng-riscv.py --kernel $(KERNEL_RV) --program $(RNG_USER_RV) --qemu $(QEMU_RISCV64)
+	python3 -B tests/rng-riscv.py --kernel $(KERNEL_RV) --program $(RNG_USER_RV) --qemu $(QEMU_RISCV64) $(TEST_MEMORY_ARGS)
 
 test-virtio-rng-host:
 	@mkdir -p build/host
@@ -1776,7 +1782,13 @@ test-log-host:
 
 .PHONY: test-environment-riscv
 test-environment-riscv: $(KERNEL_RV)
-	KERNEL_RV=$(KERNEL_RV) QEMU_RISCV64=$(QEMU_RISCV64) sh tests/environment-riscv.sh
+	@if [ -n '$(TEST_MEMORIES)' ]; then \
+		for memory in $(TEST_MEMORIES); do \
+			KERNEL_RV=$(KERNEL_RV) QEMU_RISCV64=$(QEMU_RISCV64) QEMU_MEMORY=$$memory sh tests/environment-riscv.sh || exit; \
+		done; \
+	else \
+		KERNEL_RV=$(KERNEL_RV) QEMU_RISCV64=$(QEMU_RISCV64) sh tests/environment-riscv.sh; \
+	fi
 
 .PHONY: test-platform-profile-host
 test-platform-profile-host:
@@ -1790,7 +1802,7 @@ test-rtc-host:
 
 .PHONY: test-network-riscv
 test-network-riscv: kernel-rv
-	python3 -B tests/network-riscv.py
+	python3 -B tests/network-riscv.py $(TEST_MEMORY_ARGS)
 
 .PHONY: test-virtio-net-host test-lwip-reassembly-host test-ethernet-worker-host test-network-external-riscv force-net-config
 NET_IPV4 ?= 0x0a4d0002
@@ -1868,10 +1880,10 @@ $(TTY_TERMIOS2_RV): tests/tty/termios2_probe.c $(MUSL_STAMP)
 
 .PHONY: test-tty-riscv test-tty-diff-riscv
 test-tty-riscv: $(KERNEL_RV) $(MUSL_STAMP)
-	python3 -B tests/tty/riscv.py --kernel $(KERNEL_RV) --qemu $(QEMU_RISCV64)
+	python3 -B tests/tty/riscv.py --kernel $(KERNEL_RV) --qemu $(QEMU_RISCV64) $(TEST_MEMORY_ARGS)
 test-tty-diff-riscv: $(KERNEL_RV) $(TTY_PROBE_RV) $(TTY_JOBCTRL_RV)
-	python3 -B tests/tty/riscv.py --kernel $(KERNEL_RV) --qemu $(QEMU_RISCV64) --probe $(TTY_PROBE_RV)
-	python3 -B tests/tty/riscv.py --kernel $(KERNEL_RV) --qemu $(QEMU_RISCV64) --probe $(TTY_JOBCTRL_RV) --no-ctty
+	python3 -B tests/tty/riscv.py --kernel $(KERNEL_RV) --qemu $(QEMU_RISCV64) --probe $(TTY_PROBE_RV) $(TEST_MEMORY_ARGS)
+	python3 -B tests/tty/riscv.py --kernel $(KERNEL_RV) --qemu $(QEMU_RISCV64) --probe $(TTY_JOBCTRL_RV) --no-ctty $(TEST_MEMORY_ARGS)
 
 .PHONY: test-pty-host
 test-pty-host:
@@ -1883,14 +1895,14 @@ test-pty-host:
 
 .PHONY: test-tty-termios2-riscv
 test-tty-termios2-riscv: $(KERNEL_RV) $(TTY_TERMIOS2_RV)
-	python3 -B tests/tty/riscv.py --kernel $(KERNEL_RV) --qemu $(QEMU_RISCV64) --probe $(TTY_TERMIOS2_RV)
+	python3 -B tests/tty/riscv.py --kernel $(KERNEL_RV) --qemu $(QEMU_RISCV64) --probe $(TTY_TERMIOS2_RV) $(TEST_MEMORY_ARGS)
 
 .PHONY: test-pty-riscv test-pty-apps-riscv
 test-pty-riscv: $(KERNEL_RV) $(MUSL_STAMP)
-	python3 -B tests/tty/pty_riscv.py --case core --kernel $(KERNEL_RV) --qemu $(QEMU_RISCV64)
+	python3 -B tests/tty/pty_riscv.py --case core --kernel $(KERNEL_RV) --qemu $(QEMU_RISCV64) $(TEST_MEMORY_ARGS)
 test-pty-apps-riscv: $(KERNEL_RV) $(MUSL_STAMP)
-	python3 -B tests/tty/pty_riscv.py --case libc --kernel $(KERNEL_RV) --qemu $(QEMU_RISCV64)
-	python3 -B tests/tty/pty_riscv.py --case script --kernel $(KERNEL_RV) --qemu $(QEMU_RISCV64)
+	python3 -B tests/tty/pty_riscv.py --case libc --kernel $(KERNEL_RV) --qemu $(QEMU_RISCV64) $(TEST_MEMORY_ARGS)
+	python3 -B tests/tty/pty_riscv.py --case script --kernel $(KERNEL_RV) --qemu $(QEMU_RISCV64) $(TEST_MEMORY_ARGS)
 
 .PHONY: test-epoll-host test-epoll-riscv
 test-epoll-host:

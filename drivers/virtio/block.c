@@ -399,6 +399,14 @@ static void collect_used(struct virtio_block_device *device)
     }
     if (completed) wake(&device->available);
 }
+static int batch_wait_needed(struct virtio_block_device *device)
+{
+    if (!device_live(device)) return 0;
+    if (device->queue.used->index == device->queue.last_used) return 1;
+    /* DMA先于IRQ发布完成时必须收割；仅跳过park会在IRQ-off下反复检查旧request状态。 */
+    collect_used(device);
+    return 0;
+}
 static void block_irq(void *owner)
 {
     struct virtio_block_device *device = owner;
@@ -938,7 +946,7 @@ static enum kernel_block_status virtio_block_write_batch(void *context,
              * still pending. Their completion must also wake this publisher. */
             uint64_t batch_wait_start = time_now();
             if (KERNEL_WAIT_RECHECK(&device->available, deadline, 0, &reason,
-                (device_live(device) && device->queue.used->index == device->queue.last_used)) != KERNEL_SCHEDULER_STATUS_OK)
+                batch_wait_needed(device)) != KERNEL_SCHEDULER_STATUS_OK)
                 __builtin_trap();
             device->statistics.queue_wait_ticks += time_now() - batch_wait_start;
             if (reason == KERNEL_WAIT_TIMEOUT && device_live(device)) collect_used(device);
@@ -1053,7 +1061,7 @@ static enum kernel_block_status virtio_block_read_batch(void *context,
             if (pending) device->statistics.sleeps++; else device->statistics.queue_waits++;
             uint64_t wait_start = time_now();
             if (KERNEL_WAIT_RECHECK(&device->available, deadline, 0, &reason,
-                (device_live(device) && device->queue.used->index == device->queue.last_used)) != KERNEL_SCHEDULER_STATUS_OK)
+                batch_wait_needed(device)) != KERNEL_SCHEDULER_STATUS_OK)
                 __builtin_trap();
             device->statistics.queue_wait_ticks += time_now() - wait_start;
             if (reason == KERNEL_WAIT_TIMEOUT && device_live(device)) collect_used(device);

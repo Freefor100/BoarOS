@@ -1,6 +1,7 @@
 {
   "host": {
     "host": [
+      {"name":"references","targets":["test-references"]},
       {"name":"ci-contracts","targets":["test-ci-host"]},
       {"name":"allocator","targets":["test-sync-host","test-wait-host","test-sleep-lock-host","test-scheduler-handoff-host","test-allocator-concurrency-host","test-allocator-release-host","test-allocator-preemption-host","test-allocator-cost-host"]},
       {"name":"virtio","targets":["test-virtio-framework-host","test-virtio-block-host","test-virtio-rng-host","test-virtio-net-host","test-pci-host"]},
@@ -12,20 +13,32 @@
     ]
   },
   "core": {
+    "riscv": [
+      {"name":"architecture","targets":["test-riscv"]},
+      {"name":"scale","targets":["test-scale-riscv"]},
+      {"name":"storage-concurrency","targets":["test-io-sleep-riscv"]},
+      {"name":"multi-disk-isolation","targets":["test-multi-disk-io-riscv"]},
+      {"name":"user-runtime","targets":["test-userland-riscv"]},
+      {"name":"abi","targets":["test-diff-abi-riscv"]},
+      {"name":"elf-tail","targets":["test-elf-tail-riscv"]},
+      {"name":"stack-report","targets":["test-stack-usage"]}
+    ],
     "loongarch": [
       {"name":"architecture","targets":["test-loongarch"]},
       {"name":"stack-permissions","targets":["test-stack-guard-loongarch","test-permissions-loongarch"]},
       {"name":"signals-threads","targets":["test-signal-loongarch","test-pthread-loongarch","test-pthread-oom-loongarch"]},
       {"name":"cpu-state","targets":["test-sync-loongarch","test-wait-loongarch","test-scheduler-handoff-loongarch","test-fpu-loongarch","test-simd-loongarch"]},
       {"name":"dynamic-exec","targets":["test-dynamic-loongarch","test-exec-errors-loongarch"]},
-      {"name":"pci-root","targets":["test-block-loongarch","test-root-loongarch","test-root-checksum-loongarch"]},
+      {"name":"pci-root","targets":["test-block-loongarch","test-root-loongarch","test-root-checksum-loongarch","test-root-io-loongarch"]},
       {"name":"abi","targets":["test-diff-abi-loongarch"]},
       {"name":"stack-report","targets":["test-stack-usage-la"]}
     ]
   },
   "runtime": {
     "riscv": [
-      {"name":"glibc-five-forms","targets":["test-glibc-riscv"]}
+      {"name":"glibc-five-forms","targets":["test-glibc-riscv"]},
+      {"name":"sqlite-delete","targets":["test-sqlite-rollback-riscv"]},
+      {"name":"sqlite-wal","targets":["test-sqlite-wal-riscv"]}
     ],
     "loongarch": [
       {"name":"glibc-five-forms","targets":["test-glibc-loongarch"]},

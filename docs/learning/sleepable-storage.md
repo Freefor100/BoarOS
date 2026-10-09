@@ -149,3 +149,31 @@ CI 另归档原有退出状态 JSON，避免后续调查仅有串口尾部。
 四次冷重启。所用内核 SHA-256 `e08c2569cad84fd44c6dd3ed36ffe08d8edf6eed2f5a6d63a31051f741520ba9`，
 用户 ELF `5da479333d9fc1927246e91f31a8737b838ce38edd08a2fbb5e9992dd70e6c72`。
 这些本地结果与后续托管 CI 的实际状态分别记录。
+
+## DMA发布早于等待交接
+
+[托管运行37964071894](https://github.com/Freefor100/BoarOS/actions/runs/37964071894)
+在`main@16951f0`的legacy/writethrough批量写阶段停滞。原NBD现场显示八个WRITE
+和随后八个FLUSH都已释放，guest停在batch-pending；15秒批量门禁失败，
+没有改用放宽期限或重复运行覆盖原失败。
+
+等待迁移引入的复查只比较DMA used index与last_used。完成先于IRQ时，它跳过park，
+却没有更新软件request状态；外层IRQ-off继续循环，直到请求期限才补收割。
+固定宿主wire模型在真实驱动的批量读/写路径发布反序完成并延后IRQ，旧实现确实
+等到30秒设备期限；修复在登记后观察到新used项时立即经过原collect_used校验，
+提前通知与登记回收由现有token处理。没有新完成仍阻塞，DMA owner、reset和错误
+处理保持，普通路径仍只读一次used index。
+
+反例覆盖legacy/modern的读写四种路径、内容及owner归还；完整块/等待host通过。
+同一修复内核在本机QEMU11.1.2与Ubuntu24.04的QEMU8.2.2各通过legacy/modern
+×writeback/writethrough四组合。LA现代PCI块、根I/O及reset/BAR owner两种RAM
+也通过；RV完整架构、双盘隔离及真实userland通过。这些是本轮本地结果，
+后续托管CI结论按实际提交另记。固定协议依据仍是
+`references/qemu@84f07211cc5b4fc6a371559bf8a5de4fb068e648`及
+`references/linux@f4cdf7ca9a1fdcca413157df19753f388a5a224e`。
+
+```sh
+python3 -B tests/host/virtio_block_diagnostics.py pre-park
+make test-virtio-block-host test-wait-host test-io-sleep-riscv
+make test-block-loongarch test-root-io-loongarch test-pci-reset-owner-loongarch INIT_CONFIG=config/init.json
+```

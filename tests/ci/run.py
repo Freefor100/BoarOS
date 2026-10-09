@@ -99,7 +99,8 @@ def main():
     cases = []
     for item in selected:
         argv = item.get('argv') or ['make', '--no-print-directory',
-            'INIT_CONFIG=config/init.json', *item['targets']]
+            'INIT_CONFIG=config/init.json',
+            *(['TEST_MEMORIES=512M 1G'] if args.arch != 'host' else []), *item['targets']]
         cases.append({'name': item['name'], 'argv': argv, 'timeout': item.get('timeout', 1800)})
     if args.list:
         print(json.dumps(cases, indent=2))

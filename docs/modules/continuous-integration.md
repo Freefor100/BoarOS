@@ -1,58 +1,55 @@
 # 主线双架构 CI
 
-主线 `ci.yml` 在 main push、面向 main 的 PR 和手动触发时执行。
-它保护已交付的单核 QEMU 契约，不把 CI 成功解释为所有 Linux 应用、SMP 或实板通过。
-RV 保留 Ubuntu 24.04/QEMU 8.2.2 的原回归；LA 使用固定 v11.1.0 源码及已有
-LS7A RTC 补丁。组合 runner 的通用 fixture 明确使用 `INIT_CONFIG=config/init.json`；
-保留的 RV 聚焦入口沿 main 默认通用配置执行。
-main push 和手动执行等待同组正在运行的 workflow 收口；只保留最新 pending
-执行。PR 继续取消同组旧执行，main 的固定环境冷构建可以先完成并保存缓存。
+`ci.yml`在main push、面向main的PR和手动触发时执行，保护已经交付的单核QEMU
+契约。两侧使用同一个`native-contracts.yml`执行模板及同一个结果runner；
+`tests/ci/suites.json`维护实际命令，不能以job数量或组数推定功能覆盖。
 
-2026-10-08外部审核发现两个host fixture假设：子Python未必能在100ms预算前打印，
-guest的`LD_LIBRARY_PATH=/lib:/`可能令host程序装载错误libc。本机11/29例通过不能
-排除这些环境问题。host fixture现已修正：启动前超时允许空输出，带输出的超时
-在测试内启动真实子进程，flush并通过pipe发出ready后才返回被测wait，准备预算10秒。
-host执行显式使用 `os.defpath` 和空库路径，case显式环境仍有最高优先级，guest驱动保持原环境。
-慢启动300ms/100ms预算与错误libc目录的反例先失败，修复后CI12例及清单31例通过。
-正式runner的预算、超时失败与日志保存契约不因此放宽，当前fixture和运行边界由本文维护；后续开发方向见[路线图](../goals.md#近期方向)。
+RV保留Ubuntu24.04/QEMU8.2.2回归，LA使用固定QEMU11.1.0及LS7A RTC补丁；
+GNU输入仍为RV glibc2.44、LA glibc2.42。这些环境用于架构正确性，不能直接比较性能。
+main push等待同组执行收口；PR取消同组旧执行，固定环境冷构建和完整缓存不被反复中断。
 
-## 常驻门禁
+## 共同门禁与独立扩展
 
-| Job | 内容 |
-|---|---|
-| Shared kernel and runner contracts | allocator、VirtIO transport/queue/block/RNG/net、PCI、TTY/PTY/UART、随机/RTC、epoll/lwIP、ext4 cache/batch/metadata 及 runner/profile 反例 |
-| RISC-V full test suite | 原完整架构、scale、可睡眠 I/O、双盘故障/冷重启、真实 musl userland、RNG/环境/network/TTY/PTY 及独立生产栈检查 |
-| RISC-V Linux / BoarOS differential ABI | 原 1366 条同 ELF 差分、ELF 尾页/BSS、SQLite DELETE/WAL 和原生 C 编译探针 |
-| LoongArch CPU, MM, ABI and platform | 两种 RAM 的启动、guard/权限、信号/线程/创建 OOM、FPU/SIMD、动态 musl/TLS/exec 错误、PCI/root、1366 条同 ELF 差分、栈及平台组合 |
-| RISC-V original glibc 2.44 | 512MiB/1GiB原五形态 GNU 消费者，版本与二进制身份保持原清单 |
-| LoongArch original glibc 2.42 and SQLite | 原五形态 GNU 消费者，以及静态/动态 SQLite DELETE/WAL、多进程和独立重启 |
+| 层级 | RV | LA |
+|---|---|---|
+| 固定环境 | 原GNU工具/runtime及Linux缓存 | 原GNU工具/runtime、QEMU、Linux及musl缓存 |
+| core / ABI | 完整RV、scale、I/O等待、双盘、userland、1366 ABI、ELF尾页与栈 | CPU/MM/权限、信号/线程、等待、FPU/SIMD、动态exec、PCI/root I/O、1366 ABI与栈 |
+| runtime | glibc五形态、SQLite DELETE/静态动态CLI/独立重启、WAL | 相同消费者与完成条件，保留目标ELF及libc版本差异 |
+| platform | RNG/时钟、network、termios2/TTY/PTY | 相同类别，另含boot random和16KiB pipe geometry |
+| 定时完整消费者 | 229项原程序、TTY应用、实际Ethernet、RT双盘 | 229项原程序、TTY应用、实际Ethernet、PCI设备失败及RTC模型 |
 
-allocator host组包含CPU/raw、4/16 KiB真实线程并发、非法owner、抢占与有界工作量。
-同组的`test-wait-host/test-sleep-lock-host`直接链接生产等待和RW内部资格实现，
-用握手覆盖提前wake、单次仲裁、借用/close/destroy以及16节点批次边界。
-RV完整门禁和LA cpu-state组运行`test-sync-riscv/test-sync-loongarch`：原生CPU/原子正例及
-raw内禁止阻塞的入口反例。runner接收实际构建目录；COST构建不读取普通目录，缺失产物不回退。
-两侧另运行`test-wait-riscv/test-wait-loongarch`，核对512MiB/1GiB真实首次/恢复/退出切换及可信栈回收。
-`test-platform-profile-host`保护网络/RNG的显式RAM选择及环境参数错误；RV glibc五形态
-固定执行双RAM。环境fixture可通过`QEMU_MEMORY=1G make test-environment-riscv`选择配置。
+共同ABI、SQLite、RNG、network和TTY/PTY由CI显式传入`TEST_MEMORIES=512M 1G`；
+RV环境脚本分别执行两种RAM。空的`TEST_MEMORIES`保留聚焦入口原来的默认值。
+RV DELETE入口复用与LA相同的Linux/BoarOS runner，保留Make提供的实际程序、
+loader和kernel路径，不再只运行BoarOS的旧shell smoke。glibc原五形态本身已执行双RAM。
 
-两个独立 environment job 生产各自的缓存；LA 准备失败不阻止 RV 原回归或 RV GNU 环境。
-`Main dual-architecture gate` 使用 `always()` 检查所有声明 job；failure、cancelled、
-skipped 或缺失都失败。这个汇总检查可供仓库 required-check 规则使用；workflow
-本身不修改 GitHub 分支保护设置。
+架构专有验证保留实际差异：RV legacy/modern MMIO、NBD断电恢复和客体原生C
+编译；LA LSX/LASX、PCI共享INTx/reset和LS7A RTC。LA普通SQLite重启不代替
+RV已验证的全断电矩阵；LA客体原生开发尚未交付，不增加占位成功job。
 
-`tests/ci/suites.json` 是组合清单，`tests/ci/run.py` 执行各组并保存完整输出、
-argv、预算、退出码、耗时和最终状态。独立组失败后继续收集下一组；被取消的
-清单保持 incomplete，不补记未执行项。超时停止整个进程组，资源回收标为
-unverified；正常通过仍由各 native target 的协议、退出及 owner 断言决定。
+两个environment独立生产缓存，各consumer只依赖本架构producer。core的一组
+失败后runner继续收集后续独立组；同模板的platform准备与执行在native环境成功时
+继续，不被core失败跳过。runtime与core独立。`Main dual-architecture gate`以
+`always()`检查全部声明job，failure/cancelled/skipped/缺失都失败；工作流不改变分支保护。
+
+host allocator组直接链接生产CPU/raw、buddy/slab、等待与RW资格，覆盖4/16KiB
+并发、非法owner、抢占、有界工作量及借用销毁。RV完整门禁与LA cpu-state运行
+真实raw/等待/handoff，含双RAM首次/恢复/退出切换；宿主并发不代表整个内核SMP-ready。
+
+`tests/ci/run.py`保存完整输出、argv、预算、退出码和最终状态。超时停止整个进程组，
+回收标为unverified；取消保留incomplete，未执行项不补成功。host使用宿主PATH和
+空LD_LIBRARY_PATH；输出超时测试先确认真实子进程flush/ready，正式计时预算不变。
+所有native Make命令显式使用`INIT_CONFIG=config/init.json`。
 
 ```sh
 make test-ci-host
 python3 -B tests/ci/run.py --arch host --suite host
+python3 -B tests/ci/run.py --arch riscv --suite core
 python3 -B tests/ci/run.py --arch loongarch --suite core
+python3 -B tests/ci/run.py --arch riscv --suite runtime
+python3 -B tests/ci/run.py --arch loongarch --suite runtime
 python3 -B tests/ci/run.py --arch riscv --suite platform
 python3 -B tests/ci/run.py --arch loongarch --suite platform
-python3 -B tests/ci/run.py --arch loongarch --suite runtime
 ```
 
 ## 固定环境与缓存
