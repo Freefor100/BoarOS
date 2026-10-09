@@ -8,7 +8,7 @@
       {"name":"random-clock","targets":["test-random-host","test-rtc-host","test-rtc-loongarch-host"]},
       {"name":"events-network","targets":["test-epoll-host","test-lwip-host","test-lwip-reassembly-host","test-ethernet-worker-host"]},
       {"name":"file-cache","targets":["test-lwext4-host","test-lwext4-checksum-host","test-lwext4-cache-host","test-lwext4-batch-read-host","test-lwext4-group-host","test-lwext4-metadata-host","test-lwext4-deep-truncate-host"]},
-      {"name":"runner-profiles","targets":["test-diff-abi-host","test-program-inventory-host","test-program-environment-host","test-glibc-profile-host"]}
+      {"name":"runner-profiles","targets":["test-diff-abi-host","test-program-inventory-host","test-program-environment-host","test-glibc-profile-host","test-platform-profile-host"]}
     ]
   },
   "core": {

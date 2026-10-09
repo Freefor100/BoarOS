@@ -1,6 +1,8 @@
 #!/bin/sh
 set -eu
 root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+memory=${QEMU_MEMORY:-512M}
+case "$memory" in 512M|1G) ;; *) echo 'QEMU_MEMORY must be 512M or 1G' >&2; exit 2 ;; esac
 work=$(mktemp -d "$root/build/riscv/environment-run.XXXXXX")
 trap 'result=$?; if [ "$result" -eq 0 ]; then rm -rf "$work"; else echo "environment artifacts: $work" >&2; fi' EXIT
 compiler="$root/build/riscv/musl-root/bin/musl-gcc"
@@ -13,7 +15,7 @@ mkfs.ext4 -q -F -b 4096 "$work/root.img"
 debugfs -w -R "write $work/init /init" "$work/root.img" >/dev/null 2>&1
 debugfs -w -R 'set_inode_field /init mode 0100755' "$work/root.img" >/dev/null 2>&1
 timeout -k 2s 60s "${QEMU_RISCV64:-qemu-system-riscv64}" -machine virt -bios default \
-    -kernel "${KERNEL_RV:-$root/kernel-rv}" -m 512M -smp 1 -nographic -no-reboot \
+    -kernel "${KERNEL_RV:-$root/kernel-rv}" -m "$memory" -smp 1 -nographic -no-reboot \
     -drive "file=$work/root.img,if=none,format=raw,id=root" \
     -device virtio-blk-device,drive=root,bus=virtio-mmio-bus.0 >"$work/output" 2>&1
 if ! rg -q 'ENV PASS all' "$work/output" || ! rg -q 'status=0x0' "$work/output"; then

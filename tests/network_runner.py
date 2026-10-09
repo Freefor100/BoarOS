@@ -78,6 +78,8 @@ def main(default_arch="riscv"):
     parser.add_argument('--memory',action='append',choices=('512M','1G'))
     parser.add_argument('--kernel',type=Path)
     args=parser.parse_args()
+    if args.arch=='riscv' and args.platform_config=='official' and args.memory and args.memory!=['1G']:
+        parser.error('official profile requires 1G')
     if args.arch=='loongarch':return run_loongarch(args)
     args.kernel=args.kernel or ROOT/'kernel-rv'
     work=ROOT/'build/network'/('contract-'+str(time.time_ns()))
@@ -97,23 +99,25 @@ def main(default_arch="riscv"):
     metadata['qemu']=subprocess.check_output([qemu,'--version'],text=True)
     for name,kernel in variants:
         snapshot=work/(name+'-kernel');shutil.copyfile(kernel,snapshot)
-        disk=work/(name+'.img');shutil.copyfile(image,disk)
-        command=[qemu,'-machine','virt','-bios','default','-kernel',str(snapshot),'-m','512M','-smp','1',
-                 '-nographic','-no-reboot','-drive',f'file={disk},if=none,format=raw,id=root',
-                 '-device','virtio-blk-device,drive=root,bus=virtio-mmio-bus.0']
-        if args.platform_config=='official':
-            command[command.index('-m')+1]='1G'
-            command+=['-device','virtio-net-device,netdev=net','-netdev','user,id=net','-rtc','base=utc']
-        if name=='linux':command+=['-append','root=/dev/vda rw rootwait console=ttyS0 init=/init loglevel=0 panic=-1']
-        log=work/(name+'.log')
-        try:harness.run_logged(command,log,60)
-        except (RuntimeError,TimeoutError):pass
-        raw=log.read_text(errors='replace')
-        passed=f'NETWORK PASS {args.workload}' in raw
-        if name=='boaros':passed=passed and 'heap-live=0x0; shutting down' in raw and 'exited status=0x0 ' in raw
-        metadata['runs'][name]={'passed':passed,'kernel_sha256':digest(snapshot),'command':command}
-        print(name, 'PASS' if passed else 'FAIL',work)
-        if not passed:print('\n'.join(raw.splitlines()[-8:]))
+        memories=args.memory or (('1G',) if args.platform_config=='official' else ('512M',))
+        for memory in memories:
+            label=name if len(memories)==1 else name+'-'+memory
+            disk=work/(label+'.img');shutil.copyfile(image,disk)
+            command=[qemu,'-machine','virt','-bios','default','-kernel',str(snapshot),'-m',memory,'-smp','1',
+                     '-nographic','-no-reboot','-drive',f'file={disk},if=none,format=raw,id=root',
+                     '-device','virtio-blk-device,drive=root,bus=virtio-mmio-bus.0']
+            if args.platform_config=='official':
+                command+=['-device','virtio-net-device,netdev=net','-netdev','user,id=net','-rtc','base=utc']
+            if name=='linux':command+=['-append','root=/dev/vda rw rootwait console=ttyS0 init=/init loglevel=0 panic=-1']
+            log=work/(label+'.log')
+            try:harness.run_logged(command,log,60)
+            except (RuntimeError,TimeoutError):pass
+            raw=log.read_text(errors='replace')
+            passed=f'NETWORK PASS {args.workload}' in raw
+            if name=='boaros':passed=passed and 'heap-live=0x0; shutting down' in raw and 'exited status=0x0 ' in raw
+            metadata['runs'][label]={'passed':passed,'memory':memory,'kernel_sha256':digest(snapshot),'command':command}
+            print(name,memory,'PASS' if passed else 'FAIL',work)
+            if not passed:print('\n'.join(raw.splitlines()[-8:]))
     (work/'result.json').write_text(json.dumps(metadata,indent=2)+'\n')
     if not all(row['passed'] for row in metadata['runs'].values()):return 1
     for path in work.glob('*.img'):path.unlink()

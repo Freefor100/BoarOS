@@ -1725,6 +1725,10 @@ test-log-host:
 test-environment-riscv: $(KERNEL_RV)
 	KERNEL_RV=$(KERNEL_RV) QEMU_RISCV64=$(QEMU_RISCV64) sh tests/environment-riscv.sh
 
+.PHONY: test-platform-profile-host
+test-platform-profile-host:
+	python3 -B tests/host/platform_memory.py
+
 .PHONY: test-rtc-host
 test-rtc-host:
 	@mkdir -p build/host
