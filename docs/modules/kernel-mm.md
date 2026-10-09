@@ -214,7 +214,7 @@ make test-riscv
 
 MM 聚焦测试覆盖创建失败原子性、共享引用、移动、COW fork 的父子共享/写隔离/末引用原地恢复、`PROT_NONE` COW 属性，以及正常页表回收和物理页基线；VMA 聚焦测试另覆盖共享匿名页的 fork 前驻留、双方首次 fault 顺序、权限拆分、部分撤映射、替换、退出和 OOM 回滚。同一 MM target 还运行独立 fatal kernel，注入一次页表 backing 无法解析并确认只产生一个 fatal 结果、不会返回 retry/success 路径。文件测试覆盖 cache hit/miss、write-first、尾页补零、整页越 EOF、fd 关闭后 fault、fork 后 OFD 来源和最终回收。syscall 聚焦测试验证校验错误先于不可读 OFD 的 `EACCES`，两类拒绝都释放临时 pin 且不进入 MM 提交；`test-userland-riscv` 用真实 musl mmap 覆盖匿名共享的双向可见、fd 忽略、fixed 冲突，以及原有私有 mmap。`test-mmap-riscv` 与真实 ext4 `/init` 从 U-mode 完成匿名/文件私有 mmap、COW、SIGBUS、mprotect/munmap 生命周期；`test-diff-abi-riscv` 与 `test-sqlite-wal-riscv` 另验证文件共享 mmap、`msync` 和独立进程 WAL。
 
-当前只有 RISC-V 后端；映射仍由 Sv39/4 KiB 用户页实现。普通 fork 使用独立 MM，私有页 COW、共享匿名与共享文件页保持共享；线程 clone/vfork 共享同一 MM record。匿名映射和 ELF image 使用每 MM 的 ASLR mmap ceiling（无任何随机材料时确定性降级；仅 DTB 混种不提供可信安全保证），但没有 commit accounting。栈软限制约束后续未驻留栈页的填充，已存在的 PTE 保留；新 exec 在固定容量 VMA 内按当前软限制建立初始栈。可读普通文件支持 MAP_PRIVATE/MAP_SHARED 与 `msync`；brk 尚未接入 RLIMIT_DATA。文件表和信号表不属于 MM。private futex 使用 MM 创建时分配的单调身份号与用户地址，避免 MM record 页回收后重用身份；共享匿名 futex 使用后备对象与连续字节偏移，等待者持有对象引用。共享文件 futex 尚无后备 key。
+已接入构建期绑定的RV64 Sv39/4 KiB与LA64 16 KiB/三级页表后端；共用MM策略不提供跨核保护。普通 fork 使用独立 MM，私有页 COW、共享匿名与共享文件页保持共享；线程 clone/vfork 共享同一 MM record。匿名映射和 ELF image 使用每 MM 的 ASLR mmap ceiling（无任何随机材料时确定性降级；仅 DTB 混种不提供可信安全保证），但没有 commit accounting。栈软限制约束后续未驻留栈页的填充，已存在的 PTE 保留；新 exec 在固定容量 VMA 内按当前软限制建立初始栈。可读普通文件支持 MAP_PRIVATE/MAP_SHARED 与 `msync`；brk 尚未接入 RLIMIT_DATA。文件表和信号表不属于 MM。private futex 使用 MM 创建时分配的单调身份号与用户地址，避免 MM record 页回收后重用身份；共享匿名 futex 使用后备对象与连续字节偏移，等待者持有对象引用。共享文件 futex 尚无后备 key。
 
 ## 驻留文件映射与截断
 
@@ -258,3 +258,28 @@ PROT_NONE、非当前 MM、尾页、关闭 fd、unlink、O_TRUNC 与重新增长
 `make test-cost-riscv COST_CASE=mprotect` 使用固定一页目标和16/64/256无关VMA、
 0/16/64MiB文件驻留页，三个启动副本；权限拒绝和洞窗口要求PTE访问为0。
 OOM/split/fork 由 vma/scale/ABI 组合回归继续保护。
+
+
+## SMP前置的用户复制与回收契约（2026-10-09）
+
+`kernel_mm_lookup`给出PTE快照，`physical_page_resolve`验证allocated owner并返回直接
+映射指针；两者没有取得覆盖复制阶段的额外页引用。当前syscall/缺页链依靠单CPU
+IRQ关闭纪律，文件fault睡眠前固定来源，恢复后重查VMA代次、PTE/COW和权限。
+接口尚无复制期pin或跨核保护；潜在SMP交错不代表已复现单CPUUAF。
+
+允许CLONE_VM线程跨核前，必须在同一MM保护下查找映射并取得访问pin，不能在两步
+之间被munmap释放/复用。fault睡眠后重新定位VMA/PTE/权限/COW并处理过期候选；
+pin只保证物理页存活，不能代替权限许可点。后续实现须定义片段复制与mprotect返回
+的交接关系；失败返回精确已复制前缀，不能把未复制片段算成功。
+
+撤映射、降权、文件truncate或COW替换发布之后，须确定所有活动CPU及并发切换者，
+完成远程TLB失效确认，才可归还旧页、页表和映射owner。等待远核完成时不能持有其
+所需的MM raw锁；未确认时由明确延期回收owner保留页，不能把超时当作已停止使用。
+当前RV SFENCE.VMA、LA INVTLB只完成本CPU失效，尚无远程完成协议。
+
+并发验证需明确以下交错：lookup/pin↔munmap/复用；COW发布↔并发写/退出；
+mprotect降权↔另一核访问；文件fault↔truncate/写回；MM切换↔TLB目标集合与回收。
+SMP共享MM、uaccess、活动CPU和TLB完成必须作为一个单元验收，详见[路线图](../goals.md#p6c-tlb-完成与页回收)。
+依据为本地references/linux/arch/riscv/include/asm/tlbflush.h及arch/riscv/mm/tlbflush.c，
+commit f4cdf7ca9a1fdcca413157df19753f388a5a224e；这里仅使用其本地/远程失效区别，
+不声称BoarOS已实现Linux的全部页pin接口或复制并发语义。

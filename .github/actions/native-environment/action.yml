@@ -1,0 +1,102 @@
+name: Fixed native test environment
+description: Restore original GNU packages and exact native reference caches
+inputs:
+  arch:
+    description: riscv or loongarch
+    required: true
+  mode:
+    description: prepare produces the reusable caches; consume requires them
+    default: consume
+runs:
+  using: composite
+  steps:
+    - name: Install native build dependencies
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential gcc-riscv64-unknown-elf \
+          binutils-riscv64-unknown-elf gcc-riscv64-linux-gnu binutils-riscv64-linux-gnu \
+          qemu-system-misc opensbi e2fsprogs flex bison bc libssl-dev libelf-dev \
+          python3 python3-venv python3-yaml ninja-build pkg-config libglib2.0-dev \
+          libpixman-1-dev libslirp-dev libgmp-dev libmpfr-dev libmpc-dev libisl-dev libzstd-dev \
+          zlib1g-dev git curl unzip zstd libarchive-tools iproute2 rsync gawk ripgrep apparmor
+    - name: Compute exact environment key
+      id: identity
+      shell: bash
+      env:
+        TARGET_ARCH: ${{ inputs.arch }}
+      run: echo "key=$(python3 -B tests/ci/tools.py --arch "$TARGET_ARCH" --cache-key)" >> "$GITHUB_OUTPUT"
+    - name: Restore fixed tool installation
+      id: tools
+      uses: actions/cache/restore@v5
+      with:
+        path: build/tools/${{ inputs.arch }}
+        key: main-tools-${{ runner.os }}-${{ inputs.arch }}-${{ steps.identity.outputs.key }}
+    - name: Validate tools and export their installation
+      shell: bash
+      env:
+        TARGET_ARCH: ${{ inputs.arch }}
+      run: python3 -B tests/ci/tools.py --arch "$TARGET_ARCH" --github-env
+    - name: Save verified tool installation
+      if: steps.tools.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v5
+      with:
+        path: build/tools/${{ inputs.arch }}
+        key: main-tools-${{ runner.os }}-${{ inputs.arch }}-${{ steps.identity.outputs.key }}
+    - name: Restore exact native cache
+      id: native
+      uses: actions/cache/restore@v5
+      with:
+        path: |
+          references/linux
+          references/qemu
+          references/oscomp-testsuits
+          references/musl
+          references/gcc
+          references/linux-uapi
+          references/sqlite
+          build/qemu-la-rtc
+          build/linux-la
+          build/linux-la-platform
+          build/loongarch
+          build/diff-abi/linux
+        key: main-native-${{ runner.os }}-${{ inputs.arch }}-${{ steps.identity.outputs.key }}
+    - name: Require the producer cache
+      if: inputs.mode == 'consume'
+      shell: bash
+      env:
+        CACHE_HIT: ${{ steps.native.outputs.cache-hit }}
+      run: test "$CACHE_HIT" = true
+    - name: Restore and verify fixed native inputs
+      shell: bash
+      env:
+        TARGET_ARCH: ${{ inputs.arch }}
+      run: python3 -B tests/ci/tools.py --arch "$TARGET_ARCH" --references
+    - name: Prepare LA native tools and runtimes
+      if: inputs.arch == 'loongarch' && inputs.mode == 'prepare'
+      shell: bash
+      run: |
+        make INIT_CONFIG=config/init.json prepare-la-tools prepare-la-linux \
+          prepare-la-linux-platform prepare-la-userland prepare-la-dynamic
+    - name: Prepare RV GNU reference kernel
+      if: inputs.arch == 'riscv' && inputs.mode == 'prepare'
+      shell: bash
+      run: make build-diff-abi-linux
+    - name: Save complete native cache
+      if: inputs.mode == 'prepare' && steps.native.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v5
+      with:
+        path: |
+          references/linux
+          references/qemu
+          references/oscomp-testsuits
+          references/musl
+          references/gcc
+          references/linux-uapi
+          references/sqlite
+          build/qemu-la-rtc
+          build/linux-la
+          build/linux-la-platform
+          build/loongarch
+          build/diff-abi/linux
+        key: main-native-${{ runner.os }}-${{ inputs.arch }}-${{ steps.identity.outputs.key }}

@@ -158,11 +158,13 @@ static unsigned pressure_notified, pressure_reclaimed, pressure_waited;
 static uint64_t pressure_page;
 static void pressure_notify(void *context)
 {
+    assert(!kernel_cpu_current()->raw_locks && !kernel_cpu_current()->preempt_depth);
     assert(context == &allocator && !allocator_test_irq_enabled);
     pressure_notified++;
 }
 static uint64_t pressure_reclaim(void *context, uint64_t needed)
 {
+    assert(!kernel_cpu_current()->raw_locks && !kernel_cpu_current()->preempt_depth);
     assert(context == &allocator && needed == 1 && !allocator_test_irq_enabled);
     pressure_reclaimed++;
     uint64_t unused;
@@ -172,6 +174,7 @@ static uint64_t pressure_reclaim(void *context, uint64_t needed)
 }
 static void pressure_wait(void *context)
 {
+    assert(!kernel_cpu_current()->raw_locks && !kernel_cpu_current()->preempt_depth);
     assert(context == &allocator && !allocator_test_irq_enabled);
     assert(contexts[0].reclaim_depth == 0);
     pressure_waited++;

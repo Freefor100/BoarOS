@@ -25,6 +25,8 @@ enum kernel_uaccess_status kernel_user_range_check(
     return KERNEL_UACCESS_STATUS_OK;
 }
 
+/* 返回借用direct-map指针，不取得覆盖随后复制的pin。当前fault路径在I/O后
+ * 重查映射；后续SMP必须将lookup+pin与权限许可点纳入同一MM保护。 */
 static enum kernel_uaccess_status resolve_user_page(
     struct kernel_mm *mm,
     uint64_t user_address,

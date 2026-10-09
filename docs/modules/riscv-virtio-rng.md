@@ -39,6 +39,7 @@ make all
 build/riscv/musl-root/bin/musl-gcc -fno-link-libatomic -static -O2 \
   -Wall -Wextra -Werror tests/userland/rng.c -o build/riscv/tests/user/rng-rv
 python3 -B tests/rng-riscv.py
+python3 -B tests/rng-riscv.py --memory 512M --memory 1G
 make test-rng-loongarch test-rng-failures-loongarch
 ```
 

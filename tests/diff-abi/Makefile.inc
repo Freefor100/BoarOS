@@ -42,3 +42,15 @@ build/loongarch/diff-abi-cases: $(DIFF_ABI_SOURCES) tests/diff-abi/abi.h tests/c
 .PHONY: test-diff-abi-loongarch
 test-diff-abi-loongarch: test-diff-abi-host kernel-la build/loongarch/diff-abi-cases prepare-la-tools prepare-la-linux-platform
 	python3 -B tests/diff-abi/harness.py --arch loongarch --kernel kernel-la --program build/loongarch/diff-abi-cases --timeout 180
+
+build/diff-abi/sched-handoff-rv: $(DIFF_ABI_SOURCES) tests/diff-abi/sched_handoff.c tests/diff-abi/abi.h tests/riscv/user_elf.ld
+	@mkdir -p $(@D)
+	$(CC) $(ARCH_FLAGS) -DABI_SCHED_HANDOFF_ONLY -Wno-unused-function -O2 -Wall -Wextra -Werror -ffreestanding -fno-builtin -fno-stack-protector -nostdlib -static -Wl,--build-id=none -Wl,-T,tests/riscv/user_elf.ld -Wl,--defsym,__global_pointer\$$=0 -o $@ $(DIFF_ABI_SOURCES) tests/diff-abi/sched_handoff.c
+build/loongarch/sched-handoff-la: $(DIFF_ABI_SOURCES) tests/diff-abi/sched_handoff.c tests/diff-abi/abi.h tests/common/user.ld
+	@mkdir -p $(@D)
+	$(LA_CC) $(LA_FLAGS) -DABI_SCHED_HANDOFF_ONLY -Wno-unused-function -O2 -Wall -Wextra -Werror -ffreestanding -fno-builtin -fno-stack-protector -nostdlib -nostartfiles -static -no-pie -Wl,--build-id=none -Wl,-z,max-page-size=16384 -Wl,-T,tests/common/user.ld -o $@ $(DIFF_ABI_SOURCES) tests/diff-abi/sched_handoff.c
+.PHONY: test-scheduler-handoff-riscv test-scheduler-handoff-loongarch
+test-scheduler-handoff-riscv: $(KERNEL_RV) build/diff-abi/sched-handoff-rv
+	python3 -B tests/diff-abi/harness.py --arch riscv --kernel $(KERNEL_RV) --program build/diff-abi/sched-handoff-rv --case-manifest tests/diff-abi/sched-handoff-cases.txt --memory 512M --memory 1G --timeout 60 --output build/sched-handoff-rv
+test-scheduler-handoff-loongarch: kernel-la build/loongarch/sched-handoff-la prepare-la-tools prepare-la-linux-platform
+	python3 -B tests/diff-abi/harness.py --arch loongarch --kernel kernel-la --program build/loongarch/sched-handoff-la --case-manifest tests/diff-abi/sched-handoff-cases.txt --memory 512M --memory 1G --timeout 60 --output build/sched-handoff-la

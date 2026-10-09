@@ -507,3 +507,10 @@ int main(void)
          "termios/rings/continuation/fault/timeouts/flow/cancellation/ownership pass");
     return 0;
 }
+
+#include "../host/wait_boundary.h"
+#if defined(HOST_WAIT_CORE_EMBEDDED)
+HOST_WAIT_BOUNDARY(core_, kernel_scheduler_block_current)
+#else
+HOST_WAIT_BOUNDARY(, kernel_scheduler_block_current)
+#endif

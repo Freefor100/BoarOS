@@ -24,7 +24,7 @@ futex 是“用户态原子变量 + 内核等待队列”，不是每次加锁�
 
 glibc 2.44 的 `pthread_join` 在 fixed source `nptl/pthread_join_common.c` 调用 `__futex_abstimed_wait_cancelable64`；`nptl/futex-internal.c` 以 `FUTEX_WAIT_BITSET | FUTEX_CLOCK_REALTIME` 发出 raw syscall，即使未传 timeout 也使用 bitset 命令。BoarOS 曾让 `pthread_create` 成功，却在 `pthread_join` 返 ENOSYS 后由 glibc 报 futex fatal。只让 `FUTEX_BITSET_MATCH_ANY` 伪装成普通 WAIT 会错误处理其他非零掩码、绝对截止时刻和 WAKE_BITSET；在既有 per-task futex key 模型内，等待者另存掩码、REQUEUE 保持掩码，WAKE_BITSET 仅按相交位唤醒。固定 Linux `kernel/futex/syscalls.c` 与 `waitwake.c` 是错误顺序、掩码和绝对时钟依据。当前 BoarOS 没有修改 realtime 的 syscall，启动偏移不变；未来支持调时时，已经阻塞的 realtime wait 不能继续依赖这一固定偏移假设。
 
-WAIT 必须原子地完成“比较用户字与 expected → 登记 waiter → 阻塞”。若比较与登记之间允许另一个线程修改用户字并执行 WAKE，唤醒可能落在空队列上，随后登记的线程就会错过通知。单 hart 的 BoarOS 通过关闭中断覆盖该区间；未来 SMP 必须在同一哈希桶锁保护下重新完成比较与登记，关本地中断并不能阻止其他 hart。
+WAIT 必须闭合“比较用户字与 expected → 登记 waiter → 阻塞”。若比较与登记之间允许另一个线程修改用户字并执行 WAKE，唤醒可能落在空队列上，随后登记的线程就会错过通知。当前BoarOS先建立token登记，再复查用户字；仲裁器保留park前通知。key解析、用户页和业务状态仍依赖单CPU IRQ纪律，未来共享MM的lookup/pin、比较与发布需要完整跨核协议；关本地中断不能替代它。
 
 private waiter 使用单调分配且不复用的 MM 身份号和四字节对齐用户地址；共享匿名 waiter 使用后备对象身份和对象内连续字节偏移。哈希仅用于定位桶，命中后仍须比较完整 key。不同 MM 的相同虚拟地址不会串扰，fork 后不同 MM 的同一共享对象可以互相唤醒。等待者持有共享对象引用到等待调用恢复；requeue 为迁移者取得目标引用并释放源引用，避免最后一个映射消失后旧对象地址重用。单 hart 关中断串行化解析、比较与登记，SMP 仍须独立锁协议。
 
@@ -144,6 +144,22 @@ WAKE，重启成功场景保持用户字不变，直到WAKE明确返回选中一
 在原BoarOS和固定Linux各重复200次通过，完整 `make test-userland-riscv`
 亦通过。重建的常规入口仍是该目标；内核futex实现没有随此测试修正改变。
 
+## CPU 本地与 raw 锁的边界
+
+内核 tp 继续指向任务，任务关联 CPU 记录；它与用户 TLS 的保存完全独立。
+CPU 记录持有 current、待调度标志和短锁/抢占深度，I/O guard 与回收深度仍由任务持有。
+禁止抢占只保证本地执行上下文稳定；共享元数据还需要带 acquire/release 内存序的互斥。
+raw guard 保存原 IRQ 状态并登记到 CPU 持有链，禁止递归、逆序和持锁阻塞。
+timer 可以记账并留下待调度请求，解除禁止抢占不在任意调用栈直接切换。
+延期状态还须保留OTHER轮转原因：只有need_resched时，同级peer既不higher、OTHER也不expired，
+安全返回会清掉请求并继续当前任务。idle对照会被higher条件掩盖，因此另用两个普通OTHER
+任务保护延期tick的轮转和退出回收。显式preempt计数可嵌套在raw内，但不能抵消raw自身的深度。
+
+固定依据为 `references/linux/Documentation/locking/locktypes.rst`，commit
+`f4cdf7ca9a1fdcca413157df19753f388a5a224e`；LA CPU ID 来自
+`references/linux/arch/loongarch/include/asm/loongarch.h` 的 CPUID CSR 0x20。
+宿主四线程互斥与客户机单核抢占是不同证据，二者都不能代替客户机多核等待/回收验收。
+
 ## PID 1 关机与存活后台 owner（2026-10-06）
 
 原版五项脚本全结束后出现 root CLEANUP（0xb）。最小复现为 PID 1 fork 出
@@ -181,3 +197,45 @@ make test-root-orphan-riscv
 一次 27.434 秒启动中十二项均 success，最终 PID 1 status=0、heap-live=0 并正常
 关机。它直接覆盖原程序遗留 server daemon 的触发条件；不据此将此前五项启动的
 失败记录改写为通过，也不将单次吞吐变化归因于参数调整。
+
+## 代次等待与切换尾部
+
+登记与park分离后，wake可能发生在任务仍执行旧栈时。token代次解决旧通知误中下一次等待，
+on_cpu与新栈完成点解决同一任务重新入队或旧栈提前回收；两者解决不同问题。任务提交阻塞后
+即使已经收到通知，也只能在switch_finish后重新发布runnable。回调借用同样不能由摘队代替：
+退休节点保留引用后继，context释放前同步等借用结束。调度raw域只做这些短元数据操作，
+callback在锁外同步运行并拒绝阻塞，业务对象的锁与存活仍由消费者负责。
+
+2026-10-09聚焦验证使用真实`kernel/sched/park.c`的2/4宿主通知线程及RV/LA单CPU512MiB/1GiB
+真实切换；重建命令为`make test-wait-host test-wait-riscv test-wait-loongarch`。固定同步资料仍为
+`references/linux/kernel/sched/core.c`及`include/linux/wait.h`，commit
+`f4cdf7ca9a1fdcca413157df19753f388a5a224e`；实现保留BoarOS的任务资格与owner契约。
+
+可睡眠锁的内部资格与业务对象的数据保护分开：前者用每实例raw30及调度raw40，后者继续由
+mutex/RW guard的任务owner承担。读者批次释放内部raw时，handoff owner保留原批次边界；
+后来到达者不能搭上尚未完成的旧批次。宿主握手在第16个读者后强制插入后来读者；删除批次
+边界的候选被反例拒绝，生产实现保持后来者等待旧批次退出。重建为`make test-sleep-lock-host`。
+
+futex过滤wake不能沿用跨解锁的裸next。游标借用node，requeue额外借task再释放当前游标，
+旧node借用收完后才移动登记；后备引用取得/归还留在raw域外。全局不回退的等待代次还覆盖
+任务页复用：同地址的新任务不能消费旧token。当前资料与客体配置不变，这些同步原语的宿主
+并发结果仍不等于共享MM、FD/OFD、缓存或协议业务数据已完成SMP同步。
+
+可睡眠锁必须区分通知与资格。额外通知时，等待者结束旧token、在对象raw内复查资格，
+尚未授予才重新登记，原pending位置不变。结束登记只清局部token副本；pending中的token
+只在对象raw内更新，释放者可在该间隙授资格并发送已经过期的通知。等待者随后复查即可前进。
+`test-sleep-lock-host`以握手覆盖这两个间隙，保护继续等待及资格唯一性。
+
+关闭操作自身也有寿命：即使队列为空，close停止登记与随后通知之间仍会访问队列，
+必须保留操作借用。宿主握手曾证明该间隙destroy错误成功；现在返回BUSY，操作结束才归零。
+切换完成只属于实际恢复尾部或首次trampoline，普通异常返回无需再次查旧栈前驱。
+这些边界与[匹配时间](cost-baseline.md#等待交接的匹配时间)分开验收；功能通过不意味着吞吐提高。
+
+同一短锁内完成单任务通知时，节点不会跨解锁借用，但仍须检查活动queue与borrow_owner身份。
+省去borrow动作不能连带省掉原有非法owner检测；真实宿主反例保护该边界。
+
+信号测试的ready标志若写在WAIT syscall之前，不能证明已经登记；强制信号先进入、条件再改变，
+同一LA ELF在固定Linux与BoarOS的512MiB/1GiB均返回合法EAGAIN。当前信号目录用零wake的
+FUTEX_REQUEUE确认真实登记、保持阻塞，再交付信号；固定依据为`references/linux/kernel/futex/requeue.c`，
+commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`。这不依赖随机sleep。一次未强制的旧动态目录
+失败只有汇总码10，没有子步骤结果，不能从反例或后续成功反推其确切原因；已增加结果/errno诊断。

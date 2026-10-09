@@ -46,6 +46,7 @@ riscv_context_switch:
     .type riscv_kernel_thread_trampoline, @function
 
 riscv_kernel_thread_trampoline:
+    call kernel_scheduler_switch_finish
 #if BOAROS_COST_DIAGNOSTICS
     call kernel_cost_irq_enable_now
 #endif

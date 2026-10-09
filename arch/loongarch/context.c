@@ -4,7 +4,7 @@
 #include <string.h>
 #include "../../kernel/sched/private.h"
 void la_kernel_thread_trampoline(void);
-void la_trap_return(void);
+void la_user_thread_trampoline(void);
 enum arch_context_status arch_context_init(struct arch_switch_context *context,
     uintptr_t stack, void (*entry)(void *), void *argument, void *task)
 {
@@ -17,7 +17,7 @@ enum arch_context_status arch_context_init(struct arch_switch_context *context,
 enum arch_context_status arch_context_init_user(struct arch_switch_context *context, uintptr_t frame, void *task)
 {
     if (!context || !frame || (frame&15) || !task) return ARCH_CONTEXT_STATUS_INVALID_ARGUMENT;
-    memset(context, 0, sizeof(*context)); context->ra=(uintptr_t)la_trap_return;
+    memset(context, 0, sizeof(*context)); context->ra=(uintptr_t)la_user_thread_trampoline;
     context->sp=frame; context->tp=(uintptr_t)task; return ARCH_CONTEXT_STATUS_OK;
 }
 void arch_fpu_switch(struct arch_fpu_state *previous, struct arch_fpu_state *next)

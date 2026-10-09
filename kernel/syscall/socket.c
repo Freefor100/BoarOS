@@ -276,9 +276,10 @@ static int wait_ready(struct kernel_task *caller,
             arch_interrupt_restore(saved);
             return -KERNEL_EAGAIN;
         }
-        if (kernel_scheduler_block_current(
+        if (KERNEL_WAIT_RECHECK(
                 kernel_socket_wait_queue(socket), sleep_deadline, 1,
-                &reason) !=
+                &reason,
+                ((kernel_socket_poll(socket, 0) & event) == 0U)) !=
             KERNEL_SCHEDULER_STATUS_OK) {
             arch_interrupt_restore(saved);
             return -KERNEL_EIO;

@@ -12,7 +12,8 @@
 | `tests/riscv/physical_page_main.c`、`tests/page-riscv.sh` | 构建并运行独立的 QEMU 聚焦测试内核 |
 | `tests/host/allocator_release.c` | 独立子进程验证非法释放 fatal 和各 guard 的失败诊断 |
 
-RISC-V64 构建固定 `BOAROS_PAGE_SHIFT=12`。初始化把每个字节粒度可用区间
+共用实现按构建目标使用RV64的 `BOAROS_PAGE_SHIFT=12` 或LA64的14。
+初始化把每个字节粒度可用区间
 向内收缩到完整页，拒绝溢出、乱序或重叠输入；不足一页的碎片被忽略。失败不会
 修改调用者已有的分配器状态。
 
@@ -66,14 +67,15 @@ finalized 的 order-0 页可用 `physical_page_acquire()` 增加 32 位引用，
 同一分配器的磁盘缓存登记到共同 owner，干净回收按实例轮转；停止一个实例不注销其他实例。最后实例及等待者都释放引用后才销毁共同 owner。
 
 `physical_page_resolve()` 为持有分配页的调用者提供受检查的物理地址访问。bootstrap
-模式只能按发放历史检查；finalized 模式还要求 metadata 为 allocated head/tail，明确
+模式只能按发放历史检查；finalized 模式要求页首位于 allocated 权威块，允许连续块内的尾页页首，明确
 拒绝 free 和 internal 页。两种模式都只在访问回调返回非空指针后写输出。
 
 `physical_page_total()` 保留所有对齐可用页的原始总数；
 `physical_page_available()` 在 finalized 后排除 bootstrap owner 与 metadata；
-`physical_page_metadata_pages()` 只在 finalized 后返回内部占用。metadata 每个物理页
-使用 16 字节，包含双向链索引、引用数、order 与所有权状态；16 GiB/4 KiB 的理论完整 RAM
-需要 64 MiB，即约 0.391% RAM，实际值按排除固件和内核后的页数向上取整。
+`physical_page_metadata_pages()` 只在 finalized 后返回内部占用。metadata由每页16字节载荷、有序根目录和3-bit隐式树组成；只有活跃块头使用载荷。
+令总页数P、根数R，当前字节预算为 `16*P + 32*R + ceil(3*(2*P-R)/8)`，最终按页取整。
+4 KiB下主体约占RAM的0.409%，16 KiB约0.102%；根目录与页取整另计，不能继续沿用
+旧表示的0.391%作为新资源基线。metadata来自未发放连续区间，全部标为internal。
 
 ## 算法与限制
 
@@ -81,13 +83,43 @@ finalized 的 order-0 页可用 `physical_page_acquire()` 增加 32 位引用，
 重复释放检测仍会扫描临时回收链；这条路径只服务最终页表建立前的硬件迁移。
 finalize 初始化逐页 metadata，成本为 O(物理页数)，但每次启动只发生一次。
 
-finalized 分配最多检查 32 个 order；free-list head 的插入和双向摘链为 O(1)，split
-与 coalesce 为 O(order)，不会扫描同 order 的其他空闲块。为了让 interior release 和
-resolve 能精确判定所有权，分配或释放 order N 块还会更新本次块内 `2^N` 条状态；
-常用 order-0 热路径只更新一个页记录，acquire/非末 release 也只修改该页引用数。
-分配热路径只发布阈值唤醒，不扫描缓存或执行 I/O；首次分配失败才同步扫描干净缓存。当前单 hart 仍会在开中断的内核线程中发生 timer 抢占。一次 buddy 摘链、split、
-分配发布或 release/coalesce，以及引用更新和一致性读取，均由保存/恢复 SIE 的短临界区
-保护。SMP 接入前仍须把这些边界升级为跨核锁。
+finalized分配搜索order入口，根目录按PA或平坦页索引二分；相关owner沿隐式树查找。
+free/split/allocated/internal为权威状态，inactive节点不拥有页，编码5–7为损坏。
+分裂先准备子状态再发布split，合并先摘链/退休子节点再发布free。无跨range合并；
+旧尾载荷不参与owner判断，不能用一段旧尾的状态替代树验证。
+
+只读的resolve、allocation_order和reference_count在页首载荷给出候选块头时，
+验证该几何位置的活动ALLOCATED树节点和块头字段；正常块头查询为O(log R)，
+连续块内部页或过期hint回退到完整祖先查找。合并先退休子节点，所以旧尾载荷不能
+误认新owner。该快路径经人确认：祖先关系损坏的发现时点可推迟到修改或完整审计；
+块头/候选节点检查仍保留。分配、释放和增引用始终验证完整相关祖先链。
+
+热路径检查相关权威路径、块头引用与free-list双向连接，不扫描空闲块尾记录，也不
+重写最终合并块的全部页。小请求的检查受树/根目录深度约束，重写受split/coalesce
+层数约束；完整一致性由 `physical_page_allocator_audit()` 验证。调用者只可在未发布或
+独占finalized实例上审计；该接口不分配、回收或I/O，固定深度栈遍历包括inactive节点、
+活跃head、free-list成员与覆盖/计数，损坏fatal。非法参数INVALID，未finalized为STATE。
+
+finalized元数据操作使用每allocator的raw锁，保存/恢复本CPU的IRQ并禁止抢占；这里
+互斥只覆盖分配器元数据，不证明完整SMP或硬实时。耗尽后的压力回调、I/O等待不在buddy修改区内。
+
+`test-allocator-cost-host`在4/16 KiB下用公开API强制64/512/4096/32768页split/coalesce，
+并做10000次随机操作的独立owner模型、每步审计、多range/保留洞和finalize失败验证。
+工作量计根目录/树/块头/order入口的逻辑检查和重写，重复验证重复计，批量初始化须
+按实际记录计；finalize与独立审计不并入运行期热路径窗口。请求页数N、相关根深度H、
+目录二分深度L的门禁为检查 `32*(H+1)^2+16*N+64*(L+1)`、重写 `8*(H+1)+4*N`。
+分裂每层最多7次逻辑重写、合并每层最多7次，入口/最终发布余量由上述常数覆盖；
+邻居权威检查按相关路径计，ROOT上限由最大19个usable range及order31约束，L不超过11。
+这不是固定私有调用次数或循环行号。32768页反例新检查67/67、重写94/94；
+旧尾计数与新全部逻辑计数的口径差异见[学习记录](../learning/memory-management.md#buddy-元数据成本核实2026-10-08)。
+
+COST新增三项非直方图指标，在每次元数据区内局部累计，恢复IRQ后集中提交；默认关闭，
+不持对象引用。窗口内时间排除压力I/O，完整IRQ-off分布沿用现有观测；成本计数并不
+替代客户机时间。36次匹配启动已完成：默认关闭观测时三种匿名分配工作仍较旧核慢13.6%–22.4%，
+只读快路径减少了检查，完整修改校验仍比旧块头操作昂贵；本轮交付有界最坏工作量，
+不声明典型吞吐提升。完整时间、IRQ分布及固定输入见[成本记录](../learning/cost-baseline.md#buddy-森林匹配时间2026-10-09)。
+功能与资源证据见[组合验收](../learning/memory-management.md#阶段a组合收口2026-10-09)；
+正常owner回到预热baseline，未确认DMA停止或真实mount错误仍由所属owner保留。
 
 绑定前只允许顺序发放从未释放过的页；合法 bootstrap 释放完成即返回。越界、重复或
 不属于当前 owner 的释放触发 fatal trap。
@@ -102,13 +134,15 @@ bootstrap 分散耗尽时 finalize 仍返回 `EMPTY`。当前 QEMU 满足该约�
 512 MiB、1 GiB 和 16 GiB 启动验证；开发板必须按
 真实 DTB 保留区和启动占用重新核对。若未来早期分配规模或稀疏内存使其不成立，应
 改为每 range metadata 或稀疏索引，而不是退回固定容量 heap。模块还没有清零分配、
-多回收器优先级、SMP 并发锁、NUMA、热插拔、CMA 或 per-CPU page cache。
+多回收器优先级、跨核压力回收/快照协议、NUMA、热插拔、CMA 或 per-CPU page cache。
 
 ## 验证
 
 ```sh
 make test-allocator-preemption-host
 make test-allocator-release-host
+make test-allocator-cost-host
+make test-allocator-concurrency-host
 make test-page-riscv
 make test-riscv
 ```
@@ -148,7 +182,7 @@ worker 在 SIE 开启时也调用堆和物理页分配器。`kernel/irq.h` 的 s
 恢复本 hart 的 SIE；嵌套进入不会提前打开中断，所有正常/失败返回均恢复调用者状态。
 bootstrap 回收链也使用该边界，避免 idle 安全 IRQ 返回中执行另一 owner 后破坏链。
 
-每次 buddy 分配尝试结束后才进行压力回调分发。分发另行关闭 IRQ，使 callback 函数与
+每次buddy分配尝试释放raw锁后才进行压力回调分发。分发仍按单CPU契约另行关闭IRQ，使callback函数与
 context 的读取、非阻塞干净回收、以及等待回调取得自身 owner 之间不能被卸载插入。
 `pressure_wait` 在显式睡眠前增加既有缓存组引用，睡眠期间允许其他任务运行、释放页
 和卸载最后缓存；此时没有未完成的 buddy/heap 元数据修改。回收递归深度在进入等待前

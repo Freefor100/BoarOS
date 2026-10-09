@@ -1,7 +1,37 @@
 import unittest
-from cost_report import parse, schema, percentile, validate_expected, validate_replicas
+from cost_report import parse, schema, percentile, validate_expected, validate_replicas, validate_locking, validate_resume_selection
 
 class CostReportTest(unittest.TestCase):
+    def test_resume_selection_only_applies_to_consumer_manifests(self):
+        for case in ('allocator','latency','locking'):
+            validate_resume_selection(case, {}, ['consumer-musl-0'])
+        validate_resume_selection('consumer', {'consumer_command_names':['consumer-musl-0']}, ['consumer-musl-0'])
+        with self.assertRaisesRegex(ValueError,'selection'):
+            validate_resume_selection('consumer', {}, ['consumer-musl-0'])
+        with self.assertRaisesRegex(ValueError,'selection'):
+            validate_resume_selection('metadata', {'consumer_command_names':['consumer-musl-0']}, ['consumer-musl-0'])
+
+    def test_locking_checks_the_synchronous_contention_windows(self):
+        names = {f'locking-{r}-0-{n}' for r in range(3) for n in (1,8,32)}
+        names.update(f'locking-1-{op}-8' for op in (1,2,3,4))
+        timings = {name: 100 for name in names}
+        snapshots = [{'name':name,'values':{'foreground.lock15_acquired.value':1,
+                     'foreground.lock15_blocks.value':int(name in ('locking-1-2-8','locking-1-4-8'))}}
+                     for name in names]
+        validate_locking(timings, snapshots, True)
+        for name in ('locking-1-2-8','locking-1-4-8'):
+            bad = [{**snap,'values':{**snap['values'],'foreground.lock15_blocks.value':0}}
+                   if snap['name']==name else snap for snap in snapshots]
+            with self.assertRaisesRegex(ValueError,'contention'):
+                validate_locking(timings,bad,True)
+        with self.assertRaisesRegex(ValueError,'coverage'):
+            validate_locking(timings,snapshots[:-1],True)
+        bad=[{**snap,'values':{**snap['values'],'foreground.lock15_acquired.value':0}}
+             for snap in snapshots]
+        with self.assertRaisesRegex(ValueError,'operation lock'):
+            validate_locking(timings,bad,True)
+        validate_locking(timings,[],False)
+
     def consumer_record(self):
         from cost_consumer import commands,ELFS,SCRIPTS,ORIGINAL_SHA,DEPENDENCIES
         lines=[]
@@ -202,9 +232,101 @@ class CostReportTest(unittest.TestCase):
                     fields.update({prefix+'bucket.'+str(i):'0' for i in range(65)})
         return fields
     def render(self, fields): return ''.join(k+'='+v+'\n' for k,v in fields.items())
+
+    def test_frozen_pre_allocator_schema_is_complete_without_zero_fill(self):
+        current = schema()
+        old = current[:next(i for i, metric in enumerate(current)
+                            if metric[0] == 'page_meta_checked')]
+        fields = self.valid()
+        for lane in ('foreground', 'background', 'observer'):
+            for name, _, _ in current[len(old):]:
+                for key in list(fields):
+                    if key.startswith(lane+'.'+name+'.'):
+                        del fields[key]
+        text = self.render(fields)
+        parsed = parse(text, 3, old)
+        self.assertNotIn('foreground.page_meta_checked.value', parsed)
+        with self.assertRaises(ValueError): parse(text, 3)
+        with self.assertRaises(ValueError): parse(text, 3, old[:-1])
+        del fields['foreground.irq_off_ticks.max']
+        with self.assertRaises(ValueError): parse(self.render(fields), 3, old)
+
+    def test_frozen_pre_raw_schema_is_complete_without_zero_fill(self):
+        current = schema()
+        self.assertIn('raw_wait_ticks', {name for name, _, _ in current})
+        old = current[:next(i for i, metric in enumerate(current) if metric[0] == 'raw_wait_ticks')]
+        fields = self.valid()
+        for lane in ('foreground', 'background', 'observer'):
+            for name, _, _ in current[len(old):]:
+                for key in list(fields):
+                    if key.startswith(lane+'.'+name+'.'): del fields[key]
+        parsed = parse(self.render(fields), 3, old)
+        self.assertNotIn('foreground.raw_wait_ticks.value', parsed)
+        with self.assertRaises(ValueError): parse(self.render(fields), 3)
+        with self.assertRaises(ValueError): parse(self.render(fields), 3, old[:-1])
+
+    def test_replicas_use_the_frozen_kernel_registry(self):
+        from copy import deepcopy
+        current=schema()
+        old=[list(metric) for metric in current[:next(i for i,metric in enumerate(current)
+                                                   if metric[0]=='page_meta_checked')]]
+        rows=self.comparison_records()
+        for row in rows:
+            if not row['cost_diagnostics']:continue
+            row['kernel_build_identity']={'kernel_sha256':row['kernel_sha256'],'metric_schema':old}
+            for snapshot in row['snapshots']:
+                for key in list(snapshot['values']):
+                    if any('.'+metric+'.' in key for metric, _, _ in current[len(old):]):
+                        del snapshot['values'][key]
+        self.assertEqual(len(validate_replicas(rows)),3)
+        bad=deepcopy(rows)
+        target=next(row for row in bad if row['cost_diagnostics'])
+        target['metric_schema']=[list(metric) for metric in current]
+        with self.assertRaises(ValueError):validate_replicas(bad)
+        target['metric_schema']=old
+        target['kernel_build_identity']['kernel_sha256']='wrong'
+        with self.assertRaises(ValueError):validate_replicas(bad)
+        for row in rows:
+            if row['cost_diagnostics']:
+                row['metric_schema']=row['kernel_build_identity'].pop('metric_schema')
+        self.assertEqual(len(validate_replicas(rows)),3)
+
+    def test_allocator_requires_fixed_work_and_preserves_unavailable_metrics(self):
+        from copy import deepcopy
+        from cost_report import validate_allocator
+        timings = {}; snapshots = []; lines = []
+        for epoch, (pages, iterations) in enumerate(((1,1024),(64,64),(4096,4)), 1):
+            name=f'allocator-{pages}-{iterations}'
+            timings[name]=100
+            lines.append(f'COST ALLOCATOR WORK {name} {pages} {iterations} {pages*iterations*90}')
+            lines.append(f'COST CLOSING {name} 5 0')
+            fields=self.valid(); fields['epoch']=str(epoch)
+            for metric, value in [('page_accepted',pages*iterations),('irq_off_ticks',1),
+                                  ('page_meta_checked',1),('page_meta_written',1),('allocator_meta_ticks',1)]:
+                prefix='foreground.'+metric+'.'
+                fields.update({prefix+'value':str(value),prefix+'max':str(value),prefix+'samples':'1'})
+            fields['foreground.irq_off_ticks.bucket.1']='1'
+            snapshots.append({'name':name,'values':parse(self.render(fields),epoch)})
+        raw='\n'.join(lines)+'\n'
+        self.assertTrue(validate_allocator(timings,snapshots,raw,True)['metadata_available'])
+        for broken in (raw+lines[0]+'\n',raw.replace('92160','0'),raw.replace(lines[1]+'\n','')):
+            with self.assertRaises(ValueError): validate_allocator(timings,snapshots,broken,True)
+        old=deepcopy(snapshots)
+        for snapshot in old:
+            for key in list(snapshot['values']):
+                if any('.'+metric+'.' in key for metric in
+                       ('page_meta_checked','page_meta_written','allocator_meta_ticks')):
+                    del snapshot['values'][key]
+        self.assertFalse(validate_allocator(timings,old,raw,True)['metadata_available'])
+        broken=deepcopy(snapshots)
+        broken[0]['values']['foreground.page_meta_checked.value']=0
+        with self.assertRaises(ValueError): validate_allocator(timings,broken,raw,True)
+        with self.assertRaises(ValueError): validate_allocator(timings,snapshots[:-1],raw,True)
+        off='\n'.join(line for line in lines if not line.startswith('COST CLOSING '))+'\n'
+        self.assertFalse(validate_allocator(timings,[],off,False)['metadata_available'])
     def test_frozen_pre_resize_schema(self):
-        from cost_report import supported_schemas
-        old=supported_schemas()[-1]
+        current=schema()
+        old=current[:next(i for i,metric in enumerate(current) if metric[0]=='resize_visits')]
         self.assertFalse(any(name.startswith('resize_') for name,_,_ in old))
         fields=self.valid()
         added={name for name,_,_ in schema()[len(old):]}
@@ -216,8 +338,8 @@ class CostReportTest(unittest.TestCase):
         with self.assertRaises(ValueError):parse(self.render(fields),3)
 
     def test_frozen_pre_memory_schema(self):
-        from cost_report import supported_schemas
-        old=supported_schemas()[1]
+        current=schema()
+        old=current[:next(i for i,metric in enumerate(current) if metric[0]=='heap_zero_bytes')]
         self.assertEqual(len(old),203)
         fields=self.valid()
         added={name for name,_,_ in schema()[len(old):]}

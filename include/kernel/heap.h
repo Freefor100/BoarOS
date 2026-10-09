@@ -35,6 +35,7 @@ struct kernel_heap_statistics {
 };
 
 struct kernel_heap {
+    struct kernel_raw_lock lock;
     struct physical_page_allocator *page_allocator;
     kernel_heap_physical_address_fn physical_address;
     void *partial_slabs[KERNEL_HEAP_SIZE_CLASS_COUNT];

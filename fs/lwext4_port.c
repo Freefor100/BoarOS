@@ -67,7 +67,8 @@ void boaros_lwext4_wait(void *key)
 {
     uintptr_t irq = arch_interrupt_save();
     enum kernel_wait_wake_reason reason;
-    if (kernel_scheduler_block_current(channel(key), 0, 0, &reason) != KERNEL_SCHEDULER_STATUS_OK)
+    if (KERNEL_WAIT_RECHECK(channel(key), 0, 0, &reason,
+                (1)) != KERNEL_SCHEDULER_STATUS_OK)
         __builtin_trap();
     arch_interrupt_restore(irq);
 }

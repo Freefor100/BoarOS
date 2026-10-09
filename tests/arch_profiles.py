@@ -14,6 +14,12 @@ class ArchitectureProfile:
     compiler: str
     raw_flags: tuple
     kernel: str
+    def musl_flags(self,compiler):
+        if self.name=='loongarch':return [*self.raw_flags,'-Wl,-z,max-page-size=16384']
+        # GCC 13 无此新选项；仅支持它的编译器需要禁止隐式链接 libatomic。
+        probe=subprocess.run([str(compiler),'-fno-link-libatomic','-E','-x','c','/dev/null'],
+                             stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        return ['-fno-link-libatomic'] if probe.returncode==0 else []
     def boot(self,qemu,kernel,memory):
         command=[qemu,'-machine','virt','-smp','1','-m',memory,'-kernel',str(kernel),'-nographic','-no-reboot']
         return command+(['-cpu','la464','-global','ls7a_rtc.toy-enabled=on'] if self.name=='loongarch' else ['-bios','default'])

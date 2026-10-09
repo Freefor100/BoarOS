@@ -1,4 +1,6 @@
+#define COST_END_WAIT_ASYNC 1
 #include "common.h"
+#include <termios.h>
 #include <sched.h>
 #include <signal.h>
 #include <sys/mman.h>
@@ -44,6 +46,7 @@ static void phase(unsigned waiters, unsigned relationship, unsigned operation)
     }
     for(unsigned i=0;i<jobs;i++) { char token; CHECK(read(ready[0],&token,1)==1); blocked(children[i]); }
     char name[80]; snprintf(name,sizeof(name),"locking-%u-%u-%u",relationship,operation,waiters);
+    CHECK(fflush(stdout)==0); CHECK(tcdrain(STDOUT_FILENO)==0);
     cost_begin();
     if(operation==3) CHECK(kill(children[0],SIGTERM)==0);
     char tokens[33]; memset(tokens,'g',jobs); CHECK(write(gate[1],tokens,jobs)==(ssize_t)jobs);
@@ -79,5 +82,7 @@ int main(void)
         for(unsigned n=0;n<3;n++) phase(counts[n],relationship,0);
     for(unsigned operation=1;operation<=4;operation++) phase(8,1,operation);
     if(strcmp(second_path,"/lock-b")) CHECK(umount("/second")==0);
-    puts("COST PASS locking"); return 0;
+    puts("COST PASS locking");
+    CHECK(fflush(stdout)==0); CHECK(tcdrain(STDOUT_FILENO)==0);
+    return 0;
 }

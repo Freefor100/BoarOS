@@ -190,8 +190,9 @@ enum kernel_files_status kernel_files_fcntl_lock(
             if (!kind) waiting_locks = &edge;
             enum kernel_wait_wake_reason reason;
             enum kernel_scheduler_status sleep_status =
-                kernel_scheduler_block_current(&state->waiters, 0U, 1,
-                                               &reason);
+                KERNEL_WAIT_RECHECK(&state->waiters, 0U, 1,
+                                               &reason,
+                (kernel_record_lock_get(state, owner, kind, start, end, flock.type, &found), found.owner != 0));
             if (!kind) remove_wait_edge(&edge);
             if (sleep_status != KERNEL_SCHEDULER_STATUS_OK) {
                 arch_interrupt_restore(irq);

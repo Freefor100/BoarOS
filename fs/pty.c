@@ -311,7 +311,8 @@ static void worker(void *argument)
         uintptr_t irq = arch_interrupt_save();
         while (!mount->requested && !mount->stopping) {
             enum kernel_wait_wake_reason reason;
-            if (kernel_scheduler_block_current(&mount->work, 0, 1, &reason) !=
+            if (KERNEL_WAIT_RECHECK(&mount->work, 0, 1, &reason,
+                (!mount->requested && !mount->stopping)) !=
                 KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
         }
         if (mount->stopping) { arch_interrupt_restore(irq); return; }
@@ -411,7 +412,8 @@ int kernel_pty_open_ptmx(struct kernel_vfs_mount *mount, struct kernel_heap *hea
         }
         request_work(owner);
         enum kernel_wait_wake_reason reason;
-        if (kernel_scheduler_block_current(&owner->work, 0, 1, &reason) != KERNEL_SCHEDULER_STATUS_OK)
+        if (KERNEL_WAIT_RECHECK(&owner->work, 0, 1, &reason,
+                (reclaimable && !owner->stopping)) != KERNEL_SCHEDULER_STATUS_OK)
             __builtin_trap();
         if (reason == KERNEL_WAIT_SIGNALLED) {
             kernel_signal_note_syscall_restart(caller);

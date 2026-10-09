@@ -24,6 +24,14 @@ IPv4 重组键包括源/目的地址、IP ID、协议号和输入 netif 身份�
 
 `kernel_socket_protocol_enter/leave` 记录当前任务的执行资格，禁止 raw 调用期间堆回收进入可睡眠 I/O；单 hart SIE 仍负责串行化。用户复制、设备等待和调度不持此资格，回调仅发布弱引用工作。socket 销毁前解绑所有队列；NIC 完成、每次 segment/pbuf/协议堆归还、接收堆释放、loopback 入队和 timer 到期各自发布通知。失败 NIC 不影响 loopback 和协议期限。无 NIC 运行期 IRQ 只唤醒 worker；尚未建立 worker 的模块启动边界保留无堆分配的有限 timer 入口。这不是 SMP 锁或硬实时上界，单个 raw 调用和单个 timer 回调仍完整执行。
 
+`netif_loop_output()` 在成功发布完整回环包队列后调用可选的
+`LWIP_HOOK_NETIF_LOOPBACK_QUEUED`，经端口进入 `protocol_work_ready()`，设置软件
+待处理状态并请求 worker 唤醒；该回调不消费包或重入 raw API。分配/复制失败不
+发布通知。尤其当 socket/timer 阶段在本批 loopback 服务之后产生新包时，服务
+返回值必须保持 runnable，不能依赖下一次定时器重新发现队列。
+`make test-lwip-host` 已纳入真实 lwIP/端口/socket 的 `loopback-work` 反例：固定
+协议时钟，覆盖 IPv4/IPv6、晚入队、OOM 与重试、内容交付和内存基线。
+
 非阻塞 connect 短路径推进握手，后台保证调用者不再调用 socket 时仍能进展；阻塞 connect 等待握手结果。信号沿既有 syscall restart 协议，带接收超时的中断返回 `EINTR`。未 listen 的 stream 和 datagram accept 立即返回类型对应错误，监听 socket 的 `SO_RCVTIMEO` 约束阻塞 accept。
 
 普通 socket read/readv 使用“预留队首片段→按偏移复制→提交/取消”。用户容量决定 UDP 的截断长度，一个报文可经请求持有的 4 KiB 页反复复制，最终只消费一次；不能以内部暂存容量截断报文。零长度 datagram 也必须完成 reservation；TCP EOF 没有 reservation。TCP 在用户容量内继续读取已排队片段，取得进展后不等待新数据。每段完整复制后才消费；当前段 fault 保留整段，返回先前已提交的字节数，没有先前进展则 EFAULT。UDP fault 丢弃当前 datagram。read reservation 独占队首，第二个 read/recvfrom 不得越过它。
@@ -98,6 +106,10 @@ python3 tests/program-inventory/run.py --suite libc \
   --case libc.static.socket --case libc.dynamic.socket \
   --require-pass --output build/socket-program-check
 ```
+
+`tests/network-riscv.py --memory 512M --memory 1G`分别启动同一ELF的两种RAM，
+每个配置的镜像/日志独立；result记录实际启动参数。RV official profile固定1GiB，
+冲突的显式RAM参数返回错误，不能忽略参数后给启动贴错标签。
 
 host 入口实测 UDP loopback、PCB 16 个用尽后第 17 个失败、全部释放和再分配，另在 `sndbuf>0` 时耗尽全局 TCP segment 池触发真实 `tcp_write ERR_MEM`，以及 TCP 握手/关闭后推进 200 秒协议计时、池用量回到基线。此前的 Linux/BoarOS 差分记录完全一致，包含 12 条新增 socketpair 差分记录，覆盖坏族、坏标志、坏协议、空指针、stream 双向读写、关闭 EOF、dgram 边界截断与 flags 校验。真实 pthread U-mode 另覆盖零长度 datagram、共享 socket 双读、阻塞读时 close/fd 复用、双读线程组 SIGKILL、全局池压力下错误可写事件及释放后写入进展。原版 hackbench 原 ELF 在 4 进程模式下传递消息并成功运行（Time: 0.014s），关机检查 `heap-live=0`。原版 libc-test `functional/socket.c` 的静态、动态直接 entry 用未改源码和同一 ELF 在双方通过；整合内核全量 228 项为 227 pass、1 BusyBox 包装失败，见[程序清单](../learning/user-program-inventory.md)。
 

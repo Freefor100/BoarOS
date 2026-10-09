@@ -178,3 +178,6 @@ int main(void)
     worker_mode = 0;
     return receive_contract();
 }
+
+#include "wait_boundary.h"
+HOST_WAIT_BOUNDARY(, kernel_scheduler_block_current)

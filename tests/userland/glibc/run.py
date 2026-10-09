@@ -23,6 +23,7 @@ BASE_MARKERS = ["GLIBC CONSTRUCTOR", "GLIBC MAIN", "GLIBC BASE OK"]
 EXTRA_MARKERS = ["GLIBC DLOPEN TLS OK", "GLIBC PTHREAD TLS OK",
                  "GLIBC PTHREAD CANCEL OK", "GLIBC SIGNAL OK"]
 FINAL_MARKERS = ["GLIBC RUNTIME OK", "GLIBC EXIT"]
+MEMORIES = ('512M', '1G')
 
 
 def digest(path):
@@ -141,28 +142,29 @@ def execute(programs, library, inputs, linux, kernel, qemu):
     work = Path(tempfile.mkdtemp(prefix="run.", dir=BUILD))
     status = "failed"
     try:
-        for name, program in programs.items():
-            case = work / name
-            case.mkdir()
-            disk = fixture(case, program, library, inputs)
-            expected = BASE_MARKERS + (EXTRA_MARKERS if name == "pthread-pie" else []) + FINAL_MARKERS
-            for target, image in (("linux", linux), ("boaros", kernel)):
-                target_disk = case / f"{target}.img"
-                shutil.copyfile(disk, target_disk)
-                command = [qemu, "-machine", "virt", "-bios", "default",
-                       "-object", "rng-random,id=entropy,filename=/dev/urandom",
-                       "-device", "virtio-rng-device,rng=entropy,bus=virtio-mmio-bus.7",
-                           "-kernel", str(image), "-m", "512M", "-smp", "1",
-                           "-nographic", "-no-reboot", "-drive",
-                           f"file={target_disk},if=none,format=raw,id=root",
-                           "-device", "virtio-blk-device,drive=root,bus=virtio-mmio-bus.0"]
-                if target == "linux":
-                    command += ["-append", "root=/dev/vda rw rootwait "
-                                "console=ttyS0 init=/init loglevel=0 panic=-1"]
-                log = case / f"{target}.log"
-                result = run_guest(command, log)
-                check_observation(name, target, log, expected, result)
-            print(f"glibc {inputs['glibc_version']} {name}: Linux/BoarOS markers and exit verified")
+        for memory in MEMORIES:
+            for name, program in programs.items():
+                case = work / f'{name}-{memory}'
+                case.mkdir()
+                disk = fixture(case, program, library, inputs)
+                expected = BASE_MARKERS + (EXTRA_MARKERS if name == "pthread-pie" else []) + FINAL_MARKERS
+                for target, image in (("linux", linux), ("boaros", kernel)):
+                    target_disk = case / f"{target}.img"
+                    shutil.copyfile(disk, target_disk)
+                    command = [qemu, "-machine", "virt", "-bios", "default",
+                           "-object", "rng-random,id=entropy,filename=/dev/urandom",
+                           "-device", "virtio-rng-device,rng=entropy,bus=virtio-mmio-bus.7",
+                               "-kernel", str(image), "-m", memory, "-smp", "1",
+                               "-nographic", "-no-reboot", "-drive",
+                               f"file={target_disk},if=none,format=raw,id=root",
+                               "-device", "virtio-blk-device,drive=root,bus=virtio-mmio-bus.0"]
+                    if target == "linux":
+                        command += ["-append", "root=/dev/vda rw rootwait "
+                                    "console=ttyS0 init=/init loglevel=0 panic=-1"]
+                    log = case / f"{target}.log"
+                    result = run_guest(command, log)
+                    check_observation(name, target, log, expected, result)
+                print(f"glibc {inputs['glibc_version']} {name}/{memory}: Linux/BoarOS markers and exit verified")
         status = "passed"
     finally:
         if status == "passed":
@@ -185,7 +187,7 @@ def execute_la(programs,library,inputs,kernel,qemu,only):
         area=native(SimpleNamespace(program=program,marker=expected,file=files,cc=compiler,
             kernel=str(kernel),qemu=qemu,timeout=120,platform=platforms,exit_status=42,cpu='la464'))
         for target in platforms or ('Linux','BoarOS'):
-            for ram in ('512M','1G'):
+            for ram in MEMORIES:
                 check_observation(name,target.lower(),area/f'{target}-{ram}.log',expected,0,'loongarch')
         print(f"glibc {inputs['glibc_version']} {name}: {platforms or 'Linux/BoarOS'} markers, exit and root owners verified")
 
@@ -210,7 +212,7 @@ def main():
         checked_inputs(args.arch)
         platforms=['Linux','BoarOS'] if args.only=='all' else ['Linux' if args.only=='linux' else 'BoarOS']
         kernels={'Linux':ROOT/'build/linux-la/vmlinux','BoarOS':args.kernel}
-        identity={'inputs':inputs,'platforms':platforms,
+        identity={'inputs':inputs,'platforms':platforms,'memory':MEMORIES,
             'programs':{name:digest(p) for name,p in programs.items()},'library':digest(library),
             'kernels':{name:digest(kernels[name]) for name in platforms},
             'linux_config':digest(ROOT/'build/linux-la/.config'),'qemu':digest(args.qemu),
@@ -224,6 +226,7 @@ def main():
     linux, linux_identity = linux_build()
     identity = {
         "inputs": inputs,
+        "memory": MEMORIES,
         "sources": {path.name: digest(path) for path in
                     (HERE / "probe.c", HERE / "tls_dso.c", HERE / "run.py")},
         "programs": {name: digest(path) for name, path in programs.items()},

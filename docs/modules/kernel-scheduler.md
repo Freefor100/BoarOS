@@ -1,6 +1,6 @@
 # 内核调度、线程组与生命周期
 
-本文记录单 hart OTHER/FIFO/RR 调度、线程组资源、clone/exec/wait 和回收契约。背景见[线程组与 futex](../learning/threads-and-futex.md)，信号、文件资源、MM 的稳定边界分别见对应模块文档。
+本文记录RV/LA单CPU的OTHER/FIFO/RR 调度、线程组资源、clone/exec/wait 和回收契约。背景见[线程组与 futex](../learning/threads-and-futex.md)，信号、文件资源、MM 的稳定边界分别见对应模块文档。
 
 ## 实现入口
 
@@ -14,7 +14,7 @@
 | `kernel/sched/proc.c` | 进程快照、对象路径与缺页/磁盘读取统计 |
 | `kernel/sched/exec.c` | 已准备映像的提交与旧资源清理 |
 | `kernel/sched/sync.c` | 任务 owner 的 mutex/RWlock、锁序与 FIFO 资格交接 |
-| `kernel/sched/wait.c` | 全局 blocked 链、每队列 FIFO、超时和信号唤醒 |
+| `kernel/sched/park.c`、`wait.c` | 代次等待、借用游标、blocked/期限索引及完成仲裁 |
 | `kernel/sched/futex.c` | 256 桶 WAIT/WAKE/REQUEUE、robust-list 退出清理、clear-child-tid 唤醒 |
 | `kernel/sched/signal.c` | 组/线程 pending、disposition、stop/continue 和重启 |
 | `include/arch/task.h`、`arch/riscv/process.c`、`arch/loongarch/context.c` | 构建期线程、地址空间与 trap 操作；各架构初始/clone/exec 寄存器契约 |
@@ -23,11 +23,62 @@
 
 公共 scheduler 头不暴露 Trap Frame；架构 clone 入口由 `include/arch/task.h` 选择，旧 RV 入口保留包装。syscall 通过不透明 task 接口取得 TID/TGID/PPID 和资源，不直接修改调度私有字段。
 
+等待登记、阻塞提交、期限索引和runnable发布使用统一rank40短锁；heap10→physical20、
+对象内部30→调度40是raw锁序。raw不跨架构切换，不允许调度、分配、I/O、用户复制或外部回调。
+业务条件、进程组及缓存/网络数据仍按单CPU纪律保护；等待原语互斥不表示整个内核支持SMP。
+
+`kernel_wait_prepare`为当前任务建立不回退的全局代次token，登记后复查条件，释放对象保护再调用
+`kernel_wait_park`；`kernel_wait_finish`同步撤销绑定节点。wake/期限/signal第一个完成者决定
+原因，旧代次与重复通知无效，任务页复用也不重用代次。多队列节点通过`kernel_wait_node_bind`共享token。
+代次耗尽返回INVALID_STATE且不发布新登记，重复等待和错误owner属于fatal。
+
+任务的on_cpu与CPU切换前驱共同保护旧栈：阻塞提交后的提前wake只记录ready_pending，
+park自行保存IRQ并保持关闭跨过切换交接，返回时恢复原状态；
+新栈的`kernel_scheduler_switch_finish`才发布旧任务或允许回收。恢复已有上下文的C切换尾部、
+首次kernel/user trampoline及退出切换经过同一完成点；无切换的普通异常返回不重复查询。
+调度请求用原子exchange消费，完成点不清除后来请求。
+
+wake在调度锁内判断空队列；为空直接完成，非空才建立跨解锁的借用游标。
+被摘节点保留有引用的退休后继，引用链迭代归还，每段最多16项。
+callback在调度锁外同步执行，临时禁止抢占，不能阻塞；自身只能非阻塞remove。
+释放context前必须remove_sync等待借用归零。futex过滤遍历使用同一借用游标；
+requeue先借task、放当前游标，再收完旧node借用并迁移登记，不在raw内归还后备引用。
+queue_close停止新登记并借用队列直到通知完成，空队列也不能在close的解锁间隙销毁。
+queue_destroy在注册或操作/游标/回调借用未归零时返回BUSY，调用者继续持有queue及业务owner。
+
+聚焦入口：`make test-wait-host test-wait-riscv test-wait-loongarch`。host直接链接park.c、
+真实raw/runqueue，在2/4线程握手下检查提前wake、单次仲裁、旧代次、多队列与退休游标；
+双侧512MiB/1GiB检查真实首次/退出切换、timeout及任务页回到基线。此处是原语与单CPU证据，
+不替代共享MM、业务对象或多核客体的并发验收。
+
+唯一任务节点的通知在同一raw区间完成，仍验证queue/borrow_owner身份，不建立跨解锁游标；
+回调保留借用并在锁外执行。
+finish每段最多摘16个登记，未借用的小批登记可在同一保护下结束；存在借用才等待归还。
+
+可睡眠RWlock每实例持有rank30内部raw；资格判断与token登记在同一保护下完成，释放raw再park。
+未竞争取得不在热路径栈上构造waiter；慢路径持有其栈waiter至token结束及pending摘除。
+FIFO先授资格再通知，连续读者按原边界分段，每段最多16个等待者，handoff owner覆盖分段间隙。
+已经授予但尚未运行的读者/写者仍占用锁，后来读者不能越过writer。
+通知不等于资格：额外唤醒只更新等待token，不重排FIFO；旧登记结束与重取对象raw之间也允许授资格。guard的rank/key和任务owner
+保持原契约；等待仍不可中断，没有新增timed/interruptible API。
+
+调用方无raw业务锁时，`KERNEL_WAIT_RECHECK`在登记后求值一次非阻塞条件，再park/finish。
+poll的多个节点绑定一个token；epoll停止item通知后同步撤销node才释放context。
+TTY/lwext4等通用通道仍由所属调用方在单CPU IRQ域内持条件owner；宏不把业务数据变成跨核安全。
+宿主RW门禁为`make test-sleep-lock-host`，包含1/8/32等待者、writer边界、分段中到达的读者、
+IRQ恢复及非法owner/上下文。真实I/O等待继续用`make test-io-sleep-riscv`验证DMA、超时与回收。
+
 ## 策略、就绪队列与 RT 预算
 
 OTHER 保留 100 Hz tick 轮转，内核 worker 使用 OTHER。FIFO/RR 的用户优先级为 1–99，数值越大越优先；FIFO 不因 tick 同级轮转，RR 每片 100ms，按实际在 CPU 上运行的纳秒扣除。更高优先级抢占、阻塞和 yield 不重新赠送 RR 时间片；耗尽后才重装。唤醒及策略修改标记 need_resched，在 IRQ 或返回用户态的安全边界切换。降优先级排到新级队首，升优先级排队尾，同级修改保留位置；高优先级抢占的当前任务回原级队首。
 
 ready 节点独立于 blocked/cleanup 链。全局优先级排序双链保留遍历视图，100 个等级各存 head/tail；同级插入、OTHER 尾追加、删除和选取均 O(1)，新增空的中间等级最多扫描 99 个等级，不扫描任务数。RT 被节流时只取 OTHER 队首；没有 OTHER 则 idle，不能借机运行已耗尽的 RT。
+
+FIFO yield和RR到期只轮转同级候选；未节流且没有同级竞争者时，不能把CPU下让给低优先级任务。
+旧任务仍on_cpu而暂未入队，决策必须显式比较当前与ready候选，不能把“有next”当作可轮转。
+`test-scheduler-handoff-host`直接链接生产决策、队列/策略/raw，覆盖低/同/高优先级、节流和idle；
+`test-scheduler-handoff-riscv/test-scheduler-handoff-loongarch`在512MiB/1GiB以同ELF对照固定Linux，
+高优先级yield/跨RR片时低任务计数保持0，随后高任务阻塞才允许低任务前进并正常回收。
 
 退出在发布 completion、清 TID 并唤醒等待者后，若已注册 cleanup worker，按同一
 ready 策略直接选择下一任务。退出栈只切离，回收仍由 worker 或 join owner 在可信栈
@@ -138,7 +189,7 @@ LA生产任务也沿现有内核栈窗口接口运行：PGDH共享骨架持有�
 
 聚焦入口为 `make test-stack-usage`、`make test-scheduler-cases-riscv`、`make test-scheduler-riscv`、`make test-files-riscv` 和 `make test-signal-riscv`；`make test-userland-riscv` 验证真实 pthread、共享匿名 futex、bitset 绝对 realtime 等待在 stop/continue 后保留掩码和截止时刻。`make test-diff-abi-riscv` 用同一 ELF 对照固定 Linux 的零掩码、超时、错误、按掩码唤醒和 requeue；`make test-glibc-riscv` 验证 glibc 2.44 的 `pthread_join` 消费路径。阶段收口使用 `make test-riscv`。各次实际通过范围以 README 和提交验证说明为准，不把实现路径存在等同于全部线程负载已验证。
 
-尚无 SMP、共享文件 futex、PI futex、实时信号队列、sigaltstack 或 clone3。LoongArch 已验证整数 context、timer 抢占、整数信号与静态 musl TLS/pthread 子集和任务退出回收；标量FPU和原版动态musl/DSO TLS已另行验收；SIMD及更广线程范围未验收。固定语义依据见学习总结的 Linux commit 与 musl 归档。
+尚无 SMP、共享文件 futex、PI futex、实时信号队列、sigaltstack 或 clone3。LoongArch 已验证整数 context、timer 抢占、信号、musl TLS/pthread、动态 musl/DSO TLS、标量 FPU 与 LSX/LASX；更广程序与多核仍需独立验收。固定语义依据见学习总结的 Linux commit 与 musl 归档。
 
 活动普通文件/TCP I/O 的单页暂存由任务持有并跨调用复用：首次使用时分配，调用期间登记在任务的 `io_buffer`，正常调用完成只解除登记。任务资源清理在 socket read/write reservation 之后、MM/文件表和任务栈释放之前解除登记；常驻页在任务最终存储释放时归还。页释放错误遵循物理分配器 fatal 不变量，不进入历史 cleanup 重试链。
 
@@ -180,3 +231,54 @@ C4 另计 queue validation 次数、shape/thread检查、deadline到期处理数
 pipe/proc状态双握手确认，覆盖同期限、提前信号、默认信号、取消和对象复用。
 到期处理数必须与timeout数量一致且不随无期限blocked总数增长；队列shape检查只查头尾，
 计数与索引弹出分开，不将它误报成全队列扫描。
+
+
+## SMP前置的同步与等待契约（2026-10-09）
+
+当前生产实现仍为单CPU。等待/就绪发布和对象内部资格已有raw互斥，业务状态尚未完成跨核保护。四种职责必须分开：
+
+| 机制 | 保护与限制 | 当前状态 |
+|---|---|---|
+| 本地IRQ控制 | 保存/恢复本CPU中断；单CPU短元数据发布，允许显式切换 | arch IRQ与KERNEL_IRQ_SCOPE已有 |
+| 抢占/迁移控制 | CPU本地指针借用和current稳定，不提供共享对象互斥 | cpu.h的嵌套深度；timer延后切换，既有安全点消费请求 |
+| 跨核raw短锁 | 共享状态和内存序；不得持锁阻塞、I/O或调用会等待的分配路径 | raw_lock.h的32位acquire/release原子字、CPU guard链与rank/key序 |
+| 可睡眠对象锁 | 任务guard、rank/key、资格交接和对象owner跨睡眠存活 | 内部raw30→调度raw40；业务数据仍由guard或原单CPU纪律负责 |
+
+内核tp仍指向任务，架构前缀之后的CPU关联供当前CPU查询；current与need_resched由CPU记录持有。
+启动任务与idle显式绑定，RV采用固件hart ID并在高地址重定位后重绑，LA读取CPUID CSR。
+bootstrap I/O上下文与任务I/O上下文分开，任务guard和回收深度不迁入CPU。raw guard必须按LIFO由同CPU释放，
+递归、逆序、错误owner和计数损坏fatal；block/yield/退出及可睡眠锁获取拒绝禁止抢占上下文。
+`make test-sync-host`验证真实四线程争用、IRQ恢复、显式preempt在raw内的合法嵌套及fatal反例。
+延期tick同时保存OTHER轮转原因，安全点消费；普通唤醒不自动变成同级轮转，切换后不把旧原因交给新任务。
+RV scheduler cases分别验证idle和两个同级OTHER任务的延期请求，恢复后peer必须进展并归还全部owner。
+`test-sync-riscv/test-sync-loongarch`在512M/1G运行真实原子/IRQ正例，以及raw内block/yield/退出/睡眠锁的fatal。
+runner从Make接收实际构建目录，COST入口不能借用普通产物；host保护目录覆盖和缺失输入不回退。
+这些结果不证明调度策略/任务索引、共享MM或设备业务已经具备SMP安全性。
+
+`kernel_rwlock`的栈waiter由阻塞调用持有；授予资格先于wake，新任务不得抢走已授予
+资格。持有guard期间锁对象不能移动/销毁；现有等待不可中断。未来取消/超时要明确
+撤销注册与未消费资格的owner，不能先释放调用栈再摘队。raw锁只可保护短队列修改，
+释放后再park；不能把当前整个IRQ-off acquire机械包进raw spinlock。
+
+登记、通知、阻塞和切换完成由本模块的短调度域保护；条件及task/callback/context的
+业务owner仍由调用者保持。完整SMP须把条件保护、MM页存活、对象最后释放与这套交接连接，
+不能只移植等待原语就撤掉业务IRQ纪律。当前销毁入口与借用规则见本文开头。
+
+已核对的IRQ-off显式切换与owner边界如下；这是调用盘点，不是跨核安全证明：
+
+| 调用位置 | 切换/工作 | 睡眠期间的owner |
+|---|---|---|
+| kernel/sched/sync.c acquire | 对象raw内准备token，锁外park | 调用栈waiter、任务io_context及锁对象 |
+| kernel/sched/park.c prepare/park | 仲裁登记与BLOCKED发布，锁外switch | task元数据/栈；queue资源由调用者保持 |
+| kernel/physical_page.c allocate_order | EMPTY后回收/pressure_wait | 不持buddy半成品；回调固定cache group，深度在任务context |
+| fs/page_cache.c lookup/get/readahead/writeback/pressure | loading、后台work、代次进展等待 | entry users、cache/runtime或group pin，停止先join |
+| drivers/virtio/block.c | 等descriptor/span/request完成与reset | request token及业务buffer；DMA停止未确认不释放 |
+| net/ethernet.c worker；net/socket.c协议入口 | IRQ关闭下NIC/串行lwIP批次，末尾重查后yield/block | root借设备，worker持网络；TX/RX loan直到归还/停DMA |
+| mm/mm.c文件fault | 源I/O可显式睡眠，恢复后重查 | 来源操作pin、VMA代次和候选页，失败准确回收 |
+
+等待交接须覆盖wake发生于检查前、登记后、释放保护后/park前；timeout和cancel
+与grant竞争；destroy与callback遍历；拒绝raw锁下阻塞；每种交错不能漏wake、双授予、
+重复运行或使用已销毁队列。原单CPU测试只作为退化配置，不能替代真实多CPU内存序。
+固定依据为本地references/linux/Documentation/locking/locktypes.rst，commit
+f4cdf7ca9a1fdcca413157df19753f388a5a224e；lwIP raw串行边界见references/lwip/doc/doxygen/main_page.h（pitfalls/multithreading），
+commit77dcd25a72509eb83f72b033d219b1d40cd8eb95。实现依赖只在[路线图](../goals.md#p6b-锁等待与中断规则)维护。

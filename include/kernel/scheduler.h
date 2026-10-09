@@ -24,6 +24,7 @@ enum kernel_scheduler_status {
     KERNEL_SCHEDULER_STATUS_STACK_CORRUPT,
     KERNEL_SCHEDULER_STATUS_ADDRESS_SPACE,
     KERNEL_SCHEDULER_STATUS_RESOURCE_CLEANUP,
+    KERNEL_SCHEDULER_STATUS_BUSY,
 };
 
 enum kernel_thread_kind {
@@ -146,10 +147,17 @@ enum kernel_wait_wake_reason {
 #define KERNEL_WAIT_QUEUE_INITIALIZED UINT32_C(0x57414954)
 
 struct kernel_wait_node;
+struct kernel_wait_token {
+    struct kernel_task *task;
+    uint64_t generation;
+};
 
 typedef void (*kernel_wait_callback_fn)(struct kernel_wait_node *node,
                                         uint32_t reason);
 
+/* 一个node最多登记一条queue；token绑定节点必须保持至wait_finish。
+ * 队列借用不取得业务对象引用。回调在调度raw锁外同步执行，禁止抢占/阻塞；
+ * 非阻塞remove只摘队，释放callback/context前须remove_sync收完在途借用。 */
 struct kernel_wait_node {
     struct kernel_task *task;
     kernel_wait_callback_fn callback;
@@ -157,16 +165,21 @@ struct kernel_wait_node {
     struct kernel_wait_queue *queue;
     struct kernel_wait_node *previous;
     struct kernel_wait_node *next;
+    struct kernel_wait_node *retired_next;
+    struct kernel_wait_node *token_next;
+    struct kernel_wait_queue *borrow_owner;
+    uint64_t generation, sequence;
+    uint32_t references;
 };
 
-/*
- * Token identifying a sleep channel.  Resources that can block embed one
- * queue per wake condition and hand it to block/wake.
- */
+/* 单CPU业务条件仍由调用者的IRQ纪律保护；短调度锁仅保护登记/通知。
+ * close停止新登记，destroy在注册/游标/回调借用未归零时返回BUSY并保留owner。 */
 struct kernel_wait_queue {
     uint32_t initialized;
     struct kernel_wait_node *head;
     struct kernel_wait_node *tail;
+    uint64_t sequence;
+    uint32_t closed, registrations, borrows;
 };
 
 void kernel_wait_node_init(struct kernel_wait_node *node,
@@ -178,6 +191,33 @@ void kernel_wait_queue_init(struct kernel_wait_queue *queue);
 void kernel_wait_queue_add(struct kernel_wait_queue *queue,
                            struct kernel_wait_node *node);
 void kernel_wait_queue_remove(struct kernel_wait_node *node);
+enum kernel_scheduler_status kernel_wait_node_bind(struct kernel_wait_queue *,
+    struct kernel_wait_node *, const struct kernel_wait_token *);
+enum kernel_scheduler_status kernel_wait_node_remove_sync(struct kernel_wait_node *);
+enum kernel_scheduler_status kernel_wait_queue_close(struct kernel_wait_queue *);
+enum kernel_scheduler_status kernel_wait_queue_destroy(struct kernel_wait_queue *);
+enum kernel_scheduler_status kernel_wait_prepare(struct kernel_wait_queue *,
+    uint64_t deadline, int interruptible, struct kernel_wait_token *);
+enum kernel_scheduler_status kernel_wait_park(const struct kernel_wait_token *,
+    enum kernel_wait_wake_reason *);
+enum kernel_scheduler_status kernel_wait_finish(struct kernel_wait_token *);
+enum kernel_scheduler_status kernel_wait_notify(const struct kernel_wait_token *,
+    enum kernel_wait_wake_reason);
+void kernel_scheduler_switch_finish(void);
+/* 已持单CPU IRQ保护的业务调用边界：登记后只复查非阻塞的业务条件。
+ * 需要释放对象raw的调用方使用显式prepare/park/finish，不能把锁放进表达式。 */
+#define KERNEL_WAIT_RECHECK(queue_, deadline_, interruptible_, reason_, must_wait_) \
+    ({ struct kernel_wait_token wait_recheck_token_; \
+       enum kernel_wait_wake_reason *wait_recheck_reason_ = (reason_); \
+       enum kernel_scheduler_status wait_recheck_status_ = wait_recheck_reason_ ? \
+           kernel_wait_prepare((queue_), (deadline_), (interruptible_), &wait_recheck_token_) : \
+           KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT; \
+       if (wait_recheck_status_ == KERNEL_SCHEDULER_STATUS_OK) { \
+           *wait_recheck_reason_ = KERNEL_WAIT_WOKEN; \
+           if (must_wait_) wait_recheck_status_ = kernel_wait_park(&wait_recheck_token_, wait_recheck_reason_); \
+           if (kernel_wait_finish(&wait_recheck_token_) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap(); \
+       } \
+       wait_recheck_status_; })
 
 /* Wakes the longest-blocked waiter.  Requires interrupts disabled. */
 enum kernel_scheduler_status kernel_wait_queue_wake_one(
@@ -189,6 +229,8 @@ enum kernel_scheduler_status kernel_wait_queue_wake_all(
  * Sleeps until woken through `queue` (NULL = pure timeout sleep) or until
  * `deadline` time-counter ticks elapse (0 = no deadline).  Requires
  * interrupts disabled; the caller must recheck its condition on return.
+ * 兼容包装为prepare→park→finish。持对象raw保护时须显式prepare并复查条件，
+ * 释放raw后才能park；登记后的提前wake保留通知，不会再次提交阻塞。
  */
 enum kernel_scheduler_status kernel_scheduler_block_current(
     struct kernel_wait_queue *queue,

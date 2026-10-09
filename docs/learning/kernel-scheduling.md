@@ -189,3 +189,27 @@ RT 预算按实际运行时间而不是 elapsed_ticks 扣费。如果仍只用10
 独立复跑的同类样本超出 2200ns。数值体现 IRQ/非抢占区间与测量开销，不能
 由这些样本给出硬上界。高优先级抢占后 RR 剩余运行约 39.5ms，未重置为 100ms；
 同级 RR 同时耗尽片和配额时 peer 在下一窗口运行，旧实现的队首重入已被该用例证伪。
+
+
+## IRQ与等待生命周期的边界
+
+本地IRQ、禁止抢占/迁移、跨核raw短锁和可睡眠对象锁不能互相替代。现有sync.c
+依靠关IRQ修改队列，但可以在该作用域显式block；pressure和网络worker也有这种
+路径。把全部IRQ scope直接换成raw锁会将真实等待包进禁止睡眠区。跨核短锁只可
+保护队列发布，解锁后的park窗口用待消费资格/就绪状态闭合，保留rank/key。
+接口旁已写明wait node借用和queue销毁边界；完整调用盘点与强制交错清单见
+[调度模块](../modules/kernel-scheduler.md#smp前置的同步与等待契约2026-10-09)。
+
+“原子refcount”也不能封闭用户页查找→取得pin的空窗。现有uaccess并未覆盖复制期
+pin，SMP前需把共享MM保护、sleep后重查、权限许可点、复制前缀和远程TLB确认后的
+回收连起来做；具体见[MM模块](../modules/kernel-mm.md#smp前置的用户复制与回收契约2026-10-09)。
+当前尚无这些跨核原语，单CPU门禁与宿主强制抢占也不能当作多核内存序验收。
+本文前面的栈/CPU描述保留各历史验收身份；LA现在已有独立16KiB PGDH guard栈、
+FP/LSX/LASX和当前任务切换验收，RV/LA仍各自限定单CPU，不能把历史“未来LA”段落
+当作当前能力状态。未完成能力只在docs/goals.md维护。
+
+
+双盘组合门禁扩展时另发现既有shell runner用grep -x读取TTY的CRLF行，业务检查与
+PID1退出42/heap0均成功却误报失败。冻结旧41b5947内核复现同一问题；只在单独report
+规范行末CR，原始boot.log保留，marker/退出/IRQ身份/stack/fsck仍严格检查。旧/新核
+均通过legacy与modern写入和只读重启，属于宿主读取修正，不是buddy或TTY行为变更。

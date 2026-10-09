@@ -49,6 +49,10 @@ struct kernel_cost_task *kernel_cost_current(void);
 uint64_t kernel_cost_epoch(void);
 struct kernel_cost_tag kernel_cost_capture(void);
 void kernel_cost_add_tag(struct kernel_cost_tag tag, enum kernel_cost_metric metric, uint64_t value);
+/* One metadata region publishes three counters with one bounded observer update. */
+void kernel_cost_page_metadata(struct kernel_cost_tag tag, uint64_t checked,
+                              uint64_t written, uint64_t ticks);
+void kernel_cost_raw_lock(struct kernel_cost_tag tag, uint64_t wait, uint64_t hold);
 void kernel_cost_sample_tag(struct kernel_cost_tag tag, enum kernel_cost_metric metric, uint64_t value);
 void kernel_cost_add(enum kernel_cost_metric metric, uint64_t value);
 void kernel_cost_sample(enum kernel_cost_metric metric, uint64_t value);

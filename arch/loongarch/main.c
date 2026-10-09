@@ -6,6 +6,7 @@
 #include <kernel/time.h>
 #include <platform/loongarch_rtc.h>
 #include <kernel/scheduler.h>
+#include <kernel/cpu.h>
 void la_trap_initialize(void);
 void la_boot_tasks(struct physical_page_allocator *);
 extern unsigned char __boot_stack_bottom[], __boot_stack_top[];
@@ -16,6 +17,9 @@ static struct physical_page_allocator allocator;
 extern unsigned char __kernel_start[], __kernel_end[];
 void la_kernel_main(uint64_t systab)
 {
+    uint64_t cpu_id;
+    __asm__ volatile("csrrd %0, 0x20" : "=r"(cpu_id));
+    kernel_cpu_boot_initialize(cpu_id & 0x7ffU);
     la_virt_puts("BoarOS: LA64 QEMU virt, 16 KiB pages\n");
     la_trap_initialize();
     struct boot_memory_layout layout;

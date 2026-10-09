@@ -692,7 +692,8 @@ enum kernel_page_cache_status kernel_page_cache_lookup(
     entry->users++;
     while (entry->loading) {
         enum kernel_wait_wake_reason reason;
-        if (kernel_scheduler_block_current(&entry->ready, 0, 0, &reason) != KERNEL_SCHEDULER_STATUS_OK)
+        if (KERNEL_WAIT_RECHECK(&entry->ready, 0, 0, &reason,
+                (entry->loading)) != KERNEL_SCHEDULER_STATUS_OK)
             __builtin_trap();
     }
     status = entry->load_error;
@@ -935,7 +936,8 @@ static void readahead_worker(void *argument)
         if (r->stopping) { readahead_cancel_node(cache, 0); break; }
         if (!next) {
             enum kernel_wait_wake_reason reason;
-            if (kernel_scheduler_block_current(&r->readahead_work, 0, 1, &reason) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
+            if (KERNEL_WAIT_RECHECK(&r->readahead_work, 0, 1, &reason,
+                (!r->stopping && !next)) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
             continue;
         }
         next->active = 1;
@@ -1091,7 +1093,8 @@ static int writeback_entry(struct kernel_page_cache *cache,
     uintptr_t wait_irq = arch_interrupt_save();
     while (entry->writeback) {
         enum kernel_wait_wake_reason reason;
-        if (kernel_scheduler_block_current(&entry->ready, 0, 0, &reason) != KERNEL_SCHEDULER_STATUS_OK)
+        if (KERNEL_WAIT_RECHECK(&entry->ready, 0, 0, &reason,
+                (entry->writeback)) != KERNEL_SCHEDULER_STATUS_OK)
             __builtin_trap();
     }
     arch_interrupt_restore(wait_irq);
@@ -1501,7 +1504,8 @@ static void pressure_wait(void *context)
     uint64_t round = g->round;
     while (g->pending && round == g->round && progressed == g->progressed) {
         enum kernel_wait_wake_reason reason;
-        if (kernel_scheduler_block_current(&g->progress, 0, 0, &reason) != KERNEL_SCHEDULER_STATUS_OK)
+        if (KERNEL_WAIT_RECHECK(&g->progress, 0, 0, &reason,
+                (g->pending && round == g->round && progressed == g->progressed)) != KERNEL_SCHEDULER_STATUS_OK)
             __builtin_trap();
     }
     group_put(g);
@@ -1519,7 +1523,8 @@ static void page_cache_worker(void *argument)
         while (!r->requested && !r->stopping) {
             enum kernel_wait_wake_reason reason;
             /* 空工作队列不是不可中断 I/O，不计入负载。 */
-            if (kernel_scheduler_block_current(&r->work, 0, 1, &reason) != KERNEL_SCHEDULER_STATUS_OK)
+            if (KERNEL_WAIT_RECHECK(&r->work, 0, 1, &reason,
+                (!r->requested && !r->stopping)) != KERNEL_SCHEDULER_STATUS_OK)
                 __builtin_trap();
         }
         if (r->stopping) break;

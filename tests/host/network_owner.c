@@ -194,10 +194,127 @@ static void unix_sender_owner(void)
     puts("PASS UNIX queued sender survives endpoint close and returns accounting once in either close order");
 }
 
+struct loopback_observation {
+    struct udp_pcb *sender;
+    ip_addr_t address;
+    struct pbuf *payload;
+    u16_t port;
+    unsigned wakes, received;
+    err_t error;
+};
+
+static void loopback_wake(void *context)
+{ ((struct loopback_observation *)context)->wakes++; }
+
+static void loopback_receive(void *context, struct udp_pcb *pcb, struct pbuf *packet,
+    const ip_addr_t *address, u16_t port)
+{
+    (void)pcb; (void)address; (void)port;
+    char data[3];
+    CHECK(packet->tot_len == 3 && pbuf_copy_partial(packet, data, 3, 0) == 3);
+    CHECK(!memcmp(data, "new", 3));
+    ((struct loopback_observation *)context)->received++;
+    pbuf_free(packet);
+}
+
+static void loopback_emit(void *context)
+{
+    struct loopback_observation *observation = context;
+    observation->error = udp_sendto(observation->sender, observation->payload,
+        &observation->address, observation->port);
+    pbuf_free(observation->payload);
+    observation->payload = NULL;
+}
+
+static void loopback_prepare(struct loopback_observation *observation)
+{
+    CHECK(!observation->payload);
+    observation->payload = pbuf_alloc(PBUF_TRANSPORT, 3, PBUF_RAM);
+    CHECK(observation->payload && pbuf_take(observation->payload, "new", 3) == ERR_OK);
+}
+
+static void loopback_work(void)
+{
+    kernel_socket_network_initialize();
+    uint64_t frozen = clock_ns;
+    u32_t initial_memory = lwip_stats.mem.used;
+    u32_t initial_udp = lwip_stats.memp[MEMP_UDP_PCB]->used;
+    for (unsigned ipv6 = 0; ipv6 < 2; ++ipv6) {
+        struct loopback_observation observation = {0};
+        if (ipv6) IP_ADDR6_HOST(&observation.address, 0, 0, 0, 1);
+        else IP_ADDR4(&observation.address, 127, 0, 0, 1);
+        struct udp_pcb *receiver = udp_new_ip_type(ipv6 ? IPADDR_TYPE_V6 : IPADDR_TYPE_V4);
+        observation.sender = udp_new_ip_type(ipv6 ? IPADDR_TYPE_V6 : IPADDR_TYPE_V4);
+        CHECK(receiver && observation.sender);
+        CHECK(udp_bind(receiver, &observation.address, 0) == ERR_OK);
+        observation.port = receiver->local_port;
+        udp_recv(receiver, loopback_receive, &observation);
+        loopback_prepare(&observation);
+        kernel_socket_network_hooks(NULL, loopback_wake, NULL, &observation);
+        struct kernel_socket_service_result service = kernel_socket_service_pending(
+            (struct kernel_socket_service_budget){0, 8, 0});
+        CHECK(!service.runnable && !kernel_socket_work_pending());
+
+        /* 不运行 timer 或 inline service；真实入队必须发布可运行工作并请求唤醒。 */
+        uintptr_t irq = kernel_socket_protocol_enter();
+        loopback_emit(&observation);
+        kernel_socket_protocol_leave(irq);
+        CHECK(observation.error == ERR_OK && !observation.received);
+        CHECK(kernel_socket_work_pending() && observation.wakes);
+        service = kernel_socket_service_pending((struct kernel_socket_service_budget){0, 1, 0});
+        CHECK(service.packets == 1 && !service.timers && observation.received == 1);
+
+        /* 模拟 protocol timer 在本批 loopback 阶段之后入队；返回值仍须报告新工作。 */
+        unsigned before_wakes = observation.wakes;
+        loopback_prepare(&observation);
+        sys_timeout(0, loopback_emit, &observation);
+        service = kernel_socket_service_pending((struct kernel_socket_service_budget){0, 1, 1});
+        CHECK(observation.error == ERR_OK && service.packets == 0 && service.timers == 1);
+        CHECK(service.runnable && kernel_socket_work_pending() && observation.wakes > before_wakes);
+        CHECK(observation.received == 1);
+        service = kernel_socket_service_pending((struct kernel_socket_service_budget){0, 1, 0});
+        CHECK(service.packets == 1 && !service.timers && observation.received == 2);
+        CHECK(!service.runnable && !kernel_socket_work_pending());
+
+        void *held[MEM_SIZE / 1024 + 128];
+        unsigned count = 0;
+        void *allocation;
+        u32_t before_memory = lwip_stats.mem.used;
+        loopback_prepare(&observation);
+        while ((allocation = mem_malloc(1024)) != NULL) {
+            CHECK(count < sizeof(held) / sizeof(held[0])); held[count++] = allocation;
+        }
+        while ((allocation = mem_malloc(1)) != NULL) {
+            CHECK(count < sizeof(held) / sizeof(held[0])); held[count++] = allocation;
+        }
+        before_wakes = observation.wakes;
+        irq = kernel_socket_protocol_enter();
+        loopback_emit(&observation);
+        kernel_socket_protocol_leave(irq);
+        CHECK(observation.error == ERR_MEM && observation.wakes == before_wakes);
+        CHECK(!kernel_socket_work_pending() && observation.received == 2);
+        while (count) mem_free(held[--count]);
+        CHECK(lwip_stats.mem.used == before_memory);
+        loopback_prepare(&observation);
+        irq = kernel_socket_protocol_enter();
+        loopback_emit(&observation);
+        kernel_socket_protocol_leave(irq);
+        CHECK(observation.error == ERR_OK && kernel_socket_work_pending());
+        service = kernel_socket_service_pending((struct kernel_socket_service_budget){0, 1, 0});
+        CHECK(service.packets == 1 && !service.timers && observation.received == 3);
+        udp_remove(observation.sender); udp_remove(receiver);
+        kernel_socket_network_hooks(NULL, NULL, NULL, NULL);
+        CHECK(clock_ns == frozen && lwip_stats.mem.used == initial_memory);
+        CHECK(lwip_stats.memp[MEMP_UDP_PCB]->used == initial_udp);
+        printf("PASS IPv%u loopback work publication, late enqueue and OOM rollback with frozen clock\n", ipv6 ? 6 : 4);
+    }
+}
+
 int main(int argc, char **argv)
 {
     CHECK(argc == 2);
-    if (!strcmp(argv[1], "unix-sender")) unix_sender_owner();
+    if (!strcmp(argv[1], "loopback-work")) loopback_work();
+    else if (!strcmp(argv[1], "unix-sender")) unix_sender_owner();
     else if (!strcmp(argv[1], "copy-indirect")) copy_capacity(1);
     else if (!strcmp(argv[1], "copy-ineligible")) copy_capacity(0);
     else if (!strcmp(argv[1], "timewait-capacity")) timewait_owner(0);

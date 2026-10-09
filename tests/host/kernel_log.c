@@ -30,3 +30,6 @@ int main(void){
  copy_overwrite=1;int n=action(3,sizeof(output));assert(n>0 && n<=16384);n=action(3,sizeof(output));assert(n>0 && n<=16384);assert(memmem(output,n,"overwrite",9));
  puts("PASS: kernel log ring, whole records, overwrite during copy, consumption/fault, clear, wake/signal and permissions");return 0;
 }
+
+#include "wait_boundary.h"
+HOST_WAIT_BOUNDARY(, kernel_scheduler_block_current)

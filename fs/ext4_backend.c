@@ -625,7 +625,8 @@ static int journal_wait(void *context, uint64_t sequence, enum ext4_journal_wait
         struct jbd_journal *journal = adapter->device.fs->jbd_journal;
         if (!journal->error && journal_reached(journal, kind) < sequence) {
             enum kernel_wait_wake_reason reason;
-            if (kernel_scheduler_block_current(&adapter->journal_progress, 0, 0, &reason) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
+            if (KERNEL_WAIT_RECHECK(&adapter->journal_progress, 0, 0, &reason,
+                (!journal->error && journal_reached(journal, kind) < sequence)) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
         }
         arch_interrupt_restore(irq);
     }
@@ -656,7 +657,8 @@ static void journal_worker(void *context)
         irq = arch_interrupt_save();
         if (!adapter->journal_requested && !adapter->journal_stopping) {
             enum kernel_wait_wake_reason reason;
-            if (kernel_scheduler_block_current(&adapter->journal_work, deadline, 0, &reason) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
+            if (KERNEL_WAIT_RECHECK(&adapter->journal_work, deadline, 0, &reason,
+                (!adapter->journal_requested && !adapter->journal_stopping)) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
         }
         arch_interrupt_restore(irq);
     }

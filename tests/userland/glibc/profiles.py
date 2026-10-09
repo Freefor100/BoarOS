@@ -1,6 +1,7 @@
 """Architecture profiles for unchanged GNU runtime consumers."""
 import hashlib
 import json
+import os
 from pathlib import Path
 import stat
 
@@ -22,8 +23,27 @@ def tree_digest(root):
         rows.append(row)
     return hashlib.sha256(json.dumps(rows,separators=(',',':')).encode()).hexdigest()
 
-def checked_inputs(arch='riscv'):
+def checked_inputs(arch='riscv', tools_root=None):
+    if arch not in ('riscv','loongarch'):
+        raise ValueError('unknown GNU runtime architecture: '+arch)
     manifest=json.loads((HERE/('inputs.json' if arch=='riscv' else 'inputs-loongarch.json')).read_text())
+    tools_root=tools_root or os.environ.get('BOAROS_GLIBC_ROOT')
+    if tools_root:
+        root=Path(tools_root).resolve()
+        prefix='/usr' if arch=='riscv' else '/opt/loongarch64-tools'
+        def relocated(name):
+            path=Path(name)
+            relative=path.relative_to(prefix)
+            return str(root/('usr' if arch=='riscv' else '')/relative)
+        # 只迁移宿主安装位置，原工具、CRT 和 libc 的内容身份继续严格校验。
+        for role in ('tools','runtime','installation'):
+            manifest[role]={relocated(name):expected for name,expected in manifest.get(role,{}).items()}
+        if arch=='riscv':
+            target=root/'usr/riscv64-linux-gnu'
+            manifest['compiler_flags']=[*manifest.get('compiler_flags',[]),
+                '--sysroot='+str(target),'-isystem',str(target/'usr/include'),
+                '-isystem',str(target/'include'),'-B'+str(target/'usr/lib/'),
+                '-Wl,-rpath-link,'+str(target/'lib')]
     for role in ('tools','runtime'):
         for name,expected in manifest[role].items():
             if not Path(name).is_file() or digest(name)!=expected:raise RuntimeError(f'{role} identity mismatch: {name}')

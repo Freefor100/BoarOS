@@ -3,6 +3,8 @@
 #define BOAROS_KERNEL_SCHED_PRIVATE_H
 
 #include <kernel/cost.h>
+#include <kernel/cpu.h>
+#include <kernel/wait_internal.h>
 #include <arch/context.h>
 #include <kernel/files.h>
 #include <kernel/heap.h>
@@ -99,6 +101,7 @@ struct kernel_signal_table {
 
 struct kernel_task {
     struct arch_thread_state arch;
+    struct kernel_cpu *cpu;
     uint64_t magic;
     uint64_t physical_address;
     uint64_t stack_physical_address;
@@ -125,6 +128,7 @@ struct kernel_task {
     uint64_t set_tid_address;
     uint64_t clear_tid_address;
     uint64_t robust_list_head;
+    struct kernel_wait_record wait;
     struct kernel_wait_queue *wait_queue;
     uint64_t wakeup_deadline;
     /* Intrusive ordered index over tasks with a deadline, keyed by
@@ -227,12 +231,10 @@ struct kernel_scheduler {
     struct kernel_pid_allocator pid_allocator;
     uint64_t pid_bitmap[KERNEL_PID_BITMAP_WORDS(KERNEL_PID_LIMIT)];
     struct kernel_task idle;
-    struct kernel_task *current;
     struct kernel_task *cleanup_task;
     struct kernel_wait_queue cleanup_queue;
     struct kernel_sched_runqueue runqueue;
     struct kernel_rt_bandwidth rt_bandwidth;
-    unsigned need_resched;
     struct kernel_task *exited_head;
     struct kernel_task *exited_tail;
     struct kernel_task *blocked_head;
@@ -252,8 +254,6 @@ extern struct kernel_scheduler scheduler;
 void kernel_proc_task_update_comm(struct kernel_task *task);
 
 void scheduler_wake_task(struct kernel_task *thread, uint32_t reason);
-void scheduler_wait_requeue(struct kernel_task *task,
-                            struct kernel_wait_queue *queue);
 enum kernel_pid_status process_identity_create(struct kernel_task *task,
     struct kernel_task *parent, int thread_clone);
 void process_identity_release(struct kernel_task *task);
@@ -311,4 +311,8 @@ void stopped_unlink(struct kernel_task *thread);
 enum kernel_signal_status kernel_signal_release_table(
     struct kernel_task *task);
 
+
+void ready_enqueue_locked(struct kernel_task *task, int head);
+struct kernel_task *ready_best_locked(void);
+void ready_remove_locked(struct kernel_task *task);
 #endif

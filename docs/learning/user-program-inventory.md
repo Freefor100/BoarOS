@@ -30,6 +30,16 @@ LA最初未启用完整LS7A参考模型时，stat的时间关系和两项包装�
 - 运行 Linux：`references/linux` commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`，程序清单使用独立 `tests/program-inventory/linux.config`。BusyBox 构建单用 Linux 6.6 UAPI，原因及 SHA-256 见程序环境模块；不混用运行内核版本。
 - 来源唯一清单为 `references/sources.tsv`，执行选择为 `tests/program-inventory/inputs.json`；上游源码按清单恢复，运行日志只在核对期间暂存于忽略的 `build/`。
 
+冷环境需要显式建立构建依赖，不能把前一组留下的musl或BusyBox当作准备契约。
+输入身份也必须从固定来源核对：2026-10-10发现本地既有RV原盘整体SHA与固定压缩包
+解压结果不同，网络所用六个BusyBox/libc/loader文件却完全相同；整盘不同的来源未归因。
+现有盘保持原样，网络输入沿[固定发布archive](../../references/README.md#比赛输入)
+恢复到独立缓存，不能把当前本地文件SHA直接登记成上游身份。
+
+`debugfs dump`退出0仍可能没有导出目标文件，runner必须核对目标存在及实际内容。
+同样，原BusyBox包装器整体退出0不代表其所有子项成功；固定Linux遍历`/proc`时遇到
+已退出PID的`du`失败保持参考侧失败，不用BoarOS通过或后续干净重跑覆盖它。
+
 ```sh
 make inventory-userland-riscv
 make test-program-inventory-host test-diff-abi-host

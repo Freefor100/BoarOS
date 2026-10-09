@@ -71,8 +71,9 @@ int kernel_console_read_buffer(uint32_t flags, void *buffer, size_t size,
             arch_interrupt_restore(saved);
             return -KERNEL_EAGAIN;
         }
-        sleep_status = kernel_scheduler_block_current(&console_input_queue,
-                                                      0U, 1, &wake_reason);
+        sleep_status = KERNEL_WAIT_RECHECK(&console_input_queue,
+                                                      0U, 1, &wake_reason,
+                (!arch_uart_rx_ready()));
         if (sleep_status != KERNEL_SCHEDULER_STATUS_OK) {
             arch_interrupt_restore(saved);
             return -KERNEL_EIO;

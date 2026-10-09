@@ -304,3 +304,6 @@ int main(int argc,char **argv)
     puts("virtio RNG transport lifecycle PASS");
     return 0;
 }
+
+#include "wait_boundary.h"
+HOST_WAIT_BOUNDARY(, kernel_scheduler_block_current)

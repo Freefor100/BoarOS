@@ -3,7 +3,30 @@
 固定依据：`references/linux` commit
 `f4cdf7ca9a1fdcca413157df19753f388a5a224e`；内存对象与 tmpfs 主要对照
 `mm/shmem.c`、`Documentation/filesystems/tmpfs.rst`、`fs/inode.c` 和
-`lib/{cmdline,kstrtox}.c`，硬链接对照 `fs/namei.c`。实现保持 RV64、QEMU virt、单 hart。
+`lib/{cmdline,kstrtox}.c`，硬链接对照 `fs/namei.c`。本文早期消费者记录使用
+RV64、QEMU virt、单 hart；共用挂载/syscall 路径现也由 LA 的完整 ABI 与 PTY 矩阵验证，
+架构与平台范围见[LA 模块](../modules/loongarch-boot.md)。
+
+## 基础挂载与扩展操作的边界
+
+2026-10-08 对照 `kernel/syscall/mount.c` 与 `fs/vfs.c`：普通 proc/tmpfs/devpts/ext4
+挂载和 flags=0 卸载已经接入。`tests/userland/multi_mount.c` 的 remount 输出指
+成功卸载后重新普通挂载；它没有调用 `MS_REMOUNT`，不能据 marker 宣称原位重配置。
+
+固定 `references/linux@f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的
+`fs/namespace.c` 分别处理 remount、bind、move 和传播；`include/uapi/linux/mount.h`
+定义各自 flags。`ksys_umount` 先校验允许的 flags，再按 `UMOUNT_NOFOLLOW` 决定
+路径跟随；`do_umount` 的 expiry、lazy detach 和后端 force 是不同操作。
+BoarOS 当前只接受 `MS_RDONLY/MS_SILENT`，所有非零 umount flags 返回 `ENOTSUP`。
+扩展仍未实现，非法 flags 与坏指针/路径的错误优先级也须随相应能力独立核对。
+绝对根挂载另有边界：固定 Linux 的 `do_umount` 在未请求 lazy detach 时进入
+`do_umount_root` 尝试只读重配置；BoarOS 的根挂载没有 parent/covered 边，
+普通用户态卸载返回 `EINVAL`，该路径尚未接入。
+
+普通卸载先拒绝忙引用，再停 worker、完成 I/O 和持久化，失败保留可达挂载与真实
+错误 owner。lazy detach 则需要让摘树后的实例由存活的 fd/cwd/MM 引用继续持有；
+force 也不能等同于绕过用户引用或 DMA 停止确认。基础卸载的回收证据不自动覆盖
+这些新生命周期，剩余任务集中在[P1h](../goals.md#p1h-虚拟文件系统与多挂载)。
 
 ## 多缓存的共同压力 owner
 

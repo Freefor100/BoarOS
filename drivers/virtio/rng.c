@@ -66,8 +66,9 @@ static void wait_until(struct virtio_rng_device *d, uint64_t deadline)
 {
     enum kernel_wait_wake_reason reason;
     while (!d->stopping && arch_time_read() < deadline)
-        if (kernel_scheduler_block_current(&d->progress, deadline, 0,
-                                           &reason) !=
+        if (KERNEL_WAIT_RECHECK(&d->progress, deadline, 0,
+                                           &reason,
+                (!d->stopping && arch_time_read() < deadline)) !=
             KERNEL_SCHEDULER_STATUS_OK)
             __builtin_trap();
 }
@@ -89,8 +90,9 @@ static void worker(void *owner)
             enum kernel_wait_wake_reason reason;
             while (!d->stopping && !d->completed &&
                    arch_time_read() < deadline) {
-                if (kernel_scheduler_block_current(&d->progress, deadline, 0,
-                                                   &reason) !=
+                if (KERNEL_WAIT_RECHECK(&d->progress, deadline, 0,
+                                                   &reason,
+                (!d->stopping && !d->completed && arch_time_read() < deadline)) !=
                     KERNEL_SCHEDULER_STATUS_OK)
                     __builtin_trap();
             }

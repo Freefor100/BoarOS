@@ -1,7 +1,7 @@
 # 双架构评测的输入、失败与证据
 
-当前路线为 main 单向集成到本地 oscomp-compat；旧远程分支保持原名，
-没有远程迁移、push 或托管 CI 运行事实。构建/监督入口见
+当前维护分支为 main 与 oscomp-compat，通用修复从 main 单向集成；
+旧专项名称仅保留历史输入、提交和结果身份。构建/监督入口见
 [兼容模块](../modules/oscomp-compat.md)。
 
 固定 Harness 为 `references/oscomp-autotest` 的
@@ -567,3 +567,37 @@ python3 -B tests/oscomp/official.py --collect-existing build/oscomp-official-run
 结果核对后按既有pruner清理已收口目录；工具、运行时及内核缓存保留，历史未解
 现场继续保留。结论为默认双架构、带既有监督/显式shell及LA调度运行时适配的
 容器流程已实跑并收集；原案例失败、缺失能力、总预算未到达和正常回收证据分别记录。
+
+## 当前主线集成的验证范围
+
+兼容分支集成main `16951f0bfafd196452ccce705dc9d2d3f7ffc91a`，保留双架构
+默认构建、兼容uname、原盘loader、监督/显式shell及LA调度DSO。共同README和
+路线图采用主线当前能力与限制，历史提交及正式成绩保留原身份。
+
+合并树的61项OSComp host及20项CI host通过；raw/等待/可睡眠锁及4/16KiB、
+2/4线程allocator并发门禁通过。相同raw supervisor在固定Linux与BoarOS、
+RV/LA各512MiB/1GiB的八次启动通过，含native退出、组隔离、超时KILL/reap；
+通用fixture的双架构两种RAM等待切换通过。原盘环境诊断两侧各一次1GiB启动
+均正常退出，PID1/页/堆/任务栈/根盘及设备owner核对通过。
+
+| 本次原judge聚焦组 | RV glibc | RV musl | LA glibc | LA musl |
+|---|---:|---:|---:|---:|
+| basic | 86 | 90 | 90 | 90 |
+| BusyBox | 54 | 54 | 54 | 54 |
+
+RV glibc的额外4分来自pipe输出`cpid: 6cpid: 0`，随后仍打印原写入成功行；
+固定Harness `judge_basic-glibc.py`要求单独的`cpid: 0`及第三行固定位置，
+因此该项0/4。此前固定Linux同样有父子字符输出交错记录，见上文公开修正对照；
+本次保留实际输出与判分，不修改原程序、输出或judge，也不通过重跑替换本次成绩。
+
+```sh
+make test-oscomp-host test-ci-host
+make test-sync-host test-wait-host test-sleep-lock-host test-allocator-concurrency-host
+make test-oscomp-supervisor-riscv test-oscomp-supervisor-loongarch
+make all test-wait-riscv test-wait-loongarch INIT_CONFIG=config/init.json
+python3 -B tests/oscomp/run.py --arch both --groups environment --diagnostic-timeout 180
+make all
+```
+
+以上是主线集成的聚焦验证，未重新执行3600秒官方容器、完整ABI或229项原程序；
+2130仍是先前冻结提交的正式联合成绩，不属于本次集成树。

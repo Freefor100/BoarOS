@@ -2,6 +2,7 @@
 #define BOAROS_KERNEL_PHYSICAL_PAGE_H
 
 #include <kernel/boot_memory.h>
+#include <kernel/raw_lock.h>
 
 #include <stdint.h>
 
@@ -29,6 +30,7 @@ void kernel_memory_snapshot(const struct physical_page_allocator *allocator,
                             struct kernel_memory_statistics *out);
 
 struct physical_page_metadata;
+struct physical_page_root;
 
 struct physical_page_range {
     uint64_t base;
@@ -38,6 +40,7 @@ struct physical_page_range {
 };
 
 struct physical_page_allocator {
+    struct kernel_raw_lock lock;
     void (*pressure_notify)(void *);
     void (*pressure_wait)(void *);
     void *pressure_context;
@@ -63,6 +66,10 @@ struct physical_page_allocator {
     physical_page_reclaim_fn reclaimer;
     void *reclaimer_context;
     struct physical_page_metadata *metadata;
+    struct physical_page_root *roots;
+    unsigned char *tree;
+    uint64_t tree_nodes;
+    uint32_t root_count;
     uint32_t free_heads[PHYSICAL_PAGE_MAX_ORDER + 1U];
     struct physical_page_range ranges[BOOT_MEMORY_MAX_USABLE_RANGES];
 };
@@ -78,6 +85,11 @@ enum physical_page_status physical_page_allocator_bind_access(
 
 enum physical_page_status physical_page_allocator_finalize(
     struct physical_page_allocator *allocator);
+
+/* Caller owns an unpublished or exclusive instance; never audit a live pool.
+ * No allocation, reclaim or I/O. Corrupt authority is fatal, not retryable. */
+enum physical_page_status physical_page_allocator_audit(
+    const struct physical_page_allocator *allocator);
 
 int physical_page_allocator_is_finalized(
     const struct physical_page_allocator *allocator);

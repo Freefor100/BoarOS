@@ -43,7 +43,14 @@ enum kernel_uaccess_status kernel_copy_string_from_user(
 
 ## 并发与性能边界
 
-当前 uaccess 只对 scheduler 当前、已经激活的 MM 提交新页；VMA/PTE 检查会在真正分配前拒绝非法范围。单 hart、关中断 syscall 路径保证 lookup、fault-in/COW、物理页解析和复制之间没有并发 unmap/mprotect。接入 SMP 或共享 MM 时，必须一起定义 MM 读锁、页固定、原子页引用、分配失败、部分复制和 TLB shootdown 协议；公共 syscall ABI 不需要因此改变。
+当前uaccess只对scheduler当前、已经激活的MM提交新页；VMA/PTE检查会在真正分配前拒绝
+非法范围。复制依赖现有单核调用纪律，`resolve_user_page()`本身没有取得覆盖随后复制的
+额外物理页引用，不能单靠这个接口支持共享MM跨核并行；这轮没有复现单核释放后使用错误。
+SMP前必须在同一MM保护下完成映射/权限检查和取得页pin，睡眠后重查VMA/PTE/COW状态，
+按复制片段归还pin。pin解决生命周期，不能代替mprotect权限线性化或远端TLB完成；
+撤映射、降权、截断及COW须与活动CPU集合和延后回收一起验收，保留当前FAULT/STATE
+区分及精确bytes_copied前缀。具体实现归[并发路线](../goals.md#p6c-tlb-完成与页回收)，
+本轮只收口前置契约，不增加新syscall或声称已经取得跨核保护。
 
 驻留页每个基页进行一次三级软件页表查询和一次物理页解析，随后执行页内线性字节复制；首次提交的页额外承担 VMA 二分查找、页分配/清零、PTE 写入和架构转换失效。uaccess 经内核物理映射复制，不切换硬件用户地址空间；RV 不修改 `sstatus.SUM`。文件 `read` 已以 4 KiB staging chunk 使用该路径，但当前只用结构成本和 QEMU 正确性测试约束，尚未取得开发板吞吐、TLB miss 或 cache 数据。应在真实工作负载上比较软件遍历与 RISC-V SUM+异常表快路径，再决定阈值或替换策略。
 

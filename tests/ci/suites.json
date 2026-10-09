@@ -1,0 +1,63 @@
+{
+  "host": {
+    "host": [
+      {"name":"ci-contracts","targets":["test-ci-host"]},
+      {"name":"allocator","targets":["test-sync-host","test-wait-host","test-sleep-lock-host","test-scheduler-handoff-host","test-allocator-concurrency-host","test-allocator-release-host","test-allocator-preemption-host","test-allocator-cost-host"]},
+      {"name":"virtio","targets":["test-virtio-framework-host","test-virtio-block-host","test-virtio-rng-host","test-virtio-net-host","test-pci-host"]},
+      {"name":"terminal","targets":["test-tty-host","test-pty-host","test-uart-host"]},
+      {"name":"random-clock","targets":["test-random-host","test-rtc-host","test-rtc-loongarch-host"]},
+      {"name":"events-network","targets":["test-epoll-host","test-lwip-host","test-lwip-reassembly-host","test-ethernet-worker-host"]},
+      {"name":"file-cache","targets":["test-lwext4-host","test-lwext4-checksum-host","test-lwext4-cache-host","test-lwext4-batch-read-host","test-lwext4-group-host","test-lwext4-metadata-host","test-lwext4-deep-truncate-host"]},
+      {"name":"runner-profiles","targets":["test-diff-abi-host","test-program-inventory-host","test-program-environment-host","test-glibc-profile-host","test-platform-profile-host"]}
+    ]
+  },
+  "core": {
+    "loongarch": [
+      {"name":"architecture","targets":["test-loongarch"]},
+      {"name":"stack-permissions","targets":["test-stack-guard-loongarch","test-permissions-loongarch"]},
+      {"name":"signals-threads","targets":["test-signal-loongarch","test-pthread-loongarch","test-pthread-oom-loongarch"]},
+      {"name":"cpu-state","targets":["test-sync-loongarch","test-wait-loongarch","test-scheduler-handoff-loongarch","test-fpu-loongarch","test-simd-loongarch"]},
+      {"name":"dynamic-exec","targets":["test-dynamic-loongarch","test-exec-errors-loongarch"]},
+      {"name":"pci-root","targets":["test-block-loongarch","test-root-loongarch","test-root-checksum-loongarch"]},
+      {"name":"abi","targets":["test-diff-abi-loongarch"]},
+      {"name":"stack-report","targets":["test-stack-usage-la"]}
+    ]
+  },
+  "runtime": {
+    "riscv": [
+      {"name":"glibc-five-forms","targets":["test-glibc-riscv"]}
+    ],
+    "loongarch": [
+      {"name":"glibc-five-forms","targets":["test-glibc-loongarch"]},
+      {"name":"sqlite-delete","targets":["test-sqlite-rollback-loongarch"]},
+      {"name":"sqlite-wal","targets":["test-sqlite-wal-loongarch"]}
+    ]
+  },
+  "platform": {
+    "riscv": [
+      {"name":"random-clock","targets":["test-rng-riscv","test-environment-riscv"]},
+      {"name":"network","targets":["test-network-riscv"]},
+      {"name":"tty-pty","targets":["test-tty-termios2-riscv","test-tty-diff-riscv","test-pty-riscv"]}
+    ],
+    "loongarch": [
+      {"name":"random-clock","targets":["test-boot-random-loongarch","test-rng-loongarch","test-environment-loongarch"]},
+      {"name":"network","targets":["test-network-loongarch"]},
+      {"name":"tty-pty","targets":["test-tty-termios2-loongarch","test-tty-diff-loongarch","test-pty-loongarch","test-pipe-loongarch"]}
+    ]
+  },
+  "extended": {
+    "riscv": [
+      {"name":"original-programs","argv":["python3","-B","tests/program-inventory/run.py","--arch","riscv","--reuse-builds","--memory","512M","--memory","1G","--require-pass"],"timeout":3600},
+      {"name":"tty-apps","targets":["test-tty-riscv","test-pty-apps-riscv"]},
+      {"name":"ethernet","targets":["test-network-external-riscv"]},
+      {"name":"rt-storage","targets":["test-multi-disk-rt-riscv"]}
+    ],
+    "loongarch": [
+      {"name":"original-programs","argv":["python3","-B","tests/program-inventory/run.py","--arch","loongarch","--reuse-builds","--memory","512M","--memory","1G","--require-pass"],"timeout":3600},
+      {"name":"tty-apps","targets":["test-tty-loongarch","test-pty-apps-loongarch"]},
+      {"name":"ethernet","targets":["test-network-external-loongarch"]},
+      {"name":"device-rollback","targets":["test-pci-reset-owner-loongarch","test-root-io-loongarch","test-rng-failures-loongarch","test-net-failures-loongarch","test-uart-failures-loongarch"]},
+      {"name":"rtc-model","targets":["test-rtc-model-loongarch","test-rtc-alarm-loongarch"]}
+    ]
+  }
+}

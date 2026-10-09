@@ -1,5 +1,46 @@
 # 文件时间戳：请求边界、live inode 与 relatime
 
+## 共享读取中的 checksum 计算（2026-10-08）
+
+基线 `main@cfae103` 的 `third_party/lwext4/src/ext4_fs.c` 在 GDT 和 inode 的
+metadata checksum 计算期间，把共享缓冲中的 checksum 字段清零，算完再恢复。
+`fs/lwext4_port.c` 的普通查询持有共享读锁；`kernel/sched/sync.c` 的取得读锁
+在返回前恢复 IRQ，因此不能把这个短窗口当成读者之间的独占保护。
+确定性重入通过公共 `ext4_fraw_inode_fill()` 让第二读者在该窗口校验同一合法对象，
+原路径出现外层成功、第二读者 `EUCLEAN=117`。这证明错误交错存在，不声称已经
+捕获自然 timer 抢占中的同一次故障，也不据此解释历史吞吐负向。
+
+修复以 `ext4_crc32c_zeroed()` 对字段归一化：原字节段与两个零字节顺序进入 CRC，
+输入全程不变。原 checksum seed、inode number/generation、128-byte 截断和高字段
+选择保留；orphan 的 inode 计算使用同一原语，真正修改仍由持有写权限的 caller 发布。
+没有增加 inode copy、heap 分配或 IRQ 关闭区间，也没有改变 journal undo、prune、
+回滚和持久化规则。固定 Linux
+`references/linux` commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的
+`fs/ext4/inode.c:ext4_inode_csum()` 和 `fs/ext4/super.c:ext4_group_desc_csum()`
+同样按字节段与本地零值计算；这里只引用其不修改输入的计算原则，保留 lwext4
+当前 inode 字段边界，未借此扩大磁盘格式承诺。lwext4 上游身份见下节。
+
+重建命令：
+
+```sh
+make test-lwext4-checksum-host
+make test-root-checksum-loongarch
+python3 -B tests/lwext4-checksum-read-host.py --source-root /path/to/cfae103 --output build/checksum-read-baseline
+make test-lwext4-metadata-host test-lwext4-group-host test-lwext4-recovery-host
+```
+
+CRC oracle 使用 `mprotect(PROT_READ)` 的输入，260例覆盖一个/两个字段、非零中段、
+实际 inode 124/130 offset、32～16384字节与原数据不变；7个非法内部布局必须 fatal。
+真实 ext4 镜像的8例覆盖1/4 KiB块、128/256-byte inode、GDT/inode两种交错，成功后
+归还引用、停止 journal、卸载、heap归零并经e2fsck检查。该门禁加入共同 host CI；
+本地门禁结果不等于远程 CI 已运行。LA 另外使用 `metadata_csum,64bit` 的正常根盘
+在512 MiB/1 GiB运行真实用户程序，正常退出、owner释放并通过e2fsck；同一原ELF在
+固定Linux的同类镜像另验证。默认根盘fixture不改变，checksum profile仅用于正常
+smoke路径，原错误fixture不能因更换格式而沿用未经核对的errno预期。
+
+GDT 只读定位的性能候选与更宽查询接口仍在隔离研究，尚未作为主线默认策略。
+上述修复处理已复现的 checksum 读者冲突，不声明它关闭了完整读写吞吐验收。
+
 ## 固定证据
 
 Linux 参考均为 `references/linux/` commit

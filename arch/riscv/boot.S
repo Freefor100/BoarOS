@@ -7,6 +7,7 @@ _start:
     /* OpenSBI provides a0=hart ID and a1=DTB; no firmware stack is ours. */
     mv s0, a0
     mv s1, a1
+    mv tp, zero
 
     .option push
     .option norelax
@@ -35,6 +36,8 @@ _start:
     csrw stvec, t0
 
     mv a0, s0
+    call kernel_cpu_boot_initialize
+    mv a0, s0
     mv a1, s1
     call kernel_main
 
@@ -51,6 +54,7 @@ riscv_relocate_to_high:
     /* The transition table maps the image at both its old and new VA. */
     add ra, ra, a0
     add sp, sp, a0
+    add tp, tp, a0
 
     csrr t0, stvec
     add t0, t0, a0

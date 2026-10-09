@@ -48,7 +48,7 @@ idle/cleanup 上下文单列 idle_ticks，不能解释成精确 WFI 驻留时间
 
 验证入口：`make test-cost-host`、`make test-cost-riscv COST_CASE=contract`。
 后者串行运行三个独立启动副本，在启动前保存 kernel/ELF/fixture 身份与源码内容哈希。
-目前交付 contract/write/locking/mprotect/deadline/latency/consumer，
+目前交付 contract/write/locking/mprotect/deadline/latency/consumer/readers/metadata/allocator，
 `all` 不跳过缺项；consumer 不将未完成命令标为完成。独立报告读器拒绝缺项、重复、未知键、单位错误、旧 epoch、
 直方图不一致、incomplete 和 overflow。当前 Python discovery 不收集带连字符的文件，
 因此 host target 直接运行 `python3 -B tests/test-cost-report.py`，必须实际执行测试。
@@ -202,3 +202,30 @@ TCP admission 新增 `stream_admit_blocked`（预先无容量的尝试）、`str
 （复制后提交仍为 EAGAIN 的尝试）和 `stream_copy_blocked_bytes`（尚无进展时这些失败新复制的
 payload 字节）。阻塞调用可能有多次尝试，不能当作 syscall 次数；复用暂存后缀不再次计复制。
 现有 `stream_copy` 仍记录全部真实复制。指标在末尾追加，前一网络 schema 继续可读。
+
+
+## buddy元数据观测（2026-10-09）
+
+注册表末尾增加page_meta_checked、page_meta_written（逻辑记录）和allocator_meta_ticks
+（区间累计ticks/samples/max），均不带直方图。每次元数据区内局部累计，离开后一次
+原子提交三个计数；默认关闭，不持对象引用、不分配观测内存。计时不含压力回收与I/O
+等待。加上raw区间观测后当前聚合64570字节、每任务64字节，旧223/226项完整registry仍可显式解析；缺少新
+指标标记不可用，不能填零，也不接受随意缺字段的快照。外部冻结kernel identity中的
+registry与二进制SHA必须匹配；同时声明两份registry时必须一致。
+
+`python3 -B tests/cost-riscv.py --case allocator`执行1页×1024、64页×64、4096页×4
+的固定匿名映射、逐页零值/内容检查和撤映射。allocator及既有latency均支持
+`--coordinator-elf`冻结同一个ELF，`--kernel-identity`冻结构建身份，默认三次独立启动。
+allocator复用既有10秒异步关闭协议：实际工作计时先停止，checkpoint在途scope
+排空所需的关闭ns/retries另记；EBUSY不能被吞掉，超时继续失败。最终输出用真实
+fflush/tcdrain排空TTY，原始快照损坏仍拒绝。启动预算保持180秒。
+
+匹配旧/新/返回旧、ON/OFF共36次启动及负向结论见
+[学习记录](../learning/cost-baseline.md#buddy-森林匹配时间2026-10-09)。IRQ-off直方图与
+rank持锁/wake-to-run沿用RV观测；LA本轮仅功能和16KiB工作量门禁，没有声明LA时间验收。
+
+raw_wait_ticks记录轮询/原子获取区间（无争用获取也有样本），raw_hold_ticks记录取得后
+到释放前的区间；二者只记录累计ticks/samples/max，不增加直方图。默认关闭，guard仅
+存栈上tag与时间，不固定新owner；释放raw后集中提交。元数据计时从取得锁后开始，
+排除锁获取与压力/I/O。heap→page嵌套区间可能重叠，不能把raw_hold与meta时间相加当独占CPU时间。
+完整旧226项registry缺少这两项时标为不可用；任意缺字段或部分新增schema仍拒绝。

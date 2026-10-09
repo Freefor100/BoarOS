@@ -194,3 +194,6 @@ int main(void) {
     assert(!riscv_uart_tty_stop_report(&port,&final));assert(final.transmitted==1539);assert(output[output_w-1]=='S');assert(!port&&!live_allocations&&!irq_handler&&regs[1]==0);
     assert(!riscv_uart_tty_console('x'));puts("UART IRQ/worker transport tests passed");
 }
+
+#include "wait_boundary.h"
+HOST_WAIT_BOUNDARY(, kernel_scheduler_block_current)

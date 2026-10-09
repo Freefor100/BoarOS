@@ -431,7 +431,8 @@ static int begin_call(struct virtio_block_device *device, int barrier)
         enum kernel_wait_wake_reason reason;
         device->statistics.queue_waits++;
         uint64_t wait_start = time_now();
-        if (kernel_scheduler_block_current(&device->available, 0, 0, &reason) != KERNEL_SCHEDULER_STATUS_OK)
+        if (KERNEL_WAIT_RECHECK(&device->available, 0, 0, &reason,
+                (device_live(device) && (device->barrier || (barrier ? device->active != 0 : device->barrier_waiters != 0)))) != KERNEL_SCHEDULER_STATUS_OK)
             __builtin_trap();
         device->statistics.queue_wait_ticks += time_now() - wait_start;
     }
@@ -472,7 +473,8 @@ static struct block_request *reserve_request(struct virtio_block_device *device)
         enum kernel_wait_wake_reason reason;
         device->statistics.queue_waits++;
         uint64_t wait_start = time_now();
-        if (kernel_scheduler_block_current(&device->available, 0, 0, &reason) != KERNEL_SCHEDULER_STATUS_OK)
+        if (KERNEL_WAIT_RECHECK(&device->available, 0, 0, &reason,
+                (device_live(device) && !(r = try_reserve_request(device)))) != KERNEL_SCHEDULER_STATUS_OK)
             __builtin_trap();
         device->statistics.queue_wait_ticks += time_now() - wait_start;
     }
@@ -566,7 +568,8 @@ static enum kernel_block_status wait_request(struct virtio_block_device *device,
         if (device->irq_source) {
             enum kernel_wait_wake_reason reason;
             device->statistics.sleeps++;
-            if (kernel_scheduler_block_current(&r->done, r->deadline, 0, &reason) != KERNEL_SCHEDULER_STATUS_OK)
+            if (KERNEL_WAIT_RECHECK(&r->done, r->deadline, 0, &reason,
+                (r->state == 2)) != KERNEL_SCHEDULER_STATUS_OK)
                 __builtin_trap();
             /* A timer may win the trap race even though DMA completed. This
              * one final harvest is not a polling completion loop. */
@@ -934,7 +937,8 @@ static enum kernel_block_status virtio_block_write_batch(void *context,
             /* Other calls may free slots while every request in this batch is
              * still pending. Their completion must also wake this publisher. */
             uint64_t batch_wait_start = time_now();
-            if (kernel_scheduler_block_current(&device->available, deadline, 0, &reason) != KERNEL_SCHEDULER_STATUS_OK)
+            if (KERNEL_WAIT_RECHECK(&device->available, deadline, 0, &reason,
+                (device_live(device) && device->queue.used->index == device->queue.last_used)) != KERNEL_SCHEDULER_STATUS_OK)
                 __builtin_trap();
             device->statistics.queue_wait_ticks += time_now() - batch_wait_start;
             if (reason == KERNEL_WAIT_TIMEOUT && device_live(device)) collect_used(device);
@@ -1048,7 +1052,8 @@ static enum kernel_block_status virtio_block_read_batch(void *context,
             enum kernel_wait_wake_reason reason;
             if (pending) device->statistics.sleeps++; else device->statistics.queue_waits++;
             uint64_t wait_start = time_now();
-            if (kernel_scheduler_block_current(&device->available, deadline, 0, &reason) != KERNEL_SCHEDULER_STATUS_OK)
+            if (KERNEL_WAIT_RECHECK(&device->available, deadline, 0, &reason,
+                (device_live(device) && device->queue.used->index == device->queue.last_used)) != KERNEL_SCHEDULER_STATUS_OK)
                 __builtin_trap();
             device->statistics.queue_wait_ticks += time_now() - wait_start;
             if (reason == KERNEL_WAIT_TIMEOUT && device_live(device)) collect_used(device);

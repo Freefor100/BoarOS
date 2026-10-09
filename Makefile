@@ -139,6 +139,8 @@ LWIP_SOURCES := \
 	net/lwip_port/port.c
 
 C_SOURCES := \
+	kernel/cpu.c \
+	kernel/raw_lock.c \
 	arch/riscv/context.c \
 	arch/riscv/direct_map.c \
 	arch/riscv/elf_image.c \
@@ -216,6 +218,7 @@ C_SOURCES := \
 	kernel/sched/signal.c \
 	kernel/sched/tty.c \
 	kernel/sched/wait.c \
+	kernel/sched/park.c \
 	kernel/sched/sync.c \
 	kernel/sched/futex.c \
 	kernel/syscall/dispatch.c \
@@ -260,6 +263,8 @@ OBJECTS := \
 	$(patsubst %.c,$(BUILD_DIR)/%.o,$(C_SOURCES)) \
 	$(patsubst %.S,$(BUILD_DIR)/%.o,$(ASM_SOURCES))
 TEST_RUNTIME_C_SOURCES := \
+	kernel/cpu.c \
+	kernel/raw_lock.c \
 	arch/riscv/context.c \
 	arch/riscv/direct_map.c \
 	arch/riscv/elf_image.c \
@@ -333,6 +338,7 @@ TEST_RUNTIME_C_SOURCES := \
 	kernel/sched/signal.c \
 	kernel/sched/tty.c \
 	kernel/sched/wait.c \
+	kernel/sched/park.c \
 	kernel/sched/sync.c \
 	kernel/sched/futex.c \
 	kernel/syscall/dispatch.c \
@@ -718,6 +724,13 @@ test-lwext4-extent-host:
 .PHONY: test-lwext4-cost-host
 test-lwext4-cost-host:
 	sh tests/lwext4-cost-host.sh
+
+.PHONY: test-lwext4-checksum-host
+test-lwext4-checksum-host:
+	@mkdir -p build/host
+	cc -std=gnu11 -O2 -Wall -Wextra -Werror -DCONFIG_USE_DEFAULT_CFG=1 -Ithird_party/lwext4/include tests/host/lwext4_checksum.c third_party/lwext4/src/ext4_crc32.c -o build/host/lwext4-checksum
+	build/host/lwext4-checksum
+	python3 -B tests/lwext4-checksum-read-host.py
 
 .PHONY: test-lwext4-cache-host
 .PHONY: test-lwext4-deep-truncate-host
@@ -1516,11 +1529,25 @@ build/host/lwip-port: tests/host/lwip_port_test.c \
 .PHONY: test-lwip-host
 test-lwip-host: build/host/lwip-port
 	$<
+	python3 -B tests/host/network_owner.py --case loopback-work
+
+HOST_CPU_SOURCES := kernel/cpu.c kernel/raw_lock.c tests/host/cpu_context.c
 
 test-allocator-release-host:
 	mkdir -p build/host
-	cc -std=c11 -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=12 -Itests/host/random -Iinclude tests/host/allocator_release.c kernel/physical_page.c mm/heap.c -o build/host/allocator-release
+	cc -std=c11 -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=12 -Itests/host/random -Iinclude tests/host/allocator_release.c kernel/physical_page.c $(HOST_CPU_SOURCES) mm/heap.c -o build/host/allocator-release
 	build/host/allocator-release
+
+.PHONY: test-allocator-cost-host
+test-allocator-cost-host:
+	@mkdir -p build/cost/host
+	@for shift in 12 14; do \
+		cc -std=c11 -O2 -Wall -Wextra -Werror -Itests/host/random -idirafter include \
+			-DBOAROS_PAGE_SHIFT=$$shift -DBOAROS_COST_DIAGNOSTICS=1 \
+			tests/cost/allocator_work.c kernel/cost.c kernel/physical_page.c $(HOST_CPU_SOURCES) \
+			-o build/cost/host/allocator-work-$$shift && \
+		build/cost/host/allocator-work-$$shift || exit; \
+	done
 
 include tests/diff-abi/Makefile.inc
 
@@ -1730,9 +1757,11 @@ test-cost-host:
 	build/cost/host/account-test
 	cc -std=c11 -Wall -Wextra -Werror -idirafter include -DBOAROS_COST_DIAGNOSTICS=1 tests/cost/irq_test.c kernel/cost.c -o build/cost/host/irq-test
 	build/cost/host/irq-test
-	cc -std=c11 -Wall -Wextra -Werror -Itests/host/random -idirafter include -DBOAROS_PAGE_SHIFT=12 -DBOAROS_COST_DIAGNOSTICS=1 tests/cost/page_test.c kernel/cost.c kernel/physical_page.c -o build/cost/host/page-test
+	cc -std=c11 -O2 -Wall -Wextra -Werror -Itests/host/sync -idirafter include -DBOAROS_COST_DIAGNOSTICS=1 tests/cost/raw_test.c kernel/cost.c kernel/cpu.c kernel/raw_lock.c -o build/cost/host/raw-test
+	build/cost/host/raw-test
+	cc -std=c11 -Wall -Wextra -Werror -Itests/host/random -idirafter include -DBOAROS_PAGE_SHIFT=12 -DBOAROS_COST_DIAGNOSTICS=1 tests/cost/page_test.c kernel/cost.c kernel/physical_page.c $(HOST_CPU_SOURCES) -o build/cost/host/page-test
 	build/cost/host/page-test
-	cc -std=c11 -Wall -Wextra -Werror -Itests/host/random -idirafter include -DBOAROS_PAGE_SHIFT=12 -DBOAROS_COST_DIAGNOSTICS=1 tests/memory/cost_test.c kernel/cost.c kernel/physical_page.c mm/heap.c mm/uaccess.c -o build/cost/host/memory-test
+	cc -std=c11 -Wall -Wextra -Werror -Itests/host/random -idirafter include -DBOAROS_PAGE_SHIFT=12 -DBOAROS_COST_DIAGNOSTICS=1 tests/memory/cost_test.c kernel/cost.c kernel/physical_page.c $(HOST_CPU_SOURCES) mm/heap.c mm/uaccess.c -o build/cost/host/memory-test
 	build/cost/host/memory-test
 	python3 -B tests/test-cost-report.py
 test-cost-riscv: test-cost-host
@@ -1748,6 +1777,10 @@ test-log-host:
 .PHONY: test-environment-riscv
 test-environment-riscv: $(KERNEL_RV)
 	KERNEL_RV=$(KERNEL_RV) QEMU_RISCV64=$(QEMU_RISCV64) sh tests/environment-riscv.sh
+
+.PHONY: test-platform-profile-host
+test-platform-profile-host:
+	python3 -B tests/host/platform_memory.py
 
 .PHONY: test-rtc-host
 test-rtc-host:
@@ -1784,7 +1817,7 @@ test-allocator-preemption-host:
 	mkdir -p build/host/allocator
 	cc -std=c11 -O1 -fno-inline -finstrument-functions -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=12 -Itests/host/allocator -Iinclude -c kernel/physical_page.c -o build/host/allocator/page.o
 	cc -std=c11 -O1 -fno-inline -finstrument-functions -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=12 -Itests/host/allocator -Iinclude -c mm/heap.c -o build/host/allocator/heap.o
-	cc -std=c11 -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=12 -Iinclude tests/host/allocator_preemption.c build/host/allocator/page.o build/host/allocator/heap.o -o build/host/allocator/preemption
+	cc -std=c11 -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=12 -Itests/host/allocator -Iinclude $(HOST_CPU_SOURCES) tests/host/allocator_preemption.c build/host/allocator/page.o build/host/allocator/heap.o -o build/host/allocator/preemption
 	build/host/allocator/preemption
 
 .PHONY: test-fifo-riscv
@@ -1886,6 +1919,10 @@ test-readahead-riscv:
 
 include arch/loongarch/build.mk
 
+.PHONY: test-ci-host
+test-ci-host:
+	python3 -B -m unittest discover -s tests/ci -p 'test_*.py'
+
 .PHONY: test-virtio-block-host
 .PHONY: test-virtio-framework-host
 test-virtio-framework-host:
@@ -1936,3 +1973,61 @@ test-oscomp-official:
 .PHONY: prepare-oscomp-inputs
 prepare-oscomp-inputs:
 	python3 -B tests/oscomp/assets.py
+
+.PHONY: test-sync-host
+test-sync-host:
+	@mkdir -p build/host
+	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -Itests/host/sync -idirafter include tests/host/sync.c kernel/cpu.c kernel/raw_lock.c -o build/host/sync
+	build/host/sync
+	python3 -B tests/sync/test_native.py
+
+.PHONY: test-allocator-concurrency-host
+test-allocator-concurrency-host:
+	@mkdir -p build/host
+	@for shift in 12 14; do \
+		cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -DBOAROS_PAGE_SHIFT=$$shift \
+			-Itests/host/sync -idirafter include tests/host/allocator_concurrency.c \
+			kernel/cpu.c kernel/raw_lock.c kernel/physical_page.c mm/heap.c -o build/host/allocator-concurrency-$$shift && \
+		build/host/allocator-concurrency-$$shift || exit; \
+	done
+
+$(BUILD_DIR)/sync-%.o: tests/sync/native.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -DBOAROS_SYNC_CASE=$* -c $< -o $@
+$(BUILD_DIR)/sync-%: $(OBJECTS) $(BUILD_DIR)/sync-%.o arch/riscv/linker.ld
+	$(CC) $(LDFLAGS) -Wl,--wrap=kernel_main -o $@ $(OBJECTS) $(BUILD_DIR)/sync-$*.o
+.PHONY: test-sync-riscv
+test-sync-riscv: $(foreach case,0 1 2 3 4,$(BUILD_DIR)/sync-$(case))
+	python3 -B tests/sync/native.py --arch riscv --qemu $(QEMU_RISCV64) --kernel-dir $(BUILD_DIR)
+test-riscv: test-sync-riscv
+
+.PHONY: test-wait-host
+test-wait-host:
+	@mkdir -p build/host
+	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -Itests/host/sync -idirafter include tests/host/wait.c kernel/cpu.c kernel/raw_lock.c kernel/sched/park.c kernel/sched/runqueue.c -Wl,--wrap=kernel_raw_lock_release -o build/host/wait
+	build/host/wait
+
+$(BUILD_DIR)/wait-native.o: tests/wait/native.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+$(BUILD_DIR)/wait-native: $(OBJECTS) $(BUILD_DIR)/wait-native.o arch/riscv/linker.ld
+	$(CC) $(LDFLAGS) -Wl,--wrap=kernel_scheduler_init,--wrap=kernel_wait_backend_switch -o $@ $(OBJECTS) $(BUILD_DIR)/wait-native.o
+.PHONY: test-wait-riscv
+test-wait-riscv: $(BUILD_DIR)/wait-native
+	python3 -B tests/wait/native.py --arch riscv --qemu $(QEMU_RISCV64) --kernel-dir $(BUILD_DIR)
+
+.PHONY: test-sleep-lock-host
+test-sleep-lock-host:
+	@mkdir -p build/host
+	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -DBOAROS_PAGE_SHIFT=12 -Itests/host/sync -idirafter include tests/host/sleep_lock.c kernel/cpu.c kernel/raw_lock.c kernel/sched/park.c kernel/sched/sync.c -Wl,--wrap=kernel_raw_lock_release,--wrap=kernel_raw_lock_acquire -o build/host/sleep-lock
+	build/host/sleep-lock
+
+test-riscv: test-wait-riscv
+
+.PHONY: test-scheduler-handoff-host
+test-scheduler-handoff-host:
+	@mkdir -p build/host
+	cc -std=gnu11 -O2 -Wall -Wextra -Werror -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -Itests/host/sync -idirafter include tests/host/sched_handoff.c kernel/cpu.c kernel/raw_lock.c kernel/sched/scheduling.c kernel/sched/policy.c kernel/sched/runqueue.c -Wl,--gc-sections -o build/host/scheduler-handoff
+	build/host/scheduler-handoff
+
+test-riscv: test-scheduler-handoff-riscv

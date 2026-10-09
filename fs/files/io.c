@@ -85,8 +85,9 @@ static int socket_wait_ready(struct kernel_open_file_description *description,
     while (!socket_operation_ready(socket, events)) {
         enum kernel_wait_wake_reason reason;
         uint64_t sleep_deadline = deadline;
-        if (kernel_scheduler_block_current(kernel_socket_wait_queue(socket),
-                                            sleep_deadline, 1, &reason) !=
+        if (KERNEL_WAIT_RECHECK(kernel_socket_wait_queue(socket),
+                                            sleep_deadline, 1, &reason,
+                (!socket_operation_ready(socket, events))) !=
             KERNEL_SCHEDULER_STATUS_OK) {
             arch_interrupt_restore(saved);
             return -KERNEL_EIO;

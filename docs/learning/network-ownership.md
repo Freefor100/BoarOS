@@ -1,5 +1,26 @@
 # 网络对象与 loopback 事件推进
 
+## 成功回环入队必须通知工作 owner（2026-10-08）
+
+固定 `references/lwip@77dcd25a72509eb83f72b033d219b1d40cd8eb95` 的 NO_SYS
+回环路径由应用负责调用 `netif_poll`。BoarOS 增加了有预算的服务和通知接口，
+但端口定义的 `LWIP_HOOK_NETIF_LOOPBACK_QUEUED` 没有接入导入的
+`netif_loop_output()`；这是本地整合遗漏，原上游不认识这个扩展 hook。
+
+多数发送后的 inline service 会直接扫描队列，使普通内容测试仍能通过。
+若新包来自本批 loopback 阶段之后的 socket output 或 protocol timer，软件
+pending 没有更新，worker 的 runnable 判断和唤醒都可能漏掉；后续期限推进
+才重新扫描到包。这说明内容最终正确不能单独证明事件进展正确。
+
+`tests/host/network_owner.c` 的 `loopback-work` 使用实际 lwIP、端口和 socket
+工作检测，只有宿主时钟/堆/调度边界是模型。固定时钟后，旧代码的 UDP 发送
+返回成功，而待工作检测及唤醒断言失败；修复后 IPv4/IPv6 直接入队与晚入队
+都报告 runnable，下一次只提供包预算即可交付准确内容。真实耗尽协议堆的
+发送失败不产生新工作，释放后重试及最后引用回收均回到基线。
+
+通知放在包链完全发布后，回调只置状态和请求唤醒，不同步执行协议。这个修复
+恢复已选事件契约，没有增加周期轮询；模型不提供实际唤醒延迟或吞吐测量。
+
 固定 libc-test `references/oscomp-testsuits` 的固定 pre-2025 版本 的 `libc-test/src/functional/socket.c` 真实调用 IPv4 UDP 的 bind/getsockname、微秒级 `SO_RCVTIMEO`、sendto/recvfrom，随后建立 TCP listener、非阻塞 connect 和 accept；它不消费 AF_UNIX，也不能单凭测试名推断所需协议。固定 Linux v7.2 的 `net/socket.c`、`net/ipv4/af_inet.c` 和 `fs/file.c` 提供 syscall、协议错误与 fd 生命周期比较基线。
 
 取舍比较过三条路线：自写有限 TCP/UDP 子集能控制所有状态，但协议重传、定时器和互操作验证成本最高；宿主转发可快速启动，但 fd、错误和恢复语义被宿主环境决定；固定成熟 C 栈的 raw API 保留 BoarOS 的 fd/OFD、用户复制、等待、就绪和 errno owner，同时复用已测协议状态机。用户选择第三条，固定官方 lwIP `STABLE-2_2_1_RELEASE` 采用 `NO_SYS` 单 hart 事件驱动。分配 owner 另经用户确认：协议/packet 用静态有界池，BoarOS socket/OFD/队列节点用 kernel_heap，以池计数与 root `heap-live=0` 分别核对。

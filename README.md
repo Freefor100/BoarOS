@@ -4,246 +4,95 @@
   <img src="assets/boaros_header.png" alt="BoarOS 吉祥物与字标" width="100%">
 </p>
 
-BoarOS 是从零搭建、面向 OS Comp 能力建设的 C / 少量汇编内核，目标是运行未经 BoarOS 特改的 Linux 用户程序。Linux 是用户可观察契约和机制参考：在声明支持的范围内，返回值、对象身份、共享关系、错误、并发与生命周期必须正确；内部结构不必复制 Linux。
+BoarOS 是 C／少量汇编内核，目标是运行未经 BoarOS 特改的 Linux 用户程序。
+Linux 是用户可观察语义的参考；内部实现独立维护对象所有权、失败回滚和资源回收。
+
+当前分支为 **oscomp-compat**：从 main 单向集成通用修复，保留双架构原盘启动、LTP 监督、
+判分和 LA 调度运行时适配。入口及适配范围见[兼容模块](docs/modules/oscomp-compat.md)；
+下面的共同能力与验收证据来自主线，不能据此推定原评测全部通过。
 
 ## 当前能力
 
-LA根盘支持modern PCI及transitional设备的modern接口，纯legacy PCI传输仍未接入。
-对应两种RAM的启动与owner回收证据见[LA模块](docs/modules/loongarch-boot.md)。
+生产平台为单 CPU QEMU virt：**RV64、Sv39／4 KiB 页**和**LA64、LA464、16 KiB／三级页表**。
+两侧共用 MM、调度、VFS、设备和用户程序策略，架构实现在构建期绑定。
 
-ext4 冷缓存 extent 读取已修正 OOM 后误释放未取得引用的问题；
-分配/读取失败、重试与正常回收由[VFS 模块](docs/modules/vfs-ext4.md)的独立门禁保护。
-
-当前生产路径为 **RV64、QEMU virt、单 hart、Sv39 / 4 KiB 页**。下表是已验证子集，具体接口与限制见模块文档。
-
-| 范围 | 已有能力 | 主要边界 |
+| 范围 | 已验证能力 | 主要边界／模块 |
 |---|---|---|
-| 启动与内存 | OpenSBI、DTB、高半区/direct map、buddy/slab、连续页和引用回收、独立栈窗未映射 guard 页 | 无 SMP；guard 只覆盖窗口 VA 的 SP 式越界，direct-map 别名仍在；idle/boot 栈无 guard |
-| 虚拟内存 | VMA、按需匿名页、共享匿名与共享文件映射、文件私有 COW、共享文件首次写追踪、`msync`、跨 MM 截断撤映射 | 无 `mremap`、按操作区分的 `madvise`、共享文件 futex、匿名共享页 swap 回收或 SMP 页表同步 |
-| ELF / exec | shebang、按需 ELF、PIE、`PT_INTERP`、初始栈/auxv、musl DSO/TLS、固定 glibc 2.44 启动/TLS/pthread及取消子集、失败保持旧映像 | 无 `execveat`；glibc 应用覆盖尚有限 |
-| 进程与等待 | 统一 TID/TGID/PGID/SID 身份对象、会话/进程组、fork/vfork、child-TID 生命周期差分、pthread clone、线程组退出、非组长 exec、wait/zombie/reparent、时钟与睡眠、进程组 ITIMER_REAL/SIGALRM | 合法 clone 组合仍有限；串口及 Unix98 PTY 控制终端；单 hart 关中断不等于跨核同步 |
-| 调度 | OTHER tick 轮转、FIFO/RR 1–99 优先级、CPU0 affinity、RESET_ON_FORK、可配置全局实时预算及 proc 查询、到期有序索引与最早 deadline 参与 timer 重装 | 默认 1 秒 / 950 毫秒；无 nice 权重、PI、SMP 或硬实时保证 |
-| 随机数 | ChaCha20 fast-key-erasure、BLAKE2s 混种、legacy/modern VirtIO RNG、`getrandom` 与 random/urandom 字符节点 | QEMU 宿主是信任边界；DTB/用户写入不计可信熵，缺设备时保持未就绪 |
-| futex / 信号 | WAIT/WAKE/REQUEUE、超时/重启、跨 MM 共享匿名 futex、同 MM 非 PI robust-list 退出清理、标准信号、用户 handler、同步 SEGV/BUS/ILL/TRAP 故障信息与恢复、`rt_sigtimedwait` | 无共享文件 futex、PI futex、实时信号队列和 `sigaltstack`；单 hart 验证范围 |
-| 文件与事件 | fd/OFD 分离、dup/CLOEXEC、共享 offset、阻塞 pin、部分/向量/定位 I/O、匿名pipe及ext4/tmpfs命名FIFO、poll/select/epoll；传统与 OFD 记录锁；socket OFD 与读写/就绪；mknodat 字符节点按设备号接入 null、zero、console、RTC | 独立 devpts、PTY 锁定/peer 与 packet、36/44 字节 termios；无 devfs，设备 mmap 未支持 |
-| 路径与 ext4 | 共享活目录项、cwd/dirfd、普通/NOREPLACE rename、可写/只读根盘、符号链接、目录枚举、稀疏文件、显式纳秒时间、真实文件系统统计、打开后删除、私有映射截断；共享挂载树可用户态挂载/卸载 proc、tmpfs 和第二 ext4 盘，通用 linkat 硬链接，含 meminfo、uptime、self、exe/cwd/root/fd、挂载信息与首批进程 stat/status 字段 | 无 EXCHANGE/WHITEOUT 或完整权限；缺少 /dev/console 节点时的初始标准 fd 没有路径链接，meminfo 已提供真实缓存/共享/脏页/可用量，完整进程字段尚未完成 |
-| 内存文件 | 统一稀疏内存后备对象、tmpfs 页/inode 配额、硬链接、共享/私有映射，musl POSIX 共享内存、SysV 共享内存和 tmpfs 工作目录的离线 GCC | 无 swap、SysV 信号量/消息队列、共享文件 futex；tmpfs 不持久化 |
-| 缓存与存储 | read/write/private fault 共用文件页、inode 脏范围与定向写回、OFD 错误观察、`fsync/fdatasync/O_SYNC/O_DSYNC`；VirtIO legacy/modern 多设备独立 IRQ/队列、每实例页缓存/worker、八 span 批量读写发布与 flush 屏障 | ordered journal/replay、durable commit 与后续 checkpoint、持久 orphan；恢复承诺限于已验证块模型，已接入阈值驱动后台写回与 2%/4% 空闲水位回收，无周期清脏 |
-| 终端 | DTB ns16550 IRQ＋worker，ttyS0/console/tty、canonical/raw、termios/termios2、VMIN/VTIME、控制终端和前后台作业；Unix98 PTY/devpts、packet、真实 libc PTY API及原 BusyBox ash/stty/script/replay | 其他行规程、break 生成和完整 modem 控制未交付；固定 root、单 hart |
-| 内核日志 | 从启动保存16KiB真实内核日志、完整klogctl 0–10、消费式阻塞读、清空及console级别控制 | 当前不可变root权限模型；用户console输出与日志分离，无/dev/kmsg接口 |
-| 身份与资源 | 单用户 root 的 UID/GID 查询；线程组共享并执行 NOFILE/STACK，fork 继承、exec 保留 | 真实ext4/tmpfs/匿名pipe所有权可变，进程仍固定root；无凭据变更/完整权限；fd 硬容量 1024、栈硬容量 8 MiB；其他有效 limit 返回 `ENOTSUP` |
-| 平台与网络 | RISC-V QEMU 真实根盘可配置 PID 1（默认 `/init`） 与 musl 用户态；单 hart IPv4/IPv6 UDP/TCP loopback、双栈监听、连接选项、半关闭与向量消息，固定 lwIP 2.2.1 raw API，AF_UNIX socketpair；legacy/modern VirtIO-net、静态 IPv4/ARP、有界分片重组与隔离宿主双向 TCP/HTTP，custom pbuf RX、TX indirect+SG 零拷贝（保留复制回退）、无 NIC 时协议/OFD 定时器仍由内核 worker 推进 | 无命名 AF_UNIX 端点、外部 IPv6、公网/DHCP/DNS/TLS、完整 LA 用户环境、实板或多核验证 |
+| 内存与 CPU | buddy/slab、连续页与引用、VMA、按需页、共享匿名/文件映射、COW、独立栈窗口与真实 guard；RV F/D、LA FPU/LSX/LASX | 无 SMP、远程 TLB、RV V；固定 QEMU 不提供 LA LBT；[物理页](docs/modules/physical-pages.md)、[MM](docs/modules/kernel-mm.md)、[LA](docs/modules/loongarch-boot.md) |
+| ELF 与运行时 | 静态/动态 ELF、PIE、shebang、解释器、musl DSO/TLS；RV glibc 2.44、LA glibc 2.42 的五种形态及线程/取消子集 | 无 execveat，更广 glibc 应用仍须逐个验收；[ELF](docs/modules/user-elf.md)、[exec](docs/modules/kernel-exec.md) |
+| 进程与同步 | fork/vfork/pthread、线程组/会话/进程组、exec/wait/退出回收；OTHER/FIFO/RR、deadline；基本 futex、robust-list、标准信号和同步 fault | 单 CPU；无 PI futex、共享文件 futex、实时信号队列、sigaltstack；[调度](docs/modules/kernel-scheduler.md)、[信号](docs/modules/kernel-signal.md) |
+| 文件与事件 | fd/OFD、dup、阻塞 pin、向量/定位 I/O、pipe/FIFO、poll/select/epoll、传统/OFD 记录锁、活 inode/路径、link/rename | 无完整凭据/权限、EXCHANGE/WHITEOUT；[文件接口](docs/modules/kernel-files.md) |
+| 文件系统与挂载 | ext4、procfs、tmpfs、devpts、POSIX/SysV 共享内存；用户态 mount 与普通忙卸载、独立第二 ext4 盘 | 无 bind/remount/move/传播、扩展卸载 flags 或 mount namespace；[VFS](docs/modules/vfs-ext4.md)、[tmpfs](docs/modules/tmpfs.md) |
+| 存储 | 共用 VirtIO transport/split queue、批量/乱序 I/O、flush/reset、页缓存、后台写回/压力回收、ordered journal、durable commit/checkpoint、orphan/replay | RV legacy/modern MMIO；LA modern PCI及transitional设备的modern接口，纯legacy PCI未接；[框架](docs/modules/virtio-framework.md)、[存储](docs/modules/vfs-ext4.md) |
+| 网络 | IPv4/IPv6 loopback、TCP/UDP、AF_UNIX socketpair；VirtIO-net、静态 IPv4/ARP、有界分片、宿主双向 TCP/HTTP、RX loan 与 TX SG/复制回退 | 无命名 AF_UNIX、外部 IPv6、DHCP/DNS/TLS；[网络](docs/modules/kernel-network.md) |
+| 终端与系统服务 | IRQ UART、TTY/termios2、作业控制、Unix98 PTY/devpts、原 BusyBox ash/stty/script；日志、可信 RNG、RTC、时钟/睡眠、NOFILE/STACK | 固定 root；无其他行规程、完整 modem 控制或全部资源限制；[TTY](docs/modules/kernel-tty.md)、[日志](docs/modules/kernel-log.md) |
 
-活 inode 的再次打开先取得现有节点资格，避免临时后端打开与关闭；创建权限通过已有句柄设置。弱路径 registry 仍不保存常驻目录项缓存。
+2026-10-09 本地验收：RV/LA 在 512 MiB、1 GiB 下，各自完成 **229 项原程序**的同 ELF Linux 对照；
+两侧各 **1366 条 ABI 差分**、glibc 五形态、栈/guard，以及相关存储、设备、网络、终端组合通过。
+具体输入与适用范围见[程序基线](docs/learning/user-program-inventory.md)和
+[allocator 组合验收](docs/learning/memory-management.md#阶段a组合收口2026-10-09)。
+这些结果限定于上述平台和案例；LA 客体原生开发、全断电恢复矩阵、实板与多核仍需独立验收。
 
-单 hart 存储等待已由运行期 IRQ 唤醒：两个不同文件冷读可同时在途，等待期间计算与无关缓存命中继续执行；OFD、inode、后端事务与退出清理各自保留 owner。八槽乱序完成、flush 屏障和超时 reset 在 legacy/modern、writeback/writethrough 四种组合验收，见[可睡眠存储](docs/learning/sleepable-storage.md)。
-
-块驱动对读、写及FLUSH采用30秒有限请求期限，保留真实超时、reset与DMA owner边界；官方镜像副本无需通过宿主预同步规避一秒误判。
-
-双盘暂扣与故障隔离测试已修复单字节控制终端握手，并接入 CI 配置；本机原矩阵和 FIFO/RR 组合通过，托管 CI 状态另行核对。
-
-网络 worker 已在协议推进前归还 TX 完成槽，并在睡眠前复查新容量与收包；已验证两种 VirtIO 传输下的实际 TAP 程序；综合改动的匹配实验既有收益也有默认预算吞吐回退，见[预算结果](docs/learning/data-path-budget-experiments.md#正式匹配结果2026-10-06)。TCP 流发送已用接纳 reservation 约束 payload 复制，预先无容量时不解析用户页；socket poll 已收紧为局部快照；短 syscall 与统一 worker 按独立协议预算推进，资源归还只服务等待集合。验证边界见[网络记录](docs/learning/network-ownership.md#纯就绪与有界协议服务2026-10-05)。
-
-文件追加增长已与截断分离：对齐增长不遍历缓存页，非对齐增长只处理旧 EOF 尾页；1–64 MiB 的实际页缓存规模门禁保护这一成本界；另有三启动匹配吞吐测量，64 MiB 小请求追加不再随文件增长急剧降速，缓存完成与显式同步分别报告。冷页完整覆盖省去页缓存旧内容读取，范围写回按哈希/脏页链选择较小集合，快照只复制脏区间；恢复与测量边界见[VFS 模块](docs/modules/vfs-ext4.md#当前成本边界)。
-
-epoll 以完整用户事件交付作为 ET/ONESHOT 提交点，复制 fault 保留未交付项；扫描与重入通知独立，取消和 close 保持对象寿命。验证边界见[事件交付](docs/learning/epoll-delivery.md)。
-
-PID 1 退出后先结束并回收剩余用户进程，再停止内核服务和卸载根盘；后台 daemon
-持有的 cwd、文件或 MM 不再使关机提前遇到 EBUSY。正常用户退出与 PID 1 的完成
-状态分别保留，见[调度生命周期](docs/modules/kernel-scheduler.md#退出与-exec)。
-
-文件层已有部分读写、OFD 生命周期、稀疏文件与映射截断的语义深度；显式时间设置和真实挂载统计已接入；共享匿名映射已迁移统一稀疏内存后备对象，与共享文件页均可跨 MM 读写，串口与 Unix98 PTY 已具备真实行规程、控制终端和有界传输；其他行规程与完整 modem 控制仍有缺口。ext4 恢复已覆盖 512 字节原子写、未 flush 写丢失或重排的故障模型；实板持久性仍待独立验证。固定 glibc 2.44 的五种 ELF 形态与 TLS/pthread/取消清理/信号组合已双侧验证，完整 glibc 应用兼容尚未证明。
-
-内存统计按文件页、共享匿名/tmpfs 后备页和各盘块缓冲真实 owner 计量；`sysinfo` 返回真实任务数与 1/5/15 分钟负载。原镜像 BusyBox `free` 已显示有效容量，LTP 越过缺失 `Cached` 的阻塞。已新增由真实 timer 快照支持的 coarse clock，并通过窄差分；原静态/动态 glibc `utime` 各 30 次复跑通过，诊断环境边界见[文件时间](docs/learning/file-timestamps.md)。LTP cgroup 辅助程序等待已独立定位，见[路线与验收](docs/goals.md)。
-
-固定 SQLite 3.53.4 的原生 Unix VFS 已在单 hart 上运行静态/动态 CLI、多进程 DELETE 回滚日志和普通多进程 WAL，并验证第二盘 WAL 的独立重启读回；WAL 工作负载用同一 ELF 在固定 Linux 与 BoarOS 验证 writer 竞争、未提交进程退出及第二次启动后的完整性。DELETE 与 WAL 的 EXTRA/FULL 恢复各有 NBD 断电/故障矩阵；实板持久性未验证。
-
-客体内固定 Alpine v3.22 RV64 GCC 14.2.0-r6 已在同一离线镜像上完成预处理、编译、汇编、静态链接和运行；固定 Linux 与 BoarOS 的五阶段状态、产物哈希和输出一致。同一编译流程也通过 tmpfs 工作目录；产物复制到根盘供比对，不代表 tmpfs 持久。另已完成原 GNU make4.4.1 默认FIFO jobserver的Lua5.4.3工程构建、增量、错误恢复和产物运行；其他项目与Rust尚未验收。
-
-固定BusyBox/libc-test当前共同清单为229项（原228项加环境内容案例），本轮RV229项与LA两种RAM各229项均双侧通过；原BusyBox包装器55/55子项、dmesg/RTC及df根盘内容均真实核对，历史结果继续保留。当前通用ABI差分1366条匹配，终端另有同ELF的107条差分记录；完整清单和本轮选择集合分别见[程序清单](docs/learning/user-program-inventory.md)。成本门禁见[单核规模回归](docs/learning/single-hart-scale.md)。
-
-顺序预读与连续写回提供有界实验候选，生产默认仍为预读关闭、写回一页。
-机制门禁和吞吐测量分别记录；TCP 27 组、存储 20 组已完成匹配筛选和组合扩展，共 1,218 次发布启动与 184 次诊断。用户依据结果批准网络默认改为 8 MSS/池 4 倍/协议堆 2 倍；存储仍为 RA0/WB1。历史结果中的默认标签指调整前的 8/1/1，见[结果、每连接完成时间和输入身份](docs/learning/data-path-budget-experiments.md#正式匹配结果2026-10-06)。
-
-LoongArch L0–L1 首阶段已交付：QEMU virt/LA464 单核、LA64、16 KiB/三级页表，
-独立内存 ELF 经共用 MM/exec/任务/syscall 路径进入用户态，并通过 timer 抢占、
-故障/回收及 512 MiB/1 GiB 同 ELF Linux 对照。第二阶段的现代 PCI→共用
-VirtIO 块核心→ext4 根盘→LP64S 静态 musl 已通过两种 RAM 的新验收，包含
-未修改的完整 BusyBox 中 cp/cmp/grep/cat/echo/uname/dd 七个 applet、真实文件映射、
-fork/exec/wait、错误/创建 OOM 与资源基线；真实 PCI 写故障保留失败 I/O owner 并明确停止。
-`kernel-la` 有盘时启动可配置 PID 1，无盘时运行首阶段内存 ELF 契约，见
-[LA 模块](docs/modules/loongarch-boot.md)。整数信号 handler/sigreturn、同步故障恢复、
-mask/嵌套和等待重启已通过同 ELF 的双侧两种 RAM 验证；静态 musl pthread/TLS、
-errno 隔离、timer 寄存器保持、同步/取消、futex/非 PI robust、线程组 exec/退出及
-创建 OOM/回收也已验证。原 BusyBox ash 的非交互 trap/wait 有双侧证据。
-原版LP64D musl的动态PIE/非PIE、解释器、DT_NEEDED/RPATH、初始与dlopen DSO TLS已通过双侧两种RAM；
-标量FR/FCC/FCSR、浮点信号/exec/clone也已验证，整数内核与原LP64S用户程序继续可用。
-LA内核栈已接入PGDH共享窗口及真实16KiB guard，含NX、撤映射、OOM回滚与可信异常栈验收。
-LSX/LASX状态、信号、clone/exec和关闭扩展的HWCAP已双侧验收。固定原版glibc2.42的五形态、
-初始/dlopen TLS、pthread取消和信号已在双侧两种RAM验收；RV仍固定2.44，版本差异保留。
-共用VirtIO net与Ethernet已接LA现代PCI，固定Linux/BoarOS两种RAM的真实TAP、
-原BusyBox HTTP和共享块/RNG/net IRQ、正常及构造/reset失败回收通过。无metadata checksum的空索引目录误报EUCLEAN已修复并用真实1/4KiB布局及
-LA普通/挂载后rmdir验证；RV全恢复回归已随本轮最终门禁通过。AF_UNIX发送者计费和sendfile批次已按固定Linux接入并双侧验证；完整网络ABI和本轮指定程序矩阵已完成同口径回归。共用ns16550已接LA真实TTY，串口/termios2/作业控制、PTY与原ash/stty/script/replay及录制重启已双侧两种RAM验收；UART构造失败和fatal轮询通过。LA pipe已修正为实际持有的16页容量，双侧两种RAM验证满环、wrap和回收。LS7A RTC真实UTC、日志/OFD与原BusyBox hwclock/dmesg/df已双侧两种RAM验证；Linux参考采用保留固定源的派生QEMU补齐PM/告警，具体身份和边界见[RTC平台](docs/modules/loongarch-boot.md#ls7a-rtc-与派生模拟器)。共用完整ABI的1366条记录已在LA四次启动一致匹配，RV同轮也匹配；固定BusyBox/libc-test当前229个共同ID已在LA两种RAM各全量通过，与本轮RV逐ID一致。原SQLite3.53.4的DELETE/WAL多进程、静态/动态CLI和独立重启内容也已双侧两种RAM验证；最终双架构回归（含RV SQLite/NBD全恢复及双盘）已通过，一次整体审查的页边界夹具问题已集中修复，完整ABI及审查后回归通过；本轮指定单核QEMU矩阵对齐，运行产物已按既有流程清理，工具、运行时与内核缓存保留。
-DTB随机种子仅支持早期材料和AT_RANDOM，不计可信熵。真实PCI RNG的正常、缺失、
-延迟、在途停止已双侧两种RAM验收，BoarOS构造失败与回收也已在两种RAM验收。LBT、
-更广原程序、客体原生开发、完整Harness、实板和SMP仍须另行验收；本轮共同矩阵对齐不表示所有RV能力全面等价。
-评测接入暴露的GNU空`PT_LOAD`拒绝已在共用parser修正；同一LA监督器ELF的Linux对照、两种RAM执行和回收通过，非空段权限/布局检查保持。
-共用VirtIO transport/split queue已接入RV MMIO与LA PCI block，保留batch/flush/
-超时及DMA业务owner；RNG/net已迁入，见[框架契约](docs/modules/virtio-framework.md)。
-LA EXEC 页的数据读权限已按固定 Linux 的冷/驻留状态核对；页表有效权限与请求
-VMA 权限分别保留，真实读取、uaccess、fork和撤权均有双侧两种 RAM 验证。
+主线 [CI](docs/modules/continuous-integration.md)覆盖共用 host、RV 回归、LA 核心/平台和双侧运行时，
+原程序/设备组合及存储恢复分层运行。定时组合显式准备原程序、原网络运行时及TAP能力；
+上述验收来自本地执行，不等于托管CI结果。
 
 ## 构建与验证
 
-需要 RISC-V bare-metal GCC/binutils、GNU Make 和 QEMU；支持 `riscv64-unknown-elf-` 与 `riscv64-elf-` 前缀。真实用户态和 Linux 差分的额外工具见[工具链](docs/toolchain.md)及[差分模块](docs/modules/differential-abi.md)。
+工具和固定环境见[工具链](docs/toolchain.md)、[参考资料](references/README.md)。本分支默认 `make all` 同时生成顶层 `kernel-rv`、`kernel-la`，分别使用对应架构的评测启动配置。
+显式 `INIT_CONFIG=...` 统一覆盖两侧；通用回归使用 `INIT_CONFIG=config/init.json`。
 
 ```sh
-make all                       # kernel-rv
-make test-riscv                 # 通用模块、架构与真实根启动
-make test-userland-riscv        # 静态 musl、动态 pthread / TLS
-make test-glibc-riscv           # 固定 glibc 2.44 静态/动态/PIE、TLS、pthread与取消
-make test-diff-abi-riscv        # 同一 ELF 对照固定 Linux
-make test-io-sleep-riscv        # 暂扣响应验证并发、计算/缓存进展、flush 与 reset
-make test-cost-riscv COST_CASE=contract # 默认关闭的诊断窗口，三个启动副本
-make test-scale-riscv           # I/O 分块、用户页解析、驻留查找与单页改权成本
-make test-lwip-host             # loopback、UDP 池耗尽/重用、TCP 定时回收
-make test-random-host           # 密码向量、就绪与设备契约
-make test-rng-riscv             # 两种 VirtIO 传输、延迟/取消与退出回收
-make test-sched-policy-host     # 策略、队列模型与调度 ABI
-make test-sched-bandwidth-riscv # 实时预算、RR 余片、普通任务进展
-make test-multi-disk-rt-riscv   # 实时负载下双盘与清理进展
-make test-record-lock-host      # 区间树随机模型、所有权与分配失败
-make test-record-lock-riscv     # 同 ELF 的 Linux/BoarOS 线程、fork、fd 复用、退出
-make test-nbd-host              # NBD 协议、易失/稳定镜像与断电策略
-make test-sqlite-rollback-riscv # 静态/动态 CLI、多进程回滚日志
-make test-sqlite-nbd-riscv      # QEMU 通过 Unix NBD 跑同一负载
-make test-sqlite-recovery-riscv # 固定 Linux/BoarOS 与 NBD 热日志恢复
-make test-sqlite-recovery-matrix-riscv # 小事务逐事件故障矩阵
-make test-sqlite-wal-riscv      # 固定 Linux/BoarOS 双侧多进程 WAL 与重启
-make test-sqlite-wal-recovery-riscv # 固定 Linux/BoarOS 的 WAL 正常与错误恢复
-make test-sqlite-wal-recovery-matrix-riscv # WAL 逐事件断电/写/flush 故障矩阵
-make test-offline-c-baseline-riscv # 双侧定位缺少客体原生编译器的第一失败
-make test-offline-c-riscv # 固定 Alpine 原生 GCC，双侧五阶段离线编译与运行
-make test-root-loongarch       # 同 LA 静态 musl/原 BusyBox ELF 对照 Linux，含错误与 OOM
-make test-root-io-loongarch    # 真实 PCI 写故障保留 owner；独立于正常回收验收
-make test-root-multi-block-riscv # 真实双盘、tmpfs 嵌套、忙引用与重启
-make test-multi-disk-io-riscv # 暂扣一盘 I/O 与故障隔离
-make test-sqlite-second-disk-riscv # 第二 ext4 盘 WAL 与重启
-make test-offline-c-tmpfs-riscv # tmpfs 工作目录的同 ELF 离线 GCC
-make test-busybox-tmpfs-riscv # 固定 BusyBox 在 tmpfs 上执行文件操作
-make test-stack-usage
-make test-lwext4-host
-make test-environment-riscv      # 实际日志/RTC/OFD生命周期
-make test-lwext4-cache-host # 命中先于回收、引用与失败owner
-make test-lwext4-recovery-host # 日志与 orphan 的断电/故障矩阵
-make test-lwext4-rename-host   # 改名、硬链接与最后链接回收的故障矩阵
-make test-lwext4-metadata-host # 时间设置、空间计数与几何/失败验证
-make inventory-userland-riscv  # 能力清单，不是必过门禁
-make test-references
+make all
+make test-oscomp-host
+make test-oscomp-compat      # 本地双架构诊断
+make test-oscomp-official    # 固定官方容器与原 Harness
+make all INIT_CONFIG=config/init.json
+make test-riscv
+make test-loongarch
+make test-userland-riscv
+make test-glibc-riscv test-glibc-loongarch
+make test-diff-abi-riscv test-diff-abi-loongarch
+make test-allocator-cost-host
+make test-sync-host test-allocator-concurrency-host
+make test-wait-host test-sleep-lock-host test-wait-riscv test-wait-loongarch
+make test-stack-usage test-stack-usage-la
 ```
 
-聚焦测试只在对应[模块文档](docs/README.md)维护。`make run-riscv` 不附根盘，启动后停留 timer-idle，需人工退出；`make debug-riscv` 以 `-S -s` 等待 GDB。比赛 Harness 已有双架构预算截止的容器基线，完整程序矩阵尚未结束；已完成的 LA 单核矩阵不替代该结果。
+完整分层入口见[CI 模块](docs/modules/continuous-integration.md)，聚焦命令见[模块导航](docs/README.md)。
+通用根盘 fixture 使用 `INIT_CONFIG=config/init.json`，验证后用 `make all` 恢复兼容默认。`make run-riscv` 不附根盘，停留 timer-idle；
+`make debug-riscv` 以 `-S -s` 等待 GDB。LA 启动参数见[LA 模块](docs/modules/loongarch-boot.md)。
 
-`build/` 是可重建的本地产物目录，不是验证档案。仅长期保留内核/用户程序编译结果、工具链、当前配置的 Linux 构建缓存等可跨轮复用的产物；一次性运行目录、磁盘镜像、日志和旧构建缓存应在核对结果后清理。`python3 tests/prune-build.py` 预览，`make prune-build` 执行清理；`make clean` 连可复用的内核构建产物也删除。需要临时保留案例镜像以调试时，可给清单入口传 `--keep-pass-images`，调试结束后仍应清理。
+`build/` 仅长期保留可复用构建缓存。`python3 -B tests/prune-build.py` 预览、`make prune-build` 清理已核对的运行目录、
+日志和镜像；需要保留现场时使用 `PRUNE_BUILD_KEEP`。`make clean` 会同时删除可复用内核构建产物。
 
-## 近期工作与文档
+## 开发方向与文档
 
-[开发路线](docs/goals.md)统一记录本轮任务、分支交接和后续依赖。通用兼容性在 `main`，比赛环境与运行入口在 `oscomp-compat`；后者单向合入已验收主线。只跑 RV 的原 judge 评分不等于双架构比赛交付，也不能把逐组诊断分数拼成正式总分。
+当前主线转向 **SMP 同步基础与生命周期正确性**，再进入 RV 两核、共享 MM/TLB 和 LA 多核；
+具体未完成能力与依赖只维护在[开发路线](docs/goals.md)，逐轮执行计划留在会话中。
+CPU 本地/current、嵌套抢占控制与 raw 短锁已接入 buddy/slab 元数据；等待代次、借用游标、
+新栈交接与可睡眠锁内部资格已建立。压力回收、共享MM及其他业务对象仍需跨核保护。
+等待交接的[固定P核匹配时间](docs/learning/cost-baseline.md#等待交接的匹配时间)单列默认业务、
+IRQ/锁/唤醒和观测开销；匿名生命周期额外约2.5%–4.0%，部分组合窗口仍有成本与漂移，未取得普遍性能提升。
 
-统一VFS对象、活目录项、多挂载、共享后备、SysV shm、日志/RTC、串口TTY和真实网络
-应用已交付，具体边界见[开发路线](docs/goals.md)与模块。R1–R8组合边界的修复覆盖
-SHM附件/权限、msync来源pin、整包DGRAM、同步故障与整次写门闩；文件系统仍保留
-journal、必要屏障、durable同步、orphan及恢复契约。
+buddy 已消除小页操作随无关大块页数线性检查/重写的问题，并接入只读查询快路径与完整审计。
+4/16 KiB 工作量及组合门禁通过；森林改造的默认匿名生命周期回退 **13.6%–22.4%**，
+后续 raw 互斥相对其独立基线另增加 **6.0%–7.3%**，未取得典型吞吐提升。
+机制见[物理页模块](docs/modules/physical-pages.md)，时间、IRQ 和观测开销分别见[森林结果](docs/learning/cost-baseline.md#buddy-森林匹配时间2026-10-09)与[短锁结果](docs/learning/cost-baseline.md#allocator-短锁的匹配时间)。
 
-C0–C6提供默认关闭的成本观测；组提交、版本量封口、commit/checkpoint分离和批量
-I/O已经接入。机制、历史性能口径和unknown见[成本分析](docs/learning/cost-baseline.md)，
-不以内部计数下降替代真实程序效率。当前能力与下一项优化由有效应用证据选择。
+文档分工：README 概括能力和常用入口；`docs/modules/` 维护当前契约与聚焦验证；
+`docs/learning/` 解释机制、取舍和验收证据；`docs/goals.md` 维护未完成工作。
+完成项从路线图撤下，历史问题的具体归因未确认时仍保留证据边界。
 
-评测兼容分支单向接纳main；main保留自身uname，旧glibc结果属于兼容配置。
-当前维护分支为main与oscomp-compat；本分支发布原盘LA musl调度DSO，main已有
-共用调度syscall，默认构建不发布或预加载该库。通用修复继续先落main再单向合入。
-双架构原盘官方容器运行已完成并收齐两侧44个组的状态及原联合评分：40组正常结束，
-两侧LTP各有一个总预算中断，后续musl组未到达。两侧无新内核fatal，但因预算停止，
-PID 1与设备资源正常回收未验证；测例矩阵仍有明确失败及未到达状态，详见
-[固定运行记录](docs/learning/oscomp-compat-baseline.md)。
+开发分支为 `main` 与 `oscomp-compat`。通用修复先落 main，再单向集成到兼容分支；
+比赛启动、辅助脚本、运行时适配、官方容器结果和子项分数由兼容分支维护。
+本分支默认构建并由 bootstrap 发布 LA 调度适配 DSO，musl 动态程序调用真实调度 syscall；
+main 默认构建不发布或预加载它。原盘程序、libc 和 judge 保持原身份。
+最近完整官方调用的联合整数分为 **2130**；LTP-glibc 被总预算终止、LTP-musl 未到达，
+正常 PID 1 和资源收口未验证。逐组分数、历史运行及适配身份见
+[评测证据](docs/learning/oscomp-compat-baseline.md#默认make-all接入la-linux调度运行时)。
+这次主线集成不生成新的正式成绩。
 
-本分支已改名oscomp-compat，默认make all同时生成RV/LA内核；固定输入、独立bootstrap、监督和原judge契约见[双架构评测模块](docs/modules/oscomp-compat.md)。官方digest、逐组阻塞和评分口径见固定运行记录。
-LA原musl ELF的`/lib64/ld-musl-loongarch-lp64d.so.1`链接遗漏已定位并补向原盘libc；
-固定Linux和BoarOS两种RAM的同ELF启动对照通过，历史零分仍按原运行保留。
-libc-test的无shebang内层脚本改为在临时外层副本中用原BusyBox sh显式执行；
-内容、程序和judge保留，runner公开适配身份。原LA musl cyclictest的调度查询
-由原libc直接返回ENOSYS，固定Linux同样失败；默认兼容环境现已提供真实Linux调度接口。
-修复后的LA-musl原libc-test已得217分，iozone/netperf也已进入完整原组并正常回收；
-LA libc-test逐ID状态与固定Linux一致，共同glibc失败及可选网络项继续保留，
-见[后续诊断](docs/learning/oscomp-compat-baseline.md#启动修复后的原组诊断)。最新默认容器调用已取得原联合2130分，具体44组状态见默认运行时接入记录。
-RV多出的静态clock_gettime失败已逐指令定位为原glibc malloc初始化污染errno，
-时钟返回0；同一原ELF的Linux错误返回对照也复现，见[具体归因](docs/learning/oscomp-compat-baseline.md#rv静态clock_gettime的errno来源)。
-原basic两侧、两种libc均为90/102：原brk包装器截断地址丢2分，缺真实VFAT及
-分区环境使mount/umount丢10分。原RV musl执行Linux调度syscall，原LA musl直接
-返回ENOSYS；两盘运行时实现内容不同，不以这些分差判断内核架构能力高低。
-依据和修复归属见[basic与运行时差异](docs/learning/oscomp-compat-baseline.md#basic的90分与原musl调度接口差异)。
-已批准的独立用户态修正诊断在两架构、两种RAM验证brk3/3及basic92/102；
-原LA cyclictest/libc字节保留，通过真实调度接口DSO运行四场景、获得采样并正常
-回收。该诊断自动恢复默认构建，原盘正式成绩保留，见[修正对照](docs/learning/oscomp-compat-baseline.md#公开用户态修正对照)。
-默认`make all`现在构建LA调度DSO并将它与发布脚本嵌入`kernel-la`的bootstrap；
-启动后由原盘BusyBox发布，整个LA musl动态环境统一启用，四个接口执行真实syscall，
-不按程序或测例名选择。RV原运行时已有这些接口，保持原路径。原官方容器的干净
-`make all`已构建并启动，LA-musl cyclictest四场景及18线程采样通过。默认原盘cyclictest
-两种libc在两侧都完成真实采样并正常回收；musl libc-test两侧保持217分。
-按已确认的B路线保留现有地址布局和原brk ELF，默认basic仍90/102；独立修正诊断的
-92分不计入默认结果。本次容器40组结束、两侧LTP-glibc总预算中断、LTP-musl未到达，
-正常根资源回收未验证；生命周期的额外一秒误判已按实际tick精度修正。构建链与验收见[默认运行时接入](docs/learning/oscomp-compat-baseline.md#默认make-all接入la-linux调度运行时)。
-第三次运行发现的RV ext4 fatal保留了原现场；冷读OOM的通用修复先落main再合入，并在新的完整容器运行中未再次触发fatal。原判分成绩、总预算中断和未验证的资源回收边界分别记录。
-
-本分支已合入单核数据路径修复，并补跑原版 iozone、cyclictest、iperf、libcbench、lmbench 两种 libc 的一次评分。十个脚本都结束；当时的根盘 cleanup 错误已定位为 PID 1 退出时后台用户 owner 尚未回收，并在 main 修复后同步本分支。随后仅重跑原版 iperf，两种 libc 的十二项成功且正常关机；cyclictest 部分零采样仍待定位。分数、真实 iperf 吞吐和 1/10 ms 延迟的 36 次补测见[当前五项成绩与选择依据](docs/learning/data-path-budget-experiments.md#受控延迟与原版五项评分补测2026-10-06)。常规评分复用已核对输入，不重做四个发布资产的哈希扫描。
-普通 `make all` 可直接启动官方原盘；启动辅助文件不由本地 runner 注入。
-LTP沿原比赛脚本逐项执行，保留300秒监督及源码helper跳过；报告明确标记监督适配，不以另一份测例清单替换官方流程。
-
-- [文档导航](docs/README.md)：模块契约与可复用学习材料。
-- [工程原则](docs/design.md)与[贡献说明](CONTRIBUTING.md)：技术取舍、验证与提交边界。
-- [固定资料](references/README.md)与[第三方代码](docs/third-party.md)：版本、来源及许可。
-
-异步日志与组提交已启用并验收：操作私有 undo、挂载点 running group、不可变提交版本与 joinable worker 保持 ordered/log/commit/checkpoint 屏障；完整 lwext4、SQLite DELETE/WAL 恢复和双盘隔离通过。关闭观测的原版 iozone 三次启动，musl/glibc 五项写入共十格中位吞吐提升 25.29–54.00 倍，自动模式降至 16.450/18.372 秒，均达到该轮目标。原 1GiB iozone 专项得 24.8500/25.1791；它不是完整 Harness。重读 Max 下降36%–38%，Parent 提高12%–13%，不能由最快子进程推导整体读退化。热写同步、前台版本准备及未分类读请求仍有成本，见[机制与性能验收](docs/learning/cost-baseline.md#异步日志与组提交验收2026-10-01)。
-
-S6–S8 存储流水线已落地：有界资源复用、封口与容量等待分离、durable commit 与 checkpoint 分离、八 span 批量 I/O 及热读共享 relatime 查询。最终恢复与系统回归通过，但 S9 收益目标未完成：匹配 S5 的十格 Parent 写吞吐为0.98–1.88倍，自动模式程序加同步收尾下降约22%–23%，未达到当时的性能预期；固定4MiB热读回退低于2%，musl 四进程普通读 Parent 回退17.05%。原1GiB iozone 专项为25.0271/25.3164，不代表完整 Harness。分配调用下降约91%，提交仍510组，说明前台与小事务固定成本仍须处理；完整分析、未关闭项及后续方向见[本轮验收](docs/learning/cost-baseline.md#s9-存储流水线验收2026-10-01)与[路线](docs/goals.md)。
-
-块缓存已修正先回收再查询的命中破坏：生产目标8块不变，八块热工作集宿主预热后800次访问的额外设备读从800降为0。匹配旧/新三个关闭观测启动，自动程序加durable中位改善7.76%/6.99%，四进程普通读Parent改善14.08%/1.20%；glibc四进程整条命令增加0.73%，如实保留。定点读请求下降约68%，日志组/屏障仍510/1547，热读固定工作量0设备请求但存在前台成本；原停止规则不能用来证明调度饥饿，完整分布、资源与观测扰动见[纠错分析](docs/learning/cost-baseline.md#缓存查询顺序纠错2026-10-01)。日志/RTC/根盘真实内容及BusyBox55/55此前已验收，当前ABI累计1179条；完整228项本轮未重跑。后续主线统一见[开发路线](docs/goals.md)，固定吞吐倍数不作为开发准入条件。
-
-原 iperf 3.13、netperf 2.7.0 的两种 libc 共22个受控子项完成实际传输、结果交换和退出，单连接16MiB、五连接各8MiB及UDP一万次请求响应另有内容核对。最终两种libc的代表测量统一在兼容分支，旧glibc结果不代表main版本身份支持。原连续iperf脚本仍有listener重建竞态，不能将受控完成写成原脚本全部通过；netperf原脚本两侧5/5。此前N2关闭观测三次启动的TCP接收吞吐中位为musl单/五连接242/352.6 Mbit/s、glibc261/346.7 Mbit/s；UDP_RR为6443/6612事务每秒。限制、丢包与成本解释见[网络应用结果](docs/learning/network-ownership.md#原版网络应用交付2026-10-02)。该段是N2 loopback测量；本轮真实网卡结果见下。
-
-2026-10-02纠错轮已交付未连接TCP/零长度recv、UNIX数据报半关闭、接收扩容通知和活动reservation的终止事件等待；流发送复用同请求暂存尾部。journal取消64次操作软封口，保留版本量/首脏期限、同步和恢复协议。关闭观测三次启动，自动iozone程序加durable中位musl11.541→5.129秒、glibc12.108→5.359秒；四进程所选两组改善约8%–11%，最终卸载余量约0.04秒。单TCP仅249→250、268→274Mbit/s，非阻塞跨调用复制放大仍在，不能称为主要网络瓶颈已解决。完整lwext4/SQLite恢复与双盘、1179 ABI、相关系统回归已验收。后续调查确定性复现了timer切换造成的buddy/slab元数据竞态，并已加短临界区；该竞态可导致合法释放fatal，但原始iozone fatal缺少owner快照，无法确认那一次的具体触发链。Virtqueue告警依然未找到那次运行的具体队列破坏原因；新增确定性反例说明同一页双发会污染DMA owner，重跑未复现QEMU告警。结果、边界和重建见[本轮存储](docs/learning/cost-baseline.md#版本量封口与socket纠错对照2026-10-02)与[网络](docs/learning/network-ownership.md#本轮应用结果与剩余复制2026-10-02)。这段保留上一轮的机制与测量，不作为当前网卡能力的状态。
-
-2026-10-02已交付N3：DTB发现的VirtIO-net legacy/modern、静态eth0、ARP及有界IPv4重组，IRQ收割、worker每批八帧。RX直接引用DMA至最后pbuf释放，最多32借用并有界回退；TX仍复制。原BusyBox wget/httpd在main/musl与兼容glibc的两种transport完成双向16MiB GET、16MiB CGI上传和4KiB文本POST。完整RV64、真实libc、1196 ABI、scale和栈，以及22项loopback已验收。
-
-modern关闭观测三次启动，固定内容的单/五TCP双向总量效率中位297/285Mbit/s，匹配Linux1171/1107；完整程序12.151秒，退出后到根卸载关机另约2.035秒。两项计时不能混称为纯网络或checkpoint耗时。仍有复制、协议和应用固定成本，不设置倍数门槛；buddy/slab timer交错已修复；旧QEMU Virtqueue告警未确定具体来源。公网、DNS/TLS和外部IPv6未交付。后续主线与近期队列统一见[开发路线](docs/goals.md)。
-
-接口与owner见[网卡模块](docs/modules/riscv-virtio-net.md)，内容、分布和剩余成本见[真实网卡记录](docs/learning/network-ownership.md#真实-virtio-net-与宿主应用交付2026-10-02)。下一应用由真实需求选择，现有路线只保留一项待选应用与证据触发的性能候选。
-
-2026-10-03本轮已先补匿名管道共享元数据：fchmod/fstat与两端、dup/fork/proc重开一致。
-命名FIFO与原GCC/make的Lua5.4.3工程已交付构建、增量、失败恢复、默认-j2和产物运行，构建成本已收口，-j1/-j2中位135.542/133.225秒；tmpfs表明工作目录存储不足以解释整体差距，清理元数据与内存CPU候选见[工具链记录](docs/learning/offline-toolchain-probe.md)，具体进度归[开发路线](docs/goals.md)。
-
-2026-10-03串口TTY已交付：原ash/stty在modern/legacy完成设置恢复、行编辑、管线与重定向、
-前台cat/sleep/计算程序Ctrl-C，以及停止、jobs/bg/fg、后台TTIN/TTOU和退出回收。
-控制终端、64字节readv continuation、fault前缀、取消和旧OFD hangup由同ELF的
-27＋80条Linux差分及真实资源清理保护，见[TTY契约](docs/modules/kernel-tty.md)与
-[应用机制](docs/learning/session-consumers.md#原串口ashstty与控制终端2026-10-03)。
-
-CPU线已有默认关闭的有限诊断。选定heap清零/搬迁与页内usercopy不足以解释原工程
-成本；保守宽字候选改善对齐微实验，但没有可验证的工程收益，**未启用到main**。
-生产保留字节实现与诊断，见
-[实际工作与候选判断](docs/learning/offline-toolchain-probe.md#内存操作的有限归因与未上线候选2026-10-03)。
-文件所有权已接入fchown/fchownat：修改真实inode的UID/GID、ctime和特权位，
-ext4在同一事务删除文件capability属性；进程身份仍固定root。线程退出直接选择ready
-任务，清理继续由原worker拥有。Unix98 PTY、devpts、packet 和真实 libc PTY API 已交付；
-原 BusyBox script/replay 可录制原 ash/stty、控制作业并读取完整关闭尾部，显式同步后的
-录制文件可以重启读取。资源与应用语义见[TTY契约](docs/modules/kernel-tty.md)，
-原程序的退出状态、resize和持久化边界见[消费者机制](docs/learning/session-consumers.md#pty-的身份传输与应用边界)。
-O_PATH已持有独立路径资格，支持目录相对与空路径身份操作，不获得数据或设备打开资格。
-路径truncate已接入共同截断与capability清理，负长度先于路径访问拒绝。
-空路径stat接受NULL并避免完整路径缓冲；glibc的fstat经newfstatat进入时也复用fd资格。
-全局sync与挂载范围syncfs已接入稳定引用快照、数据交接及日志durable等待；
-syncfs独立观察挂载错误，dup/fork共享OFD游标。它们不将checkpoint强行并入每次同步。
-原生accept4仍缺；原LTP准备依赖、旧libc包装、
-镜像环境与目标接口失败分开，不能由遍历结束宣称完整兼容。
-性能候选包括元数据路径、短睡眠deadline和协议背压；按真实工作量选择一项，不因理论
-先进或微实验更快自动上线，见[证据读法](docs/learning/user-program-inventory.md#性能结果必须对应实际工作)。
+- [文档导航](docs/README.md)：模块、学习材料和当前基线。
+- [工程原则](docs/design.md)、[贡献说明](CONTRIBUTING.md)：设计、验证和提交规则。
+- [固定资料](references/README.md)、[第三方代码](docs/third-party.md)：版本、来源与许可。

@@ -393,6 +393,7 @@ static unsigned long run_create_cases(
 }
 
 static struct kernel_wait_queue test_queue;
+static uint64_t wait_case_deadline;
 static volatile unsigned long timeout_wake_count;
 static volatile unsigned long timeout_reason_value;
 static volatile unsigned long event_wake_count;
@@ -412,7 +413,7 @@ static void blocked_worker(void *argument)
         signal_waiter = kernel_task_current();
     }
     if (kernel_scheduler_block_current(&test_queue,
-                                       slot == 0U ? 1000U : 0U,
+                                       slot == 0U ? wait_case_deadline : 0U,
                                        slot == 2U ? 1 : 0,
                                        &reason) !=
         KERNEL_SCHEDULER_STATUS_OK) {
@@ -556,6 +557,7 @@ static unsigned long run_wait_cases(
     unsigned long failures = 0U;
 
     kernel_wait_queue_init(&test_queue);
+    wait_case_deadline = riscv_time_read() + UINT64_C(1000000000);
 
     failures += expect_status(KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT,
                               kernel_scheduler_block_current(0, 0U, 0, 0));
@@ -605,14 +607,14 @@ static unsigned long run_wait_cases(
         failures++;
     }
     failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
-                              kernel_scheduler_expire_deadlines(999U));
+                              kernel_scheduler_expire_deadlines(wait_case_deadline - 1));
     failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
                               kernel_scheduler_on_tick(1U));
     if (timeout_wake_count != 0U) {
         failures++;
     }
     failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
-                              kernel_scheduler_expire_deadlines(1000U));
+                              kernel_scheduler_expire_deadlines(wait_case_deadline));
     failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
                               kernel_scheduler_on_tick(1U));
     if (timeout_wake_count != 1U ||
@@ -1006,7 +1008,8 @@ static unsigned long run_deadline_cases(
     uint64_t available = physical_page_available(allocator);
     struct kernel_thread_completion completion;
     unsigned long failures = 0U;
-    uint64_t now = riscv_time_read();
+    /* Manual expiry uses a future origin, independent of construction time. */
+    uint64_t now = riscv_time_read() + UINT64_C(1000000000);
 
     kernel_wait_queue_init(&deadline_queue);
     deadline_wake_count = 0U;
@@ -1245,6 +1248,56 @@ static unsigned run_handoff_cases(struct physical_page_allocator *allocator)
     return failures + (physical_page_available(allocator) != available);
 }
 
+static unsigned deferred_ran;
+static void deferred_entry(void *argument)
+{ (void)argument; deferred_ran++; }
+static unsigned run_deferred_preemption_case(struct physical_page_allocator *allocator)
+{
+    uint64_t before = physical_page_available(allocator);
+    struct kernel_cpu *cpu = kernel_cpu_current();
+    struct kernel_task *current = kernel_task_current();
+    struct kernel_thread_completion completion;
+    if (kernel_thread_create(deferred_entry, 0) != KERNEL_SCHEDULER_STATUS_OK) return 1;
+    kernel_preempt_disable();
+    unsigned failure = kernel_scheduler_on_tick(1) != KERNEL_SCHEDULER_STATUS_OK ||
+        deferred_ran || kernel_task_current() != current || !cpu->need_resched;
+    kernel_preempt_enable();
+    kernel_scheduler_prepare_idle_return();
+    failure += deferred_ran != 1 || kernel_scheduler_reap_one(&completion) != KERNEL_SCHEDULER_STATUS_OK ||
+        physical_page_available(allocator) != before || cpu->preempt_depth || cpu->raw_locks;
+    return failure;
+}
+static unsigned other_deferred_ran, other_deferred_failure;
+static void other_deferred_peer(void *argument)
+{ (void)argument; other_deferred_ran = 1; }
+static void other_deferred_current(void *argument)
+{
+    (void)argument;
+    uintptr_t irq = arch_interrupt_save();
+    struct kernel_task *before = kernel_task_current();
+    kernel_preempt_disable();
+    other_deferred_failure = kernel_scheduler_on_tick(1) != KERNEL_SCHEDULER_STATUS_OK ||
+        other_deferred_ran || kernel_task_current() != before;
+    kernel_preempt_enable();
+    kernel_task_prepare_user_return();
+    other_deferred_failure += !other_deferred_ran || kernel_cpu_current()->need_resched ||
+        kernel_task_current() != before;
+    arch_interrupt_restore(irq);
+}
+static unsigned run_other_deferred_case(struct physical_page_allocator *allocator)
+{
+    uint64_t baseline = physical_page_available(allocator);
+    struct kernel_thread_completion completion;
+    if (kernel_thread_create(other_deferred_current, 0) != KERNEL_SCHEDULER_STATUS_OK ||
+        kernel_thread_create(other_deferred_peer, 0) != KERNEL_SCHEDULER_STATUS_OK) return 1;
+    /* 无cleanup worker的fixture每次退出回idle；分别驱动并回收两个owner。 */
+    for (unsigned i = 0; i < 2; i++) {
+        if (kernel_scheduler_yield_current() != KERNEL_SCHEDULER_STATUS_OK ||
+            kernel_scheduler_reap_one(&completion) != KERNEL_SCHEDULER_STATUS_OK) return 1;
+    }
+    return other_deferred_failure + (physical_page_available(allocator) != baseline);
+}
+
 void kernel_main(unsigned long hart_id, const void *dtb)
 {
     struct boot_memory_layout layout;
@@ -1288,6 +1341,8 @@ void kernel_main(unsigned long hart_id, const void *dtb)
     failures += run_deadline_cases(&allocator);
     failures += run_idle_irq_return_case(&allocator);
     failures += run_handoff_cases(&allocator);
+    failures += run_deferred_preemption_case(&allocator);
+    failures += run_other_deferred_case(&allocator);
     failures += run_exit_dispatch_case(&allocator);
     virt_uart_puts("BoarOS: scheduler cases failures=");
     virt_uart_put_hex(failures);

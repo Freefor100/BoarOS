@@ -152,7 +152,8 @@ static void timer_worker(void *context)
         if (!n->deadline || timeout < n->deadline) n->deadline = timeout;
         COST_ADD(NETWORK_RUNNABLE_SLEEP, kernel_socket_work_pending() != 0);
         enum kernel_wait_wake_reason reason;
-        if (kernel_scheduler_block_current(progress(n), n->deadline, 0, &reason) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
+        if (KERNEL_WAIT_RECHECK(progress(n), n->deadline, 0, &reason,
+                (!n->stopping && !kernel_socket_work_pending())) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
         arch_interrupt_restore(irq);
     }
 }
@@ -244,7 +245,8 @@ static void worker(void *context)
         if (!n->deadline || timeout < n->deadline) n->deadline = timeout;
         COST_ADD(NETWORK_RUNNABLE_SLEEP, kernel_socket_work_pending() != 0);
         enum kernel_wait_wake_reason reason;
-        if (kernel_scheduler_block_current(&d->progress, n->deadline, 0, &reason) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
+        if (KERNEL_WAIT_RECHECK(&d->progress, n->deadline, 0, &reason,
+                (!n->stopping && !kernel_socket_work_pending() && capacity_generation == d->tx_capacity_generation && (d->failed || !d->ready_count))) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
         arch_interrupt_restore(irq);
     }
 }

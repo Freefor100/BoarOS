@@ -138,6 +138,26 @@ void kernel_cost_add_tag(struct kernel_cost_tag tag, enum kernel_cost_metric met
     record(tag, metric, value);
     observer(start);
 }
+void kernel_cost_page_metadata(struct kernel_cost_tag tag, uint64_t checked,
+                              uint64_t written, uint64_t ticks)
+{
+    ATOMIC_SCOPE;
+    if (!cost.active || !tag.epoch || tag.epoch != cost.epoch) return;
+    uint64_t start = kernel_cost_clock();
+    record(tag, COST_PAGE_META_CHECKED, checked);
+    record(tag, COST_PAGE_META_WRITTEN, written);
+    record(tag, COST_ALLOCATOR_META_TICKS, ticks);
+    observer(start);
+}
+void kernel_cost_raw_lock(struct kernel_cost_tag tag, uint64_t wait, uint64_t hold)
+{
+    ATOMIC_SCOPE;
+    if (!cost.active || !tag.epoch || tag.epoch != cost.epoch) return;
+    uint64_t start = kernel_cost_clock();
+    record(tag, COST_RAW_WAIT_TICKS, wait);
+    record(tag, COST_RAW_HOLD_TICKS, hold);
+    observer(start);
+}
 void kernel_cost_sample_tag(struct kernel_cost_tag tag, enum kernel_cost_metric metric, uint64_t value)
 {
     ATOMIC_SCOPE;

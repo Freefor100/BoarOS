@@ -532,19 +532,16 @@ static uint16_t ext4_fs_bg_checksum(struct ext4_sblock *sb, uint32_t bgid,
 	if (ext4_sb_feature_ro_com(sb, EXT4_FRO_COM_METADATA_CSUM)) {
 		/* Use metadata_csum algorithm instead */
 		uint32_t le32_bgid = to_le32(bgid);
-		uint32_t orig_checksum, checksum;
-
-		/* Preparation: temporarily set bg checksum to 0 */
-		orig_checksum = bg->checksum;
-		bg->checksum = 0;
+		uint32_t checksum;
+		uint32_t size = ext4_sb_get_desc_size(sb);
 
 		/* Start with the filesystem metadata checksum seed. */
 		checksum = ext4_sb_get_csum_seed(sb);
 		/* Then calculate crc32 checksum against bgid */
 		checksum = ext4_crc32c(checksum, &le32_bgid, sizeof(bgid));
-		/* Finally calculate crc32 checksum against block_group_desc */
-		checksum = ext4_crc32c(checksum, bg, ext4_sb_get_desc_size(sb));
-		bg->checksum = orig_checksum;
+		/* 共享读者会看到清零窗口；以零片段计算同一校验和，不改原缓冲。 */
+		checksum = ext4_crc32c_zeroed(checksum, bg, size,
+			offsetof(struct ext4_bgroup, checksum), size);
 
 		crc = checksum & 0xFFFF;
 		return crc;
@@ -781,15 +778,9 @@ static uint32_t ext4_fs_inode_checksum(struct ext4_inode_ref *inode_ref)
 	uint16_t inode_size = ext4_get16(sb, inode_size);
 
 	if (ext4_sb_feature_ro_com(sb, EXT4_FRO_COM_METADATA_CSUM)) {
-		uint32_t orig_checksum;
-
 		uint32_t ino_index = to_le32(inode_ref->index);
 		uint32_t ino_gen =
 			to_le32(ext4_inode_get_generation(inode_ref->inode));
-
-		/* Preparation: temporarily set bg checksum to 0 */
-		orig_checksum = ext4_inode_get_csum(sb, inode_ref->inode);
-		ext4_inode_set_csum(sb, inode_ref->inode, 0);
 
 		/* Start with the filesystem metadata checksum seed. */
 		checksum = ext4_sb_get_csum_seed(sb);
@@ -797,10 +788,11 @@ static uint32_t ext4_fs_inode_checksum(struct ext4_inode_ref *inode_ref)
 		 * and inode generation */
 		checksum = ext4_crc32c(checksum, &ino_index, sizeof(ino_index));
 		checksum = ext4_crc32c(checksum, &ino_gen, sizeof(ino_gen));
-		/* Finally calculate crc32 checksum against
-		 * the entire inode */
-		checksum = ext4_crc32c(checksum, inode_ref->inode, inode_size);
-		ext4_inode_set_csum(sb, inode_ref->inode, orig_checksum);
+		/* 校验保持共享缓冲不变；128-byte inode 只归零低位字段。 */
+		checksum = ext4_crc32c_zeroed(checksum, inode_ref->inode, inode_size,
+			offsetof(struct ext4_inode, osd2.linux2.checksum_lo),
+			inode_size > EXT4_GOOD_OLD_INODE_SIZE ?
+				offsetof(struct ext4_inode, checksum_hi) : inode_size);
 
 		/* If inode size is not large enough to hold the
 		 * upper 16bit of the checksum */

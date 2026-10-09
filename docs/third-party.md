@@ -9,11 +9,19 @@
 - 用途：向 BoarOS 自有 socket fd/OFD 与 Linux ABI 层提供单 hart IPv4 UDP/TCP 协议核心；本阶段先用 NO_SYS raw API 和 loopback，网卡后端另行验证。
 - 本地修改：IPv4重组增加协议/输入网卡键、重复/重叠/终点校验及按网卡清理，另在 netif/timeouts 增加有预算的轮回入口，旧公开入口保持无限预算包装；mem/memp 增加可选的每次真实归还 hook，netif 增加 loopback 入队 hook。对应 netif.h/timeouts.h 声明随实现维护；补丁不升级固定版本，其他导入文件保持原版。BoarOS 的 lwIP 配置、端口和 socket 所有权适配位于 `net/` 与 `fs/`，不以 lwIP 的 socket fd 空间代替 BoarOS 文件表。
 
+2026-10-08 核对并补齐回环通知接线：端口已定义
+`LWIP_HOOK_NETIF_LOOPBACK_QUEUED`，导入的 `netif_loop_output()` 原先没有调用。
+现在只在成功挂入完整包链后通知；hook 未定义的配置保留原行为。仍固定上述
+上游 commit，验证入口为 `make test-lwip-host` 与双架构真实网络/ABI 回归。
+
 ## lwext4
 
 - 上游地址：<https://github.com/gkostka/lwext4>
 - 固定版本：`58bcf89a121b72d4fb66334f1693d3b30e4cb9c5`
 - 导入路径：`third_party/lwext4/`
+- GDT/inode 与 orphan 的 CRC 计算通过只读归一化原语跳过 checksum 字段，不再
+  临时改写输入；`make test-lwext4-checksum-host` 保护并发读者、只读输入与格式边界。
+  固定来源和反例见[时间戳背景](learning/file-timestamps.md#共享读取中的-checksum-计算2026-10-08)。
 - 导入内容：`include/`、`src/`、`LICENSE`、`README.md`、`CHANGELOG`
 - 许可证：`src/ext4_extent.c` 和 `src/ext4_xattr.c` 为 GPL-2.0-or-later，其余导入源码为 BSD-3-Clause；上游说明组合后的库受 GPLv2 约束。
 - 用途：在 BoarOS 自有 VFS 与块设备接口之后提供 ext2/3/4 磁盘格式实现。
@@ -66,6 +74,12 @@ glibc 2.44 作为外部测试输入使用：官方源码归档保存在被忽略
 
 
 ## LA 静态用户程序构建输入
+
+主线 CI 恢复的 GNU 工具包和运行时另固定于 `references/toolchains/`：Loongson
+2025.08.08 发布包及 Arch 的 RV GCC16.2.1/binutils2.47/glibc2.44/API7.2 包。
+只用于被忽略的宿主构建环境和用户程序 fixture，不导入内核源码；保留原包
+许可证与文件内容，GNU profile 的原二进制身份不变。上游 URL/SHA-256 归
+`references/sources.tsv`，用法见[CI 环境记录](learning/ci-native-environment.md)。
 
 GCC15.1.0 原官方 archive 固定于 `references/sources.tsv` 的 `gcc/gcc-15.1.0.tar.xz`；
 源码在忽略的 `build/loongarch/gcc-sf/source` 原样解包，许可见 `COPYING3`，目标运行库

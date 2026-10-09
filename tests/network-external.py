@@ -24,6 +24,7 @@ sys.path.insert(0, str(ROOT / 'tests/diff-abi'))
 import harness
 sys.path.insert(0,str(ROOT/"tests"))
 from arch_profiles import PROFILES
+import network_inputs
 
 PATTERN = (bytes(range(251)) * ((16 * 1024 * 1024 + 250) // 251))[:16 * 1024 * 1024]
 HOST, GUEST = '10.77.0.1', '10.77.0.2'
@@ -177,7 +178,7 @@ def fixture(work, workload, libc, reference, observe, arch):
     profile=PROFILES[arch]
     compiler = ROOT / ('build/riscv/musl-root/bin/musl-gcc' if arch=='riscv' else 'build/loongarch/musl-root/bin/musl-gcc')
     environment=os.environ.copy()
-    flags=['-fno-link-libatomic'] if arch=='riscv' else [*profile.raw_flags,'-Wl,-z,max-page-size=16384']
+    flags=profile.musl_flags(compiler)
     if arch=='loongarch':environment['REALGCC']=str(ROOT/'build/loongarch/gcc-sf/root/bin/loongarch64-unknown-linux-gnusf-gcc')
     program = work / 'init'
     subprocess.run([str(compiler), *flags, '-static', '-O2',
@@ -198,12 +199,15 @@ def fixture(work, workload, libc, reference, observe, arch):
         shutil.copyfile(ROOT/'build/loongarch/busybox-source/busybox/busybox',target);target.chmod(0o755)
         inputs['busybox']=harness.digest(target)
     if workload == 'external' and arch=='riscv':
-        original = ROOT / 'references/oscomp-autotest/sdcard-rv.img'
+        original = network_inputs.prepare()
+        inputs['runtime_profile_sha256'] = harness.digest(ROOT / 'tests/workloads/network/inputs.json')
         for name in ('busybox', 'lib/libc.so') if libc == 'musl' else (
                 'busybox', 'lib/libc.so.6', 'lib/libm.so.6', 'lib/ld-linux-riscv64-lp64d.so.1'):
             target = tree / name
             subprocess.run(['debugfs', '-R', f'dump /{libc}/{name} {target}', str(original)],
                            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if not target.is_file() or target.stat().st_size == 0:
+                raise RuntimeError(f'original RV runtime export failed: /{libc}/{name} from {original}')
             target.chmod(0o755)
             inputs[name] = harness.digest(target)
         if libc == 'musl':
@@ -371,6 +375,7 @@ def main():
     parser = argparse.ArgumentParser(__doc__)
     parser.add_argument('--isolated', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--prepared',type=Path,help=argparse.SUPPRESS)
+    parser.add_argument('--host-probe',action='store_true',help='check private namespace and actual TAP access without starting a guest')
     parser.add_argument('--arch',choices=('riscv','loongarch'),default='riscv')
     parser.add_argument('--memory',choices=('512M','1G'),action='append')
     parser.add_argument('--only', choices=('linux', 'boaros','both'))
@@ -381,6 +386,15 @@ def main():
     parser.add_argument('--observe', action='store_true')
     parser.add_argument('--kernel', type=Path)
     args = parser.parse_args()
+    namespace = [os.environ.get('BOAROS_UNSHARE', 'unshare'), '--user', '--map-root-user', '--net']
+    if args.host_probe:
+        if not args.isolated:
+            return subprocess.call([*namespace, sys.executable, '-B', str(Path(__file__).resolve()),
+                                    '--host-probe', '--isolated'])
+        fd = tap()
+        os.close(fd)
+        print('Private user/net namespace and TAP access PASS', flush=True)
+        return 0
     profile=PROFILES[args.arch]
     args.kernel=args.kernel or ROOT/profile.kernel
     args.only=args.only or ('both' if args.arch=='loongarch' else 'boaros')
@@ -401,7 +415,7 @@ def main():
                 for transport in ('legacy','modern') if args.transport=='both' else (args.transport,):
                     for repetition in range(args.repeat):
                         print(f'isolated boot {args.arch} {platform} {memory} {transport} {repetition+1}/{args.repeat}',flush=True)
-                        result=subprocess.call(['unshare','--user','--map-root-user','--net',sys.executable,'-B',
+                        result=subprocess.call([*namespace,sys.executable,'-B',
                             str(Path(__file__).resolve()),*base,'--only',platform,'--memory',memory,'--transport',transport])
                         if result:return result
         return 0

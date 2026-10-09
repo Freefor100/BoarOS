@@ -188,3 +188,11 @@ riscv_trap_return:
     tail riscv_trap_bad_return
 
     .size riscv_trap_return, . - riscv_trap_return
+
+    .globl riscv_user_thread_trampoline
+    .type riscv_user_thread_trampoline, @function
+riscv_user_thread_trampoline:
+    /* 首次运行才有未完成的切换；普通异常返回不重复查询handoff。 */
+    call kernel_scheduler_switch_finish
+    j riscv_trap_return
+    .size riscv_user_thread_trampoline, . - riscv_user_thread_trampoline

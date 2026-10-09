@@ -3,14 +3,15 @@
 | 入口 | 唯一职责 |
 |---|---|
 | [README](../README.md) | 已验证能力摘要、运行命令、近期方向 |
-| [目标与 TODO](goals.md) | 优先队列、阶段依赖、阻塞、验收和待确认路线 |
+| [开发路线](goals.md) | 未完成能力、主线依赖和未关闭问题；不保存逐轮执行计划或完成项 |
+| [主线 CI](modules/continuous-integration.md) | 双架构常驻门禁、原程序/设备与恢复分层、固定环境及失败判定 |
 | [设计原则](design.md) | 长期工程选择；协作/提交规则见 [AGENTS](../AGENTS.md)、[CONTRIBUTING](../CONTRIBUTING.md) |
 | [工具链](toolchain.md)、[固定资料](../references/README.md)、[第三方](third-party.md) | 环境、版本、来源和许可 |
 
 优先阅读：[当前局限与后续计划](goals.md#当前应用阻塞与能力边界)、
 [最新清单口径](learning/user-program-inventory.md#当前基线与口径)、
 [存储成本与串行边界](modules/vfs-ext4.md#当前成本边界)。
-旧日期段落是当时的验证记录，当前能力以模块契约和最新基线为准。
+已完成项由模块契约和learning证据说明，路线图只保留真实缺口；逐轮执行计划留在会话。
 
 ## 模块契约
 
@@ -44,8 +45,9 @@ learning 面向读者解释机制、结果和适用条件。正文使用可识�
 | 进程 / 并发 | [调度](learning/kernel-scheduling.md)、[生命周期](learning/process-lifecycle.md)、[线程与 futex](learning/threads-and-futex.md)、[可信随机源](learning/random-source.md)、[会话/调度消费者](learning/session-consumers.md) |
 | 文件 / 事件 | [存储](learning/storage-filesystems.md)、[时间戳](learning/file-timestamps.md)、[I/O 多路复用](learning/io-multiplexing.md)、[epoll](learning/epoll-subsystem.md)、[记录锁与恢复](learning/record-lock-sqlite-recovery.md)、[可睡眠存储](learning/sleepable-storage.md)、[多挂载验收](learning/memory-backed-mounts.md)、[proc 控制](learning/proc-controls.md)、[网络 owner](learning/network-ownership.md) |
 | 真实程序 | [最近全量基线、阻塞与根因](learning/user-program-inventory.md)、[双架构评测证据](learning/oscomp-compat-baseline.md)、[客体内编译探针](learning/offline-toolchain-probe.md)、[单核规模](learning/single-hart-scale.md) |
+| CI 复现 | [固定原工具环境、缓存身份与干净 runner](learning/ci-native-environment.md) |
 
 每个可独立验证的阶段收口时检查 README、模块、learning 三类文档：有新事实才更新，旧结论直接替换，细节用链接引用。运行产物仅在核对期间暂存于忽略的 `build/`，随后用 `make prune-build` 清理一次性目录与日志；临时 plan/spec 与会话材料不入库。
 
 - [LoongArch QEMU 启动与根盘](modules/loongarch-boot.md)：平台RAM、16KiB页表、PCI/ext4/静态musl、真实用户态与Linux对照；[学习记录](learning/loongarch-bringup.md)说明固定依据与owner。
-- [LoongArch标量浮点](modules/loongarch-fpu.md)：FR/FCC/FCSR、首用/切换、信号扩展、原版LP64D用户态和验收边界。
+- [LoongArch浮点与SIMD](modules/loongarch-fpu.md)：FR/LSX/LASX、FCC/FCSR、首用/宽度升级/切换、信号扩展、原版LP64D用户态和验收边界。

@@ -42,7 +42,7 @@
 
     .macro trap_test_load_sentinels
     li ra, 0x0101010181010101
-    li tp, 0x0404040484040404
+    /* tp是已绑定任务，不能替换成无效地址；返回仍逐值核对保存。 */
     li t0, 0x0505050585050505
     li t1, 0x0606060686060606
     li t2, 0x0707070787070707
@@ -128,7 +128,11 @@
     beq t3, t4, 1f
     addi a0, a0, 1
 1:
-    trap_test_check_immediate RISCV_TRAP_FRAME_TP, 0x0404040484040404
+    ld t3, RISCV_TRAP_FRAME_TP(sp)
+    ld t4, TEST_SAVED_TP(sp)
+    beq t3, t4, 1f
+    addi a0, a0, 1
+1:
     trap_test_check_immediate RISCV_TRAP_FRAME_T0, 0x0505050585050505
     trap_test_check_immediate RISCV_TRAP_FRAME_T1, 0x0606060686060606
     trap_test_check_immediate RISCV_TRAP_FRAME_T2, 0x0707070787070707

@@ -29,14 +29,14 @@ void kernel_cost_irq_return(uint64_t status)
 static struct kernel_cost_task bootstrap_cost;
 struct kernel_cost_task *kernel_cost_current(void)
 {
-    if (!scheduler.current) return &bootstrap_cost;
-    if (scheduler.current->io_context.background_reclaim) scheduler.current->cost.wait_flags |= 64;
-    else scheduler.current->cost.wait_flags &= (uint8_t)~64U;
-    return &scheduler.current->cost;
+    if (!kernel_cpu_current()->current) return &bootstrap_cost;
+    if (kernel_cpu_current()->current->io_context.background_reclaim) kernel_cpu_current()->current->cost.wait_flags |= 64;
+    else kernel_cpu_current()->current->cost.wait_flags &= (uint8_t)~64U;
+    return &kernel_cpu_current()->current->cost;
 }
 void kernel_cost_syscall(uint64_t number, int64_t fd)
 {
-    struct kernel_task *task = scheduler.current;
+    struct kernel_task *task = kernel_cpu_current()->current;
     if (!task) return;
     kernel_cost_account(&task->cost);
     if ((number >= 62 && number <= 70) || number == 57)
@@ -54,7 +54,7 @@ static int belongs(struct kernel_task *task, uint64_t owner)
 }
 int kernel_cost_control(const char *command, size_t size)
 {
-    struct kernel_task *task = scheduler.current;
+    struct kernel_task *task = kernel_cpu_current()->current;
     if (!task || !task->group_leader) return -KERNEL_EINVAL;
     uint64_t owner = process_identity_generation(task);
     if (size == 6 && !memcmp(command, "begin\n", 6)) {
@@ -82,7 +82,7 @@ void kernel_cost_user_return(void)
 }
 void kernel_cost_task_exit(void)
 {
-    struct kernel_task *task = scheduler.current;
+    struct kernel_task *task = kernel_cpu_current()->current;
     if (!task) return;
     kernel_cost_account(&task->cost);
     if (task->cost.wait_rank) kernel_cost_add_tag(kernel_cost_task_tag(&task->cost),

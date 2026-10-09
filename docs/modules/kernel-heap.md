@@ -6,7 +6,7 @@
 
 `include/kernel/heap.h` 和 `mm/heap.c` 提供 16 字节对齐的 allocate、calloc、resize、release 与统计接口。初始化只接受已经切换到 buddy 模式的物理页分配器，并要求平台提供“堆虚拟地址到物理地址”的转换函数；堆不假定恒等映射，也不拥有独立固定 arena。
 
-不超过 2048 字节的请求进入 16、32、64、128、256、512、1024、2048 八个 size class。每张架构基页（RV 4 KiB，LA 16 KiB）slab 页同时保存 header、按页大小推导 word 数的分配 bitmap、空闲 slot 链和对象；每个 class 维护非满 slab 双向链。slab 最后一个对象释放时立即归还整页，因此空闲 slab 不长期占用物理内存。
+小对象按16字节起的二次幂size class分配：RV 4 KiB页最多2048字节，LA 16 KiB页最多8192字节。每张架构基页同时保存header、按页大小推导word数的bitmap、空闲slot链和对象；每个class维护非满slab双向链。最后一个对象释放时立即归还整页，因此空闲slab不长期占用物理内存。
 
 更大的请求按覆盖长度所需的最小 buddy order 直接分配连续页，返回页首地址。释放时通过物理页分配器保存的 allocated-head order 找回大小，不在对象前放隐藏 header，也不维护额外大对象表。这个布局让 4 KiB 请求恰好只占一页，并保持 DMA/页表消费者需要的页对齐；代价是非二次幂大对象存在 buddy 内部碎片。
 
@@ -20,19 +20,21 @@
   分配器不变量损坏时直接 fatal trap，不把释放失败转成重试状态。
 - 统计记录调用、失败、活对象、当前页与峰值页。它用于资源回收检查，不等同于按调用点或大小分布的性能 profiler。
 
-当前实现针对单 hart 启动和文件系统路径。共享 slab 查找/取槽、bitmap、链表、
-释放与统计使用保存/恢复架构中断状态的短临界区，防止开中断内核线程被 timer 抢占后产生
+当前生产平台仍为单CPU。共享slab查找/取槽、bitmap、链表、
+释放与统计使用每heap的raw锁，保存/恢复IRQ并禁止抢占，防止开中断内核线程被timer抢占后产生
 双 owner 或借用已回收 slab。缺 slab 时在区外分配并初始化私有页，再在区内发布和
 取槽；期间其他任务也创建同类 slab 仍保持独立 owner。大对象页申请、calloc 清零和
 resize 复制不放进 heap 元数据临界区，回收可重入堆。
 size-class 热路径仍是一次链首访问、slot 链更新和 bitmap 更新；新建/回收 slab 或大
-对象才进入 buddy。没有 per-CPU cache；SMP 接入前须将这些边界升级为跨核锁。
+对象才进入buddy。锁序为heap→physical allocator；嵌套页查询/释放不回收、不等待，
+页申请和压力回调在heap锁外。没有per-CPU cache；页缓存、压力回收和完整快照仍限单CPU。
 
 ## 验证
 
 ```sh
 make test-allocator-preemption-host
 make test-allocator-release-host
+make test-allocator-concurrency-host
 make test-heap-riscv
 make test-page-riscv
 ```
@@ -54,3 +56,7 @@ ticks 可以包含中断与切换，不能当作独占 CPU 时间。公共字节
 线程 timer 抢占仍由 RV64 物理页、堆与调度聚焦测试验证。
 
 LA 16 KiB fixture 用300个独立17字节对象验证位图覆盖、内容隔离及页回收；`make test-loongarch` 运行。RV allocator抢占与fatal释放测试保护既有4 KiB契约。
+
+并发host门禁用真实buddy/heap及独立owner账簿，在4/16 KiB下运行2/4线程，覆盖引用、
+各class、大对象、calloc、resize、耗尽和最终审计/资源基线。账簿不替代生产互斥；
+该宿主结果不证明客户机等待或共享MM的多核正确性。

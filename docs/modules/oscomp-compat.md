@@ -5,6 +5,8 @@
 由oscomp-rv-compat更名，现行维护名称为oscomp-compat，与main共同保留。旧名称
 仅用于历史提交与RV专项结果身份；运行时DSO留在本分支，main默认不预加载。
 输入与逐次失败的证据边界见[评测学习记录](../learning/oscomp-compat-baseline.md)。
+当前共同内核已集成 main 的 CPU 本地/raw、buddy/slab、代次等待和切换尾部；
+生产仍是单 CPU，业务对象与共享 MM 尚未完成跨核同步。
 
 ## 固定输入与入口
 
@@ -101,6 +103,11 @@ make all                              # 恢复双架构评测默认配置
 
 ## 验证与证据边界
 
+最近完整官方调用的联合整数分为2130，40个外层组completed；两侧LTP-glibc
+触及总预算，LTP-musl未到达，正常PID1及资源收口未验证。当前子项见
+[默认运行时结果](../learning/oscomp-compat-baseline.md#默认make-all接入la-linux调度运行时)；
+下文1915及失败运行保留原身份，不代表最新内核重新执行的成绩。
+
 bootstrap host门禁验证目标loader、helper架构拒绝、独立配置和显式监督参数。
 显式shell门禁验证只改变两个入口、保留非零子脚本后续进展及拒绝异常脚本形状。
 同一原BusyBox与runtest在固定Linux/BoarOS的512MiB/1GiB验证直接执行ENOEXEC、
@@ -111,8 +118,9 @@ Linux对照bootstrap为程序建立真实正进程组，因为直接内核init�
 这些probe仅是诊断fixture，不是官方镜像结果。GNU空LOAD问题在main修正后合入，
 不通过修改链接产物绕过exec差异；背景见[ELF记录](../learning/elf-loading.md)。
 
-原basic在RV/LA、glibc/musl四份结果均为90/102：brk为1/3，mount与umount均为0/5，
-其余29条89/89。brk原ELF把64位返回地址截断为32位；vfat是共同内核缺失能力，
+历史默认basic在RV/LA、glibc/musl四份结果均为90/102：brk为1/3，mount与umount均为0/5，
+其余29条89/89。本次集成聚焦的RV glibc因父子cpid输出交错为86，其他三格90；
+实际判分及重建命令见[集成范围](../learning/oscomp-compat-baseline.md#当前主线集成的验证范围)。brk原ELF把64位返回地址截断为32位；vfat是共同内核缺失能力，
 umount先卡在mount，没有到达卸载。原测例mount/umount还需要真实/dev/vda2分区环境，
 不是添加一个名字即可满足；归因见[basic与运行时差异](../learning/oscomp-compat-baseline.md#basic的90分与原musl调度接口差异)。
 LTP还可能需要scratch/loop设备、
@@ -235,7 +243,7 @@ PID1/页/堆/任务栈/根盘/设备收尾。容器清理由本次cidfile标识�
 现场没有原调用栈，且最终Job/LA生命周期未收齐，不作为完成的正式基线。
 main的a15fbf3已用实际lwext4冷缓存树读取OOM独立复现同一释放位置并修复，
 OOM/读失败、重试/卸载/堆清零、完整host恢复及双侧真实程序回归通过；
-先前事件与这条调用链的唯一归因仍须区别于确定性复现，干净官方全量重跑继续。
+先前事件与这条调用链的唯一归因仍须区别于确定性复现，该故障现场仍保留。
 
 实际kernel fatal优先于进程结束或预算证据，标记kernel-runtime-error，保留原故障行；
 当前组/单项保留kernel owner，未到达组保持not-reached，没有伪造exit/wait状态。

@@ -214,7 +214,7 @@ def main():
     environment=os.environ.copy()
     if args.arch=='loongarch':environment['REALGCC']=str(ROOT/'build/loongarch/gcc-sf/root/bin/loongarch64-unknown-linux-gnusf-gcc')
     launcher = directory / 'launcher'; gate = directory / 'gate'
-    flags = (['-fno-link-libatomic'] if args.arch=='riscv' else [*profile.raw_flags,'-Wl,-z,max-page-size=16384'])+['-static', '-O2', '-Wall', '-Wextra', '-Werror']
+    flags = profile.musl_flags(compiler)+['-static', '-O2', '-Wall', '-Wextra', '-Werror']
     command(str(compiler), *flags, str(ROOT / 'tests/tty/launcher.c'), '-o', str(launcher),env=environment)
     command(str(compiler), *flags, str(ROOT / 'tests/tty/gate.c'), '-o', str(gate),env=environment)
     busybox = ROOT / ('build/program-environment/full-busybox/source/busybox/busybox' if args.arch=='riscv' else 'build/loongarch/busybox-source/busybox/busybox')

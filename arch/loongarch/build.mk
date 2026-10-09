@@ -134,6 +134,9 @@ LA_MUSL_CC := $(LA_BUILD)/musl-root/bin/musl-gcc
 $(LA_BUILD)/root-probe: tests/loongarch/root_probe.c prepare-la-userland
 	REALGCC=$(abspath $(LA_USER_CC)) $(LA_MUSL_CC) $(LA_FLAGS) -O2 -static -Wall -Wextra -Werror -Wl,-z,max-page-size=16384 -o $@ $<
 test-root-loongarch: $(LA_BUILD)/root-probe
+.PHONY: test-root-checksum-loongarch
+test-root-checksum-loongarch: kernel-la $(LA_BUILD)/root-probe prepare-la-tools
+	python3 -B tests/loongarch/root.py --qemu $(QEMU_LOONGARCH64) --cc $(LA_CC) --smoke --metadata-csum
 $(LA_BUILD)/root-oom-%.o: tests/loongarch/root_oom.c
 	$(LA_CC) $(LA_CPPFLAGS) $(LA_CFLAGS) -DROOT_OOM_CASE=$* -c $< -o $@
 $(LA_BUILD)/kernel-root-oom-%: $(LA_BUILD)/root-oom-%.o $(LA_OBJECTS) arch/loongarch/linker.ld
@@ -338,3 +341,21 @@ test-sqlite-wal-loongarch: $(LA_BUILD)/sqlite-wal kernel-la
 .PHONY: test-sqlite-rollback-loongarch
 test-sqlite-rollback-loongarch: $(LA_BUILD)/sqlite-rollback $(LA_BUILD)/sqlite3-static $(LA_BUILD)/sqlite3-dynamic $(LA_BUILD)/sqlite-cli-init kernel-la
 	python3 -B tests/sqlite-rollback.py --arch loongarch
+
+$(LA_BUILD)/sync-%.o: tests/sync/native.c
+	@mkdir -p $(dir $@)
+	$(LA_CC) $(LA_CPPFLAGS) $(LA_CFLAGS) -DBOAROS_SYNC_CASE=$* -c $< -o $@
+$(LA_BUILD)/sync-%: $(LA_OBJECTS) $(LA_BUILD)/sync-%.o arch/loongarch/linker.ld
+	$(LA_CC) $(LA_FLAGS) -nostdlib -nostartfiles -static -no-pie -T arch/loongarch/linker.ld -Wl,--gc-sections,--wrap=physical_page_allocate,--wrap=physical_page_allocate_order,--wrap=kernel_syscall_dispatch,--wrap=la_boot_tasks -o $@ $(LA_OBJECTS) $(LA_BUILD)/sync-$*.o -lgcc
+.PHONY: test-sync-loongarch
+test-sync-loongarch: $(foreach case,0 1 2 3 4,$(LA_BUILD)/sync-$(case)) prepare-la-tools
+	python3 -B tests/sync/native.py --arch loongarch --qemu $(QEMU_LOONGARCH64) --kernel-dir $(LA_BUILD)
+
+$(LA_BUILD)/wait-native.o: tests/wait/native.c
+	@mkdir -p $(dir $@)
+	$(LA_CC) $(LA_CPPFLAGS) $(LA_CFLAGS) -c $< -o $@
+$(LA_BUILD)/wait-native: $(LA_OBJECTS) $(LA_BUILD)/wait-native.o arch/loongarch/linker.ld
+	$(LA_CC) $(LA_FLAGS) -nostdlib -nostartfiles -static -no-pie -T arch/loongarch/linker.ld -Wl,--gc-sections,--wrap=physical_page_allocate,--wrap=physical_page_allocate_order,--wrap=kernel_syscall_dispatch,--wrap=la_boot_tasks,--wrap=kernel_wait_backend_switch -o $@ $(LA_OBJECTS) $(LA_BUILD)/wait-native.o -lgcc
+.PHONY: test-wait-loongarch
+test-wait-loongarch: $(LA_BUILD)/wait-native prepare-la-tools
+	python3 -B tests/wait/native.py --arch loongarch --qemu $(QEMU_LOONGARCH64) --kernel-dir $(LA_BUILD)

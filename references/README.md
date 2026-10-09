@@ -68,6 +68,12 @@ glibc 2.44 官方源码以 `glibc/glibc-2.44.tar.xz` 保存，SHA-256
 `tests/userland/glibc/inputs.json` 逐文件 SHA-256 固定的二进制；源码
 归档不充当这些二进制的可重复构建证明。
 
+主线 CI 的原 GNU 工具与运行时包另固定在 `toolchains/`：LA 为 Loongson
+2025.08.08 的 GCC15.1.0/binutils2.45/glibc2.42，RV 为 Arch 的 GCC16.2.1-1、
+binutils2.47-1、glibc2.44-1 和 API headers7.2-1。逐包官方 URL 与 SHA-256
+见 `sources.tsv`，2026-10-08 核对。恢复到忽略的 `build/tools/` 后仍验证原
+GNU profile，安装位置可以迁移，二进制身份与库版本不变。
+
 确需整树阅读时解包到仓库外的临时目录或已忽略的 `build/`，结束后删除。不要 `git add -f`
 恢复出的仓库、PDF、压缩包或解包树，也不要把手工下载的网页副本留在仓库其他位置成为未跟踪
 快照；要长期固定的新输入应加入 `sources.tsv`，由恢复器校验。
@@ -88,6 +94,16 @@ glibc 2.44 官方源码以 `glibc/glibc-2.44.tar.xz` 保存，SHA-256
 `oscomp-testsuits` 的某个分支时应记录实际 commit；允许手动切换分支，
 但切离清单 commit 或产生本地修改后不会通过下一次恢复校验。分析结束后
 切回 `sources.tsv` 记录的 commit 即可重新验证。
+
+外网runner使用的原RV BusyBox/libc来自`pre-20250615`发布盘。
+其压缩输入另固定在`oscomp-images/sdcard-rv.img.xz`，URL与压缩SHA在`sources.tsv`；
+解压后的SHA `95973543db6b84a9a5e70f30da466ce292867aff5b689fb14c88dc9406e378b8`
+由`tests/workloads/network/inputs.json`固定，2026-10-10对固定压缩包完整解压核对。
+`python3 -B tests/network_inputs.py`验证并复用现有只读原盘，或校验下载后原子发布到
+`build/tools/network-rv/`；损坏缓存不覆盖、不重新登记身份。其他owner持有的Harness原盘
+若与解压身份不符则明确报告并保持原样，不把其现有SHA冒充发布输入。
+该输入只服务原网络消费者，
+不把main构建改成比赛启动环境。
 
 `tests/program-inventory/inputs.json` 是执行 profile：BusyBox 源码和配置取自
 清单的 `b5ec6ef8497e1818cbdec3b54bb722f036e57972`，libc-test 和比赛脚本取自

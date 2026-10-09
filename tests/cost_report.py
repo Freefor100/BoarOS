@@ -23,7 +23,9 @@ def supported_schemas():
     resize_previous=current[:next(i for i,x in enumerate(current) if x[0]=='resize_visits')]
     network_previous=current[:next(i for i,x in enumerate(current) if x[0]=='network_service_calls')]
     admission_previous=current[:next(i for i,x in enumerate(current) if x[0]=='stream_admit_blocked')]
-    return current,memory_previous,previous,stored_pipeline,journal,original,network_previous,admission_previous,resize_previous
+    allocator_previous=current[:next(i for i,x in enumerate(current) if x[0]=='page_meta_checked')]
+    raw_previous=current[:next(i for i,x in enumerate(current) if x[0]=='raw_wait_ticks')]
+    return current,memory_previous,previous,stored_pipeline,journal,original,network_previous,admission_previous,resize_previous,allocator_previous,raw_previous
 
 def parse(text, epoch, metrics=None):
     metrics=schema() if metrics is None else metrics
@@ -84,6 +86,39 @@ def validate_expected(snapshot, expected):
     for key,value in expected.items():
         if snapshot.get(key) != value: raise ValueError(f'independent expected {key}: {snapshot.get(key)} != {value}')
 
+def validate_allocator(timings, snapshots, output, diagnostics):
+    expected={f'allocator-{pages}-{count}':(pages,count,pages*count*90)
+              for pages,count in ((1,1024),(64,64),(4096,4))}
+    work=re.findall(r'^COST ALLOCATOR WORK (\S+) (\d+) (\d+) (\d+)$',output,re.M)
+    if len(work)!=3 or {name for name,*_ in work}!=set(expected):
+        raise ValueError('allocator work missing/duplicate')
+    for name,pages,count,checksum in work:
+        if tuple(map(int,(pages,count,checksum)))!=expected[name]:
+            raise ValueError('allocator work/content mismatch')
+    if set(timings)!=set(expected) or any(value<=0 for value in timings.values()):
+        raise ValueError('allocator timing coverage')
+    closing=re.findall(r'^COST CLOSING (\S+) (\d+) (\d+)$',output,re.M)
+    if (diagnostics and (len(closing)!=3 or {name for name,*_ in closing}!=set(expected))) or (not diagnostics and closing):
+        raise ValueError('allocator closing coverage')
+    if (diagnostics and (len(snapshots)!=3 or {s['name'] for s in snapshots}!=set(expected))) or (not diagnostics and snapshots):
+        raise ValueError('allocator snapshot coverage')
+    available=[]
+    for snapshot in snapshots:
+        values=snapshot['values'];pages,count,_=expected[snapshot['name']]
+        if values['foreground.page_accepted.value']<pages*count or not values['foreground.irq_off_ticks.samples']:
+            raise ValueError('allocator pages/IRQ work absent')
+        metrics=('page_meta_checked','page_meta_written','allocator_meta_ticks')
+        present=[f'foreground.{name}.value' in values for name in metrics]
+        if any(present) and not all(present):raise ValueError('partial allocator schema')
+        available.append(all(present))
+        if all(present) and any(not values[f'foreground.{name}.value'] for name in metrics):
+            raise ValueError('allocator metadata work absent')
+    if available and len(set(available))!=1:raise ValueError('changed allocator registry')
+    return {'work':[dict(name=name,pages=int(pages),iterations=int(count),checksum=int(checksum))
+                    for name,pages,count,checksum in work],
+            'closing':[dict(name=name,ns=int(ns),retries=int(retries)) for name,ns,retries in closing],
+            'metadata_available':bool(available and available[0])}
+
 def validate_deadline(name, snapshot):
     _, unrelated, mode, _ = name.split('-')
     if int(mode) == 0:
@@ -112,17 +147,46 @@ def validate_replicas(records):
         for row in rows:
             if row['cost_diagnostics'] and not row['snapshots']: raise ValueError('missing snapshots')
             if not row['cost_diagnostics'] and row['snapshots']: raise ValueError('unexpected diagnostic snapshots')
+            build=row.get('kernel_build_identity',{})
+            if build and build.get('kernel_sha256')!=row['kernel_sha256']:raise ValueError('kernel build identity mismatch')
+            registry=row.get('metric_schema');frozen=build.get('metric_schema')
+            registry=[tuple(metric) for metric in registry] if registry is not None else None
+            frozen=[tuple(metric) for metric in frozen] if frozen is not None else None
+            if registry is not None and frozen is not None and registry!=frozen:raise ValueError('kernel metric registry mismatch')
+            if registry is None:registry=frozen
             seen=set(); previous_epoch=0
             for snapshot in row['snapshots']:
                 if snapshot['name'] in seen: raise ValueError('duplicate window')
                 seen.add(snapshot['name'])
                 text=''.join(f'{k}={v}\n' for k,v in snapshot['values'].items())
-                parsed=parse(text,snapshot['values']['epoch'],row.get('metric_schema'))
+                parsed=parse(text,snapshot['values']['epoch'],registry)
                 if row['case']=='deadline':validate_deadline(snapshot['name'],parsed)
                 if parsed['epoch']<=previous_epoch:raise ValueError('reused/stale boot epoch')
                 previous_epoch=parsed['epoch']
-            if row['cost_diagnostics'] and row['case'] in ('contract','write','locking','mprotect','deadline','latency','consumer','io-pressure'):
+            if row['cost_diagnostics'] and row['case'] in ('contract','write','locking','mprotect','deadline','latency','consumer','io-pressure','allocator'):
                 expected_epochs=[1,2,3,5] if row['case']=='contract' else list(range(1,len(row['snapshots'])+1))
                 if [s['values']['epoch'] for s in row['snapshots']]!=expected_epochs:raise ValueError('boot epoch sequence')
             if row['cost_diagnostics'] and row['timings_ns'] and seen!=set(row['timings_ns']): raise ValueError('window coverage')
     return groups
+
+def validate_locking(timings, snapshots, diagnostics):
+    required = {f'locking-{relationship}-0-{waiters}'
+                for relationship in range(3) for waiters in (1, 8, 32)}
+    required.update(f'locking-1-{operation}-8' for operation in (1, 2, 3, 4))
+    if set(timings) != required or (diagnostics and {s['name'] for s in snapshots} != required):
+        raise ValueError('locking window coverage')
+    if diagnostics:
+        for snapshot in snapshots:
+            values = snapshot['values']
+            if values['foreground.lock15_acquired.value'] == 0:
+                raise ValueError('write operation lock missing')
+            # 普通热写可能全程无睡眠；同步持锁等待和truncate才是强制竞争窗口。
+            if snapshot['name'] in ('locking-1-2-8', 'locking-1-4-8') and values['foreground.lock15_blocks.value'] == 0:
+                raise ValueError('synchronous same inode contention was not exercised')
+
+def validate_resume_selection(case, record, selected):
+    if case not in ('consumer', 'metadata'):
+        return
+    expected = ['consumer-musl-1', 'consumer-glibc-1'] if case == 'metadata' else selected
+    if record.get('consumer_command_names') != expected:
+        raise ValueError('resume command selection differs')

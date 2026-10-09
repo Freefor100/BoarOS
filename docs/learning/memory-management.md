@@ -80,14 +80,117 @@ buddy_pfn = pfn XOR (1 << order)
 ```
 
 若 buddy 也空闲且仍在同一个可用 RAM 区间，就把两者摘链、取低地址作为高一级块，
-继续向上合并。BoarOS 在 metadata 中保存双向链索引，因此已知 buddy head 可以 O(1)
-摘链；split/coalesce 只随 order 数增长，不再像启动回收链那样扫描所有空闲页。
+继续向上合并。BoarOS在metadata中保存双向链索引，已知buddy的链指针修改为O(1)，
+但审查基线的校验还遍历整个空闲块；不能把链操作复杂度当成分配/释放的总成本。
 
-逐页 metadata 让错误语义也更精确：allocated head 记录原 order 和引用数，allocated tail
+旧表示的逐页 metadata 让错误语义更精确：allocated head 记录原 order 和引用数，allocated tail
 不能单独释放，free head/tail 能识别重复释放，internal 页永远不能返回给调用者。代价是
 finalize 需要 O(页数) 初始化，并永久占用每页 16 字节；4 KiB 页下约占 RAM 的
-0.391%，16 GiB 理论完整 RAM 为 64 MiB。分配/释放大块还要更新本次块内的逐页状态，
-但常用 order 0 只触碰一条记录。
+0.391%，16 GiB理论完整RAM为64 MiB。order-0分配最后只发布一个allocated记录，
+前面的free-block校验及释放后的合并块重写仍可涉及大量无关页，见下节。
+
+### Buddy 元数据成本核实（2026-10-08）
+
+固定审查基线 `cfae10338b60e6adf4769938a0b1d16ae94719ee` 与 `main@774e2dc` 的
+`kernel/physical_page.c` 相同。公开allocate/release构造合法状态、准备后重置gcov，
+证实旧全尾检查与最终合并块重写为O(B)。当前森林实现按相关树/链验证与发布，不扫描
+无关尾页；下表分别保留旧尾检查口径和最终新逻辑记录口径，不能换算周期或加速倍数。
+
+| 大块页数B | 旧分配/释放尾检查 | 旧释放重写 | 新分配/释放逻辑检查 | 新分配/释放逻辑重写 |
+|---:|---:|---:|---:|---:|
+|64|126/114|64|31/31|40/40|
+|512|1022/1004|512|43/43|58/58|
+|4096|8190/8166|4096|55/55|76/76|
+|32768|65534/65504|32768|67/67|94/94|
+
+4 KiB和16 KiB宿主页参数均验证该工作量；宿主计数不代表LA客户机时间。
+`test-allocator-cost-host`通过公开API强制split/coalesce，并以每种页参数10000次独立
+owner模型、每步审计、多range/保留洞、bootstrap导入及finalize失败验证恢复资源基线。
+现有wrong-order、tail、double-free、internal、引用与链/树损坏继续fatal；旧尾reserved
+故障改为活跃树权威损坏，未删除对应所有权反例。
+
+每页仍保留16字节载荷，只有活动块头拥有引用/链关系。只读查询检查候选块头几何及
+ALLOCATED树节点，高阶内部页/过期hint回退树路径；修改和审计检查完整祖先关系。
+这一已确认取舍允许只读查询延后发现祖先损坏。把有效head载荷复制到inactive尾页的
+反例证明载荷不能单独成为owner；删掉活动节点检查的独立错误变体会误认尾页。
+
+检查/重写上界、完整审计和自托管metadata预算由[物理页模块](../modules/physical-pages.md#算法与限制)维护。
+finalize和显式审计包含全量树/链核对及成员owner路径，不属于运行期成本窗口。
+典型负向时间结果见[成本分析](cost-baseline.md#buddy-森林匹配时间2026-10-09)，
+最终功能与资源证据见[组合验收](#阶段a组合收口2026-10-09)。
+
+<details>
+<summary>旧审核输入身份与复现</summary>
+
+- 旧生产源码SHA-256：`ecee97ce6f0d5d86d613a9b3f4d43a0b36e04785d1fcfb20b813053d4cea00f9`。
+- 用户提供的审核zip SHA-256：`097b983c5562712d1d02cbda5dcf29ed0abefa856e4f4f8bbb28a137f5322897`。
+- 计数器为本地GCC/gcov16.2.1 20260810；旧输入可用附件的
+  `buddy-probe/reproduce.sh /path/to/cfae103-checkout /path/to/output`复现，新表示使用
+  `make test-allocator-cost-host`。附件和运行日志不入Git。
+
+</details>
+
+## CPU本地状态与allocator短锁的验证
+
+CPU定位保留内核tp指向任务，通过任务的CPU关联取得本地状态；启动与重定位明确重绑，
+用户TLS不参与内核CPU定位。raw锁的互斥字和CPU guard链承担不同职责：acquire/release
+原子字发布共享元数据，guard链检查owner、LIFO与rank/key。heap→page只允许不会回收、
+等待的嵌套查询/释放；新页准备、清零、resize复制和压力回调在元数据锁外。
+具体接口与单CPU限制见[调度](../modules/kernel-scheduler.md)、[物理页](../modules/physical-pages.md)及[heap](../modules/kernel-heap.md)。
+
+`98109a4`的生产内核通过4/16KiB、2/4宿主线程的独立owner/内容模型、全部slab class、
+连续页、引用、resize、耗尽和结束审计。旧IRQ-only代码的真实两线程反例触发
+free-list-insert fatal；新实现保留非法释放、压力重入和函数边界抢占门禁。
+raw host另覆盖80000次争用更新与11类fatal；两架构原生测试在512MiB/1GiB核对CPU ID、
+IRQ、真实原子指令及raw内block/yield/退出/睡眠锁拒绝。RV使用amoswap.w.aq和release
+fence，LA使用amswap_db.w与dbar；宿主模型不代替客户机指令验收，也不证明真实多核内存序。
+
+独立审查发现延期tick丢失OTHER轮转原因、COST原生runner借用普通构建目录两项问题。
+两者都有失败对照，修复后同级peer进展和实际QEMU argv门禁通过；显式抢占嵌套不能
+抵消raw自己的深度。时间对照另列于[成本结果](cost-baseline.md#allocator-短锁的匹配时间)，
+默认新增6.0%–7.3%开销和批量IRQ尾延迟保留，不据互斥成功声称性能提高。
+
+最终本地验收覆盖完整host、COST24项解析、RV完整/scale/I/O/NBD与SQLite DELETE/WAL，
+LA核心/运行时/平台/设备错误，以及两侧双RAM userland、glibc五形态、1366 ABI、
+guard/栈、网络与终端。共同原程序229项在RV/LA×512MiB/1GiB各完成同ELF Linux对照，
+正常退出核对页/堆/任务栈/设备baseline；RV原程序的最小栈余量4344字节。
+RV首次512MiB清单因Linux原BusyBox的du遇到消失的/proc/22失败，BoarOS同项通过；
+定点复验保留参考失败，独立重跑完整512MiB清单229项通过，未把原失败改记通过。
+LA首次入口因旧目录内核快照冲突而未执行清单，另用新目录完成；准备错误不算程序失败。
+
+最终RV核SHA-256为`857349024ca1140a0b501702775d0e7ca337dcc0045640e07d54f5361469cf3b`，
+LA为`ce751f417edab75d4846d14ddb2bef53cabea01ec0a4f4a7dfbbeeb08cafac0e`，执行器和固定Linux
+沿用上一节身份。入口见[CI模块](../modules/continuous-integration.md)；新的glibc/RAM
+配置反例同时保护宿主门禁。托管CI未重跑，等待、回收/cache、共享MM和调度队列仍
+依赖单CPU协议；这些验证仅交付CPU定位与allocator元数据互斥基础。
+
+### 单核纪律与跨核同步的区别
+
+固定 `references/linux` commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的
+`Documentation/locking/locktypes.rst` 区分本地IRQ/抢占控制、raw锁与可睡眠锁。
+当前BoarOS `include/kernel/irq.h` 明确不提供SMP互斥，也不禁止显式调度；
+`kernel/sched/sync.c` 在IRQ关闭时登记并阻塞，所以不能机械替换成持raw锁睡眠。
+现有rank/key与资格交接有保留价值，等待节点和唤醒路径还需要跨核互斥及存活owner。
+
+buddy与heap共享元数据现已分别使用raw锁，锁序固定heap→physical allocator。
+私有slab准备、页申请、清零和resize复制在heap锁外；buddy尝试结束先解锁再分发压力回调。
+resolve在锁内验证owner，解锁后调用映射器，合法调用者自身的页引用覆盖这段借用；
+不能用resolve代替共享MM复制所需的pin。bootstrap/finalize仍要求独占未发布实例。
+4/16 KiB的2/4宿主线程检查独立owner、内容、共享引用、resize和耗尽，结束后完整审计并回到页/堆基线；
+旧IRQ-only实现的两线程负对照触发free-list-insert fatal。压力回调与缓存注销继续保持单CPU契约。
+
+当前uaccess最终得到direct-map指针后没有新增覆盖复制的页引用；尚未复现单核UAF，
+但共享MM跨核执行需要把映射查询与取得pin放在同一保护下。页引用解决存活，不等于
+权限或COW永远不变。远端TLB确认、活动CPU集合与撤映射后的回收必须一起设计，
+`references/linux/arch/riscv/mm/tlbflush.c` 的本地与远端失效路径提供固定依据。
+
+RV COST记录IRQ-off、按rank的对象锁持有与wake-to-run；LA尚未接完整同类时间挂钩。
+三项allocator指标及新增两项raw区间采用非直方图counter，聚合64570字节、每任务64字节，保持64KiB上限；
+记录工作量及时间总量/样本/max，分布复用IRQ-off。metric已实现，不能沿用旧设计中的
+“尚未实现”状态；接口与schema见[COST模块](../modules/kernel-cost.md#buddy元数据观测2026-10-09)。
+lwIP固定快照 `references/lwip`（`77dcd25a72509eb83f72b033d219b1d40cd8eb95`）
+`doc/doxygen/main_page.h` 的multithreading说明要求raw核心串行；SMP接入也必须保留
+这一条件，不能让各CPU并发进入现有raw API。
 
 共享物理页和共享虚拟地址空间不是一回事。COW 与只读文件缓存只让不同 PTE owner 持有
 同一 order-0 页的独立引用；每次 release 先减引用，末引用才归还 buddy。高阶连续块仍保持
@@ -111,7 +214,7 @@ BoarOS 当前对不超过 2048 字节的对象使用 16 至 2048 字节的二次
 
 `calloc` 必须在乘法前检查溢出并清零完整结果；`realloc` 在原 class 或原 buddy order 仍能容纳新长度时可以原地返回，否则先分配、复制两者较小长度，再释放旧对象。任何失败都不能改变旧对象所有权。统计中的 live bytes、当前/峰值页数和分配次数既用于发现泄漏，也为以后判断 per-CPU cache、延迟回收或更细 size class 是否值得提供基线。
 
-当前堆服务单 hart 启动、可写/只读 ext4、文件表、线程和用户映像等生产路径，没有锁。SMP 到来时必须先用锁保护全局 slab/buddy 交接，再根据目标开发板上的争用与 cache miss 数据决定是否加入 per-CPU magazine；per-CPU cache 会减少锁竞争，但也会增加跨 CPU 回收和空闲页滞留，不能仅凭“通常更快”提前加入。
+当前堆服务单 hart 启动、可写/只读 ext4、文件表、线程和用户映像；共享元数据由本CPU IRQ纪律保护，没有跨核互斥。SMP 接入需要保护全局 slab/buddy 交接，再根据目标开发板上的争用与 cache miss 数据决定是否加入 per-CPU magazine；per-CPU cache 会减少锁竞争，但也会增加跨 CPU 回收和空闲页滞留，不能仅凭“通常更快”提前加入。
 
 ## 多级页表怎样翻译地址？
 
@@ -489,3 +592,41 @@ MM record 的引用、VMA、文件/ELF 后备 pin、驻留来源和退出清理�
 `include/arch/context.h` 同样提供构建期 IRQ 绑定；RV 仍使用保存/恢复 SIE，
 不把名称中立化当成 SMP 互斥。聚焦重建为 `make test-allocator-preemption-host
 test-mm-riscv test-vma-riscv test-uaccess-riscv`。这一分离尚不构成 LA 用户态交付。
+
+
+### 阶段A组合收口（2026-10-09）
+
+`main@4ae474a`的allocator功能验收覆盖4/16KiB工作量、每种页参数10000次owner模型、
+22种fatal、实际函数边界抢占和COST23项解析；CI/程序清单host fixture分别12/31项。
+宿主慢启动与guest库路径污染的原因和已修复契约见[CI模块](../modules/continuous-integration.md)。
+
+RV完整架构/scale、真实musl/pthread、glibc五形态、1366 ABI及生产栈通过，启动核对
+512MiB/1GiB/16GiB的新metadata和页表资源。LA核心/平台/运行时/设备组合、根盘/OOM、
+guard、FP/SIMD/信号、动态TLS、glibc、1366 ABI与生产栈通过。原BusyBox/libc-test229项
+在RV/LA×512MiB/1GiB各自全部完成同ELF Linux对照；网络、TTY/PTY、随机、RTC和退出回收通过。
+
+RV另通过暂扣I/O、部分完成/flush/reset、双盘FIFO/RR、NBD及DELETE/WAL完整恢复。
+DELETE写故障39、41–44和WAL19未命中，仅按提交后的cut核验，不计作EIO命中。
+正常退出恢复预热页/堆/栈/设备baseline；故意注入失败mount或未确认DMA则保留真实owner。
+这些是单CPU证据，不证明跨核同步或LA全断电恢复已交付。
+
+固定Linux为`references/linux@f4cdf7ca9a1fdcca413157df19753f388a5a224e`。RV执行器为QEMU11.1.2，
+LA为`references/qemu@84f07211cc5b4fc6a371559bf8a5de4fb068e648`加既有RTC补丁；
+产物身份见下表和[匹配时间](cost-baseline.md#buddy-森林匹配时间2026-10-09)。
+
+<details>
+<summary>组合验收产物身份（SHA-256）</summary>
+
+| 产物 | SHA-256 |
+|---|---|
+| RV功能核 | `60ac7f2fb0cfcb271dc5e408f7d431080380a71e2be6d8403b2f8ab9173963f1` |
+| LA功能核 | `752be595d409694bcbd16371bc1fb2d89ea4d1e7eabbe74ac71c86771fc4e923` |
+| LA QEMU | `63dcacc82765ba4a18cfb623410d19fd462bd3755c06cc81cd73caaf226bc0b9` |
+| LA RTC补丁 | `a2951479d2f45afed8ffc9e69ed4a44efd7174b00a688b03d5d786332515cf2d` |
+
+RV功能核的PT_LOAD映射/内容与匹配新OFF核一致；ELF文件SHA差异来自调试信息。
+输入和命令归[CI模块](../modules/continuous-integration.md)及各模块聚焦入口；通用fixture
+使用`INIT_CONFIG=config/init.json`。未重新执行托管CI，已核对运行产物随后按prune流程清理，
+可复用缓存和未关闭现场保留。
+
+</details>

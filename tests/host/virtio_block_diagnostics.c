@@ -541,3 +541,6 @@ int main(int argc, char **argv)
     }
     return 0;
 }
+
+#include "wait_boundary.h"
+HOST_WAIT_BOUNDARY(, kernel_scheduler_block_current)

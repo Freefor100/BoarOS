@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -40,6 +41,13 @@ def compiler_identity(compiler):
             'target': capture([str(path), '-dumpmachine'])}
 
 
+def require_user_network(binary):
+    result = subprocess.run([str(binary), '-machine', 'virt', '-netdev', 'help'], cwd=ROOT,
+                            capture_output=True, text=True, timeout=10)
+    if result.returncode or not re.search(r'^\s*user\s*$', result.stdout + result.stderr, re.M):
+        raise SystemExit(f'{binary}: missing user network backend; install libslirp-dev and configure a fresh QEMU cache')
+
+
 def prepare(args):
     source, revision = fixed_repository('qemu' if args.component == 'tools' else 'linux')
     profile=getattr(args,'profile','core')
@@ -55,11 +63,17 @@ def prepare(args):
     if recorded and {key: value for key, value in recorded.items()
                      if key not in ('configuration_sha256','image_sha256')} != identity:
         raise SystemExit(f'{directory}: cache identity changed; use a fresh build directory')
+    image = directory / ('qemu-system-loongarch64' if args.component == 'tools' else 'vmlinux')
+    if recorded and (not image.is_file() or
+            hashlib.sha256(image.read_bytes()).hexdigest() != recorded.get('image_sha256')):
+        # 先拒绝损坏产物，不能让后续 make 给损坏文件重新登记合法身份。
+        raise SystemExit(f'{directory}: cached image identity mismatch; use a fresh build directory')
     if args.component == 'tools':
         if recorded is None or not (directory / 'build.ninja').exists():
             subprocess.run([str(source / 'configure'), *QEMU_OPTIONS], cwd=directory, check=True)
         subprocess.run(['ninja', '-C', str(directory), f'-j{args.jobs}',
                         'qemu-system-loongarch64'], check=True)
+        require_user_network(image)
         print(capture([str(directory / 'qemu-system-loongarch64'), '--version']))
     else:
         if not compiler['target'].startswith('loongarch64'):

@@ -3,7 +3,7 @@
 #include <stdint.h>
 
 void riscv_kernel_thread_trampoline(void);
-void riscv_trap_return(void);
+void riscv_user_thread_trampoline(void);
 
 enum riscv_context_status riscv_context_init(
     struct riscv_switch_context *context,
@@ -53,7 +53,7 @@ enum riscv_context_status riscv_context_init_user(
         return RISCV_CONTEXT_STATUS_INVALID_ARGUMENT;
     }
 
-    result.ra = (uintptr_t)riscv_trap_return;
+    result.ra = (uintptr_t)riscv_user_thread_trampoline;
     result.sp = trap_frame_pointer;
     result.tp = (uintptr_t)thread_pointer;
     for (index = 0U; index < 12U; index++) {

@@ -163,6 +163,7 @@ def main(default_arch='riscv'):
     parser.add_argument('--platform',choices=('Linux','BoarOS'),action='append');parser.add_argument('--mode',choices=('n','a','d','s'),action='append')
     parser.add_argument('--timeout',type=float,default=60)
     parser.add_argument('--output',type=Path)
+    parser.add_argument('--memory',choices=('512M','1G'),action='append')
     parser.add_argument('--marker',action='append',default=[])
     parser.add_argument('--force-device',action='store_true',help='keep hardware present for injected construction-failure probes')
     args=parser.parse_args();profile=PROFILES[args.arch]
@@ -173,7 +174,7 @@ def main(default_arch='riscv'):
     transports=['modern'] if args.arch=='loongarch' else ['legacy','modern'] if args.transport=='all' else [args.transport]
     platforms=args.platform or (['Linux','BoarOS'] if args.arch=='loongarch' else ['BoarOS'])
     for platform in platforms:
-        for memory in (('512M','1G') if args.arch=='loongarch' else ('512M',)):
+        for memory in args.memory or (('512M','1G') if args.arch=='loongarch' else ('512M',)):
             for transport in transports:
                 for mode in args.mode or ('n','a','d','s'):run(args,profile,platform,memory,transport,mode)
     print(f'RNG results and input identities: {args.output}',flush=True)
