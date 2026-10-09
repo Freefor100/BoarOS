@@ -1937,3 +1937,11 @@ test-sleep-lock-host:
 	build/host/sleep-lock
 
 test-riscv: test-wait-riscv
+
+.PHONY: test-scheduler-handoff-host
+test-scheduler-handoff-host:
+	@mkdir -p build/host
+	cc -std=gnu11 -O2 -Wall -Wextra -Werror -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -Itests/host/sync -idirafter include tests/host/sched_handoff.c kernel/cpu.c kernel/raw_lock.c kernel/sched/scheduling.c kernel/sched/policy.c kernel/sched/runqueue.c -Wl,--gc-sections -o build/host/scheduler-handoff
+	build/host/scheduler-handoff
+
+test-riscv: test-scheduler-handoff-riscv

@@ -69,6 +69,12 @@ OTHER 保留 100 Hz tick 轮转，内核 worker 使用 OTHER。FIFO/RR 的用户
 
 ready 节点独立于 blocked/cleanup 链。全局优先级排序双链保留遍历视图，100 个等级各存 head/tail；同级插入、OTHER 尾追加、删除和选取均 O(1)，新增空的中间等级最多扫描 99 个等级，不扫描任务数。RT 被节流时只取 OTHER 队首；没有 OTHER 则 idle，不能借机运行已耗尽的 RT。
 
+FIFO yield和RR到期只轮转同级候选；未节流且没有同级竞争者时，不能把CPU下让给低优先级任务。
+旧任务仍on_cpu而暂未入队，决策必须显式比较当前与ready候选，不能把“有next”当作可轮转。
+`test-scheduler-handoff-host`直接链接生产决策、队列/策略/raw，覆盖低/同/高优先级、节流和idle；
+`test-scheduler-handoff-riscv/test-scheduler-handoff-loongarch`在512MiB/1GiB以同ELF对照固定Linux，
+高优先级yield/跨RR片时低任务计数保持0，随后高任务阻塞才允许低任务前进并正常回收。
+
 退出在发布 completion、清 TID 并唤醒等待者后，若已注册 cleanup worker，按同一
 ready 策略直接选择下一任务。退出栈只切离，回收仍由 worker 或 join owner 在可信栈
 执行；不能强制返回 idle，使已经 ready 的 joiner 在 `wfi` 中等待下一次 timer。
@@ -224,14 +230,14 @@ pipe/proc状态双握手确认，覆盖同期限、提前信号、默认信号�
 
 ## SMP前置的同步与等待契约（2026-10-09）
 
-当前生产实现仍为单CPU。CPU本地状态与raw原语已接入，可睡眠锁和等待交接尚无跨核保护。四种职责必须分开：
+当前生产实现仍为单CPU。等待/就绪发布和对象内部资格已有raw互斥，业务状态尚未完成跨核保护。四种职责必须分开：
 
 | 机制 | 保护与限制 | 当前状态 |
 |---|---|---|
 | 本地IRQ控制 | 保存/恢复本CPU中断；单CPU短元数据发布，允许显式切换 | arch IRQ与KERNEL_IRQ_SCOPE已有 |
 | 抢占/迁移控制 | CPU本地指针借用和current稳定，不提供共享对象互斥 | cpu.h的嵌套深度；timer延后切换，既有安全点消费请求 |
 | 跨核raw短锁 | 共享状态和内存序；不得持锁阻塞、I/O或调用会等待的分配路径 | raw_lock.h的32位acquire/release原子字、CPU guard链与rank/key序 |
-| 可睡眠对象锁 | 任务guard、rank/key、资格交接和对象owner跨睡眠存活 | sync.c已有单CPU实现，内部仍靠单CPU IRQ纪律 |
+| 可睡眠对象锁 | 任务guard、rank/key、资格交接和对象owner跨睡眠存活 | 内部raw30→调度raw40；业务数据仍由guard或原单CPU纪律负责 |
 
 内核tp仍指向任务，架构前缀之后的CPU关联供当前CPU查询；current与need_resched由CPU记录持有。
 启动任务与idle显式绑定，RV采用固件hart ID并在高地址重定位后重绑，LA读取CPUID CSR。
@@ -242,26 +248,23 @@ bootstrap I/O上下文与任务I/O上下文分开，任务guard和回收深度�
 RV scheduler cases分别验证idle和两个同级OTHER任务的延期请求，恢复后peer必须进展并归还全部owner。
 `test-sync-riscv/test-sync-loongarch`在512M/1G运行真实原子/IRQ正例，以及raw内block/yield/退出/睡眠锁的fatal。
 runner从Make接收实际构建目录，COST入口不能借用普通产物；host保护目录覆盖和缺失输入不回退。
-这些结果不证明全局运行队列、等待、MM或设备已经具备SMP安全性。
+这些结果不证明调度策略/任务索引、共享MM或设备业务已经具备SMP安全性。
 
 `kernel_rwlock`的栈waiter由阻塞调用持有；授予资格先于wake，新任务不得抢走已授予
 资格。持有guard期间锁对象不能移动/销毁；现有等待不可中断。未来取消/超时要明确
 撤销注册与未消费资格的owner，不能先释放调用栈再摘队。raw锁只可保护短队列修改，
 释放后再park；不能把当前整个IRQ-off acquire机械包进raw spinlock。
 
-wait queue借用node，node的task/callback/context由调用者保持。当前条件检查、登记、
-BLOCKED发布和切走依靠同一CPU的IRQ关闭；返回必须重查条件。queue没有自动destroy，
-销毁资源前须阻止新登记、唤醒/取消并join全部借用者，清空注册且wake遍历结束。
-SMP须在同一共享保护下检查条件并登记，然后释放保护、提交阻塞；期间wake要留下可
-消费状态。资格/READY只能授予一次，同一任务不得被两个CPU同时运行。timeout、signal
-取消和对象销毁须争用同一登记owner，callback不能在短wake区睡眠。
+登记、通知、阻塞和切换完成由本模块的短调度域保护；条件及task/callback/context的
+业务owner仍由调用者保持。完整SMP须把条件保护、MM页存活、对象最后释放与这套交接连接，
+不能只移植等待原语就撤掉业务IRQ纪律。当前销毁入口与借用规则见本文开头。
 
 已核对的IRQ-off显式切换与owner边界如下；这是调用盘点，不是跨核安全证明：
 
 | 调用位置 | 切换/工作 | 睡眠期间的owner |
 |---|---|---|
-| kernel/sched/sync.c acquire | 等待资格，block_current | 调用栈waiter、任务io_context及锁对象 |
-| kernel/sched/wait.c block_current | 登记queue、deadline、BLOCKED后switch | task元数据/栈；queue资源由调用者保持 |
+| kernel/sched/sync.c acquire | 对象raw内准备token，锁外park | 调用栈waiter、任务io_context及锁对象 |
+| kernel/sched/park.c prepare/park | 仲裁登记与BLOCKED发布，锁外switch | task元数据/栈；queue资源由调用者保持 |
 | kernel/physical_page.c allocate_order | EMPTY后回收/pressure_wait | 不持buddy半成品；回调固定cache group，深度在任务context |
 | fs/page_cache.c lookup/get/readahead/writeback/pressure | loading、后台work、代次进展等待 | entry users、cache/runtime或group pin，停止先join |
 | drivers/virtio/block.c | 等descriptor/span/request完成与reset | request token及业务buffer；DMA停止未确认不释放 |

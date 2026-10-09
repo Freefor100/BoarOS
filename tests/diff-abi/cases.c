@@ -195,7 +195,9 @@ void abi_main(const unsigned long *initial_stack)
             abi_file_lock_exec_probe((unsigned)(argument[index] - '0'));
     }
     text("ABI BEGIN 1"); flush();
-#ifdef ABI_SYNC_ONLY
+#ifdef ABI_SCHED_HANDOFF_ONLY
+    abi_sched_handoff_cases();
+#elif defined(ABI_SYNC_ONLY)
     abi_sync_cases();
 #else
     abi_path_only_cases();

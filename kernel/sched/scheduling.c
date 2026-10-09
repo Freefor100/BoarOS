@@ -126,8 +126,10 @@ enum kernel_scheduler_status scheduler_reschedule(int rotate_other, int voluntar
                          next->scheduling.priority > current->scheduling.priority);
     int rotate = voluntary || expired ||
                  (rotate_other && current->scheduling.policy == KERNEL_SCHED_OTHER);
+    /* 当前任务尚未入队；yield/片尾只可轮转同级，不能把低优先级当成替代者。 */
+    int same_priority = next && next->scheduling.priority == current->scheduling.priority;
     if (expired) kernel_sched_policy_rotate(&current->scheduling);
-    if (!throttled && !higher && !(rotate && next)) {
+    if (!throttled && !higher && !(rotate && same_priority)) {
         kernel_raw_lock_release(&guard);
         scheduler_rearm_timer();
         return KERNEL_SCHEDULER_STATUS_OK;

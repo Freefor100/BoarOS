@@ -28,8 +28,11 @@ host执行显式使用 `os.defpath` 和空库路径，case显式环境仍有最�
 | LoongArch original glibc 2.42 and SQLite | 原五形态 GNU 消费者，以及静态/动态 SQLite DELETE/WAL、多进程和独立重启 |
 
 allocator host组包含CPU/raw、4/16 KiB真实线程并发、非法owner、抢占与有界工作量。
+同组的`test-wait-host/test-sleep-lock-host`直接链接生产等待和RW内部资格实现，
+用握手覆盖提前wake、单次仲裁、借用/close/destroy以及16节点批次边界。
 RV完整门禁和LA cpu-state组运行`test-sync-riscv/test-sync-loongarch`：原生CPU/原子正例及
 raw内禁止阻塞的入口反例。runner接收实际构建目录；COST构建不读取普通目录，缺失产物不回退。
+两侧另运行`test-wait-riscv/test-wait-loongarch`，核对512MiB/1GiB真实首次/恢复/退出切换及可信栈回收。
 `test-platform-profile-host`保护网络/RNG的显式RAM选择及环境参数错误；RV glibc五形态
 固定执行双RAM。环境fixture可通过`QEMU_MEMORY=1G make test-environment-riscv`选择配置。
 
