@@ -432,11 +432,34 @@ static void test_legal_release_is_silent(void)
     assert(console_characters == 0U);
 }
 
+static void test_retired_payload_is_not_owner(void)
+{
+    uint64_t page;
+    uint32_t order = UINT32_MAX;
+    void *pointer;
+    setup();
+    uint64_t initial = physical_page_available(&allocator);
+    assert(physical_page_allocate_order(&allocator, 1, &page) == 0);
+    struct test_page_metadata *metadata = (void *)allocator.metadata;
+    /* 非活动尾载荷不属于权威；伪造完整head hint，活动树节点仍须拒绝它。 */
+    metadata[test_page_index(page + BOAROS_PAGE_SIZE)] = metadata[test_page_index(page)];
+    metadata[test_page_index(page + BOAROS_PAGE_SIZE)].order = 0;
+    assert(physical_page_resolve(&allocator, page + BOAROS_PAGE_SIZE, &pointer) == 0);
+    assert(pointer == (void *)(uintptr_t)(page + BOAROS_PAGE_SIZE));
+    assert(physical_page_allocation_order(&allocator, page + BOAROS_PAGE_SIZE, &order) == PHYSICAL_PAGE_STATUS_INVALID);
+    assert(order == UINT32_MAX);
+    assert(physical_page_allocator_audit(&allocator) == 0);
+    assert(physical_page_release_order(&allocator, page, 1) == 0);
+    assert(physical_page_available(&allocator) == initial);
+    assert(physical_page_allocator_audit(&allocator) == 0);
+}
+
 int main(void)
 {
     struct rlimit limit = {0, 0};
     assert(setrlimit(RLIMIT_CORE, &limit) == 0);
     test_legal_release_is_silent();
+    test_retired_payload_is_not_owner();
     for (unsigned int i = 0; i < 22; i++) {
         int output[2];
         char diagnostic[2048];

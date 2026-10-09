@@ -129,7 +129,7 @@ SIGILL与buddy guard；另覆盖高阶acquire、引用溢出/internal/零引用�
 不是直接删除全尾检查后继续信任旧表示。
 
 新 `test-allocator-cost-host` 的准备全部用公开API：先保留B页块、耗尽其余页，再释放
-该块，下一次order0只能split它。4 KiB与16 KiB各自得到下表，结束后释放全部准备
+该块，下一次order0只能split它。初版500b473的4 KiB与16 KiB各自得到下表，结束后释放全部准备
 owner并恢复finalize后基线；树深度H来自对齐的2B页RAM，所以H为log2(B)+1。
 
 |B|分配逻辑检查|释放逻辑检查|分配/释放逻辑重写|
@@ -141,13 +141,15 @@ owner并恢复finalize后基线；树深度H来自对齐的2B页RAM，所以H为
 
 新计数含根、树、head和order入口（含插入时空入口判断）；旧表只统计尾检查/逐页重写，不能把两表当相同
 微操作或据此换算吞吐倍数。结构证明是旧O(B)路径退出热区，新路径的相关树/邻居
-检查满足规模上界；单层split/coalesce写入各不超过7记录，finalize与显式全审计允许O(P)。
+检查满足规模上界；单层split/coalesce写入各不超过7记录。finalize与显式全审计允许
+全量树/链核对，不属于热路径；链成员的owner路径检查也有成本，不承诺审计总时间O(P)。
 两个页参数各10000次随机owner操作每步审计，另核对多range/洞、bootstrap导入、
 映射失败/无metadata空间不发布、高阶内部尾页页首解析与非对齐拒绝。
 
 本阶段已通过allocator release/preemption/COST host及RV page/heap/MM/VMA/uaccess/
 context/scheduler窄回归，LA两种RAM真实内存ELF、fault/OOM回收和同ELF Linux对照通过。
-这是表示与窄回归证据；完整组合及36次匹配时间对照另行记录，尚不能关闭阶段A。
+以上是初版500b473的表示与窄回归证据；当时完整组合与36次匹配尚未完成，不能
+据它关闭阶段A。后续最终结果见[本轮收口](#阶段a组合收口2026-10-09)。
 
 ### 单核纪律与跨核同步的区别
 
@@ -593,3 +595,65 @@ release/acquire/audit fatal，tail refcount仍fatal，不能把引用错误降�
 查询在单根模型下检查不超过10，独立于H。最终36次匹配时间仍有13.6%–22.4%默认
 匿名生命周期回退；[完整输入/时间与观测开销](cost-baseline.md#buddy-森林匹配时间2026-10-09)
 解释该安全/工作量取舍，不用宿主计数取代客户机吞吐或IRQ尾延迟。
+
+
+### 阶段A组合收口（2026-10-09）
+
+这次执行区别于外部cfae103审查和41b5947规划：宿主CI12例、程序清单host31例，
+4/16KiB新成本gate及每种页参数10000次独立owner模型、22种fatal反例和实际函数边界
+抢占、COST23解析/模型测试全部通过。额外把真实allocated头的16字节载荷复制到
+inactive高阶尾页：resolve仍找到高阶owner、allocation_order拒绝尾页；不检查活动
+树节点的独立错误变体在此失败。未修改生产源码作故障变体，不与真实QEMU结果混算。
+
+RV `test-riscv`及scale、真实musl/pthread、glibc五形态、1366 ABI和生产栈检查通过；
+完整启动门禁核对512MiB/1GiB/16GiB的新metadata与页表资源。LA核心、平台、运行时
+和extended各组通过，覆盖两种RAM的真实ELF、OOM/构造回滚、根盘/checksum、guard、
+FP/SIMD/信号、动态TLS、glibc五形态、SQLite DELETE/WAL、1366 ABI和生产栈。
+固定BusyBox/libc-test229项在RV/LA×512MiB/1GiB各自全部完成并通过同ELF Linux对照；
+真实终端/PTY应用、外部Ethernet、随机/环境、设备故障回滚及RTC模型/告警通过。
+
+共用host CI八组全部通过，另覆盖block/record-lock/NBD/PID/sched-policy/lwext4完整
+恢复与COST。RV实际存储验证包括暂扣/部分完成/flush/reset/压力睡眠、双盘隔离、
+FIFO/RR混合负载、SQLite NBD、多进程WAL/重启、DELETE与WAL完整恢复矩阵。DELETE
+写故障序号39、41–44及WAL19没有触发，按已确认提交后的cut恢复核验，不能计作EIO
+命中；其余注入和丢失/重排扇区cut按原runner检查，不补写未发生事件为通过。
+正常退出检查新预热baseline的页/堆/任务栈和根盘/设备owner，故意注入失败mount与
+未确认DMA的场景则检查真实owner保留，不要求强行归零。
+
+本轮最终RV功能核文件SHA256为60ac7f2fb0cfcb271dc5e408f7d431080380a71e2be6d8403b2f8ab9173963f1；
+其PT_LOAD映射/内容与匹配时间新OFF核完全一致（文件SHA差异来自调试信息）。LA功能
+核SHA256为752be595d409694bcbd16371bc1fb2d89ea4d1e7eabbe74ac71c86771fc4e923。
+RV实际QEMU11.1.2身份见成本记录；LA实际QEMU11.1.0基于references/qemu commit
+84f07211cc5b4fc6a371559bf8a5de4fb068e648，RTC补丁SHA256
+ a2951479d2f45afed8ffc9e69ed4a44efd7174b00a688b03d5d786332515cf2d，
+二进制SHA256为63dcacc82765ba4a18cfb623410d19fd462bd3755c06cc81cd73caaf226bc0b9。
+Linux对照为references/linux commit f4cdf7ca9a1fdcca413157df19753f388a5a224e，各profile
+单独固定。未执行远程CI，也未将QEMU结果外推实板、SMP、巨量order31或硬实时。
+
+独立整包审查覆盖41b5947以来全部代码和SMP契约，无Critical/Important运行期问题；
+作者集中修正文档证据链接/版本标签，再运行受影响成本、fatal、抢占与解析门禁。
+默认典型性能回退已明确报告，阶段A交付有界元数据与同步前置合同，下一阶段B才实现
+跨核短锁、等待交接、CPU本地/current和生命周期同步。GDT/resident范围优化仍单列。
+
+可重建命令均显式使用通用init配置；各宿主/客体suite保持自己的日志、退出和owner
+验证，不能只根据顶层进程exit0推导所有测例或历史事故已关闭。
+
+```sh
+make test-allocator-cost-host test-allocator-release-host test-allocator-preemption-host test-cost-host
+python3 -B tests/ci/run.py --arch host --suite host
+make INIT_CONFIG=config/init.json test-riscv test-scale-riscv test-userland-riscv test-glibc-riscv test-diff-abi-riscv test-stack-usage
+python3 -B tests/root-shutdown-riscv.py
+make INIT_CONFIG=config/init.json test-root-multi-block-riscv test-io-sleep-riscv test-multi-disk-io-riscv test-sqlite-rollback-riscv test-sqlite-wal-riscv test-sqlite-nbd-riscv test-sqlite-recovery-riscv test-sqlite-wal-recovery-riscv test-sqlite-recovery-matrix-riscv test-sqlite-wal-recovery-matrix-riscv test-record-lock-riscv test-sqlite-second-disk-riscv
+python3 -B tests/ci/run.py --arch riscv --suite platform
+python3 -B tests/ci/run.py --arch riscv --suite extended
+python3 -B tests/ci/run.py --arch loongarch --suite core
+python3 -B tests/ci/run.py --arch loongarch --suite platform
+python3 -B tests/ci/run.py --arch loongarch --suite runtime
+python3 -B tests/ci/run.py --arch loongarch --suite extended
+```
+
+
+结果核对后已预览并执行make prune-build，移除104个已收口运行目录/日志/镜像路径。
+匹配内核及用户ELF缓存、工具链、运行时、固定Linux/QEMU缓存保留；已有OSComp与
+GDT未关闭现场显式keep，不删除其worktree。临时执行账本/候选变体随本轮运行目录
+清理，永久结论、固定身份和重建命令记录于本页及成本记录。

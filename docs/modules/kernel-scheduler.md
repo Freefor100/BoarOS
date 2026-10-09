@@ -187,3 +187,46 @@ C4 另计 queue validation 次数、shape/thread检查、deadline到期处理数
 pipe/proc状态双握手确认，覆盖同期限、提前信号、默认信号、取消和对象复用。
 到期处理数必须与timeout数量一致且不随无期限blocked总数增长；队列shape检查只查头尾，
 计数与索引弹出分开，不将它误报成全队列扫描。
+
+
+## SMP前置的同步与等待契约（2026-10-09）
+
+本轮只明确接口与调用边界，不引入跨核锁、抢占/迁移控制或第二核。四种职责必须分开：
+
+| 机制 | 保护与限制 | 当前状态 |
+|---|---|---|
+| 本地IRQ控制 | 保存/恢复本CPU中断；单CPU短元数据发布，允许显式切换 | arch IRQ与KERNEL_IRQ_SCOPE已有 |
+| 抢占/迁移控制 | CPU本地指针借用和current稳定，不提供共享对象互斥 | 无独立跨核契约实现 |
+| 跨核raw短锁 | 共享状态和内存序；不得持锁阻塞、I/O或调用会等待的分配路径 | 待阶段B实现 |
+| 可睡眠对象锁 | 任务guard、rank/key、资格交接和对象owner跨睡眠存活 | sync.c已有单CPU实现，内部同步待B |
+
+`kernel_rwlock`的栈waiter由阻塞调用持有；授予资格先于wake，新任务不得抢走已授予
+资格。持有guard期间锁对象不能移动/销毁；现有等待不可中断。未来取消/超时要明确
+撤销注册与未消费资格的owner，不能先释放调用栈再摘队。raw锁只可保护短队列修改，
+释放后再park；不能把当前整个IRQ-off acquire机械包进raw spinlock。
+
+wait queue借用node，node的task/callback/context由调用者保持。当前条件检查、登记、
+BLOCKED发布和切走依靠同一CPU的IRQ关闭；返回必须重查条件。queue没有自动destroy，
+销毁资源前须阻止新登记、唤醒/取消并join全部借用者，清空注册且wake遍历结束。
+SMP须在同一共享保护下检查条件并登记，然后释放保护、提交阻塞；期间wake要留下可
+消费状态。资格/READY只能授予一次，同一任务不得被两个CPU同时运行。timeout、signal
+取消和对象销毁须争用同一登记owner，callback不能在短wake区睡眠。
+
+已核对的IRQ-off显式切换与owner边界如下；这是调用盘点，不是跨核安全证明：
+
+| 调用位置 | 切换/工作 | 睡眠期间的owner |
+|---|---|---|
+| kernel/sched/sync.c acquire | 等待资格，block_current | 调用栈waiter、任务io_context及锁对象 |
+| kernel/sched/wait.c block_current | 登记queue、deadline、BLOCKED后switch | task元数据/栈；queue资源由调用者保持 |
+| kernel/physical_page.c allocate_order | EMPTY后回收/pressure_wait | 不持buddy半成品；回调固定cache group，深度在任务context |
+| fs/page_cache.c lookup/get/readahead/writeback/pressure | loading、后台work、代次进展等待 | entry users、cache/runtime或group pin，停止先join |
+| drivers/virtio/block.c | 等descriptor/span/request完成与reset | request token及业务buffer；DMA停止未确认不释放 |
+| net/ethernet.c worker；net/socket.c协议入口 | IRQ关闭下NIC/串行lwIP批次，末尾重查后yield/block | root借设备，worker持网络；TX/RX loan直到归还/停DMA |
+| mm/mm.c文件fault | 源I/O可显式睡眠，恢复后重查 | 来源操作pin、VMA代次和候选页，失败准确回收 |
+
+阶段B的强制交错须覆盖wake发生于检查前、登记后、释放保护后/park前；timeout和cancel
+与grant竞争；destroy与callback遍历；拒绝raw锁下阻塞；每种交错不能漏wake、双授予、
+重复运行或使用已销毁队列。原单CPU测试只作为退化配置，不能替代真实多CPU内存序。
+固定依据为本地references/linux/Documentation/locking/locktypes.rst，commit
+f4cdf7ca9a1fdcca413157df19753f388a5a224e；lwIP raw串行边界见references/lwip/doc/doxygen/main_page.h（pitfalls/multithreading），
+commit77dcd25a72509eb83f72b033d219b1d40cd8eb95。实现依赖只在[路线图](../goals.md#p6b-锁等待与中断规则)维护。

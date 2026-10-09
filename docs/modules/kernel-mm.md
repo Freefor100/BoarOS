@@ -258,3 +258,29 @@ PROT_NONE、非当前 MM、尾页、关闭 fd、unlink、O_TRUNC 与重新增长
 `make test-cost-riscv COST_CASE=mprotect` 使用固定一页目标和16/64/256无关VMA、
 0/16/64MiB文件驻留页，三个启动副本；权限拒绝和洞窗口要求PTE访问为0。
 OOM/split/fork 由 vma/scale/ABI 组合回归继续保护。
+
+
+## SMP前置的用户复制与回收契约（2026-10-09）
+
+`kernel_mm_lookup`给出PTE快照，`physical_page_resolve`验证allocated owner并返回直接
+映射指针；两者没有取得覆盖复制阶段的额外页引用。当前syscall/缺页链依靠单CPU
+IRQ关闭纪律，文件fault睡眠前固定来源，恢复后重查VMA代次、PTE/COW和权限。
+本轮仅把这个边界写到mm/uaccess接口，不增加运行期pin或跨核保护，也不把潜在SMP
+交错声称为已经复现的单CPUUAF。
+
+允许CLONE_VM线程跨核前，必须在同一MM保护下查找映射并取得访问pin，不能在两步
+之间被munmap释放/复用。fault睡眠后重新定位VMA/PTE/权限/COW并处理过期候选；
+pin只保证物理页存活，不能代替权限许可点。后续实现须定义片段复制与mprotect返回
+的交接关系；失败返回精确已复制前缀，不能把未复制片段算成功。
+
+撤映射、降权、文件truncate或COW替换发布之后，须确定所有活动CPU及并发切换者，
+完成远程TLB失效确认，才可归还旧页、页表和映射owner。等待远核完成时不能持有其
+所需的MM raw锁；未确认时由明确延期回收owner保留页，不能把超时当作已停止使用。
+当前RV SFENCE.VMA、LA INVTLB只完成本CPU失效，本轮没有远程完成协议。
+
+后续强制交错以握手控制顺序：lookup/pin↔munmap/复用；COW发布↔并发写/退出；
+mprotect降权↔另一核访问；文件fault↔truncate/写回；MM切换↔TLB目标集合与回收。
+SMP共享MM、uaccess、活动CPU和TLB完成必须作为一个单元验收，详见[路线图](../goals.md#p6c-tlb-完成与页回收)。
+依据为本地references/linux/arch/riscv/include/asm/tlbflush.h及arch/riscv/mm/tlbflush.c，
+commit f4cdf7ca9a1fdcca413157df19753f388a5a224e；这里仅使用其本地/远程失效区别，
+不声称BoarOS已实现Linux的全部页pin接口或复制并发语义。

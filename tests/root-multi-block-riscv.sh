@@ -48,8 +48,11 @@ run_boot()
         tail -n 100 "$output" >&2
         exit 1
     fi
-    if [ "$(grep -cxF "$marker" "$output" || true)" -ne 1 ] ||
-       [ "$(grep -cE '^BoarOS: PID 1 exited status=0x2a pages=0x[1-9a-f][0-9a-f]* heap-live=0x0; shutting down$' "$output" || true)" -ne 1 ]; then
+    # TTY的ONLCR可产生CRLF；只规范行末，原始串口日志保留供失败定位。
+    report="$output.lf"
+    sed 's/\r$//' "$output" > "$report"
+    if [ "$(grep -cxF "$marker" "$report" || true)" -ne 1 ] ||
+       [ "$(grep -cE '^BoarOS: PID 1 exited status=0x2a pages=0x[1-9a-f][0-9a-f]* heap-live=0x0; shutting down$' "$report" || true)" -ne 1 ]; then
         tail -n 100 "$output" >&2
         exit 1
     fi
@@ -57,12 +60,12 @@ run_boot()
     /^BoarOS: block device=0xfc00 irq=0x[1-9a-f][0-9a-f]*$/ {first++; a=$4}
     /^BoarOS: block device=0xfc10 irq=0x[1-9a-f][0-9a-f]*$/ {second++; b=$4}
     END {exit !(first == 1 && second == 1 && a != b)}
-    ' "$output"
-    if grep -qE 'BoarOS: (root boot error|fatal trap|root finish failure|block timeout)' "$output"; then
+    ' "$report"
+    if grep -qE 'BoarOS: (root boot error|fatal trap|root finish failure|block timeout)' "$report"; then
         cat "$output" >&2
         exit 1
     fi
-    python3 "$project_root/tests/check-stack-report.py" "$output"
+    python3 "$project_root/tests/check-stack-report.py" "$report"
     e2fsck -fn "$second_disk" > "$work_dir/$mode-$phase-fsck.log" 2>&1 || {
         cat "$work_dir/$mode-$phase-fsck.log" >&2; exit 1;
     }

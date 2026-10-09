@@ -50,6 +50,10 @@ enum kernel_mm_cleanup_stage {
     KERNEL_MM_CLEANUP_RECORD,
 };
 
+/* 句柄拥有MM记录引用，lookup返回映射快照而不取得物理页pin。
+ * 当前MM/VMA/PTE及来源发布依赖单CPU IRQ纪律；MM引用不是SMP映射锁。
+ * 后续共享MM并发须把lookup+pin、睡眠后重查、活动CPU/TLB确认与延期回收
+ * 作为同一生命周期协议；仅原子化MM/页refcount不足以保护查找到引用之间。 */
 struct kernel_mm {
     struct physical_page_allocator *allocator;
     uint64_t record_page_address;

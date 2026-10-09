@@ -104,7 +104,7 @@ static void force_split(unsigned order)
 static void stale_heads(void)
 {
     struct physical_page_allocator allocator;
-    uint64_t pages[256], large;
+    uint64_t pages[256], large, donor;
     setup(&allocator, 256);
     uint64_t initial = physical_page_available(&allocator);
     size_t count = 0;
@@ -112,17 +112,24 @@ static void stale_heads(void)
         assert(physical_page_allocate(&allocator, &pages[count++]) == 0);
     while (count) assert(physical_page_release(&allocator, pages[--count]) == 0);
     assert(physical_page_allocate_order(&allocator, 4, &large) == 0);
+    assert(physical_page_allocate(&allocator, &donor) == 0);
     for (unsigned offset = 1; offset < 16; offset++) {
         uint64_t address = large + offset * BOAROS_PAGE_SIZE;
         void *pointer;
         uint32_t value = UINT32_MAX;
-        /* 每个尾页此前都是独立owner；其过期载荷不能绕过已退休树节点。 */
+        /* 只为故障注入复制固定16字节旧载荷：有效order0头不能替代活动树。
+         * donor仍持原owner，尾载荷属于非权威存储，审计也必须忽略它。 */
+        unsigned char *payload = (void *)allocator.metadata;
+        memcpy(payload + 16 * ((address - physical_base) / BOAROS_PAGE_SIZE),
+               payload + 16 * ((donor - physical_base) / BOAROS_PAGE_SIZE), 16);
         assert(physical_page_resolve(&allocator, address, &pointer) == 0);
         assert(pointer == pool + address - physical_base);
         assert(physical_page_allocation_order(&allocator, address, &value) == PHYSICAL_PAGE_STATUS_INVALID);
         assert(value == UINT32_MAX);
     }
+    assert(physical_page_allocator_audit(&allocator) == 0);
     assert(physical_page_release_order(&allocator, large, 4) == 0);
+    assert(physical_page_release(&allocator, donor) == 0);
     assert(physical_page_available(&allocator) == initial);
     assert(physical_page_allocator_audit(&allocator) == 0);
     assert(munmap(pool, pool_bytes) == 0);

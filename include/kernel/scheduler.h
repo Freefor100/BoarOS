@@ -150,6 +150,9 @@ struct kernel_wait_node;
 typedef void (*kernel_wait_callback_fn)(struct kernel_wait_node *node,
                                         uint32_t reason);
 
+/* 每个node同时最多登记一条queue。队列借用node，调用者保持task/callback/context
+ * 和资源owner存活到摘队且wake遍历完成；注册不自动取得对象引用。
+ * callback在IRQ关闭的wake路径执行，不能阻塞或让后续遍历借用的节点失效。 */
 struct kernel_wait_node {
     struct kernel_task *task;
     kernel_wait_callback_fn callback;
@@ -161,7 +164,9 @@ struct kernel_wait_node {
 
 /*
  * Token identifying a sleep channel.  Resources that can block embed one
- * queue per wake condition and hand it to block/wake.
+ * queue per wake condition and hand it to block/wake. add/remove及条件检查要求
+ * 调用者维持当前单CPU的IRQ保护。没有隐式destroy：资源须先停止新登记，唤醒/
+ * 取消并等待所有注册和借用结束，才可销毁queue。timeout/signal也必须摘掉同一登记。
  */
 struct kernel_wait_queue {
     uint32_t initialized;
@@ -189,6 +194,10 @@ enum kernel_scheduler_status kernel_wait_queue_wake_all(
  * Sleeps until woken through `queue` (NULL = pure timeout sleep) or until
  * `deadline` time-counter ticks elapse (0 = no deadline).  Requires
  * interrupts disabled; the caller must recheck its condition on return.
+ * 条件检查→登记→BLOCKED发布在当前单CPU同一IRQ关闭区；queue由调用者持有。
+ * 后续SMP须在同一保护下检查/登记，再释放raw保护并提交park；两者间发生的
+ * wake必须留下可消费的就绪/资格状态，不能丢失、重复授予或重复运行。当前接口
+ * 没有实现该跨核交接，不能持未来raw锁调用本函数。
  */
 enum kernel_scheduler_status kernel_scheduler_block_current(
     struct kernel_wait_queue *queue,
