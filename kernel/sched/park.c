@@ -292,6 +292,7 @@ static int cursor_begin(struct kernel_wait_queue *queue, struct kernel_wait_curs
     /* 唯一任务节点的通知全在raw内，不跨解锁借用；回调仍走游标寿命。 */
     if (direct_notification && queue->registrations == 1 && !queue->head->callback) {
         struct kernel_wait_node *node = queue->head;
+        if (node->queue != queue || node->borrow_owner != queue) __builtin_trap();
         if (node->task && node->generation) {
             struct kernel_wait_token token = {node->task, node->generation};
             kernel_wait_notify_locked(&token, KERNEL_WAIT_WOKEN);

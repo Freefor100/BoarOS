@@ -283,7 +283,7 @@ static void finish_many(void)
 }
 static void owner_failures(void)
 {
-    for (unsigned which = 0; which < 5; which++) {
+    for (unsigned which = 0; which < 6; which++) {
         pid_t child = fork(); assert(child >= 0);
         if (!child) {
             struct kernel_wait_queue queue;
@@ -298,9 +298,15 @@ static void owner_failures(void)
                 struct kernel_wait_token token;
                 kernel_wait_prepare(0, 0, 0, &token);
                 kernel_wait_prepare(0, 0, 0, &token);
-            } else {
+            } else if (which == 4) {
                 struct kernel_wait_token token = {(void *)1, 1};
                 kernel_wait_finish(&token);
+            } else {
+                kernel_wait_queue_remove(&node);
+                struct kernel_wait_token token;
+                assert(kernel_wait_prepare(&queue, 0, 0, &token) == KERNEL_SCHEDULER_STATUS_OK);
+                task.node.borrow_owner = 0;
+                kernel_wait_queue_wake_all(&queue);
             }
             _exit(1);
         }
