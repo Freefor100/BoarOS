@@ -634,26 +634,32 @@ io-sleep 超时阶段 inflight-ticks/busy-ticks ≈ 8.0（八请求扣满 30 秒
 
 ## buddy 森林匹配时间（2026-10-09）
 
-旧核来自main@41b5947，新核来自500b473加本轮查询/观测改进。初始森林已消除单页
-O(B)反例，但第一次36启动中默认OFF匿名工作慢27%–46%；根目录只校验候选几何、
-复用一次PA/owner查找、深度已证明的树读去掉重复边界和一次提交三个COST计数后，
-第二轮36启动仍慢14%–28%。继续调查确认页表/uaccess频繁只读解析会重复完整祖先链。
-人已选择活动块头+树节点快路径，祖先损坏发现时点移到修改/完整审计；不是按程序
-或页地址特判。释放、分配和增引用的完整路径不变，旧尾hint回退到树查找。
+森林消除了单页O(B)最坏路径，但默认匿名生命周期仍比旧核慢13.6%–22.4%，
+不能称为典型吞吐提升。旧核为main@41b5947，新核包含500b473森林和8db407b查询/观测改进。
+初版回退为27%–46%；减少重复根/owner校验与集中计数后，再接入活动块头＋树节点的
+只读快路径，缩小了回退。该已确认取舍允许只读查询延后发现祖先损坏，修改/审计仍
+检查完整祖先关系；旧尾hint不能单独成为owner。
 
-最终第三轮36次串行启动为两个case×旧/新/返回旧×ON/OFF×三次独立磁盘。固定
-QEMU11.1.2（二进制SHA256 `5713c546693820d225e87795a14e8177343cb7ac4d9b0610a9e41c7203eb023d`），
-512MiB/单CPU/modern VirtIO/writeback，timebase10MHz，固件SHA256
-`894e2aef99590fc07ec6c60ab00282b8bc5d5d5bb2a1d0c6ada0c52df24274c0`。
-用户编译器为RV GCC16.2.1 20260810及固定musl1.2.5 wrapper；每种case全程使用同一
-ELF。旧/返回旧OFF核SHA256 `c0c47acf07128dc731ba56022e3186499c180aaed10bdfffcf4e915cc2949873`，
-ON `d7afc8ab3c0be934a3e7e9e78ee63f3f14aedd938ba788b74e6c54767507d4dc`；
-新OFF `9e37e5a82c9441195d621ed6410815f8c6e797d2ad39e3159d6fdc71f299479e`，
-ON `4d6fa5b37e92625aedf8c2e2fcef8c3d3aaa99f84073bb9579967f9e9ff9e776`。
-allocator ELF SHA256 `7c8e053111e4a8eee6c237440b09ba0ec105c8bf23708a6610e9c83bc230af0c`，
-latency ELF `248dcb0753256ad49ef68098704699e9088ecb68ccf9e936e7fabc4e1a735946`。
-输入seal、完整snapshot/schema、独立fixture、PID1退出0/heap-live0均核对；原始失败
-pilot不加入正式矩阵。返回旧使用完全相同二进制，避免反向重建改变输入。
+最终36次串行启动为两个case×旧/新/返回旧×ON/OFF×三次独立磁盘，固定
+512MiB/单CPU/modern VirtIO/writeback、10MHz timebase、QEMU11.1.2和RV GCC16.2.1
+20260810＋musl1.2.5 wrapper。每个case使用同一ELF，返回旧复用原冻结核。
+输入seal、完整schema/snapshot、独立fixture及PID1退出0/heap-live0已核对，失败pilot不加入矩阵。
+
+<details>
+<summary>固定测量产物（SHA-256）</summary>
+
+| 产物 | SHA-256 |
+|---|---|
+| QEMU11.1.2 | `5713c546693820d225e87795a14e8177343cb7ac4d9b0610a9e41c7203eb023d` |
+| 固件 | `894e2aef99590fc07ec6c60ab00282b8bc5d5d5bb2a1d0c6ada0c52df24274c0` |
+| 旧/返回旧OFF核 | `c0c47acf07128dc731ba56022e3186499c180aaed10bdfffcf4e915cc2949873` |
+| 旧/返回旧ON核 | `d7afc8ab3c0be934a3e7e9e78ee63f3f14aedd938ba788b74e6c54767507d4dc` |
+| 新OFF核 | `9e37e5a82c9441195d621ed6410815f8c6e797d2ad39e3159d6fdc71f299479e` |
+| 新ON核 | `4d6fa5b37e92625aedf8c2e2fcef8c3d3aaa99f84073bb9579967f9e9ff9e776` |
+| allocator ELF | `7c8e053111e4a8eee6c237440b09ba0ec105c8bf23708a6610e9c83bc230af0c` |
+| latency ELF | `248dcb0753256ad49ef68098704699e9088ecb68ccf9e936e7fabc4e1a735946` |
+
+</details>
 
 下表为OFF三次客户机工作时间中位数，单位ms。小工作受调度相位影响，4KiB复制和
 4KiB改权的返回旧波动明显，不能挑一次值宣称改善。
@@ -700,7 +706,7 @@ buddy调用。1MiB复制的IRQ-off旧83823–84379、新118997–122017；wake-t
 插进TTY快照，故加fflush和真实tcdrain，发生于测量外；严格parser不修补坏原始输出。
 完整旧223项schema显式解析，新字段标不可用，任意缺字段仍失败。
 
-可重建入口如下；旧/新内核须从对应已提交树构建并各冻结ON/OFF，两个用户ELF只编译
+重建上述已记录测量的入口如下；旧/新核各冻结ON/OFF，两个用户ELF只编译
 一次。按old→new→returned-old、OFF→ON、allocator→latency依序各执行replicas3；
 返回旧复用原封存核。各profile输出目录独立，不能并行执行测量。
 
@@ -712,6 +718,6 @@ python3 -B tests/cost-riscv.py --case latency --replicas 3 --kernel KERNEL --ker
 # OFF两种case增加--off；旧identity显式携带固定旧metric_schema。
 ```
 
-最终结论是最坏元数据工作量已受相关路径约束，典型负向观察已定位到仍保留的修改
-验证、根几何查询与观测成本，且未消失。平均吞吐、批量MM的IRQ尾延迟改善继续作为有测量依据的
-后续项目，不为本轮扩大锁、页缓存或调度改造范围。
+最坏元数据工作量已受相关路径约束；典型回退与批量MM的IRQ尾延迟仍在，源码/计数
+解释了保留的修改验证、根几何查询和观测成本，尚未精确分离各项周期份额。
+未解决的成本归[路线图](../goals.md#已知成本与未关闭现场)，不据此宣称平均加速。

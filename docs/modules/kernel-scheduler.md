@@ -191,14 +191,14 @@ pipe/proc状态双握手确认，覆盖同期限、提前信号、默认信号�
 
 ## SMP前置的同步与等待契约（2026-10-09）
 
-本轮只明确接口与调用边界，不引入跨核锁、抢占/迁移控制或第二核。四种职责必须分开：
+当前实现仍为单CPU；跨核锁与抢占/迁移控制尚未接入。四种职责必须分开：
 
 | 机制 | 保护与限制 | 当前状态 |
 |---|---|---|
 | 本地IRQ控制 | 保存/恢复本CPU中断；单CPU短元数据发布，允许显式切换 | arch IRQ与KERNEL_IRQ_SCOPE已有 |
 | 抢占/迁移控制 | CPU本地指针借用和current稳定，不提供共享对象互斥 | 无独立跨核契约实现 |
-| 跨核raw短锁 | 共享状态和内存序；不得持锁阻塞、I/O或调用会等待的分配路径 | 待阶段B实现 |
-| 可睡眠对象锁 | 任务guard、rank/key、资格交接和对象owner跨睡眠存活 | sync.c已有单CPU实现，内部同步待B |
+| 跨核raw短锁 | 共享状态和内存序；不得持锁阻塞、I/O或调用会等待的分配路径 | 未实现 |
+| 可睡眠对象锁 | 任务guard、rank/key、资格交接和对象owner跨睡眠存活 | sync.c已有单CPU实现，内部仍靠单CPU IRQ纪律 |
 
 `kernel_rwlock`的栈waiter由阻塞调用持有；授予资格先于wake，新任务不得抢走已授予
 资格。持有guard期间锁对象不能移动/销毁；现有等待不可中断。未来取消/超时要明确
@@ -224,7 +224,7 @@ SMP须在同一共享保护下检查条件并登记，然后释放保护、提�
 | net/ethernet.c worker；net/socket.c协议入口 | IRQ关闭下NIC/串行lwIP批次，末尾重查后yield/block | root借设备，worker持网络；TX/RX loan直到归还/停DMA |
 | mm/mm.c文件fault | 源I/O可显式睡眠，恢复后重查 | 来源操作pin、VMA代次和候选页，失败准确回收 |
 
-阶段B的强制交错须覆盖wake发生于检查前、登记后、释放保护后/park前；timeout和cancel
+等待交接须覆盖wake发生于检查前、登记后、释放保护后/park前；timeout和cancel
 与grant竞争；destroy与callback遍历；拒绝raw锁下阻塞；每种交错不能漏wake、双授予、
 重复运行或使用已销毁队列。原单CPU测试只作为退化配置，不能替代真实多CPU内存序。
 固定依据为本地references/linux/Documentation/locking/locktypes.rst，commit

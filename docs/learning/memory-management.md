@@ -91,72 +91,46 @@ finalize 需要 O(页数) 初始化，并永久占用每页 16 字节；4 KiB �
 
 ### Buddy 元数据成本核实（2026-10-08）
 
-用户提供的外部审查以 `cfae10338b60e6adf4769938a0b1d16ae94719ee` 为基线。
-本地 `main@774e2dc` 的 `kernel/physical_page.c` 与该提交完全相同，SHA-256为
-`ecee97ce6f0d5d86d613a9b3f4d43a0b36e04785d1fcfb20b813053d4cea00f9`。
-原probe链接未修改的生产实现，用公开allocate/release构造合法状态；准备后重置
-GCC覆盖计数，只统计一次order-0操作。本地GCC/gcov为16.2.1 20260810。
+固定审查基线 `cfae10338b60e6adf4769938a0b1d16ae94719ee` 与 `main@774e2dc` 的
+`kernel/physical_page.c` 相同。公开allocate/release构造合法状态、准备后重置gcov，
+证实旧全尾检查与最终合并块重写为O(B)。当前森林实现按相关树/链验证与发布，不扫描
+无关尾页；下表分别保留旧尾检查口径和最终新逻辑记录口径，不能换算周期或加速倍数。
 
-| 涉及空闲/合并块页数B | 分配：尾记录检查 | 释放：尾记录检查 | 释放：记录重写 |
-|---:|---:|---:|---:|
-|64|126|114|64|
-|512|1022|1004|512|
-|4096|8190|8166|4096|
-|32768|65534|65504|32768|
+| 大块页数B | 旧分配/释放尾检查 | 旧释放重写 | 新分配/释放逻辑检查 | 新分配/释放逻辑重写 |
+|---:|---:|---:|---:|---:|
+|64|126/114|64|31/31|40/40|
+|512|1022/1004|512|43/43|58/58|
+|4096|8190/8166|4096|55/55|76/76|
+|32768|65534/65504|32768|67/67|94/94|
 
-4 KiB及16 KiB宿主页参数均复现该表；后者不是LA客户机时间测量。
-`free_block_valid()`的全尾校验、预检与摘链的重复校验，以及最终coalesce后的
-`mark_block()`整块重写叠加出O(B)成本。它们位于本核关中断作用域内，但本次只测
-实际执行次数，未测IRQ-off持续时间或业务吞吐，不宣称这是最大的应用瓶颈。
+4 KiB和16 KiB宿主页参数均验证该工作量；宿主计数不代表LA客户机时间。
+`test-allocator-cost-host`通过公开API强制split/coalesce，并以每种页参数10000次独立
+owner模型、每步审计、多range/保留洞、bootstrap导入及finalize失败验证恢复资源基线。
+现有wrong-order、tail、double-free、internal、引用与链/树损坏继续fatal；旧尾reserved
+故障改为活跃树权威损坏，未删除对应所有权反例。
 
-外部输入 `BoarOS-cfae10338b60-audit-evidence.zip` 来自用户，SHA-256为
-`097b983c5562712d1d02cbda5dcf29ed0abefa856e4f4f8bbb28a137f5322897`；附件及运行日志
-不入仓库。原固定基线可用解包后的 `buddy-probe/reproduce.sh` 重建：
+每页仍保留16字节载荷，只有活动块头拥有引用/链关系。只读查询检查候选块头几何及
+ALLOCATED树节点，高阶内部页/过期hint回退树路径；修改和审计检查完整祖先关系。
+这一已确认取舍允许只读查询延后发现祖先损坏。把有效head载荷复制到inactive尾页的
+反例证明载荷不能单独成为owner；删掉活动节点检查的独立错误变体会误认尾页。
 
-```sh
-bash /path/to/boaros-audit/buddy-probe/reproduce.sh /path/to/cfae103-checkout /path/to/output
-make test-allocator-release-host test-allocator-preemption-host test-ci-host test-program-inventory-host
-```
+检查/重写上界、完整审计和自托管metadata预算由[物理页模块](../modules/physical-pages.md#算法与限制)维护。
+finalize和显式审计包含全量树/链核对及成员owner路径，不属于运行期成本窗口。
+典型负向时间结果见[成本分析](cost-baseline.md#buddy-森林匹配时间2026-10-09)，
+最终功能与资源证据见[组合验收](#阶段a组合收口2026-10-09)。
 
-本地上述四个目标通过，CI为11例、程序清单宿主为29例；这不代替外部审查的24目标
-执行记录，也没有重跑双架构/ABI/恢复矩阵。正式成本门禁应由公开接口构造强制split/
-coalesce，统计逻辑检查/重写工作量并保护规模上界，不能长期绑定gcov行号或私有调用数。
+<details>
+<summary>旧审核输入身份与复现</summary>
 
-原fatal用例不仅覆盖wrong-order、tail和重复释放，还修改空闲buddy尾记录的reserved，
-要求随后释放发现损坏。新实现将所有权迁移到自然对齐隐式森林，保留16字节活跃head
-载荷；旧尾载荷不再是权威。该反例已改为同一空闲buddy的活跃树编码破坏，仍要求
-SIGILL与buddy guard；另覆盖高阶acquire、引用溢出/internal/零引用及审计损坏。
-不是直接删除全尾检查后继续信任旧表示。
+- 旧生产源码SHA-256：`ecee97ce6f0d5d86d613a9b3f4d43a0b36e04785d1fcfb20b813053d4cea00f9`。
+- 用户提供的审核zip SHA-256：`097b983c5562712d1d02cbda5dcf29ed0abefa856e4f4f8bbb28a137f5322897`。
+- 计数器为本地GCC/gcov16.2.1 20260810；旧输入可用附件的
+  `buddy-probe/reproduce.sh /path/to/cfae103-checkout /path/to/output`复现，新表示使用
+  `make test-allocator-cost-host`。附件和运行日志不入Git。
 
-新 `test-allocator-cost-host` 的准备全部用公开API：先保留B页块、耗尽其余页，再释放
-该块，下一次order0只能split它。初版500b473的4 KiB与16 KiB各自得到下表，结束后释放全部准备
-owner并恢复finalize后基线；树深度H来自对齐的2B页RAM，所以H为log2(B)+1。
-
-|B|分配逻辑检查|释放逻辑检查|分配/释放逻辑重写|
-|---:|---:|---:|---:|
-|64|30|31|40/40|
-|512|42|43|58/58|
-|4096|54|55|76/76|
-|32768|66|67|94/94|
-
-新计数含根、树、head和order入口（含插入时空入口判断）；旧表只统计尾检查/逐页重写，不能把两表当相同
-微操作或据此换算吞吐倍数。结构证明是旧O(B)路径退出热区，新路径的相关树/邻居
-检查满足规模上界；单层split/coalesce写入各不超过7记录。finalize与显式全审计允许
-全量树/链核对，不属于热路径；链成员的owner路径检查也有成本，不承诺审计总时间O(P)。
-两个页参数各10000次随机owner操作每步审计，另核对多range/洞、bootstrap导入、
-映射失败/无metadata空间不发布、高阶内部尾页页首解析与非对齐拒绝。
-
-本阶段已通过allocator release/preemption/COST host及RV page/heap/MM/VMA/uaccess/
-context/scheduler窄回归，LA两种RAM真实内存ELF、fault/OOM回收和同ELF Linux对照通过。
-以上是初版500b473的表示与窄回归证据；当时完整组合与36次匹配尚未完成，不能
-据它关闭阶段A。后续最终结果见[本轮收口](#阶段a组合收口2026-10-09)。
+</details>
 
 ### 单核纪律与跨核同步的区别
-
-本轮host门禁修正先用300ms启动延迟复现100ms预算内没有 `start`，再用临时目录中的
-无效 `libc.so.6` 复现host `/bin/true` 返回127/native wait32512。CI fixture在真实进程
-flush后通过pipe登记ready，再验证原wait超时；host suite fixture覆盖manifest环境，
-不覆盖case显式环境或生产guest默认。修复后CI12例、程序清单31例通过；不是guest回归。
 
 固定 `references/linux` commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的
 `Documentation/locking/locktypes.rst` 区分本地IRQ/抢占控制、raw锁与可睡眠锁。
@@ -169,13 +143,10 @@ flush后通过pipe登记ready，再验证原wait超时；host suite fixture覆�
 权限或COW永远不变。远端TLB确认、活动CPU集合与撤映射后的回收必须一起设计，
 `references/linux/arch/riscv/mm/tlbflush.c` 的本地与远端失效路径提供固定依据。
 
-RV现有COST已经记录IRQ-off、按rank的对象锁持有与wake-to-run，不能再泛称“缺观测”。
-LA中断助手尚未接同类挂钩，完整COST桥仍有RV假设。本轮时间观测先复用RV，LA保留
-真实功能/回收及16 KiB工作量验证；这项取舍不表示两架构的观测入口已对齐。
-当前 `kernel/cost.c` 的聚合预算表达式为64098字节；新增两项工作量与一项时间metric
-并带完整三lane/65-bin直方图会达65946字节，超过65536。因此本轮新增三项采用既有
-非直方图counter，按现有布局计64386字节；时间记录总量/样本数/最大值，分布复用
-已有IRQ-off，不扩大聚合上限。这是布局计算，新增metric尚未实现。
+RV COST记录IRQ-off、按rank的对象锁持有与wake-to-run；LA尚未接完整同类时间挂钩。
+三项allocator指标采用非直方图counter，聚合64386字节、每任务64字节，保持64KiB上限；
+记录工作量及时间总量/样本/max，分布复用IRQ-off。metric已实现，不能沿用旧设计中的
+“尚未实现”状态；接口与schema见[COST模块](../modules/kernel-cost.md#buddy元数据观测2026-10-09)。
 lwIP固定快照 `references/lwip`（`77dcd25a72509eb83f72b033d219b1d40cd8eb95`）
 `doc/doxygen/main_page.h` 的multithreading说明要求raw核心串行；SMP接入也必须保留
 这一条件，不能让各CPU并发进入现有raw API。
@@ -202,7 +173,7 @@ BoarOS 当前对不超过 2048 字节的对象使用 16 至 2048 字节的二次
 
 `calloc` 必须在乘法前检查溢出并清零完整结果；`realloc` 在原 class 或原 buddy order 仍能容纳新长度时可以原地返回，否则先分配、复制两者较小长度，再释放旧对象。任何失败都不能改变旧对象所有权。统计中的 live bytes、当前/峰值页数和分配次数既用于发现泄漏，也为以后判断 per-CPU cache、延迟回收或更细 size class 是否值得提供基线。
 
-当前堆服务单 hart 启动、可写/只读 ext4、文件表、线程和用户映像等生产路径，没有锁。SMP 到来时必须先用锁保护全局 slab/buddy 交接，再根据目标开发板上的争用与 cache miss 数据决定是否加入 per-CPU magazine；per-CPU cache 会减少锁竞争，但也会增加跨 CPU 回收和空闲页滞留，不能仅凭“通常更快”提前加入。
+当前堆服务单 hart 启动、可写/只读 ext4、文件表、线程和用户映像；共享元数据由本CPU IRQ纪律保护，没有跨核互斥。SMP 接入需要保护全局 slab/buddy 交接，再根据目标开发板上的争用与 cache miss 数据决定是否加入 per-CPU magazine；per-CPU cache 会减少锁竞争，但也会增加跨 CPU 回收和空闲页滞留，不能仅凭“通常更快”提前加入。
 
 ## 多级页表怎样翻译地址？
 
@@ -582,78 +553,39 @@ MM record 的引用、VMA、文件/ELF 后备 pin、驻留来源和退出清理�
 test-mm-riscv test-vma-riscv test-uaccess-riscv`。这一分离尚不构成 LA 用户态交付。
 
 
-### 森林查询的成本取舍（2026-10-09）
-
-初始森林500b473保持全祖先检查；固定用户ELF匹配时间暴露典型操作回退，后续减少
-重复查找后仍存在。人已选择只读快路径：活跃块头的几何、ALLOCATED节点及head字段
-可直接验证，高阶内部页/过期载荷回退树路径；修改和独占审计检查祖先关系。合法合并
-先退休子节点，所以此前独立页留下的载荷不能误认新owner。额外反例用公开API把所有
-页先变成单页owner、释放再分配连续块，逐尾页验证解析和order拒绝；祖先损坏仍被
-release/acquire/audit fatal，tail refcount仍fatal，不能把引用错误降为普通INVALID。
-
-4/16KiB强制32768页单页split/coalesce最终逻辑检查67/67、重写94/94；只读活跃头
-查询在单根模型下检查不超过10，独立于H。最终36次匹配时间仍有13.6%–22.4%默认
-匿名生命周期回退；[完整输入/时间与观测开销](cost-baseline.md#buddy-森林匹配时间2026-10-09)
-解释该安全/工作量取舍，不用宿主计数取代客户机吞吐或IRQ尾延迟。
-
-
 ### 阶段A组合收口（2026-10-09）
 
-这次执行区别于外部cfae103审查和41b5947规划：宿主CI12例、程序清单host31例，
-4/16KiB新成本gate及每种页参数10000次独立owner模型、22种fatal反例和实际函数边界
-抢占、COST23解析/模型测试全部通过。额外把真实allocated头的16字节载荷复制到
-inactive高阶尾页：resolve仍找到高阶owner、allocation_order拒绝尾页；不检查活动
-树节点的独立错误变体在此失败。未修改生产源码作故障变体，不与真实QEMU结果混算。
+`main@4ae474a`的allocator功能验收覆盖4/16KiB工作量、每种页参数10000次owner模型、
+22种fatal、实际函数边界抢占和COST23项解析；CI/程序清单host fixture分别12/31项。
+宿主慢启动与guest库路径污染的原因和已修复契约见[CI模块](../modules/continuous-integration.md)。
 
-RV `test-riscv`及scale、真实musl/pthread、glibc五形态、1366 ABI和生产栈检查通过；
-完整启动门禁核对512MiB/1GiB/16GiB的新metadata与页表资源。LA核心、平台、运行时
-和extended各组通过，覆盖两种RAM的真实ELF、OOM/构造回滚、根盘/checksum、guard、
-FP/SIMD/信号、动态TLS、glibc五形态、SQLite DELETE/WAL、1366 ABI和生产栈。
-固定BusyBox/libc-test229项在RV/LA×512MiB/1GiB各自全部完成并通过同ELF Linux对照；
-真实终端/PTY应用、外部Ethernet、随机/环境、设备故障回滚及RTC模型/告警通过。
+RV完整架构/scale、真实musl/pthread、glibc五形态、1366 ABI及生产栈通过，启动核对
+512MiB/1GiB/16GiB的新metadata和页表资源。LA核心/平台/运行时/设备组合、根盘/OOM、
+guard、FP/SIMD/信号、动态TLS、glibc、1366 ABI与生产栈通过。原BusyBox/libc-test229项
+在RV/LA×512MiB/1GiB各自全部完成同ELF Linux对照；网络、TTY/PTY、随机、RTC和退出回收通过。
 
-共用host CI八组全部通过，另覆盖block/record-lock/NBD/PID/sched-policy/lwext4完整
-恢复与COST。RV实际存储验证包括暂扣/部分完成/flush/reset/压力睡眠、双盘隔离、
-FIFO/RR混合负载、SQLite NBD、多进程WAL/重启、DELETE与WAL完整恢复矩阵。DELETE
-写故障序号39、41–44及WAL19没有触发，按已确认提交后的cut恢复核验，不能计作EIO
-命中；其余注入和丢失/重排扇区cut按原runner检查，不补写未发生事件为通过。
-正常退出检查新预热baseline的页/堆/任务栈和根盘/设备owner，故意注入失败mount与
-未确认DMA的场景则检查真实owner保留，不要求强行归零。
+RV另通过暂扣I/O、部分完成/flush/reset、双盘FIFO/RR、NBD及DELETE/WAL完整恢复。
+DELETE写故障39、41–44和WAL19未命中，仅按提交后的cut核验，不计作EIO命中。
+正常退出恢复预热页/堆/栈/设备baseline；故意注入失败mount或未确认DMA则保留真实owner。
+这些是单CPU证据，不证明跨核同步或LA全断电恢复已交付。
 
-本轮最终RV功能核文件SHA256为60ac7f2fb0cfcb271dc5e408f7d431080380a71e2be6d8403b2f8ab9173963f1；
-其PT_LOAD映射/内容与匹配时间新OFF核完全一致（文件SHA差异来自调试信息）。LA功能
-核SHA256为752be595d409694bcbd16371bc1fb2d89ea4d1e7eabbe74ac71c86771fc4e923。
-RV实际QEMU11.1.2身份见成本记录；LA实际QEMU11.1.0基于references/qemu commit
-84f07211cc5b4fc6a371559bf8a5de4fb068e648，RTC补丁SHA256
- a2951479d2f45afed8ffc9e69ed4a44efd7174b00a688b03d5d786332515cf2d，
-二进制SHA256为63dcacc82765ba4a18cfb623410d19fd462bd3755c06cc81cd73caaf226bc0b9。
-Linux对照为references/linux commit f4cdf7ca9a1fdcca413157df19753f388a5a224e，各profile
-单独固定。未执行远程CI，也未将QEMU结果外推实板、SMP、巨量order31或硬实时。
+固定Linux为`references/linux@f4cdf7ca9a1fdcca413157df19753f388a5a224e`。RV执行器为QEMU11.1.2，
+LA为`references/qemu@84f07211cc5b4fc6a371559bf8a5de4fb068e648`加既有RTC补丁；
+产物身份见下表和[匹配时间](cost-baseline.md#buddy-森林匹配时间2026-10-09)。
 
-独立整包审查覆盖41b5947以来全部代码和SMP契约，无Critical/Important运行期问题；
-作者集中修正文档证据链接/版本标签，再运行受影响成本、fatal、抢占与解析门禁。
-默认典型性能回退已明确报告，阶段A交付有界元数据与同步前置合同，下一阶段B才实现
-跨核短锁、等待交接、CPU本地/current和生命周期同步。GDT/resident范围优化仍单列。
+<details>
+<summary>组合验收产物身份（SHA-256）</summary>
 
-可重建命令均显式使用通用init配置；各宿主/客体suite保持自己的日志、退出和owner
-验证，不能只根据顶层进程exit0推导所有测例或历史事故已关闭。
+| 产物 | SHA-256 |
+|---|---|
+| RV功能核 | `60ac7f2fb0cfcb271dc5e408f7d431080380a71e2be6d8403b2f8ab9173963f1` |
+| LA功能核 | `752be595d409694bcbd16371bc1fb2d89ea4d1e7eabbe74ac71c86771fc4e923` |
+| LA QEMU | `63dcacc82765ba4a18cfb623410d19fd462bd3755c06cc81cd73caaf226bc0b9` |
+| LA RTC补丁 | `a2951479d2f45afed8ffc9e69ed4a44efd7174b00a688b03d5d786332515cf2d` |
 
-```sh
-make test-allocator-cost-host test-allocator-release-host test-allocator-preemption-host test-cost-host
-python3 -B tests/ci/run.py --arch host --suite host
-make INIT_CONFIG=config/init.json test-riscv test-scale-riscv test-userland-riscv test-glibc-riscv test-diff-abi-riscv test-stack-usage
-python3 -B tests/root-shutdown-riscv.py
-make INIT_CONFIG=config/init.json test-root-multi-block-riscv test-io-sleep-riscv test-multi-disk-io-riscv test-sqlite-rollback-riscv test-sqlite-wal-riscv test-sqlite-nbd-riscv test-sqlite-recovery-riscv test-sqlite-wal-recovery-riscv test-sqlite-recovery-matrix-riscv test-sqlite-wal-recovery-matrix-riscv test-record-lock-riscv test-sqlite-second-disk-riscv
-python3 -B tests/ci/run.py --arch riscv --suite platform
-python3 -B tests/ci/run.py --arch riscv --suite extended
-python3 -B tests/ci/run.py --arch loongarch --suite core
-python3 -B tests/ci/run.py --arch loongarch --suite platform
-python3 -B tests/ci/run.py --arch loongarch --suite runtime
-python3 -B tests/ci/run.py --arch loongarch --suite extended
-```
+RV功能核的PT_LOAD映射/内容与匹配新OFF核一致；ELF文件SHA差异来自调试信息。
+输入和命令归[CI模块](../modules/continuous-integration.md)及各模块聚焦入口；通用fixture
+使用`INIT_CONFIG=config/init.json`。未重新执行托管CI，已核对运行产物随后按prune流程清理，
+可复用缓存和未关闭现场保留。
 
-
-结果核对后已预览并执行make prune-build，移除104个已收口运行目录/日志/镜像路径。
-匹配内核及用户ELF缓存、工具链、运行时、固定Linux/QEMU缓存保留；已有OSComp与
-GDT未关闭现场显式keep，不删除其worktree。临时执行账本/候选变体随本轮运行目录
-清理，永久结论、固定身份和重建命令记录于本页及成本记录。
+</details>
