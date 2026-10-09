@@ -34,8 +34,9 @@
 
 任务的on_cpu与CPU切换前驱共同保护旧栈：阻塞提交后的提前wake只记录ready_pending，
 park自行保存IRQ并保持关闭跨过切换交接，返回时恢复原状态；
-新栈的`kernel_scheduler_switch_finish`才发布旧任务或允许回收。普通返回、首次kernel/user
-入口及退出切换经过同一完成点。调度请求用原子exchange消费，完成点不清除后来请求。
+新栈的`kernel_scheduler_switch_finish`才发布旧任务或允许回收。恢复已有上下文的C切换尾部、
+首次kernel/user trampoline及退出切换经过同一完成点；无切换的普通异常返回不重复查询。
+调度请求用原子exchange消费，完成点不清除后来请求。
 
 wake在调度锁内判断空队列；为空直接完成，非空才建立跨解锁的借用游标。
 被摘节点保留有引用的退休后继，引用链迭代归还，每段最多16项。

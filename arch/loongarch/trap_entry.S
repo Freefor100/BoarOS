@@ -85,7 +85,6 @@ la_trap_entry:
     bl la_trap_dispatch
     .globl la_trap_return
 la_trap_return:
-    bl kernel_scheduler_switch_finish
     move $a0, $sp
     bl la_trap_return_prepare
     ld.d $t0, $sp, 288
@@ -126,6 +125,12 @@ la_trap_return:
     ld.d $r31, $sp, 248
     ld.d $sp, $sp, 24
     ertn
+
+    .globl la_user_thread_trampoline
+la_user_thread_trampoline:
+    # 首次用户入口完成新栈交接；正常异常返回已经在C切换尾部完成。
+    bl kernel_scheduler_switch_finish
+    b la_trap_return
 .Lguard_overflow:
     move $a0, $sp
     la.abs $sp, la_guard_stack_end

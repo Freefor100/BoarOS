@@ -103,7 +103,6 @@ riscv_trap_entry:
     .globl riscv_trap_return
     .type riscv_trap_return, @function
 riscv_trap_return:
-    call kernel_scheduler_switch_finish
     mv a0, sp
     call riscv_trap_return_prepare
     ld t0, RISCV_TRAP_FRAME_SSTATUS(sp)
@@ -189,3 +188,11 @@ riscv_trap_return:
     tail riscv_trap_bad_return
 
     .size riscv_trap_return, . - riscv_trap_return
+
+    .globl riscv_user_thread_trampoline
+    .type riscv_user_thread_trampoline, @function
+riscv_user_thread_trampoline:
+    /* 首次运行才有未完成的切换；普通异常返回不重复查询handoff。 */
+    call kernel_scheduler_switch_finish
+    j riscv_trap_return
+    .size riscv_user_thread_trampoline, . - riscv_user_thread_trampoline

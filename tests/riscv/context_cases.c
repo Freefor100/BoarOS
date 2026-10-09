@@ -6,7 +6,7 @@
 #include <stdint.h>
 
 extern void riscv_kernel_thread_trampoline(void);
-extern void riscv_trap_return(void);
+extern void riscv_user_thread_trampoline(void);
 
 static void context_entry(void *argument)
 {
@@ -163,7 +163,7 @@ static unsigned long run_user_init_cases(void)
 
     if (riscv_context_init_user(&context, frame, thread) !=
             RISCV_CONTEXT_STATUS_OK ||
-        context.ra != (uintptr_t)riscv_trap_return ||
+        context.ra != (uintptr_t)riscv_user_thread_trampoline ||
         context.sp != frame || context.tp != (uintptr_t)thread) {
         return 1U;
     }
