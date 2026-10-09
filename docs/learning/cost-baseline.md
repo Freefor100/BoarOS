@@ -38,6 +38,23 @@ DTB 时钟为 10 MHz。旧 glibc 消费者在 `oscomp-rv-compat` 的兼容配置
 默认 main 的 glibc 2.44 回归是另一套输入。1 GiB 原评测专项另列，不能与常规测量混用。
 吞吐与耗时使用关闭新增成本观测的构建；开启观测的样本只用于归因。
 
+### QEMU时间与宿主条件
+
+固定10MHz timebase规定每个时钟tick为100ns，不规定每秒执行多少客户机指令。
+当前`tests/cost-riscv.py`没有启用`-icount`。本地QEMU参考
+`references/qemu`（v11.1.0，`84f07211cc5b4fc6a371559bf8a5de4fb068e648`）中，
+`hw/intc/riscv_aclint.c`将`QEMU_CLOCK_VIRTUAL`换算为mtime；
+`system/cpus.c`和`system/cpu-timers.c`的默认路径在VM运行时使用宿主单调时钟，
+暂停时维护offset。`accel/tcg/tcg-accel-ops.c`仅在启用icount时改用指令计数时钟。
+`docs/devel/tcg-icount.rst`也明确icount不是周期精确模拟。
+
+因此，宿主CPU频率、核类型、被调度出去的时间和TCG翻译都会影响固定工作量耗时，
+也可能放大客户机观察到的IRQ-off时间；绑P核只能控制运行位置，不能锁定频率。
+本页各轮执行器身份分别固定，参考源码版本不充当实际QEMU二进制身份。
+匹配测量记录CPU/频率策略、时钟模式、观测开关及返回基线漂移，结合确定性工作量计数归因，
+不能把全部变慢归为宿主噪声，或把计数下降直接当成端到端加速。更改icount属于另一测量profile，
+不能与这里的默认TCG时间拼接。
+
 ## iozone 各轮耗时
 
 下表使用关闭观测的既有记录。程序耗时与八组程序合计均为三次独立启动的中位数。

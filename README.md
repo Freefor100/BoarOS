@@ -4,7 +4,7 @@
   <img src="assets/boaros_header.png" alt="BoarOS 吉祥物与字标" width="100%">
 </p>
 
-BoarOS 是面向 OSComp 能力建设的 C／少量汇编内核，目标是运行未经 BoarOS 特改的 Linux 用户程序。
+BoarOS 是 C／少量汇编内核，目标是运行未经 BoarOS 特改的 Linux 用户程序。
 Linux 是用户可观察语义的参考；内部实现独立维护对象所有权、失败回滚和资源回收。
 
 ## 当前能力
