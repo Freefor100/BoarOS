@@ -2,6 +2,7 @@
 #include <sched.h>
 #include <sys/mman.h>
 #include <sys/wait.h>
+#include <termios.h>
 static void blocked(pid_t pid)
 {
     char path[64],s[512];snprintf(path,sizeof(path),"/proc/%d/stat",pid);
@@ -25,5 +26,7 @@ static void phase(size_t bytes, int protect)
 int main(void)
 {
     cost_init();mkdir("/hot",0755);CHECK(mount("tmpfs","/hot","tmpfs",0,0)==0);memset(payload,0xa5,sizeof(payload));int fd=open("/hot/data",O_RDWR|O_CREAT,0600);CHECK(fd>=0);close(fd);
-    phase(4096,0);phase(65536,0);phase(1048576,0);phase(4096,1);phase(1048576,1);CHECK(unlink("/hot/data")==0);CHECK(umount("/hot")==0);puts("COST PASS latency");return 0;
+    phase(4096,0);phase(65536,0);phase(1048576,0);phase(4096,1);phase(1048576,1);CHECK(unlink("/hot/data")==0);CHECK(umount("/hot")==0);puts("COST PASS latency");
+    /* stdout尚有TTY排队字节；真实排空后才能交给PID1关机raw输出。 */
+    CHECK(fflush(stdout)==0);CHECK(tcdrain(STDOUT_FILENO)==0);return 0;
 }

@@ -84,5 +84,19 @@ int main(void)
         assert(kernel_cost_read(1, COST_CANCELLED, &value) == 0 && value == 1);
         kernel_cost_leave(&scope);
     }
+    actor.wait_flags = 0;
+    assert(kernel_cost_begin(9, 10000000, 0, 0) == 0);
+    actor.epoch = kernel_cost_epoch();
+    struct kernel_cost_tag tag = kernel_cost_capture();
+    kernel_cost_page_metadata(tag, 11, 5, 7);
+    tag.epoch--;
+    kernel_cost_page_metadata(tag, 100, 100, 100);
+    assert(kernel_cost_end(9, 0) == 0);
+    assert(kernel_cost_format(output, sizeof(output)) > 0);
+    assert(strstr(output, "foreground.page_meta_checked.value=11\n"));
+    assert(strstr(output, "foreground.page_meta_written.value=5\n"));
+    assert(strstr(output, "foreground.allocator_meta_ticks.value=7\n"));
+    assert(strstr(output, "foreground.page_meta_checked.samples=1\n"));
+    assert(strstr(output, "observer.observer_ticks.samples=1\n"));
     puts("cost core contract passed");
 }

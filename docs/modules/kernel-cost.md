@@ -202,3 +202,24 @@ TCP admission 新增 `stream_admit_blocked`（预先无容量的尝试）、`str
 （复制后提交仍为 EAGAIN 的尝试）和 `stream_copy_blocked_bytes`（尚无进展时这些失败新复制的
 payload 字节）。阻塞调用可能有多次尝试，不能当作 syscall 次数；复用暂存后缀不再次计复制。
 现有 `stream_copy` 仍记录全部真实复制。指标在末尾追加，前一网络 schema 继续可读。
+
+
+## buddy元数据观测（2026-10-09）
+
+注册表末尾增加page_meta_checked、page_meta_written（逻辑记录）和allocator_meta_ticks
+（区间累计ticks/samples/max），均不带直方图。每次元数据区内局部累计，离开后一次
+原子提交三个计数；默认关闭，不持对象引用、不分配观测内存。计时不含压力回收与I/O
+等待。当前聚合64386字节、每任务64字节，旧223项完整registry仍可显式解析；缺少新
+指标标记不可用，不能填零，也不接受随意缺字段的快照。外部冻结kernel identity中的
+registry与二进制SHA必须匹配；同时声明两份registry时必须一致。
+
+`python3 -B tests/cost-riscv.py --case allocator`执行1页×1024、64页×64、4096页×4
+的固定匿名映射、逐页零值/内容检查和撤映射。allocator及既有latency均支持
+`--coordinator-elf`冻结同一个ELF，`--kernel-identity`冻结构建身份，默认三次独立启动。
+allocator复用既有10秒异步关闭协议：实际工作计时先停止，checkpoint在途scope
+排空所需的关闭ns/retries另记；EBUSY不能被吞掉，超时继续失败。最终输出用真实
+fflush/tcdrain排空TTY，原始快照损坏仍拒绝。启动预算保持180秒。
+
+匹配旧/新/返回旧、ON/OFF共36次启动及负向结论见
+[学习记录](../learning/cost-baseline.md#buddy-森林匹配时间2026-10-09)。IRQ-off直方图与
+rank持锁/wake-to-run沿用RV观测；LA本轮仅功能和16KiB工作量门禁，没有声明LA时间验收。

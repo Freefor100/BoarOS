@@ -630,3 +630,86 @@ io-sleep 超时阶段 inflight-ticks/busy-ticks ≈ 8.0（八请求扣满 30 秒
 真实工作负载下设备大部分时间空闲、忙时深度接近 1，不满足"加深队列"的触发条件，
 队列深度与 indirect 不做；单副本 pilot 只用于归因，不是可比成绩。
 
+
+
+## buddy森林匹配时间（2026-10-09）
+
+旧核来自main@41b5947，新核来自500b473加本轮查询/观测改进。初始森林已消除单页
+O(B)反例，但第一次36启动中默认OFF匿名工作慢27%–46%；根目录只校验候选几何、
+复用一次PA/owner查找、深度已证明的树读去掉重复边界和一次提交三个COST计数后，
+第二轮36启动仍慢14%–28%。继续调查确认页表/uaccess频繁只读解析会重复完整祖先链。
+人已选择活动块头+树节点快路径，祖先损坏发现时点移到修改/完整审计；不是按程序
+或页地址特判。释放、分配和增引用的完整路径不变，旧尾hint回退到树查找。
+
+最终第三轮36次串行启动为两个case×旧/新/返回旧×ON/OFF×三次独立磁盘。固定
+QEMU11.1.2（二进制SHA256 `5713c546693820d225e87795a14e8177343cb7ac4d9b0610a9e41c7203eb023d`），
+512MiB/单CPU/modern VirtIO/writeback，timebase10MHz，固件SHA256
+`894e2aef99590fc07ec6c60ab00282b8bc5d5d5bb2a1d0c6ada0c52df24274c0`。
+用户编译器为RV GCC16.2.1 20260810及固定musl1.2.5 wrapper；每种case全程使用同一
+ELF。旧/返回旧OFF核SHA256 `c0c47acf07128dc731ba56022e3186499c180aaed10bdfffcf4e915cc2949873`，
+ON `d7afc8ab3c0be934a3e7e9e78ee63f3f14aedd938ba788b74e6c54767507d4dc`；
+新OFF `9e37e5a82c9441195d621ed6410815f8c6e797d2ad39e3159d6fdc71f299479e`，
+ON `4d6fa5b37e92625aedf8c2e2fcef8c3d3aaa99f84073bb9579967f9e9ff9e776`。
+allocator ELF SHA256 `7c8e053111e4a8eee6c237440b09ba0ec105c8bf23708a6610e9c83bc230af0c`，
+latency ELF `248dcb0753256ad49ef68098704699e9088ecb68ccf9e936e7fabc4e1a735946`。
+输入seal、完整snapshot/schema、独立fixture、PID1退出0/heap-live0均核对；原始失败
+pilot不加入正式矩阵。返回旧使用完全相同二进制，避免反向重建改变输入。
+
+下表为OFF三次客户机工作时间中位数，单位ms。小工作受调度相位影响，4KiB复制和
+4KiB改权的返回旧波动明显，不能挑一次值宣称改善。
+
+| 工作 | 旧 | 新 | 返回旧 | 新/旧 |
+|---|---:|---:|---:|---:|
+| 1页×1024匿名生命周期 | 47.295 | 53.747 | 46.659 | +13.64% |
+| 64页×64 | 74.652 | 89.630 | 73.831 | +20.06% |
+| 4096页×4 | 291.515 | 356.722 | 287.798 | +22.37% |
+| 4KiB×8复制/独立唤醒 | 4.481 | 4.416 | 3.697 | -1.45% |
+| 64KiB×8复制/独立唤醒 | 2.340 | 2.936 | 2.366 | +25.45% |
+| 1MiB×8复制/独立唤醒 | 36.292 | 43.282 | 36.345 | +19.26% |
+| 4KiB降权/恢复/唤醒 | 1.105 | 1.309 | 1.905 | +18.45% |
+| 1MiB降权/恢复/唤醒 | 0.753 | 1.066 | 0.740 | +41.44% |
+
+ON三种匿名工作旧/新中位为83.212/116.386、108.460/170.179、417.374/643.177ms。
+对应ON/OFF开销旧为75.9%、45.3%、43.2%，新为116.5%、89.9%、80.3%；本轮新增每次
+元数据计时和计数，不能把ON差额当成默认内核开销。新只读路径较第二轮将检查总量
+分别从366264/844184/3850124降为205377/582227/2728775，但写入及完整修改校验仍在。
+这是固定森林的安全/成本取舍：旧正常块头查询/修改成本低，但合法状态下有全块
+线性扫描；新修改沿树验证，不扫描无关尾页，却对常规逐页操作增加路径工作。
+数据证明典型回退仍在，不能据最坏计数下降宣布平均性能收口或硬实时保证。
+
+ON匿名三窗口IRQ-off最大值三次样本（ticks，100ns/tick）：
+
+| 工作 | 旧max | 新max | 旧p99桶 | 新p99桶 |
+|---|---|---|---|---|
+| 1页×1024 | 3804/3779/3774 | 3896/2986/2935 | 512–1023 | 512–1023 |
+| 64页×64 | 1604/1427/1386 | 3102/5323/2978 | 1024–2047 | 2048–4095 |
+| 4096页×4 | 47892/47623/47690 | 156025/160363/160548 | 256–511 | 256–511 |
+
+4096页窗口新的元数据单次max为288 ticks（三次max中位），总计1469582 ticks，
+180374个元数据样本；16.05ms的整段IRQ-off含批量撤映射等多个操作，不能归给一个
+buddy调用。1MiB复制的IRQ-off旧83823–84379、新118997–122017；wake-to-run旧
+86678–87753、新122117–122898 ticks，前台任意rank的持锁max旧84022、新121580。
+匿名工作没有前台对象锁持有样本；零样本不能解释为没有任何串行成本。固定latency
+握手证明独立任务可进展，最长不可抢占段与唤醒延迟并未改善。
+
+关闭scope的pilot曾返回EBUSY：实际暂停栈为journal worker→checkpoint→批量块写→
+调度阻塞，仍有两个真实scope。allocator因此采用已有有界异步close，不更改内核拒绝
+在途end的契约；close时间与业务timer分开。另一次latency自然退出0却有raw关机行
+插进TTY快照，故加fflush和真实tcdrain，发生于测量外；严格parser不修补坏原始输出。
+完整旧223项schema显式解析，新字段标不可用，任意缺字段仍失败。
+
+可重建入口如下；旧/新内核须从对应已提交树构建并各冻结ON/OFF，两个用户ELF只编译
+一次。按old→new→returned-old、OFF→ON、allocator→latency依序各执行replicas3；
+返回旧复用原封存核。各profile输出目录独立，不能并行执行测量。
+
+```sh
+make INIT_CONFIG=config/init.json COST_DIAGNOSTICS=0 all
+make INIT_CONFIG=config/init.json COST_DIAGNOSTICS=1 all
+python3 -B tests/cost-riscv.py --case allocator --replicas 3 --kernel KERNEL --kernel-identity IDENTITY --coordinator-elf ALLOCATOR_ELF --output EMPTY_OUTPUT
+python3 -B tests/cost-riscv.py --case latency --replicas 3 --kernel KERNEL --kernel-identity IDENTITY --coordinator-elf LATENCY_ELF --output EMPTY_OUTPUT
+# OFF两种case增加--off；旧identity显式携带固定旧metric_schema。
+```
+
+最终结论是最坏元数据工作量已受相关路径约束，典型负向观察已定位到仍保留的修改
+验证与观测成本，且未消失。平均吞吐、批量MM的IRQ尾延迟改善继续作为有测量依据的
+后续项目，不为本轮扩大锁、页缓存或调度改造范围。

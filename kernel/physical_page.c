@@ -77,7 +77,7 @@ static struct page_work page_work_begin(void)
     work.interrupts = arch_interrupt_save();
 #if BOAROS_COST_DIAGNOSTICS
     work.tag = kernel_cost_capture();
-    work.start = kernel_cost_clock();
+    if (work.tag.epoch) work.start = kernel_cost_clock();
 #endif
     return work;
 }
@@ -85,14 +85,13 @@ static struct page_work page_work_begin(void)
 static void page_work_end(struct page_work *work)
 {
 #if BOAROS_COST_DIAGNOSTICS
-    uint64_t elapsed = kernel_cost_clock() - work->start;
+    uint64_t elapsed = work->tag.epoch ? kernel_cost_clock() - work->start : 0;
 #endif
     /* 先结束元数据计时并恢复IRQ，集中发布不能扩张每条记录的临界区。 */
     arch_interrupt_restore(work->interrupts);
 #if BOAROS_COST_DIAGNOSTICS
-    kernel_cost_add_tag(work->tag, COST_PAGE_META_CHECKED, work->checked);
-    kernel_cost_add_tag(work->tag, COST_PAGE_META_WRITTEN, work->written);
-    kernel_cost_add_tag(work->tag, COST_ALLOCATOR_META_TICKS, elapsed);
+    if (work->tag.epoch)
+        kernel_cost_page_metadata(work->tag, work->checked, work->written, elapsed);
 #endif
 }
 #define PAGE_METADATA_SCOPE(name)                                                      \
@@ -557,10 +556,7 @@ static enum physical_page_status physical_page_release_bootstrap(
     return PHYSICAL_PAGE_STATUS_OK;
 }
 
-static uint64_t order_page_count(uint32_t order)
-{
-    return UINT64_C(1) << order;
-}
+static uint64_t order_page_count(uint32_t order) { return UINT64_C(1) << order; }
 
 static uint32_t largest_fitting_order(uint64_t address, uint64_t pages)
 {
@@ -571,72 +567,80 @@ static uint32_t largest_fitting_order(uint64_t address, uint64_t pages)
     return order;
 }
 
-static int root_valid(const struct physical_page_allocator *a,
-                      const struct physical_page_root *r)
+static int root_valid(const struct physical_page_allocator *a, const struct physical_page_root *r)
 {
-    if (r->order > PHYSICAL_PAGE_MAX_ORDER || r->reserved ||
-        r->range_index >= a->range_count)
+    if (r->order > PHYSICAL_PAGE_MAX_ORDER || r->reserved || r->range_index >= a->range_count)
         return 0;
     const struct physical_page_range *range = &a->ranges[r->range_index];
     uint64_t n = order_page_count(r->order), bytes = n << BOAROS_PAGE_SHIFT;
     uint64_t range_pages = (range->end - range->base) >> BOAROS_PAGE_SHIFT;
-    if (r->first_page_index < range->first_page_index || n > a->total_pages ||
-        n > range_pages ||
+    if (r->first_page_index < range->first_page_index || n > a->total_pages || n > range_pages ||
         (uint64_t)r->first_page_index - range->first_page_index > range_pages - n ||
         r->first_page_index > a->total_pages - n ||
-        r->address !=
-            range->base + (((uint64_t)r->first_page_index - range->first_page_index)
-                           << BOAROS_PAGE_SHIFT) ||
-        (r->address & (bytes - 1)) || r->address >= range->end ||
-        bytes > range->end - r->address || r->node_offset > a->tree_nodes ||
-        2 * n - 1 > a->tree_nodes - r->node_offset)
+        r->address != range->base + (((uint64_t)r->first_page_index - range->first_page_index)
+                                     << BOAROS_PAGE_SHIFT) ||
+        (r->address & (bytes - 1)) || r->address >= range->end || bytes > range->end - r->address ||
+        r->node_offset > a->tree_nodes || 2 * n - 1 > a->tree_nodes - r->node_offset)
         return 0;
     return 1;
 }
 
-static const struct physical_page_root *
-root_for_page(const struct physical_page_allocator *a, uint32_t page,
-              struct page_work *work)
+static const struct physical_page_root *root_for_page(const struct physical_page_allocator *a,
+                                                      uint32_t page, struct page_work *work)
 {
     uint32_t lo = 0, hi = a->root_count;
     while (lo < hi)
     {
         uint32_t mid = lo + (hi - lo) / 2;
-        const struct physical_page_root *r = &a->roots[mid];
         page_checked(work);
-        if (!root_valid(a, r))
-            __builtin_trap();
-        if (page < r->first_page_index)
-            hi = mid;
-        else if ((uint64_t)page - r->first_page_index >= order_page_count(r->order))
+        if (a->roots[mid].first_page_index <= page)
             lo = mid + 1;
         else
-            return r;
+            hi = mid;
     }
-    return 0;
+    if (!lo)
+        return 0;
+    const struct physical_page_root *r = &a->roots[lo - 1];
+    page_checked(work);
+    if (!root_valid(a, r))
+        __builtin_trap();
+    return (uint64_t)page - r->first_page_index < order_page_count(r->order) ? r : 0;
 }
 
-static const struct physical_page_root *
-root_for_address(const struct physical_page_allocator *a, uint64_t address,
-                 struct page_work *work)
+static const struct physical_page_root *root_for_address(const struct physical_page_allocator *a,
+                                                         uint64_t address, struct page_work *work)
 {
     uint32_t lo = 0, hi = a->root_count;
     while (lo < hi)
     {
         uint32_t mid = lo + (hi - lo) / 2;
-        const struct physical_page_root *r = &a->roots[mid];
         page_checked(work);
-        if (!root_valid(a, r))
-            __builtin_trap();
-        if (address < r->address)
-            hi = mid;
-        else if (address - r->address >=
-                 (order_page_count(r->order) << BOAROS_PAGE_SHIFT))
+        if (a->roots[mid].address <= address)
             lo = mid + 1;
         else
-            return r;
+            hi = mid;
     }
-    return 0;
+    if (!lo)
+        return 0;
+    const struct physical_page_root *r = &a->roots[lo - 1];
+    page_checked(work);
+    if (!root_valid(a, r))
+        __builtin_trap();
+    return address - r->address < (order_page_count(r->order) << BOAROS_PAGE_SHIFT) ? r : 0;
+}
+
+/* 根extent已验证；owner walk的深度d<=H，节点在[2^d-1,2^(d+1)-2]。
+ * IRQ区内目录不变，仍逐层验证祖先状态；不重复验证同一个索引上界。 */
+static inline unsigned tree_read(const struct physical_page_allocator *a,
+                                 const struct physical_page_root *root, uint64_t node,
+                                 struct page_work *work)
+{
+    uint64_t bit = (root->node_offset + node) * 3, byte = bit / 8;
+    unsigned shift = bit % 8, value = a->tree[byte];
+    if (shift > 5)
+        value |= (unsigned)a->tree[byte + 1] << 8;
+    page_checked(work);
+    return (value >> shift) & 7U;
 }
 
 static unsigned tree_get(const struct physical_page_allocator *a,
@@ -646,17 +650,11 @@ static unsigned tree_get(const struct physical_page_allocator *a,
     uint64_t index = root->node_offset + node;
     if (node >= 2 * order_page_count(root->order) - 1 || index >= a->tree_nodes)
         __builtin_trap();
-    uint64_t bit = index * 3, byte = bit / 8;
-    unsigned shift = bit % 8, value = a->tree[byte];
-    if (shift > 5)
-        value |= (unsigned)a->tree[byte + 1] << 8;
-    page_checked(work);
-    return (value >> shift) & 7U;
+    return tree_read(a, root, node, work);
 }
 
-static void tree_set(struct physical_page_allocator *a,
-                     const struct physical_page_root *root, uint64_t node,
-                     unsigned state, struct page_work *work)
+static void tree_set(struct physical_page_allocator *a, const struct physical_page_root *root,
+                     uint64_t node, unsigned state, struct page_work *work)
 {
     uint64_t index = root->node_offset + node;
     if (state > BUDDY_INTERNAL || node >= 2 * order_page_count(root->order) - 1 ||
@@ -681,54 +679,87 @@ struct buddy_owner
     unsigned state;
 };
 
+static int owner_walk(const struct physical_page_allocator *a, const struct physical_page_root *r,
+                      uint32_t page, struct buddy_owner *owner, struct page_work *work)
+{
+    *owner = (struct buddy_owner){r, 0, r->first_page_index, r->order, 0};
+    for (;;)
+    {
+        owner->state = tree_read(a, r, owner->node, work);
+        if (owner->state != BUDDY_SPLIT)
+            return owner->state >= BUDDY_FREE && owner->state <= BUDDY_INTERNAL;
+        if (!owner->order)
+            return 0;
+        owner->order--;
+        unsigned right = (uint64_t)page - owner->first >= order_page_count(owner->order);
+        owner->node = 2 * owner->node + 1 + right;
+        if (right)
+            owner->first += (uint32_t)order_page_count(owner->order);
+    }
+}
+
 static int owner_find(const struct physical_page_allocator *a, uint32_t page,
                       struct buddy_owner *owner, struct page_work *work)
 {
     const struct physical_page_root *r = root_for_page(a, page, work);
+    return r && owner_walk(a, r, page, owner, work);
+}
+
+/* 0是参数/范围拒绝，-1是权威损坏；完整祖先链只走一次。 */
+static int owner_at_address(const struct physical_page_allocator *a, uint64_t address,
+                            uint32_t *page, struct buddy_owner *owner, struct page_work *work,
+                            int read_only)
+{
+    if (address & BOAROS_PAGE_MASK)
+        return 0;
+    const struct physical_page_root *r = root_for_address(a, address, work);
     if (!r)
         return 0;
-    *owner = (struct buddy_owner){r, 0, r->first_page_index, r->order, 0};
-    for (;;)
+    *page = r->first_page_index + (uint32_t)((address - r->address) >> BOAROS_PAGE_SHIFT);
+    if (read_only)
     {
-        owner->state = tree_get(a, r, owner->node, work);
-        if (owner->state == BUDDY_SPLIT)
+        const struct physical_page_metadata *hint = &a->metadata[*page];
+        page_checked(work);
+        uint32_t offset = *page - r->first_page_index;
+        if (hint->state == PHYSICAL_PAGE_STATE_ALLOCATED_HEAD && hint->order <= r->order &&
+            !(offset & (order_page_count(hint->order) - 1)))
         {
-            if (!owner->order)
-                return 0;
-            owner->order--;
-            unsigned right =
-                (uint64_t)page - owner->first >= order_page_count(owner->order);
-            owner->node = 2 * owner->node + 1 + right;
-            if (right)
-                owner->first += (uint32_t)order_page_count(owner->order);
+            unsigned depth = r->order - hint->order;
+            uint64_t node = (order_page_count(depth) - 1) + (offset >> hint->order);
+            /* 旧尾载荷只给候选位置；ALLOCATED活动节点才证明owner。
+             * 合法合并先退休子节点，过期hint不能越过INACTIVE。祖先损坏由
+             * 修改路径/完整审计发现，只读快路径不宣称检查完整祖先关系。 */
+            if (tree_get(a, r, node, work) == BUDDY_ALLOCATED)
+            {
+                *owner = (struct buddy_owner){r, node, *page, hint->order, BUDDY_ALLOCATED};
+                return 1;
+            }
         }
-        else
-            return owner->state >= BUDDY_FREE && owner->state <= BUDDY_INTERNAL;
     }
+    return owner_walk(a, r, *page, owner, work) ? 1 : -1;
 }
 
 static uint64_t owner_address(const struct buddy_owner *owner)
 {
     return owner->root->address +
-           (((uint64_t)owner->first - owner->root->first_page_index)
-            << BOAROS_PAGE_SHIFT);
+           (((uint64_t)owner->first - owner->root->first_page_index) << BOAROS_PAGE_SHIFT);
 }
 
 static void mark_head(struct physical_page_allocator *a, uint32_t page, unsigned order,
                       enum physical_page_state state, struct page_work *work)
 {
-    a->metadata[page] = (struct physical_page_metadata){
-        PHYSICAL_PAGE_INDEX_NONE,
-        PHYSICAL_PAGE_INDEX_NONE,
-        state == PHYSICAL_PAGE_STATE_ALLOCATED_HEAD ? 1U : 0U,
-        order,
-        state,
-        0};
+    a->metadata[page] =
+        (struct physical_page_metadata){PHYSICAL_PAGE_INDEX_NONE,
+                                        PHYSICAL_PAGE_INDEX_NONE,
+                                        state == PHYSICAL_PAGE_STATE_ALLOCATED_HEAD ? 1U : 0U,
+                                        order,
+                                        state,
+                                        0};
     page_written(work);
 }
 
-static int head_valid(const struct physical_page_allocator *a,
-                      const struct buddy_owner *owner, struct page_work *work)
+static int head_valid(const struct physical_page_allocator *a, const struct buddy_owner *owner,
+                      struct page_work *work)
 {
     const struct physical_page_metadata *m = &a->metadata[owner->first];
     page_checked(work);
@@ -740,18 +771,16 @@ static int head_valid(const struct physical_page_allocator *a,
         return 0;
     if (owner->state == BUDDY_INTERNAL)
         return m->state == PHYSICAL_PAGE_STATE_INTERNAL && !m->reference_count;
-    return owner->state == BUDDY_ALLOCATED &&
-           m->state == PHYSICAL_PAGE_STATE_ALLOCATED_HEAD && m->reference_count &&
-           (!owner->order || m->reference_count == 1);
+    return owner->state == BUDDY_ALLOCATED && m->state == PHYSICAL_PAGE_STATE_ALLOCATED_HEAD &&
+           m->reference_count && (!owner->order || m->reference_count == 1);
 }
 
-static int free_head_plain(const struct physical_page_allocator *a, uint32_t page,
-                           uint32_t order, struct page_work *work)
+static int free_head_plain(const struct physical_page_allocator *a, uint32_t page, uint32_t order,
+                           struct page_work *work)
 {
     struct buddy_owner owner;
-    return owner_find(a, page, &owner, work) && owner.first == page &&
-           owner.order == order && owner.state == BUDDY_FREE &&
-           head_valid(a, &owner, work);
+    return owner_find(a, page, &owner, work) && owner.first == page && owner.order == order &&
+           owner.state == BUDDY_FREE && head_valid(a, &owner, work);
 }
 
 static int free_head_valid(const struct physical_page_allocator *a,
@@ -1259,26 +1288,21 @@ enum physical_page_status physical_page_allocate_order(
     return status;
 }
 
-enum physical_page_status
-physical_page_allocation_order(const struct physical_page_allocator *a,
-                               uint64_t address, uint32_t *order)
+enum physical_page_status physical_page_allocation_order(
+    const struct physical_page_allocator *a, uint64_t address, uint32_t *order)
 {
     PAGE_METADATA_SCOPE(work);
     uint32_t page;
-    if (!allocator_initialized(a) || !order ||
-        !page_lookup_work(a, address, 0, &page, &work))
-        return PHYSICAL_PAGE_STATUS_INVALID;
+    if (!allocator_initialized(a) || !order) return PHYSICAL_PAGE_STATUS_INVALID;
     if (!physical_page_allocator_is_finalized(a))
-        return PHYSICAL_PAGE_STATUS_STATE;
+        return page_lookup(a,address,0,&page) ? PHYSICAL_PAGE_STATUS_STATE : PHYSICAL_PAGE_STATUS_INVALID;
     struct buddy_owner owner;
-    if (!owner_find(a, page, &owner, &work))
-        __builtin_trap();
-    if (owner.state == BUDDY_FREE)
-        return PHYSICAL_PAGE_STATUS_DOUBLE_FREE;
-    if (owner.state != BUDDY_ALLOCATED || owner.first != page)
-        return PHYSICAL_PAGE_STATUS_INVALID;
-    if (!head_valid(a, &owner, &work))
-        __builtin_trap();
+    int found = owner_at_address(a,address,&page,&owner,&work,1);
+    if (!found) return PHYSICAL_PAGE_STATUS_INVALID;
+    if (found < 0) __builtin_trap();
+    if (owner.state == BUDDY_FREE) return PHYSICAL_PAGE_STATUS_DOUBLE_FREE;
+    if (owner.state != BUDDY_ALLOCATED || owner.first != page) return PHYSICAL_PAGE_STATUS_INVALID;
+    if (!head_valid(a,&owner,&work)) __builtin_trap();
     *order = owner.order;
     return PHYSICAL_PAGE_STATUS_OK;
 }
@@ -1294,13 +1318,16 @@ enum physical_page_status physical_page_release_order(struct physical_page_alloc
         physical_page_release_fatal(a, address, order, "order-range", address);
     if (address & BOAROS_PAGE_MASK)
         physical_page_release_fatal(a, address, order, "unaligned-address", address);
-    if (!page_lookup_work(a, address, 0, &page, &work))
-        physical_page_release_fatal(a, address, order, "address-range", address);
     if (!physical_page_allocator_is_finalized(a))
-        physical_page_release_fatal(a, address, order, "not-finalized", address);
+    {
+        if (!page_lookup(a,address,0,&page))
+            physical_page_release_fatal(a,address,order,"address-range",address);
+        physical_page_release_fatal(a,address,order,"not-finalized",address);
+    }
     struct buddy_owner owner;
-    if (!owner_find(a, page, &owner, &work))
-        physical_page_release_fatal(a, address, order, "tree-owner", address);
+    int found = owner_at_address(a,address,&page,&owner,&work,0);
+    if (!found) physical_page_release_fatal(a,address,order,"address-range",address);
+    if (found < 0) physical_page_release_fatal(a,address,order,"tree-owner",address);
     if (owner.state == BUDDY_FREE)
         physical_page_release_fatal(a, address, order, "already-free", address);
     if (owner.state != BUDDY_ALLOCATED || owner.first != page)
@@ -1403,8 +1430,7 @@ enum physical_page_status physical_page_acquire(struct physical_page_allocator *
     uint32_t page;
     struct buddy_owner owner;
     if (!physical_page_allocator_is_finalized(a) || (address & BOAROS_PAGE_MASK) ||
-        !page_lookup_work(a, address, 0, &page, &work) ||
-        !owner_find(a, page, &owner, &work) || owner.first != page || owner.order ||
+        owner_at_address(a,address,&page,&owner,&work,0) != 1 || owner.first != page || owner.order ||
         owner.state != BUDDY_ALLOCATED || !head_valid(a, &owner, &work) ||
         a->metadata[page].reference_count == UINT32_MAX)
         __builtin_trap();
@@ -1421,8 +1447,7 @@ physical_page_reference_count(const struct physical_page_allocator *a, uint64_t 
     uint32_t page;
     struct buddy_owner owner;
     if (!physical_page_allocator_is_finalized(a) || !references ||
-        !page_lookup_work(a, address, 0, &page, &work) ||
-        !owner_find(a, page, &owner, &work) || owner.first != page ||
+        owner_at_address(a,address,&page,&owner,&work,1) != 1 || owner.first != page ||
         owner.state != BUDDY_ALLOCATED || !head_valid(a, &owner, &work))
         __builtin_trap();
     *references = a->metadata[page].reference_count;
@@ -1478,10 +1503,9 @@ physical_page_resolve(const struct physical_page_allocator *allocator,
     {
         uint32_t page;
         struct buddy_owner owner;
-        if (!page_lookup_work(allocator, physical_address, 0, &page, &work))
-            return PHYSICAL_PAGE_STATUS_INVALID;
-        if (!owner_find(allocator, page, &owner, &work))
-            __builtin_trap();
+        int found = owner_at_address(allocator,physical_address,&page,&owner,&work,1);
+        if (!found) return PHYSICAL_PAGE_STATUS_INVALID;
+        if (found < 0) __builtin_trap();
         if (owner.state != BUDDY_ALLOCATED)
             return PHYSICAL_PAGE_STATUS_INVALID;
         if (!head_valid(allocator, &owner, &work))

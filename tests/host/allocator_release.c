@@ -91,6 +91,41 @@ static void corrupt_free_authority(uint64_t address)
     assert(0);
 }
 
+static int corrupt_allocated_ancestor(uint64_t address)
+{
+    const struct test_page_root *roots = (const void *)allocator.roots;
+    for (uint32_t i = 0; i < allocator.root_count; i++) {
+        if (address < roots[i].address || address-roots[i].address >=
+            ((UINT64_C(1) << roots[i].order) * BOAROS_PAGE_SIZE)) continue;
+        uint64_t node = 0, parent = UINT64_MAX;
+        uint64_t offset = (address-roots[i].address)/BOAROS_PAGE_SIZE;
+        unsigned order = roots[i].order;
+        for (;;) {
+            uint64_t bit = (roots[i].node_offset+node)*3, byte = bit/8;
+            unsigned shift = bit%8, value = allocator.tree[byte];
+            if (shift > 5) value |= (unsigned)allocator.tree[byte+1] << 8;
+            unsigned state = (value >> shift) & 7U;
+            if (state != 2) {
+                assert(state == 3);
+                if (parent == UINT64_MAX) return 0;
+                /* 保留活动子owner，把祖先伪造为free；修改和审计仍必须fatal。 */
+                bit = (roots[i].node_offset+parent)*3;
+                byte = bit/8; shift = bit%8; value = allocator.tree[byte];
+                if (shift > 5) value |= (unsigned)allocator.tree[byte+1] << 8;
+                value = (value & ~(7U << shift)) | (1U << shift);
+                allocator.tree[byte] = value;
+                if (shift > 5) allocator.tree[byte+1] = value >> 8;
+                return 1;
+            }
+            assert(order);
+            parent = node;
+            node = node*2+1+((offset >> --order) & 1U);
+        }
+    }
+    assert(0);
+    return 0;
+}
+
 static void *access_page(uint64_t address) { return (void *)(uintptr_t)address; }
 static int page_address(const void *pointer, uint64_t *address)
 {
@@ -236,6 +271,25 @@ static void invalid_release(unsigned int which, uint64_t page, void *object)
         corrupt_free_authority(page);
         (void)physical_page_allocator_audit(&allocator);
         break;
+    case 21: {
+        uint32_t references;
+        physical_page_reference_count(&allocator, page + BOAROS_PAGE_SIZE, &references);
+        break;
+    }
+    case 18:
+    case 19:
+    case 20: {
+        uint64_t single;
+        while (physical_page_allocate(&allocator, &single) == 0) {
+            if (!corrupt_allocated_ancestor(single)) continue;
+            if (which == 18) physical_page_release(&allocator, single);
+            else if (which == 19) physical_page_acquire(&allocator, single);
+            else (void)physical_page_allocator_audit(&allocator);
+            assert(0);
+        }
+        assert(0);
+        break;
+    }
     }
 }
 
@@ -296,6 +350,10 @@ static void check_release_diagnostic(unsigned int which, const char *diagnostic,
         {0, 0U, 0},
         {"reason=buddy-free-block ", 0U, 1},
         {"reason=buddy-free-block ", 1U, 1},
+        {0, 0U, 0},
+        {0, 0U, 0},
+        {0, 0U, 0},
+        {0, 0U, 0},
         {0, 0U, 0},
         {0, 0U, 0},
         {0, 0U, 0},
@@ -379,7 +437,7 @@ int main(void)
     struct rlimit limit = {0, 0};
     assert(setrlimit(RLIMIT_CORE, &limit) == 0);
     test_legal_release_is_silent();
-    for (unsigned int i = 0; i < 18; i++) {
+    for (unsigned int i = 0; i < 22; i++) {
         int output[2];
         char diagnostic[2048];
         size_t length = 0U;

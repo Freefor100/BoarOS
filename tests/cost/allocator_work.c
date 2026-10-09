@@ -53,6 +53,23 @@ static void end_measure(unsigned height, unsigned pages)
     printf("page=%u H=%u checked=%llu written=%llu\n", (unsigned)BOAROS_PAGE_SIZE, height,
            (unsigned long long)checked, (unsigned long long)written);
 }
+
+static void readonly_queries(struct physical_page_allocator *allocator, uint64_t page)
+{
+    for (unsigned operation=0; operation<3; operation++)
+    {
+        void *pointer;
+        uint32_t value;
+        assert(kernel_cost_begin(1,10000000,1,0)==0);
+        if (operation==0) assert(physical_page_resolve(allocator,page,&pointer)==0);
+        else if (operation==1) assert(physical_page_reference_count(allocator,page,&value)==0 && value==1);
+        else assert(physical_page_allocation_order(allocator,page,&value)==0 && value==0);
+        assert(kernel_cost_end(1,0)==0);
+        uint64_t checked,written;
+        assert(kernel_cost_read(0,COST_PAGE_META_CHECKED,&checked)==0 && checked>0 && checked<=10);
+        assert(kernel_cost_read(0,COST_PAGE_META_WRITTEN,&written)==0 && written==0);
+    }
+}
 static void force_split(unsigned order)
 {
     struct physical_page_allocator allocator;
@@ -71,14 +88,43 @@ static void force_split(unsigned order)
     assert(physical_page_allocate(&allocator, &page) == 0);
     end_measure(order+1, 1);
     assert(page >= large && page - large < (uint64_t)block_pages * BOAROS_PAGE_SIZE);
+    readonly_queries(&allocator,page);
     assert(kernel_cost_begin(1, 10000000, 1, 0) == 0);
     assert(physical_page_release(&allocator, page) == 0);
     end_measure(order+1, 1);
+    void *pointer=(void *)1;
+    assert(physical_page_resolve(&allocator,page,&pointer)==PHYSICAL_PAGE_STATUS_INVALID && pointer==(void *)1);
     assert(physical_page_allocator_audit(&allocator) == 0);
     while (count) assert(physical_page_release(&allocator, other[--count]) == 0);
     assert(physical_page_available(&allocator) == initial);
     assert(physical_page_allocator_audit(&allocator) == 0);
     free(other);
+    assert(munmap(pool, pool_bytes) == 0);
+}
+static void stale_heads(void)
+{
+    struct physical_page_allocator allocator;
+    uint64_t pages[256], large;
+    setup(&allocator, 256);
+    uint64_t initial = physical_page_available(&allocator);
+    size_t count = 0;
+    while (physical_page_available(&allocator))
+        assert(physical_page_allocate(&allocator, &pages[count++]) == 0);
+    while (count) assert(physical_page_release(&allocator, pages[--count]) == 0);
+    assert(physical_page_allocate_order(&allocator, 4, &large) == 0);
+    for (unsigned offset = 1; offset < 16; offset++) {
+        uint64_t address = large + offset * BOAROS_PAGE_SIZE;
+        void *pointer;
+        uint32_t value = UINT32_MAX;
+        /* 每个尾页此前都是独立owner；其过期载荷不能绕过已退休树节点。 */
+        assert(physical_page_resolve(&allocator, address, &pointer) == 0);
+        assert(pointer == pool + address - physical_base);
+        assert(physical_page_allocation_order(&allocator, address, &value) == PHYSICAL_PAGE_STATUS_INVALID);
+        assert(value == UINT32_MAX);
+    }
+    assert(physical_page_release_order(&allocator, large, 4) == 0);
+    assert(physical_page_available(&allocator) == initial);
+    assert(physical_page_allocator_audit(&allocator) == 0);
     assert(munmap(pool, pool_bytes) == 0);
 }
 static void random_owners(void)
@@ -209,6 +255,7 @@ int main(void)
 {
     const unsigned orders[] = {6,9,12,15};
     for (unsigned i = 0; i < sizeof(orders)/sizeof(orders[0]); i++) force_split(orders[i]);
+    stale_heads();
     random_owners();
     ranges_and_finalize();
     puts("allocator bounded work and independent owners passed");

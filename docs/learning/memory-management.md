@@ -578,3 +578,18 @@ MM record 的引用、VMA、文件/ELF 后备 pin、驻留来源和退出清理�
 `include/arch/context.h` 同样提供构建期 IRQ 绑定；RV 仍使用保存/恢复 SIE，
 不把名称中立化当成 SMP 互斥。聚焦重建为 `make test-allocator-preemption-host
 test-mm-riscv test-vma-riscv test-uaccess-riscv`。这一分离尚不构成 LA 用户态交付。
+
+
+### 森林查询的成本取舍（2026-10-09）
+
+初始森林500b473保持全祖先检查；固定用户ELF匹配时间暴露典型操作回退，后续减少
+重复查找后仍存在。人已选择只读快路径：活跃块头的几何、ALLOCATED节点及head字段
+可直接验证，高阶内部页/过期载荷回退树路径；修改和独占审计检查祖先关系。合法合并
+先退休子节点，所以此前独立页留下的载荷不能误认新owner。额外反例用公开API把所有
+页先变成单页owner、释放再分配连续块，逐尾页验证解析和order拒绝；祖先损坏仍被
+release/acquire/audit fatal，tail refcount仍fatal，不能把引用错误降为普通INVALID。
+
+4/16KiB强制32768页单页split/coalesce最终逻辑检查67/67、重写94/94；只读活跃头
+查询在单根模型下检查不超过10，独立于H。最终36次匹配时间仍有13.6%–22.4%默认
+匿名生命周期回退；[完整输入/时间与观测开销](cost-baseline.md#buddy-森林匹配时间2026-10-09)
+解释该安全/工作量取舍，不用宿主计数取代客户机吞吐或IRQ尾延迟。
