@@ -21,7 +21,8 @@ static struct kernel_rwlock lock;
 static unsigned order[64], count;
 static unsigned entered[64], leave[64], parked[64], granted[64];
 static pthread_barrier_t segment_entered, segment_released;
-static unsigned segment_enabled;
+static unsigned segment_enabled, finish_pause;
+static pthread_barrier_t finish_entered, finish_released;
 void *sync_test_cpu(void) { return &cpu; }
 struct kernel_io_context *kernel_io_context_current(void) { return &current.io_context; }
 static void initialize(unsigned id)
@@ -40,7 +41,7 @@ int kernel_wait_backend_initialized(void) { return 1; }
 int kernel_wait_backend_signal(struct kernel_task *task) { (void)task; return 0; }
 uint64_t kernel_wait_backend_time(void) { return 1; }
 void kernel_wait_backend_commit(struct kernel_task *task, uint64_t deadline, int interruptible)
-{ (void)deadline; (void)interruptible; task->state = KERNEL_THREAD_STATE_BLOCKED; __atomic_store_n(&parked[task->id - 1], 1, __ATOMIC_RELEASE); }
+{ (void)deadline; (void)interruptible; task->state = KERNEL_THREAD_STATE_BLOCKED; __atomic_fetch_add(&parked[task->id - 1], 1, __ATOMIC_RELEASE); }
 void kernel_wait_backend_notify(struct kernel_task *task, uint32_t reason)
 { task->wake_reason = reason; task->state = KERNEL_THREAD_STATE_READY; }
 void kernel_wait_backend_ready(struct kernel_task *task)
@@ -53,6 +54,19 @@ enum kernel_scheduler_status kernel_wait_backend_switch(struct kernel_task *task
     return KERNEL_SCHEDULER_STATUS_OK;
 }
 void kernel_wait_backend_quiesce(void) { sched_yield(); }
+void __real_kernel_raw_lock_acquire(struct kernel_raw_lock *, struct kernel_raw_guard *);
+void __wrap_kernel_raw_lock_acquire(struct kernel_raw_lock *raw, struct kernel_raw_guard *guard)
+{
+    if (raw == &lock.metadata && current.id == 1 && current.wait.phase == KERNEL_WAIT_FINISHED &&
+        __atomic_load_n(&parked[0], __ATOMIC_ACQUIRE) == 1 &&
+        __atomic_exchange_n(&finish_pause, 0, __ATOMIC_ACQ_REL)) {
+        int result = pthread_barrier_wait(&finish_entered);
+        assert(!result || result == PTHREAD_BARRIER_SERIAL_THREAD);
+        result = pthread_barrier_wait(&finish_released);
+        assert(!result || result == PTHREAD_BARRIER_SERIAL_THREAD);
+    }
+    __real_kernel_raw_lock_acquire(raw, guard);
+}
 void __real_kernel_raw_lock_release(struct kernel_raw_guard *);
 void __wrap_kernel_raw_lock_release(struct kernel_raw_guard *guard)
 {
@@ -98,6 +112,11 @@ static void fifo(unsigned waiters)
     kernel_rwlock_init(&lock, 10, 1);
     kernel_rwlock_write(&lock, &owner);
     count = 0;
+    finish_pause = waiters == 1;
+    if (finish_pause) {
+        assert(!pthread_barrier_init(&finish_entered, 0, 2));
+        assert(!pthread_barrier_init(&finish_released, 0, 2));
+    }
     segment_enabled = waiters == 32;
     if (segment_enabled) {
         assert(!pthread_barrier_init(&segment_entered, 0, 2));
@@ -105,11 +124,25 @@ static void fifo(unsigned waiters)
         entered[32] = leave[32] = parked[32] = granted[32] = 0;
     }
     for (unsigned i = 0; i < waiters; i++) {
-        entered[i] = leave[i] = 0;
+        entered[i] = leave[i] = parked[i] = 0;
         assert(!pthread_create(&threads[i], 0, worker, (void *)(uintptr_t)i));
         queued(i + 1); /* deterministic registration order */
+        if (!i) {
+            while (!__atomic_load_n(&parked[0], __ATOMIC_ACQUIRE)) sched_yield();
+            uintptr_t irq = arch_interrupt_save();
+            assert(kernel_wait_queue_wake_all(&lock.waiters) == KERNEL_SCHEDULER_STATUS_OK);
+            arch_interrupt_restore(irq);
+            if (waiters == 1) {
+                int result = pthread_barrier_wait(&finish_entered);
+                assert(!result || result == PTHREAD_BARRIER_SERIAL_THREAD);
+                kernel_lock_release(&owner);
+                result = pthread_barrier_wait(&finish_released);
+                assert(!result || result == PTHREAD_BARRIER_SERIAL_THREAD);
+            } else while (__atomic_load_n(&parked[0], __ATOMIC_ACQUIRE) < 2) sched_yield();
+            if (waiters > 1) assert(!__atomic_load_n(&entered[0], __ATOMIC_ACQUIRE));
+        }
     }
-    kernel_lock_release(&owner);
+    if (owner.lock) kernel_lock_release(&owner);
     while (!__atomic_load_n(&entered[0], __ATOMIC_ACQUIRE)) sched_yield();
     if (waiters > 1) {
         assert(!__atomic_load_n(&entered[1], __ATOMIC_ACQUIRE));
@@ -147,6 +180,7 @@ static void fifo(unsigned waiters)
     assert(count == waiters + (waiters == 32) && order[0] == 0 && (waiters == 1 || order[1] == 1));
     assert(!lock.writer && !lock.readers && !lock.pending_head && !lock.pending_tail);
     assert(!lock.waiters.registrations && !lock.waiters.borrows);
+    if (waiters == 1) assert(!pthread_barrier_destroy(&finish_entered) && !pthread_barrier_destroy(&finish_released));
 }
 static void fatal_cases(void)
 {

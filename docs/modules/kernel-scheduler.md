@@ -49,7 +49,8 @@ requeue先借task、放当前游标，再收完旧node借用并迁移登记，�
 
 可睡眠RWlock每实例持有rank30内部raw；资格判断与token登记在同一保护下完成，释放raw再park。
 FIFO先授资格再通知，连续读者按原边界分段，每段最多16个等待者，handoff owner覆盖分段间隙。
-已经授予但尚未运行的读者/写者仍占用锁，后来读者不能越过writer。guard的rank/key和任务owner
+已经授予但尚未运行的读者/写者仍占用锁，后来读者不能越过writer。
+通知不等于资格：额外唤醒只更新等待token，不重排FIFO；旧登记结束与重取对象raw之间也允许授资格。guard的rank/key和任务owner
 保持原契约；等待仍不可中断，没有新增timed/interruptible API。
 
 调用方无raw业务锁时，`KERNEL_WAIT_RECHECK`在登记后求值一次非阻塞条件，再park/finish。
