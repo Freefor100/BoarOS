@@ -11,22 +11,19 @@
 
 | 主线 | 尚缺能力 | 完成口径 |
 |---|---|---|
-| 同步基础 | 可睡眠锁内部保护、等待登记/阻塞/唤醒/取消/销毁交接，调度共享状态与对象引用同步 | 不丢 wake、不重复授予；等待和引用 owner 在并发退出时仍存活 |
+| 同步基础 | 调度策略记账、任务索引/生命周期及其他对象引用的跨核保护 | 全局共享状态与每CPU状态边界完整；发布、运行和退出各有唯一 owner |
 | RV 两核 | 独立 secondary 入口/栈，BSS 一次初始化，per-CPU trap/timer/FPU、IPI、远程 wake | 同一任务不双核运行；idle 可被唤醒；正常用户态切换与可信栈回收 |
 | 共享 MM 与子系统 | uaccess pin/权限、COW 发布、活动 CPU、远程 TLB 确认，OFD/cache/DMA 与退出同步 | 复制与撤映射、降权、截断、I/O/close/退出的强制交错正确；确认停止使用后才回收 |
 | 组合与 LA 多核 | RV 2/4 核低内存、故障、真实程序；LA CPU 启动/IPI/TLB/状态保存 | 架构结果独立验收，保留单核对照；正确性成立后再衡量并行收益 |
 
 ### P6b 锁、等待与中断规则
 
-CPU 本地/current、抢占控制与 buddy/slab raw 锁已存在；压力回调仍限定单 CPU。
-已有可睡眠锁会在 IRQ 关闭时显式调度，不能机械替换成 raw 锁。
+CPU 本地/current、抢占控制、buddy/slab raw、代次等待与可睡眠锁内部保护已存在。
+压力回调和业务对象仍限定单 CPU；可睡眠锁释放内部raw后才显式调度，不能机械替换IRQ域。
 接口契约和调用边界见[调度模块](modules/kernel-scheduler.md#smp前置的同步与等待契约2026-10-09)。
 
-- [ ] 闭合条件检查、登记、释放保护与 park 的交接；wake、timeout、cancel、destroy 争用同一注册 owner。
-- [ ] 将可睡眠锁内部元数据接入跨核保护，保持 rank/key、先授予资格再唤醒，禁止持 raw 锁等待 I/O。
-- [ ] 保护调度共享状态与其他对象引用；同一任务的发布、运行和退出必须有唯一 owner。
-
-这些是一个同步基础任务的核心不变量；具体实现方案、代码步骤和单次验收安排在执行会话中确定。
+剩余同步须覆盖策略/任务索引的跨CPU读写、对象引用的最后释放与远程退出关系；
+等待原语的宿主并发不能代替这些业务对象的并发验收。代码步骤和单次安排留在执行会话。
 
 ### P6c TLB 完成与页回收
 
@@ -69,7 +66,7 @@ PTE 撤销/降权后须覆盖活动 CPU 及并发切换者，确认旧翻译不�
 
 | 项目 | 已有事实与剩余问题 | 证据 |
 |---|---|---|
-| allocator 与批量 MM 成本 | 森林的典型回退13.6%–22.4%与后续 raw 互斥新增6.0%–7.3%分别测量；批量 MM 的 IRQ 尾延迟未改善 | [森林](learning/cost-baseline.md#buddy-森林匹配时间2026-10-09)、[raw 对照](learning/cost-baseline.md#allocator-短锁的匹配时间) |
+| allocator 与批量 MM 成本 | 森林13.6%–22.4%、raw互斥6.0%–7.3%、等待交接的默认匿名新增2.5%–4.0%分别测量；后台提交/退出交错与批量MM的IRQ尾延迟仍有成本 | [森林](learning/cost-baseline.md#buddy-森林匹配时间2026-10-09)、[raw 对照](learning/cost-baseline.md#allocator-短锁的匹配时间)、[等待交接](learning/cost-baseline.md#等待交接的匹配时间) |
 | 文件驻留记录范围选择 | 点查询已有哈希，mprotect/部分撤映射仍可能扫描整个驻留链；只改善范围选择/删除，不同时树化全部 MM | [规模边界](learning/single-hart-scale.md)、[MM](modules/kernel-mm.md) |
 | GDT timestamp-touch 候选 | 隔离候选消除了干净 GDT 的 undo/restore 复制，但完整读取仍有负向观察，未进入 main | [时间戳研究](learning/file-timestamps.md) |
 | 串行协议、存储与原生构建成本 | 网络批次仍有大 IRQ 区间；默认预算吞吐、同步/排空及 Lua 工程还有已测成本，按目标阶段归因 | [网络](learning/network-ownership.md)、[预算](learning/data-path-budget-experiments.md)、[工具链](learning/offline-toolchain-probe.md) |
