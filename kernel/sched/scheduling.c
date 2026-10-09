@@ -11,13 +11,13 @@ static int is_rt(const struct kernel_task *task)
 void scheduler_account_runtime(void)
 {
 #if BOAROS_COST_DIAGNOSTICS
-    if (scheduler.current) kernel_cost_account(&scheduler.current->cost);
+    if (kernel_cpu_current()->current) kernel_cost_account(&kernel_cpu_current()->current->cost);
 #endif
     uint64_t now = kernel_time_monotonic_ns();
     uint64_t delta = now - scheduler.rt_bandwidth.last_account_ns;
-    if (scheduler.current && scheduler.current != &scheduler.idle)
-        kernel_sched_policy_charge(&scheduler.current->scheduling, delta);
-    kernel_rt_bandwidth_account(&scheduler.rt_bandwidth, now, is_rt(scheduler.current));
+    if (kernel_cpu_current()->current && kernel_cpu_current()->current != &scheduler.idle)
+        kernel_sched_policy_charge(&kernel_cpu_current()->current->scheduling, delta);
+    kernel_rt_bandwidth_account(&scheduler.rt_bandwidth, now, is_rt(kernel_cpu_current()->current));
 }
 
 struct kernel_task *ready_first(void)
@@ -45,9 +45,9 @@ void ready_enqueue(struct kernel_task *task, int head)
     task->next = 0;
     kernel_sched_enqueue(&scheduler.runqueue, &task->ready_node, task,
                          (unsigned)task->scheduling.priority, head);
-    if (!scheduler.current || scheduler.current == &scheduler.idle ||
-        task->scheduling.priority > scheduler.current->scheduling.priority)
-        scheduler.need_resched = 1;
+    if (!kernel_cpu_current()->current || kernel_cpu_current()->current == &scheduler.idle ||
+        task->scheduling.priority > kernel_cpu_current()->current->scheduling.priority)
+        kernel_cpu_current()->need_resched = 1;
 }
 void ready_append(struct kernel_task *task) { ready_enqueue(task, 0); }
 struct kernel_task *ready_pop(void)
@@ -60,11 +60,11 @@ struct kernel_task *ready_pop(void)
 void scheduler_rearm_timer(void)
 {
     uint64_t delay = kernel_rt_bandwidth_delay(&scheduler.rt_bandwidth,
-        is_rt(scheduler.current),
+        is_rt(kernel_cpu_current()->current),
         scheduler.runqueue.first && scheduler.runqueue.first->priority != 0);
-    if (scheduler.current && scheduler.current != &scheduler.idle &&
-        scheduler.current->scheduling.policy == KERNEL_SCHED_RR) {
-        uint64_t slice = scheduler.current->scheduling.rr_remaining_ns;
+    if (kernel_cpu_current()->current && kernel_cpu_current()->current != &scheduler.idle &&
+        kernel_cpu_current()->current->scheduling.policy == KERNEL_SCHED_RR) {
+        uint64_t slice = kernel_cpu_current()->current->scheduling.rr_remaining_ns;
         if (!slice) slice = 1;
         if (!delay || slice < delay) delay = slice;
     }
@@ -89,7 +89,13 @@ void scheduler_rearm_timer(void)
 enum kernel_scheduler_status scheduler_reschedule(int rotate_other, int voluntary)
 {
     scheduler_account_runtime();
-    struct kernel_task *current = scheduler.current;
+    if (kernel_cpu_current()->preempt_depth) {
+        if (voluntary) __builtin_trap();
+        kernel_cpu_current()->need_resched = 1;
+        scheduler_rearm_timer();
+        return KERNEL_SCHEDULER_STATUS_OK;
+    }
+    struct kernel_task *current = kernel_cpu_current()->current;
     struct kernel_task *next = ready_best();
     int throttled = is_rt(current) && !kernel_rt_bandwidth_eligible(&scheduler.rt_bandwidth);
     int expired = current != &scheduler.idle && kernel_sched_policy_expired(&current->scheduling);
@@ -98,7 +104,7 @@ enum kernel_scheduler_status scheduler_reschedule(int rotate_other, int voluntar
     int rotate = voluntary || expired ||
                  (rotate_other && current->scheduling.policy == KERNEL_SCHED_OTHER);
     if (expired) kernel_sched_policy_rotate(&current->scheduling);
-    scheduler.need_resched = 0;
+    kernel_cpu_current()->need_resched = 0;
     if (!throttled && !higher && !(rotate && next)) {
         scheduler_rearm_timer();
         return KERNEL_SCHEDULER_STATUS_OK;
@@ -114,7 +120,7 @@ enum kernel_scheduler_status scheduler_reschedule(int rotate_other, int voluntar
 void kernel_scheduler_prepare_idle_return(void)
 {
     if (scheduler.initialized != KERNEL_SCHEDULER_INITIALIZED ||
-        scheduler.current != &scheduler.idle || !scheduler.need_resched) return;
+        kernel_cpu_current()->current != &scheduler.idle || !kernel_cpu_current()->need_resched) return;
     /* 仅空闲栈是 IRQ 返回的内核抢占点；启动/清理持锁期间继续延后。 */
     if (scheduler.idle.io_context.locks || scheduler.idle.io_context.backend_depth) return;
     if (scheduler_reschedule(0, 0) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
@@ -154,7 +160,7 @@ int kernel_task_sched_set(struct kernel_task *caller, int32_t pid,
         if (move && queued) ready_remove(task);
         task->scheduling = updated;
         if (move && queued) ready_enqueue(task, updated.priority < old_priority);
-        scheduler.need_resched = 1;
+        kernel_cpu_current()->need_resched = 1;
         scheduler_rearm_timer();
     }
     arch_interrupt_restore(irq);
@@ -184,7 +190,7 @@ int kernel_scheduler_rt_bandwidth_set(int runtime_field, int64_t value)
     int result = kernel_rt_bandwidth_set(&scheduler.rt_bandwidth, runtime_field, value,
         scheduler.rt_bandwidth.last_account_ns, 0);
     if (!result) {
-        scheduler.need_resched = 1;
+        kernel_cpu_current()->need_resched = 1;
         scheduler_rearm_timer();
     }
     arch_interrupt_restore(irq);

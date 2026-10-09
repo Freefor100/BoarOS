@@ -3,6 +3,7 @@
 #define BOAROS_KERNEL_SCHED_PRIVATE_H
 
 #include <kernel/cost.h>
+#include <kernel/cpu.h>
 #include <arch/context.h>
 #include <kernel/files.h>
 #include <kernel/heap.h>
@@ -99,6 +100,7 @@ struct kernel_signal_table {
 
 struct kernel_task {
     struct arch_thread_state arch;
+    struct kernel_cpu *cpu;
     uint64_t magic;
     uint64_t physical_address;
     uint64_t stack_physical_address;
@@ -227,12 +229,10 @@ struct kernel_scheduler {
     struct kernel_pid_allocator pid_allocator;
     uint64_t pid_bitmap[KERNEL_PID_BITMAP_WORDS(KERNEL_PID_LIMIT)];
     struct kernel_task idle;
-    struct kernel_task *current;
     struct kernel_task *cleanup_task;
     struct kernel_wait_queue cleanup_queue;
     struct kernel_sched_runqueue runqueue;
     struct kernel_rt_bandwidth rt_bandwidth;
-    unsigned need_resched;
     struct kernel_task *exited_head;
     struct kernel_task *exited_tail;
     struct kernel_task *blocked_head;

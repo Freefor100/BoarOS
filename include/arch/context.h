@@ -12,5 +12,10 @@ static inline void arch_cpu_wait(void) { __asm__ volatile("wfi" ::: "memory"); }
 #define arch_interrupt_is_enabled riscv_interrupt_is_enabled
 #define arch_current_thread_get riscv_current_thread_get
 #define arch_current_thread_set riscv_current_thread_set
+#ifndef ARCH_TASK_CPU_OFFSET
+#define ARCH_TASK_CPU_OFFSET 32
+static inline void *arch_current_cpu_get(void)
+{ void *v; __asm__ volatile("ld %0, 32(tp)" : "=r"(v)); return v; }
+#endif
 #endif
 #endif

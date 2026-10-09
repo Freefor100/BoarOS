@@ -145,7 +145,7 @@ LA生产任务也沿现有内核栈窗口接口运行：PGDH共享骨架持有�
 
 聚焦入口为 `make test-stack-usage`、`make test-scheduler-cases-riscv`、`make test-scheduler-riscv`、`make test-files-riscv` 和 `make test-signal-riscv`；`make test-userland-riscv` 验证真实 pthread、共享匿名 futex、bitset 绝对 realtime 等待在 stop/continue 后保留掩码和截止时刻。`make test-diff-abi-riscv` 用同一 ELF 对照固定 Linux 的零掩码、超时、错误、按掩码唤醒和 requeue；`make test-glibc-riscv` 验证 glibc 2.44 的 `pthread_join` 消费路径。阶段收口使用 `make test-riscv`。各次实际通过范围以 README 和提交验证说明为准，不把实现路径存在等同于全部线程负载已验证。
 
-尚无 SMP、共享文件 futex、PI futex、实时信号队列、sigaltstack 或 clone3。LoongArch 已验证整数 context、timer 抢占、整数信号与静态 musl TLS/pthread 子集和任务退出回收；标量FPU和原版动态musl/DSO TLS已另行验收；SIMD及更广线程范围未验收。固定语义依据见学习总结的 Linux commit 与 musl 归档。
+尚无 SMP、共享文件 futex、PI futex、实时信号队列、sigaltstack 或 clone3。LoongArch 已验证整数 context、timer 抢占、信号、musl TLS/pthread、动态 musl/DSO TLS、标量 FPU 与 LSX/LASX；更广程序与多核仍需独立验收。固定语义依据见学习总结的 Linux commit 与 musl 归档。
 
 活动普通文件/TCP I/O 的单页暂存由任务持有并跨调用复用：首次使用时分配，调用期间登记在任务的 `io_buffer`，正常调用完成只解除登记。任务资源清理在 socket read/write reservation 之后、MM/文件表和任务栈释放之前解除登记；常驻页在任务最终存储释放时归还。页释放错误遵循物理分配器 fatal 不变量，不进入历史 cleanup 重试链。
 
@@ -191,14 +191,21 @@ pipe/proc状态双握手确认，覆盖同期限、提前信号、默认信号�
 
 ## SMP前置的同步与等待契约（2026-10-09）
 
-当前实现仍为单CPU；跨核锁与抢占/迁移控制尚未接入。四种职责必须分开：
+当前生产实现仍为单CPU。CPU本地状态与raw原语已接入，可睡眠锁和等待交接尚无跨核保护。四种职责必须分开：
 
 | 机制 | 保护与限制 | 当前状态 |
 |---|---|---|
 | 本地IRQ控制 | 保存/恢复本CPU中断；单CPU短元数据发布，允许显式切换 | arch IRQ与KERNEL_IRQ_SCOPE已有 |
-| 抢占/迁移控制 | CPU本地指针借用和current稳定，不提供共享对象互斥 | 无独立跨核契约实现 |
-| 跨核raw短锁 | 共享状态和内存序；不得持锁阻塞、I/O或调用会等待的分配路径 | 未实现 |
+| 抢占/迁移控制 | CPU本地指针借用和current稳定，不提供共享对象互斥 | cpu.h的嵌套深度；timer延后切换，既有安全点消费请求 |
+| 跨核raw短锁 | 共享状态和内存序；不得持锁阻塞、I/O或调用会等待的分配路径 | raw_lock.h的32位acquire/release原子字、CPU guard链与rank/key序 |
 | 可睡眠对象锁 | 任务guard、rank/key、资格交接和对象owner跨睡眠存活 | sync.c已有单CPU实现，内部仍靠单CPU IRQ纪律 |
+
+内核tp仍指向任务，架构前缀之后的CPU关联供当前CPU查询；current与need_resched由CPU记录持有。
+启动任务与idle显式绑定，RV采用固件hart ID并在高地址重定位后重绑，LA读取CPUID CSR。
+bootstrap I/O上下文与任务I/O上下文分开，任务guard和回收深度不迁入CPU。raw guard必须按LIFO由同CPU释放，
+递归、逆序、错误owner和计数损坏fatal；block/yield/退出及可睡眠锁获取拒绝禁止抢占上下文。
+`make test-sync-host`验证真实四线程争用、IRQ恢复及fatal反例，RV scheduler cases验证延后tick请求不丢失。
+这些结果不证明全局运行队列、等待、MM或设备已经具备SMP安全性。
 
 `kernel_rwlock`的栈waiter由阻塞调用持有；授予资格先于wake，新任务不得抢走已授予
 资格。持有guard期间锁对象不能移动/销毁；现有等待不可中断。未来取消/超时要明确

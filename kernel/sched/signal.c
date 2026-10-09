@@ -568,7 +568,7 @@ enum kernel_signal_status kernel_signal_get_pending(
 enum kernel_signal_status kernel_signal_wait_begin(struct kernel_task *task,
                                                    uint64_t mask)
 {
-    if (task != scheduler.current || !signal_dispatchable(task) ||
+    if (task != kernel_cpu_current()->current || !signal_dispatchable(task) ||
         task->signal_wait_mask != 0U) return KERNEL_SIGNAL_STATUS_INVALID_ARGUMENT;
     task->signal_wait_mask = mask & ~SIGNAL_MASK_KILL_STOP;
     return KERNEL_SIGNAL_STATUS_OK;
@@ -582,7 +582,7 @@ enum kernel_signal_status kernel_signal_wait_take(
     uint32_t sig;
     int shared = 0;
 
-    if (task != scheduler.current || !signal_dispatchable(task) || info == 0)
+    if (task != kernel_cpu_current()->current || !signal_dispatchable(task) || info == 0)
         return KERNEL_SIGNAL_STATUS_INVALID_ARGUMENT;
     memset(info, 0, sizeof(*info));
     matching = task->signal_pending & task->signal_wait_mask;
@@ -990,7 +990,7 @@ static void signal_stop_member(struct kernel_task *task, uint32_t sig)
     if (task->state == KERNEL_THREAD_STATE_READY) {
         signal_ready_unlink(task);
     } else if (task->state != KERNEL_THREAD_STATE_RUNNING ||
-               task != scheduler.current) {
+               task != kernel_cpu_current()->current) {
         return;
     }
     task->signal_pending &= ~bit;
@@ -1102,7 +1102,7 @@ enum kernel_signal_status kernel_signal_suspend(struct kernel_task *task,
 {
     enum kernel_wait_wake_reason reason;
 
-    if (task != scheduler.current || !signal_dispatchable(task)) {
+    if (task != kernel_cpu_current()->current || !signal_dispatchable(task)) {
         return KERNEL_SIGNAL_STATUS_INVALID_ARGUMENT;
     }
     task->signal_saved_mask = task->signal_blocked;
@@ -1154,7 +1154,7 @@ void kernel_signal_restore_temporary_mask(
 void kernel_signal_force_fault(struct kernel_task *task, uint32_t sig,
     int32_t code, uint64_t address)
 {
-    if (task != scheduler.current || !signal_dispatchable(task) ||
+    if (task != kernel_cpu_current()->current || !signal_dispatchable(task) ||
         !sig || sig > KERNEL_SIGNAL_COUNT || task->signal_fault.signal) __builtin_trap();
     const struct kernel_signal_action *entry = signal_action_of(task, sig);
     uint64_t mask = signal_mask(sig);

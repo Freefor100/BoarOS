@@ -144,6 +144,19 @@ WAKE，重启成功场景保持用户字不变，直到WAKE明确返回选中一
 在原BoarOS和固定Linux各重复200次通过，完整 `make test-userland-riscv`
 亦通过。重建的常规入口仍是该目标；内核futex实现没有随此测试修正改变。
 
+## CPU 本地与 raw 锁的边界
+
+内核 tp 继续指向任务，任务关联 CPU 记录；它与用户 TLS 的保存完全独立。
+CPU 记录持有 current、待调度标志和短锁/抢占深度，I/O guard 与回收深度仍由任务持有。
+禁止抢占只保证本地执行上下文稳定；共享元数据还需要带 acquire/release 内存序的互斥。
+raw guard 保存原 IRQ 状态并登记到 CPU 持有链，禁止递归、逆序和持锁阻塞。
+timer 可以记账并留下待调度请求，解除禁止抢占不在任意调用栈直接切换。
+
+固定依据为 `references/linux/Documentation/locking/locktypes.rst`，commit
+`f4cdf7ca9a1fdcca413157df19753f388a5a224e`；LA CPU ID 来自
+`references/linux/arch/loongarch/include/asm/loongarch.h` 的 CPUID CSR 0x20。
+宿主四线程互斥与客户机单核抢占是不同证据，二者都不能代替客户机多核等待/回收验收。
+
 ## PID 1 关机与存活后台 owner（2026-10-06）
 
 原版五项脚本全结束后出现 root CLEANUP（0xb）。最小复现为 PID 1 fork 出

@@ -425,6 +425,7 @@ enum kernel_scheduler_status kernel_scheduler_block_current(
     int interruptible,
     enum kernel_wait_wake_reason *wake_reason)
 {
+    kernel_assert_can_block();
     struct kernel_task *current;
     enum kernel_scheduler_status status;
 
@@ -442,7 +443,7 @@ enum kernel_scheduler_status kernel_scheduler_block_current(
     if (status != KERNEL_SCHEDULER_STATUS_OK) {
         return status;
     }
-    current = scheduler.current;
+    current = kernel_cpu_current()->current;
     if (current == &scheduler.idle) {
         return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
     }

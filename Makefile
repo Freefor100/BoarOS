@@ -139,6 +139,8 @@ LWIP_SOURCES := \
 	net/lwip_port/port.c
 
 C_SOURCES := \
+	kernel/cpu.c \
+	kernel/raw_lock.c \
 	arch/riscv/context.c \
 	arch/riscv/direct_map.c \
 	arch/riscv/elf_image.c \
@@ -260,6 +262,8 @@ OBJECTS := \
 	$(patsubst %.c,$(BUILD_DIR)/%.o,$(C_SOURCES)) \
 	$(patsubst %.S,$(BUILD_DIR)/%.o,$(ASM_SOURCES))
 TEST_RUNTIME_C_SOURCES := \
+	kernel/cpu.c \
+	kernel/raw_lock.c \
 	arch/riscv/context.c \
 	arch/riscv/direct_map.c \
 	arch/riscv/elf_image.c \
@@ -1873,3 +1877,9 @@ test-virtio-block-host:
 .PHONY: test-lwext4-dir-empty-host
 test-lwext4-dir-empty-host:
 	python3 -B tests/lwext4-dir-empty-host.py --sanitize
+
+.PHONY: test-sync-host
+test-sync-host:
+	@mkdir -p build/host
+	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -Itests/host/sync -idirafter include tests/host/sync.c kernel/cpu.c kernel/raw_lock.c -o build/host/sync
+	build/host/sync

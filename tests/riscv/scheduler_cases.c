@@ -1245,6 +1245,26 @@ static unsigned run_handoff_cases(struct physical_page_allocator *allocator)
     return failures + (physical_page_available(allocator) != available);
 }
 
+static unsigned deferred_ran;
+static void deferred_entry(void *argument)
+{ (void)argument; deferred_ran++; }
+static unsigned run_deferred_preemption_case(struct physical_page_allocator *allocator)
+{
+    uint64_t before = physical_page_available(allocator);
+    struct kernel_cpu *cpu = kernel_cpu_current();
+    struct kernel_task *current = kernel_task_current();
+    struct kernel_thread_completion completion;
+    if (kernel_thread_create(deferred_entry, 0) != KERNEL_SCHEDULER_STATUS_OK) return 1;
+    kernel_preempt_disable();
+    unsigned failure = kernel_scheduler_on_tick(1) != KERNEL_SCHEDULER_STATUS_OK ||
+        deferred_ran || kernel_task_current() != current || !cpu->need_resched;
+    kernel_preempt_enable();
+    kernel_scheduler_prepare_idle_return();
+    failure += deferred_ran != 1 || kernel_scheduler_reap_one(&completion) != KERNEL_SCHEDULER_STATUS_OK ||
+        physical_page_available(allocator) != before || cpu->preempt_depth || cpu->raw_locks;
+    return failure;
+}
+
 void kernel_main(unsigned long hart_id, const void *dtb)
 {
     struct boot_memory_layout layout;
@@ -1288,6 +1308,7 @@ void kernel_main(unsigned long hart_id, const void *dtb)
     failures += run_deadline_cases(&allocator);
     failures += run_idle_irq_return_case(&allocator);
     failures += run_handoff_cases(&allocator);
+    failures += run_deferred_preemption_case(&allocator);
     failures += run_exit_dispatch_case(&allocator);
     virt_uart_puts("BoarOS: scheduler cases failures=");
     virt_uart_put_hex(failures);

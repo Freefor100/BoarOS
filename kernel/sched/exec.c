@@ -46,7 +46,7 @@ enum kernel_scheduler_status kernel_scheduler_exec_commit(void)
     if (status != KERNEL_SCHEDULER_STATUS_OK) {
         return status;
     }
-    thread = scheduler.current;
+    thread = kernel_cpu_current()->current;
     old_tid = thread->tid;
     transaction = thread->exec_transaction;
     if (thread == &scheduler.idle || thread->arch.user_mode != 1U ||

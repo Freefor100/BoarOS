@@ -2,7 +2,6 @@
 #include <kernel/sync.h>
 #include "private.h"
 
-static struct kernel_io_context bootstrap_io;
 struct kernel_lock_waiter {
     struct kernel_lock_waiter *next;
     struct kernel_io_context *owner;
@@ -14,7 +13,7 @@ struct kernel_lock_waiter {
 struct kernel_io_context *kernel_io_context_current(void)
 {
     struct kernel_task *task = kernel_task_current();
-    return task ? &task->io_context : &bootstrap_io;
+    return task ? &task->io_context : kernel_cpu_current()->bootstrap_io;
 }
 void kernel_rwlock_init(struct kernel_rwlock *lock, uint32_t rank, uintptr_t key)
 {
@@ -23,6 +22,7 @@ void kernel_rwlock_init(struct kernel_rwlock *lock, uint32_t rank, uintptr_t key
 }
 static int acquire(struct kernel_rwlock *lock, struct kernel_lock_guard *guard, int write, int try_only)
 {
+    kernel_assert_can_block();
     COST_SCOPE(acquire_cost, OPERATION_TICKS);
     uintptr_t irq = arch_interrupt_save();
     struct kernel_io_context *owner = kernel_io_context_current();

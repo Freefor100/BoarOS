@@ -52,7 +52,7 @@ static int64_t send_copy_fd;
 #define OP_USER UINT64_C(0x21000000)
 struct kernel_task *__real_kernel_task_current(void);
 struct kernel_task *__wrap_kernel_task_current(void)
-{ return operation_testing && sync_edit ? scheduler.current : __real_kernel_task_current(); }
+{ return operation_testing && sync_edit ? kernel_cpu_current()->current : __real_kernel_task_current(); }
 void __real_kernel_vfs_node_lock(struct kernel_vfs_node *, struct kernel_lock_guard *, int);
 void __wrap_kernel_vfs_node_lock(struct kernel_vfs_node *node, struct kernel_lock_guard *guard, int write)
 {
@@ -191,7 +191,7 @@ static void sync_source_probe(void *argument)
 enum kernel_uaccess_status __wrap_kernel_copy_from_user(struct kernel_mm *mm, void *buffer, uint64_t address, size_t size, size_t *copied)
 {
     if (send_copy_testing && mm == &sync_mm) {
-        if (address == OP_USER && scheduler.current == send_copy_task && !send_copy_paused) {
+        if (address == OP_USER && kernel_cpu_current()->current == send_copy_task && !send_copy_paused) {
             send_copy_paused = 1;
             enum kernel_wait_wake_reason reason;
             check(kernel_scheduler_block_current(&send_copy_held, 0, 0, &reason) == KERNEL_SCHEDULER_STATUS_OK, 310);
@@ -409,7 +409,7 @@ enum kernel_uaccess_status __wrap_kernel_copy_to_user(struct kernel_mm *mm, uint
 {
     if(!receive_testing || mm!=&sync_mm)
         return __real_kernel_copy_to_user(mm,address,buffer,size,copied);
-    if(scheduler.current==receive_holder && address==OP_USER+256 && !receive_paused) {
+    if(kernel_cpu_current()->current==receive_holder && address==OP_USER+256 && !receive_paused) {
         receive_paused=1;
         enum kernel_wait_wake_reason reason;
         check(kernel_scheduler_block_current(&receive_held,0,0,&reason)==KERNEL_SCHEDULER_STATUS_OK,270);
@@ -421,14 +421,14 @@ enum kernel_uaccess_status __wrap_kernel_copy_to_user(struct kernel_mm *mm, uint
 }
 static void receive_owner(void *argument)
 {
-    (void)argument; uintptr_t irq=riscv_interrupt_save(); receive_holder=scheduler.current;
+    (void)argument; uintptr_t irq=riscv_interrupt_save(); receive_holder=kernel_cpu_current()->current;
     int64_t result;
     check(kernel_files_read(&operation_files,&sync_mm,receive_pair[1],OP_USER+256,3,&result)==KERNEL_FILES_STATUS_OK && result==(receive_mode==3 ? -KERNEL_EFAULT : 3),271);
     riscv_interrupt_restore(irq);
 }
 static void receive_follower(void *argument)
 {
-    (void)argument; uintptr_t irq=riscv_interrupt_save(); receive_waiter=scheduler.current;
+    (void)argument; uintptr_t irq=riscv_interrupt_save(); receive_waiter=kernel_cpu_current()->current;
     int64_t result;
     enum kernel_files_status status=kernel_files_read(&operation_files,&sync_mm,receive_pair[1],OP_USER+300,3,&result);
     int64_t expected=(receive_mode==0 || receive_mode==3) ? 0 : receive_mode==1 ? -KERNEL_EAGAIN : -KERNEL_ERESTARTSYS;
@@ -498,14 +498,14 @@ static void receive_reservation_probe(void *argument)
 static void stream_copy_owner(void *argument)
 {
     (void)argument;
-    uintptr_t irq = riscv_interrupt_save(); send_copy_task = scheduler.current;
+    uintptr_t irq = riscv_interrupt_save(); send_copy_task = kernel_cpu_current()->current;
     struct kernel_open_file_description *pin = 0;
     int64_t result;
     check(kernel_files_pin(&operation_files, send_copy_fd, &pin, &result) == KERNEL_FILES_STATUS_OK && !result, 311);
     check(kernel_files_socket_io(&operation_files, &sync_mm, &pin, OP_USER, 3,
         KERNEL_SOCKET_MSG_NOSIGNAL, 1, &result) == KERNEL_FILES_STATUS_OK &&
         result == (send_copy_mode == 0 ? 3 : send_copy_mode == 1 ? -KERNEL_EPIPE : -KERNEL_EFAULT), 312);
-    check(!scheduler.current->socket_write_request && kernel_open_file_release(&pin) == KERNEL_OPEN_FILE_STATUS_OK, 313);
+    check(!kernel_cpu_current()->current->socket_write_request && kernel_open_file_release(&pin) == KERNEL_OPEN_FILE_STATUS_OK, 313);
     riscv_interrupt_restore(irq);
 }
 static void stream_copy_probe(void)

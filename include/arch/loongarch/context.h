@@ -1,6 +1,7 @@
 #ifndef BOAROS_ARCH_LOONGARCH_CONTEXT_H
 #define BOAROS_ARCH_LOONGARCH_CONTEXT_H
 #define ARCH_INTERRUPT_ENABLE_MASK 4
+#define ARCH_TASK_CPU_OFFSET 48
 #ifndef __ASSEMBLER__
 #include <stdint.h>
 static inline uintptr_t arch_current_stack(void) { uintptr_t v; __asm__ volatile("move %0, $sp" : "=r"(v)); return v; }
@@ -22,5 +23,7 @@ static inline void *arch_current_thread_get(void)
 { void *v; __asm__ volatile("move %0, $tp" : "=r"(v)); return v; }
 static inline void arch_current_thread_set(void *v)
 { __asm__ volatile("move $tp, %0" :: "r"(v) : "memory"); }
+static inline void *arch_current_cpu_get(void)
+{ void *v; __asm__ volatile("ld.d %0, $tp, 48" : "=r"(v)); return v; }
 #endif
 #endif

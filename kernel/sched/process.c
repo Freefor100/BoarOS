@@ -324,13 +324,13 @@ void process_group_request_exit(struct kernel_task *task,
 void kernel_user_group_exit(enum kernel_thread_exit_reason reason,
                             uint64_t status, uint64_t detail)
 {
-    process_group_request_exit(scheduler.current, reason, status, detail);
+    process_group_request_exit(kernel_cpu_current()->current, reason, status, detail);
     kernel_user_thread_exit(reason, status, detail);
 }
 
 struct arch_fpu_state *arch_process_fpu_borrow_current(void)
 {
-    return &scheduler.current->fpu;
+    return &kernel_cpu_current()->current->fpu;
 }
 
 enum kernel_mm_status kernel_scheduler_resolve_current_user_fault(
@@ -340,12 +340,12 @@ enum kernel_mm_status kernel_scheduler_resolve_current_user_fault(
     if (scheduler.initialized != KERNEL_SCHEDULER_INITIALIZED ||
         arch_interrupt_is_enabled() ||
         validate_current() != KERNEL_SCHEDULER_STATUS_OK ||
-        scheduler.current == &scheduler.idle ||
-        scheduler.current->state != KERNEL_THREAD_STATE_RUNNING ||
-        scheduler.current->arch.user_mode != 1U) {
+        kernel_cpu_current()->current == &scheduler.idle ||
+        kernel_cpu_current()->current->state != KERNEL_THREAD_STATE_RUNNING ||
+        kernel_cpu_current()->current->arch.user_mode != 1U) {
         return KERNEL_MM_STATUS_STATE;
     }
-    return kernel_mm_resolve_user_fault(&scheduler.current->mm,
+    return kernel_mm_resolve_user_fault(&kernel_cpu_current()->current->mm,
                                         virtual_address,
                                         access);
 }
@@ -490,7 +490,7 @@ static void exited_append(struct kernel_task *thread)
 
 enum kernel_scheduler_status process_group_exec_current(void)
 {
-    struct kernel_task *task = scheduler.current;
+    struct kernel_task *task = kernel_cpu_current()->current;
     struct kernel_task *leader = task->group_leader;
     struct kernel_task *member;
     enum kernel_wait_wake_reason reason;
@@ -694,7 +694,7 @@ enum kernel_scheduler_status arch_process_clone_current(
     if (status != KERNEL_SCHEDULER_STATUS_OK) {
         return status;
     }
-    parent = scheduler.current;
+    parent = kernel_cpu_current()->current;
     if (parent == &scheduler.idle || parent->arch.user_mode != 1U ||
         parent->tid_owned != 1U ||
         parent_frame != (const struct arch_trap_frame *)(
@@ -1077,7 +1077,7 @@ enum kernel_scheduler_status kernel_scheduler_wait4_current(
         if (status != KERNEL_SCHEDULER_STATUS_OK) {
             return status;
         }
-        parent = scheduler.current;
+        parent = kernel_cpu_current()->current;
         if (parent == &scheduler.idle || parent->arch.user_mode != 1U ||
             parent->tid_owned != 1U) {
             return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
@@ -1185,17 +1185,18 @@ static enum kernel_scheduler_status reparent_children(struct kernel_task *parent
 int kernel_scheduler_can_sleep(void)
 {
     return scheduler.initialized == KERNEL_SCHEDULER_INITIALIZED &&
-           scheduler.current && scheduler.current != &scheduler.idle;
+           !kernel_cpu_current()->preempt_depth && !kernel_cpu_current()->raw_locks &&
+           kernel_cpu_current()->current && kernel_cpu_current()->current != &scheduler.idle;
 }
 void kernel_scheduler_register_cleanup(void)
 {
     if (arch_interrupt_is_enabled() || !kernel_scheduler_can_sleep() ||
-        scheduler.current->arch.user_mode || scheduler.cleanup_task) __builtin_trap();
-    scheduler.cleanup_task = scheduler.current;
+        kernel_cpu_current()->current->arch.user_mode || scheduler.cleanup_task) __builtin_trap();
+    scheduler.cleanup_task = kernel_cpu_current()->current;
 }
 void kernel_scheduler_wait_cleanup(uint64_t retry_deadline)
 {
-    if (arch_interrupt_is_enabled() || scheduler.current != scheduler.cleanup_task) __builtin_trap();
+    if (arch_interrupt_is_enabled() || kernel_cpu_current()->current != scheduler.cleanup_task) __builtin_trap();
     if (!scheduler.exited_head || retry_deadline) {
         enum kernel_wait_wake_reason reason;
         if (kernel_scheduler_block_current(&scheduler.cleanup_queue, retry_deadline, 1, &reason) != KERNEL_SCHEDULER_STATUS_OK)
@@ -1206,7 +1207,7 @@ void kernel_scheduler_wait_cleanup(uint64_t retry_deadline)
 void kernel_thread_join(struct kernel_thread_join *join)
 {
     uintptr_t irq = arch_interrupt_save();
-    if (!join || join->task == scheduler.current) __builtin_trap();
+    if (!join || join->task == kernel_cpu_current()->current) __builtin_trap();
     while (join->task && join->task->state != KERNEL_THREAD_STATE_EXITED) {
         enum kernel_wait_wake_reason reason;
         if (kernel_scheduler_block_current(&join->waiters, 0, 0, &reason)
@@ -1272,7 +1273,7 @@ enum kernel_scheduler_status kernel_scheduler_reap_one(
     if (status != KERNEL_SCHEDULER_STATUS_OK) {
         return status;
     }
-    if (scheduler.current != (scheduler.cleanup_task ? scheduler.cleanup_task : &scheduler.idle)) {
+    if (kernel_cpu_current()->current != (scheduler.cleanup_task ? scheduler.cleanup_task : &scheduler.idle)) {
         return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
     }
     status = validate_queues();
@@ -1457,14 +1458,14 @@ static void switch_to_fatal_idle(enum kernel_scheduler_status status)
         scheduler.fatal_status = status;
     }
     if (scheduler.idle_context_saved != 0U &&
-        scheduler.current != &scheduler.idle) {
+        kernel_cpu_current()->current != &scheduler.idle) {
         if (activate_thread_address_space(&scheduler.idle) !=
             KERNEL_SCHEDULER_STATUS_OK) {
             for (;;) {
                 arch_cpu_wait();
             }
         }
-        scheduler.current = &scheduler.idle;
+        kernel_cpu_current()->current = &scheduler.idle;
         arch_fpu_switch(0, &scheduler.idle.fpu);
         arch_context_switch(&scheduler.discard_context,
                              &scheduler.idle.context);
@@ -1765,6 +1766,7 @@ static void kernel_thread_finish(
 static void kernel_thread_finish(
     const struct kernel_thread_completion *completion)
 {
+    kernel_assert_can_block();
     struct kernel_task *current;
     struct kernel_task *next;
     enum kernel_scheduler_status cleanup_status =
@@ -1775,7 +1777,7 @@ static void kernel_thread_finish(
         arch_interrupt_is_enabled()) {
         switch_to_fatal_idle(KERNEL_SCHEDULER_STATUS_INVALID_STATE);
     }
-    current = scheduler.current;
+    current = kernel_cpu_current()->current;
     status = validate_current();
     if (status != KERNEL_SCHEDULER_STATUS_OK || current == &scheduler.idle) {
         switch_to_fatal_idle(
@@ -1824,10 +1826,11 @@ static void kernel_thread_finish(
         next->state = KERNEL_THREAD_STATE_RUNNING;
     }
 #if BOAROS_COST_DIAGNOSTICS
-    kernel_cost_switch(&scheduler.current->cost, &next->cost);
+    kernel_cost_switch(&kernel_cpu_current()->current->cost, &next->cost);
 #endif
-    scheduler.current = next;
-    scheduler.need_resched = 0;
+    next->cpu = kernel_cpu_current();
+    kernel_cpu_current()->current = next;
+    kernel_cpu_current()->need_resched = 0;
     scheduler_rearm_timer();
     /* The dying task's FP state is discarded, but the dispatched task
      * must still have its own image reloaded. */
@@ -1879,25 +1882,25 @@ void kernel_user_thread_exit(
         (status == 0U || status > 64U)) {
         switch_to_fatal_idle(KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT);
     }
-    if (scheduler.current == 0 ||
-        scheduler.current->arch.user_mode != 1U) {
+    if (kernel_cpu_current()->current == 0 ||
+        kernel_cpu_current()->current->arch.user_mode != 1U) {
         switch_to_fatal_idle(KERNEL_SCHEDULER_STATUS_INVALID_STATE);
     }
-    completion.tid = scheduler.current->tid;
-    completion.tgid = scheduler.current->group_leader->tid;
+    completion.tid = kernel_cpu_current()->current->tid;
+    completion.tgid = kernel_cpu_current()->current->group_leader->tid;
     if (reason != KERNEL_THREAD_EXIT_SYSCALL)
-        process_group_request_exit(scheduler.current, reason, status, detail);
+        process_group_request_exit(kernel_cpu_current()->current, reason, status, detail);
     kernel_thread_finish(&completion);
 }
 
 struct kernel_task *kernel_task_current(void)
 {
     if (scheduler.initialized != KERNEL_SCHEDULER_INITIALIZED ||
-        scheduler.current == 0 ||
-        arch_current_thread_get() != scheduler.current) {
+        kernel_cpu_current()->current == 0 ||
+        arch_current_thread_get() != kernel_cpu_current()->current) {
         return 0;
     }
-    return scheduler.current;
+    return kernel_cpu_current()->current;
 }
 
 enum kernel_task_status kernel_task_set_tid_address(
@@ -2059,7 +2062,7 @@ enum kernel_task_status kernel_task_mm_borrow(
     if (task == 0 || mm == 0) {
         return KERNEL_TASK_STATUS_INVALID_ARGUMENT;
     }
-    if (task != scheduler.current ||
+    if (task != kernel_cpu_current()->current ||
         task->magic != KERNEL_THREAD_MAGIC ||
         task->state != KERNEL_THREAD_STATE_RUNNING ||
         task->arch.user_mode != 1U ||
@@ -2077,7 +2080,7 @@ enum kernel_task_status kernel_task_mm_borrow_mutable(
     if (task == 0 || mm == 0) {
         return KERNEL_TASK_STATUS_INVALID_ARGUMENT;
     }
-    if (task != scheduler.current ||
+    if (task != kernel_cpu_current()->current ||
         task->magic != KERNEL_THREAD_MAGIC ||
         task->state != KERNEL_THREAD_STATE_RUNNING ||
         task->arch.user_mode != 1U ||
@@ -2091,7 +2094,7 @@ enum kernel_task_status kernel_task_mm_borrow_mutable(
 enum kernel_task_status validate_task_resource_borrow(
     const struct kernel_task *task)
 {
-    if (task != scheduler.current ||
+    if (task != kernel_cpu_current()->current ||
         task->magic != KERNEL_THREAD_MAGIC ||
         task->state != KERNEL_THREAD_STATE_RUNNING ||
         task->arch.user_mode != 1U) {
@@ -2146,9 +2149,9 @@ enum kernel_task_status kernel_task_fs_context_borrow(
 
 void kernel_task_prepare_user_return(void)
 {
-    if (scheduler.need_resched && scheduler_reschedule(0, 0) != KERNEL_SCHEDULER_STATUS_OK)
+    if (kernel_cpu_current()->need_resched && scheduler_reschedule(0, 0) != KERNEL_SCHEDULER_STATUS_OK)
         __builtin_trap();
-    struct kernel_task *task = scheduler.current;
+    struct kernel_task *task = kernel_cpu_current()->current;
     if (task == 0 || task->arch.user_mode != 1U) return;
     uint64_t address = task->set_tid_address;
     task->set_tid_address = 0U;

@@ -24,6 +24,25 @@
 #include "private.h"
 
 struct kernel_scheduler scheduler;
+static struct kernel_cpu boot_cpu;
+static struct kernel_task bootstrap_task;
+
+_Static_assert(offsetof(struct kernel_task, cpu) == ARCH_TASK_CPU_OFFSET,
+               "current CPU lookup must preserve the architecture prefix");
+void kernel_cpu_boot_initialize(uint64_t hardware_id)
+{
+    kernel_cpu_initialize(&boot_cpu, hardware_id, &bootstrap_task.io_context);
+    bootstrap_task.cpu = &boot_cpu;
+    arch_current_thread_set(&bootstrap_task);
+}
+void kernel_cpu_boot_rebind(void)
+{
+    /* RV重定位后重新取高地址；任何短锁都不能跨地址切换持有。 */
+    if (boot_cpu.raw_locks || boot_cpu.preempt_depth || boot_cpu.current) __builtin_trap();
+    boot_cpu.bootstrap_io = &bootstrap_task.io_context;
+    bootstrap_task.cpu = &boot_cpu;
+    arch_current_thread_set(&bootstrap_task);
+}
 static int identity_heap_address(const void *pointer, uint64_t *address)
 {
     return arch_direct_map_va_to_pa((uint64_t)(uintptr_t)pointer, 1U, address)
@@ -236,24 +255,24 @@ enum kernel_scheduler_status validate_current(void)
     enum kernel_scheduler_status status;
     uintptr_t stack_pointer;
 
-    if (scheduler.current == 0 ||
-        arch_current_thread_get() != scheduler.current) {
+    if (kernel_cpu_current()->current == 0 ||
+        arch_current_thread_get() != kernel_cpu_current()->current) {
         return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
     }
-    expected_state = scheduler.current->idle != 0U
+    expected_state = kernel_cpu_current()->current->idle != 0U
                          ? KERNEL_THREAD_STATE_IDLE
                          : KERNEL_THREAD_STATE_RUNNING;
-    status = validate_thread(scheduler.current, expected_state);
+    status = validate_thread(kernel_cpu_current()->current, expected_state);
     if (status != KERNEL_SCHEDULER_STATUS_OK) {
         return status;
     }
 
     stack_pointer = current_sp();
-    if (stack_pointer < scheduler.current->stack_low ||
-        stack_pointer >= scheduler.current->stack_high) {
+    if (stack_pointer < kernel_cpu_current()->current->stack_low ||
+        stack_pointer >= kernel_cpu_current()->current->stack_high) {
         return KERNEL_SCHEDULER_STATUS_STACK_CORRUPT;
     }
-    if (arch_mmu_current_context() != arch_thread_mm(&scheduler.current->arch)) {
+    if (arch_mmu_current_context() != arch_thread_mm(&kernel_cpu_current()->current->arch)) {
         return KERNEL_SCHEDULER_STATUS_ADDRESS_SPACE;
     }
     return KERNEL_SCHEDULER_STATUS_OK;
@@ -359,6 +378,7 @@ enum kernel_scheduler_status validate_queues(void)
 enum kernel_scheduler_status scheduler_switch_current_away(
     struct kernel_task *previous)
 {
+    kernel_assert_can_block();
     scheduler_account_runtime();
     struct kernel_task *next = ready_best();
     if (!next) next = &scheduler.idle;
@@ -371,8 +391,9 @@ enum kernel_scheduler_status scheduler_switch_current_away(
 #if BOAROS_COST_DIAGNOSTICS
     kernel_cost_switch(&previous->cost, &next->cost);
 #endif
-    scheduler.current = next;
-    scheduler.need_resched = 0;
+    next->cpu = kernel_cpu_current();
+    kernel_cpu_current()->current = next;
+    kernel_cpu_current()->need_resched = 0;
     scheduler_rearm_timer();
     if (next == previous) return KERNEL_SCHEDULER_STATUS_OK;
     arch_fpu_switch(&previous->fpu, &next->fpu);
@@ -464,6 +485,7 @@ enum kernel_scheduler_status allocate_task_storage(struct kernel_task **task)
                                              KERNEL_SCHEDULER_STATUS_PAGE_ACCESS);
     clear_page(metadata);
     thread = metadata;
+    thread->cpu = kernel_cpu_current();
     thread->physical_address = metadata_address;
     thread->stack_physical_address = KERNEL_THREAD_NO_PAGE;
     status = physical_page_allocate_order(scheduler.allocator,
@@ -538,7 +560,7 @@ enum kernel_scheduler_status release_task_stack(struct kernel_task *thread)
     uint64_t free_bytes;
     uint64_t used_bytes;
 
-    if (thread == scheduler.current || thread->idle != 0U)
+    if (thread == kernel_cpu_current()->current || thread->idle != 0U)
         return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
     if (thread->stack_physical_address == KERNEL_THREAD_NO_PAGE)
         return thread->stack_low == 0U && thread->stack_high == 0U &&
@@ -648,6 +670,7 @@ enum kernel_scheduler_status kernel_scheduler_init(
             != KERNEL_HEAP_STATUS_OK) return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
     scheduler.kernel_context = kernel_context;
     scheduler.idle.arch.kernel_sp = idle_stack_high;
+    scheduler.idle.cpu = kernel_cpu_current();
     scheduler.idle.arch.user_sp = 0U;
     scheduler.idle.arch.user_mode = 0U;
     arch_thread_set_mm(&scheduler.idle.arch, scheduler.kernel_context);
@@ -679,12 +702,12 @@ enum kernel_scheduler_status kernel_scheduler_init(
 #if BOAROS_COST_DIAGNOSTICS
     scheduler.idle.cost.wait_flags = 128;
 #endif
-    scheduler.current = &scheduler.idle;
+    kernel_cpu_current()->current = &scheduler.idle;
     scheduler.cleanup_task = 0;
     kernel_wait_queue_init(&scheduler.cleanup_queue);
     memset(&scheduler.runqueue, 0, sizeof(scheduler.runqueue));
     kernel_rt_bandwidth_init(&scheduler.rt_bandwidth, kernel_time_monotonic_ns());
-    scheduler.need_resched = 0;
+    kernel_cpu_current()->need_resched = 0;
     scheduler.exited_head = 0;
     scheduler.exited_tail = 0;
     scheduler.blocked_head = 0;
@@ -1053,6 +1076,7 @@ enum kernel_scheduler_status kernel_scheduler_on_tick(uint64_t elapsed_ticks)
 
 enum kernel_scheduler_status kernel_scheduler_yield_current(void)
 {
+    kernel_assert_can_block();
     if (scheduler.initialized != KERNEL_SCHEDULER_INITIALIZED)
         return KERNEL_SCHEDULER_STATUS_NOT_INITIALIZED;
     if (arch_interrupt_is_enabled()) return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
@@ -1066,7 +1090,7 @@ enum kernel_scheduler_status kernel_scheduler_yield_current(void)
 
 void kernel_scheduler_charge_ticks(uint64_t elapsed_ticks, int from_user)
 {
-    struct kernel_task *current = scheduler.current;
+    struct kernel_task *current = kernel_cpu_current()->current;
 
     if (current == &scheduler.idle) {
         scheduler.idle_ticks += elapsed_ticks;

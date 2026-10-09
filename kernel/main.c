@@ -9,6 +9,7 @@
 #include <arch/riscv/virt_rtc.h>
 #include <arch/riscv/virt_uart.h>
 #include <kernel/boot_memory.h>
+#include <kernel/cpu.h>
 #include <kernel/dtb.h>
 #include <kernel/page.h>
 #include <kernel/physical_page.h>
@@ -805,6 +806,7 @@ void kernel_main(unsigned long hart_id, const void *dtb)
 
 static void kernel_main_high(void)
 {
+    kernel_cpu_boot_rebind();
     enum riscv_sv39_status sv39_status;
     enum physical_page_status page_status;
     enum kernel_scheduler_status scheduler_status;
