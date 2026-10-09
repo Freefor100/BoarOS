@@ -103,6 +103,7 @@ riscv_trap_entry:
     .globl riscv_trap_return
     .type riscv_trap_return, @function
 riscv_trap_return:
+    call kernel_scheduler_switch_finish
     mv a0, sp
     call riscv_trap_return_prepare
     ld t0, RISCV_TRAP_FRAME_SSTATUS(sp)

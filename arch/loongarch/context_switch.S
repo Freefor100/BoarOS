@@ -30,6 +30,7 @@ arch_context_switch:
     jr $ra
     .globl la_kernel_thread_trampoline
 la_kernel_thread_trampoline:
+    bl kernel_scheduler_switch_finish
     li.d $t0, 4
     csrxchg $t0, $t0, 0
     move $a0, $s1

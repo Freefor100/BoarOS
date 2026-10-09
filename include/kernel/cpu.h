@@ -11,6 +11,7 @@ struct kernel_raw_guard;
 struct kernel_cpu {
     uint64_t hardware_id;
     struct kernel_task *current;
+    struct kernel_task *switch_previous;
     struct kernel_io_context *bootstrap_io;
     struct kernel_raw_guard *raw_locks;
     uint32_t initialized, preempt_depth;
@@ -29,4 +30,10 @@ void kernel_cpu_boot_rebind(void);
 void kernel_preempt_disable(void);
 void kernel_preempt_enable(void);
 void kernel_assert_can_block(void);
+static inline void kernel_cpu_request_schedule(struct kernel_cpu *cpu)
+{ __atomic_store_n(&cpu->need_resched, 1U, __ATOMIC_RELEASE); }
+static inline unsigned kernel_cpu_schedule_requested(struct kernel_cpu *cpu)
+{ return __atomic_load_n(&cpu->need_resched, __ATOMIC_ACQUIRE); }
+static inline unsigned kernel_cpu_consume_schedule(struct kernel_cpu *cpu)
+{ return __atomic_exchange_n(&cpu->need_resched, 0U, __ATOMIC_ACQ_REL); }
 #endif

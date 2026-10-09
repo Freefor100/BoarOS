@@ -218,6 +218,7 @@ C_SOURCES := \
 	kernel/sched/signal.c \
 	kernel/sched/tty.c \
 	kernel/sched/wait.c \
+	kernel/sched/park.c \
 	kernel/sched/sync.c \
 	kernel/sched/futex.c \
 	kernel/syscall/dispatch.c \
@@ -337,6 +338,7 @@ TEST_RUNTIME_C_SOURCES := \
 	kernel/sched/signal.c \
 	kernel/sched/tty.c \
 	kernel/sched/wait.c \
+	kernel/sched/park.c \
 	kernel/sched/sync.c \
 	kernel/sched/futex.c \
 	kernel/syscall/dispatch.c \
@@ -1912,3 +1914,18 @@ $(BUILD_DIR)/sync-%: $(OBJECTS) $(BUILD_DIR)/sync-%.o arch/riscv/linker.ld
 test-sync-riscv: $(foreach case,0 1 2 3 4,$(BUILD_DIR)/sync-$(case))
 	python3 -B tests/sync/native.py --arch riscv --qemu $(QEMU_RISCV64) --kernel-dir $(BUILD_DIR)
 test-riscv: test-sync-riscv
+
+.PHONY: test-wait-host
+test-wait-host:
+	@mkdir -p build/host
+	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -Itests/host/sync -idirafter include tests/host/wait.c kernel/cpu.c kernel/raw_lock.c kernel/sched/park.c kernel/sched/runqueue.c -o build/host/wait
+	build/host/wait
+
+$(BUILD_DIR)/wait-native.o: tests/wait/native.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+$(BUILD_DIR)/wait-native: $(OBJECTS) $(BUILD_DIR)/wait-native.o arch/riscv/linker.ld
+	$(CC) $(LDFLAGS) -Wl,--wrap=kernel_scheduler_init,--wrap=kernel_wait_backend_switch -o $@ $(OBJECTS) $(BUILD_DIR)/wait-native.o
+.PHONY: test-wait-riscv
+test-wait-riscv: $(BUILD_DIR)/wait-native
+	python3 -B tests/wait/native.py --arch riscv --qemu $(QEMU_RISCV64) --kernel-dir $(BUILD_DIR)

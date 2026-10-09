@@ -1,4 +1,5 @@
 #include <arch/context.h>
+#include <arch/timer.h>
 #include <kernel/scheduler.h>
 #include <kernel/socket.h>
 
@@ -182,84 +183,12 @@ struct kernel_task *deadline_index_first(void)
     return task;
 }
 
-void kernel_wait_node_init(struct kernel_wait_node *node,
-                           struct kernel_task *task)
+void scheduler_wait_requeue(struct kernel_task *task, struct kernel_wait_queue *queue)
 {
-    if (node != 0) {
-        node->task = task;
-        node->callback = 0;
-        node->context = 0;
-        node->queue = 0;
-        node->previous = 0;
-        node->next = 0;
-    }
-}
-
-void kernel_wait_node_init_callback(struct kernel_wait_node *node,
-                                    kernel_wait_callback_fn callback,
-                                    void *context)
-{
-    if (node != 0) {
-        node->task = 0;
-        node->callback = callback;
-        node->context = context;
-        node->queue = 0;
-        node->previous = 0;
-        node->next = 0;
-    }
-}
-
-void kernel_wait_queue_add(struct kernel_wait_queue *queue,
-                           struct kernel_wait_node *node)
-{
-    if (queue == 0 || node == 0) {
-        return;
-    }
-    node->queue = queue;
-    node->previous = queue->tail;
-    node->next = 0;
-    if (queue->tail != 0) {
-        queue->tail->next = node;
-    } else {
-        queue->head = node;
-    }
-    queue->tail = node;
-}
-
-void kernel_wait_queue_remove(struct kernel_wait_node *node)
-{
-    struct kernel_wait_queue *queue;
-
-    if (node == 0 || node->queue == 0) {
-        return;
-    }
-    queue = node->queue;
-    if (node->previous != 0) {
-        node->previous->next = node->next;
-    } else {
-        queue->head = node->next;
-    }
-    if (node->next != 0) {
-        node->next->previous = node->previous;
-    } else {
-        queue->tail = node->previous;
-    }
-    node->queue = 0;
-    node->previous = 0;
-    node->next = 0;
-}
-
-void scheduler_wait_requeue(struct kernel_task *task,
-                            struct kernel_wait_queue *queue)
-{
-    if (task->wait_queue != 0) {
-        kernel_wait_queue_remove(&task->default_wait_node);
-    }
+    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+    kernel_wait_node_remove_locked(&task->default_wait_node);
     task->wait_queue = queue;
-    if (queue != 0) {
-        task->default_wait_node.task = task;
-        kernel_wait_queue_add(queue, &task->default_wait_node);
-    }
+    if (queue) kernel_wait_node_add_locked(queue, &task->default_wait_node);
 }
 
 /* STOPPED tasks park on their own list so the blocked-list invariant
@@ -299,197 +228,97 @@ void stopped_unlink(struct kernel_task *thread)
     thread->next = 0;
 }
 
-void scheduler_wake_task(struct kernel_task *thread, uint32_t reason)
+struct kernel_wait_record *kernel_wait_record_of(struct kernel_task *task) { return &task->wait; }
+struct kernel_wait_node *kernel_wait_default_node(struct kernel_task *task) { return &task->default_wait_node; }
+struct kernel_task *kernel_wait_current_task(void)
+{
+    struct kernel_task *task = kernel_cpu_current()->current;
+    return task && !task->idle ? task : 0;
+}
+int kernel_wait_backend_initialized(void) { return scheduler.initialized == KERNEL_SCHEDULER_INITIALIZED; }
+int kernel_wait_backend_signal(struct kernel_task *task)
+{ return task->arch.user_mode && (task->terminate_requested || kernel_signal_has_pending(task)); }
+uint64_t kernel_wait_backend_time(void) { return arch_time_read(); }
+void kernel_wait_backend_commit(struct kernel_task *task, uint64_t deadline, int interruptible)
+{
+    task->wait.ready_head = 0;
+    task->wait_queue = task->default_wait_node.queue;
+    task->wakeup_deadline = deadline;
+    task->wait_interruptible = interruptible;
+    if (deadline) deadline_index_insert(task);
+#if BOAROS_COST_DIAGNOSTICS
+    kernel_cost_block(&task->cost);
+#endif
+    task->state = KERNEL_THREAD_STATE_BLOCKED;
+    blocked_append(task);
+}
+void kernel_wait_backend_notify(struct kernel_task *task, uint32_t reason)
 {
 #if BOAROS_COST_DIAGNOSTICS
-    kernel_cost_wake(&thread->cost);
-    if (reason == KERNEL_WAIT_TIMEOUT && thread->wakeup_deadline)
-        kernel_cost_timeout(&thread->cost, thread->wakeup_deadline);
+    kernel_cost_wake(&task->cost);
+    if (reason == KERNEL_WAIT_TIMEOUT && task->wakeup_deadline)
+        kernel_cost_timeout(&task->cost, task->wakeup_deadline);
 #endif
-    scheduler_wait_requeue(thread, 0);
-    deadline_index_remove(thread);
-    thread->wakeup_deadline = 0;
-    thread->wait_interruptible = 0U;
-    thread->wake_reason = reason;
-    thread->state = KERNEL_THREAD_STATE_READY;
-    ready_append(thread);
+    blocked_unlink(task);
+    deadline_index_remove(task);
+    kernel_wait_node_remove_locked(&task->default_wait_node);
+    task->wait_queue = 0;
+    task->wakeup_deadline = 0;
+    task->wait_interruptible = 0;
+    task->wake_reason = reason;
+    task->state = KERNEL_THREAD_STATE_READY;
 }
-
-void kernel_wait_queue_init(struct kernel_wait_queue *queue)
+void kernel_wait_backend_ready(struct kernel_task *task) { ready_enqueue_locked(task, task->wait.ready_head); }
+enum kernel_scheduler_status kernel_wait_backend_switch(struct kernel_task *task)
+{ return scheduler_switch_current_away(task); }
+void kernel_wait_backend_quiesce(void)
+{ if (kernel_scheduler_yield_current() != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap(); }
+void scheduler_wake_task(struct kernel_task *task, uint32_t reason)
 {
-    if (queue != 0) {
-        queue->initialized = KERNEL_WAIT_QUEUE_INITIALIZED;
-        queue->head = 0;
-        queue->tail = 0;
-    }
-}
-
-enum kernel_scheduler_status kernel_wait_queue_wake_one(
-    struct kernel_wait_queue *queue)
-{
-    struct kernel_wait_node *node;
-
-    if (queue == 0 || queue->initialized != KERNEL_WAIT_QUEUE_INITIALIZED) {
-        return KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
-    }
-    if (scheduler.initialized != KERNEL_SCHEDULER_INITIALIZED) {
-        return KERNEL_SCHEDULER_STATUS_NOT_INITIALIZED;
-    }
-    if (arch_interrupt_is_enabled()) {
-        return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
-    }
-
-    node = queue->head;
-    while (node != 0) {
-        struct kernel_wait_node *current_node = node;
-        node = node->next;
-        if (current_node->callback != 0) {
-            current_node->callback(current_node, (uint32_t)KERNEL_WAIT_WOKEN);
-            break;
-        } else {
-            struct kernel_task *thread = current_node->task;
-            if (thread != 0 && thread->state == KERNEL_THREAD_STATE_BLOCKED) {
-                blocked_unlink(thread);
-                scheduler_wake_task(thread, (uint32_t)KERNEL_WAIT_WOKEN);
-                break;
-            }
-        }
-    }
-    return KERNEL_SCHEDULER_STATUS_OK;
-}
-
-enum kernel_scheduler_status kernel_wait_queue_wake_all(
-    struct kernel_wait_queue *queue)
-{
-    struct kernel_wait_node *node;
-
-    if (queue == 0 || queue->initialized != KERNEL_WAIT_QUEUE_INITIALIZED) {
-        return KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
-    }
-    if (scheduler.initialized != KERNEL_SCHEDULER_INITIALIZED) {
-        return KERNEL_SCHEDULER_STATUS_NOT_INITIALIZED;
-    }
-    if (arch_interrupt_is_enabled()) {
-        return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
-    }
-    node = queue->head;
-    while (node != 0) {
-        struct kernel_wait_node *current_node = node;
-        node = node->next;
-        if (current_node->callback != 0) {
-            current_node->callback(current_node, (uint32_t)KERNEL_WAIT_WOKEN);
-        } else {
-            struct kernel_task *thread = current_node->task;
-            if (thread != 0 && thread->state == KERNEL_THREAD_STATE_BLOCKED) {
-                blocked_unlink(thread);
-                scheduler_wake_task(thread, (uint32_t)KERNEL_WAIT_WOKEN);
-            }
-        }
-    }
-    return KERNEL_SCHEDULER_STATUS_OK;
+    struct kernel_wait_token token = { task, task->wait.generation };
+    (void)kernel_wait_notify(&token, reason);
 }
 
 enum kernel_scheduler_status kernel_scheduler_expire_deadlines(uint64_t now)
 {
     COST_SCOPE(cost_deadline, DEADLINE_TICKS);
     COST_ADD(DEADLINE_PASSES, 1);
-    struct kernel_task *thread;
-    enum kernel_scheduler_status status;
-
-    if (scheduler.initialized != KERNEL_SCHEDULER_INITIALIZED) {
-        return KERNEL_SCHEDULER_STATUS_NOT_INITIALIZED;
+    if (!kernel_wait_backend_initialized()) return KERNEL_SCHEDULER_STATUS_NOT_INITIALIZED;
+    if (arch_interrupt_is_enabled()) return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
+    {
+        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        struct kernel_task *task;
+        while ((task = deadline_index_first()) && (int64_t)(now - task->wakeup_deadline) >= 0) {
+            struct kernel_wait_token token = {task, task->wait.generation};
+            COST_ADD(DEADLINE_VISITS, 1);
+            if (!kernel_wait_notify_locked(&token, KERNEL_WAIT_TIMEOUT)) __builtin_trap();
+        }
     }
-    if (arch_interrupt_is_enabled()) {
-        return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
-    }
-    status = validate_queues();
-    if (status != KERNEL_SCHEDULER_STATUS_OK) {
-        return status;
-    }
-
-    while ((thread = deadline_index_first()) != 0 &&
-           (int64_t)(now - thread->wakeup_deadline) >= 0) {
-        deadline_index_remove(thread);
-        COST_ADD(DEADLINE_VISITS, 1);
-        blocked_unlink(thread);
-        scheduler_wake_task(thread, (uint32_t)KERNEL_WAIT_TIMEOUT);
-    }
+    /* 协议和信号业务回调不能进入调度raw域。 */
     kernel_socket_expire_timers();
     kernel_signal_timer_expire();
     return KERNEL_SCHEDULER_STATUS_OK;
 }
-
-enum kernel_scheduler_status kernel_scheduler_block_current(
-    struct kernel_wait_queue *queue,
-    uint64_t deadline,
-    int interruptible,
-    enum kernel_wait_wake_reason *wake_reason)
+enum kernel_scheduler_status kernel_scheduler_block_current(struct kernel_wait_queue *queue,
+    uint64_t deadline, int interruptible, enum kernel_wait_wake_reason *reason)
 {
-    kernel_assert_can_block();
-    struct kernel_task *current;
-    enum kernel_scheduler_status status;
-
-    if (scheduler.initialized != KERNEL_SCHEDULER_INITIALIZED) {
-        return KERNEL_SCHEDULER_STATUS_NOT_INITIALIZED;
-    }
-    if (wake_reason == 0 || (interruptible != 0 && interruptible != 1) ||
-        (queue != 0 && queue->initialized != KERNEL_WAIT_QUEUE_INITIALIZED)) {
-        return KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
-    }
-    if (arch_interrupt_is_enabled()) {
-        return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
-    }
-    status = validate_current();
-    if (status != KERNEL_SCHEDULER_STATUS_OK) {
-        return status;
-    }
-    current = kernel_cpu_current()->current;
-    if (current == &scheduler.idle) {
-        return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
-    }
-    status = validate_queues();
-    if (status != KERNEL_SCHEDULER_STATUS_OK) {
-        return status;
-    }
-
-    if (interruptible && current->arch.user_mode &&
-        (current->terminate_requested || kernel_signal_has_pending(current))) {
-        *wake_reason = KERNEL_WAIT_SIGNALLED;
-        return KERNEL_SCHEDULER_STATUS_OK;
-    }
-    scheduler_wait_requeue(current, queue);
-    current->wakeup_deadline = deadline;
-    if (deadline != 0U) deadline_index_insert(current);
-    current->wake_reason = (uint32_t)KERNEL_WAIT_WOKEN;
-    current->wait_interruptible = (uint32_t)interruptible;
-#if BOAROS_COST_DIAGNOSTICS
-    kernel_cost_block(&current->cost);
-#endif
-    current->state = KERNEL_THREAD_STATE_BLOCKED;
-    blocked_append(current);
-    status = scheduler_switch_current_away(current);
-    if (status != KERNEL_SCHEDULER_STATUS_OK) {
-        return status;
-    }
-
-    *wake_reason = (enum kernel_wait_wake_reason)current->wake_reason;
-    return KERNEL_SCHEDULER_STATUS_OK;
+    if (arch_interrupt_is_enabled()) return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
+    if (!reason) return KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
+    struct kernel_wait_token token;
+    enum kernel_scheduler_status status = kernel_wait_prepare(queue, deadline, interruptible, &token);
+    if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
+    status = kernel_wait_park(&token, reason);
+    enum kernel_scheduler_status finish = kernel_wait_finish(&token);
+    return status == KERNEL_SCHEDULER_STATUS_OK ? finish : status;
 }
-
-enum kernel_scheduler_status kernel_scheduler_wake_signal(
-    struct kernel_task *task)
+enum kernel_scheduler_status kernel_scheduler_wake_signal(struct kernel_task *task)
 {
-    if (scheduler.initialized != KERNEL_SCHEDULER_INITIALIZED) {
-        return KERNEL_SCHEDULER_STATUS_NOT_INITIALIZED;
+    if (!kernel_wait_backend_initialized()) return KERNEL_SCHEDULER_STATUS_NOT_INITIALIZED;
+    if (!task) return KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
+    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+    if (task->wait.interruptible) {
+        struct kernel_wait_token token = {task, task->wait.generation};
+        kernel_wait_notify_locked(&token, KERNEL_WAIT_SIGNALLED);
     }
-    if (task == 0 || arch_interrupt_is_enabled()) {
-        return KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
-    }
-    if (task->state != KERNEL_THREAD_STATE_BLOCKED ||
-        task->wait_interruptible == 0U) {
-        return KERNEL_SCHEDULER_STATUS_OK;
-    }
-    blocked_unlink(task);
-    scheduler_wake_task(task, (uint32_t)KERNEL_WAIT_SIGNALLED);
     return KERNEL_SCHEDULER_STATUS_OK;
 }

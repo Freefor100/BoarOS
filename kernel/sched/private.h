@@ -4,6 +4,7 @@
 
 #include <kernel/cost.h>
 #include <kernel/cpu.h>
+#include <kernel/wait_internal.h>
 #include <arch/context.h>
 #include <kernel/files.h>
 #include <kernel/heap.h>
@@ -127,6 +128,7 @@ struct kernel_task {
     uint64_t set_tid_address;
     uint64_t clear_tid_address;
     uint64_t robust_list_head;
+    struct kernel_wait_record wait;
     struct kernel_wait_queue *wait_queue;
     uint64_t wakeup_deadline;
     /* Intrusive ordered index over tasks with a deadline, keyed by
@@ -311,4 +313,8 @@ void stopped_unlink(struct kernel_task *thread);
 enum kernel_signal_status kernel_signal_release_table(
     struct kernel_task *task);
 
+
+void ready_enqueue_locked(struct kernel_task *task, int head);
+struct kernel_task *ready_best_locked(void);
+void ready_remove_locked(struct kernel_task *task);
 #endif

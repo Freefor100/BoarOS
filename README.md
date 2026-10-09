@@ -46,6 +46,7 @@ make test-glibc-riscv test-glibc-loongarch
 make test-diff-abi-riscv test-diff-abi-loongarch
 make test-allocator-cost-host
 make test-sync-host test-allocator-concurrency-host
+make test-wait-host test-wait-riscv test-wait-loongarch
 make test-stack-usage test-stack-usage-la
 ```
 
@@ -60,7 +61,7 @@ make test-stack-usage test-stack-usage-la
 
 当前主线转向 **SMP 同步基础与生命周期正确性**，再进入 RV 两核、共享 MM/TLB 和 LA 多核；
 具体未完成能力与依赖只维护在[开发路线](docs/goals.md)，逐轮执行计划留在会话中。
-CPU 本地/current、嵌套抢占控制与 raw 短锁已接入 buddy/slab 元数据；等待交接、压力回收和其他共享对象仍需跨核保护。
+CPU 本地/current、嵌套抢占控制与 raw 短锁已接入 buddy/slab 元数据；等待代次、借用游标与切换尾部已建立；可睡眠锁内部、压力回收和其他共享对象仍需同步收口。
 
 buddy 已消除小页操作随无关大块页数线性检查/重写的问题，并接入只读查询快路径与完整审计。
 4/16 KiB 工作量及组合门禁通过；森林改造的默认匿名生命周期回退 **13.6%–22.4%**，

@@ -393,6 +393,7 @@ static unsigned long run_create_cases(
 }
 
 static struct kernel_wait_queue test_queue;
+static uint64_t wait_case_deadline;
 static volatile unsigned long timeout_wake_count;
 static volatile unsigned long timeout_reason_value;
 static volatile unsigned long event_wake_count;
@@ -412,7 +413,7 @@ static void blocked_worker(void *argument)
         signal_waiter = kernel_task_current();
     }
     if (kernel_scheduler_block_current(&test_queue,
-                                       slot == 0U ? 1000U : 0U,
+                                       slot == 0U ? wait_case_deadline : 0U,
                                        slot == 2U ? 1 : 0,
                                        &reason) !=
         KERNEL_SCHEDULER_STATUS_OK) {
@@ -556,6 +557,7 @@ static unsigned long run_wait_cases(
     unsigned long failures = 0U;
 
     kernel_wait_queue_init(&test_queue);
+    wait_case_deadline = riscv_time_read() + UINT64_C(1000000000);
 
     failures += expect_status(KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT,
                               kernel_scheduler_block_current(0, 0U, 0, 0));
@@ -605,14 +607,14 @@ static unsigned long run_wait_cases(
         failures++;
     }
     failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
-                              kernel_scheduler_expire_deadlines(999U));
+                              kernel_scheduler_expire_deadlines(wait_case_deadline - 1));
     failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
                               kernel_scheduler_on_tick(1U));
     if (timeout_wake_count != 0U) {
         failures++;
     }
     failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
-                              kernel_scheduler_expire_deadlines(1000U));
+                              kernel_scheduler_expire_deadlines(wait_case_deadline));
     failures += expect_status(KERNEL_SCHEDULER_STATUS_OK,
                               kernel_scheduler_on_tick(1U));
     if (timeout_wake_count != 1U ||
@@ -1006,7 +1008,8 @@ static unsigned long run_deadline_cases(
     uint64_t available = physical_page_available(allocator);
     struct kernel_thread_completion completion;
     unsigned long failures = 0U;
-    uint64_t now = riscv_time_read();
+    /* Manual expiry uses a future origin, independent of construction time. */
+    uint64_t now = riscv_time_read() + UINT64_C(1000000000);
 
     kernel_wait_queue_init(&deadline_queue);
     deadline_wake_count = 0U;

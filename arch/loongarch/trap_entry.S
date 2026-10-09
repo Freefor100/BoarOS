@@ -85,6 +85,7 @@ la_trap_entry:
     bl la_trap_dispatch
     .globl la_trap_return
 la_trap_return:
+    bl kernel_scheduler_switch_finish
     move $a0, $sp
     bl la_trap_return_prepare
     ld.d $t0, $sp, 288

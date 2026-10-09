@@ -34,6 +34,7 @@ void kernel_cpu_boot_initialize(uint64_t hardware_id)
     kernel_cpu_initialize(&boot_cpu, hardware_id, &bootstrap_task.io_context);
     bootstrap_task.cpu = &boot_cpu;
     arch_current_thread_set(&bootstrap_task);
+    kernel_wait_domain_init();
 }
 void kernel_cpu_boot_rebind(void)
 {
@@ -375,30 +376,50 @@ enum kernel_scheduler_status validate_queues(void)
     return KERNEL_SCHEDULER_STATUS_OK;
 }
 
-enum kernel_scheduler_status scheduler_switch_current_away(
-    struct kernel_task *previous)
+void kernel_scheduler_switch_finish(void)
+{
+    struct kernel_cpu *cpu = kernel_cpu_current();
+    if (!cpu->switch_previous) return;
+    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+    struct kernel_task *previous = cpu->switch_previous;
+    cpu->switch_previous = 0;
+    if (previous == cpu->current || !cpu->current->wait.on_cpu) __builtin_trap();
+    kernel_wait_switch_finish_locked(previous);
+}
+
+enum kernel_scheduler_status scheduler_switch_current_away(struct kernel_task *previous)
 {
     kernel_assert_can_block();
     scheduler_account_runtime();
-    struct kernel_task *next = ready_best();
-    if (!next) next = &scheduler.idle;
-    enum kernel_scheduler_status status = activate_thread_address_space(next);
-    if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
-    if (next != &scheduler.idle) {
-        ready_remove(next);
-        next->state = KERNEL_THREAD_STATE_RUNNING;
+    struct kernel_cpu *cpu = kernel_cpu_current();
+    struct kernel_task *next;
+    {
+        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        if (cpu->switch_previous || !previous->wait.on_cpu) __builtin_trap();
+        next = ready_best_locked();
+        if (!next) next = &scheduler.idle;
+        if (next == previous) return KERNEL_SCHEDULER_STATUS_OK;
+        if (next->wait.on_cpu) __builtin_trap();
+        if (next != &scheduler.idle) {
+            ready_remove_locked(next);
+            next->state = KERNEL_THREAD_STATE_RUNNING;
+        }
+        next->wait.on_cpu = 1;
+        next->cpu = cpu;
+        cpu->current = next;
+        cpu->switch_previous = previous;
+        cpu->rotate_other = 0;
     }
+    enum kernel_scheduler_status status = activate_thread_address_space(next);
+    if (status != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
 #if BOAROS_COST_DIAGNOSTICS
     kernel_cost_switch(&previous->cost, &next->cost);
 #endif
-    next->cpu = kernel_cpu_current();
-    kernel_cpu_current()->current = next;
-    kernel_cpu_current()->need_resched = 0;
-    kernel_cpu_current()->rotate_other = 0;
     scheduler_rearm_timer();
-    if (next == previous) return KERNEL_SCHEDULER_STATUS_OK;
     arch_fpu_switch(&previous->fpu, &next->fpu);
+    /* 新栈完成handoff；raw已释放，IRQ仍关闭，旧任务尚不能再次运行/回收。 */
     arch_context_switch(&previous->context, &next->context);
+    kernel_scheduler_switch_finish();
     return KERNEL_SCHEDULER_STATUS_OK;
 }
 
@@ -487,6 +508,8 @@ enum kernel_scheduler_status allocate_task_storage(struct kernel_task **task)
     clear_page(metadata);
     thread = metadata;
     thread->cpu = kernel_cpu_current();
+    kernel_wait_record_init(&thread->wait);
+    kernel_wait_node_init(&thread->default_wait_node, thread);
     thread->physical_address = metadata_address;
     thread->stack_physical_address = KERNEL_THREAD_NO_PAGE;
     status = physical_page_allocate_order(scheduler.allocator,
@@ -557,6 +580,8 @@ enum kernel_scheduler_status allocate_task_storage(struct kernel_task **task)
  * and a GROUP_DEAD leader can later re-enter the exited queue. */
 enum kernel_scheduler_status release_task_stack(struct kernel_task *thread)
 {
+    if (thread && (thread->wait.on_cpu || thread->wait.borrows || thread->wait.nodes ||
+        thread->wait.phase != KERNEL_WAIT_FINISHED)) __builtin_trap();
     const unsigned char *cursor;
     uint64_t free_bytes;
     uint64_t used_bytes;
@@ -611,6 +636,8 @@ enum kernel_scheduler_status release_task_stack(struct kernel_task *thread)
 enum kernel_scheduler_status release_task_storage(
     struct kernel_task *thread, enum kernel_scheduler_status original_status)
 {
+    if (thread->wait.on_cpu || thread->wait.borrows || thread->wait.nodes ||
+        thread->wait.phase != KERNEL_WAIT_FINISHED) __builtin_trap();
     enum kernel_scheduler_status status = release_task_stack(thread);
     if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
     scheduler_forget_task(thread);
@@ -686,6 +713,8 @@ enum kernel_scheduler_status kernel_scheduler_init(
     scheduler.idle.last_child = 0;
     scheduler.idle.previous_sibling = 0;
     scheduler.idle.next_sibling = 0;
+    kernel_wait_record_init(&scheduler.idle.wait);
+    scheduler.idle.wait.on_cpu = 1;
     scheduler.idle.state = KERNEL_THREAD_STATE_IDLE;
     scheduler.idle.idle = 1U;
     scheduler.idle.tid = 0;
@@ -708,7 +737,7 @@ enum kernel_scheduler_status kernel_scheduler_init(
     kernel_wait_queue_init(&scheduler.cleanup_queue);
     memset(&scheduler.runqueue, 0, sizeof(scheduler.runqueue));
     kernel_rt_bandwidth_init(&scheduler.rt_bandwidth, kernel_time_monotonic_ns());
-    kernel_cpu_current()->need_resched = 0;
+    (void)kernel_cpu_consume_schedule(kernel_cpu_current());
     scheduler.exited_head = 0;
     scheduler.exited_tail = 0;
     scheduler.blocked_head = 0;

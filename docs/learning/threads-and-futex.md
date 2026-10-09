@@ -192,3 +192,16 @@ make test-root-orphan-riscv
 
 这是进程/关机生命周期修复，没有修改日志 durable、checkpoint 或设备 reset 语义；
 不为此重跑存储恢复、参数或完整 ABI 矩阵。
+
+## 代次等待与切换尾部
+
+登记与park分离后，wake可能发生在任务仍执行旧栈时。token代次解决旧通知误中下一次等待，
+on_cpu与新栈完成点解决同一任务重新入队或旧栈提前回收；两者解决不同问题。任务提交阻塞后
+即使已经收到通知，也只能在switch_finish后重新发布runnable。回调借用同样不能由摘队代替：
+退休节点保留引用后继，context释放前同步等借用结束。调度raw域只做这些短元数据操作，
+callback在锁外同步运行并拒绝阻塞，业务对象的锁与存活仍由消费者负责。
+
+2026-10-09聚焦验证使用真实`kernel/sched/park.c`的2/4宿主通知线程及RV/LA单CPU512MiB/1GiB
+真实切换；重建命令为`make test-wait-host test-wait-riscv test-wait-loongarch`。固定同步资料仍为
+`references/linux/kernel/sched/core.c`及`include/linux/wait.h`，commit
+`f4cdf7ca9a1fdcca413157df19753f388a5a224e`；实现保留BoarOS的任务资格与owner契约。

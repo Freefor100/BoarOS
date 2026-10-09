@@ -290,7 +290,6 @@ static void request_thread_termination(struct kernel_task *task)
         task->vfork_waiting = 0U;
         if (task->state == KERNEL_THREAD_STATE_BLOCKED &&
             task->wait_queue == &task->vfork_done_queue) {
-            blocked_unlink(task);
             scheduler_wake_task(task, KERNEL_WAIT_SIGNALLED);
         }
     }
@@ -478,14 +477,14 @@ void process_complete_vfork(struct kernel_task *thread)
 
 static void exited_append(struct kernel_task *thread)
 {
-    thread->next = 0;
-    if (scheduler.exited_tail == 0) {
-        scheduler.exited_head = thread;
-    } else {
-        scheduler.exited_tail->next = thread;
+    {
+        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        thread->next = 0;
+        if (scheduler.exited_tail) scheduler.exited_tail->next = thread;
+        else scheduler.exited_head = thread;
+        scheduler.exited_tail = thread;
     }
-    scheduler.exited_tail = thread;
-    if (scheduler.cleanup_queue.head) (void)kernel_wait_queue_wake_all(&scheduler.cleanup_queue);
+    (void)kernel_wait_queue_wake_all(&scheduler.cleanup_queue);
 }
 
 enum kernel_scheduler_status process_group_exec_current(void)
@@ -1286,8 +1285,13 @@ enum kernel_scheduler_status kernel_scheduler_reap_one(
         return KERNEL_SCHEDULER_STATUS_EMPTY;
     }
 
-    thread = scheduler.exited_head;
-    next = thread->next;
+    {
+        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        thread = scheduler.exited_head;
+        if (thread->wait.on_cpu || thread->wait.borrows)
+            return KERNEL_SCHEDULER_STATUS_BUSY;
+        next = thread->next;
+    }
     if (thread->magic != KERNEL_THREAD_MAGIC ||
         thread->state != KERNEL_THREAD_STATE_EXITED ||
         thread->idle != 0U ||
@@ -1813,30 +1817,31 @@ static void kernel_thread_finish(
     if (current->join) (void)kernel_wait_queue_wake_all(&current->join->waiters);
 
     scheduler_account_runtime();
-    /* cleanup 已有可调度 owner；不能把 ready joiner 送入 idle 的 WFI。
-     * 无 worker 的 fixture 仍回到负责回收的可信空闲栈。 */
-    next = scheduler.cleanup_task ? ready_best() : 0;
-    if (!next) next = &scheduler.idle;
+    struct kernel_cpu *cpu = kernel_cpu_current();
+    {
+        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        next = scheduler.cleanup_task ? ready_best_locked() : 0;
+        if (!next) next = &scheduler.idle;
+        if (cpu->switch_previous || next->wait.on_cpu || !current->wait.on_cpu) __builtin_trap();
+        if (next != &scheduler.idle) {
+            ready_remove_locked(next);
+            next->state = KERNEL_THREAD_STATE_RUNNING;
+        }
+        next->wait.on_cpu = 1;
+        next->cpu = cpu;
+        cpu->current = next;
+        cpu->switch_previous = current;
+        cpu->rotate_other = 0;
+    }
     status = activate_thread_address_space(next);
-    if (status != KERNEL_SCHEDULER_STATUS_OK) {
-        switch_to_fatal_idle(status);
-    }
-    if (next != &scheduler.idle) {
-        ready_remove(next);
-        next->state = KERNEL_THREAD_STATE_RUNNING;
-    }
+    if (status != KERNEL_SCHEDULER_STATUS_OK) switch_to_fatal_idle(status);
 #if BOAROS_COST_DIAGNOSTICS
-    kernel_cost_switch(&kernel_cpu_current()->current->cost, &next->cost);
+    kernel_cost_switch(&current->cost, &next->cost);
 #endif
-    next->cpu = kernel_cpu_current();
-    kernel_cpu_current()->current = next;
-    kernel_cpu_current()->rotate_other = 0;
-    kernel_cpu_current()->need_resched = 0;
     scheduler_rearm_timer();
-    /* The dying task's FP state is discarded, but the dispatched task
-     * must still have its own image reloaded. */
     arch_fpu_switch(0, &next->fpu);
     arch_context_switch(&scheduler.discard_context, &next->context);
+    kernel_scheduler_switch_finish();
 
     switch_to_fatal_idle(KERNEL_SCHEDULER_STATUS_INVALID_STATE);
 }
@@ -2151,7 +2156,7 @@ enum kernel_task_status kernel_task_fs_context_borrow(
 
 void kernel_task_prepare_user_return(void)
 {
-    if (kernel_cpu_current()->need_resched && scheduler_reschedule(0, 0) != KERNEL_SCHEDULER_STATUS_OK)
+    if (kernel_cpu_schedule_requested(kernel_cpu_current()) && scheduler_reschedule(0, 0) != KERNEL_SCHEDULER_STATUS_OK)
         __builtin_trap();
     struct kernel_task *task = kernel_cpu_current()->current;
     if (task == 0 || task->arch.user_mode != 1U) return;

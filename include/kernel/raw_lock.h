@@ -4,7 +4,10 @@
 #include <kernel/cost.h>
 #include <stdint.h>
 
-enum kernel_raw_rank { KERNEL_RAW_RANK_HEAP = 10, KERNEL_RAW_RANK_PAGE = 20 };
+enum kernel_raw_rank {
+    KERNEL_RAW_RANK_HEAP = 10, KERNEL_RAW_RANK_PAGE = 20,
+    KERNEL_RAW_RANK_OBJECT = 30, KERNEL_RAW_RANK_SCHEDULER = 40
+};
 /* 初始化/移动仅允许未发布实例；原子字是权威互斥，CPU链负责owner与锁序。 */
 struct kernel_raw_lock { uint32_t word, rank, initialized; };
 struct kernel_raw_guard {

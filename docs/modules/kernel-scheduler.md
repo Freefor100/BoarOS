@@ -14,7 +14,7 @@
 | `kernel/sched/proc.c` | 进程快照、对象路径与缺页/磁盘读取统计 |
 | `kernel/sched/exec.c` | 已准备映像的提交与旧资源清理 |
 | `kernel/sched/sync.c` | 任务 owner 的 mutex/RWlock、锁序与 FIFO 资格交接 |
-| `kernel/sched/wait.c` | 全局 blocked 链、每队列 FIFO、超时和信号唤醒 |
+| `kernel/sched/park.c`、`wait.c` | 代次等待、借用游标、blocked/期限索引及完成仲裁 |
 | `kernel/sched/futex.c` | 256 桶 WAIT/WAKE/REQUEUE、robust-list 退出清理、clear-child-tid 唤醒 |
 | `kernel/sched/signal.c` | 组/线程 pending、disposition、stop/continue 和重启 |
 | `include/arch/task.h`、`arch/riscv/process.c`、`arch/loongarch/context.c` | 构建期线程、地址空间与 trap 操作；各架构初始/clone/exec 寄存器契约 |
@@ -23,12 +23,28 @@
 
 公共 scheduler 头不暴露 Trap Frame；架构 clone 入口由 `include/arch/task.h` 选择，旧 RV 入口保留包装。syscall 通过不透明 task 接口取得 TID/TGID/PPID 和资源，不直接修改调度私有字段。
 
-当前锁、等待队列和调度元数据依赖单CPU中断纪律。`KERNEL_IRQ_SCOPE`既不是跨核锁，
-也不禁止显式阻塞；已有mutex/RWlock在该范围内登记等待并调度，不能整体换成raw
-spinlock。SMP前置契约区分本地IRQ、禁止抢占/迁移、跨核短锁及可睡眠对象锁；
-条件检查、登记、释放保护、阻塞提交和wake必须形成一次交接，并覆盖timeout/cancel
-和队列销毁时的真实owner。现有rank/key与先授予资格再唤醒继续保护；本轮仅盘点和
-定义契约，跨核原语及等待实现留在[下一阶段](../goals.md#p6b-锁等待与中断规则)。
+等待登记、阻塞提交、期限索引和runnable发布使用统一rank40短锁；heap10→physical20、
+对象内部30→调度40是raw锁序。raw不跨架构切换，不允许调度、分配、I/O、用户复制或外部回调。
+业务条件、进程组及缓存/网络数据仍按单CPU纪律保护；等待原语互斥不表示整个内核支持SMP。
+
+`kernel_wait_prepare`为当前任务建立唯一代次token，登记后复查条件，释放对象保护再调用
+`kernel_wait_park`；`kernel_wait_finish`同步撤销绑定节点。wake/期限/signal第一个完成者决定
+原因，旧代次与重复通知无效。多队列节点通过`kernel_wait_node_bind`共享token。
+代次耗尽返回INVALID_STATE且不发布新登记，重复等待和错误owner属于fatal。
+
+任务的on_cpu与CPU切换前驱共同保护旧栈：阻塞提交后的提前wake只记录ready_pending，
+新栈的`kernel_scheduler_switch_finish`才发布旧任务或允许回收。普通返回、首次kernel/user
+入口及退出切换经过同一完成点。调度请求用原子exchange消费，完成点不清除后来请求。
+
+wake使用借用游标；被摘节点保留有引用的退休后继，引用链迭代归还，每段最多16项。
+callback在调度锁外同步执行，临时禁止抢占，不能阻塞；自身只能非阻塞remove。
+释放context前必须remove_sync等待借用归零。queue_close停止新登记，queue_destroy在
+注册或借用未归零时返回BUSY，调用者继续持有queue及业务owner。
+
+聚焦入口：`make test-wait-host test-wait-riscv test-wait-loongarch`。host直接链接park.c、
+真实raw/runqueue，在2/4线程握手下检查提前wake、单次仲裁、旧代次、多队列与退休游标；
+双侧512MiB/1GiB检查真实首次/退出切换、timeout及任务页回到基线。此处是原语与单CPU证据，
+不替代共享MM、业务对象或多核客体的并发验收。
 
 ## 策略、就绪队列与 RT 预算
 

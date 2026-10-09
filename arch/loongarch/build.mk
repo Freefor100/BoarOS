@@ -343,3 +343,12 @@ $(LA_BUILD)/sync-%: $(LA_OBJECTS) $(LA_BUILD)/sync-%.o arch/loongarch/linker.ld
 .PHONY: test-sync-loongarch
 test-sync-loongarch: $(foreach case,0 1 2 3 4,$(LA_BUILD)/sync-$(case)) prepare-la-tools
 	python3 -B tests/sync/native.py --arch loongarch --qemu $(QEMU_LOONGARCH64) --kernel-dir $(LA_BUILD)
+
+$(LA_BUILD)/wait-native.o: tests/wait/native.c
+	@mkdir -p $(dir $@)
+	$(LA_CC) $(LA_CPPFLAGS) $(LA_CFLAGS) -c $< -o $@
+$(LA_BUILD)/wait-native: $(LA_OBJECTS) $(LA_BUILD)/wait-native.o arch/loongarch/linker.ld
+	$(LA_CC) $(LA_FLAGS) -nostdlib -nostartfiles -static -no-pie -T arch/loongarch/linker.ld -Wl,--gc-sections,--wrap=physical_page_allocate,--wrap=physical_page_allocate_order,--wrap=kernel_syscall_dispatch,--wrap=la_boot_tasks,--wrap=kernel_wait_backend_switch -o $@ $(LA_OBJECTS) $(LA_BUILD)/wait-native.o -lgcc
+.PHONY: test-wait-loongarch
+test-wait-loongarch: $(LA_BUILD)/wait-native prepare-la-tools
+	python3 -B tests/wait/native.py --arch loongarch --qemu $(QEMU_LOONGARCH64) --kernel-dir $(LA_BUILD)

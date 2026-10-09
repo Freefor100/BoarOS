@@ -132,7 +132,6 @@ static int64_t futex_wake(const struct kernel_futex_key *source,
 
         if (task != 0 && futex_key_equal(&task->futex_key, source)) {
             if (woken < count && (task->futex_bitset & bitset) != 0U) {
-                blocked_unlink(task);
                 scheduler_wake_task(task, KERNEL_WAIT_WOKEN);
                 woken++;
             } else if (moved < requeue) {
