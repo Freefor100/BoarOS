@@ -22,6 +22,8 @@ static enum fault_kind {
 } fault;
 static int injected, final_statistics;
 static unsigned batch_mode, batch_popped, batch_pushed;
+static int batch_is_write;
+static struct virtio_block_device *wait_irq_device;
 static unsigned char batch_output[8][4096];
 
 /* Independent wire records, from the VirtIO split-ring ABI. */
@@ -71,9 +73,9 @@ static void read_batch_device(void)
         const unsigned char *header = physical_pointer(descriptors[head].address, 16);
         uint32_t type; uint64_t sector;
         memcpy(&type, header, 4); memcpy(&sector, header + 8, 8);
-        assert(type == 0);
+        assert(type == (batch_is_write ? 1U : 0U));
         unsigned data = descriptors[head].next, tail = descriptors[data].next;
-        assert(descriptors[data].flags == 3 && descriptors[tail].flags == 2);
+        assert(descriptors[data].flags == (batch_is_write ? 1 : 3) && descriptors[tail].flags == 2);
         unsigned index = (unsigned)(sector / 8);
         assert(index < 8);
         /* 一个错误不能使仍被设备持有的另一span提前回收。 */
@@ -82,10 +84,14 @@ static void read_batch_device(void)
             (batch_mode == 6 && index == 3 && sector % 8 == 1);
         if (!error) {
             unsigned char *out = physical_pointer(descriptors[data].address, descriptors[data].length);
-            for (unsigned i = 0; i < descriptors[data].length; i++) out[i] = (unsigned char)((sector * 512 + i) * 7 + 3);
+            for (unsigned i = 0; i < descriptors[data].length; i++) {
+                unsigned char expected = (unsigned char)((sector * 512 + i) * 7 + 3);
+                if (batch_is_write) assert(out[i] == expected);
+                else out[i] = expected;
+            }
         }
         *(unsigned char *)physical_pointer(descriptors[tail].address, 1) = error ? 1 : 0;
-        completions[batch_pushed++ % queue_size] = (struct wire_completion){head, error ? 1 : descriptors[data].length + 1};
+        completions[batch_pushed++ % queue_size] = (struct wire_completion){head, error || batch_is_write ? 1 : descriptors[data].length + 1};
     }
     used[1] = (uint16_t)batch_pushed;
     registers[0x60 / 4] = 1;
@@ -175,7 +181,12 @@ enum kernel_scheduler_status kernel_wait_queue_wake_all(struct kernel_wait_queue
 enum kernel_scheduler_status kernel_scheduler_block_current(struct kernel_wait_queue *queue,
     uint64_t deadline, int interruptible, enum kernel_wait_wake_reason *reason)
 {
-    (void)queue; (void)deadline; (void)interruptible; (void)reason;
+    (void)queue; (void)deadline; (void)interruptible;
+    if (wait_irq_device) {
+        block_irq(wait_irq_device);
+        *reason = KERNEL_WAIT_WOKEN;
+        return KERNEL_SCHEDULER_STATUS_OK;
+    }
     abort();
 }
 enum physical_page_status physical_page_allocate_order(struct physical_page_allocator *allocator,
@@ -505,8 +516,52 @@ static void read_batch_case(unsigned version, unsigned mode)
     assert(destroy_model(&device) == RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK && allocations == releases);
 }
 
+/* DMA may publish all replies before the CPU enters its wait registration.
+ * The ring and delayed IRQ are independent of guest request state. */
+static void completed_before_park_case(unsigned version, int writing)
+{
+    struct riscv_virtio_mmio_block device = {0};
+    struct physical_page_allocator allocator = {0};
+    memset(registers, 0, sizeof(registers));
+    registers[0] = 0x74726976; registers[1] = version; registers[2] = 2;
+    registers[0x10 / 4] = 1; registers[0x34 / 4] = 32; registers[0x100 / 4] = 1024;
+    clock_value = 0; fault = BATCH_READ; batch_mode = 0;
+    batch_popped = batch_pushed = 0; batch_is_write = writing;
+    diagnostic_length = 0; diagnostic[0] = 0;
+    assert(initialize_model(&device, registers, sizeof(registers), &allocator,
+        dma_address, 1000) == RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK);
+    device.irq_source = 1; wait_irq_device = &device;
+    struct kernel_block_read_span reads[8];
+    struct kernel_block_span writes[8];
+    for (unsigned i = 0; i < 8; i++) {
+        for (unsigned j = 0; j < 512; j++)
+            batch_output[i][j] = writing ? (unsigned char)((i * 4096 + j) * 7 + 3) : 0xa5;
+        reads[i] = (struct kernel_block_read_span){i * 4096, batch_output[i], 512, 0, 0};
+        writes[i] = (struct kernel_block_span){i * 4096, batch_output[i], 512};
+    }
+    enum kernel_block_status result = writing ? kernel_block_write_batch(&device.block, writes, 8) :
+        kernel_block_read_batch(&device.block, reads, 8);
+    assert(result == KERNEL_BLOCK_STATUS_OK && batch_pushed == 8);
+    /* A completed device operation must not wait for its timeout to be harvested. */
+    assert(clock_value < device.timeout_ticks && !device.statistics.timeouts);
+    assert(!device.active && !device.inflight);
+    for (unsigned i = 0; i < 8; i++) {
+        if (!writing) assert(reads[i].status == KERNEL_BLOCK_STATUS_OK && reads[i].completed == 512);
+        for (unsigned j = 0; j < 512; j++)
+            assert(batch_output[i][j] == (unsigned char)((i * 4096 + j) * 7 + 3));
+    }
+    device.irq_source = 0; wait_irq_device = NULL; batch_is_write = 0;
+    assert(destroy_model(&device) == RISCV_VIRTIO_MMIO_BLOCK_STATUS_OK && allocations == releases);
+    printf("PASS block DMA-before-park transport=%u write=%d: completion and owner drained before deadline\n", version, writing);
+}
+
 int main(int argc, char **argv)
 {
+    if (argc == 2 && !strcmp(argv[1], "pre-park")) {
+        for (unsigned version = 1; version <= 2; version++)
+            for (int writing = 0; writing <= 1; writing++) completed_before_park_case(version, writing);
+        return 0;
+    }
     if (argc == 2 && !strcmp(argv[1], "read-batch")) {
         for (unsigned version = 1; version <= 2; version++)
             for (unsigned mode = 0; mode < 7; mode++) read_batch_case(version, mode);
@@ -534,6 +589,8 @@ int main(int argc, char **argv)
         slow_completion_case(version, 1);
         slow_completion_case(version, 4);
         queue_reuse_case(version);
+        completed_before_park_case(version, 0);
+        completed_before_park_case(version, 1);
         for (unsigned mode = 0; mode < 7; mode++) read_batch_case(version, mode);
         for (unsigned kind = NORMAL; kind <= NO_COMPLETION; ++kind) {
             run_case(version, (enum fault_kind)kind);
