@@ -138,6 +138,13 @@ finalize和显式审计包含全量树/链核对及成员owner路径，不属于
 `kernel/sched/sync.c` 在IRQ关闭时登记并阻塞，所以不能机械替换成持raw锁睡眠。
 现有rank/key与资格交接有保留价值，等待节点和唤醒路径还需要跨核互斥及存活owner。
 
+buddy与heap共享元数据现已分别使用raw锁，锁序固定heap→physical allocator。
+私有slab准备、页申请、清零和resize复制在heap锁外；buddy尝试结束先解锁再分发压力回调。
+resolve在锁内验证owner，解锁后调用映射器，合法调用者自身的页引用覆盖这段借用；
+不能用resolve代替共享MM复制所需的pin。bootstrap/finalize仍要求独占未发布实例。
+4/16 KiB的2/4宿主线程检查独立owner、内容、共享引用、resize和耗尽，结束后完整审计并回到页/堆基线；
+旧IRQ-only实现的两线程负对照触发free-list-insert fatal。压力回调与缓存注销继续保持单CPU契约。
+
 当前uaccess最终得到direct-map指针后没有新增覆盖复制的页引用；尚未复现单核UAF，
 但共享MM跨核执行需要把映射查询与取得pin放在同一保护下。页引用解决存活，不等于
 权限或COW永远不变。远端TLB确认、活动CPU集合与撤映射后的回收必须一起设计，

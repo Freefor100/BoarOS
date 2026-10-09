@@ -411,7 +411,7 @@ static enum kernel_heap_status allocate_small(struct kernel_heap *heap,
     struct kernel_slab *prepared = 0;
     enum kernel_heap_status status;
     {
-        KERNEL_IRQ_SCOPE(irq);
+        KERNEL_RAW_SCOPE(guard, &heap->lock);
         struct kernel_slab *slab = heap->partial_slabs[class_index];
         if (slab) return slab_allocate_slot(heap, slab, class_index, pointer);
     }
@@ -419,7 +419,7 @@ static enum kernel_heap_status allocate_small(struct kernel_heap *heap,
     status = slab_create(heap, class_index, &prepared);
     if (status != KERNEL_HEAP_STATUS_OK) return status;
     {
-        KERNEL_IRQ_SCOPE(irq);
+        KERNEL_RAW_SCOPE(guard, &heap->lock);
         partial_insert(heap, prepared);
         statistics_add_pages(heap, 0U);
         return slab_allocate_slot(heap, prepared, class_index, pointer);
@@ -477,7 +477,7 @@ static enum kernel_heap_status allocate_large(struct kernel_heap *heap,
     }
 
     {
-        KERNEL_IRQ_SCOPE(irq);
+        KERNEL_RAW_SCOPE(guard, &heap->lock);
         statistics_add_pages(heap, order);
         heap->statistics.live_allocations++;
     }
@@ -501,6 +501,7 @@ enum kernel_heap_status kernel_heap_init(
     }
 
     result.page_allocator = page_allocator;
+    kernel_raw_lock_init(&result.lock, KERNEL_RAW_RANK_HEAP);
     result.physical_address = physical_address;
     for (index = 0U; index < KERNEL_HEAP_SIZE_CLASS_COUNT; index++) {
         result.partial_slabs[index] = 0;
@@ -520,6 +521,7 @@ enum kernel_heap_status kernel_heap_allocate(
     size_t size,
     void **pointer)
 {
+    kernel_assert_can_block();
     KERNEL_NO_RECLAIM_IO;
     uint32_t class_index;
     void *result = 0;
@@ -529,7 +531,7 @@ enum kernel_heap_status kernel_heap_allocate(
         return KERNEL_HEAP_STATUS_INVALID;
     }
     {
-        KERNEL_IRQ_SCOPE(irq);
+        KERNEL_RAW_SCOPE(guard, &heap->lock);
         heap->statistics.allocation_calls++;
     }
     COST_ADD(HEAP_CALLS, 1); COST_ADD(HEAP_REQUESTED, size);
@@ -545,7 +547,7 @@ enum kernel_heap_status kernel_heap_allocate(
     }
     if (status != KERNEL_HEAP_STATUS_OK) {
         {
-            KERNEL_IRQ_SCOPE(irq);
+            KERNEL_RAW_SCOPE(guard, &heap->lock);
             heap->statistics.allocation_failures++;
         }
         COST_ADD(HEAP_FAILURES, 1);
@@ -571,7 +573,7 @@ enum kernel_heap_status kernel_heap_allocate_zeroed(
         return KERNEL_HEAP_STATUS_INVALID;
     }
     if (size != 0U && count > SIZE_MAX / size) {
-        KERNEL_IRQ_SCOPE(irq);
+        KERNEL_RAW_SCOPE(guard, &heap->lock);
         heap->statistics.allocation_calls++;
         heap->statistics.allocation_failures++;
         return KERNEL_HEAP_STATUS_OVERFLOW;
@@ -606,7 +608,6 @@ static enum kernel_heap_status allocation_information(
     struct kernel_slab **slab_out,
     uint32_t *slot_index_out)
 {
-    KERNEL_IRQ_SCOPE(irq);
     uintptr_t value = (uintptr_t)pointer;
     uintptr_t page_value = value & ~(uintptr_t)BOAROS_PAGE_MASK;
     uint64_t page_address;
@@ -682,7 +683,6 @@ enum kernel_heap_status kernel_heap_release(
     struct kernel_heap *heap,
     void *pointer)
 {
-    KERNEL_IRQ_SCOPE(irq);
     uint64_t physical_address;
     uint32_t order;
     size_t capacity;
@@ -696,6 +696,7 @@ enum kernel_heap_status kernel_heap_release(
     if (pointer == 0) {
         return KERNEL_HEAP_STATUS_OK;
     }
+    KERNEL_RAW_SCOPE(guard, &heap->lock);
 
     status = allocation_information(heap,
                                     pointer,
@@ -753,6 +754,7 @@ enum kernel_heap_status kernel_heap_resize(
     size_t new_size,
     void **new_pointer)
 {
+    kernel_assert_can_block();
     KERNEL_NO_RECLAIM_IO;
     uint64_t physical_address;
     uint32_t order;
@@ -779,13 +781,16 @@ enum kernel_heap_status kernel_heap_resize(
         return KERNEL_HEAP_STATUS_OVERFLOW;
     }
 
-    status = allocation_information(heap,
-                                    old_pointer,
-                                    &physical_address,
-                                    &order,
-                                    &capacity,
-                                    &slab,
-                                    &slot_index);
+    {
+        KERNEL_RAW_SCOPE(guard, &heap->lock);
+        status = allocation_information(heap,
+                                        old_pointer,
+                                        &physical_address,
+                                        &order,
+                                        &capacity,
+                                        &slab,
+                                        &slot_index);
+    }
     (void)physical_address;
     (void)slab;
     (void)slot_index;
@@ -827,10 +832,10 @@ void kernel_heap_get_statistics(
     const struct kernel_heap *heap,
     struct kernel_heap_statistics *statistics)
 {
-    KERNEL_IRQ_SCOPE(irq);
     if (!heap_initialized(heap) || statistics == 0) {
         return;
     }
+    KERNEL_RAW_SCOPE(guard, (struct kernel_raw_lock *)&heap->lock);
 
     *statistics = heap->statistics;
 }

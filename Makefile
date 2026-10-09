@@ -1478,9 +1478,11 @@ test-lwip-host: build/host/lwip-port
 	$<
 	python3 -B tests/host/network_owner.py --case loopback-work
 
+HOST_CPU_SOURCES := kernel/cpu.c kernel/raw_lock.c tests/host/cpu_context.c
+
 test-allocator-release-host:
 	mkdir -p build/host
-	cc -std=c11 -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=12 -Itests/host/random -Iinclude tests/host/allocator_release.c kernel/physical_page.c mm/heap.c -o build/host/allocator-release
+	cc -std=c11 -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=12 -Itests/host/random -Iinclude tests/host/allocator_release.c kernel/physical_page.c $(HOST_CPU_SOURCES) mm/heap.c -o build/host/allocator-release
 	build/host/allocator-release
 
 .PHONY: test-allocator-cost-host
@@ -1489,7 +1491,7 @@ test-allocator-cost-host:
 	@for shift in 12 14; do \
 		cc -std=c11 -O2 -Wall -Wextra -Werror -Itests/host/random -idirafter include \
 			-DBOAROS_PAGE_SHIFT=$$shift -DBOAROS_COST_DIAGNOSTICS=1 \
-			tests/cost/allocator_work.c kernel/cost.c kernel/physical_page.c \
+			tests/cost/allocator_work.c kernel/cost.c kernel/physical_page.c $(HOST_CPU_SOURCES) \
 			-o build/cost/host/allocator-work-$$shift && \
 		build/cost/host/allocator-work-$$shift || exit; \
 	done
@@ -1702,9 +1704,9 @@ test-cost-host:
 	build/cost/host/account-test
 	cc -std=c11 -Wall -Wextra -Werror -idirafter include -DBOAROS_COST_DIAGNOSTICS=1 tests/cost/irq_test.c kernel/cost.c -o build/cost/host/irq-test
 	build/cost/host/irq-test
-	cc -std=c11 -Wall -Wextra -Werror -Itests/host/random -idirafter include -DBOAROS_PAGE_SHIFT=12 -DBOAROS_COST_DIAGNOSTICS=1 tests/cost/page_test.c kernel/cost.c kernel/physical_page.c -o build/cost/host/page-test
+	cc -std=c11 -Wall -Wextra -Werror -Itests/host/random -idirafter include -DBOAROS_PAGE_SHIFT=12 -DBOAROS_COST_DIAGNOSTICS=1 tests/cost/page_test.c kernel/cost.c kernel/physical_page.c $(HOST_CPU_SOURCES) -o build/cost/host/page-test
 	build/cost/host/page-test
-	cc -std=c11 -Wall -Wextra -Werror -Itests/host/random -idirafter include -DBOAROS_PAGE_SHIFT=12 -DBOAROS_COST_DIAGNOSTICS=1 tests/memory/cost_test.c kernel/cost.c kernel/physical_page.c mm/heap.c mm/uaccess.c -o build/cost/host/memory-test
+	cc -std=c11 -Wall -Wextra -Werror -Itests/host/random -idirafter include -DBOAROS_PAGE_SHIFT=12 -DBOAROS_COST_DIAGNOSTICS=1 tests/memory/cost_test.c kernel/cost.c kernel/physical_page.c $(HOST_CPU_SOURCES) mm/heap.c mm/uaccess.c -o build/cost/host/memory-test
 	build/cost/host/memory-test
 	python3 -B tests/test-cost-report.py
 test-cost-riscv: test-cost-host
@@ -1756,7 +1758,7 @@ test-allocator-preemption-host:
 	mkdir -p build/host/allocator
 	cc -std=c11 -O1 -fno-inline -finstrument-functions -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=12 -Itests/host/allocator -Iinclude -c kernel/physical_page.c -o build/host/allocator/page.o
 	cc -std=c11 -O1 -fno-inline -finstrument-functions -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=12 -Itests/host/allocator -Iinclude -c mm/heap.c -o build/host/allocator/heap.o
-	cc -std=c11 -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=12 -Iinclude tests/host/allocator_preemption.c build/host/allocator/page.o build/host/allocator/heap.o -o build/host/allocator/preemption
+	cc -std=c11 -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=12 -Itests/host/allocator -Iinclude $(HOST_CPU_SOURCES) tests/host/allocator_preemption.c build/host/allocator/page.o build/host/allocator/heap.o -o build/host/allocator/preemption
 	build/host/allocator/preemption
 
 .PHONY: test-fifo-riscv
@@ -1883,3 +1885,13 @@ test-sync-host:
 	@mkdir -p build/host
 	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -Itests/host/sync -idirafter include tests/host/sync.c kernel/cpu.c kernel/raw_lock.c -o build/host/sync
 	build/host/sync
+
+.PHONY: test-allocator-concurrency-host
+test-allocator-concurrency-host:
+	@mkdir -p build/host
+	@for shift in 12 14; do \
+		cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -DBOAROS_PAGE_SHIFT=$$shift \
+			-Itests/host/sync -idirafter include tests/host/allocator_concurrency.c \
+			kernel/cpu.c kernel/raw_lock.c kernel/physical_page.c mm/heap.c -o build/host/allocator-concurrency-$$shift && \
+		build/host/allocator-concurrency-$$shift || exit; \
+	done

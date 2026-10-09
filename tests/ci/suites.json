@@ -2,7 +2,7 @@
   "host": {
     "host": [
       {"name":"ci-contracts","targets":["test-ci-host"]},
-      {"name":"allocator","targets":["test-allocator-release-host","test-allocator-preemption-host","test-allocator-cost-host"]},
+      {"name":"allocator","targets":["test-sync-host","test-allocator-concurrency-host","test-allocator-release-host","test-allocator-preemption-host","test-allocator-cost-host"]},
       {"name":"virtio","targets":["test-virtio-framework-host","test-virtio-block-host","test-virtio-rng-host","test-virtio-net-host","test-pci-host"]},
       {"name":"terminal","targets":["test-tty-host","test-pty-host","test-uart-host"]},
       {"name":"random-clock","targets":["test-random-host","test-rtc-host","test-rtc-loongarch-host"]},

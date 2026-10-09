@@ -64,6 +64,7 @@ enum buddy_state
 
 struct page_work
 {
+    struct kernel_raw_guard guard;
     uintptr_t interrupts;
 #if BOAROS_COST_DIAGNOSTICS
     struct kernel_cost_tag tag;
@@ -71,15 +72,15 @@ struct page_work
 #endif
 };
 
-static struct page_work page_work_begin(void)
+static void page_work_begin(struct page_work *work, const struct physical_page_allocator *allocator)
 {
-    struct page_work work = {0};
-    work.interrupts = arch_interrupt_save();
+    if (allocator && allocator->initialized == PHYSICAL_PAGE_ALLOCATOR_INITIALIZED)
+        kernel_raw_lock_acquire((struct kernel_raw_lock *)&allocator->lock, &work->guard);
+    else work->interrupts = arch_interrupt_save();
 #if BOAROS_COST_DIAGNOSTICS
-    work.tag = kernel_cost_capture();
-    if (work.tag.epoch) work.start = kernel_cost_clock();
+    work->tag = kernel_cost_capture();
+    if (work->tag.epoch) work->start = kernel_cost_clock();
 #endif
-    return work;
 }
 
 static void page_work_end(struct page_work *work)
@@ -88,14 +89,16 @@ static void page_work_end(struct page_work *work)
     uint64_t elapsed = work->tag.epoch ? kernel_cost_clock() - work->start : 0;
 #endif
     /* 先结束元数据计时并恢复IRQ，集中发布不能扩张每条记录的临界区。 */
-    arch_interrupt_restore(work->interrupts);
+    if (work->guard.lock) kernel_raw_lock_release(&work->guard);
+    else arch_interrupt_restore(work->interrupts);
 #if BOAROS_COST_DIAGNOSTICS
     if (work->tag.epoch)
         kernel_cost_page_metadata(work->tag, work->checked, work->written, elapsed);
 #endif
 }
-#define PAGE_METADATA_SCOPE(name)                                                      \
-    struct page_work name __attribute__((cleanup(page_work_end))) = page_work_begin()
+#define PAGE_METADATA_SCOPE(name, allocator) \
+    struct page_work name __attribute__((cleanup(page_work_end))) = {0}; \
+    page_work_begin(&name, (allocator))
 
 static void page_checked(struct page_work *work)
 {
@@ -351,6 +354,7 @@ enum physical_page_status physical_page_allocator_init(
     }
 
     result.pressure_notify = 0;
+    kernel_raw_lock_init(&result.lock, KERNEL_RAW_RANK_PAGE);
     result.pressure_wait = 0;
     result.pressure_context = 0;
     result.shared_anon_pages = 0;
@@ -1198,7 +1202,7 @@ static enum physical_page_status
 physical_page_allocate_order_once(struct physical_page_allocator *a, uint32_t order,
                                   uint64_t *address)
 {
-    PAGE_METADATA_SCOPE(work);
+    PAGE_METADATA_SCOPE(work, a);
     if (!allocator_initialized(a) || !address || order > PHYSICAL_PAGE_MAX_ORDER)
         return PHYSICAL_PAGE_STATUS_INVALID;
     if (!physical_page_allocator_is_finalized(a))
@@ -1251,6 +1255,7 @@ enum physical_page_status physical_page_allocate_order(
     uint32_t order,
     uint64_t *address)
 {
+    kernel_assert_can_block();
     COST_ADD(PAGE_CALLS, 1);
     enum physical_page_status status =
         physical_page_allocate_order_once(allocator, order, address);
@@ -1291,7 +1296,7 @@ enum physical_page_status physical_page_allocate_order(
 enum physical_page_status physical_page_allocation_order(
     const struct physical_page_allocator *a, uint64_t address, uint32_t *order)
 {
-    PAGE_METADATA_SCOPE(work);
+    PAGE_METADATA_SCOPE(work, a);
     uint32_t page;
     if (!allocator_initialized(a) || !order) return PHYSICAL_PAGE_STATUS_INVALID;
     if (!physical_page_allocator_is_finalized(a))
@@ -1310,7 +1315,7 @@ enum physical_page_status physical_page_allocation_order(
 enum physical_page_status physical_page_release_order(struct physical_page_allocator *a,
                                                       uint64_t address, uint32_t order)
 {
-    PAGE_METADATA_SCOPE(work);
+    PAGE_METADATA_SCOPE(work, a);
     uint32_t page;
     if (!allocator_initialized(a))
         physical_page_release_fatal(a, address, order, "allocator-state", address);
@@ -1426,7 +1431,7 @@ enum physical_page_status physical_page_release(
 enum physical_page_status physical_page_acquire(struct physical_page_allocator *a,
                                                 uint64_t address)
 {
-    PAGE_METADATA_SCOPE(work);
+    PAGE_METADATA_SCOPE(work, a);
     uint32_t page;
     struct buddy_owner owner;
     if (!physical_page_allocator_is_finalized(a) || (address & BOAROS_PAGE_MASK) ||
@@ -1443,7 +1448,7 @@ enum physical_page_status
 physical_page_reference_count(const struct physical_page_allocator *a, uint64_t address,
                               uint32_t *references)
 {
-    PAGE_METADATA_SCOPE(work);
+    PAGE_METADATA_SCOPE(work, a);
     uint32_t page;
     struct buddy_owner owner;
     if (!physical_page_allocator_is_finalized(a) || !references ||
@@ -1494,25 +1499,28 @@ enum physical_page_status
 physical_page_resolve(const struct physical_page_allocator *allocator,
                       uint64_t physical_address, void **pointer)
 {
-    PAGE_METADATA_SCOPE(work);
-    if (!allocator_initialized(allocator) || !pointer)
-        return PHYSICAL_PAGE_STATUS_INVALID;
-    if (!allocator->access)
-        return PHYSICAL_PAGE_STATUS_STATE;
-    if (physical_page_allocator_is_finalized(allocator))
     {
-        uint32_t page;
-        struct buddy_owner owner;
-        int found = owner_at_address(allocator,physical_address,&page,&owner,&work,1);
-        if (!found) return PHYSICAL_PAGE_STATUS_INVALID;
-        if (found < 0) __builtin_trap();
-        if (owner.state != BUDDY_ALLOCATED)
+        PAGE_METADATA_SCOPE(work, allocator);
+        if (!allocator_initialized(allocator) || !pointer)
             return PHYSICAL_PAGE_STATUS_INVALID;
-        if (!head_valid(allocator, &owner, &work))
-            __builtin_trap();
+        if (!allocator->access)
+            return PHYSICAL_PAGE_STATUS_STATE;
+        if (physical_page_allocator_is_finalized(allocator))
+        {
+            uint32_t page;
+            struct buddy_owner owner;
+            int found = owner_at_address(allocator,physical_address,&page,&owner,&work,1);
+            if (!found) return PHYSICAL_PAGE_STATUS_INVALID;
+            if (found < 0) __builtin_trap();
+            if (owner.state != BUDDY_ALLOCATED)
+                return PHYSICAL_PAGE_STATUS_INVALID;
+            if (!head_valid(allocator, &owner, &work))
+                __builtin_trap();
+        }
+        else if (!address_was_allocated(allocator, physical_address))
+            return PHYSICAL_PAGE_STATUS_INVALID;
     }
-    else if (!address_was_allocated(allocator, physical_address))
-        return PHYSICAL_PAGE_STATUS_INVALID;
+    /* 调用者已持有页owner；映射回调可只读查询，不借用buddy半成品。 */
     void *result = allocator->access(physical_address);
     if (!result)
         return PHYSICAL_PAGE_STATUS_INVALID;
@@ -1536,7 +1544,7 @@ uint64_t physical_page_available(
     if (!allocator_initialized(allocator)) {
         return 0U;
     }
-
+    KERNEL_RAW_SCOPE(guard, (struct kernel_raw_lock *)&allocator->lock);
     return allocator->available_pages;
 }
 

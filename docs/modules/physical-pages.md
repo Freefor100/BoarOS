@@ -100,8 +100,8 @@ free/split/allocated/internal为权威状态，inactive节点不拥有页，编�
 独占finalized实例上审计；该接口不分配、回收或I/O，固定深度栈遍历包括inactive节点、
 活跃head、free-list成员与覆盖/计数，损坏fatal。非法参数INVALID，未finalized为STATE。
 
-一次元数据操作仍保存/恢复本CPU的IRQ，保证单核timer抢占不能插入半成品；这里
-没有跨核互斥或硬实时承诺。耗尽后的压力回调、I/O等待不在buddy修改区内。
+finalized元数据操作使用每allocator的raw锁，保存/恢复本CPU的IRQ并禁止抢占；这里
+互斥只覆盖分配器元数据，不证明完整SMP或硬实时。耗尽后的压力回调、I/O等待不在buddy修改区内。
 
 `test-allocator-cost-host`在4/16 KiB下用公开API强制64/512/4096/32768页split/coalesce，
 并做10000次随机操作的独立owner模型、每步审计、多range/保留洞和finalize失败验证。
@@ -134,7 +134,7 @@ bootstrap 分散耗尽时 finalize 仍返回 `EMPTY`。当前 QEMU 满足该约�
 512 MiB、1 GiB 和 16 GiB 启动验证；开发板必须按
 真实 DTB 保留区和启动占用重新核对。若未来早期分配规模或稀疏内存使其不成立，应
 改为每 range metadata 或稀疏索引，而不是退回固定容量 heap。模块还没有清零分配、
-多回收器优先级、SMP 并发锁、NUMA、热插拔、CMA 或 per-CPU page cache。
+多回收器优先级、跨核压力回收/快照协议、NUMA、热插拔、CMA 或 per-CPU page cache。
 
 ## 验证
 
@@ -142,6 +142,7 @@ bootstrap 分散耗尽时 finalize 仍返回 `EMPTY`。当前 QEMU 满足该约�
 make test-allocator-preemption-host
 make test-allocator-release-host
 make test-allocator-cost-host
+make test-allocator-concurrency-host
 make test-page-riscv
 make test-riscv
 ```
@@ -181,7 +182,7 @@ worker 在 SIE 开启时也调用堆和物理页分配器。`kernel/irq.h` 的 s
 恢复本 hart 的 SIE；嵌套进入不会提前打开中断，所有正常/失败返回均恢复调用者状态。
 bootstrap 回收链也使用该边界，避免 idle 安全 IRQ 返回中执行另一 owner 后破坏链。
 
-每次 buddy 分配尝试结束后才进行压力回调分发。分发另行关闭 IRQ，使 callback 函数与
+每次buddy分配尝试释放raw锁后才进行压力回调分发。分发仍按单CPU契约另行关闭IRQ，使callback函数与
 context 的读取、非阻塞干净回收、以及等待回调取得自身 owner 之间不能被卸载插入。
 `pressure_wait` 在显式睡眠前增加既有缓存组引用，睡眠期间允许其他任务运行、释放页
 和卸载最后缓存；此时没有未完成的 buddy/heap 元数据修改。回收递归深度在进入等待前

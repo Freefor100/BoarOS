@@ -2,6 +2,7 @@
 #define BOAROS_KERNEL_PHYSICAL_PAGE_H
 
 #include <kernel/boot_memory.h>
+#include <kernel/raw_lock.h>
 
 #include <stdint.h>
 
@@ -39,6 +40,7 @@ struct physical_page_range {
 };
 
 struct physical_page_allocator {
+    struct kernel_raw_lock lock;
     void (*pressure_notify)(void *);
     void (*pressure_wait)(void *);
     void *pressure_context;
