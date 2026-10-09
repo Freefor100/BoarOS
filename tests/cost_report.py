@@ -168,3 +168,25 @@ def validate_replicas(records):
                 if [s['values']['epoch'] for s in row['snapshots']]!=expected_epochs:raise ValueError('boot epoch sequence')
             if row['cost_diagnostics'] and row['timings_ns'] and seen!=set(row['timings_ns']): raise ValueError('window coverage')
     return groups
+
+def validate_locking(timings, snapshots, diagnostics):
+    required = {f'locking-{relationship}-0-{waiters}'
+                for relationship in range(3) for waiters in (1, 8, 32)}
+    required.update(f'locking-1-{operation}-8' for operation in (1, 2, 3, 4))
+    if set(timings) != required or (diagnostics and {s['name'] for s in snapshots} != required):
+        raise ValueError('locking window coverage')
+    if diagnostics:
+        for snapshot in snapshots:
+            values = snapshot['values']
+            if values['foreground.lock15_acquired.value'] == 0:
+                raise ValueError('write operation lock missing')
+            # 普通热写可能全程无睡眠；同步持锁等待和truncate才是强制竞争窗口。
+            if snapshot['name'] in ('locking-1-2-8', 'locking-1-4-8') and values['foreground.lock15_blocks.value'] == 0:
+                raise ValueError('synchronous same inode contention was not exercised')
+
+def validate_resume_selection(case, record, selected):
+    if case not in ('consumer', 'metadata'):
+        return
+    expected = ['consumer-musl-1', 'consumer-glibc-1'] if case == 'metadata' else selected
+    if record.get('consumer_command_names') != expected:
+        raise ValueError('resume command selection differs')

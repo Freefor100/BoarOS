@@ -16,6 +16,8 @@ static void phase(size_t bytes, int protect)
     int gate[2],ready[2];CHECK(pipe(gate)==0 && pipe(ready)==0);pid_t child=fork();CHECK(child>=0);
     if(!child){CHECK(write(ready[1],"r",1)==1);char c;CHECK(read(gate[0],&c,1)==1);_exit(0);}
     char c;CHECK(read(ready[0],&c,1)==1);blocked(child);char name[64];snprintf(name,sizeof(name),"latency-%s-%zu",protect?"protect":"copy",bytes);
+    /* 前一窗口的TTY输出必须真实排空，不能混入本窗口的业务时间。 */
+    CHECK(fflush(stdout)==0);CHECK(tcdrain(STDOUT_FILENO)==0);
     cost_begin();CHECK(write(gate[1],"g",1)==1);
     if(protect){CHECK(mprotect(mapping,bytes,PROT_READ)==0);CHECK(mprotect(mapping,bytes,PROT_READ|PROT_WRITE)==0);}
     else for(unsigned i=0;i<8;i++)CHECK(pwrite(fd,payload,bytes,0)==(ssize_t)bytes);

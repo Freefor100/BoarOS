@@ -13,7 +13,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
-from cost_report import validate_deadline, validate_allocator, parse, validate_expected
+from cost_report import validate_deadline, validate_allocator, parse, validate_expected, validate_locking, validate_resume_selection
 ROOT=Path(__file__).resolve().parents[1]
 CASES=('contract','write','locking','mprotect','deadline','latency','consumer','readers','metadata','allocator')
 IMPLEMENTED=set(CASES)
@@ -45,7 +45,7 @@ def main():
     parser.add_argument('--consumer-readers',action='store_true',help='append fixed-work readers after original commands in the same boot')
     parser.add_argument('--consumer-sync',action='store_true',help='append four 128-write hot 4KiB synchronous probes in the same boot')
     parser.add_argument('--consumer-sync-only',action='store_true',help='controlled synchronous reference, no original iozone commands')
-    parser.add_argument('--coordinator-elf',type=Path,help='reuse a previously frozen consumer coordinator for matched ON/OFF comparisons')
+    parser.add_argument('--coordinator-elf',type=Path,help='reuse a frozen workload ELF for matched ON/OFF comparisons')
     args=parser.parse_args()
     names=[f'consumer-{libc}-{i}' for libc in ('musl','glibc') for i in range(8)]
     selected=names if args.consumer_commands=='all' else [f'consumer-{v.replace(":","-")}' for v in args.consumer_commands.split(',')]
@@ -53,7 +53,7 @@ def main():
     if (not selected and not args.consumer_sync_only) or len(set(selected))!=len(selected) or not set(selected)<=set(names):parser.error('invalid consumer command selection')
     if args.consumer_sync and args.case!='consumer':parser.error('synchronous probes require --case consumer')
     if args.consumer_readers and args.case!='consumer':parser.error('appended readers require --case consumer')
-    if args.coordinator_elf and (args.case not in ('consumer','readers','metadata','allocator','latency') or args.consumer_sync):parser.error('frozen coordinator requires a supported case without new probes')
+    if args.coordinator_elf and (args.case not in ('consumer','readers','metadata','allocator','latency','locking') or args.consumer_sync):parser.error('frozen coordinator requires a supported case without new probes')
     if args.consumer_commands!='all' and args.case!='consumer':parser.error('consumer selection requires --case consumer')
     if not 1000<=args.consumer_timeout_ms<=3600000:parser.error('consumer timeout must be 1000..3600000 ms')
     if args.case in ('metadata','all') and args.consumer_timeout_ms!=180000:parser.error('metadata coordinator uses a fixed 180000 ms consumer budget')
@@ -125,7 +125,7 @@ def main():
                                       'case':case,'root_drain_fixture':args.root_drain_fixture,
                                       'trace_read_lbas':args.trace_read_lbas}.items():
                         if record[key]!=value:raise ValueError('resume input differs: '+key)
-                    if record.get('consumer_command_names')!=(['consumer-musl-1','consumer-glibc-1'] if case=='metadata' else selected):raise ValueError('resume command selection differs')
+                    validate_resume_selection(case,record,selected)
                     if case=='consumer' and record.get('consumer_fixed_readers',False)!=args.consumer_readers:raise ValueError('resume reader selection differs')
                     record['input_keys']=list(record);record['input_sha256']=hashlib.sha256(payload.encode()).hexdigest()
                     returncode=0
@@ -251,14 +251,7 @@ def main():
                     required.update(('dgram-64k','dgram-oversize','file-osync','file-odsync','file-random','file-extend-accept','file-extend-sync','file-fault-prefix','file-fault-first'))
                     if set(timings)!=required or (not args.off and {s['name'] for s in snapshots}!=required): raise ValueError('missing/extra workload window')
                 if case=='locking':
-                    required={f'locking-{relationship}-0-{waiters}' for relationship in range(3) for waiters in (1,8,32)}
-                    required.update(f'locking-1-{operation}-8' for operation in (1,2,3,4))
-                    if set(timings)!=required or (not args.off and {s['name'] for s in snapshots}!=required): raise ValueError('locking window coverage')
-                    if not args.off:
-                        for snapshot in snapshots:
-                            value=snapshot['values']
-                            if value['foreground.lock15_acquired.value']==0: raise ValueError('write operation lock missing')
-                            if snapshot['name'].startswith('locking-1-0-') and value['foreground.lock15_blocks.value']==0: raise ValueError('same inode contention was not exercised')
+                    validate_locking(timings,snapshots,not args.off)
                 if not args.off:
                     for snapshot in snapshots:
                         validate_expected(snapshot['values'],metric_expectations.get(snapshot['name'],{}))

@@ -1,7 +1,37 @@
 import unittest
-from cost_report import parse, schema, percentile, validate_expected, validate_replicas
+from cost_report import parse, schema, percentile, validate_expected, validate_replicas, validate_locking, validate_resume_selection
 
 class CostReportTest(unittest.TestCase):
+    def test_resume_selection_only_applies_to_consumer_manifests(self):
+        for case in ('allocator','latency','locking'):
+            validate_resume_selection(case, {}, ['consumer-musl-0'])
+        validate_resume_selection('consumer', {'consumer_command_names':['consumer-musl-0']}, ['consumer-musl-0'])
+        with self.assertRaisesRegex(ValueError,'selection'):
+            validate_resume_selection('consumer', {}, ['consumer-musl-0'])
+        with self.assertRaisesRegex(ValueError,'selection'):
+            validate_resume_selection('metadata', {'consumer_command_names':['consumer-musl-0']}, ['consumer-musl-0'])
+
+    def test_locking_checks_the_synchronous_contention_windows(self):
+        names = {f'locking-{r}-0-{n}' for r in range(3) for n in (1,8,32)}
+        names.update(f'locking-1-{op}-8' for op in (1,2,3,4))
+        timings = {name: 100 for name in names}
+        snapshots = [{'name':name,'values':{'foreground.lock15_acquired.value':1,
+                     'foreground.lock15_blocks.value':int(name in ('locking-1-2-8','locking-1-4-8'))}}
+                     for name in names]
+        validate_locking(timings, snapshots, True)
+        for name in ('locking-1-2-8','locking-1-4-8'):
+            bad = [{**snap,'values':{**snap['values'],'foreground.lock15_blocks.value':0}}
+                   if snap['name']==name else snap for snap in snapshots]
+            with self.assertRaisesRegex(ValueError,'contention'):
+                validate_locking(timings,bad,True)
+        with self.assertRaisesRegex(ValueError,'coverage'):
+            validate_locking(timings,snapshots[:-1],True)
+        bad=[{**snap,'values':{**snap['values'],'foreground.lock15_acquired.value':0}}
+             for snap in snapshots]
+        with self.assertRaisesRegex(ValueError,'operation lock'):
+            validate_locking(timings,bad,True)
+        validate_locking(timings,[],False)
+
     def consumer_record(self):
         from cost_consumer import commands,ELFS,SCRIPTS,ORIGINAL_SHA,DEPENDENCIES
         lines=[]
