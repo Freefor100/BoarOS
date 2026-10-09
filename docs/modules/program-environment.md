@@ -146,10 +146,11 @@ unwind 库，因此程序进入 main 不能证明运行依赖完整。源码背�
 
 `make test-glibc-riscv` 编译同一源的静态 ET_EXEC、动态 ET_EXEC、动态 PIE、静态
 PIE 和动态 pthread PIE，以及独立 TLS DSO。runner 将同一 ELF 和完整运行库放入
-Linux 7.2 与 BoarOS 的隔离 ext4 镜像，分 constructor/main、运行时、atexit 和资源
+Linux 7.2 与 BoarOS 的隔离 ext4 镜像，在512MiB/1GiB分别执行同一ELF，分 constructor/main、运行时、atexit 和资源
 回收检查。组合探针覆盖独立 TLS、dlopen、pthread 创建／join、阻塞读取期间的取消及
 cleanup handler、信号 handler 和正常退出。取消时管道与暂存 owner 仍由原请求及
-共享文件表清理；不能由缺库 abort 冒充内核取消语义测试。
+共享文件表清理；不能由缺库 abort 冒充内核取消语义测试。任一内存配置失败均使入口失败，
+保留独立镜像与日志；identity明确记录两种RAM，host反例保护配置遗漏和第二配置失败。
 
 glibc 2.44 的 `pthread_join` 通过 `FUTEX_WAIT_BITSET | FUTEX_CLOCK_REALTIME` 等待线程退出；初始试跑在 BoarOS 返回 ENOSYS，glibc 因意外 futex 错误退出。`tests/diff-abi/futex_shared.c` 的同一 ELF 现在对照固定 Linux 检查 bitset 零值、绝对时钟、用户 fault、按掩码唤醒与 requeue；`tests/userland/pthread.c` 进一步检查 stop/continue 重启保留掩码与原截止时刻。当前内核 realtime offset 启动后不变，可一次换算为 monotonic；引入调时 syscall 时需重新处理阻塞中的 realtime deadline。
 
