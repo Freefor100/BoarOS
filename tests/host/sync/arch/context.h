@@ -1,6 +1,7 @@
 #ifndef BOAROS_SYNC_TEST_ARCH_CONTEXT_H
 #define BOAROS_SYNC_TEST_ARCH_CONTEXT_H
 #include <stdint.h>
+#include <arch/riscv/context.h>
 extern _Thread_local uintptr_t sync_test_irq;
 void *sync_test_cpu(void);
 static inline uintptr_t arch_interrupt_save(void)

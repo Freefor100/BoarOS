@@ -1,6 +1,7 @@
 #include <arch/context.h>
 #include <kernel/sync.h>
 #include <kernel/wait_internal.h>
+#include "private.h"
 
 struct kernel_lock_waiter {
     struct kernel_lock_waiter *next;
@@ -11,6 +12,12 @@ struct kernel_lock_waiter {
     uint64_t grant_ticks;
 #endif
 };
+struct kernel_io_context *kernel_io_context_current(void)
+{
+    struct kernel_task *task = kernel_task_current();
+    return task ? &task->io_context : kernel_cpu_current()->bootstrap_io;
+}
+
 void kernel_rwlock_init(struct kernel_rwlock *lock, uint32_t rank, uintptr_t key)
 {
     *lock = (struct kernel_rwlock){ .rank = rank, .key = key };

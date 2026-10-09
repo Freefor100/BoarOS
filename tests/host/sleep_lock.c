@@ -1,9 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
-#include <kernel/wait_internal.h>
-#include <kernel/sync.h>
-struct kernel_task { struct kernel_wait_record wait; struct kernel_wait_node default_wait_node;
-    struct kernel_io_context io_context; unsigned *dispatch; unsigned state, wake_reason, id; };
-enum { KERNEL_THREAD_STATE_BLOCKED, KERNEL_THREAD_STATE_READY };
+#include "../../kernel/sched/private.h"
+struct host_task { struct kernel_task task; unsigned *dispatch; unsigned id; };
+#define host_of(task_) ((struct host_task *)(task_))
 #include <assert.h>
 #include <pthread.h>
 #include <sched.h>
@@ -15,7 +13,8 @@ enum { KERNEL_THREAD_STATE_BLOCKED, KERNEL_THREAD_STATE_READY };
 
 _Thread_local uintptr_t sync_test_irq = 1;
 static _Thread_local struct kernel_cpu cpu;
-static _Thread_local struct kernel_task current;
+static _Thread_local struct host_task host_current;
+#define current host_current.task
 static _Thread_local unsigned ready;
 static struct kernel_rwlock lock;
 static unsigned order[64], count;
@@ -24,12 +23,12 @@ static pthread_barrier_t segment_entered, segment_released;
 static unsigned segment_enabled, finish_pause;
 static pthread_barrier_t finish_entered, finish_released;
 void *sync_test_cpu(void) { return &cpu; }
-struct kernel_io_context *kernel_io_context_current(void) { return &current.io_context; }
+struct kernel_task *kernel_task_current(void) { return &current; }
 static void initialize(unsigned id)
 {
     kernel_cpu_initialize(&cpu, id, &current.io_context);
     current = (struct kernel_task){0};
-    current.id = id;
+    host_current.id = id;
     current.wait.on_cpu = 1;
     kernel_wait_node_init(&current.default_wait_node, &current);
     sync_test_irq = 1;
@@ -41,11 +40,11 @@ int kernel_wait_backend_initialized(void) { return 1; }
 int kernel_wait_backend_signal(struct kernel_task *task) { (void)task; return 0; }
 uint64_t kernel_wait_backend_time(void) { return 1; }
 void kernel_wait_backend_commit(struct kernel_task *task, uint64_t deadline, int interruptible)
-{ (void)deadline; (void)interruptible; task->state = KERNEL_THREAD_STATE_BLOCKED; __atomic_fetch_add(&parked[task->id - 1], 1, __ATOMIC_RELEASE); }
+{ (void)deadline; (void)interruptible; task->state = KERNEL_THREAD_STATE_BLOCKED; __atomic_fetch_add(&parked[host_of(task)->id - 1], 1, __ATOMIC_RELEASE); }
 void kernel_wait_backend_notify(struct kernel_task *task, uint32_t reason)
 { task->wake_reason = reason; task->state = KERNEL_THREAD_STATE_READY; }
 void kernel_wait_backend_ready(struct kernel_task *task)
-{ __atomic_store_n(&granted[task->id - 1], 1, __ATOMIC_RELEASE); __atomic_store_n(task->dispatch, 1, __ATOMIC_RELEASE); }
+{ __atomic_store_n(&granted[host_of(task)->id - 1], 1, __ATOMIC_RELEASE); __atomic_store_n(host_of(task)->dispatch, 1, __ATOMIC_RELEASE); }
 enum kernel_scheduler_status kernel_wait_backend_switch(struct kernel_task *task)
 {
     { KERNEL_RAW_SCOPE(guard, &kernel_wait_domain); kernel_wait_switch_finish_locked(task); }
@@ -57,7 +56,7 @@ void kernel_wait_backend_quiesce(void) { sched_yield(); }
 void __real_kernel_raw_lock_acquire(struct kernel_raw_lock *, struct kernel_raw_guard *);
 void __wrap_kernel_raw_lock_acquire(struct kernel_raw_lock *raw, struct kernel_raw_guard *guard)
 {
-    if (raw == &lock.metadata && current.id == 1 && current.wait.phase == KERNEL_WAIT_FINISHED &&
+    if (raw == &lock.metadata && host_current.id == 1 && current.wait.phase == KERNEL_WAIT_FINISHED &&
         __atomic_load_n(&parked[0], __ATOMIC_ACQUIRE) == 1 &&
         __atomic_exchange_n(&finish_pause, 0, __ATOMIC_ACQ_REL)) {
         int result = pthread_barrier_wait(&finish_entered);
@@ -71,7 +70,7 @@ void __real_kernel_raw_lock_release(struct kernel_raw_guard *);
 void __wrap_kernel_raw_lock_release(struct kernel_raw_guard *guard)
 {
     int pause = segment_enabled && guard->lock == &lock.metadata &&
-        lock.handoff_owner && lock.readers == 16 && current.id == 2;
+        lock.handoff_owner && lock.readers == 16 && host_current.id == 2;
     __real_kernel_raw_lock_release(guard);
     if (pause) {
         int result = pthread_barrier_wait(&segment_entered);
@@ -84,7 +83,7 @@ static void *worker(void *argument)
 {
     unsigned id = (unsigned)(uintptr_t)argument;
     initialize(id + 1);
-    current.dispatch = &ready;
+    host_current.dispatch = &ready;
     struct kernel_lock_guard guard = {0};
     if (id == 1) kernel_rwlock_write(&lock, &guard);
     else kernel_rwlock_read(&lock, &guard);

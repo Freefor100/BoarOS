@@ -37,7 +37,8 @@ park自行保存IRQ并保持关闭跨过切换交接，返回时恢复原状态�
 新栈的`kernel_scheduler_switch_finish`才发布旧任务或允许回收。普通返回、首次kernel/user
 入口及退出切换经过同一完成点。调度请求用原子exchange消费，完成点不清除后来请求。
 
-wake使用借用游标；被摘节点保留有引用的退休后继，引用链迭代归还，每段最多16项。
+wake在调度锁内判断空队列；为空直接完成，非空才建立跨解锁的借用游标。
+被摘节点保留有引用的退休后继，引用链迭代归还，每段最多16项。
 callback在调度锁外同步执行，临时禁止抢占，不能阻塞；自身只能非阻塞remove。
 释放context前必须remove_sync等待借用归零。futex过滤遍历使用同一借用游标；
 requeue先借task、放当前游标，再收完旧node借用并迁移登记，不在raw内归还后备引用。queue_close停止新登记，queue_destroy在

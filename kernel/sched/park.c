@@ -277,16 +277,22 @@ void kernel_wait_switch_finish_locked(struct kernel_task *task)
         kernel_wait_backend_ready(task);
     }
 }
-void kernel_wait_cursor_begin(struct kernel_wait_queue *queue, struct kernel_wait_cursor *cursor)
+static int cursor_begin(struct kernel_wait_queue *queue, struct kernel_wait_cursor *cursor,
+    int skip_empty)
 {
     KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
     if (!queue || queue->initialized != KERNEL_WAIT_QUEUE_INITIALIZED || queue->borrows == UINT32_MAX)
         __builtin_trap();
     queue_shape(queue);
+    /* 空通知在同一锁内完成判断，不建立无需跨解锁使用的游标借用。 */
+    if (skip_empty && !queue->head) return 0;
     queue->borrows++;
     *cursor = (struct kernel_wait_cursor){queue, queue->head, queue->sequence};
     if (cursor->node) borrow(cursor->node);
+    return 1;
 }
+void kernel_wait_cursor_begin(struct kernel_wait_queue *queue, struct kernel_wait_cursor *cursor)
+{ (void)cursor_begin(queue, cursor, 0); }
 void kernel_wait_cursor_advance(struct kernel_wait_cursor *cursor)
 {
     struct kernel_wait_node *old = cursor->node;
@@ -350,7 +356,7 @@ static enum kernel_scheduler_status wake(struct kernel_wait_queue *queue, int al
     if (!kernel_wait_backend_initialized()) return KERNEL_SCHEDULER_STATUS_NOT_INITIALIZED;
     if (arch_interrupt_is_enabled()) return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
     struct kernel_wait_cursor cursor;
-    kernel_wait_cursor_begin(queue, &cursor);
+    if (!cursor_begin(queue, &cursor, 1)) return KERNEL_SCHEDULER_STATUS_OK;
     while (cursor.node) {
         struct kernel_wait_node *node = cursor.node;
         kernel_wait_callback_fn callback = 0;

@@ -1933,7 +1933,7 @@ test-wait-riscv: $(BUILD_DIR)/wait-native
 .PHONY: test-sleep-lock-host
 test-sleep-lock-host:
 	@mkdir -p build/host
-	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -Itests/host/sync -idirafter include tests/host/sleep_lock.c kernel/cpu.c kernel/raw_lock.c kernel/sched/park.c kernel/sched/sync.c -Wl,--wrap=kernel_raw_lock_release,--wrap=kernel_raw_lock_acquire -o build/host/sleep-lock
+	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -DBOAROS_PAGE_SHIFT=12 -Itests/host/sync -idirafter include tests/host/sleep_lock.c kernel/cpu.c kernel/raw_lock.c kernel/sched/park.c kernel/sched/sync.c -Wl,--wrap=kernel_raw_lock_release,--wrap=kernel_raw_lock_acquire -o build/host/sleep-lock
 	build/host/sleep-lock
 
 test-riscv: test-wait-riscv
