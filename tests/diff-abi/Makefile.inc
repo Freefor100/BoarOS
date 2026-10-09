@@ -19,7 +19,7 @@ build-diff-abi-linux:
 test-diff-abi-riscv: test-diff-abi-host $(KERNEL_RV) $(DIFF_ABI_RV)
 	QEMU_RISCV64=$(QEMU_RISCV64) python3 tests/diff-abi/harness.py \
 		--kernel $(KERNEL_RV) --program $(DIFF_ABI_RV) \
-		$(if $(DIFF_ABI_LINUX_KERNEL),--linux-kernel $(DIFF_ABI_LINUX_KERNEL))
+		$(if $(DIFF_ABI_LINUX_KERNEL),--linux-kernel $(DIFF_ABI_LINUX_KERNEL)) $(TEST_MEMORY_ARGS)
 
 # Focused path ABI uses the same record and syscall implementation.
 build/diff-abi/path-rv: $(DIFF_ABI_SOURCES) tests/diff-abi/abi.h tests/riscv/user_elf.ld
@@ -41,7 +41,7 @@ build/loongarch/diff-abi-cases: $(DIFF_ABI_SOURCES) tests/diff-abi/abi.h tests/c
 	$(LA_CC) $(LA_FLAGS) -O2 -Wall -Wextra -Werror -ffreestanding -fno-builtin -fno-stack-protector -nostdlib -nostartfiles -static -no-pie -Wl,--build-id=none -Wl,-z,max-page-size=16384 -Wl,-T,tests/common/user.ld -o $@ $(DIFF_ABI_SOURCES)
 .PHONY: test-diff-abi-loongarch
 test-diff-abi-loongarch: test-diff-abi-host kernel-la build/loongarch/diff-abi-cases prepare-la-tools prepare-la-linux-platform
-	python3 -B tests/diff-abi/harness.py --arch loongarch --kernel kernel-la --program build/loongarch/diff-abi-cases --timeout 180
+	python3 -B tests/diff-abi/harness.py --arch loongarch --kernel kernel-la --program build/loongarch/diff-abi-cases --timeout 180 $(TEST_MEMORY_ARGS)
 
 build/diff-abi/sched-handoff-rv: $(DIFF_ABI_SOURCES) tests/diff-abi/sched_handoff.c tests/diff-abi/abi.h tests/riscv/user_elf.ld
 	@mkdir -p $(@D)

@@ -65,3 +65,32 @@ Ubuntu 均通过；严格原程序执行仍单独判定，入口修复不等于�
 精确缓存；PR 继续取消旧执行。并发依据为
 [GitHub workflow concurrency](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/control-workflow-concurrency)
 （2026-10-08 访问）；这是缓存生产生命周期的调整，未放宽 job 的通过条件或预算。
+
+## 共同层级与已证实的内核等待错误
+
+[运行37964071894](https://github.com/Freefor100/BoarOS/actions/runs/37964071894)
+对应旧身份`16951f0`，两个environment、shared host、RV ABI、两侧GNU/runtime及
+LA core/platform均成功。失败项是RV可睡眠存储，required按真实失败拒绝。
+此前输入恢复与网络准备修复已在托管执行通过，不能把新失败再归为同一环境错误。
+设备已发布完成但batch在IRQ-off跳过park而未收割的问题见
+[存储等待记录](sleepable-storage.md#dma发布早于等待交接)。
+
+旧RV工作流还在首个step失败后跳过后续双盘/userland/platform/栈检查；LA使用
+runner分组后继续，SQLite又位于不同job，造成报告与覆盖层级不一致。现在两侧
+core/ABI、runtime/SQLite、platform共用执行模板，每个架构保持独立producer。
+共同消费者显式执行512MiB/1GiB；RV SQLite DELETE改用现有共同runner，Linux
+对照、静态/动态CLI及独立重启与LA一致。原单架构聚焦入口默认值保持。
+
+CLI反例先证明缺RV core及RV runtime缺SQLite，再保护两侧注册与显式RAM参数。
+共用runner原有失败后继续、取消/缺失和完整尾部门禁保持；新模板的platform以
+实际native准备结果为前置，不借core成功决定是否执行。架构扩展据实际设备和
+已验收消费者保留，不能为了job表面对称创建成功占位或删掉RV已有门禁。
+
+本轮本地执行新清单的两侧core/runtime/platform，各为8/3/3组，共28组全部通过，
+没有跳过或补记；审查补齐后的24项CI host、3项RAM profile及actionlint1.7.7也通过。两侧
+1366 ABI、GNU五形态、SQLite DELETE/WAL/独立重启和平台消费者实际执行双RAM；
+这些本地结果与修复后托管运行仍分别记录。
+
+独立审查发现模板迁移漏归档共同ABI目录及漏掉reference恢复门禁，已集中补齐。
+新增反例先拒绝缺失原串口/metadata/normalized/diff/失败盘和test-references的配置，
+修复后通过；patch-format仍保留，host checkout取得实际父提交。

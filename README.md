@@ -29,7 +29,7 @@ Linux 是用户可观察语义的参考；内部实现独立维护对象所有�
 [allocator 组合验收](docs/learning/memory-management.md#阶段a组合收口2026-10-09)。
 这些结果限定于上述平台和案例；LA 客体原生开发、全断电恢复矩阵、实板与多核仍需独立验收。
 
-主线 [CI](docs/modules/continuous-integration.md)覆盖共用 host、RV 回归、LA 核心/平台和双侧运行时，
+主线 [CI](docs/modules/continuous-integration.md)以同一模板覆盖共用 host、双侧 core/ABI、platform 和 glibc/SQLite，
 原程序/设备组合及存储恢复分层运行。定时组合显式准备原程序、原网络运行时及TAP能力；
 上述验收来自本地执行，不等于托管CI结果。
 

@@ -1,6 +1,8 @@
 """CI success requires complete commands and every required job."""
 import importlib.util
 import json
+import fnmatch
+import yaml
 import os
 from pathlib import Path
 import select
@@ -102,6 +104,45 @@ class Execution(unittest.TestCase):
                 self.assertIn('--reuse-builds', inventory['argv'])
                 self.assertEqual([inventory['argv'][i+1] for i, arg in enumerate(inventory['argv'])
                                   if arg == '--memory'], ['512M', '1G'])
+
+
+class ArchitectureCoverage(unittest.TestCase):
+    def plan(self, arch, suite):
+        result = subprocess.run([sys.executable, '-B', str(Path(__file__).with_name('run.py')),
+            '--arch', arch, '--suite', suite, '--list'], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def test_both_architectures_declare_core_runtime_and_platform(self):
+        for arch in ('riscv', 'loongarch'):
+            for suite in ('core', 'runtime', 'platform'):
+                with self.subTest(arch=arch, suite=suite):
+                    cases = self.plan(arch, suite)
+                    self.assertTrue(cases)
+                    self.assertTrue(all('INIT_CONFIG=config/init.json' in case['argv'] for case in cases))
+                    self.assertTrue(all('TEST_MEMORIES=512M 1G' in case['argv'] for case in cases))
+
+    def test_fixed_reference_restoration_contract_is_retained(self):
+        commands = [arg for case in self.plan('host', 'host') for arg in case['argv']]
+        self.assertIn('test-references', commands)
+
+    def test_native_template_retains_full_abi_observations_and_failed_disk(self):
+        path = Path(__file__).resolve().parents[2] / '.github/workflows/native-contracts.yml'
+        steps = yaml.safe_load(path.read_text())['jobs']['contracts']['steps']
+        uploads = [step for step in steps if step.get('uses', '').startswith('actions/upload-artifact@')]
+        ordinary = next(step for step in uploads if step.get('if') == 'always()')['with']['path'].splitlines()
+        failed = next(step for step in uploads if step.get('if') == 'failure()')['with']['path'].splitlines()
+        for name in ('linux-512M.log', 'metadata.json', 'boaros-1G.normalized', 'comparison.diff'):
+            self.assertTrue(any(fnmatch.fnmatchcase('build/diff-abi/run/' + name, pattern) for pattern in ordinary), name)
+        self.assertTrue(any(fnmatch.fnmatchcase('build/diff-abi/run/boaros-1G.img', pattern) for pattern in failed))
+
+    def test_shared_runtime_consumers_include_glibc_and_both_sqlite_modes(self):
+        for arch in ('riscv', 'loongarch'):
+            with self.subTest(arch=arch):
+                commands = [argument for case in self.plan(arch, 'runtime') for argument in case['argv']]
+                self.assertIn('test-glibc-' + arch, commands)
+                self.assertIn('test-sqlite-rollback-' + arch, commands)
+                self.assertIn('test-sqlite-wal-' + arch, commands)
 
 
 class CompilerCompatibility(unittest.TestCase):

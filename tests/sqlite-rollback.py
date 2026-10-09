@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -40,8 +41,10 @@ def main():
         saved=json.loads((prepare_dynamic.BASE/'identity.json').read_text())
         if saved['inputs']!=inputs or prepare_userland.installed_tree_manifest(prepare_dynamic.BASE,['root'])!=saved['products']:raise RuntimeError('SQLite LA dynamic runtime integrity failed')
     else:
-        paths={name:ROOT/'build/riscv/tests/user'/(name+'-rv') for name in ('sqlite-rollback','sqlite3-static','sqlite3-dynamic','sqlite-cli-init')}
-        loader=ROOT/'build/riscv/musl-root/lib/ld-musl-riscv64.so.1';loader_name=loader.name
+        names={'sqlite-rollback':'SQLITE_ROLLBACK_RV','sqlite3-static':'SQLITE_CLI_STATIC_RV',
+            'sqlite3-dynamic':'SQLITE_CLI_DYNAMIC_RV','sqlite-cli-init':'SQLITE_CLI_INIT_RV'}
+        paths={name:Path(os.environ.get(variable,ROOT/'build/riscv/tests/user'/(name+'-rv'))) for name,variable in names.items()}
+        loader=Path(os.environ.get('MUSL_LDSO',ROOT/'build/riscv/musl-root/lib/ld-musl-riscv64.so.1'));loader_name='ld-musl-riscv64.so.1'
     inputs=ROOT/'references/sqlite/sqlite-amalgamation-3530400.zip'
     pin=next(row.split('\t')[4] for row in (ROOT/'references/sources.tsv').read_text().splitlines() if row.startswith('file\tsqlite/sqlite-amalgamation-3530400.zip\t'))
     if sha(inputs)!=pin:raise RuntimeError('SQLite original archive identity mismatch')

@@ -148,7 +148,7 @@ test-root-io-loongarch: kernel-la $(LA_BUILD)/root-probe build/host/nbd-fault pr
 $(LA_BUILD)/rng-probe: tests/userland/rng.c prepare-la-userland
 	REALGCC=$(abspath $(LA_USER_CC)) $(LA_MUSL_CC) $(LA_FLAGS) -O2 -static -Wall -Wextra -Werror -Wl,-z,max-page-size=16384 -o $@ $<
 test-rng-loongarch: kernel-la $(LA_BUILD)/rng-probe prepare-la-tools prepare-la-linux-platform
-	python3 -B tests/rng_runner.py --arch loongarch
+	python3 -B tests/rng_runner.py --arch loongarch $(TEST_MEMORY_ARGS)
 $(LA_BUILD)/rng-fail-%.o: tests/loongarch/rng_failures.c arch/loongarch/build.mk
 	$(LA_CC) $(LA_CPPFLAGS) $(LA_CFLAGS) -DRNG_FAIL_AFTER=$* -c $< -o $@
 $(LA_BUILD)/kernel-rng-fail-%: $(LA_OBJECTS) $(LA_BUILD)/rng-fail-%.o arch/loongarch/linker.ld
@@ -249,13 +249,13 @@ $(LA_BUILD)/net/ethernet.o: LA_CPPFLAGS += -I$(LA_BUILD)/generated
 
 .PHONY: test-network-loongarch
 test-network-loongarch: kernel-la prepare-la-userland prepare-la-linux-platform prepare-la-tools
-	python3 -B tests/network-loongarch.py --workload contract
-	python3 -B tests/network-loongarch.py --workload content
-	python3 -B tests/network-loongarch.py --workload timer
-	python3 -B tests/network-loongarch.py --workload admission
-	python3 -B tests/network-loongarch.py --workload sendfile
-	python3 -B tests/network-loongarch.py --workload budget
-	python3 -B tests/network-loongarch.py --workload unix_sender
+	python3 -B tests/network-loongarch.py --workload contract $(TEST_MEMORY_ARGS)
+	python3 -B tests/network-loongarch.py --workload content $(TEST_MEMORY_ARGS)
+	python3 -B tests/network-loongarch.py --workload timer $(TEST_MEMORY_ARGS)
+	python3 -B tests/network-loongarch.py --workload admission $(TEST_MEMORY_ARGS)
+	python3 -B tests/network-loongarch.py --workload sendfile $(TEST_MEMORY_ARGS)
+	python3 -B tests/network-loongarch.py --workload budget $(TEST_MEMORY_ARGS)
+	python3 -B tests/network-loongarch.py --workload unix_sender $(TEST_MEMORY_ARGS)
 $(LA_BUILD)/net-failure-%.o: tests/loongarch/net_failures.c
 	$(LA_CC) $(LA_CPPFLAGS) $(LA_CFLAGS) -DNET_FAIL_CASE=$* -c $< -o $@
 $(LA_BUILD)/kernel-net-failure-%: $(LA_OBJECTS) $(LA_BUILD)/net-failure-%.o arch/loongarch/linker.ld
@@ -282,17 +282,17 @@ $(LA_BUILD)/tty-termios2-probe: tests/tty/termios2_probe.c $(LA_BUILD)/musl-root
 test-uart-failures-loongarch: $(foreach case,0 1 2 3 4 5,$(LA_BUILD)/kernel-uart-failure-$(case)) $(LA_BUILD)/network-contract
 	python3 -B tests/loongarch/uart_failures.py
 test-tty-loongarch: kernel-la
-	python3 -B tests/tty/riscv.py --arch loongarch
+	python3 -B tests/tty/riscv.py --arch loongarch $(TEST_MEMORY_ARGS)
 test-tty-diff-loongarch: kernel-la $(LA_BUILD)/tty-probe $(LA_BUILD)/tty-jobctrl
-	python3 -B tests/tty/riscv.py --arch loongarch --probe $(LA_BUILD)/tty-probe
-	python3 -B tests/tty/riscv.py --arch loongarch --probe $(LA_BUILD)/tty-jobctrl --no-ctty
+	python3 -B tests/tty/riscv.py --arch loongarch --probe $(LA_BUILD)/tty-probe $(TEST_MEMORY_ARGS)
+	python3 -B tests/tty/riscv.py --arch loongarch --probe $(LA_BUILD)/tty-jobctrl --no-ctty $(TEST_MEMORY_ARGS)
 test-tty-termios2-loongarch: kernel-la $(LA_BUILD)/tty-termios2-probe
-	python3 -B tests/tty/riscv.py --arch loongarch --probe $(LA_BUILD)/tty-termios2-probe
+	python3 -B tests/tty/riscv.py --arch loongarch --probe $(LA_BUILD)/tty-termios2-probe $(TEST_MEMORY_ARGS)
 test-pty-loongarch: kernel-la
-	python3 -B tests/tty/pty_riscv.py --arch loongarch --case core
+	python3 -B tests/tty/pty_riscv.py --arch loongarch --case core $(TEST_MEMORY_ARGS)
 test-pty-apps-loongarch: kernel-la
-	python3 -B tests/tty/pty_riscv.py --arch loongarch --case libc
-	python3 -B tests/tty/pty_riscv.py --arch loongarch --case script
+	python3 -B tests/tty/pty_riscv.py --arch loongarch --case libc $(TEST_MEMORY_ARGS)
+	python3 -B tests/tty/pty_riscv.py --arch loongarch --case script $(TEST_MEMORY_ARGS)
 
 .PHONY: test-rtc-loongarch-host
 test-rtc-loongarch-host:
@@ -302,7 +302,7 @@ test-rtc-loongarch-host:
 
 .PHONY: test-environment-loongarch
 test-environment-loongarch: kernel-la
-	python3 -B tests/environment.py --arch loongarch
+	python3 -B tests/environment.py --arch loongarch $(TEST_MEMORY_ARGS)
 
 $(LA_BUILD)/pipe-geometry: tests/workloads/pipe_geometry.c $(LA_BUILD)/musl-root/bin/musl-gcc
 	REALGCC=$(CURDIR)/$(LA_BUILD)/gcc-sf/root/bin/loongarch64-unknown-linux-gnusf-gcc $(LA_BUILD)/musl-root/bin/musl-gcc -static -O2 -Wall -Wextra -Werror $< -o $@
@@ -330,10 +330,10 @@ $(LA_BUILD)/sqlite-cli-init: tests/workloads/sqlite/cli_init.c $(LA_SQLITE_CC)
 	$(LA_SQLITE_CC) $(LA_SQLITE_FLAGS) -static -O2 -Wall -Wextra -Werror -o $@ $<
 .PHONY: test-sqlite-wal-loongarch
 test-sqlite-wal-loongarch: $(LA_BUILD)/sqlite-wal kernel-la
-	python3 -B tests/sqlite-wal-riscv.py --arch loongarch --kernel kernel-la --program $(LA_BUILD)/sqlite-wal
+	python3 -B tests/sqlite-wal-riscv.py --arch loongarch --kernel kernel-la --program $(LA_BUILD)/sqlite-wal $(TEST_MEMORY_ARGS)
 .PHONY: test-sqlite-rollback-loongarch
 test-sqlite-rollback-loongarch: $(LA_BUILD)/sqlite-rollback $(LA_BUILD)/sqlite3-static $(LA_BUILD)/sqlite3-dynamic $(LA_BUILD)/sqlite-cli-init kernel-la
-	python3 -B tests/sqlite-rollback.py --arch loongarch
+	python3 -B tests/sqlite-rollback.py --arch loongarch $(TEST_MEMORY_ARGS)
 
 $(LA_BUILD)/sync-%.o: tests/sync/native.c
 	@mkdir -p $(dir $@)

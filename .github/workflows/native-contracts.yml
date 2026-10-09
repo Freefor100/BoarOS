@@ -1,0 +1,91 @@
+name: Native architecture contracts
+
+on:
+  workflow_call:
+    inputs:
+      arch:
+        required: true
+        type: string
+      suite:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  contracts:
+    name: ${{ inputs.arch }} / ${{ inputs.suite }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/native-environment
+        id: native
+        with:
+          arch: ${{ inputs.arch }}
+      - name: Run the declared native contracts
+        env:
+          TARGET_ARCH: ${{ inputs.arch }}
+          TARGET_SUITE: ${{ inputs.suite }}
+        run: python3 -B tests/ci/run.py --arch "$TARGET_ARCH" --suite "$TARGET_SUITE"
+      - name: Prepare independent platform inputs
+        if: ${{ !cancelled() && inputs.suite == 'core' && steps.native.outcome == 'success' }}
+        id: platform
+        env:
+          TARGET_ARCH: ${{ inputs.arch }}
+        run: |
+          if [ "$TARGET_ARCH" = riscv ]; then
+            make INIT_CONFIG=config/init.json prepare-program-environment
+            python3 -B tests/program-inventory/environment.py --busybox
+          fi
+      - name: Run the declared platform contracts
+        if: ${{ !cancelled() && inputs.suite == 'core' && steps.platform.outcome == 'success' }}
+        env:
+          TARGET_ARCH: ${{ inputs.arch }}
+        run: python3 -B tests/ci/run.py --arch "$TARGET_ARCH" --suite platform
+      - name: Preserve complete observations
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: native-${{ inputs.arch }}-${{ inputs.suite }}
+          path: |
+            build/ci-run/${{ inputs.arch }}-*
+            build/${{ inputs.arch }}/**/*.log
+            build/${{ inputs.arch }}/**/*.json
+            build/${{ inputs.arch }}/**/*.normalized
+            build/${{ inputs.arch }}/**/*.diff
+            build/${{ inputs.arch }}/**/*.su
+            build/stack-usage/**/*.su
+            build/stack-usage/*.log
+            build/io-sleep-run.*/*.log
+            build/multi-disk-io.*/*.log
+            build/multi-disk-io.*/*-timeout.json
+            build/multi-disk-io.*/*-exit.json
+            build/scale-run.*/boot.log
+            build/diff-abi/run/*.log
+            build/diff-abi/run/*.json
+            build/diff-abi/run/*.normalized
+            build/diff-abi/run/*.diff
+            build/elf-tail-riscv/**/suite.json
+            build/elf-tail-riscv/**/result.json
+            build/elf-tail-riscv/**/*.log
+            build/network/contract-*/**/*.log
+            build/network/contract-*/**/*.json
+            build/program-environment/**/*.log
+            build/program-environment/**/*.json
+          if-no-files-found: warn
+      - name: Preserve failed disks
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: native-failed-images-${{ inputs.arch }}-${{ inputs.suite }}
+          path: |
+            build/${{ inputs.arch }}/**/*.img
+            build/diff-abi/run/*.img
+            build/io-sleep-run.*/root.img
+            build/multi-disk-io.*/*.img
+            build/elf-tail-riscv/**/*.img
+            build/network/contract-*/**/*.img
+          retention-days: 7
+          if-no-files-found: ignore

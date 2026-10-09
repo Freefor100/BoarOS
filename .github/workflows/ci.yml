@@ -24,6 +24,8 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 2
       - name: Install host contract dependencies
         run: |
           sudo apt-get update
@@ -31,8 +33,11 @@ jobs:
             binutils-riscv64-unknown-elf e2fsprogs python3-yaml git
       - name: Run shared contracts
         run: python3 -B tests/ci/run.py --arch host --suite host
+      - name: Check patch formatting
+        if: ${{ !cancelled() }}
+        run: git diff --check HEAD^ HEAD
       - name: Validate workflow syntax and shell scripts
-        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7 .github/workflows/ci.yml .github/workflows/native-extended.yml .github/workflows/recovery.yml
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7 .github/workflows/ci.yml .github/workflows/native-contracts.yml .github/workflows/native-extended.yml .github/workflows/recovery.yml
       - name: Preserve all host results
         if: always()
         uses: actions/upload-artifact@v7
@@ -93,50 +98,40 @@ jobs:
           include-hidden-files: true
           if-no-files-found: warn
 
+  riscv-core:
+    name: RISC-V core, ABI and platform
+    needs: riscv-environment
+    uses: ./.github/workflows/native-contracts.yml
+    with:
+      arch: riscv
+      suite: core
+
   loongarch-core:
-    name: LoongArch CPU, MM, ABI and platform
+    name: LoongArch core, ABI and platform
     needs: loongarch-environment
-    runs-on: ubuntu-24.04
-    timeout-minutes: 90
-    steps:
-      - uses: actions/checkout@v6
-      - uses: ./.github/actions/native-environment
-        id: native
-        with:
-          arch: loongarch
-      - name: Run LA native core and ABI
-        run: python3 -B tests/ci/run.py --arch loongarch --suite core
-      - name: Run LA platform contracts
-        if: ${{ !cancelled() && steps.native.outcome == 'success' }}
-        run: python3 -B tests/ci/run.py --arch loongarch --suite platform
-      - name: Preserve complete LA observations
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: loongarch-core-platform
-          path: |
-            build/ci-run/loongarch-*
-            build/loongarch/**/*.log
-            build/loongarch/**/*.json
-            build/loongarch/**/*.normalized
-            build/loongarch/**/*.diff
-            build/loongarch/**/*.su
-            build/loongarch/root-*/**/*.log
-            build/loongarch/root-*/**/*.json
-          if-no-files-found: warn
-      - name: Preserve failed LA core images
-        if: failure()
-        uses: actions/upload-artifact@v7
-        with:
-          name: loongarch-core-failed-images
-          path: |
-            build/loongarch/**/*.img
-            build/network/**/*.img
-          retention-days: 7
-          if-no-files-found: ignore
+    uses: ./.github/workflows/native-contracts.yml
+    with:
+      arch: loongarch
+      suite: core
 
   riscv-runtime:
-    name: RISC-V original glibc 2.44
+    name: RISC-V glibc 2.44 and SQLite
+    needs: riscv-environment
+    uses: ./.github/workflows/native-contracts.yml
+    with:
+      arch: riscv
+      suite: runtime
+
+  loongarch-runtime:
+    name: LoongArch glibc 2.42 and SQLite
+    needs: loongarch-environment
+    uses: ./.github/workflows/native-contracts.yml
+    with:
+      arch: loongarch
+      suite: runtime
+
+  riscv-development:
+    name: RISC-V guest native C development
     needs: riscv-environment
     runs-on: ubuntu-24.04
     timeout-minutes: 45
@@ -145,282 +140,28 @@ jobs:
       - uses: ./.github/actions/native-environment
         with:
           arch: riscv
-      - name: Run RV GNU consumers
-        run: python3 -B tests/ci/run.py --arch riscv --suite runtime
-      - name: Preserve GNU results
+      - name: Run the independently verified RV native compiler consumer
+        run: make INIT_CONFIG=config/init.json test-offline-c-riscv
+      - name: Preserve native development observations
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: riscv-glibc
-          path: |
-            build/ci-run/riscv-runtime
-            build/riscv/glibc/*.log
-            build/riscv/glibc/*.json
+          name: riscv-native-development
+          path: build/riscv/offline-c-run.*/**/*
           if-no-files-found: warn
-      - name: Preserve failed RV GNU images
+      - name: Preserve failed development disks
         if: failure()
         uses: actions/upload-artifact@v7
         with:
-          name: riscv-glibc-failed-images
-          path: build/riscv/glibc/**/*.img
+          name: riscv-native-development-failed-images
+          path: build/riscv/offline-c-run.*/**/*.img
           retention-days: 7
           if-no-files-found: ignore
-
-  loongarch-runtime:
-    name: LoongArch original glibc 2.42 and SQLite
-    needs: loongarch-environment
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v6
-      - uses: ./.github/actions/native-environment
-        with:
-          arch: loongarch
-      - name: Run LA original runtime consumers
-        run: python3 -B tests/ci/run.py --arch loongarch --suite runtime
-      - name: Preserve runtime observations
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: loongarch-runtime
-          path: |
-            build/ci-run/loongarch-runtime
-            build/loongarch/glibc/*.log
-            build/loongarch/glibc/*.json
-            build/loongarch/sqlite*/**/*.log
-            build/loongarch/sqlite*/**/*.json
-          if-no-files-found: warn
-      - name: Preserve failed LA runtime images
-        if: failure()
-        uses: actions/upload-artifact@v7
-        with:
-          name: loongarch-runtime-failed-images
-          path: |
-            build/loongarch/glibc/**/*.img
-            build/loongarch/sqlite*/**/*.img
-          retention-days: 7
-          if-no-files-found: ignore
-
-  riscv-tests:
-    name: RISC-V full test suite
-    runs-on: ubuntu-24.04
-    timeout-minutes: 45
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
-        with:
-            fetch-depth: 2
-
-      - name: Install toolchain and test dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential \
-            gcc-riscv64-unknown-elf \
-            binutils-riscv64-unknown-elf \
-            gcc-riscv64-linux-gnu \
-            binutils-riscv64-linux-gnu \
-            libc6-dev-riscv64-cross \
-            qemu-system-misc \
-            opensbi \
-            e2fsprogs \
-            curl \
-            git flex bison bc libssl-dev libelf-dev iproute2 rsync ripgrep
-
-      - name: Show tool versions
-        run: |
-          riscv64-unknown-elf-gcc --version
-          riscv64-linux-gnu-gcc --version
-          qemu-system-riscv64 --version
-          git --version
-          debugfs -V || true
-
-      - name: Fetch pinned musl source
-        run: |
-          mkdir -p references/musl
-          curl --fail --location \
-            https://musl.libc.org/releases/musl-1.2.5.tar.gz \
-            -o references/musl/musl-1.2.5.tar.gz
-
-          echo \
-            "a9a118bbe84d8764da0ea0d28b3ab3fae8477fc7e4085d90102b8596fc7c75e4  references/musl/musl-1.2.5.tar.gz" \
-            | sha256sum -c -
-
-      - name: Check patch formatting
-        run: git diff --check HEAD^ HEAD
-
-      - name: Test reference infrastructure
-        run: make test-references
-
-      - name: Compute platform Linux cache identity
-        id: platform-linux
-        run: echo "key=$(python3 -B tests/diff-abi/harness.py --cache-key)" >> "$GITHUB_OUTPUT"
-
-      - name: Restore RV platform reference kernels
-        uses: actions/cache@v5
-        with:
-          path: build/diff-abi/linux
-          key: rv-platform-linux-${{ runner.os }}-${{ steps.platform-linux.outputs.key }}-${{ hashFiles('tests/network-linux.config', 'tests/tty/pty-linux.config', 'tests/program-inventory/linux.config') }}
-
-      - name: Run RISC-V kernel tests
-        run: make test-riscv
-
-      - name: Check I/O and mapped-file scale bounds
-        run: make test-scale-riscv
-
-      - name: Check sleepable storage concurrency
-        run: make test-io-sleep-riscv
-
-      - name: Check two-disk hold and fault isolation
-        run: make test-multi-disk-io-riscv
-
-      - name: Run real userland tests
-        run: make test-userland-riscv
-
-      - name: Prepare original RV platform BusyBox
-        run: |
-          mkdir -p build/ci-run
-          awk -F '\t' '$2 == "linux" || $2 == "oscomp-testsuits" || $2 == "linux-uapi/linux-6.6.tar.xz"' \
-            references/sources.tsv > build/ci-run/riscv-platform-inputs.tsv
-          references/fetch.sh --manifest build/ci-run/riscv-platform-inputs.tsv
-          python3 -B tests/program-inventory/environment.py --busybox \
-            > build/ci-run/riscv-platform-environment.json
-
-      - name: Run RV platform contracts
-        run: python3 -B tests/ci/run.py --arch riscv --suite platform
-
-      - name: Check production compiler stack bounds
-        run: make test-stack-usage
-
-      - name: Upload compiler stack reports
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: riscv-stack-reports
-          path: |
-            build/stack-usage/**/*.su
-            build/stack-usage/*.log
-          if-no-files-found: ignore
-
-      - name: Upload RISC-V test logs
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: riscv-test-logs
-          path: |
-            build/riscv/**/*.log
-            build/scale-run.*/boot.log
-            build/io-sleep-run.*/*.log
-            build/multi-disk-io.*/*.log
-            build/multi-disk-io.*/*-timeout.json
-            build/multi-disk-io.*/*-exit.json
-            build/ci-run/riscv-platform
-            build/ci-run/riscv-platform-environment.json
-            build/program-environment/**/*.log
-            build/program-environment/**/*.json
-            build/network/contract-*/**/*
-          if-no-files-found: ignore
-      - name: Upload failed RISC-V filesystem images
-        if: failure()
-        uses: actions/upload-artifact@v7
-        with:
-          name: riscv-failed-images
-          path: |
-            build/riscv/**/*.img
-            build/io-sleep-run.*/root.img
-            build/network/contract-*/**/*.img
-          if-no-files-found: ignore
-          retention-days: 7
-
-  differential-abi:
-    name: RISC-V Linux / BoarOS differential ABI
-    runs-on: ubuntu-24.04
-    timeout-minutes: 45
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
-      - name: Install differential test dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential gcc-riscv64-unknown-elf \
-            binutils-riscv64-unknown-elf gcc-riscv64-linux-gnu \
-            binutils-riscv64-linux-gnu qemu-system-misc opensbi e2fsprogs \
-            flex bison bc libssl-dev libelf-dev python3 git curl unzip libarchive-tools zstd
-      - name: Fetch pinned musl source for ELF regression
-        run: |
-          mkdir -p references/musl
-          curl --fail --location https://musl.libc.org/releases/musl-1.2.5.tar.gz \
-            -o references/musl/musl-1.2.5.tar.gz
-          echo "a9a118bbe84d8764da0ea0d28b3ab3fae8477fc7e4085d90102b8596fc7c75e4  references/musl/musl-1.2.5.tar.gz" \
-            | sha256sum -c -
-      - name: Compute exact Linux cache identity
-        id: linux-key
-        run: echo "key=$(python3 tests/diff-abi/harness.py --cache-key)" >> "$GITHUB_OUTPUT"
-      - name: Restore pinned Linux build
-        uses: actions/cache@v5
-        with:
-          path: build/diff-abi/linux
-          key: diff-abi-linux-${{ runner.os }}-${{ steps.linux-key.outputs.key }}
-      - name: Compute ELF regression Linux cache identity
-        id: elf-linux-key
-        run: echo "key=$(python3 tests/diff-abi/harness.py --cache-key --linux-config tests/program-inventory/linux.config)" >> "$GITHUB_OUTPUT"
-      - name: Restore ELF regression Linux build
-        uses: actions/cache@v5
-        with:
-          path: build/diff-abi/linux/${{ steps.elf-linux-key.outputs.key }}
-          key: elf-tail-linux-${{ runner.os }}-${{ steps.elf-linux-key.outputs.key }}
-      - name: Run differential ABI tests
-        run: make test-diff-abi-riscv
-      - name: Check ELF file tail and BSS on both kernels
-        run: make test-elf-tail-riscv
-      - name: Restore pinned SQLite input
-        run: |
-          mkdir -p build
-          awk -F '\t' '$2 == "sqlite/sqlite-amalgamation-3530400.zip"' references/sources.tsv > build/sqlite-references.tsv
-          test -s build/sqlite-references.tsv
-          sh references/fetch.sh --manifest build/sqlite-references.tsv --root references
-      - name: Check SQLite and native compiler applications
-        run: make test-sqlite-rollback-riscv test-sqlite-wal-riscv test-offline-c-riscv
-      - name: Upload logs and normalized observations
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: differential-abi-logs
-          path: |
-            build/diff-abi/run/*.log
-            build/diff-abi/run/*.json
-            build/diff-abi/run/*.normalized
-            build/diff-abi/run/*.diff
-            build/diff-abi/linux/**/build.log
-            build/diff-abi/linux/**/configure.log
-            build/diff-abi/linux/**/identity.json
-            build/diff-abi/linux/**/.config
-            build/elf-tail-riscv/**/suite.json
-            build/elf-tail-riscv/**/result.json
-            build/elf-tail-riscv/**/*.log
-            build/riscv/sqlite*/**/*.log
-            build/riscv/offline-c-run.*/**/*
-            build/riscv/sqlite*/**/*.json
-          include-hidden-files: true
-          if-no-files-found: warn
-      - name: Upload failed filesystem images
-        if: failure()
-        uses: actions/upload-artifact@v7
-        with:
-          name: differential-abi-failed-images
-          path: |
-            build/diff-abi/run/*.img
-            build/elf-tail-riscv/**/*.img
-            build/riscv/sqlite*/**/*.img
-            build/riscv/offline-c-run.*/**/*.img
-          if-no-files-found: ignore
-          retention-days: 7
 
   required:
     name: Main dual-architecture gate
     if: always()
-    needs: [host-contracts, riscv-tests, differential-abi, riscv-environment, loongarch-environment, loongarch-core, riscv-runtime, loongarch-runtime]
+    needs: [host-contracts, riscv-environment, loongarch-environment, riscv-core, loongarch-core, riscv-runtime, loongarch-runtime, riscv-development]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
@@ -428,5 +169,5 @@ jobs:
         env:
           CI_NEEDS: ${{ toJSON(needs) }}
         run: |
-          python3 -B tests/ci/run.py --check-jobs host-contracts riscv-tests differential-abi \
-            riscv-environment loongarch-environment loongarch-core riscv-runtime loongarch-runtime
+          python3 -B tests/ci/run.py --check-jobs host-contracts riscv-environment \
+            loongarch-environment riscv-core loongarch-core riscv-runtime loongarch-runtime riscv-development
