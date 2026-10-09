@@ -1704,6 +1704,8 @@ test-cost-host:
 	build/cost/host/account-test
 	cc -std=c11 -Wall -Wextra -Werror -idirafter include -DBOAROS_COST_DIAGNOSTICS=1 tests/cost/irq_test.c kernel/cost.c -o build/cost/host/irq-test
 	build/cost/host/irq-test
+	cc -std=c11 -O2 -Wall -Wextra -Werror -Itests/host/sync -idirafter include -DBOAROS_COST_DIAGNOSTICS=1 tests/cost/raw_test.c kernel/cost.c kernel/cpu.c kernel/raw_lock.c -o build/cost/host/raw-test
+	build/cost/host/raw-test
 	cc -std=c11 -Wall -Wextra -Werror -Itests/host/random -idirafter include -DBOAROS_PAGE_SHIFT=12 -DBOAROS_COST_DIAGNOSTICS=1 tests/cost/page_test.c kernel/cost.c kernel/physical_page.c $(HOST_CPU_SOURCES) -o build/cost/host/page-test
 	build/cost/host/page-test
 	cc -std=c11 -Wall -Wextra -Werror -Itests/host/random -idirafter include -DBOAROS_PAGE_SHIFT=12 -DBOAROS_COST_DIAGNOSTICS=1 tests/memory/cost_test.c kernel/cost.c kernel/physical_page.c $(HOST_CPU_SOURCES) mm/heap.c mm/uaccess.c -o build/cost/host/memory-test
@@ -1885,6 +1887,7 @@ test-sync-host:
 	@mkdir -p build/host
 	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -Itests/host/sync -idirafter include tests/host/sync.c kernel/cpu.c kernel/raw_lock.c -o build/host/sync
 	build/host/sync
+	python3 -B tests/sync/test_native.py
 
 .PHONY: test-allocator-concurrency-host
 test-allocator-concurrency-host:
@@ -1895,3 +1898,13 @@ test-allocator-concurrency-host:
 			kernel/cpu.c kernel/raw_lock.c kernel/physical_page.c mm/heap.c -o build/host/allocator-concurrency-$$shift && \
 		build/host/allocator-concurrency-$$shift || exit; \
 	done
+
+$(BUILD_DIR)/sync-%.o: tests/sync/native.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -DBOAROS_SYNC_CASE=$* -c $< -o $@
+$(BUILD_DIR)/sync-%: $(OBJECTS) $(BUILD_DIR)/sync-%.o arch/riscv/linker.ld
+	$(CC) $(LDFLAGS) -Wl,--wrap=kernel_main -o $@ $(OBJECTS) $(BUILD_DIR)/sync-$*.o
+.PHONY: test-sync-riscv
+test-sync-riscv: $(foreach case,0 1 2 3 4,$(BUILD_DIR)/sync-$(case))
+	python3 -B tests/sync/native.py --arch riscv --qemu $(QEMU_RISCV64) --kernel-dir $(BUILD_DIR)
+test-riscv: test-sync-riscv

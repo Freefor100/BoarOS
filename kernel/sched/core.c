@@ -394,6 +394,7 @@ enum kernel_scheduler_status scheduler_switch_current_away(
     next->cpu = kernel_cpu_current();
     kernel_cpu_current()->current = next;
     kernel_cpu_current()->need_resched = 0;
+    kernel_cpu_current()->rotate_other = 0;
     scheduler_rearm_timer();
     if (next == previous) return KERNEL_SCHEDULER_STATUS_OK;
     arch_fpu_switch(&previous->fpu, &next->fpu);

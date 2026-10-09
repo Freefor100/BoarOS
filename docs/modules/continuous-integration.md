@@ -27,6 +27,10 @@ host执行显式使用 `os.defpath` 和空库路径，case显式环境仍有最�
 | RISC-V original glibc 2.44 | 原五形态 GNU 消费者，版本与二进制身份保持原清单 |
 | LoongArch original glibc 2.42 and SQLite | 原五形态 GNU 消费者，以及静态/动态 SQLite DELETE/WAL、多进程和独立重启 |
 
+allocator host组包含CPU/raw、4/16 KiB真实线程并发、非法owner、抢占与有界工作量。
+RV完整门禁和LA cpu-state组运行`test-sync-riscv/test-sync-loongarch`：原生CPU/原子正例及
+raw内禁止阻塞的入口反例。runner接收实际构建目录；COST构建不读取普通目录，缺失产物不回退。
+
 两个独立 environment job 生产各自的缓存；LA 准备失败不阻止 RV 原回归或 RV GNU 环境。
 `Main dual-architecture gate` 使用 `always()` 检查所有声明 job；failure、cancelled、
 skipped 或缺失都失败。这个汇总检查可供仓库 required-check 规则使用；workflow

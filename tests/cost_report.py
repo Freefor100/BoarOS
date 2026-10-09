@@ -24,7 +24,8 @@ def supported_schemas():
     network_previous=current[:next(i for i,x in enumerate(current) if x[0]=='network_service_calls')]
     admission_previous=current[:next(i for i,x in enumerate(current) if x[0]=='stream_admit_blocked')]
     allocator_previous=current[:next(i for i,x in enumerate(current) if x[0]=='page_meta_checked')]
-    return current,memory_previous,previous,stored_pipeline,journal,original,network_previous,admission_previous,resize_previous,allocator_previous
+    raw_previous=current[:next(i for i,x in enumerate(current) if x[0]=='raw_wait_ticks')]
+    return current,memory_previous,previous,stored_pipeline,journal,original,network_previous,admission_previous,resize_previous,allocator_previous,raw_previous
 
 def parse(text, epoch, metrics=None):
     metrics=schema() if metrics is None else metrics

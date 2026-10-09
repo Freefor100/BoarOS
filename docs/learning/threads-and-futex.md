@@ -151,6 +151,9 @@ CPU 记录持有 current、待调度标志和短锁/抢占深度，I/O guard 与
 禁止抢占只保证本地执行上下文稳定；共享元数据还需要带 acquire/release 内存序的互斥。
 raw guard 保存原 IRQ 状态并登记到 CPU 持有链，禁止递归、逆序和持锁阻塞。
 timer 可以记账并留下待调度请求，解除禁止抢占不在任意调用栈直接切换。
+延期状态还须保留OTHER轮转原因：只有need_resched时，同级peer既不higher、OTHER也不expired，
+安全返回会清掉请求并继续当前任务。idle对照会被higher条件掩盖，因此另用两个普通OTHER
+任务保护延期tick的轮转和退出回收。显式preempt计数可嵌套在raw内，但不能抵消raw自身的深度。
 
 固定依据为 `references/linux/Documentation/locking/locktypes.rst`，commit
 `f4cdf7ca9a1fdcca413157df19753f388a5a224e`；LA CPU ID 来自

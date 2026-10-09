@@ -209,7 +209,7 @@ payload 字节）。阻塞调用可能有多次尝试，不能当作 syscall 次
 注册表末尾增加page_meta_checked、page_meta_written（逻辑记录）和allocator_meta_ticks
 （区间累计ticks/samples/max），均不带直方图。每次元数据区内局部累计，离开后一次
 原子提交三个计数；默认关闭，不持对象引用、不分配观测内存。计时不含压力回收与I/O
-等待。当前聚合64386字节、每任务64字节，旧223项完整registry仍可显式解析；缺少新
+等待。加上raw区间观测后当前聚合64570字节、每任务64字节，旧223/226项完整registry仍可显式解析；缺少新
 指标标记不可用，不能填零，也不接受随意缺字段的快照。外部冻结kernel identity中的
 registry与二进制SHA必须匹配；同时声明两份registry时必须一致。
 
@@ -223,3 +223,9 @@ fflush/tcdrain排空TTY，原始快照损坏仍拒绝。启动预算保持180秒
 匹配旧/新/返回旧、ON/OFF共36次启动及负向结论见
 [学习记录](../learning/cost-baseline.md#buddy-森林匹配时间2026-10-09)。IRQ-off直方图与
 rank持锁/wake-to-run沿用RV观测；LA本轮仅功能和16KiB工作量门禁，没有声明LA时间验收。
+
+raw_wait_ticks记录轮询/原子获取区间（无争用获取也有样本），raw_hold_ticks记录取得后
+到释放前的区间；二者只记录累计ticks/samples/max，不增加直方图。默认关闭，guard仅
+存栈上tag与时间，不固定新owner；释放raw后集中提交。元数据计时从取得锁后开始，
+排除锁获取与压力/I/O。heap→page嵌套区间可能重叠，不能把raw_hold与meta时间相加当独占CPU时间。
+完整旧226项registry缺少这两项时标为不可用；任意缺字段或部分新增schema仍拒绝。

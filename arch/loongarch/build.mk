@@ -334,3 +334,12 @@ test-sqlite-wal-loongarch: $(LA_BUILD)/sqlite-wal kernel-la
 .PHONY: test-sqlite-rollback-loongarch
 test-sqlite-rollback-loongarch: $(LA_BUILD)/sqlite-rollback $(LA_BUILD)/sqlite3-static $(LA_BUILD)/sqlite3-dynamic $(LA_BUILD)/sqlite-cli-init kernel-la
 	python3 -B tests/sqlite-rollback.py --arch loongarch
+
+$(LA_BUILD)/sync-%.o: tests/sync/native.c
+	@mkdir -p $(dir $@)
+	$(LA_CC) $(LA_CPPFLAGS) $(LA_CFLAGS) -DBOAROS_SYNC_CASE=$* -c $< -o $@
+$(LA_BUILD)/sync-%: $(LA_OBJECTS) $(LA_BUILD)/sync-%.o arch/loongarch/linker.ld
+	$(LA_CC) $(LA_FLAGS) -nostdlib -nostartfiles -static -no-pie -T arch/loongarch/linker.ld -Wl,--gc-sections,--wrap=physical_page_allocate,--wrap=physical_page_allocate_order,--wrap=kernel_syscall_dispatch,--wrap=la_boot_tasks -o $@ $(LA_OBJECTS) $(LA_BUILD)/sync-$*.o -lgcc
+.PHONY: test-sync-loongarch
+test-sync-loongarch: $(foreach case,0 1 2 3 4,$(LA_BUILD)/sync-$(case)) prepare-la-tools
+	python3 -B tests/sync/native.py --arch loongarch --qemu $(QEMU_LOONGARCH64) --kernel-dir $(LA_BUILD)

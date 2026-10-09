@@ -1,6 +1,7 @@
 #ifndef BOAROS_KERNEL_RAW_LOCK_H
 #define BOAROS_KERNEL_RAW_LOCK_H
 #include <kernel/cpu.h>
+#include <kernel/cost.h>
 #include <stdint.h>
 
 enum kernel_raw_rank { KERNEL_RAW_RANK_HEAP = 10, KERNEL_RAW_RANK_PAGE = 20 };
@@ -12,6 +13,10 @@ struct kernel_raw_guard {
     struct kernel_raw_guard *previous;
     uintptr_t interrupts;
     uint32_t previous_depth;
+#if BOAROS_COST_DIAGNOSTICS
+    struct kernel_cost_tag cost;
+    uint64_t wait_ticks, hold_start;
+#endif
 };
 void kernel_raw_lock_init(struct kernel_raw_lock *, uint32_t rank);
 void kernel_raw_lock_acquire(struct kernel_raw_lock *, struct kernel_raw_guard *);

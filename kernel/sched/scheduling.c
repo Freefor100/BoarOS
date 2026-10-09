@@ -92,9 +92,12 @@ enum kernel_scheduler_status scheduler_reschedule(int rotate_other, int voluntar
     if (kernel_cpu_current()->preempt_depth) {
         if (voluntary) __builtin_trap();
         kernel_cpu_current()->need_resched = 1;
+        kernel_cpu_current()->rotate_other |= rotate_other != 0;
         scheduler_rearm_timer();
         return KERNEL_SCHEDULER_STATUS_OK;
     }
+    rotate_other |= kernel_cpu_current()->rotate_other;
+    kernel_cpu_current()->rotate_other = 0;
     struct kernel_task *current = kernel_cpu_current()->current;
     struct kernel_task *next = ready_best();
     int throttled = is_rt(current) && !kernel_rt_bandwidth_eligible(&scheduler.rt_bandwidth);

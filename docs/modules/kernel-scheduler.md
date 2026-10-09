@@ -204,7 +204,11 @@ pipe/proc状态双握手确认，覆盖同期限、提前信号、默认信号�
 启动任务与idle显式绑定，RV采用固件hart ID并在高地址重定位后重绑，LA读取CPUID CSR。
 bootstrap I/O上下文与任务I/O上下文分开，任务guard和回收深度不迁入CPU。raw guard必须按LIFO由同CPU释放，
 递归、逆序、错误owner和计数损坏fatal；block/yield/退出及可睡眠锁获取拒绝禁止抢占上下文。
-`make test-sync-host`验证真实四线程争用、IRQ恢复及fatal反例，RV scheduler cases验证延后tick请求不丢失。
+`make test-sync-host`验证真实四线程争用、IRQ恢复、显式preempt在raw内的合法嵌套及fatal反例。
+延期tick同时保存OTHER轮转原因，安全点消费；普通唤醒不自动变成同级轮转，切换后不把旧原因交给新任务。
+RV scheduler cases分别验证idle和两个同级OTHER任务的延期请求，恢复后peer必须进展并归还全部owner。
+`test-sync-riscv/test-sync-loongarch`在512M/1G运行真实原子/IRQ正例，以及raw内block/yield/退出/睡眠锁的fatal。
+runner从Make接收实际构建目录，COST入口不能借用普通产物；host保护目录覆盖和缺失输入不回退。
 这些结果不证明全局运行队列、等待、MM或设备已经具备SMP安全性。
 
 `kernel_rwlock`的栈waiter由阻塞调用持有；授予资格先于wake，新任务不得抢走已授予

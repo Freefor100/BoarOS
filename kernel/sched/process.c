@@ -1830,6 +1830,7 @@ static void kernel_thread_finish(
 #endif
     next->cpu = kernel_cpu_current();
     kernel_cpu_current()->current = next;
+    kernel_cpu_current()->rotate_other = 0;
     kernel_cpu_current()->need_resched = 0;
     scheduler_rearm_timer();
     /* The dying task's FP state is discarded, but the dispatched task
@@ -1895,12 +1896,13 @@ void kernel_user_thread_exit(
 
 struct kernel_task *kernel_task_current(void)
 {
-    if (scheduler.initialized != KERNEL_SCHEDULER_INITIALIZED ||
-        kernel_cpu_current()->current == 0 ||
-        arch_current_thread_get() != kernel_cpu_current()->current) {
-        return 0;
-    }
-    return kernel_cpu_current()->current;
+    if (scheduler.initialized != KERNEL_SCHEDULER_INITIALIZED) return 0;
+    /* CPU字段只在短IRQ区借用；返回任务自身的稳定owner，而非CPU记录借用。 */
+    uintptr_t irq = arch_interrupt_save();
+    struct kernel_task *current = kernel_cpu_current()->current;
+    if (arch_current_thread_get() != current) current = 0;
+    arch_interrupt_restore(irq);
+    return current;
 }
 
 enum kernel_task_status kernel_task_set_tid_address(

@@ -221,6 +221,20 @@ class CostReportTest(unittest.TestCase):
         del fields['foreground.irq_off_ticks.max']
         with self.assertRaises(ValueError): parse(self.render(fields), 3, old)
 
+    def test_frozen_pre_raw_schema_is_complete_without_zero_fill(self):
+        current = schema()
+        self.assertIn('raw_wait_ticks', {name for name, _, _ in current})
+        old = current[:next(i for i, metric in enumerate(current) if metric[0] == 'raw_wait_ticks')]
+        fields = self.valid()
+        for lane in ('foreground', 'background', 'observer'):
+            for name, _, _ in current[len(old):]:
+                for key in list(fields):
+                    if key.startswith(lane+'.'+name+'.'): del fields[key]
+        parsed = parse(self.render(fields), 3, old)
+        self.assertNotIn('foreground.raw_wait_ticks.value', parsed)
+        with self.assertRaises(ValueError): parse(self.render(fields), 3)
+        with self.assertRaises(ValueError): parse(self.render(fields), 3, old[:-1])
+
     def test_replicas_use_the_frozen_kernel_registry(self):
         from copy import deepcopy
         current=schema()
@@ -232,7 +246,7 @@ class CostReportTest(unittest.TestCase):
             row['kernel_build_identity']={'kernel_sha256':row['kernel_sha256'],'metric_schema':old}
             for snapshot in row['snapshots']:
                 for key in list(snapshot['values']):
-                    if any('.'+metric+'.' in key for metric in ('page_meta_checked','page_meta_written','allocator_meta_ticks')):
+                    if any('.'+metric+'.' in key for metric, _, _ in current[len(old):]):
                         del snapshot['values'][key]
         self.assertEqual(len(validate_replicas(rows)),3)
         bad=deepcopy(rows)

@@ -15,6 +15,7 @@ struct kernel_cpu {
     struct kernel_raw_guard *raw_locks;
     uint32_t initialized, preempt_depth;
     unsigned need_resched;
+    unsigned rotate_other;
 };
 static inline struct kernel_cpu *kernel_cpu_current(void)
 {

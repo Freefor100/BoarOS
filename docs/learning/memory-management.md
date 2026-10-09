@@ -151,7 +151,7 @@ resolve在锁内验证owner，解锁后调用映射器，合法调用者自身�
 `references/linux/arch/riscv/mm/tlbflush.c` 的本地与远端失效路径提供固定依据。
 
 RV COST记录IRQ-off、按rank的对象锁持有与wake-to-run；LA尚未接完整同类时间挂钩。
-三项allocator指标采用非直方图counter，聚合64386字节、每任务64字节，保持64KiB上限；
+三项allocator指标及新增两项raw区间采用非直方图counter，聚合64570字节、每任务64字节，保持64KiB上限；
 记录工作量及时间总量/样本/max，分布复用IRQ-off。metric已实现，不能沿用旧设计中的
 “尚未实现”状态；接口与schema见[COST模块](../modules/kernel-cost.md#buddy元数据观测2026-10-09)。
 lwIP固定快照 `references/lwip`（`77dcd25a72509eb83f72b033d219b1d40cd8eb95`）

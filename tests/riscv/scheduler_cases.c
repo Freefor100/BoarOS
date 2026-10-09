@@ -1264,6 +1264,36 @@ static unsigned run_deferred_preemption_case(struct physical_page_allocator *all
         physical_page_available(allocator) != before || cpu->preempt_depth || cpu->raw_locks;
     return failure;
 }
+static unsigned other_deferred_ran, other_deferred_failure;
+static void other_deferred_peer(void *argument)
+{ (void)argument; other_deferred_ran = 1; }
+static void other_deferred_current(void *argument)
+{
+    (void)argument;
+    uintptr_t irq = arch_interrupt_save();
+    struct kernel_task *before = kernel_task_current();
+    kernel_preempt_disable();
+    other_deferred_failure = kernel_scheduler_on_tick(1) != KERNEL_SCHEDULER_STATUS_OK ||
+        other_deferred_ran || kernel_task_current() != before;
+    kernel_preempt_enable();
+    kernel_task_prepare_user_return();
+    other_deferred_failure += !other_deferred_ran || kernel_cpu_current()->need_resched ||
+        kernel_task_current() != before;
+    arch_interrupt_restore(irq);
+}
+static unsigned run_other_deferred_case(struct physical_page_allocator *allocator)
+{
+    uint64_t baseline = physical_page_available(allocator);
+    struct kernel_thread_completion completion;
+    if (kernel_thread_create(other_deferred_current, 0) != KERNEL_SCHEDULER_STATUS_OK ||
+        kernel_thread_create(other_deferred_peer, 0) != KERNEL_SCHEDULER_STATUS_OK) return 1;
+    /* 无cleanup worker的fixture每次退出回idle；分别驱动并回收两个owner。 */
+    for (unsigned i = 0; i < 2; i++) {
+        if (kernel_scheduler_yield_current() != KERNEL_SCHEDULER_STATUS_OK ||
+            kernel_scheduler_reap_one(&completion) != KERNEL_SCHEDULER_STATUS_OK) return 1;
+    }
+    return other_deferred_failure + (physical_page_available(allocator) != baseline);
+}
 
 void kernel_main(unsigned long hart_id, const void *dtb)
 {
@@ -1309,6 +1339,7 @@ void kernel_main(unsigned long hart_id, const void *dtb)
     failures += run_idle_irq_return_case(&allocator);
     failures += run_handoff_cases(&allocator);
     failures += run_deferred_preemption_case(&allocator);
+    failures += run_other_deferred_case(&allocator);
     failures += run_exit_dispatch_case(&allocator);
     virt_uart_puts("BoarOS: scheduler cases failures=");
     virt_uart_put_hex(failures);

@@ -52,6 +52,8 @@ static void misuse(unsigned which)
             kernel_preempt_disable(); break;
     case 8: kernel_raw_lock_release(&a); kernel_preempt_enable(); break;
     case 9: kernel_raw_lock_release(&a); kernel_preempt_disable(); kernel_assert_can_block(); break;
+    case 10: kernel_raw_lock_release(&a); lock.word = 2; alarm(1);
+             kernel_raw_lock_acquire(&lock, &b); break;
     default: assert(0);
     }
     _exit(1);
@@ -66,11 +68,15 @@ int main(void)
     for (unsigned enabled = 0; enabled < 2; enabled++) {
         sync_test_irq = enabled;
         { KERNEL_RAW_SCOPE(a, &lock);
+          kernel_preempt_disable();
+          assert(cpu.preempt_depth == 2);
+          kernel_preempt_enable();
+          assert(cpu.preempt_depth == 1 && cpu.raw_locks);
           { KERNEL_RAW_SCOPE(b, &inner); assert(cpu.preempt_depth == 2); }
           assert(!sync_test_irq && cpu.preempt_depth == 1); }
         assert(sync_test_irq == enabled && !cpu.raw_locks && !cpu.preempt_depth);
     }
-    for (unsigned which = 0; which < 10; which++) {
+    for (unsigned which = 0; which < 11; which++) {
         pid_t child = fork(); assert(child >= 0);
         if (!child) misuse(which);
         int status; assert(waitpid(child, &status, 0) == child);
@@ -83,5 +89,5 @@ int main(void)
     for (unsigned i = 0; i < 4; i++) assert(pthread_join(threads[i], 0) == 0);
     assert(count == 80000);
     assert(pthread_barrier_destroy(&start) == 0);
-    puts("CPU/raw synchronization: mutual exclusion, visibility, IRQ restoration and 10 fatal cases passed");
+    puts("CPU/raw synchronization: mutual exclusion, visibility, IRQ restoration and 11 fatal cases passed");
 }
