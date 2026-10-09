@@ -95,6 +95,16 @@ GNU profile，安装位置可以迁移，二进制身份与库版本不变。
 但切离清单 commit 或产生本地修改后不会通过下一次恢复校验。分析结束后
 切回 `sources.tsv` 记录的 commit 即可重新验证。
 
+外网runner使用的原RV BusyBox/libc来自`pre-20250615`发布盘。
+其压缩输入另固定在`oscomp-images/sdcard-rv.img.xz`，URL与压缩SHA在`sources.tsv`；
+解压后的SHA `95973543db6b84a9a5e70f30da466ce292867aff5b689fb14c88dc9406e378b8`
+由`tests/workloads/network/inputs.json`固定，2026-10-10对固定压缩包完整解压核对。
+`python3 -B tests/network_inputs.py`验证并复用现有只读原盘，或校验下载后原子发布到
+`build/tools/network-rv/`；损坏缓存不覆盖、不重新登记身份。其他owner持有的Harness原盘
+若与解压身份不符则明确报告并保持原样，不把其现有SHA冒充发布输入。
+该输入只服务原网络消费者，
+不把main构建改成比赛启动环境。
+
 `tests/program-inventory/inputs.json` 是执行 profile：BusyBox 源码和配置取自
 清单的 `b5ec6ef8497e1818cbdec3b54bb722f036e57972`，libc-test 和比赛脚本取自
 同一个完整 object store 的附加 commit
