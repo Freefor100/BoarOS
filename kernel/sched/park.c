@@ -242,29 +242,32 @@ enum kernel_scheduler_status kernel_wait_finish(struct kernel_wait_token *token)
     if (!token || !token->task) return KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
     if (token->task != kernel_wait_current_task()) __builtin_trap();
     for (;;) {
-        struct kernel_wait_node *node;
+        int borrowed = 0;
         {
             KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
             if (!matches(token)) return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
             struct kernel_wait_record *record = kernel_wait_record_of(token->task);
             if (record->phase == KERNEL_WAIT_COMMITTED) __builtin_trap();
-            node = record->nodes;
-            if (!node && !record->borrows) {
+            /* 同一保护内结束小批登记；单节点不为再检查空链重复取锁。 */
+            for (unsigned count = 0; record->nodes && count < 16; count++) {
+                struct kernel_wait_node *node = record->nodes;
+                kernel_wait_node_remove_locked(node);
+                if (node->references) {
+                    borrowed = 1;
+                    break;
+                }
+                record->nodes = node->token_next;
+                node->generation = 0;
+                node->token_next = 0;
+            }
+            if (!record->nodes && !record->borrows) {
                 record->phase = KERNEL_WAIT_FINISHED;
                 *token = (struct kernel_wait_token){0};
                 return KERNEL_SCHEDULER_STATUS_OK;
             }
-            if (node) {
-                kernel_wait_node_remove_locked(node);
-                if (!node->references) {
-                    record->nodes = node->token_next;
-                    node->generation = 0;
-                    node->token_next = 0;
-                    continue;
-                }
-            }
+            borrowed |= record->borrows != 0;
         }
-        kernel_wait_backend_quiesce();
+        if (borrowed) kernel_wait_backend_quiesce();
     }
 }
 void kernel_wait_switch_finish_locked(struct kernel_task *task)
@@ -278,14 +281,23 @@ void kernel_wait_switch_finish_locked(struct kernel_task *task)
     }
 }
 static int cursor_begin(struct kernel_wait_queue *queue, struct kernel_wait_cursor *cursor,
-    int skip_empty)
+    int direct_notification)
 {
     KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
     if (!queue || queue->initialized != KERNEL_WAIT_QUEUE_INITIALIZED || queue->borrows == UINT32_MAX)
         __builtin_trap();
     queue_shape(queue);
     /* 空通知在同一锁内完成判断，不建立无需跨解锁使用的游标借用。 */
-    if (skip_empty && !queue->head) return 0;
+    if (direct_notification && !queue->head) return 0;
+    /* 唯一任务节点的通知全在raw内，不跨解锁借用；回调仍走游标寿命。 */
+    if (direct_notification && queue->registrations == 1 && !queue->head->callback) {
+        struct kernel_wait_node *node = queue->head;
+        if (node->task && node->generation) {
+            struct kernel_wait_token token = {node->task, node->generation};
+            kernel_wait_notify_locked(&token, KERNEL_WAIT_WOKEN);
+        }
+        return 0;
+    }
     queue->borrows++;
     *cursor = (struct kernel_wait_cursor){queue, queue->head, queue->sequence};
     if (cursor->node) borrow(cursor->node);

@@ -24,6 +24,58 @@ void kernel_rwlock_init(struct kernel_rwlock *lock, uint32_t rank, uintptr_t key
     kernel_wait_queue_init(&lock->waiters);
     kernel_raw_lock_init(&lock->metadata, KERNEL_RAW_RANK_OBJECT);
 }
+/* 在对象raw内一次发布登记与FIFO资格owner；本函数不睡眠。 */
+static __attribute__((noinline)) void register_waiter(struct kernel_rwlock *lock,
+    struct kernel_lock_waiter *waiter)
+{
+    if (kernel_wait_prepare(&lock->waiters, 0, 0, &waiter->token) != KERNEL_SCHEDULER_STATUS_OK)
+        __builtin_trap();
+    if (lock->pending_tail) lock->pending_tail->next = waiter;
+    else lock->pending_head = waiter;
+    lock->pending_tail = waiter;
+    if (waiter->write) {
+        if (lock->writers_waiting == UINT32_MAX) __builtin_trap();
+        lock->writers_waiting++;
+    }
+}
+/* waiter仅竞争时驻留慢路径栈；返回前结束token，且对象raw仍由调用者持有。 */
+static __attribute__((noinline)) uint64_t acquire_waiter(struct kernel_rwlock *lock,
+    struct kernel_io_context *owner, int write, struct kernel_raw_guard *metadata
+#if BOAROS_COST_DIAGNOSTICS
+    , unsigned rank, enum kernel_cost_metric metric
+#endif
+    )
+{
+    struct kernel_lock_waiter waiter = {.owner = owner, .write = write};
+    register_waiter(lock, &waiter);
+    while (!waiter.granted) {
+        struct kernel_wait_token parked = waiter.token;
+        kernel_raw_lock_release(metadata);
+        enum kernel_wait_wake_reason reason;
+#if BOAROS_COST_DIAGNOSTICS
+        struct kernel_cost_task *task = kernel_cost_current();
+        if (task) {
+            if (task->wait_flags & 1) kernel_cost_add((enum kernel_cost_metric)(metric+4),1);
+            task->wait_flags &= (uint8_t)~1U; task->wait_rank = (uint8_t)(rank+1);
+        }
+        kernel_cost_add((enum kernel_cost_metric)(metric+2),1);
+#endif
+        if (kernel_wait_park(&parked, &reason) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
+        /* pending中的token只在对象raw内更新；finish清局部副本，允许间隙授资格。 */
+        if (kernel_wait_finish(&parked) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
+        kernel_raw_lock_acquire(&lock->metadata, metadata);
+        /* 通知不等于资格；虚唤醒只换token，不重排FIFO的业务等待者。 */
+        if (!waiter.granted && kernel_wait_prepare(&lock->waiters, 0, 0, &waiter.token) !=
+            KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
+    }
+    /* 资格授予同时摘pending；局部waiter不得逃出慢路径的存活区间。 */
+    if (lock->pending_head == &waiter || lock->pending_tail == &waiter) __builtin_trap();
+#if BOAROS_COST_DIAGNOSTICS
+    return waiter.grant_ticks;
+#else
+    return 0;
+#endif
+}
 static int acquire(struct kernel_rwlock *lock, struct kernel_lock_guard *guard, int write, int try_only)
 {
     kernel_assert_can_block();
@@ -52,47 +104,21 @@ static int acquire(struct kernel_rwlock *lock, struct kernel_lock_guard *guard, 
         arch_interrupt_restore(irq);
         return 0;
     }
-    struct kernel_lock_waiter waiter = {.owner = owner, .write = write};
+#if BOAROS_COST_DIAGNOSTICS
+    uint64_t grant_ticks = hold_start;
+#endif
     if (lock->writer || lock->pending_head || lock->handoff_owner || (write && lock->readers)) {
-        if (kernel_wait_prepare(&lock->waiters, 0, 0, &waiter.token) != KERNEL_SCHEDULER_STATUS_OK)
-            __builtin_trap();
-        if (lock->pending_tail) lock->pending_tail->next = &waiter;
-        else lock->pending_head = &waiter;
-        lock->pending_tail = &waiter;
-        if (write) {
-            if (lock->writers_waiting == UINT32_MAX) __builtin_trap();
-            lock->writers_waiting++;
-        }
+#if BOAROS_COST_DIAGNOSTICS
+        grant_ticks = acquire_waiter(lock, owner, write, &metadata, rank, metric);
+#else
+        (void)acquire_waiter(lock, owner, write, &metadata);
+#endif
     } else {
-        waiter.granted = 1;
         if (write) lock->writer = owner;
         else {
             if (lock->readers == UINT32_MAX) __builtin_trap();
             lock->readers++;
         }
-#if BOAROS_COST_DIAGNOSTICS
-        waiter.grant_ticks = hold_start;
-#endif
-    }
-    while (!waiter.granted) {
-        struct kernel_wait_token parked = waiter.token;
-        kernel_raw_lock_release(&metadata);
-        enum kernel_wait_wake_reason reason;
-#if BOAROS_COST_DIAGNOSTICS
-        struct kernel_cost_task *task = kernel_cost_current();
-        if (task) {
-            if (task->wait_flags & 1) kernel_cost_add((enum kernel_cost_metric)(metric+4),1);
-            task->wait_flags &= (uint8_t)~1U; task->wait_rank = (uint8_t)(rank+1);
-        }
-        kernel_cost_add((enum kernel_cost_metric)(metric+2),1);
-#endif
-        if (kernel_wait_park(&parked, &reason) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
-        /* pending中的token只在对象raw内更新；finish清局部副本，允许间隙授资格。 */
-        if (kernel_wait_finish(&parked) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
-        kernel_raw_lock_acquire(&lock->metadata, &metadata);
-        /* 通知不等于资格；虚唤醒只换token，不重排FIFO的业务等待者。 */
-        if (!waiter.granted && kernel_wait_prepare(&lock->waiters, 0, 0, &waiter.token) !=
-            KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
     }
     kernel_raw_lock_release(&metadata);
     *guard = (struct kernel_lock_guard){lock, owner, owner->locks, write
@@ -106,7 +132,7 @@ static int acquire(struct kernel_rwlock *lock, struct kernel_lock_guard *guard, 
     kernel_cost_add((enum kernel_cost_metric)(metric+1),1);
     kernel_cost_sample((enum kernel_cost_metric)(metric+5),kernel_cost_clock()-wait_start);
     struct kernel_cost_scope hold = kernel_cost_enter((enum kernel_cost_metric)(metric+6));
-    guard->cost_start = waiter.grant_ticks; guard->cost_registered = hold.actor != 0;
+    guard->cost_start = grant_ticks; guard->cost_registered = hold.actor != 0;
 #endif
     owner->locks = guard;
     arch_interrupt_restore(irq);

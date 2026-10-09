@@ -28,11 +28,19 @@ static int switching;
 static struct kernel_wait_queue closing;
 static pthread_barrier_t close_entered, close_released;
 static _Thread_local unsigned pause_close;
+static _Thread_local struct kernel_wait_queue *finish_queues;
+static _Thread_local unsigned finish_remaining;
 void __real_kernel_raw_lock_release(struct kernel_raw_guard *);
 void __wrap_kernel_raw_lock_release(struct kernel_raw_guard *guard)
 {
     int pause = pause_close && guard->lock == &kernel_wait_domain && closing.closed;
     if (pause) pause_close = 0;
+    if (finish_queues && guard->lock == &kernel_wait_domain) {
+        unsigned remaining = 0;
+        for (unsigned i = 0; i < 33; i++) remaining += finish_queues[i].registrations;
+        assert(remaining <= finish_remaining && finish_remaining - remaining <= 16);
+        finish_remaining = remaining;
+    }
     __real_kernel_raw_lock_release(guard);
     if (pause) {
         int result = pthread_barrier_wait(&close_entered);
@@ -252,6 +260,27 @@ static void early_and_multi(void)
     assert(!task.wait.nodes && task.wait.phase == KERNEL_WAIT_FINISHED);
     task.wait.generation = 0;
 }
+static void finish_many(void)
+{
+    struct kernel_wait_queue queues[33];
+    struct kernel_wait_node nodes[32];
+    struct kernel_wait_token token;
+    for (unsigned i = 0; i < 33; i++) kernel_wait_queue_init(&queues[i]);
+    assert(kernel_wait_prepare(&queues[0], 0, 0, &token) == KERNEL_SCHEDULER_STATUS_OK);
+    for (unsigned i = 0; i < 32; i++) {
+        kernel_wait_node_init(&nodes[i], &task);
+        assert(kernel_wait_node_bind(&queues[i + 1], &nodes[i], &token) == KERNEL_SCHEDULER_STATUS_OK);
+    }
+    finish_queues = queues;
+    finish_remaining = 33;
+    assert(kernel_wait_finish(&token) == KERNEL_SCHEDULER_STATUS_OK);
+    assert(!finish_remaining && !task.wait.nodes && !task.wait.borrows);
+    finish_queues = 0;
+    for (unsigned i = 0; i < 33; i++) {
+        assert(kernel_wait_queue_close(&queues[i]) == KERNEL_SCHEDULER_STATUS_OK);
+        assert(kernel_wait_queue_destroy(&queues[i]) == KERNEL_SCHEDULER_STATUS_OK);
+    }
+}
 static void owner_failures(void)
 {
     for (unsigned which = 0; which < 5; which++) {
@@ -286,6 +315,7 @@ int main(void)
     kernel_wait_domain_init();
     owner_failures();
     early_and_multi();
+    finish_many();
     sync_test_irq = 1;
     arbitration(2);
     assert(sync_test_irq == 1);
