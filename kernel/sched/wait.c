@@ -183,14 +183,6 @@ struct kernel_task *deadline_index_first(void)
     return task;
 }
 
-void scheduler_wait_requeue(struct kernel_task *task, struct kernel_wait_queue *queue)
-{
-    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-    kernel_wait_node_remove_locked(&task->default_wait_node);
-    task->wait_queue = queue;
-    if (queue) kernel_wait_node_add_locked(queue, &task->default_wait_node);
-}
-
 /* STOPPED tasks park on their own list so the blocked-list invariant
  * (state == BLOCKED) stays intact; SIGCONT/SIGKILL move them back to
  * the ready queue. */
@@ -285,14 +277,19 @@ enum kernel_scheduler_status kernel_scheduler_expire_deadlines(uint64_t now)
     COST_ADD(DEADLINE_PASSES, 1);
     if (!kernel_wait_backend_initialized()) return KERNEL_SCHEDULER_STATUS_NOT_INITIALIZED;
     if (arch_interrupt_is_enabled()) return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
-    {
-        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-        struct kernel_task *task;
-        while ((task = deadline_index_first()) && (int64_t)(now - task->wakeup_deadline) >= 0) {
-            struct kernel_wait_token token = {task, task->wait.generation};
-            COST_ADD(DEADLINE_VISITS, 1);
-            if (!kernel_wait_notify_locked(&token, KERNEL_WAIT_TIMEOUT)) __builtin_trap();
+    for (;;) {
+        int done = 0;
+        {
+            KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+            for (unsigned n = 0; n < 16; n++) {
+                struct kernel_task *task = deadline_index_first();
+                if (!task || (int64_t)(now - task->wakeup_deadline) < 0) { done = 1; break; }
+                struct kernel_wait_token token = {task, task->wait.generation};
+                COST_ADD(DEADLINE_VISITS, 1);
+                if (!kernel_wait_notify_locked(&token, KERNEL_WAIT_TIMEOUT)) __builtin_trap();
+            }
         }
+        if (done) break;
     }
     /* 协议和信号业务回调不能进入调度raw域。 */
     kernel_socket_expire_timers();
@@ -302,6 +299,7 @@ enum kernel_scheduler_status kernel_scheduler_expire_deadlines(uint64_t now)
 enum kernel_scheduler_status kernel_scheduler_block_current(struct kernel_wait_queue *queue,
     uint64_t deadline, int interruptible, enum kernel_wait_wake_reason *reason)
 {
+    kernel_assert_can_block();
     if (arch_interrupt_is_enabled()) return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
     if (!reason) return KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
     struct kernel_wait_token token;

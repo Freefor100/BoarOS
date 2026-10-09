@@ -1365,7 +1365,8 @@ static int unix_reserve_packet(struct kernel_socket_write_request *request,uint3
         }
         if(flags&KERNEL_SOCKET_MSG_DONTWAIT) {result=-KERNEL_EAGAIN;break;}
         enum kernel_wait_wake_reason reason;
-        if(kernel_scheduler_block_current(&sender->wait,deadline,1,&reason)!=KERNEL_SCHEDULER_STATUS_OK)__builtin_trap();
+        if(KERNEL_WAIT_RECHECK(&sender->wait,deadline,1,&reason,
+                (sender->unix_memory + sender->tx_reserved >= sender->tx_limit))!=KERNEL_SCHEDULER_STATUS_OK)__builtin_trap();
         if(reason==KERNEL_WAIT_TIMEOUT) {result=-KERNEL_EAGAIN;break;}
         if(reason==KERNEL_WAIT_SIGNALLED) {
             if(deadline)result=-KERNEL_EINTR;

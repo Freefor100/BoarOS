@@ -508,8 +508,9 @@ enum kernel_scheduler_status process_group_exec_current(void)
     } while (member != leader);
     while (leader->group_members != (task == leader ? 1U : 2U) ||
            (task != leader && leader->state != KERNEL_THREAD_STATE_GROUP_DEAD)) {
-        status = kernel_scheduler_block_current(&leader->group_wait_queue,
-                                                 0U, 0, &reason);
+        status = KERNEL_WAIT_RECHECK(&leader->group_wait_queue,
+                                                 0U, 0, &reason,
+                (leader->group_members != (task == leader ? 1U : 2U) || (task != leader && leader->state != KERNEL_THREAD_STATE_GROUP_DEAD)));
         if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
         if (leader->group_exiting)
             kernel_user_thread_exit(KERNEL_THREAD_EXIT_SYSCALL, 0U, 0U);
@@ -874,8 +875,9 @@ enum kernel_scheduler_status arch_process_clone_current(
         parent->vfork_waiting = 1U;
         parent->vfork_wait_child = child;
         while (parent->vfork_waiting != 0U) {
-            status = kernel_scheduler_block_current(&parent->vfork_done_queue,
-                                                    0U, 0, &wake_reason);
+            status = KERNEL_WAIT_RECHECK(&parent->vfork_done_queue,
+                                                    0U, 0, &wake_reason,
+                (parent->vfork_waiting != 0U));
             if (status != KERNEL_SCHEDULER_STATUS_OK) {
                 return status;
             }
@@ -1161,10 +1163,11 @@ enum kernel_scheduler_status kernel_scheduler_wait4_current(
             *linux_result = 0;
             return KERNEL_SCHEDULER_STATUS_OK;
         }
-        status = kernel_scheduler_block_current(&parent->group_leader->child_exit_queue,
+        status = KERNEL_WAIT_RECHECK(&parent->group_leader->child_exit_queue,
                                                 0U,
                                                 1,
-                                                &wake_reason);
+                                                &wake_reason,
+                (matching_child));
         if (status != KERNEL_SCHEDULER_STATUS_OK) {
             return status;
         }
@@ -1198,7 +1201,8 @@ void kernel_scheduler_wait_cleanup(uint64_t retry_deadline)
     if (arch_interrupt_is_enabled() || kernel_cpu_current()->current != scheduler.cleanup_task) __builtin_trap();
     if (!scheduler.exited_head || retry_deadline) {
         enum kernel_wait_wake_reason reason;
-        if (kernel_scheduler_block_current(&scheduler.cleanup_queue, retry_deadline, 1, &reason) != KERNEL_SCHEDULER_STATUS_OK)
+        if (KERNEL_WAIT_RECHECK(&scheduler.cleanup_queue, retry_deadline, 1, &reason,
+                (!scheduler.exited_head || retry_deadline)) != KERNEL_SCHEDULER_STATUS_OK)
             __builtin_trap();
     }
 }
@@ -1209,7 +1213,8 @@ void kernel_thread_join(struct kernel_thread_join *join)
     if (!join || join->task == kernel_cpu_current()->current) __builtin_trap();
     while (join->task && join->task->state != KERNEL_THREAD_STATE_EXITED) {
         enum kernel_wait_wake_reason reason;
-        if (kernel_scheduler_block_current(&join->waiters, 0, 0, &reason)
+        if (KERNEL_WAIT_RECHECK(&join->waiters, 0, 0, &reason,
+                (join->task && join->task->state != KERNEL_THREAD_STATE_EXITED))
                 != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
     }
     if (join->task) {
@@ -1794,6 +1799,11 @@ static void kernel_thread_finish(
         switch_to_fatal_idle(status);
     }
 
+    {
+        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        if (current->wait.phase != KERNEL_WAIT_FINISHED || current->wait.nodes || current->wait.borrows)
+            __builtin_trap();
+    }
     /* proc readers must see departure before clear_child_tid wakes a joiner. */
 #if BOAROS_COST_DIAGNOSTICS
     kernel_cost_task_exit();

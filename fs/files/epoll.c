@@ -132,9 +132,9 @@ static enum kernel_files_status epoll_item_unlink_and_destroy(
     struct kernel_epoll *epoll = item->epoll;
     struct kernel_open_file_description *target_file = item->target_file;
 
-    if (item->wait_node.queue != 0) {
-        kernel_wait_queue_remove(&item->wait_node);
-    }
+    /* 停止新业务通知，再摘登记；在途callback仍借用item/context。 */
+    item->linked = 0;
+    if (kernel_wait_node_remove_sync(&item->wait_node) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
 
     if (epoll != 0) {
         epoll_remove_from_ready_list(epoll, item);
@@ -853,15 +853,15 @@ enum kernel_files_status kernel_files_epoll_pwait(
             enum kernel_wait_wake_reason wake_reason = KERNEL_WAIT_WOKEN;
             uint64_t saved_intr = arch_interrupt_save();
             uint64_t sleep_deadline = deadline;
-            if (!epoll->scan_owner && epoll->ready_head != 0) {
-                arch_interrupt_restore(saved_intr);
-                continue;
+            struct kernel_wait_token token;
+            enum kernel_scheduler_status sched_status = kernel_wait_prepare(
+                &epoll->wait_queue, sleep_deadline, 1, &token);
+            if (sched_status == KERNEL_SCHEDULER_STATUS_OK) {
+                int ready = !epoll->scan_owner && epoll->ready_head;
+                if (!ready) sched_status = kernel_wait_park(&token, &wake_reason);
+                if (kernel_wait_finish(&token) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
+                if (ready) { arch_interrupt_restore(saved_intr); continue; }
             }
-            enum kernel_scheduler_status sched_status =
-                kernel_scheduler_block_current(&epoll->wait_queue,
-                                               sleep_deadline,
-                                               1,
-                                               &wake_reason);
             arch_interrupt_restore(saved_intr);
             if (sched_status != KERNEL_SCHEDULER_STATUS_OK) {
                 *linux_result = -KERNEL_EIO;

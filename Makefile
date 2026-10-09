@@ -1929,3 +1929,11 @@ $(BUILD_DIR)/wait-native: $(OBJECTS) $(BUILD_DIR)/wait-native.o arch/riscv/linke
 .PHONY: test-wait-riscv
 test-wait-riscv: $(BUILD_DIR)/wait-native
 	python3 -B tests/wait/native.py --arch riscv --qemu $(QEMU_RISCV64) --kernel-dir $(BUILD_DIR)
+
+.PHONY: test-sleep-lock-host
+test-sleep-lock-host:
+	@mkdir -p build/host
+	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -Itests/host/sync -idirafter include tests/host/sleep_lock.c kernel/cpu.c kernel/raw_lock.c kernel/sched/park.c kernel/sched/sync.c -Wl,--wrap=kernel_raw_lock_release -o build/host/sleep-lock
+	build/host/sleep-lock
+
+test-riscv: test-wait-riscv

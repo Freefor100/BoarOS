@@ -205,3 +205,13 @@ callback在锁外同步运行并拒绝阻塞，业务对象的锁与存活仍由
 真实切换；重建命令为`make test-wait-host test-wait-riscv test-wait-loongarch`。固定同步资料仍为
 `references/linux/kernel/sched/core.c`及`include/linux/wait.h`，commit
 `f4cdf7ca9a1fdcca413157df19753f388a5a224e`；实现保留BoarOS的任务资格与owner契约。
+
+可睡眠锁的内部资格与业务对象的数据保护分开：前者用每实例raw30及调度raw40，后者继续由
+mutex/RW guard的任务owner承担。读者批次释放内部raw时，handoff owner保留原批次边界；
+后来到达者不能搭上尚未完成的旧批次。宿主握手在第16个读者后强制插入后来读者；删除批次
+边界的候选被反例拒绝，生产实现保持后来者等待旧批次退出。重建为`make test-sleep-lock-host`。
+
+futex过滤wake不能沿用跨解锁的裸next。游标借用node，requeue额外借task再释放当前游标，
+旧node借用收完后才移动登记；后备引用取得/归还留在raw域外。全局不回退的等待代次还覆盖
+任务页复用：同地址的新任务不能消费旧token。当前资料与客体配置不变，这些同步原语的宿主
+并发结果仍不等于共享MM、FD/OFD、缓存或协议业务数据已完成SMP同步。

@@ -165,8 +165,9 @@ int kernel_random_wait_ready(int nonblock)
     while (!kernel_random_ready()) {
         enum kernel_wait_wake_reason reason;
         if (nonblock) { arch_interrupt_restore(irq); return -KERNEL_EAGAIN; }
-        if (kernel_scheduler_block_current(kernel_random_wait_queue(), 0, 1,
-                                          &reason) != KERNEL_SCHEDULER_STATUS_OK) {
+        if (KERNEL_WAIT_RECHECK(kernel_random_wait_queue(), 0, 1,
+                                          &reason,
+                (!kernel_random_ready())) != KERNEL_SCHEDULER_STATUS_OK) {
             arch_interrupt_restore(irq); return -KERNEL_EIO;
         }
         if (reason == KERNEL_WAIT_SIGNALLED) {

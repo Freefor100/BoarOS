@@ -177,16 +177,74 @@ static void early_and_multi(void)
         assert(kernel_wait_queue_close(&queues[i]) == KERNEL_SCHEDULER_STATUS_OK);
         assert(kernel_wait_queue_destroy(&queues[i]) == KERNEL_SCHEDULER_STATUS_OK);
     }
+    int waited = 0;
+    assert(KERNEL_WAIT_RECHECK(0, 0, 0, &reason, (++waited, 0)) == KERNEL_SCHEDULER_STATUS_OK);
+    assert(waited == 1 && task.wait.phase == KERNEL_WAIT_FINISHED);
+    struct kernel_wait_cursor cursor;
+    kernel_wait_queue_init(&queues[0]);
+    kernel_wait_queue_init(&queues[1]);
+    assert(kernel_wait_prepare(&queues[0], 0, 0, &token) == KERNEL_SCHEDULER_STATUS_OK);
+    kernel_wait_cursor_begin(&queues[0], &cursor);
+    assert(cursor.node == &task.node);
+    kernel_wait_task_pin(&task);
+    kernel_wait_cursor_advance(&cursor);
+    assert(!cursor.node);
+    kernel_wait_cursor_end(&cursor);
+    assert(kernel_wait_node_move(&task.node, &queues[1]) == KERNEL_SCHEDULER_STATUS_OK);
+    assert(task.node.queue == &queues[1]);
+    kernel_wait_task_unpin(&task);
+    assert(kernel_wait_queue_wake_one(&queues[1]) == KERNEL_SCHEDULER_STATUS_OK);
+    assert(kernel_wait_finish(&token) == KERNEL_SCHEDULER_STATUS_OK);
+    kernel_wait_record_init(&task.wait);
+    task.wait.on_cpu = 1;
+    assert(kernel_wait_prepare(&queues[0], 0, 0, &token) == KERNEL_SCHEDULER_STATUS_OK);
+    struct kernel_wait_token retired_task = token;
+    assert(kernel_wait_finish(&token) == KERNEL_SCHEDULER_STATUS_OK);
+    /* Same storage, a new task owner: pointer equality must not revive an old token. */
+    kernel_wait_record_init(&task.wait);
+    task.wait.on_cpu = 1;
+    assert(kernel_wait_prepare(&queues[0], 0, 0, &token) == KERNEL_SCHEDULER_STATUS_OK);
+    assert(kernel_wait_notify(&retired_task, KERNEL_WAIT_SIGNALLED) == KERNEL_SCHEDULER_STATUS_OK);
+    assert(task.wait.phase == KERNEL_WAIT_PREPARED);
+    assert(kernel_wait_finish(&token) == KERNEL_SCHEDULER_STATUS_OK);
     task.wait.generation = UINT64_MAX;
     assert(kernel_wait_prepare(0, 0, 0, &token) == KERNEL_SCHEDULER_STATUS_INVALID_STATE);
     assert(!task.wait.nodes && task.wait.phase == KERNEL_WAIT_FINISHED);
     task.wait.generation = 0;
+}
+static void owner_failures(void)
+{
+    for (unsigned which = 0; which < 5; which++) {
+        pid_t child = fork(); assert(child >= 0);
+        if (!child) {
+            struct kernel_wait_queue queue;
+            struct kernel_wait_node node;
+            kernel_wait_queue_init(&queue);
+            kernel_wait_node_init_callback(&node, callback, 0);
+            kernel_wait_queue_add(&queue, &node);
+            if (!which) kernel_wait_queue_add(&queue, &node);
+            else if (which == 1) { queue.registrations = 0; queue.closed = 1; kernel_wait_queue_destroy(&queue); }
+            else if (which == 2) { node.previous = &node; kernel_wait_queue_wake_all(&queue); }
+            else if (which == 3) {
+                struct kernel_wait_token token;
+                kernel_wait_prepare(0, 0, 0, &token);
+                kernel_wait_prepare(0, 0, 0, &token);
+            } else {
+                struct kernel_wait_token token = {(void *)1, 1};
+                kernel_wait_finish(&token);
+            }
+            _exit(1);
+        }
+        int status; assert(waitpid(child, &status, 0) == child);
+        assert(WIFSIGNALED(status) && WTERMSIG(status) == SIGILL);
+    }
 }
 int main(void)
 {
     struct rlimit limit = {0}; assert(!setrlimit(RLIMIT_CORE, &limit));
     initialize(0);
     kernel_wait_domain_init();
+    owner_failures();
     early_and_multi();
     arbitration(2);
     arbitration(4);

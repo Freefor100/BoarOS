@@ -45,9 +45,10 @@ void ready_enqueue_locked(struct kernel_task *task, int head)
     task->next = 0;
     kernel_sched_enqueue(&scheduler.runqueue, &task->ready_node, task,
                          (unsigned)task->scheduling.priority, head);
-    if (!kernel_cpu_current()->current || kernel_cpu_current()->current == &scheduler.idle ||
-        task->scheduling.priority > kernel_cpu_current()->current->scheduling.priority)
-        kernel_cpu_request_schedule(kernel_cpu_current());
+    struct kernel_cpu *target = task->cpu ? task->cpu : kernel_cpu_current();
+    if (!target->current || target->current->idle ||
+        task->scheduling.priority > target->current->scheduling.priority)
+        kernel_cpu_request_schedule(target);
 }
 struct kernel_task *ready_best(void)
 { KERNEL_RAW_SCOPE(guard, &kernel_wait_domain); return ready_best_locked(); }

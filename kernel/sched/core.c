@@ -65,6 +65,12 @@ _Static_assert(KERNEL_STACK_BYTES >= KERNEL_STACK_GUARD_BYTES +
 _Static_assert(offsetof(struct kernel_task, arch) == 0U,
                "architecture state must prefix the scheduler task");
 
+struct kernel_io_context *kernel_io_context_current(void)
+{
+    struct kernel_task *task = kernel_task_current();
+    return task ? &task->io_context : kernel_cpu_current()->bootstrap_io;
+}
+
 static uintptr_t current_sp(void)
 {
     return arch_current_stack();

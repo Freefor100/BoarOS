@@ -195,18 +195,16 @@ static int core_poll_run(
 {
     struct kernel_open_file_description *stack_pinned[KERNEL_POLL_STACK_CAPACITY];
     struct kernel_wait_node stack_nodes[KERNEL_POLL_STACK_CAPACITY];
-    uint8_t stack_registered[KERNEL_POLL_STACK_CAPACITY];
 
     struct kernel_open_file_description **pinned = stack_pinned;
     struct kernel_wait_node *nodes = stack_nodes;
-    uint8_t *registered = stack_registered;
     void *heap_block = 0;
     int ready_count = 0;
     int error = 0;
 
     if (nfds > KERNEL_POLL_STACK_CAPACITY) {
         size_t alloc_size =
-            nfds * (sizeof(*pinned) + sizeof(*nodes) + sizeof(*registered));
+            nfds * (sizeof(*pinned) + sizeof(*nodes));
         enum kernel_heap_status h_status =
             kernel_heap_allocate(files->heap, alloc_size, &heap_block);
         if (h_status != KERNEL_HEAP_STATUS_OK) {
@@ -216,12 +214,10 @@ static int core_poll_run(
         pinned = (struct kernel_open_file_description **)heap_block;
         nodes = (struct kernel_wait_node *)((uintptr_t)pinned +
                                             nfds * sizeof(*pinned));
-        registered = (uint8_t *)((uintptr_t)nodes + nfds * sizeof(*nodes));
     }
 
     for (uint32_t i = 0; i < nfds; i++) {
         pinned[i] = 0;
-        registered[i] = 0U;
         kernel_wait_node_init(&nodes[i], task);
     }
 
@@ -257,68 +253,43 @@ static int core_poll_run(
     if (ready_count == 0 && !immediate) {
         uintptr_t saved_intr = arch_interrupt_save();
 
-        /* Register wait nodes on OFD wait queues */
-        for (uint32_t i = 0; i < nfds; i++) {
-            if (pinned[i] != 0 && pfds[i].revents == 0) {
-                struct kernel_wait_queue *wq = 0;
-                (void)kernel_open_file_poll(
-                    pinned[i], (uint32_t)(uint16_t)pfds[i].events, &wq);
-                if (wq != 0) {
-                    kernel_wait_queue_add(wq, &nodes[i]);
-                    registered[i] = 1U;
-                }
-            }
-        }
-
-        /* Re-check readiness under disabled interrupts to avoid race */
-        for (uint32_t i = 0; i < nfds; i++) {
-            if (pinned[i] != 0 && pfds[i].revents == 0) {
-                struct kernel_wait_queue *wq = 0;
-                uint32_t active = kernel_open_file_poll(
-                    pinned[i], (uint32_t)(uint16_t)pfds[i].events, &wq);
-                uint32_t rev =
-                    active & ((uint32_t)(uint16_t)pfds[i].events |
-                              KERNEL_POLLERR | KERNEL_POLLHUP | KERNEL_POLLNVAL);
-                if (rev != 0U) {
-                    pfds[i].revents = (int16_t)rev;
-                    ready_count++;
-                }
-            }
-        }
-
         while (ready_count == 0 && error == 0) {
-            enum kernel_wait_wake_reason wake_reason = KERNEL_WAIT_WOKEN;
-            uint64_t sleep_deadline = deadline;
-            if (kernel_scheduler_block_current(0, sleep_deadline, 1,
-                                               &wake_reason) !=
-                KERNEL_SCHEDULER_STATUS_OK) {
+            struct kernel_wait_token token;
+            enum kernel_wait_wake_reason reason = KERNEL_WAIT_WOKEN;
+            if (kernel_wait_prepare(0, deadline, 1, &token) != KERNEL_SCHEDULER_STATUS_OK) {
                 error = -KERNEL_EIO;
                 break;
             }
-            if (wake_reason == KERNEL_WAIT_SIGNALLED) {
-                error = -KERNEL_EINTR;
-                break;
-            }
+            /* 同一token登记多个条件，登记后复查，park前wake保留通知。 */
             for (uint32_t i = 0; i < nfds; i++) {
-                if (pinned[i] == 0) continue;
-                struct kernel_wait_queue *wq = 0;
-                uint32_t active = kernel_open_file_poll(
-                    pinned[i], (uint32_t)(uint16_t)pfds[i].events, &wq);
-                uint32_t rev = active &
-                    ((uint32_t)(uint16_t)pfds[i].events |
-                     KERNEL_POLLERR | KERNEL_POLLHUP | KERNEL_POLLNVAL);
-                if (rev != 0U) ready_count++;
+                if (!pinned[i]) continue;
+                struct kernel_wait_queue *queue = 0;
+                (void)kernel_open_file_poll(pinned[i], (uint32_t)(uint16_t)pfds[i].events, &queue);
+                if (queue && kernel_wait_node_bind(queue, &nodes[i], &token) != KERNEL_SCHEDULER_STATUS_OK) {
+                    error = -KERNEL_EIO;
+                    break;
+                }
             }
-            if (wake_reason == KERNEL_WAIT_TIMEOUT &&
-                sleep_deadline == deadline) break;
-        }
-
-        /* Unregister all wait nodes */
-        for (uint32_t i = 0; i < nfds; i++) {
-            if (registered[i] != 0U) {
-                kernel_wait_queue_remove(&nodes[i]);
-                registered[i] = 0U;
+            for (uint32_t i = 0; i < nfds && !error; i++) {
+                if (!pinned[i]) continue;
+                struct kernel_wait_queue *queue = 0;
+                uint32_t active = kernel_open_file_poll(pinned[i], (uint32_t)(uint16_t)pfds[i].events, &queue);
+                if (active & ((uint32_t)(uint16_t)pfds[i].events | KERNEL_POLLERR | KERNEL_POLLHUP | KERNEL_POLLNVAL))
+                    ready_count++;
             }
+            if (!ready_count && !error && kernel_wait_park(&token, &reason) != KERNEL_SCHEDULER_STATUS_OK)
+                error = -KERNEL_EIO;
+            if (kernel_wait_finish(&token) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
+            if (error || ready_count) break;
+            if (reason == KERNEL_WAIT_SIGNALLED) { error = -KERNEL_EINTR; break; }
+            for (uint32_t i = 0; i < nfds; i++) {
+                if (!pinned[i]) continue;
+                struct kernel_wait_queue *queue = 0;
+                uint32_t active = kernel_open_file_poll(pinned[i], (uint32_t)(uint16_t)pfds[i].events, &queue);
+                if (active & ((uint32_t)(uint16_t)pfds[i].events | KERNEL_POLLERR | KERNEL_POLLHUP | KERNEL_POLLNVAL))
+                    ready_count++;
+            }
+            if (reason == KERNEL_WAIT_TIMEOUT) break;
         }
 
         arch_interrupt_restore(saved_intr);

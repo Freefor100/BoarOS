@@ -253,7 +253,8 @@ static void worker(void *owner)
         set_ier(p, (p->ier & ~2U) | (pending && !ready ? 2 : 0));
         uint64_t deadline = (p->tx_active || p->stopping) ? arch_time_read() + ((uint64_t)p->frequency+99)/100 : 0;
         enum kernel_wait_wake_reason reason;
-        if (kernel_scheduler_block_current(&p->work, deadline, 0, &reason) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
+        if (KERNEL_WAIT_RECHECK(&p->work, deadline, 0, &reason,
+                (p->rx_read == p->rx_write && !((p->console_read != p->console_write || kernel_tty_output_pending(p->tty)) && (UART_READ(p, 5) & 32) && written))) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
         arch_interrupt_restore(irq);
     }
 }

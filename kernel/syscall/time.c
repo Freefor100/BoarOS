@@ -309,8 +309,9 @@ enum kernel_syscall_status syscall_handle_restart_syscall(
         decoded->value = 0;
         return KERNEL_SYSCALL_STATUS_OK;
     }
-    sleep_status = kernel_scheduler_block_current(0, deadline, 1,
-                                                  &wake_reason);
+    sleep_status = KERNEL_WAIT_RECHECK(0, deadline, 1,
+                                                  &wake_reason,
+                (1));
     if (sleep_status != KERNEL_SCHEDULER_STATUS_OK) {
         return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     }
@@ -462,7 +463,8 @@ enum kernel_syscall_status syscall_handle_sleep_for(
         return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     }
 
-    sleep_status = kernel_scheduler_block_current(0, deadline, 1, &wake_reason);
+    sleep_status = KERNEL_WAIT_RECHECK(0, deadline, 1, &wake_reason,
+                (1));
     if (sleep_status != KERNEL_SCHEDULER_STATUS_OK) {
         return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
     }

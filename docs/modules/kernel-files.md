@@ -149,7 +149,7 @@ make test-files-partial-write-riscv
 
 `kernel_files_ppoll()` 与 `kernel_files_pselect6()` 提供 Linux I/O 多路就绪通知：
 - **OFD 就绪检查与等待契约**：每个 open file description 通过 `kernel_open_file_poll()` 报告当前就绪位（`KERNEL_POLLIN/OUT/PRI/ERR/HUP`）并导出所属事件等待队列。管道为空且无写者（`POLLHUP`）、读端有数据（`POLLIN`）、写端有空间（`POLLOUT`）、控制台输出可用或常规文件读取就绪等状态在第一遍扫描时直接确定；若已有就绪事件或指定超时为零，则完全跳过睡眠。
-- **多队列等待节点（Wait Node）泛化**：调度器等待队列泛化为由 `struct kernel_wait_node` 串联的双向链表。当 poll 需要睡眠等待时，在被关心的所有有效 OFD 等待队列上分别挂载独立的等待节点（均关联当前 `task`），任一队列事件触发唤醒即退出阻塞，并在返回前可靠从全部队列脱链。
+- **多队列等待节点（Wait Node）泛化**：调度器等待队列泛化为由 `struct kernel_wait_node` 串联的双向链表。当 poll 需要睡眠等待时，在被关心的所有有效 OFD 等待队列上分别挂载独立的等待节点（均绑定同一个task/代次token），任一队列事件触发唤醒即退出阻塞，并在返回前可靠从全部队列脱链。
 - **OFD 钉住引用（Pinned References）生命周期**：进入阻塞前，poll 引擎通过 `kernel_files_pin()` 对所有被监听的有效 OFD 各获取一份独立引用。这确保了在多线程共享文件表环境中，即使另一线程在睡眠期间 `close()` 并复用相应 fd，正在被 poll 的 OFD 及其内部等待队列依然受保护，不会发生 Use-After-Free；唤醒与清理时统一通过 `kernel_open_file_release()` 释放。
 - **原子信号掩码替换**：`ppoll` 和 `pselect6` 支持以原子方式应用调用者指定的临时 `sigmask`，使阻塞等待能够被特定信号打断并返回 `-EINTR`，返回或打断时自动恢复原有信号掩码。
 - **紧凑栈预算与堆回退**：任务元数据虽已与 8 KiB 执行栈分离，仍需为 Trap 和深调用链保留余量；`poll` 与 `pselect6` 严格控制栈帧大小（快速路径最多 4 个描述符节点、select 最多 64 个 fd 的单字 bitset）；超出快速路径容量时统一从进程私有 `files->heap` 动态分配并在返回前完全回收，避免击穿内核栈金丝雀（Canary）。
@@ -167,7 +167,7 @@ make test-files-partial-write-riscv
   - 边缘触发（ET，`EPOLLET`）：事件一旦交付用户态，立即从就绪列表移出；仅当目标底层产生新的写入/唤醒边缘时才会重新入列；
   - 单次触发（`EPOLLONESHOT`）：事件交付后将 item 标记为 disarmed，直至用户显式通过 `EPOLL_CTL_MOD` 重新激活。
 - **OFD 双向解绑与所有权**：目标 OFD 中维护指向所有监视它的 `epitem` 双向链表（`file->ep_items`）。当目标 OFD 的底层释放时，自动触发 `kernel_epoll_notify_file_release()` 从所属 epoll 实例中解绑。销毁 epoll 实例时，逻辑解绑只执行一次，item 和 epoll 私有堆对象随后按正常 owner 顺序释放；物理页或堆释放若违反分配器不变量直接 fatal。若关联的 VFS/OFD 清理报告真实 I/O 错误，owner 留在文件表供后续回收，fd 槽已经摘除且再次 close 返回 `-EBADF`。
-- **休眠唤醒竞态防护**：`epoll_pwait` 进入休眠前关闭中断，在将当前任务挂入 `epoll->wait_queue` 后再次复核就绪列表；若在挂入瞬间发生唤醒，可立即捕获事件避免漏唤醒死锁。
+- **休眠与撤销**：`epoll_pwait`准备token后复查就绪列表，再park/finish；提前通知由token保留。回调在调度raw外同步执行并拒绝阻塞，队列借用覆盖callback/context寿命。DEL/最后close先停止item通知、同步撤销wait node，最后归还item引用；业务列表和OFD引用仍限定单CPU。
 - **逐事件交付与扫描 owner**：每实例只有一个交付扫描，ready 批次与扫描期间的 pending 通知使用独立链。完整 16 字节 event 成功复制后才消费 ET 或解除 ONESHOT；fault 保留失败项和未处理项，返回完整交付前缀或首项 `EFAULT`。LT 回队去重，MOD 的控制代次使旧交付不能覆盖重装。
 - **睡眠与退出**：扫描引用保活 item，当前目标 OFD 单独 pin；DEL/close 先逻辑解绑，最后扫描引用释放才回收。任务登记整个等待请求，强制退出先归还扫描、pending 项和 OFD，再回收旧栈。一次只使用一个栈上 event，任意合法 maxevents 不再需要按数量分配事件数组。
 - **验证边界**：`make test-epoll-host` 直接编译生产实现，覆盖回调重入、复制期间 MOD/DEL/close/fd复用、第二等待者及取消；`make test-epoll-riscv` 用同一 ELF 对照固定 Linux，覆盖 LT/ET/ONESHOT 的首项、event内部和完整前缀 fault。依据与局限见[事件交付](../learning/epoll-delivery.md)。

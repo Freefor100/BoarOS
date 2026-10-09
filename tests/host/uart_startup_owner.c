@@ -4,12 +4,20 @@
 #pragma GCC diagnostic ignored "-Wreturn-type"
 #define main basic_main
 #define kernel_scheduler_block_current fixture_core_block
+#define kernel_wait_prepare fixture_core_prepare
+#define kernel_wait_park fixture_core_park
+#define kernel_wait_finish fixture_core_finish
 #define kernel_wait_queue_wake_all fixture_core_wake
 #define kernel_heap_allocate_zeroed fixture_core_allocate
+#define HOST_WAIT_CORE_EMBEDDED 1
 #include "../tty/core_host.c"
+#undef HOST_WAIT_CORE_EMBEDDED
 #undef kernel_heap_allocate_zeroed
 #undef kernel_wait_queue_wake_all
 #undef kernel_scheduler_block_current
+#undef kernel_wait_prepare
+#undef kernel_wait_park
+#undef kernel_wait_finish
 #undef main
 #pragma GCC diagnostic pop
 #include <arch/riscv/uart_tty.h>
@@ -122,3 +130,5 @@ int main(int argc,char **argv) {
     printf("UART startup real-core %s pass; port=%zu core=%zu bytes\n",argv[1],port_bytes,core_bytes);
     return 0;
 }
+
+HOST_WAIT_BOUNDARY(, kernel_scheduler_block_current)

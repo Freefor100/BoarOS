@@ -254,8 +254,6 @@ extern struct kernel_scheduler scheduler;
 void kernel_proc_task_update_comm(struct kernel_task *task);
 
 void scheduler_wake_task(struct kernel_task *thread, uint32_t reason);
-void scheduler_wait_requeue(struct kernel_task *task,
-                            struct kernel_wait_queue *queue);
 enum kernel_pid_status process_identity_create(struct kernel_task *task,
     struct kernel_task *parent, int thread_clone);
 void process_identity_release(struct kernel_task *task);

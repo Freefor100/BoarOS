@@ -311,7 +311,8 @@ static int wait_event(struct kernel_tty_request *request, uint32_t flags, int ma
             return -KERNEL_EIO;
     }
     enum kernel_wait_wake_reason reason;
-    if (kernel_scheduler_block_current(&tty->events, deadline, 1, &reason) !=
+    if (KERNEL_WAIT_RECHECK(&tty->events, deadline, 1, &reason,
+                (1)) !=
         KERNEL_SCHEDULER_STATUS_OK)
         return -KERNEL_EIO;
     if (reason == KERNEL_WAIT_SIGNALLED) {
@@ -492,7 +493,8 @@ static void signal_input(struct kernel_tty *tty, unsigned signal)
      */
     while (tty->mode_owner) {
         enum kernel_wait_wake_reason reason;
-        if (kernel_scheduler_block_current(&tty->events, 0, 0, &reason) !=
+        if (KERNEL_WAIT_RECHECK(&tty->events, 0, 0, &reason,
+                (tty->mode_owner != 0)) !=
             KERNEL_SCHEDULER_STATUS_OK)
             __builtin_trap();
     }

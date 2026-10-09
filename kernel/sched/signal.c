@@ -1110,7 +1110,8 @@ enum kernel_signal_status kernel_signal_suspend(struct kernel_task *task,
     task->signal_blocked = mask & ~SIGNAL_MASK_KILL_STOP;
     while (!kernel_signal_has_pending(task) &&
            task->terminate_requested == 0U) {
-        if (kernel_scheduler_block_current(0, 0U, 1, &reason) !=
+        if (KERNEL_WAIT_RECHECK(0, 0U, 1, &reason,
+                (1)) !=
             KERNEL_SCHEDULER_STATUS_OK) {
             task->signal_blocked = task->signal_saved_mask;
             task->signal_restore_mask = 0U;
@@ -1194,7 +1195,8 @@ enum kernel_signal_select_result kernel_signal_select(
             if (task->signal_restore_mask != 0U) {
                 enum kernel_wait_wake_reason reason;
 
-                if (kernel_scheduler_block_current(0, 0U, 1, &reason) !=
+                if (KERNEL_WAIT_RECHECK(0, 0U, 1, &reason,
+                (1)) !=
                     KERNEL_SCHEDULER_STATUS_OK) {
                     signal_terminate(11U, 1);
                 }

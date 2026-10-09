@@ -110,7 +110,8 @@ int kernel_log_action(int action, int length, int privileged,
             if (action != 2 || total) { arch_interrupt_restore(irq); break; }
             enum kernel_wait_wake_reason reason;
             kernel_lock_release(&guard);
-            enum kernel_scheduler_status status = kernel_scheduler_block_current(&published, 0, 1, &reason);
+            enum kernel_scheduler_status status = KERNEL_WAIT_RECHECK(&published, 0, 1, &reason,
+                (read_sequence >= next_sequence));
             arch_interrupt_restore(irq);
             if (status != KERNEL_SCHEDULER_STATUS_OK || reason == KERNEL_WAIT_SIGNALLED)
                 return status == KERNEL_SCHEDULER_STATUS_OK ? -KERNEL_EINTR : -KERNEL_EIO;

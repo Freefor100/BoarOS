@@ -19,6 +19,17 @@ int kernel_wait_notify_locked(const struct kernel_wait_token *, uint32_t);
 void kernel_wait_node_add_locked(struct kernel_wait_queue *, struct kernel_wait_node *);
 void kernel_wait_node_remove_locked(struct kernel_wait_node *);
 void kernel_wait_switch_finish_locked(struct kernel_task *);
+struct kernel_wait_cursor {
+    struct kernel_wait_queue *queue;
+    struct kernel_wait_node *node;
+    uint64_t sequence;
+};
+void kernel_wait_cursor_begin(struct kernel_wait_queue *, struct kernel_wait_cursor *);
+void kernel_wait_cursor_advance(struct kernel_wait_cursor *);
+void kernel_wait_cursor_end(struct kernel_wait_cursor *);
+void kernel_wait_task_pin(struct kernel_task *);
+void kernel_wait_task_unpin(struct kernel_task *);
+enum kernel_scheduler_status kernel_wait_node_move(struct kernel_wait_node *, struct kernel_wait_queue *);
 
 /* 构建期绑定：真实任务、期限索引和切换在 wait.c；宿主仅替换机器边界。 */
 struct kernel_wait_record *kernel_wait_record_of(struct kernel_task *);

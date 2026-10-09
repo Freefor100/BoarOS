@@ -276,7 +276,8 @@ int kernel_pipe_fifo_open(struct kernel_heap *heap, struct kernel_vfs_node *node
                 !pipe->writers && pipe->writer_generation == generation :
                 !pipe->readers && pipe->reader_generation == generation)) {
             enum kernel_wait_wake_reason reason;
-            if (kernel_scheduler_block_current(&pipe->both_queue, 0, 1, &reason) != KERNEL_SCHEDULER_STATUS_OK) {
+            if (KERNEL_WAIT_RECHECK(&pipe->both_queue, 0, 1, &reason,
+                (direction == KERNEL_PIPE_ENDPOINT_READ ? !pipe->writers && pipe->writer_generation == generation : !pipe->readers && pipe->reader_generation == generation)) != KERNEL_SCHEDULER_STATUS_OK) {
                 result = -KERNEL_EIO; break;
             }
             /* 信号唤醒后仍优先认领已经发生的会合，避免重启后错失短暂对端。 */
@@ -389,10 +390,11 @@ enum kernel_pipe_status kernel_pipe_readv(
         }
         /* 用户缺页可睡眠，复制资格保护片段；空管道等待前归还，允许写者进展。 */
         kernel_lock_release(&copy_guard);
-        scheduler_status = kernel_scheduler_block_current(&pipe->read_queue,
+        scheduler_status = KERNEL_WAIT_RECHECK(&pipe->read_queue,
                                                            0U,
                                                            1,
-                                                           &wake_reason);
+                                                           &wake_reason,
+                (!pipe->bytes && pipe->writers));
         if (scheduler_status != KERNEL_SCHEDULER_STATUS_OK) {
             kernel_lock_scope_release(&copy_guard);
             arch_interrupt_restore(saved);
@@ -538,11 +540,12 @@ static enum kernel_pipe_status pipe_write_source(
             }
             /* 不能持复制资格等空间，否则读者不能消费。睡醒后重新检查尾片段。 */
             kernel_lock_release(&copy_guard);
-            scheduler_status = kernel_scheduler_block_current(
+            scheduler_status = KERNEL_WAIT_RECHECK(
                 &pipe->write_queue,
                 0U,
                 1,
-                &wake_reason);
+                &wake_reason,
+                (pipe->slots == KERNEL_PIPE_CAPACITY / BOAROS_PAGE_SIZE && pipe->readers));
             if (scheduler_status != KERNEL_SCHEDULER_STATUS_OK) {
                 kernel_lock_scope_release(&copy_guard);
                 arch_interrupt_restore(saved);

@@ -267,8 +267,9 @@ enum kernel_syscall_status syscall_handle_rt_sigtimedwait(
             else if (has_timeout)
                 decoded->value = -KERNEL_EAGAIN;
             else {
-                if (kernel_scheduler_block_current(0, 0U, 1,
-                                                   &wake_reason) !=
+                if (KERNEL_WAIT_RECHECK(0, 0U, 1,
+                                                   &wake_reason,
+                (1)) !=
                     KERNEL_SCHEDULER_STATUS_OK) {
                     kernel_signal_wait_end(caller);
                     return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;
@@ -284,8 +285,9 @@ enum kernel_syscall_status syscall_handle_rt_sigtimedwait(
             break;
         }
         if (time_status != KERNEL_TIME_STATUS_OK ||
-            kernel_scheduler_block_current(0, deadline, 1,
-                                           &wake_reason) !=
+            KERNEL_WAIT_RECHECK(0, deadline, 1,
+                                           &wake_reason,
+                (1)) !=
                 KERNEL_SCHEDULER_STATUS_OK) {
             kernel_signal_wait_end(caller);
             return KERNEL_SYSCALL_STATUS_INVALID_ARGUMENT;

@@ -1,6 +1,6 @@
 # 内核调度、线程组与生命周期
 
-本文记录单 hart OTHER/FIFO/RR 调度、线程组资源、clone/exec/wait 和回收契约。背景见[线程组与 futex](../learning/threads-and-futex.md)，信号、文件资源、MM 的稳定边界分别见对应模块文档。
+本文记录RV/LA单CPU的OTHER/FIFO/RR 调度、线程组资源、clone/exec/wait 和回收契约。背景见[线程组与 futex](../learning/threads-and-futex.md)，信号、文件资源、MM 的稳定边界分别见对应模块文档。
 
 ## 实现入口
 
@@ -27,9 +27,9 @@
 对象内部30→调度40是raw锁序。raw不跨架构切换，不允许调度、分配、I/O、用户复制或外部回调。
 业务条件、进程组及缓存/网络数据仍按单CPU纪律保护；等待原语互斥不表示整个内核支持SMP。
 
-`kernel_wait_prepare`为当前任务建立唯一代次token，登记后复查条件，释放对象保护再调用
+`kernel_wait_prepare`为当前任务建立不回退的全局代次token，登记后复查条件，释放对象保护再调用
 `kernel_wait_park`；`kernel_wait_finish`同步撤销绑定节点。wake/期限/signal第一个完成者决定
-原因，旧代次与重复通知无效。多队列节点通过`kernel_wait_node_bind`共享token。
+原因，旧代次与重复通知无效，任务页复用也不重用代次。多队列节点通过`kernel_wait_node_bind`共享token。
 代次耗尽返回INVALID_STATE且不发布新登记，重复等待和错误owner属于fatal。
 
 任务的on_cpu与CPU切换前驱共同保护旧栈：阻塞提交后的提前wake只记录ready_pending，
@@ -38,13 +38,25 @@
 
 wake使用借用游标；被摘节点保留有引用的退休后继，引用链迭代归还，每段最多16项。
 callback在调度锁外同步执行，临时禁止抢占，不能阻塞；自身只能非阻塞remove。
-释放context前必须remove_sync等待借用归零。queue_close停止新登记，queue_destroy在
+释放context前必须remove_sync等待借用归零。futex过滤遍历使用同一借用游标；
+requeue先借task、放当前游标，再收完旧node借用并迁移登记，不在raw内归还后备引用。queue_close停止新登记，queue_destroy在
 注册或借用未归零时返回BUSY，调用者继续持有queue及业务owner。
 
 聚焦入口：`make test-wait-host test-wait-riscv test-wait-loongarch`。host直接链接park.c、
 真实raw/runqueue，在2/4线程握手下检查提前wake、单次仲裁、旧代次、多队列与退休游标；
 双侧512MiB/1GiB检查真实首次/退出切换、timeout及任务页回到基线。此处是原语与单CPU证据，
 不替代共享MM、业务对象或多核客体的并发验收。
+
+可睡眠RWlock每实例持有rank30内部raw；资格判断与token登记在同一保护下完成，释放raw再park。
+FIFO先授资格再通知，连续读者按原边界分段，每段最多16个等待者，handoff owner覆盖分段间隙。
+已经授予但尚未运行的读者/写者仍占用锁，后来读者不能越过writer。guard的rank/key和任务owner
+保持原契约；等待仍不可中断，没有新增timed/interruptible API。
+
+调用方无raw业务锁时，`KERNEL_WAIT_RECHECK`在登记后求值一次非阻塞条件，再park/finish。
+poll的多个节点绑定一个token；epoll停止item通知后同步撤销node才释放context。
+TTY/lwext4等通用通道仍由所属调用方在单CPU IRQ域内持条件owner；宏不把业务数据变成跨核安全。
+宿主RW门禁为`make test-sleep-lock-host`，包含1/8/32等待者、writer边界、分段中到达的读者、
+IRQ恢复及非法owner/上下文。真实I/O等待继续用`make test-io-sleep-riscv`验证DMA、超时与回收。
 
 ## 策略、就绪队列与 RT 预算
 

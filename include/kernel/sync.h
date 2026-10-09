@@ -3,19 +3,21 @@
 
 #include <kernel/cost.h>
 #include <kernel/scheduler.h>
+#include <kernel/raw_lock.h>
 #include <stdint.h>
 
 struct kernel_io_context;
 struct kernel_lock_guard;
 struct kernel_lock_waiter;
-/* 任务级可睡眠对象锁；内部IRQ纪律只保护当前单CPU，不是跨核raw锁。
- * rank/key、不可递归及guard owner约束在睡眠期间仍有效。等待者存于调用栈，
- * 先授予资格再wake，返回后才发布guard；对象必须存活至全部guard/等待者退出。
- * 当前等待不可中断；后续timeout/cancel必须先撤注册/资格，不能提前销毁栈节点。
- * SMP实现需用短raw锁保护内部队列，但释放raw锁后才能提交阻塞。
- * Zero storage is not initialized storage. Locks may not move while owned. */
+/* 任务级可睡眠对象锁；独立rank30 raw保护内部资格，登记时嵌套rank40调度锁。
+ * rank/key、不可递归和guard owner随任务保留。释放内部raw后park，先授资格再wake；
+ * 尚未运行的获得者也计入占用。读者批次保留handoff owner及原边界，每段最多16项，
+ * 后来的读者不越过已排writer。对象存活到全部guard/等待者/handoff结束。
+ * 等待不可中断；没有timed/interruptible rwlock。初始化/移动仅允许未发布实例。 */
 struct kernel_rwlock {
+    struct kernel_raw_lock metadata;
     struct kernel_wait_queue waiters;
+    struct kernel_io_context *handoff_owner;
     struct kernel_lock_waiter *pending_head, *pending_tail;
     struct kernel_io_context *writer;
     uint32_t readers;

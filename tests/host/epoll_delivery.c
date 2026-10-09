@@ -61,6 +61,8 @@ void kernel_wait_queue_add(struct kernel_wait_queue *q,struct kernel_wait_node *
 void kernel_wait_queue_remove(struct kernel_wait_node *n)
 { struct kernel_wait_queue *q=n->queue; CHECK(q); if(n->previous)n->previous->next=n->next;else q->head=n->next;
   if(n->next)n->next->previous=n->previous;else q->tail=n->previous;n->queue=NULL;n->next=n->previous=NULL; }
+enum kernel_scheduler_status kernel_wait_node_remove_sync(struct kernel_wait_node *node)
+{ if (node->queue) kernel_wait_queue_remove(node); return KERNEL_SCHEDULER_STATUS_OK; }
 enum kernel_scheduler_status kernel_wait_queue_wake_all(struct kernel_wait_queue *q)
 { for(struct kernel_wait_node *n=q->head;n;n=n->next) if(n->callback)n->callback(n,0);return KERNEL_SCHEDULER_STATUS_OK; }
 uint32_t kernel_open_file_poll(struct kernel_open_file_description *f,uint32_t requested,struct kernel_wait_queue **q)
@@ -80,6 +82,12 @@ enum kernel_signal_status kernel_signal_set_temporary_mask(struct kernel_task *t
 void kernel_signal_restore_temporary_mask(struct kernel_task *t,uint64_t m,int i) { (void)t;(void)m;(void)i; }
 enum kernel_scheduler_status kernel_scheduler_block_current(struct kernel_wait_queue *q,uint64_t d,int i,enum kernel_wait_wake_reason *r)
 { (void)q;(void)d;(void)i;*r=KERNEL_WAIT_TIMEOUT;return KERNEL_SCHEDULER_STATUS_OK; }
+enum kernel_scheduler_status kernel_wait_prepare(struct kernel_wait_queue *q,uint64_t d,int i,struct kernel_wait_token *t)
+{ (void)q;(void)d;(void)i;*t=(struct kernel_wait_token){task,1};return KERNEL_SCHEDULER_STATUS_OK; }
+enum kernel_scheduler_status kernel_wait_park(const struct kernel_wait_token *t,enum kernel_wait_wake_reason *r)
+{ (void)t;*r=KERNEL_WAIT_TIMEOUT;return KERNEL_SCHEDULER_STATUS_OK; }
+enum kernel_scheduler_status kernel_wait_finish(struct kernel_wait_token *t)
+{ *t=(struct kernel_wait_token){0};return KERNEL_SCHEDULER_STATUS_OK; }
 enum kernel_task_status kernel_task_epoll_register(struct kernel_task *t,struct kernel_epoll_wait_request *r)
 { CHECK(t==task && !registered);registered=r;return KERNEL_TASK_STATUS_OK; }
 enum kernel_task_status kernel_task_epoll_clear(struct kernel_task *t,struct kernel_epoll_wait_request *r)

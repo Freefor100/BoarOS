@@ -1,24 +1,21 @@
 #include <arch/context.h>
 #include <kernel/sync.h>
-#include "private.h"
+#include <kernel/wait_internal.h>
 
 struct kernel_lock_waiter {
     struct kernel_lock_waiter *next;
     struct kernel_io_context *owner;
     unsigned write, granted;
+    struct kernel_wait_token token;
 #if BOAROS_COST_DIAGNOSTICS
     uint64_t grant_ticks;
 #endif
 };
-struct kernel_io_context *kernel_io_context_current(void)
-{
-    struct kernel_task *task = kernel_task_current();
-    return task ? &task->io_context : kernel_cpu_current()->bootstrap_io;
-}
 void kernel_rwlock_init(struct kernel_rwlock *lock, uint32_t rank, uintptr_t key)
 {
     *lock = (struct kernel_rwlock){ .rank = rank, .key = key };
     kernel_wait_queue_init(&lock->waiters);
+    kernel_raw_lock_init(&lock->metadata, KERNEL_RAW_RANK_OBJECT);
 }
 static int acquire(struct kernel_rwlock *lock, struct kernel_lock_guard *guard, int write, int try_only)
 {
@@ -41,12 +38,17 @@ static int acquire(struct kernel_rwlock *lock, struct kernel_lock_guard *guard, 
     uint64_t hold_start = wait_start;
     kernel_cost_add(metric,1);
 #endif
-    if (try_only && (lock->writer || lock->pending_head)) {
+    struct kernel_raw_guard metadata = {0};
+    kernel_raw_lock_acquire(&lock->metadata, &metadata);
+    if (try_only && (lock->writer || lock->pending_head || lock->handoff_owner)) {
+        kernel_raw_lock_release(&metadata);
         arch_interrupt_restore(irq);
         return 0;
     }
     struct kernel_lock_waiter waiter = {.owner = owner, .write = write};
-    if (lock->writer || lock->pending_head || (write && lock->readers)) {
+    if (lock->writer || lock->pending_head || lock->handoff_owner || (write && lock->readers)) {
+        if (kernel_wait_prepare(&lock->waiters, 0, 0, &waiter.token) != KERNEL_SCHEDULER_STATUS_OK)
+            __builtin_trap();
         if (lock->pending_tail) lock->pending_tail->next = &waiter;
         else lock->pending_head = &waiter;
         lock->pending_tail = &waiter;
@@ -65,7 +67,9 @@ static int acquire(struct kernel_rwlock *lock, struct kernel_lock_guard *guard, 
         waiter.grant_ticks = hold_start;
 #endif
     }
+    int waited = !waiter.granted;
     while (!waiter.granted) {
+        kernel_raw_lock_release(&metadata);
         enum kernel_wait_wake_reason reason;
 #if BOAROS_COST_DIAGNOSTICS
         struct kernel_cost_task *task = kernel_cost_current();
@@ -75,9 +79,12 @@ static int acquire(struct kernel_rwlock *lock, struct kernel_lock_guard *guard, 
         }
         kernel_cost_add((enum kernel_cost_metric)(metric+2),1);
 #endif
-        if (kernel_scheduler_block_current(&lock->waiters, 0, 0, &reason) !=
-            KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
+        if (kernel_wait_park(&waiter.token, &reason) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
+        kernel_raw_lock_acquire(&lock->metadata, &metadata);
+        if (!waiter.granted) __builtin_trap();
     }
+    kernel_raw_lock_release(&metadata);
+    if (waited && kernel_wait_finish(&waiter.token) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
     *guard = (struct kernel_lock_guard){lock, owner, owner->locks, write
 #if BOAROS_COST_DIAGNOSTICS
         ,0,0
@@ -108,6 +115,8 @@ void kernel_lock_release(struct kernel_lock_guard *guard)
     if (!guard || !guard->lock || guard->owner != owner || owner->locks != guard)
         __builtin_trap();
     struct kernel_rwlock *lock = guard->lock;
+    struct kernel_raw_guard metadata = {0};
+    kernel_raw_lock_acquire(&lock->metadata, &metadata);
     if (guard->write) {
         if (lock->writer != owner || lock->readers) __builtin_trap();
         lock->writer = 0;
@@ -124,29 +133,43 @@ void kernel_lock_release(struct kernel_lock_guard *guard)
 #endif
     owner->locks = guard->previous;
     *guard = (struct kernel_lock_guard){0};
-    if (!lock->writer && !lock->readers) {
-        while (lock->pending_head) {
-            struct kernel_lock_waiter *next = lock->pending_head;
-            lock->pending_head = next->next;
-            if (!lock->pending_head) lock->pending_tail = 0;
-            /* 先交接资格再唤醒；尚未运行的获得者也阻止新任务抢锁。 */
-            if (next->write) {
-                if (!lock->writers_waiting) __builtin_trap();
-                lock->writers_waiting--;
-                lock->writer = next->owner;
-            } else {
-                if (lock->readers == UINT32_MAX) __builtin_trap();
-                lock->readers++;
-            }
-            next->granted = 1;
+    if (!lock->writer && !lock->readers && !lock->handoff_owner && lock->pending_head) {
+        lock->handoff_owner = owner;
+        struct kernel_lock_waiter *boundary = lock->pending_tail;
+        int done = 0;
+        while (!done) {
+            for (unsigned n = 0; n < 16; n++) {
+                struct kernel_lock_waiter *next = lock->pending_head;
+                if (!next) __builtin_trap();
+                lock->pending_head = next->next;
+                if (!lock->pending_head) lock->pending_tail = 0;
+                if (next->write) {
+                    if (!lock->writers_waiting || lock->readers || lock->writer) __builtin_trap();
+                    lock->writers_waiting--;
+                    lock->writer = next->owner;
+                } else {
+                    if (lock->readers == UINT32_MAX) __builtin_trap();
+                    lock->readers++;
+                }
+                next->granted = 1;
 #if BOAROS_COST_DIAGNOSTICS
-            next->grant_ticks = kernel_cost_clock();
+                next->grant_ticks = kernel_cost_clock();
 #endif
-            if (!lock->waiters.head || kernel_wait_queue_wake_one(&lock->waiters) !=
-                KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
-            if (next->write || (lock->pending_head && lock->pending_head->write)) break;
+                /* token定向通知；资格先于wake，非运行获得者也计入占用。 */
+                if (kernel_wait_notify(&next->token, KERNEL_WAIT_WOKEN) != KERNEL_SCHEDULER_STATUS_OK)
+                    __builtin_trap();
+                if (next->write || next == boundary || (lock->pending_head && lock->pending_head->write)) {
+                    done = 1;
+                    break;
+                }
+            }
+            if (done) { lock->handoff_owner = 0; break; }
+            kernel_raw_lock_release(&metadata);
+            kernel_raw_lock_acquire(&lock->metadata, &metadata);
+            if (lock->handoff_owner != owner) __builtin_trap();
         }
     }
+    kernel_raw_lock_release(&metadata);
     arch_interrupt_restore(irq);
 }
 

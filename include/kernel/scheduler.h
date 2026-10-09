@@ -204,6 +204,20 @@ enum kernel_scheduler_status kernel_wait_finish(struct kernel_wait_token *);
 enum kernel_scheduler_status kernel_wait_notify(const struct kernel_wait_token *,
     enum kernel_wait_wake_reason);
 void kernel_scheduler_switch_finish(void);
+/* 无raw业务锁的单CPU调用边界：登记后只复查非阻塞的业务条件。
+ * 需要释放对象raw的调用方使用显式prepare/park/finish，不能把锁放进表达式。 */
+#define KERNEL_WAIT_RECHECK(queue_, deadline_, interruptible_, reason_, must_wait_) \
+    ({ struct kernel_wait_token wait_recheck_token_; \
+       enum kernel_wait_wake_reason *wait_recheck_reason_ = (reason_); \
+       enum kernel_scheduler_status wait_recheck_status_ = wait_recheck_reason_ ? \
+           kernel_wait_prepare((queue_), (deadline_), (interruptible_), &wait_recheck_token_) : \
+           KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT; \
+       if (wait_recheck_status_ == KERNEL_SCHEDULER_STATUS_OK) { \
+           *wait_recheck_reason_ = KERNEL_WAIT_WOKEN; \
+           if (must_wait_) wait_recheck_status_ = kernel_wait_park(&wait_recheck_token_, wait_recheck_reason_); \
+           if (kernel_wait_finish(&wait_recheck_token_) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap(); \
+       } \
+       wait_recheck_status_; })
 
 /* Wakes the longest-blocked waiter.  Requires interrupts disabled. */
 enum kernel_scheduler_status kernel_wait_queue_wake_one(
