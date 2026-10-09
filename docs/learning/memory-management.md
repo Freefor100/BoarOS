@@ -130,6 +130,40 @@ finalize和显式审计包含全量树/链核对及成员owner路径，不属于
 
 </details>
 
+## CPU本地状态与allocator短锁的验证
+
+CPU定位保留内核tp指向任务，通过任务的CPU关联取得本地状态；启动与重定位明确重绑，
+用户TLS不参与内核CPU定位。raw锁的互斥字和CPU guard链承担不同职责：acquire/release
+原子字发布共享元数据，guard链检查owner、LIFO与rank/key。heap→page只允许不会回收、
+等待的嵌套查询/释放；新页准备、清零、resize复制和压力回调在元数据锁外。
+具体接口与单CPU限制见[调度](../modules/kernel-scheduler.md)、[物理页](../modules/physical-pages.md)及[heap](../modules/kernel-heap.md)。
+
+`98109a4`的生产内核通过4/16KiB、2/4宿主线程的独立owner/内容模型、全部slab class、
+连续页、引用、resize、耗尽和结束审计。旧IRQ-only代码的真实两线程反例触发
+free-list-insert fatal；新实现保留非法释放、压力重入和函数边界抢占门禁。
+raw host另覆盖80000次争用更新与11类fatal；两架构原生测试在512MiB/1GiB核对CPU ID、
+IRQ、真实原子指令及raw内block/yield/退出/睡眠锁拒绝。RV使用amoswap.w.aq和release
+fence，LA使用amswap_db.w与dbar；宿主模型不代替客户机指令验收，也不证明真实多核内存序。
+
+独立审查发现延期tick丢失OTHER轮转原因、COST原生runner借用普通构建目录两项问题。
+两者都有失败对照，修复后同级peer进展和实际QEMU argv门禁通过；显式抢占嵌套不能
+抵消raw自己的深度。时间对照另列于[成本结果](cost-baseline.md#allocator-短锁的匹配时间)，
+默认新增6.0%–7.3%开销和批量IRQ尾延迟保留，不据互斥成功声称性能提高。
+
+最终本地验收覆盖完整host、COST24项解析、RV完整/scale/I/O/NBD与SQLite DELETE/WAL，
+LA核心/运行时/平台/设备错误，以及两侧双RAM userland、glibc五形态、1366 ABI、
+guard/栈、网络与终端。共同原程序229项在RV/LA×512MiB/1GiB各完成同ELF Linux对照，
+正常退出核对页/堆/任务栈/设备baseline；RV原程序的最小栈余量4344字节。
+RV首次512MiB清单因Linux原BusyBox的du遇到消失的/proc/22失败，BoarOS同项通过；
+定点复验保留参考失败，独立重跑完整512MiB清单229项通过，未把原失败改记通过。
+LA首次入口因旧目录内核快照冲突而未执行清单，另用新目录完成；准备错误不算程序失败。
+
+最终RV核SHA-256为`857349024ca1140a0b501702775d0e7ca337dcc0045640e07d54f5361469cf3b`，
+LA为`ce751f417edab75d4846d14ddb2bef53cabea01ec0a4f4a7dfbbeeb08cafac0e`，执行器和固定Linux
+沿用上一节身份。入口见[CI模块](../modules/continuous-integration.md)；新的glibc/RAM
+配置反例同时保护宿主门禁。托管CI未重跑，等待、回收/cache、共享MM和调度队列仍
+依赖单CPU协议；这些验证仅交付CPU定位与allocator元数据互斥基础。
+
 ### 单核纪律与跨核同步的区别
 
 固定 `references/linux` commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的

@@ -45,6 +45,7 @@ make test-userland-riscv
 make test-glibc-riscv test-glibc-loongarch
 make test-diff-abi-riscv test-diff-abi-loongarch
 make test-allocator-cost-host
+make test-sync-host test-allocator-concurrency-host
 make test-stack-usage test-stack-usage-la
 ```
 
@@ -62,8 +63,9 @@ make test-stack-usage test-stack-usage-la
 CPU 本地/current、嵌套抢占控制与 raw 短锁已接入 buddy/slab 元数据；等待交接、压力回收和其他共享对象仍需跨核保护。
 
 buddy 已消除小页操作随无关大块页数线性检查/重写的问题，并接入只读查询快路径与完整审计。
-4/16 KiB 工作量及组合门禁通过；默认匿名生命周期仍较旧核慢 **13.6%–22.4%**，未取得典型吞吐提升。
-机制见[物理页模块](docs/modules/physical-pages.md)，时间、IRQ 和观测开销见[成本结果](docs/learning/cost-baseline.md#buddy-森林匹配时间2026-10-09)。
+4/16 KiB 工作量及组合门禁通过；森林改造的默认匿名生命周期回退 **13.6%–22.4%**，
+后续 raw 互斥相对其独立基线另增加 **6.0%–7.3%**，未取得典型吞吐提升。
+机制见[物理页模块](docs/modules/physical-pages.md)，时间、IRQ 和观测开销分别见[森林结果](docs/learning/cost-baseline.md#buddy-森林匹配时间2026-10-09)与[短锁结果](docs/learning/cost-baseline.md#allocator-短锁的匹配时间)。
 
 文档分工：README 概括能力和常用入口；`docs/modules/` 维护当前契约与聚焦验证；
 `docs/learning/` 解释机制、取舍和验收证据；`docs/goals.md` 维护未完成工作。

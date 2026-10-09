@@ -11,19 +11,20 @@
 
 | 主线 | 尚缺能力 | 完成口径 |
 |---|---|---|
-| 同步基础 | CPU 本地/current、raw 短锁、可睡眠对象锁、等待登记/阻塞/唤醒/取消/销毁交接 | 不丢 wake、不重复授予；raw 锁下不能阻塞；等待和引用 owner 在并发退出时仍存活 |
+| 同步基础 | 可睡眠锁内部保护、等待登记/阻塞/唤醒/取消/销毁交接，调度共享状态与对象引用同步 | 不丢 wake、不重复授予；等待和引用 owner 在并发退出时仍存活 |
 | RV 两核 | 独立 secondary 入口/栈，BSS 一次初始化，per-CPU trap/timer/FPU、IPI、远程 wake | 同一任务不双核运行；idle 可被唤醒；正常用户态切换与可信栈回收 |
 | 共享 MM 与子系统 | uaccess pin/权限、COW 发布、活动 CPU、远程 TLB 确认，OFD/cache/DMA 与退出同步 | 复制与撤映射、降权、截断、I/O/close/退出的强制交错正确；确认停止使用后才回收 |
 | 组合与 LA 多核 | RV 2/4 核低内存、故障、真实程序；LA CPU 启动/IPI/TLB/状态保存 | 架构结果独立验收，保留单核对照；正确性成立后再衡量并行收益 |
 
 ### P6b 锁、等待与中断规则
 
-当前 IRQ 控制只保护本 CPU，已有可睡眠锁会在 IRQ 关闭时显式调度，不能机械替换成 raw 锁。
+CPU 本地/current、抢占控制与 buddy/slab raw 锁已存在；压力回调仍限定单 CPU。
+已有可睡眠锁会在 IRQ 关闭时显式调度，不能机械替换成 raw 锁。
 接口契约和调用边界见[调度模块](modules/kernel-scheduler.md#smp前置的同步与等待契约2026-10-09)。
 
-- [ ] 建立 CPU 本地/current 与短锁上下文断言，保护 allocator、引用和调度共享状态。
 - [ ] 闭合条件检查、登记、释放保护与 park 的交接；wake、timeout、cancel、destroy 争用同一注册 owner。
 - [ ] 将可睡眠锁内部元数据接入跨核保护，保持 rank/key、先授予资格再唤醒，禁止持 raw 锁等待 I/O。
+- [ ] 保护调度共享状态与其他对象引用；同一任务的发布、运行和退出必须有唯一 owner。
 
 这些是一个同步基础任务的核心不变量；具体实现方案、代码步骤和单次验收安排在执行会话中确定。
 
@@ -68,7 +69,7 @@ PTE 撤销/降权后须覆盖活动 CPU 及并发切换者，确认旧翻译不�
 
 | 项目 | 已有事实与剩余问题 | 证据 |
 |---|---|---|
-| buddy 常用路径与批量 MM | 线性最坏元数据路径已移除；默认匿名生命周期仍慢13.6%–22.4%，批量 MM 的 IRQ 尾延迟未改善 | [匹配时间](learning/cost-baseline.md#buddy-森林匹配时间2026-10-09) |
+| allocator 与批量 MM 成本 | 森林的典型回退13.6%–22.4%与后续 raw 互斥新增6.0%–7.3%分别测量；批量 MM 的 IRQ 尾延迟未改善 | [森林](learning/cost-baseline.md#buddy-森林匹配时间2026-10-09)、[raw 对照](learning/cost-baseline.md#allocator-短锁的匹配时间) |
 | 文件驻留记录范围选择 | 点查询已有哈希，mprotect/部分撤映射仍可能扫描整个驻留链；只改善范围选择/删除，不同时树化全部 MM | [规模边界](learning/single-hart-scale.md)、[MM](modules/kernel-mm.md) |
 | GDT timestamp-touch 候选 | 隔离候选消除了干净 GDT 的 undo/restore 复制，但完整读取仍有负向观察，未进入 main | [时间戳研究](learning/file-timestamps.md) |
 | 串行协议、存储与原生构建成本 | 网络批次仍有大 IRQ 区间；默认预算吞吐、同步/排空及 Lua 工程还有已测成本，按目标阶段归因 | [网络](learning/network-ownership.md)、[预算](learning/data-path-budget-experiments.md)、[工具链](learning/offline-toolchain-probe.md) |
