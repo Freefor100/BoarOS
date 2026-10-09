@@ -46,6 +46,9 @@ Linux 7.2 UAPI 已移除 CBQ 定义，而固定 BusyBox 的 `tc` 仍引用这些
 
 需要 `make`、宿主 GCC、RISC-V Linux GCC/binutils、`rsync`、`tar`、`curl` 与
 已构建的 musl 工具链。首次准备旧 UAPI 需下载固定 archive。
+`make prepare-program-environment`会沿其Make依赖构建musl；此前缺失工具时提示的
+`make musl-toolchain`不是有效目标，已改为上述真实入口。完整CI先用原程序runner
+`--build-only`准备两侧产物，再通过`--reuse-builds`核对和运行，失败不退回smoke输入。
 
 ```sh
 make test-program-environment-host

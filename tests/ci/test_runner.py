@@ -99,6 +99,7 @@ class Execution(unittest.TestCase):
                 cases = json.loads(result.stdout)
                 inventory = next(row for row in cases if row['name'] == 'original-programs')
                 self.assertIn('--require-pass', inventory['argv'])
+                self.assertIn('--reuse-builds', inventory['argv'])
                 self.assertEqual([inventory['argv'][i+1] for i, arg in enumerate(inventory['argv'])
                                   if arg == '--memory'], ['512M', '1G'])
 

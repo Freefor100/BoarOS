@@ -12,7 +12,7 @@ spec.loader.exec_module(tools)
 
 class Identity(unittest.TestCase):
     def test_producer_input_changes_invalidate_outer_cache(self):
-        changed_inputs = ('tests/program-inventory/inputs.json',
+        changed_inputs = ('.github/actions/native-environment/action.yml', 'tests/program-inventory/inputs.json',
                           'tests/diff-abi/harness.py', 'tests/diff-abi/linux.config')
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

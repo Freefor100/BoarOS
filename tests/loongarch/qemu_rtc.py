@@ -8,7 +8,7 @@ from pathlib import Path
 import shutil
 import stat
 import subprocess
-from prepare import ROOT, QEMU_OPTIONS, compiler_identity, fixed_repository
+from prepare import ROOT, QEMU_OPTIONS, compiler_identity, fixed_repository, require_user_network
 
 DIRECTORY=ROOT/'build/qemu-la-rtc'
 PATCH=ROOT/'tests/loongarch/qemu-ls7a-rtc.patch'
@@ -91,6 +91,7 @@ def prepare(jobs,rebuild=False):
     subprocess.run(['ninja','-C',str(output),f'-j{jobs}','qemu-system-loongarch64'],check=True)
     binary=DIRECTORY/'qemu-system-loongarch64'
     if not binary.exists():binary.symlink_to('build/qemu-system-loongarch64')
+    require_user_network(binary)
     identity['binary']=product(DIRECTORY/'qemu-system-loongarch64')
     identity['configuration_files']=configuration_files(output)
     stamp.write_text(json.dumps(identity,sort_keys=True,indent=2)+'\n')

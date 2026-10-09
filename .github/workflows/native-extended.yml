@@ -24,6 +24,16 @@ jobs:
         with:
           arch: ${{ matrix.arch }}
           mode: prepare
+      - name: Prepare complete consumer inputs and TAP capability
+        env:
+          TARGET_ARCH: ${{ matrix.arch }}
+        run: |
+          if [ "$TARGET_ARCH" = riscv ]; then
+            make INIT_CONFIG=config/init.json prepare-program-environment
+            python3 -B tests/network_inputs.py
+          fi
+          python3 -B tests/program-inventory/run.py --arch "$TARGET_ARCH" --build-only
+          python3 -B tests/ci/netns.py --configure-apparmor --github-env
       - name: Build the general fixture kernel
         env:
           TARGET_ARCH: ${{ matrix.arch }}
@@ -34,6 +44,9 @@ jobs:
         env:
           TARGET_ARCH: ${{ matrix.arch }}
         run: python3 -B tests/ci/run.py --arch "$TARGET_ARCH" --suite extended
+      - name: Release the temporary TAP namespace profile
+        if: always()
+        run: python3 -B tests/ci/netns.py --cleanup
       - name: Preserve full consumer and failure observations
         if: always()
         uses: actions/upload-artifact@v7
@@ -41,6 +54,7 @@ jobs:
           name: native-extended-${{ matrix.arch }}
           path: |
             build/ci-run/*-extended
+            build/tools/ci-netns/identity.json
             build/program-inventory-full/**/*.json
             build/program-inventory-full/**/*.log
             build/loongarch/program-inventory/**/*.json

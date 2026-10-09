@@ -73,10 +73,12 @@ RV 原回归仍用 Ubuntu 的交叉工具；平台测试先从固定源码构建
 的 ripgrep 依赖显式安装；准备日志及 BusyBox 身份与测试输出一起上传。
 
 LA 的 QEMU wrap 依赖按固定源码 `.wrap` revision 恢复，派生模拟器仍核对源码、
-补丁、配置和产物。Linux 在任何 make 之前拒绝缺失或损坏的已登记 ELF；不能
+补丁、配置和产物。宿主显式安装`libslirp-dev`；普通及RTC派生QEMU在发布/复用前
+用`-machine virt -netdev help`核对真实user后端，缺失则环境准备失败。
+Linux 在任何 make 之前拒绝缺失或损坏的已登记 ELF；不能
 通过重复构建给损坏文件重新登记身份。输入或产物变化使缓存验证失败。
 
-environment cache key 包含工作区位置、固定来源清单、准备脚本与 profile、宿主
+environment cache key 包含工作区位置、固定来源清单、依赖安装action、准备脚本与 profile、宿主
 工具哈希和 Python 身份。只使用精确 key；consumer 必须命中本次 producer 的
 完整缓存。工具缓存先独立保存，避免后续内核准备失败导致再次下载同一工具包。
 `build/tools`、QEMU/Linux 和用户环境是可复用缓存，`build/ci-run` 是临时输出。
@@ -87,6 +89,33 @@ environment cache key 包含工作区位置、固定来源清单、准备脚本�
 它在两种 RAM 使用完整原程序清单的 `--require-pass`，并执行真实终端应用、
 Ethernet/TAP、RT 双盘负载或 LA 设备构造/停止/reset/RTC 组合。清单生成成功
 不能代替原程序成功。结果、完整日志和失败状态分别上传。
+
+运行前独立完成输入准备：RV用`make prepare-program-environment`建立musl及UAPI，
+`tests/network_inputs.py`核对并恢复原发布盘的网络运行时；两侧先执行原程序runner的
+`--build-only`，实际清单再以`--reuse-builds`验证并复用这些产物。这样TTY不依赖前一组
+偶然留下的BusyBox，准备失败也不会冒充客户机程序失败。
+
+TAP预检实际创建私有user/net namespace、执行TUN ioctl及IP配置，不以`unshare true`
+代替设备权限验证。`tests/ci/netns.py`默认只检查；仅明确的GitHub CI配置且宿主启用
+AppArmor userns限制时，对专用`unshare`副本加载带userns许可的profile，再重复实际预检。
+网络runner通过`BOAROS_UNSHARE`使用该副本；测试、QEMU和产物保持普通job UID，
+不全局关闭限制或把整套测试提到root。probe超时停止整个进程组，workflow的always步骤
+卸载临时profile；仍失败就保留环境错误。依据为[Ubuntu官方说明](https://discourse.ubuntu.com/t/understanding-apparmor-user-namespace-restriction/58007)，访问2026-10-10。
+
+严格清单同时检查原断言和两侧结果。固定Linux的原BusyBox `du`可能因遍历中的`/proc/PID`
+消失返回失败，脚本整体退出0也不能改记成功；此类结果保持`reference-not-pass`并令门禁失败。
+被排除、未到达或仅本地通过的项目不能补成托管CI通过。
+
+```sh
+make prepare-program-environment
+python3 -B tests/network_inputs.py
+python3 -B tests/program-inventory/run.py --arch riscv --build-only
+python3 -B tests/ci/netns.py
+python3 -B tests/ci/run.py --arch riscv --suite extended
+```
+
+LA准备沿native-environment的固定入口；原程序`--build-only`使用`--arch loongarch`。
+本地命名空间检查不修改host policy，GitHub专用配置由workflow明确调用。
 
 `recovery.yml` 保留现有每周和手动 RV NBD DELETE/WAL 全恢复矩阵。LA 正常
 SQLite/重启和块错误门禁不冒充该全断电矩阵，新增 LA 恢复接口需独立验收。

@@ -96,7 +96,7 @@ def prepare(output=DEFAULT, uapi="runtime"):
         raise ValueError('unknown UAPI profile: ' + uapi)
     compiler = ROOT / 'build/riscv/musl-root/bin/musl-gcc'
     if not compiler.is_file():
-        raise RuntimeError('run make musl-toolchain before preparing the environment')
+        raise RuntimeError('run make prepare-program-environment to build musl before preparing the environment')
     tools = {}
     for tool in ('make', 'gcc', 'riscv64-linux-gnu-gcc', 'riscv64-linux-gnu-ld',
                  'riscv64-linux-gnu-ar', 'rsync'):

@@ -21,7 +21,7 @@ PACKAGES = {
         'riscv64-linux-gnu-glibc-2.44-1-any.pkg.tar.zst',
         'riscv64-linux-gnu-linux-api-headers-7.2-1-any.pkg.tar.zst')],
 }
-CACHE_INPUTS = ['references/sources.tsv', 'tests/ci/tools.py', 'tests/userland/glibc/profiles.py',
+CACHE_INPUTS = ['references/sources.tsv', 'tests/ci/tools.py', '.github/actions/native-environment/action.yml', 'tests/userland/glibc/profiles.py',
     'tests/userland/glibc/inputs.json', 'tests/userland/glibc/inputs-loongarch.json',
     'tests/loongarch/prepare.py', 'tests/loongarch/prepare_userland.py',
     'tests/loongarch/prepare_dynamic.py', 'tests/loongarch/qemu_rtc.py',

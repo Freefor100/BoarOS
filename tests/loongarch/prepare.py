@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -40,6 +41,13 @@ def compiler_identity(compiler):
             'target': capture([str(path), '-dumpmachine'])}
 
 
+def require_user_network(binary):
+    result = subprocess.run([str(binary), '-machine', 'virt', '-netdev', 'help'], cwd=ROOT,
+                            capture_output=True, text=True, timeout=10)
+    if result.returncode or not re.search(r'^\s*user\s*$', result.stdout + result.stderr, re.M):
+        raise SystemExit(f'{binary}: missing user network backend; install libslirp-dev and configure a fresh QEMU cache')
+
+
 def prepare(args):
     source, revision = fixed_repository('qemu' if args.component == 'tools' else 'linux')
     profile=getattr(args,'profile','core')
@@ -65,6 +73,7 @@ def prepare(args):
             subprocess.run([str(source / 'configure'), *QEMU_OPTIONS], cwd=directory, check=True)
         subprocess.run(['ninja', '-C', str(directory), f'-j{args.jobs}',
                         'qemu-system-loongarch64'], check=True)
+        require_user_network(image)
         print(capture([str(directory / 'qemu-system-loongarch64'), '--version']))
     else:
         if not compiler['target'].startswith('loongarch64'):
