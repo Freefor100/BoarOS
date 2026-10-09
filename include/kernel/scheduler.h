@@ -204,7 +204,7 @@ enum kernel_scheduler_status kernel_wait_finish(struct kernel_wait_token *);
 enum kernel_scheduler_status kernel_wait_notify(const struct kernel_wait_token *,
     enum kernel_wait_wake_reason);
 void kernel_scheduler_switch_finish(void);
-/* 无raw业务锁的单CPU调用边界：登记后只复查非阻塞的业务条件。
+/* 已持单CPU IRQ保护的业务调用边界：登记后只复查非阻塞的业务条件。
  * 需要释放对象raw的调用方使用显式prepare/park/finish，不能把锁放进表达式。 */
 #define KERNEL_WAIT_RECHECK(queue_, deadline_, interruptible_, reason_, must_wait_) \
     ({ struct kernel_wait_token wait_recheck_token_; \

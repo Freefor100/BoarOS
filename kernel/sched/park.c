@@ -1,4 +1,5 @@
 #include <kernel/wait_internal.h>
+#include <kernel/irq.h>
 #include <string.h>
 
 struct kernel_raw_lock kernel_wait_domain;
@@ -196,6 +197,7 @@ enum kernel_scheduler_status kernel_wait_park(const struct kernel_wait_token *to
     enum kernel_wait_wake_reason *reason)
 {
     kernel_assert_can_block();
+    KERNEL_IRQ_SCOPE(park_irq);
     if (!token || !reason || !token->task) return KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
     if (token->task != kernel_wait_current_task()) __builtin_trap();
     {
@@ -381,6 +383,7 @@ enum kernel_scheduler_status kernel_wait_queue_close(struct kernel_wait_queue *q
 {
     if (!queue || queue->initialized != KERNEL_WAIT_QUEUE_INITIALIZED)
         return KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
+    KERNEL_IRQ_SCOPE(close_irq);
     { KERNEL_RAW_SCOPE(guard, &kernel_wait_domain); queue->closed = 1; }
     return wake(queue, 1);
 }

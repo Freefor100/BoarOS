@@ -264,7 +264,11 @@ void kernel_wait_backend_ready(struct kernel_task *task) { ready_enqueue_locked(
 enum kernel_scheduler_status kernel_wait_backend_switch(struct kernel_task *task)
 { return scheduler_switch_current_away(task); }
 void kernel_wait_backend_quiesce(void)
-{ if (kernel_scheduler_yield_current() != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap(); }
+{
+    uintptr_t irq = arch_interrupt_save();
+    if (kernel_scheduler_yield_current() != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
+    arch_interrupt_restore(irq);
+}
 void scheduler_wake_task(struct kernel_task *task, uint32_t reason)
 {
     struct kernel_wait_token token = { task, task->wait.generation };

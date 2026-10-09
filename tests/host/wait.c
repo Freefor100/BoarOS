@@ -51,7 +51,7 @@ void kernel_wait_backend_ready(struct kernel_task *t)
 { assert(!t->ready_node.queued && !t->wait.on_cpu); kernel_sched_enqueue(&runnable, &t->ready_node, t, 0, 0); }
 enum kernel_scheduler_status kernel_wait_backend_switch(struct kernel_task *t)
 {
-    assert(switching && !cpu.raw_locks && !cpu.preempt_depth);
+    assert(switching && !sync_test_irq && !cpu.raw_locks && !cpu.preempt_depth);
     if (wake_after_switch) {
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
         kernel_wait_switch_finish_locked(t);
@@ -246,7 +246,10 @@ int main(void)
     kernel_wait_domain_init();
     owner_failures();
     early_and_multi();
+    sync_test_irq = 1;
     arbitration(2);
+    assert(sync_test_irq == 1);
+    sync_test_irq = 0;
     arbitration(4);
     wake_after_switch = 1;
     arbitration(2);

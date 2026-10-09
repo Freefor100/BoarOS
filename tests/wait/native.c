@@ -43,7 +43,11 @@ static void worker(void *argument)
     if (!(uintptr_t)argument) early_switch = 1;
     check(kernel_wait_prepare((uintptr_t)argument ? 0 : &queue,
         (uintptr_t)argument ? deadline : 0, 0, &token) == KERNEL_SCHEDULER_STATUS_OK);
+    arch_interrupt_restore(irq);
+    check(arch_interrupt_is_enabled());
     check(kernel_wait_park(&token, &reason) == KERNEL_SCHEDULER_STATUS_OK);
+    check(arch_interrupt_is_enabled());
+    (void)arch_interrupt_save();
     check(reason == ((uintptr_t)argument ? KERNEL_WAIT_TIMEOUT : KERNEL_WAIT_WOKEN));
     check(kernel_wait_finish(&token) == KERNEL_SCHEDULER_STATUS_OK);
     check(!kernel_cpu_current()->switch_previous && !kernel_wait_record_of(kernel_cpu_current()->current)->borrows);
