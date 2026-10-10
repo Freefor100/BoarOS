@@ -277,13 +277,16 @@ PID发布状态增加独立字段曾把64字节对象推到72字节、跨入128�
 
 关机计数必须覆盖摘索引到实际页归还的完整区间。退休队列为空仅说明owner已经转给collector，不能在页服务返回前减少pending；页释放后也不能再读task内容。最后释放的通知可能早于cleanup登记，因此域内保留进展标记，登记前后均复查；标记只要求重查真实owner，不代替用户结束或retry deadline。2/4线程用页服务握手和四个登记窗口复现旧缺口，结束时检查页、注册和借用归零。可信调用栈继续承担实际清理，raw域只提交状态。
 
-2026-10-10组合核对：RV/LA在512MiB/1GiB完成真实lifecycle、core/ABI1366、glibc五形态、
-SQLite DELETE/WAL与platform；229项原程序在四个架构/RAM组合内均与同ELF固定Linux
-对照通过。RV首次完整入口的块统计case47另保留原失败，完整重跑通过不替它归因。
-此前LA512MiB清单的一次固定Linux BusyBox du遇到退出中的/proc/85而为reference-not-pass，
-及固定Linux终端等待超时，均不被本次通过覆盖。LA设备失败、RV NBD/恢复与双侧原TTY/PTY
-组合通过；宿主交错、客户机单CPU和[未通过的成本门槛](cost-baseline.md#共享调度域的匹配时间)分别下结论。
-原程序核RV SHA`0f258cc6381b967962f38c1044421c1571c35ccecde39d231bae5fd1c4975d15`、
-LA SHA`c4895d3543f405b8d0b73b7e4cb112ba6016859745bed9d126e62530aa5efe84`；
-它们与独立干净构建的成本核身份分列。输入、完整记录定义及重建入口见[原程序清单](user-program-inventory.md)，
-组合命令见[CI分层入口](../modules/continuous-integration.md)，本次没有运行托管CI。
+2026-10-10当前保留实现的本地组合核对：host9组、RV/LA core各8组、runtime各3组、platform各3组
+全部通过，含1366条ABI、glibc五形态、SQLite DELETE/WAL、栈/guard及真实等待/退出。
+229项原程序在两侧512MiB/1GiB逐ID与同ELF固定Linux对照，四份清单均229 pass。
+LA另通过PCI/reset、RNG/net/UART失败与回收，双侧原BusyBox TTY/PTY及记录重启场景通过。
+这些是本地执行，不等于托管CI、多核或[成本门槛](cost-baseline.md#共享调度域的匹配时间)通过。
+原程序核RV SHA`4bac3664d401099e9ead6f1944cc3bc119cf6154c2b09038d26023030fa65906`、
+LA SHA`490f2985de968cec0088c0999fbaebbeff5989b408897161038c707e11bf09d1`，
+与独立对象目录的成本核身份分列。输入/判定/重建见[原程序清单](user-program-inventory.md)和[CI入口](../modules/continuous-integration.md)。
+
+RV最新块case47的丰富统计为completed=2、IRQ=2、sleep=0、runtime-poll=0，符合等待复查前
+真实完成；smoke不再强制已完成请求睡眠，暂扣响应的NBD门禁仍验证实际BLOCKED及回收。
+更早缺少这些统计的case47仍未归因。此前固定Linux LA BusyBox du因退出中的/proc/PID失败、
+以及终端等待超时，均不被当前通过覆盖。

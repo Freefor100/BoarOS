@@ -4,13 +4,16 @@
 
 `build/` 是未纳入 Git 的可重建产物目录，不是永久证据库。本页所列旧 `build/` 路径是当时的运行位置，2026-09-25 已清理，不能直接打开；可复用的结论、固定输入、身份和复现命令记录在 Git 中。运行器在执行期间会保存 JSON、日志和镜像，核对后用 `python3 tests/prune-build.py` 预览、`make prune-build` 清理整个一次性运行目录，只留下可跨轮复用的编译缓存。
 
-## 双架构最近完整结果（2026-10-07）
+## 双架构最近完整结果（2026-10-10）
 
 当前固定输入清单为 **229个相同ID**：BusyBox10项（原9项加已有环境内容案例），
-libc-test107静态、110动态及两项原包装器。RV完整229项全部通过；LA在512MiB、
-1GiB各完整229项全部通过，包括原BusyBox包装器55子项及静态/动态libc包装器。
+libc-test107静态、110动态及两项原包装器。RV/LA在512MiB、1GiB下各完整229项通过，
+包括原BusyBox包装器55子项及静态/动态libc包装器。
 每ID均有同一ELF的Linux/BoarOS真实wait/输出判定与正常root资源退出，未修改原程序。
 过去228/227的记录仍属历史，不由本次通过推断当时失败的具体修复归因。
+本次原程序核RV SHA`4bac3664d401099e9ead6f1944cc3bc119cf6154c2b09038d26023030fa65906`、
+LA SHA`490f2985de968cec0088c0999fbaebbeff5989b408897161038c707e11bf09d1`；
+独立成本核、glibc消费者及托管CI结果不能混作这份清单身份。
 
 LA Linux/QEMU及16KiB/LP64D输入见[平台模块](../modules/loongarch-boot.md)，musl
 仍固定1.2.5；glibc五形态是另一组矩阵，LA原2.42与RV原2.44的版本差异保留。
@@ -51,13 +54,12 @@ python3 tests/program-inventory/run.py --reuse-builds --require-pass --output bu
 
 ## 当前基线与口径
 
-最近的完整228项历史清单来自进程/随机/调度阶段，227 pass和原BusyBox53/55的身份
-仍在下方历史记录。本轮没有重跑228项；只运行原BusyBox包装器和环境内容工作流。
-原脚本两侧55/55子项成功、wait=0，dmesg保存真实启动消息，hwclock输出真实UTC。
-新增内容脚本检查-r/-c/-n的作用、清空后无消息，以及df根盘总量/使用量/可用量与
-同一客体statfs一致，Linux/BoarOS均退出0。BoarOS根来源为`/dev/block/252:0`，
-节点由公共镜像生成器建立。环境探针另验证console不会回灌日志、RTC与realtime
-一致、OFD独占/dup/fork/CLOEXEC和坏指针；新增27条使固定LinuxABI扩为1118。
+当前完整结果见本页开头；旧228/227及原BusyBox53/55保留为历史身份。
+原包装器的55条内部断言、wait status和真实环境行为都必须成立。内容脚本检查
+-r/-c/-n、清空后无消息，以及df容量与同一客体statfs一致；dmesg读取真实启动消息，
+hwclock输出真实UTC。BoarOS根来源`/dev/block/252:0`由公共镜像生成器建立。
+环境探针另保护console不回灌、RTC/realtime、OFD独占/dup/fork/CLOEXEC和坏指针；
+最初27条加入后的1118是历史ABI规模，当前1366条由独立ABI门禁验证。
 
 原包装器含日期、日志、PID与容量等动态内容，整份stdout跨系统不要求字节相同。
 清单显式选择contract比较：所有55条原断言、顺序、命令与wait status仍必须成立，
@@ -67,8 +69,8 @@ UART半行插在SUITE/ABI标记之前，重新核对同一原日志完整记录�
 
 重建：`make test-environment-riscv test-log-host test-rtc-host`；
 `python3 -B tests/program-inventory/run.py --suite busybox --case busybox.official --case busybox.environment --reuse-builds --require-pass --output build/environment-check`。
-输入依旧为本页固定BusyBox源码/原包装器和Linux commit；实际QEMU11.1.1、512MiB、
-单hart。环境补全的结果与分类记录在本页；逐条输出、输入身份及ABI重核记录
+输入依旧为本页固定BusyBox源码/原包装器和Linux commit；当前RV QEMU11.1.2、单CPU，LA执行器见平台模块；两种RAM显式传入。
+环境补全的结果与分类记录在本页；逐条输出、输入身份及ABI重核记录
 由上述执行器在运行目录生成，大型运行记录不纳入Git。
 
 | 分类 | 证据与判断边界 |
@@ -81,7 +83,7 @@ UART半行插在SUITE/ABI标记之前，重新核对同一原日志完整记录�
 | 程序错误/契约失败 | 非零、signal或原内部断言失败，先核对固定Linux及程序调用条件 |
 | 性能回退 | 同身份工作量及正确完成后的分布变化；Max提高不能抵消Parent/慢任务变化 |
 
-程序清单、ABI差分、原镜像诊断与正式评分仍是不同口径；本轮不产生正式评分。
+程序清单、ABI差分、原镜像诊断与正式评分是不同口径；本页结果不产生正式评分。
 后续主线只在[路线](../goals.md)维护，本页不积累开发任务。
 
 ## 历史阶段记录
