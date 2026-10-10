@@ -65,8 +65,9 @@ refill 写入无效 paired entry，交由普通用户缺页路径处理，不能
 调度器通过 `arch/task.h`、`context.h`、`timer.h` 和 `mmu.h` 构建期选择实现。
 LA 保存完整整数 trap frame（304 字节）、内核 ABI context、用户 SP/TP/ERA/PRMD；
 KS0 用于区分并交换用户/内核 TP。timer 使用 CPUCFG 频率、RDTIME.D 和 one-shot
-TCFG，接入共用 tick、deadline、预算与调度；未启用 UART 外部 IRQ，timer 轮询
-就绪输入并唤醒阻塞 read/ppoll owner。未使用FP/SIMD的task保持EUEN关闭；已使用者
+TCFG，接入共用 tick、deadline、预算与调度。已编入的相同调度期限不重复写TCFG；
+timer IRQ仍清中断、推进周期并重装下一期限。UART通过PCH-PIC/EIOINTC接入共用TTY，
+timer保留兼容轮询。未使用FP/SIMD的task保持EUEN关闭；已使用者
 按实际宽度启用FPE/SXE/ASXE并保存内嵌状态，具体见[FP/SIMD模块](loongarch-fpu.md)。LBT未支持。
 
 内存 reader 经共用 source、映像、MM、任务创建与 syscall dispatch 路径进入 PLV3。

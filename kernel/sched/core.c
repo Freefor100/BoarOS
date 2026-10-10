@@ -251,33 +251,40 @@ static enum kernel_scheduler_status validate_thread(
     return KERNEL_SCHEDULER_STATUS_OK;
 }
 
-enum kernel_scheduler_status validate_current(void)
+enum kernel_scheduler_status validate_current_on_cpu(struct kernel_cpu *cpu)
 {
+    /* IRQ关闭期间固定CPU/current借用；不跨可睡眠服务或架构切换。 */
+    struct kernel_task *current = cpu->current;
     enum kernel_thread_state expected_state;
     enum kernel_scheduler_status status;
     uintptr_t stack_pointer;
 
-    if (kernel_cpu_current()->current == 0 ||
-        arch_current_thread_get() != kernel_cpu_current()->current) {
+    if (current == 0 ||
+        arch_current_thread_get() != current) {
         return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
     }
-    expected_state = kernel_cpu_current()->current->idle != 0U
+    expected_state = current->idle != 0U
                          ? KERNEL_THREAD_STATE_IDLE
                          : KERNEL_THREAD_STATE_RUNNING;
-    status = validate_thread(kernel_cpu_current()->current, expected_state);
+    status = validate_thread(current, expected_state);
     if (status != KERNEL_SCHEDULER_STATUS_OK) {
         return status;
     }
 
     stack_pointer = current_sp();
-    if (stack_pointer < kernel_cpu_current()->current->stack_low ||
-        stack_pointer >= kernel_cpu_current()->current->stack_high) {
+    if (stack_pointer < current->stack_low ||
+        stack_pointer >= current->stack_high) {
         return KERNEL_SCHEDULER_STATUS_STACK_CORRUPT;
     }
-    if (arch_mmu_current_context() != arch_thread_mm(&kernel_cpu_current()->current->arch)) {
+    if (arch_mmu_current_context() != arch_thread_mm(&current->arch)) {
         return KERNEL_SCHEDULER_STATUS_ADDRESS_SPACE;
     }
     return KERNEL_SCHEDULER_STATUS_OK;
+}
+
+enum kernel_scheduler_status validate_current(void)
+{
+    return validate_current_on_cpu(kernel_cpu_current());
 }
 
 enum kernel_scheduler_status activate_thread_address_space(
@@ -434,14 +441,19 @@ enum kernel_scheduler_status scheduler_switch_claimed(
     return KERNEL_SCHEDULER_STATUS_OK;
 }
 
+static void fill_owned_storage(void *pointer, size_t bytes, uint64_t word)
+{
+    /* 仅初始化已独占的对齐页/栈，不用于用户复制或MMIO。
+     * may_alias覆盖对象表示，volatile保留完整写入；发布仍在初始化之后。 */
+    typedef uint64_t storage_word __attribute__((may_alias));
+    if ((uintptr_t)pointer % sizeof(storage_word) || bytes % sizeof(storage_word)) __builtin_trap();
+    volatile storage_word *output = pointer;
+    for (size_t i = 0; i < bytes / sizeof(storage_word); i++) output[i] = word;
+}
+
 void clear_page(void *pointer)
 {
-    volatile unsigned char *bytes = pointer;
-    size_t index;
-
-    for (index = 0U; index < BOAROS_PAGE_SIZE; index++) {
-        bytes[index] = 0U;
-    }
+    fill_owned_storage(pointer, BOAROS_PAGE_SIZE, 0);
 }
 
 enum kernel_scheduler_status release_after_create_failure(
@@ -541,7 +553,8 @@ enum kernel_scheduler_status allocate_task_storage(struct kernel_task **task)
         return release_after_create_failure(metadata_address,
                                              KERNEL_SCHEDULER_STATUS_PAGE_ACCESS);
     }
-    memset(stack, KERNEL_STACK_FILL, KERNEL_STACK_BYTES);
+    fill_owned_storage(stack, KERNEL_STACK_BYTES,
+                       UINT64_C(0x0101010101010101) * KERNEL_STACK_FILL);
     thread->stack_physical_address = stack_address;
     if (arch_mmu_kernel_window_active()) {
         uint64_t window;
@@ -618,6 +631,16 @@ enum kernel_scheduler_status release_task_stack(struct kernel_task *thread)
             KERNEL_STACK_CANARY)
         return KERNEL_SCHEDULER_STATUS_STACK_CORRUPT;
     cursor = (const unsigned char *)thread->stack_low;
+    /* 栈owner已停止执行；只读可用区，不跨canary/高边界。整字相同后
+     * 才跳过八字节，差异字仍逐字节定位，保留精确的最小剩余空间。 */
+    _Static_assert(KERNEL_STACK_GUARD_BYTES % sizeof(uint64_t) == 0,
+                   "stack fill scan must remain naturally aligned");
+    while (thread->stack_high - (uintptr_t)cursor >= sizeof(uint64_t)) {
+        uint64_t word;
+        __builtin_memcpy(&word, __builtin_assume_aligned(cursor, sizeof(word)), sizeof(word));
+        if (word != UINT64_C(0x0101010101010101) * KERNEL_STACK_FILL) break;
+        cursor += sizeof(word);
+    }
     while ((uintptr_t)cursor < thread->stack_high &&
            *cursor == KERNEL_STACK_FILL)
         cursor++;

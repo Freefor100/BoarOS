@@ -328,6 +328,7 @@ void process_group_request_exit(struct kernel_task *task,
                                 uint64_t status, uint64_t detail);
 enum kernel_scheduler_status process_group_exec_current(void);
 
+/* 调用者独占从allocator取得的页对齐存储，完整清零后才发布对象。 */
 void clear_page(void *pointer);
 enum kernel_scheduler_status allocate_task_storage(struct kernel_task **task);
 enum kernel_scheduler_status release_task_stack(struct kernel_task *task);
@@ -347,6 +348,7 @@ enum kernel_scheduler_status scheduler_switch_claimed(
 void scheduler_cpu_initialize(struct kernel_cpu *cpu, struct kernel_task *idle,
                               uint64_t now_ns);
 void scheduler_rearm_timer(void);
+/* IRQ关闭；CPU/current借用只覆盖决策，架构切换后不得继续使用缓存值。 */
 enum kernel_scheduler_status scheduler_reschedule(int rotate_other, int voluntary, int check_queues);
 void ready_append(struct kernel_task *thread);
 int scheduler_forget_task_locked(struct kernel_task *, struct kernel_wait_cursor *);
@@ -368,6 +370,8 @@ enum kernel_scheduler_status release_after_create_failure(
     uint64_t physical_address,
     enum kernel_scheduler_status original_status);
 enum kernel_scheduler_status validate_current(void);
+/* CPU obtained at this IRQ-off entry; never retain it across switch/sleep. */
+enum kernel_scheduler_status validate_current_on_cpu(struct kernel_cpu *cpu);
 enum kernel_task_status validate_task_resource_borrow(
     const struct kernel_task *task);
 void wake_waiting_parent(struct kernel_task *child);

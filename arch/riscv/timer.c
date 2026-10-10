@@ -121,10 +121,18 @@ static uint64_t earlier_deadline(uint64_t periodic, uint64_t event)
 enum riscv_timer_status riscv_timer_set_scheduler_deadline(uint64_t deadline)
 {
     if (!timer_state.armed) return RISCV_TIMER_STATUS_NOT_STARTED;
-    if (sbi_set_timer(earlier_deadline(timer_state.next_deadline, deadline)) != 0L)
-        return RISCV_TIMER_STATUS_SBI_SET_FAILED;
-    kernel_cpu_current()->timer_deadline = deadline;
-    return RISCV_TIMER_STATUS_OK;
+    uintptr_t irq = arch_interrupt_save();
+    struct kernel_cpu *cpu = kernel_cpu_current();
+    enum riscv_timer_status status = RISCV_TIMER_STATUS_OK;
+    /* 周期IRQ自行推进并重装硬件；相同的已确认事件不再次进入固件。
+     * 失败不发布候选，IRQ保护比较到提交之间不被tick改写。 */
+    if (cpu->timer_deadline != deadline) {
+        if (sbi_set_timer(earlier_deadline(timer_state.next_deadline, deadline)) != 0L)
+            status = RISCV_TIMER_STATUS_SBI_SET_FAILED;
+        else cpu->timer_deadline = deadline;
+    }
+    arch_interrupt_restore(irq);
+    return status;
 }
 
 enum riscv_timer_status riscv_timer_handle_interrupt(uint64_t *elapsed_ticks)

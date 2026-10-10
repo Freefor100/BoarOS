@@ -2,6 +2,7 @@
 #include <arch/riscv/timer.h>
 #include <arch/riscv/virt_uart.h>
 #include <kernel/tick.h>
+#include <kernel/cpu.h>
 
 #include "../../arch/riscv/timer_internal.h"
 
@@ -10,7 +11,6 @@
 
 #define SBI_EXT_TIME 0x54494d45UL
 #define RISCV_SIE_STIE (1UL << 5)
-#define RISCV_SSTATUS_SIE (1UL << 1)
 
 long __real_sbi_probe_extension(unsigned long extension_id);
 long __real_sbi_set_timer(uint64_t absolute_time);
@@ -182,6 +182,8 @@ static unsigned long run_timer_state_cases(void)
         elapsed != 0x1122334455667788ULL) {
         failures++;
     }
+    if (riscv_timer_set_scheduler_deadline(0) != RISCV_TIMER_STATUS_NOT_STARTED)
+        failures++;
     if (riscv_timer_start(0U, 100U) !=
             RISCV_TIMER_STATUS_INVALID_FREQUENCY ||
         riscv_timer_start(99U, 100U) !=
@@ -233,8 +235,22 @@ static unsigned long run_timer_state_cases(void)
     uint64_t event = first_deadline - 1000U;
     if (riscv_timer_set_scheduler_deadline(event) != RISCV_TIMER_STATUS_OK ||
         wrapped_deadline != event) failures++;
+    unsigned long set_calls = wrapped_set_calls;
+    if (riscv_timer_set_scheduler_deadline(event) != RISCV_TIMER_STATUS_OK ||
+        wrapped_set_calls != set_calls || wrapped_deadline != event) failures++;
+    /* Failed replacement cannot publish an unconfirmed hardware deadline. */
+    wrapped_set_result = -3L;
+    if (riscv_timer_set_scheduler_deadline(event + 1) != RISCV_TIMER_STATUS_SBI_SET_FAILED ||
+        kernel_cpu_current()->timer_deadline != event) failures++;
+    wrapped_set_result = 0;
+    set_calls = wrapped_set_calls;
+    if (riscv_timer_set_scheduler_deadline(event) != RISCV_TIMER_STATUS_OK ||
+        wrapped_set_calls != set_calls) failures++;
     if (riscv_timer_set_scheduler_deadline(0) != RISCV_TIMER_STATUS_OK ||
         wrapped_deadline != first_deadline) failures++;
+    set_calls = wrapped_set_calls;
+    if (riscv_timer_set_scheduler_deadline(0) != RISCV_TIMER_STATUS_OK ||
+        wrapped_set_calls != set_calls) failures++;
     while (((read_time() - first_deadline) >> 63) != 0U) {
         asm volatile("" ::: "memory");
     }
@@ -252,7 +268,7 @@ static unsigned long run_timer_state_cases(void)
     if (status != RISCV_TIMER_STATUS_OK || elapsed == 0U) {
         failures++;
     }
-    if (wrapped_probe_calls != 4U || wrapped_set_calls != 6U) {
+    if (wrapped_probe_calls != 4U || wrapped_set_calls != 7U) {
         failures++;
     }
 

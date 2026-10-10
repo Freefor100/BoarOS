@@ -35,7 +35,11 @@ enum arch_timer_status la_timer_start(uint32_t frequency,uint32_t ticks)
 enum arch_timer_status arch_timer_set_scheduler_deadline(uint64_t deadline)
 {
     if (!period) return ARCH_TIMER_STATUS_NOT_STARTED;
-    uintptr_t irq=arch_interrupt_save(); kernel_cpu_current()->timer_deadline=deadline; arm(); arch_interrupt_restore(irq);
+    uintptr_t irq=arch_interrupt_save();
+    struct kernel_cpu *cpu=kernel_cpu_current();
+    /* IRQ路径已重装周期/到期事件；保持已编入的相同期限。 */
+    if (cpu->timer_deadline!=deadline) { cpu->timer_deadline=deadline; arm(); }
+    arch_interrupt_restore(irq);
     return ARCH_TIMER_STATUS_OK;
 }
 enum arch_timer_status la_timer_interrupt(uint64_t *elapsed)

@@ -122,18 +122,18 @@ void scheduler_rearm_timer(void)
     uint64_t deadline;
     {
     KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-    uint64_t delay = kernel_rt_bandwidth_delay(&kernel_cpu_current()->rt_bandwidth,
-        is_rt(kernel_cpu_current()->current),
+    uint64_t delay = kernel_rt_bandwidth_delay(&cpu->rt_bandwidth,
+        is_rt(cpu->current),
         scheduler.runqueue.first && scheduler.runqueue.first->priority != 0);
-    if (kernel_cpu_current()->current && kernel_cpu_current()->current != kernel_cpu_current()->idle &&
-        kernel_cpu_current()->current->scheduling.policy == KERNEL_SCHED_RR) {
-        uint64_t slice = kernel_cpu_current()->current->scheduling.rr_remaining_ns;
+    if (cpu->current && cpu->current != cpu->idle &&
+        cpu->current->scheduling.policy == KERNEL_SCHED_RR) {
+        uint64_t slice = cpu->current->scheduling.rr_remaining_ns;
         if (!slice) slice = 1;
         if (!delay || slice < delay) delay = slice;
     }
     deadline = 0;
     if (delay && kernel_time_is_initialized()) {
-        uint64_t now = kernel_cpu_current()->rt_bandwidth.last_account_ns;
+        uint64_t now = cpu->rt_bandwidth.last_account_ns;
         uint64_t target = UINT64_MAX - now < delay ? UINT64_MAX : now + delay;
         enum kernel_time_status status = kernel_time_deadline_from_monotonic(target, &deadline);
         if (status == KERNEL_TIME_STATUS_DEADLINE_PASSED) deadline = arch_time_read() + 1U;
@@ -153,7 +153,9 @@ void scheduler_rearm_timer(void)
 
 enum kernel_scheduler_status scheduler_reschedule(int rotate_other, int voluntary, int check_queues)
 {
-    if (kernel_cpu_current()->preempt_depth) {
+    /* 调用者保持IRQ关闭；CPU借用在切换前结束，不跨睡眠或恢复点。 */
+    struct kernel_cpu *cpu = kernel_cpu_current();
+    if (cpu->preempt_depth) {
         {
             KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
             if (check_queues) {
@@ -163,12 +165,12 @@ enum kernel_scheduler_status scheduler_reschedule(int rotate_other, int voluntar
             scheduler_account_runtime_locked();
         }
         if (voluntary) __builtin_trap();
-        kernel_cpu_request_schedule(kernel_cpu_current());
-        kernel_cpu_current()->rotate_other |= rotate_other != 0;
+        kernel_cpu_request_schedule(cpu);
+        cpu->rotate_other |= rotate_other != 0;
         scheduler_rearm_timer();
         return KERNEL_SCHEDULER_STATUS_OK;
     }
-    struct kernel_task *current = kernel_cpu_current()->current;
+    struct kernel_task *current = cpu->current;
     struct kernel_task *selected;
     {
     KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
@@ -176,14 +178,14 @@ enum kernel_scheduler_status scheduler_reschedule(int rotate_other, int voluntar
         enum kernel_scheduler_status status = validate_queues_locked();
         if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
     }
-    (void)kernel_cpu_consume_schedule(kernel_cpu_current());
-    rotate_other |= kernel_cpu_current()->rotate_other;
-    kernel_cpu_current()->rotate_other = 0;
+    (void)kernel_cpu_consume_schedule(cpu);
+    rotate_other |= cpu->rotate_other;
+    cpu->rotate_other = 0;
     scheduler_account_runtime_locked();
     struct kernel_task *next = ready_best_locked();
-    int throttled = is_rt(current) && !kernel_rt_bandwidth_eligible(&kernel_cpu_current()->rt_bandwidth);
-    int expired = current != kernel_cpu_current()->idle && kernel_sched_policy_expired(&current->scheduling);
-    int higher = next && (current == kernel_cpu_current()->idle ||
+    int throttled = is_rt(current) && !kernel_rt_bandwidth_eligible(&cpu->rt_bandwidth);
+    int expired = current != cpu->idle && kernel_sched_policy_expired(&current->scheduling);
+    int higher = next && (current == cpu->idle ||
                          next->scheduling.priority > current->scheduling.priority);
     int rotate = voluntary || expired ||
                  (rotate_other && current->scheduling.policy == KERNEL_SCHED_OTHER);
@@ -195,14 +197,14 @@ enum kernel_scheduler_status scheduler_reschedule(int rotate_other, int voluntar
         scheduler_rearm_timer();
         return KERNEL_SCHEDULER_STATUS_OK;
     }
-    if (current != kernel_cpu_current()->idle) {
+    if (current != cpu->idle) {
         current->state = KERNEL_THREAD_STATE_READY;
         /* 高优先级抢占/节流保留同级队首；只有yield/时间片结束移到队尾。 */
         if (current->wait.ready_pending) __builtin_trap();
         current->wait.ready_pending = 1;
         current->wait.ready_head = !rotate;
-    } else kernel_cpu_current()->idle_context_saved = 1U;
-    selected = claim_next_locked(kernel_cpu_current(), current, next);
+    } else cpu->idle_context_saved = 1U;
+    selected = claim_next_locked(cpu, current, next);
     }
     if (!selected) __builtin_trap();
     return scheduler_switch_claimed(current, selected);

@@ -376,15 +376,18 @@ enum kernel_mm_status kernel_scheduler_resolve_current_user_fault(
     uint64_t virtual_address,
     uint32_t access)
 {
-    if (scheduler.initialized != KERNEL_SCHEDULER_INITIALIZED ||
-        arch_interrupt_is_enabled() ||
-        validate_current() != KERNEL_SCHEDULER_STATUS_OK ||
-        kernel_cpu_current()->current == kernel_cpu_current()->idle ||
-        kernel_cpu_current()->current->state != KERNEL_THREAD_STATE_RUNNING ||
-        kernel_cpu_current()->current->arch.user_mode != 1U) {
+    if (scheduler.initialized != KERNEL_SCHEDULER_INITIALIZED || arch_interrupt_is_enabled())
+        return KERNEL_MM_STATUS_STATE;
+    /* CPU借用只覆盖IRQ关闭的入口校验；缺页可能睡眠，后续只使用
+     * 当前执行owner固定的task/MM，不把CPU借用带入缺页服务。 */
+    struct kernel_cpu *cpu = kernel_cpu_current();
+    struct kernel_task *current = cpu->current;
+    if (validate_current_on_cpu(cpu) != KERNEL_SCHEDULER_STATUS_OK ||
+        current == cpu->idle || current->state != KERNEL_THREAD_STATE_RUNNING ||
+        current->arch.user_mode != 1U) {
         return KERNEL_MM_STATUS_STATE;
     }
-    return kernel_mm_resolve_user_fault(&kernel_cpu_current()->current->mm,
+    return kernel_mm_resolve_user_fault(&current->mm,
                                         virtual_address,
                                         access);
 }

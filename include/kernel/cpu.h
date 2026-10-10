@@ -13,6 +13,9 @@ struct kernel_raw_guard;
 struct kernel_cpu {
     uint64_t hardware_id;
     struct kernel_task *current;
+    /* 定位校验与本地raw状态靠近current；远程请求保留在记录尾部。 */
+    struct kernel_raw_guard *raw_locks;
+    uint32_t initialized, preempt_depth;
     struct kernel_task *switch_previous;
     struct kernel_task *idle;
     struct kernel_cpu *scheduler_next;
@@ -21,8 +24,6 @@ struct kernel_cpu {
     uint64_t idle_ticks, armed_deadline, timer_deadline;
     unsigned idle_context_saved;
     struct kernel_io_context *bootstrap_io;
-    struct kernel_raw_guard *raw_locks;
-    uint32_t initialized, preempt_depth;
     unsigned need_resched;
     unsigned rotate_other;
 };

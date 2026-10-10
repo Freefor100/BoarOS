@@ -97,6 +97,10 @@ ready 策略直接选择下一任务。退出栈只切离，回收仍由 worker 
 
 硬件 timer 的最后编程期限由当前CPU持有，取普通 tick、该CPU的RT配额耗尽/补充和当前任务RR片尾中的最早期限。预算 IRQ 可以返回 elapsed_ticks=0；此时仍重新记账调度，但不推进 tick、CPU tick 统计或 coarse clock。实际运行时间由切换、策略/配置修改和 timer 入口结算，精度受关中断临界区与模拟器 IRQ 延迟限制。用户访问复制与可睡眠路径不放在调度状态锁内。
 
+IRQ关闭的短入口复用同一次CPU/current定位，借用在切换或可睡眠服务前结束；
+缺页服务使用当前执行owner固定的task/MM，不把CPU指针带过睡眠。RV/LA timer
+后端保留已确认的相同事件，避免每次yield重复写硬件，周期IRQ仍自行重装。
+
 sched_setparam/setscheduler/getparam/getscheduler、priority_min/max、rr_get_interval 和 CPU0 affinity 使用真实任务状态；未发布 child 不可被按 TID 查询。BATCH/IDLE/DEADLINE/EXT 的 min/max 查询按固定 Linux 返回 0，设置这些策略仍显式拒绝。RESET_ON_FORK 在子任务清除并将继承的 RT 变为 OTHER；exec 保留执行线程的策略。没有实现 nice 调度、SMP、cgroup 配额或 deadline scheduler。
 
 `make test-sched-concurrency-host`直接执行生产策略/选择/等待交接，在2/4线程握手中验证唯一执行owner、旧栈交接及IRQ恢复；保护CPU独立记账和公开策略入口的同域修改。该证据不替代客户机多核。
@@ -223,6 +227,10 @@ zombie 先逻辑回收再复制 status/rusage，因此坏输出指针的 EFAULT 
 短调度域保护组/身份元数据；fd/MM等业务引用及futex条件仍依赖单CPU的IRQ纪律。共享 MM 使用同一页表与本地 SFENCE.VMA；多CPU前仍须补共享对象同步、lookup到pin的交接和远端TLB完成后回收。
 
 RV每线程拥有独立的 4 KiB 元数据页和 8 KiB 连续物理内核栈（buddy order 1）；调度器初始化要求分配器已进入 finalized buddy 模式，栈分配、构造回滚与正常释放使用同一 order。RV生产内核把栈映射到内核栈窗口（`RISCV_KERNEL_STACK_WINDOW_BASE` 起 128 MiB，12 KiB 槽：前置 4 KiB 页不建 PTE，作为未映射 guard，后接 8 KiB 栈）；空窗口骨架在页表构建期预留，所有用户根按值继承同一子树，叶子由受限的运行期接口插入/删除，空 level-0 表在最后一个叶撤除时释放，guard 页不占物理页。无活动内核页表的测试 fixture 继续使用 direct-map 栈。栈底留 16 字节对齐区和 canary，剩余 8176 字节包含 Trap Frame 与 C 调用链。新栈填充固定字节，初始用户 Trap Frame 显式清零。退出后只在其他可信栈扫描未覆盖前缀；累计最小剩余空间和最大已用空间由只读统计接口提供，生产 PID 1 完成时报告。构造回滚同样释放独立栈，不让资源清理失败保留它。
+
+页/栈初始化只写已独占、对齐的私有存储，完整初始化后才发布。可信栈回收时用整字
+跳过全为填充值的前缀，再逐字节定位首处差异；不跨canary或高边界，余量统计仍精确
+到字节。host在4/16KiB下遍历全部前缀边界并检查坏canary拒绝回收，真实guard另测。
 
 LA生产任务也沿现有内核栈窗口接口运行：PGDH共享骨架持有永久boot页，任务叶
 仅借用原连续物理栈，PLV0/RW/NX且下方16KiB未映射。异常入口在写frame前
