@@ -201,6 +201,11 @@ static void test_irq_reads(const void *dtb, struct physical_page_allocator *allo
     (void)riscv_interrupt_save();
     struct riscv_virtio_mmio_block_statistics stats;
     riscv_virtio_mmio_block_get_statistics(device, &stats);
+    virt_uart_puts("BoarOS: block IRQ reads completed="); virt_uart_put_hex(irq_done);
+    virt_uart_puts(" interrupts="); virt_uart_put_hex(stats.interrupts);
+    virt_uart_puts(" sleeps="); virt_uart_put_hex(stats.sleeps);
+    virt_uart_puts(" runtime-polls="); virt_uart_put_hex(stats.runtime_polls);
+    virt_uart_putc('\n');
     if (irq_done != 2 || !stats.interrupts || !stats.sleeps || stats.runtime_polls)
         fail_block(47, 2, irq_done);
 }
