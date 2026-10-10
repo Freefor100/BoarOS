@@ -51,7 +51,7 @@ idle/cleanup 上下文单列 idle_ticks，不能解释成精确 WFI 驻留时间
 目前交付 contract/write/locking/mprotect/deadline/latency/consumer/readers/metadata/allocator/scheduler，
 `all` 不跳过缺项；consumer 不将未完成命令标为完成。独立报告读器拒绝缺项、重复、未知键、单位错误、旧 epoch、
 直方图不一致、incomplete 和 overflow。scheduler固定8192次yield、8192次带内容核对的管道往返，以及1024次创建/wait/让出执行；
-最后报告已wait完成的child数，元数据资源归还另由生命周期门禁和整次启动基线核对。
+三个业务窗口共wait完成1026个child；预热child在计时外。元数据资源归还另由生命周期门禁和整次启动基线核对。
 各窗口时间必须为正；ON还要求真实IRQ和raw取得/持有样本。冻结ELF通过`--coordinator-elf`复用。
 当前 Python discovery 不收集带连字符的文件，
 因此 host target 直接运行 `python3 -B tests/test-cost-report.py`，必须实际执行测试。
@@ -182,9 +182,9 @@ uaccess_copy_bytes/ticks。它们只包围实际 calloc 清零、resize 搬迁�
 采样前捕获 epoch/前后台身份，睡眠或切换后仍按该来源记账；不把经过时间称为独占
 CPU 时间。零字节成功执行可以有样本，失败准备不能伪造工作量。
 
-聚合存储为 **65,436 字节**、每任务仍为64字节，距离64KiB上限仅余100字节；编译与
+该次加入后的聚合存储为 **65,436 字节**、每任务仍为64字节，距离64KiB上限仅余100字节；编译与
 快照均检查预算，后续新增指标必须重新核对容量。追加前的
-完整203项 schema 继续可读，当前209项必须齐全，版本1不变。关闭观测时没有新状态
+完整203项 schema 继续可读，当时的209项必须齐全，版本1不变。关闭观测时没有新状态
 或指令。独立消费者 fixture 核对真实范围、失败边界、样本和时钟，而不是只测试
 公共内存函数。Lua 的一次定点窗口及候选未上线结论见
 [工具链记录](../learning/offline-toolchain-probe.md#内存操作的有限归因与未上线候选2026-10-03)。

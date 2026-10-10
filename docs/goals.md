@@ -11,7 +11,7 @@
 
 | 主线 | 尚缺能力 | 完成口径 |
 |---|---|---|
-| 同步基础收口 | 调度与任务生命周期的新增成本未通过3%门槛，匹配时间及最终组合核对待收口 | 选择/发布/退休owner保持；常见业务成本和首尾漂移满足约定 |
+| 同步基础收口 | 调度/任务生命周期默认yield、唤醒、创建退出新增3.87%/11.00%/13.90%，超3%门槛；部分短窗口仍漂移 | 选择/发布/退休owner保持；成本处置确认前暂停收口与两核转换，证据见[匹配时间](learning/cost-baseline.md#共享调度域的匹配时间) |
 | RV 两核 | 独立 secondary 入口/栈，BSS 一次初始化，per-CPU trap/timer/FPU、IPI、远程 wake | 同一任务不双核运行；idle 可被唤醒；正常用户态切换与可信栈回收 |
 | 共享 MM 与子系统 | uaccess pin/权限、COW 发布、活动 CPU、远程 TLB 确认，OFD/cache/DMA 与退出同步 | 复制与撤映射、降权、截断、I/O/close/退出的强制交错正确；确认停止使用后才回收 |
 | 组合与 LA 多核 | RV 2/4 核低内存、故障、真实程序；LA CPU 启动/IPI/TLB/状态保存 | 架构结果独立验收，保留单核对照；正确性成立后再衡量并行收益 |
@@ -71,7 +71,7 @@ PTE 撤销/降权后须覆盖活动 CPU 及并发切换者，确认旧翻译不�
 | 文件驻留记录范围选择 | 点查询已有哈希，mprotect/部分撤映射仍可能扫描整个驻留链；只改善范围选择/删除，不同时树化全部 MM | [规模边界](learning/single-hart-scale.md)、[MM](modules/kernel-mm.md) |
 | GDT timestamp-touch 候选 | 隔离候选消除了干净 GDT 的 undo/restore 复制，但完整读取仍有负向观察，未进入 main | [时间戳研究](learning/file-timestamps.md) |
 | 串行协议、存储与原生构建成本 | 网络批次仍有大 IRQ 区间；默认预算吞吐、同步/排空及 Lua 工程还有已测成本，按目标阶段归因 | [网络](learning/network-ownership.md)、[预算](learning/data-path-budget-experiments.md)、[工具链](learning/offline-toolchain-probe.md) |
-| 历史 Virtqueue／页释放 fatal／偶发取消 | 同类 allocator 竞态已修复；原事件缺队列/owner现场，具体归因仍未确认。复发时保留首次状态，不用 clean run 反推关闭 | [事故边界](learning/cost-baseline.md#旧版内存释放与-virtqueue-告警2026-10-02)、[程序证据](learning/user-program-inventory.md) |
+| 未归因现场 | 历史Virtqueue/页释放fatal/偶发取消、RV块统计case47及固定Linux LA终端等待，保留各自首个阶段与缺失证据；同类修复和重跑不关闭原事件 | [事故边界](learning/cost-baseline.md#旧版内存释放与-virtqueue-告警2026-10-02)、[程序证据](learning/user-program-inventory.md)、[块诊断](modules/riscv-virtio-block.md) |
 
 这些条目不是新执行计划；已有修复的过程与反例留在对应模块/learning，不重复列入待做。
 

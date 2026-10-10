@@ -954,3 +954,104 @@ allocator/latency替换case及冻结ELF，OFF用相应核并加`--off`；目录�
 缓存仅便于复用，永久证据为身份、结论及命令，不依赖临时日志。
 
 </details>
+
+
+## 共享调度域的匹配时间
+
+2026-10-10，干净`cbcab90`与`4b862e6`生产源码使用同一GCC16.2.0/AS2.47.20260726
+独立构建。**新增默认业务成本未通过3%门槛，调度同步收口暂停。**
+冻结四个ELF、512MiB/单CPU/modern VirtIO/writeback、180秒预算；OFF四类及scheduler
+ON各按基线→新→返回基线、每组三启动，共45次。latency和locking整组各原样重跑一次，
+最终63次均正常退出并满足工作量和root资源基线；重跑后仍漂移的窗口不参与通过判定。
+首次和重跑原记录分别保留，不能挑较好的副本。旧候选完整45次也未通过；中间9次
+scheduler诊断的创建回退约6.45%，身份和宿主阶段不同，不替代下面最终匹配结果。
+
+在i5-12500H的P核2串行运行；intel_pstate/powersave，min/max400000/4500000kHz，
+并未锁定瞬时频率。QEMU11.1.2默认TCG、无icount，10MHz timebase；同一频率策略及
+首尾对照不能排除新核阶段的全部宿主扰动。比较指标为业务时间，不是指令数或模拟CPU周期。
+
+| OFF业务窗口 | 基线/新/返回中位ms | 新增 | 首尾漂移 | 判定 |
+|---|---:|---:|---:|---|
+| allocator1页×1024 | 60.627/59.077/59.682 | -1.79% | -1.56% | 成本内 |
+| allocator64页×64 | 99.649/104.034/101.162 | +3.61% | +1.52% | 超3% |
+| allocator4096页×4 | 389.710/406.166/390.230 | +4.15% | +0.13% | 超3% |
+| latency1MiB复制 | 50.883/52.095/51.048 | +2.22% | +0.32% | 成本内，重跑组 |
+| scheduler8192次yield | 402.163/418.213/403.095 | +3.87% | +0.23% | 超3% |
+| scheduler8192次管道往返 | 967.900/1070.648/961.145 | +11.00% | -0.70% | 超3% |
+| scheduler1024次创建/wait/yield | 618.708/704.016/617.536 | +13.90% | -0.19% | 超3% |
+
+新增按新中位/首尾中位均值计算。locking有效窗口0-0-1、1-0-1、1-1-8分别新增
+11.29%、10.11%、8.16%；1-2-8、1-4-8为-7.41%、-0.66%。其余8个locking窗口
+及4KiB/64KiB复制、4KiB/1MiB权限窗口重跑后首尾仍漂移超过2%，属于测量环境阻塞，
+不给成本通过结论。森林、allocator raw和等待交接的既有回退不计入本节新增。
+
+已消除空准备、全局子任务/组退出扫描、重复选择、普通末借用归还的额外worker轮次，
+并合并yield校验与决策取锁。生产反例检查这些实际工作量和owner归还；它们未带来
+整体成本达标。最终ON创建窗口raw样本中位283223→302080，yield为66035→49815。
+任务发布/查找/退休多了受保护的借用和复查；不能把全部耗时差额简单归给原子指令，
+也没有取得把OFF各阶段回退逐函数唯一分解的证据。更早版本与最终版本的百分比不可
+直接相减来声称某次小优化收益；须用相同版本、输入及返回对照单独比较。
+
+<details>
+<summary>ON归因、观测开销与资源</summary>
+
+累计取三次中位，最大值取三次最大，100ns/tick；表中基线→新。IRQ/raw/任务时间
+会重叠，不能相加。B2端点校验在IRQ域，B3在raw域，raw持有计时覆盖范围也随之变化。
+
+| scheduler窗口 | IRQ最大µs / p99桶ticks | raw取得/持有累计ms | raw取得/持有最大µs | 对象锁等待/持有累计ms | wake-to-run最大µs |
+|---|---|---|---|---|---|
+| yield | 2417.7→4512.7 / 512–1023→512–1023 | 7.038/43.334→6.048/134.176 | 21.3/120.7→23.8/1259.6 | 0.021/0.528→0.022/0.544 | 308.6→452.4 |
+| pipe往返 | 520.4→601.2 / 1024–2047→1024–2047 | 36.738/404.734→36.224/459.623 | 21.6/83.8→20.9/93.5 | 146.138/1118.432→144.107/1154.218 | 372.7→841.7 |
+| 创建/wait | 673.5→740.9 / 4096–8191→4096–8191 | 22.044/228.691→23.286/289.209 | 57.5/39.6→21.1/41.5 | 0/0→0/0 | 63.6→105.5 |
+
+ON相对OFF的独立启动耗时比，基线/新/返回依次为：yield93.61%/84.01%/90.79%，
+pipe165.49%/146.56%/166.72%，创建127.31%/119.01%/128.78%。默认性能必须用OFF。
+新核ON三个窗口后台运行记账约9.0/1.3/297.8ms，创建基线约246.3ms；观察者运行
+计数为0，输出及快照不在业务区间。新核封口首副本约0.285/0.142/0.161ms、重试0，
+与业务时间分列；这些计数不是独占CPU时间的完整分解。
+
+OFF真实编译尺寸RV任务2608→2688、CPU56→272字节；LA任务3424→3488、CPU56→256。
+任务元数据仍各占一页。PID64→72字节，使其slab class64→128；COST预算仍64KiB/任务64字节。
+512MiB OFF的root退出可用页0x1fbdb→0x1fbd8、heap-live均0；新增常驻3页不是泄漏。
+三个scheduler副本基线与新版本的root堆峰值均82页；allocator82、latency97页，locking整次
+启动峰值首次基线221–227、新217–230、返回227–233页，不能当作某个窗口的独立峰值。
+执行栈在trusted-stack回收，任务页、等待/查找借用和设备owner按各自预热基线核对。
+没有用这些单CPU结果声明SMP-ready。
+
+</details>
+
+<details>
+<summary>冻结身份与重建入口</summary>
+
+固定语义参考为本地`references/linux`的`f4cdf7ca9a1fdcca413157df19753f388a5a224e`。
+QEMU源码参考`84f07211cc5b4fc6a371559bf8a5de4fb068e648`，实际执行器另列；
+LA功能执行器仍是已有RTC补丁的QEMU11.1.0，没有新增LA COST验收。
+
+| 输入 | SHA-256 |
+|---|---|
+| 基线/返回OFF | `6c48d4f3125b59955fa8bb3b28452e6ff5ba6e1dd7cb12d591b229873164e180` |
+| 基线/返回ON | `976535a81d6a606c9bfb6e8230adb36f97525ef0771380c6dbba141bf5a28252` |
+| 新OFF | `a2e0be6e5d3d88b42b564d107e31e49f15a16e37f5aa40ea27b954b5f729b372` |
+| 新ON | `e30dcd4c18ce088f50d6a736caffefb7bb05da57df9aa2e41a88958a3d72902c` |
+| scheduler ELF | `710f436e3473ea22ed6f40f779a5003fb351b62e5b77d07e02ad44d0c1cfd4e2` |
+| RV执行器/usr/bin/qemu-system-riscv64 | `5713c546693820d225e87795a14e8177343cb7ac4d9b0610a9e41c7203eb023d` |
+| RV GCC16.2.0 | `27038346101d7c22f5d6aa81f6bfad81d1363ab26d75c3e49980d2a98192ba35` |
+| RV AS2.47.20260726 | `454dcf6547ade2c2df8e5f091a5765dea55959a038dd139aad6524f3bc226eab` |
+
+allocator/latency/locking ELF沿用上一节冻结SHA，源码见`tests/workloads/cost/`。
+重建用对应提交、独立空BUILD_DIR、`COST_DIAGNOSTICS=0/1 INIT_CONFIG=config/init.json all`；
+不能把当前版本的头文件混进旧对象。各case基线/新/返回各三副本，目录独立、运行串行：
+
+```sh
+taskset -c 2 python3 -B tests/cost-riscv.py --case scheduler --off \
+  --kernel build/data-path-baselines/sync-b3/decision-0.elf \
+  --kernel-identity build/data-path-baselines/sync-b3/decision-0.identity.json \
+  --coordinator-elf build/data-path-baselines/sync-b3/scheduler.elf \
+  --qemu /usr/bin/qemu-system-riscv64 --transport modern --cache writeback \
+  --replicas 3 --output build/cost-scheduler-recheck
+```
+
+替换case/ELF复用其他三类，ON换对应核并取消`--off`；快照与封口字段仍严格验证。
+缓存便于复用，永久事实为这里的身份、结果、边界与可重建命令；临时日志和plan不入Git。
+
+</details>

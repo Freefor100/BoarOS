@@ -208,7 +208,7 @@ zombie 先逻辑回收再复制 status/rusage，因此坏输出指针的 EFAULT 
 
 ## 同步、成本与验证边界
 
-单 hart 的 SIE 临界区串行化组关系、fd/MM 引用和 futex 登记。共享 MM 使用同一页表与本地 SFENCE.VMA；这不是 SMP 协议。多 hart 前仍须补锁、页引用原子操作和远端 TLB shootdown。
+短调度域保护组/身份元数据；fd/MM等业务引用及futex条件仍依赖单CPU的IRQ纪律。共享 MM 使用同一页表与本地 SFENCE.VMA；多CPU前仍须补共享对象同步、lookup到pin的交接和远端TLB完成后回收。
 
 RV每线程拥有独立的 4 KiB 元数据页和 8 KiB 连续物理内核栈（buddy order 1）；调度器初始化要求分配器已进入 finalized buddy 模式，栈分配、构造回滚与正常释放使用同一 order。RV生产内核把栈映射到内核栈窗口（`RISCV_KERNEL_STACK_WINDOW_BASE` 起 128 MiB，12 KiB 槽：前置 4 KiB 页不建 PTE，作为未映射 guard，后接 8 KiB 栈）；空窗口骨架在页表构建期预留，所有用户根按值继承同一子树，叶子由受限的运行期接口插入/删除，空 level-0 表在最后一个叶撤除时释放，guard 页不占物理页。无活动内核页表的测试 fixture 继续使用 direct-map 栈。栈底留 16 字节对齐区和 canary，剩余 8176 字节包含 Trap Frame 与 C 调用链。新栈填充固定字节，初始用户 Trap Frame 显式清零。退出后只在其他可信栈扫描未覆盖前缀；累计最小剩余空间和最大已用空间由只读统计接口提供，生产 PID 1 完成时报告。构造回滚同样释放独立栈，不让资源清理失败保留它。
 
@@ -240,7 +240,7 @@ LA生产任务也沿现有内核栈窗口接口运行：PGDH共享骨架持有�
 
 ## 系统统计与可等待内核任务
 
-调度器独立登记所有已发布任务，直到最后 metadata 回收才注销；构造失败不发布。`kernel_scheduler_system_statistics()` 返回真实任务数（含尚未回收的 zombie，16 位饱和）和 16 位小数的负载。每 501 个 100 Hz tick 按固定 Linux 的 1884/2014/2037（11 位小数）更新 1/5/15 分钟指数平均。READY/RUNNING 与不可中断 BLOCKED 计入活动量；空闲 worker/cleanup 的工作队列等待标为 interruptible，不凭空形成空闲负载，实际存储与压力等待仍计入。
+调度器独立登记所有已发布任务，逻辑退休时摘表；构造失败不发布。退休后仅因存储借用保留的页不再代表可见任务，未被wait/reap的zombie仍在表中。`kernel_scheduler_system_statistics()` 返回真实任务数（含尚未回收的 zombie，16 位饱和）和 16 位小数的负载。每 501 个 100 Hz tick 按固定 Linux 的 1884/2014/2037（11 位小数）更新 1/5/15 分钟指数平均。READY/RUNNING 与不可中断 BLOCKED 计入活动量；空闲 worker/cleanup 的工作队列等待标为 interruptible，不凭空形成空闲负载，实际存储与压力等待仍计入。
 
 `kernel_thread_create_joinable()` 的调用者持有 join handle；被等待线程退出不向普通 completion 队列发布业务完成。`kernel_thread_join()` 等在途调用展开到 EXITED 后，从可信调用栈摘取并释放目标栈/metadata；清理任务也可安全等待，不依赖它自己稍后执行 reap。通用 reap 同样清空并唤醒 handle。页缓存 stop 先禁止新压力提交，唤醒并 join worker，再释放专用快照页。
 
@@ -286,7 +286,7 @@ bootstrap I/O上下文与任务I/O上下文分开，任务guard和回收深度�
 RV scheduler cases分别验证idle和两个同级OTHER任务的延期请求，恢复后peer必须进展并归还全部owner。
 `test-sync-riscv/test-sync-loongarch`在512M/1G运行真实原子/IRQ正例，以及raw内block/yield/退出/睡眠锁的fatal。
 runner从Make接收实际构建目录，COST入口不能借用普通产物；host保护目录覆盖和缺失输入不回退。
-这些结果不证明调度策略/任务索引、共享MM或设备业务已经具备SMP安全性。
+这些原语门禁不替代调度/索引组合以及共享MM/设备业务的客户机多核验收。
 
 `kernel_rwlock`的栈waiter由阻塞调用持有；授予资格先于wake，新任务不得抢走已授予
 资格。持有guard期间锁对象不能移动/销毁；现有等待不可中断。未来取消/超时要明确

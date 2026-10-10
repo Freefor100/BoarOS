@@ -32,9 +32,10 @@ RV已验证的全断电矩阵；LA客体原生开发尚未交付，不增加占�
 继续，不被core失败跳过。runtime与core独立。`Main dual-architecture gate`以
 `always()`检查全部声明job，failure/cancelled/skipped/缺失都失败；工作流不改变分支保护。
 
-host allocator组直接链接生产CPU/raw、buddy/slab、等待与RW资格，覆盖4/16KiB
-并发、非法owner、抢占、有界工作量及借用销毁。RV完整门禁与LA cpu-state运行
-真实raw/等待/handoff，含双RAM首次/恢复/退出切换；宿主并发不代表整个内核SMP-ready。
+host allocator组直接链接生产CPU/raw、buddy/slab、等待与RW资格、调度/身份/退休，
+覆盖4/16KiB allocator及2/4逻辑CPU调度握手、非法owner、抢占、有界工作量和借用销毁。
+RV完整门禁与LA cpu-state运行真实raw/等待/handoff/lifecycle，含双RAM首次/恢复/退出
+及可信栈归还；宿主并发不代表整个内核SMP-ready。
 
 `tests/ci/run.py`保存完整输出、argv、预算、退出码和最终状态。超时停止整个进程组，
 回收标为unverified；取消保留incomplete，未执行项不补成功。host使用宿主PATH和

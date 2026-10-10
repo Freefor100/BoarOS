@@ -23,10 +23,10 @@ Linux 是用户可观察语义的参考；内部实现独立维护对象所有�
 | 网络 | IPv4/IPv6 loopback、TCP/UDP、AF_UNIX socketpair；VirtIO-net、静态 IPv4/ARP、有界分片、宿主双向 TCP/HTTP、RX loan 与 TX SG/复制回退 | 无命名 AF_UNIX、外部 IPv6、DHCP/DNS/TLS；[网络](docs/modules/kernel-network.md) |
 | 终端与系统服务 | IRQ UART、TTY/termios2、作业控制、Unix98 PTY/devpts、原 BusyBox ash/stty/script；日志、可信 RNG、RTC、时钟/睡眠、NOFILE/STACK | 固定 root；无其他行规程、完整 modem 控制或全部资源限制；[TTY](docs/modules/kernel-tty.md)、[日志](docs/modules/kernel-log.md) |
 
-2026-10-09 本地验收：RV/LA 在 512 MiB、1 GiB 下，各自完成 **229 项原程序**的同 ELF Linux 对照；
+2026-10-10 本地组合核对：RV/LA 在 512 MiB、1 GiB 下，各自完成 **229 项原程序**的同 ELF Linux 对照；
 两侧各 **1366 条 ABI 差分**、glibc 五形态、栈/guard，以及相关存储、设备、网络、终端组合通过。
 具体输入与适用范围见[程序基线](docs/learning/user-program-inventory.md)和
-[allocator 组合验收](docs/learning/memory-management.md#阶段a组合收口2026-10-09)。
+[调度组合核对](docs/learning/threads-and-futex.md#调度域身份发布与退休存储)。
 这些结果限定于上述平台和案例；LA 客体原生开发、全断电恢复矩阵、实板与多核仍需独立验收。
 
 主线 [CI](docs/modules/continuous-integration.md)以同一模板覆盖共用 host、双侧 core/ABI、platform 和 glibc/SQLite，
@@ -48,6 +48,7 @@ make test-diff-abi-riscv test-diff-abi-loongarch
 make test-allocator-cost-host
 make test-sync-host test-allocator-concurrency-host
 make test-wait-host test-sleep-lock-host test-wait-riscv test-wait-loongarch
+make test-sched-concurrency-host test-sched-lifecycle-riscv test-sched-lifecycle-loongarch
 make test-stack-usage test-stack-usage-la
 ```
 
@@ -64,6 +65,9 @@ make test-stack-usage test-stack-usage-la
 具体未完成能力与依赖只维护在[开发路线](docs/goals.md)，逐轮执行计划留在会话中。
 CPU 本地/current、运行结算、idle/timer归属与嵌套抢占控制已建立，raw 短锁已接入 buddy/slab 元数据；任务选择、身份发布及存储借用在统一短调度域保护，资源清理留在锁外；等待代次、借用游标、
 新栈交接与可睡眠锁内部资格已建立。压力回收、共享MM及其他业务对象仍需跨核保护。
+共享调度域的[最终匹配时间](docs/learning/cost-baseline.md#共享调度域的匹配时间)未通过新增3%门槛：
+默认yield/管道唤醒/创建退出新增3.87%/11.00%/13.90%，部分短窗口仍有首尾漂移；
+同步收口和RV两核转换暂停，当前生产配置继续单CPU。
 等待交接的[固定P核匹配时间](docs/learning/cost-baseline.md#等待交接的匹配时间)单列默认业务、
 IRQ/锁/唤醒和观测开销；匿名生命周期额外约2.5%–4.0%，部分组合窗口仍有成本与漂移，未取得普遍性能提升。
 
