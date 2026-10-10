@@ -49,6 +49,8 @@ struct kernel_pid_member {
     enum kernel_pid_role role;
 };
 #define KERNEL_PID_BUCKETS 256U
+/* procfs encodes the existing identity above 30 inode bits. */
+#define KERNEL_PID_GENERATION_MAX (UINT64_MAX >> 30U)
 struct kernel_pid_registry {
     struct kernel_pid_allocator *numbers;
     struct kernel_pid *buckets[KERNEL_PID_BUCKETS];
@@ -58,12 +60,16 @@ struct kernel_pid_registry {
 struct kernel_pid {
     kernel_pid_t number;
     uint32_t references;
-    uint32_t published; /* 0 private/reserved, 1 indexed, 2 retired */
-    uint64_t generation;
+    /* 状态与代次共用一字，保持64字节slab；引用仍为完整32位。
+     * 状态变更受identity域保护；3是损坏编码，不是可恢复状态。 */
+    uint64_t generation : 62;
+    uint64_t published : 2; /* 0 private/reserved, 1 indexed, 2 retired */
     struct kernel_pid_registry *registry;
     struct kernel_pid *hash_next;
     struct kernel_pid_member *members[KERNEL_PID_ROLES];
 };
+_Static_assert(KERNEL_PID_GENERATION_MAX <= (UINT64_MAX >> 2U),
+               "legal PID generations must fit beside the state bits");
 /* reserve owns a number and generation but is invisible to find. Roles may
  * be prepared while private; publish_reserved commits the lookup identity.
  * Final put retires either state and leaves heap disposal to the caller. */

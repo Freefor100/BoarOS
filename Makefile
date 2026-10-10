@@ -1651,6 +1651,13 @@ test-pid-object-host:
 	@mkdir -p build/host
 	cc -std=c11 -Wall -Wextra -Werror -Iinclude tests/pid-object-host.c kernel/pid.c -o build/host/pid-object-test
 	build/host/pid-object-test
+	@set -e; for shift in 12 14; do \
+	cc -std=c11 -O2 -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=$$shift \
+		-DBOAROS_COST_DIAGNOSTICS=0 -Itests/host/random -idirafter include \
+		tests/host/pid_allocation.c kernel/pid.c kernel/physical_page.c $(HOST_CPU_SOURCES) mm/heap.c \
+		-o build/host/pid-allocation-$$shift; \
+		build/host/pid-allocation-$$shift; \
+	done
 
 test-random-host:
 	PYTHONDONTWRITEBYTECODE=1 python3 tests/host/random_vectors.py

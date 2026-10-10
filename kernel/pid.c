@@ -136,7 +136,7 @@ enum kernel_pid_status kernel_pid_reserve(struct kernel_pid_registry *registry,
 {
     if (!registry || !prepared || prepared->registry || prepared->published || !registry->next_generation)
         return KERNEL_PID_STATUS_STATE;
-    if (registry->next_generation > (UINT64_MAX >> 30U))
+    if (registry->next_generation > KERNEL_PID_GENERATION_MAX)
         return KERNEL_PID_STATUS_EXHAUSTED;
     kernel_pid_t number;
     enum kernel_pid_status status = kernel_pid_allocate(registry->numbers, &number);
