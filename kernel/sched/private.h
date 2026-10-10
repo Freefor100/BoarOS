@@ -230,6 +230,9 @@ struct kernel_task {
 struct kernel_scheduler {
     uint32_t initialized;
     uint32_t shutdown_waiting;
+    /* Last disposal may notify before cleanup registers: retain progress until
+     * its next stop_users scan, without mistaking it for user quiescence. */
+    uint32_t shutdown_progress;
     uint64_t kernel_context;
     struct kernel_cpu *cpus;
     struct kernel_task *all_tasks;
@@ -275,6 +278,8 @@ static inline void scheduler_task_borrow_end(struct kernel_task **task)
 void scheduler_task_publish_locked(struct kernel_task *);
 void scheduler_task_unlink_locked(struct kernel_task *);
 void scheduler_task_retire(struct kernel_task *);
+/* 已持调度域；资源清理已结束，跨解锁使用仍须存储borrow。 */
+void scheduler_task_retire_locked(struct kernel_task *);
 void scheduler_task_collect(void);
 void scheduler_task_claim_release_locked(struct kernel_task *);
 /* wait4 owns task storage through this call; release can expose an unconsumed

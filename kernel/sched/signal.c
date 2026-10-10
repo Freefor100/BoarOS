@@ -246,6 +246,17 @@ static struct kernel_task *signal_group_leader(
 
 static struct kernel_task *signal_group_representative_get(struct kernel_task *task)
 {
+    {
+        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        struct kernel_task *leader = task ? task->group_leader : 0;
+        if (!leader || leader->retirement || leader->group_leader != leader) return 0;
+        /* 组长可接收时，发现与取得唯一结果借用在同一保护下完成；
+         * 不另建只用来再次发现同一组长的游标owner。 */
+        if (signal_dispatchable_locked(leader)) {
+            scheduler_task_get_locked(leader);
+            return leader;
+        }
+    }
     struct scheduler_group_cursor cursor;
     scheduler_group_cursor_begin(task, &cursor);
     struct kernel_task *result = 0;
@@ -822,8 +833,20 @@ static int signal_ignored_unblocked(const struct kernel_task *target,
             signal_default_action(sig) == KERNEL_SIGNAL_DEFAULT_CONTINUE);
 }
 
-static void signal_group_scope_end(struct scheduler_group_cursor *cursor)
-{ scheduler_group_cursor_end(cursor); }
+/* The caller keeps the target alive by execution or a lookup/cursor borrow.
+ * Only a distinct group container needs another cross-unlock storage owner. */
+static struct kernel_task *signal_send_leader(struct kernel_task *target,
+                                             struct kernel_task **borrowed)
+{
+    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+    struct kernel_task *leader = target ? target->group_leader : 0;
+    if (!leader || leader->retirement || leader->group_leader != leader) return 0;
+    if (leader != target) {
+        scheduler_task_get_locked(leader);
+        *borrowed = leader;
+    }
+    return leader;
+}
 
 static enum kernel_signal_status signal_send_one(
     struct kernel_task *target, uint32_t sig, kernel_pid_t sender_tid,
@@ -839,9 +862,8 @@ static enum kernel_signal_status signal_send_one(
         sig > KERNEL_SIGNAL_COUNT) {
         return KERNEL_SIGNAL_STATUS_INVALID_ARGUMENT;
     }
-    struct scheduler_group_cursor group __attribute__((cleanup(signal_group_scope_end))) = {0};
-    scheduler_group_cursor_begin(target, &group);
-    leader = group.leader;
+    SCHEDULER_TASK_BORROW(group_owner, 0);
+    leader = signal_send_leader(target, &group_owner);
     if (leader == 0) {
         return KERNEL_SIGNAL_STATUS_INVALID_STATE;
     }

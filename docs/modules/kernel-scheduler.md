@@ -132,6 +132,14 @@ wait4的STOP/CONT报告也持临时资格，复制可以睡眠；释放资格后
 退出队头仍有事件/等待/执行owner时，reaper返回BUSY；cleanup等待真实归还通知，不将待归还借用当作可立即回收的工作。
 PID1收尾另等退休存储owner全部归还，最后释放通知已登记的cleanup；空索引不能代替页基线。
 退休元数据的最后借用在普通可信调用栈上归还页；禁止抢占的回调范围只通知已有cleanup owner，raw持有者不得触发释放。
+摘索引时pending即覆盖清理owner，retire只改变可释放资格；摘队列再将页owner交给collector，
+实际锁外归还完成后，才在调度域内减少pending。
+最后一次完成保留关机进展标记，cleanup登记前后都复查，避免通知先到而永久睡眠；
+标记只要求重新检查，下一次stop_users扫描前清除，不表示live user已结束，也不绕过retry deadline。
+2/4线程门禁握手覆盖页服务未完成及通知在检查、登记、park各窗口到达，检查注册与借用归零。
+父通知的空队列或直接token通知在域内结束，实际跨解锁的
+游标才固定父任务容器。发送信号给当前已固定的leader复用既有owner；不同leader
+仍在同一保护下取得存储借用，GROUP_DEAD容器和真实成员遍历的寿命不变。
 退出通知cleanup后再选择next；join在新栈完成点通知，避免既提前释放旧栈又丢失无timer进展。
 `make test-sched-concurrency-host`涵盖2/4线程的选择、策略竞争、查找/退休与join/reaper争用；
 `make test-sched-lifecycle-riscv test-sched-lifecycle-loongarch`在512MiB/1GiB验证真实换栈、

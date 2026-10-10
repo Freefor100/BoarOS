@@ -17,10 +17,19 @@ static struct kernel_task *selected[4];
 void *sync_test_cpu(void) { return active_cpu; }
 void *sync_test_current_task(void) { return active_cpu->current; }
 static _Thread_local unsigned group_lock_calls;
+static _Thread_local unsigned cleanup_domain_entry, complete_disposal_at;
+static void complete_held_disposal(void);
+void signal_owner_cases(unsigned *lock_calls);
 void __real_kernel_raw_lock_acquire(struct kernel_raw_lock *, struct kernel_raw_guard *);
 void __wrap_kernel_raw_lock_acquire(struct kernel_raw_lock *lock, struct kernel_raw_guard *guard)
 {
     group_lock_calls++;
+    if (complete_disposal_at && ++cleanup_domain_entry == complete_disposal_at) {
+        assert(lock == &kernel_wait_domain && !active_cpu->raw_locks);
+        assert(scheduler.cleanup_queue.registrations == (complete_disposal_at > 2));
+        complete_disposal_at = 0;
+        complete_held_disposal();
+    }
     __real_kernel_raw_lock_acquire(lock, guard);
 }
 /* STOPPED state removal is covered by real guest signals; this READY-only
@@ -59,9 +68,32 @@ struct kernel_wait_node *kernel_wait_default_node(struct kernel_task *task)
 void kernel_wait_backend_notify(struct kernel_task *task, uint32_t reason)
 { (void)task; (void)reason; }
 void kernel_wait_backend_quiesce(void) { __builtin_trap(); }
+static unsigned cleanup_parks;
+static int allow_cleanup_park;
+int kernel_wait_backend_signal(struct kernel_task *task) { (void)task; return 0; }
+uint64_t kernel_wait_backend_time(void) { return now; }
+void kernel_wait_backend_commit(struct kernel_task *task, uint64_t deadline, int interruptible)
+{
+    (void)deadline; (void)interruptible;
+    assert(task == scheduler.cleanup_task && allow_cleanup_park);
+    cleanup_parks++;
+}
+enum kernel_scheduler_status kernel_wait_backend_switch(struct kernel_task *task)
+{
+    /* The real prepare/commit/finish path is linked here. Actual old/new stack
+     * handoff has its separate host and guest tests; this shim supplies a wake. */
+    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+    struct kernel_wait_token token = {task, task->wait.generation};
+    assert(kernel_wait_notify_locked(&token, KERNEL_WAIT_WOKEN));
+    return KERNEL_SCHEDULER_STATUS_OK;
+}
 
 static unsigned disposals, notifications;
 static struct kernel_task *disposal_target;
+static int hold_disposal;
+static unsigned held_collectors;
+static pthread_t collectors[3];
+static pthread_barrier_t disposal_entered, disposal_continue;
 enum physical_page_status physical_page_release(struct physical_page_allocator *a, uint64_t address)
 {
     (void)a;
@@ -72,11 +104,113 @@ enum physical_page_status physical_page_release(struct physical_page_allocator *
         struct kernel_task *task = &tasks[address/4096 - 1];
         assert(!task->storage_borrows && task->retirement == 3);
     }
-    disposals++;
+    if (hold_disposal) {
+        pthread_barrier_wait(&disposal_entered);
+        pthread_barrier_wait(&disposal_continue);
+    }
+    __atomic_fetch_add(&disposals, 1, __ATOMIC_RELAXED);
     return PHYSICAL_PAGE_STATUS_OK;
 }
 void scheduler_task_disposal_notify(void)
-{ assert(!active_cpu->raw_locks); __atomic_fetch_add(&notifications, 1, __ATOMIC_RELAXED); }
+{
+    assert(!active_cpu->raw_locks);
+    __atomic_fetch_add(&notifications, 1, __ATOMIC_RELAXED);
+    if (scheduler.cleanup_queue.initialized == KERNEL_WAIT_QUEUE_INITIALIZED)
+        assert(kernel_wait_queue_wake_all(&scheduler.cleanup_queue) == KERNEL_SCHEDULER_STATUS_OK);
+}
+static void *collect_held_metadata(void *argument)
+{
+    active_cpu=&cpus[(uintptr_t)argument];
+    scheduler_task_collect();
+    return 0;
+}
+static void complete_held_disposal(void)
+{
+    pthread_barrier_wait(&disposal_continue);
+    for (unsigned i = 0; i < held_collectors; i++) assert(!pthread_join(collectors[i], 0));
+    hold_disposal = 0;
+}
+static void shutdown_during_disposal(unsigned threads, unsigned completion_window)
+{
+    scheduler=(struct kernel_scheduler){0};
+    kernel_raw_lock_init(&kernel_wait_domain,KERNEL_RAW_RANK_SCHEDULER);
+    for(unsigned i=0;i<threads;i++) {
+        kernel_cpu_initialize(&cpus[i],i,0);
+        cpus[i].current=&idles[i];
+    }
+    active_cpu=&cpus[0];disposal_target=0;disposals=notifications=0;
+    scheduler.cleanup_task = active_cpu->current;
+    scheduler.cleanup_task->wait.on_cpu = 1;
+    kernel_wait_queue_init(&scheduler.cleanup_queue);
+    for(unsigned i=0;i<threads-1;i++) {
+        tasks[i]=(struct kernel_task){.physical_address=(i+1)*4096,
+                                     .stack_physical_address=KERNEL_THREAD_NO_PAGE};
+        KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+        scheduler_task_unlink_locked(&tasks[i]);
+    }
+    /* Unlink stops lookup, but the cleanup/retirement owner is still alive. */
+    assert(kernel_scheduler_stop_users() == 1);
+    for (unsigned i = 0; i < threads - 1; i++) {
+        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        scheduler_task_retire_locked(&tasks[i]);
+    }
+    pthread_barrier_init(&disposal_entered,0,threads);
+    pthread_barrier_init(&disposal_continue,0,threads);
+    hold_disposal=1;
+    held_collectors = threads - 1;
+    for(unsigned i=1;i<threads;i++)assert(!pthread_create(&collectors[i-1],0,collect_held_metadata,(void *)(uintptr_t)i));
+    pthread_barrier_wait(&disposal_entered);
+    /* Each real collector has claimed a record and reached its page service,
+     * but that service has not completed. Empty indices are not quiescence. */
+    assert(kernel_scheduler_stop_users()==1);
+    assert(!disposals && !notifications);
+    /* Force last ack before the first check, before prepare, after prepare
+     * before recheck, or between recheck and park. Only real registration and
+     * domain entry count control the handshake; no random sleeps are used. */
+    cleanup_domain_entry = 0;
+    complete_disposal_at = completion_window;
+    if (!completion_window) complete_held_disposal();
+    sync_test_irq = 0;
+    allow_cleanup_park = 0;
+    cleanup_parks = 0;
+    kernel_scheduler_wait_cleanup(0);
+    assert(!complete_disposal_at && disposals==threads-1 && notifications>=1);
+    assert(!scheduler.retired_pending && !scheduler.retired_tasks);
+    assert(!cleanup_parks && !scheduler.cleanup_queue.registrations &&
+           !scheduler.cleanup_queue.borrows);
+    /* Retry retains its timed-wait contract even while progress is latched. */
+    allow_cleanup_park = 1;
+    kernel_scheduler_wait_cleanup(1);
+    assert(cleanup_parks == 1);
+    assert(kernel_scheduler_stop_users()==0);
+    /* A progress notification is not a shutdown verdict. An indexed user
+     * owner still makes the next stop/wait cycle pending, even with no retired
+     * pages; retry deadlines likewise retain the existing timed wait. */
+    tasks[0] = (struct kernel_task){.physical_address = 4096,
+                                  .stack_physical_address = KERNEL_THREAD_NO_PAGE,
+                                  .arch.user_mode = 1,
+                                  .state = KERNEL_THREAD_STATE_ZOMBIE};
+    {
+        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        scheduler_task_publish_locked(&tasks[0]);
+    }
+    assert(kernel_scheduler_stop_users()==1);
+    allow_cleanup_park = 1;
+    kernel_scheduler_wait_cleanup(0);
+    kernel_scheduler_wait_cleanup(1);
+    assert(cleanup_parks == 3 && !scheduler.cleanup_queue.registrations &&
+           !scheduler.cleanup_queue.borrows);
+    {
+        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        scheduler_task_unlink_locked(&tasks[0]);
+        scheduler_task_retire_locked(&tasks[0]);
+    }
+    scheduler_task_collect();
+    assert(!scheduler.task_count && !scheduler.all_tasks &&
+           !scheduler.retired_pending && !scheduler.retired_tasks);
+    pthread_barrier_destroy(&disposal_entered);pthread_barrier_destroy(&disposal_continue);
+    puts("shutdown waits for completed metadata page disposal");
+}
 static void lifetime_generation(void)
 {
     scheduler = (struct kernel_scheduler){0};
@@ -108,7 +242,10 @@ static void lifetime_generation(void)
     tasks[0].stack_physical_address = KERNEL_THREAD_NO_PAGE;
     tasks[0].physical_address = 4096;
     tasks[0].reaping = 1; /* selected wait event still owns its completion */
-    scheduler_task_retire(&tasks[0]);
+    {
+        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        scheduler_task_retire_locked(&tasks[0]);
+    }
     {
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
         scheduler_task_claim_release_locked(&tasks[0]);
@@ -128,7 +265,11 @@ static void lifetime_generation(void)
     struct kernel_task *fresh = scheduler_task_lookup(1, KERNEL_PID_TID, replacement.generation);
     assert(fresh == &tasks[1]);
     scheduler_task_put(fresh);
+    group_lock_calls = 0;
     scheduler_task_put(borrow);
+    /* Last put, claiming disposal and publishing completed page return stay
+     * bounded. The final domain entry acknowledges the real service owner. */
+    assert(group_lock_calls <= 3);
     assert(notifications == 0 && disposals == 1);
     scheduler_task_collect();
     assert(disposals == 1 && !scheduler.retired_pending && !scheduler.retired_tasks);
@@ -170,6 +311,14 @@ static void retired_cursor_chain(void)
     assert(disposals == 3 && !scheduler.retired_pending && !scheduler.task_count);
 }
 
+static void parent_callback(struct kernel_wait_node *node, uint32_t reason)
+{
+    struct kernel_task *parent = node->context;
+    assert(reason == KERNEL_WAIT_WOKEN && parent->storage_borrows == 1);
+    assert(parent->child_exit_queue.borrows && !active_cpu->raw_locks);
+    kernel_wait_queue_remove(node);
+}
+
 static void event_claim_handoff(void)
 {
     scheduler = (struct kernel_scheduler){0};
@@ -187,6 +336,17 @@ static void event_claim_handoff(void)
     struct kernel_wait_token parent_wait, cleanup_wait;
     assert(kernel_wait_prepare(&tasks[0].child_exit_queue, 0, 0, &parent_wait) == KERNEL_SCHEDULER_STATUS_OK);
     assert(waiter->wait.phase == KERNEL_WAIT_PREPARED && tasks[0].child_exit_queue.registrations == 1);
+    /* Empty and direct task notification stay within their protecting domain;
+     * they must not create a cursor/storage borrow that survives the unlock. */
+    group_lock_calls = 0;
+    wake_waiting_parent(child);
+    assert(group_lock_calls <= 1 && waiter->wait.phase == KERNEL_WAIT_NOTIFIED);
+    assert(!tasks[0].storage_borrows && !tasks[0].child_exit_queue.borrows);
+    assert(kernel_wait_finish(&parent_wait) == KERNEL_SCHEDULER_STATUS_OK);
+    group_lock_calls = 0;
+    wake_waiting_parent(child);
+    assert(group_lock_calls <= 1);
+    assert(kernel_wait_prepare(&tasks[0].child_exit_queue, 0, 0, &parent_wait) == KERNEL_SCHEDULER_STATUS_OK);
     /* While the first copy sleeps, exit is published and the worker registers. */
     {
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
@@ -213,6 +373,12 @@ static void event_claim_handoff(void)
     assert(kernel_wait_finish(&parent_wait) == KERNEL_SCHEDULER_STATUS_OK);
     assert(!scheduler.cleanup_queue.registrations && !tasks[0].child_exit_queue.registrations);
     assert(!waiter->wait.borrows && !tasks[0].storage_borrows);
+    struct kernel_wait_node callback_node;
+    kernel_wait_node_init_callback(&callback_node, parent_callback, &tasks[0]);
+    kernel_wait_queue_add(&tasks[0].child_exit_queue, &callback_node);
+    wake_waiting_parent(child);
+    assert(!tasks[0].storage_borrows && !tasks[0].child_exit_queue.borrows);
+    assert(!tasks[0].child_exit_queue.registrations && !callback_node.references);
     puts("wait-event claim release hands off to registered waiter and reaper");
 }
 
@@ -630,9 +796,15 @@ static void concurrent_claim(unsigned count)
 
 int main(void)
 {
+    for (unsigned threads = 2; threads <= 4; threads += 2) {
+        shutdown_during_disposal(threads, 0);
+        for (unsigned window = 2; window <= 4; window++)
+            shutdown_during_disposal(threads, window);
+    }
     lifetime_generation();
     retired_cursor_chain();
     event_claim_handoff();
+    signal_owner_cases(&group_lock_calls);
     group_exit_work();
     concurrent_retirement(2);
     concurrent_retirement(4);

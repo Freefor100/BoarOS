@@ -1980,7 +1980,7 @@ test-scheduler-handoff-host:
 .PHONY: test-sched-concurrency-host
 test-sched-concurrency-host:
 	@mkdir -p build/host
-	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -Itests/host/sync -idirafter include tests/host/sched_concurrency.c kernel/cpu.c kernel/raw_lock.c kernel/sched/park.c kernel/sched/scheduling.c kernel/sched/lifetime.c kernel/sched/identity.c kernel/sched/process.c kernel/pid.c kernel/sched/policy.c kernel/sched/runqueue.c -Wl,--gc-sections,--wrap=kernel_sched_policy_charge,--wrap=kernel_sched_policy_set,--wrap=kernel_raw_lock_acquire -o build/host/sched-concurrency
+	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -Itests/host/sync -idirafter include tests/host/sched_concurrency.c tests/host/signal_owner.c kernel/cpu.c kernel/raw_lock.c kernel/sched/park.c kernel/sched/scheduling.c kernel/sched/lifetime.c kernel/sched/identity.c kernel/sched/process.c kernel/pid.c kernel/sched/policy.c kernel/sched/runqueue.c -Wl,--gc-sections,--wrap=kernel_sched_policy_charge,--wrap=kernel_sched_policy_set,--wrap=kernel_raw_lock_acquire -o build/host/sched-concurrency
 	build/host/sched-concurrency
 
 test-riscv: test-scheduler-handoff-riscv

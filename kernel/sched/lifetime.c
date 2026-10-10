@@ -117,42 +117,57 @@ void scheduler_task_unlink_locked(struct kernel_task *task)
         scheduler.task_count--;
     }
     else if (task->all_next || task->all_previous) __builtin_trap();
+    /* 摘索引即把存储owner交给清理者；retire只改变可释放资格，不能在
+     * 两个阶段间把真实owner漏出关机计数。 */
+    if (scheduler.retired_pending == UINT64_MAX) __builtin_trap();
+    scheduler.retired_pending++;
     task->retirement = 1;
+}
+
+void scheduler_task_retire_locked(struct kernel_task *task)
+{
+    /* The trusted reaper/rollback has finished real resource cleanup. */
+    domain_owned();
+    if (task->retirement != 1 || !scheduler.retired_pending ||
+        task->stack_physical_address != KERNEL_THREAD_NO_PAGE ||
+        task->wait.on_cpu || task->wait.borrows || task->wait.nodes || task->wait.phase != KERNEL_WAIT_FINISHED)
+        __builtin_trap();
+    task->retirement = 2;
+    queue_disposal_locked(task);
 }
 
 void scheduler_task_retire(struct kernel_task *task)
 {
-    /* The trusted reaper/rollback has finished real resource cleanup. */
     KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-    if (task->retirement != 1 || task->stack_physical_address != KERNEL_THREAD_NO_PAGE ||
-        task->wait.on_cpu || task->wait.borrows || task->wait.nodes || task->wait.phase != KERNEL_WAIT_FINISHED)
-        __builtin_trap();
-    task->retirement = 2;
-    scheduler.retired_pending++;
-    queue_disposal_locked(task);
+    scheduler_task_retire_locked(task);
 }
 
 void scheduler_task_collect(void)
 {
-    int released = 0, notify = 0;
+    int notify = 0, completed = 0;
     for (;;) {
         struct kernel_task *task;
         {
             KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-            task = scheduler.retired_tasks;
-            if (!task) {
-                notify = released && scheduler.shutdown_waiting && !scheduler.retired_pending;
-                break;
+            /* 摘队列只转移给本次collector；页服务尚未完成时仍有owner。
+             * 上一次实际归还结束后才发布计数，并与下一次摘取合并。 */
+            if (completed) {
+                if (!scheduler.retired_pending) __builtin_trap();
+                scheduler.retired_pending--;
+                completed = 0;
+                notify = scheduler.shutdown_waiting && !scheduler.retired_pending;
+                if (notify) scheduler.shutdown_progress = 1;
             }
+            task = scheduler.retired_tasks;
+            if (!task) break;
             scheduler.retired_tasks = task->retired_next;
             if (!scheduler.retired_pending) __builtin_trap();
-            scheduler.retired_pending--;
             if (task->retirement != 3 || task->storage_borrows || task->wait.on_cpu)
                 __builtin_trap();
         }
         /* No rank40 lock may be held while the allocator consumes the page. */
         (void)physical_page_release(scheduler.allocator, task->physical_address);
-        released = 1;
+        completed = 1;
     }
     /* PID1 teardown may be waiting for a borrowed retired record even after
      * user indices are empty. Ordinary inline disposal needs no worker turn. */

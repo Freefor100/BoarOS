@@ -510,12 +510,18 @@ static void child_remove(struct kernel_task *parent, struct kernel_task *child)
 void wake_waiting_parent(struct kernel_task *child)
 {
     SCHEDULER_TASK_BORROW(parent, 0);
+    struct kernel_wait_cursor cursor;
+    int notify = 0;
     {
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-        parent = child->parent;
-        if (parent) scheduler_task_get_locked(parent);
+        struct kernel_task *target = child->parent;
+        if (target) {
+            notify = kernel_wait_cursor_prepare_locked(&target->child_exit_queue, &cursor, 1);
+            /* 空队列/单任务通知已在域内结束；只有跨解锁的游标才需固定容器。 */
+            if (notify) { scheduler_task_get_locked(target); parent = target; }
+        }
     }
-    if (parent) (void)kernel_wait_queue_wake_all(&parent->child_exit_queue);
+    if (notify) kernel_wait_cursor_wake(&cursor, 1);
 }
 
 /* Notifies a vfork-suspended parent that the child released its shared
@@ -1036,6 +1042,9 @@ static enum kernel_scheduler_status reap_waited_child(
         child->exec_transaction != 0) {
         return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
     }
+    /* Selected zombie has a unique wait claim and a real storage borrow.
+     * Scratch disposal stays outside rank40, before the retirement transaction. */
+    kernel_task_release_io_scratch(child);
     {
     KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
     parent->group_leader->child_user_ticks += user_ticks;
@@ -1053,12 +1062,13 @@ static enum kernel_scheduler_status reap_waited_child(
     child->publish_completion = 0U;
     struct kernel_wait_cursor unused;
     if (scheduler_forget_task_locked(child, &unused)) __builtin_trap();
+    if (!child->storage_borrows) __builtin_trap();
+    scheduler_task_retire_locked(child);
     }
     process_identity_collect();
     (void)kernel_wait_queue_wake_all(&parent->group_leader->child_exit_queue);
-    kernel_task_release_io_scratch(child);
-    scheduler_task_retire(child);
-    scheduler_task_collect();
+    /* The selected borrow still prevents disposal. Its last put (or the
+     * remaining lookup owner) collects the record after the event claim ends. */
 
     if (status_address != 0U) {
         access_status = kernel_copy_to_user(&parent->mm,
@@ -1315,7 +1325,8 @@ void kernel_scheduler_register_cleanup(void)
 static int cleanup_waiting(uint64_t retry_deadline)
 {
     KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-    return !scheduler_cleanup_ready_locked() || retry_deadline;
+    return retry_deadline ||
+        (!scheduler.shutdown_progress && !scheduler_cleanup_ready_locked());
 }
 
 void kernel_scheduler_wait_cleanup(uint64_t retry_deadline)
@@ -1372,6 +1383,13 @@ int kernel_scheduler_reap_pending(void)
 int kernel_scheduler_stop_users(void)
 {
     int pending = 0;
+    {
+        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        /* 本次扫描重查真实owner。清掉旧进展后，末项释放若先于等待登记
+         * 完成，仍可由登记前/后的条件复查观察到；唤醒本身不是持久事件。 */
+        scheduler.shutdown_waiting = 1;
+        scheduler.shutdown_progress = 0;
+    }
     struct scheduler_task_cursor cursor;
     scheduler_task_cursor_begin(&cursor);
     while (cursor.task) {
@@ -1390,7 +1408,6 @@ int kernel_scheduler_stop_users(void)
     }
     {
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-        scheduler.shutdown_waiting = 1;
         pending |= scheduler.retired_pending != 0;
     }
     return pending;
