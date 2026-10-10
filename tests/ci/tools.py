@@ -64,6 +64,22 @@ def restore(names, label):
     return {row[1]: row[4] for row in selected}
 
 
+def verify_tool_commands(arch, directory):
+    binary = directory / ('usr/bin' if arch == 'riscv' else 'bin')
+    prefix = 'riscv64-linux-gnu-' if arch == 'riscv' else 'loongarch64-unknown-linux-gnu-'
+    # 文件身份不能证明宿主动态依赖齐全；在导出PATH、保存缓存前实际启动工具。
+    for suffix in ('gcc', 'as', 'ld', 'ar', 'objdump', 'readelf'):
+        command = binary / (prefix + suffix)
+        try:
+            result = subprocess.run([str(command), '--version'], stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT, text=True, timeout=15)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise RuntimeError(f'CI tool cannot start: {command}: {error}') from error
+        if result.returncode:
+            raise RuntimeError(f'CI tool cannot start: {command}: exit {result.returncode}: {result.stdout.strip()}')
+        print(f'CI tool executable: {command}: {result.stdout.splitlines()[0]}', flush=True)
+
+
 def prepare_tools(arch):
     directory = ROOT / 'build/tools' / arch
     selected = {row[1]: row[4] for row in rows() if row[1] in PACKAGES[arch]}
@@ -91,6 +107,7 @@ def prepare_tools(arch):
             'inputs': expected, 'installation': installation(staging)}, indent=2) + '\n')
         staging.rename(directory)
     checked_inputs(arch, directory)
+    verify_tool_commands(arch, directory)
     return directory
 
 

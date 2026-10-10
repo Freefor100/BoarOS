@@ -31,7 +31,12 @@ def main():
     parser.add_argument('--arch',choices=tuple(PROFILES),default='riscv')
     parser.add_argument('--memory',choices=('512M','1G'),action='append')
     parser.add_argument('--kernel',type=Path);parser.add_argument('--qemu')
+    parser.add_argument('--cc',help='raw supervisor compiler selected by Make')
     args=parser.parse_args();profile=PROFILES[args.arch];qemu=args.qemu or profile.qemu
+    compiler=args.cc or (shutil.which('riscv64-unknown-elf-gcc') if args.arch=='riscv' else None) or profile.compiler
+    compiler_path=Path(shutil.which(compiler) or compiler).resolve()
+    compiler_identity={'path':str(compiler_path),'sha256':sha(compiler_path),
+        'version':subprocess.check_output([compiler,'--version'],text=True).splitlines()[0]}
     work=Path(tempfile.mkdtemp(prefix='sqlite-run.',dir=ROOT/'build'/args.arch))
     if args.arch=='loongarch':
         paths={name:ROOT/'build/loongarch'/name for name in ('sqlite-rollback','sqlite3-static','sqlite3-dynamic','sqlite-cli-init')}
@@ -48,13 +53,13 @@ def main():
     inputs=ROOT/'references/sqlite/sqlite-amalgamation-3530400.zip'
     pin=next(row.split('\t')[4] for row in (ROOT/'references/sources.tsv').read_text().splitlines() if row.startswith('file\tsqlite/sqlite-amalgamation-3530400.zip\t'))
     if sha(inputs)!=pin:raise RuntimeError('SQLite original archive identity mismatch')
-    identity={'arch':args.arch,'archive':pin,'elfs':{name:sha(path) for name,path in paths.items()},'loader':sha(loader),'qemu':sha(shutil.which(qemu) or qemu),'runs':[]}
+    identity={'arch':args.arch,'archive':pin,'elfs':{name:sha(path) for name,path in paths.items()},'loader':sha(loader),'qemu':sha(shutil.which(qemu) or qemu),'supervisor_compiler':compiler_identity,'runs':[]}
     disk=harness.fixture(work,paths['sqlite-rollback'])
     for name in ('sqlite3-static','sqlite3-dynamic'):install(disk,'/'+name,paths[name])
     debugfs(disk,'mkdir /lib');install(disk,'/lib/'+loader_name,loader)
     debugfs(disk,'symlink /lib/libc.so /lib/'+loader_name)
     supervisor=work/'supervisor';initrd=work/'initramfs.gz'
-    subprocess.run([profile.compiler,*profile.raw_flags,'-O2','-DEXPECTED_EXIT_STATUS=42',
+    subprocess.run([compiler,*profile.raw_flags,'-O2','-DEXPECTED_EXIT_STATUS=42',
         *(['-DROOT_DIRECT_FILESYSTEM'] if args.arch=='riscv' else []),
         '-ffreestanding','-fno-builtin','-fno-stack-protector','-nostdlib','-nostartfiles',
         '-static','-no-pie','-Wl,--build-id=none',f'-Wl,-z,max-page-size={profile.page_size}',

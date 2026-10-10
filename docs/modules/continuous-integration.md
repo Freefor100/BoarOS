@@ -64,6 +64,16 @@ python3 -B tests/ci/run.py --arch loongarch --suite platform
 RV 的 sysroot 指向包内 `usr/riscv64-linux-gnu`，保留原 libc 链接脚本和 CRT，
 不改库内容。整个安装的内容、权限和链接目标另有缓存指纹。
 
+固定工具包的字节校验不代替宿主可执行检查。准备器在导出PATH和保存工具缓存前，
+实际启动两侧的gcc/as/ld/ar/objdump/readelf；缺少宿主动态库、不可执行或超时直接
+使环境准备失败。Ubuntu显式安装`libdebuginfod1`，满足原RV binutils的
+`libdebuginfod.so.1`依赖，不修改固定工具二进制或客体libc。
+
+SQLite DELETE的raw supervisor使用Make实际选择的`CC`，经
+`SQLITE_SUPERVISOR_CC`和`--cc`传入共用runner，并记录路径、版本与SHA。
+直接调用runner时，RV优先使用可用的`riscv64-unknown-elf-gcc`；显式`--cc`
+不会因路径错误而静默回退。用户SQLite ELF及musl loader仍由原构建接口提供。
+
 RV 原回归仍用 Ubuntu 的交叉工具；平台测试先从固定源码构建完整 BusyBox，
 所需 Linux 6.6 UAPI 与测试源码均按参考清单恢复。编译 runner 检测实际 wrapper
 是否支持 `-fno-link-libatomic`，不把本机新 GCC 的选项强加给旧工具。环境 shell
