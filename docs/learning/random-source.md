@@ -34,3 +34,10 @@ ELF的Linux/BoarOS、512MiB/1GiB对照；实际DMA/任务/栈OOM及IRQ失败返�
 单用generic loader的reset写入又被稍后的ROM reset覆盖，实际对照仍ready；
 最后在已完成machine reset、vCPU尚未执行时，经GDB验证并NOP掉整个seed property。
 这只改变本轮RNG实验的公开固件输入，正常启动种子策略及固定内核/libc均未改变。
+
+在途停止的两端需要显式交接：EGD请求由QEMU异步发送，内核已提交descriptor
+不代表宿主已经读到请求。用户打印后立即退出会使合法停止与宿主事件读取竞速；
+托管LA/1GiB曾以请求计数1、可信字节0、正常退出42和owner归还触发该测试误判。
+探针现在等待console放行；runner只有在观察到真实EGD请求及等待标记后才放行，
+一直不返回熵。两侧同一ELF使用该握手，超时仍失败，不以延长sleep或重试隐藏竞争。
+`make test-ci-host`保护两种事件到达顺序，真实验证仍由双架构RNG入口执行。

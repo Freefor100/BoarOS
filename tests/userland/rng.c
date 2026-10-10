@@ -65,6 +65,11 @@ int main(void)
         return 42;
     }
     if (mode == 's') {
+        char acknowledgement;
+        puts("rng: stop waiting");
+        /* 宿主观察到真实EGD请求后才放行，熵响应始终未完成。 */
+        CHECK(read(STDIN_FILENO, &acknowledgement, 1) == 1 &&
+              acknowledgement == '\n');
         puts("rng: stop pending");
         return 42;
     }

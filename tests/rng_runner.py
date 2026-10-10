@@ -74,7 +74,7 @@ def supervisor(profile,work):
     return initrd
 def run(args,profile,platform,memory,transport,mode):
     work=args.output/f'{platform}-{memory}-{transport}-{mode}';work.mkdir()
-    guest=connection=server=None;good=False
+    guest=connection=server=select=None;good=False
     try:
         kernel=Path(args.linux_kernel or profile.linux_kernel()) if platform=='Linux' else Path(args.kernel)
         shutil.copyfile(kernel,work/'kernel')
@@ -105,7 +105,8 @@ def run(args,profile,platform,memory,transport,mode):
             'program':digest(args.program),'kernel':digest(kernel),'qemu':digest(shutil.which(args.qemu) or args.qemu),
             'command':command,'seed_control':seed_control}
         (work/'identity.json').write_text(json.dumps(identity,indent=2)+'\n')
-        guest=subprocess.Popen(command,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,bufsize=0)
+        guest=subprocess.Popen(command,stdin=subprocess.PIPE if mode=='s' else subprocess.DEVNULL,
+            stdout=subprocess.PIPE,stderr=subprocess.STDOUT,bufsize=0)
         if seed_control:
             control_seed(profile,port,seed_control,work)
             (work/'identity.json').write_text(json.dumps(identity,indent=2)+'\n')
@@ -113,7 +114,7 @@ def run(args,profile,platform,memory,transport,mode):
         if server:
             server.settimeout(10);connection,_=server.accept();connection.setblocking(False)
             select.register(connection,selectors.EVENT_READ,'egd')
-        log=bytearray();requests=bytearray();released=False;total=0;end=time.monotonic()+args.timeout
+        log=bytearray();requests=bytearray();released=False;stop_confirmed=False;total=0;end=time.monotonic()+args.timeout
         while select.get_map() and time.monotonic()<end:
             for key,_ in select.select(.1):
                 data=key.fileobj.recv(4096) if key.data=='egd' else key.fileobj.read(4096)
@@ -127,6 +128,9 @@ def run(args,profile,platform,memory,transport,mode):
                 if mode=='d' and total and b'rng: computation progressed' in log and not released:
                     assert b'rng: unready' in log and b'rng: waiter ready' not in log
                     connection.sendall(bytes(i%251 for i in range(total)));released=True
+                if mode=='s' and total and b'rng: stop waiting' in log and not stop_confirmed:
+                    # 确认后端已有真实请求，仍扣住熵；只允许用户开始在途退出。
+                    guest.stdin.write(b'\n');guest.stdin.flush();stop_confirmed=True
             if guest.poll() is not None:break
         guest.wait(timeout=2)
         # process exit does not consume bytes already buffered in the stdout pipe.
@@ -137,18 +141,22 @@ def run(args,profile,platform,memory,transport,mode):
         if platform=='Linux':assert ('Linux '+('LA' if profile.name=='loongarch' else 'RV')+' root application passed') in output,output
         else:assert profile.root_success(output,42),output
         if mode=='d':assert released and 'rng: delayed ready' in output,output
-        elif mode=='s':assert total and 'rng: stop pending' in output,output
+        elif mode=='s':assert stop_confirmed and total and 'rng: stop pending' in output,output
         elif mode=='a':assert 'rng: absent boot ok' in output and 'rng: unready wait interrupted' in output,output
         else:assert 'rng: ready' in output,output
         if platform=='BoarOS' and profile.name=='riscv':quiet(['python3','-B',ROOT/'tests/check-stack-report.py',work/'guest.log'])
         if digest(args.program)!=identity['program'] or digest(kernel)!=identity['kernel']:raise RuntimeError('RNG input changed during run')
         (work/'result.json').write_text(json.dumps({'qemu_exit':guest.returncode,'user_exit':42,
             'completed':True,'pass':True,'released_entropy':released,'egd_requested':total,
+            'stop_request_confirmed':stop_confirmed,
             'root_owner_checked':platform=='BoarOS'},indent=2)+'\n')
         scope='ELF/exit and root mount lifecycle' if platform=='Linux' else 'ELF/exit and page/heap/stack/device owners'
         good=True;print(f'RNG {profile.name}/{platform}/{memory}/{transport} mode={mode}: {scope} PASS',flush=True)
     finally:
         if guest and guest.poll() is None:guest.kill();guest.wait()
+        if guest and guest.stdin:guest.stdin.close()
+        if guest and guest.stdout:guest.stdout.close()
+        if select:select.close()
         if connection:connection.close()
         if server:server.close()
         if good:
