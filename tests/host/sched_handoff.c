@@ -43,7 +43,11 @@ static void setup(int policy, int priority, int next_priority)
     peer.scheduling.priority = next_priority;
     kernel_sched_enqueue(&scheduler.runqueue, &peer.ready_node, &peer,
                          (unsigned)next_priority, 0);
-    kernel_rt_bandwidth_init(&scheduler.rt_bandwidth, 1);
+    struct kernel_rt_bandwidth initial_budget;
+    kernel_rt_bandwidth_init(&initial_budget, 1);
+    scheduler.rt_configuration = (struct kernel_rt_configuration){
+        .period_ns = initial_budget.period_ns, .runtime_ns = initial_budget.runtime_ns };
+    scheduler_cpu_initialize(&cpu, &scheduler.boot_idle, 1);
     switches = 0;
     selected = 0;
     sync_test_irq = 0;
@@ -72,13 +76,13 @@ int main(void)
     assert(scheduler_reschedule(0, 0) == KERNEL_SCHEDULER_STATUS_OK);
     assert(switches == 1 && selected == &peer && running.wait.ready_head == 1);
     setup(KERNEL_SCHED_FIFO, 50, 0);
-    scheduler.rt_bandwidth.consumed_ns = (uint64_t)scheduler.rt_bandwidth.runtime_ns;
+    cpu.rt_bandwidth.consumed_ns = (uint64_t)cpu.rt_bandwidth.runtime_ns;
     assert(scheduler_reschedule(0, 0) == KERNEL_SCHEDULER_STATUS_OK);
     assert(switches == 1 && selected == &peer);
     setup(KERNEL_SCHED_OTHER, 0, 0);
-    scheduler.idle.wait.on_cpu = 1;
-    cpu.current = &scheduler.idle;
+    scheduler.boot_idle.wait.on_cpu = 1;
+    cpu.current = &scheduler.boot_idle;
     assert(scheduler_reschedule(0, 0) == KERNEL_SCHEDULER_STATUS_OK);
-    assert(switches == 1 && selected == &peer && scheduler.idle_context_saved);
+    assert(switches == 1 && selected == &peer && cpu.idle_context_saved);
     puts("scheduler handoff: FIFO/RR lower/equal/higher, throttling and idle passed");
 }

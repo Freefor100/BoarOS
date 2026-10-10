@@ -87,9 +87,9 @@ ready 策略直接选择下一任务。退出栈只切离，回收仍由 worker 
 `test-scheduler-cases-riscv` 在未启动 timer 时验证退出、join 和清理的连续进展，
 以及除启动 owner 所持 cleanup worker 外的页回到基线。
 
-全局预算默认 period=1,000,000us、runtime=950,000us，仅运行中的 FIFO/RR 扣费，阻塞及 idle 不扣。周期补充不积累旧余额；runtime=-1 禁用节流，0 不允许运行 RT。控制更新在 IRQ 临界区先结算旧配置下的实际运行，校验 period>0、runtime>=-1 且 runtime<=period（-1除外）、两值均不超过 INT_MAXus。runtime 修改不清消费；相同 period 写入不重开周期，改变 period 时从当前时刻建立新长度但保留已消费值。proc 控件见 [procfs](procfs.md)。
+全局预算配置默认 period=1,000,000us、runtime=950,000us，消费量和结算起点按CPU保存；仅运行中的 FIFO/RR 扣费，阻塞及 idle 不扣。周期补充不积累旧余额；runtime=-1 禁用节流，0 不允许运行 RT。控制更新在调度短锁内先结算各CPU在旧配置下的实际运行，校验 period>0、runtime>=-1 且 runtime<=period（-1除外）、两值均不超过 INT_MAXus。runtime 修改不清消费；相同 period 写入不重开周期，改变 period 时从当前时刻建立新长度但保留已消费值。proc 控件见 [procfs](procfs.md)。
 
-硬件 timer 取普通 tick、RT 配额耗尽/补充和 RR 片尾中的最早期限。预算 IRQ 可以返回 elapsed_ticks=0；此时仍重新记账调度，但不推进 tick、CPU tick 统计或 coarse clock。实际运行时间由切换、策略/配置修改和 timer 入口结算，精度受关中断临界区与模拟器 IRQ 延迟限制。用户访问复制与可睡眠路径不放在调度状态锁内。
+硬件 timer 的最后编程期限由当前CPU持有，取普通 tick、该CPU的RT配额耗尽/补充和当前任务RR片尾中的最早期限。预算 IRQ 可以返回 elapsed_ticks=0；此时仍重新记账调度，但不推进 tick、CPU tick 统计或 coarse clock。实际运行时间由切换、策略/配置修改和 timer 入口结算，精度受关中断临界区与模拟器 IRQ 延迟限制。用户访问复制与可睡眠路径不放在调度状态锁内。
 
 sched_setparam/setscheduler/getparam/getscheduler、priority_min/max、rr_get_interval 和 CPU0 affinity 使用真实任务状态；未发布 child 不可被按 TID 查询。BATCH/IDLE/DEADLINE/EXT 的 min/max 查询按固定 Linux 返回 0，设置这些策略仍显式拒绝。RESET_ON_FORK 在子任务清除并将继承的 RT 变为 OTHER；exec 保留执行线程的策略。没有实现 nice 调度、SMP、cgroup 配额或 deadline scheduler。
 
@@ -244,7 +244,7 @@ pipe/proc状态双握手确认，覆盖同期限、提前信号、默认信号�
 | 跨核raw短锁 | 共享状态和内存序；不得持锁阻塞、I/O或调用会等待的分配路径 | raw_lock.h的32位acquire/release原子字、CPU guard链与rank/key序 |
 | 可睡眠对象锁 | 任务guard、rank/key、资格交接和对象owner跨睡眠存活 | 内部raw30→调度raw40；业务数据仍由guard或原单CPU纪律负责 |
 
-内核tp仍指向任务，架构前缀之后的CPU关联供当前CPU查询；current与need_resched由CPU记录持有。
+内核tp仍指向任务，架构前缀之后的CPU关联供当前CPU查询；current、need_resched、idle归属/恢复状态、退出丢弃上下文、运行结算及timer期限由CPU记录持有；RR剩余片跟随任务。
 启动任务与idle显式绑定，RV采用固件hart ID并在高地址重定位后重绑，LA读取CPUID CSR。
 bootstrap I/O上下文与任务I/O上下文分开，任务guard和回收深度不迁入CPU。raw guard必须按LIFO由同CPU释放，
 递归、逆序、错误owner和计数损坏fatal；block/yield/退出及可睡眠锁获取拒绝禁止抢占上下文。

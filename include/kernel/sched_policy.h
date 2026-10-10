@@ -15,6 +15,10 @@ struct kernel_rt_bandwidth {
     uint64_t period_ns, period_start_ns, consumed_ns, last_account_ns;
     int64_t runtime_ns;
 };
+struct kernel_rt_configuration {
+    uint64_t period_ns;
+    int64_t runtime_ns;
+};
 int kernel_sched_policy_set(struct kernel_sched_policy *state,
                             int policy, int priority, int keep_policy);
 void kernel_sched_policy_fork(struct kernel_sched_policy *child,

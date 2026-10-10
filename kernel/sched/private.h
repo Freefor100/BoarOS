@@ -220,9 +220,8 @@ struct kernel_task {
 
 struct kernel_scheduler {
     uint32_t initialized;
-    uint32_t idle_context_saved;
     uint64_t kernel_context;
-    uint64_t idle_ticks;
+    struct kernel_cpu *cpus;
     struct kernel_task *all_tasks;
     uint64_t loads[3], load_ticks;
     struct kernel_pid_registry identities;
@@ -230,22 +229,20 @@ struct kernel_scheduler {
     struct physical_page_allocator *allocator;
     struct kernel_pid_allocator pid_allocator;
     uint64_t pid_bitmap[KERNEL_PID_BITMAP_WORDS(KERNEL_PID_LIMIT)];
-    struct kernel_task idle;
+    struct kernel_task boot_idle;
     struct kernel_task *cleanup_task;
     struct kernel_wait_queue cleanup_queue;
     struct kernel_sched_runqueue runqueue;
-    struct kernel_rt_bandwidth rt_bandwidth;
+    struct kernel_rt_configuration rt_configuration;
     struct kernel_task *exited_head;
     struct kernel_task *exited_tail;
     struct kernel_task *blocked_head;
     struct kernel_task *blocked_tail;
     struct kernel_task *deadline_root;
-    uint64_t armed_deadline; /* Last deadline handed to the hardware timer. */
     struct kernel_task *stopped_head;
     struct kernel_task *stopped_tail;
     struct kernel_task *init_task;
     enum kernel_scheduler_status fatal_status;
-    struct arch_switch_context discard_context;
     struct kernel_stack_statistics stack_statistics;
 };
 
@@ -283,6 +280,8 @@ struct kernel_task *ready_best(void);
 void ready_remove(struct kernel_task *task);
 void ready_enqueue(struct kernel_task *task, int head);
 void scheduler_account_runtime(void);
+void scheduler_cpu_initialize(struct kernel_cpu *cpu, struct kernel_task *idle,
+                              uint64_t now_ns);
 void scheduler_rearm_timer(void);
 enum kernel_scheduler_status scheduler_reschedule(int rotate_other, int voluntary);
 void ready_append(struct kernel_task *thread);

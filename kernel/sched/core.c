@@ -99,7 +99,7 @@ static enum kernel_scheduler_status validate_thread(
         return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
     }
     if (thread->idle != 0U) {
-        if (thread != &scheduler.idle ||
+        if (thread != kernel_cpu_current()->idle ||
             expected_state != KERNEL_THREAD_STATE_IDLE ||
             thread->physical_address != KERNEL_THREAD_NO_PAGE ||
             thread->stack_low >= thread->stack_high ||
@@ -397,10 +397,10 @@ enum kernel_scheduler_status scheduler_switch_current_away(struct kernel_task *p
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
         if (cpu->switch_previous || !previous->wait.on_cpu) __builtin_trap();
         next = ready_best_locked();
-        if (!next) next = &scheduler.idle;
+        if (!next) next = kernel_cpu_current()->idle;
         if (next == previous) return KERNEL_SCHEDULER_STATUS_OK;
         if (next->wait.on_cpu) __builtin_trap();
-        if (next != &scheduler.idle) {
+        if (next != kernel_cpu_current()->idle) {
             ready_remove_locked(next);
             next->state = KERNEL_THREAD_STATE_RUNNING;
         }
@@ -697,53 +697,58 @@ enum kernel_scheduler_status kernel_scheduler_init(
     if (kernel_heap_init(&scheduler.identity_heap, allocator, identity_heap_address)
             != KERNEL_HEAP_STATUS_OK) return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
     scheduler.kernel_context = kernel_context;
-    scheduler.idle.arch.kernel_sp = idle_stack_high;
-    scheduler.idle.cpu = kernel_cpu_current();
-    scheduler.idle.arch.user_sp = 0U;
-    scheduler.idle.arch.user_mode = 0U;
-    arch_thread_set_mm(&scheduler.idle.arch, scheduler.kernel_context);
-    scheduler.idle.magic = KERNEL_THREAD_MAGIC;
-    scheduler.idle.physical_address = KERNEL_THREAD_NO_PAGE;
-    scheduler.idle.stack_physical_address = KERNEL_THREAD_NO_PAGE;
-    scheduler.idle.stack_low = idle_stack_low;
-    scheduler.idle.stack_high = idle_stack_high;
-    scheduler.idle.next = 0;
-    scheduler.idle.parent = 0;
-    scheduler.idle.first_child = 0;
-    scheduler.idle.last_child = 0;
-    scheduler.idle.previous_sibling = 0;
-    scheduler.idle.next_sibling = 0;
-    kernel_wait_record_init(&scheduler.idle.wait);
-    scheduler.idle.wait.on_cpu = 1;
-    scheduler.idle.state = KERNEL_THREAD_STATE_IDLE;
-    scheduler.idle.idle = 1U;
-    scheduler.idle.tid = 0;
-    scheduler.idle.tid_owned = 0U;
-    scheduler.idle.publish_completion = 0U;
-    scheduler.idle.wait_status = 0U;
-    scheduler.idle.group_leader = 0;
-    scheduler.idle.group_members = 0U;
-    scheduler.idle.completion.kind = KERNEL_THREAD_KIND_KERNEL;
-    scheduler.idle.completion.reason = KERNEL_THREAD_EXIT_RETURNED;
-    scheduler.idle.completion.tid = 0;
-    scheduler.idle.completion.tgid = 0;
-    scheduler.idle.completion.status = 0U;
-    scheduler.idle.completion.detail = 0U;
+    scheduler.boot_idle.arch.kernel_sp = idle_stack_high;
+    scheduler.boot_idle.cpu = kernel_cpu_current();
+    scheduler.boot_idle.arch.user_sp = 0U;
+    scheduler.boot_idle.arch.user_mode = 0U;
+    arch_thread_set_mm(&scheduler.boot_idle.arch, scheduler.kernel_context);
+    scheduler.boot_idle.magic = KERNEL_THREAD_MAGIC;
+    scheduler.boot_idle.physical_address = KERNEL_THREAD_NO_PAGE;
+    scheduler.boot_idle.stack_physical_address = KERNEL_THREAD_NO_PAGE;
+    scheduler.boot_idle.stack_low = idle_stack_low;
+    scheduler.boot_idle.stack_high = idle_stack_high;
+    scheduler.boot_idle.next = 0;
+    scheduler.boot_idle.parent = 0;
+    scheduler.boot_idle.first_child = 0;
+    scheduler.boot_idle.last_child = 0;
+    scheduler.boot_idle.previous_sibling = 0;
+    scheduler.boot_idle.next_sibling = 0;
+    kernel_wait_record_init(&scheduler.boot_idle.wait);
+    scheduler.boot_idle.wait.on_cpu = 1;
+    scheduler.boot_idle.state = KERNEL_THREAD_STATE_IDLE;
+    scheduler.boot_idle.idle = 1U;
+    scheduler.boot_idle.tid = 0;
+    scheduler.boot_idle.tid_owned = 0U;
+    scheduler.boot_idle.publish_completion = 0U;
+    scheduler.boot_idle.wait_status = 0U;
+    scheduler.boot_idle.group_leader = 0;
+    scheduler.boot_idle.group_members = 0U;
+    scheduler.boot_idle.completion.kind = KERNEL_THREAD_KIND_KERNEL;
+    scheduler.boot_idle.completion.reason = KERNEL_THREAD_EXIT_RETURNED;
+    scheduler.boot_idle.completion.tid = 0;
+    scheduler.boot_idle.completion.tgid = 0;
+    scheduler.boot_idle.completion.status = 0U;
+    scheduler.boot_idle.completion.detail = 0U;
 #if BOAROS_COST_DIAGNOSTICS
-    scheduler.idle.cost.wait_flags = 128;
+    scheduler.boot_idle.cost.wait_flags = 128;
 #endif
-    kernel_cpu_current()->current = &scheduler.idle;
+    kernel_cpu_current()->current = &scheduler.boot_idle;
     scheduler.cleanup_task = 0;
     kernel_wait_queue_init(&scheduler.cleanup_queue);
     memset(&scheduler.runqueue, 0, sizeof(scheduler.runqueue));
-    kernel_rt_bandwidth_init(&scheduler.rt_bandwidth, kernel_time_monotonic_ns());
+    uint64_t now = kernel_time_monotonic_ns();
+    struct kernel_rt_bandwidth initial_budget;
+    kernel_rt_bandwidth_init(&initial_budget, now);
+    scheduler.rt_configuration = (struct kernel_rt_configuration){
+        .period_ns = initial_budget.period_ns, .runtime_ns = initial_budget.runtime_ns };
+    scheduler_cpu_initialize(kernel_cpu_current(), &scheduler.boot_idle, now);
     (void)kernel_cpu_consume_schedule(kernel_cpu_current());
     scheduler.exited_head = 0;
     scheduler.exited_tail = 0;
     scheduler.blocked_head = 0;
     scheduler.blocked_tail = 0;
     scheduler.deadline_root = 0;
-    scheduler.armed_deadline = 0;
+    kernel_cpu_current()->armed_deadline = 0;
     kernel_stack_slots_reset();
     scheduler.stopped_head = 0;
     scheduler.stopped_tail = 0;
@@ -753,9 +758,9 @@ enum kernel_scheduler_status kernel_scheduler_init(
     scheduler.stack_statistics.minimum_free_bytes =
         KERNEL_STACK_BYTES - KERNEL_STACK_GUARD_BYTES;
     scheduler.stack_statistics.maximum_used_bytes = 0U;
-    scheduler.idle_context_saved = 0U;
+    kernel_cpu_current()->idle_context_saved = 0U;
     scheduler.initialized = KERNEL_SCHEDULER_INITIALIZED;
-    arch_current_thread_set(&scheduler.idle);
+    arch_current_thread_set(kernel_cpu_current()->idle);
     return KERNEL_SCHEDULER_STATUS_OK;
 }
 
@@ -1122,8 +1127,8 @@ void kernel_scheduler_charge_ticks(uint64_t elapsed_ticks, int from_user)
 {
     struct kernel_task *current = kernel_cpu_current()->current;
 
-    if (current == &scheduler.idle) {
-        scheduler.idle_ticks += elapsed_ticks;
+    if (current == kernel_cpu_current()->idle) {
+        kernel_cpu_current()->idle_ticks += elapsed_ticks;
         return;
     }
     if (current == 0 ||
@@ -1139,5 +1144,5 @@ void kernel_scheduler_charge_ticks(uint64_t elapsed_ticks, int from_user)
 
 uint64_t kernel_scheduler_idle_ticks(void)
 {
-    return scheduler.idle_ticks;
+    return kernel_cpu_current()->idle_ticks;
 }

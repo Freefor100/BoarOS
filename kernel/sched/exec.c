@@ -49,7 +49,7 @@ enum kernel_scheduler_status kernel_scheduler_exec_commit(void)
     thread = kernel_cpu_current()->current;
     old_tid = thread->tid;
     transaction = thread->exec_transaction;
-    if (thread == &scheduler.idle || thread->arch.user_mode != 1U ||
+    if (thread == kernel_cpu_current()->idle || thread->arch.user_mode != 1U ||
         transaction == 0 ||
         transaction->state != KERNEL_EXEC_TRANSACTION_PREPARED ||
         transaction->retired_mm.state != KERNEL_MM_EMPTY ||

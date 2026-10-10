@@ -339,7 +339,7 @@ enum kernel_mm_status kernel_scheduler_resolve_current_user_fault(
     if (scheduler.initialized != KERNEL_SCHEDULER_INITIALIZED ||
         arch_interrupt_is_enabled() ||
         validate_current() != KERNEL_SCHEDULER_STATUS_OK ||
-        kernel_cpu_current()->current == &scheduler.idle ||
+        kernel_cpu_current()->current == kernel_cpu_current()->idle ||
         kernel_cpu_current()->current->state != KERNEL_THREAD_STATE_RUNNING ||
         kernel_cpu_current()->current->arch.user_mode != 1U) {
         return KERNEL_MM_STATUS_STATE;
@@ -695,7 +695,7 @@ enum kernel_scheduler_status arch_process_clone_current(
         return status;
     }
     parent = kernel_cpu_current()->current;
-    if (parent == &scheduler.idle || parent->arch.user_mode != 1U ||
+    if (parent == kernel_cpu_current()->idle || parent->arch.user_mode != 1U ||
         parent->tid_owned != 1U ||
         parent_frame != (const struct arch_trap_frame *)(
                             parent->stack_high - sizeof(*parent_frame)) ||
@@ -1079,7 +1079,7 @@ enum kernel_scheduler_status kernel_scheduler_wait4_current(
             return status;
         }
         parent = kernel_cpu_current()->current;
-        if (parent == &scheduler.idle || parent->arch.user_mode != 1U ||
+        if (parent == kernel_cpu_current()->idle || parent->arch.user_mode != 1U ||
             parent->tid_owned != 1U) {
             return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
         }
@@ -1188,7 +1188,7 @@ int kernel_scheduler_can_sleep(void)
 {
     return scheduler.initialized == KERNEL_SCHEDULER_INITIALIZED &&
            !kernel_cpu_current()->preempt_depth && !kernel_cpu_current()->raw_locks &&
-           kernel_cpu_current()->current && kernel_cpu_current()->current != &scheduler.idle;
+           kernel_cpu_current()->current && kernel_cpu_current()->current != kernel_cpu_current()->idle;
 }
 void kernel_scheduler_register_cleanup(void)
 {
@@ -1277,7 +1277,7 @@ enum kernel_scheduler_status kernel_scheduler_reap_one(
     if (status != KERNEL_SCHEDULER_STATUS_OK) {
         return status;
     }
-    if (kernel_cpu_current()->current != (scheduler.cleanup_task ? scheduler.cleanup_task : &scheduler.idle)) {
+    if (kernel_cpu_current()->current != (scheduler.cleanup_task ? scheduler.cleanup_task : kernel_cpu_current()->idle)) {
         return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
     }
     status = validate_queues();
@@ -1466,18 +1466,18 @@ static void switch_to_fatal_idle(enum kernel_scheduler_status status)
     if (scheduler.fatal_status == KERNEL_SCHEDULER_STATUS_OK) {
         scheduler.fatal_status = status;
     }
-    if (scheduler.idle_context_saved != 0U &&
-        kernel_cpu_current()->current != &scheduler.idle) {
-        if (activate_thread_address_space(&scheduler.idle) !=
+    if (kernel_cpu_current()->idle_context_saved != 0U &&
+        kernel_cpu_current()->current != kernel_cpu_current()->idle) {
+        if (activate_thread_address_space(kernel_cpu_current()->idle) !=
             KERNEL_SCHEDULER_STATUS_OK) {
             for (;;) {
                 arch_cpu_wait();
             }
         }
-        kernel_cpu_current()->current = &scheduler.idle;
-        arch_fpu_switch(0, &scheduler.idle.fpu);
-        arch_context_switch(&scheduler.discard_context,
-                             &scheduler.idle.context);
+        kernel_cpu_current()->current = kernel_cpu_current()->idle;
+        arch_fpu_switch(0, &kernel_cpu_current()->idle->fpu);
+        arch_context_switch(&kernel_cpu_current()->discard_context,
+                             &kernel_cpu_current()->idle->context);
     }
 
     for (;;) {
@@ -1788,7 +1788,7 @@ static void kernel_thread_finish(
     }
     current = kernel_cpu_current()->current;
     status = validate_current();
-    if (status != KERNEL_SCHEDULER_STATUS_OK || current == &scheduler.idle) {
+    if (status != KERNEL_SCHEDULER_STATUS_OK || current == kernel_cpu_current()->idle) {
         switch_to_fatal_idle(
             status == KERNEL_SCHEDULER_STATUS_OK
                 ? KERNEL_SCHEDULER_STATUS_INVALID_STATE
@@ -1831,9 +1831,9 @@ static void kernel_thread_finish(
     {
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
         next = scheduler.cleanup_task ? ready_best_locked() : 0;
-        if (!next) next = &scheduler.idle;
+        if (!next) next = kernel_cpu_current()->idle;
         if (cpu->switch_previous || next->wait.on_cpu || !current->wait.on_cpu) __builtin_trap();
-        if (next != &scheduler.idle) {
+        if (next != kernel_cpu_current()->idle) {
             ready_remove_locked(next);
             next->state = KERNEL_THREAD_STATE_RUNNING;
         }
@@ -1850,7 +1850,7 @@ static void kernel_thread_finish(
 #endif
     scheduler_rearm_timer();
     arch_fpu_switch(0, &next->fpu);
-    arch_context_switch(&scheduler.discard_context, &next->context);
+    arch_context_switch(&kernel_cpu_current()->discard_context, &next->context);
     kernel_scheduler_switch_finish();
 
     switch_to_fatal_idle(KERNEL_SCHEDULER_STATUS_INVALID_STATE);

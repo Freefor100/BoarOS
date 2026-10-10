@@ -234,3 +234,11 @@ futex过滤wake不能沿用跨解锁的裸next。游标借用node，requeue额�
 FUTEX_REQUEUE确认真实登记、保持阻塞，再交付信号；固定依据为`references/linux/kernel/futex/requeue.c`，
 commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`。这不依赖随机sleep。一次未强制的旧动态目录
 失败只有汇总码10，没有子步骤结果，不能从反例或后续成功反推其确切原因；已增加结果/errno诊断。
+
+## CPU运行记账与全局配置
+
+运行时间的结算起点属于CPU，RR剩余片属于任务，RT参数可由系统统一配置，但消费量不能共用一个计时起点。两个CPU上的任务都从0开始运行，在10ms结算CPU A、20ms结算CPU B时，共用起点会把B的20ms误算为10ms。`test-sched-concurrency-host`以逻辑CPU交错直接执行生产记账，保护各自RR扣费与配置变更不赠送预算；这不是客户机两核验收。
+
+CPU记录还持有idle任务的归属、恢复状态、退出丢弃上下文与最后硬件timer期限。启动idle存储由静态启动owner持有，其他CPU的入口和存储尚未接入；不能复用同一idle执行栈来代替每CPU初始化。切换上下文类型独立于任务头，保留RV/LA既有汇编布局与检查。
+
+固定参考仍为`references/linux/kernel/sched/rt.c`，commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`的每CPU运行队列/消费量；当前BoarOS保持全局ready队列，不引入跨CPU预算借调。

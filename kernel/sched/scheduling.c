@@ -5,20 +5,43 @@
 
 static int is_rt(const struct kernel_task *task)
 {
-    return task && task != &scheduler.idle && task->scheduling.priority != 0;
+    return task && !task->idle && task->scheduling.priority != 0;
+}
+
+void scheduler_cpu_initialize(struct kernel_cpu *cpu, struct kernel_task *idle,
+                              uint64_t now_ns)
+{
+    if (!cpu || !idle || cpu->initialized != KERNEL_CPU_INITIALIZED || cpu->idle ||
+        !scheduler.rt_configuration.period_ns) __builtin_trap();
+    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+    for (struct kernel_cpu *p = scheduler.cpus; p; p = p->scheduler_next)
+        if (p == cpu || p->hardware_id == cpu->hardware_id) __builtin_trap();
+    /* CPU记录在在线期常驻；私有初始化后才发布到调度域。 */
+    cpu->rt_bandwidth.period_ns = scheduler.rt_configuration.period_ns;
+    cpu->rt_bandwidth.runtime_ns = scheduler.rt_configuration.runtime_ns;
+    cpu->rt_bandwidth.period_start_ns = cpu->rt_bandwidth.last_account_ns = now_ns;
+    cpu->rt_bandwidth.consumed_ns = 0;
+    cpu->idle = idle;
+    idle->cpu = cpu;
+    idle->idle = 1;
+    cpu->scheduler_next = scheduler.cpus;
+    scheduler.cpus = cpu;
+}
+
+static void account_cpu(struct kernel_cpu *cpu, uint64_t now)
+{
+#if BOAROS_COST_DIAGNOSTICS
+    if (cpu->current) kernel_cost_account(&cpu->current->cost);
+#endif
+    if (now < cpu->rt_bandwidth.last_account_ns) __builtin_trap();
+    uint64_t delta = now - cpu->rt_bandwidth.last_account_ns;
+    if (cpu->current && !cpu->current->idle)
+        kernel_sched_policy_charge(&cpu->current->scheduling, delta);
+    kernel_rt_bandwidth_account(&cpu->rt_bandwidth, now, is_rt(cpu->current));
 }
 
 void scheduler_account_runtime(void)
-{
-#if BOAROS_COST_DIAGNOSTICS
-    if (kernel_cpu_current()->current) kernel_cost_account(&kernel_cpu_current()->current->cost);
-#endif
-    uint64_t now = kernel_time_monotonic_ns();
-    uint64_t delta = now - scheduler.rt_bandwidth.last_account_ns;
-    if (kernel_cpu_current()->current && kernel_cpu_current()->current != &scheduler.idle)
-        kernel_sched_policy_charge(&kernel_cpu_current()->current->scheduling, delta);
-    kernel_rt_bandwidth_account(&scheduler.rt_bandwidth, now, is_rt(kernel_cpu_current()->current));
-}
+{ account_cpu(kernel_cpu_current(), kernel_time_monotonic_ns()); }
 
 struct kernel_task *ready_first(void)
 { return scheduler.runqueue.first ? scheduler.runqueue.first->owner : 0; }
@@ -27,7 +50,7 @@ struct kernel_task *ready_next(const struct kernel_task *task)
 struct kernel_task *ready_best_locked(void)
 {
     struct kernel_sched_node *node = kernel_sched_pick(&scheduler.runqueue,
-        kernel_rt_bandwidth_eligible(&scheduler.rt_bandwidth));
+        kernel_rt_bandwidth_eligible(&kernel_cpu_current()->rt_bandwidth));
     return node ? node->owner : 0;
 }
 void ready_remove_locked(struct kernel_task *task)
@@ -73,10 +96,10 @@ struct kernel_task *ready_pop(void)
 
 void scheduler_rearm_timer(void)
 {
-    uint64_t delay = kernel_rt_bandwidth_delay(&scheduler.rt_bandwidth,
+    uint64_t delay = kernel_rt_bandwidth_delay(&kernel_cpu_current()->rt_bandwidth,
         is_rt(kernel_cpu_current()->current),
         scheduler.runqueue.first && scheduler.runqueue.first->priority != 0);
-    if (kernel_cpu_current()->current && kernel_cpu_current()->current != &scheduler.idle &&
+    if (kernel_cpu_current()->current && kernel_cpu_current()->current != kernel_cpu_current()->idle &&
         kernel_cpu_current()->current->scheduling.policy == KERNEL_SCHED_RR) {
         uint64_t slice = kernel_cpu_current()->current->scheduling.rr_remaining_ns;
         if (!slice) slice = 1;
@@ -84,7 +107,7 @@ void scheduler_rearm_timer(void)
     }
     uint64_t deadline = 0;
     if (delay && kernel_time_is_initialized()) {
-        uint64_t now = scheduler.rt_bandwidth.last_account_ns;
+        uint64_t now = kernel_cpu_current()->rt_bandwidth.last_account_ns;
         uint64_t target = UINT64_MAX - now < delay ? UINT64_MAX : now + delay;
         enum kernel_time_status status = kernel_time_deadline_from_monotonic(target, &deadline);
         if (status == KERNEL_TIME_STATUS_DEADLINE_PASSED) deadline = arch_time_read() + 1U;
@@ -97,7 +120,7 @@ void scheduler_rearm_timer(void)
         if (blocked != 0 && (!deadline || blocked->wakeup_deadline < deadline))
             deadline = blocked->wakeup_deadline;
     }
-    scheduler.armed_deadline = deadline;
+    kernel_cpu_current()->armed_deadline = deadline;
     enum arch_timer_status status = arch_timer_set_scheduler_deadline(deadline);
     if (status != ARCH_TIMER_STATUS_OK && status != ARCH_TIMER_STATUS_NOT_STARTED)
         __builtin_trap();
@@ -120,9 +143,9 @@ enum kernel_scheduler_status scheduler_reschedule(int rotate_other, int voluntar
     {
     KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
     struct kernel_task *next = ready_best_locked();
-    int throttled = is_rt(current) && !kernel_rt_bandwidth_eligible(&scheduler.rt_bandwidth);
-    int expired = current != &scheduler.idle && kernel_sched_policy_expired(&current->scheduling);
-    int higher = next && (current == &scheduler.idle ||
+    int throttled = is_rt(current) && !kernel_rt_bandwidth_eligible(&kernel_cpu_current()->rt_bandwidth);
+    int expired = current != kernel_cpu_current()->idle && kernel_sched_policy_expired(&current->scheduling);
+    int higher = next && (current == kernel_cpu_current()->idle ||
                          next->scheduling.priority > current->scheduling.priority);
     int rotate = voluntary || expired ||
                  (rotate_other && current->scheduling.policy == KERNEL_SCHED_OTHER);
@@ -134,13 +157,13 @@ enum kernel_scheduler_status scheduler_reschedule(int rotate_other, int voluntar
         scheduler_rearm_timer();
         return KERNEL_SCHEDULER_STATUS_OK;
     }
-    if (current != &scheduler.idle) {
+    if (current != kernel_cpu_current()->idle) {
         current->state = KERNEL_THREAD_STATE_READY;
         /* 高优先级抢占/节流保留同级队首；只有yield/时间片结束移到队尾。 */
         if (current->wait.ready_pending) __builtin_trap();
         current->wait.ready_pending = 1;
         current->wait.ready_head = !rotate;
-    } else scheduler.idle_context_saved = 1U;
+    } else kernel_cpu_current()->idle_context_saved = 1U;
     }
     return scheduler_switch_current_away(current);
 }
@@ -148,9 +171,9 @@ enum kernel_scheduler_status scheduler_reschedule(int rotate_other, int voluntar
 void kernel_scheduler_prepare_idle_return(void)
 {
     if (scheduler.initialized != KERNEL_SCHEDULER_INITIALIZED ||
-        kernel_cpu_current()->current != &scheduler.idle || !kernel_cpu_schedule_requested(kernel_cpu_current())) return;
+        kernel_cpu_current()->current != kernel_cpu_current()->idle || !kernel_cpu_schedule_requested(kernel_cpu_current())) return;
     /* 仅空闲栈是 IRQ 返回的内核抢占点；启动/清理持锁期间继续延后。 */
-    if (scheduler.idle.io_context.locks || scheduler.idle.io_context.backend_depth) return;
+    if (kernel_cpu_current()->idle->io_context.locks || kernel_cpu_current()->idle->io_context.backend_depth) return;
     if (scheduler_reschedule(0, 0) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
 }
 
@@ -201,9 +224,9 @@ void kernel_scheduler_rt_bandwidth_get(int64_t *period_us, int64_t *runtime_us)
     if (scheduler.initialized != KERNEL_SCHEDULER_INITIALIZED) {
         *period_us = 1000000; *runtime_us = 950000;
     } else {
-        *period_us = (int64_t)(scheduler.rt_bandwidth.period_ns / 1000U);
-        *runtime_us = scheduler.rt_bandwidth.runtime_ns < 0 ? -1 :
-                      scheduler.rt_bandwidth.runtime_ns / 1000;
+        *period_us = (int64_t)(scheduler.rt_configuration.period_ns / 1000U);
+        *runtime_us = scheduler.rt_configuration.runtime_ns < 0 ? -1 :
+                      scheduler.rt_configuration.runtime_ns / 1000;
     }
     arch_interrupt_restore(irq);
 }
@@ -214,13 +237,33 @@ int kernel_scheduler_rt_bandwidth_set(int runtime_field, int64_t value)
     if (scheduler.initialized != KERNEL_SCHEDULER_INITIALIZED) {
         arch_interrupt_restore(irq); return -KERNEL_EAGAIN;
     }
-    scheduler_account_runtime();
-    int result = kernel_rt_bandwidth_set(&scheduler.rt_bandwidth, runtime_field, value,
-        scheduler.rt_bandwidth.last_account_ns, 0);
-    if (!result) {
-        kernel_cpu_request_schedule(kernel_cpu_current());
-        scheduler_rearm_timer();
+    int result;
+    {
+        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        uint64_t now = kernel_time_monotonic_ns();
+        uint64_t old_period = scheduler.rt_configuration.period_ns;
+        for (struct kernel_cpu *cpu = scheduler.cpus; cpu; cpu = cpu->scheduler_next)
+            account_cpu(cpu, now);
+        struct kernel_rt_bandwidth proposed = {
+            .period_ns = scheduler.rt_configuration.period_ns,
+            .runtime_ns = scheduler.rt_configuration.runtime_ns,
+            .period_start_ns = now, .last_account_ns = now
+        };
+        result = kernel_rt_bandwidth_set(&proposed, runtime_field, value, now, 0);
+        if (!result) scheduler.rt_configuration = (struct kernel_rt_configuration){
+            .period_ns = proposed.period_ns, .runtime_ns = proposed.runtime_ns };
+        if (!result) {
+            for (struct kernel_cpu *cpu = scheduler.cpus; cpu; cpu = cpu->scheduler_next) {
+                cpu->rt_bandwidth.period_ns = scheduler.rt_configuration.period_ns;
+                cpu->rt_bandwidth.runtime_ns = scheduler.rt_configuration.runtime_ns;
+                /* 改配置不赠送预算；只有周期长度变化才重建周期起点。 */
+                if (old_period != scheduler.rt_configuration.period_ns)
+                    cpu->rt_bandwidth.period_start_ns = now;
+                kernel_cpu_request_schedule(cpu);
+            }
+        }
     }
+    if (!result) scheduler_rearm_timer();
     arch_interrupt_restore(irq);
     return result;
 }

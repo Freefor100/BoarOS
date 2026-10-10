@@ -1,6 +1,8 @@
 #ifndef BOAROS_KERNEL_CPU_H
 #define BOAROS_KERNEL_CPU_H
 #include <arch/context.h>
+#include <arch/switch_context.h>
+#include <kernel/sched_policy.h>
 #include <stdint.h>
 
 #define KERNEL_CPU_INITIALIZED UINT32_C(0x43505531)
@@ -12,6 +14,12 @@ struct kernel_cpu {
     uint64_t hardware_id;
     struct kernel_task *current;
     struct kernel_task *switch_previous;
+    struct kernel_task *idle;
+    struct kernel_cpu *scheduler_next;
+    struct kernel_rt_bandwidth rt_bandwidth;
+    struct arch_switch_context discard_context;
+    uint64_t idle_ticks, armed_deadline;
+    unsigned idle_context_saved;
     struct kernel_io_context *bootstrap_io;
     struct kernel_raw_guard *raw_locks;
     uint32_t initialized, preempt_depth;

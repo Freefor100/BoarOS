@@ -4,6 +4,7 @@
 #define ARCH_TASK_CPU_OFFSET 48
 #ifndef __ASSEMBLER__
 #include <stdint.h>
+#include <arch/switch_context.h>
 static inline uintptr_t arch_current_stack(void) { uintptr_t v; __asm__ volatile("move %0, $sp" : "=r"(v)); return v; }
 static inline void arch_cpu_wait(void) { __asm__ volatile("idle 0" ::: "memory"); }
 static inline uintptr_t arch_interrupt_save(void)

@@ -117,7 +117,7 @@ static uint32_t signal_first_set(uint64_t bits)
 
 void kernel_signal_note_syscall_restart(struct kernel_task *task)
 {
-    if (task != 0 && task != &scheduler.idle &&
+    if (task != 0 && task != kernel_cpu_current()->idle &&
         task->magic == KERNEL_THREAD_MAGIC && task->arch.user_mode == 1U) {
         if (task->syscall_restart.kind == KERNEL_SYSCALL_RESTART_NONE) {
             task->syscall_restart = (struct kernel_syscall_restart_state){
@@ -131,7 +131,7 @@ void kernel_signal_note_nanosleep_restart(struct kernel_task *task,
                                           uint64_t deadline,
                                           uint64_t remaining_address)
 {
-    if (task != 0 && task != &scheduler.idle &&
+    if (task != 0 && task != kernel_cpu_current()->idle &&
         task->magic == KERNEL_THREAD_MAGIC && task->arch.user_mode == 1U) {
         task->syscall_restart = (struct kernel_syscall_restart_state){
             .kind = KERNEL_SYSCALL_RESTART_NANOSLEEP,
@@ -150,7 +150,7 @@ void kernel_signal_note_futex_timed_restart(struct kernel_task *task,
                                             uint64_t deadline_ns,
                                             uint32_t bitset)
 {
-    if (task != 0 && task != &scheduler.idle &&
+    if (task != 0 && task != kernel_cpu_current()->idle &&
         task->magic == KERNEL_THREAD_MAGIC && task->arch.user_mode == 1U) {
         task->syscall_restart = (struct kernel_syscall_restart_state){
             .kind = KERNEL_SYSCALL_RESTART_FUTEX_TIMED,
@@ -206,7 +206,7 @@ static enum kernel_signal_default_action signal_default_action(
 
 static int signal_dispatchable(const struct kernel_task *task)
 {
-    return task != 0 && task != &scheduler.idle &&
+    return task != 0 && task != kernel_cpu_current()->idle &&
            task->magic == KERNEL_THREAD_MAGIC &&
            task->arch.user_mode == 1U &&
            task->state != KERNEL_THREAD_STATE_ZOMBIE &&
@@ -219,7 +219,7 @@ static struct kernel_task *signal_group_leader(
 {
     struct kernel_task *leader;
 
-    if (task == 0 || task == &scheduler.idle ||
+    if (task == 0 || task == kernel_cpu_current()->idle ||
         task->magic != KERNEL_THREAD_MAGIC || task->arch.user_mode != 1U) {
         return 0;
     }

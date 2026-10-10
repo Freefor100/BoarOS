@@ -14,7 +14,6 @@
 #include <arch/riscv/direct_map.h>
 #define arch_thread_state riscv_thread_state
 #define arch_fpu_state riscv_fpu_state
-#define arch_switch_context riscv_switch_context
 #define arch_trap_frame riscv_trap_frame
 #define arch_context_status riscv_context_status
 #define ARCH_CONTEXT_STATUS_OK RISCV_CONTEXT_STATUS_OK
