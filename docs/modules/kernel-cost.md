@@ -56,6 +56,20 @@ idle/cleanup 上下文单列 idle_ticks，不能解释成精确 WFI 驻留时间
 当前 Python discovery 不收集带连字符的文件，
 因此 host target 直接运行 `python3 -B tests/test-cost-report.py`，必须实际执行测试。
 
+fixture匹配测量可显式传`--qemu-seed`（uint64且整个副本跨度不得溢出），副本i使用
+base+i，并在基线/候选/返回及ON/OFF间配对。默认不设置，official配置拒绝该选项。
+它固定QEMU的客体PRNG，包括生成DTB及reset时更新的`rng-seed`，不把不可信启动材料
+改成可信熵或伪造random ready，也不保证host crypto/外部RNG确定性。实际参数、种子
+和DTB哈希进入启动前seal；resume同时核对身份和argv，不能混入未设置种子的旧启动。
+固定依据为`references/qemu` commit `84f07211cc5b4fc6a371559bf8a5de4fb068e648`的
+`qemu-options.hx`、`hw/riscv/virt.c`和`hw/riscv/boot.c`；固定timebase仍不代表固定速度。
+
+`--fixture-cache PATH`只用于上述allocator/latency/locking/scheduler单盘BoarOS fixture。
+首次在客体启动前封存完整镜像及case/ELF/长度/SHA身份，以整目录发布，随后各次启动
+复制为独立可写盘。缓存损坏或半发布明确失败，不重新生成后冒充命中。三个副本的初始
+内容相同，但实际root drive路径必须不同；fresh历史记录仍使用原校验规则。冻结模式及
+内容身份进入seal，resume不能通过漏传或新增cache选项改变前置状态。默认和official不变。
+
 C1 进一步按 file/stream/dgram/other 记录 calls、requested/accepted、实际 usercopy、页解析、
 staging 累计请求容量、heap 请求字节和成功物理页。短写以实际接受前缀为准；同步尾部失败
 不会抹掉先前接受量。全局 heap/page 指标是实际 allocator 入口和成功结果，按本层单位记录，

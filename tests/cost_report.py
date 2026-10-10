@@ -141,7 +141,19 @@ def validate_replicas(records):
         if len(rows)!=3 or {r['replica'] for r in rows}!={0,1,2}: raise ValueError('three distinct boot replicas required')
         for field in ('kernel_sha256','elf_sha256','source_sha256'):
             if len({r[field] for r in rows})!=1: raise ValueError('changed immutable input: '+field)
-        if len({r['fixture_sha256'] for r in rows})!=3: raise ValueError('independent fixtures required')
+        modes={r.get('fixture_mode','fresh') for r in rows}
+        if modes=={'frozen'}:
+            from cost_fixture import validate_resume_fixture, writable_root_path
+            if key[0] not in ('allocator','latency','locking','scheduler') or key[4] or key[5]!='boaros':
+                raise ValueError('unsupported frozen fixture configuration')
+            sha=rows[0]['fixture_sha256']
+            for row in rows:validate_resume_fixture(row,sha)
+            if len({writable_root_path(row) for row in rows})!=3:
+                raise ValueError('independent writable fixtures required')
+        elif modes!={'fresh'}:
+            raise ValueError('mixed or invalid fixture mode')
+        elif len({r['fixture_sha256'] for r in rows})!=3:
+            raise ValueError('independent fixtures required')
         if any(r['replicas']!=3 or not r['acceptance'] for r in rows): raise ValueError('pilot is not acceptance')
         if len({tuple(sorted(r['timings_ns'])) for r in rows})!=1: raise ValueError('missing workload phase')
         for row in rows:
