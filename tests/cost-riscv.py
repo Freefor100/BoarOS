@@ -13,9 +13,9 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
-from cost_report import validate_deadline, validate_allocator, parse, validate_expected, validate_locking, validate_resume_selection
+from cost_report import validate_deadline, validate_allocator, parse, validate_expected, validate_locking, validate_scheduler, validate_resume_selection
 ROOT=Path(__file__).resolve().parents[1]
-CASES=('contract','write','locking','mprotect','deadline','latency','consumer','readers','metadata','allocator')
+CASES=('contract','write','locking','mprotect','deadline','latency','consumer','readers','metadata','allocator','scheduler')
 IMPLEMENTED=set(CASES)
 def digest(path):
     with Path(path).open('rb') as stream: return hashlib.file_digest(stream,'sha256').hexdigest()
@@ -53,7 +53,7 @@ def main():
     if (not selected and not args.consumer_sync_only) or len(set(selected))!=len(selected) or not set(selected)<=set(names):parser.error('invalid consumer command selection')
     if args.consumer_sync and args.case!='consumer':parser.error('synchronous probes require --case consumer')
     if args.consumer_readers and args.case!='consumer':parser.error('appended readers require --case consumer')
-    if args.coordinator_elf and (args.case not in ('consumer','readers','metadata','allocator','latency','locking') or args.consumer_sync):parser.error('frozen coordinator requires a supported case without new probes')
+    if args.coordinator_elf and (args.case not in ('consumer','readers','metadata','allocator','latency','locking','scheduler') or args.consumer_sync):parser.error('frozen coordinator requires a supported case without new probes')
     if args.consumer_commands!='all' and args.case!='consumer':parser.error('consumer selection requires --case consumer')
     if not 1000<=args.consumer_timeout_ms<=3600000:parser.error('consumer timeout must be 1000..3600000 ms')
     if args.case in ('metadata','all') and args.consumer_timeout_ms!=180000:parser.error('metadata coordinator uses a fixed 180000 ms consumer budget')
@@ -299,6 +299,8 @@ def main():
                     required={f'latency-copy-{n}' for n in (4096,65536,1048576)}|{f'latency-protect-{n}' for n in (4096,1048576)}
                     if set(timings)!=required or (not args.off and {s['name'] for s in snapshots}!=required): raise ValueError('latency coverage')
                     if not args.off and any(s['values']['foreground.irq_off_ticks.samples']==0 or s['values']['foreground.wake_to_run.samples']==0 for s in snapshots): raise ValueError('IRQ or independent wake not measured')
+                if case=='scheduler':
+                    record['scheduler']=validate_scheduler(timings,snapshots,output,not args.off)
                 if case=='allocator':
                     record['allocator']=validate_allocator(timings,snapshots,output,not args.off)
                 if case=='deadline':

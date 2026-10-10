@@ -163,7 +163,7 @@ def validate_replicas(records):
                 if row['case']=='deadline':validate_deadline(snapshot['name'],parsed)
                 if parsed['epoch']<=previous_epoch:raise ValueError('reused/stale boot epoch')
                 previous_epoch=parsed['epoch']
-            if row['cost_diagnostics'] and row['case'] in ('contract','write','locking','mprotect','deadline','latency','consumer','io-pressure','allocator'):
+            if row['cost_diagnostics'] and row['case'] in ('contract','write','locking','mprotect','deadline','latency','consumer','io-pressure','allocator','scheduler'):
                 expected_epochs=[1,2,3,5] if row['case']=='contract' else list(range(1,len(row['snapshots'])+1))
                 if [s['values']['epoch'] for s in row['snapshots']]!=expected_epochs:raise ValueError('boot epoch sequence')
             if row['cost_diagnostics'] and row['timings_ns'] and seen!=set(row['timings_ns']): raise ValueError('window coverage')
@@ -190,3 +190,21 @@ def validate_resume_selection(case, record, selected):
     expected = ['consumer-musl-1', 'consumer-glibc-1'] if case == 'metadata' else selected
     if record.get('consumer_command_names') != expected:
         raise ValueError('resume command selection differs')
+
+def validate_scheduler(timings, snapshots, output, diagnostics):
+    expected = {'scheduler-yield': (8192, 8192),
+                'scheduler-wake': (8192, 8192 * ord('p')),
+                'scheduler-create': (1024, 1024)}
+    if set(timings) != set(expected) or (diagnostics and {s['name'] for s in snapshots} != set(expected)):
+        raise ValueError('scheduler window coverage')
+    if any(value <= 0 for value in timings.values()):
+        raise ValueError('scheduler nonpositive work time')
+    work = re.findall(r'^COST SCHED WORK (\S+) (\d+) (\d+)$', output, re.M)
+    if len(work) != len(expected) or {n: (int(c), int(v)) for n, c, v in work} != expected:
+        raise ValueError('scheduler fixed work or peer progress')
+    if diagnostics:
+        for snapshot in snapshots:
+            for metric in ('irq_off_ticks', 'raw_wait_ticks', 'raw_hold_ticks'):
+                if snapshot['values'][f'foreground.{metric}.samples'] <= 0:
+                    raise ValueError(f'scheduler {metric} not measured')
+    return {'operations': expected, 'waited_children': 1026}

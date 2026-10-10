@@ -48,9 +48,12 @@ idle/cleanup 上下文单列 idle_ticks，不能解释成精确 WFI 驻留时间
 
 验证入口：`make test-cost-host`、`make test-cost-riscv COST_CASE=contract`。
 后者串行运行三个独立启动副本，在启动前保存 kernel/ELF/fixture 身份与源码内容哈希。
-目前交付 contract/write/locking/mprotect/deadline/latency/consumer/readers/metadata/allocator，
+目前交付 contract/write/locking/mprotect/deadline/latency/consumer/readers/metadata/allocator/scheduler，
 `all` 不跳过缺项；consumer 不将未完成命令标为完成。独立报告读器拒绝缺项、重复、未知键、单位错误、旧 epoch、
-直方图不一致、incomplete 和 overflow。当前 Python discovery 不收集带连字符的文件，
+直方图不一致、incomplete 和 overflow。scheduler固定8192次yield、8192次带内容核对的管道往返，以及1024次创建/wait/让出执行；
+最后报告已wait完成的child数，元数据资源归还另由生命周期门禁和整次启动基线核对。
+各窗口时间必须为正；ON还要求真实IRQ和raw取得/持有样本。冻结ELF通过`--coordinator-elf`复用。
+当前 Python discovery 不收集带连字符的文件，
 因此 host target 直接运行 `python3 -B tests/test-cost-report.py`，必须实际执行测试。
 
 C1 进一步按 file/stream/dgram/other 记录 calls、requested/accepted、实际 usercopy、页解析、

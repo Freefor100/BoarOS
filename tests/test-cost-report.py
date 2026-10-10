@@ -1,7 +1,31 @@
 import unittest
-from cost_report import parse, schema, percentile, validate_expected, validate_replicas, validate_locking, validate_resume_selection
+from cost_report import parse, schema, percentile, validate_expected, validate_replicas, validate_locking, validate_scheduler, validate_resume_selection
 
 class CostReportTest(unittest.TestCase):
+    def test_scheduler_requires_completed_windows_and_peer_content(self):
+        work = {'scheduler-yield': (8192, 8192), 'scheduler-wake': (8192, 8192 * ord('p')),
+                'scheduler-create': (1024, 1024)}
+        timings = {name: 100 for name in work}
+        output = ''.join(f'COST SCHED WORK {name} {n} {v}\n' for name, (n, v) in work.items())
+        validate_scheduler(timings, [], output, False)
+        for bad in (0, -1):
+            with self.assertRaisesRegex(ValueError, 'time'):
+                validate_scheduler({name: bad for name in work}, [], output, False)
+        for bad in ('', output + output.splitlines()[0] + '\n', output.replace('917504', '0')):
+            with self.assertRaisesRegex(ValueError, 'work|progress'):
+                validate_scheduler(timings, [], bad, False)
+        with self.assertRaisesRegex(ValueError, 'coverage'):
+            validate_scheduler(timings, [], output, True)
+        snapshots = [{'name': name, 'values': {
+            'foreground.irq_off_ticks.samples': 1,
+            'foreground.raw_wait_ticks.samples': 1,
+            'foreground.raw_hold_ticks.samples': 1}} for name in work]
+        validate_scheduler(timings, snapshots, output, True)
+        for metric in snapshots[0]['values']:
+            bad = [{**s, 'values': {**s['values'], metric: 0}} for s in snapshots]
+            with self.assertRaisesRegex(ValueError, 'not measured'):
+                validate_scheduler(timings, bad, output, True)
+
     def test_resume_selection_only_applies_to_consumer_manifests(self):
         for case in ('allocator','latency','locking'):
             validate_resume_selection(case, {}, ['consumer-musl-0'])
