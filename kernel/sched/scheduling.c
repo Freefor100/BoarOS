@@ -151,23 +151,34 @@ void scheduler_rearm_timer(void)
     arch_interrupt_restore(irq);
 }
 
-enum kernel_scheduler_status scheduler_reschedule(int rotate_other, int voluntary)
+enum kernel_scheduler_status scheduler_reschedule(int rotate_other, int voluntary, int check_queues)
 {
     if (kernel_cpu_current()->preempt_depth) {
-        scheduler_account_runtime();
+        {
+            KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+            if (check_queues) {
+                enum kernel_scheduler_status status = validate_queues_locked();
+                if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
+            }
+            scheduler_account_runtime_locked();
+        }
         if (voluntary) __builtin_trap();
         kernel_cpu_request_schedule(kernel_cpu_current());
         kernel_cpu_current()->rotate_other |= rotate_other != 0;
         scheduler_rearm_timer();
         return KERNEL_SCHEDULER_STATUS_OK;
     }
-    (void)kernel_cpu_consume_schedule(kernel_cpu_current());
-    rotate_other |= kernel_cpu_current()->rotate_other;
-    kernel_cpu_current()->rotate_other = 0;
     struct kernel_task *current = kernel_cpu_current()->current;
     struct kernel_task *selected;
     {
     KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+    if (check_queues) {
+        enum kernel_scheduler_status status = validate_queues_locked();
+        if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
+    }
+    (void)kernel_cpu_consume_schedule(kernel_cpu_current());
+    rotate_other |= kernel_cpu_current()->rotate_other;
+    kernel_cpu_current()->rotate_other = 0;
     scheduler_account_runtime_locked();
     struct kernel_task *next = ready_best_locked();
     int throttled = is_rt(current) && !kernel_rt_bandwidth_eligible(&kernel_cpu_current()->rt_bandwidth);
@@ -203,7 +214,7 @@ void kernel_scheduler_prepare_idle_return(void)
         kernel_cpu_current()->current != kernel_cpu_current()->idle || !kernel_cpu_schedule_requested(kernel_cpu_current())) return;
     /* 仅空闲栈是 IRQ 返回的内核抢占点；启动/清理持锁期间继续延后。 */
     if (kernel_cpu_current()->idle->io_context.locks || kernel_cpu_current()->idle->io_context.backend_depth) return;
-    if (scheduler_reschedule(0, 0) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
+    if (scheduler_reschedule(0, 0, 0) != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
 }
 
 static struct kernel_task *sched_target(struct kernel_task *caller, int32_t pid)

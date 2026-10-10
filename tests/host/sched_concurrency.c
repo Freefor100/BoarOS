@@ -15,6 +15,17 @@ static struct kernel_task tasks[4], idles[4];
 static pthread_barrier_t start;
 static struct kernel_task *selected[4];
 void *sync_test_cpu(void) { return active_cpu; }
+void *sync_test_current_task(void) { return active_cpu->current; }
+static _Thread_local unsigned group_lock_calls;
+void __real_kernel_raw_lock_acquire(struct kernel_raw_lock *, struct kernel_raw_guard *);
+void __wrap_kernel_raw_lock_acquire(struct kernel_raw_lock *lock, struct kernel_raw_guard *guard)
+{
+    group_lock_calls++;
+    __real_kernel_raw_lock_acquire(lock, guard);
+}
+/* STOPPED state removal is covered by real guest signals; this READY-only
+ * group cost model must never take that separate state transition. */
+void stopped_unlink_locked(struct kernel_task *task) { (void)task; __builtin_trap(); }
 uint64_t kernel_time_monotonic_ns(void) { return now; }
 void __real_kernel_sched_policy_charge(struct kernel_sched_policy *, uint64_t);
 void __wrap_kernel_sched_policy_charge(struct kernel_sched_policy *policy, uint64_t delta)
@@ -203,6 +214,54 @@ static void event_claim_handoff(void)
     assert(!scheduler.cleanup_queue.registrations && !tasks[0].child_exit_queue.registrations);
     assert(!waiter->wait.borrows && !tasks[0].storage_borrows);
     puts("wait-event claim release hands off to registered waiter and reaper");
+}
+
+static void group_exit_work(void)
+{
+    static struct kernel_task unrelated[64];
+    for (unsigned members = 1; members <= 4; members *= 2) {
+        scheduler = (struct kernel_scheduler){0};
+        kernel_cpu_initialize(&cpus[0], 7, 0);
+        active_cpu = &cpus[0];
+        sync_test_irq = 0;
+        kernel_raw_lock_init(&kernel_wait_domain, KERNEL_RAW_RANK_SCHEDULER);
+        struct kernel_task *leader = &tasks[0];
+        for (unsigned i = 0; i < members; i++) {
+            tasks[i] = (struct kernel_task){.state = KERNEL_THREAD_STATE_READY};
+            tasks[i].group_leader = leader;
+            tasks[i].group_next = &tasks[(i + 1) % members];
+            tasks[i].group_previous = &tasks[(i + members - 1) % members];
+            kernel_wait_queue_init(&tasks[i].group_wait_queue);
+        }
+        leader->group_members = members;
+        {
+            KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+            for (unsigned i = 0; i < members; i++) scheduler_task_publish_locked(&tasks[i]);
+            for (unsigned i = 0; i < 64; i++) {
+                unrelated[i] = (struct kernel_task){0};
+                scheduler_task_publish_locked(&unrelated[i]);
+            }
+        }
+        group_lock_calls = 0;
+        process_group_request_exit(&tasks[members - 1], KERNEL_THREAD_EXIT_SYSCALL, 42, 0);
+        assert(leader->group_exiting && leader->completion.status == 42);
+        /* Work may grow with members, but must not borrow64 unrelated tasks.
+         * This is an upper bound, not an exact private lock-call count. */
+        assert(group_lock_calls <= 32 * members);
+        for (unsigned i = 0; i < members; i++) {
+            assert(tasks[i].terminate_requested && !tasks[i].storage_borrows);
+            assert(!tasks[i].group_wait_queue.borrows);
+        }
+        for (unsigned i = 0; i < 64; i++)
+            assert(!unrelated[i].storage_borrows && !unrelated[i].terminate_requested);
+        {
+            KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+            for (unsigned i = 0; i < members; i++) scheduler_task_unlink_locked(&tasks[i]);
+            for (unsigned i = 0; i < 64; i++) scheduler_task_unlink_locked(&unrelated[i]);
+        }
+        assert(!scheduler.task_count && !scheduler.all_tasks);
+    }
+    puts("group exit work is bounded by1/2/4 members, independent of unrelated tasks");
 }
 
 static struct kernel_task *lifetime_borrow[4];
@@ -574,6 +633,7 @@ int main(void)
     lifetime_generation();
     retired_cursor_chain();
     event_claim_handoff();
+    group_exit_work();
     concurrent_retirement(2);
     concurrent_retirement(4);
     concurrent_exit_claim(2);

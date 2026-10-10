@@ -342,7 +342,7 @@ enum kernel_scheduler_status scheduler_switch_claimed(
 void scheduler_cpu_initialize(struct kernel_cpu *cpu, struct kernel_task *idle,
                               uint64_t now_ns);
 void scheduler_rearm_timer(void);
-enum kernel_scheduler_status scheduler_reschedule(int rotate_other, int voluntary);
+enum kernel_scheduler_status scheduler_reschedule(int rotate_other, int voluntary, int check_queues);
 void ready_append(struct kernel_task *thread);
 int scheduler_forget_task_locked(struct kernel_task *, struct kernel_wait_cursor *);
 void scheduler_forget_task(struct kernel_task *thread);
@@ -357,6 +357,8 @@ void process_complete_vfork(struct kernel_task *thread);
 enum kernel_scheduler_status activate_thread_address_space(
     const struct kernel_task *thread);
 enum kernel_scheduler_status validate_queues(void);
+/* Caller holds the scheduler domain; checks and selection observe one state. */
+enum kernel_scheduler_status validate_queues_locked(void);
 enum kernel_scheduler_status release_after_create_failure(
     uint64_t physical_address,
     enum kernel_scheduler_status original_status);

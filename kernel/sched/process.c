@@ -279,9 +279,8 @@ static void reassign_child_creators(struct kernel_task *leader, struct kernel_ta
     kernel_task_identity_put(replacement);
 }
 
-static void request_thread_termination(struct kernel_task *task)
+static void request_thread_termination_locked(struct kernel_task *task)
 {
-    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
     if (task->state == KERNEL_THREAD_STATE_EXITED || task->state == KERNEL_THREAD_STATE_ZOMBIE ||
         task->state == KERNEL_THREAD_STATE_GROUP_DEAD || task->retirement) return;
     task->terminate_requested = 1;
@@ -309,35 +308,52 @@ static void request_thread_termination(struct kernel_task *task)
 
 static void terminate_group_members(struct kernel_task *leader, struct kernel_task *except)
 {
-    struct scheduler_task_cursor cursor;
-    scheduler_task_cursor_begin(&cursor);
+    struct scheduler_group_cursor cursor;
+    scheduler_group_cursor_begin(leader, &cursor);
     while (cursor.task) {
         struct kernel_task *task = cursor.task;
-        int member;
         {
             KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-            member = task->accounted && task->group_leader == leader && task != except;
+            if (task->accounted && task->group_leader == leader && task != except)
+                request_thread_termination_locked(task);
         }
-        if (member) request_thread_termination(task);
-        scheduler_task_cursor_next(&cursor);
+        scheduler_group_cursor_next(&cursor);
     }
+    scheduler_group_cursor_end(&cursor);
 }
 
 void process_group_request_exit(struct kernel_task *task,
     enum kernel_thread_exit_reason reason, uint64_t status, uint64_t detail)
 {
     struct kernel_task *leader;
+    struct kernel_wait_cursor cursor;
+    int single = 0, notify = 0;
     {
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
         leader = task->group_leader;
         if (!leader) __builtin_trap();
-        scheduler_task_get_locked(leader);
         if (!leader->group_exiting) {
             leader->group_exiting = 1;
             leader->completion.reason = reason;
             leader->completion.status = status;
             leader->completion.detail = detail;
         }
+        single = leader->group_members == 1;
+        if (single) {
+            if (leader != task || leader->group_next != leader || leader->group_previous != leader) __builtin_trap();
+            request_thread_termination_locked(leader);
+            notify = kernel_wait_cursor_prepare_locked(&leader->group_wait_queue, &cursor, 1);
+            if (notify) scheduler_task_get_locked(leader);
+        } else scheduler_task_get_locked(leader);
+    }
+    /* Caller owns task storage. A sole member needs no global traversal or
+     * cross-unlock borrow unless notification actually has a cursor owner. */
+    if (single) {
+        if (notify) {
+            kernel_wait_cursor_wake(&cursor, 1);
+            scheduler_task_put(leader);
+        }
+        return;
     }
     terminate_group_members(leader, 0);
     (void)kernel_wait_queue_wake_all(&leader->group_wait_queue);
@@ -2309,7 +2325,7 @@ enum kernel_task_status kernel_task_fs_context_borrow(
 
 void kernel_task_prepare_user_return(void)
 {
-    if (kernel_cpu_schedule_requested(kernel_cpu_current()) && scheduler_reschedule(0, 0) != KERNEL_SCHEDULER_STATUS_OK)
+    if (kernel_cpu_schedule_requested(kernel_cpu_current()) && scheduler_reschedule(0, 0, 0) != KERNEL_SCHEDULER_STATUS_OK)
         __builtin_trap();
     struct kernel_task *task = kernel_cpu_current()->current;
     if (task == 0 || task->arch.user_mode != 1U) return;

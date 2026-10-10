@@ -296,12 +296,13 @@ enum kernel_scheduler_status activate_thread_address_space(
     return KERNEL_SCHEDULER_STATUS_OK;
 }
 
-enum kernel_scheduler_status validate_queues(void)
+enum kernel_scheduler_status validate_queues_locked(void)
     __attribute__((noinline, noclone));
 
-enum kernel_scheduler_status validate_queues(void)
+enum kernel_scheduler_status validate_queues_locked(void)
 {
-    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+    struct kernel_cpu *cpu = kernel_cpu_current();
+    if (!cpu->raw_locks || cpu->raw_locks->lock != &kernel_wait_domain) __builtin_trap();
     COST_ADD(QUEUE_VALIDATIONS, 1);
     enum kernel_scheduler_status status;
 
@@ -376,6 +377,12 @@ enum kernel_scheduler_status validate_queues(void)
         }
     }
     return KERNEL_SCHEDULER_STATUS_OK;
+}
+
+enum kernel_scheduler_status validate_queues(void)
+{
+    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+    return validate_queues_locked();
 }
 
 void kernel_scheduler_switch_finish(void)
@@ -1145,10 +1152,14 @@ enum kernel_scheduler_status kernel_scheduler_on_tick(uint64_t elapsed_ticks)
     if (scheduler_failure() != KERNEL_SCHEDULER_STATUS_OK) return scheduler_failure();
     enum kernel_scheduler_status status = validate_current();
     if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
-    status = validate_queues();
-    if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
-    if (elapsed_ticks) scheduler_sample_load(elapsed_ticks);
-    return scheduler_reschedule(elapsed_ticks != 0, 0);
+    if (elapsed_ticks) {
+        /* Load sampling traverses with borrows outside a single raw section.
+         * Preserve its fail-before-sampling check; the decision revalidates. */
+        status = validate_queues();
+        if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
+        scheduler_sample_load(elapsed_ticks);
+    }
+    return scheduler_reschedule(elapsed_ticks != 0, 0, 1);
 }
 
 enum kernel_scheduler_status kernel_scheduler_yield_current(void)
@@ -1160,9 +1171,7 @@ enum kernel_scheduler_status kernel_scheduler_yield_current(void)
     if (scheduler_failure() != KERNEL_SCHEDULER_STATUS_OK) return scheduler_failure();
     enum kernel_scheduler_status status = validate_current();
     if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
-    status = validate_queues();
-    if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
-    return scheduler_reschedule(0, 1);
+    return scheduler_reschedule(0, 1, 1);
 }
 
 void kernel_scheduler_charge_ticks(uint64_t elapsed_ticks, int from_user)
