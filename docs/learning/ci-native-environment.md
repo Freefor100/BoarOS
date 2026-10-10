@@ -94,3 +94,29 @@ CLI反例先证明缺RV core及RV runtime缺SQLite，再保护两侧注册与显
 独立审查发现模板迁移漏归档共同ABI目录及漏掉reference恢复门禁，已集中补齐。
 新增反例先拒绝缺失原串口/metadata/normalized/diff/失败盘和test-references的配置，
 修复后通过；patch-format仍保留，host checkout取得实际父提交。
+
+## 宿主动态依赖与实际编译器选择
+
+[运行37978208815](https://github.com/Freefor100/BoarOS/actions/runs/37978208815)
+在`a74c219`上确认此前block等待修复通过，双方环境准备、host、LA两层及RV原生C
+也通过；RV core和runtime分别因ELF-tail与SQLite DELETE的宿主准备错误失败。
+ELF-tail尚未启动客体：PATH中的固定Arch readelf缺`libdebuginfod.so.1`而退出127。
+SQLite已生成临时盘，但raw supervisor编译器写死为本机的`riscv64-elf-gcc`，CI只有
+`riscv64-unknown-elf-gcc`。两项均不能归为内核或原SQLite程序失败。
+
+文件身份相同不保证宿主共享库可用。保留原RV GCC16.2.1/binutils2.47与LA
+GCC15.1.0/binutils2.45包身份，Ubuntu另安装`libdebuginfod1`；准备器实际运行六类
+GNU工具的`--version`，在导出PATH及保存缓存前拒绝启动失败。Make的`CC`传入
+SQLite共用runner，而不是在CI创建本机工具名称的别名；实际compiler身份随结果保存。
+
+验证必须使用独立Ubuntu PATH、空宿主LD_LIBRARY_PATH和恢复出的原工具包，
+不能把本机同名程序、已安装共享库或既有ELF的成功作为CI环境证明。host反例保护
+工具启动失败和Make→wrapper→runner的选择传递；真实验证入口仍为
+`make INIT_CONFIG=config/init.json TEST_MEMORIES='512M 1G' test-elf-tail-riscv test-sqlite-rollback-riscv`。
+
+2026-10-10修复验收：Ubuntu24.04的独立PATH下，实际恢复工具启动、27项host测试和
+同ELF Linux/BoarOS ELF-tail通过；SQLite双RAM的DELETE、静态/动态CLI及独立重启
+12阶段通过，raw compiler为Ubuntu GCC13.2的`/usr/bin/riscv64-unknown-elf-gcc`。
+仅Git文件、无参考archive或build缓存的Ubuntu checkout也通过全部27项host测试。
+LA共用SQLite runner的双RAM12阶段及六类固定工具启动检查通过。上述是本地隔离环境
+证据，后续托管结果单独核对。
