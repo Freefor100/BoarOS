@@ -127,3 +127,5 @@ LA准备沿native-environment的固定入口；原程序`--build-only`使用`--a
 `recovery.yml` 保留现有每周和手动 RV NBD DELETE/WAL 全恢复矩阵。LA 正常
 SQLite/重启和块错误门禁不冒充该全断电矩阵，新增 LA 恢复接口需独立验收。
 所有 CI 输出核对后通过 `make prune-build` 清理，固定包与复用缓存保留。
+
+RV的wait/sync原生聚焦对象生成并导入头文件依赖，规则变更会重新编译旧的无依赖对象。host门禁用真实Make和编译器边界验证头文件变化会触发重建，不要求本机交叉编译器或已有build缓存。

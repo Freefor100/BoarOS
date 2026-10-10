@@ -1826,22 +1826,12 @@ static void kernel_thread_finish(
     exited_append(current);
     if (current->join) (void)kernel_wait_queue_wake_all(&current->join->waiters);
 
-    scheduler_account_runtime();
     struct kernel_cpu *cpu = kernel_cpu_current();
     {
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-        next = scheduler.cleanup_task ? ready_best_locked() : 0;
-        if (!next) next = kernel_cpu_current()->idle;
-        if (cpu->switch_previous || next->wait.on_cpu || !current->wait.on_cpu) __builtin_trap();
-        if (next != kernel_cpu_current()->idle) {
-            ready_remove_locked(next);
-            next->state = KERNEL_THREAD_STATE_RUNNING;
-        }
-        next->wait.on_cpu = 1;
-        next->cpu = cpu;
-        cpu->current = next;
-        cpu->switch_previous = current;
-        cpu->rotate_other = 0;
+        scheduler_account_runtime_locked();
+        next = scheduler_select_next_locked(cpu, current, scheduler.cleanup_task != 0);
+        if (!next) __builtin_trap();
     }
     status = activate_thread_address_space(next);
     if (status != KERNEL_SCHEDULER_STATUS_OK) switch_to_fatal_idle(status);

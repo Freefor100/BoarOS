@@ -280,13 +280,17 @@ struct kernel_task *ready_best(void);
 void ready_remove(struct kernel_task *task);
 void ready_enqueue(struct kernel_task *task, int head);
 void scheduler_account_runtime(void);
+void scheduler_account_runtime_locked(void);
+struct kernel_task *scheduler_select_next_locked(struct kernel_cpu *cpu,
+    struct kernel_task *previous, int ready_allowed);
+enum kernel_scheduler_status scheduler_switch_claimed(
+    struct kernel_task *previous, struct kernel_task *next);
 void scheduler_cpu_initialize(struct kernel_cpu *cpu, struct kernel_task *idle,
                               uint64_t now_ns);
 void scheduler_rearm_timer(void);
 enum kernel_scheduler_status scheduler_reschedule(int rotate_other, int voluntary);
 void ready_append(struct kernel_task *thread);
 void scheduler_forget_task(struct kernel_task *thread);
-struct kernel_task *ready_pop(void);
 void blocked_append(struct kernel_task *thread);
 void blocked_unlink(struct kernel_task *thread);
 void deadline_index_insert(struct kernel_task *task);

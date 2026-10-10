@@ -18,7 +18,7 @@ struct kernel_cpu {
     struct kernel_cpu *scheduler_next;
     struct kernel_rt_bandwidth rt_bandwidth;
     struct arch_switch_context discard_context;
-    uint64_t idle_ticks, armed_deadline;
+    uint64_t idle_ticks, armed_deadline, timer_deadline;
     unsigned idle_context_saved;
     struct kernel_io_context *bootstrap_io;
     struct kernel_raw_guard *raw_locks;

@@ -300,6 +300,7 @@ enum kernel_scheduler_status validate_queues(void)
 
 enum kernel_scheduler_status validate_queues(void)
 {
+    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
     COST_ADD(QUEUE_VALIDATIONS, 1);
     enum kernel_scheduler_status status;
 
@@ -390,26 +391,21 @@ void kernel_scheduler_switch_finish(void)
 enum kernel_scheduler_status scheduler_switch_current_away(struct kernel_task *previous)
 {
     kernel_assert_can_block();
-    scheduler_account_runtime();
     struct kernel_cpu *cpu = kernel_cpu_current();
     struct kernel_task *next;
     {
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-        if (cpu->switch_previous || !previous->wait.on_cpu) __builtin_trap();
-        next = ready_best_locked();
-        if (!next) next = kernel_cpu_current()->idle;
-        if (next == previous) return KERNEL_SCHEDULER_STATUS_OK;
-        if (next->wait.on_cpu) __builtin_trap();
-        if (next != kernel_cpu_current()->idle) {
-            ready_remove_locked(next);
-            next->state = KERNEL_THREAD_STATE_RUNNING;
-        }
-        next->wait.on_cpu = 1;
-        next->cpu = cpu;
-        cpu->current = next;
-        cpu->switch_previous = previous;
-        cpu->rotate_other = 0;
+        scheduler_account_runtime_locked();
+        next = scheduler_select_next_locked(cpu, previous, 1);
     }
+    if (!next) return KERNEL_SCHEDULER_STATUS_OK;
+    return scheduler_switch_claimed(previous, next);
+}
+
+enum kernel_scheduler_status scheduler_switch_claimed(
+    struct kernel_task *previous, struct kernel_task *next)
+{
+    kernel_assert_can_block();
     enum kernel_scheduler_status status = activate_thread_address_space(next);
     if (status != KERNEL_SCHEDULER_STATUS_OK) __builtin_trap();
 #if BOAROS_COST_DIAGNOSTICS
@@ -1125,9 +1121,10 @@ enum kernel_scheduler_status kernel_scheduler_yield_current(void)
 
 void kernel_scheduler_charge_ticks(uint64_t elapsed_ticks, int from_user)
 {
+    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
     struct kernel_task *current = kernel_cpu_current()->current;
 
-    if (current == kernel_cpu_current()->idle) {
+    if (current && current->idle) {
         kernel_cpu_current()->idle_ticks += elapsed_ticks;
         return;
     }
@@ -1144,5 +1141,9 @@ void kernel_scheduler_charge_ticks(uint64_t elapsed_ticks, int from_user)
 
 uint64_t kernel_scheduler_idle_ticks(void)
 {
-    return kernel_cpu_current()->idle_ticks;
+    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+    uint64_t ticks = 0;
+    for (struct kernel_cpu *cpu = scheduler.cpus; cpu; cpu = cpu->scheduler_next)
+        ticks += cpu->idle_ticks;
+    return ticks;
 }

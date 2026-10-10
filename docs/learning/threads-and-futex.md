@@ -242,3 +242,5 @@ commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`。这不依赖随机sleep。�
 CPU记录还持有idle任务的归属、恢复状态、退出丢弃上下文与最后硬件timer期限。启动idle存储由静态启动owner持有，其他CPU的入口和存储尚未接入；不能复用同一idle执行栈来代替每CPU初始化。切换上下文类型独立于任务头，保留RV/LA既有汇编布局与检查。
 
 固定参考仍为`references/linux/kernel/sched/rt.c`，commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`的每CPU运行队列/消费量；当前BoarOS保持全局ready队列，不引入跨CPU预算借调。
+
+CPU布局变化后的fatal也可能来自测试对象：一次RV首次任务入口仍从旧偏移40读取CPU initialized，而新记录已改变位置。反汇编与对象时间戳确认wait聚焦对象缺少头依赖；补齐MMD/MP及Make导入后，原双RAM交接/退出测试通过。仅重新链接内核不能修复这种混用，干净CI通过也不能替代本地增量构建契约。

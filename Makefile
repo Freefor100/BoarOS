@@ -1917,9 +1917,9 @@ test-allocator-concurrency-host:
 		build/host/allocator-concurrency-$$shift || exit; \
 	done
 
-$(BUILD_DIR)/sync-%.o: tests/sync/native.c
+$(BUILD_DIR)/sync-%.o: tests/sync/native.c Makefile
 	@mkdir -p $(dir $@)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -DBOAROS_SYNC_CASE=$* -c $< -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -DBOAROS_SYNC_CASE=$* -c $< -o $@
 $(BUILD_DIR)/sync-%: $(OBJECTS) $(BUILD_DIR)/sync-%.o arch/riscv/linker.ld
 	$(CC) $(LDFLAGS) -Wl,--wrap=kernel_main -o $@ $(OBJECTS) $(BUILD_DIR)/sync-$*.o
 .PHONY: test-sync-riscv
@@ -1933,9 +1933,9 @@ test-wait-host:
 	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -Itests/host/sync -idirafter include tests/host/wait.c kernel/cpu.c kernel/raw_lock.c kernel/sched/park.c kernel/sched/runqueue.c -Wl,--wrap=kernel_raw_lock_release -o build/host/wait
 	build/host/wait
 
-$(BUILD_DIR)/wait-native.o: tests/wait/native.c
+$(BUILD_DIR)/wait-native.o: tests/wait/native.c Makefile
 	@mkdir -p $(dir $@)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c $< -o $@
 $(BUILD_DIR)/wait-native: $(OBJECTS) $(BUILD_DIR)/wait-native.o arch/riscv/linker.ld
 	$(CC) $(LDFLAGS) -Wl,--wrap=kernel_scheduler_init,--wrap=kernel_wait_backend_switch -o $@ $(OBJECTS) $(BUILD_DIR)/wait-native.o
 .PHONY: test-wait-riscv
@@ -1950,6 +1950,9 @@ test-sleep-lock-host:
 
 test-riscv: test-wait-riscv
 
+$(BUILD_DIR)/sync-%.d: ;
+-include $(BUILD_DIR)/wait-native.d $(wildcard $(BUILD_DIR)/sync-*.d)
+
 .PHONY: test-scheduler-handoff-host
 test-scheduler-handoff-host:
 	@mkdir -p build/host
@@ -1959,7 +1962,7 @@ test-scheduler-handoff-host:
 .PHONY: test-sched-concurrency-host
 test-sched-concurrency-host:
 	@mkdir -p build/host
-	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -Itests/host/sync -idirafter include tests/host/sched_concurrency.c kernel/cpu.c kernel/raw_lock.c kernel/sched/scheduling.c kernel/sched/policy.c kernel/sched/runqueue.c -Wl,--gc-sections -o build/host/sched-concurrency
+	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -Itests/host/sync -idirafter include tests/host/sched_concurrency.c kernel/cpu.c kernel/raw_lock.c kernel/sched/park.c kernel/sched/scheduling.c kernel/sched/policy.c kernel/sched/runqueue.c -Wl,--gc-sections,--wrap=kernel_sched_policy_charge,--wrap=kernel_sched_policy_set -o build/host/sched-concurrency
 	build/host/sched-concurrency
 
 test-riscv: test-scheduler-handoff-riscv

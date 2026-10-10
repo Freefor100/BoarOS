@@ -40,8 +40,14 @@ static void account_cpu(struct kernel_cpu *cpu, uint64_t now)
     kernel_rt_bandwidth_account(&cpu->rt_bandwidth, now, is_rt(cpu->current));
 }
 
-void scheduler_account_runtime(void)
+void scheduler_account_runtime_locked(void)
 { account_cpu(kernel_cpu_current(), kernel_time_monotonic_ns()); }
+
+void scheduler_account_runtime(void)
+{
+    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+    scheduler_account_runtime_locked();
+}
 
 struct kernel_task *ready_first(void)
 { return scheduler.runqueue.first ? scheduler.runqueue.first->owner : 0; }
@@ -87,15 +93,36 @@ void ready_enqueue(struct kernel_task *task, int head)
     } else ready_enqueue_locked(task, head);
 }
 void ready_append(struct kernel_task *task) { ready_enqueue(task, 0); }
-struct kernel_task *ready_pop(void)
+struct kernel_task *scheduler_select_next_locked(struct kernel_cpu *cpu,
+    struct kernel_task *previous, int ready_allowed)
 {
-    struct kernel_task *task = ready_best();
-    if (task) ready_remove(task);
-    return task;
+    if (!cpu || cpu != kernel_cpu_current() || !previous || cpu->current != previous ||
+        cpu->switch_previous || !previous->wait.on_cpu || !cpu->raw_locks ||
+        cpu->raw_locks->lock != &kernel_wait_domain) __builtin_trap();
+    struct kernel_task *next = ready_allowed ? ready_best_locked() : 0;
+    if (!next) next = cpu->idle;
+    if (next == previous) return 0;
+    if (!next || next->wait.on_cpu || (next->idle && next->cpu != cpu)) __builtin_trap();
+    if (!next->idle) {
+        ready_remove_locked(next);
+        next->state = KERNEL_THREAD_STATE_RUNNING;
+    }
+    /* 摘队列与取得执行owner是同一发布点，旧owner由新栈交接释放。 */
+    next->wait.on_cpu = 1;
+    next->cpu = cpu;
+    cpu->current = next;
+    cpu->switch_previous = previous;
+    cpu->rotate_other = 0;
+    return next;
 }
 
 void scheduler_rearm_timer(void)
 {
+    uintptr_t irq = arch_interrupt_save();
+    struct kernel_cpu *cpu = kernel_cpu_current();
+    uint64_t deadline;
+    {
+    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
     uint64_t delay = kernel_rt_bandwidth_delay(&kernel_cpu_current()->rt_bandwidth,
         is_rt(kernel_cpu_current()->current),
         scheduler.runqueue.first && scheduler.runqueue.first->priority != 0);
@@ -105,7 +132,7 @@ void scheduler_rearm_timer(void)
         if (!slice) slice = 1;
         if (!delay || slice < delay) delay = slice;
     }
-    uint64_t deadline = 0;
+    deadline = 0;
     if (delay && kernel_time_is_initialized()) {
         uint64_t now = kernel_cpu_current()->rt_bandwidth.last_account_ns;
         uint64_t target = UINT64_MAX - now < delay ? UINT64_MAX : now + delay;
@@ -114,22 +141,21 @@ void scheduler_rearm_timer(void)
         else if (status != KERNEL_TIME_STATUS_OK) __builtin_trap();
     }
     /* 最早阻塞期限与 RT/时间片预算同为 tick 域；取最小者编入硬件事件。 */
-    {
-        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-        struct kernel_task *blocked = deadline_index_first();
-        if (blocked != 0 && (!deadline || blocked->wakeup_deadline < deadline))
-            deadline = blocked->wakeup_deadline;
+    struct kernel_task *blocked = deadline_index_first();
+    if (blocked != 0 && (!deadline || blocked->wakeup_deadline < deadline))
+        deadline = blocked->wakeup_deadline;
+    cpu->armed_deadline = deadline;
     }
-    kernel_cpu_current()->armed_deadline = deadline;
     enum arch_timer_status status = arch_timer_set_scheduler_deadline(deadline);
     if (status != ARCH_TIMER_STATUS_OK && status != ARCH_TIMER_STATUS_NOT_STARTED)
         __builtin_trap();
+    arch_interrupt_restore(irq);
 }
 
 enum kernel_scheduler_status scheduler_reschedule(int rotate_other, int voluntary)
 {
-    scheduler_account_runtime();
     if (kernel_cpu_current()->preempt_depth) {
+        scheduler_account_runtime();
         if (voluntary) __builtin_trap();
         kernel_cpu_request_schedule(kernel_cpu_current());
         kernel_cpu_current()->rotate_other |= rotate_other != 0;
@@ -140,8 +166,10 @@ enum kernel_scheduler_status scheduler_reschedule(int rotate_other, int voluntar
     rotate_other |= kernel_cpu_current()->rotate_other;
     kernel_cpu_current()->rotate_other = 0;
     struct kernel_task *current = kernel_cpu_current()->current;
+    struct kernel_task *selected;
     {
     KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+    scheduler_account_runtime_locked();
     struct kernel_task *next = ready_best_locked();
     int throttled = is_rt(current) && !kernel_rt_bandwidth_eligible(&kernel_cpu_current()->rt_bandwidth);
     int expired = current != kernel_cpu_current()->idle && kernel_sched_policy_expired(&current->scheduling);
@@ -164,8 +192,10 @@ enum kernel_scheduler_status scheduler_reschedule(int rotate_other, int voluntar
         current->wait.ready_pending = 1;
         current->wait.ready_head = !rotate;
     } else kernel_cpu_current()->idle_context_saved = 1U;
+    selected = scheduler_select_next_locked(kernel_cpu_current(), current, 1);
     }
-    return scheduler_switch_current_away(current);
+    if (!selected) __builtin_trap();
+    return scheduler_switch_claimed(current, selected);
 }
 
 void kernel_scheduler_prepare_idle_return(void)
@@ -187,11 +217,13 @@ int kernel_task_sched_get(struct kernel_task *caller, int32_t pid,
                            struct kernel_sched_policy *state)
 {
     if (pid < 0) return -KERNEL_EINVAL;
-    uintptr_t irq = arch_interrupt_save();
-    struct kernel_task *task = sched_target(caller, pid);
-    if (task) *state = task->scheduling;
-    arch_interrupt_restore(irq);
-    return task ? 0 : -KERNEL_ESRCH;
+    int result = -KERNEL_ESRCH;
+    {
+        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        struct kernel_task *task = sched_target(caller, pid);
+        if (task) { *state = task->scheduling; result = 0; }
+    }
+    return result;
 }
 
 int kernel_task_sched_set(struct kernel_task *caller, int32_t pid,
@@ -199,28 +231,39 @@ int kernel_task_sched_set(struct kernel_task *caller, int32_t pid,
 {
     if (pid < 0) return -KERNEL_EINVAL;
     uintptr_t irq = arch_interrupt_save();
-    struct kernel_task *task = sched_target(caller, pid);
-    if (!task) { arch_interrupt_restore(irq); return -KERNEL_ESRCH; }
-    scheduler_account_runtime();
-    struct kernel_sched_policy updated = task->scheduling;
-    int result = kernel_sched_policy_set(&updated, policy, priority, keep_policy);
-    if (!result) {
-        int old_priority = task->scheduling.priority;
-        int move = updated.priority != old_priority;
-        int queued = task->ready_node.queued;
-        if (move && queued) ready_remove(task);
-        task->scheduling = updated;
-        if (move && queued) ready_enqueue(task, updated.priority < old_priority);
-        kernel_cpu_request_schedule(kernel_cpu_current());
-        scheduler_rearm_timer();
+    int result = -KERNEL_ESRCH;
+    {
+        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        struct kernel_task *task = sched_target(caller, pid);
+        if (task) {
+            struct kernel_cpu *cpu = kernel_cpu_current();
+            uint64_t now = kernel_time_monotonic_ns();
+            account_cpu(cpu, now);
+            if (task->wait.on_cpu && task->cpu != cpu) {
+                if (!task->cpu || task->cpu->current != task) __builtin_trap();
+                account_cpu(task->cpu, now);
+            }
+            struct kernel_sched_policy updated = task->scheduling;
+            result = kernel_sched_policy_set(&updated, policy, priority, keep_policy);
+            if (!result) {
+                int old_priority = task->scheduling.priority;
+                int move = updated.priority != old_priority;
+                int queued = task->ready_node.queued;
+                if (move && queued) ready_remove_locked(task);
+                task->scheduling = updated;
+                if (move && queued) ready_enqueue_locked(task, updated.priority < old_priority);
+                kernel_cpu_request_schedule(task->cpu ? task->cpu : cpu);
+            }
+        }
     }
+    if (!result) scheduler_rearm_timer();
     arch_interrupt_restore(irq);
     return result;
 }
 
 void kernel_scheduler_rt_bandwidth_get(int64_t *period_us, int64_t *runtime_us)
 {
-    uintptr_t irq = arch_interrupt_save();
+    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
     if (scheduler.initialized != KERNEL_SCHEDULER_INITIALIZED) {
         *period_us = 1000000; *runtime_us = 950000;
     } else {
@@ -228,7 +271,6 @@ void kernel_scheduler_rt_bandwidth_get(int64_t *period_us, int64_t *runtime_us)
         *runtime_us = scheduler.rt_configuration.runtime_ns < 0 ? -1 :
                       scheduler.rt_configuration.runtime_ns / 1000;
     }
-    arch_interrupt_restore(irq);
 }
 
 int kernel_scheduler_rt_bandwidth_set(int runtime_field, int64_t value)

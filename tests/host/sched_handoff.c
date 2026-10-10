@@ -21,11 +21,12 @@ enum riscv_timer_status riscv_timer_set_scheduler_deadline(uint64_t deadline)
 enum kernel_time_status kernel_time_deadline_from_monotonic(uint64_t ns, uint64_t *ticks)
 { *ticks = ns; return KERNEL_TIME_STATUS_OK; }
 struct kernel_task *deadline_index_first(void) { return 0; }
-enum kernel_scheduler_status scheduler_switch_current_away(struct kernel_task *previous)
+enum kernel_scheduler_status scheduler_switch_claimed(struct kernel_task *previous, struct kernel_task *next)
 {
-    assert(previous == cpu.current && !cpu.raw_locks && !cpu.preempt_depth);
+    assert(previous != cpu.current && next == cpu.current &&
+           !cpu.raw_locks && !cpu.preempt_depth);
     switches++;
-    selected = ready_best();
+    selected = next;
     return KERNEL_SCHEDULER_STATUS_OK;
 }
 static void setup(int policy, int priority, int next_priority)
@@ -41,6 +42,7 @@ static void setup(int policy, int priority, int next_priority)
     running.wait.on_cpu = 1;
     assert(!kernel_sched_policy_set(&running.scheduling, policy, priority, 0));
     peer.scheduling.priority = next_priority;
+    peer.state = KERNEL_THREAD_STATE_READY;
     kernel_sched_enqueue(&scheduler.runqueue, &peer.ready_node, &peer,
                          (unsigned)next_priority, 0);
     struct kernel_rt_bandwidth initial_budget;
