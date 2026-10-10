@@ -58,6 +58,9 @@ IRQ仍保留，随后确认成功才归还资源；同一实例可再次启动�
 退出/owner分类及输入身份。RV默认仍为两种MMIO、512MiB、BoarOS八例；LA为固定
 Linux先行、BoarOS随后、两种RAM、四种模式共16例。同一原探针ELF逐次校验，
 stdout、退出、输入身份与EGD请求保留在临时`rng-run.*`，成功后的镜像立即删除。
+在途停止模式先等待宿主观察到真实EGD请求，再经console输入放行用户退出；
+宿主始终扣住熵响应，并在结果中记录`stop_request_confirmed`。只打印停止标记
+或内核提交计数不能替代该握手。host门禁覆盖用户输出/后端请求的两种到达顺序。
 正常/缺设备/延迟/在途退出的LA16例及RV八例均通过；独立GNU五形态回归通过。
 
 Linux平台缓存为`build/linux-la-platform`，启用内建RNG/net/failover/RTC；旧
