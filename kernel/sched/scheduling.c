@@ -87,13 +87,12 @@ void ready_enqueue(struct kernel_task *task, int head)
     } else ready_enqueue_locked(task, head);
 }
 void ready_append(struct kernel_task *task) { ready_enqueue(task, 0); }
-struct kernel_task *scheduler_select_next_locked(struct kernel_cpu *cpu,
-    struct kernel_task *previous, int ready_allowed)
+static struct kernel_task *claim_next_locked(struct kernel_cpu *cpu,
+    struct kernel_task *previous, struct kernel_task *next)
 {
     if (!cpu || cpu != kernel_cpu_current() || !previous || cpu->current != previous ||
         cpu->switch_previous || !previous->wait.on_cpu || !cpu->raw_locks ||
         cpu->raw_locks->lock != &kernel_wait_domain) __builtin_trap();
-    struct kernel_task *next = ready_allowed ? ready_best_locked() : 0;
     if (!next) next = cpu->idle;
     if (next == previous) return 0;
     if (!next || next->wait.on_cpu || (next->idle && next->cpu != cpu)) __builtin_trap();
@@ -108,6 +107,12 @@ struct kernel_task *scheduler_select_next_locked(struct kernel_cpu *cpu,
     cpu->switch_previous = previous;
     cpu->rotate_other = 0;
     return next;
+}
+
+struct kernel_task *scheduler_select_next_locked(struct kernel_cpu *cpu,
+    struct kernel_task *previous, int ready_allowed)
+{
+    return claim_next_locked(cpu, previous, ready_allowed ? ready_best_locked() : 0);
 }
 
 void scheduler_rearm_timer(void)
@@ -186,7 +191,7 @@ enum kernel_scheduler_status scheduler_reschedule(int rotate_other, int voluntar
         current->wait.ready_pending = 1;
         current->wait.ready_head = !rotate;
     } else kernel_cpu_current()->idle_context_saved = 1U;
-    selected = scheduler_select_next_locked(kernel_cpu_current(), current, 1);
+    selected = claim_next_locked(kernel_cpu_current(), current, next);
     }
     if (!selected) __builtin_trap();
     return scheduler_switch_claimed(current, selected);

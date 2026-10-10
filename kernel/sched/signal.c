@@ -216,6 +216,11 @@ static int signal_dispatchable_locked(const struct kernel_task *task)
 
 static int signal_dispatchable(const struct kernel_task *task)
 {
+    /* Running owner keeps its immutable prefix and local execution state;
+     * foreign targets still require the shared metadata domain. */
+    if (task && arch_current_thread_get() == task && kernel_cpu_current()->current == task)
+        return !task->idle && task->magic == KERNEL_THREAD_MAGIC && task->arch.user_mode == 1;
+
     KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
     return signal_dispatchable_locked(task);
 }

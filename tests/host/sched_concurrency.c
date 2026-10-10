@@ -41,6 +41,13 @@ struct kernel_wait_record *kernel_wait_record_of(struct kernel_task *task)
 { return &task->wait; }
 void kernel_wait_backend_ready(struct kernel_task *task)
 { ready_enqueue_locked(task, task->wait.ready_head); }
+int kernel_wait_backend_initialized(void) { return 1; }
+struct kernel_task *kernel_wait_current_task(void) { return active_cpu->current; }
+struct kernel_wait_node *kernel_wait_default_node(struct kernel_task *task)
+{ return &task->default_wait_node; }
+void kernel_wait_backend_notify(struct kernel_task *task, uint32_t reason)
+{ (void)task; (void)reason; }
+void kernel_wait_backend_quiesce(void) { __builtin_trap(); }
 
 static unsigned disposals, notifications;
 static struct kernel_task *disposal_target;
@@ -111,7 +118,7 @@ static void lifetime_generation(void)
     assert(fresh == &tasks[1]);
     scheduler_task_put(fresh);
     scheduler_task_put(borrow);
-    assert(notifications == 1);
+    assert(notifications == 0 && disposals == 1);
     scheduler_task_collect();
     assert(disposals == 1 && !scheduler.retired_pending && !scheduler.retired_tasks);
     puts("scheduler reserved identity, lookup borrow, retirement and generation passed");
@@ -150,6 +157,52 @@ static void retired_cursor_chain(void)
     assert(!cursor.task);
     scheduler_task_collect();
     assert(disposals == 3 && !scheduler.retired_pending && !scheduler.task_count);
+}
+
+static void event_claim_handoff(void)
+{
+    scheduler = (struct kernel_scheduler){0};
+    tasks[0] = tasks[1] = tasks[2] = (struct kernel_task){0};
+    kernel_cpu_initialize(&cpus[0], 7, 0);
+    active_cpu = &cpus[0];
+    sync_test_irq = 0;
+    kernel_raw_lock_init(&kernel_wait_domain, KERNEL_RAW_RANK_SCHEDULER);
+    kernel_wait_queue_init(&scheduler.cleanup_queue);
+    kernel_wait_queue_init(&tasks[0].child_exit_queue);
+    struct kernel_task *child = &tasks[1], *waiter = &tasks[2];
+    child->parent = &tasks[0];
+    child->reaping = 1; /* first wait4 owns an unconsumed STOP/CONT report */
+    active_cpu->current = waiter;
+    struct kernel_wait_token parent_wait, cleanup_wait;
+    assert(kernel_wait_prepare(&tasks[0].child_exit_queue, 0, 0, &parent_wait) == KERNEL_SCHEDULER_STATUS_OK);
+    assert(waiter->wait.phase == KERNEL_WAIT_PREPARED && tasks[0].child_exit_queue.registrations == 1);
+    /* While the first copy sleeps, exit is published and the worker registers. */
+    {
+        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        child->state = KERNEL_THREAD_STATE_EXITED;
+        exited_append_locked(child);
+        assert(!scheduler_cleanup_ready_locked());
+        assert(scheduler_task_claim_exit_locked(child) == KERNEL_SCHEDULER_STATUS_BUSY);
+    }
+    active_cpu->current = &idles[0];
+    idles[0] = (struct kernel_task){0};
+    assert(kernel_wait_prepare(&scheduler.cleanup_queue, 0, 0, &cleanup_wait) == KERNEL_SCHEDULER_STATUS_OK);
+    /* EFAULT releases only the claim; both actual registrations are notified. */
+    scheduler_task_wait_claim_release(child);
+    assert(waiter->wait.phase == KERNEL_WAIT_NOTIFIED && idles[0].wait.phase == KERNEL_WAIT_NOTIFIED);
+    {
+        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        assert(scheduler_cleanup_ready_locked());
+        assert(scheduler_task_claim_exit_locked(child) == KERNEL_SCHEDULER_STATUS_OK);
+        exited_remove_locked(child);
+        scheduler_task_claim_release_locked(child);
+    }
+    assert(kernel_wait_finish(&cleanup_wait) == KERNEL_SCHEDULER_STATUS_OK);
+    active_cpu->current = waiter;
+    assert(kernel_wait_finish(&parent_wait) == KERNEL_SCHEDULER_STATUS_OK);
+    assert(!scheduler.cleanup_queue.registrations && !tasks[0].child_exit_queue.registrations);
+    assert(!waiter->wait.borrows && !tasks[0].storage_borrows);
+    puts("wait-event claim release hands off to registered waiter and reaper");
 }
 
 static struct kernel_task *lifetime_borrow[4];
@@ -520,6 +573,7 @@ int main(void)
 {
     lifetime_generation();
     retired_cursor_chain();
+    event_claim_handoff();
     concurrent_retirement(2);
     concurrent_retirement(4);
     concurrent_exit_claim(2);

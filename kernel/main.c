@@ -736,6 +736,7 @@ static void storage_cleanup_worker(void *argument)
             sbi_shutdown();
         }
         if (scheduler_status != KERNEL_SCHEDULER_STATUS_EMPTY &&
+            scheduler_status != KERNEL_SCHEDULER_STATUS_BUSY &&
             scheduler_status != KERNEL_SCHEDULER_STATUS_RESOURCE_CLEANUP) {
             shutdown_for_scheduler_error(scheduler_status);
         }

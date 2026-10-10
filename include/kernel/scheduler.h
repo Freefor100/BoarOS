@@ -279,7 +279,9 @@ enum kernel_mm_status kernel_scheduler_resolve_current_user_fault(
 enum kernel_scheduler_status kernel_scheduler_reap_one(
     struct kernel_thread_completion *completion);
 
-/* O(1) cleanup work predicate; call with interrupts disabled. */
+/* O(1) immediately executable cleanup predicate, with interrupts disabled.
+ * Outstanding lookup/event/execution owners are pending, not runnable work;
+ * the worker parks until their release notification. reap_one may return BUSY. */
 int kernel_scheduler_reap_pending(void);
 
 /* PID 1 shutdown, with interrupts disabled: terminate remaining user groups

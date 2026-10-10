@@ -229,6 +229,7 @@ struct kernel_task {
 
 struct kernel_scheduler {
     uint32_t initialized;
+    uint32_t shutdown_waiting;
     uint64_t kernel_context;
     struct kernel_cpu *cpus;
     struct kernel_task *all_tasks;
@@ -276,6 +277,10 @@ void scheduler_task_unlink_locked(struct kernel_task *);
 void scheduler_task_retire(struct kernel_task *);
 void scheduler_task_collect(void);
 void scheduler_task_claim_release_locked(struct kernel_task *);
+/* wait4 owns task storage through this call; release can expose an unconsumed
+ * event or exited task, and notifies existing queue owners outside the domain. */
+void scheduler_task_wait_claim_release(struct kernel_task *);
+int scheduler_cleanup_ready_locked(void);
 void exited_append_locked(struct kernel_task *);
 void exited_remove_locked(struct kernel_task *);
 enum kernel_scheduler_status scheduler_task_claim_exit_locked(struct kernel_task *);

@@ -119,6 +119,10 @@ locked变体仅供已持调度域的短操作使用。借用不固定MM、文件
 父子与组校验跨段保留存储，代次变化时重查；proc调度/身份值受域保护，MM/TTY内容仍按单CPU业务契约读取。
 
 join和reaper在同一域竞争唯一清理资格，运行中的旧栈不能取得回收资格。
+wait4的STOP/CONT报告也持临时资格，复制可以睡眠；释放资格后通知父等待队列，复制失败时事件仍可选。
+退出队头仍有事件/等待/执行owner时，reaper返回BUSY；cleanup等待真实归还通知，不将待归还借用当作可立即回收的工作。
+PID1收尾另等退休存储owner全部归还，最后释放通知已登记的cleanup；空索引不能代替页基线。
+退休元数据的最后借用在普通可信调用栈上归还页；禁止抢占的回调范围只通知已有cleanup owner，raw持有者不得触发释放。
 退出通知cleanup后再选择next；join在新栈完成点通知，避免既提前释放旧栈又丢失无timer进展。
 `make test-sched-concurrency-host`涵盖2/4线程的选择、策略竞争、查找/退休与join/reaper争用；
 `make test-sched-lifecycle-riscv test-sched-lifecycle-loongarch`在512MiB/1GiB验证真实换栈、

@@ -55,6 +55,76 @@ static void worker(void *argument)
     arch_interrupt_restore(irq);
 }
 #ifdef BOAROS_SCHED_LIFECYCLE
+static struct kernel_task *held_task;
+static unsigned cleanup_phase;
+static void cleanup_probe(void *unused)
+{
+    (void)unused;
+    (void)arch_interrupt_save();
+    kernel_scheduler_register_cleanup();
+    struct kernel_thread_completion completion;
+    check(kernel_scheduler_reap_one(&completion) == KERNEL_SCHEDULER_STATUS_BUSY);
+    check(!kernel_scheduler_reap_pending());
+    cleanup_phase = 1;
+    kernel_scheduler_wait_cleanup(0);
+    check(cleanup_phase == 2);
+    check(kernel_scheduler_reap_one(&completion) == KERNEL_SCHEDULER_STATUS_EMPTY);
+    check(held_task->retirement == 2 && held_task->storage_borrows == 1);
+    check(!kernel_scheduler_reap_pending());
+    check(kernel_scheduler_stop_users()); /* root must await this storage owner */
+    cleanup_phase = 3;
+    kernel_scheduler_wait_cleanup(0);
+    check(cleanup_phase == 4 && !scheduler.retired_pending);
+    {
+        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        scheduler.cleanup_task = 0;
+    }
+}
+static void release_probe(void *unused)
+{
+    (void)unused;
+    (void)arch_interrupt_save();
+    check(cleanup_phase == 1 && scheduler.cleanup_task->wait.phase == KERNEL_WAIT_COMMITTED &&
+          !scheduler.cleanup_task->wait.on_cpu);
+    cleanup_phase = 2;
+    scheduler_task_wait_claim_release(held_task);
+    check(kernel_scheduler_yield_current() == KERNEL_SCHEDULER_STATUS_OK);
+    check(cleanup_phase == 3 && scheduler.cleanup_task->wait.phase == KERNEL_WAIT_COMMITTED &&
+          !scheduler.cleanup_task->wait.on_cpu);
+    cleanup_phase = 4;
+    scheduler_task_put(held_task);
+    held_task = 0;
+    check(kernel_scheduler_yield_current() == KERNEL_SCHEDULER_STATUS_OK);
+}
+static void cleanup_owner_progress(struct physical_page_allocator *allocator)
+{
+    uint64_t baseline = physical_page_available(allocator);
+    struct kernel_thread_join join = {0};
+    check(kernel_thread_create_joinable(empty, 0, &join) == KERNEL_SCHEDULER_STATUS_OK);
+    {
+        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        held_task = join.task;
+        scheduler_task_get_locked(held_task);
+        held_task->reaping = 1; /* wait-event copy still owns the task */
+    }
+    check(kernel_scheduler_yield_current() == KERNEL_SCHEDULER_STATUS_OK);
+    check(held_task->state == KERNEL_THREAD_STATE_EXITED && !held_task->wait.on_cpu);
+    cleanup_phase = 0;
+    check(kernel_thread_create(cleanup_probe, 0) == KERNEL_SCHEDULER_STATUS_OK);
+    check(kernel_thread_create(release_probe, 0) == KERNEL_SCHEDULER_STATUS_OK);
+    check(kernel_scheduler_yield_current() == KERNEL_SCHEDULER_STATUS_OK);
+    check(cleanup_phase == 4 && !held_task && !scheduler.cleanup_task && !join.task);
+    /* The probe cleared cleanup_task before returning, so exit selected idle;
+     * let the still-ready release owner resume its real return path. */
+    check(kernel_scheduler_yield_current() == KERNEL_SCHEDULER_STATUS_OK);
+    struct kernel_thread_completion completion;
+    for (unsigned i = 0; i < 2; i++)
+        check(kernel_scheduler_reap_one(&completion) == KERNEL_SCHEDULER_STATUS_OK);
+    check(physical_page_available(allocator) == baseline);
+    check(!scheduler.cleanup_queue.registrations && !scheduler.cleanup_queue.borrows);
+    check(physical_page_allocator_audit(allocator) == PHYSICAL_PAGE_STATUS_OK);
+    say("SCHED cleanup passed: claimed exit, real park, last borrow and owner baseline\n");
+}
 static void lifecycle(struct physical_page_allocator *allocator)
 {
     uint64_t baseline = physical_page_available(allocator);
@@ -73,6 +143,8 @@ static void lifecycle(struct physical_page_allocator *allocator)
     check(!join.task && task->retirement == 2 && task->storage_borrows == 1);
     check(task->stack_physical_address == KERNEL_THREAD_NO_PAGE);
     check(physical_page_available(allocator) + 1 == baseline);
+    /* A sleeping lookup owner is not immediately executable cleanup work. */
+    check(!kernel_scheduler_reap_pending());
     scheduler_task_put(task);
     scheduler_task_collect();
     check(!scheduler.retired_pending && !scheduler.retired_tasks);
@@ -109,6 +181,7 @@ static void run(struct physical_page_allocator *allocator)
     check(physical_page_allocator_audit(allocator) == PHYSICAL_PAGE_STATUS_OK);
 #ifdef BOAROS_SCHED_LIFECYCLE
     lifecycle(allocator);
+    cleanup_owner_progress(allocator);
 #endif
     say("WAIT native passed: first-entry, pre-switch wake, timeout, exit and owner baseline\n");
     shutdown();

@@ -54,6 +54,16 @@ static struct kernel_task *put_locked(struct kernel_task *task)
     return next;
 }
 
+static void disposal_progress(void)
+{
+    /* Resources and old stack are already gone. A normal trusted caller can
+     * return metadata now; callback/preemption scopes leave the real queue owner. */
+    struct kernel_cpu *cpu = kernel_cpu_current();
+    if (cpu->raw_locks) __builtin_trap();
+    if (!cpu->preempt_depth) scheduler_task_collect();
+    else scheduler_task_disposal_notify();
+}
+
 void scheduler_task_put(struct kernel_task *task)
 {
     if (!task) __builtin_trap();
@@ -68,7 +78,7 @@ void scheduler_task_put(struct kernel_task *task)
             notify |= old->retirement == 3;
         }
     } while (task);
-    if (notify) scheduler_task_disposal_notify();
+    if (notify) disposal_progress();
 }
 
 void scheduler_task_publish_locked(struct kernel_task *task)
@@ -124,12 +134,16 @@ void scheduler_task_retire(struct kernel_task *task)
 
 void scheduler_task_collect(void)
 {
+    int released = 0, notify = 0;
     for (;;) {
         struct kernel_task *task;
         {
             KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
             task = scheduler.retired_tasks;
-            if (!task) return;
+            if (!task) {
+                notify = released && scheduler.shutdown_waiting && !scheduler.retired_pending;
+                break;
+            }
             scheduler.retired_tasks = task->retired_next;
             if (!scheduler.retired_pending) __builtin_trap();
             scheduler.retired_pending--;
@@ -138,7 +152,12 @@ void scheduler_task_collect(void)
         }
         /* No rank40 lock may be held while the allocator consumes the page. */
         (void)physical_page_release(scheduler.allocator, task->physical_address);
+        released = 1;
     }
+    /* PID1 teardown may be waiting for a borrowed retired record even after
+     * user indices are empty. Ordinary inline disposal needs no worker turn. */
+    if (notify && kernel_cpu_current()->current != scheduler.cleanup_task)
+        scheduler_task_disposal_notify();
 }
 
 void scheduler_task_cursor_begin(struct scheduler_task_cursor *cursor)
@@ -161,7 +180,7 @@ void scheduler_task_cursor_next(struct scheduler_task_cursor *cursor)
         if (link_owner && put_locked(link_owner)) __builtin_trap(); /* next was pinned above */
         notify = old->retirement == 3;
     }
-    if (notify) scheduler_task_disposal_notify();
+    if (notify) disposal_progress();
 }
 
 void scheduler_task_cursor_end(struct scheduler_task_cursor *cursor)
@@ -256,6 +275,41 @@ void scheduler_task_claim_release_locked(struct kernel_task *task)
     domain_owned();
     if (!task || !task->reaping) __builtin_trap();
     task->reaping = 0;
+}
+
+int scheduler_cleanup_ready_locked(void)
+{
+    domain_owned();
+    struct kernel_task *task = scheduler.exited_head;
+    /* Borrowed retirement is pending ownership, not executable work. A
+     * temporary event/old-stack owner must run before this head can be reaped. */
+    return scheduler.retired_tasks || (task && !task->reaping &&
+        !task->wait.on_cpu && !task->wait.borrows);
+}
+
+void scheduler_task_wait_claim_release(struct kernel_task *task)
+{
+    struct kernel_wait_cursor parent_cursor, cleanup_cursor;
+    struct kernel_task *parent = 0;
+    int wake_parent = 0, wake_cleanup = 0;
+    {
+        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        scheduler_task_claim_release_locked(task);
+        if (task->parent) {
+            parent = task->parent;
+            wake_parent = kernel_wait_cursor_prepare_locked(&parent->child_exit_queue, &parent_cursor, 1);
+            if (wake_parent) scheduler_task_get_locked(parent);
+        }
+        if (task->exit_queued)
+            wake_cleanup = kernel_wait_cursor_prepare_locked(&scheduler.cleanup_queue, &cleanup_cursor, 1);
+    }
+    /* Failed user copies leave the event selectable. Queue/cursor ownership
+     * spans notification; callbacks and the parent's final put stay outside. */
+    if (wake_parent) {
+        kernel_wait_cursor_wake(&parent_cursor, 1);
+        scheduler_task_put(parent);
+    }
+    if (wake_cleanup) kernel_wait_cursor_wake(&cleanup_cursor, 1);
 }
 
 void scheduler_group_cursor_begin(struct kernel_task *task, struct scheduler_group_cursor *cursor)

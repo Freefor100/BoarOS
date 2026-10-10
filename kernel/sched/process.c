@@ -1142,42 +1142,77 @@ static enum kernel_scheduler_status select_wait_child(struct kernel_task *parent
     *event = 0;
     *matching = 0;
     struct kernel_task *leader = parent->group_leader;
-    enum kernel_scheduler_status status = validate_child_list(leader, 0);
-    if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
-    struct scheduler_task_cursor cursor;
-    scheduler_task_cursor_begin(&cursor);
-    while (cursor.task) {
+    SCHEDULER_TASK_BORROW(owner, 0);
+    uint64_t epoch = 0;
+    uintptr_t previous = 0;
+    uint32_t count = 0;
+    int restart = 1;
+    for (;;) {
+        struct kernel_task *next_owner = 0;
+        int done = 0;
+        enum kernel_scheduler_status status = KERNEL_SCHEDULER_STATUS_OK;
         {
             KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-            struct kernel_task *child = cursor.task;
-            if (child->accounted && child->parent == leader &&
-                !((options & LINUX___WNOTHREAD) && child->child_creator != process_identity(parent, KERNEL_PID_TID)) &&
-                !((options & LINUX___WCLONE) && !(options & LINUX___WALL)) &&
-                wait_child_matches(parent, child, pid)) {
-                *matching = 1;
-                uint32_t kind = child->state == KERNEL_THREAD_STATE_ZOMBIE ? 1 :
-                    child->group_stopped && (options & LINUX_WUNTRACED) && !child->stop_notified ? 2 :
-                    !child->group_stopped && (options & LINUX_WCONTINUED) && child->continue_notified ? 3 : 0;
-                if (kind && !child->reaping) {
-                    child->reaping = 1;
+            if (!leader) return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
+            if (leader->children_epoch != epoch) restart = 1;
+            if (restart) {
+                if (!leader || leader->magic != KERNEL_THREAD_MAGIC || !leader->tid_owned ||
+                    ((leader->first_child == 0) != (leader->last_child == 0)) ||
+                    (leader->first_child && leader->first_child->previous_sibling) ||
+                    (leader->last_child && leader->last_child->next_sibling))
+                    return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
+                epoch = leader->children_epoch;
+                count = previous = 0;
+                *matching = 0;
+            }
+            struct kernel_task *child = restart ? leader->first_child : owner;
+            restart = 0;
+            for (unsigned n = 0; child && n < 16; n++) {
+                if (++count > KERNEL_PID_LIMIT || child == parent || child->magic != KERNEL_THREAD_MAGIC ||
+                    child->idle || child->arch.user_mode != 1 || !child->tid_owned || child->tid <= 0 ||
+                    child->parent != leader || (uintptr_t)child->previous_sibling != previous ||
+                    child->publish_completion || child->state < KERNEL_THREAD_STATE_READY ||
+                    child->state > KERNEL_THREAD_STATE_GROUP_DEAD) {
+                    status = KERNEL_SCHEDULER_STATUS_INVALID_STATE;
+                    break;
+                }
+                if (!((options & LINUX___WNOTHREAD) && child->child_creator != process_identity(parent, KERNEL_PID_TID)) &&
+                    !((options & LINUX___WCLONE) && !(options & LINUX___WALL)) && wait_child_matches(parent, child, pid)) {
+                    *matching = 1;
+                    uint32_t kind = child->state == KERNEL_THREAD_STATE_ZOMBIE ? 1 :
+                        child->group_stopped && (options & LINUX_WUNTRACED) && !child->stop_notified ? 2 :
+                        !child->group_stopped && (options & LINUX_WCONTINUED) && child->continue_notified ? 3 : 0;
+                    if (kind && !child->reaping) {
+                        child->reaping = 1;
+                        scheduler_task_get_locked(child);
+                        *selected = child;
+                        *event = kind;
+                        return KERNEL_SCHEDULER_STATUS_OK;
+                    }
+                }
+                previous = (uintptr_t)child;
+                child = child->next_sibling;
+            }
+            if (status == KERNEL_SCHEDULER_STATUS_OK) {
+                if (!child) {
+                    done = 1;
+                    if (previous != (uintptr_t)leader->last_child) status = KERNEL_SCHEDULER_STATUS_INVALID_STATE;
+                } else {
                     scheduler_task_get_locked(child);
-                    *selected = child;
-                    *event = kind;
+                    next_owner = child;
                 }
             }
         }
-        if (*selected) break;
-        scheduler_task_cursor_next(&cursor);
+        if (owner) scheduler_task_put(owner);
+        owner = next_owner;
+        if (status != KERNEL_SCHEDULER_STATUS_OK || done) return status;
     }
-    scheduler_task_cursor_end(&cursor);
-    return KERNEL_SCHEDULER_STATUS_OK;
 }
 
 static void wait_claim_end(struct kernel_task **task)
 {
     if (!*task) return;
-    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-    scheduler_task_claim_release_locked(*task);
+    scheduler_task_wait_claim_release(*task);
 }
 
 enum kernel_scheduler_status kernel_scheduler_wait4_current(int64_t pid,
@@ -1195,17 +1230,21 @@ enum kernel_scheduler_status kernel_scheduler_wait4_current(int64_t pid,
         struct kernel_task *parent = kernel_cpu_current()->current;
         if (parent == kernel_cpu_current()->idle || parent->arch.user_mode != 1 || !parent->tid_owned)
             return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
-        struct kernel_wait_token token;
-        status = kernel_wait_prepare(&parent->group_leader->child_exit_queue, 0, 1, &token);
-        if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
+        struct kernel_wait_token token = {0};
         SCHEDULER_TASK_BORROW(child, 0);
         struct kernel_task *claim __attribute__((cleanup(wait_claim_end))) = 0;
         uint32_t event;
         int matching;
         status = select_wait_child(parent, pid, options, &child, &event, &matching);
         claim = child;
+        if (status == KERNEL_SCHEDULER_STATUS_OK && !child && matching && !(options & LINUX_WNOHANG)) {
+            status = kernel_wait_prepare(&parent->group_leader->child_exit_queue, 0, 1, &token);
+            if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
+            status = select_wait_child(parent, pid, options, &child, &event, &matching);
+            claim = child;
+        }
         if (status != KERNEL_SCHEDULER_STATUS_OK || child || !matching || (options & LINUX_WNOHANG)) {
-            enum kernel_scheduler_status finished = kernel_wait_finish(&token);
+            enum kernel_scheduler_status finished = token.task ? kernel_wait_finish(&token) : KERNEL_SCHEDULER_STATUS_OK;
             if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
             if (finished != KERNEL_SCHEDULER_STATUS_OK) return finished;
             if (!child) { *linux_result = matching ? 0 : -KERNEL_ECHILD; return KERNEL_SCHEDULER_STATUS_OK; }
@@ -1260,7 +1299,7 @@ void kernel_scheduler_register_cleanup(void)
 static int cleanup_waiting(uint64_t retry_deadline)
 {
     KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-    return (!scheduler.exited_head && !scheduler.retired_tasks) || retry_deadline;
+    return !scheduler_cleanup_ready_locked() || retry_deadline;
 }
 
 void kernel_scheduler_wait_cleanup(uint64_t retry_deadline)
@@ -1311,7 +1350,7 @@ void kernel_thread_join(struct kernel_thread_join *join)
 int kernel_scheduler_reap_pending(void)
 {
     KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-    return scheduler.exited_head || scheduler.retired_pending;
+    return scheduler_cleanup_ready_locked();
 }
 
 int kernel_scheduler_stop_users(void)
@@ -1332,6 +1371,11 @@ int kernel_scheduler_stop_users(void)
         }
         if (terminate) process_group_request_exit(task, KERNEL_THREAD_EXIT_SIGNAL, 9, 0);
         scheduler_task_cursor_next(&cursor);
+    }
+    {
+        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        scheduler.shutdown_waiting = 1;
+        pending |= scheduler.retired_pending != 0;
     }
     return pending;
 }
@@ -1799,6 +1843,14 @@ static uint32_t user_wait_status(
 
 static enum kernel_scheduler_status reparent_children(struct kernel_task *parent)
 {
+    enum kernel_scheduler_status status = validate_child_list(parent, 0);
+    if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
+    {
+        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        /* Most exiting children have no descendants. Validate their owner
+         * first, then avoid preparing an adoption transaction with no work. */
+        if (!parent->first_child) return KERNEL_SCHEDULER_STATUS_OK;
+    }
     SCHEDULER_TASK_BORROW(new_parent, 0);
     {
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
@@ -1808,8 +1860,6 @@ static enum kernel_scheduler_status reparent_children(struct kernel_task *parent
             new_parent = 0;
         if (new_parent) scheduler_task_get_locked(new_parent);
     }
-    enum kernel_scheduler_status status = validate_child_list(parent, 0);
-    if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
     if (new_parent) {
         status = validate_child_list(new_parent, 0);
         if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
