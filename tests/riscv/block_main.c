@@ -206,7 +206,9 @@ static void test_irq_reads(const void *dtb, struct physical_page_allocator *allo
     virt_uart_puts(" sleeps="); virt_uart_put_hex(stats.sleeps);
     virt_uart_puts(" runtime-polls="); virt_uart_put_hex(stats.runtime_polls);
     virt_uart_putc('\n');
-    if (irq_done != 2 || !stats.interrupts || !stats.sleeps || stats.runtime_polls)
+    /* IRQ可在提交返回后、wait_request复查前完成；正确字节和真实IRQ
+     * 不要求已完成请求再park。强制延迟/NBD的睡眠交接由io_sleep另验。 */
+    if (irq_done != 2 || !stats.interrupts || stats.runtime_polls)
         fail_block(47, 2, irq_done);
 }
 

@@ -84,6 +84,9 @@ host验证feature/reset失败、三个adapter的访问宽度/notify/BAR、token�
 真实块门禁包含legacy/modern MMIO与modern PCI、readonly/batch/flush、LA共享INTx
 及两种RAM的页/堆/任务栈/BAR回收；真实可睡眠I/O门禁覆盖两种传输×两种缓存
 模式、暂扣响应时计算进展、八槽部分补发、错误排空、取消和超时reset。
+RV块IRQ smoke核对两个请求的内容、IRQ完成及无运行期轮询；若IRQ在调用方检查前
+已完成，合法路径可以不睡眠。`test-io-sleep-riscv`另由host暂扣两个响应，确认
+真实任务已BLOCKED后才释放，并核对计算进展及至少两次睡眠，不能由smoke替代。
 真实PCI上的确认失败注入另验证初始化半成品、core消费后的BAR重试及根启动
 EIO/未发布PID1/资源基线；这是软件边界注入，固定QEMU自身仍提供同步reset。
 扩大RV架构、真实用户态、五形态glibc2.44、1366条ABI以及SQLite DELETE/WAL
