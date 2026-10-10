@@ -58,11 +58,18 @@ struct kernel_pid_registry {
 struct kernel_pid {
     kernel_pid_t number;
     uint32_t references;
+    uint32_t published; /* 0 private/reserved, 1 indexed, 2 retired */
     uint64_t generation;
     struct kernel_pid_registry *registry;
     struct kernel_pid *hash_next;
     struct kernel_pid_member *members[KERNEL_PID_ROLES];
 };
+/* reserve owns a number and generation but is invisible to find. Roles may
+ * be prepared while private; publish_reserved commits the lookup identity.
+ * Final put retires either state and leaves heap disposal to the caller. */
+enum kernel_pid_status kernel_pid_reserve(struct kernel_pid_registry *registry,
+                                         struct kernel_pid *prepared);
+enum kernel_pid_status kernel_pid_publish_reserved(struct kernel_pid *prepared);
 enum kernel_pid_status kernel_pid_publish(struct kernel_pid_registry *registry,
                                           struct kernel_pid *prepared);
 struct kernel_pid *kernel_pid_find(struct kernel_pid_registry *registry,

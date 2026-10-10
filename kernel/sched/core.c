@@ -2,6 +2,7 @@
 #include <arch/context.h>
 #include <kernel/files.h>
 #include <kernel/errno.h>
+#include <kernel/irq.h>
 #include <kernel/exec.h>
 #include <kernel/fs_context.h>
 #include <kernel/heap.h>
@@ -381,11 +382,18 @@ void kernel_scheduler_switch_finish(void)
 {
     struct kernel_cpu *cpu = kernel_cpu_current();
     if (!cpu->switch_previous) return;
-    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-    struct kernel_task *previous = cpu->switch_previous;
-    cpu->switch_previous = 0;
-    if (previous == cpu->current || !cpu->current->wait.on_cpu) __builtin_trap();
-    kernel_wait_switch_finish_locked(previous);
+    struct kernel_wait_cursor joined;
+    int notify = 0;
+    {
+        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        struct kernel_task *previous = cpu->switch_previous;
+        cpu->switch_previous = 0;
+        if (previous == cpu->current || !cpu->current->wait.on_cpu) __builtin_trap();
+        kernel_wait_switch_finish_locked(previous);
+        if (previous->state == KERNEL_THREAD_STATE_EXITED && previous->join)
+            notify = kernel_wait_cursor_prepare_locked(&previous->join->waiters, &joined, 1);
+    }
+    if (notify) kernel_wait_cursor_wake(&joined, 1);
 }
 
 enum kernel_scheduler_status scheduler_switch_current_away(struct kernel_task *previous)
@@ -451,6 +459,7 @@ static uint64_t kernel_stack_slot_bitmap[KERNEL_STACK_SLOT_WORDS];
 
 static int kernel_stack_slot_acquire(uint64_t *window_address)
 {
+    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
     for (uint32_t word = 0U; word < KERNEL_STACK_SLOT_WORDS; word++) {
         uint64_t free_bits = ~kernel_stack_slot_bitmap[word];
         uint32_t bit = 0U;
@@ -469,10 +478,13 @@ static int kernel_stack_slot_acquire(uint64_t *window_address)
 
 static void kernel_stack_slot_release(uint64_t window_address)
 {
+    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
     uint32_t index = (uint32_t)((window_address -
                                  ARCH_KERNEL_STACK_WINDOW_BASE) /
                                 ARCH_KERNEL_STACK_SLOT_SIZE);
-    kernel_stack_slot_bitmap[index / 64U] &= ~(UINT64_C(1) << (index % 64U));
+    uint64_t mask = UINT64_C(1) << (index % 64U);
+    if (!(kernel_stack_slot_bitmap[index / 64U] & mask)) __builtin_trap();
+    kernel_stack_slot_bitmap[index / 64U] &= ~mask;
 }
 
 static void kernel_stack_slots_reset(void)
@@ -604,11 +616,14 @@ enum kernel_scheduler_status release_task_stack(struct kernel_task *thread)
         cursor++;
     free_bytes = (uintptr_t)cursor - thread->stack_low;
     used_bytes = thread->stack_high - (uintptr_t)cursor;
-    scheduler.stack_statistics.stacks_released++;
-    if (free_bytes < scheduler.stack_statistics.minimum_free_bytes)
-        scheduler.stack_statistics.minimum_free_bytes = free_bytes;
-    if (used_bytes > scheduler.stack_statistics.maximum_used_bytes)
-        scheduler.stack_statistics.maximum_used_bytes = used_bytes;
+    {
+        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        scheduler.stack_statistics.stacks_released++;
+        if (free_bytes < scheduler.stack_statistics.minimum_free_bytes)
+            scheduler.stack_statistics.minimum_free_bytes = free_bytes;
+        if (used_bytes > scheduler.stack_statistics.maximum_used_bytes)
+            scheduler.stack_statistics.maximum_used_bytes = used_bytes;
+    }
     if (arch_mmu_kernel_window_active()) {
         uint64_t window = (uint64_t)thread->stack_low -
                           KERNEL_STACK_GUARD_BYTES - BOAROS_PAGE_SIZE;
@@ -638,15 +653,15 @@ enum kernel_scheduler_status release_task_storage(
     if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
     scheduler_forget_task(thread);
     kernel_task_release_io_scratch(thread);
-    (void)physical_page_release(scheduler.allocator, thread->physical_address);
+    scheduler_task_retire(thread);
+    scheduler_task_collect();
     return original_status;
 }
 
 void kernel_scheduler_stack_statistics(struct kernel_stack_statistics *statistics)
 {
-    uintptr_t old_status = arch_interrupt_save();
-    if (statistics != 0) *statistics = scheduler.stack_statistics;
-    arch_interrupt_restore(old_status);
+    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+    if (statistics) *statistics = scheduler.stack_statistics;
 }
 
 enum kernel_scheduler_status kernel_scheduler_init(
@@ -779,8 +794,8 @@ enum kernel_scheduler_status kernel_thread_create_joinable(
     }
 
     old_status = arch_interrupt_save();
-    if (scheduler.fatal_status != KERNEL_SCHEDULER_STATUS_OK) {
-        status = scheduler.fatal_status;
+    if (scheduler_failure() != KERNEL_SCHEDULER_STATUS_OK) {
+        status = scheduler_failure();
         goto restore_interrupts;
     }
     status = validate_current();
@@ -830,12 +845,16 @@ enum kernel_scheduler_status kernel_thread_create_joinable(
         goto restore_interrupts;
     }
 
-    if (join) {
-        kernel_wait_queue_init(&join->waiters);
-        join->task = thread;
-        thread->join = join;
+    if (join) kernel_wait_queue_init(&join->waiters);
+    {
+        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        if (join) {
+            if (join->task) __builtin_trap();
+            join->task = thread;
+            thread->join = join;
+        }
+        ready_enqueue_locked(thread, 0);
     }
-    ready_append(thread);
     status = KERNEL_SCHEDULER_STATUS_OK;
 
 restore_interrupts:
@@ -875,8 +894,8 @@ enum kernel_scheduler_status kernel_user_thread_create(
     }
 
     old_status = arch_interrupt_save();
-    if (scheduler.fatal_status != KERNEL_SCHEDULER_STATUS_OK) {
-        status = scheduler.fatal_status;
+    if (scheduler_failure() != KERNEL_SCHEDULER_STATUS_OK) {
+        status = scheduler_failure();
         goto restore_interrupts;
     }
     status = validate_current();
@@ -1030,9 +1049,10 @@ enum kernel_scheduler_status kernel_user_thread_create(
     }
 
     kernel_mm_add_user(&thread->mm);
-    ready_append(thread);
-    if (tid == 1) {
-        scheduler.init_task = thread;
+    {
+        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        ready_enqueue_locked(thread, 0);
+        if (tid == 1) scheduler.init_task = thread;
     }
     status = KERNEL_SCHEDULER_STATUS_OK;
 
@@ -1041,44 +1061,70 @@ restore_interrupts:
     return status;
 }
 
-void scheduler_forget_task(struct kernel_task *thread)
+void scheduler_task_disposal_notify(void)
 {
-    /* 退出任务必须先经唤醒路径摘除期限索引，不能带着索引项被销毁。 */
+    KERNEL_IRQ_SCOPE(disposal_irq);
+    (void)kernel_wait_queue_wake_all(&scheduler.cleanup_queue);
+}
+
+int scheduler_forget_task_locked(struct kernel_task *thread, struct kernel_wait_cursor *cursor)
+{
     if (thread->deadline_indexed) __builtin_trap();
-    process_identity_release(thread);
-    process_identity_collect();
-    if (thread->join) {
-        thread->join->task = 0;
-        (void)kernel_wait_queue_wake_all(&thread->join->waiters);
+    process_identity_release_locked(thread);
+    struct kernel_thread_join *join = thread->join;
+    int notify = 0;
+    if (join) {
+        notify = kernel_wait_cursor_prepare_locked(&join->waiters, cursor, 1);
+        join->task = 0;
         thread->join = 0;
     }
-    if (!thread->accounted) return;
-    struct kernel_task **link = &scheduler.all_tasks;
-    while (*link && *link != thread) link = &(*link)->all_next;
-    if (!*link) __builtin_trap();
-    *link = thread->all_next;
-    thread->accounted = 0;
+    if (scheduler.init_task == thread) scheduler.init_task = 0;
+    scheduler_task_unlink_locked(thread);
+    return notify;
+}
+
+void scheduler_forget_task(struct kernel_task *thread)
+{
+    struct kernel_wait_cursor cursor;
+    int notify;
+    {
+        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        notify = scheduler_forget_task_locked(thread, &cursor);
+    }
+    if (notify) kernel_wait_cursor_wake(&cursor, 1);
+    process_identity_collect();
 }
 
 void kernel_scheduler_system_statistics(uint64_t loads[3], uint16_t *tasks)
 {
-    uintptr_t irq = arch_interrupt_save();
-    uint64_t count = 0;
-    for (struct kernel_task *t = scheduler.all_tasks; t; t = t->all_next) count++;
+    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+    uint64_t count = scheduler.task_count;
     *tasks = count > UINT16_MAX ? UINT16_MAX : (uint16_t)count;
     for (unsigned i = 0; i < 3; i++) loads[i] = scheduler.loads[i] << 5;
-    arch_interrupt_restore(irq);
 }
 
 static void scheduler_sample_load(uint64_t elapsed)
 {
-    scheduler.load_ticks += elapsed;
     const uint64_t period = 5 * KERNEL_TICKS_PER_SECOND + 1;
-    if (scheduler.load_ticks < period) return;
+    {
+        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        scheduler.load_ticks += elapsed;
+        if (scheduler.load_ticks < period) return;
+    }
     uint64_t active = 0;
-    for (struct kernel_task *t = scheduler.all_tasks; t; t = t->all_next)
-        if (t->state == KERNEL_THREAD_STATE_READY || t->state == KERNEL_THREAD_STATE_RUNNING ||
-            (t->state == KERNEL_THREAD_STATE_BLOCKED && !t->wait_interruptible)) active++;
+    struct scheduler_task_cursor cursor;
+    scheduler_task_cursor_begin(&cursor);
+    while (cursor.task) {
+        {
+            KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+            struct kernel_task *task = cursor.task;
+            if (task->accounted && (task->state == KERNEL_THREAD_STATE_READY ||
+                task->state == KERNEL_THREAD_STATE_RUNNING ||
+                (task->state == KERNEL_THREAD_STATE_BLOCKED && !task->wait_interruptible))) active++;
+        }
+        scheduler_task_cursor_next(&cursor);
+    }
+    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
     active <<= 11;
     static const unsigned decay[3] = {1884, 2014, 2037};
     while (scheduler.load_ticks >= period) {
@@ -1096,7 +1142,7 @@ enum kernel_scheduler_status kernel_scheduler_on_tick(uint64_t elapsed_ticks)
     if (scheduler.initialized != KERNEL_SCHEDULER_INITIALIZED)
         return KERNEL_SCHEDULER_STATUS_NOT_INITIALIZED;
     if (arch_interrupt_is_enabled()) return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
-    if (scheduler.fatal_status != KERNEL_SCHEDULER_STATUS_OK) return scheduler.fatal_status;
+    if (scheduler_failure() != KERNEL_SCHEDULER_STATUS_OK) return scheduler_failure();
     enum kernel_scheduler_status status = validate_current();
     if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
     status = validate_queues();
@@ -1111,7 +1157,7 @@ enum kernel_scheduler_status kernel_scheduler_yield_current(void)
     if (scheduler.initialized != KERNEL_SCHEDULER_INITIALIZED)
         return KERNEL_SCHEDULER_STATUS_NOT_INITIALIZED;
     if (arch_interrupt_is_enabled()) return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
-    if (scheduler.fatal_status != KERNEL_SCHEDULER_STATUS_OK) return scheduler.fatal_status;
+    if (scheduler_failure() != KERNEL_SCHEDULER_STATUS_OK) return scheduler_failure();
     enum kernel_scheduler_status status = validate_current();
     if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
     status = validate_queues();

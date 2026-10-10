@@ -50,6 +50,17 @@ pthread 成功创建并不证明线程组完整：还应检查 join/TLS、竞争
 证明连续进展，原 pthread 程序负责检查实际成本；二者都要检查已退出任务的栈和 MM
 只能由可信上下文释放。
 
+调度选择与存储寿命应分开验证。`on_cpu`覆盖旧栈尚未切离的窗口，查找借用只覆盖任务
+元数据，不替调用者持有MM或文件资源。私有PID保留允许准备失败而不暴露身份；最后发布
+必须同时提交角色、任务索引和runnable。长遍历不能在解锁后继续用裸next：退休后继也
+需要实际owner，最后归还按迭代分段执行。
+
+一次可证实的顺序反例是：退出先选择idle、再通知cleanup，即使通知最终成功，无timer
+fixture仍会停在idle恢复点。cleanup登记通知必须先于选择；join则须等新栈释放旧执行owner。
+另一个边界是组长EXITED但其他成员仍存活：proc仍须找到真实存活代表，不能只接受GROUP_DEAD，
+否则clear-child-tid与资源清理之间会使已打开的status暂时不可读。ABI断言现在报告源码位置，
+便于区分准备失败、行为差异和退出问题。
+
 BoarOS 使用 256 个桶和每队列 FIFO 成员链。普通唤醒不扫描全局 blocked 链，futex 唤醒仍需检查目标桶中的碰撞 waiter。deadline 到期由按 (deadline, tid) 排序的索引处理，只弹出已到期者。线程 clone 共享 MM/files/fs，避免复制页表和 fd 槽；首次建立共享 disposition 时，原本尚未分配的信号表仍需要分配，不能宣称所有 clone 都只分配一个页。QEMU 运行时间不构成真实硬件性能结论。
 
 一次可复用的调试经验：线程控制块变大后，原本通过的 ext4 目录枚举可能耗尽剩余内核栈，而错误要到后续 syscall 的 canary 检查才被发现。用硬件 watchpoint 监视 canary 的首次写入，能把“nanosleep 失败”的表象还原到真正的 getdents 调用链。此处直接复用待返回 dirent 中的文件名空间消除了冗余 256 字节副本，不需要为每次枚举增加堆分配。

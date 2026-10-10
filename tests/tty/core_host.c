@@ -92,10 +92,15 @@ void kernel_task_tty_clear_session(struct kernel_tty *v, struct kernel_pid *sid)
     if (other.tty == v)
         kernel_task_tty_clear(&other);
 }
+void kernel_task_identity_put(struct kernel_pid *id) { kernel_pid_put(id); }
+int kernel_task_tty_identity_matches(const struct kernel_task *t, enum kernel_pid_role r,
+                                     const struct kernel_pid *id)
+{ (void)r; return t && id == &identity; }
 struct kernel_pid *kernel_task_tty_identity(const struct kernel_task *t,
                                             enum kernel_pid_role r)
 {
     (void)r;
+    if (t) kernel_pid_get(&identity);
     return t ? &identity : 0;
 }
 int kernel_task_tty_find_group(struct kernel_task *t, kernel_pid_t n,
@@ -107,6 +112,7 @@ int kernel_task_tty_find_group(struct kernel_task *t, kernel_pid_t n,
         return -KERNEL_EPERM;
     if (n != 7)
         return -KERNEL_ESRCH;
+    kernel_pid_get(&identity);
     *group = &identity;
     return 0;
 }

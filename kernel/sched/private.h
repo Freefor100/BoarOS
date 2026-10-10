@@ -109,11 +109,20 @@ struct kernel_task {
     uintptr_t stack_high;
     struct kernel_task *next;
     struct kernel_task *all_next;
+    struct kernel_task *all_previous;
+    struct kernel_task *retired_next;
+    struct kernel_task *exit_previous;
+    uint32_t exit_queued, reaping;
+    /* Domain-protected storage borrows; they do not pin MM/files/business state.
+     * Retirement 1 stops discovery, 2 finishes resources, 3 owns disposal. */
+    uint32_t storage_borrows, retirement;
+    struct kernel_pid *prepared_group, *prepared_session;
     struct kernel_sched_policy scheduling;
     struct kernel_sched_node ready_node;
     unsigned accounted;
     struct kernel_thread_join *join;
     struct kernel_task *parent;
+    uint64_t children_epoch, group_epoch;
     struct kernel_task *first_child;
     struct kernel_task *last_child;
     struct kernel_task *previous_sibling;
@@ -223,6 +232,8 @@ struct kernel_scheduler {
     uint64_t kernel_context;
     struct kernel_cpu *cpus;
     struct kernel_task *all_tasks;
+    struct kernel_task *retired_tasks;
+    uint64_t retired_pending, task_count;
     uint64_t loads[3], load_ticks;
     struct kernel_pid_registry identities;
     struct kernel_heap identity_heap;
@@ -247,6 +258,45 @@ struct kernel_scheduler {
 };
 
 extern struct kernel_scheduler scheduler;
+static inline enum kernel_scheduler_status scheduler_failure(void)
+{ return __atomic_load_n(&scheduler.fatal_status, __ATOMIC_RELAXED); }
+
+/* Locked variants require kernel_wait_domain; a lookup borrow is obtained
+ * under the same domain as discovery and lasts through task_put(). */
+struct kernel_task *scheduler_task_lookup_locked(kernel_pid_t, enum kernel_pid_role, uint64_t);
+struct kernel_task *scheduler_task_lookup(kernel_pid_t, enum kernel_pid_role, uint64_t);
+void scheduler_task_get_locked(struct kernel_task *);
+void scheduler_task_put(struct kernel_task *);
+static inline void scheduler_task_borrow_end(struct kernel_task **task)
+{ if (*task) scheduler_task_put(*task); }
+#define SCHEDULER_TASK_BORROW(name, expression) \
+    struct kernel_task *name __attribute__((cleanup(scheduler_task_borrow_end))) = (expression)
+void scheduler_task_publish_locked(struct kernel_task *);
+void scheduler_task_unlink_locked(struct kernel_task *);
+void scheduler_task_retire(struct kernel_task *);
+void scheduler_task_collect(void);
+void scheduler_task_claim_release_locked(struct kernel_task *);
+void exited_append_locked(struct kernel_task *);
+void exited_remove_locked(struct kernel_task *);
+enum kernel_scheduler_status scheduler_task_claim_exit_locked(struct kernel_task *);
+enum kernel_scheduler_status scheduler_join_claim_locked(struct kernel_thread_join *, struct kernel_task **);
+void scheduler_task_disposal_notify(void);
+struct scheduler_group_cursor {
+    struct kernel_task *leader, *task;
+    uint64_t epoch;
+    uint32_t member_owned, steps;
+};
+void scheduler_group_cursor_begin(struct kernel_task *, struct scheduler_group_cursor *);
+void scheduler_group_cursor_next(struct scheduler_group_cursor *);
+void scheduler_group_cursor_end(struct scheduler_group_cursor *);
+struct scheduler_task_cursor { struct kernel_task *task; };
+int scheduler_task_descends_from(struct kernel_task *, const struct kernel_task *, uint64_t);
+void scheduler_task_cursor_begin(struct scheduler_task_cursor *);
+void scheduler_task_cursor_next(struct scheduler_task_cursor *);
+void scheduler_task_cursor_end(struct scheduler_task_cursor *);
+void process_identity_commit_locked(struct kernel_task *);
+void process_identity_sync_locked(struct kernel_task *);
+void process_identity_release_locked(struct kernel_task *);
 
 void kernel_proc_task_update_comm(struct kernel_task *task);
 
@@ -276,7 +326,6 @@ enum kernel_scheduler_status release_task_storage(struct kernel_task *task,
     enum kernel_scheduler_status original_status);
 struct kernel_task *ready_first(void);
 struct kernel_task *ready_next(const struct kernel_task *task);
-struct kernel_task *ready_best(void);
 void ready_remove(struct kernel_task *task);
 void ready_enqueue(struct kernel_task *task, int head);
 void scheduler_account_runtime(void);
@@ -290,6 +339,7 @@ void scheduler_cpu_initialize(struct kernel_cpu *cpu, struct kernel_task *idle,
 void scheduler_rearm_timer(void);
 enum kernel_scheduler_status scheduler_reschedule(int rotate_other, int voluntary);
 void ready_append(struct kernel_task *thread);
+int scheduler_forget_task_locked(struct kernel_task *, struct kernel_wait_cursor *);
 void scheduler_forget_task(struct kernel_task *thread);
 void blocked_append(struct kernel_task *thread);
 void blocked_unlink(struct kernel_task *thread);
@@ -309,6 +359,8 @@ enum kernel_scheduler_status validate_current(void);
 enum kernel_task_status validate_task_resource_borrow(
     const struct kernel_task *task);
 void wake_waiting_parent(struct kernel_task *child);
+void stopped_append_locked(struct kernel_task *);
+void stopped_unlink_locked(struct kernel_task *);
 void stopped_append(struct kernel_task *thread);
 void stopped_unlink(struct kernel_task *thread);
 enum kernel_signal_status kernel_signal_release_table(

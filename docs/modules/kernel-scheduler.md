@@ -10,7 +10,8 @@
 | `kernel/sched/policy.c`、`runqueue.c` | 纯策略/预算状态机、分级 ready 队列 |
 | `kernel/sched/scheduling.c`、`kernel/syscall/sched.c` | 实际运行时间记账、抢占、安全返回边界、策略与 CPU0 affinity ABI |
 | `kernel/sched/process.c` | clone、线程组/父子树、wait、退出、回收与记账 |
-| `kernel/pid.c` | 统一身份对象、编号/代次、引用与 TID/TGID/PGID/SID 角色成员 |
+| `kernel/pid.c`、`kernel/sched/identity.c` | 私有编号保留、身份发布/角色引用，以及锁外身份存储释放 |
+| `kernel/sched/lifetime.c` | 任务存储借用、退休后继、join/reaper 资格与锁外页归还 |
 | `kernel/sched/proc.c` | 进程快照、对象路径与缺页/磁盘读取统计 |
 | `kernel/sched/exec.c` | 已准备映像的提交与旧资源清理 |
 | `kernel/sched/sync.c` | 任务 owner 的 mutex/RWlock、锁序与 FIFO 资格交接 |
@@ -25,7 +26,8 @@
 
 等待登记、阻塞提交、期限索引、运行记账、策略更新、队列校验和runnable发布使用统一rank40短锁；heap10→physical20、
 对象内部30→调度40是raw锁序。raw不跨架构切换，不允许调度、分配、I/O、用户复制或外部回调。
-业务条件、进程组及缓存/网络数据仍按单CPU纪律保护；等待原语互斥不表示整个内核支持SMP。
+任务表、身份角色、父子/组成员关系、join及退出队列也使用该调度域；私有准备和资源清理在锁外。
+共享MM、信号内容、文件/设备业务及其统计仍限定单CPU；调度元数据互斥不表示整个内核支持SMP。
 
 `kernel_wait_prepare`为当前任务建立不回退的全局代次token，登记后复查条件，释放对象保护再调用
 `kernel_wait_park`；`kernel_wait_finish`同步撤销绑定节点。wake/期限/signal第一个完成者决定
@@ -105,7 +107,25 @@ TID、TGID、PGID 和 SID 共用 `kernel_pid` 对象：编号、不可回退的�
 
 编号仅在全部角色成员和临时引用都释放后归还 bitmap。对象仍有引用不表示 TID 对应线程仍可收信号；线程 lookup、组 lookup 和 proc 可见性分别检查其角色及生命周期。组长先退出保留身份容器，直到最后线程退出或非组长 exec 原子接管四类成员。zombie 在 wait/reap 前保留进程身份；旧 proc 节点用同一对象的代次防止编号复用后命中新进程。
 
-对象存储来自调度器私有 slab heap；准备分配可以睡眠，但必须先于身份发布，发布、角色迁移和摘除区间禁止分配或 yield。单 hart 的 SIE=0 本身不代表禁止睡眠：既有 syscall/回收路径可调度，不能因此把跨分配的裸身份指针当作受保护引用。最后引用先摘编号索引、登记待释放对象，再在身份变更结束后归还存储。该机制不宣称 SMP 安全。固定依据为 `references/linux/kernel/pid.c` 的角色成员和 exec 转移，以及 `references/linux/kernel/sys.c`、`kernel/exit.c`，commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`；本实现按已选契约额外让临时引用保留编号。
+对象存储来自调度器私有slab heap。准备分配可以睡眠；reserve仅占用数字/代次，不进入查找桶。
+TID与私有TGID先构造，父进程的PGID/SID在准备期间持实际引用，自己的身份由既有角色owner覆盖。
+最终发布在同一调度域中挂接角色、进入任务索引及runnable；失败归还私有保留项，不发布半成品。
+最后PID引用只摘编号索引并登记退休，heap释放在锁外执行。
+
+`scheduler_task_lookup`在发现任务的同一保护下取得存储借用，归还使用`scheduler_task_put`；
+locked变体仅供已持调度域的短操作使用。借用不固定MM、文件表、权限、角色或代次。
+退休先摘身份和任务索引，资源由可信栈清理；最后等待/执行/查找使用结束后才归还元数据页。
+长枚举借用当前节点，退休节点保留有owner的后继；每段至多16项，后继引用迭代归还。
+父子与组校验跨段保留存储，代次变化时重查；proc调度/身份值受域保护，MM/TTY内容仍按单CPU业务契约读取。
+
+join和reaper在同一域竞争唯一清理资格，运行中的旧栈不能取得回收资格。
+退出通知cleanup后再选择next；join在新栈完成点通知，避免既提前释放旧栈又丢失无timer进展。
+`make test-sched-concurrency-host`涵盖2/4线程的选择、策略竞争、查找/退休与join/reaper争用；
+`make test-sched-lifecycle-riscv test-sched-lifecycle-loongarch`在512MiB/1GiB验证真实换栈、
+借用延后归还及trusted-stack资源基线。宿主模型不替代客户机多核。
+固定依据仍为`references/linux/kernel/pid.c`、`kernel/fork.c`、`kernel/exit.c`和`fs/exec.c`，
+commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`；本实现保留临时PID引用对数字的owner。
+
 
 每个用户执行线程有独立 TID、FP/整数寄存器、signal mask、线程 pending、clear-child-tid、robust-list 注册地址、restart 状态、私有元数据页和独立的连续物理内核栈。组长承载 TGID、进程组、父子树、组 pending、退出通知、已回卷记账及 `RLIMIT_NOFILE`/`RLIMIT_STACK`。两项限制在组内线程间共享，普通 fork 复制，exec 保留；非组长 exec 接管组身份时一并转移。双向成员环包含组长容器；组长停止执行后仍留在环中，直到组结束或非组长 exec 接管身份。
 

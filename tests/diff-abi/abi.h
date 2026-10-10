@@ -42,7 +42,8 @@ long abi_size(long fd);
 long abi_offset(long fd);
 void abi_record(const char *id, long ret, long size, long offset, long signal,
                 const void *data, usize length);
-void abi_require(int condition);
+void abi_require_at(int condition, const char *file, unsigned line);
+#define abi_require(condition) abi_require_at((condition), __FILE__, __LINE__)
 void abi_exit(long code) __attribute__((noreturn));
 void abi_mknod_cases(void);
 void abi_proc_cases(void);

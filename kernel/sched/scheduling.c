@@ -66,11 +66,7 @@ void ready_enqueue_locked(struct kernel_task *task, int head)
 #if BOAROS_COST_DIAGNOSTICS
     kernel_cost_ready(&task->cost);
 #endif
-    if (!task->accounted) {
-        task->accounted = 1;
-        task->all_next = scheduler.all_tasks;
-        scheduler.all_tasks = task;
-    }
+    if (!task->accounted) scheduler_task_publish_locked(task);
     task->next = 0;
     kernel_sched_enqueue(&scheduler.runqueue, &task->ready_node, task,
                          (unsigned)task->scheduling.priority, head);
@@ -79,8 +75,6 @@ void ready_enqueue_locked(struct kernel_task *task, int head)
         task->scheduling.priority > target->current->scheduling.priority)
         kernel_cpu_request_schedule(target);
 }
-struct kernel_task *ready_best(void)
-{ KERNEL_RAW_SCOPE(guard, &kernel_wait_domain); return ready_best_locked(); }
 void ready_remove(struct kernel_task *task)
 { KERNEL_RAW_SCOPE(guard, &kernel_wait_domain); ready_remove_locked(task); }
 void ready_enqueue(struct kernel_task *task, int head)

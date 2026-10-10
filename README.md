@@ -62,7 +62,7 @@ make test-stack-usage test-stack-usage-la
 
 当前主线转向 **SMP 同步基础与生命周期正确性**，再进入 RV 两核、共享 MM/TLB 和 LA 多核；
 具体未完成能力与依赖只维护在[开发路线](docs/goals.md)，逐轮执行计划留在会话中。
-CPU 本地/current、运行结算、idle/timer归属与嵌套抢占控制已建立，raw 短锁已接入 buddy/slab 元数据；等待代次、借用游标、
+CPU 本地/current、运行结算、idle/timer归属与嵌套抢占控制已建立，raw 短锁已接入 buddy/slab 元数据；任务选择、身份发布及存储借用在统一短调度域保护，资源清理留在锁外；等待代次、借用游标、
 新栈交接与可睡眠锁内部资格已建立。压力回收、共享MM及其他业务对象仍需跨核保护。
 等待交接的[固定P核匹配时间](docs/learning/cost-baseline.md#等待交接的匹配时间)单列默认业务、
 IRQ/锁/唤醒和观测开销；匿名生命周期额外约2.5%–4.0%，部分组合窗口仍有成本与漂移，未取得普遍性能提升。

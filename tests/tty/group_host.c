@@ -5,6 +5,10 @@
 #include <stdio.h>
 
 struct kernel_scheduler scheduler;
+struct kernel_raw_lock kernel_wait_domain;
+static struct kernel_cpu cpu;
+_Thread_local uintptr_t sync_test_irq;
+void *sync_test_cpu(void) { return &cpu; }
 struct kernel_pid *process_identity(const struct kernel_task *task, enum kernel_pid_role role)
 {
     return task->identities[role].identity;
@@ -12,6 +16,8 @@ struct kernel_pid *process_identity(const struct kernel_task *task, enum kernel_
 
 int main(void)
 {
+    kernel_cpu_initialize(&cpu, 7, 0);
+    kernel_raw_lock_init(&kernel_wait_domain, KERNEL_RAW_RANK_SCHEDULER);
     struct kernel_pid_allocator numbers = {0};
     uint64_t bitmap[KERNEL_PID_BITMAP_WORDS(32)];
     assert(kernel_pid_allocator_init(&numbers, bitmap, 32) == KERNEL_PID_STATUS_OK);
@@ -32,13 +38,15 @@ int main(void)
     kernel_pid_attach(&same.identities[KERNEL_PID_PGID], &group, KERNEL_PID_PGID, &same);
     uint32_t references = group.references;
     assert(kernel_task_tty_find_group(&caller, group.number, &found) == 0 && found == &group);
-    assert(group.references == references);
+    assert(group.references == references + 1);
+    kernel_pid_put(found);
     kernel_pid_detach(&same.identities[KERNEL_PID_PGID]);
     kernel_pid_attach(&foreign.identities[KERNEL_PID_PGID], &group, KERNEL_PID_PGID, &foreign);
     kernel_pid_attach(&same.identities[KERNEL_PID_TID], &group, KERNEL_PID_TID, &same);
     assert(kernel_task_tty_find_group(&caller, group.number, &found) == -KERNEL_EPERM && !found);
     kernel_pid_detach(&foreign.identities[KERNEL_PID_PGID]);
     assert(kernel_task_tty_find_group(&caller, group.number, &found) == 0 && found == &group);
+    kernel_pid_put(found);
     kernel_pid_detach(&same.identities[KERNEL_PID_TID]);
     kernel_pid_attach(&foreign.identities[KERNEL_PID_TID], &group, KERNEL_PID_TID, &foreign);
     assert(kernel_task_tty_find_group(&caller, group.number, &found) == -KERNEL_EPERM && !found);
@@ -51,5 +59,5 @@ int main(void)
     kernel_pid_put(&sid);
     kernel_pid_put(&foreign_sid);
     assert(!numbers.allocated);
-    puts("TTY group host: actual identity lookup/status/PID fallback/borrowed refs pass");
+    puts("TTY group host: actual identity lookup/status/PID fallback/owned lookup refs pass");
 }

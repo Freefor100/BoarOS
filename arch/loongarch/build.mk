@@ -352,3 +352,13 @@ $(LA_BUILD)/wait-native: $(LA_OBJECTS) $(LA_BUILD)/wait-native.o arch/loongarch/
 .PHONY: test-wait-loongarch
 test-wait-loongarch: $(LA_BUILD)/wait-native prepare-la-tools
 	python3 -B tests/wait/native.py --arch loongarch --qemu $(QEMU_LOONGARCH64) --kernel-dir $(LA_BUILD)
+
+$(LA_BUILD)/sched-lifecycle-native.o: tests/wait/native.c Makefile
+	@mkdir -p $(dir $@)
+	$(LA_CC) $(LA_CPPFLAGS) $(LA_CFLAGS) -DBOAROS_SCHED_LIFECYCLE=1 -c $< -o $@
+$(LA_BUILD)/sched-lifecycle-native: $(LA_OBJECTS) $(LA_BUILD)/sched-lifecycle-native.o arch/loongarch/linker.ld
+	$(LA_CC) $(LA_FLAGS) -nostdlib -nostartfiles -static -no-pie -T arch/loongarch/linker.ld -Wl,--gc-sections,--wrap=physical_page_allocate,--wrap=physical_page_allocate_order,--wrap=kernel_syscall_dispatch,--wrap=la_boot_tasks,--wrap=kernel_wait_backend_switch -o $@ $(LA_OBJECTS) $(LA_BUILD)/sched-lifecycle-native.o -lgcc
+.PHONY: test-sched-lifecycle-loongarch
+test-sched-lifecycle-loongarch: $(LA_BUILD)/sched-lifecycle-native prepare-la-tools
+	python3 -B tests/wait/native.py --arch loongarch --qemu $(QEMU_LOONGARCH64) --kernel-dir $(LA_BUILD) --case sched-lifecycle
+-include $(LA_BUILD)/sched-lifecycle-native.d

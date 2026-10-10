@@ -54,6 +54,33 @@ static void worker(void *argument)
     ended++;
     arch_interrupt_restore(irq);
 }
+#ifdef BOAROS_SCHED_LIFECYCLE
+static void lifecycle(struct physical_page_allocator *allocator)
+{
+    uint64_t baseline = physical_page_available(allocator);
+    struct kernel_thread_join join = {0};
+    check(kernel_thread_create_joinable(empty, 0, &join) == KERNEL_SCHEDULER_STATUS_OK);
+    struct kernel_task *task;
+    {
+        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        task = join.task;
+        scheduler_task_get_locked(task);
+    }
+    check(kernel_scheduler_yield_current() == KERNEL_SCHEDULER_STATUS_OK);
+    check(!task->wait.on_cpu && task->state == KERNEL_THREAD_STATE_EXITED);
+    struct kernel_thread_completion completion;
+    check(kernel_scheduler_reap_one(&completion) == KERNEL_SCHEDULER_STATUS_EMPTY);
+    check(!join.task && task->retirement == 2 && task->storage_borrows == 1);
+    check(task->stack_physical_address == KERNEL_THREAD_NO_PAGE);
+    check(physical_page_available(allocator) + 1 == baseline);
+    scheduler_task_put(task);
+    scheduler_task_collect();
+    check(!scheduler.retired_pending && !scheduler.retired_tasks);
+    check(physical_page_available(allocator) == baseline);
+    check(physical_page_allocator_audit(allocator) == PHYSICAL_PAGE_STATUS_OK);
+    say("SCHED lifecycle passed: real switch, trusted-stack release, borrowed metadata and owner baseline\n");
+}
+#endif
 static void run(struct physical_page_allocator *allocator)
 {
     (void)arch_interrupt_save();
@@ -80,6 +107,9 @@ static void run(struct physical_page_allocator *allocator)
     check(kernel_wait_queue_destroy(&queue) == KERNEL_SCHEDULER_STATUS_OK);
     check(physical_page_available(allocator) == baseline);
     check(physical_page_allocator_audit(allocator) == PHYSICAL_PAGE_STATUS_OK);
+#ifdef BOAROS_SCHED_LIFECYCLE
+    lifecycle(allocator);
+#endif
     say("WAIT native passed: first-entry, pre-switch wake, timeout, exit and owner baseline\n");
     shutdown();
 }

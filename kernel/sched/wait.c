@@ -186,8 +186,9 @@ struct kernel_task *deadline_index_first(void)
 /* STOPPED tasks park on their own list so the blocked-list invariant
  * (state == BLOCKED) stays intact; SIGCONT/SIGKILL move them back to
  * the ready queue. */
-void stopped_append(struct kernel_task *thread)
+void stopped_append_locked(struct kernel_task *thread)
 {
+    thread->blocked_previous = scheduler.stopped_tail;
     thread->next = 0;
     if (scheduler.stopped_tail == 0) {
         scheduler.stopped_head = thread;
@@ -197,28 +198,23 @@ void stopped_append(struct kernel_task *thread)
     scheduler.stopped_tail = thread;
 }
 
-void stopped_unlink(struct kernel_task *thread)
+void stopped_unlink_locked(struct kernel_task *thread)
 {
-    struct kernel_task *previous = 0;
-    struct kernel_task *current = scheduler.stopped_head;
-
-    while (current != 0 && current != thread) {
-        previous = current;
-        current = current->next;
-    }
-    if (current != thread) {
-        return;
-    }
-    if (previous == 0) {
+    struct kernel_task *previous = thread->blocked_previous;
+    if (previous) previous->next = thread->next;
+    else {
+        if (scheduler.stopped_head != thread) __builtin_trap();
         scheduler.stopped_head = thread->next;
-    } else {
-        previous->next = thread->next;
     }
-    if (scheduler.stopped_tail == thread) {
-        scheduler.stopped_tail = previous;
-    }
-    thread->next = 0;
+    if (thread->next) thread->next->blocked_previous = previous;
+    else scheduler.stopped_tail = previous;
+    thread->next = thread->blocked_previous = 0;
 }
+void stopped_append(struct kernel_task *thread)
+{ KERNEL_RAW_SCOPE(guard, &kernel_wait_domain); stopped_append_locked(thread); }
+void stopped_unlink(struct kernel_task *thread)
+{ KERNEL_RAW_SCOPE(guard, &kernel_wait_domain); stopped_unlink_locked(thread); }
+
 
 struct kernel_wait_record *kernel_wait_record_of(struct kernel_task *task) { return &task->wait; }
 struct kernel_wait_node *kernel_wait_default_node(struct kernel_task *task) { return &task->default_wait_node; }

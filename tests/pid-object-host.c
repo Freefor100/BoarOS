@@ -45,5 +45,22 @@ int main(void)
     struct kernel_pid overflow = {0};
     assert(kernel_pid_publish(&registry, &overflow) == KERNEL_PID_STATUS_EXHAUSTED);
     assert(numbers.allocated == 0 && !overflow.registry);
+    registry.next_generation = 100;
+    struct kernel_pid reserved = {0};
+    assert(kernel_pid_reserve(&registry, &reserved) == KERNEL_PID_STATUS_OK);
+    assert(numbers.allocated == 1 && !kernel_pid_find(&registry, reserved.number));
+    kernel_pid_attach(&tid, &reserved, KERNEL_PID_TID, &leader);
+    assert(kernel_pid_publish_reserved(&reserved) == KERNEL_PID_STATUS_OK);
+    assert(kernel_pid_find(&registry, reserved.number) == &reserved);
+    assert(kernel_pid_publish_reserved(&reserved) == KERNEL_PID_STATUS_STATE);
+    kernel_pid_detach(&tid);
+    kernel_pid_put(&reserved);
+    assert(kernel_pid_reserve(&registry, &reserved) == KERNEL_PID_STATUS_STATE);
+    assert(kernel_pid_take_retired(&registry) == &reserved);
+    struct kernel_pid aborted = {0};
+    assert(kernel_pid_reserve(&registry, &aborted) == KERNEL_PID_STATUS_OK);
+    kernel_pid_put(&aborted);
+    assert(!numbers.allocated && !kernel_pid_find(&registry, aborted.number));
+    assert(kernel_pid_take_retired(&registry) == &aborted);
     puts("pid object lifetime PASS");
 }

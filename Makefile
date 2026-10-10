@@ -217,7 +217,7 @@ C_SOURCES := \
 	kernel/sched/core.c \
 	kernel/sched/policy.c \
 	kernel/sched/runqueue.c \
-	kernel/sched/scheduling.c \
+	kernel/sched/scheduling.c kernel/sched/lifetime.c kernel/sched/identity.c \
 	kernel/sched/exec.c \
 	kernel/sched/process.c \
 	kernel/sched/proc.c \
@@ -337,7 +337,7 @@ TEST_RUNTIME_C_SOURCES := \
 	kernel/sched/core.c \
 	kernel/sched/policy.c \
 	kernel/sched/runqueue.c \
-	kernel/sched/scheduling.c \
+	kernel/sched/scheduling.c kernel/sched/lifetime.c kernel/sched/identity.c \
 	kernel/sched/exec.c \
 	kernel/sched/process.c \
 	kernel/sched/proc.c \
@@ -1811,7 +1811,7 @@ test-tty-host:
 	build/host/tty/endpoints
 	cc -std=gnu11 -O1 -g -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=12 -Itests/host/random -idirafter include -fsanitize=address,undefined tests/tty/flags_host.c fs/tty.c -o build/host/tty/flags
 	build/host/tty/flags
-	cc -std=gnu11 -O1 -g -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=12 -idirafter include -ffunction-sections -fdata-sections -Wl,--gc-sections -fsanitize=address,undefined tests/tty/group_host.c kernel/sched/tty.c kernel/pid.c -o build/host/tty/group
+	cc -std=gnu11 -O1 -g -Wall -Wextra -Werror -DBOAROS_PAGE_SHIFT=12 -Itests/host/sync -idirafter include -ffunction-sections -fdata-sections -Wl,--gc-sections -fsanitize=address,undefined tests/tty/group_host.c kernel/sched/tty.c kernel/pid.c kernel/cpu.c kernel/raw_lock.c -o build/host/tty/group
 	build/host/tty/group
 
 TTY_PROBE_RV := $(BUILD_DIR)/tests/user/tty-probe-rv
@@ -1942,6 +1942,17 @@ $(BUILD_DIR)/wait-native: $(OBJECTS) $(BUILD_DIR)/wait-native.o arch/riscv/linke
 test-wait-riscv: $(BUILD_DIR)/wait-native
 	python3 -B tests/wait/native.py --arch riscv --qemu $(QEMU_RISCV64) --kernel-dir $(BUILD_DIR)
 
+$(BUILD_DIR)/sched-lifecycle-native.o: tests/wait/native.c Makefile
+	@mkdir -p $(dir $@)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -DBOAROS_SCHED_LIFECYCLE=1 -c $< -o $@
+$(BUILD_DIR)/sched-lifecycle-native: $(OBJECTS) $(BUILD_DIR)/sched-lifecycle-native.o arch/riscv/linker.ld
+	$(CC) $(LDFLAGS) -Wl,--wrap=kernel_scheduler_init,--wrap=kernel_wait_backend_switch -o $@ $(OBJECTS) $(BUILD_DIR)/sched-lifecycle-native.o
+.PHONY: test-sched-lifecycle-riscv
+test-sched-lifecycle-riscv: $(BUILD_DIR)/sched-lifecycle-native
+	python3 -B tests/wait/native.py --arch riscv --qemu $(QEMU_RISCV64) --kernel-dir $(BUILD_DIR) --case sched-lifecycle
+-include $(BUILD_DIR)/sched-lifecycle-native.d
+test-riscv: test-sched-lifecycle-riscv
+
 .PHONY: test-sleep-lock-host
 test-sleep-lock-host:
 	@mkdir -p build/host
@@ -1956,13 +1967,13 @@ $(BUILD_DIR)/sync-%.d: ;
 .PHONY: test-scheduler-handoff-host
 test-scheduler-handoff-host:
 	@mkdir -p build/host
-	cc -std=gnu11 -O2 -Wall -Wextra -Werror -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -Itests/host/sync -idirafter include tests/host/sched_handoff.c kernel/cpu.c kernel/raw_lock.c kernel/sched/scheduling.c kernel/sched/policy.c kernel/sched/runqueue.c -Wl,--gc-sections -o build/host/scheduler-handoff
+	cc -std=gnu11 -O2 -Wall -Wextra -Werror -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -Itests/host/sync -idirafter include tests/host/sched_handoff.c kernel/cpu.c kernel/raw_lock.c kernel/sched/scheduling.c kernel/sched/lifetime.c kernel/sched/identity.c kernel/pid.c kernel/sched/policy.c kernel/sched/runqueue.c -Wl,--gc-sections -o build/host/scheduler-handoff
 	build/host/scheduler-handoff
 
 .PHONY: test-sched-concurrency-host
 test-sched-concurrency-host:
 	@mkdir -p build/host
-	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -Itests/host/sync -idirafter include tests/host/sched_concurrency.c kernel/cpu.c kernel/raw_lock.c kernel/sched/park.c kernel/sched/scheduling.c kernel/sched/policy.c kernel/sched/runqueue.c -Wl,--gc-sections,--wrap=kernel_sched_policy_charge,--wrap=kernel_sched_policy_set -o build/host/sched-concurrency
+	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -Itests/host/sync -idirafter include tests/host/sched_concurrency.c kernel/cpu.c kernel/raw_lock.c kernel/sched/park.c kernel/sched/scheduling.c kernel/sched/lifetime.c kernel/sched/identity.c kernel/pid.c kernel/sched/policy.c kernel/sched/runqueue.c -Wl,--gc-sections,--wrap=kernel_sched_policy_charge,--wrap=kernel_sched_policy_set -o build/host/sched-concurrency
 	build/host/sched-concurrency
 
 test-riscv: test-scheduler-handoff-riscv

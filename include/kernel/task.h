@@ -30,6 +30,8 @@ enum kernel_task_status {
 
 /* Returns the scheduler current task, or null before scheduler publication. */
 struct kernel_task *kernel_task_current(void);
+/* Releases only a lookup storage borrow, not MM/files or a running owner. */
+void kernel_task_lookup_put(struct kernel_task *task);
 enum kernel_task_status kernel_task_epoll_register(
     struct kernel_task *task, struct kernel_epoll_wait_request *request);
 enum kernel_task_status kernel_task_epoll_clear(

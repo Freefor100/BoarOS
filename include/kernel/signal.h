@@ -225,6 +225,7 @@ uint32_t kernel_signal_send_thread(struct kernel_task *caller,
                                    uint32_t sig,
                                    kernel_pid_t sender_tid);
 
+/* Returns a storage lookup borrow; release with kernel_task_lookup_put(). */
 struct kernel_task *kernel_signal_find_by_tid(kernel_pid_t tid);
 
 #endif

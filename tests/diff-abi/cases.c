@@ -13,11 +13,20 @@ long abi_call(long nr, long a, long b, long c, long d, long e, long f)
     return test_syscall6(nr,a,b,c,d,e,f);
 }
 void abi_exit(long code) { SC1(93, code); for (;;) {} }
-void abi_require(int condition)
+void abi_require_at(int condition, const char *file, unsigned source_line)
 {
     if (!condition) {
-        static const char error[] = "ABI ERROR setup\n";
-        SC3(64, 1, error, sizeof(error) - 1);
+        char error[160];
+        usize n = 0;
+        const char *prefix = "ABI ERROR setup ";
+        while (*prefix) error[n++] = *prefix++;
+        while (*file && n < 120) error[n++] = *file++;
+        error[n++] = ':';
+        char digits[12]; unsigned used_digits = 0;
+        do { digits[used_digits++] = '0' + source_line % 10; source_line /= 10; } while (source_line);
+        while (used_digits) error[n++] = digits[--used_digits];
+        error[n++] = '\n';
+        SC3(64, 1, error, n);
         abi_exit(99);
     }
 }

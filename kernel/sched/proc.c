@@ -2,6 +2,7 @@
 
 #include <arch/context.h>
 #include <kernel/errno.h>
+#include <kernel/irq.h>
 #include <kernel/files.h>
 #include <kernel/open_file.h>
 #include <kernel/proc_task.h>
@@ -38,42 +39,52 @@ static int proc_visible(const struct kernel_task *task)
            task->parent != 0;
 }
 
-static struct kernel_task *next_process(struct kernel_task *task,
-                                        struct kernel_task *root)
-{
-    if (task->first_child) return task->first_child;
-    while (task != root) {
-        if (task->next_sibling) return task->next_sibling;
-        task = task->parent;
-        if (!task) return 0;
-    }
-    return 0;
-}
-
-static struct kernel_task *representative(struct kernel_task *leader)
-{
-    if (!leader || !leader->tid_owned || leader->tid <= 0 ||
-        !leader->group_next) return 0;
-    struct kernel_task *member = leader;
-    do {
-        if (proc_visible(member)) return member;
-        member = member->group_next;
-    } while (member != leader);
-    return 0;
-}
-
 static struct kernel_task *find_member(kernel_pid_t pid, uint64_t identity)
 {
-    struct kernel_task *leader = process_find_identity(pid, KERNEL_PID_TGID);
-    return leader && process_identity_generation(leader) == identity &&
-        representative(leader) ? leader : 0;
+    struct kernel_task *leader;
+    {
+        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        leader = process_find_identity(pid, KERNEL_PID_TGID);
+        if (!leader || process_identity_generation(leader) != identity ||
+            !leader->accounted || leader->retirement) return 0;
+        scheduler_task_get_locked(leader);
+        if (proc_visible(leader)) return leader;
+    }
+    /* An EXITED/GROUP_DEAD leader remains visible through a live member.
+     * The storage borrow crosses segments; each role/state check stays locked. */
+    int visible = 0;
+    struct scheduler_task_cursor cursor;
+    scheduler_task_cursor_begin(&cursor);
+    while (cursor.task) {
+        {
+            KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+            struct kernel_task *member = cursor.task;
+            visible = member->accounted && member->group_leader == leader && proc_visible(member);
+        }
+        if (visible) break;
+        scheduler_task_cursor_next(&cursor);
+    }
+    scheduler_task_cursor_end(&cursor);
+    {
+        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        visible = visible && leader->accounted && !leader->retirement &&
+                  process_identity_generation(leader) == identity;
+    }
+    if (!visible) { scheduler_task_put(leader); return 0; }
+    return leader;
 }
 
 static struct kernel_task *find_resource_owner(kernel_pid_t pid,
                                                 uint64_t identity)
 {
     struct kernel_task *leader = find_member(pid, identity);
-    return leader && !leader->proc_exiting ? leader : 0;
+    int departing;
+    {
+        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        departing = leader && (leader->retirement || leader->proc_exiting);
+    }
+    if (departing) { scheduler_task_put(leader); return 0; }
+    return leader;
 }
 
 void kernel_proc_task_note_block_read(void)
@@ -91,37 +102,32 @@ uint64_t kernel_proc_task_block_reads(const struct kernel_task *task)
 void kernel_proc_task_note_fault(struct kernel_task *task, int major)
 {
     if (!task || !task->arch.user_mode) return;
-    uintptr_t irq = arch_interrupt_save();
+    KERNEL_IRQ_SCOPE(proc_irq);
     uint64_t *counter = major ? &task->major_faults : &task->minor_faults;
     if (*counter != UINT64_MAX) (*counter)++;
-    arch_interrupt_restore(irq);
 }
 
 int kernel_proc_process_snapshot(kernel_pid_t pid, uint64_t identity,
                                  struct kernel_proc_process_snapshot *result)
 {
     if (pid <= 0 || !identity || !result) return -KERNEL_EINVAL;
-    uintptr_t irq = arch_interrupt_save();
-    struct kernel_task *task = find_member(pid, identity);
+    KERNEL_IRQ_SCOPE(proc_irq);
+    SCHEDULER_TASK_BORROW(task, find_member(pid, identity));
     if (!task) {
-        arch_interrupt_restore(irq);
         return -KERNEL_ENOENT;
     }
-    struct kernel_task *leader = task->group_leader;
-    uint32_t threads = leader->group_members;
-    struct kernel_task *member = leader->group_next;
-    while (member != leader) {
-        if (member->proc_exiting && threads) threads--;
-        member = member->group_next;
-    }
+    struct kernel_task *leader = task;
+    uint32_t threads = 0;
+    {
+    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+    if (leader->retirement || !leader->accounted) return -KERNEL_ENOENT;
+    threads = leader->group_members;
     *result = (struct kernel_proc_process_snapshot){
         .pid = pid,
         .ppid = leader->parent && leader->parent->group_leader
             ? leader->parent->group_leader->tid : 0,
         .process_group = process_identity_number(leader, KERNEL_PID_PGID),
         .session_id = process_identity_number(leader, KERNEL_PID_SID),
-        .tty_nr = kernel_tty_rdev(kernel_task_controlling_tty(leader)),
-        .tty_pgrp = kernel_tty_foreground(kernel_task_controlling_tty(leader)),
         .identity = identity,
         .start_ticks = leader->proc_start_ticks,
         .state = task->proc_exiting ||
@@ -144,6 +150,10 @@ int kernel_proc_process_snapshot(kernel_pid_t pid, uint64_t identity,
     result->wait_channel_flag = threads < 2U &&
         task->state != KERNEL_THREAD_STATE_RUNNING &&
         task->state != KERNEL_THREAD_STATE_READY;
+    memcpy(result->comm, leader->comm, sizeof(result->comm));
+    }
+    result->tty_nr = kernel_tty_rdev(kernel_task_controlling_tty(leader));
+    result->tty_pgrp = kernel_tty_foreground(kernel_task_controlling_tty(leader));
     const struct kernel_signal_table *actions =
         (const void *)(uintptr_t)leader->signal_table_address;
     if (actions) {
@@ -155,22 +165,33 @@ int kernel_proc_process_snapshot(kernel_pid_t pid, uint64_t identity,
                 result->signal_caught |= UINT64_C(1) << sig;
         }
     }
-    memcpy(result->comm, leader->comm, sizeof(result->comm));
-    kernel_task_cpu_ticks(task, &result->user_ticks,
-        &result->kernel_ticks, &result->child_user_ticks,
-        &result->child_kernel_ticks);
-    member = leader;
-    do {
-        result->minor_faults += member->minor_faults;
-        result->major_faults += member->major_faults;
-        member = member->group_next;
-    } while (member != leader);
+    struct scheduler_task_cursor cursor;
+    scheduler_task_cursor_begin(&cursor);
+    while (cursor.task) {
+        {
+            KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+            struct kernel_task *member = cursor.task;
+            if (member->accounted && member->group_leader == leader) {
+                if (member != leader && member->proc_exiting && result->threads)
+                    result->threads--;
+                result->minor_faults += member->minor_faults;
+                result->major_faults += member->major_faults;
+                result->user_ticks += member->user_ticks;
+                result->kernel_ticks += member->kernel_ticks;
+            }
+        }
+        scheduler_task_cursor_next(&cursor);
+    }
+    {
+        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        result->child_user_ticks = leader->child_user_ticks;
+        result->child_kernel_ticks = leader->child_kernel_ticks;
+    }
     if (!task->proc_exiting && task->mm.state == KERNEL_MM_LIVE) {
         struct kernel_mm_proc_memory memory;
         if (kernel_mm_proc_memory_snapshot(&task->mm, &memory) !=
             KERNEL_MM_STATUS_OK) {
-            arch_interrupt_restore(irq);
-            return -KERNEL_EIO;
+                return -KERNEL_EIO;
         }
         result->virtual_bytes = memory.virtual_bytes;
         result->resident_pages = memory.resident_pages;
@@ -178,7 +199,6 @@ int kernel_proc_process_snapshot(kernel_pid_t pid, uint64_t identity,
         result->end_code = memory.end_code;
         result->start_stack = memory.start_stack;
     }
-    arch_interrupt_restore(irq);
     return 0;
 }
 
@@ -189,10 +209,9 @@ int kernel_proc_process_path_acquire(kernel_pid_t pid, uint64_t identity,
     (void)fd;
     if (pid <= 0 || !identity || !owner || *owner)
         return -KERNEL_EINVAL;
-    uintptr_t irq = arch_interrupt_save();
-    struct kernel_task *task = find_resource_owner(pid, identity);
+    KERNEL_IRQ_SCOPE(proc_irq);
+    SCHEDULER_TASK_BORROW(task, find_resource_owner(pid, identity));
     if (!task) {
-        arch_interrupt_restore(irq);
         return -KERNEL_ENOENT;
     }
     int result = -KERNEL_ENOENT;
@@ -212,7 +231,6 @@ int kernel_proc_process_path_acquire(kernel_pid_t pid, uint64_t identity,
             }
         }
     }
-    arch_interrupt_restore(irq);
     return result;
 }
 
@@ -221,12 +239,11 @@ int kernel_proc_next_fd(kernel_pid_t pid, uint64_t identity,
 {
     if (pid <= 0 || !identity || !fd || after < -1)
         return -KERNEL_EINVAL;
-    uintptr_t irq = arch_interrupt_save();
-    struct kernel_task *task = find_resource_owner(pid, identity);
+    KERNEL_IRQ_SCOPE(proc_irq);
+    SCHEDULER_TASK_BORROW(task, find_resource_owner(pid, identity));
     int result = task && kernel_files_is_live(&task->files)
         ? kernel_files_next_open_fd(&task->files, after, fd)
         : -KERNEL_ENOENT;
-    arch_interrupt_restore(irq);
     return result;
 }
 
@@ -235,8 +252,8 @@ int kernel_proc_fd_access_snapshot(kernel_pid_t pid, uint64_t identity,
 {
     if (pid <= 0 || !identity || fd < 0 || !readable || !writable)
         return -KERNEL_EINVAL;
-    uintptr_t irq = arch_interrupt_save();
-    struct kernel_task *task = find_resource_owner(pid, identity);
+    KERNEL_IRQ_SCOPE(proc_irq);
+    SCHEDULER_TASK_BORROW(task, find_resource_owner(pid, identity));
     struct kernel_open_file_description *file = task &&
         kernel_files_is_live(&task->files)
         ? kernel_files_fd_borrow(&task->files, fd) : 0;
@@ -249,7 +266,6 @@ int kernel_proc_fd_access_snapshot(kernel_pid_t pid, uint64_t identity,
             *writable = kernel_open_file_writable(file);
         }
     }
-    arch_interrupt_restore(irq);
     return file ? 0 : -KERNEL_ENOENT;
 }
 
@@ -258,8 +274,8 @@ int kernel_proc_fd_path_acquire(kernel_pid_t pid, uint64_t identity,
 {
     if (pid <= 0 || !identity || fd < 0 || !owner || *owner)
         return -KERNEL_EINVAL;
-    uintptr_t irq = arch_interrupt_save();
-    struct kernel_task *task = find_resource_owner(pid, identity);
+    KERNEL_IRQ_SCOPE(proc_irq);
+    SCHEDULER_TASK_BORROW(task, find_resource_owner(pid, identity));
     struct kernel_open_file_description *file = task &&
         kernel_files_is_live(&task->files)
         ? kernel_files_fd_borrow(&task->files, fd) : 0;
@@ -269,7 +285,6 @@ int kernel_proc_fd_path_acquire(kernel_pid_t pid, uint64_t identity,
         *owner = path;
         result = 0;
     }
-    arch_interrupt_restore(irq);
     return result;
 }
 
@@ -279,8 +294,8 @@ int kernel_proc_fd_pseudo_snapshot(kernel_pid_t pid, uint64_t identity,
 {
     if (pid <= 0 || !identity || fd < 0 || !snapshot)
         return -KERNEL_EINVAL;
-    uintptr_t irq = arch_interrupt_save();
-    struct kernel_task *task = find_resource_owner(pid, identity);
+    KERNEL_IRQ_SCOPE(proc_irq);
+    SCHEDULER_TASK_BORROW(task, find_resource_owner(pid, identity));
     struct kernel_open_file_description *file = task &&
         kernel_files_is_live(&task->files)
         ? kernel_files_fd_borrow(&task->files, fd) : 0;
@@ -290,7 +305,6 @@ int kernel_proc_fd_pseudo_snapshot(kernel_pid_t pid, uint64_t identity,
         snapshot->object_identity = kernel_open_file_pseudo_identity(file);
         result = 0;
     }
-    arch_interrupt_restore(irq);
     return result;
 }
 
@@ -299,15 +313,14 @@ int kernel_proc_fd_pseudo_stat(kernel_pid_t pid, uint64_t identity,
 {
     if (pid <= 0 || !identity || fd < 0 || !stat)
         return -KERNEL_EINVAL;
-    uintptr_t irq = arch_interrupt_save();
-    struct kernel_task *task = find_resource_owner(pid, identity);
+    KERNEL_IRQ_SCOPE(proc_irq);
+    SCHEDULER_TASK_BORROW(task, find_resource_owner(pid, identity));
     struct kernel_open_file_description *file = task &&
         kernel_files_is_live(&task->files)
         ? kernel_files_fd_borrow(&task->files, fd) : 0;
     /* 伪对象的元数据快照不分配也不等待；解锁后不再访问 OFD。 */
     int result = file ? kernel_open_file_pseudo_stat(file, stat)
                       : -KERNEL_ENOENT;
-    arch_interrupt_restore(irq);
     return result;
 }
 
@@ -319,8 +332,8 @@ int kernel_proc_fd_reopen_link(kernel_pid_t pid, uint64_t identity,
     if (pid <= 0 || !identity || fd < 0 || !heap || !owner || *owner)
         return -KERNEL_EINVAL;
     struct kernel_open_file_pipe_pin pin = {0};
-    uintptr_t irq = arch_interrupt_save();
-    struct kernel_task *task = find_resource_owner(pid, identity);
+    KERNEL_IRQ_SCOPE(proc_irq);
+    SCHEDULER_TASK_BORROW(task, find_resource_owner(pid, identity));
     struct kernel_open_file_description *file = task &&
         kernel_files_is_live(&task->files)
         ? kernel_files_fd_borrow(&task->files, fd) : 0;
@@ -330,7 +343,6 @@ int kernel_proc_fd_reopen_link(kernel_pid_t pid, uint64_t identity,
     else if (file &&
              kernel_open_file_kind(file) == KERNEL_OPEN_FILE_KIND_PIPE)
         result = kernel_open_file_pipe_pin(file, flags, &pin);
-    arch_interrupt_restore(irq);
     if (result || !pin.pipe) return result;
     return kernel_open_file_pipe_finish(heap, &pin, flags, owner);
 }
@@ -352,12 +364,26 @@ int kernel_proc_next_process(kernel_pid_t after, kernel_pid_t *pid,
     if (!pid || !identity || after < 0) return -KERNEL_EINVAL;
     kernel_pid_t best = 0;
     uint64_t token = 0U;
-    uintptr_t irq = arch_interrupt_save();
-    struct kernel_task *root = scheduler.init_task;
-    for (struct kernel_task *leader = root; leader;
-         leader = next_process(leader, root))
-        consider(representative(leader), after, &best, &token);
-    arch_interrupt_restore(irq);
+    KERNEL_IRQ_SCOPE(proc_irq);
+    SCHEDULER_TASK_BORROW(root, 0);
+    {
+        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        root = scheduler.init_task;
+        if (root) scheduler_task_get_locked(root);
+    }
+    if (!root) return -KERNEL_ENOENT;
+    struct scheduler_task_cursor cursor;
+    scheduler_task_cursor_begin(&cursor);
+    while (cursor.task) {
+        struct kernel_task *task = cursor.task;
+        int descends = scheduler_task_descends_from(task, root, 0);
+        {
+            KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+            if (descends && task->accounted && proc_visible(task))
+                consider(task, after, &best, &token);
+        }
+        scheduler_task_cursor_next(&cursor);
+    }
     if (!best) return -KERNEL_ENOENT;
     *pid = best;
     *identity = token;

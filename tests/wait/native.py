@@ -10,11 +10,12 @@ def main():
     parser.add_argument('--arch', choices=('riscv', 'loongarch'), required=True)
     parser.add_argument('--qemu', required=True)
     parser.add_argument('--kernel-dir', type=Path, required=True)
+    parser.add_argument('--case', choices=('wait', 'sched-lifecycle'), default='wait')
     args = parser.parse_args()
-    kernel = args.kernel_dir / 'wait-native'
+    kernel = args.kernel_dir / ('wait-native' if args.case == 'wait' else 'sched-lifecycle-native')
     if not kernel.is_file():
         raise SystemExit(f'missing wait kernel: {kernel}')
-    output_dir = Path('build/sync-b2/native') / args.arch
+    output_dir = Path('build') / ('sync-b2/native' if args.case == 'wait' else 'sched-lifecycle/native') / args.arch
     output_dir.mkdir(parents=True, exist_ok=True)
     for memory in ('512M', '1G'):
         command = [args.qemu, '-machine', 'virt', '-smp', '1', '-m', memory,
@@ -25,7 +26,9 @@ def main():
         (output_dir / f'{memory}.log').write_text(output)
         if result.returncode or 'WAIT native passed:' not in output or 'fatal' in output:
             raise SystemExit(f'{args.arch} wait {memory} failed:\n{output[-3000:]}')
-        print(f'{args.arch} wait handoff RAM={memory} passed', flush=True)
+        if args.case != 'wait' and 'SCHED lifecycle passed:' not in output:
+            raise SystemExit('missing real lifecycle evidence')
+        print(f'{args.arch} {args.case} RAM={memory} passed', flush=True)
 
 
 if __name__ == '__main__':
