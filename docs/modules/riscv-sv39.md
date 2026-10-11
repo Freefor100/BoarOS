@@ -58,6 +58,9 @@ RISC-V direct map 使用固定公式 `VA = 0xffffffc000000000 + PA`，窗口大�
 
 ## 内核栈窗口
 
+运行期两页接口`riscv_sv39_kernel_window_map_pages/unmap_pages`全部预检后提交。
+缺表私有准备并在可能睡眠后重查；空表在本地/远端失效确认后归还，详见[RV两核模块](riscv-smp.md)。
+
 `riscv_sv39_kernel_window_reserve()` 在表处于 BUILDING 时为一个未使用的根槽建立空子树：只分配 level-1 空表并写入根项，不建立任何叶。这样任何之后创建的用户空间按值复制根项时都继承同一子树指针，而运行期只修改共享的下级表。
 
 `riscv_sv39_kernel_window_map()/unmap()` 只接受窗口内 4 KiB 对齐地址：map 惰性分配 level-0 表并写入 R/W 叶，unmap 清叶并在该表变空时释放它、清 level-1 项；两者按地址 `SFENCE.VMA`，释放整表时用全局 fence。窗口不保存分配器指针——reserve 在重定位前运行，指针必须由调用方在运行期传入，否则 medany 取址会留下物理别名。窗口只覆盖一个根槽；未映射页在窗口内按 fault 处理，不存在回退映射。

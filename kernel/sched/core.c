@@ -27,6 +27,47 @@
 struct kernel_scheduler scheduler;
 static struct kernel_cpu boot_cpu;
 static struct kernel_task bootstrap_task;
+static uintptr_t current_sp(void);
+#if BOAROS_MAX_CPUS > 1
+static struct kernel_task secondary_idle;
+void kernel_assert_service_context(void)
+{
+    struct kernel_cpu *cpu = kernel_cpu_current();
+    if (cpu->logical_id || (cpu->current && cpu->current->controlled)) __builtin_trap();
+}
+
+struct kernel_task *kernel_cpu_secondary_prepare(struct kernel_cpu *cpu,
+    uint64_t hart, unsigned logical)
+{
+    if (kernel_cpu_current()->logical_id || logical != 1 || cpu->initialized)
+        __builtin_trap();
+    kernel_cpu_initialize(cpu, hart, &secondary_idle.io_context);
+    cpu->logical_id = logical;
+    secondary_idle.cpu = cpu;
+    return &secondary_idle;
+}
+
+void kernel_cpu_secondary_attach(struct kernel_cpu *cpu, uintptr_t low, uintptr_t high)
+{
+    if (arch_interrupt_is_enabled() || !cpu || cpu->logical_id != 1 || cpu->current ||
+        current_sp() < low || current_sp() >= high) __builtin_trap();
+    struct kernel_task *idle = &secondary_idle;
+    idle->arch.kernel_sp = high;
+    arch_thread_set_mm(&idle->arch, scheduler.kernel_context);
+    idle->magic = KERNEL_THREAD_MAGIC;
+    idle->physical_address = idle->stack_physical_address = KERNEL_THREAD_NO_PAGE;
+    idle->stack_low = low;
+    idle->stack_high = high;
+    idle->state = KERNEL_THREAD_STATE_IDLE;
+    idle->idle = 1;
+    idle->completion.kind = KERNEL_THREAD_KIND_KERNEL;
+    kernel_wait_record_init(&idle->wait);
+    idle->wait.on_cpu = 1;
+    cpu->current = idle;
+    arch_current_thread_set(idle);
+    scheduler_cpu_initialize(cpu, idle, kernel_time_monotonic_ns());
+}
+#endif
 
 _Static_assert(offsetof(struct kernel_task, cpu) == ARCH_TASK_CPU_OFFSET,
                "current CPU lookup must preserve the architecture prefix");
@@ -515,6 +556,7 @@ static void kernel_stack_slots_reset(void)
 /* Allocate the metadata and execution stack before publishing any owner. */
 enum kernel_scheduler_status allocate_task_storage(struct kernel_task **task)
 {
+    kernel_assert_service_context();
     struct kernel_task *thread;
     uint64_t metadata_address;
     uint64_t stack_address;
@@ -569,6 +611,10 @@ enum kernel_scheduler_status allocate_task_storage(struct kernel_task **task)
                 metadata_address, KERNEL_SCHEDULER_STATUS_NO_MEMORY);
         }
         stack_va = window + BOAROS_PAGE_SIZE;
+#if !defined(BOAROS_ARCH_LOONGARCH)
+        map_status = arch_mmu_kernel_window_map_pages(scheduler.allocator, stack_va,
+                                                      stack_address, 2);
+#else
         map_status = arch_mmu_kernel_window_map(scheduler.allocator,
                                                   stack_va, stack_address);
         if (map_status == ARCH_MMU_STATUS_OK) {
@@ -576,11 +622,14 @@ enum kernel_scheduler_status allocate_task_storage(struct kernel_task **task)
                 scheduler.allocator, stack_va + BOAROS_PAGE_SIZE,
                 stack_address + BOAROS_PAGE_SIZE);
         }
+#endif
         if (map_status != ARCH_MMU_STATUS_OK) {
+#if defined(BOAROS_ARCH_LOONGARCH)
             (void)arch_mmu_kernel_window_unmap(scheduler.allocator,
                                                  stack_va);
             (void)arch_mmu_kernel_window_unmap(
                 scheduler.allocator, stack_va + BOAROS_PAGE_SIZE);
+#endif
             kernel_stack_slot_release(window);
             (void)physical_page_release_order(scheduler.allocator,
                                               stack_address,
@@ -608,6 +657,7 @@ enum kernel_scheduler_status allocate_task_storage(struct kernel_task **task)
  * and a GROUP_DEAD leader can later re-enter the exited queue. */
 enum kernel_scheduler_status release_task_stack(struct kernel_task *thread)
 {
+    kernel_assert_service_context();
     if (thread && (thread->wait.on_cpu || thread->wait.borrows || thread->wait.nodes ||
         thread->wait.phase != KERNEL_WAIT_FINISHED)) __builtin_trap();
     const unsigned char *cursor;
@@ -657,10 +707,15 @@ enum kernel_scheduler_status release_task_stack(struct kernel_task *thread)
     if (arch_mmu_kernel_window_active()) {
         uint64_t window = (uint64_t)thread->stack_low -
                           KERNEL_STACK_GUARD_BYTES - BOAROS_PAGE_SIZE;
+#if !defined(BOAROS_ARCH_LOONGARCH)
+        if (arch_mmu_kernel_window_unmap_pages(scheduler.allocator,
+                  window + BOAROS_PAGE_SIZE, 2) != ARCH_MMU_STATUS_OK) __builtin_trap();
+#else
         (void)arch_mmu_kernel_window_unmap(scheduler.allocator,
                                              window + BOAROS_PAGE_SIZE);
         (void)arch_mmu_kernel_window_unmap(
             scheduler.allocator, window + BOAROS_PAGE_SIZE * 2U);
+#endif
         kernel_stack_slot_release(window);
     }
     (void)physical_page_release_order(scheduler.allocator,
@@ -808,8 +863,9 @@ enum kernel_scheduler_status kernel_scheduler_init(
 enum kernel_scheduler_status kernel_thread_create(void (*entry)(void *), void *argument)
 { return kernel_thread_create_joinable(entry, argument, 0); }
 
-enum kernel_scheduler_status kernel_thread_create_joinable(
-    void (*entry)(void *), void *argument, struct kernel_thread_join *join)
+static enum kernel_scheduler_status create_kernel_thread(
+    void (*entry)(void *), void *argument, struct kernel_thread_join *join,
+    uint32_t cpu_mask)
 {
     struct kernel_task *thread;
     uintptr_t old_status;
@@ -842,6 +898,12 @@ enum kernel_scheduler_status kernel_thread_create_joinable(
         goto restore_interrupts;
     }
     thread->arch.user_sp = 0U;
+#if BOAROS_MAX_CPUS > 1
+    thread->cpu_mask = cpu_mask ? cpu_mask : 1;
+    thread->controlled = cpu_mask != 0;
+#else
+    (void)cpu_mask;
+#endif
     thread->arch.user_mode = 0U;
     arch_thread_set_mm(&thread->arch, scheduler.kernel_context);
     thread->magic = KERNEL_THREAD_MAGIC;
@@ -883,6 +945,13 @@ enum kernel_scheduler_status kernel_thread_create_joinable(
             join->task = thread;
             thread->join = join;
         }
+#if BOAROS_MAX_CPUS > 1
+        if (thread->controlled) {
+            if (scheduler.controlled_owners == UINT32_MAX) __builtin_trap();
+            thread->controlled = 2;
+            scheduler.controlled_owners++;
+        }
+#endif
         ready_enqueue_locked(thread, 0);
     }
     status = KERNEL_SCHEDULER_STATUS_OK;
@@ -891,6 +960,49 @@ restore_interrupts:
     arch_interrupt_restore(old_status);
     return status;
 }
+
+enum kernel_scheduler_status kernel_thread_create_joinable(
+    void (*entry)(void *), void *argument, struct kernel_thread_join *join)
+{ return create_kernel_thread(entry, argument, join, 0); }
+
+#if BOAROS_MAX_CPUS > 1
+int kernel_scheduler_core_quiescent(struct kernel_cpu *cpu)
+{
+    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+    return !scheduler.controlled_owners && cpu && cpu->current == cpu->idle &&
+        !cpu->switch_previous && !cpu->eligible.first;
+}
+enum kernel_scheduler_status kernel_thread_create_joinable_mask(
+    void (*entry)(void *), void *argument, struct kernel_thread_join *join, uint32_t mask)
+{
+    if (!join || !mask || (mask & ~3U)) return KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
+    unsigned available = 0;
+    { KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+      for (struct kernel_cpu *cpu = scheduler.cpus; cpu; cpu = cpu->scheduler_next)
+          if (!cpu->logical_id || kernel_cpu_online(cpu)) available |= 1U << cpu->logical_id; }
+    if (mask & ~available) return KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
+    return create_kernel_thread(entry, argument, join, mask);
+}
+
+enum kernel_scheduler_status kernel_thread_set_cpu_mask(struct kernel_thread_join *join,
+                                                       uint32_t mask)
+{
+    kernel_assert_service_context();
+    if (!join || !mask || (mask & ~3U)) return KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
+    KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+    struct kernel_task *task = join->task;
+    if (!task || !task->controlled) return KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
+    unsigned available = 0;
+    for (struct kernel_cpu *cpu = scheduler.cpus; cpu; cpu = cpu->scheduler_next)
+        if (!cpu->logical_id || kernel_cpu_online(cpu)) available |= 1U << cpu->logical_id;
+    if (mask & ~available) return KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
+    if (task->state != KERNEL_THREAD_STATE_BLOCKED || task->wait.on_cpu ||
+        task->ready_node.queued || task->wait.ready_pending)
+        return KERNEL_SCHEDULER_STATUS_BUSY;
+    task->cpu_mask = mask;
+    return KERNEL_SCHEDULER_STATUS_OK;
+}
+#endif
 
 enum kernel_scheduler_status kernel_user_thread_create(
     struct kernel_mm *mm,
@@ -1175,7 +1287,11 @@ enum kernel_scheduler_status kernel_scheduler_on_tick(uint64_t elapsed_ticks)
     if (scheduler_failure() != KERNEL_SCHEDULER_STATUS_OK) return scheduler_failure();
     enum kernel_scheduler_status status = validate_current();
     if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
-    if (elapsed_ticks) {
+    if (elapsed_ticks
+#if BOAROS_MAX_CPUS > 1
+        && kernel_cpu_current()->logical_id == 0
+#endif
+    ) {
         /* Load sampling traverses with borrows outside a single raw section.
          * Preserve its fail-before-sampling check; the decision revalidates. */
         status = validate_queues();

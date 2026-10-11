@@ -61,6 +61,9 @@ void kernel_raw_lock_release(struct kernel_raw_guard *guard)
     cpu->preempt_depth = guard->previous_depth;
     __atomic_store_n(&guard->lock->word, 0U, __ATOMIC_RELEASE);
     guard->lock = 0;
+#if BOAROS_MAX_CPUS > 1
+    if (!cpu->raw_locks) kernel_cpu_flush_notifications();
+#endif
     arch_interrupt_restore(guard->interrupts);
 #if BOAROS_COST_DIAGNOSTICS
     if (guard->cost.epoch) kernel_cost_raw_lock(guard->cost, guard->wait_ticks, hold);

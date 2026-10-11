@@ -8,6 +8,12 @@
 #define DTB_MAX_RESERVED_RANGES 16U
 #define DTB_MAX_MEMORY_RANGES 16U
 #define DTB_MAX_VIRTIO_MMIO_RANGES 16U
+#define DTB_MAX_CPUS 2U
+
+struct dtb_cpu_info {
+    uint64_t hart_ids[DTB_MAX_CPUS];
+    uint32_t count;
+};
 
 enum dtb_status {
     DTB_STATUS_OK = 0,
@@ -54,5 +60,9 @@ enum dtb_status dtb_read_irq_info(const void *dtb, uint64_t boot_hart,
 
 enum dtb_status dtb_read_boot_info(const void *dtb,
                                    struct dtb_boot_info *info);
+
+/* 独立快照：boot hart 为逻辑0，其余可用hart排序；失败不发布。 */
+enum dtb_status dtb_read_cpu_info(const void *dtb, uint64_t boot_hart,
+                                struct dtb_cpu_info *info);
 
 #endif

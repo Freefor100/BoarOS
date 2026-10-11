@@ -55,12 +55,24 @@ struct kernel_task *ready_next(const struct kernel_task *task)
 { return task->ready_node.next ? task->ready_node.next->owner : 0; }
 struct kernel_task *ready_best_locked(void)
 {
-    struct kernel_sched_node *node = kernel_sched_pick(&scheduler.runqueue,
+    struct kernel_sched_node *node = kernel_sched_pick(
+#if BOAROS_MAX_CPUS > 1
+        &kernel_cpu_current()->eligible,
+#else
+        &scheduler.runqueue,
+#endif
         kernel_rt_bandwidth_eligible(&kernel_cpu_current()->rt_bandwidth));
     return node ? node->owner : 0;
 }
 void ready_remove_locked(struct kernel_task *task)
-{ kernel_sched_dequeue(&scheduler.runqueue, &task->ready_node); }
+{
+#if BOAROS_MAX_CPUS > 1
+    for (struct kernel_cpu *cpu = scheduler.cpus; cpu; cpu = cpu->scheduler_next)
+        if (task->eligible_nodes[cpu->logical_id].queued)
+            kernel_sched_dequeue(&cpu->eligible, &task->eligible_nodes[cpu->logical_id]);
+#endif
+    kernel_sched_dequeue(&scheduler.runqueue, &task->ready_node);
+}
 void ready_enqueue_locked(struct kernel_task *task, int head)
 {
 #if BOAROS_COST_DIAGNOSTICS
@@ -70,10 +82,23 @@ void ready_enqueue_locked(struct kernel_task *task, int head)
     task->next = 0;
     kernel_sched_enqueue(&scheduler.runqueue, &task->ready_node, task,
                          (unsigned)task->scheduling.priority, head);
+#if BOAROS_MAX_CPUS > 1
+    uint32_t mask = task->cpu_mask ? task->cpu_mask : 1U;
+    for (struct kernel_cpu *target = scheduler.cpus; target; target = target->scheduler_next) {
+        if (!(mask & (1U << target->logical_id))) continue;
+        kernel_sched_enqueue(&target->eligible, &task->eligible_nodes[target->logical_id],
+                             task, (unsigned)task->scheduling.priority, head);
+        if (!target->current || target->current->idle ||
+            task->scheduling.priority > target->current->scheduling.priority) {
+            kernel_cpu_request_schedule(target);
+        }
+    }
+#else
     struct kernel_cpu *target = task->cpu ? task->cpu : kernel_cpu_current();
     if (!target->current || target->current->idle ||
         task->scheduling.priority > target->current->scheduling.priority)
         kernel_cpu_request_schedule(target);
+#endif
 }
 void ready_remove(struct kernel_task *task)
 { KERNEL_RAW_SCOPE(guard, &kernel_wait_domain); ready_remove_locked(task); }
@@ -124,7 +149,11 @@ void scheduler_rearm_timer(void)
     KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
     uint64_t delay = kernel_rt_bandwidth_delay(&cpu->rt_bandwidth,
         is_rt(cpu->current),
+#if BOAROS_MAX_CPUS > 1
+        cpu->eligible.first && cpu->eligible.first->priority != 0);
+#else
         scheduler.runqueue.first && scheduler.runqueue.first->priority != 0);
+#endif
     if (cpu->current && cpu->current != cpu->idle &&
         cpu->current->scheduling.policy == KERNEL_SCHED_RR) {
         uint64_t slice = cpu->current->scheduling.rr_remaining_ns;
@@ -140,7 +169,11 @@ void scheduler_rearm_timer(void)
         else if (status != KERNEL_TIME_STATUS_OK) __builtin_trap();
     }
     /* 最早阻塞期限与 RT/时间片预算同为 tick 域；取最小者编入硬件事件。 */
-    struct kernel_task *blocked = deadline_index_first();
+    struct kernel_task *blocked =
+#if BOAROS_MAX_CPUS > 1
+        cpu->logical_id ? 0 :
+#endif
+        deadline_index_first();
     if (blocked != 0 && (!deadline || blocked->wakeup_deadline < deadline))
         deadline = blocked->wakeup_deadline;
     cpu->armed_deadline = deadline;
@@ -150,6 +183,7 @@ void scheduler_rearm_timer(void)
         __builtin_trap();
     arch_interrupt_restore(irq);
 }
+void kernel_scheduler_deadline_changed(void) { scheduler_rearm_timer(); }
 
 enum kernel_scheduler_status scheduler_reschedule(int rotate_other, int voluntary, int check_queues)
 {
@@ -314,6 +348,9 @@ int kernel_scheduler_rt_bandwidth_set(int runtime_field, int64_t value)
                 if (old_period != scheduler.rt_configuration.period_ns)
                     cpu->rt_bandwidth.period_start_ns = now;
                 kernel_cpu_request_schedule(cpu);
+#if BOAROS_MAX_CPUS > 1
+                if (cpu != kernel_cpu_current()) kernel_cpu_notify(cpu, 2U);
+#endif
             }
         }
     }

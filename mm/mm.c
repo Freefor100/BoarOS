@@ -1,4 +1,5 @@
 #include <kernel/mm_backend.h>
+#include <kernel/cpu.h>
 #include <kernel/elf64_source.h>
 #include <kernel/errno.h>
 #include <kernel/file_mapping.h>
@@ -160,6 +161,7 @@ static enum kernel_mm_status resolve_record(
     const struct kernel_mm *mm,
     struct kernel_mm_record **record)
 {
+    kernel_assert_service_context();
     void *pointer;
     int empty_space_cleanup;
 
@@ -231,6 +233,7 @@ enum kernel_mm_status kernel_mm_create(
     struct kernel_mm *mm,
     struct arch_mmu_user_space *space)
 {
+    kernel_assert_service_context();
     KERNEL_NO_RECLAIM_IO;
     struct physical_page_allocator *allocator;
     struct kernel_mm_record *record;

@@ -17,7 +17,11 @@ struct riscv_timer_state {
     int armed;
 };
 
+#if BOAROS_MAX_CPUS > 1
+#define timer_state (kernel_cpu_current()->timer)
+#else
 static struct riscv_timer_state timer_state;
+#endif
 
 uint64_t riscv_time_read(void)
 {

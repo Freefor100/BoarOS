@@ -73,6 +73,10 @@ IRQ恢复及非法owner/上下文。真实I/O等待继续用`make test-io-sleep-
 
 ## 策略、就绪队列与 RT 预算
 
+独立[RV受控两核配置](riscv-smp.md)在同一调度域内维护每CPU资格索引，只有显式mask的joinable内核任务参与跨CPU选择。
+用户及业务worker默认CPU0；全局runnable成员与on_cpu仍是唯一owner，资格节点只借用成员。
+任务构造、栈窗口和实际回收限CPU0，停止时受控存储owner归零后才确认HSM STOPPED。
+
 OTHER 保留 100 Hz tick 轮转，内核 worker 使用 OTHER。FIFO/RR 的用户优先级为 1–99，数值越大越优先；FIFO 不因 tick 同级轮转，RR 每片 100ms，按实际在 CPU 上运行的纳秒扣除。更高优先级抢占、阻塞和 yield 不重新赠送 RR 时间片；耗尽后才重装。唤醒及策略修改标记 need_resched，在 IRQ 或返回用户态的安全边界切换。降优先级排到新级队首，升优先级排队尾，同级修改保留位置；高优先级抢占的当前任务回原级队首。
 
 挑选、摘队列与取得on_cpu执行owner在同一个短锁发布点完成，普通切换与退出复用该入口；锁外才切换架构状态，旧owner仍由新栈交接释放。未使用的拆分pop入口已删除。

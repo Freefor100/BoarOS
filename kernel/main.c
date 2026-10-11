@@ -4,6 +4,7 @@
 #include <arch/riscv/root_boot.h>
 #include <arch/riscv/plic.h>
 #include <arch/riscv/sbi.h>
+#include <arch/riscv/smp.h>
 #include <arch/riscv/sv39.h>
 #include <arch/riscv/timer.h>
 #include <arch/riscv/virt_rtc.h>
@@ -40,6 +41,13 @@ static struct physical_page_allocator page_allocator;
 static struct riscv_sv39_page_table kernel_page_table;
 static struct physical_page_allocator transition_page_allocator;
 static struct riscv_sv39_page_table transition_page_table;
+#if BOAROS_MAX_CPUS > 1
+static struct dtb_cpu_info boot_cpus;
+#if BOAROS_SMP_TEST
+void riscv_smp_test_start(struct physical_page_allocator *);
+void riscv_smp_test_poll(void);
+#endif
+#endif
 static struct riscv_root_boot root_boot;
 static struct dtb_irq_info boot_irq;
 static struct dtb_boot_info boot_info;
@@ -684,6 +692,9 @@ static void storage_cleanup_worker(void *argument)
         int users_pending = init_reaped && kernel_scheduler_stop_users();
         arch_interrupt_restore(interrupt_status);
         if (init_reaped && !users_pending) {
+#if BOAROS_MAX_CPUS > 1
+            riscv_smp_stop();
+#endif
             struct kernel_heap_statistics heap_statistics;
             uint64_t available_pages;
 
@@ -763,6 +774,10 @@ void kernel_main(unsigned long hart_id, const void *dtb)
     if (dtb_read_irq_info(dtb, hart_id, &boot_irq) != DTB_STATUS_OK)
         shutdown_for_dtb_error(DTB_STATUS_UNSUPPORTED);
     boot_hart_id = hart_id;
+#if BOAROS_MAX_CPUS > 1
+    dtb_status = dtb_read_cpu_info(dtb, hart_id, &boot_cpus);
+    if (dtb_status != DTB_STATUS_OK) shutdown_for_dtb_error(dtb_status);
+#endif
     boot_dtb_address = (uintptr_t)dtb;
     /* 重定位前 __kernel_start 即物理加载地址，绑定镜像 VA->PA 偏移。 */
     riscv_image_bind_load_offset(RISCV_KERNEL_VIRTUAL_BASE -
@@ -974,6 +989,14 @@ static void kernel_main_high(void)
         __asm__ volatile("csrs sstatus, %0" ::"r"(fs_clean) : "memory");
     }
 
+#if BOAROS_MAX_CPUS > 1
+    riscv_smp_start(&boot_cpus, (UINT64_C(8) << 60) |
+                    (transition_page_table.root_address >> 12),
+                    riscv_sv39_current_satp(), boot_info.timebase_frequency);
+#if BOAROS_SMP_TEST
+    riscv_smp_test_start(&page_allocator);
+#endif
+#endif
     timer_status = riscv_timer_start(boot_info.timebase_frequency,
                                      KERNEL_TICKS_PER_SECOND);
     if (timer_status != RISCV_TIMER_STATUS_OK) {
@@ -994,11 +1017,18 @@ static void kernel_main_high(void)
         if (!root_started) {
             struct kernel_thread_completion completion;
             while (kernel_scheduler_reap_one(&completion) == KERNEL_SCHEDULER_STATUS_OK) { }
+#if BOAROS_SMP_TEST
+            riscv_smp_test_poll();
+#endif
         }
         scheduler_status = kernel_scheduler_yield_current();
         if (scheduler_status != KERNEL_SCHEDULER_STATUS_OK) shutdown_for_scheduler_error(scheduler_status);
         arch_interrupt_restore(irq | RISCV_SSTATUS_SIE);
+#if BOAROS_MAX_CPUS > 1
+        riscv_smp_idle();
+#else
         asm volatile("wfi");
+#endif
     }
 
 }

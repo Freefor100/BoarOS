@@ -1345,6 +1345,7 @@ void kernel_scheduler_wait_cleanup(uint64_t retry_deadline)
 
 void kernel_thread_join(struct kernel_thread_join *join)
 {
+    kernel_assert_service_context();
     KERNEL_IRQ_SCOPE(join_irq);
     if (!join) __builtin_trap();
     {
@@ -1426,6 +1427,7 @@ static void reap_claim_end(struct kernel_task **task)
 enum kernel_scheduler_status kernel_scheduler_reap_one(
     struct kernel_thread_completion *completion)
 {
+    kernel_assert_service_context();
     struct kernel_thread_completion result;
     struct kernel_task *thread;
     uint32_t publish;

@@ -6,10 +6,12 @@
 #include <kernel/pid.h>
 
 #include <stdint.h>
+#include <kernel/cpu_config.h>
 
 struct kernel_files;
 struct kernel_fs_context;
 struct kernel_task;
+struct kernel_cpu;
 
 enum kernel_scheduler_status {
     KERNEL_SCHEDULER_STATUS_OK = 0,
@@ -94,6 +96,8 @@ void kernel_scheduler_system_statistics(uint64_t loads[3], uint16_t *tasks);
 
 enum kernel_scheduler_status kernel_scheduler_on_tick(
     uint64_t elapsed_ticks);
+/* CPU0处理远端新增期限时，只重装本地硬件事件。 */
+void kernel_scheduler_deadline_changed(void);
 
 /* Commits the image prepared by the current user task's exec transaction. */
 enum kernel_scheduler_status kernel_scheduler_exec_commit(void);
@@ -256,6 +260,13 @@ struct kernel_thread_join {
 };
 enum kernel_scheduler_status kernel_thread_create_joinable(
     void (*entry)(void *), void *argument, struct kernel_thread_join *join);
+#if BOAROS_MAX_CPUS > 1
+/* CPU0创建并持有join；仅显式受控任务可改变mask，且必须已阻塞/off_cpu。 */
+enum kernel_scheduler_status kernel_thread_create_joinable_mask(
+    void (*entry)(void *), void *argument, struct kernel_thread_join *join, uint32_t mask);
+enum kernel_scheduler_status kernel_thread_set_cpu_mask(struct kernel_thread_join *, uint32_t);
+int kernel_scheduler_core_quiescent(struct kernel_cpu *);
+#endif
 void kernel_thread_join(struct kernel_thread_join *join);
 
 enum kernel_scheduler_status kernel_scheduler_yield_current(void);

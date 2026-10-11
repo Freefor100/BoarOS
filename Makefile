@@ -21,6 +21,22 @@ endif
 TEST_MEMORY_ARGS := $(foreach memory,$(TEST_MEMORIES),--memory $(memory))
 
 COST_DIAGNOSTICS ?= 0
+SMP ?= 0
+SMP_TEST ?= 0
+ifneq ($(filter $(SMP_TEST),0 1),$(SMP_TEST))
+$(error SMP_TEST must be 0 or 1)
+endif
+ifneq ($(filter $(SMP),0 1),$(SMP))
+$(error SMP must be 0 or 1)
+endif
+ifeq ($(SMP_TEST),1)
+ifeq ($(SMP),0)
+$(error SMP_TEST requires SMP=1)
+endif
+endif
+ifeq ($(SMP)$(COST_DIAGNOSTICS),11)
+$(error SMP plus COST is unsupported)
+endif
 ifneq ($(filter $(COST_DIAGNOSTICS),0 1),$(COST_DIAGNOSTICS))
 $(error COST_DIAGNOSTICS must be 0 or 1)
 endif
@@ -30,6 +46,17 @@ KERNEL_RV := build/cost/kernel-rv
 else
 BUILD_DIR := build/riscv
 KERNEL_RV := kernel-rv
+endif
+ifeq ($(SMP),1)
+BUILD_DIR := build/riscv-smp/riscv
+KERNEL_RV := build/riscv-smp/kernel-rv
+CPU_CAPACITY := 2
+else
+CPU_CAPACITY := 1
+endif
+ifeq ($(SMP_TEST),1)
+BUILD_DIR := build/riscv-smp-test/riscv
+KERNEL_RV := build/riscv-smp-test/kernel-rv
 endif
 TRAP_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-trap-rv
 TRAP_RETURN_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-trap-return-rv
@@ -82,6 +109,8 @@ USER_FATAL_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-user-fatal-rv
 ARCH_FLAGS := -march=rv64imac_zicsr_zifencei -mabi=lp64 -mcmodel=medany
 CPPFLAGS := -DBOAROS_COST_DIAGNOSTICS=$(COST_DIAGNOSTICS) -Iinclude -DBOAROS_PAGE_SHIFT=12 \
 	-DBOAROS_UTS_MACHINE=\"riscv64\"
+CPPFLAGS += -DBOAROS_MAX_CPUS=$(CPU_CAPACITY)
+CPPFLAGS += -DBOAROS_SMP_TEST=$(SMP_TEST)
 CFLAGS := $(ARCH_FLAGS) -std=gnu11 -O2 -g3 \
 	-ffreestanding -fno-builtin -fno-stack-protector -fno-pic -fno-pie \
 	-ffunction-sections -fdata-sections -Wall -Wextra -Werror
@@ -147,6 +176,7 @@ LWIP_SOURCES := \
 C_SOURCES := \
 	kernel/cpu.c \
 	kernel/raw_lock.c \
+	arch/riscv/smp.c \
 	arch/riscv/context.c \
 	arch/riscv/direct_map.c \
 	arch/riscv/elf_image.c \
@@ -256,6 +286,7 @@ C_SOURCES := \
 	$(LWIP_SOURCES)
 ASM_SOURCES := \
 	arch/riscv/boot.S \
+	arch/riscv/secondary.S \
 	arch/riscv/context_switch.S \
 	arch/riscv/fpu.S \
 	arch/riscv/trap_entry.S \
@@ -268,6 +299,9 @@ endif
 OBJECTS := \
 	$(patsubst %.c,$(BUILD_DIR)/%.o,$(C_SOURCES)) \
 	$(patsubst %.S,$(BUILD_DIR)/%.o,$(ASM_SOURCES))
+ifeq ($(SMP_TEST),1)
+OBJECTS += $(BUILD_DIR)/tests/riscv/smp_cases.o
+endif
 TEST_RUNTIME_C_SOURCES := \
 	kernel/cpu.c \
 	kernel/raw_lock.c \
@@ -2005,3 +2039,18 @@ test-sched-concurrency-host:
 	build/host/sched-concurrency
 
 test-riscv: test-scheduler-handoff-riscv
+
+.PHONY: kernel-rv-smp run-smp-riscv test-smp-host test-smp-riscv
+QEMU_RISCV_FIRMWARE ?= default
+kernel-rv-smp:
+	$(MAKE) SMP=1 COST_DIAGNOSTICS=0 all
+run-smp-riscv: kernel-rv-smp
+	$(QEMU_RISCV64) -machine virt -accel tcg,thread=multi -smp 2 -m $(QEMU_MEMORY) -nographic -bios $(QEMU_RISCV_FIRMWARE) -kernel build/riscv-smp/kernel-rv
+test-smp-host:
+	python3 -B tests/host/smp_dtb_test.py
+	@mkdir -p build/host
+	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -DBOAROS_MAX_CPUS=2 -Itests/host/sync -idirafter include tests/host/smp_sched.c kernel/cpu.c kernel/raw_lock.c kernel/sched/wait.c kernel/sched/scheduling.c kernel/sched/policy.c kernel/sched/runqueue.c -Wl,--gc-sections -o build/host/smp-sched
+	build/host/smp-sched
+test-smp-riscv:
+	$(MAKE) SMP=1 SMP_TEST=1 COST_DIAGNOSTICS=0 all
+	python3 -B tests/smp/riscv.py --qemu $(QEMU_RISCV64) --firmware $(QEMU_RISCV_FIRMWARE) --kernel build/riscv-smp-test/kernel-rv

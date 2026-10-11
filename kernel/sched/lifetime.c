@@ -60,7 +60,11 @@ static void disposal_progress(void)
      * return metadata now; callback/preemption scopes leave the real queue owner. */
     struct kernel_cpu *cpu = kernel_cpu_current();
     if (cpu->raw_locks) __builtin_trap();
-    if (!cpu->preempt_depth) scheduler_task_collect();
+    if (!cpu->preempt_depth
+#if BOAROS_MAX_CPUS > 1
+        && cpu->logical_id == 0
+#endif
+    ) scheduler_task_collect();
     else scheduler_task_disposal_notify();
 }
 
@@ -144,7 +148,11 @@ void scheduler_task_retire(struct kernel_task *task)
 
 void scheduler_task_collect(void)
 {
+    kernel_assert_service_context();
     int notify = 0, completed = 0;
+#if BOAROS_MAX_CPUS > 1
+    int completed_controlled = 0;
+#endif
     for (;;) {
         struct kernel_task *task;
         {
@@ -152,6 +160,13 @@ void scheduler_task_collect(void)
             /* 摘队列只转移给本次collector；页服务尚未完成时仍有owner。
              * 上一次实际归还结束后才发布计数，并与下一次摘取合并。 */
             if (completed) {
+#if BOAROS_MAX_CPUS > 1
+                if (completed_controlled) {
+                    if (!scheduler.controlled_owners) __builtin_trap();
+                    scheduler.controlled_owners--;
+                    completed_controlled = 0;
+                }
+#endif
                 if (!scheduler.retired_pending) __builtin_trap();
                 scheduler.retired_pending--;
                 completed = 0;
@@ -164,6 +179,9 @@ void scheduler_task_collect(void)
             if (!scheduler.retired_pending) __builtin_trap();
             if (task->retirement != 3 || task->storage_borrows || task->wait.on_cpu)
                 __builtin_trap();
+#if BOAROS_MAX_CPUS > 1
+            completed_controlled = task->controlled == 2;
+#endif
         }
         /* No rank40 lock may be held while the allocator consumes the page. */
         (void)physical_page_release(scheduler.allocator, task->physical_address);

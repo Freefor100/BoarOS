@@ -119,6 +119,11 @@ struct kernel_task {
     struct kernel_pid *prepared_group, *prepared_session;
     struct kernel_sched_policy scheduling;
     struct kernel_sched_node ready_node;
+#if BOAROS_MAX_CPUS > 1
+    struct kernel_sched_node eligible_nodes[BOAROS_MAX_CPUS];
+    /* controlled=1为私有准备，2持已发布存储owner，直到最终页归还。 */
+    uint32_t cpu_mask, controlled;
+#endif
     unsigned accounted;
     struct kernel_thread_join *join;
     struct kernel_task *parent;
@@ -238,6 +243,9 @@ struct kernel_scheduler {
     struct kernel_task *all_tasks;
     struct kernel_task *retired_tasks;
     uint64_t retired_pending, task_count;
+#if BOAROS_MAX_CPUS > 1
+    uint32_t controlled_owners;
+#endif
     uint64_t loads[3], load_ticks;
     struct kernel_pid_registry identities;
     struct kernel_heap identity_heap;

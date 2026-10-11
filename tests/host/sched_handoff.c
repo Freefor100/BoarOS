@@ -43,6 +43,12 @@ enum kernel_heap_status kernel_heap_release(struct kernel_heap *heap, void *poin
 { (void)heap; (void)pointer; __builtin_trap(); /* This private construction has no PID heap owner. */ }
 
 int riscv_sv39_kernel_window_active(void) { return 0; }
+enum riscv_sv39_status riscv_sv39_kernel_window_map_pages(
+    struct physical_page_allocator *a, uint64_t va, uint64_t pa, unsigned pages)
+{ (void)a; (void)va; (void)pa; (void)pages; __builtin_trap(); }
+enum riscv_sv39_status riscv_sv39_kernel_window_unmap_pages(
+    struct physical_page_allocator *a, uint64_t va, unsigned pages)
+{ (void)a; (void)va; (void)pages; __builtin_trap(); }
 enum riscv_sv39_status riscv_sv39_kernel_window_unmap(
     struct physical_page_allocator *allocator, uint64_t address)
 { (void)allocator; (void)address; __builtin_trap(); }

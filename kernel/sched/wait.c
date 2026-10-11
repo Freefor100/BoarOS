@@ -2,6 +2,9 @@
 #include <arch/timer.h>
 #include <kernel/scheduler.h>
 #include <kernel/socket.h>
+#if BOAROS_MAX_CPUS > 1
+#include <arch/riscv/smp.h>
+#endif
 
 #include "private.h"
 
@@ -106,7 +109,8 @@ static int deadline_before(const struct kernel_task *a,
                            const struct kernel_task *b)
 {
     return a->wakeup_deadline < b->wakeup_deadline ||
-           (a->wakeup_deadline == b->wakeup_deadline && a->tid < b->tid);
+           (a->wakeup_deadline == b->wakeup_deadline &&
+            (a->tid < b->tid || (a->tid == b->tid && (uintptr_t)a < (uintptr_t)b)));
 }
 
 static struct kernel_task *deadline_insert_node(struct kernel_task *root,
@@ -233,7 +237,13 @@ void kernel_wait_backend_commit(struct kernel_task *task, uint64_t deadline, int
     task->wait_queue = task->default_wait_node.queue;
     task->wakeup_deadline = deadline;
     task->wait_interruptible = interruptible;
-    if (deadline) deadline_index_insert(task);
+    if (deadline) {
+        deadline_index_insert(task);
+#if BOAROS_MAX_CPUS > 1
+        if (kernel_cpu_current()->logical_id)
+            kernel_cpu_notify(riscv_smp_cpu(0), RISCV_IPI_DEADLINE);
+#endif
+    }
 #if BOAROS_COST_DIAGNOSTICS
     kernel_cost_block(&task->cost);
 #endif

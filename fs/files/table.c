@@ -51,6 +51,7 @@ static int empty_files(const struct kernel_files *files)
 
 int kernel_files_is_live(const struct kernel_files *files)
 {
+    kernel_assert_service_context();
     return files != 0 && files->state == KERNEL_FILES_LIVE &&
            files->heap != 0 && files->record != 0 &&
            files->record->references != 0U &&
