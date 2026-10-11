@@ -293,6 +293,7 @@ python3 -B tests/cost-match-riscv.py --verify build/cost-match-new
 ```
 
 权限不足在任何正式启动前记录 `environment_blocked`，不回退到powersave测量。
-本机普通终端已完成72次同核校准，两个目标都未通过精度门槛，比较阶段全部跳过；
+本机普通终端的当前清页核及隔离FS-Off候选各完成72次同核校准，两个目标均未通过精度门槛，
+各自比较阶段全部跳过，候选没有成本验收通过资格；
 更早执行器的权限阻塞单列保留。当前成本状态及历史结果见
 [共享调度域匹配时间](../learning/cost-baseline.md#共享调度域的匹配时间)。
