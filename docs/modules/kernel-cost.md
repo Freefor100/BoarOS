@@ -271,7 +271,9 @@ driver与普通用户恢复监护进程持有同一全局 `measurement.lock`，�
 CPU策略helper只操作CPU2/3的governor、频率上下限及governor改变的EPP，请求performance/
 2500000kHz；包含其他CPU的共享policy先拒绝。测量与文件写入仍由普通用户执行，helper
 不接受工作命令。正常结束、配置失败、SIGINT/SIGTERM和控制管道EOF都进入恢复，逐项
-核对原值；恢复未验证即失败。策略读回、频率观察、同胞活动与节流计数各自记录，
+核对原值；cpufreq上下限提交后异步生效，每项只写一次，最多等1秒确认读回再写下一项，
+不把请求被接纳当作恢复完成。恢复失败仍发送原值、实际值及具体错误；恢复未验证即失败。
+策略读回、频率观察、同胞活动与节流计数各自记录，
 缺失标不可用；固定请求频率不证明实际频率恒定。
 
 runner封存完整input/result/boot.log及实际退出状态；离线校验重新解析所有工作量、
@@ -282,6 +284,8 @@ root成功行只在冻结源码的 `root_boot_finish` 完成worker/挂载/设备
 
 ```sh
 make test-cost-match-host
+# 只验证真实策略取得/恢复，不启动客户机；末条 restored 的 errors 须为空。
+printf '{"command":"restore"}\n' | sudo /usr/bin/python3 -I tests/cost_policy.py --lease
 # 在允许sudo取得root的普通宿主终端预先认证，仅helper取得权限。
 sudo -v
 make test-cost-match-riscv COST_MATCH_OUTPUT=build/cost-match-new
@@ -289,5 +293,6 @@ python3 -B tests/cost-match-riscv.py --verify build/cost-match-new
 ```
 
 权限不足在任何正式启动前记录 `environment_blocked`，不回退到powersave测量。
-本机2026-10-11执行环境的 `NoNewPrivs=1` 阻止sudo，正式启动数为0；
-当前成本状态及历史结果见[共享调度域匹配时间](../learning/cost-baseline.md#共享调度域的匹配时间)。
+本机普通终端已完成72次同核校准，两个目标都未通过精度门槛，比较阶段全部跳过；
+更早执行器的权限阻塞单列保留。当前成本状态及历史结果见
+[共享调度域匹配时间](../learning/cost-baseline.md#共享调度域的匹配时间)。

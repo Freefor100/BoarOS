@@ -18,6 +18,8 @@ import time
 SYSFS = Path('/sys/devices/system/cpu')
 CPUS = (2, 3)
 TARGET_KHZ = 2500000
+READBACK_TIMEOUT = 1.0
+READBACK_INTERVAL = 0.01
 REQUIRED = ('scaling_governor', 'scaling_min_freq', 'scaling_max_freq')
 EPP = 'energy_performance_preference'
 
@@ -115,9 +117,18 @@ class PolicyLease:
             return
         self._modified.add(name)
         self.backend.write(path, value)
-        actual = self.backend.read(path)
-        if actual != value:
-            raise PolicyError(f'policy readback mismatch: {name}/{field}: {actual} != {value}')
+        # cpufreq 的 QoS 写入只提交请求，policy 更新由 workqueue 异步完成。
+        # 等确认后再写下一边界；不重写请求，超期或驱动钳制仍明确失败。
+        deadline = time.monotonic() + READBACK_TIMEOUT
+        while True:
+            actual = self.backend.read(path)
+            if actual == value:
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise PolicyError(f'policy readback mismatch after {READBACK_TIMEOUT}s: '
+                                  f'{name}/{field}: {actual} != {value}')
+            time.sleep(min(READBACK_INTERVAL, remaining))
 
     def _range(self, name, minimum, maximum):
         path = self.policies[name]['path']
@@ -304,7 +315,9 @@ def serve_lease(lease, *, source=None, output=None):
                     os.sched_setaffinity(0, original_affinity)
                 except OSError as error:
                     restored['errors'].append(f'helper affinity restoration failed: {error}')
-            if restored['errors'] or not _emit(output, restored):
+            # 恢复失败也必须先发回原值、实际值及具体错误，不能短路丢掉记录。
+            emitted = _emit(output, restored)
+            if restored['errors'] or not emitted:
                 result = 2
         finally:
             for signum, handler in previous.items():

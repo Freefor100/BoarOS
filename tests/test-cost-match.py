@@ -402,6 +402,24 @@ class MatchControllerTest(unittest.TestCase):
                 finally:
                     self.assertEqual(client.close()['errors'], [])
 
+    def test_policy_client_preserves_the_actual_restoration_error_and_snapshot(self):
+        original_popen = subprocess.Popen
+        restoration = dict(event='restored', errors=['policy2/scaling_max_freq: restore rejected'],
+                           snapshot={'policies': {'policy2': {'fields': {'scaling_max_freq': '2500000'}}}})
+        helper = ('import sys,json; '
+                  'print(json.dumps({"event":"ready"}),flush=True); '
+                  'sys.stdin.readline(); '
+                  f'print({canonical(restoration).strip()!r},flush=True); sys.exit(2)')
+        with tempfile.TemporaryDirectory() as folder:
+            with acquire_fixture_lock(Path(folder) / 'lock') as lease:
+                client = self.driver.PolicyClient(Path(folder))
+                def launch(command, **kwargs):
+                    return original_popen([sys.executable, '-c', helper], **kwargs)
+                with patch.object(self.driver.subprocess, 'Popen', side_effect=launch), \
+                        patch.object(self.driver.os, 'geteuid', return_value=1000):
+                    client.acquire(lease)
+                self.assertEqual(client.close(), restoration)
+
 
 if __name__ == '__main__':
     unittest.main()

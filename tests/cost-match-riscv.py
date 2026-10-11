@@ -120,8 +120,8 @@ class PolicyClient:
                 self.process.stdin.write(b'{"command":"restore"}\n')
                 self.process.stdin.flush()
                 result = self._receive()
-                if result.get('event') != 'restored' or result.get('errors'):
-                    raise RuntimeError('CPU policy restoration failed')
+                if result.get('event') != 'restored':
+                    raise RuntimeError('CPU policy restoration acknowledgement missing')
             if self.process.stdin and not self.process.stdin.closed:
                 self.process.stdin.close()  # EOF is also a restoration request.
             self.process.wait(timeout=10)
@@ -137,7 +137,7 @@ class PolicyClient:
                     result = event
                 elif event.get('restoration'):
                     result = event['restoration']
-            if self.ready and self.process.returncode:
+            if self.ready and self.process.returncode and not (result and result.get('errors')):
                 raise RuntimeError('policy helper failed while restoring')
             return result or {'event': 'not-acquired', 'errors': []}
         except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as error:

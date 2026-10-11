@@ -1,3 +1,4 @@
+import io
 import json
 import os
 from pathlib import Path
@@ -7,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from cost_policy import PolicyError, PolicyLease, serve_lease
 
@@ -205,6 +207,71 @@ class PolicyLeaseTest(unittest.TestCase):
         self.assertTrue(restored['errors'])
         self.assertEqual(self.driver.read(self.fixture.root / 'cpufreq/policy2/scaling_governor'), 'powersave')
         self.assertEqual(self.driver.read(self.fixture.root / 'cpufreq/policy3/scaling_governor'), 'performance')
+
+    def test_deferred_frequency_limits_are_confirmed_before_next_write(self):
+        class DeferredDriver(Driver):
+            def __init__(self):
+                super().__init__()
+                self.pending = {}
+                self.defer = False
+
+            def write(self, path, value):
+                if self.defer and path.name in ('scaling_min_freq', 'scaling_max_freq'):
+                    self.pending[path] = [value, 2]
+                else:
+                    super().write(path, value)
+
+            def read(self, path):
+                if path in self.pending:
+                    value, remaining = self.pending[path]
+                    if remaining:
+                        self.pending[path][1] -= 1
+                    else:
+                        del self.pending[path]
+                        super().write(path, value)
+                return super().read(path)
+
+        clock = [0.0]
+        def advance(seconds):
+            clock[0] += seconds
+        self.driver = DeferredDriver()
+        self.lease = PolicyLease(self.fixture.root, backend=self.driver)
+        self.lease.acquire()
+        self.driver.defer = True
+        with patch('cost_policy.time.monotonic', side_effect=lambda: clock[0]), \
+                patch('cost_policy.time.sleep', side_effect=advance):
+            restored = self.lease.restore()
+        self.assertEqual(restored['errors'], [])
+        self.assertEqual(self.driver.pending, {})
+        self.assertEqual(self.fixture.files(), self.fixture.original)
+
+    def test_restore_error_details_are_sent_before_helper_exit(self):
+        driver = self.driver
+        class Source:
+            def readline(self, limit):
+                driver.failed = ('policy3', 'scaling_governor', 'powersave')
+                return '{"command":"restore"}\n'
+        output = io.StringIO()
+        self.assertNotEqual(serve_lease(self.lease, source=Source(), output=output), 0)
+        events = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual(events[-1]['event'], 'restored')
+        self.assertTrue(any('injected write failure' in error for error in events[-1]['errors']))
+        self.assertEqual(events[-1]['snapshot']['policies']['policy3']['fields']['scaling_governor'],
+                         'performance')
+
+    def test_clamped_limit_still_fails_with_a_bounded_readback(self):
+        clock = [0.0]
+        def advance(seconds):
+            clock[0] += seconds
+        self.driver.mismatch = ('policy3', 'scaling_min_freq', '2500000')
+        with patch('cost_policy.time.monotonic', side_effect=lambda: clock[0]), \
+                patch('cost_policy.time.sleep', side_effect=advance):
+            with self.assertRaisesRegex(PolicyError, 'readback') as error:
+                self.lease.acquire()
+        self.assertGreater(clock[0], 0)
+        self.assertLessEqual(clock[0], 1.01)
+        self.assertEqual(error.exception.restoration['errors'], [])
+        self.assertEqual(self.fixture.files(), self.fixture.original)
 
     def test_failed_stdout_still_restores(self):
         class BrokenOutput:
