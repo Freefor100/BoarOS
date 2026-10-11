@@ -1073,10 +1073,18 @@ enum riscv_sv39_status riscv_sv39_user_map_zeroed_page(
                                   physical_address);
         return status;
     }
-    for (index = 0U;
-         index < BOAROS_PAGE_SIZE / sizeof(*words);
-         index++) {
+    _Static_assert(BOAROS_PAGE_SIZE % (8U * sizeof(*words)) == 0,
+                   "private page zeroing uses complete integer groups");
+    /* 新页仍由构造方独占，清完才发布PTE；不借读或覆盖页外字节。 */
+    for (index = 0U; index < BOAROS_PAGE_SIZE / sizeof(*words); index += 8U) {
         words[index] = 0U;
+        words[index + 1U] = 0U;
+        words[index + 2U] = 0U;
+        words[index + 3U] = 0U;
+        words[index + 4U] = 0U;
+        words[index + 5U] = 0U;
+        words[index + 6U] = 0U;
+        words[index + 7U] = 0U;
     }
     *leaf = user_leaf_entry(physical_address, permissions);
     space->leaf_pages++;
