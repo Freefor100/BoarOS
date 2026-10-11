@@ -6,12 +6,12 @@
 
 ## 近期方向
 
-架构主线是 SMP 正确性。当前重点为同步基础和对象生命周期；RV 两核、共享用户地址空间及 LA 多核依次依赖它。
+架构主线是 SMP 正确性，下一项规划 RV 两核基础闭环，再接共享用户地址空间及 LA 多核。
 维持现有调度策略、全局运行队列和串行 lwIP 核心，先证明并发正确，再依据锁等待与 CPU 分布决定并行优化。
+短窗口性能归因停止，未决结果单列，不再阻塞两核规划；生产仍为单CPU。
 
 | 主线 | 尚缺能力 | 完成口径 |
 |---|---|---|
-| 同步基础收口 | 4KiB复制唤醒及shared-OFD的32等待者窗口尚未通过新增3%及误差上界；同核校准未达到±1%；后台journal与宿主等待变化已确认，OFD的vCPU时间差额未定量闭合 | 选择/发布/退休owner保持；先取得有效同核校准，不从噪声选通过；收口与两核转换暂停，证据见[匹配时间](learning/cost-baseline.md#共享调度域的匹配时间) |
 | RV 两核 | 独立 secondary 入口/栈，BSS 一次初始化，per-CPU trap/timer/FPU、IPI、远程 wake | 同一任务不双核运行；idle 可被唤醒；正常用户态切换与可信栈回收 |
 | 共享 MM 与子系统 | uaccess pin/权限、COW 发布、活动 CPU、远程 TLB 确认，OFD/cache/DMA 与退出同步 | 复制与撤映射、降权、截断、I/O/close/退出的强制交错正确；确认停止使用后才回收 |
 | 组合与 LA 多核 | RV 2/4 核低内存、故障、真实程序；LA CPU 启动/IPI/TLB/状态保存 | 架构结果独立验收，保留单核对照；正确性成立后再衡量并行收益 |
@@ -22,7 +22,7 @@ CPU 本地/current、抢占控制、buddy/slab raw、代次等待与可睡眠锁
 压力回调和业务对象仍限定单 CPU；可睡眠锁释放内部raw后才显式调度，不能机械替换IRQ域。
 接口契约和调用边界见[调度模块](modules/kernel-scheduler.md#smp前置的同步与等待契约2026-10-09)。
 
-任务索引、身份发布、查找借用和退休归还已在统一短调度域保护，成本收口仍未完成。
+任务索引、身份发布、查找借用和退休归还已在统一短调度域保护。
 其他业务对象的引用与远程退出关系随共享MM和子系统并发推进；宿主并发不能代替客户机多核验收。
 代码步骤和单次安排留在执行会话。
 
@@ -68,6 +68,7 @@ PTE 撤销/降权后须覆盖活动 CPU 及并发切换者，确认旧翻译不�
 | 项目 | 已有事实与剩余问题 | 证据 |
 |---|---|---|
 | allocator 与批量 MM 成本 | 森林13.6%–22.4%、raw互斥6.0%–7.3%、等待交接的默认匿名新增2.5%–4.0%分别测量；后台提交/退出交错与批量MM的IRQ尾延迟仍有成本 | [森林](learning/cost-baseline.md#buddy-森林匹配时间2026-10-09)、[raw 对照](learning/cost-baseline.md#allocator-短锁的匹配时间)、[等待交接](learning/cost-baseline.md#等待交接的匹配时间) |
+| 共享调度域短窗口 | 4KiB复制唤醒与32等待者OFD的正式成本仍未决，归因已停止；保留数据，不追加诊断，不作为RV两核规划前置项 | [匹配时间](learning/cost-baseline.md#共享调度域的匹配时间) |
 | 文件驻留记录范围选择 | 点查询已有哈希，mprotect/部分撤映射仍可能扫描整个驻留链；只改善范围选择/删除，不同时树化全部 MM | [规模边界](learning/single-hart-scale.md)、[MM](modules/kernel-mm.md) |
 | GDT timestamp-touch 候选 | 隔离候选消除了干净 GDT 的 undo/restore 复制，但完整读取仍有负向观察，未进入 main | [时间戳研究](learning/file-timestamps.md) |
 | 串行协议、存储与原生构建成本 | 网络批次仍有大 IRQ 区间；默认预算吞吐、同步/排空及 Lua 工程还有已测成本，按目标阶段归因 | [网络](learning/network-ownership.md)、[预算](learning/data-path-budget-experiments.md)、[工具链](learning/offline-toolchain-probe.md) |

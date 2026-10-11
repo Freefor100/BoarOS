@@ -332,3 +332,4 @@ python3 -B tests/cost-diagnostic-riscv.py --verify build/residual-diagnostic-new
 固定FS-Off核的12次诊断已通过108个原窗口及完整自然退出核对，策略恢复无错误。
 已确认后台journal阶段与等待变化，剩余定量边界见[当前成本结论](../learning/cost-baseline.md#共享调度域的匹配时间)；
 该结果没有性能通过资格，不替代正式校准。
+短窗口归因已停止，保留方法与证据供实际需求复用，不再作为RV两核规划的前置门槛。
