@@ -1371,7 +1371,9 @@ test-uaccess-oom-riscv: $(KERNEL_RV) $(UACCESS_OOM_PROGRAM_RV) \
 		./tests/uaccess-oom-riscv.sh
 
 test-icache-riscv: $(KERNEL_RV)
-	OBJDUMP_RV=$(OBJDUMP) ./tests/icache-riscv.sh
+	OBJDUMP_RV=$(OBJDUMP) MM_OBJECT_RV=$(abspath $(BUILD_DIR)/mm/mm.o) \
+		ELF_IMAGE_OBJECT_RV=$(abspath $(BUILD_DIR)/kernel/elf_image.o) \
+		SV39_OBJECT_RV=$(abspath $(BUILD_DIR)/arch/riscv/sv39.o) ./tests/icache-riscv.sh
 
 test-demand-page-riscv: test-root-init-riscv \
 		$(DEMAND_PAGE_OOM_TEST_KERNEL_RV) $(ROOT_INIT_PROGRAM_RV) \

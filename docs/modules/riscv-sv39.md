@@ -103,6 +103,8 @@ RISC-V ELF 映像构造器是当前用户映射接口的真实调用方。它先
 
 ## 验证
 
+`test-icache-riscv`检查Make传入的实际`BUILD_DIR`对象，不要求默认`build/riscv`目录存在。
+
 ```sh
 make test-sv39-riscv
 make test-sv39-fault-riscv
