@@ -331,6 +331,9 @@ int kernel_scheduler_rt_bandwidth_set(int runtime_field, int64_t value)
         uint64_t now = kernel_time_monotonic_ns();
         uint64_t old_period = scheduler.rt_configuration.period_ns;
         for (struct kernel_cpu *cpu = scheduler.cpus; cpu; cpu = cpu->scheduler_next)
+#if BOAROS_MAX_CPUS > 1
+            if (!cpu->logical_id || kernel_cpu_online(cpu))
+#endif
             account_cpu(cpu, now);
         struct kernel_rt_bandwidth proposed = {
             .period_ns = scheduler.rt_configuration.period_ns,
@@ -342,6 +345,9 @@ int kernel_scheduler_rt_bandwidth_set(int runtime_field, int64_t value)
             .period_ns = proposed.period_ns, .runtime_ns = proposed.runtime_ns };
         if (!result) {
             for (struct kernel_cpu *cpu = scheduler.cpus; cpu; cpu = cpu->scheduler_next) {
+#if BOAROS_MAX_CPUS > 1
+                if (cpu->logical_id && !kernel_cpu_online(cpu)) continue;
+#endif
                 cpu->rt_bandwidth.period_ns = scheduler.rt_configuration.period_ns;
                 cpu->rt_bandwidth.runtime_ns = scheduler.rt_configuration.runtime_ns;
                 /* 改配置不赠送预算；只有周期长度变化才重建周期起点。 */

@@ -16,7 +16,7 @@ def identity(path):
     return {"path": str(resolved), "sha256": hashlib.sha256(resolved.read_bytes()).hexdigest()}
 
 
-def boot(qemu, firmware, kernel, memory, cpus, output):
+def boot(qemu, firmware, kernel, memory, cpus, output, profile="normal"):
     command = [qemu, "-machine", "virt", "-accel", "tcg,thread=multi", "-smp", str(cpus),
                "-m", memory, "-nographic", "-no-reboot", "-bios", firmware, "-kernel", str(kernel)]
     started = time.monotonic()
@@ -56,6 +56,7 @@ def boot(qemu, firmware, kernel, memory, cpus, output):
     output.parent.mkdir(parents=True, exist_ok=True)
     output.with_suffix(".log").write_text(text)
     report = {"command": command, "memory": memory, "cpus": cpus,
+              "profile": profile,
               "vcpu_threads": sorted(t for t in threads if "/TCG" in t),
               "returncode": process.returncode, "timeout": timed_out,
               "elapsed_seconds": time.monotonic() - started,
@@ -64,10 +65,30 @@ def boot(qemu, firmware, kernel, memory, cpus, output):
     output.with_suffix(".json").write_text(json.dumps(report, indent=2) + "\n")
     if timed_out or process.returncode or len(report["vcpu_threads"]) != cpus:
         raise RuntimeError(f"QEMU execution failed: {report}")
+    if profile != "normal":
+        expected = {"missing-rfence": "SMP failure stage=SBI-extension",
+                    "denied-start": "SMP failure stage=HSM-start",
+                    "guard": " cause=0xd pc=", "denied-stop": "SMP failure stage=stop-confirmation",
+                    "rfence-error": "SMP failure stage=RFENCE"}[profile]
+        if expected not in text or "SMP natural exit" in text:
+            raise RuntimeError(f"negative profile did not reach its failure boundary:\n{text[-4000:]}")
+        if profile in ("missing-rfence", "denied-start") and "SMP online logical=1" in text:
+            raise RuntimeError("failed startup published ONLINE")
+        if profile == "rfence-error" and "SMP RFENCE error retains table and page owners" not in text:
+            raise RuntimeError("RFENCE error reached without retained-owner evidence")
+        print(f"RV SMP profile={profile} RAM={memory} expected fault; recovery unverified", flush=True)
+        return
     if "BoarOS: SMP natural exit pages/stack/table owners returned" not in text or "SMP failure" in text:
         raise RuntimeError(f"missing natural resource closure:\n{text[-4000:]}")
     if cpus == 2 and ("SMP online logical=1 hart=" not in text or
-                      "SMP timer preemption, unique execution and FD migration passed" not in text):
+                      "SMP timer preemption, unique execution and FD migration passed" not in text or
+                      "SMP early wake, WFI boundary and remote deadline passed" not in text or
+                      "SMP delayed RFENCE return retains table and page owners" not in text or
+                      "SMP dual CPU eligibility, SP and FD ownership passed" not in text or
+                      "SMP join/retirement borrow and CPU0 collection passed" not in text or
+                      "SMP RW reader batch, writer FIFO and qualification owners passed" not in text or
+                      "SMP per-CPU FIFO/yield and RR/timer qualification passed" not in text or
+                      "SMP sleeping create rechecks STOPPED and returns private owners" not in text):
         raise RuntimeError("missing independent SMP execution and migration evidence")
     print(f"RV SMP cpus={cpus} RAM={memory} native exit and owner closure passed", flush=True)
 
@@ -78,11 +99,12 @@ def main():
     parser.add_argument("--firmware", default="default")
     parser.add_argument("--kernel", type=Path, required=True)
     parser.add_argument("--output", type=Path, default=Path("build/riscv-smp/runs"))
+    parser.add_argument("--profile", choices=("normal", "missing-rfence", "denied-start", "guard", "denied-stop", "rfence-error"), default="normal")
     args = parser.parse_args()
-    for cpus in (2, 1):
+    for cpus in ((2, 1) if args.profile == "normal" else (2,)):
         for memory in ("512M", "1G"):
             boot(args.qemu, args.firmware, args.kernel, memory, cpus,
-                 args.output / f"{cpus}-{memory}")
+                 args.output / f"{cpus}-{memory}", args.profile)
 
 
 if __name__ == "__main__":

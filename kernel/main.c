@@ -44,8 +44,9 @@ static struct riscv_sv39_page_table transition_page_table;
 #if BOAROS_MAX_CPUS > 1
 static struct dtb_cpu_info boot_cpus;
 #if BOAROS_SMP_TEST
-void riscv_smp_test_start(struct physical_page_allocator *);
+void riscv_smp_test_start(struct physical_page_allocator *, int);
 void riscv_smp_test_poll(void);
+void riscv_smp_test_root_finish(void);
 #endif
 #endif
 static struct riscv_root_boot root_boot;
@@ -693,6 +694,9 @@ static void storage_cleanup_worker(void *argument)
         arch_interrupt_restore(interrupt_status);
         if (init_reaped && !users_pending) {
 #if BOAROS_MAX_CPUS > 1
+#if BOAROS_SMP_TEST
+            riscv_smp_test_root_finish();
+#endif
             riscv_smp_stop();
 #endif
             struct kernel_heap_statistics heap_statistics;
@@ -776,7 +780,7 @@ void kernel_main(unsigned long hart_id, const void *dtb)
     boot_hart_id = hart_id;
 #if BOAROS_MAX_CPUS > 1
     dtb_status = dtb_read_cpu_info(dtb, hart_id, &boot_cpus);
-    if (dtb_status != DTB_STATUS_OK) shutdown_for_dtb_error(dtb_status);
+    if (dtb_status != DTB_STATUS_OK) riscv_smp_fail("CPU-discovery", dtb_status);
 #endif
     boot_dtb_address = (uintptr_t)dtb;
     /* 重定位前 __kernel_start 即物理加载地址，绑定镜像 VA->PA 偏移。 */
@@ -994,7 +998,7 @@ static void kernel_main_high(void)
                     (transition_page_table.root_address >> 12),
                     riscv_sv39_current_satp(), boot_info.timebase_frequency);
 #if BOAROS_SMP_TEST
-    riscv_smp_test_start(&page_allocator);
+    riscv_smp_test_start(&page_allocator, root_started);
 #endif
 #endif
     timer_status = riscv_timer_start(boot_info.timebase_frequency,

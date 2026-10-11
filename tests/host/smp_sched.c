@@ -12,6 +12,8 @@ static struct kernel_task idles[2], tasks[4];
 static pthread_barrier_t gate;
 static struct kernel_task *selected[2];
 static unsigned deliveries;
+static struct kernel_cpu publishers[2];
+static unsigned first_claimed;
 
 void *sync_test_cpu(void) { return active; }
 void *sync_test_current_task(void) { return active->current; }
@@ -49,6 +51,29 @@ static void *claim(void *argument)
     KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
     selected[id] = scheduler_select_next_locked(active, active->current, 1);
     return 0;
+}
+
+static void *publish_and_claim(void *argument)
+{
+    unsigned id = (uintptr_t)argument;
+    active = id < 2 ? &cpus[id] : &publishers[id - 2];
+    sync_test_irq = 1;
+    int result = pthread_barrier_wait(&gate);
+    assert(!result || result == PTHREAD_BARRIER_SERIAL_THREAD);
+    if (id >= 2) {
+        if (id == 3) while (!__atomic_load_n(&first_claimed, __ATOMIC_ACQUIRE)) {}
+        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        setup_task(id - 2, 3, 10);
+        return 0;
+    }
+    for (;;) {
+        KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
+        if (ready_best_locked()) {
+            selected[id] = scheduler_select_next_locked(active, active->current, 1);
+            __atomic_store_n(&first_claimed, 1, __ATOMIC_RELEASE);
+            return 0;
+        }
+    }
 }
 
 int main(void)
@@ -97,5 +122,27 @@ int main(void)
       }
       for (unsigned i = 0; i < 4; i++) deadline_index_remove(&tasks[i]);
       assert(!scheduler.deadline_root); }
+    /* 额外两个线程是发布/通知actor；执行资格仍只有两个注册CPU。 */
+    scheduler = (struct kernel_scheduler){0};
+    scheduler.rt_configuration.period_ns = 1000000000;
+    scheduler.rt_configuration.runtime_ns = 950000000;
+    for (unsigned i = 0; i < 2; i++) {
+        kernel_cpu_initialize(&cpus[i], i ? 19 : 7, 0);
+        cpus[i].logical_id = i;
+        active = &cpus[i];
+        idles[i] = (struct kernel_task){0};
+        idles[i].wait.on_cpu = 1;
+        cpus[i].current = &idles[i];
+        scheduler_cpu_initialize(active, &idles[i], 1);
+        kernel_cpu_initialize(&publishers[i], 100 + i, 0);
+    }
+    assert(!pthread_barrier_init(&gate, 0, 4));
+    pthread_t actors[4];
+    for (unsigned i = 0; i < 4; i++) assert(!pthread_create(&actors[i], 0, publish_and_claim, (void *)(uintptr_t)i));
+    for (unsigned i = 0; i < 4; i++) assert(!pthread_join(actors[i], 0));
+    assert(selected[0] != selected[1] && selected[0] && selected[1]);
+    assert(!scheduler.runqueue.first && !cpus[0].eligible.first && !cpus[1].eligible.first);
+    assert(tasks[0].wait.on_cpu && tasks[1].wait.on_cpu && tasks[0].cpu != tasks[1].cpu);
+    pthread_barrier_destroy(&gate);
     puts("SMP eligibility FIFO, global membership and concurrent execution claim passed");
 }

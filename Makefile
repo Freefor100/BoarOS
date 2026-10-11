@@ -23,6 +23,12 @@ TEST_MEMORY_ARGS := $(foreach memory,$(TEST_MEMORIES),--memory $(memory))
 COST_DIAGNOSTICS ?= 0
 SMP ?= 0
 SMP_TEST ?= 0
+SMP_TEST_PROFILE ?= normal
+ifneq ($(filter $(SMP_TEST_PROFILE),normal missing-rfence denied-start guard denied-stop rfence-error),$(SMP_TEST_PROFILE))
+$(error invalid SMP_TEST_PROFILE)
+endif
+SMP_TEST_SUFFIX := $(if $(filter normal,$(SMP_TEST_PROFILE)),,$(SMP_TEST_PROFILE)/)
+SMP_NEGATIVE := $(if $(filter missing-rfence,$(SMP_TEST_PROFILE)),1,$(if $(filter denied-start,$(SMP_TEST_PROFILE)),2,$(if $(filter guard,$(SMP_TEST_PROFILE)),3,$(if $(filter denied-stop,$(SMP_TEST_PROFILE)),4,$(if $(filter rfence-error,$(SMP_TEST_PROFILE)),5,0)))))
 ifneq ($(filter $(SMP_TEST),0 1),$(SMP_TEST))
 $(error SMP_TEST must be 0 or 1)
 endif
@@ -57,6 +63,8 @@ endif
 ifeq ($(SMP_TEST),1)
 BUILD_DIR := build/riscv-smp-test/riscv
 KERNEL_RV := build/riscv-smp-test/kernel-rv
+BUILD_DIR := build/riscv-smp-test/$(SMP_TEST_SUFFIX)riscv
+KERNEL_RV := build/riscv-smp-test/$(SMP_TEST_SUFFIX)kernel-rv
 endif
 TRAP_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-trap-rv
 TRAP_RETURN_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-trap-return-rv
@@ -301,6 +309,11 @@ OBJECTS := \
 	$(patsubst %.S,$(BUILD_DIR)/%.o,$(ASM_SOURCES))
 ifeq ($(SMP_TEST),1)
 OBJECTS += $(BUILD_DIR)/tests/riscv/smp_cases.o
+OBJECTS += $(BUILD_DIR)/tests/riscv/smp_registers.o
+LDFLAGS += -Wl,--wrap=riscv_context_switch,--wrap=sbi_remote_sfence
+LDFLAGS += -Wl,--wrap=sbi_probe_extension,--wrap=sbi_hart_start,--wrap=sbi_hart_status
+LDFLAGS += -Wl,--wrap=physical_page_allocate
+$(BUILD_DIR)/tests/riscv/smp_cases.o: CPPFLAGS += -DBOAROS_SMP_NEGATIVE=$(SMP_NEGATIVE)
 endif
 TEST_RUNTIME_C_SOURCES := \
 	kernel/cpu.c \
@@ -2043,7 +2056,7 @@ test-riscv: test-scheduler-handoff-riscv
 .PHONY: kernel-rv-smp run-smp-riscv test-smp-host test-smp-riscv
 QEMU_RISCV_FIRMWARE ?= default
 kernel-rv-smp:
-	$(MAKE) SMP=1 COST_DIAGNOSTICS=0 all
+	$(MAKE) SMP=1 SMP_TEST=0 COST_DIAGNOSTICS=0 all
 run-smp-riscv: kernel-rv-smp
 	$(QEMU_RISCV64) -machine virt -accel tcg,thread=multi -smp 2 -m $(QEMU_MEMORY) -nographic -bios $(QEMU_RISCV_FIRMWARE) -kernel build/riscv-smp/kernel-rv
 test-smp-host:
@@ -2052,5 +2065,21 @@ test-smp-host:
 	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -DBOAROS_MAX_CPUS=2 -Itests/host/sync -idirafter include tests/host/smp_sched.c kernel/cpu.c kernel/raw_lock.c kernel/sched/wait.c kernel/sched/scheduling.c kernel/sched/policy.c kernel/sched/runqueue.c -Wl,--gc-sections -o build/host/smp-sched
 	build/host/smp-sched
 test-smp-riscv:
-	$(MAKE) SMP=1 SMP_TEST=1 COST_DIAGNOSTICS=0 all
+	$(MAKE) SMP=1 SMP_TEST=1 SMP_TEST_PROFILE=normal COST_DIAGNOSTICS=0 all
 	python3 -B tests/smp/riscv.py --qemu $(QEMU_RISCV64) --firmware $(QEMU_RISCV_FIRMWARE) --kernel build/riscv-smp-test/kernel-rv
+	@set -e; for profile in missing-rfence denied-start guard denied-stop rfence-error; do \
+		$(MAKE) SMP=1 SMP_TEST=1 SMP_TEST_PROFILE=$$profile COST_DIAGNOSTICS=0 all; \
+		python3 -B tests/smp/riscv.py --qemu $(QEMU_RISCV64) --firmware $(QEMU_RISCV_FIRMWARE) --kernel build/riscv-smp-test/$$profile/kernel-rv --profile $$profile --output build/riscv-smp/runs/$$profile; \
+	done
+
+.PHONY: test-smp-userland-riscv
+test-smp-userland-riscv: $(REAL_USERLAND_RV) $(PTHREAD_USERLAND_RV) $(PTHREAD_TLS_DSO_RV) $(MUSL_LDSO)
+	$(MAKE) SMP=1 SMP_TEST=1 SMP_TEST_PROFILE=normal COST_DIAGNOSTICS=0 all
+	@set -e; for memory in 512M 1G; do \
+		BOAROS_SMP_QEMU=$(QEMU_RISCV64) BOAROS_SMP_FIRMWARE=$(QEMU_RISCV_FIRMWARE) \
+		BOAROS_SMP_OUTPUT=$(CURDIR)/build/riscv-smp/runs/user-$$memory \
+		QEMU_RISCV64=$(CURDIR)/tests/smp/qemu.py KERNEL_RV=$(CURDIR)/build/riscv-smp-test/kernel-rv \
+		REAL_USERLAND_RV=$(REAL_USERLAND_RV) PTHREAD_USERLAND_RV=$(PTHREAD_USERLAND_RV) \
+		PTHREAD_TLS_DSO_RV=$(PTHREAD_TLS_DSO_RV) MUSL_LDSO=$(MUSL_LDSO) \
+		QEMU_MEMORY=$$memory USERLAND_TIMEOUT=185s tests/userland-riscv.sh; \
+	done

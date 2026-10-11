@@ -17,5 +17,8 @@ void riscv_smp_stop(void);
 void riscv_smp_sync_kernel(uint64_t address, uint64_t size);
 struct kernel_cpu *riscv_smp_cpu(unsigned logical);
 void riscv_smp_fail(const char *stage, long error) __attribute__((noreturn));
+struct riscv_trap_frame;
+void riscv_smp_trap_fatal(const struct riscv_trap_frame *) __attribute__((noreturn));
+int riscv_smp_output_allowed(void);
 #endif
 #endif

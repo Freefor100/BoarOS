@@ -863,6 +863,16 @@ enum kernel_scheduler_status kernel_scheduler_init(
 enum kernel_scheduler_status kernel_thread_create(void (*entry)(void *), void *argument)
 { return kernel_thread_create_joinable(entry, argument, 0); }
 
+#if BOAROS_MAX_CPUS > 1
+static unsigned available_cpu_mask_locked(void)
+{
+    unsigned mask = 0;
+    for (struct kernel_cpu *cpu = scheduler.cpus; cpu; cpu = cpu->scheduler_next)
+        if (!cpu->logical_id || kernel_cpu_online(cpu)) mask |= 1U << cpu->logical_id;
+    return mask;
+}
+#endif
+
 static enum kernel_scheduler_status create_kernel_thread(
     void (*entry)(void *), void *argument, struct kernel_thread_join *join,
     uint32_t cpu_mask)
@@ -938,23 +948,33 @@ static enum kernel_scheduler_status create_kernel_thread(
     }
 
     if (join) kernel_wait_queue_init(&join->waiters);
+    status = KERNEL_SCHEDULER_STATUS_OK;
     {
         KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-        if (join) {
-            if (join->task) __builtin_trap();
-            join->task = thread;
-            thread->join = join;
-        }
 #if BOAROS_MAX_CPUS > 1
-        if (thread->controlled) {
-            if (scheduler.controlled_owners == UINT32_MAX) __builtin_trap();
-            thread->controlled = 2;
-            scheduler.controlled_owners++;
-        }
+        /* 私有准备可能睡眠；只有最终接纳点的在线资格有效。停止者在CPU0
+         * 禁抢占，成功接纳先取得controlled owner再发布runnable。 */
+        if (thread->controlled && (thread->cpu_mask & ~available_cpu_mask_locked()))
+            status = KERNEL_SCHEDULER_STATUS_INVALID_STATE;
 #endif
-        ready_enqueue_locked(thread, 0);
+        if (status == KERNEL_SCHEDULER_STATUS_OK) {
+            if (join) {
+                if (join->task) __builtin_trap();
+                join->task = thread;
+                thread->join = join;
+            }
+#if BOAROS_MAX_CPUS > 1
+            if (thread->controlled) {
+                if (scheduler.controlled_owners == UINT32_MAX) __builtin_trap();
+                thread->controlled = 2;
+                scheduler.controlled_owners++;
+            }
+#endif
+            ready_enqueue_locked(thread, 0);
+        }
     }
-    status = KERNEL_SCHEDULER_STATUS_OK;
+    if (status != KERNEL_SCHEDULER_STATUS_OK)
+        status = release_task_storage(thread, status);
 
 restore_interrupts:
     arch_interrupt_restore(old_status);
@@ -976,10 +996,9 @@ enum kernel_scheduler_status kernel_thread_create_joinable_mask(
     void (*entry)(void *), void *argument, struct kernel_thread_join *join, uint32_t mask)
 {
     if (!join || !mask || (mask & ~3U)) return KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
-    unsigned available = 0;
+    unsigned available;
     { KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
-      for (struct kernel_cpu *cpu = scheduler.cpus; cpu; cpu = cpu->scheduler_next)
-          if (!cpu->logical_id || kernel_cpu_online(cpu)) available |= 1U << cpu->logical_id; }
+      available = available_cpu_mask_locked(); }
     if (mask & ~available) return KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
     return create_kernel_thread(entry, argument, join, mask);
 }
@@ -992,9 +1011,7 @@ enum kernel_scheduler_status kernel_thread_set_cpu_mask(struct kernel_thread_joi
     KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
     struct kernel_task *task = join->task;
     if (!task || !task->controlled) return KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
-    unsigned available = 0;
-    for (struct kernel_cpu *cpu = scheduler.cpus; cpu; cpu = cpu->scheduler_next)
-        if (!cpu->logical_id || kernel_cpu_online(cpu)) available |= 1U << cpu->logical_id;
+    unsigned available = available_cpu_mask_locked();
     if (mask & ~available) return KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
     if (task->state != KERNEL_THREAD_STATE_BLOCKED || task->wait.on_cpu ||
         task->ready_node.queued || task->wait.ready_pending)

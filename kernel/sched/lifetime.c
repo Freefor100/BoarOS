@@ -62,7 +62,7 @@ static void disposal_progress(void)
     if (cpu->raw_locks) __builtin_trap();
     if (!cpu->preempt_depth
 #if BOAROS_MAX_CPUS > 1
-        && cpu->logical_id == 0
+        && cpu->logical_id == 0 && (!cpu->current || !cpu->current->controlled)
 #endif
     ) scheduler_task_collect();
     else scheduler_task_disposal_notify();

@@ -4,6 +4,7 @@
 #include <arch/riscv/sbi.h>
 #include <arch/riscv/sv39.h>
 #include <arch/riscv/timer.h>
+#include <arch/riscv/trap.h>
 #include <arch/riscv/virt_uart.h>
 #include <kernel/scheduler.h>
 #include <kernel/time.h>
@@ -15,6 +16,43 @@ static struct kernel_cpu *cpus[BOAROS_MAX_CPUS];
 static unsigned cpu_count;
 static uint32_t timebase;
 static unsigned ping_seen, timer_seen, stop_requested, secondary_attached;
+static uint32_t fatal_claim;
+static uint64_t fatal_hart;
+
+int riscv_smp_output_allowed(void)
+{
+    unsigned state = __atomic_load_n(&fatal_claim, __ATOMIC_ACQUIRE);
+    return !state || (state == 2 && kernel_cpu_current()->hardware_id == fatal_hart);
+}
+
+static void claim_fatal(void)
+{
+    (void)arch_interrupt_save();
+    uint32_t expected = 0;
+    if (!__atomic_compare_exchange_n(&fatal_claim, &expected, 1, 0,
+                                     __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+        for (;;) asm volatile("wfi" ::: "memory");
+    fatal_hart = kernel_cpu_current()->hardware_id;
+    __atomic_store_n(&fatal_claim, 2, __ATOMIC_RELEASE);
+    virt_uart_emergency_begin();
+}
+
+void riscv_smp_trap_fatal(const struct riscv_trap_frame *frame)
+{
+    claim_fatal();
+    virt_uart_puts("BoarOS: SMP fatal hart=");
+    virt_uart_put_hex(kernel_cpu_current()->hardware_id);
+    virt_uart_puts(" cause=");
+    virt_uart_put_hex(frame->scause);
+    virt_uart_puts(" pc=");
+    virt_uart_put_hex(frame->sepc);
+    virt_uart_puts(" sp=");
+    virt_uart_put_hex(frame->sp);
+    virt_uart_puts(" stval=");
+    virt_uart_put_hex(frame->stval);
+    virt_uart_putc('\n');
+    sbi_shutdown();
+}
 static unsigned char secondary_stack[16384] __attribute__((aligned(4096)));
 /* 前五项是secondary.S的物理交接格式，mailbox与栈由镜像owner常驻持有。 */
 static struct {
@@ -25,14 +63,19 @@ extern void riscv_secondary_entry(void);
 
 void riscv_smp_fail(const char *stage, long error)
 {
-    (void)arch_interrupt_save();
-    virt_uart_emergency_begin();
+    claim_fatal();
     virt_uart_puts("BoarOS: SMP failure stage=");
     virt_uart_puts(stage);
     virt_uart_puts(" hart=");
     virt_uart_put_hex(kernel_cpu_current()->hardware_id);
     virt_uart_puts(" error=");
     virt_uart_put_hex((unsigned long)error);
+    virt_uart_puts(" sp=");
+    virt_uart_put_hex(arch_current_stack());
+    uintptr_t pc;
+    asm volatile("auipc %0, 0" : "=r"(pc));
+    virt_uart_puts(" pc=");
+    virt_uart_put_hex(pc);
     virt_uart_putc('\n');
     sbi_shutdown();
 }
@@ -50,12 +93,14 @@ struct kernel_cpu *riscv_smp_cpu(unsigned logical)
 
 void kernel_cpu_notify(struct kernel_cpu *target, unsigned events)
 {
+    uintptr_t irq = arch_interrupt_save();
     struct kernel_cpu *source = kernel_cpu_current();
-    if (!cpu_count && target == source) return;
+    if (!cpu_count && target == source) { arch_interrupt_restore(irq); return; }
     if (!target || target->logical_id >= cpu_count) __builtin_trap();
     __atomic_fetch_or(&target->events, events, __ATOMIC_RELEASE);
     if (target != source) source->outbound |= 1U << target->logical_id;
     if (!source->raw_locks) kernel_cpu_flush_notifications();
+    arch_interrupt_restore(irq);
 }
 
 void kernel_cpu_flush_notifications(void)
@@ -68,34 +113,43 @@ void kernel_cpu_flush_notifications(void)
         if (!(mask & (1U << i))) continue;
         long error = sbi_send_ipi(cpus[i]->hardware_id);
         if (error) riscv_smp_fail("IPI", error);
+        source->ipi_sent++;
     }
 }
 
-void riscv_smp_handle_ipi(void)
+static void consume_ipi(int interrupt)
 {
     /* 先确认SSIP，后消费软件事件；确认后的新通知不会被清除。 */
     asm volatile("csrci sip, 2" ::: "memory");
     struct kernel_cpu *cpu = kernel_cpu_current();
+    if (interrupt) cpu->ipi_received++;
     unsigned events = __atomic_exchange_n(&cpu->events, 0, __ATOMIC_ACQ_REL);
     if (events & RISCV_IPI_SCHEDULE) kernel_cpu_request_schedule(cpu);
-    if (events & RISCV_IPI_HANDSHAKE) ping_seen = 1;
-    if (events & RISCV_IPI_STOP) stop_requested = 1;
+    if (events & RISCV_IPI_HANDSHAKE) __atomic_store_n(&ping_seen, 1, __ATOMIC_RELEASE);
+    if (events & RISCV_IPI_STOP) __atomic_store_n(&stop_requested, 1, __ATOMIC_RELEASE);
     if (events & RISCV_IPI_DEADLINE)
         kernel_scheduler_deadline_changed();
 }
+void riscv_smp_handle_ipi(void) { consume_ipi(1); }
 
 void riscv_smp_timer_seen(void)
-{ if (kernel_cpu_current()->logical_id) timer_seen = 1; }
+{ if (kernel_cpu_current()->logical_id) __atomic_store_n(&timer_seen, 1, __ATOMIC_RELEASE); }
 
 void riscv_smp_idle(void)
 {
     uintptr_t irq = arch_interrupt_save();
     struct kernel_cpu *cpu = kernel_cpu_current();
-    if (__atomic_load_n(&cpu->events, __ATOMIC_ACQUIRE)) riscv_smp_handle_ipi();
+    if (__atomic_load_n(&cpu->events, __ATOMIC_ACQUIRE)) consume_ipi(0);
     kernel_scheduler_prepare_idle_return();
     /* IRQ关闭下的复查与WFI：pending SSIP即使不陷入，也能唤醒WFI。 */
     if (!kernel_cpu_schedule_requested(cpu) &&
-        !__atomic_load_n(&cpu->events, __ATOMIC_ACQUIRE)) asm volatile("wfi" ::: "memory");
+        !__atomic_load_n(&cpu->events, __ATOMIC_ACQUIRE)) {
+#if BOAROS_SMP_TEST
+        extern void riscv_smp_test_idle_boundary(struct kernel_cpu *);
+        riscv_smp_test_idle_boundary(cpu);
+#endif
+        asm volatile("wfi" ::: "memory");
+    }
     arch_interrupt_restore(irq | 2U);
 }
 
@@ -110,11 +164,12 @@ void riscv_smp_secondary_high(void)
     enum riscv_timer_status status = riscv_timer_start(timebase, KERNEL_TICKS_PER_SECOND);
     if (status) riscv_smp_fail("secondary-timer", status);
     __atomic_store_n(&secondary_attached, 1, __ATOMIC_RELEASE);
-    while (!ping_seen || !timer_seen) riscv_smp_idle();
+    while (!__atomic_load_n(&ping_seen, __ATOMIC_ACQUIRE) ||
+           !__atomic_load_n(&timer_seen, __ATOMIC_ACQUIRE)) riscv_smp_idle();
     __atomic_store_n(&secondary_cpu.state, KERNEL_CPU_ONLINE, __ATOMIC_RELEASE);
     for (;;) {
         riscv_smp_idle();
-        if (stop_requested) {
+        if (__atomic_load_n(&stop_requested, __ATOMIC_ACQUIRE)) {
             (void)arch_interrupt_save();
             if (secondary_cpu.current != secondary_cpu.idle || secondary_cpu.switch_previous ||
                 secondary_cpu.raw_locks || secondary_cpu.preempt_depth)
@@ -172,7 +227,7 @@ void riscv_smp_start(const struct dtb_cpu_info *info, uint64_t transition,
 
 void riscv_smp_stop(void)
 {
-    if (cpu_count < 2 || cpus[1]->state == KERNEL_CPU_STOPPED) return;
+    if (cpu_count < 2 || __atomic_load_n(&cpus[1]->state, __ATOMIC_ACQUIRE) == KERNEL_CPU_STOPPED) return;
     if (kernel_cpu_current()->logical_id) __builtin_trap();
     kernel_preempt_disable();
     if (!kernel_scheduler_core_quiescent(cpus[1])) riscv_smp_fail("stop-live-owner", -1);
@@ -182,6 +237,8 @@ void riscv_smp_stop(void)
     while ((state = sbi_hart_status(cpus[1]->hardware_id)) != SBI_HSM_STOPPED)
         if (state < 0 || (int64_t)(riscv_time_read() - end) >= 0)
             riscv_smp_fail("stop-confirmation", state);
+    if (__atomic_load_n(&cpus[1]->state, __ATOMIC_ACQUIRE) != KERNEL_CPU_QUIESCING)
+        riscv_smp_fail("stop-kernel-state", cpus[1]->state);
     __atomic_store_n(&cpus[1]->state, KERNEL_CPU_STOPPED, __ATOMIC_RELEASE);
     kernel_preempt_enable();
 }
@@ -193,6 +250,7 @@ void riscv_smp_sync_kernel(uint64_t address, uint64_t size)
     if (cpu_count > 1 && __atomic_load_n(&cpus[1]->state, __ATOMIC_ACQUIRE) == KERNEL_CPU_ONLINE) {
         long error = sbi_remote_sfence(cpus[1]->hardware_id, address, size);
         if (error) riscv_smp_fail("RFENCE", error);
+        kernel_cpu_current()->rfence_requests++;
     }
 }
 #endif

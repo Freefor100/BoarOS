@@ -575,7 +575,7 @@ enum riscv_sv39_status riscv_sv39_kernel_window_map_pages(
 {
     kernel_assert_service_context();
     if (!allocator || !kernel_window_valid(va, pages) || (pa & BOAROS_PAGE_MASK) ||
-        pa > RISCV_SV39_PHYSICAL_MAX - pages * BOAROS_PAGE_SIZE)
+        pa > RISCV_SV39_PHYSICAL_LIMIT - pages * BOAROS_PAGE_SIZE)
         return RISCV_SV39_STATUS_INVALID;
     uint64_t candidates[2] = {0}, *candidate_data[2] = {0};
     unsigned indexes[2] = {(va >> 21) & RISCV_SV39_INDEX_MASK,
@@ -614,8 +614,10 @@ enum riscv_sv39_status riscv_sv39_kernel_window_map_pages(
                 }
             }
             if (status == RISCV_SV39_STATUS_OK) {
+                int changed_parent = 0;
                 /* 没有分配/睡眠：全部预检后发布，候选表的owner转给共享骨架。 */
                 for (unsigned i = 0; i < tables; i++) if (!level1[indexes[i]]) {
+                    changed_parent = 1;
                     __atomic_store_n(&level1[indexes[i]], table_entry(candidates[i]), __ATOMIC_RELEASE);
                     candidates[i] = 0;
                 }
@@ -626,7 +628,9 @@ enum riscv_sv39_status riscv_sv39_kernel_window_map_pages(
                         leaf_entry(pa + page * BOAROS_PAGE_SIZE, RISCV_SV39_READ | RISCV_SV39_WRITE),
                         __ATOMIC_RELEASE);
                 }
-                kernel_window_sync(va, pages * BOAROS_PAGE_SIZE);
+                /* 非叶PTE改变必须覆盖walk缓存，不能只请求远端叶子VA失效。 */
+                kernel_window_sync(changed_parent ? 0 : va,
+                    changed_parent ? UINT64_MAX : pages * BOAROS_PAGE_SIZE);
             }
             arch_interrupt_restore(irq);
             break;

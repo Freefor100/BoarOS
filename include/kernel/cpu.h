@@ -40,6 +40,7 @@ struct kernel_cpu {
     uint32_t logical_id, state, events, outbound;
     struct { uint64_t period, next_deadline; int armed; } timer;
     struct kernel_sched_runqueue eligible;
+    uint64_t ipi_sent, ipi_received, rfence_requests;
 #endif
 };
 #if BOAROS_MAX_CPUS > 1

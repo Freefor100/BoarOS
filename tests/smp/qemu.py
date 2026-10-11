@@ -1,0 +1,78 @@
+#!/usr/bin/env python3
+"""Run the existing userland consumer unchanged in an explicit MTTCG profile."""
+import json
+import os
+from pathlib import Path
+import selectors
+import subprocess
+import sys
+import time
+from riscv import identity
+
+
+def main():
+    args = sys.argv[1:]
+    actual = os.environ["BOAROS_SMP_QEMU"]
+    firmware = os.environ.get("BOAROS_SMP_FIRMWARE", "default")
+    output = Path(os.environ["BOAROS_SMP_OUTPUT"])
+    # 原consumer保留盘准备、输入、完整marker与owner判定；仅改变架构profile。
+    for flag, value in (("-smp", "2"), ("-bios", firmware)):
+        index = args.index(flag)
+        args[index + 1] = value
+    args += ["-accel", "tcg,thread=multi"]
+    kernel = args[args.index("-kernel") + 1]
+    image = next(part.split("=", 1)[1] for value in args for part in value.split(",")
+                 if part.startswith("file="))
+    output.mkdir(parents=True, exist_ok=True)
+    prefix = output / Path(image).stem
+    record = {"command": [actual, *args], "kernel": identity(kernel),
+              "qemu": identity(actual), "disk_before": identity(image),
+              "firmware": identity(firmware) if firmware != "default" else {"mode": "default"}}
+    start = time.monotonic()
+    process = subprocess.Popen(record["command"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    os.set_blocking(process.stdout.fileno(), False)
+    selector = selectors.DefaultSelector()
+    selector.register(process.stdout, selectors.EVENT_READ)
+    threads, data, timed_out = set(), bytearray(), False
+    try:
+        while process.poll() is None:
+            for path in Path(f"/proc/{process.pid}/task").glob("*/comm"):
+                try:
+                    threads.add(path.read_text().strip())
+                except FileNotFoundError:
+                    pass
+            for key, _ in selector.select(0.005):
+                data.extend(os.read(key.fd, 65536))
+            if time.monotonic() - start >= 180:
+                timed_out = True
+                process.terminate()
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                break
+        process.wait(timeout=2)
+        os.set_blocking(process.stdout.fileno(), True)
+        data.extend(process.stdout.read())
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+        selector.close()
+        process.stdout.close()
+    text = data.decode(errors="replace")
+    prefix.with_suffix(".log").write_text(text)
+    record.update(returncode=process.returncode, timeout=timed_out, elapsed_seconds=time.monotonic() - start,
+                  vcpu_threads=sorted(t for t in threads if "/TCG" in t))
+    prefix.with_suffix(".json").write_text(json.dumps(record, indent=2) + "\n")
+    sys.stdout.buffer.write(data)
+    sys.stdout.buffer.flush()
+    if timed_out or process.returncode or len(record["vcpu_threads"]) != 2 or "SMP failure" in text or "SMP fatal" in text:
+        return 1
+    if "SMP root overlap counter=" not in text or "controller/arena/wait owners returned" not in text:
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

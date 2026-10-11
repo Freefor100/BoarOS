@@ -11,6 +11,7 @@
 | `Makefile` | 编译、链接以及运行、测试、调试入口 |
 | `arch/riscv/linker.ld` | ELF 入口、加载段、地址布局和启动栈 |
 | `arch/riscv/boot.S` | 建立最小 C 运行环境、初始化 trap CSR、调用 `kernel_main` 并完成高半区执行上下文切换 |
+| `arch/riscv/secondary.S`、`smp.c` | 独立两核配置的 HSM 入口、CPU 本地初始化、IPI 与 RFENCE；不重复清 BSS 或初始化服务 |
 | `kernel/dtb.c`、`kernel/boot_memory.c` | 读取 DTB 内存/设备事实并生成可用物理区间 |
 | `kernel/physical_page.c` | 对齐可用区间并建立单页物理分配器 |
 | `arch/riscv/direct_map.c` | 校验 direct-map 范围并转换物理/虚拟地址 |
@@ -38,7 +39,12 @@
 
 ## 当前限制
 
-当前代码只处理单 hart、QEMU `virt` UART、固定高半区内核 VMA、最终 high/direct RAM 映射、S/U-mode 整数 Trap Frame、第一段 DTB RAM、SBI timer/100 Hz tick、FIFO 内核/用户任务，以及 raw whole-disk ext4（按设备能力读写或只读）。生产 ELF 入口支持 source-backed `ET_EXEC`/`ET_DYN`/非递归 `PT_INTERP` 的 RISC-V 映像构造；真实静态与动态 musl 入口、额外 DSO 和 TLS 已验证，更多动态 libc/DSO 负载仍待补齐。QEMU ELF 的物理装载地址仍固定为 `0x80200000`；VisionFive 2 的装载地址、固件入口和存储后端必须在板级适配时单独提供，不能直接沿用平台常量。完整 Linux 文件 ABI、完整 Linux 进程/线程语义、SMP 尚未实现；LoongArch 首阶段单独见[LA 模块](loongarch-boot.md)。
+默认启动为单 hart。独立[RV 受控两核配置](riscv-smp.md)通过 HSM 进入 secondary 物理入口，
+仅 boot hart 清 BSS、建立 allocator、页表、设备和全局时钟；secondary 使用独立静态栈与 CPU 记录。
+用户任务与现有文件、设备、网络和压力服务仍在 CPU0，尚无共享用户 MM 的跨核执行闭环。
+生产 ELF 支持 source-backed `ET_EXEC`/`ET_DYN`/非递归 `PT_INTERP`，已验证静态/动态 musl、DSO/TLS 与 glibc 五形态。
+QEMU ELF 的物理装载地址仍固定为 `0x80200000`；VisionFive 2 的装载地址、固件入口和存储后端须由板级适配提供，
+不能直接沿用平台常量。完整 Linux 文件及进程 ABI、实板和 LA 多核不在当前验收范围；LA 单核见[LA 模块](loongarch-boot.md)。
 
 ## 验证入口
 
