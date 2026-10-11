@@ -297,3 +297,35 @@ python3 -B tests/cost-match-riscv.py --verify build/cost-match-new
 各自比较阶段全部跳过，候选没有成本验收通过资格；
 更早执行器的权限阻塞单列保留。当前成本状态及历史结果见
 [共享调度域匹配时间](../learning/cost-baseline.md#共享调度域的匹配时间)。
+
+### 只读执行器归因
+
+`tests/cost-diagnostic-riscv.py` 提供单独的 instrumented profile，复用单次启动、固定盘和完整
+工作量/退出检查。准备时封存原 ELF、候选核加载段、执行器、插件、符号 PC 和运行源码；
+wrapper 另记录实际含插件的 QEMU argv，与单次 runner 记录的 wrapper 身份分开核对。
+尝试槽位和 exec 收据均独占创建；失败、超时或中断不补跑，不 resume。此 profile 的
+`acceptance` 和 `performance_verified` 始终为 false，不进入正式匹配成绩。
+
+观测边界为原 ELF 的 `clock_gettime` 入口，和客体取时点有偏差；同时记录 wall、vCPU线程
+CPU时间及自愿/非自愿切换次数。wall−CPU包含WFI、I/O及宿主调度，切换次数不能换算成
+离核时长。两个时钟并非同时取样：每次CPU/切换计数取样都有MONOTONIC前后包络，
+报告wall−CPU的有符号差及包络误差区间，不把包络内的负差值判成无效。
+TB长度×执行次数只是工作量代理：异常可能提前离开TB。FS取首次执行的样本，
+仅为翻译键的一部分；hardware-address值仅在同次启动内作不透明身份比较。全局code-cache
+flush与客体TLB失效分开。所选函数入口事件不代表完成，符号体内TB代理不包含其callee；
+共享helper的业务owner没有独立证据时保持未知。热回调不输出或分配，固定容量溢出使诊断无效。
+
+```sh
+make test-cost-diagnostic-host
+# 本地观察器额外依赖 QEMU plugin API 头文件和 GLib 开发文件。
+make test-cost-diagnostic-plugin-host
+python3 -B tests/cost-diagnostic-riscv.py --prepare build/residual-diagnostic-new
+sudo -v
+python3 -B tests/cost-diagnostic-riscv.py --run build/residual-diagnostic-new
+python3 -B tests/cost-diagnostic-riscv.py --verify build/residual-diagnostic-new
+```
+
+固定资料：`references/linux@f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的
+`kernel/sys.c`定义RUSAGE_THREAD；`references/qemu@84f07211cc5b4fc6a371559bf8a5de4fb068e648`
+的`target/riscv/cpu.h`与`tcg/tcg-cpu.c`定义FS翻译键。实际插件编译头、QEMU二进制及工具SHA
+由manifest另行封存，参考源码版本不替代执行器身份。

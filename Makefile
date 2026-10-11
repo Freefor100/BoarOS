@@ -1706,7 +1706,7 @@ test-sched-bandwidth-riscv: $(KERNEL_RV) $(MUSL_STAMP)
 	KERNEL_RV=$(KERNEL_RV) QEMU_RISCV64=$(QEMU_RISCV64) sh tests/sched-bandwidth-riscv.sh
 
 # Cost variants never reuse objects compiled with a different observation flag.
-.PHONY: force-cost-config test-cost-riscv test-cost-host test-cost-match-host test-cost-match-riscv
+.PHONY: force-cost-config test-cost-riscv test-cost-host test-cost-match-host test-cost-match-riscv test-cost-diagnostic-host test-cost-diagnostic-plugin-host
 force-cost-config:
 $(BUILD_DIR)/generated/cost-config.h: force-cost-config
 	@mkdir -p $(dir $@)
@@ -1719,10 +1719,18 @@ test-cost-match-host:
 	python3 -B tests/test-cost-policy-guard.py
 	python3 -B tests/test-cost-measurement.py
 	python3 -B tests/test-cost-match.py
+test-cost-diagnostic-host:
+	python3 -B tests/test-cost-diagnostic.py
+# The optional observer requires QEMU API headers and GLib development files;
+# ordinary host COST/CI gates keep their existing dependency footprint.
+test-cost-diagnostic-plugin-host:
+	@mkdir -p build/cost/diagnostic
+	cc -std=c11 -O2 -ffunction-sections -fdata-sections -Wl,--gc-sections -Wall -Wextra -Werror $$(pkg-config --cflags glib-2.0) tests/cost/diagnostic_plugin_test.c $$(pkg-config --libs glib-2.0) -o build/cost/diagnostic/collector-test
+	build/cost/diagnostic/collector-test
 COST_MATCH_OUTPUT ?= build/cost-match-riscv
 test-cost-match-riscv: test-cost-match-host
 	python3 -B tests/cost-match-riscv.py --output $(COST_MATCH_OUTPUT)
-test-cost-host: test-cost-match-host
+test-cost-host: test-cost-match-host test-cost-diagnostic-host
 	@mkdir -p build/cost/host
 	cc -std=c11 -Wall -Wextra -Werror -idirafter include -DBOAROS_COST_DIAGNOSTICS=1 tests/cost/core_test.c kernel/cost.c -o build/cost/host/core-test
 	build/cost/host/core-test
