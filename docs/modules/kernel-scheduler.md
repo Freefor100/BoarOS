@@ -50,6 +50,7 @@ queue_destroy在注册或操作/游标/回调借用未归零时返回BUSY，调�
 
 聚焦入口：`make test-wait-host test-wait-riscv test-wait-loongarch`。host直接链接park.c、
 真实raw/runqueue，在2/4线程握手下检查提前wake、单次仲裁、旧代次、多队列与退休游标；
+COMMITTED任务的模拟backend与生产一样在通知中摘除默认节点，另验证任务/回调混合队列的FIFO和新增登记的sequence边界。
 双侧512MiB/1GiB检查真实首次/退出切换、timeout及任务页回到基线。此处是原语与单CPU证据，
 不替代共享MM、业务对象或多核客体的并发验收。
 

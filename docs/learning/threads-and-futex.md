@@ -240,6 +240,12 @@ futex过滤wake不能沿用跨解锁的裸next。游标借用node，requeue额�
 同一短锁内完成单任务通知时，节点不会跨解锁借用，但仍须检查活动queue与borrow_owner身份。
 省去borrow动作不能连带省掉原有非法owner检测；真实宿主反例保护该边界。
 
+通知可以修改被遍历的链：COMMITTED任务的backend会摘除默认等待节点并清空next，
+PREPARED任务则尚未进入该backend。曾有分段通知候选只在PREPARED模型中通过，真实锁负载
+停在首窗口；补齐2/4线程park/模拟切换完成握手后，宿主反例也能拒绝该候选。后继必须在通知前
+于同一保护下取得，跨解锁仍须借用或退休链；修正候选随后仍因实际业务成本被拒绝。
+生产通知路径未因此更换，准备态模型、提交态宿主交错与真实客户机证据分别成立。
+
 信号测试的ready标志若写在WAIT syscall之前，不能证明已经登记；强制信号先进入、条件再改变，
 同一LA ELF在固定Linux与BoarOS的512MiB/1GiB均返回合法EAGAIN。当前信号目录用零wake的
 FUTEX_REQUEUE确认真实登记、保持阻塞，再交付信号；固定依据为`references/linux/kernel/futex/requeue.c`，
