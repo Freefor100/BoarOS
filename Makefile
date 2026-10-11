@@ -1706,14 +1706,23 @@ test-sched-bandwidth-riscv: $(KERNEL_RV) $(MUSL_STAMP)
 	KERNEL_RV=$(KERNEL_RV) QEMU_RISCV64=$(QEMU_RISCV64) sh tests/sched-bandwidth-riscv.sh
 
 # Cost variants never reuse objects compiled with a different observation flag.
-.PHONY: force-cost-config test-cost-riscv test-cost-host
+.PHONY: force-cost-config test-cost-riscv test-cost-host test-cost-match-host test-cost-match-riscv
 force-cost-config:
 $(BUILD_DIR)/generated/cost-config.h: force-cost-config
 	@mkdir -p $(dir $@)
 	@printf '#define BOAROS_COST_DIAGNOSTICS %s\n' '$(COST_DIAGNOSTICS)' > $@.tmp
 	@cmp -s $@ $@.tmp && rm $@.tmp || mv $@.tmp $@
 COST_CASE ?= all
-test-cost-host:
+test-cost-match-host:
+	python3 -B tests/test-cost-match-report.py
+	python3 -B tests/test-cost-policy.py
+	python3 -B tests/test-cost-policy-guard.py
+	python3 -B tests/test-cost-measurement.py
+	python3 -B tests/test-cost-match.py
+COST_MATCH_OUTPUT ?= build/cost-match-riscv
+test-cost-match-riscv: test-cost-match-host
+	python3 -B tests/cost-match-riscv.py --output $(COST_MATCH_OUTPUT)
+test-cost-host: test-cost-match-host
 	@mkdir -p build/cost/host
 	cc -std=c11 -Wall -Wextra -Werror -idirafter include -DBOAROS_COST_DIAGNOSTICS=1 tests/cost/core_test.c kernel/cost.c -o build/cost/host/core-test
 	build/cost/host/core-test

@@ -126,6 +126,11 @@ class ArchitectureCoverage(unittest.TestCase):
         commands = [arg for case in self.plan('host', 'host') for arg in case['argv']]
         self.assertIn('test-references', commands)
 
+    def test_host_runs_matched_measurement_contracts_without_privileged_campaign(self):
+        commands = [arg for case in self.plan('host', 'host') for arg in case['argv']]
+        self.assertIn('test-cost-match-host', commands)
+        self.assertNotIn('test-cost-match-riscv', commands)
+
     def test_native_template_retains_full_abi_observations_and_failed_disk(self):
         path = Path(__file__).resolve().parents[2] / '.github/workflows/native-contracts.yml'
         steps = yaml.safe_load(path.read_text())['jobs']['contracts']['steps']

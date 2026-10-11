@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Serial, independent-boot cost measurements; unimplemented cases fail explicitly."""
 import argparse
-import fcntl
 import hashlib
 import json
 import os
@@ -16,6 +15,7 @@ import tempfile
 from cost_report import validate_deadline, validate_allocator, parse, validate_expected, validate_locking, validate_scheduler, validate_resume_selection
 from cost_seed import replica_seed, seed_arguments, validate_resume_seed
 from cost_fixture import FrozenFixture, validate_resume_fixture
+from cost_measurement import acquire_measurement_lock
 ROOT=Path(__file__).resolve().parents[1]
 CASES=('contract','write','locking','mprotect','deadline','latency','consumer','readers','metadata','allocator','scheduler')
 IMPLEMENTED=set(CASES)
@@ -25,6 +25,7 @@ def run(command, **kwargs): return subprocess.run(command,check=True,**kwargs)
 def main():
     parser=argparse.ArgumentParser(__doc__)
     parser.add_argument('--resume-from',type=Path,help='revalidate completed boot logs and continue remaining replicas without rerunning them')
+    parser.add_argument('--measurement-lock-fd',type=int,help='reuse the matched campaign parent-owned global measurement lock')
     parser.add_argument('--case',choices=(*CASES,'all'),default='all')
     parser.add_argument('--kernel',type=Path,default=ROOT/'build/cost/kernel-rv')
     parser.add_argument('--qemu',default='qemu-system-riscv64')
@@ -78,9 +79,9 @@ def main():
         sys.path.insert(0,str(ROOT/'tests/diff-abi')); import harness
         args.kernel,linux_identity=harness.fixed_linux_image(None); args.off=True
     (ROOT/'build/cost').mkdir(parents=True,exist_ok=True)
-    measurement_lock=(ROOT/'build/cost/measurement.lock').open('w')
-    try: fcntl.flock(measurement_lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+    try: measurement_lock=acquire_measurement_lock(ROOT/'build/cost/measurement.lock',args.measurement_lock_fd)
     except BlockingIOError: parser.error('another cost measurement is active; serial runs required')
+    except (OSError,ValueError) as error: parser.error('invalid inherited measurement lock: '+str(error))
     cases=CASES if args.case=='all' else (args.case,)
     missing=set(cases)-IMPLEMENTED
     if missing: parser.error('not implemented: '+','.join(sorted(missing)))

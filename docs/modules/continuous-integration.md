@@ -34,6 +34,7 @@ RV已验证的全断电矩阵；LA客体原生开发尚未交付，不增加占�
 
 host allocator组直接链接生产CPU/raw、buddy/slab、等待与RW资格、调度/身份/退休，
 覆盖4/16KiB allocator及2/4逻辑CPU调度握手、非法owner、抢占、有界工作量和借用销毁。
+同组还运行配对成本的host统计、锁继承和假sysfs恢复门禁；CI不执行需要本机限频权限的正式测量。
 RV完整门禁与LA cpu-state运行真实raw/等待/handoff/lifecycle，含双RAM首次/恢复/退出
 及可信栈归还；宿主并发不代表整个内核SMP-ready。
 

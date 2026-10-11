@@ -246,3 +246,48 @@ raw_wait_ticks记录轮询/原子获取区间（无争用获取也有样本）�
 存栈上tag与时间，不固定新owner；释放raw后集中提交。元数据计时从取得锁后开始，
 排除锁获取与压力/I/O。heap→page嵌套区间可能重叠，不能把raw_hold与meta时间相加当独占CPU时间。
 完整旧226项registry缺少这两项时标为不可用；任意缺字段或部分新增schema仍拒绝。
+
+## 短窗口匹配与宿主策略租约
+
+`make test-cost-match-host` 验证配对统计、全轮测量锁、CPU策略恢复和完整日志门禁，
+也是 `test-cost-host` 的依赖。`tests/cost-match-riscv.py` 使用固定的
+`build/data-path-baselines/sync-b3/` 输入；开始前校验原B3基线、当前OFF核的源码差异与
+加载段、工具、原ELF及只读预启动盘。没有缓存时明确失败，不重新准备盘后冒充相同输入。
+
+协议 `b3-short-v1` 每个case固定12个三启动配对块，三个既有seed各使用四次。
+校准为同一当前核的三次启动，比较为原基线/当前核/同一原基线。完整块重采样10000次，
+每次重新计算三相中位数及首尾基线均值；不得独立重采样列或平均块百分比。
+校准95%双侧区间须在±1%内，首尾漂移须在±2%内；比较单侧95%上界不超过3%才通过，
+下界超过3%为稳定超标，其余未决。区间是有限样本筛查，不能排除系统性偏差或证明普遍等价。
+所有原窗口都保留，各自校准未决时不记置信通过。新增95%门槛只用于两个目标；
+非目标继续保护原点估计3%及漂移2%门槛，不扩大验收范围。部分case结果不能声明B3整体完成。
+
+driver与普通用户恢复监护进程持有同一全局 `measurement.lock`，控制进程死亡或超时后，
+监护仍保留真实锁描述符直到负责恢复的helper退出；单次runner通过已验证的
+继承描述符复用锁。单次记录仍是 `replicas=1, acceptance=false`；完整验收属于外层manifest，
+不改变原三副本接口。完整schedule在第一次启动前封存，校准失败的case不进入比较，
+不追加样本、筛掉慢副本或重用缺少真实终态的旧日志。
+
+CPU策略helper只操作CPU2/3的governor、频率上下限及governor改变的EPP，请求performance/
+2500000kHz；包含其他CPU的共享policy先拒绝。测量与文件写入仍由普通用户执行，helper
+不接受工作命令。正常结束、配置失败、SIGINT/SIGTERM和控制管道EOF都进入恢复，逐项
+核对原值；恢复未验证即失败。策略读回、频率观察、同胞活动与节流计数各自记录，
+缺失标不可用；固定请求频率不证明实际频率恒定。
+
+runner封存完整input/result/boot.log及实际退出状态；离线校验重新解析所有工作量、
+locking的168条native wait status和唯一完整PID1终态，核对复制的kernel/firmware/ELF/DTB。
+root成功行只在冻结源码的 `root_boot_finish` 完成worker/挂载/设备销毁、heap及page基线检查后
+输出；这是既有root门禁执行证据，不是独立打印了所有等待和设备owner的零计数。
+输出目录必须新建或为空；当前协议不resume或拼接旧启动。
+
+```sh
+make test-cost-match-host
+# 在允许sudo取得root的普通宿主终端预先认证，仅helper取得权限。
+sudo -v
+make test-cost-match-riscv COST_MATCH_OUTPUT=build/cost-match-new
+python3 -B tests/cost-match-riscv.py --verify build/cost-match-new
+```
+
+权限不足在任何正式启动前记录 `environment_blocked`，不回退到powersave测量。
+本机2026-10-11执行环境的 `NoNewPrivs=1` 阻止sudo，正式启动数为0；
+当前成本状态及历史结果见[共享调度域匹配时间](../learning/cost-baseline.md#共享调度域的匹配时间)。
