@@ -9,14 +9,15 @@ Linux 是用户可观察语义的参考；内部实现独立维护对象所有�
 
 ## 当前能力
 
-生产平台为单 CPU QEMU virt：**RV64、Sv39／4 KiB 页**和**LA64、LA464、16 KiB／三级页表**。
+默认生产平台为单 CPU QEMU virt：**RV64、Sv39／4 KiB 页**和**LA64、LA464、16 KiB／三级页表**。
 两侧共用 MM、调度、VFS、设备和用户程序策略，架构实现在构建期绑定。
+独立RV两核配置已完成受控内核任务的调度正确性闭环，用户程序与现有业务仍在CPU0。
 
 | 范围 | 已验证能力 | 主要边界／模块 |
 |---|---|---|
 | 内存与 CPU | buddy/slab、连续页与引用、VMA、按需页、共享匿名/文件映射、COW、独立栈窗口与真实 guard；RV F/D、LA FPU/LSX/LASX；独立 RV 受控两核配置 | 无共享用户 MM 的跨核闭环、RV V；固定 QEMU 不提供 LA LBT；[物理页](docs/modules/physical-pages.md)、[MM](docs/modules/kernel-mm.md)、[两核边界](docs/modules/riscv-smp.md)、[LA](docs/modules/loongarch-boot.md) |
 | ELF 与运行时 | 静态/动态 ELF、PIE、shebang、解释器、musl DSO/TLS；RV glibc 2.44、LA glibc 2.42 的五种形态及线程/取消子集 | 无 execveat，更广 glibc 应用仍须逐个验收；[ELF](docs/modules/user-elf.md)、[exec](docs/modules/kernel-exec.md) |
-| 进程与同步 | fork/vfork/pthread、线程组/会话/进程组、exec/wait/退出回收；OTHER/FIFO/RR、deadline；基本 futex、robust-list、标准信号和同步 fault | 单 CPU；无 PI futex、共享文件 futex、实时信号队列、sigaltstack；[调度](docs/modules/kernel-scheduler.md)、[信号](docs/modules/kernel-signal.md) |
+| 进程与同步 | fork/vfork/pthread、线程组/会话/进程组、exec/wait/退出回收；OTHER/FIFO/RR、deadline；基本 futex、robust-list、标准信号和同步 fault | 用户任务限CPU0；无 PI futex、共享文件 futex、实时信号队列、sigaltstack；[调度](docs/modules/kernel-scheduler.md)、[信号](docs/modules/kernel-signal.md) |
 | 文件与事件 | fd/OFD、dup、阻塞 pin、向量/定位 I/O、pipe/FIFO、poll/select/epoll、传统/OFD 记录锁、活 inode/路径、link/rename | 无完整凭据/权限、EXCHANGE/WHITEOUT；[文件接口](docs/modules/kernel-files.md) |
 | 文件系统与挂载 | ext4、procfs、tmpfs、devpts、POSIX/SysV 共享内存；用户态 mount 与普通忙卸载、独立第二 ext4 盘 | 无 bind/remount/move/传播、扩展卸载 flags 或 mount namespace；[VFS](docs/modules/vfs-ext4.md)、[tmpfs](docs/modules/tmpfs.md) |
 | 存储 | 共用 VirtIO transport/split queue、批量/乱序 I/O、flush/reset、页缓存、后台写回/压力回收、ordered journal、durable commit/checkpoint、orphan/replay | RV legacy/modern MMIO；LA modern PCI及transitional设备的modern接口，纯legacy PCI未接；[框架](docs/modules/virtio-framework.md)、[存储](docs/modules/vfs-ext4.md) |
@@ -27,9 +28,10 @@ Linux 是用户可观察语义的参考；内部实现独立维护对象所有�
 两侧各 **1366 条 ABI 差分**、glibc 五形态、栈/guard，以及相关存储、设备、网络、终端组合通过。
 具体输入与适用范围见[程序基线](docs/learning/user-program-inventory.md)和
 [调度组合核对](docs/learning/threads-and-futex.md#调度域身份发布与退休存储)。
-这些结果限定于上述平台和案例；LA 客体原生开发、全断电恢复矩阵、实板与多核仍需独立验收。
+这些结果限定于上述平台和案例；LA 客体原生开发、全断电恢复矩阵、实板与共享用户MM多核仍需独立验收。
 
 主线 [CI](docs/modules/continuous-integration.md)以同一模板覆盖共用 host、双侧 core/ABI、platform 和 glibc/SQLite，
+另有独立RV受控两核结果组；
 原程序/设备组合及存储恢复分层运行。定时组合显式准备原程序、原网络运行时及TAP能力；
 上述验收来自本地执行，不等于托管CI结果。
 
@@ -50,6 +52,7 @@ make test-sync-host test-allocator-concurrency-host
 make test-wait-host test-sleep-lock-host test-wait-riscv test-wait-loongarch
 make test-sched-concurrency-host test-sched-lifecycle-riscv test-sched-lifecycle-loongarch
 make test-smp-host test-smp-riscv
+make test-smp-userland-riscv
 make test-stack-usage test-stack-usage-la
 ```
 
@@ -62,12 +65,14 @@ make test-stack-usage test-stack-usage-la
 
 ## 开发方向与文档
 
-当前主线转向 **SMP 同步基础与生命周期正确性**，再进入 RV 两核、共享 MM/TLB 和 LA 多核；
+当前主线推进 **共享用户 MM/uaccess/TLB 与业务对象并发**，再扩展RV组合压力和LA多核；
 具体未完成能力与依赖只维护在[开发路线](docs/goals.md)，逐轮执行计划留在会话中。
 CPU 本地/current、运行结算、idle/timer归属与嵌套抢占控制已建立，raw 短锁已接入 buddy/slab 元数据；任务选择、身份发布及存储借用在统一短调度域保护，资源清理留在锁外；等待代次、借用游标、
 新栈交接与可睡眠锁内部资格已建立。压力回收、共享MM及其他业务对象仍需跨核保护。
 默认生产继续单CPU；新增[RV受控两核配置](docs/modules/riscv-smp.md)使用独立构建入口，
-已验证独立启动、本地timer、资格选择和受控任务迁移的窄闭环。用户任务及现有业务仍限CPU0，
+2026-10-11在512MiB/1GiB完成MTTCG两核抢占、IPI/WFI交接、双向迁移、执行资格、
+RFENCE后栈回收、私有allocator及CPU0原静态/pthread组合；同一内核的一CPU退化也通过。
+用户任务及现有业务仍限CPU0，
 共享用户MM和业务对象并发尚未开放。
 共享调度域的[成本核对](docs/learning/cost-baseline.md#共享调度域的匹配时间)保留既有开销和短窗口未决结果；
 短窗口归因已停止，不再作为两核规划的前置门槛。既有3%测量协议保留，未决不记为通过。

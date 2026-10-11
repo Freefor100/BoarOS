@@ -3,13 +3,19 @@
     "host": [
       {"name":"references","targets":["test-references"]},
       {"name":"ci-contracts","targets":["test-ci-host"]},
-      {"name":"allocator","targets":["test-sync-host","test-wait-host","test-sleep-lock-host","test-scheduler-handoff-host","test-sched-concurrency-host","test-pid-object-host","test-allocator-concurrency-host","test-allocator-release-host","test-allocator-preemption-host","test-allocator-cost-host","test-cost-match-host"]},
+      {"name":"allocator","targets":["test-sync-host","test-smp-host","test-wait-host","test-sleep-lock-host","test-scheduler-handoff-host","test-sched-concurrency-host","test-pid-object-host","test-allocator-concurrency-host","test-allocator-release-host","test-allocator-preemption-host","test-allocator-cost-host","test-cost-match-host"]},
       {"name":"virtio","targets":["test-virtio-framework-host","test-virtio-block-host","test-virtio-rng-host","test-virtio-net-host","test-pci-host"]},
       {"name":"terminal","targets":["test-tty-host","test-pty-host","test-uart-host"]},
       {"name":"random-clock","targets":["test-random-host","test-rtc-host","test-rtc-loongarch-host"]},
       {"name":"events-network","targets":["test-epoll-host","test-lwip-host","test-lwip-reassembly-host","test-ethernet-worker-host"]},
       {"name":"file-cache","targets":["test-lwext4-host","test-lwext4-checksum-host","test-lwext4-cache-host","test-lwext4-batch-read-host","test-lwext4-group-host","test-lwext4-metadata-host","test-lwext4-deep-truncate-host"]},
       {"name":"runner-profiles","targets":["test-diff-abi-host","test-program-inventory-host","test-program-environment-host","test-glibc-profile-host","test-platform-profile-host"]}
+    ]
+  },
+  "smp": {
+    "riscv": [
+      {"name":"two-core-lifecycle","targets":["test-smp-riscv"]},
+      {"name":"pinned-user-composition","targets":["test-smp-userland-riscv"]}
     ]
   },
   "core": {

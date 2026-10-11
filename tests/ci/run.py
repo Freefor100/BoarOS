@@ -80,7 +80,7 @@ def run_cases(cases, directory):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--arch', choices=('host', 'riscv', 'loongarch'))
-    parser.add_argument('--suite', choices=('host', 'core', 'runtime', 'platform', 'extended'))
+    parser.add_argument('--suite', choices=('host', 'core', 'runtime', 'platform', 'extended', 'smp'))
     parser.add_argument('--output', type=Path)
     parser.add_argument('--list', action='store_true')
     parser.add_argument('--check-jobs', nargs='+')

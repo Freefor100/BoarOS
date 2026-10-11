@@ -1,7 +1,7 @@
 # 主线双架构 CI
 
 `ci.yml`在main push、面向main的PR和手动触发时执行，保护已经交付的单核QEMU
-契约。两侧使用同一个`native-contracts.yml`执行模板及同一个结果runner；
+契约，并增加独立的RV受控两核组。两侧使用同一个`native-contracts.yml`执行模板及同一个结果runner；
 `tests/ci/suites.json`维护实际命令，不能以job数量或组数推定功能覆盖。
 
 RV保留Ubuntu24.04/QEMU8.2.2回归，LA使用固定QEMU11.1.0及LS7A RTC补丁；
@@ -26,6 +26,11 @@ loader和kernel路径，不再只运行BoarOS的旧shell smoke。glibc原五形�
 架构专有验证保留实际差异：RV legacy/modern MMIO、NBD断电恢复和客体原生C
 编译；LA LSX/LASX、PCI共享INTx/reset和LS7A RTC。LA普通SQLite重启不代替
 RV已验证的全断电矩阵；LA客体原生开发尚未交付，不增加占位成功job。
+
+RV的`smp`组独立执行`test-smp-riscv`与`test-smp-userland-riscv`：MTTCG两核、同核一CPU退化、
+双RAM、独立故障启动和CPU0原程序组合。默认core/runtime/platform保持单CPU，LA没有SMP占位。
+该组从已安装OpenSBI包选择真实generic `fw_dynamic.bin`，显式传给Make；
+保存包版本、QEMU/固件/kernel SHA、实际vCPU线程和完整退出，不能把本地封存执行器身份冒充CI身份。
 
 两个environment独立生产缓存，各consumer只依赖本架构producer。core的一组
 失败后runner继续收集后续独立组；同模板的platform准备与执行在native环境成功时
@@ -52,6 +57,7 @@ python3 -B tests/ci/run.py --arch riscv --suite runtime
 python3 -B tests/ci/run.py --arch loongarch --suite runtime
 python3 -B tests/ci/run.py --arch riscv --suite platform
 python3 -B tests/ci/run.py --arch loongarch --suite platform
+python3 -B tests/ci/run.py --arch riscv --suite smp
 ```
 
 ## 固定环境与缓存

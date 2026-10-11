@@ -126,6 +126,16 @@ class ArchitectureCoverage(unittest.TestCase):
         commands = [arg for case in self.plan('host', 'host') for arg in case['argv']]
         self.assertIn('test-references', commands)
 
+    def test_smp_has_its_own_rv_gate_and_shared_host_contract(self):
+        commands = [arg for case in self.plan('riscv', 'smp') for arg in case['argv']]
+        self.assertIn('test-smp-riscv', commands)
+        self.assertIn('test-smp-userland-riscv', commands)
+        commands = [arg for case in self.plan('host', 'host') for arg in case['argv']]
+        self.assertIn('test-smp-host', commands)
+        result = subprocess.run([sys.executable, '-B', str(Path(__file__).with_name('run.py')),
+            '--arch', 'loongarch', '--suite', 'smp', '--list'], capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+
     def test_host_runs_matched_measurement_contracts_without_privileged_campaign(self):
         commands = [arg for case in self.plan('host', 'host') for arg in case['argv']]
         self.assertIn('test-cost-match-host', commands)

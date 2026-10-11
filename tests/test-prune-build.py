@@ -13,10 +13,12 @@ class CleanupContract(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary);build=root/'build'
             caches=('qemu-la/qemu-system-loongarch64','qemu-la-rtc/source/rtc.c',
+                'riscv-smp/riscv/kernel/main.o', 'riscv-smp-test/guard/kernel-rv',
                 'qemu-la-rtc/build/build.ninja','linux-la-platform/vmlinux',
                 'loongarch/program-libc/source/entry.c','loongarch/dynamic-dp-v2/root/lib/libc.so',
                 'loongarch/glibc/static-program','loongarch/diff-abi-cases')
             outputs=('loongarch/inventory-full/state.json','loongarch/program-inventory/state.json',
+                'riscv-smp/runs/2-512M.log',
                 'loongarch/review-boundary-green/linux.log','loongarch/diff-abi-run/linux.img',
                 'loongarch/rtc-model.case/state.bin','loongarch/sqlite-run.case/root.img',
                 'loongarch/program-libc/upstream.tar','loongarch/program-libc/build.log',

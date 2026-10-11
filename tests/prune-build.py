@@ -9,7 +9,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 BUILD = ROOT / 'build'
-KEEP_TOP = {'data-path-baselines', 'network-budget', 'io-budget', 'cost', 'riscv', 'loongarch', 'qemu-la', 'qemu-la-rtc', 'linux-la', 'linux-la-platform', 'diff-abi', 'program-environment', 'program-libc', 'host', 'tools', 'offline-c'}
+KEEP_TOP = {'data-path-baselines', 'network-budget', 'io-budget', 'cost', 'riscv', 'riscv-smp', 'riscv-smp-test', 'loongarch', 'qemu-la', 'qemu-la-rtc', 'linux-la', 'linux-la-platform', 'diff-abi', 'program-environment', 'program-libc', 'host', 'tools', 'offline-c'}
 KEEP_ROOT_FILES = {'elf-tail-rv', 'elf-tail-dynamic-rv', 'elf-tail-norelro-rv'}
 
 
@@ -44,6 +44,9 @@ def candidates():
                 result.extend(path for path in kernels.glob('*/build.log'))
 
     riscv = BUILD / 'riscv'
+    smp_runs = BUILD / 'riscv-smp' / 'runs'
+    if smp_runs.is_dir():
+        result.append(smp_runs)
     if riscv.is_dir():
         result.extend(path for path in riscv.iterdir()
                       if path.name in {'artifacts', 'musl-src', 'truncate-probe'}

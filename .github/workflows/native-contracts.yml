@@ -24,6 +24,29 @@ jobs:
         id: native
         with:
           arch: ${{ inputs.arch }}
+      - name: Record and select the actual SMP firmware
+        if: ${{ inputs.arch == 'riscv' && inputs.suite == 'smp' }}
+        run: |
+          python3 -B - <<'PY'
+          import hashlib, json, os, shutil, subprocess
+          from pathlib import Path
+          files = subprocess.check_output(['dpkg-query', '-L', 'opensbi'], text=True).splitlines()
+          candidates = [Path(p) for p in files if p.endswith('/generic/fw_dynamic.bin') and Path(p).is_file()]
+          if len(candidates) != 1:
+              raise SystemExit(f'Expected one installed generic OpenSBI image, found {candidates}')
+          firmware = candidates[0].resolve(strict=True)
+          qemu = Path(shutil.which('qemu-system-riscv64')).resolve(strict=True)
+          def identity(path):
+              return {'path': str(path), 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
+          report = {'firmware': identity(firmware), 'qemu': identity(qemu),
+                    'qemu_version': subprocess.check_output([str(qemu), '--version'], text=True),
+                    'opensbi_package': subprocess.check_output(['dpkg-query', '-W', 'opensbi'], text=True)}
+          output = Path('build/riscv-smp/ci-executor.json')
+          output.parent.mkdir(parents=True, exist_ok=True)
+          output.write_text(json.dumps(report, indent=2) + '\n')
+          with Path(os.environ['GITHUB_ENV']).open('a') as environment:
+              environment.write(f'QEMU_RISCV_FIRMWARE={firmware}\n')
+          PY
       - name: Run the declared native contracts
         env:
           TARGET_ARCH: ${{ inputs.arch }}
@@ -51,6 +74,9 @@ jobs:
           name: native-${{ inputs.arch }}-${{ inputs.suite }}
           path: |
             build/ci-run/${{ inputs.arch }}-*
+            build/riscv-smp/runs/**/*.log
+            build/riscv-smp/runs/**/*.json
+            build/riscv-smp/*.json
             build/${{ inputs.arch }}/**/*.log
             build/${{ inputs.arch }}/**/*.json
             build/${{ inputs.arch }}/**/*.normalized
