@@ -996,7 +996,7 @@ core/package节流计数没有增加；这些整轮采样不能排除短窗口�
 更早36次四类原ELF无插件筛选中，4KiB窗口相对清页核为−17.15%、shared-OFD为+1.89%，
 但部分其他窗口漂移超过2%；所测核SHA-256为`5decd2e78082270a0cb52347976849e5b2f7c40c0d5083f3253504771a65af73`，
 不含后来核对返回帧可信任务身份的修复，不能替代当前候选的正式校准。
-**本轮结果为测量未决，优化尝试结束；FS-Off未进入main，B3成本收口及RV两核转换仍暂停。**
+**两次正式校准均为测量未决；FS-Off未进入main，B3成本收口及RV两核转换仍暂停。**
 不追加样本、筛除慢副本或降低精度与3%门槛；剩余波动未取得唯一归因。
 后续只读归因入口见[执行器诊断](../modules/kernel-cost.md#只读执行器归因)。它将vCPU线程CPU时间、
 宿主切换计数、TB生成/执行代理与内核入口事件分开记录，避免把wall−CPU当作抢占时长，
@@ -1006,6 +1006,44 @@ core/package节流计数没有增加；这些整轮采样不能排除短窗口�
 
 ```sh
 python3 -B tests/cost-match-riscv.py --verify build/b3-fs-off-match
+```
+
+只读归因使用同一`9791fed`候选与原latency/locking ELF，按三个seed正序/逆序各执行一次，
+共12次独立启动、108个原窗口。`311b532`工具的离线核对通过完整输入、实际exec argv、
+原工作量/native wait status与自然退出门禁；heap-live全部为0、可用页全部为130009，
+latency/locking每次分别回收10/173个任务栈。以下为同seed `0xb30020261011` 的成对观察，
+单位为ms；两列均执行同一个核，不能解释为版本回退：
+
+| 目标／启动序号（从0计） | 客体窗口 | vCPU线程CPU时间 | wall−CPU | 新生成TB | TB指令工作代理 |
+|---|---:|---:|---:|---:|---:|
+| 复制唤醒4KiB／2→9 | 10.0465→16.0145 | 10.0311→15.0144 | 0.0647→1.0462 | 981→1059 | 885334→1348801 |
+| shared-OFD 32等待者／3→8 | 30.6761→40.9476 | 30.3601→39.2247 | 0.3193→1.7283 | 49→103 | 10937695→10979323 |
+
+12次整启动均无全库code-cache flush。OFD慢窗口生成的103个TB都位于此前未翻译的PC，
+首次执行FS均为0；新增路径包括`jbd_journal_checkpoint`、块批量提交及prepared资源释放。
+复制慢窗口出现`jbd_journal_prepare/freeze`，kernel memcpy代理增加414972、memset增加38364。
+共享helper没有调用者分账，代理不能直接换算成journal复制字节。对应固定候选源码
+`fs/ext4_backend.c:journal_worker`按真实期限/通知推进；`third_party/lwext4/src/ext4.c:ext4_group_due`
+包含首脏100ms、容量与强制条件，`ext4_journal_group_service`串起freeze、submit/checkpoint和retire。
+本次确认了后台阶段进入计时窗口，未记录具体封口原因；不能为缩小波动停止worker或删除版本复制。
+
+同seed `0xb30020261010` 的复制窗口0→11，TB生成、执行代理和所选入口计数完全相同，
+vCPU时间只增加6.747µs，wall−CPU减少168.920µs，客体时间下降162.100µs；
+宿主非自愿切换数7→2。这确认了独立于上述工作量代理的等待变化，切换数本身不提供离核时长。
+CPU3整启动非idle占比为0%–11.765%，没有core/package节流计数增量；这不是目标窗口的同步采样。
+CPU策略字段逐启动核对通过，结束后powersave、400000/4500000kHz及原EPP恢复且errors为空。
+两端`scaling_cur_freq`读数不能证明业务窗口频率恒定。
+
+**诊断完成，成本仍未决。** OFD慢窗口的vCPU时间增加29.20%、执行代理仅增加0.381%；
+冷翻译、执行成本与宿主干扰尚未完成定量分解。instrumented结果不能拼入正式OFF成绩，
+插件会移动定时交错，该journal峰与原OFF校准慢峰的对应关系尚未证实。
+新增3%、±1%校准与95%误差上界均未放宽，不追加启动或据此宣称性能收口。
+观测插件SHA-256为`05ac63bfdc30e0cd27e324cb2fda09db9a3dc647c9694e137641c5bc072bd1f5`，
+实际QEMU仍为11.1.2及既有冻结SHA；完整复核入口为：
+
+```sh
+python3 -B tests/cost-diagnostic-riscv.py --verify build/b3-residual-diagnostic
+riscv64-linux-gnu-nm -S -n build/data-path-baselines/sync-b3/fs-off-1.elf
 ```
 
 更早执行器的`NoNewPrivs=1`、0次启动记录保持环境阻塞归属。

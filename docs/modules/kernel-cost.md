@@ -329,3 +329,6 @@ python3 -B tests/cost-diagnostic-riscv.py --verify build/residual-diagnostic-new
 `kernel/sys.c`定义RUSAGE_THREAD；`references/qemu@84f07211cc5b4fc6a371559bf8a5de4fb068e648`
 的`target/riscv/cpu.h`与`tcg/tcg-cpu.c`定义FS翻译键。实际插件编译头、QEMU二进制及工具SHA
 由manifest另行封存，参考源码版本不替代执行器身份。
+固定FS-Off核的12次诊断已通过108个原窗口及完整自然退出核对，策略恢复无错误。
+已确认后台journal阶段与等待变化，剩余定量边界见[当前成本结论](../learning/cost-baseline.md#共享调度域的匹配时间)；
+该结果没有性能通过资格，不替代正式校准。
