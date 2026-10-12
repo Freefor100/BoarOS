@@ -2115,6 +2115,10 @@ test-mm-shared-concurrency-host:
 	timeout 30s build/host/mm/shared
 
 .PHONY: test-mm-file-concurrency-host
+.PHONY: test-page-cache-concurrency-host
+test-page-cache-concurrency-host:
+	sh tests/page-cache-concurrency-host.sh
+
 test-mm-file-concurrency-host:
 	@mkdir -p build/host/mm
 	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -ffunction-sections -fdata-sections \

@@ -317,6 +317,17 @@ make test-root-init-riscv
 
 ## 后台写回与水位回收
 
+受控磁盘缓存使用 `kernel_page_cache_init_controlled()` 私有构造，数据页和缓存
+metadata 位于独立 heap/allocator，不注册系统压力 hook；普通缓存初始化保持原契约。
+其索引由 rank45 mutex 保护，候选分配、数据初始化和后端 I/O 在保护外进行。
+远端冷读请求借用调用者的等待现场及文件 owner，由既有 CPU0 worker 执行；排队不
+发布 loading 页，worker 取得 inode 保护后重新查询并取得唯一加载资格。
+查询在索引保护内先借用 entry，再在锁外取得物理页引用；缓存命中不排队。
+停止先拒绝新请求，已执行读取完成后才归还请求现场，未执行请求返回 STATE。
+`make test-page-cache-concurrency-host` 链接真实 VFS/lwext4 和镜像块读写，在4/16 KiB、
+2/4宿主线程下检查冷读合并、预热命中、读失败、停止交接及最终资源；这是缓存入口
+证据，尚不构成磁盘 MM、写回别名或客户机两核验收。
+
 每个当前页缓存实例拥有一个 joinable worker；worker 借用 cache/record，调用者必须保持它们有效直到 stop/join 返回。根盘运行期启动、用户磁盘挂载时创建，所属实例卸载前停止并回收。空闲低/高水位为受管页 2%/4%，脏页启动/停止为 10%/5%，小配置至少一页且阈值严格有序。没有周期清脏。分配器和持锁路径只发布请求，低水位先回收无别名/额外引用的干净页，再写回合格脏页；仅脏阈值触发则保留清洁缓存。
 
 每批最多扫描 64 个哈希槽并让出 CPU；写回跨睡眠固定 entry 和 inode，保存槽游标而不保存可能失效的 LRU 指针。每轮代次防止扩容或重新变脏导致重复处理，无进展即等待新事件。启动持有专用 4 KiB 写回快照，后端 metadata 仍可能 ENOMEM，不是完整应急池。映射重新设保护与 generation 协议保持不变，旧完成不能清除新修改。写回错误留在 inode/mount，当前失败页在成功前不计入 MemAvailable；同一轮继续处理其他对象。后台完成不替代 fsync/fdatasync 的错误观察与 flush。

@@ -83,6 +83,22 @@ enum kernel_page_cache_status kernel_page_cache_init(
     struct kernel_heap *heap,
     struct physical_page_allocator *allocator);
 
+/* CPU0私有构造；独立allocator不得带系统压力hook。调用者持有cache至
+ * 全部MM/请求/别名结束并stop/join，末次后端清理仍由CPU0完成。 */
+enum kernel_page_cache_status kernel_page_cache_init_controlled(
+    struct kernel_page_cache *cache, struct kernel_heap *heap,
+    struct physical_page_allocator *allocator);
+int kernel_page_cache_check_domain(const struct kernel_page_cache *cache,
+    const struct kernel_heap *heap, const struct physical_page_allocator *allocator);
+struct kernel_page_cache_concurrency_state {
+    uint64_t requests_queued, requests_completed, entry_borrows;
+    uint32_t pending, running;
+    size_t entry_bytes, record_bytes, request_bytes;
+};
+/* 已有cache owner下的值快照；不固定业务状态，不扫描缓存或取得新引用。 */
+void kernel_page_cache_get_concurrency_state(struct kernel_page_cache *,
+    struct kernel_page_cache_concurrency_state *);
+
 /* Returns an owned physical-page reference that the caller must release. */
 enum kernel_page_cache_status kernel_page_cache_get(
     struct kernel_page_cache *cache,

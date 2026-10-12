@@ -22,6 +22,9 @@ void *sync_test_cpu(void)
 void mm_test_attach(unsigned id)
 {
     kernel_cpu_initialize(&cpu, id, &io);
+#if BOAROS_MAX_CPUS > 1
+    cpu.logical_id = id;
+#endif
     assert(!pthread_once(&domain_once, kernel_wait_domain_init));
     assert(id < 16); actor_id = id;
     actor = (struct mm_test_actor){0};

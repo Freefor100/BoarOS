@@ -177,3 +177,22 @@ python3 -B tests/host/virtio_block_diagnostics.py pre-park
 make test-virtio-block-host test-wait-host test-io-sleep-riscv
 make test-block-loongarch test-root-io-loongarch test-pci-reset-owner-loongarch INIT_CONFIG=config/init.json
 ```
+
+## 受控缓存的冷读交接
+
+`kernel_page_cache_init_controlled()` 使用无压力hook的独立 arena。缓存加载资格仍由
+CPU0取得；远端排队的请求不先建立loading项，否则CPU0文件写入可能持inode锁等
+loading，而请求执行者正等同一inode锁。CPU0先取得inode保护，再查缓存并发布
+loading；远端命中在索引保护内借用entry，锁外取得物理引用后归还存储借用。
+请求节点驻留调用者等待现场，完成前不能退栈。停止取消未执行请求，并等待真实
+在途读取返回，不能用取消通知代替后端完成。
+
+本地 `make test-page-cache-concurrency-host` 使用真实VFS/lwext4、镜像块I/O与生产
+park，在4/16 KiB、2/4线程下核对一次同页加载、失败合并、命中不排队和停止交接；
+最终mount/cache/页/堆归还并执行e2fsck。原RV `test-io-sleep-riscv` 的四个
+legacy/modern、writeback/writethrough profile也通过。此处只证明缓存入口和原
+单核存储退化，磁盘MM及共享写回需要其实际消费者独立验收。
+
+同编译配置的尺寸对照：entry保持200字节（256字节slab）；record由480增至656
+字节（512→1024字节slab），代价为每实例512字节容量增量；请求为96字节栈现场，
+没有每缺页请求堆分配或新worker栈。这里记录结构成本，不推定运行性能改善。
