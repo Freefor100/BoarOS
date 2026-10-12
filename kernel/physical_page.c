@@ -1568,7 +1568,7 @@ void kernel_memory_snapshot(const struct physical_page_allocator *allocator,
     out->total = physical_page_total(allocator) * BOAROS_PAGE_SIZE;
     out->free = physical_page_available(allocator) * BOAROS_PAGE_SIZE;
     out->available = out->free;
-    out->shared = allocator->shared_anon_pages * BOAROS_PAGE_SIZE;
+    out->shared = __atomic_load_n(&allocator->shared_anon_pages, __ATOMIC_ACQUIRE) * BOAROS_PAGE_SIZE;
     out->cached = out->shared;
     if (allocator->buffer_bytes)
         out->buffers = allocator->buffer_bytes(allocator->buffer_context);

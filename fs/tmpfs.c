@@ -362,8 +362,8 @@ static int statfs(struct kernel_vfs_mount *mount, struct kernel_vfs_statfs *s)
 {
     struct tmp_mount *m=tm(mount->private_data);
     *s=(struct kernel_vfs_statfs){.type=0x01021994,.block_size=BOAROS_PAGE_SIZE,.blocks=m->pages.limit,
-        .free_blocks=m->pages.limit ? m->pages.limit-m->pages.used : 0,
-        .available_blocks=m->pages.limit ? m->pages.limit-m->pages.used : 0,
+        .free_blocks=m->pages.limit ? m->pages.limit-__atomic_load_n(&m->pages.used, __ATOMIC_ACQUIRE) : 0,
+        .available_blocks=m->pages.limit ? m->pages.limit-__atomic_load_n(&m->pages.used, __ATOMIC_ACQUIRE) : 0,
         .inodes=m->inode_limit,.free_inodes=m->inode_limit ? m->inode_limit-m->inode_count : 0,
         .fsid=mount->id,.name_length=255,.flags=m->instance.read_only ? 1 : 0}; return 0;
 }
@@ -502,7 +502,7 @@ static int unmount(struct kernel_vfs_mount *mount)
         remove_entry(m, m->entries);
     }
     while(m->inodes) { m->inodes->links=0; collect_inode(m,m->inodes); }
-    if(m->pages.used || m->inode_count) __builtin_trap();
+    if(__atomic_load_n(&m->pages.used, __ATOMIC_ACQUIRE) || m->inode_count) __builtin_trap();
     struct kernel_heap *heap=m->instance.heap;
     if(kernel_heap_release(heap,m)!=KERNEL_HEAP_STATUS_OK) __builtin_trap();
     return 0;

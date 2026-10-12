@@ -2007,7 +2007,20 @@ test-sync-host:
 	build/host/sync
 	python3 -B tests/sync/test_native.py
 
-.PHONY: test-mm-pin-host
+.PHONY: test-mm-pin-host test-memory-object-concurrency-host
+test-memory-object-concurrency-host:
+	@mkdir -p build/host/mm
+	@set -e; for shift in 12 14; do \
+		cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -ffunction-sections -fdata-sections \
+		-DBOAROS_PAGE_SHIFT=$$shift -Itests/host/mm -Itests/host/sync -idirafter include \
+		tests/host/memory_object_concurrency.c tests/host/mm/context.c \
+		kernel/cpu.c kernel/raw_lock.c kernel/sched/sync.c kernel/sched/park.c \
+		kernel/physical_page.c mm/heap.c mm/memory_object.c \
+		-Wl,--gc-sections,--wrap=physical_page_acquire,--wrap=kernel_heap_allocate_zeroed \
+		-o build/host/mm/object-$$shift; \
+		timeout 30s build/host/mm/object-$$shift; \
+	done
+
 test-mm-pin-host:
 	@mkdir -p build/host/mm
 	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -ffunction-sections -fdata-sections \

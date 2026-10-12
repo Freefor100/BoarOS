@@ -17,6 +17,10 @@
 映射缺页按需实例化。文件缺页接口返回本次是否新建；失败先释放临时 pin，
 仅撤销地址仍匹配且没有其他引用的新页；已有页不回滚。inode 锁 rank 30，
 对象锁 rank 35；对象分配禁止递归进入可睡眠脏页回收。
+对象引用采用原子非零/溢出检查，末次引用唯一负责销毁；每次对象操作必须由实际owner覆盖。
+跨对象预算及allocator共享页计数在后备页发布时原子收费，失败准备归还自己的页/metadata，
+PTE、fork及pin不重复收费。驻留数/statfs使用值读取，不承诺跨对象全局原子快照。
+对象索引仍使用原mutex；预算绑定/上限在私有构造期确定。此基础同步不开放tmpfs业务跨核。
 
 截断先撤销越界的所有 MM 映射（含私有 COW），再释放对象的越界页并清零
 末页尾部。私有 COW 仍属于 MM；文件尾页清零不改写独立私有副本。
@@ -57,6 +61,7 @@ SysV 共享内存已由共用内存后备对象实现。挂载扩展的剩余工
 
 ```sh
 make test-vma-riscv test-files-riscv
+make test-memory-object-concurrency-host
 make test-diff-abi-riscv
 make test-userland-riscv
 make test-root-multi-block-riscv

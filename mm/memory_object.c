@@ -3,7 +3,6 @@
 #include <kernel/physical_page.h>
 #include <kernel/memory_object.h>
 #include <kernel/sync.h>
-#include <arch/context.h>
 
 #include <stddef.h>
 #include <stdint.h>
@@ -27,16 +26,30 @@ struct kernel_memory_object {
     uint32_t references;
 };
 
+/* 只在实际后备页发布/撤销时收费；PTE及临时页引用不重复记账。 */
+static int charge(uint64_t *counter, uint64_t limit)
+{
+    uint64_t value = __atomic_load_n(counter, __ATOMIC_RELAXED);
+    for (;;) {
+        if (value == UINT64_MAX) __builtin_trap();
+        if (limit && value >= limit) return 0;
+        if (__atomic_compare_exchange_n(counter, &value, value + 1, 1,
+            __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) return 1;
+    }
+}
+static void uncharge(uint64_t *counter)
+{
+    uint64_t value = __atomic_load_n(counter, __ATOMIC_RELAXED);
+    for (;;) {
+        if (!value) __builtin_trap();
+        if (__atomic_compare_exchange_n(counter, &value, value - 1, 1,
+            __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) return;
+    }
+}
 static void unaccount_page(struct kernel_memory_object *object)
 {
-    uintptr_t irq = arch_interrupt_save();
-    if (!object->allocator->shared_anon_pages) __builtin_trap();
-    object->allocator->shared_anon_pages--;
-    if (object->budget) {
-        if (!object->budget->used) __builtin_trap();
-        object->budget->used--;
-    }
-    arch_interrupt_restore(irq);
+    uncharge(&object->allocator->shared_anon_pages);
+    if (object->budget) uncharge(&object->budget->used);
 }
 
 static size_t bucket_for(uint64_t index, size_t bucket_count)
@@ -54,7 +67,7 @@ static enum kernel_memory_object_status grow_buckets(
     size_t capacity;
     enum kernel_heap_status status;
 
-    if (object->page_count / 2U < object->bucket_count)
+    if (__atomic_load_n(&object->page_count, __ATOMIC_RELAXED) / 2U < object->bucket_count)
         return KERNEL_MEMORY_OBJECT_OK;
     if (object->bucket_count > SIZE_MAX / 2U / sizeof(*buckets))
         return KERNEL_MEMORY_OBJECT_NO_MEMORY;
@@ -121,22 +134,25 @@ enum kernel_memory_object_status kernel_memory_object_create(
 enum kernel_memory_object_status kernel_memory_object_acquire(
     struct kernel_memory_object *object)
 {
-    if (object == 0 || object->references == 0U ||
-        object->references == UINT32_MAX)
-        return KERNEL_MEMORY_OBJECT_STATE;
-    object->references++;
-    return KERNEL_MEMORY_OBJECT_OK;
+    if (!object) return KERNEL_MEMORY_OBJECT_STATE;
+    uint32_t value = __atomic_load_n(&object->references, __ATOMIC_RELAXED);
+    for (;;) {
+        if (!value || value == UINT32_MAX) return KERNEL_MEMORY_OBJECT_STATE;
+        if (__atomic_compare_exchange_n(&object->references, &value, value + 1, 1,
+            __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) return KERNEL_MEMORY_OBJECT_OK;
+    }
 }
 
 void kernel_memory_object_release(struct kernel_memory_object **object)
 {
     struct kernel_memory_object *owner;
 
-    if (object == 0 || *object == 0 || (*object)->references == 0U)
+    if (object == 0 || *object == 0 || __atomic_load_n(&(*object)->references, __ATOMIC_ACQUIRE) == 0U)
         __builtin_trap();
     owner = *object;
     *object = 0;
-    if (--owner->references != 0U) return;
+    if (__atomic_fetch_sub(&owner->references, 1, __ATOMIC_ACQ_REL) != 1) return;
+    /* 末次owner唯一负责销毁；所有操作的实际对象引用都已结束。 */
     for (size_t bucket = 0U; bucket < owner->bucket_count; bucket++) {
         struct kernel_memory_object_page *page = owner->buckets[bucket];
 
@@ -171,7 +187,7 @@ enum kernel_memory_object_status kernel_memory_object_get_page(
     void *bytes;
 
     if (object == 0 || physical_address == 0 || created == 0 ||
-        object->references == 0U) return KERNEL_MEMORY_OBJECT_STATE;
+        __atomic_load_n(&object->references, __ATOMIC_ACQUIRE) == 0U) return KERNEL_MEMORY_OBJECT_STATE;
     KERNEL_LOCK_SCOPE(guard);
     kernel_mutex_lock(&object->lock, &guard);
     bucket = bucket_for(page_index, object->bucket_count);
@@ -184,7 +200,7 @@ enum kernel_memory_object_status kernel_memory_object_get_page(
         *created = 0;
         return KERNEL_MEMORY_OBJECT_OK;
     }
-    if (object->budget && object->budget->limit && object->budget->used >= object->budget->limit)
+    if (object->budget && object->budget->limit && __atomic_load_n(&object->budget->used, __ATOMIC_ACQUIRE) >= object->budget->limit)
         return KERNEL_MEMORY_OBJECT_NO_SPACE;
     status = grow_buckets(object);
     if (status != KERNEL_MEMORY_OBJECT_OK) return status;
@@ -208,27 +224,23 @@ enum kernel_memory_object_status kernel_memory_object_get_page(
         __builtin_trap();
     for (size_t i = 0U; i < BOAROS_PAGE_SIZE; i++)
         ((unsigned char *)bytes)[i] = 0U;
-    uintptr_t irq = arch_interrupt_save();
-    /* 多个 inode 共用预算；分配后再次核对并与发布原子记账。 */
-    if (object->budget && object->budget->limit &&
-        object->budget->used >= object->budget->limit) {
-        arch_interrupt_restore(irq);
-        if (physical_page_release(object->allocator, page->physical_address) != PHYSICAL_PAGE_STATUS_OK ||
-            kernel_heap_release(object->heap, page) != KERNEL_HEAP_STATUS_OK) __builtin_trap();
-        return KERNEL_MEMORY_OBJECT_NO_SPACE;
-    }
     if (physical_page_acquire(object->allocator, page->physical_address) !=
         PHYSICAL_PAGE_STATUS_OK) __builtin_trap();
+    /* 先完成私有的object/PTE页引用准备，再CAS竞争跨对象预算；失败归还两份。 */
+    if (object->budget && !charge(&object->budget->used, object->budget->limit)) {
+        physical_page_release(object->allocator, page->physical_address);
+        physical_page_release(object->allocator, page->physical_address);
+        kernel_heap_release(object->heap, page);
+        return KERNEL_MEMORY_OBJECT_NO_SPACE;
+    }
+    if (!charge(&object->allocator->shared_anon_pages, 0)) __builtin_trap();
     page->index = page_index;
     bucket = bucket_for(page_index, object->bucket_count);
     page->next = object->buckets[bucket];
     object->buckets[bucket] = page;
-    object->page_count++;
-    if (object->budget) object->budget->used++;
-    object->allocator->shared_anon_pages++;
+    __atomic_fetch_add(&object->page_count, 1, __ATOMIC_RELEASE);
     *physical_address = page->physical_address;
     *created = 1;
-    arch_interrupt_restore(irq);
     return KERNEL_MEMORY_OBJECT_OK;
 }
 
@@ -239,7 +251,7 @@ void kernel_memory_object_discard_new_page(
     struct kernel_memory_object_page **link;
     uint32_t references;
 
-    if (object == 0 || object->references == 0U) __builtin_trap();
+    if (object == 0 || __atomic_load_n(&object->references, __ATOMIC_ACQUIRE) == 0U) __builtin_trap();
     KERNEL_LOCK_SCOPE(guard);
     kernel_mutex_lock(&object->lock, &guard);
     link = &object->buckets[bucket_for(page_index, object->bucket_count)];
@@ -253,7 +265,7 @@ void kernel_memory_object_discard_new_page(
     if (references != 1U) return;
     struct kernel_memory_object_page *page = *link;
     *link = page->next;
-    object->page_count--;
+    __atomic_fetch_sub(&object->page_count, 1, __ATOMIC_RELEASE);
     unaccount_page(object);
     if (physical_page_release(object->allocator, physical_address) !=
             PHYSICAL_PAGE_STATUS_OK ||
@@ -264,7 +276,7 @@ void kernel_memory_object_discard_new_page(
 enum kernel_memory_object_status kernel_memory_object_find_page(
     struct kernel_memory_object *object, uint64_t index, uint64_t *address)
 {
-    if (!object || !object->references || !address) return KERNEL_MEMORY_OBJECT_STATE;
+    if (!object || !__atomic_load_n(&object->references, __ATOMIC_ACQUIRE) || !address) return KERNEL_MEMORY_OBJECT_STATE;
     KERNEL_LOCK_SCOPE(guard);
     kernel_mutex_lock(&object->lock, &guard);
     for (struct kernel_memory_object_page *p = object->buckets[bucket_for(index, object->bucket_count)];
@@ -279,11 +291,11 @@ enum kernel_memory_object_status kernel_memory_object_find_page(
 }
 
 uint64_t kernel_memory_object_resident_pages(const struct kernel_memory_object *object)
-{ if (!object || !object->references) __builtin_trap(); return object->page_count; }
+{ if (!object || !__atomic_load_n(&object->references, __ATOMIC_ACQUIRE)) __builtin_trap(); return __atomic_load_n(&object->page_count, __ATOMIC_ACQUIRE); }
 
 void kernel_memory_object_truncate(struct kernel_memory_object *object, uint64_t size)
 {
-    if (!object || !object->references) __builtin_trap();
+    if (!object || !__atomic_load_n(&object->references, __ATOMIC_ACQUIRE)) __builtin_trap();
     KERNEL_LOCK_SCOPE(guard);
     kernel_mutex_lock(&object->lock, &guard);
     uint64_t last = size >> BOAROS_PAGE_SHIFT;
@@ -294,7 +306,7 @@ void kernel_memory_object_truncate(struct kernel_memory_object *object, uint64_t
             struct kernel_memory_object_page *page = *link;
             if (page->index > last || (page->index == last && !tail)) {
                 *link = page->next;
-                object->page_count--;
+                __atomic_fetch_sub(&object->page_count, 1, __ATOMIC_RELEASE);
                 unaccount_page(object);
                 (void)physical_page_release(object->allocator, page->physical_address);
                 if (kernel_heap_release(object->heap, page) != KERNEL_HEAP_STATUS_OK) __builtin_trap();
@@ -315,6 +327,17 @@ void kernel_memory_object_truncate(struct kernel_memory_object *object, uint64_t
 void kernel_memory_object_set_budget(struct kernel_memory_object *object,
                                       struct kernel_memory_budget *budget)
 {
-    if (!object || object->page_count || object->budget) __builtin_trap();
+    if (!object || __atomic_load_n(&object->page_count, __ATOMIC_ACQUIRE) || object->budget) __builtin_trap();
     object->budget = budget;
+}
+
+enum kernel_memory_object_status kernel_memory_object_check_domain(
+    const struct kernel_memory_object *object, const struct kernel_heap *heap,
+    const struct physical_page_allocator *allocator)
+{
+    if (!object || !heap || !allocator ||
+        !__atomic_load_n(&object->references, __ATOMIC_ACQUIRE) ||
+        object->heap != heap || object->allocator != allocator || object->budget)
+        return KERNEL_MEMORY_OBJECT_STATE;
+    return KERNEL_MEMORY_OBJECT_OK;
 }
