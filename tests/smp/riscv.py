@@ -66,21 +66,25 @@ def boot(qemu, firmware, kernel, memory, cpus, output, profile="normal", contrac
     output.with_suffix(".json").write_text(json.dumps(report, indent=2) + "\n")
     if timed_out or process.returncode or len(report["vcpu_threads"]) != cpus:
         raise RuntimeError(f"QEMU execution failed: {report}")
-    if contract in ("mm", "mm-shared"):
+    if contract in ("mm", "mm-shared", "mm-file"):
         if profile != "normal":
             validate_mm_failure(text, profile, contract)
-            print(f"RV anonymous MM profile={profile} RAM={memory} expected fault; recovery unverified", flush=True)
+            print(f"RV {contract} profile={profile} RAM={memory} expected fault; recovery unverified", flush=True)
             return
         required = ("MM SMP native pin/permission/retirement/U-execute contracts passed",
                     "MM arena closure live=0x0 heap-pages=0x0",
                     "MM SMP natural exit arena/MM/pin/table/stack/wait owners returned")
-        if contract == "mm-shared":
+        if contract in ("mm-shared", "mm-file"):
             required += ("shared MM cross-root/fault/protected/migration/RFENCE owners passed",)
+        if contract == "mm-file":
+            required += ("file MM stale preparation/EOF/regrowth/private COW passed",
+                         "file MM real tmpfs cross-root/source/registration/pin/RFENCE owners passed",
+                         "file MM controller/OFD/registration/private mount owners returned")
         if any(marker not in text for marker in required) or "SMP failure" in text or "SMP fatal" in text:
             raise RuntimeError(f"missing native MM closure:\n{text[-4000:]}")
         if cpus == 2 and "SMP online logical=1 hart=" not in text:
             raise RuntimeError("MM test did not publish the secondary CPU")
-        print(f"RV anonymous MM cpus={cpus} RAM={memory} native exit and owner closure passed", flush=True)
+        print(f"RV {contract} cpus={cpus} RAM={memory} native exit and owner closure passed", flush=True)
         return
     if profile != "normal":
         expected = {"missing-rfence": "SMP failure stage=SBI-extension",
@@ -115,10 +119,12 @@ def validate_mm_failure(text, profile, contract="mm"):
         "rfence-error": ("SMP failure stage=MM-RFENCE", "MM RFENCE error retains data/table batch owners"),
         "mm-fence-i": ("SMP failure stage=MM-FENCE.I", "MM FENCE.I error retains live MM/code owners"),
     }
-    if contract == "mm-shared":
+    if contract in ("mm-shared", "mm-file"):
         if profile != "rfence-error": raise ValueError("unsupported shared MM failure profile")
         required[profile] = ("SMP failure stage=MM-RFENCE", "shared MM RFENCE error retains object/pin/data/table owners")
     elif contract != "mm": raise ValueError("unsupported MM failure contract")
+    if contract == "mm-file":
+        required["rfence-error"] += ("file MM RFENCE error retains source/registration/data/table owners",)
     if profile not in required:
         raise ValueError("unsupported MM failure profile")
     if any(marker not in text for marker in required[profile]) or "natural exit" in text:
@@ -132,9 +138,9 @@ def main():
     parser.add_argument("--kernel", type=Path, required=True)
     parser.add_argument("--output", type=Path, default=Path("build/riscv-smp/runs"))
     parser.add_argument("--profile", choices=("normal", "missing-rfence", "denied-start", "guard", "denied-stop", "rfence-error", "mm-fence-i"), default="normal")
-    parser.add_argument("--contract", choices=("scheduler", "mm", "mm-shared"), default="scheduler")
+    parser.add_argument("--contract", choices=("scheduler", "mm", "mm-shared", "mm-file"), default="scheduler")
     args = parser.parse_args()
-    if (args.contract == "mm-shared" and args.profile not in ("normal", "rfence-error")) or (args.contract == "mm" and args.profile not in ("normal", "rfence-error", "mm-fence-i")) or (args.contract != "mm" and args.profile == "mm-fence-i"):
+    if (args.contract in ("mm-shared", "mm-file") and args.profile not in ("normal", "rfence-error")) or (args.contract == "mm" and args.profile not in ("normal", "rfence-error", "mm-fence-i")) or (args.contract != "mm" and args.profile == "mm-fence-i"):
         parser.error("profile does not belong to the selected contract")
     for cpus in ((2, 1) if args.profile == "normal" else (2,)):
         for memory in ("512M", "1G"):

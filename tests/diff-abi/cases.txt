@@ -1099,6 +1099,7 @@ proc.exe-deleted-open
 proc.exe-deleted-magic
 proc.readonly-unmount
 tmpfs.mount
+tmpfs.allocated-block-units
 tmpfs.quota
 tmpfs.busy
 tmpfs.unmount

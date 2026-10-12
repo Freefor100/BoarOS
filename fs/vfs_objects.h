@@ -36,7 +36,7 @@ struct kernel_vfs_node {
     struct kernel_page_cache_entry *cache_pages;
     struct kernel_page_cache_dirty dirty_cache_pages;
     struct kernel_memory_object *memory;
-    struct kernel_file_mapping *mappings;
+    struct kernel_file_mapping_state *mapping_state;
     struct kernel_record_lock_state record_locks;
     struct kernel_vfs_instance *instance;
     struct kernel_vfs_mount *mount;

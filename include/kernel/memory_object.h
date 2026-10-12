@@ -28,6 +28,10 @@ enum kernel_memory_object_status {
 enum kernel_memory_object_status kernel_memory_object_check_domain(
     const struct kernel_memory_object *, const struct kernel_heap *,
     const struct physical_page_allocator *);
+/* 已持owner的内存文件验证真实实例预算；不放宽匿名域的无budget规则。 */
+enum kernel_memory_object_status kernel_memory_object_check_budget_domain(
+    const struct kernel_memory_object *, const struct kernel_heap *,
+    const struct physical_page_allocator *, const struct kernel_memory_budget *);
 enum kernel_memory_object_status kernel_memory_object_create(
     struct kernel_heap *heap, struct physical_page_allocator *allocator,
     struct kernel_memory_object **object);

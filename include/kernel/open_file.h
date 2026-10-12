@@ -13,6 +13,12 @@ struct kernel_vfs_node;
 struct kernel_vfs_stat;
 struct kernel_socket;
 
+/* acquire needs an existing owner; atomic references cannot revive raw pointers.
+ * A controlled CPU1 memory-file fault only drops nonlast refs: CPU0 retains a
+ * controller ref until MM registrations and all preparation borrows drain.
+ * The sole last releaser performs backend cleanup. A zero-ref detached cleanup
+ * owner is retained on real cleanup errors and may retry; it is not a live ref. */
+
 /* Borrowed identity, valid while the regular-file OFD is owned. */
 struct kernel_vfs_node *kernel_open_file_node(
     const struct kernel_open_file_description *description);
@@ -126,6 +132,20 @@ int kernel_open_file_pipe_finish(struct kernel_heap *heap,
 
 int kernel_open_file_supports_epoll(
     const struct kernel_open_file_description *file);
+
+/* caller's actual OFD owner covers the claim through exactly one finish.
+ * prepare returns outside inode protection; pin is not a content snapshot.
+ * EBUSY means epoch closed, EFAULT means EOF, ENOSPC/ENOMEM retain no claim.
+ * accepted retains the page ref for caller/PTE; rejected consumes it. A copied
+ * source is accepted too, then caller returns its extra physical reference. */
+struct kernel_open_file_page_preparation {
+    uint64_t address, index, epoch, size;
+    uint32_t pending, created;
+};
+int kernel_open_file_prepare_memory_page(struct kernel_open_file_description *,
+    uint64_t index, struct kernel_open_file_page_preparation *);
+void kernel_open_file_finish_memory_page(struct kernel_open_file_description *,
+    struct kernel_open_file_page_preparation *, int accepted);
 
 enum kernel_open_file_status kernel_open_file_acquire(
     struct kernel_open_file_description *file);

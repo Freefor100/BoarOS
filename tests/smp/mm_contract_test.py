@@ -27,9 +27,15 @@ class MMReport(unittest.TestCase):
         for invalid in (text.replace('shared MM','MM'), text+'\nnatural exit',
                         'SMP failure stage=MM-RFENCE\nMM RFENCE error retains data/table batch owners'):
             with self.assertRaises(RuntimeError): runner.validate_mm_failure(invalid,'rfence-error','mm-shared')
+    def test_file_fault_requires_real_source_owner(self):
+        text='SMP failure stage=MM-RFENCE\nshared MM RFENCE error retains object/pin/data/table owners'
+        with self.assertRaises(RuntimeError): runner.validate_mm_failure(text,'rfence-error','mm-file')
+        runner.validate_mm_failure(text+'\nfile MM RFENCE error retains source/registration/data/table owners','rfence-error','mm-file')
     def test_invalid_mm_build_profiles_fail_before_build(self):
         for arguments, expected in (
             (['MM_SMP_TEST=1'], 'MM_SMP_TEST requires'),
+            (['MM_FILE_SMP_TEST=1'], 'MM_FILE_SMP_TEST requires'),
+            (['MM_FILE_SMP_TEST=2'], 'MM_FILE_SMP_TEST must be'),
             (['MM_SHARED_SMP_TEST=1'], 'MM_SHARED_SMP_TEST requires'),
             (['SMP=1', 'SMP_TEST=1', 'MM_SMP_TEST=1', 'MM_SHARED_SMP_TEST=2'], 'MM_SHARED_SMP_TEST must be'),
             (['SMP=1', 'SMP_TEST=1', 'MM_SMP_TEST=1', 'MM_SHARED_SMP_TEST=1', 'SMP_TEST_PROFILE=mm-fence-i'], 'MM_SHARED_SMP_TEST profile'),

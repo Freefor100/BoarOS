@@ -399,3 +399,15 @@ enum kernel_memory_object_status kernel_memory_object_check_domain(
         return KERNEL_MEMORY_OBJECT_STATE;
     return KERNEL_MEMORY_OBJECT_OK;
 }
+
+enum kernel_memory_object_status kernel_memory_object_check_budget_domain(
+    const struct kernel_memory_object *object, const struct kernel_heap *heap,
+    const struct physical_page_allocator *allocator,
+    const struct kernel_memory_budget *budget)
+{
+    if (!object || !heap || !allocator || !budget ||
+        !__atomic_load_n(&object->references, __ATOMIC_ACQUIRE) ||
+        object->heap != heap || object->allocator != allocator || object->budget != budget)
+        return KERNEL_MEMORY_OBJECT_STATE;
+    return KERNEL_MEMORY_OBJECT_OK;
+}

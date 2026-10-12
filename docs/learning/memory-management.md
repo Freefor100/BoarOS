@@ -671,3 +671,18 @@ creator因无关VMA代次变化重试，旧实现删掉对象页并丢失内容�
 
 组合fixture曾在fixed替换释放旧空表后继续用旧表地址核对引用，引发allocator fatal；
 改为在替换完成后重新捕获当前数据/表owner。双RAM静态/pthread重跑通过，生产回收契约未修改。
+
+文件登记不能仅在链表锁外保存裸next。摘队后仍在执行的回调需要其MM和来源存活；
+游标的退休后继借用覆盖继续遍历，注销等待该借用结束才释放记录，迭代归还限制raw段长。
+MM的实际清理owner等drain完成，使回调对MM存储的借用有根，不需要登记永久持MM引用形成自环。
+截断持inode IO30调用可能取得MM gate25的回调会倒置锁序；旧代次关闭后释放IO30，
+同步逐MM撤销，再取得IO30修改后备，将提交校验和回收连接起来。固定依据为
+`references/linux/mm/shmem.c:shmem_setattr`及`mm/truncate.c:truncate_pagecache`，commit
+`f4cdf7ca9a1fdcca413157df19753f388a5a224e`；Linux两次撤销封住COW竞态，
+这里的代次关闭要求旧准备在重查时退出，不能把第一次撤销当成停止所有旧提交。
+非调度的原文件fixture暴露了通知NOT_INITIALIZED：空等待队列保留未初始化状态，
+有注册或借用则必须完成真实通知，不伪造scheduler就绪。
+
+映射登记状态若内嵌，会让原 504 字节 ext4 包装超过 512 字节 slab。当前采用 inode 独占、首次映射准备的 88 字节状态，普通节点保持原尺寸；状态指针只取得一次发布快照，在已有 owner 下使用，不为每次字段访问重复 acquire。首次发布与无状态截断共享 inode I/O 保护，避免“查到没有登记后释放锁，首次映射进入旧尺寸”的窗口。关闭后仍有登记借用时，不得在 MM gate 下 drain，否则截断回调等待 gate、注销者等待回调形成环。
+
+固定 Linux `references/linux@f4cdf7ca9a1fdcca413157df19753f388a5a224e` 的 `mm/shmem.c:shmem_setattr` 与 `mm/truncate.c:truncate_pagecache` 先撤整页 EOF 后的别名，覆盖私有 COW；尾页处理保留私有内容与共享后备的区别。本实现用关闭代次禁止旧候选在撤销后重新提交，内部交接方式不同，用户可见 EOF、尾零和重新增长语义保持。`st_blocks` 的 512 字节单位与架构页大小独立，16 KiB 页不能继续按每页 8 块计费。

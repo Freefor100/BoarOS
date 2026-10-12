@@ -9,7 +9,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 BUILD = ROOT / 'build'
-KEEP_TOP = {'data-path-baselines', 'network-budget', 'io-budget', 'cost', 'riscv', 'riscv-smp', 'riscv-smp-test', 'riscv-mm-smp-test', 'riscv-mm-shared-smp-test', 'loongarch', 'qemu-la', 'qemu-la-rtc', 'linux-la', 'linux-la-platform', 'diff-abi', 'program-environment', 'program-libc', 'host', 'tools', 'offline-c'}
+KEEP_TOP = {'data-path-baselines', 'network-budget', 'io-budget', 'cost', 'riscv', 'riscv-smp', 'riscv-smp-test', 'riscv-mm-smp-test', 'riscv-mm-shared-smp-test', 'riscv-mm-file-smp-test', 'loongarch', 'qemu-la', 'qemu-la-rtc', 'linux-la', 'linux-la-platform', 'diff-abi', 'program-environment', 'program-libc', 'host', 'tools', 'offline-c'}
 KEEP_ROOT_FILES = {'elf-tail-rv', 'elf-tail-dynamic-rv', 'elf-tail-norelro-rv'}
 
 
@@ -43,9 +43,10 @@ def candidates():
             if kernels.is_dir():
                 result.extend(path for path in kernels.glob('*/build.log'))
 
-    for family in ('riscv-mm-smp-test', 'riscv-mm-shared-smp-test'):
-        mm_runs = BUILD / family / 'runs'
-        if mm_runs.is_dir(): result.append(mm_runs)
+    for family in ('riscv-mm-smp-test', 'riscv-mm-shared-smp-test', 'riscv-mm-file-smp-test'):
+        directory = BUILD / family
+        if directory.is_dir():
+            result.extend(p for p in directory.iterdir() if p.is_dir() and p.name.startswith('runs'))
 
     riscv = BUILD / 'riscv'
     smp_runs = BUILD / 'riscv-smp' / 'runs'

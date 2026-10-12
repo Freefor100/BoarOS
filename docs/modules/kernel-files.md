@@ -20,6 +20,12 @@
 清理若暂时不能完成，来源节点由 MM registry 保留为唯一 owner，不重复累积引用；物理页和堆释放
 遵循 fail-stop 不变量。
 
+OFD 引用采用非零/溢出检查的原子取得与归还，只有最后归还者进入后端清理；
+引用计数为零的 detached cleanup owner 仍可处理原有真实清理错误，不能重新 acquire。
+原子引用只保护存储寿命，不使 offset、设备或文件业务自动获得跨核同步。
+受控内存文件的控制者保留独立 OFD 引用，直到映射、登记和临时准备 owner 全部结束；
+因此 CPU1 只归还非末次引用，后端最终释放仍由 CPU0 执行。
+
 描述符表初始有 32 个槽，按 2 倍增长，硬上限为 1024。`RLIMIT_NOFILE` 的组级软限制约束新 fd 的编号；open、pipe、dup 和 `F_DUPFD*` 均通过该上限，降低限制不关闭已有 fd，也不阻止继续使用它们。限额保存在组长而非共享 fd 表中：即使不同组通过 `CLONE_FILES` 共用槽位，也各按自己的限额分配；每次 syscall 借用文件表时更新任务句柄的限额。分配总是从 `next_fd` 指示的最低可能空位向后搜索；关闭较小 fd 后会回退该提示，因此当前没有预装 stdin/stdout/stderr 时第一次成功打开返回 0。`O_CLOEXEC` 作为 descriptor flag 保存在槽上；exec 提交后批量摘除这些槽，其他 fd 和 open-file offset 保持不变。
 
 normal open、dup/F_DUPFD、console、pipe2 和 epoll_create1 最终都经过 `table.c` 的统一 fd 安装原语。新建 OFD 与调用者已 acquire 的共享 OFD 使用两个显式入口；两者都只消费传入 ownership，不暗中改变引用计数，并统一提交槽位、open/CLOEXEC 统计和 `next_fd`。表满或安装前失败不提交这些状态。
@@ -295,7 +301,7 @@ make test-riscv
 
 聚焦测试在真实 QEMU legacy 与 modern VirtIO/ext4 上覆盖绝对/相对路径、错误 flags、目录与缺失文件、4096 字节路径上限、最低 fd 复用、表扩容、统一 fd 安装统计、epoll 满表原子性、`O_CLOEXEC/O_NONBLOCK`、缓存命中后的跨页读取、EOF、部分 fault、fork 后 fd 表独立与 OFD offset 共享，以及 VFS orphan/I/O owner。stat 回归核对 regular/directory 的真实 inode metadata、allocated blocks、fstat/newfstatat 共同字段和 unlink-but-open 的零链接计数。它还在关闭 fd 后通过 MM backing 继续缺页，反复固定地址映射同一 OFD 并检查来源释放只发生一次，验证父子各自持有一份来源引用。生产 exec/clone 链验证普通 fd 与 offset 跨映像和父子保持、CLOEXEC fd 不可见，PID 1 的 stdio 与跨 exec 的 console 描述符由串口标记验证，并由最终资源基线证明退出清理生效。`make test-userland-riscv` 用静态和动态 musl 程序作为 PID 1 运行 stdio、readdir、read/lseek/fstat、dup、signal、pipe、pthread、TLS 和 dlopen；其中写打开普通文件的真实 `read/pread` 及其 dup 均验证 `EBADF`，是真实 U-mode 外部测例的入口。
 
-当前提供可共享的文件表与根 fs context handle，普通 clone 仍实现“复制表/复制 cwd、共享 OFD”；系统调用层是否选择共享由 clone flags 决定。当前已支持常规文件的读写（`write/writev/pwrite64/append`）、新建、删除（`unlinkat`）、截断（`truncate/ftruncate`）与目录修改（`mkdirat/rmdir`）及符号链接（`symlinkat/readlinkat`）；并支持 cwd/dirfd、普通/NOREPLACE rename；已有阈值驱动后台写回，仍无周期清脏或 read-ahead；linkat 硬链接、tmpfs 和独立第二 ext4 盘已接入，块节点用于挂载识别，裸设备 OFD 明确不支持。当前单 hart 下 fd lookup 与 OFD acquire 之间不可调度；启用 SMP 前必须为共享 record 引用、槽查找/替换、统计和 OFD 引用补齐同步，不能直接复用这些无锁字段。pipe 同样是单 hart 对象。生产 console 接收由 DTB UART IRQ 收割、worker 推进行规程；raw/tick 轮询只保留在未建立 transport 的独立模块 fixture。IRQ、worker 和任务运行延迟没有硬实时上界，具体 continuation、termios 与 owner 见[TTY 模块](kernel-tty.md)。
+当前提供可共享的文件表与根 fs context handle，普通 clone 仍实现“复制表/复制 cwd、共享 OFD”；系统调用层是否选择共享由 clone flags 决定。当前已支持常规文件的读写（`write/writev/pwrite64/append`）、新建、删除（`unlinkat`）、截断（`truncate/ftruncate`）与目录修改（`mkdirat/rmdir`）及符号链接（`symlinkat/readlinkat`）；并支持 cwd/dirfd、普通/NOREPLACE rename；已有阈值驱动后台写回，仍无周期清脏或 read-ahead；linkat 硬链接、tmpfs 和独立第二 ext4 盘已接入，块节点用于挂载识别，裸设备 OFD 明确不支持。OFD 引用已原子化；当前单 hart 下 fd lookup 与 OFD acquire 之间不可调度；启用 SMP 前必须为共享 record 引用、槽查找/替换、统计补齐同步，不能直接复用这些无锁字段。pipe 同样是单 hart 对象。生产 console 接收由 DTB UART IRQ 收割、worker 推进行规程；raw/tick 轮询只保留在未建立 transport 的独立模块 fixture。IRQ、worker 和任务运行延迟没有硬实时上界，具体 continuation、termios 与 owner 见[TTY 模块](kernel-tty.md)。
 
 字符设备节点由 ext4 提供名称和 `st_rdev`；`openat` 只按设备号查找 `fs/char_device.c` 的内建操作表，未知设备号返回 `ENXIO`。OFD 持有选定的静态操作及 open 创建的实例，read/write/poll/ioctl 从它分派；初始标准 fd 也取得同一 console 后端。启动时优先打开根盘已有的 5:1 `/dev/console`，使标准 fd 持有真实路径；只有该节点缺失才使用无路径 UART OFD。其他查找/I/O 错误明确中止启动，不伪装为节点缺失。该表在当前执行地址域中初始化回调，兼容分页前模块测试与生产高半区。console 的 UART 输入等待支持非阻塞 `EAGAIN` 和信号打断；null 读 EOF、写消费请求长度，zero 读按实际用户复制进度填零；两者不经过普通文件页缓存和 ext4 数据 I/O。设备 OFD 由 fd 表安装和引用，dup/fork 共享，关闭 fd 不撤销已 pin 的 I/O。`readv/writev/pread64/pwrite64/lseek/fstat/ppoll` 及 console 非阻塞读取经固定 Linux 差分验证；未知 ioctl 对有效 fd 返回 `ENOTTY`。另登记 1:8 random 和 1:9 urandom：random 读取等待可信源初始化，遵循固定 Linux 的 random_read_iter，O_NONBLOCK 在未就绪时返回 EAGAIN；urandom 允许未初始化的不安全流。random poll 未就绪报告可写，就绪报告可读；urandom 始终可读写。用户写入经 BLAKE2s 混种但不计可信熵。随机 ioctl 的 RNDGETENTCNT 返回已计入可信字节数乘 8（最多 256），坏输出地址返回 EFAULT；未知请求返回 EINVAL，尚未实现的特权注熵、清池与重播种请求明确返回 ENOTSUP，不声称增加熵成功。random 支持 epoll，urandom 遵循固定 Linux 无 poll 回调的 EPERM 边界。节点仍由用户态 mknodat 建立。serial transport 发布后另按 rdev 登记 ttyS0/console/tty，并提供 [TTY 会话与行规程](kernel-tty.md)。没有动态设备注册、设备 mmap 或 devfs。
 

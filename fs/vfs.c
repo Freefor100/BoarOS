@@ -1151,11 +1151,8 @@ static void apply_truncated_size(struct kernel_vfs_node *node,
         kernel_page_cache_extend(node->instance->page_cache, node, old_size, size);
     node->size = size;
     file->size = node->size;
-    if (node->size < old_size) {
-        for (struct kernel_file_mapping *mapping = node->mappings;
-             mapping != 0; mapping = mapping->next) {
-            mapping->truncate(mapping->owner, node, node->size);
-        }
+    if (node->size < old_size && !node->memory) {
+        kernel_file_mapping_notify(node, node->size);
     }
     if (size < old_size && node->instance->page_cache)
         kernel_page_cache_truncate(node->instance->page_cache, node, size);
@@ -1297,7 +1294,30 @@ int kernel_vfs_ftruncate(struct kernel_vfs_file *file,
     /* Even a same-size ftruncate updates mtime/ctime. Reconciliation also
      * preserves visible inode mutations when the backend reports an error. */
     if (size > node->max_size) return -KERNEL_EFBIG;
-    if (node->memory) apply_truncated_size(node, file, size);
+    if (node->memory) {
+        /* 关闭旧候选的发布，释放inode锁后才逐MM撤销。登记/OFD覆盖回调
+         * 寿命；缺页最终校验取得IO读锁，因此关闭与提交有唯一先后关系。 */
+        uint64_t old_size = node->size;
+        /* 首次状态发布同样取得 I/O 读保护。没有状态时保持写保护直到
+         * 后备提交，禁止在旧尺寸和新登记之间形成未关闭的窗口。 */
+        if (!__atomic_load_n(&node->mapping_state, __ATOMIC_ACQUIRE)) {
+            uint64_t actual;
+            int changed;
+            result = node->instance->ops->truncate(node, size, &actual, &changed);
+            if (changed) apply_truncated_size(node, file, actual);
+            return result;
+        }
+        kernel_file_mapping_close(node);
+        kernel_lock_release(&node_guard);
+        if (size < old_size) kernel_file_mapping_notify(node, size);
+        kernel_vfs_node_lock(node, &node_guard, 1);
+        uint64_t actual;
+        int changed;
+        result = node->instance->ops->truncate(node, size, &actual, &changed);
+        if (changed) apply_truncated_size(node, file, actual);
+        kernel_file_mapping_open(node);
+        return result;
+    }
     result = node->memory ? 0 : kernel_page_cache_writeback_before(node->instance->page_cache, node, size);
     if (result != 0) return result;
     uint64_t actual;
@@ -1850,27 +1870,6 @@ static void release_node_pin(struct kernel_vfs_node **owner)
     if (*owner && kernel_vfs_node_release(owner)) __builtin_trap();
 }
 
-void kernel_file_mapping_register(struct kernel_file_mapping *mapping)
-{
-    if (mapping == 0 || mapping->node == 0 || mapping->owner == 0 ||
-        mapping->truncate == 0 || mapping->previous != 0) {
-        __builtin_trap();
-    }
-    mapping->next = mapping->node->mappings;
-    mapping->previous = &mapping->node->mappings;
-    if (mapping->next != 0) mapping->next->previous = &mapping->next;
-    mapping->node->mappings = mapping;
-}
-
-void kernel_file_mapping_unregister(struct kernel_file_mapping *mapping)
-{
-    if (mapping->previous == 0) return;
-    *mapping->previous = mapping->next;
-    if (mapping->next != 0) mapping->next->previous = mapping->previous;
-    mapping->next = 0;
-    mapping->previous = 0;
-}
-
 int kernel_vfs_node_release(struct kernel_vfs_node **owner)
 {
     struct kernel_vfs_node *node;
@@ -1887,7 +1886,7 @@ int kernel_vfs_node_release(struct kernel_vfs_node **owner)
         return 0;
     }
     if (node->references == 1U) {
-        if (node->mappings != 0 || node->fifo_pipe || node->cache_pages ||
+        if (!kernel_file_mapping_empty(node) || node->fifo_pipe || node->cache_pages ||
             node->dirty_cache_pages.head || node->dirty_cache_pages.count) __builtin_trap();
         if (!kernel_record_lock_state_empty(&node->record_locks))
             __builtin_trap();
@@ -1919,6 +1918,7 @@ int kernel_vfs_node_release(struct kernel_vfs_node **owner)
         }
         node->closed = 1U;
     }
+    kernel_file_mapping_destroy(node);
     (void)kernel_heap_release(node->instance->heap, node);
     *owner = 0;
     return 0;
@@ -2560,6 +2560,7 @@ int kernel_vfs_publish_node(struct kernel_vfs_mount *mount,
         node->open_files = 1;
         kernel_mutex_init(&node->write_operation, 15, (uintptr_t)node);
         kernel_rwlock_init(&node->io_lock, 30, (uintptr_t)node);
+        kernel_file_mapping_init(node);
         kernel_record_lock_state_init(&node->record_locks);
         node->next = instance->nodes;
         instance->nodes = node;
