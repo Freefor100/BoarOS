@@ -13,12 +13,14 @@
 映射登记由 MM 持有，来源 OFD 维持 inode 寿命。inode 的 rank30 raw 仅保护登记、
 代次、关闭状态和借用；注销先停止新借用并摘链，再在 MM gate、inode I/O 和 raw 锁外 drain。
 退休后继持有真实借用，归还采用迭代分段，每段最多16项；记录及 MM 存储在 drain 前不能释放。
-截断通知在 inode I/O 和 raw 锁外同步执行，回调可以睡眠取得一个 MM gate。
+受控内存文件的截断通知在 inode I/O 和 raw 锁外同步执行，回调可以睡眠取得一个 MM gate；磁盘回调保留原单CPU inode I/O 契约。
 它与禁止阻塞的等待节点回调是不同接口，不使用其抢占禁止上下文。
 内存文件缩短先关闭旧代次，通知映射，再截断后备并提交大小/时间，最后开放新代次；
 完整文件 MM 并发接纳仍由 MM 域验证和缺页提交重查保护，不因此开放磁盘业务。
 `make test-file-mapping-concurrency-host` 链接真实登记、VFS/tmpfs、OFD、对象及同步实现，
 在4/16KiB、2/4宿主线程下核对1/8/32登记、退休借用、关闭等待、来源引用和最终资源。
+映射登记的代次、短锁和等待状态由 inode 独占，首次映射时在发布 VMA 前准备；分配失败返回而不发布登记。未映射节点只有一个状态指针，不扩大原 inode（440 字节、COST 开启时 448 字节）及 ext4 包装的 512 字节 slab 档位。独立状态为 88 字节、使用 128 字节 slab，最终随 inode 释放。首次并发准备的失败候选在锁外归还，预热后的准备不分配；没有状态的截断保持 inode 写保护直到后备提交，防止首次登记越过尺寸更新。
+
 `fs/ext4_backend.c` 持有 lwext4 handle、块适配、事务、orphan 与 mount 错误，
 通用层不再包含 lwext4 头文件。实例内按后端 inode 标识合并活 node，
 不同实例不共享节点；后端准备私有 handle 后交给 `kernel_vfs_publish_node()`，
@@ -531,5 +533,3 @@ supervisor先卸载根盘。两种profile都检查真实子程序状态，不能
 原RV `test-sqlite-rollback-riscv`、WAL/NBD及完整DELETE/WAL恢复矩阵保留。共用TTY
 输出CRLF后，NBD shell parser只把CRLF还原为LF，保留原字节与全部NBD请求；不删
 任意CR，不改变SQLite程序或放宽退出/WRITE/FLUSH/真实数据库门禁。
-
-映射登记的代次、短锁和等待状态由 inode 独占，首次映射时在发布 VMA 前准备；分配失败返回而不发布登记。未映射节点只有一个状态指针，不扩大原 inode（440 字节、COST 开启时 448 字节）及 ext4 包装的 512 字节 slab 档位。独立状态为 88 字节、使用 128 字节 slab，最终随 inode 释放。首次并发准备的失败候选在锁外归还，预热后的准备不分配；没有状态的截断保持 inode 写保护直到后备提交，防止首次登记越过尺寸更新。

@@ -39,3 +39,5 @@ EXCLUDED(kernel_page_cache_alias_attach)
 EXCLUDED(kernel_page_cache_alias_detach)
 EXCLUDED(kernel_page_cache_alias_clone)
 EXCLUDED(kernel_page_cache_alias_mark_dirty)
+
+EXCLUDED(kernel_page_cache_write)

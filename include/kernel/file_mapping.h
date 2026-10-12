@@ -11,7 +11,9 @@ void kernel_vfs_node_lock(struct kernel_vfs_node *node, struct kernel_lock_guard
  * rejects new borrows; drain must run outside MM gate, inode I/O and raw locks.
  * The record and MM storage remain owned until drain returns. notify borrows a
  * cursor, drops metadata protection, then synchronously invokes the callback;
- * callbacks may acquire one MM gate and sleep, but never own inode I/O here. */
+ * Controlled memory-file notification runs outside inode I/O; its callback may
+ * acquire one MM gate and sleep. Legacy disk callbacks retain their single-CPU
+ * inode-I/O contract and cannot acquire a concurrent MM gate. */
 struct kernel_file_mapping {
     struct kernel_file_mapping *next;
     struct kernel_file_mapping **previous;

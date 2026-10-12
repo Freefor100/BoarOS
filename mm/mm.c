@@ -4197,21 +4197,24 @@ static enum kernel_mm_status memory_file_fault(struct mm_operation *operation,
     if (gate_status != KERNEL_MM_STATUS_OK) status = gate_status;
     { KERNEL_RAW_SCOPE(guard,&record->metadata); record->prepared_pages += count; }
     if (status == KERNEL_MM_STATUS_OK) {
+        kernel_vfs_node_lock(node,&inode,0);
+        uint64_t latest;
+        /* 普通单CPU MM 没有 gate：等待 inode 或扩容期间仍能显式调度。
+         * 先拒绝已过期候选，再于最后可睡眠准备之后重查完整 VMA 身份。 */
+        if (generation != kernel_vma_set_generation(record->vmas) ||
+            kernel_file_mapping_epoch(node,&latest) || latest != epoch ||
+            (source.pending && source.epoch != epoch) || offset >= kernel_open_file_size(file))
+            status = KERNEL_MM_STATUS_CONFLICT;
+    }
+    if (status == KERNEL_MM_STATUS_OK && !cookie)
+        status = reserve_file_residents(record,record->resident_count + 1);
+    if (status == KERNEL_MM_STATUS_OK) {
         struct kernel_vma latest;
         if (generation != kernel_vma_set_generation(record->vmas) ||
             kernel_vma_set_lookup(record->vmas,address,&latest) != KERNEL_VMA_STATUS_OK ||
             latest.backing != file || latest.start != vma.start || latest.backing_offset != vma.backing_offset ||
             latest.permissions != vma.permissions) status = KERNEL_MM_STATUS_CONFLICT;
     }
-    if (status == KERNEL_MM_STATUS_OK) {
-        kernel_vfs_node_lock(node,&inode,0);
-        uint64_t latest;
-        if (kernel_file_mapping_epoch(node,&latest) || latest != epoch ||
-            (source.pending && source.epoch != epoch) || offset >= kernel_open_file_size(file))
-            status = KERNEL_MM_STATUS_CONFLICT;
-    }
-    if (status == KERNEL_MM_STATUS_OK && !cookie)
-        status = reserve_file_residents(record,record->resident_count + 1);
     if (status == KERNEL_MM_STATUS_OK) {
         KERNEL_RAW_SCOPE(guard,&record->metadata);
         enum arch_mmu_status backend;

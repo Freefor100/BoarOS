@@ -2125,6 +2125,14 @@ test-mm-file-concurrency-host:
 		kernel/physical_page.c mm/heap.c mm/memory_object.c mm/vma.c mm/mm.c mm/uaccess.c arch/riscv/sv39.c \
 		-Wl,--gc-sections,--wrap=kernel_open_file_prepare_memory_page,--wrap=kernel_rwlock_write,--wrap=physical_page_allocate,--wrap=kernel_heap_allocate_zeroed -o build/host/mm/file-concurrency
 	timeout 30s build/host/mm/file-concurrency
+	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -ffunction-sections -fdata-sections \
+		-DBOAROS_PAGE_SHIFT=12 -Itests/host/mm -Itests/host/sync -idirafter include \
+		tests/host/mm_file_single_wait.c tests/host/mm/context.c tests/host/mm/file_unavailable.c \
+		fs/vfs.c fs/tmpfs.c fs/open_file.c fs/file_mapping.c fs/record_lock.c \
+		kernel/cpu.c kernel/raw_lock.c kernel/sched/sync.c kernel/sched/park.c \
+		kernel/physical_page.c mm/heap.c mm/memory_object.c mm/vma.c mm/mm.c mm/uaccess.c arch/riscv/sv39.c \
+		-Wl,--gc-sections,--wrap=kernel_open_file_prepare_memory_page,--wrap=kernel_rwlock_read -o build/host/mm/file-single-wait
+	timeout 30s build/host/mm/file-single-wait
 
 .PHONY: test-allocator-concurrency-host
 test-allocator-concurrency-host:
