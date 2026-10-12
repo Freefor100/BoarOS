@@ -132,10 +132,14 @@ class ArchitectureCoverage(unittest.TestCase):
         self.assertIn('test-smp-userland-riscv', commands)
         self.assertIn('test-mm-smp-riscv', commands)
         self.assertIn('test-mm-smp-userland-riscv', commands)
+        self.assertIn('test-mm-shared-smp-riscv', commands)
+        self.assertIn('test-mm-shared-smp-userland-riscv', commands)
         commands = [arg for case in self.plan('host', 'host') for arg in case['argv']]
         self.assertIn('test-smp-host', commands)
         self.assertIn('test-mm-pin-host', commands)
         self.assertIn('test-mm-concurrency-host', commands)
+        self.assertIn('test-memory-object-concurrency-host', commands)
+        self.assertIn('test-mm-shared-concurrency-host', commands)
         result = subprocess.run([sys.executable, '-B', str(Path(__file__).with_name('run.py')),
             '--arch', 'loongarch', '--suite', 'smp', '--list'], capture_output=True, text=True)
         self.assertNotEqual(result.returncode, 0)

@@ -38,10 +38,10 @@ void mm_test_fence(uint64_t v,int instructions)
         while(!__atomic_load_n(&fence_resume,__ATOMIC_ACQUIRE)) sched_yield();
     }
 }
-enum kernel_memory_object_status __real_kernel_memory_object_get_page(struct kernel_memory_object *,uint64_t,uint64_t *,int *);
-enum kernel_memory_object_status __wrap_kernel_memory_object_get_page(struct kernel_memory_object *o,uint64_t i,uint64_t *p,int *made)
+enum kernel_memory_object_status __real_kernel_memory_object_prepare_page(struct kernel_memory_object *,uint64_t,uint64_t *,int *);
+enum kernel_memory_object_status __wrap_kernel_memory_object_prepare_page(struct kernel_memory_object *o,uint64_t i,uint64_t *p,int *made)
 {
-    enum kernel_memory_object_status status=__real_kernel_memory_object_get_page(o,i,p,made);
+    enum kernel_memory_object_status status=__real_kernel_memory_object_prepare_page(o,i,p,made);
     unsigned id=kernel_cpu_current()->hardware_id;
     if(status==KERNEL_MEMORY_OBJECT_OK && id<5 &&
         (__atomic_fetch_and(&capture,~(1U<<id),__ATOMIC_ACQ_REL)&(1U<<id))) {
@@ -49,7 +49,7 @@ enum kernel_memory_object_status __wrap_kernel_memory_object_get_page(struct ker
         /* 尚未提交PTE，实际对象和返回页引用覆盖这次暂停。 */
         if (*made) ((unsigned char *)access(*p))[0]=0x7e;
         __atomic_store_n(&entered[id],1,__ATOMIC_RELEASE);
-        while(!__atomic_load_n(&resume,__ATOMIC_ACQUIRE)) sched_yield();
+        while(!(__atomic_load_n(&resume,__ATOMIC_ACQUIRE)&(1U<<id))) sched_yield();
     }
     return status;
 }
@@ -78,7 +78,7 @@ static void first_fault(unsigned actors)
     for(unsigned id=1;id<=actors;id++) assert(!pthread_create(&workers[id-1],0,fault,(void *)(uintptr_t)id));
     for(unsigned id=1;id<=actors;id++) prepared(id);
     assert(pages.shared_anon_pages==charged+1);
-    __atomic_store_n(&resume,1,__ATOMIC_RELEASE);
+    __atomic_store_n(&resume,UINT32_MAX,__ATOMIC_RELEASE);
     for(unsigned id=1;id<=actors;id++) assert(!pthread_join(workers[id-1],0) && results[id]==KERNEL_UACCESS_STATUS_OK);
     struct kernel_mm_mapping a,b;
     assert(!kernel_mm_lookup(&parent,target,&a) && !kernel_mm_lookup(&child,target,&b));
@@ -96,7 +96,7 @@ static void stale(int replace)
     assert(pages.shared_anon_pages==charged+1);
     assert(!kernel_mm_munmap(&parent,target,BOAROS_PAGE_SIZE));
     if(replace) map(&parent,target,BOAROS_PAGE_SIZE,RW,1);
-    __atomic_store_n(&resume,1,__ATOMIC_RELEASE);
+    __atomic_store_n(&resume,UINT32_MAX,__ATOMIC_RELEASE);
     assert(!pthread_join(worker,0));
     if(replace) {
         assert(results[1]==KERNEL_UACCESS_STATUS_OK && read_byte(&parent,target)==0);
@@ -117,6 +117,42 @@ static void oom(void)
     for(unsigned i=0;i<n;i++) physical_page_release(&pages,pressure[i]);
     write_byte(&parent,target,7); assert(read_byte(&parent,target)==7);
     assert(!kernel_mm_munmap(&parent,target,BOAROS_PAGE_SIZE));
+    assert(pages.shared_anon_pages==charged);
+}
+static void adoption_rollback(int all_losers)
+{
+    target=UINT64_C(0x60000000);
+    map(&parent,target,2*BOAROS_PAGE_SIZE,RW,1);
+    struct kernel_mm other={0}; uint64_t other_root;
+    assert(!kernel_mm_fork(&other,&parent) && !kernel_mm_context(&other,&other_root));
+    uint64_t charged=pages.shared_anon_pages;
+    memset(entered,0,sizeof(entered)); resume=0; capture=2;
+    pthread_t a,b; assert(!pthread_create(&a,0,fault,(void *)(uintptr_t)1)); prepared(1);
+    if(all_losers) {
+        struct kernel_mm saved=views[2]; uint64_t saved_root=roots[2];
+        views[2]=other; roots[2]=other_root; capture=4;
+        assert(!pthread_create(&b,0,fault,(void *)(uintptr_t)2)); prepared(2);
+        mm_test_context=other_root; assert(!kernel_mm_munmap(&other,target,BOAROS_PAGE_SIZE));
+        mm_test_context=roots[1]; assert(!kernel_mm_munmap(&parent,target,BOAROS_PAGE_SIZE));
+        /* creator先结束；第二个准备者仍持实际页引用，最后才回滚。 */
+        __atomic_store_n(&resume,2,__ATOMIC_RELEASE); assert(!pthread_join(a,0));
+        assert(results[1]==KERNEL_UACCESS_STATUS_FAULT && pages.shared_anon_pages==charged+1);
+        __atomic_store_n(&resume,6,__ATOMIC_RELEASE); assert(!pthread_join(b,0));
+        views[2]=saved; roots[2]=saved_root;
+        assert(results[2]==KERNEL_UACCESS_STATUS_FAULT && pages.shared_anon_pages==charged);
+    } else {
+        mm_test_context=other_root; write_byte(&other,target,0x5b);
+        assert(!kernel_mm_munmap(&other,target,BOAROS_PAGE_SIZE));
+        mm_test_context=roots[1];
+        /* 无关VMA修改迫使creator重查，但冷映射仍拥有已写内容。 */
+        map(&parent,target+4*BOAROS_PAGE_SIZE,BOAROS_PAGE_SIZE,RW,0);
+        __atomic_store_n(&resume,2,__ATOMIC_RELEASE); assert(!pthread_join(a,0));
+        assert(results[1]==KERNEL_UACCESS_STATUS_OK && read_byte(&parent,target)==0x5b);
+        assert(read_byte(&parent,target+1)==0x91);
+        assert(!kernel_mm_munmap(&parent,target+4*BOAROS_PAGE_SIZE,BOAROS_PAGE_SIZE));
+    }
+    assert(!kernel_mm_munmap(&parent,target,2*BOAROS_PAGE_SIZE));
+    mm_test_context=0; assert(!kernel_mm_release(&other)); mm_test_context=roots[1];
     assert(pages.shared_anon_pages==charged);
 }
 static void *unmap(void *unused)
@@ -162,7 +198,7 @@ int main(void)
         assert(!kernel_mm_acquire(&views[i],i==2||i==4?&child:&parent));
         assert(!kernel_mm_context(&views[i],&roots[i]));
     }
-    first_fault(2); first_fault(4);
+    adoption_rollback(1); adoption_rollback(0); first_fault(2); first_fault(4);
     assert(!kernel_mm_mprotect(&parent,SHARED,BOAROS_PAGE_SIZE,KERNEL_MM_READ));
     mm_test_context=roots[2]; write_byte(&child,SHARED+1,44); mm_test_context=roots[1]; assert(read_byte(&parent,SHARED+1)==44);
     assert(!kernel_mm_mprotect(&parent,SHARED,BOAROS_PAGE_SIZE,RW));

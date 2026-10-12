@@ -3565,7 +3565,7 @@ static enum kernel_mm_status resolve_user_fault_once(
         int created;
         enum kernel_memory_object_status shared_status;
 
-        shared_status = kernel_memory_object_get_page(object, index,
+        shared_status = kernel_memory_object_prepare_page(object, index,
                                                    &physical_address,
                                                    &created);
         if (shared_status == KERNEL_MEMORY_OBJECT_NO_MEMORY)
@@ -3575,12 +3575,9 @@ static enum kernel_mm_status resolve_user_fault_once(
         backend_status = arch_mmu_user_map_owned_page(
             &record->space, page_address, physical_address,
             backend_permissions_from_mm(vma.permissions));
+        kernel_memory_object_finish_page(object, index, physical_address,
+                                        backend_status == ARCH_MMU_STATUS_OK);
         if (backend_status != ARCH_MMU_STATUS_OK) {
-            if (physical_page_release(mm->allocator, physical_address) !=
-                PHYSICAL_PAGE_STATUS_OK) __builtin_trap();
-            if (created != 0)
-                kernel_memory_object_discard_new_page(object, index,
-                                                    physical_address);
             return backend_status == ARCH_MMU_STATUS_NO_MEMORY
                        ? KERNEL_MM_STATUS_NO_MEMORY
                        : KERNEL_MM_STATUS_ADDRESS_SPACE;
@@ -3977,6 +3974,7 @@ static enum kernel_mm_status anonymous_fault(struct mm_operation *operation,
     address &= ~BOAROS_PAGE_MASK;
     uint64_t generation = kernel_vma_set_generation(record->vmas), cookie = 0, old = 0;
     uint64_t replacement = KERNEL_MM_NO_PAGE;
+    uint64_t shared_preparation = KERNEL_MM_NO_PAGE;
     void *old_pointer = 0, *new_pointer;
     unsigned missing = 0;
     unsigned prepared_count = 0;
@@ -4027,12 +4025,15 @@ static enum kernel_mm_status anonymous_fault(struct mm_operation *operation,
         return KERNEL_MM_STATUS_STATE;
     kernel_lock_release(&operation->guard);
     if (object) {
-        enum kernel_memory_object_status result = kernel_memory_object_get_page(object,
+        enum kernel_memory_object_status result = kernel_memory_object_prepare_page(object,
             (vma.backing_offset + address - vma.start) >> BOAROS_PAGE_SHIFT,
             &replacement, &created);
         status = result == KERNEL_MEMORY_OBJECT_OK ? KERNEL_MM_STATUS_OK :
             result == KERNEL_MEMORY_OBJECT_NO_MEMORY ? KERNEL_MM_STATUS_NO_MEMORY : KERNEL_MM_STATUS_STATE;
-        if (status == KERNEL_MM_STATUS_OK) prepared_count += created != 0;
+        if (status == KERNEL_MM_STATUS_OK) {
+            prepared_count += created != 0;
+            shared_preparation = replacement;
+        }
     } else {
         status = allocate_private_page(allocator, &replacement, &new_pointer);
         if (status == KERNEL_MM_STATUS_OK) {
@@ -4084,10 +4085,14 @@ static enum kernel_mm_status anonymous_fault(struct mm_operation *operation,
         finish_tlb_change(record, &batch, targets, nonleaf ? 0 : address,
             nonleaf ? UINT64_MAX : BOAROS_PAGE_SIZE, (vma.permissions & KERNEL_MM_EXECUTE) != 0);
     }
+    if (shared_preparation != KERNEL_MM_NO_PAGE) {
+        kernel_memory_object_finish_page(object,
+            (vma.backing_offset + address - vma.start) >> BOAROS_PAGE_SHIFT,
+            shared_preparation, status == KERNEL_MM_STATUS_OK);
+        replacement = KERNEL_MM_NO_PAGE; /* finish已消费失败引用，成功已转给PTE。 */
+    }
     if (replacement != KERNEL_MM_NO_PAGE) {
         physical_page_release(allocator, replacement);
-        if (object && created) kernel_memory_object_discard_new_page(object,
-            (vma.backing_offset + address - vma.start) >> BOAROS_PAGE_SHIFT, replacement);
     }
     if (object) kernel_memory_object_release(&object);
     for (unsigned i = 0; i < 2; i++) if (prepared.tables[i] != KERNEL_MM_NO_PAGE) physical_page_release(allocator, prepared.tables[i]);

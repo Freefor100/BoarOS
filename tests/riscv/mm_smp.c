@@ -5,6 +5,7 @@
 #include <arch/riscv/virt_uart.h>
 #include <arch/riscv/timer.h>
 #include <kernel/mm_backend.h>
+#include <kernel/memory_object.h>
 #include <kernel/uaccess.h>
 #include <kernel/heap.h>
 #include <kernel/irq.h>
@@ -31,6 +32,15 @@ static struct kernel_thread_join fork_join, cow_join;
 static unsigned fork_done, cow_ready[2], cow_go;
 static unsigned fail_create;
 static unsigned migrated_pin_returned;
+#if BOAROS_MM_SHARED_TEST
+#define SHARED_DATA UINT64_C(0x80000000)
+static unsigned shared_stage, shared_entered[2], shared_resume, shared_created;
+static unsigned shared_cached, shared_protected, shared_written, shared_pin_held, shared_pin_release;
+static unsigned shared_remove_done, shared_root_data;
+static uint64_t shared_physical[2], shared_retired[5], shared_refs[5];
+static struct kernel_wait_queue shared_prepare_gate;
+static struct kernel_thread_join shared_remover;
+#endif
 static uint64_t old_pages[3], before_retire, background_count, background_begin;
 static struct {
     uint64_t pc, cause, address, return_pc, return_sp, old_kernel_sp, old_user_sp;
@@ -141,7 +151,11 @@ void __wrap_riscv_trap_dispatch(struct riscv_trap_frame *frame)
 long __real_sbi_remote_sfence(uint64_t, uint64_t, uint64_t);
 long __wrap_sbi_remote_sfence(uint64_t hart, uint64_t address, uint64_t size)
 {
-    if (fence_armed && kernel_task_current() == actors[0].task) {
+    if (fence_armed && (kernel_task_current() == actors[0].task
+#if BOAROS_MM_SHARED_TEST
+        || (shared_stage && kernel_task_current() == shared_remover.task)
+#endif
+        )) {
         require(!kernel_cpu_current()->raw_locks, "mm-RFENCE-inside-raw");
         fence_armed = 0;
         struct kernel_wait_token token; enum kernel_wait_wake_reason reason;
@@ -151,6 +165,21 @@ long __wrap_sbi_remote_sfence(uint64_t hart, uint64_t address, uint64_t size)
             require(kernel_wait_park(&token, &reason) == KERNEL_SCHEDULER_STATUS_OK, "mm-fence-park");
         require(kernel_wait_finish(&token) == KERNEL_SCHEDULER_STATUS_OK, "mm-fence-finish");
 #if BOAROS_SMP_NEGATIVE == 5
+#if BOAROS_MM_SHARED_TEST
+        if (shared_stage) {
+            struct kernel_mm_concurrency_state state;
+            kernel_mm_get_concurrency_state(&parent, &state);
+            require(state.pending_retirement == 1 && physical_page_available(&arena) == before_retire &&
+                arena.shared_anon_pages == 3, "shared-failed-RFENCE-batch-and-object");
+            for (unsigned i=0;i<5;i++) {
+                uint32_t references;
+                require(physical_page_reference_count(&arena,shared_retired[i],&references)==PHYSICAL_PAGE_STATUS_OK &&
+                    references==shared_refs[i], "shared-failed-RFENCE-retained-reference");
+            }
+            virt_uart_puts("BoarOS: shared MM RFENCE error retains object/pin/data/table owners\n");
+            return -1;
+        }
+#else
         struct kernel_mm_concurrency_state state;
         kernel_mm_get_concurrency_state(&parent, &state);
         require(state.pending_retirement == 1 && physical_page_available(&arena) == before_retire,
@@ -163,8 +192,32 @@ long __wrap_sbi_remote_sfence(uint64_t hart, uint64_t address, uint64_t size)
         virt_uart_puts("BoarOS: MM RFENCE error retains data/table batch owners\n");
         return -1;
 #endif
+#endif
     }
     return __real_sbi_remote_sfence(hart, address, size);
+}
+enum kernel_memory_object_status __real_kernel_memory_object_prepare_page(
+    struct kernel_memory_object *,uint64_t,uint64_t *,int *);
+enum kernel_memory_object_status __wrap_kernel_memory_object_prepare_page(
+    struct kernel_memory_object *object,uint64_t index,uint64_t *physical,int *created)
+{
+    enum kernel_memory_object_status result=__real_kernel_memory_object_prepare_page(object,index,physical,created);
+#if BOAROS_MM_SHARED_TEST
+    unsigned id=kernel_task_current()==actors[1].task ? 1 : 0;
+    if(result==KERNEL_MEMORY_OBJECT_OK && shared_stage && index==1 &&
+        !__atomic_load_n(&shared_entered[id],__ATOMIC_ACQUIRE)) {
+        require(!kernel_cpu_current()->raw_locks && !kernel_io_context_current()->locks,"shared-prepare-outside-MM-and-object");
+        shared_physical[id]=*physical;
+        __atomic_fetch_add(&shared_created,*created!=0,__ATOMIC_RELAXED);
+        struct kernel_wait_token token={0}; enum kernel_wait_wake_reason reason;
+        require(kernel_wait_prepare(&shared_prepare_gate,0,0,&token)==KERNEL_SCHEDULER_STATUS_OK,"shared-prepare-register");
+        __atomic_store_n(&shared_entered[id],1,__ATOMIC_RELEASE);
+        if(!__atomic_load_n(&shared_resume,__ATOMIC_ACQUIRE))
+            require(kernel_wait_park(&token,&reason)==KERNEL_SCHEDULER_STATUS_OK,"shared-prepare-park");
+        require(kernel_wait_finish(&token)==KERNEL_SCHEDULER_STATUS_OK,"shared-prepare-finish");
+    }
+#endif
+    return result;
 }
 long __real_sbi_remote_fence_i(uint64_t);
 long __wrap_sbi_remote_fence_i(uint64_t hart)
@@ -308,7 +361,54 @@ static void actor(void *argument)
         } else if (operation == 12) {
             __atomic_store_n(&completed[id], 1, __ATOMIC_RELEASE);
             return;
-        } else if (operation == 13) {
+        }
+#if BOAROS_MM_SHARED_TEST
+        else if(operation==20) {
+            uint64_t address, value=11;
+            require(kernel_mm_mmap_anonymous(mm,SHARED_DATA,3*BOAROS_PAGE_SIZE,KERNEL_MM_READ|KERNEL_MM_WRITE,
+                KERNEL_MM_MAP_SHARED|KERNEL_MM_MAP_FIXED,&address)==KERNEL_MM_STATUS_OK,"shared-map-create");
+            require(kernel_copy_to_user(mm,SHARED_DATA,&value,sizeof(value),&copied)==KERNEL_UACCESS_STATUS_OK,"shared-resident-before-fork");
+            value=23;
+            require(kernel_copy_to_user(mm,SHARED_DATA+2*BOAROS_PAGE_SIZE,&value,sizeof(value),&copied)==KERNEL_UACCESS_STATUS_OK &&
+                kernel_mm_mprotect(mm,SHARED_DATA+2*BOAROS_PAGE_SIZE,BOAROS_PAGE_SIZE,0)==KERNEL_MM_STATUS_OK,"shared-protected-before-fork");
+        } else if(operation==21) {
+            uint64_t value=0x90+id;
+            require(kernel_copy_to_user(mm,SHARED_DATA+BOAROS_PAGE_SIZE+id*8,&value,sizeof(value),&copied)==KERNEL_UACCESS_STATUS_OK &&
+                copied==sizeof(value),"shared-simultaneous-first-fault");
+        } else if(operation==22) {
+            require(kernel_mm_mprotect(mm,SHARED_DATA,BOAROS_PAGE_SIZE,KERNEL_MM_READ)==KERNEL_MM_STATUS_OK,"shared-parent-downgrade");
+        } else if(operation==26) {
+            uintptr_t irq=arch_interrupt_save(); asm volatile("csrs sstatus,%0"::"r"((UINT64_C(1)<<18)):"memory");
+            require(mm_smp_load(SHARED_DATA)==11,"shared-child-cache");
+            arch_interrupt_restore(irq); __atomic_store_n(&shared_cached,1,__ATOMIC_RELEASE);
+            while(!__atomic_load_n(&shared_protected,__ATOMIC_ACQUIRE)) asm volatile("nop");
+            mm_smp_store(SHARED_DATA,88); asm volatile("csrc sstatus,%0"::"r"((UINT64_C(1)<<18)):"memory");
+            __atomic_store_n(&shared_written,1,__ATOMIC_RELEASE);
+        } else if(operation==27) {
+            uint64_t value;
+            require(kernel_mm_mprotect(mm,SHARED_DATA+2*BOAROS_PAGE_SIZE,BOAROS_PAGE_SIZE,KERNEL_MM_READ|KERNEL_MM_WRITE)==KERNEL_MM_STATUS_OK &&
+                kernel_copy_from_user(mm,&value,SHARED_DATA+2*BOAROS_PAGE_SIZE,sizeof(value),&copied)==KERNEL_UACCESS_STATUS_OK &&
+                value==23,"shared-protected-leaf-remains-shared");
+        } else if(operation==28) {
+            require(kernel_mm_munmap(mm,SHARED_DATA,3*BOAROS_PAGE_SIZE)==KERNEL_MM_STATUS_OK,"shared-child-unmap");
+        } else if(operation==29) {
+            require(kernel_mm_pin_user_page(mm,SHARED_DATA,KERNEL_MM_READ,&migrating_pin)==KERNEL_MM_STATUS_OK,"shared-pin-before-migration");
+            asm volatile("mv %0, sp":"=r"(pin_sp));
+        } else if(operation==30) {
+            uintptr_t sp; asm volatile("mv %0, sp":"=r"(sp));
+            require(sp==pin_sp && migrating_pin.registration==&migrating_pin &&
+                *(uint64_t *)migrating_pin.page==88 && kernel_cpu_current()->logical_id==(cpu_count==2?1U:0U),"shared-migrated-pin-owner");
+            __atomic_store_n(&shared_pin_held,1,__ATOMIC_RELEASE);
+            while(!__atomic_load_n(&shared_pin_release,__ATOMIC_ACQUIRE)) asm volatile("nop");
+            require(*(uint64_t *)migrating_pin.page==88,"shared-last-pin-content-after-unmap");
+            kernel_mm_unpin_user_page(&migrating_pin);
+        } else if(operation==31) {
+            uint64_t address,value=1;
+            require(kernel_mm_mmap_anonymous(mm,DATA,BOAROS_PAGE_SIZE,KERNEL_MM_READ|KERNEL_MM_WRITE,KERNEL_MM_MAP_FIXED,&address)==KERNEL_MM_STATUS_OK &&
+                kernel_copy_to_user(mm,DATA,&value,sizeof(value),&copied)==KERNEL_UACCESS_STATUS_OK,"shared-root-private-test-reset");
+        }
+#endif
+        else if (operation == 13) {
             __atomic_store_n(&cow_ready[0], 1, __ATOMIC_RELEASE);
             while (!__atomic_load_n(&cow_go, __ATOMIC_ACQUIRE)) asm volatile("nop");
             uint64_t value = UINT64_C(0x11111111);
@@ -369,6 +469,107 @@ static void fork_case(void)
     virt_uart_puts("BoarOS: MM SMP fork write-pin drain and concurrent COW owners passed\n");
 }
 
+#if BOAROS_MM_SHARED_TEST
+static void shared_remove(void *unused)
+{
+    (void)unused; struct kernel_mm *mm;
+    require(kernel_task_mm_borrow_mutable(kernel_task_current(),&mm)==KERNEL_TASK_STATUS_OK &&
+        kernel_mm_munmap(mm,SHARED_DATA,3*BOAROS_PAGE_SIZE)==KERNEL_MM_STATUS_OK,"shared-parent-retire");
+    __atomic_store_n(&shared_remove_done,1,__ATOMIC_RELEASE);
+}
+static void blocked(struct kernel_thread_join *join)
+{
+    for(;;) {
+        int stopped;
+        { KERNEL_RAW_SCOPE(guard,&kernel_wait_domain);
+          stopped=join->task->state==KERNEL_THREAD_STATE_BLOCKED && !join->task->wait.on_cpu; }
+        if(stopped) return;
+        yield();
+    }
+}
+static void shared_case(void)
+{
+    shared_stage=1; kernel_wait_queue_init(&shared_prepare_gate);
+    request(0,20);
+    request(1,12); kernel_thread_join(&actors[1]);
+    child=(struct kernel_mm){0};
+    require(kernel_mm_fork(&child,&parent)==KERNEL_MM_STATUS_OK,"shared-fork-publication");
+    struct kernel_mm_mapping a,b;
+    require(kernel_mm_lookup(&parent,SHARED_DATA,&a)==KERNEL_MM_STATUS_OK &&
+        kernel_mm_lookup(&child,SHARED_DATA,&b)==KERNEL_MM_STATUS_OK &&
+        a.physical_address==b.physical_address && (a.permissions&KERNEL_MM_WRITE) &&
+        (b.permissions&KERNEL_MM_WRITE),"shared-fork-parent-child-permission");
+    require(kernel_mm_lookup(&parent,DATA,&a)==KERNEL_MM_STATUS_OK && !(a.permissions&KERNEL_MM_WRITE),"shared-mixed-private-COW");
+    struct kernel_mm owner={0};
+    require(kernel_mm_acquire(&owner,&child)==KERNEL_MM_STATUS_OK &&
+        kernel_thread_create_joinable_mm(actor,(void *)(uintptr_t)1,&actors[1],cpu_count==2?2:1,&owner)==KERNEL_SCHEDULER_STATUS_OK,
+        "shared-child-bound-task");
+    send(0,21); send(1,21);
+    wait_flag(&shared_entered[0],"shared-parent-source-ready"); wait_flag(&shared_entered[1],"shared-child-source-ready");
+    require(shared_created==1 && shared_physical[0]==shared_physical[1] && arena.shared_anon_pages==3,"shared-one-first-publication");
+    __atomic_store_n(&shared_resume,1,__ATOMIC_RELEASE); wake(&shared_prepare_gate);
+    wait_flag(&completed[0],"shared-parent-first-fault"); wait_flag(&completed[1],"shared-child-first-fault");
+    uint64_t values[2]; size_t copied;
+    require(kernel_copy_from_user(&parent,values,SHARED_DATA+BOAROS_PAGE_SIZE,sizeof(values),&copied)==KERNEL_UACCESS_STATUS_OK &&
+        values[0]==0x90 && values[1]==0x91,"shared-published-content");
+    send(1,26); wait_flag(&shared_cached,"shared-child-hardware-ready"); request(0,22);
+    __atomic_store_n(&shared_protected,1,__ATOMIC_RELEASE); wait_flag(&shared_written,"shared-child-write-still-allowed");
+    wait_flag(&completed[1],"shared-child-hardware-done");
+    request(0,27); request(1,27);
+    require(kernel_mm_lookup(&parent,SHARED_DATA+2*BOAROS_PAGE_SIZE,&a)==KERNEL_MM_STATUS_OK &&
+        kernel_mm_lookup(&child,SHARED_DATA+2*BOAROS_PAGE_SIZE,&b)==KERNEL_MM_STATUS_OK &&
+        a.physical_address==b.physical_address && arena.shared_anon_pages==3,"shared-protected-owner-classification");
+    request(1,28); request(0,29); blocked(&actors[0]);
+    if(cpu_count==2) require(kernel_thread_set_cpu_mask(&actors[0],2)==KERNEL_SCHEDULER_STATUS_OK,"shared-pin-migration-mask");
+    send(0,30); wait_flag(&shared_pin_held,"shared-pin-on-destination");
+    uint64_t root; uint64_t *entries;
+    require(kernel_mm_context(&parent,&root)==KERNEL_MM_STATUS_OK &&
+        physical_page_resolve(&arena,(root&((UINT64_C(1)<<44)-1))<<12,(void **)&entries)==PHYSICAL_PAGE_STATUS_OK,"shared-root-table");
+    shared_retired[3]=(entries[SHARED_DATA>>30]>>10)<<12;
+    require(physical_page_resolve(&arena,shared_retired[3],(void **)&entries)==PHYSICAL_PAGE_STATUS_OK,"shared-middle-table");
+    shared_retired[4]=(entries[(SHARED_DATA>>21)&511]>>10)<<12;
+    for(unsigned i=0;i<3;i++) {
+        require(kernel_mm_lookup(&parent,SHARED_DATA+i*BOAROS_PAGE_SIZE,&a)==KERNEL_MM_STATUS_OK,"shared-retired-page");
+        shared_retired[i]=a.physical_address;
+    }
+    for(unsigned i=0;i<5;i++) {
+        uint32_t refs; require(physical_page_reference_count(&arena,shared_retired[i],&refs)==PHYSICAL_PAGE_STATUS_OK,"shared-retirement-references");
+        shared_refs[i]=refs;
+    }
+    before_retire=physical_page_available(&arena); fence_entered=fence_release=0; fence_armed=cpu_count==2;
+    owner=(struct kernel_mm){0};
+    require(kernel_mm_acquire(&owner,&parent)==KERNEL_MM_STATUS_OK &&
+        kernel_thread_create_joinable_mm(shared_remove,0,&shared_remover,1,&owner)==KERNEL_SCHEDULER_STATUS_OK,"shared-remover-owner");
+    if(cpu_count==2) {
+        wait_flag(&fence_entered,"shared-remote-fence-paused");
+        struct kernel_mm_concurrency_state state; kernel_mm_get_concurrency_state(&parent,&state);
+        require(state.pending_retirement==1 && physical_page_available(&arena)==before_retire &&
+            arena.shared_anon_pages==3 && !shared_remove_done,"shared-no-free-before-RFENCE");
+        __atomic_store_n(&fence_release,1,__ATOMIC_RELEASE); wake(&fence_gate);
+    }
+    wait_flag(&shared_remove_done,"shared-remove-after-ack"); kernel_thread_join(&shared_remover);
+    uint32_t refs; require(physical_page_reference_count(&arena,shared_retired[0],&refs)==PHYSICAL_PAGE_STATUS_OK && refs==1 &&
+        !arena.shared_anon_pages,"shared-only-last-pin-remains");
+    __atomic_store_n(&shared_pin_release,1,__ATOMIC_RELEASE); wait_flag(&completed[0],"shared-last-pin-return");
+    require(kernel_mm_release(&child)==KERNEL_MM_STATUS_OK,"shared-child-caller-owner-return");
+    virt_uart_puts("BoarOS: shared MM cross-root/fault/protected/migration/RFENCE owners passed\n");
+}
+#endif
+
+static void capture_old_pages(void)
+{
+    uint64_t root;
+    require(kernel_mm_context(&parent, &root) == KERNEL_MM_STATUS_OK, "mm-root-snapshot");
+    uint64_t *entries;
+    require(physical_page_resolve(&arena, (root & ((UINT64_C(1) << 44) - 1)) << 12, (void **)&entries) == PHYSICAL_PAGE_STATUS_OK, "mm-root-owner");
+    old_pages[1] = (entries[DATA >> 30] >> 10) << 12;
+    require(physical_page_resolve(&arena, old_pages[1], (void **)&entries) == PHYSICAL_PAGE_STATUS_OK, "mm-middle-owner");
+    old_pages[2] = (entries[(DATA >> 21) & 511] >> 10) << 12;
+    struct kernel_mm_mapping mapping;
+    require(kernel_mm_lookup(&parent, DATA, &mapping) == KERNEL_MM_STATUS_OK, "mm-data-snapshot");
+    old_pages[0] = mapping.physical_address;
+}
+
 static void prepare_mm(void)
 {
     require(physical_page_allocate_order(system_pages, 12, &outer) == PHYSICAL_PAGE_STATUS_OK, "mm-arena-owner");
@@ -395,7 +596,11 @@ static void prepare_mm(void)
     require(kernel_mm_activate(&parent, kernel_context) == KERNEL_MM_STATUS_OK, "mm-initial-activate");
     uint64_t address;
     require(kernel_mm_mmap_anonymous(&parent, DATA, BOAROS_PAGE_SIZE, KERNEL_MM_READ | KERNEL_MM_WRITE,
-        KERNEL_MM_MAP_FIXED, &address) == KERNEL_MM_STATUS_OK &&
+        KERNEL_MM_MAP_FIXED
+#if BOAROS_MM_SHARED_TEST
+        | (root_mode ? KERNEL_MM_MAP_SHARED : 0)
+#endif
+        , &address) == KERNEL_MM_STATUS_OK &&
         kernel_mm_mmap_anonymous(&parent, CODE, BOAROS_PAGE_SIZE, KERNEL_MM_READ | KERNEL_MM_WRITE,
         KERNEL_MM_MAP_FIXED, &address) == KERNEL_MM_STATUS_OK, "mm-private-vmas");
     uint64_t value = 1; size_t copied; uint32_t instructions[2] = {0x02a00513, 0x00000073};
@@ -403,23 +608,20 @@ static void prepare_mm(void)
         kernel_copy_to_user(&parent, CODE, instructions, sizeof(instructions), &copied) == KERNEL_UACCESS_STATUS_OK &&
         kernel_mm_mprotect(&parent, CODE, BOAROS_PAGE_SIZE, KERNEL_MM_READ | KERNEL_MM_EXECUTE) == KERNEL_MM_STATUS_OK,
         "mm-private-initial-pages");
+#if BOAROS_MM_SHARED_TEST
+    shared_root_data=root_mode;
+#endif
     require(kernel_mm_activate(0, kernel_context) == KERNEL_MM_STATUS_OK &&
         kernel_mm_enable_concurrency(&parent) == KERNEL_MM_STATUS_OK, "mm-private-publication");
-    uint64_t root;
-    require(kernel_mm_context(&parent, &root) == KERNEL_MM_STATUS_OK, "mm-root-snapshot");
-    uint64_t *entries;
-    require(physical_page_resolve(&arena, (root & ((UINT64_C(1) << 44) - 1)) << 12, (void **)&entries) == PHYSICAL_PAGE_STATUS_OK, "mm-root-owner");
-    old_pages[1] = (entries[DATA >> 30] >> 10) << 12;
-    require(physical_page_resolve(&arena, old_pages[1], (void **)&entries) == PHYSICAL_PAGE_STATUS_OK, "mm-middle-owner");
-    old_pages[2] = (entries[(DATA >> 21) & 511] >> 10) << 12;
-    struct kernel_mm_mapping mapping;
-    require(kernel_mm_lookup(&parent, DATA, &mapping) == KERNEL_MM_STATUS_OK, "mm-data-snapshot");
-    old_pages[0] = mapping.physical_address;
+    capture_old_pages();
 }
 static void execute(void *unused)
 {
     (void)unused;
     if (root_mode) return;
+#if BOAROS_MM_SHARED_TEST
+    if(shared_root_data) { request(0,31); capture_old_pages(); shared_root_data=0; }
+#endif
     for (unsigned phase = 1; phase <= 2; phase++) {
         struct kernel_mm owner = {0}; struct kernel_thread_join failed = {0};
         require(kernel_mm_acquire(&owner, &parent) == KERNEL_MM_STATUS_OK, "mm-create-failure-input-owner");
@@ -508,6 +710,9 @@ static void execute(void *unused)
     request(1, 7);
     request(0, 10); request(1, 8);
     request(0, 14); request(1, 15);
+#if BOAROS_MM_SHARED_TEST
+    shared_case();
+#endif
     virt_uart_puts("BoarOS: MM SMP native pin/permission/retirement/U-execute contracts passed\n");
     for (unsigned id = 0; id < 2; id++) { request(id, 12); kernel_thread_join(&actors[id]); }
     kernel_mm_get_concurrency_state(&parent, &state);

@@ -1,8 +1,8 @@
 # RV 受控两核调度
 
 默认构建和LA仍为单CPU。`kernel-rv-smp`独立配置最多两个逻辑CPU，CPU0是固件选择的boot hart，
-CPU1运行显式创建的受控内核任务，可绑定受控私有匿名 MM。用户任务、现有worker、文件/共享后备和系统压力回收仍只在CPU0执行。
-这项范围不提供普通用户线程跨核或跨 MM 的 MAP_SHARED 并发语义。
+CPU1运行显式创建的受控内核任务，可绑定受控私有/共享匿名 MM。用户任务、现有worker、文件/外部后备和系统压力回收仍只在CPU0执行。
+受控任务已验证 fork 后跨 MM 的共享匿名页；普通用户线程跨核执行及其共享 MM ABI 仍未开放。
 
 ## 启动与本地状态
 
@@ -36,7 +36,7 @@ IPI软件事件使用release发布、exchange消费；接收先清SSIP。通知�
 全部预检后发布叶子，撤销后先摘空表，完成本地SFENCE与在线远端RFENCE，才释放表、栈及槽位。
 发布或摘除非叶父项使用全范围失效，不能只指定某个叶VA；已有父表中的叶修改可使用范围RFENCE。
 RFENCE错误走fatal并保留owner。单页接口仍是批量接口的包装。
-受控任务仅能进入已绑定的私有匿名 MM，不得进入文件、设备、协议或系统压力回调；并行 allocator/MM 使用 CPU0 预留、无压力 hook 的私有 arena。
+受控任务仅能进入已绑定的私有/共享匿名 MM，不得进入文件、设备、协议或系统压力回调；并行 allocator/MM 使用 CPU0 预留、无压力 hook 的私有 arena。
 `kernel_thread_create_joinable_mm()`在最终 ONLINE 复查后才转移 caller MM，失败不发布 join 或身份；缓存 root 不取得额外引用。当前任务借用覆盖执行，最后 MM 释放由 CPU0 可信栈的统一 join/reaper 路径完成。活动 MM 借用归零也是 CPU 停止条件。
 
 ## 验证入口与证据边界
@@ -90,10 +90,26 @@ host直接链接生产DTB、调度/策略/runqueue/raw实现，验证稀疏身�
 `894e2aef99590fc07ec6c60ab00282b8bc5d5d5bb2a1d0c6ada0c52df24274c0`。
 CI身份另记。启动交接及非叶失效依据见[学习说明](../learning/smp-handoff.md)。
 
-## 私有匿名 MM 验证
+## 匿名 MM 验证
 
 `build/riscv-mm-smp-test/`保存独立测试构建，默认内核入口保持单CPU。2026-10-12 的 MTTCG 2/1 CPU、512MiB/1GiB验证了：旧 write pin 排空后降权和 fork、自持pin时gate忙返回冲突并继续归还、持pin任务迁移后原栈/token/内容保持、父子同时 COW 写隔离、实际 SUM 缓存写权限撤销与重映射、延迟 RFENCE 时数据/两级空表 owner 不归还；真实 U-mode 微探针验证42→84的新代码、NX及内核地址拒读。微探针不执行普通用户 syscall，不作为用户线程跨核验收。
 
 绑定任务 metadata/stack OOM 保留 caller MM 和空 join；自然退出要求 pin/active/pending 为零、所有任务与等待存储归还，16MiB 私有 arena 的 available 回到 finalize 后4079页并独占 audit，再归还系统 order12 owner。MM RFENCE及FENCE.I错误各用双RAM独立启动，核对新调用链保留 owner 后 fatal；不计自然退出或回收成功。CPU0 原静态/pthread程序与CPU1私有MM工作重叠的组合独立执行。
 
 当前 RV 测试产物的 MM 记录544字节、pin56字节、SMP task2768字节和CPU记录1968字节；默认 task2688、CPU288。记录和任务仍各占一个metadata页，pin与退休批次不动态分配；单页pin增加实际acquire/release及两段raw，COW共享页才复制4KiB。并发gate入口检查当前任务的pin链，成本为O(K)，K仅是该owner尚持片段数，普通逐页复制每次先归还片段。每段退休最多16个owner；页表准备最多两张，竞争可产生 loser 和重试，不能由容量上界宣称应用变快。runner保存整启动OFF时间、实际指令同步和 owner 计数；没有新增匹配性能门槛、并行吞吐或硬件性能结论。
+
+共享匿名配置位于`build/riscv-mm-shared-smp-test/`，复用同一生产MM和MTTCG runner。
+2026-10-12双RAM的2/1CPU验证父子驻留/未驻留/PROT_NONE共享叶、同页首次缺页仅一次对象发布、
+共享写可见、私有叶仍COW、单侧降权不影响另一MM的硬件写权限、持pin迁移及最后映射撤销。
+暂停RFENCE时三份数据页、两份空表及对象/pin owner仍在；确认后仅最后pin持页，再归还arena。
+独立shared错误profile须包含共享链路的owner证据，不能借用旧私有MM marker算通过。
+CPU0原静态/pthread与CPU1共享匿名后台负载的组合另验，普通用户仍限CPU0。
+
+`make test-memory-object-concurrency-host test-mm-shared-concurrency-host`保护对象配额/引用及
+跨MM fault/撤映射/替换/OOM；`make test-mm-shared-smp-riscv test-mm-shared-smp-userland-riscv`
+执行客户机闭环。共享对象请求176字节，使用256字节slab；表示尺寸没有新增锁层。页槽增加准备计数/接纳状态，24→32字节，仍为32字节slab；
+准备finish增加一次对象锁和hash点查询，所有准备失败时不残留计费，接纳者撤PTE后内容仍保留。
+预热get/find不分配或解析/清零数据页；同对象同页首次只分配/清零/计费一次。跨对象额度竞争
+可能先各自准备候选，失败者全部归还。对象引用、预算和共享统计新增原子操作，CAS可重试，
+hash链和扩容的既有最坏成本仍在。共享fork/写fault不复制数据页，MM表准备/退休仍有固定容量与
+竞争重试；未追加匹配时间实验，整启动OFF时间不是并行收益或实板性能证据。

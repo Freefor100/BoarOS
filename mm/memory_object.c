@@ -9,10 +9,14 @@
 
 #define SHARED_ANON_INITIAL_BUCKETS 16U
 
+enum page_publication { PAGE_DIRECT, PAGE_PREPARING, PAGE_ADOPTED };
+
 struct kernel_memory_object_page {
     struct kernel_memory_object_page *next;
     uint64_t index;
     uint64_t physical_address;
+    uint32_t preparations;
+    uint32_t publication;
 };
 
 struct kernel_memory_object {
@@ -159,6 +163,7 @@ void kernel_memory_object_release(struct kernel_memory_object **object)
         while (page != 0) {
             struct kernel_memory_object_page *next = page->next;
 
+            if (page->preparations) __builtin_trap();
             if (physical_page_release(owner->allocator,
                                       page->physical_address) !=
                 PHYSICAL_PAGE_STATUS_OK ||
@@ -174,9 +179,9 @@ void kernel_memory_object_release(struct kernel_memory_object **object)
         __builtin_trap();
 }
 
-enum kernel_memory_object_status kernel_memory_object_get_page(
+static enum kernel_memory_object_status get_page(
     struct kernel_memory_object *object, uint64_t page_index,
-    uint64_t *physical_address, int *created)
+    uint64_t *physical_address, int *created, int preparing)
 {
     KERNEL_NO_RECLAIM_IO;
     struct kernel_memory_object_page *page;
@@ -196,6 +201,14 @@ enum kernel_memory_object_status kernel_memory_object_get_page(
         if (physical_page_acquire(object->allocator,
                                   page->physical_address) !=
             PHYSICAL_PAGE_STATUS_OK) __builtin_trap();
+        if (preparing) {
+            if (page->preparations == UINT32_MAX) __builtin_trap();
+            page->preparations++;
+            /* 继承直接消费者保存的页；新协议不能撤销其既有内容。 */
+            if (page->publication == PAGE_DIRECT) page->publication = PAGE_ADOPTED;
+        } else if (page->publication == PAGE_PREPARING) {
+            page->publication = PAGE_ADOPTED;
+        }
         *physical_address = page->physical_address;
         *created = 0;
         return KERNEL_MEMORY_OBJECT_OK;
@@ -235,6 +248,8 @@ enum kernel_memory_object_status kernel_memory_object_get_page(
     }
     if (!charge(&object->allocator->shared_anon_pages, 0)) __builtin_trap();
     page->index = page_index;
+    page->preparations = preparing != 0;
+    page->publication = preparing ? PAGE_PREPARING : PAGE_DIRECT;
     bucket = bucket_for(page_index, object->bucket_count);
     page->next = object->buckets[bucket];
     object->buckets[bucket] = page;
@@ -242,6 +257,47 @@ enum kernel_memory_object_status kernel_memory_object_get_page(
     *physical_address = page->physical_address;
     *created = 1;
     return KERNEL_MEMORY_OBJECT_OK;
+}
+
+enum kernel_memory_object_status kernel_memory_object_get_page(
+    struct kernel_memory_object *object, uint64_t index, uint64_t *address, int *created)
+{ return get_page(object, index, address, created, 0); }
+
+enum kernel_memory_object_status kernel_memory_object_prepare_page(
+    struct kernel_memory_object *object, uint64_t index, uint64_t *address, int *created)
+{ return get_page(object, index, address, created, 1); }
+
+void kernel_memory_object_finish_page(struct kernel_memory_object *object,
+    uint64_t index, uint64_t address, int accepted)
+{
+    if (!object || !__atomic_load_n(&object->references, __ATOMIC_ACQUIRE)) __builtin_trap();
+    KERNEL_LOCK_SCOPE(guard);
+    kernel_mutex_lock(&object->lock, &guard);
+    struct kernel_memory_object_page **link = &object->buckets[bucket_for(index, object->bucket_count)];
+    while (*link && (*link)->index != index) link = &(*link)->next;
+    if (!*link || (*link)->physical_address != address) {
+        /* 截断可摘除对象槽；失败准备仍独立拥有返回页，不能复活旧身份。 */
+        if (accepted || physical_page_release(object->allocator, address) != PHYSICAL_PAGE_STATUS_OK)
+            __builtin_trap();
+        return;
+    }
+    struct kernel_memory_object_page *page = *link;
+    if (!page->preparations || page->publication == PAGE_DIRECT) __builtin_trap();
+    if (accepted) page->publication = PAGE_ADOPTED;
+    else if (physical_page_release(object->allocator, address) != PHYSICAL_PAGE_STATUS_OK)
+        __builtin_trap();
+    page->preparations--;
+    /* 只有最后一个失败准备者可撤销未接纳页；PTE结束不抹去接纳历史。 */
+    if (page->preparations || page->publication == PAGE_ADOPTED) return;
+    uint32_t references;
+    if (physical_page_reference_count(object->allocator, address, &references) != PHYSICAL_PAGE_STATUS_OK)
+        __builtin_trap();
+    if (references != 1U) __builtin_trap();
+    *link = page->next;
+    __atomic_fetch_sub(&object->page_count, 1, __ATOMIC_RELEASE);
+    unaccount_page(object);
+    if (physical_page_release(object->allocator, address) != PHYSICAL_PAGE_STATUS_OK ||
+        kernel_heap_release(object->heap, page) != KERNEL_HEAP_STATUS_OK) __builtin_trap();
 }
 
 void kernel_memory_object_discard_new_page(
@@ -258,7 +314,8 @@ void kernel_memory_object_discard_new_page(
     while (*link != 0 && (*link)->index != page_index)
         link = &(*link)->next;
     /* 另一个映射已接管时保留页；truncate/replacement 也不能误删新身份。 */
-    if (*link == 0 || (*link)->physical_address != physical_address) return;
+    if (*link == 0 || (*link)->physical_address != physical_address ||
+        (*link)->preparations || (*link)->publication == PAGE_ADOPTED) return;
     if (physical_page_reference_count(object->allocator, physical_address,
                                       &references) != PHYSICAL_PAGE_STATUS_OK)
         __builtin_trap();
@@ -284,6 +341,7 @@ enum kernel_memory_object_status kernel_memory_object_find_page(
         if (p->index != index) continue;
         if (physical_page_acquire(object->allocator, p->physical_address) != PHYSICAL_PAGE_STATUS_OK)
             __builtin_trap();
+        if (p->publication == PAGE_PREPARING) p->publication = PAGE_ADOPTED;
         *address = p->physical_address;
         return KERNEL_MEMORY_OBJECT_OK;
     }

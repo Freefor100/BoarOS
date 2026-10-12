@@ -259,7 +259,7 @@ PROT_NONE、非当前 MM、尾页、关闭 fd、unlink、O_TRUNC 与重新增长
 
 ## 统一内存后备对象
 
-共享匿名与其 futex key 使用 `kernel_memory_object` 的稳定对象身份。对象拥有每个稀疏驻留页的一份引用，get/find 成功返回额外页引用；find 遇空洞不分配。对象锁 rank 35 位于 inode 30 之后；无磁盘 I/O。truncate 摘除越界的对象页引用并清零保留尾页，调用者须先撤销受影响 PTE 并持有对象；页发布失败按先释放 PTE 临时引用、再 discard 新页的顺序回滚。tmpfs 已接入同一对象及按实例共享的页预算；普通文件的 inode/OFD 与 MM 登记仍保留，内存数据页不进入磁盘缓存。缺页使用 get_page_for_fault 返回 created 身份，成功 resident 发布后取消回滚；失败先释放 pin，只有无其他引用且地址匹配的新页才 discard。文件配额耗尽为 BUS_FAULT，普通分配耗尽仍为 NO_MEMORY。详见 [tmpfs](tmpfs.md)。
+共享匿名与其 futex key 使用 `kernel_memory_object` 的稳定对象身份。对象拥有每个稀疏驻留页的一份引用，get/find 成功返回额外页引用；find 遇空洞不分配。对象锁 rank 35 位于 inode 30 之后；无磁盘 I/O。truncate 摘除越界的对象页引用并清零保留尾页，调用者须先撤销受影响 PTE 并持有对象；匿名缺页通过 prepare/finish 归还失败引用或记录 PTE 接纳，准备计数归零后才撤销未接纳页。tmpfs 已接入同一对象及按实例共享的页预算；普通文件的 inode/OFD 与 MM 登记仍保留，内存数据页不进入磁盘缓存。缺页使用 get_page_for_fault 返回 created 身份，成功 resident 发布后取消回滚；失败先释放 pin，只有无其他引用且地址匹配的新页才 discard。文件配额耗尽为 BUS_FAULT，普通分配耗尽仍为 NO_MEMORY。详见 [tmpfs](tmpfs.md)。
 
 缺页解析在合法 VMA 上权限不足返回 ACCESS，地址无映射返回 NOT_MAPPED；trap 层据此提供 SEGV_ACCERR/MAPERR，uaccess 将两者统一映射为用户复制 FAULT。这个区分不把 syscall 坏指针变成异步故障信号。
 
@@ -279,7 +279,7 @@ OOM/split/fork 由 vma/scale/ABI 组合回归继续保护。
 
 每个复制片段在 MM raw 下完成 PTE/权限检查及真实物理 acquire，复制在锁外；同一 task/I/O owner 归还 pin。pin 固定页存活，不固定映射身份或内容。`munmap` 可先撤销映射，旧片段靠 pin 完成；`mprotect` 关闭新许可并排空旧片段，fork 关闭写许可并排空旧写 pin。已持有需要排空的 pin 时不能等待自己，非法 owner fatal；零长度及无效参数不进入 drain。精确复制前缀保持。
 
-共享匿名fault在gate下取得实际对象引用，放保护后get页/准备缺表，恢复后重查VMA代次、backing、偏移和权限；返回的额外页引用成功转给PTE，失败先归还，再只discard本次创建且未被其他owner接纳的匹配页，最后归还临时对象引用。并发fork按VMA分类，只把私有叶提交成COW，共享及受保护共享叶保持共享。单侧降权只作用于本MM，不保证另一MM的共享数据内容不变。
+共享匿名fault在gate下取得实际对象引用，放保护后prepare页/准备缺表，恢复后重查VMA代次、backing、偏移和权限；prepare返回的额外页引用成功转给PTE，finish记录接纳；失败finish归还该引用并结束准备计数，只有最后失败者撤销未接纳的匹配页。另一MM撤PTE不清接纳历史，最后归还临时对象引用。并发fork按VMA分类，只把私有叶提交成COW，共享及受保护共享叶保持共享。单侧降权只作用于本MM，不保证另一MM的共享数据内容不变。
 
 fault 先在 gate/raw 下取得 VMA generation 和 PTE/COW 快照，释放保护后准备数据页及至多两张缺表，清零或复制也在锁外。恢复后重新查 VMA、权限及 PTE cookie；过期候选和竞争 loser 归还全部私有 owner，再重试。fork 的子树和 metadata 完成全部可失败准备后，才把父叶提交为 COW；同步父目标 hart 后发布子 LIVE，不在失败构造时修改父权限。
 
@@ -294,4 +294,4 @@ make test-mm-smp-riscv
 make test-mm-smp-userland-riscv INIT_CONFIG=config/init.json
 ```
 
-host 链接真实 MM/VMA/Sv39/allocator/uaccess/等待实现，只替换硬件及调度后端；2/4 actor 模型与两逻辑 CPU 活动集合模型分列。真实 MTTCG 双RAM验证见[两核模块](riscv-smp.md)。固定资料、准备/提交理由及资源证据见[内存学习说明](../learning/memory-management.md#私有匿名并发的许可与失效完成)。
+host 链接真实 MM/VMA/Sv39/allocator/uaccess/等待实现，只替换硬件及调度后端；2/4 actor 模型与两逻辑 CPU 活动集合模型分列。真实 MTTCG 双RAM验证见[两核模块](riscv-smp.md)。固定资料、准备/提交理由及资源证据见[内存学习说明](../learning/memory-management.md#匿名并发的许可与失效完成)。

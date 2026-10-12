@@ -37,6 +37,17 @@ void kernel_memory_object_release(struct kernel_memory_object **object);
 enum kernel_memory_object_status kernel_memory_object_get_page(
     struct kernel_memory_object *object, uint64_t page_index,
     uint64_t *physical_address, int *created);
+/* Concurrent MM preparation returns a page reference plus one pending claim.
+ * The caller's actual object owner covers both until exactly one finish:
+ * accepted transfers the page reference to the PTE; rejected consumes it.
+ * Finish runs outside MM raw protection (the MM gate may remain held).
+ * All rejected claims remove an unadopted page/charge; a prior acceptance is
+ * permanent until truncate or object destruction, even after that PTE ends.
+ * Direct get/find consumers accept existing prepared content immediately. */
+enum kernel_memory_object_status kernel_memory_object_prepare_page(
+    struct kernel_memory_object *, uint64_t index, uint64_t *address, int *created);
+void kernel_memory_object_finish_page(struct kernel_memory_object *,
+    uint64_t index, uint64_t address, int accepted);
 /* Caller already released its failed publication reference. Discard only the
  * matching page with no PTE/other pin owners; an adopted page is preserved. */
 void kernel_memory_object_discard_new_page(
