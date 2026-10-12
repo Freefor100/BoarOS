@@ -52,9 +52,9 @@ enum kernel_mm_cleanup_stage {
 };
 
 /* 句柄拥有MM记录引用，lookup返回映射快照而不取得物理页pin。
- * 当前MM/VMA/PTE及来源发布依赖单CPU IRQ纪律；MM引用不是SMP映射锁。
- * 后续共享MM并发须把lookup+pin、睡眠后重查、活动CPU/TLB确认与延期回收
- * 作为同一生命周期协议；仅原子化MM/页refcount不足以保护查找到引用之间。 */
+ * 受控私有匿名域由operation gate/MM raw保护，活动CPU失效确认后才回收；
+ * 文件/共享后备仍遵守单CPU业务边界。句柄不能被其他执行者并发move/release。
+ * MM引用只保证记录存活，lookup快照不能代替访问片段的实际页引用。 */
 struct kernel_mm {
     struct physical_page_allocator *allocator;
     uint64_t record_page_address;
@@ -71,11 +71,15 @@ struct kernel_mm_mapping {
  * lookup、权限许可与acquire在同一MM raw内完成，复制在raw外进行。
  * pin不固定映射身份/内容；不能复制token，也不能由另一任务归还。
  * 非resident/COW权限返回NOT_MAPPED/ACCESS，由caller fault后重新pin。
- * token首次使用须零初始化，成功才发布；失败不修改输出。重复pin或非法unpin fatal。 */
+ * token首次使用须零初始化，成功才发布；失败不修改输出。重复pin或非法unpin fatal。
+ * 自持同一MM pin时，需gate的操作只尝试取得，忙时返回CONFLICT；新pin许可
+ * 已关闭也返回CONFLICT。先归还原pin再重试，不能在保留pin时等待排空它的owner。
+ * 无争用munmap仍允许自持pin；需要排空自身pin的mprotect/fork仍是非法上下文。 */
 struct kernel_mm_user_pin {
     const struct kernel_mm *mm;
     struct kernel_io_context *owner;
     struct kernel_mm_user_pin *registration;
+    struct kernel_mm_user_pin *owner_next;
     void *page;
     uint64_t physical_address;
     uint32_t access;

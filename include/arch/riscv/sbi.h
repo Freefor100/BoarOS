@@ -16,6 +16,7 @@ long sbi_hart_stop(void);
 long sbi_send_ipi(uint64_t hart);
 /* 一个真实hart作为mask base，不要求hart ID能装进单个bitmask。 */
 long sbi_remote_sfence(uint64_t hart, uint64_t address, uint64_t size);
+long sbi_remote_fence_i(uint64_t hart);
 void sbi_shutdown(void) __attribute__((noreturn));
 
 #endif

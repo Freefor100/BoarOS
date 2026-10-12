@@ -23,14 +23,20 @@ TEST_MEMORY_ARGS := $(foreach memory,$(TEST_MEMORIES),--memory $(memory))
 COST_DIAGNOSTICS ?= 0
 SMP ?= 0
 SMP_TEST ?= 0
+MM_SMP_TEST ?= 0
 SMP_TEST_PROFILE ?= normal
-ifneq ($(filter $(SMP_TEST_PROFILE),normal missing-rfence denied-start guard denied-stop rfence-error),$(SMP_TEST_PROFILE))
+ifneq ($(filter $(SMP_TEST_PROFILE),normal missing-rfence denied-start guard denied-stop rfence-error mm-fence-i),$(SMP_TEST_PROFILE))
 $(error invalid SMP_TEST_PROFILE)
 endif
 SMP_TEST_SUFFIX := $(if $(filter normal,$(SMP_TEST_PROFILE)),,$(SMP_TEST_PROFILE)/)
-SMP_NEGATIVE := $(if $(filter missing-rfence,$(SMP_TEST_PROFILE)),1,$(if $(filter denied-start,$(SMP_TEST_PROFILE)),2,$(if $(filter guard,$(SMP_TEST_PROFILE)),3,$(if $(filter denied-stop,$(SMP_TEST_PROFILE)),4,$(if $(filter rfence-error,$(SMP_TEST_PROFILE)),5,0)))))
+SMP_NEGATIVE := $(if $(filter missing-rfence,$(SMP_TEST_PROFILE)),1,$(if $(filter denied-start,$(SMP_TEST_PROFILE)),2,$(if $(filter guard,$(SMP_TEST_PROFILE)),3,$(if $(filter denied-stop,$(SMP_TEST_PROFILE)),4,$(if $(filter rfence-error,$(SMP_TEST_PROFILE)),5,$(if $(filter mm-fence-i,$(SMP_TEST_PROFILE)),6,0))))))
 ifneq ($(filter $(SMP_TEST),0 1),$(SMP_TEST))
 $(error SMP_TEST must be 0 or 1)
+endif
+ifeq ($(SMP_TEST_PROFILE),mm-fence-i)
+ifneq ($(MM_SMP_TEST),1)
+$(error mm-fence-i requires MM_SMP_TEST=1)
+endif
 endif
 ifneq ($(filter $(SMP),0 1),$(SMP))
 $(error SMP must be 0 or 1)
@@ -38,6 +44,17 @@ endif
 ifeq ($(SMP_TEST),1)
 ifeq ($(SMP),0)
 $(error SMP_TEST requires SMP=1)
+endif
+endif
+ifneq ($(filter $(MM_SMP_TEST),0 1),$(MM_SMP_TEST))
+$(error MM_SMP_TEST must be 0 or 1)
+endif
+ifeq ($(MM_SMP_TEST),1)
+ifneq ($(SMP)$(SMP_TEST),11)
+$(error MM_SMP_TEST requires SMP=1 SMP_TEST=1)
+endif
+ifneq ($(filter $(SMP_TEST_PROFILE),normal rfence-error mm-fence-i),$(SMP_TEST_PROFILE))
+$(error MM_SMP_TEST profile must be normal, rfence-error or mm-fence-i)
 endif
 endif
 ifeq ($(SMP)$(COST_DIAGNOSTICS),11)
@@ -65,6 +82,10 @@ BUILD_DIR := build/riscv-smp-test/riscv
 KERNEL_RV := build/riscv-smp-test/kernel-rv
 BUILD_DIR := build/riscv-smp-test/$(SMP_TEST_SUFFIX)riscv
 KERNEL_RV := build/riscv-smp-test/$(SMP_TEST_SUFFIX)kernel-rv
+endif
+ifeq ($(MM_SMP_TEST),1)
+BUILD_DIR := build/riscv-mm-smp-test/$(SMP_TEST_SUFFIX)riscv
+KERNEL_RV := build/riscv-mm-smp-test/$(SMP_TEST_SUFFIX)kernel-rv
 endif
 TRAP_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-trap-rv
 TRAP_RETURN_TEST_KERNEL_RV := $(BUILD_DIR)/tests/kernel-trap-return-rv
@@ -308,12 +329,18 @@ OBJECTS := \
 	$(patsubst %.c,$(BUILD_DIR)/%.o,$(C_SOURCES)) \
 	$(patsubst %.S,$(BUILD_DIR)/%.o,$(ASM_SOURCES))
 ifeq ($(SMP_TEST),1)
+ifeq ($(MM_SMP_TEST),1)
+OBJECTS += $(BUILD_DIR)/tests/riscv/mm_smp.o $(BUILD_DIR)/tests/riscv/mm_smp_probe.o
+LDFLAGS += -Wl,--wrap=riscv_trap_dispatch,--wrap=sbi_remote_sfence,--wrap=sbi_remote_fence_i,--wrap=physical_page_allocate,--wrap=physical_page_allocate_order
+else
 OBJECTS += $(BUILD_DIR)/tests/riscv/smp_cases.o
 OBJECTS += $(BUILD_DIR)/tests/riscv/smp_registers.o
 LDFLAGS += -Wl,--wrap=riscv_context_switch,--wrap=sbi_remote_sfence
 LDFLAGS += -Wl,--wrap=sbi_probe_extension,--wrap=sbi_hart_start,--wrap=sbi_hart_status
 LDFLAGS += -Wl,--wrap=physical_page_allocate
 $(BUILD_DIR)/tests/riscv/smp_cases.o: CPPFLAGS += -DBOAROS_SMP_NEGATIVE=$(SMP_NEGATIVE)
+endif
+$(BUILD_DIR)/tests/riscv/mm_smp.o: CPPFLAGS += -DBOAROS_SMP_NEGATIVE=$(SMP_NEGATIVE)
 endif
 TEST_RUNTIME_C_SOURCES := \
 	kernel/cpu.c \
@@ -1985,10 +2012,35 @@ test-mm-pin-host:
 	@mkdir -p build/host/mm
 	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -ffunction-sections -fdata-sections \
 		-DBOAROS_PAGE_SHIFT=12 -Itests/host/mm -Itests/host/sync -idirafter include \
-		tests/host/mm_pin.c tests/host/mm/unavailable.c kernel/cpu.c kernel/raw_lock.c \
+		tests/host/mm_pin.c tests/host/mm/unavailable.c tests/host/mm/context.c \
+		kernel/cpu.c kernel/raw_lock.c kernel/sched/sync.c kernel/sched/park.c \
 		kernel/physical_page.c mm/heap.c mm/vma.c mm/mm.c mm/uaccess.c arch/riscv/sv39.c \
 		-Wl,--gc-sections -o build/host/mm/pin
 	build/host/mm/pin
+
+.PHONY: test-mm-concurrency-host
+test-mm-concurrency-host:
+	@mkdir -p build/host/mm
+	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -ffunction-sections -fdata-sections \
+		-DBOAROS_PAGE_SHIFT=12 -Itests/host/mm -Itests/host/sync -idirafter include \
+		tests/host/mm_concurrency.c tests/host/mm/unavailable.c tests/host/mm/context.c \
+		kernel/cpu.c kernel/raw_lock.c kernel/sched/sync.c kernel/sched/park.c \
+		kernel/physical_page.c mm/heap.c mm/vma.c mm/mm.c mm/uaccess.c arch/riscv/sv39.c \
+		-Wl,--gc-sections,--wrap=physical_page_allocate -o build/host/mm/concurrency
+	timeout 30s build/host/mm/concurrency
+	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -ffunction-sections -fdata-sections \
+		-DBOAROS_PAGE_SHIFT=12 -DBOAROS_MAX_CPUS=2 -Itests/host/mm -Itests/host/sync -idirafter include \
+		tests/host/mm_activity.c tests/host/mm/unavailable.c tests/host/mm/context.c \
+		kernel/cpu.c kernel/raw_lock.c kernel/sched/sync.c kernel/sched/park.c \
+		kernel/physical_page.c mm/heap.c mm/vma.c mm/mm.c mm/uaccess.c arch/riscv/sv39.c \
+		-Wl,--gc-sections -o build/host/mm/activity
+	timeout 30s build/host/mm/activity
+	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -ffunction-sections -fdata-sections \
+		-DBOAROS_PAGE_SHIFT=12 -Itests/host/mm -Itests/host/sync -idirafter include \
+		tests/host/mm_zero.c tests/host/mm/unavailable.c tests/host/mm/context.c \
+		kernel/cpu.c kernel/raw_lock.c kernel/sched/sync.c kernel/sched/park.c \
+		kernel/physical_page.c arch/riscv/sv39.c -Wl,--gc-sections -o build/host/mm/zero
+	timeout 30s build/host/mm/zero
 
 .PHONY: test-allocator-concurrency-host
 test-allocator-concurrency-host:
@@ -2064,6 +2116,16 @@ test-sched-concurrency-host:
 test-riscv: test-scheduler-handoff-riscv
 
 .PHONY: kernel-rv-smp run-smp-riscv test-smp-host test-smp-riscv
+.PHONY: test-mm-smp-riscv
+test-mm-smp-riscv:
+	$(MAKE) SMP=1 SMP_TEST=1 MM_SMP_TEST=1 COST_DIAGNOSTICS=0 all
+	python3 -B tests/smp/riscv.py --contract mm --qemu $(QEMU_RISCV64) \
+		--firmware $(QEMU_RISCV_FIRMWARE) --kernel build/riscv-mm-smp-test/kernel-rv \
+		--output build/riscv-mm-smp-test/runs
+	@set -e; for profile in rfence-error mm-fence-i; do \
+		$(MAKE) SMP=1 SMP_TEST=1 MM_SMP_TEST=1 SMP_TEST_PROFILE=$$profile COST_DIAGNOSTICS=0 all; \
+		python3 -B tests/smp/riscv.py --contract mm --qemu $(QEMU_RISCV64) --firmware $(QEMU_RISCV_FIRMWARE) --kernel build/riscv-mm-smp-test/$$profile/kernel-rv --profile $$profile --output build/riscv-mm-smp-test/runs/$$profile; \
+	done
 QEMU_RISCV_FIRMWARE ?= default
 kernel-rv-smp:
 	$(MAKE) SMP=1 SMP_TEST=0 COST_DIAGNOSTICS=0 all
@@ -2071,6 +2133,7 @@ run-smp-riscv: kernel-rv-smp
 	$(QEMU_RISCV64) -machine virt -accel tcg,thread=multi -smp 2 -m $(QEMU_MEMORY) -nographic -bios $(QEMU_RISCV_FIRMWARE) -kernel build/riscv-smp/kernel-rv
 test-smp-host:
 	python3 -B tests/host/smp_dtb_test.py
+	python3 -B tests/smp/mm_contract_test.py
 	@mkdir -p build/host
 	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -ffunction-sections -fdata-sections -DBOAROS_PAGE_SHIFT=12 -DBOAROS_MAX_CPUS=2 -Itests/host/sync -idirafter include tests/host/smp_sched.c kernel/cpu.c kernel/raw_lock.c kernel/sched/wait.c kernel/sched/scheduling.c kernel/sched/policy.c kernel/sched/runqueue.c -Wl,--gc-sections -o build/host/smp-sched
 	build/host/smp-sched
@@ -2083,6 +2146,17 @@ test-smp-riscv:
 	done
 
 .PHONY: test-smp-userland-riscv
+.PHONY: test-mm-smp-userland-riscv
+test-mm-smp-userland-riscv: $(REAL_USERLAND_RV) $(PTHREAD_USERLAND_RV) $(PTHREAD_TLS_DSO_RV) $(MUSL_LDSO)
+	$(MAKE) SMP=1 SMP_TEST=1 MM_SMP_TEST=1 COST_DIAGNOSTICS=0 all
+	@set -e; for memory in 512M 1G; do \
+		BOAROS_SMP_QEMU=$(QEMU_RISCV64) BOAROS_SMP_FIRMWARE=$(QEMU_RISCV_FIRMWARE) \
+		BOAROS_SMP_OUTPUT=$(CURDIR)/build/riscv-mm-smp-test/runs/user-$$memory \
+		QEMU_RISCV64=$(CURDIR)/tests/smp/qemu.py KERNEL_RV=$(CURDIR)/build/riscv-mm-smp-test/kernel-rv \
+		REAL_USERLAND_RV=$(REAL_USERLAND_RV) PTHREAD_USERLAND_RV=$(PTHREAD_USERLAND_RV) \
+		PTHREAD_TLS_DSO_RV=$(PTHREAD_TLS_DSO_RV) MUSL_LDSO=$(MUSL_LDSO) \
+		QEMU_MEMORY=$$memory USERLAND_TIMEOUT=185s tests/userland-riscv.sh; \
+	done
 test-smp-userland-riscv: $(REAL_USERLAND_RV) $(PTHREAD_USERLAND_RV) $(PTHREAD_TLS_DSO_RV) $(MUSL_LDSO)
 	$(MAKE) SMP=1 SMP_TEST=1 SMP_TEST_PROFILE=normal COST_DIAGNOSTICS=0 all
 	@set -e; for memory in 512M 1G; do \

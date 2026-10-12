@@ -1982,8 +1982,7 @@ static void kernel_thread_finish(
     if (current->arch.user_mode == 1U) {
         kernel_futex_release_robust(current, current->tid);
         kernel_futex_release_mm(current);
-        if (arch_mmu_switch_context(scheduler.kernel_context) !=
-            ARCH_MMU_STATUS_OK) {
+        if (kernel_mm_activate(0, scheduler.kernel_context) != KERNEL_MM_STATUS_OK) {
             switch_to_fatal_idle(
                 KERNEL_SCHEDULER_STATUS_ADDRESS_SPACE);
         }
@@ -2263,7 +2262,11 @@ enum kernel_task_status kernel_task_mm_borrow(
     if (task != kernel_cpu_current()->current ||
         task->magic != KERNEL_THREAD_MAGIC ||
         task->state != KERNEL_THREAD_STATE_RUNNING ||
-        task->arch.user_mode != 1U ||
+        (task->arch.user_mode != 1U
+#if BOAROS_MAX_CPUS > 1
+         && !(task->controlled && task->bound_mm_context && task->arch.user_mode == 0U)
+#endif
+        ) ||
         task->mm.state != KERNEL_MM_LIVE) {
         return KERNEL_TASK_STATUS_STATE;
     }
@@ -2281,7 +2284,11 @@ enum kernel_task_status kernel_task_mm_borrow_mutable(
     if (task != kernel_cpu_current()->current ||
         task->magic != KERNEL_THREAD_MAGIC ||
         task->state != KERNEL_THREAD_STATE_RUNNING ||
-        task->arch.user_mode != 1U ||
+        (task->arch.user_mode != 1U
+#if BOAROS_MAX_CPUS > 1
+         && !(task->controlled && task->bound_mm_context && task->arch.user_mode == 0U)
+#endif
+        ) ||
         task->mm.state != KERNEL_MM_LIVE) {
         return KERNEL_TASK_STATUS_STATE;
     }

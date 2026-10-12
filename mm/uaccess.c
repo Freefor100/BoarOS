@@ -17,7 +17,7 @@ enum kernel_uaccess_status kernel_user_range_check(
     uint64_t user_address,
     size_t size)
 {
-    kernel_assert_service_context();
+    /* 这里只做区间算术；真正访问由MM pin检查绑定域及权限。 */
     if (size == 0U) {
         return KERNEL_UACCESS_STATUS_OK;
     }

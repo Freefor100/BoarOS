@@ -50,8 +50,8 @@ enum kernel_uaccess_status kernel_copy_string_from_user(
 页引用要求已finalized的allocator，不把bootstrap单owner页伪装为可共享引用。
 
 pin防止已许可片段使用的页被撤映射后重新发放，不固定内容、权限或映射身份。
-CPU1的MM入口仍被拒绝；映射变更、权限撤销/COW交接与活动CPU/TLB确认尚未形成完整
-跨核协议，不能由pin层的宿主结果推导共享MM已经开放。
+普通逐页复制先归还当前片段再取下一个；显式自持同一MM pin的内部调用若gate忙或新许可关闭，返回`CONFLICT`，不得保留pin等待排空它的操作。冲突不发布新token，旧owner继续负责归还。
+CPU1只接受已绑定同一私有匿名并发记录的受控任务。mprotect 返回前排空旧片段，fork 排空旧写片段；撤映射/COW 的旧 owner 等 TLB 确认后释放。文件、共享后备和普通用户跨核执行仍未开放，详见[MM 并发边界](kernel-mm.md#私有匿名-mm-的并发与回收)。
 驻留页每个基页进行一次三级软件页表查询、物理页解析及acquire/release，增加一个固定大小栈token；随后执行页内线性字节复制；首次提交的页额外承担 VMA 二分查找、页分配/清零、PTE 写入和架构转换失效。uaccess 经内核物理映射复制，不切换硬件用户地址空间；RV 不修改 `sstatus.SUM`。文件 `read` 已以 4 KiB staging chunk 使用该路径，但当前只用结构成本和 QEMU 正确性测试约束，尚未取得开发板吞吐、TLB miss 或 cache 数据。应在真实工作负载上比较软件遍历与 RISC-V SUM+异常表快路径，再决定阈值或替换策略。
 
 COST 构建在成功解析后的固定长度页内 chunk 记录实际复制字节、次数、单次最大值
@@ -64,7 +64,8 @@ QEMU `virt` 与 VisionFive 2 共享这套 Sv39 实现，板级 RAM/MMIO 差异�
 ## 验证与限制
 
 ```sh
-make test-mm-pin-host
+make test-mm-pin-host test-mm-concurrency-host
+make test-mm-smp-riscv
 make test-uaccess-riscv
 make test-files-partial-write-riscv
 make test-userland-riscv

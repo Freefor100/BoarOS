@@ -264,6 +264,10 @@ enum kernel_scheduler_status kernel_thread_create_joinable(
 /* CPU0创建并持有join；仅显式受控任务可改变mask，且必须已阻塞/off_cpu。 */
 enum kernel_scheduler_status kernel_thread_create_joinable_mask(
     void (*entry)(void *), void *argument, struct kernel_thread_join *join, uint32_t mask);
+/* CPU0创建，成功转移已开放私有匿名域的MM引用；失败保留原句柄。
+ * 受控任务只使用绑定记录；MM与任务栈最终由CPU0可信栈回收。 */
+enum kernel_scheduler_status kernel_thread_create_joinable_mm(
+    void (*entry)(void *), void *, struct kernel_thread_join *, uint32_t, struct kernel_mm *);
 enum kernel_scheduler_status kernel_thread_set_cpu_mask(struct kernel_thread_join *, uint32_t);
 int kernel_scheduler_core_quiescent(struct kernel_cpu *);
 #endif

@@ -16,7 +16,7 @@ def identity(path):
     return {"path": str(resolved), "sha256": hashlib.sha256(resolved.read_bytes()).hexdigest()}
 
 
-def boot(qemu, firmware, kernel, memory, cpus, output, profile="normal"):
+def boot(qemu, firmware, kernel, memory, cpus, output, profile="normal", contract="scheduler"):
     command = [qemu, "-machine", "virt", "-accel", "tcg,thread=multi", "-smp", str(cpus),
                "-m", memory, "-nographic", "-no-reboot", "-bios", firmware, "-kernel", str(kernel)]
     started = time.monotonic()
@@ -57,6 +57,7 @@ def boot(qemu, firmware, kernel, memory, cpus, output, profile="normal"):
     output.with_suffix(".log").write_text(text)
     report = {"command": command, "memory": memory, "cpus": cpus,
               "profile": profile,
+              "contract": contract,
               "vcpu_threads": sorted(t for t in threads if "/TCG" in t),
               "returncode": process.returncode, "timeout": timed_out,
               "elapsed_seconds": time.monotonic() - started,
@@ -65,6 +66,20 @@ def boot(qemu, firmware, kernel, memory, cpus, output, profile="normal"):
     output.with_suffix(".json").write_text(json.dumps(report, indent=2) + "\n")
     if timed_out or process.returncode or len(report["vcpu_threads"]) != cpus:
         raise RuntimeError(f"QEMU execution failed: {report}")
+    if contract == "mm":
+        if profile != "normal":
+            validate_mm_failure(text, profile)
+            print(f"RV anonymous MM profile={profile} RAM={memory} expected fault; recovery unverified", flush=True)
+            return
+        required = ("MM SMP native pin/permission/retirement/U-execute contracts passed",
+                    "MM arena closure live=0x0 heap-pages=0x0",
+                    "MM SMP natural exit arena/MM/pin/table/stack/wait owners returned")
+        if any(marker not in text for marker in required) or "SMP failure" in text or "SMP fatal" in text:
+            raise RuntimeError(f"missing native MM closure:\n{text[-4000:]}")
+        if cpus == 2 and "SMP online logical=1 hart=" not in text:
+            raise RuntimeError("MM test did not publish the secondary CPU")
+        print(f"RV anonymous MM cpus={cpus} RAM={memory} native exit and owner closure passed", flush=True)
+        return
     if profile != "normal":
         expected = {"missing-rfence": "SMP failure stage=SBI-extension",
                     "denied-start": "SMP failure stage=HSM-start",
@@ -93,18 +108,32 @@ def boot(qemu, firmware, kernel, memory, cpus, output, profile="normal"):
     print(f"RV SMP cpus={cpus} RAM={memory} native exit and owner closure passed", flush=True)
 
 
+def validate_mm_failure(text, profile):
+    required = {
+        "rfence-error": ("SMP failure stage=MM-RFENCE", "MM RFENCE error retains data/table batch owners"),
+        "mm-fence-i": ("SMP failure stage=MM-FENCE.I", "MM FENCE.I error retains live MM/code owners"),
+    }
+    if profile not in required:
+        raise ValueError("unsupported MM failure profile")
+    if any(marker not in text for marker in required[profile]) or "natural exit" in text:
+        raise RuntimeError(f"MM failure lacks boundary/retained-owner evidence:\n{text[-4000:]}")
+
+
 def main():
     parser = argparse.ArgumentParser(__doc__)
     parser.add_argument("--qemu", required=True)
     parser.add_argument("--firmware", default="default")
     parser.add_argument("--kernel", type=Path, required=True)
     parser.add_argument("--output", type=Path, default=Path("build/riscv-smp/runs"))
-    parser.add_argument("--profile", choices=("normal", "missing-rfence", "denied-start", "guard", "denied-stop", "rfence-error"), default="normal")
+    parser.add_argument("--profile", choices=("normal", "missing-rfence", "denied-start", "guard", "denied-stop", "rfence-error", "mm-fence-i"), default="normal")
+    parser.add_argument("--contract", choices=("scheduler", "mm"), default="scheduler")
     args = parser.parse_args()
+    if (args.contract == "mm" and args.profile not in ("normal", "rfence-error", "mm-fence-i")) or (args.contract != "mm" and args.profile == "mm-fence-i"):
+        parser.error("profile does not belong to the selected contract")
     for cpus in ((2, 1) if args.profile == "normal" else (2,)):
         for memory in ("512M", "1G"):
             boot(args.qemu, args.firmware, args.kernel, memory, cpus,
-                 args.output / f"{cpus}-{memory}", args.profile)
+                 args.output / f"{cpus}-{memory}", args.profile, args.contract)
 
 
 if __name__ == "__main__":

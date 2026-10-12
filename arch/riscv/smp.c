@@ -3,12 +3,14 @@
 #include <arch/riscv/direct_map.h>
 #include <arch/riscv/sbi.h>
 #include <arch/riscv/sv39.h>
+#include <arch/riscv/mmu_context.h>
 #include <arch/riscv/timer.h>
 #include <arch/riscv/trap.h>
 #include <arch/riscv/virt_uart.h>
 #include <kernel/scheduler.h>
 #include <kernel/time.h>
 #include <kernel/tick.h>
+#include <kernel/page.h>
 #include <stddef.h>
 
 static struct kernel_cpu secondary_cpu;
@@ -251,6 +253,26 @@ void riscv_smp_sync_kernel(uint64_t address, uint64_t size)
         long error = sbi_remote_sfence(cpus[1]->hardware_id, address, size);
         if (error) riscv_smp_fail("RFENCE", error);
         kernel_cpu_current()->rfence_requests++;
+    }
+}
+void riscv_smp_sync_user(uint32_t targets, uint64_t address, uint64_t size,
+    int instructions)
+{
+    struct kernel_cpu *local = kernel_cpu_current();
+    if (local->raw_locks || (targets & ~((1U << BOAROS_MAX_CPUS) - 1U))) __builtin_trap();
+    if (size == BOAROS_PAGE_SIZE) riscv_mmu_flush_address(address);
+    else riscv_mmu_flush_all();
+    if (instructions) riscv_mmu_sync_instructions();
+    for (unsigned i = 0; i < cpu_count; i++) {
+        if (!(targets & (1U << i)) || cpus[i] == local) continue;
+        if (!kernel_cpu_online(cpus[i])) riscv_smp_fail("MM-inactive-target", -1);
+        long error = sbi_remote_sfence(cpus[i]->hardware_id, address, size);
+        if (error) riscv_smp_fail("MM-RFENCE", error);
+        local->rfence_requests++;
+        if (instructions) {
+            error = sbi_remote_fence_i(cpus[i]->hardware_id);
+            if (error) riscv_smp_fail("MM-FENCE.I", error);
+        }
     }
 }
 #endif

@@ -27,6 +27,9 @@ struct kernel_cpu {
     struct kernel_raw_guard *raw_locks;
     uint32_t initialized, preempt_depth;
     struct kernel_task *switch_previous;
+    /* 当前地址空间记录借用由执行task的MM owner覆盖，切换失效后才清旧bit。 */
+    void *active_mm_record;
+    uint64_t active_mm_generation;
     struct kernel_task *idle;
     struct kernel_cpu *scheduler_next;
     struct kernel_rt_bandwidth rt_bandwidth;

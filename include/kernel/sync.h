@@ -9,6 +9,7 @@
 struct kernel_io_context;
 struct kernel_lock_guard;
 struct kernel_lock_waiter;
+struct kernel_mm_user_pin;
 /* 任务级可睡眠对象锁；独立rank30 raw保护内部资格，登记时嵌套rank40调度锁。
  * rank/key、不可递归和guard owner随任务保留。释放内部raw后park，先授资格再wake；
  * 尚未运行的获得者也计入占用。读者批次保留handoff owner及原边界，每段最多16项，
@@ -36,6 +37,7 @@ struct kernel_lock_guard {
 };
 struct kernel_io_context {
     struct kernel_lock_guard *locks;
+    struct kernel_mm_user_pin *user_pins;
     unsigned allocation_depth;
     uint32_t reclaim_depth;
     unsigned backend_depth;
@@ -49,6 +51,9 @@ struct kernel_mutex { struct kernel_rwlock lock; };
 struct kernel_io_context *kernel_io_context_current(void);
 void kernel_rwlock_init(struct kernel_rwlock *lock, uint32_t rank, uintptr_t key);
 int kernel_rwlock_try_read(struct kernel_rwlock *lock, struct kernel_lock_guard *guard);
+/* 不登记等待者，不越过pending/handoff；忙时guard及IRQ状态不变。
+ * 上下文、rank/key、递归与owner检查仍与阻塞取得相同。 */
+int kernel_rwlock_try_write(struct kernel_rwlock *lock, struct kernel_lock_guard *guard);
 void kernel_rwlock_read(struct kernel_rwlock *lock, struct kernel_lock_guard *guard);
 void kernel_rwlock_write(struct kernel_rwlock *lock, struct kernel_lock_guard *guard);
 void kernel_lock_release(struct kernel_lock_guard *guard);
@@ -74,4 +79,6 @@ static inline void kernel_mutex_init(struct kernel_mutex *lock, uint32_t rank, u
 { kernel_rwlock_init(&lock->lock, rank, key); }
 static inline void kernel_mutex_lock(struct kernel_mutex *lock, struct kernel_lock_guard *guard)
 { kernel_rwlock_write(&lock->lock, guard); }
+static inline int kernel_mutex_try_lock(struct kernel_mutex *lock, struct kernel_lock_guard *guard)
+{ return kernel_rwlock_try_write(&lock->lock, guard); }
 #endif

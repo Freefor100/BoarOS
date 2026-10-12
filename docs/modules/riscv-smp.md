@@ -1,8 +1,8 @@
 # RV 受控两核调度
 
 默认构建和LA仍为单CPU。`kernel-rv-smp`独立配置最多两个逻辑CPU，CPU0是固件选择的boot hart，
-CPU1运行显式创建的受控内核任务。用户任务、现有worker、共享MM和系统压力回收只在CPU0执行。
-这项范围不提供用户线程跨核或共享用户MM的并发语义。
+CPU1运行显式创建的受控内核任务，可绑定受控私有匿名 MM。用户任务、现有worker、文件/共享后备和系统压力回收仍只在CPU0执行。
+这项范围不提供普通用户线程跨核或跨 MM 的 MAP_SHARED 并发语义。
 
 ## 启动与本地状态
 
@@ -36,12 +36,15 @@ IPI软件事件使用release发布、exchange消费；接收先清SSIP。通知�
 全部预检后发布叶子，撤销后先摘空表，完成本地SFENCE与在线远端RFENCE，才释放表、栈及槽位。
 发布或摘除非叶父项使用全范围失效，不能只指定某个叶VA；已有父表中的叶修改可使用范围RFENCE。
 RFENCE错误走fatal并保留owner。单页接口仍是批量接口的包装。
-受控任务不得进入MM、文件、设备、协议或系统压力回调；并行allocator使用CPU0预留、无压力hook的私有arena。
+受控任务仅能进入已绑定的私有匿名 MM，不得进入文件、设备、协议或系统压力回调；并行 allocator/MM 使用 CPU0 预留、无压力 hook 的私有 arena。
+`kernel_thread_create_joinable_mm()`在最终 ONLINE 复查后才转移 caller MM，失败不发布 join 或身份；缓存 root 不取得额外引用。当前任务借用覆盖执行，最后 MM 释放由 CPU0 可信栈的统一 join/reaper 路径完成。活动 MM 借用归零也是 CPU 停止条件。
 
 ## 验证入口与证据边界
 
 ```sh
-make test-smp-host
+make test-smp-host test-mm-pin-host test-mm-concurrency-host
+make test-mm-smp-riscv
+make test-mm-smp-userland-riscv INIT_CONFIG=config/init.json
 make kernel-rv-smp
 make test-smp-riscv QEMU_RISCV64=build/data-path-baselines/sync-b3/qemu-system-riscv64 \
   QEMU_RISCV_FIRMWARE=build/data-path-baselines/sync-b3/firmware.bin
@@ -68,7 +71,7 @@ host直接链接生产DTB、调度/策略/runqueue/raw实现，验证稀疏身�
 这些启动不计自然退出或资源回收成功。默认RV完整回归及512MiB/1GiB/16GiB启动、双侧glibc五形态、
 1366ABI、userland/guard/栈和相关SQLite/NBD、设备、网络及终端门禁通过；未重跑完整比赛Harness或全断电矩阵。
 
-默认关闭COST。当前固定工具产物中，SMP任务为2752字节（单CPU2688），CPU记录1952字节（单CPU272）；
+默认关闭COST。2026-10-11调度核心产物中，SMP任务为2752字节（单CPU2688），CPU记录1952字节（单CPU272）；
 每个任务仍持一个metadata页，没有为资格节点增加引用或页。secondary常驻16KiB栈及独立idle/CPU记录；
 同配置生产ELF的BSS比单CPU多25056字节，包含新增记录和链接对齐。
 资格挑选O(1)，入队/摘除最多维护两份资格索引。每次启动报告IPI发送/接收、RFENCE请求与整启动耗时，
@@ -86,3 +89,11 @@ host直接链接生产DTB、调度/策略/runqueue/raw实现，验证稀疏身�
 `5713c546693820d225e87795a14e8177343cb7ac4d9b0610a9e41c7203eb023d`，固件SHA-256
 `894e2aef99590fc07ec6c60ab00282b8bc5d5d5bb2a1d0c6ada0c52df24274c0`。
 CI身份另记。启动交接及非叶失效依据见[学习说明](../learning/smp-handoff.md)。
+
+## 私有匿名 MM 验证
+
+`build/riscv-mm-smp-test/`保存独立测试构建，默认内核入口保持单CPU。2026-10-12 的 MTTCG 2/1 CPU、512MiB/1GiB验证了：旧 write pin 排空后降权和 fork、自持pin时gate忙返回冲突并继续归还、持pin任务迁移后原栈/token/内容保持、父子同时 COW 写隔离、实际 SUM 缓存写权限撤销与重映射、延迟 RFENCE 时数据/两级空表 owner 不归还；真实 U-mode 微探针验证42→84的新代码、NX及内核地址拒读。微探针不执行普通用户 syscall，不作为用户线程跨核验收。
+
+绑定任务 metadata/stack OOM 保留 caller MM 和空 join；自然退出要求 pin/active/pending 为零、所有任务与等待存储归还，16MiB 私有 arena 的 available 回到 finalize 后4079页并独占 audit，再归还系统 order12 owner。MM RFENCE及FENCE.I错误各用双RAM独立启动，核对新调用链保留 owner 后 fatal；不计自然退出或回收成功。CPU0 原静态/pthread程序与CPU1私有MM工作重叠的组合独立执行。
+
+当前 RV 测试产物的 MM 记录544字节、pin56字节、SMP task2768字节和CPU记录1968字节；默认 task2688、CPU288。记录和任务仍各占一个metadata页，pin与退休批次不动态分配；单页pin增加实际acquire/release及两段raw，COW共享页才复制4KiB。并发gate入口检查当前任务的pin链，成本为O(K)，K仅是该owner尚持片段数，普通逐页复制每次先归还片段。每段退休最多16个owner；页表准备最多两张，竞争可产生 loser 和重试，不能由容量上界宣称应用变快。runner保存整启动OFF时间、实际指令同步和 owner 计数；没有新增匹配性能门槛、并行吞吐或硬件性能结论。

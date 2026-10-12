@@ -73,6 +73,8 @@ long sbi_send_ipi(uint64_t hart)
 { return sbi_ecall(SBI_EXT_IPI, 0, 1, hart, 0, 0).error; }
 long sbi_remote_sfence(uint64_t hart, uint64_t address, uint64_t size)
 { return sbi_ecall(SBI_EXT_RFENCE, 1, 1, hart, address, size).error; }
+long sbi_remote_fence_i(uint64_t hart)
+{ return sbi_ecall(SBI_EXT_RFENCE, 0, 1, hart, 0, 0).error; }
 
 void sbi_shutdown(void)
 {

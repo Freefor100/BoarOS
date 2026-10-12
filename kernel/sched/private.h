@@ -123,6 +123,7 @@ struct kernel_task {
     struct kernel_sched_node eligible_nodes[BOAROS_MAX_CPUS];
     /* controlled=1为私有准备，2持已发布存储owner，直到最终页归还。 */
     uint32_t cpu_mask, controlled;
+    uint64_t bound_mm_context;
 #endif
     unsigned accounted;
     struct kernel_thread_join *join;

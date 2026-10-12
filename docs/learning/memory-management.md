@@ -630,3 +630,21 @@ RV功能核的PT_LOAD映射/内容与匹配新OFF核一致；ELF文件SHA差异�
 可复用缓存和未关闭现场保留。
 
 </details>
+
+## 私有匿名并发的许可与失效完成
+
+自持pin再次进入gate存在真实等待环：另一操作已经持gate排空它，pin owner又排队等gate。宿主以实际park登记和真实生产MM复现阻塞后，采用非阻塞取得；忙时返回`CONFLICT`，保留旧pin/映射，先归还再重试。关闭许可后的再次pin、缺页私有准备后的重取gate也遵守此规则，后者必须清候选和旧COW临时引用。try-write保留FIFO/pending/handoff和上下文检查，不登记等待者；2/4 actor与MTTCG双RAM验证错误返回、后续进展及最终owner。该规则不改变普通无自持pin调用的等待语义。
+
+物理 pin 与权限许可是两件事。PTE、权限和 acquire 必须在同一保护下完成；复制在锁外，只保留已获许可的页内片段。撤映射可摘 PTE 而让旧 pin 完成，降权则先关闭新登记并排空旧片段，fork 只排空写 pin。它们不能靠原子 refcount 单独完成，也不能把复制全部包进 MM raw。
+
+候选准备不能长期持有 raw 或 gate。并发 fault 用 VMA generation/PTE cookie 重新验证准备前事实；COW 复制期间暂持旧页引用，提交后旧映射引用归退休批次。父 fork 的失败资源准备与权限提交分开：子树未完成不改父页，父失效确认后才发布 child。第二张表 OOM、stale candidate 和竞争 loser 都归还实际 owner，不以已分配等同于已接纳。
+
+active bit 的含义是“旧翻译仍可能被该CPU使用”，不是 scheduler 的任务归属。目标集合采样后的新进入者须先登记、切根并失效；退出者本地失效完成后才清位，同SATP并发域也不能省略。固定本地 Linux `references/linux/arch/riscv/mm/context.c`、`tlbflush.c`、`cacheflush.c`，commit `f4cdf7ca9a1fdcca413157df19753f388a5a224e`，用于核对发布与本地/远端区别。OpenSBI `references/opensbi/lib/sbi/sbi_ecall_rfence.c`、`sbi_tlb.c`，v1.8.1 `74434f255873d74e56cc50aa762d1caf24c099f8`，确认 RFENCE/FENCE.I 完成。非叶清除要求全范围，固定特权规范身份见[启动交接](smp-handoff.md)。
+
+CPU0预留16MiB arena拥有独立 allocator/heap/root template；只有kernel高半区子树由系统owner借用，allocator equality未放宽。用这一隔离域验证同MM多owner和fork/COW，不把系统压力或文件业务并发偷偷带入。绑MM任务退出必须在通用可信栈释放入口归还MM；只在某个task-storage包装里清理，会遗漏实际join路径，本轮真实资源基线曾发现这一遗漏，修复后全路径归零。
+
+验证命令与硬件/模型范围见[MM](../modules/kernel-mm.md#私有匿名-mm-的并发与回收)和[两核验证](../modules/riscv-smp.md#私有匿名-mm-验证)。宿主替换CSR/通知的活动集合握手不作为真实RFENCE证据；原SMP栈的错误profile也不能代替新MM链路。新链路独立注入RFENCE/FENCE.I错误，保留批次/live owner后fatal，回收未验证。正确性启动的OFF整段时间及固定容量计数不支持性能收益结论，默认单CPU与LA结果分列。
+
+实际 U-mode 微探针还暴露了测试上下文自身的中断假设：一次 scause=supervisor timer 到达正在执行的小段 U 指令，控制任务并不是普通用户 task，因而进入 fatal。固定特权规范20260120第3.1.6.1节规定，高特权中断不受低特权执行时的全局 SIE 位屏蔽；微探针改为暂时清 sie 源、返回S态后原样恢复。正常调度/用户 timer 行为没有修改。该探针只验证取指/访问权限，抢占证据仍来自生产调度及原用户程序，不能用屏蔽源的探针声称覆盖 U-mode 抢占。
+
+候选页和COW替换使用 `KERNEL_MM_NO_PAGE=UINT64_MAX`，不是0。RV合法物理页可以位于0；将0作“未准备/已消费/原地恢复”会拒绝合法表、漏归还候选，或把新页误作原地恢复。`test-mm-concurrency-host`的独立零地址模型导入bootstrap零页owner，验证零地址表、COW来源、末引用恢复、新替换与最终审计；它用access映射到宿主pool，不把启动期物理直访builder当成可迁移的宿主runtime walker。LA目录的0仍表达缺表，保留其原后端范围约束。

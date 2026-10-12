@@ -111,7 +111,7 @@ enum kernel_scheduler_status kernel_scheduler_exec_commit(void)
      * a non-leader exec adopted the group leader's identity. */
     kernel_futex_release_robust(thread, old_tid);
     kernel_futex_release_mm(thread);
-    if (arch_mmu_switch_context(new_context) != ARCH_MMU_STATUS_OK) {
+    if (kernel_mm_activate(&transaction->image.mm, scheduler.kernel_context) != KERNEL_MM_STATUS_OK) {
         return KERNEL_SCHEDULER_STATUS_ADDRESS_SPACE;
     }
     transaction->retired_mm = thread->mm;

@@ -13,15 +13,10 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-_Thread_local uintptr_t sync_test_irq = 1;
-_Thread_local uint64_t mm_test_context;
-static _Thread_local struct kernel_cpu cpu;
-static _Thread_local struct kernel_io_context io, other_io;
-static _Thread_local int wrong_owner;
+extern _Thread_local uint64_t mm_test_context;
+extern _Thread_local int mm_test_wrong_owner;
+void mm_test_attach(unsigned);
 static unsigned char pool[4 * 1024 * 1024] __attribute__((aligned(16384)));
-void *sync_test_cpu(void) { return &cpu; }
-struct kernel_io_context *kernel_io_context_current(void)
-{ return wrong_owner ? &other_io : &io; }
 void kernel_console_putc(char c) { fputc(c, stderr); }
 void mm_test_fence(uint64_t address, int instructions)
 { (void)address; (void)instructions; __atomic_thread_fence(__ATOMIC_SEQ_CST); }
@@ -37,7 +32,7 @@ static void fatal_pins(struct kernel_mm *mm, uint64_t address)
         if (!child) {
             struct kernel_mm_user_pin pin = {0};
             assert(!kernel_mm_pin_user_page(mm, address, KERNEL_MM_READ, &pin));
-            if (which == 0) wrong_owner = 1;
+            if (which == 0) mm_test_wrong_owner = 1;
             if (which == 1) {
                 struct kernel_mm_user_pin copy = pin;
                 kernel_mm_unpin_user_page(&copy);
@@ -60,7 +55,7 @@ int main(void)
     struct arch_mmu_user_space space = {0};
     struct kernel_heap heap = {0};
     struct kernel_mm mm = {0};
-    kernel_cpu_initialize(&cpu, 0, &io);
+    mm_test_attach(0);
     layout.usable_count = 1;
     layout.usable[0].base = (uintptr_t)pool;
     layout.usable[0].size = sizeof(pool);

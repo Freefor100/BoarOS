@@ -3,12 +3,12 @@
 #include <stdint.h>
 struct kernel_task;
 void mm_test_unavailable(void);
-struct kernel_task *kernel_task_current(void) { return 0; }
 uint64_t kernel_task_current_stack_limit(void) { return 0; }
 #define EXCLUDED(name) void name(void) { mm_test_unavailable(); }
 EXCLUDED(kernel_shm_attachment_close)
 EXCLUDED(kernel_shm_attachment_open)
 EXCLUDED(kernel_elf64_source_release)
+EXCLUDED(kernel_elf64_source_acquire)
 EXCLUDED(kernel_elf64_source_page)
 EXCLUDED(kernel_memory_object_release)
 EXCLUDED(kernel_memory_object_create)
@@ -32,4 +32,10 @@ EXCLUDED(kernel_open_file_lookup_page)
 EXCLUDED(kernel_open_file_pread)
 EXCLUDED(kernel_open_file_alias_attach)
 EXCLUDED(kernel_page_cache_alias_mark_dirty)
-EXCLUDED(kernel_lock_release)
+EXCLUDED(kernel_memory_object_acquire)
+EXCLUDED(kernel_open_file_acquire)
+EXCLUDED(kernel_page_cache_alias_clone)
+EXCLUDED(kernel_file_mapping_register)
+EXCLUDED(kernel_open_file_sync_range)
+EXCLUDED(kernel_shm_attachment_acquire)
+EXCLUDED(kernel_shm_attachment_release)

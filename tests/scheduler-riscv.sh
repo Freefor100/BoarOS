@@ -53,10 +53,21 @@ if ! grep -q "<$validate_thread_symbol>:" "$hot_disassembly"; then
     exit 1
 fi
 
-if grep -Eq 'R_RISCV_CALL(_PLT)?[[:space:]]+(kernel_mm_|riscv_kernel_mm_|kernel_pid_|physical_page_|kernel_files_|kernel_fs_context_|kernel_exec_)' \
-    "$hot_disassembly"; then
+# 地址空间活动集合属于切换交接；该入口不取得/归还引用或执行映射业务。
+# 其余MM/PID/页生命周期仍禁止进入tick/挑选路径。
+if sed '/R_RISCV_CALL.*kernel_mm_activate[[:space:]]*$/d' "$hot_disassembly" |
+    grep -Eq 'R_RISCV_CALL(_PLT)?[[:space:]]+(kernel_mm_|riscv_kernel_mm_|kernel_pid_|physical_page_|kernel_files_|kernel_fs_context_|kernel_exec_)'; then
     cat "$hot_disassembly" >&2
     echo "scheduler tick path performs MM, PID, or physical-page lifecycle work" >&2
+    exit 1
+fi
+
+mm_object=$(dirname "$scheduler_object")/../../mm/mm.o
+"$objdump" -dr --disassemble=kernel_mm_activate "$mm_object" >"$output_dir/mm-activate.dis"
+if ! grep -q '<kernel_mm_activate>:' "$output_dir/mm-activate.dis" ||
+   grep -Eq 'R_RISCV_CALL(_PLT)?[[:space:]]+(kernel_mm_(create|acquire|release|fork|pin|unpin|resolve_user)|physical_page_(allocate|acquire|release)|kernel_heap_|kernel_pid_|kernel_files_|kernel_fs_context_|kernel_exec_)' "$output_dir/mm-activate.dis"; then
+    cat "$output_dir/mm-activate.dis" >&2
+    echo "MM activation changes lifecycle owners or enters business work" >&2
     exit 1
 fi
 

@@ -186,8 +186,15 @@ static enum kernel_scheduler_status validate_thread(
     }
 
     if (thread->arch.user_mode == 0U) {
+        int bound_mm = 0;
+#if BOAROS_MAX_CPUS > 1
+        bound_mm = thread->bound_mm_context != 0;
+        if (bound_mm && (!thread->controlled || thread->mm.state != KERNEL_MM_LIVE ||
+            arch_thread_mm(&thread->arch) != thread->bound_mm_context))
+            return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
+#endif
         if (thread->arch.user_sp != 0U ||
-            arch_thread_mm(&thread->arch) != scheduler.kernel_context ||
+            (!bound_mm && arch_thread_mm(&thread->arch) != scheduler.kernel_context) ||
             thread->completion.kind != KERNEL_THREAD_KIND_KERNEL ||
             thread->completion.tid != 0 ||
             thread->completion.tgid != 0 ||
@@ -195,7 +202,7 @@ static enum kernel_scheduler_status validate_thread(
             thread->group_leader != 0 || thread->group_members != 0U ||
             thread->files.state != KERNEL_FILES_EMPTY ||
             thread->fs.state != KERNEL_FS_CONTEXT_EMPTY ||
-            thread->mm.state != KERNEL_MM_EMPTY ||
+            (!bound_mm && thread->mm.state != KERNEL_MM_EMPTY) ||
             thread->exec_transaction != 0) {
             return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
         }
@@ -334,11 +341,8 @@ enum kernel_scheduler_status activate_thread_address_space(
     if (thread == 0) {
         return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
     }
-    if (arch_mmu_current_context() == arch_thread_mm(&thread->arch)) {
-        return KERNEL_SCHEDULER_STATUS_OK;
-    }
-    if (arch_mmu_switch_context(arch_thread_mm(&thread->arch)) !=
-        ARCH_MMU_STATUS_OK) {
+    if (kernel_mm_activate(thread->mm.state == KERNEL_MM_LIVE ? &thread->mm : 0,
+        scheduler.kernel_context) != KERNEL_MM_STATUS_OK) {
         return KERNEL_SCHEDULER_STATUS_ADDRESS_SPACE;
     }
     return KERNEL_SCHEDULER_STATUS_OK;
@@ -660,6 +664,14 @@ enum kernel_scheduler_status release_task_stack(struct kernel_task *thread)
     kernel_assert_service_context();
     if (thread && (thread->wait.on_cpu || thread->wait.borrows || thread->wait.nodes ||
         thread->wait.phase != KERNEL_WAIT_FINISHED)) __builtin_trap();
+    if (thread && thread->io_context.user_pins) __builtin_trap();
+#if BOAROS_MAX_CPUS > 1
+    /* join、自动reaper及构造回滚共用可信清理点；不能只在join归还MM。 */
+    if (thread && thread->bound_mm_context && thread->mm.state == KERNEL_MM_LIVE) {
+        if (kernel_mm_release(&thread->mm) != KERNEL_MM_STATUS_OK) __builtin_trap();
+        thread->bound_mm_context = 0;
+    }
+#endif
     const unsigned char *cursor;
     uint64_t free_bytes;
     uint64_t used_bytes;
@@ -734,6 +746,7 @@ enum kernel_scheduler_status release_task_storage(
 {
     if (thread->wait.on_cpu || thread->wait.borrows || thread->wait.nodes ||
         thread->wait.phase != KERNEL_WAIT_FINISHED) __builtin_trap();
+    if (thread->io_context.user_pins) __builtin_trap();
     enum kernel_scheduler_status status = release_task_stack(thread);
     if (status != KERNEL_SCHEDULER_STATUS_OK) return status;
     scheduler_forget_task(thread);
@@ -875,12 +888,15 @@ static unsigned available_cpu_mask_locked(void)
 
 static enum kernel_scheduler_status create_kernel_thread(
     void (*entry)(void *), void *argument, struct kernel_thread_join *join,
-    uint32_t cpu_mask)
+    uint32_t cpu_mask, struct kernel_mm *bound_mm)
 {
     struct kernel_task *thread;
     uintptr_t old_status;
     enum arch_context_status context_status;
     enum kernel_scheduler_status status;
+    uint64_t bound_context = 0;
+    if (bound_mm && kernel_mm_concurrent_context(bound_mm, &bound_context) != KERNEL_MM_STATUS_OK)
+        return KERNEL_SCHEDULER_STATUS_ADDRESS_SPACE;
 
     if (scheduler.initialized != KERNEL_SCHEDULER_INITIALIZED) {
         return KERNEL_SCHEDULER_STATUS_NOT_INITIALIZED;
@@ -915,7 +931,7 @@ static enum kernel_scheduler_status create_kernel_thread(
     (void)cpu_mask;
 #endif
     thread->arch.user_mode = 0U;
-    arch_thread_set_mm(&thread->arch, scheduler.kernel_context);
+    arch_thread_set_mm(&thread->arch, bound_mm ? bound_context : scheduler.kernel_context);
     thread->magic = KERNEL_THREAD_MAGIC;
     thread->next = 0;
     thread->state = KERNEL_THREAD_STATE_READY;
@@ -958,6 +974,15 @@ static enum kernel_scheduler_status create_kernel_thread(
             status = KERNEL_SCHEDULER_STATUS_INVALID_STATE;
 #endif
         if (status == KERNEL_SCHEDULER_STATUS_OK) {
+            /* 最终ONLINE复查后才转移MM owner；失败保留caller原句柄。 */
+            if (bound_mm) {
+                if (kernel_mm_move(&thread->mm, bound_mm) != KERNEL_MM_STATUS_OK) __builtin_trap();
+#if BOAROS_MAX_CPUS > 1
+                thread->bound_mm_context = bound_context;
+#else
+                __builtin_trap();
+#endif
+            }
             if (join) {
                 if (join->task) __builtin_trap();
                 join->task = thread;
@@ -983,14 +1008,14 @@ restore_interrupts:
 
 enum kernel_scheduler_status kernel_thread_create_joinable(
     void (*entry)(void *), void *argument, struct kernel_thread_join *join)
-{ return create_kernel_thread(entry, argument, join, 0); }
+{ return create_kernel_thread(entry, argument, join, 0, 0); }
 
 #if BOAROS_MAX_CPUS > 1
 int kernel_scheduler_core_quiescent(struct kernel_cpu *cpu)
 {
     KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
     return !scheduler.controlled_owners && cpu && cpu->current == cpu->idle &&
-        !cpu->switch_previous && !cpu->eligible.first;
+        !cpu->switch_previous && !cpu->eligible.first && !cpu->active_mm_record;
 }
 enum kernel_scheduler_status kernel_thread_create_joinable_mask(
     void (*entry)(void *), void *argument, struct kernel_thread_join *join, uint32_t mask)
@@ -1000,7 +1025,18 @@ enum kernel_scheduler_status kernel_thread_create_joinable_mask(
     { KERNEL_RAW_SCOPE(guard, &kernel_wait_domain);
       available = available_cpu_mask_locked(); }
     if (mask & ~available) return KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
-    return create_kernel_thread(entry, argument, join, mask);
+    return create_kernel_thread(entry, argument, join, mask, 0);
+}
+enum kernel_scheduler_status kernel_thread_create_joinable_mm(
+    void (*entry)(void *), void *argument, struct kernel_thread_join *join,
+    uint32_t mask, struct kernel_mm *mm)
+{
+    kernel_assert_service_context();
+    if (!join || !mm || !mask || (mask & ~3U)) return KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
+    unsigned available;
+    { KERNEL_RAW_SCOPE(guard, &kernel_wait_domain); available = available_cpu_mask_locked(); }
+    if (mask & ~available) return KERNEL_SCHEDULER_STATUS_INVALID_ARGUMENT;
+    return create_kernel_thread(entry, argument, join, mask, mm);
 }
 
 enum kernel_scheduler_status kernel_thread_set_cpu_mask(struct kernel_thread_join *join,

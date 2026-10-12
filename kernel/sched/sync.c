@@ -99,7 +99,8 @@ static int acquire(struct kernel_rwlock *lock, struct kernel_lock_guard *guard, 
 #endif
     struct kernel_raw_guard metadata = {0};
     kernel_raw_lock_acquire(&lock->metadata, &metadata);
-    if (try_only && (lock->writer || lock->pending_head || lock->handoff_owner)) {
+    int busy = lock->writer || lock->pending_head || lock->handoff_owner || (write && lock->readers);
+    if (try_only && busy) {
         kernel_raw_lock_release(&metadata);
         arch_interrupt_restore(irq);
         return 0;
@@ -107,7 +108,7 @@ static int acquire(struct kernel_rwlock *lock, struct kernel_lock_guard *guard, 
 #if BOAROS_COST_DIAGNOSTICS
     uint64_t grant_ticks = hold_start;
 #endif
-    if (lock->writer || lock->pending_head || lock->handoff_owner || (write && lock->readers)) {
+    if (busy) {
 #if BOAROS_COST_DIAGNOSTICS
         grant_ticks = acquire_waiter(lock, owner, write, &metadata, rank, metric);
 #else
@@ -140,6 +141,8 @@ static int acquire(struct kernel_rwlock *lock, struct kernel_lock_guard *guard, 
 }
 int kernel_rwlock_try_read(struct kernel_rwlock *lock, struct kernel_lock_guard *guard)
 { return acquire(lock, guard, 0, 1); }
+int kernel_rwlock_try_write(struct kernel_rwlock *lock, struct kernel_lock_guard *guard)
+{ return acquire(lock, guard, 1, 1); }
 void kernel_rwlock_read(struct kernel_rwlock *lock, struct kernel_lock_guard *guard)
 { (void)acquire(lock, guard, 0, 0); }
 void kernel_rwlock_write(struct kernel_rwlock *lock, struct kernel_lock_guard *guard)
