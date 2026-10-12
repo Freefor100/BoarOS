@@ -1,0 +1,35 @@
+/* 私有匿名MM模型不执行文件、共享对象或进程业务。意外进入时立即失败，
+ * 这些入口不是成功存根，也不作为对应子系统的验收证据。 */
+#include <stdint.h>
+struct kernel_task;
+void mm_test_unavailable(void);
+struct kernel_task *kernel_task_current(void) { return 0; }
+uint64_t kernel_task_current_stack_limit(void) { return 0; }
+#define EXCLUDED(name) void name(void) { mm_test_unavailable(); }
+EXCLUDED(kernel_shm_attachment_close)
+EXCLUDED(kernel_shm_attachment_open)
+EXCLUDED(kernel_elf64_source_release)
+EXCLUDED(kernel_elf64_source_page)
+EXCLUDED(kernel_memory_object_release)
+EXCLUDED(kernel_memory_object_create)
+EXCLUDED(kernel_memory_object_get_page)
+EXCLUDED(kernel_memory_object_discard_new_page)
+EXCLUDED(kernel_open_file_node)
+EXCLUDED(kernel_file_mapping_unregister)
+EXCLUDED(kernel_open_file_release)
+EXCLUDED(kernel_page_cache_alias_detach)
+EXCLUDED(kernel_task_mm_borrow)
+EXCLUDED(kernel_proc_task_block_reads)
+EXCLUDED(kernel_proc_task_note_fault)
+EXCLUDED(kernel_vfs_node_lock)
+EXCLUDED(kernel_open_file_size)
+EXCLUDED(kernel_open_file_memory_backed)
+EXCLUDED(kernel_open_file_get_page_for_fault)
+EXCLUDED(kernel_open_file_memory_modified)
+EXCLUDED(kernel_open_file_discard_new_page)
+EXCLUDED(kernel_open_file_get_page)
+EXCLUDED(kernel_open_file_lookup_page)
+EXCLUDED(kernel_open_file_pread)
+EXCLUDED(kernel_open_file_alias_attach)
+EXCLUDED(kernel_page_cache_alias_mark_dirty)
+EXCLUDED(kernel_lock_release)

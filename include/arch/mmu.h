@@ -4,6 +4,7 @@
 #include <arch/loongarch/mmu.h>
 #else
 #include <arch/riscv/sv39.h>
+#include <arch/riscv/mmu_context.h>
 #define ARCH_MMU_STATE_ACTIVE RISCV_SV39_STATE_ACTIVE
 #define arch_mmu_page_table riscv_sv39_page_table
 #define arch_mmu_user_space_init riscv_sv39_user_space_init
@@ -46,8 +47,8 @@
 #define ARCH_MMU_USER_SPACE_LIVE RISCV_SV39_USER_SPACE_LIVE
 #define ARCH_MMU_WRITE RISCV_SV39_WRITE
 static inline void arch_mmu_sync_instructions(void)
-{ __asm__ volatile("fence.i" ::: "memory"); }
+{ riscv_mmu_sync_instructions(); }
 static inline void arch_mmu_flush_address(uint64_t address)
-{ __asm__ volatile("sfence.vma %0, zero" :: "r"(address) : "memory"); }
+{ riscv_mmu_flush_address(address); }
 #endif
 #endif

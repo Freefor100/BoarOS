@@ -1,6 +1,7 @@
 #include <kernel/cost.h>
 #include <arch/riscv/smp.h>
 #include <arch/riscv/sv39.h>
+#include <arch/riscv/mmu_context.h>
 #include <kernel/page.h>
 
 #include <stdint.h>
@@ -309,17 +310,14 @@ enum riscv_sv39_status riscv_sv39_map_range(
 
 uint64_t riscv_sv39_current_satp(void)
 {
-    uint64_t value;
-
-    __asm__ volatile("csrr %0, satp" : "=r"(value));
-    return value;
+    return riscv_mmu_context_read();
 }
 
 static void write_satp(uint64_t value)
 {
-    __asm__ volatile("sfence.vma zero, zero" ::: "memory");
-    __asm__ volatile("csrw satp, %0" : : "r"(value) : "memory");
-    __asm__ volatile("sfence.vma zero, zero" ::: "memory");
+    riscv_mmu_flush_all();
+    riscv_mmu_context_write(value);
+    riscv_mmu_flush_all();
 }
 
 enum riscv_sv39_status riscv_sv39_switch_satp(uint64_t satp)
@@ -559,7 +557,7 @@ static void kernel_window_sync(uint64_t address, uint64_t size)
     riscv_smp_sync_kernel(address, size);
 #else
     (void)address; (void)size;
-    __asm__ volatile("sfence.vma" ::: "memory");
+    riscv_mmu_flush_all();
 #endif
 }
 
@@ -1291,10 +1289,7 @@ enum riscv_sv39_status riscv_sv39_user_resolve_cow(
         *leaf = user_leaf_entry(old_address, permissions);
         space->cow_pages--;
         space->cow_in_place++;
-        __asm__ volatile("sfence.vma %0, zero"
-                         :
-                         : "r"(virtual_address & ~BOAROS_PAGE_MASK)
-                         : "memory");
+        riscv_mmu_flush_address(virtual_address & ~BOAROS_PAGE_MASK);
         return RISCV_SV39_STATUS_OK;
     }
 
@@ -1327,12 +1322,9 @@ enum riscv_sv39_status riscv_sv39_user_resolve_cow(
     space->cow_pages--;
     space->cow_copies++;
     if ((permissions & RISCV_SV39_EXECUTE) != 0U) {
-        __asm__ volatile("fence.i" : : : "memory");
+        riscv_mmu_sync_instructions();
     }
-    __asm__ volatile("sfence.vma %0, zero"
-                     :
-                     : "r"(virtual_address & ~BOAROS_PAGE_MASK)
-                     : "memory");
+    riscv_mmu_flush_address(virtual_address & ~BOAROS_PAGE_MASK);
     return RISCV_SV39_STATUS_OK;
 }
 
@@ -1669,7 +1661,7 @@ enum riscv_sv39_status riscv_sv39_user_unmap_owned_range(
         return status;
     }
     if (changed != 0) {
-        __asm__ volatile("sfence.vma zero, zero" : : : "memory");
+        riscv_mmu_flush_all();
     }
     return release_invalidated_range(space,
                                  start,
@@ -1717,11 +1709,11 @@ enum riscv_sv39_status riscv_sv39_user_protect_owned_page(
         replacement = cow ? user_cow_entry(entry_address(old), permissions)
                           : user_leaf_entry(entry_address(old), permissions);
         if (permissions & RISCV_SV39_EXECUTE)
-            __asm__ volatile("fence.i" ::: "memory");
+            riscv_mmu_sync_instructions();
     }
     if (replacement != old) {
         *leaf = replacement;
-        __asm__ volatile("sfence.vma %0, zero" :: "r"(address) : "memory");
+        riscv_mmu_flush_address(address);
         space->protect_address_flushes++;
         COST_ADD(MPROTECT_ADDRESS_TLB, 1);
     }
@@ -1781,7 +1773,7 @@ enum riscv_sv39_status riscv_sv39_user_protect_owned_range(
     }
     if ((permissions & RISCV_SV39_EXECUTE) != 0U &&
         (active_pages != 0U || protected_pages != 0U)) {
-        __asm__ volatile("fence.i" : : : "memory");
+        riscv_mmu_sync_instructions();
     }
     status = resolve_runtime_table(space->allocator,
                                    space->root_address,
@@ -1885,7 +1877,7 @@ enum riscv_sv39_status riscv_sv39_user_protect_owned_range(
     if (changed != 0) {
         space->protect_global_flushes++;
         COST_ADD(MPROTECT_GLOBAL_TLB, 1);
-        __asm__ volatile("sfence.vma zero, zero" : : : "memory");
+        riscv_mmu_flush_all();
     }
     return RISCV_SV39_STATUS_OK;
 }
@@ -2147,7 +2139,7 @@ static enum riscv_sv39_status commit_parent_cow(
             }
         }
     }
-    __asm__ volatile("sfence.vma zero, zero" : : : "memory");
+    riscv_mmu_flush_all();
     return RISCV_SV39_STATUS_OK;
 }
 

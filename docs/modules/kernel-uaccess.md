@@ -35,7 +35,7 @@ enum kernel_uaccess_status kernel_copy_string_from_user(
 
 非零固定长度请求首先验证整个半开区间位于构建期架构用户范围 `[0, ARCH_MMU_USER_LIMIT)`（RV 为 2^38，LA 为 2^47）；整数溢出或越过上限在复制前返回 `KERNEL_UACCESS_STATUS_FAULT`，`bytes_copied=0`。零长度请求不检查用户地址或内核 buffer，直接成功并报告 0。
 
-合法范围按构建期基页边界切分（RV 4 KiB、LA 16 KiB）。每个片段先经 `kernel_mm_lookup()` 查询物理地址和通用权限：若 PTE 尚未驻留，uaccess 用实际读/写方向调用 `kernel_mm_resolve_user_fault()`；anonymous `DEMAND_ZERO`、file-private 和 COW 页都复用该解析器，成功后重查 PTE。写入用户空间要求 `USER|WRITE`，读取用户空间要求 `USER|READ`，随后通过物理页分配器已绑定的 direct-map 访问函数复制。VMA 外、`PROT_NONE`、权限不足、文件整页越过 EOF 或缺页解析得到 `NO_MEMORY` 时返回 `FAULT`；MM 状态、页表结构、设备故障或已映射物理页无法解析返回 `STATE`，不能把真正的内核对象损坏伪装成普通用户 `EFAULT`。
+合法范围按构建期基页边界切分（RV 4 KiB、LA 16 KiB）。每个片段先经 `kernel_mm_pin_user_page()` 查询物理地址、验证通用权限并取得实际物理页引用；若 PTE 尚未驻留或需要 COW，uaccess 用实际读/写方向调用 `kernel_mm_resolve_user_fault()`，成功后重新 pin。anonymous `DEMAND_ZERO`、file-private 和 COW 页都复用该解析器。写入用户空间要求 `USER|WRITE`，读取用户空间要求 `USER|READ`，随后通过物理页分配器已绑定的 direct-map 访问函数复制。VMA 外、`PROT_NONE`、权限不足、文件整页越过 EOF 或缺页解析得到 `NO_MEMORY` 时返回 `FAULT`；MM 状态、页表结构、设备故障或已映射物理页无法解析返回 `STATE`，不能把真正的内核对象损坏伪装成普通用户 `EFAULT`。
 
 固定长度复制不是事务。若前面的完整片段已经复制，后续页未映射或权限不足，函数保留已复制的连续前缀并精确报告 `bytes_copied`；这与 Linux usercopy 允许部分修改目标缓冲区的内部语义一致。文件 `read` 依据这个前缀提交 open-file offset；普通文件 `write/writev` 把可读前缀提交给 backend，只按 backend 实际写入量推进 offset，并在用户 fault 后结束整个请求；`uname` 和文件层只把 `FAULT` 转成用户可见的 `-EFAULT`，内核状态错误仍由 syscall/Trap 边界判为 fatal。
 
@@ -43,16 +43,16 @@ enum kernel_uaccess_status kernel_copy_string_from_user(
 
 ## 并发与性能边界
 
-当前uaccess只对scheduler当前、已经激活的MM提交新页；VMA/PTE检查会在真正分配前拒绝
-非法范围。复制依赖现有单核调用纪律，`resolve_user_page()`本身没有取得覆盖随后复制的
-额外物理页引用，不能单靠这个接口支持共享MM跨核并行；这轮没有复现单核释放后使用错误。
-SMP前必须在同一MM保护下完成映射/权限检查和取得页pin，睡眠后重查VMA/PTE/COW状态，
-按复制片段归还pin。pin解决生命周期，不能代替mprotect权限线性化或远端TLB完成；
-撤映射、降权、截断及COW须与活动CPU集合和延后回收一起验收，保留当前FAULT/STATE
-区分及精确bytes_copied前缀。具体实现归[并发路线](../goals.md#p6c-tlb-完成与页回收)，
-本轮只收口前置契约，不增加新syscall或声称已经取得跨核保护。
+当前uaccess只对已经激活的MM提交新页，驻留页的pin也可用于启动期I/O上下文。
+每个基页片段在MM rank15 raw内完成权限检查和取得页引用，复制及原子用户操作在锁外执行，
+随后由同一任务/I/O owner归还。字符串发现NUL也先归还pin；失败保持精确前缀。
+调用者的LIVE MM句柄覆盖token的寿命；token不可复制或跨任务归还，重复登记/归还fatal。
+页引用要求已finalized的allocator，不把bootstrap单owner页伪装为可共享引用。
 
-驻留页每个基页进行一次三级软件页表查询和一次物理页解析，随后执行页内线性字节复制；首次提交的页额外承担 VMA 二分查找、页分配/清零、PTE 写入和架构转换失效。uaccess 经内核物理映射复制，不切换硬件用户地址空间；RV 不修改 `sstatus.SUM`。文件 `read` 已以 4 KiB staging chunk 使用该路径，但当前只用结构成本和 QEMU 正确性测试约束，尚未取得开发板吞吐、TLB miss 或 cache 数据。应在真实工作负载上比较软件遍历与 RISC-V SUM+异常表快路径，再决定阈值或替换策略。
+pin防止已许可片段使用的页被撤映射后重新发放，不固定内容、权限或映射身份。
+CPU1的MM入口仍被拒绝；映射变更、权限撤销/COW交接与活动CPU/TLB确认尚未形成完整
+跨核协议，不能由pin层的宿主结果推导共享MM已经开放。
+驻留页每个基页进行一次三级软件页表查询、物理页解析及acquire/release，增加一个固定大小栈token；随后执行页内线性字节复制；首次提交的页额外承担 VMA 二分查找、页分配/清零、PTE 写入和架构转换失效。uaccess 经内核物理映射复制，不切换硬件用户地址空间；RV 不修改 `sstatus.SUM`。文件 `read` 已以 4 KiB staging chunk 使用该路径，但当前只用结构成本和 QEMU 正确性测试约束，尚未取得开发板吞吐、TLB miss 或 cache 数据。应在真实工作负载上比较软件遍历与 RISC-V SUM+异常表快路径，再决定阈值或替换策略。
 
 COST 构建在成功解析后的固定长度页内 chunk 记录实际复制字节、次数、单次最大值
 及经过 ticks；解析失败、权限检查和字符串扫描不归入该复制样本。采样不改变已复制
@@ -64,6 +64,7 @@ QEMU `virt` 与 VisionFive 2 共享这套 Sv39 实现，板级 RAM/MMIO 差异�
 ## 验证与限制
 
 ```sh
+make test-mm-pin-host
 make test-uaccess-riscv
 make test-files-partial-write-riscv
 make test-userland-riscv
@@ -74,4 +75,4 @@ make test-riscv
 
 聚焦测试分别覆盖 copy-to、copy-from 和字符串复制的合法同页/跨页、零长度、整体用户范围、读写权限、容量内缺少 NUL、跨入未映射页后的精确前缀、非法内核参数、已释放 MM 和物理页访问失败。VMA 测试让 copy-to 首次提交匿名 mmap 页；真实 U-mode 测试验证 `uname` 的跨页 Linux ABI；文件测试验证跨页路径、超过一页的读缓冲区、`-EFAULT` 与 offset 提交；普通文件写测试覆盖 0、1、32、63、64、65 字节可读前缀、append、跨 iovec 进度和 backend 短写/错误，真实 U-mode 用 `mprotect(PROT_NONE)` 验证同一边界。
 
-当前没有 SUM/异常表快路径、SMP 映射稳定协议或面向原子用户结构读取的序列化辅助接口。硬件 U-mode 缺页的页分配耗尽仍按任务资源耗尽处理；syscall 内 uaccess 则把无法完成本次 fault-in 的 `NO_MEMORY` 隔离为 `FAULT`，保留已复制前缀，由 `uname` 返回 `-EFAULT`、`read` 返回前缀或首字节 `-EFAULT`。这不等于已经实现进程级 OOM killer 或把其他内核分配失败统一转换为 `EFAULT`。
+当前没有 SUM/异常表快路径和完整 SMP 映射稳定协议；32位用户比较交换使用真实原子操作并由页pin覆盖。硬件 U-mode 缺页的页分配耗尽仍按任务资源耗尽处理；syscall 内 uaccess 则把无法完成本次 fault-in 的 `NO_MEMORY` 隔离为 `FAULT`，保留已复制前缀，由 `uname` 返回 `-EFAULT`、`read` 返回前缀或首字节 `-EFAULT`。这不等于已经实现进程级 OOM killer 或把其他内核分配失败统一转换为 `EFAULT`。

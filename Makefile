@@ -1980,6 +1980,16 @@ test-sync-host:
 	build/host/sync
 	python3 -B tests/sync/test_native.py
 
+.PHONY: test-mm-pin-host
+test-mm-pin-host:
+	@mkdir -p build/host/mm
+	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -ffunction-sections -fdata-sections \
+		-DBOAROS_PAGE_SHIFT=12 -Itests/host/mm -Itests/host/sync -idirafter include \
+		tests/host/mm_pin.c tests/host/mm/unavailable.c kernel/cpu.c kernel/raw_lock.c \
+		kernel/physical_page.c mm/heap.c mm/vma.c mm/mm.c mm/uaccess.c arch/riscv/sv39.c \
+		-Wl,--gc-sections -o build/host/mm/pin
+	build/host/mm/pin
+
 .PHONY: test-allocator-concurrency-host
 test-allocator-concurrency-host:
 	@mkdir -p build/host

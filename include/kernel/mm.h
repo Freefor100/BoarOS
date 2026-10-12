@@ -9,6 +9,7 @@
 struct kernel_open_file_description;
 struct kernel_vfs_path;
 struct kernel_elf64_source;
+struct kernel_io_context;
 
 #define KERNEL_MM_READ (UINT32_C(1) << 0U)
 #define KERNEL_MM_WRITE (UINT32_C(1) << 1U)
@@ -65,6 +66,24 @@ struct kernel_mm_mapping {
     uint64_t physical_address;
     uint32_t permissions;
 };
+
+/* resident片段的实际页owner；caller的LIVE MM句柄须保持到unpin。
+ * lookup、权限许可与acquire在同一MM raw内完成，复制在raw外进行。
+ * pin不固定映射身份/内容；不能复制token，也不能由另一任务归还。
+ * 非resident/COW权限返回NOT_MAPPED/ACCESS，由caller fault后重新pin。
+ * token首次使用须零初始化，成功才发布；失败不修改输出。重复pin或非法unpin fatal。 */
+struct kernel_mm_user_pin {
+    const struct kernel_mm *mm;
+    struct kernel_io_context *owner;
+    struct kernel_mm_user_pin *registration;
+    void *page;
+    uint64_t physical_address;
+    uint32_t access;
+};
+enum kernel_mm_status kernel_mm_pin_user_page(
+    const struct kernel_mm *, uint64_t address, uint32_t access,
+    struct kernel_mm_user_pin *);
+void kernel_mm_unpin_user_page(struct kernel_mm_user_pin *);
 
 /* Success creates another independently owned reference to the same MM. */
 enum kernel_mm_status kernel_mm_acquire(

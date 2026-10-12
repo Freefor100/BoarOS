@@ -10,7 +10,8 @@
 #include <stdint.h>
 
 static uint64_t page_resolutions;
-uint64_t kernel_uaccess_page_resolutions(void) { return page_resolutions; }
+uint64_t kernel_uaccess_page_resolutions(void)
+{ return __atomic_load_n(&page_resolutions, __ATOMIC_RELAXED); }
 
 enum kernel_uaccess_status kernel_user_range_check(
     uint64_t user_address,
@@ -27,59 +28,24 @@ enum kernel_uaccess_status kernel_user_range_check(
     return KERNEL_UACCESS_STATUS_OK;
 }
 
-/* 返回借用direct-map指针，不取得覆盖随后复制的pin。当前fault路径在I/O后
- * 重查映射；后续SMP必须将lookup+pin与权限许可点纳入同一MM保护。 */
+/* 每个基页片段持有实际物理owner；fault可能睡眠，成功后重新pin。 */
 static enum kernel_uaccess_status resolve_user_page(
-    struct kernel_mm *mm,
-    uint64_t user_address,
-    uint32_t required_permissions,
-    unsigned char **page)
+    struct kernel_mm *mm, uint64_t address, uint32_t access,
+    struct kernel_mm_user_pin *pin)
 {
-    struct kernel_mm_mapping mapping;
-    void *pointer;
-    enum kernel_mm_status mm_status;
-
-    page_resolutions++;
+    __atomic_fetch_add(&page_resolutions, 1, __ATOMIC_RELAXED);
     COST_ADD(USER_RESOLUTIONS, 1); COST_IO_ADD(4, 1);
-    mm_status = kernel_mm_lookup(mm, user_address, &mapping);
-    if (mm_status == KERNEL_MM_STATUS_NOT_MAPPED ||
-        (mm_status == KERNEL_MM_STATUS_OK &&
-         (mapping.permissions &
-          (required_permissions | KERNEL_MM_USER)) !=
-             (required_permissions | KERNEL_MM_USER))) {
-        mm_status = kernel_mm_resolve_user_fault(
-            mm,
-            user_address,
-            required_permissions);
-        if (mm_status == KERNEL_MM_STATUS_NOT_MAPPED ||
-            mm_status == KERNEL_MM_STATUS_ACCESS ||
-            mm_status == KERNEL_MM_STATUS_ADDRESS_SPACE ||
-            mm_status == KERNEL_MM_STATUS_BUS_FAULT ||
-            mm_status == KERNEL_MM_STATUS_NO_MEMORY) {
-            return KERNEL_UACCESS_STATUS_FAULT;
-        }
-        if (mm_status != KERNEL_MM_STATUS_OK ||
-            kernel_mm_lookup(mm, user_address, &mapping) !=
-                KERNEL_MM_STATUS_OK) {
-            return KERNEL_UACCESS_STATUS_STATE;
-        }
+    enum kernel_mm_status status = kernel_mm_pin_user_page(mm, address, access, pin);
+    if (status == KERNEL_MM_STATUS_NOT_MAPPED || status == KERNEL_MM_STATUS_ACCESS) {
+        status = kernel_mm_resolve_user_fault(mm, address, access);
+        if (status == KERNEL_MM_STATUS_OK)
+            status = kernel_mm_pin_user_page(mm, address, access, pin);
     }
-    if (mm_status != KERNEL_MM_STATUS_OK) {
-        return KERNEL_UACCESS_STATUS_STATE;
-    }
-    required_permissions |= KERNEL_MM_USER;
-    if ((mapping.permissions & required_permissions) !=
-        required_permissions) {
-        return KERNEL_UACCESS_STATUS_FAULT;
-    }
-    if (physical_page_resolve(mm->allocator,
-                              mapping.physical_address &
-                                  ~BOAROS_PAGE_MASK,
-                              &pointer) != PHYSICAL_PAGE_STATUS_OK) {
-        return KERNEL_UACCESS_STATUS_STATE;
-    }
-    *page = pointer;
-    return KERNEL_UACCESS_STATUS_OK;
+    if (status == KERNEL_MM_STATUS_OK) return KERNEL_UACCESS_STATUS_OK;
+    if (status == KERNEL_MM_STATUS_NOT_MAPPED || status == KERNEL_MM_STATUS_ACCESS ||
+        status == KERNEL_MM_STATUS_ADDRESS_SPACE || status == KERNEL_MM_STATUS_BUS_FAULT ||
+        status == KERNEL_MM_STATUS_NO_MEMORY) return KERNEL_UACCESS_STATUS_FAULT;
+    return KERNEL_UACCESS_STATUS_STATE;
 }
 
 enum kernel_uaccess_status kernel_copy_to_user(
@@ -107,6 +73,7 @@ enum kernel_uaccess_status kernel_copy_to_user(
     }
 
     while (copied < size) {
+        struct kernel_mm_user_pin pin = {0};
         unsigned char *page;
         uint64_t current = user_destination + (uint64_t)copied;
         size_t offset = (size_t)(current & BOAROS_PAGE_MASK);
@@ -120,7 +87,7 @@ enum kernel_uaccess_status kernel_copy_to_user(
         status = resolve_user_page(mm,
                                    current,
                                    KERNEL_MM_WRITE,
-                                   &page);
+                                   &pin);
         if (status != KERNEL_UACCESS_STATUS_OK) {
             *bytes_copied = copied;
             return status;
@@ -129,6 +96,7 @@ enum kernel_uaccess_status kernel_copy_to_user(
         struct kernel_cost_tag memory_tag = kernel_cost_capture();
         uint64_t memory_start = kernel_cost_clock();
 #endif
+        page = pin.page;
         for (index = 0U; index < chunk; index++) {
             page[offset + index] = source[copied + index];
         }
@@ -137,6 +105,7 @@ enum kernel_uaccess_status kernel_copy_to_user(
         kernel_cost_add_tag(memory_tag, COST_UACCESS_COPY_TICKS, memory_elapsed);
         kernel_cost_add_tag(memory_tag, COST_UACCESS_COPY_BYTES, chunk);
 #endif
+        kernel_mm_unpin_user_page(&pin);
         COST_ADD(COPY_TO_USER, chunk);
         copied += chunk;
     }
@@ -170,6 +139,7 @@ enum kernel_uaccess_status kernel_copy_from_user(
     }
 
     while (copied < size) {
+        struct kernel_mm_user_pin pin = {0};
         unsigned char *page;
         uint64_t current = user_source + (uint64_t)copied;
         size_t offset = (size_t)(current & BOAROS_PAGE_MASK);
@@ -183,7 +153,7 @@ enum kernel_uaccess_status kernel_copy_from_user(
         status = resolve_user_page(mm,
                                    current,
                                    KERNEL_MM_READ,
-                                   &page);
+                                   &pin);
         if (status != KERNEL_UACCESS_STATUS_OK) {
             *bytes_copied = copied;
             return status;
@@ -192,6 +162,7 @@ enum kernel_uaccess_status kernel_copy_from_user(
         struct kernel_cost_tag memory_tag = kernel_cost_capture();
         uint64_t memory_start = kernel_cost_clock();
 #endif
+        page = pin.page;
         for (index = 0U; index < chunk; index++) {
             destination[copied + index] = page[offset + index];
         }
@@ -200,6 +171,7 @@ enum kernel_uaccess_status kernel_copy_from_user(
         kernel_cost_add_tag(memory_tag, COST_UACCESS_COPY_TICKS, memory_elapsed);
         kernel_cost_add_tag(memory_tag, COST_UACCESS_COPY_BYTES, chunk);
 #endif
+        kernel_mm_unpin_user_page(&pin);
         COST_ADD(COPY_FROM_USER, chunk); COST_IO_ADD(3, chunk);
         copied += chunk;
     }
@@ -212,6 +184,7 @@ enum kernel_uaccess_status kernel_user_cmpxchg_u32(
     struct kernel_mm *mm, uint64_t user_address,
     uint32_t expected, uint32_t desired, uint32_t *observed)
 {
+    struct kernel_mm_user_pin pin = {0};
     unsigned char *page;
     uint32_t current = expected;
     enum kernel_uaccess_status status;
@@ -222,11 +195,13 @@ enum kernel_uaccess_status kernel_user_cmpxchg_u32(
         kernel_user_range_check(user_address, sizeof(uint32_t)) !=
             KERNEL_UACCESS_STATUS_OK)
         return KERNEL_UACCESS_STATUS_FAULT;
-    status = resolve_user_page(mm, user_address, KERNEL_MM_WRITE, &page);
+    status = resolve_user_page(mm, user_address, KERNEL_MM_WRITE, &pin);
     if (status != KERNEL_UACCESS_STATUS_OK) return status;
+    page = pin.page;
     (void)__atomic_compare_exchange_n(
         (uint32_t *)(void *)(page + (user_address & BOAROS_PAGE_MASK)),
         &current, desired, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    kernel_mm_unpin_user_page(&pin);
     *observed = current;
     return KERNEL_UACCESS_STATUS_OK;
 }
@@ -250,6 +225,7 @@ enum kernel_uaccess_status kernel_copy_string_from_user(
     }
 
     while (copied < capacity) {
+        struct kernel_mm_user_pin pin = {0};
         unsigned char *page;
         uint64_t current = user_source + (uint64_t)copied;
         size_t offset;
@@ -272,21 +248,24 @@ enum kernel_uaccess_status kernel_copy_string_from_user(
         status = resolve_user_page(mm,
                                    current,
                                    KERNEL_MM_READ,
-                                   &page);
+                                   &pin);
         if (status != KERNEL_UACCESS_STATUS_OK) {
             *string_length = copied;
             return status;
         }
+        page = pin.page;
         for (index = 0U; index < chunk; index++) {
             char byte = (char)page[offset + index];
 
             kernel_destination[copied] = byte;
             if (byte == '\0') {
+                kernel_mm_unpin_user_page(&pin);
                 *string_length = copied;
                 return KERNEL_UACCESS_STATUS_OK;
             }
             copied++;
         }
+        kernel_mm_unpin_user_page(&pin);
     }
 
     *string_length = copied;

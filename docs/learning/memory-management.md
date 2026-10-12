@@ -179,9 +179,9 @@ resolve在锁内验证owner，解锁后调用映射器，合法调用者自身�
 4/16 KiB的2/4宿主线程检查独立owner、内容、共享引用、resize和耗尽，结束后完整审计并回到页/堆基线；
 旧IRQ-only实现的两线程负对照触发free-list-insert fatal。压力回调与缓存注销继续保持单CPU契约。
 
-当前uaccess最终得到direct-map指针后没有新增覆盖复制的页引用；尚未复现单核UAF，
-但共享MM跨核执行需要把映射查询与取得pin放在同一保护下。页引用解决存活，不等于
-权限或COW永远不变。远端TLB确认、活动CPU集合与撤映射后的回收必须一起设计，
+uaccess现按基页片段取得实际物理pin，权限检查与acquire位于同一MM rank15 raw范围；
+宿主反例证明旧lookup只有PTE引用，新pin在撤映射后阻止物理复用，归还后恢复allocator基线。
+该证据保护存活与精确复制前缀，不替代完整映射修改、权限或COW的跨核协议。远端TLB确认、活动CPU集合与撤映射后的回收必须一起设计，
 `references/linux/arch/riscv/mm/tlbflush.c` 的本地与远端失效路径提供固定依据。
 
 RV COST记录IRQ-off、按rank的对象锁持有与wake-to-run；LA尚未接完整同类时间挂钩。

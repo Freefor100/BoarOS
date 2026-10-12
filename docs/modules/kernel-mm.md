@@ -103,6 +103,17 @@ enum kernel_mm_status kernel_mm_release(struct kernel_mm *mm);
 
 `riscv_kernel_mm_satp()` 是 RISC-V scheduler 创建任务时使用的架构入口。通用层不暴露 Sv39 对象，也没有运行期 vtable；RISC-V 构建通过 `include/arch/mmu.h` 直接绑定 Sv39 操作；通用策略位于 `mm/mm.c`。LoongArch 构建以后为同一后端契约提供 16 KiB/三级页表实现。这样任务和 syscall 层依赖 MM 语义，而不依赖页表格式，调用热路径也没有间接分派。
 
+
+`kernel_mm_pin_user_page()`只对resident且已许可的基页成功，在rank15元数据保护内
+取得实际物理引用；`NOT_MAPPED/ACCESS`要求调用者fault后重查。输出token零初始化，
+成功才发布；同一I/O owner在复制完成后调用`kernel_mm_unpin_user_page()`。
+调用者保持LIVE MM句柄，末引用释放时仍有pin属于非法生命周期并fatal。
+原`kernel_mm_lookup()`仍只返回快照，不能将其物理指针借用当成pin。
+`make test-mm-pin-host`链接生产MM/VMA/Sv39 walker，只替换硬件CSR/fence；
+文件/共享对象等范围外入口一旦被调用就中止。反例先证明旧lookup只有PTE引用，
+新实现检查撤映射、耗尽/复用、权限、复制前缀、token错误和最终allocator审计。
+此入口不替代硬件TLB或两核验收。
+
 ## 句柄、引用与状态
 
 `struct kernel_mm` 是一个可移动的拥有型引用，不是地址空间本体。RISC-V 后端用 `record_page_address` 指向一张物理记录页；记录页保存引用计数、清理阶段和唯一的 `riscv_sv39_user_space`。多个 LIVE 句柄可以指向同一记录页：

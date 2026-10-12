@@ -30,6 +30,28 @@ enum kernel_mm_status kernel_mm_lookup(const struct kernel_mm *mm,uint64_t va,st
 }
 enum kernel_mm_status kernel_mm_resolve_user_fault(struct kernel_mm *mm,uint64_t va,uint32_t access)
 { (void)mm; (void)va; (void)access; return KERNEL_MM_STATUS_NOT_MAPPED; }
+/* 该fixture只验COST采样，映射模型同样持有实际物理pin，不链接通用MM。 */
+enum kernel_mm_status kernel_mm_pin_user_page(const struct kernel_mm *mm,
+    uint64_t va, uint32_t access, struct kernel_mm_user_pin *pin)
+{
+    struct kernel_mm_mapping mapping;
+    enum kernel_mm_status status = kernel_mm_lookup(mm, va, &mapping);
+    if (status) return status;
+    if ((mapping.permissions & access) != access) return KERNEL_MM_STATUS_ACCESS;
+    uint64_t physical = mapping.physical_address & ~BOAROS_PAGE_MASK;
+    void *pointer;
+    assert(!physical_page_resolve(mm->allocator, physical, &pointer));
+    assert(!physical_page_acquire(mm->allocator, physical));
+    *pin = (struct kernel_mm_user_pin){.mm = mm, .page = pointer,
+        .registration = pin, .physical_address = physical, .access = access};
+    return KERNEL_MM_STATUS_OK;
+}
+void kernel_mm_unpin_user_page(struct kernel_mm_user_pin *pin)
+{
+    assert(pin->registration == pin);
+    assert(!physical_page_release(pin->mm->allocator, pin->physical_address));
+    *pin = (struct kernel_mm_user_pin){0};
+}
 static char snapshot[1048576];
 static void expect(const char *name,unsigned value,unsigned samples,unsigned maximum)
 {
