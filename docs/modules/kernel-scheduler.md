@@ -27,7 +27,7 @@
 等待登记、阻塞提交、期限索引、运行记账、策略更新、队列校验和runnable发布使用统一rank40短锁；heap10→physical20、
 对象内部30→调度40是raw锁序。raw不跨架构切换，不允许调度、分配、I/O、用户复制或外部回调。
 任务表、身份角色、父子/组成员关系、join及退出队列也使用该调度域；私有准备和资源清理在锁外。
-受控任务可绑定私有匿名 MM，信号内容、文件/共享后备/设备业务及其统计仍限定单CPU；调度元数据互斥不表示整个内核支持SMP。
+受控任务可绑定匿名及私有arena tmpfs映射 MM，信号内容、文件/SysV/设备业务及其统计仍限定单CPU；调度元数据互斥不表示整个内核支持SMP。
 
 `kernel_wait_prepare`为当前任务建立不回退的全局代次token，登记后复查条件，释放对象保护再调用
 `kernel_wait_park`；`kernel_wait_finish`同步撤销绑定节点。wake/期限/signal第一个完成者决定
@@ -342,4 +342,4 @@ runner从Make接收实际构建目录，COST入口不能借用普通产物；hos
 f4cdf7ca9a1fdcca413157df19753f388a5a224e；lwIP raw串行边界见references/lwip/doc/doxygen/main_page.h（pitfalls/multithreading），
 commit77dcd25a72509eb83f72b033d219b1d40cd8eb95。实现依赖只在[路线图](../goals.md#p6b-锁等待与中断规则)维护。
 
-受控匿名 MM 的创建/切换与最终释放见[两核模块](riscv-smp.md#私有匿名-mm-验证)。实际地址空间切换在 rank40 外执行 `kernel_mm_activate()`；热路径静态门禁允许这项登记/本地失效入口，但继续拒绝 MM 分配、引用修改、pin/fault、文件和 exec 生命周期操作进入 switch 路径。
+受控匿名及tmpfs映射 MM 的创建/切换与最终释放见[两核模块](riscv-smp.md#私有匿名-mm-验证)。实际地址空间切换在 rank40 外执行 `kernel_mm_activate()`；热路径静态门禁允许这项登记/本地失效入口，但继续拒绝 MM 分配、引用修改、pin/fault、文件和 exec 生命周期操作进入 switch 路径。

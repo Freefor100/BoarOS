@@ -25,7 +25,7 @@ Linux 是用户可观察语义的参考；内部实现独立维护对象所有�
 | 终端与系统服务 | IRQ UART、TTY/termios2、作业控制、Unix98 PTY/devpts、原 BusyBox ash/stty/script；日志、可信 RNG、RTC、时钟/睡眠、NOFILE/STACK | 固定 root；无其他行规程、完整 modem 控制或全部资源限制；[TTY](docs/modules/kernel-tty.md)、[日志](docs/modules/kernel-log.md) |
 
 2026-10-12 本地组合核对：RV/LA 在 512 MiB、1 GiB 下，各自完成 **229 项原程序**的同 ELF Linux 对照；
-两侧各 **1366 条 ABI 差分**、glibc 五形态、栈/guard，以及相关存储、设备、网络、终端组合通过。
+两侧各 **1367 条 ABI 差分**、glibc 五形态、栈/guard，以及相关存储、设备、网络、终端组合通过。
 具体输入与适用范围见[程序基线](docs/learning/user-program-inventory.md)和
 [调度组合核对](docs/learning/threads-and-futex.md#调度域身份发布与退休存储)。
 这些结果限定于上述平台和案例；LA 客体原生开发、全断电恢复矩阵、实板与普通用户/文件及外部后备多核仍需独立验收。
@@ -57,6 +57,8 @@ make test-mm-pin-host test-mm-concurrency-host
 make test-mm-smp-riscv test-mm-smp-userland-riscv
 make test-memory-object-concurrency-host test-mm-shared-concurrency-host
 make test-mm-shared-smp-riscv test-mm-shared-smp-userland-riscv
+make test-file-mapping-concurrency-host test-mm-file-concurrency-host
+make test-mm-file-smp-riscv test-mm-file-smp-userland-riscv
 make test-stack-usage test-stack-usage-la
 ```
 
@@ -69,15 +71,15 @@ make test-stack-usage test-stack-usage-la
 
 ## 开发方向与文档
 
-当前主线推进 **文件/外部后备 MM 与业务对象并发、普通用户跨核执行**，再扩展RV组合压力和LA多核；
+当前主线推进 **磁盘/外部后备 MM 与业务对象并发、普通用户跨核执行**，再扩展RV组合压力和LA多核；
 具体未完成能力与依赖只维护在[开发路线](docs/goals.md)，逐轮执行计划留在会话中。
 CPU 本地/current、运行结算、idle/timer归属与嵌套抢占控制已建立，raw 短锁已接入 buddy/slab 元数据；任务选择、身份发布及存储借用在统一短调度域保护，资源清理留在锁外；等待代次、借用游标、
-新栈交接与可睡眠锁内部资格已建立。压力回收、文件/外部后备及其他业务对象仍需跨核保护。
+新栈交接与可睡眠锁内部资格已建立。压力回收、磁盘/外部后备及文件/其他业务对象仍需跨核保护。
 默认生产继续单CPU；新增[RV受控两核配置](docs/modules/riscv-smp.md)使用独立构建入口，
 2026-10-11在512MiB/1GiB完成MTTCG两核抢占、IPI/WFI交接、双向迁移、执行资格、
 RFENCE后栈回收、私有allocator及CPU0原静态/pthread组合；同一内核的一CPU退化也通过。
 用户任务及现有业务仍限CPU0，
-2026-10-12受控任务绑定私有/共享匿名MM，完成片段pin与降权/撤映射、跨MM共享/私有COW、活动集合与远端失效后回收、持pin迁移及可信栈收口；文件/外部后备和业务对象并发尚未开放。
+受控任务可绑定匿名和私有arena的tmpfs文件映射MM，完成片段pin、跨MM共享/私有COW、文件关闭代次与登记借用、活动集合及确认失效后回收。CPU0保留文件修改和最终释放；磁盘/外部后备、业务对象和普通用户跨核尚未开放。
 共享调度域的[成本核对](docs/learning/cost-baseline.md#共享调度域的匹配时间)保留既有开销和短窗口未决结果；
 短窗口归因已停止，不再作为两核规划的前置门槛。既有3%测量协议保留，未决不记为通过。
 FS-Off候选仍在实验分支，未进入main；宿主同步测试与单核验收不代表整个内核已具备SMP安全性。

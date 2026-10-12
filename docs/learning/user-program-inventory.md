@@ -50,7 +50,7 @@ make test-program-inventory-host test-diff-abi-host
 python3 tests/program-inventory/run.py --reuse-builds --require-pass --output build/program-check
 ```
 
-双方运行同一 ELF 与同源独立 ext4 副本。指定 `--case --require-pass` 时，只有本次选择集合必须全部完成并通过；未选项目保留已有结果或 `not-run`。未指定集合的严格模式要求全量完成并通过。Linux 自己失败标为 `reference-not-pass`，需排查参考环境，不能归罪 BoarOS。原脚本内部逐项断言也必须成立，不能只看 shell 退出码；libc runtest 原本固定返回 1，直接 entry 则预期 0。
+双方运行同一 ELF 与同源独立 ext4 副本。指定 `--case --require-pass` 时，只有本次选择集合必须全部完成并通过；未选项目保留已有结果或 `not-run`。未指定集合的严格模式要求全量完成并通过。Linux 自己失败标为 `reference-not-pass`，需排查参考环境，不能归罪 BoarOS。 原 BusyBox 清单末尾的 find 遍历根目录，也会进入 Linux 动态 `/proc`；一次参考启动的 ps 显示 PID85 为 ext4lazyinit，随后 find 报 `./proc/85: No such file or directory` 并使原断言失败。该记录属于参考端进程退出与目录遍历的竞态，不能靠后一次通过覆盖；BoarOS同脚本成功也不把该次联合结果改成通过。原脚本内部逐项断言也必须成立，不能只看 shell 退出码；libc runtest 原本固定返回 1，直接 entry 则预期 0。
 
 ## 当前基线与口径
 

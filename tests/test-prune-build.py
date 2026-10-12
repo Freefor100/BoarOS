@@ -16,6 +16,7 @@ class CleanupContract(unittest.TestCase):
                 'riscv-smp/riscv/kernel/main.o', 'riscv-smp-test/guard/kernel-rv',
                 'riscv-mm-smp-test/riscv/mm/mm.o', 'riscv-mm-smp-test/mm-fence-i/kernel-rv',
                 'riscv-mm-shared-smp-test/riscv/mm/mm.o', 'riscv-mm-shared-smp-test/rfence-error/kernel-rv',
+                'riscv-mm-file-smp-test/riscv/mm/mm.o', 'riscv-mm-file-smp-test/rfence-error/kernel-rv',
                 'qemu-la-rtc/build/build.ninja','linux-la-platform/vmlinux',
                 'loongarch/program-libc/source/entry.c','loongarch/dynamic-dp-v2/root/lib/libc.so',
                 'loongarch/glibc/static-program','loongarch/diff-abi-cases')
@@ -23,6 +24,8 @@ class CleanupContract(unittest.TestCase):
                 'riscv-smp/runs/2-512M.log',
                 'riscv-mm-smp-test/runs/rfence-error/2-1G.log',
                 'riscv-mm-shared-smp-test/runs/2-512M.log',
+                'riscv-mm-file-smp-test/runs/2-512M.log',
+                'riscv-mm-file-smp-test/runs-v3/1-1G.json',
                 'loongarch/review-boundary-green/linux.log','loongarch/diff-abi-run/linux.img',
                 'loongarch/rtc-model.case/state.bin','loongarch/sqlite-run.case/root.img',
                 'loongarch/program-libc/upstream.tar','loongarch/program-libc/build.log',

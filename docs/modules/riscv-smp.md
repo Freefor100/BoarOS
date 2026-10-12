@@ -1,8 +1,8 @@
 # RV 受控两核调度
 
 默认构建和LA仍为单CPU。`kernel-rv-smp`独立配置最多两个逻辑CPU，CPU0是固件选择的boot hart，
-CPU1运行显式创建的受控内核任务，可绑定受控私有/共享匿名 MM。用户任务、现有worker、文件/外部后备和系统压力回收仍只在CPU0执行。
-受控任务已验证 fork 后跨 MM 的共享匿名页；普通用户线程跨核执行及其共享 MM ABI 仍未开放。
+CPU1运行显式创建的受控内核任务，可绑定匿名及私有arena tmpfs文件映射 MM。CPU0保留tmpfs构造、文件读写/截断、MM/fork发布和最后后端释放；控制者保留独立OFD，命名空间运行期间不修改。用户任务、现有worker、磁盘/外部后备和系统压力回收仍只在CPU0执行。
+受控任务已验证 fork 后跨 MM 的共享匿名/真实tmpfs页与私有COW；普通用户线程跨核执行及其共享 MM ABI 仍未开放。
 
 ## 启动与本地状态
 
@@ -113,3 +113,15 @@ CPU0原静态/pthread与CPU1共享匿名后台负载的组合另验，普通用�
 可能先各自准备候选，失败者全部归还。对象引用、预算和共享统计新增原子操作，CAS可重试，
 hash链和扩容的既有最坏成本仍在。共享fork/写fault不复制数据页，MM表准备/退休仍有固定容量与
 竞争重试；未追加匹配时间实验，整启动OFF时间不是并行收益或实板性能证据。
+
+
+## 私有 tmpfs 映射域
+
+`test-mm-file-smp-riscv` 使用真实私有 tmpfs、控制者OFD和 arena 内的后备预算，在512MiB/1GiB的MTTCG两核与一核退化验证源准备后截断、EOF/重新增长、跨根共享、私有COW、受保护叶、pin迁移及RFENCE后回收。独立RFENCE错误核对来源/登记/数据/表owner保留后fatal，不记自然回收。`test-mm-file-smp-userland-riscv` 让CPU0原静态/pthread程序与CPU1受控任务同时运行；普通用户跨核及磁盘缓存业务仍未开放。接口和关闭协议见[MM](kernel-mm.md#受控-tmpfs-文件映射)。
+
+```sh
+make test-mm-file-smp-riscv
+make test-mm-file-smp-userland-riscv INIT_CONFIG=config/init.json
+```
+
+产物缓存位于 `build/riscv-mm-file-smp-test/`，默认单CPU入口及SMP+COST拒绝规则保持。新登记状态采用inode独占的首次映射准备，不增加任务字段或永久MM引用；每次启动核对arena、页/表、堆、栈、等待、OFD/登记和私有挂载owner。
