@@ -649,8 +649,15 @@ active bit 的含义是“旧翻译仍可能被该CPU使用”，不是 schedule
 
 CPU0预留16MiB arena拥有独立 allocator/heap/root template；只有kernel高半区子树由系统owner借用，allocator equality未放宽。用这一隔离域验证同MM多owner和fork/COW，不把系统压力或文件业务并发偷偷带入。绑MM任务退出必须在通用可信栈释放入口归还MM；只在某个task-storage包装里清理，会遗漏实际join路径，本轮真实资源基线曾发现这一遗漏，修复后全路径归零。
 
-验证命令与硬件/模型范围见[MM](../modules/kernel-mm.md#私有匿名-mm-的并发与回收)和[两核验证](../modules/riscv-smp.md#私有匿名-mm-验证)。宿主替换CSR/通知的活动集合握手不作为真实RFENCE证据；原SMP栈的错误profile也不能代替新MM链路。新链路独立注入RFENCE/FENCE.I错误，保留批次/live owner后fatal，回收未验证。正确性启动的OFF整段时间及固定容量计数不支持性能收益结论，默认单CPU与LA结果分列。
+验证命令与硬件/模型范围见[MM](../modules/kernel-mm.md#匿名-mm-的并发与回收)和[两核验证](../modules/riscv-smp.md#私有匿名-mm-验证)。宿主替换CSR/通知的活动集合握手不作为真实RFENCE证据；原SMP栈的错误profile也不能代替新MM链路。新链路独立注入RFENCE/FENCE.I错误，保留批次/live owner后fatal，回收未验证。正确性启动的OFF整段时间及固定容量计数不支持性能收益结论，默认单CPU与LA结果分列。
 
 实际 U-mode 微探针还暴露了测试上下文自身的中断假设：一次 scause=supervisor timer 到达正在执行的小段 U 指令，控制任务并不是普通用户 task，因而进入 fatal。固定特权规范20260120第3.1.6.1节规定，高特权中断不受低特权执行时的全局 SIE 位屏蔽；微探针改为暂时清 sie 源、返回S态后原样恢复。正常调度/用户 timer 行为没有修改。该探针只验证取指/访问权限，抢占证据仍来自生产调度及原用户程序，不能用屏蔽源的探针声称覆盖 U-mode 抢占。
 
 候选页和COW替换使用 `KERNEL_MM_NO_PAGE=UINT64_MAX`，不是0。RV合法物理页可以位于0；将0作“未准备/已消费/原地恢复”会拒绝合法表、漏归还候选，或把新页误作原地恢复。`test-mm-concurrency-host`的独立零地址模型导入bootstrap零页owner，验证零地址表、COW来源、末引用恢复、新替换与最终审计；它用access映射到宿主pool，不把启动期物理直访builder当成可迁移的宿主runtime walker。LA目录的0仍表达缺表，保留其原后端范围约束。
+
+共享匿名扩展复用同一fault准备/重查/提交，而不是另建一套策略。VMA/registry在gate内覆盖
+取得真实对象引用；暂停期间即使最后VMA被删除，对象及get返回的页owner仍存活。恢复时
+核对代次/backing/偏移/权限；失败先放页引用，再discard匹配新页，最后放对象引用。
+同页对象mutex只发布一次，两个MM各取得自己的PTE引用。并发fork的父提交必须按VMA分类：
+旧实现无条件mark_cow把共享父叶降为COW，直接权限反例失败；现在共享/protected共享跳过，
+私有叶仍COW。握手共享写证明可见性，单侧mprotect不撤另一MM许可，不替应用解决数据竞争。

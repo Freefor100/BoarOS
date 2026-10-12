@@ -1,4 +1,4 @@
-/* 私有匿名MM模型不执行文件、共享对象或进程业务。意外进入时立即失败，
+/* 匿名MM模型链接真实memory_object，不执行文件/SysV或进程业务。意外进入时立即失败，
  * 这些入口不是成功存根，也不作为对应子系统的验收证据。 */
 #include <stdint.h>
 struct kernel_task;
@@ -10,10 +10,6 @@ EXCLUDED(kernel_shm_attachment_open)
 EXCLUDED(kernel_elf64_source_release)
 EXCLUDED(kernel_elf64_source_acquire)
 EXCLUDED(kernel_elf64_source_page)
-EXCLUDED(kernel_memory_object_release)
-EXCLUDED(kernel_memory_object_create)
-EXCLUDED(kernel_memory_object_get_page)
-EXCLUDED(kernel_memory_object_discard_new_page)
 EXCLUDED(kernel_open_file_node)
 EXCLUDED(kernel_file_mapping_unregister)
 EXCLUDED(kernel_open_file_release)
@@ -32,7 +28,6 @@ EXCLUDED(kernel_open_file_lookup_page)
 EXCLUDED(kernel_open_file_pread)
 EXCLUDED(kernel_open_file_alias_attach)
 EXCLUDED(kernel_page_cache_alias_mark_dirty)
-EXCLUDED(kernel_memory_object_acquire)
 EXCLUDED(kernel_open_file_acquire)
 EXCLUDED(kernel_page_cache_alias_clone)
 EXCLUDED(kernel_file_mapping_register)

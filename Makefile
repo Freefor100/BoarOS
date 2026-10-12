@@ -2007,7 +2007,7 @@ test-sync-host:
 	build/host/sync
 	python3 -B tests/sync/test_native.py
 
-.PHONY: test-mm-pin-host test-memory-object-concurrency-host
+.PHONY: test-mm-pin-host test-memory-object-concurrency-host test-mm-shared-concurrency-host
 test-memory-object-concurrency-host:
 	@mkdir -p build/host/mm
 	@set -e; for shift in 12 14; do \
@@ -2027,7 +2027,7 @@ test-mm-pin-host:
 		-DBOAROS_PAGE_SHIFT=12 -Itests/host/mm -Itests/host/sync -idirafter include \
 		tests/host/mm_pin.c tests/host/mm/unavailable.c tests/host/mm/context.c \
 		kernel/cpu.c kernel/raw_lock.c kernel/sched/sync.c kernel/sched/park.c \
-		kernel/physical_page.c mm/heap.c mm/vma.c mm/mm.c mm/uaccess.c arch/riscv/sv39.c \
+		kernel/physical_page.c mm/heap.c mm/memory_object.c mm/vma.c mm/mm.c mm/uaccess.c arch/riscv/sv39.c \
 		-Wl,--gc-sections -o build/host/mm/pin
 	build/host/mm/pin
 
@@ -2038,14 +2038,14 @@ test-mm-concurrency-host:
 		-DBOAROS_PAGE_SHIFT=12 -Itests/host/mm -Itests/host/sync -idirafter include \
 		tests/host/mm_concurrency.c tests/host/mm/unavailable.c tests/host/mm/context.c \
 		kernel/cpu.c kernel/raw_lock.c kernel/sched/sync.c kernel/sched/park.c \
-		kernel/physical_page.c mm/heap.c mm/vma.c mm/mm.c mm/uaccess.c arch/riscv/sv39.c \
+		kernel/physical_page.c mm/heap.c mm/memory_object.c mm/vma.c mm/mm.c mm/uaccess.c arch/riscv/sv39.c \
 		-Wl,--gc-sections,--wrap=physical_page_allocate -o build/host/mm/concurrency
 	timeout 30s build/host/mm/concurrency
 	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -ffunction-sections -fdata-sections \
 		-DBOAROS_PAGE_SHIFT=12 -DBOAROS_MAX_CPUS=2 -Itests/host/mm -Itests/host/sync -idirafter include \
 		tests/host/mm_activity.c tests/host/mm/unavailable.c tests/host/mm/context.c \
 		kernel/cpu.c kernel/raw_lock.c kernel/sched/sync.c kernel/sched/park.c \
-		kernel/physical_page.c mm/heap.c mm/vma.c mm/mm.c mm/uaccess.c arch/riscv/sv39.c \
+		kernel/physical_page.c mm/heap.c mm/memory_object.c mm/vma.c mm/mm.c mm/uaccess.c arch/riscv/sv39.c \
 		-Wl,--gc-sections -o build/host/mm/activity
 	timeout 30s build/host/mm/activity
 	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -ffunction-sections -fdata-sections \
@@ -2054,6 +2054,16 @@ test-mm-concurrency-host:
 		kernel/cpu.c kernel/raw_lock.c kernel/sched/sync.c kernel/sched/park.c \
 		kernel/physical_page.c arch/riscv/sv39.c -Wl,--gc-sections -o build/host/mm/zero
 	timeout 30s build/host/mm/zero
+
+test-mm-shared-concurrency-host:
+	@mkdir -p build/host/mm
+	cc -std=gnu11 -O2 -Wall -Wextra -Werror -pthread -ffunction-sections -fdata-sections \
+		-DBOAROS_PAGE_SHIFT=12 -Itests/host/mm -Itests/host/sync -idirafter include \
+		tests/host/mm_shared.c tests/host/mm/unavailable.c tests/host/mm/context.c \
+		kernel/cpu.c kernel/raw_lock.c kernel/sched/sync.c kernel/sched/park.c \
+		kernel/physical_page.c mm/heap.c mm/memory_object.c mm/vma.c mm/mm.c mm/uaccess.c arch/riscv/sv39.c \
+		-Wl,--gc-sections,--wrap=kernel_memory_object_get_page -o build/host/mm/shared
+	timeout 30s build/host/mm/shared
 
 .PHONY: test-allocator-concurrency-host
 test-allocator-concurrency-host:

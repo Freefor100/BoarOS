@@ -31,7 +31,7 @@ CPU 本地/current、抢占控制、buddy/slab raw、代次等待与可睡眠锁
 PTE 撤销/降权后须覆盖活动 CPU 及并发切换者，确认旧翻译不能再用，才释放页、页表与映射引用；
 未完成的失效由明确 owner 延后回收，不能持远核所需的锁等待确认。
 文件 fault、COW、truncate/writeback、进程退出、FD/OFD 和设备停止同时服从此生命周期边界。
-当前接口限制见 [MM](modules/kernel-mm.md#私有匿名-mm-的并发与回收)与[uaccess](modules/kernel-uaccess.md#并发与性能边界)。
+当前接口限制见 [MM](modules/kernel-mm.md#匿名-mm-的并发与回收)与[uaccess](modules/kernel-uaccess.md#并发与性能边界)。
 
 ## 当前应用阻塞与能力边界
 

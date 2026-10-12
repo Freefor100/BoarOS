@@ -52,8 +52,8 @@ enum kernel_mm_cleanup_stage {
 };
 
 /* 句柄拥有MM记录引用，lookup返回映射快照而不取得物理页pin。
- * 受控私有匿名域由operation gate/MM raw保护，活动CPU失效确认后才回收；
- * 文件/共享后备仍遵守单CPU业务边界。句柄不能被其他执行者并发move/release。
+ * 受控私有/共享匿名域由operation gate/MM raw保护，活动CPU失效确认后才回收；
+ * 文件/外部后备仍遵守单CPU业务边界。句柄不能被其他执行者并发move/release。
  * MM引用只保证记录存活，lookup快照不能代替访问片段的实际页引用。 */
 struct kernel_mm {
     struct physical_page_allocator *allocator;

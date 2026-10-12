@@ -100,8 +100,9 @@ static void *query(void *unused)
     assert(kernel_mm_msync(&mm[3], address + 1, 1, 4) == -KERNEL_EINVAL);
     assert(kernel_mm_shmdt(&mm[3], address) == KERNEL_MM_STATUS_STATE);
     uint64_t unused_address;
-    assert(kernel_mm_mmap_anonymous(&mm[3], 0, BOAROS_PAGE_SIZE,
-        KERNEL_MM_READ, KERNEL_MM_MAP_SHARED, &unused_address) == KERNEL_MM_STATUS_STATE);
+    assert(!kernel_mm_mmap_anonymous(&mm[3], 0, BOAROS_PAGE_SIZE,
+        KERNEL_MM_READ, KERNEL_MM_MAP_SHARED, &unused_address));
+    assert(!kernel_mm_munmap(&mm[3], unused_address, BOAROS_PAGE_SIZE));
     __atomic_store_n(&done[3], 1, __ATOMIC_RELEASE);
     return 0;
 }

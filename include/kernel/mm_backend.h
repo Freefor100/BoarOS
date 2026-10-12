@@ -9,7 +9,8 @@ enum kernel_mm_status kernel_mm_concurrent_context(const struct kernel_mm *, uin
 /* 调度域外调用；next拥有MM引用，旧执行owner覆盖旧record借用。
  * NULL选择稳定kernel_context；并发域即使同SATP也做本地失效/取指同步。 */
 enum kernel_mm_status kernel_mm_activate(const struct kernel_mm *next, uint64_t kernel_context);
-/* CPU0私有构造完成后开放匿名并发域；须独占、无文件/共享后备及压力回调。
+/* CPU0私有构造完成后开放匿名并发域；须独占、无文件/外部后备及压力回调。
+ * 共享匿名对象须属于同heap/allocator且无budget；tmpfs/SysV业务仍不开放。
  * CPU1仅接受任务已绑定的同一记录；这不是普通用户态SMP开关。 */
 enum kernel_mm_status kernel_mm_enable_concurrency(struct kernel_mm *);
 struct kernel_mm_statistics {
