@@ -13,7 +13,7 @@ main push等待同组执行收口；PR取消同组旧执行，固定环境冷构
 | 层级 | RV | LA |
 |---|---|---|
 | 固定环境 | 原GNU工具/runtime及Linux缓存 | 原GNU工具/runtime、QEMU、Linux及musl缓存 |
-| core / ABI | 完整RV、scale、I/O等待、双盘、userland、1367 ABI、ELF尾页与栈 | CPU/MM/权限、信号/线程、等待、FPU/SIMD、动态exec、PCI/root I/O、1367 ABI与栈 |
+| core / ABI | 完整RV、scale、I/O等待、双盘、userland、1368 ABI、ELF尾页与栈 | CPU/MM/权限、信号/线程、等待、FPU/SIMD、动态exec、PCI/root I/O、1368 ABI与栈 |
 | runtime | glibc五形态、SQLite DELETE/静态动态CLI/独立重启、WAL | 相同消费者与完成条件，保留目标ELF及libc版本差异 |
 | platform | RNG/时钟、network、termios2/TTY/PTY | 相同类别，另含boot random和16KiB pipe geometry |
 | 定时完整消费者 | 229项原程序、TTY应用、实际Ethernet、RT双盘 | 229项原程序、TTY应用、实际Ethernet、PCI设备失败及RTC模型 |
@@ -29,7 +29,9 @@ RV已验证的全断电矩阵；LA客体原生开发尚未交付，不增加占�
 
 RV的`smp`组独立执行调度核心的`test-smp-riscv`/`test-smp-userland-riscv`和匿名 MM 的私有/共享测试、tmpfs及受控ext4文件映射测试及各自CPU0用户组合：MTTCG两核、同核一CPU退化、
 双RAM、独立故障启动和CPU0原程序组合。默认core/runtime/platform保持单CPU，LA没有SMP占位。
-该组从已安装OpenSBI包选择真实generic `fw_dynamic.bin`，显式传给Make；
+该组从已安装OpenSBI包选择 `riscv64-linux-gnu/opensbi/generic/fw_dynamic.bin`，
+排除同时安装的RV32变体，缺失或重复RV64候选使准备失败；固件显式传给Make。
+runner开启QEMU `debug-threads=on`，在Ubuntu/QEMU8.2.2同样能记录实际vCPU线程；
 保存包版本、QEMU/固件/kernel SHA、实际vCPU线程和完整退出，不能把本地封存执行器身份冒充CI身份。
 
 两个environment独立生产缓存，各consumer只依赖本架构producer。core的一组

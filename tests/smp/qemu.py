@@ -19,7 +19,7 @@ def main():
     for flag, value in (("-smp", "2"), ("-bios", firmware)):
         index = args.index(flag)
         args[index + 1] = value
-    args += ["-accel", "tcg,thread=multi"]
+    args += ["-accel", "tcg,thread=multi", "-name", "boaros-smp,debug-threads=on"]
     kernel = args[args.index("-kernel") + 1]
     image = next(part.split("=", 1)[1] for value in args for part in value.split(",")
                  if part.startswith("file="))

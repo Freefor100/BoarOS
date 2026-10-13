@@ -17,7 +17,8 @@ def identity(path):
 
 
 def boot(qemu, firmware, kernel, memory, cpus, output, profile="normal", contract="scheduler", disks=()):
-    command = [qemu, "-machine", "virt", "-accel", "tcg,thread=multi", "-smp", str(cpus),
+    command = [qemu, "-machine", "virt", "-accel", "tcg,thread=multi",
+               "-name", "boaros-smp,debug-threads=on", "-smp", str(cpus),
                "-m", memory, "-nographic", "-no-reboot", "-bios", firmware, "-kernel", str(kernel)]
     for index,disk in enumerate(disks):
         command += ["-drive",f"file={disk},if=none,format=raw,cache=writeback,id=d{index}",

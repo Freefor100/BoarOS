@@ -31,9 +31,11 @@ jobs:
           import hashlib, json, os, shutil, subprocess
           from pathlib import Path
           files = subprocess.check_output(['dpkg-query', '-L', 'opensbi'], text=True).splitlines()
-          candidates = [Path(p) for p in files if p.endswith('/generic/fw_dynamic.bin') and Path(p).is_file()]
+          # Ubuntu installs both XLEN variants; RV64 cannot boot the RV32 image.
+          candidates = [Path(p) for p in files
+                        if p.endswith('/riscv64-linux-gnu/opensbi/generic/fw_dynamic.bin') and Path(p).is_file()]
           if len(candidates) != 1:
-              raise SystemExit(f'Expected one installed generic OpenSBI image, found {candidates}')
+              raise SystemExit(f'Expected one installed RV64 generic OpenSBI image, found {candidates}')
           firmware = candidates[0].resolve(strict=True)
           qemu = Path(shutil.which('qemu-system-riscv64')).resolve(strict=True)
           def identity(path):
