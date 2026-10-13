@@ -210,6 +210,18 @@ static void pipe_geometry_case(struct kernel_heap *heap)
         assert(!kernel_copy_from_user(&domain_mm,pipe_payload,PIPE_TARGET,n,&done) && done==n);
         for (unsigned i=0;i<n;i++) assert(pipe_payload[i]==0x71);
     }
+    /* sendfile来源占独立片段，不能并入后继user write的可合并尾片段。 */
+    struct kernel_pipe_result provenance;
+    for (unsigned i=0;i<16;i++)
+        assert(!kernel_pipe_write_buffer(pipe,"S",1,1|KERNEL_PIPE_NONBLOCK,&provenance) && provenance.bytes==1);
+    struct kernel_uaccess_iovec one_read={PIPE_TARGET,1}, user_write={PIPE_SOURCE,3};
+    int64_t consumed;
+    assert(!kernel_pipe_readv(pipe,&domain_mm,&one_read,1,1,0,&consumed) && consumed==1);
+    assert(!kernel_pipe_writev(pipe,&domain_mm,&user_write,1,3,1,&provenance) && provenance.bytes==3);
+    assert(!kernel_pipe_write_buffer(pipe,"S",1,1|KERNEL_PIPE_NONBLOCK,&provenance) &&
+        provenance.bytes==-KERNEL_EAGAIN);
+    assert(!kernel_files_release(&files));
+    pipe_bind(0,0); pipe=pipe_table(heap); mm_test_bind_files(&files);
     assert(!kernel_mm_mprotect(&domain_mm,PIPE_SOURCE+BOAROS_PAGE_SIZE,BOAROS_PAGE_SIZE,0));
     struct kernel_uaccess_iovec broken={PIPE_SOURCE+BOAROS_PAGE_SIZE-16,32};
     struct kernel_pipe_result result;

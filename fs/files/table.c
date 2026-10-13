@@ -158,6 +158,39 @@ static int description_in_domain(const struct kernel_files *files,
         file->pipe->allocator==files->heap->page_allocator && !file->file.private_data &&
         !file->ep_items && !file->record_locks && !file->device_opened);
 }
+/* 仅私有、独占record启用时调用：槽引用总数必须等于OFD实际引用。
+ * 按不同OFD计端点，dup不重复计端点；O(capacity²)，不在FD raw内扫描。 */
+static int private_pipe_owners(const struct kernel_files_record *record,
+    struct kernel_pipe *pipe,int commit)
+{
+    uint32_t owners=0,readers=0,writers=0;
+    for (uint32_t i=0;i<record->statistics.capacity;i++) {
+        struct kernel_open_file_description *file=record->slots[i].description;
+        if (!file || file->pipe!=pipe) continue;
+        uint32_t j;
+        for (j=0;j<i;j++) if (record->slots[j].description==file) break;
+        if (j<i) continue;
+        uint32_t refs=0;
+        for (j=0;j<record->statistics.capacity;j++) refs+=record->slots[j].description==file;
+        if (__atomic_load_n(&file->references,__ATOMIC_ACQUIRE)!=refs) return -KERNEL_EBUSY;
+        owners++;
+        readers+=!!(file->pipe_endpoint & KERNEL_PIPE_ENDPOINT_READ);
+        writers+=!!(file->pipe_endpoint & KERNEL_PIPE_ENDPOINT_WRITE);
+    }
+    return kernel_pipe_enable_concurrency(pipe,owners,readers,writers,commit);
+}
+static int prepare_pipe_install(struct kernel_open_file_description *a,
+    struct kernel_open_file_description *b)
+{
+    if (b && (b==a || b->pipe!=a->pipe)) return -KERNEL_EBUSY;
+    if (__atomic_load_n(&a->pipe->concurrent,__ATOMIC_ACQUIRE)) return 0;
+    if (__atomic_load_n(&a->references,__ATOMIC_ACQUIRE)!=1 ||
+        (b && (b==a || b->pipe!=a->pipe ||
+               __atomic_load_n(&b->references,__ATOMIC_ACQUIRE)!=1))) return -KERNEL_EBUSY;
+    return kernel_pipe_enable_concurrency(a->pipe,1+!!b,
+        !!(a->pipe_endpoint & 1)+(b && (b->pipe_endpoint & 1)),
+        !!(a->pipe_endpoint & 2)+(b && (b->pipe_endpoint & 2)),1);
+}
 enum kernel_files_status kernel_files_check_concurrent_domain(
     const struct kernel_files *files, const struct kernel_mm *mm)
 {
@@ -185,8 +218,20 @@ enum kernel_files_status kernel_files_enable_concurrency(
             return KERNEL_FILES_STATUS_STATE;
     /* 私有、独占record的槽owner覆盖这个解锁范围；FD和pipe raw不嵌套。 */
     kernel_raw_scope_release(&guard);
-    for (uint32_t i=0;i<record->statistics.capacity;i++)
-        if (record->slots[i].description) kernel_pipe_enable_concurrency(record->slots[i].description->pipe);
+    /* 全部检查后才sealed；失败不能留下部分启用。IRQ覆盖普通CPU0别名构造。 */
+    for (int commit=0;commit<2;commit++)
+        for (uint32_t i=0;i<record->statistics.capacity;i++) {
+            struct kernel_open_file_description *file=record->slots[i].description;
+            if (!file) continue;
+            uint32_t j;
+            for (j=0;j<i;j++)
+                if (record->slots[j].description && record->slots[j].description->pipe==file->pipe) break;
+            if (j<i) continue;
+            if (private_pipe_owners(record,file->pipe,commit)) {
+                if (commit) __builtin_trap();
+                return KERNEL_FILES_STATUS_STATE;
+            }
+        }
     __atomic_store_n(&record->concurrent,1,__ATOMIC_RELEASE);
     return KERNEL_FILES_STATUS_OK;
 }
@@ -495,7 +540,7 @@ enum kernel_files_status kernel_files_install_new_owned_at(
     if (!kernel_files_is_live(files)) return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
     if (files->record->concurrent) {
         if (!owner || !description_in_domain(files,*owner) || !*owner) return KERNEL_FILES_STATUS_STATE;
-        kernel_pipe_enable_concurrency((*owner)->pipe);
+        if (prepare_pipe_install(*owner,0)) return KERNEL_FILES_STATUS_STATE;
     }
     KERNEL_FILES_SCOPE(guard, files);
     return install_owned_locked(files, fd, fd_flags, owner);
@@ -510,7 +555,7 @@ enum kernel_files_status kernel_files_install_shared_acquired_at(
     if (!kernel_files_is_live(files)) return KERNEL_FILES_STATUS_INVALID_ARGUMENT;
     if (files->record->concurrent) {
         if (!owner || !description_in_domain(files,*owner) || !*owner) return KERNEL_FILES_STATUS_STATE;
-        kernel_pipe_enable_concurrency((*owner)->pipe);
+        if (prepare_pipe_install(*owner,0)) return KERNEL_FILES_STATUS_STATE;
     }
     KERNEL_FILES_SCOPE(guard, files);
     return install_owned_locked(files, fd, fd_flags, owner);
@@ -527,7 +572,7 @@ enum kernel_files_status kernel_files_install_pair_reserved(
     struct kernel_files *files=first->files;
     if (files->record->concurrent) {
         if (!description_in_domain(files,*a) || !description_in_domain(files,*b)) return KERNEL_FILES_STATUS_STATE;
-        kernel_pipe_enable_concurrency((*a)->pipe); kernel_pipe_enable_concurrency((*b)->pipe);
+        if (prepare_pipe_install(*a,*b)) return KERNEL_FILES_STATUS_STATE;
     }
     KERNEL_FILES_SCOPE(guard, files);
     if (files->record->concurrent &&

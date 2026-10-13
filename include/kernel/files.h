@@ -126,7 +126,8 @@ struct kernel_files {
 enum kernel_files_status kernel_files_create(
     struct kernel_files *files,
     struct kernel_heap *heap);
-/* CPU0在独占、未发布record上启用；只接纳同域匿名pipe。控制者和任务
+/* CPU0在独占、未发布record上启用；全部OFD/端点引用及观察者必须在本域。
+ * 只接纳同域匿名pipe。控制者和任务
  * 分别持有handle，record共享。末handle退休后锁外清理OFD及数组。 */
 enum kernel_files_status kernel_files_enable_concurrency(struct kernel_files *, const struct kernel_mm *);
 enum kernel_files_status kernel_files_check_concurrent_domain(const struct kernel_files *, const struct kernel_mm *);

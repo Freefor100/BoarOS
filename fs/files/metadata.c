@@ -20,9 +20,9 @@ static int metadata_path(struct kernel_files *files,
 {
     struct kernel_vfs_path *start = 0;
     if (!name[0] && (flags & KERNEL_FILES_AT_EMPTY_PATH)) {
+        KERNEL_FILES_PIN_SCOPE(selected_fd);
         if (dirfd == KERNEL_FS_AT_FDCWD) start = kernel_fs_context_cwd(fs);
         else {
-            KERNEL_FILES_PIN_SCOPE(selected_fd);
             struct kernel_open_file_description *file = kernel_files_hold_fd(files,dirfd,&selected_fd);
             if (!file) return -KERNEL_EBADF;
             start = file->file.path;

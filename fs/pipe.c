@@ -15,6 +15,7 @@
 #include <kernel/task.h>
 #include <kernel/time.h>
 #include <kernel/uaccess.h>
+#include <kernel/wait_internal.h>
 
 #include <stdint.h>
 #include <string.h>
@@ -167,11 +168,21 @@ static void pipe_notify(struct kernel_pipe *pipe,int readers,int writers)
             __builtin_trap();
     }
 }
-void kernel_pipe_enable_concurrency(struct kernel_pipe *pipe)
+int kernel_pipe_enable_concurrency(struct kernel_pipe *pipe,uint32_t owners,
+    uint32_t readers,uint32_t writers,int commit)
 {
     PIPE_META(guard,pipe);
     if (pipe->fifo_node || !pipe->owners) __builtin_trap();
-    __atomic_store_n(&pipe->concurrent,1,__ATOMIC_RELEASE);
+    if (pipe->concurrent) return 0;
+    if (pipe->owners!=owners || pipe->readers!=readers || pipe->writers!=writers)
+        return -KERNEL_EBUSY;
+    KERNEL_RAW_SCOPE(wait_guard,&kernel_wait_domain);
+    struct kernel_wait_queue *queues[]={&pipe->read_queue,&pipe->write_queue,&pipe->both_queue};
+    for (unsigned i=0;i<3;i++)
+        if (queues[i]->registrations || queues[i]->borrows || queues[i]->closed)
+            return -KERNEL_EBUSY;
+    if (commit) __atomic_store_n(&pipe->concurrent,1,__ATOMIC_RELEASE);
+    return 0;
 }
 enum kernel_pipe_status kernel_pipe_acquire_endpoint(struct kernel_pipe *pipe,uint32_t endpoint)
 {
@@ -424,7 +435,8 @@ static enum kernel_pipe_status pipe_write_source(struct kernel_pipe *pipe,struct
     if (!count) return KERNEL_PIPE_STATUS_OK;
     uintptr_t irq=arch_interrupt_save();
     KERNEL_LOCK_SCOPE(copy); kernel_mutex_lock(&pipe->copy_lock,&copy);
-    uint64_t total=0; uint16_t remainder=(uint16_t)(count & BOAROS_PAGE_MASK);
+    /* sendfile/splice来源始终占新片段，不能并入user write的尾片段。 */
+    uint64_t total=0; uint16_t remainder=buffer ? 0 : (uint16_t)(count & BOAROS_PAGE_MASK);
     struct kernel_uaccess_iov_cursor cursor={iov,iov_count,0,0};
     while (total<count) {
         uint16_t slot,offset; size_t chunk; int merging,wait=0;

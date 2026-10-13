@@ -67,7 +67,10 @@ struct kernel_pipe;
 enum kernel_pipe_status kernel_pipe_create(
     struct kernel_heap *heap,
     struct kernel_pipe **owner);
-void kernel_pipe_enable_concurrency(struct kernel_pipe *);
+/* 私有发布检查全部端点与队列owner；commit前所有pipe必须先检查通过。
+ * 已sealed的pipe只能经已校验域继续安装，不产生域外观察者。 */
+int kernel_pipe_enable_concurrency(struct kernel_pipe *, uint32_t owners,
+    uint32_t readers, uint32_t writers, int commit);
 
 int kernel_pipe_fifo_open(struct kernel_heap *heap, struct kernel_vfs_node *node,
     uint32_t flags, struct kernel_pipe **owner, uint8_t *endpoint,

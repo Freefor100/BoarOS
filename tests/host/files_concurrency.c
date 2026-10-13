@@ -5,6 +5,9 @@
 #include <kernel/open_file.h>
 #include <kernel/mm_backend.h>
 #include <kernel/signal.h>
+#include <kernel/tmpfs.h>
+#include <kernel/fs_context.h>
+#include <kernel/uaccess.h>
 #include "../../fs/files/private.h"
 #include "../../fs/open_file_internal.h"
 #include "../../fs/pipe_internal.h"
@@ -20,6 +23,7 @@
 void mm_test_attach(unsigned);
 void mm_test_bind(struct kernel_mm *);
 void mm_test_bind_files(struct kernel_files *);
+extern _Thread_local uint64_t mm_test_context;
 static unsigned char pool[16 * 1024 * 1024] __attribute__((aligned(16384)));
 static void *access_page(uint64_t p) { return (void *)(uintptr_t)p; }
 static int page_address(const void *p, uint64_t *out)
@@ -28,6 +32,67 @@ static unsigned watch_pin, pin_entered, close_started, release_pin;
 static struct kernel_files files;
 static struct kernel_open_file_description *held;
 static struct kernel_mm domain_mm;
+static struct kernel_open_file_description *path_description;
+static struct kernel_vfs_path *watched_path;
+static unsigned path_acquired;
+int __real_kernel_vfs_path_acquire(struct kernel_vfs_path *);
+int __wrap_kernel_vfs_path_acquire(struct kernel_vfs_path *path)
+{
+    if (path==watched_path) {
+        assert(path_description && "OFD pin ended before the borrowed path acquired its own owner");
+        path_acquired=1;
+    }
+    return __real_kernel_vfs_path_acquire(path);
+}
+enum kernel_open_file_status __real_kernel_open_file_release(struct kernel_open_file_description **);
+enum kernel_open_file_status __wrap_kernel_open_file_release(struct kernel_open_file_description **owner)
+{
+    if (path_description && *owner==path_description) {
+        /* 精确交错：guard归还前关闭槽owner，让pin成为最后OFD引用。 */
+        path_description=0;
+        int64_t result;
+        assert(!kernel_files_close(&files,5,&result) && !result);
+    }
+    return __real_kernel_open_file_release(owner);
+}
+static void directory_pin_handoff(struct kernel_heap *heap,int metadata)
+{
+    files=(struct kernel_files){0};
+    struct kernel_vfs_mount *mount=0;
+    struct kernel_vfs_path *root=0,*path=0;
+    struct kernel_open_file_description *description=0;
+    struct kernel_fs_context fs={0};
+    int result;
+    assert(!kernel_tmpfs_create(heap,0,"",&mount));
+    assert(!kernel_vfs_path_root(mount,heap,&root));
+    if (metadata) assert(!kernel_fs_context_create(&fs,mount,heap));
+    assert(!kernel_open_file_create_at(heap,root,root,"/",KERNEL_OPEN_PATH_FOLLOW,0,&description,&result) && !result);
+    assert(!kernel_files_create(&files,heap));
+    watched_path=description->file.path; path_description=description; path_acquired=0;
+    assert(!kernel_files_install_new_owned_at(&files,5,0,&description));
+    if (metadata) {
+        uint64_t address;
+        size_t copied;
+        int64_t linux_result;
+        mm_test_bind(&domain_mm);
+        assert(!kernel_mm_context(&domain_mm,&mm_test_context));
+        assert(!kernel_mm_mmap_anonymous(&domain_mm,0x300000,BOAROS_PAGE_SIZE,
+            KERNEL_MM_READ|KERNEL_MM_WRITE,KERNEL_MM_MAP_FIXED_NOREPLACE,&address));
+        assert(!kernel_copy_to_user(&domain_mm,address,"",1,&copied) && copied==1);
+        assert(!kernel_files_utimensat(&files,&fs,&domain_mm,5,address,0,
+            KERNEL_FILES_AT_EMPTY_PATH,&linux_result) && !linux_result);
+        assert(!kernel_mm_munmap(&domain_mm,address,BOAROS_PAGE_SIZE));
+        mm_test_bind(0);
+        mm_test_context=0;
+    } else assert(!kernel_files_path_start(&files,0,5,"child",&path) && path==watched_path);
+    assert(path_acquired && !path_description);
+    watched_path=0;
+    if (path) assert(!kernel_vfs_path_release(&path));
+    if (metadata) assert(!kernel_fs_context_release(&fs));
+    assert(!kernel_files_release(&files));
+    assert(!kernel_vfs_path_release(&root) && !kernel_vfs_unmount(mount));
+    files=(struct kernel_files){0};
+}
 #ifdef PIPE_CONCURRENCY_CASES
 static unsigned signal_calls;
 enum kernel_signal_status kernel_signal_send_task(struct kernel_task *task,uint32_t sig,kernel_pid_t sender)
@@ -47,6 +112,43 @@ static void broken_kernel_writer(struct kernel_heap *heap)
 }
 #endif
 static struct kernel_files views[4];
+static void forbidden_pipe_callback(struct kernel_wait_node *node,uint32_t reason)
+{ (void)node; (void)reason; assert(!"publication notified a domain-external observer"); }
+static void reject_external_pipe_owner(struct kernel_heap *heap)
+{
+    files=(struct kernel_files){0};
+    struct kernel_files ordinary={0};
+    struct kernel_pipe *pipe=0;
+    struct kernel_open_file_description *a=0,*b=0,*external=0;
+    assert(!kernel_files_create(&files,heap));
+    assert(!kernel_pipe_create(heap,&pipe));
+    assert(!kernel_open_file_create_pipe(heap,pipe,1,0,&a));
+    assert(!kernel_open_file_create_pipe(heap,pipe,2,0,&b));
+    assert(!kernel_files_install_new_owned_at(&files,0,0,&a));
+    assert(!kernel_files_install_new_owned_at(&files,1,0,&b));
+    assert(!kernel_files_fork(&ordinary,&files));
+    assert(kernel_files_enable_concurrency(&files,&domain_mm)==KERNEL_FILES_STATUS_STATE &&
+        !files.record->concurrent && !pipe->concurrent);
+    assert(!kernel_files_release(&ordinary));
+    struct kernel_open_file_pipe_pin pin={0};
+    assert(!kernel_open_file_pipe_pin(files.record->slots[0].description,0,&pin));
+    assert(!kernel_open_file_pipe_finish(heap,&pin,0,&external));
+    assert(kernel_files_enable_concurrency(&files,&domain_mm)==KERNEL_FILES_STATUS_STATE &&
+        !files.record->concurrent && !pipe->concurrent);
+    assert(!kernel_open_file_release(&external));
+    struct kernel_wait_node observer={0};
+    kernel_wait_node_init_callback(&observer,forbidden_pipe_callback,0);
+    kernel_wait_queue_add(&pipe->read_queue,&observer);
+    assert(kernel_files_enable_concurrency(&files,&domain_mm)==KERNEL_FILES_STATUS_STATE &&
+        !files.record->concurrent && !pipe->concurrent);
+    assert(!kernel_wait_node_remove_sync(&observer));
+    /* 本表内dup有多个槽owner，却只对应一个端点，仍可启用。 */
+    int64_t result;
+    assert(!kernel_files_dup(&files,0,&result) && result==2);
+    assert(!kernel_files_enable_concurrency(&files,&domain_mm));
+    assert(!kernel_files_release(&files));
+    puts("PASS controlled pipe publication rejects ordinary aliases and independent OFDs");
+}
 static unsigned allocated[4][192], group_ready, group_release;
 static _Thread_local unsigned fail_growth;
 static unsigned maximum_copy, metadata_acquisitions;
@@ -190,6 +292,7 @@ int main(void)
         !physical_page_allocator_finalize(&pages) &&
         !kernel_heap_init(&heap, &pages, page_address));
     uint64_t baseline=physical_page_available(&pages);
+    directory_pin_handoff(&heap,0);
     assert(!kernel_files_create(&files, &heap));
     struct kernel_pipe *pipe = 0;
     struct kernel_open_file_description *read = 0, *write = 0;
@@ -225,6 +328,8 @@ int main(void)
         !kernel_mm_create(&domain_mm,&space) && !kernel_mm_vma_enable(&domain_mm,&heap));
     assert(!kernel_mm_brk_initialize(&domain_mm,0x10000,0x20000));
     assert(!kernel_mm_enable_concurrency(&domain_mm));
+    directory_pin_handoff(&heap,1);
+    reject_external_pipe_owner(&heap);
     concurrent_dup_case(&heap,2); concurrent_dup_case(&heap,4);
 #ifdef PIPE_CONCURRENCY_CASES
     broken_kernel_writer(&heap);

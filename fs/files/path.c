@@ -130,11 +130,12 @@ int kernel_files_path_start(struct kernel_files *files,
                               int64_t dirfd, const char *path,
                               struct kernel_vfs_path **start)
 {
+    /* fd被关闭后，这个pin仍覆盖借用路径，直到取得独立path引用。 */
+    KERNEL_FILES_PIN_SCOPE(selected_fd);
     if (!path[0]) return -KERNEL_ENOENT;
     if (path[0] == '/') *start = kernel_fs_context_root(fs);
     else if (dirfd == KERNEL_FS_AT_FDCWD) *start = kernel_fs_context_cwd(fs);
     else {
-        KERNEL_FILES_PIN_SCOPE(selected_fd);
         struct kernel_open_file_description *file = kernel_files_hold_fd(files,dirfd,&selected_fd);
         if (!file) return -KERNEL_EBADF;
         if ((kernel_open_file_mode(file) & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFDIR)

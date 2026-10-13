@@ -36,12 +36,17 @@ close/dup 替换在锁内摘槽，锁外处理选定 OFD；fd 复用不改变已
 open/pipe/socket 的编号预留保持到安装或取消；成对 fd 在用户输出成功后一起发布，复制失败不会按复用后的编号关闭对象。
 共享 OFD 的 APPEND/NONBLOCK 使用原子 status 更新，访问方向保持；FD_CLOEXEC 仍属于各张表。
 `kernel_files_enable_concurrency()`只在 CPU0、独占未发布表上启用同 heap/allocator 匿名 pipe 域；
+启用前核对本表槽引用覆盖全部 OFD 引用，不同 OFD 的端点总数覆盖全部 pipe owner，等待队列没有域外登记或在途借用。
+普通 fork 表别名、重开 OFD、未结束 pin 或观察者使启用返回 STATE，全部检查通过后才发布；本表内 dup 不重复计端点。
+这个私有启用检查最多 O(capacity²)，不在 FD raw 内扫描，不加入常见 lookup/close 路径。
 受控任务的 MM/files 引用在发布前准备，退出后在可信栈归还。普通后端、命名 FIFO、socket 和 epoll 业务仍受 CPU0 边界保护。
 `make test-files-concurrency-host`直接链接真实表/OFD/pipe、allocator、MM 和等待实现，
 在 4/16 KiB 模型核对 2/4 线程扩容/dup 编号唯一性、pin-close 交接、预留冲突、OOM 和引用归还；
 `make test-pipe-concurrency-host`另验证真实MM/uaccess的提前wake、fd复用后旧请求、EOF/部分EPIPE、
 复制期间poll、4095/4096/4097向量几何、故障片段撤销与munmap前缀；2/4线程检查内容隔离、ring wrap及无端点保留的EOF。
 这些宿主证据不代替真实两核和普通用户组合验收。
+相对 dirfd 和 AT_EMPTY_PATH 定位保持 OFD pin，直到借用路径取得独立引用；共享表 close 后，最后 pin 也不能早于这个交接结束。
+宿主窄反例强制在 guard 归还前关闭槽 owner，并验证路径交接与最终归还；sendfile 来源占独立片段，不并入可合并的 user-write 尾片段。
 受控内存文件的控制者保留独立 OFD 引用，直到映射、登记和临时准备 owner 全部结束；
 因此 CPU1 只归还非末次引用，后端最终释放仍由 CPU0 执行。
 
