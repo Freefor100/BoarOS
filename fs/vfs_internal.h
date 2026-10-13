@@ -22,6 +22,10 @@ struct kernel_vfs_node;
 int kernel_vfs_file_is_cost(const struct kernel_vfs_file *file);
 #endif
 struct kernel_heap;
+struct physical_page_allocator;
+/* 实际ext4 inode及其已开放cache的固定绑定；借用已有来源owner，不扫描注册表。 */
+int kernel_ext4_check_mapping_domain(const struct kernel_vfs_node *,
+    const struct kernel_heap *, const struct physical_page_allocator *);
 struct kernel_record_lock_state;
 
 struct kernel_vfs_node *kernel_vfs_file_node(

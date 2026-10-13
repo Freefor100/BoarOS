@@ -40,7 +40,8 @@ void kernel_cpu_flush_notifications(void) {}
 #endif
 void kernel_thread_yield(void) { sched_yield(); }
 enum kernel_scheduler_status kernel_scheduler_yield_current(void)
-{ sched_yield(); return KERNEL_SCHEDULER_STATUS_OK; }
+{ if (arch_interrupt_is_enabled()) return KERNEL_SCHEDULER_STATUS_INVALID_STATE;
+  sched_yield(); return KERNEL_SCHEDULER_STATUS_OK; }
 int kernel_time_is_initialized(void) { return 1; }
 uint64_t kernel_time_monotonic_ns(void)
 {
@@ -63,7 +64,15 @@ EXCLUDED(kernel_shm_attachment_release)
 EXCLUDED(kernel_elf64_source_release)
 EXCLUDED(kernel_elf64_source_acquire)
 EXCLUDED(kernel_elf64_source_page)
+#if BOAROS_MAX_CPUS == 1
 EXCLUDED(kernel_task_mm_borrow)
+#endif
+void mm_test_fence(uint64_t address, int instructions)
+{ (void)address; (void)instructions; __atomic_thread_fence(__ATOMIC_SEQ_CST); }
+#if BOAROS_MAX_CPUS > 1
+void riscv_smp_sync_user(uint32_t targets,uint64_t address,uint64_t size,int instructions)
+{ (void)targets; (void)size; mm_test_fence(address,instructions); }
+#endif
 EXCLUDED(kernel_proc_task_block_reads)
 EXCLUDED(kernel_proc_task_note_fault)
 EXCLUDED(kernel_epoll_notify_file_release)

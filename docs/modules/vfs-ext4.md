@@ -13,10 +13,10 @@
 映射登记由 MM 持有，来源 OFD 维持 inode 寿命。inode 的 rank30 raw 仅保护登记、
 代次、关闭状态和借用；注销先停止新借用并摘链，再在 MM gate、inode I/O 和 raw 锁外 drain。
 退休后继持有真实借用，归还采用迭代分段，每段最多16项；记录及 MM 存储在 drain 前不能释放。
-受控内存文件的截断通知在 inode I/O 和 raw 锁外同步执行，回调可以睡眠取得一个 MM gate；磁盘回调保留原单CPU inode I/O 契约。
+受控内存及磁盘文件的截断通知在 inode I/O 和 raw 锁外同步执行，回调可以睡眠取得一个 MM gate；普通CPU0缓存保留原调用契约。
 它与禁止阻塞的等待节点回调是不同接口，不使用其抢占禁止上下文。
 内存文件缩短先关闭旧代次，通知映射，再截断后备并提交大小/时间，最后开放新代次；
-完整文件 MM 并发接纳仍由 MM 域验证和缺页提交重查保护，不因此开放磁盘业务。
+完整文件 MM 并发接纳仍由 MM 域验证和缺页提交重查保护，不因此开放一般文件业务跨核。
 `make test-file-mapping-concurrency-host` 链接真实登记、VFS/tmpfs、OFD、对象及同步实现，
 在4/16KiB、2/4宿主线程下核对1/8/32登记、退休借用、关闭等待、来源引用和最终资源。
 映射登记的代次、短锁和等待状态由 inode 独占，首次映射时在发布 VMA 前准备；分配失败返回而不发布登记。未映射节点只有一个状态指针，不扩大原 inode（440 字节、COST 开启时 448 字节）及 ext4 包装的 512 字节 slab 档位。独立状态为 88 字节、使用 128 字节 slab，最终随 inode 释放。首次并发准备的失败候选在锁外归还，预热后的准备不分配；没有状态的截断保持 inode 写保护直到后备提交，防止首次登记越过尺寸更新。
@@ -323,10 +323,31 @@ metadata 位于独立 heap/allocator，不注册系统压力 hook；普通缓存
 远端冷读请求借用调用者的等待现场及文件 owner，由既有 CPU0 worker 执行；排队不
 发布 loading 页，worker 取得 inode 保护后重新查询并取得唯一加载资格。
 查询在索引保护内先借用 entry，再在锁外取得物理页引用；缓存命中不排队。
+CPU0受控MM任务同样把冷读交给普通CPU0 worker，不能借逻辑CPU号绕过业务域。
 停止先拒绝新请求，已执行读取完成后才归还请求现场，未执行请求返回 STATE。
 `make test-page-cache-concurrency-host` 链接真实 VFS/lwext4 和镜像块读写，在4/16 KiB、
-2/4宿主线程下检查冷读合并、预热命中、读失败、停止交接及最终资源；这是缓存入口
-证据，尚不构成磁盘 MM、写回别名或客户机两核验收。
+2/4宿主线程下检查冷读合并、64页扩容/预热命中、读失败、停止交接、1/8/32别名、
+旧写入借用、快照后新代次、真实前缀短写/EIO及最终资源；客户机证据另见[两核模块](riscv-smp.md)。
+
+受控别名在注销时停止新借用并摘链，借用游标固定退休后继；锁外drain完成后才释放
+resident/MM存储。共享磁盘叶初始只读，写缺页先取得页写许可并登记脏状态，才发布W。
+可写uaccess pin同时持有entry及页写入借用，归还不取得MM gate。写回只关闭目标页，
+锁外逐MM撤W并确认RFENCE，排空该页写借用，复制脏范围后立即重开；后端I/O由CPU0
+在inode读保护下执行，新generation不能被旧完成清除。后台worker遇旧pin或忙MM gate
+会延期，由实际pin归还/gate释放通知继续，避免它与同一worker的冷读请求互等。
+
+受控截断保留文件写操作门，先同步保留范围，再关闭代次并锁外撤映射；后端实际尺寸
+及changed明确后，在inode写保护下收敛尾零、缓存退休和尺寸发布。无变化失败不丢脏页；
+部分生效按真实尺寸处理。已退休整页的旧pin/快照借用继续固定存储，旧写回不再提交。
+purge/destroy由CPU0独占生命周期owner执行，stop/join不替代外部来源、MM或pin的结束。
+`msync`固定来源及范围后先释放MM gate，由普通CPU0任务执行同步；不开放CPU1 fsync/FD业务。
+
+```sh
+make test-page-cache-concurrency-host test-mm-disk-concurrency-host
+make test-mm-disk-smp-riscv QEMU_RISCV_FIRMWARE=build/data-path-baselines/sync-b3/firmware.bin
+make test-mm-disk-smp-userland-riscv INIT_CONFIG=config/init.json \
+  QEMU_RISCV_FIRMWARE=build/data-path-baselines/sync-b3/firmware.bin
+```
 
 每个当前页缓存实例拥有一个 joinable worker；worker 借用 cache/record，调用者必须保持它们有效直到 stop/join 返回。根盘运行期启动、用户磁盘挂载时创建，所属实例卸载前停止并回收。空闲低/高水位为受管页 2%/4%，脏页启动/停止为 10%/5%，小配置至少一页且阈值严格有序。没有周期清脏。分配器和持锁路径只发布请求，低水位先回收无别名/额外引用的干净页，再写回合格脏页；仅脏阈值触发则保留清洁缓存。
 

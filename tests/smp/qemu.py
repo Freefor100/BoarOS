@@ -25,9 +25,17 @@ def main():
                  if part.startswith("file="))
     output.mkdir(parents=True, exist_ok=True)
     prefix = output / Path(image).stem
+    if os.environ.get("BOAROS_SMP_DISK") == "1":
+        disk=output/(Path(image).stem+"-controlled.img")
+        subprocess.run(["truncate","-s","32M",str(disk)],check=True)
+        subprocess.run(["mkfs.ext4","-q","-F",str(disk)],check=True)
+        args += ["-global","virtio-mmio.force-legacy=false","-drive",f"file={disk},if=none,format=raw,cache=writeback,id=controlled",
+                 "-device","virtio-blk-device,drive=controlled,bus=virtio-mmio-bus.1"]
+    else: disk=None
     record = {"command": [actual, *args], "kernel": identity(kernel),
               "qemu": identity(actual), "disk_before": identity(image),
               "firmware": identity(firmware) if firmware != "default" else {"mode": "default"}}
+    if disk: record["controlled_disk_before"]=identity(disk)
     start = time.monotonic()
     process = subprocess.Popen(record["command"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     os.set_blocking(process.stdout.fileno(), False)
@@ -71,6 +79,9 @@ def main():
         return 1
     if "SMP root overlap counter=" not in text or "controller/arena/wait owners returned" not in text:
         return 1
+    if disk:
+        if "disk MM CPU0 I/O/cache/alias/mount owners returned" not in text: return 1
+        subprocess.run(["e2fsck","-fn",str(disk)],check=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
     return 0
 
 

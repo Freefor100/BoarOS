@@ -275,7 +275,7 @@ OOM/split/fork 由 vma/scale/ABI 组合回归继续保护。
 
 自持同一 MM pin 的调用者只尝试取得 operation gate；忙时返回 `CONFLICT`，原 pin、映射和未发布的输出保持。新 pin 许可已关闭也不等待；缺页准备后的重取 gate 使用同一规则，冲突归还候选及 COW 临时引用后返回，不在保留 pin 时自旋重试。调用者归还原 pin 后可重试，无争用的自持 pin 撤映射仍有效。零长度 mprotect 不进入 gate。
 
-`kernel_mm_enable_concurrency()`只用于 CPU0 私有构造完成的记录：独占引用、无 ELF/SysV/磁盘/外部后备、无 allocator 压力 hook。受控 tmpfs 来源须核对真实 inode、同 heap/allocator 和实例页预算。共享匿名对象须经check_domain确认属于同heap/allocator且无budget；发布后允许MAP_SHARED匿名创建。成功后才能共享句柄和通过 `kernel_thread_create_joinable_mm()` 绑定受控任务。普通用户任务仍限 CPU0；LA 仍为单CPU。CPU0 负责私有 tmpfs 构造、文件修改和最终释放；CPU1 只执行已绑定的映射操作，控制者保留独立 OFD 引用，命名空间运行期间不修改。内部开关不开放系统压力、磁盘缓存或普通文件业务跨核。
+`kernel_mm_enable_concurrency()`只用于 CPU0 私有构造完成的记录：独占引用、无 ELF/SysV/未开放外部后备、无 allocator 压力 hook。受控 tmpfs 来源须核对真实 inode、同 heap/allocator 和实例页预算；受控ext4来源须核对真实inode/挂载及独立缓存的heap/allocator绑定，登记状态由CPU0在发布前准备。共享匿名对象须经check_domain确认属于同heap/allocator且无budget；发布后允许MAP_SHARED匿名创建。成功后才能共享句柄和通过 `kernel_thread_create_joinable_mm()` 绑定受控任务。普通用户任务仍限 CPU0；LA 仍为单CPU。CPU0 负责文件构造、修改和最终释放；CPU1 只执行已绑定的映射操作，控制者保留独立 OFD/挂载/缓存 owner，命名空间运行期间不修改。内部开关不开放系统压力或普通文件业务跨核。
 
 每个复制片段在 MM raw 下完成 PTE/权限检查及真实物理 acquire，复制在锁外；同一 task/I/O owner 归还 pin。pin 固定页存活，不固定映射身份或内容。`munmap` 可先撤销映射，旧片段靠 pin 完成；`mprotect` 关闭新许可并排空旧片段，fork 关闭写许可并排空旧写 pin。已持有需要排空的 pin 时不能等待自己，非法 owner fatal；零长度及无效参数不进入 drain。精确复制前缀保持。
 
@@ -285,7 +285,7 @@ fault 先在 gate/raw 下取得 VMA generation 和 PTE/COW 快照，释放保护
 
 撤叶及空表将 owner 转给固定容量为16的退休批次。MM raw 内清 PTE/摘父项、增加代次并采样 active mask；raw 外完成本地 SFENCE 和同步 SBI RFENCE，再释放数据及表页。非叶修改使用全范围失效。取指变化另完成本地/远端 FENCE.I。目标采样后首次进入的 CPU 在同一保护下先登记、切根并完整本地失效；离开者清活动位发生在旧翻译停止之后。固件返回错误 fatal，保留真实 owner，不建立释放重试链。
 
-`kernel_mm_proc_memory_snapshot()`在 gate 下固定 VMA 数组、raw 下取得页表计数；statistics 使用 raw 快照。匿名 `msync` 保留既有区间和 errno，在 gate 下读取；自持 pin 的 gate 忙冲突在此 int 接口对应 `-EAGAIN`，不伪报资源不足。并发域只接受经域校验的 tmpfs 文件映射，拒绝 SysV/磁盘/外部后备创建与 shmdt。活动域未包含磁盘 truncate/writeback、共享 fd/offset、SysV 或设备并发，依赖见[路线图](../goals.md#p6c-tlb-完成与页回收)。
+`kernel_mm_proc_memory_snapshot()`在 gate 下固定 VMA 数组、raw 下取得页表计数；statistics 使用 raw 快照。匿名 `msync` 保留既有区间和 errno，在 gate 下读取；自持 pin 的 gate 忙冲突在此 int 接口对应 `-EAGAIN`，不伪报资源不足。并发文件域只接受经域校验的tmpfs及受控ext4映射，拒绝 SysV/未开放外部后备创建与 shmdt。共享 fd/offset、SysV、一般设备和系统压力并发尚未开放，依赖见[路线图](../goals.md#p6c-tlb-完成与页回收)。
 
 ```sh
 make test-mm-pin-host test-mm-concurrency-host
@@ -312,3 +312,18 @@ make test-mm-file-smp-userland-riscv INIT_CONFIG=config/init.json
 ```
 
 宿主链接实际 VFS/tmpfs/OFD/object/MM，4/16 KiB 的登记与来源 owner 模型、Sv39 4 KiB 的跨 MM 模型分别报告。真实 RV 使用独立 `build/riscv-mm-file-smp-test/`、MTTCG 两核及一核退化；默认用户和 LA 仍单 CPU。执行器身份和自然退出 owner 检查沿用 [RV SMP](riscv-smp.md)。
+
+## 受控 ext4 文件映射
+
+来源准备在MM gate下取得实际OFD引用，锁外由CPU0缓存worker执行冷读；恢复gate和
+inode读保护后重查VMA/文件代次、EOF、权限及PTE，过期候选只归还本次取得的owner。
+共享叶与其他MM使用同一缓存页，初始RO；私有叶保持只读后备别名/COW，fork按VMA分类。
+磁盘可写pin附带按页写借用，快照关闭后不能新增许可；等待重开先释放gate和inode保护。
+fault成功后pin若遇快照临时撤W，重新解析；真正的VMA撤权或EOF仍按用户故障结束。
+
+CPU0范围同步每批固定最多16份OFD与范围，释放gate后执行，以免写回回调等待同一gate。
+别名注销先摘链，再在gate/raw/inode外drain，忙gate的后台重试登记持实际alias借用，
+由gate释放代次与通知交接保证寿命。数据、页表与来源仍在RFENCE确认后才归还。
+缓存写回/截断的交接见[VFS](vfs-ext4.md#后台写回与水位回收)，真实两核及独立重启
+见[RV SMP](riscv-smp.md)。`make test-mm-disk-concurrency-host`链接真实Sv39、VFS/OFD、
+lwext4及镜像读写；宿主模型不证明硬件TLB或用户线程跨核ABI。

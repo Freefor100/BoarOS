@@ -174,8 +174,8 @@ static void allocation_cases(struct kernel_vfs_file *file)
     probe = 0;
     check(calls == 1 && submitted == 4096, 55);
 }
-static void rearm(void *owner, uint64_t address)
-{ (void)owner; (void)address; alias_rearms++; }
+static int rearm(void *owner, uint64_t address)
+{ (void)owner; (void)address; alias_rearms++; return 0; }
 static void redirty_worker(void *unused)
 {
     (void)unused;

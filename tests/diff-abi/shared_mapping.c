@@ -148,6 +148,17 @@ void abi_shared_file_mapping_cases(void)
     unsigned char isolation[] = {private_bytes[80], a[80]};
     abi_record("shared-file.private-isolation", 0, abi_size(second),
                abi_offset(second), 0, isolation, sizeof(isolation));
+    /* 同步后的下一代写通过read(2)的用户复制进入共享页，再次同步
+     * 并从文件读回；私有COW页仍必须与它隔离。 */
+    abi_require(SC3(227, left, ABI_PAGE_SIZE, 4) == 0);
+    abi_require(SC3(62, second, 19, 0) == 19);
+    abi_require(SC3(63, second, (void *)(left + 80), 1) == 1);
+    abi_require(SC3(227, left, ABI_PAGE_SIZE, 4) == 0);
+    abi_require(SC3(62, second, 80, 0) == 80);
+    unsigned char next_generation[] = {a[80], private_bytes[80], 0};
+    abi_require(SC3(63, second, &next_generation[2], 1) == 1);
+    abi_record("shared-file.snapshot-copy-next-generation", 0, abi_size(second),
+               abi_offset(second), 0, next_generation, sizeof(next_generation));
     abi_require(SC2(215, private_map, ABI_PAGE_SIZE) == 0);
     abi_require(SC3(35, -100, "/shared-file", 0) == 0);
     abi_require(SC1(57, second) == 0);

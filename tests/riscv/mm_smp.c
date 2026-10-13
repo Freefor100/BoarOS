@@ -11,7 +11,11 @@
 #include <kernel/tmpfs.h>
 #include <kernel/open_file.h>
 #include <kernel/vfs.h>
+#include <kernel/page_cache.h>
+#include <kernel/errno.h>
+#include <kernel/file_mapping.h>
 #include "../../fs/open_file_internal.h"
+#include "../../fs/vfs_internal.h"
 #include <kernel/irq.h>
 #include <string.h>
 #include "../../kernel/sched/private.h"
@@ -50,6 +54,28 @@ static struct kernel_vfs_mount *file_mount;
 static struct kernel_open_file_description *file_controller;
 static unsigned stale_fault, file_epoch_probe;
 #define FILE_PRIVATE_DATA UINT64_C(0x90000000)
+#endif
+#if BOAROS_MM_DISK_TEST
+static struct kernel_heap *disk_backend_heap;
+static struct kernel_block_device *disk_backend;
+static struct kernel_page_cache disk_cache;
+static struct kernel_thread_join disk_setup_join;
+static unsigned disk_setup_ready;
+static uint64_t disk_setup_ticks;
+static void require(int,const char *);
+static unsigned disk_pin_ready,disk_pin_release,disk_other_go,disk_other_done,disk_snapshot_done;
+#define DISK_COLD_DATA UINT64_C(0xa0000000)
+static struct kernel_thread_join disk_sync_join;
+static void disk_sync_body(void *unused)
+{
+    (void)unused;
+    require(!kernel_mm_msync(&parent,SHARED_DATA,BOAROS_PAGE_SIZE,4),"disk-msync-source-handoff");
+    __atomic_store_n(&disk_snapshot_done,1,__ATOMIC_RELEASE);
+}
+static struct kernel_vfs_mount disk_mount;
+static const char disk_persist[]="BoarOS controlled disk durable";
+void riscv_smp_test_disk_config(struct kernel_heap *backend_heap,struct kernel_block_device *block)
+{ disk_backend_heap=backend_heap; disk_backend=block; }
 #endif
 static uint64_t old_pages[3], before_retire, background_count, background_begin;
 static struct {
@@ -180,14 +206,24 @@ long __wrap_sbi_remote_sfence(uint64_t hart, uint64_t address, uint64_t size)
             struct kernel_mm_concurrency_state state;
             kernel_mm_get_concurrency_state(&parent, &state);
             require(state.pending_retirement == 1 && physical_page_available(&arena) == before_retire &&
-                arena.shared_anon_pages == 3, "shared-failed-RFENCE-batch-and-object");
+                (BOAROS_MM_DISK_TEST || arena.shared_anon_pages == 3), "shared-failed-RFENCE-batch-and-object");
             for (unsigned i=0;i<5;i++) {
                 uint32_t references;
                 require(physical_page_reference_count(&arena,shared_retired[i],&references)==PHYSICAL_PAGE_STATUS_OK &&
                     references==shared_refs[i], "shared-failed-RFENCE-retained-reference");
             }
 #if BOAROS_MM_FILE_TEST
+#if BOAROS_MM_DISK_TEST
+            virt_uart_emergency_begin();
+#endif
             require(file_controller && file_controller->references>=2,"file-RFENCE-controller-source-owner");
+#if BOAROS_MM_DISK_TEST
+            struct kernel_page_cache_statistics cache_state;
+            kernel_page_cache_get_statistics(&disk_cache,&cache_state);
+            require(cache_state.current_pages>=3 && disk_mount.private_data && disk_backend,
+                "disk-RFENCE-cache-mount-owner");
+            virt_uart_puts("BoarOS: disk MM RFENCE error retains cache/mount/source/data/table owners\n");
+#endif
             virt_uart_puts("BoarOS: file MM RFENCE error retains source/registration/data/table owners\n");
 #endif
             virt_uart_puts("BoarOS: shared MM RFENCE error retains object/pin/data/table owners\n");
@@ -233,12 +269,12 @@ enum kernel_memory_object_status __wrap_kernel_memory_object_prepare_page(
 #endif
     return result;
 }
-int __real_kernel_open_file_prepare_memory_page(struct kernel_open_file_description *,uint64_t,
+int __real_kernel_open_file_prepare_mapping_page(struct kernel_open_file_description *,uint64_t,
     struct kernel_open_file_page_preparation *);
-int __wrap_kernel_open_file_prepare_memory_page(struct kernel_open_file_description *file,uint64_t index,
+int __wrap_kernel_open_file_prepare_mapping_page(struct kernel_open_file_description *file,uint64_t index,
     struct kernel_open_file_page_preparation *prepared)
 {
-    int result=__real_kernel_open_file_prepare_memory_page(file,index,prepared);
+    int result=__real_kernel_open_file_prepare_mapping_page(file,index,prepared);
 #if BOAROS_MM_FILE_TEST
     unsigned id=kernel_task_current()==actors[1].task ? 1 : 0;
     if (!result && shared_stage && index==1 && !__atomic_load_n(&shared_entered[id],__ATOMIC_ACQUIRE)) {
@@ -391,6 +427,10 @@ static void actor(void *argument)
                 require(kernel_mm_pin_user_page(mm, DATA, KERNEL_MM_WRITE, &pin) == KERNEL_MM_STATUS_OK, "mm-root-overlap-pin");
                 (*(uint64_t *)pin.page)++;
                 kernel_mm_unpin_user_page(&pin);
+#if BOAROS_MM_DISK_TEST
+                uint64_t content;
+                require(!kernel_copy_from_user(mm,&content,SHARED_DATA,sizeof(content),&copied),"disk-CPU1-user-overlap-read");
+#endif
                 __atomic_fetch_add(&background_count, 1, __ATOMIC_RELAXED);
             }
         } else if (operation == 12) {
@@ -420,6 +460,9 @@ static void actor(void *argument)
             require(mm_smp_load(SHARED_DATA)==11,"shared-child-cache");
             arch_interrupt_restore(irq); __atomic_store_n(&shared_cached,1,__ATOMIC_RELEASE);
             while(!__atomic_load_n(&shared_protected,__ATOMIC_ACQUIRE)) asm volatile("nop");
+#if BOAROS_MM_DISK_TEST
+            require(!kernel_mm_resolve_user_fault(mm,SHARED_DATA,KERNEL_MM_WRITE),"disk-child-write-fault-permission");
+#endif
             mm_smp_store(SHARED_DATA,88); asm volatile("csrc sstatus,%0"::"r"((UINT64_C(1)<<18)):"memory");
             __atomic_store_n(&shared_written,1,__ATOMIC_RELEASE);
         } else if(operation==27) {
@@ -441,6 +484,45 @@ static void actor(void *argument)
             require(*(uint64_t *)migrating_pin.page==88,"shared-last-pin-content-after-unmap");
             kernel_mm_unpin_user_page(&migrating_pin);
 #if BOAROS_MM_FILE_TEST
+#if BOAROS_MM_DISK_TEST
+        } else if(operation==37) {
+            uint64_t value=11;
+            require(!kernel_copy_to_user(mm,SHARED_DATA,&value,sizeof(value),&copied),"disk-pin-writable-leaf");
+            struct kernel_mm_user_pin writer={0};
+            require(!kernel_mm_pin_user_page(mm,SHARED_DATA,KERNEL_MM_WRITE,&writer) && writer.cache_write.registration,
+                "disk-actual-page-write-borrow");
+            __atomic_store_n(&disk_pin_ready,1,__ATOMIC_RELEASE);
+            while (!__atomic_load_n(&disk_other_go,__ATOMIC_ACQUIRE)) asm volatile("nop");
+            value=1;
+            require(!kernel_copy_to_user(mm,DATA,&value,sizeof(value),&copied),"disk-unrelated-page-progress");
+            uintptr_t irq=arch_interrupt_save();
+            unsigned cpu=kernel_cpu_current()->logical_id;
+            probes[cpu].pc=(uintptr_t)mm_smp_store_pc; probes[cpu].cause=RISCV_SCAUSE_STORE_PAGE_FAULT;
+            probes[cpu].address=SHARED_DATA; probes[cpu].caught=0; probes[cpu].armed=1;
+            asm volatile("csrs sstatus,%0"::"r"((UINT64_C(1)<<18)):"memory");
+            mm_smp_store(SHARED_DATA,999);
+            asm volatile("csrc sstatus,%0"::"r"((UINT64_C(1)<<18)):"memory");
+            require(probes[cpu].caught,"disk-hardware-write-revoked-after-RFENCE"); probes[cpu].armed=0;
+            arch_interrupt_restore(irq);
+            __atomic_store_n(&disk_other_done,1,__ATOMIC_RELEASE);
+            while (!__atomic_load_n(&disk_pin_release,__ATOMIC_ACQUIRE)) asm volatile("nop");
+            *(uint64_t *)writer.page=11; kernel_mm_unpin_user_page(&writer);
+        } else if(operation==38) {
+            struct kernel_open_file_description *owner=file_controller;
+            uint64_t address;
+            require(!kernel_open_file_acquire(owner) &&
+                !kernel_mm_mmap_file_private(mm,&owner,DISK_COLD_DATA,BOAROS_PAGE_SIZE,3*BOAROS_PAGE_SIZE,
+                    KERNEL_MM_READ|KERNEL_MM_WRITE,KERNEL_MM_MAP_FIXED|KERNEL_MM_MAP_SHARED,&address),
+                "disk-background-cold-page-map");
+            uint64_t value=1;
+            require(!kernel_copy_from_user(mm,&value,DISK_COLD_DATA,sizeof(value),&copied) &&
+                copied==sizeof(value) && !value,"disk-cold-progress-while-snapshot-deferred");
+            require(!kernel_mm_munmap(mm,DISK_COLD_DATA,BOAROS_PAGE_SIZE),"disk-extra-cold-map-owner-return");
+        } else if(operation==39) {
+            uint64_t value=11;
+            require(!kernel_copy_to_user(mm,SHARED_DATA,&value,sizeof(value),&copied) &&
+                copied==sizeof(value),"disk-background-next-generation-write");
+#endif
         } else if(operation==32) {
             uint64_t value=44;
             require(kernel_copy_to_user(mm,SHARED_DATA+BOAROS_PAGE_SIZE,&value,sizeof(value),&copied)==KERNEL_UACCESS_STATUS_FAULT &&
@@ -556,8 +638,8 @@ static void shared_case(void)
     struct kernel_mm_mapping a,b;
     require(kernel_mm_lookup(&parent,SHARED_DATA,&a)==KERNEL_MM_STATUS_OK &&
         kernel_mm_lookup(&child,SHARED_DATA,&b)==KERNEL_MM_STATUS_OK &&
-        a.physical_address==b.physical_address && (a.permissions&KERNEL_MM_WRITE) &&
-        (b.permissions&KERNEL_MM_WRITE),"shared-fork-parent-child-permission");
+        a.physical_address==b.physical_address && (BOAROS_MM_DISK_TEST || (a.permissions&KERNEL_MM_WRITE)) &&
+        (BOAROS_MM_DISK_TEST || (b.permissions&KERNEL_MM_WRITE)),"shared-fork-parent-child-permission");
     require(kernel_mm_lookup(&parent,DATA,&a)==KERNEL_MM_STATUS_OK && !(a.permissions&KERNEL_MM_WRITE),"shared-mixed-private-COW");
     struct kernel_mm owner={0};
     require(kernel_mm_acquire(&owner,&child)==KERNEL_MM_STATUS_OK &&
@@ -568,7 +650,7 @@ static void shared_case(void)
     require(kernel_vfs_ftruncate(&file_controller->file,BOAROS_PAGE_SIZE)==0,"file-controller-shrink");
     uint32_t old_refs;
     require(physical_page_reference_count(&arena,shared_physical[1],&old_refs)==PHYSICAL_PAGE_STATUS_OK && old_refs==1 &&
-        arena.shared_anon_pages==1,"file-prepare-reference-survives-truncate");
+        (BOAROS_MM_DISK_TEST || arena.shared_anon_pages==1),"file-prepare-reference-survives-truncate");
     __atomic_store_n(&shared_resume,1,__ATOMIC_RELEASE); wake(&shared_prepare_gate);
     wait_flag(&stale_fault,"file-stale-fault-complete"); wait_flag(&completed[1],"file-stale-command-complete");
     require(!kernel_vfs_ftruncate(&file_controller->file,3*BOAROS_PAGE_SIZE),"file-controller-regrow");
@@ -578,7 +660,7 @@ static void shared_case(void)
 #endif
     send(0,21); send(1,21);
     wait_flag(&shared_entered[0],"shared-parent-source-ready"); wait_flag(&shared_entered[1],"shared-child-source-ready");
-    require(shared_created==1 && shared_physical[0]==shared_physical[1] && arena.shared_anon_pages==3,"shared-one-first-publication");
+    require((BOAROS_MM_DISK_TEST || shared_created==1) && shared_physical[0]==shared_physical[1] && (BOAROS_MM_DISK_TEST || arena.shared_anon_pages==3),"shared-one-first-publication");
     __atomic_store_n(&shared_resume,1,__ATOMIC_RELEASE); wake(&shared_prepare_gate);
     wait_flag(&completed[0],"shared-parent-first-fault"); wait_flag(&completed[1],"shared-child-first-fault");
     uint64_t values[2]; size_t copied;
@@ -588,13 +670,59 @@ static void shared_case(void)
     request(0,33); request(1,34);
     virt_uart_puts("BoarOS: file MM stale preparation/EOF/regrowth/private COW passed\n");
 #endif
+#if BOAROS_MM_DISK_TEST
+    require(!kernel_vfs_ftruncate(&file_controller->file,4*BOAROS_PAGE_SIZE),"disk-background-cold-page-size");
+    struct kernel_page_cache_concurrency_state background;
+    kernel_page_cache_get_concurrency_state(&disk_cache,&background);
+    uint64_t deferred_before=background.deferred_snapshots;
+    send(1,37); wait_flag(&disk_pin_ready,"disk-writer-pin-held");
+    require(!kernel_page_cache_request_writeback(&disk_cache),"disk-background-force");
+    uint64_t deferred_deadline=riscv_time_read()+UINT64_C(50000000);
+    do {
+        kernel_page_cache_get_concurrency_state(&disk_cache,&background);
+        require((int64_t)(riscv_time_read()-deferred_deadline)<0,"disk-background-defer-deadline"); yield();
+    } while (background.deferred_snapshots==deferred_before);
+    request(0,38);
+    require(!kernel_thread_create_joinable(disk_sync_body,0,&disk_sync_join),"disk-sync-controller");
+    for (;;) {
+        struct kernel_mm_mapping leaf;
+        require(!kernel_mm_lookup(&child,SHARED_DATA,&leaf),"disk-snapshot-leaf");
+        if (!(leaf.permissions&KERNEL_MM_WRITE)) break;
+        require(!disk_snapshot_done,"disk-snapshot-returned-before-revoke"); yield();
+    }
+    require(!disk_snapshot_done,"disk-pin-prevents-snapshot-completion");
+    __atomic_store_n(&disk_other_go,1,__ATOMIC_RELEASE); wait_flag(&disk_other_done,"disk-other-page-and-native-denial");
+    require(!disk_snapshot_done,"disk-other-progress-with-pin-held");
+    __atomic_store_n(&disk_pin_release,1,__ATOMIC_RELEASE);
+    wait_flag(&completed[1],"disk-pin-return-command"); kernel_thread_join(&disk_sync_join);
+    require(disk_snapshot_done,"disk-snapshot-after-pin-return");
+    require(!kernel_vfs_ftruncate(&file_controller->file,3*BOAROS_PAGE_SIZE),"disk-extra-cold-page-owner-return");
+    struct kernel_page_cache_statistics background_stats;
+    kernel_page_cache_get_statistics(&disk_cache,&background_stats);
+    uint64_t background_before=background_stats.worker_written;
+    request(0,39);
+    require(!kernel_page_cache_request_writeback(&disk_cache),"disk-background-submit-force");
+    uint64_t background_deadline=riscv_time_read()+UINT64_C(50000000);
+    do {
+        kernel_page_cache_get_statistics(&disk_cache,&background_stats);
+        require((int64_t)(riscv_time_read()-background_deadline)<0,"disk-background-submit-deadline"); yield();
+    } while (background_stats.worker_written==background_before);
+    { KERNEL_LOCK_SCOPE(io);
+      struct kernel_vfs_node *node=kernel_open_file_node(file_controller);
+      kernel_vfs_node_lock(node,&io,0);
+      uint64_t actual=0; size_t read;
+      require(!kernel_vfs_node_pread(node,0,&actual,sizeof(actual),&read) && read==sizeof(actual) && actual==11,
+          "disk-background-real-backend-content"); }
+    virt_uart_puts("BoarOS: disk MM per-page write pin/native RFENCE/other-page/msync snapshot passed\n");
+    virt_uart_puts("BoarOS: disk MM deferred snapshot/cold progress/CPU0 worker writeback passed\n");
+#endif
     send(1,26); wait_flag(&shared_cached,"shared-child-hardware-ready"); request(0,22);
     __atomic_store_n(&shared_protected,1,__ATOMIC_RELEASE); wait_flag(&shared_written,"shared-child-write-still-allowed");
     wait_flag(&completed[1],"shared-child-hardware-done");
     request(0,27); request(1,27);
     require(kernel_mm_lookup(&parent,SHARED_DATA+2*BOAROS_PAGE_SIZE,&a)==KERNEL_MM_STATUS_OK &&
         kernel_mm_lookup(&child,SHARED_DATA+2*BOAROS_PAGE_SIZE,&b)==KERNEL_MM_STATUS_OK &&
-        a.physical_address==b.physical_address && arena.shared_anon_pages==3,"shared-protected-owner-classification");
+        a.physical_address==b.physical_address && (BOAROS_MM_DISK_TEST || arena.shared_anon_pages==3),"shared-protected-owner-classification");
 #if BOAROS_MM_FILE_TEST
     request(0,36); request(1,36);
 #endif
@@ -623,7 +751,7 @@ static void shared_case(void)
         wait_flag(&fence_entered,"shared-remote-fence-paused");
         struct kernel_mm_concurrency_state state; kernel_mm_get_concurrency_state(&parent,&state);
         require(state.pending_retirement==1 && physical_page_available(&arena)==before_retire &&
-            arena.shared_anon_pages==3 && !shared_remove_done,"shared-no-free-before-RFENCE");
+            (BOAROS_MM_DISK_TEST || arena.shared_anon_pages==3) && !shared_remove_done,"shared-no-free-before-RFENCE");
         __atomic_store_n(&fence_release,1,__ATOMIC_RELEASE); wake(&fence_gate);
     }
     wait_flag(&shared_remove_done,"shared-remove-after-ack"); kernel_thread_join(&shared_remover);
@@ -636,7 +764,11 @@ static void shared_case(void)
     require(kernel_mm_release(&child)==KERNEL_MM_STATUS_OK,"shared-child-caller-owner-return");
 #if BOAROS_MM_FILE_TEST
     require(file_epoch_probe,"file-epoch-test-ran");
+#if BOAROS_MM_DISK_TEST
+    virt_uart_puts("BoarOS: file MM real ext4 cross-root/source/registration/pin/RFENCE owners passed\n");
+#else
     virt_uart_puts("BoarOS: file MM real tmpfs cross-root/source/registration/pin/RFENCE owners passed\n");
+#endif
 #endif
     virt_uart_puts("BoarOS: shared MM cross-root/fault/protected/migration/RFENCE owners passed\n");
 }
@@ -658,6 +790,9 @@ static void capture_old_pages(void)
 
 static void prepare_mm(void)
 {
+#if BOAROS_MM_FILE_TEST
+    int error;
+#endif
     require(physical_page_allocate_order(system_pages, 12, &outer) == PHYSICAL_PAGE_STATUS_OK, "mm-arena-owner");
     struct boot_memory_layout layout = {0};
     layout.usable_count = 1; layout.usable[0].base = outer; layout.usable[0].size = UINT64_C(16) << 20;
@@ -666,6 +801,26 @@ static void prepare_mm(void)
         physical_page_allocator_finalize(&arena) == PHYSICAL_PAGE_STATUS_OK &&
         kernel_heap_init(&heap, &arena, physical) == KERNEL_HEAP_STATUS_OK, "mm-private-arena");
     arena_baseline = physical_page_available(&arena);
+#if BOAROS_MM_DISK_TEST
+    require(!kernel_page_cache_init_controlled(&disk_cache,&heap,&arena) &&
+        !kernel_vfs_mount_ext4(&disk_mount,disk_backend,disk_backend_heap,&disk_cache,0),"disk-private-cache-mount");
+    file_mount=&disk_mount;
+    int opened=kernel_open_file_create(&heap,file_mount,"/controlled",&file_controller,&error);
+    if (!opened && !error) {
+        char content[sizeof(disk_persist)]; size_t count;
+        require(!kernel_vfs_pread(&file_controller->file,0,content,sizeof(content),&count) &&
+            count==sizeof(content) && !memcmp(content,disk_persist,sizeof(content)),"disk-independent-restart-content");
+        virt_uart_puts("BoarOS: disk MM independent restart durable content passed\n");
+    } else require(!kernel_open_file_create_mode(&heap,file_mount,"/controlled",0600,&file_controller,&error) && !error,
+        "disk-controller-create");
+    require(!kernel_page_cache_start_worker(&disk_cache),"disk-cache-worker");
+    file_controller->open_flags=2;
+    require(!kernel_vfs_ftruncate(&file_controller->file,3*BOAROS_PAGE_SIZE),"disk-controller-initial-size");
+    require(!kernel_file_mapping_prepare(kernel_open_file_node(file_controller)),"disk-controller-mapping-state");
+    /* 从临时activate到归还内核上下文只构造私有arena元数据，不执行I/O。
+     * 这个未绑定的构造任务不能在临时SATP下被调度器当成内核context检查。 */
+    uintptr_t construction_irq=arch_interrupt_save();
+#endif
     require(physical_page_allocate(&arena, &template_page) == PHYSICAL_PAGE_STATUS_OK, "mm-owned-root-template");
     void *source, *destination;
     uint64_t kernel_context = riscv_sv39_current_satp();
@@ -698,12 +853,15 @@ static void prepare_mm(void)
     shared_root_data=root_mode;
 #endif
 #if BOAROS_MM_FILE_TEST
-    int error;
+#if !BOAROS_MM_DISK_TEST
     require(!kernel_tmpfs_create(&heap,0,"nr_blocks=8",&file_mount) &&
         !kernel_open_file_create_mode(&heap,file_mount,"/controlled",0600,&file_controller,&error) && !error,
         "file-controller-private-tmpfs");
+#endif
+#if !BOAROS_MM_DISK_TEST
     file_controller->open_flags=2;
     require(!kernel_vfs_ftruncate(&file_controller->file,3*BOAROS_PAGE_SIZE),"file-controller-initial-size");
+#endif
     struct kernel_open_file_description *file_owner=file_controller;
     require(!kernel_open_file_acquire(file_owner) &&
         !kernel_mm_mmap_file_private(&parent,&file_owner,SHARED_DATA,3*BOAROS_PAGE_SIZE,0,
@@ -717,11 +875,17 @@ static void prepare_mm(void)
     require(kernel_mm_activate(0, kernel_context) == KERNEL_MM_STATUS_OK &&
         kernel_mm_enable_concurrency(&parent) == KERNEL_MM_STATUS_OK, "mm-private-publication");
     capture_old_pages();
+#if BOAROS_MM_DISK_TEST
+    arch_interrupt_restore(construction_irq);
+#endif
 }
 static void execute(void *unused)
 {
     (void)unused;
     if (root_mode) return;
+#if BOAROS_MM_DISK_TEST
+    uint64_t work_start=riscv_time_read(),work_end;
+#endif
 #if BOAROS_MM_SHARED_TEST
     if(shared_root_data) { request(0,31); capture_old_pages(); shared_root_data=0; }
 #endif
@@ -817,6 +981,9 @@ static void execute(void *unused)
     shared_case();
 #endif
     virt_uart_puts("BoarOS: MM SMP native pin/permission/retirement/U-execute contracts passed\n");
+#if BOAROS_MM_DISK_TEST
+    work_end=riscv_time_read();
+#endif
     for (unsigned id = 0; id < 2; id++) { request(id, 12); kernel_thread_join(&actors[id]); }
     kernel_mm_get_concurrency_state(&parent, &state);
     require(state.references == 1 && !state.pins && !state.write_pins && !state.active_cpus &&
@@ -832,8 +999,28 @@ static void execute(void *unused)
     virt_uart_puts(" pin-waits="); virt_uart_put_hex(state.pin_waits); virt_uart_putc('\n');
     require(kernel_mm_release(&parent) == KERNEL_MM_STATUS_OK, "mm-last-owner-release");
 #if BOAROS_MM_FILE_TEST
+#if BOAROS_MM_DISK_TEST
+    size_t persisted; uint64_t observed=0;
+    require(!kernel_vfs_pwrite(&file_controller->file,0,disk_persist,sizeof(disk_persist),&persisted) && persisted==sizeof(disk_persist) &&
+        !kernel_vfs_sync(&file_controller->file,0,&observed),"disk-final-durable-write");
+    kernel_page_cache_stop_worker(&disk_cache);
+    struct kernel_page_cache_concurrency_state cache_state;
+    struct kernel_page_cache_statistics cache_statistics;
+    kernel_page_cache_get_concurrency_state(&disk_cache,&cache_state);
+    kernel_page_cache_get_statistics(&disk_cache,&cache_statistics);
+    require(!cache_state.pending && !cache_state.running && !cache_state.entry_borrows &&
+        cache_state.requests_completed==cache_state.requests_queued,"disk-request-and-entry-drain");
+    virt_uart_puts("BoarOS: disk MM cache requests="); virt_uart_put_hex(cache_state.requests_queued);
+    virt_uart_puts(" peak-pages="); virt_uart_put_hex(cache_statistics.peak_pages);
+    virt_uart_puts(" background-written="); virt_uart_put_hex(cache_statistics.worker_written);
+    virt_uart_puts(" deferred-snapshots="); virt_uart_put_hex(cache_state.deferred_snapshots); virt_uart_putc('\n');
+#endif
     require(!kernel_open_file_release(&file_controller) && !file_controller && !kernel_vfs_unmount(file_mount),
         "file-controller-last-source-and-mount");
+#if BOAROS_MM_DISK_TEST
+    require(!kernel_page_cache_destroy(&disk_cache),"disk-cache-last-owner");
+    virt_uart_puts("BoarOS: disk MM CPU0 I/O/cache/alias/mount owners returned\n");
+#endif
     virt_uart_puts("BoarOS: file MM controller/OFD/registration/private mount owners returned\n");
 #endif
     physical_page_release(&arena, template_page);
@@ -846,13 +1033,21 @@ static void execute(void *unused)
         physical_page_allocator_audit(&arena) == PHYSICAL_PAGE_STATUS_OK, "mm-arena-owner-baseline");
     heap = (struct kernel_heap){0}; arena = (struct physical_page_allocator){0};
     physical_page_release_order(system_pages, outer, 12);
-    riscv_smp_stop(); __atomic_store_n(&done, 1, __ATOMIC_RELEASE);
+    riscv_smp_stop();
+#if BOAROS_MM_DISK_TEST
+    virt_uart_puts("BoarOS: disk MM OFF ticks setup="); virt_uart_put_hex(disk_setup_ticks);
+    virt_uart_puts(" work="); virt_uart_put_hex(work_end-work_start);
+    virt_uart_puts(" cleanup="); virt_uart_put_hex(riscv_time_read()-work_end); virt_uart_putc('\n');
+#endif
+    __atomic_store_n(&done, 1, __ATOMIC_RELEASE);
 }
 void riscv_smp_test_idle_boundary(struct kernel_cpu *cpu) { (void)cpu; }
-void riscv_smp_test_start(struct physical_page_allocator *pages, int has_root)
+static void start_mm_actors(void *unused)
 {
-    system_pages = pages; baseline = physical_page_available(pages);
-    root_mode = has_root; cpu_count = riscv_smp_cpu(1) ? 2 : 1;
+    (void)unused;
+#if BOAROS_MM_DISK_TEST
+    uint64_t setup_start=riscv_time_read();
+#endif
     prepare_mm();
     for (unsigned id = 0; id < 2; id++) {
         struct kernel_mm owner = {0};
@@ -864,17 +1059,44 @@ void riscv_smp_test_start(struct physical_page_allocator *pages, int has_root)
     }
     kernel_wait_queue_init(&fence_gate);
     if (root_mode) {
-        require(cpu_count == 2, "mm-root-needs-two-CPUs");
+        require(cpu_count == 2 || BOAROS_MM_DISK_TEST, "mm-root-needs-two-CPUs");
         send(1, 11);
+#if !BOAROS_MM_DISK_TEST
         uint64_t end = riscv_time_read() + UINT64_C(50000000);
         while (!__atomic_load_n(&background_count, __ATOMIC_ACQUIRE))
             require((int64_t)(riscv_time_read() - end) < 0, "mm-root-background-start");
+#endif
         background_begin = __atomic_load_n(&background_count, __ATOMIC_ACQUIRE);
         require(kernel_thread_create_joinable(execute, 0, &controller_join) == KERNEL_SCHEDULER_STATUS_OK, "mm-controller-create");
     } else require(kernel_thread_create(execute, 0) == KERNEL_SCHEDULER_STATUS_OK, "mm-controller-create");
+#if BOAROS_MM_DISK_TEST
+    disk_setup_ticks=riscv_time_read()-setup_start;
+    __atomic_store_n(&disk_setup_ready,1,__ATOMIC_RELEASE);
+#endif
+}
+void riscv_smp_test_start(struct physical_page_allocator *pages,int has_root)
+{
+    system_pages=pages; baseline=physical_page_available(pages);
+    root_mode=has_root; cpu_count=riscv_smp_cpu(1)?2:1;
+#if BOAROS_MM_DISK_TEST
+    /* 已启用IRQ的真实块I/O须在可睡眠CPU0任务执行，不能借启动栈伪装。 */
+    require(kernel_thread_create_joinable(start_mm_actors,0,&disk_setup_join)==KERNEL_SCHEDULER_STATUS_OK,
+        "disk-setup-CPU0-task");
+#else
+    start_mm_actors(0);
+#endif
 }
 void riscv_smp_test_root_finish(void)
 {
+#if BOAROS_MM_DISK_TEST
+    /* cleanup worker入口关闭IRQ；这里仍等待普通服务任务的真实I/O。
+     * yield在只剩本任务runnable时会选回自己，不能靠它接收设备IRQ。 */
+    uintptr_t finish_irq=arch_interrupt_save();
+    arch_interrupt_restore(finish_irq|RISCV_SSTATUS_SIE);
+    wait_flag(&disk_setup_ready,"disk-setup-publication");
+    kernel_thread_join(&disk_setup_join);
+    while (!__atomic_load_n(&background_count,__ATOMIC_ACQUIRE)) yield();
+#endif
     require(root_mode && __atomic_load_n(&background_count, __ATOMIC_ACQUIRE) > background_begin, "mm-real-user-overlap");
     __atomic_store_n(&root_release, 1, __ATOMIC_RELEASE);
     wait_flag(&completed[1], "mm-root-overlap-stop");
@@ -885,6 +1107,9 @@ void riscv_smp_test_root_finish(void)
     require(done, "mm-root-native-completion");
     virt_uart_puts("BoarOS: SMP root overlap counter="); virt_uart_put_hex(background_count);
     virt_uart_puts(" controller/arena/wait owners returned\n");
+#if BOAROS_MM_DISK_TEST
+    arch_interrupt_restore(finish_irq);
+#endif
 }
 void riscv_smp_test_poll(void)
 {

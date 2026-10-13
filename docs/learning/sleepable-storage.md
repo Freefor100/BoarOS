@@ -178,7 +178,7 @@ make test-virtio-block-host test-wait-host test-io-sleep-riscv
 make test-block-loongarch test-root-io-loongarch test-pci-reset-owner-loongarch INIT_CONFIG=config/init.json
 ```
 
-## 受控缓存的冷读交接
+## 受控磁盘映射的I/O与页写入交接
 
 `kernel_page_cache_init_controlled()` 使用无压力hook的独立 arena。缓存加载资格仍由
 CPU0取得；远端排队的请求不先建立loading项，否则CPU0文件写入可能持inode锁等
@@ -188,11 +188,39 @@ loading；远端命中在索引保护内借用entry，锁外取得物理引用�
 在途读取返回，不能用取消通知代替后端完成。
 
 本地 `make test-page-cache-concurrency-host` 使用真实VFS/lwext4、镜像块I/O与生产
-park，在4/16 KiB、2/4线程下核对一次同页加载、失败合并、命中不排队和停止交接；
-最终mount/cache/页/堆归还并执行e2fsck。原RV `test-io-sleep-riscv` 的四个
-legacy/modern、writeback/writethrough profile也通过。此处只证明缓存入口和原
-单核存储退化，磁盘MM及共享写回需要其实际消费者独立验收。
+park，在4/16 KiB、2/4线程下核对同页唯一加载、64页索引扩容、失败合并、命中
+不分配/读盘/排队、请求停止与1/8/32别名借用。`test-mm-disk-concurrency-host`
+再链接真实Sv39/OFD/MM，覆盖来源过期、COW/OOM/fixed替换、实际尺寸失败与最后owner。
+宿主文件/MM模型与客户机MTTCG、RFENCE及独立重启证据分列，后者见[两核模块](../modules/riscv-smp.md)。
 
-同编译配置的尺寸对照：entry保持200字节（256字节slab）；record由480增至656
-字节（512→1024字节slab），代价为每实例512字节容量增量；请求为96字节栈现场，
-没有每缺页请求堆分配或新worker栈。这里记录结构成本，不推定运行性能改善。
+写入许可不是整MM的copy开关。每个缓存entry用一个原子字表达关闭和在途写入数，
+可写pin还持entry借用。快照先关闭目标页、锁外回调撤W并确认RFENCE，再排空旧pin、
+复制原脏范围，随即开放写入；inode读保护覆盖后端提交，generation保护旧完成不清新脏。
+后台worker不能等待一个可能正排队冷读的MM gate或pin：遇忙时保留脏页并延期，
+实际gate释放或pin归还通知后再推进，复用现有worker而不增加轮询/线程。
+
+两个强制交错说明许可与寿命必须分别处理：fault成功到pin之间快照可再次撤W，
+uaccess须重查而不能把合法临时撤权误报FAULT；真正VMA降权/EOF仍结束复制。
+截断成功后整页可退出索引，但已在排空旧pin的快照仍持有entry；其完成只归还owner，
+不再把旧内容提交到重新增长的文件。后端actual/changed明确后重新取得inode写保护，
+把尾零、缓存退休与尺寸发布连在同一保护内，防止新冷加载越过收敛过程。
+对应反例验证复制前缀、页/堆归还、真实镜像读回，未删除错误状态或损坏校验。
+
+客户机fixture曾在cleanup线程的IRQ-off忙yield中等待尚未完成的setup I/O；只剩自身
+runnable时不会进入idle，设备IRQ得不到处理。GDB确认setup阻塞在真实块请求，而
+收口线程持续运行。交接期间启用IRQ、返回恢复原状态，立即退出的PID1覆盖这一边界；
+未放宽五秒握手或180秒启动预算。一次早期16KiB宿主超时缺少完整现场，原因仍未确认，
+后续通过不替它完成归因。
+
+尺寸以默认RA0/WB1、COST OFF的实际产物核对：entry216字节（256字节slab），
+record从原480变为672字节（512→1024字节slab），每实例容量增加512字节；
+alias64、resident128（仍128字节slab）、pin88、MM记录584（仍一页）、请求96字节栈现场。
+inode440及ext4包装的512字节slab保持。SMP任务2784字节，仍一页metadata；CPU1968字节。
+受控文件的冷写当前先读入再复制，普通CPU0缓存保留整页覆盖不读旧数据的路径。
+这是实际成本边界；没有每页mutex、每请求堆对象或新worker，不据结构/正确性计数宣称加速。
+常规OFF启动记录构造、业务、收尾tick与独立worker工作量，不作短窗口性能比较。
+
+固定语义依据为 `references/linux@f4cdf7ca9a1fdcca413157df19753f388a5a224e`：
+`mm/filemap.c`的fault/page_mkwrite、`mm/rmap.c`的写权限回收、`mm/truncate.c`的
+截断与驻留页关系。BoarOS使用自己的gate/代次/entry借用协议；固定源码提供行为依据，
+不把Linux锁实现直接套成BoarOS所有权。实际后端为仓库固定lwext4，默认存储RA0/WB1保持。

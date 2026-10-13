@@ -29,12 +29,12 @@ static void *access(uint64_t p) { return (void *)(uintptr_t)p; }
 static int address_of(const void *p,uint64_t *out) { *out=(uintptr_t)p; return 1; }
 void mm_test_fence(uint64_t v,int instructions)
 { (void)v;(void)instructions;__atomic_thread_fence(__ATOMIC_SEQ_CST); }
-int __real_kernel_open_file_prepare_memory_page(struct kernel_open_file_description *,uint64_t,
+int __real_kernel_open_file_prepare_mapping_page(struct kernel_open_file_description *,uint64_t,
     struct kernel_open_file_page_preparation *);
-int __wrap_kernel_open_file_prepare_memory_page(struct kernel_open_file_description *file,uint64_t index,
+int __wrap_kernel_open_file_prepare_mapping_page(struct kernel_open_file_description *file,uint64_t index,
     struct kernel_open_file_page_preparation *prepared)
 {
-    int result=__real_kernel_open_file_prepare_memory_page(file,index,prepared);
+    int result=__real_kernel_open_file_prepare_mapping_page(file,index,prepared);
     if (!result && final_inject) source_prepared=1;
     return result;
 }

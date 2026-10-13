@@ -104,6 +104,7 @@ shared-file.protect-close-sync
 shared-file.fork
 shared-file.fork-sync
 shared-file.private-isolation
+shared-file.snapshot-copy-next-generation
 shared-file.unlinked-sync
 shared-file.truncate-sigbus
 shared-file.grow-tail

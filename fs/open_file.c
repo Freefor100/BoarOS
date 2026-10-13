@@ -848,6 +848,10 @@ enum kernel_open_file_status kernel_open_file_advance(
 
 int kernel_open_file_memory_backed(struct kernel_open_file_description *file)
 { return open_file_live(file) && kernel_vfs_file_memory(&file->file) != 0; }
+const struct kernel_vfs_file *kernel_open_file_vfs_borrow(const struct kernel_open_file_description *file)
+{ return open_file_live(file) ? &file->file : 0; }
+struct kernel_page_cache *kernel_open_file_page_cache(const struct kernel_open_file_description *file)
+{ return open_file_live(file) ? kernel_vfs_file_page_cache(&file->file) : 0; }
 
 int kernel_open_file_prepare_memory_page(struct kernel_open_file_description *file,
     uint64_t index, struct kernel_open_file_page_preparation *prepared)
@@ -884,6 +888,58 @@ void kernel_open_file_finish_memory_page(struct kernel_open_file_description *fi
     kernel_memory_object_finish_page(kernel_vfs_file_memory(&file->file),
         prepared->index, prepared->address, accepted);
     prepared->pending = 0;
+}
+
+enum kernel_open_file_status kernel_open_file_check_mapping_domain(
+    const struct kernel_open_file_description *file,const struct kernel_heap *heap,
+    const struct physical_page_allocator *allocator)
+{
+    if (!open_file_live(file) || file->kind != KERNEL_OPEN_FILE_KIND_REGULAR)
+        return KERNEL_OPEN_FILE_STATUS_STATE;
+    struct kernel_vfs_node *node=kernel_open_file_node(file);
+    int error=kernel_open_file_memory_backed((struct kernel_open_file_description *)file) ?
+        kernel_tmpfs_check_domain(node,heap,allocator) : kernel_ext4_check_mapping_domain(node,heap,allocator);
+    return error ? KERNEL_OPEN_FILE_STATUS_STATE : KERNEL_OPEN_FILE_STATUS_OK;
+}
+int kernel_open_file_prepare_mapping_page(struct kernel_open_file_description *file,
+    uint64_t index,struct kernel_open_file_page_preparation *prepared)
+{
+    if (kernel_open_file_memory_backed(file)) return kernel_open_file_prepare_memory_page(file,index,prepared);
+    if (!prepared || prepared->pending || !open_file_live(file)) return -KERNEL_EINVAL;
+    struct kernel_vfs_node *node=kernel_open_file_node(file);
+    struct kernel_page_cache *cache=kernel_vfs_file_page_cache(&file->file);
+    if (!node || !kernel_page_cache_is_controlled(cache)) return -KERNEL_EINVAL;
+    uint64_t epoch,size;
+    {
+        KERNEL_LOCK_SCOPE(io); kernel_vfs_node_lock(node,&io,0);
+        int error=kernel_file_mapping_prepare(node);
+        if (error) return error;
+        if (kernel_file_mapping_epoch(node,&epoch)) return -KERNEL_EBUSY;
+        size=kernel_open_file_size(file);
+        if (index>UINT64_MAX/BOAROS_PAGE_SIZE || index*BOAROS_PAGE_SIZE>=size) return -KERNEL_EFAULT;
+    }
+    /* 不能携带inode读资格等CPU0再取得读资格：排队writer会形成等待环。 */
+    uint64_t address; size_t valid;
+    enum kernel_page_cache_status status=kernel_page_cache_get(cache,&file->file,index,&address,&valid);
+    if (status) return status==KERNEL_PAGE_CACHE_STATUS_NO_MEMORY ? -KERNEL_ENOMEM :
+        status==KERNEL_PAGE_CACHE_STATUS_STATE ? -KERNEL_EBUSY : -KERNEL_EIO;
+    {
+        KERNEL_LOCK_SCOPE(io); kernel_vfs_node_lock(node,&io,0);
+        uint64_t latest;
+        if (kernel_file_mapping_epoch(node,&latest) || latest!=epoch || index*BOAROS_PAGE_SIZE>=kernel_open_file_size(file)) {
+            physical_page_release(cache->allocator,address); return -KERNEL_EBUSY;
+        }
+    }
+    *prepared=(struct kernel_open_file_page_preparation){.address=address,.index=index,.epoch=epoch,.size=size,.pending=1};
+    return 0;
+}
+void kernel_open_file_finish_mapping_page(struct kernel_open_file_description *file,
+    struct kernel_open_file_page_preparation *prepared,int accepted)
+{
+    if (kernel_open_file_memory_backed(file)) { kernel_open_file_finish_memory_page(file,prepared,accepted); return; }
+    if (!prepared || !prepared->pending || !open_file_live(file)) __builtin_trap();
+    if (!accepted && physical_page_release(kernel_vfs_file_page_cache(&file->file)->allocator,prepared->address)) __builtin_trap();
+    prepared->pending=0;
 }
 
 static enum kernel_page_cache_status memory_page(struct kernel_open_file_description *file,
@@ -977,7 +1033,7 @@ enum kernel_page_cache_status kernel_open_file_alias_attach(
     struct kernel_open_file_description *file, uint64_t page_index,
     uint64_t physical_address, struct kernel_page_cache_alias *alias,
     void *owner, uint64_t virtual_address,
-    void (*rearm)(void *owner, uint64_t virtual_address))
+    int (*rearm)(void *owner, uint64_t virtual_address))
 {
     if (!open_file_live(file) || file->file.mount == 0 ||
         file->file.mount->private_data == 0)

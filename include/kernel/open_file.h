@@ -24,6 +24,9 @@ struct kernel_vfs_node *kernel_open_file_node(
     const struct kernel_open_file_description *description);
 struct kernel_vfs_path *kernel_open_file_path(
     const struct kernel_open_file_description *description);
+/* 同一OFD owner下借用真实文件/cache，不增加引用或允许后端跨核。 */
+const struct kernel_vfs_file *kernel_open_file_vfs_borrow(const struct kernel_open_file_description *);
+struct kernel_page_cache *kernel_open_file_page_cache(const struct kernel_open_file_description *);
 
 enum kernel_open_file_status {
     KERNEL_OPEN_FILE_STATUS_OK = 0,
@@ -146,6 +149,14 @@ int kernel_open_file_prepare_memory_page(struct kernel_open_file_description *,
     uint64_t index, struct kernel_open_file_page_preparation *);
 void kernel_open_file_finish_memory_page(struct kernel_open_file_description *,
     struct kernel_open_file_page_preparation *, int accepted);
+/* 同一准备/接纳契约；disk合法读页已被cache接纳，失败只归还额外页引用。 */
+int kernel_open_file_prepare_mapping_page(struct kernel_open_file_description *,
+    uint64_t index, struct kernel_open_file_page_preparation *);
+void kernel_open_file_finish_mapping_page(struct kernel_open_file_description *,
+    struct kernel_open_file_page_preparation *, int accepted);
+enum kernel_open_file_status kernel_open_file_check_mapping_domain(
+    const struct kernel_open_file_description *,const struct kernel_heap *,
+    const struct physical_page_allocator *);
 
 enum kernel_open_file_status kernel_open_file_acquire(
     struct kernel_open_file_description *file);
@@ -215,7 +226,7 @@ enum kernel_page_cache_status kernel_open_file_alias_attach(
     struct kernel_open_file_description *file, uint64_t page_index,
     uint64_t physical_address, struct kernel_page_cache_alias *alias,
     void *owner, uint64_t virtual_address,
-    void (*rearm)(void *owner, uint64_t virtual_address));
+    int (*rearm)(void *owner, uint64_t virtual_address));
 
 int kernel_open_file_pread(struct kernel_open_file_description *file,
                            uint64_t offset,

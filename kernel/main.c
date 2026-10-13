@@ -45,6 +45,9 @@ static struct riscv_sv39_page_table transition_page_table;
 static struct dtb_cpu_info boot_cpus;
 #if BOAROS_SMP_TEST
 void riscv_smp_test_start(struct physical_page_allocator *, int);
+#if BOAROS_MM_DISK_TEST
+void riscv_smp_test_disk_config(struct kernel_heap *,struct kernel_block_device *);
+#endif
 void riscv_smp_test_poll(void);
 void riscv_smp_test_root_finish(void);
 #endif
@@ -998,6 +1001,10 @@ static void kernel_main_high(void)
                     (transition_page_table.root_address >> 12),
                     riscv_sv39_current_satp(), boot_info.timebase_frequency);
 #if BOAROS_SMP_TEST
+#if BOAROS_MM_DISK_TEST
+    if (!root_started || root_boot.device_count<2) __builtin_trap();
+    riscv_smp_test_disk_config(&root_boot.heap,&riscv_root_boot_device(&root_boot,1)->block);
+#endif
     riscv_smp_test_start(&page_allocator, root_started);
 #endif
 #endif

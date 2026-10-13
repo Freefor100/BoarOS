@@ -11,6 +11,15 @@ static _Thread_local struct kernel_io_context io, other_io;
 struct mm_test_actor { struct kernel_task task; unsigned dispatched; };
 static _Thread_local struct mm_test_actor actor;
 static _Thread_local unsigned actor_id;
+#if BOAROS_MAX_CPUS > 1
+static _Thread_local struct kernel_mm *bound_mm;
+void mm_test_bind(struct kernel_mm *mm) { bound_mm = mm; }
+enum kernel_task_status kernel_task_mm_borrow(const struct kernel_task *task, const struct kernel_mm **mm)
+{
+    if (task != &actor.task || !bound_mm || !mm) return KERNEL_TASK_STATUS_INVALID_ARGUMENT;
+    *mm = bound_mm; return KERNEL_TASK_STATUS_OK;
+}
+#endif
 static unsigned parked[16];
 static pthread_once_t domain_once = PTHREAD_ONCE_INIT;
 unsigned mm_test_parked(unsigned id) { assert(id < 16); return __atomic_load_n(&parked[id], __ATOMIC_ACQUIRE); }
@@ -28,12 +37,21 @@ void mm_test_attach(unsigned id)
     assert(!pthread_once(&domain_once, kernel_wait_domain_init));
     assert(id < 16); actor_id = id;
     actor = (struct mm_test_actor){0};
+#if BOAROS_MAX_CPUS > 1
+    bound_mm = 0;
+#endif
     actor.task.wait.on_cpu = 1;
     kernel_wait_node_init(&actor.task.default_wait_node, &actor.task);
     sync_test_irq = 1;
 }
 /* 普通MM调用使用bootstrap I/O owner；实际park运行在TLS调度模型中。 */
-struct kernel_task *kernel_task_current(void) { return 0; }
+struct kernel_task *kernel_task_current(void)
+{
+#if BOAROS_MAX_CPUS > 1
+    if (bound_mm) return &actor.task;
+#endif
+    return 0;
+}
 struct kernel_wait_record *kernel_wait_record_of(struct kernel_task *task) { return &task->wait; }
 struct kernel_wait_node *kernel_wait_default_node(struct kernel_task *task) { return &task->default_wait_node; }
 struct kernel_task *kernel_wait_current_task(void) { return &actor.task; }

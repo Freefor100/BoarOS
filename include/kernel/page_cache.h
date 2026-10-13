@@ -30,8 +30,12 @@ struct kernel_page_cache_alias {
     struct kernel_page_cache_alias **previous;
     void *owner;
     uint64_t virtual_address;
-    void (*rearm)(void *owner, uint64_t virtual_address);
+    int (*rearm)(void *owner, uint64_t virtual_address);
+    struct kernel_page_cache_alias *retired_next;
+    uint32_t borrows, registered;
 };
+static inline int kernel_page_cache_alias_active(const struct kernel_page_cache_alias *alias)
+{ return __atomic_load_n(&alias->registered,__ATOMIC_ACQUIRE) != 0; }
 struct kernel_vfs_file;
 struct kernel_vfs_mount;
 struct kernel_vfs_node;
@@ -46,6 +50,7 @@ enum kernel_page_cache_status {
     KERNEL_PAGE_CACHE_STATUS_IO,
     KERNEL_PAGE_CACHE_STATUS_CLEANUP_REQUIRED,
     KERNEL_PAGE_CACHE_STATUS_STATE,
+    KERNEL_PAGE_CACHE_STATUS_BUSY,
 };
 
 enum kernel_page_cache_state {
@@ -90,8 +95,10 @@ enum kernel_page_cache_status kernel_page_cache_init_controlled(
     struct physical_page_allocator *allocator);
 int kernel_page_cache_check_domain(const struct kernel_page_cache *cache,
     const struct kernel_heap *heap, const struct physical_page_allocator *allocator);
+int kernel_page_cache_is_controlled(const struct kernel_page_cache *);
 struct kernel_page_cache_concurrency_state {
     uint64_t requests_queued, requests_completed, entry_borrows;
+    uint64_t deferred_snapshots;
     uint32_t pending, running;
     size_t entry_bytes, record_bytes, request_bytes;
 };
@@ -120,15 +127,41 @@ enum kernel_page_cache_status kernel_page_cache_alias_attach(
     uint64_t page_index, uint64_t physical_address,
     struct kernel_page_cache_alias *alias, void *owner,
     uint64_t virtual_address,
-    void (*rearm)(void *owner, uint64_t virtual_address));
+    int (*rearm)(void *owner, uint64_t virtual_address));
+/* 已有alias owner/借用下使用；额外借用覆盖锁外通知，不能从裸指针复活。 */
+void kernel_page_cache_alias_hold(struct kernel_page_cache_alias *);
+void kernel_page_cache_alias_put(struct kernel_page_cache_alias *);
+void kernel_page_cache_retry_alias(struct kernel_page_cache_alias *);
+enum kernel_page_cache_status kernel_page_cache_request_writeback(struct kernel_page_cache *);
+struct kernel_page_cache_resize { struct kernel_page_cache_entry *entry; uint64_t old_size; };
+/* CPU0、文件操作门owner；prepare不持inode I/O，finish在关闭代次下收敛实际尺寸。
+ * 未改变尺寸时只开放许可，不能清除旧内容。token不可复制，须覆盖后端结果。 */
+int kernel_page_cache_resize_prepare(struct kernel_page_cache *,struct kernel_vfs_node *,
+    uint64_t old_size,uint64_t target,struct kernel_page_cache_resize *);
+void kernel_page_cache_resize_finish(struct kernel_page_cache_resize *,uint64_t actual);
 void kernel_page_cache_alias_clone(struct kernel_page_cache_alias *target,
     const struct kernel_page_cache_alias *source, void *owner);
 void kernel_page_cache_alias_detach(struct kernel_page_cache_alias *alias);
+/* detach只停止发布，受控alias保持entry直到锁外drain；MM存储同样须存活。
+ * drain不持MM gate、inode I/O或raw，不能由当前在途回调等待自己。 */
+void kernel_page_cache_alias_drain(struct kernel_page_cache_alias *alias);
 void kernel_page_cache_alias_mark_dirty(struct kernel_page_cache_alias *alias);
+struct kernel_io_context;
+/* 最终地址初始化，不能复制或跨任务归还；存活至end，覆盖entry及数据页。 */
+struct kernel_page_cache_write_borrow {
+    struct kernel_page_cache_entry *entry;
+    struct kernel_io_context *owner;
+    struct kernel_page_cache_write_borrow *registration, *next;
+};
+enum kernel_page_cache_status kernel_page_cache_alias_write_begin(
+    struct kernel_page_cache_alias *, struct kernel_page_cache_write_borrow *);
+void kernel_page_cache_write_end(struct kernel_page_cache_write_borrow *);
+enum kernel_page_cache_status kernel_page_cache_wait_writable(
+    struct kernel_page_cache *, const struct kernel_vfs_file *, uint64_t index, uint64_t physical);
 
-/* Caller supplies stable kernel bytes and owns the inode mutation lock.
- * A full-page cache miss stays loading until initialized and dirty, without
- * reading the overwritten data. Partial pages preserve their old contents.
+/* Caller supplies stable kernel bytes and owns the file-operation lock.
+ * 普通CPU0缓存的full-page miss不读旧内容；受控实例自行取得每页inode保护，
+ * 当前先读入冷页，再通过写许可复制。Partial pages preserve their old contents.
  * Dirty pages remain owned until writeback or explicit discard; return zero
  * or a negative errno while retaining partial progress. */
 int kernel_page_cache_write(struct kernel_page_cache *cache,
@@ -175,5 +208,7 @@ void kernel_page_cache_get_statistics(
 
 enum kernel_page_cache_status kernel_page_cache_destroy(
     struct kernel_page_cache *cache);
+/* purge/destroy由CPU0独占生命周期owner调用：先结束外部来源/MM/别名/请求，
+ * stop/join只结束worker，不替代这些调用者的存活保证。失败保留cache owner。 */
 
 #endif

@@ -161,6 +161,16 @@ static int ext4_backend_writeback(struct kernel_vfs_node *node, uint64_t offset,
                               const void *buffer, size_t size, size_t *written);
 
 static struct kernel_vfs_backend ext4_backend;
+int kernel_ext4_check_mapping_domain(const struct kernel_vfs_node *node,
+    const struct kernel_heap *heap, const struct physical_page_allocator *allocator)
+{
+    if (!node || !node->instance || !node->mount ||
+        node->closed || node->retired || (node->mode & KERNEL_VFS_S_IFMT) != KERNEL_VFS_S_IFREG ||
+        node->instance->ops != &ext4_backend || node->mount->private_data != node->instance ||
+        !__atomic_load_n(&node->mapping_state,__ATOMIC_ACQUIRE) ||
+        !kernel_page_cache_check_domain(node->instance->page_cache,heap,allocator)) return -KERNEL_EINVAL;
+    return 0;
+}
 static void initialize_backend(void);
 static int mount_error(const struct lwext4_mount_adapter *adapter)
 {
@@ -1400,7 +1410,7 @@ static void ext4_backend_release_unlinked(struct kernel_vfs_node *node)
     int result;
 
     if (node == 0) return;
-    node->references++;
+    __atomic_fetch_add(&node->references,1,__ATOMIC_RELAXED);
     struct kernel_lock_guard guard = {0};
     kernel_vfs_node_lock(node, &guard, 1);
     if (!node->unlinked || node->retired) {
@@ -1513,7 +1523,7 @@ static int ext4_backend_pread(struct kernel_vfs_node *node,
     size_t result_count;
     int result;
 
-    if (node == 0 || node->references == 0U || node->closed ||
+    if (node == 0 || __atomic_load_n(&node->references,__ATOMIC_ACQUIRE) == 0U || node->closed ||
         bytes_read == 0 || (buffer == 0 && size != 0U)) {
         return -KERNEL_EINVAL;
     }
@@ -1542,7 +1552,7 @@ static int ext4_backend_pread(struct kernel_vfs_node *node,
 static int ext4_backend_pread_batch(struct kernel_vfs_node *node,
     struct kernel_vfs_read_span *spans, size_t count)
 {
-    if (!node || !node->references || node->closed || count > KERNEL_VFS_READ_BATCH_MAX) return -KERNEL_EINVAL;
+    if (!node || !__atomic_load_n(&node->references,__ATOMIC_ACQUIRE) || node->closed || count > KERNEL_VFS_READ_BATCH_MAX) return -KERNEL_EINVAL;
     struct ext4_file_read_span batch[KERNEL_VFS_READ_BATCH_MAX];
     for (size_t i = 0; i < count; i++) {
         size_t n = 0;

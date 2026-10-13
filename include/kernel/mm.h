@@ -3,6 +3,7 @@
 
 #include <kernel/physical_page.h>
 #include <kernel/vma.h>
+#include <kernel/page_cache.h>
 
 #include <stdint.h>
 
@@ -83,6 +84,7 @@ struct kernel_mm_user_pin {
     void *page;
     uint64_t physical_address;
     uint32_t access;
+    struct kernel_page_cache_write_borrow cache_write;
 };
 enum kernel_mm_status kernel_mm_pin_user_page(
     const struct kernel_mm *, uint64_t address, uint32_t access,

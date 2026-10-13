@@ -103,7 +103,7 @@ static unsigned instance_stop_called, instance_stop_done;
 static uint64_t instance_peer_pin;
 static uint64_t observed[2], inserted_page;
 static struct kernel_page_cache_alias alias;
-static void rearm(void *owner, uint64_t address) { (void)owner; (void)address; }
+static int rearm(void *owner, uint64_t address) { (void)owner; (void)address; return 0; }
 extern unsigned char __boot_stack_bottom[], __boot_stack_top[];
 static void check(int good, unsigned id)
 {

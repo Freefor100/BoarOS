@@ -22,7 +22,7 @@ void kernel_file_mapping_init(struct kernel_vfs_node *node)
 
 int kernel_file_mapping_prepare(struct kernel_vfs_node *node)
 {
-    if (!node || !node->references || !node->instance) return -KERNEL_EINVAL;
+    if (!node || !__atomic_load_n(&node->references,__ATOMIC_ACQUIRE) || !node->instance) return -KERNEL_EINVAL;
     if (state(node)) return 0;
     KERNEL_LOCK_SCOPE(io);
     kernel_vfs_node_lock(node, &io, 0);
